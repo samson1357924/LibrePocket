@@ -30,7 +30,8 @@ import java.util.zip.ZipInputStream
  *   Current 為錯誤回傳路徑原子（失敗回滾舊版，staging 寫入階段故障經 [writeHook]
  *   注入（test-only，全域非隔離）同樣回滾：新鮮安裝無 target、覆蓋保留舊版）；kill -9 等崩潰窗口殘留由
  *   [cleanupStaleStaging] 收斂（窗口由測試鎖定：新鮮 staging、覆蓋中雙殘留、
- *   commit 後孤兒 bak、雙重失敗 bak；同 id 多份 bak 歧義時全保留待人工）。
+ *   commit 後孤兒 bak、雙重失敗 bak；同 id 多份 bak 歧義時還原路徑全保留
+ *   待人工——target 仍在的孤兒 bak 照常入刪除預算收斂，見 [handleCleanupEntry]）。
  * - 啟動接線（#15：已接入）：[cleanupStaleStaging] 已於 [dev.librepocket.agent.LibrePocketApp]
  *   `onCreate` 以 [STALE_STAGING_MAX_AGE_MILLIS] 呼叫，destRoot 由
  *   [SkillPaths.skillRoot] 提供（`<filesDir>/skills`）。殘餘記錄：孤兒僅限
@@ -98,12 +99,10 @@ object SkillInstaller {
     /**
      * 每次清理呼叫最多「刪除類」處置的條目數（超出者保留、留待下次啟動收斂）。
      *
-     * 上限只約束遞迴刪除工作（避免單次啟動在主執行緒做無界遞迴 I/O 拖慢
-     * cold start／引發 ANR）；崩潰還原（same-dir rename，O(1)）不受此上限約束，
-     * 維持「process restart 即恢復」的窗口語意。symlink 條目的 unlink（O(1)、
-     * `handleCleanupEntry` 第一步即處置，不經 `deletionAllowed` 檢查——
-     * 不因 cap 保留）亦占用本計數（保守方向：link 多時會讓同批真實目錄
-     * 延後到下次收斂，正確性不受影響）。
+     * 上限約束一切刪除類工作（遞迴刪除與 symlink unlink 皆同類——避免單次啟動
+     * 在主執行緒做無界 I/O 拖慢 cold start／引發 ANR，超出者同批保留下次收斂）；
+     * 崩潰還原（same-dir rename，O(1)）不受此上限約束，維持「process restart
+     * 即恢復」的窗口語意。
      */
     const val MAX_CLEANUP_ENTRIES_PER_RUN = 64
 
@@ -139,13 +138,23 @@ object SkillInstaller {
     /**
      * 安全向 symlink 偵測（fail-closed）：偵測失敗時回 true（視為不可信）。
      *
+     * 以 `Files.readAttributes(..., NOFOLLOW_LINKS)` 實作（與 `ShellPolicy` 的
+     * `lstatNoFollow` 同一先例）：`Files.isSymbolicLink` 按 JDK 規格「無法判定時
+     * 回 false」且幾乎不拋例，會把 unknown 當成一般檔案（fail-open），與本函式
+     * 的 fail-closed 承諾相悖；本變體讀得成功時由 `BasicFileAttributes.isSymbolicLink`
+     * 定案，讀不到（AccessDenied／IO／已消失等）一律回 true，不降級為「非 link」。
+     *
      * 「會刪改外部內容」的路徑（[cleanupStaleStaging] 的 destRoot／條目檢查、
      * [installFiles] 覆蓋前 target 檢查、[installedVersion] 拒讀）一律用此變體：
      * 偵測不確定時寧可跳過／拒絕，也不跟隨 symlink 作用。觀察型 API
      * （[listResiduals]）同樣採用，與清理行為保持一致。
      */
     private fun isSymlinkOrUnknown(f: File): Boolean = try {
-        java.nio.file.Files.isSymbolicLink(f.toPath())
+        java.nio.file.Files.readAttributes(
+            f.toPath(),
+            java.nio.file.attribute.BasicFileAttributes::class.java,
+            java.nio.file.LinkOption.NOFOLLOW_LINKS,
+        ).isSymbolicLink
     } catch (_: Exception) {
         true
     }
@@ -249,9 +258,11 @@ object SkillInstaller {
      * 形狀符合但 id 非法者只刪不恢復。真實 skill 目錄永不以 `.` 開頭
      * （見 [SkillParser] 的 name 規則），不會被誤刪。
      *
-     * 同 id 有多份 `.bak` 候選時視為歧義：一律保留、不還原、不刪除、
-     * 不計數，需人工介入。檔名 nanoTime 後綴是單調計數器而非 wall-clock
-     * 時間戳，不可跨重啟比較新舊，故不用後綴數字選「最新」。
+     * 同 id 有多份 `.bak` 候選時，還原路徑（target 缺席者）視為歧義：一律保留、
+     * 不還原、不刪除、不計數，需人工介入（target 仍在的孤兒 bak 不受歧義
+     * 保護，照常入刪除預算收斂，見 [handleCleanupEntry]）。檔名 nanoTime 後綴
+     * 是單調計數器而非 wall-clock 時間戳，不可跨重啟比較新舊，故不用後綴
+     * 數字選「最新」。
      *
      * 齡期語意（兩閾分離）：
      * - **崩潰窗口還原**：target 缺席的單一合法 `.bak` **不問齡期**立即恢復
@@ -275,8 +286,8 @@ object SkillInstaller {
      * point-in-time 快照（鎖外計算），鎖內僅還原前重驗 `target.exists()`，
      * 極端交錯下的最終一致性依賴「不與 install 併發」契約。
      *
-     * @return 刪除或恢復的條目數（歧義保留者不計入；刪除類受每次啟動上限約束，
-     *   超出者此刻不計）。
+     * @return 刪除或恢復的條目數（歧義保留者不計入；刪除類——含 symlink unlink——
+     *   受每次啟動上限約束，超出者此刻不計；崩潰還原型豁免上限）。
      */
     fun cleanupStaleStaging(destRoot: File, maxAgeMillis: Long = STALE_STAGING_MAX_AGE_MILLIS): Int {
         if (!destRoot.isDirectory) return 0
@@ -290,9 +301,11 @@ object SkillInstaller {
         } ?: return 0
         val now = System.currentTimeMillis()
         // 先按 skill id 分組同形 .bak 候選：同 id 多份時無法證明新舊，
-        // 列舉順序未定義，逕行還原其一併刪除其餘會造成資料遺失，故全保留。
-        // 計數含未過期者——「一份新鮮 + 一份過期」同樣無法判定，逕行恢復過期版
-        // 可能是錯版勝出，故亦視為歧義。
+        // 列舉順序未定義，逕行還原其一併刪除其餘會造成資料遺失，故還原路徑
+        //（target 缺席者）全保留。計數含未過期者——「一份新鮮 + 一份過期」
+        // 同樣無法判定，逕行恢復過期版可能是錯版勝出，故亦視為歧義。
+        // target 仍在的孤兒 bak 不受歧義保護：其形狀注定不可還原，照常入
+        // 刪除預算逐次收斂（避免永久滯留，見 [handleCleanupEntry]）。
         val bakCountById = HashMap<String, Int>()
         for (f in entries) {
             val bakId = BACKUP_RE.matchEntire(f.name)?.groupValues?.get(1) ?: continue
@@ -349,7 +362,7 @@ object SkillInstaller {
         /** 已刪除完成（unlink 或 NOFOLLOW 安全遞迴刪除，占刪除預算）。 */
         DELETED,
 
-        /** 保留原狀（歧義／未達預算／單項失敗重試）。 */
+        /** 保留原狀（歧義／超出預算（deletionAllowed=false）／單項失敗重試）。 */
         KEPT,
     }
 
@@ -361,7 +374,13 @@ object SkillInstaller {
      * 跟隨 symlink、rename 會搬走 link 本身、遞迴刪除會遍歷其指向的外部目錄。
      * 故 symlink 條目一律只解除 link 本身，不遞迴刪除、也絕不還原成正式 skill
      * （唯一例外：真實目錄內部遭植入的 symlink 由 [deleteTreeSafe] 的
-     * NOFOLLOW 遍歷只解除 link 本身）。
+     * NOFOLLOW 遍歷只解除 link 本身）；unlink 亦屬刪除類，同受
+     * [MAX_CLEANUP_ENTRIES_PER_RUN] 約束，超出預算者保留待下次收斂。
+     *
+     * `.bak` 歧義檢查只守還原分支：同 id 多份候選無法證明新舊（列舉順序未定義），
+     * 逕行還原其一併刪除其餘會造成資料遺失，故還原路徑保留全數；target 仍在
+     * 的孤兒 bak（或 bak 非目錄，無還原形狀者）為純垃圾，走刪除路徑逐次收斂，
+     * 不再永久滯留。
      *
      * @return 處置結果（[Disposition.RESTORED]/[Disposition.DELETED] 計入呼叫方
      *   回傳計數；[Disposition.KEPT] 保留待人工或下次收斂）。
@@ -374,19 +393,26 @@ object SkillInstaller {
         bakCountById: Map<String, Int>,
         deletionAllowed: Boolean,
     ): Disposition {
-        // 1) 子條目 NOFOLLOW 防衛：symlink（或偵測失敗）一律只 unlink 本身。
+        // 1) 子條目 NOFOLLOW 防衛：symlink（或偵測失敗）一律只 unlink 本身
+        //    （unlink 占刪除預算，超出者保留待下次收斂）。
         if (isSymlinkOrUnknown(f)) {
+            if (!deletionAllowed) return Disposition.KEPT
             return if (unlinkEntry(f)) Disposition.DELETED else Disposition.KEPT
         }
         if (bakId != null && SkillParser.isValidName(bakId)) {
-            if ((bakCountById[bakId] ?: 0) > 1) {
-                // 歧義：同 id 多份候選，全保留、不還原、不刪除、不計數，需人工介入。
-                return Disposition.KEPT
-            }
             val target = File(destRoot, bakId)
             if (!target.exists() && f.isDirectory) {
                 // 崩潰窗口遺留：舊版已搬離、target 缺席 → 盡力恢復。
+                // 歧義守衛只在此分支：同 id 多份候選全保留、不還原、不刪除、
+                // 不計數，需人工介入（含「一份新鮮 + 一份過期」——逕行恢復過期版
+                // 可能是錯版勝出）。
+                if ((bakCountById[bakId] ?: 0) > 1) return Disposition.KEPT
                 //（f 已通過上方 NOFOLLOW 檢查；還原型不占刪除預算，O(1)。）
+                // 殘餘 TOCTOU：自上方檢查到 rename 之間存在同 uid 跨程序置換
+                // 窗口；rename 為 name-based，無純 JDK 原語可完全關閉，還原前
+                // 重驗一次限縮窗口——link／不可判定一律保留供人工處理，剩餘
+                // 風險依「不與 install 併發」的外部序列化契約覆蓋。
+                if (isSymlinkOrUnknown(f)) return Disposition.KEPT
                 val restored = try {
                     rename(f, target)
                 } catch (_: Exception) {
@@ -395,6 +421,8 @@ object SkillInstaller {
                 return if (restored) Disposition.RESTORED else Disposition.KEPT
                 // 恢復失敗則保留供人工處理，不計數。
             }
+            // target 仍在的孤兒 bak（或 bak 非目錄、無還原形狀）：純垃圾，
+            // 沿用下方刪除路徑（占刪除預算，啟動間收斂），不因同 id 歧義滯留。
         }
         // staging、target 仍在的孤兒 bak、或 id 非法者：只刪不恢復。
         // 每次啟動的刪除類工作設上限：超出者保留待下次收斂。
@@ -428,8 +456,8 @@ object SkillInstaller {
      * （與 [cleanupStaleStaging] 同形狀規則），供啟動路徑記錄殘餘。
      *
      * 與清理的差異：僅列形狀符合且過期者（含同 id 多份 bak 歧義候選——清理時
-     * 全保留，此處一併列出供人工核對）；實際收斂仍以 [cleanupStaleStaging]
-     * 回傳計數為準。回傳按檔名排序，保證穩定。
+     * 還原路徑全保留，此處一併列出供人工核對）；實際收斂仍以
+     * [cleanupStaleStaging] 回傳計數為準。回傳按檔名排序，保證穩定。
      *
      * 注意：本函式只依「形狀 + 齡期」過濾，**不區分 target 是否存在**——
      * 會被 [cleanupStaleStaging] 不問齡期立即還原的崩潰窗口候選（target 缺席的

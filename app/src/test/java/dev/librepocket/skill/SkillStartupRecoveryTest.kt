@@ -245,6 +245,95 @@ class SkillStartupRecoveryTest {
         }
     }
 
+    @Test fun cleanup_symlinkUnlink_capped_perRun() {
+        val parent = tempRoot()
+        try {
+            val root = File(parent, "skills").apply { mkdirs() }
+            val outside = File(parent, "outside").apply { mkdirs() }
+            val sentinel = File(outside, "sentinel.txt").apply { writeText("keep", Charsets.UTF_8) }
+            val tid = Thread.currentThread().id
+            val extra = 7
+            val total = SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN + extra
+            val links = (0 until total).map { i ->
+                val link = File(root, ".lnk-skill-" + i.toString().padStart(3, '0') + ".bak-$tid-$i")
+                try {
+                    java.nio.file.Files.createSymbolicLink(link.toPath(), outside.toPath())
+                } catch (e: UnsupportedOperationException) {
+                    assumeSymlinkSupported(e)
+                } catch (e: java.io.IOException) {
+                    assumeSymlinkSupported(e)
+                }
+                link
+            }
+            // symlink unlink 同屬刪除類：單次呼叫只刪至上限，其餘保留待下次收斂；
+            // 收斂期間絕不可穿透 link 觸碰外部內容。
+            val first = SkillInstaller.cleanupStaleStaging(root)
+            assertEquals("link 只刪至上限", SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN, first)
+            assertEquals(7, links.count { it.exists() })
+            assertTrue("外部 sentinel 必須存活", sentinel.isFile)
+            val second = SkillInstaller.cleanupStaleStaging(root)
+            assertEquals("剩餘 link 下次啟動收斂", extra, second)
+            assertEquals(0, links.count { it.exists() })
+            assertTrue("外部 sentinel 必須存活", sentinel.isFile)
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    @Test fun cleanup_twoStaleBaksWithLiveTarget_convergentDelete() {
+        val root = tempRoot()
+        try {
+            val tid = Thread.currentThread().id
+            val id = "bakconv-skill"
+            // target 仍在：同 id 的孤兒 .bak 形狀注定不可還原，屬純垃圾——
+            // 不得因「同 id 多份」歧義而永久滯留，應在刪除預算內逐次清空。
+            File(root, id).apply { mkdirs() }
+            val bak1 = File(root, ".$id.bak-$tid-1").apply {
+                mkdirs()
+                File(this, "SKILL.md").writeText(skillMd(id, "0.1.0"), Charsets.UTF_8)
+                setLastModified(System.currentTimeMillis() - (25L * 60 * 60 * 1000))
+            }
+            val bak2 = File(root, ".$id.bak-$tid-2").apply {
+                mkdirs()
+                File(this, "SKILL.md").writeText(skillMd(id, "0.2.0"), Charsets.UTF_8)
+                setLastModified(System.currentTimeMillis() - (25L * 60 * 60 * 1000))
+            }
+            val removed = SkillInstaller.cleanupStaleStaging(root)
+            assertEquals("target 仍在時兩份孤兒 bak 皆可收斂刪除", 2, removed)
+            assertFalse("bak1 應刪除", bak1.exists())
+            assertFalse("bak2 應刪除", bak2.exists())
+            assertTrue("live target 必須原樣保留（不得被 bak 內容覆蓋或移除）", File(root, id).isDirectory)
+            assertFalse(
+                "live target 不得被塞入 bak 的 SKILL.md（版本無關斷言）",
+                File(File(root, id), "SKILL.md").exists(),
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun cleanup_twoStaleBaksWithoutTarget_ambiguityKept_forRestore() {
+        val root = tempRoot()
+        try {
+            val tid = Thread.currentThread().id
+            val id = "bakamb-skill"
+            // target 缺席 + 同 id 多份（形狀須匹配 BACKUP_RE 的 \d+-\d+ 尾碼，
+            // 否則本測試空轉）：還原路徑無法證明新舊，全保留（資料防遺失）。
+            listOf("0.1.0" to 1, "0.2.0" to 2).forEach { (ver, suffix) ->
+                File(root, ".$id.bak-$tid-$suffix").apply {
+                    mkdirs()
+                    File(this, "SKILL.md").writeText(skillMd(id, ver), Charsets.UTF_8)
+                    setLastModified(System.currentTimeMillis() - (25L * 60 * 60 * 1000))
+                }
+            }
+            val removed = SkillInstaller.cleanupStaleStaging(root)
+            assertEquals("歧義還原候選全保留", 0, removed)
+            assertEquals(2, root.listFiles()!!.size)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
     @Test fun cleanup_symlinkDestRoot_isNoop() {
         val parent = tempRoot()
         try {

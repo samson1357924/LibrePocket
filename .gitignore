@@ -28,3 +28,6 @@ google-services.json
 # Local verification/device logs must never be committed (explicit filename patterns only, not blanket *.log).
 device_*.log
 verify_*.log
+# Python bytecode from policy scripts (local runs; CI sets PYTHONDONTWRITEBYTECODE=1).
+__pycache__/
+*.pyc

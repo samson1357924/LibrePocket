@@ -28,6 +28,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import apk_policy_inspect as policy_inspect
+from scripts import backup_rules_check
 
 ROOT = Path(__file__).resolve().parents[2]
 POLICY_CHECK = ROOT / "scripts" / "play_policy_check.sh"
@@ -961,6 +962,7 @@ class PolicyCiGateControl(unittest.TestCase):
         for required in (
             "scripts/play_policy_check.sh",
             "scripts/apk_policy_inspect.py",
+            "scripts/backup_rules_check.py",
             "scripts/summarize_junit.py",
             "scripts/check_test_budgets.py",
             "scripts/check_junit_durations.py",
@@ -977,6 +979,7 @@ class PolicyCiGateControl(unittest.TestCase):
         patterns = _pr_check_policy_patterns()
         for diff in (
             ["scripts/apk_policy_inspect.py"],
+            ["scripts/backup_rules_check.py"],
             ["scripts/tests/test_apk_policy_check.py"],
             ["scripts/apk_policy_inspect.py", "scripts/tests/test_apk_policy_check.py"],
             ["scripts/summarize_junit.py"],
@@ -1041,6 +1044,183 @@ class PolicyCiGateControl(unittest.TestCase):
             "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py",
             workflow,
         )
+
+
+class BackupRulesValidator(unittest.TestCase):
+    """Structured backup/data-extraction rule validation (P2 gate regression).
+
+    A raw-text ``grep domain=... path=...`` matches anywhere in the file, so a
+    device-transfer branch with zero excludes still passed. These fixtures pin
+    the parser-based validator against exactly those regressions.
+    """
+
+    _ALL_EXCLUDES = (
+        '        <exclude domain="sharedpref" path="librepocket_keys.xml" />\n'
+        '        <exclude domain="database" path="librepocket_vault" />\n'
+        '        <exclude domain="database" path="librepocket_vault-wal" />\n'
+        '        <exclude domain="database" path="librepocket_vault-shm" />\n'
+        '        <exclude domain="file" path="librepocket_keysets" />\n'
+    )
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+
+    def _write(self, name: str, body: str) -> str:
+        path = self.tmp / name
+        path.write_text(body, encoding="utf-8")
+        return str(path)
+
+    @staticmethod
+    def _full_backup(excludes: str) -> str:
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<full-backup-content>\n"
+            f"{excludes}"
+            "</full-backup-content>\n"
+        )
+
+    @staticmethod
+    def _data_extraction(cloud: str, device: str) -> str:
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<data-extraction-rules>\n"
+            f"    <cloud-backup>\n{cloud}    </cloud-backup>\n"
+            f"    <device-transfer>\n{device}    </device-transfer>\n"
+            "</data-extraction-rules>\n"
+        )
+
+    def test_repo_backup_files_are_valid(self) -> None:
+        errors: list[str] = []
+        for name in ("backup_rules.xml", "data_extraction_rules.xml"):
+            errors.extend(
+                backup_rules_check.validate(
+                    str(ROOT / "app" / "src" / "main" / "res" / "xml" / name)
+                )
+            )
+        self.assertEqual(errors, [])
+
+    def test_missing_device_transfer_exclude_is_caught(self) -> None:
+        # Minimal counterexample from the review: cloud-backup complete,
+        # device-transfer drops vault-wal. A raw-text grep would still PASS.
+        device = self._ALL_EXCLUDES.replace(
+            '        <exclude domain="database" path="librepocket_vault-wal" />\n', ""
+        )
+        path = self._write(
+            "data_extraction_rules.xml", self._data_extraction(self._ALL_EXCLUDES, device)
+        )
+        errors = backup_rules_check.validate(path)
+        self.assertTrue(
+            any("<device-transfer>" in e and "librepocket_vault-wal" in e for e in errors),
+            errors,
+        )
+
+    def test_empty_device_transfer_is_caught(self) -> None:
+        path = self._write(
+            "data_extraction_rules.xml", self._data_extraction(self._ALL_EXCLUDES, "")
+        )
+        errors = backup_rules_check.validate(path)
+        self.assertTrue(any("<device-transfer>" in e for e in errors), errors)
+        self.assertEqual(len(errors), len(backup_rules_check.REQUIRED_EXCLUDES), errors)
+        self.assertTrue(all("<device-transfer>" in e for e in errors), errors)
+
+    def test_commented_out_excludes_do_not_count(self) -> None:
+        commented = (
+            "    <!--\n"
+            '    <exclude domain="sharedpref" path="librepocket_keys.xml" />\n'
+            '    <exclude domain="database" path="librepocket_vault" />\n'
+            '    <exclude domain="database" path="librepocket_vault-wal" />\n'
+            '    <exclude domain="database" path="librepocket_vault-shm" />\n'
+            '    <exclude domain="file" path="librepocket_keysets" />\n'
+            "    -->\n"
+        )
+        path = self._write(
+            "data_extraction_rules.xml", self._data_extraction(commented, commented)
+        )
+        errors = backup_rules_check.validate(path)
+        self.assertEqual(
+            len(errors), 2 * len(backup_rules_check.REQUIRED_EXCLUDES), errors
+        )  # 5 per branch; comments ignored
+        self.assertTrue(
+            all("<cloud-backup>" in e or "<device-transfer>" in e for e in errors),
+            errors,
+        )
+
+    def test_missing_cloud_backup_branch_is_caught(self) -> None:
+        body = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<data-extraction-rules>\n"
+            "    <device-transfer>\n"
+            f"{self._ALL_EXCLUDES}    </device-transfer>\n"
+            "</data-extraction-rules>\n"
+        )
+        path = self._write("data_extraction_rules.xml", body)
+        errors = backup_rules_check.validate(path)
+        self.assertTrue(any("missing <cloud-backup>" in e for e in errors), errors)
+
+    def test_full_backup_content_missing_exclude_is_caught(self) -> None:
+        excludes = self._ALL_EXCLUDES.replace(
+            '        <exclude domain="file" path="librepocket_keysets" />\n', ""
+        )
+        path = self._write("backup_rules.xml", self._full_backup(excludes))
+        errors = backup_rules_check.validate(path)
+        self.assertTrue(any("librepocket_keysets" in e for e in errors), errors)
+
+    def test_unexpected_root_element_is_caught(self) -> None:
+        path = self._write("bad.xml", '<?xml version="1.0"?><something-else />')
+        errors = backup_rules_check.validate(path)
+        self.assertTrue(any("unexpected root" in e for e in errors), errors)
+
+    def test_exclude_missing_domain_or_path_attribute_is_caught(self) -> None:
+        # (None, path) / (domain, None) must not satisfy a required (domain, path).
+        excludes = (
+            '        <exclude path="librepocket_vault" />\n'
+            '        <exclude domain="database" />\n'
+        )
+        path = self._write("backup_rules.xml", self._full_backup(excludes))
+        errors = backup_rules_check.validate(path)
+        self.assertEqual(len(errors), len(backup_rules_check.REQUIRED_EXCLUDES), errors)
+
+    def test_nested_exclude_does_not_count(self) -> None:
+        # Android allows <exclude> only as a direct child of the branch; a
+        # nested <exclude> (e.g. under a future <rule>) must not satisfy it.
+        nested = (
+            '        <rule>\n'
+            f'{self._ALL_EXCLUDES.replace("        ", "            ")}'
+            '        </rule>\n'
+        )
+        path = self._write(
+            "data_extraction_rules.xml",
+            self._data_extraction(self._ALL_EXCLUDES, nested),
+        )
+        errors = backup_rules_check.validate(path)
+        self.assertEqual(len(errors), len(backup_rules_check.REQUIRED_EXCLUDES), errors)
+        self.assertTrue(all("<device-transfer>" in e for e in errors), errors)
+
+    def test_namespace_qualified_root_fails_closed(self) -> None:
+        # A default-namespace root is not the Android backup schema; the
+        # validator must fail closed rather than silently PASS.
+        body = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<full-backup-content xmlns="http://schemas.android.com/apk/res-auto">\n'
+            f"{self._ALL_EXCLUDES}</full-backup-content>\n"
+        )
+        path = self._write("backup_rules.xml", body)
+        errors = backup_rules_check.validate(path)
+        self.assertTrue(any("unexpected root" in e for e in errors), errors)
+
+
+class BackupRulesGateWiring(unittest.TestCase):
+    """Pin the shell gate so the structured validator is actually used."""
+
+    def test_gate_invokes_structured_validator(self) -> None:
+        text = POLICY_CHECK.read_text(encoding="utf-8")
+        self.assertIn("backup_rules_check.py", text)
+
+    def test_gate_does_not_use_raw_grep_for_excludes(self) -> None:
+        text = POLICY_CHECK.read_text(encoding="utf-8")
+        self.assertNotRegex(text, r"grep\b[^|\n]*\b-q\b[^|\n]*\bdomain=")
 
 
 if __name__ == "__main__":

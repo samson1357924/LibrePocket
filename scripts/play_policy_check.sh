@@ -50,6 +50,10 @@ FOSS_BLACKLIST="com.google.mlkit com.google.android.gms com.microsoft.cognitives
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
+# The backup-rules validator (source-level) runs before the artifact loop, so
+# require python3 up front rather than failing later with an opaque message.
+command -v python3 >/dev/null 2>&1 || fail 'python3 is required for the backup rules validator and APK policy scanner'
+
 # Preserve source-level checks as defense in depth; artifact checks remain the
 # authority for the bytes supplied to this gate.
 if [ "$MODE" = play ]; then
@@ -80,13 +84,13 @@ NETWORK_CONFIG="$ROOT/app/src/main/res/xml/network_security_config.xml"
 grep -q 'cleartextTrafficPermitted="false"' "$NETWORK_CONFIG" || fail "$NETWORK_CONFIG does not deny cleartext"
 for f in "$ROOT/app/src/main/res/xml/backup_rules.xml" "$ROOT/app/src/main/res/xml/data_extraction_rules.xml"; do
     [ -f "$f" ] || fail "missing $f"
-    # BackupPolicy.KEY_FILES_EXCLUDED 5 項逐項斷言（全錨定 domain+path，防註解命中繞過）。
-    grep -q 'domain="sharedpref" path="librepocket_keys.xml"' "$f" || fail "$f does not exclude key prefs"
-    grep -q 'domain="database" path="librepocket_vault"' "$f" || fail "$f does not exclude vault"
-    grep -q 'domain="database" path="librepocket_vault-wal"' "$f" || fail "$f does not exclude vault-wal"
-    grep -q 'domain="database" path="librepocket_vault-shm"' "$f" || fail "$f does not exclude vault-shm"
-    grep -q 'domain="file" path="librepocket_keysets"' "$f" || fail "$f does not exclude keysets"
 done
+# BackupPolicy.KEY_FILES_EXCLUDED 5 項逐項斷言：以結構化 XML 驗證區分
+# cloud-backup / device-transfer 並忽略註解（grep 全文比對會誤判 PASS，見
+# scripts/backup_rules_check.py 說明）。
+python3 "$SCRIPT_DIR/backup_rules_check.py" \
+    "$ROOT/app/src/main/res/xml/backup_rules.xml" \
+    "$ROOT/app/src/main/res/xml/data_extraction_rules.xml"
 
 find_tool_pair() {
     for sdk in "${ANDROID_HOME:-}" "$HOME/Android/Sdk"; do
@@ -126,7 +130,6 @@ find_tool_pair() {
 if ! find_tool_pair; then
     fail 'required Android build-tools aapt and dexdump were not both found (set ANDROID_HOME)'
 fi
-command -v python3 >/dev/null 2>&1 || fail 'python3 is required for the bounded APK policy scanner'
 
 for ART in "$@"; do
     printf '== artifact (%s APK gate): %s ==\n' "$MODE" "$ART"

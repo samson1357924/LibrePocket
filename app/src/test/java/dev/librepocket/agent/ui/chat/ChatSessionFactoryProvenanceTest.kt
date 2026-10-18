@@ -3,6 +3,7 @@ package dev.librepocket.agent.ui.chat
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
+import dev.librepocket.agent.ui.setup.SetupValidation
 import dev.librepocket.chat.ChatSession
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.keystore.EncryptedPrefsVault
@@ -36,6 +37,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 
@@ -127,6 +129,31 @@ class ChatSessionFactoryProvenanceTest {
         apiKeyRef = "provider_key/preset:custom",
     )
 
+    /**
+     * Stage1 current-shape custom endpoint: the entity id is derived from the
+     * baseUrl ([SetupValidation.deriveEndpointId]), so distinct URLs never
+     * share it. Factory `create`/`open` paths (which fail closed on legacy
+     * rows) must use this; the legacy helper above stays for the pure
+     * provenance-decision pins, which still handle old headers as data.
+     */
+    private fun customEndpointV2(baseUrl: String) = EndpointConfig(
+        providerId = SetupValidation.deriveEndpointId("custom", baseUrl),
+        presetId = "custom",
+        label = "Custom",
+        baseUrl = baseUrl,
+        protocol = ProviderProtocol.CHAT_COMPLETIONS,
+        model = "local-model",
+        apiKeyRef = SetupValidation.deriveApiKeyRef(
+            SetupValidation.deriveEndpointId("custom", baseUrl),
+        ),
+    )
+
+    /** New-shape stored header, mirroring `create()`'s provenance stamp. */
+    private fun customHeader(baseUrl: String, model: String = "local-model"): String {
+        val id = SetupValidation.deriveEndpointId("custom", baseUrl)
+        return "$id@${normalizeOrigin(baseUrl)}/$model"
+    }
+
     private fun factoryWith(
         transcripts: FakeSessionStore,
         provider: ProvenanceFakeProvider,
@@ -136,6 +163,26 @@ class ChatSessionFactoryProvenanceTest {
             val vault = EncryptedPrefsVault(InMemoryPrefs())
             vault.putKey("preset:openai", "test-key-12345678".toCharArray())
             vault.putKey("preset:custom", "test-key-12345678".toCharArray())
+            vault.putKey("test-custom-alias", "test-key-12345678".toCharArray())
+            // Stage1 per-URL live aliases for customEndpointV2 open() tests.
+            vault.putKey(
+                SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"),
+                "test-key-12345678".toCharArray(),
+            )
+            vault.putKey(
+                SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11435/v1"),
+                "test-key-12345678".toCharArray(),
+            )
+            // Respelling variants used by the fork-verdict matrix (each is a
+            // distinct entity id, so each needs its own vault key).
+            vault.putKey(
+                SetupValidation.deriveEndpointId("custom", "HTTP://127.0.0.1:11434/v1"),
+                "test-key-12345678".toCharArray(),
+            )
+            vault.putKey(
+                SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/other/path"),
+                "test-key-12345678".toCharArray(),
+            )
             vault
         },
         buildProvider = { _, _ -> provider },
@@ -299,23 +346,32 @@ class ChatSessionFactoryProvenanceTest {
      * instead of re-deriving the helper in isolation.
      */
     @Test fun sameOriginVerdicts_factoryOpenAndVmSettle_agreeOnOneLedger() = runBlocking {
+        val customA = "http://127.0.0.1:11434/v1"
+        val customB = "http://127.0.0.1:11435/v1"
         val cases = listOf(
             // Same @origin: factory reuses the id, VM hydrates.
             Triple("preset:openai@https://api.openai.com/gpt-4o-mini", openaiEndpoint(), true),
             // Stored explicit default port meets the live side.
             Triple("preset:openai@https://api.openai.com:443/gpt-4o-mini", openaiEndpoint(), true),
-            // Custom spelling variants agree through the full stack
-            // (endpoint -> effective baseUrl -> normalized origin).
-            Triple("preset:custom@http://127.0.0.1:11434/local-model", customEndpoint("http://127.0.0.1:11434/v1"), true),
-            Triple("preset:custom@http://127.0.0.1:11434/local-model", customEndpoint("HTTP://127.0.0.1:11434/v1"), true),
-            Triple("preset:custom@http://127.0.0.1:11434/local-model", customEndpoint("http://127.0.0.1:11434/other/path"), true),
+            // Stage1: the same custom URL re-derives the same entity id,
+            // so a same-URL reopen stays same-origin on both paths.
+            Triple(customHeader(customA), customEndpointV2(customA), true),
+            // Stage1: endpoint identity is URL-string-exact — a spelling
+            // variant or a different path under the same origin is a
+            // DISTINCT entity (no shared preset:custom namespace anymore),
+            // so both paths fork even though the origin matches.
+            Triple(customHeader(customA), customEndpointV2("HTTP://127.0.0.1:11434/v1"), false),
+            Triple(customHeader(customA), customEndpointV2("http://127.0.0.1:11434/other/path"), false),
             // Legacy headers without @origin: must fork on both paths, never hydrate.
             Triple("preset:openai/gpt-4o-mini", openaiEndpoint(), false),
             Triple("m", openaiEndpoint(), false),
             // Foreign provider / host / port: must fork on both paths.
             Triple("preset:deepseek/deepseek-chat", openaiEndpoint(), false),
             Triple("preset:openai@https://proxy.example.com/gpt-4o-mini", openaiEndpoint(), false),
-            Triple("preset:custom@http://127.0.0.1:11434/local-model", customEndpoint("http://127.0.0.1:11435/v1"), false),
+            Triple(customHeader(customA), customEndpointV2(customB), false),
+            // Stage1 migration quarantine: an old-shape preset:custom header
+            // never equals a per-endpoint id — same origin still forks.
+            Triple("preset:custom@http://127.0.0.1:11434/local-model", customEndpointV2(customA), false),
         )
         val probe = SettleProbeSessions(FakeSessionStore())
         val vm = chatViewModels.own(ChatViewModel(newStore(), probe, allowKeyReadPolicy()))
@@ -544,8 +600,12 @@ class ChatSessionFactoryProvenanceTest {
     }
 
     @Test fun open_sameProviderDifferentBaseUrlWithholdsModelContext() = runBlocking {
+        val customA = "http://127.0.0.1:11434/v1"
+        val customB = "http://127.0.0.1:11435/v1"
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "preset:custom@http://127.0.0.1:11434/local-model")
+        // Stage1: distinct custom URLs are distinct entities, so the stored
+        // header carries A's per-endpoint id.
+        val sid = transcripts.createSession("old chat", customHeader(customA))
         transcripts.appendEvent(event(sid, "r1", "user", "q1"))
         transcripts.appendEvent(event(sid, "r1", "assistant", "a1"))
 
@@ -555,7 +615,7 @@ class ChatSessionFactoryProvenanceTest {
                 emit(StreamEvent.Done("stop"))
             }
         }
-        val opened = factoryWith(transcripts, provider).open(customEndpoint("http://127.0.0.1:11435/v1"), sid)
+        val opened = factoryWith(transcripts, provider).open(customEndpointV2(customB), sid)
         try {
             assertTrue(opened.historyWithheld)
             opened.session.send("q2")
@@ -569,8 +629,9 @@ class ChatSessionFactoryProvenanceTest {
     }
 
     @Test fun open_sameProviderSameBaseUrlHydratesFirstRequest() = runBlocking {
+        val customA = "http://127.0.0.1:11434/v1"
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "preset:custom@http://127.0.0.1:11434/local-model")
+        val sid = transcripts.createSession("old chat", customHeader(customA))
         transcripts.appendEvent(event(sid, "r1", "user", "q1"))
         transcripts.appendEvent(event(sid, "r1", "assistant", "a1"))
 
@@ -580,7 +641,7 @@ class ChatSessionFactoryProvenanceTest {
                 emit(StreamEvent.Done("stop"))
             }
         }
-        val opened = factoryWith(transcripts, provider).open(customEndpoint("http://127.0.0.1:11434/v1"), sid)
+        val opened = factoryWith(transcripts, provider).open(customEndpointV2(customA), sid)
         try {
             assertFalse(opened.historyWithheld)
             opened.session.send("q2")
@@ -592,6 +653,47 @@ class ChatSessionFactoryProvenanceTest {
         } finally {
             opened.session.close()
         }
+    }
+
+    /**
+     * Stage1 compat: factory create/open fail closed on a legacy custom row
+     * (shared `preset:custom` entity id) BEFORE any vault read — the
+     * pre-staged fixed slot may hold another URL's key, so the row's URL/key
+     * binding is unprovable. The ViewModel already withholds the binding
+     * ([ChatViewModel.bindingOf] returns null); this pins the defense in
+     * depth for direct factory callers. Zero real keys/endpoints.
+     */
+    @Test fun legacyCustomEntityIdDeniedBeforeAnyVaultRead() = runBlocking {
+        val transcripts = FakeSessionStore()
+        var vaultAcquisitions = 0
+        val factory = ChatSessionFactory(
+            policy = allowKeyReadPolicy(),
+            vaultSource = VaultSource {
+                vaultAcquisitions++
+                val vault = EncryptedPrefsVault(InMemoryPrefs())
+                vault.putKey("preset:custom", "test-key-12345678".toCharArray())
+                vault
+            },
+            buildProvider = { _, _ -> ProvenanceFakeProvider() },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val legacy = customEndpoint("http://127.0.0.1:11434/v1")
+        try {
+            factory.create(legacy, "legacy must not create")
+            fail("legacy create must fail closed")
+        } catch (e: CaptureDeniedException) {
+            assertEquals("ENDPOINT_ID_LEGACY", e.message)
+        }
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        try {
+            factory.open(legacy, sid)
+            fail("legacy open must fail closed")
+        } catch (e: CaptureDeniedException) {
+            assertEquals("ENDPOINT_ID_LEGACY", e.message)
+        }
+        assertEquals(0, vaultAcquisitions)
     }
 
     @Test fun open_importedUnknownWithholdsModelContext() = runBlocking {

@@ -1,5 +1,7 @@
 package dev.librepocket.agent.ui.setup
 
+import dev.librepocket.preset.ProviderCatalog
+
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -13,6 +15,89 @@ class SetupValidationTest {
         assertEquals(
             "provider_key/preset:openai",
             SetupValidation.deriveApiKeyRef("preset:openai"),
+        )
+    }
+
+    @Test
+    fun deriveEndpointIdKeepsPresetIdsForBuiltins() {
+        assertEquals("preset:openai", SetupValidation.deriveEndpointId("openai", "https://api.openai.com/v1"))
+        assertEquals("preset:anthropic", SetupValidation.deriveEndpointId("anthropic", "https://api.anthropic.com"))
+    }
+
+    @Test
+    fun deriveEndpointIdIsolatesCustomUrlsStably() {
+        val urlA = "http://127.0.0.1:8123/v1"
+        val urlB = "http://127.0.0.1:8124/v1"
+        val idA = SetupValidation.deriveEndpointId("custom", urlA)
+        val idB = SetupValidation.deriveEndpointId("custom", urlB)
+        // Stable: same input re-derives the same id (rotation/model-only
+        // re-saves keep the entity).
+        assertEquals(idA, SetupValidation.deriveEndpointId("custom", urlA))
+        assertEquals(idA, SetupValidation.deriveEndpointId("custom", "  $urlA  "))
+        // Isolated: distinct URLs never share the providerId namespace, and
+        // neither collides with the legacy shared shape.
+        assertTrue(idA.startsWith("custom:"))
+        assertTrue(idB.startsWith("custom:"))
+        assertTrue(idA != idB)
+        assertTrue(idA != "preset:custom")
+        assertTrue(idB != "preset:custom")
+        // Vault/journal/provenance-safe charset: lowercase hex, fixed width.
+        for (id in listOf(idA, idB)) {
+            val hash = id.removePrefix("custom:")
+            assertEquals(32, hash.length)
+            assertTrue(hash.all { it in '0'..'9' || it in 'a'..'f' })
+        }
+    }
+
+    @Test
+    fun deriveEndpointIdMatchesPinnedVectorsAcrossRestarts() {
+        // Hardcoded vectors: derivation must be restart-stable (same input,
+        // same id, forever) so persisted rows re-derive identically after an
+        // upgrade. Any algorithm change must migrate stored rows explicitly —
+        // it must never silently fork every custom endpoint into legacy.
+        assertEquals(ProviderCatalog.CUSTOM_ID, "custom")
+        assertEquals(
+            "custom:9b514b1a65f6ebfaa4da53a116ea0038",
+            SetupValidation.deriveEndpointId(ProviderCatalog.CUSTOM_ID, "http://127.0.0.1:11434/v1"),
+        )
+        assertEquals(
+            "custom:a0507cea99932bea43520239cdcd6e82",
+            SetupValidation.deriveEndpointId(ProviderCatalog.CUSTOM_ID, "https://custom-a.example.com/v1"),
+        )
+    }
+
+    @Test
+    fun legacyEndpointIdDetectsOnlyPreStage1CustomRows() {
+        // Exact old shape: shared preset:custom id.
+        assertTrue(SetupValidation.isLegacyEndpointId("preset:custom", "custom", "http://127.0.0.1:8123/v1"))
+        // Hand-written junk for custom is legacy too (fail closed).
+        assertTrue(SetupValidation.isLegacyEndpointId("whatever", "custom", "http://127.0.0.1:8123/v1"))
+        // Current shapes pass.
+        val urlA = "http://127.0.0.1:8123/v1"
+        val current = SetupValidation.deriveEndpointId("custom", urlA)
+        assertTrue(!SetupValidation.isLegacyEndpointId(current, "custom", urlA))
+        // A respelled URL is a distinct entity (fail-closed direction).
+        assertTrue(SetupValidation.isLegacyEndpointId(current, "custom", "$urlA/"))
+        // Built-ins are unaffected.
+        assertTrue(!SetupValidation.isLegacyEndpointId("preset:openai", "openai", "https://api.openai.com/v1"))
+    }
+
+    @Test
+    fun policyResourceStaysPresetScoped() {
+        // Stage1 freezes authorization granularity: every endpoint under a
+        // preset — including per-URL custom entities — evaluates policy
+        // against the shared preset resource (Stage2 #13 revisits this).
+        assertEquals("preset:custom", SetupValidation.policyResourceForPreset("custom"))
+        assertEquals("preset:openai", SetupValidation.policyResourceForPreset("openai"))
+    }
+
+    @Test
+    fun displayLabelResolvesNewAndOldShapes() {
+        assertEquals("OpenAI", SetupValidation.displayLabelForEndpointId("preset:openai"))
+        assertEquals("自訂", SetupValidation.displayLabelForEndpointId("preset:custom"))
+        assertEquals(
+            "自訂",
+            SetupValidation.displayLabelForEndpointId(SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:8123/v1")),
         )
     }
 

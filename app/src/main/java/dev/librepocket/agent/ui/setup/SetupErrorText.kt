@@ -42,6 +42,7 @@ fun setupErrorText(code: String): String = when (code) {
     "PROVIDER_BAD_URL" -> "位址格式不正確。"
     "PROVIDER_URL_MUST_BE_HTTPS" -> "必須使用 https（本機/內網測試位址除外）。"
     "SETUP_KEY_TOO_SHORT" -> "金鑰太短（至少 8 字元），請檢查後重貼。"
+    "SETUP_MIGRATION_REKEY_REQUIRED" -> "偵測到舊版端點設定，已帶入位址與模型，請重新貼上金鑰儲存。"
     "PROVIDER_KEY_REF_BLANK", "PROVIDER_KEY_REF_MALFORMED" -> "內部參照異常，請重試。"
     "API key too short" -> "金鑰太短（至少 8 字元），請檢查後重貼。"
     "TEST_UNAUTHORIZED" -> "金鑰無效（認證失敗），請檢查後重貼。"

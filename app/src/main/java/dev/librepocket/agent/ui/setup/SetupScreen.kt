@@ -44,7 +44,9 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -111,6 +113,22 @@ fun SetupScreen(
     // First-run gate: no back escape (chat cannot work without an endpoint).
     BackHandler(enabled = isFirstRun) { }
 
+    // Legacy migration prefill: a quarantined pre-Stage1 custom row never
+    // gates Ready, so without this the form would show defaults and lose
+    // the saved address. One-shot + pristine-only inside the ViewModel: the
+    // key stays blank (re-paste required), user input is never clobbered.
+    LaunchedEffect(isFirstRun) {
+        if (isFirstRun) viewModel.prefillLegacyMigrationIfNeeded()
+    }
+    // Retryable migration status: a transient read failure leaves the probe
+    // RetryLater on a still-mounted first-run screen, where LaunchedEffect
+    // will not refire. Surface an explicit retry action instead (the prefill
+    // still re-verifies pristine/revision, so a stale tap cannot clobber).
+    // Single shared eligibility: renders exactly showMigrationRetry, so the
+    // visible button and the ViewModel gate can never drift apart.
+    val showMigrationRetry by viewModel.showMigrationRetry.collectAsStateWithLifecycle()
+    val screenScope = rememberCoroutineScope()
+
     LaunchedEffect(state.saved) {
         if (state.saved) {
             viewModel.consumeSaved()
@@ -147,6 +165,15 @@ fun SetupScreen(
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+
+        if (isFirstRun && showMigrationRetry) {
+            OutlinedButton(
+                onClick = { screenScope.launch { viewModel.prefillLegacyMigrationIfNeeded() } },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("重新載入舊版設定")
+            }
+        }
 
         // Stage F2 (#18)：gate 讀取未確認時在 SETUP 內提供非破壞性重試入口。
         // gate-first 發射序／transient 失敗後使用者可能靜止在此頁（舊守衛不導、

@@ -3,6 +3,7 @@ package dev.librepocket.agent.ui.chat
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
+import dev.librepocket.agent.ui.setup.SetupValidation
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
@@ -106,13 +107,16 @@ class ChatViewModelKeyReadS3Test {
     )
 
     private fun endpointB() = EndpointConfig(
-        providerId = "preset:custom",
+        // Stage1: stable per-endpoint entity id derived from the custom baseUrl.
+        providerId = SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"),
         presetId = "custom",
         label = "自訂",
         baseUrl = "http://127.0.0.1:11434/v1",
         protocol = ProviderProtocol.CHAT_COMPLETIONS,
         model = "local",
-        apiKeyRef = "provider_key/preset:custom",
+        apiKeyRef = SetupValidation.deriveApiKeyRef(
+            SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"),
+        ),
     )
 
     private class Harness(
@@ -132,7 +136,7 @@ class ChatViewModelKeyReadS3Test {
         val backend = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
             backend.putKey("preset:openai", "test-key-123".toCharArray())
-            backend.putKey("preset:custom", "test-key-456".toCharArray())
+            backend.putKey(SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"), "test-key-456".toCharArray())
         }
         val getKeyCalls = AtomicInteger(0)
         val countingVault = object : KeyVault {
@@ -228,7 +232,7 @@ class ChatViewModelKeyReadS3Test {
         // 重 peek B＋新 token 並確認：放行，後續送出恰一次成功。
         val snapshotB = h.vm.peekKeyReadBinding()
         assertNotNull(snapshotB)
-        assertEquals("preset:custom", snapshotB!!.providerId)
+        assertEquals(SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"), snapshotB!!.providerId)
         val tokenB = h.vm.peekKeyReadConfirmToken()
         assertNotNull(tokenB)
         assertTrue(h.vm.confirmKeyRead(snapshotB, tokenB))
@@ -313,7 +317,7 @@ class ChatViewModelKeyReadS3Test {
         // 重 peek 已是新 binding。
         val snapshot = h.vm.peekKeyReadBinding()
         assertNotNull(snapshot)
-        assertEquals("preset:custom", snapshot!!.providerId)
+        assertEquals(SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"), snapshot!!.providerId)
         assertEquals("http://127.0.0.1:11434/v1", snapshot.effectiveBaseUrl)
         // 顯示期間的 null 快照／null token 確認永遠失敗 closed。
         assertFalse(h.vm.confirmKeyRead(null, null))

@@ -7,6 +7,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okio.Buffer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -601,6 +602,224 @@ class McpProtocolContractsTest {
             assertNotNull(got)
             assertEquals(McpStatus.PROTOCOL, got!!.status)
             assertEquals(1, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    /** 以合法 JSON-RPC result body 配上給定 Content-Type，回傳 listTools 結果（CT 早擋鑑別力 fixture）。 */
+    private suspend fun listToolsWithContentType(contentType: String?): McpListResult {
+        val web = MockWebServer()
+        web.start()
+        try {
+            val resp = MockResponse().setResponseCode(200).setBody(
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                    "[{\"name\":\"a\",\"inputSchema\":{\"type\":\"object\"}}]}}",
+            )
+            if (contentType != null) resp.addHeader("Content-Type", contentType)
+            web.enqueue(resp)
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(),
+            )
+            return withTimeoutOrNull(5_000) { server.listTools() }
+                ?: error("5 秒內未回傳（CT=$contentType）")
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    // ---- Content-Type 三分支精判（只認精確 application/json） ----
+
+    @Test fun nearMissJsonContentTypesAreRejected() = runBlocking {
+        // 近似但非本子集型別：舊 `contains("json")` 會誤收——subtype 非精確 `json`
+        // 或 type 非 `application` 一律拒（fail-closed）。
+        for (ct in listOf(
+            "application/json-seq",
+            "application/ld+json",
+            "application/vnd.api+json",
+            "text/json",
+            "text/event-stream",
+            "application/xml",
+            "text/plain",
+        )) {
+            val got = listToolsWithContentType(ct)
+            assertEquals("CT=$ct 必須早擋 PROTOCOL", McpStatus.PROTOCOL, got.status)
+        }
+    }
+
+    @Test fun exactJsonContentTypeWithParamsIsAccepted() = runBlocking {
+        // 精確 application/json（含 charset 參數／大小寫變體）必須放行交 parser → OK。
+        for (ct in listOf(
+            "application/json",
+            "application/json; charset=utf-8",
+            "APPLICATION/JSON",
+        )) {
+            val got = listToolsWithContentType(ct)
+            assertEquals("CT=$ct 必須放行 → OK", McpStatus.OK, got.status)
+        }
+    }
+
+    @Test fun malformedContentTypeHeaderIsRejectedNotTreatedAsAbsent() = runBlocking {
+        // 畸形 CT（非 null 但解析不出 media type）：舊碼 body.contentType() 回 null
+        // 被當缺席放行；新碼取原始字串 → 拒（fail-closed）。
+        for (ct in listOf(
+            "application/",
+            "/json",
+            "json",
+            "application/json; charset",
+            " ",
+        )) {
+            val got = listToolsWithContentType(ct)
+            assertEquals("畸形 CT=$ct 必須拒（不得當缺席放行）", McpStatus.PROTOCOL, got.status)
+        }
+    }
+
+    @Test fun absentContentTypeIsLeftToParser() = runBlocking {
+        // 缺席 CT：放行交 parser 判定（相容 MockWebServer 預設）→ 合法 body 仍 OK。
+        val got = listToolsWithContentType(null)
+        assertEquals(McpStatus.OK, got.status)
+    }
+
+    // ---- 嚴格 UTF-8 解碼（非法序列拒，不靜默 U+FFFD） ----
+
+    @Test fun invalidUtf8BodyIsRejectedNotReplacementChar() = runBlocking {
+        // 鑑別力 fixture：孤立 0xFF 藏在 JSON **字串值內**。舊 `.string()` 靜默替換成
+        // U+FFFD（仍是合法 JSON 字元）→ parser 收下回 OK；新嚴格解碼拋
+        // mcp: invalid utf-8 → PROTOCOL。兩路徑結果相異，故能真正釘住嚴格解碼。
+        val prefix = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"a\",\"description\":\"x"
+        val suffix = "y\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        val badBytes = Buffer()
+            .writeString(prefix, Charsets.UTF_8)
+            .write(byteArrayOf(0xFF.toByte()))
+            .writeString(suffix, Charsets.UTF_8)
+
+        // (a) 傳輸層直接釘例外型別與訊息（不經 server 映射）。
+        val web0 = MockWebServer()
+        web0.start()
+        try {
+            web0.enqueue(
+                MockResponse().setResponseCode(200)
+                    .addHeader("Content-Type", "application/json")
+                    .setBody(badBytes.clone()),
+            )
+            val outcome = withTimeoutOrNull(5_000) {
+                runCatching {
+                    McpTransport().postJson(web0.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                }
+            }
+            assertNotNull("傳輸層必須回傳（成功或例外）", outcome)
+            val failure = outcome!!.exceptionOrNull()
+            assertTrue("非法 UTF-8 必須拋 McpProtocol，實際=$failure", failure is McpWire.McpProtocol)
+            assertEquals("mcp: invalid utf-8", failure!!.message)
+        } finally {
+            web0.shutdown()
+        }
+
+        // (b) server 層映射 PROTOCOL + 計熔斷一次（不 U+FFFD 充 OK）。
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(
+                MockResponse().setResponseCode(200)
+                    .addHeader("Content-Type", "application/json")
+                    .setBody(badBytes),
+            )
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = withTimeoutOrNull(5_000) { server.listTools() }
+            assertNotNull(got)
+            assertEquals("非法 UTF-8 必須 PROTOCOL（不得 U+FFFD 充 OK）", McpStatus.PROTOCOL, got!!.status)
+            assertEquals(1, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun leadingBomIsToleratedAndStripped() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}"
+            val withBom = Buffer().write(byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte()))
+                .writeString(json, Charsets.UTF_8)
+            web.enqueue(
+                MockResponse().setResponseCode(200)
+                    .addHeader("Content-Type", "application/json")
+                    .setBody(withBom),
+            )
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(),
+            )
+            val got = withTimeoutOrNull(5_000) { server.listTools() }
+            assertNotNull(got)
+            assertEquals("BOM 必須被剝除後正常解析 → OK", McpStatus.OK, got!!.status)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun doubleBomIsNotStrippedAndFailsClosed() = runBlocking {
+        // 「單一」BOM 限定：只剝前導一個 BOM。第二個 BOM 解碼成 U+FEFF 留在字串首，
+        // 非 JSON whitespace → parser 拒（bad envelope）→ PROTOCOL（不得當兩個都剝＝OK）。
+        val web = MockWebServer()
+        web.start()
+        try {
+            val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}"
+            val doubleBom = Buffer()
+                .write(byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte()))
+                .write(byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte()))
+                .writeString(json, Charsets.UTF_8)
+            web.enqueue(
+                MockResponse().setResponseCode(200)
+                    .addHeader("Content-Type", "application/json")
+                    .setBody(doubleBom),
+            )
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(),
+            )
+            val got = withTimeoutOrNull(5_000) { server.listTools() }
+            assertNotNull(got)
+            assertEquals("第二個 BOM 不得被剝（應 fail-closed PROTOCOL）", McpStatus.PROTOCOL, got!!.status)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun duplicateContentTypeHeadersAreRejected() = runBlocking {
+        // 多條 Content-Type（RFC 7230 §3.2.2 非法）：不得取最後一條放行——一律拒。
+        // 用 postJson 直釘傳輸層拋 McpProtocol（server 層會映射 PROTOCOL）。
+        val web = MockWebServer()
+        web.start()
+        try {
+            val resp = MockResponse().setResponseCode(200).setBody(
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}",
+            )
+            resp.addHeader("Content-Type", "text/html")
+            resp.addHeader("Content-Type", "application/json")
+            web.enqueue(resp)
+            val outcome = withTimeoutOrNull(5_000) {
+                runCatching {
+                    McpTransport().postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                }
+            }
+            assertNotNull(outcome)
+            val failure = outcome!!.exceptionOrNull()
+            assertTrue("重複 CT 必須拋 McpProtocol，實際=$failure", failure is McpWire.McpProtocol)
         } finally {
             web.shutdown()
         }

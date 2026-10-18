@@ -434,10 +434,23 @@ class McpTransportCancelTest {
             assertNotNull("合法 emoji JSON 必須完整回傳", got)
             assertEquals(body, got!!.second)
             assertFalse("不得含 replacement character", got.second!!.contains("\uFFFD"))
-            // Surrogate pair 完整：尾端不得是孤立 high/low surrogate。
+            // Surrogate pair 完整：掃描全字串，任何 high surrogate 必須配對 low surrogate
+            //（舊斷言只看單一字元且 `endsWith(last)` 幾乎恆假——taughtological，無鑑別力）。
             val text = got.second!!
-            val last = text[text.length - 20]
-            assertFalse("不得以孤立 surrogate 結尾", Character.isHighSurrogate(last) && text.endsWith(last.toString()))
+            var i = 0
+            var highCount = 0
+            while (i < text.length) {
+                val c = text[i]
+                if (Character.isHighSurrogate(c)) {
+                    assertTrue("high surrogate @ $i 必須配對 low surrogate", i + 1 < text.length && Character.isLowSurrogate(text[i + 1]))
+                    highCount++
+                    i += 2
+                } else {
+                    assertFalse("不得有孤立 low surrogate @ $i", Character.isLowSurrogate(c))
+                    i++
+                }
+            }
+            assertEquals("必須恰 10000 個完整 surrogate pair", 10_000, highCount)
             assertEquals(1, web.requestCount)
         } finally {
             web.shutdown()

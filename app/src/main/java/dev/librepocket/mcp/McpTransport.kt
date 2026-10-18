@@ -1,6 +1,9 @@
 package dev.librepocket.mcp
 
 import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.InternalCoroutinesApi
@@ -14,12 +17,12 @@ import okhttp3.CookieJar
 import okhttp3.Interceptor
 import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody
-import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Buffer
 import okio.BufferedSink
 
@@ -47,8 +50,11 @@ import okio.BufferedSink
  *   `proxySelector`／`connectionSpecs`／`protocols` 設定屬受信任的呼叫方元件
  *   （可繞過本層防禦——如外側 network interceptor 重加 `Retry-After: 0`），
  *   不在本層防禦邊界內（對齊 provider 同款界線）；
- * - 2xx 配非 JSON Content-Type（如 `text/event-stream`）早擋為 `McpProtocol`
- *   （不讀滿 body；缺席則交 parser 判定）；
+ * - 2xx 配 Content-Type 走三分支早擋（fail-closed，不讀滿 body）：只認精確
+ *   `application/json`；近似型別（`application/json-seq`／`application/ld+json`／
+ *   `text/json`／`application/vnd.*+json`）與畸形標頭一律早擋為 `McpProtocol`；
+ *   缺席才交 parser 判定（相容 MockWebServer 預設）；成功 body 另採嚴格 UTF-8
+ *   解碼（非法序列拋 `mcp: invalid utf-8`，見 [readBoundedBody]）；
  * - 回傳 null = 本步超時（呼叫方映射為 [McpStatus.TIMEOUT]，不重試）。
  */
 class McpTransport(
@@ -194,11 +200,18 @@ class McpTransport(
                             }
                             code to null
                         } else {
-                            // 子集聲明僅收 JSON：2xx 配非 JSON Content-Type（如 event-stream）
-                            // 即早擋（cancel + 拋 McpProtocol），不讀滿 256KiB 才判；
-                            // Content-Type 缺席則放行交 parser 判定（相容 MockWebServer 預設）。
-                            val ct = resp.body.contentType()
-                            if (ct != null && !ct.toString().contains("json", ignoreCase = true)) {
+                            // 三分支早擋（fail-closed，不讀滿 256KiB 才判）：
+                            // 缺席→放行交 parser（相容 MockWebServer 預設）；
+                            // 畸形→拒；合法但非 application/json→拒。
+                            // 只認精確 application/json（type/subtype 比對，`charset` 等
+                            // 參數忽略）。取原始標頭值以區分「缺席(null)」與「畸形(非 null
+                            // 但解析不出 media type)」——resp.body.contentType() 對畸形標頭
+                            // 回 null，會被誤當缺席放行。多條 Content-Type（RFC 7230 §3.2.2
+                            // 非法）一律拒，不取最後一條（resp.header() 只回最後一條）。
+                            val ctValues = resp.headers.values("Content-Type")
+                            if (ctValues.isNotEmpty() &&
+                                (ctValues.size != 1 || !ctValues.single().isJsonResponseContentType())
+                            ) {
                                 try {
                                     call.cancel()
                                 } catch (_: Exception) {
@@ -231,6 +244,25 @@ class McpTransport(
 private val JSON_MEDIA_TYPE: MediaType = "application/json; charset=utf-8".toMediaType()
 
 /**
+ * 回應 `Content-Type` 是否為本子集唯一接受的 `application/json`（嚴格 type/subtype 比對）。
+ *
+ * - 僅接受 media type 精確等於 `application/json`（[MediaType.type] / [MediaType.subtype]
+ *   皆為 `application` / `json`，大小寫不敏感——okhttp 已正規化為小寫）。
+ *   `charset` 等參數一律忽略（JSON 無 charset 參數語意）。
+ * - 刻意**拒**近似但非本子集型別：`application/json-seq`、`application/ld+json`、
+ *   `text/json`、`application/vnd.*+json` 等（subtype 非精確 `json`）。
+ * - **畸形**（無法解析為 media type，如缺 subtype、控制字元）→ [toMediaTypeOrNull]
+ *   回 null → 本函式回 false → 早擋（fail-closed；呼叫方以原始標頭字串區分
+ *   「缺席」與「畸形」，見 [postJson]）。
+ * - 「缺席」由呼叫方在拿原始字串時判斷（null 才放行交 parser），本函式只判「非缺席時
+ *   是否可接受」。
+ */
+internal fun String.isJsonResponseContentType(): Boolean {
+    val media = toMediaTypeOrNull() ?: return false
+    return media.type == "application" && media.subtype == "json"
+}
+
+/**
  * one-shot POST body：OkHttp 5.5.0 的 `408`、`421` 與 `recover()` 分支檢查到
  * `isOneShot` 即原樣回傳該回應、不再重送（同 provider `OneShotJsonBody`）。
  * 重送三道閘：`RetryAndFollowUpInterceptor` 本體有通用 `followUp.body.isOneShot()`
@@ -244,15 +276,17 @@ private val JSON_MEDIA_TYPE: MediaType = "application/json; charset=utf-8".toMed
  * 新建 body，單次消費不影響正常單發路徑。
  */
 internal class OneShotJsonBody(private val json: String) : RequestBody() {
-    private var written = false
+    // `writeTo` 可能被 OkHttp 於 IO 執行緒呼叫、tripwire 於另一緒程讀。`AtomicBoolean`
+    // 的 `compareAndSet` 同時提供跨界可見性（volatile 語意）與原子 test-and-set：
+    // 任一二次寫入必被擋下（`@Volatile` + check-then-act 僅保證可見性，理論上可競態雙寫）。
+    private val written = java.util.concurrent.atomic.AtomicBoolean(false)
     override fun contentType(): MediaType = JSON_MEDIA_TYPE
     override fun contentLength(): Long = json.toByteArray(Charsets.UTF_8).size.toLong()
     override fun isOneShot(): Boolean = true
     override fun writeTo(sink: BufferedSink) {
         // tripwire：任何重送路徑（政策回歸、攔截器鏈破壞 one-shot 保護）若二次
         // 寫入 body，大聲失敗而非靜默重複副作用（非 idempotent 工具的硬 invariant）。
-        check(!written) { "mcp: one-shot body replayed" }
-        written = true
+        check(written.compareAndSet(false, true)) { "mcp: one-shot body replayed" }
         sink.writeUtf8(json)
     }
 }
@@ -262,6 +296,16 @@ internal class OneShotJsonBody(private val json: String) : RequestBody() {
  * 原本的 method＋body，不檢查 `retryOnConnectionFailure(false)`。
  * `tools/call` 非 idempotent（MCP 工具預設 WRITE），重送即重複副作用，
  * 故一律移除該 header 讓 503 原樣回到呼叫方（同 provider 層做法）。
+ *
+ * 掛 **network** interceptor（非 application）：`RetryAndFollowUpInterceptor` 的
+ * 503＋Retry-After:0 分支在**所有** application/network 攔截器之後才評估 followUp，
+ * 故必須在 network 層（最靠近 socket、followUp 決策前）看到並剝除該 header，
+ * 應用層攔截器看到的回應已過時、來不及影響重送判定。
+ *
+ * 為**縱深**而非唯一防線：即便本剝除被繞過（如注入 client 的外側 network interceptor
+ * 重加 `Retry-After: 0`，屬受信任呼叫方元件、在本層防禦邊界外），POST body 仍是
+ * one-shot（[OneShotJsonBody.isOneShot]），`RetryAndFollowUpInterceptor` 的通用
+ * `followUp.body.isOneShot()` 閘會拒送。三道獨立閘疊加，任一回歸不致單點放行重送。
  */
 internal class RetryAfterStrip : Interceptor {
     override fun intercept(chain: Interceptor.Chain): Response {
@@ -297,6 +341,10 @@ internal class McpResponseTooLarge(message: String) : IOException(message)
  *
  * 未截斷才解碼回傳：絕不在 UTF-8 多位元組中間切開，不產生 replacement character；
  * 呼叫方永遠拿到完整 JSON 或明確例外，不會有半個 JSON 充 OK。
+ *
+ * 解碼採**嚴格** UTF-8（`CodingErrorAction.REPORT`）：孤立/過長/超範圍序列一律拋
+ * `mcp: invalid utf-8`（映射 PROTOCOL + 計熔斷），絕不靜默替換成 U+FFFD 半個 JSON 充 OK
+ *（舊 `.string()` 會靜默替換）。容忍單一 leading UTF-8 BOM（伺服器常見，剝除後解碼）。
  */
 private fun readBoundedBody(body: ResponseBody?, cancelCall: () -> Unit): String? {
     if (body == null) return null
@@ -319,7 +367,29 @@ private fun readBoundedBody(body: ResponseBody?, cancelCall: () -> Unit): String
         cancelCall()
         throw McpResponseTooLarge("mcp: response body reaches $byteCap bytes")
     }
-    val text = bytes.readByteArray().toResponseBody(body.contentType()).string()
+    val rawBytes = bytes.readByteArray()
+    // BOM 容錯：單一 leading UTF-8 BOM（EF BB BF）先剝除再解碼（部分伺服器會送）。
+    val bomOffset = if (
+        rawBytes.size >= 3 &&
+        rawBytes[0] == 0xEF.toByte() &&
+        rawBytes[1] == 0xBB.toByte() &&
+        rawBytes[2] == 0xBF.toByte()
+    ) {
+        3
+    } else {
+        0
+    }
+    val text = try {
+        Charsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+            .decode(ByteBuffer.wrap(rawBytes, bomOffset, rawBytes.size - bomOffset))
+            .toString()
+    } catch (_: CharacterCodingException) {
+        // 嚴格解碼失敗＝非法 UTF-8：fail-closed，映射 PROTOCOL + 計熔斷，
+        // 不用 U+FFFD 替換成半個 JSON 充 OK。
+        throw McpWire.McpProtocol("mcp: invalid utf-8")
+    }
     if (text.length > charCap) {
         throw McpResponseTooLarge("mcp: response body exceeds $charCap chars")
     }

@@ -255,26 +255,30 @@ def _extract_default_config(stripped: str) -> str | None:
     for the real block.
     """
     intervals = _string_intervals(stripped)
-    m = None
-    for cand in re.finditer(r"(?<![A-Za-z0-9_])android\s*\{", stripped):
-        if not _inside_string(cand.start(), intervals):
-            m = cand
-            break
-    if m is None:
+    android_candidates = [
+        cand for cand in re.finditer(r"(?<![A-Za-z0-9_])android\s*\{", stripped)
+        if not _inside_string(cand.start(), intervals)
+    ]
+    if not android_candidates:
         return None
+    if len(android_candidates) > 1:
+        raise TagVersionError("Gradle file must contain exactly one android block")
+    m = android_candidates[0]
     open_idx = m.end() - 1
     close_idx = _find_matching_brace(stripped, open_idx)
     if close_idx == -1:
         return None
     android_body = stripped[open_idx + 1 : close_idx]
     body_intervals = _string_intervals(android_body)
-    dm = None
-    for cand in re.finditer(r"(?<![A-Za-z0-9_])defaultConfig\s*\{", android_body):
-        if not _inside_string(cand.start(), body_intervals):
-            dm = cand
-            break
-    if dm is None:
+    default_candidates = [
+        cand for cand in re.finditer(r"(?<![A-Za-z0-9_])defaultConfig\s*\{", android_body)
+        if not _inside_string(cand.start(), body_intervals)
+    ]
+    if not default_candidates:
         return None
+    if len(default_candidates) > 1:
+        raise TagVersionError("Gradle file must contain exactly one defaultConfig block")
+    dm = default_candidates[0]
     open2 = dm.end() - 1
     close2 = _find_matching_brace(android_body, open2)
     if close2 == -1:
@@ -334,6 +338,27 @@ def parse_gradle_version(gradle_path: str) -> tuple[int, str]:
             )
         search_text = stripped
     intervals = _string_intervals(search_text)
+    # Reject files that declare more than one versionCode/versionName assignment
+    # (e.g. a literal inside a non-executed branch plus an effective dynamic
+    # assignment): the exactly-one gate applies to *all* assignments, not only
+    # the literal ones.
+    generic_code_matches = [
+        m for m in re.finditer(r"(?m)^\s*versionCode\s*=", search_text)
+        if not _inside_string(m.start(), intervals)
+    ]
+    generic_name_matches = [
+        m for m in re.finditer(r'(?m)^\s*versionName\s*=', search_text)
+        if not _inside_string(m.start(), intervals)
+    ]
+    if len(generic_code_matches) != 1:
+        raise TagVersionError(
+            f"Gradle file must contain exactly one versionCode assignment (found {len(generic_code_matches)})"
+        )
+    if len(generic_name_matches) != 1:
+        raise TagVersionError(
+            "Gradle file must contain exactly one versionName assignment "
+            f"(double-quoted, found {len(generic_name_matches)})"
+        )
     code_matches = [
         m for m in re.finditer(r"(?m)^\s*versionCode\s*=\s*([0-9]+)\s*$", search_text)
         if not _inside_string(m.start(), intervals)

@@ -129,8 +129,8 @@ fi
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 command -v mktemp >/dev/null 2>&1 || die "mktemp is required"
 command -v env >/dev/null 2>&1 || die "env is required"
-[ -f "$APKSIGNER" ] && [ -x "$APKSIGNER" ] || die "apksigner is unavailable or not executable: $APKSIGNER"
-[ -f "$AAPT" ] && [ -x "$AAPT" ] || die "aapt is unavailable or not executable: $AAPT"
+[ ! -L "$APKSIGNER" ] && [ -f "$APKSIGNER" ] && [ -x "$APKSIGNER" ] || die "apksigner is unavailable or not executable: $APKSIGNER"
+[ ! -L "$AAPT" ] && [ -f "$AAPT" ] && [ -x "$AAPT" ] || die "aapt is unavailable or not executable: $AAPT"
 [ -r "$SCRIPT_DIR/verify_release_apk.py" ] || die "release APK verifier is missing"
 [ -r "$SCRIPT_DIR/release_artifact_stage.py" ] || die "release artifact stage helper is missing"
 [ -d "$OUTPUT_PARENT" ] && [ ! -L "$OUTPUT_PARENT" ] && [ -w "$OUTPUT_PARENT" ] \

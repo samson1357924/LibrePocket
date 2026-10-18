@@ -1189,6 +1189,44 @@ class ReleaseTagVersionTest(unittest.TestCase):
         with self.assertRaises(tag_version.TagVersionError):
             tag_version.parse_gradle_version(str(path))
 
+    def test_multiple_default_config_blocks_are_rejected(self) -> None:
+        path = self.tmp / "multi-default.gradle.kts"
+        path.write_text(
+            "android {\n"
+            "    defaultConfig {\n"
+            '        versionCode = 1\n'
+            '        versionName = "0.1.0"\n'
+            "    }\n"
+            "    defaultConfig {\n"
+            '        versionCode = 9\n'
+            '        versionName = "9.9.9"\n'
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(tag_version.TagVersionError):
+            tag_version.parse_gradle_version(str(path))
+
+    def test_multiple_android_blocks_are_rejected(self) -> None:
+        path = self.tmp / "multi-android.gradle.kts"
+        path.write_text(
+            "android {\n"
+            "    defaultConfig {\n"
+            '        versionCode = 1\n'
+            '        versionName = "0.1.0"\n'
+            "    }\n"
+            "}\n"
+            "android {\n"
+            "    defaultConfig {\n"
+            '        versionCode = 9\n'
+            '        versionName = "9.9.9"\n'
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(tag_version.TagVersionError):
+            tag_version.parse_gradle_version(str(path))
+
 
 if __name__ == "__main__":
     unittest.main()

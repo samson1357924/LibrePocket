@@ -540,7 +540,10 @@ class OrderedTranscriptSinkErrorTest {
           scope.launch { runCatching { sink.onTurnStarted("run-park-2", "hi") } }
           writerParked.await()
           val flushed = scope.async { sink.flush(30_000) } // long timeout: the cancel below, never timeout
-          withTimeoutOrNull(5_000) { while (!sink.isSealed()) delay(10) }
+          // Guard budget tight to 2s: an unexpected seal would surface within
+          // ~10ms ticks, so a long budget only taxes the GOOD path (the loop
+          // always exhausts when the writer stays alive, as required here).
+          withTimeoutOrNull(2_000) { while (!sink.isSealed()) delay(10) }
             ?.let { fail("writer must stay alive in this control") }
           assertFalse("writer must be unsealed for the control", sink.isSealed())
           flushed.cancel()

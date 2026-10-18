@@ -36,6 +36,11 @@ import java.util.zip.ZipOutputStream
  * - 殘餘觀察：[SkillInstaller.listResiduals] 只列不刪（含歧義保留候選），
  *   計數與清理一致；
  *
+ * Skip 語義：symlink 案例以 [org.junit.Assume.assumeNoException] 在不支援
+ * symlink 的平台上跳過（未特權的 Windows FS 等）。綠但帶 skip 的 run 並非
+ * symlink 分支全覆蓋證明；CI 的 Linux runner 均可建 symlink，正式 gating 以
+ * CI 執行為準。
+ *
  * 測試 hook 採委託式：只擋指定 rename，其餘走真實 `from.renameTo(to)`，
  * 禁止「hook 回 true 卻沒搬」的空轉假成功。
  */

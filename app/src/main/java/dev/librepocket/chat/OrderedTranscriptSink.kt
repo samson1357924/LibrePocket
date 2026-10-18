@@ -449,8 +449,13 @@ class OrderedTranscriptSink(
         } catch (e: Throwable) {
           // Fatal Error (e.g. store AssertionError/LinkageError): fail this
           // entry's ack explicitly instead of reporting a false durable ack,
-          // then propagate so the writer seals like teardown. Never swallow
-          // and never continue draining behind a fatal.
+          // then propagate so the writer seals like teardown. The Error also
+          // LEAKS to the submitting caller on purpose: the failed ack delivers
+          // it verbatim to whoever is awaiting this entry (type and payload
+          // pinned by OrderedTranscriptSinkErrorTest). Never swallow, and
+          // never continue draining behind a fatal: after the seal the later
+          // cores fail fast instead of pretending durability survived an
+          // invariant break.
           failure = e
           if (entry.bestEffort && !(e is VirtualMachineError || e is ThreadDeath)) {
             // Non-VM fatal in an accounting entry must not seal the writer
@@ -1160,7 +1165,11 @@ class OrderedTranscriptSink(
    * Suspends until every event admitted so far is persisted, bounded by
    * [timeoutMs]. Returns true when the barrier drained (or, after [shutdown]
    * seals the channel, when the writer finished pre-seal work in time);
-   * false on timeout. Cancellation of the caller still propagates.
+   * false on timeout, and false when a buffered barrier was failed
+   * exceptionally by a writer-teardown seal race (the mapped seal-race
+   * shape below — the durable truth then flows through
+   * [hasDurableFailures]/[flushDurable] as usual). Cancellation of the
+   * caller still propagates.
    *
    * Note on durability: [flush] returns true once the barrier drains through the
    * writer, even if individual core entries encountered store exceptions and were
@@ -1192,6 +1201,13 @@ class OrderedTranscriptSink(
    * durable-failure truth then flows through [hasDurableFailures]/[flushDurable]
    * as usual. A caller cancellation, and any CE from a still-unsealed
    * writer, keep propagating (see the catch in the body).
+   * Contrast with the post-seal shape: a flush that arrives AFTER the seal
+   * never enqueues a barrier (ClosedSendChannelException) and instead joins
+   * the still-draining pre-seal tail ([writer.join]) — that writer-join
+   * wait completes normally and [flush] returns true even for a fatally
+   * sealed writer ([flushDurable] stays false; the post-fatal control pins
+   * both). The seal race only falsifies a barrier defeated mid-flight,
+   * never a barrier issued after the seal.
    */
   suspend fun flush(timeoutMs: Long = DEFAULT_FLUSH_TIMEOUT_MS): Boolean {
     // Writer-teardown seal-race signal: set when the buffered barrier was

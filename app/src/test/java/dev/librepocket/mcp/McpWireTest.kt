@@ -50,8 +50,10 @@ class McpWireTest {
     @Test fun resultAndErrorBothPresentRejected() {
         // result XOR error（Stage2，外部 review #2）：矛盾包不得擇一採納。
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2," +
+            // 錯誤碼用範圍外中性碼（1）：互斥檢查先於 code 分類，此測試只pin XOR，
+            // 不得依賴 server 範圍碼的分類結果（那由 serverErrorRangeCodesAreProtocol 釘）。
             "\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}," +
-            "\"error\":{\"code\":-32000,\"message\":\"boom\"}}"
+            "\"error\":{\"code\":1,\"message\":\"boom\"}}"
         try {
             McpWire.parseCall(json)
             fail("result+error 同時存在必須拒（McpProtocol）")

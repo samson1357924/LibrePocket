@@ -16,13 +16,15 @@ import kotlinx.coroutines.CancellationException
  * - 地址使用者配置（[McpServerConfig.baseUrl]），Key 走 [KeyVault] 加密存取；
  * - 方法：[listTools]（tools/list）+ [callTool]（tools/call）；回應須
  *   `jsonrpc=="2.0"`＋id 數值相符（固定 list=1／call=2）＋`result` XOR `error`，
- *   error 依 code 分類：協議/伺服器碼（-32700/-32600/-32601/-32603）→ PROTOCOL＋計熔斷，
- *   `-32602`/未知碼 → TOOL_ERROR 中性（message 透傳 [McpCallResult.errorMessage]，
+ *   error 形狀須含整數 `code` 與字串 `message`（缺／型別錯 → PROTOCOL＋計熔斷），
+ *   error 依 code 分類：協議/伺服器碼（-32700/-32600/-32601/-32603，及 JSON-RPC
+ *   保留 server 範圍 −32099..−32000）→ PROTOCOL＋計熔斷，
+ *   `-32602`/範圍外未知碼 → TOOL_ERROR 中性（message 透傳 [McpCallResult.errorMessage]，
  *   不進稽核）；非空 `nextCursor` → PARTIAL（不回 OK 假完整）；
  *   HTTP 400/404/405 → PROTOCOL＋計熔斷（非暫態配置錯；429/408 等仍 TRANSPORT）；
  * - 熔斷：連續失敗即開路（[McpCircuitBreaker]），開路期間短路為 CIRCUIT_OPEN；
- *   工具業務錯（`isError=true` 且具 content/structuredContent、`-32602`/未知碼 error 包）
- *   為中性，不重置亦不累計；協議碼 error 包（-32700/-32600/-32601/-32603）計熔斷
+ *   工具業務錯（`isError=true` 且具 content/structuredContent、`-32602`/範圍外未知碼
+ *   error 包）為中性，不重置亦不累計；協議碼與保留 server 範圍 error 包計熔斷
  *   （見上方法段）；result 兩鍵皆無屬形狀不完整 → 一律 PROTOCOL＋計熔斷
  *   （含 `isError=true` 但無內容的變體，見 [McpWire.parseCall]）；
  * - 超時：單次 15–30s（[McpTimeouts.clamp]），超時映射 TIMEOUT，不重試；
@@ -234,8 +236,9 @@ class McpServer(
                 val status = if (isError) McpStatus.TOOL_ERROR else McpStatus.OK
                 McpCallResult(config.id, toolName, status, clockMs() - start, resultJson, isError)
             } catch (e: McpWire.McpToolFailure) {
-                // 僅 -32602/未知碼 error 包會到此（協議碼於 parseCall 拋 McpProtocol
-                // → 下方 IAE catch → PROTOCOL + 計熔斷）；工具級錯誤中性，不碰熔斷計數。
+                // 僅 -32602/範圍外未知碼 error 包會到此（協議碼與保留 server 範圍
+                // −32099..−32000 於 parseCall 拋 McpProtocol → 下方 IAE catch
+                // → PROTOCOL + 計熔斷）；工具級錯誤中性，不碰熔斷計數。
                 // errorMessage 透傳伺服器 message（wire 層上限 200 UTF-16 code units；不進 auditMap）。
                 breaker.onNeutral()
                 McpCallResult(

@@ -215,6 +215,152 @@ class McpServerSemanticsTest {
         assertFalse(ok.second)
     }
 
+    @Test fun contentRequiredFieldsAreProtocol() {
+        // ContentBlock 必填欄位（外部 review P2-2）：有 type 但缺該型別必填資料
+        // 不得當成功——逐型別負向 fixtures ＋ 未知型別 fail-closed。
+        val bads = mapOf(
+            "{\"type\":\"text\"}" to "mcp: content missing text.text",
+            "{\"type\":\"text\",\"text\":123}" to "mcp: content bad text.text",
+            "{\"type\":\"text\",\"text\":null}" to "mcp: content missing text.text",
+            "{\"type\":\"image\",\"data\":\"AA==\"}" to "mcp: content missing image.mimeType",
+            "{\"type\":\"image\",\"mimeType\":\"image/png\"}" to "mcp: content missing image.data",
+            "{\"type\":\"image\",\"data\":123,\"mimeType\":\"image/png\"}" to
+                "mcp: content bad image.data",
+            "{\"type\":\"audio\",\"mimeType\":\"audio/wav\"}" to "mcp: content missing audio.data",
+            "{\"type\":\"resource\"}" to "mcp: content missing resource.resource",
+            "{\"type\":\"resource\",\"resource\":\"str\"}" to "mcp: content bad resource.resource",
+            "{\"type\":\"resource_link\",\"uri\":\"u\"}" to
+                "mcp: content missing resource_link.name",
+            // 未知型別訊息刻意靜態（不回顯伺服器字串 type 欄位）。
+            "{\"type\":\"\"}" to "mcp: unknown content type",
+            "{\"type\":\"future-block\"}" to "mcp: unknown content type",
+            // 四缺 fixture（reviewer 追加）：逐型別必填表每一欄位各有一個缺點，
+            // image 錯 mimeType 型別／audio 缺 mimeType／resource_link 缺 uri／
+            // resource_link 錯 name 型別。
+            "{\"type\":\"image\",\"data\":\"AA==\",\"mimeType\":123}" to
+                "mcp: content bad image.mimeType",
+            "{\"type\":\"audio\",\"data\":\"AA==\"}" to "mcp: content missing audio.mimeType",
+            "{\"type\":\"resource_link\",\"name\":\"n\"}" to
+                "mcp: content missing resource_link.uri",
+            "{\"type\":\"resource_link\",\"uri\":\"u\",\"name\":123}" to
+                "mcp: content bad resource_link.name",
+            // mustBeString=false→true 鑑別力（reviewer P3）：flag 誤改 false 時
+            // missing 案例訊息不變、測試仍綠——須有 bad-shape（非字串）案例才會紅。
+            "{\"type\":\"audio\",\"data\":\"AA==\",\"mimeType\":123}" to
+                "mcp: content bad audio.mimeType",
+            "{\"type\":\"resource_link\",\"uri\":123,\"name\":\"n\"}" to
+                "mcp: content bad resource_link.uri",
+            "{\"type\":\"text\",\"text\":{}}" to "mcp: content bad text.text",
+        )
+        for ((item, msg) in bads) {
+            val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+                "{\"content\":[$item],\"isError\":false}}"
+            try {
+                McpWire.parseCall(json, expectedId = 2L)
+                fail("壞 ContentBlock 必須拒：$item")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals(msg, e.message)
+            }
+        }
+        // 混合陣列：任一元素壞即整包拒（loop 覆蓋每個元素，非只第一個）。
+        val mixed = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":" +
+            "[{\"type\":\"text\",\"text\":\"ok\"},{\"type\":\"text\"}],\"isError\":false}}"
+        try {
+            McpWire.parseCall(mixed, expectedId = 2L)
+            fail("混合陣列中的壞元素必須拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: content missing text.text", e.message)
+        }
+        // 正例：已支援型別必填齊備＋未知鍵仍寬容（既有未知鍵政策不變）。
+        // 五型別全列（reviewer P3）：缺正例時「合法 block 也拒」的反轉 mutation 不會紅。
+        val ok = McpWire.parseCall(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":" +
+                "[{\"type\":\"text\",\"text\":\"hi\",\"extra\":1}," +
+                "{\"type\":\"image\",\"data\":\"AA==\",\"mimeType\":\"image/png\"}," +
+                "{\"type\":\"audio\",\"data\":\"AA==\",\"mimeType\":\"audio/wav\"}," +
+                "{\"type\":\"resource\",\"resource\":{\"uri\":\"u\"}}," +
+                "{\"type\":\"resource_link\",\"uri\":\"u\",\"name\":\"n\"}]," +
+                "\"isError\":false}}",
+            expectedId = 2L,
+        )
+        assertFalse(ok.second)
+    }
+
+    @Test fun validationResultOrderCombinedFixture() {
+        // 驗證順序 pin（reviewer 追加）：content 元素錯與 structuredContent 型別錯
+        // 同時存在 → content 元素驗證先跑（文件化的順序），訊息是 content missing。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+            "{\"content\":[{\"type\":\"text\"}],\"structuredContent\":[1],\"isError\":false}}"
+        try {
+            McpWire.parseCall(json, expectedId = 2L)
+            fail("驗證順序 fixture 必須拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: content missing text.text", e.message)
+        }
+        // 反向 pin：content 元素全好、structuredContent 型別錯 → 這時才是 bad structuredContent。
+        val scOnly = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+            "{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]," +
+            "\"structuredContent\":[1],\"isError\":false}}"
+        try {
+            McpWire.parseCall(scOnly, expectedId = 2L)
+            fail("structuredContent 陣列必須拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad structuredContent", e.message)
+        }
+    }
+
+    @Test fun badContentWithIsErrorTrueIsProtocolNotToolError() {
+        // 壞 content + isError:true（reviewer 追加）：形狀錯不得被 isError:true
+        // 蓋成 TOOL_ERROR（那會當中性業務錯、不計熔斷）。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+            "{\"content\":[{\"type\":\"text\"}],\"isError\":true}}"
+        try {
+            McpWire.parseCall(json, expectedId = 2L)
+            fail("壞 content + isError:true 必須 McpProtocol")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: content missing text.text", e.message)
+        }
+    }
+
+    @Test fun emptyContentArrayIsExplicitlyOk() {
+        // 空 content 陣列顯式 pin（reviewer 追加）：[] 是「有 content 鍵但零項目」
+        // ——合法形狀（非空 result、非壞元素），維持 OK/isError=false。
+        val (resultJson, isError) = McpWire.parseCall(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[],\"isError\":false}}",
+            expectedId = 2L,
+        )
+        assertFalse(isError)
+        assertEquals("[]", resultJson)
+    }
+
+    @Test fun contentMissingRequiredFieldMapsProtocolAndCountsBreaker() = runBlocking {
+        // E2E（外部 review P2-2 核心回歸）：200 + 只有 type 的 text block →
+        // PROTOCOL + 計熔斷；不得回 OK、不得 onSuccess 重置熔斷。
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+                        "{\"content\":[{\"type\":\"text\"}],\"isError\":false}}",
+                ),
+            )
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = deadline { server.callTool("t", "{}") }
+            assertEquals(McpStatus.PROTOCOL, got.status)
+            assertNull("PROTOCOL 路徑不得帶 resultJson", got.resultJson)
+            assertEquals("畸形 ContentBlock 必須計熔斷（不得 onSuccess）", 1, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
     @Test fun errorMessageTruncationIsSurrogateSafe() {
         // 截斷點落在 surrogate pair 中間時，孤立 high surrogate 必須被去掉
         //（否則渲染/序列化變 U+FFFD、出站名變 '?'）。
@@ -381,8 +527,10 @@ class McpServerSemanticsTest {
         }
     }
 
-    @Test fun errorPacketWithoutMessageSurfacesDefaultString() = runBlocking {
-        // 伺服器未提供 message → wire 層預設字串 "tool error"（KDoc 已文件化）。
+    @Test fun errorPacketWithoutMessageIsProtocolAndCountsBreaker() = runBlocking {
+        // 缺 message 的畸形 error 包（JSON-RPC 2.0 §5.1 必備欄位）：PROTOCOL + 計熔斷，
+        // 不得當中性工具錯、不得回退預設字串（外部 review P3-1）；
+        // PROTOCOL 路徑無 errorMessage（與 protocolErrorPathLeavesErrorMessageNull 同語義）。
         val web = MockWebServer()
         web.start()
         try {
@@ -391,15 +539,17 @@ class McpServerSemanticsTest {
                     "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602}}",
                 ),
             )
+            val breaker = McpCircuitBreaker()
             val server = McpServer(
                 config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
-                breaker = McpCircuitBreaker(),
+                breaker = breaker,
             )
             val got = deadline { server.callTool("t", "{}") }
-            assertEquals(McpStatus.TOOL_ERROR, got.status)
-            assertEquals("tool error", got.errorMessage)
+            assertEquals(McpStatus.PROTOCOL, got.status)
+            assertNull("PROTOCOL 路徑不得帶 errorMessage", got.errorMessage)
+            assertEquals("畸形 error 必須計熔斷（不得中性）", 1, breaker.failureCount())
         } finally {
             web.shutdown()
         }
@@ -482,7 +632,7 @@ class McpServerSemanticsTest {
 
     @Test fun isErrorResultMapsToToolErrorWithNullMessage() = runBlocking {
         // isError=true 結果路徑的 TOOL_ERROR：errorMessage 為 null（無伺服器 message，
-        // 詳情在 resultJson）——與 error 包路徑（預設字串）的分歧已文件化。
+        // 詳情在 resultJson）——與 error 包路徑（透傳伺服器 message、上限 200）的分歧已文件化。
         val web = MockWebServer()
         web.start()
         try {

@@ -15,8 +15,8 @@ import org.junit.Test
 /**
  * Stage2 envelope 完整性契約（外部獨立 review #2／#4）：
  * `jsonrpc=="2.0"`、id expectedId 校驗、result XOR error、
- * error code taxonomy（協議碼 → [McpWire.McpProtocol] → PROTOCOL + 計熔斷；
- * `-32602`/未知碼 → [McpWire.McpToolFailure] → TOOL_ERROR 中性）、
+ * error code taxonomy（協議碼與保留 server 範圍 −32099..−32000 → [McpWire.McpProtocol]
+ * → PROTOCOL + 計熔斷；`-32602`/範圍外未知碼 → [McpWire.McpToolFailure] → TOOL_ERROR 中性）、
  * request-shaped 拒、出站預檢（toolName 長度、arguments 上限）。
  *
  * 全程 MockWebServer／純 wire 解析，不連外網。
@@ -56,10 +56,13 @@ class McpEnvelopeTest {
     }
 
     @Test fun invalidParamsAndUnknownCodesAreToolFailure() {
-        // -32602（invalid params）與未知碼：工具級中性，message 保留伺服器文字。
+        // -32602（invalid params）與範圍外未知碼：工具級中性，message 保留伺服器文字。
+        //（−32000 已移出此清單：保留 server 範圍見 serverErrorRangeCodesAreProtocol——
+        // 外部 review P2-1 修正，舊 pin 把伺服器失敗鎖為中性是錯的。）
         val cases = mapOf(
             -32602 to "bad input",
-            -32000 to "boom",
+            -32100 to "just below range",
+            -31999 to "just above range",
             1 to "outer",
         )
         for ((code, msg) in cases) {
@@ -70,6 +73,52 @@ class McpEnvelopeTest {
             } catch (e: McpWire.McpToolFailure) {
                 assertEquals(msg, e.message)
             }
+        }
+    }
+
+    @Test fun serverErrorRangeCodesAreProtocol() {
+        // JSON-RPC 2.0 §5.1 保留 server 範圍（−32099..−32000）：伺服器端失敗，
+        // 非工具業務錯——與協議碼同待遇（外部 review P2-1；含邊界與範圍中點）。
+        for (code in listOf(-32099L, -32050L, -32000L)) {
+            val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":$code,\"message\":\"srv\"}}"
+            try {
+                McpWire.parseCall(json)
+                fail("server 範圍碼 $code 必須拋 McpProtocol")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: jsonrpc error $code", e.message)
+            }
+        }
+    }
+
+    @Test fun errorMessageIsRequiredString() {
+        // JSON-RPC 2.0 §5.1：error.message 必備 String。缺／非字串屬形狀不完整
+        //（外部 review P3-1）——不得默默當中性業務錯（否則畸形 error 永不計熔斷）。
+        val bads = listOf(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":1,\"message\":123}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":1,\"message\":null}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":1,\"message\":{}}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32700}}",
+            // server 範圍碼（−32099..−32000）缺 message 同樣 bad error：
+            // 形狀驗證先於 code 分類，不得因最終會計熔斷就跳過 message 檢查。
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32000}}",
+        )
+        for (bad in bads) {
+            try {
+                McpWire.parseCall(bad)
+                fail("缺／非字串 message 必須拒：$bad")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: bad error", e.message)
+            }
+        }
+        // 空字串 message 仍是合法 String（規格只要求型別）：維持中性工具錯。
+        try {
+            McpWire.parseCall(
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":1,\"message\":\"\"}}",
+            )
+            fail("空字串 message 必須走 McpToolFailure")
+        } catch (e: McpWire.McpToolFailure) {
+            assertEquals("", e.message)
         }
     }
 
@@ -200,39 +249,152 @@ class McpEnvelopeTest {
         )
     }
 
-    @Test fun oversizedInboundToolNameIsTruncatedNotRejected() {
-        // 不對稱政策 pin（已文件化）：入站（list 回應）超限名截到 128 後採納
-        //（保頁面可用），出站（callBody）直接拒——兩面各自鎖死，防政策漂移。
+    @Test fun oversizedInboundToolNameIsRejectedNotTruncated() {
+        // 對稱政策 pin（外部 review P3-3）：入站（list 回應）超限名與出站（callBody）
+        // 同待遇——整頁拒（[McpWire.McpProtocol]），不靜默截斷。截斷後名會被
+        // callBody 當成另一支工具真的送達伺服器，且 enabledTools／McpScope 以名為鍵，
+        // 前綴相同的長名碰撞即授權對象錯位，故 fail-closed。
         val name200 = "n".repeat(McpWire.TOOL_NAME_MAX_CHARS + 72)
         val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
             "[{\"name\":\"$name200\",\"inputSchema\":{\"type\":\"object\"}}]}}"
-        val tools = McpWire.parseList("s1", json, expectedId = 1L)
-        assertEquals(1, tools.size)
-        assertEquals(
-            "入站超限名必須截到 128",
-            McpWire.TOOL_NAME_MAX_CHARS,
-            tools[0].name.length,
-        )
+        try {
+            McpWire.parseList("s1", json, expectedId = 1L)
+            fail("入站超限名必須拒（不得截斷採納）")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals(
+                "mcp: tool name exceeds ${McpWire.TOOL_NAME_MAX_CHARS} chars",
+                e.message,
+            )
+        }
+        // 邊界值（恰 128）仍採納。
+        val exact = "n".repeat(McpWire.TOOL_NAME_MAX_CHARS)
+        val okJson = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"$exact\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        assertEquals(1, McpWire.parseList("s1", okJson, expectedId = 1L).size)
+        // 恰 129（+1）拒——不只測 200：界限本身必須被 pin（reviewer 追加）。
+        val one = "n".repeat(McpWire.TOOL_NAME_MAX_CHARS + 1)
+        val oneJson = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"$one\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        try {
+            McpWire.parseList("s1", oneJson, expectedId = 1L)
+            fail("129 units 名必須拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals(
+                "mcp: tool name exceeds ${McpWire.TOOL_NAME_MAX_CHARS} chars",
+                e.message,
+            )
+        }
+        // 129 units 含 emoji（127 n + 😀 = 129 units）：units 計數（非 code point），
+        // 含成對 surrogate 也一樣拒——改用 code point 計數此處即紅。
+        val emojiName = "n".repeat(McpWire.TOOL_NAME_MAX_CHARS - 1) + "😀"
+        assertEquals(McpWire.TOOL_NAME_MAX_CHARS + 1, emojiName.length)
+        val emojiJson = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"$emojiName\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        try {
+            McpWire.parseList("s1", emojiJson, expectedId = 1L)
+            fail("129 units（含 emoji）名必須拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals(
+                "mcp: tool name exceeds ${McpWire.TOOL_NAME_MAX_CHARS} chars",
+                e.message,
+            )
+        }
     }
 
-    @Test fun surrogateBoundaryTruncationAppliesToNameAndDescription() {
-        // P3 pin：name(128)/description(500) 呼叫點確實走 truncateUnits（非 take），
-        // 截斷點落在 surrogate pair 中間時退 1——改回 take 此處即紅
+    @Test fun limitConstantsArePinnedToLiterals() {
+        // 常數 literal pin（reviewer 追加）：KDoc 與外部文件引用的數字必須與
+        // 實作一致——改常數卻沒同步文件時，此測試先紅。
+        assertEquals(500, McpWire.DESCRIPTION_MAX_CHARS)
+        assertEquals(128, McpWire.TOOL_NAME_MAX_CHARS)
+    }
+
+    @Test fun callBodyRejectsLoneSurrogateToolName() {
+        // 出站孤立 surrogate（reviewer P3-6）：esc 不修 surrogate，UTF-8 編碼會變
+        // U+FFFD——送達名與列表名不一致（工具識別錯位），發送前拒。
+        for (bad in listOf("a\uD800", "a\uDC00", "\uD800\uD800", "x\uD800y")) {
+            try {
+                McpWire.callBody(bad, "{}")
+                fail("孤立 surrogate 出站名必須拒：${bad.map { it.code }}")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("mcp: tool name has lone surrogate", e.message)
+            }
+        }
+        // 成對 surrogate（emoji）名仍放行且原樣出現在請求體。
+        val okName = "t😀"
+        assertTrue(McpWire.callBody(okName, "{}").contains("\"name\":\"t😀\""))
+    }
+
+    @Test fun loneSurrogateInCallResponseIsRejected() {
+        // parseCall 路徑的孤立 surrogate（reviewer 追加）：回應 body 的字串值
+        // 同樣在 parser 層拒（與 list 路徑對稱），不因走 call 分支而放行。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":" +
+            "[{\"type\":\"text\",\"text\":\"x\\ud800\"}],\"isError\":false}}"
+        try {
+            McpWire.parseCall(json, expectedId = 2L)
+            fail("call 回應含孤立 surrogate 必須拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad envelope", e.message)
+        }
+    }
+
+    @Test fun surrogateBoundaryTruncationAppliesToDescription() {
+        // P3 pin：description(500) 呼叫點確實走 truncateUnits（非 take），截斷點
+        // 落在 surrogate pair 中間時退 1——改回 take 此處即紅
         //（errorMessage 呼叫點另有 errorMessageTruncationIsSurrogateSafe 釘住）。
+        // name 不再截斷（超限即拒，見 oversizedInboundToolNameIsRejectedNotTruncated），
+        // 限內含成對 emoji 者原樣保留（孤立 surrogate 由 loneSurrogateEscapeIsRejected 拒收）。
         val emoji = "😀" // 2 UTF-16 units
-        // name：127 個 n + emoji = 129 units，128 截斷落在 high surrogate → 退 1。
-        val name = "n".repeat(McpWire.TOOL_NAME_MAX_CHARS - 1) + emoji
-        // description：499 個 d + emoji = 501 units，500 截斷同理 → 退 1。
+        // name：126 個 n + emoji = 128 units（恰上限，成對 surrogate 不受影響）。
+        val name = "n".repeat(McpWire.TOOL_NAME_MAX_CHARS - 2) + emoji
+        assertEquals(McpWire.TOOL_NAME_MAX_CHARS, name.length)
+        // description：499 個 d + emoji = 501 units，500 截斷落在 high surrogate → 退 1。
         val desc = "d".repeat(499) + emoji
         val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
             "[{\"name\":\"$name\",\"description\":\"$desc\"," +
             "\"inputSchema\":{\"type\":\"object\"}}]}}"
         val tools = McpWire.parseList("s1", json, expectedId = 1L)
         assertEquals(1, tools.size)
-        assertEquals("name 截斷不得留孤立 surrogate", 127, tools[0].name.length)
+        assertEquals("name 限內成對 emoji 必須原樣保留", name, tools[0].name)
         assertEquals("description 截斷不得留孤立 surrogate", 499, tools[0].description.length)
-        assertFalse("name 尾不得是 high surrogate", tools[0].name.last().isHighSurrogate())
         assertFalse("description 尾不得是 high surrogate", tools[0].description.last().isHighSurrogate())
+    }
+
+    @Test fun descriptionTruncatedAtNamedLimit() {
+        // DESCRIPTION_MAX_CHARS 命名常數 pin：500 恰過、501 → 截到 500（截斷非拒絕）。
+        fun list(desc: String) = McpWire.parseList(
+            "s1",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                "[{\"name\":\"t\",\"description\":\"$desc\"," +
+                "\"inputSchema\":{\"type\":\"object\"}}]}}",
+            expectedId = 1L,
+        )[0].description
+        assertEquals(McpWire.DESCRIPTION_MAX_CHARS, list("d".repeat(500)).length)
+        assertEquals(McpWire.DESCRIPTION_MAX_CHARS, list("d".repeat(501)).length)
+    }
+
+    @Test fun loneSurrogateEscapeIsRejected() {
+        // 孤立 surrogate escape（語法合法、語意無效）：出站 esc／UTF-8 編碼會把它
+        // 變形為 U+FFFD，送達伺服器的名稱與列表不一致（工具識別錯位）——
+        // parseString fail-closed 拒收（比 RFC 嚴格，已文件化）。
+        // 缺形狀組合（reviewer 追加）：孤立 low 接在一般字元後、high 後接 high
+        //（非 low）——兩種都必須在 parser 層拒，不得當字面量放行。
+        for (bad in listOf(
+            "\\ud800", "\\udc00", "x\\ud800", "\\ud800x",
+            "x\\udc00", "\\ud800\\ud800", "\\udc00\\ud800",
+        )) {
+            val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                "[{\"name\":\"$bad\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+            try {
+                McpWire.parseList("s1", json, expectedId = 1L)
+                fail("孤立 surrogate 必須拒：$bad")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: bad envelope", e.message)
+            }
+        }
+        // 成對 escape（😀）合法通過且解碼為同一 emoji。
+        val paired = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"\\ud83d\\ude00\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        assertEquals("😀", McpWire.parseList("s1", paired, expectedId = 1L)[0].name)
     }
 
     @Test fun callBodyRejectsOversizedArguments() {
@@ -351,16 +513,57 @@ class McpEnvelopeTest {
         }
     }
 
+    @Test fun serverErrorRangeThroughServerOpensCircuit() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // 連續 server 範圍碼（−32099/−32001/−32000，伺服器端失敗）：必須計熔斷
+            // 並開路——修前被當中性業務錯（onNeutral），熔斷永不開路（外部 review P2-1）。
+            for (code in listOf(-32099, -32001, -32000)) {
+                web.enqueue(
+                    MockResponse().setResponseCode(200).setBody(
+                        "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":$code,\"message\":\"srv\"}}",
+                    ),
+                )
+            }
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            for (expected in 1..3) {
+                assertEquals(
+                    McpStatus.PROTOCOL,
+                    deadline { server.callTool("t", "{}") }.status,
+                )
+                assertEquals("server 範圍碼必須累計", expected, breaker.failureCount())
+            }
+            assertTrue("三次 server 範圍碼必須開路", breaker.isOpen())
+            assertEquals(
+                McpStatus.CIRCUIT_OPEN,
+                deadline { server.callTool("t", "{}") }.status,
+            )
+            assertEquals("開路後不得再發 HTTP", 3, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
     @Test fun invalidParamsStaysNeutralThroughServer() = runBlocking {
         val web = MockWebServer()
         web.start()
         try {
-            // -32602 仍工具級中性（既有 errorPacketIsNeutralDoesNotResetBreaker 語義）。
-            web.enqueue(
-                MockResponse().setResponseCode(200).setBody(
-                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"bad\"}}",
-                ),
-            )
+            // -32602 仍工具級中性：連發三次不得累計、不得開路
+            //（與 server 範圍碼的 serverErrorRangeThroughServerOpensCircuit 對照）。
+            repeat(3) {
+                web.enqueue(
+                    MockResponse().setResponseCode(200).setBody(
+                        "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"bad\"}}",
+                    ),
+                )
+            }
             web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
             val breaker = McpCircuitBreaker()
             val server = McpServer(
@@ -369,11 +572,15 @@ class McpEnvelopeTest {
                 transport = McpTransport(),
                 breaker = breaker,
             )
-            assertEquals(
-                McpStatus.TOOL_ERROR,
-                deadline { server.callTool("t", "{}") }.status,
-            )
-            assertEquals("-32602 必須中性", 0, breaker.failureCount())
+            repeat(3) {
+                assertEquals(
+                    McpStatus.TOOL_ERROR,
+                    deadline { server.callTool("t", "{}") }.status,
+                )
+                assertEquals("-32602 必須中性（不得累計）", 0, breaker.failureCount())
+            }
+            assertFalse("中性不得開路", breaker.isOpen())
+            // 其後真實失敗仍正常計數（中性未污染記帳）。
             assertEquals(
                 McpStatus.TRANSPORT,
                 deadline { server.callTool("t", "{}") }.status,

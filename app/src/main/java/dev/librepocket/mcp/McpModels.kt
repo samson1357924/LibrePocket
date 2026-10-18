@@ -104,8 +104,9 @@ data class McpListResult(
  *   [auditMap] 刻意不含 arguments 與 result。
  * @param errorMessage 伺服器 error 包的 message（上限 200 UTF-16 code units
  *   ＝surrogate-safe 截斷，見 [McpWire.truncateUnits]；
- *   僅 [McpStatus.TOOL_ERROR] 時非 null——伺服器未提供 message 時為
- *   wire 層預設字串 `tool error`；`isError=true` 結果路徑的 TOOL_ERROR
+ *   僅 [McpStatus.TOOL_ERROR] 時非 null——`message` 是 JSON-RPC 2.0 必備字串欄位，
+ *   缺／非字串屬形狀不完整，一律 PROTOCOL＋計熔斷（不會以預設字串充當，
+ *   外部 review P3-1）；`isError=true` 結果路徑的 TOOL_ERROR
  *   為 null——該路徑無伺服器 message，詳情在 [resultJson]）。
  *   隱私不變式：不進 [auditMap]。
  */

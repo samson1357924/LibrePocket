@@ -463,6 +463,31 @@ class McpProtocolContractsTest {
         }
     }
 
+    @Test fun userinfoInEndpointIsRejected() {
+        // userinfo（user@host／user:pass@host）形混淆：顯示主機與實際連線主機可被
+        // 分離（貼錯／釣魚網址形），Bearer／arguments 會送達與使用者認知不同的主機
+        // ——requireSecureEndpoint fail-closed 拒收（含回環 host 偽裝）。
+        for (bad in listOf(
+            "https://mcp.example.com@evil.com/mcp",
+            "https://user:pass@mcp.example.com/mcp",
+            "http://127.0.0.1@evil.com/mcp",
+            "http://user@127.0.0.1/mcp",
+            "https://user%40x@evil.com/mcp",
+        )) {
+            try {
+                McpWire.requireSecureEndpoint(bad)
+                fail("userinfo 端點必須拒：$bad")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("mcp: userinfo not allowed in endpoint", e.message)
+            }
+        }
+        // 無 userinfo 仍放行（bare-origin 自動補 /mcp 不變）。
+        assertEquals(
+            "https://mcp.example.com/mcp",
+            McpWire.requireSecureEndpoint("https://mcp.example.com"),
+        )
+    }
+
     @Test fun insecureEndpointBlockedWithoutVaultOrBreaker() = runBlocking {
         val counting = CountingVault()
         val breaker = McpCircuitBreaker()

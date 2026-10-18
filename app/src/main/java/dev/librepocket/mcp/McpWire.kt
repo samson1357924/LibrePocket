@@ -13,7 +13,8 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  *     "params":{"name":"..","arguments":{... raw json ...}}}`
  *   `argumentsJson` 呼叫方可預檢，本函仍自驗證 fail-closed（非 object 即拋，不發送）。
  * - tools/call 回應：`{"jsonrpc":"2.0","id":<n>,"result":{
- *     "content":[...],"isError":false}}`；或 `{"error":{"code":..,"message":".."}}`。
+ *     "content":[...],"isError":false}}`；或 `{"error":{"code":..,"message":".."}}`
+ *   （`code` 必備整數、`message` 必備字串——JSON-RPC 2.0 §5.1，缺/型別錯一律拒）。
  *
  * 注意：Token 永不進 body（builder 不收 token 參數，傳輸層只放標頭）。
  *
@@ -39,6 +40,13 @@ internal object McpWire {
     /** 輸入 Schema 字元上限：超限拒絕（拋 [McpProtocol]），不靜默截斷。 */
     internal const val INPUT_SCHEMA_MAX_CHARS = 8_192
 
+    /**
+     * tools/list description 字元上限：超限**截斷**（[truncateUnits]，surrogate-safe）
+     * 而非拒絕——描述僅供展示、不影響工具可用性，與 name（[TOOL_NAME_MAX_CHARS] 拒絕）
+     * 及 inputSchema（[INPUT_SCHEMA_MAX_CHARS] 拒絕）的政策區別在此。
+     */
+    internal const val DESCRIPTION_MAX_CHARS = 500
+
     /** tools/list 請求固定 id（單發子集；[McpServer] 收回應時以 expectedId=LIST_ID 校驗）。 */
     internal const val LIST_ID = 1L
 
@@ -46,10 +54,11 @@ internal object McpWire {
     internal const val CALL_ID = 2L
 
     /**
-     * 出站 toolName 字元上限（超限 [callBody] 拒絕不發送）。
-     * 不對稱政策（已測）：入站 [parseListPage] 超限名截到此上限後採納
-     * （保頁面可用；前綴相同的長名會碰撞成同名——`enabledTools`／`McpScope`
-     * 以截斷後名為鍵，屬已知取捨），出站 [callBody] 則直接拒。
+     * toolName 字元上限（入站 [parseListPage] 與出站 [callBody] 同政策，已測）：
+     * 入站超限名一律 [McpProtocol] 拒絕整頁（fail-closed，不靜默截斷——
+     * 截斷後名會被 [callBody] 當成另一支工具真的送達伺服器，且 `enabledTools`／
+     * `McpScope` 以名為鍵，前綴相同的長名碰撞會造成授權對象錯位）；
+     * 出站超限直接拒、不發送。
      */
     internal const val TOOL_NAME_MAX_CHARS = 128
 
@@ -57,7 +66,8 @@ internal object McpWire {
      * 出站 arguments 字元上限（值與回應字元上限 [McpTransport.RESPONSE_MAX_CHARS]
      * 同值但語意獨立：入站回應／出站 arguments 各管各的；
      * 超限拒絕不發送，訊息明指 arguments——不得誤稱 response。
-     * 注意為 UTF-16 code units 計數（64k emoji＝256KB，無出站位元組上限，
+     * 注意為 UTF-16 code units 計數：64,000 units 最壞 187.5 KiB（全 BMP 3-byte CJK，
+     * 64,000×3 B）或 125 KiB（全 astral emoji，32,000×4 B），無出站位元組上限，
      * 僅本地配置可控——伺服器可拒收）。
      */
     internal const val ARGUMENTS_MAX_CHARS = McpTransport.RESPONSE_MAX_CHARS
@@ -68,10 +78,38 @@ internal object McpWire {
     /**
      * 協議／伺服器端 JSON-RPC 錯誤碼（parse error／invalid request／method not found／
      * internal error）：表示協議不可互通或端點配置錯誤，[parseCall] 拋 [McpProtocol]
-     * （[McpServer] 映射 PROTOCOL + 計熔斷）。`-32602`（invalid params）與未知碼
-     * 屬工具級中性（[McpToolFailure]），見 [parseCall]。
+     * （[McpServer] 映射 PROTOCOL + 計熔斷）。`-32602`（invalid params）與
+     * （此集合及 [SERVER_ERROR_RANGE] 之外的）未知碼屬工具級中性（[McpToolFailure]），
+     * 見 [parseCall]。
      */
     private val PROTOCOL_ERROR_CODES = setOf(-32700L, -32600L, -32601L, -32603L)
+
+    /**
+     * JSON-RPC 2.0 §5.1 保留的 implementation-defined server error 範圍
+     * （−32099..−32000）：伺服器端失敗（後端不可用等），非工具業務錯。
+     * [parseCall] 與協議碼同待遇拋 [McpProtocol]（PROTOCOL + 計熔斷）——
+     * 否則持續回此類錯誤的伺服器會被當中性業務錯、熔斷永不開路（外部 review P2-1）。
+     * 與 [parseListPage] 對 list 端「error 包一律 PROTOCOL（含 −320xx）」一致。
+     * 未來子集若納入 resources 且需區分 MCP 自用碼（如 −32002 resource not found），
+     * 須先逐碼定義中性例外並補契約測試——目前 tools 子集無此通道。
+     */
+    private val SERVER_ERROR_RANGE = -32099L..-32000L
+
+    /**
+     * 已支援 ContentBlock 型別的必填欄位（MCP ContentBlock schema 子集；
+     * second＝true 表示必須為字串、false 表示必須為 object）：
+     * `text`→`text`；`image`／`audio`→`data`+`mimeType`；`resource`→`resource`；
+     * `resource_link`→`uri`+`name`。未知型別（含空字串）一律 [McpProtocol]
+     * ——本子集 fail-closed，不把「沒有實際內容的型別」當成功（外部 review P2-2）；
+     * `type` 之外的未知鍵仍寬容。未來納入新型別時逐碼擴充此表並補契約測試。
+     */
+    private val CONTENT_REQUIRED_FIELDS: Map<String, List<Pair<String, Boolean>>> = mapOf(
+        "text" to listOf("text" to true),
+        "image" to listOf("data" to true, "mimeType" to true),
+        "audio" to listOf("data" to true, "mimeType" to true),
+        "resource" to listOf("resource" to false),
+        "resource_link" to listOf("uri" to true, "name" to true),
+    )
 
     /**
      * RFC 8259 §2 的空白：僅 space/tab/LF/CR。Kotlin `isWhitespace()` 另接受
@@ -124,7 +162,8 @@ internal object McpWire {
     /**
      * 嚴格解析整份文件為 DOM。
      *
-     * 要求前導空白 + `{` 或 `[`（頂層必須是值；[parseList]/[parseCall] 再要求 object）、
+     * 要求前導空白 + `{` 或 `[`（頂層僅收 object/array——純量雖是 RFC 8259 合法
+     * JSON text，但不屬本子集，一律 bad envelope；[parseList]/[parseCall] 再要求 object）、
      * 嚴格走訪、尾隨僅空白；每層重複 key（解碼後比對）拋 `mcp: duplicate key`；
      * 深度 > 64 拋 `mcp: too deep`；其餘形狀錯誤拋 `mcp: bad envelope`。
      */
@@ -166,7 +205,7 @@ internal object McpWire {
         while (p < json.length) {
             val c = json[p++]
             when (c) {
-                '"' -> return JStr(sb.toString(), json.substring(start, p)) to p
+                '"' -> return JStr(requirePairedSurrogates(sb), json.substring(start, p)) to p
                 '\\' -> {
                     if (p >= json.length) throw McpProtocol("mcp: bad envelope")
                     when (val e = json[p++]) {
@@ -199,6 +238,35 @@ internal object McpWire {
             }
         }
         throw McpProtocol("mcp: bad envelope")
+    }
+
+    /**
+     * surrogate 配對校驗（比 RFC 8259 嚴格，刻意 fail-closed）：`"\uD800"` 類孤立
+     * surrogate escape 語法合法但語意無效——出站 [esc]／UTF-8 編碼會把它變形為
+     * U+FFFD，送達伺服器的名稱將與列表不一致（工具識別錯位），故一律拒收；
+     * 成對 escape（`😀`）逐 char append 後自然通過。
+     * 規格文本尚未納入本 repo（見 [McpWire] 修訂立場），此收緊屬子集政策。
+     */
+    private fun requirePairedSurrogates(sb: StringBuilder): String {
+        if (hasLoneSurrogate(sb)) throw McpProtocol("mcp: bad envelope")
+        return sb.toString()
+    }
+
+    /** 是否含未配對 surrogate（孤立 high、孤立 low、high 後接非 low）。 */
+    private fun hasLoneSurrogate(s: CharSequence): Boolean {
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            when {
+                c.isHighSurrogate() -> {
+                    if (i + 1 >= s.length || !s[i + 1].isLowSurrogate()) return true
+                    i += 2
+                }
+                c.isLowSurrogate() -> return true
+                else -> i++
+            }
+        }
+        return false
     }
 
     private fun parseObject(json: String, start: Int, depth: Int): Pair<JObj, Int> {
@@ -373,7 +441,11 @@ internal object McpWire {
      * 安全端點預驗（fail-closed，供 [McpServer] 在碰 vault／發送前呼叫）。
      *
      * - 空白即拋 `mcp: blank endpoint`；
-     * - 經 [endpoint] 正規化後必須能解析為 http(s) URL，否則拋 `mcp: bad endpoint`；
+     * - 經 [endpoint] 正規化後必須能解析為 http(s) URL，否則拋 `mcp: bad endpoint`
+     *   （解析在 userinfo 檢查之前——含 userinfo 的畸形 URL 會先得到 `mcp: bad endpoint`）；
+     * - 解析後 URL 不得含 userinfo（`user@host`／`user:pass@host`，拋
+     *   `mcp: userinfo not allowed in endpoint`）——顯示主機與實際連線主機可被
+     *   分離（貼錯／釣魚網址形），Bearer 與 arguments 會送達與使用者認知不同的主機；
      * - 僅放行 `https`，以及回環 `http`（`localhost`／`127.0.0.1`／`[::1]`，
      *   供 MockWebServer／本機開發；其餘 `http` 一律拋 `mcp: insecure endpoint`）。
      * 回傳正規化後 endpoint（可直接發送）。
@@ -386,6 +458,12 @@ internal object McpWire {
         } catch (_: Exception) {
             null
         } ?: throw IllegalArgumentException("mcp: bad endpoint")
+        // userinfo（user@host／user:pass@host）拒收：顯示主機與實際連線主機可被混淆
+        // （釣魚網址形），Bearer／arguments 會送達與使用者認知不同的主機
+        //（在 scheme 檢查之前擋下；okhttp 對無 userinfo 的 URL 回空字串，故用 isNullOrEmpty）。
+        if (parsed.username.isNotEmpty() || !parsed.password.isNullOrEmpty()) {
+            throw IllegalArgumentException("mcp: userinfo not allowed in endpoint")
+        }
         if (parsed.scheme == "https") return url
         if (parsed.scheme == "http" && isLoopbackHost(parsed.host)) return url
         throw IllegalArgumentException("mcp: insecure endpoint")
@@ -405,6 +483,9 @@ internal object McpWire {
      * - `toolName` 空白即拋（不送 `"name":""` 無效請求）；
      * - `toolName` 超 [TOOL_NAME_MAX_CHARS] 即拋（[parseList] 入站名同用此常數；
      *   出站同樣不放行超長名，不送可預期被拒的請求）；
+     * - `toolName` 含孤立 surrogate 即拋（[esc] 只轉義控制字元與引號，不修 surrogate；
+     *   出站後 UTF-8 編碼會把孤立 surrogate 變 U+FFFD——送達伺服器的名與列表名
+     *   不再一致，工具識別錯位，故發送前 fail-closed）；
      * - `argumentsJson` 必須是合法 JSON object 文本（空字串視為 `{}`），
      *   非 object（`null`／陣列／畸形）即拋，不發送；
      *   字元數超 [ARGUMENTS_MAX_CHARS] 即拋（訊息明指 arguments，非 response）；
@@ -414,6 +495,9 @@ internal object McpWire {
         require(toolName.isNotBlank()) { "mcp: blank tool name" }
         require(toolName.length <= TOOL_NAME_MAX_CHARS) {
             "mcp: tool name exceeds $TOOL_NAME_MAX_CHARS chars"
+        }
+        if (hasLoneSurrogate(toolName)) {
+            throw IllegalArgumentException("mcp: tool name has lone surrogate")
         }
         val args = argumentsJson.trim().ifEmpty { "{}" }
         if (args.length > ARGUMENTS_MAX_CHARS) {
@@ -485,14 +569,18 @@ internal object McpWire {
      * 驗 `jsonrpc=="2.0"`、`id` 存在／相符、request-shaped 拒；
      * tools/list 回應不得是 error 包：**error 鍵存在即拒**（含 `error:null`、
      * 含 result+error 矛盾包；不分 code：協議碼、`-32602`、未知碼、
-     * 暫態 `-320xx` 一律 [McpProtocol] PROTOCOL + 計熔斷——list 無業務錯通道，
+     * 保留 server 範圍（−32099..−32000）一律 [McpProtocol] PROTOCOL + 計熔斷——
+     * list 無業務錯通道，
      * 不當空列表、不採納）；只認頂層 `result` 包裝，
      * 再從 `result` 內取 `tools` 陣列；層級一律經 DOM 直接成員查找，
-     * 巢狀同名鍵不得遮蔽外層。inputSchema 超限拒絕不截斷；
-     * name 超限截到 [TOOL_NAME_MAX_CHARS]（與出站拒的不對稱政策見該常數 KDoc）、
+     * 巢狀同名鍵不得遮蔽外層。inputSchema 超限拒絕不截斷、缺席時預設
+     * `{"type":"object"}`（MCP 規格為必備欄位——已知規格偏差；null/字串/數字
+     * 等非 object 一律 bad inputSchema）；
+     * name 超 [TOOL_NAME_MAX_CHARS] 一律拒（與出站同政策，見該常數 KDoc）、
      * 空白／空名照收（列出即不可用——[callBody] 呼叫時拒，fail-closed 於使用點）、
      * description 非字串（含 null/數字/物件）降為空字串（描述欄位型別寬容，
-     * 不影響工具可用性）。
+     * 不影響工具可用性）、超 [DESCRIPTION_MAX_CHARS] 截斷（截斷 vs 拒絕的
+     * 政策區別見該常數 KDoc）。
      *
      * `nextCursor`（外部 review #3）：非空字串 → [McpListPage.hasMorePages]=true
      * （呼叫方映射 PARTIAL，不回 OK 假完整）；缺席／null／空字串 → false；
@@ -536,6 +624,11 @@ internal object McpWire {
                 if (item !is JObj) throw McpProtocol("mcp: bad tools item")
                 val nameVal = item.find("name")
                 if (nameVal !is JStr) throw IllegalArgumentException("mcp: tool without name")
+                // 超限名整頁拒（與出站 callBody 同政策）：截斷後名會被當成另一支工具
+                // 送達伺服器，且 enabledTools／McpScope 以名為鍵——前綴碰撞即授權錯位。
+                if (nameVal.v.length > TOOL_NAME_MAX_CHARS) {
+                    throw McpProtocol("mcp: tool name exceeds $TOOL_NAME_MAX_CHARS chars")
+                }
                 val descVal = item.find("description")
                 val desc = if (descVal is JStr) descVal.v else ""
                 val schemaVal = item.find("inputSchema")
@@ -549,8 +642,8 @@ internal object McpWire {
                 }
                 McpTool(
                     serverId = serverId,
-                    name = truncateUnits(nameVal.v, TOOL_NAME_MAX_CHARS),
-                    description = truncateUnits(desc, 500),
+                    name = nameVal.v,
+                    description = truncateUnits(desc, DESCRIPTION_MAX_CHARS),
                     inputSchema = schema,
                 )
             }
@@ -567,19 +660,22 @@ internal object McpWire {
      * `result` XOR `error`（外部 review #2）：先驗 `error` 型別（鍵存在即必須是 object，
      * `null`／字串／數字皆 [McpProtocol] `mcp: bad error`），再驗互斥
      * （object error ＋ 任何 `result` 鍵存在 → `mcp: result and error both present`）；
-     * `code` 必須是整數（缺 code／字串 code 一律 `mcp: bad error`，不靜默當業務錯）。
+     * `code` 必須是整數（缺 code／字串 code 一律 `mcp: bad error`，不靜默當業務錯）、
+     * `message` 必備且須為字串（JSON-RPC 2.0 §5.1；缺／非字串同樣 `mcp: bad error`
+     * ——形狀不完整不得默默當業務錯，否則畸形 error 永遠中性、不計熔斷，外部 review P3-1）。
      *
-     * error code 分類（外部 review #4）：
+     * error code 分類（外部 review #4＋本輪 server range 修正）：
      * - `-32700`／`-32600`／`-32601`／`-32603`（協議／伺服器端錯，見 [PROTOCOL_ERROR_CODES]）
+     *   及保留 server 範圍 −32099..−32000（見 [SERVER_ERROR_RANGE]）
      *   → 拋 [McpProtocol]（[McpServer] 映射 PROTOCOL + 計熔斷，breaker 能得知不互通）；
-     * - `-32602`（invalid params）與未知碼 → 拋 [McpToolFailure]（工具級中性；
+     * - `-32602`（invalid params）與範圍外未知碼 → 拋 [McpToolFailure]（工具級中性；
      *   message 取伺服器原文上限 200 UTF-16 code units（[truncateUnits]，
      *   不切 surrogate pair），由 [McpServer.callTool] 透傳至
      *   [McpCallResult.errorMessage]，不進 auditMap）。
      *
      * `code` 必須是整數字面量（不含指數／小數／溢位；否則 `mcp: bad error`）。
      * 注意不對稱：[parseList] 對任何 error 包（含 `-32602`/未知碼）一律
-     * [McpProtocol]（list 無業務錯通道，協議碼與暫態碼同等計熔斷）。
+     * [McpProtocol]（list 無業務錯通道，協議碼與保留 server 範圍碼同等計熔斷）。
      * 另注意 envelope 驗證先於 code 分類：規格合法的 `id:null` error 回應
      * （parse/invalid-request 場景）在 [requireResponseEnvelope] 即以
      * `mcp: missing id` 判 PROTOCOL＋計熔斷，不進 code 分類（更嚴，fail-closed）。
@@ -591,7 +687,11 @@ internal object McpWire {
      *   `content` 必備——此為已知規格偏差）；但存在時必須是陣列且**每個元素**是
      *   含字串 `type` 的 object（null／非陣列 → `mcp: bad content`；元素非 object
      *   或缺字串 type → `mcp: bad content item`——null 不視為缺席，與
-     *   `structuredContent` 的寬容 null 分歧）；
+     *   `structuredContent` 的寬容 null 分歧），且該型別的必填欄位齊備
+     *   （[CONTENT_REQUIRED_FIELDS]：缺欄位 → `mcp: content missing <type>.<field>`、
+     *   型別錯 → `mcp: content bad <type>.<field>`、未知型別 → `mcp: unknown content type`，
+     *   皆 [McpProtocol] PROTOCOL + 計熔斷——不得把無實際內容的畸形 block 當成功，
+     *   外部 review P2-2）；`type` 之外的未知鍵仍寬容；
      * - `result` 既無 `content` 又無 `structuredContent`（空 `{}`、或僅 `isError` 的
      *   無內容變體）→ [McpProtocol] `mcp: empty result`（不當成功、不當業務錯：
      *   形狀不完整一律 PROTOCOL + 計熔斷）；
@@ -627,10 +727,14 @@ internal object McpWire {
             val codeVal = errVal.find("code")
             val code = (codeVal as? JNum)?.raw?.toLongOrNull()
                 ?: throw McpProtocol("mcp: bad error")
+            // message 必備且須為字串（JSON-RPC 2.0 §5.1）：缺／非字串屬形狀不完整，
+            // 不得默默回退預設字串當業務錯（否則畸形 error 永遠中性、不計熔斷）。
             val msgVal = errVal.find("message")
-            val msg = if (msgVal is JStr) msgVal.v else "tool error"
-            if (code in PROTOCOL_ERROR_CODES) throw McpProtocol("mcp: jsonrpc error $code")
-            throw McpToolFailure(truncateUnits(msg, 200))
+            if (msgVal !is JStr) throw McpProtocol("mcp: bad error")
+            if (code in PROTOCOL_ERROR_CODES || code in SERVER_ERROR_RANGE) {
+                throw McpProtocol("mcp: jsonrpc error $code")
+            }
+            throw McpToolFailure(truncateUnits(msgVal.v, 200))
         }
         if (resultVal == null || resultVal is JNull) throw IllegalArgumentException("mcp: missing result")
         if (resultVal !is JObj) throw IllegalArgumentException("mcp: bad result")
@@ -638,12 +742,25 @@ internal object McpWire {
         if (contentVal != null && contentVal !is JArr) {
             throw McpProtocol("mcp: bad content")
         }
-        // 元素層驗證（fail-closed）：每個 content 元素必須是含字串 type 的 object
-        // （MCP ContentBlock 必備欄位）；[1]/["x"]/缺 type → 拒，不得原文透傳回 OK。
+        // 元素層驗證（fail-closed）：每個 content 元素必須是含字串 type 的 object，
+        // 且該型別的必填欄位齊備（[CONTENT_REQUIRED_FIELDS]）；[1]/["x"]/缺 type、
+        // 缺必填欄位、未知型別 → 拒，不得原文透傳回 OK（更不得由 onSuccess 重置熔斷）。
         if (contentVal is JArr) {
             for (item in contentVal.items) {
-                if (item !is JObj || item.find("type") !is JStr) {
-                    throw McpProtocol("mcp: bad content item")
+                val obj = item as? JObj ?: throw McpProtocol("mcp: bad content item")
+                val typeVal = obj.find("type")
+                if (typeVal !is JStr) throw McpProtocol("mcp: bad content item")
+                val required = CONTENT_REQUIRED_FIELDS[typeVal.v]
+                    // 訊息刻意靜態：type 欄位是伺服器字串，不得回顯進錯誤訊息
+                    //（回顯會讓伺服器控制的文字出現在上層錯誤呈現／稽核面）。
+                    ?: throw McpProtocol("mcp: unknown content type")
+                for ((field, mustBeString) in required) {
+                    val v = obj.find(field)
+                    if (v == null || v is JNull) {
+                        throw McpProtocol("mcp: content missing ${typeVal.v}.$field")
+                    }
+                    val shapeOk = if (mustBeString) v is JStr else v is JObj
+                    if (!shapeOk) throw McpProtocol("mcp: content bad ${typeVal.v}.$field")
                 }
             }
         }
@@ -674,11 +791,18 @@ internal object McpWire {
 
     class McpToolFailure(message: String) : IllegalArgumentException(message)
 
-    /** 協議形狀錯誤（inputSchema 超限、缺 result 等）：[McpServer] 映射為 PROTOCOL。 */
+    /**
+     * 協議形狀錯誤（envelope／error 形狀、inputSchema 超限、超長工具名等）：
+     * [McpServer] 映射為 PROTOCOL + 計熔斷。
+     * 注意 `mcp: missing result`／`mcp: bad result`／`mcp: bad result.tools`／
+     * `mcp: tool without name` 四類結果形狀錯刻意拋一般 [IllegalArgumentException]
+     * （與本類在 [McpServer] 同映射，行為無差異；型別區分由 McpWireD1Test 釘住）。
+     */
     class McpProtocol(message: String) : IllegalArgumentException(message)
 
     /**
-     * UTF-16 code-unit 截斷（[errorMessage][McpCallResult.errorMessage] 200／入站名 128）：
+     * UTF-16 code-unit 截斷（[errorMessage][McpCallResult.errorMessage] 200 與
+     * [description][DESCRIPTION_MAX_CHARS] 500——name 不截斷，超限即拒）：
      * 若截斷點落在 surrogate pair 中間，去掉尾端孤立 high surrogate——
      * 避免孤立 surrogate 序列化成 U+FFFD／'?'（出站名錯字、渲染亂碼）。
      */

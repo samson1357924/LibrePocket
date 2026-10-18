@@ -20,6 +20,7 @@ import dev.librepocket.provider.inferAggFailureCodeName
 import dev.librepocket.provider.streamingFlow
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
@@ -27,6 +28,7 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -64,6 +66,10 @@ private class ResExhaustRecordingSink : TranscriptSink {
   data class Tool(val runId: String, val toolIndex: Int, val id: String, val name: String, val args: String)
   val tools: MutableList<Tool> = Collections.synchronizedList(mutableListOf())
 
+  // P3/TEST: deterministic delivery latches (no wall-clock polling).
+  val failedLatch = CompletableDeferred<Unit>()
+  val toolLatch = CompletableDeferred<Unit>()
+
   override suspend fun onTurnStarted(runId: String, text: String) = Unit
   override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
   override suspend fun onTurnSucceeded(
@@ -73,7 +79,10 @@ private class ResExhaustRecordingSink : TranscriptSink {
     attemptIndex: Int?,
     hasReasoning: Boolean,
   ) = onTurnSucceeded(runId, text, hasReasoning)
-  override suspend fun onTurnFailed(runId: String, error: String) { failed.add(error) }
+  override suspend fun onTurnFailed(runId: String, error: String) {
+    failed.add(error)
+    failedLatch.complete(Unit)
+  }
   override suspend fun onTurnFailed(
     runId: String,
     partialText: String,
@@ -110,6 +119,7 @@ private class ResExhaustRecordingSink : TranscriptSink {
   override suspend fun onSteerQueued(text: String) = Unit
   override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) {
     tools.add(Tool(runId, toolIndex, id, name, argumentsJson))
+    toolLatch.complete(Unit)
   }
   override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
 }
@@ -145,11 +155,8 @@ class TurnControllerResourceExhaustedTest {
   }
 
   private fun awaitFailed(sink: ResExhaustRecordingSink) {
-    var guard = 0
-    while (sink.failed.isEmpty()) {
-      if (++guard > 800) fail("timed out waiting for transcript failure")
-      Thread.sleep(10)
-    }
+    // P3: deterministic latch instead of a 10ms poll loop.
+    runBlocking { withTimeout(5_000) { sink.failedLatch.await() } }
   }
 
   private fun assertSuppressed(
@@ -168,7 +175,12 @@ class TurnControllerResourceExhaustedTest {
       "transcript must carry the typed reason, got: ${sink.failed.single()}",
       sink.failed.single().contains(marker),
     )
-    Thread.sleep(300)
+    // P3: deterministic drain barrier instead of a 300ms absence sleep. The
+    // turn host has joined, so no turn-scoped write can be admitted after this
+    // flush; anything a poison-flush regression would have written is already
+    // delivered to the recording sink below. The boolean result is asserted so
+    // a drain timeout cannot vacuous-pass the absence check.
+    runBlocking { assertTrue("transcript drain timed out", c.flushTranscript(8_000)) }
     assertTrue("no poison-adjacent tool records may be persisted, got: ${sink.tools}", sink.tools.isEmpty())
     val body = c.uiState.value.messages.filter { it.role == "assistant" }.single().text
     assertFalse("resource-exhausted pending tools must leave no marker, got: ${body.take(120)}", body.contains("[tool:"))
@@ -351,12 +363,10 @@ class TurnControllerResourceExhaustedTest {
       assertEquals("poisoned stream must not be retried", 1, provider.streamCalls.get())
       awaitFailed(sink)
       assertEquals(1, sink.failed.size)
-      var guard = 0
-      while (sink.tools.isEmpty()) {
-        if (++guard > 800) fail("timed out waiting for preserved tool record")
-        Thread.sleep(10)
-      }
-      Thread.sleep(300)
+      // P3: deterministic tool-delivery latch + drain barrier instead of polls
+      // and a 300ms absence sleep (boolean asserted: no vacuous drain timeout).
+      runBlocking { withTimeout(5_000) { sink.toolLatch.await() } }
+      runBlocking { assertTrue("transcript drain timed out", c.flushTranscript(8_000)) }
       assertEquals("only the completed ToolDone survives, got: ${sink.tools}", 1, sink.tools.size)
       val kept = sink.tools.single()
       assertEquals(0, kept.toolIndex)

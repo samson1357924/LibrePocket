@@ -495,8 +495,10 @@ class ChatSessionLifecycleTest {
             assertEquals(0, vm.pendingRecoveryCount.value)
 
             chatMain.run { vm.send() }
-            withTimeout(5_000) { replacement.sendFinished.await() }
-            withTimeout(5_000) { while (replacement.sent.size != 2) delay(1) }
+            // P3: sendFinished is single-shot (already completed by the first
+            // send), so the real barrier for the second turn is the sent-size
+            // poll below — never a second await on the same deferred.
+            withTimeout(5_000) { while (replacement.sent.size < 2) delay(1) }
             assertEquals(
                 "returned batch and current op are each delivered once",
                 listOf("current", "queued"),
@@ -902,43 +904,36 @@ class ChatSessionLifecycleTest {
         store.save(endpoint())
         val sessions = ControlledSessions()
         val vm = newViewModel(store, sessions)
-        // Owner P2/TEST: a value-only latch cannot tell a stale pre-switch
-        // emission from the new generation (both are ["hello","ok"] — and no
-        // auto-reattach re-emits without another send). Record every messages
-        // emission across the switch instead: the fixed behavior never blanks
-        // (snapshotLiveToHistory keeps _history intact), while the old
-        // blanking behavior emits a steady [] here and fails below.
-        val seen = CopyOnWriteArrayList<List<String>>()
-        val emissions = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        // P3/TEST: fence on the projection GENERATION, never on a value.
+        // ["hello","ok"] is the projection before AND after the switch (a
+        // correct snapshot recomputes an equal value that StateFlow
+        // suppresses), so a value/emission latch is satisfied by the stale
+        // cache even when the invalidation reprojection blanks it. The
+        // generation-carrying pair in ChatViewModel always advances.
         try {
             chatMain.run { vm.sendDirect("hello") }
             val live = sessions.awaitCreated(1)
             live.sendFinished.await()
-            withTimeout(5_000) { vm.messages.first { it.size == 2 } }
-            assertEquals("session-1", vm.currentSessionId.value)
-            val baseline = CompletableDeferred<Unit>()
-            emissions.launch {
-                vm.messages.collect {
-                    seen.add(it.map { m -> m.text })
-                    if (it.size == 2) baseline.complete(Unit)
-                }
+            val preSwitch = withTimeout(5_000) {
+                vm.messagesProjection.first { it.messages.size == 2 }
             }
-            // Handshake: collector has observed the pre-switch baseline before
-            // invalidation, so an empty `seen` cannot vacuum-pass.
-            withTimeout(5_000) { baseline.await() }
+            assertEquals(listOf("hello", "ok"), preSwitch.messages.map { it.text })
+            assertEquals("session-1", vm.currentSessionId.value)
 
             store.save(endpoint().copy(model = "other-model"))
             withTimeout(5_000) { live.closed.await() }
             withTimeout(5_000) { vm.sessionState.first { it.messages.isEmpty() } }
-            // Steady-state read (no race — a blank would persist, as nothing
-            // reattaches without another send).
-            assertEquals(listOf("hello", "ok"), vm.messages.value.map { it.text })
-            assertEquals(2, vm.messages.value.size)
+            // Barrier: the first generation newer than the pre-switch one is
+            // the invalidation reprojection, so the read below can never be the
+            // stale pre-switch cache (deterministic red on a blanking
+            // regression, deterministic green with the snapshot intact).
+            val postSwitch = withTimeout(5_000) {
+                vm.messagesProjection.first { it.generation > preSwitch.generation }
+            }
+            assertEquals(listOf("hello", "ok"), postSwitch.messages.map { it.text })
+            assertEquals(2, postSwitch.messages.size)
             assertEquals("session-1", vm.currentSessionId.value)
-            // Negative: no blank emission across the whole switch window.
-            assertTrue("no blank emission across endpoint switch, got: $seen", seen.none { it.isEmpty() })
         } finally {
-            emissions.cancel()
             chatMain.run { vm.newChat() }
         }
     }
@@ -951,33 +946,26 @@ class ChatSessionLifecycleTest {
         store.save(endpoint())
         val sessions = ControlledSessions()
         val vm = newViewModel(store, sessions)
-        // Same generation barrier as F2 (see above): the ["one","ok"] latch
-        // below must observe the parked post-invalidation display, never a
-        // stale pre-switch emission.
-        val seen = CopyOnWriteArrayList<List<String>>()
-        val emissions = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        // Same projection-generation barrier as F2: the transcript must not
+        // blank across the switch, and the replacement session must really be
+        // created against the new binding.
         try {
             chatMain.run { vm.sendDirect("one") }
             val first = sessions.awaitCreated(1)
             first.sendFinished.await()
-            withTimeout(5_000) { vm.messages.first { it.size == 2 } }
-            val baseline = CompletableDeferred<Unit>()
-            emissions.launch {
-                vm.messages.collect {
-                    seen.add(it.map { m -> m.text })
-                    if (it.size == 2) baseline.complete(Unit)
-                }
+            val preSwitch = withTimeout(5_000) {
+                vm.messagesProjection.first { it.messages.size == 2 }
             }
-            withTimeout(5_000) { baseline.await() }
+            assertEquals(listOf("one", "ok"), preSwitch.messages.map { it.text })
 
             store.save(endpoint().copy(model = "other-model"))
             withTimeout(5_000) { first.closed.await() }
             withTimeout(5_000) { vm.sessionState.first { it.messages.isEmpty() } }
-            // Same steady-state barrier as F2 (see above): no auto-reattach
-            // without another send, so intact display must persist here.
-            assertEquals(listOf("one", "ok"), vm.messages.value.map { it.text })
-            assertEquals(2, vm.messages.value.size)
-            assertTrue("no blank emission across endpoint switch, got: $seen", seen.none { it.isEmpty() })
+            val postSwitch = withTimeout(5_000) {
+                vm.messagesProjection.first { it.generation > preSwitch.generation }
+            }
+            assertEquals(listOf("one", "ok"), postSwitch.messages.map { it.text })
+            assertEquals(2, postSwitch.messages.size)
 
             chatMain.run { vm.sendDirect("two") }
             val second = sessions.awaitCreated(2)
@@ -986,8 +974,10 @@ class ChatSessionLifecycleTest {
             assertEquals("session-2", vm.currentSessionId.value)
             assertEquals("", vm.input.value)
             assertNull(vm.notice.value)
+            // P3: the replacement was created against the NEW binding, not just
+            // "some session".
+            assertEquals("other-model", sessions.createdEndpoints[1].model)
         } finally {
-            emissions.cancel()
             chatMain.run { vm.newChat() }
         }
     }
@@ -1112,14 +1102,23 @@ class ChatSessionLifecycleTest {
             chatMain.run { vm.sendDirect("accepted text") }
             val live = sessions.awaitCreated(1)
             withTimeout(5_000) { live.hostEntered.await() }
-            withTimeout(5_000) { vm.messages.first { list -> list.any { it.text == "accepted text" } } }
+            val preSwitch = withTimeout(5_000) {
+                vm.messagesProjection.first { list -> list.messages.any { it.text == "accepted text" } }
+            }
 
             store.save(endpoint().copy(model = "other-model"))
 
             withTimeout(5_000) { live.closed.await() }
             assertEquals("", vm.input.value)
             assertNull(vm.notice.value)
-            assertTrue(vm.messages.value.any { it.text == "accepted text" })
+            // P3: fence on the projection generation. The state is quiet while
+            // the send gate holds, so the first newer generation is the
+            // post-invalidation reprojection; a raw vm.messages.value read can
+            // return the stale pre-switch cache.
+            val postSwitch = withTimeout(5_000) {
+                vm.messagesProjection.first { it.generation > preSwitch.generation }
+            }
+            assertTrue(postSwitch.messages.any { it.text == "accepted text" })
             assertEquals(listOf("accepted text"), live.sent.toList())
             assertEquals(1, sessions.createCalls)
         } finally {
@@ -3950,6 +3949,10 @@ class ChatSessionLifecycleTest {
         private val createCounter = AtomicInteger()
         private val openCounter = AtomicInteger()
         val createAttemptIds = CopyOnWriteArrayList<String>()
+        // P3/TEST: the binding each create() was called with, so tests can
+        // assert a post-switch send really used the new endpoint (not merely
+        // that some session was created).
+        val createdEndpoints = CopyOnWriteArrayList<EndpointConfig>()
         // S1: records the T0 allowAsk proof threaded into each factory call.
         // ALLOW authorizations must thread false (no proof); a consented ASK
         // threads true exactly once. Asserted by the S1 lifecycle tests.
@@ -3998,6 +4001,7 @@ class ChatSessionLifecycleTest {
             val ordinal = createCounter.incrementAndGet()
             val sessionId = "session-$ordinal"
             createAttemptIds.add(sessionId)
+            createdEndpoints.add(endpoint)
             seenAllowAsk.add(allowAsk)
             createGate(ordinal)
             val session = RecordingSession(sessionId, sendGate, acceptGate)

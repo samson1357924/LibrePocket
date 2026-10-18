@@ -262,6 +262,36 @@ class SessionTranscriptSinkUsageTest {
     }
 
     @Test
+    fun failedFlushRetainsUsageForLaterFlush() = runBlocking {
+        // P3: a swallowed usage-write fault must not lose the row — the entry
+        // moves to the bounded retained set (LRU) and a later flush persists
+        // it exactly once. Previously only the fault-swallow half was covered.
+        val store = SequentialFaultStore(setOf(1))
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onUsage("r1", 5, 6)
+        // Call #1 faults and is swallowed; nothing lands.
+        sink.flushBufferedUsageBestEffort("r1")
+        assertTrue("faulted flush must not persist a row", usageRows(store).isEmpty())
+        // Call #2 retries from the retained set: exactly one bare row.
+        sink.flushBufferedUsageBestEffort("r1")
+        val rows = usageRows(store)
+        assertEquals(1, rows.size)
+        assertEquals("usage input=5 output=6", rows.single().text)
+        assertEquals(null, rows.single().parentRunId)
+        assertEquals(null, rows.single().attemptIndex)
+        // Call #3 is a no-op, and a fresh notice afterwards must also drop: the
+        // successful flush marked the trailing window for this runId, so
+        // neither a re-flush nor a new onUsage may append a second row.
+        sink.flushBufferedUsageBestEffort("r1")
+        sink.onUsage("r1", 9, 9)
+        sink.flushBufferedUsageBestEffort("r1")
+        assertEquals(1, usageRows(store).size)
+        assertEquals("no third append may happen for a trailing run", 2, store.calls)
+    }
+
+    @Test
     fun successUsageFaultAfterCoreAckKeepsTerminal() = runBlocking {
         // Owner P1: usage rides outside the terminal unit — a usage-write
         // fault on a non-atomic fallback must not break the terminal.

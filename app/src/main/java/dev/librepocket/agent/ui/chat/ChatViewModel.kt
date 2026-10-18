@@ -33,6 +33,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
@@ -265,10 +266,42 @@ class ChatViewModel(
     private val _requestTrimmedCount = MutableStateFlow(0)
     val requestTrimmedCount: StateFlow<Int> = _requestTrimmedCount.asStateFlow()
 
+    /**
+     * Phase-3 test seam: atomic projection generation for [messages]. The
+     * pair publishes (generation, projected list) on every combine
+     * recomputation — including recomputations whose list equals the previous
+     * one, which the [messages] StateFlow suppresses. Lifecycle tests fence on
+     * a generation strictly newer than the one carrying a known state before
+     * reading, so a stale conflated value can never satisfy them and a
+     * regression that blanks the projection cannot hide behind the previous
+     * cached value.
+     */
+    @VisibleForTesting
+    internal data class MessagesProjection(
+        val generation: Long,
+        val messages: List<UiMessage>,
+    )
+
+    private val _messagesProjection = MutableStateFlow(MessagesProjection(0L, emptyList()))
+
+    /** Generation-carrying feed for [messages]; see [MessagesProjection]. */
+    @VisibleForTesting
+    internal val messagesProjection: StateFlow<MessagesProjection> = _messagesProjection.asStateFlow()
+
     val messages: StateFlow<List<UiMessage>> =
-        combine(_history, _sessionState) { history, live ->
-            history + live.messages.filter { it.role == "user" || it.role == "assistant" }
-        }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+        _messagesProjection.map { it.messages }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    init {
+        viewModelScope.launch {
+            combine(_history, _sessionState) { history, live ->
+                history + live.messages.filter { it.role == "user" || it.role == "assistant" }
+            }.collect { projected ->
+                _messagesProjection.value =
+                    MessagesProjection(_messagesProjection.value.generation + 1, projected)
+            }
+        }
+    }
 
     private val _currentSessionId = MutableStateFlow<String?>(null)
     val currentSessionId: StateFlow<String?> = _currentSessionId.asStateFlow()
@@ -3487,6 +3520,12 @@ class ChatViewModel(
             _pendingOpenSessionId.value = null
         }
         // F2: decouple transport invalidation from transcript display.
+        // Keep this block suspension-free: snapshotLiveToHistory may write
+        // _history while _sessionState still holds the same live rows, so a
+        // suspension between the two writes would project a transient
+        // duplicate tail ([u,a,u,a], duplicate ids) before _sessionState
+        // clears. Same-task writes let the projection collector resume once
+        // and observe only the settled pair.
         if (binding != null) snapshotLiveToHistory()
         releaseLiveAfterBoundedFlush()
         _sessionState.value = EMPTY_SESSION_STATE

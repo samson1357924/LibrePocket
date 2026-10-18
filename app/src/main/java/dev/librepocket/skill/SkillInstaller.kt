@@ -30,13 +30,15 @@ import java.util.zip.ZipInputStream
  *   注入（test-only，全域非隔離）同樣回滾：新鮮安裝無 target、覆蓋保留舊版）；kill -9 等崩潰窗口殘留由
  *   [cleanupStaleStaging] 收斂（窗口由測試鎖定：新鮮 staging、覆蓋中雙殘留、
  *   commit 後孤兒 bak、雙重失敗 bak；同 id 多份 bak 歧義時全保留待人工）。
- * - 啟動接線決策（#15：明確不接）：[cleanupStaleStaging] 尚未接入
- *   LibrePocketApp 啟動路徑——LibrePocketApp 仍為空殼、尚無 destRoot 目錄約定
- *   與登記表持久化，不硬造接線。殘餘記錄：孤兒僅限 destRoot 下嚴格形狀
- *   `.$id.tmp-…` / `.$id.bak-…`（真實 skill 目錄永不以 `.` 開頭，不會誤傷），
- *   可經 [listResiduals] 觀察、經下次 [cleanupStaleStaging] 收斂（回傳計數即
- *   收斂記錄）；接線時呼叫方須記錄回傳計數。未呼叫則孤兒留存，成功路徑的
- *   `.bak` 殘留同由下次清理收斂；
+ * - 啟動接線（#15：已接入）：[cleanupStaleStaging] 已於 [dev.librepocket.agent.LibrePocketApp]
+ *   `onCreate` 以 [STALE_STAGING_MAX_AGE_MILLIS] 呼叫，destRoot 由
+ *   [SkillPaths.skillRoot] 提供（`<filesDir>/skills`）。殘餘記錄：孤兒僅限
+ *   destRoot 下嚴格形狀 `.$id.tmp-…` / `.$id.bak-…`（真實 skill 目錄永不以 `.`
+ *   開頭，不會誤傷），可經 [listResiduals] 觀察、經 [cleanupStaleStaging]
+ *   收斂（回傳計數即收斂記錄）；啟動路徑已記錄回傳計數。
+ *   崩潰窗口還原不問齡期：target 缺席而單一的合法 `.bak` 存在時立即恢復
+ *   （否則預設 24h 內崩溃的版本要等一天）；僅有 target 在時的孤兒 `.bak`
+ *   與 staging 才受 [STALE_STAGING_MAX_AGE_MILLIS] 保護，避免誤刪進行中安裝。
  * - 同名 Skill 預設保持不變（需 `replace=true` 才覆蓋）。
  * - 降版政策（#15：揭露不擋）：`version` 為選填自由字串、無可靠全序，
  *   阻擋「降版」等於猜測比較，故永不因版本阻擋安裝；`replace=true` 已是
@@ -83,7 +85,13 @@ object SkillInstaller {
         data class Failure(val reason: SkillInstaller.Failure, val message: String) : Result
     }
 
-    /** 過期 staging 的預設保留期限（啟動清理用）。 */
+    /**
+     * 過期 staging／target 仍在時的孤兒 `.bak` 之預設保留期限（啟動清理用）。
+     *
+     * 只保護「進行中安裝」：新鲜 staging 未過期前不刪，避免誤刪另一行程刚啟動
+     * 的安裝。崩潰窗口還原（target 缺席的單一合法 `.bak`）不受此期限限制，
+     * 見 [cleanupStaleStaging]。
+     */
     const val STALE_STAGING_MAX_AGE_MILLIS = 24L * 60 * 60 * 1000L
 
     /** 同 skill 互斥鎖（per-skill 序列化併發安裝；distinct id 數量無界，條目永不驅逐，
@@ -111,6 +119,13 @@ object SkillInstaller {
 
     private fun rename(from: File, to: File): Boolean =
         renameHook?.invoke(from, to) ?: from.renameTo(to)
+
+    /** best-effort symlink 偵測（失敗時回 false，由呼叫端決定是否 fail-closed）。 */
+    private fun isSymlink(f: File): Boolean = try {
+        java.nio.file.Files.isSymbolicLink(f.toPath())
+    } catch (_: Exception) {
+        false
+    }
 
     /**
      * 測試接縫（僅測試用，全域可變，非執行緒隔離，同 [renameHook]）：
@@ -149,6 +164,15 @@ object SkillInstaller {
      * 不計數，需人工介入。檔名 nanoTime 後綴是單調計數器而非 wall-clock
      * 時間戳，不可跨重啟比較新舊，故不用後綴數字選「最新」。
      *
+     * 齡期語意（兩閾分離）：
+     * - **崩潰窗口還原**：target 缺席的單一合法 `.bak` **不問齡期**立即恢復
+     *   （否則預設 24h 內崩溃的版本要等一天，與「process restart 即恢復」矛盾）；
+     * - **進行中安裝保護**：新鲜 staging 與 target 仍在的孤兒 `.bak` 只在超過
+     *   [maxAgeMillis] 後才刪，避免誤刪另一行程刚啟動的安裝。
+     *
+     * [destRoot] 為 symlink 時直接回 0（與 [installFiles] 的防衛一致，避免
+     * 經 symlink 刪改外部目錄）。
+     *
      * 呼叫方契約：不應與 [installZip]/[installFiles] 對同一 [destRoot] 併發調用；
      * 本函式內僅對同一 id 取 per-skill 鎖做 best-effort 互斥（防與安裝提交交錯），
      * 跨 id 操作與 destRoot 建立仍需外部序列化。
@@ -157,6 +181,8 @@ object SkillInstaller {
      */
     fun cleanupStaleStaging(destRoot: File, maxAgeMillis: Long = STALE_STAGING_MAX_AGE_MILLIS): Int {
         if (!destRoot.isDirectory) return 0
+        // 與 installFiles 的防衛一致：destRoot 為 symlink 時不經它刪改外部目錄。
+        if (isSymlink(destRoot)) return 0
         val entries = try {
             destRoot.listFiles()
         } catch (_: Exception) {
@@ -179,7 +205,12 @@ object SkillInstaller {
             val stagingId = STAGING_RE.matchEntire(n)?.groupValues?.get(1)
             val bakId = if (stagingId != null) null else BACKUP_RE.matchEntire(n)?.groupValues?.get(1)
             if (stagingId == null && bakId == null) continue
-            if (now - f.lastModified() < maxAgeMillis) continue
+            // 崩潰窗口還原：target 缺席的合法 .bak 不問齡期即處理（否則預設
+            // 24h 內崩溃的版本要等一天）。其餘（staging／target 仍在的孤兒 bak）
+            // 受 maxAgeMillis 保護，避免誤刪進行中安裝。
+            val crashBak = bakId != null && SkillParser.isValidName(bakId) &&
+                !File(destRoot, bakId).exists()
+            if (!crashBak && now - f.lastModified() < maxAgeMillis) continue
             // 有效 id 的條目在 per-skill 鎖下操作，防與同 id 安裝提交交錯。
             val opId = stagingId?.takeIf { SkillParser.isValidName(it) }
                 ?: bakId?.takeIf { SkillParser.isValidName(it) }
@@ -245,6 +276,8 @@ object SkillInstaller {
     fun installedVersion(skillDir: File): String? {
         return try {
             val md = File(skillDir, SKILL_MD)
+            // 與 installFiles 的防衛一致：拒讀 symlink 型 SKILL.md（避免路徑逃逸讀取）。
+            if (isSymlink(md)) return null
             if (!md.isFile) return null
             SkillParser.parse(md.readText(Charsets.UTF_8)).manifest.version
         } catch (_: Exception) {
@@ -254,14 +287,20 @@ object SkillInstaller {
 
     /**
      * 殘餘觀察（不刪除、不恢復）：列出 [destRoot] 下已過期的安裝器內部條目
-     * （與 [cleanupStaleStaging] 同形狀同齡期規則），供啟動路徑接線前記錄殘餘。
+     * （與 [cleanupStaleStaging] 同形狀規則），供啟動路徑記錄殘餘。
      *
      * 與清理的差異：僅列形狀符合且過期者（含同 id 多份 bak 歧義候選——清理時
      * 全保留，此處一併列出供人工核對）；實際收斂仍以 [cleanupStaleStaging]
      * 回傳計數為準。回傳按檔名排序，保證穩定。
+     *
+     * 注意：崩潰窗口候選（target 缺席的新鮮 `.bak`）不在此列——它們一定會被
+     * [cleanupStaleStaging] 不問齡期立即還原，無需人工核對；本函式只列仍受
+     * [maxAgeMillis] 保護的過期 staging／target 仍在的孤兒 `.bak`。
      */
     fun listResiduals(destRoot: File, maxAgeMillis: Long = STALE_STAGING_MAX_AGE_MILLIS): List<File> {
         if (!destRoot.isDirectory) return emptyList()
+        // 與 cleanupStaleStaging 的防衛一致：symlink destRoot 不經它列外部目錄。
+        if (isSymlink(destRoot)) return emptyList()
         val entries = try {
             destRoot.listFiles()
         } catch (_: Exception) {
@@ -405,7 +444,6 @@ object SkillInstaller {
         )
         // 原子提交：staging 先寫入並 best-effort fsync，再同目錄 rename 切換；
         // 跨進程同 id 併發需外部序列化（staging/bak 後綴 nanoTime-tid 在跨進程可撞，撞即誤刪他方 staging）；
-        // replace 時舊版先搬到 .bak，成功後刪 bak，失敗回滾 bak。rename 失敗
         // replace 時舊版先搬到 .bak，成功後刪 bak，失敗回滾 bak。rename 失敗
         // 直接失敗並保留 from→to 根因，不退回拷貝。覆蓋成功另經 [installedVersion]
         // 帶回 replacedVersion（降版揭露，best-effort）。
@@ -620,8 +658,9 @@ object SkillInstaller {
         return null
     }
 
+    /** 路徑歸一（`/` 分隔、去 `./`、去前導 `/`）；反斜線由 [checkEntryName] 先行拒絕。 */
     private fun normalize(raw: String): String {
-        var s = raw.replace('\\', '/').trim()
+        var s = raw.trim()
         while (s.startsWith("./")) s = s.substring(2)
         // 壓掉中間的 "./"（保留 ".." 供上層拒絕，而非靜默歸一）。
         s = s.replace("/./", "/")

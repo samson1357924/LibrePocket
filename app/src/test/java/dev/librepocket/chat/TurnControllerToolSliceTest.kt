@@ -69,6 +69,8 @@ class TurnControllerToolSliceTest {
         data class Tool(val runId: String, val toolIndex: Int, val id: String, val name: String, val args: String)
         val tools: MutableList<Tool> = Collections.synchronizedList(mutableListOf())
         val cancelled: MutableList<Pair<String, String>> = Collections.synchronizedList(mutableListOf())
+        data class FailedRecord(val runId: String, val partialText: String, val error: String, val isFinal: Boolean)
+        val failedRecords: MutableList<FailedRecord> = Collections.synchronizedList(mutableListOf())
 
         override suspend fun onTurnStarted(runId: String, text: String) { started.add(runId to text) }
         override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) {
@@ -100,7 +102,9 @@ class TurnControllerToolSliceTest {
             parentRunId: String?,
             attemptIndex: Int?,
             isFinal: Boolean,
-        ) = Unit
+        ) {
+            failedRecords.add(FailedRecord(runId, partialText, error, isFinal))
+        }
         override suspend fun onTurnFailed(
             runId: String,
             partialText: String,
@@ -109,7 +113,9 @@ class TurnControllerToolSliceTest {
             attemptIndex: Int?,
             isFinal: Boolean,
             hasReasoning: Boolean,
-        ) = Unit
+        ) {
+            failedRecords.add(FailedRecord(runId, partialText, error, isFinal))
+        }
         override suspend fun onTurnCancelled(
             runId: String,
             partialText: String,
@@ -133,6 +139,16 @@ class TurnControllerToolSliceTest {
         override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
     }
 
+    /** Backend that returns a fixed symbol list (used to size tool results). */
+    private class FatBackend(private val symbols: List<LspTools.Symbol>) : LspTools.Backend {
+        val invocations = AtomicInteger(0)
+        override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+            invocations.incrementAndGet()
+            return symbols
+        }
+        override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+    }
+
     private fun policy(vararg rules: PolicyRule) = InMemoryPolicyStore(rules.toList())
 
     private fun slicePolicy(vararg extra: PolicyRule) = policy(
@@ -145,11 +161,13 @@ class TurnControllerToolSliceTest {
         policy: PolicyStore,
         backend: LspTools.Backend,
         switches: Map<String, Boolean> = mapOf("lsp" to true),
+        maxCallsPerTurn: Int = 1,
     ) = SafeToolSlice(
         ctxSupplier = { ProjectionContext(userSwitches = switches) },
         policy = policy,
         backend = backend,
         clock = fixedClock,
+        maxCallsPerTurn = maxCallsPerTurn,
     )
 
     private fun controller(
@@ -419,30 +437,23 @@ class TurnControllerToolSliceTest {
         assertTrue(c.uiState.value.messages.last { it.role == "assistant" }.text.contains("first answer stands"))
     }
 
-    @Test fun retryAfterContinuationFailureDoesNotReExecute() = runBlocking {
+    @Test fun retryAfterContinuationFailureReattachesExecutedPairWithoutReExecution() = runBlocking {
         // Turn-level budget: the retry after a retryable continuation failure
         // must not run the slice a second time, even if the model re-emits
-        // the tool call on the fresh attempt.
+        // the tool call on the fresh attempt — AND it must re-attach the
+        // already-executed structured pair (tools=[] on the wire) so the
+        // provider answers with the executed result in view, not blind.
         val provider = SliceProvider()
         val sink = SliceSink()
         val backend = CountingBackend()
         val pol = slicePolicy()
         val c = controller(provider, pol, sink, loop(pol, backend))
-        var continuations = 0
+        var responses = 0
         provider.handler = { request ->
-            if (request.messages.any { it.role == "tool" }) {
-                continuations++
-                flow {
-                    if (continuations == 1) {
-                        emit(StreamEvent.Failed("flaky continuation", retryable = true))
-                    } else {
-                        emit(StreamEvent.TextDelta(0, 0, "second round must never run"))
-                        emit(StreamEvent.Done("stop"))
-                    }
-                }
-            } else {
-                flow {
-                    if (continuations == 0) {
+            responses++
+            flow {
+                when (responses) {
+                    1 -> {
                         emit(
                             StreamEvent.ToolDone(
                                 toolIndex = 0,
@@ -452,7 +463,9 @@ class TurnControllerToolSliceTest {
                             ),
                         )
                         emit(StreamEvent.Done("tool_calls"))
-                    } else {
+                    }
+                    2 -> emit(StreamEvent.Failed("flaky continuation", retryable = true))
+                    else -> {
                         // Retry attempt: the model re-emits the call, but the
                         // slice must NOT run a second round this turn.
                         emit(
@@ -463,7 +476,8 @@ class TurnControllerToolSliceTest {
                                 argumentsJson = """{"query":"A"}""",
                             ),
                         )
-                        emit(StreamEvent.Done("tool_calls"))
+                        emit(StreamEvent.TextDelta(0, 0, "retry answer"))
+                        emit(StreamEvent.Done("stop"))
                     }
                 }
             }
@@ -472,11 +486,252 @@ class TurnControllerToolSliceTest {
 
         assertEquals(1, backend.invocations.get())
         assertEquals(3, provider.seenRequests.size)
-        assertTrue(provider.seenRequests[1].messages.any { it.role == "tool" })
-        assertTrue(provider.seenRequests[2].messages.none { it.role == "tool" })
+        // Continuation request: executed pair rides the wire, tools stay empty.
+        val cont = provider.seenRequests[1]
+        assertTrue(cont.tools.isEmpty())
+        assertEquals(listOf("call-a"), cont.messages.filter { it.role == "assistant" }.flatMap { it.toolCalls }.map { it.id })
+        assertEquals(listOf("call-a"), cont.messages.filter { it.role == "tool" }.map { it.toolCallId })
+        // Retried attempt: the executed pair is re-attached (tools stay empty),
+        // the record-only re-emission ("call-a2") never rides the wire.
+        val retry = provider.seenRequests[2]
+        assertTrue(retry.tools.isEmpty())
+        assertEquals(
+            listOf("call-a"),
+            retry.messages.filter { it.role == "assistant" }.flatMap { it.toolCalls }.map { it.id },
+        )
+        assertEquals(listOf("call-a"), retry.messages.filter { it.role == "tool" }.map { it.toolCallId })
+        assertTrue(retry.messages.none { it.role == "assistant" && it.toolCalls.any { it.id == "call-a2" } })
         assertEquals(ChatStatus.IDLE, c.uiState.value.status)
         assertEquals(listOf("call-a", "call-a2"), sink.tools.map { it.id })
         assertEquals(1, sink.succeeded.size)
+        assertTrue(sink.succeeded.single().second.contains("retry answer"))
+    }
+
+    @Test fun forcedRetryMissingTextDeltaKeepsToolResultAndNoTools() = runBlocking {
+        // A continuation that ends Done with no final text is an incomplete
+        // tool round: the controller forces a retryable failure. The retry
+        // must re-attach the executed pair with tools=[] (result preserved)
+        // and must not re-execute the slice.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        var responses = 0
+        provider.handler = { request ->
+            responses++
+            flow {
+                when (responses) {
+                    1 -> {
+                        emit(
+                            StreamEvent.ToolDone(
+                                toolIndex = 0,
+                                id = "call-a",
+                                name = "lsp.symbols",
+                                argumentsJson = """{"query":"A"}""",
+                            ),
+                        )
+                        emit(StreamEvent.Done("tool_calls"))
+                    }
+                    2 -> {
+                        // Continuation ends without any final TextDelta:
+                        // incomplete tool continuation → forced retry.
+                        emit(StreamEvent.Done("stop"))
+                    }
+                    else -> {
+                        emit(StreamEvent.TextDelta(0, 0, "answered now"))
+                        emit(StreamEvent.Done("stop"))
+                    }
+                }
+            }
+        }
+        c.send("查 A")
+
+        assertEquals(1, backend.invocations.get())
+        assertEquals(3, provider.seenRequests.size)
+        val retry = provider.seenRequests[2]
+        assertTrue(retry.tools.isEmpty())
+        assertEquals(listOf("call-a"), retry.messages.filter { it.role == "assistant" }.flatMap { it.toolCalls }.map { it.id })
+        assertEquals(listOf("call-a"), retry.messages.filter { it.role == "tool" }.map { it.toolCallId })
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+        assertEquals(listOf("call-a"), sink.tools.map { it.id })
+        assertEquals(1, sink.succeeded.size)
+        assertTrue(sink.succeeded.single().second.contains("answered now"))
+    }
+
+    @Test fun continuationAccountingIncludesToolCallsPayloadAndTrims() = runBlocking {
+        // Request-level budget regression: the continuation accounting must
+        // count the structured assistant toolCalls payload (the args echo
+        // alone can reach MAX_INPUT_CHARS), not only ChatMessage.text. The
+        // history length is calibrated so the discriminator holds: a
+        // TEXT-ONLY accounting of the whole continuation fits the cap —
+        // 98,500 history + the two user rows and time block (~100) + the
+        // ~1.3k tool result ≈ 99.9k ≤ MAX_REQUEST_CHARS — so pre-fix
+        // code skips the trim entirely and ships ≈104k serialized (this
+        // assert would fail), while counting the structured toolCalls
+        // payload (id + name + 4k args echo) breaches the cap, so the
+        // builder head-trims until the serialized accounting fits
+        // MAX_REQUEST_CHARS (the other exit being the typed over-budget
+        // fail-close).
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        val nearCapHistory = "a".repeat(98_500)
+        val echoArgs = """{"query":"${"x".repeat(4_000)}"}"""
+        var responses = 0
+        provider.handler = { _ ->
+            responses++
+            flow {
+                when (responses) {
+                    1 -> {
+                        emit(StreamEvent.TextDelta(0, 0, nearCapHistory))
+                        emit(StreamEvent.Done("stop"))
+                    }
+                    2 -> {
+                        emit(
+                            StreamEvent.ToolDone(
+                                toolIndex = 0,
+                                id = "call-a",
+                                name = "lsp.symbols",
+                                argumentsJson = echoArgs,
+                            ),
+                        )
+                        emit(StreamEvent.Done("tool_calls"))
+                    }
+                    else -> {
+                        emit(StreamEvent.TextDelta(0, 0, "trimmed answer"))
+                        emit(StreamEvent.Done("stop"))
+                    }
+                }
+            }
+        }
+        c.send("seed")
+        c.send("查 A")
+
+        assertEquals(1, backend.invocations.get())
+        assertEquals(3, provider.seenRequests.size)
+        val cont = provider.seenRequests[2]
+        assertTrue(cont.tools.isEmpty())
+        assertEquals(listOf("call-a"), cont.messages.filter { it.role == "assistant" }.flatMap { it.toolCalls }.map { it.id })
+        assertTrue(cont.messages.any { it.role == "tool" })
+        // Serialized accounting (text + structured toolCalls) over the
+        // outgoing continuation request stays within the request cap; a
+        // text-only accounting would have skipped the trim entirely.
+        val payload = cont.messages
+            .sumOf { m -> m.text.length + m.toolCalls.sumOf { it.id.length + it.name.length + it.argumentsJson.length } }
+        assertTrue(payload <= TurnController.MAX_REQUEST_CHARS)
+        assertTrue("continuation must head-trim once the args echo rides along", c.requestTrimmedCount.value > 0)
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+        assertEquals(2, sink.succeeded.size)
+        assertTrue(sink.succeeded.last().second.contains("trimmed answer"))
+    }
+
+    @Test fun continuationUntrimmableOverBudgetFailsClosedWithoutSending() = runBlocking {
+        // Fail-closed exit: when even the untrimmable minimum (the newest
+        // base row — here the near-admission-cap user message — plus the
+        // structured round) exceeds MAX_REQUEST_CHARS, the turn fails closed
+        // with a typed non-retryable terminal and the over-cap continuation
+        // request is never sent to the provider.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val fatBackend = FatBackend(
+            (1..12).map {
+                LspTools.Symbol(
+                    "\"".repeat(SafeToolSlice.MAX_STRING_CHARS),
+                    "function",
+                    "p".repeat(SafeToolSlice.MAX_STRING_CHARS),
+                    it,
+                )
+            },
+        )
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, fatBackend))
+        val fatResultUser = "a".repeat(90_000)
+        provider.handler = { _ ->
+            flow {
+                emit(
+                    StreamEvent.ToolDone(
+                        toolIndex = 0,
+                        id = "call-a",
+                        name = "lsp.symbols",
+                        argumentsJson = """{"query":"A"}""",
+                    ),
+                )
+                emit(StreamEvent.Done("tool_calls"))
+            }
+        }
+        c.send(fatResultUser)
+
+        // The round executed exactly once, but the continuation was never
+        // sent: only the attempt request reached the provider.
+        assertEquals(1, fatBackend.invocations.get())
+        assertEquals(1, provider.seenRequests.size)
+        assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+        assertTrue(c.uiState.value.error.orEmpty().contains("over budget"))
+        assertTrue(sink.succeeded.isEmpty())
+        // Fail-closed durability is observable: the failed terminal was
+        // recorded with the persisted executed-round marker.
+        assertEquals(1, sink.failedRecords.size)
+        val failedRecord = sink.failedRecords.single()
+        assertTrue(failedRecord.isFinal)
+        assertEquals("continuation request over budget", failedRecord.error)
+        assertTrue(failedRecord.partialText.contains("[tool-result:lsp.symbols"))
+    }
+
+    @Test fun continuationRoundLevelBudgetFailsClosedWithEightMaxCalls() = runBlocking {
+        // Round-level bound: each single result respects MAX_RESULT_CHARS,
+        // but maxCallsPerTurn=8 lets the round compound to ~8× the per-result
+        // cap — far above MAX_REQUEST_CHARS. The request-level accounting
+        // catches the compounding and fails closed instead of shipping an
+        // oversized request (the single-result cap alone cannot guarantee a
+        // request bound).
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val fatBackend = FatBackend(
+            (1..12).map {
+                LspTools.Symbol(
+                    "\"".repeat(SafeToolSlice.MAX_STRING_CHARS),
+                    "function",
+                    "p".repeat(SafeToolSlice.MAX_STRING_CHARS),
+                    it,
+                )
+            },
+        )
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, fatBackend, maxCallsPerTurn = 8))
+        provider.handler = { _ ->
+            flow {
+                for (i in 0 until 8) {
+                    emit(
+                        StreamEvent.ToolDone(
+                            toolIndex = i,
+                            id = "call-$i",
+                            name = "lsp.symbols",
+                            argumentsJson = """{"query":"A"}""",
+                        ),
+                    )
+                }
+                emit(StreamEvent.Done("tool_calls"))
+            }
+        }
+        c.send("查 A")
+
+        // All eight calls executed (round-level legality), but the
+        // continuation over-cap never shipped.
+        assertEquals(8, fatBackend.invocations.get())
+        assertEquals(1, provider.seenRequests.size)
+        assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+        assertTrue(c.uiState.value.error.orEmpty().contains("over budget"))
+        assertTrue(sink.succeeded.isEmpty())
+        // Fail-closed durability is observable: the failed terminal was
+        // recorded with the persisted executed-round marker.
+        assertEquals(1, sink.failedRecords.size)
+        val failedRecord = sink.failedRecords.single()
+        assertTrue(failedRecord.isFinal)
+        assertEquals("continuation request over budget", failedRecord.error)
+        assertTrue(failedRecord.partialText.contains("[tool-result:lsp.symbols"))
     }
 
     @Test fun cancelDuringContinuationKeepsSingleExecution() = runBlocking {

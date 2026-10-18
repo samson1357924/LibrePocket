@@ -504,7 +504,8 @@ class SafeToolSlice(
      * one assistant `toolCalls` entry plus one `tool` message per result
      * (executed or denied — pairing is total within one executed round; a
      * call re-emitted on a retried attempt is recorded without a result and
-     * never reaches here). Wire shape mirrors
+     * never reaches this builder — the retried request re-attaches the same
+     * frozen executed pair, not the live accumulation list). Wire shape mirrors
      * the T1 mock round-trip histories so all three adapters serialize it.
      */
     fun continuationMessages(calls: List<ToolCall>, results: List<ToolResult>): List<ChatMessage> {

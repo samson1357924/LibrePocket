@@ -98,6 +98,17 @@ class PolicyEvaluationException(cause: Exception) :
 class ApprovalRequiredException : Exception("chat.send approval required")
 
 /**
+ * Fail-closed signal for the P2 slice continuation budget: the serialized
+ * request payload (message text + the structured assistant `toolCalls`
+ * id/name/argumentsJson) exceeds [TurnController.MAX_REQUEST_CHARS] even
+ * after the full history-prefix trim (the newest base row + the structured
+ * round cannot be shrunk further). Within one logical turn history only
+ * grows, so this is never retried; `runTurnLoop` converts it into a typed
+ * non-retryable terminal and no over-cap request is shipped to the provider.
+ */
+class ContinuationOverBudgetException : Exception("continuation request over budget")
+
+/**
  * Outgoing context window for one [ChatRequest], and the resumed-history
  * prefix bound (Phase 3).
  *
@@ -109,13 +120,15 @@ class ApprovalRequiredException : Exception("chat.send approval required")
  * (`[tool:name args]` marker text, never separate provider `tool` messages
  * in the persisted replay) — so whole-message truncation can never detach a
  * tool result from its call. The wire-only continuation round (structured
- * assistant `toolCalls` + `tool` messages, single-turn, never truncated —
- * see [buildToolContinuation]) is exempt from this argument by construction;
- * it is appended after window trimming, so a request may exceed
- * `MAX_REQUEST_CHARS` by at most one bounded round. If it is ever
- * truncated, keep each pair atomic. Any truncation is
- * observable via [TurnController.droppedHistoryCount],
- * never silent.
+ * assistant `toolCalls` + `tool` messages, single-turn — see
+ * [buildToolContinuation]) is exempt from this appends-after-trim window
+ * argument by construction: its own accounting includes the structured
+ * payload, and when even the untrimmable minimum (newest base row + the
+ * round) still exceeds `MAX_REQUEST_CHARS` it fails closed (throw caught
+ * in runTurnLoop → typed non-retryable terminal) rather than shipping
+ * over cap. Any trimming is
+ * observable via [TurnController.droppedHistoryCount] and the
+ * continuation's own trim publication, never silent.
  *
  * The default is [Unbounded] (window everything, truncate nothing): no
  * on-device token/context measurement exists in this branch to justify a
@@ -4718,12 +4731,23 @@ class TurnController(
     var attemptRunId = logicalTurnId
     // P2 slice budget: at most one tool round per turn, including retries.
     // A retryable continuation failure starts a fresh attempt whose request
-    // excludes partial markers — without this flag the model could re-emit
-    // the call and the slice would execute it a second time.
+    // drops the failed partial fragment but re-attaches the executed pair
+    // (tools=[] on the wire) — without this flag the model could re-emit the
+    // call and the slice would execute it a second time.
     var sliceExecutedThisTurn = false
+    // The one executed round, frozen at execution time. A post-execution
+    // continuation failure re-attaches this pair on the retry request so the
+    // provider still sees the executed result instead of answering blind.
+    // Frozen (never re-derived from the live per-attempt accumulation list)
+    // so record-only re-emitted calls on retries cannot desync the
+    // calls/results sizes that `continuationMessages` requires. The
+    // `executedSliceResults.isNotEmpty()` loop-top guard also fails safe to
+    // the old pure-chat request shape in the (cancel-only) window where
+    // execute() throws before returning — keep the freeze AFTER execute().
+    var executedSliceCalls: List<dev.librepocket.provider.ToolCall> = emptyList()
+    var executedSliceResults: List<SafeToolSlice.ToolResult> = emptyList()
     while (true) {
       appendAssistantPlaceholder(attemptRunId)
-      val request = buildRequest(images, allowTools = !sliceExecutedThisTurn)
       var failed: StreamEvent.Failed? = null
       var done = false
       // P2 slice: completed model calls for the single wired tool, executed
@@ -4733,6 +4757,19 @@ class TurnController(
       // Shared aggregation state, fresh per attempt (see ToolAggState).
       val toolState = ToolAggState()
       try {
+        // Request build sits inside the attempt try so a builder failure
+        // (notably the continuation budget fail-close below) becomes a
+        // typed terminal, never an escaped turn crash.
+        val request =
+          if (sliceExecutedThisTurn && executedSliceResults.isNotEmpty() && toolSlice != null) {
+            // Post-execution retry: same shape as the first continuation —
+            // re-attach the frozen executed pair with `tools=[]`. The provider
+            // sees the already-executed result; no re-execution, no second
+            // tools offer.
+            buildToolContinuation(images, executedSliceCalls, executedSliceResults, toolSlice)
+          } else {
+            buildRequest(images, allowTools = !sliceExecutedThisTurn)
+          }
         val streamOutcome = collectStream(
           request,
           attemptRunId,
@@ -4748,9 +4785,12 @@ class TurnController(
         // continuation falls into the existing retry/terminal logic below.
         // Budget: exactly one tool round per turn — continuation ToolDones
         // are recorded, never executed (see collectToolContinuation), and a
-        // retried attempt never re-executes (sliceExecutedThisTurn). A call
-        // re-emitted on a retried attempt is recorded but left unpaired
-        // (no tool result), pinned by test.
+        // retried attempt never re-executes (sliceExecutedThisTurn): the
+        // executed pair is frozen at execution time and re-attached on the
+        // retry request with tools=[], so the provider keeps seeing the
+        // executed result. A call newly re-emitted on a retried attempt is
+        // recorded-only and stays out of that re-attached pair, pinned by
+        // test.
         val loop = toolSlice
         if (failed == null && done && loop != null && sliceCalls.isNotEmpty() && !sliceExecutedThisTurn) {
           coroutineContext.ensureActive()
@@ -4758,6 +4798,8 @@ class TurnController(
           // must not grant a second round on retry (fail-closed direction).
           sliceExecutedThisTurn = true
           val sliceResults = loop.execute(sliceCalls)
+          executedSliceCalls = sliceCalls.toList()
+          executedSliceResults = sliceResults
           for (r in sliceResults) {
             coroutineContext.ensureActive()
             // Length-prefixed marker: resultJson embeds `]` (symbols array)
@@ -4789,6 +4831,16 @@ class TurnController(
         // throws CancellationException in practice (typed denials cover the
         // rest), but a non-cancel throw here still becomes a terminal (not a
         // leaked crash) exactly like the old inline catches.
+      } catch (e: ContinuationOverBudgetException) {
+        // Fail closed (P2 continuation budget): the serialized continuation
+        // payload cannot fit MAX_REQUEST_CHARS even after the full
+        // history-prefix trim. Within one logical turn history only grows
+        // (a retry cannot shrink the request) — terminal without shipping
+        // an over-cap request, and never a second tool round.
+        failed = StreamEvent.Failed(
+          e.message ?: "continuation request over budget",
+          retryable = false,
+        )
       } catch (e: CancellationException) {
         throw e
       } catch (e: Exception) {
@@ -5392,8 +5444,14 @@ class TurnController(
    * P2 slice continuation request: the current history/user context plus the
    * structured tool round (assistant `toolCalls` + paired `tool` results —
    * pairing is total within one executed round). Markers stay inline in the
-   * assistant text AND the structured round rides alongside (double carry;
-   * only the inline markers survive into the next attempt). NO tools are
+   * assistant text AND the structured round rides alongside (double carry
+   * within one request). This builder is sequentially invoked twice per
+   * executed round — once for the live continuation, and again as the
+   * re-attached frozen pair after a post-execution retryable continuation
+   * failure (a provider `Failed` or the forced incomplete-round failure —
+   * see runTurnLoop). The
+   * failed attempt's partial inline markers do not survive that retry, the
+   * structured pair does. NO tools are
    * advertised (`allowTools = false`): the continuation request carries no
    * `tools` array. If the model still emits a second-round call it is
    * recorded (markers + transcript, `onWiredToolDone = null`) but never
@@ -5402,10 +5460,16 @@ class TurnController(
    *
    * When the structured round pushes the request past [MAX_REQUEST_CHARS],
    * history-prefix trimming (oldest-first, whole messages, tool pairing kept
-   * atomic) is additionally published on [lastRequestTrimmedCount]/[requestTrimmedCount]
+   * atomic, the structured payload counted) is additionally published on
+   * [lastRequestTrimmedCount]/[requestTrimmedCount]
    * as the total head trim of the outgoing request (added on top of the
-   * base request's own emission) — never silent.
+   * base request's own emission) — never silent. If even the untrimmable
+   * minimum (the newest base row + the structured round) exceeds the cap,
+   * this throws [ContinuationOverBudgetException]: runTurnLoop fails the
+   * turn with a typed non-retryable terminal instead of shipping an
+   * over-cap request (a retry cannot shrink history that only grows).
    */
+
   private fun buildToolContinuation(
     images: List<ChatImageRef>,
     calls: List<dev.librepocket.provider.ToolCall>,
@@ -5416,12 +5480,27 @@ class TurnController(
     val contMessages = loop.continuationMessages(calls, results)
     // Keep tool-call/tool-result pairing atomic: trim only the history prefix
     // when the structured round pushes the request over MAX_REQUEST_CHARS.
+    // Payload accounting includes the structured assistant toolCalls
+    // (id/name/args echo — the echo can reach MAX_INPUT_CHARS): a text-only
+    // sum under-counts everything that actually serializes into the
+    // outgoing request.
     val baseMessages = base.messages.toMutableList()
-    var totalChars = baseMessages.sumOf { it.text.length } + contMessages.sumOf { it.text.length }
+    var totalChars = baseMessages.sumOf { it.wirePayloadChars() } + contMessages.sumOf { it.wirePayloadChars() }
     var drop = 0
     while (drop < baseMessages.size - 1 && totalChars > MAX_REQUEST_CHARS) {
-      totalChars -= baseMessages[drop].text.length
+      totalChars -= baseMessages[drop].wirePayloadChars()
       drop++
+    }
+    if (totalChars > MAX_REQUEST_CHARS) {
+      // Untrimmable: the newest base row + the structured round exceed the
+      // cap even at the minimum prefix (the trim never removes the newest
+      // row). History only grows within one logical turn, so a retry cannot
+      // shrink this request — fail closed (typed, non-retryable) instead of
+      // silently shipping an over-cap request.
+      // Trim-count contract: on this throw path requestTrimmedCount
+      // retains only the base request's published dropCount (the request
+      // was never shipped); the next build resets it per request.
+      throw ContinuationOverBudgetException()
     }
     val finalBase = if (drop > 0) baseMessages.drop(drop) else baseMessages
     // Publish the continuation's own prefix trim (never silent): buildRequest
@@ -5436,6 +5515,19 @@ class TurnController(
     }
     return base.copy(messages = finalBase + contMessages)
   }
+
+  /**
+   * Serialized-size estimate of one [ChatMessage] on the outgoing request:
+   * message text plus every structured assistant `toolCalls` payload field
+   * (id/name/argumentsJson — the args echo is bounded by
+   * SafeToolSlice.MAX_INPUT_CHARS). The estimate is a raw String.length
+   * basis — the same measurement basis as buildRequest's own (text-only)
+   * accounting. JSON-escaping expansion and adapter wrapper keys are NOT
+   * counted (deliberately never over-counts), so the fail-close can only
+   * fire for a request that is already over cap on the strict measure.
+   */
+  private fun ChatMessage.wirePayloadChars(): Int =
+    text.length + toolCalls.sumOf { it.id.length + it.name.length + it.argumentsJson.length }
 
   /**
    * P2 slice continuation collect: delegates to [collectStream] with

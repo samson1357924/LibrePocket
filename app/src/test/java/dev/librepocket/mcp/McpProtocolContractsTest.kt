@@ -169,10 +169,14 @@ class McpProtocolContractsTest {
     @Test fun nextCursorDoesNotAutoFollowSinglePage() {
         val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
             "[{\"name\":\"a\",\"inputSchema\":{\"type\":\"object\"}}],\"nextCursor\":\"cursor-1\"}}"
-        val tools = McpWire.parseList("s1", json)
-        assertEquals("本頁工具仍須解析", 1, tools.size)
-        assertEquals("a", tools[0].name)
-        // 無跟隨語義由 E2E 鎖定：見 standardSubsetFakeEndToEnd（listTools 只發一次 HTTP）。
+        val page = McpWire.parseListPage("s1", json)
+        assertEquals("本頁工具仍須解析", 1, page.tools.size)
+        assertEquals("a", page.tools[0].name)
+        assertEquals("非空 nextCursor 必須標記還有下一頁（PARTIAL，不回 OK 假完整）", true, page.hasMorePages)
+        // parseList 薄委託維持相容（不含分頁旗標）。
+        assertEquals(1, McpWire.parseList("s1", json).size)
+        // 無跟隨語義由 E2E 鎖定：見 standardSubsetFakeEndToEnd（listTools 只發一次 HTTP）
+        // 與 McpServerSemanticsTest.nextCursorMapsToPartialKeepingTools。
     }
 
     // ---- f. id 對應：expectedId 數值校驗（Stage2 翻轉舊「不斷言」pin） ----
@@ -384,23 +388,31 @@ class McpProtocolContractsTest {
         assertTrue(McpWire.parseList("s1", ok, expectedId = 1L).isEmpty())
     }
 
-    @Test fun emptyResultObjectIsOkLocksCurrentSemantics() {
-        // 空 result {} 視為 OK（已知限制，見 McpWire.parseCall KDoc）。
-        val (resultJson, isError) = McpWire.parseCall("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}")
-        assertFalse(isError)
-        assertEquals("{}", resultJson)
+    @Test fun emptyResultObjectIsRejected() {
+        // 空 result {} 不再當成功（Stage3，外部 review #5）：形狀不完整 → PROTOCOL。
+        try {
+            McpWire.parseCall("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}")
+            fail("空 result 必須拒（McpProtocol），不得回 OK")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: empty result", e.message)
+        }
+        // content 陣列存在（即使空）仍算有結果。
+        val emptyContent = McpWire.parseCall(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[],\"isError\":false}}",
+        )
+        assertFalse(emptyContent.second)
+        assertEquals("[]", emptyContent.first)
     }
 
-    @Test fun structuredContentDiscardedWhenContentPresent() {
-        // content 存在時 structuredContent 被丟棄（已知限制，見 KDoc）。
-        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
-            "{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]," +
-            "\"structuredContent\":{\"key\":\"rich\"},\"isError\":false}}"
-        val (resultJson, isError) = McpWire.parseCall(json)
+    @Test fun structuredContentPreservedWithContent() {
+        // content＋structuredContent 皆有時整包保留（Stage3 翻轉舊「丟棄」pin）。
+        val result = "{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]," +
+            "\"structuredContent\":{\"key\":\"rich\"},\"isError\":false}"
+        val (resultJson, isError) = McpWire.parseCall(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":$result}",
+        )
         assertFalse(isError)
-        assertNotNull(resultJson)
-        assertTrue(resultJson!!.contains("ok"))
-        assertFalse(resultJson.contains("rich"))
+        assertEquals("整包 result.raw 全等保留，不得擇一丟棄", result, resultJson)
     }
 
     @Test fun isErrorNullIsFalse() {

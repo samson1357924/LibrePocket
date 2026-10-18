@@ -17,10 +17,14 @@ import kotlinx.coroutines.CancellationException
  * - 方法：[listTools]（tools/list）+ [callTool]（tools/call）；回應須
  *   `jsonrpc=="2.0"`＋id 數值相符（固定 list=1／call=2）＋`result` XOR `error`，
  *   error 依 code 分類：協議/伺服器碼（-32700/-32600/-32601/-32603）→ PROTOCOL＋計熔斷，
- *   `-32602`/未知碼 → TOOL_ERROR 中性（見 [McpWire.parseCall]）；
+ *   `-32602`/未知碼 → TOOL_ERROR 中性（message 透傳 [McpCallResult.errorMessage]，
+ *   不進稽核）；非空 `nextCursor` → PARTIAL（不回 OK 假完整）；
+ *   HTTP 400/404/405 → PROTOCOL＋計熔斷（非暫態配置錯；429/408 等仍 TRANSPORT）；
  * - 熔斷：連續失敗即開路（[McpCircuitBreaker]），開路期間短路為 CIRCUIT_OPEN；
- *   工具業務錯（`isError=true`、`-32602`/未知碼 error 包）為中性，不重置亦不累計；
- *   協議碼 error 包（-32700/-32600/-32601/-32603）計熔斷（見上方法段）；
+ *   工具業務錯（`isError=true` 且具 content/structuredContent、`-32602`/未知碼 error 包）
+ *   為中性，不重置亦不累計；協議碼 error 包（-32700/-32600/-32601/-32603）計熔斷
+ *   （見上方法段）；result 兩鍵皆無屬形狀不完整 → 一律 PROTOCOL＋計熔斷
+ *   （含 `isError=true` 但無內容的變體，見 [McpWire.parseCall]）；
  * - 超時：單次 15–30s（[McpTimeouts.clamp]），超時映射 TIMEOUT，不重試；
  * - 傳輸安全：僅放行 `https`，以及回環 `http`（測試／本機；見 [McpWire.requireSecureEndpoint]），
  *   其餘明文一律 PROTOCOL、不碰 vault、不發送、不計熔斷；
@@ -96,6 +100,13 @@ class McpServer(
                 breaker.onFailure()
                 return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
             }
+            if (code == 400 || code == 404 || code == 405) {
+                // 端點/請求形狀配置錯（非暫態）：PROTOCOL + 計熔斷（同 3xx 待遇）；
+                // 429/408 等其餘 4xx/5xx 屬暫態走 TRANSPORT——所有非 2xx 分支皆計熔斷，
+                // 分類只差 status 標籤（診斷用），不差開路行為。
+                breaker.onFailure()
+                return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
+            }
             if (code !in 200..299 || text.isNullOrBlank()) {
                 breaker.onFailure()
                 return McpListResult(config.id, emptyList(), McpStatus.TRANSPORT, clockMs() - start)
@@ -103,9 +114,12 @@ class McpServer(
             return try {
                 // expectedId=LIST_ID：回應 id 必須數值相符（錯 id 回應 fail-closed，
                 // 不採納也不重置熔斷，見 McpWire.requireResponseEnvelope）。
-                val tools = McpWire.parseList(config.id, text, McpWire.LIST_ID)
+                val page = McpWire.parseListPage(config.id, text, McpWire.LIST_ID)
                 breaker.onSuccess()
-                McpListResult(config.id, tools, McpStatus.OK, clockMs() - start)
+                // 非空 nextCursor → PARTIAL（本子集不跟隨分頁，不回 OK 假完整，
+                // 外部 review #3）；本頁工具保留供呼叫方辨識。傳輸/解析成功仍計成功。
+                val status = if (page.hasMorePages) McpStatus.PARTIAL else McpStatus.OK
+                McpListResult(config.id, page.tools, status, clockMs() - start)
             } catch (_: IllegalArgumentException) {
                 breaker.onFailure()
                 McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
@@ -193,6 +207,12 @@ class McpServer(
                 breaker.onFailure()
                 return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
             }
+            if (code == 400 || code == 404 || code == 405) {
+                // 同 listTools：端點/請求形狀配置錯（非暫態）→ PROTOCOL + 計熔斷
+                // （其餘 4xx/5xx 走 TRANSPORT，但熔斷待遇相同——皆 onFailure）。
+                breaker.onFailure()
+                return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
+            }
             if (code !in 200..299 || text.isNullOrBlank()) {
                 breaker.onFailure()
                 return McpCallResult(config.id, toolName, McpStatus.TRANSPORT, clockMs() - start)
@@ -211,8 +231,17 @@ class McpServer(
             } catch (e: McpWire.McpToolFailure) {
                 // 僅 -32602/未知碼 error 包會到此（協議碼於 parseCall 拋 McpProtocol
                 // → 下方 IAE catch → PROTOCOL + 計熔斷）；工具級錯誤中性，不碰熔斷計數。
+                // errorMessage 透傳伺服器 message（wire 層上限 200；不進 auditMap）。
                 breaker.onNeutral()
-                McpCallResult(config.id, toolName, McpStatus.TOOL_ERROR, clockMs() - start, null, true)
+                McpCallResult(
+                    config.id,
+                    toolName,
+                    McpStatus.TOOL_ERROR,
+                    clockMs() - start,
+                    null,
+                    true,
+                    errorMessage = e.message?.take(200),
+                )
             } catch (_: IllegalArgumentException) {
                 breaker.onFailure()
                 McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)

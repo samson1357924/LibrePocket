@@ -387,7 +387,9 @@ class McpWireD1Test {
             fail("parseList mismatch 必須拋 McpWire.McpProtocol，實際=${e.message}")
         }
         // 合法深巢狀仍接受（parseCall 回 OK，不誤判 mismatch）。
-        val ok = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"a\":[1,{\"b\":2}]}}"
+        val ok = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+            "{\"content\":[{\"type\":\"text\",\"text\":\"deep\"}]," +
+            "\"structuredContent\":{\"a\":[1,{\"b\":2}]}}}"
         val (result, isError) = McpWire.parseCall(ok)
         assertFalse(isError)
         assertTrue(result != null && result.contains("\"b\""))

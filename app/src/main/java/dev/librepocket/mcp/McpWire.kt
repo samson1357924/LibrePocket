@@ -454,8 +454,21 @@ internal object McpWire {
         }
     }
 
+    /** tools/list 單頁解析結果：本頁工具＋是否還有下一頁（非空 `nextCursor`）。 */
+    internal data class McpListPage(
+        val tools: List<McpTool>,
+        val hasMorePages: Boolean,
+    )
+
     /**
-     * 解析 tools/list；惡形輸入拋 IllegalArgumentException（呼叫方映射為 PROTOCOL）。
+     * 解析 tools/list（僅工具，不含分頁旗標；見 [parseListPage]）。
+     * 契約與 [parseListPage] 相同，為既有呼叫方/測試的薄委託。
+     */
+    fun parseList(serverId: String, json: String, expectedId: Long? = null): List<McpTool> =
+        parseListPage(serverId, json, expectedId).tools
+
+    /**
+     * 解析 tools/list 單頁；惡形輸入拋 IllegalArgumentException（呼叫方映射為 PROTOCOL）。
      *
      * 經 [parseStrictDoc] 嚴格走訪全文（截斷/尾隨 garbage/缺逗號/重複鍵/非法字面量/
      * 非法 escape/超深一律 [McpProtocol]）；再經 [requireResponseEnvelope]
@@ -467,10 +480,17 @@ internal object McpWire {
      * 再從 `result` 內取 `tools` 陣列；層級一律經 DOM 直接成員查找，
      * 巢狀同名鍵不得遮蔽外層。inputSchema 超限拒絕不截斷；name/description 短欄位 take 保留。
      *
+     * `nextCursor`（外部 review #3）：非空字串 → [McpListPage.hasMorePages]=true
+     * （呼叫方映射 PARTIAL，不回 OK 假完整）；缺席／null／空字串 → false；
+     * 其他型別（數字／object／布林）→ [McpProtocol] `mcp: bad nextCursor`。
+     * 僅認 `result` 內的 `nextCursor`（頂層同名鍵視為未知鍵忽略，與未知鍵政策一致）；
+     * 驗證順序：`tools` 陣列型別 → `nextCursor` → `tools` 陣列項目內容
+     * （cursor 異常與 tools 項目異常同時存在時，`mcp: bad nextCursor` 勝出）。
+     *
      * @param expectedId server 呼叫時傳 [LIST_ID]（數值比對回應 id）；
      *   null（測試直呼叫）只驗 id 存在與型別。
      */
-    fun parseList(serverId: String, json: String, expectedId: Long? = null): List<McpTool> {
+    fun parseListPage(serverId: String, json: String, expectedId: Long? = null): McpListPage {
         if (json.length > McpTransport.RESPONSE_MAX_CHARS) {
             throw McpProtocol("mcp: response body exceeds ${McpTransport.RESPONSE_MAX_CHARS} chars")
         }
@@ -489,29 +509,39 @@ internal object McpWire {
         val toolsVal = resultVal.find("tools")
             ?: throw IllegalArgumentException("mcp: bad result.tools")
         if (toolsVal !is JArr) throw IllegalArgumentException("mcp: bad result.tools")
-        if (toolsVal.items.isEmpty()) return emptyList()
-        return toolsVal.items.map { item ->
-            if (item !is JObj) throw McpProtocol("mcp: bad tools item")
-            val nameVal = item.find("name")
-            if (nameVal !is JStr) throw IllegalArgumentException("mcp: tool without name")
-            val descVal = item.find("description")
-            val desc = if (descVal is JStr) descVal.v else ""
-            val schemaVal = item.find("inputSchema")
-            val schema = when {
-                schemaVal == null -> """{"type":"object"}"""
-                schemaVal is JObj -> schemaVal.raw
-                else -> throw McpProtocol("mcp: bad inputSchema")
-            }
-            if (schema.length > INPUT_SCHEMA_MAX_CHARS) {
-                throw McpProtocol("mcp: inputSchema exceeds $INPUT_SCHEMA_MAX_CHARS chars")
-            }
-            McpTool(
-                serverId = serverId,
-                name = nameVal.v.take(TOOL_NAME_MAX_CHARS),
-                description = desc.take(500),
-                inputSchema = schema,
-            )
+        val cursorVal = resultVal.find("nextCursor")
+        val hasMorePages = when (cursorVal) {
+            null, is JNull -> false
+            is JStr -> cursorVal.v.isNotEmpty()
+            else -> throw McpProtocol("mcp: bad nextCursor")
         }
+        val tools = if (toolsVal.items.isEmpty()) {
+            emptyList()
+        } else {
+            toolsVal.items.map { item ->
+                if (item !is JObj) throw McpProtocol("mcp: bad tools item")
+                val nameVal = item.find("name")
+                if (nameVal !is JStr) throw IllegalArgumentException("mcp: tool without name")
+                val descVal = item.find("description")
+                val desc = if (descVal is JStr) descVal.v else ""
+                val schemaVal = item.find("inputSchema")
+                val schema = when {
+                    schemaVal == null -> """{"type":"object"}"""
+                    schemaVal is JObj -> schemaVal.raw
+                    else -> throw McpProtocol("mcp: bad inputSchema")
+                }
+                if (schema.length > INPUT_SCHEMA_MAX_CHARS) {
+                    throw McpProtocol("mcp: inputSchema exceeds $INPUT_SCHEMA_MAX_CHARS chars")
+                }
+                McpTool(
+                    serverId = serverId,
+                    name = nameVal.v.take(TOOL_NAME_MAX_CHARS),
+                    description = desc.take(500),
+                    inputSchema = schema,
+                )
+            }
+        }
+        return McpListPage(tools, hasMorePages)
     }
 
     /**
@@ -529,21 +559,30 @@ internal object McpWire {
      * - `-32700`／`-32600`／`-32601`／`-32603`（協議／伺服器端錯，見 [PROTOCOL_ERROR_CODES]）
      *   → 拋 [McpProtocol]（[McpServer] 映射 PROTOCOL + 計熔斷，breaker 能得知不互通）；
      * - `-32602`（invalid params）與未知碼 → 拋 [McpToolFailure]（工具級中性；
-     *   message 取伺服器原文上限 200 字元，但 [McpServer.callTool] 目前只映射狀態、
-     *   不透傳 message——已知限制）。
+     *   message 取伺服器原文上限 200 字元，由 [McpServer.callTool] 透傳至
+     *   [McpCallResult.errorMessage]，不進 auditMap）。
      *
      * `code` 必須是整數字面量（不含指數／小數／溢位；否則 `mcp: bad error`）。
      * 注意不對稱：[parseList] 對任何 error 包（含 `-32602`/未知碼）一律
      * [McpProtocol]（list 無業務錯通道，協議碼與暫態碼同等計熔斷）。
      *
-     * `isError`/`content` 只認頂層 `result` 物件的直接成員（DOM depth-1），
-     * 巢狀同名鍵不得誤判；缺 `result` 即拋 IllegalArgumentException（fail-closed）。
-     * 回傳的 resultJson 用 DOM 節點 `raw`（content 優先，否則整包 result）。
+     * 結果完整性（外部 review #5，Stage3 修正）：
+     * - 結果分支驗證順序：`content` 型別 → `structuredContent` 型別 → `isError` 型別 →
+     *   兩鍵皆無判定（與 list 端優先序同為文件化順序，非巧合）；
+     * - `content` 非可選鍵：null 仍屬型別錯 → `mcp: bad content`
+     *   （與 `structuredContent` 的寬容 null 不同——content 是 MCP 規格必備陣列）；
+     * - `result` 既無 `content` 又無 `structuredContent`（空 `{}`、或僅 `isError` 的
+     *   無內容變體）→ [McpProtocol] `mcp: empty result`（不當成功、不當業務錯：
+     *   形狀不完整一律 PROTOCOL + 計熔斷）；
+     * - `structuredContent` 存在時 null 視為缺席（與 `nextCursor: null`／
+     *   `isError: null` 的可選鍵寬容對稱），其餘非 object → `mcp: bad structuredContent`；
+     * - `resultJson` 保留資料不丟：僅 `content` → `content.raw`；
+     *   僅 `structuredContent` → `structuredContent.raw`；
+     *   兩者皆有 → 整包 `result.raw`（兩種資料都保留）。
      *
-     * 已知限制（鎖定現狀，不視為相容承諾）：
-     * - 空 `result`（`{}`，既無 `content` 又無 `structuredContent`）視為 OK
-     *  （`resultJson="{}"`，`isError=false`）；
-     * - `content` 存在時 `structuredContent` 被丟棄（僅保留 `content.raw`）。
+     * `isError`/`content`/`structuredContent` 只認頂層 `result` 物件的直接成員
+     * （DOM depth-1），巢狀同名鍵不得誤判；缺 `result` 即拋
+     * IllegalArgumentException（fail-closed）。
      *
      * @param expectedId server 呼叫時傳 [CALL_ID]（數值比對回應 id）；
      *   null（測試直呼叫）只驗 id 存在與型別。
@@ -578,6 +617,12 @@ internal object McpWire {
         if (contentVal != null && contentVal !is JArr) {
             throw McpProtocol("mcp: bad content")
         }
+        val structuredVal = resultVal.find("structuredContent")
+        // null 視為缺席（與 nextCursor: null／isError: null 的可選鍵寬容對稱）；
+        // 其餘非 object（array/string/number）拒。
+        if (structuredVal != null && structuredVal !is JNull && structuredVal !is JObj) {
+            throw McpProtocol("mcp: bad structuredContent")
+        }
         val isErrorVal = resultVal.find("isError")
         val isError = when {
             isErrorVal == null -> false
@@ -585,8 +630,16 @@ internal object McpWire {
             isErrorVal is JNull -> false
             else -> throw McpProtocol("mcp: bad isError")
         }
-        // 內存消費用：優先保留 content，否則整個 result；調用方用後即丟，不寫盤。
-        return ((contentVal?.raw ?: resultVal.raw)) to isError
+        // 結果保留（外部 review #5）：兩種資料皆存時整包保留、不得擇一丟棄；
+        // 兩者皆無（空 result）fail-closed 拒，不當成功。調用方用後即丟，不寫盤。
+        // structuredContent: null 同上視為缺席（不得把 "null" 原文當結構化結果）。
+        val resultJson = when {
+            contentVal != null && structuredVal != null && structuredVal !is JNull -> resultVal.raw
+            contentVal != null -> contentVal.raw
+            structuredVal != null && structuredVal !is JNull -> structuredVal.raw
+            else -> throw McpProtocol("mcp: empty result")
+        }
+        return resultJson to isError
     }
 
     class McpToolFailure(message: String) : IllegalArgumentException(message)

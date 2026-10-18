@@ -1,0 +1,529 @@
+package dev.librepocket.mcp
+
+import dev.librepocket.keystore.KeyVault
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
+import org.junit.Test
+
+/**
+ * Stage3 server 語義契約（外部獨立 review #3／#5＋先前 N-findings）：
+ * - 非空 `nextCursor` → [McpStatus.PARTIAL]（本頁工具保留，不回 OK 假完整）；
+ * - tools/call 結果完整性：空 result 拒、structuredContent 保留不丟；
+ * - [McpCallResult.errorMessage] 透傳伺服器 error message（不進稽核）；
+ * - HTTP 400/404/405 → PROTOCOL + 計熔斷（非暫態配置錯）；429/408 等仍 TRANSPORT。
+ *
+ * 全程 MockWebServer／純 wire 解析，不連外網。
+ */
+class McpServerSemanticsTest {
+
+    private class FakeVault : KeyVault {
+        override suspend fun putKey(providerId: String, apiKey: CharArray) = Unit
+        override suspend fun getKey(providerId: String): CharArray? = "sekret-token-1".toCharArray()
+        override suspend fun deleteKey(providerId: String) = Unit
+        override suspend fun hasKey(providerId: String): Boolean = true
+    }
+
+    // ---- nextCursor：單頁子集但不靜默丟頁 ----
+
+    @Test fun nextCursorVariantsAtWireLevel() {
+        val base = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]"
+        // 缺席／null／空字串 → 無下一頁。
+        for (tail in listOf("}", ",\"nextCursor\":null}", ",\"nextCursor\":\"\"}")) {
+            val page = McpWire.parseListPage("s1", "$base$tail}", expectedId = 1L)
+            assertFalse("應無下一頁：$tail", page.hasMorePages)
+        }
+        // 非字串型別 → bad nextCursor（不靜默當無分頁）。
+        for (bad in listOf("123", "{}", "true")) {
+            try {
+                McpWire.parseListPage("s1", "$base,\"nextCursor\":$bad}}", expectedId = 1L)
+                fail("非字串 nextCursor 必須拒：$bad")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: bad nextCursor", e.message)
+            }
+        }
+        // 空白字串非空 → 有下一頁（isEmpty 語義，不 trim）。
+        assertTrue(
+            "空白 cursor \" \" 屬非空字串",
+            McpWire.parseListPage("s1", "$base,\"nextCursor\":\" \"}}", expectedId = 1L).hasMorePages,
+        )
+    }
+
+    @Test fun badNextCursorWinsOverBadToolItems() {
+        // 驗證優先序：tools 陣列型別 → nextCursor → 項目內容。
+        // 兩者皆異常時 nextCursor 先擋（文件化順序，非巧合）。
+        try {
+            McpWire.parseListPage(
+                "s1",
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":" +
+                    "{\"tools\":[{\"bad\":1}],\"nextCursor\":123}}",
+                expectedId = 1L,
+            )
+            fail("cursor 異常必須先於 tools 項目異常擋下")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad nextCursor", e.message)
+        }
+    }
+
+    @Test fun nextCursorMapsToPartialKeepingTools() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // 先種一次失敗：PARTIAL 若計 neutral（而非 success）則不會重置，
+            // 以此鑑別 breaker.onSuccess 真的被呼叫。
+            web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                        "[{\"name\":\"a\",\"inputSchema\":{\"type\":\"object\"}}]," +
+                        "\"nextCursor\":\"page-2\"}}",
+                ),
+            )
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            assertEquals(McpStatus.TRANSPORT, withTimeoutOrNull(5_000) { server.listTools() }!!.status)
+            assertEquals(1, breaker.failureCount())
+            val got = withTimeoutOrNull(5_000) { server.listTools() }!!
+            assertEquals("不完整列表不得回 OK", McpStatus.PARTIAL, got.status)
+            assertEquals("本頁工具必須保留", listOf("a"), got.tools.map { it.name })
+            assertEquals("PARTIAL 必須計成功並重置（onSuccess 非 onNeutral）", 0, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun badNextCursorThroughServerIsProtocol() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]," +
+                        "\"nextCursor\":123}}",
+                ),
+            )
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = withTimeoutOrNull(5_000) { server.listTools() }!!
+            assertEquals(McpStatus.PROTOCOL, got.status)
+            assertEquals(1, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun noCursorStillMapsToOk() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                        "[{\"name\":\"a\",\"inputSchema\":{\"type\":\"object\"}}]}}",
+                ),
+            )
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(),
+            )
+            val got = withTimeoutOrNull(5_000) { server.listTools() }!!
+            assertEquals(McpStatus.OK, got.status)
+            assertEquals(1, got.tools.size)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    // ---- tools/call 結果完整性 ----
+
+    @Test fun structuredContentOnlyIsKept() {
+        // 僅 structuredContent（無 content）：保留結構化結果，不當空成功。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+            "{\"structuredContent\":{\"key\":\"rich\"},\"isError\":false}}"
+        val (resultJson, isError) = McpWire.parseCall(json, expectedId = 2L)
+        assertFalse(isError)
+        assertEquals("structuredContent 原文保留", "{\"key\":\"rich\"}", resultJson)
+    }
+
+    @Test fun badStructuredContentShapeIsProtocol() {
+        for (bad in listOf("[1]", "\"str\"", "42")) {
+            val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+                "{\"content\":[],\"structuredContent\":$bad,\"isError\":false}}"
+            try {
+                McpWire.parseCall(json, expectedId = 2L)
+                fail("非 object structuredContent 必須拒：$bad")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: bad structuredContent", e.message)
+            }
+        }
+    }
+
+    @Test fun structuredContentNullIsTreatedAsAbsent() {
+        // null 視為缺席（可選鍵寬容，與 nextCursor: null／isError: null 對稱）。
+        // + content → 正常成功；單獨 null（無 content）→ 兩鍵皆無 → empty result 拒。
+        val withContent = McpWire.parseCall(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+                "{\"content\":[],\"structuredContent\":null,\"isError\":false}}",
+            expectedId = 2L,
+        )
+        assertFalse(withContent.second)
+        assertEquals("[]", withContent.first)
+        try {
+            McpWire.parseCall(
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+                    "{\"structuredContent\":null,\"isError\":false}}",
+                expectedId = 2L,
+            )
+            fail("structuredContent:null 單獨存在等同空 result，必須拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: empty result", e.message)
+        }
+    }
+
+    @Test fun emptyStructuredContentObjectIsKeptAsRaw() {
+        // structuredContent:{} 空物件仍算有結構化結果（≠ 空 result），raw 全等 "{}"。
+        val (resultJson, isError) = McpWire.parseCall(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+                "{\"structuredContent\":{},\"isError\":false}}",
+            expectedId = 2L,
+        )
+        assertFalse(isError)
+        assertEquals("{}", resultJson)
+    }
+
+    @Test fun contentNullIsTypeErrorUnlikeStructuredContentNull() {
+        // content 非可選鍵：null 仍屬型別錯 → bad content（與 structuredContent 寬容 null 分歧，
+        // 已文件化取捨）。驗證順序 pin：content 型別錯先於 structuredContent 型別錯。
+        for (json in listOf(
+            "{\"content\":null,\"structuredContent\":{\"k\":1}}",
+            "{\"content\":42,\"structuredContent\":[1]}",
+        )) {
+            try {
+                McpWire.parseCall("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":$json}", expectedId = 2L)
+                fail("content 型別錯必須先擋：$json")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: bad content", e.message)
+            }
+        }
+    }
+
+    @Test fun topLevelNextCursorIsIgnoredAsUnknownKey() {
+        // 頂層同名鍵視為未知鍵忽略（僅認 result 內），不得誤判分頁。
+        val page = McpWire.parseListPage(
+            "s1",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"nextCursor\":\"x\"," +
+                "\"result\":{\"tools\":[]}}",
+            expectedId = 1L,
+        )
+        assertFalse("頂層 nextCursor 不得觸發 hasMorePages", page.hasMorePages)
+    }
+
+    @Test fun emptyResultThroughServerIsProtocol() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}",
+                ),
+            )
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            assertEquals("空 result 不得回 OK", McpStatus.PROTOCOL, got.status)
+            assertEquals(1, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun isErrorWithoutContentIsProtocolAndCountsBreaker() = runBlocking {
+        // isError=true 但 result 兩鍵皆無＝形狀不完整：不當業務錯（中性）、
+        // 不當成功——一律 PROTOCOL + 計熔斷（fail-closed，KDoc 已文件化此分支）。
+        // wire 直呼精確訊息 pin（E2E 之外再釘 wire 層訊息）。
+        try {
+            McpWire.parseCall(
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"isError\":true}}",
+                expectedId = 2L,
+            )
+            fail("無內容 isError 必須拒（mcp: empty result）")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: empty result", e.message)
+        }
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"isError\":true}}",
+                ),
+            )
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            assertEquals("無內容 isError 不得當中性業務錯", McpStatus.PROTOCOL, got.status)
+            assertEquals(1, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    // ---- errorMessage 透傳（隱私：不進稽核） ----
+
+    @Test fun toolErrorMessagePropagatedButNotAudited() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"bad\"}}",
+                ),
+            )
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(),
+            )
+            val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            assertEquals(McpStatus.TOOL_ERROR, got.status)
+            assertEquals("伺服器 message 必須透傳", "bad", got.errorMessage)
+            assertFalse("稽核不得含 error message", got.auditMap().toString().contains("bad"))
+            assertFalse(
+                "稽核鍵集合不得出現 errorMessage",
+                got.auditMap().containsKey("errorMessage"),
+            )
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun errorPacketWithoutMessageSurfacesDefaultString() = runBlocking {
+        // 伺服器未提供 message → wire 層預設字串 "tool error"（KDoc 已文件化）。
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602}}",
+                ),
+            )
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(),
+            )
+            val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            assertEquals(McpStatus.TOOL_ERROR, got.status)
+            assertEquals("tool error", got.errorMessage)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun longErrorMessageIsTruncatedTo200() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            val longMsg = "x".repeat(500)
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":" +
+                        "{\"code\":-32602,\"message\":\"$longMsg\"}}",
+                ),
+            )
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(),
+            )
+            val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            assertEquals(McpStatus.TOOL_ERROR, got.status)
+            assertEquals("message 必須截到 200 字元", 200, got.errorMessage?.length)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun protocolErrorPathLeavesErrorMessageNull() = runBlocking {
+        // PROTOCOL 路徑（協議碼 -32601）：errorMessage 為 null（僅 TOOL_ERROR 才有）。
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32601,\"message\":\"m\"}}",
+                ),
+            )
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            assertEquals(McpStatus.PROTOCOL, got.status)
+            assertNull("PROTOCOL 路徑不得帶 errorMessage", got.errorMessage)
+            assertEquals(1, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun okResultHasNoErrorMessage() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+                        "{\"content\":[],\"isError\":false}}",
+                ),
+            )
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(),
+            )
+            val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            assertEquals(McpStatus.OK, got.status)
+            assertNull(got.errorMessage)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun isErrorResultMapsToToolErrorWithNullMessage() = runBlocking {
+        // isError=true 結果路徑的 TOOL_ERROR：errorMessage 為 null（無伺服器 message，
+        // 詳情在 resultJson）——與 error 包路徑（預設字串）的分歧已文件化。
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+                        "{\"content\":[{\"type\":\"text\",\"text\":\"failed\"}],\"isError\":true}}",
+                ),
+            )
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(),
+            )
+            val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            assertEquals(McpStatus.TOOL_ERROR, got.status)
+            assertTrue(got.isError)
+            assertNull("isError 結果路徑無伺服器 message", got.errorMessage)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    // ---- HTTP 4xx taxonomy ----
+
+    @Test fun configuration4xxMapsToProtocolAndCountsBreaker() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // 400/404/405：端點/請求形狀配置錯（非暫態）→ PROTOCOL + 計熔斷。
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            for ((code, expectCount) in listOf(400 to 1, 404 to 2, 405 to 3)) {
+                web.enqueue(MockResponse().setResponseCode(code).setBody("nope"))
+                val call = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+                assertEquals("call HTTP $code 必須 PROTOCOL", McpStatus.PROTOCOL, call.status)
+                assertEquals(expectCount, breaker.failureCount())
+            }
+            assertTrue(breaker.isOpen())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun configuration4xxOnListIsProtocol() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // list 端同待遇：400/404/405 → PROTOCOL + 計熔斷（與 call 端一致）。
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            for ((code, expectCount) in listOf(400 to 1, 404 to 2, 405 to 3)) {
+                web.enqueue(MockResponse().setResponseCode(code).setBody("nope"))
+                val got = withTimeoutOrNull(5_000) { server.listTools() }!!
+                assertEquals("list HTTP $code 必須 PROTOCOL", McpStatus.PROTOCOL, got.status)
+                assertTrue(got.tools.isEmpty())
+                assertEquals("list HTTP $code 必須計熔斷", expectCount, breaker.failureCount())
+            }
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun transient4xxStillMapsToTransport() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // 429（限流）/408（逾時）屬暫態 → TRANSPORT（不得誤判配置錯）；
+            // 熔斷待遇相同：皆計失敗（分類只差 status 標籤）。
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            var expectCount = 0
+            for (code in listOf(429, 408)) {
+                web.enqueue(MockResponse().setResponseCode(code).setBody("slow down"))
+                val call = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+                assertEquals("HTTP $code 必須 TRANSPORT", McpStatus.TRANSPORT, call.status)
+                assertEquals(++expectCount, breaker.failureCount())
+            }
+        } finally {
+            web.shutdown()
+        }
+    }
+}

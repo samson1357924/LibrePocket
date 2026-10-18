@@ -72,6 +72,13 @@ enum class McpStatus {
     TOOL_ERROR,
     DISABLED,
     CIRCUIT_OPEN,
+
+    /**
+     * tools/list 本頁解析成功、但伺服器回非空 `nextCursor`（還有下一頁）。
+     * 本子集不跟隨分頁（見 [McpWire] 修訂立場）：不回 OK 假完整
+     * （外部 review #3），[McpListResult.tools] 保留本頁工具供呼叫方辨識。
+     */
+    PARTIAL,
 }
 
 /** tools/list 結果：只記工具名/描述形狀，不記任何使用者原文。 */
@@ -95,6 +102,11 @@ data class McpListResult(
  *
  * @param resultJson 僅駐記憶體的原始結果（呼叫方消費後丟棄，永不寫盤）；
  *   [auditMap] 刻意不含 arguments 與 result。
+ * @param errorMessage 伺服器 error 包的 message（wire 層上限 200 字元；
+ *   僅 [McpStatus.TOOL_ERROR] 時非 null——伺服器未提供 message 時為
+ *   wire 層預設字串 `tool error`；`isError=true` 結果路徑的 TOOL_ERROR
+ *   為 null——該路徑無伺服器 message，詳情在 [resultJson]）。
+ *   隱私不變式：不進 [auditMap]。
  */
 data class McpCallResult(
     val serverId: String,
@@ -103,6 +115,7 @@ data class McpCallResult(
     val latencyMs: Long,
     val resultJson: String? = null,
     val isError: Boolean = false,
+    val errorMessage: String? = null,
 ) {
     fun auditMap(): Map<String, Any?> = mapOf(
         "serverId" to serverId,

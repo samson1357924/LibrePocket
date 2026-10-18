@@ -19,8 +19,10 @@ import hashlib
 import io
 import os
 import re
+import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 import warnings
@@ -1094,6 +1096,18 @@ class BackupRulesValidator(unittest.TestCase):
             "</data-extraction-rules>\n"
         )
 
+    def _check(self, path: str) -> list[str]:
+        """Hinted validation keyed on fixture filename (fixtures use the two
+        well-known names). ``validate`` takes an expected root REQUIRED - a
+        hint-free call is refused, so tests always pass the binding."""
+        name = Path(path).name
+        root = (
+            backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION
+            if "data_extraction" in name
+            else backup_rules_check.EXPECTED_ROOT_BACKUP_RULES
+        )
+        return backup_rules_check.validate(path, root)
+
     def test_repo_backup_files_are_valid(self) -> None:
         # Gates pin the file↔root binding: each real file must validate against
         # its expected Android root.
@@ -1119,7 +1133,7 @@ class BackupRulesValidator(unittest.TestCase):
         path = self._write(
             "data_extraction_rules.xml", self._data_extraction(self._ALL_EXCLUDES, device)
         )
-        errors = backup_rules_check.validate(path)
+        errors = self._check(path)
         self.assertTrue(
             any("<device-transfer>" in e and "librepocket_vault-wal" in e for e in errors),
             errors,
@@ -1129,7 +1143,7 @@ class BackupRulesValidator(unittest.TestCase):
         path = self._write(
             "data_extraction_rules.xml", self._data_extraction(self._ALL_EXCLUDES, "")
         )
-        errors = backup_rules_check.validate(path)
+        errors = self._check(path)
         self.assertTrue(any("<device-transfer>" in e for e in errors), errors)
         self.assertEqual(len(errors), len(backup_rules_check.REQUIRED_EXCLUDES), errors)
         self.assertTrue(all("<device-transfer>" in e for e in errors), errors)
@@ -1147,7 +1161,7 @@ class BackupRulesValidator(unittest.TestCase):
         path = self._write(
             "data_extraction_rules.xml", self._data_extraction(commented, commented)
         )
-        errors = backup_rules_check.validate(path)
+        errors = self._check(path)
         self.assertEqual(
             len(errors), 2 * len(backup_rules_check.REQUIRED_EXCLUDES), errors
         )  # 5 per branch; comments ignored
@@ -1165,7 +1179,7 @@ class BackupRulesValidator(unittest.TestCase):
             "</data-extraction-rules>\n"
         )
         path = self._write("data_extraction_rules.xml", body)
-        errors = backup_rules_check.validate(path)
+        errors = self._check(path)
         self.assertTrue(any("missing <cloud-backup>" in e for e in errors), errors)
 
     def test_full_backup_content_missing_exclude_is_caught(self) -> None:
@@ -1173,13 +1187,18 @@ class BackupRulesValidator(unittest.TestCase):
             '        <exclude domain="file" path="librepocket_keysets" />\n', ""
         )
         path = self._write("backup_rules.xml", self._full_backup(excludes))
-        errors = backup_rules_check.validate(path)
+        errors = self._check(path)
         self.assertTrue(any("librepocket_keysets" in e for e in errors), errors)
 
     def test_unexpected_root_element_is_caught(self) -> None:
+        # Unknown/unrelated roots are caught by the binding hint first
+        # (expected-root mismatch), which is the only surface a wrong schema
+        # can appear through now that validate() requires the hint.
         path = self._write("bad.xml", '<?xml version="1.0"?><something-else />')
-        errors = backup_rules_check.validate(path)
-        self.assertTrue(any("unexpected root" in e for e in errors), errors)
+        errors = self._check(path)
+        self.assertTrue(
+            any("expected root <full-backup-content>" in e for e in errors), errors
+        )
 
     def test_exclude_missing_domain_or_path_attribute_is_caught(self) -> None:
         # (None, path) / (domain, None) must not satisfy a required (domain, path).
@@ -1188,7 +1207,7 @@ class BackupRulesValidator(unittest.TestCase):
             '        <exclude domain="database" />\n'
         )
         path = self._write("backup_rules.xml", self._full_backup(excludes))
-        errors = backup_rules_check.validate(path)
+        errors = self._check(path)
         self.assertEqual(len(errors), len(backup_rules_check.REQUIRED_EXCLUDES), errors)
 
     def test_nested_exclude_does_not_count(self) -> None:
@@ -1205,7 +1224,7 @@ class BackupRulesValidator(unittest.TestCase):
             "data_extraction_rules.xml",
             self._data_extraction(self._ALL_EXCLUDES, nested),
         )
-        errors = backup_rules_check.validate(path)
+        errors = self._check(path)
         self.assertEqual(
             len(errors),
             len(backup_rules_check.REQUIRED_EXCLUDES) + 1,
@@ -1225,8 +1244,12 @@ class BackupRulesValidator(unittest.TestCase):
             f"{self._ALL_EXCLUDES}</full-backup-content>\n"
         )
         path = self._write("backup_rules.xml", body)
-        errors = backup_rules_check.validate(path)
-        self.assertTrue(any("unexpected root" in e for e in errors), errors)
+        errors = self._check(path)
+        # Namespaced root tag (ElementTree-qualified {@uri}tag) never equals the
+        # bare expected root — fail-closed on the binding mismatch message.
+        self.assertTrue(
+            any("expected root <full-backup-content>" in e for e in errors), errors
+        )
 
     def test_duplicate_sections_are_fully_validated(self) -> None:
         # Android's runtime parser visits every matching section occurrence
@@ -1245,7 +1268,7 @@ class BackupRulesValidator(unittest.TestCase):
             f"<data-extraction-rules>\n{duplicate}</data-extraction-rules>\n"
         )
         path = self._write("data_extraction_rules.xml", body)
-        errors = backup_rules_check.validate(path)
+        errors = self._check(path)
         self.assertTrue(
             any("<cloud-backup> unknown element <notatag>" in e for e in errors),
             errors,
@@ -1272,7 +1295,7 @@ class BackupRulesValidator(unittest.TestCase):
             f"<data-extraction-rules>\n{split}</data-extraction-rules>\n"
         )
         path = self._write("data_extraction_rules.xml", body)
-        errors = backup_rules_check.validate(path)
+        errors = self._check(path)
         # First occurrence misses 4, second misses 1 (sharedpref covered there,
         # first misses it) — every occurrence must be complete.
         self.assertTrue(
@@ -1293,7 +1316,7 @@ class BackupRulesValidator(unittest.TestCase):
             "</data-extraction-rules>\n"
         )
         path = self._write("data_extraction_rules.xml", body)
-        self.assertEqual(backup_rules_check.validate(path), [])
+        self.assertEqual(self._check(path), [])
 
     # ---- 檔名↔root 綁定（swapped / wrong root 不可 false PASS）----
 
@@ -1332,17 +1355,23 @@ class BackupRulesValidator(unittest.TestCase):
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("expected root <full-backup-content>", errors[0], errors)
 
-    def test_validate_without_expected_root_keeps_branching(self) -> None:
-        # Legacy mode (no hint): the caller decides the schema; the hint-free
-        # call still branches on root and must still FAIL on missing excludes.
-        device = self._ALL_EXCLUDES.replace(
-            '        <exclude domain="database" path="librepocket_vault-wal" />\n', ""
+    def test_cli_without_expected_root_fails_closed_exit_2(self) -> None:
+        # The swapped-root false-PASS repro surfaces through every hint-free
+        # call surface. Hence validate(path) now REQUIRES the expected root and
+        # the CLI fails closed (exit 2) without --expect-root — the reviewer's
+        # swapped contents can no longer pass outside the shell gate either.
+        backup_path = self._write(
+            "backup_rules.xml",
+            self._data_extraction(self._ALL_EXCLUDES, self._ALL_EXCLUDES),
         )
-        path = self._write(
-            "data_extraction_rules.xml", self._data_extraction(self._ALL_EXCLUDES, device)
-        )
-        errors = backup_rules_check.validate(path, None)
-        self.assertTrue(any("<device-transfer>" in e for e in errors), errors)
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            code = backup_rules_check.main(["backup_rules_check.py", backup_path])
+        self.assertEqual(2, code)
+        self.assertIn("usage", buf_err.getvalue())
+        # validate itself: a keyword/inline None is no longer a valid contract.
+        with self.assertRaises(TypeError):
+            backup_rules_check.validate(backup_path)  # type: ignore[misc]  # pylint: disable=no-value-for-parameter
 
     # ---- Android runtime 嚴格性映射（FullBackup.validateInnerTagContents）----
 
@@ -1355,18 +1384,118 @@ class BackupRulesValidator(unittest.TestCase):
             "</full-backup-content>\n"
         )
         path = self._write("backup_rules.xml", body)
-        errors = backup_rules_check.validate(path)
+        errors = self._check(path)
         self.assertTrue(any("unknown element <future-tag>" in e for e in errors), errors)
+
+    def test_nested_unknown_tag_inside_legal_rule_is_caught(self) -> None:
+        # AOSP parseRules walks every START_TAG at ANY depth inside a section
+        # and validateInnerTagContents throws on the nested unknown tag too -
+        # so a legal include wrapping an unknown child must FAIL (it would
+        # silently disable backup at runtime), not PASS.
+        nested = (
+            f"{self._ALL_EXCLUDES}"
+            '    <include domain="file" path="sessions.txt">\n'
+            "        <future-tag />\n"
+            "    </include>\n"
+        )
+        path = self._write("backup_rules.xml", self._full_backup(nested))
+        errors = self._check(path)
+        self.assertTrue(
+            any("unknown element <future-tag>" in e for e in errors), errors
+        )
+        # Same shape inside a data-extraction branch.
+        nested_branch = (
+            f"{self._ALL_EXCLUDES}"
+            '    <exclude domain="file" path="sessions.txt">\n'
+            "        <odd-wrapper />\n"
+            "    </exclude>\n"
+        )
+        path = self._write(
+            "data_extraction_rules.xml",
+            self._data_extraction(nested_branch, self._ALL_EXCLUDES),
+        )
+        errors = self._check(path)
+        self.assertTrue(
+            any("unknown element <odd-wrapper>" in e for e in errors), errors
+        )
+
+    def test_tools_attributes_do_not_count_toward_runtime_limit(self) -> None:
+        # aapt strips tools:* before the runtime sees the resource: an exclude
+        # with 2 real attrs + tools:ignore is runtime-valid (2 <= 2) and must
+        # PASS, while 3 real attrs still FAIL (mirror the runtime count).
+        body = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<full-backup-content xmlns:tools="http://schemas.android.com/tools">\n'
+            f"{self._ALL_EXCLUDES}"
+            '    <exclude domain="file" path="sessions.txt" tools:ignore="FullBackupContent" />\n'
+            '    <exclude domain="database" path="notes.db" tools:ignore="x" />\n'
+            "</full-backup-content>\n"
+        )
+        path = self._write("backup_rules.xml", body)
+        self.assertEqual(self._check(path), [])
+
+        over = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<full-backup-content xmlns:tools="http://schemas.android.com/tools">\n'
+            f"{self._ALL_EXCLUDES}"
+            '    <exclude domain="file" path="sessions.txt" extra="flag" tools:ignore="x" />\n'
+            "</full-backup-content>\n"
+        )
+        path = self._write("backup_rules.xml", over)
+        errors = self._check(path)
+        self.assertTrue(any("has 3 attributes" in e for e in errors), errors)
+
+    def test_pathological_nesting_surfaces_as_clean_depth_fail(self) -> None:
+        # _MAX_RULE_NEST_DEPTH bounds the walk: a 70-deep include/exclude
+        # suffix must come out as a clean "exceeds the maximum rule nesting
+        # depth" FAIL (exit 1 with actionable stderr), never an uncaught
+        # RecursionError traceback.
+        includes = "".join(
+            f'<include domain="file" path="p{i}">' for i in range(70)
+        )
+        closes = "</include>" * 70
+        body = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<full-backup-content>\n"
+            f"{self._ALL_EXCLUDES}"
+            f"    {includes}<future-tag />{closes}\n"
+            "</full-backup-content>\n"
+        )
+        path = self._write("backup_rules.xml", body)
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            code = backup_rules_check.main(
+                [
+                    "backup_rules_check.py",
+                    "--expect-root",
+                    backup_rules_check.EXPECTED_ROOT_BACKUP_RULES,
+                    path,
+                ]
+            )
+        self.assertEqual(1, code)
+        self.assertIn("exceeds the maximum rule nesting depth", buf_err.getvalue())
+
+    def test_noncanonical_hint_matching_root_reaches_defensive_branch(self) -> None:
+        # validate() requires the hint; a caller may still pass a NON-canonical
+        # hint (not one of the two documented roots) that happens to equal the
+        # file's root tag — the binding check passes and the defensive
+        # "unexpected root element" branch rejects it (fail-closed).
+        path = self._write("weird.xml", '<something-else></something-else>')
+        errors = backup_rules_check.validate(path, "something-else")
+        self.assertTrue(
+            any("unexpected root element <something-else>" in e for e in errors),
+            errors,
+        )
 
     def test_unknown_child_tag_in_branch_is_caught(self) -> None:
         body = self._data_extraction(
             "    <wrapper-domain>\n"
-            f'{self._ALL_EXCLUDES.replace("        ", "        ")}'
+            f"{self._ALL_EXCLUDES}"
             "    </wrapper-domain>\n",
             "    <wrapper>\n    </wrapper>\n",
         )
         path = self._write("data_extraction_rules.xml", body)
-        errors = backup_rules_check.validate(path)
+        errors = self._check(path)
         self.assertTrue(
             any("<cloud-backup> unknown element <wrapper-domain>" in e for e in errors),
             errors,
@@ -1384,7 +1513,7 @@ class BackupRulesValidator(unittest.TestCase):
             '        <exclude domain="file" path="librepocket_keysets" foo="bar" />\n',
         )
         path = self._write("backup_rules.xml", self._full_backup(excludes))
-        errors = backup_rules_check.validate(path)
+        errors = self._check(path)
         self.assertTrue(
             any("<exclude> has 3 attributes" in e for e in errors), errors
         )
@@ -1395,7 +1524,7 @@ class BackupRulesValidator(unittest.TestCase):
             '        <include domain="sharedpref" path="librepocket_keys.xml" a="1" b="2" />\n',
         )
         path = self._write("backup_rules.xml", self._full_backup(includes))
-        errors = backup_rules_check.validate(path)
+        errors = self._check(path)
         self.assertTrue(
             any("<include> has 4 attributes" in e for e in errors), errors
         )
@@ -1409,7 +1538,7 @@ class BackupRulesValidator(unittest.TestCase):
             '        <exclude domain="sharedpref" path="unrelated.xml" />\n'
         )
         path = self._write("backup_rules.xml", self._full_backup(extra))
-        self.assertEqual(backup_rules_check.validate(path), [])
+        self.assertEqual(self._check(path), [])
 
     def test_malformed_xml_is_caught(self) -> None:
         # The bot's suggestion: a malformed rules file must produce exactly one
@@ -1420,7 +1549,7 @@ class BackupRulesValidator(unittest.TestCase):
             "<full-backup-content>\n"
             '  <exclude domain="database" path="unclosed\n',
         )
-        errors = backup_rules_check.validate(path)
+        errors = self._check(path)
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("invalid XML", errors[0], errors)
 
@@ -1451,13 +1580,43 @@ class BackupRulesValidator(unittest.TestCase):
         self.assertEqual(2, code, buf_err.getvalue())
 
     def test_cli_missing_file_fails_closed_exit_1(self) -> None:
+        # With the required hint the missing file surfaces as "unreadable"
+        # exit 1; hint-free invocation is exit 2 (pinned above).
         buf_err = io.StringIO()
         with contextlib.redirect_stderr(buf_err):
             code = backup_rules_check.main(
-                ["backup_rules_check.py", str(self.tmp / "no-such.xml")]
+                [
+                    "backup_rules_check.py",
+                    "--expect-root",
+                    backup_rules_check.EXPECTED_ROOT_BACKUP_RULES,
+                    str(self.tmp / "no-such.xml"),
+                ]
             )
         self.assertEqual(1, code)
         self.assertIn("unreadable", buf_err.getvalue())
+
+    def test_cli_subprocess_smoke_pass_fail_usage(self) -> None:
+        # In-process main() tests cover the argv parsing; run the REAL script
+        # once via subprocess to pin shebang/__main__/exit-code plumbing
+        # (0 pass / 1 fail / 2 usage), which in-process calls never execute.
+        good = self._write(
+            "backup_rules.xml", self._full_backup(self._ALL_EXCLUDES)
+        )
+        cmd = [sys.executable, str(ROOT / "scripts" / "backup_rules_check.py")]
+        rc_ok = subprocess.run(
+            cmd + ["--expect-root", backup_rules_check.EXPECTED_ROOT_BACKUP_RULES, good],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(0, rc_ok.returncode, rc_ok.stderr)
+        rc_fail = subprocess.run(
+            cmd + ["--expect-root", backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION, good],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(1, rc_fail.returncode)
+        self.assertIn("expected root <data-extraction-rules>", rc_fail.stderr)
+        rc_usage = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(2, rc_usage.returncode)
+        self.assertIn("usage", rc_usage.stderr)
 
     def test_cli_wrong_expected_root_exits_1(self) -> None:
         path = self._write(
@@ -1521,7 +1680,9 @@ class BackupRulesGateWiring(unittest.TestCase):
 
     def test_gate_pins_expected_roots(self) -> None:
         # The gate must pass the file↔root binding explicitly: one call per
-        # file with --expect-root (a swapped file must not false-PASS).
+        # file with --expect-root (a swapped file must not false-PASS), with
+        # each root PAIRED to its specific file (swapped arguments between the
+        # two invocations would otherwise survive the pin).
         text = POLICY_CHECK.read_text(encoding="utf-8")
         self.assertIn(
             f"--expect-root {backup_rules_check.EXPECTED_ROOT_BACKUP_RULES}", text
@@ -1529,10 +1690,322 @@ class BackupRulesGateWiring(unittest.TestCase):
         self.assertIn(
             f"--expect-root {backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION}", text
         )
+        # Argument pairing: each fixed-path invocation carries the right root.
+        self.assertRegex(
+            text,
+            r"--expect-root\s+" + re.escape(backup_rules_check.EXPECTED_ROOT_BACKUP_RULES)
+            + r"[\s\\]+\"\$ROOT/app/src/main/res/xml/backup_rules\.xml\"",
+        )
+        self.assertRegex(
+            text,
+            r"--expect-root\s+" + re.escape(backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION)
+            + r"[\s\\]+\"\$ROOT/app/src/main/res/xml/data_extraction_rules\.xml\"",
+        )
+
+    def test_gate_deep_scans_semantic_rule_shapes(self) -> None:
+        # The overlay Sweep must match semantic shapes (any *backup*rules*.xml /
+        # *data_extraction*rules*.xml), not exact filenames — an overlay alias
+        # (backup_rules_foss.xml with the WRONG root) must still reach the
+        # validator. Also pins that a find failure fails closed: find must run
+        # OUTSIDE the sort pipeline (POSIX assignment status = last pipeline
+        # element) and its non-pipelined status is guarded with an explicit fail.
+        text = POLICY_CHECK.read_text(encoding="utf-8")
+        self.assertIn("-name '*backup*rules*.xml'", text)
+        self.assertIn("-name '*data_extraction*rules*.xml'", text)
+        self.assertIn("case \"$f\" in\n        *backup*rules*.xml)", text)
+        # find runs OUTSIDE the sort pipeline: the LIST assignment contains the
+        # find substitution but no "| sort", and the explicit fail guard rides
+        # directly on that assignment's status (POSIX assignment status = last
+        # pipeline element, so find-in-pipeline would mask its own failure).
+        find_line = next(
+            line for line in text.splitlines() if "BACKUP_RULES_LIST=" in line
+        )
+        self.assertIn("$(find ", find_line)
+        self.assertNotIn("| sort", find_line)
+        # The explicit fail guard rides DIRECTLY on the non-pipelined find
+        # assignment's status (line-anchored: whatever the argument-list
+        # escapes look like, `||` and `fail` must follow on that assignment).
+        lines = text.splitlines()
+        guard_idx = next(
+            i
+            for i, l in enumerate(lines)
+            if "fail 'deep-scan of backup rules resources failed'" in l
+        )
+        self.assertIn("||", lines[guard_idx - 1])
+        self.assertIn(
+            'BACKUP_RULES_FILES="$(printf \'%s\\n\' "$BACKUP_RULES_LIST" | sort)"',
+            text,
+        )
+
+    def test_gate_pins_manifest_resource_binding(self) -> None:
+        # Runtime binding: the two manifest attributes must reference the
+        # validated resource names (attr↔resource↔schema chain closed).
+        text = POLICY_CHECK.read_text(encoding="utf-8")
+        self.assertIn('android:fullBackupContent="@xml/backup_rules"', text)
+        self.assertIn('android:dataExtractionRules="@xml/data_extraction_rules"', text)
+        self.assertIn("must reference @xml/backup_rules", text)
 
     def test_gate_does_not_use_raw_grep_for_excludes(self) -> None:
         text = POLICY_CHECK.read_text(encoding="utf-8")
         self.assertNotRegex(text, r"grep\b[^|\n]*\b-q\b[^|\n]*\bdomain=")
+
+
+class BackupRulesGateEndToEnd(unittest.TestCase):
+    """Run the REAL gate script against a cloned source tree (sandbox).
+
+    The gate computes ROOT from its own location, so copying ``scripts/`` plus
+    a minimal ``app/src`` into a temp dir exercises the source-stage checks
+    end-to-end without an APK, build-tools, or the real repo. ANDROID_HOME
+    points at a NONEXISTENT path and HOME at an empty dir so that the
+    ``$HOME/Android/Sdk`` probe (which runs regardless of ANDROID_HOME) also
+    yields nothing — the expected later failure is the build-tools/artifact
+    stage, unless a source check broke (any earlier/different failure means a
+    source check is being asserted on).
+    """
+
+    @staticmethod
+    def _minimal_tree(tree: str) -> "Path":
+        root = Path(tree)
+        scripts = root / "scripts"
+        scripts.mkdir(parents=True)
+        shutil.copy2(ROOT / "scripts" / "play_policy_check.sh", scripts)
+        shutil.copy2(ROOT / "scripts" / "backup_rules_check.py", scripts)
+        # apk_policy_inspect.py is imported only in the artifact stage; copy it
+        # so the tree is self-consistent anyway.
+        shutil.copy2(ROOT / "scripts" / "apk_policy_inspect.py", scripts)
+        main_res = root / "app" / "src" / "main" / "res" / "xml"
+        main_res.mkdir(parents=True)
+        manifest = root / "app" / "src" / "main" / "AndroidManifest.xml"
+        manifest.write_text(
+            '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+            '    <application android:fullBackupContent="@xml/backup_rules"'
+            ' android:dataExtractionRules="@xml/data_extraction_rules" />\n'
+            "</manifest>\n",
+            encoding="utf-8",
+        )
+        (main_res / "network_security_config.xml").write_text(
+            '<network-security-config>\n'
+            '    <base-config cleartextTrafficPermitted="false" />\n'
+            "</network-security-config>\n",
+            encoding="utf-8",
+        )
+        # A valid initializer: both resources legally complete. Tests that
+        # need a broken tree overwrite these files afterwards.
+        (main_res / "backup_rules.xml").write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<full-backup-content>\n"
+            "    <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
+            "    <exclude domain=\"database\" path=\"librepocket_vault\" />\n"
+            "    <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
+            "    <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
+            "    <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+            "</full-backup-content>\n",
+            encoding="utf-8",
+        )
+        (main_res / "data_extraction_rules.xml").write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<data-extraction-rules>\n"
+            "    <cloud-backup>\n"
+            "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
+            "        <exclude domain=\"database\" path=\"librepocket_vault\" />\n"
+            "        <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
+            "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
+            "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+            "    </cloud-backup>\n"
+            "    <device-transfer>\n"
+            "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
+            "        <exclude domain=\"database\" path=\"librepocket_vault\" />\n"
+            "        <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
+            "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
+            "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+            "    </device-transfer>\n"
+            "</data-extraction-rules>\n",
+            encoding="utf-8",
+        )
+        return root
+
+    def _run_gate(self, tree_root: "Path") -> subprocess.CompletedProcess:
+        env = dict(os.environ)
+        env["ANDROID_HOME"] = str(tree_root / "no-such-sdk")
+        env.pop("ANDROID_SDK_ROOT", None)
+        # HOME is neutered too: find_tool_pair's $HOME/Android/Sdk probe runs
+        # regardless of ANDROID_HOME, so an empty HOME keeps it yielding
+        # nothing (no developer SDK sneaks in ahead of the source stage).
+        env["HOME"] = str(tree_root / "home")  # no $HOME/Android/Sdk here
+        (tree_root / "home").mkdir(exist_ok=True)
+        # Minimal empty "APK" (precondition only checks extension + existence).
+        dummy = tree_root / "dummy.apk"
+        dummy.write_bytes(b"PK\x03\x04truncated-not-a-real-apk")
+        return subprocess.run(
+            ["sh", str(tree_root / "scripts" / "play_policy_check.sh"), str(dummy)],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(tree_root),
+        )
+
+    def test_valid_tree_source_stage_passes(self) -> None:
+        # A fully valid tree must sail through every source-stage check — the
+        # only later failures may come from the artifact/tool environment
+        # (build-tools missing, dummy APK not a real zip), never from source
+        # validation (no backup/manifest/cleartext/deep-scan FAIL at all).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            proc = self._run_gate(root)
+            all_fail_lines = "\n".join(
+                line for line in proc.stderr.splitlines() if line.startswith("FAIL:")
+            )
+            self.assertNotIn("expected root", all_fail_lines, proc.stderr)
+            self.assertNotIn("must reference @xml/", all_fail_lines, proc.stderr)
+            self.assertNotIn("cleartext", all_fail_lines, proc.stderr)
+            self.assertNotIn("deep-scan", all_fail_lines, proc.stderr)
+
+    def test_swapped_main_file_fails_at_source_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            (
+                root / "app" / "src" / "main" / "res" / "xml" / "backup_rules.xml"
+            ).write_text(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                "<data-extraction-rules>\n"
+                "    <cloud-backup>\n"
+                "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
+                "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+                "    </cloud-backup>\n"
+                "    <device-transfer>\n"
+                "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
+                "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+                "    </device-transfer>\n"
+                "</data-extraction-rules>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("expected root <full-backup-content>", proc.stderr)
+            self.assertNotIn("required Android build-tools", proc.stderr)
+
+    def test_aliased_overlay_wrong_root_fails_before_tool_stage(self) -> None:
+        # The original reviewer escape: a DIFFERENTLY-NAMED overlay file never
+        # reached the validator when the scan matched exact filenames only.
+        # The semantic-shape deep scan must catch it (expected-root mismatch),
+        # still before the artifact/tool stage.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            (root / "app" / "src" / "main" / "res" / "xml" / "backup_rules.xml").write_text(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                "<full-backup-content>\n"
+                "    <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
+                "    <exclude domain=\"database\" path=\"librepocket_vault\" />\n"
+                "    <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
+                "    <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
+                "    <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+                "</full-backup-content>\n",
+                encoding="utf-8",
+            )
+            foss_res = root / "app" / "src" / "foss" / "res" / "xml"
+            foss_res.mkdir(parents=True)
+            (foss_res / "backup_rules_foss.xml").write_text(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                "<data-extraction-rules>\n"
+                "    <cloud-backup>\n"
+                "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
+                "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+                "    </cloud-backup>\n"
+                "    <device-transfer>\n"
+                "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
+                "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+                "    </device-transfer>\n"
+                "</data-extraction-rules>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("expected root <full-backup-content>", proc.stderr)
+            self.assertNotIn("required Android build-tools", proc.stderr)
+
+    def test_find_failure_fails_closed_not_silent(self) -> None:
+        # POSIX pipeline semantics: the OLD wiring put find inside the sort
+        # pipeline, so the assignment status came from sort and a find failure
+        # never tripped the fail guard — an unreadable subtree could hide an
+        # overlay from the scan silently. Non-pipelined find must propagate
+        # its failure; the gate must stop at the deep-scan guard.
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses directory permissions")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            locked = root / "app" / "src" / "foss" / "res" / "xml"
+            locked.mkdir(parents=True)
+            (locked / "backup_rules_evil.xml").write_text(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                "<data-extraction-rules>\n"
+                "    <cloud-backup>\n"
+                "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
+                "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+                "    </cloud-backup>\n"
+                "    <device-transfer>\n"
+                "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
+                "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
+                "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+                "    </device-transfer>\n"
+                "</data-extraction-rules>\n",
+                encoding="utf-8",
+            )
+            locked.chmod(0o000)
+            try:
+                listed: list[str] = []
+                try:
+                    listed = os.listdir(locked)
+                except PermissionError:
+                    pass
+                if listed:
+                    # A mode-ignoring TMPDIR (e.g. drvfs/WSL mounts) makes the
+                    # lock a no-op: find succeeds and the premise is untestable
+                    # here. Fail-safe skip (can only weaken a skip, never a
+                    # real regression signal); CI's default /tmp is unaffected.
+                    self.skipTest(
+                        "TMPDIR ignores directory mode bits; find-failure "
+                        "premise untestable (see finding note)"
+                    )
+                proc = self._run_gate(root)
+            finally:
+                locked.chmod(0o755)  # let TemporaryDirectory clean up
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("deep-scan of backup rules resources failed", proc.stderr)
+            self.assertNotIn("expected root", proc.stderr, proc.stderr)
+
+    def test_missing_manifest_binding_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            manifest = root / "app" / "src" / "main" / "AndroidManifest.xml"
+            manifest.write_text(
+                "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n"
+                "    <application android:allowBackup=\"true\" />\n"
+                "</manifest>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn(
+                "android:fullBackupContent must reference @xml/backup_rules",
+                proc.stderr,
+            )
 
 
 if __name__ == "__main__":

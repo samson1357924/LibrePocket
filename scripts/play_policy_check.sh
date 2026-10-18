@@ -98,18 +98,37 @@ python3 "$SCRIPT_DIR/backup_rules_check.py" \
     --expect-root data-extraction-rules \
     "$ROOT/app/src/main/res/xml/data_extraction_rules.xml"
 
-# 縱深：掃描 app/src 下所有同形資源（未來 flavor overlay 新增／覆寫
-# backup_rules.xml / data_extraction_rules.xml 時也不能漏驗；main 兩檔已由
-# 上方固定路徑 fail-closed 檢查，此處重複驗證無害）。
+# 執行期綁定（attr↔resource）：main manifest 的兩個屬性必須指向已被驗證的
+# 資源檔名——只驗檔名不驗引用時，把 android:fullBackupContent 改指到另一個
+# （root 合法但 schema 錯置的）資源會讓 runtime 解析丟例外、備份靜默停用，
+# 而 gate 對兩個固定檔名仍 PASS（silent-drift 的最後一個未綁定環節）。
+MAIN_MANIFEST="$ROOT/app/src/main/AndroidManifest.xml"
+[ -f "$MAIN_MANIFEST" ] || fail "missing $MAIN_MANIFEST"
+grep -q 'android:fullBackupContent="@xml/backup_rules"' "$MAIN_MANIFEST" ||
+    fail "$MAIN_MANIFEST android:fullBackupContent must reference @xml/backup_rules"
+grep -q 'android:dataExtractionRules="@xml/data_extraction_rules"' "$MAIN_MANIFEST" ||
+    fail "$MAIN_MANIFEST android:dataExtractionRules must reference @xml/data_extraction_rules"
+
+# 縱深：掃描 app/src 下所有語意同形資源（檔名尾段含 backup*rules /
+# data_extraction*rules；未來 flavor overlay 以別名新增／覆寫 backup rules
+# 時也不能漏驗——精確檔名比對曾讓 overlay 逃過整段驗證）。main 兩檔已由
+# 上方固定路徑檢查，此處重複驗證無害。find 失敗不可靜默：POSIX 管道無
+# pipefail，assignment 的狀態取自最後一個管段（sort），故 find 不得與
+# sort 同管——先以非管道代入取 find 自身狀態（fail-closed），再由近乎
+# 不會失敗的 printf|sort 做排序。
+BACKUP_RULES_LIST="$(find "$ROOT/app/src" -type f \( -name '*backup*rules*.xml' -o -name '*data_extraction*rules*.xml' \) )" ||
+    fail 'deep-scan of backup rules resources failed'
+BACKUP_RULES_FILES="$(printf '%s\n' "$BACKUP_RULES_LIST" | sort)"
 while IFS= read -r f; do
+    [ -n "$f" ] || continue
     case "$f" in
-        *backup_rules.xml) broot=full-backup-content ;;
-        *data_extraction_rules.xml) broot=data-extraction-rules ;;
+        *backup*rules*.xml) broot=full-backup-content ;;
+        *data_extraction*rules*.xml) broot=data-extraction-rules ;;
         *) continue ;;
     esac
     python3 "$SCRIPT_DIR/backup_rules_check.py" --expect-root "$broot" "$f"
 done <<EOF
-$(find "$ROOT/app/src" -type f \( -name backup_rules.xml -o -name data_extraction_rules.xml \) 2>/dev/null | sort)
+$BACKUP_RULES_FILES
 EOF
 
 find_tool_pair() {

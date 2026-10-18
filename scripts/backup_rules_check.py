@@ -11,20 +11,24 @@ the gate still reports PASS.
 This module parses the XML with the stdlib parser and enforces:
 
 - the exact element structure, ignoring comments by construction;
-- the file↔root binding: Android expects ``backup_rules.xml`` (legacy) to have
-  a ``<full-backup-content>`` root and ``data_extraction_rules.xml`` a
+- the file↔root binding, enforced at EVERY call surface (REQUIRED argument):
+  Android expects ``backup_rules.xml`` (legacy) to have a
+  ``<full-backup-content>`` root and ``data_extraction_rules.xml`` a
   ``<data-extraction-rules>`` root (AOSP ``FullBackup.verifyTopLevelTag``
-  throws for the wrong tag and backup is silently disabled). Callers pass the
-  expected root via ``validate(path, expected_root)`` so a swapped or
-  misattributed file cannot pass;
+  throws for the wrong tag and backup is silently disabled). The shell gate
+  passes it via ``--expect-root``; hint-free validation is refused (the
+  swapped-file false-PASS repro stays closed outside the shell too);
 - Android's runtime strictness, mirroring ``FullBackup.validateInnerTagContents``:
-  unknown child tags and over-attribute ``<exclude>``/``<include>`` elements
+  unknown child tags (at ANY depth - the runtime parser is depth-agnostic
+  inside a section) and over-attribute ``<exclude>``/``<include>`` elements
   throw at runtime (backup silently disabled), so the gate rejects them too.
+  ``tools:``-namespace attributes never reach the runtime (aapt strips them)
+  and are excluded from the attribute counts.
 
 It is invoked by the shell gate and is directly unit-tested against negative
 fixtures. Run with:
 
-    python3 scripts/backup_rules_check.py [--expect-root <tag>] <file> [...]
+    python3 scripts/backup_rules_check.py --expect-root <tag> <file> [...]
 """
 
 from __future__ import annotations
@@ -51,9 +55,21 @@ EXPECTED_ROOT_DATA_EXTRACTION = "data-extraction-rules"
 # recognized inside the rule containers, <exclude> takes at most 2 attributes
 # (domain, path) and <include> at most 3 (domain, path, flags) - a stray extra
 # attribute makes the Android parser throw (backup disabled).
+#
+# `tools:`-namespace attributes are excluded from the count (aapt strips them
+# at compile time, so the runtime never sees them); everything else counts as-is.
 _ALLOWED_RULE_TAGS = frozenset({"include", "exclude"})
 _MAX_EXCLUDE_ATTRS = 2
 _MAX_INCLUDE_ATTRS = 3
+# Nesting guard: include/exclude never nest in Android's schema; the walk-ALL
+# recursion is bounded so a pathological suffix-of-70-nested-includes fixture
+# surfaces as a clean FAIL: line instead of an uncaught RecursionError (which
+# still exits non-zero, but without an actionable message).
+_MAX_RULE_NEST_DEPTH = 64
+_TOOLS_ATTR_NAMESPACES = (
+    "tools:",  # non-namespaced literal (defensive)
+    "{http://schemas.android.com/tools}",  # ElementTree-qualified tools:*
+)
 
 
 def _excludes(node: ET.Element) -> set[tuple[str, str]]:
@@ -65,9 +81,17 @@ def _where(branch_label: str) -> str:
 
 
 def _validate_rule_children(
-    path: str, node: ET.Element, branch_label: str = ""
+    path: str, node: ET.Element, branch_label: str = "", depth: int = 0
 ) -> list[str]:
-    """Reject tags/attribute shapes Android's runtime parser would throw on."""
+    """Reject tags/attribute shapes Android's runtime parser would throw on.
+
+    AOSP ``FullBackup.parseRules`` visits EVERY START_TAG at any depth inside a
+    rule section (the walk is depth-agnostic up to the section's END_TAG), and
+    ``validateInnerTagContents`` throws on any tag other than include/exclude.
+    So this walk recurses into include/exclude sub-trees too: a legal rule
+    element wrapping an unknown child would throw at runtime and must FAIL
+    here instead of passing the gate.
+    """
     errors: list[str] = []
     for child in node:
         tag = child.tag
@@ -78,12 +102,29 @@ def _validate_rule_children(
             )
             continue
         limit = _MAX_EXCLUDE_ATTRS if tag == "exclude" else _MAX_INCLUDE_ATTRS
-        attrs = set(child.keys())
+        # tools:* attrs are stripped by aapt before the Android runtime sees
+        # the compiled resource - counting them would reject runtime-valid
+        # files (false-FAIL). All other attributes count as-is.
+        attrs = {
+            key
+            for key in child.keys()
+            if not any(key.startswith(ns) for ns in _TOOLS_ATTR_NAMESPACES)
+        }
         if len(attrs) > limit:
             errors.append(
                 f"{path}: {_where(branch_label)}<{tag}> has {len(attrs)} attributes; "
                 f"Android allows at most {limit}"
             )
+        # Any-depth nesting: recurse even into legal include/exclude children,
+        # bounded by _MAX_RULE_NEST_DEPTH (well beyond any real rules file -
+        # deeper shapes fall out as a clean depth FAIL, not a RecursionError).
+        if depth >= _MAX_RULE_NEST_DEPTH:
+            errors.append(
+                f"{path}: {_where(branch_label)}<{tag}> exceeds the maximum "
+                f"rule nesting depth {_MAX_RULE_NEST_DEPTH}"
+            )
+            continue
+        errors.extend(_validate_rule_children(path, child, branch_label, depth + 1))
     return errors
 
 
@@ -91,18 +132,21 @@ def _missing_exclude_errors(
     path: str, branch_label: str, present: set[tuple[str, str]]
 ) -> list[str]:
     return [
-        f"{path}: {branch_label} missing exclude domain={domain} path={rule_path}"
+        f"{path}: {_where(branch_label)}missing exclude domain={domain} path={rule_path}"
         for domain, rule_path in REQUIRED_EXCLUDES
         if (domain, rule_path) not in present
     ]
 
 
-def validate(path: str, expected_root: str | None = None) -> list[str]:
+def validate(path: str, expected_root: str) -> list[str]:
     """Return a list of human-readable violations (empty when valid).
 
-    When ``expected_root`` is given (the gate always passes it), a file whose
-    root element differs is rejected outright: the wrong schema would be
-    silently ignored or throw at Android's runtime parse.
+    ``expected_root`` is REQUIRED: the file↔root binding is the whole point of
+    this validator (Android's ``verifyTopLevelTag`` throws for a wrong root and
+    backup/restore is silently disabled). A hint-free call cannot prove which
+    schema the caller intended, so every invocation surface must pass the
+    binding explicitly - the swapped-file false-PASS (reviewer repro) stays
+    closed even outside the shell gate.
     """
     try:
         root = ET.parse(path).getroot()
@@ -111,7 +155,7 @@ def validate(path: str, expected_root: str | None = None) -> list[str]:
     except OSError as exc:
         return [f"{path}: unreadable: {exc}"]
 
-    if expected_root is not None and root.tag != expected_root:
+    if root.tag != expected_root:
         return [f"{path}: expected root <{expected_root}>, found <{root.tag}>"]
 
     errors: list[str] = []
@@ -162,13 +206,15 @@ def main(argv: list[str]) -> int:
         else:
             paths.append(args[i])
             i += 1
-    if not paths:
-        # Fail closed: an accidental empty invocation must not PASS an empty
-        # harness run. Usage names the two expected roots.
+    if not paths or expected_root is None:
+        # Fail closed: an empty invocation OR a missing expected-root hint
+        # must never PASS (the hint-free swapped-file false-PASS was the
+        # reviewer's original repro; the gate and every other caller must
+        # pass the file↔root binding explicitly).
         print(
-            "usage: backup_rules_check.py [--expect-root <tag>] <rules.xml> [...] "
-            "(--expect-root full-backup-content for backup_rules.xml; "
-            "--expect-root data-extraction-rules for data_extraction_rules.xml)",
+            "usage: backup_rules_check.py --expect-root <tag> <rules.xml> [...] "
+            "(--expect-root full-backup-content for full-backup-content files; "
+            "--expect-root data-extraction-rules for data-extraction-rules files)",
             file=sys.stderr,
         )
         return 2

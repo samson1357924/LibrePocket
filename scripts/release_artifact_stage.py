@@ -78,7 +78,7 @@ def _validate_expected(flavor: str, args: argparse.Namespace) -> dict[str, str]:
     version_code = getattr(args, f"{flavor}_version_code")
     version_name = getattr(args, f"{flavor}_version_name")
     cert = getattr(args, f"{flavor}_cert_sha256").lower()
-    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+", package):
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+", package) or len(package) > 255:
         _fail(f"invalid expected package for {flavor}")
     if not re.fullmatch(r"[1-9][0-9]*", version_code) or int(version_code) > 2_147_483_647:
         _fail(f"invalid expected versionCode for {flavor}")
@@ -290,6 +290,7 @@ def _assert_stage_integrity(
         _fail(f"{stage_dir.name} identity manifest checksum does not match verifier result")
     if (
         identity_data.get("package") != expected_identity["package"]
+        or type(identity_data.get("versionCode")) is not int
         or identity_data.get("versionCode") != int(expected_identity["versionCode"])
         or identity_data.get("versionName") != expected_identity["versionName"]
         or identity_data.get("signerCertificateSha256") != expected_identity["certificateSha256"]

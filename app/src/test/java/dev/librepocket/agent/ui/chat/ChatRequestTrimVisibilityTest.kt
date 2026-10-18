@@ -290,6 +290,7 @@ class ChatRequestTrimVisibilityTest {
 
         // Attach resets (no stale badge on the new session)...
         onMain { vm.openSession(fresh) }
+        awaitTrue { vm.currentSessionId.value == fresh }
         awaitTrue { vm.messages.value.isEmpty() }
         assertEquals(0, vm.requestTrimmedCount.value)
         // ...and an untrimmed send emits 0 through the same path.

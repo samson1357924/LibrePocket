@@ -699,6 +699,13 @@ class TurnController(
             "",
             pending.attemptIndexRef.get(),
           )
+          try {
+            orderedTranscript.flushBufferedUsageBestEffort(
+              pending.attemptRef.get(), pending.logicalTurnId, pending.attemptIndexRef.get(),
+            )
+          } catch (e: Throwable) {
+            if (e is VirtualMachineError || e is ThreadDeath) throw e
+          }
         }
         if (completed == null) {
           // M3 landing check: an orphan is always a first-attempt family
@@ -1202,6 +1209,15 @@ class TurnController(
             }
             false
           } else {
+            try {
+              orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId, receipt.cancelParent, receipt.cancelIndex)
+              if (receipt.cancelId != receipt.logicalTurnId) {
+                orderedTranscript.flushBufferedUsageBestEffort(receipt.logicalTurnId, null, receipt.cancelIndex)
+              }
+              orderedTranscript.flush()
+            } catch (e: Throwable) {
+              if (e is VirtualMachineError || e is ThreadDeath) throw e
+            }
             true
           }
         } catch (_: ClosedSendChannelException) {
@@ -1236,6 +1252,12 @@ class TurnController(
             }
             false
           } else {
+            try {
+              orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId, receipt.cancelParent, receipt.cancelIndex)
+              orderedTranscript.flush()
+            } catch (e: Throwable) {
+              if (e is VirtualMachineError || e is ThreadDeath) throw e
+            }
             true
           }
         } catch (_: ClosedSendChannelException) {
@@ -1271,6 +1293,12 @@ class TurnController(
             }
             false
           } else {
+            try {
+              orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId, receipt.cancelParent, receipt.cancelIndex)
+              orderedTranscript.flush()
+            } catch (e: Throwable) {
+              if (e is VirtualMachineError || e is ThreadDeath) throw e
+            }
             true
           }
         } catch (_: ClosedSendChannelException) {
@@ -1312,6 +1340,12 @@ class TurnController(
             }
             false
           } else {
+            try {
+              orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId, receipt.cancelParent, receipt.cancelIndex)
+              orderedTranscript.flush()
+            } catch (e: Throwable) {
+              if (e is VirtualMachineError || e is ThreadDeath) throw e
+            }
             true
           }
         } catch (_: ClosedSendChannelException) {
@@ -4043,6 +4077,15 @@ class TurnController(
                 if (!deferred) {
                   try {
                     orderedTranscript.onLogicalTurnCancelled(logicalTurnId, cancelId, cancelText, cancelIndex)
+                    try {
+                      orderedTranscript.flushBufferedUsageBestEffort(cancelId, cancelParent, cancelIndex)
+                      if (cancelId != logicalTurnId) {
+                        orderedTranscript.flushBufferedUsageBestEffort(logicalTurnId, null, null)
+                      }
+                      orderedTranscript.flush()
+                    } catch (e: Throwable) {
+                      if (e is VirtualMachineError || e is ThreadDeath) throw e
+                    }
                   } catch (_: ClosedSendChannelException) {
                   } catch (sealFailure: CancellationException) {
                     if (!orderedTranscript.isSealed()) throw sealFailure
@@ -4075,6 +4118,12 @@ class TurnController(
               } else {
                 try {
                   orderedTranscript.onTurnCancelled(cancelId, cancelText, cancelParent, cancelIndex, cancelReasoning)
+                  try {
+                    orderedTranscript.flushBufferedUsageBestEffort(cancelId, cancelParent, cancelIndex)
+                    orderedTranscript.flush()
+                  } catch (e: Throwable) {
+                    if (e is VirtualMachineError || e is ThreadDeath) throw e
+                  }
                 } catch (_: ClosedSendChannelException) {
                   // Sealed after close(): explicit INTERRUPTED mark already recorded.
                 } catch (sealFailure: CancellationException) {
@@ -4881,6 +4930,14 @@ class TurnController(
         )
         terminalizedAttempts.add(attemptRunId)
         afterTerminalAckForTest?.invoke(attemptRunId)
+        try {
+          orderedTranscript.flushBufferedUsageBestEffort(
+            attemptRunId, parentFor(attemptRunId, logicalTurnId), attempt,
+          )
+          orderedTranscript.flush()
+        } catch (e: Throwable) {
+          if (e is VirtualMachineError || e is ThreadDeath) throw e
+        }
         discardTextBuffer(attemptRunId)
         return
       }
@@ -4918,6 +4975,14 @@ class TurnController(
         )
         terminalizedAttempts.add(attemptRunId)
         afterTerminalAckForTest?.invoke(attemptRunId)
+        try {
+          orderedTranscript.flushBufferedUsageBestEffort(
+            attemptRunId, parentFor(attemptRunId, logicalTurnId), attempt,
+          )
+          orderedTranscript.flush()
+        } catch (e: Throwable) {
+          if (e is VirtualMachineError || e is ThreadDeath) throw e
+        }
         discardTextBuffer(attemptRunId)
         return
       }
@@ -4949,6 +5014,14 @@ class TurnController(
       )
       terminalizedAttempts.add(attemptRunId)
       afterTerminalAckForTest?.invoke(attemptRunId)
+      try {
+        orderedTranscript.flushBufferedUsageBestEffort(
+          attemptRunId, parentFor(attemptRunId, logicalTurnId), attempt,
+        )
+        orderedTranscript.flush()
+      } catch (e: Throwable) {
+        if (e is VirtualMachineError || e is ThreadDeath) throw e
+      }
       discardTextBuffer(attemptRunId)
       attempt += 1
       val waitMs = retryConfig.delayForRetry(attempt)

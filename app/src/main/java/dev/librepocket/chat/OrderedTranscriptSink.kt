@@ -689,6 +689,12 @@ class OrderedTranscriptSink(
   override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) =
     writeOrdered { delegate.onUsage(runId, inputTokens, outputTokens) }
 
+  override suspend fun flushBufferedUsageBestEffort(
+    runId: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+  ) = writeOrdered { delegate.flushBufferedUsageBestEffort(runId, parentRunId, attemptIndex) }
+
   /**
    * Awaits the unified admission tail until stable (no newer reservation).
    * Used only by [flush] before it reserves its barrier slot: steers, cores,

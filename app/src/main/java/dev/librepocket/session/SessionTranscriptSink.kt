@@ -126,6 +126,11 @@ class SessionTranscriptSink(
          * (one live attempt) never trips this.
          */
         const val MAX_PENDING_USAGE_RUNS = 256
+
+        /**
+         * Bound on retained failed-terminal usage rows (#94 P2).
+         */
+        const val MAX_RETAINED_FAILED_USAGE_RUNS = 256
     }
 
     /** Pre-terminal authoritative usage per runId (#84, last-wins merged). */
@@ -133,6 +138,8 @@ class SessionTranscriptSink(
 
     /** Buffered usages not yet flushed with their attempt terminal. Single-writer (Ordered), insertion-ordered. Guarded by the ordered single-writer discipline of the hosting session writer — never touch from a second writer. */
     private val pendingUsage = LinkedHashMap<String, PendingUsage>()
+
+    private val retainedFailedUsage = LinkedHashMap<String, PendingUsage>()
 
     /** Per-run pre-terminal onUsage arrival counts for the flood cap. Same single-writer guard as [pendingUsage]. */
     private val usageSeen = HashMap<String, Int>()
@@ -245,23 +252,20 @@ class SessionTranscriptSink(
      * row is flushed, so a later trailing call drops (exactly one usage row
      * per runId ever).
      */
-    private suspend fun flushBufferedUsageBestEffort(
+    override suspend fun flushBufferedUsageBestEffort(
         runId: String,
-        parentRunId: String? = null,
-        attemptIndex: Int? = null,
+        parentRunId: String?,
+        attemptIndex: Int?,
     ) {
         // Mutual exclusion with the trailing path: if a trailing usage already
         // landed for this runId, drop the buffered entry (no duplicate row).
         if (runId in trailingUsageWritten) {
             pendingUsage.remove(runId)
+            retainedFailedUsage.remove(runId)
             usageSeen.remove(runId)
             return
         }
-        val usage = pendingUsage[runId] ?: return
-        // Best-effort post-core flush: never propagates (including
-        // CancellationException), so a usage-write failure cannot negate an
-        // already-committed terminal ack. Retain the buffered entry on failure
-        // so a later retry terminal still owns its authoritative row.
+        val usage = pendingUsage[runId] ?: retainedFailedUsage[runId] ?: return
         var ok = false
         try {
             store.appendEvent(
@@ -281,12 +285,20 @@ class SessionTranscriptSink(
             ok = true
         } catch (e: Throwable) {
             if (e is Error) throw e
-            // Best-effort: retain buffered entry for retry.
         }
         if (ok) {
             pendingUsage.remove(runId)
+            retainedFailedUsage.remove(runId)
             usageSeen.remove(runId)
             trailingUsageWritten.add(runId)
+        } else {
+            pendingUsage.remove(runId)
+            usageSeen.remove(runId)
+            retainedFailedUsage[runId] = usage
+            while (retainedFailedUsage.size > MAX_RETAINED_FAILED_USAGE_RUNS) {
+                val oldest = retainedFailedUsage.keys.firstOrNull() ?: break
+                retainedFailedUsage.remove(oldest)
+            }
         }
     }
 
@@ -353,7 +365,6 @@ class SessionTranscriptSink(
         // #84 follow-up: authoritative usage flushes best-effort after the
         // core ack (see flushBufferedUsageBestEffort), never in the batch.
         markTerminalized(runId)
-        flushBufferedUsageBestEffort(runId)
     }
 
     override suspend fun onTurnSucceeded(
@@ -375,7 +386,6 @@ class SessionTranscriptSink(
         // #84 follow-up: authoritative usage flushes best-effort after the
         // core ack (see flushBufferedUsageBestEffort), never in the batch.
         markTerminalized(runId)
-        flushBufferedUsageBestEffort(runId, parentRunId, attemptIndex)
     }
 
     /**
@@ -388,13 +398,11 @@ class SessionTranscriptSink(
     override suspend fun onTurnFailed(runId: String, error: String) {
         appendDurable(runId, "system", "turn $runId failed: ${Redactor.redactError(error)}", isFinal = true)
         markTerminalized(runId)
-        flushBufferedUsageBestEffort(runId)
     }
 
     override suspend fun onTurnFailed(runId: String, partialText: String, error: String) {
         appendDurable(runId, "assistant", partialText, isPartial = true, failureReason = error, isFinal = true)
         markTerminalized(runId)
-        flushBufferedUsageBestEffort(runId)
     }
 
     override suspend fun onTurnFailed(
@@ -411,7 +419,6 @@ class SessionTranscriptSink(
             isFinal = true,
         )
         markTerminalized(runId)
-        flushBufferedUsageBestEffort(runId, parentRunId, attemptIndex)
     }
 
     override suspend fun onTurnFailed(
@@ -429,7 +436,6 @@ class SessionTranscriptSink(
             isFinal = isFinal,
         )
         markTerminalized(runId)
-        flushBufferedUsageBestEffort(runId, parentRunId, attemptIndex)
     }
 
     /**
@@ -456,7 +462,6 @@ class SessionTranscriptSink(
                 isFinal = isFinal,
             )
             markTerminalized(runId)
-        flushBufferedUsageBestEffort(runId, parentRunId, attemptIndex)
             return
         }
         val now = clock()
@@ -484,7 +489,6 @@ class SessionTranscriptSink(
         // core ack (see flushBufferedUsageBestEffort), never in the batch.
         appendDurableBatch(batch)
         markTerminalized(runId)
-        flushBufferedUsageBestEffort(runId, parentRunId, attemptIndex)
     }
 
     override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) {
@@ -501,7 +505,6 @@ class SessionTranscriptSink(
         // #84 follow-up: authoritative usage flushes best-effort after the
         // core ack (see flushBufferedUsageBestEffort), never in the batch.
         markTerminalized(runId)
-        flushBufferedUsageBestEffort(runId)
     }
 
     override suspend fun onTurnCancelled(
@@ -528,7 +531,6 @@ class SessionTranscriptSink(
         // #84 follow-up: authoritative usage flushes best-effort after the
         // core ack (see flushBufferedUsageBestEffort), never in the batch.
         markTerminalized(runId)
-        flushBufferedUsageBestEffort(runId, parentRunId, attemptIndex)
     }
 
     /**
@@ -556,8 +558,6 @@ class SessionTranscriptSink(
         // the logical id's if distinct (see flushBufferedUsageBestEffort).
         markTerminalized(logicalTurnId)
         markTerminalized(attemptRunId)
-        flushBufferedUsageBestEffort(attemptRunId)
-        if (attemptRunId != logicalTurnId) flushBufferedUsageBestEffort(logicalTurnId)
     }
 
     /**
@@ -636,9 +636,6 @@ class SessionTranscriptSink(
         appendDurableBatch(batch)
         markTerminalized(logicalTurnId)
         markTerminalized(attemptRunId)
-        flushBufferedUsageBestEffort(
-            attemptRunId, parentRunId = parentRunId, attemptIndex = attemptIndex,
-        )
     }
 
     override suspend fun onSteerQueued(text: String) {
@@ -675,11 +672,16 @@ class SessionTranscriptSink(
      */
     override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) {
         if (runId in terminalizedRuns) {
-            if (runId in trailingUsageWritten) return
-            // Merge with any retained buffered pre-terminal usage (e.g. a
-            // failed flush) so an authoritative earlier value is not replaced
-            // by nulls.
-            val prev = pendingUsage[runId]
+            if (runId in trailingUsageWritten) {
+                pendingUsage.remove(runId)
+                retainedFailedUsage.remove(runId)
+                usageSeen.remove(runId)
+                return
+            }
+            // Merge with any retained buffered usage (active or
+            // failed-terminal) so an authoritative earlier value is not
+            // replaced by nulls.
+            val prev = pendingUsage[runId] ?: retainedFailedUsage[runId]
             val inTok = inputTokens ?: prev?.inputTokens
             val outTok = outputTokens ?: prev?.outputTokens
             var ok = false
@@ -704,7 +706,19 @@ class SessionTranscriptSink(
             if (ok) {
                 trailingUsageWritten.add(runId)
                 pendingUsage.remove(runId)
+                retainedFailedUsage.remove(runId)
                 usageSeen.remove(runId)
+            } else {
+                // Retain in the failed-terminal bucket for a later retry,
+                // never the active quota.
+                pendingUsage.remove(runId)
+                usageSeen.remove(runId)
+                val merged = PendingUsage(inputTokens = inTok, outputTokens = outTok)
+                retainedFailedUsage[runId] = merged
+                while (retainedFailedUsage.size > MAX_RETAINED_FAILED_USAGE_RUNS) {
+                    val oldest = retainedFailedUsage.keys.firstOrNull() ?: break
+                    retainedFailedUsage.remove(oldest)
+                }
             }
             return
         }

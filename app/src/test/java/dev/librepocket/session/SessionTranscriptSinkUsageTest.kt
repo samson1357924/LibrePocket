@@ -56,6 +56,7 @@ class SessionTranscriptSinkUsageTest {
         sink.onUsage("r1", 10, null)
         sink.onUsage("r1", 10, 20)
         sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
 
         val rows = usageRows(store)
         assertEquals(1, rows.size)
@@ -72,6 +73,7 @@ class SessionTranscriptSinkUsageTest {
         sink.onUsage("r1", 10, null)
         sink.onUsage("r1", null, 20)
         sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
 
         val rows = usageRows(store)
         assertEquals(1, rows.size)
@@ -86,6 +88,7 @@ class SessionTranscriptSinkUsageTest {
 
         repeat(100) { i -> sink.onUsage("r1", i, i * 2) }
         sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
 
         val rows = usageRows(store)
         assertEquals(1, rows.size)
@@ -100,6 +103,7 @@ class SessionTranscriptSinkUsageTest {
 
         repeat(130) { i -> sink.onUsage("r1", i, i * 2) }
         sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
 
         // Past MAX_USAGE_EVENTS_PER_RUN the merge freezes (never a failure,
         // never unbounded CPU): the row keeps the cap's values, still one row.
@@ -117,7 +121,9 @@ class SessionTranscriptSinkUsageTest {
         sink.onUsage("a", 1, 1)
         sink.onUsage("b", 2, 2)
         sink.onTurnSucceeded("a", "first", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("a")
         sink.onTurnSucceeded("b", "second", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("b")
 
         val rows = usageRows(store)
         assertEquals(2, rows.size)
@@ -134,6 +140,7 @@ class SessionTranscriptSinkUsageTest {
         // Legacy call order (terminal already written): the first trailing
         // call keeps the historical single-row shape, the rest rate-limit.
         sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
         sink.onUsage("r1", 10, 20)
         sink.onUsage("r1", 11, 21)
         sink.onUsage("r1", 12, 22)
@@ -152,6 +159,7 @@ class SessionTranscriptSinkUsageTest {
         sink.onUsage("r1", 7, null)
         sink.onUsage("r1", null, 8)
         sink.onTurnFailed("r1", "half", "boom", null, 0, true, false)
+        sink.flushBufferedUsageBestEffort("r1", null, 0)
 
         val rows = usageRows(store)
         assertEquals(1, rows.size)
@@ -166,6 +174,7 @@ class SessionTranscriptSinkUsageTest {
 
         sink.onUsage("r1", 3, 4)
         sink.onTurnCancelled("r1", "partial", null, 0, false)
+        sink.flushBufferedUsageBestEffort("r1", null, 0)
 
         val rows = usageRows(store)
         assertEquals(1, rows.size)
@@ -183,6 +192,7 @@ class SessionTranscriptSinkUsageTest {
 
             repeat(count) { i -> sink.onUsage("r1", i, i * 2) }
             sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
 
             val rows = usageRows(store)
             assertEquals("$count events still one row", 1, rows.size)
@@ -203,7 +213,9 @@ class SessionTranscriptSinkUsageTest {
         // runIds, never updates to an already-buffered one).
         sink.onUsage("r0", 100, 100)
         sink.onTurnSucceeded("r0", "kept", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r0")
         sink.onTurnSucceeded("r299", "dropped", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r299")
 
         val rows = usageRows(store)
         assertEquals("usage input=100 output=100", rows.first { it.runId == "r0" }.text)
@@ -217,6 +229,7 @@ class SessionTranscriptSinkUsageTest {
         val sink = SessionTranscriptSink(store, sid) { 42L }
 
         sink.onTurnFailed("r1", "half", "boom", null, 0, true, false)
+        sink.flushBufferedUsageBestEffort("r1", null, 0)
         sink.onUsage("r1", 10, 20)
         sink.onUsage("r1", 11, 21)
 
@@ -235,6 +248,7 @@ class SessionTranscriptSinkUsageTest {
 
         sink.onUsage("r1", 1, 2)
         sink.onTurnSucceeded("r1", "ok", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
         sink.onUsage("r1", 3, 4)
 
         val rows = usageRows(store)
@@ -254,6 +268,7 @@ class SessionTranscriptSinkUsageTest {
         // Core single assistant row is call #1, usage notice is call #2
         // (fault swallowed) — the terminal itself must not throw.
         sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
 
         assertTrue("usage fault must be swallowed", usageRows(store).isEmpty())
         val assistants = store.events.filter { it.runId == "r1" && it.kind == "assistant" }
@@ -276,6 +291,7 @@ class SessionTranscriptSinkUsageTest {
             // Batch is [reasoning #1, assistant #2]: the fault strands the
             // marker while the terminal throws — no committed final.
             sink.onTurnSucceeded("r1", "hi there", hasReasoning = true)
+            sink.flushBufferedUsageBestEffort("r1")
             fail("core batch fault must propagate")
         } catch (_: IOException) {
         }
@@ -293,6 +309,7 @@ class SessionTranscriptSinkUsageTest {
 
         sink.onUsage("r1", 7, 8)
         sink.onTurnFailed("r1", "half", "boom", null, 0, true, false)
+        sink.flushBufferedUsageBestEffort("r1", null, 0)
 
         val partials = store.events.filter { it.runId == "r1" && it.kind == "assistant" }
         assertEquals(1, partials.size)
@@ -309,6 +326,7 @@ class SessionTranscriptSinkUsageTest {
 
         sink.onUsage("r1", 3, 4)
         sink.onTurnCancelled("r1", "partial", null, 0, false)
+        sink.flushBufferedUsageBestEffort("r1", null, 0)
 
         val partials = store.events.filter { it.runId == "r1" && it.kind == "assistant" }
         assertEquals(1, partials.size)
@@ -349,12 +367,14 @@ class SessionTranscriptSinkUsageTest {
         try {
             // Core single assistant row is call #1: nothing commits.
             sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
             fail("core fault must propagate")
         } catch (_: IOException) {
         }
         assertTrue(store.events.none { it.runId == "r1" })
         // Retry: assistant is call #2, usage notice is call #3 — both land.
         sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
 
         val rows = usageRows(store)
         assertEquals(1, rows.size)

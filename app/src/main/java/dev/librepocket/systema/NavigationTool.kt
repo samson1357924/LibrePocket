@@ -87,10 +87,18 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
       if (e is kotlin.coroutines.cancellation.CancellationException) throw e
       return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到導航（${ReasonCodes.INTERNAL}）")
     }
-    return launcher.launchCatching(spec).toToolResult(
-      spec, "導航",
-      usedFallbackOnSuccess = !env.hasMapApp, successReason = check.reasonCode,
-    )
+    return when (val launched = launcher.launchCatching(spec)) {
+      // 發現式缺席（靜態有地圖但發射無處理者：被移除/停用/不可見）與靜態
+      // DEGRADED 同語義：走 [fallback] 網頁地圖話術（usedFallback=true，spec 保留）。
+      LaunchResult.NoHandler -> ToolResult(
+        false, true, spec, ReasonCodes.NO_HANDLER, fallback(params, env).userMessage,
+      )
+      // Success/Internal 走共用收斂（成功時以 usedFallbackOnSuccess 標記靜態 DEGRADED）。
+      else -> launched.toToolResult(
+        spec, "導航",
+        usedFallbackOnSuccess = !env.hasMapApp, successReason = check.reasonCode,
+      )
+    }
   }
 
   override fun fallback(params: Params, env: SystemEnv): FallbackSpec {

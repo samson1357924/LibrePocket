@@ -235,7 +235,8 @@ class IntentTypedD2Test {
   }
 
   // 註：未知子類分支無法單測——實測編譯器拒絕測試源集新增 sealed 子類；
-  // else-throw 是給未來主模組新增子類的 runtime 保底。
+  // [AndroidIntentLauncher.toIntent] 以 sealed 窮舉 when（賦值迫使編譯期檢查）
+  // 保證新增子類未補分支即編譯錯，無需 else-throw 的 runtime 保底。
 
   @Test fun launchCatching_rethrowsCancellation() {
     val cancelling = IntentLauncher {

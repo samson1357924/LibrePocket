@@ -129,10 +129,12 @@ class SkillStartupRecoveryTest {
             } catch (e: java.io.IOException) {
                 org.junit.Assume.assumeNoException("cannot create symlink", e)
             }
+            // 直接在 symlink 目標（real）建立「過期」條目：若無 symlink 防衛，
+            // listResiduals(link) 會 follow symlink 而列出它；有防衛則回空。
             val tid = Thread.currentThread().id
-            File(link, ".sym-skill.tmp-${System.nanoTime()}-$tid").apply {
+            File(real, ".sym-skill.tmp-${System.nanoTime()}-$tid").apply {
                 mkdirs()
-                setLastModified(System.currentTimeMillis() - 120_000L)
+                setLastModified(System.currentTimeMillis() - (25L * 60 * 60 * 1000))
             }
             assertTrue(SkillInstaller.listResiduals(link).isEmpty())
         } finally {

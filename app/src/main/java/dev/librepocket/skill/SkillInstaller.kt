@@ -293,9 +293,9 @@ object SkillInstaller {
      * 全保留，此處一併列出供人工核對）；實際收斂仍以 [cleanupStaleStaging]
      * 回傳計數為準。回傳按檔名排序，保證穩定。
      *
-     * 注意：崩潰窗口候選（target 缺席的新鮮 `.bak`）不在此列——它們一定會被
-     * [cleanupStaleStaging] 不問齡期立即還原，無需人工核對；本函式只列仍受
-     * [maxAgeMillis] 保護的過期 staging／target 仍在的孤兒 `.bak`。
+     * 注意：本函式只依「形狀 + 齡期」過濾，**不區分 target 是否存在**——
+     * 會被 [cleanupStaleStaging] 不問齡期立即還原的崩潰窗口候選（target 缺席的
+     * 新鮮 `.bak`）若已過期，仍會在此列出供觀察；是否還原以清理結果為準。
      */
     fun listResiduals(destRoot: File, maxAgeMillis: Long = STALE_STAGING_MAX_AGE_MILLIS): List<File> {
         if (!destRoot.isDirectory) return emptyList()

@@ -691,6 +691,26 @@ class IntentAdapterStage1Test {
     assertTrue(discovered.message, "網頁播放器" in discovered.message)
   }
 
+  @Test fun navigation_executeNoHandler_degradesToWeb() {
+    // 發現式缺席（靜態有地圖但發射無處理者）與靜態 DEGRADED 同語義：
+    // ok=false + usedFallback=true + NO_HANDLER + 網頁地圖話術（spec 保留）。
+    val noHandler = IntentLauncher { LaunchResult.NoHandler }
+    val discovered = NavigationTool.execute(NavigationTool.Params(query = "夜市"), env, noHandler)
+    assertFalse(discovered.ok)
+    assertTrue(discovered.usedFallback)
+    assertEquals(ReasonCodes.NO_HANDLER, discovered.reasonCode)
+    assertTrue(discovered.message, "網頁地圖" in discovered.message)
+    assertEquals(IntentActions.VIEW, discovered.spec?.action)
+
+    val degraded = NavigationTool.execute(
+      NavigationTool.Params(query = "夜市"), env.copy(hasMapApp = false), noHandler,
+    )
+    assertFalse(degraded.ok)
+    assertTrue(degraded.usedFallback)
+    assertEquals(ReasonCodes.NO_HANDLER, degraded.reasonCode)
+    assertTrue(degraded.message, "網頁地圖" in degraded.message)
+  }
+
   // ---- i. #15 對齊：Calendar Provider 門禁分支涵蓋 ----
 
   @Test fun calendar_checkQuery_readGrantedMatrix() {

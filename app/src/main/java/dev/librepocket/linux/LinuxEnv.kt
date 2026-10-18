@@ -21,6 +21,8 @@ import java.security.MessageDigest
  * 本檔案零 Android 依賴，JVM 單測可直接斷言。
  */
 object LinuxEnv {
+    private val SHA256_RE = Regex("[0-9a-fA-F]{64}")
+    private val DIGEST_RE = Regex("sha256:[0-9a-fA-F]{64}")
 
     /** proot 落盤檔名（`bin/` 下，PRIVATE 域，mode 0700）。 */
     const val PROOT_BIN_NAME = "proot"
@@ -159,7 +161,7 @@ object LinuxEnv {
         if ("@" in authority) return "USERINFO_FORBIDDEN"
         val host = authority.substringBefore(':')
         if (host.isBlank() || host.contains(' ') || host.contains('\t')) return "BAD_HOST"
-        if (!spec.sha256Hex.matches(Regex("[0-9a-fA-F]{64}"))) return "SHA256_REQUIRED"
+        if (!spec.sha256Hex.matches(SHA256_RE)) return "SHA256_REQUIRED"
         if (spec.sizeBytes == 0L || spec.sizeBytes < -1L) return "BAD_SIZE"
         return null
     }
@@ -180,7 +182,7 @@ object LinuxEnv {
         val at = ref.indexOf('@')
         if (at < 0) return "DIGEST_PIN_REQUIRED"
         val digest = ref.substring(at + 1)
-        if (!digest.matches(Regex("sha256:[0-9a-fA-F]{64}"))) return "DIGEST_PIN_REQUIRED"
+        if (!digest.matches(DIGEST_RE)) return "DIGEST_PIN_REQUIRED"
         if (ref.substring(0, at).isBlank()) return "EMPTY_REF"
         return null
     }

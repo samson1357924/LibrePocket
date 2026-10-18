@@ -14,11 +14,14 @@ import dev.librepocket.tool.ToolRegistry
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ensureActive
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.put
+import java.text.Normalizer
 import java.time.Clock
 import kotlin.coroutines.coroutineContext
 
@@ -42,7 +45,8 @@ import kotlin.coroutines.coroutineContext
  * 4. latest [ProjectionContext] scope re-check;
  * 5. arguments schema validation (JSON object, required non-blank `query`,
  *    optional `limit` int clamped 1..200, optional `pathPrefix` string
- *    without traversal: no `..`, no leading `/`, no backslash);
+ *    without traversal: no `..`, no leading `/`, no backslash, no `:`
+ *    (scheme/proot/drive-absolute roots), no percent-escapes);
  * 6. fresh `tool.exec` [PolicyStore.evaluateFresh] (ALLOW only; ASK/DENY/
  *    failure all deny);
  * 7. [PrivilegeGate] (READ passes without confirmation; anything else denies);
@@ -93,21 +97,29 @@ class SafeToolSlice(
          * transcript/provider continuation. Ok echoes carry a
          * `…[truncated N→cap]` marker so the model can tell echo from input;
          * deny echoes are silently capped (codes are fixed constants).
+         * Lengths are measured on the POST-redaction string: redaction can
+         * inflate a field (e.g. `⟦REDACTED:EMAIL⟧`), so a ≤cap raw string may
+         * exceed the cap after redaction — truncation is decided there, and
+         * the marker reports the post-redaction length.
          */
         const val MAX_STRING_CHARS = 500
         /** Per-input cap for model-controlled `query` / `pathPrefix` (fail-closed). */
         const val MAX_INPUT_CHARS = 4096
+        /** Total cap for serialized tool result JSON (fail-closed continuation budget). */
+        const val MAX_RESULT_CHARS = 20_000
     }
 
     /**
-     * Test seam run before EACH execution (after cancel check, before any
-     * gate): lets cancel tests park the loop in the deny/execute window and
-     * then cancel, proving zero backend invocations. Production leaves null.
-     * Volatile so a mid-turn install from the test thread is visible to the
+     * Test seam (internal: production composition leaves null) run before
+     * EACH execution (after cancel check, before any gate): lets cancel
+     * tests park the loop in the deny/execute window and then cancel,
+     * proving zero backend invocations. Read once into a local before
+     * invocation so a concurrent re-install cannot swap the hook mid-call;
+     * volatile so a mid-turn install from the test thread is visible to the
      * turn dispatcher thread.
      */
     @Volatile
-    var beforeExecuteForTest: (suspend () -> Unit)? = null
+    internal var beforeExecuteForTest: (suspend () -> Unit)? = null
 
     /** Typed deny codes (audit-stable, user-visible in the paired denial). */
     object DenyCodes {
@@ -162,15 +174,52 @@ class SafeToolSlice(
         // build denials or touch the backend (zero further effects).
         coroutineContext.ensureActive()
         if (calls.size > maxCallsPerTurn) {
-            return calls.map { deny(it, DenyCodes.BUDGET_EXCEEDED, "at most $maxCallsPerTurn tool round per turn") }
+            return calls.map { deny(it, DenyCodes.BUDGET_EXCEEDED, "at most $maxCallsPerTurn tool calls per round") }
         }
         return calls.map { executeOne(it) }
     }
 
+    /**
+     * Wire-safe redacted echo of a tool call's arguments: parse-then-redact
+     * (token-level inside each JSON string) and re-serialize a still-valid
+     * JSON object. Provider adapters re-parse this echo before serializing
+     * the continuation (`validateToolPairing`), so a raw-text redact or a
+     * `take` would corrupt the structure (several redaction rules swallow
+     * the terminating `"`/`}` of a value) and turn a working round into a
+     * non-retryable `TOOL_ARGUMENTS_INVALID` failure. On any parse failure,
+     * or when the re-serialized form exceeds [MAX_INPUT_CHARS], a fixed
+     * minimal object is emitted instead (fail-closed, still a valid object).
+     */
+    private fun redactedArgsEcho(argumentsJson: String): String {
+        val fallback = buildJsonObject { put("echo", "args redacted/capped") }.toString()
+        val root = try {
+            Json.parseToJsonElement(argumentsJson)
+        } catch (_: Exception) {
+            return fallback
+        }
+        val redacted = redactJsonStrings(root).toString()
+        return if (redacted.length <= MAX_INPUT_CHARS) redacted else fallback
+    }
+
+    /** Deep-walks a JSON value, redacting every string primitive's content.
+     *  Recursion depth is bounded upstream by the provider wire parser
+     *  (≤ MiniJson.MAX_DEPTH) — do not call with unbounded-depth input. */
+    private fun redactJsonStrings(element: JsonElement): JsonElement = when (element) {
+        is JsonPrimitive ->
+            if (element.isString) {
+                JsonPrimitive(dev.librepocket.redact.Redactor.redact(element.content).text)
+            } else {
+                element
+            }
+        is JsonObject -> JsonObject(element.entries.associate { (k, v) -> k to redactJsonStrings(v) })
+        is JsonArray -> JsonArray(element.map { redactJsonStrings(it) })
+    }
+
     private suspend fun executeOne(call: ToolCall): ToolResult {
         coroutineContext.ensureActive()
+        val hook = beforeExecuteForTest
         try {
-            beforeExecuteForTest?.invoke()
+            hook?.invoke()
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
@@ -180,9 +229,11 @@ class SafeToolSlice(
         }
         coroutineContext.ensureActive()
         val tool = ToolRegistry.find(call.name)
-            ?: return deny(call, DenyCodes.UNKNOWN_TOOL, "unknown tool ${call.name}")
+            // Redact the model-controlled name before it rides the wire in a
+            // detail (same rule as the `tool` field in [deny]).
+            ?: return deny(call, DenyCodes.UNKNOWN_TOOL, "unknown tool ${dev.librepocket.redact.Redactor.redact(call.name).text}")
         if (call.name != TOOL_NAME || !tool.executionReady) {
-            return deny(call, DenyCodes.NOT_READY, "${call.name} is not wired this round")
+            return deny(call, DenyCodes.NOT_READY, "${dev.librepocket.redact.Redactor.redact(call.name).text} is not wired this round")
         }
         // Defense-in-depth: the slice is READ-only by construction. Even if
         // the registry entry for TOOL_NAME were ever re-graded, never execute
@@ -227,6 +278,7 @@ class SafeToolSlice(
             // the provider continuation). Debug detail stays out of the wire.
             return deny(call, DenyCodes.EXEC_ERROR, "backend failed")
         }
+        coroutineContext.ensureActive()
         return when (outcome) {
             is LspTools.SymbolsOutcome.Ok -> ok(call, args.query, outcome)
             is LspTools.SymbolsOutcome.Unavailable ->
@@ -239,6 +291,9 @@ class SafeToolSlice(
     /** Registry-schema mirror: object + non-blank string `query`, optional int `limit`, optional string `pathPrefix`. */
     private fun parseArgs(argumentsJson: String): ValidArgs? {
         if (argumentsJson.length > MAX_INPUT_CHARS * 4) return null
+        // Cheap nesting-depth guard (ignores contents of JSON strings) against
+        // deeply nested payloads.
+        if (jsonNestingDepth(argumentsJson) > 32) return null
         val root = try {
             Json.parseToJsonElement(argumentsJson)
         } catch (_: Exception) {
@@ -247,7 +302,8 @@ class SafeToolSlice(
         if (root !is JsonObject) return null
         val query = (root["query"] as? JsonPrimitive)?.takeIf { it.isString }?.content
             ?.takeIf { it.isNotBlank() }
-            ?.takeIf { it.length <= MAX_INPUT_CHARS } ?: return null
+            ?.takeIf { it.length <= MAX_INPUT_CHARS }
+            ?.takeIf { it.none { c -> c.isISOControl() || c == '\u0000' } } ?: return null
         val limit = when (val raw = root["limit"]) {
             null -> LspTools.DEFAULT_LIMIT
             // Strict integer: a JSON string (even "5") is not an integer.
@@ -263,23 +319,64 @@ class SafeToolSlice(
             is JsonPrimitive -> {
                 if (!raw.isString) return null
                 val v = raw.content
-                // Scope traversal guard (raw-string layer): `..`, leading
-                // `/`, backslash, NUL, percent-escapes. Encoded forms
-                // (`%2e%2e`) are rejected here fail-closed; the injected
-                // bridge must still canonicalize/decode then re-validate and
-                // never treat this string as a trusted filesystem scope.
+                // Scope traversal guard (raw-string layer): reject Unicode
+                // normalization mismatches (homoglyphs), `..`, leading `/`
+                // (after trimming), backslash, NUL, control chars, and
+                // percent-escapes. Encoded forms (`%2e%2e`) are rejected here
+                // fail-closed; the injected bridge must still canonicalize/
+                // decode then re-validate and never treat this string as a
+                // trusted filesystem scope.
                 // `""` is allowed and normalizes downstream (StubBackend maps
                 // blank to the default scope); it is "unspecified", not a
                 // bypass (pinned by tests).
                 if (v.length > MAX_INPUT_CHARS) return null
-                if (v.contains("..") || v.startsWith("/") || v.contains("\\") || v.contains("\u0000") || v.contains("%")) {
+                // Reject any input that changes under NFKC normalization.
+                if (Normalizer.normalize(v, Normalizer.Form.NFKC) != v) return null
+                // `:` additionally rejects scheme/drive-absolute scope forms
+                // (`file:/etc`, `c:/Users`) so a scope can never name another
+                // root namespace.
+                if (v.contains("..") || v.trimStart().startsWith("/") || v.contains("\\") || v.contains("\u0000") || v.contains("%") || v.contains(":")) {
                     return null
                 }
+                if (v.any { it.isISOControl() }) return null
+                if (!isSafeInput(v)) return null
                 v
             }
             else -> return null
         }
         return ValidArgs(query, pathPrefix, limit)
+    }
+
+    /** Computes max JSON nesting depth while ignoring string contents. */
+    private fun jsonNestingDepth(s: String): Int {
+        var depth = 0
+        var max = 0
+        var inStr = false
+        var esc = false
+        for (c in s) {
+            if (inStr) {
+                if (esc) esc = false
+                else if (c == '\\') esc = true
+                else if (c == '"') inStr = false
+            } else {
+                when (c) {
+                    '"' -> inStr = true
+                    '{', '[' -> { depth++; if (depth > max) max = depth }
+                    '}', ']' -> { if (depth > 0) depth-- }
+                }
+            }
+        }
+        return max
+    }
+
+    /** Fail-closed input guard: no traversal markers, backslash, NUL, control, or percent-escape. */
+    private fun isSafeInput(v: String): Boolean {
+        if (v.contains("..")) return false
+        if (v.contains("\\")) return false
+        if (v.contains("\u0000")) return false
+        if (v.contains("%")) return false
+        if (v.any { it.isISOControl() }) return false
+        return true
     }
 
     private fun deny(call: ToolCall, code: String, detail: String): ToolResult {
@@ -288,49 +385,92 @@ class SafeToolSlice(
             put("code", code)
             // Model-controlled echoes are capped like Ok results; codes are
             // fixed constants.
-            put("tool", call.name.take(MAX_STRING_CHARS))
-            put("callId", call.id.take(MAX_STRING_CHARS))
+            put("tool", dev.librepocket.redact.Redactor.redact(call.name).text.take(MAX_STRING_CHARS))
+            put("callId", dev.librepocket.redact.Redactor.redact(call.id).text.take(MAX_STRING_CHARS))
             put("detail", detail.take(MAX_STRING_CHARS))
             put("clockMillis", clock.millis())
         }.toString()
         return ToolResult(call.id, call.name, json, denied = true, denyCode = code)
     }
 
-    private fun cappedEcho(value: String, originalLength: Int): String =
-        if (originalLength > MAX_STRING_CHARS) {
-            value.take(MAX_STRING_CHARS) + "…[truncated $originalLength→$MAX_STRING_CHARS]"
+    private fun cappedEcho(value: String): String =
+        if (value.length > MAX_STRING_CHARS) {
+            value.take(MAX_STRING_CHARS) + "…[truncated ${value.length}→$MAX_STRING_CHARS]"
         } else {
             value
         }
 
     private fun ok(call: ToolCall, query: String, outcome: LspTools.SymbolsOutcome.Ok): ToolResult {
-        val redactedQuery = dev.librepocket.redact.Redactor.redact(query).text
-        val json = buildJsonObject {
-            put("denied", false)
-            put("tool", call.name.take(MAX_STRING_CHARS))
-            put("callId", call.id.take(MAX_STRING_CHARS))
-            put("query", cappedEcho(redactedQuery, redactedQuery.length))
-            put(
-                "symbols",
-                kotlinx.serialization.json.buildJsonArray {
-                    for (s in outcome.symbols.take(LspTools.MAX_LIMIT)) {
-                        add(
-                            buildJsonObject {
-                                val rn = dev.librepocket.redact.Redactor.redact(s.name).text
-                                val rk = dev.librepocket.redact.Redactor.redact(s.kind).text
-                                val rp = dev.librepocket.redact.Redactor.redact(s.path).text
-                                put("name", cappedEcho(rn, rn.length))
-                                put("kind", cappedEcho(rk, rk.length))
-                                put("path", cappedEcho(rp, rp.length))
-                                put("line", s.line)
-                            },
-                        )
-                    }
-                },
-            )
-            put("fromStub", outcome.fromStub)
-            put("clockMillis", clock.millis())
-        }.toString()
+        val redactedQuery: String
+        val redactedSymbols: List<Triple<String, String, String>>
+        val anyFieldTruncated: Boolean
+        try {
+            redactedQuery = dev.librepocket.redact.Redactor.redact(query).text
+            val raw = outcome.symbols.take(LspTools.MAX_LIMIT)
+            // Truncation is decided on the POST-redaction lengths: redaction
+            // can inflate a field (e.g. `⟦REDACTED:EMAIL⟧`), so a ≤cap raw
+            // string may exceed the cap after redaction — decide there.
+            var truncatedFlag = false
+            redactedSymbols = raw.map { s ->
+                val rn = dev.librepocket.redact.Redactor.redact(s.name).text
+                val rk = dev.librepocket.redact.Redactor.redact(s.kind).text
+                val rp = dev.librepocket.redact.Redactor.redact(s.path).text
+                if (rn.length > MAX_STRING_CHARS || rk.length > MAX_STRING_CHARS || rp.length > MAX_STRING_CHARS) {
+                    truncatedFlag = true
+                }
+                Triple(rn, rk, rp)
+            }
+            anyFieldTruncated = truncatedFlag || redactedQuery.length > MAX_STRING_CHARS
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return deny(call, DenyCodes.EXEC_ERROR, "backend failed")
+        }
+        val rawSymbols = outcome.symbols.take(LspTools.MAX_LIMIT)
+        val symbolJsons = redactedSymbols.mapIndexed { idx, (rn, rk, rp) ->
+            val s = rawSymbols[idx]
+            buildJsonObject {
+                put("name", cappedEcho(rn))
+                put("kind", cappedEcho(rk))
+                put("path", cappedEcho(rp))
+                put("line", s.line)
+            }
+        }
+        fun build(chosen: List<kotlinx.serialization.json.JsonObject>, omittedCount: Int, truncated: Boolean): kotlinx.serialization.json.JsonObject =
+            buildJsonObject {
+                put("denied", false)
+                put("tool", dev.librepocket.redact.Redactor.redact(call.name).text.take(MAX_STRING_CHARS))
+                put("callId", dev.librepocket.redact.Redactor.redact(call.id).text.take(MAX_STRING_CHARS))
+                put("query", cappedEcho(redactedQuery))
+                put("symbols", kotlinx.serialization.json.buildJsonArray { for (o in chosen) add(o) })
+                put("returnedCount", chosen.size)
+                put("omittedCount", omittedCount)
+                put("truncated", truncated)
+                put("fromStub", outcome.fromStub)
+                put("clockMillis", clock.millis())
+            }
+        val chosen = ArrayList(symbolJsons)
+        while (chosen.size > 1) {
+            val omittedCount = symbolJsons.size - chosen.size
+            val truncated = anyFieldTruncated || omittedCount > 0
+            val candidate = build(chosen, omittedCount, truncated).toString()
+            if (candidate.length <= MAX_RESULT_CHARS) break
+            chosen.removeAt(chosen.lastIndex)
+        }
+        val omittedCount = symbolJsons.size - chosen.size
+        val truncated = anyFieldTruncated || omittedCount > 0
+        val json = build(chosen, omittedCount, truncated).toString()
+        if (json.length > MAX_RESULT_CHARS) {
+            // Floor reached and still over the total cap — a cross-constant
+            // regression between MAX_STRING_CHARS and MAX_RESULT_CHARS.
+            // Fail closed with a typed denial instead of shipping an
+            // oversized continuation. Unreachable today with ≥4× margin:
+            // a single-symbol build is ≤ ~5 K even with the three 500-char
+            // fields at cap, truncation markers, and JSON-escape doubling
+            // of fully-escaped content (vs the 20 K total); the floor pin
+            // test guards the coupling.
+            return deny(call, DenyCodes.EXEC_ERROR, "result over budget")
+        }
         return ToolResult(call.id, call.name, json, denied = false)
     }
 
@@ -345,9 +485,20 @@ class SafeToolSlice(
     fun continuationMessages(calls: List<ToolCall>, results: List<ToolResult>): List<ChatMessage> {
         require(calls.size == results.size) { "calls/results size mismatch" }
         val out = ArrayList<ChatMessage>(1 + results.size)
-        out.add(ChatMessage(role = "assistant", text = "", toolCalls = calls.map { it.copy(id = it.id.take(MAX_STRING_CHARS)) }))
+        // Name and arguments echo the model's own strings into the provider
+        // continuation/transcript exactly like `tool`/`callId` above — they
+        // get redaction + a bounded echo (no raw echo past the redaction
+        // pipeline R1–R14).
+        val normalizedCalls = calls.map {
+            it.copy(
+                id = dev.librepocket.redact.Redactor.redact(it.id).text.take(MAX_STRING_CHARS),
+                name = dev.librepocket.redact.Redactor.redact(it.name).text.take(MAX_STRING_CHARS),
+                argumentsJson = redactedArgsEcho(it.argumentsJson),
+            )
+        }
+        out.add(ChatMessage(role = "assistant", text = "", toolCalls = normalizedCalls))
         for (r in results) {
-            out.add(ChatMessage(role = "tool", text = r.resultJson, toolCallId = r.callId.take(MAX_STRING_CHARS)))
+            out.add(ChatMessage(role = "tool", text = r.resultJson, toolCallId = dev.librepocket.redact.Redactor.redact(r.callId).text.take(MAX_STRING_CHARS)))
         }
         return out
     }

@@ -96,4 +96,16 @@ class PrivilegeGateTest {
         assertFalse(PrivilegeGate.isFullTextRequestJson("{\"fullText\": 11}"))
         assertFalse(PrivilegeGate.isFullTextRequestJson("{\"limit\": 10}"))
     }
+
+    @Test fun fullTextMapVariantDetectsCaseVariedKeys() {
+        // Fail-safe over-detection: a case-varied key must not slip under the
+        // consent gate (matches the IGNORE_CASE JSON-args variant).
+        assertTrue(PrivilegeGate.isFullTextRequest(mapOf("fulltext" to "true")))
+        assertTrue(PrivilegeGate.isFullTextRequest(mapOf("FULLTEXT" to "1")))
+        assertTrue(PrivilegeGate.isFullTextRequest(mapOf("FullText" to " true ")))
+        assertFalse(PrivilegeGate.isFullTextRequest(mapOf("fulltext" to "false")))
+        assertFalse(PrivilegeGate.isFullTextRequest(mapOf("fullText" to "0")))
+        // Disagreement among case variants resolves to the fail-safe side.
+        assertTrue(PrivilegeGate.isFullTextRequest(mapOf("fullText" to "false", "fulltext" to "true")))
+    }
 }

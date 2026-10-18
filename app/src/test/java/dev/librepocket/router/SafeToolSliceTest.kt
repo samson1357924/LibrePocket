@@ -260,7 +260,14 @@ class SafeToolSliceTest {
         val msgs = s.continuationMessages(calls, listOf(ok, denied))
         assertEquals(3, msgs.size)
         assertEquals("assistant", msgs[0].role)
-        assertEquals(calls, msgs[0].toolCalls)
+        // Benign args keep their exact shape; UNPARSEABLE args are replaced
+        // with the fixed bounded object — providers re-parse this echo
+        // (validateToolPairing), so a raw `{bad` ride would fail the
+        // continuation non-retryably.
+        val echoed = msgs[0].toolCalls
+        assertEquals(2, echoed.size)
+        assertEquals("""{"query":"Foo"}""", echoed[0].argumentsJson)
+        assertEquals("""{"echo":"args redacted/capped"}""", echoed[1].argumentsJson)
         assertEquals("tool", msgs[1].role)
         assertEquals("call-1", msgs[1].toolCallId)
         assertEquals(ok.resultJson, msgs[1].text)
@@ -300,18 +307,17 @@ class SafeToolSliceTest {
     }
 
     @Test fun throwingBackendWithSecretMessageDoesNotLeak() = runBlocking {
-        val secret = "super-secret-token-value-123"
+        val marker = "backend-error-marker-42"
         val throwing = object : LspTools.Backend {
             override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
-                throw IllegalStateException(secret)
+                throw IllegalStateException(marker)
             override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
         }
         val r = slice(backend = throwing).execute(listOf(call())).single()
         assertTrue(r.denied)
         assertEquals(SafeToolSlice.DenyCodes.EXEC_ERROR, r.denyCode)
         // Fixed receipt: backend message never interpolates into the wire JSON.
-        assertFalse(r.resultJson.contains(secret))
-        assertFalse(r.resultJson.contains("super-secret-token-value-123"))
+        assertFalse(r.resultJson.contains(marker))
         assertFalse(r.resultJson.lowercase().contains("bearer"))
     }
 
@@ -469,15 +475,158 @@ class SafeToolSliceTest {
     }
 
     @Test fun hookThrowMapsToTypedExecErrorWithoutLeak() = runBlocking {
-        val secret = "sk-hook-SECRET999"
+        // Neutral marker (deliberately not a secret-shaped literal): the pin is
+        // the FIXED receipt — the hook's message never reaches the wire, same
+        // rule as throwingBackendWithSecretMessageDoesNotLeak. Secret-shaped
+        // sentinels trip the Gitleaks generic-api-key rule here, and the
+        // assertion power does not depend on that shape.
+        val marker = "hook-throw-marker-42"
         val backend = CountingBackend()
         val s = slice(backend = backend)
-        s.beforeExecuteForTest = { throw IllegalStateException(secret) }
+        s.beforeExecuteForTest = { throw IllegalStateException(marker) }
         val r = s.execute(listOf(call())).single()
         assertTrue(r.denied)
         assertEquals(SafeToolSlice.DenyCodes.EXEC_ERROR, r.denyCode)
         assertEquals("call-1", r.callId)
-        assertFalse(r.resultJson.contains(secret))
+        assertFalse(r.resultJson.contains(marker))
         assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun unknownToolDetailRedactsModelControlledName() = runBlocking {
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        val r = s.execute(listOf(call(name = "tool.a.dev@corp.example.com"))).single()
+        assertTrue(r.denied)
+        assertEquals(SafeToolSlice.DenyCodes.UNKNOWN_TOOL, r.denyCode)
+        // The detail rides the wire: the model-controlled name is redacted
+        // like every other echo (no raw pass-through past the pipeline).
+        assertFalse(r.resultJson.contains("dev@corp.example.com"))
+        assertTrue(r.resultJson.contains("⟦REDACTED:EMAIL⟧"))
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun pathPrefixColonFormsAreSchemaRejected() = runBlocking {
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        // Scheme/drive-absolute scopes must never name another root.
+        for (bad in listOf("c:/Users/x", "file:/etc", "z:foo")) {
+            val r = s.execute(
+                listOf(call(args = """{"query":"Foo","pathPrefix":"$bad"}""")),
+            ).single()
+            assertTrue(bad, r.denied)
+            assertEquals(bad, SafeToolSlice.DenyCodes.SCHEMA_INVALID, r.denyCode)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun resultBudgetDropsSymbolsToTotalCap() = runBlocking {
+        // 200 × 400-char fields ⇒ ~250K serialized; the shrink loop must drop
+        // symbols until the total fits (P2 result-total budget), keeping the
+        // JSON paired, counted, and under MAX_RESULT_CHARS.
+        val fat = object : LspTools.Backend {
+            override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+                List(LspTools.MAX_LIMIT) {
+                    LspTools.Symbol("N".repeat(400), "K".repeat(400), "P".repeat(400), it)
+                }
+            override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val s = slice(backend = fat)
+        val r = s.execute(
+            listOf(call(args = """{"query":"Foo","limit":${LspTools.MAX_LIMIT}}""")),
+        ).single()
+        assertFalse(r.denied)
+        val body = Json.parseToJsonElement(r.resultJson).jsonObject
+        assertEquals(r.callId, body["callId"]!!.jsonPrimitive.content)
+        assertEquals("true", body["truncated"]!!.jsonPrimitive.content)
+        val returned = body["returnedCount"]!!.jsonPrimitive.content.toInt()
+        val omitted = body["omittedCount"]!!.jsonPrimitive.content.toInt()
+        assertTrue(returned in 1..LspTools.MAX_LIMIT)
+        assertEquals(LspTools.MAX_LIMIT - returned, omitted)
+        assertTrue("result JSON must stay under the total cap", r.resultJson.length <= SafeToolSlice.MAX_RESULT_CHARS)
+        assertEquals(returned, body["symbols"]!!.jsonArray.size)
+    }
+
+    @Test fun resultBudgetSingleSymbolFloorStaysUnderTotalCap() = runBlocking {
+        // Worst-case single-symbol floor: ALL three fields at MAX_STRING_CHARS
+        // with full JSON-escape doubling (500 `"` chars each) — still ≪ 20K.
+        // This pins the cross-constant coupling that makes the over-budget
+        // guard unreachable; drift on either constant fails this pin, not
+        // production silently.
+        val cap = object : LspTools.Backend {
+            override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+                listOf(
+                    LspTools.Symbol(
+                        "\"".repeat(SafeToolSlice.MAX_STRING_CHARS),
+                        "\"".repeat(SafeToolSlice.MAX_STRING_CHARS),
+                        "\"".repeat(SafeToolSlice.MAX_STRING_CHARS),
+                        1,
+                    ),
+                )
+            override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val s = slice(backend = cap)
+        val r = s.execute(listOf(call(args = """{"query":"Foo","limit":1}"""))).single()
+        assertFalse(r.denied)
+        val body = Json.parseToJsonElement(r.resultJson).jsonObject
+        assertEquals("false", body["truncated"]!!.jsonPrimitive.content)
+        assertTrue("single-symbol build must stay under the total cap", r.resultJson.length <= SafeToolSlice.MAX_RESULT_CHARS)
+        assertTrue("floor must retain a ≥2× margin (cross-constant coupling)", r.resultJson.length <= SafeToolSlice.MAX_RESULT_CHARS / 2)
+    }
+
+    @Test fun continuationEchoesRedactNameAndArguments() = runBlocking {
+        val s = slice()
+        val calls = listOf(
+            ToolCall(
+                id = "call-1",
+                name = "tool.a.dev@corp.example.com",
+                argumentsJson = """{"query":"mail me at who@corp.example.com"}""",
+            ),
+        )
+        val results = listOf(SafeToolSlice.ToolResult("call-1", "n", "{}"))
+        val msgs = s.continuationMessages(calls, results)
+        assertEquals(2, msgs.size)
+        val tc = msgs[0].toolCalls.single()
+        // No raw model-controlled string rides the echo past the pipeline.
+        assertFalse(tc.name.contains("dev@corp.example.com"))
+        assertFalse(tc.argumentsJson.contains("who@corp.example.com"))
+        assertTrue(tc.argumentsJson.contains("⟦REDACTED:EMAIL⟧"))
+        // Benign calls keep their shape exactly (redaction/cap are identity).
+        val benign = listOf(call(id = "call-2"))
+        val benignMsgs = s.continuationMessages(benign, listOf(SafeToolSlice.ToolResult("call-2", "n", "{}")))
+        assertEquals(benign, benignMsgs[0].toolCalls)
+    }
+
+    @Test fun continuationArgsEchoStaysWireValidWithSecretPatternsInside() = runBlocking {
+        val s = slice()
+        // Several redaction rules (URL token, geo coords, device ids) swallow
+        // the terminating quote/brace when applied to RAW args text; the
+        // structural (parse-then-redact) echo must keep the JSON object
+        // valid — provider adapters re-parse it before serialize.
+        val calls = listOf(
+            call(
+                id = "call-1",
+                args = """{"query":"check https://x.com?token=REDACTME123456 and geo:47.6,?122.3;? imei=490154203237518"}""",
+            ),
+        )
+        val msgs = s.continuationMessages(calls, listOf(SafeToolSlice.ToolResult("call-1", "n", "{}")))
+        val echo = msgs[0].toolCalls.single().argumentsJson
+        val echoObject = Json.parseToJsonElement(echo).jsonObject
+        assertTrue(echoObject.containsKey("query"))
+        assertFalse(echo.contains("REDACTME123456"))
+        assertFalse(echo.contains("490154203237518"))
+    }
+
+    @Test fun continuationArgsEchoIsBoundedForOversizedArgs() = runBlocking {
+        val s = slice()
+        // Legal input (parseArgs accepts ≤16K); the wire-safe echo must stay
+        // a bounded, still-valid JSON object (fallback, never a corrupted
+        // `take`-cut string).
+        val longArgs = """{"query":"${"N".repeat(SafeToolSlice.MAX_INPUT_CHARS)}"}"""
+        val calls = listOf(call(id = "call-1", args = longArgs))
+        val msgs = s.continuationMessages(calls, listOf(SafeToolSlice.ToolResult("call-1", "n", "{}")))
+        val echo = msgs[0].toolCalls.single().argumentsJson
+        val echoObject = Json.parseToJsonElement(echo).jsonObject
+        assertTrue("echo must stay a bounded valid JSON object", echoObject.size == 1 && echoObject.containsKey("echo"))
+        assertFalse(echo.contains("N".repeat(64)))
     }
 }

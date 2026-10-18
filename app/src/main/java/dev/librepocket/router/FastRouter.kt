@@ -287,12 +287,16 @@ class FastRouter(
         ALARM_TIME.containsMatchIn(text)
 
     private fun findPhoneCandidate(text: String): String? =
-        PHONE_CANDIDATE.find(text)?.value
+        PHONE_CANDIDATE.findAll(text)
+            .maxByOrNull { m -> m.value.count { it.isDigit() } }
+            ?.value
 
     private fun hasPhoneNumber(text: String): Boolean {
         val raw = findPhoneCandidate(text) ?: return false
-        // Require at least one digit: a bare "+" with spaces is not a number.
-        return raw.any { it.isDigit() }
+        // Require a real digit run: a bare "+" with spaces/punctuation is not
+        // a number, and a single stray digit among punctuation is not either.
+        val digits = raw.count { it.isDigit() }
+        return digits >= 7
     }
 
     /**

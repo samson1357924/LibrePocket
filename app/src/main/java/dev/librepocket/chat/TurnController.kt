@@ -4720,7 +4720,7 @@ class TurnController(
     var sliceExecutedThisTurn = false
     while (true) {
       appendAssistantPlaceholder(attemptRunId)
-      val request = buildRequest(images)
+      val request = buildRequest(images, allowTools = !sliceExecutedThisTurn)
       var failed: StreamEvent.Failed? = null
       var done = false
       // P2 slice: completed model calls for the single wired tool, executed
@@ -4756,14 +4756,18 @@ class TurnController(
           sliceExecutedThisTurn = true
           val sliceResults = loop.execute(sliceCalls)
           for (r in sliceResults) {
+            coroutineContext.ensureActive()
             // Length-prefixed marker: resultJson embeds `]` (symbols array)
             // and model-controlled text, so a bare `]` terminator would be
             // ambiguous. Format: [tool-result:<name>:<len>:<json>], where
             // <len> is String.length (UTF-16 units, matching substring
-            // slicing) and <name> never contains `:` (dotted tool names).
-            appendAssistantText(attemptRunId, "\n[tool-result:${r.name}:${r.resultJson.length}:${r.resultJson}]")
+            // slicing). Sanitize the name so model-controlled call names cannot
+            // inject framing/colons into the persisted marker.
+            val safeName = r.name.filter { it.isLetterOrDigit() || it == '.' || it == '_' || it == '-' }.ifBlank { "tool" }
+            appendAssistantText(attemptRunId, "\n[tool-result:$safeName:${r.resultJson.length}:${r.resultJson}]")
           }
           coroutineContext.ensureActive()
+          val textDeltasBeforeContinuation = streamedTextDeltaCount
           val contRequest = buildToolContinuation(images, sliceCalls, sliceResults, loop)
           val contOutcome =
             collectToolContinuation(contRequest, attemptRunId, toolState.totalChars, toolState.visibleTextChars)
@@ -4771,6 +4775,11 @@ class TurnController(
           toolState.visibleTextChars = contOutcome.visibleTextChars
           if (contOutcome.failed != null) {
             failed = contOutcome.failed
+          } else if (streamedTextDeltaCount == textDeltasBeforeContinuation) {
+            // A tool round that yields no final answer is not a complete
+            // success; force retry/terminal handling instead of silently
+            // finalizing an empty/partial fragment.
+            failed = StreamEvent.Failed("incomplete tool continuation", retryable = true)
           }
         }
         // Catch parity with the pre-extraction loop: the slice block only
@@ -5026,6 +5035,7 @@ class TurnController(
       }
     }
     for (p in pending) {
+      coroutineContext.ensureActive()
       // Terminal guard (Finding #4): whole pending ToolDone must fit
       // the per-call budget before any marker/transcript side effect.
       requireToolAggBudget(0, p.id.length + p.name.length + p.args.length)
@@ -5035,6 +5045,7 @@ class TurnController(
     // floor 0) against the per-attempt total before any side effect.
     var totalGrowth = 0
     for (p in pending) {
+      coroutineContext.ensureActive()
       val billed =
         p.args.length +
           (state.idText[p.index]?.length ?: 0) +
@@ -5042,8 +5053,12 @@ class TurnController(
       totalGrowth += (p.id.length + p.name.length + p.args.length - billed).coerceAtLeast(0)
     }
     requireTotalToolAggBudget(state.totalChars, totalGrowth)
+    state.totalChars += totalGrowth
     for (p in pending) {
-      appendAssistantText(attemptRunId, "\n[tool:${p.name} ${p.args}]")
+      coroutineContext.ensureActive()
+      val safeName = p.name.filter { it.isLetterOrDigit() || it == '.' || it == '_' || it == '-' }.ifBlank { "tool" }
+      val safeArgs = p.args.replace("[", "［").replace("]", "］").replace("\n", " ").replace("\r", " ")
+      appendAssistantText(attemptRunId, "\n[tool:$safeName $safeArgs]")
       writeNotice { orderedTranscript.onToolDone(attemptRunId, p.index, p.id, p.name, p.args) }
       state.doneSeen.add(p.index)
     }
@@ -5130,7 +5145,9 @@ class TurnController(
     state.distinctIndexes.add(event.toolIndex)
     state.totalChars += toolDoneGrowth
     state.doneSeen.add(event.toolIndex)
-    appendAssistantText(attemptRunId, "\n[tool:${event.name} ${event.argumentsJson}]")
+    val safeName = event.name.filter { it.isLetterOrDigit() || it == '.' || it == '_' || it == '-' }.ifBlank { "tool" }
+    val safeArgs = event.argumentsJson.replace("[", "［").replace("]", "］").replace("\n", " ").replace("\r", " ")
+    appendAssistantText(attemptRunId, "\n[tool:$safeName $safeArgs]")
     writeNotice {
       orderedTranscript.onToolDone(attemptRunId, event.toolIndex, event.id, event.name, event.argumentsJson)
     }
@@ -5361,8 +5378,19 @@ class TurnController(
     results: List<SafeToolSlice.ToolResult>,
     loop: SafeToolSlice,
   ): ChatRequest {
-    val base = buildRequest(images)
-    return base.copy(messages = base.messages + loop.continuationMessages(calls, results))
+    val base = buildRequest(images, allowTools = false)
+    val contMessages = loop.continuationMessages(calls, results)
+    // Keep tool-call/tool-result pairing atomic: trim only the history prefix
+    // when the structured round pushes the request over MAX_REQUEST_CHARS.
+    val baseMessages = base.messages.toMutableList()
+    var totalChars = baseMessages.sumOf { it.text.length } + contMessages.sumOf { it.text.length }
+    var drop = 0
+    while (drop < baseMessages.size - 1 && totalChars > MAX_REQUEST_CHARS) {
+      totalChars -= baseMessages[drop].text.length
+      drop++
+    }
+    val finalBase = if (drop > 0) baseMessages.drop(drop) else baseMessages
+    return base.copy(messages = finalBase + contMessages)
   }
 
   /**
@@ -5414,7 +5442,7 @@ class TurnController(
    * (never fabricates a message for the clock). UI state and transcript keep
    * the raw user text.
    */
-  private fun buildRequest(images: List<ChatImageRef>): ChatRequest {
+  private fun buildRequest(images: List<ChatImageRef>, allowTools: Boolean = true): ChatRequest {
     val live = _uiState.value.messages
       .filter { !it.isPartial }
       .map { ChatMessage(role = it.role, text = it.text, hasReasoning = it.hasReasoning) }
@@ -5455,7 +5483,11 @@ class TurnController(
     // ToolRegistry.visibleTools() output (projection + executionReady); 40
     // tools stay executionReady=false, so a non-slice request is pure-chat
     // by construction.
-    return ChatRequest(model = model, messages = finalMessages, tools = toolSlice?.offeredTools().orEmpty())
+    // P2 slice: after a tool round has executed this turn, never advertise
+    // tools again (continuation or retry) — only paired result/terminal
+    // semantics, no second tool round.
+    val offered = if (allowTools) toolSlice?.offeredTools().orEmpty() else emptyList()
+    return ChatRequest(model = model, messages = finalMessages, tools = offered)
   }
 
   /**

@@ -15,6 +15,7 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `settings.gradle.kts`, `build.gradle.kts`, `gradle.properties`,
 `.github/workflows/pr-check.yml`) and `policy`
 (`scripts/play_policy_check.sh`, `scripts/apk_policy_inspect.py`,
+`scripts/backup_rules_check.py`,
 `scripts/summarize_junit.py`, `scripts/check_test_budgets.py`,
 `scripts/check_junit_durations.py`,
 `scripts/tests/test_apk_policy_check.py`,

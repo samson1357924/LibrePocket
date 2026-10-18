@@ -17,6 +17,9 @@ package dev.librepocket.systema
  * - 三風味皆允許；Play 需申報日曆權限 + 用途披露。
  * - 可見性（#14）：主 manifest `<queries>` 已宣告 INSERT（dir/event）/EDIT
  *   （item/event）；API 30+ 無宣告時 `resolveActivity` 被過濾為 null。
+ * - 長度/時長上限（500/500/2000 字元、單事件 5 年）為**本層自訂 fail-closed
+ *   政策**：官方 Common Intents 對 INSERT 無這些上限，本層較嚴（Binder 傳輸
+ *   防禦），越界一律 INTERNAL；dispatcher 接線時模型須知此差異。
  * - 與 [AlarmTool] 的刻意差異（#14/#15 對齊決策）：建事件靜態無 App 時本工具
  *   回 UNAVAILABLE（Alarm 回 DEGRADED），因建事件手動降級仍需一個日曆 App
  *   可開（見 [fallback] 話術），無 App 時連手動都做不到；Alarm 自有提醒不需
@@ -246,14 +249,13 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
     if (!check.executable) {
       return ToolResult(false, false, null, check.reasonCode, "做不到建日曆事件（${check.reasonCode}）")
     }
-    // fail-closed：builder IAE/ISE 收斂為 INTERNAL，不穿透生產迴圈。
-    val spec = try {
-      buildInsertIntent(params)
-    } catch (e: IllegalArgumentException) {
-      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到建日曆事件（${ReasonCodes.INTERNAL}）")
-    } catch (e: IllegalStateException) {
-      if (e is kotlin.coroutines.cancellation.CancellationException) throw e
-      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到建日曆事件（${ReasonCodes.INTERNAL}）")
+    // fail-closed：builder IAE/ISE 收斂為 INTERNAL，不穿透生產迴圈
+    //（收斂點 [guardedToolBuild]：話術由呼叫方提供，訊息與原 inline catch 逐字相同）。
+    val internalFailure =
+      ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到建日曆事件（${ReasonCodes.INTERNAL}）")
+    val spec = when (val build = guardedToolBuild(internalFailure) { buildInsertIntent(params) }) {
+      is Guarded.Internal -> return build.result
+      is Guarded.Built -> build.value
     }
     return when (val launched = launcher.launchCatching(spec)) {
       // 發現式缺席（靜態 check 通過但 resolve 為空：實現被移除/停用/不可見）：
@@ -276,15 +278,14 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
     if (!check.executable) {
       return ToolResult(false, false, null, check.reasonCode, "做不到更新日曆事件（${check.reasonCode}）")
     }
+    // fail-closed：EDIT builder（委託與待寫路徑共用）非法參數一律收斂為 INTERNAL，
+    // 收斂點 [guardedToolBuild]（話術由呼叫方提供，訊息與原 inline catch 逐字相同）。
+    val internalFailure =
+      ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到更新日曆事件（${ReasonCodes.INTERNAL}）")
     if (env.hasCalendarApp) {
-      // fail-closed：EDIT builder 非法參數收斂為 INTERNAL。
-      val spec = try {
-        buildEditIntent(params)
-      } catch (e: IllegalArgumentException) {
-        return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到更新日曆事件（${ReasonCodes.INTERNAL}）")
-      } catch (e: IllegalStateException) {
-        if (e is kotlin.coroutines.cancellation.CancellationException) throw e
-        return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到更新日曆事件（${ReasonCodes.INTERNAL}）")
+      val spec = when (val build = guardedToolBuild(internalFailure) { buildEditIntent(params) }) {
+        is Guarded.Internal -> return build.result
+        is Guarded.Built -> build.value
       }
       return when (val launched = launcher.launchCatching(spec)) {
         // 發現式缺席：與建事件同語義走手動降級（[fallbackUpdate] 話術，spec 保留）。
@@ -295,13 +296,9 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
     }
     // 無系統日曆 App：純側僅回待寫描述，不算成功（spec 攜帶目標 URI + 變更欄位）。
     // fail-closed：pending builder 非法同樣收斂為 INTERNAL。
-    val pending = try {
-      buildEditIntent(params)
-    } catch (e: IllegalArgumentException) {
-      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到更新日曆事件（${ReasonCodes.INTERNAL}）")
-    } catch (e: IllegalStateException) {
-      if (e is kotlin.coroutines.cancellation.CancellationException) throw e
-      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到更新日曆事件（${ReasonCodes.INTERNAL}）")
+    val pending = when (val build = guardedToolBuild(internalFailure) { buildEditIntent(params) }) {
+      is Guarded.Internal -> return build.result
+      is Guarded.Built -> build.value
     }
     return ToolResult(false, true, pending, ReasonCodes.NEED_PERMISSION, fallbackUpdate(params, ReasonCodes.NEED_PERMISSION).userMessage)
   }
@@ -317,15 +314,16 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
     if (!check.executable) {
       return ToolResult(false, false, null, check.reasonCode, "做不到刪除日曆事件（${check.reasonCode}）")
     }
+    // fail-closed：非法 eventId 一律收斂為 INTERNAL（委託 spec 與待寫 URI 兩路徑
+    // 共用同一失敗結果；收斂點 [guardedToolBuild]，訊息與原 inline catch 逐字相同）。
+    val internalFailure =
+      ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到刪除日曆事件（${ReasonCodes.INTERNAL}）")
     if (env.hasCalendarApp) {
-      // fail-closed：非法 eventId 收斂為 INTERNAL，不穿透。
-      val spec = try {
+      val spec = when (val build = guardedToolBuild(internalFailure) {
         IntentSpec(action = IntentActions.EDIT, dataUri = eventUri(params.eventId))
-      } catch (e: IllegalArgumentException) {
-        return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到刪除日曆事件（${ReasonCodes.INTERNAL}）")
-      } catch (e: IllegalStateException) {
-        if (e is kotlin.coroutines.cancellation.CancellationException) throw e
-        return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到刪除日曆事件（${ReasonCodes.INTERNAL}）")
+      }) {
+        is Guarded.Internal -> return build.result
+        is Guarded.Built -> build.value
       }
       return when (val launched = launcher.launchCatching(spec)) {
         // 發現式缺席：與建事件同語義走手動降級（[fallbackDelete] 話術，spec 保留）。
@@ -335,13 +333,9 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
       }
     }
     // fail-closed：非法 eventId 收斂為 INTERNAL；DELETE 待寫 spec 禁經 launcher 發射。
-    val uri = try {
-      buildDeleteDescriptor(params).first
-    } catch (e: IllegalArgumentException) {
-      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到刪除日曆事件（${ReasonCodes.INTERNAL}）")
-    } catch (e: IllegalStateException) {
-      if (e is kotlin.coroutines.cancellation.CancellationException) throw e
-      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到刪除日曆事件（${ReasonCodes.INTERNAL}）")
+    val uri = when (val build = guardedToolBuild(internalFailure) { buildDeleteDescriptor(params).first }) {
+      is Guarded.Internal -> return build.result
+      is Guarded.Built -> build.value
     }
     return ToolResult(false, true, IntentSpec(action = IntentActions.DELETE, dataUri = uri), ReasonCodes.NEED_PERMISSION, fallbackDelete(params, ReasonCodes.NEED_PERMISSION).userMessage)
   }

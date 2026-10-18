@@ -3,7 +3,7 @@ package dev.librepocket.systema
 /**
  * 快通道工具契約：每個 A 組工具都實現 check / execute / fallback 三件套。
  *
- * builder 的 `require` IAE/ISE 由各工具 `execute` 內 try-catch 收斂為
+ * builder 的 `require` IAE/ISE 由各工具 `execute` 經 [guardedToolBuild] 收斂為
  * [ToolResult]（INTERNAL，spec=null），不穿透生產迴圈：
  * [AlarmTool.execute]、[CalendarTool.execute]/[executeUpdate]/[executeDelete]、
  * [VolumeTool.execute]、[NavigationTool.execute] 皆已收斂（#15）。
@@ -51,7 +51,14 @@ object ToolRegistry {
     register(ToolDescriptor(MUSIC, SideEffectLevel.WRITE, 10_000, "音樂：媒體 Intent + MediaSession 前台"))
   }
 
+  /**
+   * 註冊（fail-closed）：重複名稱直接拒絕（`require`）——靜默覆寫會在 initializer
+   * 順序或 flavor 類覆疊出錯時把 descriptor 換人而不留痕跡。
+   */
   fun register(descriptor: ToolDescriptor) {
+    require(!descriptors.containsKey(descriptor.name)) {
+      "duplicate tool registration: ${descriptor.name}"
+    }
     descriptors[descriptor.name] = descriptor
   }
 

@@ -6,12 +6,15 @@ import java.net.URLEncoder
  * 導航工具：geo Intent 優先，無地圖 App 時降級走網頁地圖。
  *
  * Status: Target（純側契約，未接線未 E2E）。
- * 不申請位置權限：導航本身免權限，
+ * 不申報位置權限：導航本身免權限，
  * 只有「定位」才需前台定位授權，本工具不做定位。
  *
- * Target 缺口（本 PR 不改 manifest）：API 30+ 包可見性下，VIEW geo/https
- * 未在主 manifest `<queries>` 宣告，真機 resolve 恐 NoHandler；
- * 需裝置驗證後再補宣告（見主 manifest #14 註解「不擴大到導航」）。
+ * - 可見性（#14）：主 manifest `<queries>` 已宣告 VIEW geo/https scheme-only
+ *   （targetSdk 36 下 resolve-first launcher 不被過濾成假 NO_HANDLER）；
+ *   真機 handler E2E 仍 UNVERIFIED。
+ * - query 形狀為刻意近似：`geo:lat,lng?q=label` 非官式合成
+ *   `geo:0,0?q=lat,lng(label)`（括號需轉義）；多數地圖 App 以「座標＋搜尋詞」
+ *   語意照收，保守起見保留現行形狀並以測試鎖定。
  */
 object NavigationTool : SystemTool<NavigationTool.Params> {
 
@@ -78,14 +81,13 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
     if (!check.executable) {
       return ToolResult(false, false, null, check.reasonCode, "做不到導航（${check.reasonCode}）")
     }
-    // fail-closed：resolve 的座標守衛 IAE（單側座標/越界）收斂為 INTERNAL，不穿透。
-    val spec = try {
-      resolve(params, env)
-    } catch (e: IllegalArgumentException) {
-      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到導航（${ReasonCodes.INTERNAL}）")
-    } catch (e: IllegalStateException) {
-      if (e is kotlin.coroutines.cancellation.CancellationException) throw e
-      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到導航（${ReasonCodes.INTERNAL}）")
+    // fail-closed：resolve 的座標守衛 IAE（單側座標/越界）收斂為 INTERNAL，不穿透
+    //（收斂點 [guardedToolBuild]：話術由呼叫方提供，訊息與原 inline catch 逐字相同）。
+    val internalFailure =
+      ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到導航（${ReasonCodes.INTERNAL}）")
+    val spec = when (val build = guardedToolBuild(internalFailure) { resolve(params, env) }) {
+      is Guarded.Internal -> return build.result
+      is Guarded.Built -> build.value
     }
     return when (val launched = launcher.launchCatching(spec)) {
       // 發現式缺席（靜態有地圖但發射無處理者：被移除/停用/不可見）與靜態
@@ -112,9 +114,10 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
   }
 
   /**
-   * 編碼偏差（已鎖定現行，不硬改）：此處用 `URLEncoder`（空格→`+`），
-   * 與 `Uri.encode`（空格→`%20`）不同；改動牽涉 Android 層且影響純 JVM 可測性，
-   * 故僅加註 + 測試鎖定現行為（見 `navigation_labelEncoding_locksUrlEncoderPlus`）。
+   * 編碼鎖定（刻意選擇，非偏差）：`URLEncoder`（空格→`+`）——官方 geo URI
+   * 範例明載 `+` 為允許的空格編碼；`&`、`#`、`?` 亦一併跳脫，查詢串安全。
+   * 改用 `Uri.encode`（空格→`%20`）牽涉 Android 層且影響純 JVM 可測性，
+   * 故加註 + 測試鎖定現行為（見 `navigation_labelEncoding_locksUrlEncoderPlus`）。
    */
   private fun encode(s: String): String = URLEncoder.encode(s, Charsets.UTF_8.name())
 

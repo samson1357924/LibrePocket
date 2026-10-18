@@ -30,9 +30,8 @@ sealed interface IntentExtra {
  * 生產採用（#14）：[AlarmTool.parseParams]、[CalendarTool.parseInsertParams]
  * 以本 helper 讀必填 extra（缺參/錯型明確拋錯，禁預設猜測執行，#19）。
  * 未來 dispatcher 必須在呼叫 parse 側包 try-catch（ISE/IAE），收斂為
- * `ToolResult(INTERNAL)`，不得讓異常穿透生產迴圈；[AlarmTool.execute] 與
- * [CalendarTool.execute]/[executeUpdate]/[executeDelete] 已在 builder 側
- * 做同形收斂（見各 execute 內 try-catch）。
+ * `ToolResult(INTERNAL)`，不得讓異常穿透生產迴圈；builder 側同形收斂統一以
+ * [guardedToolBuild] 實作（見各工具 execute）。
  */
 inline fun <reified T : IntentExtra> Map<String, IntentExtra>.requireExtra(key: String): T {
   val v = this[key]
@@ -145,6 +144,38 @@ internal fun LaunchResult.toToolResult(
       "做不到$verb（${ReasonCodes.INTERNAL}）[${cause?.javaClass?.simpleName ?: "Unknown"}]",
     )
 }
+
+/**
+ * fail-closed builder guard 的結果（[guardedToolBuild] 回傳）：builder 成功值
+ * 或收斂好的 INTERNAL 失敗 [ToolResult]。
+ */
+internal sealed interface Guarded<out T> {
+  /** builder 成功：呼叫方續行既有流程。 */
+  data class Built<out T>(val value: T) : Guarded<T>
+
+  /** builder 違規：攜帶收斂好的失敗結果，呼叫方直接回傳它。 */
+  data class Internal(val result: ToolResult) : Guarded<Nothing>
+}
+
+/**
+ * fail-closed builder guard（多個工具 execute 的 inline catch 收斂點）：
+ * builder 拋 `IllegalArgumentException`／`IllegalStateException`（範圍/長度/
+ * 形狀違規，非取消）時回 [Guarded.Internal]，不讓異常滲出生產迴圈；
+ * `CancellationException` 照拋（取消語義不得吞）。各工具 inline catch 的
+ * 重複與訊息漂移在此單一化；失敗 ToolResult 由呼叫方提供（保留各自話術）。
+ */
+internal inline fun <T> guardedToolBuild(
+  internalFailure: ToolResult,
+  builder: () -> T,
+): Guarded<T> =
+  try {
+    Guarded.Built(builder())
+  } catch (e: IllegalArgumentException) {
+    Guarded.Internal(internalFailure)
+  } catch (e: IllegalStateException) {
+    if (e is kotlin.coroutines.cancellation.CancellationException) throw e
+    Guarded.Internal(internalFailure)
+  }
 
 data class ToolResult(
   val ok: Boolean,

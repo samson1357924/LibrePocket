@@ -39,6 +39,11 @@ object ReasonCodes {
  *   有系統日曆 App 時更新/刪除優先 EDIT 委託，免寫權限）。
  * @param exactAlarmGranted 精準鬧鐘是否可用（自有提醒降級路徑）。
  * @param hasMusicApp 是否有可處理媒體 Intent 的播放器。
+ *
+ * 接線註記：`calendarRead/WriteGranted` 與 `exactAlarmGranted` 目前在任何
+ * flavor manifest 皆未宣告對應權限（READ_CALENDAR/WRITE_CALENDAR/
+ * SCHEDULE_EXACT_ALARM），且本類無生產 producer——相關 NATIVE 分支在生產
+ * 不可達，屬 Target 語意的一部分；權限接線（含 Play 披露）刻意留給接線 PR。
  */
 data class SystemEnv(
   val flavor: Flavor = Flavor.PLAY,

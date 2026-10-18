@@ -5,17 +5,21 @@ package dev.librepocket.systema
  *
  * Status: Target（純側契約，未接線未 E2E）。
  *
- * - 點播：VIEW Intent 帶曲目/搜尋 URI，交給系統播放器。
- * - 控制（暫停/下一首等）：MEDIA_BUTTON 語義的 [ControlSpec]，
- *   端側經 MediaSession 回調落地。斷言僅自洽，未接真實播放器：
- *   單元測試只鎖 keyCode 映射與 Intent 形狀，未驗證端側 MediaSession 回調落地。
+ * - 點播契約為**刻意近似**：官定 `INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH`
+ *   （EXTRA_MEDIA_FOCUS + query extra）需要播放器逐一實作 focus 型別，
+ *   非通用路徑；本層以 VIEW 到 YT Music 網頁搜尋近似（真實可用、只依瀏覽器，
+ *   非官方契約直譯——近似屬明寫決策，不冒充官方契約）。
+ * - 可見性（#14）：主 manifest `<queries>` 已宣告 VIEW geo/https scheme-only，
+ *   targetSdk 36 下 resolve-first launcher 不再被過濾成假 NO_HANDLER；
+ *   真機 handler E2E（瀏覽器/播放器實際接起）仍 UNVERIFIED。
+ * - 控制（暫停/下一首等）：MEDIA_BUTTON 是 broadcast 語義、無 activity handler
+ *   可 resolve——launcher 必回 NoHandler，屬已記錄的端側未接線缺口
+ *   （MediaController 路徑，見下）；NoHandler 話術走 [fallback] 控制分支的
+ *   完整三段計畫（alternative 為 null：控制語意下「播放 search」亦非替代）。
+ *   單元測試僅鎖 keyCode 映射與話術形狀，未驗證端側 MediaSession 回調落地。
  * - 前台要求：實際播放必須跑在前台服務（`FOREGROUND_SERVICE_MEDIA_PLAYBACK`
  *   + 常駐通知），否則後台會被系統回收；本層僅建模，端側強制。
  * - 模糊目標（如「放點輕音樂」）不猜包名：先澄清或走預設播放器。
- *
- * Target 缺口（本 PR 不改 manifest）：API 30+ 包可見性下，VIEW https /
- * MEDIA_BUTTON 未在主 manifest `<queries>` 宣告，真機 resolve 恐 NoHandler；
- * 需裝置驗證後再補宣告（見主 manifest #14 註解「不擴大到音樂」）。
  */
 object MusicTool : SystemTool<MusicTool.Params> {
 
@@ -75,7 +79,15 @@ object MusicTool : SystemTool<MusicTool.Params> {
     }
     if (params.control != null) {
       val spec = buildControlIntent(params.control)
-      return launcher.launchCatching(spec).toToolResult(spec, "控制播放")
+      return when (val launched = launcher.launchCatching(spec)) {
+        // MEDIA_BUTTON 為 broadcast 語義，resolve-first launcher 恆回 NoHandler：
+        // 話術取 [fallback] 控制分支（完整三段計畫；generic toToolResult 的
+        // 無計畫尾段話術不滿足話術模板，見 FallbackSpec KDoc）。
+        LaunchResult.NoHandler -> ToolResult(
+          false, true, spec, ReasonCodes.NO_HANDLER, fallback(params, env).userMessage,
+        )
+        else -> launched.toToolResult(spec, "控制播放")
+      }
     }
     if (params.query.isBlank()) {
       return ToolResult(
@@ -98,10 +110,22 @@ object MusicTool : SystemTool<MusicTool.Params> {
     }
   }
 
-  override fun fallback(params: Params, env: SystemEnv): FallbackSpec = FallbackSpec(
-    reasonCode = ReasonCodes.NO_HANDLER,
-    alternative = buildPlayIntent(params),
-    userMessage = "做不到開啟播放器（${ReasonCodes.NO_HANDLER}）" +
-      "→ 可替代網頁播放器 → 需要你手動點播放",
-  )
+  override fun fallback(params: Params, env: SystemEnv): FallbackSpec {
+    if (params.control != null) {
+      // 控制路徑沒有 intent 可替代（「播放 search」不是暫停/下一首的替代）：
+      // alternative 留 null，話術指向使用者可立即達成的手動替代。
+      return FallbackSpec(
+        reasonCode = ReasonCodes.NO_HANDLER,
+        alternative = null,
+        userMessage = "做不到控制播放（${ReasonCodes.NO_HANDLER}）" +
+          "→ 可替代螢幕/通知欄的播放控制 → 需要你手動按暫停或下一首",
+      )
+    }
+    return FallbackSpec(
+      reasonCode = ReasonCodes.NO_HANDLER,
+      alternative = buildPlayIntent(params),
+      userMessage = "做不到開啟播放器（${ReasonCodes.NO_HANDLER}）" +
+        "→ 可替代網頁播放器 → 需要你手動點播放",
+    )
+  }
 }

@@ -7,6 +7,12 @@ package dev.librepocket.systema
  * 非 `ToolDescriptor` 欄位；目前尚無生產呼叫方，接線 PR 啟用；`SystemEnv` 無生產 producer，
  * `timeoutMs` 僅宣告未強制，見 [ToolRegistry]）。
  *
+ * 本層守衛多為**本層自訂的 fail-closed 政策**，較官方契約嚴格：官方
+ * Common Intents 對 HOUR/MINUTES 未定義數值範圍、對 MESSAGE 未定義長度
+ * 上限（皆無）；本層 0-23/0-59/500 字元為 Binder 傳輸防禦（超界一律
+ * INTERNAL 而非照送），未來 dispatcher 接線時模型端須知「官方合法但
+ * 本層拒絕」的可能。
+ *
  * 權限決策（#14：發送端需宣告 normal 級 `com.android.alarm.permission.SET_ALARM`）：
  * 官方 Common Intents 明確要求「要發送 ACTION_SET_ALARM，App 必須持有
  * `com.android.alarm.permission.SET_ALARM`」。接收端 activity（Google Clock /
@@ -109,26 +115,24 @@ object AlarmTool : SystemTool<AlarmTool.Params> {
       return ToolResult(false, false, null, check.reasonCode, "做不到設定鬧鐘（${check.reasonCode}）")
     }
     if (check.availability == Availability.DEGRADED) {
-      return ToolResult(
-        false, true, null, check.reasonCode,
-        "做不到呼叫系統鬧鐘（${check.reasonCode}）→ 可替代自有提醒 → 需要你授權精準鬧鐘",
-      )
+      // 靜態無系統鬧鐘 App：與執行期 NoHandler 同語義（自有提醒降級），
+      // 話術統一取 [fallback]（含 label 與通知授權提示，與姊妹工具一致）。
+      return ToolResult(false, true, null, check.reasonCode, fallback(params, env).userMessage)
     }
-    // fail-closed：builder IAE/ISE（範圍/長度）收斂為 INTERNAL，不穿透生產迴圈。
-    val spec = try {
-      buildSetAlarmIntent(params)
-    } catch (e: IllegalArgumentException) {
-      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到設定鬧鐘（${ReasonCodes.INTERNAL}）")
-    } catch (e: IllegalStateException) {
-      if (e is kotlin.coroutines.cancellation.CancellationException) throw e
-      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到設定鬧鐘（${ReasonCodes.INTERNAL}）")
+    // fail-closed：builder IAE/ISE（範圍/長度）收斂為 INTERNAL，不穿透生產迴圈
+    //（收斂點 [guardedToolBuild]：話術由呼叫方提供，訊息與原 inline catch 逐字相同）。
+    val internalFailure =
+      ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到設定鬧鐘（${ReasonCodes.INTERNAL}）")
+    val spec = when (val build = guardedToolBuild(internalFailure) { buildSetAlarmIntent(params) }) {
+      is Guarded.Internal -> return build.result
+      is Guarded.Built -> build.value
     }
     return when (val launched = launcher.launchCatching(spec)) {
       // 發現式缺席（靜態 check 通過但 resolve 為空：實現被移除/停用/不可見）：
-      // 與靜態 DEGRADED 同語義（自有提醒降級），禁靜默吞掉或猜測執行。
+      // 與靜態 DEGRADED 同語義（自有提醒降級），話術統一取 [fallback]，
+      // 禁靜默吞掉或猜測執行。
       LaunchResult.NoHandler -> ToolResult(
-        false, true, spec, ReasonCodes.NO_HANDLER,
-        "做不到呼叫系統鬧鐘（${ReasonCodes.NO_HANDLER}）→ 可替代自有提醒 → 需要你授權精準鬧鐘",
+        false, true, spec, ReasonCodes.NO_HANDLER, fallback(params, env).userMessage,
       )
       // Success/Internal 走共用收斂。
       else -> launched.toToolResult(spec, "設定鬧鐘")
@@ -145,7 +149,9 @@ object AlarmTool : SystemTool<AlarmTool.Params> {
     return FallbackSpec(
       reasonCode = ReasonCodes.NO_HANDLER,
       requiresDeclaration = "自有提醒需申報 SCHEDULE_EXACT_ALARM（API 31+）或 USE_EXACT_ALARM，" +
-        "並請求 POST_NOTIFICATIONS；触发時間 %02d:%02d".format(params.hour, params.minute),
+        "並請求 POST_NOTIFICATIONS；觸發時間 " +
+        // Locale.ROOT：時間用拉丁數字，與話術的 zh-Hant 一致（禁依裝置 locale 變體數字）。
+        String.format(java.util.Locale.ROOT, "%02d:%02d", params.hour, params.minute),
       userMessage = "做不到呼叫系統鬧鐘（${ReasonCodes.NO_HANDLER}）" +
         "→ 可替代 App 內自有提醒$label → 需要你授權精準鬧鐘與通知",
     )

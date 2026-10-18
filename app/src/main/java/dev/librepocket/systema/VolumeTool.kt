@@ -8,6 +8,20 @@ package dev.librepocket.systema
  * 純側只做 [VolumeOp] 建模與範圍校驗；端側由 [AndroidIntentLauncher]
  * 經 `AudioManager.setStreamVolume / adjustStreamVolume` 落地。
  * 降級：打不開 AudioManager 時跳系統音量面板（SOUND_SETTINGS）。
+ *
+ * 端側落地的已知條件（官方 AudioManager javadoc，接線 PR 須處理）：
+ * - `setStreamVolume` / `adjustStreamVolume` 在觸發 Do-Not-Disturb 變更、
+ *   且呼叫端未持有 Notification Policy Access 時丟 `SecurityException`；
+ *   [AndroidIntentLauncher.applyVolume] 經 `runCatching` 收斂為 bare false，
+ *   端側接線層不得把「失敗原因」丟失（拒絕 vs 系統錯誤）。
+ * - `isVolumeFixed` 裝置上 adjust 是靜默 no-op，仍會回 true——不得計為成功。
+ *
+ * 佔位錨定語義（current）：[execute] 的 `ok=true` 表示「操作已錨定」——
+ * [VolumeOp] 型別化參數與 [volumePanelSpec] 降級 spec 已產出，**不表示音量
+ * 已改變**；實際效果由端側攔截層接 [AndroidIntentLauncher.applyVolume]（該
+ * 攔截層目前仍不存在，接線 PR 落地前任何呼叫方不得把 ok=true 當成已執行）。
+ * [fallback] 的 NO_PRIVILEGE 話術保留給未來端層判定的「無法直調」分支，
+ * 純 [execute] 途徑不產生它。
  */
 object VolumeTool : SystemTool<VolumeTool.Params> {
 
@@ -69,18 +83,21 @@ object VolumeTool : SystemTool<VolumeTool.Params> {
     if (!check.executable) {
       return ToolResult(false, false, null, check.reasonCode, "做不到調音量（${check.reasonCode}）")
     }
-    // 音量走 AudioManager 直調，不經 Intent；此處以 panel spec 佔位錨定超時語義，
-    // 端側攔截本結果後改走 AudioManager（見 AndroidIntentLauncher.applyVolume）。
-    // fail-closed：builder IAE（SET 缺 index／負值）收斂為 INTERNAL，不穿透生產迴圈。
-    val op = try {
-      buildOp(params)
-    } catch (e: IllegalArgumentException) {
-      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到調音量（${ReasonCodes.INTERNAL}）")
-    } catch (e: IllegalStateException) {
-      if (e is kotlin.coroutines.cancellation.CancellationException) throw e
-      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到調音量（${ReasonCodes.INTERNAL}）")
+    // 音量走 AudioManager 直調，不經 Intent；本 execute 以 panel spec 佔位錨定
+    // 超時語義，實際效果由端側攔截層接 [AndroidIntentLauncher.applyVolume]
+    // （該層目前不存在，見類 KDoc 佔位錨定語義——ok=true 不是「已改變音量」）。
+    // fail-closed：builder IAE（SET 缺 index／負值）收斂為 INTERNAL，不穿透生產迴圈
+    //（收斂點 [guardedToolBuild]：話術由呼叫方提供，訊息與原 inline catch 逐字相同）。
+    val internalFailure =
+      ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到調音量（${ReasonCodes.INTERNAL}）")
+    val op = when (val build = guardedToolBuild(internalFailure) { buildOp(params) }) {
+      is Guarded.Internal -> return build.result
+      is Guarded.Built -> build.value
     }
-    return ToolResult(true, false, volumePanelSpec(), null, "stream=${op.streamSdkValue} dir=${op.direction}")
+    return ToolResult(
+      true, false, volumePanelSpec(), null,
+      "stream=${op.streamSdkValue} dir=${op.direction}（已錨定，端側 AudioManager 未接線）",
+    )
   }
 
   override fun fallback(params: Params, env: SystemEnv): FallbackSpec = FallbackSpec(

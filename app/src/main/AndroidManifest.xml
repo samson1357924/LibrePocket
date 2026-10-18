@@ -36,10 +36,14 @@
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
-        <!-- #14 Intent adapter（鬧鐘/日曆）：targetSdk 36 下 API 30+ package
+        <!-- #14 Intent adapter（鬧鐘/日曆/音樂/導航）：targetSdk 36 下 API 30+ package
              visibility 會把未宣告的隱式 Intent 過濾掉，使 resolveActivity 回 null
-             而被誤判為 NO_HANDLER；故補最小可見性（只有本塊三項，不擴大到
-             導航/開 App/音樂——見各工具 KDoc 的缺口註記）。
+             而被誤判為 NO_HANDLER；故補最小可見性。SET_ALARM／INSERT／EDIT＋
+             音樂與導航經 resolve-first launcher 發射的 VIEW（scheme-only：geo /
+             https——未宣告時 resolve 恆 null＝必然假 NO_HANDLER，且 static check
+             已宣稱 NATIVE，屬契約自相矛盾，故必須宣告；真機 handler E2E 仍另一
+             件事，見各工具 KDoc）。開 App 的 launcher 清單查詢仍刻意不宣告
+             （見 LaunchAppTool KDoc 的缺口註記）。
              - SET_ALARM：執行期 Intent 無 data，action-only 即可匹配時鐘 App。
              - INSERT/EDIT：執行期帶 content URI 但無顯式 type；以
                CalendarContract.Events.CONTENT_TYPE（dir/event）/
@@ -59,6 +63,14 @@
         <intent>
             <action android:name="android.intent.action.EDIT" />
             <data android:mimeType="vnd.android.cursor.item/event" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="geo" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
         </intent>
     </queries>
 

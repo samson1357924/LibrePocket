@@ -85,6 +85,11 @@ class IntentAdapterStage1Test {
     assertTrue(manifest.contains("<data android:mimeType=\"vnd.android.cursor.dir/event\" />"))
     assertTrue(manifest.contains("<action android:name=\"android.intent.action.EDIT\" />"))
     assertTrue(manifest.contains("<data android:mimeType=\"vnd.android.cursor.item/event\" />"))
+    // 導航/音樂 VIEW（scheme-only）：targetSdk 36 下未宣告時 resolve 恆 null＝
+    // 必然假 NO_HANDLER；geo 給 NavigationTool、https 給 MusicTool 網頁搜尋與
+    // NavigationTool 網頁地圖（見 manifest #14 註解與各工具 KDoc）。
+    assertTrue(manifest.contains("<data android:scheme=\"geo\" />"))
+    assertTrue(manifest.contains("<data android:scheme=\"https\" />"))
   }
 
   @Test fun manifest_declaresSetAlarmSenderPermission() {
@@ -238,7 +243,7 @@ class IntentAdapterStage1Test {
     assertFalse(r.ok)
     assertTrue(r.usedFallback)
     assertEquals(ReasonCodes.NO_HANDLER, r.reasonCode)
-    assertTrue(r.message, "可替代自有提醒" in r.message)
+    assertTrue(r.message, "可替代 App 內自有提醒" in r.message)
     assertEquals(IntentActions.SET_ALARM, r.spec?.action)
   }
 
@@ -634,6 +639,20 @@ class IntentAdapterStage1Test {
 
   // ---- g. #15 對齊：Volume/Navigation builder 非法經 execute 收斂為 INTERNAL ----
 
+  @Test fun volume_execute_success_pinsAnchoredMessage() {
+    // 成功路徑為佔位錨定語義（見 VolumeTool KDoc）：ok=true 表示操作已錨定，
+    // 訊息必須逐字明載「未接線」，呼叫方不得誤把 ok=true 當成音量已改變。
+    val r = VolumeTool.execute(VolumeTool.Params(), env, IntentLauncher { LaunchResult.Success })
+    assertTrue(r.ok)
+    assertFalse(r.usedFallback)
+    assertEquals(IntentActions.SOUND_SETTINGS, r.spec?.action)
+    assertEquals(
+      "stream=${VolumeTool.AudioStream.MUSIC.sdkValue} " +
+        "dir=${VolumeTool.Direction.RAISE}（已錨定，端側 AudioManager 未接線）",
+      r.message,
+    )
+  }
+
   @Test fun volume_execute_invalidParams_convergesToInternal() {
     var called = false
     val launcher = IntentLauncher { called = true; LaunchResult.Success }
@@ -689,6 +708,31 @@ class IntentAdapterStage1Test {
     assertTrue(discovered.usedFallback)
     assertEquals(ReasonCodes.NO_HANDLER, discovered.reasonCode)
     assertTrue(discovered.message, "網頁播放器" in discovered.message)
+  }
+
+  @Test fun music_controlNoHandler_usesFallbackControlBranch() {
+    // MEDIA_BUTTON 為 broadcast 語義、resolve-first launcher 恆回 NoHandler（已記錄的
+    // 端側未接線缺口）：話術必須取 [fallback] 控制分支的**完整三段計畫**，不得走
+    // generic toToolResult 的無計畫尾段話術；控制語意下「播放 search」非替代，
+    // FallbackSpec.alternative 留 null，spec（MEDIA_BUTTON + keyCode）保留。
+    val r = MusicTool.execute(
+      MusicTool.Params(control = MusicTool.Control.PAUSE), env, IntentLauncher { LaunchResult.NoHandler },
+    )
+    assertFalse(r.ok)
+    assertTrue(r.usedFallback)
+    assertEquals(ReasonCodes.NO_HANDLER, r.reasonCode)
+    assertEquals(IntentActions.MEDIA_BUTTON, r.spec?.action)
+    // spec（MEDIA_BUTTON + keyCode）保留：extras 按型別攜帶控制鍵碼。
+    assertEquals(
+      IntentExtra.IntVal(MusicTool.CONTROL_KEY_CODES.getValue(MusicTool.Control.PAUSE)),
+      r.spec?.extras?.get("keyCode"),
+    )
+    // 話術三段形狀（FallbackSpec 模板：做不到 X → 可替代 Y → 需要你做 Z）。
+    assertTrue(r.message, r.message.startsWith("做不到控制播放（${ReasonCodes.NO_HANDLER}）"))
+    assertTrue(r.message, "→ 可替代螢幕/通知欄的播放控制" in r.message)
+    assertTrue(r.message, "→ 需要你手動按暫停或下一首" in r.message)
+    // fallback spec 本體：控制分支 alternative=null（話術來源即此分支，非 dev 途徑）。
+    assertNull(MusicTool.fallback(MusicTool.Params(control = MusicTool.Control.PAUSE), env).alternative)
   }
 
   @Test fun navigation_executeNoHandler_degradesToWeb() {

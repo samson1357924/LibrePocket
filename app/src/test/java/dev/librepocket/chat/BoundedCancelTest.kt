@@ -379,6 +379,94 @@ class BoundedCancelTest {
     assertReopenAddsSingleInterrupted(store, sid)
   }
 
+  /**
+   * P2 landing-check pin: when the cancel terminal's core unit times out but
+   * the entry COMMITTED before the timeout (writer held between commit and
+   * ack), the handler must re-check the commit count and skip the INTERRUPTED
+   * mark — an unconditional mark would poison an already-durable cancel with a
+   * false sticky INTERRUPTED. The D15-2 hook keeps the writer parked so the
+   * timeout branch runs while the commit is already recorded; the host joining
+   * with the writer still parked proves the core bound (not a late ack) owned
+   * the timeout, so the skip branch is provably exercised.
+   */
+  @Test fun commitLandedBeforeCancelCoreTimeout_skipsFalseInterruptedMark() {
+    val store = FakeSessionStore()
+    val sid = runBlocking { store.createSession("hi", MODEL) }
+    val providerGate = CompletableDeferred<Unit>()
+    val provider = BoundedCancelProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "half"))
+        providerGate.await()
+      }
+    }
+    val n = AtomicInteger(0)
+    val c = TurnController(
+      provider = provider,
+      policy = BoundedCancelPolicy(),
+      transcript = SessionTranscriptSink(store, sid),
+      retryConfig = TurnRetryConfig(),
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "bmk-${n.incrementAndGet() - 1}" },
+      cancelCompensationTimeoutMs = 1_000L,
+    )
+    val commits = AtomicInteger(0)
+    val committedLatch = CountDownLatch(1)
+    val releaseWriter = CountDownLatch(1)
+    c.afterCommitBeforeAckForTest = {
+      // Commit #1 = user row, #2 = the cancel terminal: hold it between commit
+      // and ack so the bounded core unit expires while the row is already
+      // durable (commitCounts has advanced).
+      if (commits.incrementAndGet() == 2) {
+        committedLatch.countDown()
+        releaseWriter.await(20, TimeUnit.SECONDS)
+      }
+    }
+    try {
+      val admission = runBlocking { c.startOrEnqueue("hi") }
+      assertTrue("admission must start, was $admission", admission is TurnStart.Started)
+      val host = (admission as TurnStart.Started).host
+      runBlocking {
+        withTimeout(5_000) {
+          while (c.uiState.value.messages.none { it.role == "assistant" && it.text == "half" }) {
+            kotlinx.coroutines.delay(10)
+          }
+        }
+      }
+      c.cancel()
+      assertTrue("cancel terminal never committed", committedLatch.await(5, TimeUnit.SECONDS))
+      // Host joins while the writer is still parked: the core unit can only
+      // have completed via its timeout (its ack is held), so the
+      // markInterruptedIfNoNewCommit re-check ran against a landed commit.
+      val start = System.currentTimeMillis()
+      runBlocking { withTimeout(8_000) { host.join() } }
+      val elapsed = System.currentTimeMillis() - start
+      assertTrue("core timeout must be bounded, took ${elapsed}ms", elapsed < 6_000L)
+      assertEquals("writer must still be parked at host join", 1L, releaseWriter.count.toLong())
+      // The commit landed during the timed core unit: no false INTERRUPTED.
+      assertTrue(
+        "committed cancel must not be false-marked",
+        c.interruptedTranscriptRunIds().isEmpty(),
+      )
+      assertFalse("committed cancel is not a durable failure", c.hasDurableFailures())
+      releaseWriter.countDown()
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      awaitLedger(store) { evts -> evts.any { it.kind == "assistant" } }
+      assertEquals(listOf("user", "assistant"), store.events.map { it.kind })
+      assertEquals("half", store.events.single { it.kind == "assistant" }.text)
+      assertTrue("family must close on the committed cancel", findDanglingRunIds(store.events).isEmpty())
+      assertTrue(
+        "committed family must drain durable",
+        runBlocking { withTimeout(8_000) { c.flushDurable() } },
+      )
+    } finally {
+      providerGate.complete(Unit)
+      releaseWriter.countDown()
+      c.close()
+      runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
+    }
+  }
+
   @Test fun receiptSealedControl_hasSealedUncompensated_flushFalse_reopenSingleInterrupted() {
     // Control for the PENDING-receipt convergence branch (Current S3-F2):
     // terminal parks on a latch past the receipt deadline (maxRounds=3 ≈

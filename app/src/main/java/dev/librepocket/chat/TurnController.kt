@@ -5079,6 +5079,17 @@ class TurnController(
         // only after the sleep, so rethrow without minting.
         throw e
       }
+      // Cancellation-cooperative gate (review-88-S3 cancel-first parity): a
+      // gate-injected sleeper (or delay(<=0) / a test sleeper whose fast path
+      // returns without checking cancellation) can return with the host
+      // already cancelled. Minting/publishing the retry id here would
+      // attribute the cancel terminal to a placeholder with empty text (the
+      // just-failed attempt's partial durably non-final) instead of the
+      // just-failed attempt the backoff-gap contract above promises.
+      // Re-check before the mint so a cancel delivered up to this point still
+      // attributes to the failed attempt id (later arrivals race the mint;
+      // see the publish note below).
+      coroutineContext.ensureActive()
       attemptRunId = newId()
       // Publish before the next placeholder: a cancel in the gap still sees
       // the just-failed id only until the new id is minted here. The index

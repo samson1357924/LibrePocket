@@ -133,7 +133,9 @@ class SessionTranscriptSink(
         const val MAX_PENDING_USAGE_RUNS = 256
 
         /**
-         * Bound on retained failed-terminal usage rows (#94 P2).
+         * Bound on retained failed best-effort usage rows (#94 P2; the bucket
+         * receives both terminal-flush and trailing failures). Flood counters
+         * are evicted together with their payloads — see `retainFailedUsage`.
          */
         const val MAX_RETAINED_FAILED_USAGE_RUNS = 256
     }
@@ -144,9 +146,25 @@ class SessionTranscriptSink(
     /** Buffered usages not yet flushed with their attempt terminal. Single-writer (Ordered), insertion-ordered. Guarded by the ordered single-writer discipline of the hosting session writer — never touch from a second writer. */
     private val pendingUsage = LinkedHashMap<String, PendingUsage>()
 
+    /**
+     * Failed best-effort usage rows retained for a possible later flush of the
+     * same runId (#94 P2), LRU-bounded by [MAX_RETAINED_FAILED_USAGE_RUNS].
+     * Its key set plus [pendingUsage] always covers [usageSeen]: evicting the
+     * oldest payload here drops that runId's flood counter with it (see
+     * [retainFailedUsage]), so the accounting metadata stays bounded by
+     * `MAX_PENDING_USAGE_RUNS + MAX_RETAINED_FAILED_USAGE_RUNS` even while
+     * usage-only writes keep failing. Same single-writer guard as
+     * [pendingUsage].
+     */
     private val retainedFailedUsage = LinkedHashMap<String, PendingUsage>()
 
-    /** Per-run pre-terminal onUsage arrival counts for the flood cap. Same single-writer guard as [pendingUsage]. */
+    /**
+     * Per-run pre-terminal onUsage arrival counts for the flood cap. Every key
+     * belongs to [pendingUsage] or [retainedFailedUsage]: the P2 eviction sync
+     * in `retainFailedUsage` drops counters together with their evicted
+     * payloads, so the map never outgrows the two payload caps combined. Same
+     * single-writer guard as [pendingUsage].
+     */
     private val usageSeen = HashMap<String, Int>()
 
     /**
@@ -304,20 +322,42 @@ class SessionTranscriptSink(
             trailingUsageWritten.add(runId)
         } else {
             pendingUsage.remove(runId)
-            // Keep usageSeen so the per-run flood cap survives retries.
+            // Keep usageSeen so the per-run flood cap survives retries; the
+            // LRU eviction inside retainFailedUsage drops it together with an
+            // evicted payload (P2: no orphan counters).
             val retained = retainedFailedUsage[runId]
             val merged = PendingUsage(
                 inputTokens = usage.inputTokens ?: retained?.inputTokens,
                 outputTokens = usage.outputTokens ?: retained?.outputTokens,
             )
-            // LRU: move to end on update.
-            retainedFailedUsage.remove(runId)
-            if (retainedFailedUsage.size >= MAX_RETAINED_FAILED_USAGE_RUNS) {
-                val oldest = retainedFailedUsage.keys.firstOrNull()
-                if (oldest != null) retainedFailedUsage.remove(oldest)
-            }
-            retainedFailedUsage[runId] = merged
+            retainFailedUsage(runId, merged)
         }
+    }
+
+    /**
+     * Moves a failed best-effort usage write into the LRU-bounded
+     * [retainedFailedUsage], evicting the oldest payload at the cap. The
+     * evicted runId's [usageSeen] counter is dropped with its payload so the
+     * flood-counter map can never outgrow `pendingUsage + retainedFailedUsage`
+     * (#94 P2). Only the pre-terminal [onUsage] path reads [usageSeen], and
+     * controller-driven runs only ever flush after their terminal write
+     * returned (or after its store failure was deliberately swallowed), so a
+     * live production run cannot lose its freeze point. A direct-sink caller
+     * can still hold an evicted runId in [pendingUsage] (dual residency): its
+     * freeze restarts, bounded by the same [MAX_USAGE_EVENTS_PER_RUN] per cycle
+     * (`evictedPreTerminalRunRestartsBoundedFloodCounter` pins that shape).
+     */
+    private fun retainFailedUsage(runId: String, merged: PendingUsage) {
+        // LRU: move to end on update.
+        retainedFailedUsage.remove(runId)
+        if (retainedFailedUsage.size >= MAX_RETAINED_FAILED_USAGE_RUNS) {
+            val oldest = retainedFailedUsage.keys.firstOrNull()
+            if (oldest != null) {
+                retainedFailedUsage.remove(oldest)
+                usageSeen.remove(oldest)
+            }
+        }
+        retainedFailedUsage[runId] = merged
     }
 
     private fun usageText(usage: PendingUsage): String =
@@ -729,16 +769,12 @@ class SessionTranscriptSink(
                 usageSeen.remove(runId)
             } else {
                 // Retain in the failed-terminal bucket for a later retry,
-                // never the active quota.
+                // never the active quota. Keep usageSeen so the per-run
+                // flood cap survives retries; retainFailedUsage drops an
+                // evicted runId's counter together with its payload (P2).
                 pendingUsage.remove(runId)
-                // Keep usageSeen so the per-run flood cap survives retries.
                 val merged = PendingUsage(inputTokens = inTok, outputTokens = outTok)
-                retainedFailedUsage.remove(runId)
-                if (retainedFailedUsage.size >= MAX_RETAINED_FAILED_USAGE_RUNS) {
-                    val oldest = retainedFailedUsage.keys.firstOrNull()
-                    if (oldest != null) retainedFailedUsage.remove(oldest)
-                }
-                retainedFailedUsage[runId] = merged
+                retainFailedUsage(runId, merged)
             }
             return
         }

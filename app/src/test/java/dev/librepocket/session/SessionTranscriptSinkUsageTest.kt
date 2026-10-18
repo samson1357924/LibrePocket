@@ -36,6 +36,24 @@ private class SequentialFaultStore(
 }
 
 /**
+ * #94 P2 probe store: routes every row through the real
+ * [FakeSessionStore.appendEvent] shaping but faults only usage rows
+ * (`kind == "system"` with the `usage ` prefix) while [failUsageWrites] is
+ * set — core rows stay durable so the retention/eviction paths can be driven
+ * for an unbounded number of runIds without touching the surrounding rows.
+ */
+private class UsageFaultStore : FakeSessionStore() {
+    var failUsageWrites = true
+
+    override suspend fun appendEvent(event: TranscriptEvent): Long {
+        if (failUsageWrites && event.kind == "system" && event.text.startsWith("usage ")) {
+            throw IOException("injected usage-only fault")
+        }
+        return super.appendEvent(event)
+    }
+}
+
+/**
  * #84 sink-level regressions for [SessionTranscriptSink.onUsage]: pre-terminal
  * calls merge last-wins by runId and flush as exactly one `system` row after
  * the attempt's terminal ack (flood-safe, capped); a post-terminal trailing call
@@ -45,6 +63,25 @@ class SessionTranscriptSinkUsageTest {
 
     private fun usageRows(store: FakeSessionStore): List<TranscriptEvent> =
         store.events.filter { it.kind == "system" && it.text.startsWith("usage ") }
+
+    /**
+     * P2 probe: current accounting-container key sets
+     * `(pending, retained, seen)`. Reflection follows the repo convention for
+     * private-state pins (see the ChatViewModel fence tests); production
+     * exposes no seam for this. Keys (not just sizes) are returned so a
+     * counter dropped for the wrong runId cannot slip through as "bounded".
+     */
+    private fun accountingKeys(
+        sink: SessionTranscriptSink,
+    ): Triple<Set<String>, Set<String>, Set<String>> {
+        fun keysOf(field: String): Set<String> {
+            val f = SessionTranscriptSink::class.java.getDeclaredField(field)
+            f.isAccessible = true
+            @Suppress("UNCHECKED_CAST")
+            return (f.get(sink) as Map<String, *>).keys.toSet()
+        }
+        return Triple(keysOf("pendingUsage"), keysOf("retainedFailedUsage"), keysOf("usageSeen"))
+    }
 
     @Test
     fun dualPreTerminalUsageMergesToSingleRowWithFinalValues() = runBlocking {
@@ -402,7 +439,7 @@ class SessionTranscriptSinkUsageTest {
         try {
             // Core single assistant row is call #1: nothing commits.
             sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
-        sink.flushBufferedUsageBestEffort("r1")
+            sink.flushBufferedUsageBestEffort("r1")
             fail("core fault must propagate")
         } catch (_: IOException) {
         }
@@ -415,5 +452,165 @@ class SessionTranscriptSinkUsageTest {
         assertEquals(1, rows.size)
         assertEquals("usage input=7 output=8", rows.single().text)
         assertEquals(1, store.events.count { it.runId == "r1" && it.kind == "assistant" })
+    }
+
+    @Test
+    fun failedFlushKeepsFloodCapForLaterRetry() = runBlocking {
+        // P2 pairing: keeping usageSeen across a failed flush is what freezes
+        // the merge past MAX_USAGE_EVENTS_PER_RUN even when the row is later
+        // retried successfully.
+        val store = UsageFaultStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        repeat(130) { i -> sink.onUsage("r1", i, i * 2) }
+        // Fails and is swallowed; the row moves to the retained bucket but the
+        // run's 128-event freeze must survive.
+        sink.flushBufferedUsageBestEffort("r1")
+        assertTrue("faulted flush must not persist a row", usageRows(store).isEmpty())
+        store.failUsageWrites = false
+        repeat(130) { i -> sink.onUsage("r1", 1_000 + i, 2_000 + i * 2) }
+        sink.flushBufferedUsageBestEffort("r1")
+
+        val rows = usageRows(store)
+        assertEquals(1, rows.size)
+        assertEquals("usage input=127 output=254", rows.single().text)
+    }
+
+    @Test
+    fun failedUsageEvictionDropsFloodCounterWithPayload() = runBlocking {
+        // P2 (review round 9): evicting the oldest retained failed usage at
+        // MAX_RETAINED_FAILED_USAGE_RUNS must drop that runId's flood counter
+        // too — otherwise usageSeen grows O(N) while the payload set stays
+        // capped at 256.
+        val store = UsageFaultStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        repeat(300) { i ->
+            sink.onUsage("r$i", i, i)
+            sink.onTurnSucceeded("r$i", "ok", hasReasoning = false)
+            sink.flushBufferedUsageBestEffort("r$i")
+        }
+        val (pending, retained, seen) = accountingKeys(sink)
+        assertTrue("no active payload may survive a failed flush", pending.isEmpty())
+        assertEquals(SessionTranscriptSink.MAX_RETAINED_FAILED_USAGE_RUNS, retained.size)
+        assertEquals("flood counters must follow payload eviction", retained, seen)
+        assertTrue("the oldest key must be evicted from both", "r0" !in seen && "r0" !in retained)
+        assertTrue("the kept LRU window must stay", "r44" in seen && "r299" in seen)
+
+        // A retained retry still persists exactly once (the newest entry),
+        // while an evicted run's payload is gone (bounded best-effort loss).
+        store.failUsageWrites = false
+        sink.flushBufferedUsageBestEffort("r299")
+        assertEquals(listOf("usage input=299 output=299"), usageRows(store).map { it.text })
+        sink.flushBufferedUsageBestEffort("r0")
+        assertEquals(1, usageRows(store).size)
+    }
+
+    @Test
+    fun trailingFailedUsageEvictionDropsFloodCounterWithPayload() = runBlocking {
+        // Same P2 invariant through the post-terminal trailing path: the run
+        // buffered pre-terminal usage, was terminalized, and its immediate
+        // trailing write failed into the retained bucket.
+        val store = UsageFaultStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        repeat(300) { i ->
+            sink.onUsage("t$i", i, i)
+            sink.onTurnSucceeded("t$i", "ok", hasReasoning = false)
+            sink.onUsage("t$i", i, i)
+        }
+        val (pending, retained, seen) = accountingKeys(sink)
+        assertTrue("no active payload may survive a failed flush", pending.isEmpty())
+        assertEquals(SessionTranscriptSink.MAX_RETAINED_FAILED_USAGE_RUNS, retained.size)
+        assertEquals("flood counters must follow payload eviction", retained, seen)
+        assertTrue("the oldest key must be evicted from both", "t0" !in seen && "t0" !in retained)
+
+        // A trailing retry of a retained (still not trailing-written) run
+        // persists exactly once; an evicted runId has no payload left.
+        store.failUsageWrites = false
+        sink.onUsage("t299", 5, 6)
+        assertEquals(listOf("usage input=5 output=6"), usageRows(store).map { it.text })
+        sink.flushBufferedUsageBestEffort("t0")
+        assertEquals(1, usageRows(store).size)
+    }
+
+    @Test
+    fun retainedFailedUsageEvictsExactlyAt257() = runBlocking {
+        // P2 boundary: exactly 256 distinct failed flushes fill the LRU
+        // without evicting; the 257th drops the oldest payload and its counter.
+        val atCap = UsageFaultStore()
+        val capSid = atCap.createSession("hi", "m")
+        val capSink = SessionTranscriptSink(atCap, capSid) { 42L }
+        repeat(256) { i ->
+            capSink.onUsage("r$i", i, i)
+            capSink.flushBufferedUsageBestEffort("r$i")
+        }
+        val capKeys = accountingKeys(capSink)
+        assertEquals(SessionTranscriptSink.MAX_RETAINED_FAILED_USAGE_RUNS, capKeys.second.size)
+        assertEquals(capKeys.second, capKeys.third)
+        atCap.failUsageWrites = false
+        capSink.flushBufferedUsageBestEffort("r0")
+        assertEquals(listOf("usage input=0 output=0"), usageRows(atCap).map { it.text })
+
+        val overflow = UsageFaultStore()
+        val overflowSid = overflow.createSession("hi", "m")
+        val overflowSink = SessionTranscriptSink(overflow, overflowSid) { 42L }
+        repeat(257) { i ->
+            overflowSink.onUsage("r$i", i, i)
+            overflowSink.flushBufferedUsageBestEffort("r$i")
+        }
+        val overflowKeys = accountingKeys(overflowSink)
+        assertEquals(SessionTranscriptSink.MAX_RETAINED_FAILED_USAGE_RUNS, overflowKeys.second.size)
+        assertEquals(overflowKeys.second, overflowKeys.third)
+        assertTrue("the 257th insert must evict r0 from both", "r0" !in overflowKeys.third)
+        overflow.failUsageWrites = false
+        overflowSink.flushBufferedUsageBestEffort("r0")
+        assertTrue("evicted payload is best-effort dropped", usageRows(overflow).isEmpty())
+        overflowSink.flushBufferedUsageBestEffort("r256")
+        assertEquals(listOf("usage input=256 output=256"), usageRows(overflow).map { it.text })
+    }
+
+    @Test
+    fun evictedPreTerminalRunRestartsBoundedFloodCounter() = runBlocking {
+        // Direct-sink dual residency (not reachable from the controller): a
+        // run that failed a pre-terminal flush is re-buffered while its
+        // payload still sits in the retained bucket. The eviction drops the
+        // counter even though that pending payload survives; the freeze then
+        // restarts with the fresh window, bounded by the same 128-event cap
+        // per cycle — the documented trade-off of the eviction sync in
+        // retainFailedUsage.
+        val store = UsageFaultStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onUsage("r0", 1, 1)
+        sink.flushBufferedUsageBestEffort("r0")
+        // Re-buffer the still-pre-terminal runId: dual residency
+        // (retainedFailedUsage + pendingUsage + usageSeen all hold r0).
+        sink.onUsage("r0", 7, 8)
+        val dual = accountingKeys(sink)
+        assertTrue("dual residency: retained and pending both hold r0", "r0" in dual.first && "r0" in dual.second)
+
+        repeat(256) { i ->
+            sink.onUsage("f$i", i, i)
+            sink.flushBufferedUsageBestEffort("f$i")
+        }
+        val afterEviction = accountingKeys(sink)
+        assertTrue("the pending payload survives its counter's eviction", "r0" in afterEviction.first)
+        assertTrue("r0 must have been evicted from both payload+counters", "r0" !in afterEviction.second && "r0" !in afterEviction.third)
+
+        // A fresh 130-event flood on the evicted runId freezes at the new
+        // window's 128th event, never unbounded and never old values.
+        repeat(130) { i -> sink.onUsage("r0", 1_000 + i, 2_000 + i * 2) }
+        store.failUsageWrites = false
+        sink.flushBufferedUsageBestEffort("r0")
+
+        assertEquals(
+            listOf("usage input=1127 output=2254"),
+            usageRows(store).map { it.text },
+        )
     }
 }

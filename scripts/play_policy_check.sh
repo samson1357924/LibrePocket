@@ -88,9 +88,29 @@ done
 # BackupPolicy.KEY_FILES_EXCLUDED 5 項逐項斷言：以結構化 XML 驗證區分
 # cloud-backup / device-transfer 並忽略註解（grep 全文比對會誤判 PASS，見
 # scripts/backup_rules_check.py 說明）。
+# 檔名↔root 綁定 fail-closed：backup_rules.xml 必須是 <full-backup-content>、
+# data_extraction_rules.xml 必須是 <data-extraction-rules>——root 與 Android
+# 預期不符時 runtime 會直接丟出解析例外（備份靜默停用），gate 不得誤判 PASS。
 python3 "$SCRIPT_DIR/backup_rules_check.py" \
-    "$ROOT/app/src/main/res/xml/backup_rules.xml" \
+    --expect-root full-backup-content \
+    "$ROOT/app/src/main/res/xml/backup_rules.xml"
+python3 "$SCRIPT_DIR/backup_rules_check.py" \
+    --expect-root data-extraction-rules \
     "$ROOT/app/src/main/res/xml/data_extraction_rules.xml"
+
+# 縱深：掃描 app/src 下所有同形資源（未來 flavor overlay 新增／覆寫
+# backup_rules.xml / data_extraction_rules.xml 時也不能漏驗；main 兩檔已由
+# 上方固定路徑 fail-closed 檢查，此處重複驗證無害）。
+while IFS= read -r f; do
+    case "$f" in
+        *backup_rules.xml) broot=full-backup-content ;;
+        *data_extraction_rules.xml) broot=data-extraction-rules ;;
+        *) continue ;;
+    esac
+    python3 "$SCRIPT_DIR/backup_rules_check.py" --expect-root "$broot" "$f"
+done <<EOF
+$(find "$ROOT/app/src" -type f \( -name backup_rules.xml -o -name data_extraction_rules.xml \) 2>/dev/null | sort)
+EOF
 
 find_tool_pair() {
     for sdk in "${ANDROID_HOME:-}" "$HOME/Android/Sdk"; do

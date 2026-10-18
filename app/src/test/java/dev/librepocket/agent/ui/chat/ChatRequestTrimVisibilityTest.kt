@@ -31,9 +31,11 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -165,10 +167,17 @@ class ChatRequestTrimVisibilityTest {
         }
     }
 
-    private fun awaitTrue(timeoutMs: Long = 30_000, cond: () -> Boolean) {
+    private fun awaitTrue(
+        timeoutMs: Long = 30_000,
+        diagnostics: () -> String = { "" },
+        cond: () -> Boolean,
+    ) {
         val end = System.currentTimeMillis() + timeoutMs
         while (!cond()) {
-            if (System.currentTimeMillis() > end) error("timed out waiting for condition")
+            if (System.currentTimeMillis() > end) {
+                val detail = diagnostics().takeIf { it.isNotBlank() }?.let { " — $it" } ?: ""
+                error("timed out waiting for condition$detail")
+            }
             Thread.sleep(10)
         }
     }
@@ -288,10 +297,35 @@ class ChatRequestTrimVisibilityTest {
         onMain { vm.send() }
         awaitTrue { vm.requestTrimmedCount.value == 1 }
 
+        // Fence baseline while still on the big session (post-trim): the big
+        // session's projections are never empty, so under the quiet premise
+        // (nothing else mutates history/session state between this capture and
+        // the fence) the first newer empty generation is the fresh attach's
+        // reprojection, never a conflated stale snapshot.
+        val preAttachGeneration = vm.messagesProjection.value.generation
+
         // Attach resets (no stale badge on the new session)...
         onMain { vm.openSession(fresh) }
-        awaitTrue { vm.currentSessionId.value == fresh }
-        awaitTrue { vm.messages.value.isEmpty() }
+        // Sync point: the attach itself must be observable before fencing, so
+        // the generation wait below can never be satisfied pre-attach.
+        awaitTrue(
+            diagnostics = {
+                "pre-attach wait: currentSessionId=${vm.currentSessionId.value} (want $fresh)" +
+                    " status=${vm.sessionState.value.status} trimmed=${vm.requestTrimmedCount.value}" +
+                    " messages=${vm.messages.value.size} gen=${vm.messagesProjection.value.generation}"
+            },
+        ) { vm.currentSessionId.value == fresh }
+        // Raw `messages.value.isEmpty()` may catch a conflated stale value;
+        // the projection fence requires a strictly newer generation carrying
+        // the empty list. 30s is only a safety bound — the wait is
+        // event-driven.
+        runBlocking {
+            withTimeout(30_000) {
+                vm.messagesProjection.first {
+                    it.generation > preAttachGeneration && it.messages.isEmpty()
+                }
+            }
+        }
         assertEquals(0, vm.requestTrimmedCount.value)
         // ...and an untrimmed send emits 0 through the same path.
         onMain { vm.onInputChange("hello") }

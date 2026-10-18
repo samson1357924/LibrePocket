@@ -1851,6 +1851,32 @@ class TurnController(
   internal var beforeFlushDurableReturnForTest: (suspend () -> Unit)? = null
 
   /**
+   * D15-2 settle-wait seam: runs synchronously on the cancelled host after
+   * the SUBMITTING admission snapshot and immediately before the bounded
+   * settle wait (non-suspending, null in production). Lets the cancel-gap
+   * grid await the settle-wait decision observably instead of sleeping a
+   * fixed heuristic: once the seam fires, the host has provably committed to
+   * the SUBMITTING path, so releasing a blocked terminal writer afterwards
+   * still exercises the post-wait re-evaluation (COMMITTED keeps suppression,
+   * FAILED falls through to the normal final) instead of racing it.
+   */
+  internal var onCancelSettleWaitEnteredForTest: (() -> Unit)? = null
+
+  /**
+   * D15-2 suppressed-final seam: runs synchronously on the cancelled host as
+   * the first instruction of the `suppressed && suppressedFinal` branch
+   * (non-suspending, null in production). The branch is also reachable via
+   * the still-pending-stall sub-case (settle-wait timeout, optimistic
+   * suppression, no commit observed), so the seam alone only proves branch
+   * entry. In the commit→ack grid it fires while the writer's ack is still
+   * held (the test pins the commit via
+   * [OrderedTranscriptSink.afterCommitBeforeAckForTest] before cancelling),
+   * which is what lets that grid await it and pin "cancel landed inside the
+   * commit→ack window" without a fixed sleep.
+   */
+  internal var onSuppressedFinalFlushEnteredForTest: (() -> Unit)? = null
+
+  /**
    * Returns the live in-flight host job, lazily clearing a completed one.
    *
    * Has a lazy-clear side effect (`inFlight = null` when completed), so the
@@ -3992,6 +4018,10 @@ class TurnController(
         if (cancelId == logicalTurnId) commitCount >= 2 else commitCount >= 1
       var terminalSubmitting = terminalFinal != null && snap.pending
       if (terminalSubmitting && !acked && !terminalCommitted) {
+        // D15-2 test seam (null in production): fires after the SUBMITTING
+        // decision so the cancel-gap grid can release its blocked terminal
+        // writer deterministically instead of sleeping a fixed heuristic.
+        onCancelSettleWaitEnteredForTest?.invoke()
         withContext(NonCancellable) {
           withTimeoutOrNull(cancelSettleTimeoutMs) {
             while (orderedTranscript.coreSubmitTruth(cancelId).pending) delay(10)
@@ -4044,6 +4074,11 @@ class TurnController(
         }
       }
       if (suppressed && suppressedFinal) {
+        // D15-2 test seam (null in production): fires on branch entry. The
+        // commit→ack grid pins the commit (afterCommitBeforeAckForTest) and
+        // holds the ack, so its wait proves the COMMITTED-observed path;
+        // the still-pending-stall sub-case also reaches this branch.
+        onSuppressedFinalFlushEnteredForTest?.invoke()
         // Success / terminal-failure final already durable (COMMITTED/acked,
         // or SUBMITTING that settled as COMMITTED during the bounded wait
         // above, or still-pending stall keeping the optimistic zero below with

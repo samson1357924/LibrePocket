@@ -238,8 +238,9 @@ class OrderedTranscriptSink(
    * - [beforeSendForTest] runs after the predecessor gate completes and
    *   before the channel send; tests suspend it on a gate to deterministically
    *   widen the await -> send gap that pre-fix newcomers exploited.
-   * - [afterSendForTest] runs after the channel send returns and before the
-   *   `sent` proof flag is set (core writes only). Deterministic proxy
+   * - [afterSendForTest] runs after the channel send returns — before the
+   *   `sent` proof flag on core writes (with a flag); the flush barrier also
+   *   fires it (that path has no flag). Deterministic proxy
    *   (stronger-than-production: guaranteed-admitted) for the send-races-cancel
    *   flag shape (`sent == false && sendAttempted == true`): production's true
    *   window is a CE racing a suspended channel send (send throws CE with the
@@ -1191,6 +1192,13 @@ class OrderedTranscriptSink(
             writer.join()
             return@withTimeoutOrNull
           }
+          // Post-send test seam (null in production): same signal shape as
+          // core writes, so a test can prove the barrier is buffered before
+          // acting on the writer (e.g. firing a fatal) — otherwise the
+          // send-vs-seal ordering is a race the sealed-join path above could
+          // win, reporting a drained flush instead of the parked failure.
+          checkNotHoldingAdmissionLock("afterSendForTest:flush")
+          afterSendForTest?.invoke(reservation.ticket)
           // Release before the drain: the send was attempted, so successors
           // may proceed while this caller waits. Idempotent with the finally
           // below, which covers timeout/cancel abandonment paths.

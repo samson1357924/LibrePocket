@@ -275,6 +275,15 @@ class ChatViewModel(
      * reading, so a stale conflated value can never satisfy them and a
      * regression that blanks the projection cannot hide behind the previous
      * cached value.
+     *
+     * The fence is a no-stale guarantee, not a target-identity guarantee: any
+     * recomputation of the backing history or session-state flows advances the
+     * generation, so the first generation newer than a captured one may carry
+     * an intermediate pairing rather than the reprojection a test is waiting
+     * for. Assertions on the first newer generation therefore hold only while
+     * the backing sources are quiet between the capture and the fence; with
+     * concurrent sources they must pair the generation fence with the value
+     * condition they actually require.
      */
     @VisibleForTesting
     internal data class MessagesProjection(

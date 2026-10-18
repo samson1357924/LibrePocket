@@ -150,11 +150,20 @@ class TerminalAckCancelGapTest {
     }
     val n = AtomicInteger(0)
     val c = controller(provider, SessionTranscriptSink(store, sid), n)
+    val settleWaitEntered = CountDownLatch(1)
+    c.onCancelSettleWaitEnteredForTest = { settleWaitEntered.countDown() }
     try {
       val host = startedHost(c)
       assertTrue("terminal write never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
       c.cancel()
-      Thread.sleep(300)
+      // Deterministic replacement for a fixed sleep: the cancel handler has
+      // provably committed to the SUBMITTING settle-wait before the blocked
+      // writer is released, so the post-wait FAILED re-evaluation (pending
+      // cleared, still no commit) is what the assertions below exercise.
+      assertTrue(
+        "cancel must enter the settle-wait before the blocked terminal write is released",
+        settleWaitEntered.await(5, TimeUnit.SECONDS),
+      )
       store.assistantGate.complete(Unit)
       joinHost(host)
       flush(c)
@@ -218,11 +227,21 @@ class TerminalAckCancelGapTest {
       provider, SessionTranscriptSink(store, sid), n,
       retry = TurnRetryConfig(maxRetries = 1, retryDelaysMs = listOf(0L)),
     )
+    val settleWaitEntered = CountDownLatch(1)
+    c.onCancelSettleWaitEnteredForTest = { settleWaitEntered.countDown() }
     try {
       val host = startedHost(c)
       assertTrue("retry terminal never entered", secondEntered.await(5, TimeUnit.SECONDS))
       c.cancel()
-      Thread.sleep(300)
+      // Deterministic replacement for a fixed sleep: the cancel handler has
+      // provably committed to the SUBMITTING settle-wait before the blocked
+      // retry terminal is released, so the post-wait COMMITTED re-evaluation
+      // (pending cleared, commit landed) is what the zero-new assertions
+      // exercise.
+      assertTrue(
+        "cancel must enter the settle-wait before the blocked retry terminal is released",
+        settleWaitEntered.await(5, TimeUnit.SECONDS),
+      )
       secondGate.complete(Unit)
       joinHost(host)
       flush(c)
@@ -343,6 +362,8 @@ class TerminalAckCancelGapTest {
       val commits = AtomicInteger(0)
       val committedLatch = CountDownLatch(1)
       val releaseWriter = CountDownLatch(1)
+      val suppressedFinalEntered = CountDownLatch(1)
+      c.onSuppressedFinalFlushEnteredForTest = { suppressedFinalEntered.countDown() }
       c.afterCommitBeforeAckForTest = {
         if (commits.incrementAndGet() == 2) {
           committedLatch.countDown()
@@ -353,7 +374,14 @@ class TerminalAckCancelGapTest {
         val host = startedHost(c)
         assertTrue("terminal never committed", committedLatch.await(5, TimeUnit.SECONDS))
         c.cancel()
-        Thread.sleep(300)
+        // Deterministic replacement for a fixed sleep: the host has provably
+        // observed the terminal as COMMITTED (never SUBMITTING) and entered
+        // the suppressed-final branch while the writer's ack is still held —
+        // the true commit→ack window the assertions below pin.
+        assertTrue(
+          "cancel must reach the suppressed-final branch with the ack still in flight",
+          suppressedFinalEntered.await(5, TimeUnit.SECONDS),
+        )
         releaseWriter.countDown()
         joinHost(host)
         flush(c)
@@ -411,6 +439,8 @@ class TerminalAckCancelGapTest {
       val commits = AtomicInteger(0)
       val committedLatch = CountDownLatch(1)
       val releaseWriter = CountDownLatch(1)
+      val suppressedFinalEntered = CountDownLatch(1)
+      c.onSuppressedFinalFlushEnteredForTest = { suppressedFinalEntered.countDown() }
       c.afterCommitBeforeAckForTest = {
         if (commits.incrementAndGet() == 2) {
           committedLatch.countDown()
@@ -421,7 +451,14 @@ class TerminalAckCancelGapTest {
         val host = startedHost(c)
         assertTrue("terminal never committed", committedLatch.await(5, TimeUnit.SECONDS))
         c.cancel()
-        Thread.sleep(300)
+        // Deterministic replacement for a fixed sleep: the host has provably
+        // observed the terminal as COMMITTED (never SUBMITTING) and entered
+        // the suppressed-final branch while the writer's ack is still held —
+        // the true commit→ack window the assertions below pin.
+        assertTrue(
+          "cancel must reach the suppressed-final branch with the ack still in flight",
+          suppressedFinalEntered.await(5, TimeUnit.SECONDS),
+        )
         releaseWriter.countDown()
         joinHost(host)
         flush(c)

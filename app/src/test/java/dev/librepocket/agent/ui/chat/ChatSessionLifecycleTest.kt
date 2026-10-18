@@ -923,10 +923,15 @@ class ChatSessionLifecycleTest {
             store.save(endpoint().copy(model = "other-model"))
             withTimeout(5_000) { live.closed.await() }
             withTimeout(5_000) { vm.sessionState.first { it.messages.isEmpty() } }
-            // Barrier: the first generation newer than the pre-switch one is
-            // the invalidation reprojection, so the read below can never be the
-            // stale pre-switch cache (deterministic red on a blanking
-            // regression, deterministic green with the snapshot intact).
+            // Barrier: a generation strictly newer than the pre-switch one can
+            // never be the stale pre-switch cache (deterministic red on a
+            // blanking regression, deterministic green with the snapshot
+            // intact). Quiet premise: the endpoint switch is the only source
+            // mutating history/session state between the capture above and
+            // this fence, so the first newer generation is the invalidation
+            // reprojection. Under concurrent sources the fence alone would
+            // only prove not-stale — which is why the assertion below also
+            // checks the projected value.
             val postSwitch = withTimeout(5_000) {
                 vm.messagesProjection.first { it.generation > preSwitch.generation }
             }

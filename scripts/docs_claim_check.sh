@@ -7,6 +7,11 @@
 #      documented in TESTING.md that CI does not run).
 #   B. docs/ENV.md version table matches gradle/libs.versions.toml,
 #      app/build.gradle.kts, gradle-wrapper.properties, and the workflow JDK.
+#   C. MCP zero-wiring: no production source file outside
+#      dev/librepocket/mcp/ (in any production source set — main + flavors
+#      play/foss/github + debug, Kotlin and Java, excluding test*/androidTest*)
+#      references the mcp package or any Mcp* type (the "not wired" claim in
+#      docs is enforced in CI).
 #
 # Fails closed: any mismatch prints a message and exits non-zero.
 set -euo pipefail
@@ -128,6 +133,35 @@ if [ -z "$JDK_VER" ]; then
   report "cannot parse java-version from pr-check.yml"
 elif ! grep -Eq "JDK ${JDK_VER}([^0-9]|$)" "$ENV_DOC"; then
   report "ENV.md missing JDK $JDK_VER baseline from pr-check.yml"
+fi
+
+# --- C. MCP zero-wiring (not-wired invariant) ---
+# MCP (package dev.librepocket.mcp) is declared+implemented but deliberately
+# NOT wired: no production code outside its own package may reference it. It
+# has JVM unit tests only (no device run), and every MCP tool stays behind the
+# executionReady=false fail-closed double gate. A wiring PR must flip tools
+# per the acceptance checklist in docs/CAPABILITY_MATRIX.md AND deliberately
+# widen this gate — never widen it as a side effect.
+# Matches the package import path plus any Mcp* type name (McpServer, McpScope,
+# McpWire, McpRegistry, McpTransport, McpTool, ...); prose that says only
+# "MCP" (e.g. KDoc forward mentions) does not match. Scans every production
+# source set (app/src/<set>/java for main + flavors play/foss/github + debug,
+# Kotlin and Java), excluding only the test*/androidTest* source sets that
+# legitimately reference MCP — flavor code ships in the APK, so a Mcp*
+# reference there is production wiring too.
+if [ ! -d "$ROOT/app/src" ]; then
+  report "missing app/src — MCP zero-wiring scan cannot run (fail closed)"
+else
+  mapfile -t MCP_REFS < <(
+    find "$ROOT/app/src" -type d -name java \
+      -not -path '*/src/test*' -not -path '*/src/androidTest*' \
+      -exec grep -rnE 'dev\.librepocket\.mcp|Mcp[A-Z]' --include='*.kt' --include='*.java' {} + 2>/dev/null \
+      | grep -v 'app/src/.*/java/dev/librepocket/mcp/' || true
+  )
+  if [ "${#MCP_REFS[@]}" -ne 0 ]; then
+    report "production Kotlin/Java outside dev/librepocket/mcp/ references MCP types (MCP must stay unwired until the wiring PR updates this gate):"
+    printf '%s\n' "${MCP_REFS[@]}"
+  fi
 fi
 
 if [ "$fail" -ne 0 ]; then

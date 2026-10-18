@@ -15,6 +15,16 @@ Observed current debug APK inventory (provided by the parent, not verified by
 this helper): about 17-20 root DEX shards, largest shard about 43.8 MB, and
 about 65-80 MB total DEX. Limits below leave headroom for that inventory; they
 are resource limits, not evidence that any real APK passed this scanner.
+
+Backup-binding authority: this scanner asserts that the MERGED manifest
+(what the final APK will actually run) still carries
+``android:fullBackupContent``/``android:dataExtractionRules`` bound to the
+pinned xml resources. Source-level checks (``backup_rules_check.py``) cannot
+see what a manifest-merger marker (``tools:node="replace"``, ``tools:remove``)
+stripped, so this artifact-level check is the authoritative proof that the
+bindings survived the merge. Runtime impact when missing: AOSP FullBackup
+treats both refs as absent and copies EVERYTHING (including the key files the
+whole policy exists to protect).
 """
 
 from __future__ import annotations
@@ -60,7 +70,23 @@ MAX_DEX_DESCRIPTOR_ENCODED_BYTES = 12 * 1024 * 1024
 MAX_APK_DESCRIPTOR_UTF16_UNITS = 16 * 1024 * 1024
 MAX_APK_DESCRIPTOR_ENCODED_BYTES = 48 * 1024 * 1024
 MAX_AAPT_OUTPUT_BYTES = 8 * 1024 * 1024
+# ``aapt dump resources`` prints one line per (entry, config) pair (~100-160
+# bytes each); a real app-wide table can reach several MB, while the compact
+# manifest-only dumps stay ~KBs. A larger per-call bound keeps the shared
+# manifest-dump budget (and with it the manifest parse scope) unchanged.
+MAX_RESOURCES_DUMP_BYTES = 32 * 1024 * 1024
 TOOL_TIMEOUT_SECONDS = 120.0
+
+# Merged-manifest backup bindings (the artifact-level authority). Resource-id
+# constants are stable SDK definitions of the android attrs:
+# android:fullBackupContent = 0x010104eb, android:dataExtractionRules =
+# 0x0101063e. The resource NAMES are the pins from backup_rules_check.py
+# EXPECTED_MANIFEST_ATTRS (values "@xml/backup_rules" /
+# "@xml/data_extraction_rules" minus the "@xml/" prefix).
+_BACKUP_BINDING_ATTRS: tuple[tuple[str, str, str], ...] = (
+    ("fullBackupContent", "0x010104eb", "backup_rules"),
+    ("dataExtractionRules", "0x0101063e", "data_extraction_rules"),
+)
 
 PLAY_FORBIDDEN_PERMISSIONS = (
     "SEND_SMS",
@@ -581,7 +607,7 @@ def _kill_and_reap(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
-def _run_bounded_stdout(command: list[str], label: str) -> str:
+def _run_bounded_stdout(command: list[str], label: str, max_bytes: int = MAX_AAPT_OUTPUT_BYTES) -> str:
     try:
         process = subprocess.Popen(
             command,
@@ -606,12 +632,12 @@ def _run_bounded_stdout(command: list[str], label: str) -> str:
                 raise PolicyError(f"{label} timed out after {TOOL_TIMEOUT_SECONDS:g}s")
             if not selector.select(remaining):
                 raise PolicyError(f"{label} timed out after {TOOL_TIMEOUT_SECONDS:g}s")
-            read_limit = min(64 * 1024, MAX_AAPT_OUTPUT_BYTES + 1 - len(output))
+            read_limit = min(64 * 1024, max_bytes + 1 - len(output))
             chunk = os.read(file_descriptor, read_limit)
             if not chunk:
                 break
             output.extend(chunk)
-            if len(output) > MAX_AAPT_OUTPUT_BYTES:
+            if len(output) > max_bytes:
                 raise PolicyError(f"{label} output exceeds bounded parser limit")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -650,6 +676,111 @@ def _validate_aapt_output(aapt: str, apk: Path) -> tuple[str, str]:
     if not re.search(r"(?im)^\s*E:\s*manifest\b", xmltree):
         raise PolicyError("aapt xmltree output lacks a manifest root")
     return permissions, xmltree
+
+
+def _application_manifest_block(xmltree: str) -> str:
+    """Slice the merged <application> element's dump lines out of the tree.
+
+    aapt prints one line per element/attribute with two-space indent steps
+    (``  E: application``); the block ends at the next ``E:`` element line of
+    the same or shallower indentation. A manifest without an application
+    element cannot carry either backup binding, so absence fails closed.
+    """
+    lines = xmltree.splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(r"^(\s*)E:\s*application\b", line)
+        if match is None:
+            continue
+        indent = match.group(1)
+        end = len(lines)
+        for follow in range(index + 1, len(lines)):
+            sibling = re.match(r"^(\s*)E:\s", lines[follow])
+            if sibling and len(sibling.group(1)) <= len(indent):
+                end = follow
+                break
+        return "\n".join(lines[index:end])
+    raise PolicyError(
+        "merged manifest lacks an <application> element - the backup "
+        "bindings cannot survive a manifest that has no application to bind"
+    )
+
+
+def _assert_merged_backup_bindings(aapt: str, apk: Path, xmltree: str) -> None:
+    """Assert the merged <application> still binds the backup rules resources.
+
+    The manifest merger runs between the validated source manifests and the
+    bytes aapt sees; a marker such as ``tools:node="replace"`` or
+    ``tools:remove="android:fullBackupContent"`` silently deletes the binding,
+    and at runtime AOSP FullBackup then copies EVERYTHING (key files included).
+    This artifact-level assertion is the authority on the merged bytes - the
+    source-level manifest validation (``backup_rules_check.py``) cannot observe
+    what the merger does. Both aapt spellings are accepted: the namespace is
+    spelled ``android:...`` by aapt v1 dumps and
+    ``http://schemas.android.com/apk/res/android:...`` by aapt2; aapt v1 prints
+    resource references as ``=@0x…`` and string values as the raw literal.
+    """
+    resolved: dict[str, tuple[str, int]] = {}
+    # Scope the attribute search to the merged <application> block: a binding
+    # line on any other node must not satisfy this gate (and a manifest with
+    # no application element cannot carry the bindings at all).
+    application_block = _application_manifest_block(xmltree)
+    for name, resource_id, resource in _BACKUP_BINDING_ATTRS:
+        match = re.search(
+            r"^\s*A:\s+(?:android:|http://schemas\.android\.com/apk/res/android:)"
+            + re.escape(name)
+            + r"\(\s*"
+            + re.escape(resource_id)
+            + r"\s*\)=(.+)$",
+            application_block,
+            re.MULTILINE,
+        )
+        if match is None:
+            raise PolicyError(
+                "merged manifest lost the backup binding "
+                f"android:{name} ({resource_id}) on <application>: a "
+                'manifest-merger marker (tools:node="replace" / tools:remove) '
+                "can strip it; Auto Backup would then copy the protected key files"
+            )
+        value = match.group(1).strip()
+        # aapt v1 prints "@0x7f010000"; aapt2 may spell it "@res/0x7f010000".
+        reference = re.match(r"@(?:res/)?0x([0-9a-fA-F]+)", value)
+        if reference is not None:
+            resolved[name] = (resource, int(reference.group(1), 16))
+            continue
+        # Plain-string forms print the resource name as a literal instead of
+        # an id (older aapt prints Raw string values without an id guess).
+        literal = re.search(r"@[\w/]+", value)
+        if literal is None or literal.group(0) != f"@xml/{resource}":
+            got = literal.group(0) if literal else value
+            raise PolicyError(
+                f"merged manifest android:{name} does not reference "
+                f"@xml/{resource} (got {got}) - rebound backup binding"
+            )
+    if not resolved:
+        return
+    resources = _run_bounded_stdout(
+        [aapt, "dump", "resources", str(apk)],
+        "aapt dump resources",
+        max_bytes=MAX_RESOURCES_DUMP_BYTES,
+    )
+    for name, (resource, identifier) in resolved.items():
+        resource_name = re.escape("xml/" + resource)
+        # aapt v1: "spec resource 0x7f010000 pkg:xml/backup_rules: flags=…"
+        spec_line = re.compile(
+            r"^\s*(?:spec\s+)?resource 0x%08x\s+\S+:%s\s*:" % (identifier, resource_name),
+            re.MULTILINE,
+        )
+        # aapt2: "resource 0x7f010000 xml/backup_rules …" (no spec/pkg form).
+        aapt2_line = re.compile(
+            r"^\s*resource 0x%08x\s+%s\b" % (identifier, resource_name),
+            re.MULTILINE,
+        )
+        if not (spec_line.search(resources) or aapt2_line.search(resources)):
+            raise PolicyError(
+                f"merged manifest android:{name} resource id 0x{identifier:08x} "
+                f"does not resolve to @xml/{resource} in the resources table "
+                "- rebound backup binding"
+            )
 
 
 def _validate_dexdump(dexdump: str, dex_name: str, dex_bytes: bytes) -> None:
@@ -727,6 +858,9 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str) -> None:
 
     infos, dex_infos = _validate_archive(apk)
     permissions, xmltree = _validate_aapt_output(aapt, apk)
+    # Backup bindings on the MERGED manifest (artifact-level authority) run
+    # for every policy mode: Play and Foss ship the same binding contract.
+    _assert_merged_backup_bindings(aapt, apk, xmltree)
     parsed_dexes: list[ParsedDex] = []
     descriptor_budget = DescriptorBudget()
     with zipfile.ZipFile(apk, "r") as archive:

@@ -31,7 +31,12 @@ This module parses the XML with the stdlib parser and enforces:
   comment while the attributes are gone, and a single-quoted attribute value
   would false-FAIL. The MAIN manifest checks ``--require-both`` (absence is
   fatal); overlay manifests fail only on a present-but-different value
-  (omitting merges main's value, which is legal).
+  (omitting merges main's value, which is legal). Overlay-level manifest
+  merger markers are parsed too: absence is only "legal inheritance" when no
+  marker strips main's attribute - a ``tools:remove`` naming these attributes,
+  or ``tools:node="replace"/"remove"`` on ``<application>``, deletes the
+  merged binding and must FAIL (the APK-level scanner then asserts the merged
+  bytes independently; source level stays defense in depth).
 
 It is invoked by the shell gate and is directly unit-tested against negative
 fixtures. Run with:
@@ -155,6 +160,15 @@ def _missing_exclude_errors(
 
 
 _ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
+# Manifest-merger marker namespace (both the plain-E spelling parities dev/
+# tools overlays use and the ElementTree-qualified form are matched).
+_TOOLS_NS_PREFIX = "tools:"
+_TOOLS_NS_URI = "{http://schemas.android.com/tools}"
+# ``tools:node`` values that cannot prove the merged manifest keeps an
+# attribute the higher-priority document did not re-declare:
+# ``remove`` strips the whole element, ``replace`` replaces every inherited
+# attribute with this document's value.
+_MERGE_STRIP_NODE_VALUES = frozenset({"remove", "replace"})
 
 # Runtime attr↔resource binding: Auto Backup reads these two attributes off
 # the merged <application> element, and the named resources are exactly the
@@ -216,6 +230,23 @@ def validate(path: str, expected_root: str) -> list[str]:
     return errors
 
 
+def _tools_marker_entries(element: ET.Element) -> tuple[tuple[str, str], ...]:
+    """Return ``(local-name, value)`` pairs of tools: merger marker attributes.
+
+    Both the namespaced spelling (``xmlns:tools`` bound to the Android tools
+    namespace, parsed by ElementTree as ``{uri}name``) and the non-namespaced
+    literal ``tools:`` spelling are matched; the literal form is defensive for
+    hand-written fixtures where the parser keeps the prefix in the name.
+    """
+    entries: list[tuple[str, str]] = []
+    for key, value in element.attrib.items():
+        if key.startswith(_TOOLS_NS_URI):
+            entries.append((key[len(_TOOLS_NS_URI) :], value))
+        elif key.startswith(_TOOLS_NS_PREFIX):
+            entries.append((key[len(_TOOLS_NS_PREFIX) :], value))
+    return tuple(entries)
+
+
 def validate_manifest(path: str, require_both: bool = False) -> list[str]:
     """Bind the manifest's backup attributes to the validated resources.
 
@@ -227,6 +258,15 @@ def validate_manifest(path: str, require_both: bool = False) -> list[str]:
     omitting an attribute is legal - merger inherits main's value - and an
     overlay might not even carry an <application> (whole-tree inheritance,
     e.g. a permissions-only overlay), which is equally legal there.
+
+    Merger markers change the absence semantics (fail-closed): an absent
+    attribute is only a legal inheritance when no marker strips main's value.
+    ``tools:remove`` naming one of the two attributes, or
+    ``tools:node="remove"`` / ``tools:node="replace"`` on ``<application>``
+    without re-declaring both pinned values, deletes the merged binding -
+    the merged manifest would run Auto Backup unprotected on the key files,
+    so the source-level gate refuses it. The APK-level scanner asserts the
+    merged bytes independently; this source check is defense in depth.
     """
     try:
         root = ET.parse(path).getroot()
@@ -238,13 +278,62 @@ def validate_manifest(path: str, require_both: bool = False) -> list[str]:
         return [
             f"{path}: manifest check needs a <manifest> root, found <{root.tag}>"
         ]
+    errors: list[str] = []
     application = root.find("application")
+    expected_values = dict(EXPECTED_MANIFEST_ATTRS)
+
+    def _own(name: str) -> str | None:
+        return None if application is None else application.get(f"{_ANDROID_NS}{name}")
+
+    # Merger markers on <manifest> root that name the backup bindings: the
+    # marker surface for these attributes is <application>/target nodes, so a
+    # root-level marker naming them is an undefined shape - refuse to prove
+    # anything about the merged outcome from this document alone.
+    for local, value in _tools_marker_entries(root):
+        if local in ("remove", "node") and any(
+            name in value for name in expected_values
+        ):
+            errors.append(
+                f"{path}: tools:{local} marker on <manifest> names a backup "
+                f"binding attribute ({value.strip()!r}) - merger outcome for "
+                f"{tuple(expected_values)} is unverifiable here"
+            )
     if application is None:
+        if errors:
+            return errors
         if require_both:
             return [f"{path}: manifest check needs an <application> element"]
         # Overlay without <application>: whole-tree inheritance is legal.
         return []
-    errors: list[str] = []
+    for local, value in _tools_marker_entries(application):
+        mentions = [name for name in expected_values if name in value]
+        if local == "remove":
+            for name in mentions:
+                own = _own(name)
+                if own is None:
+                    errors.append(
+                        f"{path}: tools:remove strips android:{name} while the "
+                        f"attribute is absent - the merged manifest would lose "
+                        f"{expected_values[name]}"
+                    )
+                # own != expected is reported by the generic loop below; own
+                # == expected from THIS document survives the marker legally.
+        elif local == "node" and value.strip() in _MERGE_STRIP_NODE_VALUES:
+            if value.strip() == "remove":
+                errors.append(
+                    f"{path}: tools:node=\"remove\" on <application> strips the "
+                    f"whole element - the merged manifest would lose "
+                    f"android:fullBackupContent AND android:dataExtractionRules"
+                )
+            else:
+                for name, expected in EXPECTED_MANIFEST_ATTRS:
+                    own = _own(name)
+                    if own is None:
+                        errors.append(
+                            f"{path}: tools:node=\"replace\" on <application> does "
+                            f"not re-declare android:{name} - the merged manifest "
+                            f"would lose {expected}"
+                        )
     for name, expected in EXPECTED_MANIFEST_ATTRS:
         value = application.get(f"{_ANDROID_NS}{name}")
         if value is None:

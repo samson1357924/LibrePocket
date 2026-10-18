@@ -59,7 +59,10 @@ command -v python3 >/dev/null 2>&1 || fail 'python3 is required for the backup r
 if [ "$MODE" = play ]; then
     for m in "$ROOT/app/src/main/AndroidManifest.xml" "$ROOT/app/src/play/AndroidManifest.xml"; do
         [ -f "$m" ] || continue
-        BODY=$(grep -v 'tools:node="remove"' "$m" || true)
+        # Quote-tolerant: single-quoted tools:node value is equally valid XML
+        # and equally inert for the merger; a filter that only eats the
+        # double-quoted spelling would false-FAIL it.
+        BODY=$(grep -vE "tools:node=[\"']remove[\"']" "$m" || true)
         for p in $BLACKLIST_PERMS; do
             if printf '%s\n' "$BODY" | grep -q "$p"; then
                 fail "source manifest $m declares $p"
@@ -76,12 +79,28 @@ else
         done
     done
 fi
-if grep -rn 'usesCleartextTraffic="true"' "$ROOT/app/src" 2>/dev/null | grep -q .; then
+# Quote-tolerant greps: single-quoted attribute values are equally valid XML
+# and equally enable cleartext; a double-quote-literal-only grep was escapable.
+if grep -rnE "usesCleartextTraffic=[\"']true" "$ROOT/app/src" 2>/dev/null | grep -q .; then
     fail 'cleartext explicitly enabled somewhere under app/src'
 fi
-NETWORK_CONFIG="$ROOT/app/src/main/res/xml/network_security_config.xml"
-[ -f "$NETWORK_CONFIG" ] || fail "missing $NETWORK_CONFIG"
-grep -q 'cleartextTrafficPermitted="false"' "$NETWORK_CONFIG" || fail "$NETWORK_CONFIG does not deny cleartext"
+# Every flavor overlay may override network_security_config (merger picks the
+# highest-priority file), so pin the deny-all in EVERY copy under app/src, not
+# only main's; the fixed-path grep would let a flavor copy re-enable cleartext
+# while source-level checks still PASS (the scanner carries the authority, this
+# stays defense in depth).
+NSC_LIST="$(find "$ROOT/app/src" -type f -name network_security_config.xml)" ||
+    fail 'network security config scan failed'
+[ -n "$NSC_LIST" ] || fail 'missing network_security_config.xml under app/src'
+while IFS= read -r nsconfig; do
+    [ -n "$nsconfig" ] || continue
+    # Quote-tolerant for the positive deny-all pin too (single quotes are
+    # equally valid XML; a literal-only grep false-FAILs them).
+    grep -qE "cleartextTrafficPermitted=[\"']false" "$nsconfig" ||
+        fail "$nsconfig does not deny cleartext"
+done <<EOF
+$NSC_LIST
+EOF
 for f in "$ROOT/app/src/main/res/xml/backup_rules.xml" "$ROOT/app/src/main/res/xml/data_extraction_rules.xml"; do
     [ -f "$f" ] || fail "missing $f"
 done

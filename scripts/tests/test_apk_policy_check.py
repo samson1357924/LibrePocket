@@ -243,6 +243,11 @@ class ApkPolicyHarness(unittest.TestCase):
         self._write_dexdump()
 
     def _write_aapt(self) -> None:
+        # The default xmltree is a merged manifest that CARRIES the backup
+        # bindings: apk_policy_inspect asserts the merged <application> keeps
+        # android:fullBackupContent / android:dataExtractionRules (artifact-
+        # level authority), so a fixture without them would be a rejection
+        # specimen now. FAKE_AAPT_XMLTREE selects negative/stripped shapes.
         aapt = self.build_tools / "aapt"
         aapt.write_text(
             "#!/bin/sh\n"
@@ -254,7 +259,45 @@ class ApkPolicyHarness(unittest.TestCase):
             "esac\n"
             "case \"${1:-} ${2:-}\" in\n"
             "  'dump permissions') printf '%s\\n' 'package:dev.librepocket.agent' ;;\n"
-            "  'dump xmltree') printf '%s\\n' 'E: manifest' '  E: application' ;;\n"
+            "  'dump xmltree')\n"
+            "    case \"${FAKE_AAPT_XMLTREE:-bindings}\" in\n"
+            "      stripped)\n"
+            "        printf '%s\\n' 'E: manifest' '  E: application' ;;\n"
+            "      no-application)\n"
+            "        printf '%s\\n' 'E: manifest' ;;\n"
+            "      aapt2)\n"
+            "        printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "          '    A: http://schemas.android.com/apk/res/android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "          '    A: http://schemas.android.com/apk/res/android:dataExtractionRules(0x0101063e)=@0x7f010001' ;;\n"
+            "      literal)\n"
+            "        printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "          '    A: android:fullBackupContent(0x010104eb)=\"@xml/backup_rules\" (Raw: \"@xml/backup_rules\")' \\\n"
+            "          '    A: android:dataExtractionRules(0x0101063e)=\"@xml/data_extraction_rules\" (Raw: \"@xml/data_extraction_rules\")' ;;\n"
+            "      rebound)\n"
+            "        printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "          '    A: android:fullBackupContent(0x010104eb)=@0x7f091001' \\\n"
+            "          '    A: android:dataExtractionRules(0x0101063e)=@0x7f091002' ;;\n"
+            "      *)  # bindings (the default, realistic merged manifest)\n"
+            "        printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "          '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "          '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' ;;\n"
+            "    esac ;;\n"
+            "  'dump resources')\n"
+            "    case \"${FAKE_AAPT_RESOURCES:-table}\" in\n"
+            "      missing) printf '%s\\n' '    (no xml/type resources)' ;;\n"
+            "      aapt2-table)\n"
+            "        printf '%s\\n' \\\n"
+            "          '    resource 0x7f010000 xml/backup_rules () (file) res/xml/backup_rules.xml' \\\n"
+            "          '    resource 0x7f010001 xml/data_extraction_rules () (file) res/xml/data_extraction_rules.xml' ;;\n"
+            "      wrong-name)\n"
+            "        printf '%s\\n' \\\n"
+            "          '      spec resource 0x7f010000 dev.librepocket.agent:xml/backup_rules_evil: flags=0x00000000' \\\n"
+            "          '      spec resource 0x7f010001 dev.librepocket.agent:xml/data_extraction_rules_evil: flags=0x00000000' ;;\n"
+            "      *)  # table (the default, id→name binding intact)\n"
+            "        printf '%s\\n' \\\n"
+            "          '      spec resource 0x7f010000 dev.librepocket.agent:xml/backup_rules: flags=0x00000000' \\\n"
+            "          '      spec resource 0x7f010001 dev.librepocket.agent:xml/data_extraction_rules: flags=0x00000000' ;;\n"
+            "    esac ;;\n"
             "  *) echo 'unexpected fake aapt invocation' >&2; exit 24 ;;\n"
             "esac\n",
             encoding="utf-8",
@@ -282,6 +325,8 @@ class ApkPolicyHarness(unittest.TestCase):
         sdk: Path | None = None,
         aapt_mode: str = "ok",
         dexdump_mode: str = "ok",
+        xmltree_mode: str = "bindings",
+        resources_mode: str = "table",
     ) -> dict[str, str]:
         env = os.environ.copy()
         env.update(
@@ -291,6 +336,8 @@ class ApkPolicyHarness(unittest.TestCase):
                 "PATH": f"{self.fake_bin}:/usr/bin:/bin",
                 "FAKE_AAPT_MODE": aapt_mode,
                 "FAKE_DEXDUMP_MODE": dexdump_mode,
+                "FAKE_AAPT_XMLTREE": xmltree_mode,
+                "FAKE_AAPT_RESOURCES": resources_mode,
                 "LC_ALL": "C",
             }
         )
@@ -303,6 +350,8 @@ class ApkPolicyHarness(unittest.TestCase):
         foss: bool = False,
         aapt_mode: str = "ok",
         dexdump_mode: str = "ok",
+        xmltree_mode: str = "bindings",
+        resources_mode: str = "table",
         sdk: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = ["sh", str(POLICY_CHECK)]
@@ -312,7 +361,13 @@ class ApkPolicyHarness(unittest.TestCase):
         return subprocess.run(
             command,
             cwd=ROOT,
-            env=self._env(sdk=sdk, aapt_mode=aapt_mode, dexdump_mode=dexdump_mode),
+            env=self._env(
+                sdk=sdk,
+                aapt_mode=aapt_mode,
+                dexdump_mode=dexdump_mode,
+                xmltree_mode=xmltree_mode,
+                resources_mode=resources_mode,
+            ),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -452,6 +507,146 @@ class ApkPolicyHarness(unittest.TestCase):
             self.tmp / "no-dex.apk", {"AndroidManifest.xml": b"synthetic manifest"}
         )
         self.assert_rejected(apk)
+
+    # -- merged-manifest backup-binding assertion (artifact-level authority) --
+
+    def test_merged_backup_bindings_stripped_rejected_both_modes(self) -> None:
+        # The third-party reviewer repro: a manifest-merger marker may strip
+        # android:fullBackupContent / android:dataExtractionRules from the
+        # merged <application>; the source manifests still LOOK bound. Only
+        # the merged bytes can prove the binding survived the merger.
+        apk = complete_apk(
+            self.tmp / "stripped-binding.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for foss in (False, True):
+            with self.subTest(mode="foss" if foss else "play"):
+                result = self.run_policy(apk, foss=foss, xmltree_mode="stripped")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("merged manifest lost the backup binding", result.stdout)
+
+    def test_merged_backup_binding_attr_with_wrong_printed_id_rejected(self) -> None:
+        # Printing the attribute with a DIFFERENT resource-id (i.e. an attr
+        # that is not actually android:fullBackupContent) fails closed too;
+        # a fake aapt cannot relabel it past the id pin.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, "lost the backup binding"
+        ):
+            policy_inspect._assert_merged_backup_bindings(
+                "/unused/aapt",
+                self.tmp / "unused.apk",
+                "  E: application\n"
+                "    A: android:fullBackupContent(0x99990001)=@0x7f010000",
+            )
+
+    def test_merged_backup_binding_literal_rebound_name_rejected(self) -> None:
+        # String-shaped values must be the pinned resource exactly.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, "rebound backup binding"
+        ):
+            policy_inspect._assert_merged_backup_bindings(
+                "/unused/aapt",
+                self.tmp / "unused.apk",
+                "  E: application\n"
+                '    A: android:fullBackupContent(0x010104eb)=@xml/backup_rules_evil\n'
+                '    A: android:dataExtractionRules(0x0101063e)=@xml/data_extraction_rules\n',
+            )
+
+    def test_merged_backup_bindings_aapt2_spelling_and_literal_raw_pass(self) -> None:
+        # Both dump spellings must be accepted: the fully-qualified namespace
+        # form (newer aapt2 style) and the Raw-literal string form.
+        apk = complete_apk(
+            self.tmp / "spelling-matrix.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for mode in ("aapt2", "literal"):
+            with self.subTest(xmltree_form=mode):
+                result = self.run_policy(apk, xmltree_mode=mode)
+                self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_merged_backup_binding_outside_application_rejected(self) -> None:
+        # A binding string living on a node OTHER than <application> (or an
+        # attribute printed after the application block) must not satisfy
+        # the gate: the search is scoped to the merged application block.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, "lost the backup binding"
+        ):
+            policy_inspect._assert_merged_backup_bindings(
+                "/unused/aapt",
+                self.tmp / "unused.apk",
+                "  E: application\n"
+                '    A: android:label(0x01010001)="Faux" (Raw: "Faux")\n'
+                "  E: someone-else\n"
+                '    A: android:fullBackupContent(0x010104eb)=@xml/backup_rules\n'
+                '    A: android:dataExtractionRules(0x0101063e)=@xml/data_extraction_rules\n',
+            )
+
+    def test_merged_backup_bindings_without_application_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, "lacks an <application> element"
+        ):
+            policy_inspect._assert_merged_backup_bindings(
+                "/unused/aapt",
+                self.tmp / "unused.apk",
+                "E: manifest\n",
+            )
+
+    def test_manifest_lacks_application_rejected_by_gate(self) -> None:
+        # End-to-end: a merged manifest with no <application> at all cannot
+        # pass the binding gate.
+        apk = complete_apk(
+            self.tmp / "no-application.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, xmltree_mode="no-application")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_merged_resolved_via_aapt2_resource_line_accepted(self) -> None:
+        # aapt2's dump resources shape (no spec/pkg prefix) must resolve too;
+        # keep this accepted only because find_tool_pair passes aapt v1 - the
+        # tolerance is for output-format variance, not for tool substitution.
+        apk = complete_apk(
+            self.tmp / "aapt2-table.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, resources_mode="aapt2-table")
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_merged_backup_bindings_resource_rebound_rejected(self) -> None:
+        # The attr exists but points at a DIFFERENT id than the pinned
+        # resource name (rebind to xml/backup_rules_evil): the gate refuses.
+        apk = complete_apk(
+            self.tmp / "rebound-binding.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(
+            apk, xmltree_mode="rebound", resources_mode="wrong-name"
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("rebound backup binding", result.stdout)
+
+    def test_merged_backup_bindings_missing_resource_table_rejected(self) -> None:
+        # An attr referencing an id with no xml/<name> entry in the table
+        # cannot be proven to be the pinned resource: fail closed.
+        apk = complete_apk(
+            self.tmp / "missing-table-binding.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, resources_mode="missing")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("rebound backup binding", result.stdout)
+
+    def test_merged_backup_bindings_id_name_mismatch_rejected(self) -> None:
+        # The table binds the referenced id to a WRONG xml resource name
+        # (spec resource ...xml/backup_rules_evil): reject even though both
+        # attrs exist on the merged application.
+        apk = complete_apk(
+            self.tmp / "name-mismatch-binding.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, resources_mode="wrong-name")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("rebound backup binding", result.stdout)
 
     def test_rejects_truncated_zip(self) -> None:
         complete = complete_apk(self.tmp / "complete.apk").read_bytes()
@@ -1121,6 +1316,102 @@ class BackupRulesValidator(unittest.TestCase):
         'android:fullBackupContent="@xml/backup_rules" '
         'android:dataExtractionRules="@xml/data_extraction_rules"'
     )
+
+    @staticmethod
+    def _tools_manifest(attrs: str) -> str:
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n'
+            '    xmlns:tools="http://schemas.android.com/tools">\n'
+            f"    <application {attrs} />\n"
+            "</manifest>\n"
+        )
+
+    # -- manifest-merger markers: absence is NOT legal inheritance when a
+    # marker strips main's binding (third-party reviewer repro) --
+
+    def test_overlay_tools_remove_backup_attrs_fails_closed(self) -> None:
+        p = self._write(
+            "AndroidManifest.xml",
+            self._tools_manifest(
+                'tools:remove="android:fullBackupContent,android:dataExtractionRules"'
+            ),
+        )
+        errors = backup_rules_check.validate_manifest(p)
+        self.assertEqual(len(errors), 2, errors)
+        self.assertTrue(
+            any("tools:remove strips android:fullBackupContent" in e for e in errors),
+            errors,
+        )
+        self.assertTrue(
+            any(
+                "tools:remove strips android:dataExtractionRules" in e for e in errors
+            ),
+            errors,
+        )
+
+    def test_overlay_tools_node_replace_without_attrs_fails_closed(self) -> None:
+        p = self._write(
+            "AndroidManifest.xml",
+            self._tools_manifest('android:allowBackup="true" tools:node="replace"'),
+        )
+        errors = backup_rules_check.validate_manifest(p)
+        self.assertEqual(len(errors), 2, errors)
+        self.assertTrue(
+            any("tools:node=\"replace\"" in e for e in errors), errors
+        )
+
+    def test_overlay_tools_node_remove_application_fails_closed(self) -> None:
+        p = self._write(
+            "AndroidManifest.xml", self._tools_manifest('tools:node="remove"')
+        )
+        errors = backup_rules_check.validate_manifest(p)
+        # ONE combined message: the whole element is stripped - only its
+        # re-declaration could prove otherwise, and tools:node="remove"
+        # never admits that.
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn('tools:node="remove"', errors[0])
+        self.assertIn("android:fullBackupContent", errors[0])
+        self.assertIn("android:dataExtractionRules", errors[0])
+
+    def test_overlay_marker_with_own_pinned_values_passes(self) -> None:
+        # Re-declaring BOTH pinned values while carrying a marker is provably
+        # fine: this document's own attributes survive the merge.
+        for marker in (
+            'tools:node="replace" ',
+            'tools:remove="android:fullBackupContent" ',
+        ):
+            with self.subTest(marker=marker):
+                p = self._write(
+                    "AndroidManifest.xml",
+                    self._tools_manifest(marker + self._MANIFEST_BINDING),
+                )
+                self.assertEqual(backup_rules_check.validate_manifest(p), [])
+
+    def test_root_manifest_level_marker_naming_backup_attrs_rejected(self) -> None:
+        body = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n'
+            '    xmlns:tools="http://schemas.android.com/tools"\n'
+            '    tools:remove="android:fullBackupContent">\n'
+            "</manifest>\n"
+        )
+        p = self._write("AndroidManifest.xml", body)
+        errors = backup_rules_check.validate_manifest(p)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("tools:remove marker on <manifest>", errors[0])
+
+    def test_overlay_benign_tools_markers_still_pass(self) -> None:
+        # tools:ignore / tools:insert never strip the inherited attributes.
+        p = self._write(
+            "AndroidManifest.xml",
+            self._tools_manifest(
+                'tools:ignore="android:fullBackupContent" '
+                'tools:insert="android:appComponentFactory@placeholder" '
+                'android:allowBackup="true"'
+            ),
+        )
+        self.assertEqual(backup_rules_check.validate_manifest(p), [])
 
     def test_manifest_structured_binding_passes(self) -> None:
         # Plain double-quoted attrs AND single-quoted (equally valid XML) both
@@ -1903,6 +2194,32 @@ class BackupRulesGateWiring(unittest.TestCase):
             text,
         )
 
+    def test_gate_nsc_scan_is_guarded_find(self) -> None:
+        # The all-flavor network_security_config scan must fail closed the
+        # same way the backup deep scan does: a non-pipelined guarded find
+        # (assignment status is find's own), then a non-empty guard. Without
+        # this pin the e2e tests cannot tell WHICH guarded scan surfaced a
+        # find failure (both print named "scan failed" messages).
+        text = POLICY_CHECK.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        nsc_assign = next(
+            (i for i, line in enumerate(lines) if "NSC_LIST=" in line),
+            None,
+        )
+        self.assertIsNotNone(nsc_assign, text)
+        self.assertIn("$(find ", lines[nsc_assign])
+        self.assertNotIn("| sort", lines[nsc_assign])
+        guard = next(
+            (
+                i
+                for i in range(nsc_assign + 1, min(nsc_assign + 3, len(lines)))
+                if "fail 'network security config scan failed'" in lines[i]
+            ),
+            None,
+        )
+        self.assertIsNotNone(guard, text)
+        self.assertIn("||", lines[guard - 1])
+
     def test_gate_binds_manifest_attrs_via_structured_check(self) -> None:
         # Runtime binding must be enforced by the structured XML checker
         # (comment-escape proof: bare-text grep PASSes a manifest whose
@@ -2163,7 +2480,17 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             finally:
                 locked.chmod(0o755)  # let TemporaryDirectory clean up
             self.assertEqual(proc.returncode, 1, proc.stderr)
-            self.assertIn("deep-scan of backup rules resources failed", proc.stderr)
+            # The unreadable subtree trips the FIRST fail-closed scan guard;
+            # since the NSC pin also scans app/src with a guarded find, the
+            # surfaced message may be either scan - what must hold is that a
+            # find failure produces a named-scan FAIL (never silent progress),
+            # and no later-stage message can follow.
+            self.assertIn("scan failed", proc.stderr)
+            self.assertTrue(
+                "deep-scan of backup rules resources failed" in proc.stderr
+                or "network security config scan failed" in proc.stderr,
+                proc.stderr,
+            )
             self.assertNotIn("expected root", proc.stderr, proc.stderr)
 
     def test_missing_manifest_binding_fails_closed(self) -> None:
@@ -2203,6 +2530,85 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             self.assertEqual(proc.returncode, 1, proc.stderr)
             self.assertIn("(attribute absent)", proc.stderr)
             self.assertNotIn("build-tools", proc.stderr)
+
+    def test_flavor_overlay_tools_remove_marker_fails_closed(self) -> None:
+        # The reviewer's P2 repro at gate level: a flavor overlay whose
+        # <application> carries tools:remove for the two backup attrs passes
+        # the naive "absent = inheritance" reading, but the merger removes
+        # main's bindings from the merged manifest. The source gate must
+        # reject the marker shape before any artifact exists.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            (root / "app" / "src" / "foss").mkdir(parents=True, exist_ok=True)
+            (root / "app" / "src" / "foss" / "AndroidManifest.xml").write_text(
+                '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n'
+                '    xmlns:tools="http://schemas.android.com/tools">\n'
+                "    <application\n"
+                '        tools:remove="android:fullBackupContent,android:dataExtractionRules" />\n'
+                "</manifest>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("tools:remove strips android:fullBackupContent", proc.stderr)
+            self.assertNotIn("required Android build-tools", proc.stderr)
+
+    def test_flavor_overlay_tools_node_replace_fails_closed(self) -> None:
+        # The sibling shape: tools:node="replace" replaces the whole
+        # <application>; without re-declaring the bindings the merged app
+        # would run Auto Backup unprotected.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            (root / "app" / "src" / "foss").mkdir(parents=True, exist_ok=True)
+            (root / "app" / "src" / "foss" / "AndroidManifest.xml").write_text(
+                '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n'
+                '    xmlns:tools="http://schemas.android.com/tools">\n'
+                '    <application android:allowBackup="true" tools:node="replace" />\n'
+                "</manifest>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("tools:node=\"replace\"", proc.stderr)
+
+    def test_flavor_overlay_marker_with_own_pinned_values_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            (root / "app" / "src" / "foss").mkdir(parents=True, exist_ok=True)
+            (root / "app" / "src" / "foss" / "AndroidManifest.xml").write_text(
+                '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n'
+                '    xmlns:tools="http://schemas.android.com/tools">\n'
+                "    <application\n"
+                '        android:fullBackupContent="@xml/backup_rules"\n'
+                '        android:dataExtractionRules="@xml/data_extraction_rules"\n'
+                '        tools:node="replace" />\n'
+                "</manifest>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertNotIn("or marker would lose", proc.stderr)
+            self.assertNotIn("tools:node", proc.stderr)
+            self.assertNotIn("must reference @xml/", proc.stderr)
+
+    def test_flavor_overlay_tools_marker_kept_values_passes(self) -> None:
+        # tools:remove naming one attr while the same document re-declares
+        # that attr with the pinned value survives legally (own values beat
+        # the strip marker); the gate must not false-FAIL this shape.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            (root / "app" / "src" / "foss").mkdir(parents=True, exist_ok=True)
+            (root / "app" / "src" / "foss" / "AndroidManifest.xml").write_text(
+                '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n'
+                '    xmlns:tools="http://schemas.android.com/tools">\n'
+                "    <application\n"
+                '        android:fullBackupContent="@xml/backup_rules"\n'
+                "        tools:remove=\"android:fullBackupContent\" />\n"
+                "</manifest>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertNotIn("tools:remove strips", proc.stderr)
+            self.assertNotIn("must reference @xml/", proc.stderr)
 
     def test_flavor_overlay_rebound_attr_fails_closed(self) -> None:
         # Merger lets a flavor overlay rebind android:fullBackupContent; the

@@ -9,8 +9,10 @@
   CleartextNotPermittedException. LAN hosts (192.168.x / 10.x) stay denied:
   reach them via `adb reverse` or an explicit entry added here temporarily.
 
-  The Play policy gate (scripts/play_policy_check.sh) only asserts on the MAIN
-  config, so this file can never weaken a release artifact.
+  The Play policy gate (scripts/play_policy_check.sh) fail-closed scans EVERY
+  network_security_config.xml under app/src and asserts each carries a
+  cleartextTrafficPermitted="false" base-config pin (loopback domain-config
+  entries stay debug-only: this overlay never ships in a release artifact).
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="false">

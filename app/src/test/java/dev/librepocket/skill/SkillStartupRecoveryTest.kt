@@ -13,7 +13,12 @@ import java.io.File
  * - 崩潰窗口還原不問齡期：target 缺席的合法 `.bak` 在預設 24h 期限下仍立即恢復
  *   （否則崩溃後要等一天，與「process restart 即恢復」矛盾）；
  * - 進行中安裝保護：新鲜 staging／target 仍在的孤兒 `.bak` 不受預設期限刪除；
- * - symlink 防衛：cleanup／listResiduals／installedVersion 不經 symlink 作用外部目錄。
+ * - symlink 防衛：cleanup／listResiduals／installedVersion 不經 symlink 作用外部目錄；
+ * - 子條目 symlink 防衛（NOFOLLOW）：形狀內的 symlink 條目只解除 link 本身——
+ *   不遞迴刪除其指向的外部內容、也不還原為正式 skill；真實目錄走
+ *   NOFOLLOW 遞迴刪除（內部遭植入 symlink 亦不波及外部）；
+ * - 每次啟動刪除類處置設 [SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN] 上限：
+ *   超出者保留、下次啟動繼續收斂。
  *
  * 啟動接線（[dev.librepocket.agent.LibrePocketApp.onCreate] 真的呼叫清理）由
  * `LibrePocketAppStartupTest`（Robolectric）覆蓋。
@@ -89,7 +94,156 @@ class SkillStartupRecoveryTest {
         }
     }
 
-    // ---- symlink 防衛 ----
+    // ---- 子條目 symlink 防衛（NOFOLLOW）----
+
+    /** 平台支援 symlink 時才測（無 symlink 環境下 noop skip）。 */
+    private fun assumeSymlinkSupported(e: Exception) {
+        when (e) {
+            is UnsupportedOperationException ->
+                org.junit.Assume.assumeNoException("platform without symlink", e)
+            is java.io.IOException ->
+                org.junit.Assume.assumeNoException("cannot create symlink", e)
+        }
+    }
+
+    @Test fun cleanup_symlinkStaleStaging_externalContentsSurvive() {
+        val parent = tempRoot()
+        try {
+            val root = File(parent, "skills").apply { mkdirs() }
+            val outside = File(parent, "outside").apply { mkdirs() }
+            val sentinel = File(outside, "sentinel.txt").apply { writeText("keep", Charsets.UTF_8) }
+            val link = File(root, ".evil-skill.tmp-${System.nanoTime()}-1")
+            try {
+                java.nio.file.Files.createSymbolicLink(link.toPath(), outside.toPath())
+            } catch (e: UnsupportedOperationException) {
+                assumeSymlinkSupported(e)
+            } catch (e: java.io.IOException) {
+                assumeSymlinkSupported(e)
+            }
+            // 條目齡期取自 f.lastModified()（跟隨 symlink → 外部目錄 mtime）：
+            // 把外部目錄設為過期，使條目進入刪除路徑。
+            outside.setLastModified(System.currentTimeMillis() - (25L * 60 * 60 * 1000))
+            val removed = SkillInstaller.cleanupStaleStaging(root)
+            assertEquals(1, removed)
+            assertFalse("symlink 條目應被解除（只刪 link 本身）", link.exists())
+            assertTrue("外部 sentinel 必須存活（不得遞迴刪入外部目錄）", sentinel.isFile)
+            assertTrue("外部目錄必須保留", outside.isDirectory)
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    @Test fun cleanup_freshSymlinkCrashBak_notRestoredAsSkill() {
+        val parent = tempRoot()
+        try {
+            val root = File(parent, "skills").apply { mkdirs() }
+            val outside = File(parent, "outside").apply { mkdirs() }
+            val sentinel = File(outside, "sentinel.txt").apply { writeText("keep", Charsets.UTF_8) }
+            val link = File(root, ".evil-skill.bak-${System.nanoTime()}-1")
+            try {
+                java.nio.file.Files.createSymbolicLink(link.toPath(), outside.toPath())
+            } catch (e: UnsupportedOperationException) {
+                assumeSymlinkSupported(e)
+            } catch (e: java.io.IOException) {
+                assumeSymlinkSupported(e)
+            }
+            // target 缺席 + 合法 id：崩潰還原語意不問齡期，會立刻進入處置。
+            // 防衛要求：link 不得被還原成正式 skill，只解除 link 本身。
+            val removed = SkillInstaller.cleanupStaleStaging(root)
+            assertEquals(1, removed)
+            assertFalse("外部目錄不得成為正式 skill（不得 rename link）",
+                File(root, "evil-skill").exists())
+            assertFalse("link 本身應被解除", link.exists())
+            assertTrue("外部內容必須存活", sentinel.isFile)
+            assertTrue("外部目錄必須保留", outside.isDirectory)
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    @Test fun cleanup_danglingSymlinkStaleEntry_unlinkOnly() {
+        val parent = tempRoot()
+        try {
+            val root = File(parent, "skills").apply { mkdirs() }
+            val link = File(root, ".ghost-skill.tmp-${System.nanoTime()}-1")
+            try {
+                java.nio.file.Files.createSymbolicLink(
+                    link.toPath(),
+                    File(parent, "no-such-target").toPath(),
+                )
+            } catch (e: UnsupportedOperationException) {
+                assumeSymlinkSupported(e)
+            } catch (e: java.io.IOException) {
+                assumeSymlinkSupported(e)
+            }
+            // dangling link 的 lastModified() 回 0 → 恆為過期，直接進入刪除路徑。
+            val removed = SkillInstaller.cleanupStaleStaging(root)
+            assertEquals(1, removed)
+            assertFalse("dangling link 應被解除", link.exists())
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    @Test fun cleanup_realStagingWithInnerSymlink_externalContentsSurvive() {
+        val parent = tempRoot()
+        try {
+            val root = File(parent, "skills").apply { mkdirs() }
+            val outsideFile = File(parent, "outside-file").apply { mkdirs() }
+            val outsideDir = File(parent, "outside-dir").apply { mkdirs() }
+            val sentinelFile = File(outsideFile, "sentinel.txt").apply {
+                writeText("keep", Charsets.UTF_8)
+            }
+            val sentinelDir = File(outsideDir, "nested.txt").apply {
+                writeText("keep", Charsets.UTF_8)
+            }
+            val staging = File(root, ".evil-skill.tmp-${System.nanoTime()}-1").apply { mkdirs() }
+            val linkToFile = File(staging, "to-file.lnk")
+            val linkToDir = File(staging, "to-dir.lnk")
+            try {
+                java.nio.file.Files.createSymbolicLink(
+                    linkToFile.toPath(),
+                    sentinelFile.toPath(),
+                )
+                java.nio.file.Files.createSymbolicLink(linkToDir.toPath(), outsideDir.toPath())
+            } catch (e: UnsupportedOperationException) {
+                assumeSymlinkSupported(e)
+            } catch (e: java.io.IOException) {
+                assumeSymlinkSupported(e)
+            }
+            staging.setLastModified(System.currentTimeMillis() - (25L * 60 * 60 * 1000))
+            val removed = SkillInstaller.cleanupStaleStaging(root)
+            assertEquals(1, removed)
+            assertFalse("真實 staging 目錄應被安全遞迴刪除", staging.exists())
+            assertTrue("內部 link 指向外部的檔案內容必須存活", sentinelFile.isFile)
+            assertTrue("內部 link 指向外部的目錄內容必須存活", sentinelDir.isFile)
+            assertTrue("外部目錄必須保留", outsideDir.isDirectory)
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    @Test fun cleanup_deleteBudget_cappedPerRun() {
+        val root = tempRoot()
+        try {
+            // 建立「上限 + 7」個過期 staging 條目，證明單次呼叫只刪至上限，
+            // 其餘保留、下次啟動收斂。
+            val extra = 7
+            val total = SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN + extra
+            for (i in 0 until total) {
+                File(root, ".cap-skill-" + i.toString().padStart(3, '0') + ".tmp-1-2").apply {
+                    mkdirs()
+                    setLastModified(System.currentTimeMillis() - (25L * 60 * 60 * 1000))
+                }
+            }
+            val first = SkillInstaller.cleanupStaleStaging(root)
+            assertEquals("單次刪除只到上限", SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN, first)
+            val second = SkillInstaller.cleanupStaleStaging(root)
+            assertEquals("剩餘條目下次啟動收斂", extra, second)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
 
     @Test fun cleanup_symlinkDestRoot_isNoop() {
         val parent = tempRoot()
@@ -156,6 +310,32 @@ class SkillStartupRecoveryTest {
                 org.junit.Assume.assumeNoException("cannot create symlink", e)
             }
             assertNull(SkillInstaller.installedVersion(skillDir))
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    @Test fun installedVersion_symlinkSkillDir_returnsNull() {
+        val parent = tempRoot()
+        try {
+            // 外部「已安裝」的 skill 目錄（一般檔案，SKILL.md 解析正常）。
+            val real = File(parent, "real-skill").apply { mkdirs() }
+            File(real, SkillInstaller.SKILL_MD).writeText(
+                "---\nname: real-skill\ndescription: 正常解析\nversion: 1.2.3\n---\n正文",
+                Charsets.UTF_8,
+            )
+            // 正向對照：真實目錄可讀出版本。
+            assertEquals("1.2.3", SkillInstaller.installedVersion(real))
+            val link = File(parent, "link-skill")
+            try {
+                java.nio.file.Files.createSymbolicLink(link.toPath(), real.toPath())
+            } catch (e: UnsupportedOperationException) {
+                org.junit.Assume.assumeNoException("platform without symlink", e)
+            } catch (e: java.io.IOException) {
+                org.junit.Assume.assumeNoException("cannot create symlink", e)
+            }
+            // 目錄級防衛：拒讀 symlink 型 skill 目錄（不經 link 讀外部內容）。
+            assertNull(SkillInstaller.installedVersion(link))
         } finally {
             parent.deleteRecursively()
         }

@@ -94,6 +94,17 @@ object SkillInstaller {
      */
     const val STALE_STAGING_MAX_AGE_MILLIS = 24L * 60 * 60 * 1000L
 
+    /**
+     * 每次清理呼叫最多「刪除類」處置的條目數（超出者保留、留待下次啟動收斂）。
+     *
+     * 上限只約束遞迴刪除工作（避免單次啟動在主執行緒做無界遞迴 I/O 拖慢
+     * cold start／引發 ANR）；崩潰還原（same-dir rename，O(1)）不受此上限約束，
+     * 維持「process restart 即恢復」的窗口語意。symlink 條目的 unlink（O(1)）
+     * 亦計入本預算（保守方向：link 多時會讓同批真實目錄延後到下次收斂，
+     * 正確性不受影響）。
+     */
+    const val MAX_CLEANUP_ENTRIES_PER_RUN = 64
+
     /** 同 skill 互斥鎖（per-skill 序列化併發安裝；distinct id 數量無界，條目永不驅逐，
      *  呼叫方須限流；leak 可接受但已文件化，見 [lockFor]）。 */
     private val skillLocks = ConcurrentHashMap<String, ReentrantLock>()
@@ -120,9 +131,81 @@ object SkillInstaller {
     private fun rename(from: File, to: File): Boolean =
         renameHook?.invoke(from, to) ?: from.renameTo(to)
 
-    /** best-effort symlink 偵測（失敗時回 false，由呼叫端決定是否 fail-closed）。 */
-    private fun isSymlink(f: File): Boolean = try {
+    /**
+     * 安全向 symlink 偵測（fail-closed）：偵測失敗時回 true（視為不可信）。
+     *
+     * 「會刪改外部內容」的路徑（[cleanupStaleStaging] 的 destRoot／條目檢查、
+     * [installFiles] 覆蓋前 target 檢查、[installedVersion] 拒讀）一律用此變體：
+     * 偵測不確定時寧可跳過／拒絕，也不跟隨 symlink 作用。觀察型 API
+     * （[listResiduals]）同樣採用，與清理行為保持一致。
+     */
+    private fun isSymlinkOrUnknown(f: File): Boolean = try {
         java.nio.file.Files.isSymbolicLink(f.toPath())
+    } catch (_: Exception) {
+        true
+    }
+
+    /**
+     * 純 unlink（NOFOLLOW）：只解除 symlink 目錄項本身，決不刪除其指向的
+     * 外部內容（dangling link 亦可刪）；刪不掉（權限／EIO）時保留原狀回 false。
+     */
+    private fun unlinkEntry(f: File): Boolean = try {
+        java.nio.file.Files.delete(f.toPath())
+        true
+    } catch (_: Exception) {
+        // best-effort：刪不掉就留下（下次啟動重試或人工處理），不影響呼叫方。
+        false
+    }
+
+    /**
+     * NOFOLLOW 的安全遞迴刪除（清理用途，取代 [File.deleteRecursively]）：
+     * 以 `Files.walkFileTree`（預設不跟隨 symlink）遍歷——
+     * - symlink 條目（含根本身）只被 unlink，其指向的外部內容不受波及；
+     * - 一般檔案／目錄正常刪除；個別子項刪除失敗保持 best-effort、繼續其餘回收。
+     *
+     * @return 根條目是否已消失（回收完成）；部分失敗保留殘餘並回 false，
+     *   由呼叫方下次啟動重試收斂。
+     */
+    private fun deleteTreeSafe(entry: File): Boolean = try {
+        val root = entry.toPath()
+        java.nio.file.Files.walkFileTree(
+            root,
+            object : java.nio.file.SimpleFileVisitor<java.nio.file.Path>() {
+                override fun visitFile(
+                    file: java.nio.file.Path,
+                    attrs: java.nio.file.attribute.BasicFileAttributes,
+                ): java.nio.file.FileVisitResult {
+                    // followLinks 關閉時 symlink 亦走此分支：只解除 link 本身。
+                    try {
+                        java.nio.file.Files.delete(file)
+                    } catch (_: Exception) {
+                        // best-effort：單檔刪不掉不阻斷其餘回收。
+                    }
+                    return java.nio.file.FileVisitResult.CONTINUE
+                }
+
+                override fun visitFileFailed(
+                    file: java.nio.file.Path,
+                    exc: java.io.IOException,
+                ): java.nio.file.FileVisitResult {
+                    // 讀不到子條目（權限等）：best-effort，繼續其餘回收。
+                    return java.nio.file.FileVisitResult.CONTINUE
+                }
+
+                override fun postVisitDirectory(
+                    dir: java.nio.file.Path,
+                    exc: java.io.IOException?,
+                ): java.nio.file.FileVisitResult {
+                    try {
+                        java.nio.file.Files.delete(dir)
+                    } catch (_: Exception) {
+                        // best-effort：清不掉保留，影響最終回傳值（下次重試）。
+                    }
+                    return java.nio.file.FileVisitResult.CONTINUE
+                }
+            },
+        )
+        !java.nio.file.Files.exists(root)
     } catch (_: Exception) {
         false
     }
@@ -170,19 +253,30 @@ object SkillInstaller {
      * - **進行中安裝保護**：新鲜 staging 與 target 仍在的孤兒 `.bak` 只在超過
      *   [maxAgeMillis] 後才刪，避免誤刪另一行程刚啟動的安裝。
      *
-     * [destRoot] 為 symlink 時直接回 0（與 [installFiles] 的防衛一致，避免
-     * 經 symlink 刪改外部目錄）。
+     * [destRoot] 為 symlink（或偵測失敗）時直接回 0；destRoot 下形狀內的
+     * **子條目 symlink** 一律只解除 link 本身（NOFOLLOW，見 [handleCleanupEntry]），
+     * 絕不遞迴刪除其指向的外部內容、也絕不還原成正式 skill；真實目錄改走
+     * NOFOLLOW 的 [deleteTreeSafe]（內部遭植入 symlink 亦只解除 link 本身，
+     * 不波及外部）。
+     *
+     * 每次呼叫的「刪除類」處置有 [MAX_CLEANUP_ENTRIES_PER_RUN] 上限：超出者
+     * 保留原狀、留待下次啟動繼續收斂（避免單次啟動無界遞迴 I/O）；崩潰還原型
+     * （rename，O(1)）不受上限約束。
      *
      * 呼叫方契約：不應與 [installZip]/[installFiles] 對同一 [destRoot] 併發調用；
      * 本函式內僅對同一 id 取 per-skill 鎖做 best-effort 互斥（防與安裝提交交錯），
-     * 跨 id 操作與 destRoot 建立仍需外部序列化。
+     * 跨 id 操作與 destRoot 建立仍需外部序列化。另注：`bakCountById` 為列舉時的
+     * point-in-time 快照（鎖外計算），鎖內僅還原前重驗 `target.exists()`，
+     * 極端交錯下的最終一致性依賴「不與 install 併發」契約。
      *
-     * @return 刪除或恢復的條目數（歧義保留者不計入）。
+     * @return 刪除或恢復的條目數（歧義保留者不計入；刪除類受每次啟動上限約束，
+     *   超出者此刻不計）。
      */
     fun cleanupStaleStaging(destRoot: File, maxAgeMillis: Long = STALE_STAGING_MAX_AGE_MILLIS): Int {
         if (!destRoot.isDirectory) return 0
-        // 與 installFiles 的防衛一致：destRoot 為 symlink 時不經它刪改外部目錄。
-        if (isSymlink(destRoot)) return 0
+        // 與 installFiles 的防衛一致：destRoot 為 symlink 時不經它刪改外部目錄；
+        // 偵測失敗時一併回 0（fail-closed）。
+        if (isSymlinkOrUnknown(destRoot)) return 0
         val entries = try {
             destRoot.listFiles()
         } catch (_: Exception) {
@@ -200,6 +294,8 @@ object SkillInstaller {
             bakCountById[bakId] = (bakCountById[bakId] ?: 0) + 1
         }
         var removed = 0
+        // 每次啟動的刪除類工作預算：避免無界遞迴 I/O（超出者待下次收斂）。
+        var deleted = 0
         for (f in entries) {
             val n = f.name
             val stagingId = STAGING_RE.matchEntire(n)?.groupValues?.get(1)
@@ -211,28 +307,58 @@ object SkillInstaller {
             val crashBak = bakId != null && SkillParser.isValidName(bakId) &&
                 !File(destRoot, bakId).exists()
             if (!crashBak && now - f.lastModified() < maxAgeMillis) continue
+            // 刪除類處置受每次啟動上限約束；還原型（rename，O(1)）不設限。
+            val deletionAllowed = deleted < MAX_CLEANUP_ENTRIES_PER_RUN
             // 有效 id 的條目在 per-skill 鎖下操作，防與同 id 安裝提交交錯。
             val opId = stagingId?.takeIf { SkillParser.isValidName(it) }
                 ?: bakId?.takeIf { SkillParser.isValidName(it) }
-            if (opId != null) {
+            val disp = if (opId != null) {
                 val lock = lockFor(opId)
                 lock.lock()
                 try {
-                    if (handleCleanupEntry(f, stagingId, bakId, destRoot, bakCountById)) removed++
+                    handleCleanupEntry(f, stagingId, bakId, destRoot, bakCountById, deletionAllowed)
                 } finally {
                     lock.unlock()
                 }
-                continue
+            } else {
+                handleCleanupEntry(f, stagingId, bakId, destRoot, bakCountById, deletionAllowed)
             }
-            if (handleCleanupEntry(f, stagingId, bakId, destRoot, bakCountById)) removed++
+            when (disp) {
+                Disposition.RESTORED -> removed++
+                Disposition.DELETED -> {
+                    removed++
+                    deleted++
+                }
+                Disposition.KEPT -> Unit
+            }
         }
         return removed
+    }
+
+    /** 清理單一條目的處置結果（供呼叫方計數並區分預算歸屬）。 */
+    private enum class Disposition {
+        /** 已還原為正式 skill（rename，O(1)，占用回傳計數）。 */
+        RESTORED,
+
+        /** 已刪除完成（unlink 或 NOFOLLOW 安全遞迴刪除，占刪除預算）。 */
+        DELETED,
+
+        /** 保留原狀（歧義／未達預算／單項失敗重試）。 */
+        KEPT,
     }
 
     /**
      * 單一清理條目的實際處置（呼叫方已按 id 取鎖或 id 非法無需取鎖）。
      *
-     * @return true 表示已刪除或已恢復（計入回傳計數）。
+     * 子條目 symlink 防衛（NOFOLLOW，先於一切處置）：安裝器寫出的條目理應是
+     * 一般檔案／目錄，形狀內條目為 symlink 即不可信——`File.isDirectory` 會
+     * 跟隨 symlink、rename 會搬走 link 本身、遞迴刪除會遍歷其指向的外部目錄。
+     * 故 symlink 條目一律只解除 link 本身，不遞迴刪除、也絕不還原成正式 skill
+     * （唯一例外：真實目錄內部遭植入的 symlink 由 [deleteTreeSafe] 的
+     * NOFOLLOW 遍歷只解除 link 本身）。
+     *
+     * @return 處置結果（[Disposition.RESTORED]/[Disposition.DELETED] 計入呼叫方
+     *   回傳計數；[Disposition.KEPT] 保留待人工或下次收斂）。
      */
     private fun handleCleanupEntry(
         f: File,
@@ -240,32 +366,34 @@ object SkillInstaller {
         bakId: String?,
         destRoot: File,
         bakCountById: Map<String, Int>,
-    ): Boolean {
+        deletionAllowed: Boolean,
+    ): Disposition {
+        // 1) 子條目 NOFOLLOW 防衛：symlink（或偵測失敗）一律只 unlink 本身。
+        if (isSymlinkOrUnknown(f)) {
+            return if (unlinkEntry(f)) Disposition.DELETED else Disposition.KEPT
+        }
         if (bakId != null && SkillParser.isValidName(bakId)) {
             if ((bakCountById[bakId] ?: 0) > 1) {
                 // 歧義：同 id 多份候選，全保留、不還原、不刪除、不計數，需人工介入。
-                return false
+                return Disposition.KEPT
             }
             val target = File(destRoot, bakId)
             if (!target.exists() && f.isDirectory) {
                 // 崩潰窗口遺留：舊版已搬離、target 缺席 → 盡力恢復。
+                //（f 已通過上方 NOFOLLOW 檢查；還原型不占刪除預算，O(1)。）
                 val restored = try {
                     rename(f, target)
                 } catch (_: Exception) {
                     false
                 }
-                if (restored) return true
+                return if (restored) Disposition.RESTORED else Disposition.KEPT
                 // 恢復失敗則保留供人工處理，不計數。
-                return false
             }
         }
         // staging、target 仍在的孤兒 bak、或 id 非法者：只刪不恢復。
-        return try {
-            f.deleteRecursively()
-        } catch (_: Exception) {
-            // best-effort：刪不掉就留下，不影響呼叫方。
-            false
-        }
+        // 每次啟動的刪除類工作設上限：超出者保留待下次收斂。
+        if (!deletionAllowed) return Disposition.KEPT
+        return if (deleteTreeSafe(f)) Disposition.DELETED else Disposition.KEPT
     }
 
     /**
@@ -275,9 +403,13 @@ object SkillInstaller {
      */
     fun installedVersion(skillDir: File): String? {
         return try {
+            // 目錄級防衛（與 destRoot 防衛同類）：拒讀 symlink 型 skill 目錄——
+            // 其下 SKILL.md 可能經父層 link 逃逸讀取外部內容。
+            if (isSymlinkOrUnknown(skillDir)) return null
             val md = File(skillDir, SKILL_MD)
-            // 與 installFiles 的防衛一致：拒讀 symlink 型 SKILL.md（避免路徑逃逸讀取）。
-            if (isSymlink(md)) return null
+            // 與 installFiles 的防衛一致：拒讀 symlink 型 SKILL.md（避免路徑逃逸讀取）；
+            // 偵測失敗時視為不可信（fail-closed）。
+            if (isSymlinkOrUnknown(md)) return null
             if (!md.isFile) return null
             SkillParser.parse(md.readText(Charsets.UTF_8)).manifest.version
         } catch (_: Exception) {
@@ -299,8 +431,9 @@ object SkillInstaller {
      */
     fun listResiduals(destRoot: File, maxAgeMillis: Long = STALE_STAGING_MAX_AGE_MILLIS): List<File> {
         if (!destRoot.isDirectory) return emptyList()
-        // 與 cleanupStaleStaging 的防衛一致：symlink destRoot 不經它列外部目錄。
-        if (isSymlink(destRoot)) return emptyList()
+        // 與 cleanupStaleStaging 的防衛一致：symlink destRoot 不經它列外部目錄；
+        // 偵測失敗時一併回空（fail-closed）。
+        if (isSymlinkOrUnknown(destRoot)) return emptyList()
         val entries = try {
             destRoot.listFiles()
         } catch (_: Exception) {
@@ -483,9 +616,14 @@ object SkillInstaller {
             if (target.exists() && !replace) {
                 return Result.Failure(Failure.ALREADY_EXISTS, "skill '$root' already installed")
             }
+            // 覆蓋前 target symlink 防衛（fail-closed）：不對 symlink target 進行
+            // rename/刪除——planted target 會經由 bak 刪除波及外部內容。
+            if (target.exists() && isSymlinkOrUnknown(target)) {
+                return Result.Failure(Failure.IO_ERROR, "target must not be symlink: ${target.name}")
+            }
             val tid = Thread.currentThread().id
             val staging = File(destRoot, ".$root.tmp-${System.nanoTime()}-$tid")
-            if (staging.exists()) staging.deleteRecursively()
+            if (staging.exists()) deleteTreeSafe(staging)
             if (!staging.mkdirs() && !staging.isDirectory) {
                 throw java.io.IOException("cannot create staging ${staging.name}")
             }
@@ -515,7 +653,7 @@ object SkillInstaller {
                 fsyncBestEffort(staging)
                 if (!target.exists()) {
                     if (!rename(staging, target)) {
-                        staging.deleteRecursively()
+                        deleteTreeSafe(staging)
                         return Result.Failure(
                             Failure.IO_ERROR,
                             "commit failed: rename staging ${staging.name} -> ${target.name}",
@@ -526,9 +664,9 @@ object SkillInstaller {
                     // 降版揭露：先快照舊版 version（best-effort，失敗即 null），成功時帶回。
                     replacedVersion = installedVersion(target)
                     val backup = File(destRoot, ".$root.bak-${System.nanoTime()}-$tid")
-                    if (backup.exists()) backup.deleteRecursively()
+                    if (backup.exists()) deleteTreeSafe(backup)
                     if (!rename(target, backup)) {
-                        staging.deleteRecursively()
+                        deleteTreeSafe(staging)
                         return Result.Failure(
                             Failure.IO_ERROR,
                             "commit failed: backup old version ${target.name} -> ${backup.name}",
@@ -548,7 +686,7 @@ object SkillInstaller {
                             e.message ?: e.javaClass.simpleName
                         }
                         try {
-                            staging.deleteRecursively()
+                            deleteTreeSafe(staging)
                         } catch (_: Exception) {
                             // best-effort：清不掉不影響已組好的失敗訊息與回滾結果。
                         }
@@ -569,12 +707,14 @@ object SkillInstaller {
                         }
                     }
                     // 成功路徑的 bak 刪除為 best-effort：回傳忽略，
-                    // 殘留由下次 [cleanupStaleStaging] 收斂。
-                    backup.deleteRecursively()
+                    // 殘留由下次 [cleanupStaleStaging] 收斂。NOFOLLOW 刪除
+                    // （[deleteTreeSafe]）：live skill 內若遭植入 symlink，
+                    // 只解除 link 本身、不波及外部內容。
+                    deleteTreeSafe(backup)
                     fsyncBestEffort(destRoot)
                 }
             } catch (e: Exception) {
-                staging.deleteRecursively()
+                deleteTreeSafe(staging)
                 throw e
             }
         } catch (e: Exception) {

@@ -314,6 +314,41 @@ class SkillInstallTest {
         }
     }
 
+    @Test fun installOntoSymlinkTarget_isRefused_ioError() {
+        val parent = Files.createTempDirectory("skill-install-link").toFile().apply {
+            deleteOnExit()
+        }
+        try {
+            val root = File(parent, "skills").apply { mkdirs() }
+            val outside = File(parent, "outside").apply { mkdirs() }
+            val sentinel = File(outside, "sentinel.txt").apply { writeText("keep", Charsets.UTF_8) }
+            val target = File(root, "meeting-prep")
+            try {
+                java.nio.file.Files.createSymbolicLink(target.toPath(), outside.toPath())
+            } catch (e: UnsupportedOperationException) {
+                org.junit.Assume.assumeNoException("platform without symlink", e)
+            } catch (e: java.io.IOException) {
+                org.junit.Assume.assumeNoException("cannot create symlink", e)
+            }
+            val zip = zipOf(
+                "meeting-prep/SKILL.md" to skillMd().toByteArray(Charsets.UTF_8),
+            )
+            // 覆蓋（replace=true）到 planted symlink target：必須被拒（fail-closed），
+            // 不得對 link 進行 rename→bak→deleteRecursively（波及外部內容）。
+            val r = SkillInstaller.installZip(zip, root, replace = true)
+            assertTrue("expected failure, got $r", r is SkillInstaller.Result.Failure)
+            assertEquals(
+                SkillInstaller.Failure.IO_ERROR,
+                (r as SkillInstaller.Result.Failure).reason,
+            )
+            assertTrue("外部 sentinel 必須存活", sentinel.isFile)
+            assertTrue("planted link 不得被搬移或刪除", java.nio.file.Files.isSymbolicLink(target.toPath()))
+            // 非 replace 的新鮮安裝在 ALREADY_EXISTS 檢查就先擋，不受本測影響。
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
     // 避免引入 Truth/Guava：用 JDK NIO 建臨時目錄。
     private object Files {
         fun createTempDirectory(prefix: String): java.nio.file.Path =

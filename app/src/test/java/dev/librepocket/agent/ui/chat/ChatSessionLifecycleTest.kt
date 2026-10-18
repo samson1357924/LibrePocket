@@ -916,7 +916,16 @@ class ChatSessionLifecycleTest {
             live.sendFinished.await()
             withTimeout(5_000) { vm.messages.first { it.size == 2 } }
             assertEquals("session-1", vm.currentSessionId.value)
-            emissions.launch { vm.messages.collect { seen.add(it.map { m -> m.text }) } }
+            val baseline = CompletableDeferred<Unit>()
+            emissions.launch {
+                vm.messages.collect {
+                    seen.add(it.map { m -> m.text })
+                    if (it.size == 2) baseline.complete(Unit)
+                }
+            }
+            // Handshake: collector has observed the pre-switch baseline before
+            // invalidation, so an empty `seen` cannot vacuum-pass.
+            withTimeout(5_000) { baseline.await() }
 
             store.save(endpoint().copy(model = "other-model"))
             withTimeout(5_000) { live.closed.await() }
@@ -952,7 +961,14 @@ class ChatSessionLifecycleTest {
             val first = sessions.awaitCreated(1)
             first.sendFinished.await()
             withTimeout(5_000) { vm.messages.first { it.size == 2 } }
-            emissions.launch { vm.messages.collect { seen.add(it.map { m -> m.text }) } }
+            val baseline = CompletableDeferred<Unit>()
+            emissions.launch {
+                vm.messages.collect {
+                    seen.add(it.map { m -> m.text })
+                    if (it.size == 2) baseline.complete(Unit)
+                }
+            }
+            withTimeout(5_000) { baseline.await() }
 
             store.save(endpoint().copy(model = "other-model"))
             withTimeout(5_000) { first.closed.await() }

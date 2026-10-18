@@ -16,7 +16,7 @@ import java.nio.charset.CodingErrorAction
  * - UTF-8 is decoded from the raw byte stream: multi-byte characters split
  *   across [feed] chunks are buffered, never decoded per-Char.
  * - A single line longer than [MAX_LINE_BYTES] (1 MiB) latches [lineTooLong];
- *   providers translate that into `Failed(retryable=false, "SSE_LINE_TOO_LONG")`.
+ *   providers translate that into `Failed(retryable=false, LINE_TOO_LONG_MESSAGE)`.
  * - One event's total `data:` payload is capped by [MAX_FRAME_BYTES]:
  *   many tiny lines could otherwise stack past memory without tripping the
  *   per-line cap (small-line stacking attack). Exceeding it latches
@@ -53,6 +53,9 @@ class SseFrameParser {
 
         /** Typed failure for a stacked multi-line event, distinct from line/truncation. */
         const val FRAME_TOO_LARGE_MESSAGE = "SSE_FRAME_TOO_LARGE"
+
+        /** Typed failure for a single oversized SSE line. */
+        const val LINE_TOO_LONG_MESSAGE = "SSE_LINE_TOO_LONG"
     }
 
     private val byteBuf = ByteArrayOutputStream()

@@ -25,8 +25,14 @@ private class SequentialFaultStore(
         return super.appendEvent(event)
     }
 
-    override suspend fun appendEvents(events: List<TranscriptEvent>): List<Long> =
-        super<SessionStore>.appendEvents(events)
+    override suspend fun appendEvents(events: List<TranscriptEvent>): List<Long> {
+        // Reproduce the SessionStore default sequential fallback by hand: each
+        // row goes through the (possibly fault-injecting) appendEvent above,
+        // so a mid-batch throw leaves the committed prefix behind (non-atomic).
+        val ids = ArrayList<Long>(events.size)
+        for (event in events) ids.add(appendEvent(event))
+        return ids
+    }
 }
 
 /**

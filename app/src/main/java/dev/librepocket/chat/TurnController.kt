@@ -741,6 +741,7 @@ class TurnController(
   val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
 
   /** Last usage reported by the provider (billing/context accounting; P1 records only). */
+  @Volatile
   var lastUsage: StreamEvent.Usage? = null
     private set
 
@@ -4130,10 +4131,10 @@ class TurnController(
       // STREAMING, and never report success. Falls through to the normal
       // completion path below (same as a provider failure): empty queue keeps
       // ERROR, queued work may still promote.
-      // The terminal path above never ran its discardTextBuffer, so drop any
-      // retained attempt buffer here (ids are never reused; clear-all is safe
-      // under single-flight and idempotent with the normal path).
-      attemptTextBuffers.clear()
+      // The terminal path above never ran its discardTextBuffer, so drop only
+      // the active attempt's buffer (ids are never reused; clear-all could
+      // wipe a queued attempt's buffer under future multi-flight).
+      discardTextBuffer(attemptRef.get())
       synchronized(lock) {
         activityRevision++
         _uiState.update {
@@ -4156,8 +4157,8 @@ class TurnController(
       // it always propagates (never swallowed like the sink's rethrow).
       if (e is VirtualMachineError || e is ThreadDeath) throw e
       // Same leak guard as the Exception path above: the terminal discard
-      // never ran, so drop any retained attempt buffer.
-      attemptTextBuffers.clear()
+      // never ran, so drop only the active attempt's buffer.
+      discardTextBuffer(attemptRef.get())
       synchronized(lock) {
         activityRevision++
         _uiState.update {
@@ -4513,6 +4514,9 @@ class TurnController(
       orderedTranscript.onTurnStarted(logicalTurnId, text)
       durableUserRows.add(logicalTurnId)
     }
+    // Authoritative usage is per-turn (#84): a turn that emits no Usage must
+    // not inherit the previous turn's billing.
+    lastUsage = null
     var attempt = 0
     var attemptRunId = logicalTurnId
     while (true) {
@@ -4724,10 +4728,12 @@ class TurnController(
               // (capped: frozen at MAX_USAGE_EVENTS_PER_ATTEMPT, never a
               // failure). Attempt isolation: each retry merges into its own
               // attempt id. [lastUsage] holds the merged authoritative value.
-              val seen = attemptUsageSeen
-                .computeIfAbsent(attemptRunId) { AtomicInteger(0) }
-                .incrementAndGet()
-              if (seen <= MAX_USAGE_EVENTS_PER_ATTEMPT) {
+              val counter = attemptUsageSeen.computeIfAbsent(attemptRunId) { AtomicInteger(0) }
+              // Freeze the per-attempt flood counter at the cap (sink parity):
+              // once MAX_USAGE_EVENTS_PER_ATTEMPT is reached, neither the
+              // counter nor the merge advances.
+              if (counter.get() < MAX_USAGE_EVENTS_PER_ATTEMPT) {
+                counter.incrementAndGet()
                 val merged = mergeUsage(attemptUsages[attemptRunId], event)
                 attemptUsages[attemptRunId] = merged
                 lastUsage = merged
@@ -5150,8 +5156,13 @@ class TurnController(
     // No matching UI row (defensive; production always placeholders first):
     // skip the full-history copy plus the no-op emission instead of counting
     // a phantom commit. The buffer is kept so the terminal snapshot stays
-    // exact via assistantTextOf.
-    if (_uiState.value.messages.none { it.id == runId && it.role == "assistant" }) return
+    // exact via assistantTextOf. Clear the dirty counters so the guard does
+    // not rescan on every later flush.
+    if (_uiState.value.messages.none { it.id == runId && it.role == "assistant" }) {
+      buf.unflushedChars = 0
+      buf.unflushedDeltas = 0
+      return
+    }
     val snapshot = buf.text.toString()
     val reasoning = buf.hasReasoning
     // The update{} lambda may re-run on contention, so counter side effects
@@ -5303,7 +5314,7 @@ internal fun isResourceExhausted(failed: StreamEvent.Failed?): Boolean {
   return failed.message.contains(TOOL_ARGS_TOO_LARGE, ignoreCase = true) ||
     failed.message.contains(TEXT_TOO_LARGE, ignoreCase = true) ||
     failed.message.contains(SseFrameParser.FRAME_TOO_LARGE_MESSAGE, ignoreCase = true) ||
-    failed.message.contains("SSE_LINE_TOO_LONG", ignoreCase = true)
+    failed.message.contains(SseFrameParser.LINE_TOO_LONG_MESSAGE, ignoreCase = true)
 }
 
 /**

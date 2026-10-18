@@ -92,7 +92,10 @@ import kotlinx.coroutines.CancellationException
  * best-effort notices: failures are swallowed and never break the chat loop.
  * [onUsage] itself never throws (best-effort call), but the merged row is
  * persisted durably with the attempt terminal (#84), never one row per call.
- * Cancellation always propagates.
+ * Cancellation propagates for core writes. Post-core accounting paths
+ * ([flushBufferedUsageBestEffort]) swallow it so a cancelled best-effort
+ * usage write cannot negate an already-committed terminal ack (P1 #2); the
+ * separate trailing [onUsage] entry follows the general propagation contract.
  * Text is redacted again by [RoomSessionStore] on write.
  *
  * Cross-restart RUNNING → INTERRUPTED backfill lives in Phase 3 as well (see
@@ -228,17 +231,6 @@ class SessionTranscriptSink(
     )
 
     /**
-     * Removes and returns the buffered pre-terminal usage for [runId] (null
-     * when none). The post-ack flush below appends the returned row after
-     * the core terminal ack, so one attempt owns exactly one usage row with
-     * the final values.
-     */
-    private fun takePendingUsage(runId: String): PendingUsage? {
-        usageSeen.remove(runId)
-        return pendingUsage.remove(runId)
-    }
-
-    /**
      * Post-ack authoritative usage flush (#84 follow-up, fail-closed
      * accounting): persists the run's buffered pre-terminal usage as one
      * `system` row AFTER the core terminal ack, best-effort (failures
@@ -258,12 +250,44 @@ class SessionTranscriptSink(
         parentRunId: String? = null,
         attemptIndex: Int? = null,
     ) {
-        val usage = takePendingUsage(runId) ?: return
-        trailingUsageWritten.add(runId)
-        appendNotice(
-            runId, "system", usageText(usage),
-            isFinal = true, parentRunId = parentRunId, attemptIndex = attemptIndex,
-        )
+        // Mutual exclusion with the trailing path: if a trailing usage already
+        // landed for this runId, drop the buffered entry (no duplicate row).
+        if (runId in trailingUsageWritten) {
+            pendingUsage.remove(runId)
+            usageSeen.remove(runId)
+            return
+        }
+        val usage = pendingUsage[runId] ?: return
+        // Best-effort post-core flush: never propagates (including
+        // CancellationException), so a usage-write failure cannot negate an
+        // already-committed terminal ack. Retain the buffered entry on failure
+        // so a later retry terminal still owns its authoritative row.
+        var ok = false
+        try {
+            store.appendEvent(
+                TranscriptEvent(
+                    sessionId = sessionId,
+                    runId = runId,
+                    kind = "system",
+                    text = usageText(usage),
+                    createdAt = clock(),
+                    isPartial = false,
+                    failureReason = null,
+                    parentRunId = parentRunId,
+                    attemptIndex = attemptIndex,
+                    isFinal = true,
+                ),
+            )
+            ok = true
+        } catch (e: Throwable) {
+            if (e is Error) throw e
+            // Best-effort: retain buffered entry for retry.
+        }
+        if (ok) {
+            pendingUsage.remove(runId)
+            usageSeen.remove(runId)
+            trailingUsageWritten.add(runId)
+        }
     }
 
     private fun usageText(usage: PendingUsage): String =
@@ -315,7 +339,6 @@ class SessionTranscriptSink(
 
     override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) {
         val now = clock()
-        markTerminalized(runId)
         val batch = ArrayList<TranscriptEvent>(3)
         // Phase2 marker-first: the payload-free `reasoning` marker leads so a
         // non-atomic fallback store (default sequential loop) that fails on
@@ -329,6 +352,7 @@ class SessionTranscriptSink(
         appendDurableBatch(batch)
         // #84 follow-up: authoritative usage flushes best-effort after the
         // core ack (see flushBufferedUsageBestEffort), never in the batch.
+        markTerminalized(runId)
         flushBufferedUsageBestEffort(runId)
     }
 
@@ -340,7 +364,6 @@ class SessionTranscriptSink(
         hasReasoning: Boolean,
     ) {
         val now = clock()
-        markTerminalized(runId)
         val batch = ArrayList<TranscriptEvent>(3)
         // Phase2 marker-first (see the 3-arg form above): orphan marker is
         // harmless, orphan assistant would fail open.
@@ -351,6 +374,7 @@ class SessionTranscriptSink(
         appendDurableBatch(batch)
         // #84 follow-up: authoritative usage flushes best-effort after the
         // core ack (see flushBufferedUsageBestEffort), never in the batch.
+        markTerminalized(runId)
         flushBufferedUsageBestEffort(runId, parentRunId, attemptIndex)
     }
 
@@ -362,14 +386,14 @@ class SessionTranscriptSink(
      * write); the store's text-path `redact()` second pass is then a no-op.
      */
     override suspend fun onTurnFailed(runId: String, error: String) {
-        markTerminalized(runId)
         appendDurable(runId, "system", "turn $runId failed: ${Redactor.redactError(error)}", isFinal = true)
+        markTerminalized(runId)
         flushBufferedUsageBestEffort(runId)
     }
 
     override suspend fun onTurnFailed(runId: String, partialText: String, error: String) {
-        markTerminalized(runId)
         appendDurable(runId, "assistant", partialText, isPartial = true, failureReason = error, isFinal = true)
+        markTerminalized(runId)
         flushBufferedUsageBestEffort(runId)
     }
 
@@ -380,13 +404,13 @@ class SessionTranscriptSink(
         parentRunId: String?,
         attemptIndex: Int?,
     ) {
-        markTerminalized(runId)
         appendDurable(
             runId, "assistant", partialText,
             isPartial = true, failureReason = error,
             parentRunId = parentRunId, attemptIndex = attemptIndex,
             isFinal = true,
         )
+        markTerminalized(runId)
         flushBufferedUsageBestEffort(runId, parentRunId, attemptIndex)
     }
 
@@ -398,13 +422,13 @@ class SessionTranscriptSink(
         attemptIndex: Int?,
         isFinal: Boolean,
     ) {
-        markTerminalized(runId)
         appendDurable(
             runId, "assistant", partialText,
             isPartial = true, failureReason = error,
             parentRunId = parentRunId, attemptIndex = attemptIndex,
             isFinal = isFinal,
         )
+        markTerminalized(runId)
         flushBufferedUsageBestEffort(runId, parentRunId, attemptIndex)
     }
 
@@ -424,7 +448,6 @@ class SessionTranscriptSink(
         isFinal: Boolean,
         hasReasoning: Boolean,
     ) {
-        markTerminalized(runId)
         if (!hasReasoning) {
             appendDurable(
                 runId, "assistant", partialText,
@@ -432,7 +455,8 @@ class SessionTranscriptSink(
                 parentRunId = parentRunId, attemptIndex = attemptIndex,
                 isFinal = isFinal,
             )
-            flushBufferedUsageBestEffort(runId, parentRunId, attemptIndex)
+            markTerminalized(runId)
+        flushBufferedUsageBestEffort(runId, parentRunId, attemptIndex)
             return
         }
         val now = clock()
@@ -459,6 +483,7 @@ class SessionTranscriptSink(
         // #84 follow-up: authoritative usage flushes best-effort after the
         // core ack (see flushBufferedUsageBestEffort), never in the batch.
         appendDurableBatch(batch)
+        markTerminalized(runId)
         flushBufferedUsageBestEffort(runId, parentRunId, attemptIndex)
     }
 
@@ -468,7 +493,6 @@ class SessionTranscriptSink(
 
     override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) {
         val now = clock()
-        markTerminalized(runId)
         val batch = ArrayList<TranscriptEvent>(3)
         // Phase2 marker-first (see onTurnSucceeded): orphan marker harmless.
         if (hasReasoning) batch.add(coreEvent(runId, "reasoning", "", now, isFinal = true))
@@ -476,6 +500,7 @@ class SessionTranscriptSink(
         appendDurableBatch(batch)
         // #84 follow-up: authoritative usage flushes best-effort after the
         // core ack (see flushBufferedUsageBestEffort), never in the batch.
+        markTerminalized(runId)
         flushBufferedUsageBestEffort(runId)
     }
 
@@ -487,7 +512,6 @@ class SessionTranscriptSink(
         hasReasoning: Boolean,
     ) {
         val now = clock()
-        markTerminalized(runId)
         val batch = ArrayList<TranscriptEvent>(3)
         // Phase2 marker-first (see onTurnSucceeded): orphan marker harmless.
         if (hasReasoning) {
@@ -503,6 +527,7 @@ class SessionTranscriptSink(
         appendDurableBatch(batch)
         // #84 follow-up: authoritative usage flushes best-effort after the
         // core ack (see flushBufferedUsageBestEffort), never in the batch.
+        markTerminalized(runId)
         flushBufferedUsageBestEffort(runId, parentRunId, attemptIndex)
     }
 
@@ -525,12 +550,12 @@ class SessionTranscriptSink(
         // second assistant row for the same attempt. Exact text pattern (like
         // the INTERRUPTED marker): hidden from the chat replay (system kind),
         // visible in export, terminal for the backfill scan.
-        markTerminalized(logicalTurnId)
-        markTerminalized(attemptRunId)
         appendDurable(logicalTurnId, "system", "turn $logicalTurnId cancelled", isFinal = true)
         // #84 follow-up: any still-pending usage (mid-stream cancel) flushes
         // best-effort after the cancel mark — the attempt's row first, then
         // the logical id's if distinct (see flushBufferedUsageBestEffort).
+        markTerminalized(logicalTurnId)
+        markTerminalized(attemptRunId)
         flushBufferedUsageBestEffort(attemptRunId)
         if (attemptRunId != logicalTurnId) flushBufferedUsageBestEffort(logicalTurnId)
     }
@@ -578,8 +603,6 @@ class SessionTranscriptSink(
         attemptIndex: Int?,
         hasReasoning: Boolean,
     ) {
-        markTerminalized(logicalTurnId)
-        markTerminalized(attemptRunId)
         val now = clock()
         val batch = ArrayList<TranscriptEvent>(if (hasReasoning) 4 else 3)
         batch.add(
@@ -611,6 +634,8 @@ class SessionTranscriptSink(
             ),
         )
         appendDurableBatch(batch)
+        markTerminalized(logicalTurnId)
+        markTerminalized(attemptRunId)
         flushBufferedUsageBestEffort(
             attemptRunId, parentRunId = parentRunId, attemptIndex = attemptIndex,
         )
@@ -650,8 +675,37 @@ class SessionTranscriptSink(
      */
     override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) {
         if (runId in terminalizedRuns) {
-            if (!trailingUsageWritten.add(runId)) return
-            appendNotice(runId, "system", "usage input=$inputTokens output=$outputTokens", isFinal = true)
+            if (runId in trailingUsageWritten) return
+            // Merge with any retained buffered pre-terminal usage (e.g. a
+            // failed flush) so an authoritative earlier value is not replaced
+            // by nulls.
+            val prev = pendingUsage[runId]
+            val inTok = inputTokens ?: prev?.inputTokens
+            val outTok = outputTokens ?: prev?.outputTokens
+            var ok = false
+            try {
+                store.appendEvent(
+                    TranscriptEvent(
+                        sessionId = sessionId,
+                        runId = runId,
+                        kind = "system",
+                        text = "usage input=$inTok output=$outTok",
+                        createdAt = clock(),
+                        isPartial = false,
+                        failureReason = null,
+                        isFinal = true,
+                    ),
+                )
+                ok = true
+            } catch (e: Throwable) {
+                if (e is Error || e is CancellationException) throw e
+                // Best-effort: allow a later retry.
+            }
+            if (ok) {
+                trailingUsageWritten.add(runId)
+                pendingUsage.remove(runId)
+                usageSeen.remove(runId)
+            }
             return
         }
         if (pendingUsage[runId] == null && pendingUsage.size >= MAX_PENDING_USAGE_RUNS) return

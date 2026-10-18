@@ -704,7 +704,7 @@ class TurnController(
               pending.attemptRef.get(), pending.logicalTurnId, pending.attemptIndexRef.get(),
             )
           } catch (e: Throwable) {
-            if (e is VirtualMachineError || e is ThreadDeath) throw e
+            if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
           }
         }
         if (completed == null) {
@@ -735,7 +735,7 @@ class TurnController(
         // everything after failing the ack).
         // Current (S3-F1): narrowed to non-VM Errors. Target: sink-owned
         // fail+throw+seal for drains as well.
-        if (e is VirtualMachineError || e is ThreadDeath) throw e
+        if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
         orderedTranscript.markInterrupted(pending.logicalTurnId)
       }
     }
@@ -856,10 +856,19 @@ class TurnController(
    * most one usage notice no matter how many `Usage` events arrived.
    */
   private suspend fun flushAttemptUsage(runId: String) {
-    val merged = attemptUsages.remove(runId)
-    attemptUsageSeen.remove(runId)
+    val merged = attemptUsages[runId]
     if (merged != null) {
-      writeNotice { orderedTranscript.onUsage(runId, merged.inputTokens, merged.outputTokens) }
+      try {
+        writeNotice { orderedTranscript.onUsage(runId, merged.inputTokens, merged.outputTokens) }
+        attemptUsages.remove(runId)
+        attemptUsageSeen.remove(runId)
+      } catch (e: Throwable) {
+        if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+        // Best-effort: retain the cell for a later retry instead of losing
+        // the authoritative usage on a transient store failure.
+      }
+    } else {
+      attemptUsageSeen.remove(runId)
     }
   }
 
@@ -1216,7 +1225,7 @@ class TurnController(
               }
               orderedTranscript.flush()
             } catch (e: Throwable) {
-              if (e is VirtualMachineError || e is ThreadDeath) throw e
+              if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
             }
             true
           }
@@ -1256,7 +1265,7 @@ class TurnController(
               orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId, receipt.cancelParent, receipt.cancelIndex)
               orderedTranscript.flush()
             } catch (e: Throwable) {
-              if (e is VirtualMachineError || e is ThreadDeath) throw e
+              if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
             }
             true
           }
@@ -1297,7 +1306,7 @@ class TurnController(
               orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId, receipt.cancelParent, receipt.cancelIndex)
               orderedTranscript.flush()
             } catch (e: Throwable) {
-              if (e is VirtualMachineError || e is ThreadDeath) throw e
+              if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
             }
             true
           }
@@ -1344,7 +1353,7 @@ class TurnController(
               orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId, receipt.cancelParent, receipt.cancelIndex)
               orderedTranscript.flush()
             } catch (e: Throwable) {
-              if (e is VirtualMachineError || e is ThreadDeath) throw e
+              if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
             }
             true
           }
@@ -1732,6 +1741,7 @@ class TurnController(
    * post-ack window, cancel it there, and assert zero-new (final) vs
    * system-mark (intermediate) without racing the microsecond return path.
    */
+  @Volatile
   internal var afterTerminalAckForTest: (suspend (String) -> Unit)? = null
 
   /** Test seam between an idle admission snapshot and its fresh policy gate. */
@@ -2079,7 +2089,7 @@ class TurnController(
       // admitted failures mark INTERRUPTED and project
       // TranscriptDurabilityException (retryable); VM-fatal always propagates
       // unwrapped, and CancellationException never lands here (caught first).
-      if (e is VirtualMachineError || e is ThreadDeath) throw e
+      if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
       if (!sent.get() && sendAttempted.get()) {
         return DurableAdmission.UNKNOWN
       }
@@ -4052,12 +4062,15 @@ class TurnController(
         // cancelCompensationTimeoutMs). Target: split notice/terminal bounds.
         withContext(NonCancellable) {
           try {
+            // #84: flush usage outside the timed core-compensation block so a
+            // stalled accounting write cannot consume the cancel budget.
+            try {
+              withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+                flushAttemptUsage(cancelId)
+              }
+            } catch (_: Throwable) {
+            }
             val completed = withTimeoutOrNull(cancelCompensationTimeoutMs) {
-              // #84: a cancel mid-stream still owns a pending authoritative
-              // usage — write it as the single notice before the cancel
-              // terminal below. No-op when the attempt already terminalized
-              // (its terminal path flushed first).
-              flushAttemptUsage(cancelId)
               if (suppressed) {
                 // R18-1 Stage 2: split already-durable vs still-pending.
                 // Already-durable (acked || COMMITTED, no receipt): the
@@ -4082,9 +4095,8 @@ class TurnController(
                       if (cancelId != logicalTurnId) {
                         orderedTranscript.flushBufferedUsageBestEffort(logicalTurnId, null, null)
                       }
-                      orderedTranscript.flush()
                     } catch (e: Throwable) {
-                      if (e is VirtualMachineError || e is ThreadDeath) throw e
+                      if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
                     }
                   } catch (_: ClosedSendChannelException) {
                   } catch (sealFailure: CancellationException) {
@@ -4094,7 +4106,7 @@ class TurnController(
                     // S3-F1 (Current): narrowed fatal in the cancel mark (sink
                     // already failed the ack + sealed); keep original cancel.
                     // VM-fatal always propagates.
-                    if (e is VirtualMachineError || e is ThreadDeath) throw e
+                    if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
                   }
                 } else {
                   try {
@@ -4112,7 +4124,7 @@ class TurnController(
                     // S3-F1 (Current): narrowed fatal in the notice (writer
                     // seals); the PENDING receipt above still owns the
                     // handoff. VM-fatal always propagates.
-                    if (e is VirtualMachineError || e is ThreadDeath) throw e
+                    if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
                   }
                 }
               } else {
@@ -4120,9 +4132,8 @@ class TurnController(
                   orderedTranscript.onTurnCancelled(cancelId, cancelText, cancelParent, cancelIndex, cancelReasoning)
                   try {
                     orderedTranscript.flushBufferedUsageBestEffort(cancelId, cancelParent, cancelIndex)
-                    orderedTranscript.flush()
                   } catch (e: Throwable) {
-                    if (e is VirtualMachineError || e is ThreadDeath) throw e
+                    if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
                   }
                 } catch (_: ClosedSendChannelException) {
                   // Sealed after close(): explicit INTERRUPTED mark already recorded.
@@ -4136,7 +4147,7 @@ class TurnController(
                   // S3-F1 (Current): narrowed fatal in the cancel terminal
                   // (sink already failed the ack + sealed); keep original
                   // cancel. VM-fatal always propagates.
-                  if (e is VirtualMachineError || e is ThreadDeath) throw e
+                  if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
                 }
               }
             }
@@ -4155,6 +4166,14 @@ class TurnController(
                 }
               }
             }
+            // Best-effort drain of accounting writes without consuming the
+            // compensation timeout above (core terminal already decided).
+            try {
+              withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+                orderedTranscript.flush()
+              }
+            } catch (_: Throwable) {
+            }
           } catch (_: ClosedSendChannelException) {
             // Sealed after close(): explicit INTERRUPTED mark already recorded.
           } catch (sealFailure: CancellationException) {
@@ -4167,7 +4186,7 @@ class TurnController(
             // replace the original cancellation with a new fatal, except
             // VM-fatal which always propagates (contrast OrderedTranscriptSink
             // fail+throw+seal: fail the ack, mark, then rethrow).
-            if (e is VirtualMachineError || e is ThreadDeath) throw e
+            if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
           }
         }
       }
@@ -4204,7 +4223,7 @@ class TurnController(
       // lands here (caught first above), so CE semantics are unchanged.
       // VM-fatal (VirtualMachineError/ThreadDeath) never lands here either —
       // it always propagates (never swallowed like the sink's rethrow).
-      if (e is VirtualMachineError || e is ThreadDeath) throw e
+      if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
       // Same leak guard as the Exception path above: the terminal discard
       // never ran, so drop only the active attempt's buffer.
       discardTextBuffer(attemptRef.get())
@@ -4891,7 +4910,7 @@ class TurnController(
         // sanitizeError → UI ERROR. CancellationException never lands here
         // (rethrown first above), so CE semantics are unchanged. VM-fatal
         // always propagates (contrast OrderedTranscriptSink fail+throw+seal).
-        if (e is VirtualMachineError || e is ThreadDeath) throw e
+        if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
         coroutineContext.ensureActive()
         failed = StreamEvent.Failed(
           e.message ?: "provider error",
@@ -4929,14 +4948,22 @@ class TurnController(
           successReceipt, successOutcome,
         )
         terminalizedAttempts.add(attemptRunId)
-        afterTerminalAckForTest?.invoke(attemptRunId)
+        withContext(NonCancellable) {
+          try {
+            orderedTranscript.flushBufferedUsageBestEffort(
+              attemptRunId, parentFor(attemptRunId, logicalTurnId), attempt,
+            )
+            withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+              orderedTranscript.flush()
+            }
+          } catch (e: Throwable) {
+            if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+          }
+        }
         try {
-          orderedTranscript.flushBufferedUsageBestEffort(
-            attemptRunId, parentFor(attemptRunId, logicalTurnId), attempt,
-          )
-          orderedTranscript.flush()
+          afterTerminalAckForTest?.invoke(attemptRunId)
         } catch (e: Throwable) {
-          if (e is VirtualMachineError || e is ThreadDeath) throw e
+          if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
         }
         discardTextBuffer(attemptRunId)
         return
@@ -4974,14 +5001,22 @@ class TurnController(
           assistantReasoningOf(attemptRunId),
         )
         terminalizedAttempts.add(attemptRunId)
-        afterTerminalAckForTest?.invoke(attemptRunId)
+        withContext(NonCancellable) {
+          try {
+            orderedTranscript.flushBufferedUsageBestEffort(
+              attemptRunId, parentFor(attemptRunId, logicalTurnId), attempt,
+            )
+            withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+              orderedTranscript.flush()
+            }
+          } catch (e: Throwable) {
+            if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+          }
+        }
         try {
-          orderedTranscript.flushBufferedUsageBestEffort(
-            attemptRunId, parentFor(attemptRunId, logicalTurnId), attempt,
-          )
-          orderedTranscript.flush()
+          afterTerminalAckForTest?.invoke(attemptRunId)
         } catch (e: Throwable) {
-          if (e is VirtualMachineError || e is ThreadDeath) throw e
+          if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
         }
         discardTextBuffer(attemptRunId)
         return
@@ -5013,14 +5048,22 @@ class TurnController(
         assistantReasoningOf(attemptRunId),
       )
       terminalizedAttempts.add(attemptRunId)
-      afterTerminalAckForTest?.invoke(attemptRunId)
+      withContext(NonCancellable) {
+        try {
+          orderedTranscript.flushBufferedUsageBestEffort(
+            attemptRunId, parentFor(attemptRunId, logicalTurnId), attempt,
+          )
+          withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+            orderedTranscript.flush()
+          }
+        } catch (e: Throwable) {
+          if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+        }
+      }
       try {
-        orderedTranscript.flushBufferedUsageBestEffort(
-          attemptRunId, parentFor(attemptRunId, logicalTurnId), attempt,
-        )
-        orderedTranscript.flush()
+        afterTerminalAckForTest?.invoke(attemptRunId)
       } catch (e: Throwable) {
-        if (e is VirtualMachineError || e is ThreadDeath) throw e
+        if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
       }
       discardTextBuffer(attemptRunId)
       attempt += 1

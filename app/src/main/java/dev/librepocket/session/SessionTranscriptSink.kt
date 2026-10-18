@@ -284,7 +284,10 @@ class SessionTranscriptSink(
             )
             ok = true
         } catch (e: Throwable) {
-            if (e is Error) throw e
+            if (e is CancellationException) throw e
+            if (e is VirtualMachineError || e is ThreadDeath) throw e
+            // Best-effort accounting: swallow other errors so a usage-only
+            // failure cannot seal/block core work.
         }
         if (ok) {
             pendingUsage.remove(runId)
@@ -293,12 +296,19 @@ class SessionTranscriptSink(
             trailingUsageWritten.add(runId)
         } else {
             pendingUsage.remove(runId)
-            usageSeen.remove(runId)
-            retainedFailedUsage[runId] = usage
-            while (retainedFailedUsage.size > MAX_RETAINED_FAILED_USAGE_RUNS) {
-                val oldest = retainedFailedUsage.keys.firstOrNull() ?: break
-                retainedFailedUsage.remove(oldest)
+            // Keep usageSeen so the per-run flood cap survives retries.
+            val retained = retainedFailedUsage[runId]
+            val merged = PendingUsage(
+                inputTokens = usage.inputTokens ?: retained?.inputTokens,
+                outputTokens = usage.outputTokens ?: retained?.outputTokens,
+            )
+            // LRU: move to end on update.
+            retainedFailedUsage.remove(runId)
+            if (retainedFailedUsage.size >= MAX_RETAINED_FAILED_USAGE_RUNS) {
+                val oldest = retainedFailedUsage.keys.firstOrNull()
+                if (oldest != null) retainedFailedUsage.remove(oldest)
             }
+            retainedFailedUsage[runId] = merged
         }
     }
 
@@ -700,7 +710,8 @@ class SessionTranscriptSink(
                 )
                 ok = true
             } catch (e: Throwable) {
-                if (e is Error || e is CancellationException) throw e
+                if (e is CancellationException) throw e
+                if (e is VirtualMachineError || e is ThreadDeath) throw e
                 // Best-effort: allow a later retry.
             }
             if (ok) {
@@ -712,13 +723,14 @@ class SessionTranscriptSink(
                 // Retain in the failed-terminal bucket for a later retry,
                 // never the active quota.
                 pendingUsage.remove(runId)
-                usageSeen.remove(runId)
+                // Keep usageSeen so the per-run flood cap survives retries.
                 val merged = PendingUsage(inputTokens = inTok, outputTokens = outTok)
-                retainedFailedUsage[runId] = merged
-                while (retainedFailedUsage.size > MAX_RETAINED_FAILED_USAGE_RUNS) {
-                    val oldest = retainedFailedUsage.keys.firstOrNull() ?: break
-                    retainedFailedUsage.remove(oldest)
+                retainedFailedUsage.remove(runId)
+                if (retainedFailedUsage.size >= MAX_RETAINED_FAILED_USAGE_RUNS) {
+                    val oldest = retainedFailedUsage.keys.firstOrNull()
+                    if (oldest != null) retainedFailedUsage.remove(oldest)
                 }
+                retainedFailedUsage[runId] = merged
             }
             return
         }

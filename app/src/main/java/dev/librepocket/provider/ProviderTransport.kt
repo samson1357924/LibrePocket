@@ -419,8 +419,7 @@ internal fun postJson(url: String, headers: LinkedHashMap<String, String>, bodyJ
 internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit): Flow<StreamEvent> =
     flow(block)
         .catch { e ->
-            if (e is VirtualMachineError || e is ThreadDeath) throw e
-            if (e is CancellationException) throw e
+            if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
             currentCoroutineContext().ensureActive()
             when (e) {
                 is ProviderFailure -> emit(

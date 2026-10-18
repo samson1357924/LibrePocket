@@ -65,10 +65,10 @@ def _validate_tool(value: str, label: str) -> str:
     if not os.path.isabs(value):
         _fail(f"{label} path must be absolute")
     try:
-        info = os.stat(value)
+        info = os.lstat(value)
     except OSError as exc:
         _fail(f"{label} is unavailable: {exc.strerror or exc}")
-    if not stat.S_ISREG(info.st_mode) or not os.access(value, os.X_OK):
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or not os.access(value, os.X_OK):
         _fail(f"{label} must be an executable regular file")
     return value
 

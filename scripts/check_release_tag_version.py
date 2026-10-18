@@ -313,8 +313,25 @@ def parse_gradle_version(gradle_path: str) -> tuple[int, str]:
     # that literals in raw strings, comments (already stripped) or unrelated
     # scopes cannot satisfy the gate. Fall back to the whole file for simple
     # fixtures that do not declare an android block.
+    # An ``android {`` block that is present but cannot be resolved to a
+    # ``defaultConfig {`` block (unterminated/malformed or missing
+    # defaultConfig) must NOT silently fall back to a whole-file scan: that
+    # would let unrelated top-level literals satisfy the gate (fail-open).
+    # Only files with no android block at all use the legacy whole-file scan
+    # (simple/test fixtures).
+    _android_block_re = re.compile(r"(?<![A-Za-z0-9_])android\s*\{")
+    _detection_intervals = _string_intervals(stripped)
+    _has_android_block = any(
+        not _inside_string(candidate.start(), _detection_intervals)
+        for candidate in _android_block_re.finditer(stripped)
+    )
     search_text = _extract_default_config(stripped)
     if search_text is None:
+        if _has_android_block:
+            raise TagVersionError(
+                "Gradle file declares an android block but no parseable "
+                "android.defaultConfig block"
+            )
         search_text = stripped
     intervals = _string_intervals(search_text)
     code_matches = [

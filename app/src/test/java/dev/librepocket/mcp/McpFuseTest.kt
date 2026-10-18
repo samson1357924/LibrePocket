@@ -82,10 +82,12 @@ class McpFuseTest {
             }
             assertTrue(breaker.isOpen())
             assertEquals(3, web.requestCount)
-            // 開路期間短路：不發 HTTP。
+            // 開路期間短路：不發 HTTP（call 與 list 兩端獨立分支，各自驗證）。
             val shorted = s.callTool("search", arg)
             assertEquals(McpStatus.CIRCUIT_OPEN, shorted.status)
             assertEquals(3, web.requestCount)
+            assertEquals(McpStatus.CIRCUIT_OPEN, s.listTools().status)
+            assertEquals("list 短路不得發 HTTP", 3, web.requestCount)
         } finally {
             web.shutdown()
         }

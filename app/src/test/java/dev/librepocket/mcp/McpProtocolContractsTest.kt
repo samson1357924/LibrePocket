@@ -2,6 +2,7 @@ package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.mockwebserver.MockResponse
@@ -32,6 +33,11 @@ import org.junit.Test
  * 全程 MockWebServer／純 wire 解析，不連外網；MCP 生產零 import 維持（不接線）。
  */
 class McpProtocolContractsTest {
+
+    /** 5 秒統一 deadline：逾時以明確錯誤失敗（取代 `!!` 的無脈絡 NPE）。 */
+    private suspend fun <T> deadline(block: suspend CoroutineScope.() -> T): T =
+        withTimeoutOrNull(5_000, block)
+            ?: error("5 秒內未回傳——server 未返回（佇列阻塞或 timeout 到期）")
 
     private class FakeVault : KeyVault {
         override suspend fun putKey(providerId: String, apiKey: CharArray) = Unit
@@ -431,9 +437,15 @@ class McpProtocolContractsTest {
         assertTrue(
             McpWire.requireSecureEndpoint("https://mcp.example.com/api/mcp?x=1").contains("/api/mcp"),
         )
-        // 回環 http 放行（測試／本機）。
-        assertNotNull(McpWire.requireSecureEndpoint("http://localhost:8080/mcp"))
-        assertNotNull(McpWire.requireSecureEndpoint("http://127.0.0.1:8080/"))
+        // 回環 http 放行（測試／本機）：全等驗證（bare-origin 同樣自動補 /mcp）。
+        assertEquals(
+            "http://localhost:8080/mcp",
+            McpWire.requireSecureEndpoint("http://localhost:8080/mcp"),
+        )
+        assertEquals(
+            "http://127.0.0.1:8080/mcp",
+            McpWire.requireSecureEndpoint("http://127.0.0.1:8080/"),
+        )
         // 非回環 http 與畸形一律拒。
         for (bad in listOf("http://mcp.example.com/mcp", "http://192.168.1.10/mcp", "::::", "ftp://h/mcp")) {
             try {
@@ -494,14 +506,14 @@ class McpProtocolContractsTest {
                 transport = McpTransport(),
                 breaker = breaker,
             )
-            assertEquals(McpStatus.TRANSPORT, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
-            assertEquals(McpStatus.TRANSPORT, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
+            assertEquals(McpStatus.TRANSPORT, deadline { server.callTool("t", "{}") }.status)
+            assertEquals(McpStatus.TRANSPORT, deadline { server.callTool("t", "{}") }.status)
             assertEquals(2, breaker.failureCount())
-            assertEquals(McpStatus.TOOL_ERROR, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
+            assertEquals(McpStatus.TOOL_ERROR, deadline { server.callTool("t", "{}") }.status)
             assertEquals("TOOL_ERROR 必須中性（不重置）", 2, breaker.failureCount())
-            assertEquals(McpStatus.TRANSPORT, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
+            assertEquals(McpStatus.TRANSPORT, deadline { server.callTool("t", "{}") }.status)
             assertTrue(breaker.isOpen())
-            assertEquals(McpStatus.CIRCUIT_OPEN, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
+            assertEquals(McpStatus.CIRCUIT_OPEN, deadline { server.callTool("t", "{}") }.status)
         } finally {
             web.shutdown()
         }
@@ -527,12 +539,12 @@ class McpProtocolContractsTest {
                 transport = McpTransport(),
                 breaker = breaker,
             )
-            assertEquals(McpStatus.TRANSPORT, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
-            assertEquals(McpStatus.TRANSPORT, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
+            assertEquals(McpStatus.TRANSPORT, deadline { server.callTool("t", "{}") }.status)
+            assertEquals(McpStatus.TRANSPORT, deadline { server.callTool("t", "{}") }.status)
             assertEquals(2, breaker.failureCount())
-            assertEquals(McpStatus.TOOL_ERROR, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
+            assertEquals(McpStatus.TOOL_ERROR, deadline { server.callTool("t", "{}") }.status)
             assertEquals("error 包必須中性（不重置）", 2, breaker.failureCount())
-            assertEquals(McpStatus.TRANSPORT, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
+            assertEquals(McpStatus.TRANSPORT, deadline { server.callTool("t", "{}") }.status)
             assertTrue(breaker.isOpen())
         } finally {
             web.shutdown()
@@ -645,6 +657,11 @@ class McpProtocolContractsTest {
             val secondBody = second!!.body.readUtf8()
             assertTrue(firstBody.contains("\"method\":\"tools/list\""))
             assertTrue(secondBody.contains("\"method\":\"tools/call\""))
+            // 出站 envelope 字面量：jsonrpc 版本與固定 id（list=1、call=2）。
+            assertTrue(firstBody.contains("\"jsonrpc\":\"2.0\""))
+            assertTrue(firstBody.contains("\"id\":1,\"method\":\"tools/list\""))
+            assertTrue(secondBody.contains("\"jsonrpc\":\"2.0\""))
+            assertTrue(secondBody.contains("\"id\":2,\"method\":\"tools/call\""))
             assertFalse("lifecycle 交握不得出現", firstBody.contains("initialize"))
             assertFalse("lifecycle 交握不得出現", secondBody.contains("initialize"))
             assertEquals("成功不得計熔斷", 0, breaker.failureCount())

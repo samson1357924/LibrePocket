@@ -251,6 +251,13 @@ class McpTransportSecurityTest {
             val req = web.takeRequest(5, TimeUnit.SECONDS)
             assertNotNull("expected request within 5s", req)
             assertEquals("Bearer sekret-token-1", req!!.getHeader("Authorization"))
+            // 請求標頭契約（McpTransport 發送設定）。
+            assertTrue(
+                "Content-Type 必須為 application/json：${req.getHeader("Content-Type")}",
+                req.getHeader("Content-Type")?.startsWith("application/json") == true,
+            )
+            assertEquals("application/json", req.getHeader("Accept"))
+            assertEquals("POST", req.method)
         } finally {
             web.shutdown()
         }

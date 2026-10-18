@@ -482,6 +482,8 @@ class McpTransportCancelTest {
                     Thread.sleep(10_000)
                 }
             } catch (_: Exception) {
+                // 僅 server thread 的 socket 錯誤靜默；測試主體勿用 catch (Exception)
+                // 包 deadline{}——會吞掉其 ISE 造成靜默通過。
             }
         }
         serverThread.isDaemon = true

@@ -1,6 +1,7 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.mockwebserver.MockResponse
@@ -23,11 +24,27 @@ import org.junit.Test
  */
 class McpServerSemanticsTest {
 
+    /** 5 秒統一 deadline：逾時以明確錯誤失敗（取代 `!!` 的無脈絡 NPE）。 */
+    private suspend fun <T> deadline(block: suspend CoroutineScope.() -> T): T =
+        withTimeoutOrNull(5_000, block)
+            ?: error("5 秒內未回傳——server 未返回（佇列阻塞或 timeout 到期）")
+
     private class FakeVault : KeyVault {
+        var reads = 0
         override suspend fun putKey(providerId: String, apiKey: CharArray) = Unit
-        override suspend fun getKey(providerId: String): CharArray? = "sekret-token-1".toCharArray()
+        override suspend fun getKey(providerId: String): CharArray? {
+            reads++
+            return "sekret-token-1".toCharArray()
+        }
         override suspend fun deleteKey(providerId: String) = Unit
         override suspend fun hasKey(providerId: String): Boolean = true
+    }
+
+    private class EmptyVault : KeyVault {
+        override suspend fun putKey(providerId: String, apiKey: CharArray) = Unit
+        override suspend fun getKey(providerId: String): CharArray? = null
+        override suspend fun deleteKey(providerId: String) = Unit
+        override suspend fun hasKey(providerId: String): Boolean = false
     }
 
     // ---- nextCursor：單頁子集但不靜默丟頁 ----
@@ -92,9 +109,9 @@ class McpServerSemanticsTest {
                 transport = McpTransport(),
                 breaker = breaker,
             )
-            assertEquals(McpStatus.TRANSPORT, withTimeoutOrNull(5_000) { server.listTools() }!!.status)
+            assertEquals(McpStatus.TRANSPORT, deadline { server.listTools() }.status)
             assertEquals(1, breaker.failureCount())
-            val got = withTimeoutOrNull(5_000) { server.listTools() }!!
+            val got = deadline { server.listTools() }
             assertEquals("不完整列表不得回 OK", McpStatus.PARTIAL, got.status)
             assertEquals("本頁工具必須保留", listOf("a"), got.tools.map { it.name })
             assertEquals("PARTIAL 必須計成功並重置（onSuccess 非 onNeutral）", 0, breaker.failureCount())
@@ -120,7 +137,7 @@ class McpServerSemanticsTest {
                 transport = McpTransport(),
                 breaker = breaker,
             )
-            val got = withTimeoutOrNull(5_000) { server.listTools() }!!
+            val got = deadline { server.listTools() }
             assertEquals(McpStatus.PROTOCOL, got.status)
             assertEquals(1, breaker.failureCount())
         } finally {
@@ -144,7 +161,7 @@ class McpServerSemanticsTest {
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
             )
-            val got = withTimeoutOrNull(5_000) { server.listTools() }!!
+            val got = deadline { server.listTools() }
             assertEquals(McpStatus.OK, got.status)
             assertEquals(1, got.tools.size)
         } finally {
@@ -252,7 +269,7 @@ class McpServerSemanticsTest {
                 transport = McpTransport(),
                 breaker = breaker,
             )
-            val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            val got = deadline { server.callTool("t", "{}") }
             assertEquals("空 result 不得回 OK", McpStatus.PROTOCOL, got.status)
             assertEquals(1, breaker.failureCount())
         } finally {
@@ -288,7 +305,7 @@ class McpServerSemanticsTest {
                 transport = McpTransport(),
                 breaker = breaker,
             )
-            val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            val got = deadline { server.callTool("t", "{}") }
             assertEquals("無內容 isError 不得當中性業務錯", McpStatus.PROTOCOL, got.status)
             assertEquals(1, breaker.failureCount())
         } finally {
@@ -313,7 +330,7 @@ class McpServerSemanticsTest {
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
             )
-            val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            val got = deadline { server.callTool("t", "{}") }
             assertEquals(McpStatus.TOOL_ERROR, got.status)
             assertEquals("伺服器 message 必須透傳", "bad", got.errorMessage)
             assertFalse("稽核不得含 error message", got.auditMap().toString().contains("bad"))
@@ -342,7 +359,7 @@ class McpServerSemanticsTest {
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
             )
-            val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            val got = deadline { server.callTool("t", "{}") }
             assertEquals(McpStatus.TOOL_ERROR, got.status)
             assertEquals("tool error", got.errorMessage)
         } finally {
@@ -367,7 +384,7 @@ class McpServerSemanticsTest {
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
             )
-            val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            val got = deadline { server.callTool("t", "{}") }
             assertEquals(McpStatus.TOOL_ERROR, got.status)
             assertEquals("message 必須截到 200 字元", 200, got.errorMessage?.length)
         } finally {
@@ -392,7 +409,7 @@ class McpServerSemanticsTest {
                 transport = McpTransport(),
                 breaker = breaker,
             )
-            val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            val got = deadline { server.callTool("t", "{}") }
             assertEquals(McpStatus.PROTOCOL, got.status)
             assertNull("PROTOCOL 路徑不得帶 errorMessage", got.errorMessage)
             assertEquals(1, breaker.failureCount())
@@ -417,7 +434,7 @@ class McpServerSemanticsTest {
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
             )
-            val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            val got = deadline { server.callTool("t", "{}") }
             assertEquals(McpStatus.OK, got.status)
             assertNull(got.errorMessage)
         } finally {
@@ -443,7 +460,7 @@ class McpServerSemanticsTest {
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
             )
-            val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            val got = deadline { server.callTool("t", "{}") }
             assertEquals(McpStatus.TOOL_ERROR, got.status)
             assertTrue(got.isError)
             assertNull("isError 結果路徑無伺服器 message", got.errorMessage)
@@ -468,7 +485,7 @@ class McpServerSemanticsTest {
             )
             for ((code, expectCount) in listOf(400 to 1, 404 to 2, 405 to 3)) {
                 web.enqueue(MockResponse().setResponseCode(code).setBody("nope"))
-                val call = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+                val call = deadline { server.callTool("t", "{}") }
                 assertEquals("call HTTP $code 必須 PROTOCOL", McpStatus.PROTOCOL, call.status)
                 assertEquals(expectCount, breaker.failureCount())
             }
@@ -492,7 +509,7 @@ class McpServerSemanticsTest {
             )
             for ((code, expectCount) in listOf(400 to 1, 404 to 2, 405 to 3)) {
                 web.enqueue(MockResponse().setResponseCode(code).setBody("nope"))
-                val got = withTimeoutOrNull(5_000) { server.listTools() }!!
+                val got = deadline { server.listTools() }
                 assertEquals("list HTTP $code 必須 PROTOCOL", McpStatus.PROTOCOL, got.status)
                 assertTrue(got.tools.isEmpty())
                 assertEquals("list HTTP $code 必須計熔斷", expectCount, breaker.failureCount())
@@ -518,10 +535,97 @@ class McpServerSemanticsTest {
             var expectCount = 0
             for (code in listOf(429, 408)) {
                 web.enqueue(MockResponse().setResponseCode(code).setBody("slow down"))
-                val call = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+                val call = deadline { server.callTool("t", "{}") }
                 assertEquals("HTTP $code 必須 TRANSPORT", McpStatus.TRANSPORT, call.status)
                 assertEquals(++expectCount, breaker.failureCount())
             }
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    // ---- Stage4 覆蓋清掃：DISABLED／vault-miss／空 body ----
+
+    @Test fun disabledServerOrToolShortCircuitsWithoutHttp() = runBlocking {
+        // 主開關關閉與逐工具關閉皆須短路：不發 HTTP、不碰 vault。
+        val web = MockWebServer()
+        web.start()
+        try {
+            val offVault = FakeVault()
+            val off = McpServer(
+                config = McpServerConfig(
+                    id = "s1",
+                    baseUrl = web.url("/").toString(),
+                    enabled = false,
+                ),
+                keyVault = offVault,
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(),
+            )
+            assertEquals(McpStatus.DISABLED, off.listTools().status)
+            assertEquals(McpStatus.DISABLED, off.callTool("t", "{}").status)
+            val perToolVault = FakeVault()
+            val perTool = McpServer(
+                config = McpServerConfig(
+                    id = "s1",
+                    baseUrl = web.url("/").toString(),
+                    enabledTools = mapOf("t" to false),
+                ),
+                keyVault = perToolVault,
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(),
+            )
+            assertEquals(McpStatus.DISABLED, perTool.callTool("t", "{}").status)
+            assertEquals("停用不得發 HTTP", 0, web.requestCount)
+            assertEquals("停用不得碰 vault（主開關）", 0, offVault.reads)
+            assertEquals("停用不得碰 vault（逐工具）", 0, perToolVault.reads)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun missingVaultKeyMapsToUnauthorizedWithoutHttp() = runBlocking {
+        // vault 無 key：UNAUTHORIZED、不發 HTTP、不計熔斷（配置問題非傳輸失敗）。
+        val web = MockWebServer()
+        web.start()
+        try {
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = EmptyVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            assertEquals(McpStatus.UNAUTHORIZED, server.listTools().status)
+            assertEquals(McpStatus.UNAUTHORIZED, server.callTool("t", "{}").status)
+            assertEquals("無 key 不得發 HTTP", 0, web.requestCount)
+            assertEquals("無 key 不計熔斷", 0, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun blankBodyWith2xxIsTransportNotProtocol() = runBlocking {
+        // 2xx＋空白 body（Content-Type 缺席情境）：不進 parser（與解析失敗→PROTOCOL 分界），
+        // 走 TRANSPORT。list 與 call 是兩條獨立的 isNullOrBlank 分支，各自驗證。
+        val web = MockWebServer()
+        web.start()
+        try {
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            web.enqueue(MockResponse().setResponseCode(200).setBody(""))
+            val call = deadline { server.callTool("t", "{}") }
+            assertEquals(McpStatus.TRANSPORT, call.status)
+            assertEquals(1, breaker.failureCount())
+            web.enqueue(MockResponse().setResponseCode(200).setBody(""))
+            val list = deadline { server.listTools() }
+            assertEquals(McpStatus.TRANSPORT, list.status)
+            assertEquals(2, breaker.failureCount())
         } finally {
             web.shutdown()
         }

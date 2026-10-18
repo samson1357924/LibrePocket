@@ -1,6 +1,7 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.mockwebserver.MockResponse
@@ -20,6 +21,11 @@ import org.junit.Test
  * 全程 MockWebServer／純 wire 解析，不連外網。
  */
 class McpEnvelopeTest {
+
+    /** 5 秒統一 deadline：逾時以明確錯誤失敗（取代 `!!` 的無脈絡 NPE）。 */
+    private suspend fun <T> deadline(block: suspend CoroutineScope.() -> T): T =
+        withTimeoutOrNull(5_000, block)
+            ?: error("5 秒內未回傳——server 未返回（佇列阻塞或 timeout 到期）")
 
     private class FakeVault : KeyVault {
         var reads = 0
@@ -227,13 +233,13 @@ class McpEnvelopeTest {
                 transport = McpTransport(),
                 breaker = breaker,
             )
-            val longName = withTimeoutOrNull(5_000) {
+            val longName = deadline {
                 server.callTool("t".repeat(McpWire.TOOL_NAME_MAX_CHARS + 1), "{}")
-            }!!
+            }
             assertEquals(McpStatus.PROTOCOL, longName.status)
-            val bigArgs = withTimeoutOrNull(5_000) {
+            val bigArgs = deadline {
                 server.callTool("t", "{\"pad\":\"" + "x".repeat(McpWire.ARGUMENTS_MAX_CHARS) + "\"}")
-            }!!
+            }
             assertEquals(McpStatus.PROTOCOL, bigArgs.status)
             // 出站預檢 fail-closed：不發送、不碰 vault、不計熔斷。
             assertEquals("超量參數不得發送 HTTP", 0, web.requestCount)
@@ -275,23 +281,23 @@ class McpEnvelopeTest {
             )
             assertEquals(
                 McpStatus.PROTOCOL,
-                withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status,
+                deadline { server.callTool("t", "{}") }.status,
             )
             assertEquals(1, breaker.failureCount())
             assertEquals(
                 McpStatus.PROTOCOL,
-                withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status,
+                deadline { server.callTool("t", "{}") }.status,
             )
             assertEquals(2, breaker.failureCount())
             assertEquals(
                 McpStatus.PROTOCOL,
-                withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status,
+                deadline { server.callTool("t", "{}") }.status,
             )
             assertEquals("協議碼必須累計", 3, breaker.failureCount())
             assertTrue("協議碼必須累計並開路", breaker.isOpen())
             assertEquals(
                 McpStatus.CIRCUIT_OPEN,
-                withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status,
+                deadline { server.callTool("t", "{}") }.status,
             )
         } finally {
             web.shutdown()
@@ -318,12 +324,12 @@ class McpEnvelopeTest {
             )
             assertEquals(
                 McpStatus.TOOL_ERROR,
-                withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status,
+                deadline { server.callTool("t", "{}") }.status,
             )
             assertEquals("-32602 必須中性", 0, breaker.failureCount())
             assertEquals(
                 McpStatus.TRANSPORT,
-                withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status,
+                deadline { server.callTool("t", "{}") }.status,
             )
             assertEquals(1, breaker.failureCount())
         } finally {
@@ -354,12 +360,12 @@ class McpEnvelopeTest {
                 transport = McpTransport(),
                 breaker = breaker,
             )
-            val list = withTimeoutOrNull(5_000) { server.listTools() }!!
+            val list = deadline { server.listTools() }
             assertEquals(McpStatus.PROTOCOL, list.status)
             assertTrue("錯 id 回應不得採納", list.tools.isEmpty())
             assertEquals(1, breaker.failureCount())
             // call 同語義（id 1 ≠ CALL_ID 2）。
-            val call = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!
+            val call = deadline { server.callTool("t", "{}") }
             assertEquals(McpStatus.PROTOCOL, call.status)
             assertEquals(2, breaker.failureCount())
         } finally {
@@ -384,7 +390,7 @@ class McpEnvelopeTest {
                 transport = McpTransport(),
                 breaker = breaker,
             )
-            val got = withTimeoutOrNull(5_000) { server.listTools() }!!
+            val got = deadline { server.listTools() }
             assertEquals(McpStatus.PROTOCOL, got.status)
             assertTrue(got.tools.isEmpty())
             assertEquals(1, breaker.failureCount())

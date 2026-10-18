@@ -1,5 +1,6 @@
 package dev.librepocket.chat
 
+import androidx.annotation.VisibleForTesting
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -296,6 +297,7 @@ class OrderedTranscriptSink(
    * teardown. Must not run under [admissionLock] (checked like the other
    * hooks); a hook throw propagates like any post-send caller fault.
    */
+  @VisibleForTesting
   internal var afterBarrierSendForTest: (suspend () -> Unit)? = null
 
   /**
@@ -1275,12 +1277,22 @@ class OrderedTranscriptSink(
   }
 
   /**
-   * True if any admitted core event failed during persistence or was interrupted by teardown/timeout.
+   * True while the sink's durability truth is poisoned: `[interrupted]` is
+   * non-empty. The set only ever holds two mark kinds with different
+   * permanence —
+   * - a genuine persistence failure ([markStoreFailure]): pinned by
+   *   [storeFailed], never cleared — [clearTimeoutMarkOnCommit] refuses it;
+   * - a drain-timeout / seal / fail-fast orphan mark: **provisional** —
+   *   lifted by [clearTimeoutMarkOnCommit] when the still-running writer
+   *   proves the same-id commit (R23-1).
    *
-   * R23-1: a drain-timeout/seal mark is not a persistence failure — when the
-   * still-running writer later commits the row, the success path clears that
-   * id (the row is durable); a genuine store failure ([markStoreFailure])
-   * never clears. Either way a failing read stays fail-closed (true).
+   * So `true` never means "permanently failed" for the second kind: a failing
+   * read is the fail-closed provisional truth inside that window, and a later
+   * proven commit for the same runId legitimately restores a clean read.
+   * Deliberately outside this set (and outside this boolean): proven
+   * never-delivered ghosts ([resolvedUndelivered] / [markNeverAdmitted]) —
+   * they stay visible via [interruptedRunIds] only and never poison
+   * durability truth.
    */
   fun hasDurableFailures(): Boolean = synchronized(poisonLock) { interrupted.isNotEmpty() }
 

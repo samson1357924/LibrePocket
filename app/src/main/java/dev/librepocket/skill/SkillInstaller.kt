@@ -1,5 +1,6 @@
 package dev.librepocket.skill
 
+import androidx.annotation.VisibleForTesting
 import dev.librepocket.tool.ToolRegistry
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -124,7 +125,10 @@ object SkillInstaller {
      * 測試接縫（僅測試用，全域可變，非執行緒隔離：同一 JVM 內一執行緒設 hook
      * 影響所有併發安裝；生產不得設定，測試須在 `@After` 重置為 null）。
      * 為 null 時走真實 [File.renameTo]；測試可注入失敗以驗證回滾。
+     * `@VisibleForTesting internal` 慣例同 VoiceSpeaker preEmitHook/postCheckHook：
+     * 生產呼叫點不得依賴（annotation 供 lint 靜態把關）。
      */
+    @VisibleForTesting
     @Volatile
     internal var renameHook: ((from: File, to: File) -> Boolean)? = null
 
@@ -216,6 +220,7 @@ object SkillInstaller {
      * 前先調用，拋錯即模擬該階段失敗（磁碟滿/IO 錯），安裝以 IO_ERROR 失敗並回滾
      * （新鮮安裝無 target、覆蓋保留舊版，staging 已清）。
      */
+    @VisibleForTesting
     @Volatile
     internal var writeHook: ((staging: File, rel: String, bytes: ByteArray) -> Unit)? = null
 

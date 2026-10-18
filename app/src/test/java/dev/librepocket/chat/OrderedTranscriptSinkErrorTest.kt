@@ -417,7 +417,7 @@ class OrderedTranscriptSinkErrorTest {
    * seal race to NOT drained — `false` with the durable-failure poison set —
    * instead of rethrowing the foreign teardown CE through [flushDurable]
    * (which a controller-level caller treats as a fail-closed Boolean), which
-   * previously failed `ErrorTerminalTest.delegateThrowsErrorOnStarted_productsDurabilityError`
+   * previously failed `ErrorTerminalTest.delegateThrowsErrorOnStarted_projectsDurabilityError`
    * non-deterministically.
    *
    * Deterministic interleave (test hook, no timing inference): `afterBarrierSendForTest`

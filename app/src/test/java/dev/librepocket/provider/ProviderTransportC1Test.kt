@@ -465,7 +465,7 @@ class ProviderTransportC1Test {
             val body = Buffer()
                 .writeUtf8(prefix)
                 .writeUtf8("中".repeat(tailChars - 1))
-                .writeByte(0xE4) // lead byte of the final char; completes only at EOF
+                .writeByte(0xE4) // lead byte of 中; EOF yields one U+FFFD, never a completed char
             server.enqueue(
                 MockResponse()
                     .setHeader("Content-Type", "text/event-stream")

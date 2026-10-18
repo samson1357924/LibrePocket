@@ -211,6 +211,52 @@ class SseParserTest {
         assertTrue(whole.any { it.data.contains("我來幫你查一下") })
     }
 
+    @Test
+    fun flushDeliversTailEventWithoutTrailingBlankLine() {
+        // The final `data:` line is LF-terminated but the stream ends without a
+        // blank line: only flush dispatches the tail event. No budget latch
+        // fires in this shape; a flush-time lineTooLong latch would drop it.
+        val p = SseFrameParser()
+        assertTrue(p.feed("data: tail").isEmpty())
+        assertTrue(p.feed(" value\n").isEmpty())
+        val tail = p.flush()
+        assertEquals(1, tail.size)
+        assertEquals("tail value", tail[0].data)
+        assertNull(tail[0].eventName)
+        assertFalse(p.lineTooLong)
+        assertFalse(p.frameTooLong)
+    }
+
+    @Test
+    fun flushTailLatchAtEofDropsPendingEvent() {
+        // flush-time lineTooLong tail latch: while feed() runs, the unterminated
+        // tail sits exactly one char under the x3 bound, and the final 中 is
+        // truncated to its lead byte. flush() decodes that byte as U+FFFD,
+        // pushes the tail over MAX_LINE_BYTES, latches lineTooLong and clears the
+        // pending `data: x` event. The event must be dropped, never dispatched.
+        val p = SseFrameParser()
+        p.feed("data: x\n") // pendingData = ["x"]
+
+        // "data: " = 6 chars; 6 + 349_519 = 349_525 chars.
+        // 349_525 * 3 = 1_048_575 <= 1_048_576 (MAX_LINE_BYTES): no latch yet.
+        p.feed("data: " + "中".repeat(349_519))
+
+        // 0xE4 is the lead byte of 中 (it needs two continuation bytes), so
+        // completeUtf8PrefixLen holds it back: it adds no char to the tail check.
+        p.feed(byteArrayOf(0xE4.toByte()))
+        assertFalse(p.lineTooLong)
+
+        // EOF decodes the lone 0xE4 as U+FFFD (one char on the JVM):
+        // 349_526 * 3 = 1_048_578 > 1 MiB. The tail check clears pendingData
+        // before the tail-event branch, so flush() returns empty.
+        assertTrue("the EOF tail check must latch lineTooLong", p.flush().isEmpty())
+        assertTrue(p.lineTooLong)
+        assertFalse("the line cap, not the frame cap, must latch", p.frameTooLong)
+
+        // lineTooLong is sticky; a later flush can never resurrect the event.
+        assertTrue(p.flush().isEmpty())
+    }
+
     private fun resourceBytes(name: String): ByteArray {
         val stream = javaClass.classLoader!!.getResourceAsStream(name)
             ?: error("missing test resource: $name")

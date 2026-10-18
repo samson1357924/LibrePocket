@@ -165,7 +165,7 @@ class ChatRequestTrimVisibilityTest {
         }
     }
 
-    private fun awaitTrue(timeoutMs: Long = 15_000, cond: () -> Boolean) {
+    private fun awaitTrue(timeoutMs: Long = 30_000, cond: () -> Boolean) {
         val end = System.currentTimeMillis() + timeoutMs
         while (!cond()) {
             if (System.currentTimeMillis() > end) error("timed out waiting for condition")

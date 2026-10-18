@@ -27,7 +27,7 @@ import java.util.zip.ZipInputStream
  *   replace 時舊版先搬到 `.bak`，成功後刪 bak，失敗回滾 bak；rename 失敗
  *   直接失敗並保留 from→to 根因，不退回拷貝；
  * - 同 skill 安裝互斥（per-skill 鎖），防併發交錯（新鮮安裝與覆蓋同 id 皆序列化）；
- *   Current 為錯誤回傳路徑原子（失敗回滾舊版，staging 寫入階段故障經 [writeHook]
+ *   Commit 為錯誤回傳路徑原子（失敗回滾舊版，staging 寫入階段故障經 [writeHook]
  *   注入（test-only，全域非隔離）同樣回滾：新鮮安裝無 target、覆蓋保留舊版）；kill -9 等崩潰窗口殘留由
  *   [cleanupStaleStaging] 收斂（窗口由測試鎖定：新鮮 staging、覆蓋中雙殘留、
  *   commit 後孤兒 bak、雙重失敗 bak；同 id 多份 bak 歧義時還原路徑全保留
@@ -39,7 +39,7 @@ import java.util.zip.ZipInputStream
  *   開頭，不會誤傷），可經 [listResiduals] 觀察、經 [cleanupStaleStaging]
  *   收斂（回傳計數即收斂記錄）；啟動路徑已記錄回傳計數。
  *   崩潰窗口還原不問齡期：target 缺席而單一的合法 `.bak` 存在時立即恢復
- *   （否則預設 24h 內崩溃的版本要等一天）；僅有 target 在時的孤兒 `.bak`
+ *   （否則預設 24h 內崩潰的版本要等一天）；僅有 target 在時的孤兒 `.bak`
  *   與 staging 才受 [STALE_STAGING_MAX_AGE_MILLIS] 保護，避免誤刪進行中安裝。
  * - 同名 Skill 預設保持不變（需 `replace=true` 才覆蓋）。
  * - 降版政策（#15：揭露不擋）：`version` 為選填自由字串、無可靠全序，
@@ -90,7 +90,7 @@ object SkillInstaller {
     /**
      * 過期 staging／target 仍在時的孤兒 `.bak` 之預設保留期限（啟動清理用）。
      *
-     * 只保護「進行中安裝」：新鲜 staging 未過期前不刪，避免誤刪另一行程刚啟動
+     * 只保護「進行中安裝」：新鮮 staging 未過期前不刪，避免誤刪另一行程剛啟動
      * 的安裝。崩潰窗口還原（target 缺席的單一合法 `.bak`）不受此期限限制，
      * 見 [cleanupStaleStaging]。
      */
@@ -266,9 +266,9 @@ object SkillInstaller {
      *
      * 齡期語意（兩閾分離）：
      * - **崩潰窗口還原**：target 缺席的單一合法 `.bak` **不問齡期**立即恢復
-     *   （否則預設 24h 內崩溃的版本要等一天，與「process restart 即恢復」矛盾）；
-     * - **進行中安裝保護**：新鲜 staging 與 target 仍在的孤兒 `.bak` 只在超過
-     *   [maxAgeMillis] 後才刪，避免誤刪另一行程刚啟動的安裝。
+     *   （否則預設 24h 內崩潰的版本要等一天，與「process restart 即恢復」矛盾）；
+     * - **進行中安裝保護**：新鮮 staging 與 target 仍在的孤兒 `.bak` 只在超過
+     *   [maxAgeMillis] 後才刪，避免誤刪另一行程剛啟動的安裝。
      *
      * [destRoot] 為 symlink（或偵測失敗）時直接回 0；destRoot 下形狀內的
      * **子條目 symlink** 一律只解除 link 本身（NOFOLLOW，見 [handleCleanupEntry]），
@@ -321,7 +321,7 @@ object SkillInstaller {
             val bakId = if (stagingId != null) null else BACKUP_RE.matchEntire(n)?.groupValues?.get(1)
             if (stagingId == null && bakId == null) continue
             // 崩潰窗口還原：target 缺席的合法 .bak 不問齡期即處理（否則預設
-            // 24h 內崩溃的版本要等一天）。其餘（staging／target 仍在的孤兒 bak）
+            // 24h 內崩潰的版本要等一天）。其餘（staging／target 仍在的孤兒 bak）
             // 受 maxAgeMillis 保護，避免誤刪進行中安裝。
             val crashBak = bakId != null && SkillParser.isValidName(bakId) &&
                 !File(destRoot, bakId).exists()

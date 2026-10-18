@@ -8,11 +8,11 @@ import org.junit.Test
 import java.io.File
 
 /**
- * #15 崩溃恢復清理硬化測試（純 JVM）。
+ * #15 崩潰恢復清理硬化測試（純 JVM）。
  *
  * - 崩潰窗口還原不問齡期：target 缺席的合法 `.bak` 在預設 24h 期限下仍立即恢復
- *   （否則崩溃後要等一天，與「process restart 即恢復」矛盾）；
- * - 進行中安裝保護：新鲜 staging／target 仍在的孤兒 `.bak` 不受預設期限刪除；
+ *   （否則崩潰後要等一天，與「process restart 即恢復」矛盾）；
+ * - 進行中安裝保護：新鮮 staging／target 仍在的孤兒 `.bak` 不受預設期限刪除；
  * - symlink 防衛：cleanup／listResiduals／installedVersion 不經 symlink 作用外部目錄；
  * - 子條目 symlink 防衛（NOFOLLOW）：形狀內的 symlink 條目只解除 link 本身——
  *   不遞迴刪除其指向的外部內容、也不還原為正式 skill；真實目錄走
@@ -34,7 +34,7 @@ class SkillStartupRecoveryTest {
     // ---- 齡期語意（兩閾分離）----
 
     @Test fun crashWindowFreshBak_restoredImmediatelyAtDefaultAge() {
-        // 崩溃後數秒的 .bak（target 缺席）：即使未達 24h 預設期限也必須立即恢復。
+        // 崩潰後數秒的 .bak（target 缺席）：即使未達 24h 預設期限也必須立即恢復。
         val root = tempRoot()
         try {
             val tid = Thread.currentThread().id
@@ -54,7 +54,7 @@ class SkillStartupRecoveryTest {
     }
 
     @Test fun freshStaging_keptAtDefaultAge() {
-        // 進行中安裝保護：新鲜 staging 不受預設 24h 期限刪除（避免誤刪他方刚啟動的安裝）。
+        // 進行中安裝保護：新鮮 staging 不受預設 24h 期限刪除（避免誤刪他方剛啟動的安裝）。
         val root = tempRoot()
         try {
             val tid = Thread.currentThread().id

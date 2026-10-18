@@ -1108,6 +1108,172 @@ class BackupRulesValidator(unittest.TestCase):
         )
         return backup_rules_check.validate(path, root)
 
+    @staticmethod
+    def _manifest(application_attrs: str) -> str:
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+            f"    <application {application_attrs} />\n"
+            "</manifest>\n"
+        )
+
+    _MANIFEST_BINDING = (
+        'android:fullBackupContent="@xml/backup_rules" '
+        'android:dataExtractionRules="@xml/data_extraction_rules"'
+    )
+
+    def test_manifest_structured_binding_passes(self) -> None:
+        # Plain double-quoted attrs AND single-quoted (equally valid XML) both
+        # parse to the same values - the old byte-grep failed the latter.
+        for body in (
+            self._manifest(self._MANIFEST_BINDING),
+            self._manifest(self._MANIFEST_BINDING.replace('"', "'")),
+        ):
+            p = self._write("AndroidManifest.xml", body)
+            self.assertEqual(
+                backup_rules_check.validate_manifest(p, require_both=True), []
+            )
+
+    def test_manifest_comment_survivor_no_longer_fools_the_check(self) -> None:
+        # The raw-grep escape: attributes deleted, literals surviving only
+        # inside an XML comment (runtime runs unprotected Auto Backup while a
+        # grep gate reports PASS). ET drops comments by construction - the
+        # structured check fails closed instead.
+        commented = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+            '    <!-- <application android:fullBackupContent="@xml/backup_rules" '
+            'android:dataExtractionRules="@xml/data_extraction_rules" /> -->\n'
+            "    <application />\n"
+            "</manifest>\n"
+        )
+        p = self._write("AndroidManifest.xml", commented)
+        errors = backup_rules_check.validate_manifest(p, require_both=True)
+        self.assertEqual(len(errors), 2, errors)
+        self.assertTrue(
+            any("fullBackupContent must reference @xml/backup_rules" in e for e in errors),
+            errors,
+        )
+        self.assertTrue(
+            any("dataExtractionRules must reference @xml/data_extraction_rules" in e for e in errors),
+            errors,
+        )
+        # Overlay semantics: same comment-escape tree without --require-both
+        # is LEGAL absence (merger inherits main's values).
+        self.assertEqual(backup_rules_check.validate_manifest(p), [])
+
+    def test_manifest_misbound_or_seen_value_fails_closed(self) -> None:
+        p = self._write(
+            "AndroidManifest.xml",
+            self._manifest('android:fullBackupContent="@xml/other_rules"'),
+        )
+        errors = backup_rules_check.validate_manifest(p)
+        self.assertTrue(
+            any("fullBackupContent must reference @xml/backup_rules" in e and "got" in e for e in errors),
+            errors,
+        )
+        # require_both additionally reports the absent dataExtractionRules.
+        errors = backup_rules_check.validate_manifest(p, require_both=True)
+        self.assertTrue(
+            any("dataExtractionRules must reference @xml/data_extraction_rules" in e and "absent" in e for e in errors),
+            errors,
+        )
+
+    def test_manifest_wrong_root_or_missing_application_fails_closed(self) -> None:
+        p = self._write(
+            "AndroidManifest.xml",
+            '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n</resources>\n',
+        )
+        errors = backup_rules_check.validate_manifest(p, require_both=True)
+        self.assertTrue(any("needs a <manifest> root" in e for e in errors), errors)
+
+        # MAIN: no <application> at all → fatal (attrs must live there).
+        p = self._write(
+            "AndroidManifest.xml",
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+            "</manifest>\n",
+        )
+        errors = backup_rules_check.validate_manifest(p, require_both=True)
+        self.assertTrue(any("needs an <application>" in e for e in errors), errors)
+
+        # OVERLAY: a permissions-only manifest without <application> inherits
+        # the whole merged tree and is legal (play flavor is exactly this).
+        self.assertEqual(backup_rules_check.validate_manifest(p), [])
+
+        # Missing file surfaces as unreadable (exit 1 downstream).
+        errors = backup_rules_check.validate_manifest(
+            str(self.tmp / "no-such-manifest.xml"), require_both=True
+        )
+        self.assertTrue(any("unreadable" in e for e in errors))
+
+    def test_cli_check_manifest_wiring_exit_codes(self) -> None:
+        good = self._write("AndroidManifest.xml", self._manifest(self._MANIFEST_BINDING))
+        missing = self._write(
+            "AndroidManifestMissing.xml", self._manifest('android:allowBackup="true"')
+        )
+        self.assertEqual(
+            backup_rules_check.main(
+                ["x", "--check-manifest", "--require-both", good]
+            ),
+            0,
+        )
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            code = backup_rules_check.main(
+                ["x", "--check-manifest", "--require-both", missing]
+            )
+        self.assertEqual(1, code)
+        self.assertIn("fullBackupContent must reference", buf_err.getvalue())
+        # Mode conflicts stay fail-closed exit 2.
+        for argv in (
+            ["x", "--check-manifest", "--expect-root", "full-backup-content", good],
+            ["x", "--require-both", good],
+        ):
+            buf_err = io.StringIO()
+            with contextlib.redirect_stderr(buf_err):
+                code = backup_rules_check.main(argv)
+            self.assertEqual(2, code, argv)
+
+    def test_cli_duplicate_expect_root_fails_closed(self) -> None:
+        # Last-wins on a repeated binding hint is a silent contract slip:
+        # reject duplicates outright (exit 2).
+        good = self._write(
+            "backup_rules.xml", self._full_backup(self._ALL_EXCLUDES)
+        )
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            code = backup_rules_check.main(
+                [
+                    "x",
+                    "--expect-root",
+                    "full-backup-content",
+                    "--expect-root",
+                    "data-extraction-rules",
+                    good,
+                ]
+            )
+        self.assertEqual(2, code)
+        self.assertIn("duplicate --expect-root", buf_err.getvalue())
+
+    def test_unknown_wrapper_descends_into_nested_unknown(self) -> None:
+        # AOSP validates every START_TAG: an unknown wrapper does not exempt
+        # its content, so a nested unknown inside an unknown wrapper is
+        # reported too (message completeness; outer report already fail-closed).
+        body = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<full-backup-content>\n"
+            f"{self._ALL_EXCLUDES}"
+            "    <outer-wrapper>\n"
+            "        <inner-future />\n"
+            "    </outer-wrapper>\n"
+            "</full-backup-content>\n"
+        )
+        path = self._write("backup_rules.xml", body)
+        errors = self._check(path)
+        self.assertTrue(any("<outer-wrapper>" in e for e in errors), errors)
+        self.assertTrue(any("<inner-future>" in e for e in errors), errors)
+
     def test_repo_backup_files_are_valid(self) -> None:
         # Gates pin the file↔root binding: each real file must validate against
         # its expected Android root.
@@ -1737,13 +1903,23 @@ class BackupRulesGateWiring(unittest.TestCase):
             text,
         )
 
-    def test_gate_pins_manifest_resource_binding(self) -> None:
-        # Runtime binding: the two manifest attributes must reference the
-        # validated resource names (attr↔resource↔schema chain closed).
+    def test_gate_binds_manifest_attrs_via_structured_check(self) -> None:
+        # Runtime binding must be enforced by the structured XML checker
+        # (comment-escape proof: bare-text grep PASSes a manifest whose
+        # attributes are gone with the survivors inside a comment). The gate
+        # requires BOTH attrs on the main manifest and only equality-when-set
+        # on flavor overlays; no raw grep for these attrs may survive.
         text = POLICY_CHECK.read_text(encoding="utf-8")
-        self.assertIn('android:fullBackupContent="@xml/backup_rules"', text)
-        self.assertIn('android:dataExtractionRules="@xml/data_extraction_rules"', text)
-        self.assertIn("must reference @xml/backup_rules", text)
+        self.assertIn('--check-manifest --require-both "$MAIN_MANIFEST"', text)
+        self.assertIn('for m in "$ROOT"/app/src/*/AndroidManifest.xml', text)
+        self.assertIn("--check-manifest \"$m\"", text)
+        self.assertRegex(
+            text,
+            r"python3 .+backup_rules_check\.py.+--check-manifest",
+        )
+        # The old raw-grep enforcer is retired for these attrs.
+        self.assertNotIn("grep -q 'android:fullBackupContent", text)
+        self.assertNotIn("grep -q 'android:dataExtractionRules", text)
 
     def test_gate_does_not_use_raw_grep_for_excludes(self) -> None:
         text = POLICY_CHECK.read_text(encoding="utf-8")
@@ -2006,6 +2182,64 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "android:fullBackupContent must reference @xml/backup_rules",
                 proc.stderr,
             )
+
+    def test_comment_escape_manifest_fails_closed(self) -> None:
+        # The raw-grep escape this gate closed: attributes deleted, the two
+        # literals surviving only inside an XML comment. An ET-based check
+        # sees no attributes (comments are dropped by construction) and must
+        # fail the gate where the old byte-grep PASSed.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            manifest = root / "app" / "src" / "main" / "AndroidManifest.xml"
+            manifest.write_text(
+                '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                '    <!-- <application android:fullBackupContent="@xml/backup_rules" '
+                'android:dataExtractionRules="@xml/data_extraction_rules" /> -->\n'
+                '    <application android:allowBackup="true" />\n'
+                "</manifest>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("(attribute absent)", proc.stderr)
+            self.assertNotIn("build-tools", proc.stderr)
+
+    def test_flavor_overlay_rebound_attr_fails_closed(self) -> None:
+        # Merger lets a flavor overlay rebind android:fullBackupContent; the
+        # gate must reject a rebinding to any other resource while tolerating
+        # legal absence (inherit main's values).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            (root / "app" / "src" / "foss").mkdir(parents=True, exist_ok=True)
+            (root / "app" / "src" / "foss" / "AndroidManifest.xml").write_text(
+                '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                '    <application android:allowBackup="true"\n'
+                '        android:fullBackupContent="@xml/other_rules" />\n'
+                "</manifest>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("fullBackupContent must reference @xml/backup_rules", proc.stderr)
+            self.assertIn("got '@xml/other_rules'", proc.stderr)
+
+    def test_flavor_overlay_inheriting_attrs_passes(self) -> None:
+        # A flavor manifest that simply omits the attrs is legal (merger keeps
+        # main's binding); the gate must not false-FAIL on it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            (root / "app" / "src" / "foss").mkdir(parents=True, exist_ok=True)
+            (root / "app" / "src" / "foss" / "AndroidManifest.xml").write_text(
+                '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                '    <application android:allowBackup="true" />\n'
+                "</manifest>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            all_fail_lines = "\n".join(
+                line for line in proc.stderr.splitlines() if line.startswith("FAIL:")
+            )
+            self.assertNotIn("must reference", all_fail_lines, proc.stderr)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ package dev.librepocket.systema
  * builder 的 `require` IAE/ISE 由各工具 `execute` 經 [guardedToolBuild] 收斂為
  * [ToolResult]（INTERNAL，spec=null），不穿透生產迴圈：
  * [AlarmTool.execute]、[CalendarTool.execute]/[executeUpdate]/[executeDelete]、
- * [VolumeTool.execute]、[NavigationTool.execute] 皆已收斂（#15）。
+ * [MusicTool.execute]、[VolumeTool.execute]、[NavigationTool.execute] 皆已收斂（#15）。
  * parse 側（模型參數 → Params，未來 dispatcher 唯一入口）同樣拋 IAE/ISE，
  * 未來 dispatcher 須在呼叫 parse 側包 try-catch 收斂為 `ToolResult`；
  * 生產尚無 dispatcher 接線，目前 parse 僅測試直調。

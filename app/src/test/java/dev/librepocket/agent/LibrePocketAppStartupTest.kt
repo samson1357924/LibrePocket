@@ -17,8 +17,8 @@ import java.io.File
  *
  * Robolectric 會在測試環境建立 [LibrePocketApp] 並呼叫一次 `onCreate`；本測試
  * 在 `filesDir/skills` 植入崩潰窗口殘留後再次走 `onCreate`，模擬 process restart，
- * 驗證 [dev.librepocket.skill.SkillInstaller.cleanupStaleStaging] 確實被production
- * 入口呼叫並恢復。
+ * 驗證 [dev.librepocket.skill.SkillInstaller.cleanupStaleStaging] 確實被
+ * production 入口呼叫並恢復。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])

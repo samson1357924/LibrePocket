@@ -98,16 +98,21 @@ python3 "$SCRIPT_DIR/backup_rules_check.py" \
     --expect-root data-extraction-rules \
     "$ROOT/app/src/main/res/xml/data_extraction_rules.xml"
 
-# 執行期綁定（attr↔resource）：main manifest 的兩個屬性必須指向已被驗證的
-# 資源檔名——只驗檔名不驗引用時，把 android:fullBackupContent 改指到另一個
-# （root 合法但 schema 錯置的）資源會讓 runtime 解析丟例外、備份靜默停用，
-# 而 gate 對兩個固定檔名仍 PASS（silent-drift 的最後一個未綁定環節）。
+# 執行期綁定（attr↔resource）：以結構化 XML 解析逐檔驗證（bare-text grep 會被
+# 註解內的同字串假冒——屬性已刪光而僅剩註解字樣時 gate 仍 PASS，即本 gate 要防
+# 的金鑰外洩；單引號等合法 XML 格式也會誤判）。主 manifest 兩屬性必填且等值，
+# 缺任一即 fail；flavor overlay「有設則必須等值」（省略屬性＝合併沿用 main 值，
+# 合法）。此綁定同時封死「rebind 到其他資源逃過驗證」的路徑：屬性只能指向
+# @xml/backup_rules / @xml/data_extraction_rules，而這兩個檔名形態已被上方與
+# 深掃逐一驗證。
 MAIN_MANIFEST="$ROOT/app/src/main/AndroidManifest.xml"
 [ -f "$MAIN_MANIFEST" ] || fail "missing $MAIN_MANIFEST"
-grep -q 'android:fullBackupContent="@xml/backup_rules"' "$MAIN_MANIFEST" ||
-    fail "$MAIN_MANIFEST android:fullBackupContent must reference @xml/backup_rules"
-grep -q 'android:dataExtractionRules="@xml/data_extraction_rules"' "$MAIN_MANIFEST" ||
-    fail "$MAIN_MANIFEST android:dataExtractionRules must reference @xml/data_extraction_rules"
+python3 "$SCRIPT_DIR/backup_rules_check.py" --check-manifest --require-both "$MAIN_MANIFEST"
+for m in "$ROOT"/app/src/*/AndroidManifest.xml; do
+    case "$m" in "$ROOT/app/src/main/AndroidManifest.xml") continue ;; esac
+    [ -f "$m" ] || continue
+    python3 "$SCRIPT_DIR/backup_rules_check.py" --check-manifest "$m"
+done
 
 # 縱深：掃描 app/src 下所有語意同形資源（檔名尾段含 backup*rules /
 # data_extraction*rules；未來 flavor overlay 以別名新增／覆寫 backup rules

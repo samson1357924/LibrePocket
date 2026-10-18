@@ -23,12 +23,21 @@ This module parses the XML with the stdlib parser and enforces:
   inside a section) and over-attribute ``<exclude>``/``<include>`` elements
   throw at runtime (backup silently disabled), so the gate rejects them too.
   ``tools:``-namespace attributes never reach the runtime (aapt strips them)
-  and are excluded from the attribute counts.
+  and are excluded from the attribute counts;
+- the attr↔resource runtime binding (``--check-manifest``): the manifest's
+  ``android:fullBackupContent`` / ``android:dataExtractionRules`` attributes
+  must name exactly the validated resources. Structured (ElementTree) on
+  purpose - a bare-text grep is escapable by the literal surviving in an XML
+  comment while the attributes are gone, and a single-quoted attribute value
+  would false-FAIL. The MAIN manifest checks ``--require-both`` (absence is
+  fatal); overlay manifests fail only on a present-but-different value
+  (omitting merges main's value, which is legal).
 
 It is invoked by the shell gate and is directly unit-tested against negative
 fixtures. Run with:
 
     python3 scripts/backup_rules_check.py --expect-root <tag> <file> [...]
+    python3 scripts/backup_rules_check.py --check-manifest [--require-both] <manifest.xml> [...]
 """
 
 from __future__ import annotations
@@ -100,6 +109,13 @@ def _validate_rule_children(
                 f"{path}: {_where(branch_label)}unknown element <{tag}> "
                 "(Android rejects unrecognized tags at parse time)"
             )
+            # An unknown wrapper does not exempt its content: the runtime
+            # validates every START_TAG, so descend and report nested
+            # unknown tags too (message completeness, still fail-closed).
+            if depth < _MAX_RULE_NEST_DEPTH:
+                errors.extend(
+                    _validate_rule_children(path, child, branch_label, depth + 1)
+                )
             continue
         limit = _MAX_EXCLUDE_ATTRS if tag == "exclude" else _MAX_INCLUDE_ATTRS
         # tools:* attrs are stripped by aapt before the Android runtime sees
@@ -136,6 +152,18 @@ def _missing_exclude_errors(
         for domain, rule_path in REQUIRED_EXCLUDES
         if (domain, rule_path) not in present
     ]
+
+
+_ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
+
+# Runtime attr↔resource binding: Auto Backup reads these two attributes off
+# the merged <application> element, and the named resources are exactly the
+# files validate() checks. Values are PINNED (an attr pointing elsewhere gets
+# runtime-ignored or throws silently disabling backup).
+EXPECTED_MANIFEST_ATTRS: tuple[tuple[str, str], ...] = (
+    ("fullBackupContent", "@xml/backup_rules"),
+    ("dataExtractionRules", "@xml/data_extraction_rules"),
+)
 
 
 def validate(path: str, expected_root: str) -> list[str]:
@@ -188,9 +216,56 @@ def validate(path: str, expected_root: str) -> list[str]:
     return errors
 
 
+def validate_manifest(path: str, require_both: bool = False) -> list[str]:
+    """Bind the manifest's backup attributes to the validated resources.
+
+    Structured (ElementTree) on purpose: a bare-text grep is escapable by the
+    literal surviving inside an XML comment while the attributes are gone -
+    the gate would PASS while runtime Auto Backup runs unprotected (key leak).
+    ``require_both`` (the MAIN manifest) fails closed on an ABSENT attribute.
+    Overlay manifests (default) fail only on a PRESENT-but-different value:
+    omitting an attribute is legal - merger inherits main's value - and an
+    overlay might not even carry an <application> (whole-tree inheritance,
+    e.g. a permissions-only overlay), which is equally legal there.
+    """
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as exc:
+        return [f"{path}: invalid XML: {exc}"]
+    except OSError as exc:
+        return [f"{path}: unreadable: {exc}"]
+    if root.tag != "manifest":
+        return [
+            f"{path}: manifest check needs a <manifest> root, found <{root.tag}>"
+        ]
+    application = root.find("application")
+    if application is None:
+        if require_both:
+            return [f"{path}: manifest check needs an <application> element"]
+        # Overlay without <application>: whole-tree inheritance is legal.
+        return []
+    errors: list[str] = []
+    for name, expected in EXPECTED_MANIFEST_ATTRS:
+        value = application.get(f"{_ANDROID_NS}{name}")
+        if value is None:
+            if require_both:
+                errors.append(
+                    f"{path}: android:{name} must reference {expected} "
+                    "(attribute absent)"
+                )
+            continue
+        if value != expected:
+            errors.append(
+                f"{path}: android:{name} must reference {expected} (got {value!r})"
+            )
+    return errors
+
+
 def main(argv: list[str]) -> int:
     args = argv[1:]
     expected_root: str | None = None
+    check_manifest = False
+    require_both = False
     paths: list[str] = []
     i = 0
     while i < len(args):
@@ -198,29 +273,58 @@ def main(argv: list[str]) -> int:
             if i + 1 >= len(args):
                 print("FAIL: --expect-root requires a value", file=sys.stderr)
                 return 2
+            if expected_root is not None:
+                print("FAIL: duplicate --expect-root", file=sys.stderr)
+                return 2
             expected_root = args[i + 1]
             i += 2
+        elif args[i] == "--check-manifest":
+            check_manifest = True
+            i += 1
+        elif args[i] == "--require-both":
+            require_both = True
+            i += 1
         elif args[i].startswith("--"):
             print(f"FAIL: unknown option {args[i]}", file=sys.stderr)
             return 2
         else:
             paths.append(args[i])
             i += 1
-    if not paths or expected_root is None:
-        # Fail closed: an empty invocation OR a missing expected-root hint
-        # must never PASS (the hint-free swapped-file false-PASS was the
-        # reviewer's original repro; the gate and every other caller must
-        # pass the file↔root binding explicitly).
+    if not paths:
+        # Fail closed: an empty invocation must never PASS an empty run
+        # (the hint-free swapped-file false-PASS was the reviewer's original
+        # repro; the gate and every other caller pass bindings explicitly).
         print(
-            "usage: backup_rules_check.py --expect-root <tag> <rules.xml> [...] "
+            "usage: backup_rules_check.py (--expect-root <tag> <rules.xml> [...] | "
+            "--check-manifest [--require-both] <manifest.xml> [...]) "
             "(--expect-root full-backup-content for full-backup-content files; "
             "--expect-root data-extraction-rules for data-extraction-rules files)",
             file=sys.stderr,
         )
         return 2
+    if expected_root is None and not check_manifest:
+        # A rules-file path without any binding hint cannot prove the schema.
+        print(
+            "usage: backup_rules_check.py --expect-root <tag> <rules.xml> [...] | "
+            "--check-manifest [--require-both] <manifest.xml> [...]",
+            file=sys.stderr,
+        )
+        return 2
+    if expected_root is not None and check_manifest:
+        print(
+            "FAIL: --check-manifest and --expect-root are mutually exclusive",
+            file=sys.stderr,
+        )
+        return 2
+    if require_both and not check_manifest:
+        print("FAIL: --require-both requires --check-manifest", file=sys.stderr)
+        return 2
     errors: list[str] = []
     for path in paths:
-        errors.extend(validate(path, expected_root))
+        if check_manifest:
+            errors.extend(validate_manifest(path, require_both))
+        else:
+            errors.extend(validate(path, expected_root))
     if errors:
         for line in errors:
             print(f"FAIL: {line}", file=sys.stderr)

@@ -429,7 +429,7 @@ class OrderedTranscriptSinkErrorTest {
    * teardown scope cancel into the writer finally seal + orphan drain,
    * failing THIS barrier with the teardown CE.
    *
-   * All goroutines run off the runBlocking event loop (feeder/flush on
+   * All coroutines run off the runBlocking event loop (feeder/flush on
    * Dispatchers.Default, writer on the single-thread sink executor) and every
    * test-side wait is a suspend await — no thread-blocking latch can starve
    * the runBlocking loop.

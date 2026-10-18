@@ -9,7 +9,7 @@ import dev.librepocket.skill.SkillPaths
  * Application entry point. Infrastructure skeleton only:
  * no agent loop, no tools, no business logic.
  *
- * #15 崩溃恢復：啟動時收斂上一次安裝被 kill 留下的 staging／.bak 殘留
+ * #15 崩潰恢復：啟動時收斂上一次安裝被 kill 留下的 staging／.bak 殘留
  * （見 [SkillInstaller.cleanupStaleStaging]）。此為 best-effort：清理失敗
  * 不得妨礙 App 啟動，故僅捕 [Exception] 並記錄 warning（VM `[Error]` 一類致命
  * 例外不吞，避免隱藏 OOM 等根因）；刪除類工作量由

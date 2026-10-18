@@ -366,7 +366,6 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
    * 建事件降級僅用於 NO_HANDLER（靜態無 App 不可執行，不經此函式；
    * 執行期 NoHandler 才走手動話術）。USER_DISABLED 等路徑由 [execute] 早期回傳。
    */
-
   override fun fallback(params: EventParams, env: SystemEnv): FallbackSpec = FallbackSpec(
     reasonCode = ReasonCodes.NO_HANDLER,
     userMessage = "做不到建立「${params.title}」（${ReasonCodes.NO_HANDLER}）" +

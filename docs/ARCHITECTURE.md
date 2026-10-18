@@ -1,6 +1,6 @@
 # LibrePocket 架構：Current、Target 與 Proposed
 
-> **Current snapshot**：依 `0185935` 核對（2026-10-16，S1–S7＋R27＋R28-1）。本文分開記錄目前接線與未完成設計，不把規劃圖視為產品能力。
+> **Current snapshot**：依 `0185935` 核對（2026-10-16，S1–S7＋R27＋R28-1）；#96 後 `lsp.symbols` 已 executionReady（翻轉點 `28cb5f1`，見 CAPABILITY_MATRIX），本檔相關段落待重校。本文分開記錄目前接線與未完成設計，不把規劃圖視為產品能力。
 >
 > - **範圍：** Android app composition、provider、Room transcript、flavor 與工具執行狀態。
 > - **Owner role：** app/runtime 維護者；未指派個人。

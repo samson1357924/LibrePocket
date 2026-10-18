@@ -1,6 +1,7 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import java.net.SocketTimeoutException
 import kotlinx.coroutines.CancellationException
 
 /**
@@ -69,7 +70,15 @@ class McpServer(
             // 明文非回環／畸形地址：fail-closed，不碰 vault、不發送、不計熔斷。
             return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
         }
-        val key = keyVault.getKey(config.keyId)
+        val key = try {
+            keyVault.getKey(config.keyId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // vault 存取例外（keystore 錯誤／裝置鎖定等）：與無 key 同待遇（UNAUTHORIZED、
+            // 不計熔斷——本地 keystore 問題非傳輸失敗），絕不外拋崩潰呼叫方。
+            return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, clockMs() - start)
+        }
         if (key == null) {
             // 無 key 不計熔斷（配置問題，非傳輸失敗）。
             return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, clockMs() - start)
@@ -82,6 +91,12 @@ class McpServer(
                 key.fill('\u0000')
             } catch (_: Exception) {
             }
+        }
+        // Bearer 預檢（fail-closed）：只放行可列印 ASCII（0x20–0x7E）。key 含控制字元／
+        // 非 ASCII（含孤立 surrogate）即 UNAUTHORIZED、不發送、不計熔斷——這類值非合法
+        // token（多為 keystore 損壞或注入企圖），放行會把 CR/LF 等塞進標頭造成 header injection。
+        if (!isPrintableAscii(bearer)) {
+            return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, clockMs() - start)
         }
         try {
             val raw = transport.postJson(config.baseUrl, bearer, McpWire.listBody(), timeoutMs)
@@ -141,6 +156,11 @@ class McpServer(
             // 傳輸層非 JSON 早擋（如 event-stream）：PROTOCOL + 計熔斷（同超量路徑）。
             breaker.onFailure()
             return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
+        } catch (_: SocketTimeoutException) {
+            // 讀/連線超時（非本層 deadline）：與本層 deadline 同待遇 → TIMEOUT + 計熔斷
+            //（非 TRANSPORT——超時是暫態、可重試語義，分類應為 TIMEOUT）。
+            breaker.onFailure()
+            return McpListResult(config.id, emptyList(), McpStatus.TIMEOUT, clockMs() - start)
         } catch (_: Exception) {
             breaker.onFailure()
             return McpListResult(config.id, emptyList(), McpStatus.TRANSPORT, clockMs() - start)
@@ -184,7 +204,15 @@ class McpServer(
             // 明文非回環／畸形地址：fail-closed，不碰 vault、不發送、不計熔斷。
             return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
         }
-        val key = keyVault.getKey(config.keyId)
+        val key = try {
+            keyVault.getKey(config.keyId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // vault 存取例外（keystore 錯誤／裝置鎖定等）：與無 key 同待遇（UNAUTHORIZED、
+            // 不計熔斷——本地 keystore 問題非傳輸失敗），絕不外拋崩潰呼叫方。
+            return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, clockMs() - start)
+        }
         if (key == null) {
             // 無 key 不計熔斷（配置問題，非傳輸失敗）。
             return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, clockMs() - start)
@@ -197,6 +225,11 @@ class McpServer(
                 key.fill('\u0000')
             } catch (_: Exception) {
             }
+        }
+        // Bearer 預檢（fail-closed，同 listTools）：只放行可列印 ASCII，非此即 UNAUTHORIZED、
+        // 不發送、不計熔斷（防 header injection／keystore 損壞值流入標頭）。
+        if (!isPrintableAscii(bearer)) {
+            return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, clockMs() - start)
         }
         try {
             val raw = transport.postJson(config.baseUrl, bearer, body, timeoutMs)
@@ -266,12 +299,35 @@ class McpServer(
             // 傳輸層非 JSON 早擋（如 event-stream）：PROTOCOL + 計熔斷（同超量路徑）。
             breaker.onFailure()
             return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
+        } catch (_: SocketTimeoutException) {
+            // 讀/連線超時（非本層 deadline）：與本層 deadline 同待遇 → TIMEOUT + 計熔斷。
+            breaker.onFailure()
+            return McpCallResult(config.id, toolName, McpStatus.TIMEOUT, clockMs() - start)
         } catch (_: Exception) {
             breaker.onFailure()
             return McpCallResult(config.id, toolName, McpStatus.TRANSPORT, clockMs() - start)
         }
     }
 }
+
+/**
+ * Bearer token 可列印 ASCII 預檢（fail-closed）：值須非空、長度不超過 [BEARER_MAX_CHARS]，
+ * 且每個字元皆在 0x20–0x7E。
+ *
+ * 拒絕：空字串、控制字元（含 CR/LF——header injection 向量）、非 ASCII（含孤立
+ * surrogate，UTF-8 編碼會變 U+FFFD 使 token 失真）、超長（損壞 keystore 回傳巨量值的
+ * 縱深上限，避免數 MB token 直接流進標頭與 String 複製記憶體放大）。合法 Bearer token
+ * （RFC 6750 b64token／Bearer 65–90 基本拉丁字元）必在此範圍內；範圍外者多為 keystore
+ * 損壞或注入企圖，一律不發送。
+ */
+internal fun isPrintableAscii(value: String): Boolean {
+    if (value.isEmpty()) return false
+    if (value.length > BEARER_MAX_CHARS) return false
+    return value.all { it.code in 0x20..0x7E }
+}
+
+/** Bearer token 預檢長度上限（縱深；遠大於任何合法 token，僅擋損壞 keystore 的巨量值）。 */
+private const val BEARER_MAX_CHARS = 8_192
 
 /**
  * 多伺服器聚合：薄封裝，逐服獨立熔斷（同進程多 [McpServer] 實例）。

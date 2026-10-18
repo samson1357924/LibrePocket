@@ -147,6 +147,7 @@ class McpFuseTest {
                 assertEquals(McpStatus.UNAUTHORIZED, s.callTool("t", "{}").status)
             }
             assertTrue(breaker.isOpen())
+            assertEquals("401 必須逐次計入熔斷失敗（3 次）", 3, breaker.failureCount())
         } finally {
             web.shutdown()
         }
@@ -269,9 +270,11 @@ class McpFuseTest {
                 "[{\"name\":\"search\",\"description\":\"d\",\"inputSchema\":$schema}]}}"
             web.enqueue(MockResponse().setResponseCode(200).setBody(body))
             val clock = Clock(0L)
-            val s = server(web, clock, McpCircuitBreaker(clockMs = clock::get))
+            val breaker = McpCircuitBreaker(clockMs = clock::get)
+            val s = server(web, clock, breaker)
             val r = s.listTools()
             assertEquals(McpStatus.PROTOCOL, r.status)
+            assertEquals("PROTOCOL 必須計入熔斷失敗一次", 1, breaker.failureCount())
         } finally {
             web.shutdown()
         }
@@ -285,9 +288,11 @@ class McpFuseTest {
                 "\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"isError\":false}}"
             web.enqueue(MockResponse().setResponseCode(200).setBody(body))
             val clock = Clock(0L)
-            val s = server(web, clock, McpCircuitBreaker(clockMs = clock::get))
+            val breaker = McpCircuitBreaker(clockMs = clock::get)
+            val s = server(web, clock, breaker)
             val r = s.callTool("search", "{}")
             assertEquals(McpStatus.PROTOCOL, r.status)
+            assertEquals("PROTOCOL 必須計入熔斷失敗一次", 1, breaker.failureCount())
         } finally {
             web.shutdown()
         }
@@ -301,9 +306,11 @@ class McpFuseTest {
             val body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[],\"isError\":True}}"
             web.enqueue(MockResponse().setResponseCode(200).setBody(body))
             val clock = Clock(0L)
-            val s = server(web, clock, McpCircuitBreaker(clockMs = clock::get))
+            val breaker = McpCircuitBreaker(clockMs = clock::get)
+            val s = server(web, clock, breaker)
             val r = s.callTool("search", "{}")
             assertEquals(McpStatus.PROTOCOL, r.status)
+            assertEquals("PROTOCOL 必須計入熔斷失敗一次", 1, breaker.failureCount())
         } finally {
             web.shutdown()
         }
@@ -320,9 +327,11 @@ class McpFuseTest {
             assertTrue(body.length > McpTransport.RESPONSE_MAX_CHARS)
             web.enqueue(MockResponse().setResponseCode(200).setBody(body))
             val clock = Clock(0L)
-            val s = server(web, clock, McpCircuitBreaker(clockMs = clock::get))
+            val breaker = McpCircuitBreaker(clockMs = clock::get)
+            val s = server(web, clock, breaker)
             val r = s.callTool("search", "{}")
             assertEquals(McpStatus.PROTOCOL, r.status)
+            assertEquals("PROTOCOL 必須計入熔斷失敗一次", 1, breaker.failureCount())
         } finally {
             web.shutdown()
         }

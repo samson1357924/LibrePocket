@@ -464,6 +464,42 @@ class McpProtocolContractsTest {
         }
     }
 
+    @Test fun isLoopbackHostNegativePinsRejectLookalikes() {
+        // 回環判定是**精確**白名單（localhost／127.0.0.1／::1），任何近似形一律非回環：
+        // 若實作放寬（如 endsWith/contains），下列釣魚近似域會被誤放行成 http 明文。
+        val nonLoopback = listOf(
+            "127.0.0.2", // 127/8 內但非精確 127.0.0.1（fail-closed，非白名單即拒）
+            "127.1.1.1",
+            "0.0.0.0",
+            "192.168.1.1",
+            "evil.com",
+            "localhost.evil.com",
+            "127.0.0.1.evil.com",
+            "127.0.0.1.nip.io",
+            "evil-localhost",
+            "localhostevil",
+            "sub.localhost",
+            "::2",
+            "fe80::1",
+        )
+        for (h in nonLoopback) {
+            assertFalse("[$h] 必須非回環（精確白名單）", McpWire.isLoopbackHost(h))
+        }
+        // 正對照：精確白名單（含大小寫／bracket／前後空白正規化）仍放行。
+        for (h in listOf("localhost", "LOCALHOST", "127.0.0.1", "::1", "[::1]", "  localhost  ")) {
+            assertTrue("[$h] 必須為回環", McpWire.isLoopbackHost(h))
+        }
+        // 端到端：http + 回環近似域 → insecure endpoint（不得當回環放行明文）。
+        for (bad in listOf("http://localhost.evil.com/mcp", "http://127.0.0.1.evil.com/mcp")) {
+            try {
+                McpWire.requireSecureEndpoint(bad)
+                fail("回環近似域必須拒：$bad")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("mcp: insecure endpoint", e.message)
+            }
+        }
+    }
+
     @Test fun userinfoInEndpointIsRejected() {
         // userinfo（user@host／user:pass@host）形混淆：顯示主機與實際連線主機可被
         // 分離（貼錯／釣魚網址形），Bearer／arguments 會送達與使用者認知不同的主機

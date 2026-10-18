@@ -1,0 +1,14 @@
+{
+  "play": {
+    "package": "dev.librepocket.agent",
+    "cert_sha256": "PUT_REAL_64_HEX_PIN_HERE_FOR_PLAY"
+  },
+  "foss": {
+    "package": "dev.librepocket.agent.foss",
+    "cert_sha256": "PUT_REAL_64_HEX_PIN_HERE_FOR_FOSS"
+  },
+  "github": {
+    "package": "dev.librepocket.agent.github",
+    "cert_sha256": "PUT_REAL_64_HEX_PIN_HERE_FOR_GITHUB"
+  }
+}

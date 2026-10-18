@@ -462,10 +462,10 @@ def _validate_expected(args: argparse.Namespace) -> tuple[str, str, str, str, in
 def _validate_tool(path_value: str, tool_name: str) -> str:
     path = Path(os.path.abspath(path_value))
     try:
-        info = os.stat(path)
+        info = os.lstat(path)
     except OSError as exc:
         _fail(f"required {tool_name} is unavailable: {exc.strerror or exc}")
-    if not stat.S_ISREG(info.st_mode) or not os.access(path, os.X_OK):
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or not os.access(path, os.X_OK):
         _fail(f"required {tool_name} is not an executable regular file")
     return str(path)
 
@@ -657,8 +657,13 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_parser() -> argparse.ArgumentParser:
+    """Public entry point for test/rehearsal consumers (stable alias)."""
+    return _build_parser()
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    args = build_parser().parse_args(argv)
     try:
         result = verify_and_stage(args)
     except VerificationError as exc:

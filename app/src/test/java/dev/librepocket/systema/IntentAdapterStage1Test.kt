@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.ApplicationInfo
 import android.content.pm.ResolveInfo
+import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -830,5 +831,151 @@ class IntentAdapterStage1Test {
     assertEquals(ReasonCodes.USER_DISABLED, d.reasonCode)
     assertNull(d.spec)
     assertFalse("USER_DISABLED 不得調用 launcher", called)
+  }
+
+  // ---- i. Phase2 收斂與契約釘選（cause 後綴、registry 拒絕、MIME、空白澄清、
+  //        DELETE 發射 allowlist、長度邊界）----
+
+  @Test fun guardedToolBuild_illegalArgument_mapsCauseTaggedInternal() {
+    val failure = ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到測試（INTERNAL）")
+    val bad = "secret-input"
+    val guarded = guardedToolBuild(failure) {
+      throw IllegalArgumentException("bad value: $bad")
+    }
+    val r = (guarded as Guarded.Internal).result
+    assertFalse(r.ok)
+    assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+    // 與 launch 路徑對稱：追加 cause 類名，不得回顯 builder 訊息體。
+    assertEquals("做不到測試（INTERNAL）[IllegalArgumentException]", r.message)
+    assertFalse("builder 訊息不得回顯", r.message.contains("secret-input"))
+  }
+
+  @Test fun guardedToolBuild_illegalState_mapsCauseTaggedInternal() {
+    // ISE 分支（非取消）同樣收斂為 INTERNAL + 類名後綴——guard KDoc 承諾的
+    // 契約此前無直接釘選。
+    val failure = ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到測試（INTERNAL）")
+    val guarded = guardedToolBuild(failure) { throw IllegalStateException("state boom") }
+    val r = (guarded as Guarded.Internal).result
+    assertFalse(r.ok)
+    assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+    assertEquals("做不到測試（INTERNAL）[IllegalStateException]", r.message)
+  }
+
+  @Test fun guardedToolBuild_cancellation_reraises() {
+    val failure = ToolResult(false, false, null, ReasonCodes.INTERNAL, "x（INTERNAL）")
+    try {
+      guardedToolBuild(failure) { throw kotlin.coroutines.cancellation.CancellationException("cancel") }
+      fail("取消語義不得吞成 INTERNAL")
+    } catch (_: kotlin.coroutines.cancellation.CancellationException) {
+      // 照拋即契約。
+    }
+  }
+
+  @Test fun calendar_specMime_matchesQueriesEntries() {
+    // 顯式 MIME 與 manifest <queries> 的 mimeType 條目精確對應（P2 fix：
+    // typeless content URI 依賴 PM 查詢時的 provider-resolve，顯式者確定）。
+    assertEquals(
+      CalendarTool.MIME_EVENT_DIR,
+      CalendarTool.buildInsertIntent(CalendarTool.EventParams("例會", 1000, 2000)).mimeType,
+    )
+    assertEquals(
+      CalendarTool.MIME_EVENT_ITEM,
+      CalendarTool.buildEditIntent(CalendarTool.UpdateParams(eventId = "7", title = "t")).mimeType,
+    )
+    assertEquals(
+      CalendarTool.MIME_EVENT_ITEM,
+      CalendarTool.executeDelete(
+        CalendarTool.DeleteParams("7"), env, IntentLauncher { LaunchResult.Success },
+      ).spec?.mimeType,
+    )
+    // 無 App pending 路徑的 EDIT spec 同帶 item MIME（契約一致）。
+    assertEquals(
+      CalendarTool.MIME_EVENT_ITEM,
+      CalendarTool.executeUpdate(
+        CalendarTool.UpdateParams(eventId = "7", title = "t"), env.copy(hasCalendarApp = false),
+        IntentLauncher { LaunchResult.Success },
+      ).spec?.mimeType,
+    )
+  }
+
+  @Test fun calendar_locationDescription_lengthGuards_rejected() {
+    var called = false
+    val launcher = IntentLauncher { called = true; LaunchResult.Success }
+    val longLoc = "l".repeat(CalendarTool.MAX_LOCATION_LEN + 1)
+    val longDesc = "d".repeat(CalendarTool.MAX_DESCRIPTION_LEN + 1)
+    for (p in listOf(
+      CalendarTool.EventParams("例會", 1000, 2000, location = longLoc),
+      CalendarTool.EventParams("例會", 1000, 2000, description = longDesc),
+    )) {
+      called = false
+      val r = CalendarTool.execute(p, env, launcher)
+      assertFalse(r.ok)
+      assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+      assertNull(r.spec)
+      assertFalse("location/description 長度違規不得調用 launcher", called)
+    }
+  }
+
+  @Test fun calendar_lengths_atBoundary_inclusive() {
+    val p = CalendarTool.EventParams(
+      "t".repeat(CalendarTool.MAX_TITLE_LEN), 1000, 2000,
+      location = "l".repeat(CalendarTool.MAX_LOCATION_LEN),
+      description = "d".repeat(CalendarTool.MAX_DESCRIPTION_LEN),
+    )
+    val spec = CalendarTool.buildInsertIntent(p)
+    assertEquals(IntentActions.INSERT, spec.action)
+    val back = CalendarTool.parseInsertParams(spec.extras)
+    assertEquals(CalendarTool.MAX_TITLE_LEN, back.title.length)
+    assertEquals(CalendarTool.MAX_LOCATION_LEN, back.location.length)
+    assertEquals(CalendarTool.MAX_DESCRIPTION_LEN, back.description.length)
+  }
+
+  @Test fun alarm_messageLen_atBoundary_inclusive() {
+    val msg = "m".repeat(AlarmTool.MAX_MESSAGE_LEN)
+    val spec = AlarmTool.buildSetAlarmIntent(AlarmTool.Params(7, 30, msg))
+    val parsed = AlarmTool.parseParams(spec.extras)
+    assertEquals(AlarmTool.MAX_MESSAGE_LEN, parsed.message.length)
+    assertEquals(msg.length, parsed.message.length)
+  }
+
+  @Test fun navigation_allBlankParams_needsClarification_notLaunched() {
+    // 空白目的地（query/label/座標皆缺）回 NEED_CLARIFICATION，不構建
+    // `geo:0,0?q=` 無意義 intent（#19 猜測執行禁令；與 MusicTool 同語義）。
+    var called = false
+    val r = NavigationTool.execute(
+      NavigationTool.Params(), env, IntentLauncher { called = true; LaunchResult.Success },
+    )
+    assertFalse(r.ok)
+    assertFalse(r.usedFallback)
+    assertEquals(ReasonCodes.NEED_CLARIFICATION, r.reasonCode)
+    assertNull(r.spec)
+    assertFalse("空白目的地不得發射 intent", called)
+  }
+
+  @Test fun launcher_deleteSpec_rejectsWithInternal_evenWhenResolved() {
+    // DELETE 待寫 spec 禁經 launcher 發射（CalendarTool/manifest 契約機械化）：
+    // 即使 handler 已 resolve，也在 resolve 之前以 Internal fail-closed 拒絕。
+    val app = appContext()
+    addResolve(
+      app,
+      Intent(IntentActions.DELETE).setDataAndType(
+        Uri.parse("content://com.android.calendar/events/7"),
+        CalendarTool.MIME_EVENT_ITEM,
+      ),
+    )
+    val r = AndroidIntentLauncher(app).launch(
+      IntentSpec(
+        action = IntentActions.DELETE,
+        dataUri = "content://com.android.calendar/events/7",
+        mimeType = CalendarTool.MIME_EVENT_ITEM,
+      ),
+    )
+    // 斷言 allowlist 的標記訊息（而非只斷言任何 Internal），否則 guard 移除後
+    // 仍可能碰巧由 toIntent/resolve 拋錯路徑給出 Internal 而假綠。
+    assertTrue("DELETE spec 禁發射：回 Internal", r is LaunchResult.Internal)
+    assertTrue(
+      "Internal 應來自進入 resolve 前的 DELETE allowlist guard",
+      (r as LaunchResult.Internal).cause?.message?.contains("DELETE spec must not be launched") == true,
+    )
   }
 }

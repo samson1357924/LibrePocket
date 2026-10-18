@@ -15,6 +15,10 @@ import java.net.URLEncoder
  * - query 形狀為刻意近似：`geo:lat,lng?q=label` 非官式合成
  *   `geo:0,0?q=lat,lng(label)`（括號需轉義）；多數地圖 App 以「座標＋搜尋詞」
  *   語意照收，保守起見保留現行形狀並以測試鎖定。
+ * - 空白目的地（query/label/座標皆缺）回 NEED_CLARIFICATION（[execute]）
+ *   而非構建無意義的空搜尋 intent；與 [MusicTool] 的空白 query 澄清同契約，
+ *   即使靜態 `check` 已判 NATIVE/DEGRADED 亦然（目的缺席是使用者意圖問題，
+ *   與環境能力無關）。
  */
 object NavigationTool : SystemTool<NavigationTool.Params> {
 
@@ -80,6 +84,15 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
     val check = check(env)
     if (!check.executable) {
       return ToolResult(false, false, null, check.reasonCode, "做不到導航（${check.reasonCode}）")
+    }
+    // 空白目的地禁猜測執行（#19，與 MusicTool 空白 query 同語義）：query/label/
+    // 座標皆缺時會構建出 `geo:0,0?q=`（或空 OSM 搜尋），對使用者毫無意義——
+    // 回 NEED_CLARIFICATION，不靜默開啟空搜尋的 intent。
+    if (params.query.isBlank() && params.label.isBlank() && params.latitude == null) {
+      return ToolResult(
+        false, false, null, ReasonCodes.NEED_CLARIFICATION,
+        "導航去哪裡（${ReasonCodes.NEED_CLARIFICATION}）？→ 需要你說出目的地（地名或座標）",
+      )
     }
     // fail-closed：resolve 的座標守衛 IAE（單側座標/越界）收斂為 INTERNAL，不穿透
     //（收斂點 [guardedToolBuild]：話術由呼叫方提供，訊息與原 inline catch 逐字相同）。

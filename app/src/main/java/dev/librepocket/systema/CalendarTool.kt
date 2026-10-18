@@ -17,6 +17,10 @@ package dev.librepocket.systema
  * - 三風味皆允許；Play 需申報日曆權限 + 用途披露。
  * - 可見性（#14）：主 manifest `<queries>` 已宣告 INSERT（dir/event）/EDIT
  *   （item/event）；API 30+ 無宣告時 `resolveActivity` 被過濾為 null。
+ *   委託 intent 顯式攜帶對應型別（[MIME_EVENT_DIR]/[MIME_EVENT_ITEM]，與
+ *   queries 的 mimeType 條目精確對應；理由見 [buildInsertIntent] 註記）。
+ *   真機 INSERT/EDIT handler E2E（系統日曆實際接起 intent）仍 UNVERIFIED——
+ *   `<queries>` 決策不得視為裝置驗證證據。
  * - 長度/時長上限（500/500/2000 字元、單事件 5 年）為**本層自訂 fail-closed
  *   政策**：官方 Common Intents 對 INSERT 無這些上限，本層較嚴（Binder 傳輸
  *   防禦），越界一律 INTERNAL；dispatcher 接線時模型須知此差異。
@@ -36,7 +40,10 @@ package dev.librepocket.systema
  */
 object CalendarTool : SystemTool<CalendarTool.EventParams> {
 
-  /** Binder/傳輸防禦上限（build/parse 同守衛，不等到執行期才暴露）。 */
+  /** Binder/傳輸防禦上限（build/parse 同守衛，不等到執行期才暴露）。
+   *  （與 [AlarmTool.MAX_MESSAGE_LEN] 同值同源：本層自訂 Binder 傳輸防禦，
+   *  非官方契約；改動須與 IntentSpec KDoc 的長度政策註記同步。）
+   */
   const val MAX_TITLE_LEN = 500
   const val MAX_LOCATION_LEN = 500
   const val MAX_DESCRIPTION_LEN = 2000
@@ -84,6 +91,12 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
   const val EXTRA_EVENT_TITLE = "title"
   const val EXTRA_EVENT_LOCATION = "eventLocation"
   const val EXTRA_EVENT_DESCRIPTION = "description"
+
+  /** `CalendarContract.Events.CONTENT_TYPE`（dir 型 MIME，INSERT 委託用；與 manifest `<queries>` 的 mimeType 條目精確對應）。 */
+  const val MIME_EVENT_DIR = "vnd.android.cursor.dir/event"
+
+  /** `CalendarContract.Events.CONTENT_ITEM_TYPE`（item 型 MIME，EDIT／刪除委託用；同上）。 */
+  const val MIME_EVENT_ITEM = "vnd.android.cursor.item/event"
 
   /** Events `_id` 數字校驗（避免每次呼叫重配 Regex）。 */
   private val EVENT_ID_PATTERN = Regex("[0-9]+")
@@ -160,6 +173,11 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
     return IntentSpec(
       action = IntentActions.INSERT,
       dataUri = EVENTS_CONTENT_URI,
+      // 顯式攜帶 dir 型 MIME：與 manifest `<queries>` 的 mimeType 條目精確對應。
+      // （`resolveActivity` 經 AOSP `Intent.resolveTypeIfNeeded` 才會 provider-
+      // resolve content URI 的型別；顯式設定讓 PM 級匹配不依賴 provider 查詢，
+      // 為確定性 fail-closed 設計——provider 未就緒時也不會誤判 NO_HANDLER。）
+      mimeType = MIME_EVENT_DIR,
       extras = extras,
     )
   }
@@ -179,7 +197,8 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
     val location = extras.optionalExtra<IntentExtra.Str>(EXTRA_EVENT_LOCATION)?.value.orEmpty()
     val description = extras.optionalExtra<IntentExtra.Str>(EXTRA_EVENT_DESCRIPTION)?.value.orEmpty()
     require(title.isNotBlank()) { "title must not be blank" }
-    require(title.length <= MAX_TITLE_LEN) { "title too long" }
+    // 與 [buildInsertIntent] 同訊息形狀（附長度數字，不回顯內容）。
+    require(title.length <= MAX_TITLE_LEN) { "title too long: ${title.length} > $MAX_TITLE_LEN" }
     require(location.length <= MAX_LOCATION_LEN) { "location too long" }
     require(description.length <= MAX_DESCRIPTION_LEN) { "description too long" }
     require(begin >= 0) { "beginTime must be >= 0" }
@@ -223,7 +242,8 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
       if (begin != null) require(begin >= 0) { "beginTime must be >= 0" }
       if (end != null) require(end >= 0) { "endTime must be >= 0" }
     }
-    params.title?.let { require(it.length <= MAX_TITLE_LEN) { "title too long" } }
+    // 與 insert/parse 同訊息形狀（附長度數字，不回顯內容）。
+    params.title?.let { require(it.length <= MAX_TITLE_LEN) { "title too long: ${it.length} > $MAX_TITLE_LEN" } }
     params.location?.let { require(it.length <= MAX_LOCATION_LEN) { "location too long" } }
     params.description?.let { require(it.length <= MAX_DESCRIPTION_LEN) { "description too long" } }
     val extras = mutableMapOf<String, IntentExtra>()
@@ -235,6 +255,8 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
     return IntentSpec(
       action = IntentActions.EDIT,
       dataUri = eventUri(params.eventId),
+      // item 型 MIME：單事件 URI + 精確型別（同理見 [buildInsertIntent] 註記）。
+      mimeType = MIME_EVENT_ITEM,
       extras = extras,
     )
   }
@@ -320,7 +342,7 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
       ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到刪除日曆事件（${ReasonCodes.INTERNAL}）")
     if (env.hasCalendarApp) {
       val spec = when (val build = guardedToolBuild(internalFailure) {
-        IntentSpec(action = IntentActions.EDIT, dataUri = eventUri(params.eventId))
+        IntentSpec(action = IntentActions.EDIT, dataUri = eventUri(params.eventId), mimeType = MIME_EVENT_ITEM)
       }) {
         is Guarded.Internal -> return build.result
         is Guarded.Built -> build.value

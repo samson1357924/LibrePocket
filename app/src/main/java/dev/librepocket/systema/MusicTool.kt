@@ -20,6 +20,11 @@ package dev.librepocket.systema
  * - 前台要求：實際播放必須跑在前台服務（`FOREGROUND_SERVICE_MEDIA_PLAYBACK`
  *   + 常駐通知），否則後台會被系統回收；本層僅建模，端側強制。
  * - 模糊目標（如「放點輕音樂」）不猜包名：先澄清或走預設播放器。
+ * - [buildPlayIntent] 的 `targetPackage` 參數為**測試建模**用途（純映射方便
+ *   斷言 extras/flags）；生產**不傳**（OEM/播放器包名各異，本層不代選 app，
+ *   與 manifest 「直啟不採用 setPackage」註記一致）——新呼叫方禁無腦透傳。
+ * - 與姊妹工具同契約：execute 內 builder 一律經 [guardedToolBuild] 收斂
+ *   （控制映射與 play 編碼的拋例不再穿透生產迴圈）。
  */
 object MusicTool : SystemTool<MusicTool.Params> {
 
@@ -63,14 +68,26 @@ object MusicTool : SystemTool<MusicTool.Params> {
       targetPackage = defaultPlayerPackage,
     )
 
-  fun buildControl(control: Control): ControlSpec =
-    ControlSpec(control, CONTROL_KEY_CODES.getValue(control))
+  fun buildControl(control: Control): ControlSpec {
+    // 鍵碼查表缺項以 ISE 快速失敗（可被 [guardedToolBuild] 收斂為 INTERNAL），
+    // 而非讓穿透性的 NoSuchElementException（guard 不可捕）漏出生產迴圈；
+    // 新增 Control 未補鍵碼時層面即收斂、話術保持一致（Phase2 收斂點真實性）。
+    val keyCode = CONTROL_KEY_CODES[control]
+      ?: throw IllegalStateException("no keyCode mapping for Control.${control.name}")
+    return ControlSpec(control, keyCode)
+  }
 
-  fun buildControlIntent(control: Control): IntentSpec = IntentSpec(
-    action = IntentActions.MEDIA_BUTTON,
-    // D2 型別化：keyCode 用 Int，端側 MediaSession 回調按 int 讀回。
-    extras = mapOf("keyCode" to IntentExtra.IntVal(CONTROL_KEY_CODES.getValue(control))),
-  )
+  fun buildControlIntent(control: Control): IntentSpec {
+    // 同 [buildControl]：缺鍵碼 ISE（非 NoSuchElementException），確保
+    // guardedToolBuild 真實收斂；D2 型別化：keyCode 用 Int，端側 MediaSession
+    // 回調按 int 讀回。
+    val keyCode = CONTROL_KEY_CODES[control]
+      ?: throw IllegalStateException("no keyCode mapping for Control.${control.name}")
+    return IntentSpec(
+      action = IntentActions.MEDIA_BUTTON,
+      extras = mapOf("keyCode" to IntentExtra.IntVal(keyCode)),
+    )
+  }
 
   override fun execute(params: Params, env: SystemEnv, launcher: IntentLauncher): ToolResult {
     val check = check(env)
@@ -78,7 +95,14 @@ object MusicTool : SystemTool<MusicTool.Params> {
       return ToolResult(false, false, null, check.reasonCode, "做不到播放音樂（${check.reasonCode}）")
     }
     if (params.control != null) {
-      val spec = buildControlIntent(params.control)
+      // fail-closed：MEDIA_BUTTON 映射（keyCode 查表缺項拋 ISE）一律收斂為
+      // INTERNAL，不穿透生產迴圈（收斂點 [guardedToolBuild]，話術形狀同姊妹工具）。
+      val controlFailure =
+        ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到控制播放（${ReasonCodes.INTERNAL}）")
+      val spec = when (val build = guardedToolBuild(controlFailure) { buildControlIntent(params.control) }) {
+        is Guarded.Internal -> return build.result
+        is Guarded.Built -> build.value
+      }
       return when (val launched = launcher.launchCatching(spec)) {
         // MEDIA_BUTTON 為 broadcast 語義，resolve-first launcher 恆回 NoHandler：
         // 話術取 [fallback] 控制分支（完整三段計畫；generic toToolResult 的
@@ -95,7 +119,14 @@ object MusicTool : SystemTool<MusicTool.Params> {
         "放什麼音樂（${ReasonCodes.NEED_CLARIFICATION}）？→ 可替代預設歌單 → 需要你說出曲名或歌手",
       )
     }
-    val spec = buildPlayIntent(params)
+    // fail-closed：play builder（URLEncoder 若拋）同樣收斂為 INTERNAL
+    //（收斂點 [guardedToolBuild]）。
+    val playFailure =
+      ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到播放音樂（${ReasonCodes.INTERNAL}）")
+    val spec = when (val build = guardedToolBuild(playFailure) { buildPlayIntent(params) }) {
+      is Guarded.Internal -> return build.result
+      is Guarded.Built -> build.value
+    }
     return when (val launched = launcher.launchCatching(spec)) {
       // 發現式缺席（靜態有播放器但發射無處理者：被移除/停用/不可見）與靜態
       // DEGRADED 同語義：走 [fallback] 話術（可替代網頁播放器），spec 保留。

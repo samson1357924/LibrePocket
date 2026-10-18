@@ -12,8 +12,9 @@ package dev.librepocket.systema
  * 端側落地的已知條件（官方 AudioManager javadoc，接線 PR 須處理）：
  * - `setStreamVolume` / `adjustStreamVolume` 在觸發 Do-Not-Disturb 變更、
  *   且呼叫端未持有 Notification Policy Access 時丟 `SecurityException`；
- *   [AndroidIntentLauncher.applyVolume] 經 `runCatching` 收斂為 bare false，
- *   端側接線層不得把「失敗原因」丟失（拒絕 vs 系統錯誤）。
+ *   [AndroidIntentLauncher.applyVolume] 經 try/catch 收斂為 bare false
+ *  （只收 `Exception`，`CancellationException` 重拋），端側接線層不得把
+ *   「失敗原因」丟失（拒絕 vs 系統錯誤）。
  * - `isVolumeFixed` 裝置上 adjust 是靜默 no-op，仍會回 true——不得計為成功。
  *
  * 佔位錨定語義（current）：[execute] 的 `ok=true` 表示「操作已錨定」——

@@ -18,9 +18,12 @@ import kotlin.coroutines.cancellation.CancellationException
  * （含 `resolveActivity` 自身拋錯，D1 此處在 runCatching 之外會直接外洩）。
  * 呼叫方接 [FallbackSpec]。
  *
- * 例外收斂說明：三處 catch 皆只收 `Exception`（`OutOfMemoryError` 等 VM fatal
- * 直接外洩）；`CancellationException` 在 launch 與 launchCatching 皆明確重拋，
- * structured concurrency 由呼叫方維持。
+ * 例外收斂說明：本類的 catch 皆只收 `Exception`（`OutOfMemoryError` 等 VM fatal
+ * 直接外洩）；`CancellationException` 在 [launch] 三段與 [applyVolume] 皆明確
+ * 重拋，structured concurrency 由呼叫方維持。
+ *
+ * 發射 allowlist：[IntentActions.DELETE] 待寫 spec 不經本層發射（[CalendarTool]
+ * 契約），見 [launch]，企圖發射 fail-closed 回 `Internal`。
  *
  * 已接受風險（文件化，不改行為）：隱式 Intent handler 劫持——系統依預設
  * App 選擇處理者，本層不代選；高風險操作由呼叫方經使用者確認後才發起，
@@ -29,6 +32,14 @@ import kotlin.coroutines.cancellation.CancellationException
 class AndroidIntentLauncher(private val context: Context) : IntentLauncher {
 
   override fun launch(spec: IntentSpec): LaunchResult {
+    // 防禦性 allowlist：DELETE（待寫 spec，僅供展示/端側直寫用，見 CalendarTool
+    // KDoc 與 manifest 文檔契約）禁經 launcher 發射——企圖發射視為層錯誤，
+    // fail-closed 回 Internal（不猜測轉發）。
+    if (spec.action == IntentActions.DELETE) {
+      return LaunchResult.Internal(
+        IllegalStateException("DELETE spec must not be launched (end-side direct write only)"),
+      )
+    }
     val intent = try {
       toIntent(spec)
     } catch (e: CancellationException) {
@@ -56,12 +67,18 @@ class AndroidIntentLauncher(private val context: Context) : IntentLauncher {
     }
   }
 
-  /** 經 AudioManager 落地音量操作；回傳實際是否生效。 */
+  /**
+   * 經 AudioManager 落地音量操作；回傳實際是否生效。
+   *
+   * 例外收斂與 [launch] 同契約：只收 `Exception`（回 false；`OutOfMemoryError`
+   * 等 VM fatal 直接外洩），`CancellationException` 明確重拋（structured
+   * concurrency 由呼叫方維持；本函式不得把取消吞成 false）。
+   */
   fun applyVolume(params: VolumeTool.Params): Boolean {
     val audio = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
       ?: return false
     val stream = params.stream.sdkValue
-    return runCatching {
+    return try {
       when (params.direction) {
         VolumeTool.Direction.RAISE ->
           audio.adjustStreamVolume(stream, AudioManager.ADJUST_RAISE, 0)
@@ -78,7 +95,11 @@ class AndroidIntentLauncher(private val context: Context) : IntentLauncher {
         }
       }
       true
-    }.getOrDefault(false)
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Exception) {
+      false
+    }
   }
 
   /**

@@ -29,8 +29,12 @@ data class ToolDescriptor(
 )
 
 /**
- * 工具註冊表。A 組 6 項在此註冊，FastRouter 按名取用。
- * 原創命名：`system.*` 前綴保留給快通道系統操作。
+ * 工具註冊表（原創命名：`system.*` 前綴保留給快通道系統操作）。
+ *
+ * 注意：與 `dev.librepocket.tool.ToolRegistry` 同名——FastRouter 實際查詢的
+ * 是後者（裝配提示的 slow 通道表，見其檔案說明）；本表目前僅由 [init] 填入、
+ * 以 `names()`（A 組 6 項）供測試/契約自述使用，生產執行器尚未接線
+ *（未來 dispatcher 按名取用時須另接線，勿誤以為已掛在 FastRouter）。
  */
 object ToolRegistry {
   const val NAVIGATE = "system.navigate"
@@ -54,6 +58,9 @@ object ToolRegistry {
   /**
    * 註冊（fail-closed）：重複名稱直接拒絕（`require`）——靜默覆寫會在 initializer
    * 順序或 flavor 類覆疊出錯時把 descriptor 換人而不留痕跡。
+   *
+   * 呼叫契約：僅限物件 initializer（類初始化單執行緒保證）；backing map 為
+   * 非 thread-safe 的 `linkedMapOf`，未來若開放執行期註冊須先加同步。
    */
   fun register(descriptor: ToolDescriptor) {
     require(!descriptors.containsKey(descriptor.name)) {

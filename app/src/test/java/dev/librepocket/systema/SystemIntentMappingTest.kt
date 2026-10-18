@@ -35,6 +35,17 @@ class SystemIntentMappingTest {
     assertEquals(6, ToolRegistry.all().size)
   }
 
+  @Test fun registry_duplicateName_rejected_stateStable() {
+    // fail-closed 拒絕：重複名稱 require（IAE），且註冊表狀態不變——
+    // 靜默覆寫會把 descriptor 換人而不留痕跡（見 ToolRegistry.register KDoc）。
+    val before = ToolRegistry.all()
+    val thrown = runCatching {
+      ToolRegistry.register(ToolDescriptor(ToolRegistry.NAVIGATE, SideEffectLevel.READ, 10_000))
+    }.exceptionOrNull()
+    assertTrue("重複註冊應被拒絕（IAE）：$thrown", thrown is IllegalArgumentException)
+    assertEquals("拒絕不得改動註冊表", before, ToolRegistry.all())
+  }
+
   // ---- 1. 導航 ----
 
   @Test fun navigate_placeQuery_mapsToGeoIntent() {

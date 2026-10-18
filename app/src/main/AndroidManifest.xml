@@ -45,7 +45,9 @@
              件事，見各工具 KDoc）。開 App 的 launcher 清單查詢仍刻意不宣告
              （見 LaunchAppTool KDoc 的缺口註記）。
              - SET_ALARM：執行期 Intent 無 data，action-only 即可匹配時鐘 App。
-             - INSERT/EDIT：執行期帶 content URI 但無顯式 type；以
+             - INSERT/EDIT：執行期帶 content URI「＋顯式 dir/item type」（與本
+               mimeType 條目精確對應，PM 級匹配不依賴 provider-resolve，見
+               CalendarTool.buildInsertIntent 註記）；以
                CalendarContract.Events.CONTENT_TYPE（dir/event）/
                CONTENT_ITEM_TYPE（item/event）匹配日曆 App 過濾器；queries 的
                path 屬性一律視為 *，故不寫 data URI。

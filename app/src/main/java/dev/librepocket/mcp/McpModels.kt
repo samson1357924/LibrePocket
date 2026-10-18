@@ -126,4 +126,16 @@ data class McpCallResult(
         "latencyMs" to latencyMs,
         "isError" to isError,
     )
+
+    /**
+     * 隱私覆寫：data class 自動 [toString] 會把 [resultJson]（結果原文）與
+     * [errorMessage]（伺服器訊息）一併帶進日誌/crash report——違反「原文不落盤」
+     * 不變式（[auditMap] 已刻意排除兩者）。此處以佔位符取代原文，僅保留判錯所需
+     * 的狀態欄位。稽核一律走 [auditMap]，不走 [toString]。
+     */
+    override fun toString(): String =
+        "McpCallResult(serverId=$serverId, tool=$tool, status=$status, " +
+            "latencyMs=$latencyMs, isError=$isError, " +
+            "resultJson=<${resultJson?.length ?: 0} chars>, " +
+            "errorMessage=<${errorMessage?.length ?: 0} chars>)"
 }

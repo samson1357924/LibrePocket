@@ -1,0 +1,161 @@
+package dev.librepocket.mcp
+
+import dev.librepocket.keystore.KeyVault
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * Stage4 多伺服器聚合（[McpRegistry]）契約：
+ * - `ids()`／`get()` 逐服索引（命中回同實例、缺席回 null）；
+ * - `listAll()` 聚合各服獨立結果（一服失敗不牽連他服——逐服獨立熔斷）；
+ * - 逐服 timeout 為上限（非總量），呼叫方另包總超時。
+ *
+ * 全程 MockWebServer（回環），不連外網。
+ */
+class McpRegistryTest {
+
+    private class FakeVault : KeyVault {
+        override suspend fun putKey(providerId: String, apiKey: CharArray) = Unit
+        override suspend fun getKey(providerId: String): CharArray? = "sekret-token-1".toCharArray()
+        override suspend fun deleteKey(providerId: String) = Unit
+        override suspend fun hasKey(providerId: String): Boolean = true
+    }
+
+    private fun goodListBody(): String =
+        """{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"search","description":"d","inputSchema":{"type":"object"}}]}}"""
+
+    private fun server(web: MockWebServer, id: String): McpServer = McpServer(
+        config = McpServerConfig(id = id, baseUrl = web.url("/").toString()),
+        keyVault = FakeVault(),
+        transport = McpTransport(),
+        breaker = McpCircuitBreaker(),
+    )
+
+    @Test fun idsAndGetIndexRegisteredServers() {
+        val webA = MockWebServer()
+        val webB = MockWebServer()
+        webA.start()
+        webB.start()
+        try {
+            val a = server(webA, "a")
+            val b = server(webB, "b")
+            val reg = McpRegistry(mapOf("a" to a, "b" to b))
+            assertEquals(setOf("a", "b"), reg.ids())
+            // 命中回同實例（identity），缺席回 null。
+            assertSame(a, reg.get("a"))
+            assertSame(b, reg.get("b"))
+            assertNull("未註冊 id 必須回 null", reg.get("zzz"))
+        } finally {
+            webA.shutdown()
+            webB.shutdown()
+        }
+    }
+
+    @Test fun emptyRegistryHasNoIds() {
+        val reg = McpRegistry(emptyMap())
+        assertTrue(reg.ids().isEmpty())
+        assertNull(reg.get("a"))
+    }
+
+    @Test fun listAllAggregatesIndependentResults() = runBlocking {
+        val webA = MockWebServer()
+        val webB = MockWebServer()
+        webA.start()
+        webB.start()
+        try {
+            // A 服正常回 tools/list；B 服回畸形（tools 非陣列）→ 各自獨立結果。
+            webA.enqueue(MockResponse().setResponseCode(200).setBody(goodListBody()))
+            webB.enqueue(
+                MockResponse().setResponseCode(200)
+                    .setBody("""{"jsonrpc":"2.0","id":1,"result":{"tools":"oops"}}"""),
+            )
+            val reg = McpRegistry(mapOf("a" to server(webA, "a"), "b" to server(webB, "b")))
+            val got = withTimeoutOrNull(8_000) { reg.listAll() }
+            assertNotNull("listAll 必須在 8s 內回傳", got)
+            assertEquals(setOf("a", "b"), got!!.keys)
+            assertEquals("A 服獨立成功（OK）", McpStatus.OK, got.getValue("a").status)
+            assertEquals(1, got.getValue("a").tools.size)
+            assertEquals("B 服畸形獨立失敗（PROTOCOL），不牽連 A", McpStatus.PROTOCOL, got.getValue("b").status)
+            assertTrue(got.getValue("b").tools.isEmpty())
+        } finally {
+            webA.shutdown()
+            webB.shutdown()
+        }
+    }
+
+    @Test fun listAllOneServerCircuitOpenDoesNotAffectOthers() = runBlocking {
+        val webA = MockWebServer()
+        val webDown = MockWebServer()
+        webA.start()
+        webDown.start()
+        try {
+            // 先把 down 服連續打掛（3 次 400 → PROTOCOL + 開路），再驗 listAll 仍聚合兩服。
+            repeat(3) { webDown.enqueue(MockResponse().setResponseCode(400).setBody("bad")) }
+            webA.enqueue(MockResponse().setResponseCode(200).setBody(goodListBody()))
+            val down = server(webDown, "down")
+            // 逐服獨立：down 服開路後，其後續呼叫短路為 CIRCUIT_OPEN。
+            repeat(3) { down.listTools() }
+            assertTrue("down 服熔斷應已開路", down.breaker().isOpen())
+            // listAll 仍聚合：a 服 OK，down 服 CIRCUIT_OPEN（開路短路）。
+            val reg = McpRegistry(mapOf("a" to server(webA, "a"), "down" to down))
+            val got = withTimeoutOrNull(8_000) { reg.listAll() }
+            assertNotNull(got)
+            assertEquals(McpStatus.OK, got!!.getValue("a").status)
+            assertEquals("開路服短路為 CIRCUIT_OPEN", McpStatus.CIRCUIT_OPEN, got.getValue("down").status)
+            // 反向獨立：a 服成功不得重置他服熔斷——listAll 後 down 服仍應開路。
+            //（若 listAll 誤加 servers.values.forEach { breaker.reset() }，此斷言紅。）
+            assertTrue("他服成功不得重置 down 服熔斷", down.breaker().isOpen())
+        } finally {
+            webA.shutdown()
+            webDown.shutdown()
+        }
+    }
+
+    @Test fun listAllIsDisabledWhenServerDisabled() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            val disabled = McpServer(
+                config = McpServerConfig(id = "off", baseUrl = web.url("/").toString(), enabled = false),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+            )
+            val reg = McpRegistry(mapOf("off" to disabled))
+            val got = withTimeoutOrNull(5_000) { reg.listAll() }
+            assertNotNull(got)
+            assertEquals("停用服回 DISABLED（不發送）", McpStatus.DISABLED, got!!.getValue("off").status)
+            assertEquals("不發送任何請求", 0, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun listAllAcceptsTimeoutParamOnHappyPath() = runBlocking {
+        // 注意：本測試只驗 listAll 接受 timeoutMs 參數並走通呼叫路徑（快速回應，
+        // 不觸發超時）。它**不**宣稱驗證 timeoutMs 真的逐服轉發——那需 ≥15s 延遲
+        // 或可注入 fake server（McpServer 為 final），超出單元測試範圍，故不以
+        // 「forward」命名誤導（外部 review P2）。
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(MockResponse().setResponseCode(200).setBody(goodListBody()))
+            val reg = McpRegistry(mapOf("a" to server(web, "a")))
+            // timeoutMs 鉗 15–30s：傳 MIN_MS 仍成功。
+            val got = withTimeoutOrNull(8_000) { reg.listAll(McpTimeouts.MIN_MS) }
+            assertNotNull(got)
+            assertEquals(McpStatus.OK, got!!.getValue("a").status)
+            assertEquals(1, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+}

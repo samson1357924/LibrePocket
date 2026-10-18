@@ -60,12 +60,12 @@ class McpScopeTest {
     }
 
     @Test fun readNeedsNoConfirm() {
-        val p = McpScope.project(open, "lookup", sideEffect = SideEffect.READ)
+        val p = McpScope.project(open, "lookup")
         assertTrue(McpScope.canExecute(open, "lookup", false, p, SideEffect.READ))
     }
 
     @Test fun privilegedNeedsConfirm() {
-        val p = McpScope.project(open, "exec", sideEffect = SideEffect.PRIVILEGED)
+        val p = McpScope.project(open, "exec")
         assertEquals(
             McpGate.NeedConfirm("mcp.s1.exec"),
             McpScope.check(open, "exec", false, p, SideEffect.PRIVILEGED),
@@ -106,5 +106,79 @@ class McpScopeTest {
 
     @Test fun switchKeyShape() {
         assertEquals("mcp.s1.search", McpScope.switchKey("s1", "search"))
+    }
+
+    // ---- Stage4: toToolDef inputSchema 透傳 + executionReady fail-closed pins ----
+
+    @Test fun toToolDefPassesInputSchemaThrough() {
+        val schema = """{"type":"object","properties":{"q":{"type":"string"}}}"""
+        val def = McpScope.toToolDef("s1", "search", inputSchema = schema)
+        assertEquals("遠端 inputSchema 必須原樣透傳給 ToolDef.jsonSchema", schema, def.jsonSchema)
+    }
+
+    @Test fun toToolDefDefaultsToMinimalObjectSchema() {
+        // 伺服器未宣告 schema 時退最小 {"type":"object"}。交叉斷言：預設須與
+        // McpTool.inputSchema 的預設**逐字元相同**——若任一邊漂移（如加空白），
+        // 本斷言即紅，避免兩個自釘字面值各自漂移卻無人發現。
+        assertEquals("""{"type":"object"}""", McpScope.toToolDef("s1", "search").jsonSchema)
+        assertEquals(
+            "toToolDef 預設 jsonSchema 必須等於 McpTool.inputSchema 預設",
+            McpTool(serverId = "s1", name = "search").inputSchema,
+            McpScope.toToolDef("s1", "search").jsonSchema,
+        )
+    }
+
+    @Test fun toToolDefIsNotExecutionReady() {
+        // 顯式雙閘 fail-closed：MCP 工具未接線前一律不可被模型看見（visibleTools 需
+        // executionReady=true）。若接線翻轉此旗標，本測試紅以提醒逐項審查。
+        assertFalse("MCP toToolDef 必須 executionReady=false（未接線，模型不可見）",
+            McpScope.toToolDef("s1", "search").executionReady)
+        assertFalse(McpScope.toToolDef("s1", "search", inputSchema = """{"type":"object"}""").executionReady)
+    }
+
+    @Test fun toToolDefRequiresSwitchAndSideEffect() {
+        val def = McpScope.toToolDef("s1", "search")
+        assertEquals(SideEffect.WRITE, def.sideEffect)
+        assertEquals("mcp.s1.search", def.annotations.requiresSwitch)
+        assertTrue(def.annotations.switchDefault)
+        // fallbackHint 預設值（降級時對使用者的替代指引）釘住，避免靜默清空。
+        assertEquals("ask the user to enable or confirm the MCP tool manually", def.annotations.fallbackHint)
+    }
+
+    @Test fun toToolDefInterpolatesServerAndToolName() {
+        // 參數化盲點：前兩組測試都用 ("s1","search")（正是開關鍵字面），若 name/
+        // requiresSwitch 被硬編碼成 "mcp.s1.search" 而非插值，前測仍綠。改用不同組
+        // 釘住插值正確。
+        val def = McpScope.toToolDef("srv2", "other")
+        assertEquals("mcp.srv2.other", def.name)
+        assertEquals("mcp.srv2.other", def.annotations.requiresSwitch)
+    }
+
+    // ---- Stage4: toString 隱私覆寫（resultJson/errorMessage 不進日誌） ----
+
+    @Test fun callResultToStringRedactsResultAndErrorMessage() {
+        val r = McpCallResult(
+            serverId = "s1",
+            tool = "search",
+            status = McpStatus.OK,
+            latencyMs = 12L,
+            resultJson = """{"data":"s3cr3t-result"}""",
+            isError = true,
+            errorMessage = "s3cr3t-error-detail",
+        )
+        val s = r.toString()
+        assertFalse("toString 不得外洩 resultJson 原文", s.contains("s3cr3t-result"))
+        assertFalse("toString 不得外洩 errorMessage 原文", s.contains("s3cr3t-error-detail"))
+        // 仍保留判錯所需狀態欄位。
+        assertTrue(s.contains("s1") && s.contains("search") && s.contains("OK"))
+        assertTrue("latencyMs 必須保留", s.contains("latencyMs=12"))
+        assertTrue("isError 必須保留", s.contains("isError=true"))
+        // 佔位符格式釘住：<N chars>（非 "<redacted>"——保留觀測性，僅去除原文）。
+        assertTrue("resultJson 佔位符須為 <N chars> 形", s.contains("resultJson=<24 chars>"))
+        assertTrue("errorMessage 佔位符須為 <N chars> 形", s.contains("errorMessage=<19 chars>"))
+        // null resultJson 亦不得變成 "null" 字樣外洩結構（維持 <0 chars>）。
+        val nullResult = McpCallResult("s1", "t", McpStatus.OK, 1L)
+        assertFalse(nullResult.toString().contains("resultJson=null"))
+        assertTrue(nullResult.toString().contains("resultJson=<0 chars>"))
     }
 }

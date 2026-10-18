@@ -35,12 +35,22 @@ object McpScope {
     fun switchKey(serverId: String, toolName: String): String =
         "$SWITCH_PREFIX$serverId.$toolName"
 
-    /** 第三方工具轉內建 [ToolDef] 視圖（預設 WRITE），便於複用 Schema/轉錄鏈路。 */
-    fun toToolDef(serverId: String, toolName: String, sideEffect: SideEffect = SideEffect.WRITE): ToolDef =
+    /**
+     * 第三方工具轉內建 [ToolDef] 視圖（預設 WRITE），便於複用 Schema/轉錄鏈路。
+     *
+     * @param inputSchema 遠端 `tools/list` 回傳的 JSON Schema 文本（[McpTool.inputSchema]），
+     *   原樣透傳給內建 Schema 校驗鏈路；預設最小 `{"type":"object"}`（伺服器未宣告時）。
+     */
+    fun toToolDef(
+        serverId: String,
+        toolName: String,
+        sideEffect: SideEffect = SideEffect.WRITE,
+        inputSchema: String = """{"type":"object"}""",
+    ): ToolDef =
         ToolDef(
             name = "mcp.$serverId.$toolName",
             description = "Third-party MCP tool $toolName on server $serverId (default WRITE).",
-            jsonSchema = """{"type": "object"}""",
+            jsonSchema = inputSchema,
             sideEffect = sideEffect,
             // 顯式雙閘：即使將來接線，模型仍不可見（須 wiring PR 逐項翻轉）。
             executionReady = false,
@@ -51,12 +61,11 @@ object McpScope {
             ),
         )
 
-    /** 純函數投影：相同輸入必得相同輸出。 */
+    /** 純函數投影：相同輸入必得相同輸出。`sideEffect` 不影響投影（投影只看開關/啟用），故不收此參數。 */
     fun project(
         config: McpServerConfig,
         toolName: String,
         ctx: ProjectionContext = ProjectionContext(),
-        sideEffect: SideEffect = SideEffect.WRITE,
     ): Projection {
         val qualified = "mcp.${config.id}.$toolName"
         if (!config.enabled || !config.isToolEnabled(toolName)) {

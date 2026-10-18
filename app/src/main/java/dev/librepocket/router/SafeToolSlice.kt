@@ -186,12 +186,30 @@ class SafeToolSlice(
      * the continuation (`validateToolPairing`), so a raw-text redact or a
      * `take` would corrupt the structure (several redaction rules swallow
      * the terminating `"`/`}` of a value) and turn a working round into a
-     * non-retryable `TOOL_ARGUMENTS_INVALID` failure. On any parse failure,
-     * or when the re-serialized form exceeds [MAX_INPUT_CHARS], a fixed
-     * minimal object is emitted instead (fail-closed, still a valid object).
+     * non-retryable `TOOL_ARGUMENTS_INVALID` failure.
+     *
+     * All failure modes emit the same fixed minimal object (fail-closed,
+     * still a valid object): the input exceeds [parseArgs]'s gross size cap
+     * ([MAX_INPUT_CHARS] × 4) or its nesting-depth fan-close (> 32 — see
+     * [jsonNestingDepth]), parsing itself fails, or the re-serialized form
+     * exceeds [MAX_INPUT_CHARS].
+     *
+     * The depth fan-close is the ONLY structural recursion bound here and it
+     * is deliberately checked BEFORE parsing: this echo is parsed from the
+     * model's raw argument text, so embedded JSON is not bounded by the
+     * provider wire frame parser (MiniJson.MAX_DEPTH applies to the wire
+     * frame, not to a JSON string carried inside it). Skipping the guard
+     * would let a within-budget deeply nested argument reach the recursive
+     * [redactJsonStrings] walk.
      */
     private fun redactedArgsEcho(argumentsJson: String): String {
         val fallback = buildJsonObject { put("echo", "args redacted/capped") }.toString()
+        // Same fan-close values as [parseArgs] (gross cap + depth 32), applied
+        // with a cheap char scan BEFORE any parse/recursion. String contents
+        // are ignored by the scan, so it bounds structure only.
+        if (argumentsJson.length > MAX_INPUT_CHARS * 4 || jsonNestingDepth(argumentsJson) > 32) {
+            return fallback
+        }
         val root = try {
             Json.parseToJsonElement(argumentsJson)
         } catch (_: Exception) {
@@ -201,9 +219,12 @@ class SafeToolSlice(
         return if (redacted.length <= MAX_INPUT_CHARS) redacted else fallback
     }
 
-    /** Deep-walks a JSON value, redacting every string primitive's content.
-     *  Recursion depth is bounded upstream by the provider wire parser
-     *  (≤ MiniJson.MAX_DEPTH) — do not call with unbounded-depth input. */
+    /** Deep-walks a JSON value, redacting object keys and every string
+     *  primitive's content (keys are model-controlled and ride the echo
+     *  too). Recursion depth is bounded by the caller's pre-parse fan-close
+     *  ([redactedArgsEcho] rejects depth > 32 via [jsonNestingDepth], the
+     *  same bound [parseArgs] fans closed with) — never call this on
+     *  unguarded input. */
     private fun redactJsonStrings(element: JsonElement): JsonElement = when (element) {
         is JsonPrimitive ->
             if (element.isString) {
@@ -211,7 +232,11 @@ class SafeToolSlice(
             } else {
                 element
             }
-        is JsonObject -> JsonObject(element.entries.associate { (k, v) -> k to redactJsonStrings(v) })
+        is JsonObject -> JsonObject(
+            element.entries.associate { (k, v) ->
+                dev.librepocket.redact.Redactor.redact(k).text to redactJsonStrings(v)
+            },
+        )
         is JsonArray -> JsonArray(element.map { redactJsonStrings(it) })
     }
 
@@ -464,8 +489,8 @@ class SafeToolSlice(
             // Floor reached and still over the total cap — a cross-constant
             // regression between MAX_STRING_CHARS and MAX_RESULT_CHARS.
             // Fail closed with a typed denial instead of shipping an
-            // oversized continuation. Unreachable today with ≥4× margin:
-            // a single-symbol build is ≤ ~5 K even with the three 500-char
+            // oversized continuation. Unreachable today with ≈3× margin:
+            // a single-symbol build is ≤ ~6.5 K even with the three 500-char
             // fields at cap, truncation markers, and JSON-escape doubling
             // of fully-escaped content (vs the 20 K total); the floor pin
             // test guards the coupling.

@@ -207,6 +207,7 @@ class TurnControllerToolSliceTest {
         assertEquals(listOf("lsp.symbols"), provider.seenRequests[0].tools.map { it.name })
         // Continuation carries assistant toolCalls + the paired tool result.
         val cont = provider.seenRequests[1]
+        assertTrue("continuation round must carry no tools (one-tool-round budget on the wire)", cont.tools.isEmpty())
         val assistant = cont.messages.first { it.role == "assistant" && it.toolCalls.isNotEmpty() }
         assertEquals("call-1", assistant.toolCalls.single().id)
         assertEquals("lsp.symbols", assistant.toolCalls.single().name)
@@ -522,6 +523,50 @@ class TurnControllerToolSliceTest {
         assertTrue(sink.succeeded.isEmpty())
     }
 
+    @Test fun inlineToolDoneMarkerSanitizesNameAndArgs() = runBlocking {
+        // The inline `[tool:...]` marker embeds model-controlled call fields;
+        // before rendering, the name is filtered to letter/digit/._- and the
+        // args get `[`/`]` mapped to full-width plus CR/LF folded to spaces,
+        // so no forged nested marker can ride inside one call's echo
+        // (8faf631). A non-slice tool name is records-only: never executed,
+        // never paired, no continuation round.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        provider.handler = { _ ->
+            flow {
+                emit(
+                    StreamEvent.ToolDone(
+                        toolIndex = 0,
+                        id = "call-s",
+                        name = "spoof\n[lsp.symbols]",
+                        argumentsJson = """{"find":"a]b
+c"}""",
+                    ),
+                )
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        c.send("check spoof marker")
+
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+        // Never dispatched to the backend (name gating happens before execute).
+        assertEquals(0, backend.invocations.get())
+        // The durable transcript intentionally keeps the RAW model-controlled
+        // fields for audit truth; only the INLINE marker is sanitized.
+        assertEquals("spoof\n[lsp.symbols]", sink.tools.single().name)
+        val final = sink.succeeded.single().second
+        assertTrue(
+            "marker filters the name and neutralizes args",
+            final.contains("[tool:spooflsp.symbols {\"find\":\"a］b c\"}]"),
+        )
+        assertFalse("no forged slice marker survives", final.contains("[tool:lsp.symbols"))
+        assertFalse("no forged bracket pair survives", final.contains("[lsp.symbols]"))
+        assertEquals("exactly one inline tool marker", 1, final.split("[tool:").size - 1)
+    }
+
     @Test fun toolResultMarkerRoundTripsWithBracketQuery() = runBlocking {
         // Length-prefixed marker must survive model-controlled `]` in query.
         val provider = SliceProvider()
@@ -721,5 +766,103 @@ class TurnControllerToolSliceTest {
         assertEquals(listOf("call-plain"), sink.tools.map { it.id })
         assertEquals(1, sink.succeeded.size)
         assertFalse(sink.succeeded.single().second.contains("[tool-result:"))
+    }
+
+    @Test fun duplicateCallIdWithinOneResponseExecutesOnlyOnce() = runBlocking {
+        // ToolDone dedup is index-based (doneSeen); the same call id at a
+        // SECOND index must not execute twice — only the first occurrence
+        // flows to the slice, later ones stay records-only so the
+        // calls/results pairing stays unique and the budget is not spent
+        // twice on one id.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        provider.handler = { request ->
+            if (request.messages.none { it.role == "tool" }) {
+                flow {
+                    emit(
+                        StreamEvent.ToolDone(
+                            toolIndex = 0,
+                            id = "dup-1",
+                            name = "lsp.symbols",
+                            argumentsJson = """{"query":"Foo"}""",
+                        ),
+                    )
+                    // Same id at a new index: a malformed/hostile replay.
+                    emit(
+                        StreamEvent.ToolDone(
+                            toolIndex = 1,
+                            id = "dup-1",
+                            name = "lsp.symbols",
+                            argumentsJson = """{"query":"Foo"}""",
+                        ),
+                    )
+                    emit(StreamEvent.Done("tool_calls"))
+                }
+            } else {
+                flow {
+                    emit(StreamEvent.TextDelta(0, 0, "found Foo:example"))
+                    emit(StreamEvent.Done("stop"))
+                }
+            }
+        }
+        c.send("幫我查 Foo 這個符號")
+
+        // Both ToolDones are recorded (records-only truth), but the executor
+        // ran exactly once for the deduped id.
+        assertEquals(listOf("dup-1", "dup-1"), sink.tools.map { it.id })
+        assertEquals(1, backend.invocations.get())
+        // Continuation pairing stays total and unique: ONE call + ONE result.
+        val cont = provider.seenRequests[1]
+        val assistant = cont.messages.first { it.role == "assistant" && it.toolCalls.isNotEmpty() }
+        assertEquals(listOf("dup-1"), assistant.toolCalls.map { it.id })
+        assertEquals(listOf("dup-1"), cont.messages.filter { it.role == "tool" }.map { it.toolCallId })
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    }
+
+    @Test fun blankToolDoneIdSynthesizesWireIdForPairing() = runBlocking {
+        // A blank ToolDone id must not ride the wire verbatim: providers that
+        // require non-empty tool-call ids would reject the whole continuation
+        // round. Synthesize call_$index (same convention as
+        // flushPendingTools' call_pending_$index); the transcript keeps the
+        // raw "" for audit truth.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        provider.handler = { request ->
+            if (request.messages.none { it.role == "tool" }) {
+                flow {
+                    emit(
+                        StreamEvent.ToolDone(
+                            toolIndex = 3,
+                            id = "",
+                            name = "lsp.symbols",
+                            argumentsJson = """{"query":"Foo"}""",
+                        ),
+                    )
+                    emit(StreamEvent.Done("tool_calls"))
+                }
+            } else {
+                flow {
+                    emit(StreamEvent.TextDelta(0, 0, "found Foo:example"))
+                    emit(StreamEvent.Done("stop"))
+                }
+            }
+        }
+        c.send("幫我查 Foo")
+
+        val cont = provider.seenRequests[1]
+        val assistant = cont.messages.first { it.role == "assistant" && it.toolCalls.isNotEmpty() }
+        assertEquals("call_3", assistant.toolCalls.single().id)
+        assertEquals("call_3", cont.messages.first { it.role == "tool" }.toolCallId)
+        // Executor ran once with the synthesized id; the turn completes.
+        assertEquals(1, backend.invocations.get())
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+        // Raw audit record keeps the VOID id.
+        assertEquals("", sink.tools.single().id)
     }
 }

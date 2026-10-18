@@ -918,7 +918,10 @@ class TurnController(
   /**
    * R5-5: [lastRequestTrimmedCount] as a StateFlow, emitted synchronously in
    * [buildRequest] alongside the AtomicInteger set (one emission per attempt,
-   * at most 4 per send — negligible cost; last attempt wins). Distinct from
+   * at most 4 per send — negligible cost; last attempt wins); a tool
+   * continuation (`buildToolContinuation`) additionally emits its total once
+   * per tool round, adding the continuation's own prefix trim on top of the
+   * base request's count. Distinct from
    * the load-time [droppedHistoryCount] (DB tail cap): this counts send-time
    * per-request 100k-char trims. Never summed with resume omission; surfaced
    * via ChatSession/VM as `requestTrimmedCount`. Rejections before any request
@@ -4997,13 +5000,17 @@ class TurnController(
    * many small ToolDeltas across many indexes must still trip the shared
    * budget. Monotonic within the attempt (ToolDone arrivals never
    * decrement it); retries start a fresh attempt with fresh counters.
+   * `seenCallIds` additionally dedups the execution path by call id (a
+   * duplicate id at two indexes executes once; later occurrences stay
+   * records-only so calls/results pairing stays unique).
    *
    * Per-attempt visible-text budget (#94): text/reasoning deltas check
-   * [requireTurnTextBudget] against [visibleTextChars] before buffering
-   * (the tripping delta is never retained and never counted); tool markers
-   * are excluded (their own budgets live in the tool-agg fields above). The
+   * [requireTurnTextBudget] against [visibleTextChars] before buffering (the
+   * tripping delta is never retained and never counted); tool markers are
+   * excluded (their own budgets live in the tool-agg fields above). The
    * budget accumulates across the tool-continuation rounds of one attempt
-   * (seeded by [collectToolContinuation]).
+   * (seeded by [collectToolContinuation]) — retries start a fresh attempt
+   * with fresh counters.
    */
   private class ToolAggState(
     var totalChars: Int = 0,
@@ -5013,6 +5020,7 @@ class TurnController(
     val idText: MutableMap<Int, StringBuilder> = mutableMapOf(),
     val nameText: MutableMap<Int, StringBuilder> = mutableMapOf(),
     val doneSeen: MutableSet<Int> = mutableSetOf(),
+    val seenCallIds: MutableSet<String> = mutableSetOf(),
   )
 
   /** Outcome of one shared stream collect: terminal failure (if any) plus Done. */
@@ -5155,10 +5163,27 @@ class TurnController(
     // (after a successful collect, same turn); everything else stays
     // records-only even when a loop is attached. A null callback means
     // record-only (tool continuation second round).
-    if (onWiredToolDone != null && toolSlice != null && event.name == SafeToolSlice.TOOL_NAME) {
+    // Execution-path id intake hardening:
+    // (a) a duplicate call id within one response executes only once —
+    //     later occurrences stay records-only so calls/results pairing
+    //     stays unique (dedup by wire id, not index);
+    // (b) a blank id synthesizes the deterministic per-index wire id
+    //     (`call_${event.toolIndex}`): the
+    //     internal pairing validator (ProviderJson TOOL_CALL_MISSING_ID /
+    //     TOOL_CALL_DUPLICATE_ID, non-retryable) and providers alike fail
+    //     closed on an empty tool-call id. The transcript record above
+    //     deliberately keeps the RAW event id for audit truth.
+    val wireId = event.id.ifBlank { "call_${event.toolIndex}" }
+    if (
+      onWiredToolDone != null &&
+      toolSlice != null &&
+      event.name == SafeToolSlice.TOOL_NAME &&
+      wireId !in state.seenCallIds
+    ) {
+      state.seenCallIds.add(wireId)
       onWiredToolDone(
         dev.librepocket.provider.ToolCall(
-          id = event.id,
+          id = wireId,
           name = event.name,
           argumentsJson = event.argumentsJson,
         ),
@@ -5368,9 +5393,18 @@ class TurnController(
    * structured tool round (assistant `toolCalls` + paired `tool` results —
    * pairing is total within one executed round). Markers stay inline in the
    * assistant text AND the structured round rides alongside (double carry;
-   * only the inline markers survive into the next attempt). Tools stay
-   * attached (same offer): a second model tool call is recorded but never
-   * executed (one tool round per turn).
+   * only the inline markers survive into the next attempt). NO tools are
+   * advertised (`allowTools = false`): the continuation request carries no
+   * `tools` array. If the model still emits a second-round call it is
+   * recorded (markers + transcript, `onWiredToolDone = null`) but never
+   * executed — the one-tool-round-per-turn budget holds on the wire, not
+   * only in code.
+   *
+   * When the structured round pushes the request past [MAX_REQUEST_CHARS],
+   * history-prefix trimming (oldest-first, whole messages, tool pairing kept
+   * atomic) is additionally published on [lastRequestTrimmedCount]/[requestTrimmedCount]
+   * as the total head trim of the outgoing request (added on top of the
+   * base request's own emission) — never silent.
    */
   private fun buildToolContinuation(
     images: List<ChatImageRef>,
@@ -5390,6 +5424,16 @@ class TurnController(
       drop++
     }
     val finalBase = if (drop > 0) baseMessages.drop(drop) else baseMessages
+    // Publish the continuation's own prefix trim (never silent): buildRequest
+    // already emitted the base request's context-window trim, so this adds on
+    // top — lastRequestTrimmedCount then reflects the TOTAL head trim of the
+    // outgoing continuation request. Single-writer (same coroutine), so the
+    // read-add-set is exact.
+    if (drop > 0) {
+      val total = _lastRequestTrimmedCount.get() + drop
+      _lastRequestTrimmedCount.set(total)
+      _requestTrimmedCount.value = total
+    }
     return base.copy(messages = finalBase + contMessages)
   }
 
@@ -5441,6 +5485,13 @@ class TurnController(
    * copy of the last user message only. No user message means no injection
    * (never fabricates a message for the clock). UI state and transcript keep
    * the raw user text.
+   *
+   * `allowTools` gates the structured `tools` offer: `true` (attempt round,
+   * default) offers the slice tool when the loop is attached; the tool
+   * continuation round passes `false` so the wire carries NO tool array
+   * (one-tool-round-per-turn enforced on the request shape). Kotlin default
+   * args compile to a SINGLE JVM method `(List, boolean)` (+ the `$default`
+   * bridge) — reflection callers must use the two-param signature.
    */
   private fun buildRequest(images: List<ChatImageRef>, allowTools: Boolean = true): ChatRequest {
     val live = _uiState.value.messages

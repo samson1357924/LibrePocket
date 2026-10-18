@@ -149,9 +149,6 @@ class FastRouter(
 
     private data class TemplateMatch(val toolName: String, val argumentsJson: String)
 
-    private fun jsonText(text: String): String =
-        "{\"text\": \"${esc(text)}\"}"
-
     private fun matchTemplate(text: String): TemplateMatch? {
         if (text.isEmpty()) return null
         // Slow-lane intents resolve to the automation descriptor so projection
@@ -165,15 +162,12 @@ class FastRouter(
         return null
     }
 
-    private fun containsAny(text: String, hints: List<Regex>): Boolean =
-        hints.any { it.containsMatchIn(text) }
-
     companion object {
         private fun r(pattern: String): Regex = Regex(pattern, RegexOption.IGNORE_CASE)
 
         // Template hints, precompiled once per process: these lists were
-        // per-instance vals (recompiling ~60 patterns per FastRouter()), but
-        // decide() is a hot path — hoisted with identical patterns.
+        // per-instance vals (recompiling 100+ patterns per FastRouter()),
+        // but decide() is a hot path — hoisted with identical patterns.
         private val SCREENSHOT_HINTS = listOf(r("截圖"), r("截图"), r("擷取"), r("screenshot"), r("螢幕.*存"), r("屏幕.*存"))
         private val NOTIFICATION_HINTS = listOf(r("通知"), r("notification"), r("未讀"), r("未读"), r("訊息中心"))
         private val ALARM_HINTS = listOf(r("鬧鐘"), r("闹钟"), r("alarm"), r("定時.*響"), r("定时.*响"), r("提醒.*點"), r("提醒.*点"))
@@ -221,146 +215,158 @@ class FastRouter(
         private val MUSIC_PAUSE = Regex("暫停|暂停|pause", RegexOption.IGNORE_CASE)
         private val VOLUME_MUTE = Regex("靜音|静音|mute", RegexOption.IGNORE_CASE)
         private val VOLUME_LEVEL = Regex("(\\d{1,3})")
-    }
 
-    private val RULES: List<Triple<String, List<Regex>, (String) -> String>> = listOf(
-        Triple(
-            "screenshot.capture",
-            SCREENSHOT_HINTS,
-            { t -> "{\"share\": false, \"text\": \"${esc(t)}\"}" },
-        ),
-        Triple(
-            "notification.read",
-            NOTIFICATION_HINTS,
-            { t -> "{\"limit\": 10, \"text\": \"${esc(t)}\"}" },
-        ),
-        Triple(
-            "alarm.create",
-            ALARM_HINTS,
-            { t -> alarmArgs(t) },
-        ),
-        Triple(
-            "phone.dial",
-            PHONE_HINTS,
-            { t -> phoneArgs(t) },
-        ),
-        Triple(
-            "sms.compose",
-            SMS_HINTS,
-            { t -> "{\"to\": \"\", \"body\": \"${esc(t)}\", \"raw\": \"${esc(t)}\"}" },
-        ),
-        Triple(
-            "mail.compose",
-            MAIL_HINTS,
-            { t -> "{\"to\": \"\", \"subject\": \"\", \"body\": \"${esc(t)}\"}" },
-        ),
-        Triple(
-            "calendar.create",
-            CALENDAR_HINTS,
-            { t -> "{\"title\": \"${esc(t)}\", \"start\": \"\", \"end\": \"\"}" },
-        ),
-        Triple(
-            "music.control",
-            MUSIC_HINTS,
-            { t -> "{\"action\": \"${musicAction(t)}\", \"text\": \"${esc(t)}\"}" },
-        ),
-        Triple(
-            "volume.set",
-            VOLUME_HINTS,
-            { t -> volumeArgs(t) },
-        ),
-        Triple(
-            "navigate",
-            NAVIGATE_HINTS,
-            { t -> "{\"destination\": \"${esc(t)}\", \"mode\": \"driving\"}" },
-        ),
-        Triple(
-            "open_app",
-            OPEN_APP_HINTS,
-            { t -> "{\"appName\": \"${esc(t)}\", \"packageName\": \"\"}" },
-        ),
-    )
+        // FastRouter template rules + arg builders, hoisted to the
+        // companion with the hint regexes (Stage C completion): the
+        // 11-entry rule list and the builder closures stop allocating
+        // per FastRouter(); decide() is a hot path. The shared JSON/esc
+        // helpers and the phone finder live here too so the RULES lambdas
+        // never capture the instance.
+        private val RULES: List<Triple<String, List<Regex>, (String) -> String>> = listOf(
+            Triple(
+                "screenshot.capture",
+                SCREENSHOT_HINTS,
+                { t -> "{\"share\": false, \"text\": \"${esc(t)}\"}" },
+            ),
+            Triple(
+                "notification.read",
+                NOTIFICATION_HINTS,
+                { t -> "{\"limit\": 10, \"text\": \"${esc(t)}\"}" },
+            ),
+            Triple(
+                "alarm.create",
+                ALARM_HINTS,
+                { t -> alarmArgs(t) },
+            ),
+            Triple(
+                "phone.dial",
+                PHONE_HINTS,
+                { t -> phoneArgs(t) },
+            ),
+            Triple(
+                "sms.compose",
+                SMS_HINTS,
+                { t -> "{\"to\": \"\", \"body\": \"${esc(t)}\", \"raw\": \"${esc(t)}\"}" },
+            ),
+            Triple(
+                "mail.compose",
+                MAIL_HINTS,
+                { t -> "{\"to\": \"\", \"subject\": \"\", \"body\": \"${esc(t)}\"}" },
+            ),
+            Triple(
+                "calendar.create",
+                CALENDAR_HINTS,
+                { t -> "{\"title\": \"${esc(t)}\", \"start\": \"\", \"end\": \"\"}" },
+            ),
+            Triple(
+                "music.control",
+                MUSIC_HINTS,
+                { t -> "{\"action\": \"${musicAction(t)}\", \"text\": \"${esc(t)}\"}" },
+            ),
+            Triple(
+                "volume.set",
+                VOLUME_HINTS,
+                { t -> volumeArgs(t) },
+            ),
+            Triple(
+                "navigate",
+                NAVIGATE_HINTS,
+                { t -> "{\"destination\": \"${esc(t)}\", \"mode\": \"driving\"}" },
+            ),
+            Triple(
+                "open_app",
+                OPEN_APP_HINTS,
+                { t -> "{\"appName\": \"${esc(t)}\", \"packageName\": \"\"}" },
+            ),
+        )
 
-    private fun isNegated(text: String): Boolean = containsAny(text, NEGATION_HINTS)
+        private fun jsonText(text: String): String =
+            "{\"text\": \"${esc(text)}\"}"
 
-    private fun hasExplicitAlarmTime(text: String): Boolean =
-        ALARM_TIME.containsMatchIn(text)
+        private fun findPhoneCandidate(text: String): String? =
+            PHONE_CANDIDATE.findAll(text)
+                .maxByOrNull { m -> m.value.count { it.isDigit() } }
+                ?.value
 
-    private fun findPhoneCandidate(text: String): String? =
-        PHONE_CANDIDATE.findAll(text)
-            .maxByOrNull { m -> m.value.count { it.isDigit() } }
-            ?.value
-
-    private fun hasPhoneNumber(text: String): Boolean {
-        val raw = findPhoneCandidate(text) ?: return false
-        // Require a real digit run: a bare "+" with spaces/punctuation is not
-        // a number, and a single stray digit among punctuation is not either.
-        val digits = raw.count { it.isDigit() }
-        return digits >= 7
-    }
-
-    /**
-     * Stage1 缺參門（本輪封閉集，措辭收斂：只斷言此四項，不推及其他工具）：
-     * 缺 alarm 時間（不預設 7:00）、缺 phone 號碼（不送空字串）、
-     * `sms.compose`（to 恆空，待收件者抽取落地前一律補參）、`calendar.create`
-     *（start/end 恆空，待日期解析落地前一律補參）。回傳問句即需澄清，null
-     * 即參數齊備（進接線門）。
-     *
-     * 範圍註記：`mail.compose`（to/subject 模板恆空）與 `open_app`
-     *（packageName 模板恆空）同屬空欄位形狀，但本輪不在缺參門內（後續收件者／
-     * 包名抽取落地後再收斂）；此二者仍被接線門以 USER_DISABLED 拒絕，絕不執行。
-     */
-    private fun missingQuestionFor(toolName: String, text: String): String? = when (toolName) {
-        "alarm.create" ->
-            if (!hasExplicitAlarmTime(text)) "請問要設幾點的鬧鐘？例如「明天早上7點30分叫我」" else null
-        "phone.dial" ->
-            if (!hasPhoneNumber(text)) "請問要打給哪個號碼？例如「打電話給 0912345678」" else null
-        "sms.compose" ->
-            "請問簡訊要傳給誰？請補上收件號碼，例如「傳簡訊給 0912345678 說…」"
-        "calendar.create" ->
-            "請問行程的時間是？請補上日期時間，例如「明天下午三點加個行程」需含時間"
-        else -> null
-    }
-
-    private fun esc(text: String): String = buildString {
-        for (c in text) {
-            when (c) {
-                '\\' -> { append('\\'); append('\\') }
-                '"' -> { append('\\'); append('"') }
-                '\n' -> append("\\n")
-                '\r' -> append("\\r")
-                '\t' -> append("\\t")
-                '\b' -> append("\\b")
-                '\u000C' -> append("\\f")
-                else -> if (c.code < 0x20) append(String.format(java.util.Locale.ROOT, "\\u%04x", c.code)) else append(c)
+        private fun esc(text: String): String = buildString {
+            for (c in text) {
+                when (c) {
+                    '\\' -> { append('\\'); append('\\') }
+                    '"' -> { append('\\'); append('"') }
+                    '\n' -> append("\\n")
+                    '\r' -> append("\\r")
+                    '\t' -> append("\\t")
+                    '\b' -> append("\\b")
+                    '\u000C' -> append("\\f")
+                    else -> if (c.code < 0x20) append(String.format(java.util.Locale.ROOT, "\\u%04x", c.code)) else append(c)
+                }
             }
         }
-    }
 
-    private fun phoneArgs(text: String): String {
-        val digits = findPhoneCandidate(text)?.trim() ?: ""
-        return "{\"number\": \"${esc(digits)}\", \"raw\": \"${esc(text)}\"}"
-    }
+        private fun phoneArgs(text: String): String {
+            val digits = findPhoneCandidate(text)?.trim() ?: ""
+            return "{\"number\": \"${esc(digits)}\", \"raw\": \"${esc(text)}\"}"
+        }
 
-    private fun musicAction(text: String): String = when {
-        MUSIC_NEXT.containsMatchIn(text) -> "next"
-        MUSIC_PREV.containsMatchIn(text) -> "previous"
-        MUSIC_PAUSE.containsMatchIn(text) -> "pause"
-        else -> "play"
-    }
+        private fun musicAction(text: String): String = when {
+            MUSIC_NEXT.containsMatchIn(text) -> "next"
+            MUSIC_PREV.containsMatchIn(text) -> "previous"
+            MUSIC_PAUSE.containsMatchIn(text) -> "pause"
+            else -> "play"
+        }
 
-    private fun volumeArgs(text: String): String {
-        val mute = VOLUME_MUTE.containsMatchIn(text)
-        val level = VOLUME_LEVEL.find(text)?.groupValues?.get(1)?.toIntOrNull()
-            ?.coerceIn(0, 100)
-        return "{\"level\": ${level ?: 50}, \"mute\": $mute}"
-    }
+        private fun volumeArgs(text: String): String {
+            val mute = VOLUME_MUTE.containsMatchIn(text)
+            val level = VOLUME_LEVEL.find(text)?.groupValues?.get(1)?.toIntOrNull()
+                ?.coerceIn(0, 100)
+            return "{\"level\": ${level ?: 50}, \"mute\": $mute}"
+        }
 
-    private fun alarmArgs(text: String): String {
-        val m = ALARM_TIME.find(text)
-        val hour = m?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(0, 23) ?: 7
-        val minute = m?.groupValues?.get(2)?.takeIf { it.isNotEmpty() }?.toIntOrNull()
-            ?.coerceIn(0, 59) ?: 0
-        return "{\"hour\": $hour, \"minute\": $minute, \"label\": \"${esc(text)}\"}"
+        private fun alarmArgs(text: String): String {
+            val m = ALARM_TIME.find(text)
+            val hour = m?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(0, 23) ?: 7
+            val minute = m?.groupValues?.get(2)?.takeIf { it.isNotEmpty() }?.toIntOrNull()
+                ?.coerceIn(0, 59) ?: 0
+            return "{\"hour\": $hour, \"minute\": $minute, \"label\": \"${esc(text)}\"}"
+        }
+
+        private fun isNegated(text: String): Boolean = containsAny(text, NEGATION_HINTS)
+
+        private fun hasExplicitAlarmTime(text: String): Boolean =
+            ALARM_TIME.containsMatchIn(text)
+
+        private fun hasPhoneNumber(text: String): Boolean {
+            val raw = findPhoneCandidate(text) ?: return false
+            // Require a real digit run: a bare "+" with spaces/punctuation is not
+            // a number, and a single stray digit among punctuation is not either.
+            val digits = raw.count { it.isDigit() }
+            return digits >= 7
+        }
+
+        /**
+         * Stage1 缺參門（本輪封閉集，措辭收斂：只斷言此四項，不推及其他工具）：
+         * 缺 alarm 時間（不預設 7:00）、缺 phone 號碼（不送空字串）、
+         * `sms.compose`（to 恆空，待收件者抽取落地前一律補參）、`calendar.create`
+         *（start/end 恆空，待日期解析落地前一律補參）。回傳問句即需澄清，null
+         * 即參數齊備（進接線門）。
+         *
+         * 範圍註記：`mail.compose`（to/subject 模板恆空）與 `open_app`
+         *（packageName 模板恆空）同屬空欄位形狀，但本輪不在缺參門內（後續收件者／
+         * 包名抽取落地後再收斂）；此二者仍被接線門以 USER_DISABLED 拒絕，絕不執行。
+         */
+        private fun missingQuestionFor(toolName: String, text: String): String? = when (toolName) {
+            "alarm.create" ->
+                if (!hasExplicitAlarmTime(text)) "請問要設幾點的鬧鐘？例如「明天早上7點30分叫我」" else null
+            "phone.dial" ->
+                if (!hasPhoneNumber(text)) "請問要打給哪個號碼？例如「打電話給 0912345678」" else null
+            "sms.compose" ->
+                "請問簡訊要傳給誰？請補上收件號碼，例如「傳簡訊給 0912345678 說…」"
+            "calendar.create" ->
+                "請問行程的時間是？請補上日期時間，例如「明天下午三點加個行程」需含時間"
+            else -> null
+        }
+
+        private fun containsAny(text: String, hints: List<Regex>): Boolean =
+            hints.any { it.containsMatchIn(text) }
     }
 }

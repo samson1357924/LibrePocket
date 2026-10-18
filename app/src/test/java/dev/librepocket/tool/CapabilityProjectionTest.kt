@@ -24,7 +24,7 @@ class CapabilityProjectionTest {
         grantedPermissions = setOf("android.permission.READ_CALENDAR", "listener:notification"),
     )
 
-    @Test fun fastToolsCountIsEighteen() {
+    @Test fun fastToolsCountIsNineteen() {
         // P2 11 + S1-C 7（shell.exec + calendar.query/update/delete + contact.search/list/get）
         // + S3 1（shell.elevated，自裝風味提權橋）。
         assertEquals(19, ToolRegistry.FAST_TOOLS.size)

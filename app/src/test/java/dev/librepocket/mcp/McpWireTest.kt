@@ -105,4 +105,18 @@ class McpWireTest {
         assertFalse(isError)
         assertTrue("40k CJK 結果必須完整保留（無 32k 靜默截斷）", result != null && result.contains(big))
     }
+
+    @Test fun escEscapesAllC0ControlsForRfc8259Json() {
+        // esc 必須逃逸所有 <0x20 控制字元（parity with FastRouter.esc），
+        // 否則 hostile frame 的 名稱/參數 會以裸控制字元進入 JSON 輸出。
+        assertEquals("\\u0000", McpWire.esc("\u0000"))
+        assertEquals("\\u001f", McpWire.esc("\u001f"))
+        assertEquals("\\n\\t\\r", McpWire.esc("\n\t\r"))
+        assertEquals("\\\"x\\\\", McpWire.esc("\"x\\"))
+        assertEquals("A \\u0001B \\u0002", McpWire.esc("A \u0001B \u0002"))
+        // DEL(0x7F) 以上邊界：RFC 8259 只要求 <0x20，DEL 保持原料不被逃逸。
+        assertEquals("\u007f", McpWire.esc("\u007f"))
+        // 0x20 以上的字元不被逃逸。
+        assertEquals("穩定", McpWire.esc("穩定"))
+    }
 }

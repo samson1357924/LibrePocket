@@ -1179,19 +1179,17 @@ internal object McpWire {
     internal fun esc(raw: String): String {
         val sb = StringBuilder(raw.length)
         for (c in raw) {
-            when (c) {
-                '"' -> sb.append("\\\"")
-                '\\' -> sb.append("\\\\")
-                '\b' -> sb.append("\\b")
-                '\u000C' -> sb.append("\\f")
-                '\n' -> sb.append("\\n")
-                '\r' -> sb.append("\\r")
-                '\t' -> sb.append("\\t")
-                else -> if (c.code < 0x20) {
-                    sb.append("\\u%04x".format(c.code))
-                } else {
-                    sb.append(c)
-                }
+            when {
+                c == '"' -> sb.append("\\\"")
+                c == '\\' -> sb.append("\\\\")
+                c == '\n' -> sb.append("\\n")
+                c == '\r' -> sb.append("\\r")
+                c == '\t' -> sb.append("\\t")
+                // RFC 8259: escape every remaining C0 control (<0x20) so a
+                // hostile frame can never emit raw control characters into
+                // JSON output (parity with FastRouter.esc).
+                c.code < 0x20 -> sb.append("\\u").append(c.code.toString(16).padStart(4, '0'))
+                else -> sb.append(c)
             }
         }
         return sb.toString()

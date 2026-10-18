@@ -16,6 +16,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.Clock
@@ -52,15 +53,13 @@ class SafeToolSliceTest {
         override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
     }
 
-    private fun allowPolicy(vararg extra: PolicyRule) = runBlocking {
-        val s = InMemoryPolicyStore(
+    private fun allowPolicy(vararg extra: PolicyRule): InMemoryPolicyStore =
+        InMemoryPolicyStore(
             listOf(
                 PolicyRule("chat.send:*", Verdict.ALLOW, 10),
                 PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 10),
             ) + extra.toList(),
         )
-        s
-    }
 
     private fun slice(
         ctx: ProjectionContext = ProjectionContext(userSwitches = mapOf("lsp" to true)),
@@ -283,7 +282,7 @@ class SafeToolSliceTest {
         // branch itself is not directly executable (static registry), the
         // defense-in-depth check in SafeToolSlice.executeOne covers it.
         val tool = ToolRegistry.find(SafeToolSlice.TOOL_NAME)
-        assertTrue(tool != null)
+        assertNotNull(tool)
         assertEquals(dev.librepocket.tool.SideEffect.READ, tool!!.sideEffect)
         assertTrue(tool.executionReady)
     }
@@ -295,7 +294,7 @@ class SafeToolSliceTest {
             override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
         }
         val s = slice(backend = throwing)
-        val r = s.execute(listOf(call())) .single()
+        val r = s.execute(listOf(call())).single()
         assertTrue(r.denied)
         assertEquals(SafeToolSlice.DenyCodes.EXEC_ERROR, r.denyCode)
         assertEquals("call-1", r.callId)
@@ -573,6 +572,34 @@ class SafeToolSliceTest {
         assertTrue("floor must retain a ≥2× margin (cross-constant coupling)", r.resultJson.length <= SafeToolSlice.MAX_RESULT_CHARS / 2)
     }
 
+    @Test fun postRedactionInflationMarksTruncatedField() = runBlocking {
+        // Truncation is decided on POST-redaction lengths: a raw field ≤
+        // MAX_STRING_CHARS can exceed the cap after redaction inflates each
+        // match into a marker. `geo:1,2` (7 chars) redacts to
+        // `⟦REDACTED:GEO⟧` (+7 per match), so 71 raw pairs = 497 chars stay
+        // ≤ 500 RAW (a raw-length decision would NOT truncate) while
+        // inflating to 71 × 14 = 994 post-redaction — the field must be
+        // capped with the truncation suffix AND turn the `truncated` flag,
+        // never silently inflate past the wire budget.
+        val backend = CountingBackend(
+            symbols = listOf(
+                LspTools.Symbol("geo:1,2".repeat(71), "function", "app/src/main/Example.kt", 1),
+            ),
+        )
+        val s = slice(backend = backend)
+        val r = s.execute(listOf(call())).single()
+        assertFalse(r.denied)
+        val body = Json.parseToJsonElement(r.resultJson).jsonObject
+        assertEquals("true", body["truncated"]!!.jsonPrimitive.content)
+        val symbols = body["symbols"]!!.jsonArray
+        assertEquals(1, symbols.size)
+        val name = symbols[0].jsonObject["name"]!!.jsonPrimitive.content
+        // Redaction fired and the inflated value got the truncation suffix.
+        assertTrue(name.contains("⟦REDACTED:GEO⟧"))
+        assertTrue(name.contains("…[truncated "))
+        assertTrue("capped field stays within MAX_STRING_CHARS", name.length <= SafeToolSlice.MAX_STRING_CHARS + 40)
+    }
+
     @Test fun continuationEchoesRedactNameAndArguments() = runBlocking {
         val s = slice()
         val calls = listOf(
@@ -602,25 +629,33 @@ class SafeToolSliceTest {
         // the terminating quote/brace when applied to RAW args text; the
         // structural (parse-then-redact) echo must keep the JSON object
         // valid — provider adapters re-parse it before serialize.
+        // The fake token value is deliberately low-entropy: it must survive
+        // CI secret scanners (gitleaks generic-api-key: stopword adjacency
+        // + captured-value Shannon entropy ≥ ~3.5) while still exercising
+        // the URL-token redaction rule, whose match needs only the `token=`
+        // key, not the value's randomness.
         val calls = listOf(
             call(
                 id = "call-1",
-                args = """{"query":"check https://x.com?token=REDACTME123456 and geo:47.6,?122.3;? imei=490154203237518"}""",
+                args = """{"query":"check https://x.com?token=url-demo-00 and geo:47.6,?122.3;? imei=490154203237518"}""",
             ),
         )
         val msgs = s.continuationMessages(calls, listOf(SafeToolSlice.ToolResult("call-1", "n", "{}")))
         val echo = msgs[0].toolCalls.single().argumentsJson
         val echoObject = Json.parseToJsonElement(echo).jsonObject
         assertTrue(echoObject.containsKey("query"))
-        assertFalse(echo.contains("REDACTME123456"))
+        assertFalse(echo.contains("url-demo-00"))
         assertFalse(echo.contains("490154203237518"))
     }
 
     @Test fun continuationArgsEchoIsBoundedForOversizedArgs() = runBlocking {
         val s = slice()
-        // Legal input (parseArgs accepts ≤16K); the wire-safe echo must stay
-        // a bounded, still-valid JSON object (fallback, never a corrupted
-        // `take`-cut string).
+        // Legal input size for execution (parseArgs' gross cap is
+        // MAX_INPUT_CHARS * 4 = 16K; the echo cap is tighter — the
+        // post-redaction form must fit MAX_INPUT_CHARS) — the wire-safe echo
+        // must stay a bounded, still-valid JSON object (fallback, never a
+        // corrupted `take`-cut string), and the final echo must not exceed
+        // the echo budget at all.
         val longArgs = """{"query":"${"N".repeat(SafeToolSlice.MAX_INPUT_CHARS)}"}"""
         val calls = listOf(call(id = "call-1", args = longArgs))
         val msgs = s.continuationMessages(calls, listOf(SafeToolSlice.ToolResult("call-1", "n", "{}")))
@@ -628,5 +663,51 @@ class SafeToolSliceTest {
         val echoObject = Json.parseToJsonElement(echo).jsonObject
         assertTrue("echo must stay a bounded valid JSON object", echoObject.size == 1 && echoObject.containsKey("echo"))
         assertFalse(echo.contains("N".repeat(64)))
+        assertTrue("echo must stay within MAX_INPUT_CHARS", echo.length <= SafeToolSlice.MAX_INPUT_CHARS)
+    }
+
+    @Test fun continuationArgsEchoFailsClosedOnDeepNesting() = runBlocking {
+        // The echo parses the model-controlled argument string directly, so
+        // embedded JSON is NOT bounded by the provider wire frame parser
+        // (MiniJson.MAX_DEPTH applies to the wire frame, not to a JSON string
+        // carried inside it). The pre-parse depth fan-close (same char-scan
+        // bound as parseArgs: depth ≤ 32) must trip BEFORE any recursive
+        // walk — otherwise a within-size, deeply nested argument would reach
+        // the recursive redaction on a stack. Pinned with depth-1000 input
+        // that is BOTH within the 16K gross size cap AND small enough that
+        // its (valid but oversized-depth) echo would fit MAX_INPUT_CHARS, so
+        // the ONLY possible gate is the depth guard: any regression that
+        // removes the guard parses + redacts normally and fails this pin.
+        val s = slice()
+        val deep = "[".repeat(1000) + "1" + "]".repeat(1000)
+        val calls = listOf(call(id = "call-1", args = deep))
+        val msgs = s.continuationMessages(calls, listOf(SafeToolSlice.ToolResult("call-1", "n", "{}")))
+        val echo = msgs[0].toolCalls.single().argumentsJson
+        val echoObject = Json.parseToJsonElement(echo).jsonObject
+        assertEquals(1, echoObject.size)
+        assertEquals("args redacted/capped", echoObject["echo"]!!.jsonPrimitive.content)
+        // No nested structure may survive the fan-close.
+        assertFalse(echo.contains("["))
+        assertFalse(echo.contains("]"))
+    }
+
+    @Test fun everyRegisteredNonSliceToolDeniesNotReady() = runBlocking {
+        // Systematic negative sweep (beyond the two sampled tools): every
+        // registered name other than the slice tool must reach a typed
+        // NOT_READY denial with ZERO backend invocations — never dispatched.
+        // The count pin makes this sweep self-checking: it always covers
+        // exactly every registered non-slice tool.
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        var swept = 0
+        for (tool in ToolRegistry.ALL) {
+            if (tool.name == SafeToolSlice.TOOL_NAME) continue
+            val r = s.execute(listOf(call(name = tool.name))).single()
+            assertTrue(tool.name, r.denied)
+            assertEquals(tool.name, SafeToolSlice.DenyCodes.NOT_READY, r.denyCode)
+            swept++
+        }
+        assertEquals(ToolRegistry.ALL.size - 1, swept)
+        assertEquals(0, backend.invocations.get())
     }
 }

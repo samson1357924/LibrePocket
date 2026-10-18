@@ -21,7 +21,8 @@ import org.junit.Test
  *   皆為候選未採納：本 repo 內無任一修訂的規格文本，工作區無外網可核對，
  *   任何「差異表」都將是虛構，故此處不寫差異表。
  * - 選擇：單一傳輸子集起步 —— 僅 `tools/list`＋`tools/call` 經 Streamable HTTP POST、
- *   Bearer 標頭、單頁（不跟隨分頁）、HTTP 一問一答配對（不做 response id 斷言）。
+ *   Bearer 標頭、單頁（不跟隨分頁）、固定 id（list=1／call=2，收回應時以 expectedId
+ *   數值校驗，Stage2 起錯 id 一律 fail-closed）。
  *   不送 `initialize`、不接 SSE stream、不協商 `protocolVersion`。
  *   排除依據不是「規格說不用」，而是 fail-closed：子集外的形狀一律走 PROTOCOL
  *  （或根本不送該請求），見本檔 lifecycle/metadata/SSE/cursor/id 契約。
@@ -59,7 +60,8 @@ class McpProtocolContractsTest {
         } catch (e: McpWire.McpToolFailure) {
             fail("空包不得映射 TOOL_ERROR，實際=${e.message}")
         } catch (e: IllegalArgumentException) {
-            assertEquals("mcp: missing result", e.message)
+            // Stage2：空包連 jsonrpc 都缺，envelope 驗證先擋。
+            assertEquals("mcp: bad jsonrpc", e.message)
         }
     }
 
@@ -70,7 +72,8 @@ class McpProtocolContractsTest {
         } catch (e: McpWire.McpToolFailure) {
             fail("空包不得映射 TOOL_ERROR，實際=${e.message}")
         } catch (e: IllegalArgumentException) {
-            assertEquals("mcp: missing result", e.message)
+            // Stage2：同 List 變體，空包在 envelope 驗證即拒。
+            assertEquals("mcp: bad jsonrpc", e.message)
         }
     }
 
@@ -110,7 +113,8 @@ class McpProtocolContractsTest {
         } catch (e: McpWire.McpToolFailure) {
             fail("不得映射 TOOL_ERROR，實際=${e.message}")
         } catch (e: IllegalArgumentException) {
-            assertEquals("mcp: missing result", e.message)
+            // 無 id：envelope 驗證先擋（id 先於 result 檢查）。
+            assertEquals("mcp: missing id", e.message)
         }
         try {
             McpWire.parseCall(json)
@@ -118,7 +122,7 @@ class McpProtocolContractsTest {
         } catch (e: McpWire.McpToolFailure) {
             fail("不得映射 TOOL_ERROR，實際=${e.message}")
         } catch (e: IllegalArgumentException) {
-            assertEquals("mcp: missing result", e.message)
+            assertEquals("mcp: missing id", e.message)
         }
     }
 
@@ -171,22 +175,67 @@ class McpProtocolContractsTest {
         // 無跟隨語義由 E2E 鎖定：見 standardSubsetFakeEndToEnd（listTools 只發一次 HTTP）。
     }
 
-    // ---- f. id 對應：HTTP 一問一答配對，wire 層不斷言 id（鎖定現狀） ----
+    // ---- f. id 對應：expectedId 數值校驗（Stage2 翻轉舊「不斷言」pin） ----
 
-    @Test fun responseIdIsNotAssertedByWireLayer() {
-        // 呼叫方以 HTTP 一問一答配對（見 McpWire KDoc 非目標註記）：string／null／缺席 id
-        // 皆照常解析。此測鎖定該語義，防後人誤加 id 斷言把單子集玩成多路複用。
+    @Test fun responseIdIsAssertedAgainstExpectedId() {
+        // 無 expectedId（測試直呼叫）只驗 id 存在與型別；server 呼叫傳 expectedId
+        // 必須數值相符——單發子集不支援 id 複用，但錯 id 回應不得採納（外部 review #2）。
         val stringId = "{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"result\":{\"tools\":[]}}"
-        assertTrue(McpWire.parseList("s1", stringId).isEmpty())
-        val nullId = "{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":" +
-            "{\"content\":[],\"isError\":false}}"
-        val (_, isError) = McpWire.parseCall(nullId)
-        assertFalse(isError)
-        val missingId = "{\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[]}}"
-        assertTrue(McpWire.parseList("s1", missingId).isEmpty())
-        // id 型別錯亂但解析仍過：mismatched id 不擋（配對責任在傳輸層，不在 parser）。
+        assertTrue("無 expectedId：字串 id 仍接受", McpWire.parseList("s1", stringId).isEmpty())
+        // 缺席／null id 一律拒（翻轉舊「照常解析」pin）。
+        for (bad in listOf(
+            "{\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[]}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":{\"tools\":[]}}",
+        )) {
+            try {
+                McpWire.parseList("s1", bad)
+                fail("缺席／null id 必須拒：$bad")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: missing id", e.message)
+            }
+        }
+        // mismatched id：無 expectedId 不比對值（HTTP 一問一答仍在 server 層把關），
+        // 傳 expectedId 必須擋。
         val mismatched = "{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{\"tools\":[]}}"
         assertTrue(McpWire.parseList("s1", mismatched).isEmpty())
+        try {
+            McpWire.parseList("s1", mismatched, expectedId = 1L)
+            fail("mismatched id 必須拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: id mismatch", e.message)
+        }
+        // 字串 id 配 expectedId 同樣 mismatch（要求數值相符）。
+        try {
+            McpWire.parseList("s1", stringId, expectedId = 1L)
+            fail("字串 id 配 expectedId 必須拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: id mismatch", e.message)
+        }
+        // 分數／指數字面量 id：合法 JNum 但非整數字串，toLongOrNull 得 null → mismatch
+        // （伺服器把 2 序列化成 2.0 的 fail-closed 取捨在此釘定）。
+        for (rawId in listOf("1.0", "1e3")) {
+            val floatId = "{\"jsonrpc\":\"2.0\",\"id\":$rawId,\"result\":{\"tools\":[]}}"
+            try {
+                McpWire.parseList("s1", floatId, expectedId = 1L)
+                fail("id $rawId 不得當 1")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: id mismatch", e.message)
+            }
+        }
+        // call 同語義。
+        val callMismatch = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[],\"isError\":false}}"
+        try {
+            McpWire.parseCall(callMismatch, expectedId = 2L)
+            fail("call id mismatch 必須拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: id mismatch", e.message)
+        }
+        // 相符 id 通過。
+        val okList = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}"
+        assertTrue(McpWire.parseList("s1", okList, expectedId = 1L).isEmpty())
+        val okCall = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[],\"isError\":false}}"
+        val (_, isError) = McpWire.parseCall(okCall, expectedId = 2L)
+        assertFalse(isError)
     }
 
     // ---- g. 巢狀同名 key（per-revision suite 變體） ----
@@ -307,13 +356,32 @@ class McpProtocolContractsTest {
         }
     }
 
-    @Test fun missingJsonrpcStillParsesLocksNonGoal() {
-        // jsonrpc 非目標（不斷言版本）：缺席仍照常解析，防後人誤加版本斷言。
-        val list = "{\"id\":1,\"result\":{\"tools\":[]}}"
-        assertTrue(McpWire.parseList("s1", list).isEmpty())
+    @Test fun missingOrWrongJsonrpcIsRejected() {
+        // jsonrpc 必須存在且嚴格 "2.0"（Stage2 翻轉舊 non-goal pin，外部 review #2）。
+        for (bad in listOf(
+            "{\"id\":1,\"result\":{\"tools\":[]}}",
+            "{\"jsonrpc\":\"1.0\",\"id\":1,\"result\":{\"tools\":[]}}",
+            "{\"jsonrpc\":2.0,\"id\":1,\"result\":{\"tools\":[]}}",
+            "{\"jsonrpc\":null,\"id\":1,\"result\":{\"tools\":[]}}",
+            "{\"jsonrpc\":true,\"id\":1,\"result\":{\"tools\":[]}}",
+        )) {
+            try {
+                McpWire.parseList("s1", bad)
+                fail("缺／錯版 jsonrpc 必須拒：$bad")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: bad jsonrpc", e.message)
+            }
+        }
         val call = "{\"id\":2,\"result\":{\"content\":[],\"isError\":false}}"
-        val (_, isError) = McpWire.parseCall(call)
-        assertFalse(isError)
+        try {
+            McpWire.parseCall(call)
+            fail("缺 jsonrpc 必須拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad jsonrpc", e.message)
+        }
+        // 正確版本仍過。
+        val ok = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}"
+        assertTrue(McpWire.parseList("s1", ok, expectedId = 1L).isEmpty())
     }
 
     @Test fun emptyResultObjectIsOkLocksCurrentSemantics() {
@@ -559,10 +627,14 @@ class McpProtocolContractsTest {
             val second = web.takeRequest(5, TimeUnit.SECONDS)
             assertNotNull(first)
             assertNotNull(second)
-            assertTrue(first!!.body.readUtf8().contains("\"method\":\"tools/list\""))
-            assertTrue(second!!.body.readUtf8().contains("\"method\":\"tools/call\""))
-            assertFalse("lifecycle 交握不得出現", first.body.readUtf8().contains("initialize"))
-            assertFalse("lifecycle 交握不得出現", second.body.readUtf8().contains("initialize"))
+            // body 是一次性 Buffer：先緩存再全部斷言（二次 readUtf8 讀到空 buffer，
+            // 否則「不得出現 initialize」會是永真的假負例）。
+            val firstBody = first!!.body.readUtf8()
+            val secondBody = second!!.body.readUtf8()
+            assertTrue(firstBody.contains("\"method\":\"tools/list\""))
+            assertTrue(secondBody.contains("\"method\":\"tools/call\""))
+            assertFalse("lifecycle 交握不得出現", firstBody.contains("initialize"))
+            assertFalse("lifecycle 交握不得出現", secondBody.contains("initialize"))
             assertEquals("成功不得計熔斷", 0, breaker.failureCount())
             // 稽核不含原文。
             assertFalse(call.auditMap().toString().contains("hi"))

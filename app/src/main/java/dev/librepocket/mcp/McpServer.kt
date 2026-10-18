@@ -14,9 +14,13 @@ import kotlinx.coroutines.CancellationException
  * MCP 行），啟用前須單獨驗 production dispatcher、取消與副作用邊界，不得批次開啟。
  *
  * - 地址使用者配置（[McpServerConfig.baseUrl]），Key 走 [KeyVault] 加密存取；
- * - 方法：[listTools]（tools/list）+ [callTool]（tools/call）；
+ * - 方法：[listTools]（tools/list）+ [callTool]（tools/call）；回應須
+ *   `jsonrpc=="2.0"`＋id 數值相符（固定 list=1／call=2）＋`result` XOR `error`，
+ *   error 依 code 分類：協議/伺服器碼（-32700/-32600/-32601/-32603）→ PROTOCOL＋計熔斷，
+ *   `-32602`/未知碼 → TOOL_ERROR 中性（見 [McpWire.parseCall]）；
  * - 熔斷：連續失敗即開路（[McpCircuitBreaker]），開路期間短路為 CIRCUIT_OPEN；
- *   工具業務錯（`isError=true`／error 包）為中性，不重置亦不累計；
+ *   工具業務錯（`isError=true`、`-32602`/未知碼 error 包）為中性，不重置亦不累計；
+ *   協議碼 error 包（-32700/-32600/-32601/-32603）計熔斷（見上方法段）；
  * - 超時：單次 15–30s（[McpTimeouts.clamp]），超時映射 TIMEOUT，不重試；
  * - 傳輸安全：僅放行 `https`，以及回環 `http`（測試／本機；見 [McpWire.requireSecureEndpoint]），
  *   其餘明文一律 PROTOCOL、不碰 vault、不發送、不計熔斷；
@@ -97,7 +101,9 @@ class McpServer(
                 return McpListResult(config.id, emptyList(), McpStatus.TRANSPORT, clockMs() - start)
             }
             return try {
-                val tools = McpWire.parseList(config.id, text)
+                // expectedId=LIST_ID：回應 id 必須數值相符（錯 id 回應 fail-closed，
+                // 不採納也不重置熔斷，見 McpWire.requireResponseEnvelope）。
+                val tools = McpWire.parseList(config.id, text, McpWire.LIST_ID)
                 breaker.onSuccess()
                 McpListResult(config.id, tools, McpStatus.OK, clockMs() - start)
             } catch (_: IllegalArgumentException) {
@@ -192,7 +198,8 @@ class McpServer(
                 return McpCallResult(config.id, toolName, McpStatus.TRANSPORT, clockMs() - start)
             }
             return try {
-                val (resultJson, isError) = McpWire.parseCall(text)
+                // expectedId=CALL_ID：回應 id 必須數值相符（同 listTools）。
+                val (resultJson, isError) = McpWire.parseCall(text, McpWire.CALL_ID)
                 if (isError) {
                     // 工具業務錯：中性，不重置亦不累計熔斷（防交錯壓住不斷路）。
                     breaker.onNeutral()
@@ -202,7 +209,8 @@ class McpServer(
                 val status = if (isError) McpStatus.TOOL_ERROR else McpStatus.OK
                 McpCallResult(config.id, toolName, status, clockMs() - start, resultJson, isError)
             } catch (e: McpWire.McpToolFailure) {
-                // 伺服器回 error 包：工具級錯誤，中性（會話不中斷，不碰熔斷計數）。
+                // 僅 -32602/未知碼 error 包會到此（協議碼於 parseCall 拋 McpProtocol
+                // → 下方 IAE catch → PROTOCOL + 計熔斷）；工具級錯誤中性，不碰熔斷計數。
                 breaker.onNeutral()
                 McpCallResult(config.id, toolName, McpStatus.TOOL_ERROR, clockMs() - start, null, true)
             } catch (_: IllegalArgumentException) {

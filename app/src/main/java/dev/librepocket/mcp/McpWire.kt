@@ -20,8 +20,12 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  * Stage D：單一嚴格遞迴 JSON parser（raw-span DOM）取代全部手寫掃描器。
  * P1（巢狀同名鍵遮蔽）與 P2（巢狀形狀錯誤回 OK）皆由 DOM 層級正確性關閉。
  *
- * 已知非目標（follow-up，不在本層驗證）：`jsonrpc == "2.0"` 版本斷言、
- * response id 與 request id 對應（呼叫方以 HTTP 一問一答配對，不做 id 複用檢查）。
+ * Stage2 envelope 完整性（外部 review #2）：回應必須 `jsonrpc == "2.0"`、
+ * `id` 存在（server 呼叫時以 expectedId 數值對應，固定 list=1／call=2）、
+ * `result` XOR `error`、request-shaped（含 `method`）一律拒；
+ * error 依 code 分類（見 [parseCall]）。HTTP 一問一答配對仍不支援 id 複用
+ * （單發單回，不生成隨機 id）；server 路徑（必傳 expectedId）對錯 id 回應
+ * 一律 fail-closed 不採納，null expectedId 僅限測試直呼叫。
  *
  * 修訂立場（#11 Stage2 本 PR 選型，非 Accepted ADR；單一傳輸子集起步）：
  * `2025-11-25` 與 `2026-07-28`（#11 提及的候選修訂號，repo 內無文本）
@@ -34,6 +38,32 @@ internal object McpWire {
 
     /** 輸入 Schema 字元上限：超限拒絕（拋 [McpProtocol]），不靜默截斷。 */
     internal const val INPUT_SCHEMA_MAX_CHARS = 8_192
+
+    /** tools/list 請求固定 id（單發子集；[McpServer] 收回應時以 expectedId=LIST_ID 校驗）。 */
+    internal const val LIST_ID = 1L
+
+    /** tools/call 請求固定 id（同 [LIST_ID]；以 expectedId=CALL_ID 校驗回應）。 */
+    internal const val CALL_ID = 2L
+
+    /** 出站 toolName 字元上限（[parseList] 入站名同用此常數；超限不發送）。 */
+    internal const val TOOL_NAME_MAX_CHARS = 128
+
+    /**
+     * 出站 arguments 字元上限（與回應上限 [McpTransport.RESPONSE_MAX_CHARS] 對稱；
+     * 超限拒絕不發送，訊息明指 arguments——不得誤稱 response）。
+     */
+    internal const val ARGUMENTS_MAX_CHARS = McpTransport.RESPONSE_MAX_CHARS
+
+    /** 回應 `jsonrpc` 必須嚴格等於此值（JSON-RPC 2.0；缺席／其他版本一律拒）。 */
+    private const val JSONRPC_VERSION = "2.0"
+
+    /**
+     * 協議／伺服器端 JSON-RPC 錯誤碼（parse error／invalid request／method not found／
+     * internal error）：表示協議不可互通或端點配置錯誤，[parseCall] 拋 [McpProtocol]
+     * （[McpServer] 映射 PROTOCOL + 計熔斷）。`-32602`（invalid params）與未知碼
+     * 屬工具級中性（[McpToolFailure]），見 [parseCall]。
+     */
+    private val PROTOCOL_ERROR_CODES = setOf(-32700L, -32600L, -32601L, -32603L)
 
     /**
      * RFC 8259 §2 的空白：僅 space/tab/LF/CR。Kotlin `isWhitespace()` 另接受
@@ -358,20 +388,29 @@ internal object McpWire {
         return h == "localhost" || h == "127.0.0.1" || h == "::1"
     }
 
-    fun listBody(id: Long = 1L): String =
+    fun listBody(id: Long = LIST_ID): String =
         """{"jsonrpc":"2.0","id":$id,"method":"tools/list","params":{}}"""
 
     /**
      * 組裝 tools/call 請求體（fail-closed）。
      *
      * - `toolName` 空白即拋（不送 `"name":""` 無效請求）；
+     * - `toolName` 超 [TOOL_NAME_MAX_CHARS] 即拋（[parseList] 入站名同用此常數；
+     *   出站同樣不放行超長名，不送可預期被拒的請求）；
      * - `argumentsJson` 必須是合法 JSON object 文本（空字串視為 `{}`），
      *   非 object（`null`／陣列／畸形）即拋，不發送；
+     *   字元數超 [ARGUMENTS_MAX_CHARS] 即拋（訊息明指 arguments，非 response）；
      * - `toolName` 經 [esc] 轉義（含 `\b`／`\f`／C0 控制字元 `\\u00XX`）。
      */
-    fun callBody(toolName: String, argumentsJson: String, id: Long = 2L): String {
+    fun callBody(toolName: String, argumentsJson: String, id: Long = CALL_ID): String {
         require(toolName.isNotBlank()) { "mcp: blank tool name" }
+        require(toolName.length <= TOOL_NAME_MAX_CHARS) {
+            "mcp: tool name exceeds $TOOL_NAME_MAX_CHARS chars"
+        }
         val args = argumentsJson.trim().ifEmpty { "{}" }
+        if (args.length > ARGUMENTS_MAX_CHARS) {
+            throw IllegalArgumentException("mcp: arguments exceed $ARGUMENTS_MAX_CHARS chars")
+        }
         // fail-closed：arguments 必須是合法 JSON object 文本（上層不再另行保證，
         // 此處直接驗證；非法即拋，呼叫方在發送前擋下，不送畸形 JSON-RPC）。
         val parsed = try {
@@ -385,19 +424,64 @@ internal object McpWire {
     }
 
     /**
+     * 通用回應 envelope 驗證（[parseList]／[parseCall] 共用，外部 review #2）。
+     *
+     * - `jsonrpc` 必須存在且嚴格等於 `"2.0"`（缺席／`"1.0"`／數字 2.0 一律
+     *   [McpProtocol] `mcp: bad jsonrpc`）；
+     * - `id` 必須存在且非 null（否則 `mcp: missing id`）；[expectedId] 非 null 時
+     *   必須為數值且相等（`mcp: id mismatch`——單發子集不支援 id 複用，
+     *   錯 id 回應不得採納，也不得重置熔斷）；無 [expectedId] 時僅要求
+     *   數值或字串型別（`mcp: bad id`）；
+     * - request-shaped（含 `method` 鍵）一律拒（`mcp: request-shaped response`）：
+     *   server 端請求包不是本子集的回應。
+     */
+    private fun requireResponseEnvelope(doc: JObj, expectedId: Long?) {
+        val jsonrpc = doc.find("jsonrpc")
+        if (jsonrpc !is JStr || jsonrpc.v != JSONRPC_VERSION) {
+            throw McpProtocol("mcp: bad jsonrpc")
+        }
+        val id = doc.find("id")
+        if (id == null || id is JNull) throw McpProtocol("mcp: missing id")
+        if (expectedId != null) {
+            if (id !is JNum || id.raw.toLongOrNull() != expectedId) {
+                throw McpProtocol("mcp: id mismatch")
+            }
+        } else if (id !is JNum && id !is JStr) {
+            throw McpProtocol("mcp: bad id")
+        }
+        if (doc.find("method") != null) {
+            throw McpProtocol("mcp: request-shaped response")
+        }
+    }
+
+    /**
      * 解析 tools/list；惡形輸入拋 IllegalArgumentException（呼叫方映射為 PROTOCOL）。
      *
      * 經 [parseStrictDoc] 嚴格走訪全文（截斷/尾隨 garbage/缺逗號/重複鍵/非法字面量/
-     * 非法 escape/超深一律 [McpProtocol]）；只認頂層 `result` 包裝，
+     * 非法 escape/超深一律 [McpProtocol]）；再經 [requireResponseEnvelope]
+     * 驗 `jsonrpc=="2.0"`、`id` 存在／相符、request-shaped 拒；
+     * tools/list 回應不得是 error 包（不分 code：協議碼、`-32602`、未知碼、
+     * 暫態 `-320xx` 一律 [McpProtocol] PROTOCOL + 計熔斷——list 無業務錯通道，
+     * 不當空列表、不採納）；result+error 矛盾包同被此分支擋下；
+     * `result` 鍵存在（含 null）在有 error 時一律視為矛盾；只認頂層 `result` 包裝，
      * 再從 `result` 內取 `tools` 陣列；層級一律經 DOM 直接成員查找，
      * 巢狀同名鍵不得遮蔽外層。inputSchema 超限拒絕不截斷；name/description 短欄位 take 保留。
+     *
+     * @param expectedId server 呼叫時傳 [LIST_ID]（數值比對回應 id）；
+     *   null（測試直呼叫）只驗 id 存在與型別。
      */
-    fun parseList(serverId: String, json: String): List<McpTool> {
+    fun parseList(serverId: String, json: String, expectedId: Long? = null): List<McpTool> {
         if (json.length > McpTransport.RESPONSE_MAX_CHARS) {
             throw McpProtocol("mcp: response body exceeds ${McpTransport.RESPONSE_MAX_CHARS} chars")
         }
         val doc = parseStrictDoc(json)
         if (doc !is JObj) throw McpProtocol("mcp: bad envelope")
+        requireResponseEnvelope(doc, expectedId)
+        if (doc.find("error") != null) {
+            // error 回應不屬 tools/list 成功子集（-32601 等協議/伺服器錯；
+            // result+error 同時存在亦先在此擋下）：一律 PROTOCOL + 計熔斷。
+            throw McpProtocol("mcp: unexpected error response")
+        }
         val resultVal = doc.find("result")
             ?: throw IllegalArgumentException("mcp: missing result")
         if (resultVal is JNull) throw IllegalArgumentException("mcp: missing result")
@@ -423,7 +507,7 @@ internal object McpWire {
             }
             McpTool(
                 serverId = serverId,
-                name = nameVal.v.take(128),
+                name = nameVal.v.take(TOOL_NAME_MAX_CHARS),
                 description = desc.take(500),
                 inputSchema = schema,
             )
@@ -433,7 +517,25 @@ internal object McpWire {
     /**
      * 解析 tools/call：回傳 (resultJson, isError)。
      *
-     * 經 [parseStrictDoc] 嚴格走訪全文；只有頂層 `error` 鍵才算 error 包；
+     * 經 [parseStrictDoc] 嚴格走訪全文；再經 [requireResponseEnvelope] 驗
+     * `jsonrpc=="2.0"`、`id` 存在／相符、request-shaped（含 `method`）拒。
+     *
+     * `result` XOR `error`（外部 review #2）：先驗 `error` 型別（鍵存在即必須是 object，
+     * `null`／字串／數字皆 [McpProtocol] `mcp: bad error`），再驗互斥
+     * （object error ＋ 任何 `result` 鍵存在 → `mcp: result and error both present`）；
+     * `code` 必須是整數（缺 code／字串 code 一律 `mcp: bad error`，不靜默當業務錯）。
+     *
+     * error code 分類（外部 review #4）：
+     * - `-32700`／`-32600`／`-32601`／`-32603`（協議／伺服器端錯，見 [PROTOCOL_ERROR_CODES]）
+     *   → 拋 [McpProtocol]（[McpServer] 映射 PROTOCOL + 計熔斷，breaker 能得知不互通）；
+     * - `-32602`（invalid params）與未知碼 → 拋 [McpToolFailure]（工具級中性；
+     *   message 取伺服器原文上限 200 字元，但 [McpServer.callTool] 目前只映射狀態、
+     *   不透傳 message——已知限制）。
+     *
+     * `code` 必須是整數字面量（不含指數／小數／溢位；否則 `mcp: bad error`）。
+     * 注意不對稱：[parseList] 對任何 error 包（含 `-32602`/未知碼）一律
+     * [McpProtocol]（list 無業務錯通道，協議碼與暫態碼同等計熔斷）。
+     *
      * `isError`/`content` 只認頂層 `result` 物件的直接成員（DOM depth-1），
      * 巢狀同名鍵不得誤判；缺 `result` 即拋 IllegalArgumentException（fail-closed）。
      * 回傳的 resultJson 用 DOM 節點 `raw`（content 優先，否則整包 result）。
@@ -442,28 +544,35 @@ internal object McpWire {
      * - 空 `result`（`{}`，既無 `content` 又無 `structuredContent`）視為 OK
      *  （`resultJson="{}"`，`isError=false`）；
      * - `content` 存在時 `structuredContent` 被丟棄（僅保留 `content.raw`）。
+     *
+     * @param expectedId server 呼叫時傳 [CALL_ID]（數值比對回應 id）；
+     *   null（測試直呼叫）只驗 id 存在與型別。
      */
-    fun parseCall(json: String): Pair<String?, Boolean> {
+    fun parseCall(json: String, expectedId: Long? = null): Pair<String?, Boolean> {
         if (json.length > McpTransport.RESPONSE_MAX_CHARS) {
             throw McpProtocol("mcp: response body exceeds ${McpTransport.RESPONSE_MAX_CHARS} chars")
         }
         val doc = parseStrictDoc(json)
         if (doc !is JObj) throw McpProtocol("mcp: bad envelope")
+        requireResponseEnvelope(doc, expectedId)
         val errVal = doc.find("error")
-        if (errVal != null) {
-            if (errVal is JNull) {
-                // 忽略，續走 result（既有 nullTopLevelErrorIsOk 語義）。
-            } else if (errVal is JObj) {
-                val msgVal = errVal.find("message")
-                val msg = if (msgVal is JStr) msgVal.v else "tool error"
-                throw McpToolFailure(msg.take(200))
-            } else {
-                throw McpProtocol("mcp: bad error")
-            }
-        }
         val resultVal = doc.find("result")
-            ?: throw IllegalArgumentException("mcp: missing result")
-        if (resultVal is JNull) throw IllegalArgumentException("mcp: missing result")
+        if (errVal != null) {
+            if (errVal !is JObj) throw McpProtocol("mcp: bad error")
+            if (resultVal != null) {
+                // result XOR error：同時存在是矛盾包（伺服器 bug 或非本子集），
+                // 不得擇一採納（舊「error 優先」會採納矛盾內容並重置熔斷）。
+                throw McpProtocol("mcp: result and error both present")
+            }
+            val codeVal = errVal.find("code")
+            val code = (codeVal as? JNum)?.raw?.toLongOrNull()
+                ?: throw McpProtocol("mcp: bad error")
+            val msgVal = errVal.find("message")
+            val msg = if (msgVal is JStr) msgVal.v else "tool error"
+            if (code in PROTOCOL_ERROR_CODES) throw McpProtocol("mcp: jsonrpc error $code")
+            throw McpToolFailure(msg.take(200))
+        }
+        if (resultVal == null || resultVal is JNull) throw IllegalArgumentException("mcp: missing result")
         if (resultVal !is JObj) throw IllegalArgumentException("mcp: bad result")
         val contentVal = resultVal.find("content")
         if (contentVal != null && contentVal !is JArr) {

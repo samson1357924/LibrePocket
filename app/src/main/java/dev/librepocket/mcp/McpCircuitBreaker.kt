@@ -4,9 +4,10 @@ package dev.librepocket.mcp
  * D03 逐伺服器熔斷：連續失敗達閾值即開路一段時間，期間直接短路
  * （回 [McpStatus.CIRCUIT_OPEN]），不發 HTTP，不中斷會話。
  *
- * - 失敗 = 傳輸錯誤 / 超時 / 非 2xx / 協議解析失敗；
+ * - 失敗 = 傳輸錯誤 / 超時 / 非 2xx / 協議解析失敗（含 JSON-RPC 協議碼 error 包
+ *   -32700/-32600/-32601/-32603，見 [McpWire.parseCall]）；
  *   成功（2xx 且解析通過且 `isError=false`）計成功；
- *   工具業務錯（HTTP 200 + `isError=true` 或 JSON-RPC error 包）為中性
+ *   工具業務錯（HTTP 200 + `isError=true`，或 code 為 `-32602`/未知碼的 error 包）為中性
  *   （[onNeutral]，不記成功也不記失敗，避免交錯 TOOL_ERROR 壓住熔斷）；
  *   客戶端參數錯誤（未發送即回 PROTOCOL）同樣不碰熔斷，由呼叫方早退。
  *   本類只記 [onSuccess]/[onFailure]/[onNeutral]，語義由 [McpServer] 統一。

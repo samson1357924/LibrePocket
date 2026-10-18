@@ -47,23 +47,37 @@ class McpWireTest {
         }
     }
 
-    @Test fun topLevelErrorWinsOverNestedResultShape() {
+    @Test fun resultAndErrorBothPresentRejected() {
+        // result XOR error（Stage2，外部 review #2）：矛盾包不得擇一採納。
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2," +
             "\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}," +
             "\"error\":{\"code\":-32000,\"message\":\"boom\"}}"
         try {
             McpWire.parseCall(json)
-            fail("expected McpToolFailure")
-        } catch (e: McpWire.McpToolFailure) {
-            assertEquals("boom", e.message)
+            fail("result+error 同時存在必須拒（McpProtocol）")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: result and error both present", e.message)
         }
     }
 
-    @Test fun nullTopLevelErrorIsOk() {
-        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+    @Test fun nullTopLevelErrorIsRejected() {
+        // error 鍵存在即必須是 object（null 亦非法）：error:null + result 與
+        // error:null 單獨皆不得回 OK（bad error 先於互斥檢查）。
+        val both = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
             "{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"isError\":false},\"error\":null}"
-        val (_, isError) = McpWire.parseCall(json)
-        assertFalse(isError)
+        try {
+            McpWire.parseCall(both)
+            fail("error:null + result 必須拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad error", e.message)
+        }
+        val onlyNull = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":null}"
+        try {
+            McpWire.parseCall(onlyNull)
+            fail("error:null 單獨必須拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad error", e.message)
+        }
     }
 
     @Test fun missingContentAndResultThrowsProtocol() {

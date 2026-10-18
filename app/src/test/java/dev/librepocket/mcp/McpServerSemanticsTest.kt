@@ -193,6 +193,44 @@ class McpServerSemanticsTest {
         }
     }
 
+    @Test fun badContentItemsAreProtocol() {
+        // 元素層 fail-closed：content 元素必須是含字串 type 的 object，
+        // 不得原文透傳回 OK（外部 final review P3）。
+        for (badItem in listOf("1", "\"x\"", "{}", "{\"type\":42}", "null")) {
+            val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+                "{\"content\":[$badItem],\"isError\":false}}"
+            try {
+                McpWire.parseCall(json, expectedId = 2L)
+                fail("壞 content 元素必須拒：$badItem")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: bad content item", e.message)
+            }
+        }
+        // 正例：合法元素（含 type 字串）照常通過。
+        val ok = McpWire.parseCall(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+                "{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"isError\":false}}",
+            expectedId = 2L,
+        )
+        assertFalse(ok.second)
+    }
+
+    @Test fun errorMessageTruncationIsSurrogateSafe() {
+        // 截斷點落在 surrogate pair 中間時，孤立 high surrogate 必須被去掉
+        //（否則渲染/序列化變 U+FFFD、出站名變 '?'）。
+        val emoji = "😀" // 2 個 UTF-16 code units
+        // 199 個 x + emoji：take(200) 會落在 high surrogate 上 → 退 1 → 199 字元。
+        val msg = "x".repeat(199) + emoji
+        val truncated = McpWire.truncateUnits(msg, 200)
+        assertEquals("截斷後不得含孤立 surrogate", 199, truncated.length)
+        assertEquals("x", truncated.last().toString())
+        // 198 個 x + emoji：take(200) 恰好含完整 pair → 保留。
+        val exact = "x".repeat(198) + emoji
+        assertEquals(200, McpWire.truncateUnits(exact, 200).length)
+        // 未超限不動。
+        assertEquals("short", McpWire.truncateUnits("short", 200))
+    }
+
     @Test fun structuredContentNullIsTreatedAsAbsent() {
         // null 視為缺席（可選鍵寬容，與 nextCursor: null／isError: null 對稱）。
         // + content → 正常成功；單獨 null（無 content）→ 兩鍵皆無 → empty result 拒。
@@ -539,6 +577,9 @@ class McpServerSemanticsTest {
                 assertEquals("HTTP $code 必須 TRANSPORT", McpStatus.TRANSPORT, call.status)
                 assertEquals(++expectCount, breaker.failureCount())
             }
+            // 408 是 OkHttp replay 分支之一（由 one-shot body 擋下）：
+            // 恰兩發請求＝兩碼各一發，無隱性重送。
+            assertEquals("429/408 不得觸發重送", 2, web.requestCount)
         } finally {
             web.shutdown()
         }
@@ -600,6 +641,56 @@ class McpServerSemanticsTest {
             assertEquals(McpStatus.UNAUTHORIZED, server.callTool("t", "{}").status)
             assertEquals("無 key 不得發 HTTP", 0, web.requestCount)
             assertEquals("無 key 不計熔斷", 0, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun blankBaseUrlIsUnauthorizedWithoutHttp() = runBlocking {
+        // 空 baseUrl：配置錯誤 → UNAUTHORIZED（與 vault-miss 同待遇），
+        // 不發 HTTP、不碰 vault、不計熔斷（此分支曾零覆蓋，final review P2）。
+        val web = MockWebServer()
+        web.start()
+        try {
+            val vault = FakeVault()
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = "   "),
+                keyVault = vault,
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            assertEquals(McpStatus.UNAUTHORIZED, server.listTools().status)
+            assertEquals(McpStatus.UNAUTHORIZED, server.callTool("t", "{}").status)
+            assertEquals("空地址不得發 HTTP", 0, web.requestCount)
+            assertEquals("空地址不得碰 vault", 0, vault.reads)
+            assertEquals("空地址不計熔斷", 0, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun oversizedSuccessListBodyIsProtocolNotOk() = runBlocking {
+        // list 端 200＋超量 body → PROTOCOL + 計熔斷（McpResponseTooLarge catch
+        // 的 list 分支，曾無 E2E——刪掉會靜默降級 TRANSPORT）。
+        val web = MockWebServer()
+        web.start()
+        try {
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            web.enqueue(
+                MockResponse().setResponseCode(200)
+                    .setChunkedBody("[".repeat(300 * 1024), 8192),
+            )
+            val got = deadline { server.listTools() }
+            assertEquals("超量 200 list 不得回 OK", McpStatus.PROTOCOL, got.status)
+            assertTrue(got.tools.isEmpty())
+            assertEquals(1, breaker.failureCount())
         } finally {
             web.shutdown()
         }

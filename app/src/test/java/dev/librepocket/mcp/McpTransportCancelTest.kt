@@ -341,6 +341,36 @@ class McpTransportCancelTest {
         }
     }
 
+    @Test fun hugeContentLengthHeaderRejectedBeforeReading() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        val signals = CallSignals()
+        try {
+            // Content-Length 預檢分支：謊報 content-length 1MiB（> 256KiB cap）而實送
+            // 1KiB → 收到標頭即拋＋cancel，不排空 body。刪預檢分支時會落到讀迴圈
+            // 讀到 EOF/截斷（IOException 或 OK Success）而非 McpResponseTooLarge，故紅。
+            web.enqueue(
+                MockResponse().setResponseCode(200)
+                    .setBody("z".repeat(1024))
+                    .setHeader("Content-Length", "1048576"),
+            )
+            val outcome = withTimeoutOrNull(5_000) {
+                runCatching {
+                    transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                }
+            }
+            assertNotNull("Content-Length 超量必須立即拋出", outcome)
+            assertTrue(
+                "Content-Length 預檢必須拋 McpResponseTooLarge，實際=$outcome",
+                outcome!!.exceptionOrNull() is McpResponseTooLarge,
+            )
+            assertCallCancelled(signals, "Content-Length 預檢 terminal")
+            assertEquals(1, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
     @Test fun charOverCapThrowsInsteadOfTruncatedOk() = runBlocking {
         val web = MockWebServer()
         web.start()

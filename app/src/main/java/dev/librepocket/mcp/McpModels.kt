@@ -102,7 +102,8 @@ data class McpListResult(
  *
  * @param resultJson 僅駐記憶體的原始結果（呼叫方消費後丟棄，永不寫盤）；
  *   [auditMap] 刻意不含 arguments 與 result。
- * @param errorMessage 伺服器 error 包的 message（wire 層上限 200 字元；
+ * @param errorMessage 伺服器 error 包的 message（上限 200 UTF-16 code units
+ *   ＝surrogate-safe 截斷，見 [McpWire.truncateUnits]；
  *   僅 [McpStatus.TOOL_ERROR] 時非 null——伺服器未提供 message 時為
  *   wire 層預設字串 `tool error`；`isError=true` 結果路徑的 TOOL_ERROR
  *   為 null——該路徑無伺服器 message，詳情在 [resultJson]）。

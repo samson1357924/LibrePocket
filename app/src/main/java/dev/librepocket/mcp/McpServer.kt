@@ -58,7 +58,7 @@ class McpServer(
             return McpListResult(config.id, emptyList(), McpStatus.CIRCUIT_OPEN, clockMs() - start)
         }
         if (config.baseUrl.isBlank()) {
-            // 空地址：配置錯誤，不碰 vault、不計熔斷（沿用 UNAUTHORIZED 語義，相容既有測試）。
+            // 空地址：配置錯誤，不碰 vault、不計熔斷（UNAUTHORIZED，與 vault-miss 同待遇）。
             return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, clockMs() - start)
         }
         try {
@@ -107,6 +107,9 @@ class McpServer(
                 breaker.onFailure()
                 return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
             }
+            // 其餘 4xx/5xx → TRANSPORT（含 406/415：本子集只送 Accept: application/json、
+            // 不協商 text/event-stream，合規 server 若回 406 屬互通差異——歸暫態並計熔斷，
+            // 3 連敗即開路，不無限重試。有意決策，見 THREAT_MODEL MCP 行）。
             if (code !in 200..299 || text.isNullOrBlank()) {
                 breaker.onFailure()
                 return McpListResult(config.id, emptyList(), McpStatus.TRANSPORT, clockMs() - start)
@@ -170,6 +173,7 @@ class McpServer(
             return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
         }
         if (config.baseUrl.isBlank()) {
+            // 空地址：配置錯誤，不碰 vault、不計熔斷（沿用 UNAUTHORIZED 語義）。
             return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, clockMs() - start)
         }
         try {
@@ -180,6 +184,7 @@ class McpServer(
         }
         val key = keyVault.getKey(config.keyId)
         if (key == null) {
+            // 無 key 不計熔斷（配置問題，非傳輸失敗）。
             return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, clockMs() - start)
         }
         val bearer: String
@@ -231,7 +236,7 @@ class McpServer(
             } catch (e: McpWire.McpToolFailure) {
                 // 僅 -32602/未知碼 error 包會到此（協議碼於 parseCall 拋 McpProtocol
                 // → 下方 IAE catch → PROTOCOL + 計熔斷）；工具級錯誤中性，不碰熔斷計數。
-                // errorMessage 透傳伺服器 message（wire 層上限 200；不進 auditMap）。
+                // errorMessage 透傳伺服器 message（wire 層上限 200 UTF-16 code units；不進 auditMap）。
                 breaker.onNeutral()
                 McpCallResult(
                     config.id,
@@ -240,7 +245,7 @@ class McpServer(
                     clockMs() - start,
                     null,
                     true,
-                    errorMessage = e.message?.take(200),
+                    errorMessage = e.message?.let { McpWire.truncateUnits(it, 200) },
                 )
             } catch (_: IllegalArgumentException) {
                 breaker.onFailure()

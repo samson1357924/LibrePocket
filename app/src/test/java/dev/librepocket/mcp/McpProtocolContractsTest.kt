@@ -555,10 +555,15 @@ class McpProtocolContractsTest {
         val web = MockWebServer()
         web.start()
         try {
+            // 鑑別力 fixture：body 是**合法** JSON-RPC result——若刪掉傳輸層 CT 早擋，
+            // parser 會收下並回 OK；有早擋才 PROTOCOL（cancel 不讀滿）。
             web.enqueue(
                 MockResponse().setResponseCode(200)
                     .addHeader("Content-Type", "text/event-stream")
-                    .setBody("event: message\ndata: {\"jsonrpc\":\"2.0\"}\n\n"),
+                    .setBody(
+                        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                            "[{\"name\":\"a\",\"inputSchema\":{\"type\":\"object\"}}]}}",
+                    ),
             )
             val breaker = McpCircuitBreaker()
             val server = McpServer(

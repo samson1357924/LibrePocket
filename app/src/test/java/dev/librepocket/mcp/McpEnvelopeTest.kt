@@ -7,6 +7,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -167,6 +168,17 @@ class McpEnvelopeTest {
         } catch (e: McpWire.McpProtocol) {
             assertEquals("mcp: unexpected error response", e.message)
         }
+        // error:null 亦拒（error 鍵存在即拒，含 null——與 call 端 bad error 對稱）。
+        try {
+            McpWire.parseList(
+                "s1",
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]},\"error\":null}",
+                expectedId = 1L,
+            )
+            fail("list 不得收 error:null")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: unexpected error response", e.message)
+        }
     }
 
     // ---- 出站預檢（callBody fail-closed） ----
@@ -186,6 +198,41 @@ class McpEnvelopeTest {
         McpWire.parseStrictDoc(
             McpWire.callBody("t".repeat(McpWire.TOOL_NAME_MAX_CHARS), "{}"),
         )
+    }
+
+    @Test fun oversizedInboundToolNameIsTruncatedNotRejected() {
+        // 不對稱政策 pin（已文件化）：入站（list 回應）超限名截到 128 後採納
+        //（保頁面可用），出站（callBody）直接拒——兩面各自鎖死，防政策漂移。
+        val name200 = "n".repeat(McpWire.TOOL_NAME_MAX_CHARS + 72)
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"$name200\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        val tools = McpWire.parseList("s1", json, expectedId = 1L)
+        assertEquals(1, tools.size)
+        assertEquals(
+            "入站超限名必須截到 128",
+            McpWire.TOOL_NAME_MAX_CHARS,
+            tools[0].name.length,
+        )
+    }
+
+    @Test fun surrogateBoundaryTruncationAppliesToNameAndDescription() {
+        // P3 pin：name(128)/description(500) 呼叫點確實走 truncateUnits（非 take），
+        // 截斷點落在 surrogate pair 中間時退 1——改回 take 此處即紅
+        //（errorMessage 呼叫點另有 errorMessageTruncationIsSurrogateSafe 釘住）。
+        val emoji = "😀" // 2 UTF-16 units
+        // name：127 個 n + emoji = 129 units，128 截斷落在 high surrogate → 退 1。
+        val name = "n".repeat(McpWire.TOOL_NAME_MAX_CHARS - 1) + emoji
+        // description：499 個 d + emoji = 501 units，500 截斷同理 → 退 1。
+        val desc = "d".repeat(499) + emoji
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"$name\",\"description\":\"$desc\"," +
+            "\"inputSchema\":{\"type\":\"object\"}}]}}"
+        val tools = McpWire.parseList("s1", json, expectedId = 1L)
+        assertEquals(1, tools.size)
+        assertEquals("name 截斷不得留孤立 surrogate", 127, tools[0].name.length)
+        assertEquals("description 截斷不得留孤立 surrogate", 499, tools[0].description.length)
+        assertFalse("name 尾不得是 high surrogate", tools[0].name.last().isHighSurrogate())
+        assertFalse("description 尾不得是 high surrogate", tools[0].description.last().isHighSurrogate())
     }
 
     @Test fun callBodyRejectsOversizedArguments() {

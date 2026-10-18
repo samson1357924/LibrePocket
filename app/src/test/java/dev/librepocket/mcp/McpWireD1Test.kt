@@ -225,6 +225,10 @@ class McpWireD1Test {
             "badLiteralTrailingChars" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":123abc}",
             "badLiteralTRUE" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":TRUE}",
             "badLiteralUndefined" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":undefined}",
+            // 數字嚴格性（NUMBER_RE）：前導零／正號／尾點不得被當合法數字。
+            "badLiteralLeadingZero" to "{\"jsonrpc\":\"2.0\",\"id\":02,\"result\":{}}",
+            "badLiteralPlusSign" to "{\"jsonrpc\":\"2.0\",\"id\":+2,\"result\":{}}",
+            "badLiteralTrailingDot" to "{\"jsonrpc\":\"2.0\",\"id\":2.,\"result\":{}}",
         )
         for ((name, json) in badEnvelopeCases) {
             try {

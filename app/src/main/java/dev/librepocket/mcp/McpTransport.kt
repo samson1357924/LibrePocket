@@ -40,9 +40,13 @@ import okio.BufferedSink
  * - 不自動跟隨 redirect：3xx 為終端回應（[McpServer] 映射 PROTOCOL + 計熔斷），
  *   `tools/call` body／Bearer 只會送到預驗過的初始端點；
  *   注入的 client 經 [transportClient] 強制套用 redirect／連線失敗重試／503 重送／
- *   authenticator／cookie／cache 政策，且 POST body 為 one-shot（OkHttp 層的
- *   replay 分支一律拒送）；注入 client 自帶的 application interceptor 屬受信任的
- *   呼叫方元件，不在本層防禦邊界內（對齊 provider 同款界線）；
+ *   authenticator／cookie／cache 政策，且 POST body 為 one-shot（其餘 replay 分支
+ *   由 one-shot 拒送；503＋Retry-After: 0 由 [RetryAfterStrip] 於 network 層剝除，
+ *   與 one-shot 閘雙重；[OneShotJsonBody] 另帶二次寫入 tripwire 硬失敗）；注入 client 的 application interceptor、
+ *   network interceptor、`Dns`／TLS（`sslSocketFactory`/`hostnameVerifier`）／
+ *   `proxySelector`／`connectionSpecs`／`protocols` 設定屬受信任的呼叫方元件
+ *   （可繞過本層防禦——如外側 network interceptor 重加 `Retry-After: 0`），
+ *   不在本層防禦邊界內（對齊 provider 同款界線）；
  * - 2xx 配非 JSON Content-Type（如 `text/event-stream`）早擋為 `McpProtocol`
  *   （不讀滿 body；缺席則交 parser 判定）；
  * - 回傳 null = 本步超時（呼叫方映射為 [McpStatus.TIMEOUT]，不重試）。
@@ -98,8 +102,9 @@ class McpTransport(
 
         /**
          * 成功 body 位元組安全上限：覆蓋既有 `take(64_000)` 字元語義的所有語言
-         * （64k 字元 × UTF-8 最大 4 bytes = 256KiB），讀塊 8KiB 同級 provider。
-         * 超量一律拋 [McpResponseTooLarge]（fail-closed），不回截斷 JSON。
+         *（任何在字元上限內的 body 必 < 64k×4 = 256000 bytes < 256KiB，故位元組
+         * cap 只在已超字元上限或位元組流本身巨大時才會先觸發），讀塊 8KiB 同級 provider。
+         * 超量（達 cap 即拋）一律 [McpResponseTooLarge]（fail-closed），不回截斷 JSON。
          */
         internal const val RESPONSE_MAX_BYTES = 256L * 1024L
 
@@ -228,16 +233,26 @@ private val JSON_MEDIA_TYPE: MediaType = "application/json; charset=utf-8".toMed
 /**
  * one-shot POST body：OkHttp 5.5.0 的 `408`、`421` 與 `recover()` 分支檢查到
  * `isOneShot` 即原樣回傳該回應、不再重送（同 provider `OneShotJsonBody`）。
- * `503 + Retry-After: 0` 與 `authenticator` 兩個分支**不看** `isOneShot`，
- * 分別由 [RetryAfterStrip] 與 `Authenticator.NONE` 擋下（三道閘各守一路）。
+ * 重送三道閘：`RetryAndFollowUpInterceptor` 本體有通用 `followUp.body.isOneShot()`
+ * 閘（涵蓋 503/401/redirect 的 followUp 路徑）；`503 + Retry-After: 0` 分支本身
+ * 不檢查 isOneShot 也不看 `retryOnConnectionFailure`（408/421 分支才有 per-branch
+ * isOneShot 檢查），故 [RetryAfterStrip] 另在 network 層剝除該指令作為縱深，
+ * 不依賴 one-shot 政策；`authenticator`/`proxyAuthenticator` 由 `NONE` 擋下。
  * `tools/call` 非 idempotent（MCP 工具預設 WRITE），這是把「非 idempotent 只送一次」
- * 釘在 OkHttp 層的最後一道閘。每次 `postJson` 皆新建 body，單次消費不影響正常單發路徑。
+ * 釘在 OkHttp 層的最後一道閘；[writeTo] 另帶二次寫入 tripwire（政策回歸時硬失敗，
+ * 對外經 [McpServer] 收斂為 TRANSPORT + 計熔斷，不 crash）。每次 `postJson` 皆
+ * 新建 body，單次消費不影響正常單發路徑。
  */
 internal class OneShotJsonBody(private val json: String) : RequestBody() {
+    private var written = false
     override fun contentType(): MediaType = JSON_MEDIA_TYPE
     override fun contentLength(): Long = json.toByteArray(Charsets.UTF_8).size.toLong()
     override fun isOneShot(): Boolean = true
     override fun writeTo(sink: BufferedSink) {
+        // tripwire：任何重送路徑（政策回歸、攔截器鏈破壞 one-shot 保護）若二次
+        // 寫入 body，大聲失敗而非靜默重複副作用（非 idempotent 工具的硬 invariant）。
+        check(!written) { "mcp: one-shot body replayed" }
+        written = true
         sink.writeUtf8(json)
     }
 }
@@ -289,7 +304,7 @@ private fun readBoundedBody(body: ResponseBody?, cancelCall: () -> Unit): String
     val charCap = McpTransport.RESPONSE_MAX_CHARS
     if (body.contentLength() > byteCap) {
         cancelCall()
-        throw McpResponseTooLarge("mcp: response body exceeds $byteCap bytes")
+        throw McpResponseTooLarge("mcp: response body exceeds $byteCap bytes (content-length)")
     }
     val source = body.source()
     val bytes = Buffer()
@@ -300,8 +315,9 @@ private fun readBoundedBody(body: ResponseBody?, cancelCall: () -> Unit): String
         remaining -= read
     }
     if (remaining == 0L) {
+        // 讀滿 byteCap 即視為超量（達 cap 拒，>= 語義——不嘗試探測 cap+1）。
         cancelCall()
-        throw McpResponseTooLarge("mcp: response body exceeds $byteCap bytes")
+        throw McpResponseTooLarge("mcp: response body reaches $byteCap bytes")
     }
     val text = bytes.readByteArray().toResponseBody(body.contentType()).string()
     if (text.length > charCap) {

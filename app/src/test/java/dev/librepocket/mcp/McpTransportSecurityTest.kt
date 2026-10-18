@@ -57,7 +57,24 @@ class McpTransportSecurityTest {
             "{\"content\":[{\"type\":\"text\",\"text\":\"x\"}],\"isError\":false}}",
     )
 
-    // ---- 1. cross-origin redirect 不跟隨：body 不外送（review P1）----
+    // ---- 1. one-shot body tripwire：二次寫入硬失敗 ----
+
+    @Test fun oneShotBodyTripwireFailsLoudOnSecondWrite() {
+        // tripwire 是對未來回歸的硬閘（政策破壞 one-shot 保護時大聲失敗，
+        // 不靜默重複副作用）；此處直接雙寫驗其存在——刪 check 即紅。
+        val body = OneShotJsonBody("{\"a\":1}")
+        val sink = okio.Buffer()
+        body.writeTo(sink)
+        assertEquals("{\"a\":1}", sink.readUtf8())
+        try {
+            body.writeTo(okio.Buffer())
+            fail("one-shot body 二次寫入必須硬失敗（tripwire）")
+        } catch (e: IllegalStateException) {
+            assertTrue(e.message!!.contains("one-shot body replayed"))
+        }
+    }
+
+    // ---- 2. cross-origin redirect 不跟隨：body 不外送（review P1）----
 
     @Test fun redirect307DoesNotReplayArgumentsToUnvalidatedOrigin() = runBlocking {
         val origin = MockWebServer()
@@ -123,7 +140,7 @@ class McpTransportSecurityTest {
         }
     }
 
-    // ---- 2. 注入的 permissive client 一律正規化 ----
+    // ---- 3. 注入的 permissive client 一律正規化 ----
 
     @Test fun injectedClientWithRedirectsEnabledIsNeutralized() = runBlocking {
         val origin = MockWebServer()
@@ -156,7 +173,7 @@ class McpTransportSecurityTest {
         }
     }
 
-    // ---- 3. 503 + Retry-After:0 不在 OkHttp 內部重送（review F-02）----
+    // ---- 4. 503 + Retry-After:0 不在 OkHttp 內部重送（review F-02）----
 
     @Test fun retryAfterZeroDoesNotReplayToolsCall() = runBlocking {
         val web = MockWebServer()
@@ -182,7 +199,7 @@ class McpTransportSecurityTest {
         }
     }
 
-    // ---- 4. 直調 transport 的明文 fail-closed（KDoc「直調亦擋」）----
+    // ---- 5. 直調 transport 的明文 fail-closed（KDoc「直調亦擋」）----
 
     @Test fun directPostJsonToInsecureEndpointThrowsBeforeAnySocket() = runBlocking {
         // TEST-NET-1（RFC 5737，預期不可路由）：若預驗失效，退化行為會是嘗試連線後失敗，
@@ -200,7 +217,7 @@ class McpTransportSecurityTest {
         }
     }
 
-    // ---- 5. 3xx 契約端到端：list 與 call 皆 PROTOCOL，成功路徑不受影響 ----
+    // ---- 6. 3xx 契約端到端：list 與 call 皆 PROTOCOL，成功路徑不受影響 ----
 
     @Test fun redirectRefusedThenNextCallSucceedsNormally() = runBlocking {
         val web = MockWebServer()
@@ -229,7 +246,7 @@ class McpTransportSecurityTest {
         }
     }
 
-    // ---- 6. 單次預算的正向控制：正常 200 路徑仍完全可用 ----
+    // ---- 7. 單次預算的正向控制：正常 200 路徑仍完全可用 ----
 
     @Test fun happyPathStillSingleRoundTripWithBearer() = runBlocking {
         val web = MockWebServer()
@@ -263,7 +280,7 @@ class McpTransportSecurityTest {
         }
     }
 
-    // ---- 7. 單次預算元件的直接釘子（防回歸成隱性重送）----
+    // ---- 8. 單次預算元件的直接釘子（防回歸成隱性重送）----
 
     @Test fun transportClientIsIdempotentAndForcesAllPolicyKnobs() {
         // defaultHttp() 已套用 → 建構子再套用一次不得重複掛攔截器。

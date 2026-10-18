@@ -22,8 +22,8 @@ import org.robolectric.annotation.Config
  * #14 Intent adapter 修碼測試（Stage1，Play scoped）。
  *
  * 三決策對應：
- * - a) SET_ALARM 發送端免 `<uses-permission>`（見 [AlarmTool] KDoc）：manifest
- *   不加宣告（pinned by [manifest_noSetAlarmUsesPermission])，接收端強制要求則
+ * - a) SET_ALARM 發送端需 `<uses-permission>`（官方 Common Intents 契約；見 [AlarmTool] KDoc）：manifest
+ *   必須宣告（pinned by [manifest_declaresSetAlarmSenderPermission])，接收端保護仍在時
  *   `SecurityException` → INTERNAL（pinned by [alarm_deniedSender_mapsToInternal])；
  *   發射時無處理者走自有提醒降級（pinned by [alarm_launchNoHandler_degradesToOwnReminder])。
  * - b) package visibility 最小 queries（SET_ALARM + 日曆 INSERT/EDIT，見主
@@ -87,11 +87,21 @@ class IntentAdapterStage1Test {
     assertTrue(manifest.contains("<data android:mimeType=\"vnd.android.cursor.item/event\" />"))
   }
 
-  @Test fun manifest_noSetAlarmUsesPermission() {
-    // 決策 a)：SET_ALARM 發送端無需宣告；任何 flavor 加了就是權限面擴大。
-    for (text in listOf(mainManifest()) + listOf("play", "foss", "github").map(::flavorManifest)) {
-      assertFalse(text.contains("com.android.alarm.permission.SET_ALARM"))
-      assertFalse(text.contains("android.permission.SET_ALARM"))
+  @Test fun manifest_declaresSetAlarmSenderPermission() {
+    // 決策 a)：官方契約要求發送端持有 normal 級 com.android.alarm.permission.SET_ALARM，
+    // 故 common manifest 必須宣告（缺權會在真機被 SecurityException 拒絕）。
+    val manifest = mainManifest()
+    assertTrue(
+      manifest.contains("<uses-permission android:name=\"com.android.alarm.permission.SET_ALARM\" />"),
+    )
+    // 不可寫成 framework 命名空間（android.permission.SET_ALARM 不存在）。
+    assertFalse(manifest.contains("android.permission.SET_ALARM"))
+    // 三 flavor 疊加層不得各自偷加（權限只在 common 宣告一次）。
+    for (flavor in listOf("play", "foss", "github")) {
+      assertFalse(
+        "$flavor overlay 不得重複宣告 SET_ALARM 權限",
+        flavorManifest(flavor).contains("com.android.alarm.permission.SET_ALARM"),
+      )
     }
   }
 
@@ -240,14 +250,22 @@ class IntentAdapterStage1Test {
   }
 
   @Test fun alarm_deniedSender_mapsToInternal() {
-    // 缺權分型：接收端強制要求而我方未持有 → SecurityException → INTERNAL（非 NO_HANDLER）。
+    // 缺權分型：接收端保護仍在而我方未持有 → SecurityException → INTERNAL（非 NO_HANDLER）。
+    // 此路徑為 fail-closed 防禦；正常情況發送端已宣告 normal 級 SET_ALARM 權限（見上）。
     val app = appContext()
     addResolve(app, Intent(IntentActions.SET_ALARM))
     val denied = object : ContextWrapper(app) {
-      override fun startActivity(intent: Intent): Unit = throw SecurityException("deny")
+      override fun startActivity(intent: Intent): Unit = throw SecurityException("deny-secret")
     }
     val r = AndroidIntentLauncher(denied).launch(AlarmTool.buildSetAlarmIntent(AlarmTool.Params(7, 30)))
     assertTrue(r is LaunchResult.Internal)
+    // 只附 cause 類名，不得回顯例外 message（PII/秘密不外洩）。
+    val msg = r.toToolResult(
+      AlarmTool.buildSetAlarmIntent(AlarmTool.Params(7, 30)),
+      "設定鬧鐘",
+    ).message
+    assertTrue("INTERNAL 訊息應含例外類名：$msg", msg.contains("SecurityException"))
+    assertFalse("INTERNAL 訊息不得回顯例外 message：$msg", msg.contains("deny-secret"))
   }
 
   @Test fun flags_grantReadAndClearTask_droppedViaToIntent() {

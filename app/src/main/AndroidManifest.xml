@@ -13,6 +13,13 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
+    <!-- #14 SET_ALARM 發送端權限（官方 Common Intents 契約）：接收端 activity 的
+         `android:permission="com.android.alarm.permission.SET_ALARM"` 限制的是
+         「呼叫端」——Google Clock / AOSP DeskClock 的 SET_ALARM handler 以此權限
+         保護，發送 App 未持有會在 startActivity 被 SecurityException 拒絕。此為
+         normal 級權限（安裝即自動授權、非高風險，Play 不需申報或 Data Safety 披露）。 -->
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+
     <!-- S2 系統語音辨識：委託系統 RecognizerIntent（無 RECORD_AUDIO 新權限）。
          queries 僅宣告可見性，供 PackageManager 解析辨識服務；
          action 必須是 RECOGNIZE_SPEECH（與 VoiceStt.ACTION 同字面值），
@@ -37,8 +44,8 @@
                CalendarContract.Events.CONTENT_TYPE（dir/event）/
                CONTENT_ITEM_TYPE（item/event）匹配日曆 App 過濾器；queries 的
                path 屬性一律視為 *，故不寫 data URI。
-             刻意不加任何 uses-permission：SET_ALARM 發送端無需宣告（見
-             AlarmTool KDoc 決策）；DELETE 動作不經 launcher 發射（僅待寫描述）。
+             刻意不宣告 DELETE（不經 launcher 發射，僅待寫描述）。SET_ALARM 發送端
+             權限見上方 uses-permission（官方契約要求，非宣告即被拒）。
              直啟（setPackage）不採用：OEM 時鐘/日曆包名各異，硬編碼等於猜測
              包名（#19 猜測執行禁令），且剝奪使用者選擇器。 -->
         <intent>

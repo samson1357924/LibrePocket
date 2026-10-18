@@ -7,13 +7,15 @@ package dev.librepocket.systema
  * 非 `ToolDescriptor` 欄位；目前尚無生產呼叫方，接線 PR 啟用；`SystemEnv` 無生產 producer，
  * `timeoutMs` 僅宣告未強制，見 [ToolRegistry]）。
  *
- * 權限決策（#14：採「修正註解＋降級語義」，不加 manifest 宣告）：
- * SET_ALARM 發送端無需任何 `<uses-permission>`——AOSP `AlarmClock` 只要求
- * 接收端 activity 持有 `com.android.alarm.permission.SET_ALARM`（時鐘 App
- * 自行宣告），發送端走 `startActivity` 交由使用者選擇器，無發送端宣告要求
- * （`ACTION_SET_ALARM` 區塊無 `@RequiresPermission`；權限註記只出現在
- * DISMISS/TIMER 動作）。故不為發送端加宣告（加了也是死重且擴大 Play 權限面）。
- * 個別裝置時鐘若自行強制要求而觸發 `SecurityException`，[AndroidIntentLauncher]
+ * 權限決策（#14：發送端需宣告 normal 級 `com.android.alarm.permission.SET_ALARM`）：
+ * 官方 Common Intents 明確要求「要發送 ACTION_SET_ALARM，App 必須持有
+ * `com.android.alarm.permission.SET_ALARM`」。接收端 activity（Google Clock /
+ * AOSP DeskClock 的 SET_ALARM handler）以 `android:permission` 保護時，該屬性
+ * 限制的是**呼叫端**：未持有此權限的發送 App 在 `startActivity` 會被系統以
+ * `SecurityException` 拒絕。此為 normal 級權限（安裝即自動授權、非高風險，
+ * Play 不需申報或 Data Safety 披露），故於 common manifest 宣告，三風味一致。
+ * 個別時鐘 App 若未以該權限保護，亦不影響：持有 normal 權限者一律可發射。
+ * 若未來時鐘 App 改變保護方式而觸發其他 `SecurityException`，[AndroidIntentLauncher]
  * 已收斂為 `INTERNAL`（fail-closed，不靜默退回猜測執行；僅附 cause 類名，
  * 不含 message/PII，亦無 audit——intent 層不審計，由未來 dispatcher 層統一審計）。
  * 降級「自有提醒」才需要精準鬧鐘申報

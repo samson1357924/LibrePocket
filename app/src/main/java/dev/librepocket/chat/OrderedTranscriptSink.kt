@@ -78,10 +78,16 @@ class OrderedTranscriptSink(
      */
     val outcome: AtomicReference<Boolean?>? = null,
     /**
-     * Best-effort accounting entry: a stall or non-VM failure in [block]
-     * must not block subsequent durable core writes or seal the writer.
-     * Such entries are executed under a bounded timeout and their
-     * non-VM-fatal failures are swallowed.
+     * Best-effort accounting entry: a cancellation-cooperative stall or
+     * non-VM failure in [block] must not block subsequent durable core writes
+     * or seal the writer. Such entries run under [BEST_EFFORT_TIMEOUT_MS]
+     * (skipped on timeout) and their non-VM failures (including non-VM
+     * Errors) are swallowed; CancellationException from real scope teardown
+     * and VM-fatal/ThreadDeath still propagate. A store call that blocks
+     * without a suspension point (e.g. a blocking transaction on the writer
+     * thread) cannot be preempted by the timeout — that is the same shared
+     * store limit as core entries, documented in the P1 spec, and is not
+     * covered by this flag.
      */
     val bestEffort: Boolean = false,
   )
@@ -726,11 +732,8 @@ class OrderedTranscriptSink(
   override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) =
     writeOrdered(bestEffort = true) { delegate.onUsage(runId, inputTokens, outputTokens) }
 
-  override suspend fun flushBufferedUsageBestEffort(
-    runId: String,
-    parentRunId: String?,
-    attemptIndex: Int?,
-  ) = writeOrdered(bestEffort = true) { delegate.flushBufferedUsageBestEffort(runId, parentRunId, attemptIndex) }
+  override suspend fun flushBufferedUsageBestEffort(runId: String) =
+    writeOrdered(bestEffort = true) { delegate.flushBufferedUsageBestEffort(runId) }
 
   /**
    * Awaits the unified admission tail until stable (no newer reservation).
@@ -1263,6 +1266,13 @@ class OrderedTranscriptSink(
         val flushed = try {
           flush(drainTimeoutMs)
         } catch (_: Throwable) {
+          // Security Finding3 (Stage-3, intentional teardown swallow): same
+          // rationale as the settle catch above — a throw here (non-VM Error
+          // from a broken store, a CE from a flush bug, even VM-fatal) must
+          // fall through to the orphan mark + seal below instead of aborting
+          // the teardown; the writer entry loop already rethrew any VM-fatal
+          // to seal. flushed=false drives the fail-closed path, so the
+          // swallow can never fabricate durability.
           false
         }
         if (!flushed) {
@@ -1414,6 +1424,24 @@ class OrderedTranscriptSink(
       }
       pendingCore.remove(runId)
       if (!interrupted.contains(runId)) interrupted.add(runId)
+    }
+  }
+
+  /**
+   * Atomic landing-check variant of [markInterrupted] for cancel
+   * compensation: mark [runId] only when no commit landed after the caller's
+   * [beforeCommitCount] snapshot. The count re-check and the mark run under
+   * [submitTruthLock] (nested [poisonLock] inside it, the established
+   * submitTruthLock → poisonLock order shared with [clearTimeoutMarkOnCommit]),
+   * closing the read→mark gap: a commit racing the caller's timeout either
+   * bumped the count before this lock (mark skipped) or takes the same lock
+   * afterwards and clears any mark via [clearTimeoutMarkOnCommit] — never a
+   * sticky false INTERRUPTED.
+   */
+  internal fun markInterruptedIfNoNewCommit(runId: String, beforeCommitCount: Int) {
+    synchronized(submitTruthLock) {
+      val after = commitCounts[runId]?.get() ?: 0
+      if (after <= beforeCommitCount) markInterrupted(runId)
     }
   }
 

@@ -90,12 +90,17 @@ import kotlinx.coroutines.CancellationException
  * propagates so the session writer fails the ack instead of reporting a
  * false durable write. [onTurnRetried], [onSteerQueued] and [onToolDone] stay
  * best-effort notices: failures are swallowed and never break the chat loop.
- * [onUsage] itself never throws (best-effort call), but the merged row is
- * persisted durably with the attempt terminal (#84), never one row per call.
- * Cancellation propagates for core writes. Post-core accounting paths
- * ([flushBufferedUsageBestEffort]) swallow it so a cancelled best-effort
- * usage write cannot negate an already-committed terminal ack (P1 #2); the
- * separate trailing [onUsage] entry follows the general propagation contract.
+ * [onUsage] itself never throws (best-effort call); the merged row is
+ * persisted best-effort as a standalone `system` row right after the attempt
+ * terminal commits (#84) — deliberately outside the terminal unit — never one
+ * row per call. Cancellation propagates for core writes. The post-core
+ * accounting path ([flushBufferedUsageBestEffort]) rethrows
+ * [CancellationException] and VM-fatal itself; the enclosing
+ * [dev.librepocket.chat.OrderedTranscriptSink] best-effort entry loop swallows
+ * a cancellable stall / non-VM failure while the writer scope is live (real
+ * teardown still propagates), so a stalled usage write cannot negate an
+ * already-committed terminal ack (P1 #2). The separate trailing [onUsage]
+ * entry follows the general propagation contract.
  * Text is redacted again by [RoomSessionStore] on write.
  *
  * Cross-restart RUNNING → INTERRUPTED backfill lives in Phase 3 as well (see
@@ -239,24 +244,27 @@ class SessionTranscriptSink(
 
     /**
      * Post-ack authoritative usage flush (#84 follow-up, fail-closed
-     * accounting): persists the run's buffered pre-terminal usage as one
-     * `system` row AFTER the core terminal ack, best-effort (failures
-     * swallowed by [appendNotice], never break the terminal — usage is
-     * accounting, never load-bearing). Call only after the core write
-     * returns: the usage row is deliberately NOT part of the terminal unit,
-     * so a usage-write failure on a non-atomic store fallback can never
-     * leave a committed final behind a thrown terminal (see [onUsage]).
-     * On core failure the entry stays buffered (bounded residue, same
-     * discipline as [terminalizedRuns]) so a same-runId terminal retry
-     * still owns its authoritative row. Marks [trailingUsageWritten] when a
-     * row is flushed, so a later trailing call drops (exactly one usage row
-     * per runId ever).
+     * accounting): persists the run's buffered pre-terminal usage as one bare
+     * `system` row after the core terminal has committed, best-effort
+     * (non-cancellation / non-VM failures are swallowed by its own internal
+     * catch — never break the terminal; usage is accounting, never
+     * load-bearing). The row never carries attempt linkage
+     * (`parentRunId`/`attemptIndex` stay null): the JSONL S2-F2 shape gate
+     * allows linkage only on assistant/reasoning rows, and the legacy trailing
+     * path ([onUsage]) already writes linkage-free rows.
+     * Call only after the core write's ack completed or its bounded wait
+     * expired (a cancelled host may call with the ack still in flight): the
+     * usage row is deliberately NOT part of the terminal unit, so a
+     * usage-write failure on a non-atomic store fallback can never leave a
+     * committed final behind a thrown terminal (see [onUsage]). On core
+     * failure the entry stays buffered (bounded residue, same discipline as
+     * [terminalizedRuns]) so a same-runId terminal retry still owns its
+     * authoritative row. Marks [trailingUsageWritten] when a row is flushed,
+     * so a later trailing call drops and a second flush is idempotent (exactly
+     * one usage row per runId ever, except an unavoidable at-least-once window
+     * when the first write's ack is cancelled after the store committed).
      */
-    override suspend fun flushBufferedUsageBestEffort(
-        runId: String,
-        parentRunId: String?,
-        attemptIndex: Int?,
-    ) {
+    override suspend fun flushBufferedUsageBestEffort(runId: String) {
         // Mutual exclusion with the trailing path: if a trailing usage already
         // landed for this runId, drop the buffered entry (no duplicate row).
         if (runId in trailingUsageWritten) {
@@ -277,8 +285,8 @@ class SessionTranscriptSink(
                     createdAt = clock(),
                     isPartial = false,
                     failureReason = null,
-                    parentRunId = parentRunId,
-                    attemptIndex = attemptIndex,
+                    parentRunId = null,
+                    attemptIndex = null,
                     isFinal = true,
                 ),
             )

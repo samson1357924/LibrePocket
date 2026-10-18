@@ -62,6 +62,11 @@ class SessionTranscriptSinkUsageTest {
         assertEquals(1, rows.size)
         assertEquals("usage input=10 output=20", rows.single().text)
         assertEquals("r1", rows.single().runId)
+        // S2-F2 shape gate: the usage row is a bare system row — it never
+        // carries attempt linkage (parentRunId/attemptIndex), matching
+        // JsonlCodec's import gate for system rows.
+        assertEquals(null, rows.single().parentRunId)
+        assertEquals(null, rows.single().attemptIndex)
     }
 
     @Test
@@ -159,7 +164,7 @@ class SessionTranscriptSinkUsageTest {
         sink.onUsage("r1", 7, null)
         sink.onUsage("r1", null, 8)
         sink.onTurnFailed("r1", "half", "boom", null, 0, true, false)
-        sink.flushBufferedUsageBestEffort("r1", null, 0)
+        sink.flushBufferedUsageBestEffort("r1")
 
         val rows = usageRows(store)
         assertEquals(1, rows.size)
@@ -174,7 +179,7 @@ class SessionTranscriptSinkUsageTest {
 
         sink.onUsage("r1", 3, 4)
         sink.onTurnCancelled("r1", "partial", null, 0, false)
-        sink.flushBufferedUsageBestEffort("r1", null, 0)
+        sink.flushBufferedUsageBestEffort("r1")
 
         val rows = usageRows(store)
         assertEquals(1, rows.size)
@@ -192,7 +197,7 @@ class SessionTranscriptSinkUsageTest {
 
             repeat(count) { i -> sink.onUsage("r1", i, i * 2) }
             sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
-        sink.flushBufferedUsageBestEffort("r1")
+            sink.flushBufferedUsageBestEffort("r1")
 
             val rows = usageRows(store)
             assertEquals("$count events still one row", 1, rows.size)
@@ -229,7 +234,7 @@ class SessionTranscriptSinkUsageTest {
         val sink = SessionTranscriptSink(store, sid) { 42L }
 
         sink.onTurnFailed("r1", "half", "boom", null, 0, true, false)
-        sink.flushBufferedUsageBestEffort("r1", null, 0)
+        sink.flushBufferedUsageBestEffort("r1")
         sink.onUsage("r1", 10, 20)
         sink.onUsage("r1", 11, 21)
 
@@ -309,7 +314,7 @@ class SessionTranscriptSinkUsageTest {
 
         sink.onUsage("r1", 7, 8)
         sink.onTurnFailed("r1", "half", "boom", null, 0, true, false)
-        sink.flushBufferedUsageBestEffort("r1", null, 0)
+        sink.flushBufferedUsageBestEffort("r1")
 
         val partials = store.events.filter { it.runId == "r1" && it.kind == "assistant" }
         assertEquals(1, partials.size)
@@ -326,7 +331,7 @@ class SessionTranscriptSinkUsageTest {
 
         sink.onUsage("r1", 3, 4)
         sink.onTurnCancelled("r1", "partial", null, 0, false)
-        sink.flushBufferedUsageBestEffort("r1", null, 0)
+        sink.flushBufferedUsageBestEffort("r1")
 
         val partials = store.events.filter { it.runId == "r1" && it.kind == "assistant" }
         assertEquals(1, partials.size)

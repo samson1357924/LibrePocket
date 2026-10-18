@@ -3,6 +3,7 @@ package dev.librepocket.chat
 import java.util.Collections
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
@@ -745,6 +746,116 @@ class OrderedTranscriptSinkTest {
           release.complete(Unit)
         }
       }
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  // ---- #94 best-effort accounting entries: bounded skip, non-sealing, and
+  // non-VM swallow vs VM-fatal seal. ----
+
+  @Test fun stalledBestEffortUsageIsBoundedAndSkipped() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val stall = CompletableDeferred<Unit>()
+      val notices = AtomicInteger(0)
+      val delegate = object : SinkProbe() {
+        override suspend fun flushBufferedUsageBestEffort(runId: String) {
+          // Cancellation-cooperative stall (a wedged store await): the writer
+          // must time the entry out and keep draining.
+          stall.await()
+        }
+
+        override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) {
+          notices.incrementAndGet()
+        }
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 8)
+      runBlocking {
+        withTimeout(10_000) {
+          sink.flushBufferedUsageBestEffort("r1")
+          // Admitted behind the stalled entry: the bounded skip must let it run.
+          sink.onUsage("r1", 1, 2)
+          assertTrue("writer must drain after the bounded skip", sink.flush(5_000))
+        }
+      }
+      assertEquals(1, notices.get())
+      assertFalse("best-effort stall must not seal the writer", sink.isSealed())
+      assertFalse("a skipped accounting write is not a durable failure", sink.hasDurableFailures())
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  @Test fun bestEffortNonVmFatalIsSwallowed() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val notices = AtomicInteger(0)
+      val delegate = object : SinkProbe() {
+        override suspend fun flushBufferedUsageBestEffort(runId: String) {
+          // Non-VM fatal (Error, not Exception): best-effort accounting must
+          // swallow it instead of sealing the writer like a core entry would.
+          throw AssertionError("simulated accounting fatal")
+        }
+
+        override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) {
+          notices.incrementAndGet()
+        }
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 8)
+      runBlocking {
+        withTimeout(10_000) {
+          sink.flushBufferedUsageBestEffort("r1")
+          sink.onUsage("r1", 1, 2)
+          assertTrue("writer must drain past the swallowed fatal", sink.flush(5_000))
+        }
+      }
+      assertEquals(1, notices.get())
+      assertFalse("non-VM fatal in a best-effort entry must not seal", sink.isSealed())
+      assertFalse(sink.hasDurableFailures())
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  @Test fun bestEffortVmFatalStillSeals() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val entered = CompletableDeferred<Unit>()
+      val release = CompletableDeferred<Unit>()
+      val delegate = object : SinkProbe() {
+        override suspend fun flushBufferedUsageBestEffort(runId: String) {
+          // VM-fatal is never swallowed, even on a best-effort entry: the
+          // writer must end (seal) instead of pretending the accounting ran.
+          // Latched so the flush barrier is provably parked behind this entry
+          // before the fatal fires (no send-vs-seal race in the assertion).
+          entered.complete(Unit)
+          release.await()
+          throw OutOfMemoryError("simulated VM fatal")
+        }
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 8)
+      runBlocking {
+        withTimeout(10_000) {
+          sink.flushBufferedUsageBestEffort("r1")
+          entered.await()
+          val flushOutcome = async {
+            runCatching { sink.flush(2_000) }
+          }
+          delay(100) // barrier admitted, parked behind r1
+          release.complete(Unit)
+          val outcome = flushOutcome.await()
+          val failure = outcome.exceptionOrNull()
+          assertTrue(
+            "VM-fatal must propagate to the parked flush, got $outcome",
+            failure is OutOfMemoryError,
+          )
+        }
+      }
+      assertTrue("VM-fatal must seal the writer", sink.isSealed())
     } finally {
       exec.shutdown()
     }

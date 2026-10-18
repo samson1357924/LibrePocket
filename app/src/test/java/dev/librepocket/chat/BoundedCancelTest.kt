@@ -233,7 +233,9 @@ class BoundedCancelTest {
     }
     val n = AtomicInteger(0)
     // Injected 1s bound (production 5s): proves the mechanism without a real
-    // 5s stall; the 6s fence below is the spec's production-convergence bar.
+    // 5s stall. The 6s fence asserts the CORE bound only: the handler's usage
+    // transfer/persist/drain run outside it under 2s best-effort bounds
+    // (usage is empty here, so those steps are instant).
     val c = TurnController(
       provider = provider,
       policy = BoundedCancelPolicy(),
@@ -258,8 +260,10 @@ class BoundedCancelTest {
         }
       }
       c.cancel()
-      // Bounded convergence: the wedged immediate write times out (1s bound)
-      // instead of parking the host; 6s is the spec bar for production 5s.
+      // Bounded convergence: the wedged immediate write times out (1s core
+      // bound) instead of parking the host; 6s fences that core bound (plus
+      // the instant empty-usage best-effort steps), not the full production
+      // wall time.
       // Prove the wedge was actually hit (cancel entered the stuck delegate)
       // before latching convergence, so the timeout — not a fast path — owns it.
       assertTrue(
@@ -307,7 +311,9 @@ class BoundedCancelTest {
    * converge bounded via timeout markInterrupted on the precise logical id
    * (never true-and-dangling, never a duplicate assistant).
    *
-   * Production 5s bound; test injects 1s like the streaming wedge above.
+   * Production 5s core bound; test injects 1s like the streaming wedge above
+   * (the fence asserts that core bound; the usage best-effort steps run
+   * outside it).
    */
   @Test fun wedgedSuppressedCancel_hostConvergesBounded_flushFalse_reopenSingleInterrupted() {
     val store = WedgedSystemStore()

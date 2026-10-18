@@ -387,4 +387,64 @@ class TerminalAckCancelGapTest {
   // cell suffices for the对照 requirement (success final, COMMITTED, zero new).
   // A second Room retryable cell is intentionally omitted (Fake grid already
   // pins the system-mark branch; Room here pins real-DB durability for finals).
+  // ---------------------------------------------------------------------------
+
+  @Test fun successCancelBetweenCommitAndAckKeepsUsageRow() {
+    // Same commit→ack hold as the Room cell above, with provider usage on the
+    // attempt: the suppressed-final cancel branch persists the buffered
+    // authoritative usage as a bare system row AFTER the durable success final
+    // (it was silently dropped before the #94 fix). Linkage stays null so the
+    // JSONL shape gate accepts the row on export/import.
+    val db = LibrePocketDb.openInMemory(ApplicationProvider.getApplicationContext())
+    try {
+      val store = RoomSessionStore(db) { 1_700_000_000_000L }
+      val sid = runBlocking { store.createSession("hi", "m") }
+      val provider = GapProvider {
+        flow {
+          emit(StreamEvent.Usage(11, 22))
+          emit(StreamEvent.TextDelta(0, 0, "ok"))
+          emit(StreamEvent.Done("stop"))
+        }
+      }
+      val n = AtomicInteger(0)
+      val c = controller(provider, SessionTranscriptSink(store, sid), n)
+      val commits = AtomicInteger(0)
+      val committedLatch = CountDownLatch(1)
+      val releaseWriter = CountDownLatch(1)
+      c.afterCommitBeforeAckForTest = {
+        if (commits.incrementAndGet() == 2) {
+          committedLatch.countDown()
+          releaseWriter.await(5, TimeUnit.SECONDS)
+        }
+      }
+      try {
+        val host = startedHost(c)
+        assertTrue("terminal never committed", committedLatch.await(5, TimeUnit.SECONDS))
+        c.cancel()
+        Thread.sleep(300)
+        releaseWriter.countDown()
+        joinHost(host)
+        flush(c)
+        val events = runBlocking { store.loadEvents(sid, 0, 100) }
+        // (a) user + success final + usage; no cancel row, no duplicate.
+        assertEquals(listOf("user", "assistant", "system"), events.map { it.kind })
+        assertEquals("usage input=11 output=22", events[2].text)
+        // (b) bare system row: no attempt linkage (JSONL S2-F2 shape gate).
+        assertEquals(null, events[2].parentRunId)
+        assertEquals(null, events[2].attemptIndex)
+        // (c) the whole transcript survives the JSONL export/import gate
+        // (linkage on a system row would throw here).
+        events.forEachIndexed { i, e -> JsonlCodec.decode(i + 1, JsonlCodec.encode(e)) }
+        // (d) family closed by the success final (one usage row, never a
+        // second terminal).
+        assertTrue("dangling: $events", findDanglingRunIds(events).isEmpty())
+        assertEquals(1, events.count { it.kind == "system" && it.text.startsWith("usage ") })
+      } finally {
+        releaseWriter.countDown()
+        c.close()
+      }
+    } finally {
+      db.close()
+    }
+  }
 }

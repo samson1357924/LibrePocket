@@ -408,9 +408,13 @@ class TurnController(
    *
    * Current (S3-F2): this bound owns all three wedged-writer convergences.
    * Production is 5s ([CANCEL_RECEIPT_COMPENSATION_TIMEOUT_MS]); tests inject
-   * 1s to prove the mechanism without a real 5s stall (the 6s fence below is
-   * the spec's production-convergence bar). Target: single shared ledger
-   * budget instead of three shares of this timeout.
+   * 1s to prove the mechanism without a real 5s stall. #94 note: the
+   * immediate-cancel handler now wraps its usage transfer + persist + drain in
+   * their own [OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS] bounds OUTSIDE
+   * this core bound, so a worst-case handler can exceed this timeout by up to
+   * three best-effort bounds (the 6s fence asserts the core bound, not the
+   * full handler wall time). Target: single shared ledger budget instead of
+   * three shares of this timeout.
    */
   private val cancelCompensationTimeoutMs: Long = CANCEL_RECEIPT_COMPENSATION_TIMEOUT_MS,
   /**
@@ -700,9 +704,7 @@ class TurnController(
             pending.attemptIndexRef.get(),
           )
           try {
-            orderedTranscript.flushBufferedUsageBestEffort(
-              pending.attemptRef.get(), pending.logicalTurnId, pending.attemptIndexRef.get(),
-            )
+            orderedTranscript.flushBufferedUsageBestEffort(pending.attemptRef.get())
           } catch (e: Throwable) {
             if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
           }
@@ -1219,9 +1221,9 @@ class TurnController(
             false
           } else {
             try {
-              orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId, receipt.cancelParent, receipt.cancelIndex)
+              orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId)
               if (receipt.cancelId != receipt.logicalTurnId) {
-                orderedTranscript.flushBufferedUsageBestEffort(receipt.logicalTurnId, null, receipt.cancelIndex)
+                orderedTranscript.flushBufferedUsageBestEffort(receipt.logicalTurnId)
               }
               orderedTranscript.flush()
             } catch (e: Throwable) {
@@ -1262,7 +1264,10 @@ class TurnController(
             false
           } else {
             try {
-              orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId, receipt.cancelParent, receipt.cancelIndex)
+              orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId)
+              if (receipt.cancelId != receipt.logicalTurnId) {
+                orderedTranscript.flushBufferedUsageBestEffort(receipt.logicalTurnId)
+              }
               orderedTranscript.flush()
             } catch (e: Throwable) {
               if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
@@ -1303,7 +1308,10 @@ class TurnController(
             false
           } else {
             try {
-              orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId, receipt.cancelParent, receipt.cancelIndex)
+              orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId)
+              if (receipt.cancelId != receipt.logicalTurnId) {
+                orderedTranscript.flushBufferedUsageBestEffort(receipt.logicalTurnId)
+              }
               orderedTranscript.flush()
             } catch (e: Throwable) {
               if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
@@ -1350,7 +1358,10 @@ class TurnController(
             false
           } else {
             try {
-              orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId, receipt.cancelParent, receipt.cancelIndex)
+              orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId)
+              if (receipt.cancelId != receipt.logicalTurnId) {
+                orderedTranscript.flushBufferedUsageBestEffort(receipt.logicalTurnId)
+              }
               orderedTranscript.flush()
             } catch (e: Throwable) {
               if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
@@ -4043,6 +4054,28 @@ class TurnController(
         // Durable and non-cancellable: the host is cancelled but the session
         // writer is independent, so the record below still drains on close (or
         // is explicitly marked INTERRUPTED instead of silently dropped).
+        //
+        // #84: the terminal path already transferred this attempt's usage
+        // into the sink buffer before the terminal entry was registered.
+        // Persist it as a bare system row bounded here; FIFO admission keeps
+        // it behind the terminal's slot whenever that terminal lands. On the
+        // acked/COMMITTED sub-case no receipt exists; on the still-pending
+        // SUBMITTING sub-case a PENDING receipt exists, but its revoke and
+        // compensation paths do not own usage (dedup-safe via
+        // trailingUsageWritten), so the host persists here either way. This
+        // branch dropped the buffered usage silently before the flush.
+        withContext(NonCancellable) {
+          try {
+            withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+              orderedTranscript.flushBufferedUsageBestEffort(cancelId)
+              if (cancelId != logicalTurnId) {
+                orderedTranscript.flushBufferedUsageBestEffort(logicalTurnId)
+              }
+            }
+          } catch (e: Throwable) {
+            if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+          }
+        }
       } else {
         // S3-F2: bounded immediate cancel. The compensation runs in
         // NonCancellable (channel.send + ack.await); without a timeout a
@@ -4060,16 +4093,33 @@ class TurnController(
         //
         // Current (S3-F2): production 5s, tests inject 1s (see
         // cancelCompensationTimeoutMs). Target: split notice/terminal bounds.
+        // #84 isolation: the authoritative usage transfer + persist runs
+        // OUTSIDE the timed core unit below (before/after, each under its own
+        // best-effort bound), so a stalled accounting write can never consume
+        // the core budget and turn a committed cancel into a false
+        // INTERRUPTED mark. Worst-case handler wall time is therefore
+        // transfer ≤ 1x best-effort bound + core ≤ cancelCompensationTimeoutMs
+        // + persist ≤ 1x + drain ≤ 1x (≈ 11s with the production 5s core; the
+        // 6s test fence asserts the core bound, not this total). The deferred
+        // (notice-first) case is owned by the cancel receipt waiter, which
+        // flushes after its deferred core write; a waiter that degrades to
+        // SEALED without a deferred write intentionally drops the usage row
+        // with the dangling family (reopen backfill owns the family, usage is
+        // export-only data).
+        val deferred = terminalSubmitting && !acked && !terminalCommitted
         withContext(NonCancellable) {
           try {
-            // #84: flush usage outside the timed core-compensation block so a
-            // stalled accounting write cannot consume the cancel budget.
+            // #84: transfer the controller's usage cell into the sink buffer
+            // before the core unit (the persist below reads the buffer).
             try {
               withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
                 flushAttemptUsage(cancelId)
               }
-            } catch (_: Throwable) {
+            } catch (e: Throwable) {
+              if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
             }
+            val landingId = if (suppressed) logicalTurnId else cancelId
+            val beforeLanded = orderedTranscript.coreSubmitTruth(landingId).commitCount
             val completed = withTimeoutOrNull(cancelCompensationTimeoutMs) {
               if (suppressed) {
                 // R18-1 Stage 2: split already-durable vs still-pending.
@@ -4086,18 +4136,9 @@ class TurnController(
                 // dangling (reopen INTERRUPTED takes over) instead of user+system
                 // closed without the partial. Timeout / seal exits write no
                 // terminal row here (notice only or nothing).
-                val deferred = terminalSubmitting && !acked && !terminalCommitted
                 if (!deferred) {
                   try {
                     orderedTranscript.onLogicalTurnCancelled(logicalTurnId, cancelId, cancelText, cancelIndex)
-                    try {
-                      orderedTranscript.flushBufferedUsageBestEffort(cancelId, cancelParent, cancelIndex)
-                      if (cancelId != logicalTurnId) {
-                        orderedTranscript.flushBufferedUsageBestEffort(logicalTurnId, null, null)
-                      }
-                    } catch (e: Throwable) {
-                      if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
-                    }
                   } catch (_: ClosedSendChannelException) {
                   } catch (sealFailure: CancellationException) {
                     if (!orderedTranscript.isSealed()) throw sealFailure
@@ -4130,11 +4171,6 @@ class TurnController(
               } else {
                 try {
                   orderedTranscript.onTurnCancelled(cancelId, cancelText, cancelParent, cancelIndex, cancelReasoning)
-                  try {
-                    orderedTranscript.flushBufferedUsageBestEffort(cancelId, cancelParent, cancelIndex)
-                  } catch (e: Throwable) {
-                    if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
-                  }
                 } catch (_: ClosedSendChannelException) {
                   // Sealed after close(): explicit INTERRUPTED mark already recorded.
                 } catch (sealFailure: CancellationException) {
@@ -4151,19 +4187,36 @@ class TurnController(
                 }
               }
             }
-            if (completed == null) {
-              // Timeout: no terminal row was written. Deferred notice-first
-              // keeps the PENDING receipt above (waiter → COMPENSATED/SEALED);
-              // every other path marks INTERRUPTED so the dangling family
-              // stays visible to flushDurable/reopen instead of reporting
-              // true-and-dangling.
-              val receiptOwned = terminalSubmitting && !acked && !terminalCommitted
-              if (!receiptOwned) {
-                if (suppressed) {
-                  orderedTranscript.markInterrupted(logicalTurnId)
-                } else {
-                  orderedTranscript.markInterrupted(cancelId)
+            // #84: accounting persist outside the timed core unit. The
+            // deferred (notice-first) case is owned by the cancel receipt
+            // waiter (it flushes after its deferred core write); every other
+            // case persists here, bounded, so a stalled usage write cannot
+            // extend the core compensation budget.
+            if (!deferred) {
+              try {
+                withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+                  orderedTranscript.flushBufferedUsageBestEffort(cancelId)
+                  if (suppressed && cancelId != logicalTurnId) {
+                    orderedTranscript.flushBufferedUsageBestEffort(logicalTurnId)
+                  }
                 }
+              } catch (e: Throwable) {
+                if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+              }
+            }
+            if (completed == null) {
+              // Core-unit timeout. [markInterruptedIfNoNewCommit] re-checks the
+              // landing truth under the sink's submitTruthLock after the delta
+              // snapshot ([beforeLanded]), so a commit that landed just before
+              // the timeout is never poisoned with a false INTERRUPTED mark
+              // (and a commit racing the mark itself still clears it via
+              // clearTimeoutMarkOnCommit). Deferred notice-first keeps the
+              // PENDING receipt above (waiter → COMPENSATED/SEALED); every
+              // other path marks INTERRUPTED only when nothing new landed, so
+              // a dangling family stays visible to flushDurable/reopen instead
+              // of reporting true-and-dangling.
+              if (!deferred) {
+                orderedTranscript.markInterruptedIfNoNewCommit(landingId, beforeLanded)
               }
             }
             // Best-effort drain of accounting writes without consuming the
@@ -4172,7 +4225,8 @@ class TurnController(
               withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
                 orderedTranscript.flush()
               }
-            } catch (_: Throwable) {
+            } catch (e: Throwable) {
+              if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
             }
           } catch (_: ClosedSendChannelException) {
             // Sealed after close(): explicit INTERRUPTED mark already recorded.
@@ -4950,10 +5004,10 @@ class TurnController(
         terminalizedAttempts.add(attemptRunId)
         withContext(NonCancellable) {
           try {
-            orderedTranscript.flushBufferedUsageBestEffort(
-              attemptRunId, parentFor(attemptRunId, logicalTurnId), attempt,
-            )
+            // Bounded end-to-end (admission + drain): a wedged best-effort
+            // usage write must not park the host past its own timeout.
             withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+              orderedTranscript.flushBufferedUsageBestEffort(attemptRunId)
               orderedTranscript.flush()
             }
           } catch (e: Throwable) {
@@ -5003,10 +5057,10 @@ class TurnController(
         terminalizedAttempts.add(attemptRunId)
         withContext(NonCancellable) {
           try {
-            orderedTranscript.flushBufferedUsageBestEffort(
-              attemptRunId, parentFor(attemptRunId, logicalTurnId), attempt,
-            )
+            // Bounded end-to-end (admission + drain): a wedged best-effort
+            // usage write must not park the host past its own timeout.
             withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+              orderedTranscript.flushBufferedUsageBestEffort(attemptRunId)
               orderedTranscript.flush()
             }
           } catch (e: Throwable) {
@@ -5050,10 +5104,10 @@ class TurnController(
       terminalizedAttempts.add(attemptRunId)
       withContext(NonCancellable) {
         try {
-          orderedTranscript.flushBufferedUsageBestEffort(
-            attemptRunId, parentFor(attemptRunId, logicalTurnId), attempt,
-          )
+          // Bounded end-to-end (admission + drain): a wedged best-effort
+          // usage write must not park the host past its own timeout.
           withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+            orderedTranscript.flushBufferedUsageBestEffort(attemptRunId)
             orderedTranscript.flush()
           }
         } catch (e: Throwable) {

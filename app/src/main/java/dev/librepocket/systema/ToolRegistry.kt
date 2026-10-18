@@ -3,11 +3,10 @@ package dev.librepocket.systema
 /**
  * 快通道工具契約：每個 A 組工具都實現 check / execute / fallback 三件套。
  *
- * builder 的 `require` IAE/ISE 由 [AlarmTool.execute] 與
- * [CalendarTool.execute]/[executeUpdate]/[executeDelete] 內 try-catch 收斂為
- * [ToolResult]（INTERNAL，spec=null），不穿透生產迴圈。
- * 其餘工具（Volume/Navigation/Music）仍直接外洩，屬 Target 缺口，
- * 未來 dispatcher 須統一在呼叫 parse/builder 側包 try-catch 收斂。
+ * builder 的 `require` IAE/ISE 由各工具 `execute` 內 try-catch 收斂為
+ * [ToolResult]（INTERNAL，spec=null），不穿透生產迴圈：
+ * [AlarmTool.execute]、[CalendarTool.execute]/[executeUpdate]/[executeDelete]、
+ * [VolumeTool.execute]、[NavigationTool.execute] 皆已收斂（#15）。
  * parse 側（模型參數 → Params，未來 dispatcher 唯一入口）同樣拋 IAE/ISE，
  * 未來 dispatcher 須在呼叫 parse 側包 try-catch 收斂為 `ToolResult`；
  * 生產尚無 dispatcher 接線，目前 parse 僅測試直調。

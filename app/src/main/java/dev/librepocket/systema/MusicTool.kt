@@ -84,10 +84,18 @@ object MusicTool : SystemTool<MusicTool.Params> {
       )
     }
     val spec = buildPlayIntent(params)
-    return launcher.launchCatching(spec).toToolResult(
-      spec, "播放音樂",
-      usedFallbackOnSuccess = !env.hasMusicApp, successReason = check.reasonCode,
-    )
+    return when (val launched = launcher.launchCatching(spec)) {
+      // 發現式缺席（靜態有播放器但發射無處理者：被移除/停用/不可見）與靜態
+      // DEGRADED 同語義：走 [fallback] 話術（可替代網頁播放器），spec 保留。
+      LaunchResult.NoHandler -> ToolResult(
+        false, true, spec, ReasonCodes.NO_HANDLER, fallback(params, env).userMessage,
+      )
+      // Success/Internal 走共用收斂（Internal 收斂為 INTERNAL）。
+      else -> launched.toToolResult(
+        spec, "播放音樂",
+        usedFallbackOnSuccess = !env.hasMusicApp, successReason = check.reasonCode,
+      )
+    }
   }
 
   override fun fallback(params: Params, env: SystemEnv): FallbackSpec = FallbackSpec(

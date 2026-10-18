@@ -78,7 +78,15 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
     if (!check.executable) {
       return ToolResult(false, false, null, check.reasonCode, "做不到導航（${check.reasonCode}）")
     }
-    val spec = resolve(params, env)
+    // fail-closed：resolve 的座標守衛 IAE（單側座標/越界）收斂為 INTERNAL，不穿透。
+    val spec = try {
+      resolve(params, env)
+    } catch (e: IllegalArgumentException) {
+      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到導航（${ReasonCodes.INTERNAL}）")
+    } catch (e: IllegalStateException) {
+      if (e is kotlin.coroutines.cancellation.CancellationException) throw e
+      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到導航（${ReasonCodes.INTERNAL}）")
+    }
     return launcher.launchCatching(spec).toToolResult(
       spec, "導航",
       usedFallbackOnSuccess = !env.hasMapApp, successReason = check.reasonCode,

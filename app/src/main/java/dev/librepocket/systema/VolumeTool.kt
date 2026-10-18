@@ -71,7 +71,15 @@ object VolumeTool : SystemTool<VolumeTool.Params> {
     }
     // 音量走 AudioManager 直調，不經 Intent；此處以 panel spec 佔位錨定超時語義，
     // 端側攔截本結果後改走 AudioManager（見 AndroidIntentLauncher.applyVolume）。
-    val op = buildOp(params)
+    // fail-closed：builder IAE（SET 缺 index／負值）收斂為 INTERNAL，不穿透生產迴圈。
+    val op = try {
+      buildOp(params)
+    } catch (e: IllegalArgumentException) {
+      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到調音量（${ReasonCodes.INTERNAL}）")
+    } catch (e: IllegalStateException) {
+      if (e is kotlin.coroutines.cancellation.CancellationException) throw e
+      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到調音量（${ReasonCodes.INTERNAL}）")
+    }
     return ToolResult(true, false, volumePanelSpec(), null, "stream=${op.streamSdkValue} dir=${op.direction}")
   }
 

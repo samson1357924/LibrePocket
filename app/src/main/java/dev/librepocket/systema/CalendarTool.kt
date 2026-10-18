@@ -303,7 +303,7 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
       if (e is kotlin.coroutines.cancellation.CancellationException) throw e
       return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到更新日曆事件（${ReasonCodes.INTERNAL}）")
     }
-    return ToolResult(false, true, pending, ReasonCodes.NEED_PERMISSION, "做不到更新日曆事件（${ReasonCodes.NEED_PERMISSION}）")
+    return ToolResult(false, true, pending, ReasonCodes.NEED_PERMISSION, fallbackUpdate(params, ReasonCodes.NEED_PERMISSION).userMessage)
   }
 
   /**
@@ -343,7 +343,7 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
       if (e is kotlin.coroutines.cancellation.CancellationException) throw e
       return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到刪除日曆事件（${ReasonCodes.INTERNAL}）")
     }
-    return ToolResult(false, true, IntentSpec(action = IntentActions.DELETE, dataUri = uri), ReasonCodes.NEED_PERMISSION, "做不到刪除日曆事件（${ReasonCodes.NEED_PERMISSION}）")
+    return ToolResult(false, true, IntentSpec(action = IntentActions.DELETE, dataUri = uri), ReasonCodes.NEED_PERMISSION, fallbackDelete(params, ReasonCodes.NEED_PERMISSION).userMessage)
   }
 
   /**

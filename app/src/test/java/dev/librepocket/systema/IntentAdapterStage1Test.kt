@@ -632,6 +632,114 @@ class IntentAdapterStage1Test {
     assertFalse("靜態不可執行不得調用 launcher", called)
   }
 
+  // ---- g. #15 對齊：Volume/Navigation builder 非法經 execute 收斂為 INTERNAL ----
+
+  @Test fun volume_execute_invalidParams_convergesToInternal() {
+    var called = false
+    val launcher = IntentLauncher { called = true; LaunchResult.Success }
+    for (p in listOf(
+      VolumeTool.Params(direction = VolumeTool.Direction.SET), // index 缺席
+      VolumeTool.Params(direction = VolumeTool.Direction.SET, index = -1),
+    )) {
+      called = false
+      val r = VolumeTool.execute(p, env, launcher)
+      assertFalse(r.ok)
+      assertFalse(r.usedFallback)
+      assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+      assertNull(r.spec)
+      assertTrue(r.message.contains(ReasonCodes.INTERNAL))
+      assertFalse("builder 非法不得調用 launcher", called)
+    }
+  }
+
+  @Test fun navigation_execute_invalidParams_convergesToInternal() {
+    var called = false
+    val launcher = IntentLauncher { called = true; LaunchResult.Success }
+    for (p in listOf(
+      NavigationTool.Params(latitude = 91.0, longitude = 0.0), // 緯度越界
+      NavigationTool.Params(latitude = 1.0, longitude = null), // 單側座標
+      NavigationTool.Params(latitude = Double.NaN, longitude = 1.0), // 非有限值
+    )) {
+      called = false
+      val r = NavigationTool.execute(p, env, launcher)
+      assertFalse(r.ok)
+      assertFalse(r.usedFallback)
+      assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+      assertNull(r.spec)
+      assertTrue(r.message.contains(ReasonCodes.INTERNAL))
+      assertFalse("builder 非法不得調用 launcher", called)
+    }
+  }
+
+  // ---- h. #15 對齊：Music NoHandler 走降級話術（與 Alarm/Calendar 同形） ----
+
+  @Test fun music_executeNoHandler_degradesToWebPlayer() {
+    // 靜態 DEGRADED（無播放器）與發現式缺席（有播放器但發射無處理者）同語義：
+    // ok=false + usedFallback=true + NO_HANDLER + 網頁播放器話術（spec 保留）。
+    val noHandler = IntentLauncher { LaunchResult.NoHandler }
+    val degraded = MusicTool.execute(MusicTool.Params("輕音樂"), env.copy(hasMusicApp = false), noHandler)
+    assertFalse(degraded.ok)
+    assertTrue(degraded.usedFallback)
+    assertEquals(ReasonCodes.NO_HANDLER, degraded.reasonCode)
+    assertTrue(degraded.message, "網頁播放器" in degraded.message)
+    assertEquals(IntentActions.VIEW, degraded.spec?.action)
+
+    val discovered = MusicTool.execute(MusicTool.Params("輕音樂"), env, noHandler)
+    assertFalse(discovered.ok)
+    assertTrue(discovered.usedFallback)
+    assertEquals(ReasonCodes.NO_HANDLER, discovered.reasonCode)
+    assertTrue(discovered.message, "網頁播放器" in discovered.message)
+  }
+
+  // ---- i. #15 對齊：Calendar Provider 門禁分支涵蓋 ----
+
+  @Test fun calendar_checkQuery_readGrantedMatrix() {
+    val granted = CalendarTool.checkQuery(env.copy(calendarReadGranted = true))
+    assertEquals(Availability.NATIVE, granted.availability)
+    val denied = CalendarTool.checkQuery(env.copy(calendarReadGranted = false))
+    assertEquals(Availability.DEGRADED, denied.availability)
+    assertEquals(ReasonCodes.NEED_PERMISSION, denied.reasonCode)
+  }
+
+  @Test fun calendar_checkUpdate_noApp_writeGrantedMatrix() {
+    val noApp = env.copy(hasCalendarApp = false)
+    val writeGranted = CalendarTool.checkUpdate(noApp.copy(calendarWriteGranted = true))
+    assertEquals(Availability.DEGRADED, writeGranted.availability)
+    assertEquals(ReasonCodes.NEED_PERMISSION, writeGranted.reasonCode)
+    val writeDenied = CalendarTool.checkUpdate(noApp.copy(calendarWriteGranted = false))
+    assertEquals(Availability.DEGRADED, writeDenied.availability)
+    assertEquals(ReasonCodes.NEED_PERMISSION, writeDenied.reasonCode)
+  }
+
+  @Test fun calendar_noApp_needPermissionMessage_matchesFallback() {
+    // 無 App 的 NEED_PERMISSION 話術應與 NoHandler 用手動降級話術一致，
+    // 且必須含「手動」與原因碼（直接斷言，避免只與 fallback 相對比較）。
+    val noApp = env.copy(hasCalendarApp = false)
+    val u = CalendarTool.executeUpdate(
+      CalendarTool.UpdateParams(eventId = "7", title = "例會"), noApp,
+      IntentLauncher { LaunchResult.Success },
+    )
+    assertEquals(
+      CalendarTool.fallbackUpdate(CalendarTool.UpdateParams(eventId = "7", title = "例會"), ReasonCodes.NEED_PERMISSION).userMessage,
+      u.message,
+    )
+    assertTrue(u.message, "手動" in u.message)
+    assertTrue(u.message, "（${ReasonCodes.NEED_PERMISSION}）" in u.message)
+    val d = CalendarTool.executeDelete(CalendarTool.DeleteParams("9"), noApp, IntentLauncher { LaunchResult.Success })
+    assertEquals(
+      CalendarTool.fallbackDelete(CalendarTool.DeleteParams("9"), ReasonCodes.NEED_PERMISSION).userMessage,
+      d.message,
+    )
+    assertTrue(d.message, "手動" in d.message)
+    assertTrue(d.message, "（${ReasonCodes.NEED_PERMISSION}）" in d.message)
+  }
+
+  @Test fun calendar_checkDelete_delegatesToCheckUpdate() {
+    val noApp = env.copy(hasCalendarApp = false)
+    assertEquals(CalendarTool.checkUpdate(noApp), CalendarTool.checkDelete(noApp))
+    assertEquals(CalendarTool.checkUpdate(env), CalendarTool.checkDelete(env))
+  }
+
   @Test fun execute_userDisabled_returnsDisabledNotNoHandler() {
     // USER_DISABLED 由 execute 早期回傳，不得經 fallback 取 NO_HANDLER 話術；
     // launcher 不得被調用，spec 為 null。

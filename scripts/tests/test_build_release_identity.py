@@ -1151,6 +1151,44 @@ class ReleaseTagVersionTest(unittest.TestCase):
         result_json = json.loads(good_pins.stdout)
         self.assertEqual(result_json.get("status"), "ok")
 
+    def test_raw_string_literals_cannot_satisfy_the_gate(self) -> None:
+        path = self.tmp / "raw-string.gradle.kts"
+        path.write_text(
+            'val releaseCode = 9\n'
+            'val releaseName = "9.9.9"\n'
+            'val documentation = """\n'
+            'versionCode = 1\n'
+            'versionName = "0.1.0"\n'
+            '"""\n'
+            '\n'
+            'android {\n'
+            '    defaultConfig {\n'
+            '        versionCode = releaseCode\n'
+            '        versionName = releaseName\n'
+            '    }\n'
+            '}\n',
+            encoding="utf-8",
+        )
+        with self.assertRaises(tag_version.TagVersionError):
+            tag_version.parse_gradle_version(str(path))
+
+    def test_unrelated_scope_literals_cannot_satisfy_the_gate(self) -> None:
+        path = self.tmp / "unrelated-scope.gradle.kts"
+        path.write_text(
+            'versionCode = 1\n'
+            'versionName = "0.1.0"\n'
+            '\n'
+            'android {\n'
+            '    defaultConfig {\n'
+            '        versionCode = releaseCode\n'
+            '        versionName = releaseName\n'
+            '    }\n'
+            '}\n',
+            encoding="utf-8",
+        )
+        with self.assertRaises(tag_version.TagVersionError):
+            tag_version.parse_gradle_version(str(path))
+
 
 if __name__ == "__main__":
     unittest.main()

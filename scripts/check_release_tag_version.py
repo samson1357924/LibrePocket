@@ -82,10 +82,15 @@ def _strip_kotlin_comments(text: str) -> str:
             i += 1
             while i < n:
                 if text[i] == "\\":
+                    nxt = text[i + 1 : i + 2]
+                    if nxt == "" or nxt == "\n":
+                        break  # unterminated escape at EOL
                     i += 2
                 elif text[i] == '"':
                     i += 1
                     break
+                elif text[i] == "\n":
+                    break  # unterminated string at EOL
                 else:
                     i += 1
         elif text.startswith("/*", i):
@@ -116,6 +121,167 @@ def _strip_kotlin_comments(text: str) -> str:
     return "".join(out)
 
 
+def _find_matching_brace(text: str, open_index: int) -> int:
+    """Return index of the brace matching the '{' at open_index, or -1."""
+    if open_index < 0 or open_index >= len(text) or text[open_index] != "{":
+        return -1
+    depth = 0
+    i = open_index
+    n = len(text)
+    while i < n:
+        if text.startswith('"""', i):
+            end = text.find('"""', i + 3)
+            i = n if end == -1 else end + 3
+            continue
+        elif text[i] == '"':
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    nxt = text[i + 1 : i + 2]
+                    if nxt == "" or nxt == "\n":
+                        i = n
+                        break
+                    i += 2
+                elif text[i] == '"':
+                    i += 1
+                    break
+                elif text[i] == "\n":
+                    break
+                else:
+                    i += 1
+            continue
+        elif text[i] == "'":
+            i += 1
+            while i < n and text[i] != "\n":
+                if text[i] == "\\":
+                    nxt = text[i + 1 : i + 2]
+                    if nxt == "" or nxt == "\n":
+                        break
+                    if nxt == "u":
+                        if "\n" in text[i : i + 6] or len(text) < i + 6:
+                            break
+                        i += 6
+                    else:
+                        i += 2
+                elif text[i] == "'":
+                    i += 1
+                    break
+                else:
+                    i += 1
+            continue
+        elif text[i] == "{":
+            depth += 1
+            i += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+            i += 1
+        else:
+            i += 1
+    return -1
+
+
+def _string_intervals(text: str) -> list[tuple[int, int]]:
+    """Return (start, end) half-open intervals covering string literals."""
+    intervals: list[tuple[int, int]] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith('"""', i):
+            end = text.find('"""', i + 3)
+            if end == -1:
+                intervals.append((i, n))
+                break
+            intervals.append((i, end + 3))
+            i = end + 3
+        elif text[i] == '"':
+            start = i
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    nxt = text[i + 1 : i + 2]
+                    if nxt == "" or nxt == "\n":
+                        i = n
+                        break
+                    i += 2
+                elif text[i] == '"':
+                    i += 1
+                    break
+                elif text[i] == "\n":
+                    break
+                else:
+                    i += 1
+            intervals.append((start, i))
+        elif text[i] == "'":
+            start = i
+            i += 1
+            while i < n and text[i] != "\n":
+                if text[i] == "\\":
+                    nxt = text[i + 1 : i + 2]
+                    if nxt == "" or nxt == "\n":
+                        break
+                    if nxt == "u":
+                        if "\n" in text[i : i + 6] or len(text) < i + 6:
+                            break
+                        i += 6
+                    else:
+                        i += 2
+                elif text[i] == "'":
+                    i += 1
+                    break
+                else:
+                    i += 1
+            intervals.append((start, i))
+        else:
+            i += 1
+    return intervals
+
+
+def _inside_string(pos: int, intervals: list[tuple[int, int]]) -> bool:
+    for start, end in intervals:
+        if start <= pos < end:
+            return True
+    return False
+
+
+def _extract_default_config(stripped: str) -> str | None:
+    """Return the body of the first android { ... defaultConfig { ... } } block.
+
+    Returns None when no such block exists, so callers fall back to the
+    (legacy) whole-file scan for simple/test fixtures.
+
+    String literals are skipped so that an ``android {`` / ``defaultConfig {``
+    sequence appearing inside a (raw or ordinary) string cannot be mistaken
+    for the real block.
+    """
+    intervals = _string_intervals(stripped)
+    m = None
+    for cand in re.finditer(r"(?<![A-Za-z0-9_])android\s*\{", stripped):
+        if not _inside_string(cand.start(), intervals):
+            m = cand
+            break
+    if m is None:
+        return None
+    open_idx = m.end() - 1
+    close_idx = _find_matching_brace(stripped, open_idx)
+    if close_idx == -1:
+        return None
+    android_body = stripped[open_idx + 1 : close_idx]
+    body_intervals = _string_intervals(android_body)
+    dm = None
+    for cand in re.finditer(r"(?<![A-Za-z0-9_])defaultConfig\s*\{", android_body):
+        if not _inside_string(cand.start(), body_intervals):
+            dm = cand
+            break
+    if dm is None:
+        return None
+    open2 = dm.end() - 1
+    close2 = _find_matching_brace(android_body, open2)
+    if close2 == -1:
+        return None
+    return android_body[open2 + 1 : close2]
+
+
 def parse_gradle_version(gradle_path: str) -> tuple[int, str]:
     if not isinstance(gradle_path, (str, os.PathLike)):
         raise TagVersionError("Gradle file path must be a string")
@@ -143,8 +309,24 @@ def parse_gradle_version(gradle_path: str) -> tuple[int, str]:
     # Kotlin comments are stripped first so commented-out literals can never
     # satisfy the gate; trailing `//` comments are tolerated.
     stripped = _strip_kotlin_comments(text)
-    codes = re.findall(r"(?m)^\s*versionCode\s*=\s*([0-9]+)\s*$", stripped)
-    names = re.findall(r'(?m)^\s*versionName\s*=\s*"([^"]+)"\s*$', stripped)
+    # Prefer the authoritative android.defaultConfig block when present so
+    # that literals in raw strings, comments (already stripped) or unrelated
+    # scopes cannot satisfy the gate. Fall back to the whole file for simple
+    # fixtures that do not declare an android block.
+    search_text = _extract_default_config(stripped)
+    if search_text is None:
+        search_text = stripped
+    intervals = _string_intervals(search_text)
+    code_matches = [
+        m for m in re.finditer(r"(?m)^\s*versionCode\s*=\s*([0-9]+)\s*$", search_text)
+        if not _inside_string(m.start(), intervals)
+    ]
+    name_matches = [
+        m for m in re.finditer(r'(?m)^\s*versionName\s*=\s*"([^"]+)"\s*$', search_text)
+        if not _inside_string(m.start(), intervals)
+    ]
+    codes = [m.group(1) for m in code_matches]
+    names = [m.group(1) for m in name_matches]
     if len(codes) != 1:
         raise TagVersionError(
             f"Gradle file must contain exactly one versionCode assignment (found {len(codes)})"
@@ -157,6 +339,8 @@ def parse_gradle_version(gradle_path: str) -> tuple[int, str]:
     raw_code = codes[0]
     if len(raw_code) > 1 and raw_code.startswith("0"):
         raise TagVersionError("Gradle versionCode must not contain leading zeros")
+    if len(raw_code) > 10:
+        raise TagVersionError("Gradle versionCode has too many digits")
     try:
         code = int(raw_code)
     except ValueError as exc:

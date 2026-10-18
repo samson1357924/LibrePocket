@@ -404,8 +404,10 @@ internal fun postJson(url: String, headers: LinkedHashMap<String, String>, bodyJ
  * so aggregation/SSE budget overflows (`AGG_TOO_LARGE` with distinct
  * `TOOL_ARGS_TOO_LARGE` / `TEXT_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
  * messages) stay typed end-to-end for TurnController's pending-flush guard.
- * Other branches keep `code = null` (legacy/classified failures), except the
- * unknown-runtime fallback which carries `UNKNOWN_RUNTIME` so the controller
+ * The `IllegalArgumentException` and `IOException` branches carry
+ * `code = inferAggFailureCodeName(e.message)` (null for non-aggregation
+ * messages), and the unknown-runtime fallback carries
+ * `inferAggFailureCodeName(e.message) ?: UNKNOWN_RUNTIME`, so the controller
  * can discard poison-adjacent pending tools without changing retry semantics
  * of other fatal events (401/validation stay flushable).
  * Unknown runtime failures fail closed (`retryable = false`): only

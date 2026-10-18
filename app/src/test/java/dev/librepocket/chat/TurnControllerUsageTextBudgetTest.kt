@@ -14,6 +14,7 @@ import dev.librepocket.provider.StreamEvent
 import dev.librepocket.provider.TEXT_TOO_LARGE
 import dev.librepocket.provider.requireTurnTextBudget
 import dev.librepocket.session.FakeSessionStore
+import dev.librepocket.session.RoomSessionStore
 import dev.librepocket.session.SessionTranscriptSink
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
@@ -507,6 +508,12 @@ class TurnControllerUsageTextBudgetTest {
     // The fail-closed guard itself: exactly at cap passes, one char over
     // throws typed non-retryable AGG_TOO_LARGE.
     assertEquals(100_000, MAX_TURN_TEXT_CHARS)
+    // Executable links for the "Equal to RoomSessionStore.MAX_TEXT_CHARS"
+    // claims: (a) MAX_TURN_TEXT_CHARS KDoc (StreamEvent.kt ~L243) and
+    // (b) TurnController.MAX_REQUEST_CHARS KDoc (TurnController.kt ~L478).
+    // Changing either cap must update its pin and its KDoc.
+    assertEquals(RoomSessionStore.MAX_TEXT_CHARS, MAX_TURN_TEXT_CHARS)
+    assertEquals(RoomSessionStore.MAX_TEXT_CHARS, TurnController.MAX_REQUEST_CHARS)
     requireTurnTextBudget(99_999, 1)
     requireTurnTextBudget(MAX_TURN_TEXT_CHARS, 0)
     try {

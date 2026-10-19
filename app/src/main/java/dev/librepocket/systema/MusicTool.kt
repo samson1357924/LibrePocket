@@ -72,12 +72,15 @@ object MusicTool : SystemTool<MusicTool.Params> {
   }
 
   fun buildPlayIntent(params: Params, defaultPlayerPackage: String? = null): IntentSpec {
+    // 空白 query 是呼叫方契約前置：[execute] 的空白路徑先收斂 NEED_CLARIFICATION
+    // 才到 builder；fallback 經 [guardedFallbackAlternative] 依此守衛降
+    // alternative=null（不構建空搜尋 intent，#19 猜測執行禁令同向）。
+    require(params.query.isNotBlank()) { "query must not be blank" }
     // Binder 傳輸上限防禦：URLEncoder 前以欄位長度計（見 IntentSpec KDoc 長度政策）。
     require(params.query.length <= MAX_QUERY_LEN) { "query too long: ${params.query.length} > $MAX_QUERY_LEN" }
     return IntentSpec(
       action = IntentActions.VIEW,
-      dataUri = if (params.query.isBlank()) null
-      else "https://music.youtube.com/search?q=${java.net.URLEncoder.encode(params.query, Charsets.UTF_8.name())}",
+      dataUri = "https://music.youtube.com/search?q=${java.net.URLEncoder.encode(params.query, Charsets.UTF_8.name())}",
       targetPackage = defaultPlayerPackage,
     )
   }

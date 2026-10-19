@@ -35,8 +35,15 @@ object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
   data class Params(val query: String)
 
   /** Unknown 分支話術的 query 回顯上限（話術防回顯，非參數校驗：[resolve]
-   *  對 query 本身無上限；spec 與比對邏輯不受此限）。 */
+   *  對 query 本身無上限；spec 與比對邏輯不受此限）。澄清候選的單一候選回顯
+   *  上限另見 [MAX_CANDIDATE_ECHO_LEN]（同屬防回顯政策）。 */
   const val MAX_QUERY_ECHO_LEN = 32
+
+  /** 澄清候選（NeedClarification 話術）的單一候選回顯上限（與
+   *  [MAX_QUERY_ECHO_LEN]/[CalendarTool.MAX_EVENT_ID_ECHO_LEN] 同款防回顯政策，
+   *  非參數校驗；候選可能為可見集內的超長包名，截斷話術回顯，spec/比對邏輯
+   *  仍以完整值運行）。 */
+  const val MAX_CANDIDATE_ECHO_LEN = 64
 
   /**
    * queries 白名單：別名 → 包名。只收錄常見公開 App，收斂規劃空間。
@@ -193,8 +200,12 @@ object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
       when (val r = resolve(params.query, env.installedPackages)) {
         is LaunchResolution.NeedClarification -> FallbackSpec(
           reasonCode = ReasonCodes.NEED_CLARIFICATION,
+          // 候選回顯經 [MAX_CANDIDATE_ECHO_LEN] 截斷（防回顯上限，同
+          // [MAX_QUERY_ECHO_LEN] 政策；候選數上限 5 仍由 [resolve] 把關）。
           userMessage = "開啟哪個 App（${ReasonCodes.NEED_CLARIFICATION}）" +
-            "→ 可替代候選：" + r.candidates.joinToString("、") + " → 需要你選一個",
+            "→ 可替代候選：" +
+            r.candidates.joinToString("、") { it.take(MAX_CANDIDATE_ECHO_LEN) } +
+            " → 需要你選一個",
         )
         else -> FallbackSpec(
           reasonCode = ReasonCodes.NO_HANDLER,

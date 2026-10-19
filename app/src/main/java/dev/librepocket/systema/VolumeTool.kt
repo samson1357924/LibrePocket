@@ -7,7 +7,8 @@ package dev.librepocket.systema
  *
  * 純側只做 [VolumeOp] 建模與範圍校驗；端側由 [AndroidIntentLauncher]
  * 經 `AudioManager.setStreamVolume / adjustStreamVolume` 落地。
- * 降級：打不開 AudioManager 時跳系統音量面板（SOUND_SETTINGS）。
+ * 降級：打不開 AudioManager 時跳系統音量面板（SOUND_SETTINGS；該 action 的
+ * resolve 需主 manifest `<queries>` 宣告，見 manifest #14 註解）。
  *
  * 端側落地的已知條件（官方 AudioManager javadoc，接線 PR 須處理）：
  * - `setStreamVolume` / `adjustStreamVolume` 在觸發 Do-Not-Disturb 變更、

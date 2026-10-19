@@ -72,13 +72,17 @@ class AndroidIntentLauncher(private val context: Context) : IntentLauncher {
    *
    * 例外收斂與 [launch] 同契約：只收 `Exception`（回 false；`OutOfMemoryError`
    * 等 VM fatal 直接外洩），`CancellationException` 明確重拋（structured
-   * concurrency 由呼叫方維持；本函式不得把取消吞成 false）。
+   * concurrency 由呼叫方維持；本函式不得把取消吞成 false）。AudioManager 取得
+   * 亦在 try 內（service fetch 拋錯＝系統錯誤，收斂 false）；SET 必帶
+   * clampedIndex（invariant guard：`buildOp` 的 SET 契約成立時恆非 null，守衛
+   * 只是防「夾取結果意外回 null 被靜默改寫 0＝誤靜音」的回歸，缺即 IAE
+   * 於 try 內收斂 false，不猜測執行）。
    */
   fun applyVolume(params: VolumeTool.Params): Boolean {
-    val audio = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-      ?: return false
     val stream = params.stream.sdkValue
     return try {
+      val audio = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        ?: return false
       when (params.direction) {
         VolumeTool.Direction.RAISE ->
           audio.adjustStreamVolume(stream, AudioManager.ADJUST_RAISE, 0)
@@ -91,7 +95,11 @@ class AndroidIntentLauncher(private val context: Context) : IntentLauncher {
         VolumeTool.Direction.SET -> {
           val max = audio.getStreamMaxVolume(stream)
           val op = VolumeTool.buildOp(params, max)
-          audio.setStreamVolume(stream, op.clampedIndex ?: 0, 0)
+          audio.setStreamVolume(
+            stream,
+            requireNotNull(op.clampedIndex) { "SET without clampedIndex" },
+            0,
+          )
         }
       }
       true

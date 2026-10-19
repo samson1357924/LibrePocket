@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.ApplicationInfo
 import android.content.pm.ResolveInfo
+import android.media.AudioManager
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
@@ -34,6 +35,10 @@ import org.robolectric.annotation.Config
  *   （pinned by [alarm_unresolvedHandler_mapsToNoHandler]）。
  * - c) 生產讀側採用 [requireExtra]/[optionalExtra]（[AlarmTool.parseParams]、
  *   [CalendarTool.parseInsertParams]）：缺參/錯型明確拋錯，禁預設猜測執行（#19）。
+ * - Phase 4 增補（P3）：applyVolume fail-closed／SET 夾取（shadow AudioManager）、
+ *   LaunchApp 候選回顯上限、Music 空白 query builder 守衛、degraded 環境先驗證、
+ *   guardedToolBuild 白名單穿透、USER_DISABLED 矩陣擴充；(b) 的 `<queries>` 釘選
+ *   併入 SOUND_SETTINGS 條目。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
@@ -118,6 +123,10 @@ class IntentAdapterStage1Test {
     // NavigationTool 網頁地圖（見 manifest #14 註解與各工具 KDoc）。
     assertManifestHasSingleAttr(manifest, "data", "scheme", "geo")
     assertManifestHasSingleAttr(manifest, "data", "scheme", "https")
+    // SOUND_SETTINGS（VolumeTool 降級音量面板）：同一 targetSdk 36 可見性過濾
+    // 矛盾——未宣告時 resolve-first launcher 會把面板 intent 過濾成假 NO_HANDLER
+    // （manifest #14 註解同形理由；VolumeTool KDoc 註明此依賴）。
+    assertManifestHasSingleAttr(manifest, "action", "name", "android.settings.SOUND_SETTINGS")
   }
 
   @Test fun manifest_declaresSetAlarmSenderPermission() {
@@ -484,17 +493,24 @@ class IntentAdapterStage1Test {
     assertNull(badUpdate.spec)
     assertTrue(badUpdate.message.contains(ReasonCodes.INTERNAL))
     for (badId in listOf("", "1/2", "../0", "abc")) {
-      for ((label, r) in listOf(
-        "update" to CalendarTool.executeUpdate(CalendarTool.UpdateParams(eventId = badId), env, launcher),
-        "delete" to CalendarTool.executeDelete(CalendarTool.DeleteParams(badId), env, launcher),
-      )) {
-        assertFalse("$label badId=$badId", r.ok)
-        assertFalse("$label badId=$badId", r.usedFallback)
-        assertEquals("$label badId=$badId", ReasonCodes.INTERNAL, r.reasonCode)
-        assertNull("$label badId=$badId", r.spec)
-        assertTrue("$label badId=$badId", r.message.contains(ReasonCodes.INTERNAL))
-      }
-      assertFalse("非法 eventId 不得調用 launcher：$badId", called)
+      // 逐案歸因（P3）：每案執行前重置 called，斷言「該案」守衛失敗確實未觸
+      // launcher（此前旗標僅跨案共用，歸因不精確）。
+      called = false
+      val u = CalendarTool.executeUpdate(CalendarTool.UpdateParams(eventId = badId), env, launcher)
+      assertFalse("update badId=$badId", u.ok)
+      assertFalse("update badId=$badId", u.usedFallback)
+      assertEquals("update badId=$badId", ReasonCodes.INTERNAL, u.reasonCode)
+      assertNull("update badId=$badId", u.spec)
+      assertTrue("update badId=$badId", u.message.contains(ReasonCodes.INTERNAL))
+      assertFalse("非法 eventId 不得調用 launcher：update badId=$badId", called)
+      called = false
+      val d = CalendarTool.executeDelete(CalendarTool.DeleteParams(badId), env, launcher)
+      assertFalse("delete badId=$badId", d.ok)
+      assertFalse("delete badId=$badId", d.usedFallback)
+      assertEquals("delete badId=$badId", ReasonCodes.INTERNAL, d.reasonCode)
+      assertNull("delete badId=$badId", d.spec)
+      assertTrue("delete badId=$badId", d.message.contains(ReasonCodes.INTERNAL))
+      assertFalse("非法 eventId 不得調用 launcher：delete badId=$badId", called)
     }
     // 無 App pending 路徑非法 eventId 同樣收斂為 INTERNAL（程式已修，補釘選）。
     val noApp = env.copy(hasCalendarApp = false)
@@ -554,8 +570,9 @@ class IntentAdapterStage1Test {
     }
   }
 
-  @Test fun alarm_parse_optionalMistypeMatrix_throwsExplicit() {
-    // 選填鍵錯型矩陣：MESSAGE IntVal / SKIP_UI 已測，此處補 MESSAGE 錯型。
+  @Test fun alarm_parse_mistypeMatrix_throwsExplicit() {
+    // 錯型矩陣：alarm MESSAGE 錯型（選填鍵；SKIP_UI 錯型另見
+    // alarm_parse_optionalKeys_defaultOnlyWhenAbsent）＋ calendar 必填 title 錯型。
     try {
       AlarmTool.parseParams(
         mapOf(
@@ -873,6 +890,39 @@ class IntentAdapterStage1Test {
     assertEquals(ReasonCodes.USER_DISABLED, nBad.reasonCode)
     assertNull(nBad.spec)
     assertFalse("USER_DISABLED 不得調用 launcher", called)
+    // ---- P3 擴充：Volume/Music/LaunchApp 同形（能力先於參數，鏡像既有 per-tool
+    // 合法+非法參數矩陣）。Volume 的「合法」取預設 RAISE、非法取 SET 缺 index；
+    // Music 合法取 control=PAUSE、非法取超長 query；LaunchApp 無 builder 守衛集合，
+    // 合法取別名 query、非法取空白 query（其可執行分支的澄清收斂受能力門禁阻斷）。
+    val v = VolumeTool.execute(VolumeTool.Params(direction = VolumeTool.Direction.RAISE), disabled, launcher)
+    assertFalse(v.ok)
+    assertFalse(v.usedFallback)
+    assertNull(v.spec)
+    assertEquals(ReasonCodes.USER_DISABLED, v.reasonCode)
+    assertTrue(v.message.contains(ReasonCodes.USER_DISABLED))
+    val vBad = VolumeTool.execute(VolumeTool.Params(direction = VolumeTool.Direction.SET), disabled, launcher)
+    assertEquals(ReasonCodes.USER_DISABLED, vBad.reasonCode)
+    assertNull(vBad.spec)
+    val m = MusicTool.execute(MusicTool.Params(control = MusicTool.Control.PAUSE), disabled, launcher)
+    assertFalse(m.ok)
+    assertFalse(m.usedFallback)
+    assertNull(m.spec)
+    assertEquals(ReasonCodes.USER_DISABLED, m.reasonCode)
+    val mBad = MusicTool.execute(
+      MusicTool.Params(query = "x".repeat(MusicTool.MAX_QUERY_LEN + 1)), disabled, launcher,
+    )
+    assertEquals(ReasonCodes.USER_DISABLED, mBad.reasonCode)
+    assertNull(mBad.spec)
+    val la = LaunchAppTool.execute(LaunchAppTool.Params("地圖"), disabled, launcher)
+    assertFalse(la.ok)
+    assertFalse(la.usedFallback)
+    assertNull(la.spec)
+    assertEquals(ReasonCodes.USER_DISABLED, la.reasonCode)
+    assertEquals("做不到開啟 App（${ReasonCodes.USER_DISABLED}）", la.message)
+    val laBad = LaunchAppTool.execute(LaunchAppTool.Params(""), disabled, launcher)
+    assertEquals(ReasonCodes.USER_DISABLED, laBad.reasonCode)
+    assertNull(laBad.spec)
+    assertFalse("USER_DISABLED 不得調用 launcher（Volume/Music/LaunchApp 擴充）", called)
   }
 
   // ---- i. Phase2 收斂與契約釘選（cause 後綴、registry 拒絕、MIME、空白澄清、
@@ -909,6 +959,19 @@ class IntentAdapterStage1Test {
       guardedToolBuild(failure) { throw kotlin.coroutines.cancellation.CancellationException("cancel") }
       fail("取消語義不得吞成 INTERNAL")
     } catch (_: kotlin.coroutines.cancellation.CancellationException) {
+      // 照拋即契約。
+    }
+  }
+
+  @Test fun guardedToolBuild_nonWhitelistedRuntime_reraises() {
+    // 非 IAE/ISE 的 RuntimeException 不得被吞（白名單性質 pin，形狀對稱
+    // guardedFallbackAlternative_convergesOrNull_cancellationReraises 的
+    // NoSuchElementException）：guard 完成即例外，不得收斂成 Internal。
+    val failure = ToolResult(false, false, null, ReasonCodes.INTERNAL, "x（INTERNAL）")
+    try {
+      guardedToolBuild(failure) { throw ArithmeticException("arithmetic boom") }
+      fail("非守衛白名單的 RuntimeException 不得吞成 INTERNAL")
+    } catch (_: ArithmeticException) {
       // 照拋即契約。
     }
   }
@@ -1156,7 +1219,9 @@ class IntentAdapterStage1Test {
     assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
     assertNull(r.spec)
     assertFalse("超長 query 不得調用 launcher", called)
-    assertFalse("超長 query 不得回顯", r.message.contains("qqqq"))
+    // 逐字 pin（強化原 assertFalse(qqqq) 的回顯禁令）：超長 query 的守衛訊息
+    // 只攜 cause 類名（tagInternalCause），話術逐字等於 INTERNAL 模板。
+    assertEquals("做不到導航（${ReasonCodes.INTERNAL}）[IllegalArgumentException]", r.message)
   }
 
   @Test fun music_queryLength_bounds() {
@@ -1177,7 +1242,9 @@ class IntentAdapterStage1Test {
     assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
     assertNull(r.spec)
     assertFalse("超長 query 不得調用 launcher", called)
-    assertFalse("超長 query 不得回顯", r.message.contains("qqqq"))
+    // 逐字 pin（強化原 assertFalse(qqqq) 的回顯禁令）：超長 query 的守衛訊息
+    // 只攜 cause 類名（tagInternalCause），話術逐字等於 INTERNAL 模板。
+    assertEquals("做不到播放音樂（${ReasonCodes.INTERNAL}）[IllegalArgumentException]", r.message)
   }
 
   // ---- k. P3 增補釘選：fallback 防拋收斂、launcher Internal 分型、防回顯截斷 ----
@@ -1275,5 +1342,151 @@ class IntentAdapterStage1Test {
     assertEquals(ReasonCodes.NO_HANDLER, fb.reasonCode)
     assertTrue(fb.userMessage, "「${long.take(cap)}」" in fb.userMessage)
     assertFalse(fb.userMessage, long.take(cap + 1) in fb.userMessage)
+  }
+
+  // ---- l. Phase 4 增補：LaunchApp 候選回顯上限、Music 空白守衛、degraded 先驗證 ----
+
+  @Test fun launchApp_clarification_candidates_echoCapped() {
+    // 澄清候選話術的單一候選回顯經 MAX_CANDIDATE_ECHO_LEN 截斷（同
+    // [MAX_QUERY_ECHO_LEN] 防回顯政策；候選可能為可見集內的超長包名）；
+    // 本層對 installedPackages 來源值無長度上限，spec/比對邏輯仍以完整值運行。
+    val cap = LaunchAppTool.MAX_CANDIDATE_ECHO_LEN
+    val long1 = "x".repeat(cap + 35) // 99 字全 x
+    val long2 = "x".repeat(cap + 34) + "y" // 99 字、內容可辨異
+    val e = env.copy(installedPackages = setOf(long1, long2))
+    // resolve 側以完整候選運行（截斷僅在話術，不縮減解析/澄清集合）。
+    val resolution = LaunchAppTool.resolve("x", e.installedPackages)
+    assertTrue(resolution is LaunchAppTool.LaunchResolution.NeedClarification)
+    assertTrue(
+      "resolve 候選須為完整值",
+      long1 in (resolution as LaunchAppTool.LaunchResolution.NeedClarification).candidates,
+    )
+    var launched = false
+    val r = LaunchAppTool.execute(
+      LaunchAppTool.Params("x"), e, IntentLauncher { launched = true; LaunchResult.Success },
+    )
+    assertFalse("澄清路徑不得調用 launcher", launched)
+    assertEquals(ReasonCodes.NEED_CLARIFICATION, r.reasonCode)
+    // 話術逐案截斷：cap 段在、cap+1 與兩個完整原文不在（與
+    // launchApp_unknown_echoCappedInCopy 的 cap/cap+1 斷言同形）。
+    assertTrue(r.message, "x".repeat(cap) in r.message)
+    assertFalse(r.message, "x".repeat(cap + 1) in r.message)
+    assertFalse(r.message, long1 in r.message)
+    assertFalse(r.message, long2 in r.message)
+    // execute 話術與 fallback 同模板（F4c 契約，逐字 pin）。
+    assertEquals(LaunchAppTool.fallback(LaunchAppTool.Params("x"), e).userMessage, r.message)
+  }
+
+  @Test fun music_fallback_blankQuery_alternativeNull_noThrow() {
+    // buildPlayIntent 空白 query 守衛（#19 不構建空搜尋 intent）：fallback 的
+    // alternative 構建經 guardedFallbackAlternative 依守衛降 null，話術形狀不變
+    //（與 music_fallback_overLongQuery_alternativeNull_noThrow 同形；execute 的
+    // 空白路徑先收斂 NEED_CLARIFICATION，不會以空白 query 觸 builder）。
+    val f = MusicTool.fallback(MusicTool.Params(query = ""), env)
+    assertNull(f.alternative)
+    assertEquals(ReasonCodes.NO_HANDLER, f.reasonCode)
+    assertTrue(f.userMessage, f.userMessage.startsWith("做不到開啟播放器（${ReasonCodes.NO_HANDLER}）"))
+    // builder 本體的空白守衛訊息 pin（deterministic，不回顯內容）。
+    try {
+      MusicTool.buildPlayIntent(MusicTool.Params(query = ""))
+      fail("expected IllegalArgumentException for blank query")
+    } catch (e: IllegalArgumentException) {
+      assertTrue(e.message ?: "", "must not be blank" in (e.message ?: ""))
+    }
+  }
+
+  @Test fun music_execute_degraded_stillValidates_failClosed() {
+    // 靜態 DEGRADED（無播放器）亦先過 builder fail-closed 校驗（同
+    // alarm_execute_degraded_stillValidates_failClosed）：超長 query → INTERNAL
+    //（逐字模板+cause 類名，不取 fallback 話術、不回顯超長原文），launcher 不被呼叫。
+    var called = false
+    val launcher = IntentLauncher { called = true; LaunchResult.Success }
+    val r = MusicTool.execute(
+      MusicTool.Params(query = "q".repeat(MusicTool.MAX_QUERY_LEN + 1)),
+      env.copy(hasMusicApp = false),
+      launcher,
+    )
+    assertFalse(r.ok)
+    assertFalse(r.usedFallback)
+    assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+    assertNull(r.spec)
+    assertEquals("做不到播放音樂（${ReasonCodes.INTERNAL}）[IllegalArgumentException]", r.message)
+    assertFalse("DEGRADED 校驗失敗不得調用 launcher", called)
+  }
+
+  @Test fun navigation_execute_degraded_stillValidates_failClosed() {
+    // 同上（導航側）：靜態 DEGRADED（無地圖 App）亦先過 web builder 的座標守衛
+    //——緯度越界 → INTERNAL（逐字模板+cause 類名），launcher 不被呼叫，不再以
+    // 網頁地圖 fallback 話術掩蓋非法參數。
+    var called = false
+    val launcher = IntentLauncher { called = true; LaunchResult.Success }
+    val r = NavigationTool.execute(
+      NavigationTool.Params(latitude = 91.0, longitude = 0.0),
+      env.copy(hasMapApp = false),
+      launcher,
+    )
+    assertFalse(r.ok)
+    assertFalse(r.usedFallback)
+    assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+    assertNull(r.spec)
+    assertEquals("做不到導航（${ReasonCodes.INTERNAL}）[IllegalArgumentException]", r.message)
+    assertFalse("DEGRADED 校驗失敗不得調用 launcher", called)
+  }
+
+  // ---- m. Phase 4 增補：applyVolume 音量落地 fail-closed（Robolectric AudioManager shadow） ----
+
+  @Test fun applyVolume_setBeyondMax_clampsToActualMax() {
+    // SET 方向以端側 getStreamMaxVolume 夾取（buildOp）再照送 setStreamVolume，
+    // 不靜默改寫 0＝靜音；shadow 側（Robolectric 4.17 jar 已驗證 setStreamMaxVolume
+    // 為 public、對全 stream 生效；STREAM_MUSIC 預設 max=15）把 max 收到 5，
+    // index=99 須收斂為實際 max 5 落地。
+    val app = appContext()
+    val audio = app.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    Shadows.shadowOf(audio).setStreamMaxVolume(5)
+    val launcher = AndroidIntentLauncher(app)
+    assertTrue(
+      launcher.applyVolume(VolumeTool.Params(direction = VolumeTool.Direction.SET, index = 99)),
+    )
+    assertEquals(5, audio.getStreamVolume(AudioManager.STREAM_MUSIC))
+  }
+
+  @Test fun applyVolume_setMissingIndex_convergesFalse() {
+    // SET 缺 index 的 builder IAE 在 try 內拋（buildOp 於端側執行）→ 例外收斂
+    // bare false，不穿透呼叫方（與 class KDoc 的「只收 Exception」同契約形狀）。
+    val launcher = AndroidIntentLauncher(appContext())
+    assertFalse(
+      launcher.applyVolume(VolumeTool.Params(direction = VolumeTool.Direction.SET)),
+    )
+  }
+
+  @Test fun applyVolume_audioServiceFetchThrows_convergesFalse() {
+    // AudioManager 取得與直調同在 try 內（P3 修復）：service fetch 拋錯＝系統錯誤，
+    // Exception（此處 SecurityException）收斂 false，不外洩打穿呼叫方；
+    // CancellationException 是唯一重拋路徑，下案釘留。
+    val throwing = object : ContextWrapper(appContext()) {
+      override fun getSystemService(name: String): Any? =
+        if (name == Context.AUDIO_SERVICE) throw SecurityException("deny")
+        else super.getSystemService(name)
+    }
+    assertFalse(AndroidIntentLauncher(throwing).applyVolume(VolumeTool.Params()))
+  }
+
+  @Test fun applyVolume_audioServiceFetchCancellation_reraises() {
+    // fetch 取消 = CancellationException 照拋（structured concurrency 由呼叫方
+    // 維持），不得吞成 false（與 launch 三段的 CE 契約同形）。
+    val cancelling = object : ContextWrapper(appContext()) {
+      override fun getSystemService(name: String): Any? =
+        if (name == Context.AUDIO_SERVICE) {
+          throw kotlin.coroutines.cancellation.CancellationException("cancel")
+        } else {
+          super.getSystemService(name)
+        }
+    }
+    try {
+      AndroidIntentLauncher(cancelling).applyVolume(VolumeTool.Params())
+      fail("取消語義不得吞成 false")
+    } catch (_: kotlin.coroutines.cancellation.CancellationException) {
+      // 照拋即契約。
+    }
   }
 }

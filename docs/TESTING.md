@@ -308,8 +308,9 @@ pins the fail-closed INTERNAL mapping), and a degraded/no-app capability state
 must not skip validation. (2) USER_DISABLED-first: a disabled capability
 short-circuits ahead of parameter questions —
 `IntentAdapterStage1Test.execute_userDisabled_returnsDisabledNotNoHandler`
-pins that disabled users get `ReasonCodes.USER_DISABLED` on AlarmTool and all
-CalendarTool execute forms with `usedFallback=false`, `spec=null`, and the
+pins that disabled users get `ReasonCodes.USER_DISABLED` on AlarmTool,
+VolumeTool, MusicTool, LaunchAppTool and all CalendarTool execute forms with
+`usedFallback=false`, `spec=null`, and the
 launcher never invoked (never reinterpreted through fallback as NO_HANDLER
 copy), and that disabled + invalid parameters still answer
 `ReasonCodes.USER_DISABLED`, not INTERNAL (capability question precedes the
@@ -321,7 +322,10 @@ parameter question, exactly one exception to contract (1));
 `IntentAdapterStage1Test.calendar_eventIdEcho_cappedInFallbackCopy` assert
 the cap-length substring present and cap+1 absent in both `execute` and
 `fallback` copy, while spec/URI construction keeps the full value (the cap is
-anti-echo for message text, deliberately not a parameter-validation cap).
+anti-echo for message text, deliberately not a parameter-validation cap);
+LaunchApp clarification copy additionally truncates each candidate to
+`LaunchAppTool.MAX_CANDIDATE_ECHO_LEN` (64, same anti-echo policy) pinned by
+`IntentAdapterStage1Test.launchApp_clarification_candidates_echoCapped`.
 
 ### Skill subsystem fail-closed evidence (Current, #15)
 

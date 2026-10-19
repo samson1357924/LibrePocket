@@ -44,6 +44,9 @@
              已宣稱 NATIVE，屬契約自相矛盾，故必須宣告；真機 handler E2E 仍另一
              件事，見各工具 KDoc）。開 App 的 launcher 清單查詢仍刻意不宣告
              （見 LaunchAppTool KDoc 的缺口註記）。
+             - SOUND_SETTINGS：VolumeTool 降級取系統音量面板（打不開 AudioManager
+               的替代）；未宣告時 resolve 恆 null＝必然假 NO_HANDLER（targetSdk 36
+               package-visibility 過濾，與下方 geo/https 同形矛盾）。
              - SET_ALARM：執行期 Intent 無 data，action-only 即可匹配時鐘 App。
              - INSERT/EDIT：執行期帶 content URI「＋顯式 dir/item type」（與本
                mimeType 條目精確對應，PM 級匹配不依賴 provider-resolve，見
@@ -73,6 +76,9 @@
         <intent>
             <action android:name="android.intent.action.VIEW" />
             <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.settings.SOUND_SETTINGS" />
         </intent>
     </queries>
 

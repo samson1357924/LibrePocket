@@ -488,6 +488,23 @@ class IntentTypedD2Test {
     assertEquals(ReasonCodes.INTERNAL, r2.reasonCode)
   }
 
+  @Test fun launchApp_single_success_okWithSpecAndEmptyMessage() {
+    // LaunchResult 分型矩陣補齊（與上測 NoHandler/Internal 同風格）：別名命中 →
+    // 發射成功 → ok=true、spec/package 保留（MAIN+LAUNCHER+setPackage，F1 契約）、
+    // message 為空字串（Success 分支無 fallback 話術/原因碼）。
+    var launched: IntentSpec? = null
+    val r = LaunchAppTool.execute(
+      LaunchAppTool.Params("地圖"), env, IntentLauncher { launched = it; LaunchResult.Success },
+    )
+    assertTrue(r.ok)
+    assertFalse(r.usedFallback)
+    assertNull(r.reasonCode)
+    assertEquals("", r.message)
+    assertEquals(IntentActions.MAIN, r.spec?.action)
+    assertEquals("com.google.android.apps.maps", r.spec?.targetPackage)
+    assertEquals("com.google.android.apps.maps", launched?.targetPackage)
+  }
+
   @Test fun launchApp_blankQuery_needsClarification_bothEnvironments() {
     // F4a：空白 query 是意圖缺席（與 Music/Navigation 空白目標同契約）——
     // NEED_CLARIFICATION 而非 Unknown 的「做不到開啟「」」NO_HANDLER 話術，

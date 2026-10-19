@@ -1052,8 +1052,10 @@ class TurnControllerTest {
   // must convert to the typed terminal (no escape, no poison record).
   @Test fun boundaryPendingFlushFailureConvertsToTypedTerminal() {
     // MAX_TOOL_CALL_AGG_BYTES = 1MiB, x3 char->byte estimate: billable max
-    // is 349525 chars; the synthetic "call_pending_0"+"pending" defaults
-    // add 21 chars at flush time to overflow it.
+    // is 349525 chars; the synthetic "call_blank_pending_0"+"pending"
+    // defaults add 27 chars at flush time to overflow it (Phase-0 N2 renamed
+    // the synthesis from "call_pending_0"; the boundary holds because the
+    // longer default only trips the same budget harder).
     val boundary = "x".repeat(349_525)
     val provider = FakeLlmProvider {
       flow {

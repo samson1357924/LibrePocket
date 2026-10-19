@@ -168,9 +168,21 @@ internal object MiniJson {
                             't' -> sb.append('\t')
                             'u' -> {
                                 if (pos + 4 > s.length) fail("bad unicode escape")
+                                // Strict 4-hex gate (parity with McpWire.parseString):
+                                // `toIntOrNull(16)` also accepts signed prefixes —
+                                // `\u-123` would decode to U+FEDD (negation
+                                // overflow), `\u+0bb` would silently read as
+                                // 0x00bb — while RFC 8259 only admits hex
+                                // digits. Any `\uXXXX` whose 4 units are not
+                                // exactly [0-9a-fA-F]{4} fails closed with the
+                                // same parser error as the other malformed
+                                // escape branches.
                                 val hex = s.substring(pos, pos + 4)
+                                if (hex.any { it !in '0'..'9' && it !in 'a'..'f' && it !in 'A'..'F' }) {
+                                    fail("bad unicode escape")
+                                }
                                 pos += 4
-                                sb.append(hex.toIntOrNull(16)?.toChar() ?: fail("bad unicode escape"))
+                                sb.append(hex.toInt(16).toChar())
                             }
                             else -> fail("bad escape '\\$e'")
                         }

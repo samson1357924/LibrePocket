@@ -1512,9 +1512,13 @@ class TurnControllerToolSliceTest {
     @Test fun blankToolDoneIdSynthesizesWireIdForPairing() = runBlocking {
         // A blank ToolDone id must not ride the wire verbatim: providers that
         // require non-empty tool-call ids would reject the whole continuation
-        // round. Synthesize call_$index (same convention as
-        // flushPendingTools' call_pending_$index); the transcript keeps the
-        // raw "" for audit truth.
+        // round. Synthesize call_blank_$index (same convention as
+        // flushPendingTools' call_blank_pending_$index — Phase-0 N2 changed
+        // BOTH synthesis prefixes to a non-colliding form: the old
+        // `call_$index`/`call_pending_$index` output could collide with a
+        // genuine model-supplied id shaped exactly like the synthesis and
+        // silently skip execution); the transcript keeps the raw "" for audit
+        // truth.
         val provider = SliceProvider()
         val sink = SliceSink()
         val backend = CountingBackend()
@@ -1544,12 +1548,54 @@ class TurnControllerToolSliceTest {
 
         val cont = provider.seenRequests[1]
         val assistant = cont.messages.first { it.role == "assistant" && it.toolCalls.isNotEmpty() }
-        assertEquals("call_3", assistant.toolCalls.single().id)
-        assertEquals("call_3", cont.messages.first { it.role == "tool" }.toolCallId)
+        assertEquals("call_blank_3", assistant.toolCalls.single().id)
+        assertEquals("call_blank_3", cont.messages.first { it.role == "tool" }.toolCallId)
         // Executor ran once with the synthesized id; the turn completes.
         assertEquals(1, backend.invocations.get())
         assertEquals(ChatStatus.IDLE, c.uiState.value.status)
         // Raw audit record keeps the VOID id.
         assertEquals("", sink.tools.single().id)
+    }
+
+    @Test fun redactedCallIdCollisionExecutesOnceStaysRecordsOnly() = runBlocking {
+        // F1: execution dedup keys the REDACTED pairing form — the exact id
+        // the continuation re-binds and the provider pairing validator sees.
+        // Two distinct raw call ids that redact to ONE string must not both
+        // execute: pre-fix both ran, the re-bound continuation carried a
+        // duplicate paired id, and the non-retryable TOOL_CALL_DUPLICATE_ID
+        // killed the turn AFTER execution. Post-fix only the first executes;
+        // the colliding second call stays records-only. Raw ids stay on the
+        // durable audit record; the wire only ever sees the redacted key.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        provider.handler = { request ->
+            if (request.messages.none { it.role == "tool" }) {
+                flow {
+                    emit(StreamEvent.ToolDone(toolIndex = 0, id = "user1@example.com", name = "lsp.symbols", argumentsJson = """{"query":"Foo"}"""))
+                    emit(StreamEvent.ToolDone(toolIndex = 1, id = "user2@example.com", name = "lsp.symbols", argumentsJson = """{"query":"Bar"}"""))
+                    emit(StreamEvent.Done("tool_calls"))
+                }
+            } else {
+                flow {
+                    emit(StreamEvent.TextDelta(0, 0, "found Foo and Bar"))
+                    emit(StreamEvent.Done("stop"))
+                }
+            }
+        }
+        c.send("查 Foo 與 Bar")
+
+        // Both raw ids are recorded (records-only audit truth), but the
+        // executor ran exactly once for the redacted-colliding pair.
+        assertEquals(listOf("user1@example.com", "user2@example.com"), sink.tools.map { it.id })
+        assertEquals(1, backend.invocations.get())
+        // Pairing is total AND unique in the REDACTED form the wire uses.
+        val cont = provider.seenRequests[1]
+        val assistant = cont.messages.first { it.role == "assistant" && it.toolCalls.isNotEmpty() }
+        assertEquals(listOf("⟦REDACTED:EMAIL⟧"), assistant.toolCalls.map { it.id })
+        assertEquals(listOf("⟦REDACTED:EMAIL⟧"), cont.messages.filter { it.role == "tool" }.map { it.toolCallId })
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
     }
 }

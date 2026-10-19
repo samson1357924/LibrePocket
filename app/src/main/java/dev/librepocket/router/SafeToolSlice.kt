@@ -69,7 +69,11 @@ import kotlin.coroutines.coroutineContext
  * Shareability: one instance is shared by every session a factory builds, so
  * construction-captured state (`ctxSupplier`, `policy`, `backend`, `clock`)
  * must be safe for concurrent turns — keep the slice stateless; per-turn
- * state lives in the turn engine, not here. When a second tool wires, retire
+ * state lives in the turn engine, not here. Sanctioned exception
+ * ([F4]): [beforeExecuteForTest] is an internal `@Volatile` TEST seam only —
+ * production composition never installs it, and it is cross-thread-visible
+ * exactly so a cancel test parking the loop from the test thread is seen by
+ * the turn dispatcher thread. When a second tool wires, retire
  * this slice (or generalize it): [offeredTools] stays pinned to [TOOL_NAME]
  * and would silently hide the new tool otherwise.
  */
@@ -100,7 +104,9 @@ class SafeToolSlice(
          * Lengths are measured on the POST-redaction string: redaction can
          * inflate a field (e.g. `⟦REDACTED:EMAIL⟧`), so a ≤cap raw string may
          * exceed the cap after redaction — truncation is decided there, and
-         * the marker reports the post-redaction length.
+         * the marker reports the post-redaction length. Truncation goes
+         * through [cappedTake] (surrogate-safe): a plain `take` at the cap
+         * could split a UTF-16 surrogate pair and emit a lone surrogate.
          */
         const val MAX_STRING_CHARS = 500
         /** Per-input cap for model-controlled `query` / `pathPrefix` (fail-closed). */
@@ -116,6 +122,48 @@ class SafeToolSlice(
         const val MAX_GROSS_ARGS_CHARS = MAX_INPUT_CHARS * 4
         /** Nesting-depth fan-close bound shared by [parseArgs]/[redactedArgsEcho] (see [jsonNestingDepth]). */
         const val MAX_NESTING_DEPTH = 32
+
+        /**
+         * Surrogate-safe cap slice, the single replacement for every
+         * `.take([MAX_STRING_CHARS])` string-cap in this file (result-JSON
+         * fields, echoes, call ids, continuation re-binds): a plain `take`
+         * at the cap can cut BETWEEN the two halves of a well-formed
+         * UTF-16 surrogate pair (the cap-1 unit a high surrogate) and emit
+         * a lone surrogate into JSON that the escapers/serializers pass
+         * through raw — degraded to U+FFFD at UTF-8 encode. It steps back
+         * over the trailing high-surrogate run at the cut: for well-formed
+         * UTF-16 (a high surrogate's low partner is always the very next
+         * unit) this is exactly ONE unit, so the capped length is
+         * `[cap]-1` on a genuine split and exactly `[cap]` otherwise;
+         * malformed pre-existing lone-surrogate input can only extend the
+         * walk back from the cut, never split a pair that was not already
+         * malformed. Work is bounded by `[cap]` (≤ `cap+1` in the split
+         * case counting the marker afterwards).
+         */
+        internal fun cappedTake(value: String, cap: Int): String {
+            if (value.length <= cap) return value
+            var end = cap
+            while (end > 0 && value[end - 1].code in 0xD800..0xDBFF) {
+                end--
+            }
+            return value.substring(0, end)
+        }
+
+        /**
+         * Execution-dedup pairing key for the turn engine: the EXACT
+         * redaction + cap that [continuationMessages] applies to call ids
+         * (the form every provider pairing validator and each provider-side
+         * `tool_call_id` sees on the wire). The turn engine routes its
+         * dedup through this seam instead of importing the redactor — two
+         * distinct raw ids that redact to one string must never both
+         * execute, or the re-bound continuation would carry a duplicate
+         * paired id and fail closed with the non-retryable
+         * `TOOL_CALL_DUPLICATE_ID` AFTER both calls already ran. The
+         * durable audit record keeps raw ids; only the execution
+         * candidate/set key is redacted.
+         */
+        internal fun redactedPairingId(callId: String): String =
+            cappedTake(dev.librepocket.redact.Redactor.redact(callId).text, MAX_STRING_CHARS)
 
         /**
          * Exact receipt the secret-keyed structural walk emits. Must stay
@@ -448,8 +496,11 @@ class SafeToolSlice(
                 if (!raw.isString) return null
                 val v = raw.content
                 // Scope traversal guard (raw-string layer): Unicode
-                // normalization mismatches (homoglyphs) are rejected here;
-                // every traversal/marker denial comes from the single shared
+                // normalization mismatches (NFKC-unstable homoglyphs) are
+                // rejected here — NFKC-stable lookalike code points pass,
+                // so the rejection is "changed under NFKC", not the bare
+                // presence of a lookalike; every traversal/marker denial
+                // comes from the single shared
                 // predicate [isSafeInput] (`..`, leading `/` after trimming,
                 // backslash, NUL, control chars, percent-escapes, and `:` —
                 // scheme/drive-absolute scope forms such as `file:/etc` and
@@ -499,9 +550,9 @@ class SafeToolSlice(
             put("code", code)
             // Model-controlled echoes are capped like Ok results; codes are
             // fixed constants.
-            put("tool", dev.librepocket.redact.Redactor.redact(call.name).text.take(MAX_STRING_CHARS))
-            put("callId", dev.librepocket.redact.Redactor.redact(call.id).text.take(MAX_STRING_CHARS))
-            put("detail", detail.take(MAX_STRING_CHARS))
+            put("tool", cappedTake(dev.librepocket.redact.Redactor.redact(call.name).text, MAX_STRING_CHARS))
+            put("callId", cappedTake(dev.librepocket.redact.Redactor.redact(call.id).text, MAX_STRING_CHARS))
+            put("detail", cappedTake(detail, MAX_STRING_CHARS))
             put("clockMillis", clock.millis())
         }.toString()
         return ToolResult(call.id, call.name, json, denied = true, denyCode = code)
@@ -509,7 +560,7 @@ class SafeToolSlice(
 
     private fun cappedEcho(value: String): String =
         if (value.length > MAX_STRING_CHARS) {
-            value.take(MAX_STRING_CHARS) + "…[truncated ${value.length}→$MAX_STRING_CHARS]"
+            cappedTake(value, MAX_STRING_CHARS) + "…[truncated ${value.length}→$MAX_STRING_CHARS]"
         } else {
             value
         }
@@ -553,8 +604,8 @@ class SafeToolSlice(
         fun build(chosen: List<kotlinx.serialization.json.JsonObject>, omittedCount: Int, truncated: Boolean): kotlinx.serialization.json.JsonObject =
             buildJsonObject {
                 put("denied", false)
-                put("tool", dev.librepocket.redact.Redactor.redact(call.name).text.take(MAX_STRING_CHARS))
-                put("callId", dev.librepocket.redact.Redactor.redact(call.id).text.take(MAX_STRING_CHARS))
+                put("tool", cappedTake(dev.librepocket.redact.Redactor.redact(call.name).text, MAX_STRING_CHARS))
+                put("callId", cappedTake(dev.librepocket.redact.Redactor.redact(call.id).text, MAX_STRING_CHARS))
                 put("query", cappedEcho(redactedQuery))
                 put("symbols", kotlinx.serialization.json.buildJsonArray { for (o in chosen) add(o) })
                 put("returnedCount", chosen.size)
@@ -610,19 +661,26 @@ class SafeToolSlice(
         // get redaction + a bounded echo (no raw echo past the redaction
         // pipeline R1–R14, with secret-keyed string members collapsing to
         // the fixed receipt — see [redactedArgsEcho]).
-        // Call ids echo through the same redaction path by design (never
-        // verbatim); verbatim passthrough + collision fail-closed is a
-        // deliberate deferred decision — current callers never re-bind ids.
+        // Call ids ARE re-bound on this path — never verbatim: each call/id
+        // here and each result's `toolCallId` below is replaced with its
+        // REDACTED form, which is why the turn engine dedups execution
+        // candidates on the same key ([redactedPairingId]). Pairing then
+        // stays unique where the wire is unique: two distinct raw ids that
+        // redact to one string cannot both execute — the colliding second
+        // call stays records-only (execution dropped, marker + audit kept),
+        // never a duplicate `call`/`tool` pair that would fail the provider
+        // pairing validator with a non-retryable `TOOL_CALL_DUPLICATE_ID`
+        // after execution.
         val normalizedCalls = calls.map {
             it.copy(
-                id = dev.librepocket.redact.Redactor.redact(it.id).text.take(MAX_STRING_CHARS),
-                name = dev.librepocket.redact.Redactor.redact(it.name).text.take(MAX_STRING_CHARS),
+                id = cappedTake(dev.librepocket.redact.Redactor.redact(it.id).text, MAX_STRING_CHARS),
+                name = cappedTake(dev.librepocket.redact.Redactor.redact(it.name).text, MAX_STRING_CHARS),
                 argumentsJson = redactedArgsEcho(it.argumentsJson),
             )
         }
         out.add(ChatMessage(role = "assistant", text = "", toolCalls = normalizedCalls))
         for (r in results) {
-            out.add(ChatMessage(role = "tool", text = r.resultJson, toolCallId = dev.librepocket.redact.Redactor.redact(r.callId).text.take(MAX_STRING_CHARS)))
+            out.add(ChatMessage(role = "tool", text = r.resultJson, toolCallId = cappedTake(dev.librepocket.redact.Redactor.redact(r.callId).text, MAX_STRING_CHARS)))
         }
         return out
     }

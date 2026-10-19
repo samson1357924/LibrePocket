@@ -107,6 +107,13 @@ class ApprovalRequiredException : Exception("chat.send approval required")
  * round cannot be shrunk further). Within one logical turn history only
  * grows, so this is never retried; `runTurnLoop` converts it into a typed
  * non-retryable terminal and no over-cap request is shipped to the provider.
+ *
+ * Image carve-out (aligned with [TurnController.MAX_REQUEST_CHARS]):
+ * [MAX_REQUEST_CHARS] is a TEXT-basis cap — image payload bytes ride OUTSIDE
+ * this accounting (never counted in `text.length`), so an over-budget image
+ * attachment can never trip this exception on byte volume alone; image
+ * size/rejection is governed separately (spec §4 byte caps and
+ * ImageFallbackPolicy).
  */
 class ContinuationOverBudgetException : Exception("continuation request over budget")
 
@@ -4768,6 +4775,16 @@ class TurnController(
             // re-attach the frozen executed pair with `tools=[]`. The provider
             // sees the already-executed result; no re-execution, no second
             // tools offer.
+            // Phase-1 residual (recorded, separate design round —
+            // attempt-level semantics): this retry attempt has NO
+            // completeness gate of its own — if it yields no ToolDone and no
+            // final-answer evidence, a Done terminal still finalizes like a
+            // plain empty reply (the `contOutcome.finalAnswerEvidence == 0`
+            // gate below runs only for a NEW executed tool round, not for
+            // the re-attached frozen pair). The direction stays
+            // conservative: the executed result rides unchanged and nothing
+            // re-executes; a richer retry-completeness policy needs its own
+            // design round.
             buildToolContinuation(images, executedSliceCalls, executedSliceResults, toolSlice)
           } else {
             buildRequest(images, allowTools = !sliceExecutedThisTurn)
@@ -5063,9 +5080,12 @@ class TurnController(
    * many small ToolDeltas across many indexes must still trip the shared
    * budget. Monotonic within the attempt (ToolDone arrivals never
    * decrement it); retries start a fresh attempt with fresh counters.
-   * `seenCallIds` additionally dedups the execution path by call id (a
-   * duplicate id at two indexes executes once; later occurrences stay
-   * records-only so calls/results pairing stays unique).
+   * `seenCallIds` additionally dedups the execution path by the REDACTED
+   * pairing key ([SafeToolSlice.redactedPairingId] — the same form the
+   * continuation re-binds ids to on the wire): a duplicate raw id at two
+   * indexes executes once, and so do two distinct raw ids that redact to
+   * one key; later occurrences stay records-only so calls/results pairing
+   * stays unique.
    *
    * Per-attempt visible-text budget (#94): text/reasoning deltas check
    * [requireTurnTextBudget] against [visibleTextChars] before buffering (the
@@ -5106,6 +5126,12 @@ class TurnController(
 
   private suspend fun flushPendingTools(state: ToolAggState, attemptRunId: String) {
     coroutineContext.ensureActive()
+    // Phase-0 P3-5 residual (recorded): a truncated stream can flush
+    // "[tool:pending …]" crumbs for indexes that buffered only empty ToolDelta
+    // frames, and they ride later requests as audit noise. Accepted/deferred:
+    // redaction posture is pinned (flushedPendingMarkerMatchesRedactionPolicy)
+    // and poison-adjacent discard is governed by shouldDiscardPendingTools;
+    // no filtering or behavior work this phase.
     // Atomicity: preflight every pending index (including the synthetic
     // id/name defaults, which delta billing never sees) before any
     // marker/transcript side effect, so a later index overflowing cannot
@@ -5115,7 +5141,12 @@ class TurnController(
     val pending = state.argText.mapNotNull { (index, args) ->
       if (index in state.doneSeen) null
       else {
-        val id = state.idText[index]?.toString().orEmpty().ifEmpty { "call_pending_$index" }
+        // Blank-id synthesis with the same NON-colliding prefix as
+        // noteToolDone (`call_blank_pending_$index`): a buffered
+        // ToolDelta-only index must not alias a model-supplied flat call id
+        // (Phase-0 N2). Records-only: the flushed pair is marker + transcript
+        // truth, never an execution candidate.
+        val id = state.idText[index]?.toString().orEmpty().ifEmpty { "call_blank_pending_$index" }
         val name = state.nameText[index]?.toString().orEmpty().ifEmpty { "pending" }
         PendingTool(index, id, name, args.toString())
       }
@@ -5266,23 +5297,38 @@ class TurnController(
     // records-only even when a loop is attached. A null callback means
     // record-only (tool continuation second round).
     // Execution-path id intake hardening:
-    // (a) a duplicate call id within one response executes only once —
-    //     later occurrences stay records-only so calls/results pairing
-    //     stays unique (dedup by wire id, not index);
-    // (b) a blank id synthesizes the deterministic per-index wire id
-    //     (`call_${event.toolIndex}`): the
-    //     internal pairing validator (ProviderJson TOOL_CALL_MISSING_ID /
-    //     TOOL_CALL_DUPLICATE_ID, non-retryable) and providers alike fail
-    //     closed on an empty tool-call id. The transcript record above
-    //     deliberately keeps the RAW event id for audit truth.
-    val wireId = event.id.ifBlank { "call_${event.toolIndex}" }
+    // (a) a duplicate execution candidate is deduped by the REDACTED pairing
+    //     key, not the raw id: the continuation below re-binds every id to
+    //     its redacted form (SafeToolSlice.continuationMessages), so two
+    //     distinct raw ids that redact to one string would otherwise both
+    //     execute and then ride the wire as a duplicate call/result pair —
+    //     the internal pairing validator (ProviderJson
+    //     TOOL_CALL_DUPLICATE_ID, non-retryable) would kill the turn AFTER
+    //     both calls already executed. The colliding second call stays
+    //     records-only (its marker + transcript record above are kept).
+    //     The dedup routes through the SafeToolSlice seam
+    //     (redactedPairingId) — the turn engine must not import the
+    //     redactor for this key;
+    // (b) a blank id synthesizes the deterministic per-index wire id with a
+    //     NON-colliding prefix (`call_blank_${event.toolIndex}`): the plain
+    //     `call_${index}` form could be aliased in reverse — a later
+    //     model-supplied flat `call_3` id would replicate the synthesis of
+    //     an earlier blank call, satisfy the seen-set quickly, and
+    //     silently skip execution (Phase-0 N2). The internal pairing
+    //     validator (ProviderJson TOOL_CALL_MISSING_ID, non-retryable) and
+    //     providers alike fail closed on an empty tool-call id; providers
+    //     whose mapper carries no blank-id repair still rely on this
+    //     fallback. The transcript record above deliberately keeps the RAW
+    //     event id for audit truth.
+    val wireId = event.id.ifBlank { "call_blank_${event.toolIndex}" }
+    val pairingId = SafeToolSlice.redactedPairingId(wireId)
     if (
       onWiredToolDone != null &&
       toolSlice != null &&
       event.name == SafeToolSlice.TOOL_NAME &&
-      wireId !in state.seenCallIds
+      pairingId !in state.seenCallIds
     ) {
-      state.seenCallIds.add(wireId)
+      state.seenCallIds.add(pairingId)
       onWiredToolDone(
         dev.librepocket.provider.ToolCall(
           id = wireId,
@@ -5344,6 +5390,13 @@ class TurnController(
             // Reasoning Deltas below never count (reasoning-only continuation
             // is not a final answer). The lifetime counter above and the
             // budget accounting stay untouched (cost-metric contracts).
+            // Deferred rationale (recorded, separate design round):
+            // isServerToolMarker is a CONTAINS predicate, so ONE delta that
+            // merges visible text AND the marker frame is over-excluded
+            // wholesale — its text half does not count as evidence and may
+            // yield a false-incomplete retry. The over-exclusion direction is
+            // fail-closed (never a false complete) and is the accepted Phase-1
+            // trade-off; splitting a merged text+marker delta is future work.
             if (event.delta.isNotEmpty() && !ServerToolTranscript.isServerToolMarker(event.delta)) {
               state.finalAnswerEvidence++
             }
@@ -5939,6 +5992,10 @@ class TurnController(
  * (text-only) accounting. JSON-escaping expansion and adapter wrapper keys
  * are NOT counted (deliberately never over-counts), so the fail-close can
  * only fire for a request that is already over cap on the strict measure.
+ * Image carve-out (aligned with MAX_REQUEST_CHARS's boundary invariant):
+ * this is a TEXT-basis estimate — image payload bytes ride OUTSIDE the
+ * accounting (never counted in `text.length`; ImageFallbackPolicy governs
+ * them separately), so the tool continuation budget also stays text-basis.
  *
  * `internal` visibility is deliberate: same-module unit tests must reach the
  * exact production formula directly (no reflection pin needed); keep the

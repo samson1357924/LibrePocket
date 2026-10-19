@@ -313,4 +313,43 @@ class FastRouterDecisionTest {
         assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
         assertNull(d.toolCall)
     }
+
+    // ---- Phase-0 pin (D): phone-candidate selection (Stage-3 行為, now
+    // pinned) — findPhoneCandidate takes the candidate with the MOST digits
+    // (maxByOrNull on the digit count; first-max tie-break), observably via
+    // hasPhoneNumber: a ≥7-digit candidate selected → wiring gate
+    // (USER_DISABLED), none → 補參澄清. The two-candidate scenarios below pin
+    // both directions; the tie case documents the first-max tie-break (both
+    // tied candidates keep the same outcome, so the tie-break half is
+    // pinned as determinism through the only public observation point). ----
+
+    @Test fun phoneCandidateMaxDigitCountWinsOverFirstMatch() {
+        // (a) short candidate first + long number later: selection must skip
+        // the 4-digit first candidate (disproves "first match wins").
+        val a = decide("打電話給 1-2-3-4，或回撥 0912345678")
+        assertEquals(RouteKind.DENIED, a.route)
+        assertEquals(DenyReason.USER_DISABLED, a.reasonCode)
+        assertFalse(a.fallbackMessage!!.contains("NEED_CLARIFICATION"))
+    }
+
+    @Test fun phoneCandidateMaxDigitCountWinsOverLastMatch() {
+        // (b) long number first + short candidate later: the short trailing
+        // candidate must not take over (disproves "last match wins").
+        val b = decide("打電話給 0912345678，忙線時改打 1-2-3-4")
+        assertEquals(RouteKind.DENIED, b.route)
+        assertEquals(DenyReason.USER_DISABLED, b.reasonCode)
+        assertFalse(b.fallbackMessage!!.contains("NEED_CLARIFICATION"))
+    }
+
+    @Test fun phoneCandidateFirstMaxTieBreakIsDeterministic() {
+        // (c) tie: two equal-digit candidates → same decision; maxByOrNull
+        // keeps the FIRST max (stdlib tie-break, documented — both tie
+        // candidates drive the same ≥7-digit outcome through the gate).
+        val c = decide("打電話給 0912345678，或改打 0987654321")
+        assertEquals(RouteKind.DENIED, c.route)
+        assertEquals(DenyReason.USER_DISABLED, c.reasonCode)
+        val c2 = decide("打電話給 0912345678，或改打 0987654321")
+        assertEquals(c.reasonCode, c2.reasonCode)
+        assertEquals(c.fallbackMessage, c2.fallbackMessage)
+    }
 }

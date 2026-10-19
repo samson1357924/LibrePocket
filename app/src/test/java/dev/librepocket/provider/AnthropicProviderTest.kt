@@ -181,6 +181,42 @@ class AnthropicProviderTest {
         assertEquals(StreamEvent.Failed("SSE_TRUNCATED", retryable = true), events.last())
     }
 
+    // ---- Phase-0 review (C): blank tool id / name at content_block_stop ----
+
+    @Test
+    fun toolUseStartWithoutIdSynthesizesRepairIdAtStop() {
+        // A tool_use block started without an id must not emit an empty
+        // tool-call id at content_block_stop: internal pairing validation
+        // (TOOL_CALL_MISSING_ID, non-retryable) and providers fail closed on
+        // one. Repair parity with ResponsesProvider's output_item.done:
+        // `call_` + 8 chars — and no empty id ever rides the done event.
+        val mapper = AnthropicMapper()
+        mapper.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"get_weather"}}""",
+        )
+        val stopEvents = mapper.mapPayload("""{"type":"content_block_stop","index":0}""")
+        val done = stopEvents.filterIsInstance<StreamEvent.ToolDone>().single()
+        assertTrue("expected call_-prefixed synthetic id, was: ${done.id}", done.id.startsWith("call_"))
+        assertEquals("call_XXXXXXXX".length, done.id.length)
+        assertEquals("get_weather", done.name)
+    }
+
+    @Test
+    fun toolUseStartWithoutNameRidesBlankNameNoFabrication() {
+        // Blank tool NAME: no synthesis by design — a nameless tool_use
+        // rides its (empty) name verbatim; the turn layer's records-only
+        // gate on the exact slice tool name can never execute a nameless
+        // call (fail-closed downstream, never a wrong-name execution).
+        val mapper = AnthropicMapper()
+        mapper.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_wx8f"}}""",
+        )
+        val done = mapper.mapPayload("""{"type":"content_block_stop","index":0}""")
+            .filterIsInstance<StreamEvent.ToolDone>().single()
+        assertEquals("toolu_wx8f", done.id)
+        assertEquals("", done.name)
+    }
+
     @Test
     fun anthropicVersionAndMaxTokensContract() {
         assertEquals("2023-06-01", AnthropicProvider.ANTHROPIC_VERSION)

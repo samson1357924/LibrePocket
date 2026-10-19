@@ -1,7 +1,9 @@
 package dev.librepocket.router
 
 import dev.librepocket.policy.InMemoryPolicyStore
+import dev.librepocket.policy.PolicyDecision
 import dev.librepocket.policy.PolicyRule
+import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.tool.DenyReason
 import dev.librepocket.tool.Flavor
@@ -164,6 +166,10 @@ class SafeToolSliceTest {
             """{"query":"x","limit":true}""",
             """{"query":"x","pathPrefix":5}""",
             """{"query":"x","limit":{}}""",
+            // F3(b): ISO-control INSIDE the model-controlled `query` (the
+            // query-layer check, distinct from the pathPrefix \u0000/\u0001
+            // pins below in the traversal tests) denies schema-invalid.
+            "{\"query\":\"a\\u0001b\"}",
         )
         for ((i, args) in bad.withIndex()) {
             val r = s.execute(listOf(call(args = args, id = "bad-$i"))).single()
@@ -777,6 +783,181 @@ class SafeToolSliceTest {
             swept++
         }
         assertEquals(ToolRegistry.ALL.size - 1, swept)
+        assertEquals(0, backend.invocations.get())
+    }
+
+    // ---- Phase-0 review bundle (D/F3) ----
+
+    /**
+     * F2/F3 pins helper: assert a string carries no LONE surrogate (a high
+     * surrogate must be immediately followed by its low partner; a low
+     * surrogate must be immediately preceded by its high partner). The
+     * capped strings are UTF-16-unit-safe only when this holds — a lone
+     * surrogate degrades to U+FFFD at UTF-8 encode.
+     */
+    private fun assertNoLoneSurrogate(s: String) {
+        var i = 0
+        while (i < s.length) {
+            val u = s[i].code
+            if (u in 0xD800..0xDBFF) {
+                assertTrue(
+                    "lone high surrogate at $i of: $s",
+                    i + 1 < s.length && s[i + 1].code in 0xDC00..0xDFFF,
+                )
+                i += 2
+            } else {
+                assertFalse("lone low surrogate at $i of: $s", u in 0xDC00..0xDFFF)
+                i++
+            }
+        }
+    }
+
+    @Test fun surrogatePairsNotSplitAtQueryAndBackendFieldCaps() = runBlocking {
+        // F2: cappedEcho's old `.take(MAX_STRING_CHARS)` could cut between the
+        // two halves of a surrogate pair and emit a LONE high surrogate into
+        // the result JSON. The capped helper steps back over the split pair —
+        // pinned on the model-controlled `query` echo AND the
+        // backend-controlled symbol fields: 499 ASCII units + one emoji
+        // (501 UTF-16 units) puts the pair's high half exactly at the cap-1
+        // cut → the capped portion is 499 units (pair dropped intact), the
+        // last unit is not a high surrogate, and no lone surrogate rides
+        // anywhere in the result JSON.
+        val emoji = "\uD83D\uDE00"
+        val longBackend = object : LspTools.Backend {
+            override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+                listOf(
+                    LspTools.Symbol(
+                        "n".repeat(499) + emoji,
+                        "k".repeat(499) + emoji,
+                        "p".repeat(499) + emoji,
+                        1,
+                    ),
+                )
+            override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val s = slice(backend = longBackend)
+        val query = "q".repeat(499) + emoji
+        assertEquals(501, query.length)
+        val r = s.execute(listOf(call(args = """{"query":"$query"}"""))).single()
+        assertFalse(r.denied)
+        assertNoLoneSurrogate(r.resultJson)
+        val body = Json.parseToJsonElement(r.resultJson).jsonObject
+        val echo = body["query"]!!.jsonPrimitive.content
+        val cut = echo.indexOf('…')
+        assertTrue("expected capped marker in echo: $echo", echo.contains("[truncated 501→500]"))
+        val capped = echo.substring(0, cut)
+        // Split case: one unit below the cap (the pair stepped out intact).
+        assertEquals(SafeToolSlice.MAX_STRING_CHARS - 1, capped.length)
+        assertFalse("last unit must not be a high surrogate", capped.last().isHighSurrogate())
+        val sym = body["symbols"]!!.jsonArray.single().jsonObject
+        for (field in listOf("name", "kind", "path")) {
+            val v = sym[field]!!.jsonPrimitive.content
+            val fieldCut = v.indexOf('…')
+            assertTrue("expected capped marker in $field: $v", fieldCut > 0)
+            val cappedField = v.substring(0, fieldCut)
+            assertEquals(field, SafeToolSlice.MAX_STRING_CHARS - 1, cappedField.length)
+            assertFalse(field, cappedField.last().isHighSurrogate())
+        }
+    }
+
+    @Test fun surrogatePairRightOfTheCutKeepsFullCapInEcho() = runBlocking {
+        // The non-split boundary case: 500 ASCII + emoji (502 units) cuts at
+        // exactly 500 BEFORE the pair starts — the capped portion is a plain
+        // 500 ASCII units, no surrogate handling needed and none triggered.
+        val emoji = "\uD83D\uDE00"
+        val longBackend = object : LspTools.Backend {
+            override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+                listOf(LspTools.Symbol("m".repeat(2000), "k".repeat(2000), "p".repeat(2000), 1))
+            override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val s = slice(backend = longBackend)
+        val query = "q".repeat(500) + emoji
+        val r = s.execute(listOf(call(args = """{"query":"$query"}"""))).single()
+        assertFalse(r.denied)
+        assertNoLoneSurrogate(r.resultJson)
+        val body = Json.parseToJsonElement(r.resultJson).jsonObject
+        val echo = body["query"]!!.jsonPrimitive.content
+        val cut = echo.indexOf('…')
+        assertTrue(echo.contains("[truncated 502→500]"))
+        assertEquals(SafeToolSlice.MAX_STRING_CHARS, echo.substring(0, cut).length)
+    }
+
+    @Test fun surrogateCapAppliesToCallIdEchoesToo() = runBlocking {
+        // The same cap helper must govern the call-id string caps (deny
+        // receipt + continuation re-bind): an emoji crossing the cap in a
+        // call id keeps the pairing intact without splitting the pair.
+        val emoji = "\uD83D\uDE00"
+        val emojiId = "I".repeat(499) + emoji
+        val s = slice(backend = CountingBackend())
+        val unknown = s.execute(listOf(call(id = emojiId, name = "nope.tool"))).single()
+        assertTrue(unknown.denied)
+        assertNoLoneSurrogate(unknown.resultJson)
+        val denyBody = Json.parseToJsonElement(unknown.resultJson).jsonObject
+        assertEquals(SafeToolSlice.MAX_STRING_CHARS - 1, denyBody["callId"]!!.jsonPrimitive.content.length)
+        // Internal pairing keeps the full id; the continuation re-bind caps
+        // the same surrogate-safe way.
+        assertEquals(emojiId, unknown.callId)
+        val msgs = s.continuationMessages(listOf(call(id = emojiId)), listOf(unknown))
+        val contId = msgs.first { it.role == "tool" }.toolCallId
+        assertEquals(SafeToolSlice.MAX_STRING_CHARS - 1, contId!!.length)
+        assertNoLoneSurrogate(contId)
+    }
+
+    @Test fun queryTraversalAndEscapeShapesStayAllowed() = runBlocking {
+        // F3(a): the documented (but previously untested) claim — the
+        // model-controlled `query` keeps its own narrower check, so
+        // traversal/colon/percent-marks in a SEARCH STRING stay legal; only
+        // pathPrefix is scope-restricted.
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        val allowed = listOf("a..b%3Ac", "c:/tmp", "../external-query", "%2e%2e", "file:/doc")
+        for ((i, q) in allowed.withIndex()) {
+            val r = s.execute(listOf(call(args = """{"query":"$q"}""", id = "q-ok-$i"))).single()
+            assertFalse("query must stay allowed: $q", r.denied)
+        }
+        assertEquals(allowed.size, backend.invocations.get())
+    }
+
+    @Test fun overGrossArgsExecuteGateDeniesSchemaInvalidWithZeroSideEffects() = runBlocking {
+        // F3(c): parseArgs' gross cap fans closed at the EXECUTE gate with
+        // the same typed SCHEMA_INVALID denial (never a crash, never an
+        // oversized parse): a well-shaped object whose raw argument text
+        // exceeds MAX_GROSS_ARGS_CHARS is rejected before any parse.
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        val args = """{"query":"""" + "x".repeat(SafeToolSlice.MAX_GROSS_ARGS_CHARS) + """"}"""
+        assertTrue(args.length > SafeToolSlice.MAX_GROSS_ARGS_CHARS)
+        val r = s.execute(listOf(call(args = args, id = "gross"))).single()
+        assertTrue(r.denied)
+        assertEquals(SafeToolSlice.DenyCodes.SCHEMA_INVALID, r.denyCode)
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun throwingPolicyStoreStillFailsClosedWithZeroSideEffects() = runBlocking {
+        // F3(d): the fresh `evaluateFresh` catch-all in executeOne — a store
+        // that THROWS (storage/IO failure) denies POLICY_DENIED with the
+        // fixed "ERROR" receipt and ZERO backend effects (fail-closed;
+        // denial is a typed result, pairing preserved).
+        val backend = CountingBackend()
+        val throwing = object : PolicyStore {
+            override fun evaluate(action: String, resource: String): PolicyDecision =
+                PolicyDecision(Verdict.ALLOW, null, 0L)
+            override suspend fun setRule(rule: PolicyRule) = Unit
+            override suspend fun removeRule(pattern: String) = Unit
+            override suspend fun listRules(): List<PolicyRule> = emptyList()
+            override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision =
+                throw IllegalStateException("policy io exploded")
+        }
+        val s = SafeToolSlice(
+            ctxSupplier = { ProjectionContext(userSwitches = mapOf("lsp" to true)) },
+            policy = throwing,
+            backend = backend,
+            clock = fixedClock,
+        )
+        val r = s.execute(listOf(call(id = "err-1"))).single()
+        assertTrue(r.denied)
+        assertEquals(SafeToolSlice.DenyCodes.POLICY_DENIED, r.denyCode)
+        assertTrue("fixed ERROR receipt", r.resultJson.contains("ERROR"))
         assertEquals(0, backend.invocations.get())
     }
 }

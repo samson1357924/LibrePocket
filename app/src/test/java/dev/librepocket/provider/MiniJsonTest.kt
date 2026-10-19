@@ -165,4 +165,42 @@ class MiniJsonTest {
             assertEquals(ProviderFailureCode.AGG_TOO_LARGE, e.code)
         }
     }
+
+    // ---- Phase-0 review (B): signed / non-hex \uXXXX escapes fail closed ----
+
+    @Test
+    fun parseAcceptsValidHexUnicodeEscapes() {
+        // Control (pre-fix behavior retained for well-formed input): mixed-case
+        // hex decodes, BMP target intact.
+        assertEquals("»", (MiniJson.parse("\"\\u00bb\"") as MiniJson.JStr).v)
+        assertEquals("»", (MiniJson.parse("\"\\u00BB\"") as MiniJson.JStr).v)
+        assertEquals("水", (MiniJson.parse("\"\\u6c34\"") as MiniJson.JStr).v)
+    }
+
+    @Test
+    fun parseRejectsSignedAndNonHexUnicodeEscapes() {
+        // `toIntOrNull(16)` accepted signed prefixes: `\u-123` decoded to the
+        // U+FEDD overflow value and `\u+0bb` silently read 0x00bb; RFC 8259
+        // only admits hex digits (same rule McpWire.parseString pins at its
+        // own parser). Every such escape now fails closed with the standard
+        // parser error — the same mechanism as `bad escape '\x'` — not a
+        // silent decode.
+        for (bad in listOf(
+            "\"\\u-123\"", // signed negative
+            "\"\\u+0bb\"", // signed positive
+            "\"\\u 0bb\"", // delimiter/whitespace unit
+            "\"\\u0x0b\"", // radix prefix inside the 4 units
+            "\"\\u0bb\"",  // only 3 usable units → 'b' is not hex-4
+        )) {
+            try {
+                MiniJson.parse(bad)
+                fail("signed/non-hex escape must fail closed: $bad")
+            } catch (e: MiniJson.MiniJsonException) {
+                assertTrue(
+                    "expected the parse-error mechanism for $bad, got: ${e.message}",
+                    e.message!!.contains("bad unicode escape"),
+                )
+            }
+        }
+    }
 }

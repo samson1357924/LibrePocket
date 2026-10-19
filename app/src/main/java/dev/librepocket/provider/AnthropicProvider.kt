@@ -343,7 +343,29 @@ internal class AnthropicMapper(val round: Int = 0) {
                 val block = blocks[index] ?: return emptyList()
                 block.closed = true
                 if (block.kind == BlockKind.TOOL) {
-                    out.add(StreamEvent.ToolDone(index, block.toolId, block.toolName, block.args.toString()))
+                    // Blank-id repair at the terminal (parity with
+                    // ResponsesProvider's output_item.done): a tool_use block
+                    // that started WITHOUT an `id` must not emit an empty
+                    // tool-call id — the internal pairing validator
+                    // (ProviderJson TOOL_CALL_MISSING_ID, non-retryable) and
+                    // providers alike fail closed on one. Same synthetic shape
+                    // (`call_` + 8 hex chars). The synthetic default was
+                    // billed as 0 chars at content_block_start, so its growth
+                    // is charged here (per-key + round total, checked BEFORE
+                    // write/emit) — same posture as the Responses mapper.
+                    // NOTE blank tool `name`: no fabrication — a nameless
+                    // block rides its (possibly empty) name verbatim; the
+                    // turn layer scrubs blank names to `tool` in records and
+                    // its records-only gate on the exact slice tool name can
+                    // never execute a nameless call (fail-closed).
+                    val doneId = block.toolId.ifEmpty {
+                        val syntheticId = "call_" + java.util.UUID.randomUUID().toString().take(8)
+                        requireToolIdBudget(syntheticId.length)
+                        requireTotalToolAggBudget(totalAggChars, syntheticId.length)
+                        totalAggChars += syntheticId.length
+                        syntheticId
+                    }
+                    out.add(StreamEvent.ToolDone(index, doneId, block.toolName, block.args.toString()))
                 }
             }
             "message_delta" -> {

@@ -300,10 +300,12 @@ class OrderedTranscriptSink(
    * that "the barrier is buffered behind whatever is currently in flight and
    * the admission chain is clear". A test observing this hook signal knows
    * any later writer death will fail THIS barrier via the [sealWriter]
-   * orphan drain (the exact shape the seal-race mapping in [flush] handles);
-   * the hook may suspend to park the flush there while the test arms the
-   * teardown. Must not run under [admissionLock] (checked like the other
-   * hooks); a hook throw propagates like any post-send caller fault.
+   * orphan drain with the seal cause (a teardown CE maps to not-drained per
+   * the seal-race mapping in [flush]; a fatal Error instead escapes [flush]
+   * verbatim, fail-loud); the hook may suspend to park the flush there while
+   * the test arms the teardown. Must not run under [admissionLock] (checked
+   * like the other hooks); a hook throw propagates like any post-send caller
+   * fault.
    */
   @VisibleForTesting
   internal var afterBarrierSendForTest: (suspend () -> Unit)? = null
@@ -347,8 +349,10 @@ class OrderedTranscriptSink(
 
   private fun releaseAdmission(gate: CompletableDeferred<Unit>) {
     // complete() is non-throwing and idempotent (returns false if already
-    // completed or cancelled): a cancelled/completed gate still wakes as a
-    // no-op, so no defensive try/catch is needed here.
+    // completed or cancelled): a completed gate re-completes harmlessly
+    // returning false, and a cancelled gate's awaiters were already released
+    // by their own cancellation (complete() there is just a late no-op), so
+    // no defensive try/catch is needed here.
     gate.complete(Unit)
     admissionChain.compareAndSet(gate, null)
   }
@@ -442,6 +446,12 @@ class OrderedTranscriptSink(
             // block itself (e.g. an inner withTimeout): remember the failure
             // so the finally below fails the ack explicitly instead of
             // reporting a false durable ack, then propagate so the writer ends.
+            // Reach note: every core and non-best-effort notice entry CE
+            // lands in this else; the two best-effort usage notices (onUsage
+            // + flushBufferedUsageBestEffort) land in the swallow branch
+            // above while the scope is active — a self-thrown CE and the
+            // bounded-timeout CE alike; a best-effort entry reaches this
+            // else only at teardown, when writerScope is already inactive.
             failure = e
             throw e
           }
@@ -1204,10 +1214,15 @@ class OrderedTranscriptSink(
    *
    * Writer-teardown seal race: if the writer dies while a buffered barrier
    * is still queued behind it, [sealWriter]'s orphan drain fails that
-   * barrier with the teardown CE. [flush] maps that race to `false` (not
-   * drained) instead of rethrowing the foreign teardown exception — the
-   * durable-failure truth then flows through [hasDurableFailures]/[flushDurable]
-   * as usual. A caller cancellation, and any CE from a still-unsealed
+   * barrier with the seal cause — two shapes, per the catch in the body:
+   * - teardown CE (scope-cancel death): [flush] maps that race to `false`
+   *   (not drained) instead of rethrowing the foreign teardown exception —
+   *   the durable-failure truth then flows through
+   *   [hasDurableFailures]/[flushDurable] as usual;
+   * - fatal Error / VM-fatal: the seal cause is the Error itself, which is
+   *   no CancellationException and escapes [flush] verbatim (fail-loud,
+   *   pinned by #bestEffortVmFatalStillSeals in OrderedTranscriptSinkTest).
+   * A caller cancellation, and any CE from a still-unsealed
    * writer, keep propagating (see the catch in the body).
    * Contrast with the post-seal shape: a flush that arrives AFTER the seal
    * never enqueues a barrier (ClosedSendChannelException) and instead joins
@@ -1269,13 +1284,27 @@ class OrderedTranscriptSink(
           } catch (e: CancellationException) {
             // Writer-teardown race on a buffered barrier (CI flake root):
             // while this barrier sits in the channel behind a still-running
-            // entry, the writer can die (fatal delegate Error, shutdown
-            // scope cancel) and [sealWriter]'s orphan drain then completes
-            // this VERY barrier exceptionally with its teardown CE
-            // ("transcript writer dead"). That failure is not caller
-            // cancellation, and rethrowing it would surface a foreign
-            // teardown exception through [flushDurable] (which promises a
-            // fail-closed Boolean). Mapping, in catch order:
+            // entry, the writer can die and [sealWriter]'s orphan drain then
+            // completes this VERY barrier exceptionally — with the seal
+            // cause from the writer finally
+            // (`lastFailure ?: CancellationException("transcript writer dead")`),
+            // which has TWO shapes the mapping below only covers one of:
+            // - teardown CE (scope-cancel death, no fatal Error): the seal
+            //   cause is the teardown's CancellationException —
+            //   "transcript writer dead" only when no per-entry *propagating*
+            //   failure (a CancellationException or a non-Exception)
+            //   preceded the death — a routine Exception-tier entry failure
+            //   neither seals the writer nor sets lastFailure — otherwise
+            //   that per-entry teardown CE itself. Not caller cancellation,
+            //   and rethrowing it would
+            //   surface a foreign teardown exception through [flushDurable]
+            //   (which promises a fail-closed Boolean).
+            // - fatal delegate Error / VM-fatal: the lastFailure filter passes
+            //   the Error through, so the seal cause IS that Error — no
+            //   CancellationException, this catch never sees it, and it
+            //   escapes [flush] verbatim (fail-loud; pinned by
+            //   #bestEffortVmFatalStillSeals in OrderedTranscriptSinkTest).
+            // Mapping, in catch order:
             // - caller coroutine cancelled, or writer not yet sealed (some
             //   unrelated cancellation): rethrow — cancellation semantics
             //   unchanged;

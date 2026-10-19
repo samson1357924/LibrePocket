@@ -16,6 +16,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
@@ -568,6 +569,203 @@ class OrderedTranscriptSinkErrorTest {
       }
     } finally {
       scope?.cancel()
+      exec.shutdown()
+    }
+  }
+
+  /**
+   * C-P1 settle-VM-fatal regression (S3-F1 fail-loud): the VM-fatal rethrow
+   * inserted into [OrderedTranscriptSink.shutdown]'s settle catch was a
+   * behaviour-level change with no regression test. This pins the rethrow
+   * side: an OOM thrown during settle escapes the teardown job with the
+   * injected type + payload, and the drain is NOT attempted — no seal, no
+   * interrupt marks, the admitted core host stays pending (a regressed
+   * swallow would run the drain instead: seal, orphan marks + failed acks
+   * inside the same injected budget — the non-VM sibling below pins that
+   * branch).
+   *
+   * Injection point: the production `settle` parameter itself. Production
+   * composes the host-settle lambda through this exact parameter, and
+   * shutdown runs it inside the production
+   * `withContext(NonCancellable) { withTimeoutOrNull(drainTimeoutMs) {...} }`
+   * block whose catch performs the VM-fatal rethrow — so the injected lambda
+   * exercises the production catch with no reflection and no test-only
+   * seam. The in-flight host is parked in its delegate (entered/gate), the
+   * same deterministic parked-orphan shape the seal group uses.
+   *
+   * Note on completion capture: the teardown job fails exceptionally with
+   * the injected OOM, but on kotlinx-coroutines 1.10.1 `Job.join()` returns
+   * normally for a failed child (fast and slow path alike, and the parent is
+   * a supervisor) — there is no rethrow for the test to catch — so the OOM
+   * is pinned as the job's completion CAUSE via `invokeOnCompletion`; had
+   * the job already completed at registration, the handler would fire
+   * synchronously, so the capture cannot race `shutdown`'s launch.
+   * Note on test output: writerScope is a top-level SupervisorJob scope, so
+   * the failed child's OOM is never resumed into a parent and surfaces once
+   * through the global handler (stderr) — the noise is expected, not a
+   * failure.
+   */
+  @Test fun shutdownSettleVMFatal_rethrowsOutOfMemoryErrorAndAbortsDrain() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val entered = CompletableDeferred<Unit>()
+      val gate = CompletableDeferred<Unit>()
+      val delegate = object : TranscriptSink {
+        override suspend fun onTurnStarted(runId: String, text: String) {
+          entered.complete(Unit)
+          gate.await() // parked in the writer: the in-flight host a working settle would have waited on
+        }
+        override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
+        override suspend fun onTurnFailed(runId: String, error: String) = Unit
+        override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
+        override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
+        override suspend fun onSteerQueued(text: String) = Unit
+        override suspend fun onToolDone(
+          runId: String,
+          toolIndex: Int,
+          id: String,
+          name: String,
+          argumentsJson: String,
+        ) = Unit
+        override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 8)
+      runBlocking {
+        val orphan = async { sink.onTurnStarted("orphan-1", "hi") }
+        try {
+          withTimeout(20_000) {
+            entered.await() // writer consumed the entry; parked in the delegate
+            val job = checkNotNull(sink.shutdown(
+              drainTimeoutMs = 100L,
+              settle = { throw OutOfMemoryError("simulated VM fatal in settle") },
+            )) { "first shutdown must return the teardown job" }
+            val causeSignal = CompletableDeferred<Throwable?>()
+            job.invokeOnCompletion { causeSignal.complete(it) }
+            val fatal = causeSignal.await()
+            assertTrue(
+              "settle VM-fatal must fail the teardown job exceptionally, got $fatal",
+              fatal is OutOfMemoryError,
+            )
+            assertTrue(
+              "completion cause must keep the injected payload type + message, got $fatal",
+              fatal?.message == "simulated VM fatal in settle",
+            )
+            // Teardown aborts BEFORE the drain: none of the drain's side
+            // effects ran (the non-VM sibling below pins the swallow branch,
+            // where the same budget marks + fails + seals).
+            assertFalse("aborted teardown must not seal", sink.isSealed())
+            assertTrue("aborted drain must not mark orphans", sink.interruptedRunIds().isEmpty())
+            assertFalse("aborted drain must not poison durability", sink.hasDurableFailures())
+            assertTrue("orphan must still be admitted-pending", sink.isCorePending("orphan-1"))
+            assertFalse("writer must still be alive", sink.isWriterCompleted())
+          }
+        } finally {
+          // Idempotent unblock, also on a failed assert, so the executor
+          // cannot leak a parked writer.
+          gate.complete(Unit)
+        }
+        // Writer survived the aborted teardown: the released host still
+        // commits (no discard, no seal, no orphan mark).
+        withTimeout(5_000) { while (sink.isCorePending("orphan-1")) delay(10) }
+        orphan.join()
+        assertTrue("writer must stay alive after the aborted teardown", sink.coreCommitCount("orphan-1") >= 1)
+        assertTrue("a committed orphan must leave no marks", sink.interruptedRunIds().isEmpty())
+      }
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  /**
+   * Control for the abort above: the ordinary [Error] tier from settle
+   * (AssertionError here — OOM/StackOverflowError/ThreadDeath would take the
+   * rethrow branch) is INTENTIONALLY swallowed by [OrderedTranscriptSink.shutdown]'s
+   * settle catch (D15-4 teardown fail-closed), and the drain still runs to
+   * completion: the admitted core is marked a drain-timeout orphan, its ack
+   * fails explicitly (never a false durable success), and the teardown seals.
+   * Same settled output as a clean settle against a stalled store.
+   *
+   * Injection point: the same production `settle` parameter as the sibling,
+   * landing in the same production settle catch — only the catch tier differs.
+   *
+   * Note on completion capture: the trailing `writerScope.cancel()` at the
+   * end of teardown self-cancels the coroutine running the teardown (a
+   * child of that scope), so the job's completion CAUSE is ALWAYS the
+   * teardown's own CancellationException — never null. Since `Job.join()`
+   * returns normally even for a failed child (coroutines 1.10.1), a plain
+   * join can never pin this either way; the CAUSE captured via
+   * `invokeOnCompletion` is what proves the swallow — the settled non-VM
+   * Error was swallowed if and only if the cause is that
+   * CancellationException and NOT the AssertionError (a regression that
+   * rethrew it would land the AssertionError as the completion cause and
+   * fail this assertion). Same no-race mechanics as the sibling: a job
+   * already completed at registration fires the handler synchronously.
+   */
+  @Test fun shutdownSettleNonVMFatalError_isSwallowedAndDrainStillSeals() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val entered = CompletableDeferred<Unit>()
+      val gate = CompletableDeferred<Unit>()
+      val delegate = object : TranscriptSink {
+        override suspend fun onTurnStarted(runId: String, text: String) {
+          entered.complete(Unit)
+          gate.await() // parked in the writer: the drain must mark + fail it as an orphan
+        }
+        override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
+        override suspend fun onTurnFailed(runId: String, error: String) = Unit
+        override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
+        override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
+        override suspend fun onSteerQueued(text: String) = Unit
+        override suspend fun onToolDone(
+          runId: String,
+          toolIndex: Int,
+          id: String,
+          name: String,
+          argumentsJson: String,
+        ) = Unit
+        override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 8)
+      runBlocking {
+        val orphan = async { sink.onTurnStarted("orphan-1", "hi") }
+        try {
+          withTimeout(20_000) {
+            entered.await()
+            val job = checkNotNull(sink.shutdown(
+              drainTimeoutMs = 200L,
+              settle = { throw AssertionError("simulated settle fatal") },
+            )) { "first shutdown must return the teardown job" }
+            val causeSignal = CompletableDeferred<Throwable?>()
+            job.invokeOnCompletion { causeSignal.complete(it) }
+            val cause = causeSignal.await()
+            assertTrue(
+              "non-VM settle Error must be swallowed (completion cause is the trailing self-cancel CE, not the AssertionError), got $cause",
+              cause is CancellationException,
+            )
+            try {
+              withTimeout(4_000) { orphan.await() }
+              fail("drain-timeout orphan must throw, never hang or succeed")
+            } catch (_: CancellationException) {
+              // Explicit bounded failure: the drain ran.
+            } catch (e: Exception) {
+              fail("orphan must fail with CancellationException, got $e")
+            }
+            assertEquals(
+              "drain must mark the timed-out orphan",
+              listOf("orphan-1"),
+              sink.interruptedRunIds(),
+            )
+            assertTrue(sink.pendingRunIds().isEmpty())
+            assertTrue("drain must still seal after the swallowed Error", sink.isSealed())
+          }
+        } finally {
+          // Idempotent unblock, also on a failed assert.
+          gate.complete(Unit)
+        }
+      }
+    } finally {
       exec.shutdown()
     }
   }

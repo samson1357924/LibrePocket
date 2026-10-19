@@ -16,6 +16,7 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `.github/workflows/pr-check.yml`) and `policy`
 (`scripts/play_policy_check.sh`, `scripts/apk_policy_inspect.py`,
 `scripts/backup_rules_check.py`,
+`scripts/nsc_check.py`,
 `scripts/summarize_junit.py`, `scripts/check_test_budgets.py`,
 `scripts/check_junit_durations.py`,
 `scripts/tests/test_apk_policy_check.py`,
@@ -283,22 +284,34 @@ multiple-roots lane; that lane is pinned separately in
 payload is driven through both the files lane and the compressed-zip lane, so
 the shared-validation claim is evidenced rather than inferred — a rejected
 ref-name rejects both). The
-fail-closed destRoot probe and restore content proof are additionally
-pinned in `SkillStartupRecoveryTest`: the destRoot probe
+fail-closed destRoot probe group is additionally pinned in
+`SkillStartupRecoveryTest`: the destRoot probe
 `isSymlinkOrUnknown` treats undecidable attributes as unsafe
 (install into a nonexistent destRoot still succeeds; a cleanup on a
 symlink/unknown destRoot is a no-op — `cleanup_symlinkDestRoot_isNoop` — and
 `listResiduals_symlinkDestRoot_isEmpty` lists nothing), symlink classification
 runs before the age gate so fresh link-shaped staging is unlinked in the same
 run (`cleanup_freshLinkStagingShape_unlinkedRegardlessOfAge`, unlink-only,
-external contents survive), a symlinked or unreadable SKILL.md never
+external contents survive), and a symlinked or unreadable SKILL.md never
 restores or reports a version
 (`installedVersion_symlinkSkillMd_returnsNull`,
-`installedVersion_symlinkSkillDir_returnsNull`), and a target-less single
-`.bak` restores only when `bakManifestName` proves a real, non-symlink,
+`installedVersion_symlinkSkillDir_returnsNull`). The restore content proof
+group is pinned in `SkillAtomicCommitTest`: a target-less single `.bak`
+restores only when `bakManifestName` proves a real, non-symlink,
 `MAX_SINGLE_FILE_BYTES`-bounded, parseable SKILL.md whose manifest name equals
 the bak id — otherwise it converges to KEPT (still listed by
-`listResiduals`). `SkillAtomicCommitTest` pins the replace path to
+`listResiduals`), with its four cases pinned separately as
+`staleBakWithoutTarget_manifestNameMismatch_keptNotRestored`,
+`staleBakWithoutTarget_missingOrCorruptSkillMd_keptNotRestored`,
+`staleBakWithoutTarget_oversizedSkillMd_keptNotRestored`, and
+`staleBakWithoutTarget_symlinkSkillMd_keptNotRestored`. Cleanup and restore
+work are budgeted per run: deletion stays within `MAX_CLEANUP_ENTRIES_PER_RUN`
+(64) and restore within the same-source independent `MAX_RESTORES_PER_RUN`
+(16), with beyond-budget entries kept this run and converging on the next
+startup (`cleanup_restoreBudget_cappedPerRun`; consuming the independent
+restore budget while the deletion budget is exhausted mid-run is pinned by
+`cleanupBudget_midRun_restoreExempt`).
+`SkillAtomicCommitTest` pins the replace path to
 all-or-nothing: staging-rename/backup/rollback failures keep the old bytes
 intact with no half-product and no leftovers, reporting `IO_ERROR` with the
 backup location when rollback itself fails.

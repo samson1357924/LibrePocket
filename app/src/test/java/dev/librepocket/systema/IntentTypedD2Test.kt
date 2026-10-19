@@ -722,7 +722,7 @@ class IntentTypedD2Test {
     // LAUNCHER category，否則隱式 intent filter 匹配不可達（IntentSpec.categories
     // KDoc 契約句；framework 常量字面值逐字鎖定）。
     assertEquals(
-      listOf("android.app.category.LAUNCHER"),
+      listOf("android.intent.category.LAUNCHER"),
       LaunchAppTool.launchSpec("com.google.android.apps.maps").categories,
     )
   }
@@ -735,11 +735,11 @@ class IntentTypedD2Test {
       IntentSpec(
         action = IntentActions.MAIN,
         targetPackage = "com.example.test",
-        categories = listOf("android.app.category.LAUNCHER", "android.app.category.DEFAULT"),
+        categories = listOf("android.intent.category.LAUNCHER", "android.intent.category.DEFAULT"),
       ),
     )
     assertEquals(
-      setOf("android.app.category.LAUNCHER", "android.app.category.DEFAULT"),
+      setOf("android.intent.category.LAUNCHER", "android.intent.category.DEFAULT"),
       intent.categories,
     )
     assertEquals("android.intent.action.MAIN", intent.action)

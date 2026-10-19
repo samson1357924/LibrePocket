@@ -468,7 +468,7 @@ object SkillInstaller {
             // 會把 link 吃掉；懸空／指向外部的 link 槽經 lstat 讀得屬性即為
             // [TargetState.PRESENT]，不豁免齡期、按孤兒語意走刪除路徑。
             val bakIdValid = bakId != null && SkillParser.isValidName(bakId)
-            val targetState = if (bakIdValid && bakId != null) {
+            val targetState = if (bakIdValid) {
                 targetStateNoFollow(File(destRoot, bakId))
             } else {
                 TargetState.PRESENT

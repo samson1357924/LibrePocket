@@ -18,7 +18,7 @@ package dev.librepocket.systema
  * `NO_HANDLER`「做不到開啟「」」空回顯話術）。
  *
  * Spec 形狀（F1 修正）：[launchSpec] 為 ACTION_MAIN+setPackage 並攜
- * `android.app.category.LAUNCHER`——launcher activity 的 manifest filter
+ * `android.intent.category.LAUNCHER`——launcher activity 的 manifest filter
  * 通常僅 MAIN+LAUNCHER，隱式 intent 缺 category 則 filter 匹配不可達
  * （與 geo/https 已修的同形真機恆 NoHandler 矛盾；契約句見
  * [IntentSpec.categories] KDoc）。
@@ -124,7 +124,7 @@ object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
   fun launchSpec(packageName: String): IntentSpec = IntentSpec(
     action = IntentActions.MAIN,
     targetPackage = packageName,
-    categories = listOf("android.app.category.LAUNCHER"),
+    categories = listOf("android.intent.category.LAUNCHER"),
   )
 
   override fun check(env: SystemEnv): CheckResult {
@@ -169,11 +169,13 @@ object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
         ToolResult(
           false, false, null, ReasonCodes.NEED_CLARIFICATION, fallback(params, env).userMessage,
         )
-      LaunchResolution.Unknown -> ToolResult(
-        false, false, null, ReasonCodes.NO_HANDLER,
-        // 同 [MAX_QUERY_ECHO_LEN]（[CalendarTool.MAX_EVENT_ID_ECHO_LEN] 的防回顯契約）：話術只回顧前 32 字。
-        "做不到開啟「${params.query.take(MAX_QUERY_ECHO_LEN)}」（${ReasonCodes.NO_HANDLER}）→ 可替代手動開啟 → 需要你告訴我是哪個 App",
-      )
+      LaunchResolution.Unknown ->
+        // 話術取 [fallback] else 分支，字面單一來源（同 blank 澄清分支做法，
+        // 避免與 fallback 模板漂移）；防回顯上限 [MAX_QUERY_ECHO_LEN] 仍由
+        // 該分支自保（話術只回顧前 32 字）。
+        ToolResult(
+          false, false, null, ReasonCodes.NO_HANDLER, fallback(params, env).userMessage,
+        )
     }
   }
 

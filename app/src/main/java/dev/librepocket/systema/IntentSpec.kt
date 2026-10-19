@@ -109,7 +109,7 @@ object IntentFlags {
  * `categories`（預設空值＝既有呼叫面零破壞；欄位放最後，避免既有 positional
  * 呼叫斷裂）：由 launcher 逐項 `addCategory` 映射（見
  * [AndroidIntentLauncher.toIntent]）。契約：**僅允許 framework 常量字面值**，
- * 目前唯一使用點為 `android.app.category.LAUNCHER`（[LaunchAppTool.launchSpec]
+ * 目前唯一使用點為 `android.intent.category.LAUNCHER`（[LaunchAppTool.launchSpec]
  * 的 ACTION_MAIN+setPackage 隱式啟動——launcher activity 的 manifest filter
  * 通常僅 MAIN+LAUNCHER，隱式 intent 缺 category 則 filter 匹配不可達，與
  * geo/https 同形的真機恆 NoHandler 矛盾，為本欄存在的理由）；未來新增值必須

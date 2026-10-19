@@ -149,6 +149,11 @@ class McpTransport(
         } catch (e: IllegalArgumentException) {
             throw McpWire.McpProtocol(e.message ?: "mcp: bad endpoint")
         }
+        // 縱深：Bearer 可列印 ASCII 預檢（同上僅防直調）——CR/LF header-injection
+        // 在建標頭前攔下；正常路徑由 McpServer 預檢後映射 UNAUTHORIZED，故此處不可達。
+        if (!isPrintableAscii(bearer)) {
+            throw McpWire.McpProtocol("mcp: bad bearer")
+        }
         // bare-origin 相容：無 path 時 endpoint() 自動補 /mcp（舊配置相容，建議記 warning 提醒手動補完整 path）。
         val url = McpWire.endpoint(baseUrl)
         // 可觀測性：自動補 /mcp 時記 warning（runCatching 使 JVM 單測無 mocked Log 仍綠）。

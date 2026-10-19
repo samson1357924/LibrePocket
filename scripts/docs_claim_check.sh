@@ -144,19 +144,21 @@ fi
 # widen this gate — never widen it as a side effect.
 # Matches the package import path plus any Mcp* type name (McpServer, McpScope,
 # McpWire, McpRegistry, McpTransport, McpTool, ...); prose that says only
-# "MCP" (e.g. KDoc forward mentions) does not match. Scans every production
-# source set (app/src/<set>/java for main + flavors play/foss/github + debug,
-# Kotlin and Java), excluding only the test*/androidTest* source sets that
-# legitimately reference MCP — flavor code ships in the APK, so a Mcp*
-# reference there is production wiring too.
+# "MCP" (e.g. KDoc forward mentions) does not match. Scans every .kt/.java file
+# under app/src regardless of source root (java/, kotlin/, …) — main + flavors
+# play/foss/github + debug — excluding only the test*/androidTest* source sets
+# that legitimately reference MCP: flavor code ships in the APK, so a Mcp*
+# reference there is production wiring too. Exclusion is by package path
+# (…/dev/librepocket/mcp/) with grep -H (filename always shown) so a real
+# wiring import outside the package never matches it.
 if [ ! -d "$ROOT/app/src" ]; then
   report "missing app/src — MCP zero-wiring scan cannot run (fail closed)"
 else
   mapfile -t MCP_REFS < <(
-    find "$ROOT/app/src" -type d -name java \
+    find "$ROOT/app/src" -type f \( -name '*.kt' -o -name '*.java' \) \
       -not -path '*/src/test*' -not -path '*/src/androidTest*' \
-      -exec grep -rnE 'dev\.librepocket\.mcp|Mcp[A-Z]' --include='*.kt' --include='*.java' {} + 2>/dev/null \
-      | grep -v 'app/src/.*/java/dev/librepocket/mcp/' || true
+      -exec grep -HnE 'dev\.librepocket\.mcp|Mcp[A-Z]' {} + 2>/dev/null \
+      | grep -v '/dev/librepocket/mcp/' || true
   )
   if [ "${#MCP_REFS[@]}" -ne 0 ]; then
     report "production Kotlin/Java outside dev/librepocket/mcp/ references MCP types (MCP must stay unwired until the wiring PR updates this gate):"

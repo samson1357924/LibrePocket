@@ -301,6 +301,53 @@ class McpEnvelopeTest {
         }
     }
 
+    @Test fun inboundToolNameControlCharsRejectedFailClosed() {
+        // 伺服器控制的入站名流進 auditMap（tools 名清單）與以名為鍵的開關——CR/LF 可偽造
+        // 稽核列、C0/ESC 可干擾終端（外部 review P3-3）。fail-closed 整頁拒，不採納。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"bad\\nname\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        try {
+            McpWire.parseList("s1", json, expectedId = 1L)
+            fail("含 CR/LF 控制字元的入站名必須拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: tool name has control chars", e.message)
+        }
+        // 跨 C0 範圍＋DEL 取樣（JSON \uXXXX 轉義——raw control char 會先破壞 JSON parse）：
+        // 每個都須拒。`>= 0x7F` 誤刪非 ASCII 由下方 read_é文 正向對照釘住；
+        // `<= 0x20` 誤拒空白由 inboundToolNameWithSpaceIsAccepted 釘住。
+        for (esc in listOf("\\n", "\\r", "\\t", "\\u001b", "\\u007f")) {
+            val j = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                "[{\"name\":\"a${esc}b\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+            try {
+                McpWire.parseList("s1", j, expectedId = 1L)
+                fail("控制字元 [$esc] 必須拒")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: tool name has control chars", e.message)
+            }
+        }
+        // 邊界：非 ASCII 非控制字母（é、中文）仍採納——預檢只拒 C0/DEL，不是
+        // printable-ASCII 一刀切（否則會誤拒合法國際化工具名）。
+        val ok = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"read_é文\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        assertEquals(1, McpWire.parseList("s1", ok, expectedId = 1L).size)
+    }
+
+    @Test fun inboundToolNameWithSpaceIsAccepted() {
+        // 政策 pin：parseListPage 對名只拒超長與 C0/DEL 控制字元，空白照收（工具名可能含
+        // 空格）。沒有此測，`it.code < 0x20` 被改成 `<= 0x20` 會誤拒空白且無測試變紅。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"my tool\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        val tools = McpWire.parseList("s1", json, expectedId = 1L)
+        assertEquals(1, tools.size)
+        assertEquals("my tool", tools[0].name)
+        // 純空白名（KDoc「空白／空名照收」）亦採納。
+        val sp = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\" \",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        val t2 = McpWire.parseList("s1", sp, expectedId = 1L)
+        assertEquals(1, t2.size)
+        assertEquals(" ", t2[0].name)
+    }
+
     @Test fun limitConstantsArePinnedToLiterals() {
         // 常數 literal pin（reviewer 追加）：KDoc 與外部文件引用的數字必須與
         // 實作一致——改常數卻沒同步文件時，此測試先紅。

@@ -181,4 +181,34 @@ class McpScopeTest {
         assertFalse(nullResult.toString().contains("resultJson=null"))
         assertTrue(nullResult.toString().contains("resultJson=<0 chars>"))
     }
+
+    // ---- Stage5: McpListResult.toString 覆寫（description/inputSchema 不進日誌） ----
+
+    @Test fun listResultToStringSummarizesToolsWithoutDetail() {
+        // 外部 review P3-3：data class 預設 toString 會把每支工具的 description/
+        // inputSchema（伺服器控制、可極大、可含控制字元）整串帶進日誌/crash report。
+        // 覆寫為計數佔位（<N tools>）；auditMap 才是稽核來源（只記名與計數）。
+        val tools = listOf(
+            McpTool(
+                serverId = "s9",
+                name = "t1",
+                description = "leaky-description-token",
+                inputSchema = """{"type":"object","properties":{"x":{"type":"string"}}}""",
+            ),
+        )
+        val r = McpListResult("s9", tools, McpStatus.OK, 7L)
+        val s = r.toString()
+        assertFalse("toString 不得外洩 description 原文", s.contains("leaky-description-token"))
+        assertFalse("toString 不得外洩 inputSchema 明細", s.contains("inputSchema"))
+        assertFalse("toString 不得外洩每支工具名明細", s.contains("t1"))
+        // 仍保留觀測所需狀態欄位。
+        assertTrue("須保留 serverId", s.contains("s9"))
+        assertTrue("須保留 status", s.contains("OK"))
+        assertTrue("latencyMs 須保留", s.contains("latencyMs=7"))
+        // 佔位符格式釘住：<N tools>。
+        assertTrue("tools 佔位符須為 <N tools> 形", s.contains("tools=<1 tools>"))
+        // auditMap 仍記名（稽核合法欄位），與 toString 分工不變。
+        assertEquals("t1", (r.auditMap()["tools"] as List<*>)[0])
+        assertEquals(1, r.auditMap()["toolCount"])
+    }
 }

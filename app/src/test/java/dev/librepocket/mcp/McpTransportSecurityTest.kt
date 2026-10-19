@@ -217,6 +217,24 @@ class McpTransportSecurityTest {
         }
     }
 
+    @Test fun directPostJsonWithNonPrintableBearerThrowsBeforeAnySocket() = runBlocking {
+        // 縱深（外部 review P3-1）：可列印 ASCII 預檢在建標頭前攔下 CR/LF header-injection，
+        // 即使直調 transport（繞過 McpServer 預檢）亦 fail-closed——任何 socket 前拋。
+        // 正常路徑 McpServer 先預檢映射 UNAUTHORIZED（不計熔斷、不發送），故此 guard 純縱深。
+        // 用 https 端點：requireSecureEndpoint 先過，才輪到 bearer 預檢（否則先撞 insecure）。
+        try {
+            McpTransport().postJson(
+                "https://192.0.2.1/mcp",
+                "bad\rbearer",
+                "{}",
+                McpTimeouts.DEFAULT_MS,
+            )
+            fail("含 CR 的 Bearer 必須在任何 socket 前拋 McpProtocol")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad bearer", e.message)
+        }
+    }
+
     // ---- 6. 3xx 契約端到端：list 與 call 皆 PROTOCOL，成功路徑不受影響 ----
 
     @Test fun redirectRefusedThenNextCallSucceedsNormally() = runBlocking {

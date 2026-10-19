@@ -50,6 +50,7 @@ MCP 目前 declared＋implemented、未接線、未驗證（僅 JVM）。啟用�
 - **Production 接線**：`McpServer`／`McpScope` 接上 dispatcher/executor（MCP 目前零 production import，見 `scripts/docs_claim_check.sh` zero-wiring 檢查）。
 - **逐工具 `executionReady` 翻轉＋完整驗收**：每個工具按上方驗收項目（flavor、實體資源、權限、使用者確認、fresh policy evaluation、dispatcher/executor、取消與錯誤語義、持久化/審計路徑、正向＋拒絕控制測試）個別完成後才翻轉；不得一次全開。
 - **取消與副作用邊界驗證**：MCP 呼叫走同一投影＋確認閘——WRITE/PRIVILEGED 在 `callTool` 前經 `McpScope.check` 確認；取消語義與內建工具同等要求。
+- **每輪再投影（不跨輪快取 `Projection`）**：`McpScope.check` 信任呼叫端傳入的 `Projection`、不重查 `config.enabled`——跨輪沿用 disable 前的舊投影會照樣通過；接線 PR 必須每輪重新 `project()`（與內建工具 `PrivilegeGate.check` 同形狀的既有契約）。
 - **Key 重綁確認**：keyId↔baseUrl 無自動綁定；接線 PR 須加入 rebind 確認，URL 變更不得靜默沿用舊 key（見 THREAT_MODEL Target「Credential 綁定 endpoint」與 S4-C）。
 - **回環 http 例外限縮**：明文回環例外目前套用於生產配置；啟用前以 flavor 或配置限縮（見 THREAT_MODEL MCP Bearer 行殘餘風險）。
 - **刻意更新 zero-wiring 閘**：`scripts/docs_claim_check.sh` 目前禁止任何 production import；接線 PR 必須隨同放寬該閘，不得作為副作用繞過。

@@ -629,6 +629,11 @@ internal object McpWire {
                 if (nameVal.v.length > TOOL_NAME_MAX_CHARS) {
                     throw McpProtocol("mcp: tool name exceeds $TOOL_NAME_MAX_CHARS chars")
                 }
+                // C0/DEL 控制字元一律拒（fail-closed）：名流進 auditMap（tools 名清單）與
+                // 以名為鍵的 enabledTools／McpScope——CR/LF 可偽造稽核列、C0/ESC 可干擾終端。
+                if (nameVal.v.any { it.code < 0x20 || it.code == 0x7F }) {
+                    throw McpProtocol("mcp: tool name has control chars")
+                }
                 val descVal = item.find("description")
                 val desc = if (descVal is JStr) descVal.v else ""
                 val schemaVal = item.find("inputSchema")

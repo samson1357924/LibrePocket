@@ -47,6 +47,15 @@ class McpServerAccountingTest {
         override suspend fun hasKey(providerId: String): Boolean = true
     }
 
+    /** getKey 拋 CancellationException（模擬取消發生於 vault 存取期間）。 */
+    private class CancelledVault : KeyVault {
+        override suspend fun putKey(providerId: String, apiKey: CharArray) = Unit
+        override suspend fun getKey(providerId: String): CharArray? =
+            throw java.util.concurrent.CancellationException("cancelled during key retrieval")
+        override suspend fun deleteKey(providerId: String) = Unit
+        override suspend fun hasKey(providerId: String): Boolean = true
+    }
+
     private fun server(
         web: MockWebServer,
         transport: McpTransport,
@@ -224,6 +233,66 @@ class McpServerAccountingTest {
             assertEquals(McpStatus.UNAUTHORIZED, got!!.status)
             assertEquals(0, breaker.failureCount())
             assertEquals(0, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    // ---- vault 取消（CE 先於 generic catch 重拋）：不得吞成 UNAUTHORIZED ----
+
+    @Test fun vaultCancellationPropagatesNotMappedToUnauthorized() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            val breaker = McpCircuitBreaker()
+            val s = server(web, McpTransport(), breaker, CancelledVault())
+            // listTools：vault 取消須原樣外傳（CE 先於 generic catch 重拋），不得吞成 UNAUTHORIZED。
+            val listEx = runCatching { s.listTools() }.exceptionOrNull()
+            assertTrue(
+                "listTools vault 取消須以 CancellationException 外傳（非 UNAUTHORIZED 結果）",
+                listEx is java.util.concurrent.CancellationException,
+            )
+            assertEquals("取消不計熔斷", 0, breaker.failureCount())
+            assertEquals("取消不發送", 0, web.requestCount)
+            // callTool 同待遇。
+            val callEx = runCatching { s.callTool("t", "{}") }.exceptionOrNull()
+            assertTrue(
+                "callTool vault 取消須以 CancellationException 外傳（非 UNAUTHORIZED 結果）",
+                callEx is java.util.concurrent.CancellationException,
+            )
+            assertEquals(0, breaker.failureCount())
+            assertEquals(0, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    // ---- callTool 路徑 key 用後即擦（重複擦除區塊亦須真的擦） ----
+
+    @Test fun callToolKeyIsErasedAfterUseButRequestStillCarriesToken() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        val real = "sekret-token-1".toCharArray()
+        val vault = RefVault(real)
+        try {
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"isError\":false}}",
+                ),
+            )
+            val s = server(web, McpTransport(), McpCircuitBreaker(), vault)
+            val got = withTimeoutOrNull(5_000) { s.callTool("t", "{}") }
+            assertNotNull(got)
+            assertEquals(McpStatus.OK, got!!.status)
+            // 請求仍帶原 token（String(key) 先複製）。
+            val req = web.takeRequest(5, TimeUnit.SECONDS)
+            assertNotNull("expected request within 5s", req)
+            assertEquals("Bearer sekret-token-1", req!!.getHeader("Authorization"))
+            // callTool 路徑的重複擦除區塊也須真的擦——與 listTools 同待遇。
+            assertTrue(
+                "callTool key 用後即擦：原 CharArray 必須全為 NUL",
+                real.all { it.code == 0 },
+            )
         } finally {
             web.shutdown()
         }

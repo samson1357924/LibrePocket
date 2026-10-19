@@ -95,6 +95,16 @@ data class McpListResult(
         "status" to status.name,
         "latencyMs" to latencyMs,
     )
+
+    /**
+     * 隱私覆寫：data class 自動 [toString] 會把 [tools] 內每支工具的 name/description/
+     * inputSchema（伺服器控制、可極大、可含控制字元）整串帶進日誌/crash report——
+     * description/inputSchema 非稽核欄位（[auditMap] 只記名與計數）。此處以計數佔位取代
+     * 明細，與 [McpCallResult.toString] 同策略。稽核一律走 [auditMap]，不走 [toString]。
+     */
+    override fun toString(): String =
+        "McpListResult(serverId=$serverId, tools=<${tools.size} tools>, " +
+            "status=$status, latencyMs=$latencyMs)"
 }
 
 /**

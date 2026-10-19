@@ -133,6 +133,112 @@ class McpCircuitBreakerConcurrencyTest {
         }
     }
 
+    // ---- C-07：到期語義（查詢純唯讀、同點一致、無半開、延窗） ----
+
+    @Test fun expiryQueriesAreReadOnlyAndConsistentRegardlessOfOrder() {
+        // 舊碼 `isOpen()` 到期順手重置（唯讀查詢有副作用）：先呼叫 isOpen 的
+        // 執行緒會讓後呼叫的 failureCount 從舊值變 0，結果依呼叫順序而異。
+        // 現為：到期後 isOpen()==false／failureCount()==0（已清窗讀取視圖），
+        // 且兩者皆不改狀態——把假時鐘撥回未到期可證明狀態仍在。
+        var now = 0L
+        val first = McpCircuitBreaker(maxFailures = 1, openMs = 100L, clockMs = { now })
+        first.onFailure()
+        assertTrue(first.isOpen())
+        assertEquals(1, first.failureCount())
+        now = 100L
+        assertEquals("到期後 failureCount 讀為 0", 0, first.failureCount())
+        assertFalse("到期後 isOpen 讀為 false", first.isOpen())
+        now = 50L
+        assertTrue("查詢不得重置：撥回未到期後視窗狀態仍在", first.isOpen())
+        assertEquals("查詢不得清計數", 1, first.failureCount())
+
+        // 相反查詢順序得到相同讀取視圖（無順序依賴）。
+        var now2 = 0L
+        val second = McpCircuitBreaker(maxFailures = 1, openMs = 100L, clockMs = { now2 })
+        second.onFailure()
+        now2 = 100L
+        assertFalse(second.isOpen())
+        assertEquals(0, second.failureCount())
+    }
+
+    @Test fun failureAfterExpiryStartsFreshRecoveryCountWithoutHalfOpen() {
+        // C-07(c)：無半開態（記錄在案的最小取捨）。到期後第一個 canCall 全閉
+        // 放行＋清零；仍壞的伺服器需再累積滿閾值才重開，期間全量發送。
+        var now = 0L
+        val breaker = McpCircuitBreaker(maxFailures = 3, openMs = 100L, clockMs = { now })
+        repeat(3) { breaker.onFailure() }
+        assertTrue(breaker.isOpen())
+        now = 100L
+        assertFalse("到期純查詢即讀為已清窗", breaker.isOpen())
+        assertEquals(0, breaker.failureCount())
+        // 到期後第一敗：恢復期計數從 1 起（不沿用舊計數、不立刻重開）。
+        breaker.onFailure()
+        assertEquals(1, breaker.failureCount())
+        assertFalse("單敗不得立即重開（無半開單發探測）", breaker.isOpen())
+        assertTrue("視窗已過即全閉放行", breaker.canCall())
+        // 需再累積滿閾值才重開。
+        breaker.onFailure()
+        breaker.onFailure()
+        assertTrue("再滿閾值才重開", breaker.isOpen())
+    }
+
+    @Test fun inFlightFailureBeforeExpiryPushesWindowOut() {
+        // C-07(d)：開窗中（未到期前抵達）的 in-flight 失敗把窗口重切為 now+openMs
+        // ——已達閾值時每敗重切，開窗可被持續失敗一路延長。
+        var now = 0L
+        val breaker = McpCircuitBreaker(maxFailures = 1, openMs = 1_000L, clockMs = { now })
+        breaker.onFailure() // 開路至 1_000
+        now = 500L
+        breaker.onFailure() // 未到期 → 重切至 1_500
+        now = 1_200L
+        assertTrue("原窗已過但延長窗未過，仍開路", breaker.isOpen())
+        assertFalse(breaker.canCall())
+        now = 1_500L
+        assertFalse("延長窗到點即閉", breaker.isOpen())
+        assertTrue(breaker.canCall())
+    }
+
+    @Test fun backwardInjectedClockDoesNotShrinkOrExtendWindow() {
+        // C-08：預設時鐘已改單調源；注入的假時鐘若回撥，到期判定以 `now >= openUntil`
+        // 為準——回撥只會讓窗口「看起來更遠」，不會提早關窗（生產預設無回撥）。
+        var now = 10_000L
+        val breaker = McpCircuitBreaker(maxFailures = 1, openMs = 100L, clockMs = { now })
+        breaker.onFailure() // openUntil = 10_100
+        now = 5_000L // NTP 式回撥
+        assertTrue("回撥不得提早關窗", breaker.isOpen())
+        assertFalse(breaker.canCall())
+    }
+
+    @Test fun defaultMonotonicClockIsUptimeBasedNotEpoch() {
+        // C-08：預設時鐘改 nanoTime 基準（開機 uptime），值遠小於 epoch 毫秒。
+        // mutation（改回 System::currentTimeMillis 的 epoch 值）此測即紅。
+        // nanoTime 規範允許任意起點（含負值），故不 pin 非負；只驗不倒退＋量級。
+        val t1 = monotonicClockMs()
+        val t2 = monotonicClockMs()
+        assertTrue("單調時鐘不得倒退（t2 >= t1）", t2 >= t1)
+        // 量級判準（避免 wall clock 跨 1ms 的機率性誤綠）：uptime 量級（至多數十天）
+        // vs epoch 量級（約 1.7e12 ms），差值遠大於 1e6；改回 wall clock 時差值 ≈ 0
+        // → 穩定轉紅。不用 `t < currentTimeMillis()` 的點比較。
+        assertTrue(
+            "單調時鐘不得是 epoch 量級（currentTimeMillis）：差值須遠大於 1e6 ms",
+            System.currentTimeMillis() - t2 > 1_000_000L,
+        )
+    }
+
+    @Test fun breakerDefaultClockFieldIsMonotonicUptimeBasedNotWallClock() {
+        // C-08 接線 pin：預設參數必須實際指向 monotonicClockMs（不只是函式本身單調
+        // ——mutation 把預設改回 System::currentTimeMillis 時，前測仍綠，本測會紅）。
+        val field = McpCircuitBreaker::class.java.getDeclaredField("clockMs")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val clock = field.get(McpCircuitBreaker()) as () -> Long
+        assertTrue(
+            "McpCircuitBreaker 預設時鐘不得是 epoch 量級（System::currentTimeMillis）：" +
+                "uptime 與 epoch 差值須遠大於 1e6 ms",
+            System.currentTimeMillis() - clock() > 1_000_000L,
+        )
+    }
+
     @Test fun breakerPublicSurfaceIsExactlyTheContractedApi() {
         // D-04：onStatus／reset 為零生產零測試呼叫的死碼已刪（本測為負向釘）——
         // 任何人重加任何公開方法（含復活 onStatus/reset）此測即紅，

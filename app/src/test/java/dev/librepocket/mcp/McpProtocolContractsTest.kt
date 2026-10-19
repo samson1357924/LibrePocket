@@ -62,7 +62,7 @@ class McpProtocolContractsTest {
 
     @Test fun emptyObjectIsNotOkForList() {
         try {
-            McpWire.parseList("s1", "{}")
+            McpWire.parseList("s1", "{}", null)
             fail("空包必須拒絕（映射 PROTOCOL），不得回空工具列表充 OK")
         } catch (e: McpWire.McpToolFailure) {
             fail("空包不得映射 TOOL_ERROR，實際=${e.message}")
@@ -74,7 +74,7 @@ class McpProtocolContractsTest {
 
     @Test fun emptyObjectIsNotOkForCall() {
         try {
-            McpWire.parseCall("{}")
+            McpWire.parseCall("{}", null)
             fail("空包必須拒絕（映射 PROTOCOL），不得回 OK")
         } catch (e: McpWire.McpToolFailure) {
             fail("空包不得映射 TOOL_ERROR，實際=${e.message}")
@@ -102,7 +102,7 @@ class McpProtocolContractsTest {
             "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}," +
             "\"serverInfo\":{\"name\":\"s\",\"version\":\"1\"}}}"
         try {
-            McpWire.parseList("s1", json)
+            McpWire.parseList("s1", json, null)
             fail("initialize 形狀不得被當成工具列表（映射 PROTOCOL）")
         } catch (e: McpWire.McpToolFailure) {
             fail("不得映射 TOOL_ERROR，實際=${e.message}")
@@ -115,7 +115,7 @@ class McpProtocolContractsTest {
         // notifications/initialized 形狀（無 result，有 method）雙 parser 皆拒。
         val json = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"
         try {
-            McpWire.parseList("s1", json)
+            McpWire.parseList("s1", json, null)
             fail("notification 形狀不得回工具列表")
         } catch (e: McpWire.McpToolFailure) {
             fail("不得映射 TOOL_ERROR，實際=${e.message}")
@@ -124,7 +124,7 @@ class McpProtocolContractsTest {
             assertEquals("mcp: missing id", e.message)
         }
         try {
-            McpWire.parseCall(json)
+            McpWire.parseCall(json, null)
             fail("notification 形狀不得回 OK")
         } catch (e: McpWire.McpToolFailure) {
             fail("不得映射 TOOL_ERROR，實際=${e.message}")
@@ -139,12 +139,12 @@ class McpProtocolContractsTest {
         val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"_meta\":{\"trace\":\"x\"}," +
             "\"result\":{\"tools\":[{\"name\":\"a\",\"inputSchema\":{\"type\":\"object\"}}]," +
             "\"_meta\":{\"page\":\"1\"}}}"
-        val tools = McpWire.parseList("s1", json)
+        val tools = McpWire.parseList("s1", json, null)
         assertEquals(1, tools.size)
         assertEquals("a", tools[0].name)
         val call = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
             "{\"content\":[],\"isError\":false,\"_meta\":{}},\"protocolVersion\":\"2025-11-25\"}"
-        val (_, isError) = McpWire.parseCall(call)
+        val (_, isError) = McpWire.parseCall(call, null)
         assertFalse(isError)
     }
 
@@ -154,7 +154,7 @@ class McpProtocolContractsTest {
         val sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2," +
             "\"result\":{\"content\":[],\"isError\":false}}\n\n"
         try {
-            McpWire.parseCall(sse)
+            McpWire.parseCall(sse, null)
             fail("SSE frame 不得被當成 tools/call 回應回 OK")
         } catch (e: McpWire.McpProtocol) {
             assertEquals("mcp: bad envelope", e.message)
@@ -162,7 +162,7 @@ class McpProtocolContractsTest {
             fail("SSE frame 必須拋 McpProtocol（mcp: bad envelope），實際=${e.message}")
         }
         try {
-            McpWire.parseList("s1", sse)
+            McpWire.parseList("s1", sse, null)
             fail("SSE frame 不得被當成 tools/list 回應")
         } catch (e: McpWire.McpProtocol) {
             assertEquals("mcp: bad envelope", e.message)
@@ -176,12 +176,12 @@ class McpProtocolContractsTest {
     @Test fun nextCursorDoesNotAutoFollowSinglePage() {
         val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
             "[{\"name\":\"a\",\"inputSchema\":{\"type\":\"object\"}}],\"nextCursor\":\"cursor-1\"}}"
-        val page = McpWire.parseListPage("s1", json)
+        val page = McpWire.parseListPage("s1", json, null)
         assertEquals("本頁工具仍須解析", 1, page.tools.size)
         assertEquals("a", page.tools[0].name)
         assertEquals("非空 nextCursor 必須標記還有下一頁（PARTIAL，不回 OK 假完整）", true, page.hasMorePages)
         // parseList 薄委託維持相容（不含分頁旗標）。
-        assertEquals(1, McpWire.parseList("s1", json).size)
+        assertEquals(1, McpWire.parseList("s1", json, null).size)
         // 無跟隨語義由 E2E 鎖定：見 standardSubsetFakeEndToEnd（listTools 只發一次 HTTP）
         // 與 McpServerSemanticsTest.nextCursorMapsToPartialKeepingTools。
     }
@@ -192,14 +192,14 @@ class McpProtocolContractsTest {
         // 無 expectedId（測試直呼叫）只驗 id 存在與型別；server 呼叫傳 expectedId
         // 必須數值相符——單發子集不支援 id 複用，但錯 id 回應不得採納（外部 review #2）。
         val stringId = "{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"result\":{\"tools\":[]}}"
-        assertTrue("無 expectedId：字串 id 仍接受", McpWire.parseList("s1", stringId).isEmpty())
+        assertTrue("無 expectedId：字串 id 仍接受", McpWire.parseList("s1", stringId, null).isEmpty())
         // 缺席／null id 一律拒（翻轉舊「照常解析」pin）。
         for (bad in listOf(
             "{\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[]}}",
             "{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":{\"tools\":[]}}",
         )) {
             try {
-                McpWire.parseList("s1", bad)
+                McpWire.parseList("s1", bad, null)
                 fail("缺席／null id 必須拒：$bad")
             } catch (e: McpWire.McpProtocol) {
                 assertEquals("mcp: missing id", e.message)
@@ -208,7 +208,7 @@ class McpProtocolContractsTest {
         // mismatched id：無 expectedId 不比對值（HTTP 一問一答仍在 server 層把關），
         // 傳 expectedId 必須擋。
         val mismatched = "{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{\"tools\":[]}}"
-        assertTrue(McpWire.parseList("s1", mismatched).isEmpty())
+        assertTrue(McpWire.parseList("s1", mismatched, null).isEmpty())
         try {
             McpWire.parseList("s1", mismatched, expectedId = 1L)
             fail("mismatched id 必須拒")
@@ -256,7 +256,7 @@ class McpProtocolContractsTest {
         val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
             "[{\"name\":\"real\",\"inputSchema\":{\"type\":\"object\"," +
             "\"properties\":{\"tools\":{\"type\":\"array\"}}}}]}}"
-        val tools = McpWire.parseList("s1", json)
+        val tools = McpWire.parseList("s1", json, null)
         assertEquals(1, tools.size)
         assertEquals("real", tools[0].name)
     }
@@ -266,7 +266,7 @@ class McpProtocolContractsTest {
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
             "{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]," +
             "\"structuredContent\":{\"result\":\"nested\"},\"isError\":false}}"
-        val (result, isError) = McpWire.parseCall(json)
+        val (result, isError) = McpWire.parseCall(json, null)
         assertFalse(isError)
         assertTrue(result != null && result.contains("ok"))
     }
@@ -280,7 +280,7 @@ class McpProtocolContractsTest {
         val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
             "[{\"name\":\"t\",\"inputSchema\":$schema}]}}"
         try {
-            McpWire.parseList("s1", json)
+            McpWire.parseList("s1", json, null)
             fail("超長 inputSchema 必須拒絕，不得靜默截斷")
         } catch (e: McpWire.McpProtocol) {
             assertEquals(
@@ -300,7 +300,7 @@ class McpProtocolContractsTest {
             val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
                 "[{\"name\":\"t\",\"inputSchema\":{\"type\":\"object\",\"v\":\"a${bad}b\"}}]}}"
             try {
-                McpWire.parseList("s1", json)
+                McpWire.parseList("s1", json, null)
                 fail("非法 \\u 跳脫必須拒絕：$bad")
             } catch (_: McpWire.McpProtocol) {
                 // 預期：mcp: bad envelope。
@@ -460,7 +460,7 @@ class McpProtocolContractsTest {
             "{\"jsonrpc\":true,\"id\":1,\"result\":{\"tools\":[]}}",
         )) {
             try {
-                McpWire.parseList("s1", bad)
+                McpWire.parseList("s1", bad, null)
                 fail("缺／錯版 jsonrpc 必須拒：$bad")
             } catch (e: McpWire.McpProtocol) {
                 assertEquals("mcp: bad jsonrpc", e.message)
@@ -468,7 +468,7 @@ class McpProtocolContractsTest {
         }
         val call = "{\"id\":2,\"result\":{\"content\":[],\"isError\":false}}"
         try {
-            McpWire.parseCall(call)
+            McpWire.parseCall(call, null)
             fail("缺 jsonrpc 必須拒")
         } catch (e: McpWire.McpProtocol) {
             assertEquals("mcp: bad jsonrpc", e.message)
@@ -481,7 +481,7 @@ class McpProtocolContractsTest {
     @Test fun emptyResultObjectIsRejected() {
         // 空 result {} 不再當成功（Stage3，外部 review #5）：形狀不完整 → PROTOCOL。
         try {
-            McpWire.parseCall("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}")
+            McpWire.parseCall("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}", null)
             fail("空 result 必須拒（McpProtocol），不得回 OK")
         } catch (e: McpWire.McpProtocol) {
             assertEquals("mcp: empty result", e.message)
@@ -489,6 +489,7 @@ class McpProtocolContractsTest {
         // content 陣列存在（即使空）仍算有結果。
         val emptyContent = McpWire.parseCall(
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[],\"isError\":false}}",
+            null,
         )
         assertFalse(emptyContent.second)
         assertEquals("[]", emptyContent.first)
@@ -500,6 +501,7 @@ class McpProtocolContractsTest {
             "\"structuredContent\":{\"key\":\"rich\"},\"isError\":false}"
         val (resultJson, isError) = McpWire.parseCall(
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":$result}",
+            null,
         )
         assertFalse(isError)
         assertEquals("整包 result.raw 全等保留，不得擇一丟棄", result, resultJson)
@@ -508,6 +510,7 @@ class McpProtocolContractsTest {
     @Test fun isErrorNullIsFalse() {
         val (resultJson, isError) = McpWire.parseCall(
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[],\"isError\":null}}",
+            null,
         )
         assertFalse(isError)
         assertNotNull(resultJson)

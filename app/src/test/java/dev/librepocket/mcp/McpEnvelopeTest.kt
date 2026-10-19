@@ -47,7 +47,7 @@ class McpEnvelopeTest {
         for (code in listOf(-32700, -32600, -32601, -32603)) {
             val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":$code,\"message\":\"e$code\"}}"
             try {
-                McpWire.parseCall(json)
+                McpWire.parseCall(json, null)
                 fail("協議碼 $code 必須拋 McpProtocol")
             } catch (e: McpWire.McpProtocol) {
                 assertEquals("mcp: jsonrpc error $code", e.message)
@@ -68,7 +68,7 @@ class McpEnvelopeTest {
         for ((code, msg) in cases) {
             val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":$code,\"message\":\"$msg\"}}"
             try {
-                McpWire.parseCall(json)
+                McpWire.parseCall(json, null)
                 fail("code $code 必須拋 McpToolFailure")
             } catch (e: McpWire.McpToolFailure) {
                 assertEquals(msg, e.message)
@@ -82,7 +82,7 @@ class McpEnvelopeTest {
         for (code in listOf(-32099L, -32050L, -32000L)) {
             val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":$code,\"message\":\"srv\"}}"
             try {
-                McpWire.parseCall(json)
+                McpWire.parseCall(json, null)
                 fail("server 範圍碼 $code 必須拋 McpProtocol")
             } catch (e: McpWire.McpProtocol) {
                 assertEquals("mcp: jsonrpc error $code", e.message)
@@ -105,7 +105,7 @@ class McpEnvelopeTest {
         )
         for (bad in bads) {
             try {
-                McpWire.parseCall(bad)
+                McpWire.parseCall(bad, null)
                 fail("缺／非字串 message 必須拒：$bad")
             } catch (e: McpWire.McpProtocol) {
                 assertEquals("mcp: bad error", e.message)
@@ -117,6 +117,7 @@ class McpEnvelopeTest {
         try {
             McpWire.parseCall(
                 "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":1,\"message\":\"\"}}",
+                null,
             )
             fail("空字串 message 必須走 McpToolFailure")
         } catch (e: McpWire.McpToolFailure) {
@@ -132,7 +133,7 @@ class McpEnvelopeTest {
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602," +
             "\"message\":\"\\u001b[31mFAKE\\r\\nline\\u007f\"}}"
         try {
-            McpWire.parseCall(json)
+            McpWire.parseCall(json, null)
             fail("-32602 必須拋 McpToolFailure")
         } catch (e: McpWire.McpToolFailure) {
             val msg = e.message!!
@@ -145,6 +146,7 @@ class McpEnvelopeTest {
         try {
             McpWire.parseCall(
                 "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"bad params\"}}",
+                null,
             )
             fail("必須拋 McpToolFailure")
         } catch (e: McpWire.McpToolFailure) {
@@ -159,7 +161,7 @@ class McpEnvelopeTest {
         val escs = "\\u001b".repeat(100)
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"$escs\"}}"
         try {
-            McpWire.parseCall(json)
+            McpWire.parseCall(json, null)
             fail("必須拋 McpToolFailure")
         } catch (e: McpWire.McpToolFailure) {
             val msg = e.message!!
@@ -172,7 +174,7 @@ class McpEnvelopeTest {
         val mixed = "x".repeat(199) + "😀"
         val json2 = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"$mixed\"}}"
         try {
-            McpWire.parseCall(json2)
+            McpWire.parseCall(json2, null)
             fail("必須拋 McpToolFailure")
         } catch (e: McpWire.McpToolFailure) {
             val msg = e.message!!
@@ -190,7 +192,7 @@ class McpEnvelopeTest {
             // raw TAB 直嵌 JSON 字串會先在 parser 層破壞（嚴格 JSON 拒裸控制字元）。
             val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"$blank\"}}"
             try {
-                McpWire.parseCall(json)
+                McpWire.parseCall(json, null)
                 fail("空白 message 必須走 McpToolFailure")
             } catch (e: McpWire.McpToolFailure) {
                 assertEquals("jsonrpc error -32602", e.message)
@@ -200,6 +202,7 @@ class McpEnvelopeTest {
         try {
             McpWire.parseCall(
                 "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":4242,\"message\":\"\"}}",
+                null,
             )
             fail("必須拋 McpToolFailure")
         } catch (e: McpWire.McpToolFailure) {
@@ -209,6 +212,7 @@ class McpEnvelopeTest {
         try {
             McpWire.parseCall(
                 "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"x\"}}",
+                null,
             )
             fail("必須拋 McpToolFailure")
         } catch (e: McpWire.McpToolFailure) {
@@ -226,7 +230,7 @@ class McpEnvelopeTest {
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602," +
             "\"message\":\"$spacesThenX\"}}"
         try {
-            McpWire.parseCall(json)
+            McpWire.parseCall(json, null)
             fail("必須拋 McpToolFailure")
         } catch (e: McpWire.McpToolFailure) {
             assertEquals("escape 後仍純空白 → 靜態 fallback（不是 200 個空白）",
@@ -238,7 +242,7 @@ class McpEnvelopeTest {
         val json2 = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602," +
             "\"message\":\"$spacesThenEsc\"}}"
         try {
-            McpWire.parseCall(json2)
+            McpWire.parseCall(json2, null)
             fail("必須拋 McpToolFailure")
         } catch (e: McpWire.McpToolFailure) {
             assertEquals("jsonrpc error -32602", e.message)
@@ -249,7 +253,7 @@ class McpEnvelopeTest {
         val json3 = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602," +
             "\"message\":\"$long\"}}"
         try {
-            McpWire.parseCall(json3)
+            McpWire.parseCall(json3, null)
             fail("必須拋 McpToolFailure")
         } catch (e: McpWire.McpToolFailure) {
             assertEquals("非空白長訊息 → sanitize＋截斷 200 units，非 fallback",
@@ -266,7 +270,7 @@ class McpEnvelopeTest {
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602," +
             "\"message\":\"warn \\u202eevil \\u0085\\u2028 x\"}}"
         try {
-            McpWire.parseCall(json)
+            McpWire.parseCall(json, null)
             fail("必須拋 McpToolFailure")
         } catch (e: McpWire.McpToolFailure) {
             assertEquals("bidi/C1/U+2028 逐字等於原文（刻意不轉義）", original, e.message)
@@ -281,7 +285,7 @@ class McpEnvelopeTest {
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602," +
             "\"message\":\"\\u200b\\u2060\\ufeff\"}}"
         try {
-            McpWire.parseCall(json)
+            McpWire.parseCall(json, null)
             fail("必須拋 McpToolFailure")
         } catch (e: McpWire.McpToolFailure) {
             assertEquals("FORMAT 字元原樣透傳（不 fallback、不轉義）", "\u200b\u2060\ufeff", e.message)
@@ -335,7 +339,7 @@ class McpEnvelopeTest {
         )
         for (bad in bads) {
             try {
-                McpWire.parseCall(bad)
+                McpWire.parseCall(bad, null)
                 fail("非法 code 必須拒：$bad")
             } catch (e: McpWire.McpProtocol) {
                 assertEquals("mcp: bad error", e.message)
@@ -350,7 +354,7 @@ class McpEnvelopeTest {
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":42}",
         )) {
             try {
-                McpWire.parseCall(bad)
+                McpWire.parseCall(bad, null)
                 fail("非 object error 必須拒：$bad")
             } catch (e: McpWire.McpProtocol) {
                 assertEquals("mcp: bad error", e.message)
@@ -387,7 +391,7 @@ class McpEnvelopeTest {
             assertEquals("mcp: request-shaped response", e.message)
         }
         try {
-            McpWire.parseCall("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\"}")
+            McpWire.parseCall("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\"}", null)
             fail("純請求包不得回 OK")
         } catch (e: McpWire.McpProtocol) {
             assertEquals("mcp: request-shaped response", e.message)
@@ -881,7 +885,7 @@ class McpEnvelopeTest {
         // 無 expectedId 也只放行數值／字串 id：布林等型別 → mcp: bad id。
         val json = "{\"jsonrpc\":\"2.0\",\"id\":true,\"result\":{\"tools\":[]}}"
         try {
-            McpWire.parseList("s1", json)
+            McpWire.parseList("s1", json, null)
             fail("布林 id 必須拒")
         } catch (e: McpWire.McpProtocol) {
             assertEquals("mcp: bad id", e.message)
@@ -1108,6 +1112,28 @@ class McpEnvelopeTest {
             assertEquals(1, breaker.failureCount())
         } finally {
             web.shutdown()
+        }
+    }
+
+    @Test fun expectedIdHasNoImplicitDefaultOnAnyParserEntryPoint() {
+        // B-07：expectedId 曾以 `= null` 預設放寬（顯式 null＝只驗 id 存在與型別，
+        // 生產誤用即靜默降級）。移除預設後 Kotlin 不再為這些入口生成 `$default`
+        // 合成橋——任何人都無法省略 expectedId；mutation（把預設加回任一入口）
+        // 會重新生成 `<name>$default`，本測即紅。
+        val cls = McpWire::class.java
+        val arity = mapOf("parseList" to 3, "parseListPage" to 3, "parseCall" to 2)
+        for ((name, params) in arity) {
+            val declared = cls.methods.filter { it.name == name }
+            assertEquals("$name 應恰有一個公開簽名", 1, declared.size)
+            assertEquals(
+                "$name 參數數（expectedId 必須顯式傳，無隱含預設）",
+                params,
+                declared.single().parameterTypes.size,
+            )
+            assertFalse(
+                "$name 不得再有 Kotlin 預設值合成橋（expectedId 預設被加回）",
+                cls.methods.any { it.name == "$name\$default" },
+            )
         }
     }
 }

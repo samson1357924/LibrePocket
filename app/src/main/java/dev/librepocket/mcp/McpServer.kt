@@ -40,7 +40,8 @@ import kotlinx.coroutines.CancellationException
  *   authenticator／cookie／cache 政策同樣強制、POST body 為 one-shot，
  *   application interceptor 屬受信任呼叫方元件，見 [McpTransport] KDoc）；
  * - 隱私：Bearer 只放標頭；`CharArray` 用後即擦（`String`／OkHttp 拷貝為已知殘留，
- *   見 THREAT_MODEL，已最小化生命週期）；稽核只記 id/status/latency；
+ *   見 THREAT_MODEL，已最小化生命週期）；稽核只記 id/status/latency
+ *   （latency 以**單調**預設時鐘計算、負差鉗 0——C-08，見 [elapsedMs]）；
  * - 授權：本層不做 [McpScope.check]，接線 dispatcher 必須先經投影＋確認
  *  （WRITE 未確認不得調 [callTool]，見 [McpScope]）；
  * - 綁定：`keyId` 與 `baseUrl` 無自動綁定，換 URL 不得靜默沿用舊 key，
@@ -51,28 +52,38 @@ class McpServer(
     private val keyVault: KeyVault,
     private val transport: McpTransport = McpTransport(),
     private val breaker: McpCircuitBreaker = McpCircuitBreaker(),
-    private val clockMs: () -> Long = System::currentTimeMillis,
+    // C-08：預設時鐘改單調源（nanoTime 基準，單位維持 ms）。注入式簽名不變——
+    // 既有測試全用假時鐘；回撥序列由 elapsedMs 的鉗制兜底（防禦深度）。
+    private val clockMs: () -> Long = ::monotonicClockMs,
 ) {
     fun config(): McpServerConfig = config
     fun breaker(): McpCircuitBreaker = breaker
 
+    /**
+     * 經過時間（C-08）：以注入 [clockMs] 差值計 ms，**負差一律鉗 0**——
+     * 注入的非單調假時鐘（NTP 回撥類序列，如 1000 → 900）不得把負 `latencyMs`
+     * 直送 [McpCallResult.auditMap]／[McpListResult.auditMap] 與日誌面。
+     * 預設時鐘本身即單調（[monotonicClockMs]），鉗制是對注入時鐘的防禦深度。
+     */
+    private fun elapsedMs(start: Long): Long = (clockMs() - start).coerceAtLeast(0L)
+
     suspend fun listTools(timeoutMs: Long = config.effectiveTimeoutMs()): McpListResult {
         val start = clockMs()
         if (!config.enabled) {
-            return McpListResult(config.id, emptyList(), McpStatus.DISABLED, clockMs() - start)
+            return McpListResult(config.id, emptyList(), McpStatus.DISABLED, elapsedMs(start))
         }
         if (!breaker.canCall()) {
-            return McpListResult(config.id, emptyList(), McpStatus.CIRCUIT_OPEN, clockMs() - start)
+            return McpListResult(config.id, emptyList(), McpStatus.CIRCUIT_OPEN, elapsedMs(start))
         }
         if (config.baseUrl.isBlank()) {
             // 空地址：配置錯誤，不碰 vault、不計熔斷（UNAUTHORIZED，與 vault-miss 同待遇）。
-            return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, clockMs() - start)
+            return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
         try {
             McpWire.requireSecureEndpoint(config.baseUrl)
         } catch (_: IllegalArgumentException) {
             // 明文非回環／畸形地址：fail-closed，不碰 vault、不發送、不計熔斷。
-            return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
+            return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, elapsedMs(start))
         }
         val key = try {
             keyVault.getKey(config.keyId)
@@ -81,11 +92,11 @@ class McpServer(
         } catch (_: Exception) {
             // vault 存取例外（keystore 錯誤／裝置鎖定等）：與無 key 同待遇（UNAUTHORIZED、
             // 不計熔斷——本地 keystore 問題非傳輸失敗），絕不外拋崩潰呼叫方。
-            return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, clockMs() - start)
+            return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
         if (key == null) {
             // 無 key 不計熔斷（配置問題，非傳輸失敗）。
-            return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, clockMs() - start)
+            return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
         val bearer: String
         try {
@@ -100,27 +111,27 @@ class McpServer(
         // 非 ASCII（含孤立 surrogate）即 UNAUTHORIZED、不發送、不計熔斷——這類值非合法
         // token（多為 keystore 損壞或注入企圖），放行會把 CR/LF 等塞進標頭造成 header injection。
         if (!isPrintableAscii(bearer)) {
-            return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, clockMs() - start)
+            return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
         try {
             val raw = transport.postJson(config.baseUrl, bearer, McpWire.listBody(), timeoutMs)
             // bearer 僅棧上短生命週期，不存欄位、不寫 log。
             if (raw == null) {
                 breaker.onFailure()
-                return McpListResult(config.id, emptyList(), McpStatus.TIMEOUT, clockMs() - start)
+                return McpListResult(config.id, emptyList(), McpStatus.TIMEOUT, elapsedMs(start))
             }
             val (code, text) = raw
             if (code == 401 || code == 403) {
                 // C-06：401/403 不計熔斷——與 vault-miss／Bearer 預檢同待遇（認證
                 // 設定錯非暫態傳輸失敗，換 key／修權限後須立即恢復，不等開窗）。
-                return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, clockMs() - start)
+                return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, elapsedMs(start))
             }
             if (code in 300..399) {
                 // 傳輸層不跟隨 redirect（見 McpTransport.transportClient）：3xx 是終端回應。
                 // 伺服器/代理配置與本子集不合 → PROTOCOL + 計熔斷；body 不讀、
                 // 參數不重放（第二次端點從未收到請求，見 McpTransportSecurityTest）。
                 breaker.onFailure()
-                return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
+                return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, elapsedMs(start))
             }
             if (code == 400 || code == 404 || code == 405) {
                 // 端點/請求形狀配置錯（非暫態）：PROTOCOL + 計熔斷（同 3xx 待遇）；
@@ -128,14 +139,14 @@ class McpServer(
                 // UNAUTHORIZED 不計熔斷、可立即恢復）外，其餘非 2xx 分支皆計熔斷，
                 // 分類只差 status 標籤（診斷用）。
                 breaker.onFailure()
-                return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
+                return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, elapsedMs(start))
             }
             // 其餘 4xx/5xx → TRANSPORT（含 406/415：本子集只送 Accept: application/json、
             // 不協商 text/event-stream，合規 server 若回 406 屬互通差異——歸暫態並計熔斷，
             // 3 連敗即開路，不無限重試。有意決策，見 THREAT_MODEL MCP 行）。
             if (code !in 200..299 || text.isNullOrBlank()) {
                 breaker.onFailure()
-                return McpListResult(config.id, emptyList(), McpStatus.TRANSPORT, clockMs() - start)
+                return McpListResult(config.id, emptyList(), McpStatus.TRANSPORT, elapsedMs(start))
             }
             return try {
                 // expectedId=LIST_ID：回應 id 必須數值相符（錯 id 回應 fail-closed，
@@ -145,10 +156,10 @@ class McpServer(
                 // 非空 nextCursor → PARTIAL（本子集不跟隨分頁，不回 OK 假完整，
                 // 外部 review #3）；本頁工具保留供呼叫方辨識。傳輸/解析成功仍計成功。
                 val status = if (page.hasMorePages) McpStatus.PARTIAL else McpStatus.OK
-                McpListResult(config.id, page.tools, status, clockMs() - start)
+                McpListResult(config.id, page.tools, status, elapsedMs(start))
             } catch (_: IllegalArgumentException) {
                 breaker.onFailure()
-                McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
+                McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, elapsedMs(start))
             }
         } catch (e: CancellationException) {
             // 外部取消/外部 deadline 一律透傳，不計熔斷、不映射 TRANSPORT/TIMEOUT。
@@ -157,19 +168,19 @@ class McpServer(
         } catch (_: McpResponseTooLarge) {
             // 成功 body 超量（位元組/字元上限）：顯式 PROTOCOL + 計熔斷，不當 OK。
             breaker.onFailure()
-            return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
+            return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, elapsedMs(start))
         } catch (_: McpWire.McpProtocol) {
             // 傳輸層非 JSON 早擋（如 event-stream）：PROTOCOL + 計熔斷（同超量路徑）。
             breaker.onFailure()
-            return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
+            return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, elapsedMs(start))
         } catch (_: SocketTimeoutException) {
             // 讀/連線超時（非本層 deadline）：與本層 deadline 同待遇 → TIMEOUT + 計熔斷
             //（非 TRANSPORT——超時是暫態、可重試語義，分類應為 TIMEOUT）。
             breaker.onFailure()
-            return McpListResult(config.id, emptyList(), McpStatus.TIMEOUT, clockMs() - start)
+            return McpListResult(config.id, emptyList(), McpStatus.TIMEOUT, elapsedMs(start))
         } catch (_: Exception) {
             breaker.onFailure()
-            return McpListResult(config.id, emptyList(), McpStatus.TRANSPORT, clockMs() - start)
+            return McpListResult(config.id, emptyList(), McpStatus.TRANSPORT, elapsedMs(start))
         }
     }
 
@@ -182,8 +193,9 @@ class McpServer(
      *   PROTOCOL，不發送、不碰 vault、不計熔斷。只駐記憶體，不寫盤、不進稽核
      *   （稽核見 [McpCallResult.auditMap]）。
      *
-     * toolName 形狀（C-02）：只收遠端 **bare** 名——已限定名（[McpScope.switchKey]
-     * 形狀 `mcp.<id>.<tool>`）不得當 bare 名發送（否則 `enabledTools` 缺鍵預設啟用，
+     * toolName 形狀（C-02）：只收遠端 **bare** 名——已限定名（保留前綴 `mcp.` 開頭，
+     * 含 [McpScope.switchKey] 授權鍵形狀 `mcp.<len>|<id>|<tool>` 與展示形狀
+     * `mcp.<id>.<tool>`）不得當 bare 名發送（否則 `enabledTools` 缺鍵預設啟用，
      * 停用清單被靜默繞過）。
      *
      * **驗證先後序（S2-D01）**：①便宜短路——[McpStatus.DISABLED]（主開關／逐項停用）
@@ -207,10 +219,10 @@ class McpServer(
     ): McpCallResult {
         val start = clockMs()
         if (!config.enabled || !config.isToolEnabled(toolName)) {
-            return McpCallResult(config.id, toolName, McpStatus.DISABLED, clockMs() - start)
+            return McpCallResult(config.id, toolName, McpStatus.DISABLED, elapsedMs(start))
         }
         if (!breaker.canCall()) {
-            return McpCallResult(config.id, toolName, McpStatus.CIRCUIT_OPEN, clockMs() - start)
+            return McpCallResult(config.id, toolName, McpStatus.CIRCUIT_OPEN, elapsedMs(start))
         }
         val body: String
         try {
@@ -221,17 +233,17 @@ class McpServer(
         } catch (_: IllegalArgumentException) {
             // 客戶端參數錯誤（已限定名／空白名／控制字元／超長名／非 object／畸形）：
             // fail-closed，不發送、不碰 vault、不計熔斷（與傳輸失敗區分）。
-            return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
+            return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, elapsedMs(start))
         }
         if (config.baseUrl.isBlank()) {
             // 空地址：配置錯誤，不碰 vault、不計熔斷（沿用 UNAUTHORIZED 語義）。
-            return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, clockMs() - start)
+            return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
         try {
             McpWire.requireSecureEndpoint(config.baseUrl)
         } catch (_: IllegalArgumentException) {
             // 明文非回環／畸形地址：fail-closed，不碰 vault、不發送、不計熔斷。
-            return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
+            return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, elapsedMs(start))
         }
         val key = try {
             keyVault.getKey(config.keyId)
@@ -240,11 +252,11 @@ class McpServer(
         } catch (_: Exception) {
             // vault 存取例外（keystore 錯誤／裝置鎖定等）：與無 key 同待遇（UNAUTHORIZED、
             // 不計熔斷——本地 keystore 問題非傳輸失敗），絕不外拋崩潰呼叫方。
-            return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, clockMs() - start)
+            return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
         if (key == null) {
             // 無 key 不計熔斷（配置問題，非傳輸失敗）。
-            return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, clockMs() - start)
+            return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
         val bearer: String
         try {
@@ -258,34 +270,34 @@ class McpServer(
         // Bearer 預檢（fail-closed，同 listTools）：只放行可列印 ASCII，非此即 UNAUTHORIZED、
         // 不發送、不計熔斷（防 header injection／keystore 損壞值流入標頭）。
         if (!isPrintableAscii(bearer)) {
-            return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, clockMs() - start)
+            return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
         try {
             val raw = transport.postJson(config.baseUrl, bearer, body, timeoutMs)
             if (raw == null) {
                 breaker.onFailure()
-                return McpCallResult(config.id, toolName, McpStatus.TIMEOUT, clockMs() - start)
+                return McpCallResult(config.id, toolName, McpStatus.TIMEOUT, elapsedMs(start))
             }
             val (code, text) = raw
             if (code == 401 || code == 403) {
                 // 同 listTools：401/403 不計熔斷（C-06 認證錯立即恢復）。
-                return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, clockMs() - start)
+                return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, elapsedMs(start))
             }
             if (code in 300..399) {
                 // 同 listTools：不跟隨 redirect，3xx 終端 → PROTOCOL + 計熔斷。
                 breaker.onFailure()
-                return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
+                return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, elapsedMs(start))
             }
             if (code == 400 || code == 404 || code == 405) {
                 // 同 listTools：端點/請求形狀配置錯（非暫態）→ PROTOCOL + 計熔斷
                 //（其餘 4xx/5xx 走 TRANSPORT 亦計熔斷；唯一例外 401/403——
                 // UNAUTHORIZED 不計熔斷，見上方 C-06 註記）。
                 breaker.onFailure()
-                return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
+                return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, elapsedMs(start))
             }
             if (code !in 200..299 || text.isNullOrBlank()) {
                 breaker.onFailure()
-                return McpCallResult(config.id, toolName, McpStatus.TRANSPORT, clockMs() - start)
+                return McpCallResult(config.id, toolName, McpStatus.TRANSPORT, elapsedMs(start))
             }
             return try {
                 // expectedId=CALL_ID：回應 id 必須數值相符（同 listTools）。
@@ -297,7 +309,7 @@ class McpServer(
                     breaker.onSuccess()
                 }
                 val status = if (isError) McpStatus.TOOL_ERROR else McpStatus.OK
-                McpCallResult(config.id, toolName, status, clockMs() - start, resultJson, isError)
+                McpCallResult(config.id, toolName, status, elapsedMs(start), resultJson, isError)
             } catch (e: McpWire.McpToolFailure) {
                 // 僅 -32602/範圍外未知碼 error 包會到此（協議碼與保留 server 範圍
                 // −32099..−32000 於 parseCall 拋 McpProtocol → 下方 IAE catch
@@ -311,7 +323,7 @@ class McpServer(
                     config.id,
                     toolName,
                     McpStatus.TOOL_ERROR,
-                    clockMs() - start,
+                    elapsedMs(start),
                     null,
                     true,
                     errorMessage = e.message?.let {
@@ -320,7 +332,7 @@ class McpServer(
                 )
             } catch (_: IllegalArgumentException) {
                 breaker.onFailure()
-                McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
+                McpCallResult(config.id, toolName, McpStatus.PROTOCOL, elapsedMs(start))
             }
         } catch (e: CancellationException) {
             // 外部取消/外部 deadline 一律透傳，不計熔斷、不映射 TRANSPORT/TIMEOUT。
@@ -329,18 +341,18 @@ class McpServer(
         } catch (_: McpResponseTooLarge) {
             // 成功 body 超量（位元組/字元上限）：顯式 PROTOCOL + 計熔斷，不當 OK。
             breaker.onFailure()
-            return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
+            return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, elapsedMs(start))
         } catch (_: McpWire.McpProtocol) {
             // 傳輸層非 JSON 早擋（如 event-stream）：PROTOCOL + 計熔斷（同超量路徑）。
             breaker.onFailure()
-            return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
+            return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, elapsedMs(start))
         } catch (_: SocketTimeoutException) {
             // 讀/連線超時（非本層 deadline）：與本層 deadline 同待遇 → TIMEOUT + 計熔斷。
             breaker.onFailure()
-            return McpCallResult(config.id, toolName, McpStatus.TIMEOUT, clockMs() - start)
+            return McpCallResult(config.id, toolName, McpStatus.TIMEOUT, elapsedMs(start))
         } catch (_: Exception) {
             breaker.onFailure()
-            return McpCallResult(config.id, toolName, McpStatus.TRANSPORT, clockMs() - start)
+            return McpCallResult(config.id, toolName, McpStatus.TRANSPORT, elapsedMs(start))
         }
     }
 }

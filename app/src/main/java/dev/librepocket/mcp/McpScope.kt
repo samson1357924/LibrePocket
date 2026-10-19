@@ -21,12 +21,15 @@ import dev.librepocket.tool.ToolDef
  *    見 [check]）。若未來子集納入 sideEffect 宣告，須改為**取自工具定義**，
  *    不得改回收呼叫端參數。
  * 2. 投影（[project] 純函數）：伺服器主開關關閉，或該工具逐項關閉
- *    （[McpServerConfig.enabledTools] / [ProjectionContext.userSwitches]
- *    的 `mcp.<serverId>.<tool>` 覆寫），一律 UNAVAILABLE + USER_DISABLED；
+ *    （[McpServerConfig.enabledTools] 以 bare 名、[ProjectionContext.userSwitches]
+ *    以 [switchKey] 的結構化鍵 `mcp.<len>|<serverId>|<tool>` 覆寫），
+ *    一律 UNAVAILABLE + USER_DISABLED；
  *    開啟即 NATIVE（MCP 只需網路權限，無風味封鎖；開關預設開是為了讓
  *    確認閘（[check]）接管 WRITE 授權，而非預設放行執行——執行仍須確認）。
  * 3. 確認（[check]）：投影不可用一律 [McpGate.Denied]；可用但未確認一律
  *    [McpGate.NeedConfirm]（規則 1：恆 WRITE，無 READ 免確認路徑）。
+ *    [McpGate.NeedConfirm] 攜**結構化授權識別** [McpGate.NeedConfirm.switchKey]；
+ *    其 `toolName` 僅為展示字串（見該型別 KDoc，C-04 訊息邊界）。
  *    **單一投影真相（C-01）**：[check]／[canExecute] 不收呼叫端的 [Projection]——
  *    每次呼叫以**傳入的** [McpServerConfig] ＋ [ProjectionContext] 在內部重投影
  *    （委託 [project]）。呼叫方無法再把停用前的舊投影／他服的投影帶進來放行；
@@ -39,42 +42,79 @@ import dev.librepocket.tool.ToolDef
  *    `enabledTools` 以遠端 bare 名查鍵、缺鍵預設啟用，停用清單會被「誤傳
  *    已限定名」靜默繞過（全鏈綠燈、無 require 報錯）。
  *
- * 開關 key 形狀：`mcp.<serverId>.<toolName>`（例如 `mcp.files.search`）。
+ * 鍵形狀（C-04 已修）：**授權鍵**與**展示形狀**分離——
+ * - 授權鍵＝[switchKey]（＝[ToolAnnotations.requiresSwitch]／
+ *   [ProjectionContext.userSwitches] 的鍵）：長度前綴結構化形狀
+ *   `mcp.<serverId 的 UTF-16 code units 數（String.length）>|<serverId>|<toolName>`
+ *   （如 `mcp.2|s1|search`），
+ *   對任意輸入**單射**——遠端 tool 名合法可含 `.`／`|`、serverId 不設形狀限制，
+ *   舊字串拼接形狀 `mcp.<id>.<tool>` 的跨服碰撞
+ *   （`switchKey("a.b","c") == switchKey("a","b.c")`）已不可能；
+ * - 展示形狀＝[ToolDef.name]／[Projection.toolName]：維持
+ *   `mcp.<serverId>.<toolName>`（例如 `mcp.files.search`）——**文件化契約**
+ *   （wire 保留前綴 `mcp.` 兩端同政策），**不作授權用途**。誠實揭露：
+ *   dotted serverId 下兩服的展示字串仍可能相同（如 `("a.b","c")` 與 `("a","b.c")`
+ *   皆 `mcp.a.b.c`），接線時不得以展示字串反解授權對象，一律以
+ *   `(config.id, toolName)` 二元組取用（現未接線，僅本包＋測試受影響）。
  * 命名保留：橋接別名（`LspTools` 約定 `mcp.<serverId>.lsp…`）不得與遠端
  * `tools/list` 回傳名機械式區分，碰撞時逃逸規則待定（現未接線，僅預留）。
  */
 object McpScope {
 
     /**
-     * 保留前綴（開關鍵／[dev.librepocket.tool.ToolDef.name] 的形狀）：
-     * `mcp.<serverId>.<toolName>`。**單一真相**——wire 層入站政策直接引用本常數
+     * 保留前綴（`mcp.`）：**單一真相**——[ToolDef.name]／[Projection.toolName] 的
+     * 展示形狀與 [switchKey] 授權鍵**都以此開頭**（鍵為
+     * `mcp.<serverId 的 UTF-16 code units 數>|<id>|<tool>`，
+     * 見 [switchKey]），兩種形狀同在保留命名空間內。wire 層入站政策直接引用本常數
      * （[McpWire.RESERVED_TOOL_PREFIX] 是本常數的別名，不另立魔數），兩端同政策：
-     * 入站 `McpWire.parseListPage` 對此前綴名整頁拒、本包 [requireBareToolName] 拒用。
+     * 入站 `McpWire.parseListPage` 對此前綴名整頁拒、本包 [requireBareToolName] 拒用
+     * ——故開關鍵永不可能是合法遠端 bare 名（誤當工具名用必被 fail-closed 拒，已測）。
      */
     const val SWITCH_PREFIX = "mcp."
 
     /**
-     * 開關鍵：`mcp.<serverId>.<toolName>`。
+     * 開關鍵＝**授權鍵**（C-04 已修）：長度前綴結構化形狀
+     * `mcp.<serverId 的 UTF-16 code units 數（String.length）>|<serverId>|<toolName>`
+     * （例如 `mcp.2|s1|search`）。
+     *
+     * **單射性（跨服不碰撞）**：前綴之後先寫十進位的 `String.length`（UTF-16 code
+     * units 數，**非 code point 數**——emoji 等非 BMP 字元計 2 units）＋`|`，
+     * 再接**恰該 units 數**的 serverId、`|`、最後是 toolName——給定鍵字串，
+     * 數字段由 `|` 定界、id 段長度由數字唯一決定，(serverId, toolName) 可唯一解回，
+     * 故 `switchKey("a.b","c") != switchKey("a","b.c")`
+     * 與 `switchKey("a|b","c") != switchKey("a","b|c")`（皆已測）。
+     * 刻意**不拒字元、不 sanitize、不設 serverId 形狀**：遠端 tool 名含 `.`／`|`
+     * 是合法遠端形狀（拒了會「列出但不可用」），serverId 是既有配置值——
+     * 結構化鍵對正常輸入零失敗。
      *
      * [toolName] 必須是 bare 名（[requireBareToolName] fail-closed）。
      *
-     * **已知跨服鍵碰撞（C-04，本輪未修）**：[serverId] 可含 `.`，
-     * `switchKey("a.b","c") == switchKey("a","b.c")`（皆 `mcp.a.b.c`）——
-     * 不同伺服器的開關鍵可能互相覆寫（授權對象錯位）。接線前必須收斂
-     * serverId 形狀（或改分層鍵），見 `docs/CAPABILITY_MATRIX.md`
-     * 「MCP 啟用／接線 gate 清單」。
+     * **與展示形狀不同字串**：[ToolDef.name]／[Projection.toolName] 維持
+     * `mcp.<id>.<tool>`（文件化契約，見類 KDoc）。`annotations.requiresSwitch` 與
+     * [ProjectionContext.userSwitches] 一律用本函形狀，不得以 name 字面代替；
+     * 反向亦然——本鍵字串不得當 bare tool 名送入任何入口（以 `mcp.` 開頭，
+     * [requireBareToolName] 必拒，fail-closed 已測）。
      */
     fun switchKey(serverId: String, toolName: String): String {
         requireBareToolName(toolName)
-        return "$SWITCH_PREFIX$serverId.$toolName"
+        return "$SWITCH_PREFIX${serverId.length}|$serverId|$toolName"
     }
+
+    /**
+     * 展示形狀（[ToolDef.name]／[Projection.toolName]，文件化契約）：
+     * `mcp.<serverId>.<toolName>`。只作展示／識別，**不作授權鍵**（授權一律經
+     * [switchKey]）；dotted serverId 下可能跨服同字串（類 KDoc 誠實揭露）。
+     */
+    private fun qualifiedName(serverId: String, toolName: String): String =
+        "$SWITCH_PREFIX$serverId.$toolName"
 
     /**
      * toolName 形狀校驗（C-02，fail-closed；違反一律 `IllegalArgumentException`）：
      * - 空白名（[String.isNotBlank]，與 wire 出站 `callBody` 同政策）——Unicode 空白
      *   同樣算空白（NBSP `U+00A0`、全形空格 `U+3000` 等，[Char.isWhitespace] 語意，已測）；
-     * - 已限定名：以 [SWITCH_PREFIX]（`mcp.`）開頭——那是 [ToolDef.name]/開關鍵
-     *   的形狀，不是遠端 bare 名；拿它查 `enabledTools` 會因缺鍵預設啟用而繞過停用清單。
+     * - 已限定名：以 [SWITCH_PREFIX]（`mcp.`）開頭——那是 [ToolDef.name]（展示形狀）
+     *   與 [switchKey]（授權鍵 `mcp.<len>|<id>|<tool>`）共用的保留前綴，不是遠端
+     *   bare 名；拿它查 `enabledTools` 會因缺鍵預設啟用而繞過停用清單。
      *   **保留前綴兩端同政策**（單一真相 [McpWire.RESERVED_TOOL_PREFIX]＝[SWITCH_PREFIX]）：
      *   入站 `McpWire.parseListPage` 對此前綴的遠端名**整頁拒**（拋 [McpWire.McpProtocol]）、
      *   出站／授權側（本函）**拒用**——兩邊都做，才不會「列出但不可用」；
@@ -138,7 +178,8 @@ object McpScope {
      *
      * 仍存限制（誠實揭露，見 CAPABILITY_MATRIX「MCP 啟用／接線 gate 清單」）：
      * 內建投影路徑只看 [ProjectionContext.userSwitches]、看不到 [McpServerConfig]——
-     * 若呼叫端在 ctx 明寫 `userSwitches[mcp.<id>.<tool>]=true`，停用伺服器的
+     * 若呼叫端在 ctx 明寫 `userSwitches[switchKey(id, tool)]=true`（結構化鍵
+     * `mcp.<len>|<id>|<tool>`，見 [switchKey]），停用伺服器的
      * ToolDef 會被翻回 NATIVE（本輪無法在包內表達「無條件主開關」：內建
      * annotations 沒有不可覆寫的停用位）。兩道既有兜底：① MCP 自己的授權路徑
      * （[project]／[check]／[canExecute]）一律以 config 重查、不吃此覆寫；
@@ -146,10 +187,19 @@ object McpScope {
      * 停用與否皆不可執行、模型不可見。
      *
      * @param inputSchema 遠端 `tools/list` 回傳的 JSON Schema 文本（[McpTool.inputSchema]），
-     *   原樣透傳給內建 Schema 校驗鏈路；預設最小 `{"type":"object"}` 是**本地建構**
-     *   預設值（未傳參數的直呼叫／測試用），與遠端契約無關——wire 層遠端缺
-     *   inputSchema 一律 PROTOCOL（[McpWire.parseListPage] fail-closed），
-     *   不會以本預設值充當遠端宣告。
+     *   **原樣透傳、本地只做 JSON 形狀層保證（C-09 精確化，行為不變）**：
+     *   - 遠端路徑：[McpWire.parseListPage] 已 fail-closed 保證為 **object-root**
+     *     （根 `type` 恆字串 `"object"`）且 ≤ [McpWire.INPUT_SCHEMA_MAX_CHARS]（8192）
+     *     字元的合法 JSON——到手即可安全透傳，不會帶畸形 JSON 進 [ToolDef.jsonSchema]；
+     *   - **語義不在本地驗**：schema 是否為合法 JSON Schema 語義（如
+     *     `{"type":"banana"}`、缺 `type`、空物件）與參數是否符合 schema，
+     *     一律由 provider／遠端伺服器負責——provider 端僅再驗**同一層 JSON 形狀**
+     *     （[dev.librepocket.provider.toolSchemaElement] 的 root-object 檢查，非 object／
+     *     不可解析 → `ProviderFailure` fail-closed），**不做 meta-schema 校驗**；
+     *     語義爛但形狀合法的 schema 會原樣送進請求（誠實揭露，非 fail-closed）；
+     *   - 本地建構預設 `{"type":"object"}`（未傳參數的直呼叫／測試用）與遠端契約
+     *     無關——wire 層遠端缺 inputSchema 一律 PROTOCOL（[McpWire.parseListPage]
+     *     fail-closed），不會以本預設值充當遠端宣告。
      */
     fun toToolDef(
         config: McpServerConfig,
@@ -159,7 +209,8 @@ object McpScope {
         // 形狀校驗 fail-closed（C-02）：經 switchKey 統一入口，已限定名/空白/控制字元/超長皆拒。
         val key = switchKey(config.id, toolName)
         return ToolDef(
-            name = "mcp.${config.id}.$toolName",
+            // 展示形狀（文件化契約）≠ 授權鍵：name 走 qualifiedName、requiresSwitch 走 switchKey（C-04）。
+            name = qualifiedName(config.id, toolName),
             description = "Third-party MCP tool $toolName on server ${config.id} (default WRITE).",
             jsonSchema = inputSchema,
             // MCP 子集無 sideEffect 宣告 → 恆 WRITE（S2-R02：呼叫端不得降級，見本函 KDoc）。
@@ -183,7 +234,7 @@ object McpScope {
         ctx: ProjectionContext = ProjectionContext(),
     ): Projection {
         requireBareToolName(toolName)
-        val qualified = "mcp.${config.id}.$toolName"
+        val qualified = qualifiedName(config.id, toolName)
         if (!config.enabled || !config.isToolEnabled(toolName)) {
             return Projection(qualified, CapabilityLevel.UNAVAILABLE, DenyReason.USER_DISABLED)
         }
@@ -205,6 +256,11 @@ object McpScope {
      * `READ` 降級跳過確認）。若未來子集納入宣告，須改為取自工具定義，
      * 不得改回收呼叫端參數。
      *
+     * 未確認回 [McpGate.NeedConfirm]，其 [McpGate.NeedConfirm.switchKey] 是**授權識別**
+     * （結構化 [switchKey]，對 `(config.id, toolName)` 單射）；
+     * [McpGate.NeedConfirm.toolName] 只是展示字串，接線回送不得以它反解授權對象
+     * （C-04 訊息邊界，見 [McpGate.NeedConfirm] KDoc）。
+     *
      * [toolName] 形狀 fail-closed（C-02，經 [project]→[requireBareToolName]）。
      */
     fun check(
@@ -220,7 +276,11 @@ object McpScope {
         // 第三方收緊：恆 WRITE、未確認即需確認（內建 WRITE 在 PrivilegeGate 可直行；
         // MCP 無 sideEffect 宣告，呼叫端無從降級——見本函 KDoc）。
         if (!confirmed) {
-            return McpGate.NeedConfirm(projection.toolName)
+            return McpGate.NeedConfirm(
+                toolName = projection.toolName,
+                // 授權識別一律用結構化 switchKey，絕不用展示字串（C-04）。
+                switchKey = switchKey(config.id, toolName),
+            )
         }
         return McpGate.Allowed
     }
@@ -237,6 +297,18 @@ object McpScope {
 /** MCP 授權結果（鏡像 PrivilegeGate 形狀；MCP 恆 WRITE——未確認一律 [NeedConfirm]）。 */
 sealed interface McpGate {
     data object Allowed : McpGate
-    data class NeedConfirm(val toolName: String) : McpGate
+
+    /**
+     * 需使用者確認（MCP 恆 WRITE）。
+     *
+     * **[switchKey] 是授權識別；[toolName] 只是展示字串**（[ToolDef.name] 形狀
+     * `mcp.<id>.<tool>`）。識別／回送**一律用 [switchKey]**（結構化、對
+     * `(serverId, toolName)` 單射，見 [McpScope.switchKey]），**不得用 [toolName]**：
+     * dotted serverId 下兩服可投影出相同展示字串（`("a.b","c")` 與 `("a","b.c")`
+     * 皆 `mcp.a.b.c`），以展示字串回送 `callTool`／查開關會錯位到另一服
+     * （C-04 在訊息邊界的殘餘）。
+     */
+    data class NeedConfirm(val toolName: String, val switchKey: String) : McpGate
+
     data class Denied(val reason: DenyReason) : McpGate
 }

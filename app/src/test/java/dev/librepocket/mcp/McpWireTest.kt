@@ -15,7 +15,7 @@ class McpWireTest {
     @Test fun contentTextExactlyErrorIsOk() {
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
             "{\"content\":[{\"type\":\"text\",\"text\":\"error\"}],\"isError\":false}}"
-        val (result, isError) = McpWire.parseCall(json)
+        val (result, isError) = McpWire.parseCall(json, null)
         assertFalse(isError)
         assertTrue(result != null && result.contains("error"))
     }
@@ -24,7 +24,7 @@ class McpWireTest {
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
             "{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]," +
             "\"structuredContent\":{\"error\":\"nested detail\"},\"isError\":false}}"
-        val (result, isError) = McpWire.parseCall(json)
+        val (result, isError) = McpWire.parseCall(json, null)
         assertFalse(isError)
         assertTrue(result != null && result.contains("ok"))
     }
@@ -32,7 +32,7 @@ class McpWireTest {
     @Test fun contentItemWithErrorKeyIsOk() {
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
             "{\"content\":[{\"type\":\"text\",\"text\":\"hi\",\"error\":\"detail\"}],\"isError\":false}}"
-        val (_, isError) = McpWire.parseCall(json)
+        val (_, isError) = McpWire.parseCall(json, null)
         assertFalse(isError)
     }
 
@@ -40,7 +40,7 @@ class McpWireTest {
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2," +
             "\"error\":{\"code\":-32602,\"message\":\"bad input\"}}"
         try {
-            McpWire.parseCall(json)
+            McpWire.parseCall(json, null)
             fail("expected McpToolFailure")
         } catch (e: McpWire.McpToolFailure) {
             assertEquals("bad input", e.message)
@@ -55,7 +55,7 @@ class McpWireTest {
             "\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}," +
             "\"error\":{\"code\":1,\"message\":\"boom\"}}"
         try {
-            McpWire.parseCall(json)
+            McpWire.parseCall(json, null)
             fail("result+error 同時存在必須拒（McpProtocol）")
         } catch (e: McpWire.McpProtocol) {
             assertEquals("mcp: result and error both present", e.message)
@@ -68,14 +68,14 @@ class McpWireTest {
         val both = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
             "{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"isError\":false},\"error\":null}"
         try {
-            McpWire.parseCall(both)
+            McpWire.parseCall(both, null)
             fail("error:null + result 必須拒")
         } catch (e: McpWire.McpProtocol) {
             assertEquals("mcp: bad error", e.message)
         }
         val onlyNull = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":null}"
         try {
-            McpWire.parseCall(onlyNull)
+            McpWire.parseCall(onlyNull, null)
             fail("error:null 單獨必須拒")
         } catch (e: McpWire.McpProtocol) {
             assertEquals("mcp: bad error", e.message)
@@ -87,7 +87,7 @@ class McpWireTest {
         // 不回 (null, false) 假成功。
         val truncated = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":"
         try {
-            McpWire.parseCall(truncated)
+            McpWire.parseCall(truncated, null)
             fail("expected IllegalArgumentException for missing result.content")
         } catch (e: McpWire.McpToolFailure) {
             fail("truncated JSON must not be McpToolFailure (TOOL_ERROR), got: ${e.message}")
@@ -101,7 +101,7 @@ class McpWireTest {
         val big = "繁".repeat(40_000)
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
             "{\"content\":[{\"type\":\"text\",\"text\":\"$big\"}],\"isError\":false}}"
-        val (result, isError) = McpWire.parseCall(json)
+        val (result, isError) = McpWire.parseCall(json, null)
         assertFalse(isError)
         assertTrue("40k CJK 結果必須完整保留（無 32k 靜默截斷）", result != null && result.contains(big))
     }

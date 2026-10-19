@@ -6,6 +6,7 @@ import dev.librepocket.tool.ProjectionContext
 import dev.librepocket.tool.SideEffect
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -56,7 +57,8 @@ class McpScopeTest {
     }
 
     @Test fun userSwitchOffProjectsUserDisabled() {
-        val ctx = ProjectionContext(userSwitches = mapOf("mcp.s1.search" to false))
+        // C-04：授權鍵是結構化 switchKey，不是展示名 `mcp.s1.search`。
+        val ctx = ProjectionContext(userSwitches = mapOf(McpScope.switchKey("s1", "search") to false))
         val p = McpScope.project(open, "search", ctx)
         assertEquals(CapabilityLevel.UNAVAILABLE, p.level)
         assertEquals(DenyReason.USER_DISABLED, p.reason)
@@ -66,7 +68,7 @@ class McpScopeTest {
         val p = McpScope.project(open, "search")
         assertEquals(CapabilityLevel.NATIVE, p.level)
         val need = McpScope.check(open, "search", false)
-        assertEquals(McpGate.NeedConfirm("mcp.s1.search"), need)
+        assertEquals(McpGate.NeedConfirm("mcp.s1.search", "mcp.2|s1|search"), need)
         assertFalse(McpScope.canExecute(open, "search", false))
         assertTrue(McpScope.canExecute(open, "search", true))
     }
@@ -78,7 +80,7 @@ class McpScopeTest {
         // 一律按 WRITE 對待——名字看起來像「讀取」的工具（lookup）未確認仍必須
         // NeedConfirm。mutation（把 check 改成一律 Allowed）此測即紅。
         assertEquals(CapabilityLevel.NATIVE, McpScope.project(open, "lookup").level)
-        assertEquals(McpGate.NeedConfirm("mcp.s1.lookup"), McpScope.check(open, "lookup", false))
+        assertEquals(McpGate.NeedConfirm("mcp.s1.lookup", "mcp.2|s1|lookup"), McpScope.check(open, "lookup", false))
         assertFalse("MCP 工具未確認不得執行（無 READ 免確認路徑）", McpScope.canExecute(open, "lookup", false))
         assertTrue(McpScope.canExecute(open, "lookup", true))
     }
@@ -88,7 +90,7 @@ class McpScopeTest {
         // 傳參驗證——該參數已移除（呼叫端不得選 sideEffect），改釘「連名字像
         // 執行類的工具也走同一條恆 WRITE 確認閘」：未確認 NeedConfirm、已確認 Allowed。
         assertEquals(CapabilityLevel.NATIVE, McpScope.project(open, "exec").level)
-        assertEquals(McpGate.NeedConfirm("mcp.s1.exec"), McpScope.check(open, "exec", false))
+        assertEquals(McpGate.NeedConfirm("mcp.s1.exec", "mcp.2|s1|exec"), McpScope.check(open, "exec", false))
         assertTrue(McpScope.canExecute(open, "exec", true))
         // 對照：停用時即便已確認仍 Denied（恆 WRITE 不影響 C-01 重投影判定）。
         val off = open.copy(enabledTools = mapOf("exec" to false))
@@ -103,7 +105,7 @@ class McpScopeTest {
         assertEquals(McpGate.Denied(DenyReason.USER_DISABLED), McpScope.check(off, "exec", false))
         assertFalse(McpScope.canExecute(off, "exec", false))
         // 對照：啟用 + 未確認 → NeedConfirm（確認順序未把啟用側誤判為 Denied）。
-        assertEquals(McpGate.NeedConfirm("mcp.s1.exec"), McpScope.check(open, "exec", false))
+        assertEquals(McpGate.NeedConfirm("mcp.s1.exec", "mcp.2|s1|exec"), McpScope.check(open, "exec", false))
     }
 
     @Test fun scopeApiSignaturesPinNoSideEffectParameter() {
@@ -167,7 +169,9 @@ class McpScopeTest {
     }
 
     @Test fun switchKeyShape() {
-        assertEquals("mcp.s1.search", McpScope.switchKey("s1", "search"))
+        // C-04 正向 pin：保留 `mcp.` 前綴（與 requireBareToolName／wire 同源）＋
+        // 長度前綴結構化鍵；展示名（ToolDef.name）仍是 `mcp.s1.search`，兩者分離。
+        assertEquals("mcp.2|s1|search", McpScope.switchKey("s1", "search"))
     }
 
     // ---- Stage6 C-01：單一投影真相（check/canExecute 內部以傳入 config 重投影） ----
@@ -211,7 +215,7 @@ class McpScopeTest {
     @Test fun checkAndCanExecuteHonorProjectionContextSwitches() {
         // ctx 是 check/canExecute 唯一的呼叫端投影輸入：該鍵在 ctx 明關 → Denied
         //（重投影吃 ctx，不吃任何跨輪快取的舊 Projection）。
-        val ctx = ProjectionContext(userSwitches = mapOf("mcp.s1.search" to false))
+        val ctx = ProjectionContext(userSwitches = mapOf(McpScope.switchKey("s1", "search") to false))
         assertEquals(McpGate.Denied(DenyReason.USER_DISABLED), McpScope.check(open, "search", true, ctx))
         assertFalse(McpScope.canExecute(open, "search", true, ctx))
         // 對照：他工具不受影響。
@@ -224,8 +228,10 @@ class McpScopeTest {
         // C-02 重現翻轉：`enabledTools=mapOf("search" to false)` 下，舊碼
         // project(cfg, "mcp.s1.search") 以已限定名查鍵 →缺鍵預設啟用 → NATIVE
         //（停用清單被靜默繞過、全鏈綠燈無 require 報錯）。現在一律 IAE fail-closed。
+        // N-B5：除展示形狀外，結構化授權鍵字面 `mcp.2|s1|search` 同樣以 `mcp.`
+        // 開頭——同一 startsWith 機制必須同樣拒（釘死結構化字面也不得當 bare 名）。
         val cfg = open.copy(enabledTools = mapOf("search" to false))
-        for (bad in listOf("mcp.s1.search", "mcp.s1.mcp.s1.search", "mcp.", "mcp.x")) {
+        for (bad in listOf("mcp.s1.search", "mcp.2|s1|search", "mcp.s1.mcp.s1.search", "mcp.", "mcp.x")) {
             assertRejected("project($bad)") { McpScope.project(cfg, bad) }
             assertRejected("check($bad)") { McpScope.check(cfg, bad, confirmed = true) }
             assertRejected("canExecute($bad)") { McpScope.canExecute(cfg, bad, confirmed = true) }
@@ -292,7 +298,7 @@ class McpScopeTest {
         // `MCP.foo`（大寫變體）屬合法 bare 名照收（scope 與 wire 入站同此語意）。
         assertEquals(CapabilityLevel.NATIVE, McpScope.project(open, "MCP.foo").level)
         assertEquals(CapabilityLevel.NATIVE, McpScope.project(open, "MCP.search").level)
-        assertEquals("mcp.s1.MCP.foo", McpScope.switchKey("s1", "MCP.foo"))
+        assertEquals("mcp.2|s1|MCP.foo", McpScope.switchKey("s1", "MCP.foo"))
         // 對照：小寫保留前綴仍拒（非大小寫不敏感的 startsWith）。
         assertRejected("project(mcp.foo)") { McpScope.project(open, "mcp.foo") }
     }
@@ -304,36 +310,149 @@ class McpScopeTest {
         // 斷言在 McpServerSemanticsTest.loneSurrogateAsymmetryScopeAllowsButCallToolRejects）。
         val lone = "a\uD800"
         assertEquals(CapabilityLevel.NATIVE, McpScope.project(open, lone).level)
-        assertEquals(McpGate.NeedConfirm("mcp.s1.a\uD800"), McpScope.check(open, lone, false))
-        assertEquals("mcp.s1.a\uD800", McpScope.switchKey("s1", lone))
+        assertEquals(McpGate.NeedConfirm("mcp.s1.a\uD800", "mcp.2|s1|a\uD800"), McpScope.check(open, lone, false))
+        assertEquals("mcp.2|s1|a\uD800", McpScope.switchKey("s1", lone))
         // 對照：成對 surrogate（emoji）同樣放行（非「凡 surrogate 皆拒」）。
         assertEquals(CapabilityLevel.NATIVE, McpScope.project(open, "t😀").level)
     }
 
-    @Test fun switchKeyCrossServerCollisionSnapshotKnownLimitation() {
-        // known limitation 快照（S2-D05 / C-04）：serverId 可含 `.`，跨服鍵碰撞
-        // `switchKey("a.b","c") == switchKey("a","b.c")`（皆 mcp.a.b.c，授權對象可能
-        // 錯位）。修 C-04（收斂 serverId 形狀或改分層鍵）／接線 PR 時**應翻轉**此快照
-        //（屆時改斷言兩鍵不相等），見 CAPABILITY_MATRIX gate 清單。
-        assertEquals(
-            "C-04 已知碰撞（修 C-04 時翻轉此測）",
+    @Test fun switchKeyIsInjectiveAcrossServerIdsAndToolNames() {
+        // C-04 翻轉（舊快照 pin 的已知碰撞）：字串拼接 `mcp.<id>.<tool>` 讓
+        // `("a.b","c")` 與 `("a","b.c")` 撞同一把授權鍵（停用／確認一服誤傷
+        // 另一服）。長度前綴結構化鍵對任意輸入單射——mutation（改回 "." 拼接）
+        // 此測即紅。
+        assertEquals("mcp.3|a.b|c", McpScope.switchKey("a.b", "c"))
+        assertEquals("mcp.1|a|b.c", McpScope.switchKey("a", "b.c"))
+        assertNotEquals(
+            "跨服 dotted id 不得碰撞",
             McpScope.switchKey("a.b", "c"),
             McpScope.switchKey("a", "b.c"),
         )
-        assertEquals("mcp.a.b.c", McpScope.switchKey("a.b", "c"))
+        // `|` 是合法的遠端 tool 名字元，也不得成為新的歧義來源。
+        assertEquals("mcp.3|a|b|c", McpScope.switchKey("a|b", "c"))
+        assertEquals("mcp.1|a|b|c", McpScope.switchKey("a", "b|c"))
+        assertNotEquals(
+            "tool 名含 | 不得碰撞",
+            McpScope.switchKey("a|b", "c"),
+            McpScope.switchKey("a", "b|c"),
+        )
+        // 長度前綴本身防相鄰字元重切（("ab","c") vs ("a","bc")）。
+        assertNotEquals(
+            "id/tool 邊界重切不得碰撞",
+            McpScope.switchKey("ab", "c"),
+            McpScope.switchKey("a", "bc"),
+        )
+
+        // 使用者可見後果：關閉 A 服的鍵不得停用 B 服（授權與內建投影兩條路徑）。
+        val cfgA = McpServerConfig(id = "a.b", baseUrl = "https://mcp.example.com")
+        val cfgB = McpServerConfig(id = "a", baseUrl = "https://mcp.example.com")
+        val ctxAOff = ProjectionContext(
+            userSwitches = mapOf(McpScope.switchKey("a.b", "c") to false),
+        )
+        assertEquals(CapabilityLevel.UNAVAILABLE, McpScope.project(cfgA, "c", ctxAOff).level)
+        assertEquals(
+            "A 服的開關鍵不得誤傷 B 服（C-04 原始 bug）",
+            CapabilityLevel.NATIVE,
+            McpScope.project(cfgB, "b.c", ctxAOff).level,
+        )
+        val defA = McpScope.toToolDef(cfgA, "c")
+        val defB = McpScope.toToolDef(cfgB, "b.c")
+        assertNotEquals(
+            "requiresSwitch 必須走結構化鍵",
+            defA.annotations.requiresSwitch,
+            defB.annotations.requiresSwitch,
+        )
+        assertEquals(
+            "內建投影路徑同鍵同語義：A 關不影響 B",
+            CapabilityLevel.NATIVE,
+            defB.project(ctxAOff).level,
+        )
+        assertEquals(CapabilityLevel.UNAVAILABLE, defA.project(ctxAOff).level)
+
+        // 誠實殘餘（文件化契約不改）：展示名仍可能同字串；不得以 name 反解授權對象。
+        assertEquals("mcp.a.b.c", defA.name)
+        assertEquals("mcp.a.b.c", defB.name)
+    }
+
+    // ---- Stage5 SF-A1：NeedConfirm 授權識別＝結構化 switchKey（非展示字串） ----
+
+    @Test fun needConfirmIdentityIsSwitchKeyEvenWhenDisplayNamesCollide() {
+        // C-04 在訊息邊界的殘餘：NeedConfirm 舊形狀只帶展示名 `mcp.<id>.<tool>`，
+        // dotted serverId 下兩服可同字串——接線 dispatcher 若以 NeedConfirm.toolName
+        // 回送 callTool 會錯位。現形狀 (toolName 展示, switchKey 授權識別)：
+        // 展示名可相同，識別欄位必須不同。mutation（switchKey 改回展示名）此測即紅。
+        val cfgA = McpServerConfig(id = "a.b", baseUrl = "https://mcp.example.com")
+        val cfgB = McpServerConfig(id = "a", baseUrl = "https://mcp.example.com")
+        val gateA = McpScope.check(cfgA, "c", confirmed = false) as McpGate.NeedConfirm
+        val gateB = McpScope.check(cfgB, "b.c", confirmed = false) as McpGate.NeedConfirm
+
+        assertEquals("展示名可相同（僅 UI 顯示用）", gateA.toolName, gateB.toolName)
+        assertEquals("mcp.a.b.c", gateA.toolName)
+        assertEquals("mcp.a.b.c", gateB.toolName)
+        assertNotEquals(
+            "授權識別不得靠展示字串：dotted-id 兩服的 switchKey 必須不同",
+            gateA.switchKey,
+            gateB.switchKey,
+        )
+        assertEquals("mcp.3|a.b|c", gateA.switchKey)
+        assertEquals("mcp.1|a|b.c", gateB.switchKey)
+        // 識別欄位本身就是結構化鍵，不是展示字串。
+        assertNotEquals(gateA.switchKey, gateA.toolName)
+    }
+
+    // ---- Stage5 N-B6：舊 dotted 展示鍵不再是授權鍵（C-04 解耦核心） ----
+
+    @Test fun legacyDottedDisplayKeyIsNotAnAuthorizationSwitch() {
+        // 反向 pin：`userSwitches["mcp.s1.search"]`（舊 dotted 授權鍵形狀）**不再**
+        // 參與授權查找——被忽略；只有結構化 `switchKey("s1","search")` 生效。
+        // mutation（把 project/switchKey 查詢改回展示字串）此測即紅。
+        val legacyKeyCtx = ProjectionContext(userSwitches = mapOf("mcp.s1.search" to false))
+        assertEquals(
+            "舊 dotted 鍵不得停用工具（被忽略）",
+            CapabilityLevel.NATIVE,
+            McpScope.project(open, "search", legacyKeyCtx).level,
+        )
+        assertEquals(
+            McpGate.Allowed,
+            McpScope.check(open, "search", confirmed = true, legacyKeyCtx),
+        )
+        // 內建投影路徑同語義：requiresSwitch 是結構化鍵，舊展示字串不參與查找。
+        assertEquals(
+            CapabilityLevel.NATIVE,
+            McpScope.toToolDef(open, "search").project(legacyKeyCtx).level,
+        )
+
+        // 反向控制：結構化授權鍵關閉 → 生效（授權路徑＋內建投影路徑）。
+        val structuredCtx = ProjectionContext(
+            userSwitches = mapOf(McpScope.switchKey("s1", "search") to false),
+        )
+        assertEquals(
+            CapabilityLevel.UNAVAILABLE,
+            McpScope.project(open, "search", structuredCtx).level,
+        )
+        assertEquals(
+            McpGate.Denied(DenyReason.USER_DISABLED),
+            McpScope.check(open, "search", confirmed = true, structuredCtx),
+        )
+        assertEquals(
+            CapabilityLevel.UNAVAILABLE,
+            McpScope.toToolDef(open, "search").project(structuredCtx).level,
+        )
     }
 
     @Test fun disabledServerToolDefUserSwitchOverrideSnapshotKnownLimitation() {
         // known limitation 快照（S2-D05 / CAPABILITY_MATRIX gate 清單）：內建投影路徑
         // 只看 ProjectionContext.userSwitches、看不到 McpServerConfig——ctx 明寫
-        // `userSwitches[mcp.s1.search]=true` 會把**停用伺服器**的 ToolDef 翻回 NATIVE。
+        // `userSwitches[switchKey("s1","search")]=true` 會把**停用伺服器**的 ToolDef 翻回 NATIVE。
         // 此測驗證 KDoc/CAPABILITY_MATRIX 的揭露屬實。接線 PR 以 config 重驗或收斂
         // 此分歧（或未來 annotations 加入不可覆寫的停用位）時**應翻轉**（屆時改斷言
         // UNAVAILABLE）；見 CAPABILITY_MATRIX gate 清單「toToolDef 主開關在內建投影
         // 路徑的殘餘覆寫」。
         val off = McpServerConfig.disabled("s1", "https://mcp.example.com")
         val def = McpScope.toToolDef(off, "search")
-        val p = def.project(ProjectionContext(userSwitches = mapOf("mcp.s1.search" to true)))
+        val p = def.project(
+            ProjectionContext(userSwitches = mapOf(McpScope.switchKey("s1", "search") to true)),
+        )
         assertEquals(
             "殘餘覆寫快照（修此分歧時翻轉為 UNAVAILABLE）",
             CapabilityLevel.NATIVE,
@@ -395,7 +514,7 @@ class McpScopeTest {
     @Test fun toToolDefRequiresSwitchAndSideEffect() {
         val def = McpScope.toToolDef(open, "search")
         assertEquals(SideEffect.WRITE, def.sideEffect)
-        assertEquals("mcp.s1.search", def.annotations.requiresSwitch)
+        assertEquals("mcp.2|s1|search", def.annotations.requiresSwitch)
         assertTrue(def.annotations.switchDefault)
         // fallbackHint 預設值（降級時對使用者的替代指引）釘住，避免靜默清空。
         assertEquals("ask the user to enable or confirm the MCP tool manually", def.annotations.fallbackHint)
@@ -403,12 +522,12 @@ class McpScopeTest {
 
     @Test fun toToolDefInterpolatesServerAndToolName() {
         // 參數化盲點：前兩組測試都用 ("s1","search")（正是開關鍵字面），若 name/
-        // requiresSwitch 被硬編碼成 "mcp.s1.search" 而非插值，前測仍綠。改用不同組
-        // 釘住插值正確。
+        // requiresSwitch 被硬編碼成 "mcp.s1.search"／"mcp.2|s1|search" 而非插值，
+        // 前測仍綠。改用不同組釘住插值正確。
         val other = McpServerConfig(id = "srv2", baseUrl = "https://mcp.example.com")
         val def = McpScope.toToolDef(other, "other")
         assertEquals("mcp.srv2.other", def.name)
-        assertEquals("mcp.srv2.other", def.annotations.requiresSwitch)
+        assertEquals("mcp.4|srv2|other", def.annotations.requiresSwitch)
     }
 
     // ---- Stage6 C-01：toToolDef 主開關（收 config，switchDefault 接 isToolEnabled） ----
@@ -445,9 +564,9 @@ class McpScopeTest {
     }
 
     @Test fun toToolDefEnabledServerHonorsUserSwitchesOnBuiltinProjectionPath() {
-        // 啟用時與 MCP 投影同鍵同語義：ctx 明關 `mcp.<id>.<tool>` → 內建路徑亦 UNAVAILABLE。
+        // 啟用時與 MCP 投影同鍵同語義：ctx 明關授權鍵（結構化 switchKey）→ 內建路徑亦 UNAVAILABLE。
         val def = McpScope.toToolDef(open, "search")
-        val ctx = ProjectionContext(userSwitches = mapOf("mcp.s1.search" to false))
+        val ctx = ProjectionContext(userSwitches = mapOf(McpScope.switchKey("s1", "search") to false))
         assertEquals(CapabilityLevel.UNAVAILABLE, def.project(ctx).level)
         assertEquals(DenyReason.USER_DISABLED, def.project(ctx).reason)
     }

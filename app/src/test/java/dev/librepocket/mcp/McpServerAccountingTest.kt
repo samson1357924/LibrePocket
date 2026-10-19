@@ -328,4 +328,44 @@ class McpServerAccountingTest {
             web.shutdown()
         }
     }
+
+    // ---- C-08：注入的非單調假時鐘不得把負 latency 直送稽核 ----
+
+    @Test fun injectedBackwardClockLatencyIsClampedToZeroNotNegative() = runBlocking {
+        // NTP 回撥類序列 1000 → 900：end - start < 0。elapsedMs() 一律
+        // coerceAtLeast(0)，latencyMs 與 auditMap 皆為 0（不得為負）。
+        // 使用 DISABLED 短路路徑，無需 mock 伺服器（仍經過兩次 clockMs 呼叫）。
+        val seq = ArrayDeque(listOf(1_000L, 900L, 1_000L, 900L))
+        val s = McpServer(
+            config = McpServerConfig.disabled("s1", "https://mcp.example.com"),
+            keyVault = FakeVault(),
+            clockMs = { seq.removeFirst() },
+        )
+        val list = s.listTools()
+        assertEquals(McpStatus.DISABLED, list.status)
+        assertEquals("回撥不得產出負 latency", 0L, list.latencyMs)
+        assertEquals(0L, list.auditMap()["latencyMs"])
+        val call = s.callTool("search", "{}")
+        assertEquals(McpStatus.DISABLED, call.status)
+        assertEquals("回撥不得產出負 latency（call）", 0L, call.latencyMs)
+        assertEquals(0L, call.auditMap()["latencyMs"])
+    }
+
+    @Test fun serverDefaultClockFieldIsMonotonicUptimeBasedNotWallClock() {
+        // C-08 接線 pin：McpServer 預設時鐘必須實際指向 monotonicClockMs（mutation
+        // 把預設改回 System::currentTimeMillis 時本測紅——單測 monotonicClockMs 抓不到）。
+        val s = McpServer(
+            config = McpServerConfig.disabled("s1", "https://mcp.example.com"),
+            keyVault = FakeVault(),
+        )
+        val field = McpServer::class.java.getDeclaredField("clockMs")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val clock = field.get(s) as () -> Long
+        assertTrue(
+            "McpServer 預設時鐘不得是 epoch 量級（System::currentTimeMillis）：" +
+                "uptime 與 epoch 差值須遠大於 1e6 ms",
+            System.currentTimeMillis() - clock() > 1_000_000L,
+        )
+    }
 }

@@ -25,8 +25,12 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  * `id` 存在（server 呼叫時以 expectedId 數值對應，固定 list=1／call=2）、
  * `result` XOR `error`、request-shaped（含 `method`）一律拒；
  * error 依 code 分類（見 [parseCall]）。HTTP 一問一答配對仍不支援 id 複用
- * （單發單回，不生成隨機 id）；server 路徑（必傳 expectedId）對錯 id 回應
- * 一律 fail-closed 不採納，null expectedId 僅限測試直呼叫。
+ * （單發單回，不生成隨機 id）；server 路徑對錯 id 回應一律 fail-closed 不採納。
+ * **B-07（expectedId 顯式化）**：[parseList]／[parseListPage]／[parseCall] 的
+ * `expectedId` **沒有預設值**——每個呼叫點必須顯式傳值或顯式 `null`
+ * （生產只傳 [LIST_ID]／[CALL_ID]；`null`＝僅驗 id 存在與型別，**僅限測試直呼叫**），
+ * 「放寬語意」不再是可誤觸的預設，由簽名機械強制
+ * （`McpEnvelopeTest.expectedIdHasNoImplicitDefaultOnAnyParserEntryPoint` 釘面）。
  *
  * 修訂立場（#11 Stage2 本 PR 選型，非 Accepted ADR；單一傳輸子集起步）：
  * `2025-11-25` 與 `2026-07-28`（#11 提及的候選修訂號，repo 內無文本）
@@ -599,10 +603,17 @@ internal object McpWire {
     /**
      * 解析 tools/list（僅工具，不含分頁旗標；見 [parseListPage]）。
      * 契約與 [parseListPage] 相同，為既有測試的薄委託。
-     * **生產禁用**：此 API 同時失去 hasMorePages（PARTIAL）與 expectedId 強制
-     *（預設 null 只驗 id 存在），生產呼叫方一律用 [parseListPage]＋[LIST_ID]。
+     * **生產禁用（test-only，B-07 後無預設可誤用）**：此 API 同時失去
+     * hasMorePages（PARTIAL）與 [expectedId] 強制便利——`expectedId` 必須顯式傳
+     * （本入口慣例傳 `null`＝只驗 id 存在與型別）；生產呼叫方一律用
+     * [parseListPage]＋[LIST_ID]（`McpServer.listTools` 是唯一生產 list 呼叫點）。
+     * 可見性：本物件 `internal`，此函在模組外不可見；包內生產碼零呼叫
+     * （人工 grep 維護；zero-wiring gate 不涵蓋此內部 test-only 用法），
+     * KDoc 與簽名雙重宣示 test-only。
+     *
+     * @param expectedId **無預設值（B-07）**——顯式 `null`（測試）或顯式 id 比對值。
      */
-    fun parseList(serverId: String, json: String, expectedId: Long? = null): List<McpTool> =
+    fun parseList(serverId: String, json: String, expectedId: Long?): List<McpTool> =
         parseListPage(serverId, json, expectedId).tools
 
     /**
@@ -661,10 +672,11 @@ internal object McpWire {
      * 驗證順序：`tools` 陣列型別 → `nextCursor` → `tools` 陣列項目內容
      * （cursor 異常與 tools 項目異常同時存在時，`mcp: bad nextCursor` 勝出）。
      *
-     * @param expectedId server 呼叫時傳 [LIST_ID]（數值比對回應 id）；
-     *   null（測試直呼叫）只驗 id 存在與型別。
+     * @param expectedId **無預設值（B-07 顯式化）**：生產（[McpServer.listTools]）
+     *   一律傳 [LIST_ID]（數值比對回應 id，錯 id 回應 fail-closed 不採納）；
+     *   顯式 `null` 只驗 id 存在與型別——**僅限測試直呼叫**，放寬不再是預設。
      */
-    fun parseListPage(serverId: String, json: String, expectedId: Long? = null): McpListPage {
+    fun parseListPage(serverId: String, json: String, expectedId: Long?): McpListPage {
         if (json.length > McpTransport.RESPONSE_MAX_CHARS) {
             throw McpProtocol("mcp: response body exceeds ${McpTransport.RESPONSE_MAX_CHARS} chars")
         }
@@ -834,10 +846,11 @@ internal object McpWire {
      * （DOM depth-1），巢狀同名鍵不得誤判；缺 `result` 即拋
      * IllegalArgumentException（fail-closed）。
      *
-     * @param expectedId server 呼叫時傳 [CALL_ID]（數值比對回應 id）；
-     *   null（測試直呼叫）只驗 id 存在與型別。
+     * @param expectedId **無預設值（B-07 顯式化）**：生產（[McpServer.callTool]）
+     *   一律傳 [CALL_ID]（數值比對回應 id）；顯式 `null` 只驗 id 存在與型別——
+     *   **僅限測試直呼叫**，放寬不再是預設。
      */
-    fun parseCall(json: String, expectedId: Long? = null): Pair<String?, Boolean> {
+    fun parseCall(json: String, expectedId: Long?): Pair<String?, Boolean> {
         if (json.length > McpTransport.RESPONSE_MAX_CHARS) {
             throw McpProtocol("mcp: response body exceeds ${McpTransport.RESPONSE_MAX_CHARS} chars")
         }

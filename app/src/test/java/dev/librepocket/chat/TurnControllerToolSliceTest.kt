@@ -7,6 +7,7 @@ import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol as ProviderProto
+import dev.librepocket.provider.ServerToolTranscript
 import dev.librepocket.provider.StreamEvent
 import dev.librepocket.router.SafeToolSlice
 import dev.librepocket.tool.LspTools
@@ -557,6 +558,181 @@ class TurnControllerToolSliceTest {
         assertEquals(listOf("call-a"), sink.tools.map { it.id })
         assertEquals(1, sink.succeeded.size)
         assertTrue(sink.succeeded.single().second.contains("answered now"))
+    }
+
+    @Test fun emptyTextDeltaContinuationCountsAsMissingFinalAnswer() = runBlocking {
+        // Maintainer P1: an empty TextDelta must NOT satisfy the continuation
+        // final-answer completeness check. The old counter-snapshot check
+        // counted any delta ARRIVAL, so a continuation that streamed
+        // TextDelta("") frames and closed Done finalized a markers-only
+        // "reply" as success. Now the round carries zero final-answer
+        // evidence → the retryable "incomplete tool continuation" failure →
+        // the executed pair is re-attached on the retry (tools=[], no
+        // re-execution) and the turn only succeeds on real visible text.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        var responses = 0
+        provider.handler = { _ ->
+            responses++
+            flow {
+                when (responses) {
+                    1 -> {
+                        emit(
+                            StreamEvent.ToolDone(
+                                toolIndex = 0,
+                                id = "call-a",
+                                name = "lsp.symbols",
+                                argumentsJson = """{"query":"A"}""",
+                            ),
+                        )
+                        emit(StreamEvent.Done("tool_calls"))
+                    }
+                    2 -> {
+                        // Bypass script: deltas ARRIVE but are all empty
+                        // (pre-fix this incremented the arrival counter and
+                        // finalized the markers-only fragment as success).
+                        emit(StreamEvent.TextDelta(0, 0, ""))
+                        emit(StreamEvent.TextDelta(0, 0, ""))
+                        emit(StreamEvent.Done("stop"))
+                    }
+                    else -> {
+                        emit(StreamEvent.TextDelta(0, 0, "answered now"))
+                        emit(StreamEvent.Done("stop"))
+                    }
+                }
+            }
+        }
+        c.send("查 A")
+
+        // The slice executed exactly once; the incomplete continuation forced
+        // a retryable failure that was retried (third provider call), never
+        // final.
+        assertEquals(1, backend.invocations.get())
+        assertEquals(3, provider.seenRequests.size)
+        assertTrue(sink.failedRecords.any { it.error == "incomplete tool continuation" && !it.isFinal })
+        assertTrue(sink.failedRecords.none { it.isFinal })
+        // The retry re-attaches the executed pair (result preserved, tools
+        // stay empty — no re-execution, no second tools offer).
+        val retry = provider.seenRequests[2]
+        assertTrue(retry.tools.isEmpty())
+        assertEquals(listOf("call-a"), retry.messages.filter { it.role == "assistant" }.flatMap { it.toolCalls }.map { it.id })
+        assertEquals(listOf("call-a"), retry.messages.filter { it.role == "tool" }.map { it.toolCallId })
+        // The turn never succeeds with markers-only text: the success row is
+        // the retry attempt's own visible text, not the tool-marker fragment.
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+        assertEquals(listOf("call-a"), sink.tools.map { it.id })
+        assertEquals(1, sink.succeeded.size)
+        assertTrue(sink.succeeded.single().second.contains("answered now"))
+        assertFalse(sink.succeeded.single().second.contains("call-a"))
+        assertFalse(sink.succeeded.single().second.contains("[tool-result:"))
+    }
+
+    @Test fun reasoningOnlyContinuationCountsAsMissingFinalAnswer() = runBlocking {
+        // Maintainer P1 (tightened semantics): a reasoning-only continuation
+        // is not a final answer. Thinking deltas streaming to Done used to
+        // pass the arrival-counter check; now they carry zero final-answer
+        // evidence → the retryable "incomplete tool continuation" failure
+        // engages, and only a retry with real text completes the turn.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        var responses = 0
+        provider.handler = { _ ->
+            responses++
+            flow {
+                when (responses) {
+                    1 -> {
+                        emit(
+                            StreamEvent.ToolDone(
+                                toolIndex = 0,
+                                id = "call-a",
+                                name = "lsp.symbols",
+                                argumentsJson = """{"query":"A"}""",
+                            ),
+                        )
+                        emit(StreamEvent.Done("tool_calls"))
+                    }
+                    2 -> {
+                        emit(StreamEvent.ReasoningDelta(0, 0, "thinking about the answer…"))
+                        emit(StreamEvent.Done("stop"))
+                    }
+                    else -> {
+                        emit(StreamEvent.TextDelta(0, 0, "final answer after thinking"))
+                        emit(StreamEvent.Done("stop"))
+                    }
+                }
+            }
+        }
+        c.send("查 A")
+
+        assertEquals(1, backend.invocations.get())
+        assertEquals(3, provider.seenRequests.size)
+        assertTrue(sink.failedRecords.any { it.error == "incomplete tool continuation" && !it.isFinal })
+        assertTrue(sink.failedRecords.none { it.isFinal })
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+        assertEquals(1, sink.succeeded.size)
+        assertTrue(sink.succeeded.single().second.contains("final answer after thinking"))
+        assertFalse(sink.succeeded.single().second.contains("thinking about the answer"))
+    }
+
+    @Test fun serverToolMarkerDeltaDoesNotSatisfyContinuationEvidence() = runBlocking {
+        // Maintainer P1 (server-tool exclusion): a TextDelta that is only the
+        // `[SERVER_TOOL:…]` web-search marker is not final-answer evidence
+        // either — a continuation closing Done with just the marker must not
+        // succeed. The marker delta rides TextDelta per ServerTools
+        // (ServerToolTranscript.webSearchMarker), so the evidence gate
+        // excludes it explicitly.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        var responses = 0
+        provider.handler = { _ ->
+            responses++
+            flow {
+                when (responses) {
+                    1 -> {
+                        emit(
+                            StreamEvent.ToolDone(
+                                toolIndex = 0,
+                                id = "call-a",
+                                name = "lsp.symbols",
+                                argumentsJson = """{"query":"A"}""",
+                            ),
+                        )
+                        emit(StreamEvent.Done("tool_calls"))
+                    }
+                    2 -> {
+                        emit(StreamEvent.TextDelta(0, 0, ServerToolTranscript.webSearchMarker("started")))
+                        emit(StreamEvent.Done("stop"))
+                    }
+                    else -> {
+                        emit(StreamEvent.TextDelta(0, 0, "real answer now"))
+                        emit(StreamEvent.Done("stop"))
+                    }
+                }
+            }
+        }
+        c.send("查 A")
+
+        assertEquals(1, backend.invocations.get())
+        assertEquals(3, provider.seenRequests.size)
+        assertTrue(sink.failedRecords.any { it.error == "incomplete tool continuation" && !it.isFinal })
+        // The marker delta landed as visible text on the failed (partial)
+        // attempt, but that attempt never became a success.
+        assertTrue(
+            sink.failedRecords.any { !it.isFinal && it.partialText.contains("[SERVER_TOOL:web_search") },
+        )
+        assertEquals(1, sink.succeeded.size)
+        assertTrue(sink.succeeded.single().second.contains("real answer now"))
+        assertFalse(sink.succeeded.single().second.contains("[SERVER_TOOL"))
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
     }
 
     @Test fun continuationAccountingIncludesToolCallsPayloadAndTrims() = runBlocking {

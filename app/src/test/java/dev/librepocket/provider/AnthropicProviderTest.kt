@@ -120,6 +120,53 @@ class AnthropicProviderTest {
     }
 
     @Test
+    fun emptyTextDeltaFrameYieldsNoEvent() {
+        // Empty-delta suppression (parity with ChatCompletions): an empty
+        // text_delta frame yields NO TextDelta — an empty increment must
+        // never pose as final-answer evidence downstream (continuation
+        // completeness, maintainer P1). A following non-empty frame on the
+        // same block still lands (guard, not arm-level mute).
+        val mapper = AnthropicMapper()
+        mapper.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}""",
+        )
+        assertEquals(
+            emptyList<StreamEvent>(),
+            mapper.mapPayload(
+                """{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}""",
+            ),
+        )
+        val real = mapper.mapPayload(
+            """{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"real"}}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "real")), real)
+    }
+
+    @Test
+    fun emptyThinkingDeltaFrameYieldsNoEvent() {
+        // Same suppression on the thinking arm: an empty thinking frame is
+        // dropped (zero payload must not flip the downstream reasoning-source
+        // flag either). The block-start presence marker is unchanged.
+        val mapper = AnthropicMapper()
+        assertEquals(
+            listOf(StreamEvent.ReasoningPresent),
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}""",
+            ),
+        )
+        assertEquals(
+            emptyList<StreamEvent>(),
+            mapper.mapPayload(
+                """{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}""",
+            ),
+        )
+        val real = mapper.mapPayload(
+            """{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reasoning payload"}}""",
+        )
+        assertEquals(listOf(StreamEvent.ReasoningDelta(0, 0, "reasoning payload")), real)
+    }
+
+    @Test
     fun unclosedBlockAtMessageStopFailsRetryable() {
         val mapper = AnthropicMapper()
         mapper.mapPayload(

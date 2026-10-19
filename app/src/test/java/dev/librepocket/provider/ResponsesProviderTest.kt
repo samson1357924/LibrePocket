@@ -106,6 +106,45 @@ class ResponsesProviderTest {
     }
 
     @Test
+    fun emptyOutputTextDeltaFrameYieldsNoEvent() {
+        // Empty-delta suppression (parity with ChatCompletions): an empty
+        // frame yields NO TextDelta — an empty increment must never pose as
+        // final-answer evidence downstream (continuation completeness,
+        // maintainer P1). A following non-empty frame still lands (the guard
+        // only mutes the empty frame, not the arm).
+        val mapper = ResponsesMapper()
+        assertEquals(
+            emptyList<StreamEvent>(),
+            mapper.mapPayload(
+                """{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":""}""",
+            ),
+        )
+        val real = mapper.mapPayload(
+            """{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"real"}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "real")), real)
+    }
+
+    @Test
+    fun emptyReasoningDeltaFrameYieldsNoEvent() {
+        // Same suppression on the reasoning arm: an empty reasoning frame is
+        // dropped (zero payload must not flip the downstream reasoning-source
+        // flag either).
+        val mapper = ResponsesMapper()
+        assertEquals(
+            emptyList<StreamEvent>(),
+            mapper.mapPayload(
+                """{"type":"response.reasoning_summary_text.delta","output_index":1,"content_index":0,"delta":""}""",
+            ),
+        )
+        val real = mapper.mapPayload(
+            """{"type":"response.reasoning_summary_text.delta","output_index":1,"content_index":0,"delta":"summarized"}""",
+        )
+        assertEquals(1, real.size)
+        assertEquals(StreamEvent.ReasoningDelta(0, 1000, "summarized"), real.single())
+    }
+
+    @Test
     fun opaqueFieldsNeverSurfaceAsEvents() {
         val events = replayFixture()
         for (e in events) {

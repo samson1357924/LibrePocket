@@ -237,13 +237,20 @@ internal class ResponsesMapper(val round: Int = 0) {
         when (type) {
             "response.output_text.delta" -> {
                 val delta = root.string("delta") ?: return emptyList()
-                out.add(StreamEvent.TextDelta(round, blockOf(root), delta))
+                // Empty-delta suppression (parity with ChatCompletions): an
+                // empty frame yields NO event, so it can never park an empty
+                // block in the UI or masquerade as final-answer evidence
+                // downstream (continuation completeness, maintainer P1).
+                if (delta.isNotEmpty()) out.add(StreamEvent.TextDelta(round, blockOf(root), delta))
             }
             "response.reasoning_summary_text.delta",
             "response.reasoning_text.delta",
             -> {
                 val delta = root.string("delta") ?: return emptyList()
-                out.add(StreamEvent.ReasoningDelta(round, blockOf(root), delta))
+                // Same suppression: an empty reasoning frame would flip the
+                // reasoning-source flag downstream (hasReasoning) with zero
+                // payload; it is dropped here instead.
+                if (delta.isNotEmpty()) out.add(StreamEvent.ReasoningDelta(round, blockOf(root), delta))
             }
             "response.output_item.added" -> {
                 val item = root.obj("item") ?: return emptyList()

@@ -311,11 +311,19 @@ internal class AnthropicMapper(val round: Int = 0) {
                     "text_delta" -> {
                         val t = delta.string("text") ?: return emptyList()
                         if (block.kind == BlockKind.OTHER) block.kind = BlockKind.TEXT
-                        out.add(StreamEvent.TextDelta(round, index, t))
+                        // Empty-delta suppression (parity with
+                        // ChatCompletions): an empty frame yields NO event —
+                        // it must not count as final-answer evidence
+                        // downstream (continuation completeness, maintainer
+                        // P1). Block-kind bookkeeping above is unchanged.
+                        if (t.isNotEmpty()) out.add(StreamEvent.TextDelta(round, index, t))
                     }
                     "thinking_delta" -> {
                         val t = delta.string("thinking") ?: return emptyList()
-                        out.add(StreamEvent.ReasoningDelta(round, index, t))
+                        // Same suppression: an empty reasoning frame would
+                        // flip the reasoning-source flag downstream with zero
+                        // payload; it is dropped here instead.
+                        if (t.isNotEmpty()) out.add(StreamEvent.ReasoningDelta(round, index, t))
                     }
                     "signature_delta" -> out.add(StreamEvent.ReasoningPresent) // presence marker only; never displayed, never persisted
                     "input_json_delta" -> {

@@ -232,9 +232,9 @@ not OR-converged copies — pinned per test in `SkillInstallTest`:
 `nameMismatchRejected` (`NAME_MISMATCH`), and
 `filesAndZipShareSameValidation_unknownToolRejected` (`UNKNOWN_TOOL`; files
 and zips share one validation path, so a rejected ref-name rejects both). The
-current head (fail-closed destRoot probe + restore content proof, commit
-`cddc030a`) additionally pins in `SkillStartupRecoveryTest`: the destRoot
-probe `isSymlinkOrUnknown` treats undecidable attributes as unsafe
+fail-closed destRoot probe and restore content proof are additionally
+pinned in `SkillStartupRecoveryTest`: the destRoot probe
+`isSymlinkOrUnknown` treats undecidable attributes as unsafe
 (install into a nonexistent destRoot still succeeds; a cleanup on a
 symlink/unknown destRoot is a no-op — `cleanup_symlinkDestRoot_isNoop` — and
 `listResiduals_symlinkDestRoot_isEmpty` lists nothing), symlink classification
@@ -270,9 +270,18 @@ every XML file is readable, `tests > 0`, `failures == 0`, `errors == 0`, and
 every suite's counters exactly equal its direct `<testcase>` detail, counting
 `skipped` cases separately and surfacing them (with per-suite mismatches,
 empty or contradictory totals, or unreadable files forcing `INCOMPLETE` /
-`PARTIAL` / `NO_RESULTS` instead). It therefore refuses to print `PASS` for a
-run whose results are incomplete — a red, skip, parser gap, or truncated
-report cannot be laundered into a green claim by the reporter.
+`PARTIAL` / `NO_RESULTS` instead). `PASS` therefore means "no failures or
+errors among the executed tests"; it does not require zero skips. Those
+skips are disclosed rather than laundered: the report carries a separate
+`skipped` metric row, lists every skipped case by ident under a
+`**Skipped tests (N):**` heading (a truncated tail is replaced by an
+explicit "omitted N failures / M skips; see XML artifact" notice —
+never a silent drop), and the suite's own
+`test_summarize_junit.py:test_long_skipped_ident_is_truncated` pins a run
+with 1 skipped still rendering `PASS`, while a suite whose `skipped`
+counter contradicts its skipped `<testcase>` detail is `INCOMPLETE`. Whether
+the skip count should additionally block an overall green claim is a
+reviewer-side judgment on the report, not an assertion the reporter makes.
 
 ## Local commands
 

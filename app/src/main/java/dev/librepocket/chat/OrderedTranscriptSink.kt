@@ -446,7 +446,6 @@ class OrderedTranscriptSink(
             throw e
           }
         } catch (e: Exception) {
-        } catch (e: Exception) {
           // Durable core failure (e.g. store IOException): fail this entry's
           // ack explicitly; the writer itself stays alive for later entries.
           // Notice entries carry no ack, so this stays best-effort for them.

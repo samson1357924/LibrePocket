@@ -54,15 +54,23 @@ import kotlin.coroutines.coroutineContext
 import kotlin.jvm.Volatile
 
 /**
- * The sole retry budget for one logical turn (at most 3 retries / 4 requests).
- * Provider adapters make one classified attempt and never multiply this budget.
+ * The sole retry budget for one logical turn: at most 3 retries after a
+ * failing attempt (4 provider requests for a plain chat turn). Provider
+ * adapters make one classified attempt and never multiply this budget.
+ *
+ * P2 tool-slice path: a turn that executes the safe tool slice can issue up
+ * to 5 provider requests — the initial tool request, the same-turn
+ * continuation, and up to 3 retries of the frozen-pair continuation. The
+ * retry budget itself is unchanged (3 retries after the failing request);
+ * the extra request is the initial tool round, not an extra retry. Pinned by
+ * `TurnControllerToolSliceTest.slicePathIssuesAtMostFiveProviderRequests`.
  */
 data class TurnRetryConfig(
   val maxRetries: Int = 3,
   val retryDelaysMs: List<Long> = listOf(2_000L, 4_000L, 8_000L),
 ) {
   init {
-    require(maxRetries in 0..3) { "a turn may make at most four provider attempts" }
+    require(maxRetries in 0..3) { "a turn may configure at most three retries" }
   }
 
   /** 1-based retry index → delay. Extra retry indices reuse the last delay. */
@@ -274,8 +282,11 @@ internal enum class DurableAdmission {
  * (marker text + [TranscriptSink.onToolDone]) so tool calls are never dropped,
  * [StreamEvent.Usage] is recorded ([TranscriptSink.onUsage] + [lastUsage]).
  * Retry ownership is here: each retryable terminal failure gets a new runId
- * and isolated assistant/tool aggregation, with at most four provider attempts
- * per logical turn.
+ * and isolated assistant/tool aggregation. The retry budget allows at most
+ * four requests per logical turn (the failing request + 3 retries); the P2
+ * tool-slice path spends that budget on the continuation and its retries,
+ * with the initial tool round as the extra request (up to five — see
+ * [TurnRetryConfig]).
  *
  * Records-only default (production: toolSlice=null): without a loop this
  * controller records ToolDone only and never executes tools. Projection
@@ -4775,16 +4786,12 @@ class TurnController(
             // re-attach the frozen executed pair with `tools=[]`. The provider
             // sees the already-executed result; no re-execution, no second
             // tools offer.
-            // Phase-1 residual (recorded, separate design round —
-            // attempt-level semantics): this retry attempt has NO
-            // completeness gate of its own — if it yields no ToolDone and no
-            // final-answer evidence, a Done terminal still finalizes like a
-            // plain empty reply (the `contOutcome.finalAnswerEvidence == 0`
-            // gate below runs only for a NEW executed tool round, not for
-            // the re-attached frozen pair). The direction stays
-            // conservative: the executed result rides unchanged and nothing
-            // re-executes; a richer retry-completeness policy needs its own
-            // design round.
+            // Completeness invariant: a frozen-pair retry is a continuation
+            // too and is held to the same final-answer evidence bar as the
+            // first continuation (the post-collect gate below): a Done with
+            // zero non-blank visible text fails retryable instead of
+            // finalizing an empty assistant row. The executed result still
+            // rides unchanged and nothing re-executes.
             buildToolContinuation(images, executedSliceCalls, executedSliceResults, toolSlice)
           } else {
             buildRequest(images, allowTools = !sliceExecutedThisTurn)
@@ -4797,6 +4804,19 @@ class TurnController(
         )
         failed = streamOutcome.failed
         done = streamOutcome.done
+        // P2 slice: a frozen-pair retry is a continuation too. Symmetric with
+        // the first-continuation gate below: Done without visible final-answer
+        // evidence (invisible-only TextDeltas — blank, control, or format
+        // characters — plus reasoning-only, server-tool markers, and
+        // record-only ToolDones) is an incomplete continuation, never a
+        // successful empty reply. Only
+        // applies after a slice executed; the first executed round's
+        // continuation is gated via contOutcome.finalAnswerEvidence below.
+        if (failed == null && done && sliceExecutedThisTurn &&
+            toolState.finalAnswerEvidence == 0
+        ) {
+          failed = StreamEvent.Failed("incomplete tool continuation", retryable = true)
+        }
         // P2 slice (default-off): same-turn tool continuation for the single
         // wired tool. Cancel between collect and execution aborts here with
         // zero further effects (ensureActive + the loop's own checks throw
@@ -4842,12 +4862,14 @@ class TurnController(
             // A tool round that yields no final answer is not a complete
             // success; force retry/terminal handling instead of silently
             // finalizing an empty/partial fragment. Evidence is gated to
-            // NON-EMPTY visible text that is not a server-tool marker
-            // (ToolAggState.finalAnswerEvidence — maintainer P1): an empty
-            // TextDelta, a web-search marker delta, or a reasoning-only
-            // stream no longer satisfies the check; a zero-evidence round —
-            // including the pre-existing zero-EVENT round — fails retryable
-            // here exactly as before.
+            // NON-BLANK, visible text that is not a server-tool marker
+            // (ToolAggState.finalAnswerEvidence — maintainer P1): an
+            // invisible-only TextDelta (whitespace including non-breaking
+            // spaces, C0/C1 controls, Unicode format characters such as
+            // ZWSP/BOM), a web-search marker
+            // delta, or a reasoning-only stream no longer satisfies the
+            // check; a zero-evidence round — including the pre-existing
+            // zero-EVENT round — fails retryable here exactly as before.
             failed = StreamEvent.Failed("incomplete tool continuation", retryable = true)
           }
         }
@@ -5096,8 +5118,10 @@ class TurnController(
    * with fresh counters.
    *
    * Continuation final-answer evidence ([finalAnswerEvidence]): count of
-   * non-empty, non-server-tool-marker TextDeltas. Empty deltas and
-   * `[SERVER_TOOL:…]` markers are not visible final-answer text, and
+   * visible, non-server-tool-marker TextDeltas. Invisible deltas (blank,
+   * C0/C1 controls, Unicode format characters — see
+   * [hasVisibleAnswerText]) and `[SERVER_TOOL:…]` markers are not visible
+   * final-answer text, and
    * Reasoning Deltas do NOT count (a reasoning-only continuation is not a
    * final answer). Consumed only by the continuation completeness check in
    * [runTurnLoop]; the lifetime arrival counter stays untouched (cost-metric
@@ -5114,9 +5138,10 @@ class TurnController(
     val seenCallIds: MutableSet<String> = mutableSetOf(),
     /**
      * Evidence that the continuation produced a final answer: count of
-     * non-empty, non-server-tool-marker TextDeltas. Reasoning deltas do NOT
-     * count (a reasoning-only continuation is not a final answer). Consumed
-     * only by the continuation completeness check.
+     * visible, non-server-tool-marker TextDeltas (invisible-only deltas —
+     * blank, control, or Unicode format characters — do not count).
+     * Reasoning deltas do NOT count (a reasoning-only continuation is not a
+     * final answer). Consumed only by the continuation completeness check.
      */
     var finalAnswerEvidence: Int = 0,
   )
@@ -5340,10 +5365,58 @@ class TurnController(
   }
 
   /**
+   * True when [text] contains at least one character a user could see as
+   * final-answer content.
+   *
+   * Continuation evidence must not be satisfied by invisible frames:
+   * whitespace/space separators (including non-breaking spaces), C0/C1
+   * controls, Unicode `Cf` format characters (ZWSP, BOM, LRM/RLM, ...), and
+   * default-ignorable/blank fillers (variation selectors, combining
+   * grapheme joiner, Hangul fillers, braille blank) are not visible answer
+   * text. Iteration is by code point so supplementary-plane visible
+   * characters (emoji, CJK extensions) still count. The direction is
+   * fail-closed: an invisible-only delta leaves the continuation at zero
+   * evidence, so it retries instead of finalizing an empty assistant row.
+   */
+  private fun hasVisibleAnswerText(text: String): Boolean {
+    var i = 0
+    while (i < text.length) {
+      val codePoint = text.codePointAt(i)
+      val type = Character.getType(codePoint)
+      if (!Character.isWhitespace(codePoint) &&
+        !Character.isSpaceChar(codePoint) &&
+        !Character.isISOControl(codePoint) &&
+        type != Character.FORMAT.toInt() &&
+        !isDefaultIgnorableOrBlank(codePoint)
+      ) {
+        return true
+      }
+      i += Character.charCount(codePoint)
+    }
+    return false
+  }
+
+  /**
+   * Default-ignorable or visually blank code points outside the `Cf`
+   * (format), whitespace, and control categories: variation selectors,
+   * combining grapheme joiner, Hangul fillers, Khmer inherent vowels, and
+   * the braille blank. Excluding them keeps an invisible-only delta from
+   * counting as final-answer evidence while visible base characters in the
+   * same grapheme still count.
+   */
+  private fun isDefaultIgnorableOrBlank(codePoint: Int): Boolean = when (codePoint) {
+    0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800, 0x3164, 0xFFA0 -> true
+    in 0x180B..0x180F -> true
+    in 0xFE00..0xFE0F -> true
+    in 0xE0100..0xE01EF -> true
+    else -> false
+  }
+
+  /**
    * Shared stream-event collect for the attempt loop and the P2 tool
    * continuation. Text/reasoning deltas run the shared per-attempt
    * visible-text budget ([ToolAggState.visibleTextChars] +
-   * [requireTurnTextBudget]); non-empty, non-server-tool-marker TextDeltas
+   * [requireTurnTextBudget]); visible, non-server-tool-marker TextDeltas
    * additionally accumulate [ToolAggState.finalAnswerEvidence] (the
    * continuation completeness input — ReasoningDelta is never evidence);
    * Usage events merge into the per-attempt
@@ -5383,10 +5456,12 @@ class TurnController(
             requireTurnTextBudget(state.visibleTextChars, event.delta.length)
             state.visibleTextChars += event.delta.length
             _streamedTextDeltaCount.incrementAndGet()
-            // Continuation final-answer evidence: only NON-EMPTY visible text
-            // that is not a `SERVER_TOOL` marker counts — an empty TextDelta
-            // or a web-search marker frame (`\n[SERVER_TOOL:web_search …]\n`,
-            // see ServerToolTranscript.webSearchMarker) is not a final answer.
+            // Continuation final-answer evidence: only visible text (not
+            // blank/control/format-only — see hasVisibleAnswerText) that is
+            // not a `SERVER_TOOL` marker counts — an invisible-only
+            // TextDelta or a web-search marker frame
+            // (`\n[SERVER_TOOL:web_search …]\n`, see
+            // ServerToolTranscript.webSearchMarker) is not a final answer.
             // Reasoning Deltas below never count (reasoning-only continuation
             // is not a final answer). The lifetime counter above and the
             // budget accounting stay untouched (cost-metric contracts).
@@ -5397,7 +5472,7 @@ class TurnController(
             // yield a false-incomplete retry. The over-exclusion direction is
             // fail-closed (never a false complete) and is the accepted Phase-1
             // trade-off; splitting a merged text+marker delta is future work.
-            if (event.delta.isNotEmpty() && !ServerToolTranscript.isServerToolMarker(event.delta)) {
+            if (hasVisibleAnswerText(event.delta) && !ServerToolTranscript.isServerToolMarker(event.delta)) {
               state.finalAnswerEvidence++
             }
             appendAssistantText(attemptRunId, event.delta)
@@ -5554,8 +5629,8 @@ class TurnController(
    * the updated per-attempt tool total, and the [ToolAggState.finalAnswerEvidence]
    * accumulated in this continuation round — the completeness input for
    * runTurnLoop's "incomplete tool continuation" failure (evidence counts
-   * non-empty, non-server-tool-marker visible TextDeltas only; a
-   * zero-evidence round, including the pre-existing zero-EVENT round, is
+   * visible, non-server-tool-marker TextDeltas only; a zero-evidence round,
+   * including invisible-only and the pre-existing zero-EVENT rounds, is
    * never a completed final answer).
    */
   private data class ContinuationOutcome(

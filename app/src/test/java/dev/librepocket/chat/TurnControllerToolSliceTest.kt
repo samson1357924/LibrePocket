@@ -193,6 +193,86 @@ class TurnControllerToolSliceTest {
     private fun ChatRequest.toolResultTexts(): List<String> =
         messages.filter { it.role == "tool" }.map { it.text }
 
+    /**
+     * Asserts the wire-side one-round budget and frozen-pair re-attachment:
+     * the first request offers exactly the slice tool; every later request
+     * (continuations and post-execution retries alike) carries no tools and
+     * re-attaches the same executed call id + paired result text.
+     */
+    private fun assertFrozenPairRequests(requests: List<ChatRequest>) {
+        assertTrue("expected the tool round plus at least one continuation", requests.size >= 2)
+        assertEquals(listOf("lsp.symbols"), requests.first().tools.map { it.name })
+        val expectedCalls = requests[1].messages.filter { it.role == "assistant" }.flatMap { it.toolCalls }
+        assertEquals("the executed round must freeze exactly one call", 1, expectedCalls.size)
+        val expectedResults = requests[1].toolResultTexts()
+        assertEquals("the executed round must pair exactly one result", 1, expectedResults.size)
+        requests.drop(1).forEachIndexed { index, request ->
+            val requestNo = index + 2
+            assertTrue("request $requestNo must carry no tools", request.tools.isEmpty())
+            assertEquals(
+                "request $requestNo must re-attach exactly the frozen call (id/name/args)",
+                expectedCalls,
+                request.messages.filter { it.role == "assistant" }.flatMap { it.toolCalls },
+            )
+            assertEquals(
+                "request $requestNo must pair exactly the frozen executed result",
+                listOf("call-a"),
+                request.messages.filter { it.role == "tool" }.map { it.toolCallId },
+            )
+            assertEquals(
+                "request $requestNo must carry the frozen result text unchanged",
+                expectedResults,
+                request.toolResultTexts(),
+            )
+        }
+    }
+
+    /** Non-final records for every failed attempt, one final record on exhaustion. */
+    private fun assertFailedRecordShape(sink: SliceSink, error: String) {
+        assertEquals(4, sink.failedRecords.size)
+        assertEquals(3, sink.failedRecords.count { !it.isFinal })
+        assertTrue("the last record must be the final failure", sink.failedRecords.last().isFinal)
+        assertTrue(
+            "every failed record must carry the gate error: ${sink.failedRecords.map { it.error }}",
+            sink.failedRecords.all { it.error == error },
+        )
+    }
+
+    /** One executed tool round: the wired call followed by its Done. */
+    private fun toolRoundFlow() = flow {
+        emit(
+            StreamEvent.ToolDone(
+                toolIndex = 0,
+                id = "call-a",
+                name = "lsp.symbols",
+                argumentsJson = """{"query":"A"}""",
+            ),
+        )
+        emit(StreamEvent.Done("tool_calls"))
+    }
+
+    /** A text-only stop response (no deltas by default). */
+    private fun doneStopFlow(vararg deltas: String) = flow {
+        deltas.forEach { emit(StreamEvent.TextDelta(0, 0, it)) }
+        emit(StreamEvent.Done("stop"))
+    }
+
+    /** Retryable provider failure used to reach a post-execution retry. */
+    private fun retryableFailureFlow(message: String = "flaky continuation") = flow {
+        emit(StreamEvent.Failed(message, retryable = true))
+    }
+
+    /**
+     * Scripts [responses] in order; requests past the list repeat the last
+     * one (so an unexpected extra request cannot crash the test instead of
+     * failing an assertion).
+     */
+    private fun SliceProvider.script(vararg responses: Flow<StreamEvent>) {
+        require(responses.isNotEmpty()) { "script needs at least one response" }
+        var i = 0
+        handler = { responses[minOf(i++, responses.lastIndex)] }
+    }
+
     @Test fun happyRoundTripPairsCallIdToFinalAnswer() = runBlocking {
         val provider = SliceProvider()
         val sink = SliceSink()
@@ -558,6 +638,243 @@ class TurnControllerToolSliceTest {
         assertEquals(listOf("call-a"), sink.tools.map { it.id })
         assertEquals(1, sink.succeeded.size)
         assertTrue(sink.succeeded.single().second.contains("answered now"))
+    }
+
+    @Test fun postExecutionRetryEmptyDoneNeverSucceeds() = runBlocking {
+        // Post-execution retries are continuations too: a retry that closes
+        // Done with no visible text must never finalize as an empty success.
+        // The retry budget is 3, so the turn makes 5 provider requests total
+        // (tool round + first continuation + 3 retries) and terminates ERROR.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        provider.script(
+            toolRoundFlow(),
+            doneStopFlow(),
+            doneStopFlow(),
+            doneStopFlow(),
+            doneStopFlow(),
+        )
+        c.send("查 A")
+
+        assertEquals(1, backend.invocations.get())
+        assertEquals(5, provider.seenRequests.size)
+        assertFrozenPairRequests(provider.seenRequests)
+        assertTrue(sink.succeeded.isEmpty())
+        assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+        assertFailedRecordShape(sink, "incomplete tool continuation")
+    }
+
+    @Test fun firstContinuationInvisibleOnlyTextDoesNotSucceed() = runBlocking {
+        // The first same-turn continuation is held to the same visible-text
+        // bar as frozen-pair retries. Every invisible-only variant (Unicode
+        // whitespace including NBSP/em-space, C0/C1 controls, Cf format
+        // chars such as ZWSP/BOM/LRM, and default-ignorable/blank fillers)
+        // must force a retry; the retry with visible text then completes the
+        // turn.
+        val invisibleVariants = listOf(
+            " \n\t ",
+            "\u00A0\u2003\u2007\u202F",
+            "\u200B\uFEFF\u200E\u200F",
+            "\u0000\u0007\u0085\u009F",
+            "\uFE0F\u034F\u2800\u115F",
+        )
+        invisibleVariants.forEach { invisible ->
+            val provider = SliceProvider()
+            val sink = SliceSink()
+            val backend = CountingBackend()
+            val pol = slicePolicy()
+            val c = controller(provider, pol, sink, loop(pol, backend))
+            provider.script(
+                toolRoundFlow(),
+                doneStopFlow(invisible),
+                doneStopFlow("answered now"),
+            )
+            c.send("查 A")
+
+            assertEquals(1, backend.invocations.get())
+            assertEquals(3, provider.seenRequests.size)
+            assertFrozenPairRequests(provider.seenRequests)
+            assertEquals(
+                "invisible-only continuation must retry: ${invisible.map { it.code }}",
+                ChatStatus.IDLE,
+                c.uiState.value.status,
+            )
+            assertEquals(1, sink.succeeded.size)
+            assertTrue(sink.succeeded.single().second.contains("answered now"))
+            assertTrue(
+                "first continuation must be recorded as incomplete",
+                sink.failedRecords.any { !it.isFinal && it.error == "incomplete tool continuation" },
+            )
+            assertTrue(sink.failedRecords.none { it.isFinal })
+        }
+    }
+
+    @Test fun supplementaryPlaneVisibleTextCountsAsEvidence() = runBlocking {
+        // Evidence iterates by code point, not UTF-16 unit: an emoji-only or
+        // CJK-Ext-B-only answer is visible text and must finalize on the
+        // first continuation (no spurious incomplete retry).
+        listOf("\uD83D\uDE00", "\uD840\uDC00").forEach { visible ->
+            val provider = SliceProvider()
+            val sink = SliceSink()
+            val backend = CountingBackend()
+            val pol = slicePolicy()
+            val c = controller(provider, pol, sink, loop(pol, backend))
+            provider.script(toolRoundFlow(), doneStopFlow(visible))
+            c.send("查 A")
+
+            assertEquals(1, backend.invocations.get())
+            assertEquals(2, provider.seenRequests.size)
+            assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+            assertEquals(1, sink.succeeded.size)
+            assertTrue(sink.succeeded.single().second.contains(visible))
+            assertTrue(sink.failedRecords.isEmpty())
+        }
+    }
+
+    @Test fun postExecutionRetryInvisibleOnlyDoesNotSucceed() = runBlocking {
+        // Same predicate on frozen-pair retries: invisible-only TextDeltas
+        // are not evidence in any encoding form; a marker-only retry is not
+        // either. Both exhaust the retry budget to a terminal ERROR.
+        suspend fun assertRetryNeverSucceeds(retry: Flow<StreamEvent>) {
+            val provider = SliceProvider()
+            val sink = SliceSink()
+            val backend = CountingBackend()
+            val pol = slicePolicy()
+            val c = controller(provider, pol, sink, loop(pol, backend))
+            provider.script(
+                toolRoundFlow(),
+                retryableFailureFlow(),
+                retry,
+                doneStopFlow(),
+                doneStopFlow(),
+            )
+            c.send("查 A")
+
+            assertEquals(1, backend.invocations.get())
+            assertEquals(5, provider.seenRequests.size)
+            assertFrozenPairRequests(provider.seenRequests)
+            assertTrue(sink.succeeded.isEmpty())
+            assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+            assertEquals(4, sink.failedRecords.size)
+            assertEquals(3, sink.failedRecords.count { !it.isFinal })
+            assertTrue(sink.failedRecords.last().isFinal)
+            assertEquals("incomplete tool continuation", sink.failedRecords.last().error)
+        }
+
+        assertRetryNeverSucceeds(doneStopFlow(" \n\t "))
+        assertRetryNeverSucceeds(doneStopFlow("\u00A0\u2003\u2007\u202F"))
+        assertRetryNeverSucceeds(doneStopFlow("\u200B\uFEFF\u200E\u200F"))
+        assertRetryNeverSucceeds(doneStopFlow("\u0000\u0007\u0085\u009F"))
+        assertRetryNeverSucceeds(doneStopFlow("\uFE0F\u034F\u2800\u115F"))
+        assertRetryNeverSucceeds(
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, ServerToolTranscript.webSearchMarker("started")))
+                emit(StreamEvent.Done("stop"))
+            },
+        )
+    }
+
+    @Test fun postExecutionRetryRecordOnlyToolDoneDoesNotSucceed() = runBlocking {
+        // A post-execution retry may re-emit a ToolDone. It is recorded only
+        // (one round per turn) and is not final-answer evidence, so Done with
+        // no visible text must still fail as an incomplete continuation.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        provider.script(
+            toolRoundFlow(),
+            retryableFailureFlow(),
+            flow {
+                emit(
+                    StreamEvent.ToolDone(
+                        toolIndex = 0,
+                        id = "call-b",
+                        name = "lsp.symbols",
+                        argumentsJson = """{"query":"B"}""",
+                    ),
+                )
+                emit(StreamEvent.Done("stop"))
+            },
+            doneStopFlow(),
+            doneStopFlow(),
+        )
+        c.send("查 A")
+
+        assertEquals(1, backend.invocations.get())
+        assertEquals(5, provider.seenRequests.size)
+        assertFrozenPairRequests(provider.seenRequests)
+        // First execution + the record-only re-emission, never a re-run.
+        assertEquals(listOf("call-a", "call-b"), sink.tools.map { it.id })
+        assertTrue(sink.succeeded.isEmpty())
+        assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+        assertEquals(4, sink.failedRecords.size)
+        assertEquals(3, sink.failedRecords.count { !it.isFinal })
+        assertTrue(sink.failedRecords.last().isFinal)
+        assertEquals("incomplete tool continuation", sink.failedRecords.last().error)
+    }
+
+    @Test fun slicePathIssuesAtMostFiveProviderRequests() = runBlocking {
+        // Budget pin for TurnRetryConfig's KDoc: initial tool request + the
+        // same-turn continuation + 3 retries = 5 provider requests. A
+        // retryable continuation failure on every attempt must terminate
+        // ERROR instead of issuing a sixth request, and the slice never
+        // re-executes.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        provider.script(
+            toolRoundFlow(),
+            retryableFailureFlow(),
+            retryableFailureFlow(),
+            retryableFailureFlow(),
+            retryableFailureFlow(),
+        )
+        c.send("查 A")
+
+        assertEquals(1, backend.invocations.get())
+        assertEquals(5, provider.seenRequests.size)
+        assertFrozenPairRequests(provider.seenRequests)
+        assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+        assertTrue(sink.succeeded.isEmpty())
+        val final = sink.failedRecords.last()
+        assertTrue(final.isFinal)
+        assertEquals("flaky continuation", final.error)
+    }
+
+    @Test fun lastAllowedPostExecutionRetryCanStillSucceed() = runBlocking {
+        // Symmetric to the budget pin: the last allowed retry is a real
+        // attempt. Three retryable failures (first continuation + retries
+        // 1-2) must not pre-emptively terminalize; retry 3's visible answer
+        // finalizes IDLE with the frozen pair still on every request.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        provider.script(
+            toolRoundFlow(),
+            retryableFailureFlow("flaky-1"),
+            retryableFailureFlow("flaky-2"),
+            retryableFailureFlow("flaky-3"),
+            doneStopFlow("recovered on the last retry"),
+        )
+        c.send("查 A")
+
+        assertEquals(1, backend.invocations.get())
+        assertEquals(5, provider.seenRequests.size)
+        assertFrozenPairRequests(provider.seenRequests)
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+        assertEquals(1, sink.succeeded.size)
+        assertTrue(sink.succeeded.single().second.contains("recovered on the last retry"))
+        assertEquals(3, sink.failedRecords.count { !it.isFinal })
+        assertTrue(sink.failedRecords.none { it.isFinal })
     }
 
     @Test fun emptyTextDeltaContinuationCountsAsMissingFinalAnswer() = runBlocking {

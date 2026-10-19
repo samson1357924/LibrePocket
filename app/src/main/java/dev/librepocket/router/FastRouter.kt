@@ -288,6 +288,10 @@ class FastRouter(
                 .maxByOrNull { m -> m.value.count { it.isDigit() } }
                 ?.value
 
+        // RFC-8259-complete escape encoder (C0 + quote + backslash), mirroring
+        // dev.librepocket.mcp.McpWire.esc (which additionally escapes lone
+        // surrogates). Control-char rule changes must be made in BOTH, or
+        // extract a shared helper — do not silently diverge.
         private fun esc(text: String): String = buildString {
             for (c in text) {
                 when (c) {

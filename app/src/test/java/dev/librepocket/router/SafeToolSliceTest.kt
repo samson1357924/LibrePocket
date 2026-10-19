@@ -338,6 +338,40 @@ class SafeToolSliceTest {
         assertEquals(0, backend.invocations.get())
     }
 
+    @Test fun pathPrefixTrustedFormPinCoversFullPredicateSet() = runBlocking {
+        // Coverage completion for the shared deny predicate: the traversal
+        // block above pins `..`, leading `/`, backslash and NUL; these inputs
+        // pin the remaining isSafeInput/NFKC elements — each denied by a
+        // distinct condition that no other pin covers today.
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        val bad = listOf(
+            // `a%2e%2e`: NFKC-stable ASCII; no literal `..` anywhere, so the
+            // percent branch of isSafeInput is the discriminating denial.
+            """{"query":"Foo","pathPrefix":"a%2e%2e"}""",
+            // `a\u0001b`: not NUL; the non-NUL ISO-control branch denies
+            // (the NUL pin above does not reach this path).
+            "{\"query\":\"Foo\",\"pathPrefix\":\"a\\u0001b\"}",
+            // `a\uFF05b` (fullwidth `％` U+FF05): NFKC-normalizes to `a%b`,
+            // so the NFKC-equality check denies before isSafeInput — no
+            // literal `%`/ISO-control needed.
+            "{\"query\":\"Foo\",\"pathPrefix\":\"a\\uFF05b\"}",
+        )
+        for ((i, args) in bad.withIndex()) {
+            val r = s.execute(listOf(call(args = args, id = "trust-$i"))).single()
+            assertTrue(args, r.denied)
+            assertEquals(args, SafeToolSlice.DenyCodes.SCHEMA_INVALID, r.denyCode)
+        }
+        assertEquals(0, backend.invocations.get())
+        // Benign buffer: the plain relative scope still runs, so the pins
+        // discriminate the predicate rather than a blanket deny.
+        val ok = s.execute(
+            listOf(call(args = """{"query":"Foo","pathPrefix":"a/b"}""", id = "trust-ok")),
+        ).single()
+        assertFalse(ok.denied)
+        assertEquals(1, backend.invocations.get())
+    }
+
     @Test fun pathPrefixBenignValuesPass() = runBlocking {
         val backend = CountingBackend()
         val s = slice(backend = backend)
@@ -689,6 +723,41 @@ class SafeToolSliceTest {
         // No nested structure may survive the fan-close.
         assertFalse(echo.contains("["))
         assertFalse(echo.contains("]"))
+    }
+
+    @Test fun continuationArgsEchoRedactsSecretNamedMembers() = runBlocking {
+        // Isolated key/value redaction cannot catch secret-keyed members: a
+        // bare key name never matches the secret rules (they need a `:`/`=`)
+        // and a plain value carries no secret shape — so the structural walk
+        // must be KEY-AWARE and collapse their string values to the fixed
+        // receipt, while non-secret members keep the normal (identity here)
+        // walk. Values are gitleaks-safe low-entropy fixtures.
+        val s = slice()
+        val calls = listOf(
+            call(
+                id = "call-1",
+                args = """{"query":"q","creds":{"password":"simplevalue2","api_key":"AlphaBetaGamma42","note":"plain note"}}""",
+            ),
+        )
+        val msgs = s.continuationMessages(calls, listOf(SafeToolSlice.ToolResult("call-1", "n", "{}")))
+        val echo = msgs[0].toolCalls.single().argumentsJson
+        assertFalse(echo.contains("simplevalue2"))
+        assertFalse(echo.contains("AlphaBetaGamma42"))
+        assertTrue(echo.contains("⟦REDACTED⟧"))
+        // Non-secret members still echo normally.
+        assertTrue(echo.contains("plain note"))
+        assertTrue(echo.contains("\"query\":\"q\""))
+    }
+
+    @Test fun continuationArgsEchoRedactsTopLevelSecretKey() = runBlocking {
+        val s = slice()
+        val calls = listOf(
+            call(id = "call-1", args = """{"password":"hunter2","query":"A"}"""),
+        )
+        val msgs = s.continuationMessages(calls, listOf(SafeToolSlice.ToolResult("call-1", "n", "{}")))
+        val echo = msgs[0].toolCalls.single().argumentsJson
+        assertFalse(echo.contains("hunter2"))
+        assertTrue(echo.contains("⟦REDACTED⟧"))
     }
 
     @Test fun everyRegisteredNonSliceToolDeniesNotReady() = runBlocking {

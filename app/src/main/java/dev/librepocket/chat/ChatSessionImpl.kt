@@ -5,15 +5,12 @@ import dev.librepocket.provider.ChatImage
 import dev.librepocket.provider.ChatMessage
 import dev.librepocket.provider.LlmProvider
 import kotlinx.coroutines.CoroutineDispatcher
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.StateFlow
 
 /**
  * Product [ChatSession]: thin lifecycle wrapper around [TurnController].
- * Owns the session scope; [close] shuts the controller down and releases it.
+ * Delegates turn execution to [TurnController]; [close] shuts the controller down.
  *
  * The controller consumes the unified M1 [dev.librepocket.provider.StreamEvent]
  * union via [LlmProvider] directly; [model] selects the ChatRequest model and

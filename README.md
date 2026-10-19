@@ -6,12 +6,12 @@ LibrePocket is an Android application for chatting with a user-configured model 
 
 ## Current status
 
-Checked 2026-10-14 against `d5a98bd35e919083b0475027c9b2e74b703e4e58` (committed 2026-10-13). This is a source snapshot, not a release or device certification. Scope: public product status. Owner role: project maintainers. Source of truth: checked-in app/build/CI configuration and the cited commit. Update trigger: changes to current runtime, flavor, privacy, test, or release claims.
+Checked 2026-10-14 against `d5a98bd35e919083b0475027c9b2e74b703e4e58` (committed 2026-10-13); after #96 the only wired built-in tool is `lsp.symbols` (flipped at `b804ce89e99588cd5ca7c9cc3556e4dc37df6911`), see [the capability matrix](docs/CAPABILITY_MATRIX.md). This is a source snapshot, not a release or device certification. Scope: public product status. Owner role: project maintainers. Source of truth: checked-in app/build/CI configuration and the cited commit. Update trigger: changes to current runtime, flavor, privacy, test, or release claims.
 
 - The current app has three Android product flavors: `play`, `foss`, and `github`, each with a distinct application ID. Their source sets, dependencies, and manifests are not capability-equivalent.
 - The provider layer contains adapters for Chat Completions, Responses, and Anthropic Messages. Protocol support does not certify compatibility with every endpoint using those labels.
 - Chat transcripts are currently persisted through Room. JSONL codecs and export/import logic exist as library code; the current app UI has no user-facing export/import route wired. The proposed append-only JSONL source-of-truth design is not the current storage contract.
-- The built-in registry declares 41 tools, but none is marked `executionReady`; the current model-visible built-in tool list is therefore empty. A declaration, projection, or scaffold is not an executable feature.
+- The built-in registry declares 41 tools; exactly one is marked `executionReady` (the P2 slice `lsp.symbols`, READ-only); the other 40 are not. With the `lsp` switch on, the model-visible built-in tool list is `["lsp.symbols"]`; the switch defaults off, so the default context remains empty. A declaration, projection, or scaffold remains not an executable feature.
 - Android `allowBackup` is enabled. The configured Android backup rules exclude key-related files; they do not establish that transcripts, preferences, or audit data are excluded. Do not treat Android backup as transcript privacy protection.
 - GitHub release automation exists, but there is no verified final-artifact gate that fails closed on signature/certificate, package, version, and debug state. Release readiness is not established.
 

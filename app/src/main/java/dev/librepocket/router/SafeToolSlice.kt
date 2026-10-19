@@ -107,6 +107,162 @@ class SafeToolSlice(
         const val MAX_INPUT_CHARS = 4096
         /** Total cap for serialized tool result JSON (fail-closed continuation budget). */
         const val MAX_RESULT_CHARS = 20_000
+
+        /**
+         * Gross args pre-parse bound for the model's raw argument text
+         * ([MAX_INPUT_CHARS] × 4): the single source for the identical
+         * fan-close in [parseArgs] and [redactedArgsEcho].
+         */
+        const val MAX_GROSS_ARGS_CHARS = MAX_INPUT_CHARS * 4
+        /** Nesting-depth fan-close bound shared by [parseArgs]/[redactedArgsEcho] (see [jsonNestingDepth]). */
+        const val MAX_NESTING_DEPTH = 32
+
+        /**
+         * Exact receipt the secret-keyed structural walk emits. Must stay
+         * byte-equal to the value receipt Redactor's R3 (JSON_KEY_FIELD)
+         * substitutes ("⟦REDACTED⟧") so the structural echo agrees with the
+         * raw-text scanner on the shape; a local copy is unavoidable because
+         * Redactor keeps the constant private.
+         */
+        private const val SECRET_VALUE_RECEIPT = "⟦REDACTED⟧"
+
+        /**
+         * Secret-bearing KEY families: the same vocabulary Redactor's R3
+         * scanner supports (`secret|token|password|passwd|auth|api[_-]?key`,
+         * case-insensitive). Unanchored on purpose: the structural walk sees
+         * bare key names that can never satisfy the raw-text rules (which
+         * need a `:`/`=`), so over-matching helper keys (`apiKeyHint`,
+         * `oauthAuth`) is fail-safe over-redaction of an echo, never a leak;
+         * contains-style matching is deliberate collateral — benign keys
+         * merely containing a family word (`author`, `tokenizer`,
+         * `secretary`) are over-redacted on purpose too. Caveat: a
+         * secret-keyed OBJECT recurses through the normal walk, so nesting
+         * is a documented bypass (`{"password":{"z":"<value>"}}` echoes
+         * under an inner non-secret key) — the policy targets the
+         * conventional well-named key case; full structural marking is out
+         * of scope for this echo.
+         */
+        private val SECRET_KEY_FAMILY =
+            Regex("(?i)(secret|token|password|passwd|auth|api[_-]?key)")
+
+        /**
+         * Wire-safe redacted echo of a tool call's arguments: parse-then-redact
+         * (token-level inside each JSON string, and KEY-AWARE: a string member
+         * under a secret-family key ([SECRET_KEY_FAMILY]) collapses to the
+         * fixed [SECRET_VALUE_RECEIPT], because bare key names never match the
+         * secret rules and plain values carry no secret shape — isolation-only
+         * redaction leaks `{"password":"…"}` verbatim) and re-serialize a
+         * still-valid JSON object. Provider adapters re-parse this echo before
+         * serializing the continuation (`validateToolPairing`), so a raw-text
+         * redact or a `take` would corrupt the structure (several redaction
+         * rules swallow the terminating `"`/`}` of a value) and turn a working
+         * round into a non-retryable `TOOL_ARGUMENTS_INVALID` failure.
+         *
+         * All failure modes emit the same fixed minimal object (fail-closed,
+         * still a valid object): the input exceeds [parseArgs]'s gross size cap
+         * ([MAX_GROSS_ARGS_CHARS] = [MAX_INPUT_CHARS] × 4) or its nesting-depth
+         * fan-close (> [MAX_NESTING_DEPTH] — see [jsonNestingDepth]), parsing
+         * itself fails, or the re-serialized form exceeds [MAX_INPUT_CHARS].
+         *
+         * The depth fan-close is the ONLY structural recursion bound here and it
+         * is deliberately checked BEFORE parsing: this echo is parsed from the
+         * model's raw argument text, so embedded JSON is not bounded by the
+         * provider wire frame parser (MiniJson.MAX_DEPTH applies to the wire
+         * frame, not to a JSON string carried inside it). Skipping the guard
+         * would let a within-budget deeply nested argument reach the recursive
+         * [redactJsonStrings] walk.
+         *
+         * internal (never public) so the turn engine can reuse the identical
+         * redaction posture for its provider-visible inline tool marker — the
+         * transcript audit record there stays RAW by design.
+         */
+        internal fun redactedArgsEcho(argumentsJson: String): String {
+            val fallback = buildJsonObject { put("echo", "args redacted/capped") }.toString()
+            // Same fan-close as [parseArgs] ([MAX_GROSS_ARGS_CHARS] +
+            // [MAX_NESTING_DEPTH]), applied with a cheap char scan BEFORE any
+            // parse/recursion. String contents are ignored by the scan, so it
+            // bounds structure only.
+            if (argumentsJson.length > MAX_GROSS_ARGS_CHARS ||
+                jsonNestingDepth(argumentsJson) > MAX_NESTING_DEPTH
+            ) {
+                return fallback
+            }
+            val root = try {
+                Json.parseToJsonElement(argumentsJson)
+            } catch (_: Exception) {
+                return fallback
+            }
+            val redacted = redactJsonStrings(root).toString()
+            return if (redacted.length <= MAX_INPUT_CHARS) redacted else fallback
+        }
+
+        /** Deep-walks a JSON value, redacting object keys and every string
+         *  primitive's content (keys are model-controlled and ride the echo
+         *  too), KEY-AWARE: a string member — or an array of strings — under
+         *  a secret-family key ([SECRET_KEY_FAMILY]) collapses to the fixed
+         *  [SECRET_VALUE_RECEIPT] (isolated value redaction alone cannot catch
+         *  secret-keyed plain values). Numbers/booleans under a secret key are
+         *  never fabricated — a non-string value carries no secret shape — and
+         *  secret-keyed objects keep the normal walk so structural safety is
+         *  preserved. Recursion depth is bounded by the caller's pre-parse
+         *  fan-close ([redactedArgsEcho] rejects depth > [MAX_NESTING_DEPTH]
+         *  via [jsonNestingDepth], the same bound [parseArgs] fans closed
+         *  with) — never call this on unguarded input. */
+        private fun redactJsonStrings(element: JsonElement): JsonElement = when (element) {
+            is JsonPrimitive ->
+                if (element.isString) {
+                    JsonPrimitive(dev.librepocket.redact.Redactor.redact(element.content).text)
+                } else {
+                    element
+                }
+            is JsonObject -> JsonObject(
+                // Post-parse keys are already unique (duplicate raw keys
+                // collapse at parse); DISTINCT raw keys can still redact to
+                // identical text, so `associate` collapses them last-wins,
+                // silently dropping one already-redacted echo member — lossy
+                // yet safe (over-redaction only): the echo stays valid JSON.
+                element.entries.associate { (k, v) ->
+                    dev.librepocket.redact.Redactor.redact(k).text to when {
+                        // Pre-redact key decides: the receipt applies to the
+                        // VALUE (string or array of strings) only.
+                        SECRET_KEY_FAMILY.containsMatchIn(k) -> secretValueReceipt(v)
+                        else -> redactJsonStrings(v)
+                    }
+                },
+            )
+            is JsonArray -> JsonArray(element.map { redactJsonStrings(it) })
+        }
+
+        /** Secret-keyed member value: every string (deep into nested arrays)
+         *  becomes the fixed receipt; arrays of objects hand members to the
+         *  normal walk; non-string primitives pass untouched. */
+        private fun secretValueReceipt(v: JsonElement): JsonElement = when (v) {
+            is JsonPrimitive -> if (v.isString) JsonPrimitive(SECRET_VALUE_RECEIPT) else v
+            is JsonArray -> JsonArray(v.map { secretValueReceipt(it) })
+            is JsonObject -> redactJsonStrings(v)
+        }
+
+        /** Computes max JSON nesting depth while ignoring string contents. */
+        private fun jsonNestingDepth(s: String): Int {
+            var depth = 0
+            var max = 0
+            var inStr = false
+            var esc = false
+            for (c in s) {
+                if (inStr) {
+                    if (esc) esc = false
+                    else if (c == '\\') esc = true
+                    else if (c == '"') inStr = false
+                } else {
+                    when (c) {
+                        '"' -> inStr = true
+                        '{', '[' -> { depth++; if (depth > max) max = depth }
+                        '}', ']' -> { if (depth > 0) depth-- }
+                    }
+                }
+            }
+            return max
+        }
     }
 
     /**
@@ -168,6 +324,14 @@ class SafeToolSlice(
      * results are discarded by the throw — zero further backend effects).
      * Backend exceptions (non-cancel) are mapped to typed `EXEC_ERROR`
      * denials to preserve call-id pairing.
+     *
+     * Durability: the exec-once guarantee is turn-layer, not process-level.
+     * If the process dies between [execute] and the continuation's final
+     * settle, the round's result markers stay in the persisted partial and
+     * reopen backfill stamps exactly one `INTERRUPTED` terminal (`findDanglingRunIds`
+     * in ChatSessionFactory) — nothing re-executes (no tool round resumes on
+     * reopen), so a returned result whose receipt was lost is the read-only
+     * conservative outcome.
      */
     suspend fun execute(calls: List<ToolCall>): List<ToolResult> {
         // Cancel first: a cancel racing the collect→execute handoff must not
@@ -177,67 +341,6 @@ class SafeToolSlice(
             return calls.map { deny(it, DenyCodes.BUDGET_EXCEEDED, "at most $maxCallsPerTurn tool calls per round") }
         }
         return calls.map { executeOne(it) }
-    }
-
-    /**
-     * Wire-safe redacted echo of a tool call's arguments: parse-then-redact
-     * (token-level inside each JSON string) and re-serialize a still-valid
-     * JSON object. Provider adapters re-parse this echo before serializing
-     * the continuation (`validateToolPairing`), so a raw-text redact or a
-     * `take` would corrupt the structure (several redaction rules swallow
-     * the terminating `"`/`}` of a value) and turn a working round into a
-     * non-retryable `TOOL_ARGUMENTS_INVALID` failure.
-     *
-     * All failure modes emit the same fixed minimal object (fail-closed,
-     * still a valid object): the input exceeds [parseArgs]'s gross size cap
-     * ([MAX_INPUT_CHARS] × 4) or its nesting-depth fan-close (> 32 — see
-     * [jsonNestingDepth]), parsing itself fails, or the re-serialized form
-     * exceeds [MAX_INPUT_CHARS].
-     *
-     * The depth fan-close is the ONLY structural recursion bound here and it
-     * is deliberately checked BEFORE parsing: this echo is parsed from the
-     * model's raw argument text, so embedded JSON is not bounded by the
-     * provider wire frame parser (MiniJson.MAX_DEPTH applies to the wire
-     * frame, not to a JSON string carried inside it). Skipping the guard
-     * would let a within-budget deeply nested argument reach the recursive
-     * [redactJsonStrings] walk.
-     */
-    private fun redactedArgsEcho(argumentsJson: String): String {
-        val fallback = buildJsonObject { put("echo", "args redacted/capped") }.toString()
-        // Same fan-close values as [parseArgs] (gross cap + depth 32), applied
-        // with a cheap char scan BEFORE any parse/recursion. String contents
-        // are ignored by the scan, so it bounds structure only.
-        if (argumentsJson.length > MAX_INPUT_CHARS * 4 || jsonNestingDepth(argumentsJson) > 32) {
-            return fallback
-        }
-        val root = try {
-            Json.parseToJsonElement(argumentsJson)
-        } catch (_: Exception) {
-            return fallback
-        }
-        val redacted = redactJsonStrings(root).toString()
-        return if (redacted.length <= MAX_INPUT_CHARS) redacted else fallback
-    }
-
-    /** Deep-walks a JSON value, redacting object keys and every string
-     *  primitive's content (keys are model-controlled and ride the echo
-     *  too). Recursion depth is bounded by the caller's pre-parse fan-close
-     *  ([redactedArgsEcho] rejects depth > 32 via [jsonNestingDepth], the
-     *  same bound [parseArgs] fans closed with) — never call this on
-     *  unguarded input. */
-    private fun redactJsonStrings(element: JsonElement): JsonElement = when (element) {
-        is JsonPrimitive ->
-            if (element.isString) {
-                JsonPrimitive(dev.librepocket.redact.Redactor.redact(element.content).text)
-            } else {
-                element
-            }
-        is JsonObject -> JsonObject(
-            element.entries.associate { (k, v) ->
-                dev.librepocket.redact.Redactor.redact(k).text to redactJsonStrings(v)
-            },
-        )
-        is JsonArray -> JsonArray(element.map { redactJsonStrings(it) })
     }
 
     private suspend fun executeOne(call: ToolCall): ToolResult {
@@ -315,10 +418,10 @@ class SafeToolSlice(
 
     /** Registry-schema mirror: object + non-blank string `query`, optional int `limit`, optional string `pathPrefix`. */
     private fun parseArgs(argumentsJson: String): ValidArgs? {
-        if (argumentsJson.length > MAX_INPUT_CHARS * 4) return null
+        if (argumentsJson.length > MAX_GROSS_ARGS_CHARS) return null
         // Cheap nesting-depth guard (ignores contents of JSON strings) against
         // deeply nested payloads.
-        if (jsonNestingDepth(argumentsJson) > 32) return null
+        if (jsonNestingDepth(argumentsJson) > MAX_NESTING_DEPTH) return null
         val root = try {
             Json.parseToJsonElement(argumentsJson)
         } catch (_: Exception) {
@@ -344,26 +447,23 @@ class SafeToolSlice(
             is JsonPrimitive -> {
                 if (!raw.isString) return null
                 val v = raw.content
-                // Scope traversal guard (raw-string layer): reject Unicode
-                // normalization mismatches (homoglyphs), `..`, leading `/`
-                // (after trimming), backslash, NUL, control chars, and
-                // percent-escapes. Encoded forms (`%2e%2e`) are rejected here
-                // fail-closed; the injected bridge must still canonicalize/
-                // decode then re-validate and never treat this string as a
-                // trusted filesystem scope.
+                // Scope traversal guard (raw-string layer): Unicode
+                // normalization mismatches (homoglyphs) are rejected here;
+                // every traversal/marker denial comes from the single shared
+                // predicate [isSafeInput] (`..`, leading `/` after trimming,
+                // backslash, NUL, control chars, percent-escapes, and `:` —
+                // scheme/drive-absolute scope forms such as `file:/etc` and
+                // `c:/Users` must never name another root namespace).
+                // Encoded forms (`%2e%2e`) are rejected here fail-closed; the
+                // injected bridge must still canonicalize/decode then
+                // re-validate and never treat this string as a trusted
+                // filesystem scope.
                 // `""` is allowed and normalizes downstream (StubBackend maps
                 // blank to the default scope); it is "unspecified", not a
                 // bypass (pinned by tests).
                 if (v.length > MAX_INPUT_CHARS) return null
                 // Reject any input that changes under NFKC normalization.
                 if (Normalizer.normalize(v, Normalizer.Form.NFKC) != v) return null
-                // `:` additionally rejects scheme/drive-absolute scope forms
-                // (`file:/etc`, `c:/Users`) so a scope can never name another
-                // root namespace.
-                if (v.contains("..") || v.trimStart().startsWith("/") || v.contains("\\") || v.contains("\u0000") || v.contains("%") || v.contains(":")) {
-                    return null
-                }
-                if (v.any { it.isISOControl() }) return null
                 if (!isSafeInput(v)) return null
                 v
             }
@@ -372,34 +472,23 @@ class SafeToolSlice(
         return ValidArgs(query, pathPrefix, limit)
     }
 
-    /** Computes max JSON nesting depth while ignoring string contents. */
-    private fun jsonNestingDepth(s: String): Int {
-        var depth = 0
-        var max = 0
-        var inStr = false
-        var esc = false
-        for (c in s) {
-            if (inStr) {
-                if (esc) esc = false
-                else if (c == '\\') esc = true
-                else if (c == '"') inStr = false
-            } else {
-                when (c) {
-                    '"' -> inStr = true
-                    '{', '[' -> { depth++; if (depth > max) max = depth }
-                    '}', ']' -> { if (depth > 0) depth-- }
-                }
-            }
-        }
-        return max
-    }
-
-    /** Fail-closed input guard: no traversal markers, backslash, NUL, control, or percent-escape. */
+    /**
+     * Fail-closed scope guard, single shared predicate (no duplicated inline
+     * re-checks): no traversal markers (`..`), no absolute scope form (leading
+     * `/` after trimming), no backslash, NUL, ISO-control chars, or
+     * percent-escapes; `:` additionally rejects scheme/drive-absolute scope
+     * forms (`file:/etc`, `c:/Users`) so a scope can never name another root
+     * namespace. Filesystem-shaped scope input only — the model-controlled
+     * `query` deliberately keeps its own narrower check (a search string may
+     * contain `..`/`%`/`:` and stays allowed).
+     */
     private fun isSafeInput(v: String): Boolean {
         if (v.contains("..")) return false
+        if (v.trimStart().startsWith("/")) return false
         if (v.contains("\\")) return false
         if (v.contains("\u0000")) return false
         if (v.contains("%")) return false
+        if (v.contains(":")) return false
         if (v.any { it.isISOControl() }) return false
         return true
     }
@@ -475,6 +564,11 @@ class SafeToolSlice(
                 put("clockMillis", clock.millis())
             }
         val chosen = ArrayList(symbolJsons)
+        // Worst case accepted deliberately: the scan-down shrink re-serializes
+        // per dropped symbol (O(n²) in symbol count), but the input is
+        // pre-bounded by the LspTools.MAX_LIMIT item cap and the per-field
+        // MAX_STRING_CHARS cap, so the quadratic component is constant-bounded
+        // — perf, not correctness.
         while (chosen.size > 1) {
             val omittedCount = symbolJsons.size - chosen.size
             val truncated = anyFieldTruncated || omittedCount > 0
@@ -514,7 +608,11 @@ class SafeToolSlice(
         // Name and arguments echo the model's own strings into the provider
         // continuation/transcript exactly like `tool`/`callId` above — they
         // get redaction + a bounded echo (no raw echo past the redaction
-        // pipeline R1–R14).
+        // pipeline R1–R14, with secret-keyed string members collapsing to
+        // the fixed receipt — see [redactedArgsEcho]).
+        // Call ids echo through the same redaction path by design (never
+        // verbatim); verbatim passthrough + collision fail-closed is a
+        // deliberate deferred decision — current callers never re-bind ids.
         val normalizedCalls = calls.map {
             it.copy(
                 id = dev.librepocket.redact.Redactor.redact(it.id).text.take(MAX_STRING_CHARS),

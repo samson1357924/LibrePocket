@@ -5117,7 +5117,19 @@ class TurnController(
     for (p in pending) {
       coroutineContext.ensureActive()
       val safeName = p.name.filter { it.isLetterOrDigit() || it == '.' || it == '_' || it == '-' }.ifBlank { "tool" }
-      val safeArgs = p.args.replace("[", "［").replace("]", "］").replace("\n", " ").replace("\r", " ")
+      // Redact THEN scrub (full parity with noteToolDone): the flushed
+      // pending marker rides assistant text, which buildRequest re-sends to
+      // the provider on every later attempt/turn, so the crumb args take the
+      // same structural redaction posture as the continuation echo. Scrub
+      // AFTER redaction — a valid echo legitimately contains `[`/`]`. The
+      // CR/LF fold is belt-and-braces only: post-redaction echo output
+      // carries no raw control chars (the JSON serializer escapes them; a
+      // parse-fail collapses to the fixed receipt), so it is inert today but
+      // guards future edits to the echo path. Redact-then-scrub; audit stays
+      // raw by design.
+      val safeArgs = SafeToolSlice.redactedArgsEcho(p.args)
+        .replace("[", "［").replace("]", "］").replace("\n", " ")
+        .replace("\r", " ")
       appendAssistantText(attemptRunId, "\n[tool:$safeName $safeArgs]")
       writeNotice { orderedTranscript.onToolDone(attemptRunId, p.index, p.id, p.name, p.args) }
       state.doneSeen.add(p.index)
@@ -5206,7 +5218,19 @@ class TurnController(
     state.totalChars += toolDoneGrowth
     state.doneSeen.add(event.toolIndex)
     val safeName = event.name.filter { it.isLetterOrDigit() || it == '.' || it == '_' || it == '-' }.ifBlank { "tool" }
-    val safeArgs = event.argumentsJson.replace("[", "［").replace("]", "］").replace("\n", " ").replace("\r", " ")
+    // Redact THEN scrub: the inline marker rides assistant text, which
+    // buildRequest re-sends to the provider on every later attempt/turn, so
+    // the args take the same structural redaction posture as the continuation
+    // echo (SafeToolSlice.redactedArgsEcho — parse/size/depth failures already
+    // collapse to a fixed receipt). Scrubbing happens AFTER redaction, because
+    // a valid echo legitimately contains `[`/`]` array framing. The CR/LF
+    // fold below is belt-and-braces only: post-redaction echo output carries
+    // no raw control chars (the JSON serializer escapes them; the fallback
+    // receipt is fixed), so it is inert today but guards future edits to the
+    // echo path. The durable transcript audit record below deliberately keeps
+    // the RAW args (audit truth, never provider-visible text).
+    val safeArgs = SafeToolSlice.redactedArgsEcho(event.argumentsJson)
+      .replace("[", "［").replace("]", "］").replace("\n", " ").replace("\r", " ")
     appendAssistantText(attemptRunId, "\n[tool:$safeName $safeArgs]")
     writeNotice {
       orderedTranscript.onToolDone(attemptRunId, event.toolIndex, event.id, event.name, event.argumentsJson)
@@ -5445,13 +5469,17 @@ class TurnController(
    * structured tool round (assistant `toolCalls` + paired `tool` results —
    * pairing is total within one executed round). Markers stay inline in the
    * assistant text AND the structured round rides alongside (double carry
-   * within one request). This builder is sequentially invoked twice per
-   * executed round — once for the live continuation, and again as the
-   * re-attached frozen pair after a post-execution retryable continuation
+   * within one request). This builder runs once for the live continuation,
+   * then is re-derived once per post-execution retry attempt — each retry
+   * re-attaches the frozen executed pair after a retryable continuation
    * failure (a provider `Failed` or the forced incomplete-round failure —
    * see runTurnLoop). The
    * failed attempt's partial inline markers do not survive that retry, the
-   * structured pair does. NO tools are
+   * structured pair does. Re-attached requests inherit the attempt-0
+   * continuation's `requireNoReasoningHistory` semantics unchanged: with a
+   * reasoning-sourced settled history a post-exec continuation failure
+   * terminals instead of succeeding blind (fail-closed by construction, not
+   * a new adapter refusal class). NO tools are
    * advertised (`allowTools = false`): the continuation request carries no
    * `tools` array. If the model still emits a second-round call it is
    * recorded (markers + transcript, `onWiredToolDone = null`) but never
@@ -5594,6 +5622,9 @@ class TurnController(
     combined.addAll(live)
     val base = applyHistoryCap(combined, historyCap).toMutableList()
     droppedHistoryCount = (combined.size - base.size).coerceAtLeast(0)
+    // Per-request image re-load/decode is an accepted cost trade-off;
+    // decoder-level reuse/caching is deliberately deferred (bounds documented
+    // in defaultChatImageLoader's KDoc).
     val loaded = runCatching { imageLoader(images) }.getOrDefault(emptyList())
     if (loaded.isNotEmpty()) {
       val lastUser = base.indexOfLast { it.role == "user" }

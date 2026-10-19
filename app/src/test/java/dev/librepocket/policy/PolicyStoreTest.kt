@@ -1,5 +1,6 @@
 package dev.librepocket.policy
 
+import dev.librepocket.router.SafeToolSlice
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -61,26 +62,24 @@ class PolicyStoreTest {
 
   @Test fun toolExecIsKnownButDefaultsToAsk() {
     // Stage2 slice basis: known (explicit rules apply), but the default
-    // ruleset has no `tool.exec` rule — only `*:*` ASK matches, so the slice
+    // ruleset has no slice rule — only `*:*` ASK matches, so the slice
     // (which requires ALLOW) denies fail-closed until explicitly allowed.
     val s = InMemoryPolicyStore()
-    val d = s.evaluate("tool.exec", "lsp.symbols")
+    val d = s.evaluate(SafeToolSlice.POLICY_ACTION, SafeToolSlice.TOOL_NAME)
     assertEquals(Verdict.ASK, d.verdict)
   }
 
   @Test fun toolExecDefaultAskHoldsOnFreshRecheck() = runBlocking {
-    // The slice uses evaluateFresh(SafeToolSlice.POLICY_ACTION,
-    // SafeToolSlice.TOOL_NAME) — literals kept in sync with those constants.
-    // Pin the same ASK default on the execution-basis path.
+    // Pin the same ASK default on the execution-basis path the slice uses.
     val s = InMemoryPolicyStore()
-    assertEquals(Verdict.ASK, s.evaluateFresh("tool.exec", "lsp.symbols").verdict)
+    assertEquals(Verdict.ASK, s.evaluateFresh(SafeToolSlice.POLICY_ACTION, SafeToolSlice.TOOL_NAME).verdict)
   }
 
   @Test fun toolExecExplicitAllowAuthorizes() = runBlocking {
-    val s = store(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 10))
-    assertEquals(Verdict.ALLOW, s.evaluateFresh("tool.exec", "lsp.symbols").verdict)
+    val s = store(PolicyRule("${SafeToolSlice.POLICY_ACTION}:${SafeToolSlice.TOOL_NAME}", Verdict.ALLOW, 10))
+    assertEquals(Verdict.ALLOW, s.evaluateFresh(SafeToolSlice.POLICY_ACTION, SafeToolSlice.TOOL_NAME).verdict)
     // Other tools stay denied without their own rule.
-    assertEquals(Verdict.DENY, s.evaluateFresh("tool.exec", "shell.exec").verdict)
+    assertEquals(Verdict.DENY, s.evaluateFresh(SafeToolSlice.POLICY_ACTION, "shell.exec").verdict)
   }
 
   @Test fun noMatchIsDeny() {

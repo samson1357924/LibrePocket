@@ -157,7 +157,19 @@ artifact-level scanner (`test_merged_backup_bindings_stripped_rejected_both_mode
 `test_merged_backup_bindings_missing_resource_table_rejected`), because an XML
 comment can hide a deleted attribute at source level
 (`test_manifest_comment_survivor_no_longer_fools_the_check`) and a merger
-marker can strip the binding at merge time. The harness's synthetic
+marker can strip the binding at merge time. The merged-manifest value itself is
+also proven, per attribute, through `aapt dump resources` (one shared dump per
+scan): an `@0x…` id must resolve to the pinned xml name, a reference-NAME
+literal (older aapt's print of a typed reference) must match the pin over the
+WHOLE decoded value and the name must be carried by the same table
+(`test_merged_reference_bindings_resolve_through_table_both_modes`,
+`test_backup_binding_string_branch_full_value_equality`,
+`test_merged_nsc_unresolvable_id_and_literal_name_proven_through_table`), and
+any other payload — e.g. `@xml/backup_rules;junk` — is a raw string the runtime
+would never dereference, so it fails closed
+(`test_merged_backup_binding_literal_with_trailing_junk_rejected`). The two
+binding authorities share that single resources dump
+(`test_e2e_resources_dump_runs_once_per_scan`); the harness's synthetic
 APK-like fixtures prove scanner logic only; for a real artifact the artifact
 tier is the post-assembly `scripts/play_policy_check.sh` stage (CI assembly
 step above), and no synthetic fixture run substitutes for it.

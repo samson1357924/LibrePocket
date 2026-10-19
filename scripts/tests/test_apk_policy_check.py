@@ -787,6 +787,24 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
             "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
             "            '    A: android:networkSecurityConfig(0x01010527)=\"@xml/network_security_config;\" (Raw: \"@xml/network_security_config;\")' ;;\n"
+            "        backup-literal-junk)\n"
+            "          # The pinned BACKUP literal plus trailing junk: a search()-style\n"
+            "          # prefix match would accept \"@xml/backup_rules;junk\" while the\n"
+            "          # runtime would never dereference the raw string at all. The\n"
+            "          # decoded FULL payload must match the pin exactly.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=\"@xml/backup_rules;junk\" (Raw: \"@xml/backup_rules;junk\")' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' ;;\n"
+            "        data-rules-rebound-id)\n"
+            "          # Per-attribute proof: ONLY android:dataExtractionRules carries\n"
+            "          # an id with NO entry in the resources table (default FAKE_AAPT\n"
+            "          # table carries 0x7f010000-0x7f010002). One unresolvable id must\n"
+            "          # fail the whole binding gate - there is no skip-return.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f091002' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' ;;\n"
             "        accessibility)\n"
             "          # Legal foss/github overlay shape (mirrors the real overlay\n"
             "          # manifests): a declared accessibility service carrying the\n"
@@ -829,6 +847,13 @@ class ApkPolicyHarness(unittest.TestCase):
             "      esac\n"
             "    fi ;;\n"
             "  'dump resources')\n"
+            "    # e2e single-dump counter: the counter file (optionally exported\n"
+            "    # by the harness) gains one byte per ``dump resources`` INVOCATION,\n"
+            "    # so a run that executes the dump exactly once leaves exactly one\n"
+            "    # byte. Nothing else in this fake touches the file.\n"
+            "    if [ -n \"${FAKE_AAPT_RESOURCES_COUNT_FILE:-}\" ]; then\n"
+            "      printf 'x' >> \"${FAKE_AAPT_RESOURCES_COUNT_FILE}\"\n"
+            "    fi\n"
             "    case \"${FAKE_AAPT_RESOURCES:-table}\" in\n"
             "      missing) printf '%s\\n' '    (no xml/type resources)' ;;\n"
             "      aapt2-table)\n"
@@ -889,6 +914,7 @@ class ApkPolicyHarness(unittest.TestCase):
         nsc_mode: str = "ok",
         rules_mode: str = "ok",
         permissions: str = "",
+        resources_count_file: Path | None = None,
     ) -> dict[str, str]:
         env = os.environ.copy()
         env.update(
@@ -906,6 +932,8 @@ class ApkPolicyHarness(unittest.TestCase):
                 "LC_ALL": "C",
             }
         )
+        if resources_count_file is not None:
+            env["FAKE_AAPT_RESOURCES_COUNT_FILE"] = str(resources_count_file)
         return env
 
     def run_policy(
@@ -921,6 +949,7 @@ class ApkPolicyHarness(unittest.TestCase):
         rules_mode: str = "ok",
         sdk: Path | None = None,
         permissions: str = "",
+        resources_count_file: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = ["sh", str(POLICY_CHECK)]
         if foss:
@@ -938,6 +967,7 @@ class ApkPolicyHarness(unittest.TestCase):
                 nsc_mode=nsc_mode,
                 rules_mode=rules_mode,
                 permissions=permissions,
+                resources_count_file=resources_count_file,
             ),
             text=True,
             stdout=subprocess.PIPE,
@@ -1100,14 +1130,16 @@ class ApkPolicyHarness(unittest.TestCase):
         # Printing the attribute with a DIFFERENT resource-id (i.e. an attr
         # that is not actually android:fullBackupContent) fails closed too;
         # a fake aapt cannot relabel it past the id pin.
+        # get_resources is never called in these cases: the failure happens
+        # inside the attr loop. A return of "" would fail any proof CLOSED
+        # (no table entry survives an empty dump) had it been reached.
         with self.assertRaisesRegex(
             policy_inspect.PolicyError, "lost the backup binding"
         ):
             policy_inspect._assert_merged_backup_bindings(
-                "/unused/aapt",
-                self.tmp / "unused.apk",
                 "  E: application\n"
                 "    A: android:fullBackupContent(0x99990001)=@0x7f010000",
+                lambda: "",
             )
 
     def test_merged_backup_binding_literal_rebound_name_rejected(self) -> None:
@@ -1116,11 +1148,10 @@ class ApkPolicyHarness(unittest.TestCase):
             policy_inspect.PolicyError, "rebound backup binding"
         ):
             policy_inspect._assert_merged_backup_bindings(
-                "/unused/aapt",
-                self.tmp / "unused.apk",
                 "  E: application\n"
                 '    A: android:fullBackupContent(0x010104eb)=@xml/backup_rules_evil\n'
                 '    A: android:dataExtractionRules(0x0101063e)=@xml/data_extraction_rules\n',
+                lambda: "",
             )
 
     def test_merged_backup_bindings_aapt2_spelling_and_literal_raw_pass(self) -> None:
@@ -1143,13 +1174,12 @@ class ApkPolicyHarness(unittest.TestCase):
             policy_inspect.PolicyError, "lost the backup binding"
         ):
             policy_inspect._assert_merged_backup_bindings(
-                "/unused/aapt",
-                self.tmp / "unused.apk",
                 "  E: application\n"
                 '    A: android:label(0x01010001)="Faux" (Raw: "Faux")\n'
                 "  E: someone-else\n"
                 '    A: android:fullBackupContent(0x010104eb)=@xml/backup_rules\n'
                 '    A: android:dataExtractionRules(0x0101063e)=@xml/data_extraction_rules\n',
+                lambda: "",
             )
 
     def test_merged_backup_bindings_without_application_rejected(self) -> None:
@@ -1157,9 +1187,8 @@ class ApkPolicyHarness(unittest.TestCase):
             policy_inspect.PolicyError, "lacks an <application> element"
         ):
             policy_inspect._assert_merged_backup_bindings(
-                "/unused/aapt",
-                self.tmp / "unused.apk",
                 "E: manifest\n",
+                lambda: "",
             )
 
     def test_manifest_lacks_application_rejected_by_gate(self) -> None:
@@ -1218,6 +1247,266 @@ class ApkPolicyHarness(unittest.TestCase):
         result = self.run_policy(apk, resources_mode="wrong-name")
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("rebound backup binding", result.stdout)
+
+    # -- P2 fail-closed binding: raw-string payloads, per-attr id proof,
+    #    mandatory resources-table proof for BOTH binding authorities --
+
+    def test_merged_backup_binding_literal_with_trailing_junk_rejected(self) -> None:
+        # The backup pair's string-branch must full-match the DECODED payload:
+        # "@xml/backup_rules;junk" used to satisfy a search()-style prefix
+        # match, but a raw string is never a typed reference - the runtime
+        # would not dereference it and Auto Backup would run rule-less. The
+        # negative fixture pins the raw-string fail-closed message.
+        apk = complete_apk(
+            self.tmp / "backup-literal-junk.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, xmltree_mode="backup-literal-junk")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "binding is a raw string, not a resource reference", result.stdout
+        )
+
+    def test_merged_data_extraction_rules_unresolvable_id_rejected(self) -> None:
+        # e2e per-attr proof: android:dataExtractionRules bound to an id with
+        # NO entry in the (default) resources table must fail the whole run -
+        # the skip-return that previously licensed an unproven id is gone.
+        apk = complete_apk(
+            self.tmp / "data-rules-rebound-id.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, xmltree_mode="data-rules-rebound-id")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("rebound backup binding", result.stdout)
+
+    def test_backup_binding_string_branch_full_value_equality(self) -> None:
+        # Direct matrix for the string branch: trailing junk fails with the
+        # raw-string message; a wrong but well-formed reference NAME keeps the
+        # historical rebound message; the clean literal (older aapt's print of
+        # a typed reference) is accepted when the table carries both names.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            "binding is a raw string, not a resource reference",
+        ):
+            policy_inspect._assert_merged_backup_bindings(
+                "  E: application\n"
+                '    A: android:fullBackupContent(0x010104eb)="@xml/backup_rules;junk" (Raw: "@xml/backup_rules;junk")\n'
+                '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001\n',
+                lambda: "",
+            )
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            r"does not reference @xml/backup_rules \(got @xml/backup_rules_evil\)",
+        ):
+            policy_inspect._assert_merged_backup_bindings(
+                "  E: application\n"
+                '    A: android:fullBackupContent(0x010104eb)=@xml/backup_rules_evil\n'
+                '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001\n',
+                lambda: "",
+            )
+        # Positive control: clean name-form bindings proven through the table.
+        policy_inspect._assert_merged_backup_bindings(
+            "  E: application\n"
+            '    A: android:fullBackupContent(0x010104eb)=@xml/backup_rules\n'
+            '    A: android:dataExtractionRules(0x0101063e)=@xml/data_extraction_rules\n',
+            lambda: (
+                "      spec resource 0x7f010000 dev.librepocket.agent:xml/backup_rules:"
+                " flags=0x00000000\n"
+                "      spec resource 0x7f010001 dev.librepocket.agent:xml/data_extraction_rules:"
+                " flags=0x00000000\n"
+            ),
+        )
+        # Gate-level proof-mandatory pin: the SAME clean name-form literals
+        # against an EMPTY table must fail through the inverse proof (old
+        # behavior skipped the check when resolution was absent) - the
+        # binding could never survive a runtime dereference.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            r"references @xml/backup_rules but the resources table carries no resource with that name",
+        ):
+            policy_inspect._assert_merged_backup_bindings(
+                "  E: application\n"
+                '    A: android:fullBackupContent(0x010104eb)=@xml/backup_rules\n'
+                '    A: android:dataExtractionRules(0x0101063e)=@xml/data_extraction_rules\n',
+                lambda: "",
+            )
+
+    def test_merged_backup_binding_per_attribute_unresolvable_id_rejected(self) -> None:
+        # Either backup attr bound to an id the table does not carry fails the
+        # whole gate; each half of the pair is proven, individually.
+        data_rules_only_table = (
+            "      spec resource 0x7f010001 dev.librepocket.agent:xml/data_extraction_rules:"
+            " flags=0x00000000\n"
+        )
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            r"android:fullBackupContent resource id 0x7f010000 does not resolve"
+            r" to @xml/backup_rules",
+        ):
+            policy_inspect._assert_merged_backup_bindings(
+                "  E: application\n"
+                '    A: android:fullBackupContent(0x010104eb)=@0x7f010000\n'
+                '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001\n',
+                lambda: data_rules_only_table,
+            )
+        backup_rules_only_table = (
+            "      spec resource 0x7f010000 dev.librepocket.agent:xml/backup_rules:"
+            " flags=0x00000000\n"
+        )
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            r"android:dataExtractionRules resource id 0x7f010001 does not resolve"
+            r" to @xml/data_extraction_rules",
+        ):
+            policy_inspect._assert_merged_backup_bindings(
+                "  E: application\n"
+                '    A: android:fullBackupContent(0x010104eb)=@0x7f010000\n'
+                '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001\n',
+                lambda: backup_rules_only_table,
+            )
+
+    def test_resources_table_carries_name_inverse_proof_matrix(self) -> None:
+        # The NAME-form proof (inverse of the id↔name resolve): both measured
+        # aapt spellings accept, absence fails closed.
+        aapt2_table = (
+            "    resource 0x7f010000 xml/backup_rules () (file) res/xml/backup_rules.xml\n"
+            "    resource 0x7f010001 xml/data_extraction_rules () (file)"
+            " res/xml/data_extraction_rules.xml\n"
+        )
+        policy_inspect._resources_table_carries_name(
+            aapt2_table, "backup_rules", "fullBackupContent"
+        )
+        policy_inspect._resources_table_carries_name(
+            aapt2_table, "data_extraction_rules", "dataExtractionRules"
+        )
+        policy_inspect._resources_table_carries_name(
+            "      spec resource 0x7f010000 dev.librepocket.agent:xml/backup_rules:"
+            " flags=0x00000000\n",
+            "backup_rules",
+            "fullBackupContent",
+        )
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            r"references @xml/network_security_config but the resources table"
+            r" carries no resource with that name",
+        ):
+            policy_inspect._resources_table_carries_name(
+                # A table that carries only the backup pair's names cannot
+                # prove the NSC name (same fail lane as the missing dump).
+                aapt2_table,
+                "network_security_config",
+                "networkSecurityConfig",
+                binding_kind="networkSecurityConfig",
+            )
+
+    def test_merged_reference_bindings_resolve_through_table_both_modes(self) -> None:
+        # Positive control: the REAL reference binding (id-form @0x…) must
+        # resolve through the fake aapt resources table in BOTH scanning
+        # modes - the id↔name pairing is the merger-proof half of the pin.
+        apk = complete_apk(
+            self.tmp / "reference-bindings.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        play_result = self.run_policy(apk)
+        self.assertEqual(play_result.returncode, 0, play_result.stdout)
+        github_result = self._run_scanner_cli(apk, "github")
+        self.assertEqual(
+            github_result.returncode, 0, github_result.stdout + github_result.stderr
+        )
+
+    def test_merged_nsc_unresolvable_id_and_literal_name_proven_through_table(self) -> None:
+        # networkSecurityConfig gets the same two proofs: an id with no table
+        # entry fails closed (no skip-return), and a clean literal binding
+        # (older-aapt print of a typed reference) must be carried by the
+        # name column of the SAME table before the compiled-XML gate runs.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            r"android:networkSecurityConfig resource id 0x7f091003 does not resolve"
+            r" to @xml/network_security_config",
+        ):
+            policy_inspect._assert_merged_network_security_config(
+                "/unused/aapt",
+                self.tmp / "unused.apk",
+                "  E: application\n"
+                "    A: android:networkSecurityConfig(0x01010527)=@0x7f091003\n",
+                lambda: "",
+            )
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            r"references @xml/network_security_config but the resources table"
+            r" carries no resource with that name",
+        ):
+            policy_inspect._assert_merged_network_security_config(
+                "/unused/aapt",
+                self.tmp / "unused.apk",
+                "  E: application\n"
+                '    A: android:networkSecurityConfig(0x01010527)="@xml/network_security_config" (Raw: "@xml/network_security_config")\n',
+                lambda: "",
+            )
+
+    def test_one_shared_resources_dump_serves_both_binding_authorities(self) -> None:
+        # P3: ``aapt dump resources`` runs ONCE per APK. Both binding
+        # authorities prove their bindings through the SAME per-APK resolver
+        # (parameter threading, no module-global cache), so a scan that runs
+        # both authorities executes exactly one resources dump subprocess -
+        # the refactor's replacement for the previous dump-per-authority.
+        resolver = policy_inspect._resources_dump_resolver(
+            str(self.build_tools / "aapt"), self.tmp / "unused.apk"
+        )
+        xmltree = (
+            "  E: application\n"
+            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000\n'
+            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001\n'
+            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002\n'
+        )
+        with mock.patch.object(
+            policy_inspect,
+            "_run_bounded_stdout",
+            wraps=policy_inspect._run_bounded_stdout,
+        ) as bounded:
+            policy_inspect._assert_merged_backup_bindings(xmltree, resolver)
+            policy_inspect._assert_merged_network_security_config(
+                str(self.build_tools / "aapt"),
+                self.tmp / "unused.apk",
+                xmltree,
+                resolver,
+            )
+        # The backup and the NSC authority together trigger exactly ONE
+        # ``dump resources`` execution (the NSC binding check would spawn a
+        # second one without the shared resolver).
+        resources_invocations = [
+            call
+            for call in bounded.call_args_list
+            if call.args[0][1:3] == ["dump", "resources"]
+        ]
+        self.assertEqual(len(resources_invocations), 1)
+        # The NSC COMPILED-config dump is a separate authority's execution and
+        # still runs exactly once by itself (the two dumps are not conflated).
+        member_invocations = [
+            call
+            for call in bounded.call_args_list
+            if len(call.args[0]) > 4
+            and call.args[0][4] == "res/xml/network_security_config.xml"
+        ]
+        self.assertEqual(len(member_invocations), 1)
+
+    def test_e2e_resources_dump_runs_once_per_scan(self) -> None:
+        # End-to-end P3 guard: a full play-mode scan proving both binding
+        # authorities leaves exactly ONE ``dump resources`` invocation byte in
+        # the fake aapt's counter file (the second authority reuses the
+        # threadable result instead of spawning a second dump).
+        apk = complete_apk(
+            self.tmp / "single-dump.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        counter = self.tmp / "resources-invocations"
+        result = self.run_policy(apk, resources_count_file=counter)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(
+            counter.read_bytes(),
+            b"x",
+            "the binding authorities must share ONE resources dump per scan",
+        )
 
     # -- compiled backup-rules BYTES (artifact-level exact-set authority) --
 
@@ -1628,6 +1917,7 @@ class ApkPolicyHarness(unittest.TestCase):
                 '    A: android:label(0x01010001)="Faux" (Raw: "Faux")\n'
                 "  E: someone-else\n"
                 "    A: android:networkSecurityConfig(0x01010527)=@0x7f010002\n",
+                lambda: "",
             )
 
     def test_merged_nsc_binding_with_wrong_printed_id_rejected(self) -> None:
@@ -1641,6 +1931,7 @@ class ApkPolicyHarness(unittest.TestCase):
                 self.tmp / "unused.apk",
                 "  E: application\n"
                 "    A: android:networkSecurityConfig(0x99990002)=@0x7f010002\n",
+                lambda: "",
             )
 
     def test_merged_nsc_resources_table_wrong_name_or_missing_rejected(self) -> None:
@@ -1782,10 +2073,14 @@ class ApkPolicyHarness(unittest.TestCase):
             aapt, _REAL_DEBUG_APK
         )
         self.assertTrue(permissions)
-        policy_inspect._assert_merged_backup_bindings(aapt, _REAL_DEBUG_APK, xmltree)
+        # The three artifact authorities now share ONE resources dump via the
+        # lazily-memoized resolver: pass the same callable to both binding
+        # checks (~the inspect_apk wiring).
+        get_resources = policy_inspect._resources_dump_resolver(aapt, _REAL_DEBUG_APK)
+        policy_inspect._assert_merged_backup_bindings(xmltree, get_resources)
         policy_inspect._assert_merged_backup_rules_bytes(aapt, _REAL_DEBUG_APK)
         policy_inspect._assert_merged_network_security_config(
-            aapt, _REAL_DEBUG_APK, xmltree
+            aapt, _REAL_DEBUG_APK, xmltree, get_resources
         )
 
     def test_rejects_truncated_zip(self) -> None:
@@ -3445,9 +3740,15 @@ class BackupRulesValidator(unittest.TestCase):
         self.assertNotIn("missing exclude", stderr)
 
     def test_fifo_rules_file_is_refused_immediately(self) -> None:
-        # A checker handed a FIFO must refuse on os.stat BEFORE any open()
-        # (ET.parse's open on a FIFO blocks until a writer appears) - main()
-        # exit code and message only, no timing claim.
+        # A checker handed a FIFO must refuse without ever blocking: the
+        # loader opens the path O_RDONLY|O_NONBLOCK and proves S_ISREG on the
+        # OPEN FILE's own descriptor via os.fstat before any read, so the
+        # refusal fires on the SAME inode that would be read. main() exit
+        # code and message only, no timing claim.
+        # Post-fix note: the retired stat-then-open load had a swap window in
+        # which a FIFO appearing between os.stat and open() wedged the
+        # checker's open() until a writer appeared - open/fstat/read now pin
+        # ONE fd, so that mkfifo-in-window race is structurally impossible.
         fifo = self.tmp / "fifo.xml"
         os.mkfifo(fifo)
         buf_err = io.StringIO()
@@ -3462,6 +3763,37 @@ class BackupRulesValidator(unittest.TestCase):
             )
         self.assertEqual(1, code)
         self.assertIn("not a regular file", buf_err.getvalue())
+
+    def test_directory_rules_file_refused_as_non_regular(self) -> None:
+        # Directory analog of the FIFO pin (deterministic, no race): opening
+        # a directory read-only never blocks, and the loader's fstat proof on
+        # the OPEN file descriptor lands in the SAME structured non-regular
+        # fail lane with exit 1 - a directory can never reach ET.parse as a
+        # stream source.
+        directory = self.tmp / "rules-dir"
+        directory.mkdir()
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            code = backup_rules_check.main(
+                [
+                    "backup_rules_check.py",
+                    "--expect-root",
+                    backup_rules_check.EXPECTED_ROOT_BACKUP_RULES,
+                    str(directory),
+                ]
+            )
+        self.assertEqual(1, code)
+        self.assertIn("not a regular file", buf_err.getvalue())
+
+    def test_missing_rules_file_reports_unreadable(self) -> None:
+        # The open-first loader keeps the historical "unreadable" lane for a
+        # missing path (os.open's OSError), with the same harness exit code.
+        missing = str(self.tmp / "no-such.xml")
+        errors = backup_rules_check.validate(
+            missing, backup_rules_check.EXPECTED_ROOT_BACKUP_RULES
+        )
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("unreadable: ", errors[0])
 
     def test_noncanonical_hint_matching_root_reaches_defensive_branch(self) -> None:
         # validate() requires the hint; a caller may still pass a NON-canonical
@@ -4973,15 +5305,33 @@ class NscCheckValidator(unittest.TestCase):
                 self.assertEqual(nsc_check.validate(legal, mode), [])
 
     def test_fifo_config_is_refused_immediately(self) -> None:
-        # A checker handed a FIFO must refuse on os.stat BEFORE any open()
-        # (ET.parse's open on a FIFO blocks until a writer appears) - the same
-        # fail-closed shape as the backup-rules side, asserted via main() exit
-        # code and message only (no timing claim).
+        # A checker handed a FIFO must refuse without ever blocking: the
+        # loader opens the path O_RDONLY|O_NONBLOCK and proves S_ISREG on the
+        # OPEN FILE's own descriptor via os.fstat before any read - the same
+        # fail-closed shape as the backup-rules side, asserted via main()
+        # exit code and message only (no timing claim).
+        # Post-fix note: the retired stat-then-open load had a swap window in
+        # which a FIFO appearing between os.stat and open() wedged the
+        # checker's open() until a writer appeared - open/fstat/read now pin
+        # ONE fd, so that mkfifo-in-window race is structurally impossible.
         fifo = self.tmp / "fifo.xml"
         os.mkfifo(fifo)
         buf_err = io.StringIO()
         with contextlib.redirect_stderr(buf_err):
             code = nsc_check.main(["nsc_check.py", "--mode", "release", str(fifo)])
+        self.assertEqual(1, code)
+        self.assertIn("not a regular file", buf_err.getvalue())
+
+    def test_directory_nsc_config_refused_as_non_regular(self) -> None:
+        # Directory analog of the FIFO pin (deterministic, no race): the
+        # O_NONBLOCK open never blocks, and the fstat regular-file proof on
+        # the OPEN descriptor lands in the same structured non-regular lane
+        # with exit 1 (never an ET.parse stall, never an exception).
+        directory = self.tmp / "nsc-dir"
+        directory.mkdir()
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            code = nsc_check.main(["nsc_check.py", "--mode", "release", str(directory)])
         self.assertEqual(1, code)
         self.assertIn("not a regular file", buf_err.getvalue())
 

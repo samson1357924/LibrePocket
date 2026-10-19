@@ -378,11 +378,19 @@ def _read_source_document(path: str) -> tuple[ET.Element | None, list[str]]:
 
     Guards, in order:
 
-    - ``os.stat`` (FOLLOWING symlinks on purpose: a symlink pointing at a
-      regular file is the existing legal path for every caller of these
-      checkers) and ``S_ISREG``: a FIFO, directory or device file refuses
-      immediately - ``ET.parse``'s ``open()`` would block on a FIFO until a
-      writer appears, so the checker itself must not stall on one;
+    - open-first-then-``fstat``: the path is opened read-only (O_NONBLOCK
+      where the platform provides it; FOLLOWING symlinks on purpose: a
+      symlink pointing at a regular file is the existing legal path for
+      every caller of these checkers) and ``os.fstat`` on the OPEN FILE's
+      own descriptor proves ``S_ISREG`` against ONE pinned inode - a FIFO,
+      directory or device file refuses immediately (``ET.parse`` would block
+      on a FIFO until a writer appears, so the checker itself must not stall
+      on one), and the old stat-then-open window can no longer swap a FIFO
+      past the regular-file proof: open/fstat/read all share one fd, so an
+      mkfifo-in-between race is structurally impossible post-fix. A
+      non-regular path refuses from whichever layer exposes it first (CPython
+      rejects ``os.fdopen`` on a directory fd outright; that and the
+      ``os.open`` refusal lane surface the same structured message);
     - a case-insensitive DOCTYPE scan over the raw bytes BEFORE
       ``ET.fromstring``: expat materializes internal-subset ATTLIST DEFAULTS
       into the parsed tree, so a hand-authored internal subset could fabricate
@@ -400,17 +408,42 @@ def _read_source_document(path: str) -> tuple[ET.Element | None, list[str]]:
     NUL-stripped copy of them, so UTF-16-shaped NUL-interleaved sources hit
     the same refusal.
     """
+    non_regular_refusal = (
+        f"{path}: not a regular file - refused fail-closed "
+        "(FIFO/directory/device would make ET.parse's open() block the checker)"
+    )
     try:
-        stat_result = os.stat(path)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except IsADirectoryError:
+        # Same structured outcome as the fdopen/fstat lanes below: whichever
+        # layer exposes the non-regular path first refuses with one message
+        # and opens nothing that could block a later ET.parse.
+        return None, [non_regular_refusal]
     except OSError as exc:
         return None, [f"{path}: unreadable: {exc}"]
-    if not stat.S_ISREG(stat_result.st_mode):
-        return None, [
-            f"{path}: not a regular file - refused fail-closed "
-            "(FIFO/directory/device would make ET.parse's open() block the checker)"
-        ]
     try:
-        with open(path, "rb") as handle:
+        try:
+            handle = os.fdopen(fd, "rb")
+        except IsADirectoryError:
+            # CPython refuses to build a stream on a directory fd outright;
+            # the fd is NOT owned by any stream yet, so close it here.
+            os.close(fd)
+            return None, [non_regular_refusal]
+        except OSError:
+            # Any other fdopen failure likewise leaves the fd unowned; close
+            # it defensively and let the outer OSError lane report unreadable.
+            os.close(fd)
+            raise
+        # fdopen succeeded: the stream owns the fd and the context manager
+        # closes it on every exit path below.
+        with handle:
+            # S_ISREG is proven on the OPEN FILE's descriptor: one fd pins one
+            # inode across fstat and read. A FIFO-named path never wedges the
+            # checker - O_NONBLOCK made open() return immediately, and the
+            # fstat refusal fires before any read.
+            stat_result = os.fstat(handle.fileno())
+            if not stat.S_ISREG(stat_result.st_mode):
+                return None, [non_regular_refusal]
             raw = handle.read()
     except OSError as exc:
         return None, [f"{path}: unreadable: {exc}"]

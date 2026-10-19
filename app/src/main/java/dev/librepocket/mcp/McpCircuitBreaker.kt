@@ -4,7 +4,9 @@ package dev.librepocket.mcp
  * D03 逐伺服器熔斷：連續失敗達閾值即開路一段時間，期間直接短路
  * （回 [McpStatus.CIRCUIT_OPEN]），不發 HTTP，不中斷會話。
  *
- * - 失敗 = 傳輸錯誤 / 超時 / 非 2xx / 協議解析失敗（含 JSON-RPC 協議碼 error 包
+ * - 失敗 = 傳輸錯誤 / 超時 / 非 2xx（**401/403 認證錯例外**——見 [McpServer]
+ *   C-06：UNAUTHORIZED 不計熔斷、換 key／修權限後立即恢復，不等開窗）/
+ *   協議解析失敗（含 JSON-RPC 協議碼 error 包
  *   -32700/-32600/-32601/-32603、保留 server 範圍 −32099..−32000 的 error 包，
  *   以及 result 兩鍵皆無／content 必填欄位缺失等形狀不完整
  *   ——含 `isError=true` 但無 content/structuredContent 的變體，
@@ -14,7 +16,9 @@ package dev.librepocket.mcp
  *   未知碼的 error 包）為中性（[onNeutral]，不記成功也不記失敗，避免交錯 TOOL_ERROR
  *   壓住熔斷）；
  *   客戶端參數錯誤（未發送即回 PROTOCOL）同樣不碰熔斷，由呼叫方早退。
- *   本類只記 [onSuccess]/[onFailure]/[onNeutral]，語義由 [McpServer] 統一。
+ *   本類只記 [onSuccess]/[onFailure]/[onNeutral]，語義由 [McpServer] 統一
+ *   （契約面僅此三事件＋[canCall]/[isOpen]/[failureCount] 查詢——D-04 曾存在的
+ *   `onStatus`/`reset` 為零呼叫死碼，已移除，見 McpCircuitBreakerConcurrencyTest 釘面）。
  * - 時鐘可注入，執行緒安全（原創小實現，與 Jev 熔斷同構但參數獨立）。
  *
  * 預設：連續 3 次失敗開路 60s（BACKLOG D03「連續失敗熔斷」的最小實現）。
@@ -65,16 +69,5 @@ class McpCircuitBreaker(
     }
 
     @Synchronized
-    fun onStatus(ok: Boolean) {
-        if (ok) onSuccess() else onFailure()
-    }
-
-    @Synchronized
     fun failureCount(): Int = failures
-
-    @Synchronized
-    fun reset() {
-        failures = 0
-        openUntilMs = 0L
-    }
 }

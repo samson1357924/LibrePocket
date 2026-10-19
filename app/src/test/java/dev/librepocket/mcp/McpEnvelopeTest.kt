@@ -797,6 +797,39 @@ class McpEnvelopeTest {
         assertEquals(McpWire.DESCRIPTION_MAX_CHARS, list("d".repeat(501)).length)
     }
 
+    @Test fun nonStringDescriptionRejectsWholePage() {
+        // Stage4 B-05：description 缺席 → 空字串（可選欄位照收）；出現即須字串——
+        // null/數字/物件/陣列/布林一律整頁 McpProtocol `mcp: bad description`
+        //（fail-closed，與 nextCursor/inputSchema 型別政策一致；舊寬容降級
+        //「非字串→空字串」不復存在）。mutation（改回 `if (descVal is JStr)...else ""`
+        // 且拿掉拋錯）此測即紅。
+        fun json(desc: String) = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"t\",\"description\":$desc," +
+            "\"inputSchema\":{\"type\":\"object\"}}]}}"
+        // 缺席：合法（描述為空字串）。
+        val absent = McpWire.parseListPage(
+            "s1",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                "[{\"name\":\"t\",\"inputSchema\":{\"type\":\"object\"}}]}}",
+            1L,
+        )
+        assertEquals("description 缺席 → 空字串（不拒頁）", "", absent.tools[0].description)
+        for ((desc, label) in listOf(
+            "null" to "null",
+            "42" to "number",
+            "{\"x\":1}" to "object",
+            "[\"d\"]" to "array",
+            "true" to "boolean",
+        )) {
+            try {
+                McpWire.parseListPage("s1", json(desc), 1L)
+                fail("description=$label 必須整頁拒（fail-closed，不得降級空字串）")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: bad description", e.message)
+            }
+        }
+    }
+
     @Test fun loneSurrogateEscapeIsRejected() {
         // 孤立 surrogate escape（語法合法、語意無效）：出站 esc／UTF-8 編碼會把它
         // 變形為 U+FFFD，送達伺服器的名稱與列表不一致（工具識別錯位）——

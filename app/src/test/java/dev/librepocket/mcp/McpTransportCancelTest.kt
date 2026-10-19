@@ -677,7 +677,7 @@ class McpTransportCancelTest {
             assertNotNull("超大 401 必須回 UNAUTHORIZED（非 PROTOCOL/TRANSPORT/例外）", got)
             assertEquals(McpStatus.UNAUTHORIZED, got!!.status)
             assertNull("UNAUTHORIZED 不得帶 resultJson", got.resultJson)
-            assertEquals("401 必須計入熔斷失敗一次", 1, breaker.failureCount())
+            assertEquals("401 認證錯不計熔斷（C-06，與 vault-miss 同待遇）", 0, breaker.failureCount())
             assertFalse(breaker.isOpen())
             assertEquals(1, web.requestCount)
         } finally {
@@ -702,7 +702,7 @@ class McpTransportCancelTest {
             assertNotNull("超大 403 必須回 UNAUTHORIZED（非 PROTOCOL）", got)
             assertEquals(McpStatus.UNAUTHORIZED, got!!.status)
             assertNull("UNAUTHORIZED 不得帶 resultJson", got.resultJson)
-            assertEquals(1, breaker.failureCount())
+            assertEquals("403 認證錯不計熔斷（C-06）", 0, breaker.failureCount())
             assertFalse(breaker.isOpen())
             assertEquals(1, web.requestCount)
         } finally {
@@ -754,7 +754,7 @@ class McpTransportCancelTest {
             assertNotNull("超大 401 listTools 必須回 UNAUTHORIZED", first)
             assertEquals(McpStatus.UNAUTHORIZED, first!!.status)
             assertTrue(first.tools.isEmpty())
-            assertEquals(1, breaker1.failureCount())
+            assertEquals("list 401 認證錯不計熔斷（C-06）", 0, breaker1.failureCount())
             assertFalse(breaker1.isOpen())
             val breaker2 = McpCircuitBreaker()
             val server2 = McpServer(

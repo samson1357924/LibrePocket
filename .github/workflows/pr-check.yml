@@ -297,6 +297,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # Fixture self-test first (D-02): proves the guard still rejects every
+      # zero-wiring bypass surface — each wiring vector (out-of-package, in-
+      # package outbound, manifest FQN + relative component, new module) and
+      # each discovery fail-closed path (no manifests / no src roots /
+      # unreadable or zero production sources) — before trusting its PASSED
+      # on this repo.
+      - name: Run docs claim check self-test
+        run: |
+          chmod +x scripts/test_docs_claim_check.sh
+          scripts/test_docs_claim_check.sh
+
       - name: Run docs claim check
         run: |
           chmod +x scripts/docs_claim_check.sh

@@ -23,8 +23,11 @@ import kotlinx.coroutines.CancellationException
  *   `-32602`/範圍外未知碼 → TOOL_ERROR 中性（message 消毒後透傳
  *   [McpCallResult.errorMessage]——C0/DEL → `\\uXXXX` 轉義、空/純空白 → 靜態
  *   `jsonrpc error <code>`，見 [McpWire.parseCall]；不進稽核）；非空 `nextCursor` → PARTIAL（不回 OK 假完整）；
- *   HTTP 400/404/405 → PROTOCOL＋計熔斷（非暫態配置錯；429/408 等仍 TRANSPORT）；
+ *   HTTP 401/403 → UNAUTHORIZED＋**不計熔斷**（C-06：認證錯與 vault-miss／Bearer 預檢
+ *   同待遇，換 key／修權限後立即恢復）、HTTP 400/404/405 → PROTOCOL＋計熔斷（非暫態配置錯；
+ *   429/408 等仍 TRANSPORT）；
  * - 熔斷：連續失敗即開路（[McpCircuitBreaker]），開路期間短路為 CIRCUIT_OPEN；
+ *   401/403 認證錯**不計**（C-06，見上方法段）；
  *   工具業務錯（`isError=true` 且具 content/structuredContent、`-32602`/範圍外未知碼
  *   error 包）為中性，不重置亦不累計；協議碼與保留 server 範圍 error 包計熔斷
  *   （見上方法段）；result 兩鍵皆無屬形狀不完整 → 一律 PROTOCOL＋計熔斷
@@ -108,7 +111,8 @@ class McpServer(
             }
             val (code, text) = raw
             if (code == 401 || code == 403) {
-                breaker.onFailure()
+                // C-06：401/403 不計熔斷——與 vault-miss／Bearer 預檢同待遇（認證
+                // 設定錯非暫態傳輸失敗，換 key／修權限後須立即恢復，不等開窗）。
                 return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, clockMs() - start)
             }
             if (code in 300..399) {
@@ -120,8 +124,9 @@ class McpServer(
             }
             if (code == 400 || code == 404 || code == 405) {
                 // 端點/請求形狀配置錯（非暫態）：PROTOCOL + 計熔斷（同 3xx 待遇）；
-                // 429/408 等其餘 4xx/5xx 屬暫態走 TRANSPORT——所有非 2xx 分支皆計熔斷，
-                // 分類只差 status 標籤（診斷用），不差開路行為。
+                // 429/408 等其餘 4xx/5xx 屬暫態走 TRANSPORT。除 401/403（C-06：
+                // UNAUTHORIZED 不計熔斷、可立即恢復）外，其餘非 2xx 分支皆計熔斷，
+                // 分類只差 status 標籤（診斷用）。
                 breaker.onFailure()
                 return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
             }
@@ -263,7 +268,7 @@ class McpServer(
             }
             val (code, text) = raw
             if (code == 401 || code == 403) {
-                breaker.onFailure()
+                // 同 listTools：401/403 不計熔斷（C-06 認證錯立即恢復）。
                 return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, clockMs() - start)
             }
             if (code in 300..399) {
@@ -273,7 +278,8 @@ class McpServer(
             }
             if (code == 400 || code == 404 || code == 405) {
                 // 同 listTools：端點/請求形狀配置錯（非暫態）→ PROTOCOL + 計熔斷
-                // （其餘 4xx/5xx 走 TRANSPORT，但熔斷待遇相同——皆 onFailure）。
+                //（其餘 4xx/5xx 走 TRANSPORT 亦計熔斷；唯一例外 401/403——
+                // UNAUTHORIZED 不計熔斷，見上方 C-06 註記）。
                 breaker.onFailure()
                 return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
             }

@@ -4,7 +4,7 @@
 
 - **Scope:** Repository CI, local JVM/Robolectric tests, static policy gates, and separately scheduled Android device tests.
 - **Owner role:** CI/build maintainer; no individual is assigned here.
-- **Source of truth:** `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`, `.github/workflows/security-audit.yml`, `scripts/docs_claim_check.sh`, `scripts/apk_policy_inspect.py`, `scripts/summarize_junit.py`, `scripts/tests/test_apk_policy_check.py`, `scripts/tests/test_summarize_junit.py`, test source sets, Gradle wrapper/catalog, and the command results from the exact commit being assessed.
+- **Source of truth:** `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`, `.github/workflows/security-audit.yml`, `scripts/docs_claim_check.sh`, `scripts/test_docs_claim_check.sh`, `scripts/apk_policy_inspect.py`, `scripts/summarize_junit.py`, `scripts/tests/test_apk_policy_check.py`, `scripts/tests/test_summarize_junit.py`, test source sets, Gradle wrapper/catalog, and the command results from the exact commit being assessed.
 - **Update trigger:** CI, test source-set, Android SDK/JDK, policy-script, or merge-gate changes.
 
 ## Current CI scope
@@ -21,9 +21,16 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `scripts/tests/test_summarize_junit.py`,
 `scripts/tests/test_check_test_budgets.py`,
 `scripts/tests/test_check_junit_durations.py`,
+`scripts/build_release.sh`, `scripts/verify_release_apk.py`,
+`scripts/release_artifact_stage.py`,
+`scripts/tests/test_release_artifact_verifier.py`,
+`scripts/tests/test_build_release_identity.py`,
 `.github/workflows/pr-check.yml`) outputs. `docs-guard` always runs the
-static grep guard `scripts/docs_claim_check.sh` (no Gradle, no emulator);
-`pr-gate` (`always()`, needs all prior jobs) resolves a skipped Gradle
+fixture self-test `scripts/test_docs_claim_check.sh` (synthetic repos for every
+zero-wiring bypass surface — each wiring vector and each discovery fail-closed
+path —, CWD-independent) followed by the static grep guard
+`scripts/docs_claim_check.sh` (no Gradle, no emulator; requires `python3` with
+PyYAML for workflow YAML validation); `pr-gate` (`always()`, needs all prior jobs) resolves a skipped Gradle
 stage as pass only when the corresponding `changes` output is explicitly
 `false`, and fails closed otherwise.
 
@@ -148,6 +155,10 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
 python3 scripts/check_test_budgets.py
 python3 scripts/check_junit_durations.py
 
+# Docs/claims guard and its fixture self-test (static, no Gradle)
+bash scripts/docs_claim_check.sh
+bash scripts/test_docs_claim_check.sh
+
 # Flavor unit/Robolectric tests
 ./gradlew :app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest --max-workers=1 --no-daemon
 
@@ -192,7 +203,7 @@ JSON, so the harness runs them on helper-only diffs. The synthetic fixtures
 prove the gate's fail-closed matrix only; they are not real-APK/SDK evidence,
 not a signing/build rehearsal, and not a basis for closing Issue #12.
 
-The local APK release integration is `scripts/build_release.sh`; it requires `--apk`, explicit per-flavor trusted identity values, explicit SDK parser paths, and an existing output parent before it reaches credential lookup or build. It remains a local staging/verification path only, not a publishing workflow or release-readiness claim.
+The local APK release integration is `scripts/build_release.sh`; it requires `--apk`, explicit per-flavor trusted identity values, explicit SDK parser paths, and an existing output parent before it reaches credential lookup or build. It remains a local staging/verification path only, not a publishing workflow or release-readiness claim. Its helpers `scripts/release_artifact_stage.py` and `scripts/verify_release_apk.py` (covered by `scripts/tests/test_release_artifact_verifier.py` and `scripts/tests/test_build_release_identity.py`) stage and verify the release artifact for that local path; `pr-check.yml` lists them only as `policy` path triggers (not as invoked CI commands), and `scripts/docs_claim_check.sh` Section A requires every script the workflow references to be documented here.
 
 The synthetic Python fixtures and fake `aapt`/`dexdump`/`apksigner`/Gradle/policy commands test bounded parser, policy, identity, transaction, failure-cleanup, and process-cancellation behavior; they do not represent a real APK or prove Android SDK native-tool compatibility. A release/build maintainer should run the APK policy/native-parser gates against fresh debug APKs for all three flavors and record their paths, SHA-256 values, SDK build-tools version, command output, and tested commit. The separate signed-release verifier requires fresh controlled test fixtures/native-tool evidence and explicit trusted identity values; its synthetic harness alone does not establish that validation. Do not infer a pass from historical APK inventory. These are instructions, not a claim that they were run for this documentation change. Version sources are listed in [Build Environment](ENV.md).
 

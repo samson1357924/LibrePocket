@@ -112,7 +112,8 @@ class McpRegistryTest {
             assertEquals(McpStatus.OK, got!!.getValue("a").status)
             assertEquals("開路服短路為 CIRCUIT_OPEN", McpStatus.CIRCUIT_OPEN, got.getValue("down").status)
             // 反向獨立：a 服成功不得重置他服熔斷——listAll 後 down 服仍應開路。
-            //（若 listAll 誤加 servers.values.forEach { breaker.reset() }，此斷言紅。）
+            //（若 listAll 誤加「他服成功即清空 down 服 failures／開窗」的重置邏輯，
+            //  此斷言紅——breaker 僅有 onSuccess/onFailure/onNeutral 契約面，D-04。）
             assertTrue("他服成功不得重置 down 服熔斷", down.breaker().isOpen())
         } finally {
             webA.shutdown()

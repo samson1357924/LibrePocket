@@ -646,8 +646,12 @@ internal object McpWire {
      * 不採納首支；重複判定在單頁內（**跨頁不適用**：本子集不跟隨
      * `nextCursor` 分頁，見 [McpWire] 修訂立場——每頁各自獨立驗證）、
      * 名形狀驗證順序：超限 → 控制字元 → 空白 → 保留前綴 → 同頁重複，與上方
-     * KDoc 文件化順序一致；description 非字串（含 null/數字/物件）降為空字串（描述欄位型別寬容，
-     * 不影響工具可用性）、超 [DESCRIPTION_MAX_CHARS] 截斷（截斷 vs 拒絕的
+     * KDoc 文件化順序一致；description **缺席 → 空字串，出現即須字串**
+     * （null/數字/物件/布林 → [McpProtocol] `mcp: bad description`，B-05
+     * fail-closed——型別寬容曾讓伺服器以錯型別靜默降級為空描述，與
+     * `nextCursor`／`inputSchema` 的型別 fail-closed 同政策——唯 `nextCursor`
+     * 例外：顯式 null 同缺席（→ false，非整頁拒，見下段）、
+     * 超 [DESCRIPTION_MAX_CHARS] 截斷（截斷 vs 拒絕的
      * 政策區別見該常數 KDoc）。
      *
      * `nextCursor`（外部 review #3）：非空字串 → [McpListPage.hasMorePages]=true
@@ -730,6 +734,11 @@ internal object McpWire {
                     throw McpProtocol("mcp: duplicate tool name")
                 }
                 val descVal = item.find("description")
+                // B-05：description 缺席 → 空字串（欄位本身可選）；出現即須字串——
+                // null/數字/物件/布林一律整頁拒（與 inputSchema 型別 fail-closed
+                // 同政策，不靜默降級為空描述；nextCursor 例外：顯式 JNull 同缺席
+                // ——其政策是 null/缺席 → hasMorePages=false，非整頁拒）。
+                if (descVal != null && descVal !is JStr) throw McpProtocol("mcp: bad description")
                 val desc = if (descVal is JStr) descVal.v else ""
                 // inputSchema 為 MCP wire 必備欄位：缺席不得憑空合成預設
                 //（外部 review「2026-10-19 re-review P2-2」fail-open——舊碼缺 schema 合成 {"type":"object"}

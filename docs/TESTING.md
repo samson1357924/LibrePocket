@@ -23,7 +23,12 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `scripts/tests/test_summarize_junit.py`,
 `scripts/tests/test_check_test_budgets.py`,
 `scripts/tests/test_check_junit_durations.py`,
-`.github/workflows/pr-check.yml`) outputs. `docs-guard` always runs the
+`.github/workflows/pr-check.yml`) outputs. The `policy` list ends with a
+trailing `- 'scripts/**'` catch-all: the explicit entries exist for
+readability/history, and the catch-all defaults any new `scripts/`
+harness code (checker or script test) into the gate with no filter edit
+(`PolicyCiGateControl` pins the catch-all in the parsed filter list).
+`docs-guard` always runs the
 static grep guard `scripts/docs_claim_check.sh` (no Gradle, no emulator);
 `pr-gate` (`always()`, needs all prior jobs) resolves a skipped Gradle
 stage as pass only when the corresponding `changes` output is explicitly
@@ -33,7 +38,7 @@ When `code == true`, the workflow uses JDK 25 and runs these Gradle stages:
 
 1. `:app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest` (including Robolectric tests available in those source sets). The unit-tests job fans out over a flavor matrix with fail-fast disabled, so each flavor runs on its own runner and wall time is the slowest shard rather than the sum. Test report artifacts now include both HTML reports and structured JUnit XML (`app/build/test-results/`), retained for 14 days; results are parsed in real time into GitHub Actions Step Summary (`$GITHUB_STEP_SUMMARY`) to surface failure counts, skipped tests, and assertion summaries directly without requiring artifact downloads. The parser (`scripts/summarize_junit.py`, covered by `scripts/tests/test_summarize_junit.py`) is reporting-only and never a gate: it emits an explicit `Status:` line that reads `PASS` only when every XML file is readable, `tests > 0`, `failures == 0`, `errors == 0`, and every suite's counters exactly equal its direct `<testcase>` detail (`tests` vs case count, `failures+errors` vs failed cases, `skipped` vs skipped cases, either direction) — otherwise `FAIL`, `PARTIAL` (unreadable files), `INCOMPLETE` (empty or contradictory totals, including any per-suite mismatch), or `NO_RESULTS` (no XML). Only outermost suites are counted (a `<testsuite>` root counts itself; a `<testsuites>` root counts its direct `<testsuite>` children; nested suites are ignored for counting with a warning and force `INCOMPLETE`, since outer counters alone cannot prove completeness; Gradle never emits nested suites, so flat real-world results are unaffected). Rendered output is capped at 900 KiB of UTF-8 bytes (idents, messages, every warning, and the flavor title each truncated to 300 characters); overflow drops tail entries and records `omitted N failures / M skips; see XML artifact` (plus `omitted K warning(s); see XML artifact` when warnings themselves overflow), never raising.
 2. `:app:lintPlayDebug :app:lintFossDebug :app:lintGithubDebug`.
-3. `:app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug`, then `scripts/play_policy_check.sh` for Play and `scripts/play_policy_check.sh --foss` for Foss. This stage also runs when only `policy == true`.
+3. `:app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug`, then `scripts/play_policy_check.sh` for Play and `scripts/play_policy_check.sh --foss` for Foss, plus the github-mode artifact binding authority on the assembled github debug APK in the same stage (`apk_policy_inspect.py --mode github`, alongside the common five-token manifest source scan). This stage also runs when only `policy == true`.
 
 Robolectric SDK pin (Current): JVM unit tests run with `sdk=33` pinned in
 `app/src/test/resources/robolectric.properties`, while `targetSdk` is 36

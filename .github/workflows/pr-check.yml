@@ -71,9 +71,19 @@ jobs:
               # tests that pin the workflow wiring (defense in depth; a
               # workflow edit already counts as code, so Gradle stages run).
               - '.github/workflows/pr-check.yml'
+              # Trailing catch-all: the explicit entries above exist for
+              # readability/history; this glob defaults new scripts/ harness
+              # code (any new checker or script test) into the policy gate
+              # with no filter edit needed. Pinned by PolicyCiGateControl.
+              - 'scripts/**'
             bot:
               - 'github_bot/**'
               - '.github/workflows/pocketguard.yml'
+              # Kept (same defense-in-depth rationale as the policy list):
+              # this workflow owns the bot test lane (node version, npm
+              # ci/test/typecheck, pr-gate BOT case), and pocketguard.yml
+              # runs the bot but never its tests — a wiring edit must
+              # re-execute them here.
               - '.github/workflows/pr-check.yml'
 
   unit-tests:
@@ -87,6 +97,10 @@ jobs:
         flavor: [play, foss, github]
     # 單風味實測約 7m（編譯 3.5m + 測試）；三 job 並跑，wall 取決於最慢分片。
     timeout-minutes: 20
+    # Python-only: keeps __pycache__ off runners for the bare python3 gate
+    # steps (write-budget + duration gates); Gradle steps are unaffected.
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -226,6 +240,12 @@ jobs:
     if: needs.changes.outputs.policy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Job-level env: every python3 invocation in this job stays byte-import
+    # clean. The inline PYTHONDONTWRITEBYTECODE=1 prefixes on the step run
+    # lines below are redundant at runtime but kept verbatim —
+    # PolicyCiGateControl pins those exact step lines (env prefix included).
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -246,6 +266,10 @@ jobs:
     if: needs.changes.outputs.code == 'true' || needs.changes.outputs.policy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # Python-only: keeps __pycache__ off runners for the bare python3
+    # artifact-authority steps below; Gradle steps are unaffected.
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -301,8 +325,10 @@ jobs:
       # accessibility service).
       - name: Run Github Flavor Artifact Binding Check (mode-independent)
         run: |
-          AAPT=$(command -v aapt)
-          DEXDUMP=$(command -v dexdump)
+          # set -e turns a bare failing `X=$(command -v ...)` into an opaque
+          # exit 1; report the missing tool named (fail-closed, not skipped).
+          AAPT=$(command -v aapt) || { echo "::error::aapt not found: build-tools PATH step failed"; exit 1; }
+          DEXDUMP=$(command -v dexdump) || { echo "::error::dexdump not found: build-tools PATH step failed"; exit 1; }
           python3 scripts/apk_policy_inspect.py --mode github --apk app/build/outputs/apk/github/debug/app-github-debug.apk --aapt "$AAPT" --dexdump "$DEXDUMP"
           python3 scripts/backup_rules_check.py --check-permission-removals "SEND_SMS,RECEIVE_SMS,READ_SMS,MANAGE_EXTERNAL_STORAGE,BIND_VPN_SERVICE" app/src/main/AndroidManifest.xml app/src/github/AndroidManifest.xml
 

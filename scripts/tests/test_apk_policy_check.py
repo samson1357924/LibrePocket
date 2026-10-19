@@ -2718,6 +2718,10 @@ class PolicyCiGateControl(unittest.TestCase):
             "scripts/tests/test_check_test_budgets.py",
             "scripts/tests/test_check_junit_durations.py",
             ".github/workflows/pr-check.yml",
+            # Trailing catch-all (kept LAST in the yml list): defaults any
+            # new scripts/ harness code into the policy gate without a
+            # filter edit; docs/TESTING.md cites this pin.
+            "scripts/**",
         ):
             with self.subTest(path=required):
                 self.assertIn(required, patterns)

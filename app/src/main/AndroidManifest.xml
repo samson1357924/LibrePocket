@@ -14,21 +14,17 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
-    <!-- #14 SET_ALARM 發送端權限（官方 Common Intents 契約）：接收端 activity 的
-         `android:permission="com.android.alarm.permission.SET_ALARM"` 限制的是
-         「呼叫端」——Google Clock / AOSP DeskClock 的 SET_ALARM handler 以此權限
-         保護，發送 App 未持有會在 startActivity 被 SecurityException 拒絕。此為
-         normal 級權限（安裝即自動授權、非高風險，Play 不需申報或 Data Safety 披露）。 -->
+    <!-- #14 SET_ALARM 發送端權限：接收端的 SET_ALARM handler 保護「呼叫端」，
+         發送 App 未持有即在 startActivity 遭 SecurityException（normal 級，
+         Play 無需申報）。完整理由與 <queries> 可見性契約：
+         docs/specs/ANDROID_INTENT_VISIBILITY.md -->
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
 
-    <!-- S2 系統語音辨識：委託系統 RecognizerIntent（無 RECORD_AUDIO 新權限）。
-         queries 僅宣告可見性，供 PackageManager 解析辨識服務；
-         action 必須是 RECOGNIZE_SPEECH（與 VoiceStt.ACTION 同字面值），
-         不可用 RecognitionService（服務類名，非 intent action，解析不到）；
-         無服務時 ChatScreen 降級手動輸入（NO_PRIVILEGE）。
-         S2 系統語音輸出：TTS_SERVICE 可見性供 getEngines() 引擎探測；
-         targetSdk 36 package-visibility 過濾下若缺此宣告，引擎表可能為空
-         而被誤判 NO_ENGINE。 -->
+    <!-- queries 可見性（S2 語音 + #14 intent adapter）：targetSdk 36 package
+         visibility 會把未宣告的隱式 Intent 過濾掉，resolve-first launcher 即
+         resolve null＝必然假 NO_HANDLER（static check 已宣稱 NATIVE，屬契約
+         自相矛盾）。逐條理由、MIME 對應與刻意不宣告清單（launch-app 按
+         LaunchAppTool KDoc 缺口註記／DELETE）：docs/specs/ANDROID_INTENT_VISIBILITY.md -->
     <queries>
         <intent>
             <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
@@ -36,28 +32,6 @@
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
-        <!-- #14 Intent adapter（鬧鐘/日曆/音樂/導航）：targetSdk 36 下 API 30+ package
-             visibility 會把未宣告的隱式 Intent 過濾掉，使 resolveActivity 回 null
-             而被誤判為 NO_HANDLER；故補最小可見性。SET_ALARM／INSERT／EDIT＋
-             音樂與導航經 resolve-first launcher 發射的 VIEW（scheme-only：geo /
-             https——未宣告時 resolve 恆 null＝必然假 NO_HANDLER，且 static check
-             已宣稱 NATIVE，屬契約自相矛盾，故必須宣告；真機 handler E2E 仍另一
-             件事，見各工具 KDoc）。開 App 的 launcher 清單查詢仍刻意不宣告
-             （見 LaunchAppTool KDoc 的缺口註記）。
-             - SOUND_SETTINGS：VolumeTool 降級取系統音量面板（打不開 AudioManager
-               的替代）；未宣告時 resolve 恆 null＝必然假 NO_HANDLER（targetSdk 36
-               package-visibility 過濾，與下方 geo/https 同形矛盾）。
-             - SET_ALARM：執行期 Intent 無 data，action-only 即可匹配時鐘 App。
-             - INSERT/EDIT：執行期帶 content URI「＋顯式 dir/item type」（與本
-               mimeType 條目精確對應，PM 級匹配不依賴 provider-resolve，見
-               CalendarTool.buildInsertIntent 註記）；以
-               CalendarContract.Events.CONTENT_TYPE（dir/event）/
-               CONTENT_ITEM_TYPE（item/event）匹配日曆 App 過濾器；queries 的
-               path 屬性一律視為 *，故不寫 data URI。
-             刻意不宣告 DELETE（不經 launcher 發射，僅待寫描述）。SET_ALARM 發送端
-             權限見上方 uses-permission（官方契約要求，非宣告即被拒）。
-             直啟（setPackage）不採用：OEM 時鐘/日曆包名各異，硬編碼等於猜測
-             包名（#19 猜測執行禁令），且剝奪使用者選擇器。 -->
         <intent>
             <action android:name="android.intent.action.SET_ALARM" />
         </intent>

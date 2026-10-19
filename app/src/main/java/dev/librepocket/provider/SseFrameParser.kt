@@ -16,7 +16,7 @@ import java.nio.charset.CodingErrorAction
  * - UTF-8 is decoded from the raw byte stream: multi-byte characters split
  *   across [feed] chunks are buffered, never decoded per-Char.
  * - A single line longer than [MAX_LINE_BYTES] (1 MiB) latches [lineTooLong];
- *   providers translate that into `Failed(retryable=false, "SSE_LINE_TOO_LONG")`.
+ *   providers translate that into `Failed(retryable=false, LINE_TOO_LONG_MESSAGE)`.
  * - One event's total `data:` payload is capped by [MAX_FRAME_BYTES]:
  *   many tiny lines could otherwise stack past memory without tripping the
  *   per-line cap (small-line stacking attack). Exceeding it latches
@@ -53,6 +53,9 @@ class SseFrameParser {
 
         /** Typed failure for a stacked multi-line event, distinct from line/truncation. */
         const val FRAME_TOO_LARGE_MESSAGE = "SSE_FRAME_TOO_LARGE"
+
+        /** Typed failure for a single oversized SSE line. */
+        const val LINE_TOO_LONG_MESSAGE = "SSE_LINE_TOO_LONG"
     }
 
     private val byteBuf = ByteArrayOutputStream()
@@ -94,11 +97,36 @@ class SseFrameParser {
     fun feed(text: String): List<Frame> =
         feed(text.toByteArray(Charsets.UTF_8))
 
-    /** Drain any trailing buffered event at end of stream. */
+    /**
+     * Drain the stream tail at end of stream and deliver at most one buffered
+     * event (the event with no trailing blank line).
+     *
+     * This EOF drain never completes an SSE line, so it yields no frames and
+     * cannot newly latch [frameTooLong]: after any latch-free [feed], [textBuf]
+     * contains no LF and [byteBuf] holds only an incomplete UTF-8 suffix.
+     * `completeUtf8PrefixLen` never withholds an LF byte — a withheld suffix is
+     * either a short all-continuation run or starts at a non-continuation byte
+     * followed only by continuation bytes, while an ASCII byte (including
+     * `0x0A`) is never withheld — and
+     * decoding that strictly incomplete suffix at EOF only appends replacement
+     * chars, never `'\n'`. `handleLine`, the only writer of [frameTooLong], is
+     * therefore unreachable here. Any `data:` line that could still contribute
+     * to a tail event was handled by the [feed] that delivered its LF; once
+     * `handleLine` latches mid-feed, the loop breaks and every later call is
+     * short-circuited above.
+     *
+     * With no earlier latch, a pending tail event is dropped exactly when the
+     * EOF tail check latches [lineTooLong]: that check clears [pendingData],
+     * [pendingEvent] and [pendingChars], so no partial event is dispatched.
+     * (It applies the conservative `length * 3` bound to the buffered tail and
+     * also covers an over-long non-`data:` field.) With no pending event — or
+     * after [lineTooLong] or [frameTooLong] latched in an earlier call — this
+     * method returns empty. Dropping the whole tail event is the fail-closed
+     * outcome: no partial frame is handed to the protocol mapper.
+     */
     fun flush(): List<Frame> {
         if (lineTooLong || frameTooLong) return emptyList()
         val out = drainLines(atEof = true)
-        if (frameTooLong) return emptyList()
         if (pendingData.isNotEmpty() || pendingEvent != null) {
             val frame = Frame(pendingEvent, pendingData.joinToString("\n"))
             pendingEvent = null

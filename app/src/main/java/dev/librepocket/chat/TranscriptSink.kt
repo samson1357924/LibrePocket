@@ -314,6 +314,21 @@ interface TranscriptSink {
 
   /** Token usage for this turn (billing/context accounting; P1 records only). */
   suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?)
+
+  /**
+   * Post-core best-effort flush of any usage buffered for [runId] (#84/#94).
+   * Must NOT be part of the core terminal ack: callers invoke it after the
+   * terminal core write has committed so a slow/failing usage write can
+   * never delay or negate an already-durable terminal. Best-effort: a
+   * cancellation-cooperative stall is bounded by the sink's best-effort entry
+   * timeout (the entry is skipped) and non-VM failures are swallowed;
+   * [CancellationException] from real scope teardown and VM-fatal always
+   * propagate. The persisted row is a bare `system` usage row: it never
+   * carries attempt linkage (`parentRunId`/`attemptIndex`), matching the
+   * JSONL shape gate that allows linkage only on assistant/reasoning rows.
+   * Default no-op for legacy sinks.
+   */
+  suspend fun flushBufferedUsageBestEffort(runId: String) = Unit
 }
 
 /** Default sink: drops everything (used until the M4 store lands). */
@@ -385,4 +400,5 @@ class NoOpTranscriptSink : TranscriptSink {
   override suspend fun onSteerQueued(text: String) = Unit
   override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) = Unit
   override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
+  override suspend fun flushBufferedUsageBestEffort(runId: String) = Unit
 }

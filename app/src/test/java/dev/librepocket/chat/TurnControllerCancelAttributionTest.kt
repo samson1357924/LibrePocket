@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -25,6 +26,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -269,9 +271,17 @@ class TurnControllerCancelAttributionTest {
     val c = controller(
       provider,
       sink,
+      // Non-cancellation-cooperative sleeper: the gate await runs under
+      // NonCancellable, so the cancel below resumes it with neither a CE nor a
+      // cancellation observation -- it returns normally with the host already
+      // cancelled. This is the deterministic shape of the production hazard
+      // (CompletableDeferred.await() fast path / delay(<=0) never check the
+      // parent job), so ONLY the explicit ensureActive() gate before the id
+      // mint can keep the cancel attributed to the failed attempt. Removing
+      // that gate must turn this test red (mutation-pinned).
       sleeper = {
         sleeperEntered.countDown()
-        sleeperGate.await()
+        withContext(NonCancellable) { sleeperGate.await() }
       },
       retry = TurnRetryConfig(maxRetries = 1, retryDelaysMs = listOf(5_000L)),
     )
@@ -284,7 +294,9 @@ class TurnControllerCancelAttributionTest {
       val failedAttemptId =
         c.uiState.value.messages.first { it.role == "assistant" && it.text == "OLD-PARTIAL" }.id
       c.cancel()
-      // Unblock the sleeper so the host can observe the cancellation.
+      // Unblock after the cancel: the NonCancellable sleeper still returns
+      // normally, so the host reaches the ensureActive() gate already
+      // cancelled (never a cooperative CE out of the await).
       sleeperGate.complete(Unit)
       runBlocking { withTimeout(5_000) { (admission as TurnStart.Started).host.join() } }
       runBlocking { withTimeout(5_000) { c.flushTranscript() } }

@@ -10,6 +10,7 @@ import dev.librepocket.provider.ProviderFailure
 import dev.librepocket.provider.ProviderFailureCode
 import dev.librepocket.provider.SseFrameParser
 import dev.librepocket.provider.StreamEvent
+import dev.librepocket.provider.TEXT_TOO_LARGE
 import dev.librepocket.provider.TOOL_ARGS_TOO_LARGE
 import dev.librepocket.provider.FailureKind
 import dev.librepocket.provider.ProviderErrorClassifier
@@ -17,6 +18,7 @@ import dev.librepocket.provider.inferAggFailureCodeName
 import dev.librepocket.provider.requireToolAggBudget
 import dev.librepocket.provider.requireToolCountBudget
 import dev.librepocket.provider.requireTotalToolAggBudget
+import dev.librepocket.provider.requireTurnTextBudget
 import dev.librepocket.redact.Redactor
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
@@ -44,6 +46,7 @@ import java.time.ZoneId
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.coroutineContext
 
@@ -288,12 +291,40 @@ internal enum class DurableAdmission {
  * scopes share one failure semantics; the round total is monotonic per
  * attempt (`ToolDone` arrivals never decrement it).
  *
- * UI update cost: every visible delta still performs one UI update (streaming
- * visibility and cancel snapshots depend on it), so no batching cadence is
- * claimed. The cost is observable via [streamedTextDeltaCount],
- * [uiTextUpdateCount] and [uiTextCopiedChars] as the measured baseline for a
- * future throttle (TODO #16: measure on-device first; no unmeasured
- * threshold is hardcoded here).
+ * Visible text has its own per-attempt budget (#83, see
+ * `MAX_TURN_TEXT_CHARS` / `requireTurnTextBudget`): `TextDelta` +
+ * `ReasoningDelta` chars accepted into one attempt's assistant block may not
+ * exceed 100_000 (the durable-row cap, so a text-only attempt that passes
+ * fits the store without silent truncation). Exceeding it throws the same
+ * typed non-retryable `AGG_TOO_LARGE` (`TEXT_TOO_LARGE`, never silent
+ * truncation, never a retry — the failed fragment stays partial like every
+ * other budget overflow). Tool-marker text is excluded (own budgets above);
+ * a marker-heavy attempt may still hit the store truncate path (pre-existing
+ * residual, disclosed — never silently introduced here).
+ *
+ * Usage is authoritative per attempt (#84): every [StreamEvent.Usage] of one
+ * attempt merges last-wins (null fields keep the previous value) into a
+ * single pending usage, written once via [TranscriptSink.onUsage] before the
+ * attempt terminal — an Anthropic normal turn (dual `Usage`: `message_start`
+ * + `message_delta`) persists exactly one row with the final values, and a
+ * 100-event flood still persists one row. Retries start fresh (attempt
+ * isolation, like the tool budgets). [lastUsage] holds the merged
+ * authoritative value.
+ *
+ * UI update cost: visible deltas accumulate in a per-attempt buffer and flush
+ * to [_uiState] immediately while the block is small (fast first paint:
+ * shorter than [UI_TEXT_FLUSH_CHARS] and at most [UI_TEXT_FLUSH_DELTAS]
+ * appends — streaming visibility and small-turn snapshots behave exactly as
+ * before), then at most every [UI_TEXT_FLUSH_CHARS] unflushed chars or
+ * [UI_TEXT_FLUSH_DELTAS] unflushed deltas once it outgrows that cadence
+ * (#83 hybrid incremental update: buffer appends cost O(delta), only flushes
+ * copy the block, so a hostile tiny-delta drip costs O(flushes) instead of
+ * O(deltas)). Terminal and cancel paths always flush, and snapshots read the
+ * buffer, so cancellation and terminal snapshots stay exact while streaming
+ * stays live (at most one cadence behind past the first paint). The cost is
+ * observable via [streamedTextDeltaCount] (arrival count, every delta),
+ * [uiTextUpdateCount] (flush count) and [uiTextCopiedChars] (chars copied by
+ * flush commits).
  *
  * Context window: the outgoing request carries [historyCap] (default
  * Unbounded — zero behavior change); truncation is oldest-first,
@@ -377,9 +408,14 @@ class TurnController(
    *
    * Current (S3-F2): this bound owns all three wedged-writer convergences.
    * Production is 5s ([CANCEL_RECEIPT_COMPENSATION_TIMEOUT_MS]); tests inject
-   * 1s to prove the mechanism without a real 5s stall (the 6s fence below is
-   * the spec's production-convergence bar). Target: single shared ledger
-   * budget instead of three shares of this timeout.
+   * 1s to prove the mechanism without a real 5s stall. #94 note: the
+   * immediate-cancel handler now wraps its usage transfer + persist + drain in
+   * their own [OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS] bounds OUTSIDE
+   * this core bound, so a worst-case handler can exceed this timeout by up to
+   * the settle bound (`cancelSettleTimeoutMs`, production 5s, only on the
+   * SUBMITTING settle-wait sub-path) plus three best-effort bounds (the 6s
+   * fence asserts the core bound, not the full handler wall time). Target:
+   * single shared ledger budget instead of three shares of this timeout.
    */
   private val cancelCompensationTimeoutMs: Long = CANCEL_RECEIPT_COMPENSATION_TIMEOUT_MS,
   /**
@@ -472,6 +508,33 @@ class TurnController(
      * at the next admission/promotion boundary.
      */
     const val MAX_REQUEST_CHARS = 100_000
+
+    /**
+     * Per-attempt usage-notice flood cap (#84): at most this many
+     * [StreamEvent.Usage] events are merged into one attempt's authoritative
+     * usage; further events are ignored (frozen at the cap, never a failure).
+     * Legitimate turns emit at most 2 (Anthropic `message_start` +
+     * `message_delta`), so 128 leaves 64x headroom while bounding merge CPU
+     * against a usage-event flood. The sink owns the same cap per run
+     * ([dev.librepocket.session.SessionTranscriptSink]), so a direct-sink
+     * flood is bounded there too.
+     */
+    const val MAX_USAGE_EVENTS_PER_ATTEMPT = 128
+
+    /**
+     * Visible-text UI flush cadence (#83): while one attempt's block is
+     * shorter than [UI_TEXT_FLUSH_CHARS] with at most [UI_TEXT_FLUSH_DELTAS]
+     * appends, every append commits immediately (fast first paint, small-turn
+     * snapshots exactly as before); past that, commits happen at most every
+     * cadence. Streaming stays live (at most one cadence behind past the
+     * first paint) while a hostile drip of tiny deltas costs O(flushes) full
+     * copies instead of O(deltas): 3000 x 1-char deltas flush ~125 times
+     * (~143 Ki chars copied) instead of 3000 times (~4.5 Mi chars). Terminal
+     * and cancel paths always flush, so snapshots stay exact (see
+     * [assistantTextOf]).
+     */
+    const val UI_TEXT_FLUSH_CHARS = 4_096
+    const val UI_TEXT_FLUSH_DELTAS = 32
   }
 
   init {
@@ -641,6 +704,11 @@ class TurnController(
             "",
             pending.attemptIndexRef.get(),
           )
+          try {
+            orderedTranscript.flushBufferedUsageBestEffort(pending.attemptRef.get())
+          } catch (e: Throwable) {
+            if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+          }
         }
         if (completed == null) {
           // M3 landing check: an orphan is always a first-attempt family
@@ -670,7 +738,7 @@ class TurnController(
         // everything after failing the ack).
         // Current (S3-F1): narrowed to non-VM Errors. Target: sink-owned
         // fail+throw+seal for drains as well.
-        if (e is VirtualMachineError || e is ThreadDeath) throw e
+        if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
         orderedTranscript.markInterrupted(pending.logicalTurnId)
       }
     }
@@ -683,6 +751,7 @@ class TurnController(
   val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
 
   /** Last usage reported by the provider (billing/context accounting; P1 records only). */
+  @Volatile
   var lastUsage: StreamEvent.Usage? = null
     private set
 
@@ -705,37 +774,112 @@ class TurnController(
 
   /**
    * Visible-text deltas collected this controller lifetime (text + reasoning).
-   * Together with [uiTextUpdateCount]/[uiTextCopiedChars] this makes the
-   * per-delta UI-update cost observable for the future throttle decision
-   * (TODO #16): today every delta still performs one UI update (streaming
-   * visibility and the cancel-before-flush snapshot depend on it — see
-   * `cancelStopsStreamFastAndKeepsPartial`), so no batching cadence is
-   * claimed here.
-   *
-   * TODO(#16): measure delta inter-arrival rates and Compose frame times on
-   * a mid-range device across representative sessions FIRST, then introduce a
-   * count- or time-based flush throttle justified by those numbers. An
-   * unmeasured threshold must not be hardcoded; until it lands these counters
-   * are the observable baseline (a throttle must reduce [uiTextUpdateCount]
-   * and [uiTextCopiedChars] while keeping cancellation snapshots exact).
+   * Counts every accepted delta at arrival (the tripping over-budget delta is
+   * rejected before counting). Together with [uiTextUpdateCount]/
+   * [uiTextCopiedChars] this keeps the per-delta arrival rate observable while
+   * the UI commit cost below is batched (#83). Atomic so the count stays
+   * correct even if the single-writer discipline is ever relaxed.
    */
-  var streamedTextDeltaCount: Int = 0
-    private set
+  private val _streamedTextDeltaCount = AtomicInteger(0)
+  var streamedTextDeltaCount: Int
+    get() = _streamedTextDeltaCount.get()
+    private set(value) {
+      _streamedTextDeltaCount.set(value)
+    }
 
-  /** UI text writes performed (one per non-empty visible write; tool markers included). */
-  var uiTextUpdateCount: Int = 0
-    private set
+  /** UI text commits performed (one per flush: immediate while small, cadenced past it; tool markers included). Atomic, see above. */
+  private val _uiTextUpdateCount = AtomicInteger(0)
+  var uiTextUpdateCount: Int
+    get() = _uiTextUpdateCount.get()
+    private set(value) {
+      _uiTextUpdateCount.set(value)
+    }
 
   /**
-   * Chars copied by immutable UI text updates (prior block length + delta
-   * length per write, tool markers included). This is the quadratic term a
-   * future throttle must cut; exact under the controller's single-writer
-   * discipline (no concurrent writers, so the committed snapshot read by the
-   * final CAS attempt is the true prior; a future multi-writer needs CAS
-   * conflict handling or must accept approximate counters).
+   * Chars copied by immutable UI text commits (materialized block length per
+   * flush, tool markers included). Buffer appends between flushes cost
+   * O(delta) and are not counted here — that uncounted incremental path is
+   * the #83 O(n^2) fix; only flush commits copy. Exact under the
+   * controller's single-writer discipline (no concurrent writers on one
+   * attempt's buffer); atomic like the counters above.
    */
-  var uiTextCopiedChars: Long = 0
-    private set
+  private val _uiTextCopiedChars = AtomicLong(0)
+  var uiTextCopiedChars: Long
+    get() = _uiTextCopiedChars.get()
+    private set(value) {
+      _uiTextCopiedChars.set(value)
+    }
+
+  /**
+   * Per-attempt visible-text buffer (#83): the full assistant-block text
+   * (streamed text + reasoning + tool markers) plus the unflushed tail.
+   * Single-writer per attempt id (only the host coroutine touches its live
+   * attempt's buffer), so no locking beyond the concurrent map. Entries are
+   * discarded after their attempt terminal is snapshotted, so at most the
+   * live attempt is retained.
+   */
+  private class TextBuffer {
+    val text = StringBuilder()
+    var unflushedChars = 0
+    var unflushedDeltas = 0
+    /** All appends this attempt (markers included); selects the flush path below. */
+    var totalDeltas = 0
+    var hasReasoning = false
+  }
+  private val attemptTextBuffers = java.util.concurrent.ConcurrentHashMap<String, TextBuffer>()
+
+  /**
+   * Per-attempt authoritative usage (#84): merged last-wins value per live
+   * attempt id, written once before the attempt terminal. Removed by
+   * [flushAttemptUsage] (terminal/cancel paths), so at most the live attempt
+   * is retained. Attempt isolation: retries mint fresh ids with fresh cells.
+   */
+  private val attemptUsages = java.util.concurrent.ConcurrentHashMap<String, StreamEvent.Usage>()
+  /** Per-attempt usage-event arrival counts for the [MAX_USAGE_EVENTS_PER_ATTEMPT] flood cap. */
+  private val attemptUsageSeen = java.util.concurrent.ConcurrentHashMap<String, AtomicInteger>()
+
+  /**
+   * Last-wins usage merge (#84): the incoming event's non-null fields win,
+   * null fields keep the previous value — so an Anthropic dual (`Usage(in,
+   * null)` then `Usage(in, out)`) and a split (`Usage(in, null)` then
+   * `Usage(null, out)`) both converge to the authoritative final.
+   */
+  private fun mergeUsage(old: StreamEvent.Usage?, event: StreamEvent.Usage): StreamEvent.Usage =
+    StreamEvent.Usage(
+      inputTokens = event.inputTokens ?: old?.inputTokens,
+      outputTokens = event.outputTokens ?: old?.outputTokens,
+    )
+
+  /**
+   * Writes one attempt's authoritative usage (if any) as a single
+   * [TranscriptSink.onUsage] notice and clears its cells. Best-effort like
+   * every notice (seal race drops explicitly, cancellation propagates).
+   * Called before every attempt terminal (success / terminal-failure /
+   * intermediate partial) and on the cancel path, so one attempt owns at
+   * most one usage notice no matter how many `Usage` events arrived.
+   */
+  private suspend fun flushAttemptUsage(runId: String) {
+    val merged = attemptUsages[runId]
+    if (merged != null) {
+      try {
+        writeNotice { orderedTranscript.onUsage(runId, merged.inputTokens, merged.outputTokens) }
+        attemptUsages.remove(runId)
+        attemptUsageSeen.remove(runId)
+      } catch (e: Throwable) {
+        if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+        // Best-effort: swallow the failure and keep the cell. No non-cancel
+        // path flushes this attempt id again; the only later transfer is the
+        // cancel handler's flushAttemptUsage(cancelId), while this attempt is
+        // still current and the branch is not the suppressed final (e.g. the
+        // retry-backoff gap before the next mint, or a terminal window that
+        // settles FAILED), bounded by BEST_EFFORT_TIMEOUT_MS. Otherwise the
+        // row is lost — deliberate: usage is accounting-only, never
+        // load-bearing.
+      }
+    } else {
+      attemptUsageSeen.remove(runId)
+    }
+  }
 
   private val _lastRequestTrimmedCount = AtomicInteger(0)
 
@@ -1083,6 +1227,15 @@ class TurnController(
             }
             false
           } else {
+            try {
+              orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId)
+              if (receipt.cancelId != receipt.logicalTurnId) {
+                orderedTranscript.flushBufferedUsageBestEffort(receipt.logicalTurnId)
+              }
+              orderedTranscript.flush()
+            } catch (e: Throwable) {
+              if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+            }
             true
           }
         } catch (_: ClosedSendChannelException) {
@@ -1094,7 +1247,7 @@ class TurnController(
           runCatching {
             android.util.Log.w(
               "TurnController",
-              "cancel receipt system compensation failed: ${storeFailure.message}",
+              "cancel receipt system compensation failed: ${sanitizeError(storeFailure.message ?: "")}",
             )
           }
           false
@@ -1117,6 +1270,15 @@ class TurnController(
             }
             false
           } else {
+            try {
+              orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId)
+              if (receipt.cancelId != receipt.logicalTurnId) {
+                orderedTranscript.flushBufferedUsageBestEffort(receipt.logicalTurnId)
+              }
+              orderedTranscript.flush()
+            } catch (e: Throwable) {
+              if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+            }
             true
           }
         } catch (_: ClosedSendChannelException) {
@@ -1128,7 +1290,7 @@ class TurnController(
           runCatching {
             android.util.Log.w(
               "TurnController",
-              "cancel receipt compensation failed: ${storeFailure.message}",
+              "cancel receipt compensation failed: ${sanitizeError(storeFailure.message ?: "")}",
             )
           }
           false
@@ -1152,6 +1314,15 @@ class TurnController(
             }
             false
           } else {
+            try {
+              orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId)
+              if (receipt.cancelId != receipt.logicalTurnId) {
+                orderedTranscript.flushBufferedUsageBestEffort(receipt.logicalTurnId)
+              }
+              orderedTranscript.flush()
+            } catch (e: Throwable) {
+              if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+            }
             true
           }
         } catch (_: ClosedSendChannelException) {
@@ -1163,7 +1334,7 @@ class TurnController(
           runCatching {
             android.util.Log.w(
               "TurnController",
-              "cancel receipt compensation failed: ${storeFailure.message}",
+              "cancel receipt compensation failed: ${sanitizeError(storeFailure.message ?: "")}",
             )
           }
           false
@@ -1193,6 +1364,15 @@ class TurnController(
             }
             false
           } else {
+            try {
+              orderedTranscript.flushBufferedUsageBestEffort(receipt.cancelId)
+              if (receipt.cancelId != receipt.logicalTurnId) {
+                orderedTranscript.flushBufferedUsageBestEffort(receipt.logicalTurnId)
+              }
+              orderedTranscript.flush()
+            } catch (e: Throwable) {
+              if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+            }
             true
           }
         } catch (_: ClosedSendChannelException) {
@@ -1204,7 +1384,7 @@ class TurnController(
           runCatching {
             android.util.Log.w(
               "TurnController",
-              "cancel receipt batch compensation failed: ${storeFailure.message}",
+              "cancel receipt batch compensation failed: ${sanitizeError(storeFailure.message ?: "")}",
             )
           }
           false
@@ -1314,7 +1494,7 @@ class TurnController(
               runCatching {
                 android.util.Log.w(
                   "TurnController",
-                  "cancel receipt waiter failed: ${compensationFailure.message}",
+                  "cancel receipt waiter failed: ${sanitizeError(compensationFailure.message ?: "")}",
                 )
               }
               receipt.state.compareAndSet(CancelReceiptState.CLAIMED, CancelReceiptState.SEALED)
@@ -1461,7 +1641,7 @@ class TurnController(
             runCatching {
               android.util.Log.w(
                 "TurnController",
-                "cancel receipt waiter failed: ${compensationFailure.message}",
+                "cancel receipt waiter failed: ${sanitizeError(compensationFailure.message ?: "")}",
               )
             }
             receipt.state.compareAndSet(CancelReceiptState.CLAIMED, CancelReceiptState.SEALED)
@@ -1474,7 +1654,7 @@ class TurnController(
         runCatching {
           android.util.Log.w(
             "TurnController",
-            "cancel receipt waiter failed: ${waiterFailure.message}",
+            "cancel receipt waiter failed: ${sanitizeError(waiterFailure.message ?: "")}",
           )
         }
         receipt.state.compareAndSet(CancelReceiptState.PENDING, CancelReceiptState.SEALED)
@@ -1579,6 +1759,7 @@ class TurnController(
    * post-ack window, cancel it there, and assert zero-new (final) vs
    * system-mark (intermediate) without racing the microsecond return path.
    */
+  @Volatile
   internal var afterTerminalAckForTest: (suspend (String) -> Unit)? = null
 
   /** Test seam between an idle admission snapshot and its fresh policy gate. */
@@ -1675,6 +1856,32 @@ class TurnController(
    * snapshot plus monotonic failure epoch. Must run outside the lock.
    */
   internal var beforeFlushDurableReturnForTest: (suspend () -> Unit)? = null
+
+  /**
+   * D15-2 settle-wait seam: runs synchronously on the cancelled host after
+   * the SUBMITTING admission snapshot and immediately before the bounded
+   * settle wait (non-suspending, null in production). Lets the cancel-gap
+   * grid await the settle-wait decision observably instead of sleeping a
+   * fixed heuristic: once the seam fires, the host has provably committed to
+   * the SUBMITTING path, so releasing a blocked terminal writer afterwards
+   * still exercises the post-wait re-evaluation (COMMITTED keeps suppression,
+   * FAILED falls through to the normal final) instead of racing it.
+   */
+  internal var onCancelSettleWaitEnteredForTest: (() -> Unit)? = null
+
+  /**
+   * D15-2 suppressed-final seam: runs synchronously on the cancelled host as
+   * the first instruction of the `suppressed && suppressedFinal` branch
+   * (non-suspending, null in production). The branch is also reachable via
+   * the still-pending-stall sub-case (settle-wait timeout, optimistic
+   * suppression, no commit observed), so the seam alone only proves branch
+   * entry. In the commit→ack grid it fires while the writer's ack is still
+   * held (the test pins the commit via
+   * [OrderedTranscriptSink.afterCommitBeforeAckForTest] before cancelling),
+   * which is what lets that grid await it and pin "cancel landed inside the
+   * commit→ack window" without a fixed sleep.
+   */
+  internal var onSuppressedFinalFlushEnteredForTest: (() -> Unit)? = null
 
   /**
    * Returns the live in-flight host job, lazily clearing a completed one.
@@ -1926,7 +2133,7 @@ class TurnController(
       // admitted failures mark INTERRUPTED and project
       // TranscriptDurabilityException (retryable); VM-fatal always propagates
       // unwrapped, and CancellationException never lands here (caught first).
-      if (e is VirtualMachineError || e is ThreadDeath) throw e
+      if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
       if (!sent.get() && sendAttempted.get()) {
         return DurableAdmission.UNKNOWN
       }
@@ -3766,6 +3973,11 @@ class TurnController(
       val cancelId = attemptRef.get()
       val cancelIndex = attemptIndexRef.get()
       val cancelParent = parentFor(cancelId, logicalTurnId)
+      // #83: a cancel mid-stream still owns buffered (possibly unflushed)
+      // text — flush so the UI copy is exact before snapshotting. The flush
+      // is non-suspending (_uiState.update only), safe in this cancelled
+      // context; the snapshot below also reads the buffer directly.
+      flushAssistantText(cancelId)
       val cancelText = assistantTextOf(cancelId)
       // Stage F dedup, D15-2 submit-truth fix: the terminalized set holds every
       // attempt whose row is already durably acked, but it is updated only
@@ -3813,6 +4025,10 @@ class TurnController(
         if (cancelId == logicalTurnId) commitCount >= 2 else commitCount >= 1
       var terminalSubmitting = terminalFinal != null && snap.pending
       if (terminalSubmitting && !acked && !terminalCommitted) {
+        // D15-2 test seam (null in production): fires after the SUBMITTING
+        // decision so the cancel-gap grid can release its blocked terminal
+        // writer deterministically instead of sleeping a fixed heuristic.
+        onCancelSettleWaitEnteredForTest?.invoke()
         withContext(NonCancellable) {
           withTimeoutOrNull(cancelSettleTimeoutMs) {
             while (orderedTranscript.coreSubmitTruth(cancelId).pending) delay(10)
@@ -3865,6 +4081,11 @@ class TurnController(
         }
       }
       if (suppressed && suppressedFinal) {
+        // D15-2 test seam (null in production): fires on branch entry. The
+        // commit→ack grid pins the commit (afterCommitBeforeAckForTest) and
+        // holds the ack, so its wait proves the COMMITTED-observed path;
+        // the still-pending-stall sub-case also reaches this branch.
+        onSuppressedFinalFlushEnteredForTest?.invoke()
         // Success / terminal-failure final already durable (COMMITTED/acked,
         // or SUBMITTING that settled as COMMITTED during the bounded wait
         // above, or still-pending stall keeping the optimistic zero below with
@@ -3875,6 +4096,28 @@ class TurnController(
         // Durable and non-cancellable: the host is cancelled but the session
         // writer is independent, so the record below still drains on close (or
         // is explicitly marked INTERRUPTED instead of silently dropped).
+        //
+        // #84: the terminal path already transferred this attempt's usage
+        // into the sink buffer before the terminal entry was registered.
+        // Persist it as a bare system row bounded here; FIFO admission keeps
+        // it behind the terminal's slot whenever that terminal lands. On the
+        // acked/COMMITTED sub-case no receipt exists; on the still-pending
+        // SUBMITTING sub-case a PENDING receipt exists, but its revoke and
+        // compensation paths do not own usage (dedup-safe via
+        // trailingUsageWritten), so the host persists here either way. This
+        // branch dropped the buffered usage silently before the flush.
+        withContext(NonCancellable) {
+          try {
+            withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+              orderedTranscript.flushBufferedUsageBestEffort(cancelId)
+              if (cancelId != logicalTurnId) {
+                orderedTranscript.flushBufferedUsageBestEffort(logicalTurnId)
+              }
+            }
+          } catch (e: Throwable) {
+            if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+          }
+        }
       } else {
         // S3-F2: bounded immediate cancel. The compensation runs in
         // NonCancellable (channel.send + ack.await); without a timeout a
@@ -3892,8 +4135,37 @@ class TurnController(
         //
         // Current (S3-F2): production 5s, tests inject 1s (see
         // cancelCompensationTimeoutMs). Target: split notice/terminal bounds.
+        // #84 isolation: the authoritative usage transfer + persist runs
+        // OUTSIDE the timed core unit below (before/after, each under its own
+        // best-effort bound), so a stalled accounting write can never consume
+        // the core budget and turn a committed cancel into a false
+        // INTERRUPTED mark. Worst-case handler wall time is therefore
+        // settle ≤ cancelSettleTimeoutMs (production 5s; only on the
+        // SUBMITTING settle-wait sub-path) + transfer ≤ 1x best-effort bound +
+        // core ≤ cancelCompensationTimeoutMs + persist ≤ 1x (non-deferred) +
+        // drain ≤ 1x: ≤ 16s with the production 5s settle + 5s core, ≤ 14s on
+        // the deferred path (no persist), ≤ 11s when the settle-wait does not
+        // apply. The 6s test fence asserts the core bound, not this total.
+        // The deferred
+        // (notice-first) case is owned by the cancel receipt waiter, which
+        // flushes after its deferred core write; a waiter that degrades to
+        // SEALED without a deferred write intentionally drops the usage row
+        // with the dangling family (reopen backfill owns the family, usage is
+        // export-only data).
+        val deferred = terminalSubmitting && !acked && !terminalCommitted
         withContext(NonCancellable) {
           try {
+            // #84: transfer the controller's usage cell into the sink buffer
+            // before the core unit (the persist below reads the buffer).
+            try {
+              withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+                flushAttemptUsage(cancelId)
+              }
+            } catch (e: Throwable) {
+              if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+            }
+            val landingId = if (suppressed) logicalTurnId else cancelId
+            val beforeLanded = orderedTranscript.coreSubmitTruth(landingId).commitCount
             val completed = withTimeoutOrNull(cancelCompensationTimeoutMs) {
               if (suppressed) {
                 // R18-1 Stage 2: split already-durable vs still-pending.
@@ -3910,7 +4182,6 @@ class TurnController(
                 // dangling (reopen INTERRUPTED takes over) instead of user+system
                 // closed without the partial. Timeout / seal exits write no
                 // terminal row here (notice only or nothing).
-                val deferred = terminalSubmitting && !acked && !terminalCommitted
                 if (!deferred) {
                   try {
                     orderedTranscript.onLogicalTurnCancelled(logicalTurnId, cancelId, cancelText, cancelIndex)
@@ -3922,7 +4193,7 @@ class TurnController(
                     // S3-F1 (Current): narrowed fatal in the cancel mark (sink
                     // already failed the ack + sealed); keep original cancel.
                     // VM-fatal always propagates.
-                    if (e is VirtualMachineError || e is ThreadDeath) throw e
+                    if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
                   }
                 } else {
                   try {
@@ -3940,7 +4211,7 @@ class TurnController(
                     // S3-F1 (Current): narrowed fatal in the notice (writer
                     // seals); the PENDING receipt above still owns the
                     // handoff. VM-fatal always propagates.
-                    if (e is VirtualMachineError || e is ThreadDeath) throw e
+                    if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
                   }
                 }
               } else {
@@ -3958,24 +4229,50 @@ class TurnController(
                   // S3-F1 (Current): narrowed fatal in the cancel terminal
                   // (sink already failed the ack + sealed); keep original
                   // cancel. VM-fatal always propagates.
-                  if (e is VirtualMachineError || e is ThreadDeath) throw e
+                  if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
                 }
               }
             }
-            if (completed == null) {
-              // Timeout: no terminal row was written. Deferred notice-first
-              // keeps the PENDING receipt above (waiter → COMPENSATED/SEALED);
-              // every other path marks INTERRUPTED so the dangling family
-              // stays visible to flushDurable/reopen instead of reporting
-              // true-and-dangling.
-              val receiptOwned = terminalSubmitting && !acked && !terminalCommitted
-              if (!receiptOwned) {
-                if (suppressed) {
-                  orderedTranscript.markInterrupted(logicalTurnId)
-                } else {
-                  orderedTranscript.markInterrupted(cancelId)
+            // #84: accounting persist outside the timed core unit. The
+            // deferred (notice-first) case is owned by the cancel receipt
+            // waiter (it flushes after its deferred core write); every other
+            // case persists here, bounded, so a stalled usage write cannot
+            // extend the core compensation budget.
+            if (!deferred) {
+              try {
+                withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+                  orderedTranscript.flushBufferedUsageBestEffort(cancelId)
+                  if (suppressed && cancelId != logicalTurnId) {
+                    orderedTranscript.flushBufferedUsageBestEffort(logicalTurnId)
+                  }
                 }
+              } catch (e: Throwable) {
+                if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
               }
+            }
+            if (completed == null) {
+              // Core-unit timeout. [markInterruptedIfNoNewCommit] re-checks the
+              // landing truth under the sink's submitTruthLock after the delta
+              // snapshot ([beforeLanded]), so a commit that landed just before
+              // the timeout is never poisoned with a false INTERRUPTED mark
+              // (and a commit racing the mark itself still clears it via
+              // clearTimeoutMarkOnCommit). Deferred notice-first keeps the
+              // PENDING receipt above (waiter → COMPENSATED/SEALED); every
+              // other path marks INTERRUPTED only when nothing new landed, so
+              // a dangling family stays visible to flushDurable/reopen instead
+              // of reporting true-and-dangling.
+              if (!deferred) {
+                orderedTranscript.markInterruptedIfNoNewCommit(landingId, beforeLanded)
+              }
+            }
+            // Best-effort drain of accounting writes without consuming the
+            // compensation timeout above (core terminal already decided).
+            try {
+              withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+                orderedTranscript.flush()
+              }
+            } catch (e: Throwable) {
+              if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
             }
           } catch (_: ClosedSendChannelException) {
             // Sealed after close(): explicit INTERRUPTED mark already recorded.
@@ -3989,10 +4286,11 @@ class TurnController(
             // replace the original cancellation with a new fatal, except
             // VM-fatal which always propagates (contrast OrderedTranscriptSink
             // fail+throw+seal: fail the ack, mark, then rethrow).
-            if (e is VirtualMachineError || e is ThreadDeath) throw e
+            if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
           }
         }
       }
+      discardTextBuffer(cancelId)
       throw e
     } catch (e: Exception) {
       // Durable core-write failure (e.g. store IOException on started/
@@ -4001,6 +4299,10 @@ class TurnController(
       // STREAMING, and never report success. Falls through to the normal
       // completion path below (same as a provider failure): empty queue keeps
       // ERROR, queued work may still promote.
+      // The terminal path above never ran its discardTextBuffer, so drop only
+      // the active attempt's buffer (ids are never reused; clear-all could
+      // wipe a queued attempt's buffer under future multi-flight).
+      discardTextBuffer(attemptRef.get())
       synchronized(lock) {
         activityRevision++
         _uiState.update {
@@ -4021,7 +4323,10 @@ class TurnController(
       // lands here (caught first above), so CE semantics are unchanged.
       // VM-fatal (VirtualMachineError/ThreadDeath) never lands here either —
       // it always propagates (never swallowed like the sink's rethrow).
-      if (e is VirtualMachineError || e is ThreadDeath) throw e
+      if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+      // Same leak guard as the Exception path above: the terminal discard
+      // never ran, so drop only the active attempt's buffer.
+      discardTextBuffer(attemptRef.get())
       synchronized(lock) {
         activityRevision++
         _uiState.update {
@@ -4377,6 +4682,9 @@ class TurnController(
       orderedTranscript.onTurnStarted(logicalTurnId, text)
       durableUserRows.add(logicalTurnId)
     }
+    // Authoritative usage is per-turn (#84): a turn that emits no Usage must
+    // not inherit the previous turn's billing.
+    lastUsage = null
     var attempt = 0
     var attemptRunId = logicalTurnId
     while (true) {
@@ -4384,6 +4692,10 @@ class TurnController(
       val request = buildRequest(images)
       var failed: StreamEvent.Failed? = null
       var done = false
+      // Per-attempt visible-text budget (#83): TextDelta + ReasoningDelta
+      // chars accepted into this attempt's block. Tool markers are excluded
+      // (own budgets below). Retries start fresh (attempt isolation).
+      var visibleTextChars = 0
       // Tool aggregation for this attempt: deltas without a terminal ToolDone
       // are flushed as pending records so they are never silently dropped.
       val toolArgText = mutableMapOf<Int, StringBuilder>()
@@ -4469,16 +4781,27 @@ class TurnController(
           if (done || failed != null) return@collect
           when (event) {
             is StreamEvent.TextDelta -> {
-              streamedTextDeltaCount++
+              // Fail-closed visible-text budget (#83): a hostile stream of
+              // tiny text fragments must not grow memory without bound.
+              // Throws typed non-retryable TEXT_TOO_LARGE (never silent
+              // truncation); the catch below turns it into the typed terminal
+              // with the accepted fragment kept partial, like the tool
+              // budgets. Checked BEFORE buffering/display: the tripping delta
+              // is never retained and never counted.
+              requireTurnTextBudget(visibleTextChars, event.delta.length)
+              visibleTextChars += event.delta.length
+              _streamedTextDeltaCount.incrementAndGet()
               appendAssistantText(attemptRunId, event.delta)
             }
             // Reasoning stays in the same assistant block: P1 keeps one visible
             // stream and never loses thinking content. The block is additionally
             // flagged reasoning-sourced so tool-dependent / thinking-mode
             // follow-up rebuilds fail closed (ordinary no-tools ones continue).
-            // Single _uiState.update (text + flag) to avoid two full maps per delta.
+            // Shares the visible-text budget above (one block, one budget).
             is StreamEvent.ReasoningDelta -> {
-              streamedTextDeltaCount++
+              requireTurnTextBudget(visibleTextChars, event.delta.length)
+              visibleTextChars += event.delta.length
+              _streamedTextDeltaCount.incrementAndGet()
               appendReasoningDelta(attemptRunId, event.delta)
             }
             // Opaque reasoning marker: no visible text, only the source flag
@@ -4565,8 +4888,24 @@ class TurnController(
               }
             }
             is StreamEvent.Usage -> {
-              lastUsage = event
-              writeNotice { orderedTranscript.onUsage(attemptRunId, event.inputTokens, event.outputTokens) }
+              // Authoritative per-attempt usage (#84): merge last-wins (null
+              // fields keep the previous value) and write once before the
+              // attempt terminal below — never one notice per event. An
+              // Anthropic normal turn (dual Usage) persists exactly one row
+              // with the final values; a flood still persists one row
+              // (capped: frozen at MAX_USAGE_EVENTS_PER_ATTEMPT, never a
+              // failure). Attempt isolation: each retry merges into its own
+              // attempt id. [lastUsage] holds the merged authoritative value.
+              val counter = attemptUsageSeen.computeIfAbsent(attemptRunId) { AtomicInteger(0) }
+              // Freeze the per-attempt flood counter at the cap (sink parity):
+              // once MAX_USAGE_EVENTS_PER_ATTEMPT is reached, neither the
+              // counter nor the merge advances.
+              if (counter.get() < MAX_USAGE_EVENTS_PER_ATTEMPT) {
+                counter.incrementAndGet()
+                val merged = mergeUsage(attemptUsages[attemptRunId], event)
+                attemptUsages[attemptRunId] = merged
+                lastUsage = merged
+              }
             }
             is StreamEvent.Done -> {
               // Finalization waits until post-collection flush succeeds and
@@ -4611,18 +4950,11 @@ class TurnController(
           retryable = e.retryable,
           code = e.code?.name ?: inferAggFailureCodeName(e.message),
         )
-        // Single source of truth with the Failed-event path above: discard
-        // covers typed AGG_TOO_LARGE (incl. message-inferred legacy shape).
-        // UNKNOWN_RUNTIME arrives via the Failed-event path and the
-        // unknown-Exception/Throwable catches below (built-in adapters never
-        // throw it as a ProviderFailure; a custom one carrying it still
-        // discards via the same predicate); other ProviderFailures
-        // (e.g. 401) flush.
         flushCatchingBudgetOverflow()
         // AGG_TOO_LARGE is this collector's own guard: fail closed without
         // recording poison-adjacent pending tools (the typed terminal error
-        // is the observable record). Visible text is already current because
-        // text updates stay per-delta (see uiTextUpdateCount).
+        // is the observable record). Accepted visible text stays buffered and
+        // is flushed exact by the terminal path below (see flushAssistantText).
       } catch (e: IllegalArgumentException) {
         // Validation fail-closed (mirrors streamingFlow's IAE branch):
         // malformed request/arguments never retry. Flush stays, guarded by
@@ -4678,7 +5010,7 @@ class TurnController(
         // sanitizeError → UI ERROR. CancellationException never lands here
         // (rethrown first above), so CE semantics are unchanged. VM-fatal
         // always propagates (contrast OrderedTranscriptSink fail+throw+seal).
-        if (e is VirtualMachineError || e is ThreadDeath) throw e
+        if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
         coroutineContext.ensureActive()
         failed = StreamEvent.Failed(
           e.message ?: "provider error",
@@ -4688,12 +5020,19 @@ class TurnController(
       }
       val failure = failed
       if (failure == null) {
+        // Single authoritative usage notice (#84) precedes the terminal, so
+        // the sink observes exactly one usage per attempt in order.
+        flushAttemptUsage(attemptRunId)
+        // Flush the text buffer (#83) so the UI copy is exact before the
+        // snapshot below; the snapshot itself also reads the buffer.
+        flushAssistantText(attemptRunId)
         // Done arrived and post-collection flush succeeded: the fragment is
         // genuinely settled. Finalize here (not at Done receipt) so a flush
         // budget failure keeps isPartial=true per the failed-fragment
         // contract below.
         finalizeAssistant(attemptRunId)
-        // Snapshot text: assistantTextOf reads uiState at execution time.
+        // Snapshot text: assistantTextOf reads the buffer (exact, including
+        // unflushed tail) with the UI copy as fallback.
         val successText = assistantTextOf(attemptRunId)
         val successReasoning = assistantReasoningOf(attemptRunId)
         // D15-2 + R18-2: record the per-entry terminal receipt BEFORE the
@@ -4709,7 +5048,24 @@ class TurnController(
           successReceipt, successOutcome,
         )
         terminalizedAttempts.add(attemptRunId)
-        afterTerminalAckForTest?.invoke(attemptRunId)
+        withContext(NonCancellable) {
+          try {
+            // Bounded end-to-end (admission + drain): a wedged best-effort
+            // usage write must not park the host past its own timeout.
+            withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+              orderedTranscript.flushBufferedUsageBestEffort(attemptRunId)
+              orderedTranscript.flush()
+            }
+          } catch (e: Throwable) {
+            if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+          }
+        }
+        try {
+          afterTerminalAckForTest?.invoke(attemptRunId)
+        } catch (e: Throwable) {
+          if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+        }
+        discardTextBuffer(attemptRunId)
         return
       }
       // Keep the failed fragment as-is (isPartial=true); the retry below
@@ -4726,6 +5082,12 @@ class TurnController(
           activityRevision++
           _uiState.update { it.copy(status = ChatStatus.ERROR, error = clean) }
         }
+        // Single authoritative usage + exact text flush (#84/#83) precede
+        // the terminal, like the success path above. A TEXT_TOO_LARGE
+        // overflow lands here (typed non-retryable): the accepted fragment
+        // stays partial with the typed reason, never retried.
+        flushAttemptUsage(attemptRunId)
+        flushAssistantText(attemptRunId)
         // D15-2 + R18-2: per-entry receipt before admission (final, like success).
         // R18-3: the failed partial carries the live reasoning flag so the
         // ledger marker survives reopen (same contract as success/cancel).
@@ -4739,7 +5101,24 @@ class TurnController(
           assistantReasoningOf(attemptRunId),
         )
         terminalizedAttempts.add(attemptRunId)
-        afterTerminalAckForTest?.invoke(attemptRunId)
+        withContext(NonCancellable) {
+          try {
+            // Bounded end-to-end (admission + drain): a wedged best-effort
+            // usage write must not park the host past its own timeout.
+            withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+              orderedTranscript.flushBufferedUsageBestEffort(attemptRunId)
+              orderedTranscript.flush()
+            }
+          } catch (e: Throwable) {
+            if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+          }
+        }
+        try {
+          afterTerminalAckForTest?.invoke(attemptRunId)
+        } catch (e: Throwable) {
+          if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+        }
+        discardTextBuffer(attemptRunId)
         return
       }
       // Stage C: persist the retried partial BEFORE the retry notice, so a
@@ -4749,6 +5128,10 @@ class TurnController(
       // same logical family. Stage F: intermediate partials are non-final
       // (isFinal=false) so the family still dangles until a final row lands.
       val retriedClean = sanitizeError(failure.message)
+      // Single authoritative usage + exact text flush (#84/#83) precede the
+      // intermediate terminal, like the paths above.
+      flushAttemptUsage(attemptRunId)
+      flushAssistantText(attemptRunId)
       // D15-2 + R18-2: per-entry receipt before admission (non-final: the
       // family still dangles until a final row lands, so a suppressing cancel
       // writes the system mark instead of zero rows).
@@ -4765,7 +5148,24 @@ class TurnController(
         assistantReasoningOf(attemptRunId),
       )
       terminalizedAttempts.add(attemptRunId)
-      afterTerminalAckForTest?.invoke(attemptRunId)
+      withContext(NonCancellable) {
+        try {
+          // Bounded end-to-end (admission + drain): a wedged best-effort
+          // usage write must not park the host past its own timeout.
+          withTimeoutOrNull(OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS) {
+            orderedTranscript.flushBufferedUsageBestEffort(attemptRunId)
+            orderedTranscript.flush()
+          }
+        } catch (e: Throwable) {
+          if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+        }
+      }
+      try {
+        afterTerminalAckForTest?.invoke(attemptRunId)
+      } catch (e: Throwable) {
+        if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+      }
+      discardTextBuffer(attemptRunId)
       attempt += 1
       val waitMs = retryConfig.delayForRetry(attempt)
       // Bound to the logical turn (single user row), not to the failed
@@ -4779,6 +5179,17 @@ class TurnController(
         // only after the sleep, so rethrow without minting.
         throw e
       }
+      // Cancellation-cooperative gate (review-88-S3 cancel-first parity): a
+      // gate-injected sleeper (or delay(<=0) / a test sleeper whose fast path
+      // returns without checking cancellation) can return with the host
+      // already cancelled. Minting/publishing the retry id here would
+      // attribute the cancel terminal to a placeholder with empty text (the
+      // just-failed attempt's partial durably non-final) instead of the
+      // just-failed attempt the backoff-gap contract above promises.
+      // Re-check before the mint so a cancel delivered up to this point still
+      // attributes to the failed attempt id (later arrivals race the mint;
+      // see the publish note below).
+      coroutineContext.ensureActive()
       attemptRunId = newId()
       // Publish before the next placeholder: a cancel in the gap still sees
       // the just-failed id only until the new id is minted here. The index
@@ -4905,28 +5316,104 @@ class TurnController(
   }
 
   private fun appendAssistantPlaceholder(runId: String) {
+    // Fresh buffer per attempt (a retried placeholder never inherits the
+    // previous attempt's tail; the old buffer was discarded at its terminal).
+    attemptTextBuffers[runId] = TextBuffer()
     _uiState.update { s ->
       s.copy(messages = s.messages + UiMessage(id = runId, role = "assistant", text = "", isPartial = true))
     }
   }
 
+  /**
+   * Buffers one visible write (#83 incremental update): appends [delta] to
+   * the attempt buffer in O(delta) and commits to [_uiState] immediately
+   * while the block is small, at the flush cadence past it (see
+   * [flushAssistantText]). Terminal and cancel paths flush unconditionally,
+   * and snapshots read the buffer, so they stay exact. Single-writer per
+   * attempt id (only the host coroutine touches its live attempt's buffer).
+   */
   private fun appendAssistantText(runId: String, delta: String) {
     if (delta.isEmpty()) return
-    // Single-writer: prior is read from the CAS snapshot s, so a retried
-    // lambda still commits the last attempt's value. The update{} lambda may
-    // re-run on contention, so counter side effects stay outside update{} and
-    // execute exactly once per committed write.
-    var prior = 0
+    bufferAppend(runId, delta, reasoning = false)
+  }
+
+  /**
+   * Shared buffer-append for [appendAssistantText] (reasoning=false) and
+   * [appendReasoningDelta] (reasoning=true, text excluded from nothing —
+   * both share the one visible-text budget enforced by the caller).
+   */
+  private fun bufferAppend(runId: String, delta: String, reasoning: Boolean) {
+    val buf = attemptTextBuffers.computeIfAbsent(runId) { TextBuffer() }
+    if (buf.text.isEmpty()) {
+      // Late join without a placeholder (defensive; production always
+      // placeholders first): seed from the committed UI copy so the buffer
+      // stays the full block. Seeded chars are already committed, so only
+      // the new delta counts toward the next flush.
+      _uiState.value.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.let {
+        if (it.text.isNotEmpty()) buf.text.append(it.text)
+      }
+    }
+    buf.text.append(delta)
+    if (reasoning) buf.hasReasoning = true
+    buf.totalDeltas += 1
+    buf.unflushedChars += delta.length
+    buf.unflushedDeltas += 1
+    // #83 hybrid cadence: fast first paint while the block is small
+    // (immediate commit — preserves streaming visibility and every
+    // small-turn snapshot exactly as before), batched once it outgrows the
+    // cadence (only flush at cadence — bounds hostile tiny-delta drips to
+    // O(flushes) full copies instead of O(deltas)).
+    if (buf.text.length < UI_TEXT_FLUSH_CHARS && buf.totalDeltas <= UI_TEXT_FLUSH_DELTAS) {
+      flushAssistantText(runId)
+    } else if (buf.unflushedChars >= UI_TEXT_FLUSH_CHARS || buf.unflushedDeltas >= UI_TEXT_FLUSH_DELTAS) {
+      flushAssistantText(runId)
+    }
+  }
+
+  /**
+   * Commits one attempt's buffered text to [_uiState] with a single immutable
+   * copy. Exactly one [uiTextUpdateCount] increment and one
+   * [uiTextCopiedChars] charge (materialized length) per commit; buffer
+   * appends between commits cost O(delta) and are uncounted. Non-suspending
+   * (safe on the cancel path). No-op when nothing is pending.
+   */
+  private fun flushAssistantText(runId: String) {
+    val buf = attemptTextBuffers[runId] ?: return
+    if (buf.unflushedChars == 0 && buf.unflushedDeltas == 0) return
+    // No matching UI row (defensive; production always placeholders first):
+    // skip the full-history copy plus the no-op emission instead of counting
+    // a phantom commit. The buffer is kept so the terminal snapshot stays
+    // exact via assistantTextOf. Clear the dirty counters so the guard does
+    // not rescan on every later flush.
+    if (_uiState.value.messages.none { it.id == runId && it.role == "assistant" }) {
+      buf.unflushedChars = 0
+      buf.unflushedDeltas = 0
+      return
+    }
+    val snapshot = buf.text.toString()
+    val reasoning = buf.hasReasoning
+    // The update{} lambda may re-run on contention, so counter side effects
+    // stay outside update{} and execute exactly once per committed flush.
     _uiState.update { s ->
-      prior = s.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.text?.length ?: 0
       s.copy(
         messages = s.messages.map { m ->
-          if (m.id == runId && m.role == "assistant") m.copy(text = m.text + delta) else m
+          if (m.id == runId && m.role == "assistant") {
+            m.copy(text = snapshot, hasReasoning = m.hasReasoning || reasoning)
+          } else {
+            m
+          }
         },
       )
     }
-    uiTextUpdateCount++
-    uiTextCopiedChars += prior + delta.length
+    buf.unflushedChars = 0
+    buf.unflushedDeltas = 0
+    _uiTextUpdateCount.incrementAndGet()
+    _uiTextCopiedChars.addAndGet(snapshot.length.toLong())
+  }
+
+  /** Drops one attempt's buffer after its terminal snapshot (UI already exact). */
+  private fun discardTextBuffer(runId: String) {
+    attemptTextBuffers.remove(runId)
   }
 
   /**
@@ -4936,8 +5423,11 @@ class TurnController(
    * thinking-mode follow-up (ordinary no-tools follow-ups continue).
    * Short-circuits when the flag is already set to avoid a full list copy
    * plus a no-op flow emission (opaque [StreamEvent.ReasoningPresent] path).
+   * Also records the flag in the attempt buffer so a later flush preserves
+   * it even when the UI copy was already flagged first.
    */
   private fun markAssistantReasoning(runId: String) {
+    attemptTextBuffers[runId]?.hasReasoning = true
     if (_uiState.value.messages.any { it.id == runId && it.role == "assistant" && it.hasReasoning }) return
     _uiState.update { s ->
       s.copy(
@@ -4949,30 +5439,18 @@ class TurnController(
   }
 
   /**
-   * Merges one reasoning delta into the attempt's assistant block with a
-   * single [_uiState] update (one list map): appends [delta] to the visible
-   * text and sets `hasReasoning=true` together. An empty [delta] still sets
-   * the flag (empty reasoning counts as reasoning-sourced, matching the
-   * previous mark-then-append behavior where the mark ran first and the
-   * empty append returned early).
+   * Merges one reasoning delta into the attempt's buffer and flags it
+   * reasoning-sourced. An empty [delta] still sets the flag (empty reasoning
+   * counts as reasoning-sourced, matching the previous mark-then-append
+   * behavior) without text or flush accounting.
    */
   private fun appendReasoningDelta(runId: String, delta: String) {
-    // Observable cost baseline (same as appendAssistantText): every delta is
-    // exactly one update; copies count prior text re-copied plus new chars.
-    // Prior is read from the CAS snapshot s (atomic: the committed attempt's
-    // value). The update{} lambda may re-run on contention, so counter side
-    // effects stay outside update{} and execute exactly once per write.
-    var prior = 0
-    _uiState.update { s ->
-      prior = s.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.text?.length ?: 0
-      s.copy(
-        messages = s.messages.map { m ->
-          if (m.id == runId && m.role == "assistant") m.copy(text = m.text + delta, hasReasoning = true) else m
-        },
-      )
+    if (delta.isEmpty()) {
+      markAssistantReasoning(runId)
+      attemptTextBuffers.computeIfAbsent(runId) { TextBuffer() }.hasReasoning = true
+      return
     }
-    uiTextUpdateCount++
-    uiTextCopiedChars += prior + delta.length
+    bufferAppend(runId, delta, reasoning = true)
   }
 
   private fun finalizeAssistant(runId: String) {
@@ -4985,12 +5463,19 @@ class TurnController(
     }
   }
 
+  /**
+   * One attempt's assistant-block text, exact including any unflushed buffer
+   * tail (#83). Falls back to the committed UI copy once the buffer is
+   * discarded (post-terminal, UI already flushed exact).
+   */
   private fun assistantTextOf(runId: String): String =
-    _uiState.value.messages.firstOrNull { it.id == runId }?.text.orEmpty()
+    attemptTextBuffers[runId]?.text?.toString()
+      ?: _uiState.value.messages.firstOrNull { it.id == runId }?.text.orEmpty()
 
-  /** Reasoning-source flag of one attempt's block (false when absent). */
+  /** Reasoning-source flag of one attempt's block (buffer or UI, false when absent). */
   private fun assistantReasoningOf(runId: String): Boolean =
-    _uiState.value.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.hasReasoning == true
+    attemptTextBuffers[runId]?.hasReasoning == true ||
+      (_uiState.value.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.hasReasoning == true)
 }
 
 /**
@@ -5044,18 +5529,19 @@ internal fun sanitizeError(raw: String): String = Redactor.redactError(raw)
  * [StreamEvent.Failed.code] (`streamingFlow` fills `ProviderFailure.code?.name`
  * or infers it from the message; `pumpSse` sets it for SSE budget overflows),
  * or — for legacy/message-only `Failed`s with `code == null` — when
- * [failed.message] contains `TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` /
- * `SSE_LINE_TOO_LONG` case-insensitively (same markers as the classifier's
- * fatal list). Null (truncated fallback, not yet failed) is never exhausted,
- * and already-emitted `ToolDone` records are unaffected (written inline at
- * collection time, not via the pending flush).
+ * [failed.message] contains `TOOL_ARGS_TOO_LARGE` / `TEXT_TOO_LARGE` /
+ * `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG` case-insensitively (same
+ * markers as the classifier's fatal list). Null (truncated fallback, not yet
+ * failed) is never exhausted, and already-emitted `ToolDone` records are
+ * unaffected (written inline at collection time, not via the pending flush).
  */
 internal fun isResourceExhausted(failed: StreamEvent.Failed?): Boolean {
   if (failed == null) return false
   if (failed.code?.equals(ProviderFailureCode.AGG_TOO_LARGE.name, ignoreCase = true) == true) return true
   return failed.message.contains(TOOL_ARGS_TOO_LARGE, ignoreCase = true) ||
+    failed.message.contains(TEXT_TOO_LARGE, ignoreCase = true) ||
     failed.message.contains(SseFrameParser.FRAME_TOO_LARGE_MESSAGE, ignoreCase = true) ||
-    failed.message.contains("SSE_LINE_TOO_LONG", ignoreCase = true)
+    failed.message.contains(SseFrameParser.LINE_TOO_LONG_MESSAGE, ignoreCase = true)
 }
 
 /**

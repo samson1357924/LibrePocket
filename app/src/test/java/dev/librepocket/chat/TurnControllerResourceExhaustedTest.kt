@@ -6,16 +6,21 @@ import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.ChatMessage
 import dev.librepocket.provider.ChatRequest
+import dev.librepocket.provider.FailureKind
 import dev.librepocket.provider.LlmProvider
+import dev.librepocket.provider.ProviderErrorClassifier
 import dev.librepocket.provider.ProviderFailure
 import dev.librepocket.provider.ProviderFailureCode
 import dev.librepocket.provider.ProviderProtocol as ProviderProto
 import dev.librepocket.provider.SseFrameParser
 import dev.librepocket.provider.StreamEvent
+import dev.librepocket.provider.TEXT_TOO_LARGE
 import dev.librepocket.provider.TOOL_ARGS_TOO_LARGE
+import dev.librepocket.provider.inferAggFailureCodeName
 import dev.librepocket.provider.streamingFlow
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
@@ -23,6 +28,7 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -60,6 +66,10 @@ private class ResExhaustRecordingSink : TranscriptSink {
   data class Tool(val runId: String, val toolIndex: Int, val id: String, val name: String, val args: String)
   val tools: MutableList<Tool> = Collections.synchronizedList(mutableListOf())
 
+  // P3/TEST: deterministic delivery latches (no wall-clock polling).
+  val failedLatch = CompletableDeferred<Unit>()
+  val toolLatch = CompletableDeferred<Unit>()
+
   override suspend fun onTurnStarted(runId: String, text: String) = Unit
   override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
   override suspend fun onTurnSucceeded(
@@ -69,7 +79,10 @@ private class ResExhaustRecordingSink : TranscriptSink {
     attemptIndex: Int?,
     hasReasoning: Boolean,
   ) = onTurnSucceeded(runId, text, hasReasoning)
-  override suspend fun onTurnFailed(runId: String, error: String) { failed.add(error) }
+  override suspend fun onTurnFailed(runId: String, error: String) {
+    failed.add(error)
+    failedLatch.complete(Unit)
+  }
   override suspend fun onTurnFailed(
     runId: String,
     partialText: String,
@@ -106,6 +119,7 @@ private class ResExhaustRecordingSink : TranscriptSink {
   override suspend fun onSteerQueued(text: String) = Unit
   override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) {
     tools.add(Tool(runId, toolIndex, id, name, argumentsJson))
+    toolLatch.complete(Unit)
   }
   override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
 }
@@ -141,11 +155,8 @@ class TurnControllerResourceExhaustedTest {
   }
 
   private fun awaitFailed(sink: ResExhaustRecordingSink) {
-    var guard = 0
-    while (sink.failed.isEmpty()) {
-      if (++guard > 800) fail("timed out waiting for transcript failure")
-      Thread.sleep(10)
-    }
+    // P3: deterministic latch instead of a 10ms poll loop.
+    runBlocking { withTimeout(5_000) { sink.failedLatch.await() } }
   }
 
   private fun assertSuppressed(
@@ -164,7 +175,12 @@ class TurnControllerResourceExhaustedTest {
       "transcript must carry the typed reason, got: ${sink.failed.single()}",
       sink.failed.single().contains(marker),
     )
-    Thread.sleep(300)
+    // P3: deterministic drain barrier instead of a 300ms absence sleep. The
+    // turn host has joined, so no turn-scoped write can be admitted after this
+    // flush; anything a poison-flush regression would have written is already
+    // delivered to the recording sink below. The boolean result is asserted so
+    // a drain timeout cannot vacuous-pass the absence check.
+    runBlocking { assertTrue("transcript drain timed out", c.flushTranscript(8_000)) }
     assertTrue("no poison-adjacent tool records may be persisted, got: ${sink.tools}", sink.tools.isEmpty())
     val body = c.uiState.value.messages.filter { it.role == "assistant" }.single().text
     assertFalse("resource-exhausted pending tools must leave no marker, got: ${body.take(120)}", body.contains("[tool:"))
@@ -196,6 +212,82 @@ class TurnControllerResourceExhaustedTest {
     } finally {
       c.close()
     }
+  }
+
+  @Test fun textTooLargeViaCodedStreamingFlowSuppressesPendingFlush() {
+    val provider = ResExhaustFakeProvider()
+    provider.handler = {
+      streamingFlow {
+        emit(StreamEvent.ToolDelta(0, "id-0", "f", "{\"a\":1}"))
+        emit(StreamEvent.ToolDelta(0, null, null, "x"))
+        throw ProviderFailure(false, TEXT_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
+      }
+    }
+    // Probe the transport layer directly: the typed throw must surface as a
+    // coded non-retryable Failed (code propagation, not just message text).
+    val probe = runBlocking {
+      provider.handler(ChatRequest(model = "m", messages = listOf(ChatMessage("user", "hi")))).toList()
+    }
+    val probeFailed = probe.filterIsInstance<StreamEvent.Failed>().single()
+    assertTrue(probeFailed.message.contains(TEXT_TOO_LARGE))
+    assertEquals(ProviderFailureCode.AGG_TOO_LARGE.name, probeFailed.code)
+    assertFalse("TEXT_TOO_LARGE must be non-retryable", probeFailed.retryable)
+
+    val sink = ResExhaustRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertSuppressed(c, provider, sink, TEXT_TOO_LARGE)
+      // The collector-thrown shape (code present after the Phase 1 fix) and
+      // the legacy message-only shape must both read as exhausted.
+      assertTrue(isResourceExhausted(StreamEvent.Failed(TEXT_TOO_LARGE, retryable = false)))
+      assertTrue(
+        isResourceExhausted(
+          StreamEvent.Failed(
+            TEXT_TOO_LARGE,
+            retryable = false,
+            code = ProviderFailureCode.AGG_TOO_LARGE.name,
+          ),
+        ),
+      )
+      assertFalse(isResourceExhausted(StreamEvent.Failed("boom", retryable = true)))
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun textTooLargeCollectorThrowSuppressesPendingFlush() {
+    // Collector-thrown TEXT_TOO_LARGE (requireTurnTextBudget) takes the
+    // `catch ProviderFailure` path: pending ToolDeltas must not flush.
+    val provider = ResExhaustFakeProvider {
+      flow {
+        emit(StreamEvent.ToolDelta(0, "id-0", "f", "{\"a\":1}"))
+        emit(StreamEvent.ToolDelta(0, null, null, "x"))
+        repeat(101) { emit(StreamEvent.TextDelta(0, 0, "y".repeat(1_000))) }
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = ResExhaustRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertSuppressed(c, provider, sink, TEXT_TOO_LARGE)
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun textTooLargeMarkersAreFatalAndInferAggTooLarge() {
+    // Classifier: a text_too_large body snippet is fatal (never retried),
+    // consistent with inferAggFailureCodeName and isResourceExhausted.
+    assertEquals(
+      FailureKind.FATAL,
+      ProviderErrorClassifier.classify(null, null, "response text_too_large: budget exceeded"),
+    )
+    assertEquals(
+      ProviderFailureCode.AGG_TOO_LARGE.name,
+      inferAggFailureCodeName("TEXT_TOO_LARGE: per-attempt budget exceeded"),
+    )
   }
 
   @Test fun sseFrameTooLargeMessageOnlyStillSuppressesPendingFlush() {
@@ -271,12 +363,10 @@ class TurnControllerResourceExhaustedTest {
       assertEquals("poisoned stream must not be retried", 1, provider.streamCalls.get())
       awaitFailed(sink)
       assertEquals(1, sink.failed.size)
-      var guard = 0
-      while (sink.tools.isEmpty()) {
-        if (++guard > 800) fail("timed out waiting for preserved tool record")
-        Thread.sleep(10)
-      }
-      Thread.sleep(300)
+      // P3: deterministic tool-delivery latch + drain barrier instead of polls
+      // and a 300ms absence sleep (boolean asserted: no vacuous drain timeout).
+      runBlocking { withTimeout(5_000) { sink.toolLatch.await() } }
+      runBlocking { assertTrue("transcript drain timed out", c.flushTranscript(8_000)) }
       assertEquals("only the completed ToolDone survives, got: ${sink.tools}", 1, sink.tools.size)
       val kept = sink.tools.single()
       assertEquals(0, kept.toolIndex)

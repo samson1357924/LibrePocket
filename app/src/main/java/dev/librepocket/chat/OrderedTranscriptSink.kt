@@ -19,6 +19,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
@@ -76,6 +77,19 @@ class OrderedTranscriptSink(
      * production for non-terminal entries.
      */
     val outcome: AtomicReference<Boolean?>? = null,
+    /**
+     * Best-effort accounting entry: a cancellation-cooperative stall or
+     * non-VM failure in [block] must not block subsequent durable core writes
+     * or seal the writer. Such entries run under [BEST_EFFORT_TIMEOUT_MS]
+     * (skipped on timeout) and their non-VM failures (including non-VM
+     * Errors) are swallowed; CancellationException from real scope teardown
+     * and VM-fatal/ThreadDeath still propagate. A store call that blocks
+     * without a suspension point (e.g. a blocking transaction on the writer
+     * thread) cannot be preempted by the timeout — that is the same shared
+     * store limit as core entries, documented in the P1 spec, and is not
+     * covered by this flag.
+     */
+    val bestEffort: Boolean = false,
   )
 
   private val writerScope = CoroutineScope(SupervisorJob() + dispatcher)
@@ -224,8 +238,9 @@ class OrderedTranscriptSink(
    * - [beforeSendForTest] runs after the predecessor gate completes and
    *   before the channel send; tests suspend it on a gate to deterministically
    *   widen the await -> send gap that pre-fix newcomers exploited.
-   * - [afterSendForTest] runs after the channel send returns and before the
-   *   `sent` proof flag is set (core writes only). Deterministic proxy
+   * - [afterSendForTest] runs after the channel send returns — before the
+   *   `sent` proof flag on core writes (with a flag); the flush barrier also
+   *   fires it (that path has no flag). Deterministic proxy
    *   (stronger-than-production: guaranteed-admitted) for the send-races-cancel
    *   flag shape (`sent == false && sendAttempted == true`): production's true
    *   window is a CE racing a suspended channel send (send throws CE with the
@@ -380,30 +395,59 @@ class OrderedTranscriptSink(
     check(!Thread.holdsLock(admissionLock)) { "PG-W2: $hook must not run under admissionLock" }
 
   private val writer: Job = writerScope.launch {
+    var lastFailure: Throwable? = null
     try {
       for (entry in channel) {
         var failure: Throwable? = null
         try {
-          entry.block()
+          if (entry.bestEffort) {
+            withTimeout(BEST_EFFORT_TIMEOUT_MS) { entry.block() }
+          } else {
+            entry.block()
+          }
         } catch (e: CancellationException) {
-          // Writer teardown (shutdown scope cancel): remember the failure so
-          // the finally below fails the ack explicitly instead of reporting a
-          // false durable ack, then propagate so the writer ends.
-          failure = e
-          throw e
+          if (entry.bestEffort && writerScope.isActive) {
+            // Best-effort accounting: swallow cancellation (including the
+            // bounded-timeout cancellation) so a stalled usage write can never
+            // seal the writer or block subsequent durable core writes. Scope
+            // cancellation (shutdown) still propagates below.
+            failure = null
+          } else {
+            // Writer teardown (shutdown scope cancel): remember the failure so
+            // the finally below fails the ack explicitly instead of reporting a
+            // false durable ack, then propagate so the writer ends.
+            failure = e
+            throw e
+          }
         } catch (e: Exception) {
           // Durable core failure (e.g. store IOException): fail this entry's
           // ack explicitly; the writer itself stays alive for later entries.
           // Notice entries carry no ack, so this stays best-effort for them.
           failure = e
+          if (entry.bestEffort) {
+            // Accounting failures are best-effort: do not fail/seal.
+            failure = null
+          }
         } catch (e: Throwable) {
           // Fatal Error (e.g. store AssertionError/LinkageError): fail this
           // entry's ack explicitly instead of reporting a false durable ack,
           // then propagate so the writer seals like teardown. Never swallow
           // and never continue draining behind a fatal.
           failure = e
-          throw e
+          if (entry.bestEffort && !(e is VirtualMachineError || e is ThreadDeath)) {
+            // Non-VM fatal in an accounting entry must not seal the writer
+            // or block later core writes; swallow it (best-effort).
+            failure = null
+          } else {
+            throw e
+          }
         } finally {
+          // Only propagating failures (cancellation / VM-fatal) should become
+          // the seal cause for later outstanding acks; routine durable store
+          // failures keep the writer alive and must not poison the seal cause.
+          if (failure != null && (failure is CancellationException || failure !is Exception)) {
+            lastFailure = failure
+          }
           val ack = entry.ack
           if (ack != null) {
             coreAcks.remove(ack)
@@ -479,7 +523,7 @@ class OrderedTranscriptSink(
     } finally {
       // Any exit (teardown, fatal, or post-seal drain) seals: no later core
       // may park unbounded behind a dead writer.
-      sealWriter(CancellationException("transcript writer dead"))
+      sealWriter(lastFailure ?: CancellationException("transcript writer dead"))
     }
   }
 
@@ -687,7 +731,10 @@ class OrderedTranscriptSink(
   ) = writeOrdered { delegate.onToolDone(runId, toolIndex, id, name, argumentsJson) }
 
   override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) =
-    writeOrdered { delegate.onUsage(runId, inputTokens, outputTokens) }
+    writeOrdered(bestEffort = true) { delegate.onUsage(runId, inputTokens, outputTokens) }
+
+  override suspend fun flushBufferedUsageBestEffort(runId: String) =
+    writeOrdered(bestEffort = true) { delegate.flushBufferedUsageBestEffort(runId) }
 
   /**
    * Awaits the unified admission tail until stable (no newer reservation).
@@ -961,7 +1008,7 @@ class OrderedTranscriptSink(
    * path, and `close()` clears the controller FIFO, so there is nothing to
    * fall back to here.
    */
-  private suspend fun writeOrdered(block: suspend () -> Unit) {
+  private suspend fun writeOrdered(bestEffort: Boolean = false, block: suspend () -> Unit) {
     // No catch: admission failure is the caller's explicit signal.
     // CancellationException propagates to the cancelled caller, and
     // ClosedSendChannelException (sealed after shutdown) propagates to the
@@ -981,7 +1028,7 @@ class OrderedTranscriptSink(
       checkNotHoldingAdmissionLock("beforeSendForTest:writeOrdered")
       beforeSendForTest?.invoke(reservation.ticket)
       sendInvoked = true
-      channel.send(Entry(runId = null, block))
+      channel.send(Entry(runId = null, block, bestEffort = bestEffort))
     } finally {
       if (sendInvoked) releaseAdmission(reservation.gate)
       else releaseAbandoned(reservation)
@@ -1145,6 +1192,13 @@ class OrderedTranscriptSink(
             writer.join()
             return@withTimeoutOrNull
           }
+          // Post-send test seam (null in production): same signal shape as
+          // core writes, so a test can prove the barrier is buffered before
+          // acting on the writer (e.g. firing a fatal) — otherwise the
+          // send-vs-seal ordering is a race the sealed-join path above could
+          // win, reporting a drained flush instead of the parked failure.
+          checkNotHoldingAdmissionLock("afterSendForTest:flush")
+          afterSendForTest?.invoke(reservation.ticket)
           // Release before the drain: the send was attempted, so successors
           // may proceed while this caller waits. Idempotent with the finally
           // below, which covers timeout/cancel abandonment paths.
@@ -1217,7 +1271,19 @@ class OrderedTranscriptSink(
           // Durability truth stays in interrupted/hasDurableFailures, never
           // a false success from this swallow.
         }
-        if (!flush(drainTimeoutMs)) {
+        val flushed = try {
+          flush(drainTimeoutMs)
+        } catch (_: Throwable) {
+          // Security Finding3 (Stage-3, intentional teardown swallow): same
+          // rationale as the settle catch above — a throw here (non-VM Error
+          // from a broken store, a CE from a flush bug, even VM-fatal) must
+          // fall through to the orphan mark + seal below instead of aborting
+          // the teardown; the writer entry loop already rethrew any VM-fatal
+          // to seal. flushed=false drives the fail-closed path, so the
+          // swallow can never fabricate durability.
+          false
+        }
+        if (!flushed) {
           val cause = CancellationException("transcript drain timeout")
           for (runId in pendingCore.toList()) {
             // R23-1 late-commit race: the writer may commit between the
@@ -1366,6 +1432,24 @@ class OrderedTranscriptSink(
       }
       pendingCore.remove(runId)
       if (!interrupted.contains(runId)) interrupted.add(runId)
+    }
+  }
+
+  /**
+   * Atomic landing-check variant of [markInterrupted] for cancel
+   * compensation: mark [runId] only when no commit landed after the caller's
+   * [beforeCommitCount] snapshot. The count re-check and the mark run under
+   * [submitTruthLock] (nested [poisonLock] inside it, the established
+   * submitTruthLock → poisonLock order shared with [clearTimeoutMarkOnCommit]),
+   * closing the read→mark gap: a commit racing the caller's timeout either
+   * bumped the count before this lock (mark skipped) or takes the same lock
+   * afterwards and clears any mark via [clearTimeoutMarkOnCommit] — never a
+   * sticky false INTERRUPTED.
+   */
+  internal fun markInterruptedIfNoNewCommit(runId: String, beforeCommitCount: Int) {
+    synchronized(submitTruthLock) {
+      val after = commitCounts[runId]?.get() ?: 0
+      if (after <= beforeCommitCount) markInterrupted(runId)
     }
   }
 
@@ -1554,5 +1638,6 @@ class OrderedTranscriptSink(
     const val DEFAULT_CAPACITY = 128
     const val DEFAULT_DRAIN_TIMEOUT_MS = 5_000L
     const val DEFAULT_FLUSH_TIMEOUT_MS = 5_000L
+    const val BEST_EFFORT_TIMEOUT_MS = 2_000L
   }
 }

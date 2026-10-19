@@ -94,6 +94,10 @@ class ProviderErrorTest {
             FailureKind.FATAL,
             ProviderErrorClassifier.classify(null, null, "SSE_LINE_TOO_LONG"),
         )
+        assertEquals(
+            FailureKind.FATAL,
+            ProviderErrorClassifier.classify(null, null, "TEXT_TOO_LARGE"),
+        )
     }
 
     @Test

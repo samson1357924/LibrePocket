@@ -11,7 +11,7 @@
 >
 > **Target scope:** provider BYOK, minimum chat loop, session persistence, policy model, and local tests. Agent tool execution, GUI, terminal, MCP, memory, and cloud sync were originally scoped as later work. “No app-managed cloud sync” does not mean Android Auto Backup is disabled.
 
-### Current 行為補充（conversation-ledger；以程式為準，補充核對至 `0185935` S1–S7＋R27＋R28-1）
+### Current 行為補充（conversation-ledger；以程式為準，補充核對至 `0185935` S1–S7＋R27＋R28-1，另加 PR #94 P1–P4：`Failed.code` 傳遞、classifier `text_too_large`、sink distinct 256 順序、預算／用量邊界與 cancel+usage 測試硬化；P1 retry-gap cancel 歸因（`ensureActive` gate）、P2 CE cancel handler 用量隔離（transfer／persist 移出 core timed unit 各包 `BEST_EFFORT_TIMEOUT_MS`、`markInterruptedIfNoNewCommit` 原子 landing check、suppressed-final 補寫、usage 列改 bare `system`（無 linkage）對齊 JsonlCodec S2-F2 gate、呼叫端 CE/VM rethrow；writer live CE 視為 stall）、P3 測試決定性（`messagesProjection` generation fence、latch／drain barrier 取代 sleep、retained-usage 重試測試）、P4 docs 同步＋`SseFrameParser.flush` 不可達 frameTooLong 重檢移除（新增 tail flush 測試）；另加 R2：rebase 至 `c169276`、usage post-ack best-effort（不在 terminal unit 內）、Atomic 計數器；本輪 review-round-9 修復：`a73bdff4`（retained-failed usage 逐出時連同 `usageSeen` 計數丟棄，`usageSeen ⊆ pending ∪ retained`）、`f617748b`（cancel／trim race seam 化：`onCancelSettleWaitEnteredForTest`／`onSuppressedFinalFlushEnteredForTest` latch、`afterSendForTest` flush seam、投影 `generation` fence 取代 sleep；best-effort teardown／IOException 測試）、`b64014c4`（P1_SPEC §3.4 EOF tail flush 契約（至多一個 LF 完整尾事件、未 LF 終止片段丟棄、tail-cap latch 丟整個 pending 事件）＋刻意 WHATWG 偏離；§3.2 retained-LRU 256 與 CE 留原緩衝語意；ProviderTransport KDoc；tail `[DONE]` 正／負 mutation-pinned e2e；`MAX_TURN_TEXT_CHARS`／`MAX_REQUEST_CHARS`＝`RoomSessionStore.MAX_TEXT_CHARS` pin；`TEXT_TOO_LARGE` classify 列）、`38cc63e6`（cancel 最壞 wall-time 16s＝settle 5s＋transfer 2s＋core 5s＋persist 2s（non-deferred）＋drain 2s；deferred 14s／無 settle-wait 11s；`flushAttemptUsage` retained cell 的後續 transfer 僅餘 cancel handler（attempt 仍 current、非 suppressed-final 分支；例如 retry-backoff gap））；程式以 PR #94 head（`07858f6`＋P1–P4 `04fa17d`／`eaaae4e`／`5e9e38a`／`5a920e42`＋`55836653`（final-review 硬化）＋本輪修復 `a73bdff4`／`f617748b`／`b64014c4`／`38cc63e6`）為準；2026-10-19 核對；本輪已跑 JVM 單測（`:app:testGithubDebugUnitTest` 全 suite 綠，另 targeted 套件），未執行 instrumented／裝置 smoke）
 
 - **8 個 `CHAT_*` notice 碼**（見 `ChatScreen.chatNoticeText`／`ChatViewModel`）：`CHAT_SEND_DENIED`、`CHAT_APPROVAL_REQUIRED`、`CHAT_POLICY_UNAVAILABLE`、`CHAT_INPUT_TOO_LONG`、`CHAT_STORE_UNAVAILABLE` 皆為 NOT accepted（本次未送出，呼叫者保留文字；`INPUT_TOO_LONG` 為 100k 邊界 fail-fast）；`CHAT_STORE_PENDING` 為 UNKNOWN／PENDING_COMMIT（見下）；`CHAT_CANCELLED_RECOVERY`、`CHAT_QUEUE_RECOVERY_REQUIRED` 為排隊保留 recovery（取消／待送訊息已保留，須手動確認重送）。
 - **UNKNOWN／settle（勿重送）：** `TranscriptPendingException` 表示超時送後 fate 未定；ownership 保留，同 opId 重送被擋，直到 `TurnController.settlePendingAdmission` 以同一邏輯 id 認領（claim）或轉失敗可重試（convert）。呼叫者收到 PENDING 時必須 NOT 重送。
@@ -399,7 +399,9 @@ sealed interface StreamEvent {
 | 終態異常 | 缺 `[DONE]`/無合法 `finish_reason` → `Failed(retryable=true)` | `response.completed` 缺 `output`/空陣列 → 用流內已收增量恢復（記 `recovered=true`）；`response.failed/incomplete` → `Failed` | 缺 `message_stop` 或可見/工具塊未閉合 → `Failed(retryable=true)` |
 
 - 發送前上下文窗口（Current）：`HistoryWindowCap` 僅裁剪發送用請求副本（oldest-first，淘汰最舊、保留最新、整訊息；預設 `Unbounded` 即不裁剪），UI 與 transcript 保留完整歷史；裁剪數見 `TurnController.droppedHistoryCount`（永不靜默）。token 預算待裝置量測後再定（TODO #16，不硬編數字）。
-- UI 更新成本（Current）：可見增量仍逐 delta 寫入（串流可見性＋cancel 快照依賴）；`streamedTextDeltaCount`／`uiTextUpdateCount`／`uiTextCopiedChars` 為節流決策提供可觀察基線，節流閾值待裝置量測後再定（TODO #16）。
+- UI 更新成本（Current）：可見增量先進 per-attempt buffer（O(delta) 累加）；區塊尚小時即時向 UI 提交（首繪快速、小 turn 行為不變），超出 4 KiB／32 append 節奏後才批次提交；終端與 cancel 必沖洗，快照讀 buffer，故串流可見且快照精確；`streamedTextDeltaCount` 計到達數（超限觸發 delta 在計數前被拒，不計入）、`uiTextUpdateCount` 計提交數（無匹配 UI 列的 flush 跳過提交、不計數）、`uiTextCopiedChars` 計提交拷貝字元。
+- 可見文字預算（Current，#83）：每 attempt `TextDelta`＋`ReasoningDelta` 合計不得超過 100_000 字元（`MAX_TURN_TEXT_CHARS`，等於 durable-row 上限，tool marker 不計）；超限為 typed non-retryable `TEXT_TOO_LARGE`（code `AGG_TOO_LARGE`），不靜默截斷、不重試，失敗片段保留 partial。
+- 用量權威值（Current，#84＋P1 fail-closed 跟進＋P2 隔離）：每 attempt 單一權威 Usage：last-wins 合併，null 欄位保留舊值，`TurnController` 在終端前寫一次（flush 亦清 attempt 計數），`SessionTranscriptSink.flushBufferedUsageBestEffort(runId)` 在終端 core entry 之後 best-effort 補寫（正常路徑為 commit／ack 後；非 suppressed-final、非 deferred 的 cancel 路徑為 bounded core timed unit 後，即使 timeout／store failure 仍會嘗試 persist（CE/VM 另行處理）；suppressed-final／deferred 見下；不在 terminal batch 內，失敗吞掉不影響終端；一般終端 core write 失敗而尚未進入 flush 時緩衝保留，同 runId 重試仍保有該列）；該列為 bare `system` 列：`parentRunId`／`attemptIndex` 恆 `null`（無 attempt linkage），對齊 JsonlCodec S2-F2 形狀 gate（system 列帶 linkage 會使匯出後匯入失敗）；`OrderedTranscriptSink` 以 `BEST_EFFORT_TIMEOUT_MS`（2s）界住單次補寫（writer 端僅跳過可取消 stall；無 suspension point 的 blocking store call 仍共用 store 限制；非 VM 失敗吞、VM/ThreadDeath 重拋；live best-effort 的 CE（含 timeout）視為 stall 吞掉、僅 teardown 重拋，usage-flush 的 controller catch 重拋 CE/VM；receipt waiter 的 bounded helper 會將 CE 降級為 SEALED/false），best-effort 使用量寫入的 store 失敗（非 CE／VM／ThreadDeath，被吞）會把合併後 payload（null 欄位沿用 retained 舊值）移入 retained LRU（上限 `MAX_RETAINED_FAILED_USAGE_RUNS`=256）供後續 flush 重試，逐出最舊 payload 時連同其 `usageSeen` 計數一併丟棄（#94 P2：不留孤兒計數，計數 map 由 pending＋retained 共同界定；被逐出但仍留在 `pendingUsage` 的 runId（direct-sink 雙棲）可重新累積新的有界計數（每逐出週期上限同 `MAX_USAGE_EVENTS_PER_RUN` = 128））；取消／timeout 不走 retained 路徑——entry 留在原緩衝（`pendingUsage`／retained 不變）待後續 flush，CE 依前述各層規則傳播（ordered 層 live best-effort CE 含 `BEST_EFFORT_TIMEOUT_MS` stall 吞掉、僅 teardown 重拋、controller usage-flush catch 重拋 CE/VM），成功後 `trailingUsageWritten` 使同 runId 再次 flush／新 trailing notice 直接丟棄（每 runId 唯一一列，僅補寫 ack 被取消的 at-least-once 窗除外）；controller 的 attemptRunId 即 sink 的 runId；Anthropic 雙 Usage 正常 turn 單行，100 事件 flood 仍單行，flood 上限各層 128（第 129 起凍結）；sink 另有「已緩衝、尚未終端化」的 distinct runId 256 上限（超限 best-effort 丟棄，先擋後記帳；terminalized/trailing runId 不計入）＋ post-terminal trailing 每 runId 限追加一次（終端已沖洗者直接丟棄，全 runId 唯一一列）；cancel 路徑（P2）：authoritative transfer 在 core timed unit 前、persist 在後，各包同一 best-effort 界（不佔 `cancelCompensationTimeoutMs` 補償預算），suppressed-final 分支亦補寫，deferred（notice-first）由 cancel receipt waiter 在 deferred core write 後補寫；timeout 的 landing check 只在 commitCount 無新增時才標 INTERRUPTED（`markInterruptedIfNoNewCommit` 與 commit 同 `submitTruthLock`，杜絕假 sticky mark）；`lastUsage` 為 per-turn：無 Usage 的 turn 重置為 null（不繼承前一 turn）。
 
 ### 3.3 工具 ID 與多輪一致性（P1 記錄、不執行）
 
@@ -412,6 +414,7 @@ sealed interface StreamEvent {
 - 按行切分；`data:` 前綴去一空格後拼接，多行 `data:` 以 `\n` 合併為單一 payload。
 - `:` 開頭行為註釋心跳（丟棄，不報錯）。
 - `data: [DONE]`（Chat）為流結束標記，不做 JSON 解析。
+- EOF（連線乾淨關閉）：`flush()` 至多補發一個已緩衝但未見空行邊界的尾事件（`data:`／`event:` 行均已 LF 終止；多行 `data:` 照常以 `\n` 合併）；未見 LF 的最後一行永不完成（整行丟棄、絕不併入 payload，其位元組僅在 EOF 解碼以執行尾端上限）。故尾端 `data: [DONE]\n` 後立即斷線（無空行）仍會送達該尾事件，使已具 `finish_reason` 的 Chat 終結為成功——此為對 WHATWG（EOF 丟棄 pending event，該形狀將變成可重試 `SSE_TRUNCATED`）的刻意偏離；未 LF 終止的片段照樣丟棄（fail-closed：絕不產生部分 payload）。尾端上限亦 fail-closed：EOF 尾檢查對緩衝的無換行尾端以保守 ×3 估計超過 `MAX_LINE_BYTES` 時鎖定 `lineTooLong`，鎖定會清空並丟棄整個 pending 尾事件（不派發任何部分 frame）；`frameTooLong` 不可能於 flush 時新鎖定（flush 的 drain 不存在未處理的 LF 終止行，`handleLine` 故不可達）。證據：`SseParserTest.flushDeliversTailEventWithoutTrailingBlankLine`、`SseParserTest.flushTailLatchAtEofDropsPendingEvent`；provider e2e 正／負控見 `ProviderTransportC1Test.chatDoneTailWithoutTrailingBlankLineStillCommitsDone`、`chatFinishReasonWithoutDoneAtEofFailsRetryable`。
 - UTF-8 按位元組流解碼，不得按 Char 切分（多位元組字元跨 chunk 時緩衝未完成位元組）。
 - 單行上限 1 MiB（防惡意服務端撐爆內存；超限 → `Failed("SSE_LINE_TOO_LONG", retryable=false, code="AGG_TOO_LARGE")`）。
 - 單事件 `data:` 總量上限 1 MiB（沿用單行預算，非新數字；防多小行堆疊攻擊——每行合法但合併超限 → `Failed("SSE_FRAME_TOO_LARGE", retryable=false, code="AGG_TOO_LARGE")`，與單行超限／`SSE_TRUNCATED` 斷線區分）。
@@ -469,8 +472,8 @@ object ProviderErrorClassifier {
 | 類別 | 條件 | `retryable` |
 |------|------|-------------|
 | RETRYABLE | 連接中斷、讀超時、提前 EOF、HTTP 408/409/425/429/5xx（除 501）、`SSE_TRUNCATED` | `true` |
-| FATAL | 401/403（認證）、402/402變體（額度/計費）、400/422（協議格式）、證書錯誤（SSLHandshake）、`IMAGE_TOO_LARGE`、`SSE_LINE_TOO_LONG`、`SSE_FRAME_TOO_LARGE`、`TOOL_ARGS_TOO_LARGE`、URL/協議配置錯 | `false` |
-| 啟發式 | body 含 `insufficient_quota|billing|invalid_api_key|unauthorized|image_too_large|sse_line_too_long|sse_frame_too_large|tool_args_too_large`（大小寫無關） → FATAL；含 `rate_limit|overloaded|timeout|temporarily` → RETRYABLE | — |
+| FATAL | 401/403（認證）、402/402變體（額度/計費）、400/422（協議格式）、證書錯誤（SSLHandshake）、`IMAGE_TOO_LARGE`、`SSE_LINE_TOO_LONG`、`SSE_FRAME_TOO_LARGE`、`TOOL_ARGS_TOO_LARGE`、`TEXT_TOO_LARGE`、URL/協議配置錯 | `false` |
+| 啟發式 | body 含 `insufficient_quota|billing|invalid_api_key|unauthorized|image_too_large|sse_line_too_long|sse_frame_too_large|tool_args_too_large|text_too_large`（大小寫無關） → FATAL；含 `rate_limit|overloaded|timeout|temporarily` → RETRYABLE | — |
 - 型別化交叉引用（Current）：聚合／SSE 預算溢出另以型別化 `ProviderFailureCode.AGG_TOO_LARGE`（`ProviderFailure.code`／`StreamEvent.Failed.code`）傳遞，與上表 body 標記同義（`isResourceExhausted` 認 code 亦認 marker；實作見 `StreamEvent.kt`／`ProviderTransport.streamingFlow`／`TurnController.shouldDiscardPendingTools`）。未知 runtime 失敗另以 `ProviderFailureCode.UNKNOWN_RUNTIME` 傳遞（`streamingFlow` unknown fallback／直接拋 unknown／Error），`shouldDiscardPendingTools` 認 `AGG_TOO_LARGE` 或 `UNKNOWN_RUNTIME`；其他 `code == null` 致命事件（401／validation）維持 flush。
 
 ### 5.3 重試語義
@@ -741,8 +744,8 @@ resource := wildcard 路徑，支援 "*"（單段）與 "**"（跨段），如�
 
 | 測試類 | 層 | 斷言要點 |
 |--------|----|----------|
-| `SseFrameParserTest` | [J] | 多行 `data:` 合併；註釋心跳丟棄；`[DONE]` 識別；UTF-8 多位元組跨 chunk；單行超 1 MiB → 錯誤；空行切分 |
-| `ChatCompletionsProviderTest` | [J]（MockWebServer 重放，真實 SSE 文本 fixture） | `index` 聚合 tool_call；空 ID 不覆蓋；缺 ID 分配唯一值；`finish_reason` 結束塊；缺 `[DONE]` → `Failed(retryable=true)`；`reasoning_content` 去重 |
+| `SseParserTest` | [J] | 多行 `data:` 合併；註釋心跳丟棄；`[DONE]` 識別；UTF-8 多位元組跨 chunk；單行超 1 MiB → 錯誤；空行切分 |
+| `ChatCompletionsMappingTest` | [J]（真實 SSE 文本 fixture 重放） | `index` 聚合 tool_call；空 ID 不覆蓋；缺 ID 分配唯一值；`finish_reason` 結束塊；缺 `[DONE]` → `Failed(retryable=true)`；`reasoning_content` 去重 |
 | `ResponsesProviderTest` | [J] | `stream:true/store:false` 出站斷言；`response.completed` 空 output 用流內增量恢復；`response.failed` → FATAL；opaque 欄位不進 transcript |
 | `AnthropicProviderTest` | [J] | `anthropic-version` 頭；`max_tokens` 必填；`thinking_delta` 投影；塊未閉合 + 缺 `message_stop` → `Failed`；簽名塊不持久化 |
 | `ProviderErrorClassifierTest` | [J] | 表 §5.2 全覆蓋：429/5xx→RETRYABLE；401/402/400→FATAL；body 啟發式大小寫無關；`null` code + `SSLHandshakeException`→FATAL |
@@ -800,7 +803,7 @@ resource := wildcard 路徑，支援 "*"（單段）與 "**"（跨段），如�
 
 ### 11.2 SSE 解析單測
 
-- `SseFrameParserTest`、`ChatCompletionsProviderTest`、`ResponsesProviderTest`、`AnthropicProviderTest` 四類全綠，且 fixture 為真實抓包脫敏文本（非手編最小串）。
+- `SseParserTest`、`ChatCompletionsMappingTest`、`ResponsesProviderTest`、`AnthropicProviderTest` 四類全綠，且 fixture 為真實抓包脫敏文本（非手編最小串）。
 
 ### 11.3 脫敏單測
 

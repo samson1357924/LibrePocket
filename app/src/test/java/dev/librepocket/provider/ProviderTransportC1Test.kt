@@ -443,6 +443,75 @@ class ProviderTransportC1Test {
     }
 
     /**
+     * EOF tail-dispatch contract at provider e2e level: the final
+     * `data: [DONE]` line is LF-terminated but the body ends with NO trailing
+     * blank line, so only `SseFrameParser.flush()` can deliver it. A parser or
+     * mapper regression that discards the buffered tail would turn this into
+     * retryable `SSE_TRUNCATED` instead of the success; the parser-level pin is
+     * [SseParserTest.flushDeliversTailEventWithoutTrailingBlankLine].
+     */
+    @Test
+    fun chatDoneTailWithoutTrailingBlankLineStillCommitsDone() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val body = buildString {
+                append("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+                append("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+                // LF-terminated, never blank-line terminated: flush() owns it.
+                append("data: [DONE]\n")
+            }
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(body),
+            )
+            val events = withTimeout(10_000) {
+                providerFor(ProviderProtocol.CHAT_COMPLETIONS, server).stream(request()).toList()
+            }
+            assertEquals("exactly one Done, got: $events", 1, events.count { it is StreamEvent.Done })
+            assertTrue("the EOF tail must not append a failure", events.none { it is StreamEvent.Failed })
+            assertEquals(StreamEvent.Done("stop"), events.last())
+            assertEquals("one terminal is one request", 1, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    /**
+     * Negative control for [chatDoneTailWithoutTrailingBlankLineStillCommitsDone]:
+     * the same body WITHOUT the `[DONE]` line ends at the finish_reason frame
+     * boundary, and `finish_reason` alone must never succeed — the honest clean
+     * EOF is the retryable truncation. Proves the positive control is not
+     * vacuous and locks the honest-EOF truncation shape.
+     */
+    @Test
+    fun chatFinishReasonWithoutDoneAtEofFailsRetryable() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val body = buildString {
+                append("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+                append("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+            }
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(body),
+            )
+            val events = withTimeout(10_000) {
+                providerFor(ProviderProtocol.CHAT_COMPLETIONS, server).stream(request()).toList()
+            }
+            assertTrue("finish_reason alone must never produce Done", events.none { it is StreamEvent.Done })
+            assertEquals(1, events.count { it is StreamEvent.Failed })
+            assertEquals(StreamEvent.Failed("SSE_TRUNCATED", retryable = true), events.last())
+            assertEquals("truncated stream remains one request", 1, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    /**
      * EOF-flush latch path: one newline-free line whose final multi-byte char
      * is split across the last read. Everything decoded before EOF is exactly
      * `MAX_LINE_BYTES / 3` chars — one char UNDER the tail latch — because the
@@ -465,7 +534,7 @@ class ProviderTransportC1Test {
             val body = Buffer()
                 .writeUtf8(prefix)
                 .writeUtf8("中".repeat(tailChars - 1))
-                .writeByte(0xE4) // lead byte of the final char; completes only at EOF
+                .writeByte(0xE4) // lead byte of 中; EOF yields one U+FFFD, never a completed char
             server.enqueue(
                 MockResponse()
                     .setHeader("Content-Type", "text/event-stream")

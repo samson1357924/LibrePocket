@@ -1,0 +1,616 @@
+package dev.librepocket.session
+
+import java.io.IOException
+import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
+import org.junit.Test
+
+/**
+ * Non-atomic store fallback probe (owner P1 repro shape): routes every row
+ * through the real [FakeSessionStore.appendEvent] shaping but uses the
+ * [SessionStore] default sequential [SessionStore.appendEvents] loop (no
+ * snapshot / rollback) with [IOException] injected at the given 1-based
+ * [appendEvent] call numbers — a committed prefix behind a thrown terminal.
+ */
+private class SequentialFaultStore(
+    private val failAtCalls: Set<Int>,
+) : FakeSessionStore() {
+    var calls = 0
+        private set
+
+    override suspend fun appendEvent(event: TranscriptEvent): Long {
+        if (++calls in failAtCalls) throw IOException("injected fault at appendEvent call $calls")
+        return super.appendEvent(event)
+    }
+
+    override suspend fun appendEvents(events: List<TranscriptEvent>): List<Long> {
+        // Reproduce the SessionStore default sequential fallback by hand: each
+        // row goes through the (possibly fault-injecting) appendEvent above,
+        // so a mid-batch throw leaves the committed prefix behind (non-atomic).
+        val ids = ArrayList<Long>(events.size)
+        for (event in events) ids.add(appendEvent(event))
+        return ids
+    }
+}
+
+/**
+ * #94 P2 probe store: routes every row through the real
+ * [FakeSessionStore.appendEvent] shaping but faults only usage rows
+ * (`kind == "system"` with the `usage ` prefix) while [failUsageWrites] is
+ * set — core rows stay durable so the retention/eviction paths can be driven
+ * for an unbounded number of runIds without touching the surrounding rows.
+ */
+private class UsageFaultStore : FakeSessionStore() {
+    var failUsageWrites = true
+
+    override suspend fun appendEvent(event: TranscriptEvent): Long {
+        if (failUsageWrites && event.kind == "system" && event.text.startsWith("usage ")) {
+            throw IOException("injected usage-only fault")
+        }
+        return super.appendEvent(event)
+    }
+}
+
+/**
+ * #84 sink-level regressions for [SessionTranscriptSink.onUsage]: pre-terminal
+ * calls merge last-wins by runId and flush as exactly one `system` row after
+ * the attempt's terminal ack (flood-safe, capped); a post-terminal trailing call
+ * keeps the legacy single-row shape unless the terminal already flushed.
+ */
+class SessionTranscriptSinkUsageTest {
+
+    private fun usageRows(store: FakeSessionStore): List<TranscriptEvent> =
+        store.events.filter { it.kind == "system" && it.text.startsWith("usage ") }
+
+    /**
+     * P2 probe: current accounting-container key sets
+     * `(pending, retained, seen)`. Reflection follows the repo convention for
+     * private-state pins (see the ChatViewModel fence tests); production
+     * exposes no seam for this. Keys (not just sizes) are returned so a
+     * counter dropped for the wrong runId cannot slip through as "bounded".
+     */
+    private fun accountingKeys(
+        sink: SessionTranscriptSink,
+    ): Triple<Set<String>, Set<String>, Set<String>> {
+        fun keysOf(field: String): Set<String> {
+            val f = SessionTranscriptSink::class.java.getDeclaredField(field)
+            f.isAccessible = true
+            @Suppress("UNCHECKED_CAST")
+            return (f.get(sink) as Map<String, *>).keys.toSet()
+        }
+        return Triple(keysOf("pendingUsage"), keysOf("retainedFailedUsage"), keysOf("usageSeen"))
+    }
+
+    @Test
+    fun dualPreTerminalUsageMergesToSingleRowWithFinalValues() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        // Anthropic shape: input-only first, full values on the delta.
+        sink.onUsage("r1", 10, null)
+        sink.onUsage("r1", 10, 20)
+        sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
+
+        val rows = usageRows(store)
+        assertEquals(1, rows.size)
+        assertEquals("usage input=10 output=20", rows.single().text)
+        assertEquals("r1", rows.single().runId)
+        // S2-F2 shape gate: the usage row is a bare system row — it never
+        // carries attempt linkage (parentRunId/attemptIndex), matching
+        // JsonlCodec's import gate for system rows.
+        assertEquals(null, rows.single().parentRunId)
+        assertEquals(null, rows.single().attemptIndex)
+    }
+
+    @Test
+    fun splitNullsMergeLastWins() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onUsage("r1", 10, null)
+        sink.onUsage("r1", null, 20)
+        sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
+
+        val rows = usageRows(store)
+        assertEquals(1, rows.size)
+        assertEquals("usage input=10 output=20", rows.single().text)
+    }
+
+    @Test
+    fun flood100PreTerminalStillSingleRow() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        repeat(100) { i -> sink.onUsage("r1", i, i * 2) }
+        sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
+
+        val rows = usageRows(store)
+        assertEquals(1, rows.size)
+        assertEquals("usage input=99 output=198", rows.single().text)
+    }
+
+    @Test
+    fun usageFloodCapFreezesPast128() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        repeat(130) { i -> sink.onUsage("r1", i, i * 2) }
+        sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
+
+        // Past MAX_USAGE_EVENTS_PER_RUN the merge freezes (never a failure,
+        // never unbounded CPU): the row keeps the cap's values, still one row.
+        val rows = usageRows(store)
+        assertEquals(1, rows.size)
+        assertEquals("usage input=127 output=254", rows.single().text)
+    }
+
+    @Test
+    fun distinctRunsDoNotMerge() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onUsage("a", 1, 1)
+        sink.onUsage("b", 2, 2)
+        sink.onTurnSucceeded("a", "first", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("a")
+        sink.onTurnSucceeded("b", "second", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("b")
+
+        val rows = usageRows(store)
+        assertEquals(2, rows.size)
+        assertEquals("usage input=1 output=1", rows.first { it.runId == "a" }.text)
+        assertEquals("usage input=2 output=2", rows.first { it.runId == "b" }.text)
+    }
+
+    @Test
+    fun trailingPostTerminalUsageAppendsOnceThenDrops() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        // Legacy call order (terminal already written): the first trailing
+        // call keeps the historical single-row shape, the rest rate-limit.
+        sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
+        sink.onUsage("r1", 10, 20)
+        sink.onUsage("r1", 11, 21)
+        sink.onUsage("r1", 12, 22)
+
+        val rows = usageRows(store)
+        assertEquals(1, rows.size)
+        assertEquals("usage input=10 output=20", rows.single().text)
+    }
+
+    @Test
+    fun failedTerminalFlushesPendingUsage() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onUsage("r1", 7, null)
+        sink.onUsage("r1", null, 8)
+        sink.onTurnFailed("r1", "half", "boom", null, 0, true, false)
+        sink.flushBufferedUsageBestEffort("r1")
+
+        val rows = usageRows(store)
+        assertEquals(1, rows.size)
+        assertEquals("usage input=7 output=8", rows.single().text)
+    }
+
+    @Test
+    fun cancelledTerminalFlushesPendingUsage() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onUsage("r1", 3, 4)
+        sink.onTurnCancelled("r1", "partial", null, 0, false)
+        sink.flushBufferedUsageBestEffort("r1")
+
+        val rows = usageRows(store)
+        assertEquals(1, rows.size)
+        assertEquals("usage input=3 output=4", rows.single().text)
+    }
+
+    @Test
+    fun usageCapExactBoundary128And129Freeze() = runBlocking {
+        // 128 events merge fully (last wins = event 127); the 129th is
+        // ignored: both freeze at (127, 254), pinning `seen <= 128`.
+        for (count in listOf(128, 129)) {
+            val store = FakeSessionStore()
+            val sid = store.createSession("hi", "m")
+            val sink = SessionTranscriptSink(store, sid) { 42L }
+
+            repeat(count) { i -> sink.onUsage("r1", i, i * 2) }
+            sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+            sink.flushBufferedUsageBestEffort("r1")
+
+            val rows = usageRows(store)
+            assertEquals("$count events still one row", 1, rows.size)
+            assertEquals("usage input=127 output=254", rows.single().text)
+        }
+    }
+
+    @Test
+    fun distinctRunsCappedAt256DropsBestEffort() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        // 300 distinct pre-terminal runIds: only the first 256 buffer
+        // (insertion order); the rest drop best-effort without throwing.
+        repeat(300) { i -> sink.onUsage("r$i", i, i) }
+        // A buffered run must still merge while full (the cap only gates new
+        // runIds, never updates to an already-buffered one).
+        sink.onUsage("r0", 100, 100)
+        sink.onTurnSucceeded("r0", "kept", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r0")
+        sink.onTurnSucceeded("r299", "dropped", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r299")
+
+        val rows = usageRows(store)
+        assertEquals("usage input=100 output=100", rows.first { it.runId == "r0" }.text)
+        assertTrue("r299 usage must have been dropped", rows.none { it.runId == "r299" })
+    }
+
+    @Test
+    fun trailingAfterFailedAppendsOnceThenDrops() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onTurnFailed("r1", "half", "boom", null, 0, true, false)
+        sink.flushBufferedUsageBestEffort("r1")
+        sink.onUsage("r1", 10, 20)
+        sink.onUsage("r1", 11, 21)
+
+        val rows = usageRows(store)
+        assertEquals(1, rows.size)
+        assertEquals("usage input=10 output=20", rows.single().text)
+    }
+
+    @Test
+    fun preAndPostTerminalUsageWritesExactlyOneRow() = runBlocking {
+        // Owner P2: a terminal-flushed usage consumes the trailing budget —
+        // pre- plus post-terminal usage still own exactly one row.
+        val store = FakeSessionStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onUsage("r1", 1, 2)
+        sink.onTurnSucceeded("r1", "ok", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
+        sink.onUsage("r1", 3, 4)
+
+        val rows = usageRows(store)
+        assertEquals("pre+post terminal usage must own exactly one row", 1, rows.size)
+        assertEquals("usage input=1 output=2", rows.single().text)
+    }
+
+    @Test
+    fun failedFlushRetainsUsageForLaterFlush() = runBlocking {
+        // P3: a swallowed usage-write fault must not lose the row — the entry
+        // moves to the bounded retained set (LRU) and a later flush persists
+        // it exactly once. Previously only the fault-swallow half was covered.
+        val store = SequentialFaultStore(setOf(1))
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onUsage("r1", 5, 6)
+        // Call #1 faults and is swallowed; nothing lands.
+        sink.flushBufferedUsageBestEffort("r1")
+        assertTrue("faulted flush must not persist a row", usageRows(store).isEmpty())
+        // Call #2 retries from the retained set: exactly one bare row.
+        sink.flushBufferedUsageBestEffort("r1")
+        val rows = usageRows(store)
+        assertEquals(1, rows.size)
+        assertEquals("usage input=5 output=6", rows.single().text)
+        assertEquals(null, rows.single().parentRunId)
+        assertEquals(null, rows.single().attemptIndex)
+        // Call #3 is a no-op, and a fresh notice afterwards must also drop: the
+        // successful flush marked the trailing window for this runId, so
+        // neither a re-flush nor a new onUsage may append a second row.
+        sink.flushBufferedUsageBestEffort("r1")
+        sink.onUsage("r1", 9, 9)
+        sink.flushBufferedUsageBestEffort("r1")
+        assertEquals(1, usageRows(store).size)
+        assertEquals("no third append may happen for a trailing run", 2, store.calls)
+    }
+
+    @Test
+    fun successUsageFaultAfterCoreAckKeepsTerminal() = runBlocking {
+        // Owner P1: usage rides outside the terminal unit — a usage-write
+        // fault on a non-atomic fallback must not break the terminal.
+        val store = SequentialFaultStore(setOf(2))
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onUsage("r1", 10, 20)
+        // Core single assistant row is call #1, usage notice is call #2
+        // (fault swallowed) — the terminal itself must not throw.
+        sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
+
+        assertTrue("usage fault must be swallowed", usageRows(store).isEmpty())
+        val assistants = store.events.filter { it.runId == "r1" && it.kind == "assistant" }
+        assertEquals(1, assistants.size)
+        assertTrue(assistants.single().isFinal)
+        assertEquals("hi there", assistants.single().text)
+    }
+
+    @Test
+    fun successReasoningCoreFaultMidBatchStaysDangling() = runBlocking {
+        // Owner P1: the core batch keeps its pre-#84 fail-closed shape — a
+        // mid-batch fault leaves at most the orphan marker, never a final
+        // assistant (the marker itself is isFinal but never a family terminal).
+        val store = SequentialFaultStore(setOf(2))
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onUsage("r1", 10, 20)
+        try {
+            // Batch is [reasoning #1, assistant #2]: the fault strands the
+            // marker while the terminal throws — no committed final.
+            sink.onTurnSucceeded("r1", "hi there", hasReasoning = true)
+            sink.flushBufferedUsageBestEffort("r1")
+            fail("core batch fault must propagate")
+        } catch (_: IOException) {
+        }
+        val r1 = store.events.filter { it.runId == "r1" }
+        assertEquals("only the orphan marker may persist", listOf("reasoning"), r1.map { it.kind })
+    }
+
+    @Test
+    fun failedTerminalUsageFaultKeepsCore() = runBlocking {
+        // Owner P1, failed path: core single partial is call #1, usage
+        // notice is call #2 (fault swallowed) — the failure row persists.
+        val store = SequentialFaultStore(setOf(2))
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onUsage("r1", 7, 8)
+        sink.onTurnFailed("r1", "half", "boom", null, 0, true, false)
+        sink.flushBufferedUsageBestEffort("r1")
+
+        val partials = store.events.filter { it.runId == "r1" && it.kind == "assistant" }
+        assertEquals(1, partials.size)
+        assertTrue(partials.single().isPartial)
+        assertTrue("usage fault must be swallowed", usageRows(store).isEmpty())
+    }
+
+    @Test
+    fun cancelledTerminalUsageFaultKeepsCore() = runBlocking {
+        // Owner P1, cancel path: same shape as the failed path.
+        val store = SequentialFaultStore(setOf(2))
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onUsage("r1", 3, 4)
+        sink.onTurnCancelled("r1", "partial", null, 0, false)
+        sink.flushBufferedUsageBestEffort("r1")
+
+        val partials = store.events.filter { it.runId == "r1" && it.kind == "assistant" }
+        assertEquals(1, partials.size)
+        assertTrue(partials.single().isPartial)
+        assertTrue(partials.single().isFinal)
+        assertTrue("usage fault must be swallowed", usageRows(store).isEmpty())
+    }
+
+    @Test
+    fun failedAndCancelledCoreFaultMidBatchPropagatesWithoutFinal() = runBlocking {
+        // Owner P1, racing-cancel path: fault on the 2nd row (reasoning
+        // marker) leaves the non-final partial only — still dangling.
+        val store = SequentialFaultStore(setOf(2))
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        try {
+            sink.onTurnFailedAndCancelled("L", "A9", "half", "boom", null, 0, true)
+            fail("core batch fault must propagate")
+        } catch (_: IOException) {
+        }
+        val attempt = store.events.filter { it.runId == "A9" }
+        assertEquals("only the non-final partial may persist", listOf("assistant"), attempt.map { it.kind })
+        assertTrue(attempt.single().isPartial)
+        assertTrue(attempt.single().isFinal.not())
+        assertTrue("no terminal mark may commit behind a thrown terminal", store.events.none { it.isFinal })
+    }
+
+    @Test
+    fun sameRunIdTerminalRetryPreservesUsageAfterCoreFault() = runBlocking {
+        // Owner P1: pre-ack memory is not cleared — a same-runId terminal
+        // retry after a core fault still owns its authoritative usage row.
+        val store = SequentialFaultStore(setOf(1))
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onUsage("r1", 7, 8)
+        try {
+            // Core single assistant row is call #1: nothing commits.
+            sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+            sink.flushBufferedUsageBestEffort("r1")
+            fail("core fault must propagate")
+        } catch (_: IOException) {
+        }
+        assertTrue(store.events.none { it.runId == "r1" })
+        // Retry: assistant is call #2, usage notice is call #3 — both land.
+        sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+        sink.flushBufferedUsageBestEffort("r1")
+
+        val rows = usageRows(store)
+        assertEquals(1, rows.size)
+        assertEquals("usage input=7 output=8", rows.single().text)
+        assertEquals(1, store.events.count { it.runId == "r1" && it.kind == "assistant" })
+    }
+
+    @Test
+    fun failedFlushKeepsFloodCapForLaterRetry() = runBlocking {
+        // P2 pairing: keeping usageSeen across a failed flush is what freezes
+        // the merge past MAX_USAGE_EVENTS_PER_RUN even when the row is later
+        // retried successfully.
+        val store = UsageFaultStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        repeat(130) { i -> sink.onUsage("r1", i, i * 2) }
+        // Fails and is swallowed; the row moves to the retained bucket but the
+        // run's 128-event freeze must survive.
+        sink.flushBufferedUsageBestEffort("r1")
+        assertTrue("faulted flush must not persist a row", usageRows(store).isEmpty())
+        store.failUsageWrites = false
+        repeat(130) { i -> sink.onUsage("r1", 1_000 + i, 2_000 + i * 2) }
+        sink.flushBufferedUsageBestEffort("r1")
+
+        val rows = usageRows(store)
+        assertEquals(1, rows.size)
+        assertEquals("usage input=127 output=254", rows.single().text)
+    }
+
+    @Test
+    fun failedUsageEvictionDropsFloodCounterWithPayload() = runBlocking {
+        // P2 (review round 9): evicting the oldest retained failed usage at
+        // MAX_RETAINED_FAILED_USAGE_RUNS must drop that runId's flood counter
+        // too — otherwise usageSeen grows O(N) while the payload set stays
+        // capped at 256.
+        val store = UsageFaultStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        repeat(300) { i ->
+            sink.onUsage("r$i", i, i)
+            sink.onTurnSucceeded("r$i", "ok", hasReasoning = false)
+            sink.flushBufferedUsageBestEffort("r$i")
+        }
+        val (pending, retained, seen) = accountingKeys(sink)
+        assertTrue("no active payload may survive a failed flush", pending.isEmpty())
+        assertEquals(SessionTranscriptSink.MAX_RETAINED_FAILED_USAGE_RUNS, retained.size)
+        assertEquals("flood counters must follow payload eviction", retained, seen)
+        assertTrue("the oldest key must be evicted from both", "r0" !in seen && "r0" !in retained)
+        assertTrue("the kept LRU window must stay", "r44" in seen && "r299" in seen)
+
+        // A retained retry still persists exactly once (the newest entry),
+        // while an evicted run's payload is gone (bounded best-effort loss).
+        store.failUsageWrites = false
+        sink.flushBufferedUsageBestEffort("r299")
+        assertEquals(listOf("usage input=299 output=299"), usageRows(store).map { it.text })
+        sink.flushBufferedUsageBestEffort("r0")
+        assertEquals(1, usageRows(store).size)
+    }
+
+    @Test
+    fun trailingFailedUsageEvictionDropsFloodCounterWithPayload() = runBlocking {
+        // Same P2 invariant through the post-terminal trailing path: the run
+        // buffered pre-terminal usage, was terminalized, and its immediate
+        // trailing write failed into the retained bucket.
+        val store = UsageFaultStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        repeat(300) { i ->
+            sink.onUsage("t$i", i, i)
+            sink.onTurnSucceeded("t$i", "ok", hasReasoning = false)
+            sink.onUsage("t$i", i, i)
+        }
+        val (pending, retained, seen) = accountingKeys(sink)
+        assertTrue("no active payload may survive a failed flush", pending.isEmpty())
+        assertEquals(SessionTranscriptSink.MAX_RETAINED_FAILED_USAGE_RUNS, retained.size)
+        assertEquals("flood counters must follow payload eviction", retained, seen)
+        assertTrue("the oldest key must be evicted from both", "t0" !in seen && "t0" !in retained)
+
+        // A trailing retry of a retained (still not trailing-written) run
+        // persists exactly once; an evicted runId has no payload left.
+        store.failUsageWrites = false
+        sink.onUsage("t299", 5, 6)
+        assertEquals(listOf("usage input=5 output=6"), usageRows(store).map { it.text })
+        sink.flushBufferedUsageBestEffort("t0")
+        assertEquals(1, usageRows(store).size)
+    }
+
+    @Test
+    fun retainedFailedUsageEvictsExactlyAt257() = runBlocking {
+        // P2 boundary: exactly 256 distinct failed flushes fill the LRU
+        // without evicting; the 257th drops the oldest payload and its counter.
+        val atCap = UsageFaultStore()
+        val capSid = atCap.createSession("hi", "m")
+        val capSink = SessionTranscriptSink(atCap, capSid) { 42L }
+        repeat(256) { i ->
+            capSink.onUsage("r$i", i, i)
+            capSink.flushBufferedUsageBestEffort("r$i")
+        }
+        val capKeys = accountingKeys(capSink)
+        assertEquals(SessionTranscriptSink.MAX_RETAINED_FAILED_USAGE_RUNS, capKeys.second.size)
+        assertEquals(capKeys.second, capKeys.third)
+        atCap.failUsageWrites = false
+        capSink.flushBufferedUsageBestEffort("r0")
+        assertEquals(listOf("usage input=0 output=0"), usageRows(atCap).map { it.text })
+
+        val overflow = UsageFaultStore()
+        val overflowSid = overflow.createSession("hi", "m")
+        val overflowSink = SessionTranscriptSink(overflow, overflowSid) { 42L }
+        repeat(257) { i ->
+            overflowSink.onUsage("r$i", i, i)
+            overflowSink.flushBufferedUsageBestEffort("r$i")
+        }
+        val overflowKeys = accountingKeys(overflowSink)
+        assertEquals(SessionTranscriptSink.MAX_RETAINED_FAILED_USAGE_RUNS, overflowKeys.second.size)
+        assertEquals(overflowKeys.second, overflowKeys.third)
+        assertTrue("the 257th insert must evict r0 from both", "r0" !in overflowKeys.third)
+        overflow.failUsageWrites = false
+        overflowSink.flushBufferedUsageBestEffort("r0")
+        assertTrue("evicted payload is best-effort dropped", usageRows(overflow).isEmpty())
+        overflowSink.flushBufferedUsageBestEffort("r256")
+        assertEquals(listOf("usage input=256 output=256"), usageRows(overflow).map { it.text })
+    }
+
+    @Test
+    fun evictedPreTerminalRunRestartsBoundedFloodCounter() = runBlocking {
+        // Direct-sink dual residency (not reachable from the controller): a
+        // run that failed a pre-terminal flush is re-buffered while its
+        // payload still sits in the retained bucket. The eviction drops the
+        // counter even though that pending payload survives; the freeze then
+        // restarts with the fresh window, bounded by the same 128-event cap
+        // per cycle — the documented trade-off of the eviction sync in
+        // retainFailedUsage.
+        val store = UsageFaultStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onUsage("r0", 1, 1)
+        sink.flushBufferedUsageBestEffort("r0")
+        // Re-buffer the still-pre-terminal runId: dual residency
+        // (retainedFailedUsage + pendingUsage + usageSeen all hold r0).
+        sink.onUsage("r0", 7, 8)
+        val dual = accountingKeys(sink)
+        assertTrue("dual residency: retained and pending both hold r0", "r0" in dual.first && "r0" in dual.second)
+
+        repeat(256) { i ->
+            sink.onUsage("f$i", i, i)
+            sink.flushBufferedUsageBestEffort("f$i")
+        }
+        val afterEviction = accountingKeys(sink)
+        assertTrue("the pending payload survives its counter's eviction", "r0" in afterEviction.first)
+        assertTrue("r0 must have been evicted from both payload+counters", "r0" !in afterEviction.second && "r0" !in afterEviction.third)
+
+        // A fresh 130-event flood on the evicted runId freezes at the new
+        // window's 128th event, never unbounded and never old values.
+        repeat(130) { i -> sink.onUsage("r0", 1_000 + i, 2_000 + i * 2) }
+        store.failUsageWrites = false
+        sink.flushBufferedUsageBestEffort("r0")
+
+        assertEquals(
+            listOf("usage input=1127 output=2254"),
+            usageRows(store).map { it.text },
+        )
+    }
+}

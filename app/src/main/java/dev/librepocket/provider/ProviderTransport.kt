@@ -40,9 +40,10 @@ internal enum class ProviderFailureCode {
     /**
      * A streaming aggregate exceeded its memory budget (per-tool-call
      * ToolDelta fragments, the per-attempt whole-round tool total, the
-     * distinct-tool count, or one SSE event's total `data:` payload).
+     * distinct-tool count, one SSE event's total `data:` payload, or the
+     * per-attempt visible-text budget `TEXT_TOO_LARGE`).
      * Always pairs with a distinct non-retryable message
-     * (`TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`),
+     * (`TOOL_ARGS_TOO_LARGE` / `TEXT_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`),
      * never silent truncation, and never a retry of the poisoned stream.
      */
     AGG_TOO_LARGE,
@@ -65,10 +66,11 @@ internal class ProviderFailure(
  * aggregation/SSE code for [StreamEvent.Failed.code] propagation.
  */
 internal fun inferAggFailureCodeName(message: String?): String? {
-    val lower = message?.lowercase().orEmpty()
-    return if (lower.contains("tool_args_too_large") ||
-        lower.contains("sse_frame_too_large") ||
-        lower.contains("sse_line_too_long")
+    val lower = message?.lowercase(java.util.Locale.ROOT).orEmpty()
+    return if (lower.contains(TOOL_ARGS_TOO_LARGE.lowercase(java.util.Locale.ROOT)) ||
+        lower.contains(TEXT_TOO_LARGE.lowercase(java.util.Locale.ROOT)) ||
+        lower.contains(SseFrameParser.FRAME_TOO_LARGE_MESSAGE.lowercase(java.util.Locale.ROOT)) ||
+        lower.contains(SseFrameParser.LINE_TOO_LONG_MESSAGE.lowercase(java.util.Locale.ROOT))
     ) {
         ProviderFailureCode.AGG_TOO_LARGE.name
     } else {
@@ -145,7 +147,7 @@ internal fun jsonEscape(raw: String): String {
             '\t' -> sb.append("\\t")
             '\b' -> sb.append("\\b")
             '\u000C' -> sb.append("\\f")
-            else -> if (c < ' ') sb.append("\\u%04x".format(c.code)) else sb.append(c)
+            else -> if (c < ' ') sb.append("\\u%04x".format(java.util.Locale.ROOT, c.code)) else sb.append(c)
         }
     }
     return sb.toString()
@@ -334,7 +336,9 @@ internal suspend fun pumpSse(
                         throw ProviderFailure(kind == FailureKind.RETRYABLE, redactedError("SSE_TRANSPORT", e.message), e)
                     }
                     if (read == -1) {
+                        currentCoroutineContext().ensureActive()
                         for (frame in parser.flush()) {
+                            currentCoroutineContext().ensureActive()
                             if (onFrame(frame) == SsePumpDecision.STOP) {
                                 protocolTerminalReached = true
                                 stopped = true
@@ -345,6 +349,7 @@ internal suspend fun pumpSse(
                     }
                     val frames = parser.feed(buf, 0, read)
                     for (frame in frames) {
+                        currentCoroutineContext().ensureActive()
                         if (onFrame(frame) == SsePumpDecision.STOP) {
                             protocolTerminalReached = true
                             stopped = true
@@ -353,8 +358,9 @@ internal suspend fun pumpSse(
                         }
                     }
                     if (!protocolTerminalReached) {
+                        currentCoroutineContext().ensureActive()
                         if (parser.lineTooLong) {
-                            throw ProviderFailure(false, "SSE_LINE_TOO_LONG", code = ProviderFailureCode.AGG_TOO_LARGE)
+                            throw ProviderFailure(false, SseFrameParser.LINE_TOO_LONG_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
                         }
                         if (parser.frameTooLong) {
                             throw ProviderFailure(false, SseFrameParser.FRAME_TOO_LARGE_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
@@ -362,8 +368,9 @@ internal suspend fun pumpSse(
                     }
                 }
                 if (!protocolTerminalReached) {
+                    currentCoroutineContext().ensureActive()
                     if (parser.lineTooLong) {
-                        throw ProviderFailure(false, "SSE_LINE_TOO_LONG", code = ProviderFailureCode.AGG_TOO_LARGE)
+                        throw ProviderFailure(false, SseFrameParser.LINE_TOO_LONG_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
                     }
                     if (parser.frameTooLong) {
                         throw ProviderFailure(false, SseFrameParser.FRAME_TOO_LARGE_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
@@ -395,10 +402,12 @@ internal fun postJson(url: String, headers: LinkedHashMap<String, String>, bodyJ
  * `code` propagation (Stage D): a [ProviderFailure] becomes
  * [StreamEvent.Failed] with `code = e.code?.name ?: inferAggFailureCodeName(e.message)`,
  * so aggregation/SSE budget overflows (`AGG_TOO_LARGE` with distinct
- * `TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
+ * `TOOL_ARGS_TOO_LARGE` / `TEXT_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
  * messages) stay typed end-to-end for TurnController's pending-flush guard.
- * Other branches keep `code = null` (legacy/classified failures), except the
- * unknown-runtime fallback which carries `UNKNOWN_RUNTIME` so the controller
+ * The `IllegalArgumentException` and `IOException` branches carry
+ * `code = inferAggFailureCodeName(e.message)` (null for non-aggregation
+ * messages), and the unknown-runtime fallback carries
+ * `inferAggFailureCodeName(e.message) ?: UNKNOWN_RUNTIME`, so the controller
  * can discard poison-adjacent pending tools without changing retry semantics
  * of other fatal events (401/validation stay flushable).
  * Unknown runtime failures fail closed (`retryable = false`): only
@@ -412,8 +421,7 @@ internal fun postJson(url: String, headers: LinkedHashMap<String, String>, bodyJ
 internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit): Flow<StreamEvent> =
     flow(block)
         .catch { e ->
-            if (e is VirtualMachineError || e is ThreadDeath) throw e
-            if (e is CancellationException) throw e
+            if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
             currentCoroutineContext().ensureActive()
             when (e) {
                 is ProviderFailure -> emit(
@@ -424,7 +432,11 @@ internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit)
                     ),
                 )
                 is IllegalArgumentException -> emit(
-                    StreamEvent.Failed(redactedError("PROVIDER_BAD_REQUEST", e.message), retryable = false),
+                    StreamEvent.Failed(
+                        redactedError("PROVIDER_BAD_REQUEST", e.message),
+                        retryable = false,
+                        code = inferAggFailureCodeName(e.message),
+                    ),
                 )
                 is IOException -> {
                     val kind = ProviderErrorClassifier.classify(null, e, null)

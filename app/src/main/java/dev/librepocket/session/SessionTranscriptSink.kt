@@ -16,7 +16,11 @@ import kotlinx.coroutines.CancellationException
  * implemented) and `isFinal=1`, legacy two-arg turn failed -> `system` event
  * (`turn <runId> failed: <reason>`, kept out of the chat replay, visible in
  * export), retried -> `retry` event, steer queued -> `steer` event, tool
- * done -> `tool` event, usage -> `system` event (accounting, P1 records only).
+ * done -> `tool` event, usage -> one `system` event per attempt (authoritative
+ * last-wins #84: pre-terminal `onUsage` calls merge by runId and flush with
+ * the attempt terminal, so an Anthropic dual or a flood persists exactly one
+ * row with the final values; a post-terminal trailing call appends once,
+ * further trailing calls drop).
  *
  * A reasoning-sourced turn (`hasReasoning == true`) persists one extra
  * `reasoning` event with the same runId and empty text together with its
@@ -84,9 +88,19 @@ import kotlinx.coroutines.CancellationException
  * [onTurnFailed] overloads, all [onTurnCancelled] overloads and
  * [onLogicalTurnCancelled] are durable core events — a store failure
  * propagates so the session writer fails the ack instead of reporting a
- * false durable write. [onTurnRetried], [onSteerQueued], [onToolDone] and
- * [onUsage] stay best-effort notices: failures are swallowed and never
- * break the chat loop. Cancellation always propagates.
+ * false durable write. [onTurnRetried], [onSteerQueued] and [onToolDone] stay
+ * best-effort notices: failures are swallowed and never break the chat loop.
+ * [onUsage] itself never throws (best-effort call); the merged row is
+ * persisted best-effort as a standalone `system` row right after the attempt
+ * terminal commits (#84) — deliberately outside the terminal unit — never one
+ * row per call. Cancellation propagates for core writes. The post-core
+ * accounting path ([flushBufferedUsageBestEffort]) rethrows
+ * [CancellationException] and VM-fatal itself; the enclosing
+ * [dev.librepocket.chat.OrderedTranscriptSink] best-effort entry loop swallows
+ * a cancellable stall / non-VM failure while the writer scope is live (real
+ * teardown still propagates), so a stalled usage write cannot negate an
+ * already-committed terminal ack (P1 #2). The separate trailing [onUsage]
+ * entry follows the general propagation contract.
  * Text is redacted again by [RoomSessionStore] on write.
  *
  * Cross-restart RUNNING → INTERRUPTED backfill lives in Phase 3 as well (see
@@ -99,6 +113,73 @@ class SessionTranscriptSink(
     private val sessionId: String,
     private val clock: () -> Long = System::currentTimeMillis,
 ) : TranscriptSink {
+
+    companion object {
+        /**
+         * Per-run usage-event flood cap (#84): at most this many `onUsage`
+         * calls per runId are merged; further pre-terminal calls are ignored
+         * (frozen, never a failure). Legitimate callers emit 1 per attempt
+         * (see `TurnController`, which already coalesces), so 128 leaves wide
+         * headroom while bounding merge CPU against a direct-sink flood.
+         */
+        const val MAX_USAGE_EVENTS_PER_RUN = 128
+
+        /**
+         * Bound on distinct runIds with buffered pre-terminal usage (#84):
+         * further new runIds are dropped best-effort (usage is accounting,
+         * never load-bearing). Terminal flushes remove entries, so production
+         * (one live attempt) never trips this.
+         */
+        const val MAX_PENDING_USAGE_RUNS = 256
+
+        /**
+         * Bound on retained failed best-effort usage rows (#94 P2; the bucket
+         * receives both terminal-flush and trailing failures). Flood counters
+         * are evicted together with their payloads — see `retainFailedUsage`.
+         */
+        const val MAX_RETAINED_FAILED_USAGE_RUNS = 256
+    }
+
+    /** Pre-terminal authoritative usage per runId (#84, last-wins merged). */
+    private data class PendingUsage(val inputTokens: Int?, val outputTokens: Int?)
+
+    /** Buffered usages not yet flushed with their attempt terminal. Single-writer (Ordered), insertion-ordered. Guarded by the ordered single-writer discipline of the hosting session writer — never touch from a second writer. */
+    private val pendingUsage = LinkedHashMap<String, PendingUsage>()
+
+    /**
+     * Failed best-effort usage rows retained for a possible later flush of the
+     * same runId (#94 P2), LRU-bounded by [MAX_RETAINED_FAILED_USAGE_RUNS].
+     * Its key set plus [pendingUsage] always covers [usageSeen]: evicting the
+     * oldest payload here drops that runId's flood counter with it (see
+     * [retainFailedUsage]), so the accounting metadata stays bounded by
+     * `MAX_PENDING_USAGE_RUNS + MAX_RETAINED_FAILED_USAGE_RUNS` even while
+     * usage-only writes keep failing. Same single-writer guard as
+     * [pendingUsage].
+     */
+    private val retainedFailedUsage = LinkedHashMap<String, PendingUsage>()
+
+    /**
+     * Per-run pre-terminal onUsage arrival counts for the flood cap. Every key
+     * belongs to [pendingUsage] or [retainedFailedUsage]: the P2 eviction sync
+     * in `retainFailedUsage` drops counters together with their evicted
+     * payloads, so the map never outgrows the two payload caps combined. Same
+     * single-writer guard as [pendingUsage].
+     */
+    private val usageSeen = HashMap<String, Int>()
+
+    /**
+     * RunIds that already own a terminal row. A post-terminal `onUsage`
+     * (trailing accounting, e.g. legacy call order) is appended immediately
+     * once per runId instead of buffering forever; pre-terminal floods still
+     * merge to one row via [pendingUsage]. Bounded by the session's terminal
+     * count (same discipline as the controller's terminal sets); deliberately
+     * uncapped (an eviction would break the once-per-runId dedup — a bounded
+     * residue of small ids, not payload). Same single-writer guard.
+     */
+    private val terminalizedRuns = HashSet<String>()
+
+    /** RunIds that already consumed their single trailing post-terminal usage write (rate-limit). Same bound and single-writer guard as [terminalizedRuns]. */
+    private val trailingUsageWritten = HashSet<String>()
 
     /** Durable core write: store failures propagate so the writer fails the ack. */
     private suspend fun appendDurable(
@@ -179,6 +260,116 @@ class SessionTranscriptSink(
         isFinal = isFinal,
     )
 
+    /**
+     * Post-ack authoritative usage flush (#84 follow-up, fail-closed
+     * accounting): persists the run's buffered pre-terminal usage as one bare
+     * `system` row after the core terminal has committed, best-effort
+     * (non-cancellation / non-VM failures are swallowed by its own internal
+     * catch — never break the terminal; usage is accounting, never
+     * load-bearing). The row never carries attempt linkage
+     * (`parentRunId`/`attemptIndex` stay null): the JSONL S2-F2 shape gate
+     * allows linkage only on assistant/reasoning rows, and the legacy trailing
+     * path ([onUsage]) already writes linkage-free rows.
+     * Call only after the core write's ack completed or its bounded wait
+     * expired (a cancelled host may call with the ack still in flight): the
+     * usage row is deliberately NOT part of the terminal unit, so a
+     * usage-write failure on a non-atomic store fallback can never leave a
+     * committed final behind a thrown terminal (see [onUsage]). On core
+     * failure the entry stays buffered (bounded residue, same discipline as
+     * [terminalizedRuns]) so a same-runId terminal retry still owns its
+     * authoritative row. Marks [trailingUsageWritten] when a row is flushed,
+     * so a later trailing call drops and a second flush is idempotent (exactly
+     * one usage row per runId ever, except an unavoidable at-least-once window
+     * when the first write's ack is cancelled after the store committed).
+     */
+    override suspend fun flushBufferedUsageBestEffort(runId: String) {
+        // Mutual exclusion with the trailing path: if a trailing usage already
+        // landed for this runId, drop the buffered entry (no duplicate row).
+        if (runId in trailingUsageWritten) {
+            pendingUsage.remove(runId)
+            retainedFailedUsage.remove(runId)
+            usageSeen.remove(runId)
+            return
+        }
+        val usage = pendingUsage[runId] ?: retainedFailedUsage[runId] ?: return
+        var ok = false
+        try {
+            store.appendEvent(
+                TranscriptEvent(
+                    sessionId = sessionId,
+                    runId = runId,
+                    kind = "system",
+                    text = usageText(usage),
+                    createdAt = clock(),
+                    isPartial = false,
+                    failureReason = null,
+                    parentRunId = null,
+                    attemptIndex = null,
+                    isFinal = true,
+                ),
+            )
+            ok = true
+        } catch (e: Throwable) {
+            if (e is CancellationException) throw e
+            if (e is VirtualMachineError || e is ThreadDeath) throw e
+            // Best-effort accounting: swallow other errors so a usage-only
+            // failure cannot seal/block core work.
+        }
+        if (ok) {
+            pendingUsage.remove(runId)
+            retainedFailedUsage.remove(runId)
+            usageSeen.remove(runId)
+            trailingUsageWritten.add(runId)
+        } else {
+            pendingUsage.remove(runId)
+            // Keep usageSeen so the per-run flood cap survives retries; the
+            // LRU eviction inside retainFailedUsage drops it together with an
+            // evicted payload (P2: no orphan counters).
+            val retained = retainedFailedUsage[runId]
+            val merged = PendingUsage(
+                inputTokens = usage.inputTokens ?: retained?.inputTokens,
+                outputTokens = usage.outputTokens ?: retained?.outputTokens,
+            )
+            retainFailedUsage(runId, merged)
+        }
+    }
+
+    /**
+     * Moves a failed best-effort usage write into the LRU-bounded
+     * [retainedFailedUsage], evicting the oldest payload at the cap. The
+     * evicted runId's [usageSeen] counter is dropped with its payload so the
+     * flood-counter map can never outgrow `pendingUsage + retainedFailedUsage`
+     * (#94 P2). Only the pre-terminal [onUsage] path reads [usageSeen], and
+     * controller-driven runs only ever flush after their terminal write
+     * returned (or after its store failure was deliberately swallowed), so a
+     * live production run cannot lose its freeze point. A direct-sink caller
+     * can still hold an evicted runId in [pendingUsage] (dual residency): its
+     * freeze restarts, bounded by the same [MAX_USAGE_EVENTS_PER_RUN] per cycle
+     * (`evictedPreTerminalRunRestartsBoundedFloodCounter` pins that shape).
+     */
+    private fun retainFailedUsage(runId: String, merged: PendingUsage) {
+        // LRU: move to end on update.
+        retainedFailedUsage.remove(runId)
+        if (retainedFailedUsage.size >= MAX_RETAINED_FAILED_USAGE_RUNS) {
+            val oldest = retainedFailedUsage.keys.firstOrNull()
+            if (oldest != null) {
+                retainedFailedUsage.remove(oldest)
+                usageSeen.remove(oldest)
+            }
+        }
+        retainedFailedUsage[runId] = merged
+    }
+
+    private fun usageText(usage: PendingUsage): String =
+        "usage input=${usage.inputTokens} output=${usage.outputTokens}"
+
+    /**
+     * Marks [runId] terminalized for the trailing-usage rule (see [onUsage]).
+     */
+    private fun markTerminalized(runId: String) {
+        terminalizedRuns.add(runId)
+    }
+
     /** Best-effort notice write: persistence must never break the chat loop. */
     private suspend fun appendNotice(
         runId: String,
@@ -218,7 +409,7 @@ class SessionTranscriptSink(
 
     override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) {
         val now = clock()
-        val batch = ArrayList<TranscriptEvent>(2)
+        val batch = ArrayList<TranscriptEvent>(3)
         // Phase2 marker-first: the payload-free `reasoning` marker leads so a
         // non-atomic fallback store (default sequential loop) that fails on
         // the 2nd row leaves only an orphan marker behind — harmless (no user
@@ -229,6 +420,9 @@ class SessionTranscriptSink(
         if (hasReasoning) batch.add(coreEvent(runId, "reasoning", "", now, isFinal = true))
         batch.add(coreEvent(runId, "assistant", text, now, isFinal = true))
         appendDurableBatch(batch)
+        // #84 follow-up: authoritative usage flushes best-effort after the
+        // core ack (see flushBufferedUsageBestEffort), never in the batch.
+        markTerminalized(runId)
     }
 
     override suspend fun onTurnSucceeded(
@@ -239,7 +433,7 @@ class SessionTranscriptSink(
         hasReasoning: Boolean,
     ) {
         val now = clock()
-        val batch = ArrayList<TranscriptEvent>(2)
+        val batch = ArrayList<TranscriptEvent>(3)
         // Phase2 marker-first (see the 3-arg form above): orphan marker is
         // harmless, orphan assistant would fail open.
         if (hasReasoning) {
@@ -247,6 +441,9 @@ class SessionTranscriptSink(
         }
         batch.add(coreEvent(runId, "assistant", text, now, parentRunId = parentRunId, attemptIndex = attemptIndex, isFinal = true))
         appendDurableBatch(batch)
+        // #84 follow-up: authoritative usage flushes best-effort after the
+        // core ack (see flushBufferedUsageBestEffort), never in the batch.
+        markTerminalized(runId)
     }
 
     /**
@@ -258,10 +455,12 @@ class SessionTranscriptSink(
      */
     override suspend fun onTurnFailed(runId: String, error: String) {
         appendDurable(runId, "system", "turn $runId failed: ${Redactor.redactError(error)}", isFinal = true)
+        markTerminalized(runId)
     }
 
     override suspend fun onTurnFailed(runId: String, partialText: String, error: String) {
         appendDurable(runId, "assistant", partialText, isPartial = true, failureReason = error, isFinal = true)
+        markTerminalized(runId)
     }
 
     override suspend fun onTurnFailed(
@@ -277,6 +476,7 @@ class SessionTranscriptSink(
             parentRunId = parentRunId, attemptIndex = attemptIndex,
             isFinal = true,
         )
+        markTerminalized(runId)
     }
 
     override suspend fun onTurnFailed(
@@ -293,6 +493,7 @@ class SessionTranscriptSink(
             parentRunId = parentRunId, attemptIndex = attemptIndex,
             isFinal = isFinal,
         )
+        markTerminalized(runId)
     }
 
     /**
@@ -318,10 +519,11 @@ class SessionTranscriptSink(
                 parentRunId = parentRunId, attemptIndex = attemptIndex,
                 isFinal = isFinal,
             )
+            markTerminalized(runId)
             return
         }
         val now = clock()
-        val batch = ArrayList<TranscriptEvent>(2)
+        val batch = ArrayList<TranscriptEvent>(3)
         // Phase2 marker-first (see onTurnSucceeded): the marker inherits
         // `parentRunId` / `attemptIndex` / `isFinal` verbatim (flag-only,
         // empty text) and leads, so a non-atomic fallback leaves only an
@@ -341,7 +543,10 @@ class SessionTranscriptSink(
                 isFinal = isFinal,
             ),
         )
+        // #84 follow-up: authoritative usage flushes best-effort after the
+        // core ack (see flushBufferedUsageBestEffort), never in the batch.
         appendDurableBatch(batch)
+        markTerminalized(runId)
     }
 
     override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) {
@@ -350,11 +555,14 @@ class SessionTranscriptSink(
 
     override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) {
         val now = clock()
-        val batch = ArrayList<TranscriptEvent>(2)
+        val batch = ArrayList<TranscriptEvent>(3)
         // Phase2 marker-first (see onTurnSucceeded): orphan marker harmless.
         if (hasReasoning) batch.add(coreEvent(runId, "reasoning", "", now, isFinal = true))
         batch.add(coreEvent(runId, "assistant", partialText, now, isPartial = true, isFinal = true))
         appendDurableBatch(batch)
+        // #84 follow-up: authoritative usage flushes best-effort after the
+        // core ack (see flushBufferedUsageBestEffort), never in the batch.
+        markTerminalized(runId)
     }
 
     override suspend fun onTurnCancelled(
@@ -365,7 +573,7 @@ class SessionTranscriptSink(
         hasReasoning: Boolean,
     ) {
         val now = clock()
-        val batch = ArrayList<TranscriptEvent>(2)
+        val batch = ArrayList<TranscriptEvent>(3)
         // Phase2 marker-first (see onTurnSucceeded): orphan marker harmless.
         if (hasReasoning) {
             batch.add(coreEvent(runId, "reasoning", "", now, parentRunId = parentRunId, attemptIndex = attemptIndex, isFinal = true))
@@ -378,6 +586,9 @@ class SessionTranscriptSink(
             ),
         )
         appendDurableBatch(batch)
+        // #84 follow-up: authoritative usage flushes best-effort after the
+        // core ack (see flushBufferedUsageBestEffort), never in the batch.
+        markTerminalized(runId)
     }
 
     /**
@@ -400,6 +611,11 @@ class SessionTranscriptSink(
         // the INTERRUPTED marker): hidden from the chat replay (system kind),
         // visible in export, terminal for the backfill scan.
         appendDurable(logicalTurnId, "system", "turn $logicalTurnId cancelled", isFinal = true)
+        // #84 follow-up: any still-pending usage (mid-stream cancel) flushes
+        // best-effort after the cancel mark — the attempt's row first, then
+        // the logical id's if distinct (see flushBufferedUsageBestEffort).
+        markTerminalized(logicalTurnId)
+        markTerminalized(attemptRunId)
     }
 
     /**
@@ -446,7 +662,7 @@ class SessionTranscriptSink(
         hasReasoning: Boolean,
     ) {
         val now = clock()
-        val batch = ArrayList<TranscriptEvent>(if (hasReasoning) 3 else 2)
+        val batch = ArrayList<TranscriptEvent>(if (hasReasoning) 4 else 3)
         batch.add(
             coreEvent(
                 attemptRunId, "assistant", partialText, now,
@@ -464,6 +680,11 @@ class SessionTranscriptSink(
                 ),
             )
         }
+        // #84 follow-up: the attempt's authoritative usage flushes
+        // best-effort after the atomic batch ack (see
+        // flushBufferedUsageBestEffort), never inside it — so the
+        // racing-cancel path still owns one row without endangering the
+        // batch's fail-closed shape.
         batch.add(
             coreEvent(
                 logicalTurnId, "system", "turn $logicalTurnId cancelled", now,
@@ -471,6 +692,8 @@ class SessionTranscriptSink(
             ),
         )
         appendDurableBatch(batch)
+        markTerminalized(logicalTurnId)
+        markTerminalized(attemptRunId)
     }
 
     override suspend fun onSteerQueued(text: String) {
@@ -487,7 +710,82 @@ class SessionTranscriptSink(
         appendNotice(runId, "tool", "[tool:$name $argumentsJson]", isFinal = true)
     }
 
+    /**
+     * Authoritative per-attempt usage (#84): pre-terminal calls merge
+     * last-wins by [runId] (null fields keep the previous value) and flush
+     * as exactly one `system` row after the attempt's terminal ack (see
+     * [flushBufferedUsageBestEffort]) — an Anthropic dual or a 100-event
+     * flood persists one row with the final values. The row is deliberately
+     * outside the terminal unit: on a non-atomic store fallback a usage
+     * failure can never strand a committed final behind a thrown terminal
+     * (fail-closed), and usage is accounting, never load-bearing.
+     * Pre-terminal floods are capped ([MAX_USAGE_EVENTS_PER_RUN], frozen past
+     * the cap, never a failure) and distinct buffered runIds are capped
+     * ([MAX_PENDING_USAGE_RUNS], best-effort drop). A post-terminal trailing
+     * call (legacy call order: terminal already written) appends immediately
+     * once per runId — unless the terminal already flushed this runId's row
+     * (see [flushBufferedUsageBestEffort]), in which case it drops; further
+     * trailing calls drop (rate-limit). The call
+     * itself never throws (best-effort); CancellationException propagates.
+     */
     override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) {
-        appendNotice(runId, "system", "usage input=$inputTokens output=$outputTokens", isFinal = true)
+        if (runId in terminalizedRuns) {
+            if (runId in trailingUsageWritten) {
+                pendingUsage.remove(runId)
+                retainedFailedUsage.remove(runId)
+                usageSeen.remove(runId)
+                return
+            }
+            // Merge with any retained buffered usage (active or
+            // failed-terminal) so an authoritative earlier value is not
+            // replaced by nulls.
+            val prev = pendingUsage[runId] ?: retainedFailedUsage[runId]
+            val inTok = inputTokens ?: prev?.inputTokens
+            val outTok = outputTokens ?: prev?.outputTokens
+            var ok = false
+            try {
+                store.appendEvent(
+                    TranscriptEvent(
+                        sessionId = sessionId,
+                        runId = runId,
+                        kind = "system",
+                        text = "usage input=$inTok output=$outTok",
+                        createdAt = clock(),
+                        isPartial = false,
+                        failureReason = null,
+                        isFinal = true,
+                    ),
+                )
+                ok = true
+            } catch (e: Throwable) {
+                if (e is CancellationException) throw e
+                if (e is VirtualMachineError || e is ThreadDeath) throw e
+                // Best-effort: allow a later retry.
+            }
+            if (ok) {
+                trailingUsageWritten.add(runId)
+                pendingUsage.remove(runId)
+                retainedFailedUsage.remove(runId)
+                usageSeen.remove(runId)
+            } else {
+                // Retain in the failed-terminal bucket for a later retry,
+                // never the active quota. Keep usageSeen so the per-run
+                // flood cap survives retries; retainFailedUsage drops an
+                // evicted runId's counter together with its payload (P2).
+                pendingUsage.remove(runId)
+                val merged = PendingUsage(inputTokens = inTok, outputTokens = outTok)
+                retainFailedUsage(runId, merged)
+            }
+            return
+        }
+        if (pendingUsage[runId] == null && pendingUsage.size >= MAX_PENDING_USAGE_RUNS) return
+        val seen = (usageSeen[runId] ?: 0) + 1
+        if (seen > MAX_USAGE_EVENTS_PER_RUN) return
+        usageSeen[runId] = seen
+        val prev = pendingUsage[runId]
+        pendingUsage[runId] = PendingUsage(
+            inputTokens = inputTokens ?: prev?.inputTokens,
+            outputTokens = outputTokens ?: prev?.outputTokens,
+        )
     }
 }

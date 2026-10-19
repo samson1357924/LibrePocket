@@ -54,7 +54,8 @@ import java.util.zip.ZipInputStream
  *   與 staging 才受 [STALE_STAGING_MAX_AGE_MILLIS] 保護，避免誤刪進行中安裝。
  *   崩潰還原不占刪除預算（兩預算不互相擠兌），但每 run 另受
  *   [MAX_RESTORES_PER_RUN] 專屬上限（還原含跨檔 SKILL.md 讀取＋解析成本，
- *   見該常量 KDoc），超出者本 run 保留、下次啟動收斂。
+ *   兩上限皆計 attempt——失敗亦計入，見各常量 KDoc），超出者本 run 保留、
+ *   下次啟動收斂。
  * - 同名 Skill 預設保持不變（需 `replace=true` 才覆蓋）。
  * - 降版政策（#15：揭露不擋）：`version` 為選填自由字串、無可靠全序，
  *   阻擋「降版」等於猜測比較，故永不因版本阻擋安裝；`replace=true` 已是
@@ -129,27 +130,34 @@ object SkillInstaller {
     const val STALE_STAGING_MAX_AGE_MILLIS = 24L * 60 * 60 * 1000L
 
     /**
-     * 每次清理呼叫最多「刪除類」處置的條目數（超出者保留、留待下次啟動收斂）。
+     * 每次清理呼叫最多「刪除類」工作嘗試（attempt）數——超出者保留、留待下次啟動收斂。
      *
-     * 上限約束一切刪除類工作（遞迴刪除與 symlink unlink 皆同類——避免單次啟動
-     * 在主執行緒做無界 I/O 拖慢 cold start／引發 ANR，超出者同批保留下次收斂）；
+     * 上限約束的是**有償工作嘗試**而非「成功」：遞迴刪除與 symlink unlink 各自的
+     * attempt 都在車道入口（**首 I/O 之前**）計入，**失敗亦計入**（walk 部分失敗回
+     * false、unlink 刪不掉皆不退回）——否則失敗佔多的殘留會讓單次啟動做無界 I/O
+     * （成功計數不改帳，失敗候選永不耗盡本 run 額度；P2-1 的症狀形）。超限後的
+     * 候選一律 KEPT 且本 run 零 I/O，下次啟動繼續收斂；成功數另由
+     * [cleanupStaleStaging] 的回傳（removed）單獨計，供啟動 log。
      * 崩潰還原（same-dir rename，O(1)）**不共用在刪除預算**（兩者不互相擠兌，
      * 見下），但另受同源的 [MAX_RESTORES_PER_RUN] 專屬上限約束。
      */
     const val MAX_CLEANUP_ENTRIES_PER_RUN = 64
 
     /**
-     * 每次清理呼叫最多「還原型」處置的候選數（超出者本 run 保留、下次啟動收斂）。
+     * 每次清理呼叫最多「還原型」工作嘗試（attempt）數——超出者本 run 保留、下次啟動收斂。
      *
      * 誠實筆記：每個還原**不止**一次 rename（O(1)）——還要先跨檔讀 bak 內
      * `SKILL.md`（受 [MAX_SINGLE_FILE_BYTES] 上限）、解析 frontmatter，加上
-     * 呼叫方與 per-skill 鎖內各一次的 NOFOLLOW 目標槽探針。單項 I/O 有界，但
-     * **候選數量在 pre-cap 實作中無界**（刪除側早有 [MAX_CLEANUP_ENTRIES_PER_RUN]
-     * 約束，還原側原註記「豁免上限」，兩者計法不同源）。本常量把還原型與刪除
-     * 類納入同源的「per-run 有界收斂」語意：如單次啟動候選多於上限，只還原至
-     * 上限，其餘候選本 run 保留原狀（不還原、不刪除），下次啟動繼續收斂——
-     * 新殘留 ≤ 上限的常態崩潰窗口仍受「process restart 即恢復」保護，僅極端
-     * 堆積時把耗費攤到多次啟動。
+     * 呼叫方與 per-skill 鎖內各一次的 NOFOLLOW 目標槽探針。本上限約束的正是
+     * 這些**有償工作嘗試**而非「成功」：attempt 在歧義守衛之後、NOFOLLOW 重探
+     * 之前（首 I/O 前）計入，**失敗亦計入**——錯名／損毀（解析失敗）bak 的內容
+     * 證明、改名失敗的 rename 皆不退回；success-counting 舊計法（成功才改帳）
+     * 下失敗候選永不耗盡額度，單次啟動可對同批殘留反覆付全額 I/O（P2-1）。
+     * 超限後的候選本 run KEPT 且零 I/O，下次啟動繼續收斂。歧義候選（同 id 多份、
+     * 全保留待人工）刻意**不消耗** attempt：歧義永不收斂，若占額會讓其後的合法
+     * crash-bak 永遠等不到還原機會；其查詢本身維持 O(1)/free。新殘留 ≤ 上限的
+     * 常態崩潰窗口仍受「process restart 即恢復」保護，僅極端堆積時把耗費攤到
+     * 多次啟動。
      */
     const val MAX_RESTORES_PER_RUN = 16
 
@@ -337,6 +345,22 @@ object SkillInstaller {
     internal var writeHook: ((staging: File, rel: String, bytes: ByteArray) -> Unit)? = null
 
     /**
+     * 測試接縫（僅測試用，全域可變，非執行緒隔離，同 [renameHook] 慣例：
+     * 生產不得設定、測試須於 `@After` 重置為 null；`@VisibleForTesting internal`
+     * 同 VoiceSpeaker hook 慣例，annotation 供 lint 靜態把關）。
+     *
+     * 刪除車道 attempt 注入縫：在刪除類 attempt 消耗點（車道入口、首 I/O 前，
+     * 見 [MAX_CLEANUP_ENTRIES_PER_RUN] 的 attempt 語意）以條目名調用——回 true
+     * （或 null 預設）照常執行真實刪除（[unlinkEntry]／[deleteTreeSafe]）；回
+     * false 表「attempt 已計入、真實 I/O 本 run 跳過（skip-fail）」：條目 KEPT
+     * 原狀、下次啟動收斂。生產路徑恆為 null，零成本 no-op（null 短路，不建
+     * lambda）。
+     */
+    @VisibleForTesting
+    @Volatile
+    internal var deleteHook: ((name: String) -> Boolean)? = null
+
+    /**
      * 自家 staging／backup 檔名形狀（嚴格錨定；見 [cleanupStaleStaging]）。
      *
      * 產名形狀合約（規格註記）：`System.nanoTime` 按 Javadoc 規格**允許為負**
@@ -358,6 +382,57 @@ object SkillInstaller {
         } catch (_: Exception) {
             // best-effort：sync 不到就留下，呼叫方不受影響。
         }
+    }
+
+    /**
+     * 單次清理 run 的 attempt 預算（刪除類／還原型同源獨立兩帳；語意見兩常量
+     * KDoc——上限計「工作嘗試」而非「成功」，失敗亦計入）。
+     *
+     * 消耗點在各工作車道入口、**首 I/O 之前**（[bindDelete] 於 unlink／
+     * deleteTreeSafe 前、[bindRestore] 於還原的 NOFOLLOW 重探前）；成功數由
+     * 呼叫方另行計數（removed 回傳值），不反映在本物件。
+     */
+    private class RunBudget(private val maxDeletes: Int, private val maxRestores: Int) {
+        var deleteAttempts = 0
+            private set
+        var restoreAttempts = 0
+            private set
+
+        /** 還原車道可用性檢查（僅查詢、不消耗；歧義守衛刻意在此之前維持 free）。 */
+        val restoreAvailable: Boolean get() = restoreAttempts < maxRestores
+
+        /**
+         * 刪除車道入口（首 I/O 前）：有額則計入 attempt 並過 [SkillInstaller.deleteHook]
+         * （false＝本 run 跳過真實 I/O、KEPT 待下次收斂）；無額回 false（不消耗、不調 hook）。
+         */
+        fun bindDelete(name: String): Boolean {
+            if (deleteAttempts >= maxDeletes) return false
+            deleteAttempts++
+            return SkillInstaller.deleteHook?.invoke(name) ?: true
+        }
+
+        /** 還原車道入口（首 I/O 前）：有額才計入 attempt（其後的 NOFOLLOW 重探、內容證明、rename 皆在本額之內）。 */
+        fun bindRestore(): Boolean {
+            if (restoreAttempts >= maxRestores) return false
+            restoreAttempts++
+            return true
+        }
+    }
+
+    /** 最近一次 [cleanupStaleStaging] 的 attempt 預算（測試觀察縫；全域可變、非執行緒隔離，同 [renameHook] 慣例）。 */
+    @Volatile
+    private var lastRunBudget: RunBudget? = null
+
+    /**
+     * 測試觀察縫（test-only，生產不得依賴）：回傳最近一次 [cleanupStaleStaging]
+     * 的 per-run attempt 總數（first＝刪除類 attempt、second＝還原型 attempt；
+     * 失敗亦計入，見兩常量 KDoc）。早期返回（非目錄／symlink destRoot／列舉失敗）
+     * 的 run 回報零 attempt。併發呼叫時值為最近完成登記 run 的快照，非隔離。
+     */
+    @VisibleForTesting
+    internal fun cleanupAttemptsForTest(): Pair<Int, Int> {
+        val b = lastRunBudget ?: return Pair(0, 0)
+        return Pair(b.deleteAttempts, b.restoreAttempts)
     }
 
     /**
@@ -402,11 +477,12 @@ object SkillInstaller {
      * 即刪、解不動（非空目錄）即 KEPT——僅奇異 FS 觸發，安全不變量不受影響；
      * KEPT 者每次啟動重試，仍不收斂者需人工。
      *
-     * 每次呼叫的「刪除類」處置有 [MAX_CLEANUP_ENTRIES_PER_RUN] 上限、還原型
-     * 處置有同源獨立的 [MAX_RESTORES_PER_RUN] 上限（兩預算不互相擠兌；還原
-     * 除 rename 外每候選還有跨檔 SKILL.md 讀取＋解析成本，不是純 O(1)，
-     * pre-cap 實作對還原數量無界，見該常量 KDoc 的誠實筆記）：超出者保留
-     * 原狀、留待下次啟動繼續收斂（避免單次啟動無界 I/O）。
+     * 每次呼叫的「刪除類」工作嘗試（attempt）有 [MAX_CLEANUP_ENTRIES_PER_RUN]
+     * 上限、還原型 attempt 有同源獨立的 [MAX_RESTORES_PER_RUN] 上限（兩預算
+     * 不互相擠兌；上限計 attempt 而非成功——失敗亦在車道入口、首 I/O 前計入，
+     * 還原除 rename 外每候選還有跨檔 SKILL.md 讀取＋解析成本，不是純 O(1)，
+     * 語意見該兩常量 KDoc）：超出者保留原狀（本 run 零 I/O）、留待下次啟動
+     * 繼續收斂（避免單次啟動無界 I/O）。
      *
      * 呼叫方契約：不應與 [installZip]/[installFiles] 對同一 [destRoot] 併發調用；
      * 本函式內僅對同一 id 取 per-skill 鎖做 best-effort 互斥（防與安裝提交交錯），
@@ -414,13 +490,20 @@ object SkillInstaller {
      * point-in-time 快照（鎖外計算），鎖內還原分支僅再重驗 NOFOLLOW 槽狀態與
      * 條目本身非 link，極端交錯下的最終一致性依賴「不與 install 併發」契約。
      *
-     * @return 已處置（還原或刪除）的條目數（combo 計數，同一數位混合兩類；
-     *   歧義保留者與「超出本 run 預算」者均不計入——刪除類（含 symlink unlink）
-     *   受 [MAX_CLEANUP_ENTRIES_PER_RUN]、還原型受 [MAX_RESTORES_PER_RUN]
-     *   上限約束，超出者此刻保留原狀待下次收斂；呼叫方（啟動 log）僅需
-     *   對 >0 警示，不依賴兩類拆除分項）。
+     * @return 已成功處置（還原或刪除）的條目數（combo 計數，同一數位混合兩類；
+     *   歧義保留者、預算耗盡者（attempt 已另帳，見兩常量 KDoc）與「屬性或內容
+     *   不可證明」者均不計入——刪除類（含 symlink unlink）的 attempt 受
+     *   [MAX_CLEANUP_ENTRIES_PER_RUN]、還原型受 [MAX_RESTORES_PER_RUN] 約束，
+     *   耗盡者此刻保留原狀待下次收斂；呼叫方（啟動 log）僅需對 >0 警示，
+     *   不依賴兩類拆除分項；per-run attempt 總數另有測試縫
+     *   [cleanupAttemptsForTest] 可觀察）。
      */
     fun cleanupStaleStaging(destRoot: File, maxAgeMillis: Long = STALE_STAGING_MAX_AGE_MILLIS): Int {
+        // per-run attempt 預算（失敗亦計入，見兩常量 KDoc）。先建先登記：早期
+        // 返回路徑（非目錄／symlink destRoot／列舉失敗）亦令測試縫
+        // [cleanupAttemptsForTest] 回報本 run 的零 attempt，而非殘留更早 run 的總數。
+        val budget = RunBudget(MAX_CLEANUP_ENTRIES_PER_RUN, MAX_RESTORES_PER_RUN)
+        lastRunBudget = budget
         if (!destRoot.isDirectory) return 0
         // 與 installFiles 的防衛一致（installFiles 同變體，項目已對齊）：
         // destRoot 為 symlink 時不經它刪改外部目錄；
@@ -445,10 +528,9 @@ object SkillInstaller {
             bakCountById[bakId] = (bakCountById[bakId] ?: 0) + 1
         }
         var removed = 0
-        // 每次啟動的刪除類／還原型工作預算（同源獨立帳，見兩常量 KDoc）：
-        // 避免單次啟動無界 I/O（超出者本 run 保留、待下次收斂）。
-        var deleted = 0
-        var restored = 0
+        // 每次啟動的刪除類／還原型工作預算（同源獨立帳，attempt 語意見兩常量
+        // KDoc）：失敗亦在車道入口（首 I/O 前）計入，避免單次啟動無界 I/O
+        // （超出者本 run 保留、待下次收斂）；成功數另計於 removed。
         for (f in entries) {
             val n = f.name
             val stagingId = STAGING_RE.matchEntire(n)?.groupValues?.get(1)
@@ -476,10 +558,8 @@ object SkillInstaller {
             val crashBak = !isLinkEntry && bakIdValid &&
                 targetState == TargetState.ABSENT
             if (!crashBak && !isLinkEntry && now - f.lastModified() < maxAgeMillis) continue
-            // 刪除類處置受每次啟動上限約束；還原型另有同源獨立上限（見
-            // [MAX_RESTORES_PER_RUN]，超出者本 run 保留、下次啟動收斂）。
-            val deletionAllowed = deleted < MAX_CLEANUP_ENTRIES_PER_RUN
-            val restoreAllowed = restored < MAX_RESTORES_PER_RUN
+            // 刪除類／還原型 attempt 預算由 [RunBudget] 在各工作車道入口（首
+            // I/O 前）檢查並消耗（失敗亦計入；超出者本 run KEPT、下次啟動收斂）。
             // 有效 id 的條目在 per-skill 鎖下操作，防與同 id 安裝提交交錯。
             val opId = stagingId?.takeIf { SkillParser.isValidName(it) }
                 ?: bakId?.takeIf { SkillParser.isValidName(it) }
@@ -493,8 +573,7 @@ object SkillInstaller {
                         bakId,
                         destRoot,
                         bakCountById,
-                        deletionAllowed,
-                        restoreAllowed,
+                        budget,
                     )
                 } finally {
                     lock.unlock()
@@ -506,19 +585,12 @@ object SkillInstaller {
                     bakId,
                     destRoot,
                     bakCountById,
-                    deletionAllowed,
-                    restoreAllowed,
+                    budget,
                 )
             }
             when (disp) {
-                Disposition.RESTORED -> {
-                    removed++
-                    restored++
-                }
-                Disposition.DELETED -> {
-                    removed++
-                    deleted++
-                }
+                Disposition.RESTORED -> removed++
+                Disposition.DELETED -> removed++
                 Disposition.KEPT -> Unit
             }
         }
@@ -527,14 +599,13 @@ object SkillInstaller {
 
     /** 清理單一條目的處置結果（供呼叫方計數並區分預算歸屬）。 */
     private enum class Disposition {
-        /** 已還原為正式 skill（rename；占還原型預算 [MAX_RESTORES_PER_RUN] 與回傳計數）。 */
+        /** 已還原為正式 skill（rename；占還原型 attempt 預算 [MAX_RESTORES_PER_RUN] 與回傳計數）。 */
         RESTORED,
 
-        /** 已刪除完成（unlink 或 NOFOLLOW 安全遞迴刪除，占刪除預算 [MAX_CLEANUP_ENTRIES_PER_RUN]）。 */
+        /** 已刪除完成（unlink 或 NOFOLLOW 安全遞迴刪除，占刪除 attempt 預算 [MAX_CLEANUP_ENTRIES_PER_RUN]）。 */
         DELETED,
 
-        /** 保留原狀（歧義／超出任一預算（deletionAllowed=false 或 restoreAllowed=false）／
-         *  屬性或內容不可證明／單項失敗重試）。 */
+        /** 保留原狀（歧義／刪除類或還原型 attempt 預算耗盡／屬性或內容不可證明／單項失敗重試）。 */
         KEPT,
     }
 
@@ -547,8 +618,15 @@ object SkillInstaller {
      * 跟隨 symlink、rename 會搬走 link 本身、遞迴刪除會遍歷其指向的外部目錄。
      * 故 symlink 條目一律只解除 link 本身，不遞迴刪除、也絕不還原成正式 skill
      * （唯一例外：真實目錄內部遭植入的 symlink 由 [deleteTreeSafe] 的
-     * NOFOLLOW 遍歷只解除 link 本身）；unlink 亦屬刪除類，同受
-     * [MAX_CLEANUP_ENTRIES_PER_RUN] 約束，超出預算者保留待下次收斂。
+     * NOFOLLOW 遍歷只解除 link 本身）；unlink 亦屬刪除類，attempt 同受
+     * [MAX_CLEANUP_ENTRIES_PER_RUN] 約束，超出者保留待下次收斂。
+     *
+     * attempt 預算語意（[RunBudget]）：刪除類（unlink／deleteTreeSafe）與還原型
+     * 的 attempt 都在**各工作車道入口、首 I/O 前**消耗——失敗（回 false／解析
+     * 失敗／改名失敗）不退回，budget 耗盡後的候選直接 KEPT、本 run 零 I/O。
+     * 還原車道的歧義守衛刻意在消耗點**之前**且不消耗 attempt（O(1)/free）：
+     * 歧義候選永不收斂（全保留待人工），若占額會讓其後的合法 crash-bak 永遠
+     * 等不到還原機會。
      *
      * target 槽狀態以 [targetStateNoFollow] 三態定案（鎖內縱深重驗，防「呼叫方
      * 探針後槽位被換」的 TOCTOU）：[TargetState.PRESENT]（真實檔案／目錄或
@@ -571,13 +649,12 @@ object SkillInstaller {
         bakId: String?,
         destRoot: File,
         bakCountById: Map<String, Int>,
-        deletionAllowed: Boolean,
-        restoreAllowed: Boolean,
+        budget: RunBudget,
     ): Disposition {
         // 1) 子條目 NOFOLLOW 防衛：symlink（或偵測失敗）一律只 unlink 本身
-        //    （unlink 占刪除預算，超出者保留待下次收斂）。
+        //    （unlink 占刪除 attempt 預算，失敗／超出者保留待下次收斂）。
         if (isSymlinkOrUnknown(f)) {
-            if (!deletionAllowed) return Disposition.KEPT
+            if (!budget.bindDelete(f.name)) return Disposition.KEPT
             return if (unlinkEntry(f)) Disposition.DELETED else Disposition.KEPT
         }
         if (bakId != null && SkillParser.isValidName(bakId)) {
@@ -590,15 +667,18 @@ object SkillInstaller {
                     return Disposition.KEPT
                 TargetState.ABSENT -> if (f.isDirectory) {
                     // 崩潰窗口遺留：舊版已搬離、NOFOLLOW 探針判定 target 缺席
-                    // → 盡力恢復。還原型工作預算：超出本 run 上限者保留、下次
-                    // 啟動收斂（每還原另有跨檔 SKILL.md 讀取＋解析成本，見
-                    // [MAX_RESTORES_PER_RUN]）。
-                    if (!restoreAllowed) return Disposition.KEPT
+                    // → 盡力恢復。還原型可用性檢查（同舊 restoreAllowed 閘位；
+                    // attempt 語意見 [MAX_RESTORES_PER_RUN]）：耗盡者本 run KEPT。
+                    if (!budget.restoreAvailable) return Disposition.KEPT
                     // 歧義守衛只在此分支：同 id 多份候選全保留、不還原、不刪除、
                     // 不計數，需人工介入（含「一份新鮮 + 一份過期」——逕行恢復過期版
-                    // 可能是錯版勝出）。
+                    // 可能是錯版勝出）。查詢為 O(1)/free、不消耗 attempt（見上）。
                     if ((bakCountById[bakId] ?: 0) > 1) return Disposition.KEPT
-                    //（f 已通過上方 NOFOLLOW 檢查；還原型不占刪除預算，預算另計。）
+                    //（f 已通過上方 NOFOLLOW 檢查；還原型共用同源 attempt 預算，不占刪除預算。）
+                    // 消耗還原 attempt（首 I/O 前）：其後的 NOFOLLOW 重探、跨檔
+                    // SKILL.md 內容證明、rename 皆屬有償工作，解析失敗／改名失敗
+                    // 亦不退回——超限者本 run KEPT、下次啟動收斂。
+                    if (!budget.bindRestore()) return Disposition.KEPT
                     // 殘餘 TOCTOU：自上方檢查到 rename 之間存在同 uid 跨程序置換
                     // 窗口；rename 為 name-based，無純 JDK 原語可完全關閉，還原前
                     // 重驗一次限縮窗口——link／不可判定一律保留供人工處理，剩餘
@@ -609,8 +689,9 @@ object SkillInstaller {
                     // （防**形狀-only** 的 bak 經名扶正、錯版內容勝出；name 與
                     // bakId 相符的完整偽造不在本守衛反例範圍——bak 無雜湊認證，
                     // 界限見類 KDoc）；讀不得／解析失敗／
-                    // 超單檔上限一律視為無法證明，KEPT 待人工（與歧義同哲學：
-                    // 不確定即不破壞、不還原、不刪除；listResiduals 照常列出）。
+                    // 超單檔上限一律視為無法證明，KEPT 待人工（attempt 已計入，
+                    // 見上；與歧義同哲學：不確定即不破壞、不還原、不刪除；
+                    // listResiduals 照常列出）。
                     if (bakManifestName(f) != bakId) return Disposition.KEPT
                     val restored = try {
                         rename(f, target)
@@ -618,16 +699,17 @@ object SkillInstaller {
                         false
                     }
                     return if (restored) Disposition.RESTORED else Disposition.KEPT
-                    // 恢復失敗則保留供人工處理，不計數。
+                    // 恢復失敗則保留供人工處理，不計數（attempt 仍已計入）。
                 }
                 // （槽位缺席但 bak 非目錄：無還原形狀 → 下方刪除路徑，既有語意。）
             }
             // target 槽被佔的孤兒 bak（或 bak 非目錄、無還原形狀）：純垃圾，
-            // 沿用下方刪除路徑（占刪除預算，啟動間收斂），不因同 id 歧義滯留。
+            // 沿用下方刪除路徑（占刪除 attempt 預算，啟動間收斂），不因同 id 歧義滯留。
         }
         // staging、target 槽被佔的孤兒 bak、或 id 非法者：只刪不恢復。
-        // 每次啟動的刪除類工作設上限：超出者保留待下次收斂。
-        if (!deletionAllowed) return Disposition.KEPT
+        // 刪除類 attempt 在 deleteTreeSafe 前（首 I/O 前）計入；walk 部分失敗
+        //（回 false）亦不退回——超出者保留待下次收斂。
+        if (!budget.bindDelete(f.name)) return Disposition.KEPT
         return if (deleteTreeSafe(f)) Disposition.DELETED else Disposition.KEPT
     }
 

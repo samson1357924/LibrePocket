@@ -19,7 +19,10 @@ import java.io.File
  *   NOFOLLOW 遞迴刪除（內部遭植入 symlink 亦不波及外部）；
  * - 每次啟動刪除類處置設 [SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN] 上限、
  *   還原型另有同源獨立的 [SkillInstaller.MAX_RESTORES_PER_RUN] 上限（兩預算
- *   不互相擠兌）：超出者本 run 保留、下次啟動繼續收斂（分見
+ *   不互相擠兌；上限計工作嘗試（attempt）——失敗亦在車道入口、首 I/O 前計入，
+ *   超出者本 run KEPT 且零 I/O、下次啟動收斂，attempt 縫／注入釘見
+ *   SkillAtomicCommitTest 的 restoreAttempts_／proofAttempts_／deleteAttempts_
+ *   三釘）：超出者本 run 保留、下次啟動繼續收斂（分見
  *   cleanup_deleteBudget_cappedPerRun／cleanup_restoreBudget_cappedPerRun；
  *   同 run 兩預算並存互不擠兌見 cleanupBudget_midRun_restoreExempt）；
  * - 還原 target 槽探針為 NOFOLLOW 三態（fail-closed）：槽位被植入 link

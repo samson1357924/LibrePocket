@@ -360,12 +360,26 @@ the bak id — otherwise it converges to KEPT (still listed by
 `staleBakWithoutTarget_missingOrCorruptSkillMd_keptNotRestored`,
 `staleBakWithoutTarget_oversizedSkillMd_keptNotRestored`, and
 `staleBakWithoutTarget_symlinkSkillMd_keptNotRestored`. Cleanup and restore
-work are budgeted per run: deletion stays within `MAX_CLEANUP_ENTRIES_PER_RUN`
-(64) and restore within the same-source independent `MAX_RESTORES_PER_RUN`
-(16), with beyond-budget entries kept this run and converging on the next
-startup (`cleanup_restoreBudget_cappedPerRun`; consuming the independent
-restore budget while the deletion budget is exhausted mid-run is pinned by
-`cleanupBudget_midRun_restoreExempt`).
+work are budgeted per run and the caps bind **attempts**, not successes: the
+deletion budget `MAX_CLEANUP_ENTRIES_PER_RUN` (64) and the same-source
+independent restore budget `MAX_RESTORES_PER_RUN` (16) each count a work
+attempt consumed at the lane entry **before the first I/O of that work**
+(unlink / `deleteTreeSafe` / the restore lane's post-ambiguity content proof
+and rename), so failures consume the budget too (wrong-name or corrupt baks
+that fully read+parse SKILL.md, denied renames, partially failing delete
+walks); past the cap a candidate is KEPT with zero I/O this run and the same
+startup budget runs converge on later startups
+(`cleanup_restoreBudget_cappedPerRun` for the all-succeed shape;
+`SkillAtomicCommitTest.restoreAttempts_cappedOnFailures_goodBakWaitsNextRun`,
+`SkillAtomicCommitTest.proofAttempts_stopAtCap_onExpensiveCorruptBaks`, and
+`SkillAtomicCommitTest.deleteAttempts_hookSkipFail_cappedExactly` pin the
+failure-heavy shapes via the `cleanupAttemptsForTest` seam and the
+skip-fail `deleteHook`; consuming the independent restore budget while the
+deletion budget is exhausted mid-run is pinned by
+`cleanupBudget_midRun_restoreExempt`). The ambiguity lane deliberately stays
+free of restore attempts (ambiguous baks never converge and would otherwise
+starve later legal crash-baks), and the returned count remains the success
+count (restores + deletes), not the attempt tally.
 `SkillAtomicCommitTest` pins the replace path to
 all-or-nothing: staging-rename/backup/rollback failures keep the old bytes
 intact with no half-product and no leftovers, reporting `IO_ERROR` with the

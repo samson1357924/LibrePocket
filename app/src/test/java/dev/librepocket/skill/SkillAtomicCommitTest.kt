@@ -27,6 +27,10 @@ import java.util.zip.ZipOutputStream
  * - 新鮮安裝 rename 失敗：無 target、staging 已清；
  * - staging 寫入階段失敗（[SkillInstaller.writeHook] 注入）：新鮮安裝無
  *   target、覆蓋保留舊版位元組（backup 階段尚未開始）、staging 已清；
+ * - 清理 attempt 預算（P2-1：上限計工作嘗試、失敗亦計入，見 SkillInstaller
+ *   兩預算常量 KDoc）：還原／刪除 attempt 以 [SkillInstaller.cleanupAttemptsForTest]
+ *   測試縫與 [SkillInstaller.deleteHook]（skip-fail 語意）注入釘死
+ *   （restoreAttempts_／proofAttempts_／deleteAttempts_ 三釘）；
  * - 併發安裝同一 skill 序列化（per-skill 鎖 + hook 內最大並發斷言；
  *   新鮮安裝同 id 恰一勝出、其餘 ALREADY_EXISTS）；
  * - 重啟清理：過期 staging／孤兒 bak 收斂、嚴格檔名形狀、崩潰三窗口調 cleanup 即恢復、
@@ -52,6 +56,7 @@ class SkillAtomicCommitTest {
     @After fun resetHooks() {
         SkillInstaller.renameHook = null
         SkillInstaller.writeHook = null
+        SkillInstaller.deleteHook = null
     }
 
     private fun skillMd(
@@ -1205,6 +1210,207 @@ class SkillAtomicCommitTest {
             )
         } finally {
             parent.deleteRecursively()
+        }
+    }
+
+    // ---- 清理 attempt 預算（P2-1：上限計工作嘗試、失敗亦計入；見 SkillInstaller 兩常量 KDoc）----
+
+    @Test fun restoreAttempts_cappedOnFailures_goodBakWaitsNextRun() {
+        // 還原型 attempt 釘（殺死舊 success-counting 計法）：cap 份可解析、尺寸
+        // 合法的「失敗型」bak（個人化混形：錯名型——內容證明 fail-closed 拒還原、
+        // 不經 rename；rename 失敗型——renameHook=false 拒絕，hook 計數觀察 rename
+        // 嘗試）+ 1 份已知合法 bak。單 run：17 份候選只付 cap 份 attempt
+        //（cleanupAttemptsForTest().second 恰 cap；first==0 對照還原車道不占刪除
+        // 帳），rename 嘗試 ≤ cap，合法 bak 本 run 不得被還原（attempt 被失敗型
+        // 耗盡便零 I/O，或其 rename 被注入拒絕——皆 KEPT、內容完整、仍在 bak 形
+        // 狀），人工移除失敗型 bak 後的下個 run 才還原（跨 run 收斂誠實）。
+        // 舊行為（成功才改帳）：失敗型永不耗額——17 份全部付全額（lstat＋全檔讀
+        // ＋解析，rename 車者再加 rename），合法 bak 同 run 被扶正；attempt 縫在
+        // 舊計法下為 0～1（僅計成功）， 非 cap——本測以縫為主殺死形。
+        // 誠實註記（列舉順序）：`listFiles()` 順序未定義，合法 bak 可能位於 cap
+        // 之內——此形其 attempt 已付、rename 由 hook 拒絕；「cap 後零 I/O 的 17th」
+        // 形由 attempt 縫恰 cap＋車道序（bindRestore 先於 bakManifestName）佐證，
+        // 讀取本身無注入縫，屬手動審計（同 proofAttempts_ 款）。
+        val root = tempRoot()
+        try {
+            val tid = Thread.currentThread().id
+            val cap = SkillInstaller.MAX_RESTORES_PER_RUN
+            val wrongIds = (0 until cap / 2).map { "atmw-" + it.toString().padStart(3, '0') }
+            val renameFailIds = (cap / 2 until cap).map { "atmr-" + it.toString().padStart(3, '0') }
+            fun bakFor(id: String, mdName: String): File =
+                File(root, ".$id.bak-${Math.abs(System.nanoTime())}-$tid").apply {
+                    mkdirs()
+                    File(this, "SKILL.md").writeText(
+                        skillMd(name = mdName, body = "attempt 正文"),
+                        Charsets.UTF_8,
+                    )
+                }
+            val wrongBaks = wrongIds.map { bakFor(it, "$it-alt") } // 可解析但 name != bakId
+            val renameFailBaks = renameFailIds.map { bakFor(it, it) } // 內容合法、rename 端拒絕
+            val goodBak = bakFor("atmg-skill", "atmg-skill")
+
+            val hookCalls = AtomicInteger(0)
+            SkillInstaller.renameHook = { _, _ ->
+                hookCalls.incrementAndGet()
+                false
+            }
+            val removed = SkillInstaller.cleanupStaleStaging(root)
+
+            val attempts = SkillInstaller.cleanupAttemptsForTest()
+            assertEquals(
+                "cap 份失敗型 + 1 合法 bak 只付 cap 份還原 attempt（失敗亦計入）",
+                cap,
+                attempts.second,
+            )
+            assertEquals("純還原 run 不得占刪除帳", 0, attempts.first)
+            assertTrue(
+                "rename 嘗試以 hook 觀察、不得超過還原型 cap：${hookCalls.get()}",
+                hookCalls.get() in 1..cap,
+            )
+            assertEquals("合法 bak 本 run 不得被還原", 0, removed)
+            assertFalse("合法 bak 不得被扶正", File(root, "atmg-skill").exists())
+            assertTrue(
+                "合法 bak 原樣保留（KEPT 待下 run）",
+                goodBak.isDirectory && File(goodBak, "SKILL.md").isFile,
+            )
+            assertEquals(
+                "失敗型 bak 刻意不被清理（錯名型永續 KEPT 待人工；rename 失敗型下 run 重試）",
+                cap + 1,
+                root.listFiles()!!.size,
+            )
+
+            // 人工移除失敗型 bak（錯名型屬永續 KEPT 形需人工；rename 失敗型由本測
+            // 代行人工消形），只留合法 bak：新 run 新額度，應還原。
+            SkillInstaller.renameHook = null
+            (wrongBaks + renameFailBaks).forEach { it.deleteRecursively() }
+            val second = SkillInstaller.cleanupStaleStaging(root)
+            assertEquals("合法 bak 於後續 run 還原（跨 run 收斂）", 1, second)
+            assertTrue(File(root, "atmg-skill/SKILL.md").isFile)
+            SkillParser.parse(File(root, "atmg-skill/SKILL.md").readText(Charsets.UTF_8))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun proofAttempts_stopAtCap_onExpensiveCorruptBaks() {
+        // 內容證明 attempt 釘（殺死舊 success-counting 計法的敗證側）：cap+7 份
+        // 「昂貴但敗證」bak——SKILL.md 全檔 60KB（＜MAX_SINGLE_FILE_BYTES 可全讀，
+        // 且在 SkillParser body 預算內故「解析成功、純 name != bakId」——敗因恰為
+        // fail-closed 的拒還原車道、全讀＋解析成本為真；刻意不走「body 超限」或
+        // 「不可解析」敗因以避免與尺寸／損毀款形混形）。單 run attempt 恰停 cap；
+        // cap 後候選本 run 不再付任何證明工作：
+        // 「未被讀」無注入縫可觀察（bakManifestName 內 lstat＋read 無 hook）——
+        // 誠實註記：由 bindRestore 先於 bakManifestName 的車道序＋attempt 縫恰
+        // cap 佐證，正式覆證屬真機/手動審計（同 SkillInstaller KDoc honesty 款）。
+        // 舊行為：敗證 bak 不占額——cap+7 份全在單 run 付 60KB 讀＋解析
+        //（removed 同為 0，計數殺不動此形）；attempt 縫 0（或僅計成功）≠ cap。
+        val root = tempRoot()
+        try {
+            val extra = 7
+            val total = SkillInstaller.MAX_RESTORES_PER_RUN + extra
+            val tid = Thread.currentThread().id
+            val filler = "A".repeat(60_000)
+            val baks = (0 until total).map { i ->
+                val id = "proof-" + i.toString().padStart(3, '0')
+                File(root, ".$id.bak-${Math.abs(System.nanoTime())}-$tid").apply {
+                    mkdirs()
+                    File(this, "SKILL.md").writeText(
+                        skillMd(name = "$id-alt", body = filler),
+                        Charsets.UTF_8,
+                    )
+                }
+            }
+            val removed = SkillInstaller.cleanupStaleStaging(root)
+            val attempts = SkillInstaller.cleanupAttemptsForTest()
+            assertEquals("敗證 bak 不得被還原", 0, removed)
+            assertEquals(
+                "attempt 恰停 cap（每份敗證 bak 的全檔讀＋解析都占 attempt）",
+                SkillInstaller.MAX_RESTORES_PER_RUN,
+                attempts.second,
+            )
+            assertEquals("純還原 run 不得占刪除帳", 0, attempts.first)
+            assertTrue(
+                "cap 後本 run 原樣保留（bak 未被代刪）：${root.listFiles()!!.size}",
+                baks.all { it.isDirectory && File(it, "SKILL.md").isFile },
+            )
+            val second = SkillInstaller.cleanupStaleStaging(root)
+            assertEquals("敗證形下個 run 仍不得還原（跨 run 語意不變）", 0, second)
+            assertEquals(
+                "敗證 bak 不得被移除（fail-closed 語意不變）",
+                total,
+                root.listFiles()!!.size,
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun deleteAttempts_hookSkipFail_cappedExactly() {
+        // 刪除類 attempt 釘（殺死舊 success-counting 計法的刪除側）：cap+7 個過期
+        // staging 條目 + deleteHook=false（skip-fail 語意：attempt 已計入、真實
+        // I/O 本 run 跳過）。單 run：hook 調用恰 cap（有額才調——cap 後條目無額
+        // 不調、零 I/O），removed==0，全部條目（含其內 sentinel）原樣——「65th
+        // 仍在」由全員 survive 佐證（誰恰逢第 65 位不可控，hook=false 下全員
+        // KEPT）。舊行為：敗刪不改帳——cap+7 個全都會被 hook 調用（71≠cap，
+        // 本測 behavioral 主殺死形，不僅靠縫）。hook 清回 null 後 64→7→0 跨 run
+        // 收斂（成功車道仍受同 cap 約束；收斂對照同
+        // SkillStartupRecoveryTest.cleanup_deleteBudget_cappedPerRun），且 hook
+        // 計數不再增加（null 短路＝生產零成本 no-op 的可觀察面）。
+        val root = tempRoot()
+        try {
+            val extra = 7
+            val total = SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN + extra
+            val dirs = (0 until total).map { i ->
+                File(root, ".capdel-" + i.toString().padStart(3, '0') + ".tmp-1-2").apply {
+                    mkdirs()
+                    File(this, "payload.txt").writeText("keep", Charsets.UTF_8)
+                    setLastModified(System.currentTimeMillis() - (25L * 60 * 60 * 1000))
+                }
+            }
+            val hookCalls = AtomicInteger(0)
+            SkillInstaller.deleteHook = { _ ->
+                hookCalls.incrementAndGet()
+                false
+            }
+            val first = SkillInstaller.cleanupStaleStaging(root)
+            val attempts = SkillInstaller.cleanupAttemptsForTest()
+            assertEquals(
+                "hook 調用恰 cap（skip-fail 亦耗刪除 attempt；cap 後不調）",
+                SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN,
+                hookCalls.get(),
+            )
+            assertEquals(
+                "attempt 縫與 hook 調用同帳（first＝刪除類 attempt）",
+                SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN,
+                attempts.first,
+            )
+            assertEquals("刪除 run 不影響還原型帳", 0, attempts.second)
+            assertEquals("hook=false 的 run 不得回報任何刪除", 0, first)
+            assertTrue(
+                "cap 前後全員 survive（I/O 已跳過）：${root.listFiles()!!.size}",
+                dirs.all { it.isDirectory && File(it, "payload.txt").isFile },
+            )
+
+            // hook 清回 null：真實刪除恢復，64→7→0 跨 run 收斂；hook 計數不再變。
+            SkillInstaller.deleteHook = null
+            assertEquals(
+                "run 2 仍只刪至 cap（attempt 預算對成敗中立的對照組）",
+                SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN,
+                SkillInstaller.cleanupStaleStaging(root),
+            )
+            assertEquals(
+                "null hook 後 hook 不得再被調（零成本 no-op）",
+                SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN,
+                hookCalls.get(),
+            )
+            assertEquals("run 3 收斂剩餘", extra, SkillInstaller.cleanupStaleStaging(root))
+            assertEquals(0, SkillInstaller.cleanupStaleStaging(root))
+            assertTrue(
+                "全部收斂後無 staging 殘餘：${root.listFiles()!!.toList()}",
+                dirs.none { it.exists() },
+            )
+        } finally {
+            root.deleteRecursively()
         }
     }
 }

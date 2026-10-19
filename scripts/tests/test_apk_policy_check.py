@@ -14,6 +14,7 @@ Run with: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_p
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import io
@@ -398,6 +399,66 @@ class ApkPolicyHarness(unittest.TestCase):
             "            'E: network-security-config (line=1)' \\\n"
             "            '  E: base-config (line=2)' \\\n"
             "            '    A: cleartextTrafficPermitted=(type 0x12)0xffffffff' ;;\n"
+            "        pins-ok)\n"
+            "          # Compiled VALUE-SHAPE positive control: src=\"system\"\n"
+            "          # prints as the quoted raw string and a legal 32-byte\n"
+            "          # sha-256 pin (quoted attr + C: chardata) must validate\n"
+            "          # at the artifact face the same way the source face does.\n"
+            "          printf '%s\\n' \\\n"
+            "            'E: network-security-config (line=1)' \\\n"
+            "            '  E: base-config (line=2)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '    E: trust-anchors (line=3)' \\\n"
+            "            '      E: certificates (line=4)' \\\n"
+            "            '        A: src=\"system\"' \\\n"
+            "            '  E: domain-config (line=5)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '    E: domain (line=6)' \\\n"
+            "            '      A: includeSubdomains=(type 0x12)0x0' \\\n"
+            "            '      C: \"example.com\"' \\\n"
+            "            '    E: pin-set (line=7)' \\\n"
+            "            '      E: pin (line=8)' \\\n"
+            "            '        A: digest=\"sha-256\"' \\\n"
+            "            '        C: \"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\"' ;;\n"
+            "        pins-bad-digest)\n"
+            "          # artifact-face P1 mirror: an unsupported digest\n"
+            "          # algorithm must fail the compiled bytes with the same\n"
+            "          # AOSP wording (Pin.isSupportedDigestAlgorithm).\n"
+            "          printf '%s\\n' \\\n"
+            "            'E: network-security-config (line=1)' \\\n"
+            "            '  E: base-config (line=2)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '  E: domain-config (line=3)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '    E: domain (line=4)' \\\n"
+            "            '      A: includeSubdomains=(type 0x12)0x0' \\\n"
+            "            '      C: \"example.com\"' \\\n"
+            "            '    E: pin-set (line=5)' \\\n"
+            "            '      E: pin (line=6)' \\\n"
+            "            '        A: digest=\"SHA-512\"' \\\n"
+            "            '        C: \"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==\"' ;;\n"
+            "        cert-src-file-path)\n"
+            "          # artifact-face certificates src: a file-path src is the\n"
+            "          # runtime \"Unknown certificates src\" throw shape.\n"
+            "          printf '%s\\n' \\\n"
+            "            'E: network-security-config (line=1)' \\\n"
+            "            '  E: base-config (line=2)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '    E: trust-anchors (line=3)' \\\n"
+            "            '      E: certificates (line=4)' \\\n"
+            "            '        A: src=\"res/raw/certs.p12\"' ;;\n"
+            "        cert-src-typed)\n"
+            "          # artifact-face legal resource-reference src: the COMPILED\n"
+            "          # typed payload prints unquoted (@res/0x...) and must stay\n"
+            "          # accepted by the same allow-set prefix (parseCertificatesEntry\n"
+            "          # sourceId != -1 -> ResourceCertificateSource).\n"
+            "          printf '%s\\n' \\\n"
+            "            'E: network-security-config (line=1)' \\\n"
+            "            '  E: base-config (line=2)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '    E: trust-anchors (line=3)' \\\n"
+            "            '      E: certificates (line=4)' \\\n"
+            "            '        A: src=@res/0x7f050001' ;;\n"
             "        unknown-line)\n"
             "          printf '%s\\n' \\\n"
             "            'E: network-security-config (line=1)' \\\n"
@@ -1457,6 +1518,30 @@ class ApkPolicyHarness(unittest.TestCase):
             with self.subTest(dump_mode=nsc_mode):
                 result = self.run_policy(apk, nsc_mode=nsc_mode)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_compiled_nsc_value_semantics_matrix(self) -> None:
+        # The AOSP parse-time VALUE checks route through _attr_errors, so the
+        # COMPILED dump face (rebuilt ElementTree from `aapt dump xmltree` via
+        # _parse_aapt_xmltree) enforces the identical semantics: a legal
+        # src="system" trust-anchor plus a 32-byte sha-256 pin passes, an
+        # unsupported digest algorithm and a file-path certificates src fail
+        # with the same AOSP wording, and a TYPED resource-reference src
+        # (printed unquoted by aapt as @res/0x...) stays accepted
+        # (parseCertificatesEntry's sourceId != -1 branch).
+        apk = complete_apk(
+            self.tmp / "nsc-values.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, nsc_mode="pins-ok")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        result = self.run_policy(apk, nsc_mode="cert-src-typed")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        result = self.run_policy(apk, nsc_mode="pins-bad-digest")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Unsupported pin digest algorithm: SHA-512", result.stdout)
+        result = self.run_policy(apk, nsc_mode="cert-src-file-path")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Unknown certificates src", result.stdout)
 
     def test_network_security_mode_derivation_is_fail_closed(self) -> None:
         # Only the measured debuggable encoding proves debug mode: absent,
@@ -3088,6 +3173,88 @@ class BackupRulesValidator(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertIn("exceeds the maximum rule nesting depth", buf_err.getvalue())
 
+    def test_doctype_attlist_default_injection_refused_at_source(self) -> None:
+        # expat resolves internal-subset ATTLIST DEFAULTS into the parsed tree
+        # (measured): `<!ATTLIST exclude domain CDATA "sharedpref">` fabricates
+        # the domain value of an <exclude> that carries only path=, composing
+        # one REQUIRED key out of injected data. Without the DOCTYPE guard this
+        # fixture would PASS the exact-set gate with data the source never
+        # carried; the guard must refuse it fail-closed BEFORE the fabricated
+        # values can count (and NOT because of a coincidental required-attr
+        # failure - the control below shows the attribute-less exclude alone
+        # produces the "missing exclude" structural error, while the DOCTYPE
+        # shape fails with the DOCTYPE message instead).
+        fours = (
+            '        <exclude domain="database" path="librepocket_vault" />\n'
+            '        <exclude domain="database" path="librepocket_vault-wal" />\n'
+            '        <exclude domain="database" path="librepocket_vault-shm" />\n'
+            '        <exclude domain="file" path="librepocket_keysets" />\n'
+        )
+        doctype_body = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<!DOCTYPE full-backup-content [\n'
+            '<!ATTLIST exclude domain CDATA "sharedpref">\n'
+            ']>\n'
+            "<full-backup-content>\n"
+            '  <exclude path="librepocket_keys.xml" />\n'
+            f"{fours}"
+            "</full-backup-content>\n"
+        )
+        # Document the expat behavior the guard exists for.
+        fabricated = ET.fromstring(doctype_body)
+        self.assertEqual(fabricated[0].get("domain"), "sharedpref")
+        # Control: the SAME shape without the internal subset fails on the
+        # missing exclude (NOT with the DOCTYPE message).
+        control_path = self._write(
+            "control.xml",
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<full-backup-content>\n"
+            '  <exclude path="librepocket_keys.xml" />\n'
+            f"{fours}"
+            "</full-backup-content>\n",
+        )
+        errors = backup_rules_check.validate(
+            control_path, backup_rules_check.EXPECTED_ROOT_BACKUP_RULES
+        )
+        self.assertTrue(
+            any("missing exclude domain=sharedpref" in e for e in errors), errors
+        )
+        path = self._write("doctyped.xml", doctype_body)
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            code = backup_rules_check.main(
+                [
+                    "backup_rules_check.py",
+                    "--expect-root",
+                    backup_rules_check.EXPECTED_ROOT_BACKUP_RULES,
+                    path,
+                ]
+            )
+        self.assertEqual(1, code)
+        stderr = buf_err.getvalue()
+        self.assertIn("DOCTYPE declarations are rejected", stderr)
+        self.assertIn("fabricate rule data", stderr)
+        self.assertNotIn("missing exclude", stderr)
+
+    def test_fifo_rules_file_is_refused_immediately(self) -> None:
+        # A checker handed a FIFO must refuse on os.stat BEFORE any open()
+        # (ET.parse's open on a FIFO blocks until a writer appears) - main()
+        # exit code and message only, no timing claim.
+        fifo = self.tmp / "fifo.xml"
+        os.mkfifo(fifo)
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            code = backup_rules_check.main(
+                [
+                    "backup_rules_check.py",
+                    "--expect-root",
+                    backup_rules_check.EXPECTED_ROOT_BACKUP_RULES,
+                    str(fifo),
+                ]
+            )
+        self.assertEqual(1, code)
+        self.assertIn("not a regular file", buf_err.getvalue())
+
     def test_noncanonical_hint_matching_root_reaches_defensive_branch(self) -> None:
         # validate() requires the hint; a caller may still pass a NON-canonical
         # hint (not one of the two documented roots) that happens to equal the
@@ -4152,6 +4319,316 @@ class NscCheckValidator(unittest.TestCase):
         self.assertTrue(
             any("missing required attribute digest" in e for e in errors), errors
         )
+
+    # ---- AOSP parse-time VALUE semantics (_VALUE_CHECKS, single landing
+    # point in _attr_errors so source and artifact faces cannot drift) ----
+
+    _PIN_32B = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+    _PIN_64B = (
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEy"
+        "MzQ1Njc4OTo7PD0+Pw=="
+    )
+
+    @classmethod
+    def _pinned_config(
+        cls,
+        digest_attr: str | None = ' digest="sha-256"',
+        pin_body: str | None = None,
+        expiration_attr: str | None = ' expiration="2023-02-28"',
+    ) -> str:
+        body = cls._PIN_32B if pin_body is None else pin_body
+        expiration = expiration_attr if expiration_attr is not None else ""
+        digest = digest_attr if digest_attr is not None else ""
+        return (
+            '  <base-config cleartextTrafficPermitted="false" />\n'
+            '  <domain-config cleartextTrafficPermitted="false">\n'
+            "    <domain>example.com</domain>\n"
+            f"    <pin-set{expiration}>\n"
+            f"      <pin{digest}>{body}</pin>\n"
+            "    </pin-set>\n"
+            "  </domain-config>\n"
+        )
+
+    def test_pin_digest_algorithm_matrix(self) -> None:
+        # AOSP Pin.isSupportedDigestAlgorithm: "SHA-256".equalsIgnoreCase(value)
+        # (Pin.java "Currently only SHA-256 is supported"). Case-insensitive
+        # sha-256 spellings are runtime-legal; SHA-512/MD5 throw at parse time
+        # and even the MISSING attr (parsePin sees null) throws the same
+        # exception - so the value check must fail it too, on top of the
+        # required-attribute mirror.
+        for spelling in ("sha-256", "SHA-256", "ShA-256"):
+            with self.subTest(accepted=spelling):
+                path = self._write("nsc.xml", self._config(
+                    self._pinned_config(digest_attr=f' digest="{spelling}"')
+                ))
+                self.assertEqual(nsc_check.validate(path, "release"), [])
+        for digest_attr, expected_value in (
+            (' digest="SHA-512"', "SHA-512"),
+            (' digest="MD5"', "MD5"),
+            ("", "null"),  # missing attr -> parsePin sees null
+        ):
+            with self.subTest(rejected=digest_attr or "absent"):
+                path = self._write("nsc.xml", self._config(
+                    self._pinned_config(digest_attr=digest_attr)
+                ))
+                errors = nsc_check.validate(path, "release")
+                self.assertTrue(
+                    any(
+                        "Unsupported pin digest algorithm" in e
+                        and f": {expected_value} " in e
+                        for e in errors
+                    ),
+                    errors,
+                )
+        # Missing digest stays a required-attribute failure as well; the pair
+        # of runtime-throw mirrors coexists on the same element.
+        path = self._write("nsc.xml", self._config(
+            self._pinned_config(digest_attr="")
+        ))
+        errors = nsc_check.validate(path, "release")
+        self.assertTrue(
+            any("missing required attribute digest" in e for e in errors),
+            errors,
+        )
+
+    def test_pin_digest_value_matrix(self) -> None:
+        # AOSP parsePin: Base64.decode(getText().trim(), 0) then the byte
+        # length must equal Pin.getDigestLength("SHA-256") = 32. Bad base64
+        # -> "Invalid pin digest"; a decodable payload of any other length
+        # -> the "digest length N does not match expected length..." wording.
+        path = self._write("nsc.xml", self._config(
+            self._pinned_config(pin_body=self._PIN_32B)
+        ))
+        self.assertEqual(nsc_check.validate(path, "release"), [])
+        # Runtime-parity positive control: Java String#trim drops ASCII
+        # whitespace around the payload exactly like _java_trim.
+        path = self._write("trimmed.xml", self._config(
+            self._pinned_config(pin_body=f"  {self._PIN_32B}  ")
+        ))
+        self.assertEqual(nsc_check.validate(path, "release"), [])
+        for body, expected in (
+            ("not_bas@64!!", "Invalid pin digest"),
+            (
+                base64.b64encode(b"16 bytes exactly").decode("ascii"),
+                "digest length 16 does not match expected length for SHA-256 of 32",
+            ),
+            (self._PIN_64B, "digest length 64 does not match expected length for SHA-256 of 32"),
+        ):
+            with self.subTest(pin_body=body[:12]):
+                path = self._write("nsc.xml", self._config(
+                    self._pinned_config(pin_body=body)
+                ))
+                errors = nsc_check.validate(path, "release")
+                self.assertTrue(any(expected in e for e in errors), errors)
+
+    def test_pin_set_expiration_matrix(self) -> None:
+        # AOSP parsePinSet: expiration is OPTIONAL (absent -> Long.MAX_VALUE)
+        # and a present value must be a real yyyy-MM-dd date
+        # (SimpleDateFormat("yyyy-MM-dd") + setLenient(false)).
+        for expiration_attr in (' expiration="2023-02-28"', "", ' expiration="2016-02-29"'):
+            with self.subTest(accepted=expiration_attr or "absent"):
+                path = self._write("nsc.xml", self._config(
+                    self._pinned_config(expiration_attr=expiration_attr)
+                ))
+                self.assertEqual(nsc_check.validate(path, "release"), [])
+        # Empty <pin-set/> is runtime-legal on current main (no thrown
+        # exception): the gate accepts it in the same direction - the documented
+        # not-mirrored shape.
+        for body in (
+            self._BASE_FALSE + '  <domain-config cleartextTrafficPermitted="false">\n'
+            '    <domain>example.com</domain>\n'
+            "    <pin-set />\n"
+            "  </domain-config>\n",
+            self._BASE_FALSE + '  <domain-config cleartextTrafficPermitted="false">\n'
+            '    <domain>example.com</domain>\n'
+            '    <pin-set expiration="2023-02-28" />\n'
+            "  </domain-config>\n",
+        ):
+            path = self._write("empty-pin-set.xml", self._config(body))
+            self.assertEqual(nsc_check.validate(path, "release"), [])
+        for expiration_attr in (' expiration="2023-02-30"', ' expiration="2023-13-01"', ' expiration="20230228"'):
+            with self.subTest(rejected=expiration_attr.strip()):
+                path = self._write("nsc.xml", self._config(
+                    self._pinned_config(expiration_attr=expiration_attr)
+                ))
+                errors = nsc_check.validate(path, "release")
+                self.assertTrue(
+                    any("Invalid expiration date in pin-set" in e for e in errors),
+                    errors,
+                )
+
+    def test_certificates_src_allowset_matrix(self) -> None:
+        # AOSP parseCertificatesEntry allow set (hard evidence, frameworks/base
+        # main): "system" / "user" / "wfa" (WfaCertificateSource - the runtime
+        # diagnostic string omits wfa but its code accepts it) plus resource
+        # references. A file-path src throws
+        # "Unknown certificates src. Should be one of system|user|@resourceVal".
+        for source in ("system", "user", "wfa", "@raw/dev_certs"):
+            with self.subTest(accepted=source):
+                path = self._write("nsc.xml", self._config(
+                    '  <base-config cleartextTrafficPermitted="false">\n'
+                    "    <trust-anchors>\n"
+                    f'      <certificates src="{source}" />\n'
+                    "    </trust-anchors>\n"
+                    "  </base-config>\n"
+                ))
+                self.assertEqual(nsc_check.validate(path, "release"), [])
+        for source in ("res/raw/certs.p12", "/data/misc/certs", "system-key-store", "?attr/dev_certs"):
+            # "?attr/dev_certs" compiles to TypedValue.TYPE_ATTRIBUTE, and
+            # XmlBlock.Parser#getAttributeResourceValue converts ONLY
+            # TypedValue.TYPE_REFERENCE ("don't attempt to convert any other
+            # types") - so the runtime never enters the
+            # ResourceCertificateSource branch for a ?-typed src and throws on
+            # the raw string instead. Refused here with the same message.
+            with self.subTest(rejected=source):
+                path = self._write("nsc.xml", self._config(
+                    '  <base-config cleartextTrafficPermitted="false">\n'
+                    "    <trust-anchors>\n"
+                    f'      <certificates src="{source}" />\n'
+                    "    </trust-anchors>\n"
+                    "  </base-config>\n"
+                ))
+                errors = nsc_check.validate(path, "release")
+                self.assertTrue(
+                    any(
+                        "Unknown certificates src. Should be one of "
+                        "system|user|@resourceVal" in e
+                        and f"{source!r}" in e
+                        for e in errors
+                    ),
+                    errors,
+                )
+
+    def test_runtime_accuracy_rationales_corrected(self) -> None:
+        # Rationale-accuracy pins: (a) the Android runtime READS
+        # hstsEnforced on config entries (XmlConfigSource.parseConfigEntry ->
+        # Builder#setHstsEnforced), so the gate's refusal must be worded as
+        # the stricter-than-runtime fail-safe it is - never as a
+        # "silently ignores" mirror - and must name the future-whitelist duty;
+        # (b) <certificateTransparency> inside debug-overrides is an EXPLICIT
+        # runtime throw ("certificateTransparency not allowed in
+        # debug-overrides"), mirrored with its own message instead of the
+        # generic "runtime skips unknown tags" wording.
+        path = self._write("hsts.xml", self._config(
+            '  <base-config cleartextTrafficPermitted="false" hstsEnforced="true" />\n'
+        ))
+        errors = nsc_check.validate(path, "release")
+        self.assertTrue(
+            any(
+                "runtime DOES honor hstsEnforced" in e
+                and "stricter-than-runtime fail-safe" in e
+                and "whitelist" in e
+                for e in errors
+            ),
+            errors,
+        )
+        self.assertFalse(
+            any("silently ignores unknown attributes" in e for e in errors),
+            errors,
+        )
+        path = self._write("ct-debug.xml", self._config(
+            self._BASE_FALSE
+            + '  <debug-overrides cleartextTrafficPermitted="false">\n'
+            '    <certificateTransparency enabled="true" />\n'
+            "  </debug-overrides>\n"
+        ))
+        for mode in nsc_check.MODES:
+            with self.subTest(mode=mode):
+                errors = nsc_check.validate(path, mode)
+                self.assertTrue(
+                    any(
+                        'certificateTransparency not allowed in debug-overrides' in e
+                        and "not a runtime" in e
+                        for e in errors
+                    ),
+                    errors,
+                )
+                self.assertFalse(
+                    any("skips unknown tags" in e for e in errors), errors
+                )
+
+    def test_nsc_doctype_attlist_fabrication_refused_at_source(self) -> None:
+        # expat resolves internal-subset ATTLIST DEFAULTS into the parsed tree
+        # (measured: `<!ATTLIST base-config cleartextTrafficPermitted CDATA
+        # "false">` materializes the deny-all pin on a bare <base-config/>).
+        # Without the DOCTYPE guard this fixture PASSES the gate with rule
+        # data the source never carried; the guard must refuse it fail-closed
+        # BEFORE that fabrication can count.
+        # Control proves the fabrication is load-bearing: the SAME shape
+        # without the DOCTYPE block still fails on the missing explicit pin.
+        control = self._write("control.xml", self._config("  <base-config />\n"))
+        errors = nsc_check.validate(control, "release")
+        self.assertTrue(
+            any('must set cleartextTrafficPermitted="false" explicitly' in e for e in errors),
+            errors,
+        )
+        body = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<!DOCTYPE network-security-config [\n'
+            '<!ATTLIST base-config cleartextTrafficPermitted CDATA "false">\n'
+            ']>\n'
+            "<network-security-config>\n"
+            "  <base-config />\n"
+            "</network-security-config>\n"
+        )
+        path = self._write("doctyped.xml", body)
+        # Document the expat behavior the guard exists for.
+        fabricated = ET.fromstring(body)
+        self.assertEqual(fabricated[0].get("cleartextTrafficPermitted"), "false")
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            code = nsc_check.main(["nsc_check.py", "--mode", "release", path])
+        self.assertEqual(1, code)
+        self.assertIn("DOCTYPE declarations are rejected", buf_err.getvalue())
+
+    def test_deep_nested_domain_config_surfaces_clean_fail(self) -> None:
+        # _MAX_NS_DOMAIN_NEST_DEPTH bounds the nested-domain-config walk: a
+        # 70-level suffix must surface as a clean structured FAIL (exit 1 with
+        # an actionable message), never an uncaught RecursionError traceback.
+        nested = "  <domain-config>\n" * 70
+        body = (
+            self._BASE_FALSE
+            + nested
+            + '    <domain includeSubdomains="false">example.com</domain>\n'
+            + "  </domain-config>\n" * 70
+        )
+        path = self._write("deep.xml", self._config(body))
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            code = nsc_check.main(["nsc_check.py", "--mode", "release", path])
+        self.assertEqual(1, code)
+        stderr = buf_err.getvalue()
+        self.assertIn("exceeds the maximum domain-config nesting depth 64", stderr)
+        # Legal nesting depths stay accepted: a three-level all-false chain
+        # inside the bound keeps validating clean in BOTH modes.
+        chain = (
+            '  <domain-config cleartextTrafficPermitted="false">\n'
+            '    <domain includeSubdomains="false">outer.example.com</domain>\n'
+            "    <domain-config cleartextTrafficPermitted=\"false\">\n"
+            '      <domain includeSubdomains="false">mid.example.com</domain>\n'
+            "      <domain-config cleartextTrafficPermitted=\"false\">\n"
+            '        <domain includeSubdomains="false">inner.example.com</domain>\n'
+            "      </domain-config>\n"
+            "    </domain-config>\n"
+            "  </domain-config>\n"
+        )
+        legal = self._write("legal-depth.xml", self._config(self._BASE_FALSE + chain))
+        for mode in nsc_check.MODES:
+            with self.subTest(mode=mode):
+                self.assertEqual(nsc_check.validate(legal, mode), [])
+
+    def test_fifo_config_is_refused_immediately(self) -> None:
+        # A checker handed a FIFO must refuse on os.stat BEFORE any open()
+        # (ET.parse's open on a FIFO blocks until a writer appears) - the same
+        # fail-closed shape as the backup-rules side, asserted via main() exit
+        # code and message only (no timing claim).
+        fifo = self.tmp / "fifo.xml"
+        os.mkfifo(fifo)
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            code = nsc_check.main(["nsc_check.py", "--mode", "release", str(fifo)])
+        self.assertEqual(1, code)
+        self.assertIn("not a regular file", buf_err.getvalue())
 
     def test_bool_attribute_values_must_be_lowercased_keywords(self) -> None:
         path = self._write(

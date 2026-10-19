@@ -24,6 +24,19 @@ This module parses the XML with the stdlib parser and enforces:
   throw at runtime (backup silently disabled), so the gate rejects them too.
   ``tools:``-namespace attributes never reach the runtime (aapt strips them)
   and are excluded from the attribute counts;
+- SOURCE files passing through ``validate`` / ``validate_manifest`` /
+  ``validate_permission_removals`` are guarded BEFORE any parse: they must be
+  regular files (``os.stat`` S_ISREG with symlinks followed on purpose - a
+  symlink to a regular file is the existing legal path; a FIFO would make the
+  checker's own ``open()`` block until a writer appears) and must contain no
+  DOCTYPE declaration (case-insensitive byte scan; the scan also catches
+  UTF-16-shaped NUL-interleaved payloads). The DOCTYPE refusal exists because
+  expat resolves internal-subset ATTLIST defaults into the parsed
+  ElementTree, so a hand-authored internal subset could fabricate rule data
+  (e.g. default a ``<exclude>``'s ``domain`` attribute). The compiled
+  artifact face carries no DOCTYPE (``aapt dump xmltree`` prints
+  elements/attributes only), so the compiled bytes stay the authority for
+  schema types there;
 - rule ``path``-attribute traversal guard: a path whose value contains
   ``..`` is refused outright. Android's rules schema resolves paths INSIDE
   the rule's domain (there is no parent-directory reference), and the
@@ -76,6 +89,8 @@ fixtures. Run with:
 
 from __future__ import annotations
 
+import os
+import stat
 import sys
 import xml.etree.ElementTree as ET
 from typing import Iterable
@@ -351,14 +366,67 @@ def validate(path: str, expected_root: str) -> list[str]:
     binding explicitly - the swapped-file false-PASS (reviewer repro) stays
     closed even outside the shell gate.
     """
-    try:
-        root = ET.parse(path).getroot()
-    except ET.ParseError as exc:
-        return [f"{path}: invalid XML: {exc}"]
-    except OSError as exc:
-        return [f"{path}: unreadable: {exc}"]
+    root, load_errors = _read_source_document(path)
+    if root is None:
+        return load_errors
 
     return validate_tree(root, path, expected_root)
+
+
+def _read_source_document(path: str) -> tuple[ET.Element | None, list[str]]:
+    """Fail-closed source loader used before ANY file open that could block.
+
+    Guards, in order:
+
+    - ``os.stat`` (FOLLOWING symlinks on purpose: a symlink pointing at a
+      regular file is the existing legal path for every caller of these
+      checkers) and ``S_ISREG``: a FIFO, directory or device file refuses
+      immediately - ``ET.parse``'s ``open()`` would block on a FIFO until a
+      writer appears, so the checker itself must not stall on one;
+    - a case-insensitive DOCTYPE scan over the raw bytes BEFORE
+      ``ET.fromstring``: expat materializes internal-subset ATTLIST DEFAULTS
+      into the parsed tree, so a hand-authored internal subset could fabricate
+      rule data this gate pins (measured:
+      ``<!ATTLIST exclude domain CDATA "sharedpref">`` injects a ``domain``
+      value into the parsed Element that the source text never carries).
+      DOCTYPE declarations are refused outright at this SOURCE surface; the
+      compiled artifact face carries none (``aapt dump xmltree`` prints
+      elements/attributes only), so the compiled bytes stay the authority
+      for schema types there;
+    - then the ordinary ElementTree parse with the historical messages
+      ("unreadable" / "invalid XML") preserved for existing surfaces.
+
+    The scan lowercases the raw bytes (plain ASCII encodings) AND a
+    NUL-stripped copy of them, so UTF-16-shaped NUL-interleaved sources hit
+    the same refusal.
+    """
+    try:
+        stat_result = os.stat(path)
+    except OSError as exc:
+        return None, [f"{path}: unreadable: {exc}"]
+    if not stat.S_ISREG(stat_result.st_mode):
+        return None, [
+            f"{path}: not a regular file - refused fail-closed "
+            "(FIFO/directory/device would make ET.parse's open() block the checker)"
+        ]
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return None, [f"{path}: unreadable: {exc}"]
+    if b"<!doctype" in raw.lower() or b"<!doctype" in raw.replace(b"\x00", b"").lower():
+        return None, [
+            f"{path}: DOCTYPE declarations are rejected: internal "
+            "ATTLIST/defaulted attributes would fabricate rule data "
+            "(expat resolves internal-subset ATTLIST defaults into the parsed "
+            "ElementTree; the compiled artifact surface carries no DOCTYPE and "
+            "stays governed by the compiled bytes)"
+        ]
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as exc:
+        return None, [f"{path}: invalid XML: {exc}"]
+    return root, []
 
 
 def _tools_marker_entries(element: ET.Element) -> tuple[tuple[str, str], ...]:
@@ -410,12 +478,9 @@ def validate_manifest(
     merged bytes independently; this source check is defense in depth.
     """
     bindings = tuple(EXPECTED_MANIFEST_ATTRS if expected_attrs is None else expected_attrs)
-    try:
-        root = ET.parse(path).getroot()
-    except ET.ParseError as exc:
-        return [f"{path}: invalid XML: {exc}"]
-    except OSError as exc:
-        return [f"{path}: unreadable: {exc}"]
+    root, load_errors = _read_source_document(path)
+    if root is None:
+        return load_errors
     if root.tag != "manifest":
         return [
             f"{path}: manifest check needs a <manifest> root, found <{root.tag}>"
@@ -518,12 +583,9 @@ def validate_permission_removals(path: str, blacklisted: Iterable[str]) -> list[
     old grep's catch-universe).
     """
     tokens = tuple(blacklisted)
-    try:
-        root = ET.parse(path).getroot()
-    except ET.ParseError as exc:
-        return [f"{path}: invalid XML: {exc}"]
-    except OSError as exc:
-        return [f"{path}: unreadable: {exc}"]
+    root, load_errors = _read_source_document(path)
+    if root is None:
+        return load_errors
     if root.tag != "manifest":
         return [f"{path}: manifest check needs a <manifest> root, found <{root.tag}>"]
     errors: list[str] = []

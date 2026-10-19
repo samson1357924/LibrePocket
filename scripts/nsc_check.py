@@ -55,19 +55,68 @@ construction) and enforces:
     narrows and stays valid;
 - Android runtime strictness, mirrored from AOSP
   ``frameworks/base/core/java/android/security/net/config/XmlConfigSource.java``:
-  * duplicates the runtime throws on at parse time are FAILs here too
+  * duplicates of the runtime throws at parse time are FAILs here too
     ("Only one base-config allowed", "Only one debug-overrides allowed",
     "Multiple trust-anchor elements not allowed", duplicate <domain> text
     ("has already been specified")) and ``<domain-config>`` without a
     ``<domain>`` child ("No domain elements in domain-config");
+  * parse-time VALUE semantics are mirrored through the ``_VALUE_CHECKS``
+    table (single landing point in ``_attr_errors``, so source and artifact
+    faces cannot drift): ``<pin digest=...>`` must be
+    ``"SHA-256".equalsIgnoreCase`` per ``Pin.isSupportedDigestAlgorithm``
+    (missing attr mirrors parsePin seeing null; ``sha-256`` in any case is
+    legal) and the TEXT must be Base64 with exactly 32 decoded bytes
+    (``Base64.decode`` + ``Pin.getDigestLength("SHA-256") == 32``);
+    ``<pin-set expiration>`` must be a real ``yyyy-MM-dd`` date
+    (``SimpleDateFormat("yyyy-MM-dd")`` + ``setLenient(false)``: 2023-02-30
+    throws, 2023-02-28 parses; ABSENT stays legal like the runtime's
+    ``Long.MAX_VALUE``, and an EMPTY ``<pin-set/>`` is also runtime-legal on
+    current main, so the gate accepts it in the same direction - not
+    mirrored as a throw); ``<certificates src>`` is the AOSP
+    ``parseCertificatesEntry`` allow set: ``system`` / ``user`` / ``wfa``
+    (WfaCertificateSource - wfa IS runtime-accepted hard-evidence even
+    though the runtime's diagnostic string omits it) plus resource
+    references, which require a compiled ``TypedValue.TYPE_REFERENCE``
+    (source ``"@..."`` spellings and the compiled typed payloads
+    ``@0x…``/``@res/0x…``; "?attr"-typed values NEVER resolve per
+    ``XmlBlock.Parser#getAttributeResourceValue`` and are refused). A
+    file-path src throws.
+    Documented stricter-than-runtime residuals: Android's
+    ``Base64.decode(digest, 0)`` tolerates limited line breaks (the gate is
+    stricter), Java's ``DateFormat.parse`` ignores trailing unparsed
+    characters (``strptime`` refuses them), and a source-level ``"@..."``
+    string cannot be distinguished from a real resource reference - that
+    residual is covered by the compiled-artifact face, which sees the dump
+    type; no file-path form is admitted on either face;
   * runtime visibility limits made explicit: unknown elements are SILENTLY
-    skipped by the runtime (``XmlUtils.skipCurrentTag``) and unknown attributes
-    are SILENTLY ignored (the attr loop in ``parseConfigEntry`` has no
-    else-throw). The gate deliberately FAILS CLOSED on both shapes instead of
-    mirroring the silent skip: at source level a stray/typo'd attribute (e.g.
-    ``includesubdomains``) would silently flip semantics or invite shape-drift
-    escapes, so the stricter-than-runtime refusal is pinned here with this
-    rationale rather than hidden;
+    skipped by the runtime (``XmlUtils.skipCurrentTag``) and unknown
+    attributes are SILENTLY ignored by ``parseConfigEntry``'s attribute loop
+    - with one nuance each: (a) ``hstsEnforced`` IS honored by the runtime
+    (``builder.setHstsEnforced``), so the gate's refusal of it is a
+    stricter-than-runtime fail-safe rather than a silent-ignore mirror (a
+    future HSTS support change must whitelist it in the same edit), and
+    (b) ``<certificateTransparency>`` inside ``debug-overrides`` is an
+    EXPLICIT runtime throw ("certificateTransparency not allowed in
+    debug-overrides"), mirrored with its own message instead of the generic
+    skip wording. The gate deliberately FAILS CLOSED on the remaining
+    unknown shapes instead of mirroring the silent skip: at source level a
+    stray/typo'd attribute (e.g. ``includesubdomains``) would silently flip
+    semantics or invite shape-drift escapes, so the stricter-than-runtime
+    refusal is pinned here with this rationale rather than hidden;
+  * nested ``<domain-config>`` walks are bounded by
+    ``_MAX_NS_DOMAIN_NEST_DEPTH`` (mirroring backup_rules_check's
+    ``_MAX_RULE_NEST_DEPTH``): pathological nesting surfaces as a clean
+    structured FAIL, never an uncaught RecursionError traceback;
+  * SOURCE files passing through ``validate`` are guarded BEFORE any parse:
+    they must be regular files (``os.stat`` S_ISREG with symlinks followed
+    on purpose - a symlink to a regular file is the existing legal path; a
+    FIFO would make the checker's own ``open()`` block) and must contain no
+    DOCTYPE declaration (case-insensitive byte scan): expat resolves
+    internal-subset ATTLIST defaults into the parsed ElementTree, so a
+    hand-authored internal subset could fabricate the very attributes this
+    gate pins. The compiled artifact face carries no DOCTYPE (``aapt dump
+    xmltree`` prints elements/attributes only), so the compiled bytes stay
+    the authority for typed values;
   * ``tools:``-namespace attributes never reach the runtime (aapt strips them)
     and are excluded from all attribute checks;
   * debug-overrides policies only apply to debuggable builds, but this gate
@@ -92,8 +141,13 @@ Run with:
 
 from __future__ import annotations
 
+import base64
+import datetime
+import os
+import stat
 import sys
 import xml.etree.ElementTree as ET
+from typing import Callable
 
 NSC_ROOT = "network-security-config"
 MODES = ("release", "debug")
@@ -158,6 +212,166 @@ _REQUIRED_ATTRS: dict[str, frozenset[str]] = {
 }
 _BOOL_ATTRS = frozenset(("cleartextTrafficPermitted", "includeSubdomains", "overridePins", "enabled"))
 
+# Elements whose attribute loop reads hstsEnforced (parseConfigEntry covers
+# the three config-entry tags only); used to shape the refusal rationale.
+_HSTS_HONORING_TAGS = frozenset(("base-config", "domain-config", "debug-overrides"))
+
+# Nesting guard for the nested <domain-config> walk (AOSP parseConfigEntry
+# recurses once per nesting level): bounded mirrors backup_rules_check's
+# _MAX_RULE_NEST_DEPTH so a pathological suffix-of-nested-configs fixture
+# surfaces as a clean structured FAIL line instead of an uncaught
+# RecursionError traceback.
+_MAX_NS_DOMAIN_NEST_DEPTH = 64
+
+# -- Parse-time VALUE semantics, mirrored from AOSP (frameworks/base main) --
+#
+# Each entry keys a ``(tag, attr)`` pair; ``attr=None`` denotes the element's
+# own TEXT. A None return means "runtime-legal at parse time"; anything else
+# is the mirrored parser-exception wording. Routing the checks through
+# ``_attr_errors`` is the single landing point: the source-file gate and the
+# compiled-artifact scanner (``apk_policy_inspect.py``, which rebuilds the
+# same ElementTree shape from ``aapt dump xmltree`` and calls
+# ``validate_tree``) then enforce the identical value semantics, and the
+# trust-anchors / pin-set / config-entry walkers that already delegate there
+# cover all three nsconfig families with this one table.
+#
+# Hard AOSP evidence (fetched from frameworks/base main):
+# - ``XmlConfigSource.parsePin``: ``Pin.isSupportedDigestAlgorithm(digest)``
+#   -> ``Pin.java`` `"SHA-256".equalsIgnoreCase(algorithm)` ("Currently only
+#   SHA-256 is supported. SHA-512 if/once Chromium networking stack supports
+#   it."); a MISSING attr is null there and hits the same throw, so the
+#   digest-algorithm check also covers the missing-attr case (on top of the
+#   _REQUIRED_ATTRS mirror). Then ``Base64.decode(getText().trim(), 0)``
+#   ("Invalid pin digest") and
+#   ``digest length N does not match expected length for X of M`` with
+#   ``Pin.getDigestLength("SHA-256") == 32``.
+# - ``XmlConfigSource.parsePinSet``: ``expiration`` is OPTIONAL (absent ->
+#   ``Long.MAX_VALUE``, no throw) and validated with
+#   ``SimpleDateFormat("yyyy-MM-dd")`` + ``setLenient(false)`` ->
+#   "Invalid expiration date in pin-set". An EMPTY ``<pin-set/>`` is also
+#   runtime-legal (current main builds ``PinSet(pins=[])`` without throwing),
+#   so the gate likewise accepts one in the same direction - the empty shape
+#   is NOT mirrored as a throw.
+# - ``XmlConfigSource.parseCertificatesEntry``: after the required-attr mirror,
+#   ``getAttributeResourceValue(null, "src", -1) != -1`` (which requires a
+#   compiled TypedValue.TYPE_REFERENCE - XmlBlock.Parser#getAttributeResource
+#   Value converts no other types, so "?attr"-typed values never become
+#   ResourceCertificateSource) or ``"system"`` / ``"user"`` / ``"wfa"``
+#   (WfaCertificateSource - wfa IS runtime-accepted even though the runtime's
+#   own diagnostic string
+#   "Unknown certificates src. Should be one of system|user|@resourceVal"
+#   omits it). Any file-path src throws.
+#
+# One documented stricter-than-runtime residual per family:
+# - pin text: android.util.Base64.decode(digest, 0) skips limited ASCII line
+#   breaks regardless of flags; Python's ``validate=True`` does not. The gate
+#   refuses whitespace-formatted pins (fail-closed, never less) - the runtime
+#   would tolerate them.
+# - pin text trimming mirrors Java's ``String#trim`` via ``_java_trim`` (NBSP
+#   and friends SURVIVE trimming, and base64 then refuses them exactly like
+#   the runtime decode).
+# - an element with NO text at all reaches the runtime's separate
+#   "Missing pin digest" branch (parsePin's ``parser.next() != TEXT``);
+#   ElementTree cannot distinguish `<pin/>` from `<pin>  </pin>` faithfully
+#   at this surface, so the gate reports the length wording (0) for both -
+#   both shapes fail either way.
+# - expiration: Java's ``DateFormat.parse`` ignores un-parsed TRAILING
+#   characters, so the runtime would accept a "yyyy-MM-dd" prefix followed by
+#   junk; ``strptime`` refuses the whole-string form (stricter, fail-closed).
+# - certificates src at SOURCE level: the literal "@name" spellings and the
+#   compiled typed REFERENCE payloads ("@0x…", "@res/0x…" as printed by aapt
+#   and passed through verbatim by the artifact rebuild) are both accepted by
+#   the "@" prefix. Source XML cannot distinguish a literal "@foo" STRING from
+#   a resource reference - that residual is covered by the compiled-artifact
+#   surface, whose dump shows the type; "?attr"-typed values NEVER resolve
+#   (TYPE_REFERENCE only, see the predicate KDoc) and are refused on both
+#   faces alongside file-path forms.
+
+
+def _pin_digest_algorithm_error(value: str | None) -> str | None:
+    # Mirror Pin.isSupportedDigestAlgorithm: "SHA-256".equalsIgnoreCase(value).
+    # None (missing attribute) mirrors the runtime string for null - already
+    # covered by _REQUIRED_ATTRS too, but the value semantics stay complete.
+    if value is not None and value.lower() == "sha-256":
+        return None
+    return (
+        f"Unsupported pin digest algorithm: {value if value is not None else 'null'} "
+        "(AOSP parsePin throws via Pin.isSupportedDigestAlgorithm - "
+        '"SHA-256".equalsIgnoreCase is the only supported form; sha-256 spelled '
+        "in any case stays legal, SHA-512/MD5/absent throw)"
+    )
+
+
+def _pin_digest_value_error(text: str | None) -> str | None:
+    # Mirror parsePin: Base64.decode(getText().trim(), 0) then length == 32.
+    digest_text = _java_trim(text or "")
+    try:
+        decoded = base64.b64decode(digest_text, validate=True)
+    except ValueError:
+        return 'Invalid pin digest (AOSP parsePin: Base64.decode failure)'
+    if len(decoded) != 32:
+        return (
+            f"digest length {len(decoded)} does not match expected length for "
+            f"SHA-256 of 32 (AOSP parsePin wording; Pin.getDigestLength)"
+        )
+    return None
+
+
+def _pin_set_expiration_error(value: str | None) -> str | None:
+    # Mirror parsePinSet: the attribute is OPTIONAL; a present value must be a
+    # real yyyy-MM-dd date (SimpleDateFormat("yyyy-MM-dd") + setLenient(false)).
+    if value is None:
+        return None
+    try:
+        datetime.datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return (
+            f"Invalid expiration date in pin-set (AOSP parsePinSet: "
+            'SimpleDateFormat("yyyy-MM-dd") + setLenient(false); '
+            f"got {value!r})"
+        )
+    return None
+
+
+def _certificates_src_error(value: str | None) -> str | None:
+    # Mirror parseCertificatesEntry. None (missing) is already reported by the
+    # _REQUIRED_ATTRS mirror ("certificates element missing src attribute");
+    # do not double-report it here.
+    if value is None:
+        return None
+    if value in ("system", "user", "wfa"):
+        return None
+    if value.startswith("@"):
+        # Resource-reference form. Evidence for the non-@ branches: compiled
+        # typed values only enter the ResourceCertificateSource branch when
+        # their type is TypedValue.TYPE_REFERENCE
+        # (XmlBlock.Parser#getAttributeResourceValue: "don't attempt to
+        # convert any other types" - TYPE_ATTRIBUTE i.e. "?attr/..." never
+        # resolves to an id, so the runtime then compares the STRING "src"
+        # value and throws). The SOURCE face shows literal "@name" spellings;
+        # the COMPILED artifact face prints the typed REFERENCE payload
+        # ("@0x…", "@res/0x…"), which apk_policy_inspect passes through
+        # verbatim. A source-level literal "@foo" STRING cannot be
+        # distinguished from a resource reference at THIS surface - that
+        # residual is covered by the compiled-artifact face, which sees the
+        # dump type; no file-path form is admitted on either surface.
+        return None
+    return (
+        "Unknown certificates src. Should be one of system|user|@resourceVal "
+        f"(AOSP parseCertificatesEntry wording; got {value!r} - system, user, "
+        "wfa and @resource references are the runtime-accepted forms, "
+        "file-path srcs throw)"
+    )
+
+
+# (tag, attr) -> predicate. attr=None keys the element's own TEXT (`pin`).
+_VALUE_CHECKS: dict[tuple[str, str | None], Callable[[str | None], str | None]] = {
+    ("pin", "digest"): _pin_digest_algorithm_error,
+    ("pin", None): _pin_digest_value_error,
+    ("pin-set", "expiration"): _pin_set_expiration_error,
+    ("certificates", "src"): _certificates_src_error,
+}
+
 
 def _is_tools_attribute(key: str) -> bool:
     return key.startswith(_TOOLS_NS_URI) or key.startswith(_TOOLS_NS_PREFIX)
@@ -177,6 +391,25 @@ def _attr_errors(path: str, where: str, element: ET.Element, errors: list[str]) 
                         f"{path}: {where} {key} must be exactly \"true\" or \"false\" "
                         f"(got {value!r})"
                     )
+        elif key == "hstsEnforced" and element.tag in _HSTS_HONORING_TAGS:
+            # Not in the gate's schema table, BUT the runtime DOES read it on
+            # config entries: AOSP XmlConfigSource.parseConfigEntry's
+            # attribute loop calls ``builder.setHstsEnforced(...)`` for this
+            # attr. So this refusal is a stricter-than-runtime fail-safe,
+            # NOT a mirror of a runtime that "silently ignores" it - a
+            # future HSTS support change must whitelist the attribute in the
+            # SAME edit (never leave the gate refusing an attr the runtime
+            # honors once a pin depends on it). On OTHER elements the attr
+            # loop never runs, so the generic drift message below applies.
+            errors.append(
+                f"{path}: {where} unknown attribute {key!r} "
+                "(the Android runtime DOES honor hstsEnforced on config "
+                "entries - XmlConfigSource.parseConfigEntry calls "
+                "Builder#setHstsEnforced - so the gate refusing it is a "
+                "stricter-than-runtime fail-safe, not a silent-ignore "
+                "mirror; a future HSTS support change must whitelist it in "
+                "that same edit)"
+            )
         else:
             errors.append(
                 f"{path}: {where} unknown attribute {key!r} "
@@ -189,6 +422,25 @@ def _attr_errors(path: str, where: str, element: ET.Element, errors: list[str]) 
                 f"{path}: {where} missing required attribute {required_attr} "
                 "(Android's parser throws at runtime without it)"
             )
+    # Parse-time VALUE semantics (see _VALUE_CHECKS): one landing point for
+    # every (tag, attr) family, applied wherever this helper already runs -
+    # trust-anchors, pin-set, config entries - so source and artifact faces
+    # cannot drift apart. ``attr=None`` predicates read the element's own TEXT
+    # (the <pin> payload).
+    for (tag, attr), check in _VALUE_CHECKS.items():
+        if tag != element.tag:
+            continue
+        value: str | None = element.text if attr is None else element.get(attr)
+        detail = check(value)
+        if detail is not None:
+            errors.append(f"{path}: {where} {detail}")
+            # Mirror parsePin's THROW-AT-FIRST-FAILURE chain: once one check
+            # of this element failed, the runtime never reached the next step
+            # (a refused pin BODY is never decoded after the digest
+            # algorithm was already refused). The `pin` family is the only
+            # one with more than one check, so stopping here reproduces the
+            # runtime's single-cause report.
+            break
 
 
 def _validate_trust_anchors(
@@ -280,6 +532,7 @@ def _validate_config_entry(
     seen_domains: set[str],
     errors: list[str],
     parent_effective_cleartext: str | None = None,
+    depth: int = 0,
 ) -> str | None:
     """Validate a base/domain/debug-overrides config entry.
 
@@ -319,6 +572,19 @@ def _validate_config_entry(
     pin_set_count = 0
     for child in element:
         if child.tag not in allowed_children:
+            if element.tag == "debug-overrides" and child.tag == "certificateTransparency":
+                # Not a silent skip: the runtime EXPLICITLY throws for this
+                # parent/child pair ("certificateTransparency not allowed in
+                # debug-overrides", XmlConfigSource.parseConfigEntry). The
+                # message mirrors the throw instead of the generic
+                # unknown-tag skip wording (accuracy of the rationale).
+                errors.append(
+                    f"{path}: {where} <certificateTransparency> is refused "
+                    "(Android throws \"certificateTransparency not allowed "
+                    "in debug-overrides\" at parse time, not a runtime-"
+                    "skipped unknown tag)"
+                )
+                continue
             errors.append(
                 f"{path}: {where} unknown element <{child.tag}> "
                 "(runtime skips unknown tags; the gate fail-closes on schema drift)"
@@ -339,6 +605,18 @@ def _validate_config_entry(
             # reachability is already guaranteed by allowed_children). AOSP
             # parseConfigEntry recurses with THIS builder as the child's
             # parent, so the child inherits our effective cleartext value.
+            # The recursion is bounded by _MAX_NS_DOMAIN_NEST_DEPTH: a
+            # pathological suffix of nested configs surfaces as a clean
+            # structured FAIL, not an uncaught RecursionError traceback.
+            if depth >= _MAX_NS_DOMAIN_NEST_DEPTH:
+                errors.append(
+                    f"{path}: {where} nested <domain-config> exceeds the maximum "
+                    f"domain-config nesting depth {_MAX_NS_DOMAIN_NEST_DEPTH} "
+                    "(the walk is bounded so pathological nesting surfaces as "
+                    "a clean structured FAIL, never an uncaught RecursionError "
+                    "traceback)"
+                )
+                continue
             _validate_config_entry(
                 path,
                 child,
@@ -348,6 +626,7 @@ def _validate_config_entry(
                 seen_domains=seen_domains,
                 errors=errors,
                 parent_effective_cleartext=effective,
+                depth=depth + 1,
             )
     if trust_anchor_count > 1:
         errors.append(
@@ -490,6 +769,62 @@ def validate_tree(root: ET.Element, mode: str, path: str) -> list[str]:
     return errors
 
 
+def _read_source_document(path: str) -> tuple[ET.Element | None, list[str]]:
+    """Fail-closed source loader used before ANY file open that could block.
+
+    Guards, in order:
+
+    - ``os.stat`` (FOLLOWING symlinks on purpose: a symlink pointing at a
+      regular file is the existing legal path for every caller of these
+      checkers) and ``S_ISREG``: a FIFO, directory or device file refuses
+      immediately - ``ET.parse``'s ``open()`` would block on a FIFO until a
+      writer appears, so the checker itself must not stall on one;
+    - a case-insensitive DOCTYPE scan over the raw bytes BEFORE
+      ``ET.fromstring``: expat materializes internal-subset ATTLIST DEFAULTS
+      into the parsed tree, so a hand-authored internal subset could fabricate
+      the very attributes this gate pins (measured:
+      ``<!ATTLIST base-config cleartextTrafficPermitted CDATA "false">``
+      injects the deny-all pin's value into the parsed Element without the
+      source carrying it). DOCTYPE declarations are refused outright at this
+      SOURCE surface; the compiled artifact carries none (aapt dump xmltree
+      emits elements/attributes only), so the compiled bytes' authority stems
+      from the artifact face regardless;
+    - then the ordinary ElementTree parse with the historical messages
+      ("unreadable" / "invalid XML") preserved for existing surfaces.
+
+    The scan lowercases the raw bytes (plain ASCII encodings) AND a
+    NUL-stripped copy of them, so UTF-16-shaped NUL-interleaved sources hit
+    the same refusal.
+    """
+    try:
+        stat_result = os.stat(path)
+    except OSError as exc:
+        return None, [f"{path}: unreadable: {exc}"]
+    if not stat.S_ISREG(stat_result.st_mode):
+        return None, [
+            f"{path}: not a regular file - refused fail-closed "
+            "(FIFO/directory/device would make ET.parse's open() block the checker)"
+        ]
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return None, [f"{path}: unreadable: {exc}"]
+    if b"<!doctype" in raw.lower() or b"<!doctype" in raw.replace(b"\x00", b"").lower():
+        return None, [
+            f"{path}: DOCTYPE declarations are rejected: internal "
+            "ATTLIST/defaulted attributes would fabricate rule data "
+            "(expat resolves internal-subset ATTLIST defaults into the parsed "
+            "ElementTree; the compiled artifact surface carries no DOCTYPE and "
+            "stays governed by the compiled bytes)"
+        ]
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as exc:
+        return None, [f"{path}: invalid XML: {exc}"]
+    return root, []
+
+
 def validate(path: str, mode: str) -> list[str]:
     """Return human-readable violations (empty when valid).
 
@@ -499,12 +834,9 @@ def validate(path: str, mode: str) -> list[str]:
     """
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r} (expected one of {MODES})")
-    try:
-        root = ET.parse(path).getroot()
-    except ET.ParseError as exc:
-        return [f"{path}: invalid XML: {exc}"]
-    except OSError as exc:
-        return [f"{path}: unreadable: {exc}"]
+    root, load_errors = _read_source_document(path)
+    if root is None:
+        return load_errors
     return validate_tree(root, mode, path)
 
 

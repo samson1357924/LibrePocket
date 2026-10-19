@@ -73,7 +73,26 @@ data class McpTool(
      */
     val inputSchema: String = """{"type":"object"}""",
     val sideEffect: SideEffect = SideEffect.WRITE,
-)
+) {
+    /**
+     * 隱私覆寫（Stage3 C-05）：data class 自動 [toString] 會把 [description]
+     * （伺服器控制、可含經 `\\uXXXX` 解碼的 ESC 等控制字元、上限 500 units）與
+     * [inputSchema]（伺服器控制、上限 [McpWire.INPUT_SCHEMA_MAX_CHARS] 字元的
+     * JSON 文本）整串帶進日誌/crash report——兩者非稽核欄位。此處以 `<N chars>`
+     * 佔位取代明細，比照 [McpCallResult.toString]／[McpListResult.toString] 的
+     * 既有風格；[serverId]（本地配置）照常輸出供判錯。[name]（入站已拒 C0/DEL
+     * 的識別欄位，可合法含空白/非 ASCII）經 [McpWire.escapeControlUnits] 輸出
+     *（Stage3 S3-D04：與 [McpCallResult] 稽核面同政策——合法名 no-op 原樣，
+     * 本地建構/被拒場景帶入的 C0/DEL 或孤立 surrogate 轉成可見 `\\uXXXX`，
+     * 日誌面不裸露 C0/DEL、不外洩孤立 surrogate 損壞編碼）。不動 `equals`/`copy`
+     * （data class 語意不變，僅日誌面收窄）。稽核走 [McpListResult.auditMap]
+     * （只記名與計數）。
+     */
+    override fun toString(): String =
+        "McpTool(serverId=$serverId, name=${McpWire.escapeControlUnits(name)}, " +
+            "description=<${description.length} chars>, " +
+            "inputSchema=<${inputSchema.length} chars>, sideEffect=$sideEffect)"
+}
 
 /** 傳輸/邏輯狀態：OK 以外一律視為工具級錯誤，不中斷會話（見 BACKLOG.md D03）。 */
 enum class McpStatus {
@@ -101,6 +120,13 @@ data class McpListResult(
     val status: McpStatus,
     val latencyMs: Long,
 ) {
+    /**
+     * 稽核面。`tools` 名清單**刻意**不經 [McpWire.escapeControlUnits]（與
+     * [McpCallResult.auditMap] 的 tool 欄轉義不對稱）：名的唯一建構點是
+     * `McpWire.parseListPage`，入站已 fail-closed 拒 C0/DEL 與孤立 surrogate——
+     * wire 來源的名不可能含控制字元。直呼本建構子的本地呼叫端自備字串屬
+     * 防禦深度缺口（re-review F-S3-02），接線 PR 若引入非 wire 來源須一併轉義。
+     */
     fun auditMap(): Map<String, Any?> = mapOf(
         "serverId" to serverId,
         "toolCount" to tools.size,
@@ -125,11 +151,14 @@ data class McpListResult(
  *
  * @param resultJson 僅駐記憶體的原始結果（呼叫方消費後丟棄，永不寫盤）；
  *   [auditMap] 刻意不含 arguments 與 result。
- * @param errorMessage 伺服器 error 包的 message（上限 200 UTF-16 code units
- *   ＝surrogate-safe 截斷，見 [McpWire.truncateUnits]；
+ * @param errorMessage 伺服器 error 包的 message（wire 層消毒後上限
+ *   [McpWire.ERROR_MESSAGE_MAX_UNITS]＝200 UTF-16 code units，C0/DEL 已換成
+ *   可見 `\\uXXXX` 轉義、轉義/surrogate 邊界截斷，見 [McpWire.escapeControlUnits]；
  *   僅 [McpStatus.TOOL_ERROR] 時非 null——`message` 是 JSON-RPC 2.0 必備字串欄位，
  *   缺／非字串屬形狀不完整，一律 PROTOCOL＋計熔斷（不會以預設字串充當，
- *   外部 review P3-1）；`isError=true` 結果路徑的 TOOL_ERROR
+ *   外部 review P3-1；**空／純空白** message 則在 wire 層填靜態
+ *   `jsonrpc error <code>`——B-03，伺服器不得以空 message 讓錯誤不可辨識）；
+ *   `isError=true` 結果路徑的 TOOL_ERROR
  *   為 null——該路徑無伺服器 message，詳情在 [resultJson]）。
  *   隱私不變式：不進 [auditMap]。
  */
@@ -142,9 +171,15 @@ data class McpCallResult(
     val isError: Boolean = false,
     val errorMessage: String? = null,
 ) {
+    /**
+     * 稽核面 [tool] 欄（Stage3 A-01）：形狀閘**被拒**的 toolName（呼叫端自備字串，
+     * 可含 CR/LF/ESC）仍會進本欄供診斷，但只以 [McpWire.escapeControlUnits] 的
+     * 可見 `\\uXXXX` 轉義形式出現——裸 CR/LF 偽造稽核列的通道關閉。
+     * 合法名（入站已拒 C0/DEL、出站形狀閘同政策）原樣保留，既有稽核語意不變。
+     */
     fun auditMap(): Map<String, Any?> = mapOf(
         "serverId" to serverId,
-        "tool" to tool,
+        "tool" to McpWire.escapeControlUnits(tool),
         "status" to status.name,
         "latencyMs" to latencyMs,
         "isError" to isError,
@@ -154,10 +189,11 @@ data class McpCallResult(
      * 隱私覆寫：data class 自動 [toString] 會把 [resultJson]（結果原文）與
      * [errorMessage]（伺服器訊息）一併帶進日誌/crash report——違反「原文不落盤」
      * 不變式（[auditMap] 已刻意排除兩者）。此處以佔位符取代原文，僅保留判錯所需
-     * 的狀態欄位。稽核一律走 [auditMap]，不走 [toString]。
+     * 的狀態欄位；[tool] 同 [auditMap] 以轉義形式輸出（被拒名的裸 CR/LF 不得
+     * 經日誌面外顯，Stage3 A-01）。稽核一律走 [auditMap]，不走 [toString]。
      */
     override fun toString(): String =
-        "McpCallResult(serverId=$serverId, tool=$tool, status=$status, " +
+        "McpCallResult(serverId=$serverId, tool=${McpWire.escapeControlUnits(tool)}, status=$status, " +
             "latencyMs=$latencyMs, isError=$isError, " +
             "resultJson=<${resultJson?.length ?: 0} chars>, " +
             "errorMessage=<${errorMessage?.length ?: 0} chars>)"

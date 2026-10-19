@@ -310,16 +310,99 @@ class McpProtocolContractsTest {
         }
     }
 
-    @Test fun escCoversBackspaceFormfeedAndC0() {
+    @Test fun callBodyRejectsControlCharToolNameAndEscStillEscapesAsDefenseInDepth() {
+        // Stage3 A-01 翻轉（舊測 escCoversBackspaceFormfeedAndC0 把「C0 出站經 esc
+        // 轉義合法」釘成正向——該行為正是漏洞：C0 工具名會被真的送達伺服器，
+        // 且被拒名流進 auditMap 時可偽造稽核列）。toolName 是**識別欄位**，現與入站
+        // parseListPage 對稱：C0/DEL 一律拒（靜態訊息、不發送）。esc 本體保留完整
+        // C0 轉義當防禦深度（toolName 路徑已先拒；直呼 esc 保持轉義分支覆蓋）。
         val name = "a\"b\\c\bd\ne\rg\th" + '\u000C' + '\u0001' + "-end"
-        val body = McpWire.callBody(name, "{}")
-        // 產出必須是合法 JSON（嚴格 parser 可走訪），且不得含裸控制字元。
-        McpWire.parseStrictDoc(body)
-        assertFalse("不得含裸 BS", body.contains("\b"))
-        assertFalse("不得含裸 FF", body.contains("\u000C"))
-        assertTrue(body.contains("\\b"))
-        assertTrue(body.contains("\\f"))
-        assertTrue(body.contains("\\u0001"))
+        try {
+            McpWire.callBody(name, "{}")
+            fail("含 C0 控制字元的出站 toolName 必須拒（不發送）")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("mcp: tool name has control chars", e.message)
+        }
+        // esc 直呼 unit pin：產出為合法 JSON 字串片段且無裸控制字元。
+        val escaped = McpWire.esc(name)
+        McpWire.parseStrictDoc("""{"v":"$escaped"}""")
+        assertFalse("不得含裸 BS", escaped.contains("\b"))
+        assertFalse("不得含裸 FF", escaped.contains("\u000C"))
+        assertTrue(escaped.contains("\\b"))
+        assertTrue(escaped.contains("\\f"))
+        assertTrue(escaped.contains("\\u0001"))
+    }
+
+    @Test fun controlCharToolNameMapsToProtocolWithEscapedAuditAndToString() = runBlocking {
+        // Stage3 A-01 E2E：C0 toolName（CR/LF 偽造稽核列重現）→ PROTOCOL（既有 IAE
+        // catch 映射）、不發送、不碰 vault、不計熔斷；被拒名仍進 auditMap()["tool"]
+        // 與 toString()（呼叫端自備字串），但只以可見 \uXXXX 轉義形式出現——
+        // 裸 CR/LF 通道關閉（修飾前 auditMap 含裸 \r\n，本測即紅）。
+        val web = MockWebServer()
+        web.start()
+        try {
+            val vault = CountingVault()
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = vault,
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val bad = "x\r\n[FAKE] status=OK"
+            val got = withTimeoutOrNull(5_000) { server.callTool(bad, "{}") }
+            assertNotNull(got)
+            assertEquals(McpStatus.PROTOCOL, got!!.status)
+            assertEquals("形狀閘違反不得發送 HTTP", 0, web.requestCount)
+            assertEquals("形狀閘違反不得碰 vault", 0, vault.calls)
+            assertEquals("形狀閘違反不得計熔斷", 0, breaker.failureCount())
+            val auditTool = got.auditMap()["tool"] as String
+            assertTrue(
+                "auditMap tool 不得含裸 C0/DEL",
+                auditTool.none { it.code < 0x20 || it.code == 0x7F },
+            )
+            assertEquals(
+                "被拒名以 \\uXXXX 轉義進稽核（不丟字、不可偽造列）",
+                "x\\u000d\\u000a[FAKE] status=OK",
+                auditTool,
+            )
+            val s = got.toString()
+            assertTrue("toString 不得含裸 C0/DEL", s.none { it.code < 0x20 || it.code == 0x7F })
+            assertTrue("toString 的 tool 欄同為轉義形式", s.contains("x\\u000d\\u000a[FAKE] status=OK"))
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun overlongToolNameMapsToProtocolWithFullLengthUntruncatedAudit() = runBlocking {
+        // S3-D05 稽核面取捨 pin：>128 字元名出站拒（PROTOCOL、不發送、不碰 vault、
+        // 不計熔斷）；被拒名進 auditMap()["tool"] **只轉義不截斷**——200 字元名
+        // 稽核欄完整長度不變（稽核面 tool 欄無長度上限是已知取捨：僅本地呼叫端
+        // 可控、不經 wire，截斷反而使稽核證據失真，見 escapeControlUnits KDoc）。
+        // 截斷 audit tool 欄即紅。
+        val web = MockWebServer()
+        web.start()
+        try {
+            val vault = CountingVault()
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = vault,
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val name = "n".repeat(200)
+            val got = withTimeoutOrNull(5_000) { server.callTool(name, "{}") }
+            assertNotNull(got)
+            assertEquals(McpStatus.PROTOCOL, got!!.status)
+            assertEquals("超限名不得發送 HTTP", 0, web.requestCount)
+            assertEquals("超限名不得碰 vault", 0, vault.calls)
+            assertEquals("超限名不得計熔斷", 0, breaker.failureCount())
+            assertEquals("稽核面 tool 欄完整長度不變（只轉義不截斷）",
+                name, got.auditMap()["tool"])
+        } finally {
+            web.shutdown()
+        }
     }
 
     @Test fun callBodyRejectsNonObjectArguments() {

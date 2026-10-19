@@ -47,6 +47,14 @@ internal object McpWire {
      */
     internal const val DESCRIPTION_MAX_CHARS = 500
 
+    /**
+     * tools/call error 包 `message` 顯示上限（UTF-16 code units）：
+     * [escapeControlUnits] 消毒後仍不得超過此上限（轉義展開計入預算，
+     * 在轉義/surrogate 邊界截斷）；[McpServer.callTool] 透傳前再以此值
+     * 防禦性鉗一次（消毒後已是 no-op，單一真相在此常數）。
+     */
+    internal const val ERROR_MESSAGE_MAX_UNITS = 200
+
     /** tools/list 請求固定 id（單發子集；[McpServer] 收回應時以 expectedId=LIST_ID 校驗）。 */
     internal const val LIST_ID = 1L
 
@@ -506,18 +514,31 @@ internal object McpWire {
      * - `toolName` 空白即拋（不送 `"name":""` 無效請求）；
      * - `toolName` 超 [TOOL_NAME_MAX_CHARS] 即拋（[parseList] 入站名同用此常數；
      *   出站同樣不放行超長名，不送可預期被拒的請求）；
+     * - `toolName` 含 C0 控制字元（`< 0x20`）或 DEL（`0x7F`）即拋（靜態訊息
+     *   `mcp: tool name has control chars`，與入站 [parseListPage] 對稱——Stage3
+     *   A-01：CR/LF 可偽造稽核列、C0/ESC 可干擾終端；toolName 是**識別欄位**，
+     *   一律拒而非轉義。對照 `argumentsJson`：那是**遠端資料通道**，控制字元
+     *   屬合法 payload 內容，經嚴格 JSON parser 驗證後原樣保留（不經 [esc]），
+     *   兩者政策差異在此）；
      * - `toolName` 含孤立 surrogate 即拋（[esc] 只轉義控制字元與引號，不修 surrogate；
      *   出站後 UTF-8 編碼會把孤立 surrogate 變 U+FFFD——送達伺服器的名與列表名
      *   不再一致，工具識別錯位，故發送前 fail-closed）；
+     *   （名形狀驗證順序：空白 → 超限 → C0/DEL → 孤立 surrogate，與下方程式一致）；
      * - `argumentsJson` 必須是合法 JSON object 文本（空字串視為 `{}`），
      *   非 object（`null`／陣列／畸形）即拋，不發送；
      *   字元數超 [ARGUMENTS_MAX_CHARS] 即拋（訊息明指 arguments，非 response）；
-     * - `toolName` 經 [esc] 轉義（含 `\b`／`\f`／C0 控制字元 `\\u00XX`）。
+     * - `toolName` 經 [esc] 轉義：C0/DEL 已先在此拒（其 [esc] C0 分支屬防禦深度，
+     *   見該函 KDoc），實際會走到的只剩引號／反斜線等 JSON 必要編碼。
      */
     fun callBody(toolName: String, argumentsJson: String, id: Long = CALL_ID): String {
         require(toolName.isNotBlank()) { "mcp: blank tool name" }
         require(toolName.length <= TOOL_NAME_MAX_CHARS) {
             "mcp: tool name exceeds $TOOL_NAME_MAX_CHARS chars"
+        }
+        // C0/DEL 拒（與入站 parseListPage 對稱，A-01）：識別欄位不轉義、一律拒；
+        // 靜態訊息（不插值名——名含伺服器/呼叫端字串，不回顯進錯誤面）。
+        if (toolName.any { it.code < 0x20 || it.code == 0x7F }) {
+            throw IllegalArgumentException("mcp: tool name has control chars")
         }
         if (hasLoneSurrogate(toolName)) {
             throw IllegalArgumentException("mcp: tool name has lone surrogate")
@@ -616,8 +637,16 @@ internal object McpWire {
      * 空白／NBSP 等 Unicode 空白；與保留前綴同政策——空白名在所有 [McpScope] 授權
      * 入口都被 [McpScope.requireBareToolName] 拒，照收同樣會讓未來接線
      * `map { McpScope.toToolDef(...) }` 拋未映射 IAE 打斷整輪；名**內含**空格
-     * （如 `my tool`）不受影響，正向已測），
-     * description 非字串（含 null/數字/物件）降為空字串（描述欄位型別寬容，
+     * （如 `my tool`）不受影響，正向已測）、
+     * **同頁重複名整頁拒**（靜態訊息 `mcp: duplicate tool name`，Stage3 B-04：
+     * `enabledTools`／[McpScope] 授權路徑**以名為鍵**（精確比對、缺鍵預設啟用），
+     * 同頁重複名會讓「哪一支工具被停用／授權」失去唯一對象，且
+     * [McpListResult.auditMap] 的 `toolCount`／`tools` 名清單對重複名失真——
+     * 與超限名／保留前綴／空白名同政策整頁 fail-closed 拒，不靜默略過單支、
+     * 不採納首支；重複判定在單頁內（**跨頁不適用**：本子集不跟隨
+     * `nextCursor` 分頁，見 [McpWire] 修訂立場——每頁各自獨立驗證）、
+     * 名形狀驗證順序：超限 → 控制字元 → 空白 → 保留前綴 → 同頁重複，與上方
+     * KDoc 文件化順序一致；description 非字串（含 null/數字/物件）降為空字串（描述欄位型別寬容，
      * 不影響工具可用性）、超 [DESCRIPTION_MAX_CHARS] 截斷（截斷 vs 拒絕的
      * 政策區別見該常數 KDoc）。
      *
@@ -659,6 +688,9 @@ internal object McpWire {
         val tools = if (toolsVal.items.isEmpty()) {
             emptyList()
         } else {
+            // 同頁重複名追蹤（B-04）：以名為鍵的 enabledTools／McpScope 授權語意
+            // 需要「頁內名唯一」——重複名整頁拒，不靜默略過、不採納首支。
+            val seenNames = HashSet<String>()
             toolsVal.items.map { item ->
                 if (item !is JObj) throw McpProtocol("mcp: bad tools item")
                 val nameVal = item.find("name")
@@ -674,7 +706,7 @@ internal object McpWire {
                     throw McpProtocol("mcp: tool name has control chars")
                 }
                 // 空白／空名整頁拒（與保留前綴同政策；名形狀驗證順序：超限 → 控制字元 →
-                // 空白 → 保留前綴，與上方 KDoc 文件化順序一致）：空白名在所有
+                // 空白 → 保留前綴 → 同頁重複，與上方 KDoc 文件化順序一致）：空白名在所有
                 // McpScope 授權入口都被 requireBareToolName 拒（isNotBlank），照收會
                 // 「列出但不可用」且讓未來接線 `map { McpScope.toToolDef(...) }` 拋
                 // 未映射 IAE 打斷整輪——與保留前綴同災難形（re-review F-S2-02）。
@@ -682,14 +714,20 @@ internal object McpWire {
                 if (nameVal.v.isBlank()) {
                     throw McpProtocol("mcp: tool name is blank")
                 }
-                // 保留前綴整頁拒（名形狀驗證順序：超限 → 控制字元 → 空白 → 保留前綴，與上方
-                // KDoc 文件化順序一致）：`mcp.`（＝McpScope.SWITCH_PREFIX，單一真相經
+                // 保留前綴整頁拒（名形狀驗證順序：超限 → 控制字元 → 空白 → 保留前綴 →
+                // 同頁重複，與上方 KDoc 文件化順序一致）：`mcp.`（＝McpScope.SWITCH_PREFIX，單一真相經
                 // RESERVED_TOOL_PREFIX 引用）是開關鍵/ToolDef.name 的形狀，不是遠端 bare 名。
                 // 照收會「列出但不可用」（所有 McpScope 授權入口都拒此前綴），且未來接線
                 // `map { McpScope.toToolDef(...) }` 會拋未映射 IAE 打斷整輪——與超限名同政策：
                 // 整頁 fail-closed 拒，不靜默略過單支。
                 if (nameVal.v.startsWith(RESERVED_TOOL_PREFIX)) {
                     throw McpProtocol("mcp: tool name uses reserved prefix")
+                }
+                // 同頁重複名整頁拒（B-04，驗證順序末位）：靜態訊息、不回顯名——
+                // enabledTools／McpScope 以名為鍵（精確比對、缺鍵預設啟用），重複名
+                // 使「停用／授權哪一支」失去唯一對象，auditMap toolCount 失真。
+                if (!seenNames.add(nameVal.v)) {
+                    throw McpProtocol("mcp: duplicate tool name")
                 }
                 val descVal = item.find("description")
                 val desc = if (descVal is JStr) descVal.v else ""
@@ -740,9 +778,15 @@ internal object McpWire {
      *   及保留 server 範圍 −32099..−32000（見 [SERVER_ERROR_RANGE]）
      *   → 拋 [McpProtocol]（[McpServer] 映射 PROTOCOL + 計熔斷，breaker 能得知不互通）；
      * - `-32602`（invalid params）與範圍外未知碼 → 拋 [McpToolFailure]（工具級中性；
-     *   message 取伺服器原文上限 200 UTF-16 code units（[truncateUnits]，
-     *   不切 surrogate pair），由 [McpServer.callTool] 透傳至
-     *   [McpCallResult.errorMessage]，不進 auditMap）。
+     *   message 經 [escapeControlUnits] 消毒——C0/DEL 換成可見 `\\uXXXX` 轉義、
+     *   上限 [ERROR_MESSAGE_MAX_UNITS] UTF-16 code units（轉義/surrogate 邊界截斷，
+     *   不切 surrogate pair、不裸露 C0/DEL——bidi 方向控制字元 U+202A..U+202E、
+     *   C1（U+0085 等）、U+2028/2029 刻意不轉義，邊界見該函 KDoc）、
+     *   空／純空白 message 填靜態 `jsonrpc error <code>`（B-03：伺服器不得以空
+     *   message 讓錯誤不可辨識；code 為本地解析整數，插值非伺服器自由文字；
+     *   blank 判同時覆蓋**原始**與**消毒後**——預算截斷可把「<200 空白>x」切成
+     *   轉義後仍純空白，S3-R01），由 [McpServer.callTool]
+     *   透傳至 [McpCallResult.errorMessage]，不進 auditMap）。
      *
      * `code` 必須是整數字面量（不含指數／小數／溢位；否則 `mcp: bad error`）。
      * 注意不對稱：[parseList] 對任何 error 包（含 `-32602`/未知碼）一律
@@ -810,7 +854,26 @@ internal object McpWire {
             if (code in PROTOCOL_ERROR_CODES || code in SERVER_ERROR_RANGE) {
                 throw McpProtocol("mcp: jsonrpc error $code")
             }
-            throw McpToolFailure(truncateUnits(msgVal.v, 200))
+            // B-03（空訊息靜態替代）：空／純空白 message 不得原樣透傳——伺服器刻意
+            // 送空 message 會讓上層錯誤不可辨識。code 已是**本地解析的整數**
+            //（非伺服器自由文字），插值安全；純數字插值外皆為靜態字面。
+            // 原文層 blank 判先行且涵蓋 C0 空白（TAB 等）：這類輸入直接走靜態
+            // 替代、不消毒（B-03 語意「空白＝無可辨識訊息」，不產出 \u0009 之類
+            // 的轉義空白充當訊息）。
+            // A-02（控制字元消毒）：非空 message 經 escapeControlUnits 把 C0/DEL
+            // 換成可見 \uXXXX 轉義（≤ERROR_MESSAGE_MAX_UNITS units、轉義邊界截斷、
+            // surrogate 安全），不裸露 C0/DEL、預算內不靜默丟字。
+            // S3-R01（post-escape blank 防繞過）：200 units 預算截斷可能把
+            //「<200 個空白>x」切成**轉義後仍純空白**的字串——對 escape 結果
+            // 再判一次 blank，仍補同一靜態替代（兩分支各消毒至多一次，正常
+            // 非空白路徑語意不變：sanitize＋截斷、無 fallback）。
+            val message = if (msgVal.v.isBlank()) {
+                "jsonrpc error $code"
+            } else {
+                escapeControlUnits(msgVal.v, ERROR_MESSAGE_MAX_UNITS)
+                    .ifBlank { "jsonrpc error $code" }
+            }
+            throw McpToolFailure(message)
         }
         if (resultVal == null || resultVal is JNull) throw IllegalArgumentException("mcp: missing result")
         if (resultVal !is JObj) throw IllegalArgumentException("mcp: bad result")
@@ -914,8 +977,9 @@ internal object McpWire {
     class McpProtocol(message: String) : IllegalArgumentException(message)
 
     /**
-     * UTF-16 code-unit 截斷（[errorMessage][McpCallResult.errorMessage] 200 與
-     * [description][DESCRIPTION_MAX_CHARS] 500——name 不截斷，超限即拒）：
+     * UTF-16 code-unit 截斷（[description][DESCRIPTION_MAX_CHARS] 500——
+     * name 不截斷，超限即拒；errorMessage 的顯示上限改走 [escapeControlUnits]，
+     * 內建預算與 surrogate 邊界截斷）：
      * 若截斷點落在 surrogate pair 中間，去掉尾端孤立 high surrogate——
      * 避免孤立 surrogate 序列化成 U+FFFD／'?'（出站名錯字、渲染亂碼）。
      */
@@ -925,6 +989,84 @@ internal object McpWire {
         return if (cut.last().isHighSurrogate()) cut.dropLast(1) else cut
     }
 
+    /**
+     * 顯示消毒（Stage3 A-02 errorMessage＋A-01 稽核面 tool 欄，單一真相）：
+     * C0（U+0000..U+001F）、DEL（U+007F）與**孤立 surrogate**（未成對的 high/low，
+     * S3-D02——出站 [callBody] 對孤立 surrogate 亦 fail-closed 拒，稽核面不得
+     * 原樣放行讓日誌損壞編碼）逐一替換為**可見的六字元字面** `\\uXXXX`
+     *（小寫 hex，與 [esc] 的 C0 分支同格式）；其餘字元（含**成對** surrogate、
+     * bidi 方向控制字元 U+202A..U+202E、C1（U+0080..U+009F，如 U+0085 NEL）、
+     * U+2028/U+2029、非 BMP）原樣保留——本函轉義範圍**刻意只有** C0/DEL＋
+     * 孤立 surrogate，擴大即是政策變更（政策邊界 pin：
+     * `bidiC1AndLineSeparatorsPassThroughUnescaped`、`loneSurrogateIsEscapedNotPassthrough`）。
+     * 取捨（KDoc 文件化）：
+     * - **預算內不靜默丟字**：轉義形式保留「是哪個控制字元」的診斷資訊（對照
+     *   U+FFFD 替換——1:1 不展開但資訊全失，且 U+FFFD 本身語意是「解碼錯」
+     *   誤導）；「預算外捨棄」（預算放不下完整六字元轉義或 surrogate pair 即止）
+     *   屬截斷語意，非本條所稱的「靜默丟字」——邊界由
+     *   `escapeTruncationStopsAtEscapeBoundaryWithoutHalfEscapeOrTail` pin；
+     * - **不讓裸 C0/DEL 外顯**：CR/LF 偽造稽核列、ESC 干擾終端的通道關閉
+     *   （轉義後是純可列印文字）；
+     * - **不得超過 [maxUnits] 上限**（UTF-16 code units）：轉義展開**計入預算**，
+     *   截斷落在轉義邊界（放不下完整六字元即止，不留半截 `\u00`）與 surrogate
+     *   邊界（pair 放不下即止，不切斷代理對；孤立 surrogate 經本函只會被轉義
+     *   **消除**——本函不產生新的孤立 surrogate）。
+     *
+     * 與 [esc] 的差異（兩者不可互換）：[esc] 是**出站 JSON 編碼**（toolName 經
+     * [callBody] 已先拒 C0/DEL，其 C0 分支屬防禦深度）；本函是**入站伺服器文字／
+     * 呼叫端字串的顯示消毒**（[McpCallResult.errorMessage]、auditMap/toString 的
+     * tool 欄），不產出 JSON，只保證安全呈現。
+     *
+     * @param maxUnits 預算上限；預設不設限——[McpCallResult.auditMap] 的 tool 欄
+     *   對**被拒**名只轉義不截斷（呼叫端自備字串，保留完整診斷；合法名恆 ≤
+     *   [TOOL_NAME_MAX_CHARS] 且不含 C0，走此路徑原樣保留）。稽核面 tool 欄
+     *   **無長度上限**是已知取捨（S3-D05）：被拒名只可能由本地呼叫端提供、
+     *   不經 wire，超長名的記憶體放大風險以「呼叫端可控」抵償；在此截斷反而
+     *   使稽核證據失真（截斷後無法還原原名）。
+     */
+    internal fun escapeControlUnits(s: String, maxUnits: Int = Int.MAX_VALUE): String {
+        val sb = StringBuilder(s.length)
+        var budget = maxUnits
+        var i = 0
+        while (i < s.length && budget > 0) {
+            val c = s[i]
+            when {
+                c.isHighSurrogate() && i + 1 < s.length && s[i + 1].isLowSurrogate() -> {
+                    if (budget < 2) return sb.toString()
+                    sb.append(c).append(s[i + 1])
+                    budget -= 2
+                    i += 2
+                }
+                // S3-D02：走到這裡的 surrogate 必為孤立（成對 high+low 已於上分支
+                // 以 i+=2 消耗——low 無前導 high、high 無後繼 low）：與 C0/DEL 同
+                // 待遇轉成 \uXXXX（計入預算）。成對 surrogate 原樣保留。
+                c.isSurrogate() || c.code < 0x20 || c.code == 0x7F -> {
+                    val escText = "\\u%04x".format(c.code)
+                    if (escText.length > budget) return sb.toString()
+                    sb.append(escText)
+                    budget -= escText.length
+                    i++
+                }
+                else -> {
+                    sb.append(c)
+                    budget--
+                    i++
+                }
+            }
+        }
+        return sb.toString()
+    }
+
+    /**
+     * 出站 JSON 字串編碼（引號／反斜線／C0 短形式與 `\\u00XX`；DEL 原樣——
+     * 它不是 JSON 控制字元）。
+     *
+     * 注意（Stage3 A-01）：[callBody] 對 **toolName** 已先拒 C0/DEL（識別欄位
+     * 不編碼、一律拒），本函的 C0 分支對 toolName 路徑是**防禦深度**
+     *（單元測試直呼覆蓋）；`argumentsJson` 是遠端資料通道，控制字元屬合法
+     * payload 內容，但那條路徑**不經本函**——arguments 以原文進 body、
+     * 經 [parseStrictDoc] 驗證。本函不得用於放行本應拒絕的識別欄位。
+     */
     internal fun esc(raw: String): String {
         val sb = StringBuilder(raw.length)
         for (c in raw) {

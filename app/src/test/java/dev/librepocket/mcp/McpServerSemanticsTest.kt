@@ -735,6 +735,64 @@ class McpServerSemanticsTest {
         }
     }
 
+    @Test fun controlCharErrorMessageIsEscapedEndToEnd() = runBlocking {
+        // Stage3 A-02 E2E：伺服器 message 含 ESC 序列＋CR/LF → errorMessage 不含裸
+        // C0/DEL（wire 層已換 \uXXXX 轉義；server 層鉗制為 no-op）——上層錯誤呈現
+        // 不得外顯伺服器控制字元。修飾前 errorMessage 含裸 \u001b/\r\n，本測即紅。
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602," +
+                        "\"message\":\"\\u001b[31mFAKE\\r\\nline\"}}",
+                ),
+            )
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(),
+            )
+            val got = deadline { server.callTool("t", "{}") }
+            assertEquals(McpStatus.TOOL_ERROR, got.status)
+            val msg = got.errorMessage!!
+            assertTrue("errorMessage 不得含裸 C0/DEL", msg.none { it.code < 0x20 || it.code == 0x7F })
+            assertEquals("\\u001b[31mFAKE\\u000d\\u000aline", msg)
+            assertTrue(msg.length <= McpWire.ERROR_MESSAGE_MAX_UNITS)
+            assertFalse("稽核不得含 errorMessage", got.auditMap().toString().contains("FAKE"))
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun emptyErrorMessageMapsToStaticTextEndToEnd() = runBlocking {
+        // Stage3 B-03 E2E：空 message → errorMessage 為靜態 `jsonrpc error -32602`
+        //（不是空字串——伺服器不得以空 message 讓錯誤不可辨識），仍 TOOL_ERROR 中性。
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"\"}}",
+                ),
+            )
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = deadline { server.callTool("t", "{}") }
+            assertEquals(McpStatus.TOOL_ERROR, got.status)
+            assertEquals("jsonrpc error -32602", got.errorMessage)
+            assertEquals("空 message 仍屬中性工具錯（不計熔斷）", 0, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
     @Test fun protocolErrorPathLeavesErrorMessageNull() = runBlocking {
         // PROTOCOL 路徑（協議碼 -32601）：errorMessage 為 null（僅 TOOL_ERROR 才有）。
         val web = MockWebServer()

@@ -158,4 +158,34 @@ class McpRegistryTest {
             web.shutdown()
         }
     }
+
+    @Test fun registryDefensivelyCopiesConstructorMapAndIdsView() {
+        // Stage3 C-10：防禦性複製——建構後增刪改**原 map** 不影響 registry
+        //（成員資格在建構時固定）；ids() 回傳**快照**，呼叫端增刪回傳集合
+        // 不影響內部。mutation（拿掉 toMap()/keys.toSet()）此測即紅。
+        val web = MockWebServer()
+        web.start()
+        try {
+            val a = server(web, "a")
+            val b = server(web, "b")
+            // 兩元素起步：Kotlin toSet() 對單元素集合回不可變 singleton——
+            // 快照可變性驗證須 ≥2 元素（LinkedHashSet）才有意義。
+            val mutable = linkedMapOf("a" to a, "b" to b)
+            val reg = McpRegistry(mutable)
+            // 原 map 事後變更不得滲透 registry。
+            mutable["evil"] = server(web, "evil")
+            mutable.remove("a")
+            assertEquals("原 map 增改不得影響 registry", setOf("a", "b"), reg.ids())
+            assertSame("命中仍回原實例", a, reg.get("a"))
+            assertNull("未經原 map 事後新增的 id 必須回 null", reg.get("evil"))
+            // ids() 快照：呼叫端（型別上可變的 Set 實作）增刪不得影響內部。
+            val ids = reg.ids() as MutableSet<String>
+            ids.add("injected")
+            ids.remove("a")
+            assertEquals("ids() 回傳集合被改動不得影響內部", setOf("a", "b"), reg.ids())
+            assertSame(a, reg.get("a"))
+        } finally {
+            web.shutdown()
+        }
+    }
 }

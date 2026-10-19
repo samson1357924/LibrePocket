@@ -20,8 +20,9 @@ import kotlinx.coroutines.CancellationException
  *   error 形狀須含整數 `code` 與字串 `message`（缺／型別錯 → PROTOCOL＋計熔斷），
  *   error 依 code 分類：協議/伺服器碼（-32700/-32600/-32601/-32603，及 JSON-RPC
  *   保留 server 範圍 −32099..−32000）→ PROTOCOL＋計熔斷，
- *   `-32602`/範圍外未知碼 → TOOL_ERROR 中性（message 透傳 [McpCallResult.errorMessage]，
- *   不進稽核）；非空 `nextCursor` → PARTIAL（不回 OK 假完整）；
+ *   `-32602`/範圍外未知碼 → TOOL_ERROR 中性（message 消毒後透傳
+ *   [McpCallResult.errorMessage]——C0/DEL → `\\uXXXX` 轉義、空/純空白 → 靜態
+ *   `jsonrpc error <code>`，見 [McpWire.parseCall]；不進稽核）；非空 `nextCursor` → PARTIAL（不回 OK 假完整）；
  *   HTTP 400/404/405 → PROTOCOL＋計熔斷（非暫態配置錯；429/408 等仍 TRANSPORT）；
  * - 熔斷：連續失敗即開路（[McpCircuitBreaker]），開路期間短路為 CIRCUIT_OPEN；
  *   工具業務錯（`isError=true` 且具 content/structuredContent、`-32602`/範圍外未知碼
@@ -185,10 +186,14 @@ class McpServer(
      * → ④body 組裝（[McpWire.callBody]）。即**形狀閘在 DISABLED／CIRCUIT_OPEN 之後、
      * callBody 之前**：停用伺服器連形狀都不驗（便宜判定先跑），回 DISABLED、
      * 不碰 vault 不發送；熔斷開路時同理回 CIRCUIT_OPEN。形狀閘違反走既有
-     * IAE catch → PROTOCOL：不發送、不碰 vault、不計熔斷。被拒的 toolName 仍會
-     * 進 [McpCallResult.auditMap] 的 `"tool"` 欄（稽核列偽造目前由入站
-     * [McpWire.parseListPage] 拒控制字元名擋；出站側同類防護屬下一階段，
-     * 不在本輪改動 [McpCallResult.auditMap] 行為）。
+     * IAE catch → PROTOCOL：不發送、不碰 vault、不計熔斷。
+     *
+     * 被拒 toolName 與稽核面（Stage3 A-01 收斂）：C0/DEL 控制字元名兩端同政策
+     * ——形狀閘（[McpScope.requireBareToolName]）與出站 [McpWire.callBody] 各拒一次
+     *（後者是 wire 層防禦深度，直呼 callBody 亦拒）；被拒名仍會進
+     * [McpCallResult.auditMap] 的 `"tool"` 欄與 `toString()`（呼叫端自備字串，
+     * 保留診斷），但只以 [McpWire.escapeControlUnits] 的可見 `\\uXXXX` 轉義形式
+     * 出現——裸 CR/LF 偽造稽核列的通道已關閉（合法名原樣，稽核語意不變）。
      */
     suspend fun callTool(
         toolName: String,
@@ -291,7 +296,10 @@ class McpServer(
                 // 僅 -32602/範圍外未知碼 error 包會到此（協議碼與保留 server 範圍
                 // −32099..−32000 於 parseCall 拋 McpProtocol → 下方 IAE catch
                 // → PROTOCOL + 計熔斷）；工具級錯誤中性，不碰熔斷計數。
-                // errorMessage 透傳伺服器 message（wire 層上限 200 UTF-16 code units；不進 auditMap）。
+                // errorMessage 為 wire 層已消毒的 message（C0/DEL → \uXXXX 轉義、
+                // 空/純空白 → 靜態 `jsonrpc error <code>`，見 McpWire.parseCall）；
+                // 下列鉗制是防禦性 no-op（消毒後已 ≤上限，單一真相在
+                // McpWire.ERROR_MESSAGE_MAX_UNITS；不進 auditMap）。
                 breaker.onNeutral()
                 McpCallResult(
                     config.id,
@@ -300,7 +308,9 @@ class McpServer(
                     clockMs() - start,
                     null,
                     true,
-                    errorMessage = e.message?.let { McpWire.truncateUnits(it, 200) },
+                    errorMessage = e.message?.let {
+                        McpWire.truncateUnits(it, McpWire.ERROR_MESSAGE_MAX_UNITS)
+                    },
                 )
             } catch (_: IllegalArgumentException) {
                 breaker.onFailure()
@@ -353,11 +363,18 @@ private const val BEARER_MAX_CHARS = 8_192
  *
  * `timeoutMs` 為逐服上限（非總量）：N 服最壞 N×timeout，呼叫方需另包總超時；
  * 順序執行，取消時丟棄已得結果（見 Stage2 review W5）。
+ *
+ * 防禦性複製（Stage3 C-10）：建構時 [servers.toMap] 快照（呼叫端之後增刪改原
+ * map 不影響本聚合——registry 的成員資格在建構時固定）；[ids] 回傳
+ * `keys.toSet()` 快照（呼叫端增刪回傳集合不影響內部）。對外型別不變
+ * （[Map]／[Set]），[get]／[listAll] 語意不變。
  */
 class McpRegistry(
-    private val servers: Map<String, McpServer>,
+    servers: Map<String, McpServer>,
 ) {
-    fun ids(): Set<String> = servers.keys
+    private val servers: Map<String, McpServer> = servers.toMap()
+
+    fun ids(): Set<String> = servers.keys.toSet()
 
     fun get(serverId: String): McpServer? = servers[serverId]
 

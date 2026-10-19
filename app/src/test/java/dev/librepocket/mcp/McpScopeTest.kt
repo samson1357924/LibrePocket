@@ -251,8 +251,8 @@ class McpScopeTest {
 
     @Test fun controlCharToolNameRejectedOnEveryScopeEntryPoint() {
         // C0（NUL/CR/LF/ESC）與 DEL——與入站 parseListPage 同政策（控制字元干擾
-        // 終端與以名為鍵的比較；稽核列偽造目前由入站 parseListPage 拒控制字元名擋，
-        // 被拒 toolName 仍進 auditMap()["tool"]，出站側同類防護屬下一階段）。
+        // 終端與以名為鍵的比較；稽核列偽造雙端已收斂：入站拒名、出站 callBody
+        // 對稱拒，被拒名在 auditMap/toString 只以 \uXXXX 轉義出現——Stage3 A-01）。
         for (bad in listOf("sea\nrch", "se\rch", "a\u001bb", "a\u0000b", "a\u007fb")) {
             assertRejected("project($bad)") { McpScope.project(open, bad) }
             assertRejected("check($bad)") { McpScope.check(open, bad, confirmed = true) }
@@ -508,5 +508,98 @@ class McpScopeTest {
         // auditMap 仍記名（稽核合法欄位），與 toString 分工不變。
         assertEquals("t1", (r.auditMap()["tools"] as List<*>)[0])
         assertEquals(1, r.auditMap()["toolCount"])
+    }
+
+    // ---- Stage3 C-05: McpTool.toString 覆寫（description/inputSchema 不進日誌） ----
+
+    @Test fun toolToStringRedactsDescriptionAndInputSchema() {
+        // C-05：result.tools 是公開的，直接 log McpTool 會輸出伺服器控制的
+        // description（可含經 \uXXXX 解碼的 ESC——parseString 解碼後未過濾、
+        // 只截斷到 500）與 ≤8192 字元 inputSchema。覆寫為 <N chars> 佔位
+        //（比照 McpCallResult/McpListResult 既有風格）；name（入站已拒 C0/DEL，
+        // 可合法含空白/非 ASCII）照常輸出。mutation（拿掉 McpTool.toString 覆寫）
+        // 此測即紅（data class 預設 toString 會帶出原文與 "inputSchema=" 明細）。
+        val schema = """{"type":"object","properties":{"x":{"type":"string"}}}"""
+        val tool = McpTool(
+            serverId = "s9",
+            name = "read_é 文",
+            description = "leaky\u001b[31m-description-token",
+            inputSchema = schema,
+        )
+        val s = tool.toString()
+        assertFalse("toString 不得外洩 description 原文", s.contains("leaky"))
+        assertFalse("toString 不得含裸 ESC（伺服器控制字元）", s.contains('\u001b'))
+        assertFalse("toString 不得外洩 inputSchema 明細", s.contains("properties"))
+        // 保留識別／狀態欄位（serverId 本地配置、name 為合法識別欄位）。
+        assertTrue("須保留 serverId", s.contains("s9"))
+        assertTrue("name（合法識別欄位）照常輸出", s.contains("read_é 文"))
+        assertTrue(s.contains("sideEffect="))
+        // 佔位符格式釘住：<N chars>（與 McpCallResult/McpListResult 同風格）。
+        assertTrue("description 佔位符須為 <N chars> 形",
+            s.contains("description=<${tool.description.length} chars>"))
+        assertTrue("inputSchema 佔位符須為 <N chars> 形",
+            s.contains("inputSchema=<${schema.length} chars>"))
+        // equals/copy 語意不動（data class 值相等仍看原文欄位）。
+        assertEquals(tool, tool.copy())
+        // 對照：McpListResult.auditMap 分工不變（仍記名與計數）。
+        val list = McpListResult("s9", listOf(tool), McpStatus.OK, 1L)
+        assertEquals("read_é 文", (list.auditMap()["tools"] as List<*>)[0])
+        assertEquals(1, list.auditMap()["toolCount"])
+    }
+
+    @Test fun callResultAuditAndToStringEscapeRejectedToolNameControlChars() {
+        // Stage3 A-01 稽核面 pin：被拒 toolName（呼叫端自備、含 CR/LF/ESC）進
+        // auditMap()["tool"] 與 toString() 時只以 \uXXXX 轉義形式出現——裸 CR/LF
+        // 偽造稽核列的通道關閉。合法名原樣（稽核語意不變）。
+        // mutation（拿掉 escapeControlUnits 呼叫）此測即紅。
+        val bad = McpCallResult("s1", "x\r\n[FAKE] status=OK", McpStatus.PROTOCOL, 1L)
+        val auditTool = bad.auditMap()["tool"] as String
+        assertEquals("x\\u000d\\u000a[FAKE] status=OK", auditTool)
+        assertTrue(auditTool.none { it.code < 0x20 || it.code == 0x7F })
+        assertTrue("toString 同為轉義形式",
+            bad.toString().contains("tool=x\\u000d\\u000a[FAKE] status=OK"))
+        // 正向：合法名（無 C0）原樣——既有稽核語意不變。
+        val ok = McpCallResult("s1", "search", McpStatus.OK, 1L)
+        assertEquals("search", ok.auditMap()["tool"])
+        assertTrue(ok.toString().contains("tool=search"))
+    }
+
+    @Test fun loneSurrogateToolNameIsEscapedOnAuditFace() {
+        // S3-D02 稽核面 pin：出站 callBody 對孤立 surrogate 是 fail-closed 拒——
+        // 進入 McpCallResult.tool 的孤立 surrogate 在 auditMap()["tool"]／
+        // toString() 不得原樣（日誌損壞編碼、政策不對稱），只以 \uXXXX 轉義
+        // 出現；成對 surrogate 原樣。mutation（拿掉 escapeControlUnits 的孤立
+        // surrogate 分支）此測即紅。
+        val lone = McpCallResult("s1", "a\ud800b", McpStatus.PROTOCOL, 1L)
+        val auditTool = lone.auditMap()["tool"] as String
+        assertEquals("孤立 surrogate 轉義進稽核", "a\\ud800b", auditTool)
+        assertFalse("auditMap tool 不得含孤立 surrogate", auditTool.any { it.isSurrogate() })
+        assertTrue("toString 同為轉義形式", lone.toString().contains("tool=a\\ud800b"))
+        assertFalse("toString 不得含孤立 surrogate", lone.toString().any { it.isSurrogate() })
+        // 對照：成對 surrogate（emoji）名原樣（非「凡 surrogate 皆轉義」）。
+        val pair = McpCallResult("s1", "😀", McpStatus.OK, 1L)
+        assertEquals("😀", pair.auditMap()["tool"])
+        // McpTool.toString 同政策（S3-D04）：name 的孤立 surrogate 亦轉義。
+        val tool = McpTool(serverId = "s1", name = "t\ud800", description = "d")
+        val ts = tool.toString()
+        assertFalse("McpTool.toString 不得含孤立 surrogate", ts.any { it.isSurrogate() })
+        assertTrue("McpTool.toString 的 name 同為轉義形式", ts.contains("name=t\\ud800"))
+    }
+
+    @Test fun toolToStringEscapesNameControlCharsButKeepsLegalNames() {
+        // S3-D04：McpTool.toString 的 name 也套 escapeControlUnits——與
+        // McpCallResult 稽核面政策對齊。name 含 C0（本地建構／被拒名場景）→
+        // 轉義、無裸 C0/DEL；合法名（read_é文、含空白）no-op 原樣輸出。
+        // mutation（拿掉 McpTool.toString name 的 escapeControlUnits）此測即紅。
+        val bad = McpTool(serverId = "s1", name = "read\r\n_x", description = "d")
+        val s = bad.toString()
+        assertTrue("McpTool.toString 不得含裸 C0/DEL",
+            s.none { it.code < 0x20 || it.code == 0x7F })
+        assertTrue("C0 以 \\uXXXX 轉義出現", s.contains("name=read\\u000d\\u000a_x"))
+        // 正向：合法名 no-op（非 ASCII、含空白皆原樣；既有 C-05 測不削弱）。
+        val legal = McpTool(serverId = "s1", name = "read_é文", description = "d")
+        assertTrue("合法名（read_é文）原樣輸出", legal.toString().contains("name=read_é文"))
+        val spaced = McpTool(serverId = "s1", name = "read_é 文", description = "d")
+        assertTrue("合法名（含空白）原樣輸出", spaced.toString().contains("name=read_é 文"))
     }
 }

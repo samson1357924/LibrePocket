@@ -111,15 +111,215 @@ class McpEnvelopeTest {
                 assertEquals("mcp: bad error", e.message)
             }
         }
-        // 空字串 message 仍是合法 String（規格只要求型別）：維持中性工具錯。
+        // 空字串 message 仍是合法 String（規格只要求型別）：維持中性工具錯，
+        // 但 Stage3 B-03 起**空/純空白 message 填靜態替代**（不原樣透傳 ""——
+        // 伺服器不得以空 message 讓錯誤不可辨識）。詳見 emptyOrBlankErrorMessageGetsStaticFallback。
         try {
             McpWire.parseCall(
                 "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":1,\"message\":\"\"}}",
             )
             fail("空字串 message 必須走 McpToolFailure")
         } catch (e: McpWire.McpToolFailure) {
-            assertEquals("", e.message)
+            assertEquals("jsonrpc error 1", e.message)
         }
+    }
+
+    @Test fun errorMessageControlCharsAreEscapedNotBare() {
+        // Stage3 A-02：伺服器 error.message 的 C0/DEL 不得裸露到 errorMessage
+        //（會流入上層錯誤呈現）——換成可見 \uXXXX 轉義（小寫 hex），正向：
+        // 無控制字元的訊息原文保留。mutation（拿掉 escapeControlUnits 呼叫）此測即紅。
+        // JSON \uXXXX 轉義把控制字元解碼進 JStr（raw control char 會先破壞 JSON parse）。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602," +
+            "\"message\":\"\\u001b[31mFAKE\\r\\nline\\u007f\"}}"
+        try {
+            McpWire.parseCall(json)
+            fail("-32602 必須拋 McpToolFailure")
+        } catch (e: McpWire.McpToolFailure) {
+            val msg = e.message!!
+            assertTrue("errorMessage 不得含裸 C0/DEL", msg.none { it.code < 0x20 || it.code == 0x7F })
+            assertEquals("轉義形式釘住（\\uXXXX 小寫 hex、逐字元）",
+                "\\u001b[31mFAKE\\u000d\\u000aline\\u007f", msg)
+            assertTrue("轉義後仍 ≤200 units", msg.length <= McpWire.ERROR_MESSAGE_MAX_UNITS)
+        }
+        // 正向：正常訊息原文保留（僅可能截斷，不做任何轉義）。
+        try {
+            McpWire.parseCall(
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"bad params\"}}",
+            )
+            fail("必須拋 McpToolFailure")
+        } catch (e: McpWire.McpToolFailure) {
+            assertEquals("無控制字元訊息必須原文保留", "bad params", e.message)
+        }
+    }
+
+    @Test fun errorMessageEscapeExpansionIsBoundedTo200Units() {
+        // A-02 預算 pin：轉義展開**計入** 200 units 上限（不得回顯超過上限），
+        // 截斷落在轉義邊界（100 個 ESC → 每個 6 units 預算放 33 個 = 198 units，
+        // 不留半截 "\u00"——200 單位硬切會得到 33 個完整轉義＋2 units 半截）。
+        val escs = "\\u001b".repeat(100)
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"$escs\"}}"
+        try {
+            McpWire.parseCall(json)
+            fail("必須拋 McpToolFailure")
+        } catch (e: McpWire.McpToolFailure) {
+            val msg = e.message!!
+            assertEquals("轉義邊界截斷（33×6=198 units，無半截轉義）", 198, msg.length)
+            assertTrue(msg.none { it.code < 0x20 || it.code == 0x7F })
+            assertEquals(McpWire.ERROR_MESSAGE_MAX_UNITS, 200)
+        }
+        // surrogate 預算：199 個 x＋emoji → pair 放不下即止（不切斷代理對、
+        // 不產生孤立 surrogate；與 truncateUnits 同邊界語意）。
+        val mixed = "x".repeat(199) + "😀"
+        val json2 = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"$mixed\"}}"
+        try {
+            McpWire.parseCall(json2)
+            fail("必須拋 McpToolFailure")
+        } catch (e: McpWire.McpToolFailure) {
+            val msg = e.message!!
+            assertEquals("截斷不得切斷 surrogate pair", 199, msg.length)
+            assertEquals("x", msg.last().toString())
+        }
+    }
+
+    @Test fun emptyOrBlankErrorMessageGetsStaticFallback() {
+        // Stage3 B-03：空／純空白 message → 靜態 `jsonrpc error <code>`（code 是本地
+        // 解析整數，插值非伺服器自由文字）。伺服器不得以空 message 讓錯誤不可辨識。
+        // mutation（拿掉 isBlank 靜態替代）此測即紅。
+        for (blank in listOf("", "   ", "\\t")) {
+            // 注意 "\\t" 是 JSON escape（解碼後為 raw TAB，isBlank 為 true）——
+            // raw TAB 直嵌 JSON 字串會先在 parser 層破壞（嚴格 JSON 拒裸控制字元）。
+            val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"$blank\"}}"
+            try {
+                McpWire.parseCall(json)
+                fail("空白 message 必須走 McpToolFailure")
+            } catch (e: McpWire.McpToolFailure) {
+                assertEquals("jsonrpc error -32602", e.message)
+            }
+        }
+        // 未知碼（非 -32602、非協議碼/保留範圍）同樣插該 code。
+        try {
+            McpWire.parseCall(
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":4242,\"message\":\"\"}}",
+            )
+            fail("必須拋 McpToolFailure")
+        } catch (e: McpWire.McpToolFailure) {
+            assertEquals("jsonrpc error 4242", e.message)
+        }
+        // 對照：非空白訊息不受 B-03 影響（原文保留）。
+        try {
+            McpWire.parseCall(
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"x\"}}",
+            )
+            fail("必須拋 McpToolFailure")
+        } catch (e: McpWire.McpToolFailure) {
+            assertEquals("x", e.message)
+        }
+    }
+
+    @Test fun blankAfterEscapeTruncationGetsStaticFallback() {
+        // S3-R01（post-escape blank 防繞過）：「<200 個空白>x」原文**非** blank，
+        // 但 200 units 預算截斷後只剩 200 個空白（x 在預算外、無轉義展開）——
+        // 若只判原始 message，errorMessage 會是純空白、B-03 fallback 不觸發。
+        // 修法：sanitize 後對 escape 結果再判 blank → 同一靜態替代。
+        // mutation（拿掉 post-escape ifBlank）此測即紅。
+        val spacesThenX = " ".repeat(200) + "x"
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602," +
+            "\"message\":\"$spacesThenX\"}}"
+        try {
+            McpWire.parseCall(json)
+            fail("必須拋 McpToolFailure")
+        } catch (e: McpWire.McpToolFailure) {
+            assertEquals("escape 後仍純空白 → 靜態 fallback（不是 200 個空白）",
+                "jsonrpc error -32602", e.message)
+        }
+        // 變體：非空白尾巴是 C0（ESC）——預算剩 1 放不下六字元轉義、止於
+        // 199 個空白，escape 結果仍純空白 → 同補靜態替代。
+        val spacesThenEsc = " ".repeat(199) + "\\u001b"
+        val json2 = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602," +
+            "\"message\":\"$spacesThenEsc\"}}"
+        try {
+            McpWire.parseCall(json2)
+            fail("必須拋 McpToolFailure")
+        } catch (e: McpWire.McpToolFailure) {
+            assertEquals("jsonrpc error -32602", e.message)
+        }
+        // 對照：正常非空白長訊息（>200 units）仍走 sanitize＋截斷，**不**誤補
+        // fallback（post-escape blank 判不得改變正常路徑語意）。
+        val long = "err:".repeat(100) // 400 units，全可列印
+        val json3 = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602," +
+            "\"message\":\"$long\"}}"
+        try {
+            McpWire.parseCall(json3)
+            fail("必須拋 McpToolFailure")
+        } catch (e: McpWire.McpToolFailure) {
+            assertEquals("非空白長訊息 → sanitize＋截斷 200 units，非 fallback",
+                "err:".repeat(50), e.message)
+        }
+    }
+
+    @Test fun bidiC1AndLineSeparatorsPassThroughUnescaped() {
+        // S3-D01 政策邊界 pin：escapeControlUnits 轉義範圍刻意只有 C0/DEL（＋孤立
+        // surrogate）——bidi 方向控制字元 U+202E、C1（U+0085 NEL）、U+2028
+        // line separator 一律**原樣透傳**。擴大 escapeControlUnits 範圍（把 bidi
+        // 也轉義）此測即紅。
+        val original = "warn \u202eevil \u0085\u2028 x"
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602," +
+            "\"message\":\"warn \\u202eevil \\u0085\\u2028 x\"}}"
+        try {
+            McpWire.parseCall(json)
+            fail("必須拋 McpToolFailure")
+        } catch (e: McpWire.McpToolFailure) {
+            assertEquals("bidi/C1/U+2028 逐字等於原文（刻意不轉義）", original, e.message)
+        }
+    }
+
+    @Test fun formatOnlyMessagePassesThroughWithoutStaticFallback() {
+        // re-review NEW-01 已接受邊界 pin：FORMAT/C1/bidi 字元（U+200B 零寬空格、
+        // U+2060 word joiner、U+FEFF）既非 Kotlin isBlank() 空白、也不屬 C0/DEL——
+        // 刻意「原樣透傳、不觸發靜態 fallback」。此為文件化取捨（狀態仍 TOOL_ERROR
+        // 可辨識、不進稽核）；若日後改為「無可見字元即 fallback」，此測應翻轉。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602," +
+            "\"message\":\"\\u200b\\u2060\\ufeff\"}}"
+        try {
+            McpWire.parseCall(json)
+            fail("必須拋 McpToolFailure")
+        } catch (e: McpWire.McpToolFailure) {
+            assertEquals("FORMAT 字元原樣透傳（不 fallback、不轉義）", "\u200b\u2060\ufeff", e.message)
+        }
+    }
+
+    @Test fun escapeTruncationStopsAtEscapeBoundaryWithoutHalfEscapeOrTail() {
+        // S3-D03 截斷邊界 pin：195 個純字元＋ESC＋tail → 預算剩 5、放不下六字元
+        // 轉義 → **止於 195**（不留半截 \u00、不補進 tail）。此屬「預算外捨棄」，
+        // 與「預算內不靜默丟字」（以轉義取代 U+FFFD）相鄰但不同——KDoc 已限定。
+        val input = "a".repeat(195) + "\u001b" + "tail"
+        assertEquals("預算剩 5 < 6：止於 195，無半截轉義、無 tail",
+            "a".repeat(195), McpWire.escapeControlUnits(input, 200))
+        // 對照：194 個純字元＋ESC → 預算剩 6 恰放下完整六字元轉義。
+        assertEquals("預算剩 6 = 6：完整轉義收錄",
+            "a".repeat(194) + "\\u001b",
+            McpWire.escapeControlUnits("a".repeat(194) + "\u001b" + "tail", 200))
+    }
+
+    @Test fun loneSurrogateIsEscapedNotPassthrough() {
+        // S3-D02 政策 pin：孤立 surrogate（未成對 high/low）→ 字面 \uXXXX（計入
+        // 預算）；成對 surrogate 原樣保留。出站 callBody 對孤立 surrogate 是
+        // fail-closed 拒——稽核面/顯示面不得原樣放行造成政策不對稱（log 損壞編碼）。
+        // mutation（拿掉孤立 surrogate 轉義分支）此測即紅。
+        assertEquals("孤立 high → 轉義", "\\ud800", McpWire.escapeControlUnits("\ud800"))
+        assertEquals("孤立 low → 轉義", "\\udc00", McpWire.escapeControlUnits("\udc00"))
+        assertEquals("夾在可列印字元間的孤立 high",
+            "x\\ud800y", McpWire.escapeControlUnits("x\ud800y"))
+        assertEquals("相鄰反序（low 後接 high）：兩者皆孤立、皆轉義",
+            "\\udc00\\ud800", McpWire.escapeControlUnits("\udc00\ud800"))
+        assertEquals("high high low：前 high 孤立轉義、後 high+low 成對原樣",
+            "\\ud800" + "\ud800\udc00", McpWire.escapeControlUnits("\ud800\ud800\udc00"))
+        assertEquals("成對 surrogate（emoji）原樣（非「凡 surrogate 皆轉義」）",
+            "😀ok", McpWire.escapeControlUnits("😀ok"))
+        // 預算 pin：孤立 surrogate 的轉義展開計入預算（195 純字元＋孤立 high →
+        // 預算剩 5 放不下六字元 → 止於 195，不產生半截）。
+        assertEquals("孤立 surrogate 轉義計入預算",
+            "a".repeat(195), McpWire.escapeControlUnits("a".repeat(195) + "\ud800", 200))
     }
 
     @Test fun errorWithoutIntegerCodeIsProtocol() {
@@ -451,6 +651,102 @@ class McpEnvelopeTest {
         // 成對 surrogate（emoji）名仍放行且原樣出現在請求體。
         val okName = "t😀"
         assertTrue(McpWire.callBody(okName, "{}").contains("\"name\":\"t😀\""))
+    }
+
+    @Test fun callBodyRejectsC0AndDelToolNames() {
+        // Stage3 A-01：出站 toolName 對 C0/DEL 拒絕與入站 parseListPage 對稱
+        //（inboundToolNameControlCharsRejectedFailClosed 的出站半邊）——識別欄位
+        // 一律拒而非轉義。靜態訊息 pin（不插值名）。mutation（拿掉 callBody 的
+        // C0/DEL 檢查）此測即紅。
+        for (bad in listOf(
+            "x\r\n[FAKE] status=OK",
+            "sea\nrch",
+            "se\rch",
+            "a\u001bb",
+            "a\u0000b",
+            "a\u0001b",
+            "a\u000cb",
+            "a\tb",
+            "a\u007fb",
+        )) {
+            try {
+                McpWire.callBody(bad, "{}")
+                fail("出站 toolName 含 C0/DEL 必須拒：${bad.map { it.code }}")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("mcp: tool name has control chars", e.message)
+            }
+        }
+        // 邊界正向：可列印國際化名／內嵌空格／成對 surrogate 不誤拒（預檢只拒
+        // C0/DEL，不是 printable-ASCII 一刀切）。
+        for (ok in listOf("search", "my tool", "read_é文", "t😀")) {
+            assertTrue(McpWire.callBody(ok, "{}").contains("\"name\":\"$ok\""))
+        }
+    }
+
+    @Test fun inboundDuplicateToolNameRejectedWholePage() {
+        // Stage3 B-04：同頁重複工具名整頁拒（靜態訊息）——enabledTools／McpScope
+        // 以名為鍵（精確比對、缺鍵預設啟用），重複名使「停用／授權哪一支」失去
+        // 唯一對象、auditMap toolCount 失真。與超限名／保留前綴／空白名同政策：
+        // 不靜默略過單支、不採納首支。跨頁不適用（本子集不跟隨 nextCursor 分頁，
+        // 每頁獨立驗證——見 McpWire 修訂立場與 nextCursorDoesNotAutoFollowSinglePage）。
+        // mutation（拿掉 parseListPage 的 seenNames 檢查）此測即紅。
+        val page = { tools: String ->
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":$tools}}"
+        }
+        // ① 同名同 schema 兩支 → McpProtocol、靜態訊息。
+        try {
+            McpWire.parseList(
+                "s1",
+                page(
+                    """[{"name":"a","inputSchema":{"type":"object"}},""" +
+                        """{"name":"a","inputSchema":{"type":"object"}}]""",
+                ),
+                expectedId = 1L,
+            )
+            fail("同頁重複工具名必須整頁拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: duplicate tool name", e.message)
+        }
+        // ② 同名不同 schema 兩支 → 同樣拒（重複判定只看名，不看 schema）。
+        try {
+            McpWire.parseList(
+                "s1",
+                page(
+                    """[{"name":"a","inputSchema":{"type":"object","properties":{"x":{"type":"string"}}}},""" +
+                        """{"name":"a","inputSchema":{"type":"object"}}]""",
+                ),
+                expectedId = 1L,
+            )
+            fail("同名不同 schema 必須同樣拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: duplicate tool name", e.message)
+        }
+        // ③ 三支中第二、三支重複（`a b a`）：中間的合法 b 不救整頁——整頁拒。
+        try {
+            McpWire.parseList(
+                "s1",
+                page(
+                    """[{"name":"a","inputSchema":{"type":"object"}},""" +
+                        """{"name":"b","inputSchema":{"type":"object"}},""" +
+                        """{"name":"a","inputSchema":{"type":"object"}}]""",
+                ),
+                expectedId = 1L,
+            )
+            fail("重複名夾在合法名之後仍須整頁拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: duplicate tool name", e.message)
+        }
+        // ④ 正向：不同名頁（含大小寫變體——精確比對、不做正規化）正常收 2 支。
+        val ok = McpWire.parseList(
+            "s1",
+            page(
+                """[{"name":"a","inputSchema":{"type":"object"}},""" +
+                    """{"name":"A","inputSchema":{"type":"object"}}]""",
+            ),
+            expectedId = 1L,
+        )
+        assertEquals(2, ok.size)
+        assertEquals(listOf("a", "A"), ok.map { it.name })
     }
 
     @Test fun loneSurrogateInCallResponseIsRejected() {

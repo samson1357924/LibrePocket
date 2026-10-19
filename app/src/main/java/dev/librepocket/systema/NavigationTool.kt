@@ -15,12 +15,20 @@ import java.net.URLEncoder
  * - query 形狀為刻意近似：`geo:lat,lng?q=label` 非官式合成
  *   `geo:0,0?q=lat,lng(label)`（括號需轉義）；多數地圖 App 以「座標＋搜尋詞」
  *   語意照收，保守起見保留現行形狀並以測試鎖定。
+ * - query/label 長度上限（[MAX_QUERY_LEN]=500，間隔註記見 IntentSpec KDoc 長度
+ *   政策）為本層自訂 Binder 傳輸防禦（官方契約無此上限）：兩個 builder 端
+ *   fail-closed 拒絕，越界經 [execute] 收斂 INTERNAL；上限以**編碼前欄位長度**
+ *   計（`URLEncoder` 後 URI 可更長，與 [AlarmTool] 欄位級上限同政策）。
  * - 空白目的地（query/label/座標皆缺）回 NEED_CLARIFICATION（[execute]）
  *   而非構建無意義的空搜尋 intent；與 [MusicTool] 的空白 query 澄清同契約，
  *   即使靜態 `check` 已判 NATIVE/DEGRADED 亦然（目的缺席是使用者意圖問題，
  *   與環境能力無關）。
  */
 object NavigationTool : SystemTool<NavigationTool.Params> {
+
+  /** Binder 傳輸上限防禦：query/label 過長在 builder 即拒（本層自訂政策，
+   *  非官方契約；與 [AlarmTool.MAX_MESSAGE_LEN] 同值同源，IntentSpec KDoc 同步註記）。 */
+  const val MAX_QUERY_LEN = 500
 
   data class Params(
     val query: String = "",
@@ -52,6 +60,8 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
     val lng = params.longitude
     requirePairedCoords(lat, lng)
     if (lat != null && lng != null) requireLatLng(lat, lng)
+    require(params.query.length <= MAX_QUERY_LEN) { "query too long: ${params.query.length} > $MAX_QUERY_LEN" }
+    require(params.label.length <= MAX_QUERY_LEN) { "label too long: ${params.label.length} > $MAX_QUERY_LEN" }
     val data = if (lat != null && lng != null) {
       val base = "geo:$lat,$lng"
       if (params.label.isNotBlank()) "$base?q=${encode(params.label)}" else base
@@ -67,6 +77,8 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
     val lng = params.longitude
     // 與 geo 一致：web 分支同樣收斂座標守衛（有限值 + 範圍），禁越界座標經 OSM URL 外洩。
     if (lat != null && lng != null) requireLatLng(lat, lng)
+    require(params.query.length <= MAX_QUERY_LEN) { "query too long: ${params.query.length} > $MAX_QUERY_LEN" }
+    require(params.label.length <= MAX_QUERY_LEN) { "label too long: ${params.label.length} > $MAX_QUERY_LEN" }
     val q = when {
       params.query.isNotBlank() -> params.query
       params.label.isNotBlank() -> params.label
@@ -117,7 +129,10 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
   }
 
   override fun fallback(params: Params, env: SystemEnv): FallbackSpec {
-    val web = buildWebIntent(params)
+    // 防拋收斂（[guardedFallbackAlternative]）：fallback 是「報告失敗」的路徑，
+    // 自身不得反拋打穿呼叫方——[buildWebIntent] 的座標/長度守衛在非法參數下
+    // 拋 IAE，此處降為 null：話術形狀不變，僅無預建 intent 載體。
+    val web = guardedFallbackAlternative { buildWebIntent(params) }
     return FallbackSpec(
       reasonCode = ReasonCodes.NO_HANDLER,
       alternative = web,

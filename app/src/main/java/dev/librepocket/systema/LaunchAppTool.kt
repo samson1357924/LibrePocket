@@ -22,6 +22,10 @@ object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
 
   data class Params(val query: String)
 
+  /** Unknown 分支話術的 query 回顯上限（話術防回顯，非參數校驗：[resolve]
+   *  對 query 本身無上限；spec 與比對邏輯不受此限）。 */
+  const val MAX_QUERY_ECHO_LEN = 32
+
   /**
    * queries 白名單：別名 → 包名。只收錄常見公開 App，收斂規劃空間。
    * key 全小寫，匹配時大小寫無關。
@@ -119,7 +123,8 @@ object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
       )
       LaunchResolution.Unknown -> ToolResult(
         false, false, null, ReasonCodes.NO_HANDLER,
-        "做不到開啟「${params.query}」（${ReasonCodes.NO_HANDLER}）→ 可替代手動開啟 → 需要你告訴我是哪個 App",
+        // 同 [MAX_QUERY_ECHO_LEN]（[CalendarTool.MAX_EVENT_ID_ECHO_LEN] 的防回顯契約）：話術只回顧前 32 字。
+        "做不到開啟「${params.query.take(MAX_QUERY_ECHO_LEN)}」（${ReasonCodes.NO_HANDLER}）→ 可替代手動開啟 → 需要你告訴我是哪個 App",
       )
     }
   }
@@ -133,7 +138,8 @@ object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
       )
       else -> FallbackSpec(
         reasonCode = ReasonCodes.NO_HANDLER,
-        userMessage = "做不到開啟「${params.query}」（${ReasonCodes.NO_HANDLER}）" +
+        // 同 [MAX_QUERY_ECHO_LEN]（[CalendarTool.MAX_EVENT_ID_ECHO_LEN] 的防回顯契約）：話術只回顧前 32 字。
+        userMessage = "做不到開啟「${params.query.take(MAX_QUERY_ECHO_LEN)}」（${ReasonCodes.NO_HANDLER}）" +
           "→ 可替代手動從桌面開啟 → 需要你確認 App 名稱",
       )
     }

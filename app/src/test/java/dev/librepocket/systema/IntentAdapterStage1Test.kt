@@ -77,29 +77,54 @@ class IntentAdapterStage1Test {
     "app/src/$flavor/AndroidManifest.xml",
   ).readText()
 
+  /**
+   * 寬容 manifest 正向 pin：單屬性元素以語義 regex 鎖定屬性值（逐字鎖值，
+   * 經 [Regex.escape]），僅容忍引號型別、`=` 前後空白、自閉斜線位置與元素尾端
+   * 的**額外屬性**（如 play overlay 的 `tools:node="remove"`）等排版差異
+   * （AGP/lint 對 manifest 排版的正規化不應使語義不變的 pin 假紅）；
+   * 負向 pin 仍用 `contains`（嚴格保守）。
+   *
+   * 已知界限（誠實記載）：pinned 屬性須為元素的**第一位屬性**（現行全部
+   * pin 目標皆如此、AGP 不重排既有屬性順序）；額外屬性群組經負查排除第二個
+   * 同名 pinned 屬性（重複屬性本為無效 manifest，aapt2 建置即擋）；
+   * 檢查為**原文級**（不解析 XML 語義樹，註解內的同形元素也會命中——現行
+   * 目標檔經實測無註解誤觸，改動 manifest 時留意）。
+   */
+  private fun assertManifestHasSingleAttr(manifest: String, tag: String, attrName: String, attrValue: String) {
+    val value = Regex.escape(attrValue)
+    val re = Regex(
+      """<$tag\s+android:$attrName\s*=\s*(?:"$value"|'$value')""" +
+        """(?:\s+(?!android:$attrName\s*=)[\w:.\-]+\s*=\s*(?:"[^"]*"|'[^']*'))*\s*/?>""",
+    )
+    assertTrue(
+      "manifest 應宣告 <$tag android:$attrName=\"$attrValue\">",
+      re.containsMatchIn(manifest),
+    )
+  }
+
   // ---- a/b. manifest 宣告 ----
 
   @Test fun manifest_main_declaresAlarmCalendarQueries() {
     val manifest = mainManifest()
-    assertTrue(manifest.contains("<action android:name=\"android.intent.action.SET_ALARM\" />"))
-    assertTrue(manifest.contains("<action android:name=\"android.intent.action.INSERT\" />"))
-    assertTrue(manifest.contains("<data android:mimeType=\"vnd.android.cursor.dir/event\" />"))
-    assertTrue(manifest.contains("<action android:name=\"android.intent.action.EDIT\" />"))
-    assertTrue(manifest.contains("<data android:mimeType=\"vnd.android.cursor.item/event\" />"))
+    // 寬容 regex pin（見 helper KDoc）：語義鎖值，不再逐字比對整個元素排版。
+    assertManifestHasSingleAttr(manifest, "action", "name", "android.intent.action.SET_ALARM")
+    assertManifestHasSingleAttr(manifest, "action", "name", "android.intent.action.INSERT")
+    assertManifestHasSingleAttr(manifest, "data", "mimeType", "vnd.android.cursor.dir/event")
+    assertManifestHasSingleAttr(manifest, "action", "name", "android.intent.action.EDIT")
+    assertManifestHasSingleAttr(manifest, "data", "mimeType", "vnd.android.cursor.item/event")
     // 導航/音樂 VIEW（scheme-only）：targetSdk 36 下未宣告時 resolve 恆 null＝
     // 必然假 NO_HANDLER；geo 給 NavigationTool、https 給 MusicTool 網頁搜尋與
     // NavigationTool 網頁地圖（見 manifest #14 註解與各工具 KDoc）。
-    assertTrue(manifest.contains("<data android:scheme=\"geo\" />"))
-    assertTrue(manifest.contains("<data android:scheme=\"https\" />"))
+    assertManifestHasSingleAttr(manifest, "data", "scheme", "geo")
+    assertManifestHasSingleAttr(manifest, "data", "scheme", "https")
   }
 
   @Test fun manifest_declaresSetAlarmSenderPermission() {
     // 決策 a)：官方契約要求發送端持有 normal 級 com.android.alarm.permission.SET_ALARM，
     // 故 common manifest 必須宣告（缺權會在真機被 SecurityException 拒絕）。
+    // 正向 pin 亦改寬容 regex（見 helper KDoc）；負向與 overlay 檢查嚴格保守。
     val manifest = mainManifest()
-    assertTrue(
-      manifest.contains("<uses-permission android:name=\"com.android.alarm.permission.SET_ALARM\" />"),
-    )
+    assertManifestHasSingleAttr(manifest, "uses-permission", "name", "com.android.alarm.permission.SET_ALARM")
     // 不可寫成 framework 命名空間（android.permission.SET_ALARM 不存在）。
     assertFalse(manifest.contains("android.permission.SET_ALARM"))
     // 三 flavor 疊加層不得各自偷加（權限只在 common 宣告一次）。
@@ -118,8 +143,11 @@ class IntentAdapterStage1Test {
       assertFalse("$flavor overlay 不得出現 SET_ALARM", overlay.contains("SET_ALARM"))
       assertFalse("$flavor overlay 不得出現 calendar mimeType", overlay.contains("vnd.android.cursor"))
     }
-    // 防疊加層被整塊改寫：Play 高風險移除錨仍在。
-    assertTrue(flavorManifest("play").contains("<uses-permission android:name=\"android.permission.SEND_SMS\""))
+    // 防疊加層被整塊改寫：Play 高風險 uses-permission 宣告仍在（寬容 regex pin，
+    // 見 helper KDoc；該元素帶 tools:node="remove" 額外屬性，helper 的額外屬性
+    // 寬容得以**容納**它——此為排版容忍、非鎖定該屬性，tools:node 被移除不會
+    // 假紅；「移除後不進 play 產物」的語義由 policy gate 於 artifact 層把關）。
+    assertManifestHasSingleAttr(flavorManifest("play"), "uses-permission", "name", "android.permission.SEND_SMS")
   }
 
   // ---- c. 生產讀側：alarm parse ----
@@ -830,6 +858,17 @@ class IntentAdapterStage1Test {
     assertFalse(d.ok)
     assertEquals(ReasonCodes.USER_DISABLED, d.reasonCode)
     assertNull(d.spec)
+    // USER_DISABLED 先於參數校驗（P2 修補契約）：禁用時非法參數亦回 USER_DISABLED
+    // 而非 INTERNAL（能力問題先於參數問題）。
+    val aBad = AlarmTool.execute(AlarmTool.Params(25, 0), disabled, launcher)
+    assertEquals(ReasonCodes.USER_DISABLED, aBad.reasonCode)
+    assertNull(aBad.spec)
+    val cBad = CalendarTool.execute(CalendarTool.EventParams("", 1000, 2000), disabled, launcher)
+    assertEquals(ReasonCodes.USER_DISABLED, cBad.reasonCode)
+    assertNull(cBad.spec)
+    val nBad = NavigationTool.execute(NavigationTool.Params(latitude = 91.0, longitude = 0.0), disabled, launcher)
+    assertEquals(ReasonCodes.USER_DISABLED, nBad.reasonCode)
+    assertNull(nBad.spec)
     assertFalse("USER_DISABLED 不得調用 launcher", called)
   }
 
@@ -977,5 +1016,255 @@ class IntentAdapterStage1Test {
       "Internal 應來自進入 resolve 前的 DELETE allowlist guard",
       (r as LaunchResult.Internal).cause?.message?.contains("DELETE spec must not be launched") == true,
     )
+  }
+
+  // ---- j. fail-closed hoist：驗證先於能力分支（P2 修復釘選） ----
+
+  @Test fun alarm_execute_degraded_stillValidates_failClosed() {
+    // 靜態 DEGRADED（無系統鬧鐘 App）亦先過 builder fail-closed 校驗：
+    // hour=25/minute=60/超長 message → INTERNAL，不取 fallback 話術（不回顯
+    // 超長原文），launcher 不被呼叫。
+    var called = false
+    val launcher = IntentLauncher { called = true; LaunchResult.Success }
+    val noApp = env.copy(hasAlarmApp = false)
+    val longMsg = "x".repeat(AlarmTool.MAX_MESSAGE_LEN + 1)
+    for (p in listOf(
+      AlarmTool.Params(25, 0),
+      AlarmTool.Params(7, 60),
+      AlarmTool.Params(7, 30, longMsg),
+    )) {
+      called = false
+      val r = AlarmTool.execute(p, noApp, launcher)
+      assertFalse(r.ok)
+      assertFalse(r.usedFallback)
+      assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+      assertNull(r.spec)
+      assertTrue(r.message.contains(ReasonCodes.INTERNAL))
+      assertFalse("超長 message 不得回顯", r.message.contains(longMsg))
+      assertFalse("DEGRADED 校驗失敗不得調用 launcher", called)
+    }
+  }
+
+  @Test fun alarm_execute_degraded_validKeepsFallbackCopyWithFullLabel() {
+    // 合法 500 字 message 在 DEGRADED 路徑完整入話術（刻意不做 take 截斷），
+    // fallback 形狀（spec=null、usedFallback=true、NO_HANDLER）不因 hoist 漂移。
+    val msg = "m".repeat(AlarmTool.MAX_MESSAGE_LEN)
+    val r = AlarmTool.execute(
+      AlarmTool.Params(7, 30, msg), env.copy(hasAlarmApp = false),
+      IntentLauncher { LaunchResult.Success },
+    )
+    assertFalse(r.ok)
+    assertTrue(r.usedFallback)
+    assertEquals(ReasonCodes.NO_HANDLER, r.reasonCode)
+    assertNull(r.spec)
+    assertTrue(r.message, "「$msg」" in r.message)
+  }
+
+  @Test fun calendar_execute_noApp_invalidParams_convergesToInternal() {
+    // 同形修補釘選：靜態 no-app（UNAVAILABLE）亦先過 builder 校驗——非法
+    // title/location → INTERNAL（不是 NO_HANDLER 早期回傳），launcher 不被呼叫。
+    var called = false
+    val launcher = IntentLauncher { called = true; LaunchResult.Success }
+    val noApp = env.copy(hasCalendarApp = false)
+    val longTitle = "t".repeat(CalendarTool.MAX_TITLE_LEN + 1)
+    val longLoc = "l".repeat(CalendarTool.MAX_LOCATION_LEN + 1)
+    for (p in listOf(
+      CalendarTool.EventParams("", 1000, 2000),
+      CalendarTool.EventParams(longTitle, 1000, 2000),
+      CalendarTool.EventParams("例會", 1000, 2000, location = longLoc),
+    )) {
+      called = false
+      val r = CalendarTool.execute(p, noApp, launcher)
+      assertFalse(r.ok)
+      assertFalse(r.usedFallback)
+      assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+      assertNull(r.spec)
+      assertTrue(r.message.contains(ReasonCodes.INTERNAL))
+      assertFalse("超長 title 不得回顯", r.message.contains(longTitle))
+      assertFalse("校驗失敗不得調用 launcher", called)
+    }
+  }
+
+  @Test fun calendar_eventIdEcho_cappedInFallbackCopy() {
+    // eventId 缺席守衛是數字形狀（無長度上限）：話術回顯經 MAX_EVENT_ID_ECHO_LEN
+    // 截斷（spec/URI 守衛仍用完整值——DELETE 待寫 URI 以完整 id 鎖定）。
+    val big = "9".repeat(1024)
+    val cap = CalendarTool.MAX_EVENT_ID_ECHO_LEN
+    val u = CalendarTool.executeUpdate(
+      CalendarTool.UpdateParams(eventId = big, title = "例會"), env,
+      IntentLauncher { LaunchResult.NoHandler },
+    )
+    assertTrue(u.message, "「${big.take(cap)}」" in u.message)
+    assertFalse(u.message, big.take(cap + 1) in u.message)
+    val noApp = env.copy(hasCalendarApp = false)
+    val d = CalendarTool.executeDelete(
+      CalendarTool.DeleteParams(big), noApp, IntentLauncher { LaunchResult.Success },
+    )
+    assertTrue(d.message, "「${big.take(cap)}」" in d.message)
+    assertFalse(d.message, big.take(cap + 1) in d.message)
+    assertEquals(IntentActions.DELETE, d.spec?.action)
+    assertEquals("${CalendarTool.EVENTS_CONTENT_URI}/$big", d.spec?.dataUri)
+  }
+
+  @Test fun navigation_queryLabelLength_bounds() {
+    // 500 合法（builder 成功入 URI）；501 → builder IAE（geo/web 兩側同守衛）；
+    // 經 execute 一律 INTERNAL 且不觸 launcher。
+    val ok = NavigationTool.buildGeoIntent(
+      NavigationTool.Params(query = "q".repeat(NavigationTool.MAX_QUERY_LEN)),
+    )
+    assertTrue(ok.dataUri!!.startsWith("geo:0,0?q="))
+    val okLabel = NavigationTool.buildGeoIntent(
+      NavigationTool.Params(latitude = 1.0, longitude = 2.0, label = "l".repeat(NavigationTool.MAX_QUERY_LEN)),
+    )
+    assertTrue(okLabel.dataUri!!.startsWith("geo:1.0,2.0?q="))
+    val okWeb = NavigationTool.buildWebIntent(
+      NavigationTool.Params(query = "q".repeat(NavigationTool.MAX_QUERY_LEN)),
+    )
+    assertTrue(okWeb.dataUri!!.startsWith("https://www.openstreetmap.org/search?query="))
+    val overQuery = "q".repeat(NavigationTool.MAX_QUERY_LEN + 1)
+    val overLabel = "l".repeat(NavigationTool.MAX_QUERY_LEN + 1)
+    for ((shape, p) in listOf(
+      "query" to NavigationTool.Params(query = overQuery),
+      "label" to NavigationTool.Params(latitude = 1.0, longitude = 2.0, label = overLabel),
+    )) {
+      for ((side, build) in listOf(
+        "geo" to { NavigationTool.buildGeoIntent(p) },
+        "web" to { NavigationTool.buildWebIntent(p) },
+      )) {
+        try {
+          build()
+          fail("expected IllegalArgumentException for over-long $shape ($side)")
+        } catch (e: IllegalArgumentException) {
+          assertTrue(e.message ?: "", "too long" in (e.message ?: ""))
+        }
+      }
+    }
+    var called = false
+    val r = NavigationTool.execute(
+      NavigationTool.Params(query = overQuery), env,
+      IntentLauncher { called = true; LaunchResult.Success },
+    )
+    assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+    assertNull(r.spec)
+    assertFalse("超長 query 不得調用 launcher", called)
+    assertFalse("超長 query 不得回顯", r.message.contains("qqqq"))
+  }
+
+  @Test fun music_queryLength_bounds() {
+    // 500 合法；501 builder IAE；經 execute 一律 INTERNAL 且不觸 launcher。
+    val ok = MusicTool.buildPlayIntent(MusicTool.Params("q".repeat(MusicTool.MAX_QUERY_LEN)))
+    assertTrue(ok.dataUri!!.startsWith("https://music.youtube.com/search?q="))
+    try {
+      MusicTool.buildPlayIntent(MusicTool.Params("q".repeat(MusicTool.MAX_QUERY_LEN + 1)))
+      fail("expected IllegalArgumentException for over-long query")
+    } catch (e: IllegalArgumentException) {
+      assertTrue(e.message ?: "", "too long" in (e.message ?: ""))
+    }
+    var called = false
+    val r = MusicTool.execute(
+      MusicTool.Params(query = "q".repeat(MusicTool.MAX_QUERY_LEN + 1)), env,
+      IntentLauncher { called = true; LaunchResult.Success },
+    )
+    assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+    assertNull(r.spec)
+    assertFalse("超長 query 不得調用 launcher", called)
+    assertFalse("超長 query 不得回顯", r.message.contains("qqqq"))
+  }
+
+  // ---- k. P3 增補釘選：fallback 防拋收斂、launcher Internal 分型、防回顯截斷 ----
+
+  @Test fun navigation_fallback_invalidParams_alternativeNull_noThrow() {
+    // fallback 是「報告失敗」的路徑，不得反拋打穿呼叫方（此前 buildWebIntent
+    // 守衛會穿透）：非法座標 → alternative=null，話術形狀不變，不拋 IAE。
+    val f = NavigationTool.fallback(
+      NavigationTool.Params(latitude = 91.0, longitude = 0.0), env,
+    )
+    assertNull(f.alternative)
+    assertEquals(ReasonCodes.NO_HANDLER, f.reasonCode)
+    // 話術首段釘選（與 music_controlNoHandler 的完整模板 pin 同形）。
+    assertTrue(f.userMessage, f.userMessage.startsWith("做不到開啟地圖 App（${ReasonCodes.NO_HANDLER}）"))
+    assertTrue(f.userMessage, "網頁地圖" in f.userMessage)
+  }
+
+  @Test fun music_fallback_overLongQuery_alternativeNull_noThrow() {
+    // 同上：play 分支 alternative 構建失敗（query 超長）降為 null，不反拋。
+    val f = MusicTool.fallback(
+      MusicTool.Params(query = "q".repeat(MusicTool.MAX_QUERY_LEN + 1)), env,
+    )
+    assertNull(f.alternative)
+    assertEquals(ReasonCodes.NO_HANDLER, f.reasonCode)
+    // 話術首段釘選（與 nav fallback 同形；有別於 generic toToolResult 無計畫話術）。
+    assertTrue(f.userMessage, f.userMessage.startsWith("做不到開啟播放器（${ReasonCodes.NO_HANDLER}）"))
+    assertTrue(f.userMessage, "網頁播放器" in f.userMessage)
+  }
+
+  @Test fun guardedFallbackAlternative_convergesOrNull_cancellationReraises() {
+    // IAE/ISE（非取消）→ null；CancellationException 照拋（取消語義不得吞）。
+    assertNull(
+      guardedFallbackAlternative<IntentSpec> {
+        throw IllegalArgumentException("builder secret-input")
+      },
+    )
+    assertNull(
+      guardedFallbackAlternative<IntentSpec> { throw IllegalStateException("state boom") },
+    )
+    // 非 IAE/ISE 的 RuntimeException 不得被吞（白名單性質 pin）：穿透即契約。
+    try {
+      guardedFallbackAlternative<IntentSpec> { throw NoSuchElementException("missing-key") }
+      fail("非守衛白名單的 RuntimeException 不得吞成 null")
+    } catch (_: NoSuchElementException) {
+      // 照拋即契約（白名單僅 IAE/ISE；取消另見下案）。
+    }
+    try {
+      guardedFallbackAlternative<IntentSpec> {
+        throw kotlin.coroutines.cancellation.CancellationException("cancel")
+      }
+      fail("取消語義不得吞成 null")
+    } catch (_: kotlin.coroutines.cancellation.CancellationException) {
+      // 照拋即契約。
+    }
+  }
+
+  @Test fun execute_launcherInternal_typingKeepsSpecAndCauseName() {
+    // launcher 失敗分型補測：各工具 execute 的 Internal 分支統一形狀——
+    // INTERNAL + cause 類名後綴（不回顯例外訊息）、spec 保留（嘗試過的 intent
+    // 不靜默丟失）、usedFallback=false（Internal 非降級分支）。
+    val secret = "launcher-secret-payload"
+    val launcher = IntentLauncher { LaunchResult.Internal(IllegalStateException(secret)) }
+    val cases = listOf(
+      "alarm" to AlarmTool.execute(AlarmTool.Params(7, 30), env, launcher),
+      "calendar-insert" to CalendarTool.execute(CalendarTool.EventParams("例會", 1000, 2000), env, launcher),
+      "calendar-update" to CalendarTool.executeUpdate(CalendarTool.UpdateParams(eventId = "7"), env, launcher),
+      "music-control" to MusicTool.execute(MusicTool.Params(control = MusicTool.Control.NEXT), env, launcher),
+      "music-play" to MusicTool.execute(MusicTool.Params(query = "輕音樂"), env, launcher),
+      "navigation" to NavigationTool.execute(NavigationTool.Params(query = "夜市"), env, launcher),
+      // launchapp 走 Single→launcher 分支（alias 命中即單包 spec）；Volume 不納入：
+      // 其 execute 不經 launcher（錨定語義），無 Internal-launcher 分支。
+      "launchapp" to LaunchAppTool.execute(LaunchAppTool.Params("地圖"), env, launcher),
+    )
+    for ((label, r) in cases) {
+      assertFalse(label, r.ok)
+      assertFalse(label, r.usedFallback)
+      assertEquals(label, ReasonCodes.INTERNAL, r.reasonCode)
+      assertTrue("$label spec 應保留", r.spec != null)
+      assertTrue("$label 訊息應含 INTERNAL", r.message.contains(ReasonCodes.INTERNAL))
+      assertTrue("$label 訊息應含 cause 類名：${r.message}", r.message.contains("[IllegalStateException]"))
+      assertFalse("$label 不得回顯例外訊息", r.message.contains(secret))
+    }
+  }
+
+  @Test fun launchApp_unknown_echoCappedInCopy() {
+    // Unknown 分支話術僅回顯前 MAX_QUERY_ECHO_LEN 字元（話術防回顯，非參數
+    // 校驗；execute 與 fallback else 分支同形）。
+    val long = "x".repeat(1024)
+    val cap = LaunchAppTool.MAX_QUERY_ECHO_LEN
+    val r = LaunchAppTool.execute(LaunchAppTool.Params(long), env, IntentLauncher { LaunchResult.Success })
+    assertEquals(ReasonCodes.NO_HANDLER, r.reasonCode)
+    assertTrue(r.message, "「${long.take(cap)}」" in r.message)
+    assertFalse(r.message, long.take(cap + 1) in r.message)
+    val fb = LaunchAppTool.fallback(LaunchAppTool.Params(long), env)
+    assertEquals(ReasonCodes.NO_HANDLER, fb.reasonCode)
+    assertTrue(fb.userMessage, "「${long.take(cap)}」" in fb.userMessage)
+    assertFalse(fb.userMessage, long.take(cap + 1) in fb.userMessage)
   }
 }

@@ -12,6 +12,12 @@ package dev.librepocket.systema
  * 上限（皆無）；本層 0-23/0-59/500 字元為 Binder 傳輸防禦（超界一律
  * INTERNAL 而非照送），未來 dispatcher 接線時模型端須知「官方合法但
  * 本層拒絕」的可能。
+ * P2 收斂：本校驗經 [execute] 的 [guardedToolBuild] 於能力分支（DEGRADED/
+ * launch）之前一律執行；靜態無系統鬧鐘 App 的降級路徑先驗證後降級，非法
+ * 參數在任何可執行分支皆得 INTERNAL（USER_DISABLED 除外：能力問題先於
+ * 參數問題，見測試 USER_DISABLED 釘選）。驗證刻意留在 builder 本體（build/
+ * parse 兩側已有同值守衛；另抽 validateParams 會成第三份須同步的守衛集，
+ * 故以 [guardedToolBuild] 於執行點收斂取代）。
  *
  * 權限決策（#14：發送端需宣告 normal 級 `com.android.alarm.permission.SET_ALARM`）：
  * 官方 Common Intents 明確要求「要發送 ACTION_SET_ALARM，App 必須持有
@@ -114,18 +120,22 @@ object AlarmTool : SystemTool<AlarmTool.Params> {
     if (!check.executable) {
       return ToolResult(false, false, null, check.reasonCode, "做不到設定鬧鐘（${check.reasonCode}）")
     }
-    if (check.availability == Availability.DEGRADED) {
-      // 靜態無系統鬧鐘 App：與執行期 NoHandler 同語義（自有提醒降級），
-      // 話術統一取 [fallback]（含 label 與通知授權提示，與姊妹工具一致）。
-      return ToolResult(false, true, null, check.reasonCode, fallback(params, env).userMessage)
-    }
-    // fail-closed：builder IAE/ISE（範圍/長度）收斂為 INTERNAL，不穿透生產迴圈
-    //（收斂點 [guardedToolBuild]：話術由呼叫方提供，訊息與原 inline catch 逐字相同）。
+    // fail-closed：builder IAE/ISE（範圍/長度）收斂為 INTERNAL，且必須早於
+    // DEGRADED 分支——靜態無系統鬧鐘 App 的降級路徑同樣不得繞過參數校驗
+    //（P2 修復：此前 hour=25/超長 message 走 fallback 話術原樣回顯「25:00」
+    // 與整段 label，KDoc「越界一律 INTERNAL」失實）。收斂點 [guardedToolBuild]：
+    // 話術由呼叫方提供，訊息與原 inline catch 逐字相同；DEGRADED 契約維持
+    // spec=null（驗證後即棄 build 產物，不攜帶嘗試過的 spec）。
     val internalFailure =
       ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到設定鬧鐘（${ReasonCodes.INTERNAL}）")
     val spec = when (val build = guardedToolBuild(internalFailure) { buildSetAlarmIntent(params) }) {
       is Guarded.Internal -> return build.result
       is Guarded.Built -> build.value
+    }
+    if (check.availability == Availability.DEGRADED) {
+      // 靜態無系統鬧鐘 App：與執行期 NoHandler 同語義（自有提醒降級），
+      // 話術統一取 [fallback]（含 label 與通知授權提示，與姊妹工具一致）。
+      return ToolResult(false, true, null, check.reasonCode, fallback(params, env).userMessage)
     }
     return when (val launched = launcher.launchCatching(spec)) {
       // 發現式缺席（靜態 check 通過但 resolve 為空：實現被移除/停用/不可見）：
@@ -143,6 +153,11 @@ object AlarmTool : SystemTool<AlarmTool.Params> {
    * 降級分支僅用於 NO_HANDLER（靜態無 App 或執行期發現式缺席）。
    * USER_DISABLED 等不可執行路徑由 [execute] 早期回傳，不經此函式；
    * 未來呼叫方不得以 USER_DISABLED 調用本函式取 NO_HANDLER 話術。
+   * 參數契約：本函式收到的 params 已經由 [buildSetAlarmIntent]（或 parse 側）
+   * 完成同一組 fail-closed 校驗（0-23/0-59/≤[MAX_MESSAGE_LEN]），且 [execute]
+   * 的守衛在能力分支之前一律執行。label/time 渲染**刻意不做 take 截斷**：500
+   * 字上限已保證話術長度有界，臨時截斷反而改變合法上限輸入的話術（見測試
+   * `alarm_execute_degraded_validKeepsFallbackCopyWithFullLabel` 釘選）。
    */
   override fun fallback(params: Params, env: SystemEnv): FallbackSpec {
     val label = if (params.message.isNotBlank()) "「${params.message}」" else "鬧鐘"

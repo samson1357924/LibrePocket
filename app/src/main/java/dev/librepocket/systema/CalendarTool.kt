@@ -23,7 +23,12 @@ package dev.librepocket.systema
  *   `<queries>` 決策不得視為裝置驗證證據。
  * - 長度/時長上限（500/500/2000 字元、單事件 5 年）為**本層自訂 fail-closed
  *   政策**：官方 Common Intents 對 INSERT 無這些上限，本層較嚴（Binder 傳輸
- *   防禦），越界一律 INTERNAL；dispatcher 接線時模型須知此差異。
+ *   防禦），越界一律 INTERNAL；dispatcher 接線時模型須知此差異。建事件路徑的
+ *   此校驗於 [execute] 守衛中先於「靜態無 App」早期回傳執行（同形修補）：非法
+ *   參數在任何可執行分支皆得 INTERNAL（USER_DISABLED 除外：能力問題先於
+ *   參數問題，見測試 USER_DISABLED 釘選）；驗證刻意留在 builder 本體
+ *   （build/parse 兩側已有同值守衛，另抽 validateParams 會成第三份須同步的
+ *   守衛集，故以 [guardedToolBuild] 於執行點收斂取代）。
  * - 與 [AlarmTool] 的刻意差異（#14/#15 對齊決策）：建事件靜態無 App 時本工具
  *   回 UNAVAILABLE（Alarm 回 DEGRADED），因建事件手動降級仍需一個日曆 App
  *   可開（見 [fallback] 話術），無 App 時連手動都做不到；Alarm 自有提醒不需
@@ -100,6 +105,11 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
 
   /** Events `_id` 數字校驗（避免每次呼叫重配 Regex）。 */
   private val EVENT_ID_PATTERN = Regex("[0-9]+")
+
+  /** fallback 話術的 eventId 回顯上限：id 已驗證純數字（[EVENT_ID_PATTERN]），
+   *  但數字串長度無上限（10^k 行 id 實務上遠短於此）；僅截斷話術回顯防超長
+   *  輸入回顯擴大，spec/URI 守衛仍以完整 id 校驗（見 `calendar_eventIdEcho_cappedInFallbackCopy`）。 */
+  const val MAX_EVENT_ID_ECHO_LEN = 64
 
   override val descriptor: ToolDescriptor
     get() = ToolRegistry.get(ToolRegistry.CALENDAR)!!
@@ -268,16 +278,24 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
 
   override fun execute(params: EventParams, env: SystemEnv, launcher: IntentLauncher): ToolResult {
     val check = check(env)
-    if (!check.executable) {
+    if (!check.executable && check.reasonCode == ReasonCodes.USER_DISABLED) {
       return ToolResult(false, false, null, check.reasonCode, "做不到建日曆事件（${check.reasonCode}）")
     }
-    // fail-closed：builder IAE/ISE 收斂為 INTERNAL，不穿透生產迴圈
-    //（收斂點 [guardedToolBuild]：話術由呼叫方提供，訊息與原 inline catch 逐字相同）。
+    // fail-closed（同形修補）：builder IAE/ISE 收斂為 INTERNAL，且必須早於
+    // 「靜態無系統日曆 App」的早期回傳——此前無 App + 非法 title 以 NO_HANDLER
+    // 直接回，繞過長度/時長守衛，KDoc「越界一律 INTERNAL」失實（與
+    // [AlarmTool] DEGRADED 同形洞）。收斂點 [guardedToolBuild]：話術由呼叫方
+    // 提供，訊息與原 inline catch 逐字相同。
     val internalFailure =
       ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到建日曆事件（${ReasonCodes.INTERNAL}）")
     val spec = when (val build = guardedToolBuild(internalFailure) { buildInsertIntent(params) }) {
       is Guarded.Internal -> return build.result
       is Guarded.Built -> build.value
+    }
+    if (!check.executable) {
+      // 靜態無系統日曆 App（UNAVAILABLE）：走到這裡的參數已通過上方守衛，
+      // 非法參數不再以 NO_HANDLER 繞過；契約同前（spec=null、不調 launcher）。
+      return ToolResult(false, false, null, check.reasonCode, "做不到建日曆事件（${check.reasonCode}）")
     }
     return when (val launched = launcher.launchCatching(spec)) {
       // 發現式缺席（靜態 check 通過但 resolve 為空：實現被移除/停用/不可見）：
@@ -365,6 +383,7 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
   /**
    * 建事件降級僅用於 NO_HANDLER（靜態無 App 不可執行，不經此函式；
    * 執行期 NoHandler 才走手動話術）。USER_DISABLED 等路徑由 [execute] 早期回傳。
+   * title 已由守衛校驗（≤[MAX_TITLE_LEN]），label 渲染不做截斷（同 [AlarmTool.fallback] 契約）。
    */
   override fun fallback(params: EventParams, env: SystemEnv): FallbackSpec = FallbackSpec(
     reasonCode = ReasonCodes.NO_HANDLER,
@@ -372,17 +391,23 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
       "→ 可替代手動在系統日曆新建 → 需要你開啟日曆 App 填入時間",
   )
 
-  /** 改事件降級（S1-C）：一律手動替代，引用原因碼。 */
+  /**
+   * 改事件降級（S1-C）：一律手動替代，引用原因碼。
+   * eventId 回顯經 [MAX_EVENT_ID_ECHO_LEN] 截斷（話術有界；spec/URI 不受影響）。
+   */
   fun fallbackUpdate(params: UpdateParams, reasonCode: String): FallbackSpec = FallbackSpec(
     reasonCode = reasonCode,
-    userMessage = "做不到更新事件「${params.eventId}」（$reasonCode）" +
+    userMessage = "做不到更新事件「${params.eventId.take(MAX_EVENT_ID_ECHO_LEN)}」（$reasonCode）" +
       "→ 可替代手動在系統日曆編輯 → 需要你開啟日曆 App 修改後儲存",
   )
 
-  /** 刪事件降級（S1-C）：一律手動替代，引用原因碼。 */
+  /**
+   * 刪事件降級（S1-C）：一律手動替代，引用原因碼。
+   * eventId 回顯經 [MAX_EVENT_ID_ECHO_LEN] 截斷（話術有界；spec/URI 不受影響）。
+   */
   fun fallbackDelete(params: DeleteParams, reasonCode: String): FallbackSpec = FallbackSpec(
     reasonCode = reasonCode,
-    userMessage = "做不到刪除事件「${params.eventId}」（$reasonCode）" +
+    userMessage = "做不到刪除事件「${params.eventId.take(MAX_EVENT_ID_ECHO_LEN)}」（$reasonCode）" +
       "→ 可替代手動在系統日曆刪除 → 需要你開啟日曆 App 長按刪除",
   )
 }

@@ -9,6 +9,8 @@ package dev.librepocket.systema
  *   （EXTRA_MEDIA_FOCUS + query extra）需要播放器逐一實作 focus 型別，
  *   非通用路徑；本層以 VIEW 到 YT Music 網頁搜尋近似（真實可用、只依瀏覽器，
  *   非官方契約直譯——近似屬明寫決策，不冒充官方契約）。
+ *   query 長度上限（[MAX_QUERY_LEN]=500）為本層 Binder 傳輸防禦（官方契約
+ *   無此上限），builder fail-closed 拒絕，越界經 [execute] 收斂 INTERNAL。
  * - 可見性（#14）：主 manifest `<queries>` 已宣告 VIEW geo/https scheme-only，
  *   targetSdk 36 下 resolve-first launcher 不再被過濾成假 NO_HANDLER；
  *   真機 handler E2E（瀏覽器/播放器實際接起）仍 UNVERIFIED。
@@ -27,6 +29,10 @@ package dev.librepocket.systema
  *   （控制映射與 play 編碼的拋例不再穿透生產迴圈）。
  */
 object MusicTool : SystemTool<MusicTool.Params> {
+
+  /** Binder 傳輸上限防禦：query 過長在 builder 即拒（本層自訂政策，非官方
+   *  契約；與 [AlarmTool.MAX_MESSAGE_LEN]/[NavigationTool.MAX_QUERY_LEN] 同值同源）。 */
+  const val MAX_QUERY_LEN = 500
 
   enum class Control { PLAY, PAUSE, TOGGLE, NEXT, PREVIOUS }
 
@@ -60,13 +66,16 @@ object MusicTool : SystemTool<MusicTool.Params> {
     }
   }
 
-  fun buildPlayIntent(params: Params, defaultPlayerPackage: String? = null): IntentSpec =
-    IntentSpec(
+  fun buildPlayIntent(params: Params, defaultPlayerPackage: String? = null): IntentSpec {
+    // Binder 傳輸上限防禦：URLEncoder 前以欄位長度計（見 IntentSpec KDoc 長度政策）。
+    require(params.query.length <= MAX_QUERY_LEN) { "query too long: ${params.query.length} > $MAX_QUERY_LEN" }
+    return IntentSpec(
       action = IntentActions.VIEW,
       dataUri = if (params.query.isBlank()) null
       else "https://music.youtube.com/search?q=${java.net.URLEncoder.encode(params.query, Charsets.UTF_8.name())}",
       targetPackage = defaultPlayerPackage,
     )
+  }
 
   fun buildControl(control: Control): ControlSpec {
     // 鍵碼查表缺項以 ISE 快速失敗（可被 [guardedToolBuild] 收斂為 INTERNAL），
@@ -154,7 +163,9 @@ object MusicTool : SystemTool<MusicTool.Params> {
     }
     return FallbackSpec(
       reasonCode = ReasonCodes.NO_HANDLER,
-      alternative = buildPlayIntent(params),
+      // 防拋收斂（[guardedFallbackAlternative]，同 [NavigationTool.fallback]）：
+      // query 守衛違規時降為 null，話術形狀不變；fallback 不得反拋打穿呼叫方。
+      alternative = guardedFallbackAlternative { buildPlayIntent(params) },
       userMessage = "做不到開啟播放器（${ReasonCodes.NO_HANDLER}）" +
         "→ 可替代網頁播放器 → 需要你手動點播放",
     )

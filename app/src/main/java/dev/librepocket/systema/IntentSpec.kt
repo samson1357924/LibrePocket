@@ -7,8 +7,13 @@ package dev.librepocket.systema
  *
  * 長度政策註記：本層字串長度上限（[AlarmTool.MAX_MESSAGE_LEN]、
  * [CalendarTool.MAX_TITLE_LEN]/[CalendarTool.MAX_LOCATION_LEN]/
- * [CalendarTool.MAX_DESCRIPTION_LEN]）皆為**本層自訂 fail-closed 政策**
- * （Binder 傳輸防禦），非官方契約；builder/parse 兩側同值，改動須三處同步。
+ * [CalendarTool.MAX_DESCRIPTION_LEN]、[NavigationTool.MAX_QUERY_LEN]
+ * （其 label 同限）、[MusicTool.MAX_QUERY_LEN]）皆為**本層自訂 fail-closed
+ * 政策**（Binder 傳輸防禦），非官方契約；builder/parse 兩側同值，改動須同步
+ * （[NavigationTool.MAX_QUERY_LEN]/[MusicTool.MAX_QUERY_LEN] 目前僅 builder 側
+ * 守衛，同步點分別為 geo/web 兩 builder 與 play builder）。
+ * [CalendarTool.MAX_EVENT_ID_ECHO_LEN] 與 [LaunchAppTool.MAX_QUERY_ECHO_LEN]
+ * 則僅限制話術回顯長度（參數校驗/守衛仍以完整值進行），同屬防回顯政策。
  *
  * D2 型別化 extras：D1 的全 String 會讓端側 `getIntExtra /
  * getLongExtra / getBooleanExtra` 讀回預設值（系統鬧鐘/日曆 App 直接忽略），
@@ -193,6 +198,26 @@ internal inline fun <T> guardedToolBuild(
 /** INTERNAL 失敗訊息附加 cause 類名（`做不到 X（INTERNAL）` → `…（INTERNAL）[IAE 類名]`）。 */
 private fun ToolResult.tagInternalCause(cause: Throwable): ToolResult =
   copy(message = "$message[${cause.javaClass.simpleName}]")
+
+/**
+ * fail-closed fallback 的 alternative 構建收斂點（[guardedToolBuild] 的「報告
+ * 失敗」側對稱）：fallback 是回報降級的路徑，自身不得反拋例外打穿呼叫方——
+ * builder 拋 `IllegalArgumentException`／`IllegalStateException`（座標/長度等
+ * 守衛違規，非取消）時降為 null（僅「無預建 intent 可替代」，話術由呼叫方
+ * 自持，形狀不變）；`CancellationException` 照拋（取消語義不得吞，注意它繼承
+ * ISE，必須排在前位）。現行採用：[NavigationTool.fallback]、[MusicTool.fallback]
+ * 的 play 分支；新增 fallback 若會構建 intent，必須經此收斂。
+ */
+internal inline fun <T> guardedFallbackAlternative(builder: () -> T): T? =
+  try {
+    builder()
+  } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+    throw e
+  } catch (e: IllegalArgumentException) {
+    null
+  } catch (e: IllegalStateException) {
+    null
+  }
 
 data class ToolResult(
   val ok: Boolean,

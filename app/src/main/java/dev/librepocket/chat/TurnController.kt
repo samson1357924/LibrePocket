@@ -412,9 +412,10 @@ class TurnController(
    * immediate-cancel handler now wraps its usage transfer + persist + drain in
    * their own [OrderedTranscriptSink.BEST_EFFORT_TIMEOUT_MS] bounds OUTSIDE
    * this core bound, so a worst-case handler can exceed this timeout by up to
-   * three best-effort bounds (the 6s fence asserts the core bound, not the
-   * full handler wall time). Target: single shared ledger budget instead of
-   * three shares of this timeout.
+   * the settle bound (`cancelSettleTimeoutMs`, production 5s, only on the
+   * SUBMITTING settle-wait sub-path) plus three best-effort bounds (the 6s
+   * fence asserts the core bound, not the full handler wall time). Target:
+   * single shared ledger budget instead of three shares of this timeout.
    */
   private val cancelCompensationTimeoutMs: Long = CANCEL_RECEIPT_COMPENSATION_TIMEOUT_MS,
   /**
@@ -866,8 +867,12 @@ class TurnController(
         attemptUsageSeen.remove(runId)
       } catch (e: Throwable) {
         if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
-        // Best-effort: retain the cell for a later retry instead of losing
-        // the authoritative usage on a transient store failure.
+        // Best-effort: swallow the failure and keep the cell. No other path
+        // flushes this attempt id again; the one later transfer is the cancel
+        // handler when a cancel lands in this attempt's retry-backoff gap
+        // (attemptRef still holds the just-failed id until the next mint) and
+        // it gives up after BEST_EFFORT_TIMEOUT_MS. Otherwise the row is
+        // lost — deliberate: usage is accounting-only, never load-bearing.
       }
     } else {
       attemptUsageSeen.remove(runId)
@@ -4133,9 +4138,13 @@ class TurnController(
         // best-effort bound), so a stalled accounting write can never consume
         // the core budget and turn a committed cancel into a false
         // INTERRUPTED mark. Worst-case handler wall time is therefore
-        // transfer ≤ 1x best-effort bound + core ≤ cancelCompensationTimeoutMs
-        // + persist ≤ 1x + drain ≤ 1x (≈ 11s with the production 5s core; the
-        // 6s test fence asserts the core bound, not this total). The deferred
+        // settle ≤ cancelSettleTimeoutMs (production 5s; only on the
+        // SUBMITTING settle-wait sub-path) + transfer ≤ 1x best-effort bound +
+        // core ≤ cancelCompensationTimeoutMs + persist ≤ 1x (non-deferred) +
+        // drain ≤ 1x: ≤ 16s with the production 5s settle + 5s core, ≤ 14s on
+        // the deferred path (no persist), ≤ 11s when the settle-wait does not
+        // apply. The 6s test fence asserts the core bound, not this total.
+        // The deferred
         // (notice-first) case is owned by the cancel receipt waiter, which
         // flushes after its deferred core write; a waiter that degrades to
         // SEALED without a deferred write intentionally drops the usage row

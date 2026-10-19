@@ -3,8 +3,9 @@ package dev.librepocket.systema
 /**
  * 開 App 工具：launchIntent + `<queries>` 白名單 + 模糊名澄清。
  *
- * 端側 manifest 需在 `<queries>` 中宣告可見包（約束：本包不動 manifest，
- * 此處以 [QUERY_WHITELIST] 作為唯一真相來源，發版時由 manifest 側對齊）：
+ * 端側 manifest 已補最小 <queries>（SET_ALARM/日曆/geo/https，見主 manifest #14
+ * 註解）；開 App 的 launcher 清單查詢仍刻意不宣告——以 [QUERY_WHITELIST] 作
+ * 唯一真相來源，manifest 註解反向引用本檔的缺口註記：
  * ```xml
  * <queries>
  *   <package android:name="com.google.android.apps.maps" />
@@ -12,11 +13,11 @@ package dev.librepocket.systema
  * </queries>
  * ```
  * 白名單外不可見 → [LaunchResolution.NeedClarification] 或 Unknown，
- * 禁止猜測包名（ARCH §9.1）。
+ * 禁止猜測包名。
  *
- * Target 缺口（本 PR 不改 manifest）：API 30+ 包可見性下，若 manifest
- * `<queries>` 未覆蓋 [QUERY_WHITELIST]，真機 resolve 恐集體 NoHandler；
- * 需裝置驗證後再補宣告。
+ * Target 缺口（刻意保留）：開 App launcher 清單查詢未加入 <queries>；API 30+
+ * 包可見性下 [QUERY_WHITELIST] 的包真機 resolve 恐 NoHandler——防包名猜測
+ * 優先，需裝置驗證後再決定是否補宣告。
  */
 object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
 

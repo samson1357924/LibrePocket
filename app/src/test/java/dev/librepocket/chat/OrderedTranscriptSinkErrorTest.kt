@@ -11,7 +11,6 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -77,7 +76,6 @@ class OrderedTranscriptSinkErrorTest {
               sink.onTurnSucceeded("run-next", "late", hasReasoning = false)
               fail("post-fatal core must fail fast, never succeed")
             } catch (_: CancellationException) {
-            } catch (_: Exception) {
             }
           }
           val elapsed = System.currentTimeMillis() - started
@@ -133,6 +131,20 @@ class OrderedTranscriptSinkErrorTest {
           assertFalse(sink.flushDurable())
           withTimeout(5_000) { while (!sink.isSealed()) delay(10) }
           assertTrue(sink.isSealed())
+          // Fatal seals like teardown: writer dead, later cores fail fast
+          // (same post-fatal control as the sibling test above).
+          val started = System.currentTimeMillis()
+          withTimeout(4_000) {
+            try {
+              sink.onTurnSucceeded("run-next", "late", hasReasoning = false)
+              fail("post-fatal core must fail fast, never succeed")
+            } catch (_: CancellationException) {
+            }
+          }
+          val elapsed = System.currentTimeMillis() - started
+          assertTrue("post-fatal core must fail fast, took ${elapsed}ms", elapsed < 4_000L)
+          assertTrue(sink.interruptedRunIds().contains("run-next"))
+          assertTrue(sink.pendingRunIds().isEmpty())
           sink.shutdown()?.join()
         }
       }
@@ -188,7 +200,6 @@ class OrderedTranscriptSinkErrorTest {
               sink.onTurnStarted("run-next", "hi")
               fail("post-fatal core must fail fast, never succeed")
             } catch (_: CancellationException) {
-            } catch (_: ClosedSendChannelException) {
             }
           }
           val elapsed = System.currentTimeMillis() - started

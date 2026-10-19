@@ -131,6 +131,149 @@ silently downgrade redaction or writes):
   the two gates above are the enforcement. Do not claim sharded execution until
   it is wired and run.
 
+## Current policy gates, tool-contract pins, and honest skips (P2 activation)
+
+### Artifact-level backup binding gate (Current, policy gate)
+
+The backup boundary has two tiers, and only the artifact tier proves the
+shipped package. Source level: `scripts/backup_rules_check.py` validates the
+five key-file excludes (`REQUIRED_EXCLUDES` — sharedpref `librepocket_keys.xml`,
+database `librepocket_vault`/`-wal`/`-shm`, file `librepocket_keysets`) inside
+the correct `<cloud-backup>` / `<device-transfer>` branches, with the file↔root
+binding required at every call surface (`--expect-root full-backup-content` /
+`--expect-root data-extraction-rules`; a swapped file is silently ignored by
+the Android runtime parser). `--check-manifest` pins the manifest
+`android:fullBackupContent` / `android:dataExtractionRules` attributes to
+`@xml/backup_rules` / `@xml/data_extraction_rules` (`EXPECTED_MANIFEST_ATTRS`;
+`--require-both` on the main manifest, overlays fail closed only on a
+present-but-different value or on a `tools:` marker that strips the binding).
+The covering tests (`scripts/tests/test_apk_policy_check.py`, classes
+`BackupRulesValidator` and `ApkPolicyHarness`) run inside the harness command
+above (no Gradle). The operative claim is: source-level PASS alone never proves
+the artifact — the merged APK binding bytes are asserted independently by the
+artifact-level scanner (`test_merged_backup_bindings_stripped_rejected_both_modes`,
+`test_merged_backup_binding_outside_application_rejected`,
+`test_merged_backup_bindings_missing_resource_table_rejected`), because an XML
+comment can hide a deleted attribute at source level
+(`test_manifest_comment_survivor_no_longer_fools_the_check`) and a merger
+marker can strip the binding at merge time. The harness's synthetic
+APK-like fixtures prove scanner logic only; for a real artifact the artifact
+tier is the post-assembly `scripts/play_policy_check.sh` stage (CI assembly
+step above), and no synthetic fixture run substitutes for it.
+
+### Manifest pin semantics: tools: markers and quote normalization (Current, policy-harness tests)
+
+`backup_rules_check.py` parses with stdlib ElementTree, so manifest claims are
+structurally checked, not grepped. Pinned semantics (all in
+`scripts/tests/test_apk_policy_check.py`, class `BackupRulesValidator`):
+
+- Quote normalization: plain double-quoted attributes AND single-quoted
+  (equally valid XML) parse to the same bound values
+  (`test_manifest_structured_binding_passes`) — the old byte-grep gate failed
+  the single-quoted spelling; structured parsing ends that false-FAIL.
+- Comment-slap resistance: attributes deleted while the literals survive only
+  inside an XML comment must fail closed, both `--require-both` (main) and as
+  legal-absence inheritance (overlay)
+  (`test_manifest_comment_survivor_no_longer_fools_the_check`).
+- `tools:` merger-marker semantics: `tools:remove` naming
+  `fullBackupContent`/`dataExtractionRules` while absent, or a
+  `tools:node="replace"` / `tools:node="remove"` on `<application>` without
+  re-declaring both pinned values, deletes the merged binding and fails closed
+  (`test_overlay_tools_remove_backup_attrs_fails_closed`,
+  `test_overlay_tools_node_replace_without_attrs_fails_closed`,
+  `test_overlay_tools_node_remove_application_fails_closed`); a root-level
+  marker naming the attributes is an undefined shape and is refused
+  (`test_root_manifest_level_marker_naming_backup_attrs_rejected`). Benign
+  markers stay legal: `tools:ignore`/`tools:insert` never strip the binding
+  (`test_overlay_benign_tools_markers_still_pass`) and each pin kept as its
+  own re-declaration passes (`test_overlay_marker_with_own_pinned_values_passes`).
+- `tools:*` attributes are excluded from runtime-attribute counts because aapt
+  strips them before the runtime parses the rules (companion negative checks
+  in the same class); at artifact level an aapt2-spelling merged binding that
+  resolves through the resource table is accepted
+  (`test_merged_backup_bindings_aapt2_spelling_and_literal_raw_pass`) and a
+  misbound/rebound one is rejected
+  (`test_merged_backup_binding_attr_with_wrong_printed_id_rejected`,
+  `test_merged_backup_binding_literal_rebound_name_rejected`).
+
+### Validation before capability branches; USER_DISABLED-first; bounded echoes (Current, tool contract)
+
+The systema tools pin three contracts. (1) Parameter validation runs before
+any capability branch: every tool resolves its `IntentSpec` through the shared
+`guardedToolBuild` helper (defined in `IntentSpec.kt`), so an out-of-range
+parameter converges to `ReasonCodes.INTERNAL` on every executable branch
+(`IntentAdapterStage1Test.guardedToolBuild_illegalArgument_mapsCauseTaggedInternal`
+pins the fail-closed INTERNAL mapping), and a degraded/no-app capability state
+must not skip validation. (2) USER_DISABLED-first: a disabled capability
+short-circuits ahead of parameter questions —
+`IntentAdapterStage1Test.execute_userDisabled_returnsDisabledNotNoHandler`
+pins that disabled users get `ReasonCodes.USER_DISABLED` on AlarmTool and all
+CalendarTool execute forms with `usedFallback=false`, `spec=null`, and the
+launcher never invoked (never reinterpreted through fallback as NO_HANDLER
+copy), and that disabled + invalid parameters still answer
+`ReasonCodes.USER_DISABLED`, not INTERNAL (capability question precedes the
+parameter question, exactly one exception to contract (1));
+`CalendarFullTest.updateDisabledIsUnavailable` pins the check-side denial.
+(3) Bounded echoes: failure copy echoes at most `LaunchAppTool.MAX_QUERY_ECHO_LEN`
+(32) / `CalendarTool.MAX_EVENT_ID_ECHO_LEN` (64) characters —
+`IntentAdapterStage1Test.launchApp_unknown_echoCappedInCopy` and
+`IntentAdapterStage1Test.calendar_eventIdEcho_cappedInFallbackCopy` assert
+the cap-length substring present and cap+1 absent in both `execute` and
+`fallback` copy, while spec/URI construction keeps the full value (the cap is
+anti-echo for message text, deliberately not a parameter-validation cap).
+
+### Skill subsystem fail-closed evidence (Current, #15)
+
+The skill installer/registry fail closed on shape doubts, with exact reasons —
+not OR-converged copies — pinned per test in `SkillInstallTest`:
+`pathTraversalRejected` (`SkillInstaller.Failure.TRAVERSAL`),
+`missingSkillMdRejected` (`MISSING_SKILL_MD`),
+`badFrontmatterRejected_missingName` (`BAD_FRONTMATTER`),
+`nameMismatchRejected` (`NAME_MISMATCH`), and
+`filesAndZipShareSameValidation_unknownToolRejected` (`UNKNOWN_TOOL`; files
+and zips share one validation path, so a rejected ref-name rejects both). The
+current head (fail-closed destRoot probe + restore content proof, commit
+`cddc030a`) additionally pins in `SkillStartupRecoveryTest`: the destRoot
+probe `isSymlinkOrUnknown` treats undecidable attributes as unsafe
+(install into a nonexistent destRoot still succeeds; a cleanup on a
+symlink/unknown destRoot is a no-op — `cleanup_symlinkDestRoot_isNoop` — and
+`listResiduals_symlinkDestRoot_isEmpty` lists nothing), symlink classification
+runs before the age gate so fresh link-shaped staging is unlinked in the same
+run (`cleanup_freshLinkStagingShape_unlinkedRegardlessOfAge`, unlink-only,
+external contents survive), a symlinked or unreadable SKILL.md never
+restores or reports a version
+(`installedVersion_symlinkSkillMd_returnsNull`,
+`installedVersion_symlinkSkillDir_returnsNull`), and a target-less single
+`.bak` restores only when `bakManifestName` proves a real, non-symlink,
+`MAX_SINGLE_FILE_BYTES`-bounded, parseable SKILL.md whose manifest name equals
+the bak id — otherwise it converges to KEPT (still listed by
+`listResiduals`). `SkillAtomicCommitTest` pins the replace path to
+all-or-nothing: staging-rename/backup/rollback failures keep the old bytes
+intact with no half-product and no leftovers, reporting `IO_ERROR` with the
+backup location when rollback itself fails.
+
+### Honest Assume-skip semantics (Current, skip≠pass)
+
+Environment-dependent tests skip with JUnit `Assume` instead of faking a pass
+or polluting the run with unrelated reds: `ChatSnapshotByteCapFullStressTest`
+requires `NIGHTLY_STRESS == "1"` via `requireNightly()` (`assumeTrue`), so the
+full 100-turn/200-row stress skips on PR runs and only executes in the
+nightly job; `LinuxSmokeTest` skips the host-`proot` comparison behind
+`Assume.assumeTrue("no host proot; guest-path smoke above is the CI signal",
+proot)`; `AndroidEncryptedPrefsTest` uses
+`Assume.assumeNoException("Android Keystore unavailable in this sandbox", e)`;
+`ShellPhysicalGateTest` skips Windows and permission-unknown cases (chmod
+unattributable to root detection), and `ScopedFileStoreB2Test` skips
+Windows/non-POSIX symlink cases. A skip is never counted as a pass:
+`scripts/summarize_junit.py` emits its `Status:` line as `PASS` only when
+every XML file is readable, `tests > 0`, `failures == 0`, `errors == 0`, and
+every suite's counters exactly equal its direct `<testcase>` detail, counting
+`skipped` cases separately and surfacing them (with per-suite mismatches,
+empty or contradictory totals, or unreadable files forcing `INCOMPLETE` /
+`PARTIAL` / `NO_RESULTS` instead). It therefore refuses to print `PASS` for a
+run whose results are incomplete — a red, skip, parser gap, or truncated
+report cannot be laundered into a green claim by the reporter.
+
 ## Local commands
 
 Use one Gradle execution at a time on constrained machines. The repo's maintenance guidance requires `--max-workers=1 --no-daemon`; do not run a parallel flavor matrix after an OOM.

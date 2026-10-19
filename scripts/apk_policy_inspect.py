@@ -52,10 +52,20 @@ dump failure, a missing entry, or a set difference fails closed.
 Modes: ``--mode play`` / ``--mode foss`` run every scanner policy.  The
 additional ``--mode github`` runs ONLY the mode-independent artifact
 authorities (merged manifest backup bindings, compiled backup-rules bytes,
-merged networkSecurityConfig binding + compiled NSC): the Github debug
-artifact is neither a Play nor a Foss package, so the flavor DEX class-table
-policies do not apply, while the same manifest/resource merger paths this
-scanner exists to police are shared by all three flavors.
+merged networkSecurityConfig binding + compiled NSC) plus the COMMON flavor
+permission policy below: the Github debug artifact is neither a Play nor a
+Foss package, so the flavor DEX class-table policies do not apply, while the
+same manifest/resource merger paths this scanner exists to police are shared
+by all three flavors.
+
+Common manifest policy (P2-1): SMS, MANAGE_EXTERNAL_STORAGE, and VPN
+declarations are forbidden in EVERY flavor (``COMMON_FORBIDDEN_PERMISSIONS``
+plus ``vpnservice``-shaped merged-manifest references). The scan consumes the
+same permissions/xmltree dumps the play policy reads and runs before the mode
+split, so the github early-return can never skip it. Accessibility stays a
+play-only extra: the foss/github overlays legally declare accessibility
+services (locked decision), so the a11y token must never enter the common
+set.
 """
 
 from __future__ import annotations
@@ -137,14 +147,35 @@ _NETWORK_SECURITY_RESOURCE = "network_security_config"
 _NETWORK_SECURITY_MEMBER = "res/xml/network_security_config.xml"
 _DEBUGGABLE_ATTR_ID = "0x0101000f"
 
-PLAY_FORBIDDEN_PERMISSIONS = (
+# P2-1 common manifest policy (locked decision, see the flavor overlay
+# headers in app/src/foss/AndroidManifest.xml and
+# app/src/github/AndroidManifest.xml): NO SMS, NO MANAGE_EXTERNAL_STORAGE,
+# NO VPN in ANY flavor. These tokens are forbidden on every artifact face
+# and are enforced by ``_check_common_permissions`` for all modes (play,
+# foss AND github - the github mode previously early-returned without any
+# permission scan). Accessibility MUST stay out of this tuple: the foss and
+# github overlays legally declare accessibility services, so the a11y token
+# remains a play-only extra in PLAY_FORBIDDEN_PERMISSIONS below.
+COMMON_FORBIDDEN_PERMISSIONS = (
     "SEND_SMS",
     "RECEIVE_SMS",
     "READ_SMS",
     "MANAGE_EXTERNAL_STORAGE",
-    "BIND_ACCESSIBILITY_SERVICE",
     "BIND_VPN_SERVICE",
 )
+# Play = the common flavor policy plus the play-only extras (at minimum
+# BIND_ACCESSIBILITY_SERVICE). Keep the exact existing token strings.
+PLAY_ONLY_FORBIDDEN_PERMISSIONS = ("BIND_ACCESSIBILITY_SERVICE",)
+PLAY_FORBIDDEN_PERMISSIONS = (
+    COMMON_FORBIDDEN_PERMISSIONS + PLAY_ONLY_FORBIDDEN_PERMISSIONS
+)
+# VPN registration is forbidden by the COMMON policy: beyond the
+# ``BIND_VPN_SERVICE`` uses-permission token, a bare ``<service>`` / intent
+# filter spelling out a VpnService subclass ("vpnservice", case-insensitive)
+# in the merged xmltree ships a VPN without the permission. Play-only DEX
+# superclass analysis stays in _check_play; the xmltree surface here runs
+# for every mode (no DEX parsing needed for the github mode).
+COMMON_VPN_REFERENCE_RE = re.compile(r"vpnservice", re.IGNORECASE)
 PLAY_DEFINED_CLASS_PREFIXES = (
     "Ldev/librepocket/agent/github/",
     "Ldev/librepocket/agent/foss/",
@@ -1195,13 +1226,49 @@ def _validate_dexdump(dexdump: str, dex_name: str, dex_bytes: bytes) -> None:
         raise PolicyError(f"native dexdump rejected {dex_name} (exit {return_code})")
 
 
+def _check_common_permissions(permissions: str, xmltree: str) -> None:
+    """Assert the COMMON flavor permission policy on the merged manifest.
+
+    The locked manifest policy (the decision noted in
+    ``app/src/foss/AndroidManifest.xml`` / ``app/src/github/AndroidManifest.xml``)
+    forbids SMS, MANAGE_EXTERNAL_STORAGE, and VPN declarations in EVERY
+    flavor, so this check runs for ALL modes in ``inspect_apk`` BEFORE the
+    github early-return (which previously scanned no permissions at all),
+    closing the common-manifest enforcement gap for Foss/Github.
+
+    Surface: the same two dumps the play scan consumes - ``aapt dump
+    permissions`` output plus the merged-manifest ``aapt dump xmltree`` - so
+    the check adds no new tool contract and is grounded in the compiled
+    artifact bytes. VPN registration is caught both by the
+    ``BIND_VPN_SERVICE`` uses-permission token and by ``vpnservice``-shaped
+    xmltree element references (a bare ``<service>`` advertising a
+    ``VpnService`` subclass ships a VPN without the permission); the
+    play-only DEX superclass analysis stays in ``_check_play``. Accessibility
+    is deliberately NOT part of the common set: the foss/github overlays
+    legally declare accessibility services, and the a11y token must never
+    fail them (see ``_check_play`` for the play-only halves).
+    """
+    manifest_dump = (permissions + "\n" + xmltree).upper()
+    for token in COMMON_FORBIDDEN_PERMISSIONS:
+        if token in manifest_dump:
+            raise PolicyError(
+                f"merged manifest declares forbidden permission/reference "
+                f"{token} (common flavor policy: fail-closed in every mode)"
+            )
+    if COMMON_VPN_REFERENCE_RE.search(xmltree):
+        raise PolicyError(
+            "merged manifest registers a VpnService (common flavor policy: "
+            "fail-closed in every mode)"
+        )
+
+
 def _check_play(permissions: str, xmltree: str, infos: Iterable[zipfile.ZipInfo], dexes: list[ParsedDex]) -> None:
     manifest_dump = (permissions + "\n" + xmltree).upper()
     for token in PLAY_FORBIDDEN_PERMISSIONS:
         if token in manifest_dump:
             raise PolicyError(f"Play APK declares forbidden permission/reference {token}")
-    if re.search(r"accessibilityservice|vpnservice", xmltree, re.IGNORECASE):
-        raise PolicyError("Play APK manifest registers an AccessibilityService/VpnService")
+    if re.search(r"accessibilityservice", xmltree, re.IGNORECASE):
+        raise PolicyError("Play APK manifest registers an AccessibilityService")
 
     for dex in dexes:
         for descriptor in dex.defined_classes:
@@ -1254,13 +1321,21 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str) -> None:
     # every policy contract provable in this artifact.
     _assert_merged_network_security_config(aapt, apk, xmltree)
 
+    # Common flavor permission policy (P2-1): forbidden SMS / all-files-access
+    # / VPN declarations fail EVERY mode, including github (which otherwise
+    # early-returns below). Play-only extras (accessibility) stay in
+    # _check_play; the common scan adds no new tool contract - the same
+    # permissions/manifest dumps the play scan consumes.
+    _check_common_permissions(permissions, xmltree)
+
     if mode == "github":
         # Github debug is neither a Play nor a Foss package: no flavor DEX
         # class-table policy applies. It already proved the mode-independent
         # artifact authorities (merged backup binding + compiled rules bytes
-        # + NSC binding compiled check) above - that is the entire contract
-        # here. The aapt/dexdump tool contract is still enforced above, so a
-        # wrong tool invocation cannot silently degrade the mode.
+        # + NSC binding compiled check) plus the COMMON flavor permission
+        # policy above - that is the entire contract here. The aapt/dexdump
+        # tool contract is still enforced above, so a wrong tool invocation
+        # cannot silently degrade the mode.
         print(
             f"  structure: APK ZIP/manifest OK ({len(dex_infos)} root DEX "
             "shard(s), DEX tables not parsed)"

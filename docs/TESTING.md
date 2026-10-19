@@ -185,7 +185,9 @@ NSC) with no flavor-DEX class-table policy
 the wiring is pinned by `PolicyCiGateControl`). Third, the Play source
 permission blacklist is enforced by `backup_rules_check.py`'s
 `validate_permission_removals` (CLI: `--check-permission-removals
-<perm,perm,...>`; the shell gate passes the same six tokens). It requires
+<perm,perm,...>`; the shell gate passes the play lane's six tokens, the
+foss/github lanes the common five-token subset - see the P2-1 note below). It
+requires
 every `<uses-permission>` / `<uses-permission-sdk-23>` element whose
 android:name matches a blacklisted token to carry `tools:node="remove"` ON
 THE ELEMENT (the merger marker that provably deletes a whole declared
@@ -196,6 +198,59 @@ comments
 (`PermissionRemovalValidator.test_multiline_marked_removal_is_accepted`,
 `BackupRulesGateEndToEnd.test_multiline_marked_permission_removal_no_longer_false_fails`,
 `BackupRulesGateEndToEnd.test_unmarked_blacklisted_permission_fails_at_source_stage`).
+
+P2-1 round 2 closes the flavor asymmetry left around that third point. The
+locked common manifest decision (NO SMS, NO MANAGE_EXTERNAL_STORAGE, NO VPN in
+ANY flavor) is enforced ON the artifact face for foss and github too:
+`_check_common_permissions` runs in every mode BEFORE the play/foss/github
+split, so a github-mode APK carrying a common-token uses-permission (or a bare
+`<service>` / intent-filter spelling out a VpnService subclass in the merged
+xmltree) fails even though github mode has no permission scan of its own
+(`ApkPolicyHarness.test_common_forbidden_permissions_rejected_in_every_mode`,
+`ApkPolicyHarness.test_github_mode_fails_on_common_permission_only`,
+`ApkPolicyHarness.test_vpn_service_reference_rejected_by_common_check`). In
+play mode a common-token finding intentionally surfaces with the shared
+`_check_common_permissions` wording ("common flavor policy: fail-closed in
+every mode") ahead of the play-only wording, and the retired play-mode
+vpnservice regex is subsumed by that common reference scan — reporting text
+only, the fail-closed behavior is unchanged. The
+`BIND_ACCESSIBILITY_SERVICE` token deliberately stays a play-only extra: the
+foss and github overlays legally declare accessibility services, so that token
+must never join the common set
+(`ApkPolicyHarness.test_accessibility_token_stays_play_only`,
+`ApkPolicyHarness.test_common_permissions_function_accepts_accessibility_surface`).
+At source level the shell gate picks a per-mode token set + overlay manifest
+pair (play = full six-token CSV, foss/github = the common five tokens) and
+feeds them through the same structured CLI; the pr-check github assembly step
+runs the common five-token source scan in the same step as the artifact scan
+(`BackupRulesGateWiring.test_gate_enforces_common_blacklist_in_every_mode`,
+which also cross-checks the shell common set against the scanner's
+`COMMON_FORBIDDEN_PERMISSIONS` tuple;
+`BackupRulesGateEndToEnd.test_github_lane_rejects_unmarked_common_permission`,
+`BackupRulesGateEndToEnd.test_github_lane_accepts_marked_removal_and_clean_overlay`).
+
+Two adjacent shell findings were made fail-closed in the same pass. A missing
+flavor/overlay manifest no longer makes the whole structured permission stage
+silently absent (the retired `[ -f "$m" ] || continue` skip): every lane now
+fails naming the path
+(`BackupRulesGateWiring.test_gate_missing_manifest_fails_closed_not_skipped`,
+`BackupRulesGateEndToEnd.test_missing_flavor_manifest_fails_named_not_skipped`).
+And the raw cleartext scan observes POSIX grep marking (0 = violation, 1 =
+clean, anything else = filesystem error, so the retired `2>/dev/null`
+pipeline could swallow rc 2 and silently PASS an unreadable subtree) and
+accepts every legal spelling: single-quoted values and whitespace around "="
+inclusive
+(`BackupRulesGateWiring.test_gate_cleartext_scan_is_quote_and_rc_honest`,
+`BackupRulesGateEndToEnd.test_cleartext_scan_matches_all_legal_spellings`).
+The semantic-shape deep scans widen their NAME universes only: a rules
+resource may be spelled with dashes (data-extraction-rules.xml) and the NSC
+deep scan covers `*network*security*.xml` (network-security.xml without the
+config segment included) - a name widening can only ADD files to the scan,
+because each found file is still validated fail-closed by its own root/shape
+checker
+(`BackupRulesGateWiring.test_gate_deep_scans_alias_rule_names`,
+`BackupRulesGateEndToEnd.test_dash_alias_rules_files_are_deep_scanned`,
+`BackupRulesGateEndToEnd.test_nsc_alias_without_config_segment_is_deep_scanned`).
 
 Two engine additions harden the rule language itself: any rule `path`
 containing `..` is refused outright (Android's rules schema resolves paths

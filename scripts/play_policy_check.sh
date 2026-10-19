@@ -5,6 +5,12 @@
 # Usage:
 #   scripts/play_policy_check.sh <play-apk> [second-play-apk ...]
 #   scripts/play_policy_check.sh --foss <foss-apk> [second-foss-apk ...]
+#   scripts/play_policy_check.sh --github <github-apk> [...]
+#
+# The common manifest policy (P2-1: NO SMS / MANAGE_EXTERNAL_STORAGE / VPN in
+# ANY flavor) is enforced at source level in EVERY branch -- see the
+# structured permission-removal gate below -- and on the artifact by
+# scripts/apk_policy_inspect.py --mode github for the github flavor.
 #
 # The Python scanner checks ZIP/APK structure, manifest output from aapt,
 # DEX type_ids and relevant class_defs. Native dexdump is a bounded-time,
@@ -14,12 +20,18 @@ set -eu
 export LC_ALL=C
 
 MODE=play
-if [ "${1:-}" = "--foss" ]; then
-    MODE=foss
-    shift
-fi
+case "${1:-}" in
+    --foss)
+        MODE=foss
+        shift
+        ;;
+    --github)
+        MODE=github
+        shift
+        ;;
+esac
 if [ "$#" -lt 1 ]; then
-    printf 'usage: %s [--foss] <apk> [...]; AAB is unsupported\n' "$0" >&2
+    printf 'usage: %s [--foss|--github] <apk> [...]; AAB is unsupported\n' "$0" >&2
     exit 2
 fi
 
@@ -49,6 +61,15 @@ BLACKLIST_PERMS="SEND_SMS RECEIVE_SMS READ_SMS MANAGE_EXTERNAL_STORAGE BIND_ACCE
 # Comma form for the structured validator (same tokens).
 BLACKLIST_PERMS_CSV=$(printf '%s' "$BLACKLIST_PERMS" | tr ' \n' ',,')
 FOSS_BLACKLIST="com.google.mlkit com.google.android.gms com.microsoft.cognitiveservices.speech rikka.shizuku"
+# P2-1 通行 manifest 政策（locked decision：任何 flavor 皆 NO SMS、NO
+# MANAGE_EXTERNAL_STORAGE、NO VPN）：結構化 permission-removal 掃描在「每一個」
+# 分支都要跑（F6：MAIN manifest 加進 SEND_SMS 必須讓每個 flavor 門都紅）。
+# play 在通行黑名單之上額外保留 play-only 的 BIND_ACCESSIBILITY_SERVICE；
+# a11y token 永不得進入通行黑名單——foss/github overlay 依法合法宣告
+# accessibility service（見兩份 overlay manifest 註記）。
+COMMON_BLACKLIST_PERMS="SEND_SMS RECEIVE_SMS READ_SMS MANAGE_EXTERNAL_STORAGE BIND_VPN_SERVICE"
+# Comma form for the structured validator (same tokens).
+COMMON_BLACKLIST_PERMS_CSV=$(printf '%s' "$COMMON_BLACKLIST_PERMS" | tr ' \n' ',,')
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
@@ -69,16 +90,38 @@ command -v python3 >/dev/null 2>&1 || fail 'python3 is required for the backup r
 # comments dropped by the stdlib parser) and requires tools:node="remove" ON
 # THE ELEMENT for every blacklisted name - the exact merger-marker machinery
 # the other manifest checks here already run.
-if [ "$MODE" = play ]; then
-    for m in "$ROOT/app/src/main/AndroidManifest.xml" "$ROOT/app/src/play/AndroidManifest.xml"; do
-        [ -f "$m" ] || continue
-        python3 "$SCRIPT_DIR/backup_rules_check.py" \
-            --check-permission-removals "$BLACKLIST_PERMS_CSV" \
-            "$m"
-    done
-else
+#
+# P2-1：通行黑名單在每個分支都結構化執行（foss 分支過去只掃專有字串、github
+# 分支在 shell 層完全沒有 lane）：黑名單＝mode 對應的 manifest set（main +
+# 該分支 flavor overlay），play 用完整六 token（含 a11y），foss/github 只用
+# 通行五 token（絕不含 a11y）。manifest 缺檔一律 FAIL（過去 `|| continue`
+# 讓整段結構化掃描可被 missing file 靜默跳過＝fail-open，故改 fail-closed）。
+case "$MODE" in
+    play)
+        PERM_TOKENS="$BLACKLIST_PERMS_CSV"
+        FLAVOR_DIR="play"
+        ;;
+    foss)
+        PERM_TOKENS="$COMMON_BLACKLIST_PERMS_CSV"
+        FLAVOR_DIR="foss"
+        ;;
+    github)
+        PERM_TOKENS="$COMMON_BLACKLIST_PERMS_CSV"
+        FLAVOR_DIR="github"
+        ;;
+    *)
+        fail "unknown mode: $MODE"
+        ;;
+esac
+for m in "$ROOT/app/src/main/AndroidManifest.xml" "$ROOT/app/src/$FLAVOR_DIR/AndroidManifest.xml"; do
+    [ -f "$m" ] || fail "missing manifest: $m"
+    python3 "$SCRIPT_DIR/backup_rules_check.py" \
+        --check-permission-removals "$PERM_TOKENS" \
+        "$m"
+done
+if [ "$MODE" = foss ]; then
     for m in "$ROOT/app/src/main/AndroidManifest.xml" "$ROOT/app/src/foss/AndroidManifest.xml"; do
-        [ -f "$m" ] || continue
+        [ -f "$m" ] || fail "missing manifest: $m"
         for needle in $FOSS_BLACKLIST; do
             if grep -i -q "$needle" "$m"; then
                 fail "source manifest $m references proprietary $needle"
@@ -86,11 +129,20 @@ else
         done
     done
 fi
-# Quote-tolerant greps: single-quoted attribute values are equally valid XML
-# and equally enable cleartext; a double-quote-literal-only grep was escapable.
-if grep -rnE "usesCleartextTraffic=[\"']true" "$ROOT/app/src" 2>/dev/null | grep -q .; then
-    fail 'cleartext explicitly enabled somewhere under app/src'
-fi
+# Quote-tolerant, error-honest cleartext scan: single-quoted attribute values
+# are equally valid XML and equally enable cleartext (the double-quote-only
+# grep was escapable), whitespace around "=" is legal spelling, and POSIX
+# grep marking (0=violation, 1=clean, 2+=scan failure) must be observed - the
+# retired `2>/dev/null` + pipeline wiring swallowed rc 2, silently PASSing on
+# unreadable subtrees (fail-open). 這裡保留 raw-text 掃描：註解內殘字也算
+# 違規（比 runtime 更嚴做 fail-closed）；編譯後語意另由 NSC/manifest 結構化門管。
+cleartext_rc=0
+grep -rnE "usesCleartextTraffic[[:space:]]*=[[:space:]]*[\"']true" "$ROOT/app/src" || cleartext_rc=$?
+case "$cleartext_rc" in
+    0) fail 'cleartext explicitly enabled somewhere under app/src' ;;
+    1) : ;;
+    *) fail 'cleartext scan failed (grep filesystem error under app/src)' ;;
+esac
 # 結構化 NSC gate（scripts/nsc_check.py）：舊版「檔內任一處出現
 # cleartextTrafficPermitted=false 即過」的反例是 base-config false + domain-config
 # true（example.com）——整檔語意已放行明文流量而 gate 仍 PASS。改為結構化 XML
@@ -98,10 +150,14 @@ fi
 # 分流：debug source set → loopback 白名單規則；其餘 release-bearing source set
 # （main/play/foss/github/未來 release overlay）一律 deny-all（規則表見
 # scripts/nsc_check.py 模組說明）。
-# 深掃吞 alias：語意同形檔名 *network*security*config*.xml 一併驗證（未來 flavor
-# overlay 以別名新增 NSC 時也不能漏驗）；find 依舊非管線代入取自身狀態（POSIX
-# 賦值狀態＝最後管段，find 不得與 sort 同管），fail-closed。
-NSC_LIST="$(find "$ROOT/app/src" -type f -name '*network*security*config*.xml')" ||
+# 深掃吞 alias：語意同形檔名一併驗證——`*network*security*.xml` 比「必須含
+# config」的舊比對更寬：dash 拼法（network-security-config.xml）、缺段落別名
+# （network-security.xml）均列入，未來 flavor overlay 以別名新增 NSC 時也不
+# 能漏驗；檔名放寬只能讓 find 掃到「更多檔」，不可能放寬內容判準
+# （nsc_check.py 以 XML root/shape fail-closed 驗證每一個被掃到的檔，與 NSC
+# 本體檔名無關的檔會被拒）。find 依舊非管線代入取自身狀態（POSIX 賦值狀態＝
+# 最後管段，find 不得與 sort 同管），fail-closed。
+NSC_LIST="$(find "$ROOT/app/src" -type f -name '*network*security*.xml')" ||
     fail 'network security config scan failed'
 [ -n "$NSC_LIST" ] || fail 'missing network_security_config.xml under app/src'
 [ -f "$ROOT/app/src/main/res/xml/network_security_config.xml" ] ||
@@ -138,13 +194,14 @@ python3 "$SCRIPT_DIR/backup_rules_check.py" \
 # 缺任一即 fail；flavor overlay「有設則必須等值」（省略屬性＝合併沿用 main 值，
 # 合法）。此綁定同時封死「rebind 到其他資源逃過驗證」的路徑：屬性只能指向
 # @xml/backup_rules / @xml/data_extraction_rules，而這兩個檔名形態已被上方與
-# 深掃逐一驗證。
+# 深掃逐一驗證。overlay manifest 缺檔不得被靜默跳過（`|| continue` 曾讓
+# missing flavor manifest 使整段 overlay 綁定驗證靜默失效＝fail-open）。
 MAIN_MANIFEST="$ROOT/app/src/main/AndroidManifest.xml"
-[ -f "$MAIN_MANIFEST" ] || fail "missing $MAIN_MANIFEST"
+[ -f "$MAIN_MANIFEST" ] || fail "missing manifest: $MAIN_MANIFEST"
 python3 "$SCRIPT_DIR/backup_rules_check.py" --check-manifest --require-both "$MAIN_MANIFEST"
 for m in "$ROOT"/app/src/*/AndroidManifest.xml; do
     case "$m" in "$ROOT/app/src/main/AndroidManifest.xml") continue ;; esac
-    [ -f "$m" ] || continue
+    [ -f "$m" ] || fail "missing manifest: $m"
     python3 "$SCRIPT_DIR/backup_rules_check.py" --check-manifest "$m"
 done
 # NSC 綁定縱深（attr↔resource）：上方的 source 級深掃只驗證了「存在的 NSC 檔」，
@@ -154,21 +211,22 @@ done
 # @xml/network_security_config（require-both：缺屬性即 fail），overlay「有設則
 # 必須等值」。校驗語義（merger markers、quote-tolerant）由 backup_rules_check
 # .validate_manifest 以屬性集參數統一實作，nsc_check.py 只傳入自己的綁定。
+# NSC 綁定 loop 同樣 fail-closed：缺 overlay manifest 即 FAIL，不得靜默略過。
 python3 "$SCRIPT_DIR/nsc_check.py" --check-manifest --require-both "$MAIN_MANIFEST"
 for m in "$ROOT"/app/src/*/AndroidManifest.xml; do
     case "$m" in "$ROOT/app/src/main/AndroidManifest.xml") continue ;; esac
-    [ -f "$m" ] || continue
+    [ -f "$m" ] || fail "missing manifest: $m"
     python3 "$SCRIPT_DIR/nsc_check.py" --check-manifest "$m"
 done
 
 # 縱深：掃描 app/src 下所有語意同形資源（檔名尾段含 backup*rules /
-# data_extraction*rules；未來 flavor overlay 以別名新增／覆寫 backup rules
-# 時也不能漏驗——精確檔名比對曾讓 overlay 逃過整段驗證）。main 兩檔已由
-# 上方固定路徑檢查，此處重複驗證無害。find 失敗不可靜默：POSIX 管道無
-# pipefail，assignment 的狀態取自最後一個管段（sort），故 find 不得與
-# sort 同管——先以非管道代入取 find 自身狀態（fail-closed），再由近乎
-# 不會失敗的 printf|sort 做排序。
-BACKUP_RULES_LIST="$(find "$ROOT/app/src" -type f \( -name '*backup*rules*.xml' -o -name '*data_extraction*rules*.xml' \) )" ||
+# data_extraction*rules；P2-1 深掃再吞 dash 拼法——data-extraction-rules.xml
+# 這種下劃線↔連字號別名過去的精確比對會漏掃，等於 overlay 以 dash 別名新增
+# backup rules 時整段驗證可被跳過）。main 兩檔已由上方固定路徑檢查，此處
+# 重複驗證無害。find 失敗不可靜默：POSIX 管道無 pipefail，assignment 的狀態
+# 取自最後一個管段（sort），故 find 不得與 sort 同管——先以非管道代入取
+# find 自身狀態（fail-closed），再由近不會失敗的 printf|sort 做排序。
+BACKUP_RULES_LIST="$(find "$ROOT/app/src" -type f \( -name '*backup*rules*.xml' -o -name '*data_extraction*rules*.xml' -o -name '*data-extraction*rules*.xml' \) )" ||
     fail 'deep-scan of backup rules resources failed'
 BACKUP_RULES_FILES="$(printf '%s\n' "$BACKUP_RULES_LIST" | sort)"
 while IFS= read -r f; do
@@ -176,6 +234,7 @@ while IFS= read -r f; do
     case "$f" in
         *backup*rules*.xml) broot=full-backup-content ;;
         *data_extraction*rules*.xml) broot=data-extraction-rules ;;
+        *data-extraction*rules*.xml) broot=data-extraction-rules ;;
         *) continue ;;
     esac
     python3 "$SCRIPT_DIR/backup_rules_check.py" --expect-root "$broot" "$f"

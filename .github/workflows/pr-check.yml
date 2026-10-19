@@ -291,11 +291,20 @@ jobs:
       # (no Play/Foss DEX class-table policy). Both tools resolve from the
       # build-tools dir prepended to PATH above; a missing tool fails the
       # step (fail-closed), it can never be softly skipped.
+      #
+      # P2-1: the source-level COMMON manifest policy (backup_rules_check.py,
+      # the same structured CLI the shell gate runs per branch) also covers
+      # this lane - an SMS/all-files-access/VPN uses-permission re-declared
+      # in app/src/main or app/src/github without a tools:node="remove"
+      # marker must fail here too (BIND_ACCESSIBILITY_SERVICE is deliberately
+      # NOT in the common set: the github overlay legally declares the
+      # accessibility service).
       - name: Run Github Flavor Artifact Binding Check (mode-independent)
         run: |
           AAPT=$(command -v aapt)
           DEXDUMP=$(command -v dexdump)
           python3 scripts/apk_policy_inspect.py --mode github --apk app/build/outputs/apk/github/debug/app-github-debug.apk --aapt "$AAPT" --dexdump "$DEXDUMP"
+          python3 scripts/backup_rules_check.py --check-permission-removals "SEND_SMS,RECEIVE_SMS,READ_SMS,MANAGE_EXTERNAL_STORAGE,BIND_VPN_SERVICE" app/src/main/AndroidManifest.xml app/src/github/AndroidManifest.xml
 
       - name: Upload Debug APKs
         if: success()

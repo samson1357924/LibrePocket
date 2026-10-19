@@ -293,7 +293,14 @@ class ApkPolicyHarness(unittest.TestCase):
             "  hang) sleep 30 ;;\n"
             "esac\n"
             "case \"${1:-} ${2:-}\" in\n"
-            "  'dump permissions') printf '%s\\n' 'package:dev.librepocket.agent' ;;\n"
+            "  'dump permissions')\n"
+            "    printf '%s\\n' 'package:dev.librepocket.agent'\n"
+            "    # FAKE_AAPT_PERMISSIONS: comma-separated uses-permission token\n"
+            "    # names appended in the measured aapt dump spelling, used by the\n"
+            "    # common/play permission-policy negative fixtures only.\n"
+            "    for token in $(echo \"${FAKE_AAPT_PERMISSIONS:-}\" | tr ',' ' '); do\n"
+            "      printf '%s\\n' \"uses-permission: android.permission.${token}\"\n"
+            "    done ;;\n"
             "  'dump xmltree')\n"
             "    if [ \"${4:-}\" = \"res/xml/network_security_config.xml\" ]; then\n"
             "      # Compiled-NSC fixtures mirror the real aapt v1 xmltree shape\n"
@@ -780,6 +787,40 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
             "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
             "            '    A: android:networkSecurityConfig(0x01010527)=\"@xml/network_security_config;\" (Raw: \"@xml/network_security_config;\")' ;;\n"
+            "        accessibility)\n"
+            "          # Legal foss/github overlay shape (mirrors the real overlay\n"
+            "          # manifests): a declared accessibility service carrying the\n"
+            "          # BIND_ACCESSIBILITY_SERVICE protection permission and the\n"
+            "          # accessibilityservice intent action/meta-data. The PLAY-ONLY\n"
+            "          # policy must reject this; the COMMON permission policy (foss\n"
+            "          # and github modes) must never trip on it.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: service (line=3)' \\\n"
+            "            '      A: android:name=\"dev.librepocket.foss.FossAccessibilityService\" (Raw: \"dev.librepocket.foss.FossAccessibilityService\")' \\\n"
+            "            '      A: android:permission=\"android.permission.BIND_ACCESSIBILITY_SERVICE\" (Raw: \"android.permission.BIND_ACCESSIBILITY_SERVICE\")' \\\n"
+            "            '      E: intent-filter (line=4)' \\\n"
+            "            '        E: action (line=5)' \\\n"
+            "            '          A: android:name=\"android.accessibilityservice.AccessibilityService\" (Raw: \"android.accessibilityservice.AccessibilityService\")' \\\n"
+            "            '      E: meta-data (line=6)' \\\n"
+            "            '        A: android:name=\"android.accessibilityservice\" (Raw: \"android.accessibilityservice\")' \\\n"
+            "            '        A: android:resource=\"@xml/accessibility_config\" (Raw: \"@xml/accessibility_config\")' ;;\n"
+            "        vpnservice)\n"
+            "          # A merged <service> ADVERTISING a VpnService subclass (the\n"
+            "          # android.net.VpnService intent action) WITHOUT the\n"
+            "          # BIND_VPN_SERVICE uses-permission. The COMMON policy must\n"
+            "          # fail every mode on this xmltree face alone.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: service (line=3)' \\\n"
+            "            '      A: android:name=\"dev.librepocket.github.VpnTunnel\" (Raw: \"dev.librepocket.github.VpnTunnel\")' \\\n"
+            "            '      E: intent-filter (line=4)' \\\n"
+            "            '        E: action (line=5)' \\\n"
+            "            '          A: android:name=\"android.net.VpnService\" (Raw: \"android.net.VpnService\")' ;;\n"
             "        *)  # bindings (the default, realistic merged manifest)\n"
             "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
             "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
@@ -847,6 +888,7 @@ class ApkPolicyHarness(unittest.TestCase):
         resources_mode: str = "table",
         nsc_mode: str = "ok",
         rules_mode: str = "ok",
+        permissions: str = "",
     ) -> dict[str, str]:
         env = os.environ.copy()
         env.update(
@@ -860,6 +902,7 @@ class ApkPolicyHarness(unittest.TestCase):
                 "FAKE_AAPT_RESOURCES": resources_mode,
                 "FAKE_AAPT_NSC": nsc_mode,
                 "FAKE_AAPT_RULES": rules_mode,
+                "FAKE_AAPT_PERMISSIONS": permissions,
                 "LC_ALL": "C",
             }
         )
@@ -877,6 +920,7 @@ class ApkPolicyHarness(unittest.TestCase):
         nsc_mode: str = "ok",
         rules_mode: str = "ok",
         sdk: Path | None = None,
+        permissions: str = "",
     ) -> subprocess.CompletedProcess[str]:
         command = ["sh", str(POLICY_CHECK)]
         if foss:
@@ -893,6 +937,7 @@ class ApkPolicyHarness(unittest.TestCase):
                 resources_mode=resources_mode,
                 nsc_mode=nsc_mode,
                 rules_mode=rules_mode,
+                permissions=permissions,
             ),
             text=True,
             stdout=subprocess.PIPE,
@@ -1283,12 +1328,14 @@ class ApkPolicyHarness(unittest.TestCase):
         xmltree_mode: str = "bindings",
         resources_mode: str = "table",
         nsc_mode: str = "ok",
+        permissions: str = "",
     ) -> subprocess.CompletedProcess[str]:
         env = self._env(
             rules_mode=rules_mode,
             xmltree_mode=xmltree_mode,
             resources_mode=resources_mode,
             nsc_mode=nsc_mode,
+            permissions=permissions,
         )
         return subprocess.run(
             [
@@ -1370,6 +1417,167 @@ class ApkPolicyHarness(unittest.TestCase):
         result = self._run_scanner_cli(apk, "githubx")
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("invalid choice", result.stderr)
+
+    # -- common flavor permission policy (P2-1, enforced BEFORE the mode split) --
+
+    def test_common_forbidden_permissions_rejected_in_every_mode(self) -> None:
+        # The locked flavor decision (app/src/foss + app/src/github overlay
+        # headers): NO SMS, NO MANAGE_EXTERNAL_STORAGE, NO VPN in any flavor.
+        # A uses-permission line for each COMMON token must fail the gate in
+        # play, foss AND github lanes (github previously early-returned with
+        # zero permission scanning).
+        apk = complete_apk(
+            self.tmp / "common-perm.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for token in policy_inspect.COMMON_FORBIDDEN_PERMISSIONS:
+            for mode in ("play", "foss", "github"):
+                with self.subTest(token=token, mode=mode):
+                    if mode == "github":
+                        result = self._run_scanner_cli(apk, "github", permissions=token)
+                        output = result.stdout + result.stderr
+                    elif mode == "foss":
+                        result = self.run_policy(apk, foss=True, permissions=token)
+                        # run_policy merges stderr into stdout.
+                        output = result.stdout
+                    else:
+                        result = self.run_policy(apk, permissions=token)
+                        output = result.stdout
+                    self.assertNotEqual(
+                        result.returncode,
+                        0,
+                        f"{mode} mode accepted forbidden {token}:\n{output}",
+                    )
+                    self.assertIn(
+                        f"declares forbidden permission/reference {token}",
+                        output,
+                    )
+
+    def test_common_check_scans_the_xmltree_face_for_permission_tokens(self) -> None:
+        # Direct function-level matrix: the token scan covers BOTH surfaces
+        # the play scan consumes (permissions dump + merged xmltree); the
+        # VPN xmltree reference ("vpnservice") is caught even without the
+        # BIND_VPN_SERVICE uses-permission token.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            r"forbidden permission/reference SEND_SMS",
+        ):
+            policy_inspect._check_common_permissions(
+                "",
+                'A: android:name="android.permission.SEND_SMS"',
+            )
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            r"forbidden permission/reference MANAGE_EXTERNAL_STORAGE",
+        ):
+            policy_inspect._check_common_permissions(
+                "uses-permission: android.permission.MANAGE_EXTERNAL_STORAGE\n",
+                "  E: manifest\n",
+            )
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, r"registers a VpnService"
+        ):
+            policy_inspect._check_common_permissions(
+                "",
+                'E: intent-filter\n'
+                '  A: android:name="android.net.VpnService"',
+            )
+
+    def test_github_mode_fails_on_common_permission_only(self) -> None:
+        # The asymmetry-fix core proof: a github-mode APK whose ONLY policy
+        # problem is the COMMON token scan still fails - the common check
+        # must execute upstream of the github early-return (which used to
+        # run no permission scan at all).
+        apk = complete_apk(
+            self.tmp / "github-only-common.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self._run_scanner_cli(apk, "github", permissions="RECEIVE_SMS")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "declares forbidden permission/reference RECEIVE_SMS", result.stderr
+        )
+        self.assertNotIn("policy: github OK", result.stdout)
+
+    def test_vpn_service_reference_rejected_by_common_check(self) -> None:
+        # A bare VpnService-declaring <service> in the merged xmltree (the
+        # android.net.VpnService intent action, no uses-permission token in
+        # the permissions dump) must fail the COMMON policy - in github mode,
+        # without requiring any DEX parse.
+        dex = minimal_dex(type_descriptors=("Ljava/lang/Object;",))
+        apk = complete_apk(self.tmp / "github-vpn-service.apk", dex)
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="vpnservice", permissions=""
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        # Policy message may carry either the vpn-ref shape; the common
+        # scanner asserts the dedicated VpnService wording.
+        self.assertIn("registers a VpnService", result.stderr)
+        # Pre-mode-split routing: foss and play must fail the same shape
+        # too (the old play-only regex is gone; the common check is the
+        # only vpnservice xmltree authority).
+        result = self.run_policy(
+            apk, foss=True, xmltree_mode="vpnservice", permissions=""
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("registers a VpnService", result.stdout)
+
+    def test_accessibility_token_stays_play_only(self) -> None:
+        # Positive controls pinning accessibility legality: a merged manifest
+        # carrying android.permission.BIND_ACCESSIBILITY_SERVICE (both as a
+        # uses-permission token AND as the service's protection permission)
+        # plus an accessibilityservice xmltree declaration must PASS the foss
+        # and github lanes and FAIL the play lane, pinning that the COMMON
+        # set never grows an a11y token.
+        dex = minimal_dex(
+            type_descriptors=("Ljava/lang/Object;",),
+            class_definitions=(
+                ("Ldev/librepocket/foss/FossAccessibilityService;", None),
+            ),
+        )
+        apk = complete_apk(self.tmp / "a11y-legal.apk", dex)
+        for mode in ("github", "foss"):
+            with self.subTest(legal_mode=mode):
+                if mode == "github":
+                    result = self._run_scanner_cli(
+                        apk,
+                        "github",
+                        xmltree_mode="accessibility",
+                        permissions="BIND_ACCESSIBILITY_SERVICE",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                    self.assertIn("policy: github OK", result.stdout)
+                else:
+                    result = self.run_policy(
+                        apk,
+                        foss=True,
+                        xmltree_mode="accessibility",
+                        permissions="BIND_ACCESSIBILITY_SERVICE",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout)
+        with self.subTest(play_still_forbids="BIND_ACCESSIBILITY_SERVICE"):
+            result = self.run_policy(
+                apk, xmltree_mode="accessibility", permissions="BIND_ACCESSIBILITY_SERVICE"
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            # In play mode the token surfaces through the permissions dump
+            # (the play-only scan worded below); the a11y service-token
+            # message rides the same lane when only the xmltree face
+            # carries it.
+            self.assertIn(
+                "declares forbidden permission/reference BIND_ACCESSIBILITY_SERVICE",
+                result.stdout,
+            )
+
+    def test_common_permissions_function_accepts_accessibility_surface(self) -> None:
+        # Function-level control for the same asymmetric contract: the a11y
+        # token (permission dump or xmltree spelling) must NEVER trip the
+        # COMMON checker.
+        policy_inspect._check_common_permissions(
+            "uses-permission: android.permission.BIND_ACCESSIBILITY_SERVICE\n",
+            'E: service\n'
+            '  A: android:name="android.accessibilityservice.AccessibilityService"\n',
+        )
 
     # -- merged-manifest networkSecurityConfig binding (artifact authority) --
 
@@ -3845,19 +4053,31 @@ class BackupRulesGateWiring(unittest.TestCase):
         # grep -vE filter (a legal multi-line element with tools:node on
         # its own line false-FAILED it). The marker machinery rides the
         # same script entry that already validates manifest bindings.
+        # P2-1 round 2: the scan is now fed from a per-mode dispatch that
+        # maps EVERY flavor to its blacklist + overlay pair; the play
+        # branch keeps the full six-token CSV (common + play-only a11y).
         text = POLICY_CHECK.read_text(encoding="utf-8")
         self.assertIn(
-            '--check-permission-removals "$BLACKLIST_PERMS_CSV"', text
+            '--check-permission-removals "$PERM_TOKENS"', text
         )
-        # Scoped to the PLAY mode source manifests (main + play flavor),
-        # each guarded for existence.
+        # The play branch of the dispatch must keep the full-play token set
+        # and the play overlay dir (a11y-token enforcement stays here).
         self.assertRegex(
             text,
-            r'if \[ "\$MODE" = play \]; then\n'
-            r'    for m in "\$ROOT/app/src/main/AndroidManifest\.xml"'
-            r' "\$ROOT/app/src/play/AndroidManifest\.xml"; do\n'
-            r'        \[ -f "\$m" \] \|\| continue\n'
-            r'        python3 "\$SCRIPT_DIR/backup_rules_check\.py" \\',
+            r'    play\)\n'
+            r'        PERM_TOKENS="\$BLACKLIST_PERMS_CSV"\n'
+            r'        FLAVOR_DIR="play"\n'
+            r'        ;;\n',
+        )
+        # One structured scanner loop over main + the mode's OWN overlay;
+        # a missing manifest FAILS the gate named (see the dedicated
+        # fail-closed pin), it is never silently skipped.
+        self.assertRegex(
+            text,
+            r'for m in "\$ROOT/app/src/main/AndroidManifest\.xml"'
+            r' "\$ROOT/app/src/\$FLAVOR_DIR/AndroidManifest\.xml"; do\n'
+            r'    \[ -f "\$m" \] \|\| fail "missing manifest: \$m"\n'
+            r'    python3 "\$SCRIPT_DIR/backup_rules_check\.py" \\',
         )
         # The retired enforcer must be gone from EXECUTED script text (the
         # documentation comment quoting `grep -vE "tools:node=..."` stays as
@@ -3866,6 +4086,141 @@ class BackupRulesGateWiring(unittest.TestCase):
             if line.lstrip().startswith("#"):
                 continue
             self.assertNotIn("grep -vE", line, line)
+
+    def test_gate_enforces_common_blacklist_in_every_mode(self) -> None:
+        # P2-1 locked decision enforced at the shell layer: the COMMON
+        # blacklist (NO SMS / MANAGE_EXTERNAL_STORAGE / VPN) runs in EVERY
+        # branch - the foss lane previously only grepped proprietary
+        # needles and the github lane did not exist at all. The dispatch
+        # maps play -> full six-token CSV, foss/github -> common five
+        # tokens; the a11y token must NEVER join the common set (the foss
+        # and github overlays legally declare accessibility services).
+        text = POLICY_CHECK.read_text(encoding="utf-8")
+        self.assertIn(
+            'BLACKLIST_PERMS="SEND_SMS RECEIVE_SMS READ_SMS'
+            ' MANAGE_EXTERNAL_STORAGE BIND_ACCESSIBILITY_SERVICE BIND_VPN_SERVICE"\n',
+            text,
+        )
+        self.assertIn(
+            'COMMON_BLACKLIST_PERMS="SEND_SMS RECEIVE_SMS READ_SMS'
+            ' MANAGE_EXTERNAL_STORAGE BIND_VPN_SERVICE"\n',
+            text,
+        )
+        common_match = re.search(r'COMMON_BLACKLIST_PERMS="([^"]*)"', text)
+        self.assertIsNotNone(common_match, text)
+        common_tokens = common_match.group(1).split()
+        self.assertNotIn("BIND_ACCESSIBILITY_SERVICE", common_tokens)
+        # Cross-face drift guard: the shell common set must equal the
+        # python scanner's COMMON_FORBIDDEN_PERMISSIONS tuple exactly -
+        # either face drifting alone would reopen the flavor asymmetry
+        # this gate just closed.
+        self.assertEqual(
+            set(common_tokens),
+            set(policy_inspect.COMMON_FORBIDDEN_PERMISSIONS),
+        )
+        # Exact per-mode mapping (missing github branch here would mean
+        # the P2-1 shell gap reopened).
+        self.assertIn(
+            'case "$MODE" in\n'
+            '    play)\n'
+            '        PERM_TOKENS="$BLACKLIST_PERMS_CSV"\n'
+            '        FLAVOR_DIR="play"\n'
+            '        ;;\n'
+            '    foss)\n'
+            '        PERM_TOKENS="$COMMON_BLACKLIST_PERMS_CSV"\n'
+            '        FLAVOR_DIR="foss"\n'
+            '        ;;\n'
+            '    github)\n'
+            '        PERM_TOKENS="$COMMON_BLACKLIST_PERMS_CSV"\n'
+            '        FLAVOR_DIR="github"\n'
+            '        ;;\n'
+            '    *)\n'
+            '        fail "unknown mode: $MODE"\n'
+            '        ;;\n'
+            'esac\n',
+            text,
+        )
+        # The workflow's github assembly step must call the SAME common
+        # five-token source scan (it is the only github-facing
+        # element-level check on a plain scanner/scripts diff, so the
+        # yml text itself gets a literal pin - otherwise the claim above
+        # is manually verifiable only).
+        workflow = PR_CHECK_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            'backup_rules_check.py --check-permission-removals '
+            '"SEND_SMS,RECEIVE_SMS,READ_SMS,MANAGE_EXTERNAL_STORAGE,'
+            'BIND_VPN_SERVICE" app/src/main/AndroidManifest.xml '
+            'app/src/github/AndroidManifest.xml',
+            workflow,
+        )
+
+    def test_gate_missing_manifest_fails_closed_not_skipped(self) -> None:
+        # The retired `[ -f "$m" ] || continue` turned a vanishing flavor
+        # overlay into a silently ABSENT structured permission scan
+        # (fail-open). Every existence guard in executed text must fail
+        # the gate with a named path; only the while-read blank-line
+        # guards (`[ -n ... ] || continue`) legitimately keep skipping.
+        text = POLICY_CHECK.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            self.assertNotRegex(
+                line, r'\[ -f [^]]*\] \|\| continue', line
+            )
+        # Named-path failures are the expected shape everywhere a
+        # structured manifest/resource check is fed.
+        self.assertGreaterEqual(
+            text.count('|| fail "missing manifest:'), 5, text
+        )
+        self.assertIn('[ -f "$m" ] || fail "missing manifest: $m"', text)
+
+    def test_gate_cleartext_scan_is_quote_and_rc_honest(self) -> None:
+        # The raw cleartext scan must observe POSIX grep marking instead
+        # of piping through `grep -q .` behind `2>/dev/null` (which
+        # swallowed rc 2 = unreadable subtree, a fail-open). Both legal
+        # spelling variants (single quotes, whitespace around "=") are in
+        # the pattern, and the rc case disposes 0/1/* explicitly.
+        text = POLICY_CHECK.read_text(encoding="utf-8")
+        grep_line = next(
+            line for line in text.splitlines() if "usesCleartextTraffic" in line
+        )
+        self.assertIn("|| cleartext_rc=$?", grep_line, grep_line)
+        # The aapt-facing pattern carries the escaped double quote inside the
+        # shell double-quoted string: [\"']true.
+        self.assertIn(
+            "usesCleartextTraffic[[:space:]]*=[[:space:]]*[\\\"']true",
+            grep_line,
+            grep_line,
+        )
+        # The retired stderr discard must stay retired on the scan line.
+        self.assertNotIn("2>/dev/null", grep_line, grep_line)
+        self.assertIn(
+            'case "$cleartext_rc" in\n'
+            "    0) fail 'cleartext explicitly enabled somewhere under app/src' ;;\n"
+            "    1) : ;;\n"
+            "    *) fail 'cleartext scan failed (grep filesystem error under app/src)' ;;\n"
+            "esac",
+            text,
+        )
+
+    def test_gate_deep_scans_alias_rule_names(self) -> None:
+        # P2-1 deep-scan widening: a rules resource may be added under a
+        # dash spelling (data-extraction-rules.xml) and an NSC alias
+        # without the "config" segment (network-security.xml); the
+        # exact-name finds ignored both, so an overlay could ship an
+        # unvalidated resource under those names. The widened name sets
+        # ride the same guarded finds, and the case dispatch binds the
+        # new dash shape to the true data-extraction-rules root.
+        text = POLICY_CHECK.read_text(encoding="utf-8")
+        self.assertIn("-name '*data-extraction*rules*.xml'", text)
+        self.assertIn(
+            "*data-extraction*rules*.xml) broot=data-extraction-rules ;;", text
+        )
+        nsc_line = next(line for line in text.splitlines() if "NSC_LIST=" in line)
+        self.assertIn("-name '*network*security*.xml'", nsc_line, nsc_line)
+        # The retired narrower NSC name must be gone entirely (no
+        # half-widened find quietly left behind).
+        self.assertNotIn("-name '*network*security*config*.xml'", text)
 
 
 class NscCheckValidator(unittest.TestCase):
@@ -5008,6 +5363,23 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             "</manifest>\n",
             encoding="utf-8",
         )
+        # P2-1 round 2: every flavor lane scans main + ITS OWN overlay
+        # manifest fail-closed (missing overlay = FAIL, never skip), so the
+        # sandbox ships a legal minimal overlay per flavor. Each carries an
+        # <application> with NO pinned attrs: enforcement is
+        # equality-when-set, absence legally inherits main's bindings. (The
+        # real overlays additionally declare the accessibility service via an
+        # android:permission attribute - orthogonal to this gate's checks.)
+        for flavor in ("play", "foss", "github"):
+            (root / "app" / "src" / flavor).mkdir(parents=True, exist_ok=True)
+            (
+                root / "app" / "src" / flavor / "AndroidManifest.xml"
+            ).write_text(
+                '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                '    <application android:allowBackup="true" />\n'
+                "</manifest>\n",
+                encoding="utf-8",
+            )
         (main_res / "network_security_config.xml").write_text(
             '<network-security-config>\n'
             '    <base-config cleartextTrafficPermitted="false" />\n'
@@ -5049,7 +5421,9 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
         )
         return root
 
-    def _run_gate(self, tree_root: "Path") -> subprocess.CompletedProcess:
+    def _run_gate(
+        self, tree_root: "Path", *mode_flags: str
+    ) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         env["ANDROID_HOME"] = str(tree_root / "no-such-sdk")
         env.pop("ANDROID_SDK_ROOT", None)
@@ -5062,11 +5436,32 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
         dummy = tree_root / "dummy.apk"
         dummy.write_bytes(b"PK\x03\x04truncated-not-a-real-apk")
         return subprocess.run(
-            ["sh", str(tree_root / "scripts" / "play_policy_check.sh"), str(dummy)],
+            [
+                "sh",
+                str(tree_root / "scripts" / "play_policy_check.sh"),
+                *mode_flags,
+                str(dummy),
+            ],
             capture_output=True,
             text=True,
             env=env,
             cwd=str(tree_root),
+        )
+
+    def _assert_source_stage_clean_then_tool_stage_failure(
+        self, proc: subprocess.CompletedProcess
+    ) -> None:
+        # After a clean source stage the run must still fail in the
+        # tool/artifact stage: CI has no build-tools ("required Android
+        # build-tools"), a dev environment may expose them and then trip
+        # the dummy-APK ZIP parse instead. Either marker proves only the
+        # late stage fired; every source-stage FAIL must have stayed
+        # absent (callers assert those individually first).
+        self.assertNotEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(
+            "required Android build-tools" in proc.stderr
+            or "ZIP structure" in proc.stderr,
+            proc.stderr,
         )
 
     def test_valid_tree_source_stage_passes(self) -> None:
@@ -5212,15 +5607,23 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             finally:
                 locked.chmod(0o755)  # let TemporaryDirectory clean up
             self.assertEqual(proc.returncode, 1, proc.stderr)
-            # The unreadable subtree trips the FIRST fail-closed scan guard;
-            # since the NSC pin also scans app/src with a guarded find, the
-            # surfaced message may be either scan - what must hold is that a
-            # find failure produces a named-scan FAIL (never silent progress),
-            # and no later-stage message can follow.
+            # The unreadable subtree trips the FIRST fail-closed scan guard
+            # reachable: since the rc-honest cleartext rewrite, that guard is
+            # the grep rc case (rc >= 2 = filesystem error, named fail); the
+            # NSC/deep-scan guarded finds would fire the same way if the run
+            # got that far. What must hold: a scan failure produces a
+            # named-scan FAIL (never silent progress), and no later-stage
+            # message can follow.
             self.assertIn("scan failed", proc.stderr)
             self.assertTrue(
-                "deep-scan of backup rules resources failed" in proc.stderr
-                or "network security config scan failed" in proc.stderr,
+                any(
+                    marker in proc.stderr
+                    for marker in (
+                        "cleartext scan failed (grep filesystem error under app/src)",
+                        "deep-scan of backup rules resources failed",
+                        "network security config scan failed",
+                    )
+                ),
                 proc.stderr,
             )
             self.assertNotIn("expected root", proc.stderr, proc.stderr)
@@ -5541,6 +5944,227 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             self.assertIn('without tools:node="remove"', proc.stderr)
             self.assertIn("SEND_SMS", proc.stderr)
             self.assertNotIn("required Android build-tools", proc.stderr)
+
+    # -- P2-1 通行黑名單 lanes（common policy + fail-closed wiring round 2）--
+
+    def test_missing_flavor_manifest_fails_named_not_skipped(self) -> None:
+        # The retired `[ -f "$m" ] || continue`: a vanishing overlay made the
+        # whole structured permission stage silently ABSENT (and even the
+        # explicit-glob binding loops cannot see a nonexistent file, so the
+        # gate would green-light the flavor end-to-end). Every lane must now
+        # FAIL naming the path, before any tool/artifact stage.
+        for mode_flags, flavor in (
+            ((), "play"),  # default lane
+            (("--github",), "github"),
+            (("--foss",), "main"),
+        ):
+            with self.subTest(mode=mode_flags, flavor=flavor):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = self._minimal_tree(tmp)
+                    (
+                        root / "app" / "src" / flavor / "AndroidManifest.xml"
+                    ).unlink()
+                    proc = self._run_gate(root, *mode_flags)
+                    self.assertEqual(proc.returncode, 1, proc.stderr)
+                    self.assertIn("missing manifest:", proc.stderr)
+                    self.assertIn(
+                        f"app/src/{flavor}/AndroidManifest.xml", proc.stderr
+                    )
+                    # Failed at the named guard, not later: no tool-stage
+                    # message may follow (androidx/tools errors would betray
+                    # a silently-continued scan).
+                    self.assertNotIn("required Android build-tools", proc.stderr)
+                    self.assertNotIn("blacklisted permission", proc.stderr)
+
+    def test_github_lane_rejects_unmarked_common_permission(self) -> None:
+        # The new github shell lane: an unmarked COMMON token (SEND_SMS) in
+        # the github overlay must fail `--github` via the structured scan at
+        # the source stage - the lane previously did not exist, so this
+        # shape shipped unscanned. The foss lane (previously only grepping
+        # proprietary needles) is pinned to the same common token set.
+        for mode_flags, overlay, token in (
+            (("--github",), "github", "SEND_SMS"),
+            (("--foss",), "foss", "READ_SMS"),
+        ):
+            with self.subTest(mode=mode_flags, overlay=overlay, token=token):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = self._minimal_tree(tmp)
+                    overlay_manifest = (
+                        root / "app" / "src" / overlay / "AndroidManifest.xml"
+                    )
+                    overlay_manifest.write_text(
+                        '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                        '    <application android:allowBackup="true" />\n'
+                        f'    <uses-permission android:name="android.permission.{token}" />\n'
+                        "</manifest>\n",
+                        encoding="utf-8",
+                    )
+                    proc = self._run_gate(root, *mode_flags)
+                    self.assertEqual(proc.returncode, 1, proc.stderr)
+                    self.assertIn(
+                        f"blacklisted permission {token}", proc.stderr
+                    )
+                    self.assertIn('without tools:node="remove"', proc.stderr)
+                    self.assertNotIn("required Android build-tools", proc.stderr)
+
+    def test_github_lane_accepts_marked_removal_and_clean_overlay(self) -> None:
+        # Positive control for the new lane with merger machinery: a github
+        # overlay that marks SEND_SMS with tools:node="remove" (deleting a
+        # lower-priority declaration in the merged artifact) must pass every
+        # source-stage check; the run then reaches the artifact/tool stage -
+        # no permission/binding/deep-scan FAIL may surface first.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            (root / "app" / "src" / "github" / "AndroidManifest.xml").write_text(
+                '<manifest xmlns:android="http://schemas.android.com/apk/res/android"'
+                ' xmlns:tools="http://schemas.android.com/tools">\n'
+                '    <application android:allowBackup="true" />\n'
+                '    <uses-permission android:name="android.permission.SEND_SMS"'
+                ' tools:node="remove" />\n'
+                "</manifest>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root, "--github")
+            self.assertNotIn("blacklisted permission", proc.stderr, proc.stderr)
+            self.assertNotIn("missing manifest", proc.stderr, proc.stderr)
+            self.assertNotIn("expected root", proc.stderr, proc.stderr)
+            self._assert_source_stage_clean_then_tool_stage_failure(proc)
+
+    def test_cleartext_scan_matches_all_legal_spellings(self) -> None:
+        # Quote/space-tolerant + rc-honest raw scan: single-quoted values and
+        # whitespace around "=" are legal XML attribute spellings that the
+        # retired double-quote-only grep PASSed. Every variant must fail the
+        # gate at the scan step; only a "false" spelling must never trip it.
+        for label, snippet in (
+            ("double-quoted", '    <application android:usesCleartextTraffic="true" />\n'),
+            (
+                "single-quoted-spaced",
+                "    <application android:usesCleartextTraffic = 'true' />\n",
+            ),
+        ):
+            with self.subTest(label=label, snippet=snippet):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = self._minimal_tree(tmp)
+                    notes = root / "app" / "src" / "github" / "res" / "values"
+                    notes.mkdir(parents=True)
+                    (notes / "legacy_notes.xml").write_text(
+                        '<?xml version="1.0" encoding="utf-8"?>\n'
+                        "<resources>\n"
+                        f"{snippet}"
+                        "</resources>\n",
+                        encoding="utf-8",
+                    )
+                    proc = self._run_gate(root)
+                    self.assertEqual(proc.returncode, 1, proc.stderr)
+                    self.assertIn(
+                        "cleartext explicitly enabled somewhere under app/src",
+                        proc.stderr,
+                    )
+                    self.assertNotIn("required Android build-tools", proc.stderr)
+        # rc-honesty + quote-tolerance NEGATIVE control: an enforced-false
+        # spelling in any quoting must sail past the scan step (its failure
+        # is later, at the tool stage).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            notes = root / "app" / "src" / "github" / "res" / "values"
+            notes.mkdir(parents=True)
+            (notes / "legacy_notes.xml").write_text(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                "<resources>\n"
+                "    <application android:usesCleartextTraffic = 'false' />\n"
+                "</resources>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertNotIn("cleartext", proc.stderr, proc.stderr)
+            self._assert_source_stage_clean_then_tool_stage_failure(proc)
+
+    def test_dash_alias_rules_files_are_deep_scanned(self) -> None:
+        # P2-1 deep-scan widening: overlay rules resources spelled with a
+        # DASH (data-extraction-rules.xml) were invisible to the retired
+        # exact-name find, so an overlay could ship an unvalidated rules
+        # file under that alias. The widened find must validate it with the
+        # data-extraction-rules root binding; a wrong-root alias fails at
+        # the deep-scan stage, a correct one passes (legal new shape).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            res = root / "app" / "src" / "github" / "res" / "xml"
+            res.mkdir(parents=True)
+            (res / "data-extraction-rules.xml").write_text(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                "<full-backup-content>\n"
+                '    <exclude domain="sharedpref" path="bait.xml" />\n'
+                "</full-backup-content>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("expected root <data-extraction-rules>", proc.stderr)
+            self.assertNotIn("required Android build-tools", proc.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            res = root / "app" / "src" / "foss" / "res" / "xml"
+            res.mkdir(parents=True)
+            (res / "data-extraction-rules.xml").write_text(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                "<data-extraction-rules>\n"
+                "    <cloud-backup>\n"
+                '        <exclude domain="sharedpref" path="librepocket_keys.xml" />\n'
+                '        <exclude domain="database" path="librepocket_vault" />\n'
+                '        <exclude domain="database" path="librepocket_vault-wal" />\n'
+                '        <exclude domain="database" path="librepocket_vault-shm" />\n'
+                '        <exclude domain="file" path="librepocket_keysets" />\n'
+                "    </cloud-backup>\n"
+                "    <device-transfer>\n"
+                '        <exclude domain="sharedpref" path="librepocket_keys.xml" />\n'
+                '        <exclude domain="database" path="librepocket_vault" />\n'
+                '        <exclude domain="database" path="librepocket_vault-wal" />\n'
+                '        <exclude domain="database" path="librepocket_vault-shm" />\n'
+                '        <exclude domain="file" path="librepocket_keysets" />\n'
+                "    </device-transfer>\n"
+                "</data-extraction-rules>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertNotIn("expected root", proc.stderr, proc.stderr)
+            self.assertNotIn("deep-scan", proc.stderr, proc.stderr)
+            self._assert_source_stage_clean_then_tool_stage_failure(proc)
+
+    def test_nsc_alias_without_config_segment_is_deep_scanned(self) -> None:
+        # The NSC deep scan was widened from the exact
+        # *network*security*config* name shape to *network*security*: an
+        # overlay naming its network-security resource WITHOUT the "config"
+        # segment (network-security.xml) used to escape every validation.
+        # The alias must reach nsc_check.py now, and a wrong root must fail
+        # the gate; the correctly-shaped dash alias passes (name widening
+        # can only add files to the scan, never loosen the root/shape
+        # judgement nsc_check independently applies).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            res = root / "app" / "src" / "foss" / "res" / "xml"
+            res.mkdir(parents=True)
+            (res / "network-security.xml").write_text(
+                "<resources>\n</resources>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("expected root <network-security-config>", proc.stderr)
+            self.assertNotIn("required Android build-tools", proc.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            res = root / "app" / "src" / "github" / "res" / "xml"
+            res.mkdir(parents=True)
+            (res / "network-security-config.xml").write_text(
+                "<network-security-config>\n"
+                '    <base-config cleartextTrafficPermitted="false" />\n'
+                "</network-security-config>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertNotIn("expected root", proc.stderr, proc.stderr)
+            self.assertNotIn("network security", proc.stderr, proc.stderr)
+            self._assert_source_stage_clean_then_tool_stage_failure(proc)
 
 
 if __name__ == "__main__":

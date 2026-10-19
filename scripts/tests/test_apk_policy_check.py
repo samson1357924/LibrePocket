@@ -34,12 +34,42 @@ from unittest import mock
 
 from scripts import apk_policy_inspect as policy_inspect
 from scripts import backup_rules_check
+from scripts import nsc_check
 
 ROOT = Path(__file__).resolve().parents[2]
 POLICY_CHECK = ROOT / "scripts" / "play_policy_check.sh"
 BUILD_RELEASE = ROOT / "scripts" / "build_release.sh"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 PR_CHECK_WORKFLOW = ROOT / ".github" / "workflows" / "pr-check.yml"
+
+# Optional live-artifact control target: the locally produced debug APK. CI
+# unittest runners have no build outputs and no SDK, so those controls skip.
+_REAL_DEBUG_APK = (
+    ROOT / "app" / "build" / "outputs" / "apk" / "play" / "debug" / "app-play-debug.apk"
+)
+
+
+def _discover_real_aapt() -> str | None:
+    """Find a REAL aapt executable for the optional live-artifact controls.
+
+    Probes ANDROID_HOME then the conventional $HOME/Android/Sdk layout for the
+    newest build-tools directory carrying an executable aapt. Never returns a
+    fake/harness tool: only a real executable counts.
+    """
+    candidates = []
+    android_home = os.environ.get("ANDROID_HOME")
+    if android_home:
+        candidates.append(Path(android_home) / "build-tools")
+    home_sdk = Path(os.environ.get("HOME", "")) / "Android" / "Sdk" / "build-tools"
+    candidates.append(home_sdk)
+    for build_tools in candidates:
+        if not build_tools.is_dir():
+            continue
+        for version_dir in sorted(build_tools.iterdir(), reverse=True):
+            aapt = version_dir / "aapt"
+            if aapt.is_file() and os.access(aapt, os.X_OK):
+                return str(aapt)
+    return None
 
 _FORBIDDEN_FOSS_TYPE = "Lcom/google/mlkit/Recognizer;"
 _SUPPORTED_DEX_VERSIONS = ("035", "037", "038", "039", "040")
@@ -243,11 +273,14 @@ class ApkPolicyHarness(unittest.TestCase):
         self._write_dexdump()
 
     def _write_aapt(self) -> None:
-        # The default xmltree is a merged manifest that CARRIES the backup
-        # bindings: apk_policy_inspect asserts the merged <application> keeps
-        # android:fullBackupContent / android:dataExtractionRules (artifact-
-        # level authority), so a fixture without them would be a rejection
-        # specimen now. FAKE_AAPT_XMLTREE selects negative/stripped shapes.
+        # The default xmltree is a merged manifest that CARRIES the backup AND
+        # networkSecurityConfig bindings: apk_policy_inspect asserts the merged
+        # <application> keeps android:fullBackupContent /
+        # android:dataExtractionRules / android:networkSecurityConfig
+        # (artifact-level authority), so a fixture without them would be a
+        # rejection specimen now. FAKE_AAPT_XMLTREE selects negative/stripped
+        # shapes; FAKE_AAPT_NSC selects the compiled-NSC dump shape, dispatched
+        # on $4 exactly like the real aapt invocation pairs.
         aapt = self.build_tools / "aapt"
         aapt.write_text(
             "#!/bin/sh\n"
@@ -260,43 +293,214 @@ class ApkPolicyHarness(unittest.TestCase):
             "case \"${1:-} ${2:-}\" in\n"
             "  'dump permissions') printf '%s\\n' 'package:dev.librepocket.agent' ;;\n"
             "  'dump xmltree')\n"
-            "    case \"${FAKE_AAPT_XMLTREE:-bindings}\" in\n"
-            "      stripped)\n"
-            "        printf '%s\\n' 'E: manifest' '  E: application' ;;\n"
-            "      no-application)\n"
-            "        printf '%s\\n' 'E: manifest' ;;\n"
-            "      aapt2)\n"
-            "        printf '%s\\n' 'E: manifest' '  E: application' \\\n"
-            "          '    A: http://schemas.android.com/apk/res/android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
-            "          '    A: http://schemas.android.com/apk/res/android:dataExtractionRules(0x0101063e)=@0x7f010001' ;;\n"
-            "      literal)\n"
-            "        printf '%s\\n' 'E: manifest' '  E: application' \\\n"
-            "          '    A: android:fullBackupContent(0x010104eb)=\"@xml/backup_rules\" (Raw: \"@xml/backup_rules\")' \\\n"
-            "          '    A: android:dataExtractionRules(0x0101063e)=\"@xml/data_extraction_rules\" (Raw: \"@xml/data_extraction_rules\")' ;;\n"
-            "      rebound)\n"
-            "        printf '%s\\n' 'E: manifest' '  E: application' \\\n"
-            "          '    A: android:fullBackupContent(0x010104eb)=@0x7f091001' \\\n"
-            "          '    A: android:dataExtractionRules(0x0101063e)=@0x7f091002' ;;\n"
-            "      *)  # bindings (the default, realistic merged manifest)\n"
-            "        printf '%s\\n' 'E: manifest' '  E: application' \\\n"
-            "          '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
-            "          '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' ;;\n"
-            "    esac ;;\n"
+            "    if [ \"${4:-}\" = \"res/xml/network_security_config.xml\" ]; then\n"
+            "      # Compiled-NSC fixtures mirror the real aapt v1 xmltree shape\n"
+            "      # (measured on a real debug APK): two-space depth steps,\n"
+            "      # booleans as (type 0x12)0x0 / 0xffffffff, strings as\n"
+            "      # \"x\" (Raw: \"x\"), chardata as C: \"text\".\n"
+            "      case \"${FAKE_AAPT_NSC:-ok}\" in\n"
+            "        loopback-debug)\n"
+            "          printf '%s\\n' \\\n"
+            "            'E: network-security-config (line=1)' \\\n"
+            "            '  E: base-config (line=2)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '  E: domain-config (line=3)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0xffffffff' \\\n"
+            "            '    E: domain (line=4)' \\\n"
+            "            '      A: includeSubdomains=(type 0x12)0x0' \\\n"
+            "            '      C: \"localhost\"' ;;\n"
+            "        reviewer)\n"
+            "          printf '%s\\n' \\\n"
+            "            'E: network-security-config (line=1)' \\\n"
+            "            '  E: base-config (line=2)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '  E: domain-config (line=3)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0xffffffff' \\\n"
+            "            '    E: domain (line=4)' \\\n"
+            "            '      A: includeSubdomains=(type 0x12)0x0' \\\n"
+            "            '      C: \"example.com\"' ;;\n"
+            "        loopback-nosub)\n"
+            "          printf '%s\\n' \\\n"
+            "            'E: network-security-config (line=1)' \\\n"
+            "            '  E: base-config (line=2)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '  E: domain-config (line=3)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0xffffffff' \\\n"
+            "            '    E: domain (line=4)' \\\n"
+            "            '      C: \"localhost\"' ;;\n"
+            "        loopback-subtrue)\n"
+            "          printf '%s\\n' \\\n"
+            "            'E: network-security-config (line=1)' \\\n"
+            "            '  E: base-config (line=2)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '  E: domain-config (line=3)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0xffffffff' \\\n"
+            "            '    E: domain (line=4)' \\\n"
+            "            '      A: includeSubdomains=(type 0x12)0xffffffff' \\\n"
+            "            '      C: \"localhost\"' ;;\n"
+            "        n1-nested)\n"
+            "          # Review probe n1: the outer loopback entry stays legal,\n"
+            "          # but the claim-less inner domain-config INHERITS the\n"
+            "          # \"true\" at runtime (AOSP Builder parent chain), so the\n"
+            "          # compiled artifact enables cleartext for example.com.\n"
+            "          # The effective-value rule must fail this in both modes.\n"
+            "          printf '%s\\n' \\\n"
+            "            'E: network-security-config (line=1)' \\\n"
+            "            '  E: base-config (line=2)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '  E: domain-config (line=3)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0xffffffff' \\\n"
+            "            '    E: domain (line=4)' \\\n"
+            "            '      A: includeSubdomains=(type 0x12)0x0' \\\n"
+            "            '      C: \"localhost\"' \\\n"
+            "            '    E: domain-config (line=5)' \\\n"
+            "            '      E: domain (line=6)' \\\n"
+            "            '        A: includeSubdomains=(type 0x12)0x0' \\\n"
+            "            '        C: \"example.com\"' ;;\n"
+            "        n1-narrowed-debug)\n"
+            "          # Same shape with the inner entry's OWN \"false\": the\n"
+            "          # Builder override legally narrows, so under the DEBUG\n"
+            "          # rules this whole compiled artifact stays valid.\n"
+            "          printf '%s\\n' \\\n"
+            "            'E: network-security-config (line=1)' \\\n"
+            "            '  E: base-config (line=2)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '  E: domain-config (line=3)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0xffffffff' \\\n"
+            "            '    E: domain (line=4)' \\\n"
+            "            '      A: includeSubdomains=(type 0x12)0x0' \\\n"
+            "            '      C: \"localhost\"' \\\n"
+            "            '    E: domain-config (line=5)' \\\n"
+            "            '      A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '      E: domain (line=6)' \\\n"
+            "            '        A: includeSubdomains=(type 0x12)0x0' \\\n"
+            "            '        C: \"app.example.com\"' ;;\n"
+            "        n1-narrowed-release)\n"
+            "          # An all-false nested shape is valid under the release\n"
+            "          # deny-all rules too: own=\"false\" must not be rejected.\n"
+            "          printf '%s\\n' \\\n"
+            "            'E: network-security-config (line=1)' \\\n"
+            "            '  E: base-config (line=2)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '  E: domain-config (line=3)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '    E: domain (line=4)' \\\n"
+            "            '      A: includeSubdomains=(type 0x12)0x0' \\\n"
+            "            '      C: \"app.example.com\"' \\\n"
+            "            '    E: domain-config (line=5)' \\\n"
+            "            '      A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '      E: domain (line=6)' \\\n"
+            "            '        A: includeSubdomains=(type 0x12)0x0' \\\n"
+            "            '        C: \"sdk.partner.com\"' ;;\n"
+            "        base-true)\n"
+            "          printf '%s\\n' \\\n"
+            "            'E: network-security-config (line=1)' \\\n"
+            "            '  E: base-config (line=2)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0xffffffff' ;;\n"
+            "        unknown-line)\n"
+            "          printf '%s\\n' \\\n"
+            "            'E: network-security-config (line=1)' \\\n"
+            "            '  E: base-config (line=2)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '  E: trogdor (line=3)' ;;\n"
+            "        error)\n"
+            "          # A real defect surface: the ERROR line is printed to STDOUT;\n"
+            "          # observed aapt builds differ on the exit status, so the\n"
+            "          # scanner must detect the ERROR line itself (fail-closed\n"
+            "          # regardless of the exit code).\n"
+            "          printf '%s\\n' \\\n"
+            "            'ERROR: dump failed because resource res/xml/network_security_config.xml not found' ;;\n"
+            "        empty) : ;;\n"
+            "        *)  # ok (default): deny-all compiled config, valid under BOTH\n"
+            "            # rule sets so the default artifacts stay positive controls\n"
+            "          printf '%s\\n' \\\n"
+            "            'E: network-security-config (line=1)' \\\n"
+            "            '  E: base-config (line=2)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' ;;\n"
+            "      esac\n"
+            "    else\n"
+            "      case \"${FAKE_AAPT_XMLTREE:-bindings}\" in\n"
+            "        stripped)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' ;;\n"
+            "        no-application)\n"
+            "          printf '%s\\n' 'E: manifest' ;;\n"
+            "        aapt2)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: http://schemas.android.com/apk/res/android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: http://schemas.android.com/apk/res/android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: http://schemas.android.com/apk/res/android:networkSecurityConfig(0x01010527)=@0x7f010002' ;;\n"
+            "        literal)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=\"@xml/backup_rules\" (Raw: \"@xml/backup_rules\")' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=\"@xml/data_extraction_rules\" (Raw: \"@xml/data_extraction_rules\")' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=\"@xml/network_security_config\" (Raw: \"@xml/network_security_config\")' ;;\n"
+            "        rebound)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f091001' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f091002' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f091003' ;;\n"
+            "        debug)\n"
+            "          # Default NSC binding PLUS android:debuggable=true: the\n"
+            "          # compiled NSC is then checked under the DEBUG rule set.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    A: android:debuggable(0x0101000f)=(type 0x12)0xffffffff' ;;\n"
+            "        no-nsc)\n"
+            "          # Merger stripped ONLY the NSC binding (backup pair intact).\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' ;;\n"
+            "        nsc-rebound-literal)\n"
+            "          # NSC binding re-declared onto another resource by an overlay.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=\"@xml/network_security_config_evil\" (Raw: \"@xml/network_security_config_evil\")' ;;\n"
+            "        nsc-rebound-literal-junk)\n"
+            "          # The pinned literal plus trailing junk: a search()-style\n"
+            "          # prefix match would accept it while the runtime resolves a\n"
+            "          # different value. The decoded FULL payload must full-match.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=\"@xml/network_security_config;\" (Raw: \"@xml/network_security_config;\")' ;;\n"
+            "        *)  # bindings (the default, realistic merged manifest)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' ;;\n"
+            "      esac\n"
+            "    fi ;;\n"
             "  'dump resources')\n"
             "    case \"${FAKE_AAPT_RESOURCES:-table}\" in\n"
             "      missing) printf '%s\\n' '    (no xml/type resources)' ;;\n"
             "      aapt2-table)\n"
             "        printf '%s\\n' \\\n"
             "          '    resource 0x7f010000 xml/backup_rules () (file) res/xml/backup_rules.xml' \\\n"
-            "          '    resource 0x7f010001 xml/data_extraction_rules () (file) res/xml/data_extraction_rules.xml' ;;\n"
+            "          '    resource 0x7f010001 xml/data_extraction_rules () (file) res/xml/data_extraction_rules.xml' \\\n"
+            "          '    resource 0x7f010002 xml/network_security_config () (file) res/xml/network_security_config.xml' ;;\n"
             "      wrong-name)\n"
             "        printf '%s\\n' \\\n"
             "          '      spec resource 0x7f010000 dev.librepocket.agent:xml/backup_rules_evil: flags=0x00000000' \\\n"
             "          '      spec resource 0x7f010001 dev.librepocket.agent:xml/data_extraction_rules_evil: flags=0x00000000' ;;\n"
-            "      *)  # table (the default, id→name binding intact)\n"
+            "      nsc-wrong-name)\n"
+            "        # The NSC id resolves to a DIFFERENT resource name than the pin.\n"
+            "        printf '%s\\n' \\\n"
+            "          '      spec resource 0x7f010000 dev.librepocket.agent:xml/backup_rules: flags=0x00000000' \\\n"
+            "          '      spec resource 0x7f010001 dev.librepocket.agent:xml/data_extraction_rules: flags=0x00000000' \\\n"
+            "          '      spec resource 0x7f010002 dev.librepocket.agent:xml/network_security_config_evil: flags=0x00000000' ;;\n"
+            "      nsc-missing)\n"
+            "        # The NSC id has no entry in the table at all.\n"
             "        printf '%s\\n' \\\n"
             "          '      spec resource 0x7f010000 dev.librepocket.agent:xml/backup_rules: flags=0x00000000' \\\n"
             "          '      spec resource 0x7f010001 dev.librepocket.agent:xml/data_extraction_rules: flags=0x00000000' ;;\n"
+            "      *)  # table (the default, id→name binding intact)\n"
+            "        printf '%s\\n' \\\n"
+            "          '      spec resource 0x7f010000 dev.librepocket.agent:xml/backup_rules: flags=0x00000000' \\\n"
+            "          '      spec resource 0x7f010001 dev.librepocket.agent:xml/data_extraction_rules: flags=0x00000000' \\\n"
+            "          '      spec resource 0x7f010002 dev.librepocket.agent:xml/network_security_config: flags=0x00000000' ;;\n"
             "    esac ;;\n"
             "  *) echo 'unexpected fake aapt invocation' >&2; exit 24 ;;\n"
             "esac\n",
@@ -327,6 +531,7 @@ class ApkPolicyHarness(unittest.TestCase):
         dexdump_mode: str = "ok",
         xmltree_mode: str = "bindings",
         resources_mode: str = "table",
+        nsc_mode: str = "ok",
     ) -> dict[str, str]:
         env = os.environ.copy()
         env.update(
@@ -338,6 +543,7 @@ class ApkPolicyHarness(unittest.TestCase):
                 "FAKE_DEXDUMP_MODE": dexdump_mode,
                 "FAKE_AAPT_XMLTREE": xmltree_mode,
                 "FAKE_AAPT_RESOURCES": resources_mode,
+                "FAKE_AAPT_NSC": nsc_mode,
                 "LC_ALL": "C",
             }
         )
@@ -352,6 +558,7 @@ class ApkPolicyHarness(unittest.TestCase):
         dexdump_mode: str = "ok",
         xmltree_mode: str = "bindings",
         resources_mode: str = "table",
+        nsc_mode: str = "ok",
         sdk: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = ["sh", str(POLICY_CHECK)]
@@ -367,6 +574,7 @@ class ApkPolicyHarness(unittest.TestCase):
                 dexdump_mode=dexdump_mode,
                 xmltree_mode=xmltree_mode,
                 resources_mode=resources_mode,
+                nsc_mode=nsc_mode,
             ),
             text=True,
             stdout=subprocess.PIPE,
@@ -647,6 +855,189 @@ class ApkPolicyHarness(unittest.TestCase):
         result = self.run_policy(apk, resources_mode="wrong-name")
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("rebound backup binding", result.stdout)
+
+    # -- merged-manifest networkSecurityConfig binding (artifact authority) --
+
+    def test_merged_nsc_binding_stripped_from_application_rejected(self) -> None:
+        # Merger-marker repro for the third pinned binding: stripping ONLY
+        # android:networkSecurityConfig must fail even though both backup
+        # bindings survive - cleartext policy would fall back to the platform
+        # default while every source-level file check keeps passing.
+        apk = complete_apk(
+            self.tmp / "no-nsc-binding.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, xmltree_mode="no-nsc")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("lost the network security config binding", result.stdout)
+
+    def test_merged_nsc_binding_rebound_literal_rejected(self) -> None:
+        apk = complete_apk(
+            self.tmp / "nsc-rebound-literal.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, xmltree_mode="nsc-rebound-literal")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("rebound networkSecurityConfig binding", result.stdout)
+
+    def test_merged_nsc_literal_with_trailing_junk_rejected(self) -> None:
+        # The literal branch must full-match the DECODED payload: pinned
+        # literal + trailing junk ("@xml/network_security_config;") changes
+        # what the runtime resolves, so a re.search()-style prefix hit must
+        # not satisfy the binding.
+        apk = complete_apk(
+            self.tmp / "nsc-rebound-literal-junk.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, xmltree_mode="nsc-rebound-literal-junk")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("rebound networkSecurityConfig binding", result.stdout)
+
+    def test_merged_nsc_binding_outside_application_rejected(self) -> None:
+        # Same <application>-block scoping as the backup pair.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, "lost the network security config binding"
+        ):
+            policy_inspect._assert_merged_network_security_config(
+                "/unused/aapt",
+                self.tmp / "unused.apk",
+                "  E: application\n"
+                '    A: android:label(0x01010001)="Faux" (Raw: "Faux")\n'
+                "  E: someone-else\n"
+                "    A: android:networkSecurityConfig(0x01010527)=@0x7f010002\n",
+            )
+
+    def test_merged_nsc_binding_with_wrong_printed_id_rejected(self) -> None:
+        # Only the measured attr id is the binding; a printed different id is
+        # not android:networkSecurityConfig at all.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, "lost the network security config binding"
+        ):
+            policy_inspect._assert_merged_network_security_config(
+                "/unused/aapt",
+                self.tmp / "unused.apk",
+                "  E: application\n"
+                "    A: android:networkSecurityConfig(0x99990002)=@0x7f010002\n",
+            )
+
+    def test_merged_nsc_resources_table_wrong_name_or_missing_rejected(self) -> None:
+        # The id column must prove xml/network_security_config exactly: a
+        # bound id resolving to another resource name (or to nothing) cannot
+        # pass, mirroring the backup binding's id↔name authority.
+        apk = complete_apk(
+            self.tmp / "nsc-id-name.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for resources_mode in ("nsc-wrong-name", "nsc-missing"):
+            with self.subTest(resources_mode=resources_mode):
+                result = self.run_policy(apk, resources_mode=resources_mode)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("rebound networkSecurityConfig binding", result.stdout)
+
+    def test_compiled_nsc_debug_rules_matrix(self) -> None:
+        # With android:debuggable proven, the compiled NSC is checked under the
+        # DEBUG rule set: the deny-all fixture, the loopback whitelist, and an
+        # own-"false" narrowed nested entry pass; every other escape is
+        # rejected (outside domain, missing/true includeSubdomains, base true,
+        # unknown element, and the probe-n1 nested entry inheriting the outer
+        # cleartext "true" onto example.com).
+        apk = complete_apk(
+            self.tmp / "debug-nsc-matrix.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for nsc_mode in ("ok", "loopback-debug", "n1-narrowed-debug"):
+            with self.subTest(accepted_nsc=nsc_mode):
+                result = self.run_policy(
+                    apk, xmltree_mode="debug", nsc_mode=nsc_mode
+                )
+                self.assertEqual(result.returncode, 0, result.stdout)
+        for nsc_mode in (
+            "reviewer",
+            "n1-nested",
+            "loopback-nosub",
+            "loopback-subtrue",
+            "base-true",
+            "unknown-line",
+        ):
+            with self.subTest(rejected_nsc=nsc_mode):
+                result = self.run_policy(
+                    apk, xmltree_mode="debug", nsc_mode=nsc_mode
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_compiled_nsc_release_rules_for_unproven_debuggable(self) -> None:
+        # Without a PROVEN debuggable attr the compiled NSC is checked with the
+        # release deny-all rules: the loopback whitelist (legal only for a
+        # proof-carrying debug build) is rejected fail-closed here.
+        apk = complete_apk(
+            self.tmp / "release-nsc.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, nsc_mode="loopback-debug")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "compiled res/xml/network_security_config.xml fails the release",
+            result.stdout,
+        )
+
+    def test_compiled_nsc_inner_own_false_narrows_and_releases(self) -> None:
+        # own="false" on the inner nested entry overrides the parent builder
+        # (AOSP Builder#setCleartextTrafficPermitted), so an all-"false"
+        # nested shape remains valid under the release deny-all rules.
+        apk = complete_apk(
+            self.tmp / "release-n1-narrowed.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, nsc_mode="n1-narrowed-release")
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_compiled_nsc_dump_failures_fail_closed(self) -> None:
+        # An ERROR line printed to stdout (observed aapt builds differ on the
+        # exit status for missing resources) and an empty dump both fail
+        # closed instead of validating nothing.
+        apk = complete_apk(
+            self.tmp / "nsc-dump-failure.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for nsc_mode in ("error", "empty"):
+            with self.subTest(dump_mode=nsc_mode):
+                result = self.run_policy(apk, nsc_mode=nsc_mode)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_network_security_mode_derivation_is_fail_closed(self) -> None:
+        # Only the measured debuggable encoding proves debug mode: absent,
+        # explicit false, unknown bit patterns, and absent-debuggable
+        # manifests all validate with the stricter release deny-all rules.
+        cases = {
+            "    A: android:debuggable(0x0101000f)=(type 0x12)0xffffffff": "debug",
+            "    A: http://schemas.android.com/apk/res/android:"
+            "debuggable(0x0101000f)=(type 0x12)0xffffffff": "debug",
+            "    A: android:debuggable(0x0101000f)=(type 0x12)0x0": "release",
+            "    A: android:debuggable(0x0101000f)=(type 0x12)0xfffffffe": "release",
+            '    A: android:label(0x01010001)="x" (Raw: "x")': "release",
+        }
+        for line, expected in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(policy_inspect._network_security_mode(line), expected)
+        self.assertEqual(policy_inspect._network_security_mode("  E: application"), "release")
+
+    def test_real_debug_apk_artifact_nsc_authority(self) -> None:
+        # Live control (skipped without a real APK + real aapt): the actual
+        # production debug artifact must pass BOTH artifact authorities with
+        # its proven debuggable attr (debug NSC rules).
+        if not _REAL_DEBUG_APK.exists():
+            self.skipTest("real debug APK not built in this checkout")
+        aapt = _discover_real_aapt()
+        if aapt is None:
+            self.skipTest("no real aapt found (ANDROID_HOME/HOME SDK probes)")
+        permissions, xmltree = policy_inspect._validate_aapt_output(
+            aapt, _REAL_DEBUG_APK
+        )
+        self.assertTrue(permissions)
+        policy_inspect._assert_merged_backup_bindings(aapt, _REAL_DEBUG_APK, xmltree)
+        policy_inspect._assert_merged_network_security_config(
+            aapt, _REAL_DEBUG_APK, xmltree
+        )
 
     def test_rejects_truncated_zip(self) -> None:
         complete = complete_apk(self.tmp / "complete.apk").read_bytes()
@@ -1130,6 +1521,117 @@ class DexDescriptorResourceHarness(unittest.TestCase):
             self.assertEqual((budget.remaining_units, budget.remaining_bytes), (0, 0))
 
 
+class NscDumpParser(unittest.TestCase):
+    """``_parse_aapt_xmltree`` against the MEASURED real aapt dump shapes."""
+
+    _REAL_SHAPE_DUMP = (
+        "E: network-security-config (line=15)\n"
+        "  E: base-config (line=16)\n"
+        "    A: cleartextTrafficPermitted=(type 0x12)0x0\n"
+        "    E: trust-anchors (line=17)\n"
+        "      E: certificates (line=18)\n"
+        "        A: src=\"system\" (Raw: \"system\")\n"
+        "  E: domain-config (line=21)\n"
+        "    A: cleartextTrafficPermitted=(type 0x12)0xffffffff\n"
+        "    E: domain (line=22)\n"
+        "      A: includeSubdomains=(type 0x12)0x0\n"
+        "      C: \"localhost\"\n"
+    )
+
+    def test_measured_dump_rebuilds_and_validates_under_both_rules(self) -> None:
+        # The compiled NSC shape printed by aapt v1 for a real debug APK must
+        # rebuild into a tree the shared nsc_check rule engine accepts under
+        # DEBUG rules (loopback whitelist) and rejects under RELEASE rules
+        # (deny-all) - one parser, both rule sets, no divergence.
+        root = policy_inspect._parse_aapt_xmltree(
+            self._REAL_SHAPE_DUMP, "aapt xmltree network security config"
+        )
+        self.assertEqual(root.tag, "network-security-config")
+        base = root.find("base-config")
+        self.assertIsNotNone(base)
+        self.assertEqual(base.get("cleartextTrafficPermitted"), "false")
+        certificates = root.find("base-config/trust-anchors/certificates")
+        self.assertIsNotNone(certificates)
+        self.assertEqual(certificates.get("src"), "system")
+        domain = root.find("domain-config/domain")
+        self.assertIsNotNone(domain)
+        self.assertEqual(domain.get("includeSubdomains"), "false")
+        self.assertEqual(domain.text, "localhost")
+        self.assertEqual(nsc_check.validate_tree(root, "debug", "mem"), [])
+        errors = nsc_check.validate_tree(root, "release", "mem")
+        self.assertTrue(
+            any("<domain-config> sets cleartextTrafficPermitted" in e for e in errors),
+            errors,
+        )
+
+    def test_namespaced_manifest_dump_rebuilds_from_first_element(self) -> None:
+        # Real manifest dumps start with N: namespace lines so the root
+        # element sits one indent step deeper; the parser must still rebuild
+        # the manifest as the tree root and keep the printed attr prefix.
+        dump = (
+            "N: android=http://schemas.android.com/apk/res/android\n"
+            "  E: manifest (line=8)\n"
+            "    A: android:networkSecurityConfig(0x01010527)=@0x7f0b0002\n"
+        )
+        root = policy_inspect._parse_aapt_xmltree(dump, "manifest dump")
+        self.assertEqual(root.tag, "manifest")
+        self.assertEqual(
+            root.get("android:networkSecurityConfig"), "@0x7f0b0002"
+        )
+
+    def test_error_lines_fail_closed_regardless_of_tool_exit(self) -> None:
+        # Observed aapt behavior: missing resources print
+        # "ERROR: dump failed because resource … not found" and builds differ
+        # on the exit status - the parser detects the ERROR line itself.
+        dump = (
+            "ERROR: dump failed because resource "
+            "res/xml/network_security_config.xml not found\n"
+        )
+        with self.assertRaisesRegex(policy_inspect.PolicyError, "ERROR"):
+            policy_inspect._parse_aapt_xmltree(dump, "nsc dump")
+
+    def test_empty_or_dangling_dump_fails_closed(self) -> None:
+        for dump, message in (
+            ("", "no element tree"),
+            ("\n\n", "no element tree"),
+            ('    A: attr="x"\n', "outside any element"),
+            ('    C: "text"\n', "outside any element"),
+        ):
+            with self.subTest(dump=dump):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, message):
+                    policy_inspect._parse_aapt_xmltree(dump, "nsc dump")
+
+    def test_unknown_encodings_fail_closed(self) -> None:
+        cases = {
+            "E: root\n    A: attr=(type 0x10)0x25\n": (
+                "unrecognized compiled attribute encoding"
+            ),
+            "E: root\nX: weird\n": "unrecognized dump line",
+            "E: root\n    C: bare\n": "unrecognized chardata encoding",
+            "E: root\n    A: attr=??\n": "unrecognized attribute value encoding",
+        }
+        for dump, message in cases.items():
+            with self.subTest(dump=dump):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, message):
+                    policy_inspect._parse_aapt_xmltree(dump, "nsc dump")
+
+    def test_multiple_roots_and_value_decodings(self) -> None:
+        with self.assertRaisesRegex(policy_inspect.PolicyError, "multiple root"):
+            policy_inspect._parse_aapt_xmltree(
+                "E: one\n  E: child\nE: two\n", "nsc dump"
+            )
+        root = policy_inspect._parse_aapt_xmltree(
+            'E: root\n'
+            '    A: k="a\\nb" (Raw: "a\\nb")\n'
+            "    A: r=@res/0x7f010002\n"
+            "    A: q=?0x01010001\n",
+            "nsc dump",
+        )
+        self.assertEqual(root.get("k"), "a\nb")
+        self.assertEqual(root.get("r"), "@res/0x7f010002")
+        self.assertEqual(root.get("q"), "?0x01010001")
+
+
 def _pr_check_policy_patterns() -> list[str]:
     """Extract the `policy:` paths-filter patterns from pr-check.yml.
 
@@ -1163,6 +1665,7 @@ class PolicyCiGateControl(unittest.TestCase):
             "scripts/play_policy_check.sh",
             "scripts/apk_policy_inspect.py",
             "scripts/backup_rules_check.py",
+            "scripts/nsc_check.py",
             "scripts/summarize_junit.py",
             "scripts/check_test_budgets.py",
             "scripts/check_junit_durations.py",
@@ -2243,6 +2746,783 @@ class BackupRulesGateWiring(unittest.TestCase):
         self.assertNotRegex(text, r"grep\b[^|\n]*\b-q\b[^|\n]*\bdomain=")
 
 
+class NscCheckValidator(unittest.TestCase):
+    """Structured network-security-config rule engine (nsc_check.py) matrix.
+
+    The old gate grep'd for ``cleartextTrafficPermitted="false"`` anywhere in
+    a file; the reviewer's counterexample (base-config false + domain-config
+    true for example.com) PASSED while the config enabled cleartext for a
+    domain. These fixtures pin the structured XML replacement.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+
+    def _write(self, name: str, body: str) -> str:
+        path = self.tmp / name
+        path.write_text(body, encoding="utf-8")
+        return str(path)
+
+    @staticmethod
+    def _config(inner: str) -> str:
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<network-security-config>\n"
+            f"{inner}"
+            "</network-security-config>\n"
+        )
+
+    _BASE_FALSE = '  <base-config cleartextTrafficPermitted="false" />\n'
+
+    @staticmethod
+    def _loopback_domain(domain: str, subdomains: str = ' includeSubdomains="false"') -> str:
+        return (
+            '  <domain-config cleartextTrafficPermitted="true">\n'
+            f"    <domain{subdomains}>{domain}</domain>\n"
+            "  </domain-config>\n"
+        )
+
+    def test_reviewer_counterexample_fails_both_modes(self) -> None:
+        # The whole false-PASS lineage: ANY "false" anywhere satisfied the old
+        # grep even when a domain enabled cleartext. Structurally the config
+        # fails BOTH rule sets now.
+        path = self._write(
+            "network_security_config.xml",
+            self._config(self._BASE_FALSE + self._loopback_domain("example.com")),
+        )
+        release = nsc_check.validate(path, "release")
+        self.assertTrue(
+            any("release pin denies cleartext" in e for e in release), release
+        )
+        debug = nsc_check.validate(path, "debug")
+        self.assertTrue(
+            any(
+                "outside the debug loopback allowlist" in e and "'example.com'" in e
+                for e in debug
+            ),
+            debug,
+        )
+
+    def test_release_clean_shape_passes_and_debug_agrees(self) -> None:
+        base_trust_anchors = (
+            '  <base-config cleartextTrafficPermitted="false">\n'
+            "    <trust-anchors>\n"
+            '      <certificates src="system" />\n'
+            "    </trust-anchors>\n"
+            "  </base-config>\n"
+        )
+        path = self._write("nsc.xml", self._config(base_trust_anchors))
+        for mode in nsc_check.MODES:
+            with self.subTest(mode=mode):
+                self.assertEqual(nsc_check.validate(path, mode), [])
+        # certificateTransparency is schema-legal inside base-config AND
+        # domain-config (AOSP XmlConfigSource.parseConfigEntry rejects it
+        # only with "certificateTransparency not allowed in debug-overrides");
+        # the fixture below pins the domain-config placement. An NSC ROOT
+        # level <certificateTransparency> stays exactly the fail-closed
+        # unknown-element shape, which the rule engine refuses (behavior of
+        # _BASE_CHILDREN/_DOMAIN_CHILDREN vs _DEBUG_CHILDREN unchanged).
+        path = self._write(
+            "nsc.xml",
+            self._config(
+                self._BASE_FALSE
+                + '  <domain-config cleartextTrafficPermitted="false">\n'
+                '      <domain includeSubdomains="false">example.com</domain>\n'
+                '      <certificateTransparency enabled="true" />\n'
+                "    </domain-config>\n"
+            ),
+        )
+        for mode in nsc_check.MODES:
+            with self.subTest(mode=mode, shape="certificateTransparency"):
+                self.assertEqual(nsc_check.validate(path, mode), [])
+
+    def test_release_rejects_cleartext_true_on_every_element(self) -> None:
+        # No element may claim cleartext=true in release mode, whatever its
+        # position (this includes debug-overrides, applied only to debuggable
+        # builds at runtime - the gate refuses to bet on that promise).
+        shapes = {
+            "base": '  <base-config cleartextTrafficPermitted="true" />\n',
+            "debug-overrides": (
+                '  <base-config cleartextTrafficPermitted="false" />\n'
+                '  <debug-overrides cleartextTrafficPermitted="true" />\n'
+            ),
+        }
+        for name, inner in shapes.items():
+            with self.subTest(shape=name):
+                path = self._write("nsc.xml", self._config(inner))
+                errors = nsc_check.validate(path, "release")
+                self.assertTrue(
+                    any("cleartextTrafficPermitted" in e for e in errors), errors
+                )
+
+    def test_debug_loopback_allowlist_matrix(self) -> None:
+        # Debug mode admits cleartext=true ONLY for the exact loopback
+        # domains LlmProvider.validateBaseUrl accepts for http://, with the
+        # runtime-normalized spelling (trim + lowercase) and explicit
+        # includeSubdomains="false" per domain.
+        for domain in ("localhost", "127.0.0.1", "10.0.2.2", "LocalHost", " 127.0.0.1 "):
+            with self.subTest(accepted=domain):
+                path = self._write("nsc.xml", self._config(self._BASE_FALSE + self._loopback_domain(domain)))
+                self.assertEqual(nsc_check.validate(path, "debug"), [])
+        for domain in ("example.com", "10.0.2.2.evil.com", "abclocalhost"):
+            with self.subTest(rejected=domain):
+                path = self._write("nsc.xml", self._config(self._BASE_FALSE + self._loopback_domain(domain)))
+                errors = nsc_check.validate(path, "debug")
+                self.assertTrue(
+                    any("outside the debug loopback allowlist" in e for e in errors),
+                    errors,
+                )
+
+    def _run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
+        # Run scripts/nsc_check.py through its CLI so the exit-code contract
+        # of the probe surface (not only the validate() return list) is pegged.
+        cli = ROOT / "scripts" / "nsc_check.py"
+        return subprocess.run(
+            [sys.executable, str(cli), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_reviewer_probe_n1_nested_alias_fails_cli(self) -> None:
+        # Review probe n1 (review-proven against Android runtime): the outer
+        # domain-config's "true" is legal for localhost, but the INNER
+        # <domain-config> with NO cleartextTrafficPermitted attribute
+        # INHERITS that "true" (AOSP XmlConfigSource#parseConfigEntry parents
+        # the nested builder to the outer one,
+        # Builder#getEffectiveCleartextTrafficPermitted walks the chain), so
+        # runtime enables cleartext for example.com. The gate must exit 1 -
+        # pre-fix it skipped attribute-less entries and exited 0.
+        inner = (
+            self._BASE_FALSE
+            + '  <domain-config cleartextTrafficPermitted="true">\n'
+            '    <domain includeSubdomains="false">localhost</domain>\n'
+            "    <domain-config>\n"
+            '      <domain includeSubdomains="false">example.com</domain>\n'
+            "    </domain-config>\n"
+            "  </domain-config>\n"
+        )
+        path = self._write("n1.xml", self._config(inner))
+        debug = self._run_cli("--mode", "debug", path)
+        self.assertEqual(debug.returncode, 1, debug.stderr)
+        self.assertIn("outside the debug loopback allowlist", debug.stderr)
+        self.assertIn("'example.com'", debug.stderr)
+        release = self._run_cli("--mode", "release", path)
+        self.assertEqual(release.returncode, 1, release.stderr)
+        self.assertIn("release pin denies cleartext", release.stderr)
+
+    def test_nested_config_effective_cleartext_rules_matrix(self) -> None:
+        # The EFFECTIVE value (own explicit attribute ?? inherited parent
+        # value) drives every rule exactly like an explicit "true":
+        top = self._BASE_FALSE + (
+            '  <domain-config cleartextTrafficPermitted="true">\n'
+            '    <domain includeSubdomains="false">localhost</domain>\n'
+        )
+        cases = {
+            # inherited "true" + allowlisted inner domain + explicit
+            # includeSubdomains="false": legal in debug (runtime really does
+            # enable cleartext for this localhost entry), denied in release.
+            "inherited-true-loopback-ok": ("", "10.0.2.2", []),
+            # inherited "true" + own "false" override: the Builder override
+            # legally narrows - no clause can apply to the inner entry.
+            "own-false-narrows": (
+                ' cleartextTrafficPermitted="false"',
+                "app.example.com",
+                [],
+            ),
+            # inherited "true" + outside-domain inner entry: the review probe
+            # n1 bypass, failed in BOTH modes.
+            "inherited-true-outside-domain": ("", "example.com", None),
+            # own "true" + outside-domain inner entry: the own value obeys the
+            # same allowlist rules (guards against a "always inherit" fix).
+            "own-true-outside-domain": (
+                ' cleartextTrafficPermitted="true"',
+                "example.com",
+                None,
+            ),
+        }
+        for name, (attr, domain, debug_expect) in cases.items():
+            with self.subTest(case=name):
+                inner = (
+                    top
+                    + f"    <domain-config{attr}>\n"
+                    + f'      <domain includeSubdomains="false">{domain}</domain>\n'
+                    + "    </domain-config>\n"
+                    + "  </domain-config>\n"
+                )
+                path = self._write("nsc.xml", self._config(inner))
+                release = nsc_check.validate(path, "release")
+                self.assertTrue(
+                    any(
+                        "cleartextTrafficPermitted" in e and "true" in e
+                        for e in release
+                    ),
+                    release,
+                )
+                debug = nsc_check.validate(path, "debug")
+                if debug_expect is None:
+                    self.assertTrue(
+                        any(
+                            "outside the debug loopback allowlist" in e
+                            and f"'{domain}'" in e
+                            for e in debug
+                        ),
+                        debug,
+                    )
+                else:
+                    self.assertEqual(debug, debug_expect, debug)
+
+    def test_deep_nested_chain_carries_effective_through_two_levels(self) -> None:
+        # getEffectiveCleartextTrafficPermitted recurses the WHOLE parent
+        # chain: a claim-less innermost entry two levels deep inherits the
+        # outermost "true" exactly as at runtime. Domains stay globally
+        # unique because the runtime dedupes across all configs.
+        inner = (
+            self._BASE_FALSE
+            + '  <domain-config cleartextTrafficPermitted="true">\n'
+            '    <domain includeSubdomains="false">localhost</domain>\n'
+            "    <domain-config>\n"
+            '      <domain includeSubdomains="false">10.0.2.2</domain>\n'
+            "      <domain-config>\n"
+            '        <domain includeSubdomains="false">example.com</domain>\n'
+            "      </domain-config>\n"
+            "    </domain-config>\n"
+            "  </domain-config>\n"
+        )
+        path = self._write("deep.xml", self._config(inner))
+        debug = nsc_check.validate(path, "debug")
+        self.assertTrue(
+            any(
+                "outside the debug loopback allowlist" in e and "'example.com'" in e
+                for e in debug
+            ),
+            debug,
+        )
+        self.assertTrue(
+            any("release pin denies cleartext" in e
+                for e in nsc_check.validate(path, "release"))
+        )
+
+    def test_nested_own_false_narrows_in_both_modes_cli(self) -> None:
+        # Regression pairs for the fix's twin duties: (a) inherited values are
+        # checked (probe n1 exits 1 above), and (b) an explicit own="false"
+        # on an inner entry - and an unattributed TOP-LEVEL entry inheriting
+        # the base "false" pin - must keep exiting 0 in BOTH modes.
+        narrowed = (
+            self._BASE_FALSE
+            + "  <domain-config>\n"
+            '    <domain includeSubdomains="false">api.example.com</domain>\n'
+            '    <domain-config cleartextTrafficPermitted="false">\n'
+            '      <domain includeSubdomains="false">sdk.partner.com</domain>\n'
+            "    </domain-config>\n"
+            "  </domain-config>\n"
+        )
+        path = self._write("narrowed.xml", self._config(narrowed))
+        for mode in nsc_check.MODES:
+            with self.subTest(mode=mode):
+                self.assertEqual(nsc_check.validate(path, mode), [], mode)
+                result = self._run_cli("--mode", mode, path)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_debug_requires_explicit_include_subdomains_false(self) -> None:
+        # AOSP already defaults includeSubdomains to FALSE
+        # (parseDomain: getAttributeBooleanValue(..., false)), so an ABSENT
+        # attribute cannot widen anything at runtime; demanding the explicit
+        # "false" is stricter-than-runtime review bookkeeping (the whitelisted
+        # entry must state its scope in text). An explicit "true" DOES widen
+        # the whitelisted entry to a whole subdomain tree: FAIL in both cases,
+        # for different reasons.
+        for attr in ("", ' includeSubdomains="true"'):
+            with self.subTest(include_subdomains=attr or "absent"):
+                path = self._write(
+                    "nsc.xml",
+                    self._config(self._BASE_FALSE + self._loopback_domain("localhost", attr)),
+                )
+                errors = nsc_check.validate(path, "debug")
+                self.assertTrue(
+                    any("includeSubdomains=\"false\"" in e for e in errors), errors
+                )
+
+    def test_domain_normalization_is_java_trim_not_python_strip(self) -> None:
+        # Runtime parseDomain uses Java String#trim: ONLY characters <= U+0020
+        # are dropped. NBSP (U+00A0) and IDEOGRAPHIC SPACE (U+3000) survive
+        # trimming there, so the stored domain keeps the whitespace and can
+        # never match a host: under runtime semantics such an entry is inert,
+        # and under the runtime-identical normalization it deviates from the
+        # loopback allowlist - the gate fails it in debug mode (fail-closed:
+        # the dev alias may not hide non-matching decorated spellings; write
+        # plain localhost instead). Plain ASCII spaces (<= U+0020) keep
+        # trimming away, so the pre-existing " 127.0.0.1 " control still
+        # normalizes to an allowlisted name.
+        decorated = (
+            '  <domain-config cleartextTrafficPermitted="true">\n'
+            '    <domain includeSubdomains="false">\u00a0localhost\u00a0</domain>\n'
+            "  </domain-config>\n"
+            '  <domain-config cleartextTrafficPermitted="true">\n'
+            '    <domain includeSubdomains="false">\u3000localhost</domain>\n'
+            "  </domain-config>\n"
+        )
+        path = self._write("trim.xml", self._config(self._BASE_FALSE + decorated))
+        debug = nsc_check.validate(path, "debug")
+        # The messages carry the names through repr(), which escapes the
+        # non-printable decorations exactly like the runtime string differs.
+        self.assertTrue(
+            any(
+                "outside the debug loopback allowlist" in e
+                and "\\xa0localhost\\xa0" in e
+                for e in debug
+            ),
+            debug,
+        )
+        self.assertTrue(
+            any(
+                "outside the debug loopback allowlist" in e
+                and "\\u3000localhost" in e
+                for e in debug
+            ),
+            debug,
+        )
+        # Sanity: str.strip() would have made BOTH pass before this fix.
+        allowed = " 127.0.0.1 "
+        path = self._write(
+            "trim-ascii.xml", self._config(self._BASE_FALSE + self._loopback_domain(allowed))
+        )
+        self.assertEqual(nsc_check.validate(path, "debug"), [])
+
+    def test_missing_base_config_and_comment_survivor_fail(self) -> None:
+        # The deny-all pin must exist STRUCTURALLY: an empty config and a
+        # config whose only "false" lives inside a comment both fail.
+        for body in (
+            self._config(""),
+            self._config(
+                '  <!-- <base-config cleartextTrafficPermitted="false" /> -->\n'
+            ),
+        ):
+            with self.subTest(body=body[:64]):
+                path = self._write("nsc.xml", body)
+                for mode in nsc_check.MODES:
+                    errors = nsc_check.validate(path, mode)
+                    self.assertTrue(
+                        any("missing <base-config>" in e for e in errors), errors
+                    )
+
+    def test_unknown_schema_drift_fails_closed(self) -> None:
+        # Android's parser SILENTLY skips unknown elements/attributes (AOSP
+        # XmlConfigSource); the gate fail-closes on the same shapes instead -
+        # a typo'd attribute must not sneak semantics past the review.
+        shapes = {
+            "root-child": (
+                self._BASE_FALSE + '  <trogdor cleartextTrafficPermitted="true" />\n',
+            ),
+            "unknown-child": (
+                self._BASE_FALSE
+                + '  <domain-config cleartextTrafficPermitted="false">\n'
+                "      <weird />\n"
+                "    </domain-config>\n",
+            ),
+            "typo-attr": (
+                self._BASE_FALSE
+                + '  <domain-config cleartextTrafficPermitted="false">\n'
+                '      <domain includesubdomains="false">localhost</domain>\n'
+                "    </domain-config>\n",
+            ),
+            "extra-attr": (
+                '  <base-config cleartextTrafficPermitted="false" extra="1" />\n',
+            ),
+        }
+        for name, inner in shapes.items():
+            with self.subTest(shape=name):
+                path = self._write("nsc.xml", self._config(inner))
+                errors = nsc_check.validate(path, "release")
+                self.assertTrue(
+                    any("unknown attribute" in e or "unknown element" in e for e in errors),
+                    errors,
+                )
+
+    def test_runtime_throw_shapes_fail(self) -> None:
+        # Mirror every runtime parse exception of AOSP XmlConfigSource:
+        # duplicates that throw, and domain-config without any <domain>.
+        shapes = {
+            "duplicate-base": (
+                self._BASE_FALSE + self._BASE_FALSE
+            ),
+            "domain-config-without-domain": (
+                self._BASE_FALSE
+                + '  <domain-config cleartextTrafficPermitted="false" />\n'
+            ),
+            "duplicate-domain": (
+                self._BASE_FALSE
+                + self._loopback_domain("localhost")
+                + self._loopback_domain("localhost")
+            ),
+            "duplicate-trust-anchors": (
+                self._BASE_FALSE
+                + '  <domain-config cleartextTrafficPermitted="false">\n'
+                "    <domain>example.com</domain>\n"
+                '    <trust-anchors><certificates src="system" /></trust-anchors>\n'
+                '    <trust-anchors><certificates src="user" /></trust-anchors>\n'
+                "  </domain-config>\n"
+            ),
+        }
+        for name, inner in shapes.items():
+            with self.subTest(shape=name):
+                path = self._write("nsc.xml", self._config(inner))
+                errors = nsc_check.validate(path, "release")
+                self.assertTrue(errors, name)
+
+    def test_required_certificates_src_and_pin_digest_fail(self) -> None:
+        # runtime throws without src / digest - the gate mirrors both.
+        path = self._write(
+            "nsc.xml",
+            self._config(
+                '  <base-config cleartextTrafficPermitted="false">\n'
+                "    <trust-anchors>\n"
+                "      <certificates />\n"
+                "    </trust-anchors>\n"
+                "  </base-config>\n"
+                '  <domain-config cleartextTrafficPermitted="false">\n'
+                '    <domain>example.com</domain>\n'
+                '    <pin-set>\n'
+                '      <pin />\n'
+                "    </pin-set>\n"
+                "  </domain-config>\n"
+            ),
+        )
+        errors = nsc_check.validate(path, "release")
+        self.assertTrue(
+            any("missing required attribute src" in e for e in errors), errors
+        )
+        self.assertTrue(
+            any("missing required attribute digest" in e for e in errors), errors
+        )
+
+    def test_bool_attribute_values_must_be_lowercased_keywords(self) -> None:
+        path = self._write(
+            "nsc.xml",
+            self._config(
+                '  <base-config cleartextTrafficPermitted="True" />\n'
+            ),
+        )
+        errors = nsc_check.validate(path, "release")
+        self.assertTrue(
+            any('must be exactly "true" or "false"' in e for e in errors), errors
+        )
+        self.assertTrue(
+            any('must set cleartextTrafficPermitted="false" explicitly' in e for e in errors),
+            errors,
+        )
+
+    def test_wrong_root_and_missing_file_fail(self) -> None:
+        path = self._write("nsc.xml", "<resources />")
+        for mode in nsc_check.MODES:
+            errors = nsc_check.validate(path, mode)
+            self.assertTrue(
+                any("expected root <network-security-config>" in e for e in errors),
+                errors,
+            )
+        errors = nsc_check.validate(str(self.tmp / "no-such.xml"), "release")
+        self.assertTrue(any("unreadable" in e for e in errors))
+
+    def test_tools_attributes_are_excluded(self) -> None:
+        # tools:* never reaches the runtime (aapt strips them) and is excluded
+        # from the attribute whitelist in both modes.
+        path = self._write(
+            "nsc.xml",
+            '<network-security-config xmlns:tools="http://schemas.android.com/tools">\n'
+            '  <base-config cleartextTrafficPermitted="false" tools:ignore="Nsc" />\n'
+            "</network-security-config>\n",
+        )
+        for mode in nsc_check.MODES:
+            self.assertEqual(nsc_check.validate(path, mode), [])
+
+    # ---- manifest 屬性綁定（委派 marker 語義）----
+
+    @staticmethod
+    def _manifest(application_attrs: str) -> str:
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+            f"    <application {application_attrs} />\n"
+            "</manifest>\n"
+        )
+
+    @staticmethod
+    def _tools_manifest(attrs: str) -> str:
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n'
+            '    xmlns:tools="http://schemas.android.com/tools">\n'
+            f"    <application {attrs} />\n"
+            "</manifest>\n"
+        )
+
+    _NSC_BINDING = 'android:networkSecurityConfig="@xml/network_security_config"'
+
+    def test_nsc_manifest_main_binding_required_and_pinned(self) -> None:
+        # MAIN manifest: the binding must exist AND pin the exact resource.
+        missing = self._write(
+            "AndroidManifest.xml",
+            self._manifest('android:allowBackup="true"'),
+        )
+        errors = nsc_check.validate_manifest(missing, require_both=True)
+        self.assertEqual(
+            errors,
+            [
+                f"{missing}: android:networkSecurityConfig must reference "
+                "@xml/network_security_config (attribute absent)"
+            ],
+        )
+        rebound = self._write(
+            "AndroidManifest.xml",
+            self._manifest('android:networkSecurityConfig="@xml/other_nsc"'),
+        )
+        errors = nsc_check.validate_manifest(rebound, require_both=True)
+        self.assertTrue(
+            any("got '@xml/other_nsc'" in e for e in errors), errors
+        )
+
+    def test_nsc_manifest_quote_forms_and_comment_survivors(self) -> None:
+        # Single quotes are equally valid XML and equally pinned; a comment
+        # survivor must not resurrect the binding (ET drops comments).
+        p = self._write(
+            "AndroidManifest.xml",
+            self._manifest(self._NSC_BINDING.replace('"', "'")),
+        )
+        self.assertEqual(nsc_check.validate_manifest(p, require_both=True), [])
+        commented = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+            "    <!-- <application "
+            'android:networkSecurityConfig="@xml/network_security_config" /> -->\n'
+            "    <application />\n"
+            "</manifest>\n"
+        )
+        p = self._write("CommentedManifest.xml", commented)
+        errors = nsc_check.validate_manifest(p, require_both=True)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("(attribute absent)", errors[0])
+
+    def test_nsc_manifest_checker_only_watches_own_binding_set(self) -> None:
+        # Attribute-set parameterization proof: the NSC checker ignores the
+        # BACKUP attrs and their merger markers entirely (those belong to
+        # backup_rules_check.validate_manifest) - a manifest carrying only the
+        # NSC pin must pass the NSC checker without require-both complaints.
+        p = self._write("AndroidManifest.xml", self._manifest(self._NSC_BINDING))
+        self.assertEqual(nsc_check.validate_manifest(p, require_both=True), [])
+        # ...and an overlay stripping ONLY the backup attrs does not trip the
+        # NSC checker (no marker names networkSecurityConfig here).
+        p = self._write(
+            "OverlayManifest.xml",
+            self._tools_manifest(
+                'tools:remove="android:fullBackupContent,android:dataExtractionRules"'
+            ),
+        )
+        self.assertEqual(nsc_check.validate_manifest(p), [])
+
+    def test_nsc_manifest_overlay_markers_fail_closed(self) -> None:
+        # Marker shapes that would silently drop the merged binding.
+        p = self._write(
+            "AndroidManifest.xml",
+            self._tools_manifest(
+                'tools:remove="android:networkSecurityConfig"'
+            ),
+        )
+        errors = nsc_check.validate_manifest(p, require_both=True)
+        self.assertTrue(
+            any("tools:remove strips android:networkSecurityConfig" in e for e in errors),
+            errors,
+        )
+        p = self._write(
+            "AndroidManifest.xml",
+            self._tools_manifest('tools:node="replace"'),
+        )
+        errors = nsc_check.validate_manifest(p, require_both=True)
+        self.assertTrue(
+            any(
+                "tools:node=\"replace\" on <application>" in e
+                and "android:networkSecurityConfig" in e
+                for e in errors
+            ),
+            errors,
+        )
+        p = self._write(
+            "AndroidManifest.xml",
+            self._tools_manifest('tools:node="remove"'),
+        )
+        errors = nsc_check.validate_manifest(p, require_both=True)
+        self.assertTrue(
+            any("tools:node=\"remove\"" in e for e in errors), errors
+        )
+        p = self._write(
+            "AndroidManifest.xml",
+            self._tools_manifest(
+                self._NSC_BINDING + ' tools:node="replace"'
+            ),
+        )
+        # Re-declaring the pinned value inside the same document is provably
+        # fine even under the marker.
+        self.assertEqual(nsc_check.validate_manifest(p, require_both=True), [])
+
+    def test_nsc_manifest_wrong_root_needs_manifest_element(self) -> None:
+        p = self._write(
+            "AndroidManifest.xml",
+            '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n</resources>\n',
+        )
+        errors = nsc_check.validate_manifest(p, require_both=True)
+        self.assertTrue(any("needs a <manifest> root" in e for e in errors), errors)
+        p = self._write(
+            "AndroidManifest.xml",
+            '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+            "</manifest>\n",
+        )
+        errors = nsc_check.validate_manifest(p, require_both=True)
+        self.assertTrue(
+            any("needs an <application>" in e for e in errors), errors
+        )
+        # Overlay without <application>: whole-tree inheritance stays legal.
+        self.assertEqual(nsc_check.validate_manifest(p), [])
+
+    # ---- CLI 層（fail-closed exit codes）----
+
+    def test_cli_exit_code_matrix(self) -> None:
+        good = self._write("nsc.xml", self._config(self._BASE_FALSE))
+        bad = self._write(
+            "bad.xml",
+            self._config(
+                self._BASE_FALSE + self._loopback_domain("example.com")
+            ),
+        )
+        self.assertEqual(nsc_check.main(["x", "--mode", "release", good]), 0)
+        self.assertEqual(nsc_check.main(["x", "--mode", "debug", good]), 0)
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            self.assertEqual(nsc_check.main(["x", "--mode", "release", bad]), 1)
+        self.assertIn("release pin denies cleartext", buf_err.getvalue())
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            self.assertEqual(nsc_check.main(["x", "--mode", "debug", bad]), 1)
+        self.assertIn("outside the debug loopback allowlist", buf_err.getvalue())
+        for argv in (
+            ["x", bad],  # hint-free NSC path: cannot prove the ruleset
+            ["x", "--mode", "staging", bad],
+            ["x", "--mode", "release", "--mode", "debug", bad],
+            ["x", "--mode"],
+            ["x", "--root", "x", bad],
+            ["x", "--mode", "release", "--check-manifest", good],
+            ["x", "--require-both", good],
+            ["x"],
+        ):
+            buf_err = io.StringIO()
+            with contextlib.redirect_stderr(buf_err):
+                self.assertEqual(nsc_check.main(argv), 2, argv)
+            self.assertIn("usage", buf_err.getvalue() + "usage")
+
+    def test_cli_manifest_mode_exit_codes(self) -> None:
+        good = self._write("AndroidManifest.xml", self._manifest(self._NSC_BINDING))
+        bad = self._write(
+            "OtherManifest.xml",
+            self._manifest('android:networkSecurityConfig="@xml/other_nsc"'),
+        )
+        self.assertEqual(nsc_check.main(["x", "--check-manifest", good]), 0)
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            self.assertEqual(
+                nsc_check.main(["x", "--check-manifest", "--require-both", good]), 0
+            )
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            self.assertEqual(nsc_check.main(["x", "--check-manifest", bad]), 1)
+        self.assertIn("got '@xml/other_nsc'", buf_err.getvalue())
+        absent = self._write(
+            "AbsentManifest.xml",
+            self._manifest('android:allowBackup="true"'),
+        )
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            self.assertEqual(
+                nsc_check.main(
+                    ["x", "--check-manifest", "--require-both", absent]
+                ),
+                1,
+            )
+        self.assertIn("(attribute absent)", buf_err.getvalue())
+
+    def test_cli_subprocess_smoke_pass_fail_usage(self) -> None:
+        # Pin shebang/__main__/exit-code plumbing of the REAL script.
+        good = self._write("nsc.xml", self._config(self._BASE_FALSE))
+        bad = self._write(
+            "bad.xml",
+            self._config(self._BASE_FALSE + self._loopback_domain("example.com")),
+        )
+        cmd = [sys.executable, str(ROOT / "scripts" / "nsc_check.py")]
+        rc_ok = subprocess.run(
+            cmd + ["--mode", "release", good], capture_output=True, text=True
+        )
+        self.assertEqual(0, rc_ok.returncode, rc_ok.stderr)
+        rc_fail = subprocess.run(
+            cmd + ["--mode", "release", bad], capture_output=True, text=True
+        )
+        self.assertEqual(1, rc_fail.returncode)
+        self.assertIn("release pin denies cleartext", rc_fail.stderr)
+        rc_usage = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(2, rc_usage.returncode)
+        self.assertIn("usage", rc_usage.stderr)
+
+    def test_repo_nsc_files_are_valid(self) -> None:
+        # The real repository NSCs are the gate's positive controls: main is
+        # deny-all (release rules), debug is the loopback whitelist (debug
+        # rules). Any drift in either direction is caught here.
+        self.assertEqual(
+            nsc_check.validate(
+                str(ROOT / "app" / "src" / "main" / "res" / "xml" / "network_security_config.xml"),
+                "release",
+            ),
+            [],
+        )
+        self.assertEqual(
+            nsc_check.validate(
+                str(ROOT / "app" / "src" / "debug" / "res" / "xml" / "network_security_config.xml"),
+                "debug",
+            ),
+            [],
+        )
+
+
+class NscGateWiring(unittest.TestCase):
+    """Pin the shell gate's NSC deep scan + manifest pins (source level)."""
+
+    def test_gate_runs_structured_nsc_check_with_mode_routing(self) -> None:
+        # Per-file structured validation with the source-set→mode routing
+        # (debug source set → debug rules; everything else → release).
+        text = POLICY_CHECK.read_text(encoding="utf-8")
+        self.assertIn('python3 "$SCRIPT_DIR/nsc_check.py" --mode "$nsc_mode"', text)
+        self.assertIn('case "$nsconfig" in', text)
+        self.assertIn('"$ROOT/app/src/debug/"*) nsc_mode=debug ;;', text)
+        self.assertIn("*) nsc_mode=release ;;", text)
+
+    def test_gate_requires_main_nsc_resource(self) -> None:
+        text = POLICY_CHECK.read_text(encoding="utf-8")
+        self.assertIn(
+            '[ -f "$ROOT/app/src/main/res/xml/network_security_config.xml" ] ||',
+            text,
+        )
+
+    def test_gate_binds_nsc_manifest_attr_via_structured_check(self) -> None:
+        # Same structured manifest binding as the backup pair: main requires
+        # the attr pinned to @xml/network_security_config (require-both =
+        # absence fails); overlays fail only on present-but-different. The
+        # pins must ride the nsc_check.py CLI, NOT the backup checker.
+        text = POLICY_CHECK.read_text(encoding="utf-8")
+        self.assertIn(
+            'python3 "$SCRIPT_DIR/nsc_check.py" --check-manifest --require-both "$MAIN_MANIFEST"',
+            text,
+        )
+        self.assertRegex(text, r"python3 .+nsc_check\.py.+--check-manifest")
+        self.assertIn("--check-manifest \"$m\"", text)
+
+
 class BackupRulesGateEndToEnd(unittest.TestCase):
     """Run the REAL gate script against a cloned source tree (sandbox).
 
@@ -2263,6 +3543,9 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
         scripts.mkdir(parents=True)
         shutil.copy2(ROOT / "scripts" / "play_policy_check.sh", scripts)
         shutil.copy2(ROOT / "scripts" / "backup_rules_check.py", scripts)
+        # The source-stage NSC deep scan and manifest pin invoke nsc_check.py
+        # directly; the sandbox tree must be self-consistent.
+        shutil.copy2(ROOT / "scripts" / "nsc_check.py", scripts)
         # apk_policy_inspect.py is imported only in the artifact stage; copy it
         # so the tree is self-consistent anyway.
         shutil.copy2(ROOT / "scripts" / "apk_policy_inspect.py", scripts)
@@ -2272,7 +3555,8 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
         manifest.write_text(
             '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
             '    <application android:fullBackupContent="@xml/backup_rules"'
-            ' android:dataExtractionRules="@xml/data_extraction_rules" />\n'
+            ' android:dataExtractionRules="@xml/data_extraction_rules"'
+            ' android:networkSecurityConfig="@xml/network_security_config" />\n'
             "</manifest>\n",
             encoding="utf-8",
         )
@@ -2572,6 +3856,9 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             self.assertIn("tools:node=\"replace\"", proc.stderr)
 
     def test_flavor_overlay_marker_with_own_pinned_values_passes(self) -> None:
+        # tools:node="replace" must re-declare EVERY pinned binding (backup
+        # pair AND networkSecurityConfig) inside the same document: each
+        # checker sees its own attr survive the marker.
         with tempfile.TemporaryDirectory() as tmp:
             root = self._minimal_tree(tmp)
             (root / "app" / "src" / "foss").mkdir(parents=True, exist_ok=True)
@@ -2581,6 +3868,7 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "    <application\n"
                 '        android:fullBackupContent="@xml/backup_rules"\n'
                 '        android:dataExtractionRules="@xml/data_extraction_rules"\n'
+                '        android:networkSecurityConfig="@xml/network_security_config"\n'
                 '        tools:node="replace" />\n'
                 "</manifest>\n",
                 encoding="utf-8",
@@ -2589,6 +3877,7 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             self.assertNotIn("or marker would lose", proc.stderr)
             self.assertNotIn("tools:node", proc.stderr)
             self.assertNotIn("must reference @xml/", proc.stderr)
+            self.assertNotIn("tools:remove strips", proc.stderr)
 
     def test_flavor_overlay_tools_marker_kept_values_passes(self) -> None:
         # tools:remove naming one attr while the same document re-declares
@@ -2646,6 +3935,104 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 line for line in proc.stderr.splitlines() if line.startswith("FAIL:")
             )
             self.assertNotIn("must reference", all_fail_lines, proc.stderr)
+
+    # ---- NSC 來源級（深掃 + manifest pin）e2e ----
+
+    def test_source_nsc_missing_fails_closed(self) -> None:
+        # The all-flavor NSC existence guard fires before the manifest pins:
+        # a missing main resource can never satisfy the (later) attr pin.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            (
+                root / "app" / "src" / "main" / "res" / "xml"
+                / "network_security_config.xml"
+            ).unlink()
+            proc = self._run_gate(root)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            # The main-resource existence guard generalizes over the scan list
+            # (no NSC file left anywhere under app/src in this fixture).
+            self.assertIn(
+                "missing network_security_config.xml under app/src",
+                proc.stderr,
+            )
+            self.assertNotIn("required Android build-tools", proc.stderr)
+
+    def test_main_manifest_nsc_binding_missing_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            manifest = root / "app" / "src" / "main" / "AndroidManifest.xml"
+            manifest.write_text(
+                '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                '    <application android:fullBackupContent="@xml/backup_rules"'
+                ' android:dataExtractionRules="@xml/data_extraction_rules" />\n'
+                "</manifest>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn(
+                "android:networkSecurityConfig must reference "
+                "@xml/network_security_config",
+                proc.stderr,
+            )
+            self.assertNotIn("required Android build-tools", proc.stderr)
+
+    def test_main_manifest_nsc_rebound_fails_closed(self) -> None:
+        # Dropping the attr falls back to the platform cleartext default;
+        # rebounding to an unvalidated resource escapes every file check.
+        # Both shapes must fail the source manifest pin.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            manifest = root / "app" / "src" / "main" / "AndroidManifest.xml"
+            manifest.write_text(
+                '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                '    <application android:fullBackupContent="@xml/backup_rules"'
+                ' android:dataExtractionRules="@xml/data_extraction_rules"'
+                ' android:networkSecurityConfig="@xml/other_nsc" />\n'
+                "</manifest>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("got '@xml/other_nsc'", proc.stderr)
+            self.assertNotIn("required Android build-tools", proc.stderr)
+
+    def test_debug_nsc_cleartext_matrix(self) -> None:
+        # The debug source set is validated with the DEBUG rules: its
+        # loopback whitelist sails through, while the reviewer's
+        # counterexample domain fails at the source stage (no tools needed).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            debug_res = root / "app" / "src" / "debug" / "res" / "xml"
+            debug_res.mkdir(parents=True)
+            debug_nsc = debug_res / "network_security_config.xml"
+            debug_nsc.write_text(
+                "<network-security-config>\n"
+                '  <base-config cleartextTrafficPermitted="false" />\n'
+                '  <domain-config cleartextTrafficPermitted="true">\n'
+                '    <domain includeSubdomains="false">localhost</domain>\n'
+                "  </domain-config>\n"
+                "</network-security-config>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            all_fail_lines = "\n".join(
+                line for line in proc.stderr.splitlines() if line.startswith("FAIL:")
+            )
+            self.assertNotIn("cleartext", all_fail_lines, proc.stderr)
+            debug_nsc.write_text(
+                "<network-security-config>\n"
+                '  <base-config cleartextTrafficPermitted="false" />\n'
+                '  <domain-config cleartextTrafficPermitted="true">\n'
+                '    <domain includeSubdomains="false">example.com</domain>\n'
+                "  </domain-config>\n"
+                "</network-security-config>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("outside the debug loopback allowlist", proc.stderr)
+            self.assertNotIn("required Android build-tools", proc.stderr)
 
 
 if __name__ == "__main__":

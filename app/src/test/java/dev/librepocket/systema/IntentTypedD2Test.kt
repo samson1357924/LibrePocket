@@ -584,4 +584,53 @@ class IntentTypedD2Test {
     )
     assertEquals("geo:25.0,121.0?q=a+b", spec.dataUri)
   }
+
+  // ---- 14. Stage 3：navigation blank 判斷的雙側座標契約 ----
+
+  @Test fun navigation_execute_latitudeOnly_convergesInternal() {
+    // 反向控制：latitude-only 不是「空白目的地」（雙側缺席才是）——續走 resolve
+    // 撞 [NavigationTool.requirePairedCoords]（禁靜默丟棄）收斂 INTERNAL。
+    val r = NavigationTool.execute(
+      NavigationTool.Params(latitude = 25.0), env, IntentLauncher { LaunchResult.Success },
+    )
+    assertFalse(r.ok)
+    assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+  }
+
+  @Test fun navigation_execute_longitudeOnly_convergesInternal() {
+    // reviewer 回報的繞道面：單缺 longitude 時，舊空白判斷只看緯度側，會把
+    // 配對破損偽裝成「缺目的地」回 NEED_CLARIFICATION，與 latitude-only 收斂
+    // INTERNAL 的方向不一致。修正後單側經/緯同被 paired-coord 守衛攔下。
+    val r = NavigationTool.execute(
+      NavigationTool.Params(longitude = 121.0), env, IntentLauncher { LaunchResult.Success },
+    )
+    assertFalse(r.ok)
+    assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+  }
+
+  @Test fun navigation_execute_blankDestination_needsClarification() {
+    // 正向控制：query/label 空白且經緯**雙側**皆缺才是真正的空白目的地，
+    // 澄清話術不因本修正意外收緊；且與地圖有無（NATIVE/DEGRADED）無關。
+    val native = NavigationTool.execute(
+      NavigationTool.Params(), env, IntentLauncher { LaunchResult.Success },
+    )
+    assertFalse(native.ok)
+    assertEquals(ReasonCodes.NEED_CLARIFICATION, native.reasonCode)
+    val degraded = NavigationTool.execute(
+      NavigationTool.Params(), env.copy(hasMapApp = false), IntentLauncher { LaunchResult.Success },
+    )
+    assertFalse(degraded.ok)
+    assertEquals(ReasonCodes.NEED_CLARIFICATION, degraded.reasonCode)
+  }
+
+  @Test fun navigation_execute_userDisabled_beatsClarification_forLongitudeOnly() {
+    // 檢查優先序：USER_DISABLED 早於空白/座標判斷——longitude-only 參數
+    // 不得掩蓋使用者已關閉快通道的事實。
+    val disabled = env.copy(userEnabled = false)
+    val r = NavigationTool.execute(
+      NavigationTool.Params(longitude = 121.0), disabled, IntentLauncher { LaunchResult.Success },
+    )
+    assertFalse(r.ok)
+    assertEquals(ReasonCodes.USER_DISABLED, r.reasonCode)
+  }
 }

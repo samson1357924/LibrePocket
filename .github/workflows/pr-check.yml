@@ -50,6 +50,7 @@ jobs:
               - 'scripts/play_policy_check.sh'
               - 'scripts/apk_policy_inspect.py'
               - 'scripts/backup_rules_check.py'
+              - 'scripts/nsc_check.py'
               - 'scripts/summarize_junit.py'
               - 'scripts/check_test_budgets.py'
               - 'scripts/check_junit_durations.py'

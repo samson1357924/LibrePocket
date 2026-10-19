@@ -84,20 +84,28 @@ fi
 if grep -rnE "usesCleartextTraffic=[\"']true" "$ROOT/app/src" 2>/dev/null | grep -q .; then
     fail 'cleartext explicitly enabled somewhere under app/src'
 fi
-# Every flavor overlay may override network_security_config (merger picks the
-# highest-priority file), so pin the deny-all in EVERY copy under app/src, not
-# only main's; the fixed-path grep would let a flavor copy re-enable cleartext
-# while source-level checks still PASS (the scanner carries the authority, this
-# stays defense in depth).
-NSC_LIST="$(find "$ROOT/app/src" -type f -name network_security_config.xml)" ||
+# 結構化 NSC gate（scripts/nsc_check.py）：舊版「檔內任一處出現
+# cleartextTrafficPermitted=false 即過」的反例是 base-config false + domain-config
+# true（example.com）——整檔語意已放行明文流量而 gate 仍 PASS。改為結構化 XML
+# 驗證（ElementTree 忽略註解，註解內殘字不滿足釘點），規則集依「來源集歸屬」
+# 分流：debug source set → loopback 白名單規則；其餘 release-bearing source set
+# （main/play/foss/github/未來 release overlay）一律 deny-all（規則表見
+# scripts/nsc_check.py 模組說明）。
+# 深掃吞 alias：語意同形檔名 *network*security*config*.xml 一併驗證（未來 flavor
+# overlay 以別名新增 NSC 時也不能漏驗）；find 依舊非管線代入取自身狀態（POSIX
+# 賦值狀態＝最後管段，find 不得與 sort 同管），fail-closed。
+NSC_LIST="$(find "$ROOT/app/src" -type f -name '*network*security*config*.xml')" ||
     fail 'network security config scan failed'
 [ -n "$NSC_LIST" ] || fail 'missing network_security_config.xml under app/src'
+[ -f "$ROOT/app/src/main/res/xml/network_security_config.xml" ] ||
+    fail 'missing app/src/main/res/xml/network_security_config.xml'
 while IFS= read -r nsconfig; do
     [ -n "$nsconfig" ] || continue
-    # Quote-tolerant for the positive deny-all pin too (single quotes are
-    # equally valid XML; a literal-only grep false-FAILs them).
-    grep -qE "cleartextTrafficPermitted=[\"']false" "$nsconfig" ||
-        fail "$nsconfig does not deny cleartext"
+    case "$nsconfig" in
+        "$ROOT/app/src/debug/"*) nsc_mode=debug ;;
+        *) nsc_mode=release ;;
+    esac
+    python3 "$SCRIPT_DIR/nsc_check.py" --mode "$nsc_mode" "$nsconfig"
 done <<EOF
 $NSC_LIST
 EOF
@@ -131,6 +139,19 @@ for m in "$ROOT"/app/src/*/AndroidManifest.xml; do
     case "$m" in "$ROOT/app/src/main/AndroidManifest.xml") continue ;; esac
     [ -f "$m" ] || continue
     python3 "$SCRIPT_DIR/backup_rules_check.py" --check-manifest "$m"
+done
+# NSC 綁定縱深（attr↔resource）：上方的 source 級深掃只驗證了「存在的 NSC 檔」，
+# 但 merged manifest 若把 android:networkSecurityConfig rebind 到一個未被掃到的
+# 資源（或屬性被整段刪掉），release 就直接落回 platform 預設（允許明文）——
+# 檔案本身再乾淨也攔不到。故主 manifest 必須把屬性釘在
+# @xml/network_security_config（require-both：缺屬性即 fail），overlay「有設則
+# 必須等值」。校驗語義（merger markers、quote-tolerant）由 backup_rules_check
+# .validate_manifest 以屬性集參數統一實作，nsc_check.py 只傳入自己的綁定。
+python3 "$SCRIPT_DIR/nsc_check.py" --check-manifest --require-both "$MAIN_MANIFEST"
+for m in "$ROOT"/app/src/*/AndroidManifest.xml; do
+    case "$m" in "$ROOT/app/src/main/AndroidManifest.xml") continue ;; esac
+    [ -f "$m" ] || continue
+    python3 "$SCRIPT_DIR/nsc_check.py" --check-manifest "$m"
 done
 
 # 縱深：掃描 app/src 下所有語意同形資源（檔名尾段含 backup*rules /

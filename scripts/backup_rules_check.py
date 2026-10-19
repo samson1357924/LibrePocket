@@ -247,8 +247,18 @@ def _tools_marker_entries(element: ET.Element) -> tuple[tuple[str, str], ...]:
     return tuple(entries)
 
 
-def validate_manifest(path: str, require_both: bool = False) -> list[str]:
+def validate_manifest(
+    path: str,
+    require_both: bool = False,
+    expected_attrs: tuple[tuple[str, str], ...] | None = None,
+    binding_kind: str = "backup",
+) -> list[str]:
     """Bind the manifest's backup attributes to the validated resources.
+
+    ``expected_attrs`` overrides the (attr, pinned resource) set - the NSC
+    gate (``nsc_check.py``) reuses this exact marker machinery for
+    ``android:networkSecurityConfig`` so the merger-marker semantics exist
+    only here. ``binding_kind`` only names the binding family in messages.
 
     Structured (ElementTree) on purpose: a bare-text grep is escapable by the
     literal surviving inside an XML comment while the attributes are gone -
@@ -261,13 +271,14 @@ def validate_manifest(path: str, require_both: bool = False) -> list[str]:
 
     Merger markers change the absence semantics (fail-closed): an absent
     attribute is only a legal inheritance when no marker strips main's value.
-    ``tools:remove`` naming one of the two attributes, or
+    ``tools:remove`` naming one of the pinned attributes, or
     ``tools:node="remove"`` / ``tools:node="replace"`` on ``<application>``
-    without re-declaring both pinned values, deletes the merged binding -
+    without re-declaring every pinned value, deletes the merged binding -
     the merged manifest would run Auto Backup unprotected on the key files,
     so the source-level gate refuses it. The APK-level scanner asserts the
     merged bytes independently; this source check is defense in depth.
     """
+    bindings = tuple(EXPECTED_MANIFEST_ATTRS if expected_attrs is None else expected_attrs)
     try:
         root = ET.parse(path).getroot()
     except ET.ParseError as exc:
@@ -280,12 +291,12 @@ def validate_manifest(path: str, require_both: bool = False) -> list[str]:
         ]
     errors: list[str] = []
     application = root.find("application")
-    expected_values = dict(EXPECTED_MANIFEST_ATTRS)
+    expected_values = dict(bindings)
 
     def _own(name: str) -> str | None:
         return None if application is None else application.get(f"{_ANDROID_NS}{name}")
 
-    # Merger markers on <manifest> root that name the backup bindings: the
+    # Merger markers on <manifest> root that name a pinned binding: the
     # marker surface for these attributes is <application>/target nodes, so a
     # root-level marker naming them is an undefined shape - refuse to prove
     # anything about the merged outcome from this document alone.
@@ -294,7 +305,7 @@ def validate_manifest(path: str, require_both: bool = False) -> list[str]:
             name in value for name in expected_values
         ):
             errors.append(
-                f"{path}: tools:{local} marker on <manifest> names a backup "
+                f"{path}: tools:{local} marker on <manifest> names a {binding_kind} "
                 f"binding attribute ({value.strip()!r}) - merger outcome for "
                 f"{tuple(expected_values)} is unverifiable here"
             )
@@ -320,13 +331,13 @@ def validate_manifest(path: str, require_both: bool = False) -> list[str]:
                 # == expected from THIS document survives the marker legally.
         elif local == "node" and value.strip() in _MERGE_STRIP_NODE_VALUES:
             if value.strip() == "remove":
+                lost = " AND ".join(f"android:{name}" for name, _ in bindings)
                 errors.append(
                     f"{path}: tools:node=\"remove\" on <application> strips the "
-                    f"whole element - the merged manifest would lose "
-                    f"android:fullBackupContent AND android:dataExtractionRules"
+                    f"whole element - the merged manifest would lose {lost}"
                 )
             else:
-                for name, expected in EXPECTED_MANIFEST_ATTRS:
+                for name, expected in bindings:
                     own = _own(name)
                     if own is None:
                         errors.append(
@@ -334,7 +345,7 @@ def validate_manifest(path: str, require_both: bool = False) -> list[str]:
                             f"not re-declare android:{name} - the merged manifest "
                             f"would lose {expected}"
                         )
-    for name, expected in EXPECTED_MANIFEST_ATTRS:
+    for name, expected in bindings:
         value = application.get(f"{_ANDROID_NS}{name}")
         if value is None:
             if require_both:

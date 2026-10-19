@@ -19,10 +19,12 @@ import java.net.URLEncoder
  *   政策）為本層自訂 Binder 傳輸防禦（官方契約無此上限）：兩個 builder 端
  *   fail-closed 拒絕，越界經 [execute] 收斂 INTERNAL；上限以**編碼前欄位長度**
  *   計（`URLEncoder` 後 URI 可更長，與 [AlarmTool] 欄位級上限同政策）。
- * - 空白目的地（query/label/座標皆缺）回 NEED_CLARIFICATION（[execute]）
- *   而非構建無意義的空搜尋 intent；與 [MusicTool] 的空白 query 澄清同契約，
- *   即使靜態 `check` 已判 NATIVE/DEGRADED 亦然（目的缺席是使用者意圖問題，
- *   與環境能力無關）。
+ * - 空白目的地（query/label 空白且經緯**雙側**皆缺）回 NEED_CLARIFICATION
+ *   （[execute]）而非構建無意義的空搜尋 intent；與 [MusicTool] 的空白 query
+ *   澄清同契約，即使靜態 `check` 已判 NATIVE/DEGRADED 亦然（目的缺席是使用者
+ *   意圖問題，與環境能力無關）。單側經/緯不屬「空白目的地」：那是配對破損
+ *   （[requirePairedCoords] 禁靜默丟棄），經 [resolve] 收斂 INTERNAL——與
+ *   latitude-only 同方向，不以澄清話術偽裝成「缺目的地資訊」。
  */
 object NavigationTool : SystemTool<NavigationTool.Params> {
 
@@ -99,8 +101,13 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
     }
     // 空白目的地禁猜測執行（#19，與 MusicTool 空白 query 同語義）：query/label/
     // 座標皆缺時會構建出 `geo:0,0?q=`（或空 OSM 搜尋），對使用者毫無意義——
-    // 回 NEED_CLARIFICATION，不靜默開啟空搜尋的 intent。
-    if (params.query.isBlank() && params.label.isBlank() && params.latitude == null) {
+    // 回 NEED_CLARIFICATION，不靜默開啟空搜尋的 intent。座標缺席以**雙側**為準
+    //（與 [requirePairedCoords] 的配對契約同形）：單側經/緯（如 longitude-only）
+    // 不是「空白目的地」而是配對破損——續走 [resolve] 被 paired-coord 守衛攔下
+    // 收斂 INTERNAL，與 latitude-only 同方向，不以澄清話術偽裝「缺資訊」。
+    if (params.query.isBlank() && params.label.isBlank() &&
+      params.latitude == null && params.longitude == null
+    ) {
       return ToolResult(
         false, false, null, ReasonCodes.NEED_CLARIFICATION,
         "導航去哪裡（${ReasonCodes.NEED_CLARIFICATION}）？→ 需要你說出目的地（地名或座標）",

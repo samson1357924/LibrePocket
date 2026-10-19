@@ -25,6 +25,19 @@ stripped, so this artifact-level check is the authoritative proof that the
 bindings survived the merge. Runtime impact when missing: AOSP FullBackup
 treats both refs as absent and copies EVERYTHING (including the key files the
 whole policy exists to protect).
+
+Network-security-config authority (same artifact-level reasoning): the merged
+manifest must still carry ``android:networkSecurityConfig`` pinned to
+``@xml/network_security_config``, AND the compiled resource itself is parsed
+out of ``aapt dump xmltree`` of the APK and re-validated with the EXACT rules
+of ``scripts/nsc_check.py``. The source stage greps/validates source XML files,
+but the merged artifact is what ships: a resource overlay, an alias flip, or a
+merger rebind would never be visible at source level. The validation mode is
+derived fail-closed from the merged manifest's own ``android:debuggable``
+(attr 0x0101000f) = true (type 0x12)0xffffffff → debug rules (loopback-only
+cleartext); anything else (absent/false/unparseable) → the release deny-all
+rules, so a build that cannot PROVE it is debuggable is checked with the
+stricter contract.
 """
 
 from __future__ import annotations
@@ -42,8 +55,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import zipfile
 import zlib
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Iterable
 
@@ -87,6 +102,22 @@ _BACKUP_BINDING_ATTRS: tuple[tuple[str, str, str], ...] = (
     ("fullBackupContent", "0x010104eb", "backup_rules"),
     ("dataExtractionRules", "0x0101063e", "data_extraction_rules"),
 )
+
+# Merged-manifest networkSecurityConfig binding (same artifact-level authority
+# as the backup pair). Resource-id constants are MEASURED SDK definitions
+# (platform data/res/values/public-final.xml, android-36 == android-37.0, not
+# guessed): android:networkSecurityConfig = 0x01010527,
+# android:debuggable = 0x0101000f. The resource NAME is the pin from
+# nsc_check.py EXPECTED_MANIFEST_RESOURCE ("@xml/network_security_config" minus
+# the "@xml/" prefix); aapt v1 xmltree only resolves the compiled member by its
+# canonical res/<type>/<name> path (a literal 0x… id or type/name form answers
+# "resource ... not found"), so the tree dump goes through that path after the
+# id↔name mapping is proven against the resources table.
+_NETWORK_SECURITY_ATTR_NAME = "networkSecurityConfig"
+_NETWORK_SECURITY_ATTR_ID = "0x01010527"
+_NETWORK_SECURITY_RESOURCE = "network_security_config"
+_NETWORK_SECURITY_MEMBER = "res/xml/network_security_config.xml"
+_DEBUGGABLE_ATTR_ID = "0x0101000f"
 
 PLAY_FORBIDDEN_PERMISSIONS = (
     "SEND_SMS",
@@ -700,9 +731,44 @@ def _application_manifest_block(xmltree: str) -> str:
                 break
         return "\n".join(lines[index:end])
     raise PolicyError(
-        "merged manifest lacks an <application> element - the backup "
-        "bindings cannot survive a manifest that has no application to bind"
+        "merged manifest lacks an <application> element - the backup and "
+        "network security bindings cannot survive a manifest that has no "
+        "application to bind"
     )
+
+
+def _resources_table_resolves(
+    resources: str,
+    identifier: int,
+    resource: str,
+    attr_name: str,
+    binding_kind: str = "backup",
+) -> None:
+    """Assert ``identifier`` maps to ``@xml/<resource>`` in a resources dump.
+
+    Shared by the backup and the networkSecurityConfig binding authorities -
+    the id↔name column is the merger-proof half of the pin (the attr value
+    alone can name a resource another id owns). The aapt spelling tolerance
+    (v1 ``spec … pkg:xml/<name>:`` form and aapt2 plain form) prevents an
+    output-format change from silently bypassing the check.
+    """
+    resource_name = re.escape("xml/" + resource)
+    # aapt v1: "spec resource 0x7f010000 pkg:xml/backup_rules: flags=…"
+    spec_line = re.compile(
+        r"^\s*(?:spec\s+)?resource 0x%08x\s+\S+:%s\s*:" % (identifier, resource_name),
+        re.MULTILINE,
+    )
+    # aapt2: "resource 0x7f010000 xml/backup_rules …" (no spec/pkg form).
+    aapt2_line = re.compile(
+        r"^\s*resource 0x%08x\s+%s\b" % (identifier, resource_name),
+        re.MULTILINE,
+    )
+    if not (spec_line.search(resources) or aapt2_line.search(resources)):
+        raise PolicyError(
+            f"merged manifest android:{attr_name} resource id 0x{identifier:08x} "
+            f"does not resolve to @xml/{resource} in the resources table "
+            f"- rebound {binding_kind} binding"
+        )
 
 
 def _assert_merged_backup_bindings(aapt: str, apk: Path, xmltree: str) -> None:
@@ -764,23 +830,272 @@ def _assert_merged_backup_bindings(aapt: str, apk: Path, xmltree: str) -> None:
         max_bytes=MAX_RESOURCES_DUMP_BYTES,
     )
     for name, (resource, identifier) in resolved.items():
-        resource_name = re.escape("xml/" + resource)
-        # aapt v1: "spec resource 0x7f010000 pkg:xml/backup_rules: flags=…"
-        spec_line = re.compile(
-            r"^\s*(?:spec\s+)?resource 0x%08x\s+\S+:%s\s*:" % (identifier, resource_name),
-            re.MULTILINE,
+        _resources_table_resolves(resources, identifier, resource, name)
+
+
+def _unescape_dump_string(value: str) -> str:
+    """Decode aapt's C-style escapes in dumped quoted strings.
+
+    aapt prints string payloads with ``"\\n"``/``"\\t"``/``"\\r"``/``"\\""``
+    /``"\\\\"`` escapes inside the quotes. Unknown escapes are kept literal
+    rather than guessed away: the downstream schema checks (nsc_check.py)
+    fail closed on the resulting value in both directions, so decoding must
+    not become a bypass channel.
+    """
+    decoded: list[str] = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == "\\" and index + 1 < len(value):
+            following = value[index + 1]
+            mapped = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\"}.get(following)
+            if mapped is not None:
+                decoded.append(mapped)
+                index += 2
+                continue
+        decoded.append(character)
+        index += 1
+    return "".join(decoded)
+
+
+def _xmltree_attr_value(raw_value: str, label: str) -> str:
+    """Decode one printed ``A: <name>=<value>`` payload from a xmltree dump.
+
+    Measured aapt encodings (real APK dumps, build-tools 35/36):
+      * booleans print without quotes as ``(type 0x12)0x0`` /
+        ``(type 0x12)0xffffffff``; a boolean exists only as these two values
+        in compiled binary XML, so any other typed encoding fails closed
+        instead of being guessed into the tree;
+      * strings print as ``"value" (Raw: "value")`` - the RAW payload wins
+        when both spellings appear and both go through the escape decoder;
+      * resource references print unquoted (``@0x…``, ``@res/0x…``,
+        ``?0x…``) and pass through verbatim; schema checks reject them
+        wherever non-string values are illegal.
+    """
+    value = raw_value.strip()
+    typed = re.match(r"^\(type\s+[^\s)]+\)(.*)$", value)
+    if typed is not None:
+        payload = typed.group(1).strip()
+        if payload == "0x0":
+            return "false"
+        if payload == "0xffffffff":
+            return "true"
+        raise PolicyError(
+            f"{label}: unrecognized compiled attribute encoding {value!r}"
         )
-        # aapt2: "resource 0x7f010000 xml/backup_rules …" (no spec/pkg form).
-        aapt2_line = re.compile(
-            r"^\s*resource 0x%08x\s+%s\b" % (identifier, resource_name),
-            re.MULTILINE,
-        )
-        if not (spec_line.search(resources) or aapt2_line.search(resources)):
+    quoted = re.match(
+        r'^"((?:[^"\\]|\\.)*)"\s*(?:\(Raw:\s*"((?:[^"\\]|\\.)*)"\s*\))?(?:\s*)?$', value
+    )
+    if quoted is not None:
+        if quoted.group(2) is not None:
+            return _unescape_dump_string(quoted.group(2))
+        return _unescape_dump_string(quoted.group(1))
+    if re.fullmatch(r"@(?:res/)?0x[0-9a-fA-F]+", value) or re.fullmatch(
+        r"\?0x[0-9a-fA-F]+", value
+    ):
+        return value
+    raise PolicyError(f"{label}: unrecognized attribute value encoding {value!r}")
+
+
+def _xmltree_text_value(raw_text: str, label: str) -> str:
+    """Decode one printed ``C:`` chardata payload (always quoted+escaped)."""
+    quoted = re.fullmatch(r'"((?:[^"\\]|\\.)*)"', raw_text.strip())
+    if quoted is None:
+        raise PolicyError(f"{label}: unrecognized chardata encoding {raw_text!r}")
+    return _unescape_dump_string(quoted.group(1))
+
+
+_XMLTREE_ELEMENT = re.compile(r"^(\s*)E:\s*([^(\s]+)\s*(?:\(line=\d+\))?\s*$")
+_XMLTREE_ATTRIBUTE = re.compile(r"^(\s*)A:\s+([^=]+)=(.*)$")
+_XMLTREE_TEXT = re.compile(r"^(\s*)C:\s+(.*)$")
+_XMLTREE_ERROR = re.compile(r"^\s*ERROR:")
+_XMLTREE_ATTR_ID_PARENS = re.compile(r"\(\s*0x[0-9a-fA-F]+\s*\)\s*$")
+
+
+def _parse_aapt_xmltree(dump: str, label: str) -> ET.Element:
+    """Rebuild one ElementTree from ``aapt dump xmltree`` output (fail closed).
+
+    aapt prints one line per element/attribute with two-space indent steps:
+    elements ``E: <tag> (line=N)``, attributes ``A: <name>[(<id>)]=<value>``,
+    chardata ``C: "text"``, namespace declarations ``N: prefix=uri``. The N:
+    lines only rename attribute prefixes and are dropped; indentation defines
+    the hierarchy RELATIVE to the first element line, so a dump whose root
+    sits deeper (namespace lines above it) still rebuilds.
+
+    Beyond this shape everything fails closed: ERROR lines are detected here
+    because at least one observed aapt exits 0 after printing ``ERROR: dump
+    failed because resource … not found`` (never trust the exit status
+    alone), a second root at indent depth 0 is a parse anomaly, and text
+    segments are concatenated (fine for schema checks; the NSC schema allows
+    text only where no children may appear).
+    """
+    root: ET.Element | None = None
+    stack: list[tuple[int, ET.Element]] = []
+    for line in dump.splitlines():
+        if not line.strip():
+            continue
+        if _XMLTREE_ERROR.match(line):
             raise PolicyError(
-                f"merged manifest android:{name} resource id 0x{identifier:08x} "
-                f"does not resolve to @xml/{resource} in the resources table "
-                "- rebound backup binding"
+                f"{label} reported a dump ERROR line (fail closed): {line.strip()}"
             )
+        element_match = _XMLTREE_ELEMENT.match(line)
+        if element_match is not None:
+            indent, tag = element_match.group(1), element_match.group(2)
+            element = ET.Element(tag)
+            while stack and stack[-1][0] >= indent:
+                stack.pop()
+            if stack:
+                stack[-1][1].append(element)
+            else:
+                if root is not None:
+                    raise PolicyError(f"{label} contains multiple root elements")
+                root = element
+            stack.append((indent, element))
+            continue
+        attribute_match = _XMLTREE_ATTRIBUTE.match(line)
+        if attribute_match is not None:
+            if not stack:
+                raise PolicyError(f"{label} has an attribute outside any element")
+            name = _XMLTREE_ATTR_ID_PARENS.sub("", attribute_match.group(2).strip())
+            stack[-1][1].set(name, _xmltree_attr_value(attribute_match.group(3), label))
+            continue
+        text_match = _XMLTREE_TEXT.match(line)
+        if text_match is not None:
+            if not stack:
+                raise PolicyError(f"{label} has text outside any element")
+            current = stack[-1][1]
+            current.text = (current.text or "") + _xmltree_text_value(
+                text_match.group(2), label
+            )
+            continue
+        if line.lstrip().startswith("N:"):
+            continue
+        raise PolicyError(f"{label}: unrecognized dump line: {line.strip()!r}")
+    if root is None:
+        raise PolicyError(f"{label} contains no element tree")
+    return root
+
+
+def _load_nsc_rules() -> types.ModuleType:
+    """Load the shared network-security rule engine (``scripts/nsc_check.py``).
+
+    Inserting this file's own directory keeps ``import nsc_check`` resolving
+    when this scanner runs as a bare script (sys.path[0] = scripts/) AND as
+    the ``scripts.apk_policy_inspect`` package module (repo root on sys.path):
+    either way the compiled XML is validated with the exact rules the source
+    gate runs, never a divergent local reimplementation.
+    """
+    scripts_dir = str(Path(__file__).resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import nsc_check
+
+    return nsc_check
+
+
+def _network_security_mode(application_block: str) -> str:
+    """Derive the NSC rule mode from the merged manifest's debuggable attr.
+
+    Measured merged-manifest encoding (real debug APK):
+    ``android:debuggable(0x0101000f)=(type 0x12)0xffffffff`` when the build
+    is debuggable; absence and ``(type 0x12)0x0`` are the non-debug forms.
+    ONLY the exact true encoding proves DEBUG mode - everything else
+    (absent/false/unknown spelling) is validated with the stricter release
+    deny-all rules, fail-closed against proof-by-promise.
+    """
+    debuggable = re.search(
+        r"^\s*A:\s+(?:android:|http://schemas\.android\.com/apk/res/android:)"
+        + r"debuggable\(\s*"
+        + re.escape(_DEBUGGABLE_ATTR_ID)
+        + r"\s*\)=(.+)$",
+        application_block,
+        re.MULTILINE,
+    )
+    if debuggable is not None and debuggable.group(1).strip() == "(type 0x12)0xffffffff":
+        return "debug"
+    return "release"
+
+
+def _assert_merged_network_security_config(aapt: str, apk: Path, xmltree: str) -> None:
+    """Assert the merged NSC binding AND the compiled XML's policy shape.
+
+    Both halves are artifact-level authority (the source stage cannot observe
+    what ships): a merger marker can strip ``android:networkSecurityConfig``
+    so cleartext falls back to the platform default, or rebind it to a
+    resource no source gate ever validated. Once the pin survives, the
+    compiled resource itself is dumped via ``aapt dump xmltree`` and rebuilt
+    by ``_parse_aapt_xmltree`` - a compiled-XML alias cannot differ from
+    source undetected - then validated with ``scripts/nsc_check.py
+    .validate_tree`` under the mode derived from ``android:debuggable``.
+    """
+    application_block = _application_manifest_block(xmltree)
+    mode = _network_security_mode(application_block)
+    match = re.search(
+        r"^\s*A:\s+(?:android:|http://schemas\.android\.com/apk/res/android:)"
+        + re.escape(_NETWORK_SECURITY_ATTR_NAME)
+        + r"\(\s*"
+        + re.escape(_NETWORK_SECURITY_ATTR_ID)
+        + r"\s*\)=(.+)$",
+        application_block,
+        re.MULTILINE,
+    )
+    if match is None:
+        raise PolicyError(
+            "merged manifest lost the network security config binding "
+            "android:networkSecurityConfig (0x01010527) on <application>: a "
+            'manifest-merger marker (tools:node="replace" / tools:remove) '
+            "can strip it; cleartext policy would fall back to the platform "
+            "default"
+        )
+    value = match.group(1).strip()
+    bound_by_id = re.match(r"@(?:res/)?0x([0-9a-fA-F]+)", value)
+    if bound_by_id is not None:
+        # The id column is the merger-proof half of the pin: prove the
+        # referenced id IS xml/network_security_config in the table (an id
+        # snapshot alias to another name must not pass).
+        resources = _run_bounded_stdout(
+            [aapt, "dump", "resources", str(apk)],
+            "aapt dump resources",
+            max_bytes=MAX_RESOURCES_DUMP_BYTES,
+        )
+        _resources_table_resolves(
+            resources,
+            int(bound_by_id.group(1), 16),
+            _NETWORK_SECURITY_RESOURCE,
+            _NETWORK_SECURITY_ATTR_NAME,
+            binding_kind="networkSecurityConfig",
+        )
+    else:
+        # Older aapt prints the resource reference as a quoted string literal
+        # instead of an id. Decode the FULL payload first (the Raw spelling is
+        # the authority; unknown encodings fail closed inside
+        # _xmltree_attr_value) and then demand an EXACT match on the whole
+        # decoded value: a search()-style prefix hit would let trailing junk
+        # such as "@xml/network_security_config;" satisfy this pin while the
+        # runtime actually resolves - or fails to resolve - a different value.
+        decoded = _xmltree_attr_value(
+            value, f"merged manifest android:{_NETWORK_SECURITY_ATTR_NAME}"
+        )
+        if decoded != f"@xml/{_NETWORK_SECURITY_RESOURCE}":
+            raise PolicyError(
+                f"merged manifest android:{_NETWORK_SECURITY_ATTR_NAME} does not "
+                f"reference @xml/{_NETWORK_SECURITY_RESOURCE} (got {decoded}) - "
+                "rebound networkSecurityConfig binding"
+            )
+    nsc_dump = _run_bounded_stdout(
+        [aapt, "dump", "xmltree", str(apk), _NETWORK_SECURITY_MEMBER],
+        "aapt dump xmltree (network security config)",
+        max_bytes=MAX_RESOURCES_DUMP_BYTES,
+    )
+    root = _parse_aapt_xmltree(nsc_dump, "aapt xmltree network security config")
+    errors = _load_nsc_rules().validate_tree(
+        root, mode, _NETWORK_SECURITY_MEMBER
+    )
+    if errors:
+        raise PolicyError(
+            f"compiled {_NETWORK_SECURITY_MEMBER} fails the {mode} network "
+            f"security rules (artifact-level authority): {'; '.join(errors)}"
+        )
 
 
 def _validate_dexdump(dexdump: str, dex_name: str, dex_bytes: bytes) -> None:
@@ -861,6 +1176,11 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str) -> None:
     # Backup bindings on the MERGED manifest (artifact-level authority) run
     # for every policy mode: Play and Foss ship the same binding contract.
     _assert_merged_backup_bindings(aapt, apk, xmltree)
+    # networkSecurityConfig binding + compiled-XML rule check (same
+    # artifact-level authority, scripts/nsc_check.py rule engine); joined
+    # execution with the backup gate so one merged-manifest difference keeps
+    # every policy contract provable in this artifact.
+    _assert_merged_network_security_config(aapt, apk, xmltree)
     parsed_dexes: list[ParsedDex] = []
     descriptor_budget = DescriptorBudget()
     with zipfile.ZipFile(apk, "r") as archive:

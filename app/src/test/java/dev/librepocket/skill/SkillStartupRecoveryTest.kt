@@ -61,7 +61,7 @@ class SkillStartupRecoveryTest {
         val root = tempRoot()
         try {
             val tid = Thread.currentThread().id
-            val bak = File(root, ".fresh-skill.bak-${System.nanoTime()}-$tid").apply {
+            val bak = File(root, ".fresh-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(skillMd("fresh-skill", "舊版正文"), Charsets.UTF_8)
                 // 刻意設為「新鮮」（剛剛），證明崩潰窗口不受 maxAge 限制。
@@ -81,7 +81,7 @@ class SkillStartupRecoveryTest {
         val root = tempRoot()
         try {
             val tid = Thread.currentThread().id
-            val staging = File(root, ".inflight-skill.tmp-${System.nanoTime()}-$tid").apply {
+            val staging = File(root, ".inflight-skill.tmp-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(skillMd("inflight-skill", "新版正文"), Charsets.UTF_8)
                 setLastModified(System.currentTimeMillis())
@@ -104,7 +104,7 @@ class SkillStartupRecoveryTest {
                 writeText(skillMd(name, "現行版"), Charsets.UTF_8)
             }
             val tid = Thread.currentThread().id
-            val bak = File(root, ".$name.bak-${System.nanoTime()}-$tid").apply {
+            val bak = File(root, ".$name.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(skillMd(name, "舊版"), Charsets.UTF_8)
                 setLastModified(System.currentTimeMillis())
@@ -135,7 +135,7 @@ class SkillStartupRecoveryTest {
             val root = File(parent, "skills").apply { mkdirs() }
             val outside = File(parent, "outside").apply { mkdirs() }
             val sentinel = File(outside, "sentinel.txt").apply { writeText("keep", Charsets.UTF_8) }
-            val link = File(root, ".evil-skill.tmp-${System.nanoTime()}-1")
+            val link = File(root, ".evil-skill.tmp-${Math.abs(System.nanoTime())}-1")
             try {
                 java.nio.file.Files.createSymbolicLink(link.toPath(), outside.toPath())
             } catch (e: UnsupportedOperationException) {
@@ -163,7 +163,7 @@ class SkillStartupRecoveryTest {
             val root = File(parent, "skills").apply { mkdirs() }
             val outside = File(parent, "outside").apply { mkdirs() }
             val sentinel = File(outside, "sentinel.txt").apply { writeText("keep", Charsets.UTF_8) }
-            val link = File(root, ".evil-skill.bak-${System.nanoTime()}-1")
+            val link = File(root, ".evil-skill.bak-${Math.abs(System.nanoTime())}-1")
             try {
                 java.nio.file.Files.createSymbolicLink(link.toPath(), outside.toPath())
             } catch (e: UnsupportedOperationException) {
@@ -189,7 +189,7 @@ class SkillStartupRecoveryTest {
         val parent = tempRoot()
         try {
             val root = File(parent, "skills").apply { mkdirs() }
-            val link = File(root, ".ghost-skill.tmp-${System.nanoTime()}-1")
+            val link = File(root, ".ghost-skill.tmp-${Math.abs(System.nanoTime())}-1")
             try {
                 java.nio.file.Files.createSymbolicLink(
                     link.toPath(),
@@ -219,7 +219,7 @@ class SkillStartupRecoveryTest {
             val root = File(parent, "skills").apply { mkdirs() }
             val outside = File(parent, "outside").apply { mkdirs() }
             val sentinel = File(outside, "sentinel.txt").apply { writeText("keep", Charsets.UTF_8) }
-            val link = File(root, ".evil-skill.tmp-${System.nanoTime()}-1")
+            val link = File(root, ".evil-skill.tmp-${Math.abs(System.nanoTime())}-1")
             try {
                 java.nio.file.Files.createSymbolicLink(link.toPath(), outside.toPath())
             } catch (e: UnsupportedOperationException) {
@@ -352,7 +352,7 @@ class SkillStartupRecoveryTest {
             val sentinelDir = File(outsideDir, "nested.txt").apply {
                 writeText("keep", Charsets.UTF_8)
             }
-            val staging = File(root, ".evil-skill.tmp-${System.nanoTime()}-1").apply { mkdirs() }
+            val staging = File(root, ".evil-skill.tmp-${Math.abs(System.nanoTime())}-1").apply { mkdirs() }
             val linkToFile = File(staging, "to-file.lnk")
             val linkToDir = File(staging, "to-dir.lnk")
             try {
@@ -470,7 +470,7 @@ class SkillStartupRecoveryTest {
                 }
             }
             val tid = Thread.currentThread().id
-            val bak = File(root, ".rst-skill.bak-${System.nanoTime()}-$tid").apply {
+            val bak = File(root, ".rst-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(skillMd("rst-skill", "舊版正文"), Charsets.UTF_8)
                 setLastModified(System.currentTimeMillis())
@@ -596,7 +596,7 @@ class SkillStartupRecoveryTest {
                 org.junit.Assume.assumeNoException("cannot create symlink", e)
             }
             val tid = Thread.currentThread().id
-            File(link, ".sym-skill.bak-${System.nanoTime()}-$tid").apply {
+            File(link, ".sym-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(skillMd("sym-skill", "舊版"), Charsets.UTF_8)
                 setLastModified(System.currentTimeMillis() - 120_000L)
@@ -624,7 +624,7 @@ class SkillStartupRecoveryTest {
             // 直接在 symlink 目標（real）建立「過期」條目：若無 symlink 防衛，
             // listResiduals(link) 會 follow symlink 而列出它；有防衛則回空。
             val tid = Thread.currentThread().id
-            File(real, ".sym-skill.tmp-${System.nanoTime()}-$tid").apply {
+            File(real, ".sym-skill.tmp-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 setLastModified(System.currentTimeMillis() - (25L * 60 * 60 * 1000))
             }

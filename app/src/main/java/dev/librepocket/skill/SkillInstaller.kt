@@ -21,7 +21,10 @@ import java.util.zip.ZipInputStream
  *   工具，以及條目數/單檔/歸檔/總解壓四項預算；
  *   條目數預算的計數單位乃誠實差異（見 [unzipConstrained]）：ZIP 側含
  *   directory 條目、files 側僅檔案表鍵——兩者皆為保守方向（寧多不漏）；
- *   另有單條目名位元組上限 [MAX_ENTRY_NAME_BYTES]（防名稱超限才在寫入端
+ *   ZIP 的 directory 條目亦過同一名形狀閘（剝恰一個尾隨 '/' 後呼叫
+ *   [checkEntryName]；照舊不產檔案表鍵，見 [unzipConstrained]）；
+ *   另有單條目名位元組上限 [MAX_ENTRY_NAME_BYTES]（形狀閘**最前哨**——
+ *   超限名一律先收斂到長度預算訊息、不經任何回顧車道，防在寫入端
  *   以 ENAMETOOLONG 漂移成 IO_ERROR）；
  * - 每個 ZIP 只允許一個 Skill（單一頂層目錄 + 恰一個 `SKILL.md`）；
  * - 安裝只保存檔案、登記索引並預設啟用：永不執行 `scripts/` 下任何內容；
@@ -269,13 +272,28 @@ object SkillInstaller {
      * 或其他非一般檔案（含目錄型）的 SKILL.md 皆回 null：呼叫方視為「無法證明
      * 屬性」，僅 KEPT，不還原、不刪除
      * （與歧義同哲學）。
+     *
+     * 尺寸讀取改為**有界窗口**（TOCTOU 縱深）：lstat 的 length() 只作預閘，
+     * 真讀取至多 `MAX_SINGLE_FILE_BYTES + 1` 位元組（Files.newInputStream ＋
+     * readNBytes）——lstat 通過後到全文讀取前檔案被撐大的殘餘窗口內，實際
+     * 讀得超限即視為無法證明（回 null），不再依賴無界 readText 全量讀取；
+     * 解析僅吃這份受讀位元組前綴。
      */
     private fun bakManifestName(bakDir: File): String? = try {
         val md = File(bakDir, SKILL_MD)
         if (isSymlinkOrUnknown(md) || !md.isFile || md.length() > MAX_SINGLE_FILE_BYTES) {
             null
         } else {
-            SkillParser.parse(md.readText(Charsets.UTF_8)).manifest.name
+            java.nio.file.Files.newInputStream(md.toPath()).use { ins ->
+                // 至多 MAX+1 位元組：恰好 MAX 位元組照常可解析（與預閘一致），
+                // 讀滿 MAX+1 即「窗口內被撐大到超限」，無法證明。
+                val prefix = ins.readNBytes((MAX_SINGLE_FILE_BYTES + 1).toInt())
+                if (prefix.size > MAX_SINGLE_FILE_BYTES) {
+                    null
+                } else {
+                    SkillParser.parse(String(prefix, Charsets.UTF_8)).manifest.name
+                }
+            }
         }
     } catch (_: Exception) {
         null
@@ -716,7 +734,8 @@ object SkillInstaller {
     /**
      * 讀取已安裝版的 `version`（降版揭露用，見類 KDoc）。
      *
-     * best-effort：SKILL.md 缺席或解析失敗時回 null，不拋錯、不影響安裝結果。
+     * best-effort：SKILL.md 缺席、超單檔上限或解析失敗時回 null，不拋錯、
+     * 不影響安裝結果。
      */
     fun installedVersion(skillDir: File): String? {
         return try {
@@ -728,7 +747,19 @@ object SkillInstaller {
             // 偵測失敗時視為不可信（fail-closed）。
             if (isSymlinkOrUnknown(md)) return null
             if (!md.isFile) return null
-            SkillParser.parse(md.readText(Charsets.UTF_8)).manifest.version
+            // 與 [bakManifestName] 同一單檔上限（fail-closed 對稱）：超限
+            // SKILL.md 不讀、不解析、視為不可讀——揭露值本就是 best-effort
+            //（回 null，覆蓋照常進行，不因揭露失敗受阻），防對植入的
+            // 超限 frontmatter 做無界 readText。
+            if (md.length() > MAX_SINGLE_FILE_BYTES) return null
+            // lstat 與 readText 之間存在 swap 增長窗（同 bakManifestName 的
+            // 修正）：以 bounded read 兜底——超過單檔上限的字首一律視為
+            // 不可讀，讀取量本身有界。
+            val bytes = md.inputStream().use { s ->
+                s.readNBytes(MAX_SINGLE_FILE_BYTES.toInt() + 1)
+            }
+            if (bytes.size > MAX_SINGLE_FILE_BYTES) return null
+            SkillParser.parse(String(bytes, Charsets.UTF_8)).manifest.version
         } catch (_: Exception) {
             null
         }
@@ -858,6 +889,10 @@ object SkillInstaller {
         }
         // 單一頂層根 + 恰一個 SKILL.md。（裸頂層條目已在彙整階段逐 key 拒絕，
         // 此處按解析後的根集合縱深重驗——與換行式寫出端的形狀閘互為冗餘。）
+        // 誠實註記：第二子句為既存冗餘（死條件），到達此處的 key 恆含 '/'
+        // （裸 key 已於上方逐 key 拒、norm 又永非空——空形在 checkEntryName
+        // 即拒），`none { ... }` 不可能為真；保守起見不改判定（minimal diff），
+        // 僅註記，防未來誤把兩子句讀成兩條獨立語意。
         val roots = normalized.keys.map { it.substringBefore('/') }.toSet()
         if (roots.size != 1 || normalized.keys.none { '/' in it }) {
             return Result.Failure(Failure.MULTIPLE_ROOTS, "package must hold exactly one skill directory")
@@ -960,18 +995,60 @@ object SkillInstaller {
                 } catch (_: Exception) {
                     false
                 }
-                if (!made && !destRoot.isDirectory) {
-                    throw java.io.IOException("cannot create destRoot ${destRoot.name}")
+                // mkdirs 失敗的雙因消歧（fail-closed，先於舊「cannot create」
+                // 路由）：跟隨 link 的 isDirectory() 會把 planted symlink
+                // destRoot（本探針後置入，逃過上方 exists() 門的 symlink 防衛）
+                // 誤判成「race 中他人建成的真目錄」而照常寫入連結指向的外部
+                // 目錄——故 !made 分支先做 NOFOLLOW 探針（[isSymlinkOrUnknown]，
+                // 與上方 symlink 防衛同一先例變體），link／屬性不可判定一律
+                // 拒裝（IOException 會被下方統一收斂成 IO_ERROR；訊息與上方
+                // 真 symlink 車道收斂、僅含檔名）；真實目錄（race 中他人建成）
+                // 維持既有 silent-pass，僅「仍非目錄」者走「cannot create」舊
+                // 形狀。made=true 路徑刻意不動（正常建成無需重探；本僅在
+                // mkdirs 回 false 的灰分支加探針）。
+                if (!made) {
+                    if (isSymlinkOrUnknown(destRoot)) {
+                        throw java.io.IOException("destRoot must not be symlink: ${destRoot.name}")
+                    }
+                    if (!destRoot.isDirectory) {
+                        throw java.io.IOException("cannot create destRoot ${destRoot.name}")
+                    }
                 }
             }
             val target = File(destRoot, root)
-            if (target.exists() && !replace) {
-                return Result.Failure(Failure.ALREADY_EXISTS, "skill '$root' already installed")
-            }
-            // 覆蓋前 target symlink 防衛（fail-closed）：不對 symlink target 進行
-            // rename/刪除——planted target 會經由 bak 刪除波及外部內容。
-            if (target.exists() && isSymlinkOrUnknown(target)) {
-                return Result.Failure(Failure.IO_ERROR, "target must not be symlink: ${target.name}")
+            // target 槽三態 NOFOLLOW 探針（與 [handleCleanupEntry] 的 target 槽
+            // 判定同一先例變體，見 [targetStateNoFollow]）：跟隨 link 的
+            // `File.exists()` 把懸空 link 槽誤判成「缺席」——新鮮安裝會直接
+            // rename 把植入 link 吃掉（下方 isSymlink 防衛同樣被 exists()
+            // 短路跳過）、!replace 新鮮安裝對正 link 亦是同一 rename 吃 link
+            // 行為。改以三態定案：
+            // [TargetState.ABSENT]（確定缺席）→ 新鮮安裝路徑照常 proceed；
+            // [TargetState.PRESENT]（真實檔案／目錄或植入 link——NOFOLLOW 讀得
+            // 屬性即算被佔、dangling 亦然，與 cleanup 的「dangling ⊄ absent」
+            // 立場一致）→ 按序套既有契約：link（含 dangling）→ IO_ERROR 拒絕
+            //（更具體車道先於 ALREADY_EXISTS；訊息與原真 symlink 釘案字句
+            // 收斂，僅含檔名），真實檔案／目錄 + !replace → ALREADY_EXISTS
+            //（既有契約保留）；[TargetState.UNKNOWN]（屬性不可判定）→
+            // fail-closed 拒裝（訊息與真 symlink 收斂，同 destRoot 探針慣例：
+            // 不洩更多檔案系統屬性、僅含檔名）。
+            when (targetStateNoFollow(target)) {
+                TargetState.ABSENT -> Unit
+                TargetState.UNKNOWN ->
+                    return Result.Failure(Failure.IO_ERROR, "target must not be symlink: ${target.name}")
+                TargetState.PRESENT -> {
+                    // target symlink 防衛（fail-closed，先於 ALREADY_EXISTS 的
+                    // 佔位契約）：link 型 target（正 link 或 dangling）無論
+                    // replace 與否一律拒絕——不對 link 進行 rename→bak（波及
+                    // 外部內容），亦不讓新鮮 rename 把 link 吃掉。
+                    if (isSymlinkOrUnknown(target)) {
+                        return Result.Failure(Failure.IO_ERROR, "target must not be symlink: ${target.name}")
+                    }
+                    // 非 link 的被佔槽位（真實檔案／目錄）→ 既有契約：
+                    // !replace 拒裝。
+                    if (!replace) {
+                        return Result.Failure(Failure.ALREADY_EXISTS, "skill '$root' already installed")
+                    }
+                }
             }
             val tid = Thread.currentThread().id
             // 產名一律 abs(nanoTime)（見 STAGING_RE 產名形狀合約）：nanoTime 規格
@@ -1090,10 +1167,16 @@ object SkillInstaller {
      *
      * 條目預算（[MAX_ENTRIES]）的計數單位**含 directory 條目**（誠實註記）：
      * 每讀到一個 entry（含目錄型，不產檔案表鍵）皆計數、超限即拒——只讓計數
-     * 更早觸頂（保守方向，寧多不漏）。對照：files 側（[installFiles] 的
-     * `files.size`）僅計檔案表鍵。兩種計法刻意不一致（ZIP 的目錄條目是包裝
-     * 自陳形狀，解包層採最保守計法；files 表無此概念），不改行為以免耦合
-     * 兩側解包層細節。
+     * 更早觸頂（保守方向，寧多不漏）。directory 條目同樣過**同名形狀閘**
+     * （[checkEntryName]；ZIP 目錄條目名按慣例尾隨 '/'，而空段規則不容尾隨
+     * 空段，故先剝掉**恰一個**尾隨 '/' 再檢——"a//b/" 剝一刀後仍含中段空段
+     * 照樣拒、"x//" 亦留 "x/" 被拒（與檔表側同一空段規則）；良性形如
+     * "dir/"、"./dir/" 照常通過）。照舊**不產檔案表鍵**：否則 "root/" 歸一
+     * 後的裸頂層名會誤觸 installFiles 的 MULTIPLE_ROOTS，封殺一切帶目錄條目
+     * 的正常物料；directory 條目亦無內容流、仍不計位元組預算。對照：files 側
+     * （[installFiles] 的 `files.size`）僅計檔案表鍵。兩種計法刻意不一致
+     * （ZIP 的目錄條目是包裝自陳形狀，解包層採最保守計法；files 表無此概念），
+     * 不改行為以免耦合兩側解包層細節。
      */
     private fun unzipConstrained(zipBytes: ByteArray): Map<String, ByteArray> {
         val out = LinkedHashMap<String, ByteArray>()
@@ -1134,6 +1217,18 @@ object SkillInstaller {
                         buf.write(chunk, 0, n)
                     }
                     out[norm] = buf.toByteArray()
+                } else {
+                    // directory 條目與檔型條目同一名形狀閘（注入面不因條目型別
+                    // 豁免；條目計數已在上方統一計入、建制不變）：ZIP 目錄條目
+                    // 名按慣例尾隨 '/'，本閘的空段規則不容尾隨空段，故剝掉
+                    // 恰一個尾隨 '/' 再檢（見本函式 KDoc；檢查目標為剝後名，
+                    // 訊息回顧亦僅經 [checkEntryName] 的既有車道）。目錄條目
+                    // 照舊不產檔案表鍵、不讀流（無內容）、不計位元組預算。
+                    val failure = checkEntryName(name.removeSuffix("/"))
+                    if (failure != null) {
+                        val r = failure as Result.Failure
+                        throw ConstrainedException(r.reason, r.message)
+                    }
                 }
                 zin.closeEntry()
                 entry = zin.nextEntry
@@ -1145,6 +1240,20 @@ object SkillInstaller {
 
     private fun checkEntryName(raw: String): Result.Failure? {
         if (raw.isEmpty()) return Result.Failure(Failure.TRAVERSAL, "empty entry name")
+        // 名稱位元組上限放在形狀規則**最前哨**（回顯車道把關；形狀拒絕車道，
+        // 同空段／空名，見 [MAX_ENTRY_NAME_BYTES]）：超限名本身可為 hostile
+        // 供給（zip 條目名可任意長），若先跑形狀規則，ABSOLUTE_PATH／
+        // BAD_SEPARATOR／"path traversal"／"bad path segment" 的訊息會把
+        // 全名（可達 64KB+ 的任意供給）回顯進錯誤訊息。故先收斂到既有
+        // 「entry name too long」形狀（同 TRAVERSAL 車道，訊息僅回長度預算、
+        // 不回顯全文，錯誤碼不再以 ENAMETOOLONG 漂移成 IO_ERROR）——
+        // ≤上限的名照常走其後的形狀規則、既有 short-name 釘案字句不變。
+        if (raw.toByteArray(Charsets.UTF_8).size > MAX_ENTRY_NAME_BYTES) {
+            return Result.Failure(
+                Failure.TRAVERSAL,
+                "entry name too long (max $MAX_ENTRY_NAME_BYTES bytes)",
+            )
+        }
         if (raw.startsWith("/") || raw.startsWith("\\")) {
             return Result.Failure(Failure.ABSOLUTE_PATH, "absolute path: $raw")
         }
@@ -1158,17 +1267,10 @@ object SkillInstaller {
         val parts = norm.split('/')
         if (parts.any { it == ".." }) return Result.Failure(Failure.TRAVERSAL, "path traversal: $raw")
         if (parts.any { it.isEmpty() }) {
-            // 允許尾隨 '/' 的目錄條目（解包側已跳過）；檔案表不應含空段。
+            // 檔案表不含空段：解包側的目錄條目已剝掉恰一個尾隨 '/' 才到達
+            //（見 [unzipConstrained]），"a//b/" 剝一刀後仍含空段在此照樣拒；
+            // files 側框架帶尾隨 '/' 的 raw 名仍由本段形狀拒。
             return Result.Failure(Failure.TRAVERSAL, "bad path segment: $raw")
-        }
-        if (raw.toByteArray(Charsets.UTF_8).size > MAX_ENTRY_NAME_BYTES) {
-            // 名稱位元組上限（形狀拒絕車道，同空段／空名；見 [MAX_ENTRY_NAME_BYTES]）：
-            // 不在訊息回顯全文——超限名本身可為 hostile 供給（zip 條目名可任意長），
-            // 只回長度預算，錯誤碼不再以 ENAMETOOLONG 漂移成 IO_ERROR。
-            return Result.Failure(
-                Failure.TRAVERSAL,
-                "entry name too long (max $MAX_ENTRY_NAME_BYTES bytes)",
-            )
         }
         return null
     }

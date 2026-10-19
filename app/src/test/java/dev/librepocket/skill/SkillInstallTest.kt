@@ -547,9 +547,192 @@ class SkillInstallTest {
             )
             assertTrue("外部 sentinel 必須存活", sentinel.isFile)
             assertTrue("planted link 不得被搬移或刪除", java.nio.file.Files.isSymbolicLink(target.toPath()))
-            // 非 replace 的新鮮安裝在 ALREADY_EXISTS 檢查就先擋，不受本測影響。
+            // 非 replace 的新鮮安裝對 link target 同樣以 IO_ERROR 拒絕（target
+            // NOFOLLOW 三態探針先於 ALREADY_EXISTS 的佔位契約，link 型一律
+            // 拒絕，見 SkillInstaller target 探針註記），不受本測影響。
         } finally {
             parent.deleteRecursively()
+        }
+    }
+
+    @Test fun installOntoDanglingLinkTarget_isRefused_ioError_withControls() {
+        val parent = Files.createTempDirectory("skill-install-link").toFile().apply {
+            deleteOnExit()
+        }
+        try {
+            val root = File(parent, "skills").apply { mkdirs() }
+            val nowhere = File(parent, "nowhere") // 刻意不存在：link 恆懸空
+            val zip = zipOf(
+                "meeting-prep/SKILL.md" to skillMd().toByteArray(Charsets.UTF_8),
+            )
+            val target = File(root, "meeting-prep")
+            try {
+                java.nio.file.Files.createSymbolicLink(target.toPath(), nowhere.toPath())
+            } catch (e: UnsupportedOperationException) {
+                org.junit.Assume.assumeNoException("platform without symlink", e)
+            } catch (e: java.io.IOException) {
+                org.junit.Assume.assumeNoException("cannot create symlink", e)
+            }
+            // 懸空 link：跟隨 link 的 exists() 曾把它誤判成「缺席」——新鮮安裝
+            // （replace=false）過去會 rename 把植入 link 吃掉。NOFOLLOW 三態
+            // 探針讀得屬性 → PRESENT（被佔，與 cleanup 的「dangling ⊄ absent」
+            // 立場一致），fresh 安裝即走 symlink 拒絕車道，訊息與上方真 link
+            // 釘案同一字句（installOntoSymlinkTarget_isRefused_ioError）。
+            val r = SkillInstaller.installZip(zip, root)
+            assertTrue("expected failure, got $r", r is SkillInstaller.Result.Failure)
+            assertEquals(
+                SkillInstaller.Failure.IO_ERROR,
+                (r as SkillInstaller.Result.Failure).reason,
+            )
+            assertTrue(
+                "訊息應與真 symlink target 案同字句：${(r as SkillInstaller.Result.Failure).message}",
+                "target must not be symlink" in (r as SkillInstaller.Result.Failure).message,
+            )
+            // 實證「不波及據點」：植入 link 本身存活、未被 rename 吃掉；
+            // destRoot 無半成品；連結指向物（缺席）未被創造。
+            assertTrue(
+                "懸空 link 不得被搬移或吃掉",
+                java.nio.file.Files.isSymbolicLink(target.toPath()),
+            )
+            assertTrue(
+                "不得殘留半成品：${root.listFiles()!!.toList()}",
+                root.listFiles()!!.isEmpty(),
+            )
+            assertFalse("不得經 link 造出外部內容", nowhere.exists())
+
+            // 正向對照一：fresh 安裝到真缺席 target（無 link）照常成功。
+            val root2 = File(parent, "skills2").apply { mkdirs() }
+            val rOk = SkillInstaller.installZip(zip, root2)
+            assertTrue("fresh install onto ABSENT target must succeed, got $rOk",
+                rOk is SkillInstaller.Result.Success)
+            assertTrue(File(root2, "meeting-prep/SKILL.md").isFile)
+
+            // 正向對照二：非 link 的被佔槽位（真安裝目錄）+ replace=false
+            // 仍走既有 ALREADY_EXISTS 契約。
+            val rAgain = SkillInstaller.installZip(zip, root2)
+            assertTrue("expected failure, got $rAgain", rAgain is SkillInstaller.Result.Failure)
+            assertEquals(
+                SkillInstaller.Failure.ALREADY_EXISTS,
+                (rAgain as SkillInstaller.Result.Failure).reason,
+            )
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    @Test fun zipDirEntryTraversalName_rejected_sameShapeLaneAsFiles() {
+        val root = tempRoot()
+        try {
+            // 目錄條目（尾隨 '/'）與檔型條目同一名形狀閘（條目計數建制不變）：
+            // `evil/../x/` 剝掉恰一個尾隨 '/' 後的 "evil/../x" 仍屬穿越——
+            // 與檔名形狀同一 TRAVERSAL 車道、同一「path traversal: …」訊息。
+            // 解包在記憶體中止、未到 staging → destRoot 無半成品、無 extraction
+            // 殘餘。目錄條目置於首位：證明拒絕在消費任何檔條目之前命中。
+            val bos = ByteArrayOutputStream()
+            ZipOutputStream(bos).use { zos ->
+                val dir = ZipEntry("evil/../x/")
+                zos.putNextEntry(dir)
+                zos.closeEntry()
+                zos.putNextEntry(ZipEntry("meeting-prep/SKILL.md"))
+                zos.write(skillMd().toByteArray(Charsets.UTF_8))
+                zos.closeEntry()
+            }
+            val r = SkillInstaller.installZip(bos.toByteArray(), root)
+            assertTrue("expected failure, got $r", r is SkillInstaller.Result.Failure)
+            assertEquals(
+                SkillInstaller.Failure.TRAVERSAL,
+                (r as SkillInstaller.Result.Failure).reason,
+            )
+            assertTrue(
+                "訊息應指名穿越：${(r as SkillInstaller.Result.Failure).message}",
+                "path traversal" in (r as SkillInstaller.Result.Failure).message,
+            )
+            assertFalse("未落盤任何檔條目", File(root, "meeting-prep").exists())
+            assertFalse("不容穿越目錄名實體化", File(root, "evil").exists())
+            assertTrue(
+                "不得留下任何解包殘餘：${root.listFiles()!!.toList()}",
+                root.listFiles()!!.isEmpty(),
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun zipDirEntries_benignStillInstall_noKeysForDirs() {
+        val root = tempRoot()
+        try {
+            // 對照（良性）：帶目錄條目的正常物料照常安裝成功——形狀閘剝尾隨
+            // '/' 後放行 "meeting-prep/refs/"，且目錄條目照舊不產檔案表鍵
+            //（否則裸頂層名 "meeting-prep" 會誤觸 installFiles 的
+            // MULTIPLE_ROOTS、封殺帶目錄條目的正常物料）。目錄條目亦不實體化
+            //（鍵僅屬檔條目），故只斷言檔案落盤與成功。
+            //（誠實標註：本測為 positive control，非 fail-old 判別——舊碼
+            // 跳過目錄條目本就成功；它擋的是「尾斜體剝離缺漏 / 目錄條目誤產鍵」。）
+            val bos = ByteArrayOutputStream()
+            ZipOutputStream(bos).use { zos ->
+                val dir = ZipEntry("meeting-prep/refs/")
+                zos.putNextEntry(dir)
+                zos.closeEntry()
+                zos.putNextEntry(ZipEntry("meeting-prep/SKILL.md"))
+                zos.write(skillMd().toByteArray(Charsets.UTF_8))
+                zos.closeEntry()
+            }
+            val r = SkillInstaller.installZip(bos.toByteArray(), root)
+            assertTrue("expected success, got $r", r is SkillInstaller.Result.Success)
+            assertEquals("meeting-prep", (r as SkillInstaller.Result.Success).skill.id)
+            assertTrue(File(root, "meeting-prep/SKILL.md").isFile)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun oversizedEntryName_hitsLengthCapBeforeShapeEchoLanes() {
+        val root = tempRoot()
+        try {
+            // >4KB 且形狀違規（含中段 "../"）的條目名：位元組上限現為形狀規則
+            // 最前哨——超限名整體只收斂到「entry name too long」（TRAVERSAL
+            // 車道，訊息僅回長度預算、訊息全文被釘死故必不含 4KB+ 原名），
+            // 不再先經形狀回顯車道把全名洩進訊息（舊序會先命中
+            // "path traversal: $raw" 回顯全文）。
+            val longName = "a/../" + "b".repeat(SkillInstaller.MAX_ENTRY_NAME_BYTES)
+            val rFiles = SkillInstaller.installFiles(
+                linkedMapOf<String, ByteArray>(
+                    "meeting-prep/SKILL.md" to skillMd().toByteArray(Charsets.UTF_8),
+                    longName to "x".toByteArray(),
+                ),
+                root,
+            )
+            assertTrue("expected failure, got $rFiles", rFiles is SkillInstaller.Result.Failure)
+            val fFiles = rFiles as SkillInstaller.Result.Failure
+            assertEquals(SkillInstaller.Failure.TRAVERSAL, fFiles.reason)
+            assertEquals(
+                "訊息全文釘死（超限名不得有任何回顯）：${fFiles.message}",
+                "entry name too long (max ${SkillInstaller.MAX_ENTRY_NAME_BYTES} bytes)",
+                fFiles.message,
+            )
+            assertFalse("must not echo the oversized raw name", longName in fFiles.message)
+            assertTrue(
+                "不得留下半成品：${root.listFiles()!!.toList()}",
+                root.listFiles()!!.isEmpty(),
+            )
+
+            // zip 路徑（同一共用 helper，zip 與 files 兩框架匯流處一致）。
+            val zip = zipOf(
+                "meeting-prep/SKILL.md" to skillMd().toByteArray(Charsets.UTF_8),
+                longName to "x".toByteArray(),
+            )
+            val rZip = SkillInstaller.installZip(zip, root)
+            assertTrue("expected failure, got $rZip", rZip is SkillInstaller.Result.Failure)
+            val fZip = rZip as SkillInstaller.Result.Failure
+            assertEquals(SkillInstaller.Failure.TRAVERSAL, fZip.reason)
+            assertEquals(
+                "entry name too long (max ${SkillInstaller.MAX_ENTRY_NAME_BYTES} bytes)",
+                fZip.message,
+            )
+            assertFalse("must not echo the oversized raw name", longName in fZip.message)
+            assertTrue(root.listFiles()!!.isEmpty())
+        } finally {
+            root.deleteRecursively()
         }
     }
 

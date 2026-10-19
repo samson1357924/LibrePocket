@@ -469,8 +469,8 @@ class SkillAtomicCommitTest {
                 File(this, "x").writeText("x")
                 setLastModified(now - 120_000L)
             }
-            val fresh = File(root, ".atomic-skill.tmp-${System.nanoTime()}-$tid").apply { mkdirs() }
-            val staleBak = File(root, ".atomic-skill.bak-${System.nanoTime()}-$tid").apply {
+            val fresh = File(root, ".atomic-skill.tmp-${Math.abs(System.nanoTime())}-$tid").apply { mkdirs() }
+            val staleBak = File(root, ".atomic-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 setLastModified(now - 120_000L)
             }
@@ -492,7 +492,7 @@ class SkillAtomicCommitTest {
         try {
             // 模擬崩潰窗口：backup 已搬離、target 缺席（真實 nano-tid 格式名）。
             val tid = Thread.currentThread().id
-            val bak = File(root, ".orphan-skill.bak-${System.nanoTime()}-$tid").apply {
+            val bak = File(root, ".orphan-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(
                     skillMd(name = "orphan-skill", body = "舊版正文"),
@@ -563,7 +563,7 @@ class SkillAtomicCommitTest {
         try {
             // 形狀符合但 id 非法（NAME_RE 拒大寫）：只刪不恢復。
             val tid = Thread.currentThread().id
-            val bad = File(root, ".UPPER.bak-${System.nanoTime()}-$tid").apply {
+            val bad = File(root, ".UPPER.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText("junk")
                 setLastModified(System.currentTimeMillis() - 120_000L)
@@ -584,7 +584,7 @@ class SkillAtomicCommitTest {
             val root = tempRoot()
             try {
                 val tid = Thread.currentThread().id
-                val staging = File(root, ".w1-skill.tmp-${System.nanoTime()}-$tid").apply {
+                val staging = File(root, ".w1-skill.tmp-${Math.abs(System.nanoTime())}-$tid").apply {
                     mkdirs()
                     File(this, "SKILL.md").writeText(skillMd(name = "w1-skill", body = "新版正文"))
                 }
@@ -601,11 +601,11 @@ class SkillAtomicCommitTest {
             val root = tempRoot()
             try {
                 val tid = Thread.currentThread().id
-                File(root, ".w2-skill.bak-${System.nanoTime()}-$tid").apply {
+                File(root, ".w2-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                     mkdirs()
                     File(this, "SKILL.md").writeText(skillMd(name = "w2-skill", body = "舊版正文"))
                 }
-                File(root, ".w2-skill.tmp-${System.nanoTime()}-$tid").apply {
+                File(root, ".w2-skill.tmp-${Math.abs(System.nanoTime())}-$tid").apply {
                     mkdirs()
                     File(this, "SKILL.md").writeText(skillMd(name = "w2-skill", body = "新版正文"))
                 }
@@ -629,7 +629,7 @@ class SkillAtomicCommitTest {
                     mkdirs()
                     File(this, "SKILL.md").writeText(skillMd(name = "w3-skill", body = "新版正文"))
                 }
-                val bak = File(root, ".w3-skill.bak-${System.nanoTime()}-$tid").apply { mkdirs() }
+                val bak = File(root, ".w3-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply { mkdirs() }
                 val removed = SkillInstaller.cleanupStaleStaging(root, maxAgeMillis = 0L)
                 assertEquals(1, removed)
                 assertFalse(bak.exists())
@@ -816,6 +816,45 @@ class SkillAtomicCommitTest {
         }
     }
 
+    @Test fun installedVersion_oversizedSkillMd_returnsNull() {
+        // 與 bakManifestName 同一單檔上限（fail-closed 對稱／零成長硬射防衛；
+        // 誠實標註：本測對舊程式碼亦為綠——舊路徑由 SkillParser 的 body 上限
+        // 擋下並同樣回 null，本測護住的是「尺寸閘先行、不做無界 readText」
+        // 的未來漂移與 DoS 型讀取窗，鏡法同
+        // staleBakWithoutTarget_oversizedSkillMd_keptNotRestored 的超限
+        // 建構）：SKILL.md >MAX_SINGLE_FILE_BYTES 即不讀、不解析，
+        // [SkillInstaller.installedVersion] 視為不可讀回 null；覆蓋揭露鏈
+        //（replace 成功帶回 replacedVersion）對超限舊版同樣揭露為 null，且
+        // 安裝本身不因揭露失敗受阻。
+        val root = tempRoot()
+        try {
+            installV1(root, name = "oversizever-skill", body = "正文")
+            val mdText = skillMd(name = "oversizever-skill", version = "1.0") + "\n" +
+                "A".repeat(SkillInstaller.MAX_SINGLE_FILE_BYTES.toInt() + 1)
+            File(root, "oversizever-skill/SKILL.md").writeText(mdText, Charsets.UTF_8)
+            assertEquals(
+                "超限 SKILL.md 不得被讀取揭露",
+                null,
+                SkillInstaller.installedVersion(File(root, "oversizever-skill")),
+            )
+
+            // 覆蓋路徑：replacedVersion 對超限舊版揭露 null；安裝照常成功。
+            val v2 = zipOf(
+                "oversizever-skill/SKILL.md" to
+                    skillMd(name = "oversizever-skill", body = "新正文", version = "2.0")
+                        .toByteArray(Charsets.UTF_8),
+            )
+            val r = SkillInstaller.installZip(v2, root, replace = true)
+            assertTrue("expected success, got $r", r is SkillInstaller.Result.Success)
+            assertEquals(null, (r as SkillInstaller.Result.Success).replacedVersion)
+
+            // 對照（成功換新後閘只拒超限、不拒正常）：新版可讀出版本。
+            assertEquals("2.0", SkillInstaller.installedVersion(File(root, "oversizever-skill")))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
     @Test fun listResiduals_observesWithoutMutating() {
         val root = tempRoot()
         try {
@@ -826,9 +865,9 @@ class SkillAtomicCommitTest {
                 mkdirs()
                 setLastModified(now - 120_000L)
             }
-            val fresh = File(root, ".atomic-skill.tmp-${System.nanoTime()}-$tid").apply { mkdirs() }
+            val fresh = File(root, ".atomic-skill.tmp-${Math.abs(System.nanoTime())}-$tid").apply { mkdirs() }
             // target 仍在時的孤兒 bak（清理會刪除並計數）。
-            val staleBak = File(root, ".atomic-skill.bak-${System.nanoTime()}-$tid").apply {
+            val staleBak = File(root, ".atomic-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 setLastModified(now - 120_000L)
             }
@@ -948,7 +987,7 @@ class SkillAtomicCommitTest {
         val root = tempRoot()
         try {
             val tid = Thread.currentThread().id
-            val future = File(root, ".atomic-skill.tmp-${System.nanoTime()}-$tid").apply {
+            val future = File(root, ".atomic-skill.tmp-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 assertTrue("setLastModified must succeed", setLastModified(System.currentTimeMillis() + 600_000L))
             }
@@ -965,7 +1004,7 @@ class SkillAtomicCommitTest {
         val root = tempRoot()
         try {
             val tid = Thread.currentThread().id
-            val fileBak = File(root, ".orphan2-skill.bak-${System.nanoTime()}-$tid").apply {
+            val fileBak = File(root, ".orphan2-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 writeText("not a dir")
                 setLastModified(System.currentTimeMillis() - 120_000L)
             }
@@ -987,7 +1026,7 @@ class SkillAtomicCommitTest {
             assertTrue("expected success, got $r", r is SkillInstaller.Result.Success)
             assertTrue(File(root, "a.b-c/SKILL.md").isFile)
             val tid = Thread.currentThread().id
-            val stale = File(root, ".a.b-c.tmp-${System.nanoTime()}-$tid").apply {
+            val stale = File(root, ".a.b-c.tmp-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 assertTrue(setLastModified(System.currentTimeMillis() - 120_000L))
             }
@@ -1068,8 +1107,8 @@ class SkillAtomicCommitTest {
                     (r as SkillInstaller.Result.Failure).reason,
                 )
                 assertTrue(
-                    "message 應循 mkdirs 失敗路由（同 destRootNotCreatable 款式）：${(r as SkillInstaller.Result.Failure).message}",
-                    "cannot create" in (r as SkillInstaller.Result.Failure).message,
+                    "message 應循未知屬性→ NOT symlink 收斂路由（同 destRoot must not be symlink 款式）：${(r as SkillInstaller.Result.Failure).message}",
+                    "destRoot must not be symlink" in (r as SkillInstaller.Result.Failure).message,
                 )
             } finally {
                 try {
@@ -1091,7 +1130,7 @@ class SkillAtomicCommitTest {
         val root = tempRoot()
         try {
             val tid = Thread.currentThread().id
-            val bak = File(root, ".mismatch-skill.bak-${System.nanoTime()}-$tid").apply {
+            val bak = File(root, ".mismatch-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(
                     skillMd(name = "other-name", body = "偽 bak 內容"),
@@ -1119,12 +1158,12 @@ class SkillAtomicCommitTest {
         val root = tempRoot()
         try {
             val tid = Thread.currentThread().id
-            val missing = File(root, ".mdmiss-skill.bak-${System.nanoTime()}-$tid").apply {
+            val missing = File(root, ".mdmiss-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "orphan").writeText("not a skill", Charsets.UTF_8)
                 setLastModified(System.currentTimeMillis() - 120_000L)
             }
-            val corrupt = File(root, ".mdjunk-skill.bak-${System.nanoTime()}-$tid").apply {
+            val corrupt = File(root, ".mdjunk-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText("junk without frontmatter", Charsets.UTF_8)
                 setLastModified(System.currentTimeMillis() - 120_000L)
@@ -1152,7 +1191,7 @@ class SkillAtomicCommitTest {
             val tid = Thread.currentThread().id
             val mdText = skillMd(name = "oversize-skill", body = "正文") + "\n" +
                 "A".repeat(SkillInstaller.MAX_SINGLE_FILE_BYTES.toInt() + 1)
-            val bak = File(root, ".oversize-skill.bak-${System.nanoTime()}-$tid").apply {
+            val bak = File(root, ".oversize-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(mdText, Charsets.UTF_8)
                 setLastModified(System.currentTimeMillis() - 120_000L)
@@ -1184,7 +1223,7 @@ class SkillAtomicCommitTest {
                 writeText(skillMd(name = "linkbak-skill"), Charsets.UTF_8)
             }
             val tid = Thread.currentThread().id
-            val bak = File(root, ".linkbak-skill.bak-${System.nanoTime()}-$tid").apply { mkdirs() }
+            val bak = File(root, ".linkbak-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply { mkdirs() }
             try {
                 java.nio.file.Files.createSymbolicLink(
                     File(bak, "SKILL.md").toPath(),

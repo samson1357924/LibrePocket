@@ -86,24 +86,28 @@ object MusicTool : SystemTool<MusicTool.Params> {
     // 鍵碼查表缺項以 ISE 快速失敗（可被 [guardedToolBuild] 收斂為 INTERNAL），
     // 而非讓穿透性的 NoSuchElementException（guard 不可捕）漏出生產迴圈；
     // 新增 Control 未補鍵碼時層面即收斂、話術保持一致（Phase2 收斂點真實性）。
-    val keyCode = CONTROL_KEY_CODES[control]
-      ?: throw IllegalStateException("no keyCode mapping for Control.${control.name}")
-    return ControlSpec(control, keyCode)
+    // 缺鍵碼守衛與 [buildControlIntent] 共用 [keyCodeOrThrow]（單一實作）。
+    return ControlSpec(control, keyCodeOrThrow(control))
   }
 
   fun buildControlIntent(control: Control): IntentSpec {
-    // 同 [buildControl]：缺鍵碼 ISE（非 NoSuchElementException），確保
-    // guardedToolBuild 真實收斂；D2 型別化：keyCode 用 Int，端側 MediaSession
-    // 回調按 int 讀回。契約 gap 見檔 KDoc 控制段：官方形狀為
-    // EXTRA_KEY_EVENT（KeyEvent），此 keyCode Int 為內部建模近似——
+    // 同 [buildControl]：缺鍵碼 ISE（非 NoSuchElementException，共用
+    // [keyCodeOrThrow]），確保 guardedToolBuild 真實收斂；D2 型別化：keyCode 用
+    // Int，端側 MediaSession 回調按 int 讀回。契約 gap 見檔 KDoc 控制段：
+    // 官方形狀為 EXTRA_KEY_EVENT（KeyEvent），此 keyCode Int 為內部建模近似——
     // 接線須對齊或改直控，不得冒充官方契約。
-    val keyCode = CONTROL_KEY_CODES[control]
-      ?: throw IllegalStateException("no keyCode mapping for Control.${control.name}")
     return IntentSpec(
       action = IntentActions.MEDIA_BUTTON,
-      extras = mapOf("keyCode" to IntentExtra.IntVal(keyCode)),
+      extras = mapOf("keyCode" to IntentExtra.IntVal(keyCodeOrThrow(control))),
     )
   }
+
+  /** 控制鍵碼查表的共用快路：缺項拋 ISE 快速失敗（可被 [guardedToolBuild] 收斂為
+   *  INTERNAL），[buildControl]／[buildControlIntent] 兩份 builder 只有這一份
+   *  缺鍵碼守衛——ISE 訊息字面與抽取前的 inline 版本逐字相同。 */
+  private fun keyCodeOrThrow(control: Control): Int =
+    CONTROL_KEY_CODES[control]
+      ?: throw IllegalStateException("no keyCode mapping for Control.${control.name}")
 
   override fun execute(params: Params, env: SystemEnv, launcher: IntentLauncher): ToolResult {
     val check = check(env)

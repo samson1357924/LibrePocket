@@ -272,11 +272,17 @@ anti-echo for message text, deliberately not a parameter-validation cap).
 The skill installer/registry fail closed on shape doubts, with exact reasons —
 not OR-converged copies — pinned per test in `SkillInstallTest`:
 `pathTraversalRejected` (`SkillInstaller.Failure.TRAVERSAL`),
+`absolutePathRejected` (`ABSOLUTE_PATH`, exact — an absolute entry hits the
+per-entry name gate before the summary gates, so it never reaches the
+multiple-roots lane; that lane is pinned separately in
+`multiRootPackage_rejected_exactReason`),
 `missingSkillMdRejected` (`MISSING_SKILL_MD`),
 `badFrontmatterRejected_missingName` (`BAD_FRONTMATTER`),
 `nameMismatchRejected` (`NAME_MISMATCH`), and
-`filesAndZipShareSameValidation_unknownToolRejected` (`UNKNOWN_TOOL`; files
-and zips share one validation path, so a rejected ref-name rejects both). The
+`filesAndZipShareSameValidation_unknownToolRejected` (`UNKNOWN_TOOL`; the same
+payload is driven through both the files lane and the compressed-zip lane, so
+the shared-validation claim is evidenced rather than inferred — a rejected
+ref-name rejects both). The
 fail-closed destRoot probe and restore content proof are additionally
 pinned in `SkillStartupRecoveryTest`: the destRoot probe
 `isSymlinkOrUnknown` treats undecidable attributes as unsafe

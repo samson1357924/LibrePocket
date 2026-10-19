@@ -78,16 +78,31 @@ class SkillInstallTest {
     @Test fun filesAndZipShareSameValidation_unknownToolRejected() {
         val root = tempRoot()
         try {
-            val files = mapOf(
-                "meeting-prep/SKILL.md" to skillMd(tools = "[no.such.tool]").toByteArray(Charsets.UTF_8),
+            val md = skillMd(tools = "[no.such.tool]").toByteArray(Charsets.UTF_8)
+            // files 路徑（直接檔案表）：UNKNOWN_TOOL exact pin。
+            val r1 = SkillInstaller.installFiles(
+                mapOf("meeting-prep/SKILL.md" to md),
+                root,
             )
-            val r1 = SkillInstaller.installFiles(files, root)
             assertTrue(r1 is SkillInstaller.Result.Failure)
             assertEquals(
                 SkillInstaller.Failure.UNKNOWN_TOOL,
                 (r1 as SkillInstaller.Result.Failure).reason,
             )
             assertFalse(File(root, "meeting-prep").exists())
+            assertTrue("不得留下半成品：${root.listFiles()!!.toList()}", root.listFiles()!!.isEmpty())
+            // zip 路徑（壓縮同一物料）：installZip 解包後落入同一校驗鏈
+            // （installFiles），同一 reason 同一形狀——本測試名稱所主張的
+            // files/zip 共用驗證以實證涵蓋，不再只是推斷。
+            val zip = zipOf("meeting-prep/SKILL.md" to md)
+            val r2 = SkillInstaller.installZip(zip, root)
+            assertTrue(r2 is SkillInstaller.Result.Failure)
+            assertEquals(
+                SkillInstaller.Failure.UNKNOWN_TOOL,
+                (r2 as SkillInstaller.Result.Failure).reason,
+            )
+            assertFalse(File(root, "meeting-prep").exists())
+            assertTrue("不得留下半成品：${root.listFiles()!!.toList()}", root.listFiles()!!.isEmpty())
         } finally {
             root.deleteRecursively()
         }
@@ -184,13 +199,46 @@ class SkillInstallTest {
     @Test fun absolutePathRejected() {
         val root = tempRoot()
         try {
+            // 絕對路徑條目（前導 '/'）：per-entry 形狀閘 checkEntryName 先於彙整閘
+            // 命中 → reason 恰為 ABSOLUTE_PATH（exact，不再以 OR 收斂
+            // MULTIPLE_ROOTS——那是截然不同的車道，由下方對照案釘住）。
             val r = SkillInstaller.installFiles(
                 mapOf("/tmp/evil" to "x".toByteArray()),
                 root,
             )
             assertTrue(r is SkillInstaller.Result.Failure)
-            val reason = (r as SkillInstaller.Result.Failure).reason
-            assertTrue(reason == SkillInstaller.Failure.ABSOLUTE_PATH || reason == SkillInstaller.Failure.MULTIPLE_ROOTS)
+            assertEquals(
+                SkillInstaller.Failure.ABSOLUTE_PATH,
+                (r as SkillInstaller.Result.Failure).reason,
+            )
+            assertFalse("destRoot 不得被動", File(root, "tmp").exists())
+            assertTrue("不得留下半成品：${root.listFiles()!!.toList()}", root.listFiles()!!.isEmpty())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun multiRootPackage_rejected_exactReason() {
+        // 對照案（exact 車道分流）：兩個頂層根確實走 MULTIPLE_ROOTS（彙整閘文案），
+        // 與絕對路徑車道（per-entry checkEntryName）分流清楚。
+        val root = tempRoot()
+        try {
+            val r = SkillInstaller.installFiles(
+                mapOf(
+                    "alpha/SKILL.md" to skillMd(name = "alpha").toByteArray(Charsets.UTF_8),
+                    "beta/notes.txt" to "x".toByteArray(Charsets.UTF_8),
+                ),
+                root,
+            )
+            assertTrue(r is SkillInstaller.Result.Failure)
+            val f = r as SkillInstaller.Result.Failure
+            assertEquals(SkillInstaller.Failure.MULTIPLE_ROOTS, f.reason)
+            assertTrue(
+                "message 應指名單一根主張：${f.message}",
+                "exactly one skill directory" in f.message,
+            )
+            assertFalse(File(root, "alpha").exists())
+            assertFalse(File(root, "beta").exists())
         } finally {
             root.deleteRecursively()
         }

@@ -98,9 +98,12 @@ object VolumeTool : SystemTool<VolumeTool.Params> {
       is Guarded.Internal -> return build.result
       is Guarded.Built -> build.value
     }
+    // 話術純化：message 只保留 stream/dir 狀態回顯；「已錨定／端側 AudioManager
+    // 未接線」屬工程註記，語義由類 KDoc「佔位錨定語義」與上註釋承載——呼叫方
+    // 仍以 ok=true 契約（非「已改變音量」）為準，不靠話術夾帶狀態註記。
     return ToolResult(
       true, false, volumePanelSpec(), null,
-      "stream=${op.streamSdkValue} dir=${op.direction}（已錨定，端側 AudioManager 未接線）",
+      "stream=${op.streamSdkValue} dir=${op.direction}",
     )
   }
 

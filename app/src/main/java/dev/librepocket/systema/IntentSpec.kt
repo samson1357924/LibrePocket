@@ -191,7 +191,9 @@ internal sealed interface Guarded<out T> {
  * fail-closed builder guard（多個工具 execute 的 inline catch 收斂點）：
  * builder 拋 `IllegalArgumentException`／`IllegalStateException`（範圍/長度/
  * 形狀違規，非取消）時回 [Guarded.Internal]，不讓異常滲出生產迴圈；
- * `CancellationException` 照拋（取消語義不得吞）。各工具 inline catch 的
+ * `CancellationException` 照拋（取消語義不得吞；CE 繼承 ISE，catch 形狀與
+ * [guardedFallbackAlternative] 統一為「先 CE → 再 IAE/ISE」，避免「內嵌 CE
+ * 檢查」與「先捕 CE」兩種寫法在兩個 guard 間漂移）。各工具 inline catch 的
  * 重複與訊息漂移在此單一化；失敗 ToolResult 由呼叫方提供（保留各自話術），
  * 並附加 cause 類名（與 [LaunchResult.toToolResult] 的 launch 路徑對稱，
  * 讓分派層可區分「參數被本層政策拒絕」與「系統拒絕」；僅附類名，不附
@@ -203,10 +205,11 @@ internal inline fun <T> guardedToolBuild(
 ): Guarded<T> =
   try {
     Guarded.Built(builder())
+  } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+    throw e
   } catch (e: IllegalArgumentException) {
     Guarded.Internal(internalFailure.tagInternalCause(e))
   } catch (e: IllegalStateException) {
-    if (e is kotlin.coroutines.cancellation.CancellationException) throw e
     Guarded.Internal(internalFailure.tagInternalCause(e))
   }
 
@@ -219,8 +222,9 @@ private fun ToolResult.tagInternalCause(cause: Throwable): ToolResult =
  * 失敗」側對稱）：fallback 是回報降級的路徑，自身不得反拋例外打穿呼叫方——
  * builder 拋 `IllegalArgumentException`／`IllegalStateException`（座標/長度等
  * 守衛違規，非取消）時降為 null（僅「無預建 intent 可替代」，話術由呼叫方
- * 自持，形狀不變）；`CancellationException` 照拋（取消語義不得吞，注意它繼承
- * ISE，必須排在前位）。現行採用：[NavigationTool.fallback]、[MusicTool.fallback]
+ * 自持，形狀不變）；`CancellationException` 照拋（取消語義不得吞；CE 繼承
+ * ISE，與 [guardedToolBuild] 統一為「先 CE → 再 IAE/ISE」形狀）。現行採用：
+ * [NavigationTool.fallback]、[MusicTool.fallback]
  * 的 play 分支；新增 fallback 若會構建 intent，必須經此收斂。
  */
 internal inline fun <T> guardedFallbackAlternative(builder: () -> T): T? =

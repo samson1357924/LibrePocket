@@ -666,6 +666,11 @@ object SkillInstaller {
      * 對照：清理會不問齡期直接解除的 link 類條目（NOFOLLOW 前置分類，不參與
      * 齡期判斷）未過期時不會先經本函式列出——觀察面與清理的分類語意刻意
      * 不完全重疊（本函式維持「形狀 + 齡期」單一規則，不重複清理的分類邏輯）。
+     *
+     * 接線狀態（誠實註記，防誤導消費者）：本函式**尚未接線**——main 目前沒有
+     * 生產呼叫者，唯一呼叫者是測試（SkillStartupRecoveryTest／
+     * SkillAtomicCommitTest）；「供啟動路徑記錄殘餘」是接線 PR 的目標用法，
+     * 接線落地前啟動路徑並不含本觀察。
      */
     fun listResiduals(destRoot: File, maxAgeMillis: Long = STALE_STAGING_MAX_AGE_MILLIS): List<File> {
         if (!destRoot.isDirectory) return emptyList()

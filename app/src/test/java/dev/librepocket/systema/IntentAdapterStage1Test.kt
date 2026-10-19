@@ -55,7 +55,8 @@ class IntentAdapterStage1Test {
       .addResolveInfoForIntent(intent, ResolveInfo().apply { this.activityInfo = activityInfo })
   }
 
-  /** 單測工作目錄（模組 dir）出發，向上走最多 5 層找原始碼/清單檔（同 VoiceSttTest）。 */
+  /** 單測工作目錄（模組 dir）出發，向上走最多 5 個上層（含起始目錄共 6 個層級，
+   *  故取 6 項的 take(6)——註解與程式同一真相）找原始碼/清單檔（同 VoiceSttTest）。 */
   private fun findSource(vararg relPaths: String): java.io.File {
     val bases = generateSequence(java.io.File(System.getProperty("user.dir") ?: ".")) { it.parentFile }.take(6).toList()
     for (base in bases) {
@@ -668,16 +669,18 @@ class IntentAdapterStage1Test {
 
   // ---- g. #15 對齊：Volume/Navigation builder 非法經 execute 收斂為 INTERNAL ----
 
-  @Test fun volume_execute_success_pinsAnchoredMessage() {
+  @Test fun volume_execute_success_pinsStateEchoMessage() {
     // 成功路徑為佔位錨定語義（見 VolumeTool KDoc）：ok=true 表示操作已錨定，
-    // 訊息必須逐字明載「未接線」，呼叫方不得誤把 ok=true 當成音量已改變。
+    // 呼叫方不得誤把 ok=true 當成音量已改變（接線狀態註記只活在 VolumeTool
+    // KDoc/註解；message 為純話術狀態回顯，不含「未接線」工程註記字樣）。
     val r = VolumeTool.execute(VolumeTool.Params(), env, IntentLauncher { LaunchResult.Success })
     assertTrue(r.ok)
     assertFalse(r.usedFallback)
     assertEquals(IntentActions.SOUND_SETTINGS, r.spec?.action)
+    assertFalse("話術不得混入工程註記", r.message.contains("未接線"))
     assertEquals(
       "stream=${VolumeTool.AudioStream.MUSIC.sdkValue} " +
-        "dir=${VolumeTool.Direction.RAISE}（已錨定，端側 AudioManager 未接線）",
+        "dir=${VolumeTool.Direction.RAISE}",
       r.message,
     )
   }
@@ -911,6 +914,12 @@ class IntentAdapterStage1Test {
   }
 
   @Test fun calendar_specMime_matchesQueriesEntries() {
+    // 字面 pin（原「常量自比」弱 pin 收緊）：MIME 常量本體必須逐字等於官定
+    // MIME 字面值，與 manifest <queries> 的字面 pin（assertManifestHasSingleAttr
+    // 的 mimeType 條目）在同一檔內交會——常量側與 manifest 側不再兩頭各自
+    // 字面、互不檢查（漂移任一側即紅）。
+    assertEquals("vnd.android.cursor.dir/event", CalendarTool.MIME_EVENT_DIR)
+    assertEquals("vnd.android.cursor.item/event", CalendarTool.MIME_EVENT_ITEM)
     // 顯式 MIME 與 manifest <queries> 的 mimeType 條目精確對應（P2 fix：
     // typeless content URI 依賴 PM 查詢時的 provider-resolve，顯式者確定）。
     assertEquals(

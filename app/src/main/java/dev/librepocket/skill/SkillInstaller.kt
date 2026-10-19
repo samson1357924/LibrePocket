@@ -1054,6 +1054,10 @@ object SkillInstaller {
             // 產名一律 abs(nanoTime)（見 STAGING_RE 產名形狀合約）：nanoTime 規格
             // 允許為負，負值直拼會掉出 STAGING_RE 形狀、殘留永不收斂。
             val staging = File(destRoot, ".$root.tmp-${Math.abs(System.nanoTime())}-$tid")
+            // positive exists() 安全註記：staging 名是本程序自產的
+            // abs(nanoTime)-tid（掃描形狀 \d+-\d+ 合約）；若同 uid 預測者搶植
+            // link，NOFOLLOW 的 deleteTreeSafe 只解除 link 本身、dangling 亦同，
+            // rename(2) 永不跟隨其 target——外部內容不受影響（勿併發前提見上）。
             if (staging.exists()) deleteTreeSafe(staging)
             if (!staging.mkdirs() && !staging.isDirectory) {
                 throw java.io.IOException("cannot create staging ${staging.name}")
@@ -1097,6 +1101,10 @@ object SkillInstaller {
                     // 產名同取 abs(nanoTime)（同一產名形狀合約，見 STAGING_RE 註記），
                     // backup 名與 BACKUP_RE 掃描點匹配（規格層 Long.MIN_VALUE 死角見同處，不重述）。
                     val backup = File(destRoot, ".$root.bak-${Math.abs(System.nanoTime())}-$tid")
+                    // positive exists() 安全註記（與 staging 同理由）：fresh 產名
+                    // 由本程序自產；planted 正 link 經 NOFOLLOW deleteTreeSafe 只是
+                    // unlink 本身、dangling 會被不跟隨的 rename 覆蓋——外部內容保持
+                    // 完整（勿併發前提見 installFiles KDoc）。
                     if (backup.exists()) deleteTreeSafe(backup)
                     if (!rename(target, backup)) {
                         deleteTreeSafe(staging)

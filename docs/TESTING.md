@@ -194,10 +194,13 @@ handlers' XML while the manifest binding and source files all stay faithful
 `test_compiled_backup_rules_dump_failures_fail_closed`,
 `test_compiled_backup_rules_evaluate_via_shared_engine`). Second, the Github
 debug flavor is not a play or foss artifact, so its compiled bytes must not
-escape the gate either: pr-check.yml runs the scanner's `--mode github`
-right after the play/foss policy gate, executing only the mode-independent
-artifact authorities (merged backup bindings, compiled rules bytes, compiled
-NSC) with no flavor-DEX class-table policy
+escape the gate either: pr-check.yml's github step runs the scanner's
+`--mode github` right after the play/foss policy gate - the scanner mode
+itself executes only the mode-independent artifact authorities (merged
+backup bindings, compiled rules bytes, compiled NSC), and the SAME step
+additionally runs the common five-token source scan (see P2-1 below) -
+with no flavor-DEX class-table policy, matching the scanner's own
+docstring (that flavor ships proprietary components by design)
 (`ApkPolicyHarness.test_github_mode_passes_mode_independent_authorities`;
 the wiring is pinned by `PolicyCiGateControl`). Third, the Play source
 permission blacklist is enforced by `backup_rules_check.py`'s

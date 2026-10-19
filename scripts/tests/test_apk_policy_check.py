@@ -2765,6 +2765,24 @@ class PolicyCiGateControl(unittest.TestCase):
             workflow,
         )
 
+    def test_artifact_step_tools_fail_named_not_opaque(self) -> None:
+        # The aapt/dexdump lookups must fail with a named ::error diagnosis
+        # (final-review pin): unguarded, a missing build-tools PATH step
+        # surfaces as an opaque "exit 1" with nothing actionable; the guard
+        # keeps the step non-zero (diagnosis-only) but names the missing
+        # tool either way.
+        workflow = PR_CHECK_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            'AAPT=$(command -v aapt) || { echo "::error::aapt not found: '
+            'build-tools PATH step failed"; exit 1; }',
+            workflow,
+        )
+        self.assertIn(
+            'DEXDUMP=$(command -v dexdump) || { echo "::error::dexdump not '
+            'found: build-tools PATH step failed"; exit 1; }',
+            workflow,
+        )
+
     def test_docs_only_diff_does_not_trigger_policy_gate(self) -> None:
         patterns = _pr_check_policy_patterns()
         matched = any(

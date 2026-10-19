@@ -738,7 +738,9 @@ class TurnControllerToolSliceTest {
     @Test fun continuationAccountingIncludesToolCallsPayloadAndTrims() = runBlocking {
         // Request-level budget regression: the continuation accounting must
         // count the structured assistant toolCalls payload (the args echo
-        // alone can reach MAX_INPUT_CHARS), not only ChatMessage.text. The
+        // alone can reach MAX_INPUT_CHARS) and the tool-result
+        // ChatMessage.toolCallId (shared `wirePayloadChars` helper), not only
+        // ChatMessage.text. The
         // history length is calibrated so the discriminator holds: a
         // TEXT-ONLY accounting of the whole continuation fits the cap —
         // 98,500 history + the two user rows and time block (~100) + the
@@ -792,11 +794,12 @@ class TurnControllerToolSliceTest {
         assertTrue(cont.tools.isEmpty())
         assertEquals(listOf("call-a"), cont.messages.filter { it.role == "assistant" }.flatMap { it.toolCalls }.map { it.id })
         assertTrue(cont.messages.any { it.role == "tool" })
-        // Serialized accounting (text + structured toolCalls) over the
-        // outgoing continuation request stays within the request cap; a
-        // text-only accounting would have skipped the trim entirely.
-        val payload = cont.messages
-            .sumOf { m -> m.text.length + m.toolCalls.sumOf { it.id.length + it.name.length + it.argumentsJson.length } }
+        // Serialized accounting (single source of truth: the production
+        // `wirePayloadChars` helper — text + toolCallId + the structured
+        // assistant toolCalls) over the outgoing continuation request stays
+        // within the request cap; a text-only accounting would have skipped
+        // the trim entirely.
+        val payload = cont.messages.sumOf { it.wirePayloadChars() }
         assertTrue(payload <= TurnController.MAX_REQUEST_CHARS)
         assertTrue("continuation must head-trim once the args echo rides along", c.requestTrimmedCount.value > 0)
         assertEquals(ChatStatus.IDLE, c.uiState.value.status)
@@ -908,6 +911,114 @@ class TurnControllerToolSliceTest {
         assertTrue(failedRecord.isFinal)
         assertEquals("continuation request over budget", failedRecord.error)
         assertTrue(failedRecord.partialText.contains("[tool-result:lsp.symbols"))
+    }
+
+    @Test fun continuationAccountingIncludesToolCallIdFailsClosed() = runBlocking {
+        // Maintainer P2: the tool-result `ChatMessage.toolCallId` serializes
+        // on the wire through ALL three adapters (`tool_call_id` /
+        // `function_call_output.call_id` / `tool_result.tool_use_id`), but the
+        // pre-fix accounting summed only text + the assistant toolCalls
+        // (id/name/argumentsJson) — an under-count of up to
+        // 8 × SafeToolSlice.MAX_STRING_CHARS = 4,000 chars
+        // (maxCallsPerTurn=8 × the redacted call-id echo cap per tool row).
+        // Discriminator: everything EXCEPT the toolCallId term is built so
+        // the untrimmable minimum (the newest base row + the structured
+        // round) fits MAX_REQUEST_CHARS under the text-only counterfactual —
+        // the eight 500-char ids are the DECISIVE surplus. Pre-fix code would
+        // have shipped the over-cap continuation (seenRequests would grow);
+        // the fixed accounting fails closed: typed non-retryable terminal,
+        // no over-cap request sent (provider.seenRequests stays at the
+        // attempt round).
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val toolLoop = loop(pol, backend, maxCallsPerTurn = 8)
+        val c = controller(provider, pol, sink, toolLoop)
+        // Call ids that SURVIVE redaction unchanged at the full echo cap
+        // (500 chars, alphanumeric+dash — no key/secret/EMAIL/phone/IP/geo
+        // shape), distinct per call: "call-" + 492 × 'a' + index (100..107).
+        val fatId = { i: Int -> "call-" + "a".repeat(492) + (100 + i) }
+        // Calibrated so ALL non-toolCallId payload (user row + time block +
+        // assistant id/name/args echo + result texts) stays ≤
+        // MAX_REQUEST_CHARS ≊ 97.8k, and only the +4,000 id term breaches it.
+        val history = "a".repeat(87_400)
+        provider.handler = { _ ->
+            flow {
+                for (i in 0 until 8) {
+                    emit(
+                        StreamEvent.ToolDone(
+                            toolIndex = i,
+                            id = fatId(i),
+                            name = "lsp.symbols",
+                            argumentsJson = """{"query":"A"}""",
+                        ),
+                    )
+                }
+                emit(StreamEvent.Done("tool_calls"))
+            }
+        }
+        c.send(history)
+
+        // The round executed exactly once (all eight calls), but the
+        // over-cap continuation never shipped.
+        assertEquals(8, backend.invocations.get())
+        assertEquals(8, sink.tools.size)
+        assertEquals(1, provider.seenRequests.size)
+        assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+        assertTrue(c.uiState.value.error.orEmpty().contains("over budget"))
+        assertTrue(sink.succeeded.isEmpty())
+        // Fail-closed durability is observable: the failed terminal was
+        // recorded with the persisted executed-round marker.
+        assertEquals(1, sink.failedRecords.size)
+        val failedRecord = sink.failedRecords.single()
+        assertTrue(failedRecord.isFinal)
+        assertEquals("continuation request over budget", failedRecord.error)
+        assertTrue(failedRecord.partialText.contains("[tool-result:lsp.symbols"))
+
+        // Discriminator proof: rebuild the SAME wire-shaped structured block
+        // through the PRODUCTION builder (continuationMessages), take the
+        // base contribution from the REAL observed attempt request via the
+        // SHARED accounting helper, and show the text-only counterfactual
+        // fits the cap while the toolCallId-inclusive total breaches it.
+        val markerLens = Regex("""\[tool-result:lsp\.symbols:(\d{1,8}):""")
+            .findAll(failedRecord.partialText)
+            .map { m ->
+                val len = m.groupValues[1].toInt()
+                // Length-prefixed framing asserts itself (TurnController's
+                // marker format): the sliced JSON is closed by a `]` marker
+                // terminator exactly <len> UTF-16 units after `<len>:`.
+                assertEquals(']', failedRecord.partialText[m.range.last + 1 + len])
+                failedRecord.partialText.substring(m.range.last + 1, m.range.last + 1 + len)
+            }
+            .toList()
+        assertEquals(8, markerLens.size)
+        val wireCalls = sink.tools.map { dev.librepocket.provider.ToolCall(it.id, it.name, it.args) }
+        val wireResults = (0 until 8).map { i ->
+            SafeToolSlice.ToolResult(callId = fatId(i), name = "lsp.symbols", resultJson = markerLens[i])
+        }
+        val structured = toolLoop.continuationMessages(wireCalls, wireResults)
+        // Redaction honesty of the fixture: every call id arrives on the
+        // rebuilt wire rows at the full echo cap — the ids are NOT the
+        // under-count shadow of a redaction slimming.
+        assertEquals(8, structured.count { it.toolCallId?.length == SafeToolSlice.MAX_STRING_CHARS })
+        val basePayload = provider.seenRequests.single().messages.sumOf { it.wirePayloadChars() }
+        // Text-only counterfactual — the PRE-fix formula (text + assistant
+        // toolCalls id/name/args, NO ChatMessage.toolCallId).
+        val textOnlyTotal = basePayload + structured.sumOf { m ->
+            m.text.length + m.toolCalls.sumOf { t -> t.id.length + t.name.length + t.argumentsJson.length }
+        }
+        val toolCallIdTerm = structured.sumOf { (it.toolCallId?.length ?: 0) }
+        assertEquals(8 * SafeToolSlice.MAX_STRING_CHARS, toolCallIdTerm)
+        val inclusiveTotal = textOnlyTotal + toolCallIdTerm
+        assertTrue(
+            "text-only counterfactual must fit the cap (ids alone are the decisive surplus): $textOnlyTotal",
+            textOnlyTotal <= TurnController.MAX_REQUEST_CHARS,
+        )
+        assertTrue(
+            "toolCallId-inclusive accounting must breach the cap: $inclusiveTotal",
+            inclusiveTotal > TurnController.MAX_REQUEST_CHARS,
+        )
     }
 
     @Test fun cancelDuringContinuationKeepsSingleExecution() = runBlocking {

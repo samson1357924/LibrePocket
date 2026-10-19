@@ -100,8 +100,9 @@ class ApprovalRequiredException : Exception("chat.send approval required")
 
 /**
  * Fail-closed signal for the P2 slice continuation budget: the serialized
- * request payload (message text + the structured assistant `toolCalls`
- * id/name/argumentsJson) exceeds [TurnController.MAX_REQUEST_CHARS] even
+ * request payload (message text + the tool-result `ChatMessage.toolCallId` +
+ * the structured assistant `toolCalls` id/name/argumentsJson) exceeds
+ * [TurnController.MAX_REQUEST_CHARS] even
  * after the full history-prefix trim (the newest base row + the structured
  * round cannot be shrunk further). Within one logical turn history only
  * grows, so this is never retried; `runTurnLoop` converts it into a typed
@@ -5556,7 +5557,9 @@ class TurnController(
     // Keep tool-call/tool-result pairing atomic: trim only the history prefix
     // when the structured round pushes the request over MAX_REQUEST_CHARS.
     // Payload accounting includes the structured assistant toolCalls
-    // (id/name/args echo — the echo can reach MAX_INPUT_CHARS): a text-only
+    // (id/name/args echo — the echo can reach MAX_INPUT_CHARS) and the
+    // tool-result `ChatMessage.toolCallId` (maintainer P2: every adapter
+    // serializes it on the wire): a text-only
     // sum under-counts everything that actually serializes into the
     // outgoing request.
     val baseMessages = base.messages.toMutableList()
@@ -5590,19 +5593,6 @@ class TurnController(
     }
     return base.copy(messages = finalBase + contMessages)
   }
-
-  /**
-   * Serialized-size estimate of one [ChatMessage] on the outgoing request:
-   * message text plus every structured assistant `toolCalls` payload field
-   * (id/name/argumentsJson — the args echo is bounded by
-   * SafeToolSlice.MAX_INPUT_CHARS). The estimate is a raw String.length
-   * basis — the same measurement basis as buildRequest's own (text-only)
-   * accounting. JSON-escaping expansion and adapter wrapper keys are NOT
-   * counted (deliberately never over-counts), so the fail-close can only
-   * fire for a request that is already over cap on the strict measure.
-   */
-  private fun ChatMessage.wirePayloadChars(): Int =
-    text.length + toolCalls.sumOf { it.id.length + it.name.length + it.argumentsJson.length }
 
   /**
    * P2 slice continuation collect: delegates to [collectStream] with
@@ -5929,6 +5919,35 @@ class TurnController(
     attemptTextBuffers[runId]?.hasReasoning == true ||
       (_uiState.value.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.hasReasoning == true)
 }
+
+/**
+ * Serialized-size estimate of one [ChatMessage] on the outgoing request —
+ * the SINGLE SOURCE OF TRUTH for the continuation budget accounting
+ * (`buildToolContinuation`'s trim + fail-close sums it; the
+ * TurnControllerToolSliceTest pins call this same function, so production
+ * arithmetic and test arithmetic cannot drift).
+ *
+ * Counts everything that actually serializes into the request for one
+ * message: [ChatMessage.text], the tool-result `ChatMessage.toolCallId`
+ * (maintainer P2: every adapter serializes this field on the wire —
+ * `tool_call_id` / `function_call_output.call_id` / `tool_result.tool_use_id`
+ * — so role="tool" rows count it alongside the text; its echo is capped at
+ * SafeToolSlice.MAX_STRING_CHARS per row), plus every structured assistant
+ * `toolCalls` payload field (id/name/argumentsJson — the args echo is
+ * bounded by SafeToolSlice.MAX_INPUT_CHARS). The estimate is a raw
+ * String.length basis — the same measurement basis as buildRequest's own
+ * (text-only) accounting. JSON-escaping expansion and adapter wrapper keys
+ * are NOT counted (deliberately never over-counts), so the fail-close can
+ * only fire for a request that is already over cap on the strict measure.
+ *
+ * `internal` visibility is deliberate: same-module unit tests must reach the
+ * exact production formula directly (no reflection pin needed); keep the
+ * per-message arithmetic in sync ONLY through this function.
+ */
+internal fun ChatMessage.wirePayloadChars(): Int =
+  text.length +
+    (toolCallId?.length ?: 0) +
+    toolCalls.sumOf { it.id.length + it.name.length + it.argumentsJson.length }
 
 /**
  * Pure fallback detector for the warn path: true only when a non-blank

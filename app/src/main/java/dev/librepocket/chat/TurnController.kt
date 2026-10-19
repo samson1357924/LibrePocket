@@ -5138,6 +5138,16 @@ class TurnController(
     val doneSeen: MutableSet<Int> = mutableSetOf(),
     val seenCallIds: MutableSet<String> = mutableSetOf(),
     /**
+     * Raw model id -> wire id, cached only when that raw id aliases a
+     * synthesized/reserved id and therefore had to be re-bound. Identity
+     * mappings are deliberately not cached: a later blank allocation may
+     * reserve that same string, and a subsequent genuine call must still be
+     * recognized as non-duplicate at that point.
+     */
+    val wireIdAliases: MutableMap<String, String> = mutableMapOf(),
+    /** Synthesized/re-bound ids that later model-supplied ids must not alias. */
+    val reservedWireIds: MutableSet<String> = mutableSetOf(),
+    /**
      * Evidence that the continuation produced a final answer: count of
      * visible, non-server-tool-marker TextDeltas (invisible-only deltas —
      * blank, control, or Unicode format characters — do not count).
@@ -5167,11 +5177,11 @@ class TurnController(
     val pending = state.argText.mapNotNull { (index, args) ->
       if (index in state.doneSeen) null
       else {
-        // Blank-id synthesis with the same NON-colliding prefix as
-        // noteToolDone (`call_blank_pending_$index`): a buffered
-        // ToolDelta-only index must not alias a model-supplied flat call id
-        // (Phase-0 N2). Records-only: the flushed pair is marker + transcript
-        // truth, never an execution candidate.
+        // Blank-id synthesis with the same recognizable prefix as
+        // noteToolDone (`call_blank_pending_$index`). Records-only: the
+        // flushed pair is marker + transcript truth, never an execution
+        // candidate, so a model-supplied id that aliases this audit form
+        // cannot suppress or duplicate execution.
         val id = state.idText[index]?.toString().orEmpty().ifEmpty { "call_blank_pending_$index" }
         val name = state.nameText[index]?.toString().orEmpty().ifEmpty { "pending" }
         PendingTool(index, id, name, args.toString())
@@ -5335,18 +5345,32 @@ class TurnController(
     //     The dedup routes through the SafeToolSlice seam
     //     (redactedPairingId) — the turn engine must not import the
     //     redactor for this key;
-    // (b) a blank id synthesizes the deterministic per-index wire id with a
-    //     NON-colliding prefix (`call_blank_${event.toolIndex}`): the plain
-    //     `call_${index}` form could be aliased in reverse — a later
-    //     model-supplied flat `call_3` id would replicate the synthesis of
-    //     an earlier blank call, satisfy the seen-set quickly, and
-    //     silently skip execution (Phase-0 N2). The internal pairing
-    //     validator (ProviderJson TOOL_CALL_MISSING_ID, non-retryable) and
-    //     providers alike fail closed on an empty tool-call id; providers
-    //     whose mapper carries no blank-id repair still rely on this
-    //     fallback. The transcript record above deliberately keeps the RAW
-    //     event id for audit truth.
-    val wireId = event.id.ifBlank { "call_blank_${event.toolIndex}" }
+    // (b) a blank id synthesizes the deterministic per-index wire id
+    //     (`call_blank_${event.toolIndex}`). Prefixing alone is not enough:
+    //     a later model-supplied literal `call_blank_3` would still alias
+    //     the earlier blank call, satisfy the seen-set, and silently skip
+    //     execution. Synthesized ids are therefore reserved; a model id that
+    //     aliases one is re-bound to a unique `_2` suffix (idempotently per
+    //     raw id), so genuine calls execute while exact duplicate raw ids
+    //     still dedup. The internal pairing validator (ProviderJson
+    //     TOOL_CALL_MISSING_ID, non-retryable) and providers alike fail
+    //     closed on an empty tool-call id; providers whose mapper carries no
+    //     blank-id repair still rely on this fallback. The transcript record
+    //     above deliberately keeps the RAW event id for audit truth.
+    val wireId = if (event.id.isBlank()) {
+      allocateWireCallId("call_blank_${event.toolIndex}", state).also {
+        state.reservedWireIds.add(it)
+      }
+    } else {
+      state.wireIdAliases[event.id] ?: if (event.id in state.reservedWireIds) {
+        allocateWireCallId(event.id, state).also {
+          state.reservedWireIds.add(it)
+          state.wireIdAliases[event.id] = it
+        }
+      } else {
+        event.id
+      }
+    }
     val pairingId = SafeToolSlice.redactedPairingId(wireId)
     if (
       onWiredToolDone != null &&
@@ -5363,6 +5387,23 @@ class TurnController(
         ),
       )
     }
+  }
+
+  /**
+   * Allocate a wire id that cannot alias an already-seen execution candidate
+   * or a reserved synthesized/renamed id. Suffixes are deterministic in
+   * allocation order so duplicate events keep deduping instead of fanning out.
+   */
+  private fun allocateWireCallId(preferred: String, state: ToolAggState): String {
+    var candidate = preferred
+    var suffix = 2
+    while (
+      SafeToolSlice.redactedPairingId(candidate) in state.seenCallIds ||
+      candidate in state.reservedWireIds
+    ) {
+      candidate = "${preferred}_${suffix++}"
+    }
+    return candidate
   }
 
   /**

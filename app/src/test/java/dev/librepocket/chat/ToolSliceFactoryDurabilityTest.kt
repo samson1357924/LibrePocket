@@ -33,7 +33,6 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
-import java.io.File
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
@@ -53,14 +52,20 @@ import java.util.concurrent.atomic.AtomicInteger
 class ToolSliceFactoryDurabilityTest {
 
     private var db: LibrePocketDb? = null
-    private var tmpDir: File? = null
 
     @After fun tearDown() {
         try { db?.close() } finally {
             db = null
-            tmpDir?.deleteRecursively()
-            tmpDir = null
         }
+    }
+
+    private class CountingStubBackend : LspTools.Backend {
+        val invocations = AtomicInteger(0)
+        override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+            invocations.incrementAndGet()
+            return listOf(LspTools.Symbol("$query:example", "function", "app/src/main/Example.kt", 1))
+        }
+        override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
     }
 
     private class ScriptedProvider(
@@ -88,12 +93,14 @@ class ToolSliceFactoryDurabilityTest {
         val store: SessionStore = RoomSessionStore(opened) { 1_700_000_000_000L }
         val provider = ScriptedProvider()
         val policy = allowKeyReadPolicy()
+        val builds = AtomicInteger(0)
         policy.setRule(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 20))
         val fixedClock = Clock.fixed(Instant.parse("2026-10-09T01:41:22Z"), ZoneId.of("UTC"))
+        val backend = CountingStubBackend()
         val toolSlice = SafeToolSlice(
             ctxSupplier = { ProjectionContext(userSwitches = mapOf("lsp" to true)) },
             policy = policy,
-            backend = LspTools.StubBackend,
+            backend = backend,
             clock = fixedClock,
         )
         val factory = ChatSessionFactory(
@@ -103,7 +110,10 @@ class ToolSliceFactoryDurabilityTest {
                 v.putKey("preset:openai", "test-key-12345678".toCharArray())
                 v
             },
-            buildProvider = { _, _ -> provider },
+            buildProvider = { _, _ ->
+                builds.incrementAndGet()
+                provider
+            },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = store
             },
@@ -138,6 +148,8 @@ class ToolSliceFactoryDurabilityTest {
         try {
             created.session.send("幫我查 Foo 這個符號")
             assertTrue(created.session.flushDurable(8_000))
+            assertEquals("exactly one backend execution", 1, backend.invocations.get())
+            assertEquals("create builds exactly one provider", 1, builds.get())
 
             val sid = created.sessionId!!
             val events = store.loadEvents(sid, 0, 2000)
@@ -154,7 +166,9 @@ class ToolSliceFactoryDurabilityTest {
             val before = events.map { Triple(it.runId, it.kind, it.text) }
             val reopened = factory.open(endpoint(), sid, allowAsk = false, keyIsCurrent = { true })
             try {
-                assertEquals(false, reopened.historyWithheld)
+                assertFalse(reopened.historyWithheld)
+                assertEquals("reopen must not re-execute the durable round", 1, backend.invocations.get())
+                assertEquals("open builds exactly one provider", 2, builds.get())
                 val after = store.loadEvents(sid, 0, 2000).map { Triple(it.runId, it.kind, it.text) }
                 assertEquals(before, after)
             } finally {
@@ -176,6 +190,7 @@ class ToolSliceFactoryDurabilityTest {
         val provider = ScriptedProvider()
         val policy = allowKeyReadPolicy()
         val requests = AtomicInteger(0)
+        val builds = AtomicInteger(0)
         val factory = ChatSessionFactory(
             policy = policy,
             vaultSource = VaultSource {
@@ -183,7 +198,10 @@ class ToolSliceFactoryDurabilityTest {
                 v.putKey("preset:openai", "test-key-12345678".toCharArray())
                 v
             },
-            buildProvider = { _, _ -> provider },
+            buildProvider = { _, _ ->
+                builds.incrementAndGet()
+                provider
+            },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = store
             },
@@ -212,6 +230,7 @@ class ToolSliceFactoryDurabilityTest {
             assertTrue(created.session.flushDurable(8_000))
 
             assertEquals(1, requests.get())
+            assertEquals("default factory still builds exactly one provider", 1, builds.get())
             val sid = created.sessionId!!
             val events = store.loadEvents(sid, 0, 2000)
             val finals = events.filter { it.kind == "assistant" && it.isFinal }

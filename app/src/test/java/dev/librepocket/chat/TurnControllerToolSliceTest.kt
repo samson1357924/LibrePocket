@@ -17,6 +17,7 @@ import dev.librepocket.tool.ProjectionContext
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
@@ -57,10 +58,53 @@ class TurnControllerToolSliceTest {
     ) : LlmProvider {
         override val protocol: ProviderProto = ProviderProto.CHAT_COMPLETIONS
         val seenRequests: MutableList<ChatRequest> = Collections.synchronizedList(mutableListOf())
+        private var frozenContinuationResults: List<String>? = null
 
         override fun stream(request: ChatRequest): Flow<StreamEvent> = flow {
-            seenRequests.add(request)
+            val prior = synchronized(seenRequests) { seenRequests.size }
+            if (prior > 0) validateContinuationRequest(request, prior + 1)
+            synchronized(seenRequests) { seenRequests.add(request) }
             emitAll(handler(request))
+        }
+
+        /**
+         * Wire-contract guard, not a test assertion: every request carrying an
+         * executed tool result must be a frozen continuation. It catches a
+         * regression in any test that silently re-offers tools, drops or
+         * reorders one of several paired results (whole-round loss is covered
+         * by assertFrozenPairRequests), mutates result text, or duplicates a
+         * call id, before the fake provider can make the turn look healthy.
+         */
+        private fun validateContinuationRequest(request: ChatRequest, requestNo: Int) {
+            // A later turn ends with a fresh user message and legitimately
+            // re-offers tools; a frozen continuation/retry ends with the tool
+            // result that was just executed.
+            if (request.messages.lastOrNull()?.role != "tool") {
+                frozenContinuationResults = null
+                return
+            }
+            check(request.tools.isEmpty()) {
+                "request $requestNo after the tool round must carry no tools, was ${request.tools.map { it.name }}"
+            }
+            val calls = request.messages.filter { it.role == "assistant" }.flatMap { it.toolCalls }
+            val results = request.messages.filter { it.role == "tool" }
+            check(calls.isNotEmpty()) { "request $requestNo must re-attach the executed call" }
+            check(calls.map { it.id } == results.map { it.toolCallId }) {
+                "request $requestNo call/result ids must pair in order: calls=${calls.map { it.id }}, " +
+                    "results=${results.map { it.toolCallId }}"
+            }
+            check(calls.map { it.id }.distinct().size == calls.size) {
+                "request $requestNo must not carry duplicate paired ids: ${calls.map { it.id }}"
+            }
+            val resultTexts = results.map { it.text }
+            val frozen = frozenContinuationResults
+            if (frozen == null) {
+                frozenContinuationResults = resultTexts
+            } else {
+                check(resultTexts == frozen) {
+                    "request $requestNo must re-send the frozen result text unchanged: was $resultTexts, expected $frozen"
+                }
+            }
         }
 
         override suspend fun listModels(): List<String> = emptyList()
@@ -204,6 +248,17 @@ class TurnControllerToolSliceTest {
     private fun assertFrozenPairRequests(requests: List<ChatRequest>) {
         assertTrue("expected the tool round plus at least one continuation", requests.size >= 2)
         assertEquals(listOf("lsp.symbols"), requests.first().tools.map { it.name })
+        assertTrue(
+            "the initial tool-round request must not carry a tool result yet",
+            requests.first().messages.none { it.role == "tool" },
+        )
+        requests.forEachIndexed { index, request ->
+            assertEquals(
+                "request ${index + 1} must carry exactly one user turn",
+                1,
+                request.messages.count { it.role == "user" },
+            )
+        }
         val expectedCalls = requests[1].messages.filter { it.role == "assistant" }.flatMap { it.toolCalls }
         assertEquals("the executed round must freeze exactly one call", 1, expectedCalls.size)
         val expectedResults = requests[1].toolResultTexts()
@@ -1496,6 +1551,56 @@ class TurnControllerToolSliceTest {
         assertTrue(sink.succeeded.isEmpty())
     }
 
+    @Test fun cancelDuringBackendExecutionPropagatesWithoutContinuation() = runBlocking {
+        // Turn-level mid-execution cancel: the model call completed, the slice
+        // backend is suspended, and the user cancels. Cancellation must reach
+        // the backend exactly once, must not synthesize a continuation, and
+        // must end the turn CANCELLED (not a typed denial/failure).
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val entered = CompletableDeferred<Unit>()
+        val observed = AtomicInteger(0)
+        val backend = object : LspTools.Backend {
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+                entered.complete(Unit)
+                try {
+                    awaitCancellation()
+                } finally {
+                    observed.incrementAndGet()
+                }
+            }
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        provider.handler = { _ ->
+            flow {
+                emit(
+                    StreamEvent.ToolDone(
+                        toolIndex = 0,
+                        id = "call-a",
+                        name = "lsp.symbols",
+                        argumentsJson = """{"query":"A"}""",
+                    ),
+                )
+                emit(StreamEvent.Done("tool_calls"))
+            }
+        }
+        val job = async(Dispatchers.Default) { c.send("查 A") }
+        assertTrue("backend never entered", withTimeoutOrNull(8_000) { entered.await(); true } ?: false)
+        c.cancel()
+        assertTrue(
+            "send did not finish after cancel",
+            withTimeoutOrNull(8_000) { job.join(); true } ?: false,
+        )
+
+        assertEquals("backend must observe exactly one cancellation", 1, observed.get())
+        assertEquals("cancel must not request a continuation", 1, provider.seenRequests.size)
+        assertEquals(ChatStatus.CANCELLED, c.uiState.value.status)
+        assertEquals(1, sink.cancelled.size)
+        assertTrue(sink.succeeded.isEmpty())
+    }
+
     @Test fun inlineToolDoneMarkerSanitizesNameAndArgs() = runBlocking {
         // Marker hygiene: the fullwidth bracket scrub keeps a nested-marker
         // forgery out of this echo (covered by this fixture). The CR/LF fold
@@ -2023,6 +2128,93 @@ class TurnControllerToolSliceTest {
         assertEquals(ChatStatus.IDLE, c.uiState.value.status)
         // Raw audit record keeps the VOID id.
         assertEquals("", sink.tools.single().id)
+    }
+
+    @Test fun blankIdCollisionWithGenuineIdExecutesBothCalls() = runBlocking {
+        // A model-supplied id can equal the deterministic blank repair shape.
+        // Prefixing alone would alias the earlier synthesized id and silently
+        // skip the genuine call; both stream orders (and a non-slice call
+        // seeding the same id before the blank) must execute, with unique wire
+        // ids and total pairing.
+        data class Case(val calls: List<Triple<Int, String, String>>, val expected: List<String>)
+        val cases = listOf(
+            Case(
+                listOf(
+                    Triple(0, "", "lsp.symbols"),
+                    Triple(1, "call_blank_0", "lsp.symbols"),
+                ),
+                listOf("call_blank_0", "call_blank_0_2"),
+            ),
+            Case(
+                listOf(
+                    Triple(0, "call_blank_1", "lsp.symbols"),
+                    Triple(1, "", "lsp.symbols"),
+                ),
+                listOf("call_blank_1", "call_blank_1_2"),
+            ),
+            Case(
+                listOf(
+                    Triple(7, "call_blank_0", "other.tool"),
+                    Triple(0, "", "lsp.symbols"),
+                    Triple(8, "call_blank_0", "lsp.symbols"),
+                ),
+                listOf("call_blank_0", "call_blank_0_2"),
+            ),
+            Case(
+                listOf(
+                    Triple(0, "", "lsp.symbols"),
+                    Triple(1, "call_blank_0", "lsp.symbols"),
+                    Triple(2, "call_blank_0", "lsp.symbols"),
+                ),
+                listOf("call_blank_0", "call_blank_0_2"),
+            ),
+        )
+        for (case in cases) {
+            val provider = SliceProvider()
+            val sink = SliceSink()
+            val backend = CountingBackend()
+            val pol = slicePolicy()
+            val c = controller(provider, pol, sink, loop(pol, backend, maxCallsPerTurn = 2))
+            provider.handler = { request ->
+                if (request.messages.none { it.role == "tool" }) {
+                    flow {
+                        case.calls.forEachIndexed { i, (toolIndex, id, name) ->
+                            emit(
+                                StreamEvent.ToolDone(
+                                    toolIndex = toolIndex,
+                                    id = id,
+                                    name = name,
+                                    argumentsJson = """{"query":"Q$i"}""",
+                                ),
+                            )
+                        }
+                        emit(StreamEvent.Done("tool_calls"))
+                    }
+                } else {
+                    flow {
+                        emit(StreamEvent.TextDelta(0, 0, "done"))
+                        emit(StreamEvent.Done("stop"))
+                    }
+                }
+            }
+            c.send("查 Q0 與 Q1")
+
+            assertEquals("case=${case.calls}", 2, backend.invocations.get())
+            assertEquals("case=${case.calls}", case.calls.size, sink.tools.size)
+            val cont = provider.seenRequests[1]
+            val assistant = cont.messages.first { it.role == "assistant" && it.toolCalls.isNotEmpty() }
+            assertEquals(
+                "case=${case.calls} wire ids",
+                case.expected,
+                assistant.toolCalls.map { it.id },
+            )
+            assertEquals(
+                "case=${case.calls} paired results",
+                case.expected,
+                cont.messages.filter { it.role == "tool" }.map { it.toolCallId },
+            )
+            assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+        }
     }
 
     @Test fun redactedCallIdCollisionExecutesOnceStaysRecordsOnly() = runBlocking {

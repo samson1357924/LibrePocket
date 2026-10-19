@@ -239,9 +239,21 @@ class FastRouterDecisionTest {
         }
     }
 
+    @Test fun negationAloneDoesNotFabricateToolMatch() {
+        // The negation gate runs only after a tool template matches. A bare
+        // negation must stay the ordinary no-match denial: no tool call, no
+        // clarification reason, and no fabricated execution candidate.
+        for (text in listOf("不要", "取消", "停止", "別", "不用")) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertNull("$text must not fabricate a tool call", d.toolCall)
+            assertNull("$text has no matched tool, so no deny reason", d.reasonCode)
+            assertTrue(text, d.fallbackMessage!!.isNotBlank())
+        }
+    }
+
     @Test fun clarificationReasonDistinctFromUserDisabled() {
         // 審計可區分：缺參/否定（NEED_CLARIFICATION）≠ 未接線/開關關（USER_DISABLED）。
-        assertTrue(DenyReason.NEED_CLARIFICATION != DenyReason.USER_DISABLED)
         val missing = decide("幫我設個鬧鐘")
         val wired = decide("明天早上7點30分叫我起床，設個鬧鐘")
         assertEquals(DenyReason.NEED_CLARIFICATION, missing.reasonCode)

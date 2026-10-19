@@ -2,8 +2,10 @@ package dev.librepocket.agent.ui.setup
 
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.edit
+import androidx.lifecycle.viewModelScope
 import dev.librepocket.agent.ui.Routes
 import dev.librepocket.agent.ui.chat.VaultSource
+import dev.librepocket.agent.ui.chat.cancelAndJoinChatTestScopes
 import dev.librepocket.agent.ui.effectiveLogoutGuardError
 import dev.librepocket.agent.ui.shouldNavigateToSettings
 import dev.librepocket.agent.ui.shouldNavigateToSetup
@@ -19,7 +21,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -58,46 +59,24 @@ class SetupCrossVmJournalTest {
 
     private val tmpDirs = ArrayList<java.io.File>()
     private val scopes = ArrayList<CoroutineScope>()
+    private val viewModels = ArrayList<SetupViewModel>()
 
     @Before
     fun setUp() {
-        // TODO(#96-followup): root-cause the Main leak (neighboring class
-        // draining Main users) and remove this retry. CI flake hardening for
-        // "Dispatchers.Main is used concurrently with setting it" (observed
-        // in PR #96 CI): retry briefly, then fail loudly.
-        retryMainOp("setMain") { Dispatchers.setMain(UnconfinedTestDispatcher()) }
+        Dispatchers.setMain(UnconfinedTestDispatcher())
     }
 
     @After
     fun tearDown() {
-        // D2: cancel DataStore scopes BEFORE resetMain — pendingTeardown/gate
-        // collect store flows via viewModelScope(Main); cancelling after reset
-        // would dispatch via a reset Main and fail teardown (not the test).
-        scopes.forEach { it.cancel() }
-        // resetMain races the same way as setMain (same NonConcurrent guard).
-        retryMainOp("resetMain") { Dispatchers.resetMain() }
+        // Root cause of the #96 "Dispatchers.Main is used concurrently with
+        // setting it" flake: SetupViewModel owns stateIn(WhileSubscribed(5s))
+        // collectors in viewModelScope(Main). Cancelling only the DataStore
+        // scopes left those Main users alive into the next test, so setMain/
+        // resetMain could hit the NonConcurrent guard. Cancel AND JOIN the VM
+        // scopes (plus DataStore scopes) while Main is still installed.
+        cancelAndJoinChatTestScopes(viewModels.map { it.viewModelScope } + scopes)
+        Dispatchers.resetMain()
         tmpDirs.forEach { it.deleteRecursively() }
-    }
-
-    private fun retryMainOp(name: String, op: () -> Unit) {
-        var attempts = 0
-        val end = System.nanoTime() + 5_000_000_000L
-        while (true) {
-            try {
-                op()
-                if (attempts > 0) println("SetupCrossVmJournalTest: $name succeeded after $attempts retries")
-                return
-            } catch (e: IllegalStateException) {
-                if (System.nanoTime() > end) throw e
-                attempts++
-                try {
-                    Thread.sleep(50)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    throw e
-                }
-            }
-        }
     }
 
     private val noProvider: (dev.librepocket.provider.ProviderConfig, dev.librepocket.provider.KeyProvider) -> LlmProvider =
@@ -131,7 +110,7 @@ class SetupCrossVmJournalTest {
             vaultSource = VaultSource { vault },
             policy = MutablePolicy(Verdict.ALLOW),
             buildProvider = noProvider,
-        )
+        ).also { viewModels.add(it) }
 
     private fun awaitSaveSettled(vm: SetupViewModel, timeoutMs: Long = 8000) {
         val end = System.currentTimeMillis() + timeoutMs

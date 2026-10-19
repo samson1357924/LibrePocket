@@ -202,6 +202,57 @@ class AnthropicProviderTest {
     }
 
     @Test
+    fun mixedTextAndTwoToolBlocksProjectInOrderWithDistinctIds() {
+        // Multi-call/mixed stream: a text block plus two tool_use blocks (one
+        // explicit id, one blank repaired at stop). The mapper must keep
+        // native indexes, preserve the explicit id, synthesize a distinct
+        // non-empty id for the blank call, and still end on message_stop.
+        val mapper = AnthropicMapper()
+        assertEquals(
+            emptyList<StreamEvent>(),
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}""",
+            ),
+        )
+        assertEquals(
+            listOf(StreamEvent.TextDelta(0, 0, "lookup: ")),
+            mapper.mapPayload(
+                """{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lookup: "}}""",
+            ),
+        )
+        mapper.mapPayload(
+            """{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_a","name":"get_weather"}}""",
+        )
+        mapper.mapPayload(
+            """{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Taipei\"}"}}""",
+        )
+        mapper.mapPayload("""{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","name":"get_time"}}""")
+        mapper.mapPayload(
+            """{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"tz\":\"UTC\"}"}}""",
+        )
+        mapper.mapPayload("""{"type":"content_block_stop","index":0}""")
+        val first = mapper.mapPayload("""{"type":"content_block_stop","index":1}""")
+            .filterIsInstance<StreamEvent.ToolDone>().single()
+        val second = mapper.mapPayload("""{"type":"content_block_stop","index":2}""")
+            .filterIsInstance<StreamEvent.ToolDone>().single()
+        mapper.mapPayload("""{"type":"message_delta","delta":{"stop_reason":"tool_use"}}""")
+        assertEquals(listOf(StreamEvent.Done("tool_use")), mapper.mapPayload("""{"type":"message_stop"}"""))
+
+        assertEquals(1, first.toolIndex)
+        assertEquals("toolu_a", first.id)
+        assertEquals("get_weather", first.name)
+        assertEquals("""{"city":"Taipei"}""", first.argumentsJson)
+        assertEquals(2, second.toolIndex)
+        assertTrue("blank id must be repaired, was: ${second.id}", second.id.startsWith("call_"))
+        assertTrue(
+            "repaired id must keep the canonical call_ + 8-hex shape, was: ${second.id}",
+            Regex("call_[0-9a-f]{8}").matches(second.id),
+        )
+        assertEquals("get_time", second.name)
+        assertEquals("""{"tz":"UTC"}""", second.argumentsJson)
+    }
+
+    @Test
     fun toolUseStartWithoutNameRidesBlankNameNoFabrication() {
         // Blank tool NAME: no synthesis by design — a nameless tool_use
         // rides its (empty) name verbatim; the turn layer's records-only

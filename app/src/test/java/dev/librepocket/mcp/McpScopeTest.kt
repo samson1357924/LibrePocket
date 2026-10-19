@@ -117,9 +117,12 @@ class McpScopeTest {
     }
 
     @Test fun toToolDefDefaultsToMinimalObjectSchema() {
-        // 伺服器未宣告 schema 時退最小 {"type":"object"}。交叉斷言：預設須與
-        // McpTool.inputSchema 的預設**逐字元相同**——若任一邊漂移（如加空白），
-        // 本斷言即紅，避免兩個自釘字面值各自漂移卻無人發現。
+        // 本地建構預設：toToolDef 未傳 inputSchema 時退最小 {"type":"object"}。
+        // 注意這**不是 wire fallback**——遠端缺 inputSchema 一律 PROTOCOL
+        //（McpWire.parseListPage fail-closed，見 McpWireD1Test 的負向 pin），
+        // 此預設值不會出現在任何解析結果。交叉斷言：兩個本地預設值（toToolDef
+        // 參數預設與 McpTool 建構預設）須**逐字元相同**——若任一邊漂移（如加
+        // 空白），本斷言即紅，避免兩個自釘字面值各自漂移卻無人發現。
         assertEquals("""{"type":"object"}""", McpScope.toToolDef("s1", "search").jsonSchema)
         assertEquals(
             "toToolDef 預設 jsonSchema 必須等於 McpTool.inputSchema 預設",

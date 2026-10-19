@@ -679,15 +679,124 @@ class McpWireD1Test {
     }
 
     @Test fun parseListMultipleValidToolsStillOk() {
-        // 合法混合多 tool（含缺席 inputSchema 預設）仍過。
+        // 合法混合多 tool（每支都帶 object-root inputSchema）仍過。
+        // 舊 fixture 曾以 `{"name":"b"}`（缺 inputSchema）鎖 fallback 正向——
+        // 外部 review「2026-10-19 re-review P2-2」後 fail-closed，缺 schema 見下方負向 pin。
         val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
             "[{\"name\":\"a\",\"description\":\"da\",\"inputSchema\":{\"type\":\"object\"}}," +
-            "{\"name\":\"b\"}]}}"
+            "{\"name\":\"b\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]}}"
         val tools = McpWire.parseList("s1", json)
         assertEquals(2, tools.size)
         assertEquals("a", tools[0].name)
         assertEquals("b", tools[1].name)
-        assertEquals("""{"type":"object"}""", tools[1].inputSchema)
+        assertEquals("合法 inputSchema 必須逐字元透傳", """{"type":"object","properties":{}}""", tools[1].inputSchema)
+    }
+
+    // ---- i-2. Stage P2-2：inputSchema 必備＋根 type 必須 object（fail-closed） ----
+
+    @Test fun parseListMissingInputSchemaIsProtocol() {
+        // 缺 inputSchema 不再憑空合成 {"type":"object"}（外部 review「2026-10-19 re-review P2-2」fail-open）：
+        // MCP wire 必備欄位，缺席即 PROTOCOL（整頁拒，與超限名同政策）。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"a\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"b\"}]}}"
+        try {
+            McpWire.parseList("s1", json)
+            fail("缺 inputSchema 必須拋 McpProtocol（mcp: missing inputSchema），不得合成預設")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: missing inputSchema", e.message)
+        } catch (e: IllegalArgumentException) {
+            fail("缺 inputSchema 必須拋 McpWire.McpProtocol，實際=${e.message}")
+        }
+    }
+
+    @Test fun parseListNonObjectRootTypeSchemaIsProtocol() {
+        // object 之外的根 type 一律拒：缺 type（{}）／非 object 值（array）／
+        // type 非字串（123／true／null／array）——只驗根 type，不做完整 JSON Schema
+        // meta-validation；null 與 ["object","null"] 亦非「恰為字串 object」，同落
+        // root-type 訊息（與 bad inputSchema 的「整個 schema 非 object」刻意區分）。
+        for (schema in listOf(
+            "{}",
+            "{\"type\":\"array\"}",
+            "{\"type\":123}",
+            "{\"type\":true}",
+            "{\"type\":null}",
+            "{\"type\":[\"object\",\"null\"]}",
+            // 大小寫／前導空白變體：比對刻意精確（!= "object"），防止日後被改成
+            // ignoreCase／trim 放寬而不自知（re-review F-S1-01 盲點）。
+            "{\"type\":\"OBJECT\"}",
+            "{\"type\":\"Object\"}",
+            "{\"type\":\" object\"}",
+        )) {
+            val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                "[{\"name\":\"a\",\"inputSchema\":$schema}]}}"
+            try {
+                McpWire.parseList("s1", json)
+                fail("根 type 非 object 必須拋 McpProtocol：$schema")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: inputSchema root type must be object", e.message)
+            }
+        }
+    }
+
+    @Test fun parseListShapeCheckedBeforeLength() {
+        // 驗證順序 pin（S1-D04）：同一個 inputSchema 同時「超 8192 字元」且「根 type
+        // 非 object」→ 必須先判形狀錯。訊息是 root type must be object，不得先落到
+        // 超限訊息（形狀先於長度，與 KDoc 文件化順序一致）。
+        val pad = "x".repeat(9_000)
+        val schema = "{\"type\":\"array\",\"pad\":\"$pad\"}"
+        assertTrue("fixture 必須同時超 8192 字元", schema.length > 8_192)
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"a\",\"inputSchema\":$schema}]}}"
+        try {
+            McpWire.parseList("s1", json)
+            fail("超長且根 type 非 object 的 inputSchema 必須拋 McpProtocol")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals(
+                "形狀必須先於長度檢查：$schema",
+                "mcp: inputSchema root type must be object",
+                e.message,
+            )
+        }
+    }
+
+    @Test fun parseListNonObjectSchemaVariantsStayProtocol() {
+        // null／字串／數字／陣列／布林型別的 inputSchema 維持 bad inputSchema。
+        for (schema in listOf("null", "\"str\"", "123", "[1]", "true")) {
+            val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                "[{\"name\":\"a\",\"inputSchema\":$schema}]}}"
+            try {
+                McpWire.parseList("s1", json)
+                fail("非 object inputSchema 必須拋 McpProtocol：$schema")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: bad inputSchema", e.message)
+            }
+        }
+    }
+
+    @Test fun parseListMixedPageWithBadSchemaRejectsWholePage() {
+        // 頁內混合（一支壞 schema）→ 整頁拒（fail-closed，與超限名整頁拒同政策）。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"good\",\"inputSchema\":{\"type\":\"object\"}}," +
+            "{\"name\":\"bad\",\"inputSchema\":{\"type\":\"array\"}}]}}"
+        try {
+            McpWire.parseList("s1", json)
+            fail("頁內任一壞 inputSchema 必須整頁拒，不得只略過壞項")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: inputSchema root type must be object", e.message)
+        }
+    }
+
+    @Test fun parseListObjectRootSchemaAcceptedVerbatim() {
+        // 正向：最小 {"type":"object"} 與完整 properties/required schema 皆收，
+        // 且 inputSchema 原文逐字元透傳（不重排、不補空白）。
+        val full = """{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}"""
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"min\",\"inputSchema\":{\"type\":\"object\"}}," +
+            "{\"name\":\"full\",\"inputSchema\":$full}]}}"
+        val tools = McpWire.parseList("s1", json)
+        assertEquals(2, tools.size)
+        assertEquals("""{"type":"object"}""", tools[0].inputSchema)
+        assertEquals("合法 inputSchema 必須原文透傳", full, tools[1].inputSchema)
     }
 
     // ---- k. Stage D P1：巢狀同名鍵不得遮蔽外層（owner 原 repro） ----

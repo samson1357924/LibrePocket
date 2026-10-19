@@ -39,7 +39,10 @@ object McpScope {
      * 第三方工具轉內建 [ToolDef] 視圖（預設 WRITE），便於複用 Schema/轉錄鏈路。
      *
      * @param inputSchema 遠端 `tools/list` 回傳的 JSON Schema 文本（[McpTool.inputSchema]），
-     *   原樣透傳給內建 Schema 校驗鏈路；預設最小 `{"type":"object"}`（伺服器未宣告時）。
+     *   原樣透傳給內建 Schema 校驗鏈路；預設最小 `{"type":"object"}` 是**本地建構**
+     *   預設值（未傳參數的直呼叫／測試用），與遠端契約無關——wire 層遠端缺
+     *   inputSchema 一律 PROTOCOL（[McpWire.parseListPage] fail-closed），
+     *   不會以本預設值充當遠端宣告。
      */
     fun toToolDef(
         serverId: String,

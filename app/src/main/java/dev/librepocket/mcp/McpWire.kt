@@ -88,7 +88,7 @@ internal object McpWire {
      * JSON-RPC 2.0 §5.1 保留的 implementation-defined server error 範圍
      * （−32099..−32000）：伺服器端失敗（後端不可用等），非工具業務錯。
      * [parseCall] 與協議碼同待遇拋 [McpProtocol]（PROTOCOL + 計熔斷）——
-     * 否則持續回此類錯誤的伺服器會被當中性業務錯、熔斷永不開路（外部 review P2-1）。
+     * 否則持續回此類錯誤的伺服器會被當中性業務錯、熔斷永不開路（外部 review「前輪 P2-1」）。
      * 與 [parseListPage] 對 list 端「error 包一律 PROTOCOL（含 −320xx）」一致。
      * 未來子集若納入 resources 且需區分 MCP 自用碼（如 −32002 resource not found），
      * 須先逐碼定義中性例外並補契約測試——目前 tools 子集無此通道。
@@ -98,9 +98,12 @@ internal object McpWire {
     /**
      * 已支援 ContentBlock 型別的必填欄位（MCP ContentBlock schema 子集；
      * second＝true 表示必須為字串、false 表示必須為 object）：
-     * `text`→`text`；`image`／`audio`→`data`+`mimeType`；`resource`→`resource`；
+     * `text`→`text`；`image`／`audio`→`data`+`mimeType`；`resource`→`resource`
+     * （本表只管**外層** `resource` 是 object；**內層**再經 [requireResourceContents]
+     * 二段驗證：`uri` 非空字串 ＋ `text`/`blob` 至少一個存在且為字串——外部 review
+     * 「2026-10-19 re-review P2-1」fail-open，缺 text/blob 的 resource 無可呈現內容，不得當成功）；
      * `resource_link`→`uri`+`name`。未知型別（含空字串）一律 [McpProtocol]
-     * ——本子集 fail-closed，不把「沒有實際內容的型別」當成功（外部 review P2-2）；
+     * ——本子集 fail-closed，不把「沒有實際內容的型別」當成功（外部 review「前輪 P2-2」）；
      * `type` 之外的未知鍵仍寬容。未來納入新型別時逐碼擴充此表並補契約測試。
      */
     private val CONTENT_REQUIRED_FIELDS: Map<String, List<Pair<String, Boolean>>> = mapOf(
@@ -573,9 +576,15 @@ internal object McpWire {
      * list 無業務錯通道，
      * 不當空列表、不採納）；只認頂層 `result` 包裝，
      * 再從 `result` 內取 `tools` 陣列；層級一律經 DOM 直接成員查找，
-     * 巢狀同名鍵不得遮蔽外層。inputSchema 超限拒絕不截斷、缺席時預設
-     * `{"type":"object"}`（MCP 規格為必備欄位——已知規格偏差；null/字串/數字
-     * 等非 object 一律 bad inputSchema）；
+     * 巢狀同名鍵不得遮蔽外層。inputSchema 為 MCP wire **必備**欄位（遠端契約，
+     * fail-closed）：缺席 → `mcp: missing inputSchema`（不憑空合成預設——外部 review
+     * 「2026-10-19 re-review P2-2」fail-open）；非 object（null／字串／數字／陣列／布林）→ `mcp: bad inputSchema`；
+     * object 但根 `type` 缺席／非字串／值非 `"object"` → `mcp: inputSchema root type
+     * must be object`（**只驗根 type**，不做完整 JSON Schema meta-validation）；
+     * 超 [INPUT_SCHEMA_MAX_CHARS] 拒絕不截斷（驗證順序：先形狀——缺席/非 object/
+     * 根 type——後長度）。`McpScope.toToolDef`／[McpTool.inputSchema] 的
+     * `{"type":"object"}` 預設參數是**本地建構**預設值（直呼叫／測試用），
+     * 與遠端契約無關，不會出現在任何解析結果；
      * name 超 [TOOL_NAME_MAX_CHARS] 一律拒（與出站同政策，見該常數 KDoc）、
      * 空白／空名照收（列出即不可用——[callBody] 呼叫時拒，fail-closed 於使用點）、
      * description 非字串（含 null/數字/物件）降為空字串（描述欄位型別寬容，
@@ -636,12 +645,21 @@ internal object McpWire {
                 }
                 val descVal = item.find("description")
                 val desc = if (descVal is JStr) descVal.v else ""
+                // inputSchema 為 MCP wire 必備欄位：缺席不得憑空合成預設
+                //（外部 review「2026-10-19 re-review P2-2」fail-open——舊碼缺 schema 合成 {"type":"object"}
+                // 讓不互通的伺服器回 OK 並重置熔斷）。
                 val schemaVal = item.find("inputSchema")
-                val schema = when {
-                    schemaVal == null -> """{"type":"object"}"""
-                    schemaVal is JObj -> schemaVal.raw
-                    else -> throw McpProtocol("mcp: bad inputSchema")
+                    ?: throw McpProtocol("mcp: missing inputSchema")
+                // 非 object（字串/數字/陣列/布林/null）維持既有 bad inputSchema。
+                if (schemaVal !is JObj) throw McpProtocol("mcp: bad inputSchema")
+                // 根 type 必須恰為字串 "object"（缺 type／非字串／其他值一律拒；
+                // 只驗根 type，不做完整 JSON Schema meta-validation）。
+                val rootType = schemaVal.find("type")
+                if (rootType !is JStr || rootType.v != "object") {
+                    throw McpProtocol("mcp: inputSchema root type must be object")
                 }
+                val schema = schemaVal.raw
+                // 形狀驗證先於長度（與 KDoc 文件化順序一致）；超限拒絕不截斷。
                 if (schema.length > INPUT_SCHEMA_MAX_CHARS) {
                     throw McpProtocol("mcp: inputSchema exceeds $INPUT_SCHEMA_MAX_CHARS chars")
                 }
@@ -696,7 +714,12 @@ internal object McpWire {
      *   （[CONTENT_REQUIRED_FIELDS]：缺欄位 → `mcp: content missing <type>.<field>`、
      *   型別錯 → `mcp: content bad <type>.<field>`、未知型別 → `mcp: unknown content type`，
      *   皆 [McpProtocol] PROTOCOL + 計熔斷——不得把無實際內容的畸形 block 當成功，
-     *   外部 review P2-2）；`type` 之外的未知鍵仍寬容；
+     *   外部 review「前輪 P2-2」）；`type` 之外的未知鍵仍寬容；
+     * - `resource` 型別另有**內層二段驗證**（[requireResourceContents]，外部 review
+     *   「2026-10-19 re-review P2-1」fail-open）：`resource` 物件必須含**非空字串** `uri`，且 `text`/`blob`
+     *   **至少一個存在且為字串**（兩者並存時兩個都必須是字串，否則拒——不完整
+     *   resource 無可呈現內容，不得原文透傳回 OK）；任一不符 → 靜態訊息
+     *   `mcp: bad resource contents`（不插值伺服器文字）＋ PROTOCOL + 計熔斷；
      * - `result` 既無 `content` 又無 `structuredContent`（空 `{}`、或僅 `isError` 的
      *   無內容變體）→ [McpProtocol] `mcp: empty result`（不當成功、不當業務錯：
      *   形狀不完整一律 PROTOCOL + 計熔斷）；
@@ -767,6 +790,13 @@ internal object McpWire {
                     val shapeOk = if (mustBeString) v is JStr else v is JObj
                     if (!shapeOk) throw McpProtocol("mcp: content bad ${typeVal.v}.$field")
                 }
+                // resource 二段驗證（外部 review「2026-10-19 re-review P2-1」fail-open）：上表已保證外層
+                // `resource` 是 object，內層再驗 uri 非空字串＋text/blob 至少一個
+                // 字串；不完整 resource 無可呈現內容，不得原文透傳回 OK（更不得由
+                // onSuccess 重置熔斷）——[requireResourceContents]。
+                if (typeVal.v == "resource") {
+                    requireResourceContents(obj.find("resource"))
+                }
             }
         }
         val structuredVal = resultVal.find("structuredContent")
@@ -792,6 +822,36 @@ internal object McpWire {
             else -> throw McpProtocol("mcp: empty result")
         }
         return resultJson to isError
+    }
+
+    /**
+     * `resource` ContentBlock **內層**二段驗證（外部 review「2026-10-19 re-review P2-1」fail-open）：
+     * - `resource` 必須是 object（外層 [CONTENT_REQUIRED_FIELDS] 已驗，此處防禦性再擋）；
+     * - `uri` 必須是**非空**字串（缺／null／非字串／空字串皆拒）；
+     *   `uri` 只拒空字串、不 trim（單一空白字串照收；與 `nextCursor` 政策一致——
+     *   同樣只以 `isEmpty()` 區分，不做 isBlank 歸一化）；
+     * - `text` 與 `blob` **至少一個存在且為字串**；兩者並存時兩個都必須是字串
+     *   （一正一錯即拒，不得只驗存在的那個）；`null` 不視為存在（可選鍵寬容
+     *   不適用於「內容載體」——null 內容＝無內容，fail-closed）；
+     *   **mixed null 與 null-only 同拒**（`text:null`＋`blob:"AA=="` 一併拒——
+     *   null 不視為缺席載體，不得被另一個合法載體掩蓋）。
+     *
+     * 任一不符拋 [McpProtocol]（[McpServer] 映射 PROTOCOL + 計熔斷）。
+     * 訊息刻意靜態（`mcp: bad resource contents`）：不逐項區分缺哪个欄位，
+     * 亦不插值任何伺服器字串——避免伺服器控制的文字進入上層錯誤呈現／稽核面。
+     * 不做完整 MCP Resource 內容 meta-validation（本子集只驗此三形狀要件）。
+     */
+    private fun requireResourceContents(inner: JVal?) {
+        val obj = inner as? JObj ?: throw McpProtocol("mcp: bad resource contents")
+        val uri = obj.find("uri")
+        if (uri !is JStr || uri.v.isEmpty()) {
+            throw McpProtocol("mcp: bad resource contents")
+        }
+        val text = obj.find("text")
+        val blob = obj.find("blob")
+        if (text != null && text !is JStr) throw McpProtocol("mcp: bad resource contents")
+        if (blob != null && blob !is JStr) throw McpProtocol("mcp: bad resource contents")
+        if (text == null && blob == null) throw McpProtocol("mcp: bad resource contents")
     }
 
     class McpToolFailure(message: String) : IllegalArgumentException(message)

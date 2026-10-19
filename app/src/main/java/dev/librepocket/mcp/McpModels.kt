@@ -57,7 +57,12 @@ data class McpTool(
     val serverId: String,
     val name: String,
     val description: String = "",
-    /** JSON Schema 文本（原樣透傳給模型做 Schema 校驗，不在此解析）。 */
+    /**
+     * JSON Schema 文本（原樣透傳給模型做 Schema 校驗，不在此解析）。
+     * 遠端來源必為 object-root schema（[McpWire.parseListPage] fail-closed：
+     * 缺／非 object／根 type 非 "object" 一律 PROTOCOL）；此預設值僅供
+     * **本地建構**（未傳參數的直呼叫／測試），不會出現在任何解析結果。
+     */
     val inputSchema: String = """{"type":"object"}""",
     val sideEffect: SideEffect = SideEffect.WRITE,
 )

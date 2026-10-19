@@ -58,7 +58,7 @@ class McpEnvelopeTest {
     @Test fun invalidParamsAndUnknownCodesAreToolFailure() {
         // -32602（invalid params）與範圍外未知碼：工具級中性，message 保留伺服器文字。
         //（−32000 已移出此清單：保留 server 範圍見 serverErrorRangeCodesAreProtocol——
-        // 外部 review P2-1 修正，舊 pin 把伺服器失敗鎖為中性是錯的。）
+        // 外部 review「前輪 P2-1」修正，舊 pin 把伺服器失敗鎖為中性是錯的。）
         val cases = mapOf(
             -32602 to "bad input",
             -32100 to "just below range",
@@ -78,7 +78,7 @@ class McpEnvelopeTest {
 
     @Test fun serverErrorRangeCodesAreProtocol() {
         // JSON-RPC 2.0 §5.1 保留 server 範圍（−32099..−32000）：伺服器端失敗，
-        // 非工具業務錯——與協議碼同待遇（外部 review P2-1；含邊界與範圍中點）。
+        // 非工具業務錯——與協議碼同待遇（外部 review「前輪 P2-1」；含邊界與範圍中點）。
         for (code in listOf(-32099L, -32050L, -32000L)) {
             val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":$code,\"message\":\"srv\"}}"
             try {
@@ -565,7 +565,7 @@ class McpEnvelopeTest {
         web.start()
         try {
             // 連續 server 範圍碼（−32099/−32001/−32000，伺服器端失敗）：必須計熔斷
-            // 並開路——修前被當中性業務錯（onNeutral），熔斷永不開路（外部 review P2-1）。
+            // 並開路——修前被當中性業務錯（onNeutral），熔斷永不開路（外部 review「前輪 P2-1」）。
             for (code in listOf(-32099, -32001, -32000)) {
                 web.enqueue(
                     MockResponse().setResponseCode(200).setBody(

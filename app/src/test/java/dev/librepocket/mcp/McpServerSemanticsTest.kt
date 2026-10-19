@@ -216,7 +216,7 @@ class McpServerSemanticsTest {
     }
 
     @Test fun contentRequiredFieldsAreProtocol() {
-        // ContentBlock 必填欄位（外部 review P2-2）：有 type 但缺該型別必填資料
+        // ContentBlock 必填欄位（外部 review「前輪 P2-2」）：有 type 但缺該型別必填資料
         // 不得當成功——逐型別負向 fixtures ＋ 未知型別 fail-closed。
         val bads = mapOf(
             "{\"type\":\"text\"}" to "mcp: content missing text.text",
@@ -251,6 +251,19 @@ class McpServerSemanticsTest {
             "{\"type\":\"resource_link\",\"uri\":123,\"name\":\"n\"}" to
                 "mcp: content bad resource_link.uri",
             "{\"type\":\"text\",\"text\":{}}" to "mcp: content bad text.text",
+            // resource 內層二段驗證（外部 review「2026-10-19 re-review P2-1」fail-open）：外層 object 之後
+            // 內層缺 uri／缺 text|blob／型別錯 → 靜態訊息 bad resource contents。
+            // 完整矩陣（含正反鑑別）見 resourceContentRequiresUriAndTextOrBlob。
+            "{\"type\":\"resource\",\"resource\":{}}" to "mcp: bad resource contents",
+            "{\"type\":\"resource\",\"resource\":{\"uri\":\"u\"}}" to
+                "mcp: bad resource contents",
+            "{\"type\":\"resource\",\"resource\":null}" to "mcp: content missing resource.resource",
+            "{\"type\":\"resource\",\"resource\":{\"text\":\"x\"}}" to
+                "mcp: bad resource contents",
+            "{\"type\":\"resource\",\"resource\":{\"uri\":\"u\",\"text\":1}}" to
+                "mcp: bad resource contents",
+            "{\"type\":\"resource\",\"resource\":{\"uri\":123,\"blob\":[]}}" to
+                "mcp: bad resource contents",
         )
         for ((item, msg) in bads) {
             val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
@@ -273,17 +286,93 @@ class McpServerSemanticsTest {
         }
         // 正例：已支援型別必填齊備＋未知鍵仍寬容（既有未知鍵政策不變）。
         // 五型別全列（reviewer P3）：缺正例時「合法 block 也拒」的反轉 mutation 不會紅。
+        // resource 正例須帶 text|blob（舊 fixture `{"uri":"u"}` 在 P2-1 後已是負向，
+        // 見 resourceContentRequiresUriAndTextOrBlob）。
         val ok = McpWire.parseCall(
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":" +
                 "[{\"type\":\"text\",\"text\":\"hi\",\"extra\":1}," +
                 "{\"type\":\"image\",\"data\":\"AA==\",\"mimeType\":\"image/png\"}," +
                 "{\"type\":\"audio\",\"data\":\"AA==\",\"mimeType\":\"audio/wav\"}," +
-                "{\"type\":\"resource\",\"resource\":{\"uri\":\"u\"}}," +
+                "{\"type\":\"resource\",\"resource\":{\"uri\":\"u\",\"text\":\"embedded\"}}," +
                 "{\"type\":\"resource_link\",\"uri\":\"u\",\"name\":\"n\"}]," +
                 "\"isError\":false}}",
             expectedId = 2L,
         )
         assertFalse(ok.second)
+    }
+
+    // ---- resource 內層二段驗證（外部 review「2026-10-19 re-review P2-1」fail-open）----
+
+    @Test fun resourceContentRequiresUriAndTextOrBlob() {
+        // 內層政策：uri 必須**非空**字串；text/blob 至少一個存在且為字串；
+        // 兩者並存時兩個都必須是字串（一正一錯即拒）；null 不算合法內容載體。
+        // 訊息全程靜態（bad resource contents）——不逐項區分、不插值伺服器文字。
+        val bads = mapOf(
+            // 缺 type：元素層就拒（與 inner 驗證前後一致）。
+            "{\"resource\":{\"uri\":\"u\"}}" to "mcp: bad content item",
+            // 空物件：無 uri 無 text/blob。
+            "{\"type\":\"resource\",\"resource\":{}}" to "mcp: bad resource contents",
+            // 缺 text|blob（＝舊 review P2 repro：修前回 OK 且 onSuccess 重置熔斷）。
+            "{\"type\":\"resource\",\"resource\":{\"uri\":\"u\"}}" to
+                "mcp: bad resource contents",
+            // 缺 uri。
+            "{\"type\":\"resource\",\"resource\":{\"text\":\"x\"}}" to
+                "mcp: bad resource contents",
+            "{\"type\":\"resource\",\"resource\":{\"blob\":\"AA==\"}}" to
+                "mcp: bad resource contents",
+            // 空字串 uri 非「非空」。
+            "{\"type\":\"resource\",\"resource\":{\"uri\":\"\",\"text\":\"x\"}}" to
+                "mcp: bad resource contents",
+            // 型別錯：uri 非字串／text 非字串／blob 非字串。
+            "{\"type\":\"resource\",\"resource\":{\"uri\":123,\"blob\":[]}}" to
+                "mcp: bad resource contents",
+            "{\"type\":\"resource\",\"resource\":{\"uri\":\"u\",\"text\":1}}" to
+                "mcp: bad resource contents",
+            "{\"type\":\"resource\",\"resource\":{\"uri\":\"u\",\"blob\":{\"b\":1}}}" to
+                "mcp: bad resource contents",
+            // 兩者並存但一正一錯：不得只驗存在的那個。
+            "{\"type\":\"resource\",\"resource\":{\"uri\":\"u\",\"text\":\"x\",\"blob\":1}}" to
+                "mcp: bad resource contents",
+            // null 不視為合法內容載體（fail-closed：null 內容＝無內容）。
+            "{\"type\":\"resource\",\"resource\":{\"uri\":\"u\",\"text\":null}}" to
+                "mcp: bad resource contents",
+            // mixed null（review 指出的 mutation 盲點）：text:null＋合法 blob 不得被
+            // 另一個載體掩蓋——null 不視為缺席載體，與 null-only 同拒。
+            "{\"type\":\"resource\",\"resource\":{\"uri\":\"u\",\"text\":null,\"blob\":\"AA==\"}}" to
+                "mcp: bad resource contents",
+            "{\"type\":\"resource\",\"resource\":{\"uri\":\"u\",\"blob\":null}}" to
+                "mcp: bad resource contents",
+            // 深層夾帶：未知鍵巢狀的 text 不得充當內容載體（只認 resource 直接成員）。
+            "{\"type\":\"resource\",\"resource\":{\"uri\":\"u\",\"x\":{\"text\":\"y\"}}}" to
+                "mcp: bad resource contents",
+        )
+        for ((item, msg) in bads) {
+            val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+                "{\"content\":[$item],\"isError\":false}}"
+            try {
+                McpWire.parseCall(json, expectedId = 2L)
+                fail("畸形 resource 內層必須拒：$item")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("靜態訊息不得隨內容變動：$item", msg, e.message)
+            }
+        }
+        // 正向：text 單獨／blob 單獨（含 mimeType 未知鍵）／兩者並存皆 OK，
+        // 且 resultJson 逐字元保留原文（raw-span 透傳，不重排不丟鍵）。
+        val positives = listOf(
+            "{\"type\":\"resource\",\"resource\":{\"uri\":\"u\",\"text\":\"hi\"}}",
+            "{\"type\":\"resource\",\"resource\":{\"uri\":\"u\",\"blob\":\"AA==\",\"mimeType\":\"image/png\"}}",
+            "{\"type\":\"resource\",\"resource\":{\"uri\":\"u\",\"text\":\"hi\",\"blob\":\"AA==\"}}",
+            // 已知政策 pin：uri 只拒空字串、不 trim（空白字串照收，與 nextCursor 政策一致）——
+            // 若日後改為 isBlank 拒收，此案例應翻轉為負向（改斷言 bad resource contents）。
+            "{\"type\":\"resource\",\"resource\":{\"uri\":\" \",\"text\":\"x\"}}",
+        )
+        for (item in positives) {
+            val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+                "{\"content\":[$item],\"isError\":false}}"
+            val (resultJson, isError) = McpWire.parseCall(json, expectedId = 2L)
+            assertFalse("合法 resource 不得 isError：$item", isError)
+            assertEquals("resultJson 必須逐字元保留原文：$item", "[$item]", resultJson)
+        }
     }
 
     @Test fun validationResultOrderCombinedFixture() {
@@ -334,7 +423,7 @@ class McpServerSemanticsTest {
     }
 
     @Test fun contentMissingRequiredFieldMapsProtocolAndCountsBreaker() = runBlocking {
-        // E2E（外部 review P2-2 核心回歸）：200 + 只有 type 的 text block →
+        // E2E（外部 review「前輪 P2-2」核心回歸）：200 + 只有 type 的 text block →
         // PROTOCOL + 計熔斷；不得回 OK、不得 onSuccess 重置熔斷。
         val web = MockWebServer()
         web.start()
@@ -356,6 +445,72 @@ class McpServerSemanticsTest {
             assertEquals(McpStatus.PROTOCOL, got.status)
             assertNull("PROTOCOL 路徑不得帶 resultJson", got.resultJson)
             assertEquals("畸形 ContentBlock 必須計熔斷（不得 onSuccess）", 1, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun malformedResourceContentOpensCircuit() = runBlocking {
+        // E2E（外部 review「2026-10-19 re-review P2-1」回歸）：畸形 resource 內層（缺 text|blob）連打
+        // 熔斷門檻次 → 逐次 PROTOCOL + 計熔斷，最後開路 CIRCUIT_OPEN。
+        // 修前此 fixture 回 OK 且 onSuccess 重置熔斷——連打永不開路。
+        val web = MockWebServer()
+        web.start()
+        try {
+            val badBody = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+                "{\"content\":[{\"type\":\"resource\",\"resource\":{\"uri\":\"u\"}}]," +
+                "\"isError\":false}}"
+            repeat(3) { web.enqueue(MockResponse().setResponseCode(200).setBody(badBody)) }
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            for (expected in 1..3) {
+                assertEquals(McpStatus.PROTOCOL, deadline { server.callTool("t", "{}") }.status)
+                assertEquals("畸形 resource 必須逐次累計熔斷", expected, breaker.failureCount())
+            }
+            assertTrue("連打門檻次畸形 resource 必須開路", breaker.isOpen())
+            assertEquals(
+                McpStatus.CIRCUIT_OPEN,
+                deadline { server.callTool("t", "{}") }.status,
+            )
+            assertEquals("開路後不得再發 HTTP", 3, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun missingInputSchemaListOpensCircuit() = runBlocking {
+        // E2E（外部 review「2026-10-19 re-review P2-2」回歸）：tools/list 缺 inputSchema（頁內混合：
+        // 一支合法、一支缺 schema）→ 整頁 PROTOCOL + 計熔斷；連打門檻次開路。
+        // 修前缺 schema 合成 {"type":"object"} 回 OK——不互通的伺服器永不被發現。
+        val web = MockWebServer()
+        web.start()
+        try {
+            val badBody = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                "[{\"name\":\"good\",\"inputSchema\":{\"type\":\"object\"}}," +
+                "{\"name\":\"bad\"}]}}"
+            repeat(3) { web.enqueue(MockResponse().setResponseCode(200).setBody(badBody)) }
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            for (expected in 1..3) {
+                assertEquals(McpStatus.PROTOCOL, deadline { server.listTools() }.status)
+                assertEquals("缺 inputSchema 必須逐次累計熔斷", expected, breaker.failureCount())
+            }
+            assertTrue("連打門檻次缺 inputSchema 必須開路", breaker.isOpen())
+            assertEquals(
+                McpStatus.CIRCUIT_OPEN,
+                deadline { server.listTools() }.status,
+            )
+            assertEquals("開路後不得再發 HTTP", 3, web.requestCount)
         } finally {
             web.shutdown()
         }

@@ -11,19 +11,29 @@ import dev.librepocket.tool.LspTools
 import dev.librepocket.tool.ProjectionContext
 import dev.librepocket.tool.ToolRegistry
 import dev.librepocket.provider.ToolCall
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
+import java.util.AbstractList
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -47,12 +57,12 @@ class SafeToolSliceTest {
     ) : LspTools.Backend {
         val invocations = AtomicInteger(0)
         var lastLimit: Int = -1
-        override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+        override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
             invocations.incrementAndGet()
             lastLimit = limit
             return symbols.filter { query.isNotBlank() }.take(limit)
         }
-        override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
     }
 
     private fun allowPolicy(vararg extra: PolicyRule): InMemoryPolicyStore =
@@ -68,12 +78,13 @@ class SafeToolSliceTest {
         policy: InMemoryPolicyStore = allowPolicy(),
         backend: LspTools.Backend = CountingBackend(),
         clock: Clock = fixedClock,
+        timeoutMillisForTest: Long? = null,
     ) = SafeToolSlice(
         ctxSupplier = { ctx },
         policy = policy,
         backend = backend,
         clock = clock,
-    )
+    ).also { it.backendTimeoutMillisForTest = timeoutMillisForTest }
 
     private fun call(name: String = "lsp.symbols", args: String = """{"query":"Foo"}""", id: String = "call-1") =
         ToolCall(id = id, name = name, argumentsJson = args)
@@ -295,9 +306,9 @@ class SafeToolSliceTest {
 
     @Test fun throwingBackendMapsToTypedExecError() = runBlocking {
         val throwing = object : LspTools.Backend {
-            override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
                 throw IllegalStateException("boom")
-            override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
         }
         val s = slice(backend = throwing)
         val r = s.execute(listOf(call())).single()
@@ -314,9 +325,9 @@ class SafeToolSliceTest {
     @Test fun throwingBackendWithSecretMessageDoesNotLeak() = runBlocking {
         val marker = "backend-error-marker-42"
         val throwing = object : LspTools.Backend {
-            override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
                 throw IllegalStateException(marker)
-            override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
         }
         val r = slice(backend = throwing).execute(listOf(call())).single()
         assertTrue(r.denied)
@@ -447,9 +458,9 @@ class SafeToolSliceTest {
 
     @Test fun longQueryAndSymbolsTruncateToCap() = runBlocking {
         val longBackend = object : LspTools.Backend {
-            override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
                 listOf(LspTools.Symbol("N".repeat(2000), "K".repeat(2000), "P".repeat(2000), 7))
-            override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
         }
         val s = slice(backend = longBackend)
         val longQuery = "Q".repeat(2000)
@@ -513,8 +524,223 @@ class SafeToolSliceTest {
         assertEquals(1, backend.invocations.get())
     }
 
-    @Test fun hookThrowMapsToTypedExecErrorWithoutLeak() = runBlocking {
-        // Neutral marker (deliberately not a secret-shaped literal): the pin is
+    @Test fun denyDetailTakesRedactionPipelineNotBareCap() = runBlocking {
+        // The detail can embed a model-controlled string; it must be redacted
+        // centrally like every other wire echo. The unknown-tool path is the
+        // reachable shape, and its raw name is deliberately passed to deny().
+        val backend = CountingBackend()
+        val r = slice(backend = backend).execute(
+            listOf(call(name = "tool.a.dev@corp.example.com")),
+        ).single()
+        assertTrue(r.denied)
+        assertEquals(SafeToolSlice.DenyCodes.UNKNOWN_TOOL, r.denyCode)
+        val detail = Json.parseToJsonElement(r.resultJson).jsonObject["detail"]!!.jsonPrimitive.content
+        assertFalse(detail.contains("dev@corp.example.com"))
+        assertTrue(detail.contains("⟦REDACTED:EMAIL⟧"))
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun longRedactedCallIdsThatSharePrefixStayDistinct() = runBlocking {
+        // Regression pin for capped pairing-id collisions: two long raw ids
+        // sharing the whole cap-length prefix previously produced ONE
+        // redacted pairing key, so the second execution candidate was dropped
+        // as a duplicate. The deterministic hash suffix must keep both ids
+        // distinct, bounded, and identical between the turn-engine seam and
+        // the continuation wire form.
+        val prefix = "I".repeat(SafeToolSlice.MAX_STRING_CHARS + 100)
+        val rawA = "${prefix}A"
+        val rawB = "${prefix}B"
+        val idA = SafeToolSlice.redactedPairingId(rawA)
+        val idB = SafeToolSlice.redactedPairingId(rawB)
+        assertNotEquals(idA, idB)
+        assertTrue(idA.length <= SafeToolSlice.MAX_STRING_CHARS)
+        assertTrue(idB.length <= SafeToolSlice.MAX_STRING_CHARS)
+        // Deterministic: the same raw id always maps to the same wire id.
+        assertEquals(idA, SafeToolSlice.redactedPairingId(rawA))
+        assertTrue("suffix identifies the full redacted id", Regex("#[0-9a-f]{8}$").containsMatchIn(idA))
+        val s = slice()
+        val calls = listOf(call(id = rawA, args = """{"query":"A"}"""), call(id = rawB, args = """{"query":"B"}"""))
+        val results = listOf(
+            SafeToolSlice.ToolResult(rawA, "lsp.symbols", "{}"),
+            SafeToolSlice.ToolResult(rawB, "lsp.symbols", "{}"),
+        )
+        val msgs = s.continuationMessages(calls, results)
+        assertEquals(idA, msgs[0].toolCalls[0].id)
+        assertEquals(idB, msgs[0].toolCalls[1].id)
+        assertEquals(idA, msgs[1].toolCallId)
+        assertEquals(idB, msgs[2].toolCallId)
+        // The ok receipt echoes the same bounded id, so audit and pairing agree.
+        val receipt = s.execute(listOf(call(id = rawA))).single()
+        assertEquals(idA, Json.parseToJsonElement(receipt.resultJson).jsonObject["callId"]!!.jsonPrimitive.content)
+    }
+
+    @Test fun throwingCtxSupplierOffersNoToolsAndDeniesTyped() = runBlocking {
+        val backend = CountingBackend()
+        val marker = "ctx-supplier-marker-42"
+        val s = SafeToolSlice(
+            ctxSupplier = { throw IllegalStateException(marker) },
+            policy = allowPolicy(),
+            backend = backend,
+            clock = fixedClock,
+        )
+        assertTrue("projection failure means pure chat", s.offeredTools().isEmpty())
+        val r = s.execute(listOf(call())).single()
+        assertTrue(r.denied)
+        assertEquals(SafeToolSlice.DenyCodes.SCOPE_DENIED, r.denyCode)
+        assertFalse(r.resultJson.contains(marker))
+        assertEquals("projection unavailable", Json.parseToJsonElement(r.resultJson).jsonObject["detail"]!!.jsonPrimitive.content)
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun backendTimeoutMapsToTypedExecDenied() = runBlocking {
+        val started = AtomicInteger(0)
+        val slow = object : LspTools.Backend {
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+                started.incrementAndGet()
+                delay(60_000)
+                return emptyList()
+            }
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val r = slice(backend = slow, timeoutMillisForTest = 50).execute(listOf(call())).single()
+        assertTrue(r.denied)
+        assertEquals(SafeToolSlice.DenyCodes.EXEC_DENIED, r.denyCode)
+        assertEquals("backend timed out", Json.parseToJsonElement(r.resultJson).jsonObject["detail"]!!.jsonPrimitive.content)
+        assertEquals(1, started.get())
+        // A timeout is a paired denial for the model call, not a lost pairing.
+        assertEquals("call-1", r.callId)
+        assertEquals("lsp.symbols", r.name)
+    }
+
+    @Test fun cancelInsideBackendPropagatesAsCancellation() = runBlocking {
+        val started = CompletableDeferred<Unit>()
+        val cancelled = AtomicInteger(0)
+        val thrown = CompletableDeferred<Throwable?>()
+        val gated = object : LspTools.Backend {
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+                started.complete(Unit)
+                try {
+                    awaitCancellation()
+                } finally {
+                    cancelled.incrementAndGet()
+                }
+            }
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val job = launch(Dispatchers.Default) {
+            try {
+                // A huge annotation override keeps the production timer from
+                // masking a swallowed external cancellation.
+                slice(backend = gated, timeoutMillisForTest = 300_000).execute(listOf(call()))
+                thrown.complete(null)
+            } catch (e: CancellationException) {
+                thrown.complete(e)
+                throw e
+            }
+        }
+        withTimeout(5_000) { started.await() }
+        withTimeout(5_000) { job.cancelAndJoin() }
+        assertEquals("backend observed cancellation", 1, cancelled.get())
+        // The slice must RETHROW, not turn the cancel into a denial: observe
+        // the exception the child received before it completed cancellation.
+        val error = withTimeout(5_000) { thrown.await() }
+        assertTrue("execute must rethrow cancellation, was $error", error is CancellationException)
+    }
+
+    @Test fun limitDropCountsInOmittedAndSymbolsSnapshotIsTakenOnce() = runBlocking {
+        // A backend returning more than MAX_LIMIT violates its own limit
+        // contract; the slice still bounds the wire copy, reports the cap drop
+        // in omittedCount/truncated, and iterates the backend list exactly
+        // once (the redaction + raw-field passes share one snapshot).
+        val all = List(LspTools.MAX_LIMIT + 7) { LspTools.Symbol("S$it", "k", "p", it) }
+        val iterations = AtomicInteger(0)
+        val backing = object : AbstractList<LspTools.Symbol>() {
+            override val size: Int get() = all.size
+            // Backing random access must never be used after the snapshot; if
+            // the raw-field pass re-reads `outcome.symbols[idx]`, this throws.
+            override fun get(index: Int): LspTools.Symbol = error("backing get must not be used")
+            override fun iterator(): MutableIterator<LspTools.Symbol> {
+                iterations.incrementAndGet()
+                return all.toMutableList().iterator()
+            }
+        }
+        val backend = object : LspTools.Backend {
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> = backing
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val r = slice(backend = backend).execute(
+            listOf(call(args = """{"query":"Foo","limit":${LspTools.MAX_LIMIT}}""")),
+        ).single()
+        assertFalse(r.denied)
+        val body = Json.parseToJsonElement(r.resultJson).jsonObject
+        assertEquals(LspTools.MAX_LIMIT, body["returnedCount"]!!.jsonPrimitive.content.toInt())
+        assertEquals(7, body["omittedCount"]!!.jsonPrimitive.content.toInt())
+        assertEquals("true", body["truncated"]!!.jsonPrimitive.content)
+        assertEquals("backend list must be snapshotted once", 1, iterations.get())
+        // The emitted lines come from the snapshot iterator, not a second
+        // random-access read of the backend list.
+        val lines = body["symbols"]!!.jsonArray.map { it.jsonObject["line"]!!.jsonPrimitive.content.toInt() }
+        assertEquals((0 until LspTools.MAX_LIMIT).toList(), lines)
+    }
+
+    @Test fun throwingBackendListIteratorMapsToTypedExecError() = runBlocking {
+        // Contract: non-cancel backend failures are typed EXEC_ERROR, never an
+        // escaped turn crash. The bounded snapshot now happens inside ok()'s
+        // typed boundary, so a lazy backend List that throws from size or
+        // iterator() must not escape execute().
+        val backend = object : LspTools.Backend {
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+                object : AbstractList<LspTools.Symbol>() {
+                    override val size: Int get() = LspTools.MAX_LIMIT + 1
+                    override fun get(index: Int): LspTools.Symbol = error("get must not be used")
+                    override fun iterator(): MutableIterator<LspTools.Symbol> =
+                        throw IllegalStateException("iterator boom")
+                }
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val r = slice(backend = backend).execute(listOf(call())).single()
+        assertTrue(r.denied)
+        assertEquals(SafeToolSlice.DenyCodes.EXEC_ERROR, r.denyCode)
+        assertFalse(r.resultJson.contains("iterator boom"))
+    }
+
+    @Test fun limitOmittedAndShrinkDropsAccumulateInOmittedCount() = runBlocking {
+        // Both drop sources at once: 7 over MAX_LIMIT plus whatever the total
+        // result budget drops. omittedCount must report the sum and the result
+        // must stay under MAX_RESULT_CHARS.
+        val fat = object : LspTools.Backend {
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+                List(LspTools.MAX_LIMIT + 7) {
+                    LspTools.Symbol("N".repeat(400), "K".repeat(400), "P".repeat(400), it)
+                }
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val r = slice(backend = fat).execute(
+            listOf(call(args = """{"query":"Foo","limit":${LspTools.MAX_LIMIT}}""")),
+        ).single()
+        assertFalse(r.denied)
+        val body = Json.parseToJsonElement(r.resultJson).jsonObject
+        val returned = body["returnedCount"]!!.jsonPrimitive.content.toInt()
+        val omitted = body["omittedCount"]!!.jsonPrimitive.content.toInt()
+        assertTrue(returned in 1..LspTools.MAX_LIMIT)
+        assertEquals(7 + (LspTools.MAX_LIMIT - returned), omitted)
+        assertEquals("true", body["truncated"]!!.jsonPrimitive.content)
+        assertTrue(r.resultJson.length <= SafeToolSlice.MAX_RESULT_CHARS)
+    }
+
+    @Test fun exactMaxLimitBoundaryReportsNoOmission() = runBlocking {
+        val backend = CountingBackend(symbols = List(LspTools.MAX_LIMIT) { LspTools.Symbol("S$it", "k", "p", it) })
+        val r = slice(backend = backend).execute(
+            listOf(call(args = """{"query":"Foo","limit":${LspTools.MAX_LIMIT}}""")),
+        ).single()
+        assertFalse(r.denied)
+        val body = Json.parseToJsonElement(r.resultJson).jsonObject
+        assertEquals(LspTools.MAX_LIMIT, body["returnedCount"]!!.jsonPrimitive.content.toInt())
+        assertEquals(0, body["omittedCount"]!!.jsonPrimitive.content.toInt())
+        assertEquals("false", body["truncated"]!!.jsonPrimitive.content)
+    }
+
+    @Test fun hookThrowMapsToTypedExecErrorWithoutLeak() = runBlocking {        // Neutral marker (deliberately not a secret-shaped literal): the pin is
         // the FIXED receipt — the hook's message never reaches the wire, same
         // rule as throwingBackendWithSecretMessageDoesNotLeak. Secret-shaped
         // sentinels trip the Gitleaks generic-api-key rule here, and the
@@ -563,11 +789,11 @@ class SafeToolSliceTest {
         // symbols until the total fits (P2 result-total budget), keeping the
         // JSON paired, counted, and under MAX_RESULT_CHARS.
         val fat = object : LspTools.Backend {
-            override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
                 List(LspTools.MAX_LIMIT) {
                     LspTools.Symbol("N".repeat(400), "K".repeat(400), "P".repeat(400), it)
                 }
-            override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
         }
         val s = slice(backend = fat)
         val r = s.execute(
@@ -592,7 +818,7 @@ class SafeToolSliceTest {
         // guard unreachable; drift on either constant fails this pin, not
         // production silently.
         val cap = object : LspTools.Backend {
-            override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
                 listOf(
                     LspTools.Symbol(
                         "\"".repeat(SafeToolSlice.MAX_STRING_CHARS),
@@ -601,7 +827,7 @@ class SafeToolSliceTest {
                         1,
                     ),
                 )
-            override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
         }
         val s = slice(backend = cap)
         val r = s.execute(listOf(call(args = """{"query":"Foo","limit":1}"""))).single()
@@ -824,7 +1050,7 @@ class SafeToolSliceTest {
         // anywhere in the result JSON.
         val emoji = "\uD83D\uDE00"
         val longBackend = object : LspTools.Backend {
-            override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
                 listOf(
                     LspTools.Symbol(
                         "n".repeat(499) + emoji,
@@ -833,7 +1059,7 @@ class SafeToolSliceTest {
                         1,
                     ),
                 )
-            override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
         }
         val s = slice(backend = longBackend)
         val query = "q".repeat(499) + emoji
@@ -866,9 +1092,9 @@ class SafeToolSliceTest {
         // 500 ASCII units, no surrogate handling needed and none triggered.
         val emoji = "\uD83D\uDE00"
         val longBackend = object : LspTools.Backend {
-            override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
                 listOf(LspTools.Symbol("m".repeat(2000), "k".repeat(2000), "p".repeat(2000), 1))
-            override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
         }
         val s = slice(backend = longBackend)
         val query = "q".repeat(500) + emoji
@@ -883,24 +1109,32 @@ class SafeToolSliceTest {
     }
 
     @Test fun surrogateCapAppliesToCallIdEchoesToo() = runBlocking {
-        // The same cap helper must govern the call-id string caps (deny
-        // receipt + continuation re-bind): an emoji crossing the cap in a
-        // call id keeps the pairing intact without splitting the pair.
+        // The same bounded-id helper governs the call-id wire forms (deny/ok
+        // receipt + continuation re-bind): an emoji near the cap is not split,
+        // and the hash suffix keeps the capped id within the cap and distinct
+        // (the capped prefix here ends before the pair, so the full cap is
+        // usable).
         val emoji = "\uD83D\uDE00"
-        val emojiId = "I".repeat(499) + emoji
+        // Place the pair exactly across the capped-prefix boundary: the cap
+        // reserves 9 chars for the hash suffix, so the prefix cut is at 491
+        // and the high surrogate sits at index 490. A plain take(491) would
+        // split the pair and this test would emit a lone surrogate.
+        val emojiId = "I".repeat(490) + emoji + "I".repeat(20)
         val s = slice(backend = CountingBackend())
         val unknown = s.execute(listOf(call(id = emojiId, name = "nope.tool"))).single()
         assertTrue(unknown.denied)
         assertNoLoneSurrogate(unknown.resultJson)
         val denyBody = Json.parseToJsonElement(unknown.resultJson).jsonObject
         assertEquals(SafeToolSlice.MAX_STRING_CHARS - 1, denyBody["callId"]!!.jsonPrimitive.content.length)
-        // Internal pairing keeps the full id; the continuation re-bind caps
-        // the same surrogate-safe way.
+        assertNoLoneSurrogate(denyBody["callId"]!!.jsonPrimitive.content)
+        // Internal pairing keeps the full id; the continuation re-bind uses
+        // the same bounded, surrogate-safe form.
         assertEquals(emojiId, unknown.callId)
         val msgs = s.continuationMessages(listOf(call(id = emojiId)), listOf(unknown))
         val contId = msgs.first { it.role == "tool" }.toolCallId
         assertEquals(SafeToolSlice.MAX_STRING_CHARS - 1, contId!!.length)
         assertNoLoneSurrogate(contId)
+        assertEquals(SafeToolSlice.redactedPairingId(emojiId), contId)
     }
 
     @Test fun queryTraversalAndEscapeShapesStayAllowed() = runBlocking {

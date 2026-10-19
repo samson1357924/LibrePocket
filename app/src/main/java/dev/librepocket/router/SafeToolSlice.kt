@@ -12,7 +12,9 @@ import dev.librepocket.tool.ProjectionContext
 import dev.librepocket.tool.SideEffect
 import dev.librepocket.tool.ToolRegistry
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -21,6 +23,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.put
+import java.security.MessageDigest
 import java.text.Normalizer
 import java.time.Clock
 import kotlin.coroutines.coroutineContext
@@ -50,10 +53,12 @@ import kotlin.coroutines.coroutineContext
  * 6. fresh `tool.exec` [PolicyStore.evaluateFresh] (ALLOW only; ASK/DENY/
  *    failure all deny);
  * 7. [PrivilegeGate] (READ passes without confirmation; anything else denies);
- * 8. executor ([LspTools.symbols] on the injected backend — default
+ * 8. executor ([LspTools.symbols] on the injected suspend backend — default
  *    [LspTools.StubBackend] is pure computation, no IO; injected backends
  *    must honor the same cancel contract and never return secrets, see
- *    [LspTools.Backend]).
+ *    [LspTools.Backend]). The call runs under the registry entry's
+ *    `ToolAnnotations.timeoutMs`; a timeout is a typed `EXEC_DENIED`, never a
+ *    turn cancellation.
  *
  * Denials are TYPED RESULTS (not throws, except [CancellationException]):
  * every model call gets a paired `tool` message (call-id pairing preserved
@@ -69,11 +74,13 @@ import kotlin.coroutines.coroutineContext
  * Shareability: one instance is shared by every session a factory builds, so
  * construction-captured state (`ctxSupplier`, `policy`, `backend`, `clock`)
  * must be safe for concurrent turns — keep the slice stateless; per-turn
- * state lives in the turn engine, not here. Sanctioned exception
- * ([F4]): [beforeExecuteForTest] is an internal `@Volatile` TEST seam only —
- * production composition never installs it, and it is cross-thread-visible
- * exactly so a cancel test parking the loop from the test thread is seen by
- * the turn dispatcher thread. When a second tool wires, retire
+ * state lives in the turn engine, not here. Sanctioned exceptions
+ * ([F4]): [beforeExecuteForTest] and [backendTimeoutMillisForTest] are
+ * internal `@Volatile` TEST seams only — production composition never
+ * installs them, and they are cross-thread-visible exactly so a cancel test
+ * parking the loop from the test thread is seen by the turn dispatcher
+ * thread (and a timeout test can shorten the annotation budget). When a
+ * second tool wires, retire
  * this slice (or generalize it): [offeredTools] stays pinned to [TOOL_NAME]
  * and would silently hide the new tool otherwise.
  */
@@ -150,9 +157,9 @@ class SafeToolSlice(
         }
 
         /**
-         * Execution-dedup pairing key for the turn engine: the EXACT
-         * redaction + cap that [continuationMessages] applies to call ids
-         * (the form every provider pairing validator and each provider-side
+         * Execution-dedup pairing key for the turn engine: the EXACT bounded
+         * redaction that [continuationMessages] applies to call ids (the form
+         * every provider pairing validator and each provider-side
          * `tool_call_id` sees on the wire). The turn engine routes its
          * dedup through this seam instead of importing the redactor — two
          * distinct raw ids that redact to one string must never both
@@ -162,8 +169,29 @@ class SafeToolSlice(
          * durable audit record keeps raw ids; only the execution
          * candidate/set key is redacted.
          */
-        internal fun redactedPairingId(callId: String): String =
-            cappedTake(dev.librepocket.redact.Redactor.redact(callId).text, MAX_STRING_CHARS)
+        internal fun redactedPairingId(callId: String): String = boundedRedactedId(callId)
+
+        /**
+         * Bounded, collision-disambiguated redacted id, the single shape for
+         * every wire/pairing call id. Redaction runs first (it can inflate a
+         * string), then short ids pass through unchanged. A redacted id
+         * longer than [MAX_STRING_CHARS] keeps a surrogate-safe capped prefix
+         * plus a deterministic `#` + 8-hex SHA-256 suffix of the FULL
+         * redacted id: two long ids that share the cap-length prefix (or
+         * redact to a shared prefix) stay distinct instead of collapsing into
+         * one pairing key (which would silently drop the second execution).
+         * The result never exceeds [MAX_STRING_CHARS].
+         */
+        internal fun boundedRedactedId(callId: String): String {
+            val redacted = dev.librepocket.redact.Redactor.redact(callId).text
+            if (redacted.length <= MAX_STRING_CHARS) return redacted
+            val digest = MessageDigest.getInstance("SHA-256").digest(redacted.toByteArray(Charsets.UTF_8))
+            val hex = digest.take(4).joinToString("") { byte ->
+                (byte.toInt() and 0xFF).toString(16).padStart(2, '0')
+            }
+            val suffix = "#$hex"
+            return cappedTake(redacted, MAX_STRING_CHARS - suffix.length) + suffix
+        }
 
         /**
          * Exact receipt the secret-keyed structural walk emits. Must stay
@@ -325,6 +353,16 @@ class SafeToolSlice(
     @Volatile
     internal var beforeExecuteForTest: (suspend () -> Unit)? = null
 
+    /**
+     * Test seam (internal: production composition leaves null) shortening the
+     * per-call backend budget below the registry annotation so timeout tests
+     * do not wait the production `ToolAnnotations.timeoutMs` (10 s). Read once
+     * before the wrapped call; positive values only. Volatile for the same
+     * cross-thread install reason as [beforeExecuteForTest].
+     */
+    @Volatile
+    internal var backendTimeoutMillisForTest: Long? = null
+
     /** Typed deny codes (audit-stable, user-visible in the paired denial). */
     object DenyCodes {
         const val UNKNOWN_TOOL = "UNKNOWN_TOOL"
@@ -335,9 +373,9 @@ class SafeToolSlice(
         const val NEED_CONFIRM = "NEED_CONFIRM"
         // Reserved for future WRITE/PRIVILEGED bridges: the current slice
         // rejects non-READ entries with SCOPE_DENIED before the gate, so no
-        // slice path produces NEED_CONFIRM today. EXEC_DENIED is likewise
-        // reserved: blank queries (the only Unavailable source) are rejected
-        // by schema validation first.
+        // slice path produces NEED_CONFIRM today. EXEC_DENIED is reachable
+        // only for a backend timeout (blank-query Unavailable is rejected by
+        // schema validation first).
         const val EXEC_DENIED = "EXEC_DENIED"
         const val EXEC_ERROR = "EXEC_ERROR"
         const val BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
@@ -358,28 +396,43 @@ class SafeToolSlice(
 
     /**
      * Schemas the model may call this round: `visibleTools ∩ {slice}`.
-     * Empty (switch off / flavor-blocked / not-ready) means pure chat —
-     * the request carries no tools and [execute] refuses everything.
+     * Empty (switch off / flavor-blocked / not-ready / a throwing
+     * [ctxSupplier]) means pure chat — the request carries no tools and
+     * [execute] refuses everything. A projection-supplier failure is treated
+     * as "no projection" rather than a turn failure.
      */
-    fun offeredTools(): List<ToolSchema> =
-        ToolRegistry.visibleTools(ctxSupplier())
+    fun offeredTools(): List<ToolSchema> {
+        val ctx = try {
+            ctxSupplier()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return emptyList()
+        }
+        return ToolRegistry.visibleTools(ctx)
             .filter { it.name == TOOL_NAME }
             .map { ToolSchema(it.name, it.description, it.jsonSchema) }
+    }
 
     /**
      * Execute one attempt's model tool calls in order. Never throws except
      * [CancellationException] (cancel aborts remaining calls; partial
      * results are discarded by the throw — zero further backend effects).
      * Backend exceptions (non-cancel) are mapped to typed `EXEC_ERROR`
-     * denials to preserve call-id pairing.
+     * denials to preserve call-id pairing; a backend call exceeding the
+     * registry `ToolAnnotations.timeoutMs` is a typed `EXEC_DENIED`.
      *
      * Durability: the exec-once guarantee is turn-layer, not process-level.
-     * If the process dies between [execute] and the continuation's final
-     * settle, the round's result markers stay in the persisted partial and
-     * reopen backfill stamps exactly one `INTERRUPTED` terminal (`findDanglingRunIds`
-     * in ChatSessionFactory) — nothing re-executes (no tool round resumes on
-     * reopen), so a returned result whose receipt was lost is the read-only
-     * conservative outcome.
+     * The engine marks the round executed before calling [execute], so a
+     * same-turn retry never re-executes, and no tool round resumes on reopen.
+     * Result markers are appended to the attempt partial through the normal
+     * bounded transcript flush, which is best-effort: a process kill before
+     * the next flush can lose the marker suffix (or a kill during [execute]
+     * can leave none). Reopen backfill then stamps one `INTERRUPTED` terminal
+     * when the family still dangles (`findDanglingRunIds` in
+     * ChatSessionFactory, itself best-effort). A returned result whose receipt
+     * was lost is therefore the read-only conservative outcome: nothing
+     * re-executes.
      */
     suspend fun execute(calls: List<ToolCall>): List<ToolResult> {
         // Cancel first: a cancel racing the collect→execute handoff must not
@@ -405,11 +458,11 @@ class SafeToolSlice(
         }
         coroutineContext.ensureActive()
         val tool = ToolRegistry.find(call.name)
-            // Redact the model-controlled name before it rides the wire in a
-            // detail (same rule as the `tool` field in [deny]).
-            ?: return deny(call, DenyCodes.UNKNOWN_TOOL, "unknown tool ${dev.librepocket.redact.Redactor.redact(call.name).text}")
+            // The raw model-controlled name is redacted centrally in [deny]
+            // (detail + tool echo) before it can reach the wire.
+            ?: return deny(call, DenyCodes.UNKNOWN_TOOL, "unknown tool ${call.name}")
         if (call.name != TOOL_NAME || !tool.executionReady) {
-            return deny(call, DenyCodes.NOT_READY, "${dev.librepocket.redact.Redactor.redact(call.name).text} is not wired this round")
+            return deny(call, DenyCodes.NOT_READY, "${call.name} is not wired this round")
         }
         // Defense-in-depth: the slice is READ-only by construction. Even if
         // the registry entry for TOOL_NAME were ever re-graded, never execute
@@ -419,7 +472,16 @@ class SafeToolSlice(
         if (tool.sideEffect != SideEffect.READ) {
             return deny(call, DenyCodes.SCOPE_DENIED, "sideEffect=${tool.sideEffect} not allowed in slice")
         }
-        val projection = tool.project(ctxSupplier())
+        // A throwing ctxSupplier (or projection predicate) is a scope failure,
+        // not a turn crash: deny typed with a fixed detail so no exception
+        // message rides the wire, and never touch policy/backend.
+        val projection = try {
+            tool.project(ctxSupplier())
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return deny(call, DenyCodes.SCOPE_DENIED, "projection unavailable")
+        }
         if (projection.level != CapabilityLevel.NATIVE) {
             val reason = projection.reason ?: DenyReason.USER_DISABLED
             return deny(call, DenyCodes.SCOPE_DENIED, reason.name)
@@ -444,8 +506,17 @@ class SafeToolSlice(
                 return deny(call, DenyCodes.SCOPE_DENIED, gate.reason.name)
         }
         coroutineContext.ensureActive()
+        // Read once: a concurrent test install cannot change the budget
+        // mid-call. The production budget is the registry annotation.
+        val timeoutMillis = backendTimeoutMillisForTest ?: tool.annotations.timeoutMs
         val outcome = try {
-            LspTools.symbols(args.query, args.pathPrefix, args.limit, backend)
+            withTimeout(timeoutMillis) {
+                LspTools.symbols(args.query, args.pathPrefix, args.limit, backend)
+            }
+        } catch (e: TimeoutCancellationException) {
+            // Our timer fired; an external cancel that races it still wins.
+            coroutineContext.ensureActive()
+            return deny(call, DenyCodes.EXEC_DENIED, "backend timed out")
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
@@ -456,7 +527,15 @@ class SafeToolSlice(
         }
         coroutineContext.ensureActive()
         return when (outcome) {
-            is LspTools.SymbolsOutcome.Ok -> ok(call, args.query, outcome)
+            is LspTools.SymbolsOutcome.Ok -> try {
+                ok(call, args.query, outcome)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // Defense in depth for backend List implementations whose
+                // lazy reads throw outside ok()'s own typed boundary.
+                deny(call, DenyCodes.EXEC_ERROR, "backend failed")
+            }
             is LspTools.SymbolsOutcome.Unavailable ->
                 deny(call, DenyCodes.EXEC_DENIED, outcome.detail)
         }
@@ -548,11 +627,13 @@ class SafeToolSlice(
         val json = buildJsonObject {
             put("denied", true)
             put("code", code)
-            // Model-controlled echoes are capped like Ok results; codes are
-            // fixed constants.
+            // Model-controlled echoes are redacted THEN capped like Ok
+            // results (redaction can inflate a string); codes are fixed
+            // constants. The detail can embed a model/backend-controlled
+            // string, so it takes the same pipeline rather than a bare cap.
             put("tool", cappedTake(dev.librepocket.redact.Redactor.redact(call.name).text, MAX_STRING_CHARS))
-            put("callId", cappedTake(dev.librepocket.redact.Redactor.redact(call.id).text, MAX_STRING_CHARS))
-            put("detail", cappedTake(detail, MAX_STRING_CHARS))
+            put("callId", boundedRedactedId(call.id))
+            put("detail", cappedTake(dev.librepocket.redact.Redactor.redact(detail).text, MAX_STRING_CHARS))
             put("clockMillis", clock.millis())
         }.toString()
         return ToolResult(call.id, call.name, json, denied = true, denyCode = code)
@@ -566,17 +647,26 @@ class SafeToolSlice(
         }
 
     private fun ok(call: ToolCall, query: String, outcome: LspTools.SymbolsOutcome.Ok): ToolResult {
+        // Snapshot the bounded projection ONCE inside the typed-error
+        // boundary: a backend List with a throwing size/iterator/get is a
+        // backend failure (EXEC_ERROR), never an escaped turn crash. Both the
+        // redaction pass and the raw-field pass share this snapshot, and a
+        // backend returning more than MAX_LIMIT (contract violation) is not
+        // iterated twice.
+        val available: List<LspTools.Symbol>
+        val limitOmitted: Int
         val redactedQuery: String
         val redactedSymbols: List<Triple<String, String, String>>
         val anyFieldTruncated: Boolean
         try {
+            available = outcome.symbols.take(LspTools.MAX_LIMIT)
+            limitOmitted = (outcome.symbols.size - available.size).coerceAtLeast(0)
             redactedQuery = dev.librepocket.redact.Redactor.redact(query).text
-            val raw = outcome.symbols.take(LspTools.MAX_LIMIT)
             // Truncation is decided on the POST-redaction lengths: redaction
             // can inflate a field (e.g. `⟦REDACTED:EMAIL⟧`), so a ≤cap raw
             // string may exceed the cap after redaction — decide there.
             var truncatedFlag = false
-            redactedSymbols = raw.map { s ->
+            redactedSymbols = available.map { s ->
                 val rn = dev.librepocket.redact.Redactor.redact(s.name).text
                 val rk = dev.librepocket.redact.Redactor.redact(s.kind).text
                 val rp = dev.librepocket.redact.Redactor.redact(s.path).text
@@ -591,9 +681,8 @@ class SafeToolSlice(
         } catch (_: Exception) {
             return deny(call, DenyCodes.EXEC_ERROR, "backend failed")
         }
-        val rawSymbols = outcome.symbols.take(LspTools.MAX_LIMIT)
         val symbolJsons = redactedSymbols.mapIndexed { idx, (rn, rk, rp) ->
-            val s = rawSymbols[idx]
+            val s = available[idx]
             buildJsonObject {
                 put("name", cappedEcho(rn))
                 put("kind", cappedEcho(rk))
@@ -605,7 +694,7 @@ class SafeToolSlice(
             buildJsonObject {
                 put("denied", false)
                 put("tool", cappedTake(dev.librepocket.redact.Redactor.redact(call.name).text, MAX_STRING_CHARS))
-                put("callId", cappedTake(dev.librepocket.redact.Redactor.redact(call.id).text, MAX_STRING_CHARS))
+                put("callId", boundedRedactedId(call.id))
                 put("query", cappedEcho(redactedQuery))
                 put("symbols", kotlinx.serialization.json.buildJsonArray { for (o in chosen) add(o) })
                 put("returnedCount", chosen.size)
@@ -621,13 +710,16 @@ class SafeToolSlice(
         // MAX_STRING_CHARS cap, so the quadratic component is constant-bounded
         // — perf, not correctness.
         while (chosen.size > 1) {
-            val omittedCount = symbolJsons.size - chosen.size
+            val omittedCount = limitOmitted + (symbolJsons.size - chosen.size)
             val truncated = anyFieldTruncated || omittedCount > 0
             val candidate = build(chosen, omittedCount, truncated).toString()
             if (candidate.length <= MAX_RESULT_CHARS) break
             chosen.removeAt(chosen.lastIndex)
         }
-        val omittedCount = symbolJsons.size - chosen.size
+        // A backend returning more than MAX_LIMIT is over the item cap even
+        // when the serialized result fits: report both cap drops and
+        // shrink-loop drops in omittedCount, and mark truncated.
+        val omittedCount = limitOmitted + (symbolJsons.size - chosen.size)
         val truncated = anyFieldTruncated || omittedCount > 0
         val json = build(chosen, omittedCount, truncated).toString()
         if (json.length > MAX_RESULT_CHARS) {
@@ -663,24 +755,26 @@ class SafeToolSlice(
         // the fixed receipt — see [redactedArgsEcho]).
         // Call ids ARE re-bound on this path — never verbatim: each call/id
         // here and each result's `toolCallId` below is replaced with its
-        // REDACTED form, which is why the turn engine dedups execution
+        // bounded REDACTED form ([boundedRedactedId], deterministic hash
+        // suffix past the cap), which is why the turn engine dedups execution
         // candidates on the same key ([redactedPairingId]). Pairing then
         // stays unique where the wire is unique: two distinct raw ids that
         // redact to one string cannot both execute — the colliding second
         // call stays records-only (execution dropped, marker + audit kept),
         // never a duplicate `call`/`tool` pair that would fail the provider
         // pairing validator with a non-retryable `TOOL_CALL_DUPLICATE_ID`
-        // after execution.
+        // after execution. Two distinct long ids sharing the capped prefix no
+        // longer collide: the suffix keeps them distinct and both execute.
         val normalizedCalls = calls.map {
             it.copy(
-                id = cappedTake(dev.librepocket.redact.Redactor.redact(it.id).text, MAX_STRING_CHARS),
+                id = boundedRedactedId(it.id),
                 name = cappedTake(dev.librepocket.redact.Redactor.redact(it.name).text, MAX_STRING_CHARS),
                 argumentsJson = redactedArgsEcho(it.argumentsJson),
             )
         }
         out.add(ChatMessage(role = "assistant", text = "", toolCalls = normalizedCalls))
         for (r in results) {
-            out.add(ChatMessage(role = "tool", text = r.resultJson, toolCallId = cappedTake(dev.librepocket.redact.Redactor.redact(r.callId).text, MAX_STRING_CHARS)))
+            out.add(ChatMessage(role = "tool", text = r.resultJson, toolCallId = boundedRedactedId(r.callId)))
         }
         return out
     }

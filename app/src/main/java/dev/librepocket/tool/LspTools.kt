@@ -32,25 +32,27 @@ object LspTools {
      * （僅替換資料來源，不改變開關/投影語義）。
      *
      * 實作契約：必須是純計算或有界查詢；不得執行副作用、不得回傳秘密
-     * （結果會經 continuation 發給 provider），呼叫方取消時應盡快響應。
-     * [dev.librepocket.router.SafeToolSlice] 會把非取消例外映射為 typed
-     * denial，絕不洩漏為 turn 失敗。
+     * （結果會經 continuation 發給 provider），呼叫方取消時應盡快響應——
+     * API 為 suspend，取消會從實作內的第一個 suspend 點傳播出去。
+     * [dev.librepocket.router.SafeToolSlice] 以 registry 的
+     * `ToolAnnotations.timeoutMs` 包住呼叫：逾時映射為 typed `EXEC_DENIED`，
+     * 其他非取消例外映射為 typed `EXEC_ERROR`，絕不洩漏為 turn 失敗。
      */
     interface Backend {
-        fun symbols(query: String, pathPrefix: String?, limit: Int): List<Symbol>
-        fun diagnostics(path: String): List<Diagnostic>
+        suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<Symbol>
+        suspend fun diagnostics(path: String): List<Diagnostic>
     }
 
     /** 本地樁：確定性輸出（同輸入恆得同輸出），無網路、無外部進程。 */
     object StubBackend : Backend {
-        override fun symbols(query: String, pathPrefix: String?, limit: Int): List<Symbol> {
+        override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<Symbol> {
             if (query.isBlank()) return emptyList()
             val base = pathPrefix?.trimEnd('/')?.ifBlank { null } ?: "app/src/main"
             return listOf(Symbol("$query:example", "function", "$base/Example.kt", 1))
                 .take(limit.coerceIn(1, MAX_LIMIT))
         }
 
-        override fun diagnostics(path: String): List<Diagnostic> = emptyList()
+        override suspend fun diagnostics(path: String): List<Diagnostic> = emptyList()
     }
 
     sealed interface SymbolsOutcome {
@@ -63,7 +65,7 @@ object LspTools {
         data class Unavailable(val reason: DenyReason, val detail: String, val message: String) : DiagnosticsOutcome
     }
 
-    fun symbols(
+    suspend fun symbols(
         query: String,
         pathPrefix: String? = null,
         limit: Int = DEFAULT_LIMIT,
@@ -88,7 +90,7 @@ object LspTools {
         )
     }
 
-    fun diagnostics(
+    suspend fun diagnostics(
         path: String,
         backend: Backend = StubBackend,
     ): DiagnosticsOutcome {

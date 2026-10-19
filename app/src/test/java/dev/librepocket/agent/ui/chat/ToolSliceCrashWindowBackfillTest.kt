@@ -40,11 +40,11 @@ private class CrashReopenProvider : LlmProvider {
 
 private class CrashReopenBackend : LspTools.Backend {
   val invocations = AtomicInteger(0)
-  override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+  override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
     invocations.incrementAndGet()
     return emptyList()
   }
-  override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+  override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
 }
 
 /**

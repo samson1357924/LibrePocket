@@ -135,21 +135,21 @@ class TurnControllerToolSliceTest {
 
     private class CountingBackend : LspTools.Backend {
         val invocations = AtomicInteger(0)
-        override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+        override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
             invocations.incrementAndGet()
             return listOf(LspTools.Symbol("$query:example", "function", "app/src/main/Example.kt", 1))
         }
-        override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
     }
 
     /** Backend that returns a fixed symbol list (used to size tool results). */
     private class FatBackend(private val symbols: List<LspTools.Symbol>) : LspTools.Backend {
         val invocations = AtomicInteger(0)
-        override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+        override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
             invocations.incrementAndGet()
             return symbols
         }
-        override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
     }
 
     private fun policy(vararg rules: PolicyRule) = InMemoryPolicyStore(rules.toList())

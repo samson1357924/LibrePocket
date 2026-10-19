@@ -1,5 +1,6 @@
 package dev.librepocket.tool
 
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -7,11 +8,11 @@ import org.junit.Test
 
 /**
  * S1-B `lsp.symbols` / `lsp.diagnostics` 測試：本地樁確定性、MCP 橋接可替換、
- * 開關預設關。樁無外部依賴。
+ * 開關預設關。樁無外部依賴；backend API 為 suspend，測試以 `runBlocking` 驅動。
  */
 class LspStubTest {
 
-    @Test fun stubSymbolsAreDeterministic() {
+    @Test fun stubSymbolsAreDeterministic() = runBlocking {
         val first = LspTools.symbols("Foo", backend = LspTools.StubBackend)
         val second = LspTools.symbols("Foo", backend = LspTools.StubBackend)
         assertTrue(first is LspTools.SymbolsOutcome.Ok)
@@ -23,7 +24,7 @@ class LspStubTest {
         assertTrue(first.fromStub)
     }
 
-    @Test fun stubDiagnosticsAreEmptyButWellFormed() {
+    @Test fun stubDiagnosticsAreEmptyButWellFormed() = runBlocking {
         val outcome = LspTools.diagnostics("app/src/main/Example.kt", backend = LspTools.StubBackend)
         assertTrue(outcome is LspTools.DiagnosticsOutcome.Ok)
         val ok = outcome as LspTools.DiagnosticsOutcome.Ok
@@ -31,12 +32,12 @@ class LspStubTest {
         assertTrue(ok.fromStub)
     }
 
-    @Test fun mcpBridgeOverridesStub() {
+    @Test fun mcpBridgeOverridesStub() = runBlocking {
         val bridge = object : LspTools.Backend {
-            override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
                 listOf(LspTools.Symbol(query, "class", "mcp://srv/Main.kt", 42))
 
-            override fun diagnostics(path: String): List<LspTools.Diagnostic> =
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> =
                 listOf(LspTools.Diagnostic(path, 7, "error", "mcp: unresolved reference"))
         }
         val symbols = LspTools.symbols("Bar", backend = bridge)
@@ -49,7 +50,7 @@ class LspStubTest {
         assertEquals(1, (diags as LspTools.DiagnosticsOutcome.Ok).diagnostics.size)
     }
 
-    @Test fun blankInputIsUnavailableWithMatrixTemplate() {
+    @Test fun blankInputIsUnavailableWithMatrixTemplate() = runBlocking {
         val symbols = LspTools.symbols("  ")
         assertTrue(symbols is LspTools.SymbolsOutcome.Unavailable)
         val u = symbols as LspTools.SymbolsOutcome.Unavailable

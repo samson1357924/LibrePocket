@@ -40,6 +40,10 @@ package dev.librepocket.mcp
  *    `openUntilMs` 重切為 `now + openMs`（已達閾值時每敗重切）——開窗可被持續
  *    失敗一路延長；**到期後**才抵達的失敗先清窗（第 2 點視圖）再計數，視為
  *    恢復期第一敗、不沿用舊計數。兩半皆已測。
+ *    **開窗中 in-flight 成功**（[onSuccess] 在窗已開後才返回）只清 `failures`，
+ *    **不關閉已由其他請求開的窗**（保守，避免成功／失敗交錯造成 flapping）；
+ *    此狀態下 `failureCount() == 0` 但 [isOpen] 仍為 true，直到視窗到期
+ *    （`successWhileWindowOpenClearsFailuresButKeepsWindow` 釘住，行為不改）。
  *
  * 預設：連續 3 次失敗開路 60s（BACKLOG D03「連續失敗熔斷」的最小實現）。
  */
@@ -73,6 +77,13 @@ class McpCircuitBreaker(
     @Synchronized
     fun isOpen(): Boolean = openUntilMs != 0L && !windowExpired()
 
+    /**
+     * 成功事件：清 `failures`；若視窗已到期亦順手清窗（狀態入口）。
+     *
+     * **開窗中**（窗由其他請求的失敗打開、尚未到期）的成功**不關窗**——只清
+     * `failures`，`failureCount() == 0` 但 [isOpen] 仍為 true（保守，避免
+     * flapping；見類 KDoc 第 4 點），直到到期由 [canCall]／[onFailure] 清窗。
+     */
     @Synchronized
     fun onSuccess() {
         failures = 0

@@ -297,6 +297,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # PyYAML is a hard dependency of the docs claim check (A0 parses every
+      # checked-in workflow). Missing PyYAML is already fail-closed there, but
+      # the traceback message is misleading; fail here with an actionable hint.
+      - name: Verify PyYAML
+        run: |
+          set -euo pipefail
+          if ! python3 -c 'import yaml'; then
+            echo "PyYAML is required by scripts/docs_claim_check.sh; install python3-yaml" >&2
+            exit 1
+          fi
+
       # Fixture self-test first (D-02): proves the guard still rejects every
       # zero-wiring bypass surface — each wiring vector (out-of-package, in-
       # package outbound, manifest FQN + relative component, new module) and

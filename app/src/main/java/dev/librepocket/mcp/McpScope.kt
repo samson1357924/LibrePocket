@@ -118,14 +118,14 @@ object McpScope {
      *   **保留前綴兩端同政策**（單一真相 [McpWire.RESERVED_TOOL_PREFIX]＝[SWITCH_PREFIX]）：
      *   入站 `McpWire.parseListPage` 對此前綴的遠端名**整頁拒**（拋 [McpWire.McpProtocol]）、
      *   出站／授權側（本函）**拒用**——兩邊都做，才不會「列出但不可用」；
+     * - 超 [McpWire.TOOL_NAME_MAX_CHARS]（128）UTF-16 code units——**直接引用 wire 常數**，
+     *   不另立魔數（wire 層入站／出站已同此常數，三方同源）；
      * - C0 控制字元（`< 0x20`）與 DEL（`0x7F`）——與入站 `parseListPage` 同政策
      *   （控制字元干擾終端／以名為鍵的比較；**稽核列偽造**雙端皆已收斂：入站
      *   `parseListPage` 拒控制字元名使該類名無法自遠端列表流入，出站
      *   [McpWire.callBody] 同政策拒發送（Stage3 A-01 對稱防護），被拒名在
      *   [McpCallResult.auditMap]／`toString()` 只以 `\\uXXXX` 轉義形式出現
-     *   （見 [McpCallResult.auditMap]）；
-     * - 超 [McpWire.TOOL_NAME_MAX_CHARS]（128）UTF-16 code units——**直接引用 wire 常數**，
-     *   不另立魔數（wire 層入站／出站已同此常數，三方同源）。
+     *   （見 [McpCallResult.auditMap]）。
      *
      * **不做正規化（精確鍵語意）**：不 trim、大小寫敏感；[McpServerConfig.enabledTools]
      * 以遠端名**精確比對**（`getOrDefault(toolName, true)`），變體名（前後空白／大小寫）

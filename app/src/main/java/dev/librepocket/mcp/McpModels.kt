@@ -12,8 +12,11 @@ import dev.librepocket.tool.SideEffect
  * 隱私不變式（測試強制）：
  * - Token 只放 HTTP `Authorization` 標頭，不進 JSON-RPC body，不寫 log/audit；
  * - Key 一律走 [dev.librepocket.keystore.KeyVault]（[McpServerConfig.keyId]），用後即擦；
- * - 原參數（tools/call argumentsJson）與結果原文不落盤：稽核只記
- *   serverId / tool / status / latencyMs（見 [McpCallResult.auditMap]）。
+ * - 原參數（tools/call argumentsJson）、結果原文與 errorMessage 不落盤：
+ *   稽核只記 serverId / tool / status / latencyMs / isError
+ *   （[McpCallResult.auditMap]）與 serverId / toolCount / tools / status /
+ *   latencyMs（[McpListResult.auditMap]）；audit 欄位**刻意不含**
+ *   arguments／result／error（errorMessage）。
  */
 object McpTimeouts {
     const val MIN_MS: Long = 15_000L
@@ -123,14 +126,17 @@ data class McpListResult(
     val latencyMs: Long,
 ) {
     /**
-     * 稽核面。`tools` 名清單**刻意**不經 [McpWire.escapeControlUnits]（與
+     * 稽核面。[serverId] 是本地配置值，但可含 CR/LF 等 C0/DEL（偽造稽核列）——
+     * 與 [McpCallResult.auditMap] 的 `tool` 欄同政策，經
+     * [McpWire.escapeControlUnits] 只轉義 C0/DEL／孤立 surrogate，一般字元原樣。
+     * `tools` 名清單**刻意**不經 [McpWire.escapeControlUnits]（與
      * [McpCallResult.auditMap] 的 tool 欄轉義不對稱）：名的唯一建構點是
      * `McpWire.parseListPage`，入站已 fail-closed 拒 C0/DEL 與孤立 surrogate——
      * wire 來源的名不可能含控制字元。直呼本建構子的本地呼叫端自備字串屬
      * 防禦深度缺口（re-review F-S3-02），接線 PR 若引入非 wire 來源須一併轉義。
      */
     fun auditMap(): Map<String, Any?> = mapOf(
-        "serverId" to serverId,
+        "serverId" to McpWire.escapeControlUnits(serverId),
         "toolCount" to tools.size,
         "tools" to tools.map { it.name },
         "status" to status.name,
@@ -178,9 +184,11 @@ data class McpCallResult(
      * 可含 CR/LF/ESC）仍會進本欄供診斷，但只以 [McpWire.escapeControlUnits] 的
      * 可見 `\\uXXXX` 轉義形式出現——裸 CR/LF 偽造稽核列的通道關閉。
      * 合法名（入站已拒 C0/DEL、出站形狀閘同政策）原樣保留，既有稽核語意不變。
+     * [serverId] 同政策（本地配置值可含 C0/DEL）：只轉義控制字元／孤立 surrogate，
+     * 一般字元原樣。
      */
     fun auditMap(): Map<String, Any?> = mapOf(
-        "serverId" to serverId,
+        "serverId" to McpWire.escapeControlUnits(serverId),
         "tool" to McpWire.escapeControlUnits(tool),
         "status" to status.name,
         "latencyMs" to latencyMs,

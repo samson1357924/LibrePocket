@@ -198,6 +198,29 @@ class McpCircuitBreakerConcurrencyTest {
         assertTrue(breaker.canCall())
     }
 
+    @Test fun successWhileWindowOpenClearsFailuresButKeepsWindow() {
+        // C-07 語義 pin（行為不改，只文件化＋釘死）：in-flight 成功在窗已開後
+        // 才返回時，onSuccess 只清 failures、**不關閉**已由其他請求開的窗
+        //（保守，避免成功／失敗交錯造成 flapping）。故 failureCount()==0 但
+        // isOpen() 仍 true，直到視窗到期才恢復；此狀態屬刻意設計。
+        var now = 0L
+        val breaker = McpCircuitBreaker(maxFailures = 3, openMs = 1_000L, clockMs = { now })
+        repeat(3) { breaker.onFailure() } // T1 三次失敗開窗至 1_000
+        assertTrue("前提：視窗已開", breaker.isOpen())
+        assertEquals(3, breaker.failureCount())
+
+        breaker.onSuccess() // 開窗中的 in-flight 成功
+
+        assertEquals("成功只清 failures", 0, breaker.failureCount())
+        assertTrue("不得關閉已由其他請求開的窗（保守，避免 flapping）", breaker.isOpen())
+        assertFalse("窗仍開，短路照舊", breaker.canCall())
+
+        now = 1_000L
+        assertFalse("到期後視窗才關閉", breaker.isOpen())
+        assertEquals(0, breaker.failureCount())
+        assertTrue("到期後放行", breaker.canCall())
+    }
+
     @Test fun backwardInjectedClockDoesNotShrinkOrExtendWindow() {
         // C-08：預設時鐘已改單調源；注入的假時鐘若回撥，到期判定以 `now >= openUntil`
         // 為準——回撥只會讓窗口「看起來更遠」，不會提早關窗（生產預設無回撥）。

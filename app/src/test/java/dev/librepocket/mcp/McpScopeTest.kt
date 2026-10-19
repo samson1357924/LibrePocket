@@ -168,6 +168,30 @@ class McpScopeTest {
         assertTrue(list.auditMap().containsKey("serverId"))
     }
 
+    @Test fun callResultAuditEscapesServerIdControlChars() {
+        // security P4：serverId 是本地配置值，可含 CR/LF／NUL——原樣進稽核可偽造
+        // 日誌列。與 tool 欄同政策經 escapeControlUnits 只轉義 C0/DEL（一般字元
+        // 原樣）；mutation（拿掉 serverId 的 escapeControlUnits）此測即紅。
+        val r = McpCallResult("s\r\n\u0000id", "search", McpStatus.OK, 1L)
+        val audit = r.auditMap()["serverId"] as String
+        assertEquals("s\\u000d\\u000a\\u0000id", audit)
+        assertTrue("稽核 serverId 不得含裸 C0/DEL", audit.none { it.code < 0x20 || it.code == 0x7F })
+        // 正向：正常 serverId no-op 原樣（稽核語意不變）。
+        assertEquals("s1", McpCallResult("s1", "search", McpStatus.OK, 1L).auditMap()["serverId"])
+    }
+
+    @Test fun listResultAuditEscapesServerIdControlChars() {
+        // security P4：與 McpCallResult.auditMap 同政策；list 稽核列同樣不得被
+        // serverId 的裸 CR/LF 偽造。mutation（拿掉 serverId 的 escapeControlUnits）
+        // 此測即紅。
+        val r = McpListResult("s\r\n\u0000id", emptyList(), McpStatus.OK, 1L)
+        val audit = r.auditMap()["serverId"] as String
+        assertEquals("s\\u000d\\u000a\\u0000id", audit)
+        assertTrue("稽核 serverId 不得含裸 C0/DEL", audit.none { it.code < 0x20 || it.code == 0x7F })
+        // 正向：正常 serverId no-op 原樣。
+        assertEquals("s1", McpListResult("s1", emptyList(), McpStatus.OK, 1L).auditMap()["serverId"])
+    }
+
     @Test fun switchKeyShape() {
         // C-04 正向 pin：保留 `mcp.` 前綴（與 requireBareToolName／wire 同源）＋
         // 長度前綴結構化鍵；展示名（ToolDef.name）仍是 `mcp.s1.search`，兩者分離。

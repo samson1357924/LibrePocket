@@ -18,10 +18,22 @@ import java.io.File
  *   不遞迴刪除其指向的外部內容、也不還原為正式 skill；真實目錄走
  *   NOFOLLOW 遞迴刪除（內部遭植入 symlink 亦不波及外部）；
  * - 每次啟動刪除類處置設 [SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN] 上限：
- *   超出者保留、下次啟動繼續收斂。
+ *   超出者保留、下次啟動繼續收斂（崩潰還原型豁免上限，見
+ *   cleanupBudget_midRun_restoreExempt）。
  *
- * 啟動接線（[dev.librepocket.agent.LibrePocketApp.onCreate] 真的呼叫清理）由
- * `LibrePocketAppStartupTest`（Robolectric）覆蓋。
+ * Skip 語義：以下測試需平台可建 symlink，未支援時以 [org.junit.Assume.assumeNoException]
+ * 跳過，非 silent-fail——綠但帶 skip 的 run 並非 symlink 防衛全覆蓋證明，
+ * 正式 gating 以可建 symlink 的 CI（Linux）為準：
+ * cleanup_symlinkStaleStaging_externalContentsSurvive、cleanup_freshSymlinkCrashBak_notRestoredAsSkill、
+ * cleanup_danglingSymlinkStaleEntry_unlinkOnly、cleanup_realStagingWithInnerSymlink_externalContentsSurvive、
+ * cleanup_symlinkUnlink_capped_perRun、cleanup_symlinkDestRoot_isNoop、
+ * listResiduals_symlinkDestRoot_isEmpty、installedVersion_symlinkSkillMd_returnsNull、
+ * installedVersion_symlinkSkillDir_returnsNull、cleanup_freshLinkStagingShape_unlinkedRegardlessOfAge。
+ *
+ * 啟動接線（[dev.librepocket.agent.LibrePocketApp.onCreate] 真的呼叫清理）屬
+ * Android 行為，由 `LibrePocketAppStartupTest`（Robolectric）覆蓋；
+ * 「屬性讀取失敗（AccessDenied 等）一律回 true」的分岔無 JVM 注入縫，
+ * 只能真機/手動驗——本檔主張以 CI 綠為準、skip 不計入 symlink 分支覆蓋。
  */
 class SkillStartupRecoveryTest {
 
@@ -120,8 +132,9 @@ class SkillStartupRecoveryTest {
             } catch (e: java.io.IOException) {
                 assumeSymlinkSupported(e)
             }
-            // 條目齡期取自 f.lastModified()（跟隨 symlink → 外部目錄 mtime）：
-            // 把外部目錄設為過期，使條目進入刪除路徑。
+            // 探針先行（NOFOLLOW 前置分類）後，link 條目不參與齡期判斷——
+            // lastModified() 跟隨 symlink 的舊因果已不適用，新舊一律只解除 link
+            // 本身；外部目錄設為過期僅為縱深對照（結果不依賴外部 mtime）。
             outside.setLastModified(System.currentTimeMillis() - (25L * 60 * 60 * 1000))
             val removed = SkillInstaller.cleanupStaleStaging(root)
             assertEquals(1, removed)
@@ -176,10 +189,39 @@ class SkillStartupRecoveryTest {
             } catch (e: java.io.IOException) {
                 assumeSymlinkSupported(e)
             }
-            // dangling link 的 lastModified() 回 0 → 恆為過期，直接進入刪除路徑。
+            // 探針先行後本測不依賴齡期：dangling link 經 NOFOLLOW 前置分類直接
+            // 進入「只解除 link 本身」路徑（lastModified()==0 的舊因果已不適用）。
             val removed = SkillInstaller.cleanupStaleStaging(root)
             assertEquals(1, removed)
             assertFalse("dangling link 應被解除", link.exists())
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    @Test fun cleanup_freshLinkStagingShape_unlinkedRegardlessOfAge() {
+        // 新鮮（mtime=now）的 .tmp-* symlink 條目也必須只解除 link 本身：
+        // lastModified() 會跟隨 link（mtime 不可信），故 NOFOLLOW 分類必須先於
+        // 齡期閘——不得因「新鮮」而把 link 留待下次收斂，外部內容更絕不可觸。
+        val parent = tempRoot()
+        try {
+            val root = File(parent, "skills").apply { mkdirs() }
+            val outside = File(parent, "outside").apply { mkdirs() }
+            val sentinel = File(outside, "sentinel.txt").apply { writeText("keep", Charsets.UTF_8) }
+            val link = File(root, ".evil-skill.tmp-${System.nanoTime()}-1")
+            try {
+                java.nio.file.Files.createSymbolicLink(link.toPath(), outside.toPath())
+            } catch (e: UnsupportedOperationException) {
+                assumeSymlinkSupported(e)
+            } catch (e: java.io.IOException) {
+                assumeSymlinkSupported(e)
+            }
+            // 指向物刻意保持「新鮮」：若探針晚於齡期閘，此條目會被誤保留（removed==0）。
+            assertEquals(1, SkillInstaller.cleanupStaleStaging(root))
+            assertFalse("新鮮 link 亦應立即解除", link.exists())
+            assertTrue("外部 sentinel 必須存活", sentinel.isFile)
+            assertTrue("外部目錄必須保留", outside.isDirectory)
+            assertFalse("不得還原為正式 skill", File(root, "evil-skill").exists())
         } finally {
             parent.deleteRecursively()
         }
@@ -240,6 +282,46 @@ class SkillStartupRecoveryTest {
             assertEquals("單次刪除只到上限", SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN, first)
             val second = SkillInstaller.cleanupStaleStaging(root)
             assertEquals("剩餘條目下次啟動收斂", extra, second)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun cleanupBudget_midRun_restoreExempt() {
+        // 刪除類預算吃滿的 run 內，崩潰還原（rename，O(1)）仍必須豁免上限：
+        // 嶄新 destRoot（無 installed 干擾），64 個過期 staging（不同合法 id）+
+        // 1 份新鮮 crash-bak（name==bakId、SKILL.md 可解析、target 缺席）→
+        // 無論列舉順序：bak 照常還原（還原分支不檢查 deletionAllowed，豁免成立）、
+        // 64 刪除恰好吃滿上限，removed == 上限 + 1（bak 從不擠兌刪除預算，反之亦然）。
+        val root = tempRoot()
+        try {
+            val now = System.currentTimeMillis()
+            for (i in 0 until SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN) {
+                File(root, ".cap-rst-skill-" + i.toString().padStart(3, '0') + ".tmp-1-2").apply {
+                    mkdirs()
+                    setLastModified(now - (25L * 60 * 60 * 1000))
+                }
+            }
+            val tid = Thread.currentThread().id
+            val bak = File(root, ".rst-skill.bak-${System.nanoTime()}-$tid").apply {
+                mkdirs()
+                File(this, "SKILL.md").writeText(skillMd("rst-skill", "舊版正文"), Charsets.UTF_8)
+                setLastModified(System.currentTimeMillis())
+            }
+            val removed = SkillInstaller.cleanupStaleStaging(root)
+            assertEquals(SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN + 1, removed)
+            assertTrue("crash-bak 應已還原為正式 skill", File(root, "rst-skill/SKILL.md").isFile)
+            assertFalse("bak 應被消費：${root.listFiles()!!.toList()}", bak.exists())
+            assertTrue(
+                "64 個過期 staging 應全部收斂：${root.listFiles()!!.toList()}",
+                root.listFiles()!!.none { it.name.startsWith(".cap-rst-skill") },
+            )
+            assertEquals(
+                "第二次呼叫不該再有東西可收斂",
+                0,
+                SkillInstaller.cleanupStaleStaging(root),
+            )
+            assertTrue("還原後的 rst-skill 不得被誤觸", File(root, "rst-skill/SKILL.md").isFile)
         } finally {
             root.deleteRecursively()
         }

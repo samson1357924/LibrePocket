@@ -30,15 +30,18 @@ import java.util.zip.ZipOutputStream
  * - 併發安裝同一 skill 序列化（per-skill 鎖 + hook 內最大並發斷言；
  *   新鮮安裝同 id 恰一勝出、其餘 ALREADY_EXISTS）；
  * - 重啟清理：過期 staging／孤兒 bak 收斂、嚴格檔名形狀、崩潰三窗口調 cleanup 即恢復、
- *   同 id 多份 orphan backup 歧義全保留；
+ *   同 id 多份 orphan backup 歧義全保留、還原內容校驗（SKILL.md name==bakId，
+ *   不符或不可解析者 KEPT 待人工）；
  * - 降版揭露不擋：覆蓋成功帶回 replacedVersion（舊版無 version/新鮮安裝為 null）、
  *   [SkillInstaller.installedVersion] 缺席/損毀回 null；
  * - 殘餘觀察：[SkillInstaller.listResiduals] 只列不刪（含歧義保留候選），
  *   計數與清理一致；
  *
  * Skip 語義：symlink 案例以 [org.junit.Assume.assumeNoException] 在不支援
- * symlink 的平台上跳過（未特權的 Windows FS 等）。綠但帶 skip 的 run 並非
- * symlink 分支全覆蓋證明；CI 的 Linux runner 均可建 symlink，正式 gating 以
+ * symlink 的平台上跳過（未特權的 Windows FS 等）；destRootUnreadableAttrs_convergesToIoError
+ * 另以 POSIX 權限探測＋非 root 閘 assume-skip（屬性判定分支本身無 JVM 注入縫）。
+ * 綠但帶 skip 的 run 並非
+ * symlink／屬性分支全覆蓋證明；CI 的 Linux runner 均可建 symlink，正式 gating 以
  * CI 執行為準。
  *
  * 測試 hook 採委託式：只擋指定 rename，其餘走真實 `from.renameTo(to)`，
@@ -988,6 +991,220 @@ class SkillAtomicCommitTest {
             assertFalse(stale.exists())
         } finally {
             root.deleteRecursively()
+        }
+    }
+
+    @Test fun installIntoNonexistentDestRoot_createsAndSucceeds() {
+        // 首次安裝到「不存在」的 destRoot：探針僅在已存在時運作——不存在路徑
+        // 不被判為不可信，mkdirs 建目錄後照常成功、enabled 預設 true。
+        // 反例守衛：防 fail-closed 探針把「不存在」誤殺成拒裝（拿不到屬性≠不存在）。
+        val parent = tempRoot()
+        try {
+            val destRoot = File(parent, "nested-root/skills")
+            val r = SkillInstaller.installFiles(
+                linkedMapOf<String, ByteArray>(
+                    "atomic-skill/SKILL.md" to skillMd(name = "atomic-skill").toByteArray(Charsets.UTF_8),
+                ),
+                destRoot,
+            )
+            assertTrue("expected success, got $r", r is SkillInstaller.Result.Success)
+            val skill = (r as SkillInstaller.Result.Success).skill
+            assertTrue("destRoot 應由安裝建立", destRoot.isDirectory)
+            assertTrue(File(destRoot, "atomic-skill/SKILL.md").isFile)
+            assertTrue(skill.enabled)
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    @Test fun destRootUnreadableAttrs_convergesToIoError() {
+        // destRoot 已存在、父層摘除 x bit：lstat/stat/exists 均讀不到屬性，
+        // 頂層仍必須以 IO_ERROR 收斂（不拋出、不落半成品）。
+        // 誠實註記：未知屬性分支本身（exists() 為真而 lstat 失敗）在本 JVM 測試組
+        // 無注入縫；本案釘的是 mkdirs/lstat 失敗路由到 IO_ERROR 的「上層收斂」，
+        // 探針未知分支的保真屬 KDoc 承諾＋code 一致性，只能真機/手動驗。
+        // POSIX chmod 需非 Windows 且非 root（root 對 x bit 的繞過使閘失效），否則 assume-skip。
+        val parent = tempRoot()
+        try {
+            val destRoot = File(parent, "skills").apply { mkdirs() }
+            val supportsPosix = try {
+                java.nio.file.Files.getPosixFilePermissions(parent.toPath())
+                true
+            } catch (_: Exception) {
+                false
+            }
+            org.junit.Assume.assumeTrue("POSIX permissions unsupported on this FS", supportsPosix)
+            org.junit.Assume.assumeTrue(
+                "chmod gate ineffective as root",
+                System.getProperty("user.name") != "root",
+            )
+            val original = java.nio.file.Files.getPosixFilePermissions(parent.toPath())
+            try {
+                java.nio.file.Files.setPosixFilePermissions(
+                    parent.toPath(),
+                    java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"),
+                )
+                // 功能性閘：chmod 可能靜默失效（user.name 誤報 root、特殊 mount
+                // 掛載選項）；未真摘 x bit 時後續路由與一般路徑無異，assume-skip
+                // 而非讓斷言在失效閘下偶然通過。
+                org.junit.Assume.assumeFalse(
+                    "chmod gate ineffective (x bit still set)",
+                    java.nio.file.Files.isExecutable(parent.toPath()),
+                )
+                val r = SkillInstaller.installFiles(
+                    linkedMapOf<String, ByteArray>(
+                        "conv-skill/SKILL.md" to skillMd(name = "conv-skill").toByteArray(Charsets.UTF_8),
+                    ),
+                    destRoot,
+                )
+                assertTrue("expected failure, got $r", r is SkillInstaller.Result.Failure)
+                assertEquals(
+                    SkillInstaller.Failure.IO_ERROR,
+                    (r as SkillInstaller.Result.Failure).reason,
+                )
+                assertTrue(
+                    "message 應循 mkdirs 失敗路由（同 destRootNotCreatable 款式）：${(r as SkillInstaller.Result.Failure).message}",
+                    "cannot create" in (r as SkillInstaller.Result.Failure).message,
+                )
+            } finally {
+                try {
+                    java.nio.file.Files.setPosixFilePermissions(parent.toPath(), original)
+                } catch (_: Exception) {
+                    // best effort 還原；還原失敗會令本測 temp 清理殘餘（誠實代價，不改變斷言）。
+                }
+            }
+            assertFalse("不得落半成品", File(destRoot, "conv-skill").exists())
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    @Test fun staleBakWithoutTarget_manifestNameMismatch_keptNotRestored() {
+        // 還原內容校驗（fail-closed）：bak 內 SKILL.md 可解析但 manifest.name 與
+        // bakId 不符 → 無法證明此 bak 屬於該 skill：KEPT、不扶正（bakId 與
+        // other-name 皆不得出現）、不刪除；listResiduals 照常列出供人工核對。
+        val root = tempRoot()
+        try {
+            val tid = Thread.currentThread().id
+            val bak = File(root, ".mismatch-skill.bak-${System.nanoTime()}-$tid").apply {
+                mkdirs()
+                File(this, "SKILL.md").writeText(
+                    skillMd(name = "other-name", body = "偽 bak 內容"),
+                    Charsets.UTF_8,
+                )
+                setLastModified(System.currentTimeMillis() - 120_000L)
+            }
+            val removed = SkillInstaller.cleanupStaleStaging(root, maxAgeMillis = 60_000L)
+            assertEquals(0, removed)
+            assertFalse("bakId 不得被扶正", File(root, "mismatch-skill").exists())
+            assertFalse("other-name 不得被扶正", File(root, "other-name").exists())
+            assertTrue("bak 不得被刪除", bak.isDirectory)
+            assertTrue(
+                "listResiduals 照常列出：${SkillInstaller.listResiduals(root, maxAgeMillis = 60_000L).map { it.name }}",
+                SkillInstaller.listResiduals(root, maxAgeMillis = 60_000L).any { it == bak },
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun staleBakWithoutTarget_missingOrCorruptSkillMd_keptNotRestored() {
+        // 還原內容校驗兩案：bak 內無 SKILL.md；SKILL.md 非 frontmatter（解析失敗）。
+        // 兩者皆「無法證明歸屬」：KEPT、不還原、不刪除（listResiduals 照常列出）。
+        val root = tempRoot()
+        try {
+            val tid = Thread.currentThread().id
+            val missing = File(root, ".mdmiss-skill.bak-${System.nanoTime()}-$tid").apply {
+                mkdirs()
+                File(this, "orphan").writeText("not a skill", Charsets.UTF_8)
+                setLastModified(System.currentTimeMillis() - 120_000L)
+            }
+            val corrupt = File(root, ".mdjunk-skill.bak-${System.nanoTime()}-$tid").apply {
+                mkdirs()
+                File(this, "SKILL.md").writeText("junk without frontmatter", Charsets.UTF_8)
+                setLastModified(System.currentTimeMillis() - 120_000L)
+            }
+            val removed = SkillInstaller.cleanupStaleStaging(root, maxAgeMillis = 60_000L)
+            assertEquals(0, removed)
+            assertFalse(File(root, "mdmiss-skill").exists())
+            assertFalse(File(root, "mdjunk-skill").exists())
+            assertTrue("缺 SKILL.md 的 bak 不得被刪", missing.isDirectory)
+            assertTrue("損毀 SKILL.md 的 bak 不得被刪", corrupt.isDirectory)
+            val listed = SkillInstaller.listResiduals(root, maxAgeMillis = 60_000L).map { it.name }
+            assertTrue("缺檔 bak 照常列出：$listed", missing.name in listed)
+            assertTrue("損毀 bak 照常列出：$listed", corrupt.name in listed)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun staleBakWithoutTarget_oversizedSkillMd_keptNotRestored() {
+        // 尺寸守衛：SKILL.md >MAX_SINGLE_FILE_BYTES 即不讀、不解析（防記憶體放大）。
+        // 內容刻意為「可能合法」（name==bakId 的 frontmatter + 超限填充）：
+        // 證明尺寸閘獨立於解析、超限即無法證明歸屬：KEPT、不還原、不刪除。
+        val root = tempRoot()
+        try {
+            val tid = Thread.currentThread().id
+            val mdText = skillMd(name = "oversize-skill", body = "正文") + "\n" +
+                "A".repeat(SkillInstaller.MAX_SINGLE_FILE_BYTES.toInt() + 1)
+            val bak = File(root, ".oversize-skill.bak-${System.nanoTime()}-$tid").apply {
+                mkdirs()
+                File(this, "SKILL.md").writeText(mdText, Charsets.UTF_8)
+                setLastModified(System.currentTimeMillis() - 120_000L)
+            }
+            val removed = SkillInstaller.cleanupStaleStaging(root, maxAgeMillis = 60_000L)
+            assertEquals(0, removed)
+            assertFalse(File(root, "oversize-skill").exists())
+            assertTrue("超限 bak 不得被刪", bak.isDirectory)
+            assertTrue(
+                "超限 bak 照常列出：${SkillInstaller.listResiduals(root, maxAgeMillis = 60_000L).map { it.name }}",
+                SkillInstaller.listResiduals(root, maxAgeMillis = 60_000L).any { it == bak },
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun staleBakWithoutTarget_symlinkSkillMd_keptNotRestored() {
+        // bak 內 SKILL.md 為指向外部的 symlink：內容證明 fail-closed（不跟隨）
+        // → KEPT、不還原、不刪；讀取不得穿透 link 觸碰外部 sentinel。
+        val parent = tempRoot()
+        try {
+            val root = File(parent, "skills").apply { mkdirs() }
+            val outside = File(parent, "outside").apply { mkdirs() }
+            // sentinel 內容刻意可解析為 name == bakId（linkbak-skill）：若未來
+            // 回歸成「跟隨 link 讀取」，bak 會被扶正而使下方不扶正斷言轉紅——
+            // KEPT 結果因此與 sentinel 內容形成對照，而非僅靠 sentinel 存活。
+            val sentinel = File(outside, "sentinel.txt").apply {
+                writeText(skillMd(name = "linkbak-skill"), Charsets.UTF_8)
+            }
+            val tid = Thread.currentThread().id
+            val bak = File(root, ".linkbak-skill.bak-${System.nanoTime()}-$tid").apply { mkdirs() }
+            try {
+                java.nio.file.Files.createSymbolicLink(
+                    File(bak, "SKILL.md").toPath(),
+                    sentinel.toPath(),
+                )
+            } catch (e: UnsupportedOperationException) {
+                org.junit.Assume.assumeNoException("platform without symlink", e)
+            } catch (e: java.io.IOException) {
+                org.junit.Assume.assumeNoException("cannot create symlink", e)
+            }
+            bak.setLastModified(System.currentTimeMillis() - 120_000L)
+            val removed = SkillInstaller.cleanupStaleStaging(root, maxAgeMillis = 60_000L)
+            assertEquals(0, removed)
+            assertFalse("bakId 不得被扶正", File(root, "linkbak-skill").exists())
+            assertTrue("bak 不得被刪", bak.isDirectory)
+            assertTrue(
+                "linkbak 案亦照常列出：${SkillInstaller.listResiduals(root, maxAgeMillis = 60_000L).map { it.name }}",
+                SkillInstaller.listResiduals(root, maxAgeMillis = 60_000L).any { it == bak },
+            )
+            assertTrue(
+                "讀取不得穿透 link（外部 sentinel 存活且原樣）",
+                sentinel.isFile && sentinel.readText(Charsets.UTF_8) == skillMd(name = "linkbak-skill"),
+            )
+        } finally {
+            parent.deleteRecursively()
         }
     }
 }

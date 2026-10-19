@@ -39,7 +39,10 @@ import java.util.zip.ZipInputStream
  *   開頭，不會誤傷），可經 [listResiduals] 觀察、經 [cleanupStaleStaging]
  *   收斂（回傳計數即收斂記錄）；啟動路徑已記錄回傳計數。
  *   崩潰窗口還原不問齡期：target 缺席而單一的合法 `.bak` 存在時立即恢復
- *   （否則預設 24h 內崩潰的版本要等一天）；僅有 target 在時的孤兒 `.bak`
+ *   （「合法」含形狀、id 規則與**還原內容校驗**通過：bak 內 SKILL.md 可解析且
+ *   manifest.name==bakId，見 [bakManifestName]；反例——偽 bak 帶不相符 name 或
+ *   損毀 SKILL.md 者不被扶正，KEPT 待人工。否則預設 24h 內崩潰的版本要等一天）；
+ *   僅有 target 在時的孤兒 `.bak`
  *   與 staging 才受 [STALE_STAGING_MAX_AGE_MILLIS] 保護，避免誤刪進行中安裝。
  * - 同名 Skill 預設保持不變（需 `replace=true` 才覆蓋）。
  * - 降版政策（#15：揭露不擋）：`version` 為選填自由字串、無可靠全序，
@@ -145,7 +148,8 @@ object SkillInstaller {
      * 定案，讀不到（AccessDenied／IO／已消失等）一律回 true，不降級為「非 link」。
      *
      * 「會刪改外部內容」的路徑（[cleanupStaleStaging] 的 destRoot／條目檢查、
-     * [installFiles] 覆蓋前 target 檢查、[installedVersion] 拒讀）一律用此變體：
+     * [installFiles] 的 destRoot 探針與覆蓋前 target 檢查、[bakManifestName] 的
+     * SKILL.md 讀取、[installedVersion] 拒讀）一律用此變體：
      * 偵測不確定時寧可跳過／拒絕，也不跟隨 symlink 作用。觀察型 API
      * （[listResiduals]）同樣採用，與清理行為保持一致。
      */
@@ -169,6 +173,25 @@ object SkillInstaller {
     } catch (_: Exception) {
         // best-effort：刪不掉就留下（下次啟動重試或人工處理），不影響呼叫方。
         false
+    }
+
+    /**
+     * bak 還原物的內容證明（fail-closed）：SKILL.md 存在、非 symlink、大小受
+     * [MAX_SINGLE_FILE_BYTES] 約束、可解析時回 manifest.name，否則回 null。
+     * 反例——偽造 `.bak`（name 不符）、缺失／損毀／超限 SKILL.md、symlink 型
+     * 或其他非一般檔案（含目錄型）的 SKILL.md 皆回 null：呼叫方視為「無法證明
+     * 屬性」，僅 KEPT，不還原、不刪除
+     * （與歧義同哲學）。
+     */
+    private fun bakManifestName(bakDir: File): String? = try {
+        val md = File(bakDir, SKILL_MD)
+        if (isSymlinkOrUnknown(md) || !md.isFile || md.length() > MAX_SINGLE_FILE_BYTES) {
+            null
+        } else {
+            SkillParser.parse(md.readText(Charsets.UTF_8)).manifest.name
+        }
+    } catch (_: Exception) {
+        null
     }
 
     /**
@@ -251,8 +274,9 @@ object SkillInstaller {
      * 重啟 staging 清理：刪除 [destRoot] 下過期的安裝器內部條目
      * （嚴格形狀 `.$id.tmp-<nano>-<tid>`），以及 target 仍在時的孤兒 `.bak`
      * （嚴格形狀 `.$id.tmp…` 之外只認 `.$id.bak-<nano>-<tid>`）；若 target 缺席而
-     * 形狀合法、id 通過 [SkillParser] name 規則的 `.bak` 仍在（崩潰窗口遺留），
-     * 則盡力把舊版恢復為 target。
+     * 形狀合法、id 通過 [SkillParser] name 規則、**還原內容校驗**通過的 `.bak`
+     * 仍在（崩潰窗口遺留；bak 內 SKILL.md 可解析且 manifest.name==bakId，見
+     * [bakManifestName]），則盡力把舊版恢復為 target。
      *
      * 形狀不符（`.nomedia`／`.random`／`.my.bakery`／`x.bak-y` 等）一律不碰；
      * 形狀符合但 id 非法者只刪不恢復。真實 skill 目錄永不以 `.` 開頭
@@ -264,17 +288,27 @@ object SkillInstaller {
      * 是單調計數器而非 wall-clock 時間戳，不可跨重啟比較新舊，故不用後綴
      * 數字選「最新」。
      *
+     * 內容校驗未過者（name 不符／SKILL.md 缺失或損毀／超單檔上限）同樣
+     * **KEPT** 永續待人工：bak 形狀是安裝器的溝通槽，不對「幾乎像 skill」的
+     * 內容動刪除路徑；[listResiduals] 照常列出（形狀正確者）供人工核對。
+     *
      * 齡期語意（兩閾分離）：
-     * - **崩潰窗口還原**：target 缺席的單一合法 `.bak` **不問齡期**立即恢復
+     * - **崩潰窗口還原**：target 缺席的單一合法 `.bak`（含還原內容校驗通過）
+     *   **不問齡期**立即恢復
      *   （否則預設 24h 內崩潰的版本要等一天，與「process restart 即恢復」矛盾）；
      * - **進行中安裝保護**：新鮮 staging 與 target 仍在的孤兒 `.bak` 只在超過
      *   [maxAgeMillis] 後才刪，避免誤刪另一行程剛啟動的安裝。
      *
      * [destRoot] 為 symlink（或偵測失敗）時直接回 0；destRoot 下形狀內的
-     * **子條目 symlink** 一律只解除 link 本身（NOFOLLOW，見 [handleCleanupEntry]），
+     * **子條目 symlink** 一律只解除 link 本身（NOFOLLOW；探針先於齡期閘——
+     * lastModified() 會跟隨 symlink，mtime 不可信，link 類節點不參與齡期判斷，
+     * 新鮮 link 亦立即只解除 link 本身，見 [handleCleanupEntry]），
      * 絕不遞迴刪除其指向的外部內容、也絕不還原成正式 skill；真實目錄改走
      * NOFOLLOW 的 [deleteTreeSafe]（內部遭植入 symlink 亦只解除 link 本身，
-     * 不波及外部）。
+     * 不波及外部）。屬性不可判定（[isSymlinkOrUnknown] 的 unknown 分支）的
+     * 真實條目同入 link 桶（不參與齡期判斷）：解得動（檔案/空目錄 unlink）
+     * 即刪、解不動（非空目錄）即 KEPT——僅奇異 FS 觸發，安全不變量不受影響；
+     * KEPT 者每次啟動重試，仍不收斂者需人工。
      *
      * 每次呼叫的「刪除類」處置有 [MAX_CLEANUP_ENTRIES_PER_RUN] 上限：超出者
      * 保留原狀、留待下次啟動繼續收斂（避免單次啟動無界遞迴 I/O）；崩潰還原型
@@ -291,7 +325,8 @@ object SkillInstaller {
      */
     fun cleanupStaleStaging(destRoot: File, maxAgeMillis: Long = STALE_STAGING_MAX_AGE_MILLIS): Int {
         if (!destRoot.isDirectory) return 0
-        // 與 installFiles 的防衛一致：destRoot 為 symlink 時不經它刪改外部目錄；
+        // 與 installFiles 的防衛一致（installFiles 同變體，項目已對齊）：
+        // destRoot 為 symlink 時不經它刪改外部目錄；
         // 偵測失敗時一併回 0（fail-closed）。
         if (isSymlinkOrUnknown(destRoot)) return 0
         val entries = try {
@@ -320,12 +355,17 @@ object SkillInstaller {
             val stagingId = STAGING_RE.matchEntire(n)?.groupValues?.get(1)
             val bakId = if (stagingId != null) null else BACKUP_RE.matchEntire(n)?.groupValues?.get(1)
             if (stagingId == null && bakId == null) continue
+            // 1) NOFOLLOW 節點分類先於齡期閘：lastModified() 會跟隨 symlink（mtime 不可信），
+            //    link 類節點不參與齡期判斷，一律進入「只解除 link 本身」的刪除路徑
+            //    （占刪除預算、不觸指向物內容；crashBak 對 link 恆為 false——link 不可還原）。
+            val isLinkEntry = isSymlinkOrUnknown(f)
             // 崩潰窗口還原：target 缺席的合法 .bak 不問齡期即處理（否則預設
-            // 24h 內崩潰的版本要等一天）。其餘（staging／target 仍在的孤兒 bak）
-            // 受 maxAgeMillis 保護，避免誤刪進行中安裝。
-            val crashBak = bakId != null && SkillParser.isValidName(bakId) &&
+            // 24h 內崩潰的版本要等一天）；還原前另經 [bakManifestName] 內容校驗。
+            // 其餘（staging／target 仍在的孤兒 bak）受 maxAgeMillis 保護，
+            // 避免誤刪進行中安裝。
+            val crashBak = !isLinkEntry && bakId != null && SkillParser.isValidName(bakId) &&
                 !File(destRoot, bakId).exists()
-            if (!crashBak && now - f.lastModified() < maxAgeMillis) continue
+            if (!crashBak && !isLinkEntry && now - f.lastModified() < maxAgeMillis) continue
             // 刪除類處置受每次啟動上限約束；還原型（rename，O(1)）不設限。
             val deletionAllowed = deleted < MAX_CLEANUP_ENTRIES_PER_RUN
             // 有效 id 的條目在 per-skill 鎖下操作，防與同 id 安裝提交交錯。
@@ -369,8 +409,9 @@ object SkillInstaller {
     /**
      * 單一清理條目的實際處置（呼叫方已按 id 取鎖或 id 非法無需取鎖）。
      *
-     * 子條目 symlink 防衛（NOFOLLOW，先於一切處置）：安裝器寫出的條目理應是
-     * 一般檔案／目錄，形狀內條目為 symlink 即不可信——`File.isDirectory` 會
+     * 子條目 symlink 防衛（NOFOLLOW，先於一切處置）：呼叫方已先行探測一次
+     * （NOFOLLOW 分類先於齡期閘，mtime 不可信），此處為縱深重驗。安裝器寫出的
+     * 條目理應是一般檔案／目錄，形狀內條目為 symlink 即不可信——`File.isDirectory` 會
      * 跟隨 symlink、rename 會搬走 link 本身、遞迴刪除會遍歷其指向的外部目錄。
      * 故 symlink 條目一律只解除 link 本身，不遞迴刪除、也絕不還原成正式 skill
      * （唯一例外：真實目錄內部遭植入的 symlink 由 [deleteTreeSafe] 的
@@ -413,6 +454,14 @@ object SkillInstaller {
                 // 重驗一次限縮窗口——link／不可判定一律保留供人工處理，剩餘
                 // 風險依「不與 install 併發」的外部序列化契約覆蓋。
                 if (isSymlinkOrUnknown(f)) return Disposition.KEPT
+                // 還原內容校驗（fail-closed）：bak 內 SKILL.md 必須可解析且
+                // manifest.name == bakId，否則無法證明此 bak 屬於該 skill
+                // （防**形狀-only** 的 bak 經名扶正、錯版內容勝出；name 與
+                // bakId 相符的完整偽造不在本守衛反例範圍——bak 無雜湊認證，
+                // 界限見類 KDoc）；讀不得／解析失敗／
+                // 超單檔上限一律視為無法證明，KEPT 待人工（與歧義同哲學：
+                // 不確定即不破壞、不還原、不刪除；listResiduals 照常列出）。
+                if (bakManifestName(f) != bakId) return Disposition.KEPT
                 val restored = try {
                     rename(f, target)
                 } catch (_: Exception) {
@@ -462,6 +511,9 @@ object SkillInstaller {
      * 注意：本函式只依「形狀 + 齡期」過濾，**不區分 target 是否存在**——
      * 會被 [cleanupStaleStaging] 不問齡期立即還原的崩潰窗口候選（target 缺席的
      * 新鮮 `.bak`）若已過期，仍會在此列出供觀察；是否還原以清理結果為準。
+     * 對照：清理會不問齡期直接解除的 link 類條目（NOFOLLOW 前置分類，不參與
+     * 齡期判斷）未過期時不會先經本函式列出——觀察面與清理的分類語意刻意
+     * 不完全重疊（本函式維持「形狀 + 齡期」單一規則，不重複清理的分類邏輯）。
      */
     fun listResiduals(destRoot: File, maxAgeMillis: Long = STALE_STAGING_MAX_AGE_MILLIS): List<File> {
         if (!destRoot.isDirectory) return emptyList()
@@ -488,7 +540,10 @@ object SkillInstaller {
      * 由 ZIP 位元組安裝。
      *
      * @param expectedHashes 相對路徑 → 期望 SHA-256 hex；為 null 時跳過雜湊比對
-     *   （仍記錄實測雜湊供展示/審計）。
+     *   （仍把實測雜湊存入 SkillDef.fileHashes；目前無消費者，供未來展示/審計）。
+     *   非 null 時允許部分覆蓋（刻意）：僅清單內列出者逐項比對（清單引用缺檔
+     *   或不符即 HASH_MISMATCH），未列出者不驗——供增量物料不必攜全量 manifest；
+     *   反例——需全量完整性時呼叫方須自行列齊全部路徑，本參數不做全集推導。
      */
     fun installZip(
         zipBytes: ByteArray,
@@ -626,15 +681,20 @@ object SkillInstaller {
                     "cannot create destRoot: not a directory: ${destRoot.name}",
                 )
             }
-            try {
-                // best-effort 僅擋直接 symlink destRoot；父層 symlink/ check-then-use TOCTOU
-                // 需呼叫方保證同 destRoot 勿併發（見 cleanupStaleStaging 契約），此處不承諾完整防禦。
-                if (java.nio.file.Files.isSymbolicLink(destRoot.toPath())) {
+            // fail-closed destRoot 探針（與 cleanupStaleStaging/listResiduals/installedVersion
+            // 同一先例變體）：Files.isSymbolicLink 讀不到屬性時回 false（fail-open DIDM）
+            // 不可作唯一探針；偵測失敗一律視為不可信，拒裝（訊息與真 symlink 相同，
+            // 刻意收斂，免洩漏更多檔案系統屬性；僅含檔名、不含絕對路徑）。
+            // 僅在已存在時探測——[isSymlinkOrUnknown] 對不存在路徑回 true，
+            // 先判 exists 防「首次安裝建目錄」被誤殺（反例：全新 destRoot 直接安裝）。
+            // 誠實等級註記：「屬性讀取失敗」分支（exists() 為真而 lstat 失敗）在本
+            // JVM 測試組無注入縫，保真屬 KDoc 承諾＋code 一致性，僅得真機/手動驗。
+            // 父層 symlink／check-then-use TOCTOU 需呼叫方保證同 destRoot 勿併發
+            // （見 [cleanupStaleStaging] 契約），此處不承諾完整防禦。
+            if (destRoot.exists()) {
+                if (isSymlinkOrUnknown(destRoot)) {
                     return Result.Failure(Failure.IO_ERROR, "destRoot must not be symlink: ${destRoot.name}")
                 }
-            } catch (_: Exception) {
-                // best-effort：判斷失敗即視為不可信，拒裝。
-                return Result.Failure(Failure.IO_ERROR, "cannot trust destRoot: ${destRoot.name}")
             }
             if (!destRoot.exists()) {
                 val made = try {

@@ -14,8 +14,15 @@ import java.util.zip.ZipOutputStream
  * D04 Skill 安裝測試（BACKLOG D04 驗收方向）：匯入校驗失敗拒裝。
  *
  * 覆蓋 Eta 安裝邊界思想的最小實現：受限解包（穿越/絕對/重複/嵌套/
- * 非法 frontmatter/四項預算）、雜湊校驗、權限清單、scripts 永不執行、
- * 失敗不留殘餘、同名預設不覆蓋。
+ * 非法 frontmatter/四項預算的確切 Failure 值）、雜湊校驗（含
+ * expectedHashes 部分覆蓋：僅清單內路徑逐項比對、引用缺檔即 HASH_MISMATCH）、
+ * 權限清單、scripts 永不執行、失敗不留殘餘、同名預設不覆蓋。
+ *
+ * Skip 語義：installOntoSymlinkTarget_isRefused_ioError 以 [org.junit.Assume.assumeNoException]
+ * 在不支援 symlink 的平台（未特權的 Windows FS 等）跳過——綠但帶 skip 的 run
+ * 並非「planted symlink target 防衛」分支的覆蓋證明。除了 symlink 與
+ * 「屬性不可判定」分支（後者無測試縫，行為只能真機/手動驗），本檔其餘測試
+ * 為純 JVM 可重現（解包規則、預算、雜湊、frontmatter）。
  */
 class SkillInstallTest {
 
@@ -108,6 +115,48 @@ class SkillInstallTest {
             } finally {
                 root2.deleteRecursively()
             }
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun expectedHashes_partialCoverage_onlyListedPathsVerified() {
+        val root = tempRoot()
+        try {
+            // 部分覆蓋（刻意設計，見 installZip KDoc）：expectedHashes 只列 SKILL.md，
+            // 未列入的 refs/extra.md 不參與比對但照常落盤——增量物料不必攜全量 manifest。
+            val mdBytes = skillMd().toByteArray(Charsets.UTF_8)
+            val zip = zipOf(
+                "meeting-prep/SKILL.md" to mdBytes,
+                "meeting-prep/refs/extra.md" to "未列入的附檔".toByteArray(Charsets.UTF_8),
+            )
+            val expected = mapOf("SKILL.md" to SkillHashes.sha256Hex(mdBytes))
+            val r = SkillInstaller.installZip(zip, root, expectedHashes = expected)
+            assertTrue("expected success, got $r", r is SkillInstaller.Result.Success)
+            assertTrue(File(root, "meeting-prep/refs/extra.md").isFile)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun expectedHashes_refMissingFile_rejected() {
+        val root = tempRoot()
+        try {
+            // 清單引用了不存在的檔：與「不符」同因 HASH_MISMATCH（引用缺檔），
+            // 失敗先於 staging → destRoot 不落半成品。
+            val mdBytes = skillMd().toByteArray(Charsets.UTF_8)
+            val zip = zipOf("meeting-prep/SKILL.md" to mdBytes)
+            val expected = mapOf(
+                "SKILL.md" to SkillHashes.sha256Hex(mdBytes),
+                "no-such.md" to "0".repeat(64),
+            )
+            val r = SkillInstaller.installZip(zip, root, expectedHashes = expected)
+            assertTrue("expected failure, got $r", r is SkillInstaller.Result.Failure)
+            assertEquals(
+                SkillInstaller.Failure.HASH_MISMATCH,
+                (r as SkillInstaller.Result.Failure).reason,
+            )
+            assertFalse(File(root, "meeting-prep").exists())
         } finally {
             root.deleteRecursively()
         }
@@ -254,10 +303,11 @@ class SkillInstallTest {
             )
             val r = SkillInstaller.installZip(zip, root)
             assertTrue(r is SkillInstaller.Result.Failure)
-            val reason = (r as SkillInstaller.Result.Failure).reason
-            assertTrue(
-                reason == SkillInstaller.Failure.FILE_TOO_LARGE ||
-                    reason == SkillInstaller.Failure.TOTAL_TOO_LARGE,
+            // 確切 reason 釘選（非 OR 收斂）：SKILL.md 極小且總量未達 MAX_TOTAL_BYTES，
+            // 解包流式與 files 兩路徑的 fileSize 閘都先於 total 閘觸發 → FILE_TOO_LARGE。
+            assertEquals(
+                SkillInstaller.Failure.FILE_TOO_LARGE,
+                (r as SkillInstaller.Result.Failure).reason,
             )
             assertFalse(File(root, "meeting-prep").exists())
         } finally {
@@ -346,6 +396,136 @@ class SkillInstallTest {
             // 非 replace 的新鮮安裝在 ALREADY_EXISTS 檢查就先擋，不受本測影響。
         } finally {
             parent.deleteRecursively()
+        }
+    }
+
+    @Test fun tooManyEntries_zip_rejected() {
+        val root = tempRoot()
+        try {
+            // MAX_ENTRIES+1 條目（先一個合法 SKILL.md，再 64 個 filler）：
+            // 解包側條目計數必須在第 65 個條目中止，給出確切 TOO_MANY_ENTRIES；
+            // 解包在記憶體中止、未及落盤 → destRoot 無半成品、無 staging 殘餘。
+            val entries: Array<Pair<String, ByteArray>> =
+                arrayOf("meeting-prep/SKILL.md" to skillMd().toByteArray(Charsets.UTF_8)) +
+                    (0 until SkillInstaller.MAX_ENTRIES).map { i ->
+                        "filler-" + i.toString().padStart(3, '0') + ".dat" to "x".toByteArray()
+                    }
+            val zip = zipOf(*entries)
+            val r = SkillInstaller.installZip(zip, root)
+            assertTrue("expected failure, got $r", r is SkillInstaller.Result.Failure)
+            assertEquals(
+                SkillInstaller.Failure.TOO_MANY_ENTRIES,
+                (r as SkillInstaller.Result.Failure).reason,
+            )
+            assertFalse(File(root, "meeting-prep").exists())
+            assertTrue(
+                "不得留下任何解包殘餘：${root.listFiles()!!.toList()}",
+                root.listFiles()!!.isEmpty(),
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun archiveBudgetExceeded_zip_rejected() {
+        val root = tempRoot()
+        try {
+            // 壓縮後歸檔 >MAX_ARCHIVE_BYTES：隨機（不可壓縮）資料鬆弛不出縮減，
+            // 單條目即超——歸檔預算在解包「之前」檢查，必須給出確切
+            // ARCHIVE_TOO_LARGE，destRoot 無半成品。
+            val random = java.util.Random(524L)
+            val incompressible = ByteArray(2_400_000).also { random.nextBytes(it) }
+            val zip = zipOf(
+                "meeting-prep/SKILL.md" to skillMd().toByteArray(Charsets.UTF_8),
+                "meeting-prep/big.bin" to incompressible,
+            )
+            val r = SkillInstaller.installZip(zip, root)
+            assertTrue("expected failure, got $r", r is SkillInstaller.Result.Failure)
+            assertEquals(
+                SkillInstaller.Failure.ARCHIVE_TOO_LARGE,
+                (r as SkillInstaller.Result.Failure).reason,
+            )
+            // M2 收緊（review 建議）：歸檔閘在解包前 ⇒ 失敗時 destRoot 必空。
+            assertTrue(
+                "解包前失敗，destRoot 不得有任何殘餘：${root.listFiles()!!.toList()}",
+                root.listFiles()!!.isEmpty(),
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun singleFileBudget_filesPath_exactReason_rejected() {
+        val root = tempRoot()
+        try {
+            // files 路徑單檔恰超 MAX_SINGLE_FILE_BYTES（總量未達 MAX_TOTAL_BYTES）：
+            // 規格化迴圈逐檔比對必須給出確切 FILE_TOO_LARGE（非 OR 收斂），
+            // 失敗先於 staging → destRoot 不落半成品。
+            val big = ByteArray((SkillInstaller.MAX_SINGLE_FILE_BYTES + 1).toInt()) { 0x41 }
+            val r = SkillInstaller.installFiles(
+                linkedMapOf<String, ByteArray>(
+                    "meeting-prep/SKILL.md" to skillMd().toByteArray(Charsets.UTF_8),
+                    "meeting-prep/big.bin" to big,
+                ),
+                root,
+            )
+            assertTrue("expected failure, got $r", r is SkillInstaller.Result.Failure)
+            assertEquals(
+                SkillInstaller.Failure.FILE_TOO_LARGE,
+                (r as SkillInstaller.Result.Failure).reason,
+            )
+            assertFalse(File(root, "meeting-prep").exists())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun totalBudgetMidStream_filesAndZip_exactReason_rejected() {
+        val root = tempRoot()
+        try {
+            // 六檔各 180_000B（每檔 < MAX_SINGLE_FILE_BYTES、五檔後合計仍 < MAX_TOTAL_BYTES）：
+            // 總量在第六檔內部中途越過 MAX_TOTAL_BYTES。files 與 zip 解包流式兩路徑
+            // 都必須收斂到同一確切 reason TOTAL_TOO_LARGE（非 OR）；
+            // 靜態推導定案：zip 路徑在 unzipConstrained 的逐條目流式累加中於
+            // data-05.bin 剩餘位元組內觸發（900,2xx + <180,000 > 1,048,576），
+            // 屬解包中段、非前置規格化階段。
+            val big = ByteArray(180_000) { 0x41 }
+            val files = linkedMapOf<String, ByteArray>(
+                "meeting-prep/SKILL.md" to skillMd().toByteArray(Charsets.UTF_8),
+            )
+            (0 until 6).forEach { i ->
+                files["meeting-prep/data-" + i.toString().padStart(2, '0') + ".bin"] = big
+            }
+            val rFiles = SkillInstaller.installFiles(files, root)
+            assertTrue("expected failure, got $rFiles", rFiles is SkillInstaller.Result.Failure)
+            assertEquals(
+                SkillInstaller.Failure.TOTAL_TOO_LARGE,
+                (rFiles as SkillInstaller.Result.Failure).reason,
+            )
+            assertFalse(File(root, "meeting-prep").exists())
+
+            val zip = zipOf(
+                "meeting-prep/SKILL.md" to skillMd().toByteArray(Charsets.UTF_8),
+                "meeting-prep/data-00.bin" to big,
+                "meeting-prep/data-01.bin" to big,
+                "meeting-prep/data-02.bin" to big,
+                "meeting-prep/data-03.bin" to big,
+                "meeting-prep/data-04.bin" to big,
+                "meeting-prep/data-05.bin" to big,
+            )
+            val rZip = SkillInstaller.installZip(zip, root)
+            assertTrue("expected failure, got $rZip", rZip is SkillInstaller.Result.Failure)
+            assertEquals(
+                SkillInstaller.Failure.TOTAL_TOO_LARGE,
+                (rZip as SkillInstaller.Result.Failure).reason,
+            )
+            assertFalse(File(root, "meeting-prep").exists())
+            assertTrue(
+                "zip 路徑不得留下 staging 半成品：${root.listFiles()!!.toList()}",
+                root.listFiles()!!.none { it.name.startsWith(".") },
+            )
+        } finally {
+            root.deleteRecursively()
         }
     }
 

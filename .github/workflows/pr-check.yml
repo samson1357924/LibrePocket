@@ -283,6 +283,20 @@ jobs:
           chmod +x scripts/play_policy_check.sh
           scripts/play_policy_check.sh --foss app/build/outputs/apk/foss/debug/app-foss-debug.apk
 
+      # The Github debug APK has no flavor-specific policy gate, but it ships
+      # through the same manifest/resource merger paths. Run the
+      # mode-independent artifact authorities (merged-manifest backup binding
+      # + compiled backup-rules bytes + networkSecurityConfig binding and
+      # compiled NSC) on it as well; --mode github runs exactly that subset
+      # (no Play/Foss DEX class-table policy). Both tools resolve from the
+      # build-tools dir prepended to PATH above; a missing tool fails the
+      # step (fail-closed), it can never be softly skipped.
+      - name: Run Github Flavor Artifact Binding Check (mode-independent)
+        run: |
+          AAPT=$(command -v aapt)
+          DEXDUMP=$(command -v dexdump)
+          python3 scripts/apk_policy_inspect.py --mode github --apk app/build/outputs/apk/github/debug/app-github-debug.apk --aapt "$AAPT" --dexdump "$DEXDUMP"
+
       - name: Upload Debug APKs
         if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

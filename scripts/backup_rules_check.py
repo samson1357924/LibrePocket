@@ -24,31 +24,61 @@ This module parses the XML with the stdlib parser and enforces:
   throw at runtime (backup silently disabled), so the gate rejects them too.
   ``tools:``-namespace attributes never reach the runtime (aapt strips them)
   and are excluded from the attribute counts;
+- rule ``path``-attribute traversal guard: a path whose value contains
+  ``..`` is refused outright. Android's rules schema resolves paths INSIDE
+  the rule's domain (there is no parent-directory reference), and the
+  runtime behavior of such a path is not something this file-level gate can
+  verify, so the stricter-than-runtime refusal is intentional (fail closed);
+- the platform-supported `<cross-platform-transfer>` section (Android 16
+  QPR2, API 36.1 — iOS cross-platform transfer) is REFUSED on appearance:
+  its policy is undecided, and a gate that neither validates nor rejects a
+  known runtime section would silently inherit undefined backup semantics;
 - the attr↔resource runtime binding (``--check-manifest``): the manifest's
   ``android:fullBackupContent`` / ``android:dataExtractionRules`` attributes
   must name exactly the validated resources. Structured (ElementTree) on
   purpose - a bare-text grep is escapable by the literal surviving in an XML
   comment while the attributes are gone, and a single-quoted attribute value
-  would false-FAIL. The MAIN manifest checks ``--require-both`` (absence is
+  would false-FAIL. The MAIN manifest requires ``--require-both`` (absence is
   fatal); overlay manifests fail only on a present-but-different value
   (omitting merges main's value, which is legal). Overlay-level manifest
   merger markers are parsed too: absence is only "legal inheritance" when no
   marker strips main's attribute - a ``tools:remove`` naming these attributes,
   or ``tools:node="replace"/"remove"`` on ``<application>``, deletes the
   merged binding and must FAIL (the APK-level scanner then asserts the merged
-  bytes independently; source level stays defense in depth).
+  bytes independently; source level stays defense in depth);
+- the Play permission blacklist (``--check-permission-removals``): every
+  ``<uses-permission>`` / ``<uses-permission-sdk-23>`` element whose
+  ``android:name`` contains a blacklisted token must carry
+  ``tools:node="remove"`` ON THE ELEMENT (the only merger marker that
+  provably deletes a whole lower-priority element; ``tools:remove`` targets
+  attributes, ``replace``/``merge`` keep the declaration merged). This is
+  the element-aware replacement of the retired per-line ``grep -vE
+  "tools:node=..."`` filter, which false-FAILED a legal multi-line element
+  (its ``android:name`` line stayed unmarked) and could not separate real
+  elements from XML comments.
+
+The artifact-level scanner (``scripts/apk_policy_inspect.py``) reuses the
+SAME engine for the compiled bytes: ``ARTIFACT_RULE_MEMBERS`` names the
+canonical resource members (``res/xml/backup_rules.xml``,
+``res/xml/data_extraction_rules.xml``); the scanner dumps them via
+``aapt dump xmltree``, rebuilds the tree and calls ``validate_tree`` with
+``exact_excludes=True`` - the compiled exclude set must equal
+``REQUIRED_EXCLUDES`` EXACTLY (missing AND unexpected entries are failures,
+order-free). Source-level presence-only validation cannot see such a rewrite.
 
 It is invoked by the shell gate and is directly unit-tested against negative
 fixtures. Run with:
 
     python3 scripts/backup_rules_check.py --expect-root <tag> <file> [...]
     python3 scripts/backup_rules_check.py --check-manifest [--require-both] <manifest.xml> [...]
+    python3 scripts/backup_rules_check.py --check-permission-removals <perm,perm,...> <manifest.xml> [...]
 """
 
 from __future__ import annotations
 
 import sys
 import xml.etree.ElementTree as ET
+from typing import Iterable
 
 # BackupPolicy.KEY_FILES_EXCLUDED: the five key/vault artifacts that must never
 # be backed up. Each entry is (domain, path).
@@ -64,6 +94,17 @@ REQUIRED_EXCLUDES: tuple[tuple[str, str], ...] = (
 # ignored by the runtime parser - see module docstring).
 EXPECTED_ROOT_BACKUP_RULES = "full-backup-content"
 EXPECTED_ROOT_DATA_EXTRACTION = "data-extraction-rules"
+
+# Artifact-level scan targets (consumed by ``apk_policy_inspect.py``): the
+# COMPILED rule resources are addressed by their canonical res/ member path
+# (aapt v1 xmltree only resolves that form - the same constraint the NSC
+# member pin works under), each paired with the root the runtime expects for
+# that filename. The catalog pins the filenames↔roots here so the artifact
+# scanner and the gate can never drift apart.
+ARTIFACT_RULE_MEMBERS: tuple[tuple[str, str], ...] = (
+    ("res/xml/backup_rules.xml", EXPECTED_ROOT_BACKUP_RULES),
+    ("res/xml/data_extraction_rules.xml", EXPECTED_ROOT_DATA_EXTRACTION),
+)
 
 # Mirror FullBackup.validateInnerTagContents: only <include>/<exclude> are
 # recognized inside the rule containers, <exclude> takes at most 2 attributes
@@ -136,6 +177,18 @@ def _validate_rule_children(
                 f"{path}: {_where(branch_label)}<{tag}> has {len(attrs)} attributes; "
                 f"Android allows at most {limit}"
             )
+        # Path traversal guard (module docstring): a "path" value containing
+        # ".." cannot be proven to resolve inside the rule's domain. Android's
+        # documented rules semantics have no parent-directory references and
+        # the gate cannot verify the runtime behavior of such a value, so any
+        # occurrence refuses the file (stricter than runtime, fail-closed).
+        rule_path = child.get("path")
+        if rule_path is not None and ".." in rule_path:
+            errors.append(
+                f"{path}: {_where(branch_label)}<{tag}> path {rule_path!r} "
+                'contains "..": rule paths must stay inside their domain '
+                "(Android's backup rules have no parent-directory references)"
+            )
         # Any-depth nesting: recurse even into legal include/exclude children,
         # bounded by _MAX_RULE_NEST_DEPTH (well beyond any real rules file -
         # deeper shapes fall out as a clean depth FAIL, not a RecursionError).
@@ -156,6 +209,28 @@ def _missing_exclude_errors(
         f"{path}: {_where(branch_label)}missing exclude domain={domain} path={rule_path}"
         for domain, rule_path in REQUIRED_EXCLUDES
         if (domain, rule_path) not in present
+    ]
+
+
+def _unexpected_exclude_errors(
+    path: str, branch_label: str, present: set[tuple[str, str]]
+) -> list[str]:
+    """Report excludes BEYOND the required five (exact-set mode only).
+
+    Artifact-level authority only: the compiled rule bytes must carry exactly
+    ``REQUIRED_EXCLUDES`` (BackupPolicy.KEY_FILES_EXCLUDED) so any
+    resources-overlay / merger rewrite of the compiled XML - even one that
+    only ADDS entries - fails as the set difference it is (order-free).
+    Source-level third parties may over-shield (extra rules never key-leak),
+    so ``validate`` keeps the presence-only semantics by default.
+    """
+    extra = sorted(present - set(REQUIRED_EXCLUDES))
+    return [
+        f"{path}: {_where(branch_label)}unexpected exclude domain={domain} "
+        f"path={rule_path} - the compiled backup rules must carry exactly "
+        "the KEY_FILES_EXCLUDED set "
+        f"({len(REQUIRED_EXCLUDES)} entries), nothing else"
+        for domain, rule_path in extra
     ]
 
 
@@ -180,6 +255,92 @@ EXPECTED_MANIFEST_ATTRS: tuple[tuple[str, str], ...] = (
 )
 
 
+# Root-level rule sections. Both are platform-supported schema sections the
+# gate must cover; see the corrections below (the old comment called the
+# anything-else branch "runtime silently skips unknown root-level children"
+# - true ONLY for genuinely unknown tags, never for PLATFORM-supported ones).
+_GATE_SECTIONS = ("cloud-backup", "device-transfer")
+# Android 16 QPR2 (API 36.1) adds a third platform section for iOS
+# cross-platform transfer: <cross-platform-transfer>. It is no longer an
+# "unknown element" the runtime would skip, and no transfer policy has settled
+# the gate for it - so the gate refuses its appearance outright instead of
+# neither validating nor rejecting a REAL runtime section (undefined backup
+# semantics would otherwise pass silently).
+_UNDECIDED_SECTIONS: frozenset[str] = frozenset({"cross-platform-transfer"})
+
+
+def validate_tree(
+    root: ET.Element,
+    path: str,
+    expected_root: str,
+    *,
+    exact_excludes: bool = False,
+) -> list[str]:
+    """Structured rule validation on an ALREADY-PARSED tree.
+
+    Shared by ``validate`` (the file loader) and the artifact-level scanner
+    (``apk_policy_inspect.py``), which rebuilds an ElementTree from the
+    ``aapt dump xmltree`` output of the COMPILED resource: both surfaces run
+    the exact same rules so a compiled-XML rewrite cannot diverge from source.
+    ``exact_excludes=True`` (artifact level only) additionally refuses
+    excludes beyond ``REQUIRED_EXCLUDES`` - see ``_unexpected_exclude_errors``.
+    """
+    if root.tag != expected_root:
+        return [f"{path}: expected root <{expected_root}>, found <{root.tag}>"]
+
+    errors: list[str] = []
+    if root.tag == "full-backup-content":
+        # Android's validator rejects unknown tags / over-attribute rules here;
+        # a file that would fail at runtime must fail the gate, not PASS.
+        errors.extend(_validate_rule_children(path, root))
+        present = _excludes(root)
+        errors.extend(_missing_exclude_errors(path, "", present))
+        if exact_excludes:
+            errors.extend(_unexpected_exclude_errors(path, "", present))
+    elif root.tag == "data-extraction-rules":
+        # Android's runtime parser visits EVERY matching section occurrence
+        # (duplicates included), so the gate validates all of them too;
+        # required excludes must be present in every occurrence (stricter
+        # than the runtime union, fail-closed for split-rule edits).
+        # NOTE (comment-corrected per review): the "runtime silently skips
+        # unknown root-level children" premise below holds ONLY for
+        # genuinely unknown tags. Every PLATFORM-supported section name must
+        # be covered by this gate (validated pair above, refused as undecided
+        # in _UNDECIDED_SECTIONS); hardcoding the walk against
+        # supported names keeps a future platform section from sneaking past
+        # as a "skip".
+        seen: set[str] = set()
+        for child in root:
+            if child.tag in _UNDECIDED_SECTIONS:
+                errors.append(
+                    f"{path}: <{child.tag}> is a platform-supported root "
+                    "section (Android 16 QPR2 / API 36.1, iOS cross-platform "
+                    "transfer); the iOS transfer policy is UNDECIDED - the "
+                    "gate must neither validate nor silently accept it, so "
+                    "(fail closed) it refuses the element outright"
+                )
+                continue
+            if child.tag not in _GATE_SECTIONS:
+                # Runtime silently skips TRULY unknown root-level children;
+                # mirror that and let the two required branches carry the
+                # policy (platform-named sections never reach this branch).
+                continue
+            seen.add(child.tag)
+            errors.extend(_validate_rule_children(path, child, f"<{child.tag}>"))
+            present = _excludes(child)
+            errors.extend(_missing_exclude_errors(path, f"<{child.tag}>", present))
+            if exact_excludes:
+                errors.extend(
+                    _unexpected_exclude_errors(path, f"<{child.tag}>", present)
+                )
+        for branch in _GATE_SECTIONS:
+            if branch not in seen:
+                errors.append(f"{path}: missing <{branch}>")
+    else:
+        errors.append(f"{path}: unexpected root element <{root.tag}>")
+    return errors
+
+
 def validate(path: str, expected_root: str) -> list[str]:
     """Return a list of human-readable violations (empty when valid).
 
@@ -197,37 +358,7 @@ def validate(path: str, expected_root: str) -> list[str]:
     except OSError as exc:
         return [f"{path}: unreadable: {exc}"]
 
-    if root.tag != expected_root:
-        return [f"{path}: expected root <{expected_root}>, found <{root.tag}>"]
-
-    errors: list[str] = []
-    if root.tag == "full-backup-content":
-        # Android's validator rejects unknown tags / over-attribute rules here;
-        # a file that would fail at runtime must fail the gate, not PASS.
-        errors.extend(_validate_rule_children(path, root))
-        present = _excludes(root)
-        errors.extend(_missing_exclude_errors(path, "", present))
-    elif root.tag == "data-extraction-rules":
-        # Android's runtime parser visits EVERY matching section occurrence
-        # (duplicates included), so the gate validates all of them too;
-        # required excludes must be present in every occurrence (stricter
-        # than the runtime union, fail-closed for split-rule edits).
-        seen: set[str] = set()
-        for child in root:
-            if child.tag not in ("cloud-backup", "device-transfer"):
-                # Runtime silently skips unknown root-level children; mirror
-                # that and let the two required branches carry the policy.
-                continue
-            seen.add(child.tag)
-            errors.extend(_validate_rule_children(path, child, f"<{child.tag}>"))
-            present = _excludes(child)
-            errors.extend(_missing_exclude_errors(path, f"<{child.tag}>", present))
-        for branch in ("cloud-backup", "device-transfer"):
-            if branch not in seen:
-                errors.append(f"{path}: missing <{branch}>")
-    else:
-        errors.append(f"{path}: unexpected root element <{root.tag}>")
-    return errors
+    return validate_tree(root, path, expected_root)
 
 
 def _tools_marker_entries(element: ET.Element) -> tuple[tuple[str, str], ...]:
@@ -361,11 +492,73 @@ def validate_manifest(
     return errors
 
 
+# Ecosystem permission tags the removal scan covers. <uses-permission-sdk-23>
+# exists precisely to gate API 23+; scanning only <uses-permission> would
+# shrink the old raw grep's catch-universe.
+_PERMISSION_ELEMENTS: tuple[str, ...] = ("uses-permission", "uses-permission-sdk-23")
+
+
+def validate_permission_removals(path: str, blacklisted: Iterable[str]) -> list[str]:
+    """Prove every blacklisted permission element carries ``tools:node="remove"``.
+
+    The Play source blacklist used to be a per-line ``grep -vE
+    "tools:node=..."`` filter: a LEGAL multi-line element whose
+    ``android:name`` and ``tools:node="remove"`` sit on different lines left
+    the name line un-filtered and false-FAILED the gate, while a
+    whole-file grep could also match text inside XML comments. This
+    structured scan (same marker machinery as ``validate_manifest``) reports
+    a violation only for a REAL, comment-proof element whose android:name
+    contains a blacklisted token and which carries no merger-removal marker
+    on ITSELF: ``tools:node="remove"`` is the only marker that deletes a
+    whole element from a lower-priority document - ``tools:remove`` names
+    attributes, and ``replace``/``merge`` keep the declaration merged.
+
+    Both ecosystem permission tags are scanned (``uses-permission-sdk-23``
+    declares the same permission on API 23+ and would otherwise shrink the
+    old grep's catch-universe).
+    """
+    tokens = tuple(blacklisted)
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as exc:
+        return [f"{path}: invalid XML: {exc}"]
+    except OSError as exc:
+        return [f"{path}: unreadable: {exc}"]
+    if root.tag != "manifest":
+        return [f"{path}: manifest check needs a <manifest> root, found <{root.tag}>"]
+    errors: list[str] = []
+    for tag in _PERMISSION_ELEMENTS:
+        for element in root.iter(tag):
+            name = element.get(f"{_ANDROID_NS}name")
+            if not name:
+                # A permission element whose name cannot be resolved (no
+                # xmlns:android binding) is an unprovable shape while the
+                # grep it replaces never tolerated the literal either way.
+                errors.append(
+                    f"{path}: <{tag}> carries no android:name "
+                    "(uncharged unknown permission element)"
+                )
+                continue
+            for token in tokens:
+                if token not in name:
+                    continue
+                markers = dict(_tools_marker_entries(element))
+                if markers.get("node", "").strip() != "remove":
+                    errors.append(
+                        f"{path}: <{tag} android:name={name!r}> declares "
+                        f"blacklisted permission {token} without "
+                        "tools:node=\"remove\" on the element - the merged "
+                        "manifest keeps the permission"
+                    )
+    return errors
+
+
 def main(argv: list[str]) -> int:
     args = argv[1:]
     expected_root: str | None = None
     check_manifest = False
     require_both = False
+    permission_tokens: tuple[str, ...] | None = None
     paths: list[str] = []
     i = 0
     while i < len(args):
@@ -381,6 +574,32 @@ def main(argv: list[str]) -> int:
         elif args[i] == "--check-manifest":
             check_manifest = True
             i += 1
+        elif args[i] == "--check-permission-removals":
+            if i + 1 >= len(args):
+                print(
+                    "FAIL: --check-permission-removals requires a "
+                    "comma-separated permission list",
+                    file=sys.stderr,
+                )
+                return 2
+            if permission_tokens is not None:
+                print("FAIL: duplicate --check-permission-removals", file=sys.stderr)
+                return 2
+            # Tokens are SUBSTRINGS of android:name, and callers routinely
+            # pass whitespace CSVs ("SEND_SMS, RECEIVE_SMS"): storing the
+            # unstripped " RECEIVE_SMS" never matches anything and the
+            # gate silently fails open. Store the stripped form instead;
+            # strip-to-empty entries still drop out, so an all-empty
+            # blacklist keeps exiting 2 below (fail-closed on no tokens).
+            tokens = tuple(t.strip() for t in args[i + 1].split(",") if t.strip())
+            if not tokens:
+                print(
+                    "FAIL: --check-permission-removals blacklist is empty",
+                    file=sys.stderr,
+                )
+                return 2
+            permission_tokens = tokens
+            i += 2
         elif args[i] == "--require-both":
             require_both = True
             i += 1
@@ -396,23 +615,28 @@ def main(argv: list[str]) -> int:
         # repro; the gate and every other caller pass bindings explicitly).
         print(
             "usage: backup_rules_check.py (--expect-root <tag> <rules.xml> [...] | "
-            "--check-manifest [--require-both] <manifest.xml> [...]) "
+            "--check-manifest [--require-both] <manifest.xml> [...] | "
+            "--check-permission-removals <perm,perm,...> <manifest.xml> [...]) "
             "(--expect-root full-backup-content for full-backup-content files; "
             "--expect-root data-extraction-rules for data-extraction-rules files)",
             file=sys.stderr,
         )
         return 2
-    if expected_root is None and not check_manifest:
+    if expected_root is None and not check_manifest and permission_tokens is None:
         # A rules-file path without any binding hint cannot prove the schema.
         print(
             "usage: backup_rules_check.py --expect-root <tag> <rules.xml> [...] | "
-            "--check-manifest [--require-both] <manifest.xml> [...]",
+            "--check-manifest [--require-both] <manifest.xml> [...] | "
+            "--check-permission-removals <perm,perm,...> <manifest.xml> [...]",
             file=sys.stderr,
         )
         return 2
-    if expected_root is not None and check_manifest:
+    if (expected_root is not None) + check_manifest + (permission_tokens is not None) > 1:
+        # Exactly ONE command mode at a time; all combinations are refused
+        # (each mode has its own path contract).
         print(
-            "FAIL: --check-manifest and --expect-root are mutually exclusive",
+            "FAIL: --check-manifest, --expect-root and "
+            "--check-permission-removals are mutually exclusive",
             file=sys.stderr,
         )
         return 2
@@ -423,6 +647,8 @@ def main(argv: list[str]) -> int:
     for path in paths:
         if check_manifest:
             errors.extend(validate_manifest(path, require_both))
+        elif permission_tokens is not None:
+            errors.extend(validate_permission_removals(path, permission_tokens))
         else:
             errors.extend(validate(path, expected_root))
     if errors:

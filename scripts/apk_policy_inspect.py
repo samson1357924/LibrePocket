@@ -38,6 +38,24 @@ derived fail-closed from the merged manifest's own ``android:debuggable``
 cleartext); anything else (absent/false/unparseable) → the release deny-all
 rules, so a build that cannot PROVE it is debuggable is checked with the
 stricter contract.
+
+Compiled backup-rules BYTES (third artifact-level authority): the merged
+manifest binding only pins the FILENAMES ``@xml/backup_rules`` /
+``@xml/data_extraction_rules`` - it cannot observe what a resources overlay
+or merger rewrite put INTO the compiled XML while leaving those filenames
+alone. So both compiled resources are dumped with ``aapt dump xmltree``,
+rebuilt into trees, and re-validated by the source gate's own engine
+(``backup_rules_check.validate_tree``) demanding the EXACT
+``REQUIRED_EXCLUDES`` set (BackupPolicy.KEY_FILES_EXCLUDED, order-free): a
+dump failure, a missing entry, or a set difference fails closed.
+
+Modes: ``--mode play`` / ``--mode foss`` run every scanner policy.  The
+additional ``--mode github`` runs ONLY the mode-independent artifact
+authorities (merged manifest backup bindings, compiled backup-rules bytes,
+merged networkSecurityConfig binding + compiled NSC): the Github debug
+artifact is neither a Play nor a Foss package, so the flavor DEX class-table
+policies do not apply, while the same manifest/resource merger paths this
+scanner exists to police are shared by all three flavors.
 """
 
 from __future__ import annotations
@@ -833,6 +851,41 @@ def _assert_merged_backup_bindings(aapt: str, apk: Path, xmltree: str) -> None:
         _resources_table_resolves(resources, identifier, resource, name)
 
 
+def _assert_merged_backup_rules_bytes(aapt: str, apk: Path) -> None:
+    """Assert the COMPILED backup rules still exclude exactly the key files.
+
+    The manifest binding pins only the filenames ``@xml/backup_rules`` /
+    ``@xml/data_extraction_rules`` - it cannot see what a resources overlay or
+    the merger wrote INTO the compiled XML while leaving those filenames
+    unchanged. So both compiled rule resources are dumped via
+    ``aapt dump xmltree`` (canonical res/ member paths, the same resolution
+    form ``_assert_merged_network_security_config`` proves works), rebuilt
+    with ``_parse_aapt_xmltree`` (ERROR lines / empty / truncated dumps fail
+    closed), and validated by the source gate's own engine
+    (``backup_rules_check.validate_tree``) with ``exact_excludes=True``: the
+    exclude set must equal ``BackupPolicy.KEY_FILES_EXCLUDED`` EXACTLY
+    (missing AND unexpected entries are set differences, order-free).
+    Source-level rules validation cannot reach this rewrite; this is the
+    artifact-level authority on the rules bytes.
+    """
+    backup_rules_check = _load_backup_rules_check()
+    for member, expected_root in backup_rules_check.ARTIFACT_RULE_MEMBERS:
+        rules_dump = _run_bounded_stdout(
+            [aapt, "dump", "xmltree", str(apk), member],
+            f"aapt dump xmltree (backup rules: {member})",
+            max_bytes=MAX_RESOURCES_DUMP_BYTES,
+        )
+        root = _parse_aapt_xmltree(rules_dump, f"aapt xmltree {member}")
+        errors = backup_rules_check.validate_tree(
+            root, member, expected_root, exact_excludes=True
+        )
+        if errors:
+            raise PolicyError(
+                f"compiled {member} fails the exact backup-rules set "
+                f"(artifact-level authority): {'; '.join(errors)}"
+            )
+
+
 def _unescape_dump_string(value: str) -> str:
     """Decode aapt's C-style escapes in dumped quoted strings.
 
@@ -991,6 +1044,22 @@ def _load_nsc_rules() -> types.ModuleType:
     import nsc_check
 
     return nsc_check
+
+
+def _load_backup_rules_check() -> types.ModuleType:
+    """Load the shared backup-rules engine (``scripts/backup_rules_check.py``).
+
+    Same path contract as ``_load_nsc_rules``: the compiled backup rules are
+    validated with the exact ``REQUIRED_EXCLUDES``/file↔root engine the source
+    gate runs, never a divergent local reimplementation (drift between the
+    two copies would be an invisible gate weakening).
+    """
+    scripts_dir = str(Path(__file__).resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import backup_rules_check
+
+    return backup_rules_check
 
 
 def _network_security_mode(application_block: str) -> str:
@@ -1176,11 +1245,33 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str) -> None:
     # Backup bindings on the MERGED manifest (artifact-level authority) run
     # for every policy mode: Play and Foss ship the same binding contract.
     _assert_merged_backup_bindings(aapt, apk, xmltree)
+    # Compiled backup-rules BYTES (the binding itself pins filenames only;
+    # the compiled content must still carry the exact key-file exclude set).
+    _assert_merged_backup_rules_bytes(aapt, apk)
     # networkSecurityConfig binding + compiled-XML rule check (same
     # artifact-level authority, scripts/nsc_check.py rule engine); joined
     # execution with the backup gate so one merged-manifest difference keeps
     # every policy contract provable in this artifact.
     _assert_merged_network_security_config(aapt, apk, xmltree)
+
+    if mode == "github":
+        # Github debug is neither a Play nor a Foss package: no flavor DEX
+        # class-table policy applies. It already proved the mode-independent
+        # artifact authorities (merged backup binding + compiled rules bytes
+        # + NSC binding compiled check) above - that is the entire contract
+        # here. The aapt/dexdump tool contract is still enforced above, so a
+        # wrong tool invocation cannot silently degrade the mode.
+        print(
+            f"  structure: APK ZIP/manifest OK ({len(dex_infos)} root DEX "
+            "shard(s), DEX tables not parsed)"
+        )
+        print(
+            "  policy: github OK (mode-independent artifact authorities "
+            "only: merged-manifest backup/NSC bindings + compiled backup "
+            "rules bytes + compiled NSC)"
+        )
+        return
+
     parsed_dexes: list[ParsedDex] = []
     descriptor_budget = DescriptorBudget()
     with zipfile.ZipFile(apk, "r") as archive:
@@ -1205,7 +1296,7 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("play", "foss"), required=True)
+    parser.add_argument("--mode", choices=("play", "foss", "github"), required=True)
     parser.add_argument("--apk", required=True)
     parser.add_argument("--aapt", required=True)
     parser.add_argument("--dexdump", required=True)

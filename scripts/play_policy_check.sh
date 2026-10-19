@@ -46,6 +46,8 @@ done
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 BLACKLIST_PERMS="SEND_SMS RECEIVE_SMS READ_SMS MANAGE_EXTERNAL_STORAGE BIND_ACCESSIBILITY_SERVICE BIND_VPN_SERVICE"
+# Comma form for the structured validator (same tokens).
+BLACKLIST_PERMS_CSV=$(printf '%s' "$BLACKLIST_PERMS" | tr ' \n' ',,')
 FOSS_BLACKLIST="com.google.mlkit com.google.android.gms com.microsoft.cognitiveservices.speech rikka.shizuku"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -55,19 +57,24 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || fail 'python3 is required for the backup rules validator and APK policy scanner'
 
 # Preserve source-level checks as defense in depth; artifact checks remain the
-# authority for the bytes supplied to this gate.
+# authority for the bytes supplied to this gate. The Play permission blacklist
+# is enforced by the STRUCTURED manifest scanner (backup_rules_check.py
+# validate_permission_removals), NOT by the old per-line grep: a legal
+# multi-line element differs over which line carries "tools:node=remove", so
+#   BODY=$(grep -vE "tools:node=[\"']remove[\"']" ...) ; grep -q SEND_SMS
+# false-FAILED <uses-permission android:name="...SEND_SMS"\n
+# tools:node="remove" /> (its first line still contained the token), while a
+# whole-body grep cannot separate real elements from XML comments anyway. The
+# structured scan is element-aware (multi-line/continuation spellings included,
+# comments dropped by the stdlib parser) and requires tools:node="remove" ON
+# THE ELEMENT for every blacklisted name - the exact merger-marker machinery
+# the other manifest checks here already run.
 if [ "$MODE" = play ]; then
     for m in "$ROOT/app/src/main/AndroidManifest.xml" "$ROOT/app/src/play/AndroidManifest.xml"; do
         [ -f "$m" ] || continue
-        # Quote-tolerant: single-quoted tools:node value is equally valid XML
-        # and equally inert for the merger; a filter that only eats the
-        # double-quoted spelling would false-FAIL it.
-        BODY=$(grep -vE "tools:node=[\"']remove[\"']" "$m" || true)
-        for p in $BLACKLIST_PERMS; do
-            if printf '%s\n' "$BODY" | grep -q "$p"; then
-                fail "source manifest $m declares $p"
-            fi
-        done
+        python3 "$SCRIPT_DIR/backup_rules_check.py" \
+            --check-permission-removals "$BLACKLIST_PERMS_CSV" \
+            "$m"
     done
 else
     for m in "$ROOT/app/src/main/AndroidManifest.xml" "$ROOT/app/src/foss/AndroidManifest.xml"; do

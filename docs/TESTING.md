@@ -161,6 +161,51 @@ APK-like fixtures prove scanner logic only; for a real artifact the artifact
 tier is the post-assembly `scripts/play_policy_check.sh` stage (CI assembly
 step above), and no synthetic fixture run substitutes for it.
 
+### Compiled rule bytes, Github mode, and the Play permission blacklist (Current, policy gate)
+
+Three review-driven additions to the same tier. First, the artifact scanner
+(`scripts/apk_policy_inspect.py`) asserts the COMPILED backup rule resources
+(`res/xml/backup_rules.xml` / `res/xml/data_extraction_rules.xml`, dumped via
+`aapt dump xmltree`, identical member forms as the NSC scan) with the very
+same engine as the file-level gate (`backup_rules_check.validate_tree`), in
+exact-set mode: the compiled exclude set must equal `REQUIRED_EXCLUDES`
+EXACTLY — a missing entry fails as usual AND an unexpected extra is a set
+difference, order-free — because a resources overlay can rewrite the
+handlers' XML while the manifest binding and source files all stay faithful
+(`test_compiled_backup_rules_missing_exclude_rejected`,
+`test_compiled_backup_rules_dump_failures_fail_closed`,
+`test_compiled_backup_rules_evaluate_via_shared_engine`). Second, the Github
+debug flavor is not a play or foss artifact, so its compiled bytes must not
+escape the gate either: pr-check.yml runs the scanner's `--mode github`
+right after the play/foss policy gate, executing only the mode-independent
+artifact authorities (merged backup bindings, compiled rules bytes, compiled
+NSC) with no flavor-DEX class-table policy
+(`ApkPolicyHarness.test_github_mode_passes_mode_independent_authorities`;
+the wiring is pinned by `PolicyCiGateControl`). Third, the Play source
+permission blacklist is enforced by `backup_rules_check.py`'s
+`validate_permission_removals` (CLI: `--check-permission-removals
+<perm,perm,...>`; the shell gate passes the same six tokens). It requires
+every `<uses-permission>` / `<uses-permission-sdk-23>` element whose
+android:name matches a blacklisted token to carry `tools:node="remove"` ON
+THE ELEMENT (the merger marker that provably deletes a whole declared
+element). This replaces the retired per-line `grep -vE "tools:node=..."`
+filter, which false-FAILED the legal multi-line spelling (android:name and
+the marker on different lines) and could not separate real elements from XML
+comments
+(`PermissionRemovalValidator.test_multiline_marked_removal_is_accepted`,
+`BackupRulesGateEndToEnd.test_multiline_marked_permission_removal_no_longer_false_fails`,
+`BackupRulesGateEndToEnd.test_unmarked_blacklisted_permission_fails_at_source_stage`).
+
+Two engine additions harden the rule language itself: any rule `path`
+containing `..` is refused outright (Android's rules schema resolves paths
+INSIDE the rule domain; a parent-directory reference is not something a
+file-level gate can verify, so failure is closed)
+(`test_rule_path_containing_parent_dir_is_refused`), and Android 16 QPR2
+(API 36.1) added `<cross-platform-transfer>` as a THIRD platform-supported
+section - the gate treats it as an undecided transfer policy and refuses the
+element outright rather than silently validating or skipping it
+(`test_cross_platform_transfer_section_is_refused`).
+
 ### Manifest pin semantics: tools: markers and quote normalization (Current, policy-harness tests)
 
 `backup_rules_check.py` parses with stdlib ElementTree, so manifest claims are

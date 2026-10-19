@@ -26,6 +26,7 @@ import sys
 import tempfile
 import unittest
 import warnings
+import xml.etree.ElementTree as ET
 import zipfile
 import zlib
 from fnmatch import fnmatchcase
@@ -418,6 +419,258 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '  E: base-config (line=2)' \\\n"
             "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' ;;\n"
             "      esac\n"
+            "    elif [ \"${4:-}\" = \"res/xml/backup_rules.xml\" ] || [ \"${4:-}\" = \"res/xml/data_extraction_rules.xml\" ]; then\n"
+            "      # Compiled backup-rules fixtures mirror the real aapt v1 xmltree\n"
+            "      # shape: rule attributes carry NO namespace, so they print\n"
+            "      # exactly like the NSC src attribute does (A: domain=\"x\"\n"
+            "      # (Raw: \"x\")) and the rebuilt tree carries plain domain/path\n"
+            "      # keys just like the source-file parser. Dispatch mirrors the\n"
+            "      # real invocation pairs: the member path ($4) selects the dump.\n"
+            "      case \"${FAKE_AAPT_RULES:-ok}\" in\n"
+            "        error)\n"
+            "          # Missing-compiled-resource surface: the ERROR line goes to\n"
+            "          # STDOUT and builds differ on the exit status - fail closed\n"
+            "          # via the tree parser, exactly like the NSC control.\n"
+            "          printf 'ERROR: dump failed because resource %s not found\\n' \"${4##*/}\" ;;\n"
+            "        empty) : ;;\n"
+            "        missing-one)\n"
+            "          # The file/librepocket_keysets exclude drops out of EVERY\n"
+            "          # section: the exact-set rule must reject the compiled\n"
+            "          # bytes in both members (dump succeeds, content differs).\n"
+            "          if [ \"${4:-}\" = \"res/xml/backup_rules.xml\" ]; then\n"
+            "            printf '%s\\n' \\\n"
+            "              'E: full-backup-content (line=1)' \\\n"
+            "              '  E: exclude (line=2)' \\\n"
+            "              '    A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '    A: path=\"librepocket_keys.xml\" (Raw: \"librepocket_keys.xml\")' \\\n"
+            "              '  E: exclude (line=3)' \\\n"
+            "              '    A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '    A: path=\"librepocket_vault\" (Raw: \"librepocket_vault\")' \\\n"
+            "              '  E: exclude (line=4)' \\\n"
+            "              '    A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '    A: path=\"librepocket_vault-wal\" (Raw: \"librepocket_vault-wal\")' \\\n"
+            "              '  E: exclude (line=5)' \\\n"
+            "              '    A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '    A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")'\n"
+            "          else\n"
+            "            printf '%s\\n' \\\n"
+            "              'E: data-extraction-rules (line=1)' \\\n"
+            "              '  E: cloud-backup (line=2)' \\\n"
+            "              '    E: exclude (line=3)' \\\n"
+            "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '      A: path=\"librepocket_keys.xml\" (Raw: \"librepocket_keys.xml\")' \\\n"
+            "              '    E: exclude (line=4)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault\" (Raw: \"librepocket_vault\")' \\\n"
+            "              '    E: exclude (line=5)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault-wal\" (Raw: \"librepocket_vault-wal\")' \\\n"
+            "              '    E: exclude (line=6)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '  E: device-transfer (line=7)' \\\n"
+            "              '    E: exclude (line=8)' \\\n"
+            "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '      A: path=\"librepocket_keys.xml\" (Raw: \"librepocket_keys.xml\")' \\\n"
+            "              '    E: exclude (line=9)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault\" (Raw: \"librepocket_vault\")' \\\n"
+            "              '    E: exclude (line=10)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault-wal\" (Raw: \"librepocket_vault-wal\")' \\\n"
+            "              '    E: exclude (line=11)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")'\n"
+            "          fi ;;\n"
+            "        extra-one)\n"
+            "          # The mirror image of missing-one: every REQUIRED exclude\n"
+            "          # stays and ONE entry beyond the pinned five adds itself\n"
+            "          # to EVERY section: the exact-set rule must reject the\n"
+            "          # compiled bytes in both members (dump succeeds, content\n"
+            "          # differs).\n"
+            "          if [ \"${4:-}\" = \"res/xml/backup_rules.xml\" ]; then\n"
+            "            printf '%s\\n' \\\n"
+            "              'E: full-backup-content (line=1)' \\\n"
+            "              '  E: exclude (line=2)' \\\n"
+            "              '    A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '    A: path=\"librepocket_keys.xml\" (Raw: \"librepocket_keys.xml\")' \\\n"
+            "              '  E: exclude (line=3)' \\\n"
+            "              '    A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '    A: path=\"librepocket_vault\" (Raw: \"librepocket_vault\")' \\\n"
+            "              '  E: exclude (line=4)' \\\n"
+            "              '    A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '    A: path=\"librepocket_vault-wal\" (Raw: \"librepocket_vault-wal\")' \\\n"
+            "              '  E: exclude (line=5)' \\\n"
+            "              '    A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '    A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '  E: exclude (line=6)' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
+            "              '  E: exclude (line=7)' \\\n"
+            "              '    A: domain=\"path\" (Raw: \"path\")' \\\n"
+            "              '    A: path=\"extra.xml\" (Raw: \"extra.xml\")'\n"
+            "          else\n"
+            "            printf '%s\\n' \\\n"
+            "              'E: data-extraction-rules (line=1)' \\\n"
+            "              '  E: cloud-backup (line=2)' \\\n"
+            "              '    E: exclude (line=3)' \\\n"
+            "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '      A: path=\"librepocket_keys.xml\" (Raw: \"librepocket_keys.xml\")' \\\n"
+            "              '    E: exclude (line=4)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault\" (Raw: \"librepocket_vault\")' \\\n"
+            "              '    E: exclude (line=5)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault-wal\" (Raw: \"librepocket_vault-wal\")' \\\n"
+            "              '    E: exclude (line=6)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '    E: exclude (line=7)' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
+            "              '    E: exclude (line=8)' \\\n"
+            "              '      A: domain=\"path\" (Raw: \"path\")' \\\n"
+            "              '      A: path=\"extra.xml\" (Raw: \"extra.xml\")' \\\n"
+            "              '  E: device-transfer (line=9)' \\\n"
+            "              '    E: exclude (line=10)' \\\n"
+            "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '      A: path=\"librepocket_keys.xml\" (Raw: \"librepocket_keys.xml\")' \\\n"
+            "              '    E: exclude (line=11)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault\" (Raw: \"librepocket_vault\")' \\\n"
+            "              '    E: exclude (line=12)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault-wal\" (Raw: \"librepocket_vault-wal\")' \\\n"
+            "              '    E: exclude (line=13)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '    E: exclude (line=14)' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
+            "              '    E: exclude (line=15)' \\\n"
+            "              '      A: domain=\"path\" (Raw: \"path\")' \\\n"
+            "              '      A: path=\"extra.xml\" (Raw: \"extra.xml\")'\n"
+            "          fi ;;\n"
+            "        cross)\n"
+            "          # Android 16 QPR2's third PLATFORM section inside the\n"
+            "          # COMPILED bytes: the validate_tree parity must refuse it\n"
+            "          # regardless of the section's content (undecided policy).\n"
+            "          if [ \"${4:-}\" = \"res/xml/data_extraction_rules.xml\" ]; then\n"
+            "            printf '%s\\n' \\\n"
+            "              'E: data-extraction-rules (line=1)' \\\n"
+            "              '  E: cloud-backup (line=2)' \\\n"
+            "              '    E: exclude (line=3)' \\\n"
+            "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '      A: path=\"librepocket_keys.xml\" (Raw: \"librepocket_keys.xml\")' \\\n"
+            "              '    E: exclude (line=4)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault\" (Raw: \"librepocket_vault\")' \\\n"
+            "              '    E: exclude (line=5)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault-wal\" (Raw: \"librepocket_vault-wal\")' \\\n"
+            "              '    E: exclude (line=6)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '    E: exclude (line=7)' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
+            "              '  E: device-transfer (line=8)' \\\n"
+            "              '    E: exclude (line=9)' \\\n"
+            "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '      A: path=\"librepocket_keys.xml\" (Raw: \"librepocket_keys.xml\")' \\\n"
+            "              '    E: exclude (line=10)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault\" (Raw: \"librepocket_vault\")' \\\n"
+            "              '    E: exclude (line=11)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault-wal\" (Raw: \"librepocket_vault-wal\")' \\\n"
+            "              '    E: exclude (line=12)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '    E: exclude (line=13)' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
+            "              '  E: cross-platform-transfer (line=14)' \\\n"
+            "              '    E: exclude (line=15)' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"cross_transfer_leak.xml\" (Raw: \"cross_transfer_leak.xml\")'\n"
+            "          else\n"
+            "            printf '%s\\n' \\\n"
+            "              'E: full-backup-content (line=1)' \\\n"
+            "              '  E: exclude (line=2)' \\\n"
+            "              '    A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '    A: path=\"librepocket_keys.xml\" (Raw: \"librepocket_keys.xml\")' \\\n"
+            "              '  E: exclude (line=3)' \\\n"
+            "              '    A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '    A: path=\"librepocket_vault\" (Raw: \"librepocket_vault\")' \\\n"
+            "              '  E: exclude (line=4)' \\\n"
+            "              '    A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '    A: path=\"librepocket_vault-wal\" (Raw: \"librepocket_vault-wal\")' \\\n"
+            "              '  E: exclude (line=5)' \\\n"
+            "              '    A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '    A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '  E: exclude (line=6)' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")'\n"
+            "          fi ;;\n"
+            "        *)  # ok (default): exactly the REQUIRED_EXCLUDES set under\n"
+            "            # both roots, so the default artifacts stay positive\n"
+            "            # controls for the compiled-bytes authority\n"
+            "          if [ \"${4:-}\" = \"res/xml/backup_rules.xml\" ]; then\n"
+            "            printf '%s\\n' \\\n"
+            "              'E: full-backup-content (line=1)' \\\n"
+            "              '  E: exclude (line=2)' \\\n"
+            "              '    A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '    A: path=\"librepocket_keys.xml\" (Raw: \"librepocket_keys.xml\")' \\\n"
+            "              '  E: exclude (line=3)' \\\n"
+            "              '    A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '    A: path=\"librepocket_vault\" (Raw: \"librepocket_vault\")' \\\n"
+            "              '  E: exclude (line=4)' \\\n"
+            "              '    A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '    A: path=\"librepocket_vault-wal\" (Raw: \"librepocket_vault-wal\")' \\\n"
+            "              '  E: exclude (line=5)' \\\n"
+            "              '    A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '    A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '  E: exclude (line=6)' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")'\n"
+            "          else\n"
+            "            printf '%s\\n' \\\n"
+            "              'E: data-extraction-rules (line=1)' \\\n"
+            "              '  E: cloud-backup (line=2)' \\\n"
+            "              '    E: exclude (line=3)' \\\n"
+            "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '      A: path=\"librepocket_keys.xml\" (Raw: \"librepocket_keys.xml\")' \\\n"
+            "              '    E: exclude (line=4)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault\" (Raw: \"librepocket_vault\")' \\\n"
+            "              '    E: exclude (line=5)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault-wal\" (Raw: \"librepocket_vault-wal\")' \\\n"
+            "              '    E: exclude (line=6)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '    E: exclude (line=7)' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
+            "              '  E: device-transfer (line=8)' \\\n"
+            "              '    E: exclude (line=9)' \\\n"
+            "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '      A: path=\"librepocket_keys.xml\" (Raw: \"librepocket_keys.xml\")' \\\n"
+            "              '    E: exclude (line=10)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault\" (Raw: \"librepocket_vault\")' \\\n"
+            "              '    E: exclude (line=11)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault-wal\" (Raw: \"librepocket_vault-wal\")' \\\n"
+            "              '    E: exclude (line=12)' \\\n"
+            "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
+            "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '    E: exclude (line=13)' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")'\n"
+            "          fi ;;\n"
+            "      esac\n"
             "    else\n"
             "      case \"${FAKE_AAPT_XMLTREE:-bindings}\" in\n"
             "        stripped)\n"
@@ -532,6 +785,7 @@ class ApkPolicyHarness(unittest.TestCase):
         xmltree_mode: str = "bindings",
         resources_mode: str = "table",
         nsc_mode: str = "ok",
+        rules_mode: str = "ok",
     ) -> dict[str, str]:
         env = os.environ.copy()
         env.update(
@@ -544,6 +798,7 @@ class ApkPolicyHarness(unittest.TestCase):
                 "FAKE_AAPT_XMLTREE": xmltree_mode,
                 "FAKE_AAPT_RESOURCES": resources_mode,
                 "FAKE_AAPT_NSC": nsc_mode,
+                "FAKE_AAPT_RULES": rules_mode,
                 "LC_ALL": "C",
             }
         )
@@ -559,6 +814,7 @@ class ApkPolicyHarness(unittest.TestCase):
         xmltree_mode: str = "bindings",
         resources_mode: str = "table",
         nsc_mode: str = "ok",
+        rules_mode: str = "ok",
         sdk: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = ["sh", str(POLICY_CHECK)]
@@ -575,6 +831,7 @@ class ApkPolicyHarness(unittest.TestCase):
                 xmltree_mode=xmltree_mode,
                 resources_mode=resources_mode,
                 nsc_mode=nsc_mode,
+                rules_mode=rules_mode,
             ),
             text=True,
             stdout=subprocess.PIPE,
@@ -856,6 +1113,203 @@ class ApkPolicyHarness(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("rebound backup binding", result.stdout)
 
+    # -- compiled backup-rules BYTES (artifact-level exact-set authority) --
+
+    def test_compiled_backup_rules_missing_exclude_rejected(self) -> None:
+        # A resources-overlay/merger rewrite can change the COMPILED rule
+        # content while every source file and the manifest binding stay
+        # faithful. The artifact bytes must still carry the EXACT five
+        # excludes: dropping one entry fails the run even though the dump
+        # succeeded and the binding survived.
+        apk = complete_apk(
+            self.tmp / "rules-missing-one.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, rules_mode="missing-one")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "missing exclude domain=file path=librepocket_keysets", result.stdout
+        )
+        self.assertIn("compiled res/xml/", result.stdout)
+
+    def test_compiled_backup_rules_unexpected_exclude_rejected(self) -> None:
+        # The mirror image of the missing-one control: a resources-overlay /
+        # merger rewrite can also ADD an exclude to the COMPILED rule
+        # content. The artifact bytes must still carry EXACTLY the five
+        # excludes: adding one entry (domain="path", path="extra.xml") fails
+        # the run even though every required entry survives and the dump
+        # succeeded.
+        apk = complete_apk(
+            self.tmp / "rules-extra-one.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, rules_mode="extra-one")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "unexpected exclude domain=path path=extra.xml", result.stdout
+        )
+        self.assertIn("compiled res/xml/", result.stdout)
+
+    def test_compiled_backup_rules_valid_bytes_accepted(self) -> None:
+        # Positive control: the exactly-pinned five-exclude set (any order)
+        # passes both members, keeping the default artifact runs positive.
+        apk = complete_apk(
+            self.tmp / "rules-ok.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, rules_mode="ok")
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_compiled_backup_rules_dump_failures_fail_closed(self) -> None:
+        # A missing/unparseable compiled rules member must reject before any
+        # "inert dump" reading can pass the gate (ERROR stdout line and empty
+        # output both surface as policy failures).
+        apk = complete_apk(
+            self.tmp / "rules-dump-failure.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for rules_mode in ("error", "empty"):
+            with self.subTest(dump_mode=rules_mode):
+                result = self.run_policy(apk, rules_mode=rules_mode)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_compiled_cross_platform_transfer_rejected_at_artifact_level(self) -> None:
+        # The Android 16 QPR2 third platform section inside the COMPILED
+        # bytes must be refused by the artifact scan too (same engine
+        # parity as the source gate): undecided policy = fail closed.
+        apk = complete_apk(
+            self.tmp / "rules-cross-section.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, rules_mode="cross")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("cross-platform-transfer", result.stdout)
+
+    def test_compiled_backup_rules_evaluate_via_shared_engine(self) -> None:
+        # In-process proof that the scanner validates the rebuilt compiled
+        # tree with the SOURCE gate's exact engine (validate_tree with
+        # exact_excludes=True), so a divergent port cannot silently disagree
+        # with the file-level validator.
+        engine_module = policy_inspect._load_backup_rules_check()
+        apk = complete_apk(
+            self.tmp / "rules-direct.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        with mock.patch.object(
+            engine_module, "validate_tree", wraps=engine_module.validate_tree
+        ) as engine:
+            policy_inspect._assert_merged_backup_rules_bytes(
+                str(self.build_tools / "aapt"), apk
+            )
+        self.assertEqual(engine.call_count, len(engine_module.ARTIFACT_RULE_MEMBERS))
+        for engine_call, (member, expected_root) in zip(
+            engine.call_args_list, engine_module.ARTIFACT_RULE_MEMBERS
+        ):
+            self.assertEqual(engine_call.args[1], member)
+            self.assertEqual(engine_call.args[2], expected_root)
+            # Exact-set mode is ON at artifact level: extras beyond the five
+            # required excludes are refused, not tolerated.
+            self.assertIs(engine_call.kwargs.get("exact_excludes"), True)
+
+    # -- github artifact mode (mode-independent authorities only) --
+
+    def _run_scanner_cli(
+        self,
+        apk: Path,
+        mode: str,
+        *,
+        rules_mode: str = "ok",
+        xmltree_mode: str = "bindings",
+        resources_mode: str = "table",
+        nsc_mode: str = "ok",
+    ) -> subprocess.CompletedProcess[str]:
+        env = self._env(
+            rules_mode=rules_mode,
+            xmltree_mode=xmltree_mode,
+            resources_mode=resources_mode,
+            nsc_mode=nsc_mode,
+        )
+        return subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "apk_policy_inspect.py"),
+                "--mode",
+                mode,
+                "--apk",
+                str(apk),
+                "--aapt",
+                str(self.build_tools / "aapt"),
+                "--dexdump",
+                str(self.dexdump_path),
+            ],
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    def test_github_mode_passes_mode_independent_authorities(self) -> None:
+        # The github debug build is not a play/foss artifact: the flavor DEX
+        # class-table policies must NOT reject it, while the mode-independent
+        # artifact authorities still run. The DEX deliberately carries a
+        # forbidden Foss reference to prove DEX policies are entirely skipped
+        # in this mode (play/foss modes would reject the same bytes).
+        dex = minimal_dex(
+            type_descriptors=("Ljava/lang/Object;",),
+            class_definitions=((_FORBIDDEN_FOSS_TYPE, None),),
+        )
+        apk = complete_apk(self.tmp / "github-mode-dex.apk", dex)
+        result = self._run_scanner_cli(apk, "github")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("policy: github OK", result.stdout)
+        self.assertIn("mode-independent", result.stdout)
+
+    def test_github_mode_still_enforces_artifact_authorities(self) -> None:
+        # Mode-independence is not mode-blindness: a merged manifest stripped
+        # of the backup bindings must fail the github scan too.
+        apk = complete_apk(
+            self.tmp / "github-mode-stripped.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self._run_scanner_cli(apk, "github", xmltree_mode="stripped")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("merged manifest lost the backup binding", result.stderr)
+
+    def test_github_mode_compiled_rules_and_nsc_checked(self) -> None:
+        # The compiled-bytes and NSC authorities ride along in github mode:
+        # a dump-failed rules member rejects the same artifact (fail-closed
+        # ERROR line), as does a compiled set missing one of the pinned
+        # excludes (the exact-set authority works before any mode split).
+        apk = complete_apk(
+            self.tmp / "github-mode-rules.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self._run_scanner_cli(apk, "github", rules_mode="error")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "aapt xmltree res/xml/backup_rules.xml reported a dump ERROR",
+            result.stderr,
+        )
+        result = self._run_scanner_cli(apk, "github", rules_mode="missing-one")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("compiled res/xml/backup_rules.xml", result.stderr)
+        self.assertIn(
+            "missing exclude domain=file path=librepocket_keysets",
+            result.stderr,
+        )
+        result = self._run_scanner_cli(apk, "github", nsc_mode="reviewer")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+
+    def test_github_mode_unknown_mode_arg_rejected_by_cli(self) -> None:
+        apk = complete_apk(
+            self.tmp / "github-mode-typo.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self._run_scanner_cli(apk, "githubx")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("invalid choice", result.stderr)
+
     # -- merged-manifest networkSecurityConfig binding (artifact authority) --
 
     def test_merged_nsc_binding_stripped_from_application_rejected(self) -> None:
@@ -1023,8 +1477,9 @@ class ApkPolicyHarness(unittest.TestCase):
 
     def test_real_debug_apk_artifact_nsc_authority(self) -> None:
         # Live control (skipped without a real APK + real aapt): the actual
-        # production debug artifact must pass BOTH artifact authorities with
-        # its proven debuggable attr (debug NSC rules).
+        # production debug artifact must pass ALL artifact authorities with
+        # its proven debuggable attr (debug NSC rules) — merged backup
+        # bindings, compiled backup-rules bytes, and the NSC pair.
         if not _REAL_DEBUG_APK.exists():
             self.skipTest("real debug APK not built in this checkout")
         aapt = _discover_real_aapt()
@@ -1035,6 +1490,7 @@ class ApkPolicyHarness(unittest.TestCase):
         )
         self.assertTrue(permissions)
         policy_inspect._assert_merged_backup_bindings(aapt, _REAL_DEBUG_APK, xmltree)
+        policy_inspect._assert_merged_backup_rules_bytes(aapt, _REAL_DEBUG_APK)
         policy_inspect._assert_merged_network_security_config(
             aapt, _REAL_DEBUG_APK, xmltree
         )
@@ -1729,6 +2185,26 @@ class PolicyCiGateControl(unittest.TestCase):
         self.assertIn("python3 scripts/summarize_junit.py", workflow)
         self.assertIn("summary_parser_crashed_fallback", workflow)
 
+    def test_github_flavor_artifact_check_runs_mode_independent_scan(self) -> None:
+        # The github debug APK is neither a play nor a foss artifact, yet the
+        # mode-independent artifact authorities (merged backup bindings,
+        # compiled backup-rules bytes, compiled NSC) still apply to it. The
+        # assembly job must run the scanner's github mode on it right after
+        # the play/foss policy gate so a scanner-only or wiring-only diff
+        # cannot drop this check silently again.
+        workflow = PR_CHECK_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            "Run Github Flavor Artifact Binding Check (mode-independent)",
+            workflow,
+        )
+        self.assertIn("python3 scripts/apk_policy_inspect.py --mode github", workflow)
+        # The scanned artifact is the github debug APK assembly just built
+        # (exact artifact-to-mode pairing).
+        self.assertIn(
+            "--apk app/build/outputs/apk/github/debug/app-github-debug.apk",
+            workflow,
+        )
+
     def test_pr_gate_requires_policy_harness(self) -> None:
         workflow = PR_CHECK_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("policy-harness", workflow)
@@ -2278,6 +2754,183 @@ class BackupRulesValidator(unittest.TestCase):
         path = self._write("data_extraction_rules.xml", body)
         self.assertEqual(self._check(path), [])
 
+    def test_cross_platform_transfer_section_is_refused(self) -> None:
+        # Android 16 QPR2 (API 36.1) promotes <cross-platform-transfer> to a
+        # THIRD platform section (iOS cross-platform transfer). It is NOT an
+        # unknown element the runtime skips silently, and no transfer policy
+        # has settled the gate for it: the gate refuses its appearance
+        # outright instead of neither validating nor rejecting it.
+        body = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<data-extraction-rules>\n"
+            f"    <cloud-backup>\n{self._ALL_EXCLUDES}    </cloud-backup>\n"
+            f"    <device-transfer>\n{self._ALL_EXCLUDES}    </device-transfer>\n"
+            "    <cross-platform-transfer>\n"
+            '        <exclude domain="file" path="cross_leak.xml" />\n'
+            "    </cross-platform-transfer>\n"
+            "</data-extraction-rules>\n"
+        )
+        path = self._write("data_extraction_rules.xml", body)
+        errors = self._check(path)
+        self.assertTrue(
+            any("<cross-platform-transfer> is a platform-supported root section" in e for e in errors),
+            errors,
+        )
+        self.assertTrue(
+            any("UNDECIDED" in e for e in errors), errors
+        )
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            code = backup_rules_check.main(
+                [
+                    "backup_rules_check.py",
+                    "--expect-root",
+                    backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION,
+                    path,
+                ]
+            )
+        self.assertEqual(1, code)
+        self.assertIn("cross-platform-transfer", buf_err.getvalue())
+
+    def test_cross_platform_transfer_inside_legal_section_fails(self) -> None:
+        # The element nested INSIDE a legal section is an unknown rule child
+        # (FullBackup validates every START_TAG) - the depth-agnostic walk
+        # already fails it; pin that sibling shape explicitly.
+        body = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<data-extraction-rules>\n"
+            "    <cloud-backup>\n"
+            f"{self._ALL_EXCLUDES}"
+            "        <cross-platform-transfer transferId=\"x\" />\n"
+            "    </cloud-backup>\n"
+            f"    <device-transfer>\n{self._ALL_EXCLUDES}    </device-transfer>\n"
+            "</data-extraction-rules>\n"
+        )
+        path = self._write("data_extraction_rules.xml", body)
+        errors = self._check(path)
+        self.assertTrue(
+            any("<cloud-backup> unknown element <cross-platform-transfer>" in e for e in errors),
+            errors,
+        )
+
+    def test_two_platform_sections_alone_still_pass(self) -> None:
+        # The incumbent two-mode matrix stays a positive control after the
+        # third-section refusal lands (cloud-backup + device-transfer only).
+        path = self._write(
+            "data_extraction_rules.xml",
+            self._data_extraction(self._ALL_EXCLUDES, self._ALL_EXCLUDES),
+        )
+        self.assertEqual(self._check(path), [])
+
+    def test_rule_path_containing_parent_dir_is_refused(self) -> None:
+        # Android's rules schema resolves paths INSIDE the rule domain (no
+        # parent-directory references); the gate cannot verify such a path's
+        # runtime behavior, so ANY ".." in a rule path refuses the file,
+        # including a standalone "foo..bar" spelling (substring semantics,
+        # deterministic and stricter than runtime).
+        shapes = {
+            "dotdot-lead": '        <exclude domain="file" path="../evil.xml" />\n',
+            "dotdot-mid": '        <include domain="file" path="a/../b" />\n',
+            "dotdot-tail-only": '        <exclude domain="file" path="notes..bak" />\n',
+        }
+        for name, extra in shapes.items():
+            with self.subTest(shape=name):
+                path = self._write(
+                    "backup_rules.xml", self._full_backup(self._ALL_EXCLUDES + extra)
+                )
+                errors = self._check(path)
+                self.assertTrue(
+                    any('contains ".."' in e for e in errors), errors
+                )
+                # Both include and exclude shapes carry the same message shape.
+                if extra.startswith('        <include'):
+                    self.assertTrue(
+                        any("<include> path" in e for e in errors), errors
+                    )
+
+    def test_rule_path_traversal_rejected_in_branches_too(self) -> None:
+        # The refusal walks data-extraction branches with the same branch
+        # label discipline as the other rule checks.
+        body = self._data_extraction(
+            '        <exclude domain="file" path="sub/../../escape" />\n',
+            self._ALL_EXCLUDES,
+        )
+        path = self._write("data_extraction_rules.xml", body)
+        errors = self._check(path)
+        self.assertTrue(
+            any("<cloud-backup>" in e and 'contains ".."' in e for e in errors),
+            errors,
+        )
+
+    def test_exact_excludes_mode_flags_set_differences(self) -> None:
+        # Artifact-level authority: `exact_excludes=True` (the compiled-bytes
+        # scan) demands the exact REQUIRED_EXCLUDES set - a missing entry
+        # fails as usual AND an unexpected extra is a set difference too,
+        # order-free. Source-level default stays presence-only (over-shielding
+        # tolerated at source: the exact-set pin is deliberately compiled-byte
+        # only).
+        tree = ET.fromstring(
+            self._full_backup(
+                self._ALL_EXCLUDES
+                + '        <exclude domain="file" path="unrelated.xml" />\n'
+            )
+        )
+        self.assertEqual(
+            backup_rules_check.validate_tree(tree, "x", "full-backup-content"), []
+        )
+        errors = backup_rules_check.validate_tree(
+            tree, "x", "full-backup-content", exact_excludes=True
+        )
+        self.assertTrue(
+            any("unexpected exclude domain=file path=unrelated.xml" in e for e in errors),
+            errors,
+        )
+        exact_subset = ET.fromstring(
+            self._full_backup(
+                self._ALL_EXCLUDES.replace(
+                    '        <exclude domain="database" path="librepocket_vault-wal" />\n',
+                    "",
+                )
+            )
+        )
+        missing_present = backup_rules_check.validate_tree(
+            exact_subset, "x", "full-backup-content", exact_excludes=True
+        )
+        self.assertTrue(
+            any("missing exclude domain=database path=librepocket_vault-wal" in e
+                for e in missing_present),
+            missing_present,
+        )
+        # Reordered but complete set: still exact (order-independent).
+        exclude_lines = self._ALL_EXCLUDES.splitlines(keepends=True)
+        reordered = ET.fromstring(
+            self._full_backup("".join(reversed(exclude_lines)))
+        )
+        self.assertEqual(
+            backup_rules_check.validate_tree(
+                reordered, "x", "full-backup-content", exact_excludes=True
+            ),
+            [],
+        )
+
+    def test_validate_tree_matches_validate_on_representative_shapes(self) -> None:
+        # The artifact scanner runs validate_tree directly; the file loader
+        # must agree with it for at least one good and one bad tree so the
+        # two surfaces can never diverge.
+        good = self._full_backup(self._ALL_EXCLUDES)
+        bad = self._data_extraction(self._ALL_EXCLUDES, "")
+        for body, tag, hint in (
+            (good, "backup_rules.xml", backup_rules_check.EXPECTED_ROOT_BACKUP_RULES),
+            (bad, "data_extraction_rules.xml", backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION),
+        ):
+            path = self._write(tag, body)
+            self.assertEqual(
+                backup_rules_check.validate(path, hint),
+                backup_rules_check.validate_tree(
+                    ET.parse(path).getroot(), path, hint
+                ),
+            )
+
     # ---- 檔名↔root 綁定（swapped / wrong root 不可 false PASS）----
 
     def test_swapped_roots_are_rejected(self) -> None:
@@ -2597,6 +3250,280 @@ class BackupRulesValidator(unittest.TestCase):
         self.assertIn("expected root <full-backup-content>", buf_err.getvalue())
 
 
+class PermissionRemovalValidator(unittest.TestCase):
+    """Play permission blacklist via the structured manifest scanner.
+
+    The old gate filtered each manifest body line-by-line
+    (``grep -vE "tools:node=..."`` then grepped tokens), so a LEGAL multi-line
+    element whose ``android:name`` and ``tools:node="remove"`` sit on
+    different lines left the name line unfiltered and false-FAILED the gate,
+    while a whole-body grep also matched text inside XML comments.
+
+    The structured scan uses the same merger-marker machinery as the
+    manifest binding checks: only a real (comment-proof) element whose
+    android:name carries a blacklisted token, AND that carries no
+    ``tools:node="remove"`` ON ITSELF, is a violation.
+    """
+
+    _TOOLS_NS = "http://schemas.android.com/tools"
+    _ANDROID_NS = "http://schemas.android.com/apk/res/android"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+
+    def _write(self, name: str, body: str) -> str:
+        path = self.tmp / name
+        path.write_text(body, encoding="utf-8")
+        return str(path)
+
+    def _manifest(self, body: str) -> str:
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            f'<manifest xmlns:android="{self._ANDROID_NS}"'
+            f' xmlns:tools="{self._TOOLS_NS}">\n'
+            f"{body}"
+            "</manifest>\n"
+        )
+
+    _BLACKLIST = ("SEND_SMS", "RECEIVE_SMS", "READ_SMS", "BIND_VPN_SERVICE")
+
+    def test_multiline_marked_removal_is_accepted(self) -> None:
+        # The original false-FAIL repro: android:name and tools:node sit on
+        # separate lines of ONE legal element; a line filter sees the name
+        # line unmarked. The element-aware scan accepts it.
+        body = self._manifest(
+            "    <uses-permission\n"
+            '        android:name="android.permission.SEND_SMS"\n'
+            '        tools:node="remove" />\n'
+        )
+        path = self._write("main.xml", body)
+        self.assertEqual(
+            backup_rules_check.validate_permission_removals(path, self._BLACKLIST),
+            [],
+        )
+
+    def test_single_line_marked_removal_is_accepted(self) -> None:
+        body = self._manifest(
+            '    <uses-permission android:name="android.permission.BIND_VPN_SERVICE"'
+            ' tools:node="remove" />\n'
+        )
+        path = self._write("main.xml", body)
+        self.assertEqual(
+            backup_rules_check.validate_permission_removals(path, self._BLACKLIST),
+            [],
+        )
+
+    def test_sdk23_variant_tag_is_scanned_too(self) -> None:
+        # uses-permission-sdk-23 declares the same permission on API 23+;
+        # scanning only the plain tag would shrink the grep catch-universe.
+        body = self._manifest(
+            '    <uses-permission-sdk-23\n'
+            '        android:name="android.permission.RECEIVE_SMS"\n'
+            '        tools:node="remove" />\n'
+        )
+        path = self._write("main.xml", body)
+        self.assertEqual(
+            backup_rules_check.validate_permission_removals(path, self._BLACKLIST),
+            [],
+        )
+        unmarked = body.replace(' tools:node="remove" />\n', " />\n")
+        path = self._write("sdk23-unmarked.xml", unmarked)
+        errors = backup_rules_check.validate_permission_removals(path, self._BLACKLIST)
+        self.assertTrue(
+            any("uses-permission-sdk-23" in e for e in errors), errors
+        )
+
+    def test_unmarked_blacklisted_element_is_rejected(self) -> None:
+        body = self._manifest(
+            '    <uses-permission android:name="android.permission.SEND_SMS" />\n'
+        )
+        path = self._write("main.xml", body)
+        errors = backup_rules_check.validate_permission_removals(path, self._BLACKLIST)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn(
+            "blacklisted permission SEND_SMS", errors[0], errors
+        )
+        self.assertIn('without tools:node="remove"', errors[0], errors)
+
+    def test_wrong_marker_still_rejected(self) -> None:
+        # The merger deletes a whole element ONLY with tools:node="remove";
+        # tools:remove targets attributes, tools:node="replace"/"merge" keep
+        # (or re-declare in a more specific way) the declaration.
+        for marker, label in (
+            ('        tools:remove="android:name" />\n', "tools:remove-attr"),
+            ('        tools:node="merge" />\n', "merge-marker"),
+        ):
+            with self.subTest(label=label):
+                body = self._manifest(
+                    "    <uses-permission\n"
+                    '        android:name="android.permission.READ_SMS"\n'
+                    + marker
+                )
+                path = self._write(f"{label}.xml", body)
+                errors = backup_rules_check.validate_permission_removals(
+                    path, self._BLACKLIST
+                )
+                self.assertTrue(
+                    any("blacklisted permission READ_SMS" in e for e in errors),
+                    errors,
+                )
+
+    def test_comment_wrapped_element_is_invisible(self) -> None:
+        # A comment (including a blacklisted literal inside it) cannot
+        # declare the permission: ElementTree drops it, and so must the scan
+        # (the swapped legacy grep false-tokened here).
+        body = self._manifest(
+            "    <!-- <uses-permission android:name=\"android.permission.SEND_SMS\" /> -->\n"
+        )
+        path = self._write("main.xml", body)
+        self.assertEqual(
+            backup_rules_check.validate_permission_removals(path, self._BLACKLIST),
+            [],
+        )
+
+    def test_unblacklisted_or_unlisted_names_never_flag(self) -> None:
+        body = self._manifest(
+            '    <uses-permission android:name="android.permission.INTERNET" />\n'
+            '    <uses-permission android:name="android.permission.SEND_SMS_EXTENDED"'
+            ' tools:node="remove" />\n'
+        )
+        path = self._write("main.xml", body)
+        self.assertEqual(
+            backup_rules_check.validate_permission_removals(path, self._BLACKLIST),
+            [],
+        )
+
+    def test_unnamed_permission_element_is_uncharged_error(self) -> None:
+        # A permission element whose name cannot be resolved cannot prove it
+        # is safe (or blacklisted) - refuse, rather than green-light a shape
+        # the merger behavior of is unresolved.
+        body = self._manifest(
+            '    <uses-permission tools:node="remove" />\n'
+        )
+        path = self._write("main.xml", body)
+        errors = backup_rules_check.validate_permission_removals(path, self._BLACKLIST)
+        self.assertTrue(
+            any("carries no android:name" in e for e in errors), errors
+        )
+
+    def test_non_manifest_root_and_invalid_xml_fail_closed(self) -> None:
+        path = self._write("rules.xml", "<resources>\n</resources>\n")
+        errors = backup_rules_check.validate_permission_removals(path, self._BLACKLIST)
+        self.assertTrue(any("needs a <manifest> root" in e for e in errors), errors)
+        path = self._write("broken.xml", "<manifest xmlns:android='x'>\n")
+        errors = backup_rules_check.validate_permission_removals(path, self._BLACKLIST)
+        self.assertTrue(any("invalid XML" in e for e in errors), errors)
+
+    # -- CLI 層（--check-permission-removals exit-code matrix）--
+
+    def test_cli_exit_codes_and_mutual_exclusion(self) -> None:
+        marked = self._manifest(
+            '    <uses-permission android:name="android.permission.SEND_SMS"'
+            ' tools:node="remove" />\n'
+        )
+        unmarked = self._manifest(
+            '    <uses-permission android:name="android.permission.SEND_SMS" />\n'
+        )
+        good = self._write("marked.xml", marked)
+        bad = self._write("unmarked.xml", unmarked)
+        manifest_for_other_mode = self._write("manifest.xml", marked)
+        # PASS / real-FAIL / hint-free exit-code matrix.
+        self.assertEqual(
+            backup_rules_check.main(
+                ["x", "--check-permission-removals", "SEND_SMS", good]
+            ),
+            0,
+        )
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            self.assertEqual(
+                backup_rules_check.main(
+                    ["x", "--check-permission-removals", "SEND_SMS", bad]
+                ),
+                1,
+            )
+        self.assertIn('without tools:node="remove"', buf_err.getvalue())
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            self.assertEqual(backup_rules_check.main(["x", manifest_for_other_mode]), 2)
+        self.assertIn("usage", buf_err.getvalue())
+        # Exactly one command mode at a time.
+        for argv in (
+            "--check-manifest",
+            "--expect-root full-backup-content",
+        ):
+            buf_err = io.StringIO()
+            with contextlib.redirect_stderr(buf_err):
+                self.assertEqual(
+                    backup_rules_check.main(
+                        ["x", *argv.split(), "--check-permission-removals", "SEND_SMS",
+                         manifest_for_other_mode]
+                    ),
+                    2,
+                )
+            self.assertIn(
+                "mutually exclusive", buf_err.getvalue(), argv
+            )
+        # Missing value / duplicate / empty blacklist / require-both alone.
+        for argv, expected in (
+            (["x", "--check-permission-removals"], "requires a"),
+            (
+                ["x", "--check-permission-removals", "SEND_SMS", bad,
+                 "--check-permission-removals", "RECEIVE_SMS"],
+                "duplicate --check-permission-removals",
+            ),
+            (["x", "--check-permission-removals", "", bad], "blacklist is empty"),
+            (["x", "--check-permission-removals", ",,", bad], "blacklist is empty"),
+            (
+                ["x", "--check-permission-removals", "SEND_SMS",
+                 "--require-both", bad],
+                "--require-both requires --check-manifest",
+            ),
+        ):
+            buf_err = io.StringIO()
+            with contextlib.redirect_stderr(buf_err):
+                self.assertEqual(backup_rules_check.main(argv), 2, argv)
+            self.assertIn(expected, buf_err.getvalue(), argv)
+        # The real gate's CSV carries multi-token slices; token = substring
+        # of android:name (the gate passes bare classifier tokens).
+        multi = self._manifest(
+            '    <uses-permission android:name="android.permission.READ_SMS"'
+            ' tools:node="remove" />\n'
+        )
+        path = self._write("multi.xml", multi)
+        self.assertEqual(
+            backup_rules_check.main(
+                ["x", "--check-permission-removals",
+                 "SEND_SMS,RECEIVE_SMS,READ_SMS,BIND_VPN_SERVICE", path]
+            ),
+            0,
+        )
+        # A whitespace CSV must still MATCH: storing the unstripped
+        # " RECEIVE_SMS" used to be a token that is a substring of no
+        # android:name, so an unmarked RECEIVE_SMS element silently
+        # PASSED (fail-open). Strip-before-store makes this same shape
+        # fail closed with the real marker message.
+        path = self._write(
+            "whitespace-csv.xml",
+            self._manifest(
+                '    <uses-permission android:name="android.permission.RECEIVE_SMS" />\n'
+            ),
+        )
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            self.assertEqual(
+                backup_rules_check.main(
+                    ["x", "--check-permission-removals", "SEND_SMS, RECEIVE_SMS", path]
+                ),
+                1,
+            )
+        self.assertIn(
+            "blacklisted permission RECEIVE_SMS", buf_err.getvalue()
+        )
+
+
 class BackupAnchorSync(unittest.TestCase):
     """Pin REQUIRED_EXCLUDES to BackupPolicy.KEY_FILES_EXCLUDED (drift guard).
 
@@ -2744,6 +3671,34 @@ class BackupRulesGateWiring(unittest.TestCase):
     def test_gate_does_not_use_raw_grep_for_excludes(self) -> None:
         text = POLICY_CHECK.read_text(encoding="utf-8")
         self.assertNotRegex(text, r"grep\b[^|\n]*\b-q\b[^|\n]*\bdomain=")
+
+    def test_gate_enforces_play_blacklist_via_structured_scan(self) -> None:
+        # Play permission blacklist: the structured element-aware scan
+        # (validate_permission_removals) replaced the retired per-line
+        # grep -vE filter (a legal multi-line element with tools:node on
+        # its own line false-FAILED it). The marker machinery rides the
+        # same script entry that already validates manifest bindings.
+        text = POLICY_CHECK.read_text(encoding="utf-8")
+        self.assertIn(
+            '--check-permission-removals "$BLACKLIST_PERMS_CSV"', text
+        )
+        # Scoped to the PLAY mode source manifests (main + play flavor),
+        # each guarded for existence.
+        self.assertRegex(
+            text,
+            r'if \[ "\$MODE" = play \]; then\n'
+            r'    for m in "\$ROOT/app/src/main/AndroidManifest\.xml"'
+            r' "\$ROOT/app/src/play/AndroidManifest\.xml"; do\n'
+            r'        \[ -f "\$m" \] \|\| continue\n'
+            r'        python3 "\$SCRIPT_DIR/backup_rules_check\.py" \\',
+        )
+        # The retired enforcer must be gone from EXECUTED script text (the
+        # documentation comment quoting `grep -vE "tools:node=..."` stays as
+        # the design note, but no line-filter pipeline may survive).
+        for line in text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            self.assertNotIn("grep -vE", line, line)
 
 
 class NscCheckValidator(unittest.TestCase):
@@ -3404,20 +4359,36 @@ class NscCheckValidator(unittest.TestCase):
         with contextlib.redirect_stderr(buf_err):
             self.assertEqual(nsc_check.main(["x", "--mode", "debug", bad]), 1)
         self.assertIn("outside the debug loopback allowlist", buf_err.getvalue())
-        for argv in (
-            ["x", bad],  # hint-free NSC path: cannot prove the ruleset
-            ["x", "--mode", "staging", bad],
-            ["x", "--mode", "release", "--mode", "debug", bad],
-            ["x", "--mode"],
-            ["x", "--root", "x", bad],
-            ["x", "--mode", "release", "--check-manifest", good],
-            ["x", "--require-both", good],
-            ["x"],
+        # Per-argv REAL messages: each usage-refusal shape must carry its own
+        # reason (the previous shared tail asserted
+        # `assertIn("usage", buf_err + "usage")`, which is true of EVERY
+        # string and therefore pinned nothing).
+        for argv, expected in (
+            (["x", bad], "usage: nsc_check.py --mode (release|debug)"),
+            (["x", "--mode", "staging", bad], "unknown --mode 'staging'"),
+            (
+                ["x", "--mode", "release", "--mode", "debug", bad],
+                "duplicate --mode",
+            ),
+            (["x", "--mode"], "--mode requires a value (release|debug)"),
+            (["x", "--root", "x", bad], "unknown option --root"),
+            (
+                ["x", "--mode", "release", "--check-manifest", good],
+                "--check-manifest and --mode are mutually exclusive",
+            ),
+            (["x", "--require-both", good], "usage: nsc_check.py --mode (release|debug)"),
+            (
+                # With a mode present the hint-free refusal no longer fires,
+                # so this argv is the one that reaches the flag check.
+                ["x", "--mode", "release", "--require-both", good],
+                "--require-both requires --check-manifest",
+            ),
+            (["x"], "usage: nsc_check.py (--mode (release|debug)"),
         ):
             buf_err = io.StringIO()
             with contextlib.redirect_stderr(buf_err):
                 self.assertEqual(nsc_check.main(argv), 2, argv)
-            self.assertIn("usage", buf_err.getvalue() + "usage")
+            self.assertIn(expected, buf_err.getvalue(), argv)
 
     def test_cli_manifest_mode_exit_codes(self) -> None:
         good = self._write("AndroidManifest.xml", self._manifest(self._NSC_BINDING))
@@ -4032,6 +5003,66 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             proc = self._run_gate(root)
             self.assertEqual(proc.returncode, 1, proc.stderr)
             self.assertIn("outside the debug loopback allowlist", proc.stderr)
+            self.assertNotIn("required Android build-tools", proc.stderr)
+
+    # -- Play permission blacklist (structured, element-aware) --
+
+    def _play_manifest(self, permission_body: str) -> str:
+        # The sandbox main manifest extended with a tools-namespace binding
+        # (the merger-marker machinery needs it) and a permission element.
+        return (
+            '<manifest xmlns:android="http://schemas.android.com/apk/res/android"'
+            ' xmlns:tools="http://schemas.android.com/tools">\n'
+            '    <application android:fullBackupContent="@xml/backup_rules"'
+            ' android:dataExtractionRules="@xml/data_extraction_rules"'
+            ' android:networkSecurityConfig="@xml/network_security_config" />\n'
+            f"{permission_body}"
+            "</manifest>\n"
+        )
+
+    def test_multiline_marked_permission_removal_no_longer_false_fails(self) -> None:
+        # The original false-FAIL repro through the REAL gate: one legal
+        # multi-line element whose android:name and tools:node="remove" sit
+        # on different lines left the name line unfiltered in the old
+        # grep -vE wiring and blacklisted-token-grep then hit it. Source
+        # stage must now pass (later failure may only be the artifact stage).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            (root / "app" / "src" / "main" / "AndroidManifest.xml").write_text(
+                self._play_manifest(
+                    "    <uses-permission\n"
+                    '        android:name="android.permission.SEND_SMS"\n'
+                    '        tools:node="remove" />\n'
+                    '    <uses-permission'
+                    ' android:name="android.permission.INTERNET" />\n'
+                ),
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            fail_lines = "\n".join(
+                line for line in proc.stderr.splitlines() if line.startswith("FAIL:")
+            )
+            self.assertNotIn("SEND_SMS", fail_lines, proc.stderr)
+            self.assertNotIn("blacklisted permission", fail_lines, proc.stderr)
+
+    def test_unmarked_blacklisted_permission_fails_at_source_stage(self) -> None:
+        # The actual danger: a blacklisted permission DECLARED without the
+        # removal marker (the old grep would miss it in a multi-line or
+        # comment shape too). The structured scan fails the gate at the
+        # source stage, before any artifact/message drift.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            (root / "app" / "src" / "main" / "AndroidManifest.xml").write_text(
+                self._play_manifest(
+                    '    <uses-permission'
+                    ' android:name="android.permission.SEND_SMS" />\n'
+                ),
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn('without tools:node="remove"', proc.stderr)
+            self.assertIn("SEND_SMS", proc.stderr)
             self.assertNotIn("required Android build-tools", proc.stderr)
 
 

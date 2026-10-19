@@ -5684,14 +5684,16 @@ class TurnController(
     val contMessages = loop.continuationMessages(calls, results)
     // Keep tool-call/tool-result pairing atomic: trim only the history prefix
     // when the structured round pushes the request over MAX_REQUEST_CHARS.
-    // Payload accounting includes the structured assistant toolCalls
-    // (id/name/args echo — the echo can reach MAX_INPUT_CHARS) and the
-    // tool-result `ChatMessage.toolCallId` (maintainer P2: every adapter
-    // serializes it on the wire): a text-only
-    // sum under-counts everything that actually serializes into the
-    // outgoing request.
+    // Payload accounting is the conservative full-request estimate
+    // (`requestWireEstimate`: per-message terms for the base AND the
+    // structured round, plus the request envelope once) and includes the
+    // structured assistant toolCalls (id/name/args echo — the echo can reach
+    // MAX_INPUT_CHARS) and the tool-result `ChatMessage.toolCallId` (every
+    // adapter serializes it on the wire), with JSON-escaping expansion
+    // over-counted: a text-only sum under-counts everything that actually
+    // serializes into the outgoing request (quote-dense text can triple).
     val baseMessages = base.messages.toMutableList()
-    var totalChars = baseMessages.sumOf { it.wirePayloadChars() } + contMessages.sumOf { it.wirePayloadChars() }
+    var totalChars = requestWireEstimate(baseMessages + contMessages)
     var drop = 0
     while (drop < baseMessages.size - 1 && totalChars > MAX_REQUEST_CHARS) {
       totalChars -= baseMessages[drop].wirePayloadChars()
@@ -6049,37 +6051,130 @@ class TurnController(
 }
 
 /**
+ * Conservative per-message structural allowance for [ChatMessage.wirePayloadChars]:
+ * role/content/tool-call wrapper keys and separators all three adapters emit
+ * per message, measured against `ResponsesProvider`, `AnthropicProvider` and
+ * `ChatCompletionsProvider` with margin (worst measured single-message wrapper
+ * is ~80 chars: the Anthropic tool-result frame; the assistant tool-call
+ * message lands near 52). Over-estimating by design: the estimate must
+ * never under-count a serialization that actually ships.
+ */
+internal const val MESSAGE_WRAPPER_CHARS = 128
+
+/**
+ * Conservative per-tool-call structural allowance for
+ * [ChatMessage.wirePayloadChars]: `id`/`type`/`function.name`/`arguments`
+ * (Chat), `call_id`/`name`/`arguments` (Responses) and `id`/`name`/`input`
+ * (Anthropic) wrapper keys and braces. Worst measured wrapper is the Chat
+ * Completions `tool_calls[]` element at 67 chars (`arguments:"{}"` with empty
+ * ids); 96 leaves margin for adapter drift.
+ */
+internal const val TOOL_CALL_WRAPPER_CHARS = 96
+
+/**
+ * Conservative per-request envelope allowance for [requestWireEstimate]:
+ * `model`, stream flags and the `messages`/`input` array scaffolding of one
+ * outgoing request (Chat ~41, Responses ~52, Anthropic ~58 measured, plus the
+ * model value and header separators). Counted ONCE per request, never per
+ * side of a merged message list. Tool arrays are empty on continuation
+ * requests by construction (no `allowTools`), and production never sets
+ * `systemPromptOverride`, so those bytes are outside the continuation budget.
+ */
+internal const val REQUEST_ENVELOPE_CHARS = 160
+
+/**
+ * Conservative over-count (in UTF-16 units) of the JSON-encoded string
+ * content the three adapters emit for one raw Kotlin string — the shared
+ * escaping term of [ChatMessage.wirePayloadChars].
+ *
+ * Covers every escaper the adapters use: `jsonEscape`/`q`
+ * (`ProviderTransport.kt`, Responses/Chat/Anthropic `buildBody`) and the
+ * kotlinx `JsonPrimitive` path behind `buildJsonObject`
+ * (`ProviderJson.kt` tool fragments). Per code unit:
+ * - `"` and `\` -> 2 (`\"` / `\\`),
+ * - `\b`, `\f`, `\n`, `\r`, `\t` -> 2 (`\b` / `\f` / …),
+ * - any other U+0000-U+001F -> 6 (`\u00XX`),
+ * - valid surrogate pair -> 2 (both escapers keep the pair raw),
+ * - lone surrogate -> 6 (the `\uXXXX` cost, so the estimate stays an
+ *   over-count even if an escaper starts escaping unpaired surrogates),
+ * - everything else -> 1.
+ *
+ * O(n) single pass by index, no allocation. `internal` visibility so
+ * same-module tests can pin the estimate against the REAL escapers instead
+ * of a re-derived formula.
+ */
+internal fun jsonEscapedChars(s: String): Int {
+  var total = 0
+  var i = 0
+  while (i < s.length) {
+    val c = s[i]
+    when {
+      c == '"' || c == '\\' -> { total += 2; i++ }
+      c == '\b' || c == '\u000C' || c == '\n' || c == '\r' || c == '\t' -> { total += 2; i++ }
+      c < ' ' -> { total += 6; i++ }
+      Character.isHighSurrogate(c) ->
+        if (i + 1 < s.length && Character.isLowSurrogate(s[i + 1])) {
+          total += 2; i += 2
+        } else {
+          total += 6; i++
+        }
+      Character.isLowSurrogate(c) -> { total += 6; i++ }
+      else -> { total += 1; i++ }
+    }
+  }
+  return total
+}
+
+/**
  * Serialized-size estimate of one [ChatMessage] on the outgoing request —
  * the SINGLE SOURCE OF TRUTH for the continuation budget accounting
  * (`buildToolContinuation`'s trim + fail-close sums it; the
  * TurnControllerToolSliceTest pins call this same function, so production
  * arithmetic and test arithmetic cannot drift).
  *
- * Counts everything that actually serializes into the request for one
+ * Counts a CONSERVATIVE over-count of everything that serializes for one
  * message: [ChatMessage.text], the tool-result `ChatMessage.toolCallId`
- * (maintainer P2: every adapter serializes this field on the wire —
- * `tool_call_id` / `function_call_output.call_id` / `tool_result.tool_use_id`
- * — so role="tool" rows count it alongside the text; its echo is capped at
- * SafeToolSlice.MAX_STRING_CHARS per row), plus every structured assistant
- * `toolCalls` payload field (id/name/argumentsJson — the args echo is
- * bounded by SafeToolSlice.MAX_INPUT_CHARS). The estimate is a raw
- * String.length basis — the same measurement basis as buildRequest's own
- * (text-only) accounting. JSON-escaping expansion and adapter wrapper keys
- * are NOT counted (deliberately never over-counts), so the fail-close can
- * only fire for a request that is already over cap on the strict measure.
- * Image carve-out (aligned with MAX_REQUEST_CHARS's boundary invariant):
- * this is a TEXT-basis estimate — image payload bytes ride OUTSIDE the
- * accounting (never counted in `text.length`; ImageFallbackPolicy governs
- * them separately), so the tool continuation budget also stays text-basis.
+ * (all three adapters serialize it on the wire — `tool_call_id` /
+ * `function_call_output.call_id` / `tool_result.tool_use_id` — so role="tool"
+ * rows count its escaped form alongside the text), every structured assistant
+ * `toolCalls` field (id/name/argumentsJson), plus per-message and per-tool-call
+ * structural wrapper allowances ([MESSAGE_WRAPPER_CHARS] /
+ * [TOOL_CALL_WRAPPER_CHARS]) measured across the three adapters.
+ *
+ * Fail-close invariant: every term is an over-count of the corresponding
+ * serialized bytes (string escaping via [jsonEscapedChars], wrappers with
+ * margin), so if a cap check against [TurnController.MAX_REQUEST_CHARS]
+ * passes, the serialized request's text/tool JSON is ≤ the cap — never the
+ * old raw-`String.length` under-count (`q` escaping alone can triple
+ * quote-dense text). Image carve-out (aligned with MAX_REQUEST_CHARS's
+ * boundary invariant): this stays a TEXT-basis estimate — image payload
+ * bytes ride OUTSIDE the accounting (never counted in `text.length`;
+ * ImageFallbackPolicy governs them separately).
  *
  * `internal` visibility is deliberate: same-module unit tests must reach the
  * exact production formula directly (no reflection pin needed); keep the
  * per-message arithmetic in sync ONLY through this function.
  */
 internal fun ChatMessage.wirePayloadChars(): Int =
-  text.length +
-    (toolCallId?.length ?: 0) +
-    toolCalls.sumOf { it.id.length + it.name.length + it.argumentsJson.length }
+  MESSAGE_WRAPPER_CHARS +
+    jsonEscapedChars(text) +
+    (toolCallId?.let { jsonEscapedChars(it) } ?: 0) +
+    toolCalls.sumOf { tc ->
+      TOOL_CALL_WRAPPER_CHARS +
+        jsonEscapedChars(tc.id) +
+        jsonEscapedChars(tc.name) +
+        jsonEscapedChars(tc.argumentsJson)
+    }
+
+/**
+ * Serialized-size estimate of a whole outgoing request: per-message estimates
+ * ([wirePayloadChars]) plus the one-per-request [REQUEST_ENVELOPE_CHARS]
+ * envelope. The envelope is counted exactly once, so trimming per-message
+ * terms (as `buildToolContinuation` does) keeps the total consistent with the
+ * request that ships.
+ */
+internal fun requestWireEstimate(messages: List<ChatMessage>): Int =
+  messages.sumOf { it.wirePayloadChars() } + REQUEST_ENVELOPE_CHARS
 
 /**
  * Pure fallback detector for the warn path: true only when a non-blank

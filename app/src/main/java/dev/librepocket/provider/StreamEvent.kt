@@ -157,7 +157,13 @@ internal fun requireTotalToolAggBudget(totalChars: Int, incomingChars: Int) =
  * - Responses `emittedToolIds`: one entry per distinct (`toolIndex`, id)
  *   pair already emitted (its `output_item.done` path is pre-checked here;
  *   the `finishPendingTools` drain adds at most one pair per already-capped
- *   `callsByItem` entry, so the set stays within 2x the cap).
+ *   `callsByItem` entry, so the set stays within 2x the cap);
+ * - Responses `streamedTextByBlock`: one entry per distinct streamed
+ *   `output_text` block key; Responses `webSearchStates`: one entry per
+ *   distinct web-search item key; the two mixed-identity correlation maps
+ *   (`toolKeyByOutputIndex`, `textKeyByOutputIndex`) register at most one
+ *   entry per admitted key/index and are likewise capped (best-effort
+ *   registration is skipped at the cap).
  * Admissions are checked BEFORE insert, so the overflowing entry is never
  * buffered; a key that only replaces a known one is not re-billed.
  *
@@ -188,23 +194,28 @@ internal fun requireToolCountBudget(distinctCount: Int) {
 }
 
 /**
- * Per-key length cap (chars) for Responses String-keyed tool collections:
- * each `item_id` map key and each emitted `(toolIndex, id)` pair id may
- * hold at most this many chars.
+ * Per-key length cap (chars) for every Responses String-keyed producer
+ * collection: `callsByItem` item ids, emitted `(toolIndex, id)` pair ids,
+ * streamed-text block keys (`id:<item_id>#<content_index>`), and web-search
+ * item keys. Each single key may hold at most this many chars.
  *
  * 4096 rationale: legitimate fixture ids are all < 20 chars, so 4096 leaves
  * ~200x headroom for real provider ids while bounding retention.
  * Per collection: at most 64 admissions x 4096 chars = 262144 chars
- * (256 Ki chars) of key retention. The two Responses keyed collections
- * (`callsByItem` keys + `emittedToolIds` pair ids — the latter up to 2x the
- * admission cap, because the `output_item.done` pre-check and the
- * `finishPendingTools` drain can each admit one pair per item) merge to at
- * most 786432 chars worst-case (262144 + 524288 = 786432 = 192 x 4096), still ~24x
+ * (256 Ki chars) of key retention. The four Responses keyed collections
+ * (`callsByItem` keys, `emittedToolIds` pair ids — up to 2x the admission cap
+ * because the `output_item.done` pre-check and the `finishPendingTools` drain
+ * can each admit one pair per item — `streamedTextByBlock` block keys, and
+ * `webSearchStates` item keys) merge to at most 1310720 chars worst-case
+ * (262144 + 524288 + 262144 + 262144 = 1310720 = 320 x 4096), still ~15x
  * below the pre-fix 19.2M hostile shape (64 x 300KB) and bounded where the
- * pre-fix retention was unbounded. Synthetic fallbacks (`"item_"` / `"call_"`
- * + 8 random chars, 13 chars) are far below it and unaffected; empty strings
- * keep their current quota behavior (still admitted, still billed — not
- * separately repaired here).
+ * pre-fix retention was unbounded. The mixed-identity correlation maps
+ * (`toolKeyByOutputIndex`, `textKeyByOutputIndex`) store references to
+ * already-gated keys only (plus short synthetic/positional keys), so they add
+ * no new horizontal retention. Synthetic fallbacks (`"call_"` + 8 random
+ * chars, 13 chars) are far below it and unaffected; empty strings are
+ * "absent" identities (never a shared "" bucket) since the P2 identity
+ * hardening.
  *
  * Orthogonal dual guard with [requireToolCountBudget]: the count cap bounds
  * HOW MANY keys are admitted, this cap bounds HOW LONG each single key may

@@ -220,34 +220,36 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
     private var usage: StreamEvent.Usage? = null
     private var sawDone = false
     private var failed: StreamEvent.Failed? = null
-    // Sticky JSON-depth breach latch (fail-closed): once a frame exceeds
-    // MiniJson.MAX_DEPTH, mapPayload throws typed non-retryable and every
-    // later mapPayload rethrows the same way, so no finish_reason + [DONE]
-    // pair can become Done; finish() reports the typed failure instead of
-    // SSE_TRUNCATED. Set only from the MiniJsonDepthException branch below.
-    private var jsonDepthFailed = false
+    // Sticky fatal-parser-breach latch (fail-closed): once a frame exceeds
+    // MiniJson.MAX_DEPTH or MiniJson.MAX_NODES, mapPayload throws typed
+    // non-retryable and every later mapPayload rethrows the same way, so no
+    // finish_reason + [DONE] pair can become Done; finish() reports the typed
+    // failure instead of SSE_TRUNCATED. Set only from the
+    // MiniJsonFatalException branch below.
+    private var jsonFatalFailed = false
 
     fun markDone() {
         sawDone = true
     }
 
     fun mapPayload(payload: String): List<StreamEvent> {
-        if (jsonDepthFailed) throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
+        if (jsonFatalFailed) throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
         if (failed != null) return emptyList()
         val root = try {
             MiniJson.parse(payload) as? MiniJson.JObj ?: return emptyList()
         } catch (e: MiniJson.MiniJsonException) {
-            if (e is MiniJson.MiniJsonDepthException) {
-                // A depth breach is NOT a droppable malformed frame: dropping
-                // it would lose its delta and let a later finish_reason +
-                // [DONE] succeed without it (fake success), or degrade at EOF
-                // to a retryable SSE_TRUNCATED that retries the poisoned
-                // stream. Fail the attempt with the same typed non-retryable
-                // failure as every aggregation-budget overflow; streamingFlow
-                // converts the throw into a single Failed terminal. Other
-                // malformed input still drops just this frame below
-                // (sniffing rule §3.4: not our shape, ignore).
-                jsonDepthFailed = true
+            if (e is MiniJson.MiniJsonFatalException) {
+                // A fatal parser breach (depth or node-count ceiling) is NOT a
+                // droppable malformed frame: dropping it would lose its delta
+                // and let a later finish_reason + [DONE] succeed without it
+                // (fake success), or degrade at EOF to a retryable
+                // SSE_TRUNCATED that retries the poisoned stream. Fail the
+                // attempt with the same typed non-retryable failure as every
+                // aggregation-budget overflow; streamingFlow converts the
+                // throw into a single Failed terminal. Other malformed input
+                // still drops just this frame below (sniffing rule §3.4: not
+                // our shape, ignore).
+                jsonFatalFailed = true
                 throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
             }
             return emptyList() // sniffing rule §3.4: not our shape, ignore
@@ -317,12 +319,13 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
 
     /** Terminal projection: ToolDones -> Usage? -> Done, else Failed(retryable). */
     fun finish(): List<StreamEvent> {
-        // A latched depth breach dominates the honest-EOF path: the poisoned
-        // attempt reports the typed non-retryable failure, never a retryable
-        // SSE_TRUNCATED (which would retry the poisoned stream) and never a
-        // success. Carries the AGG_TOO_LARGE code so TurnController's
-        // pending-flush guard treats it like every other budget overflow.
-        if (jsonDepthFailed) {
+        // A latched fatal parser breach (depth or node count) dominates the
+        // honest-EOF path: the poisoned attempt reports the typed
+        // non-retryable failure, never a retryable SSE_TRUNCATED (which would
+        // retry the poisoned stream) and never a success. Carries the
+        // AGG_TOO_LARGE code so TurnController's pending-flush guard treats it
+        // like every other budget overflow.
+        if (jsonFatalFailed) {
             return listOf(
                 StreamEvent.Failed(
                     TOOL_ARGS_TOO_LARGE,

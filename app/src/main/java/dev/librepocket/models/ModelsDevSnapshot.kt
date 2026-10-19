@@ -30,6 +30,21 @@ object ModelsDevSnapshot {
     const val MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
     const val CACHE_TTL_MS = 24L * 60 * 60 * 1000
 
+    /**
+     * Node ceiling for [parse], passed explicitly to `MiniJson.parse`.
+     *
+     * Unlike hostile SSE frames (bounded per-frame, see `MiniJson.MAX_NODES`),
+     * the snapshot is a legitimate, byte-bounded document the user opted into:
+     * [fetchSnapshotOutcome] rejects bodies over [MAX_SNAPSHOT_BYTES] (4 MiB)
+     * before parsing, and `fetchSnapshot` callers pass a size-checked body.
+     * The densest legal node shape is a flat array/object at ~2 bytes per node
+     * (`[0,0,…]`), so a full 4 MiB snapshot cannot exceed 4 MiB / 2 =
+     * 2,097,152 nodes; the ceiling equals that worst case, so a legitimate
+     * snapshot never regresses while the parse still fails typed
+     * ([MiniJson.MiniJsonNodeLimitException]) far below unbounded allocation.
+     */
+    const val MODELS_DEV_MAX_NODES = 2_097_152
+
     data class ModelEntry(
         val providerId: String?,
         val wireId: String,
@@ -97,7 +112,7 @@ object ModelsDevSnapshot {
      */
     fun parse(body: String, nowMs: Long = System.currentTimeMillis()): Snapshot {
         val root = try {
-            MiniJson.parse(body)
+            MiniJson.parse(body, maxNodes = MODELS_DEV_MAX_NODES)
         } catch (e: MiniJson.MiniJsonException) {
             throw SnapshotException("MODELS_SNAPSHOT_PARSE", e)
         }

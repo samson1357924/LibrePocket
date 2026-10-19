@@ -5,7 +5,9 @@ import dev.librepocket.policy.PolicyRule
 import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.ChatRequest
+import dev.librepocket.provider.ChatCompletionsProvider
 import dev.librepocket.provider.LlmProvider
+import dev.librepocket.provider.ProviderConfig
 import dev.librepocket.provider.ProviderProtocol as ProviderProto
 import dev.librepocket.provider.ServerToolTranscript
 import dev.librepocket.provider.StreamEvent
@@ -1338,6 +1340,118 @@ class TurnControllerToolSliceTest {
         )
     }
 
+    @Test fun continuationAccountingEscapingAwareFailsClosedOnQuoteDenseResult() = runBlocking {
+        // Phase 2B boundary pin: a quote-dense tool result whose ESCAPED wire
+        // cost (every `"`/`\` doubles when the result JSON is embedded as a
+        // JSON string) far exceeds its raw text length. The escape-blind raw
+        // accounting (text + toolCallId + id/name/args lengths — the pre-fix
+        // basis) fits MAX_REQUEST_CHARS and would ship the request; the
+        // conservative escape-aware accounting (`requestWireEstimate`)
+        // breaches the cap and the untrimmable minimum fails closed, so the
+        // provider never sees an over-cap serialized request.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val fatBackend = FatBackend(
+            (1..12).map {
+                LspTools.Symbol(
+                    "\"".repeat(SafeToolSlice.MAX_STRING_CHARS),
+                    "function",
+                    "p".repeat(SafeToolSlice.MAX_STRING_CHARS),
+                    it,
+                )
+            },
+        )
+        val pol = slicePolicy()
+        val toolLoop = loop(pol, fatBackend)
+        val c = controller(provider, pol, sink, toolLoop)
+        // Calibrated (fixed clock, deterministic slice result): raw
+        // counterfactual ≈ 97k ≤ cap, escape-aware estimate ≈ 110k > cap.
+        val history = "a".repeat(78_000)
+        provider.handler = { _ ->
+            flow {
+                emit(
+                    StreamEvent.ToolDone(
+                        toolIndex = 0,
+                        id = "call-a",
+                        name = "lsp.symbols",
+                        argumentsJson = """{"query":"A"}""",
+                    ),
+                )
+                emit(StreamEvent.Done("tool_calls"))
+            }
+        }
+        c.send(history)
+
+        // (1) Fail closed: the over-cap continuation never reached the wire.
+        assertEquals("the over-cap continuation must never be sent", 1, provider.seenRequests.size)
+        assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+        assertTrue(c.uiState.value.error.orEmpty().contains("over budget"))
+        assertTrue(sink.succeeded.isEmpty())
+        assertEquals(1, fatBackend.invocations.get())
+
+        // (2) The attempt request that DID ship serializes within the cap.
+        val attempt = provider.seenRequests.single()
+        val attemptBody = ChatCompletionsProvider(
+            ProviderConfig(
+                id = "00000000-0000-0000-0000-00000000aa01",
+                label = "test",
+                baseUrl = "https://api.example.com/v1",
+                protocol = ProviderProto.CHAT_COMPLETIONS,
+                apiKeyRef = "provider_key/00000000-0000-0000-0000-00000000aa01",
+            ),
+            { null },
+        ).buildBody(attempt)
+        assertTrue(
+            "the shipped attempt body must stay within the cap: ${attemptBody.length}",
+            attemptBody.length <= TurnController.MAX_REQUEST_CHARS,
+        )
+
+        // (3) Rebuild the exact would-be continuation (observed base request
+        // + structured round through the PRODUCTION builder) and compare the
+        // escape-blind raw basis against the escape-aware estimate.
+        assertEquals(1, sink.failedRecords.size)
+        val failedRecord = sink.failedRecords.single()
+        assertTrue(failedRecord.isFinal)
+        val markerLens = Regex("""\[tool-result:lsp\.symbols:(\d{1,8}):""")
+            .findAll(failedRecord.partialText)
+            .map { m ->
+                val len = m.groupValues[1].toInt()
+                // Length-prefixed framing asserts itself: the sliced JSON is
+                // closed by a `]` exactly <len> UTF-16 units after `<len>:`.
+                assertEquals(']', failedRecord.partialText[m.range.last + 1 + len])
+                failedRecord.partialText.substring(m.range.last + 1, m.range.last + 1 + len)
+            }
+            .toList()
+        assertEquals(1, markerLens.size)
+        val wireCalls = sink.tools.map { dev.librepocket.provider.ToolCall(it.id, it.name, it.args) }
+        assertEquals(1, wireCalls.size)
+        val wireResults = listOf(
+            SafeToolSlice.ToolResult(
+                callId = wireCalls.single().id,
+                name = "lsp.symbols",
+                resultJson = markerLens.single(),
+            ),
+        )
+        val wouldBe = attempt.messages + toolLoop.continuationMessages(wireCalls, wireResults)
+        val rawBasis = wouldBe.sumOf { m ->
+            m.text.length + (m.toolCallId?.length ?: 0) +
+                m.toolCalls.sumOf { t -> t.id.length + t.name.length + t.argumentsJson.length }
+        }
+        val estimate = requestWireEstimate(wouldBe)
+        assertTrue(
+            "raw-basis accounting must fit the cap (escape-blind would ship): $rawBasis",
+            rawBasis <= TurnController.MAX_REQUEST_CHARS,
+        )
+        assertTrue(
+            "escape-aware estimate must breach the cap: $estimate",
+            estimate > TurnController.MAX_REQUEST_CHARS,
+        )
+        assertTrue(
+            "escaping expansion must be the decisive surplus: raw=$rawBasis estimate=$estimate",
+            estimate - rawBasis > 10_000,
+        )
+    }
+
     @Test fun cancelDuringContinuationKeepsSingleExecution() = runBlocking {
         val provider = SliceProvider()
         val sink = SliceSink()
@@ -1702,6 +1816,43 @@ class TurnControllerToolSliceTest {
         assertEquals(listOf("call-a"), sink.tools.map { it.id })
         assertEquals(ChatStatus.ERROR, c.uiState.value.status)
         assertTrue(sink.succeeded.isEmpty())
+    }
+
+    @Test fun outputMismatchTerminalSkipsSliceExecutionAndIsNotRetried() = runBlocking {
+        // P1-1 deterministic stream-contract failure: the mapper's
+        // RESPONSES_OUTPUT_MISMATCH terminal is non-retryable, so the turn
+        // must end after ONE request and the recorded tool call must never
+        // reach the executor (execution is gated on a Done terminal).
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        provider.handler = {
+            flow {
+                emit(
+                    StreamEvent.ToolDone(
+                        toolIndex = 0,
+                        id = "call-m",
+                        name = "lsp.symbols",
+                        argumentsJson = """{"query":"M"}""",
+                    ),
+                )
+                emit(StreamEvent.Failed("RESPONSES_OUTPUT_MISMATCH", retryable = false))
+            }
+        }
+        c.send("查 M")
+
+        assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+        assertEquals("RESPONSES_OUTPUT_MISMATCH", c.uiState.value.error.orEmpty())
+        assertEquals("mismatch terminal must skip execution", 0, backend.invocations.get())
+        assertEquals("non-retryable: exactly one request", 1, provider.seenRequests.size)
+        assertTrue(sink.succeeded.isEmpty())
+        assertEquals(1, sink.failedRecords.size)
+        val failed = sink.failedRecords.single()
+        assertTrue(failed.isFinal)
+        assertEquals("RESPONSES_OUTPUT_MISMATCH", failed.error)
+        assertFalse("the pending call must not be recorded as executed", failed.partialText.contains("[tool-result:"))
     }
 
     @Test fun cancelBeforeExecutionHasZeroSideEffects() = runBlocking {

@@ -24,6 +24,12 @@ import okhttp3.OkHttpClient
  *   (`THINKING_ROUND_TRIP_NOT_SUPPORTED`, checked first in `buildBody`).
  * - Missing `message_stop` or unclosed visible/tool blocks ->
  *   `Failed(retryable=true)`.
+ * - Block-protocol breaches (P1-3) latch: a delta/stop for an unknown
+ *   `index`, a delta for an already-closed block, or a `tool_use` stop
+ *   reason without any tool block fails the attempt retryable at
+ *   `message_stop` instead of dropping frames and fabricating a success.
+ *   A duplicate `content_block_stop` is idempotent (no second
+ *   [StreamEvent.ToolDone], no second synthetic id).
  */
 class AnthropicProvider(
     private val config: ProviderConfig,
@@ -200,31 +206,39 @@ internal class AnthropicMapper(val round: Int = 0) {
     private var outputTokens: Int? = null
     private var stopReason: String? = null
     private var terminal: StreamEvent? = null
-    // Sticky JSON-depth breach latch (fail-closed): once a frame exceeds
-    // MiniJson.MAX_DEPTH, mapPayload throws typed non-retryable and every
-    // later mapPayload rethrows the same way, so message_stop can never
-    // become Done; finish() reports the typed failure instead of
-    // SSE_TRUNCATED. Set only from the MiniJsonDepthException branch below.
-    private var jsonDepthFailed = false
+    // Sticky fatal-parser-breach latch (fail-closed): once a frame exceeds
+    // MiniJson.MAX_DEPTH or MiniJson.MAX_NODES, mapPayload throws typed
+    // non-retryable and every later mapPayload rethrows the same way, so
+    // message_stop can never become Done; finish() reports the typed failure
+    // instead of SSE_TRUNCATED. Set only from the MiniJsonFatalException
+    // branch below.
+    private var jsonFatalFailed = false
+    // Sticky block-protocol breach latch (P1-3): a delta for an unknown or
+    // already-closed block, or a stop for an unknown block, proves the
+    // stream is out of contract. Dropping such a frame silently would let
+    // message_stop fabricate a Done without it; instead the breach is
+    // remembered and message_stop reports the retryable SSE_TRUNCATED.
+    private var blockProtocolInconsistent = false
     var terminalReached: Boolean = false
         private set
 
     fun mapPayload(payload: String): List<StreamEvent> {
-        if (jsonDepthFailed) throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
+        if (jsonFatalFailed) throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
         if (terminal != null) return emptyList()
         val root = try {
             MiniJson.parse(payload) as? MiniJson.JObj ?: return emptyList()
         } catch (e: MiniJson.MiniJsonException) {
-            if (e is MiniJson.MiniJsonDepthException) {
-                // A depth breach is NOT a droppable malformed frame: dropping
-                // it would lose its delta and let message_stop succeed without
-                // it (fake success), or degrade at EOF to a retryable
-                // SSE_TRUNCATED that retries the poisoned stream. Fail the
-                // attempt with the same typed non-retryable failure as every
-                // aggregation-budget overflow; streamingFlow converts the throw
-                // into a single Failed terminal. Other malformed input still
-                // drops just this frame below.
-                jsonDepthFailed = true
+            if (e is MiniJson.MiniJsonFatalException) {
+                // A fatal parser breach (depth or node-count ceiling) is NOT a
+                // droppable malformed frame: dropping it would lose its delta
+                // and let message_stop succeed without it (fake success), or
+                // degrade at EOF to a retryable SSE_TRUNCATED that retries the
+                // poisoned stream. Fail the attempt with the same typed
+                // non-retryable failure as every aggregation-budget overflow;
+                // streamingFlow converts the throw into a single Failed
+                // terminal. Other malformed input still drops just this frame
+                // below.
+                jsonFatalFailed = true
                 throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
             }
             return emptyList()
@@ -305,7 +319,16 @@ internal class AnthropicMapper(val round: Int = 0) {
             }
             "content_block_delta" -> {
                 val index = root.int("index") ?: return emptyList()
-                val block = blocks[index] ?: return emptyList()
+                // P1-3: an unknown index (never started, or dropped by the
+                // admission cap) or a delta for an already-closed block is a
+                // protocol breach, not a droppable extra: latch it so
+                // message_stop fails retryable instead of folding the loss
+                // into a success.
+                val block = blocks[index]
+                if (block == null || block.closed) {
+                    blockProtocolInconsistent = true
+                    return emptyList()
+                }
                 val delta = root.obj("delta") ?: return emptyList()
                 when (delta.string("type")) {
                     "text_delta" -> {
@@ -340,7 +363,19 @@ internal class AnthropicMapper(val round: Int = 0) {
             }
             "content_block_stop" -> {
                 val index = root.int("index") ?: return emptyList()
-                val block = blocks[index] ?: return emptyList()
+                // P1-3: a stop for an unknown index is the same protocol
+                // breach as an unknown delta — latch, message_stop decides.
+                val block = blocks[index]
+                if (block == null) {
+                    blockProtocolInconsistent = true
+                    return emptyList()
+                }
+                // P1-3: a duplicate stop for an already-closed block is
+                // idempotent and emits nothing (no second ToolDone, no second
+                // synthetic id). It is NOT a breach: providers legitimately
+                // repeat a terminal frame, and the first stop already
+                // delivered the authoritative projection.
+                if (block.closed) return emptyList()
                 block.closed = true
                 if (block.kind == BlockKind.TOOL) {
                     // Blank-id repair at the terminal (parity with
@@ -365,6 +400,12 @@ internal class AnthropicMapper(val round: Int = 0) {
                         totalAggChars += syntheticId.length
                         syntheticId
                     }
+                    // P1-3: write the chosen id back BEFORE emit so a later
+                    // replay (duplicate stop / same-index restart) sees the
+                    // same id and the synthetic growth is billed exactly once
+                    // (a TOOL->TOOL restart retires it with the rest of the
+                    // block's chars instead of under-retiring an empty id).
+                    block.toolId = doneId
                     out.add(StreamEvent.ToolDone(index, doneId, block.toolName, block.args.toString()))
                 }
             }
@@ -376,8 +417,15 @@ internal class AnthropicMapper(val round: Int = 0) {
                 }
             }
             "message_stop" -> {
+                // P1-3: a stop with any visible/tool block still open, no
+                // stop_reason, a latched block-protocol breach, or a
+                // `tool_use` reason without a single TOOL-kind block is a
+                // truncated/inconsistent stream: fail retryable rather than
+                // manufacture Done. Duplicate message_stop stays a no-op via
+                // the terminal early-return at the top of mapPayload.
                 val open = blocks.values.any { !it.closed && (it.kind == BlockKind.TEXT || it.kind == BlockKind.TOOL) }
-                if (open || stopReason == null) {
+                val toolUseWithoutBlock = stopReason == "tool_use" && toolBlockCount == 0
+                if (open || stopReason == null || blockProtocolInconsistent || toolUseWithoutBlock) {
                     terminal = StreamEvent.Failed("SSE_TRUNCATED", retryable = true)
                 } else {
                     terminal = StreamEvent.Done(stopReason!!)
@@ -387,10 +435,21 @@ internal class AnthropicMapper(val round: Int = 0) {
             }
             "ping" -> Unit
             "message_error", "error" -> {
-                val msg = root.obj("error")?.string("message")
+                val err = root.obj("error")
+                val msg = err?.string("message")
                     ?: root.obj("message")?.string("text")
                     ?: "ANTHROPIC_ERROR"
-                val kind = ProviderErrorClassifier.classify(null, null, msg)
+                // P1-4: structured Anthropic error types (overloaded_error,
+                // invalid_request_error, authentication_error, ...) reach the
+                // classifier alongside the message so retryability does not
+                // depend on the message wording. Redaction stays unchanged.
+                val kind = ProviderErrorClassifier.classify(
+                    null,
+                    null,
+                    msg,
+                    structuredCode = err?.string("code"),
+                    structuredType = err?.string("type"),
+                )
                 terminal = StreamEvent.Failed(redactedError("ANTHROPIC_ERROR", msg), kind == FailureKind.RETRYABLE)
                 out.add(terminal!!)
                 terminalReached = true
@@ -400,12 +459,13 @@ internal class AnthropicMapper(val round: Int = 0) {
     }
 
     fun finish(): List<StreamEvent> {
-        // A latched depth breach dominates the honest-EOF path: the poisoned
-        // attempt reports the typed non-retryable failure, never a retryable
-        // SSE_TRUNCATED (which would retry the poisoned stream) and never a
-        // success. Carries the AGG_TOO_LARGE code so TurnController's
-        // pending-flush guard treats it like every other budget overflow.
-        if (jsonDepthFailed) {
+        // A latched fatal parser breach (depth or node count) dominates the
+        // honest-EOF path: the poisoned attempt reports the typed
+        // non-retryable failure, never a retryable SSE_TRUNCATED (which would
+        // retry the poisoned stream) and never a success. Carries the
+        // AGG_TOO_LARGE code so TurnController's pending-flush guard treats it
+        // like every other budget overflow.
+        if (jsonFatalFailed) {
             return listOf(
                 StreamEvent.Failed(
                     TOOL_ARGS_TOO_LARGE,

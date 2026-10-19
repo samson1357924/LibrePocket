@@ -461,14 +461,75 @@ class IntentTypedD2Test {
   @Test fun launchApp_single_noHandlerAndInternal_codes() {
     val singleEnv = SystemEnv(installedPackages = setOf("com.google.android.apps.maps"))
     val noHandler = IntentLauncher { LaunchResult.NoHandler }
+    // F4b：Single→launcher NoHandler 與 Alarm/Calendar/Music/Navigation 同形——
+    // usedFallback=true + [fallback] 完整三段話術（嘗試過的 spec 保留），不再用
+    // generic toToolResult 的兩段話術；三段模板特徵句逐段鎖定。
     val r1 = LaunchAppTool.execute(LaunchAppTool.Params("com.google.android.apps.maps"), singleEnv, noHandler)
     assertFalse(r1.ok)
-    assertFalse(r1.usedFallback)
+    assertTrue(r1.usedFallback)
     assertEquals(ReasonCodes.NO_HANDLER, r1.reasonCode)
+    assertEquals(
+      "com.google.android.apps.maps", r1.spec?.targetPackage,
+    )
+    assertEquals(
+      LaunchAppTool.fallback(LaunchAppTool.Params("com.google.android.apps.maps"), singleEnv).userMessage,
+      r1.message,
+    )
+    assertTrue(
+      r1.message,
+      r1.message.startsWith("做不到開啟「com.google.android.apps.maps」（${ReasonCodes.NO_HANDLER}）"),
+    )
+    assertTrue(r1.message, "→ 可替代手動從桌面開啟" in r1.message)
+    assertTrue(r1.message, "→ 需要你確認 App 名稱" in r1.message)
     val internal = IntentLauncher { LaunchResult.Internal(RuntimeException("boom")) }
     val r2 = LaunchAppTool.execute(LaunchAppTool.Params("com.google.android.apps.maps"), singleEnv, internal)
     assertFalse(r2.ok)
+    assertFalse(r2.usedFallback)
     assertEquals(ReasonCodes.INTERNAL, r2.reasonCode)
+  }
+
+  @Test fun launchApp_blankQuery_needsClarification_bothEnvironments() {
+    // F4a：空白 query 是意圖缺席（與 Music/Navigation 空白目標同契約）——
+    // NEED_CLARIFICATION 而非 Unknown 的「做不到開啟「」」NO_HANDLER 話術，
+    // 話術與 fallback 空白分支同模板；launcher 不得被調用（無意圖即無 intent）。
+    // LaunchAppTool.check 無靜態 DEGRADED 分支（僅 USER_DISABLED/NATIVE），
+    // 故以「預設可見集／空可見集」兩環境鎖定 env 無關性（同
+    // navigation_execute_blankDestination_needsClarification 的正向+反向控制）。
+    val visible = setOf("com.google.android.apps.maps", "com.spotify.music")
+    for (e in listOf(SystemEnv(installedPackages = visible), SystemEnv(installedPackages = emptySet()))) {
+      for (q in listOf("", "   ")) {
+        var called = false
+        val r = LaunchAppTool.execute(
+          LaunchAppTool.Params(q), e, IntentLauncher { called = true; LaunchResult.Success },
+        )
+        assertFalse("query=「$q」應澄清", r.ok)
+        assertFalse(r.usedFallback)
+        assertEquals(ReasonCodes.NEED_CLARIFICATION, r.reasonCode)
+        assertNull(r.spec)
+        assertEquals(
+          LaunchAppTool.fallback(LaunchAppTool.Params(q), e).userMessage,
+          r.message,
+        )
+        assertTrue(r.message, r.message.startsWith("開啟哪個 App（${ReasonCodes.NEED_CLARIFICATION}）？"))
+        assertTrue(r.message, "→ 可替代手動從桌面開啟" in r.message)
+        assertTrue(r.message, "→ 需要你說出 App 名稱" in r.message)
+        assertFalse("空白 query 不得回顯「」話術", r.message.contains("「"))
+        assertFalse("空白 query 不得調用 launcher", called)
+      }
+    }
+  }
+
+  @Test fun launchApp_fuzzyClarification_messageMatchesFallback() {
+    // F4c：execute 的候選澄清話術與 [fallback] NeedClarification 分支同一模板
+    //（此前僅問句+候選、缺「→ 可替代 → 需要你做 Z」尾段，與 fallback 版本漂移）。
+    val e = SystemEnv(installedPackages = setOf("com.google.android.apps.maps", "com.spotify.music"))
+    val r = LaunchAppTool.execute(LaunchAppTool.Params("music"), e, IntentLauncher { LaunchResult.Success })
+    assertFalse(r.ok)
+    assertFalse(r.usedFallback)
+    assertEquals(ReasonCodes.NEED_CLARIFICATION, r.reasonCode)
+    assertEquals(LaunchAppTool.fallback(LaunchAppTool.Params("music"), e).userMessage, r.message)
+    assertTrue(r.message, "→ 可替代候選：" in r.message)
+    assertTrue(r.message, "→ 需要你選一個" in r.message)
   }
 
   @Test fun navigation_degradedSuccess_locksFallbackSemantics() {
@@ -585,6 +646,25 @@ class IntentTypedD2Test {
     assertEquals("geo:25.0,121.0?q=a+b", spec.dataUri)
   }
 
+  @Test fun navigation_geo_coordsBlankLabel_queryFillsQ() {
+    // F5：lat/lng + 空白 label + 非空 query → q 來源補位為 query（query 已過
+    // 長度校驗，靜默丟棄即縮減合法輸入；與 requirePairedCoords「禁靜默丟棄」
+    // 同伴原則）。label 非空白時維持原優先序（q=label）；label/query 皆空白
+    // 時回裸座標（禁空 q 查詢）。
+    val queryFills = NavigationTool.buildGeoIntent(
+      NavigationTool.Params(query = "night market", latitude = 25.0, longitude = 121.0, label = "   "),
+    )
+    assertEquals("geo:25.0,121.0?q=night+market", queryFills.dataUri)
+    val labelWins = NavigationTool.buildGeoIntent(
+      NavigationTool.Params(query = "night market", latitude = 25.0, longitude = 121.0, label = "abc"),
+    )
+    assertEquals("geo:25.0,121.0?q=abc", labelWins.dataUri)
+    val bare = NavigationTool.buildGeoIntent(
+      NavigationTool.Params(latitude = 25.0, longitude = 121.0),
+    )
+    assertEquals("geo:25.0,121.0", bare.dataUri)
+  }
+
   // ---- 14. Stage 3：navigation blank 判斷的雙側座標契約 ----
 
   @Test fun navigation_execute_latitudeOnly_convergesInternal() {
@@ -632,5 +712,48 @@ class IntentTypedD2Test {
     )
     assertFalse(r.ok)
     assertEquals(ReasonCodes.USER_DISABLED, r.reasonCode)
+  }
+
+  // ---- 15. F1：IntentSpec categories 映射（隱式 MAIN 啟動契約）----
+
+  @Test fun launchApp_launchSpec_carriesLauncherCategory() {
+    // 隱式 MAIN+setPackage 的 filter 契約：launcher activity 的 manifest filter
+    // 通常僅 MAIN+CATEGORY_LAUNCHER（無 CATEGORY_DEFAULT）——spec 必攜
+    // LAUNCHER category，否則隱式 intent filter 匹配不可達（IntentSpec.categories
+    // KDoc 契約句；framework 常量字面值逐字鎖定）。
+    assertEquals(
+      listOf("android.app.category.LAUNCHER"),
+      LaunchAppTool.launchSpec("com.google.android.apps.maps").categories,
+    )
+  }
+
+  @Test fun intentSpec_categories_addedOneByOneViaToIntent() {
+    // 幾項 categories 逐項 addCategory（斷言端側 intent.getCategories() 集合）；
+    // dataUri/extras 既有路徑不受影響。
+    val launcher = AndroidIntentLauncher(appContext())
+    val intent = launcher.toIntent(
+      IntentSpec(
+        action = IntentActions.MAIN,
+        targetPackage = "com.example.test",
+        categories = listOf("android.app.category.LAUNCHER", "android.app.category.DEFAULT"),
+      ),
+    )
+    assertEquals(
+      setOf("android.app.category.LAUNCHER", "android.app.category.DEFAULT"),
+      intent.categories,
+    )
+    assertEquals("android.intent.action.MAIN", intent.action)
+    assertEquals("com.example.test", intent.`package`)
+  }
+
+  @Test fun intentSpec_absentCategories_intentHasNone() {
+    // 缺省 categories（既有 spec 形狀）產生無分類 intent——既有 pin 不因
+    // 新欄位漂移（零破壞契約）。
+    val launcher = AndroidIntentLauncher(appContext())
+    assertNull(
+      launcher.toIntent(
+        IntentSpec(action = IntentActions.VIEW, dataUri = "https://example.com"),
+      ).categories,
+    )
   }
 }

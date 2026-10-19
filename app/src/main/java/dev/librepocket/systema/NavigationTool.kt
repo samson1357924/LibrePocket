@@ -14,7 +14,9 @@ import java.net.URLEncoder
  *   真機 handler E2E 仍 UNVERIFIED。
  * - query 形狀為刻意近似：`geo:lat,lng?q=label` 非官式合成
  *   `geo:0,0?q=lat,lng(label)`（括號需轉義）；多數地圖 App 以「座標＋搜尋詞」
- *   語意照收，保守起見保留現行形狀並以測試鎖定。
+ *   語意照收，保守起見保留現行形狀並以測試鎖定。座標存在時 q 來源優先序為
+ *   label → query（空白 label 時以非空 query 補位，理由見 [buildGeoIntent]
+ *   註解；禁靜默縮減合法輸入）。
  * - query/label 長度上限（[MAX_QUERY_LEN]=500，間隔註記見 IntentSpec KDoc 長度
  *   政策）為本層自訂 Binder 傳輸防禦（官方契約無此上限）：兩個 builder 端
  *   fail-closed 拒絕，越界經 [execute] 收斂 INTERNAL；上限以**編碼前欄位長度**
@@ -66,7 +68,12 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
     require(params.label.length <= MAX_QUERY_LEN) { "label too long: ${params.label.length} > $MAX_QUERY_LEN" }
     val data = if (lat != null && lng != null) {
       val base = "geo:$lat,$lng"
-      if (params.label.isNotBlank()) "$base?q=${encode(params.label)}" else base
+      // q 來源優先序（座標存在時）：label → query——兩者皆已過長度校驗，label
+      // 空白而 query 非空時靜默丟棄 query 等於縮減使用者已完整提供的輸入（與
+      // [requirePairedCoords] 的「單側座標 fail-fast：禁靜默丟棄」同伴原則同
+      // 方向）；兩者皆空白才回裸座標（禁構建空 q 的無意義查詢）。
+      val q = if (params.label.isNotBlank()) params.label else params.query
+      if (q.isNotBlank()) "$base?q=${encode(q)}" else base
     } else {
       "geo:0,0?q=${encode(params.query)}"
     }

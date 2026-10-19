@@ -13,8 +13,11 @@ package dev.librepocket.systema
  * - `setStreamVolume` / `adjustStreamVolume` 在觸發 Do-Not-Disturb 變更、
  *   且呼叫端未持有 Notification Policy Access 時丟 `SecurityException`；
  *   [AndroidIntentLauncher.applyVolume] 經 try/catch 收斂為 bare false
- *  （只收 `Exception`，`CancellationException` 重拋），端側接線層不得把
- *   「失敗原因」丟失（拒絕 vs 系統錯誤）。
+ *  （只收 `Exception`，`CancellationException` 重拋）。誠實聲明（拒絕 vs 系統
+ *   錯誤的分型在現契約下不可實現）：Boolean 回傳目前**丟失原因分型**——
+ *  「呼叫端被拒（SecurityException）」與「系統錯誤」在該函式回傳後不可區分；
+ *   接線層若需區分二者，須另開拋出式落點（或在 applyVolume 內部自判後分型），
+ *   不得依賴現有 Boolean 簽名取得原因碼。
  * - `isVolumeFixed` 裝置上 adjust 是靜默 no-op，仍會回 true——不得計為成功。
  *
  * 佔位錨定語義（current）：[execute] 的 `ok=true` 表示「操作已錨定」——

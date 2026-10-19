@@ -107,7 +107,8 @@ class AndroidIntentLauncher(private val context: Context) : IntentLauncher {
    * 不得繞過 resolveActivity/try-catch 直調 `startActivity`。
    *
    * toIntent 拋錯分支目前近乎 dead code：現有映射（action/data/package/
-   * extras allowlist flags）對合法 [IntentSpec] 不拋；保留作 fail-closed 防禦，
+   * categories/extras/allowlist flags）對合法 [IntentSpec] 不拋；保留作
+   * fail-closed 防禦，
    * 故無針對性拋錯測試，僅由 resolve/start 拋錯測試覆蓋同層收斂語義。
    */
   fun toIntent(spec: IntentSpec): Intent {
@@ -118,6 +119,10 @@ class AndroidIntentLauncher(private val context: Context) : IntentLauncher {
       intent.setDataAndType(data, mime)
     }
     spec.targetPackage?.let { intent.setPackage(it) }
+    // categories 逐項 addCategory（契約見 [IntentSpec.categories] KDoc：僅
+    // framework 常量字面值，目前唯一使用點為 launchSpec 的 LAUNCHER；缺它則
+    // ACTION_MAIN+setPackage 的隱式啟動濾不到 launcher activity filter）。
+    spec.categories.forEach { intent.addCategory(it) }
     spec.extras.forEach { (k, v) ->
       // 窮舉表達式（賦值迫使編譯器檢查）：新增 IntentExtra 子類未補分支即編譯錯，
       // 不依賴執行期 `else -> throw`；保留 fail-closed 語義於編譯期。

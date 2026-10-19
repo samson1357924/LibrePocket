@@ -22,6 +22,12 @@ package dev.librepocket.systema
  * 決策註記：float/double 需求出現時再加 DoubleVal + toIntent 分支
  * （不預先加型別；[AndroidIntentLauncher.toIntent] 以窮舉 `when` 表達式
  * （賦值迫使編譯器檢查）保證新增子類未補分支即編譯錯，fail-closed 於編譯期）。
+ *
+ * SystemEnv Status（原懸掛於 [IntentSpec] 上方的孤兒 KDoc，併入檔首以免誤掛）：
+ * Target（純側契約，未接線未 E2E）。`SystemEnv` 目前無生產 producer
+ * （無 `PackageManager.resolveActivity → SystemEnv` 映射，見各工具 `check`
+ * KDoc）；測試以假 `SystemEnv` + 假 `IntentLauncher` 直調驗證映射語義，
+ * 不得當作端到端能力證據。
  */
 sealed interface IntentExtra {
   data class Str(val value: String) : IntentExtra
@@ -96,16 +102,24 @@ object IntentFlags {
 }
 
 /**
- * Status: Target（純側契約，未接線未 E2E）。`SystemEnv` 目前無生產 producer
- *（無 `PackageManager.resolveActivity → SystemEnv` 映射，見各工具 `check`
- * KDoc）；測試以假 `SystemEnv` + 假 `IntentLauncher` 直調驗證映射語義，
- * 不得當作端到端能力證據。
- */
-
-/**
  * 純側 intent 描述：launcher 的唯一輸入形狀（KDoc 見檔案頂部契約說明；
  * 欄位語意：`dataUri` 與 `mimeType` 同設時由 launcher 併為
  * `setDataAndType`，`targetPackage` 僅契約白名單場景使用）。
+ *
+ * `categories`（預設空值＝既有呼叫面零破壞；欄位放最後，避免既有 positional
+ * 呼叫斷裂）：由 launcher 逐項 `addCategory` 映射（見
+ * [AndroidIntentLauncher.toIntent]）。契約：**僅允許 framework 常量字面值**，
+ * 目前唯一使用點為 `android.app.category.LAUNCHER`（[LaunchAppTool.launchSpec]
+ * 的 ACTION_MAIN+setPackage 隱式啟動——launcher activity 的 manifest filter
+ * 通常僅 MAIN+LAUNCHER，隱式 intent 缺 category 則 filter 匹配不可達，與
+ * geo/https 同形的真機恆 NoHandler 矛盾，為本欄存在的理由）；未來新增值必須
+ * 先對照官方 manifest `<intent-filter>` 匹配契約（含 `CATEGORY_DEFAULT` 的
+ * MATCH_DEFAULT_ONLY 語義），不得在工具層自造 category。
+ *
+ * 精確度警告：本欄為必要條件而非充分條件——`resolveActivity`
+ * （MATCH_DEFAULT_ONLY）對 launcher-only filter 仍不可達（launcher filter
+ * 無 `CATEGORY_DEFAULT`）；真機可發射的充分條件是接線 PR 的顯式
+ * component 派生，不得據本欄誤判本層已可發射。
  */
 data class IntentSpec(
   val action: String,
@@ -114,6 +128,7 @@ data class IntentSpec(
   val targetPackage: String? = null,
   val extras: Map<String, IntentExtra> = emptyMap(),
   val flags: Int = 0,
+  val categories: List<String> = emptyList(),
 )
 
 /**

@@ -13,11 +13,22 @@ package dev.librepocket.systema
  * </queries>
  * ```
  * 白名單外不可見 → [LaunchResolution.NeedClarification] 或 Unknown，
- * 禁止猜測包名。
+ * 禁止猜測包名。空白 query 是**意圖缺席**，橫向與 Music/Navigation 統一：
+ * [execute]/[fallback] 先收斂 `NEED_CLARIFICATION`（不走 Unknown 的
+ * `NO_HANDLER`「做不到開啟「」」空回顯話術）。
+ *
+ * Spec 形狀（F1 修正）：[launchSpec] 為 ACTION_MAIN+setPackage 並攜
+ * `android.app.category.LAUNCHER`——launcher activity 的 manifest filter
+ * 通常僅 MAIN+LAUNCHER，隱式 intent 缺 category 則 filter 匹配不可達
+ * （與 geo/https 已修的同形真機恆 NoHandler 矛盾；契約句見
+ * [IntentSpec.categories] KDoc）。
  *
  * Target 缺口（刻意保留）：開 App launcher 清單查詢未加入 <queries>；API 30+
  * 包可見性下 [QUERY_WHITELIST] 的包真機 resolve 恐 NoHandler——防包名猜測
- * 優先，需裝置驗證後再決定是否補宣告。
+ * 優先，需裝置驗證後再決定是否補宣告。launchSpec 已補 LAUNCHER category，
+ * 但 resolve 作為（MATCH_DEFAULT_ONLY 對 launcher-only filter 的限制）與
+ * 顯式 component 派生仍屬接線 PR 的 Target 缺口，本層 fail-closed 收斂
+ * （resolve null → [LaunchResult.NoHandler] 話術路徑）不變。
  */
 object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
 
@@ -73,6 +84,9 @@ object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
    *   禁透傳 LLM/MCP 輸出的包名（防包名猜測/劫持）。
    */
   fun resolve(query: String, visiblePackages: Set<String>): LaunchResolution {
+    // 空白 query 的 NEED_CLARIFICATION 收斂在 [execute]/[fallback] 上游先行
+    // 攔截（與 Music/Navigation 空白目標統一）；此處仍回 Unknown 作直接呼叫
+    // resolve 的安全網。
     val q = query.trim().lowercase()
     if (q.isEmpty()) return LaunchResolution.Unknown
     // 精確包名直達（需在可見集合內）。
@@ -97,9 +111,20 @@ object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
     }
   }
 
+  /**
+   * ACTION_MAIN + setPackage 的隱式啟動 spec。category 契約（F1）：官方隱式
+   * intent 啟動需 filter 匹配，launcher activity filter 通常僅
+   * `MAIN` + `CATEGORY_LAUNCHER`（無 `CATEGORY_DEFAULT`）——隱式 intent 缺
+   * LAUNCHER category 必不匹配（`resolveActivity` 恆 null → 真機話術恆
+   * NoHandler），故攜 framework 常量字面值（`IntentSpec.categories` 契約：
+   * 目前唯一使用點）。真機 resolve 仍受 MATCH_DEFAULT_ONLY / Target 缺口限制
+   *（見 object KDoc），本層不改 launcher 的 resolve 語義（fail-closed 收斂
+   * resolve null → NoHandler 不變）。
+   */
   fun launchSpec(packageName: String): IntentSpec = IntentSpec(
     action = IntentActions.MAIN,
     targetPackage = packageName,
+    categories = listOf("android.app.category.LAUNCHER"),
   )
 
   override fun check(env: SystemEnv): CheckResult {
@@ -114,14 +139,36 @@ object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
     if (!gate.executable) {
       return ToolResult(false, false, null, gate.reasonCode, "做不到開啟 App（${gate.reasonCode}）")
     }
+    // 空白 query：使用者意圖缺席（F4a，與 Music/Navigation 空白目標同契約），
+    // 與環境能力無關（即使靜態 NATIVE 亦然）——回 NEED_CLARIFICATION，不產生
+    // 「做不到開啟「」」的空回顯 NO_HANDLER 話術；話術取 [fallback] 空白分支
+    // 保證兩處同模板，且不調用 launcher（無意圖即無可發射的 intent）。
+    if (params.query.isBlank()) {
+      return ToolResult(
+        false, false, null, ReasonCodes.NEED_CLARIFICATION, fallback(params, env).userMessage,
+      )
+    }
     return when (val r = resolve(params.query, env.installedPackages)) {
       is LaunchResolution.Single -> {
-        launcher.launchCatching(r.spec).toToolResult(r.spec, "開啟 App")
+        when (val launched = launcher.launchCatching(r.spec)) {
+          // 發現式缺席（白名單命中但發射無處理者：被移除/停用/不可見）與姊妹
+          // 工具（Alarm/Calendar/Music/Navigation）同形（F4b）：話術取
+          // [fallback] 的完整三段計畫（generic toToolResult 兩段話術不滿足
+          // FallbackSpec KDoc 模板），usedFallback=true、嘗試過的 spec 保留。
+          LaunchResult.NoHandler -> ToolResult(
+            false, true, r.spec, ReasonCodes.NO_HANDLER, fallback(params, env).userMessage,
+          )
+          // Success/Internal 走共用收斂（Internal 收斂為 INTERNAL+cause 類名）。
+          else -> launched.toToolResult(r.spec, "開啟 App")
+        }
       }
-      is LaunchResolution.NeedClarification -> ToolResult(
-        false, false, null, ReasonCodes.NEED_CLARIFICATION,
-        "開啟哪個 App（${ReasonCodes.NEED_CLARIFICATION}）？候選：" + r.candidates.joinToString("、"),
-      )
+      is LaunchResolution.NeedClarification ->
+        // 澄清話術與 [fallback] NeedClarification 分支同一模板（F4c）：
+        // 補齊「→ 可替代候選… → 需要你選一個」尾段，統一話術模板（此前僅
+        // 問句+候選、缺尾段，與 fallback 版本漂移）。
+        ToolResult(
+          false, false, null, ReasonCodes.NEED_CLARIFICATION, fallback(params, env).userMessage,
+        )
       LaunchResolution.Unknown -> ToolResult(
         false, false, null, ReasonCodes.NO_HANDLER,
         // 同 [MAX_QUERY_ECHO_LEN]（[CalendarTool.MAX_EVENT_ID_ECHO_LEN] 的防回顯契約）：話術只回顧前 32 字。
@@ -131,17 +178,28 @@ object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
   }
 
   override fun fallback(params: Params, env: SystemEnv): FallbackSpec =
-    when (val r = resolve(params.query, env.installedPackages)) {
-      is LaunchResolution.NeedClarification -> FallbackSpec(
+    if (params.query.isBlank()) {
+      // F4a：空白 query 是意圖缺席，非「找不到 App」——澄清優先（與
+      // Music/Navigation 空白目標收斂點統一），禁把空白字串回顯成 NO_HANDLER
+      // 的「做不到開啟「」」話術。三段形狀對齊 FallbackSpec KDoc 模板。
+      FallbackSpec(
         reasonCode = ReasonCodes.NEED_CLARIFICATION,
-        userMessage = "開啟哪個 App（${ReasonCodes.NEED_CLARIFICATION}）" +
-          "→ 可替代候選：" + r.candidates.joinToString("、") + " → 需要你選一個",
+        userMessage = "開啟哪個 App（${ReasonCodes.NEED_CLARIFICATION}）？" +
+          "→ 可替代手動從桌面開啟 → 需要你說出 App 名稱",
       )
-      else -> FallbackSpec(
-        reasonCode = ReasonCodes.NO_HANDLER,
-        // 同 [MAX_QUERY_ECHO_LEN]（[CalendarTool.MAX_EVENT_ID_ECHO_LEN] 的防回顯契約）：話術只回顧前 32 字。
-        userMessage = "做不到開啟「${params.query.take(MAX_QUERY_ECHO_LEN)}」（${ReasonCodes.NO_HANDLER}）" +
-          "→ 可替代手動從桌面開啟 → 需要你確認 App 名稱",
-      )
+    } else {
+      when (val r = resolve(params.query, env.installedPackages)) {
+        is LaunchResolution.NeedClarification -> FallbackSpec(
+          reasonCode = ReasonCodes.NEED_CLARIFICATION,
+          userMessage = "開啟哪個 App（${ReasonCodes.NEED_CLARIFICATION}）" +
+            "→ 可替代候選：" + r.candidates.joinToString("、") + " → 需要你選一個",
+        )
+        else -> FallbackSpec(
+          reasonCode = ReasonCodes.NO_HANDLER,
+          // 同 [MAX_QUERY_ECHO_LEN]（[CalendarTool.MAX_EVENT_ID_ECHO_LEN] 的防回顯契約）：話術只回顧前 32 字。
+          userMessage = "做不到開啟「${params.query.take(MAX_QUERY_ECHO_LEN)}」（${ReasonCodes.NO_HANDLER}）" +
+            "→ 可替代手動從桌面開啟 → 需要你確認 App 名稱",
+        )
+      }
     }
 }

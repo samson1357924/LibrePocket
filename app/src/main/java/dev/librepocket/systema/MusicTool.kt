@@ -19,6 +19,11 @@ package dev.librepocket.systema
  *   （MediaController 路徑，見下）；NoHandler 話術走 [fallback] 控制分支的
  *   完整三段計畫（alternative 為 null：控制語意下「播放 search」亦非替代）。
  *   單元測試僅鎖 keyCode 映射與話術形狀，未驗證端側 MediaSession 回調落地。
+ *   官方契約 gap（明寫，防誤導接線者）：official contract uses EXTRA_KEY_EVENT
+ *   （`android.intent.extra.KEY_EVENT`，型別 KeyEvent）；本 spec 的 `keyCode`
+ *   Int 是內部建模近似——接線者最終必須對齊 EXTRA_KEY_EVENT（由 keyCode
+ *   構建 KeyEvent extra）或改調 MediaController/媒體會話 API 直控，不得以
+ *   現 keyCode extra 冒充官方契約。
  * - 前台要求：實際播放必須跑在前台服務（`FOREGROUND_SERVICE_MEDIA_PLAYBACK`
  *   + 常駐通知），否則後台會被系統回收；本層僅建模，端側強制。
  * - 模糊目標（如「放點輕音樂」）不猜包名：先澄清或走預設播放器。
@@ -89,7 +94,9 @@ object MusicTool : SystemTool<MusicTool.Params> {
   fun buildControlIntent(control: Control): IntentSpec {
     // 同 [buildControl]：缺鍵碼 ISE（非 NoSuchElementException），確保
     // guardedToolBuild 真實收斂；D2 型別化：keyCode 用 Int，端側 MediaSession
-    // 回調按 int 讀回。
+    // 回調按 int 讀回。契約 gap 見檔 KDoc 控制段：官方形狀為
+    // EXTRA_KEY_EVENT（KeyEvent），此 keyCode Int 為內部建模近似——
+    // 接線須對齊或改直控，不得冒充官方契約。
     val keyCode = CONTROL_KEY_CODES[control]
       ?: throw IllegalStateException("no keyCode mapping for Control.${control.name}")
     return IntentSpec(
@@ -128,8 +135,11 @@ object MusicTool : SystemTool<MusicTool.Params> {
         "放什麼音樂（${ReasonCodes.NEED_CLARIFICATION}）？→ 可替代預設歌單 → 需要你說出曲名或歌手",
       )
     }
-    // fail-closed：play builder（URLEncoder 若拋）同樣收斂為 INTERNAL
-    //（收斂點 [guardedToolBuild]）。
+    // fail-closed 收斂範圍（精確版）：play builder 的 query 長度守衛（IAE）經
+    // [guardedToolBuild] 收斂為 INTERNAL；`URLEncoder.encode`（固定 UTF-8）按
+    // 規格宣告的 `UnsupportedEncodingException` 屬 IOException 族、不在 guard
+    // 白名單——固定 charset 下實務不可達，charset 可配置化前無收斂缺口，
+    // 禁再宣稱「URLEncoder 若拋亦收斂」。
     val playFailure =
       ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到播放音樂（${ReasonCodes.INTERNAL}）")
     val spec = when (val build = guardedToolBuild(playFailure) { buildPlayIntent(params) }) {

@@ -59,8 +59,28 @@ internal object McpWire {
      * 截斷後名會被 [callBody] 當成另一支工具真的送達伺服器，且 `enabledTools`／
      * `McpScope` 以名為鍵，前綴相同的長名碰撞會造成授權對象錯位）；
      * 出站超限直接拒、不發送。
+     * 交叉引用：`McpScope.requireBareToolName`（C-02 授權路徑形狀閘）**直接引用本常數**
+     * ——單一真相，不另立魔數。
      */
     internal const val TOOL_NAME_MAX_CHARS = 128
+
+    /**
+     * 保留工具名前綴（`mcp.`）：**單一真相直接引用 [McpScope.SWITCH_PREFIX]**（本常數
+     * 是該常數的別名，不另立魔數——`McpScope` 與本物件永不各寫一份字面值）。
+     *
+     * 保留前綴**兩端同政策**（見本常數、[parseListPage] 與 `McpScope.requireBareToolName`
+     * 三處 KDoc）：
+     * - 入站（遠端 `tools/list`）：以此前綴開頭的遠端工具名**整頁拒**
+     *   （拋 [McpProtocol] → PROTOCOL + 計熔斷）——`mcp.` 是 [dev.librepocket.tool.ToolDef.name]／
+     *   開關鍵的形狀，不是遠端 bare 名；照收會「列出但不可用」（所有 `McpScope`
+     *   授權入口都拒該前綴），且未來接線 `map { McpScope.toToolDef(...) }`
+     *   會拋未映射 `IllegalArgumentException` 打斷整輪；
+     * - 出站／授權側（`McpScope.requireBareToolName`）：拒用此前綴名（同政策的另一端）。
+     *
+     * 大小寫敏感（正向已測）：只有小寫 `mcp.` 是保留前綴，`MCP.x` 屬合法 bare 名照收
+     * （與 `McpScope.SWITCH_PREFIX` 的 `startsWith` 語義一致，不做正規化）。
+     */
+    internal const val RESERVED_TOOL_PREFIX: String = McpScope.SWITCH_PREFIX
 
     /**
      * 出站 arguments 字元上限（值與回應字元上限 [McpTransport.RESPONSE_MAX_CHARS]
@@ -586,7 +606,17 @@ internal object McpWire {
      * `{"type":"object"}` 預設參數是**本地建構**預設值（直呼叫／測試用），
      * 與遠端契約無關，不會出現在任何解析結果；
      * name 超 [TOOL_NAME_MAX_CHARS] 一律拒（與出站同政策，見該常數 KDoc）、
-     * 空白／空名照收（列出即不可用——[callBody] 呼叫時拒，fail-closed 於使用點）、
+     * 以 [RESERVED_TOOL_PREFIX]（`mcp.`＝[McpScope.SWITCH_PREFIX]，單一真相）開頭的
+     * **保留前綴名整頁拒**（靜態訊息 `mcp: tool name uses reserved prefix`，
+     * 與既有「超限名整頁拒」同政策——保留前綴兩端同政策：**入站整頁拒、
+     * 出站拒用**（`McpScope.requireBareToolName`），否則「列出但不可用」＋
+     * 未來接線 `map { McpScope.toToolDef(...) }` 拋未映射 IAE 打斷整輪；
+     * 大小寫敏感：`MCP.x` 照收，正向已測）、
+     * 空白／空名**整頁拒**（靜態訊息 `mcp: tool name is blank`，`isBlank()` 涵蓋全形
+     * 空白／NBSP 等 Unicode 空白；與保留前綴同政策——空白名在所有 [McpScope] 授權
+     * 入口都被 [McpScope.requireBareToolName] 拒，照收同樣會讓未來接線
+     * `map { McpScope.toToolDef(...) }` 拋未映射 IAE 打斷整輪；名**內含**空格
+     * （如 `my tool`）不受影響，正向已測），
      * description 非字串（含 null/數字/物件）降為空字串（描述欄位型別寬容，
      * 不影響工具可用性）、超 [DESCRIPTION_MAX_CHARS] 截斷（截斷 vs 拒絕的
      * 政策區別見該常數 KDoc）。
@@ -642,6 +672,24 @@ internal object McpWire {
                 // 以名為鍵的 enabledTools／McpScope——CR/LF 可偽造稽核列、C0/ESC 可干擾終端。
                 if (nameVal.v.any { it.code < 0x20 || it.code == 0x7F }) {
                     throw McpProtocol("mcp: tool name has control chars")
+                }
+                // 空白／空名整頁拒（與保留前綴同政策；名形狀驗證順序：超限 → 控制字元 →
+                // 空白 → 保留前綴，與上方 KDoc 文件化順序一致）：空白名在所有
+                // McpScope 授權入口都被 requireBareToolName 拒（isNotBlank），照收會
+                // 「列出但不可用」且讓未來接線 `map { McpScope.toToolDef(...) }` 拋
+                // 未映射 IAE 打斷整輪——與保留前綴同災難形（re-review F-S2-02）。
+                // isBlank() 涵蓋全形空白/NBSP 等 Unicode 空白；名「內含」空格不受影響。
+                if (nameVal.v.isBlank()) {
+                    throw McpProtocol("mcp: tool name is blank")
+                }
+                // 保留前綴整頁拒（名形狀驗證順序：超限 → 控制字元 → 空白 → 保留前綴，與上方
+                // KDoc 文件化順序一致）：`mcp.`（＝McpScope.SWITCH_PREFIX，單一真相經
+                // RESERVED_TOOL_PREFIX 引用）是開關鍵/ToolDef.name 的形狀，不是遠端 bare 名。
+                // 照收會「列出但不可用」（所有 McpScope 授權入口都拒此前綴），且未來接線
+                // `map { McpScope.toToolDef(...) }` 會拋未映射 IAE 打斷整輪——與超限名同政策：
+                // 整頁 fail-closed 拒，不靜默略過單支。
+                if (nameVal.v.startsWith(RESERVED_TOOL_PREFIX)) {
+                    throw McpProtocol("mcp: tool name uses reserved prefix")
                 }
                 val descVal = item.find("description")
                 val desc = if (descVal is JStr) descVal.v else ""

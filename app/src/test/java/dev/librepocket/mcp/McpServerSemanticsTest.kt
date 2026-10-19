@@ -930,6 +930,163 @@ class McpServerSemanticsTest {
         }
     }
 
+    @Test fun qualifiedToolNameMapsToProtocolWithoutHttpVaultOrBreaker() = runBlocking {
+        // C-02 E2E：已限定名（`mcp.<id>.<tool>`，ToolDef.name 形狀）不得被當 bare 名
+        // 發送——舊路徑 enabledTools 以 "mcp.s1.search" 查鍵、缺鍵預設啟用，
+        // 停用清單（"search"→false）被靜默繞過且真的發送。形狀閘（C-02）fail-closed：
+        // PROTOCOL、不發送（requestCount==0）、不碰 vault、不計熔斷（走 callTool 既有
+        // IAE catch，不新增分支待遇）。
+        val web = MockWebServer()
+        web.start()
+        try {
+            val breaker = McpCircuitBreaker()
+            val vault = FakeVault()
+            val server = McpServer(
+                config = McpServerConfig(
+                    id = "s1",
+                    baseUrl = web.url("/").toString(),
+                    enabledTools = mapOf("search" to false),
+                ),
+                keyVault = vault,
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = deadline { server.callTool("mcp.s1.search", "{}") }
+            assertEquals(McpStatus.PROTOCOL, got.status)
+            assertEquals("已限定名不得發送 HTTP", 0, web.requestCount)
+            assertEquals("已限定名不得碰 vault", 0, vault.reads)
+            assertEquals("已限定名不得計熔斷", 0, breaker.failureCount())
+            // 同待遇取樣：C0 控制字元名與超長名同樣 PROTOCOL、不發送。
+            for (bad in listOf("bad\nname", "t".repeat(McpWire.TOOL_NAME_MAX_CHARS + 1))) {
+                assertEquals(McpStatus.PROTOCOL, deadline { server.callTool(bad, "{}") }.status)
+                assertEquals("控制字元/超長名不得發送 HTTP", 0, web.requestCount)
+                assertEquals("控制字元/超長名不得碰 vault", 0, vault.reads)
+                assertEquals("控制字元/超長名不得計熔斷", 0, breaker.failureCount())
+            }
+            // 對照：bare 停用名維持既有 DISABLED 語意（形狀閘不改動停用判定）。
+            assertEquals(McpStatus.DISABLED, deadline { server.callTool("search", "{}") }.status)
+            assertEquals(0, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun reservedPrefixToolListMapsToProtocolAndCountsBreaker() = runBlocking {
+        // S2-R01/S2-D02 E2E：遠端 tools/list 回含保留前綴 `mcp.x` 的頁 → 整頁
+        // PROTOCOL＋計熔斷（入站 parseListPage 拋 McpProtocol 的既有 catch 分支，
+        // 與超限名／控制字元名同待遇）；不回 OK、不帶出任何工具。
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                        "[{\"name\":\"mcp.x\",\"inputSchema\":{\"type\":\"object\"}}]}}",
+                ),
+            )
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = deadline { server.listTools() }
+            assertEquals(McpStatus.PROTOCOL, got.status)
+            assertTrue("保留前綴名頁不得帶出任何工具", got.tools.isEmpty())
+            assertEquals("保留前綴名必須計熔斷", 1, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun shapeGateRunsAfterDisabledAndCircuitOpenShortCircuits() = runBlocking {
+        // S2-D01 先後序 pin：形狀閘（requireBareToolName）在 DISABLED／CIRCUIT_OPEN
+        // **之後**、callBody **之前**——便宜短路先於形狀閘（見 McpServer.callTool KDoc）。
+        val web = MockWebServer()
+        web.start()
+        try {
+            // ① 停用 server ＋已限定名 `mcp.s1.search` → DISABLED（不是 PROTOCOL）：
+            // 便宜判定先跑，形狀閘不執行，不碰 vault、不發 HTTP。
+            val vault = FakeVault()
+            val off = McpServer(
+                config = McpServerConfig(
+                    id = "s1",
+                    baseUrl = web.url("/").toString(),
+                    enabled = false,
+                ),
+                keyVault = vault,
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(),
+            )
+            assertEquals(McpStatus.DISABLED, deadline { off.callTool("mcp.s1.search", "{}") }.status)
+            assertEquals("停用短路不得碰 vault", 0, vault.reads)
+            assertEquals("停用短路不得發 HTTP", 0, web.requestCount)
+            // ② 熔斷已開路＋非法名 `mcp.s1.search` → CIRCUIT_OPEN（不是 PROTOCOL）：
+            // 開路判定先於形狀閘，同樣不碰 vault、不發 HTTP、不重計熔斷。
+            val breaker = McpCircuitBreaker()
+            val openVault = FakeVault()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = openVault,
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            repeat(3) { breaker.onFailure() }
+            assertTrue("前提：熔斷已開路", breaker.isOpen())
+            assertEquals(
+                McpStatus.CIRCUIT_OPEN,
+                deadline { server.callTool("mcp.s1.search", "{}") }.status,
+            )
+            assertEquals("開路短路不得碰 vault", 0, openVault.reads)
+            assertEquals("開路短路不得發 HTTP", 0, web.requestCount)
+            assertEquals("CIRCUIT_OPEN 短路不得重計熔斷", 3, breaker.failureCount())
+            // 對照（先後序反面）：同一非法名在「啟用＋熔斷閉合」時才走形狀閘 → PROTOCOL。
+            val liveVault = FakeVault()
+            val live = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = liveVault,
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(),
+            )
+            assertEquals(McpStatus.PROTOCOL, deadline { live.callTool("mcp.s1.search", "{}") }.status)
+            assertEquals(0, liveVault.reads)
+            assertEquals("形狀閘違反不得發 HTTP", 0, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun loneSurrogateAsymmetryScopeAllowsButCallToolRejects() = runBlocking {
+        // S2-D03 不對稱交叉 pin：requireBareToolName 不查孤立 surrogate（scope 放行，
+        // 只用來查鍵／建開關鍵、不出網路），出站 McpWire.callBody 一律拒 →
+        // callTool 回 PROTOCOL、不發送、不碰 vault、不計熔斷。
+        val web = MockWebServer()
+        web.start()
+        try {
+            val cfg = McpServerConfig(id = "s1", baseUrl = web.url("/").toString())
+            val lone = "a\uD800"
+            assertTrue(
+                "scope 側放行（已知不對稱，見 requireBareToolName KDoc）",
+                McpScope.canExecute(cfg, lone, confirmed = true),
+            )
+            val vault = FakeVault()
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = cfg,
+                keyVault = vault,
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            assertEquals(McpStatus.PROTOCOL, deadline { server.callTool(lone, "{}") }.status)
+            assertEquals("孤立 surrogate 不得發送", 0, web.requestCount)
+            assertEquals("孤立 surrogate 不得碰 vault", 0, vault.reads)
+            assertEquals("孤立 surrogate 不得計熔斷", 0, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
     @Test fun missingVaultKeyMapsToUnauthorizedWithoutHttp() = runBlocking {
         // vault 無 key：UNAUTHORIZED、不發 HTTP、不計熔斷（配置問題非傳輸失敗）。
         val web = MockWebServer()

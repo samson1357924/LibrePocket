@@ -171,8 +171,24 @@ class McpServer(
      * tools/call。
      *
      * @param argumentsJson 必須是合法 JSON object 文本（空字串視為 `{}`）；
-     *   非法（空白 tool 名／非 object／畸形）即回 PROTOCOL，不發送、不碰 vault、
-     *   不計熔斷。只駐記憶體，不寫盤、不進稽核（稽核見 [McpCallResult.auditMap]）。
+     *   非法（空白 tool 名／**已限定名 `mcp.…`／C0-DEL 控制字元／超 128 UTF-16 units**
+     *   （[McpScope.requireBareToolName]，C-02 fail-closed）／非 object／畸形）即回
+     *   PROTOCOL，不發送、不碰 vault、不計熔斷。只駐記憶體，不寫盤、不進稽核
+     *   （稽核見 [McpCallResult.auditMap]）。
+     *
+     * toolName 形狀（C-02）：只收遠端 **bare** 名——已限定名（[McpScope.switchKey]
+     * 形狀 `mcp.<id>.<tool>`）不得當 bare 名發送（否則 `enabledTools` 缺鍵預設啟用，
+     * 停用清單被靜默繞過）。
+     *
+     * **驗證先後序（S2-D01）**：①便宜短路——[McpStatus.DISABLED]（主開關／逐項停用）
+     * → ②[CIRCUIT_OPEN]（熔斷開路）→ ③**形狀閘**（[McpScope.requireBareToolName]）
+     * → ④body 組裝（[McpWire.callBody]）。即**形狀閘在 DISABLED／CIRCUIT_OPEN 之後、
+     * callBody 之前**：停用伺服器連形狀都不驗（便宜判定先跑），回 DISABLED、
+     * 不碰 vault 不發送；熔斷開路時同理回 CIRCUIT_OPEN。形狀閘違反走既有
+     * IAE catch → PROTOCOL：不發送、不碰 vault、不計熔斷。被拒的 toolName 仍會
+     * 進 [McpCallResult.auditMap] 的 `"tool"` 欄（稽核列偽造目前由入站
+     * [McpWire.parseListPage] 拒控制字元名擋；出站側同類防護屬下一階段，
+     * 不在本輪改動 [McpCallResult.auditMap] 行為）。
      */
     suspend fun callTool(
         toolName: String,
@@ -188,10 +204,13 @@ class McpServer(
         }
         val body: String
         try {
+            // C-02 形狀閘（bare 名 fail-closed）：已限定名/空白/C0-DEL/超長一律拒——
+            // 統一走下方既有 IAE catch → PROTOCOL（不發送、不碰 vault、不計熔斷）。
+            McpScope.requireBareToolName(toolName)
             body = McpWire.callBody(toolName, argumentsJson)
         } catch (_: IllegalArgumentException) {
-            // 客戶端參數錯誤（空白名／非 object／畸形）：fail-closed，不發送、
-            // 不碰 vault、不計熔斷（與傳輸失敗區分）。
+            // 客戶端參數錯誤（已限定名／空白名／控制字元／超長名／非 object／畸形）：
+            // fail-closed，不發送、不碰 vault、不計熔斷（與傳輸失敗區分）。
             return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
         }
         if (config.baseUrl.isBlank()) {

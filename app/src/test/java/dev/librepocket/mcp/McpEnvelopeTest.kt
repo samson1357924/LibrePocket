@@ -333,19 +333,101 @@ class McpEnvelopeTest {
     }
 
     @Test fun inboundToolNameWithSpaceIsAccepted() {
-        // 政策 pin：parseListPage 對名只拒超長與 C0/DEL 控制字元，空白照收（工具名可能含
-        // 空格）。沒有此測，`it.code < 0x20` 被改成 `<= 0x20` 會誤拒空白且無測試變紅。
+        // 政策 pin：工具名「內含」空格照收（`my tool`）。沒有此測，控制字元檢查
+        // `it.code < 0x20` 被改成 `<= 0x20` 會誤拒半形空格且無測試變紅。
+        // 注意：**純空白名**已改為入站整頁拒（見 inboundBlankToolNameRejectedWholePage，
+        // re-review F-S2-01/F-S2-02 政策收緊）。
         val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
             "[{\"name\":\"my tool\",\"inputSchema\":{\"type\":\"object\"}}]}}"
         val tools = McpWire.parseList("s1", json, expectedId = 1L)
         assertEquals(1, tools.size)
         assertEquals("my tool", tools[0].name)
-        // 純空白名（KDoc「空白／空名照收」）亦採納。
-        val sp = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
-            "[{\"name\":\" \",\"inputSchema\":{\"type\":\"object\"}}]}}"
-        val t2 = McpWire.parseList("s1", sp, expectedId = 1L)
-        assertEquals(1, t2.size)
-        assertEquals(" ", t2[0].name)
+    }
+
+    @Test fun inboundBlankToolNameRejectedWholePage() {
+        // re-review F-S2-01/F-S2-02：空白／空名**整頁拒**（靜態訊息、不回顯伺服器字串）。
+        // 與保留前綴同政策——空白名在所有 McpScope 授權入口都被 requireBareToolName
+        // 拒（isNotBlank），照收會「列出但不可用」且讓未來接線 `map { toToolDef(...) }`
+        // 拋未映射 IAE 打斷整輪。isBlank() 涵蓋 Unicode 空白（全形空格／NBSP）。
+        // mutation（拿掉 parseListPage 的空白檢查）此測即紅。
+        val page = { name: String ->
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                "[{\"name\":\"$name\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        }
+        for (name in listOf("", " ", "   ", "\u3000", "\u00a0")) {
+            try {
+                McpWire.parseList("s1", page(name), expectedId = 1L)
+                fail("空白名必須整頁拒：[$name]")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: tool name is blank", e.message)
+            }
+        }
+        // 混頁（一支合法＋一支純空白）→ 同樣整頁拒（不靜默略過單支）。
+        try {
+            McpWire.parseList(
+                "s1",
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                    "[{\"name\":\"ok\",\"inputSchema\":{\"type\":\"object\"}}," +
+                    "{\"name\":\" \",\"inputSchema\":{\"type\":\"object\"}}]}}",
+                expectedId = 1L,
+            )
+            fail("混頁含空白名必須整頁拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: tool name is blank", e.message)
+        }
+    }
+
+    @Test fun inboundReservedPrefixToolNameRejectedWholePage() {
+        // S2-R01/S2-D02：保留前綴 `mcp.`（＝McpScope.SWITCH_PREFIX，單一真相經
+        // McpWire.RESERVED_TOOL_PREFIX 引用）開頭的遠端名**整頁拒**——保留前綴兩端
+        // 同政策（入站整頁拒、出站 requireBareToolName 拒用）。照收會「列出但不可用」
+        //（所有 McpScope 授權入口都拒此前綴），且未來接線 `map { toToolDef(...) }`
+        // 會拋未映射 IAE 打斷整輪。mutation（拿掉 parseListPage 的前綴檢查）此測即紅。
+        val page = { tools: String ->
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":$tools}}"
+        }
+        // ① 單支 `mcp.x` → McpProtocol、靜態訊息。
+        try {
+            McpWire.parseList(
+                "s1",
+                page("""[{"name":"mcp.x","inputSchema":{"type":"object"}}]"""),
+                expectedId = 1L,
+            )
+            fail("保留前綴名必須整頁拒")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: tool name uses reserved prefix", e.message)
+        }
+        // ② 混頁（一支合法＋一支保留前綴）→ 同樣整頁拒（不只擋單支頁、不靜默略過）。
+        try {
+            McpWire.parseList(
+                "s1",
+                page(
+                    """[{"name":"good","inputSchema":{"type":"object"}},""" +
+                        """{"name":"mcp.s1.search","inputSchema":{"type":"object"}}]""",
+                ),
+                expectedId = 1L,
+            )
+            fail("混頁含保留前綴名必須整頁拒（不得略過單支）")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: tool name uses reserved prefix", e.message)
+        }
+        // ③ 大小寫變體 `MCP.x` 照收（前綴檢查大小寫敏感、不做正規化——正向 pin）。
+        val ok = McpWire.parseList(
+            "s1",
+            page("""[{"name":"MCP.x","inputSchema":{"type":"object"}}]"""),
+            expectedId = 1L,
+        )
+        assertEquals(1, ok.size)
+        assertEquals("MCP.x", ok[0].name)
+        // ④ 前綴字樣夾在中間（`xmcp.y`）非保留前綴，照收。
+        assertEquals(
+            1,
+            McpWire.parseList(
+                "s1",
+                page("""[{"name":"xmcp.y","inputSchema":{"type":"object"}}]"""),
+                expectedId = 1L,
+            ).size,
+        )
     }
 
     @Test fun limitConstantsArePinnedToLiterals() {

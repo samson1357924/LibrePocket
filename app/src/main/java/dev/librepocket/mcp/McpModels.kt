@@ -52,7 +52,15 @@ data class McpServerConfig(
     }
 }
 
-/** 遠端工具描述（tools/list 回傳）。第三方工具預設副作用為 WRITE（見 [McpScope]）。 */
+/**
+ * 遠端工具描述（tools/list 回傳）。第三方工具預設副作用為 WRITE（見 [McpScope]）。
+ *
+ * `sideEffect` 恆為 [SideEffect.WRITE]：**MCP 子集沒有遠端 sideEffect 宣告**，
+ * 本欄位只是模型預設值，**無任何授權路徑讀取**——[McpScope.check]／[McpScope.canExecute]
+ * 不收 [McpTool]、亦不收呼叫端 sideEffect 參數，一律按 WRITE 對待（傳 READ 無從
+ * 降級確認，S2-R02）。若未來子集納入 sideEffect 宣告，須改為「取自工具定義」並
+ * 讓 `McpScope.check` 讀取該值——不得改回收呼叫端參數。
+ */
 data class McpTool(
     val serverId: String,
     val name: String,

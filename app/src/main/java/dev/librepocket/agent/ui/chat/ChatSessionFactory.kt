@@ -2067,10 +2067,142 @@ internal suspend fun hasWithheldSwitchMarker(store: SessionStore, sessionId: Str
  * Stage E: fail-closed single-row bound. Rows longer than
  * [MODEL_HISTORY_MAX_CHARS_PER_MESSAGE] are cut with a visible marker so
  * the omission is observable in the payload itself, never silent.
+ *
+ * P2 tool markers are compacted first: local tool calls replay inline as
+ * `[tool:<name> <args>]` assistant text (see `TurnController`), and the args
+ * echo is audit text, not replay payload. Left unbounded it can consume the
+ * whole per-row budget and push the marker itself — or the answer after it —
+ * past the cut, and the cut can slice a marker mid-way. [compactToolMarkers]
+ * bounds each marker to `[tool:<name> …]` before the cap; ordinary (≤20k)
+ * rows bypass compaction and replay byte-identical.
  */
 internal fun cappedHistoryText(text: String): String {
     if (text.length <= MODEL_HISTORY_MAX_CHARS_PER_MESSAGE) return text
-    return text.take(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE) + HISTORY_TRUNCATION_MARKER
+    val compacted = compactToolMarkers(text)
+    return capAvoidingPartialToolMarker(compacted) + HISTORY_TRUNCATION_MARKER
+}
+
+/**
+ * Take the per-row prefix without ending inside a `[tool:` marker.
+ *
+ * Every opener after the last closing `]` is necessarily unterminated. Only
+ * producer-shaped openers (line-start `[tool:` plus a plausible name) are
+ * treated that way: dropping at an arbitrary mid-line `[tool:` fragment would
+ * silently throw away most of an otherwise ordinary over-cap row. The cut can
+ * also land inside the opener itself (`[`, `[t`, … `[tool:`), so trim any
+ * trailing proper prefix of the opener. Complete markers earlier in the
+ * prefix stay intact.
+ */
+private fun capAvoidingPartialToolMarker(compacted: String): String {
+    val cut = compacted.take(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE)
+    var open = cut.indexOf(TOOL_MARKER_OPEN, cut.lastIndexOf(']') + 1)
+    while (open >= 0 && !isProducerMarkerOpener(cut, open)) {
+        open = cut.indexOf(TOOL_MARKER_OPEN, open + 1)
+    }
+    val body = if (open < 0) cut else cut.take(open)
+    // Repeat: trimming one prefix can expose an overlapping one ("[tool:[").
+    // Track an end index instead of repeated dropLast (avoids O(n²) copies).
+    var end = body.length
+    trim@ while (end > 0) {
+        val maxPrefix = minOf(TOOL_MARKER_OPEN.length, end)
+        for (len in maxPrefix downTo 1) {
+            var isPrefix = true
+            for (j in 0 until len) {
+                if (body[end - len + j] != TOOL_MARKER_OPEN[j]) {
+                    isPrefix = false
+                    break
+                }
+            }
+            if (isPrefix) {
+                end -= len
+                continue@trim
+            }
+        }
+        break
+    }
+    return body.substring(0, end)
+}
+
+/** Producer markers are appended as `\n[tool:<name> <args>]` (TurnController). */
+private fun isProducerMarkerOpener(text: String, index: Int): Boolean {
+    if (index > 0 && text[index - 1] != '\n') return false
+    val first = text.getOrNull(index + TOOL_MARKER_OPEN.length) ?: return false
+    return first.isLetterOrDigit() || first == '.' || first == '_' || first == '-'
+}
+
+private const val TOOL_MARKER_OPEN = "[tool:"
+private const val TOOL_MARKER_COMPACTED_ARGS = "…"
+private const val TOOL_MARKER_NAME_MAX_CHARS = 64
+
+/**
+ * Bound inline local-tool markers (`[tool:name args]`) to
+ * `[tool:name …]` for over-cap hydrated rows (see [cappedHistoryText]).
+ *
+ * Only the args echo is dropped; the marker and name stay so the model can
+ * still see that the tool call happened. The name is additionally capped at
+ * [TOOL_MARKER_NAME_MAX_CHARS] UTF-16 units, without splitting a surrogate
+ * pair, so one hostile marker cannot exhaust the row budget. The cap also
+ * applies to over-long names in empty-args/no-args marker shapes (no-args
+ * keeps its shape as `[tool:<name>]`); short marker-shaped fragments are left
+ * verbatim. A `[tool:` fragment without a closing `]` is left untouched
+ * (crafted/partial text: the normal producer always closes the marker).
+ */
+internal fun compactToolMarkers(text: String): String {
+    if (!text.contains(TOOL_MARKER_OPEN)) return text
+    val sb = StringBuilder(text.length)
+    var i = 0
+    while (i < text.length) {
+        val start = text.indexOf(TOOL_MARKER_OPEN, i)
+        if (start < 0) {
+            sb.append(text, i, text.length)
+            break
+        }
+        val end = text.indexOf(']', start + TOOL_MARKER_OPEN.length)
+        if (end < 0) {
+            sb.append(text, i, text.length)
+            break
+        }
+        val nameStart = start + TOOL_MARKER_OPEN.length
+        val nameEnd = text.indexOf(' ', nameStart)
+        val first = text.getOrNull(nameStart)
+        val nameLooksReal = first != null &&
+            (first.isLetterOrDigit() || first == '.' || first == '_' || first == '-')
+        val hasArgs = nameEnd > nameStart && nameEnd < end
+        val nameLimit = if (hasArgs) nameEnd else end
+        val nameTooLong = nameLimit - nameStart > TOOL_MARKER_NAME_MAX_CHARS
+        if (!nameLooksReal || nameEnd == nameStart) {
+            // Marker-shaped fragment (no plausible name); keep it verbatim
+            // rather than guessing at its content.
+            sb.append(text, i, end + 1)
+        } else if (!nameTooLong && (!hasArgs || nameEnd + 1 == end)) {
+            // Short no-args/empty-args markers stay byte-identical; adding
+            // " …" to empty args would grow the marker instead of shrinking it.
+            sb.append(text, i, end + 1)
+        } else if (!hasArgs) {
+            // No args section: keep that shape; appending " …" would grow a
+            // 65-unit name by one character instead of shrinking it.
+            sb.append(text, i, nameStart)
+            sb.append(markerNamePrefix(text, nameStart, nameLimit))
+            sb.append(']')
+        } else {
+            sb.append(text, i, nameStart)
+            sb.append(markerNamePrefix(text, nameStart, nameLimit))
+            sb.append(' ').append(TOOL_MARKER_COMPACTED_ARGS).append(']')
+        }
+        i = end + 1
+    }
+    return sb.toString()
+}
+
+/** First [TOOL_MARKER_NAME_MAX_CHARS] units of the name, never splitting a pair. */
+private fun markerNamePrefix(text: String, start: Int, limit: Int): String {
+    var end = minOf(limit, start + TOOL_MARKER_NAME_MAX_CHARS)
+    if (end < limit && end > start &&
+        text[end - 1].isHighSurrogate() && text[end].isLowSurrogate()
+    ) {
+        end--
+    }
+    return text.substring(start, end)
 }
 
 /** Production wiring for [ChatViewModel] (shares the process-singleton endpoint store). */

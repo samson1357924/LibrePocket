@@ -300,7 +300,8 @@ internal enum class DurableAdmission {
  * P2 slice opt-in (see below) attaches the single-tool closed loop.
  *
  * P2 safe slice (#19, default-off): when constructed with a [SafeToolSlice],
- * the single wired tool (`lsp.symbols`, the only `executionReady=true` entry)
+ * the single `executionReady` tool (`lsp.symbols`; the loop exists only when a
+ * caller attaches a slice, and production attaches none)
  * runs a same-turn closed loop — request tools → model ToolDone → schema
  * validation → latest scope/policy re-check → executor → typed result →
  * provider continuation → final UI/transcript. All other tools stay
@@ -4770,7 +4771,7 @@ class TurnController(
       appendAssistantPlaceholder(attemptRunId)
       var failed: StreamEvent.Failed? = null
       var done = false
-      // P2 slice: completed model calls for the single wired tool, executed
+      // P2 slice: completed model calls for the single slice tool, executed
       // after a successful collect (same turn). Calls for any other tool stay
       // records-only (marker + transcript, never executed).
       val sliceCalls = mutableListOf<dev.librepocket.provider.ToolCall>()
@@ -4818,7 +4819,7 @@ class TurnController(
           failed = StreamEvent.Failed("incomplete tool continuation", retryable = true)
         }
         // P2 slice (default-off): same-turn tool continuation for the single
-        // wired tool. Cancel between collect and execution aborts here with
+        // slice tool. Cancel between collect and execution aborts here with
         // zero further effects (ensureActive + the loop's own checks throw
         // CancellationException, which the catch below rethrows). A failed
         // continuation falls into the existing retry/terminal logic below.
@@ -5317,7 +5318,7 @@ class TurnController(
     writeNotice {
       orderedTranscript.onToolDone(attemptRunId, event.toolIndex, event.id, event.name, event.argumentsJson)
     }
-    // P2 slice: only the single wired tool proceeds to execution
+    // P2 slice: only the single slice tool proceeds to execution
     // (after a successful collect, same turn); everything else stays
     // records-only even when a loop is attached. A null callback means
     // record-only (tool continuation second round).

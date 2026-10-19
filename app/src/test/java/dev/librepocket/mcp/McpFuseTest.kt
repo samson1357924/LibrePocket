@@ -93,6 +93,73 @@ class McpFuseTest {
         }
     }
 
+    @Test fun invalidClientArgsMapToProtocolWithoutVaultHttpOrBreaker() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // No response enqueued: any HTTP attempt would surface as a failure.
+            val clock = Clock(0L)
+            val breaker = McpCircuitBreaker(maxFailures = 3, openMs = 60_000L, clockMs = clock::get)
+            val vaultMustNotBeRead = object : KeyVault {
+                override suspend fun putKey(providerId: String, apiKey: CharArray) = error("no put")
+                override suspend fun getKey(providerId: String): CharArray? =
+                    error("client-arg rejection must not touch the vault")
+                override suspend fun deleteKey(providerId: String) = error("no delete")
+                override suspend fun hasKey(providerId: String): Boolean = error("no hasKey")
+            }
+            val s = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), keyId = "mcp:s1"),
+                keyVault = vaultMustNotBeRead,
+                transport = McpTransport(),
+                breaker = breaker,
+                clockMs = clock::get,
+            )
+            for (bad in listOf("[1,2]", "not json", "\",\"extra\":true")) {
+                val r = s.callTool("search", bad)
+                assertEquals("client-arg '$bad' must fail closed as PROTOCOL", McpStatus.PROTOCOL, r.status)
+                assertEquals(null, r.resultJson)
+            }
+            // Client-arg errors are caller bugs, not transport failures: no
+            // token/vault read, no request, no breaker count.
+            assertEquals(0, web.requestCount)
+            assertEquals(0, breaker.failureCount())
+            assertFalse(breaker.isOpen())
+
+            // Once open, the breaker check also stays ahead of client-arg
+            // validation: malformed args still report CIRCUIT_OPEN, with no
+            // vault read, HTTP attempt, or extra breaker count.
+            repeat(3) { breaker.onFailure() }
+            assertTrue(breaker.isOpen())
+            val failuresWhileOpen = breaker.failureCount()
+            assertEquals(McpStatus.CIRCUIT_OPEN, s.callTool("search", "[1]").status)
+            assertEquals(0, web.requestCount)
+            assertEquals(failuresWhileOpen, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun disabledConfigShortCircuitsBeforeClientArgValidation() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            val clock = Clock(0L)
+            val s = McpServer(
+                config = McpServerConfig.disabled(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(clockMs = clock::get),
+                clockMs = clock::get,
+            )
+            // Cheap config check stays ahead of body validation: a disabled
+            // server reports DISABLED (not PROTOCOL) for malformed args.
+            assertEquals(McpStatus.DISABLED, s.callTool("search", "[1]").status)
+            assertEquals(0, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
     @Test fun windowExpiryRecovers() = runBlocking {
         val web = MockWebServer()
         web.start()

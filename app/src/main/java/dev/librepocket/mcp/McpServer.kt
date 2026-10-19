@@ -49,6 +49,26 @@ import kotlinx.coroutines.CancellationException
  *  （WRITE 未確認不得調 [callTool]，見 [McpScope]）；
  * - 綁定：`keyId` 與 `baseUrl` 無自動綁定，換 URL 不得靜默沿用舊 key，
  *   接線前須補重綁確認（對照 Setup S4-C，見 THREAT_MODEL Target）。
+ *
+ * baseUrl 形狀先驗（fail-closed，配置問題不當傳輸失敗）：
+ * [McpWire.isValidBaseUrl] 在讀 vault / 發 HTTP / 計熔斷之前先確認地址可形成
+ * 有效 http(s) endpoint；blank 或 malformed 一律回 UNAUTHORIZED（與既有 blank
+ * 語義一致），且零 vault 讀取、零 HTTP、零熔斷計數——否則 malformed URL 會在
+ * 傳輸層拋 IllegalArgumentException，被外層 catch 映射成 TRANSPORT 並計一次
+ * 熔斷失敗（配置錯誤污染熔斷器，幾次壞設定就打開整台機器的 MCP 通道）。
+ * [McpWire.requireSecureEndpoint] 另有一道更嚴的傳輸預驗（明文非回環 → PROTOCOL、
+ * userinfo／backslash／單標籤 authority 一律拒），兩者並存、不互相取代。
+ *
+ * 順序（兩個方法一致，僅 callTool 多一層 body 校驗）：
+ * 1. 停用 → DISABLED（最便宜，短路一切）；
+ * 2. 熔斷開路 → CIRCUIT_OPEN（不發 HTTP；既有語義不動）；
+ * 3. callTool 專屬：client 參數 body 建構失敗 → PROTOCOL（caller bug，
+ *    零 vault / 零 HTTP / 零熔斷；malformed args 必須先於 baseUrl 判定，
+ *    否則壞參數會被錯標成 UNAUTHORIZED）；
+ * 4. baseUrl 形狀 → UNAUTHORIZED（零 vault / 零 HTTP / 零熔斷）；
+ * 5. vault 讀 key（缺 key → UNAUTHORIZED，零熔斷）；
+ * 6. HTTP（401/403 → UNAUTHORIZED+計熔斷；逾時 → TIMEOUT+計熔斷；其他失敗 →
+ *    TRANSPORT+計熔斷；body 形狀錯 → PROTOCOL+計熔斷）。
  */
 class McpServer(
     private val config: McpServerConfig,
@@ -80,6 +100,16 @@ class McpServer(
         }
         if (config.baseUrl.isBlank()) {
             // 空地址：配置錯誤，不碰 vault、不計熔斷（UNAUTHORIZED，與 vault-miss 同待遇）。
+            return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, elapsedMs(start))
+        }
+        // baseUrl 形狀先驗（P2 slice 硬化；在 vault / HTTP / 熔斷計數之前）：
+        // malformed/blank 地址是**配置問題**，不是傳輸失敗——不得讀 vault、
+        // 不得發 HTTP、不得計熔斷。否則壞地址會落到傳輸層拋
+        // IllegalArgumentException，被外層 catch 映射成 TRANSPORT 並計一次
+        // 熔斷失敗（配置錯誤污染全域共享的熔斷器：幾次壞設定就打開整台機器
+        // 的 MCP 通道）。[McpWire.isValidBaseUrl] 對「使用者寫的原始地址」判定
+        // （不是對 endpoint() 的改寫結果），刻意比 OkHttp 嚴。
+        if (!McpWire.isValidBaseUrl(config.baseUrl)) {
             return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
         try {
@@ -196,11 +226,17 @@ class McpServer(
     /**
      * tools/call。
      *
-     * @param argumentsJson 必須是合法 JSON object 文本（空字串視為 `{}`）；
+     * @param argumentsJson 必須是合法 JSON object 文本（空字串視為 `{}`；
+     *   trim 後為空亦視為 `{}`——Kotlin `trim()` 含 Unicode 空白）；
      *   非法（空白 tool 名／**已限定名 `mcp.…`／C0-DEL 控制字元／超 128 UTF-16 units**
-     *   （[McpScope.requireBareToolName]，C-02 fail-closed）／非 object／畸形）即回
+     *   （[McpScope.requireBareToolName]，C-02 fail-closed）／非 object／畸形／逾限
+     *   （[McpWire.callBody] 經 [McpWire.parseStrictDoc] 嚴格驗證））即回
      *   PROTOCOL，不發送、不碰 vault、不計熔斷。只駐記憶體，不寫盤、不進稽核
      *   （稽核見 [McpCallResult.auditMap]）。
+     *
+     * baseUrl 形狀（[McpWire.isValidBaseUrl]）在 body 校驗**之後**、vault 之前驗證：
+     * 壞參數仍優先報 PROTOCOL（不得被改標成 UNAUTHORIZED），壞地址則零 vault／
+     * 零 HTTP／零熔斷。停用／熔斷開路仍先短路（DISABLED／CIRCUIT_OPEN 不驗參數）。
      *
      * toolName 形狀（C-02）：只收遠端 **bare** 名——已限定名（保留前綴 `mcp.` 開頭，
      * 含 [McpScope.switchKey] 授權鍵形狀 `mcp.<len>|<id>|<tool>` 與展示形狀
@@ -246,6 +282,12 @@ class McpServer(
         }
         if (config.baseUrl.isBlank()) {
             // 空地址：配置錯誤，不碰 vault、不計熔斷（沿用 UNAUTHORIZED 語義）。
+            return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, elapsedMs(start))
+        }
+        // baseUrl 形狀先驗（P2 slice 硬化）：**在 body 校驗之後、vault 之前**——
+        // 壞參數仍優先報 PROTOCOL（不得被改標成 UNAUTHORIZED），而壞地址則
+        // 零 vault／零 HTTP／零熔斷（配置問題不得污染全域共享的熔斷器）。
+        if (!McpWire.isValidBaseUrl(config.baseUrl)) {
             return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
         try {

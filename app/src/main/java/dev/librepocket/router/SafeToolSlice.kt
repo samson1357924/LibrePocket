@@ -29,7 +29,9 @@ import java.time.Clock
 import kotlin.coroutines.coroutineContext
 
 /**
- * P2 safe vertical slice (#19): the single wired tool's closed loop.
+ * P2 safe vertical slice (#19): the single `executionReady` tool's closed loop.
+ * Opt-in by construction: production sessions are built without a slice
+ * (`ChatSessionFactory.toolSlice=null`, records-only); tests attach this loop.
  *
  * Owns exactly one tool ([TOOL_NAME] = `lsp.symbols`, READ-only, deterministic
  * [LspTools.StubBackend] echo): request-tools offer → schema validation →
@@ -95,7 +97,7 @@ class SafeToolSlice(
         require(maxCallsPerTurn in 1..8) { "maxCallsPerTurn must be 1..8, was $maxCallsPerTurn" }
     }
     companion object {
-        /** The single wired tool (the only `executionReady=true` entry). */
+        /** The single slice tool (registry `executionReady=true`; loop is opt-in/test-attached). */
         const val TOOL_NAME: String = "lsp.symbols"
 
         /** Execution-basis policy action (known action; default ASK → slice needs ALLOW). */
@@ -425,6 +427,8 @@ class SafeToolSlice(
      * Durability: the exec-once guarantee is turn-layer, not process-level.
      * The engine marks the round executed before calling [execute], so a
      * same-turn retry never re-executes, and no tool round resumes on reopen.
+     * There is no durable structured tool-result event: reopened model
+     * history sees only the inline marker text (when the flush below landed).
      * Result markers are appended to the attempt partial through the normal
      * bounded transcript flush, which is best-effort: a process kill before
      * the next flush can lose the marker suffix (or a kill during [execute]

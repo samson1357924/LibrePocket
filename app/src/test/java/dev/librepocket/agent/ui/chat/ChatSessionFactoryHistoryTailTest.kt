@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -183,6 +184,37 @@ class ChatSessionFactoryHistoryTailTest {
         }
     }
 
+    @Test fun open_giantAssistantRowCompactsToolMarkersInModelContext() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        val args = "a".repeat(10_000)
+        val huge = "answer\n[tool:lsp.symbols $args]" + "z".repeat(15_000)
+        transcripts.appendEvent(event(sid, "r-tool", "user", "q"))
+        transcripts.appendEvent(event(sid, "r-tool", "assistant", huge))
+
+        val provider = TailFakeProvider {
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "fresh"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val opened = factoryWith(transcripts, provider).open(sampleEndpoint(), sid)
+        try {
+            opened.session.send("q-new")
+            val req = provider.seenRequests.single()
+            val hydrated = req.messages[1].text
+            // Model context: marker bounded, args echo dropped, answer kept.
+            assertTrue(hydrated.contains("[tool:lsp.symbols …]"))
+            assertFalse(hydrated.contains("a".repeat(32)))
+            assertTrue(hydrated.contains("z".repeat(1_000)))
+            // Persistence is untouched: compaction is a read-path projection.
+            val raw = transcripts.loadEvents(sid, 0, 10).first { it.kind == "assistant" }.text
+            assertEquals(huge, raw)
+        } finally {
+            opened.session.close()
+        }
+    }
+
     @Test fun cappedHistoryText_boundary() {
         val factory = factoryWith(FakeSessionStore(), TailFakeProvider())
         val exact = "y".repeat(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE)
@@ -192,6 +224,115 @@ class ChatSessionFactoryHistoryTailTest {
         val capped = factory.cappedHistoryText(over)
         assertTrue(capped.endsWith(HISTORY_TRUNCATION_MARKER))
         assertEquals(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE + HISTORY_TRUNCATION_MARKER.length, capped.length)
+    }
+
+    @Test fun cappedHistoryText_compactsToolMarkerArgsBeforeCap() {
+        // A huge inline args echo is audit text; it must not consume the row
+        // budget or push the visible answer past the 20k cut. Compaction keeps
+        // the marker (name only) so the model still sees the tool-call trace.
+        val args = "a".repeat(10_000)
+        val text = "head\n[tool:lsp.symbols $args]" + "z".repeat(15_000)
+        assertTrue(text.length > MODEL_HISTORY_MAX_CHARS_PER_MESSAGE)
+        val capped = cappedHistoryText(text)
+        assertTrue("marker survives in bounded form", capped.contains("[tool:lsp.symbols …]"))
+        assertFalse("args echo must be dropped", capped.contains("a".repeat(32)))
+        assertTrue("answer after the marker must not be pushed out", capped.contains("z".repeat(1_000)))
+        assertTrue(capped.endsWith(HISTORY_TRUNCATION_MARKER))
+    }
+
+    @Test fun cappedHistoryText_neverEndsInsideToolMarker() {
+        // The 20k cut can land in the middle of a compacted marker; a partial
+        // "[tool:lsp.symbol…" is not replayable and must be dropped instead.
+        // Producer markers start at line start (TurnController appends "\n").
+        val prefixLen = MODEL_HISTORY_MAX_CHARS_PER_MESSAGE - 10
+        val text = "y".repeat(prefixLen - 1) + "\n" +
+            "[tool:lsp.symbols " + "b".repeat(100) + "]"
+        val body = cappedHistoryText(text).removeSuffix(HISTORY_TRUNCATION_MARKER)
+        assertFalse(body.contains("[tool:"))
+        assertEquals(prefixLen, body.length)
+    }
+
+    @Test fun cappedHistoryText_dropsEveryTrailingPartialMarkerOpener() {
+        // Two producer-shaped openers straddle the cut with no closing bracket:
+        // dropping only the last one would leave the first fragment visible.
+        val text = "y".repeat(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE - 16) +
+            "\n[tool:a\n[tool:b" + "z".repeat(10)
+        val body = cappedHistoryText(text).removeSuffix(HISTORY_TRUNCATION_MARKER)
+        assertFalse(body.contains("[tool:"))
+        assertEquals(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE - 15, body.length)
+    }
+
+    @Test fun cappedHistoryText_neverEndsInsideMarkerOpenerPrefix() {
+        // The cut may fall 1-6 chars into the opener itself, not just after it.
+        for (opener in listOf("[", "[t", "[to", "[too", "[tool", "[tool:")) {
+            val prefixLen = MODEL_HISTORY_MAX_CHARS_PER_MESSAGE - opener.length
+            val text = "y".repeat(prefixLen - 1) + "\n" + opener +
+                "name args]\n" + "z".repeat(100)
+            val body = cappedHistoryText(text).removeSuffix(HISTORY_TRUNCATION_MARKER)
+            assertEquals("opener='$opener'", prefixLen, body.length)
+            assertFalse("opener='$opener'", body.endsWith("["))
+        }
+    }
+
+    @Test fun cappedHistoryText_trimsOverlappingOpenerPrefixes() {
+        // Trimming one prefix can expose another ("[[tool:" / "[tool:[").
+        for (tail in listOf("[[tool:", "[tool:[")) {
+            val text = "y".repeat(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE - tail.length) +
+                tail + "z".repeat(10)
+            val body = cappedHistoryText(text).removeSuffix(HISTORY_TRUNCATION_MARKER)
+            assertFalse("tail='$tail'", body.endsWith("["))
+            assertEquals(
+                "tail='$tail'",
+                MODEL_HISTORY_MAX_CHARS_PER_MESSAGE - 7,
+                body.length,
+            )
+        }
+    }
+
+    @Test fun cappedHistoryText_underCapRowsReplayByteIdentical() {
+        // Compaction is strictly an over-cap projection: short rows containing
+        // real markers must reach the provider unchanged.
+        for (text in listOf(
+            "[tool:lsp.symbols {\"q\":\"x\"}]",
+            "a\n[tool:t {\"k\":1}]\nb",
+        )) {
+            assertEquals(text, cappedHistoryText(text))
+        }
+    }
+
+    @Test fun cappedHistoryText_ignoresMidLineMarkerFragment() {
+        // A literal mid-line "[tool:" in an ordinary over-cap paste is not a
+        // producer marker; truncating at it would drop most of the row.
+        val text = "prefix [tool:realname " + "y".repeat(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE)
+        val body = cappedHistoryText(text).removeSuffix(HISTORY_TRUNCATION_MARKER)
+        assertEquals(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE, body.length)
+        assertTrue(body.endsWith("y"))
+    }
+
+    @Test fun compactToolMarkers_boundsNamesAndLeavesFragmentsVerbatim() {
+        // Normal rows bypass compaction entirely (call path above), but the
+        // helper itself only touches real marker shapes.
+        assertEquals("[tool:oops] and [tool:] stay", compactToolMarkers("[tool:oops] and [tool:] stay"))
+        assertEquals("[TOOL:y z]", compactToolMarkers("[TOOL:y z]"))
+        assertEquals(
+            "[tool:${"n".repeat(64)} …]",
+            compactToolMarkers("[tool:${"n".repeat(200)} args]"),
+        )
+        assertEquals("[tool:lsp.symbols …]", compactToolMarkers("[tool:lsp.symbols {\"q\":\"x\"}]"))
+        // Short empty/no-args markers stay byte-identical: adding " …" would
+        // grow the marker; over-long names are capped even in those shapes.
+        assertEquals("[tool:a ]", compactToolMarkers("[tool:a ]"))
+        assertEquals("[tool:oops]", compactToolMarkers("[tool:oops]"))
+        assertEquals("[tool:${"n".repeat(64)} …]", compactToolMarkers("[tool:${"n".repeat(200)} ]"))
+        assertEquals("[tool:${"n".repeat(64)}]", compactToolMarkers("[tool:${"n".repeat(200)}]"))
+        // 65-unit no-args name would grow if compacted to "[name …]"; the
+        // no-args shape shrinks instead.
+        assertEquals("[tool:${"n".repeat(64)}]", compactToolMarkers("[tool:${"n".repeat(65)}]"))
+        // The 64-unit cap must not split a surrogate pair.
+        assertEquals(
+            "[tool:${"n".repeat(63)} …]",
+            compactToolMarkers("[tool:${"n".repeat(63)}😀${"x".repeat(200)} args]"),
+        )
     }
 
     /**

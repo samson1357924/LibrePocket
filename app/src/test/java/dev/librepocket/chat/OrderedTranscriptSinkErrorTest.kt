@@ -80,7 +80,14 @@ class OrderedTranscriptSinkErrorTest {
             }
           }
           val elapsed = System.currentTimeMillis() - started
-          assertTrue("post-fatal core must fail fast, took ${elapsed}ms", elapsed < 4_000L)
+          // Fail-fast hang pin: the bounded call's blanket CancellationException
+          // catch cannot distinguish a timed-out park from a real fail-fast
+          // (a withTimeout TCE subclasses CE), so this wall check is the direct
+          // signal. 1_000ms is far above the healthy ~ms fail-fast path while a
+          // path that actually waits its budget lands ~4_000ms and fails here;
+          // the old < 4_000 ceiling only restated the surrounding withTimeout
+          // and widened the CI-pause flake window for no coverage gain.
+          assertTrue("post-fatal core must fail fast, took ${elapsed}ms", elapsed < 1_000L)
           assertTrue(sink.interruptedRunIds().contains("run-next"))
           assertTrue(sink.pendingRunIds().isEmpty())
           assertTrue("sealed barrier must still drain", sink.flush())
@@ -143,7 +150,11 @@ class OrderedTranscriptSinkErrorTest {
             }
           }
           val elapsed = System.currentTimeMillis() - started
-          assertTrue("post-fatal core must fail fast, took ${elapsed}ms", elapsed < 4_000L)
+          // Same fail-fast hang pin as the sibling above: the blanket CE catch
+          // cannot distinguish a timed-out park (TCE subclasses CE), so this
+          // wall check is the direct signal; 1_000ms keeps the pin with a
+          // CI-pause-safe margin far below the ~4_000ms budget-park shape.
+          assertTrue("post-fatal core must fail fast, took ${elapsed}ms", elapsed < 1_000L)
           assertTrue(sink.interruptedRunIds().contains("run-next"))
           assertTrue(sink.pendingRunIds().isEmpty())
           sink.shutdown()?.join()
@@ -204,7 +215,11 @@ class OrderedTranscriptSinkErrorTest {
             }
           }
           val elapsed = System.currentTimeMillis() - started
-          assertTrue("post-fatal core must fail fast, took ${elapsed}ms", elapsed < 4_000L)
+          // Same fail-fast hang pin as the sibling above: the blanket CE catch
+          // cannot distinguish a timed-out park (TCE subclasses CE), so this
+          // wall check is the direct signal; 1_000ms keeps the pin with a
+          // CI-pause-safe margin far below the ~4_000ms budget-park shape.
+          assertTrue("post-fatal core must fail fast, took ${elapsed}ms", elapsed < 1_000L)
           assertTrue(sink.interruptedRunIds().contains("run-next"))
           assertTrue(sink.pendingRunIds().isEmpty())
           sink.shutdown()?.join()
@@ -759,10 +774,215 @@ class OrderedTranscriptSinkErrorTest {
             )
             assertTrue(sink.pendingRunIds().isEmpty())
             assertTrue("drain must still seal after the swallowed Error", sink.isSealed())
+            // Tier-agnostic commit discriminator: a drain-timeout orphan reads
+            // UNcommitted whether its mark is the provisional tier
+            // ([interrupted] only, as shaped here) or the [storeFailed]
+            // poison tier — both mean nothing wrote, both leave the count 0.
+            // This shape cannot distinguish the two tiers; exposing a
+            // storeFailed query seam was deliberately NOT done — one boolean
+            // accessor would expose teardown internals for a single shape's
+            // discriminator (house minimal-seam practice).
+            assertFalse("drained orphan must read uncommitted", sink.isCoreCommitted("orphan-1"))
           }
         } finally {
           // Idempotent unblock, also on a failed assert.
           gate.complete(Unit)
+        }
+      }
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  /**
+   * F5 pin: [OrderedTranscriptSink.shutdown]'s FLUSH-catch swallow lane
+   * (`catch (_: Throwable) { false }` around the internal bounded
+   * [OrderedTranscriptSink.flush]). Injection point: the production
+   * [OrderedTranscriptSink.afterBarrierSendForTest] hook throwing a plain
+   * (non-VM) [Error] while the writer is still alive — the barrier send
+   * itself succeeds (channel open), so the detached hook is reached inside
+   * the teardown's own flush, there is no catch inside flush that covers a
+   * non-CE fault, and the Error escapes [OrderedTranscriptSink.flush]
+   * verbatim (fail-loud shape documented in flush's KDoc) into exactly this
+   * teardown swallow lane: `flushed = false`, the drain still runs (nothing
+   * admitted here, so no orphans, no marks), the teardown seals, and
+   * durability truth stays honest (`flushed == false` drove the fail-closed
+   * path; no core write ever owed an ack, so nothing was fabricated).
+   *
+   * Capture style mirrors the two settle VM-fatal siblings above:
+   * `invokeOnCompletion` + `CompletableDeferred<Throwable?>`, with the same
+   * no-race mechanics (a job already completed at registration fires the
+   * handler synchronously). The teardown's completion CAUSE is the trailing
+   * `writerScope.cancel()` self-cancel CE — the deterministic always-shape
+   * the non-VM settle sibling documents — so asserting the cause is that CE
+   * (never the AssertionError) is exactly the swallow proof; no further
+   * cause details are asserted (payload is not carried through the swallow).
+   * Hook faults are test-only: the hook is null in production.
+   */
+  @Test fun shutdownFlushCatchSwallowsNonVMFatalError_stillDrainsAndSeals() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val delegate = object : TranscriptSink {
+        override suspend fun onTurnStarted(runId: String, text: String) = Unit
+        override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
+        override suspend fun onTurnFailed(runId: String, error: String) = Unit
+        override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
+        override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
+        override suspend fun onSteerQueued(text: String) = Unit
+        override suspend fun onToolDone(
+          runId: String,
+          toolIndex: Int,
+          id: String,
+          name: String,
+          argumentsJson: String,
+        ) = Unit
+        override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 8)
+      sink.afterBarrierSendForTest = { throw AssertionError("simulated flush fatal") }
+      runBlocking {
+        withTimeout(4_000) {
+          val job = checkNotNull(sink.shutdown()) { "first shutdown must return the teardown job" }
+          val causeSignal = CompletableDeferred<Throwable?>()
+          job.invokeOnCompletion { causeSignal.complete(it) }
+          val cause = causeSignal.await()
+          assertTrue(
+            "flush Error must land in the swallow lane (completion cause is the trailing self-cancel CE, not the AssertionError), got $cause",
+            cause is CancellationException,
+          )
+          // The swallow never aborts the teardown: drain + seal still happen.
+          assertTrue("swallowed flush Error must still drain and seal", sink.isSealed())
+          assertTrue("no core write admitted, so no orphan marks", sink.interruptedRunIds().isEmpty())
+          assertTrue(sink.pendingRunIds().isEmpty())
+          assertFalse("the swallow must never fabricate durability truth", sink.hasDurableFailures())
+        }
+      }
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  /**
+   * F2 contract pin (deterministic seam-level control in the
+   * [timeoutMarkClearsOnLaterCommitSameId] style): a runId resolved as a
+   * proven-undelivered ghost OWNS the resolved poison slot, and a follow-up
+   * genuine store failure for that SAME id records NOTHING —
+   * [OrderedTranscriptSink.markInterrupted] and
+   * [OrderedTranscriptSink.markStoreFailure] share the
+   * [OrderedTranscriptSink.isResolvedUndelivered] early-return, so
+   * [OrderedTranscriptSink.hasDurableFailures] reads false-clean afterwards.
+   * This is the current intended semantic (the resolve tier wins the slot by
+   * design — the ghost may otherwise never late-commit), correct ONLY under
+   * the fresh-runId retry contract: `TurnController.settlePendingAdmission`
+   * resolves the ghost and rolls the user row back with the SAME opId
+   * retryable on a FRESH id, and GhostUndeliveredDurableTest#controllerGhostBarrierProofRetryKeepsFlushDurableClean
+   * pins that the same-session same-opId retry admits on a fresh id
+   * (`retryId != ghost`). A production path reusing a resolved runId as a
+   * real admission id is documented-unsupported here: the genuine failure
+   * tier cannot mark it (poison gap) — reuse support would require extending
+   * the poison logic first, which is why no tier-promotion path exists.
+   *
+   * Interleave (existing seams only, no new hook): write #1 is admitted and
+   * parked inside the writer's delegate (id admitted-pending), then resolved
+   * via the public production seam
+   * [OrderedTranscriptSink.tryResolveUndelivered]. Its flush-barrier
+   * non-delivery proof is the controller's precondition (see its KDoc);
+   * this seam-level control drops the proof phase but drives the same
+   * poison-slot collision the F2 comments guard. The genuine failure is a
+   * REAL second core write of the same id whose delegate throws
+   * IOException — the writer finally routes it through
+   * [OrderedTranscriptSink.markStoreFailure], which the resolved guard
+   * swallows verbatim.
+   */
+  @Test fun ghostResolveThenSameIdGenuineFailure_staysCleanUnderFreshRunIdContract() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val entered = CompletableDeferred<Unit>()
+      val gate = CompletableDeferred<Unit>()
+      // Mutated only on the single writer thread (same pattern as `userCalls`
+      // in storeFailurePoisonSurvivesLaterCommitSameId).
+      var ghostWrites = 0
+      val delegate = object : TranscriptSink {
+        override suspend fun onTurnStarted(runId: String, text: String) {
+          if (runId == "ghost-then-fail") {
+            if (ghostWrites++ == 0) {
+              entered.complete(Unit)
+              gate.await() // write #1 parked in the writer, id admitted-pending
+            } else {
+              throw IOException("fault-injected disk failure") // write #2: genuine failure, same id
+            }
+          }
+        }
+        override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
+        override suspend fun onTurnFailed(runId: String, error: String) = Unit
+        override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
+        override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
+        override suspend fun onSteerQueued(text: String) = Unit
+        override suspend fun onToolDone(
+          runId: String,
+          toolIndex: Int,
+          id: String,
+          name: String,
+          argumentsJson: String,
+        ) = Unit
+        override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 8)
+      runBlocking {
+        withTimeout(10_000) {
+          // Write #1 admitted; its waiter is parked on the ack while the
+          // writer is parked inside the delegate. runCatching: the resolver
+          // fails this dangling ack on purpose (it can never late-commit).
+          val orphan = async { runCatching { sink.onTurnStarted("ghost-then-fail", "before resolve") } }
+          entered.await() // writer consumed the entry; parked in the delegate
+          assertTrue(
+            "resolution must win the poison slot while the id is admitted-pending",
+            sink.tryResolveUndelivered("ghost-then-fail"),
+          )
+          assertTrue(sink.isResolvedUndelivered("ghost-then-fail"))
+          assertTrue(
+            "resolved ghost keeps its visible true INTERRUPTED mark",
+            sink.interruptedRunIds().contains("ghost-then-fail"),
+          )
+          assertFalse(
+            "proven-undelivered ghost must not poison durability",
+            sink.hasDurableFailures(),
+          )
+          // Through the (ack-released) ghost block: the row still commits,
+          // untouched by the resolved tier (no storeFailed pin to honor).
+          gate.complete(Unit)
+          withTimeout(5_000) { while (!sink.isCoreCommitted("ghost-then-fail")) delay(10) }
+          // Write #2, same id: the genuine failure the fresh-runId contract
+          // forbids. The writer finally routes it to
+          // [OrderedTranscriptSink.markStoreFailure], which early-returns on
+          // the resolved id — the pin below.
+          try {
+            sink.onTurnStarted("ghost-then-fail", "same-id reuse after resolve")
+            fail("genuine failure must not ack as durable")
+          } catch (e: IOException) {
+            // Explicit forward: the failed entry's ack, never a false success.
+          }
+          assertEquals(
+            "only the resolved (pre-failure) write counts as committed",
+            1,
+            sink.coreCommitCount("ghost-then-fail"),
+          )
+          assertTrue(
+            "resolved ghost stays visible after the genuine failure",
+            sink.interruptedRunIds().contains("ghost-then-fail"),
+          )
+          assertTrue(
+            "the resolve tier keeps owning the poison slot",
+            sink.isResolvedUndelivered("ghost-then-fail"),
+          )
+          assertTrue(sink.pendingRunIds().isEmpty())
+          assertFalse(
+            "documented-unsupported same-id reuse reads false-clean; lifting is correct only under the fresh-runId retry contract",
+            sink.hasDurableFailures(),
+          )
+          sink.shutdown()?.join()
         }
       }
     } finally {

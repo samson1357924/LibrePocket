@@ -1189,6 +1189,23 @@ class OrderedTranscriptSink(
    * [hasDurableFailures]/[flushDurable] as usual). Cancellation of the
    * caller still propagates.
    *
+   * Enumerated false/throw shapes completing the list above:
+   * - post-seal-join timeout: the "already sealed" path waits on
+   *   [writer.join] INSIDE the same [withTimeoutOrNull] budget (see the
+   *   [ClosedSendChannelException] guard below), so that join timing out
+   *   also yields false — only a completed post-seal join returns true;
+   * - [timeoutMs] <= 0: [withTimeoutOrNull] returns null for a non-positive
+   *   budget WITHOUT running this body (verified against
+   *   kotlinx-coroutines 1.10.1) — no admission-tail await, no barrier send,
+   *   no exception; [flush] short-circuits to false;
+   * - test-hook throw: [afterBarrierSendForTest] (null in production) runs
+   *   INSIDE this body right after the barrier send. A [CancellationException]
+   *   from the hook is rethrown unchanged by the dedicated catch below (a
+   *   hook CE is not caller cancellation, but it is never swallowed), and any
+   *   non-CE fault escapes [flush] verbatim (fail-loud) — which inside
+   *   [shutdown]'s bounded flush call lands in the teardown swallow lane
+   *   (`flushed = false`), never a false drained.
+   *
    * Note on durability: [flush] returns true once the barrier drains through the
    * writer, even if individual core entries encountered store exceptions and were
    * marked interrupted. Callers requiring guaranteed durable persistence without
@@ -1310,8 +1327,9 @@ class OrderedTranscriptSink(
             //   unchanged;
             // - sealed writer: treat as NOT drained (barrierSealed). The
             //   seal already marked every unacked core under [poisonLock],
-            //   so [hasDurableFailures] is true and [flushDurable] returns
-            //   the fail-closed false instead of throwing.
+            //   so [hasDurableFailures] is true when any core was
+            //   outstanding; with none outstanding, `flush() == false`
+            //   alone keeps [flushDurable] fail-closed instead of throwing.
             if (coroutineContext[Job]?.isCancelled == true || !isSealed()) throw e
             barrierSealed = true
           }
@@ -1331,21 +1349,43 @@ class OrderedTranscriptSink(
 
   /**
    * True while the sink's durability truth is poisoned: `[interrupted]` is
-   * non-empty. The set only ever holds two mark kinds with different
-   * permanence —
+   * non-empty. The set only ever holds two mark tiers with different
+   * permanence AND different lift windows —
    * - a genuine persistence failure ([markStoreFailure]): pinned by
-   *   [storeFailed], never cleared — [clearTimeoutMarkOnCommit] refuses it;
-   * - a drain-timeout / seal / fail-fast orphan mark: **provisional** —
-   *   lifted by [clearTimeoutMarkOnCommit] when the still-running writer
-   *   proves the same-id commit (R23-1).
+   *   [storeFailed], never cleared — [clearTimeoutMarkOnCommit] refuses it.
+   *   Note the tier breadth: the writer finally routes EVERY non-null
+   *   core-entry failure into [markStoreFailure], so an in-flight mid-entry
+   *   teardown [CancellationException] and a delegate block's own self-thrown
+   *   CE are genuine-tier too (the [markStoreFailure] KDoc's
+   *   "teardown/fatal mid-entry" clause names the teardown shape; the
+   *   delegate-CE shape rides the same writer-finally routing) —
+   *   never lifted, by the same [storeFailed] pin;
+   * - a drain-timeout / seal / fail-fast orphan mark ([markInterrupted], plus
+   *   the [sealWriter] poison loops and the fail-fast gates of
+   *   [writeCoreTracked]/[writeCoreWithAck]): provisional, but ONLY inside
+   *   the channel-close window — the late-commit lift
+   *   ([clearTimeoutMarkOnCommit]) lives solely in the writer success path,
+   *   so a mark of this tier is lifted only while the writer still drains
+   *   and can run a same-id entry to completion (R23-1); never once
+   *   [writerDead] is set. A [sealWriter] mark is therefore provisional in
+   *   tier (not [storeFailed]-pinned) but permanent in effect — the writer
+   *   is already dead when [sealWriter] runs, so no success-path lift is
+   *   reachable again.
    *
-   * So `true` never means "permanently failed" for the second kind: a failing
-   * read is the fail-closed provisional truth inside that window, and a later
-   * proven commit for the same runId legitimately restores a clean read.
+   * So `true` never means "permanently failed" for the second tier inside
+   * that window: a failing read is the fail-closed provisional truth while
+   * the writer can still prove the row durable, and a later proven commit
+   * for the same runId legitimately restores a clean read. Once the writer
+   * is dead the distinction stops mattering to this boolean — both tiers
+   * read terminal there (no lift is reachable), only the [storeFailed] pin
+   * additionally closes the still-draining window for genuine failures.
    * Deliberately outside this set (and outside this boolean): proven
    * never-delivered ghosts ([resolvedUndelivered] / [markNeverAdmitted]) —
    * they stay visible via [interruptedRunIds] only and never poison
-   * durability truth.
+   * durability truth — including a follow-up genuine store failure for an
+   * already-resolved id, which records nothing (fresh-runId retry contract;
+   * see the contract-boundary comments at the two early-returns in
+   * [markInterrupted]/[markStoreFailure]).
    */
   fun hasDurableFailures(): Boolean = synchronized(poisonLock) { interrupted.isNotEmpty() }
 
@@ -1559,6 +1599,17 @@ class OrderedTranscriptSink(
     // handler below (the resolver fails the ghost ack exceptionally, which
     // re-enters here). Keep it only in the resolved set. Atomic with
     // tryResolve/seal under [poisonLock]: check-then-add has no gap.
+    // Contract boundary (F2): the early-return below also swallows a
+    // post-resolve GENUINE store failure — [markStoreFailure] mirrors this
+    // guard — so that failure records nothing and [hasDurableFailures] reads
+    // false-clean afterwards. Safe today ONLY under the fresh-runId retry
+    // contract (TurnController.settlePendingAdmission: the resolved ghost is
+    // rolled back with the SAME opId retryable on a FRESH id;
+    // GhostUndeliveredDurableTest#controllerGhostBarrierProofRetryKeepsFlushDurableClean
+    // pins the fresh retry id): reusing a resolved runId as a real admission
+    // id is documented-unsupported — the resolve tier owns the poison slot
+    // and the genuine failure tier cannot record into it (poison gap; any
+    // future reuse support must extend the poison logic first).
     synchronized(poisonLock) {
       if (resolvedUndelivered.contains(runId)) {
         pendingCore.remove(runId)
@@ -1600,6 +1651,17 @@ class OrderedTranscriptSink(
    * poison mutation (A1 order).
    */
   internal fun markStoreFailure(runId: String) {
+    // Contract boundary (F2, mirror of [markInterrupted]'s same guard): an
+    // id already in [resolvedUndelivered] records NOTHING here, so a
+    // genuine store failure AFTER a ghost resolve in the same session would
+    // leave [hasDurableFailures] false-clean. This is intended ONLY under
+    // the fresh-runId retry contract (TurnController.settlePendingAdmission:
+    // every post-resolve retry of the same opId mints a FRESH id; pinned by
+    // GhostUndeliveredDurableTest#controllerGhostBarrierProofRetryKeepsFlushDurableClean
+    // where the retry id provably differs): reusing a resolved runId as a
+    // real admission id is documented-unsupported — poison gap, the resolve
+    // tier wins the slot and this genuine tier cannot mark it (any future
+    // reuse support must extend the poison logic first).
     synchronized(poisonLock) {
       if (resolvedUndelivered.contains(runId)) {
         pendingCore.remove(runId)

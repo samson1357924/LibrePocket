@@ -17,9 +17,14 @@ import java.io.File
  * - 子條目 symlink 防衛（NOFOLLOW）：形狀內的 symlink 條目只解除 link 本身——
  *   不遞迴刪除其指向的外部內容、也不還原為正式 skill；真實目錄走
  *   NOFOLLOW 遞迴刪除（內部遭植入 symlink 亦不波及外部）；
- * - 每次啟動刪除類處置設 [SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN] 上限：
- *   超出者保留、下次啟動繼續收斂（崩潰還原型豁免上限，見
- *   cleanupBudget_midRun_restoreExempt）。
+ * - 每次啟動刪除類處置設 [SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN] 上限、
+ *   還原型另有同源獨立的 [SkillInstaller.MAX_RESTORES_PER_RUN] 上限（兩預算
+ *   不互相擠兌）：超出者本 run 保留、下次啟動繼續收斂（分見
+ *   cleanup_deleteBudget_cappedPerRun／cleanup_restoreBudget_cappedPerRun；
+ *   同 run 兩預算並存互不擠兌見 cleanupBudget_midRun_restoreExempt）；
+ * - 還原 target 槽探針為 NOFOLLOW 三態（fail-closed）：槽位被植入 link
+ *   （懸空或指向外部）／屬性不可判定皆不視為候選——絕不以 rename 吃掉
+ *   槽位 link（danglingTargetLinkOccupiedSlot／existingTargetLinkOccupiedSlot）。
  *
  * Skip 語義：以下測試需平台可建 symlink，未支援時以 [org.junit.Assume.assumeNoException]
  * 跳過，非 silent-fail——綠但帶 skip 的 run 並非 symlink 防衛全覆蓋證明，
@@ -28,12 +33,15 @@ import java.io.File
  * cleanup_danglingSymlinkStaleEntry_unlinkOnly、cleanup_realStagingWithInnerSymlink_externalContentsSurvive、
  * cleanup_symlinkUnlink_capped_perRun、cleanup_symlinkDestRoot_isNoop、
  * listResiduals_symlinkDestRoot_isEmpty、installedVersion_symlinkSkillMd_returnsNull、
- * installedVersion_symlinkSkillDir_returnsNull、cleanup_freshLinkStagingShape_unlinkedRegardlessOfAge。
+ * installedVersion_symlinkSkillDir_returnsNull、cleanup_freshLinkStagingShape_unlinkedRegardlessOfAge、
+ * cleanup_danglingTargetLinkOccupiedSlot_bakNotRestoredAsSkill、
+ * cleanup_existingTargetLinkOccupiedSlot_orphanBakDeleted_externalSurvives。
  *
  * 啟動接線（[dev.librepocket.agent.LibrePocketApp.onCreate] 真的呼叫清理）屬
  * Android 行為，由 `LibrePocketAppStartupTest`（Robolectric）覆蓋；
- * 「屬性讀取失敗（AccessDenied 等）一律回 true」的分岔無 JVM 注入縫，
- * 只能真機/手動驗——本檔主張以 CI 綠為準、skip 不計入 symlink 分支覆蓋。
+ * 無注入縫的分岔（「屬性讀取失敗（AccessDenied 等）一律 fail-closed」、還原
+ * target 槽 UNKNOWN→KEPT 等）只能真機/手動驗——本檔主張以 CI 綠為準、
+ * skip 不計入 symlink／屬性分支覆蓋。
  */
 class SkillStartupRecoveryTest {
 
@@ -227,6 +235,108 @@ class SkillStartupRecoveryTest {
         }
     }
 
+    @Test fun cleanup_danglingTargetLinkOccupiedSlot_bakNotRestoredAsSkill() {
+        // 還原 target 槽探針為 NOFOLLOW 三態（fail-closed）：destRoot/<id> 為
+        // 懸空 link 時，跟隨 link 的 File.exists() 會誤判「槽缺席」，其後的還原
+        // rename 會把懸空 link 吃掉（本測釘死該舊形不得復現）。修後：NOFOLLOW
+        // lstat 讀得 link 屬性＝槽位被佔 → 不還原；bak 依現有 cleanup 語意自然
+        // 收斂——新鮮者本 run 受齡期保護保留，過期後按「target 槽在」孤兒族入
+        // 刪除預算刪除；link 全程不動。
+        val parent = tempRoot()
+        try {
+            val root = File(parent, "skills").apply { mkdirs() }
+            val tid = Thread.currentThread().id
+            val id = "dangslot-skill"
+            val link = File(root, id)
+            try {
+                java.nio.file.Files.createSymbolicLink(
+                    link.toPath(),
+                    File(parent, "no-such-target").toPath(),
+                )
+            } catch (e: UnsupportedOperationException) {
+                assumeSymlinkSupported(e)
+            } catch (e: java.io.IOException) {
+                assumeSymlinkSupported(e)
+            }
+            val bak = File(root, ".$id.bak-${Math.abs(System.nanoTime())}-$tid").apply {
+                mkdirs()
+                File(this, "SKILL.md").writeText(skillMd(id, "舊版正文"), Charsets.UTF_8)
+            }
+            // 第一輪：bak 新鮮 → 槽位被佔故不豁免齡期（本 run 保留、下次收斂）。
+            assertEquals(0, SkillInstaller.cleanupStaleStaging(root))
+            assertTrue("新鮮 bak 不得被刪", bak.exists())
+            assertTrue(
+                "懸空 link 不得被 rename 吃掉",
+                java.nio.file.Files.isSymbolicLink(link.toPath()),
+            )
+            // 第二輪：bak 過期 → 槽位被佔（NOFOLLOW 讀得 link 屬性）→ 照孤兒
+            // bak 語意入刪除預算收斂；懸空 link 全程不被還原成真實目錄。
+            assertTrue(
+                "setLastModified must succeed",
+                bak.setLastModified(System.currentTimeMillis() - (25L * 60 * 60 * 1000)),
+            )
+            assertEquals(
+                "槽位被佔 → 過期 bak 按孤兒語意收斂（1）",
+                1,
+                SkillInstaller.cleanupStaleStaging(root),
+            )
+            assertFalse("bak 應已按刪除預算收斂", bak.exists())
+            assertTrue(
+                "懸空 link 不得被還原 rename 吃掉",
+                java.nio.file.Files.isSymbolicLink(link.toPath()),
+            )
+            assertFalse("槽位不得出現真實 skill 目錄", File(root, "$id/SKILL.md").isFile)
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    @Test fun cleanup_existingTargetLinkOccupiedSlot_orphanBakDeleted_externalSurvives() {
+        // 槽位為指向**存在**外部目錄的植入 link：NOFOLLOW lstat 讀得 link 屬性
+        // ＝槽位被佔 → 同樣不視為還原候選（link 不可 rename 還原）；bak 走孤兒
+        // 刪除路徑收斂，link 與指向的外部內容全程不動（防衛還原吃掉 link／
+        // 把指向物頂成正式 skill 的舊形）。
+        val parent = tempRoot()
+        try {
+            val root = File(parent, "skills").apply { mkdirs() }
+            val outside = File(parent, "outside").apply { mkdirs() }
+            val sentinel = File(outside, "sentinel.txt").apply { writeText("keep", Charsets.UTF_8) }
+            val tid = Thread.currentThread().id
+            val id = "linkdir-skill"
+            val link = File(root, id)
+            try {
+                java.nio.file.Files.createSymbolicLink(link.toPath(), outside.toPath())
+            } catch (e: UnsupportedOperationException) {
+                assumeSymlinkSupported(e)
+            } catch (e: java.io.IOException) {
+                assumeSymlinkSupported(e)
+            }
+            val bak = File(root, ".$id.bak-${Math.abs(System.nanoTime())}-$tid").apply {
+                mkdirs()
+                File(this, "SKILL.md").writeText(skillMd(id, "舊版正文"), Charsets.UTF_8)
+                setLastModified(System.currentTimeMillis() - (25L * 60 * 60 * 1000))
+            }
+            assertEquals(
+                "槽位被佔 → bak 照孤兒語意收斂（1）",
+                1,
+                SkillInstaller.cleanupStaleStaging(root),
+            )
+            assertTrue(
+                "link 不得被還原 rename 吃掉",
+                java.nio.file.Files.isSymbolicLink(link.toPath()),
+            )
+            assertTrue("外部 sentinel 必須存活", sentinel.isFile)
+            assertTrue("外部目錄必須保留", outside.isDirectory)
+            assertFalse("bak 應已按刪除預算收斂", bak.exists())
+            assertFalse(
+                "外部不得被侵入任何 skill 內容（防衛以指向物為界的對照）",
+                File(outside, "SKILL.md").isFile,
+            )
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
     @Test fun cleanup_realStagingWithInnerSymlink_externalContentsSurvive() {
         val parent = tempRoot()
         try {
@@ -287,12 +397,66 @@ class SkillStartupRecoveryTest {
         }
     }
 
+    @Test fun cleanup_restoreBudget_cappedPerRun() {
+        // 還原型（每候選除 rename 外：跨檔讀 bak 內 SKILL.md ≤256KB＋frontmatter
+        // 解析＋呼叫方與鎖內各一次 NOFOLLOW 槽探針——非純 O(1)）受同源獨立上限
+        // [SkillInstaller.MAX_RESTORES_PER_RUN]：植入 cap+7 份無歧義 crash-bak
+        // （各自合法 id、NOFOLLOW 判定 target 槽缺席、內容可解析），單 run 恰
+        // 還原 cap 份、其餘 bak 整體保留（列舉順序無關——仿
+        // cleanup_deleteBudget_cappedPerRun 只做計數上界斷言，不斷言具體誰是
+        // 被還原組），剩餘者下次啟動收斂；三態一致：還原型計數計入回傳，
+        // 本 run 超量者計 KEPT（保留原狀，不得被代刪成 DELETED 計數）。
+        val root = tempRoot()
+        try {
+            val extra = 7
+            val total = SkillInstaller.MAX_RESTORES_PER_RUN + extra
+            val tid = Thread.currentThread().id
+            val ids = (0 until total).map { "rstcap-" + it.toString().padStart(3, '0') }
+            val baks = ids.map { id ->
+                File(root, ".$id.bak-${Math.abs(System.nanoTime())}-$tid").apply {
+                    mkdirs()
+                    File(this, "SKILL.md").writeText(skillMd(id, "舊版正文"), Charsets.UTF_8)
+                }
+            }
+            val first = SkillInstaller.cleanupStaleStaging(root)
+            assertEquals("單次還原只到還原型上限", SkillInstaller.MAX_RESTORES_PER_RUN, first)
+            val restoredIds = ids.count { File(root, "$it/SKILL.md").isFile }
+            assertEquals(
+                "恰 cap 份以 rename 還原成真實 skill（內容即 bak 原物）",
+                SkillInstaller.MAX_RESTORES_PER_RUN,
+                restoredIds,
+            )
+            assertEquals(
+                "其餘 bak 原樣保留（本 run 保留、未還原也不被代刪）",
+                extra,
+                baks.count { it.isDirectory && File(it, "SKILL.md").isFile },
+            )
+            assertEquals(
+                "回傳計數為 combo（還原＋刪除）；本例純還原時 first 應恰等於還原數",
+                first,
+                restoredIds,
+            )
+            val second = SkillInstaller.cleanupStaleStaging(root)
+            assertEquals("剩餘候選下次啟動收斂", extra, second)
+            assertEquals(0, SkillInstaller.cleanupStaleStaging(root))
+            assertTrue(
+                "全部收斂後無 bak 殘餘：${root.listFiles()!!.toList()}",
+                baks.none { it.exists() },
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
     @Test fun cleanupBudget_midRun_restoreExempt() {
-        // 刪除類預算吃滿的 run 內，崩潰還原（rename，O(1)）仍必須豁免上限：
-        // 嶄新 destRoot（無 installed 干擾），64 個過期 staging（不同合法 id）+
-        // 1 份新鮮 crash-bak（name==bakId、SKILL.md 可解析、target 缺席）→
-        // 無論列舉順序：bak 照常還原（還原分支不檢查 deletionAllowed，豁免成立）、
-        // 64 刪除恰好吃滿上限，removed == 上限 + 1（bak 從不擠兌刪除預算，反之亦然）。
+        // 刪除類預算吃滿的 run 內，崩潰還原仍必須照常進行：還原型占用**獨立的**
+        // [SkillInstaller.MAX_RESTORES_PER_RUN] 預算、不共刪除預算——本測同時
+        // 釘「同 run 兩預算互不擠兌」。嶄新 destRoot（無 installed 干擾），
+        // 64 個過期 staging（不同合法 id）+ 1 份新鮮 crash-bak（name==bakId、
+        // SKILL.md 可解析、NOFOLLOW 判定 target 槽缺席、此還原量 << 還原上限）→
+        // 無論列舉順序：bak 照常還原（還原分支檢查的是 restoreAllowed、不觸
+        // deletionAllowed）、64 刪除恰好吃滿刪除上限，removed == 刪除上限 + 1
+        //（bak 不擠兌刪除預算，64 個 staging 也不擠兌還原預算）。
         val root = tempRoot()
         try {
             val now = System.currentTimeMillis()

@@ -14,7 +14,7 @@ import java.util.zip.ZipOutputStream
  * D04 Skill 安裝測試（BACKLOG D04 驗收方向）：匯入校驗失敗拒裝。
  *
  * 覆蓋 Eta 安裝邊界思想的最小實現：受限解包（穿越/絕對/重複/嵌套/
- * 非法 frontmatter/四項預算的確切 Failure 值）、雜湊校驗（含
+ * 裸頂層條目/條目名長度上限/非法 frontmatter/四項預算的確切 Failure 值）、雜湊校驗（含
  * expectedHashes 部分覆蓋：僅清單內路徑逐項比對、引用缺檔即 HASH_MISMATCH）、
  * 權限清單、scripts 永不執行、失敗不留殘餘、同名預設不覆蓋。
  *
@@ -233,6 +233,112 @@ class SkillInstallTest {
                 (r as SkillInstaller.Result.Failure).reason,
             )
             assertFalse(File(root, "meeting-prep").exists())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun bareTopLevelEntry_files_rejectedShaped_notIoError() {
+        val root = tempRoot()
+        try {
+            // 裸頂層 key（無 '/'，等於 root 名）必須在彙整校驗被顯式拒絕：
+            // 修前會把該 key 當 rel 落成根內頂層雜檔（staging 寫出 stray file）、
+            // 或同名深層條目 mkdirs 撞案後以 IO_ERROR 失敗蓋過形狀 reason（語意
+            // 漂移）。修後：MULTIPLE_ROOTS（頂層形狀違規的既有車道）＋ 訊息僅
+            // 回顯條目名（相對形，不洩內部路徑）；destRoot 無半成品。
+            val r = SkillInstaller.installFiles(
+                linkedMapOf<String, ByteArray>(
+                    // manifest name 用合法 id（xx）；本 key（裸頂層「x」）在彙整
+                    // 階段即被拒，frontmatter 根本不會被解析。
+                    "x" to "stray".toByteArray(Charsets.UTF_8),
+                    "x/SKILL.md" to skillMd(name = "xx").toByteArray(Charsets.UTF_8),
+                ),
+                root,
+            )
+            assertTrue("expected failure, got $r", r is SkillInstaller.Result.Failure)
+            val f = r as SkillInstaller.Result.Failure
+            assertEquals(SkillInstaller.Failure.MULTIPLE_ROOTS, f.reason)
+            assertTrue("message 應指名裸頂層條目：${f.message}", "bare top-level" in f.message)
+            assertTrue(
+                "訊息僅回顯條目名（不洩內部路徑）：${f.message}",
+                f.message.endsWith(": x"),
+            )
+            assertFalse("destRoot 不得被動", File(root, "x").exists())
+            assertTrue(
+                "不得留下半成品：${root.listFiles()!!.toList()}",
+                root.listFiles()!!.isEmpty(),
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun bareTopLevelEntry_zip_rejectedShaped_notIoError() {
+        val root = tempRoot()
+        try {
+            // zip 條目同名（檔案型裸頂層條目）：解包後與 files 路徑共用彙整
+            // 校驗，同一形狀 reason；錯誤碼面不得出現 IO_ERROR。
+            val zip = zipOf(
+                "x" to "stray".toByteArray(Charsets.UTF_8),
+                "x/SKILL.md" to skillMd(name = "xx").toByteArray(Charsets.UTF_8),
+            )
+            val r = SkillInstaller.installZip(zip, root)
+            assertTrue("expected failure, got $r", r is SkillInstaller.Result.Failure)
+            val f = r as SkillInstaller.Result.Failure
+            assertEquals(SkillInstaller.Failure.MULTIPLE_ROOTS, f.reason)
+            assertTrue("message 應指名裸頂層條目：${f.message}", "bare top-level" in f.message)
+            assertFalse(File(root, "x").exists())
+            assertTrue(
+                "不得留下半成品：${root.listFiles()!!.toList()}",
+                root.listFiles()!!.isEmpty(),
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun entryNameOverLimit_rejectedShaped_notEnametoolongIoDrift() {
+        val root = tempRoot()
+        try {
+            // 名稱位元組上限（[SkillInstaller.MAX_ENTRY_NAME_BYTES]＝4096）：
+            // 超限名在彙整校驗（[SkillInstaller.checkEntryName]——zip 與 files
+            // 兩路徑共用）即以形狀 reason（TRAVERSAL 車道）拒絕，不再落入
+            // staging 寫入端以 ENAMETOOLONG 收斂成 IO_ERROR（語意漂移防住）；
+            // 訊息僅回長度預算、不回顯全文（超限名可為 hostile 供給）。
+            val longName = "a".repeat(SkillInstaller.MAX_ENTRY_NAME_BYTES + 1)
+            val rFiles = SkillInstaller.installFiles(
+                linkedMapOf<String, ByteArray>(
+                    "meeting-prep/SKILL.md" to skillMd().toByteArray(Charsets.UTF_8),
+                    longName to "x".toByteArray(),
+                ),
+                root,
+            )
+            assertTrue("expected failure, got $rFiles", rFiles is SkillInstaller.Result.Failure)
+            val fFiles = rFiles as SkillInstaller.Result.Failure
+            assertEquals(SkillInstaller.Failure.TRAVERSAL, fFiles.reason)
+            assertTrue(
+                "message 應指名長度預算：${fFiles.message}",
+                "entry name too long" in fFiles.message,
+            )
+            assertFalse("訊息不回顯全文", longName in fFiles.message)
+            assertFalse(File(root, "meeting-prep").exists())
+            assertTrue(
+                "不得留下半成品：${root.listFiles()!!.toList()}",
+                root.listFiles()!!.isEmpty(),
+            )
+
+            val zip = zipOf(
+                "meeting-prep/SKILL.md" to skillMd().toByteArray(Charsets.UTF_8),
+                longName to "x".toByteArray(),
+            )
+            val rZip = SkillInstaller.installZip(zip, root)
+            assertTrue("expected failure, got $rZip", rZip is SkillInstaller.Result.Failure)
+            assertEquals(
+                SkillInstaller.Failure.TRAVERSAL,
+                (rZip as SkillInstaller.Result.Failure).reason,
+            )
+            assertTrue("entry name too long" in rZip.message)
+            assertTrue(root.listFiles()!!.isEmpty())
         } finally {
             root.deleteRecursively()
         }

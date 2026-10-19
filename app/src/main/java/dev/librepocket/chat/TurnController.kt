@@ -867,12 +867,14 @@ class TurnController(
         attemptUsageSeen.remove(runId)
       } catch (e: Throwable) {
         if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
-        // Best-effort: swallow the failure and keep the cell. No other path
-        // flushes this attempt id again; the one later transfer is the cancel
-        // handler when a cancel lands in this attempt's retry-backoff gap
-        // (attemptRef still holds the just-failed id until the next mint) and
-        // it gives up after BEST_EFFORT_TIMEOUT_MS. Otherwise the row is
-        // lost — deliberate: usage is accounting-only, never load-bearing.
+        // Best-effort: swallow the failure and keep the cell. No non-cancel
+        // path flushes this attempt id again; the only later transfer is the
+        // cancel handler's flushAttemptUsage(cancelId), while this attempt is
+        // still current and the branch is not the suppressed final (e.g. the
+        // retry-backoff gap before the next mint, or a terminal window that
+        // settles FAILED), bounded by BEST_EFFORT_TIMEOUT_MS. Otherwise the
+        // row is lost — deliberate: usage is accounting-only, never
+        // load-bearing.
       }
     } else {
       attemptUsageSeen.remove(runId)

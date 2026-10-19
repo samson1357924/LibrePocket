@@ -510,7 +510,7 @@ class TurnControllerUsageTextBudgetTest {
     assertEquals(100_000, MAX_TURN_TEXT_CHARS)
     // Executable links for the "Equal to RoomSessionStore.MAX_TEXT_CHARS"
     // claims: (a) MAX_TURN_TEXT_CHARS KDoc (StreamEvent.kt ~L243) and
-    // (b) TurnController.MAX_REQUEST_CHARS KDoc (TurnController.kt ~L478).
+    // (b) TurnController.MAX_REQUEST_CHARS KDoc (TurnController.kt ~L479).
     // Changing either cap must update its pin and its KDoc.
     assertEquals(RoomSessionStore.MAX_TEXT_CHARS, MAX_TURN_TEXT_CHARS)
     assertEquals(RoomSessionStore.MAX_TEXT_CHARS, TurnController.MAX_REQUEST_CHARS)

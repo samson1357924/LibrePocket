@@ -2236,7 +2236,7 @@ private fun producerMarkerEnd(text: String, start: Int): Int {
     while (i < text.length) {
         val c = text[i]
         if (c == ']') return i
-        if (c == '\n') return -1
+        if (c == '\n' || c == '\r') return -1
         if (c == ' ') break
         i++
     }
@@ -2248,6 +2248,11 @@ private fun producerMarkerEnd(text: String, start: Int): Int {
     i++
     while (i < text.length) {
         val c = text[i]
+        // Producer markers are single-line: a literal CR/LF anywhere before
+        // the closing ] means this is not a producer marker (or is corrupt).
+        // Rejecting it even inside a quoted value prevents a crafted multi-line
+        // span from compacting away intervening assistant prose.
+        if (c == '\n' || c == '\r') return -1
         if (inString) {
             if (escaped) {
                 escaped = false
@@ -2262,7 +2267,6 @@ private fun producerMarkerEnd(text: String, start: Int): Int {
                 '{', '[' -> depth++
                 '}' -> if (depth > 0) depth--
                 ']' -> if (depth == 0) return i else depth--
-                '\n' -> return -1
             }
         }
         i++

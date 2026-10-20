@@ -303,6 +303,14 @@ class ChatSessionFactoryHistoryTailTest {
         )
     }
 
+    @Test fun compactToolMarkers_doesNotSpanLinesInsideQuotedArgs() {
+        // A literal newline inside a quoted value is not producer output (the
+        // producer folds CR/LF); treating it as unterminated prevents a crafted
+        // multi-line span from compacting intervening assistant prose.
+        val text = "[tool:lsp.symbols {\"query\":\"oops\nstill prose\n\"]}] tail"
+        assertEquals(text, compactToolMarkers(text))
+    }
+
     @Test fun cappedHistoryText_neverSplitsSurrogateAtCap() {
         val text = "a".repeat(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE - 1) + "😀" +
             "b".repeat(100)

@@ -589,14 +589,18 @@ class SkillInstallTest {
                 "target must not be symlink" in (r as SkillInstaller.Result.Failure).message,
             )
             // 實證「不波及據點」：植入 link 本身存活、未被 rename 吃掉；
-            // destRoot 無半成品；連結指向物（缺席）未被創造。
+            // destRoot 無半成品（唯一允許存在的條目就是植入 link 本身——
+            // 設定的 link 不是本程序的財產，拒絕路徑不移除它；
+            // staging 已清理）；連結指向物（缺席）未被創造。
             assertTrue(
                 "懸空 link 不得被搬移或吃掉",
                 java.nio.file.Files.isSymbolicLink(target.toPath()),
             )
-            assertTrue(
-                "不得殘留半成品：${root.listFiles()!!.toList()}",
-                root.listFiles()!!.isEmpty(),
+            val entries = root.listFiles()!!.toList()
+            assertEquals(
+                "不得殘留半成品（僅植入 link 本身存活）：$entries",
+                listOf(target),
+                entries,
             )
             assertFalse("不得經 link 造出外部內容", nowhere.exists())
 

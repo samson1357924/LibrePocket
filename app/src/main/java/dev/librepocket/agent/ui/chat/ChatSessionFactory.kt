@@ -2065,8 +2065,11 @@ internal suspend fun hasWithheldSwitchMarker(store: SessionStore, sessionId: Str
 
 /**
  * Stage E: fail-closed single-row bound. Rows longer than
- * [MODEL_HISTORY_MAX_CHARS_PER_MESSAGE] are cut with a visible marker so
- * the omission is observable in the payload itself, never silent.
+ * [MODEL_HISTORY_MAX_CHARS_PER_MESSAGE] are bounded with a visible marker
+ * whenever the cap actually removes text, so the omission is observable in
+ * the payload itself, never silent. Compaction may bring an over-cap row
+ * under the cap by itself; in that case the compacted marker is the visible
+ * record of the dropped args and no truncation suffix is added.
  *
  * P2 tool markers are compacted first: local tool calls replay inline as
  * `[tool:<name> <args>]` assistant text (see `TurnController`), and the args
@@ -2074,7 +2077,9 @@ internal suspend fun hasWithheldSwitchMarker(store: SessionStore, sessionId: Str
  * whole per-row budget and push the marker itself — or the answer after it —
  * past the cut, and the cut can slice a marker mid-way. [compactToolMarkers]
  * bounds each marker to `[tool:<name> …]` before the cap; ordinary (≤20k)
- * rows bypass compaction and replay byte-identical.
+ * rows bypass compaction and replay byte-identical. Compaction is applied
+ * only to assistant rows at the hydration call site: a user row's `[tool:`
+ * text is user content, never a producer marker.
  */
 internal fun cappedHistoryText(
     text: String,

@@ -215,6 +215,37 @@ class ChatSessionFactoryHistoryTailTest {
         }
     }
 
+    @Test fun open_giantUserRowNeverCompactsToolMarkerText() = runBlocking {
+        // The hydration call site compacts assistant rows only. A user row's
+        // `[tool:...]` text is user content; it must reach the model verbatim
+        // even when the same row is capped.
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        val marker = "[tool:note keep these user args]"
+        val huge = "user start\n$marker " + "z".repeat(30_000)
+        transcripts.appendEvent(event(sid, "r-user-tool", "user", huge))
+        transcripts.appendEvent(event(sid, "r-user-tool", "assistant", "ok"))
+
+        val provider = TailFakeProvider {
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "fresh"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val opened = factoryWith(transcripts, provider).open(sampleEndpoint(), sid)
+        try {
+            opened.session.send("q-new")
+            val hydratedUser = provider.seenRequests.single().messages.first().text
+            assertTrue(hydratedUser.contains(marker))
+            assertFalse(hydratedUser.contains("[tool:note …]"))
+            assertTrue(hydratedUser.endsWith(HISTORY_TRUNCATION_MARKER))
+            val raw = transcripts.loadEvents(sid, 0, 10).first { it.kind == "user" }.text
+            assertEquals(huge, raw)
+        } finally {
+            opened.session.close()
+        }
+    }
+
     @Test fun cappedHistoryText_boundary() {
         val factory = factoryWith(FakeSessionStore(), TailFakeProvider())
         val exact = "y".repeat(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE)

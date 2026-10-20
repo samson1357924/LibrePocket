@@ -1015,10 +1015,11 @@ class SafeToolSliceTest {
         assertEquals("duplicate id must not touch the backend", 0, backend.invocations.get())
     }
 
-    @Test fun hugeBackendFieldsAreRawCappedBeforeRedaction() = runBlocking {
+    @Test fun hugeBackendFieldsAreOmittedBeforeRedaction() = runBlocking {
         // Backend fields are redacted before the 500-char echo cap, so an
         // unbounded future backend string must be pre-bounded or it can burn
-        // full-pass redaction CPU/heap first.
+        // full-pass redaction CPU/heap first. Over-bound values are omitted
+        // whole, so no raw prefix survives.
         val huge = "S".repeat(1_000_000)
         val backend = object : LspTools.Backend {
             override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
@@ -1032,7 +1033,25 @@ class SafeToolSliceTest {
             result.resultJson.length <= SafeToolSlice.MAX_RESULT_CHARS,
         )
         assertFalse("raw megabyte field must not survive", result.resultJson.contains("S".repeat(10_000)))
-        assertTrue(result.resultJson.contains("[truncated 2000→500]"))
+        assertTrue(result.resultJson.contains("[backend field omitted: 1000000 chars]"))
+        val body = Json.parseToJsonElement(result.resultJson).jsonObject
+        assertEquals("true", body["truncated"]!!.jsonPrimitive.content)
+    }
+
+    @Test fun oversizedBackendFieldOmittedWholeAvoidsBoundaryRedactionMiss() = runBlocking {
+        // A suffix-anchored rule (URL credentials) would miss its suffix past
+        // a raw pre-cap; truncating the prefix would then echo the credential.
+        // Omission must not retain any prefix.
+        val overBoundary = "https://user:hunter2" + "a".repeat(3_000) + "@host"
+        val backend = object : LspTools.Backend {
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+                listOf(LspTools.Symbol("ok", "Function", overBoundary, 1))
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val result = slice(backend = backend).execute(listOf(call())).single()
+        assertFalse(result.denied)
+        assertFalse("credential prefix must not survive omission", result.resultJson.contains("hunter2"))
+        assertTrue(result.resultJson.contains("[backend field omitted:"))
     }
 
     @Test fun continuationArgsEchoRedactsTopLevelSecretKey() = runBlocking {

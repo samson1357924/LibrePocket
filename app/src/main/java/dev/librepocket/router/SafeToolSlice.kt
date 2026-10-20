@@ -123,11 +123,11 @@ class SafeToolSlice(
          * Raw backend-owned field bound applied BEFORE `Redactor.redact`.
          * Redaction makes multiple full passes/allocations; an unbounded
          * backend string (future MCP bridge) could otherwise burn CPU/heap
-         * before the 500-char echo cap. The cap is deliberately wider than
-         * [MAX_STRING_CHARS] so redaction can inflate a value and still have
-         * its post-redaction truncation decision made at 500. Omitted raw
-         * suffix never reaches the wire, so a pre-cap is fail-closed, not a
-         * leak.
+         * before the 500-char echo cap. Over-bound values are omitted WHOLE —
+         * never truncated to a prefix — because suffix-anchored Redactor rules
+         * (URL credentials, emails) would miss a suffix beyond the cut and the
+         * retained prefix could carry the secret. The omitted suffix never
+         * reaches the wire; omission is reflected in `truncated`.
          */
         const val RAW_BACKEND_FIELD_MAX_CHARS = MAX_STRING_CHARS * 4
         /** Per-input cap for model-controlled `query` / `pathPrefix` (fail-closed). */
@@ -675,10 +675,12 @@ class SafeToolSlice(
             value
         }
 
-    /** Pre-redaction bound for backend-owned strings (see [RAW_BACKEND_FIELD_MAX_CHARS]). */
+    /** Pre-redaction bound for backend-owned strings (see [RAW_BACKEND_FIELD_MAX_CHARS]).
+     *  Over-bound values are replaced whole by a fixed receipt: a truncated
+     *  prefix could defeat suffix-anchored redaction rules. */
     private fun boundedRawBackendField(value: String): String =
         if (value.length <= RAW_BACKEND_FIELD_MAX_CHARS) value
-        else cappedTake(value, RAW_BACKEND_FIELD_MAX_CHARS)
+        else "[backend field omitted: ${value.length} chars]"
 
     private fun ok(call: ToolCall, query: String, outcome: LspTools.SymbolsOutcome.Ok): ToolResult {
         // Snapshot the bounded projection ONCE inside the typed-error
@@ -700,7 +702,11 @@ class SafeToolSlice(
             // can inflate a field (e.g. `⟦REDACTED:EMAIL⟧`), so a ≤cap raw
             // string may exceed the cap after redaction — decide there.
             var truncatedFlag = false
+            var rawOmitted = false
             redactedSymbols = available.map { s ->
+                rawOmitted = rawOmitted || s.name.length > RAW_BACKEND_FIELD_MAX_CHARS ||
+                    s.kind.length > RAW_BACKEND_FIELD_MAX_CHARS ||
+                    s.path.length > RAW_BACKEND_FIELD_MAX_CHARS
                 val rn = dev.librepocket.redact.Redactor.redact(boundedRawBackendField(s.name)).text
                 val rk = dev.librepocket.redact.Redactor.redact(boundedRawBackendField(s.kind)).text
                 val rp = dev.librepocket.redact.Redactor.redact(boundedRawBackendField(s.path)).text
@@ -709,7 +715,7 @@ class SafeToolSlice(
                 }
                 Triple(rn, rk, rp)
             }
-            anyFieldTruncated = truncatedFlag || redactedQuery.length > MAX_STRING_CHARS
+            anyFieldTruncated = truncatedFlag || rawOmitted || redactedQuery.length > MAX_STRING_CHARS
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (_: Exception) {

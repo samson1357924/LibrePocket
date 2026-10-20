@@ -285,8 +285,14 @@ jobs:
         with:
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
-      - name: Assemble Debug APKs
-        run: ./gradlew :app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug
+      # P2: the release variants merge buildType (app/src/release) and
+      # <flavor><BuildType> source sets that Debug APKs never contain, so
+      # PR CI assembles all six variants. The release APKs are UNSIGNED
+      # (this job runs without -PreleaseSigning; see app/build.gradle.kts
+      # L82-95: no signing config assigned -> unsigned output) — a staging
+      # identity question, not a policy-scan blocker.
+      - name: Assemble Debug & Unsigned Release APKs
+        run: ./gradlew :app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug :app:assemblePlayRelease :app:assembleFossRelease :app:assembleGithubRelease
 
       - name: Configure Android SDK build-tools for aapt & dexdump
         run: |
@@ -323,6 +329,17 @@ jobs:
       # marker must fail here too (BIND_ACCESSIBILITY_SERVICE is deliberately
       # NOT in the common set: the github overlay legally declares the
       # accessibility service).
+      #
+      # P2: the scan runs over the PER-LANE UNIVERSE (AGP merge: variant >
+      # buildType > flavor > main), not the old two fixed paths: main and
+      # the github overlay by fixed path (named failure when missing), then
+      # every glob-encountered app/src/*/AndroidManifest.xml case-filtered
+      # into buildType overlays (app/src/{debug,release}), the github
+      # overlay + its <flavor><BuildType> variant dirs (githubRelease/...,
+      # prefix match), while other flavors' overlays and the test source
+      # sets (test*/androidTest) are outside the universe. A rogue
+      # app/src/release/AndroidManifest.xml previously survived this lane
+      # (Debug APKs never contain the release source set); it cannot now.
       - name: Run Github Flavor Artifact Binding Check (mode-independent)
         run: |
           # set -e turns a bare failing `X=$(command -v ...)` into an opaque
@@ -330,13 +347,59 @@ jobs:
           AAPT=$(command -v aapt) || { echo "::error::aapt not found: build-tools PATH step failed"; exit 1; }
           DEXDUMP=$(command -v dexdump) || { echo "::error::dexdump not found: build-tools PATH step failed"; exit 1; }
           python3 scripts/apk_policy_inspect.py --mode github --apk app/build/outputs/apk/github/debug/app-github-debug.apk --aapt "$AAPT" --dexdump "$DEXDUMP"
-          python3 scripts/backup_rules_check.py --check-permission-removals "SEND_SMS,RECEIVE_SMS,READ_SMS,MANAGE_EXTERNAL_STORAGE,BIND_VPN_SERVICE" app/src/main/AndroidManifest.xml app/src/github/AndroidManifest.xml
+          main=app/src/main/AndroidManifest.xml
+          overlay=app/src/github/AndroidManifest.xml
+          for m in "$main" "$overlay"; do
+            [ -f "$m" ] || { echo "::error::missing manifest: $m"; exit 1; }
+            python3 scripts/backup_rules_check.py --check-permission-removals "SEND_SMS,RECEIVE_SMS,READ_SMS,MANAGE_EXTERNAL_STORAGE,BIND_VPN_SERVICE" "$m"
+          done
+          for m in app/src/*/AndroidManifest.xml; do
+            case "$m" in
+              app/src/main/AndroidManifest.xml|app/src/github/AndroidManifest.xml) continue ;;
+              app/src/debug/AndroidManifest.xml|app/src/release/AndroidManifest.xml) ;;
+              app/src/github*/AndroidManifest.xml) ;;
+              app/src/test*/AndroidManifest.xml|app/src/androidTest*/AndroidManifest.xml) continue ;;
+              *) continue ;;
+            esac
+            python3 scripts/backup_rules_check.py --check-permission-removals "SEND_SMS,RECEIVE_SMS,READ_SMS,MANAGE_EXTERNAL_STORAGE,BIND_VPN_SERVICE" "$m"
+          done
 
-      - name: Upload Debug APKs
+      # P2 release artifact tier: the SAME policy as the debug face, applied
+      # to the APKs that actually merge the release source set (the reviewer
+      # sandbox case: a rogue app/src/release SEND_SMSd APK stayed green
+      # through the debug-only wiring until release staging). The output-dir
+      # glob fails closed when no APK was produced and tolerates AGP's
+      # unsigned naming (app-<flavor>-release-unsigned.apk: PR assembly runs
+      # without -PreleaseSigning, see app/build.gradle.kts).
+      - name: Run Play Release Policy Check (ROADMAP D07)
+        run: |
+          chmod +x scripts/play_policy_check.sh
+          set -- app/build/outputs/apk/play/release/*.apk
+          [ -f "$1" ] || { echo "::error::no assembled release APK for play under app/build/outputs/apk/play/release/"; exit 1; }
+          scripts/play_policy_check.sh "$@"
+
+      - name: Run Foss Release Policy Check (ROADMAP D07)
+        run: |
+          chmod +x scripts/play_policy_check.sh
+          set -- app/build/outputs/apk/foss/release/*.apk
+          [ -f "$1" ] || { echo "::error::no assembled release APK for foss under app/build/outputs/apk/foss/release/"; exit 1; }
+          scripts/play_policy_check.sh --foss "$@"
+
+      - name: Run Github Release Artifact Binding Check (mode-independent)
+        run: |
+          AAPT=$(command -v aapt) || { echo "::error::aapt not found: build-tools PATH step failed"; exit 1; }
+          DEXDUMP=$(command -v dexdump) || { echo "::error::dexdump not found: build-tools PATH step failed"; exit 1; }
+          set -- app/build/outputs/apk/github/release/*.apk
+          [ -f "$1" ] || { echo "::error::no assembled release APK for github under app/build/outputs/apk/github/release/"; exit 1; }
+          for apk in "$@"; do
+            python3 scripts/apk_policy_inspect.py --mode github --apk "$apk" --aapt "$AAPT" --dexdump "$DEXDUMP"
+          done
+
+      - name: Upload Debug & Release APKs
         if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: debug-apks
+          name: assembled-apks
           path: app/build/outputs/apk/**/*.apk
           retention-days: 7
 

@@ -8,9 +8,23 @@
 #   scripts/play_policy_check.sh --github <github-apk> [...]
 #
 # The common manifest policy (P2-1: NO SMS / MANAGE_EXTERNAL_STORAGE / VPN in
-# ANY flavor) is enforced at source level in EVERY branch -- see the
+# ANY flavor) is enforced at source level in EVERY lane -- see the
 # structured permission-removal gate below -- and on the artifact by
 # scripts/apk_policy_inspect.py --mode github for the github flavor.
+#
+# "Every lane" scans the PER-LANE UNIVERSE (AGP manifest merge precedence:
+# variant > buildType > flavor > main), not one branch of anything: for mode
+# X the lane's scan universe is
+#   app/src/main/AndroidManifest.xml                  (base, mandatory)
+#   app/src/<X>/AndroidManifest.xml                   (flavor overlay, mandatory)
+#   app/src/{debug,release}/AndroidManifest.xml       (buildType, all flavors)
+#   app/src/<X><BuildType>/AndroidManifest.xml        (variant dirs: playRelease,
+#                                                      fossDebug, githubRelease, ...)
+# Other flavors' overlays (e.g. app/src/play/ for the foss lane) are OUTSIDE
+# the universe - a play overlay may carry GMS strings and must never trip a
+# foss scan - and the test source sets (test*/androidTest) never merge into
+# an APK. A rogue app/src/release/AndroidManifest.xml therefore fails every
+# lane here even though a Debug APK never contains the release source set.
 #
 # The Python scanner checks ZIP/APK structure, manifest output from aapt,
 # DEX type_ids and relevant class_defs. Native dexdump is a bounded-time,
@@ -91,11 +105,22 @@ command -v python3 >/dev/null 2>&1 || fail 'python3 is required for the backup r
 # THE ELEMENT for every blacklisted name - the exact merger-marker machinery
 # the other manifest checks here already run.
 #
-# P2-1：通行黑名單在每個分支都結構化執行（foss 分支過去只掃專有字串、github
-# 分支在 shell 層完全沒有 lane）：黑名單＝mode 對應的 manifest set（main +
-# 該分支 flavor overlay），play 用完整六 token（含 a11y），foss/github 只用
-# 通行五 token（絕不含 a11y）。manifest 缺檔一律 FAIL（過去 `|| continue`
-# 讓整段結構化掃描可被 missing file 靜默跳過＝fail-open，故改 fail-closed）。
+# P2-1：通行黑名單在每個 lane 都結構化執行（foss lane 過去只掃專有字串、
+# github lane 在 shell 層完全沒有 lane）：token 依 mode 分流，play 用完整六
+# token（含 a11y），foss/github 只用通行五 token（絕不含 a11y）；manifest 缺
+# 檔一律 FAIL（過去 `|| continue` 讓整段結構化掃描可被 missing file 靜默
+# 跳過＝fail-open，故改 fail-closed）。
+# P2：掃描宇宙＝per-lane universe（AGP merge 優先序：variant > buildType >
+# flavor > main）＝main + 該 lane 自己的 flavor overlay（固定路徑，缺檔
+# named fail）+ 該 flavor 的 buildType overlay（app/src/{debug,release} 對
+# 所有 flavor 生效）+ 其 <flavor><BuildType> variant 目錄（例 playRelease、
+# fossDebug、githubRelease，前綴命中）；其它 flavor 的 overlay（例 play
+# overlay 對 foss lane 的 GMS needle 掃描會誤殺）與 test*/androidTest 測試
+# source set（不屬 APK merge）排除。植入 app/src/release/AndroidManifest.xml
+# 的 SEND_SMS 曾躲過「main + flavor overlay」兩固定路徑掃描——Debug APK 不含
+# release source set，三 lane 全綠直至 release staging——現在 release/variant
+# overlay 屬於每個 lane 的掃描宇宙（glob 枚舉 + case 過濾，fail-closed：
+# overlay 存在即掃，未來新增 release/<flavor><BuildType> 目錄不可能漏掃）。
 case "$MODE" in
     play)
         PERM_TOKENS="$BLACKLIST_PERMS_CSV"
@@ -113,15 +138,63 @@ case "$MODE" in
         fail "unknown mode: $MODE"
         ;;
 esac
+# Two mandatory manifests per lane, by FIXED path (fail-closed named):
+# main (the base every variant merges) and the lane's own flavor overlay.
+# The repo requires both to exist; a vanished one must stop the gate here.
 for m in "$ROOT/app/src/main/AndroidManifest.xml" "$ROOT/app/src/$FLAVOR_DIR/AndroidManifest.xml"; do
     [ -f "$m" ] || fail "missing manifest: $m"
     python3 "$SCRIPT_DIR/backup_rules_check.py" \
         --check-permission-removals "$PERM_TOKENS" \
         "$m"
 done
+# Extended per-lane universe (base + mandatory overlay already scanned
+# above). The glob enumerates every top-level source set's manifest — an
+# existing source set WITHOUT a manifest contributes nothing to an AGP
+# merge, so scanning exactly the manifests that exist is the complete
+# fail-closed universe for future release/<flavor><BuildType> dirs (they
+# cannot escape by not existing; if they exist, they are in the glob). The
+# case filter keeps buildType overlays (debug/release apply to ALL
+# flavors), and the lane's <flavor><BuildType> variant overlays via the
+# flavor-name prefix; it drops the two mandatory manifests (no duplicate
+# scan), other flavors' overlays (e.g. app/src/play/ must not trip the
+# foss lane), and the test source sets (test*/androidTest never merge).
+# NOTE: buildType overlays are pinned to {debug, release} literals below;
+# add a new buildType in app/build.gradle.kts and extend that arm here.
+for m in "$ROOT"/app/src/*/AndroidManifest.xml; do
+    case "$m" in
+        "$ROOT/app/src/main/AndroidManifest.xml"|"$ROOT/app/src/$FLAVOR_DIR/AndroidManifest.xml") continue ;;
+        "$ROOT/app/src/debug/AndroidManifest.xml"|"$ROOT/app/src/release/AndroidManifest.xml") ;;
+        "$ROOT/app/src/${FLAVOR_DIR}"*/AndroidManifest.xml) ;;
+        "$ROOT/app/src/test"*/AndroidManifest.xml|"$ROOT/app/src/androidTest"*/AndroidManifest.xml) continue ;;
+        *) continue ;;
+    esac
+    [ -f "$m" ] || fail "missing manifest: $m"
+    python3 "$SCRIPT_DIR/backup_rules_check.py" \
+        --check-permission-removals "$PERM_TOKENS" \
+        "$m"
+done
+# The foss proprietary-string scan follows the SAME per-lane universe —
+# NOT a blind "every manifest" sweep, which would grep other flavors'
+# overlays (a play overlay could fake a GMS hit for the foss lane) and the
+# test source sets. Mandatory pair by fixed path (named fail), extended
+# universe by the same glob + case filter as the permission scan above.
 if [ "$MODE" = foss ]; then
     for m in "$ROOT/app/src/main/AndroidManifest.xml" "$ROOT/app/src/foss/AndroidManifest.xml"; do
         [ -f "$m" ] || fail "missing manifest: $m"
+        for needle in $FOSS_BLACKLIST; do
+            if grep -i -q "$needle" "$m"; then
+                fail "source manifest $m references proprietary $needle"
+            fi
+        done
+    done
+    for m in "$ROOT"/app/src/*/AndroidManifest.xml; do
+        case "$m" in
+            "$ROOT/app/src/main/AndroidManifest.xml"|"$ROOT/app/src/foss/AndroidManifest.xml") continue ;;
+            "$ROOT/app/src/debug/AndroidManifest.xml"|"$ROOT/app/src/release/AndroidManifest.xml") ;;
+            "$ROOT/app/src/foss"*/AndroidManifest.xml) ;;
+            "$ROOT/app/src/test"*/AndroidManifest.xml|"$ROOT/app/src/androidTest"*/AndroidManifest.xml) continue ;;
+            *) continue ;;
+        esac
         for needle in $FOSS_BLACKLIST; do
             if grep -i -q "$needle" "$m"; then
                 fail "source manifest $m references proprietary $needle"

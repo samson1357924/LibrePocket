@@ -2815,6 +2815,44 @@ class PolicyCiGateControl(unittest.TestCase):
             workflow,
         )
 
+    def test_release_variants_assembled_and_policy_applied(self) -> None:
+        # P2 release artifact tier (the reviewer sandbox case): Debug APKs
+        # never contain the release source set, so an
+        # app/src/release/AndroidManifest.xml rogue stayed green through
+        # the debug-only wiring until release staging. The assembly stage
+        # must build all three release variants (unsigned - no
+        # -PreleaseSigning in PR builds) AND run the same-tier policy on
+        # them in the same job.
+        workflow = PR_CHECK_WORKFLOW.read_text(encoding="utf-8")
+        for task in (
+            ":app:assemblePlayRelease",
+            ":app:assembleFossRelease",
+            ":app:assembleGithubRelease",
+        ):
+            with self.subTest(task=task):
+                self.assertIn(task, workflow)
+        # Same-tier artifact policy per lane: the shell gate for play/foss
+        # and the mode-independent scanner for github, each over ITS
+        # flavor's release output dir (exact artifact-to-mode pairing).
+        self.assertIn("Run Play Release Policy Check (ROADMAP D07)", workflow)
+        self.assertIn("Run Foss Release Policy Check (ROADMAP D07)", workflow)
+        self.assertIn(
+            "Run Github Release Artifact Binding Check (mode-independent)",
+            workflow,
+        )
+        self.assertIn("scripts/play_policy_check.sh \"$@\"", workflow)
+        self.assertIn('scripts/play_policy_check.sh --foss "$@"', workflow)
+        for flavor in ("play", "foss", "github"):
+            with self.subTest(flavor=flavor):
+                self.assertIn(
+                    f"app/build/outputs/apk/{flavor}/release/*.apk", workflow
+                )
+        # Fail closed on a missing artifact: the glob guard names the
+        # flavor and exits non-zero (an empty output dir can never pass).
+        self.assertIn("::error::no assembled release APK for play", workflow)
+        self.assertIn("::error::no assembled release APK for foss", workflow)
+        self.assertIn("::error::no assembled release APK for github", workflow)
+
     def test_pr_gate_requires_policy_harness(self) -> None:
         workflow = PR_CHECK_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("policy-harness", workflow)
@@ -4407,9 +4445,19 @@ class BackupRulesGateWiring(unittest.TestCase):
         # grep -vE filter (a legal multi-line element with tools:node on
         # its own line false-FAILED it). The marker machinery rides the
         # same script entry that already validates manifest bindings.
-        # P2-1 round 2: the scan is now fed from a per-mode dispatch that
-        # maps EVERY flavor to its blacklist + overlay pair; the play
-        # branch keeps the full six-token CSV (common + play-only a11y).
+        # P2-1 round 2: the scan is fed from a per-mode dispatch that maps
+        # EVERY flavor to its blacklist, keeping the play branch on the
+        # full six-token CSV (common + play-only a11y).
+        # P2 round 3: the SCAN UNIVERSE is the per-lane AGP merge universe
+        # — main + the mode's OWN overlay by fixed paths (named failure,
+        # never skipped), then every glob-encountered overlay manifest
+        # case-filtered into buildType overlays (debug/release apply to
+        # all flavors) and the lane's <flavor><BuildType> variant dirs
+        # (prefix match), while other flavors' overlays and the test
+        # source sets are dropped. The reviewer escape this closes: a
+        # rogue app/src/release/AndroidManifest.xml was invisible to the
+        # two-fixed-path scan (Debug APKs never contain the release
+        # source set) yet merges into the release artifact.
         text = POLICY_CHECK.read_text(encoding="utf-8")
         self.assertIn(
             '--check-permission-removals "$PERM_TOKENS"', text
@@ -4423,15 +4471,58 @@ class BackupRulesGateWiring(unittest.TestCase):
             r'        FLAVOR_DIR="play"\n'
             r'        ;;\n',
         )
-        # One structured scanner loop over main + the mode's OWN overlay;
-        # a missing manifest FAILS the gate named (see the dedicated
-        # fail-closed pin), it is never silently skipped.
+        # Fixed-path mandatory pair per lane: main + the mode's OWN overlay
+        # (missing file FAILS named; it is never silently skipped).
         self.assertRegex(
             text,
             r'for m in "\$ROOT/app/src/main/AndroidManifest\.xml"'
             r' "\$ROOT/app/src/\$FLAVOR_DIR/AndroidManifest\.xml"; do\n'
             r'    \[ -f "\$m" \] \|\| fail "missing manifest: \$m"\n'
             r'    python3 "\$SCRIPT_DIR/backup_rules_check\.py" \\',
+        )
+        # Extended per-lane universe: a full glob over every source set's
+        # manifest (existence = merge candidate; a future release/ or
+        # <flavor><BuildType> overlay cannot escape by not being known)
+        # with the exact case filter that scopes buildType overlays and
+        # variant overlays INTO the lane and everything else OUT.
+        self.assertRegex(
+            text,
+            r'\nfor m in "\$ROOT"/app/src/\*/AndroidManifest\.xml; do\n'
+            r'    case "\$m" in\n'
+            r'        "\$ROOT/app/src/main/AndroidManifest\.xml"\|'
+            r'"\$ROOT/app/src/\$FLAVOR_DIR/AndroidManifest\.xml"\) continue ;;\n'
+            r'        "\$ROOT/app/src/debug/AndroidManifest\.xml"\|'
+            r'"\$ROOT/app/src/release/AndroidManifest\.xml"\) ;;\n'
+            r'        "\$ROOT/app/src/\$\{FLAVOR_DIR\}"\*/AndroidManifest\.xml\) ;;\n'
+            r'        "\$ROOT/app/src/test"\*/AndroidManifest\.xml\|'
+            r'"\$ROOT/app/src/androidTest"\*/AndroidManifest\.xml\) continue ;;\n'
+            r'        \*\) continue ;;\n'
+            r'    esac\n'
+            r'    \[ -f "\$m" \] \|\| fail "missing manifest: \$m"\n'
+            r'    python3 "\$SCRIPT_DIR/backup_rules_check\.py" \\\n'
+            r'        --check-permission-removals "\$PERM_TOKENS" \\\n'
+            r'        "\$m"\n'
+            r'done\n',
+        )
+        # Cross-flavor isolation is enforced by the filter, not by the
+        # glob: the play lane must never sweep app/src/play* overlays via
+        # the FOSS branch either — the foss needle scan reuses the SAME
+        # case filter (identical shape, literal "foss"), so a play overlay
+        # cannot fake a proprietary-needle hit for the foss lane.
+        self.assertRegex(
+            text,
+            r'\n    for m in "\$ROOT"/app/src/\*/AndroidManifest\.xml; do\n'
+            r'        case "\$m" in\n'
+            r'            "\$ROOT/app/src/main/AndroidManifest\.xml"\|'
+            r'"\$ROOT/app/src/foss/AndroidManifest\.xml"\) continue ;;\n'
+            r'            "\$ROOT/app/src/debug/AndroidManifest\.xml"\|'
+            r'"\$ROOT/app/src/release/AndroidManifest\.xml"\) ;;\n'
+            r'            "\$ROOT/app/src/foss"\*/AndroidManifest\.xml\) ;;\n'
+            r'            "\$ROOT/app/src/test"\*/AndroidManifest\.xml\|'
+            r'"\$ROOT/app/src/androidTest"\*/AndroidManifest\.xml\) continue ;;\n'
+            r'            \*\) continue ;;\n'
+            r'        esac\n'
+            r'        for needle in \$FOSS_BLACKLIST; do\n',
         )
         # The retired enforcer must be gone from EXECUTED script text (the
         # documentation comment quoting `grep -vE "tools:node=..."` stays as
@@ -4494,19 +4585,48 @@ class BackupRulesGateWiring(unittest.TestCase):
             'esac\n',
             text,
         )
-        # The workflow's github assembly step must call the SAME common
-        # five-token source scan (it is the only github-facing
-        # element-level check on a plain scanner/scripts diff, so the
-        # yml text itself gets a literal pin - otherwise the claim above
-        # is manually verifiable only).
+        # The workflow's github assembly step must run the SAME common
+        # five-token source scan over the SAME per-lane universe (it is
+        # the only github-facing element-level check on a plain
+        # scanner/scripts diff, so the yml text itself gets a literal pin
+        # - otherwise the claim above is manually verifiable only). The
+        # case filter is pinned literally: narrowing back to the retired
+        # "main + github overlay" two-path scan (the P2 reviewer escape)
+        # must trip this pin.
         workflow = PR_CHECK_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn(
-            'backup_rules_check.py --check-permission-removals '
+            "python3 scripts/backup_rules_check.py --check-permission-removals "
             '"SEND_SMS,RECEIVE_SMS,READ_SMS,MANAGE_EXTERNAL_STORAGE,'
-            'BIND_VPN_SERVICE" app/src/main/AndroidManifest.xml '
-            'app/src/github/AndroidManifest.xml',
+            'BIND_VPN_SERVICE" "$m"',
             workflow,
         )
+        # Fixed-path mandatory pair first (github lane), named failure.
+        self.assertIn(
+            'for m in "$main" "$overlay"; do',
+            workflow,
+        )
+        self.assertIn('overlay=app/src/github/AndroidManifest.xml', workflow)
+        # Extended lane universe filter - buildType overlays and the
+        # github overlay + variant dirs IN, main/mandatory pair (already
+        # scanned), other flavors' overlays and test source sets OUT.
+        self.assertIn(
+            "app/src/main/AndroidManifest.xml|app/src/github/AndroidManifest.xml) continue ;;",
+            workflow,
+        )
+        self.assertIn(
+            "app/src/debug/AndroidManifest.xml|app/src/release/AndroidManifest.xml) ;;",
+            workflow,
+        )
+        self.assertIn("app/src/github*/AndroidManifest.xml) ;;", workflow)
+        self.assertIn(
+            "app/src/test*/AndroidManifest.xml|app/src/androidTest*/AndroidManifest.xml) continue ;;",
+            workflow,
+        )
+        # Cross-flavor isolation at the workflow face too: the github lane
+        # must never sweep a play or foss overlay (the play overlay could
+        # fake the GMS needle / a11y expectations there).
+        self.assertNotIn("app/src/play/AndroidManifest.xml", workflow)
+        self.assertNotIn("app/src/foss/AndroidManifest.xml", workflow)
 
     def test_gate_missing_manifest_fails_closed_not_skipped(self) -> None:
         # The retired `[ -f "$m" ] || continue` turned a vanishing flavor
@@ -5742,6 +5862,14 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
         # equality-when-set, absence legally inherits main's bindings. (The
         # real overlays additionally declare the accessibility service via an
         # android:permission attribute - orthogonal to this gate's checks.)
+        # P2 round 3: the per-lane universe additionally case-filters the
+        # full app/src/*/AndroidManifest.xml glob (buildType overlays and
+        # <flavor><BuildType> variant dirs merge into this lane's variants;
+        # other flavors' overlays and the test source sets do not). Release
+        # and variant dirs are OPTIONAL under AGP (an absent source set
+        # contributes nothing to a merge), so the minimal tree ships none -
+        # the rogue-overlay and clean-release-overlay cases create them
+        # explicitly.
         for flavor in ("play", "foss", "github"):
             (root / "app" / "src" / flavor).mkdir(parents=True, exist_ok=True)
             (
@@ -6400,6 +6528,143 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             self.assertNotIn("blacklisted permission", proc.stderr, proc.stderr)
             self.assertNotIn("missing manifest", proc.stderr, proc.stderr)
             self.assertNotIn("expected root", proc.stderr, proc.stderr)
+            self._assert_source_stage_clean_then_tool_stage_failure(proc)
+
+    # -- P2 per-lane scan universe (release/buildType + variant overlays) --
+    # The reviewer sandbox escape, end-to-end under the REAL gate script:
+    # buildType (app/src/release) and <flavor><BuildType> variant overlays
+    # merge into release variants that Debug APKs never contain, so the
+    # retired main+own-overlay two FIXED paths left every PR lane green
+    # until release staging.
+
+    def _rogue_permission_manifest(self) -> str:
+        return (
+            '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+            '    <application android:allowBackup="true" />\n'
+            '    <uses-permission android:name="android.permission.SEND_SMS" />\n'
+            "</manifest>\n"
+        )
+
+    def _write_rogue_overlay(
+        self, root: "Path", source_set: str
+    ) -> None:
+        manifest = root / "app" / "src" / source_set / "AndroidManifest.xml"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(self._rogue_permission_manifest(), encoding="utf-8")
+
+    def test_release_manifest_rogue_permission_fails_every_lane(self) -> None:
+        # A rogue app/src/release/AndroidManifest.xml merges into EVERY
+        # flavor's release variant, so it belongs to EVERY lane's universe
+        # (buildType overlays are flavor-independent): each of the three
+        # lanes must FAIL named at the source stage.
+        for mode_flags in ((), ("--foss",), ("--github",)):
+            with self.subTest(mode=mode_flags):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = self._minimal_tree(tmp)
+                    self._write_rogue_overlay(root, "release")
+                    proc = self._run_gate(root, *mode_flags)
+                    self.assertEqual(proc.returncode, 1, proc.stderr)
+                    self.assertIn("blacklisted permission SEND_SMS", proc.stderr)
+                    self.assertIn('without tools:node="remove"', proc.stderr)
+                    self.assertIn("app/src/release/AndroidManifest.xml", proc.stderr)
+                    # Failed before any artifact/tool stage could run.
+                    self.assertNotIn("required Android build-tools", proc.stderr)
+
+    def test_flavor_variant_manifest_rogue_permission_fails_its_lane_only(self) -> None:
+        # A rogue app/src/githubRelease/AndroidManifest.xml merges into
+        # github-flavor variants only: the github lane must FAIL named,
+        # while the foss lane (whose universe excludes other flavors'
+        # overlays and their variant dirs) must still pass the source
+        # stage with the same rogue present - no cross-flavor false-FAIL.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            self._write_rogue_overlay(root, "githubRelease")
+            proc = self._run_gate(root, "--github")
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("blacklisted permission SEND_SMS", proc.stderr)
+            self.assertIn(
+                "app/src/githubRelease/AndroidManifest.xml", proc.stderr
+            )
+            self.assertNotIn("required Android build-tools", proc.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            self._write_rogue_overlay(root, "githubRelease")
+            proc = self._run_gate(root, "--foss")
+            fail_lines = "\n".join(
+                line for line in proc.stderr.splitlines() if line.startswith("FAIL:")
+            )
+            self.assertNotIn("blacklisted permission", fail_lines, proc.stderr)
+            self.assertNotIn("missing manifest", fail_lines, proc.stderr)
+            self._assert_source_stage_clean_then_tool_stage_failure(proc)
+
+    def test_play_overlay_rogue_permission_fails_play_not_foss(self) -> None:
+        # Cross-flavor universe isolation: a rogue SEND_SMS in the PLAY
+        # overlay fails the play lane, and must NOT fail the foss lane -
+        # app/src/play cannot merge into a foss variant, and a blind
+        # all-manifest sweep would false-FAIL the foss lane (which would
+        # also have mis-grepped play overlays for its GMS needles).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            self._write_rogue_overlay(root, "play")
+            proc = self._run_gate(root)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("blacklisted permission SEND_SMS", proc.stderr)
+            self.assertIn('without tools:node="remove"', proc.stderr)
+            self.assertIn("app/src/play/AndroidManifest.xml", proc.stderr)
+            self.assertNotIn("required Android build-tools", proc.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            self._write_rogue_overlay(root, "play")
+            proc = self._run_gate(root, "--foss")
+            fail_lines = "\n".join(
+                line for line in proc.stderr.splitlines() if line.startswith("FAIL:")
+            )
+            self.assertNotIn("blacklisted permission", fail_lines, proc.stderr)
+            self.assertNotIn("references proprietary", fail_lines, proc.stderr)
+            self._assert_source_stage_clean_then_tool_stage_failure(proc)
+
+    def test_main_manifest_rogue_permission_fails_every_lane(self) -> None:
+        # F6 baseline, made explicit against the new universe wiring: a
+        # rogue SEND_SMS in MAIN merges into every variant of every flavor
+        # and must keep failing all three lanes named (pinning that the
+        # glob+case main skip means "scanned once, not unscanned").
+        for mode_flags in ((), ("--foss",), ("--github",)):
+            with self.subTest(mode=mode_flags):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = self._minimal_tree(tmp)
+                    self._write_rogue_overlay(root, "main")
+                    proc = self._run_gate(root, *mode_flags)
+                    self.assertEqual(proc.returncode, 1, proc.stderr)
+                    self.assertIn("blacklisted permission SEND_SMS", proc.stderr)
+                    self.assertIn('without tools:node="remove"', proc.stderr)
+                    self.assertIn("app/src/main/AndroidManifest.xml", proc.stderr)
+                    self.assertNotIn("required Android build-tools", proc.stderr)
+
+    def test_clean_release_overlay_before_play_needle_sweeps_nothing(self) -> None:
+        # The extended universe must scan a LEGAL release overlay too (not
+        # only rogues): a clean app/src/release manifest plus a legal
+        # marked-removal shape must sail through every source check and
+        # reach the artifact/tool stage. (Existence = scan; the fail-closed
+        # universe is driven by what exists, not by a fixed whitelist.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            (root / "app" / "src" / "release" / "AndroidManifest.xml").parent.mkdir(
+                parents=True
+            )
+            (
+                root / "app" / "src" / "release" / "AndroidManifest.xml"
+            ).write_text(
+                '<manifest xmlns:android="http://schemas.android.com/apk/res/android"'
+                ' xmlns:tools="http://schemas.android.com/tools">\n'
+                '    <application android:allowBackup="true" />\n'
+                '    <uses-permission android:name="android.permission.SEND_SMS"'
+                ' tools:node="remove" />\n'
+                "</manifest>\n",
+                encoding="utf-8",
+            )
+            proc = self._run_gate(root)
+            self.assertNotIn("blacklisted permission", proc.stderr, proc.stderr)
+            self.assertNotIn("missing manifest", proc.stderr, proc.stderr)
             self._assert_source_stage_clean_then_tool_stage_failure(proc)
 
     def test_cleartext_scan_matches_all_legal_spellings(self) -> None:

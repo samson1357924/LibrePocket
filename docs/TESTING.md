@@ -38,7 +38,7 @@ When `code == true`, the workflow uses JDK 25 and runs these Gradle stages:
 
 1. `:app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest` (including Robolectric tests available in those source sets). The unit-tests job fans out over a flavor matrix with fail-fast disabled, so each flavor runs on its own runner and wall time is the slowest shard rather than the sum. Test report artifacts now include both HTML reports and structured JUnit XML (`app/build/test-results/`), retained for 14 days; results are parsed in real time into GitHub Actions Step Summary (`$GITHUB_STEP_SUMMARY`) to surface failure counts, skipped tests, and assertion summaries directly without requiring artifact downloads. The parser (`scripts/summarize_junit.py`, covered by `scripts/tests/test_summarize_junit.py`) is reporting-only and never a gate: it emits an explicit `Status:` line that reads `PASS` only when every XML file is readable, `tests > 0`, `failures == 0`, `errors == 0`, and every suite's counters exactly equal its direct `<testcase>` detail (`tests` vs case count, `failures+errors` vs failed cases, `skipped` vs skipped cases, either direction) — otherwise `FAIL`, `PARTIAL` (unreadable files), `INCOMPLETE` (empty or contradictory totals, including any per-suite mismatch), or `NO_RESULTS` (no XML). Only outermost suites are counted (a `<testsuite>` root counts itself; a `<testsuites>` root counts its direct `<testsuite>` children; nested suites are ignored for counting with a warning and force `INCOMPLETE`, since outer counters alone cannot prove completeness; Gradle never emits nested suites, so flat real-world results are unaffected). Rendered output is capped at 900 KiB of UTF-8 bytes (idents, messages, every warning, and the flavor title each truncated to 300 characters); overflow drops tail entries and records `omitted N failures / M skips; see XML artifact` (plus `omitted K warning(s); see XML artifact` when warnings themselves overflow), never raising.
 2. `:app:lintPlayDebug :app:lintFossDebug :app:lintGithubDebug`.
-3. `:app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug`, then `scripts/play_policy_check.sh` for Play and `scripts/play_policy_check.sh --foss` for Foss, plus the github-mode artifact binding authority on the assembled github debug APK in the same stage (`apk_policy_inspect.py --mode github`, alongside the common five-token manifest source scan). This stage also runs when only `policy == true`.
+3. `:app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug :app:assemblePlayRelease :app:assembleFossRelease :app:assembleGithubRelease` (the release variants are assembled UNSIGNED — this job runs without `-PreleaseSigning`, so no signing config is assigned per `app/build.gradle.kts`), then `scripts/play_policy_check.sh` for Play and `scripts/play_policy_check.sh --foss` for Foss on the debug APKs, plus the github-mode artifact binding authority on the assembled github debug APK in the same stage (`apk_policy_inspect.py --mode github`, alongside the common five-token manifest source scan), and the SAME-tier policy on the three release APK outputs as well (`Run {Play,Foss} Release Policy Check` through the shell gate over `app/build/outputs/apk/{play,foss}/release/*.apk`, `Run Github Release Artifact Binding Check` over `app/build/outputs/apk/github/release/*.apk`) — Debug APKs never contain the release source set, so a rogue release/variant manifest only becomes an artifact fact on this tier. This stage also runs when only `policy == true`.
 
 Robolectric SDK pin (Current): JVM unit tests run with `sdk=33` pinned in
 `app/src/test/resources/robolectric.properties`, while `targetSdk` is 36
@@ -239,15 +239,58 @@ foss and github overlays legally declare accessibility services, so that token
 must never join the common set
 (`ApkPolicyHarness.test_accessibility_token_stays_play_only`,
 `ApkPolicyHarness.test_common_permissions_function_accepts_accessibility_surface`).
-At source level the shell gate picks a per-mode token set + overlay manifest
-pair (play = full six-token CSV, foss/github = the common five tokens) and
-feeds them through the same structured CLI; the pr-check github assembly step
-runs the common five-token source scan in the same step as the artifact scan
+At source level the shell gate picks a per-mode token set (play = full
+six-token CSV, foss/github = the common five tokens) fed through the same
+structured CLI over the PER-LANE universe (P2 round 3, replacing the
+retired "main + flavor overlay" two fixed paths): main and the mode's own
+flavor overlay are checked by fixed path (missing file = FAIL named,
+never skipped), then every glob-encountered `app/src/*/AndroidManifest.xml`
+is case-filtered into the lane universe — KEPT when it is a buildType
+overlay (`app/src/debug` / `app/src/release`, applicable to every flavor)
+or the lane's own overlay / `<flavor><BuildType>` variant overlay (exact
+name or flavor-name prefix match: `playRelease`, `fossDebug`,
+`githubRelease`, ...) — and SKIPPED otherwise, because other flavors'
+overlays (the play overlay must never trip a foss-lane GMS needle) and the
+test source sets (`test*` / `androidTest`) never merge into an APK of that
+lane. The foss proprietary-string needle scan follows the same
+case-filtered universe, not a sweep over every manifest. This closes the
+reviewer escape where a rogue `app/src/release/AndroidManifest.xml`
+(merging into every flavor's release variants but shipped by no Debug
+APK) stayed green through all three lanes
+(`BackupRulesGateWiring.test_gate_enforces_play_blacklist_via_structured_scan`,
+`BackupRulesGateEndToEnd.test_release_manifest_rogue_permission_fails_every_lane`,
+`BackupRulesGateEndToEnd.test_flavor_variant_manifest_rogue_permission_fails_its_lane_only`,
+`BackupRulesGateEndToEnd.test_play_overlay_rogue_permission_fails_play_not_foss`,
+`BackupRulesGateEndToEnd.test_main_manifest_rogue_permission_fails_every_lane`,
+`BackupRulesGateEndToEnd.test_clean_release_overlay_before_play_needle_sweeps_nothing`).
+The pr-check github assembly step runs the common five-token source scan
+over the same per-lane case-filtered universe in the same step as the
+artifact scan
 (`BackupRulesGateWiring.test_gate_enforces_common_blacklist_in_every_mode`,
 which also cross-checks the shell common set against the scanner's
 `COMMON_FORBIDDEN_PERMISSIONS` tuple;
 `BackupRulesGateEndToEnd.test_github_lane_rejects_unmarked_common_permission`,
 `BackupRulesGateEndToEnd.test_github_lane_accepts_marked_removal_and_clean_overlay`).
+
+### Release-variant artifact authority (Current, policy gate)
+
+The Build & Policy Gates stage additionally assembles all three release
+variants (`:app:assemblePlayRelease :app:assembleFossRelease
+:app:assembleGithubRelease` together with the debug tasks) and applies the
+debug-tier artifact policy to each lane's release APK in the same job:
+the shell gate for Play and Foss (`scripts/play_policy_check.sh` /
+`--foss` over `app/build/outputs/apk/{play,foss}/release/*.apk`) and the
+mode-independent artifact authorities (`apk_policy_inspect.py --mode
+github`) on the github release output. The release APKs are UNSIGNED (the
+job runs without `-PreleaseSigning`, so `app/build.gradle.kts` assigns no
+signing config and AGP emits `app-<flavor>-release-unsigned.apk`); the
+output-dir glob is naming-drift-proof and fails closed when no APK was
+produced. This tier is the artifact face of the same P2 escape: a rogue
+`app/src/release/AndroidManifest.xml` previously merged into an APK that
+PR CI never scanned until release staging
+(`PolicyCiGateControl.test_release_variants_assembled_and_policy_applied`).
+The upload step keeps both faces (`Upload Debug & Release APKs`, artifact
+`assembled-apks`).
 
 Two adjacent shell findings were made fail-closed in the same pass. A missing
 flavor/overlay manifest no longer makes the whole structured permission stage
@@ -466,6 +509,10 @@ python3 scripts/check_junit_durations.py
 
 # Debug assembly
 ./gradlew :app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug --max-workers=1 --no-daemon
+
+# Debug + unsigned-release assembly (release is unsigned without
+# -PreleaseSigning; a direct assemble/bundle is exactly what CI policy runs)
+./gradlew :app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug :app:assemblePlayRelease :app:assembleFossRelease :app:assembleGithubRelease --max-workers=1 --no-daemon
 
 # APK-only artifact policy checks after successful assembly; AAB is unsupported
 # and rejected before credentials/build by the local release builder.

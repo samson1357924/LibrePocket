@@ -18,7 +18,7 @@
 #         checks; other elements' `name` (meta-data, action, category…) get
 #         the token check only. <manifest package="dev.librepocket.mcp…">
 #         fails. Placeholders mentioning MCP fail closed; parse errors fail
-#         closed. A text grep (FQN boundary / Mcp[A-Z]) remains as
+#         closed. A raw-text scan (FQN boundary / Mcp[A-Z]) remains as
 #         defense-in-depth (comments still turn it red — accepted cost);
 #      2. Gradle manifest injection: no `manifestPlaceholders` /
 #         `add|set|getManifestPlaceholders` in ANY gradle file alongside an
@@ -26,8 +26,10 @@
 #         extra cannot hide it), no `manifest.srcFile` or getter
 #         `getManifest().srcFile|setSrcFile`, no namespace/applicationId/
 #         setNamespace/setApplicationId set to dev.librepocket.mcp, and no
-#         MCP literal in any gradle.properties (all decoded through JLS
-#         `\uXXXX` escapes first);
+#         MCP literal in any gradle.properties or *.toml version catalog
+#         (gradle/properties decoded through JLS `\uXXXX` escapes first; TOML
+#         basic strings decode `\uXXXX`/`\UXXXXXXXX` but literal strings and
+#         comments do not, and the raw text is scanned as a backstop);
 #      3. in-package outbound import allowlist / FQN: inside the MCP package
 #         — classified by the UNIQUE real `package` declaration after a
 #         recursive Kotlin/Java lexer strips comments/strings/char literals
@@ -38,26 +40,31 @@
 #         than one declaration fails closed — the ONLY allowed
 #         dev.librepocket.* references are the import allowlist
 #         (keystore.KeyVault + the 7 tool contract types), the package decl,
-#         self-mentions, and KDoc links ([dev.librepocket.…]) — any other
-#         import (incl. star imports) or fully-qualified outbound use fails;
+#         self-mentions, and KDoc links in comments (blanked before scanning,
+#         so a bracketed/generic FQN in real code or a string is still found) —
+#         any other import (incl. star imports) or fully-qualified outbound use
+#         fails;
 #      4. whole-module package-classification outside references: no
 #         production source file OUTSIDE the MCP package (same package-based
 #         split; every module's production source roots — main + flavors +
 #         debug, Kotlin and Java, excluding test*/androidTest*) references
 #         the mcp package or any Mcp* type. Scanned by a Python normaliser
-#         (backticks, single-line /*…*/ and // comments, whitespace around
-#         dots) rather than a literal grep; multi-line block comments are a
-#         documented residual. Java is lexed after JLS Unicode escape
-#         decoding; an escape-obscured MCP reference is reported by the ESC
-#         pre-scan (which masks only the package header, never the whole
-#         line) and fails closed;
+#         (backticks, same-line /*…*/ comments, // comments, whitespace
+#         around dots) rather than a literal grep. Java is lexed
+#         after JLS Unicode escape decoding; an escape-obscured MCP reference
+#         (including one that decodes to whitespace inside the FQN) fails
+#         closed via the decoded scan and the ESC pre-scan (which masks only
+#         the package header, never the whole line);
 #      5. discovery/classification fail-closed: no src roots / no manifests /
 #         no in-package sources / unreadable or ambiguous package
-#         declarations / grep or find errors ⇒ fail, never silent pass.
+#         declarations / text-scan, parse or find errors ⇒ fail, never silent
+#         pass.
 #         Merged-manifest output, string-concatenated gradle literals,
 #         arbitrary dynamic property resolution and dynamic/reflective wiring
 #         are outside this text guard's evidence: a green CI run does not
-#         prove they are absent. Symlinks are not followed (`find -type f`).
+#         prove they are absent. Symlinked sources/directories are not
+#         followed; the helper fails closed with a diagnostic instead of
+#         silently skipping them (G-13).
 #
 # Fails closed: any mismatch prints a message and exits non-zero.
 # Self-test: scripts/test_docs_claim_check.sh (fixture repos per wiring vector
@@ -71,6 +78,10 @@ ENV_DOC="$ROOT/docs/ENV.md"
 TOML="$ROOT/gradle/libs.versions.toml"
 APP_BUILD="$ROOT/app/build.gradle.kts"
 WRAPPER="$ROOT/gradle/wrapper/gradle-wrapper.properties"
+# Shared stdlib-only lexer/scan helper (Stage1): C1 discovery, C2 type names and
+# C3 outbound are delegated to it. A missing/unreadable helper or missing
+# python3 fails closed (never a silent pass).
+MCP_SCAN="$ROOT/scripts/mcp_scan.py"
 
 fail=0
 report() { echo "docs_claim_check: $1"; fail=1; }
@@ -90,11 +101,15 @@ for wf in "$ROOT"/.github/workflows/*.yml; do
   fi
 done
 
-for f in "$WORKFLOW" "$TESTING" "$ENV_DOC" "$TOML" "$APP_BUILD" "$WRAPPER"; do
+for f in "$WORKFLOW" "$TESTING" "$ENV_DOC" "$TOML" "$APP_BUILD" "$WRAPPER" \
+  "$MCP_SCAN"; do
   if [ ! -f "$f" ]; then
     report "missing required file: $f"
   fi
 done
+if [ ! -r "$MCP_SCAN" ]; then
+  report "helper scripts/mcp_scan.py missing or unreadable (fail closed)"
+fi
 if [ "$fail" -ne 0 ]; then exit 1; fi
 
 # --- A. Workflow run: lines vs docs/TESTING.md ---
@@ -190,7 +205,7 @@ elif ! grep -Eq "JDK ${JDK_VER}([^0-9]|$)" "$ENV_DOC"; then
 fi
 
 # --- C. MCP zero-wiring (not-wired invariant) — five fail-closed surfaces:
-#   1. AndroidManifest registration (text grep + real XML parse, C2);
+#   1. AndroidManifest registration (raw-text scan + real XML parse, C2);
 #   2. Gradle manifest injection (placeholders / srcFile / namespace /
 #      applicationId / gradle.properties, C2b);
 #   3. in-package outbound import allowlist / FQN (C3);
@@ -208,8 +223,24 @@ fi
 # as a side effect (Stage4 D-01: the old single grep let a manifest component,
 # an in-package outbound import, or a brand-new module slip through).
 
-# --- C1. Discovery: every production source root of every module (fail-closed
-# on find errors or an empty result — parser drift must not silently pass). ---
+# --- C1. Discovery: every production source of every module, repo-wide, via
+# the shared helper (fail-closed on find/python3/discover errors or an empty
+# result). The helper scans all production `.kt`/`.java` files — including a
+# source root outside `*/src` configured through a custom `java.srcDir(...)` —
+# and excludes only the real Gradle test source sets, i.e. files at
+# `<module>/src/<sourceSet>/…` where the module root comes from the root
+# settings.gradle[.kts] (`include`/`includeBuild`/`projectDir`; with no root
+# settings, repo root + depth-1 children with build.gradle[.kts] + `src/`)
+# and the sourceSet starts with `test`/`androidTest`. Everything else stays in
+# scope: a production package literally named `…src.test…` under `src/main`, a
+# custom `extra/java` root that later contains `src/test`, and an inert
+# marker file (or marker + `src/` child) in a package directory (neither is a
+# module root, so a sibling package named `build` is not pruned). A `build`
+# directory is pruned only when it is a real Gradle output root, not a package
+# segment. Symlinked sources/directories are not followed: discovery fails
+# closed with a diagnostic rather than silently skipping them.
+# The zero-src-root sanity check is kept: a repo with no `*/src` directory at
+# all means parser/checkout drift, never a silent pass.
 if ! SRC_LIST="$(find "$ROOT" -type d -name src \
   -not -path '*/build/*' -not -path '*/.gradle/*' -not -path '*/.git/*' \
   -not -path '*/node_modules/*' 2>&1)"; then
@@ -224,20 +255,28 @@ if [ "${#SRC_DIRS[@]}" -eq 0 ]; then
   report "no */src source roots found under repo root (parser drift?) — MCP scan cannot run (fail closed)"
 fi
 
-# Production source files of every module: Kotlin/Java, excluding only the
-# test*/androidTest* source sets that legitimately reference MCP (flavor code
-# ships in the APK, so a Mcp* reference there is production wiring too).
+# Production source files (Kotlin/Java) of every module, including roots that
+# are not under a `*/src` directory. The helper prunes build/.gradle/.git/
+# node_modules and does not follow symlinks; a walk/read error exits non-zero.
 PROD_FILES=()
-if [ "${#SRC_DIRS[@]}" -gt 0 ]; then
-  if ! PROD_LIST="$(find "${SRC_DIRS[@]}" -type f \( -name '*.kt' -o -name '*.java' \) \
-    -not -path '*/src/test*' -not -path '*/src/androidTest*' 2>&1)"; then
-    report "find over production sources failed (fail closed): $PROD_LIST"
+PROD_LIST=""
+if ! command -v python3 >/dev/null 2>&1; then
+  report "python3 not available for production source discovery (fail closed)"
+elif [ ! -r "$MCP_SCAN" ]; then
+  report "helper scripts/mcp_scan.py missing or unreadable (fail closed)"
+else
+  set +e
+  PROD_LIST="$(python3 "$MCP_SCAN" discover "$ROOT" 2>&1)"
+  DISC_RC=$?
+  set -e
+  if [ "$DISC_RC" -ne 0 ]; then
+    report "production source discovery failed (fail closed, rc=$DISC_RC): $PROD_LIST"
     PROD_LIST=""
   fi
-  while IFS= read -r f; do
-    [ -n "$f" ] && PROD_FILES+=("$f")
-  done <<< "$PROD_LIST"
 fi
+while IFS= read -r f; do
+  [ -n "$f" ] && PROD_FILES+=("$f")
+done <<< "$PROD_LIST"
 if [ "${#PROD_FILES[@]}" -eq 0 ]; then
   report "no production Kotlin/Java sources found (parser drift?) — MCP scan cannot run (fail closed)"
 fi
@@ -290,7 +329,10 @@ fi
 # consumes the line). A line still carrying `dev.librepocket.` or `Mcp[A-Z]`
 # after decoding means a Java Unicode escape obscured an MCP-related
 # reference, reported as `ESC\t<path>\t<lineno>\t<text>` and failed closed.
-MCP_FQN_BOUNDARY='dev\.librepocket\.mcp([^A-Za-z0-9_]|$)|Mcp[A-Z]'
+# The raw manifest text scan uses the same JVM identifier-part predicate
+# (letters, Nd/Nl, Mn/Mc/Cf/Pc/Sc, `$`/`_`), so `dev.librepocket.mcpfoo`,
+# `…mcp$Compat`, `…mcpé`, `…mcp\u0301`, `…mcp\u200d` and `…mcp€X` are different
+# packages, while `Mcp[A-Z]` stays deliberately wide (over-approximate).
 IN_PKG_FILES=()
 OUTSIDE_FILES=()
 PKG_SCAN_FAILED=0
@@ -304,17 +346,88 @@ if [ "${#PROD_FILES[@]}" -gt 0 ]; then
 import os
 import re
 import sys
+import unicodedata
 
 root = sys.argv[1]
 files = sys.argv[2:]
 
-FQN_RE = re.compile(r"^dev\.librepocket\.mcp(\.[A-Za-z_][A-Za-z0-9_]*)*$")
-PKG_DECL = re.compile(
-    r"(?<![A-Za-z0-9_$`])package\s+"
-    r"((?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)*"
-    r"`?[A-Za-z_][A-Za-z0-9_]*`?)")
+# A package segment is scanned with the full JVM identifier-part predicate.
+# `\w`/`[^\W\d]` are NOT enough: Python's `\w` excludes Mn/Mc/Cf/Pc/Sc, so a
+# lookalike package such as `dev.librepocket.mcp\u0301` used to be truncated to
+# `dev.librepocket.mcp`, classified IN, and its real MCP import was stripped as
+# a self-mention (G-17).  The exact `Character.isJavaIdentifierPart` categories
+# are used here too: L*, Nd, Nl, Mn/Mc/Cf/Pc/Sc plus `$`/`_` and the
+# identifier-ignorable controls.  Category No (e.g. U+00B2) is intentionally
+# excluded.
+FQN_RE = re.compile(r"^dev\.librepocket\.mcp(?:\..+)?$")
+PKG_HEAD = re.compile(r"package\s+")
 PKG_LINE = re.compile(r"^\s*package\b")
 ESC_MCP = re.compile(r"dev\.librepocket\.|Mcp[A-Z]")
+# JVM whitespace around a dot (space/tab/form feed/vtab) collapses; a line
+# terminator does not (that would join separate physical lines).
+DOTS = re.compile(r"[^\S\n]*\.[^\S\n]*")
+_IDENT_EXTRA = frozenset({"Mn", "Mc", "Cf", "Pc", "Sc"})
+
+
+def is_ident_part(c):
+    if c == "$" or c == "_":
+        return True
+    category = unicodedata.category(c)
+    if category[0] == "L" or category in ("Nd", "Nl"):
+        return True
+    if category in _IDENT_EXTRA:
+        return True
+    o = ord(c)
+    return o <= 0x08 or 0x0E <= o <= 0x1B or 0x7F <= o <= 0x9F
+
+
+def scan_pkg_name(code, i):
+    """Scan a full qualified name starting at `i` with JVM identifier rules.
+
+    Returns (normalised_name_or_None, end_index).  Comments are already blanked
+    to spaces by the lexer; whitespace and dots may separate segments and a
+    Kotlin backticked segment is accepted.  Scanning manually (instead of a
+    `\\w`-based regex) means a legal lookalike continuation such as U+0301,
+    U+20AC, U+203F or U+200D is part of the name, so it can never be truncated
+    back to `dev.librepocket.mcp`.
+    """
+    n = len(code)
+    segments = []
+    while True:
+        while i < n and code[i].isspace():
+            i += 1
+        if i < n and code[i] == "`":
+            j = code.find("`", i + 1)
+            if j < 0:
+                return None, i
+            segments.append(code[i + 1:j])
+            i = j + 1
+        else:
+            start = i
+            while i < n and is_ident_part(code[i]):
+                i += 1
+            if i == start:
+                return None, i
+            segments.append(code[start:i])
+        j = i
+        while j < n and code[j].isspace():
+            j += 1
+        if j < n and code[j] == ".":
+            i = j + 1
+            continue
+        return ".".join(segments), i
+
+
+def package_declarations(code):
+    decls = []
+    for match in PKG_HEAD.finditer(code):
+        before = code[match.start() - 1] if match.start() else ""
+        if before and (is_ident_part(before) or before == "`"):
+            continue
+        name, _ = scan_pkg_name(code, match.end())
+        if name is not None:
+            decls.append(re.sub(r"[`\s]", "", name))
+    return decls
 
 
 def rel(path):
@@ -474,8 +587,8 @@ def scan_code(text, i, nested, stop_brace=False):
             # Kotlin backtick identifier. Lex the whole quoted token so its
             # text can never forge a package declaration:
             #   - a plain identifier keeps its content (and delimiters, which
-            #     PKG_DECL tolerates) so `package `dev`.librepocket.mcp` still
-            #     classifies;
+            #     the package scanner tolerates) so `package `dev`.librepocket.mcp`
+            #     still classifies;
             #   - anything else (spaces, `package …` prose, an unterminated
             #     backtick) collapses to `_BT_`, so `val `package dev…` = 1`
             #     cannot count as a declaration. Newlines are preserved to keep
@@ -533,7 +646,7 @@ def read_text(path):
 def classify(text, is_java):
     nested = not is_java
     _, code, _ = scan_code(text, 0, nested)
-    decls = [re.sub(r"[`\s]", "", d) for d in PKG_DECL.findall(code)]
+    decls = package_declarations(code)
     if len(decls) > 1:
         return ("BAD", "multiple package declarations")
     if not decls:
@@ -554,7 +667,12 @@ def main():
         if is_java:
             decoded = java_unicode_decode(text)
             if "\\u" in text:
-                for lineno, line in enumerate(decoded.splitlines(), 1):
+                # JVM-faithful line split: form feed (and the other Unicode
+                # separator characters `str.splitlines()` treats as breaks) is
+                # ordinary whitespace, not a line terminator.
+                decoded_lines = decoded.replace(
+                    "\r\n", "\n").replace("\r", "\n").split("\n")
+                for lineno, line in enumerate(decoded_lines, 1):
                     # Mask only the package declaration HEADER (up to its
                     # first `;`), never the whole physical line: Java allows
                     # `package a; import b;` on one line, and skipping the
@@ -567,7 +685,13 @@ def main():
                         if semi == -1:
                             continue
                         scan_line = scan_line[semi + 1:]
-                    if ESC_MCP.search(scan_line):
+                    # Collapse whitespace around dots so an escape that decoded
+                    # to a space/tab/form-feed inside the FQN
+                    # (`dev\u0020.librepocket…`) is still an MCP reference on
+                    # ONE physical line.  A decoded line terminator is not
+                    # joined (documented N-B3 residual), because DOTS never
+                    # crosses `\n`.
+                    if ESC_MCP.search(DOTS.sub(".", scan_line)):
                         print("\t".join(
                             ("ESC", path, str(lineno), line.strip())))
         else:
@@ -634,23 +758,49 @@ if [ "${#IN_PKG_FILES[@]}" -eq 0 ] && [ "$PKG_SCAN_FAILED" -eq 0 ]; then
   report "no production source declares package dev.librepocket.mcp (parser drift?) — MCP package scan cannot run (fail closed)"
 fi
 
+# --- C2 type-name enumeration (delegated to the shared helper). The manifest
+# relative-component name set is the file basenames (added below) plus every
+# type declared in an in-package file. Names come from the comment/string-
+# stripped, Java-Unicode-decoded lexed view, so `class /* c */ Transport` and
+# Java `cl\u0061ss Transport` are both seen. A read failure (rc>=2) is already a
+# hard gate failure; the name set then falls back to basenames only.
+TYPE_NAMES=""
+if [ "${#IN_PKG_FILES[@]}" -gt 0 ]; then
+  if ! command -v python3 >/dev/null 2>&1; then
+    report "python3 not available for MCP type-name enumeration (fail closed)"
+  elif [ ! -r "$MCP_SCAN" ]; then
+    report "helper scripts/mcp_scan.py missing or unreadable (fail closed)"
+  else
+    set +e
+    TYPE_NAMES="$(python3 "$MCP_SCAN" types "$ROOT" \
+      "${IN_PKG_FILES[@]}" 2>&1)"
+    TYPE_RC=$?
+    set -e
+    if [ "$TYPE_RC" -ne 0 ]; then
+      report "MCP type-name scan failed (fail closed, rc=$TYPE_RC): $TYPE_NAMES"
+      TYPE_NAMES=""
+    fi
+  fi
+fi
+
 # --- C2. Surface: AndroidManifest registration (any module, any flavor). ---
 # N-B1 accepted cost: the bare `Mcp[A-Z]` substring is deliberately wide — a
 # third-party string containing e.g. `McpCompat` also turns this red
 # (fail-closed direction, not tightened: any token-boundary rule risks
 # dropping a real `dev.librepocket.mcp.McpServer` reference mid-string).
-# The FQN half of the text pattern carries a trailing boundary
-# (`dev\.librepocket\.mcp([^A-Za-z0-9_]|$)`) so a lookalike package such as
-# `dev.librepocket.mcpfoo` is no longer a false red. XML component checks keep
-# the substring form (over-approximate, fail-closed).
+# The FQN half of the text pattern carries a full JVM identifier-aware trailing
+# boundary (combining marks, ZWJ/Cf, currency symbols, `$`) so a lookalike
+# package such as `dev.librepocket.mcpfoo` (or `…mcp$Compat`/`…mcpé`/
+# `…mcp\u0301`/`…mcp\u200d`/`…mcp€X`) is no longer a false red. XML component
+# checks keep the substring form (over-approximate, fail-closed).
 #
 # Two layers:
-#   1. A text grep (FQN with trailing boundary / Mcp[A-Z]) over the raw
-#      manifest files. It is
-#      defense-in-depth: it also catches comments, though `xml.etree` does not
-#      expose comments (documented accepted cost — a comment mentioning MCP
-#      turns the gate red). Entity-encoded dots (&#46;) have no literal `.`,
-#      so only layer 2 can catch them (pinned by a fixture).
+#   1. A raw-text scan (FQN with an identifier-aware trailing boundary /
+#      Mcp[A-Z]) over the raw manifest files. It is defense-in-depth: it also
+#      catches comments, though `xml.etree` does not expose comments
+#      (documented accepted cost — a comment mentioning MCP turns the gate
+#      red). Entity-encoded dots (&#46;) have no literal `.`, so only layer 2
+#      can catch them (pinned by a fixture).
 #   2. A real XML parse (python3 stdlib only: no PyYAML, no new dependency).
 #      This is the authoritative layer. It matches attributes by local-name
 #      (namespace-prefix tolerant), so quote style, `=` whitespace, line
@@ -685,7 +835,7 @@ fi
 #      data/sealed/value/annotation class forms and backticked Kotlin names
 #      such as class `Transport`). This catches a manifest registering
 #      `Transport` when `class Transport` lives in a differently named file,
-#      and mirrors C3/C4's package-based truth. TYPE_DECL is
+#      and mirrors C3/C4's package-based truth. The helper's TYPE_DECL is
 #      deliberately over-approximate: `enum`/`record`/`typealias` cannot be
 #      manifest components, but matching them only turns the gate red
 #      (fail-closed, never green).
@@ -708,16 +858,9 @@ done <<< "$MF_LIST"
 if [ "${#MANIFESTS[@]}" -eq 0 ]; then
   report "no AndroidManifest*.xml found (parser drift?) — MCP manifest scan cannot run (fail closed)"
 else
-  set +e
-  MF_HITS="$(grep -HnE "$MCP_FQN_BOUNDARY" "${MANIFESTS[@]}" 2>&1)"
-  MF_RC=$?
-  set -e
-  if [ "$MF_RC" -ge 2 ]; then
-    report "manifest grep failed (fail closed, rc=$MF_RC): $MF_HITS"
-  elif [ "$MF_RC" -eq 0 ]; then
-    report "Android manifest registers MCP (MCP must stay unwired until the wiring PR updates this gate):"
-    printf '%s\n' "$MF_HITS"
-  fi
+  # The text layer (comments included) and the authoritative XML layer run in
+  # one Python pass below. The text layer is identifier-aware for `$`/Unicode
+  # (see mcp_fqn_in in that pass), so a lookalike package is not a false red.
 
   # Authoritative XML layer (Stage6 A/B). IN_PKG_FILES was classified by C1b
   # via the package declaration; the parser adds declared type names to the
@@ -728,27 +871,61 @@ else
     report "python3 not available for AndroidManifest XML parsing (fail closed)"
   else
     set +e
-    MF_XML_OUT="$(python3 - "$ROOT" "${#IN_PKG_FILES[@]}" \
+    MF_XML_OUT="$(python3 - "$ROOT" "$TYPE_NAMES" \
+      "${#IN_PKG_FILES[@]}" \
       ${IN_PKG_FILES[@]+"${IN_PKG_FILES[@]}"} "${MANIFESTS[@]}" <<'PY'
 import os
 import re
 import sys
+import unicodedata
 import xml.etree.ElementTree as ET
 
 root = sys.argv[1]
-n_in = int(sys.argv[2])
-in_files = sys.argv[3:3 + n_in]
-manifests = sys.argv[3 + n_in:]
+# Newline-separated declared type names emitted by scripts/mcp_scan.py `types`
+# (comment/string-stripped, Java-Unicode-decoded). These are the load-bearing
+# half of the relative-component name set; basenames are added below.
+type_names = [n for n in sys.argv[2].split("\n") if n]
+n_in = int(sys.argv[3])
+in_files = sys.argv[4:4 + n_in]
+manifests = sys.argv[4 + n_in:]
 
 FQN = "dev.librepocket.mcp"
+# Identifier-aware trailing boundary using the full JVM identifier-part
+# predicate (same one as scripts/mcp_scan.py, G-11): `$`, `_`, letters/digits,
+# currency symbols (Sc), connecting punctuation (Pc), combining marks (Mn/Mc)
+# and format/ignorable controls (Cf) all continue the package name, so
+# lookalikes (`mcpfoo`, `mcp$Compat`, `mcpé`, `mcp\u0301`, `mcp\u200d`,
+# `mcp€X`) are not the mcp package. `Mcp[A-Z]` remains deliberately wide
+# (fail-closed, N-B1).
+_IDENT_EXTRA = frozenset({"Mn", "Mc", "Cf", "Pc", "Sc"})
+
+
+def is_ident_part(c):
+    if c == "$" or c == "_":
+        return True
+    category = unicodedata.category(c)
+    if category[0] == "L" or category in ("Nd", "Nl"):
+        return True
+    if category in _IDENT_EXTRA:
+        return True
+    o = ord(c)
+    return o <= 0x08 or 0x0E <= o <= 0x1B or 0x7F <= o <= 0x9F
+
+
+def mcp_fqn_in(text):
+    """True when `text` contains the mcp package, boundary-aware."""
+    i = 0
+    while True:
+        j = text.find(FQN, i)
+        if j < 0:
+            return False
+        k = j + len(FQN)
+        if k >= len(text) or not is_ident_part(text[k]):
+            return True
+        i = k
+
+
 MCP_TYPE = re.compile(r"Mcp[A-Z]")
-# Deliberately over-approximate: enum/record/typealias cannot be manifest
-# components, but matching extra names only turns the gate red (fail-closed).
-TYPE_DECL = re.compile(
-    r"\b(?:enum\s+class|enum|class|object|interface|record|typealias)"
-    # Kotlin permits backticked type names (e.g. class `Transport`), and the
-    # manifest refers to the JVM name without the backticks.
-    r"\s+`?([A-Za-z_][A-Za-z0-9_$]*)`?")
 
 # Only these element names carry a component class in `name`. Everything else
 # (meta-data, action, category, uses-permission…) holds data, not a component.
@@ -779,14 +956,14 @@ def local_name(name):
 
 def package_names():
     # Package-based (not path-based): in_files are production sources whose
-    # package declaration is dev.librepocket.mcp(.…). Collect file basenames
-    # plus every declared type (class/object/interface/enum/record/typealias
-    # and modifiers such as data/sealed/value, which still carry `class`).
-    found = set()
+    # package declaration is dev.librepocket.mcp(.…). The declared type names
+    # (comment/string-stripped, Java-Unicode-decoded) are precomputed by
+    # scripts/mcp_scan.py; the file basenames are added here. Deliberately
+    # over-approximate (enum/record/typealias cannot be components): extra names
+    # only turn the gate red (fail-closed).
+    found = set(type_names)
     for path in in_files:
         found.add(os.path.basename(path).rsplit(".", 1)[0])
-        with open(path, encoding="utf-8", errors="replace") as handle:
-            found.update(TYPE_DECL.findall(handle.read()))
     return found
 
 
@@ -807,7 +984,7 @@ def relative_candidates(value):
 
 def full_reason(value):
     # FULL rule set: used for component names and component-reference attrs.
-    if FQN in value or MCP_TYPE.search(value):
+    if mcp_fqn_in(value) or MCP_TYPE.search(value):
         return "Android manifest registers MCP"
     if "${" in value and "mcp" in value.lower():
         return ("Android manifest registers MCP (placeholder component "
@@ -830,6 +1007,25 @@ def main():
 
     failed = False
     for manifest in manifests:
+        # Defense-in-depth text layer: catches comments (which ElementTree
+        # does not expose) and any raw FQN/`Mcp[A-Z]` token. It is an
+        # identifier-aware Python regex, so a lookalike package is not a false
+        # red. A read error fails closed here (the XML parse below would also
+        # fail, but this keeps the diagnostic explicit).
+        try:
+            with open(manifest, encoding="utf-8", errors="replace") as handle:
+                raw = handle.read()
+        except Exception as exc:
+            print("cannot read AndroidManifest (fail closed): "
+                  f"{rel(manifest)}: {exc}")
+            failed = True
+            continue
+        for lineno, line in enumerate(raw.split("\n"), 1):
+            if mcp_fqn_in(line) or MCP_TYPE.search(line):
+                print("Android manifest registers MCP (MCP must stay unwired "
+                      "until the wiring PR updates this gate): "
+                      f"{rel(manifest)}:{lineno}: {line.strip()}")
+                failed = True
         try:
             tree = ET.parse(manifest)
         except Exception as exc:
@@ -858,11 +1054,11 @@ def main():
                 if attribute == "name":
                     if tag in COMPONENT_ELEMENTS:
                         reason = full_reason(value)
-                    elif FQN in value or MCP_TYPE.search(value):
+                    elif mcp_fqn_in(value) or MCP_TYPE.search(value):
                         # Non-component name: token check only. A bare
                         # basename (e.g. meta-data "Transport") is data.
-                        # redundant with the C2 text-grep layer; do not remove
-                        # both
+                        # Redundant with the C2 text-scan layer; do not remove
+                        # both.
                         reason = "Android manifest registers MCP"
                 elif attribute in COMPONENT_REF_ATTRS:
                     reason = full_reason(value)
@@ -922,17 +1118,24 @@ fi
 #     keyword and `=`; the trailing boundary keeps `dev.librepocket.mcpfoo`
 #     green;
 #   - an MCP FQN / `Mcp[A-Z]` literal in any gradle.properties (a property
-#     consumed via project.property(...) is an indirect wiring surface).
+#     consumed via project.property(...) is an indirect wiring surface);
+#   - an MCP FQN / `Mcp[A-Z]` literal in any `*.toml` (at minimum the Gradle
+#     version catalog `gradle/libs.versions.toml`, whose `[versions]` entries
+#     are consumed as `libs.versions.<alias>.get()`; a literal there feeds a
+#     namespace/applicationId/placeholder exactly like gradle.properties).
+#     TOML basic strings (`"…"`/`"""…"""`) decode `\uXXXX` and `\UXXXXXXXX`
+#     like Gradle's parser; literal strings (`'…'`/`'''…'''`) do not process
+#     escapes and are left verbatim. The raw file is scanned as a backstop.
 # Comment/space normalisation uses a second view of the same text (newlines
 # preserved for diagnostics); the raw view is still scanned so a token that
 # only appears in a comment remains fail-closed.
-# Discovery is `find` over every gradle file and gradle.properties
+# Discovery is `find` over every gradle file, gradle.properties and *.toml
 # (build/.gradle/.git excluded) — a superset of git-tracked files, so an
 # untracked local injection also fails closed. Find/read/parse errors fail
 # closed. Residual: string-concatenation-built gradle literals
 # (`"dev.librepocket." + "mcp."`), non-literal dynamic property resolution
 # (environment/system property with no MCP literal anywhere in a scanned
-# gradle/properties file), and injection expressed only in buildSrc or a
+# gradle/properties/toml file), and injection expressed only in buildSrc or a
 # convention plugin `.kt` file stay outside this text guard.
 if ! GRADLE_LIST="$(find "$ROOT" -type f \( -name '*.gradle' -o -name '*.gradle.kts' \) \
   -not -path '*/build/*' -not -path '*/.gradle/*' -not -path '*/.git/*' 2>&1)"; then
@@ -954,7 +1157,18 @@ while IFS= read -r f; do
   [ -n "$f" ] && PROPERTIES_FILES+=("$f")
 done <<< "$GRP_LIST"
 
-if [ "${#GRADLE_FILES[@]}" -gt 0 ] || [ "${#PROPERTIES_FILES[@]}" -gt 0 ]; then
+if ! TOML_LIST="$(find "$ROOT" -type f -name '*.toml' \
+  -not -path '*/build/*' -not -path '*/.gradle/*' -not -path '*/.git/*' 2>&1)"; then
+  report "find over toml files failed (fail closed): $TOML_LIST"
+  TOML_LIST=""
+fi
+CATALOG_FILES=()
+while IFS= read -r f; do
+  [ -n "$f" ] && CATALOG_FILES+=("$f")
+done <<< "$TOML_LIST"
+
+if [ "${#GRADLE_FILES[@]}" -gt 0 ] || [ "${#PROPERTIES_FILES[@]}" -gt 0 ] \
+  || [ "${#CATALOG_FILES[@]}" -gt 0 ]; then
   if ! command -v python3 >/dev/null 2>&1; then
     report "python3 not available for gradle injection scan (fail closed)"
   else
@@ -962,10 +1176,14 @@ if [ "${#GRADLE_FILES[@]}" -gt 0 ] || [ "${#PROPERTIES_FILES[@]}" -gt 0 ]; then
     GR_OUT="$(python3 - "$ROOT" "${#GRADLE_FILES[@]}" \
       ${GRADLE_FILES[@]+"${GRADLE_FILES[@]}"} \
       "${#PROPERTIES_FILES[@]}" \
-      ${PROPERTIES_FILES[@]+"${PROPERTIES_FILES[@]}"} <<'PY'
+      ${PROPERTIES_FILES[@]+"${PROPERTIES_FILES[@]}"} \
+      "${#CATALOG_FILES[@]}" \
+      ${CATALOG_FILES[@]+"${CATALOG_FILES[@]}"} <<'PY'
 import os
 import re
+import subprocess
 import sys
+import unicodedata
 
 root = sys.argv[1]
 n_gradle = int(sys.argv[2])
@@ -975,9 +1193,63 @@ pos += n_gradle
 n_props = int(sys.argv[pos])
 pos += 1
 properties_files = sys.argv[pos:pos + n_props]
+pos += n_props
+n_toml = int(sys.argv[pos])
+pos += 1
+toml_files = sys.argv[pos:pos + n_toml]
 
-# Same boundary as the manifest/C4 text grep.
-MCP = re.compile(r"dev\.librepocket\.mcp([^A-Za-z0-9_]|$)|Mcp[A-Z]")
+root = os.path.abspath(root)
+module_root_set = None
+module_roots_error = None
+helper = os.path.join(root, "scripts", "mcp_scan.py")
+try:
+    proc = subprocess.run(
+        [sys.executable, helper, "module-roots", root],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        timeout=120)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"module-roots rc={proc.returncode}: "
+            f"{(proc.stderr or proc.stdout).strip()}")
+    parsed_roots = {
+        os.path.normpath(line.strip())
+        for line in proc.stdout.splitlines() if line.strip()
+    }
+    if not parsed_roots:
+        raise RuntimeError("module-roots returned no roots")
+    module_root_set = parsed_roots
+except Exception as exc:
+    module_roots_error = str(exc)
+
+# Same identifier-aware boundary as the manifest raw-text scan and C4 (G-11:
+# combining marks, ZWJ/Cf and currency symbols continue the identifier).
+_IDENT_EXTRA = frozenset({"Mn", "Mc", "Cf", "Pc", "Sc"})
+
+
+def is_ident_part(c):
+    if c == "$" or c == "_":
+        return True
+    category = unicodedata.category(c)
+    if category[0] == "L" or category in ("Nd", "Nl"):
+        return True
+    if category in _IDENT_EXTRA:
+        return True
+    o = ord(c)
+    return o <= 0x08 or 0x0E <= o <= 0x1B or 0x7F <= o <= 0x9F
+
+
+def mcp_token_in(text):
+    prefix = "dev.librepocket.mcp"
+    i = 0
+    while True:
+        j = text.find(prefix, i)
+        if j < 0:
+            break
+        k = j + len(prefix)
+        if k >= len(text) or not is_ident_part(text[k]):
+            return True
+        i = k
+    return bool(re.search(r"Mcp[A-Z]", text))
 # Match the srcFile/setSrcFile token regardless of receiver. AGP exposes
 # `manifest.srcFile(...)`, but valid Kotlin can hide the receiver behind an
 # alias, `.apply { srcFile(...) }`, or a newline before the dot; a token-only
@@ -990,9 +1262,969 @@ NS = re.compile(
     # Property forms `namespace.set/convention/value(…)`. Quote class covers
     # plain, triple-quoted (Kotlin/Groovy) and Groovy slashy strings.
     r"\s*(?:=\s*|\(\s*|\.\s*(?:set|convention|value)\s*\(\s*)?"
-    r"[\"'/]{0,3}dev\.librepocket\.mcp"
-    r"([^A-Za-z0-9_]|$)", re.IGNORECASE)
+    r"[\"'/]{0,3}dev\.librepocket\.mcp", re.IGNORECASE)
+
+
+def ns_matches(text):
+    # Identifier-aware trailing boundary (same predicate as mcp_token_in), so
+    # a legal non-MCP namespace with a combining-mark/currency continuation is
+    # not a false red. (AGP restricts namespace segments to ASCII, so this is
+    # consistency rather than a fail-open fix.)
+    for match in NS.finditer(text):
+        k = match.end()
+        if k >= len(text) or not is_ident_part(text[k]):
+            yield match
+
+
+def ns_hit(text):
+    return next(ns_matches(text), None) is not None
 PH_TOKEN = "manifestplaceholders"
+# G-16: a MAIN source set that adds a srcDir under <module>/src/test* (or a
+# pruned <module>/build root) compiles test-shaped code as production.  The
+# helper's path-based test exclusion would then drop it, so fail closed with a
+# specific diagnostic.  The WHOLE balanced argument expression is parsed (not
+# just a literal immediately after the call): `file(...)`, `project.file(...)`,
+# `listOf(...)`, `files(...)`, `setSrcDirs(...)`, string concatenation,
+# same-file `val` indirection, `$buildDir`/`buildDir`/`layout.buildDirectory`
+# and multi-line expressions are all resolved.  Paths are resolved against the
+# build file's MODULE directory and only `<module>/src/<test*|androidTest*>`
+# or a path under `<module>/build` is flagged, so `extra/src/testFixtures`
+# stays a legitimate production root (P5/P6).  An explicit main srcDir under
+# `build/` (P3, `build/generated/ksp`) stays red as an accepted fail-closed
+# over-block: explicit build srcDirs are not currently added to discovery.
+# An expression that cannot be resolved to a safe path fails closed.
+SRCDIR_TOKEN = re.compile(r"(?<![\w$])(setSrcDirs|srcDirs|srcDir)\b")
+SRCDIR_ASSIGN = re.compile(r"(?<![\w$])(srcDirs|srcDir)\b\s*(\+=|=)")
+SOURCESET_CALL = re.compile(
+    r"sourceSets\s*\.\s*(?:getByName|create|maybeCreate|named)"
+    r"\s*\(\s*[\"']([^\"'\n]+)[\"']")
+SOURCESET_INDEX = re.compile(
+    r"sourceSets\s*\[\s*[\"']([^\"'\n]+)[\"']\s*\]")
+SOURCESET_PROP = re.compile(r"sourceSets\s*\.\s*([A-Za-z_$][\w$]*)")
+SOURCESET_BARE_CALL = re.compile(
+    r"\b(?:getByName|create|maybeCreate|named)"
+    r"\s*\(\s*[\"']([^\"'\n]+)[\"']")
+SOURCESET_MARK = re.compile(r"(?<![\w$.])sourceSets\s*$")
+APPLY_HEADER = re.compile(r"(?:^|\.)\s*apply\s*$")
+VAL_DECL = re.compile(
+    r"(?<![\w$])(?:val|var|def)\s+([A-Za-z_$][A-Za-z0-9_$]*)"
+    r"\s*(?::\s*[^=\n]+)?=\s*")
+NAME_ASSIGN = re.compile(
+    r"(?<![\w$.])([A-Za-z_$][A-Za-z0-9_$]*)\s*"
+    r"(?:[+\-*/]?=|\+\+|--)(?![=>])")
+BUILD_MARK = "\x00BUILD\x00"
+MODULE_MARK = "\x00MODULE\x00"
+ROOT_MARK = "\x00ROOT\x00"
+TOKEN_RE = re.compile(
+    # Triple-quoted forms must precede the single-quote forms so the raw
+    # string is one token (`"""extra/java"""`, not three empty strings).
+    r'"""(?:\\.|(?!""")[\s\S])*"""'
+    r"|'''(?:\\.|(?!''')[\s\S])*'''"
+    r'|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
+    r"|[A-Za-z_$][A-Za-z0-9_$]*|\d+|\S",
+    re.S)
+IDENT_RE = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*$")
+WRAPPER_CALLS = frozenset({
+    "file", "project.file", "rootProject.file", "files",
+    "listOf", "mutableListOf", "setOf", "arrayOf", "list",
+    "setSrcDirs", "srcDir", "srcDirs",
+})
+BUILD_CALLS = frozenset({
+    "buildDir", "project.buildDir", "rootProject.buildDir",
+    "layout.buildDirectory", "project.layout.buildDirectory",
+})
+BUILD_DIR_CALLS = frozenset({
+    "layout.buildDirectory.dir", "project.layout.buildDirectory.dir",
+    "buildDir.resolve", "project.buildDir.resolve",
+    "rootProject.buildDir.resolve",
+    "layout.buildDirectory.get", "project.layout.buildDirectory.get",
+})
+BUILD_BARE = frozenset({
+    "buildDir", "project.buildDir", "rootProject.buildDir",
+    "layout.buildDirectory", "project.layout.buildDirectory",
+})
+MODULE_BARE = frozenset({"projectDir", "project.projectDir"})
+ROOT_BARE = frozenset({"rootDir", "project.rootDir", "rootProject.projectDir"})
+
+
+def strip_comments_len(text):
+    """Blank comments but keep string literals and the exact length."""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in "\"'":
+            quote = c
+            triple = text.startswith(c * 3, i)
+            j = i + (3 if triple else 1)
+            while j < n:
+                if not triple and text[j] == "\\":
+                    j += 2
+                    continue
+                if triple and text.startswith(c * 3, j):
+                    j += 3
+                    break
+                if not triple and text[j] == c:
+                    j += 1
+                    break
+                j += 1
+            out.append(text[i:j])
+            i = j
+            continue
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            if j < 0:
+                j = n
+            out.append(" " * (j - i))
+            i = j
+            continue
+        if text.startswith("/*", i):
+            level = 1
+            j = i + 2
+            while j < n and level:
+                if text.startswith("/*", j):
+                    level += 1
+                    j += 2
+                elif text.startswith("*/", j):
+                    level -= 1
+                    j += 2
+                else:
+                    j += 1
+            out.append("".join("\n" if ch == "\n" else " "
+                               for ch in text[i:j]))
+            i = j
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def blank_strings_len(text):
+    """Blank string/backtick literals (newlines kept) to locate real calls."""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in "\"'`":
+            if c == "`":
+                j = text.find("`", i + 1)
+                j = n if j < 0 else j + 1
+            else:
+                quote = c
+                triple = text.startswith(c * 3, i)
+                j = i + (3 if triple else 1)
+                while j < n:
+                    if not triple and text[j] == "\\":
+                        j += 2
+                        continue
+                    if triple and text.startswith(c * 3, j):
+                        j += 3
+                        break
+                    if not triple and text[j] == c:
+                        j += 1
+                        break
+                    j += 1
+            out.append("".join("\n" if ch == "\n" else " "
+                               for ch in text[i:j]))
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def blank_quoted_len(text):
+    """Blank only quote-delimited literals, leaving backticks as code.
+
+    `blank_strings_len` also blanks backticked identifiers (which are legal
+    call/property names).  Source-set matching uses this view so a match that
+    starts inside a `"..."`/`'...'` literal is rejected, while a backticked
+    method/property is still treated as code (G-26).
+    """
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in "\"'":
+            quote = c
+            triple = text.startswith(c * 3, i)
+            j = i + (3 if triple else 1)
+            while j < n:
+                if not triple and text[j] == "\\":
+                    j += 2
+                    continue
+                if triple and text.startswith(c * 3, j):
+                    j += 3
+                    break
+                if not triple and text[j] == c:
+                    j += 1
+                    break
+                j += 1
+            out.append("".join("\n" if ch == "\n" else " "
+                               for ch in text[i:j]))
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def balanced_end(code, open_index):
+    depth = 0
+    i = open_index
+    n = len(code)
+    while i < n:
+        if code[i] == "(":
+            depth += 1
+        elif code[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return n
+
+
+def expression_end(code, keep, start):
+    """End of a statement expression (`=`/`+=` RHS), balancing brackets."""
+    depth = 0
+    i = start
+    n = len(code)
+    saw = False
+    while i < n:
+        c = code[i]
+        if c in "([{":
+            depth += 1
+            saw = True
+        elif c in ")]}":
+            if depth > 0:
+                depth -= 1
+            saw = True
+        elif c == ";" and depth == 0:
+            return i
+        elif c == "\n" and depth == 0:
+            k = i - 1
+            while k >= start and keep[k].isspace():
+                k -= 1
+            prev = keep[k] if k >= start else ""
+            if saw and prev not in ("+", ",", ".", "=", "\\", ":", "?"):
+                return i
+        elif not c.isspace():
+            saw = True
+        elif not keep[i].isspace():
+            # String content is blanked in the code view; it is still a real
+            # expression token, so the statement does not end before it.
+            saw = True
+        i += 1
+    return n
+
+
+def marker_for(name):
+    name = re.sub(r"\s+", "", name)
+    if name.startswith("$"):
+        name = name[1:]
+    if name.startswith("{") and name.endswith("}"):
+        name = name[1:-1]
+    if name in BUILD_BARE or name in ("buildDir", "project.buildDir"):
+        return BUILD_MARK
+    if name in MODULE_BARE:
+        return MODULE_MARK
+    if name in ROOT_BARE:
+        return ROOT_MARK
+    return None
+
+
+def decode_string_token(token):
+    quote = token[0]
+    body = token[1:-1]
+    if len(body) >= 4 and body.startswith(quote * 2) and \
+            body.endswith(quote * 2):
+        body = body[2:-2]
+    parts = []
+    cur = []
+    ok = True
+    i = 0
+    n = len(body)
+    escapes = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\",
+               '"': '"', "'": "'", "$": "$"}
+    while i < n:
+        c = body[i]
+        if c == "\\" and i + 1 < n:
+            cur.append(escapes.get(body[i + 1], body[i + 1]))
+            i += 2
+            continue
+        if c == "$":
+            if i + 1 < n and body[i + 1] == "{":
+                j = body.find("}", i + 2)
+                if j < 0:
+                    ok = False
+                    break
+                marker = marker_for(body[i + 2:j])
+                if marker is None:
+                    ok = False
+                else:
+                    if cur:
+                        parts.append("".join(cur))
+                        cur = []
+                    parts.append(marker)
+                i = j + 1
+                continue
+            m = re.match(r"[A-Za-z_$][A-Za-z0-9_$]*", body[i + 1:])
+            if m:
+                marker = marker_for(m.group(0))
+                if marker is None:
+                    ok = False
+                else:
+                    if cur:
+                        parts.append("".join(cur))
+                        cur = []
+                    parts.append(marker)
+                i += 1 + len(m.group(0))
+                continue
+            cur.append("$")
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    if cur:
+        parts.append("".join(cur))
+    return [parts], ok
+
+
+def analyze_expr(expr, resolver, block, use_pos, seen=None):
+    """Evaluate a srcDir expression to (list-of-path-part-lists, resolved)."""
+    seen = set() if seen is None else seen
+    tokens = TOKEN_RE.findall(expr)
+    return ExprParser(tokens, resolver, block, use_pos, seen).parse()
+
+
+class ExprParser:
+    def __init__(self, tokens, resolver, block, use_pos, seen):
+        self.tokens = tokens
+        self.i = 0
+        self.resolver = resolver
+        self.block = block
+        self.use_pos = use_pos
+        self.seen = seen
+
+    def peek(self):
+        return self.tokens[self.i] if self.i < len(self.tokens) else None
+
+    def take(self):
+        token = self.peek()
+        self.i += 1
+        return token
+
+    def parse(self):
+        values, ok = self.parse_additive()
+        if self.i != len(self.tokens):
+            ok = False
+        return values, ok
+
+    def parse_additive(self):
+        values, ok = self.parse_primary()
+        while self.peek() == "+":
+            self.i += 1
+            rhs, ok2 = self.parse_primary()
+            if len(values) == 1 and len(rhs) == 1:
+                values = [values[0] + rhs[0]]
+            else:
+                values = values + rhs
+            ok = ok and ok2
+        return values, ok
+
+    def parse_primary(self):
+        token = self.take()
+        if token is None:
+            return [], False
+        if token[0] in "\"'":
+            return decode_string_token(token)
+        if IDENT_RE.match(token):
+            chain = [token]
+            while self.peek() == "." and self.i + 1 < len(self.tokens) \
+                    and IDENT_RE.match(self.tokens[self.i + 1]):
+                self.i += 1
+                chain.append(self.take())
+            if self.peek() == "(":
+                self.i += 1
+                args, ok = self.parse_args()
+                return self.apply_call(chain, args, ok)
+            return self.apply_bare(chain)
+        if token == "(":
+            values, ok = self.parse_additive()
+            if self.peek() == ")":
+                self.i += 1
+            else:
+                ok = False
+            return values, ok
+        if token == "[":
+            values = []
+            ok = True
+            if self.peek() == "]":
+                self.i += 1
+                return values, True
+            while True:
+                item, ok2 = self.parse_additive()
+                values = values + item
+                ok = ok and ok2
+                if self.peek() == ",":
+                    self.i += 1
+                    continue
+                if self.peek() == "]":
+                    self.i += 1
+                    break
+                ok = False
+                break
+            return values, ok
+        return [], False
+
+    def parse_args(self):
+        args = []
+        ok = True
+        if self.peek() == ")":
+            self.i += 1
+            return args, True
+        while True:
+            values, ok2 = self.parse_additive()
+            args.append(values)
+            ok = ok and ok2
+            if self.peek() == ",":
+                self.i += 1
+                continue
+            if self.peek() == ")":
+                self.i += 1
+                break
+            ok = False
+            while self.peek() not in (None, ")"):
+                self.i += 1
+            if self.peek() == ")":
+                self.i += 1
+            break
+        return args, ok
+
+    def flatten(self, args):
+        values = []
+        for item in args:
+            values = values + item
+        return values
+
+    def apply_call(self, chain, args, ok):
+        name = ".".join(chain)
+        if name in WRAPPER_CALLS:
+            return self.flatten(args), ok
+        if name in BUILD_CALLS:
+            return [[BUILD_MARK]], ok
+        if name in BUILD_DIR_CALLS:
+            values = []
+            for item in args:
+                if not item:
+                    values.append([BUILD_MARK])
+                for parts in item:
+                    values.append([BUILD_MARK] + parts)
+            return values or [[BUILD_MARK]], ok
+        if name.endswith("File") or name in ("File", "java.io.File"):
+            if args and args[0] and args[0][0] in ([MODULE_MARK], [ROOT_MARK]):
+                base = args[0][0][0]
+                values = []
+                for item in args[1:]:
+                    for parts in item:
+                        values.append([base] + parts)
+                return values, ok
+            return self.flatten(args), ok
+        # Unknown call: its string arguments are not trustworthy as paths.
+        return self.flatten(args), False
+
+    def apply_bare(self, chain):
+        name = ".".join(chain)
+        if name in BUILD_BARE:
+            return [[BUILD_MARK]], True
+        if name in MODULE_BARE:
+            return [[MODULE_MARK]], True
+        if name in ROOT_BARE:
+            return [[ROOT_MARK]], True
+        if len(chain) == 1:
+            decl = self.resolver.resolve(
+                chain[0], self.use_pos, self.block)
+            if decl is not None and decl["pos"] not in self.seen:
+                return analyze_expr(
+                    decl["expr"], self.resolver, decl["block"],
+                    decl["pos"], self.seen | {decl["pos"]})
+        return [], False
+
+
+def parts_to_path(parts, module_dir, root_dir):
+    text = "".join(parts)
+    build_dir = os.path.normpath(os.path.join(module_dir, "build"))
+    if BUILD_MARK in text:
+        if not text.startswith(BUILD_MARK):
+            return None
+        rest = text[len(BUILD_MARK):].lstrip("/\\")
+        return os.path.normpath(os.path.join(build_dir, rest)) if rest \
+            else build_dir
+    if MODULE_MARK in text:
+        if not text.startswith(MODULE_MARK):
+            return None
+        rest = text[len(MODULE_MARK):].lstrip("/\\")
+        return os.path.normpath(os.path.join(module_dir, rest)) if rest \
+            else os.path.normpath(module_dir)
+    if ROOT_MARK in text:
+        if not text.startswith(ROOT_MARK):
+            return None
+        rest = text[len(ROOT_MARK):].lstrip("/\\")
+        return os.path.normpath(os.path.join(root_dir, rest)) if rest \
+            else os.path.normpath(root_dir)
+    if os.path.isabs(text):
+        return os.path.normpath(text)
+    return os.path.normpath(os.path.join(module_dir, text))
+
+
+def _under(path, parent):
+    try:
+        return os.path.commonpath((path, parent)) == parent
+    except ValueError:
+        return False
+
+
+def module_path_problem(path, module_dir, module_roots, root_dir):
+    """Classify a srcDir path as safe/problem/unresolved.
+
+    In-module paths keep the historical rules.  A path that escapes its
+    module is resolved against the settings-derived module roots: another
+    module's pre-pruned `build/` tree or test source set is unsafe, another
+    module's production source root is safe, and anything else inside the
+    repo is unresolved (fail closed).
+    """
+    module_dir = os.path.normpath(module_dir)
+    path = os.path.normpath(path)
+    build_dir = os.path.join(module_dir, "build")
+    if path == build_dir or path.startswith(build_dir + os.sep):
+        return "problem"
+    rel = os.path.relpath(path, module_dir)
+    if rel != os.pardir and not rel.startswith(os.pardir + os.sep):
+        parts = rel.split(os.sep)
+        # An ancestor of `src/test*` puts the whole test tree on the main
+        # classpath.  `src` itself also contains every test source set.
+        if rel == os.curdir or parts == ["src"]:
+            return "problem"
+        # Discovery never walks these cache/vendor trees, so a srcDir inside
+        # one is invisible to every downstream surface: fail closed.
+        if any(part in (".git", ".gradle", "node_modules") for part in parts):
+            return "unresolved"
+        if parts[0] == "build":
+            return "problem"
+        if parts[0] == "src":
+            if len(parts) < 2:
+                return "problem"
+            if re.match(r"(?:test|androidTest)", parts[1]):
+                return "problem"
+        return "safe"
+    if not _under(path, root_dir):
+        return "unresolved"
+    if module_roots is None:
+        return "unresolved"
+    for base in sorted(module_roots, key=len, reverse=True):
+        base = os.path.normpath(base)
+        if not _under(path, base):
+            continue
+        if path == base:
+            return "unresolved"
+        if _under(path, os.path.join(base, "build")):
+            return "problem"
+        source = os.path.join(base, "src")
+        if _under(path, source):
+            relsrc = os.path.relpath(path, source)
+            if relsrc == os.curdir:
+                return "problem"
+            first = relsrc.split(os.sep)[0]
+            if re.match(r"(?:test|androidTest)", first):
+                return "problem"
+            return "safe"
+        return "unresolved"
+    return "unresolved"
+
+
+class Block:
+    __slots__ = ("open", "close", "parent", "header", "shape_header",
+                 "long_header", "shape_long_header")
+
+    def __init__(self, open_index, parent, header, shape_header,
+                 long_header, shape_long_header):
+        self.open = open_index
+        self.close = None
+        self.parent = parent
+        self.header = header
+        self.shape_header = shape_header
+        self.long_header = long_header
+        self.shape_long_header = shape_long_header
+
+
+def build_blocks(keep, shape):
+    blocks = []
+    stack = []
+    for i, char in enumerate(shape):
+        if char == "{":
+            header_start = max(
+                shape.rfind("{", 0, i), shape.rfind("}", 0, i),
+                shape.rfind(";", 0, i), shape.rfind("\n", 0, i)) + 1
+            long_start = max(
+                shape.rfind("{", 0, i), shape.rfind("}", 0, i),
+                shape.rfind(";", 0, i)) + 1
+            parent = stack[-1] if stack else None
+            block = Block(
+                i, parent, keep[header_start:i].strip(),
+                shape[header_start:i].strip(),
+                keep[long_start:i].strip(), shape[long_start:i].strip())
+            blocks.append(block)
+            stack.append(block)
+        elif char == "}":
+            if stack:
+                stack.pop().close = i
+    return blocks
+
+
+def block_at(blocks, pos):
+    best = None
+    for block in blocks:
+        if block.open < pos and (block.close is None or pos < block.close):
+            if best is None or block.open > best.open:
+                best = block
+    return best
+
+
+def source_set_candidates(text, shape_text, allow_bare=False):
+    """Return all source-set names mentioned as real code in `text`.
+
+    Matching is done on a length-preserving backtick-normalised copy, so
+    `sourceSets.`getByName`("test")` is the same call as the unquoted form.
+    The shape check rejects matches that begin inside a string literal.
+    """
+    norm = text.replace("`", " ")
+    qshape = blank_quoted_len(text)
+    candidates = []
+    patterns = (SOURCESET_CALL, SOURCESET_INDEX)
+    for pattern in patterns:
+        for match in pattern.finditer(norm):
+            if qshape[match.start()].strip():
+                candidates.append((match.start(), match.group(1)))
+    for match in SOURCESET_PROP.finditer(norm):
+        if not qshape[match.start()].strip():
+            continue
+        name = match.group(1)
+        if name not in ("getByName", "create", "maybeCreate", "named",
+                        "findByName"):
+            candidates.append((match.start(), name))
+    if allow_bare:
+        for match in SOURCESET_BARE_CALL.finditer(norm):
+            if qshape[match.start()].strip():
+                candidates.append((match.start(), match.group(1)))
+    return candidates
+
+
+def source_set_from_text(text, shape_text, allow_bare=False):
+    candidates = source_set_candidates(text, shape_text, allow_bare)
+    return max(candidates)[1] if candidates else None
+
+
+def is_source_sets_block(block):
+    return bool(re.search(r"(?<![\w$])sourceSets\s*$", block.header))
+
+
+def source_set_receiver_header(text):
+    """True when a block header is a sourceSets receiver chain, not an
+    arbitrary lambda that merely mentions sourceSets in an argument."""
+    return bool(re.match(r"\s*(?:android\s*\.\s*)?sourceSets\b", text))
+
+
+def block_source_set(block):
+    context = None
+    if source_set_receiver_header(block.header):
+        context = source_set_from_text(block.header, block.shape_header)
+    if not context and (APPLY_HEADER.search(block.header)
+                        or block.header.strip() in (")", "]", "}")):
+        allow_bare = (block.parent is not None
+                      and is_source_sets_block(block.parent))
+        apply_match = re.search(
+            r"(?:^|\.)\s*apply\s*$", block.long_header)
+        if apply_match:
+            # Only the receiver chain directly left of `.apply`; never an
+            # earlier statement in the same block (G-24).
+            start = receiver_chain_start(
+                block.shape_long_header, apply_match.start())
+            context = source_set_from_text(
+                block.long_header[start:apply_match.start()],
+                block.shape_long_header[start:apply_match.start()],
+                allow_bare=allow_bare)
+        else:
+            context = source_set_from_text(
+                block.long_header, block.shape_long_header,
+                allow_bare=allow_bare)
+    if context:
+        return context
+    if block.parent is not None and is_source_sets_block(block.parent):
+        context = source_set_from_text(
+            block.header, block.shape_header, allow_bare=True)
+        if context:
+            return context
+        match = re.match(r"\s*([A-Za-z_$][\w$]*)\s*$", block.header)
+        if match and match.group(1) not in ("sourceSets", "val", "var",
+                                            "def"):
+            return match.group(1)
+    return None
+
+
+def _matching_open(shape, close_index):
+    pairs = {")": "(", "]": "["}
+    opener = pairs.get(shape[close_index])
+    if opener is None:
+        return None
+    depth = 0
+    i = close_index
+    while i >= 0:
+        char = shape[i]
+        if char == shape[close_index]:
+            depth += 1
+        elif char == opener:
+            depth -= 1
+            if depth == 0:
+                return i
+        i -= 1
+    return None
+
+
+def receiver_chain_start(shape, pos):
+    """Start of the receiver chain immediately left of `pos`.
+
+    Walks left over `.ident`, calls and balanced brackets.  A newline is only
+    crossed when the dot that introduced the continuation was already
+    consumed; this keeps D1's multi-line receiver while refusing to absorb a
+    complete earlier statement (G-24).
+    """
+    i = pos
+    crossed_dot = False
+    while i > 0:
+        j = i - 1
+        saw_newline = False
+        while j >= 0 and shape[j].isspace():
+            if shape[j] == "\n":
+                saw_newline = True
+            j -= 1
+        if j < 0 or shape[j] in ";{}":
+            return i
+        if saw_newline and not crossed_dot and shape[j] != ".":
+            return i
+        crossed_dot = False
+        char = shape[j]
+        if char == ".":
+            i = j
+            crossed_dot = True
+            continue
+        if char in ")]":
+            open_index = _matching_open(shape, j)
+            if open_index is None:
+                return i
+            k = open_index - 1
+            while k >= 0 and shape[k].isspace():
+                k -= 1
+            if k >= 0 and (shape[k].isalnum() or shape[k] in "_$"):
+                while k >= 0 and (shape[k].isalnum() or shape[k] in "_$"):
+                    k -= 1
+                i = k + 1
+            else:
+                i = open_index
+            continue
+        if char.isalnum() or char in "_$":
+            while j >= 0 and (shape[j].isalnum() or shape[j] in "_$"):
+                j -= 1
+            i = j + 1
+            continue
+        return i
+    return i
+
+
+def source_set_context(keep, shape, blocks, pos):
+    # Prefer a provably enclosing source-set block.  This is the actual
+    # lexical context of the call; mentions in other statements of the block
+    # must not override it (G-24).
+    current = block_at(blocks, pos)
+    while current is not None:
+        context = block_source_set(current)
+        if context:
+            return context
+        current = current.parent
+
+    # No enclosing source-set block: inspect only the receiver chain directly
+    # left of the srcDir token (multi-line receivers included).
+    start = receiver_chain_start(shape, pos)
+    candidates = source_set_candidates(
+        keep[start:pos], shape[start:pos])
+    names = {name for _, name in candidates}
+    if len(names) > 1:
+        # More than one source-set receiver in one chain is ambiguous.
+        return None
+    if names:
+        return names.pop()
+    return None
+
+
+class ValResolver:
+    def __init__(self, declarations, assignments):
+        self.declarations = declarations
+        self.assignments = assignments
+
+    def resolve(self, name, use_pos, use_block):
+        best = None
+        for decl in self.declarations:
+            if decl["name"] != name or decl["pos"] >= use_pos:
+                continue
+            block = decl["block"]
+            if block is not None and not (
+                    block.open < use_pos
+                    and (block.close is None or use_pos < block.close)):
+                continue
+            if best is None or decl["pos"] > best["pos"]:
+                best = decl
+        if best is None:
+            return None
+        # A `var`/`def` may have been changed before the use.  Any assignment
+        # between the declaration and the use could be on the reaching path
+        # (including a nested lambda), so refuse to resolve it: fail closed.
+        if best.get("kind") in ("var", "def"):
+            for assignment in self.assignments:
+                if assignment["name"] != name:
+                    continue
+                if best["pos"] < assignment["pos"] < use_pos:
+                    return None
+        return best
+
+
+def collect_declarations(code, keep, blocks):
+    declarations = []
+    name_spans = []
+    # Match on the string-preserving view so the `\s*` after `=` cannot run
+    # through a blanked string literal; reject a `val` that lives inside a
+    # string because `code` is blank there.
+    for match in VAL_DECL.finditer(keep):
+        if not code[match.start()].strip():
+            continue
+        end = expression_end(code, keep, match.end())
+        kind_match = re.match(r"(val|var|def)\b", keep[match.start():])
+        declarations.append({
+            "name": match.group(1),
+            "kind": kind_match.group(1) if kind_match else "val",
+            "expr": keep[match.end():end].strip(),
+            "pos": match.start(),
+            "block": block_at(blocks, match.start()),
+        })
+        name_spans.append((match.start(1), match.end(1)))
+    return declarations, name_spans
+
+
+def collect_assignments(code, declarations, name_spans, blocks):
+    names = {decl["name"] for decl in declarations}
+    assignments = []
+    for match in NAME_ASSIGN.finditer(code):
+        name = match.group(1)
+        if name not in names:
+            continue
+        if any(start <= match.start() < end for start, end in name_spans):
+            # The `=` in a declaration is initialisation, not assignment.
+            continue
+        assignments.append({
+            "name": name,
+            "pos": match.start(),
+            "block": block_at(blocks, match.start()),
+        })
+    return assignments
+
+
+def main_srcdir_lines(text, build_path):
+    """Return (unsafe_lines, unresolved_lines) for a Gradle build file."""
+    module_dir = os.path.dirname(build_path)
+    keep = strip_comments_len(text)
+    code = blank_strings_len(keep)
+    blocks = build_blocks(keep, code)
+    declarations, decl_name_spans = collect_declarations(code, keep, blocks)
+    assignments = collect_assignments(
+        code, declarations, decl_name_spans, blocks)
+    resolver = ValResolver(declarations, assignments)
+    unsafe = []
+    unresolved = []
+
+    def is_decl_name(pos):
+        return any(start <= pos < end for start, end in decl_name_spans)
+
+    def check(start, expr):
+        context = source_set_context(keep, code, blocks, start)
+        # A test source set's own srcDir is legitimate (P4).  An unknown
+        # receiver is treated as main: fail closed rather than skip.
+        if context and re.match(r"(?:test|androidTest)", context):
+            return
+        if not expr.strip():
+            return
+        values, ok = analyze_expr(
+            expr, resolver, block_at(blocks, start), start)
+        lineno = text.count("\n", 0, start) + 1
+        if not ok:
+            unresolved.append(lineno)
+            return
+        for parts in values:
+            path = parts_to_path(parts, module_dir, root)
+            if path is None:
+                unresolved.append(lineno)
+                return
+            status = module_path_problem(
+                path, module_dir, module_root_set, root)
+            if status == "problem":
+                unsafe.append(lineno)
+                return
+            if status == "unresolved":
+                unresolved.append(lineno)
+                return
+
+    for match in SRCDIR_TOKEN.finditer(code):
+        if is_decl_name(match.start()):
+            # Typed or untyped declaration (`val srcDir: String = …`): it is
+            # not a source-dir argument (G-27).
+            continue
+        # A parenthesised call may put `(` after whitespace/newlines.
+        k = match.end()
+        while k < len(keep) and keep[k].isspace():
+            k += 1
+        if k < len(keep) and keep[k] == "(":
+            end = balanced_end(code, k)
+            check(match.start(), keep[k + 1:end])
+            continue
+        # Groovy command syntax has no parentheses: `srcDir 'src/test'`.
+        # It must stay on the same physical line; a following `:`, `,`, `)`,
+        # `]`, `}`, `=` or property dot is a parameter/type annotation/named
+        # argument, not a source-dir argument.
+        j = match.end()
+        while j < len(keep) and keep[j] in " \t\r":
+            j += 1
+        if j >= len(keep) or keep[j] == "\n" or keep.startswith("+=", j) \
+                or keep[j] in "=.,)]}:":
+            continue
+        end = expression_end(code, keep, match.end())
+        newline = keep.find("\n", match.end())
+        if newline >= 0:
+            end = min(end, newline)
+        expr = keep[match.end():end].strip()
+        if expr:
+            # Command-syntax arguments are comma separated; treat them like a
+            # list so `srcDirs 'src/main/java', 'extra/java'` resolves.
+            check(match.start(), "listOf(" + expr + ")")
+
+    for match in SRCDIR_ASSIGN.finditer(code):
+        if is_decl_name(match.start()):
+            # `val srcDir = …` declares a value; it is not a source-dir
+            # assignment.  Its uses are resolved through the scope resolver.
+            continue
+        end = expression_end(code, keep, match.end())
+        check(match.start(), keep[match.end():end])
+
+    return unsafe, unresolved
 
 # Comment/whitespace normalisation view: strip `/*…*/` and `//…` (newlines
 # preserved so diagnostics keep their line numbers), collapse spaces/tabs
@@ -1001,7 +2233,7 @@ PH_TOKEN = "manifestplaceholders"
 # `manifest . srcFile` and `getManifest ( ) . srcFile`; raw text is scanned
 # too (fail-closed on tokens that only appear in comments).
 COMMENTS = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
-DOTS = re.compile(r"[ \t]*\.[ \t]*")
+DOTS = re.compile(r"[^\S\n]*\.[^\S\n]*")
 EMPTY_PARENS = re.compile(r"\([ \t]*\)")
 
 
@@ -1027,7 +2259,7 @@ def logical_properties_lines(text):
     result = []
     buf = ""
     start = 1
-    for lineno, line in enumerate(text.splitlines(), 1):
+    for lineno, line in enumerate(text.split("\n"), 1):
         line = line.rstrip("\r")
         trailing = len(line) - len(line.rstrip("\\"))
         if not buf:
@@ -1088,16 +2320,159 @@ def unicode_escape_decode(text):
 
 def read(path):
     with open(path, encoding="utf-8", errors="replace") as handle:
-        return handle.read()
+        text = handle.read()
+    # JVM physical line terminators only: CRLF/CR become LF, and only LF ends a
+    # line. Form feed is ordinary whitespace (never `splitlines()`).
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def toml_escape_decode(text):
+    """Decode TOML basic-string escapes `\\uXXXX` and `\\UXXXXXXXX`.
+
+    Only the two Unicode escapes matter to the MCP scan; every other sequence
+    is copied verbatim.  A backslash is eligible only after an even run of
+    contiguous backslashes (a `\\\\u…` escaped backslash is not an escape).
+    """
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] != "\\":
+            out.append(text[i])
+            i += 1
+            continue
+        j = i
+        while j < n and text[j] == "\\":
+            j += 1
+        k = i
+        while k < j:
+            if (k - i) % 2 == 0:
+                if text.startswith("\\u", k):
+                    m = k + 2
+                    digits = text[m:m + 4]
+                    if (len(digits) == 4 and
+                            all(c in "0123456789abcdefABCDEF"
+                                for c in digits)):
+                        out.append(chr(int(digits, 16)))
+                        k = m + 4
+                        continue
+                elif text.startswith("\\U", k):
+                    m = k + 2
+                    digits = text[m:m + 8]
+                    if (len(digits) == 8 and
+                            all(c in "0123456789abcdefABCDEF"
+                                for c in digits)):
+                        point = int(digits, 16)
+                        if point <= 0x10FFFF:
+                            out.append(chr(point))
+                            k = m + 8
+                            continue
+            out.append(text[k])
+            k += 1
+        i = k
+    return "".join(out)
+
+
+def toml_decode(text):
+    """Decode Unicode escapes inside TOML BASIC strings only.
+
+    TOML literal strings (`'…'`, `'''…'''`) process no escapes, so they are
+    copied verbatim (a literal `\\u002e` must not become a dot).  Comments,
+    keys and bare values are copied verbatim too; the caller still scans the
+    RAW text as a fail-closed backstop, so nothing needs to be decoded there.
+    """
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text.startswith('"""', i):
+            j = i + 3
+            body = []
+            while j < n:
+                if text[j] == "\\" and j + 1 < n:
+                    body.append(text[j:j + 2])
+                    j += 2
+                    continue
+                if text.startswith('"""', j):
+                    break
+                body.append(text[j])
+                j += 1
+            out.append('"""')
+            out.append(toml_escape_decode("".join(body)))
+            if text.startswith('"""', j):
+                k = j + 3
+                while k < n and text[k] == '"':
+                    k += 1
+                out.append(text[j:k])
+                j = k
+            out.append('"')
+            i = j
+            continue
+        if text.startswith("'''", i):
+            j = i + 3
+            while j < n and not text.startswith("'''", j):
+                j += 1
+            j = min(n, j + 3)
+            while j < n and text[j] == "'":
+                j += 1
+            out.append(text[i:j])
+            i = j
+            continue
+        c = text[i]
+        if c == "#":
+            j = text.find("\n", i)
+            if j < 0:
+                j = n
+            out.append(text[i:j])
+            i = j
+            continue
+        if c == '"':
+            j = i + 1
+            body = []
+            while j < n:
+                if text[j] == "\\" and j + 1 < n:
+                    body.append(text[j:j + 2])
+                    j += 2
+                    continue
+                if text[j] == '"' or text[j] == "\n":
+                    break
+                body.append(text[j])
+                j += 1
+            out.append('"')
+            out.append(toml_escape_decode("".join(body)))
+            if j < n and text[j] == '"':
+                out.append('"')
+                j += 1
+            i = j
+            continue
+        if c == "'":
+            j = i + 1
+            while j < n and text[j] not in ("'", "\n"):
+                j += 1
+            if j < n and text[j] == "'":
+                j += 1
+            out.append(text[i:j])
+            i = j
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def main():
     failed = False
+    if module_roots_error is not None:
+        print("cannot determine Gradle module roots (fail closed): "
+              f"{module_roots_error}")
+        failed = True
     has_ph = False
     mcp_hits = []
     src_hits = []
     ns_hits = []
     prop_hits = []
+    toml_hits = []
+    srcdir_hits = []
+    srcdir_unresolved_hits = []
 
     for path in gradle_files:
         try:
@@ -1106,36 +2481,51 @@ def main():
             print(f"cannot read gradle file (fail closed): {rel(path)}: {exc}")
             failed = True
             continue
-        original_lines = text.splitlines()
+        original_lines = text.split("\n")
+        normalized = normalize(text)
         # Scan both the raw text (fail-closed on tokens in comments/strings)
         # and the comment/dot-normalised view (catches legal obfuscation such
         # as `namespace /*x*/ =` or `manifest . srcFile`). Line numbers and
         # the reported source line come from the original file.
-        for view in (text, normalize(text)):
-            for lineno, line in enumerate(view.splitlines(), 1):
+        for view in (text, normalized):
+            for lineno, line in enumerate(view.split("\n"), 1):
                 original = (original_lines[lineno - 1]
                             if lineno - 1 < len(original_lines) else line)
                 where = f"{rel(path)}:{lineno}:{original}"
                 if PH_TOKEN in line.lower():
                     has_ph = True
-                if MCP.search(line) and where not in mcp_hits:
+                if mcp_token_in(line) and where not in mcp_hits:
                     mcp_hits.append(where)
                 if SRC.search(line) and where not in src_hits:
                     src_hits.append(where)
-                if NS.search(line) and where not in ns_hits:
+                if ns_hit(line) and where not in ns_hits:
                     ns_hits.append(where)
 
             # Cross-line namespace/applicationId: the value may sit on the
             # next line (`namespace =\n    "dev.librepocket.mcp"`). NS uses
             # \s*, which already spans newlines; comments are blanked in the
             # normalised view, so `namespace = /*x*/\n "…"` is covered too.
-            for match in NS.finditer(view):
+            for match in ns_matches(view):
                 lineno = view.count("\n", 0, match.start()) + 1
                 original = (original_lines[lineno - 1]
                             if lineno - 1 < len(original_lines) else "")
                 where = f"{rel(path)}:{lineno}:{original}"
                 if where not in ns_hits:
                     ns_hits.append(where)
+
+        unsafe, unresolved = main_srcdir_lines(text, path)
+        for lineno in unsafe:
+            original = (original_lines[lineno - 1]
+                        if lineno - 1 < len(original_lines) else "")
+            where = f"{rel(path)}:{lineno}:{original}"
+            if where not in srcdir_hits:
+                srcdir_hits.append(where)
+        for lineno in unresolved:
+            original = (original_lines[lineno - 1]
+                        if lineno - 1 < len(original_lines) else "")
+            where = f"{rel(path)}:{lineno}:{original}"
+            if where not in srcdir_unresolved_hits:
+                srcdir_unresolved_hits.append(where)
 
     for path in properties_files:
         try:
@@ -1146,8 +2536,8 @@ def main():
                   f"{rel(path)}: {exc}")
             failed = True
             continue
-        for lineno, line in enumerate(text.splitlines(), 1):
-            if MCP.search(line):
+        for lineno, line in enumerate(text.split("\n"), 1):
+            if mcp_token_in(line):
                 prop_hits.append(f"{rel(path)}:{lineno}:{line}")
         # Properties joins `\\`-continued physical lines before decoding
         # Unicode escapes; scan that logical view too, otherwise a literal
@@ -1155,7 +2545,7 @@ def main():
         try:
             for lineno, joined in logical_properties_lines(raw):
                 line = unicode_escape_decode(joined)
-                if MCP.search(line):
+                if mcp_token_in(line):
                     hit = f"{rel(path)}:{lineno}:{line}"
                     if hit not in prop_hits:
                         prop_hits.append(hit)
@@ -1163,6 +2553,32 @@ def main():
             print("cannot join gradle.properties lines (fail closed): "
                   f"{rel(path)}: {exc}")
             failed = True
+
+    for path in toml_files:
+        try:
+            raw = read(path)
+        except Exception as exc:
+            print("cannot read build catalog (fail closed): "
+                  f"{rel(path)}: {exc}")
+            failed = True
+            continue
+        # TOML-aware decode: escapes are processed only inside basic strings,
+        # so `\uXXXX`/`\UXXXXXXXX` resolve like Gradle's tomllj parser while a
+        # literal string's `\u…` stays literal.  The raw file is scanned too as
+        # a fail-closed backstop (a literal/comment mentioning the FQN fails).
+        try:
+            decoded = toml_decode(raw)
+        except Exception as exc:
+            print("cannot decode build catalog (fail closed): "
+                  f"{rel(path)}: {exc}")
+            failed = True
+            continue
+        for view in (raw, decoded):
+            for lineno, line in enumerate(view.split("\n"), 1):
+                if mcp_token_in(line):
+                    hit = f"{rel(path)}:{lineno}:{line}"
+                    if hit not in toml_hits:
+                        toml_hits.append(hit)
 
     if has_ph and mcp_hits:
         print("manifest placeholders request MCP components:")
@@ -1187,8 +2603,22 @@ def main():
         print("gradle.properties exposes MCP components:")
         for hit in prop_hits:
             print(hit)
+    if toml_hits:
+        print("gradle version catalog references MCP components (fail closed):")
+        for hit in toml_hits:
+            print(hit)
+    if srcdir_hits:
+        print("main source set adds a test/build source dir (fail closed):")
+        for hit in srcdir_hits:
+            print(hit)
+    if srcdir_unresolved_hits:
+        print("main source set source dir cannot be resolved to a safe path "
+              "(fail closed):")
+        for hit in srcdir_unresolved_hits:
+            print(hit)
 
-    caught = bool(mcp_hits or src_hits or ns_hits or prop_hits)
+    caught = bool(mcp_hits or src_hits or ns_hits or prop_hits or toml_hits
+                  or srcdir_hits or srcdir_unresolved_hits)
     return 1 if (caught or failed) else 0
 
 
@@ -1213,147 +2643,61 @@ PY
 fi
 
 # --- C3. Surface: in-package outbound dependencies (allowlist, fail-closed).
-# Only these exact imports may cross the package boundary (import allowlist =
-# KeyVault + the 7 tool contract types; star imports and anything else fail);
-# outside imports, the package decl, self-mentions (dev.librepocket.mcp) and
-# KDoc links ([dev.librepocket.…] or the HTML form <dev.librepocket.…>) must
-# carry every remaining occurrence. N-B2: import matching tolerates leading
-# indentation and trailing whitespace/comments (line is left-trimmed before
-# classification; the allowlist anchors accept trailing [[:space:]] and //
-# comments — the comment tail is `//.*`, NOT `//[^\n]*`: inside a POSIX
-# bracket expression `\n` is the two literal chars backslash+n, not a
-# newline, so `[^\n]` wrongly rejected any trailing comment containing the
-# letter n or a backslash; lines are read one at a time so `.` cannot cross
-# lines). Import lines are normalised before classification (`static` and
-# repeated whitespace collapsed; block comments anywhere on the line and a
-# `//` tail dropped; trailing `;` dropped), so `import  dev…`,
-# `import static dev…`, `import /*x*/ dev…`, `import X; // note` and
-# `import X /* note */;` cannot fall through the allowlist by taking an early
-# `continue`; a subpackage may import a parent-package mcp type. A package
-# header followed by more code on the same physical line drops only the
-# header up to the first `;`, then continues scanning the remainder. N-B3
-# known limitation: an FQN split across physical lines
-# (e.g. "dev.librepocket\n.router.X") is not caught by this per-line C3 scan.
-# Single-line block comments between segments, spaces around dots and
-# backticked segments are normalised before the leftover check (C4 does the
-# same for the outside split); the raw line is also checked after only the
-# KDoc/self-mention allowances, so a literal containing `/*`/`*/` cannot make
-# the normaliser swallow a real contiguous FQN. That raw check deliberately
-# over-approximates: a bare outbound FQN inside a comment or string in an
-# in-package file also turns red. The Kotlin formatter does not wrap at
-# package-segment boundaries, so the remaining line-split form is accepted
-# residual risk rather than a silent gap in the single-line rules. The
-# self-mention strip is boundary-aware (`dev.librepocket.mcpfoo` is outbound,
-# not a self-mention).
-MCP_ALLOWLIST='^[[:space:]]*import dev\.librepocket\.(keystore\.KeyVault|tool\.(CapabilityLevel|DenyReason|Projection|ProjectionContext|SideEffect|ToolAnnotations|ToolDef))([[:space:]]*//.*)?[[:space:]]*$'
+# Delegated to scripts/mcp_scan.py `outbound` (shared lexer; fail-closed if the
+# helper or python3 is missing). Each `;`-separated import declaration is
+# parsed and classified INDEPENDENTLY on a comment/string-stripped,
+# Java-Unicode-decoded view: two individually allowlisted imports on one
+# physical line PASS (the old `^…$`-per-line test false-red them), while
+# `import X; class Y { outbound FQN }` is still scanned. Imports are normalised
+# (comments/whitespace around dots, backticks, `static`) before the allowlist
+# test, so `import dev . librepocket . router.X` (legal Java/Kotlin) cannot fall
+# through an exact-prefix `case` and its early `continue`. Java declarations end
+# at `;` and may span physical lines (`import dev.\nlibrepocket.router.X;`),
+# Kotlin declarations end at `;`/end of line. Validated imports and the package
+# declaration are removed, then the remainder is scanned for outbound
+# `dev.librepocket.*` references on a code view (comments+strings blanked,
+# dots/backticks normalised) plus a string-kept view (comments blanked), so a
+# string literal `"/*"` cannot desynchronise a comment stripper and swallow an
+# FQN. The string view is scanned twice: raw (a contiguous FQN always matches)
+# and normalised (backticks removed, same-line `/*…*/` blanked, JVM whitespace
+# around dots collapsed) so the legal spellings `"dev . librepocket . X"`,
+# `"dev.`librepocket`.X"` and `"dev/*x*/.librepocket.X"` cannot hide it. The
+# only allowed outward
+# types are KeyVault + the 7 tool contract types (and static members/nested
+# types of those types); a subpackage may import a parent-package mcp type;
+# star imports to dev.librepocket.* fail; the identifier-aware self-mention
+# strip (full JVM identifier-part predicate) keeps `dev.librepocket.mcpfoo`,
+# `…mcp$Compat`, `…mcpé`, `…mcp\u0301`, `…mcp\u200d` and `…mcp€X` outbound.
+# No KDoc `[`/`<` prefix strip is applied:
+# comments are already blanked in both views, so a generic argument, grouped
+# annotation or bracketed string is real code/string content and must be
+# scanned (stripping it hid `List<dev.librepocket.…>` and `@[…]`).
+# N-B3 residual: an FQN split across physical lines is not joined.
 if [ "${#IN_PKG_FILES[@]}" -gt 0 ]; then
-  MCP_PKG_FILES=("${IN_PKG_FILES[@]}")
-  for f in ${MCP_PKG_FILES[@]+"${MCP_PKG_FILES[@]}"}; do
-    if [ ! -r "$f" ]; then
-      report "unreadable mcp source (fail closed): $f"
-      continue
+  if ! command -v python3 >/dev/null 2>&1; then
+    report "python3 not available for in-package outbound scan (fail closed)"
+  elif [ ! -r "$MCP_SCAN" ]; then
+    report "helper scripts/mcp_scan.py missing or unreadable (fail closed)"
+  else
+    set +e
+    MCP_OB="$(python3 "$MCP_SCAN" outbound "$ROOT" \
+      "${IN_PKG_FILES[@]}" 2>&1)"
+    OB_RC=$?
+    set -e
+    if [ "$OB_RC" -ge 2 ]; then
+      report "in-package outbound scan failed (fail closed, rc=$OB_RC)"
+    elif [ "$OB_RC" -eq 1 ] && [ -z "$MCP_OB" ]; then
+      # rc 1 means "findings printed"; with no output it is a helper crash, not
+      # a clean run (fail closed, never a silent pass).
+      report "in-package outbound scan failed (fail closed, rc=1 with no findings)"
     fi
-    lineno=0
-    while IFS= read -r line || [ -n "$line" ]; do
-      lineno=$((lineno + 1))
-      # N-B2: classify on the left-trimmed form so indented package/import
-      # lines behave like column-0 ones (the report still quotes the original).
-      trimmed="${line#"${line%%[![:space:]]*}"}"
-      # A package declaration may be followed by more code on the same
-      # physical line (`package …; import …` is legal Java/Kotlin). Drop only
-      # the declaration header up to the first semicolon and keep scanning the
-      # remainder; a declaration with no semicolon consumes the whole line.
-      # This also handles non-canonical spellings (comments/whitespace/
-      # backticks) without letting them hide a same-line outbound reference.
-      case "$trimmed" in
-        package[[:space:]]*)
-          case "$trimmed" in
-            *\;*)
-              trimmed="${trimmed#*;}"
-              trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
-              ;;
-            *) continue ;;
-          esac
-          ;;
-      esac
-      case "$trimmed" in
-        import[[:space:]]*)
-          # Normalise the import before classifying it: drop block comments
-          # anywhere on the line and a `//` tail, remove backticks from
-          # package segments, collapse `static` and any run of whitespace
-          # (`import  dev…`, `import static dev…`, `import `dev`.…`), and drop
-          # the trailing semicolon. The allowlist is tested against this
-          # normalised string, so a non-canonical but legal spelling (comment
-          # before the path, `import X; // note`, `import X /* note */;`,
-          # `import `dev`.librepocket…`) cannot fall through the exact-prefix
-          # `case`.
-          import_norm="$(printf '%s\n' "$trimmed" | sed -E \
-            's#/\*([^*]|\*+[^*/])*\*+/##g; s#[[:space:]]*//.*$##; s/`//g; s/^import[[:space:]]+(static[[:space:]]+)?/import /; s/;[[:space:]]*(\/\/.*)?$/\1/; s/;[[:space:]]*$//; s/[[:space:]]+/ /g; s/[[:space:]]*$//')"
-          case "$import_norm" in
-            "import dev.librepocket."*)
-              # A subpackage file may import a parent-package mcp type
-              # (dev.librepocket.mcp.McpServer) without that being outbound.
-              if printf '%s\n' "$import_norm" | \
-                grep -qE '^import dev\.librepocket\.mcp(\.[A-Za-z_][A-Za-z0-9_]*)*$'; then
-                continue
-              fi
-              if ! printf '%s\n' "$import_norm" | grep -qE "$MCP_ALLOWLIST"; then
-                report "outbound import not on allowlist (fail closed): ${f#"$ROOT"/}:$lineno: $line"
-                fail=1
-              fi
-              ;;
-          esac
-          # A line may contain more than one import declaration
-          # (`import java…; import dev.librepocket…;`). The per-line prefix
-          # classifier sees only the first; fall through to the leftover scan
-          # for the multi-import form instead of taking the early continue.
-          # Detect on the normalised text, not the raw line: comments are
-          # already stripped there, so `; /* gap */ import …` is recognised
-          # and an allowlisted import whose trailing comment merely contains
-          # the text `; import …` does not become a false red.
-          if ! printf '%s\n' "$import_norm" | \
-            grep -qE ';[[:space:]]*import[[:space:]]'; then
-            continue
-          fi
-          ;;
-      esac
-      # Normalise legal-but-non-canonical single-line spellings before the
-      # leftover check: block comments between package segments (including
-      # two comments on one line), spaces around dots, and backticks. Comments
-      # are removed with a non-greedy ERE so two comments cannot swallow the
-      # path between them; `//` is deliberately left alone (it comments out
-      # the rest of the physical line, and truncating at a `//` inside a
-      # string would hide a later reference).
-      # Then strip allowed forms: KDoc links start with "[dev.librepocket."
-      # or "<dev.librepocket." and self-mentions are "dev.librepocket.mcp"
-      # (backtick prose or package path). The self-mention match is
-      # boundary-aware so a lookalike package `dev.librepocket.mcpfoo` is NOT
-      # stripped (it is a real outbound ref).
-      stripped="$(printf '%s\n' "$line" | sed -E \
-        's#/\*([^*]|\*+[^*/])*\*+/##g; s/[ \t]*\.[ \t]*/./g; s/`//g; s/\[dev\.librepocket\.//g; s/<dev\.librepocket\.//g; s/dev\.librepocket\.mcp([^A-Za-z0-9_]|$)/\1/g')"
-      case "$stripped" in
-        *dev.librepocket.*)
-          report "outbound reference from inside dev/librepocket/mcp/ (fail closed): ${f#"$ROOT"/}:$lineno: $line"
-          fail=1
-          continue
-          ;;
-      esac
-      # Also check the raw line with only the KDoc/self-mention allowances.
-      # The normalisation above is not string-aware; a literal such as
-      # `val s = "/*"; val x = dev.librepocket.router.X; val t = "*/"` could
-      # otherwise make the block-comment removal swallow the real reference.
-      # This is deliberately over-approximate: a bare outbound FQN inside a
-      # comment/string in an in-package file also turns red (fail-closed).
-      raw_stripped="$(printf '%s\n' "$line" | sed -E \
-        's/\[dev\.librepocket\.//g; s/<dev\.librepocket\.//g; s/dev\.librepocket\.mcp([^A-Za-z0-9_]|$)/\1/g')"
-      case "$raw_stripped" in
-        *dev.librepocket.*)
-          report "outbound reference from inside dev/librepocket/mcp/ (fail closed): ${f#"$ROOT"/}:$lineno: $line"
-          fail=1
-          ;;
-      esac
-    done < "$f"
-  done
+    if [ -n "$MCP_OB" ]; then
+      while IFS= read -r msg; do
+        [ -n "$msg" ] || continue
+        report "$msg"
+      done <<< "$MCP_OB"
+    fi
+  fi
 fi
 
 # --- C4. Surface: any production source OUTSIDE the package (whole module
@@ -1365,24 +2709,31 @@ fi
 # scan output, so contents cannot hide a hit (`... // see /dev/librepocket/mcp/`).
 # Read/scan errors still fail closed; zero outside files is a legitimate
 # no-op (C1 separately fails closed on zero production files). The scan is a
-# Python normaliser: a small recursive lexer blanks // and /*…*/ comments only
-# outside strings (multi-line comments included; newlines preserved), keeps
+# Python normaliser: a small recursive lexer blanks // and same-line /*…*/
+# comments only outside strings (newlines preserved, so an FQN split by a
+# physical newline is not joined — documented N-B3 residual), keeps
 # string contents (so a URL `https://…` cannot truncate the line and hide a
 # later FQN), understands Kotlin `${…}` templates and Java text-block escapes,
-# then removes backticks and collapses same-line whitespace around dots.
+# decodes JLS `\uXXXX` escapes for Java (so `dev\u0020.librepocket…` is joined
+# on the same physical line), then removes backticks and collapses same-line
+# whitespace around dots.
 # This is needed because the same Java/Kotlin code also compiles as
 # `dev.librepocket.`mcp`.Transport`, `dev.librepocket./*x*/mcp.Transport` and
 # `dev . librepocket . mcp`. Residual: an FQN split across physical lines is
-# not joined (C4 scans line by line); a comment inside a raw string template
+# not joined (C4 scans line by line, including when `\u000a`/`\u000d` produces
+# the split); a comment inside a raw string template
 # is string content, not code, and is deliberately not parsed as a comment.
 # N-B1 accepted cost: the bare `Mcp[A-Z]` substring is deliberately wide — a
 # third-party string containing e.g. `McpCompat` also turns this red
 # (fail-closed direction, not tightened: a token-boundary rule cannot
 # distinguish com.x.McpCompat from a real McpServer reference without
 # full parsing, and a missed wiring reference is the worse failure mode).
-# The FQN half carries a trailing boundary
-# (`dev\.librepocket\.mcp([^A-Za-z0-9_]|$)`) so `dev.librepocket.mcpfoo` is
-# no longer a false red; `Mcp[A-Z]` stays deliberately wide. ---
+# The FQN half carries a full JVM identifier-aware trailing boundary so
+# lookalike packages such as `dev.librepocket.mcpfoo`,
+# `dev.librepocket.mcp$Compat`, `dev.librepocket.mcpé`,
+# `dev.librepocket.mcp\u0301`, `dev.librepocket.mcp\u200d` and
+# `dev.librepocket.mcp€X` are not the mcp package; `Mcp[A-Z]` stays
+# deliberately wide. ---
 if [ "${#OUTSIDE_FILES[@]}" -gt 0 ]; then
   if ! command -v python3 >/dev/null 2>&1; then
     report "python3 not available for production source scan (fail closed)"
@@ -1392,14 +2743,47 @@ if [ "${#OUTSIDE_FILES[@]}" -gt 0 ]; then
 import os
 import re
 import sys
+import unicodedata
 
 root = sys.argv[1]
 files = sys.argv[2:]
 
-# Same trailing boundary as the manifest text grep: `dev.librepocket.mcpfoo`
-# is a different package. `Mcp[A-Z]` stays deliberately wide (fail closed).
-MCP = re.compile(r"dev\.librepocket\.mcp([^A-Za-z0-9_]|$)|Mcp[A-Z]")
-DOTS = re.compile(r"[ \t]*\.[ \t]*")
+# Same identifier-aware trailing boundary as the manifest raw-text scan and
+# C2b (G-11): `$`, `_`, alphanumerics, currency symbols (Sc), connecting
+# punctuation (Pc), combining marks (Mn/Mc) and format/ignorable controls (Cf)
+# all continue the package name, so `dev.librepocket.mcpfoo`, `…mcp$Compat`,
+# `…mcpé`, `…mcp\u0301`, `…mcp\u200d` and `…mcp€X` are different packages.
+# `Mcp[A-Z]` stays deliberately wide (fail closed).
+_IDENT_EXTRA = frozenset({"Mn", "Mc", "Cf", "Pc", "Sc"})
+
+
+def is_ident_part(c):
+    if c == "$" or c == "_":
+        return True
+    category = unicodedata.category(c)
+    if category[0] == "L" or category in ("Nd", "Nl"):
+        return True
+    if category in _IDENT_EXTRA:
+        return True
+    o = ord(c)
+    return o <= 0x08 or 0x0E <= o <= 0x1B or 0x7F <= o <= 0x9F
+
+
+def mcp_token_in(text):
+    prefix = "dev.librepocket.mcp"
+    i = 0
+    while True:
+        j = text.find(prefix, i)
+        if j < 0:
+            break
+        k = j + len(prefix)
+        if k >= len(text) or not is_ident_part(text[k]):
+            return True
+        i = k
+    return bool(re.search(r"Mcp[A-Z]", text))
+# JVM whitespace around a dot (space, tab, form feed, vertical tab) collapses;
+# a line terminator does not (that would join separate lines).
+DOTS = re.compile(r"[^\S\n]*\.[^\S\n]*")
 
 
 def rel(path):
@@ -1527,6 +2911,40 @@ def sanitize(text, java):
     return result
 
 
+def java_unicode_decode(text):
+    # JLS 3.3: javac translates \uXXXX before tokenising.  A backslash is
+    # eligible only after an even run of contiguous backslashes; invalid hex
+    # stays literal.  Decoding here lets DOTS collapse a whitespace escape that
+    # was injected inside a FQN (`dev\u0020.librepocket…`).
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] != "\\":
+            out.append(text[i])
+            i += 1
+            continue
+        j = i
+        while j < n and text[j] == "\\":
+            j += 1
+        k = i
+        while k < j:
+            if ((k - i) % 2 == 0 and text.startswith("\\u", k)):
+                m = k + 2
+                while m < n and text[m] == "u":
+                    m += 1
+                digits = text[m:m + 4]
+                if (len(digits) == 4 and
+                        all(c in "0123456789abcdefABCDEF" for c in digits)):
+                    out.append(chr(int(digits, 16)))
+                    k = m + 4
+                    continue
+            out.append(text[k])
+            k += 1
+        i = k
+    return "".join(out)
+
+
 def main():
     hits = []
     failed = False
@@ -1541,15 +2959,29 @@ def main():
             continue
         # `text` is raw source. Sanitise it once so comments are blanked only
         # outside strings; newlines are preserved, so line numbers/reporting
-        # still point at the original line.
-        sanitized = sanitize(text, path.endswith(".java"))
-        for lineno, line in enumerate(sanitized.splitlines(), 1):
+        # still point at the original line. CRLF/CR are normalised to LF and
+        # only `\n` splits a line: form feed is JVM whitespace, not a line
+        # terminator, so a reference on one physical line is never cut in two.
+        if "\r" in text:
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+        java = path.endswith(".java")
+        original_lines = text.split("\n")
+        # JLS 3.3: javac translates \uXXXX before tokenising, so an escape can
+        # inject whitespace into a FQN (`dev\u0020.librepocket…`).  Decode
+        # before sanitising; DOTS below then collapses the injected
+        # space/tab/form-feed.  A decoded line terminator genuinely splits the
+        # FQN across physical lines (documented N-B3 residual, not joined).
+        if java:
+            text = java_unicode_decode(text)
+        sanitized = sanitize(text, java)
+        for lineno, line in enumerate(sanitized.split("\n"), 1):
             # Normalise legal-but-non-canonical spellings: backticked package
-            # segments, blanked /*…*/ comments between segments, and
+            # segments, blanked /*…*/ comments between segments, and JVM
             # whitespace around dots.
             scan = DOTS.sub(".", line.replace("`", ""))
-            if MCP.search(scan):
-                original = text.splitlines()[lineno - 1]
+            if mcp_token_in(scan):
+                original = (original_lines[lineno - 1]
+                            if lineno - 1 < len(original_lines) else line)
                 hits.append(f"{rel(path)}:{lineno}:{original}")
     for hit in hits:
         print(hit)

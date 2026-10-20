@@ -63,6 +63,12 @@
 #  1ah. C4 `//` inside a string does not truncate a later MCP FQN (fix4)
 #  1ai. positive: a comment containing `; import …` after an allowlisted
 #      import is not treated as a real second import (fix4)
+#  1aj. form feed is JVM whitespace, not a line break: a same-line FQN split by
+#      `\f` is still caught (Stage1 C4-FF)
+#  1ak. production source outside `*/src` (custom `java.srcDir`) is scanned
+#      (Stage1 C1-SRC)
+#  1al. production package `…/com/example/src/test/…` under `src/main` is
+#      scanned (Stage1 C1-TEST)
 #   2. in-package outbound import (mcp package imports beyond the allowlist)
 #  2b. double-space `import  dev.librepocket.…` is still checked (fix4 M2)
 #  2c. Java `import static dev.librepocket.router.…` is still checked (M2)
@@ -75,6 +81,12 @@
 #  2i. backticked outbound import segment is still checked (fix4)
 #  2j. second outbound import on one physical line is still checked (fix4)
 #  2k. comment between `;` and the second outbound import is still checked
+#  2l. spaced-dot outbound import (Kotlin) is rejected (Stage1 C3-WS)
+#  2m. spaced-dot outbound import (Java) is rejected (Stage1 C3-WS)
+#  2n. single-space outbound import is rejected (Stage1 C3-WS)
+#  2o. same-line package + import + outbound FQN is still scanned (Stage1 F2)
+#  2p. string `"/*"` does not desync the outbound FQN scan (Stage1 F3)
+#  2q. positive: two individually allowlisted imports on one line pass (C3-OB)
 #   3. in-package FQN outbound use (fully-qualified call/type without import)
 #   4. manifest registration      (AndroidManifest* registers an MCP component)
 #   5. new-module reference       (a second module's src tree references MCP)
@@ -109,7 +121,7 @@
 #  6x. cross-file manifestPlaceholders + root build extra MCP literal (S2)
 #  6y. gradle.properties MCP literal consumed via project.property (S2)
 #  6z. getManifest().setSrcFile getter form (S2d)
-#  6aa. manifest comment mentioning MCP pins the text-grep layer (Stage6 fix2)
+#  6aa. manifest comment mentioning MCP pins the raw-text layer (Stage6 fix2)
 #  6ab. typealias name counts for relative resolution (N4 over-approx)
 #  6ad. addManifestPlaceholders + MCP literal (fix3 P0-3)
 #  6ae. setNamespace("dev.librepocket.mcp") setter form (fix3 P1)
@@ -133,6 +145,83 @@
 #  6ax. standalone MCP literal in any gradle file fails closed (fix4)
 #  6ay. receiver-less/aliased `srcFile` token is rejected (fix4)
 #  6az. `\`-continued gradle.properties MCP literal is joined and rejected
+#  6ba. comment-spliced type declaration resolves a relative component (Stage1)
+#  6bb. Java `cl\u0061ss` type declaration resolves a relative component (Stage1)
+#  6bc. gradle version catalog (libs.versions.toml) MCP literal (Stage1 C2B-TOML)
+#  6bd. TOML `\UXXXXXXXX` escape decodes to the mcp package (G-04)
+#  6be. (positive) TOML literal string ignores escapes (G-08)
+#  6bf. Unicode Java type name resolves a relative component (G-05)
+#  6bg. backticked punctuated Kotlin type name resolves a component (G-05)
+#  6bh. `$`-leading Java type name resolves a relative component (G-05)
+#  6bi. (positive) manifest component `dev.librepocket.mcpé…` is a lookalike
+#  6bj. (positive) manifest component `dev.librepocket.mcpfoo…` is a lookalike
+#  6bk. TOML multiline basic string `\uXXXX` decodes (G-04)
+#  6bl. (positive) TOML multiline literal string ignores escapes (G-08)
+#  1am. C4 catches an escape-space-obscured FQN on one line (G-03)
+#  1an. same with a tab escape (G-03)
+#  1ao. in-package `mcp$Compat` lookalike is outbound (G-06)
+#  1ap. in-package `mcpé` lookalike is outbound (G-06)
+#  1aq. production package named `build` is scanned (G-07)
+#  1ar. custom `extra/java` root containing `src/test` is production (C1-TEST)
+#  1as. a file whose package is `dev.librepocket.mcp$Compat` is OUTSIDE (C4)
+#  1at. a file whose package is `dev.librepocket.mcpé` is OUTSIDE (C4)
+#  2r. Java generic type argument is not a KDoc link (G-01)
+#  2s. Kotlin grouped annotation `@[...]` is not a KDoc link (G-01)
+#  2t. Kotlin generic type argument is not a KDoc link (G-01)
+#  2u. Java import split across lines is fully validated (G-02)
+#  2v. block-comment/newline-split Java import is validated (G-02)
+#  2w. line-comment-split Java import is validated (G-02)
+#  2x. `\u000a`-split Java import is validated (G-02)
+#  2y. (positive) allowlisted Java import split across lines (G-09)
+#  2z. (positive) static member of an allowlisted type (G-10)
+#  2aa. a bracketed FQN inside a string is not a KDoc link
+#  1au. in-package `mcp<combining>` lookalike is outbound (G-11)
+#  1av. in-package `mcp<ZWJ>` string lookalike is outbound (G-11)
+#  1aw. in-package `mcp€X` lookalike is outbound (G-11)
+#  6bm. combining-mark type name resolves a relative component (G-12)
+#  6bn. ZWJ type name resolves a relative component (G-12)
+#  6bo. currency-symbol-leading type name resolves a component (G-12)
+#  6bp. `$1Wire` type name resolves a relative component (G-12)
+#  1ax. C4 lookalikes with combining/ZWJ/currency parts are not the mcp pkg
+#  6bq. manifest lookalikes with combining/ZWJ/currency parts are not mcp
+#  2ab. Kotlin spaced-dot FQN in a string is caught (G-15)
+#  2ac. Java spaced-dot FQN in a string is caught (G-15)
+#  2ad. Kotlin backticked-segment string FQN is caught (G-15)
+#  2ae. Java same-line-comment string FQN is caught (G-15)
+#  2af. contiguous string FQN control is caught (G-15)
+#  1ay. main srcDir("src/test") is a test-into-production config (G-16)
+#  1az. symlinked production source fails closed, not silently skipped (G-13)
+#  1ba. marker + build package (settings.gradle) is scanned (G-14)
+#  1bb. marker + build package (build.gradle.kts) is scanned (G-14)
+#  2ag. (positive) backticked Kotlin import alias with a space (O-01)
+#  1bc. C1 classifier: package `dev.librepocket.mcp` + U+0301/U+20AC/U+203F/
+#      U+200D is a lookalike (OUT), so its real MCP import is C4-scanned (G-17)
+#  1bd. C1 classifier: lookalike package with a fully-qualified use, no import
+#  1be. (positive) a file in a lookalike package referencing only that package
+#      stays green (C4 must not over-flag the lookalike name) (G-17)
+#  1bf. (positive) `dev.librepocket.mcp²` is a self-mention: U+00B2 (No) is not
+#      a java identifier part (is_ident_part exactness)
+#  1bg. only a lookalike declaration: zero real IN files fails closed (G-17)
+#  1bh. marker+src spoof inside a package still scans its build/ (G-14c)
+#  1bi. (positive) root settings include(":app") prunes the module build (G-14)
+#  1bj. (positive) nested include(":feature:mcpui") module build is pruned
+#  1bk. (positive) no settings: depth-1 app/build.gradle.kts + src (G-14)
+#  1bl. no settings: a depth-2 marker+src spoof cannot prune build/ (G-14)
+#  1bm. main srcDir val indirection (G-16b)
+#  1bn. main srcDir file(...) (G-16d)
+#  1bo. main srcDir string concatenation (G-16e)
+#  1bp. main setSrcDirs(listOf(...)) (G-16f)
+#  1bq. main srcDirs(listOf(...)) (G-16g)
+#  1br. main srcDir project.file(...) (G-16h)
+#  1bs. main srcDir $buildDir (G-16i)
+#  1bt. main srcDir layout.buildDirectory.dir (G-16j)
+#  1bu. main srcDirs += (Groovy assignment form)
+#  1bv. unresolvable main srcDir provider fails closed
+#  1bw. (positive) srcDir extra/java; srcDir src/main/java; test-source own
+#      srcDir; extra/src/test; extra/src/testFixtures; src/test in a package
+#      path (P1/P2/P4/P5/P6/P7)
+#  1bx. srcDir("build/generated/ksp") stays an accepted fail-closed over-block
+#      (P3; explicit main srcDirs under build are not added to discovery)
 #   7. discovery: no manifests at all (fail closed, never silent pass)
 #   8. discovery: no */src source roots at all
 #   9. discovery: unreadable production source (chmod 000 → scan fails closed)
@@ -140,6 +229,7 @@
 # 10b. discovery: no production source declares package dev.librepocket.mcp
 #  11. Section A: scripts/tests/*.py referenced by the workflow but absent
 #      from docs/TESTING.md (P3-2 subdirectory coverage)
+#  12. discovery: the shared helper is missing (fail closed)
 #  N8. (positive) applicationId dev.librepocket.mcpfoo (trailing boundary, S2)
 #  N8b. (positive) namespace dev.librepocket.mcpfoo (trailing boundary, S2)
 # Positive controls: the clean fixture, an in-package path comment (1c), a
@@ -148,32 +238,20 @@
 # (N8/N8b/1ac/6am/6aq), the comment-split package (1p), the benign Java
 # Unicode escape (1q), the non-mcp manifest placeholder (6aj), the
 # normalised-import/self-import positives (1ad/1af/1ag/1ai/2d/2e), the
-# triple-quoted mcpfoo boundary (6aw), the C4 lookalike boundary (1z), and
-# the REAL repository must PASS, and the gate source must
+# two-allowlisted-imports-on-one-line positive (2q), the split-allowlisted
+# import (2y), the allowlisted static member (2z), the TOML literal string
+# (6be), the TOML multiline literal string (6bl), the triple-quoted mcpfoo
+# boundary (6aw), the manifest lookalikes (6bi/6bj/6bq), the C4 lookalike
+# boundaries (1z/1ax), the backticked Kotlin import alias (2ag), and the REAL
+# repository must PASS, and the gate source must
 # still carry every C1–C4 section marker (N-B7: a section wrapped in
 # `if false` would otherwise stay green).
-#
+# Stage1: C1/C2/C3 delegate to stdlib scripts/mcp_scan.py (copied per fixture);
+# C4/ESC split on \n only and decode Java `\uXXXX`; C2b scans *.toml catalogs
+# with a TOML-aware (basic-vs-literal string) escape decoder.
 # Counts are runtime counters (authoritative: the final say() line).
-#
 # Stdlib only (bash/grep/find + the gate's own python3/yaml), CWD-independent,
 # temp dirs cleaned on exit. Exit non-zero on any mismatch.
-set -euo pipefail
-
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GATE="$ROOT/scripts/docs_claim_check.sh"
-if [ ! -f "$GATE" ]; then
-  echo "test_docs_claim_check: missing gate at $GATE"
-  exit 1
-fi
-
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-
-failures=0
-pos_cases=0
-neg_cases=0
-say() { echo "test_docs_claim_check: $1"; }
-
 # --- minimal repo that must pass every gate section -------------------------
 make_template() {
   local d="$1"
@@ -181,6 +259,7 @@ make_template() {
     "$d/app/src/main/java/dev/librepocket/mcp" \
     "$d/app/src/main/java/dev/librepocket/other"
   cp "$GATE" "$d/scripts/docs_claim_check.sh"
+  cp "${GATE%/*}/mcp_scan.py" "$d/scripts/mcp_scan.py"
 
   cat > "$d/.github/workflows/pr-check.yml" <<'YAML'
 name: pr-check
@@ -304,6 +383,28 @@ expect_fail() {
     failures=$((failures + 1))
   fi
 }
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GATE="$ROOT/scripts/docs_claim_check.sh"
+HELPER="$ROOT/scripts/mcp_scan.py"
+if [ ! -f "$GATE" ]; then
+  echo "test_docs_claim_check: missing gate at $GATE"
+  exit 1
+fi
+if [ ! -r "$HELPER" ]; then
+  echo "test_docs_claim_check: missing or unreadable helper at $HELPER"
+  exit 1
+fi
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+failures=0
+pos_cases=0
+neg_cases=0
+say() { echo "test_docs_claim_check: $1"; }
 
 make_template "$TMP/clean"
 expect_pass "$TMP/clean" "clean fixture passes every section"
@@ -818,6 +919,58 @@ expect_fail "$TMP/outside_url_string" \
   "C4 keeps scanning after // inside a string literal (fix4)" \
   "production Kotlin/Java outside dev/librepocket/mcp/ references MCP types"
 
+# 1aj. Stage1 C4-FF: form feed is ordinary JVM whitespace, not a line
+# terminator. The old `str.splitlines()` cut `dev.librepocket.<FF>mcp.X` into
+# two lines (neither matching) and the reference escaped. The scan must split
+# on `\n` only and collapse JVM whitespace (incl. `\f`) around the dot.
+cp -r "$TMP/clean" "$TMP/outside_form_feed"
+mkdir -p "$TMP/outside_form_feed/app/src/main/java/com/example"
+{ printf 'package com.example;\n\npublic class Use {\n  Object a = dev.librepocket.';
+  printf '\014';
+  printf 'mcp.OneShotJsonBody.class;\n}\n'; } \
+  > "$TMP/outside_form_feed/app/src/main/java/com/example/Use.java"
+expect_fail "$TMP/outside_form_feed" \
+  "form-feed-separated FQN on one physical line is caught (Stage1)" \
+  "production Kotlin/Java outside dev/librepocket/mcp/ references MCP types"
+
+# 1ak. Stage1 C1-SRC: a production source root outside `*/src` (configured
+# through a custom `java.srcDir(...)`) used to be invisible to the whole
+# C1/C3/C4 machinery. The helper discovers every production `.kt`/`.java` file
+# repo-wide, so this outside reference is scanned.
+cp -r "$TMP/clean" "$TMP/outside_srcdir"
+mkdir -p "$TMP/outside_srcdir/app/extra/java/com/example"
+cat > "$TMP/outside_srcdir/app/extra/java/com/example/Wired.kt" <<'KT'
+package com.example
+
+import dev.librepocket.mcp.McpServer
+
+internal class Wired(private val s: McpServer)
+KT
+cat >> "$TMP/outside_srcdir/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("extra/java")
+}
+KTS
+expect_fail "$TMP/outside_srcdir" \
+  "production source outside */src (custom srcDir) is scanned (Stage1)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+# 1al. Stage1 C1-TEST: the old `-not -path '*/src/test*'` exclusion dropped any
+# production path containing `/src/test`, including a package literally named
+# `com.example.src.test` under a normal `src/main` root. Only the source-set
+# component immediately after the module's `src` dir is a test source set.
+cp -r "$TMP/clean" "$TMP/outside_src_test_pkg"
+mkdir -p "$TMP/outside_src_test_pkg/app/src/main/java/com/example/src/test"
+cat > "$TMP/outside_src_test_pkg/app/src/main/java/com/example/src/test/Out.kt" <<'KT'
+package com.example.src.test
+
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/outside_src_test_pkg" \
+  "production package .../src/test/... under src/main is still scanned (Stage1)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
 # 2. in-package outbound import beyond the allowlist (surface: import allowlist)
 cp -r "$TMP/clean" "$TMP/in_import"
 cat > "$TMP/in_import/app/src/main/java/dev/librepocket/mcp/Wired.kt" <<'KT'
@@ -940,8 +1093,9 @@ expect_fail "$TMP/in_import_backtick" \
   "backticked outbound import segment is still checked (fix4)" \
   "outbound import not on allowlist"
 
-# 2j. fix4 follow-up: two import declarations on one physical line; the
-# leftover scan catches the second (outbound) import.
+# 2j. fix4 follow-up: two import declarations on one physical line; the second
+# (outbound) import is classified independently and rejected (Stage1: the
+# helper's import parser no longer relies on the old raw leftover scan).
 cp -r "$TMP/clean" "$TMP/in_import_two_on_line"
 cat > "$TMP/in_import_two_on_line/app/src/main/java/dev/librepocket/mcp/TwoImports.java" <<'JAVA'
 package dev.librepocket.mcp;
@@ -952,10 +1106,10 @@ public class TwoImports { }
 JAVA
 expect_fail "$TMP/in_import_two_on_line" \
   "second outbound import on one line is still checked (fix4)" \
-  "outbound reference from inside dev/librepocket/mcp/"
+  "outbound import not on allowlist"
 
 # 2k. fix4 follow-up: a block comment between the `;` and the second import
-# must not hide the multi-import form from the fallback guard.
+# must not hide the second declaration.
 cp -r "$TMP/clean" "$TMP/in_import_two_on_line_comment"
 cat > "$TMP/in_import_two_on_line_comment/app/src/main/java/dev/librepocket/mcp/GapImport.kt" <<'KT'
 package dev.librepocket.mcp
@@ -966,7 +1120,90 @@ internal class GapImport(private val gate: PrivilegeGate)
 KT
 expect_fail "$TMP/in_import_two_on_line_comment" \
   "comment-gapped second outbound import is still checked (fix4)" \
+  "outbound import not on allowlist"
+
+# 2l. Stage1 C3-WS: whitespace around the dots of an outbound import is legal
+# Java/Kotlin. The helper normalises it before the allowlist test, so it can no
+# longer fall through the old exact-prefix `case` and its early `continue`.
+cp -r "$TMP/clean" "$TMP/in_import_spaced_dot"
+cat > "$TMP/in_import_spaced_dot/app/src/main/java/dev/librepocket/mcp/SpacedDot.kt" <<'KT'
+package dev.librepocket.mcp
+
+import dev . librepocket . router . PrivilegeGate
+
+internal class SpacedDot(private val g: PrivilegeGate)
+KT
+expect_fail "$TMP/in_import_spaced_dot" \
+  "spaced-dot outbound import (Kotlin) is rejected (Stage1)" \
+  "outbound import not on allowlist"
+
+# 2m. Same, Java grammar (every dot spaced, terminating `;`).
+cp -r "$TMP/clean" "$TMP/in_import_spaced_dot_java"
+cat > "$TMP/in_import_spaced_dot_java/app/src/main/java/dev/librepocket/mcp/SpacedDot.java" <<'JAVA'
+package dev.librepocket.mcp;
+
+import dev . librepocket . router . PrivilegeGate;
+
+public class SpacedDot { PrivilegeGate g; }
+JAVA
+expect_fail "$TMP/in_import_spaced_dot_java" \
+  "spaced-dot outbound import (Java) is rejected (Stage1)" \
+  "outbound import not on allowlist"
+
+# 2n. A single space before one dot is enough (the lead's original repro).
+cp -r "$TMP/clean" "$TMP/in_import_spaced_dot_single"
+cat > "$TMP/in_import_spaced_dot_single/app/src/main/java/dev/librepocket/mcp/SpacedDot.kt" <<'KT'
+package dev.librepocket.mcp
+
+import dev.librepocket .router.PrivilegeGate
+
+internal class SpacedDot(private val g: PrivilegeGate)
+KT
+expect_fail "$TMP/in_import_spaced_dot_single" \
+  "single-space outbound import is rejected (Stage1)" \
+  "outbound import not on allowlist"
+
+# 2o. Stage1 F2: a package declaration, an (allowed) import and an outbound
+# FQN on ONE physical line. The old import branch `continue`d and skipped the
+# leftover FQN scan; the helper removes the package/import and scans the rest.
+cp -r "$TMP/clean" "$TMP/in_fqn_same_line_class"
+cat > "$TMP/in_fqn_same_line_class/app/src/main/java/dev/librepocket/mcp/Rogue.java" <<'JAVA'
+package dev.librepocket.mcp; import java.util.List; class Rogue { dev.librepocket.router.PrivilegeGate gate; }
+JAVA
+expect_fail "$TMP/in_fqn_same_line_class" \
+  "same-line import + class + outbound FQN is still scanned (Stage1)" \
   "outbound reference from inside dev/librepocket/mcp/"
+
+# 2p. Stage1 F3: a string literal `"/*"` desynchronises a comment stripper that
+# is not string-aware, letting it swallow `dev.` and hide the (comment-split)
+# outbound FQN. The helper lexes strings, so the comment is blanked correctly
+# and the whitespace around the dot is normalised.
+cp -r "$TMP/clean" "$TMP/in_fqn_string_desync"
+cat > "$TMP/in_fqn_string_desync/app/src/main/java/dev/librepocket/mcp/Desync.kt" <<'KT'
+package dev.librepocket.mcp
+
+internal fun rogue() {
+    val s = "/*"; val x = dev./* x */librepocket.router.PrivilegeGate; val t = "*/"
+}
+KT
+expect_fail "$TMP/in_fqn_string_desync" \
+  "string comment delimiters do not desync the outbound FQN scan (Stage1)" \
+  "outbound reference from inside dev/librepocket/mcp/"
+
+# 2q. Stage1 C3-OB positive control: two INDIVIDUALLY allowlisted imports
+# (ToolDef + KeyVault) on one physical line are not outbound. The old per-line
+# `^…$` allowlist test (and the raw leftover fallback) false-red this. The
+# helper classifies each `;`-separated import independently.
+cp -r "$TMP/clean" "$TMP/in_import_two_allowlisted"
+cat > "$TMP/in_import_two_allowlisted/app/src/main/java/dev/librepocket/mcp/TwoAllow.java" <<'JAVA'
+package dev.librepocket.mcp;
+
+import dev.librepocket.tool.ToolDef; import dev.librepocket.keystore.KeyVault;
+
+public class TwoAllow { }
+JAVA
+expect_pass "$TMP/in_import_two_allowlisted" \
+  "two individually allowlisted imports on one line pass (Stage1)"
 
 # 3. in-package fully-qualified outbound use without import (surface: FQN)
 cp -r "$TMP/clean" "$TMP/in_fqn"
@@ -1165,7 +1402,7 @@ XML
 expect_pass "$TMP/rel_manifest_test_only" \
   "test-source-only basename does not turn the manifest red (F1)"
 
-# 6j. Stage6 A4: entity-encoded dots defeat the raw text grep
+# 6j. Stage6 A4: entity-encoded dots defeat the raw text scan
 # (`dev.librepocket&#46;mcp&#46;SomeService` has no literal `.`), so only the
 # XML FQN branch can catch it. Pins that branch.
 cp -r "$TMP/clean" "$TMP/manifest_entity_fqn"
@@ -1316,7 +1553,7 @@ expect_fail "$TMP/gradle_application_id" \
   "namespace/applicationId requests MCP package"
 
 # 6s. Stage6 A1: <manifest package="dev.librepocket.mcp…"> in entity form —
-# the raw text grep sees no literal dot, so only the XML package branch can
+# the raw text scan sees no literal dot, so only the XML package branch can
 # catch it (Stage6 fix2).
 cp -r "$TMP/clean" "$TMP/manifest_package"
 cat > "$TMP/manifest_package/app/src/main/AndroidManifest.xml" <<'XML'
@@ -1442,7 +1679,7 @@ expect_fail "$TMP/gradle_srcfile_getter" \
   "custom manifest srcFile bypasses MCP manifest scan"
 
 # 6aa. Stage6 fix2: a manifest comment mentioning MCP still turns the gate red
-# (the text-grep layer is deliberately defense-in-depth).
+# (the raw-text layer is deliberately defense-in-depth).
 cp -r "$TMP/clean" "$TMP/manifest_comment"
 cat > "$TMP/manifest_comment/app/src/main/AndroidManifest.xml" <<'XML'
 <?xml version="1.0" encoding="utf-8"?>
@@ -1589,7 +1826,7 @@ android {
 }
 KTS
 expect_pass "$TMP/gradle_namespace_mcpfoo_subpkg" \
-  "namespace dev.librepocket.mcpfoo is not the mcp package (S2)"
+  "namespace dev.librepocket.mcpfoo is not the mcp package (S2/6am)"
 
 # 6an. fix4 S3: defensive `manifest.setSrcFile(...)` spelling. AGP's real API
 # is `manifest.srcFile(...)`; the setter spelling is guarded anyway.
@@ -1775,6 +2012,2008 @@ expect_fail "$TMP/gradle_properties_continuation" \
   "backslash-continued gradle.properties MCP literal is rejected (fix4)" \
   "gradle.properties exposes MCP components"
 
+# 6ba. Stage1 C2-TD: a comment between the type keyword and its name made the
+# raw-text TYPE_DECL miss the type, so a relative manifest component resolved
+# into the (now-invisible) class. Names come from the lexed view.
+cp -r "$TMP/clean" "$TMP/manifest_type_comment"
+cat > "$TMP/manifest_type_comment/app/src/main/java/dev/librepocket/mcp/Wire.java" <<'JAVA'
+package dev.librepocket.mcp;
+class /* c */ Transport {}
+JAVA
+cat > "$TMP/manifest_type_comment/app/src/main/AndroidManifest.xml" <<'XML'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <activity android:name=".MainActivity" />
+  <service android:name=".mcp.Transport" />
+</manifest>
+XML
+expect_fail "$TMP/manifest_type_comment" \
+  "comment-spliced type declaration still resolves a relative component (Stage1)" \
+  "Android manifest registers MCP (relative component .Transport)"
+
+# 6bb. Stage1 C2-TD (Java Unicode variant): javac translates `\uXXXX` before
+# lexing, so `cl\u0061ss Transport` is a real declaration the raw-text scan
+# missed.
+cp -r "$TMP/clean" "$TMP/manifest_type_unicode"
+cat > "$TMP/manifest_type_unicode/app/src/main/java/dev/librepocket/mcp/Wire.java" <<'JAVA'
+package dev.librepocket.mcp;
+class Wire {}
+cl\u0061ss Transport {}
+JAVA
+cat > "$TMP/manifest_type_unicode/app/src/main/AndroidManifest.xml" <<'XML'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <activity android:name=".MainActivity" />
+  <service android:name=".mcp.Transport" />
+</manifest>
+XML
+expect_fail "$TMP/manifest_type_unicode" \
+  "Java Unicode-escaped class keyword still resolves a relative component (Stage1)" \
+  "Android manifest registers MCP (relative component .Transport)"
+
+# 6bc. Stage1 C2B-TOML: the Gradle version catalog is a committed build input;
+# an MCP literal in it (consumed as libs.versions.mcpPkg.get()) must fail closed
+# exactly like a gradle.properties literal.
+cp -r "$TMP/clean" "$TMP/gradle_toml_catalog"
+cat > "$TMP/gradle_toml_catalog/gradle/libs.versions.toml" <<'TOML'
+[versions]
+agp = "9.0.0"
+kotlin = "2.1.0"
+compileSdk = "35"
+targetSdk = "35"
+minSdk = "26"
+mcpPkg = "dev.librepocket.mcp"
+TOML
+sed -i 's|namespace = "dev.librepocket.agent"|namespace = libs.versions.mcpPkg.get()|' \
+  "$TMP/gradle_toml_catalog/app/build.gradle.kts"
+expect_fail "$TMP/gradle_toml_catalog" \
+  "gradle version catalog MCP literal is rejected (Stage1)" \
+  "gradle version catalog references MCP components"
+
+# --- Stage1-fix2 regressions: bypasses found by adversarial review ----------
+# Each fixture pins the legal construct that used to reach the code view in a
+# form the gate could not see, plus the allowlisted/positive inverses.
+
+# 2r. G-01: a Java generic type argument is real code, not a KDoc link. The old
+# code-view strip removed `<dev.librepocket.` and hid the outbound type.
+cp -r "$TMP/clean" "$TMP/in_fqn_generic_java"
+cat > "$TMP/in_fqn_generic_java/app/src/main/java/dev/librepocket/mcp/Gen.java" <<'JAVA'
+package dev.librepocket.mcp;
+import java.util.List;
+class Gen { List<dev.librepocket.router.PrivilegeGate> gates; }
+JAVA
+expect_fail "$TMP/in_fqn_generic_java" \
+  "Java generic type argument is not stripped as a KDoc link (G-01)" \
+  "outbound reference from inside dev/librepocket/mcp/"
+
+# 2s. G-01 (Kotlin): a grouped annotation `@[...]` is real code too.
+cp -r "$TMP/clean" "$TMP/in_grouped_annotation"
+cat > "$TMP/in_grouped_annotation/app/src/main/java/dev/librepocket/mcp/Anno.kt" <<'KT'
+package dev.librepocket.mcp
+@[dev.librepocket.router.Anno]
+internal class Anno
+KT
+expect_fail "$TMP/in_grouped_annotation" \
+  "Kotlin grouped annotation is not stripped as a KDoc link (G-01)" \
+  "outbound reference from inside dev/librepocket/mcp/"
+
+# 2t. G-01 (Kotlin generic): `<dev.librepocket.…>` as a type argument.
+cp -r "$TMP/clean" "$TMP/in_fqn_generic_kotlin"
+cat > "$TMP/in_fqn_generic_kotlin/app/src/main/java/dev/librepocket/mcp/GenK.kt" <<'KT'
+package dev.librepocket.mcp
+internal class GenK(private val g: List<dev.librepocket.router.PrivilegeGate>)
+KT
+expect_fail "$TMP/in_fqn_generic_kotlin" \
+  "Kotlin generic type argument is not stripped as a KDoc link (G-01)" \
+  "outbound reference from inside dev/librepocket/mcp/"
+
+# 2u. G-02: a Java import declaration may span physical lines. The whole
+# declaration must be parsed and its COMPLETE path validated.
+cp -r "$TMP/clean" "$TMP/in_import_newline_java"
+cat > "$TMP/in_import_newline_java/app/src/main/java/dev/librepocket/mcp/SplitJ.java" <<'JAVA'
+package dev.librepocket.mcp;
+import dev.
+librepocket.router.PrivilegeGate;
+class SplitJ { PrivilegeGate g; }
+JAVA
+expect_fail "$TMP/in_import_newline_java" \
+  "Java import split across a physical line is fully validated (G-02)" \
+  "outbound import not on allowlist"
+
+# 2v. G-02: block comment between package segments of a split import.
+cp -r "$TMP/clean" "$TMP/in_import_comment_newline_java"
+cat > "$TMP/in_import_comment_newline_java/app/src/main/java/dev/librepocket/mcp/SplitC.java" <<'JAVA'
+package dev.librepocket.mcp;
+import dev.librepocket./*
+*/router.PrivilegeGate;
+class SplitC { }
+JAVA
+expect_fail "$TMP/in_import_comment_newline_java" \
+  "comment/newline-split Java import is fully validated (G-02)" \
+  "outbound import not on allowlist"
+
+# 2w. G-02: line comment terminates the first physical line of the import.
+cp -r "$TMP/clean" "$TMP/in_import_linecomment_java"
+cat > "$TMP/in_import_linecomment_java/app/src/main/java/dev/librepocket/mcp/SplitL.java" <<'JAVA'
+package dev.librepocket.mcp;
+import dev.// split
+librepocket.router.PrivilegeGate;
+class SplitL { }
+JAVA
+expect_fail "$TMP/in_import_linecomment_java" \
+  "line-comment-split Java import is fully validated (G-02)" \
+  "outbound import not on allowlist"
+
+# 2x. G-02: JLS `\u000a` escape is translated before lexing, so the import
+# really does continue on the next physical line.
+cp -r "$TMP/clean" "$TMP/in_import_escaped_newline_java"
+cat > "$TMP/in_import_escaped_newline_java/app/src/main/java/dev/librepocket/mcp/SplitE.java" <<'JAVA'
+package dev.librepocket.mcp;
+import dev.\u000alibrepocket.router.PrivilegeGate;
+class SplitE { }
+JAVA
+expect_fail "$TMP/in_import_escaped_newline_java" \
+  "Unicode-escaped newline in a Java import is fully validated (G-02)" \
+  "outbound import not on allowlist"
+
+# 2y. G-09 (+G-02) positive: a Java-legal import split after the keyword, where
+# the COMPLETE path is allowlisted, must pass.
+cp -r "$TMP/clean" "$TMP/in_import_allowed_split_java"
+cat > "$TMP/in_import_allowed_split_java/app/src/main/java/dev/librepocket/mcp/SplitAllow.java" <<'JAVA'
+package dev.librepocket.mcp;
+import
+dev.librepocket.tool.ToolDef;
+class SplitAllow { }
+JAVA
+expect_pass "$TMP/in_import_allowed_split_java" \
+  "allowlisted Java import split across lines passes (G-09)"
+
+# 2z. G-10 positive: a static member of an allowlisted contract type is not a
+# new outbound type.
+cp -r "$TMP/clean" "$TMP/in_static_member_allowlisted"
+cat > "$TMP/in_static_member_allowlisted/app/src/main/java/dev/librepocket/mcp/StaticMember.java" <<'JAVA'
+package dev.librepocket.mcp;
+import static dev.librepocket.tool.ToolDef.DEFAULT;
+class StaticMember { }
+JAVA
+expect_pass "$TMP/in_static_member_allowlisted" \
+  "static member import of an allowlisted type passes (G-10)"
+
+# 2aa. G-01 follow-up: comments are blanked in both lexer views, so a `[`/`<`
+# before a FQN is never a KDoc link by the time C3 scans. Stripping it from the
+# string-kept view hid a bracketed reflective class name.
+cp -r "$TMP/clean" "$TMP/in_bracket_string"
+cat > "$TMP/in_bracket_string/app/src/main/java/dev/librepocket/mcp/Bracket.kt" <<'KT'
+package dev.librepocket.mcp
+internal val gate = "[dev.librepocket.router.PrivilegeGate]"
+KT
+expect_fail "$TMP/in_bracket_string" \
+  "bracketed FQN inside a string is not stripped as a KDoc link (G-01)" \
+  "outbound reference from inside dev/librepocket/mcp/"
+
+# 1am. G-03: an escape that decodes to a space inside a one-line FQN is still
+# an MCP reference (javac translates the escape before tokenising).
+cp -r "$TMP/clean" "$TMP/outside_escape_space"
+mkdir -p "$TMP/outside_escape_space/app/src/main/java/com/example"
+cat > "$TMP/outside_escape_space/app/src/main/java/com/example/Use.java" <<'JAVA'
+package com.example;
+public class Use { Object x = dev\u0020.librepocket.mcp.OneShotJsonBody.class; }
+JAVA
+expect_fail "$TMP/outside_escape_space" \
+  "escape-space-obscured FQN on one physical line is caught (G-03)" \
+  "production Kotlin/Java outside dev/librepocket/mcp/ references MCP types"
+
+# 1an. G-03: same with a tab escape.
+cp -r "$TMP/clean" "$TMP/outside_escape_tab"
+mkdir -p "$TMP/outside_escape_tab/app/src/main/java/com/example"
+cat > "$TMP/outside_escape_tab/app/src/main/java/com/example/Use.java" <<'JAVA'
+package com.example;
+public class Use { Object x = dev\u0009.librepocket.mcp.OneShotJsonBody.class; }
+JAVA
+expect_fail "$TMP/outside_escape_tab" \
+  "escape-tab-obscured FQN on one physical line is caught (G-03)" \
+  "production Kotlin/Java outside dev/librepocket/mcp/ references MCP types"
+
+# 6bd. G-04: TOML basic strings support `\UXXXXXXXX` (8 hex) as well as
+# `\uXXXX`; Gradle's parser resolves it, so it must not hide a catalog literal.
+cp -r "$TMP/clean" "$TMP/gradle_toml_u8"
+cat > "$TMP/gradle_toml_u8/gradle/libs.versions.toml" <<'TOML'
+[versions]
+agp = "9.0.0"
+kotlin = "2.1.0"
+compileSdk = "35"
+targetSdk = "35"
+minSdk = "26"
+mcpPkg = "dev.librepocket\U0000002Emcp"
+TOML
+sed -i 's|namespace = "dev.librepocket.agent"|namespace = libs.versions.mcpPkg.get()|' \
+  "$TMP/gradle_toml_u8/app/build.gradle.kts"
+expect_fail "$TMP/gradle_toml_u8" \
+  "TOML \\UXXXXXXXX escape is decoded and rejected (G-04)" \
+  "gradle version catalog references MCP components"
+
+# 6be. G-08 positive: TOML LITERAL strings do not process escapes, so a
+# `\u002e` next to `dev.librepocket` is prose, not the mcp package.
+cp -r "$TMP/clean" "$TMP/gradle_toml_literal"
+cat >> "$TMP/gradle_toml_literal/gradle/libs.versions.toml" <<'TOML'
+note = 'dev.librepocket\u002emcp (literal, not a package)'
+TOML
+expect_pass "$TMP/gradle_toml_literal" \
+  "TOML literal string with an escape stays green (G-08)"
+
+# 6bf. G-05: Unicode Java identifier as a declared type name.
+cp -r "$TMP/clean" "$TMP/manifest_type_unicode_ident"
+cat > "$TMP/manifest_type_unicode_ident/app/src/main/java/dev/librepocket/mcp/Wire.java" <<'JAVA'
+package dev.librepocket.mcp;
+class Tränsport {}
+JAVA
+cat > "$TMP/manifest_type_unicode_ident/app/src/main/AndroidManifest.xml" <<'XML'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <activity android:name=".MainActivity" />
+  <service android:name=".mcp.Tränsport" />
+</manifest>
+XML
+expect_fail "$TMP/manifest_type_unicode_ident" \
+  "Unicode type name resolves a relative manifest component (G-05)" \
+  "Android manifest registers MCP (relative component .Tränsport)"
+
+# 6bg. G-05: backticked Kotlin type name with non-identifier punctuation.
+cp -r "$TMP/clean" "$TMP/manifest_type_backtick_punct"
+cat > "$TMP/manifest_type_backtick_punct/app/src/main/java/dev/librepocket/mcp/Bar.kt" <<'KT'
+package dev.librepocket.mcp
+internal class `Transport-X`
+KT
+cat > "$TMP/manifest_type_backtick_punct/app/src/main/AndroidManifest.xml" <<'XML'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <activity android:name=".MainActivity" />
+  <service android:name=".mcp.Transport-X" />
+</manifest>
+XML
+expect_fail "$TMP/manifest_type_backtick_punct" \
+  "backticked punctuated type name resolves a relative component (G-05)" \
+  "Android manifest registers MCP (relative component .Transport-X)"
+
+# 6bh. G-05: `$` is a legal Java identifier start, not a terminator. A type
+# declared in a differently named file must still enter the C2 name set.
+cp -r "$TMP/clean" "$TMP/manifest_type_dollar_ident"
+cat > "$TMP/manifest_type_dollar_ident/app/src/main/java/dev/librepocket/mcp/Dollar.java" <<'JAVA'
+package dev.librepocket.mcp;
+class $Wire {}
+JAVA
+cat > "$TMP/manifest_type_dollar_ident/app/src/main/AndroidManifest.xml" <<'XML'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <activity android:name=".MainActivity" />
+  <service android:name=".mcp.$Wire" />
+</manifest>
+XML
+expect_fail "$TMP/manifest_type_dollar_ident" \
+  "dollar-leading type name resolves a relative component (G-05)" \
+  "Android manifest registers MCP (relative component .\$Wire)"
+
+# 6bi. G-06 positive: a Unicode lookalike package is not the mcp package in a
+# manifest component name (the raw-text layer is Unicode-identifier-aware).
+cp -r "$TMP/clean" "$TMP/manifest_component_unicode_lookalike"
+cat > "$TMP/manifest_component_unicode_lookalike/app/src/main/AndroidManifest.xml" <<'XML'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <activity android:name=".MainActivity" />
+  <service android:name="dev.librepocket.mcpé.Service" />
+</manifest>
+XML
+expect_pass "$TMP/manifest_component_unicode_lookalike" \
+  "manifest component dev.librepocket.mcpé is not the mcp package (G-06)"
+
+# 6bj. G-06 positive: `mcpfoo` is a different package in a manifest component
+# name too (full_reason uses the same identifier-aware boundary).
+cp -r "$TMP/clean" "$TMP/manifest_component_mcpfoo"
+cat > "$TMP/manifest_component_mcpfoo/app/src/main/AndroidManifest.xml" <<'XML'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <activity android:name=".MainActivity" />
+  <service android:name="dev.librepocket.mcpfoo.Service" />
+</manifest>
+XML
+expect_pass "$TMP/manifest_component_mcpfoo" \
+  "manifest component dev.librepocket.mcpfoo is not the mcp package (G-06)"
+
+# 6bk. G-04: multiline basic strings decode escapes like single-line ones.
+cp -r "$TMP/clean" "$TMP/gradle_toml_multiline_basic"
+cat >> "$TMP/gradle_toml_multiline_basic/gradle/libs.versions.toml" <<'TOML'
+mcpPkg = """dev.librepocket\u002emcp"""
+TOML
+sed -i 's|namespace = "dev.librepocket.agent"|namespace = libs.versions.mcpPkg.get()|' \
+  "$TMP/gradle_toml_multiline_basic/app/build.gradle.kts"
+expect_fail "$TMP/gradle_toml_multiline_basic" \
+  "TOML multiline basic string escape is decoded and rejected (G-04)" \
+  "gradle version catalog references MCP components"
+
+# 6bl. G-08 positive: multiline literal strings process no escapes either.
+cp -r "$TMP/clean" "$TMP/gradle_toml_multiline_literal"
+cat >> "$TMP/gradle_toml_multiline_literal/gradle/libs.versions.toml" <<'TOML'
+note = '''dev.librepocket\u002emcp'''
+TOML
+expect_pass "$TMP/gradle_toml_multiline_literal" \
+  "TOML multiline literal string with an escape stays green (G-08)"
+
+# 1ao. G-06: `$` continues a JVM identifier, so `mcp$Compat` is a different
+# package and must stay outbound instead of being stripped as a self-mention.
+cp -r "$TMP/clean" "$TMP/in_self_mention_dollar"
+cat > "$TMP/in_self_mention_dollar/app/src/main/java/dev/librepocket/mcp/UseDollar.java" <<'JAVA'
+package dev.librepocket.mcp;
+class UseDollar { dev.librepocket.mcp$Compat.Widget w; }
+JAVA
+expect_fail "$TMP/in_self_mention_dollar" \
+  "mcp\$Compat lookalike is outbound, not a self-mention (G-06)" \
+  "outbound reference from inside dev/librepocket/mcp/"
+
+# 1ap. G-06: a Unicode letter continues the identifier too.
+cp -r "$TMP/clean" "$TMP/in_self_mention_unicode"
+cat > "$TMP/in_self_mention_unicode/app/src/main/java/dev/librepocket/mcp/UseUni.java" <<'JAVA'
+package dev.librepocket.mcp;
+class UseUni { dev.librepocket.mcpé.Widget w; }
+JAVA
+expect_fail "$TMP/in_self_mention_unicode" \
+  "mcpé lookalike is outbound, not a self-mention (G-06)" \
+  "outbound reference from inside dev/librepocket/mcp/"
+
+# 1as. G-06 (classification): a package that *starts* like the mcp package but
+# continues with `$` is a different package. The old ASCII PKG_DECL truncated
+# it to `dev.librepocket.mcp`, classified the file IN and skipped C4.
+cp -r "$TMP/clean" "$TMP/outside_pkg_dollar_lookalike"
+mkdir -p "$TMP/outside_pkg_dollar_lookalike/app/src/main/java/com/example"
+cat > "$TMP/outside_pkg_dollar_lookalike/app/src/main/java/com/example/Look.kt" <<'KT'
+package dev.librepocket.mcp$Compat
+import dev.librepocket.mcp.McpServer
+internal val server: McpServer? = null
+KT
+expect_fail "$TMP/outside_pkg_dollar_lookalike" \
+  "package dev.librepocket.mcp\$Compat is outside and C4-scanned (G-06)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+# 1at. G-06 (classification): same for a Unicode continuation. A truncated
+# ASCII capture must not turn a lookalike package into the mcp package.
+cp -r "$TMP/clean" "$TMP/outside_pkg_unicode_lookalike"
+mkdir -p "$TMP/outside_pkg_unicode_lookalike/app/src/main/java/com/example"
+cat > "$TMP/outside_pkg_unicode_lookalike/app/src/main/java/com/example/Look.kt" <<'KT'
+package dev.librepocket.mcpé
+import dev.librepocket.mcp.McpServer
+internal val server: McpServer? = null
+KT
+expect_fail "$TMP/outside_pkg_unicode_lookalike" \
+  "package dev.librepocket.mcpé is outside and C4-scanned (G-06)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+# 1aq. G-07: a production PACKAGE literally named `build` must be scanned; only
+# a real Gradle output root is pruned.
+cp -r "$TMP/clean" "$TMP/outside_build_package"
+mkdir -p "$TMP/outside_build_package/app/src/main/java/com/example/build"
+cat > "$TMP/outside_build_package/app/src/main/java/com/example/build/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/outside_build_package" \
+  "production package named build is scanned (G-07)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+# 1ar. C1-TEST: a custom `java.srcDir("extra/java")` root whose package path
+# later contains `src/test` is a production root, not a test source set.
+cp -r "$TMP/clean" "$TMP/outside_srcdir_src_test"
+mkdir -p "$TMP/outside_srcdir_src_test/app/extra/java/dev/librepocket/mcp/src/test"
+cat > "$TMP/outside_srcdir_src_test/app/extra/java/dev/librepocket/mcp/src/test/Evil.kt" <<'KT'
+package dev.librepocket.mcp
+import dev.librepocket.router.PrivilegeGate
+internal class Evil(private val g: PrivilegeGate)
+KT
+cat >> "$TMP/outside_srcdir_src_test/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("extra/java")
+}
+KTS
+expect_fail "$TMP/outside_srcdir_src_test" \
+  "custom srcDir root containing src/test is still production (C1-TEST)" \
+  "outbound import not on allowlist"
+
+# --- Stage1-fix3: identifier-part boundary, string normalisation, source-set
+# --- and symlink/module-root scope (second adversarial re-review) -----------
+
+# 1au. G-11: a combining mark (Mn) continues a JVM identifier, so
+# `dev.librepocket.mcp<U+0301>` is a different package, not a self-mention.
+cp -r "$TMP/clean" "$TMP/in_self_mention_combining"
+printf 'package dev.librepocket.mcp;\nclass UseComb { dev.librepocket.mcp\u0301.Widget w; }\n' \
+  > "$TMP/in_self_mention_combining/app/src/main/java/dev/librepocket/mcp/UseComb.java"
+expect_fail "$TMP/in_self_mention_combining" \
+  "combining-mark lookalike is outbound, not a self-mention (G-11)" \
+  "outbound reference from inside dev/librepocket/mcp/"
+
+# 1av. G-11: ZWJ (Cf, Java identifier-ignorable) continues the identifier.
+cp -r "$TMP/clean" "$TMP/in_self_mention_zwj"
+printf 'package dev.librepocket.mcp;\nclass UseZwj { String s = "dev.librepocket.mcp\u200d.Widget"; }\n' \
+  > "$TMP/in_self_mention_zwj/app/src/main/java/dev/librepocket/mcp/UseZwj.java"
+expect_fail "$TMP/in_self_mention_zwj" \
+  "ZWJ string lookalike is outbound, not a self-mention (G-11)" \
+  "outbound reference from inside dev/librepocket/mcp/"
+
+# 1aw. G-11: a currency symbol (Sc) continues the identifier too.
+cp -r "$TMP/clean" "$TMP/in_self_mention_currency"
+printf 'package dev.librepocket.mcp;\nclass UseCur { dev.librepocket.mcp\u20acX.Widget w; }\n' \
+  > "$TMP/in_self_mention_currency/app/src/main/java/dev/librepocket/mcp/UseCur.java"
+expect_fail "$TMP/in_self_mention_currency" \
+  "currency-symbol lookalike is outbound, not a self-mention (G-11)" \
+  "outbound reference from inside dev/librepocket/mcp/"
+
+# 6bm. G-12: decomposed Unicode in a declared type name must be captured in
+# full (the old ASCII remainder stopped at `Tra`).
+cp -r "$TMP/clean" "$TMP/manifest_type_combining"
+printf 'package dev.librepocket.mcp;\nclass Tra\u0308nsport {}\n' \
+  > "$TMP/manifest_type_combining/app/src/main/java/dev/librepocket/mcp/Wire.java"
+printf '<?xml version="1.0" encoding="utf-8"?>\n<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n  <activity android:name=".MainActivity" />\n  <service android:name=".mcp.Tra\u0308nsport" />\n</manifest>\n' \
+  > "$TMP/manifest_type_combining/app/src/main/AndroidManifest.xml"
+expect_fail "$TMP/manifest_type_combining" \
+  "combining-mark type name resolves a relative component (G-12)" \
+  "Android manifest registers MCP (relative component .Tra"$'\u0308'"nsport)"
+
+# 6bn. G-12: ZWJ inside a declared type name.
+cp -r "$TMP/clean" "$TMP/manifest_type_zwj"
+printf 'package dev.librepocket.mcp;\nclass Tra\u200dnsport {}\n' \
+  > "$TMP/manifest_type_zwj/app/src/main/java/dev/librepocket/mcp/Wire.java"
+printf '<?xml version="1.0" encoding="utf-8"?>\n<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n  <activity android:name=".MainActivity" />\n  <service android:name=".mcp.Tra\u200dnsport" />\n</manifest>\n' \
+  > "$TMP/manifest_type_zwj/app/src/main/AndroidManifest.xml"
+expect_fail "$TMP/manifest_type_zwj" \
+  "ZWJ type name resolves a relative component (G-12)" \
+  "Android manifest registers MCP (relative component .Tra"$'\u200d'"nsport)"
+
+# 6bo. G-12: a currency symbol is a legal Java identifier start (`€Wire`).
+cp -r "$TMP/clean" "$TMP/manifest_type_currency_start"
+printf 'package dev.librepocket.mcp;\nclass \u20acWire {}\n' \
+  > "$TMP/manifest_type_currency_start/app/src/main/java/dev/librepocket/mcp/Wire.java"
+printf '<?xml version="1.0" encoding="utf-8"?>\n<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n  <activity android:name=".MainActivity" />\n  <service android:name=".mcp.\u20acWire" />\n</manifest>\n' \
+  > "$TMP/manifest_type_currency_start/app/src/main/AndroidManifest.xml"
+expect_fail "$TMP/manifest_type_currency_start" \
+  "currency-symbol-leading type name resolves a component (G-12)" \
+  "Android manifest registers MCP (relative component ."$'\u20ac'"Wire)"
+
+# 6bp. G-12: `$` followed by a digit is a legal JVM identifier (`$1Wire`).
+cp -r "$TMP/clean" "$TMP/manifest_type_dollar_digit"
+cat > "$TMP/manifest_type_dollar_digit/app/src/main/java/dev/librepocket/mcp/Wire.java" <<'JAVA'
+package dev.librepocket.mcp;
+class $1Wire {}
+JAVA
+cat > "$TMP/manifest_type_dollar_digit/app/src/main/AndroidManifest.xml" <<'XML'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <activity android:name=".MainActivity" />
+  <service android:name=".mcp.$1Wire" />
+</manifest>
+XML
+expect_fail "$TMP/manifest_type_dollar_digit" \
+  "dollar-digit type name resolves a relative component (G-12)" \
+  'Android manifest registers MCP (relative component .$1Wire)'
+
+# 1ax (positive). G-11: a legal lookalike package is NOT the mcp package, so
+# C4 must stay green for combining/ZWJ/currency continuations.
+cp -r "$TMP/clean" "$TMP/outside_pkg_combining_lookalike"
+mkdir -p "$TMP/outside_pkg_combining_lookalike/app/src/main/java/com/example"
+printf 'package com.example;\nclass UseComb { dev.librepocket.mcp\u0301.Widget w; }\n' \
+  > "$TMP/outside_pkg_combining_lookalike/app/src/main/java/com/example/UseComb.java"
+expect_pass "$TMP/outside_pkg_combining_lookalike" \
+  "C4: dev.librepocket.mcp<combining> is a lookalike package (G-11)"
+
+cp -r "$TMP/clean" "$TMP/outside_pkg_zwj_lookalike"
+mkdir -p "$TMP/outside_pkg_zwj_lookalike/app/src/main/java/com/example"
+printf 'package com.example;\nclass UseZwj { String s = "dev.librepocket.mcp\u200d.Widget"; }\n' \
+  > "$TMP/outside_pkg_zwj_lookalike/app/src/main/java/com/example/UseZwj.java"
+expect_pass "$TMP/outside_pkg_zwj_lookalike" \
+  "C4: dev.librepocket.mcp<ZWJ> is a lookalike package (G-11)"
+
+cp -r "$TMP/clean" "$TMP/outside_pkg_currency_lookalike"
+mkdir -p "$TMP/outside_pkg_currency_lookalike/app/src/main/java/com/example"
+printf 'package com.example;\nclass UseCur { dev.librepocket.mcp\u20acX.Widget w; }\n' \
+  > "$TMP/outside_pkg_currency_lookalike/app/src/main/java/com/example/UseCur.java"
+expect_pass "$TMP/outside_pkg_currency_lookalike" \
+  "C4: dev.librepocket.mcp<currency> is a lookalike package (G-11)"
+
+# 6bq (positive). G-11: the manifest raw-text and XML layers use the same
+# identifier-aware boundary, so legal lookalike packages are not false reds.
+for lookalike in combining zwj currency; do
+  d="$TMP/manifest_component_${lookalike}_lookalike"
+  cp -r "$TMP/clean" "$d"
+  case "$lookalike" in
+    combining) value='dev.librepocket.mcp\u0301.Transport' ;;
+    zwj) value='dev.librepocket.mcp\u200d.Transport' ;;
+    currency) value='dev.librepocket.mcp\u20acX.Transport' ;;
+  esac
+  printf '<?xml version="1.0" encoding="utf-8"?>\n<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n  <activity android:name=".MainActivity" />\n  <service android:name="%b" />\n</manifest>\n' \
+    "$value" > "$d/app/src/main/AndroidManifest.xml"
+  expect_pass "$d" \
+    "manifest: dev.librepocket.mcp<${lookalike}> is a lookalike package (G-11)"
+done
+
+# 2ab. G-15: the C3 string view is normalised like HEAD's line view, so a
+# legal spaced-dot FQN inside a string is still outbound.
+cp -r "$TMP/clean" "$TMP/string_view_spaced_fqn"
+cat > "$TMP/string_view_spaced_fqn/app/src/main/java/dev/librepocket/mcp/S.kt" <<'KT'
+package dev.librepocket.mcp
+internal val s = "dev . librepocket . router . PrivilegeGate"
+KT
+expect_fail "$TMP/string_view_spaced_fqn" \
+  "spaced-dot FQN in a Kotlin string is caught (G-15)" \
+  "outbound reference from inside dev/librepocket/mcp/"
+
+# 2ac. G-15 (Java grammar): same spaced-dot string form.
+cp -r "$TMP/clean" "$TMP/string_view_spaced_fqn_java"
+cat > "$TMP/string_view_spaced_fqn_java/app/src/main/java/dev/librepocket/mcp/S.java" <<'JAVA'
+package dev.librepocket.mcp;
+class S { String s = "dev . librepocket . router . PrivilegeGate"; }
+JAVA
+expect_fail "$TMP/string_view_spaced_fqn_java" \
+  "spaced-dot FQN in a Java string is caught (G-15)" \
+  "outbound reference from inside dev/librepocket/mcp/"
+
+# 2ad. G-15: backticked package segment inside a string.
+cp -r "$TMP/clean" "$TMP/string_view_backticked_fqn"
+cat > "$TMP/string_view_backticked_fqn/app/src/main/java/dev/librepocket/mcp/S.kt" <<'KT'
+package dev.librepocket.mcp
+internal val s = "dev.`librepocket`.router.PrivilegeGate"
+KT
+expect_fail "$TMP/string_view_backticked_fqn" \
+  "backticked-segment string FQN is caught (G-15)" \
+  "outbound reference from inside dev/librepocket/mcp/"
+
+# 2ae. G-15: a same-line block comment between string segments.
+cp -r "$TMP/clean" "$TMP/string_view_comment_fqn"
+cat > "$TMP/string_view_comment_fqn/app/src/main/java/dev/librepocket/mcp/S.java" <<'JAVA'
+package dev.librepocket.mcp;
+class S { String s = "dev/*x*/.librepocket.router.PrivilegeGate"; }
+JAVA
+expect_fail "$TMP/string_view_comment_fqn" \
+  "same-line-comment string FQN is caught (G-15)" \
+  "outbound reference from inside dev/librepocket/mcp/"
+
+# 2af. G-15 control: the contiguous string form was always caught; the raw
+# string view remains active alongside the normalised one.
+cp -r "$TMP/clean" "$TMP/string_view_contiguous_fqn"
+cat > "$TMP/string_view_contiguous_fqn/app/src/main/java/dev/librepocket/mcp/S.kt" <<'KT'
+package dev.librepocket.mcp
+internal val s = "dev.librepocket.router.PrivilegeGate"
+KT
+expect_fail "$TMP/string_view_contiguous_fqn" \
+  "contiguous string FQN control is caught (G-15)" \
+  "outbound reference from inside dev/librepocket/mcp/"
+
+# 1ay. G-16: a MAIN source set pointed at `src/test` compiles test-shaped code
+# as production; fail closed instead of dropping it as a test source.
+cp -r "$TMP/clean" "$TMP/main_srcdir_into_src_test"
+mkdir -p "$TMP/main_srcdir_into_src_test/app/src/test/java/com/example"
+cat > "$TMP/main_srcdir_into_src_test/app/src/test/java/com/example/Wired.java" <<'JAVA'
+package com.example;
+class Wired { Object x = dev.librepocket.mcp.McpServer; }
+JAVA
+cat >> "$TMP/main_srcdir_into_src_test/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("src/test")
+}
+KTS
+expect_fail "$TMP/main_srcdir_into_src_test" \
+  "main srcDir into src/test fails closed (G-16)" \
+  "main source set adds a test/build source dir"
+
+# 1az. G-13: a production source that is a symlink to an excluded test payload
+# must fail closed rather than being silently skipped.
+cp -r "$TMP/clean" "$TMP/discover_symlink_test_payload"
+mkdir -p "$TMP/discover_symlink_test_payload/app/src/main/java/com/example" \
+  "$TMP/discover_symlink_test_payload/app/src/test/java/com/example"
+cat > "$TMP/discover_symlink_test_payload/app/src/test/java/com/example/Payload.java" <<'JAVA'
+package com.example;
+class Payload { Object x = dev.librepocket.mcp.OneShotJsonBody.class; }
+JAVA
+ln -s ../../../../test/java/com/example/Payload.java \
+  "$TMP/discover_symlink_test_payload/app/src/main/java/com/example/Payload.java"
+expect_fail "$TMP/discover_symlink_test_payload" \
+  "symlinked production source fails closed (G-13)" \
+  "symlinked source not scanned (fail closed)"
+
+# 1ba/1bb. G-14: an inert marker file in a package directory is not a module
+# root, so a sibling production package named `build` is still scanned.
+for marker in settings.gradle build.gradle.kts; do
+  d="$TMP/module_marker_${marker//./_}"
+  cp -r "$TMP/clean" "$d"
+  mkdir -p "$d/app/src/main/java/com/example/build"
+  cat > "$d/app/src/main/java/com/example/build/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+  : > "$d/app/src/main/java/com/example/$marker"
+  expect_fail "$d" \
+    "marker-only package dir does not prune build package ($marker) (G-14)" \
+    "outside dev/librepocket/mcp/ references MCP types"
+done
+
+# 2ag (positive). O-01: a backticked Kotlin import alias containing a space is
+# legal and the imported type is allowlisted.
+cp -r "$TMP/clean" "$TMP/in_import_backticked_alias"
+cat > "$TMP/in_import_backticked_alias/app/src/main/java/dev/librepocket/mcp/K2.kt" <<'KT'
+package dev.librepocket.mcp
+import dev.librepocket.tool.ToolDef as `T D`
+internal class K2x
+KT
+expect_pass "$TMP/in_import_backticked_alias" \
+  "backticked Kotlin import alias with a space passes (O-01)"
+
+# --- Stage1-fix3 round 2: package-classifier lookalikes (G-17) -------------
+
+# 1bc. G-17: a legal Java identifier-part continuation must be part of the
+# declared package name, not truncated back to `dev.librepocket.mcp`.  Each
+# lookalike file imports the REAL mcp type, so C4 must flag it.
+for lookalike in combining currency pc zwj; do
+  d="$TMP/outside_pkg_${lookalike}_continuation"
+  cp -r "$TMP/clean" "$d"
+  mkdir -p "$d/app/src/main/java/com/example"
+  case "$lookalike" in
+    combining) part='\u0301' ;;
+    currency) part='\u20acX' ;;
+    pc) part='\u203fX' ;;
+    zwj) part='\u200d' ;;
+  esac
+  printf 'package dev.librepocket.mcp%b;\nimport dev.librepocket.mcp.McpStub;\nclass Evil { Object x = McpStub.class; }\n' \
+    "$part" > "$d/app/src/main/java/com/example/Evil.java"
+  expect_fail "$d" \
+    "package dev.librepocket.mcp<${lookalike}> is OUT and C4-scanned (G-17)" \
+    "outside dev/librepocket/mcp/ references MCP types"
+done
+
+# 1bd. G-17: the same truncation with a fully-qualified use and no import.
+cp -r "$TMP/clean" "$TMP/outside_pkg_combining_fqn"
+mkdir -p "$TMP/outside_pkg_combining_fqn/app/src/main/java/com/example"
+printf 'package dev.librepocket.mcp\u0301;\nclass Evil { Object x = dev.librepocket.mcp.McpStub.class; }\n' \
+  > "$TMP/outside_pkg_combining_fqn/app/src/main/java/com/example/Evil.java"
+expect_fail "$TMP/outside_pkg_combining_fqn" \
+  "lookalike package with a fully-qualified MCP use is C4-scanned (G-17)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+# 1be (positive). G-17: C4 must not over-flag the lookalike package itself.
+# This file references only its own lookalike package, never the real one.
+cp -r "$TMP/clean" "$TMP/outside_pkg_lookalike_self"
+mkdir -p "$TMP/outside_pkg_lookalike_self/app/src/main/java/com/example"
+printf 'package dev.librepocket.mcp\u0301;\nclass Own { dev.librepocket.mcp\u0301.Widget w; }\n' \
+  > "$TMP/outside_pkg_lookalike_self/app/src/main/java/com/example/Own.java"
+expect_pass "$TMP/outside_pkg_lookalike_self" \
+  "a lookalike package referencing only itself stays green (G-17)"
+
+# 1bf (positive). U+00B2 is category No, which Java does NOT accept as an
+# identifier part.  `dev.librepocket.mcp²` is therefore the mcp package and the
+# reference is a self-mention (the old `isalnum()` over-approximation made this
+# red).
+cp -r "$TMP/clean" "$TMP/in_self_mention_superscript"
+printf 'package dev.librepocket.mcp;\nclass Sup { String s = "dev.librepocket.mcp\u00b2.Widget"; }\n' \
+  > "$TMP/in_self_mention_superscript/app/src/main/java/dev/librepocket/mcp/Sup.java"
+expect_pass "$TMP/in_self_mention_superscript" \
+  "dev.librepocket.mcp<U+00B2> is a self-mention (exact is_ident_part)"
+
+# 1bg. G-17 parser-drift guard: a tree whose only "mcp" declaration is a
+# lookalike has ZERO real in-package files; the gate must fail closed rather
+# than accept the truncated declaration.
+cp -r "$TMP/clean" "$TMP/no_in_pkg_lookalike"
+printf 'package dev.librepocket.mcp\u0301\nclass OtherStub\n' \
+  > "$TMP/no_in_pkg_lookalike/app/src/main/java/dev/librepocket/mcp/McpStub.kt"
+expect_fail "$TMP/no_in_pkg_lookalike" \
+  "only a lookalike declaration fails the zero-IN guard (G-17)" \
+  "no production source declares package dev.librepocket.mcp"
+
+# --- Stage1-fix3 round 2: settings-driven module roots (G-14) ---------------
+
+# 1bh. G-14c: an inert settings.gradle + src/.keep inside a Java package is
+# not a Gradle module; its sibling `build/` is production code.
+cp -r "$TMP/clean" "$TMP/module_marker_src_spoof"
+mkdir -p "$TMP/module_marker_src_spoof/app/src/main/java/com/example/build" \
+  "$TMP/module_marker_src_spoof/app/src/main/java/com/example/src"
+: > "$TMP/module_marker_src_spoof/app/src/main/java/com/example/settings.gradle"
+: > "$TMP/module_marker_src_spoof/app/src/main/java/com/example/src/.keep"
+cat > "$TMP/module_marker_src_spoof/app/src/main/java/com/example/build/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/module_marker_src_spoof" \
+  "marker+src package dir does not prune a sibling build package (G-14c)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+# 1bi (positive). A real root settings.gradle.kts include(":app") still prunes
+# the module's build output. The payload is a WIRED reference: if pruning were
+# disabled, C4 would scan app/build and fail, so PASS proves the tree is pruned.
+cp -r "$TMP/clean" "$TMP/module_root_settings_app"
+cat > "$TMP/module_root_settings_app/settings.gradle.kts" <<'KTS'
+rootProject.name = "fixture"
+include(":app")
+KTS
+mkdir -p "$TMP/module_root_settings_app/app/build/generated/ksp/com/example"
+cat > "$TMP/module_root_settings_app/app/build/generated/ksp/com/example/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_pass "$TMP/module_root_settings_app" \
+  "settings include(:app) actually prunes a wired app/build (G-14)"
+
+# 1bj (positive). A nested module included by the root settings is a module
+# root too, so its generated build output (wired payload) is pruned.
+cp -r "$TMP/clean" "$TMP/module_root_settings_nested"
+cat > "$TMP/module_root_settings_nested/settings.gradle.kts" <<'KTS'
+rootProject.name = "fixture"
+include(":app")
+include(":feature:mcpui")
+KTS
+mkdir -p "$TMP/module_root_settings_nested/feature/mcpui/src/main/java/com/example" \
+  "$TMP/module_root_settings_nested/feature/mcpui/build/generated/com/example"
+cat > "$TMP/module_root_settings_nested/feature/mcpui/build.gradle.kts" <<'KTS'
+plugins { id("java") }
+KTS
+cat > "$TMP/module_root_settings_nested/feature/mcpui/src/main/java/com/example/Clean.kt" <<'KT'
+package com.example
+internal class Clean
+KT
+cat > "$TMP/module_root_settings_nested/feature/mcpui/build/generated/com/example/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_pass "$TMP/module_root_settings_nested" \
+  "nested settings include(:feature:mcpui) prunes a wired build (G-14)"
+
+# 1bk (positive). No settings file: the depth-1 app/build.gradle.kts + src
+# fallback still recognizes app as a module (and prunes a wired app/build).
+cp -r "$TMP/clean" "$TMP/module_no_settings_app"
+mkdir -p "$TMP/module_no_settings_app/app/build/generated/com/example"
+cat > "$TMP/module_no_settings_app/app/build/generated/com/example/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_pass "$TMP/module_no_settings_app" \
+  "no-settings depth-1 app module prunes a wired build (G-14)"
+
+# 1bk2 (negative control). The same wired app/build without an include(:app)
+# must be scanned and rejected: a green here would mean pruning ignored the
+# settings file's module list.
+cp -r "$TMP/clean" "$TMP/module_root_settings_no_include"
+cat > "$TMP/module_root_settings_no_include/settings.gradle.kts" <<'KTS'
+rootProject.name = "fixture"
+KTS
+mkdir -p "$TMP/module_root_settings_no_include/app/build/generated/com/example"
+cat > "$TMP/module_root_settings_no_include/app/build/generated/com/example/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/module_root_settings_no_include" \
+  "settings without include(:app) scans a wired app/build (G-14)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+# 1bl. No settings file: the fallback is depth-1 only, so a depth-2
+# marker+src spoof cannot prune its build/ tree.
+cp -r "$TMP/clean" "$TMP/module_no_settings_spoof_depth2"
+mkdir -p "$TMP/module_no_settings_spoof_depth2/app/spoof/build" \
+  "$TMP/module_no_settings_spoof_depth2/app/spoof/src"
+: > "$TMP/module_no_settings_spoof_depth2/app/spoof/settings.gradle"
+: > "$TMP/module_no_settings_spoof_depth2/app/spoof/src/.keep"
+cat > "$TMP/module_no_settings_spoof_depth2/app/spoof/build/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/module_no_settings_spoof_depth2" \
+  "no-settings depth-2 marker+src spoof still scans build/ (G-14)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+# --- Stage1-fix3 round 2: whole-expression srcDir parsing (G-16) -----------
+
+for form in val file concat setlist srcslist projectfile assign; do
+  d="$TMP/main_srcdir_$form"
+  cp -r "$TMP/clean" "$d"
+  mkdir -p "$d/app/src/test/java/com/example"
+  cat > "$d/app/src/test/java/com/example/Wired.java" <<'JAVA'
+package com.example;
+class Wired { Object x = dev.librepocket.mcp.McpServer; }
+JAVA
+  case "$form" in
+    val) snippet='    val d = "src/test"
+    sourceSets.getByName("main").java.srcDir(d)' ;;
+    file) snippet='    sourceSets.getByName("main").java.srcDir(file("src/test"))' ;;
+    concat) snippet='    sourceSets.getByName("main").java.srcDir("src/" + "test")' ;;
+    setlist) snippet='    sourceSets.getByName("main").java.setSrcDirs(listOf("src/test"))' ;;
+    srcslist) snippet='    sourceSets.getByName("main").java.srcDirs(listOf("src/test"))' ;;
+    projectfile) snippet='    sourceSets.getByName("main").java.srcDir(project.file("src/test"))' ;;
+    assign) snippet='    sourceSets.getByName("main").java.srcDirs += "src/test"' ;;
+  esac
+  printf '\nandroid {\n%s\n}\n' "$snippet" >> "$d/app/build.gradle.kts"
+  expect_fail "$d" \
+    "main srcDir $form form is a test-into-production config (G-16)" \
+    "main source set adds a test/build source dir"
+done
+
+# 1bs/1bt. G-16i/j: build-dir providers and a source committed under build/.
+for form in buildvar builddir; do
+  d="$TMP/main_srcdir_$form"
+  cp -r "$TMP/clean" "$d"
+  mkdir -p "$d/app/build/gen/com/example"
+  cat > "$d/app/build/gen/com/example/Wired.java" <<'JAVA'
+package com.example;
+class Wired { Object x = dev.librepocket.mcp.McpServer; }
+JAVA
+  case "$form" in
+    buildvar) snippet='    sourceSets.getByName("main").java.srcDir("$buildDir/gen")' ;;
+    builddir) snippet='    sourceSets.getByName("main").java.srcDir(layout.buildDirectory.dir("gen"))' ;;
+  esac
+  printf '\nandroid {\n%s\n}\n' "$snippet" >> "$d/app/build.gradle.kts"
+  expect_fail "$d" \
+    "main srcDir $form resolves under the module build dir (G-16)" \
+    "main source set adds a test/build source dir"
+done
+
+# 1bv. A main srcDir expression that cannot be resolved to a safe path (an
+# arbitrary provider/lambda) fails closed with its own diagnostic.
+cp -r "$TMP/clean" "$TMP/main_srcdir_unresolvable"
+mkdir -p "$TMP/main_srcdir_unresolvable/app/src/test/java/com/example"
+cat > "$TMP/main_srcdir_unresolvable/app/src/test/java/com/example/Wired.java" <<'JAVA'
+package com.example;
+class Wired { Object x = dev.librepocket.mcp.McpServer; }
+JAVA
+cat >> "$TMP/main_srcdir_unresolvable/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir(provider { "src/test" })
+}
+KTS
+expect_fail "$TMP/main_srcdir_unresolvable" \
+  "unresolvable main srcDir fails closed (G-16)" \
+  "main source set source dir cannot be resolved to a safe path"
+
+# 1bw (positive). Legitimate custom roots; a test source set's own srcDir; and
+# a production package path that merely contains `src/test`.
+cp -r "$TMP/clean" "$TMP/main_srcdir_extra_java"
+mkdir -p "$TMP/main_srcdir_extra_java/app/extra/java/com/example"
+cat > "$TMP/main_srcdir_extra_java/app/extra/java/com/example/Clean.kt" <<'KT'
+package com.example
+internal class Clean
+KT
+cat >> "$TMP/main_srcdir_extra_java/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("extra/java")
+}
+KTS
+expect_pass "$TMP/main_srcdir_extra_java" \
+  "srcDir(extra/java) stays green (P1)"
+
+cp -r "$TMP/clean" "$TMP/main_srcdir_src_main"
+cat >> "$TMP/main_srcdir_src_main/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("src/main/java")
+}
+KTS
+expect_pass "$TMP/main_srcdir_src_main" \
+  "srcDir(src/main/java) stays green (P2)"
+
+cp -r "$TMP/clean" "$TMP/main_srcdir_test_set"
+cat >> "$TMP/main_srcdir_test_set/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("test").java.srcDir("src/test")
+}
+KTS
+expect_pass "$TMP/main_srcdir_test_set" \
+  "a test source set's own srcDir stays green (P4)"
+
+cp -r "$TMP/clean" "$TMP/main_srcdir_extra_src_test"
+mkdir -p "$TMP/main_srcdir_extra_src_test/app/extra/src/test/com/example"
+cat > "$TMP/main_srcdir_extra_src_test/app/extra/src/test/com/example/Clean.kt" <<'KT'
+package com.example
+internal class Clean
+KT
+cat >> "$TMP/main_srcdir_extra_src_test/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("extra/src/test")
+}
+KTS
+expect_pass "$TMP/main_srcdir_extra_src_test" \
+  "srcDir(extra/src/test) is a scanned production root (P5)"
+
+# 1bw2 (P5 negative). The same custom root must actually be scanned: a wired
+# file under app/extra/src/test is rejected even though its directory name
+# contains `test` (it is not `<module>/src/test*`).
+cp -r "$TMP/clean" "$TMP/main_srcdir_extra_src_test_wired"
+mkdir -p "$TMP/main_srcdir_extra_src_test_wired/app/extra/src/test/com/example"
+cat > "$TMP/main_srcdir_extra_src_test_wired/app/extra/src/test/com/example/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+cat >> "$TMP/main_srcdir_extra_src_test_wired/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("extra/src/test")
+}
+KTS
+expect_fail "$TMP/main_srcdir_extra_src_test_wired" \
+  "custom srcDir(extra/src/test) is scanned, so wired MCP fails (P5)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/main_srcdir_extra_src_testfixtures"
+mkdir -p "$TMP/main_srcdir_extra_src_testfixtures/app/extra/src/testFixtures/com/example"
+cat > "$TMP/main_srcdir_extra_src_testfixtures/app/extra/src/testFixtures/com/example/Clean.kt" <<'KT'
+package com.example
+internal class Clean
+KT
+cat >> "$TMP/main_srcdir_extra_src_testfixtures/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("extra/src/testFixtures")
+}
+KTS
+expect_pass "$TMP/main_srcdir_extra_src_testfixtures" \
+  "srcDir(extra/src/testFixtures) is a scanned production root (P6)"
+
+# 1bw3 (P6 negative). A wired file in the custom testFixtures-named root proves
+# it is scanned rather than classified as `<module>/src/test*`.
+cp -r "$TMP/clean" "$TMP/main_srcdir_extra_src_testfixtures_wired"
+mkdir -p "$TMP/main_srcdir_extra_src_testfixtures_wired/app/extra/src/testFixtures/com/example"
+cat > "$TMP/main_srcdir_extra_src_testfixtures_wired/app/extra/src/testFixtures/com/example/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+cat >> "$TMP/main_srcdir_extra_src_testfixtures_wired/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("extra/src/testFixtures")
+}
+KTS
+expect_fail "$TMP/main_srcdir_extra_src_testfixtures_wired" \
+  "custom srcDir(extra/src/testFixtures) is scanned, so wired MCP fails (P6)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/main_srcdir_package_src_test"
+mkdir -p "$TMP/main_srcdir_package_src_test/app/extra/java/com/example/src/test"
+cat > "$TMP/main_srcdir_package_src_test/app/extra/java/com/example/src/test/Clean.kt" <<'KT'
+package com.example.src.test
+internal class Clean
+KT
+cat >> "$TMP/main_srcdir_package_src_test/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("extra/java")
+}
+KTS
+expect_pass "$TMP/main_srcdir_package_src_test" \
+  "srcDir(extra/java) with a src/test package path stays green (P7)"
+
+# 1bx. P3 accepted fail-closed over-block: an explicit main srcDir under the
+# module build root (build/generated/ksp) is red because explicit build srcDirs
+# are not currently added to discovery.
+cp -r "$TMP/clean" "$TMP/main_srcdir_build_generated"
+cat >> "$TMP/main_srcdir_build_generated/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("build/generated/ksp")
+}
+KTS
+expect_fail "$TMP/main_srcdir_build_generated" \
+  "srcDir(build/generated/ksp) is an accepted fail-closed over-block (P3)" \
+  "main source set adds a test/build source dir"
+
+# --- Stage1 fix5: ancestor/pruned in-module srcDir roots (G-23) ------------
+
+for form in ancestor_src ancestor_dot ancestor_dotdot ancestor_join ancestor_file; do
+  d="$TMP/srcdir_g23_$form"
+  cp -r "$TMP/clean" "$d"
+  mkdir -p "$d/app/src/test/java/com/example"
+  cat > "$d/app/src/test/java/com/example/Wired.java" <<'JAVA'
+package com.example;
+class Wired { Object x = dev.librepocket.mcp.McpServer; }
+JAVA
+  case "$form" in
+    ancestor_src) snippet='    sourceSets.getByName("main").java.srcDir("src")' ;;
+    ancestor_dot) snippet='    sourceSets.getByName("main").java.srcDir(".")' ;;
+    ancestor_dotdot) snippet='    sourceSets.getByName("main").java.srcDir("src/main/../..")' ;;
+    ancestor_join) snippet='    sourceSets.getByName("main").java.srcDir("src" + "")' ;;
+    ancestor_file) snippet='    sourceSets.getByName("main").java.srcDir(file("."))' ;;
+  esac
+  printf '
+android {
+%s
+}
+' "$snippet" >> "$d/app/build.gradle.kts"
+  expect_fail "$d" \
+    "in-module srcDir $form is an ancestor of src/test (G-23)" \
+    "main source set adds a test/build source dir"
+done
+
+for form in gradle node_modules git; do
+  d="$TMP/srcdir_g23_pruned_$form"
+  cp -r "$TMP/clean" "$d"
+  case "$form" in
+    gradle) rel=".gradle/gen" ;;
+    node_modules) rel="node_modules/gen" ;;
+    git) rel=".git/gen" ;;
+  esac
+  mkdir -p "$d/app/$rel/com/example"
+  cat > "$d/app/$rel/com/example/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+  printf '
+android {
+    sourceSets.getByName("main").java.srcDir("%s")
+}
+' \
+    "$rel" >> "$d/app/build.gradle.kts"
+  expect_fail "$d" \
+    "srcDir($rel) is in a discovery-pruned tree (G-23)" \
+    "main source set source dir cannot be resolved to a safe path"
+done
+
+cp -r "$TMP/clean" "$TMP/srcdir_g23_controls"
+mkdir -p "$TMP/srcdir_g23_controls/app/extra/java/com/example"
+cat > "$TMP/srcdir_g23_controls/app/extra/java/com/example/Clean.kt" <<'KT'
+package com.example
+internal class Clean
+KT
+cat >> "$TMP/srcdir_g23_controls/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("src/main")
+    sourceSets.getByName("main").java.srcDir("src/main/java")
+    sourceSets.getByName("main").java.srcDir("extra/java")
+}
+KTS
+expect_pass "$TMP/srcdir_g23_controls" \
+  "src/main, src/main/java and extra/java stay safe (G-23 controls)"
+
+# --- Stage1 fix4: structural source-set context (G-18) ----------------------
+# A local variable named testMode/label inside a MAIN block must not suppress
+# the guard; a local `main` label inside a TEST block must not make it main.
+
+cp -r "$TMP/clean" "$TMP/srcdir_g18_main_apply_local_test"
+cat >> "$TMP/srcdir_g18_main_apply_local_test/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.apply {
+        val testMode = true
+        java.srcDir("src/test")
+    }
+}
+KTS
+expect_fail "$TMP/srcdir_g18_main_apply_local_test" \
+  "main apply block with local testMode still flags src/test (G-18 X1)" \
+  "main source set adds a test/build source dir"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g18_main_apply_control"
+cat >> "$TMP/srcdir_g18_main_apply_control/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.apply {
+        java.srcDir("src/test")
+    }
+}
+KTS
+expect_fail "$TMP/srcdir_g18_main_apply_control" \
+  "the same main apply block without testMode is still flagged (G-18 X1b)" \
+  "main source set adds a test/build source dir"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g18_main_block_label"
+cat >> "$TMP/srcdir_g18_main_block_label/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets {
+        main {
+            val label = "test"
+            java.srcDir("src/test")
+        }
+    }
+}
+KTS
+expect_fail "$TMP/srcdir_g18_main_block_label" \
+  "main source-set block with a local test label still flags src/test (G-18 X5)" \
+  "main source set adds a test/build source dir"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g18_test_block_label"
+cat >> "$TMP/srcdir_g18_test_block_label/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("test") {
+        val label = "main"
+        java.srcDir("src/test")
+    }
+}
+KTS
+expect_pass "$TMP/srcdir_g18_test_block_label" \
+  "test source-set block with a local main label stays green (G-18 X10)"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g18_receivers_test_sets"
+cat >> "$TMP/srcdir_g18_receivers_test_sets/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.create("testCreate") { java.srcDir("src/testCreate") }
+    sourceSets.maybeCreate("testMaybe") { java.srcDir("src/testMaybe") }
+    sourceSets.named("testNamed") { java.srcDir("src/testNamed") }
+    sourceSets["testIndex"] { java.srcDir("src/testIndex") }
+    sourceSets.testProp { java.srcDir("src/testProp") }
+    sourceSets { testBare { java.srcDir("src/testBare") } }
+    sourceSets["testDirect"].java.srcDir("src/testDirect")
+    sourceSets.testDirectProp.java.srcDir("src/testDirectProp")
+}
+KTS
+expect_pass "$TMP/srcdir_g18_receivers_test_sets" \
+  "all documented source-set receiver forms identify test sets (G-18)"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g18_main_after_nested_test"
+cat >> "$TMP/srcdir_g18_main_after_nested_test/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main") {
+        sourceSets.getByName("test") {
+            java.srcDir("src/test")
+        }
+        java.srcDir("src/test")
+    }
+}
+KTS
+expect_fail "$TMP/srcdir_g18_main_after_nested_test" \
+  "main srcDir after a nested test block is still main (G-18 window leak)" \
+  "main source set adds a test/build source dir"
+
+# --- Stage1 fix5: source-set context prefers enclosing blocks (G-24) ------
+
+mkdir -p "$TMP/srcdir_g24_wire/app/src/test/java/com/example"
+cat > "$TMP/srcdir_g24_wire/app/src/test/java/com/example/Wired.java" <<'JAVA'
+package com.example;
+class Wired { Object x = dev.librepocket.mcp.McpServer; }
+JAVA
+
+for case_name in d15 d18 d14 d17; do
+  d="$TMP/srcdir_g24_$case_name"
+  cp -r "$TMP/clean" "$d"
+  mkdir -p "$d/app/src/test/java/com/example"
+  cp "$TMP/srcdir_g24_wire/app/src/test/java/com/example/Wired.java" \
+    "$d/app/src/test/java/com/example/Wired.java"
+  case "$case_name" in
+    d15) snippet='    sourceSets.getByName("main") {
+        println(sourceSets.getByName("test").name)
+        java.srcDir("src/test")
+    }' ;;
+    d18) snippet='    sourceSets.getByName("main") {
+        println(sourceSets.named("test"))
+        java.srcDir("src/test")
+    }' ;;
+    d14) snippet='    sourceSets.getByName("main").java.apply {
+        val x = foo(sourceSets.getByName("test"))
+        srcDir("src/test")
+    }' ;;
+    d17) snippet='    println(sourceSets.getByName("test").name)
+    sourceSets.getByName("main") {
+        java.srcDir("src/test")
+    }' ;;
+  esac
+  printf '
+android {
+%s
+}
+' "$snippet" >> "$d/app/build.gradle.kts"
+  expect_fail "$d" \
+    "enclosing main block wins over an unrelated test mention ($case_name, G-24)" \
+    "main source set adds a test/build source dir"
+done
+
+for case_name in d21 d22; do
+  d="$TMP/srcdir_g24_$case_name"
+  cp -r "$TMP/clean" "$d"
+  case "$case_name" in
+    d21) snippet='    sourceSets.getByName("test") {
+        println(sourceSets.getByName("main").name)
+        java.srcDir("src/test")
+    }' ;;
+    d22) snippet='    sourceSets.getByName("test").java.apply {
+        val mainDirs = sourceSets.getByName("main").java.srcDirs
+        srcDir("src/test")
+    }' ;;
+  esac
+  printf '
+android {
+%s
+}
+' "$snippet" >> "$d/app/build.gradle.kts"
+  expect_pass "$d" \
+    "enclosing test block wins over an unrelated main mention ($case_name, G-24)"
+done
+
+cp -r "$TMP/clean" "$TMP/srcdir_g24_d1_multiline_test"
+cat >> "$TMP/srcdir_g24_d1_multiline_test/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets
+        .getByName("test")
+        .java
+        .srcDir("src/test")
+}
+KTS
+expect_pass "$TMP/srcdir_g24_d1_multiline_test" \
+  "a multi-line test receiver is still recognised (G-24 D1)"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g24_d2_multiline_main"
+cat >> "$TMP/srcdir_g24_d2_multiline_main/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets
+        .getByName("main")
+        .java
+        .srcDir("src/test")
+}
+KTS
+expect_fail "$TMP/srcdir_g24_d2_multiline_main" \
+  "a multi-line main receiver is still flagged (G-24 D2)" \
+  "main source set adds a test/build source dir"
+
+# --- Stage1 fix4: scope-aware val/var/def resolution (G-19) ----------------
+# A sibling test-block declaration must not shadow a main declaration, and a
+# declaration named srcDir is not an assignment.
+
+cp -r "$TMP/clean" "$TMP/srcdir_g19_shadowed_main_build"
+cat >> "$TMP/srcdir_g19_shadowed_main_build/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main") {
+        val gen = "build/gen"
+        java.srcDir(gen)
+    }
+    sourceSets.getByName("test") {
+        val gen = "extra/java"
+        java.srcDir(gen)
+    }
+}
+KTS
+expect_fail "$TMP/srcdir_g19_shadowed_main_build" \
+  "sibling test val does not shadow a main build val (G-19 X16)" \
+  "main source set adds a test/build source dir"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g19_shadowed_main_build_control"
+cat >> "$TMP/srcdir_g19_shadowed_main_build_control/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main") {
+        val gen = "build/gen"
+        java.srcDir(gen)
+    }
+}
+KTS
+expect_fail "$TMP/srcdir_g19_shadowed_main_build_control" \
+  "the same main build val without a shadow is correctly flagged (G-19 X16b)" \
+  "main source set adds a test/build source dir"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g19_sibling_test_dir"
+cat >> "$TMP/srcdir_g19_sibling_test_dir/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main") {
+        val d = "extra/java"
+        java.srcDir(d)
+    }
+    sourceSets.getByName("test") {
+        val d = "src/test"
+        java.srcDir(d)
+    }
+}
+KTS
+expect_pass "$TMP/srcdir_g19_sibling_test_dir" \
+  "sibling test val does not false-red a safe main val (G-19 X17)"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g19_top_level_srcdir_name"
+cat >> "$TMP/srcdir_g19_top_level_srcdir_name/app/build.gradle.kts" <<'KTS'
+
+val srcDir = "src/test"
+
+android {
+    sourceSets.getByName("test") {
+        java.srcDir(srcDir)
+    }
+}
+KTS
+expect_pass "$TMP/srcdir_g19_top_level_srcdir_name" \
+  "val named srcDir is a declaration, not an assignment (G-19 X11)"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g19_test_local_srcdir"
+cat >> "$TMP/srcdir_g19_test_local_srcdir/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("test") {
+        val srcDir = "src/test"
+        java.srcDir(srcDir)
+    }
+}
+KTS
+expect_pass "$TMP/srcdir_g19_test_local_srcdir" \
+  "test-local val named srcDir stays green (G-19 X6)"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g19_main_test_val"
+cat >> "$TMP/srcdir_g19_main_test_val/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main") {
+        val d = "src/test"
+        java.srcDir(d)
+    }
+}
+KTS
+expect_fail "$TMP/srcdir_g19_main_test_val" \
+  "main val resolving to src/test is flagged (G-19 X2)" \
+  "main source set adds a test/build source dir"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g19_named_srcDir_main"
+cat >> "$TMP/srcdir_g19_named_srcDir_main/app/build.gradle.kts" <<'KTS'
+
+val srcDir = "src/test"
+
+android {
+    sourceSets.getByName("main") {
+        java.srcDir(srcDir)
+    }
+}
+KTS
+expect_fail "$TMP/srcdir_g19_named_srcDir_main" \
+  "a val named srcDir is still resolved when used by main (G-19)" \
+  "main source set adds a test/build source dir"
+
+# --- Stage1 fix5: var/def assignments invalidate the declaration (G-25) ----
+
+for case_name in b1 b2 b3; do
+  d="$TMP/srcdir_g25_$case_name"
+  cp -r "$TMP/clean" "$d"
+  mkdir -p "$d/app/build/gen/com/example"
+  cat > "$d/app/build/gen/com/example/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+  case "$case_name" in
+    b1) snippet='    sourceSets.getByName("main") {
+        var gen = "extra/java"
+        gen = "build/gen"
+        java.srcDir(gen)
+    }' ;;
+    b2) snippet='var d = "extra/java"
+
+android {
+    sourceSets.getByName("main") {
+        d = "build/gen"
+        java.srcDir(d)
+    }
+}' ;;
+    b3) snippet='    sourceSets.getByName("main") {
+        var gen = "extra/java"
+        run {
+            gen = "build/gen"
+        }
+        java.srcDir(gen)
+    }' ;;
+  esac
+  if [ "$case_name" = "b2" ]; then
+    printf '
+%s
+' "$snippet" >> "$d/app/build.gradle.kts"
+  else
+    printf '
+android {
+%s
+}
+' "$snippet" >> "$d/app/build.gradle.kts"
+  fi
+  expect_fail "$d" \
+    "a reassigned var before srcDir fails closed ($case_name, G-25)" \
+    "main source set source dir cannot be resolved to a safe path"
+done
+
+cp -r "$TMP/clean" "$TMP/srcdir_g25_b1b_control"
+cat >> "$TMP/srcdir_g25_b1b_control/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main") {
+        var gen = "extra/java"
+        java.srcDir(gen)
+    }
+}
+KTS
+expect_pass "$TMP/srcdir_g25_b1b_control" \
+  "an unassigned var still resolves to its safe initial value (G-25 B1b)"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g25_b4_groovy_build"
+cat > "$TMP/srcdir_g25_b4_groovy_build/app/extra.gradle" <<'GRADLE'
+android {
+    sourceSets.getByName("main") {
+        def gen = "extra/java"
+        def gen = "build/gen"
+        java.srcDir(gen)
+    }
+}
+GRADLE
+expect_fail "$TMP/srcdir_g25_b4_groovy_build" \
+  "Groovy duplicate def resolves to the nearest preceding value (G-25 B4)" \
+  "main source set adds a test/build source dir"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g25_b5_groovy_safe"
+cat > "$TMP/srcdir_g25_b5_groovy_safe/app/extra.gradle" <<'GRADLE'
+android {
+    sourceSets.getByName("main") {
+        def gen = "build/gen"
+        def gen = "extra/java"
+        java.srcDir(gen)
+    }
+}
+GRADLE
+expect_pass "$TMP/srcdir_g25_b5_groovy_safe" \
+  "Groovy duplicate def nearest safe value stays green (G-25 B5)"
+
+# --- Stage1 fix5: backticked receivers (G-26) ------------------------------
+
+cp -r "$TMP/clean" "$TMP/srcdir_g26_backtick_receivers"
+cat >> "$TMP/srcdir_g26_backtick_receivers/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.`getByName`("test").java.srcDir("src/test")
+    sourceSets.`create`("testCreate").java.srcDir("src/testCreate")
+    sourceSets.`named`("testNamed").java.srcDir("src/testNamed")
+    sourceSets["testIndex"].java.srcDir("src/testIndex")
+    sourceSets.`testProp`.java.srcDir("src/testProp")
+}
+KTS
+expect_pass "$TMP/srcdir_g26_backtick_receivers" \
+  "backticked test source-set receivers stay green (G-26)"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g26_backtick_main"
+cat >> "$TMP/srcdir_g26_backtick_main/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.`getByName`("main").java.srcDir("src/test")
+}
+KTS
+expect_fail "$TMP/srcdir_g26_backtick_main" \
+  "a backticked main receiver is still flagged (G-26 D12)" \
+  "main source set adds a test/build source dir"
+
+# --- Stage1 fix5: typed srcDir declarations/parameters (G-27) --------------
+
+cp -r "$TMP/clean" "$TMP/srcdir_g27_typed_val"
+cat >> "$TMP/srcdir_g27_typed_val/app/build.gradle.kts" <<'KTS'
+
+val srcDir: String = "src/test"
+
+android {
+    sourceSets.getByName("test") {
+        java.srcDir(srcDir)
+    }
+}
+KTS
+expect_pass "$TMP/srcdir_g27_typed_val" \
+  "a typed val named srcDir is not a command-syntax call (G-27 D29)"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g27_helper_param"
+cat >> "$TMP/srcdir_g27_helper_param/app/build.gradle.kts" <<'KTS'
+
+fun copyInto(srcDir: String) {
+    println(srcDir)
+}
+KTS
+expect_pass "$TMP/srcdir_g27_helper_param" \
+  "a function parameter named srcDir is not a call (G-27 D30)"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g27_typed_val_main"
+cat >> "$TMP/srcdir_g27_typed_val_main/app/build.gradle.kts" <<'KTS'
+
+val srcDir: String = "src/test"
+
+android {
+    sourceSets.getByName("main") {
+        java.srcDir(srcDir)
+    }
+}
+KTS
+expect_fail "$TMP/srcdir_g27_typed_val_main" \
+  "a typed val used by main is still resolved and flagged (G-27 D31)" \
+  "main source set adds a test/build source dir"
+
+# --- Stage1 fix5: triple-quoted srcDir literals (G-28) ---------------------
+
+cp -r "$TMP/clean" "$TMP/srcdir_g28_triple_safe"
+cat >> "$TMP/srcdir_g28_triple_safe/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("""extra/java""")
+}
+KTS
+expect_pass "$TMP/srcdir_g28_triple_safe" \
+  "a triple-quoted safe srcDir literal stays green (G-28)"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g28_triple_test"
+cat >> "$TMP/srcdir_g28_triple_test/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("""src/test""")
+}
+KTS
+expect_fail "$TMP/srcdir_g28_triple_test" \
+  "a triple-quoted test srcDir literal is flagged for the real reason (G-28)" \
+  "main source set adds a test/build source dir"
+
+# --- Stage1 fix4: cross-module srcDir paths use module roots (G-20) --------
+# A srcDir escaping the module is resolved against settings-derived roots.
+
+# G-20 uses a real second module: `../app/...` normalizes back to the app
+# module and would only re-test the in-module rules.
+add_shared_module() {
+  local d="$1"
+  cat > "$d/settings.gradle.kts" <<'KTS'
+rootProject.name = "fixture"
+include(":app")
+include(":shared")
+KTS
+  mkdir -p "$d/shared/src/main/java/com/example"
+  cat > "$d/shared/src/main/java/com/example/Clean.kt" <<'KT'
+package com.example
+internal class Clean
+KT
+}
+
+cp -r "$TMP/clean" "$TMP/srcdir_g20_escape_test"
+add_shared_module "$TMP/srcdir_g20_escape_test"
+mkdir -p "$TMP/srcdir_g20_escape_test/shared/src/test/java/com/example"
+cat > "$TMP/srcdir_g20_escape_test/shared/src/test/java/com/example/Wired.java" <<'JAVA'
+package com.example;
+class Wired { Object x = dev.librepocket.mcp.McpServer; }
+JAVA
+cat >> "$TMP/srcdir_g20_escape_test/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("../shared/src/test")
+}
+KTS
+expect_fail "$TMP/srcdir_g20_escape_test" \
+  "../shared/src/test is another module's test tree (G-20 X3)" \
+  "main source set adds a test/build source dir"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g20_escape_build"
+add_shared_module "$TMP/srcdir_g20_escape_build"
+mkdir -p "$TMP/srcdir_g20_escape_build/shared/build/gen/com/example"
+cat > "$TMP/srcdir_g20_escape_build/shared/build/gen/com/example/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+cat >> "$TMP/srcdir_g20_escape_build/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("../shared/build/gen")
+}
+KTS
+expect_fail "$TMP/srcdir_g20_escape_build" \
+  "../shared/build/gen is another module's build tree (G-20 X4)" \
+  "main source set adds a test/build source dir"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g20_escape_testfixtures"
+add_shared_module "$TMP/srcdir_g20_escape_testfixtures"
+mkdir -p "$TMP/srcdir_g20_escape_testfixtures/shared/src/testFixtures/java/com/example"
+cat > "$TMP/srcdir_g20_escape_testfixtures/shared/src/testFixtures/java/com/example/Wired.java" <<'JAVA'
+package com.example;
+class Wired { Object x = dev.librepocket.mcp.McpServer; }
+JAVA
+cat >> "$TMP/srcdir_g20_escape_testfixtures/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("../shared/src/testFixtures")
+}
+KTS
+expect_fail "$TMP/srcdir_g20_escape_testfixtures" \
+  "../shared/src/testFixtures is another module's test tree (G-20)" \
+  "main source set adds a test/build source dir"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g20_escape_build_generated"
+add_shared_module "$TMP/srcdir_g20_escape_build_generated"
+mkdir -p "$TMP/srcdir_g20_escape_build_generated/shared/build/generated/com/example"
+cat > "$TMP/srcdir_g20_escape_build_generated/shared/build/generated/com/example/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+cat >> "$TMP/srcdir_g20_escape_build_generated/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("../shared/build/generated")
+}
+KTS
+expect_fail "$TMP/srcdir_g20_escape_build_generated" \
+  "../shared/build/generated is another module's build tree (G-20)" \
+  "main source set adds a test/build source dir"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g20_shared_main"
+add_shared_module "$TMP/srcdir_g20_shared_main"
+cat >> "$TMP/srcdir_g20_shared_main/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("../shared/src/main")
+}
+KTS
+expect_pass "$TMP/srcdir_g20_shared_main" \
+  "../shared/src/main is another module's production root (G-20)"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g20_unknown_internal"
+cat >> "$TMP/srcdir_g20_unknown_internal/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("../unknown/src/main")
+}
+KTS
+expect_fail "$TMP/srcdir_g20_unknown_internal" \
+  "repo-internal path outside known modules is unresolved (G-20)" \
+  "main source set source dir cannot be resolved to a safe path"
+
+cp -r "$TMP/clean" "$TMP/srcdir_g20_outside_repo"
+cat >> "$TMP/srcdir_g20_outside_repo/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("main").java.srcDir("../../outside/src/main")
+}
+KTS
+expect_fail "$TMP/srcdir_g20_outside_repo" \
+  "path outside the repo root is unresolved (G-20)" \
+  "main source set source dir cannot be resolved to a safe path"
+
+# --- Stage1 fix4: structural settings parsing (G-21) ----------------------
+# String contents are not settings code; non-literal/conditional/helper calls
+# make the settings file untrusted (repo-root-only pruning, fail closed).
+
+cp -r "$TMP/clean" "$TMP/settings_g21_string_include"
+cat > "$TMP/settings_g21_string_include/settings.gradle.kts" <<'KTS'
+val note = "include(':evil')"
+KTS
+mkdir -p "$TMP/settings_g21_string_include/evil/build/gen"
+cat > "$TMP/settings_g21_string_include/evil/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/settings_g21_string_include" \
+  "include text inside a string is not a settings call (G-21 XS9)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/settings_g21_string_include_control"
+cat > "$TMP/settings_g21_string_include_control/settings.gradle.kts" <<'KTS'
+val note = "include(':evil')"
+include(":app")
+KTS
+mkdir -p "$TMP/settings_g21_string_include_control/evil/build/gen"
+cat > "$TMP/settings_g21_string_include_control/evil/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/settings_g21_string_include_control" \
+  "a string include cannot hide an actually unincluded module (G-21 XS9_control)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/settings_g21_string_includebuild"
+cat > "$TMP/settings_g21_string_includebuild/settings.gradle.kts" <<'KTS'
+val note = "includeBuild('evil')"
+KTS
+mkdir -p "$TMP/settings_g21_string_includebuild/evil/build/gen"
+cat > "$TMP/settings_g21_string_includebuild/evil/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/settings_g21_string_includebuild" \
+  "includeBuild text inside a string is not a settings call (G-21 XS10)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/settings_g21_string_concat_include"
+cat > "$TMP/settings_g21_string_concat_include/settings.gradle.kts" <<'KTS'
+val note = "includeBuild(" + "'evil'" + ")"
+include(":app")
+KTS
+mkdir -p "$TMP/settings_g21_string_concat_include/evil/build/gen"
+cat > "$TMP/settings_g21_string_concat_include/evil/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/settings_g21_string_concat_include" \
+  "concatenated include text inside a string is not a call (G-21 XS11)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/settings_g21_expr_include"
+cat > "$TMP/settings_g21_expr_include/settings.gradle.kts" <<'KTS'
+include(":app".uppercase())
+KTS
+mkdir -p "$TMP/settings_g21_expr_include/app/build/gen"
+cat > "$TMP/settings_g21_expr_include/app/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/settings_g21_expr_include" \
+  "non-literal include argument disables module pruning (G-21 XS12)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/settings_g21_expr_include_control"
+cat > "$TMP/settings_g21_expr_include_control/settings.gradle.kts" <<'KTS'
+include(":APP")
+KTS
+mkdir -p "$TMP/settings_g21_expr_include_control/app/build/gen"
+cat > "$TMP/settings_g21_expr_include_control/app/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/settings_g21_expr_include_control" \
+  "include(:APP) does not prune the lowercase app module (G-21 XS12b)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/settings_g21_conditional_include"
+cat > "$TMP/settings_g21_conditional_include/settings.gradle.kts" <<'KTS'
+include(":app")
+if (false) {
+    include(":evil")
+}
+KTS
+mkdir -p "$TMP/settings_g21_conditional_include/app/build/gen"
+cat > "$TMP/settings_g21_conditional_include/app/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/settings_g21_conditional_include" \
+  "include under if(false) makes settings untrusted (G-21 XS13)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/settings_g21_conditional_true_control"
+cat > "$TMP/settings_g21_conditional_true_control/settings.gradle.kts" <<'KTS'
+include(":app")
+if (true) {
+    include(":evil")
+}
+KTS
+mkdir -p "$TMP/settings_g21_conditional_true_control/app/build/gen"
+cat > "$TMP/settings_g21_conditional_true_control/app/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/settings_g21_conditional_true_control" \
+  "conditional include cannot be trusted as top-level app pruning (G-21 XS13b)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/settings_g21_single_statement_if"
+cat > "$TMP/settings_g21_single_statement_if/settings.gradle.kts" <<'KTS'
+include(":app")
+if (false)
+    include(":evil")
+KTS
+mkdir -p "$TMP/settings_g21_single_statement_if/app/build/gen"
+cat > "$TMP/settings_g21_single_statement_if/app/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/settings_g21_single_statement_if" \
+  "single-statement if include is not a top-level include (G-21 XS15)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/settings_g21_dynamic_include"
+cat > "$TMP/settings_g21_dynamic_include/settings.gradle.kts" <<'KTS'
+val mods = listOf(":evil")
+include(mods.first())
+KTS
+mkdir -p "$TMP/settings_g21_dynamic_include/evil/build/gen"
+cat > "$TMP/settings_g21_dynamic_include/evil/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/settings_g21_dynamic_include" \
+  "dynamic include argument fails closed (G-21 XS5)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/settings_g21_helper_include"
+cat > "$TMP/settings_g21_helper_include/settings.gradle.kts" <<'KTS'
+fun helper() { include(":evil") }
+include(":app")
+KTS
+mkdir -p "$TMP/settings_g21_helper_include/evil/build/gen"
+cat > "$TMP/settings_g21_helper_include/evil/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/settings_g21_helper_include" \
+  "include inside a helper function fails closed (G-21 XS7)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/settings_g21_lambda_include"
+cat > "$TMP/settings_g21_lambda_include/settings.gradle.kts" <<'KTS'
+listOf(":evil").forEach { include(it) }
+include(":app")
+KTS
+mkdir -p "$TMP/settings_g21_lambda_include/evil/build/gen"
+cat > "$TMP/settings_g21_lambda_include/evil/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/settings_g21_lambda_include" \
+  "include inside a lambda fails closed (G-21 XS8)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/settings_g21_literal_include"
+cat > "$TMP/settings_g21_literal_include/settings.gradle.kts" <<'KTS'
+include(":app")
+KTS
+mkdir -p "$TMP/settings_g21_literal_include/app/build/gen"
+cat > "$TMP/settings_g21_literal_include/app/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_pass "$TMP/settings_g21_literal_include" \
+  "literal top-level include prunes a wired app/build (G-21 XS1)"
+
+cp -r "$TMP/clean" "$TMP/settings_g21_concat_include"
+cat > "$TMP/settings_g21_concat_include/settings.gradle.kts" <<'KTS'
+include(":" + "app")
+KTS
+mkdir -p "$TMP/settings_g21_concat_include/app/build/gen"
+cat > "$TMP/settings_g21_concat_include/app/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_pass "$TMP/settings_g21_concat_include" \
+  "literal concatenation include prunes a wired app/build (G-21 XS2)"
+
+cp -r "$TMP/clean" "$TMP/settings_g21_includebuild"
+cat > "$TMP/settings_g21_includebuild/settings.gradle.kts" <<'KTS'
+includeBuild("inc")
+KTS
+mkdir -p "$TMP/settings_g21_includebuild/inc/build/gen"
+cat > "$TMP/settings_g21_includebuild/inc/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_pass "$TMP/settings_g21_includebuild" \
+  "literal includeBuild prunes its wired build tree (G-21 XS4)"
+
+# G-21 XS6a: a non-default mapping must actually be honoured (include(":app")
+# alone would already prune <root>/app, so that does not exercise the override).
+cp -r "$TMP/clean" "$TMP/settings_g21_projectdir"
+cat > "$TMP/settings_g21_projectdir/settings.gradle.kts" <<'KTS'
+include(":renamed")
+project(":renamed").projectDir = file("modules/app")
+KTS
+mkdir -p "$TMP/settings_g21_projectdir/modules/app/build/gen"
+cat > "$TMP/settings_g21_projectdir/modules/app/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_pass "$TMP/settings_g21_projectdir" \
+  "literal projectDir override prunes a non-default wired modules/app/build (G-21 XS6a)"
+
+# The same wiring without the override must be scanned: this pins that the
+# pass above depends on the projectDir mapping, not on include(":renamed").
+cp -r "$TMP/clean" "$TMP/settings_g21_projectdir_missing"
+cat > "$TMP/settings_g21_projectdir_missing/settings.gradle.kts" <<'KTS'
+include(":renamed")
+KTS
+mkdir -p "$TMP/settings_g21_projectdir_missing/modules/app/build/gen"
+cat > "$TMP/settings_g21_projectdir_missing/modules/app/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/settings_g21_projectdir_missing" \
+  "dropping the projectDir override scans modules/app/build (G-21)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/settings_g21_projectdir_dynamic"
+cat > "$TMP/settings_g21_projectdir_dynamic/settings.gradle.kts" <<'KTS'
+include(":renamed")
+project(":renamed").projectDir = file(providers.gradleProperty("appDir").get())
+KTS
+mkdir -p "$TMP/settings_g21_projectdir_dynamic/modules/app/build/gen"
+cat > "$TMP/settings_g21_projectdir_dynamic/modules/app/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/settings_g21_projectdir_dynamic" \
+  "a dynamic projectDir override makes settings untrusted (G-21)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+# --- Stage1 fix5: Groovy command-syntax settings (G-29) -------------------
+# `include ':app'` / `includeBuild 'inc'` are valid Groovy-DSL command calls
+# and must be parsed like the parenthesised forms.
+
+cp -r "$TMP/clean" "$TMP/settings_g29_groovy_include"
+cat > "$TMP/settings_g29_groovy_include/settings.gradle" <<'GRADLE'
+rootProject.name = 'fixture'
+include ':app', ':lib'
+GRADLE
+mkdir -p "$TMP/settings_g29_groovy_include/app/build/gen"
+cat > "$TMP/settings_g29_groovy_include/app/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_pass "$TMP/settings_g29_groovy_include" \
+  "Groovy command-syntax include prunes a wired app/build (G-29)"
+
+cp -r "$TMP/clean" "$TMP/settings_g29_groovy_includebuild"
+cat > "$TMP/settings_g29_groovy_includebuild/settings.gradle" <<'GRADLE'
+rootProject.name = 'fixture'
+includeBuild 'inc'
+GRADLE
+mkdir -p "$TMP/settings_g29_groovy_includebuild/inc/build/gen"
+cat > "$TMP/settings_g29_groovy_includebuild/inc/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_pass "$TMP/settings_g29_groovy_includebuild" \
+  "Groovy command-syntax includeBuild prunes a wired inc/build (G-29)"
+
+cp -r "$TMP/clean" "$TMP/settings_g29_groovy_dynamic"
+cat > "$TMP/settings_g29_groovy_dynamic/settings.gradle" <<'GRADLE'
+rootProject.name = 'fixture'
+def mods = [':app']
+include mods.first()
+GRADLE
+mkdir -p "$TMP/settings_g29_groovy_dynamic/app/build/gen"
+cat > "$TMP/settings_g29_groovy_dynamic/app/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/settings_g29_groovy_dynamic" \
+  "Groovy command-syntax dynamic include fails closed (G-29)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/settings_g29_groovy_conditional"
+cat > "$TMP/settings_g29_groovy_conditional/settings.gradle" <<'GRADLE'
+rootProject.name = 'fixture'
+include ':app'
+if (false) include ':evil'
+GRADLE
+mkdir -p "$TMP/settings_g29_groovy_conditional/app/build/gen"
+cat > "$TMP/settings_g29_groovy_conditional/app/build/gen/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/settings_g29_groovy_conditional" \
+  "conditional command-syntax include makes settings untrusted (G-29)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+# --- Stage1 fix4: a module named build is not pruned (G-22) ----------------
+
+cp -r "$TMP/clean" "$TMP/module_g22_named_build"
+cat > "$TMP/module_g22_named_build/settings.gradle.kts" <<'KTS'
+include(":build")
+KTS
+mkdir -p "$TMP/module_g22_named_build/build/src/main"
+cat > "$TMP/module_g22_named_build/build/src/main/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/module_g22_named_build" \
+  "include(:build) keeps the build module's production sources (G-22 X18)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/module_g22_named_core"
+cat > "$TMP/module_g22_named_core/settings.gradle.kts" <<'KTS'
+include(":core")
+KTS
+mkdir -p "$TMP/module_g22_named_core/core/src/main"
+cat > "$TMP/module_g22_named_core/core/src/main/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+expect_fail "$TMP/module_g22_named_core" \
+  "include(:core) production sources are scanned (G-22 X18b)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/module_g22_no_settings_build"
+rm -f "$TMP/module_g22_no_settings_build/settings.gradle.kts"
+mkdir -p "$TMP/module_g22_no_settings_build/build/src/main"
+cat > "$TMP/module_g22_no_settings_build/build/src/main/Wired.kt" <<'KT'
+package com.example.build
+internal val server = dev.librepocket.mcp.McpServer::class
+KT
+cat > "$TMP/module_g22_no_settings_build/build/build.gradle.kts" <<'KTS'
+plugins { id("java") }
+KTS
+expect_fail "$TMP/module_g22_no_settings_build" \
+  "no-settings depth-1 module named build is scanned (G-22)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
 # 7. discovery fail-closed: no AndroidManifest*.xml anywhere
 cp -r "$TMP/clean" "$TMP/no_manifest"
 rm "$TMP/no_manifest/app/src/main/AndroidManifest.xml"
@@ -1828,6 +4067,23 @@ expect_fail "$TMP/no_in_pkg" \
   "zero in-package declarations fails closed (discovery surface)" \
   "no production source declares package dev.librepocket.mcp"
 
+# 12. discovery fail-closed: the shared helper is missing. A green gate here
+# would mean C1/C2/C3 silently stopped running.
+cp -r "$TMP/clean" "$TMP/helper_missing"
+rm "$TMP/helper_missing/scripts/mcp_scan.py"
+expect_fail "$TMP/helper_missing" \
+  "missing helper fails closed (discovery surface)" \
+  "helper scripts/mcp_scan.py missing or unreadable (fail closed)"
+
+# 12b. discovery fail-closed: the helper is syntactically broken (Python exits
+# 1). The diagnostic must name the discovery failure, not misattribute the
+# traceback as a list of source paths.
+cp -r "$TMP/clean" "$TMP/helper_broken"
+printf 'def broken(:\n' > "$TMP/helper_broken/scripts/mcp_scan.py"
+expect_fail "$TMP/helper_broken" \
+  "broken helper fails closed at discovery (not as path cascade)" \
+  "production source discovery failed (fail closed"
+
 # N8. Stage6 fix2 positive control (S2): applicationId dev.librepocket.mcpfoo
 # is a different package — the trailing boundary must keep it green.
 cp -r "$TMP/clean" "$TMP/appid_mcpfoo"
@@ -1841,7 +4097,7 @@ cp -r "$TMP/clean" "$TMP/namespace_mcpfoo"
 sed -i 's|namespace = "dev\.librepocket\.agent"|namespace = "dev.librepocket.mcpfoo"|' \
   "$TMP/namespace_mcpfoo/app/build.gradle.kts"
 expect_pass "$TMP/namespace_mcpfoo" \
-  "namespace dev.librepocket.mcpfoo is not the mcp package (S2)"
+  "namespace dev.librepocket.mcpfoo is not the mcp package (S2/N8b)"
 
 # Positive control on the real repository (not just synthetic fixtures).
 expect_pass "$ROOT" "real repository passes"

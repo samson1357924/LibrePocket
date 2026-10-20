@@ -839,6 +839,52 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '      E: intent-filter (line=4)' \\\n"
             "            '        E: action (line=5)' \\\n"
             "            '          A: android:name=\"android.net.VpnService\" (Raw: \"android.net.VpnService\")' ;;\n"
+            "        backup-decoy-child)\n"
+            "          # Reviewer probe (the decoy-child shape): the merged\n"
+            "          # <application> LOST both backup bindings while a decoy\n"
+            "          # CHILD service wears them with id values that fully\n"
+            "          # resolve through the resources table. aapt prints a\n"
+            "          # child's attributes at +4 from the application line, so\n"
+            "          # the pre-anchor text slice matched them and PASSED the\n"
+            "          # gate; the application-attr-level anchor must reject it.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: service (line=3)' \\\n"
+            "            '      A: android:name=\"decoy.Service\" (Raw: \"decoy.Service\")' \\\n"
+            "            '      A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '      A: android:dataExtractionRules(0x0101063e)=@0x7f010001' ;;\n"
+            "        backup-decoy-split)\n"
+            "          # Half the pair on the application, half on a decoy\n"
+            "          # child: one attr cannot carry the pair through the gate\n"
+            "          # - the missing application-level attr must fail with the\n"
+            "          # same \"lost the backup binding\" error.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: service (line=3)' \\\n"
+            "            '      A: android:name=\"decoy.Service\" (Raw: \"decoy.Service\")' \\\n"
+            "            '      A: android:dataExtractionRules(0x0101063e)=@0x7f010001' ;;\n"
+            "        nsc-decoy-child)\n"
+            "          # Same decoy-child vector against the networkSecurityConfig\n"
+            "          # pin: the binding attr exists ONLY on a child <service>.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    E: service (line=3)' \\\n"
+            "            '      A: android:name=\"decoy.Service\" (Raw: \"decoy.Service\")' \\\n"
+            "            '      A: android:networkSecurityConfig(0x01010527)=@0x7f010002' ;;\n"
+            "        debuggable-decoy-child)\n"
+            "          # The debuggable attr proves DEBUG NSC rules ONLY on\n"
+            "          # <application> itself: a child-borne debuggable(true)\n"
+            "          # must keep the release deny-all rules (the loopback\n"
+            "          # whitelist stays rejected under the release mode).\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: service (line=4)' \\\n"
+            "            '      A: android:name=\"decoy.Service\" (Raw: \"decoy.Service\")' \\\n"
+            "            '      A: android:debuggable(0x0101000f)=(type 0x12)0xffffffff' ;;\n"
             "        *)  # bindings (the default, realistic merged manifest)\n"
             "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
             "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
@@ -1181,6 +1227,84 @@ class ApkPolicyHarness(unittest.TestCase):
                 '    A: android:dataExtractionRules(0x0101063e)=@xml/data_extraction_rules\n',
                 lambda: "",
             )
+
+    def test_merged_backup_binding_decoy_child_rejected(self) -> None:
+        # Reviewer probe (the decoy-child repro): BOTH binding attributes
+        # live on a decoy CHILD service while <application> lost them, each
+        # id fully resolving through the resources table. aapt prints a
+        # child's attributes at +4 from the application element line, so the
+        # application-attr-level anchor (exactly +2) leaves that line nothing
+        # to match - the gate fails with the mandatory "lost the backup
+        # binding" error instead of passing a rule-less Auto Backup.
+        complete_table = (
+            "      spec resource 0x7f010000 dev.librepocket.agent:xml/backup_rules:"
+            " flags=0x00000000\n"
+            "      spec resource 0x7f010001 dev.librepocket.agent:xml/data_extraction_rules:"
+            " flags=0x00000000\n"
+        )
+        decoy_tree = (
+            "  E: application\n"
+            '    A: android:label(0x01010001)="Faux" (Raw: "Faux")\n'
+            "    E: service (line=3)\n"
+            '      A: android:name="decoy.Service" (Raw: "decoy.Service")\n'
+            "      A: android:fullBackupContent(0x010104eb)=@0x7f010000\n"
+            "      A: android:dataExtractionRules(0x0101063e)=@0x7f010001\n"
+        )
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            r"lost the backup binding android:fullBackupContent \(0x010104eb\)",
+        ):
+            policy_inspect._assert_merged_backup_bindings(decoy_tree, lambda: complete_table)
+        # Positive control: the SAME id bindings printed AT the application's
+        # own attribute level (+2, correct aapt printing) still satisfy the
+        # gate - the anchor must never mistake the legal shape for a decoy.
+        policy_inspect._assert_merged_backup_bindings(
+            "  E: application\n"
+            "    A: android:fullBackupContent(0x010104eb)=@0x7f010000\n"
+            "    A: android:dataExtractionRules(0x0101063e)=@0x7f010001\n",
+            lambda: complete_table,
+        )
+
+    def test_merged_backup_binding_half_decoy_child_rejected(self) -> None:
+        # Half the pair printed at the application attr level, half only on
+        # a decoy child: one attr cannot carry the pair through the gate.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            r"lost the backup binding android:dataExtractionRules \(0x0101063e\)",
+        ):
+            policy_inspect._assert_merged_backup_bindings(
+                "  E: application\n"
+                "    A: android:fullBackupContent(0x010104eb)=@0x7f010000\n"
+                "    E: service (line=3)\n"
+                "      A: android:dataExtractionRules(0x0101063e)=@0x7f010001\n",
+                lambda: "",
+            )
+
+    def test_merged_backup_binding_decoy_child_rejected_end_to_end(self) -> None:
+        # End-to-end reviewer probe: the fake aapt serves the decoy-child
+        # tree (bindings ONLY on a child <service>, ids resolving through
+        # the default resources table). The backup gate must reject it.
+        apk = complete_apk(
+            self.tmp / "backup-decoy-child.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, xmltree_mode="backup-decoy-child")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("merged manifest lost the backup binding", result.stdout)
+
+    def test_merged_backup_binding_half_decoy_child_rejected_end_to_end(self) -> None:
+        # End-to-end split decoy: fullBackupContent on the application,
+        # dataExtractionRules ONLY on a child; the pair cannot partially
+        # pass, so the missing application-level attr names the failure.
+        apk = complete_apk(
+            self.tmp / "backup-decoy-split.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, xmltree_mode="backup-decoy-split")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "lost the backup binding android:dataExtractionRules", result.stdout
+        )
 
     def test_merged_backup_bindings_without_application_rejected(self) -> None:
         with self.assertRaisesRegex(
@@ -1920,6 +2044,36 @@ class ApkPolicyHarness(unittest.TestCase):
                 lambda: "",
             )
 
+    def test_merged_nsc_binding_decoy_child_rejected(self) -> None:
+        # Same decoy-child vector as the backup pair: the binding attr
+        # exists ONLY on a child <service> (fully resolvable id through the
+        # resources table), so the application-attr-level anchor must fail
+        # the gate - the pre-anchor text slice matched the child line.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, "lost the network security config binding"
+        ):
+            policy_inspect._assert_merged_network_security_config(
+                "/unused/aapt",
+                self.tmp / "unused.apk",
+                "  E: application\n"
+                "    A: android:fullBackupContent(0x010104eb)=@0x7f010000\n"
+                "    E: service (line=3)\n"
+                "      A: android:networkSecurityConfig(0x01010527)=@0x7f010002\n",
+                lambda: "",
+            )
+
+    def test_merged_nsc_binding_decoy_child_rejected_end_to_end(self) -> None:
+        # End-to-end: the fake aapt serves the NSC decoy-child tree and the
+        # default resources table resolves every id; only the missing
+        # application-level binding may reject the run.
+        apk = complete_apk(
+            self.tmp / "nsc-decoy-child.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, xmltree_mode="nsc-decoy-child")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("lost the network security config binding", result.stdout)
+
     def test_merged_nsc_binding_with_wrong_printed_id_rejected(self) -> None:
         # Only the measured attr id is the binding; a printed different id is
         # not android:networkSecurityConfig at all.
@@ -1994,6 +2148,22 @@ class ApkPolicyHarness(unittest.TestCase):
             result.stdout,
         )
 
+    def test_merged_debuggable_decoy_child_keeps_release_nsc_rules(self) -> None:
+        # End-to-end decoy-child debuggable: a child <service> wearing
+        # debuggable(true) must NOT license the DEBUG-only loopback
+        # whitelist - the mode derivation is anchored at the application's
+        # own attribute level, so the compile stays under the release
+        # deny-all rules and the loopback compiled config is rejected.
+        apk = complete_apk(
+            self.tmp / "debuggable-decoy-child.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(
+            apk, xmltree_mode="debuggable-decoy-child", nsc_mode="loopback-debug"
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("fails the release network security rules", result.stdout)
+
     def test_compiled_nsc_inner_own_false_narrows_and_releases(self) -> None:
         # own="false" on the inner nested entry overrides the parent builder
         # (AOSP Builder#setCleartextTrafficPermitted), so an all-"false"
@@ -2058,6 +2228,50 @@ class ApkPolicyHarness(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertEqual(policy_inspect._network_security_mode(line), expected)
         self.assertEqual(policy_inspect._network_security_mode("  E: application"), "release")
+
+    def test_network_security_mode_ignores_decoy_child_debuggable(self) -> None:
+        # The debuggable anchor: only an ``A:`` line at the application's
+        # OWN attribute level (+2) may prove the debug face. A decoy CHILD
+        # service with debuggable(true) flips nothing - the unproven
+        # application stays on the release deny-all rules (loopback
+        # cleartext must not be unlocked by a child) - and a child-borne
+        # debuggable(false) proves nothing either way.
+        decoy_true = (
+            "  E: application\n"
+            '    A: android:label(0x01010001)="Faux" (Raw: "Faux")\n'
+            "    E: service (line=3)\n"
+            '      A: android:name="decoy.Service" (Raw: "decoy.Service")\n'
+            "      A: android:debuggable(0x0101000f)=(type 0x12)0xffffffff\n"
+        )
+        self.assertEqual(policy_inspect._network_security_mode(decoy_true), "release")
+        decoy_false = (
+            "  E: application\n"
+            "    E: service (line=3)\n"
+            "      A: android:debuggable(0x0101000f)=(type 0x12)0x0\n"
+        )
+        self.assertEqual(policy_inspect._network_security_mode(decoy_false), "release")
+        # Positive controls: debuggable TRUE (either namespace spelling) at
+        # the application attr level still proves the debug face, with the
+        # anchor self-derived from the block's own application line.
+        parent_true = (
+            "  E: application\n"
+            "    A: android:debuggable(0x0101000f)=(type 0x12)0xffffffff\n"
+            "    E: service (line=3)\n"
+            "      A: android:debuggable(0x0101000f)=(type 0x12)0x0\n"
+        )
+        self.assertEqual(policy_inspect._network_security_mode(parent_true), "debug")
+        parent_true_aapt2 = (
+            "  E: application\n"
+            "    A: http://schemas.android.com/apk/res/android:"
+            "debuggable(0x0101000f)=(type 0x12)0xffffffff\n"
+        )
+        self.assertEqual(
+            policy_inspect._network_security_mode(parent_true_aapt2), "debug"
+        )
+        # The explicit production anchor (threaded by the NSC gate from
+        # _application_manifest_block) agrees in both directions.
+        self.assertEqual(policy_inspect._network_security_mode(decoy_true, 2), "release")
+        self.assertEqual(policy_inspect._network_security_mode(parent_true, 2), "debug")
 
     def test_real_debug_apk_artifact_nsc_authority(self) -> None:
         # Live control (skipped without a real APK + real aapt): the actual

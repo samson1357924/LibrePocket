@@ -796,13 +796,21 @@ def _validate_aapt_output(aapt: str, apk: Path) -> tuple[str, str]:
     return permissions, xmltree
 
 
-def _application_manifest_block(xmltree: str) -> str:
+def _application_manifest_block(xmltree: str) -> tuple[str, int]:
     """Slice the merged <application> element's dump lines out of the tree.
 
     aapt prints one line per element/attribute with two-space indent steps
     (``  E: application``); the block ends at the next ``E:`` element line of
     the same or shallower indentation. A manifest without an application
     element cannot carry either backup binding, so absence fails closed.
+
+    Alongside the slice this returns the application element line's leading
+    whitespace length so the binding gates can anchor their ``A:`` matches at
+    the application's OWN attribute level (indent + 2, aapt's two-space
+    hierarchy step): a decoy CHILD's attributes print at indent + 4, so a
+    text search without this anchor would accept a merged ``<service>`` that
+    wears ``android:fullBackupContent`` / ``android:dataExtractionRules``
+    while the ``<application>`` itself lost both bindings.
     """
     lines = xmltree.splitlines()
     for index, line in enumerate(lines):
@@ -816,12 +824,27 @@ def _application_manifest_block(xmltree: str) -> str:
             if sibling and len(sibling.group(1)) <= len(indent):
                 end = follow
                 break
-        return "\n".join(lines[index:end])
+        return "\n".join(lines[index:end]), len(indent)
     raise PolicyError(
         "merged manifest lacks an <application> element - the backup and "
         "network security bindings cannot survive a manifest that has no "
         "application to bind"
     )
+
+
+def _application_attr_anchor(app_indent: int) -> str:
+    """Regex prefix for ``A:`` lines at the application's OWN attr level.
+
+    aapt prints every element's attributes exactly two spaces past the
+    element line (``  E: application`` / ``    A: android:...``), so the
+    application element at ``app_indent`` spaces carries its attributes at
+    ``app_indent + 2``. The exact-width quantifier (not ``\\s*``) is the
+    decoy-child anchor: a CHILD's attributes print at ``app_indent + 4`` and
+    a sibling's block is already excluded by
+    ``_application_manifest_block``, so only lines at this exact level can
+    ever satisfy the application-scoped binding gates.
+    """
+    return r"^[ ]{%d}" % (app_indent + 2)
 
 
 def _resources_table_resolves(
@@ -919,16 +942,35 @@ def _assert_merged_backup_bindings(
       * any other payload (``@xml/backup_rules;junk``, plain text, unknown
         encodings) is a raw string: the runtime never dereferences it, Auto
         Backup would run rule-less, so it fails closed here.
+
+    The matched ``A:`` line must sit at the application element's OWN
+    attribute level (``app_indent + 2`` leading spaces, aapt's two-space
+    hierarchy step). The block alone is not enough: a decoy CHILD such as
+    the merged ``<service>`` observed in the reviewer repro can carry BOTH
+    binding attributes (id values that fully resolve through the resources
+    table) while ``<application>`` lost them - its ``A:`` lines print at
+    ``app_indent + 4``, so the exact-level anchor leaves nothing for them to
+    match and the gate fails with the mandatory "lost the backup binding"
+    error.
     """
     proven_ids: list[tuple[str, str, int]] = []
     proven_names: list[tuple[str, str]] = []
-    # Scope the attribute search to the merged <application> block: a binding
-    # line on any other node must not satisfy this gate (and a manifest with
-    # no application element cannot carry the bindings at all).
-    application_block = _application_manifest_block(xmltree)
+    # Scope the attribute search to the merged <application> block AND to the
+    # application element's OWN attribute line level: aapt indents an
+    # element's attributes exactly two spaces past its element line, so the
+    # anchor is app_indent + 2, while a decoy CHILD's attributes print at
+    # app_indent + 4 - e.g. a merged <service> that wears
+    # android:fullBackupContent / android:dataExtractionRules after the
+    # merger stripped them from <application> must NOT satisfy this gate
+    # either. A binding line on any other node must not satisfy this gate
+    # (and a manifest with no application element cannot carry the bindings
+    # at all).
+    application_block, app_indent = _application_manifest_block(xmltree)
+    application_attr_anchor = _application_attr_anchor(app_indent)
     for name, resource_id, resource in _BACKUP_BINDING_ATTRS:
         match = re.search(
-            r"^\s*A:\s+(?:android:|http://schemas\.android\.com/apk/res/android:)"
+            application_attr_anchor
+            + r"A:\s+(?:android:|http://schemas\.android\.com/apk/res/android:)"
             + re.escape(name)
             + r"\(\s*"
             + re.escape(resource_id)
@@ -1195,7 +1237,7 @@ def _load_backup_rules_check() -> types.ModuleType:
     return backup_rules_check
 
 
-def _network_security_mode(application_block: str) -> str:
+def _network_security_mode(application_block: str, app_indent: int | None = None) -> str:
     """Derive the NSC rule mode from the merged manifest's debuggable attr.
 
     Measured merged-manifest encoding (real debug APK):
@@ -1204,9 +1246,31 @@ def _network_security_mode(application_block: str) -> str:
     ONLY the exact true encoding proves DEBUG mode - everything else
     (absent/false/unknown spelling) is validated with the stricter release
     deny-all rules, fail-closed against proof-by-promise.
+
+    The match is anchored at the <application> element's OWN attribute level
+    (``app_indent + 2``, exactly like the binding gates): aapt prints a CHILD
+    element's attributes at ``app_indent + 4``, so a decoy child carrying
+    android:debuggable cannot flip the mode to debug (a debug face merely
+    RELAXES the loopback cleartext rules, so an unproven surface must stay
+    on the release deny-all side). ``app_indent`` is the production anchor
+    returned by ``_application_manifest_block``; when it is omitted, the
+    anchor is self-derived from the FIRST ``E: application`` line inside the
+    block, and only a block that carries no application element line at all
+    (the direct unit-level call shape) keeps the legacy level-free match.
     """
+    indent = app_indent
+    if indent is None:
+        anchor_match = re.search(
+            r"^([ \t]*)E:\s*application\b", application_block, re.MULTILINE
+        )
+        if anchor_match is not None:
+            indent = len(anchor_match.group(1))
+    anchor = (
+        _application_attr_anchor(indent) if indent is not None else r"^\s*"
+    )
     debuggable = re.search(
-        r"^\s*A:\s+(?:android:|http://schemas\.android\.com/apk/res/android:)"
+        anchor
+        + r"A:\s+(?:android:|http://schemas\.android\.com/apk/res/android:)"
         + r"debuggable\(\s*"
         + re.escape(_DEBUGGABLE_ATTR_ID)
         + r"\s*\)=(.+)$",
@@ -1238,11 +1302,23 @@ def _assert_merged_network_security_config(
     by ``_parse_aapt_xmltree`` - a compiled-XML alias cannot differ from
     source undetected - then validated with ``scripts/nsc_check.py
     .validate_tree`` under the mode derived from ``android:debuggable``.
+
+    Both the binding ``A:`` line and the ``android:debuggable`` mode input
+    are anchored at the <application> element's OWN attribute level
+    (``app_indent + 2``, aapt's two-space hierarchy step): a decoy CHILD
+    observed in the reviewer repro can wear
+    ``android:networkSecurityConfig`` (fully resolvable through the
+    resources table) or ``android:debuggable=true`` while ``<application>``
+    itself carries neither - the child's ``A:`` lines print at
+    ``app_indent + 4``, so the exact-level anchor leaves them nothing to
+    match and the gate fails with its mandatory errors.
     """
-    application_block = _application_manifest_block(xmltree)
-    mode = _network_security_mode(application_block)
+    application_block, app_indent = _application_manifest_block(xmltree)
+    mode = _network_security_mode(application_block, app_indent)
+    application_attr_anchor = _application_attr_anchor(app_indent)
     match = re.search(
-        r"^\s*A:\s+(?:android:|http://schemas\.android\.com/apk/res/android:)"
+        application_attr_anchor
+        + r"A:\s+(?:android:|http://schemas\.android\.com/apk/res/android:)"
         + re.escape(_NETWORK_SECURITY_ATTR_NAME)
         + r"\(\s*"
         + re.escape(_NETWORK_SECURITY_ATTR_ID)

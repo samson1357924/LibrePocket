@@ -261,35 +261,112 @@ class McpEnvelopeTest {
         }
     }
 
-    @Test fun bidiC1AndLineSeparatorsPassThroughUnescaped() {
-        // S3-D01 政策邊界 pin：escapeControlUnits 轉義範圍刻意只有 C0/DEL（＋孤立
-        // surrogate）——bidi 方向控制字元 U+202E、C1（U+0085 NEL）、U+2028
-        // line separator 一律**原樣透傳**。擴大 escapeControlUnits 範圍（把 bidi
-        // 也轉義）此測即紅。
-        val original = "warn \u202eevil \u0085\u2028 x"
+    @Test fun bidiC1AndLineSeparatorsAreEscaped() {
+        // F-03 政策 pin：escapeControlUnits 除 C0/DEL／孤立 surrogate 外，亦將
+        // C1（U+0085 NEL）、U+2028 line separator 與 bidi 控制 U+202E 轉成
+        // 可見 `\uXXXX`（小寫 hex）——LS/PS/NEL 不得被行導向工具當換行、bidi 不得
+        // 重排顯示。mutation（拿掉任一類別）此測即紅。
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602," +
             "\"message\":\"warn \\u202eevil \\u0085\\u2028 x\"}}"
         try {
             McpWire.parseCall(json, null)
             fail("必須拋 McpToolFailure")
         } catch (e: McpWire.McpToolFailure) {
-            assertEquals("bidi/C1/U+2028 逐字等於原文（刻意不轉義）", original, e.message)
+            assertEquals(
+                "bidi/C1/U+2028 一律可見轉義（不得原樣透傳）",
+                "warn \\u202eevil \\u0085\\u2028 x",
+                e.message,
+            )
         }
     }
 
-    @Test fun formatOnlyMessagePassesThroughWithoutStaticFallback() {
-        // re-review NEW-01 已接受邊界 pin：FORMAT/C1/bidi 字元（U+200B 零寬空格、
-        // U+2060 word joiner、U+FEFF）既非 Kotlin isBlank() 空白、也不屬 C0/DEL——
-        // 刻意「原樣透傳、不觸發靜態 fallback」。此為文件化取捨（狀態仍 TOOL_ERROR
-        // 可辨識、不進稽核）；若日後改為「無可見字元即 fallback」，此測應翻轉。
+    @Test fun formatOnlyMessageEscapedWithoutStaticFallback() {
+        // F-03：FORMAT/零寬字元（U+200B 零寬空格、U+2060 word joiner、U+FEFF）
+        // 不再原樣透傳——轉成可見 `\uXXXX`（非 raw），但仍非 Kotlin isBlank()、
+        // 故**不觸發**靜態 fallback（狀態仍 TOOL_ERROR 可辨識、不進稽核）。
+        // mutation（把零寬字元移出轉義集合）此測即紅。
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602," +
             "\"message\":\"\\u200b\\u2060\\ufeff\"}}"
         try {
             McpWire.parseCall(json, null)
             fail("必須拋 McpToolFailure")
         } catch (e: McpWire.McpToolFailure) {
-            assertEquals("FORMAT 字元原樣透傳（不 fallback、不轉義）", "\u200b\u2060\ufeff", e.message)
+            assertEquals(
+                "FORMAT 字元轉義（非 raw、非 fallback）",
+                "\\u200b\\u2060\\ufeff",
+                e.message,
+            )
         }
+    }
+
+    @Test fun displayEscapeCoversC1SeparatorsBidiAndZeroWidth() {
+        // F-03 各類別逐一釘住（六字元小寫 `\uXXXX`；成對 surrogate 與一般
+        // Unicode 原樣）。mutation（漏掉任一 code point 類別）此測即紅。
+        // C1 控制（含 U+0085 NEL）。
+        assertEquals("\\u0080\\u0085\\u009f", McpWire.escapeControlUnits("\u0080\u0085\u009f"))
+        // 行／段落分隔。
+        assertEquals("\\u2028\\u2029", McpWire.escapeControlUnits("\u2028\u2029"))
+        // bidi 控制：U+061C／U+200E／U+200F。
+        assertEquals("\\u061c\\u200e\\u200f", McpWire.escapeControlUnits("\u061c\u200e\u200f"))
+        // bidi 嵌入／覆寫：U+202A..U+202E。
+        assertEquals(
+            "\\u202a\\u202b\\u202c\\u202d\\u202e",
+            McpWire.escapeControlUnits("\u202a\u202b\u202c\u202d\u202e"),
+        )
+        // bidi isolate：U+2066..U+2069。
+        assertEquals(
+            "\\u2066\\u2067\\u2068\\u2069",
+            McpWire.escapeControlUnits("\u2066\u2067\u2068\u2069"),
+        )
+        // 零寬／格式：U+200B..U+200D、U+2060、U+FEFF。
+        assertEquals(
+            "\\u200b\\u200c\\u200d\\u2060\\ufeff",
+            McpWire.escapeControlUnits("\u200b\u200c\u200d\u2060\ufeff"),
+        )
+        // 對照：C0/DEL 仍轉義；emoji（成對 surrogate）、CJK、重音、一般空白原樣。
+        assertEquals("\\u0000\\u001f\\u007f", McpWire.escapeControlUnits("\u0000\u001f\u007f"))
+        assertEquals("😀中文 é ", McpWire.escapeControlUnits("😀中文 é "))
+    }
+
+    @Test fun displayEscapeResidualCfStaysRawAndIsDocumented() {
+        // S2-03／R2-05 殘餘（刻意**不**納入 needsDisplayEscape）：這些 Cf 不換行、
+        // 不重排，只造成名混淆／稽核可讀性問題；若未來擴充集合，此測會紅，須同步
+        // 更新 McpWire／McpModels KDoc 與 CAPABILITY_MATRIX／THREAT_MODEL 的精確清單。
+        for (residual in listOf(
+            "\u00ad", // SOFT HYPHEN
+            "\u180e", // MONGOLIAN VOWEL SEPARATOR
+            "\u2061", "\u2064", // invisible operators
+            "\u206a", "\u206f", // deprecated format controls
+            "\ufff9", "\ufffb", // interlinear annotation
+            "\uDB40\uDC00", // tag char U+E0000（surrogate pair）
+            "\uDB40\uDC7F", // tag char U+E007F
+        )) {
+            assertEquals(
+                "殘餘 Cf 仍原樣（${Integer.toHexString(residual[0].code)}）",
+                residual,
+                McpWire.escapeControlUnits(residual),
+            )
+        }
+        assertEquals("\u00ad\u180e", McpWire.escapeControlUnits("\u00ad\u180e"))
+    }
+
+    @Test fun displayEscapeBudgetCountsExpansionAcrossCategories() {
+        // F-03 預算 pin：所有新類別的六字元轉義展開都計入 maxUnits，且截斷落在
+        // 轉義邊界（195 純字元＋6 units 放不下 → 止於 195，不留半截）。
+        for (c in listOf("\u0085", "\u2028", "\u2029", "\u202e", "\u2066", "\u200b", "\ufeff")) {
+            assertEquals(
+                "預算剩 5 < 6：止於 195（$c）",
+                "a".repeat(195),
+                McpWire.escapeControlUnits("a".repeat(195) + c, 200),
+            )
+            assertEquals(
+                "預算剩 6 = 6：完整轉義收錄（$c）",
+                "a".repeat(194) + "\\u%04x".format(c[0].code),
+                McpWire.escapeControlUnits("a".repeat(194) + c, 200),
+            )
+        }
+        // 成對 surrogate 佔 2 units（非展開）：194 + emoji 恰滿 196。
+        assertEquals("a".repeat(194) + "😀", McpWire.escapeControlUnits("a".repeat(194) + "😀", 196))
     }
 
     @Test fun escapeTruncationStopsAtEscapeBoundaryWithoutHalfEscapeOrTail() {

@@ -532,6 +532,15 @@ class McpServerSemanticsTest {
         assertEquals("short", McpWire.truncateUnits("short", 200))
     }
 
+    @Test fun truncateUnitsNonPositiveBudgetIsEmptyNotEmptyException() {
+        // RT-05：maxUnits <= 0 時舊碼 `take(0).last()` 會拋 NoSuchElementException
+        //（非 IAE，會被 server 的 broad catch 誤映射 TRANSPORT）；空預算語意＝空字串。
+        assertEquals("", McpWire.truncateUnits("x", 0))
+        assertEquals("", McpWire.truncateUnits("", 0))
+        assertEquals("", McpWire.truncateUnits("x", -1))
+        assertEquals("", McpWire.truncateUnits("", -1))
+    }
+
     @Test fun structuredContentNullIsTreatedAsAbsent() {
         // null 視為缺席（可選鍵寬容，與 nextCursor: null／isError: null 對稱）。
         // + content → 正常成功；單獨 null（無 content）→ 兩鍵皆無 → empty result 拒。

@@ -52,10 +52,16 @@ import dev.librepocket.tool.ToolDef
  *   （`switchKey("a.b","c") == switchKey("a","b.c")`）已不可能；
  * - 展示形狀＝[ToolDef.name]／[Projection.toolName]：維持
  *   `mcp.<serverId>.<toolName>`（例如 `mcp.files.search`）——**文件化契約**
- *   （wire 保留前綴 `mcp.` 兩端同政策），**不作授權用途**。誠實揭露：
+ *   （wire 保留前綴 `mcp.` 兩端同政策），**不作授權用途**。展示面的
+ *   `serverId` 與 `toolName` 皆經 [McpWire.escapeControlUnits] 消毒（C0/DEL、C1、
+ *   bidi、零寬、LS/PS → `\uXXXX`；正常名 no-op）——**身份用原文、顯示用轉義**：
+ *   授權鍵／[switchKey]／`enabledTools` 一律用原文（RT-04）。
+ *   誠實揭露：
  *   dotted serverId 下兩服的展示字串仍可能相同（如 `("a.b","c")` 與 `("a","b.c")`
- *   皆 `mcp.a.b.c`），接線時不得以展示字串反解授權對象，一律以
- *   `(config.id, toolName)` 二元組取用（現未接線，僅本包＋測試受影響）。
+ *   皆 `mcp.a.b.c`）；此外轉義**不單射**——含**原始** U+2028 的 id／toolName 與
+ *   含**字面六字元** `\u2028` 的字串會顯示成同一 `mcp.\u2028…`（R2-04／S2-04）。
+ *   兩種碰撞都僅影響顯示；接線時不得以展示字串反解授權對象，一律以
+ *   `(config.id, raw toolName)` 經 [switchKey] 取用（現未接線，僅本包＋測試受影響）。
  * 命名保留：橋接別名（`LspTools` 約定 `mcp.<serverId>.lsp…`）不得與遠端
  * `tools/list` 回傳名機械式區分，碰撞時逃逸規則待定（現未接線，僅預留）。
  */
@@ -85,7 +91,9 @@ object McpScope {
      * 與 `switchKey("a|b","c") != switchKey("a","b|c")`（皆已測）。
      * 刻意**不拒字元、不 sanitize、不設 serverId 形狀**：遠端 tool 名含 `.`／`|`
      * 是合法遠端形狀（拒了會「列出但不可用」），serverId 是既有配置值——
-     * 結構化鍵對正常輸入零失敗。
+     * 結構化鍵對正常輸入零失敗。**身份一律用原文**：`config.id` 含控制/格式
+     * 字元時本鍵仍保留原文（不得替換成顯示轉義形，否則授權身份與 `enabledTools`
+     * 錯位）；展示面另經 [McpWire.escapeControlUnits]（RT-04）。
      *
      * [toolName] 必須是 bare 名（[requireBareToolName] fail-closed）。
      *
@@ -103,10 +111,15 @@ object McpScope {
     /**
      * 展示形狀（[ToolDef.name]／[Projection.toolName]，文件化契約）：
      * `mcp.<serverId>.<toolName>`。只作展示／識別，**不作授權鍵**（授權一律經
-     * [switchKey]）；dotted serverId 下可能跨服同字串（類 KDoc 誠實揭露）。
+     * [switchKey]）；`serverId` 與 `toolName` 皆經 [McpWire.escapeControlUnits]
+     * 消毒供顯示（正常名 no-op；含 CR/LF/C1/bidi/零寬時以 `\uXXXX` 出現，不讓配置值
+     * 或遠端 `tools/list` 名注入模型可見文字或偽造日誌列／視覺偽裝，RT-04／R2-02）。
+     * dotted serverId 或轉義撞字面 `\uXXXX` 時可能跨服同字串（類 KDoc 誠實揭露；
+     * 顯示非授權真相）。
      */
     private fun qualifiedName(serverId: String, toolName: String): String =
-        "$SWITCH_PREFIX$serverId.$toolName"
+        "$SWITCH_PREFIX${McpWire.escapeControlUnits(serverId)}." +
+            McpWire.escapeControlUnits(toolName)
 
     /**
      * toolName 形狀校驗（C-02，fail-closed；違反一律 `IllegalArgumentException`）：
@@ -211,7 +224,10 @@ object McpScope {
         return ToolDef(
             // 展示形狀（文件化契約）≠ 授權鍵：name 走 qualifiedName、requiresSwitch 走 switchKey（C-04）。
             name = qualifiedName(config.id, toolName),
-            description = "Third-party MCP tool $toolName on server ${config.id} (default WRITE).",
+            // RT-04／R2-02：display 用轉義 id 與 toolName；授權身份（switchKey／isToolEnabled）
+            // 仍用原文。轉義不單射（原始 U+2028 vs 字面 `\u2028`），顯示非授權真相。
+            description = "Third-party MCP tool ${McpWire.escapeControlUnits(toolName)} on server " +
+                "${McpWire.escapeControlUnits(config.id)} (default WRITE).",
             jsonSchema = inputSchema,
             // MCP 子集無 sideEffect 宣告 → 恆 WRITE（S2-R02：呼叫端不得降級，見本函 KDoc）。
             sideEffect = SideEffect.WRITE,

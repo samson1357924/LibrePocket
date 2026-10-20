@@ -28,6 +28,15 @@ class McpScopeTest {
         }
     }
 
+    /** 顯示面不得出現的原始控制/格式字元（與 [McpWire.escapeControlUnits] 政策對應）。 */
+    private fun hasRawDisplayUnsafe(s: String): Boolean = s.any {
+        it.code < 0x20 || it.code == 0x7F || it.code in 0x80..0x9F ||
+            it.code == 0x061C || it.code == 0x200E || it.code == 0x200F ||
+            it.code in 0x202A..0x202E || it.code in 0x2066..0x2069 ||
+            it == '\u200B' || it == '\u200C' || it == '\u200D' ||
+            it == '\u2060' || it == '\uFEFF' || it == '\u2028' || it == '\u2029'
+    }
+
     @Test fun defaultSideEffectIsWrite() {
         val def = McpScope.toToolDef(open, "search")
         assertEquals(SideEffect.WRITE, def.sideEffect)
@@ -334,7 +343,12 @@ class McpScopeTest {
         // 斷言在 McpServerSemanticsTest.loneSurrogateAsymmetryScopeAllowsButCallToolRejects）。
         val lone = "a\uD800"
         assertEquals(CapabilityLevel.NATIVE, McpScope.project(open, lone).level)
-        assertEquals(McpGate.NeedConfirm("mcp.s1.a\uD800", "mcp.2|s1|a\uD800"), McpScope.check(open, lone, false))
+        // 展示面經 escapeControlUnits：孤立 surrogate 轉為字面 `\ud800`（R2-02 同政策）；
+        // 授權鍵保留原文（`switchKey` 不轉義）。
+        assertEquals(
+            McpGate.NeedConfirm("mcp.s1.a\\ud800", "mcp.2|s1|a\uD800"),
+            McpScope.check(open, lone, false),
+        )
         assertEquals("mcp.2|s1|a\uD800", McpScope.switchKey("s1", lone))
         // 對照：成對 surrogate（emoji）同樣放行（非「凡 surrogate 皆拒」）。
         assertEquals(CapabilityLevel.NATIVE, McpScope.project(open, "t😀").level)
@@ -744,5 +758,161 @@ class McpScopeTest {
         assertTrue("合法名（read_é文）原樣輸出", legal.toString().contains("name=read_é文"))
         val spaced = McpTool(serverId = "s1", name = "read_é 文", description = "d")
         assertTrue("合法名（含空白）原樣輸出", spaced.toString().contains("name=read_é 文"))
+    }
+
+    @Test fun locallyConstructedToolNameFormatCharsEscapedInAuditAndToString() {
+        // F-03/RT-03：McpTool 可由 wire 以外來源本地建構——name 含 CR/LF、C1、
+        // bidi、零寬時，auditMap()["tools"] 與 toString() 只以 `\uXXXX` 出現，
+        // 不得有裸控制/格式字元（稽核列偽造／視覺偽裝通道關閉）。
+        val badName = "a\r\n\u0085\u202e\u200b_b"
+        val tool = McpTool(serverId = "s1", name = badName, description = "d")
+        val list = McpListResult("s1", listOf(tool), McpStatus.OK, 1L)
+        val audited = (list.auditMap()["tools"] as List<*>)[0] as String
+        assertEquals("a\\u000d\\u000a\\u0085\\u202e\\u200b_b", audited)
+        assertFalse("audit tools 不得含裸控制/格式字元", hasRawDisplayUnsafe(audited))
+        val ts = tool.toString()
+        assertFalse("McpTool.toString 不得含裸控制/格式字元", hasRawDisplayUnsafe(ts))
+        assertTrue("name 以 \\uXXXX 轉義", ts.contains("name=a\\u000d\\u000a\\u0085\\u202e\\u200b_b"))
+        // 合法名 no-op（既有稽核語意不變）。
+        val legal = McpTool(serverId = "s1", name = "read_é 文", description = "d")
+        val legalAudit = (McpListResult("s1", listOf(legal), McpStatus.OK, 1L)
+            .auditMap()["tools"] as List<*>)[0]
+        assertEquals("read_é 文", legalAudit)
+        assertTrue(legal.toString().contains("name=read_é 文"))
+    }
+
+    @Test fun serverIdControlCharsEscapedInAllThreeToStrings() {
+        // F-03：三個 toString 的 serverId 一律 escapeControlUnits（本地配置值可含
+        // CR/LF/C1），與 auditMap 的 serverId 政策一致；CR/LF 不得偽造日誌列。
+        val id = "s\r\n\u0085id"
+        val tool = McpTool(serverId = id, name = "search", description = "d")
+        val list = McpListResult(id, listOf(tool), McpStatus.OK, 1L)
+        val call = McpCallResult(id, "search", McpStatus.OK, 1L)
+        for (s in listOf(tool.toString(), list.toString(), call.toString())) {
+            assertFalse("toString 不得含裸控制/格式字元", hasRawDisplayUnsafe(s))
+            assertTrue(
+                "serverId 以 \\uXXXX 轉義",
+                s.contains("serverId=s\\u000d\\u000a\\u0085id"),
+            )
+        }
+        // auditMap 同政策（既有 C0 測已釘；此處補 C1）。
+        assertEquals("s\\u000d\\u000a\\u0085id", list.auditMap()["serverId"])
+        assertEquals("s\\u000d\\u000a\\u0085id", call.auditMap()["serverId"])
+    }
+
+    @Test fun configIdEscapedOnDisplayButRawInIdentityKey() {
+        // RT-04：config.id 在模型可見展示面（ToolDef.name/description、
+        // Projection.toolName）經 escapeControlUnits；授權身份（switchKey）用原文。
+        val id = "s\r\n\u0085\u202e\u200b"
+        val cfg = McpServerConfig(id = id, baseUrl = "https://mcp.example.com")
+        val def = McpScope.toToolDef(cfg, "search")
+        assertFalse("ToolDef.name 不得含裸控制/格式字元", hasRawDisplayUnsafe(def.name))
+        assertFalse("description 不得含裸控制/格式字元", hasRawDisplayUnsafe(def.description))
+        assertTrue(def.name.contains("s\\u000d\\u000a\\u0085\\u202e\\u200b"))
+        assertTrue(def.description.contains("s\\u000d\\u000a\\u0085\\u202e\\u200b"))
+        // Projection.toolName 同 display policy。
+        val projection = McpScope.project(cfg, "search")
+        assertFalse("Projection.toolName 不得含裸控制/格式字元",
+            hasRawDisplayUnsafe(projection.toolName))
+        assertEquals(def.name, projection.toolName)
+        // 身份：switchKey 保留原文（不轉義）且仍對 (id, tool) 單射。
+        val key = McpScope.switchKey(id, "search")
+        assertEquals("mcp.${id.length}|$id|search", key)
+        assertTrue("switchKey 必須含原始 id", key.contains(id))
+        assertNotEquals("不同 id 仍不碰撞", McpScope.switchKey("s", "search"), key)
+        assertNotEquals(
+            "長度前綴維持單射（含格式字元 id）",
+            McpScope.switchKey(id, "a|b"),
+            McpScope.switchKey(id + "|a", "b"),
+        )
+        // 正常 id 完全不變。
+        assertEquals("mcp.s1.search", McpScope.toToolDef(open, "search").name)
+        assertEquals(
+            "Third-party MCP tool search on server s1 (default WRITE).",
+            McpScope.toToolDef(open, "search").description,
+        )
+        assertEquals("mcp.2|s1|search", McpScope.switchKey("s1", "search"))
+    }
+
+    @Test fun remoteToolNameEscapedOnDisplayButRawInIdentityKey() {
+        // R2-02／S2-02：遠端 toolName 在模型可見展示面（ToolDef.name／description、
+        // Projection.toolName）經 escapeControlUnits；授權身份（switchKey）用原文。
+        val cfg = McpServerConfig(id = "s1", baseUrl = "https://mcp.example.com")
+        for (tool in listOf(
+            "a\u2028b", // LS（行分隔）
+            "a\u2029b", // PS（段落分隔）
+            "a\u202eb", // RLO（bidi 重排）
+            "a\u0085b", // NEL（C1，部分工具視為換行）
+            "a\u200bb", // ZWSP（零寬）
+            "a\u2066b", // LRI（bidi isolate）
+        )) {
+            val def = McpScope.toToolDef(cfg, tool)
+            assertFalse("ToolDef.name 不得含裸控制/格式字元（$tool）",
+                hasRawDisplayUnsafe(def.name))
+            assertFalse("description 不得含裸控制/格式字元（$tool）",
+                hasRawDisplayUnsafe(def.description))
+            val projection = McpScope.project(cfg, tool)
+            assertFalse("Projection.toolName 不得含裸控制/格式字元（$tool）",
+                hasRawDisplayUnsafe(projection.toolName))
+            assertEquals(def.name, projection.toolName)
+            // 身份仍用原文：結構化 switchKey 原樣含 remote toolName。
+            val key = McpScope.switchKey("s1", tool)
+            assertEquals("mcp.2|s1|$tool", key)
+            assertTrue("switchKey 必須含原始 toolName", key.contains(tool))
+            assertEquals("requiresSwitch 必須是原始結構化鍵", key, def.annotations.requiresSwitch)
+            assertNotEquals("展示名不得當授權鍵", def.name, key)
+            // 投影／開關查找以原文鍵為準（escaped display 不參與授權）。
+            val off = McpScope.project(
+                cfg,
+                tool,
+                ProjectionContext(userSwitches = mapOf(key to false)),
+            )
+            assertEquals(CapabilityLevel.UNAVAILABLE, off.level)
+            assertEquals(DenyReason.USER_DISABLED, off.reason)
+            assertFalse(
+                "enabledTools 以原始 toolName 為鍵",
+                cfg.copy(enabledTools = mapOf(tool to false)).isToolEnabled(tool),
+            )
+            // 顯示形狀：id 正常、toolName 轉義。
+            assertTrue(def.name.startsWith("mcp.s1."))
+            assertTrue(def.name.contains(McpWire.escapeControlUnits(tool)))
+        }
+        // 合法名完全不變（no-op）。
+        assertEquals("mcp.s1.search", McpScope.toToolDef(open, "search").name)
+        assertEquals(
+            "Third-party MCP tool search on server s1 (default WRITE).",
+            McpScope.toToolDef(open, "search").description,
+        )
+        assertEquals("mcp.2|s1|search", McpScope.switchKey("s1", "search"))
+    }
+
+    @Test fun escapedDisplayCollisionIsNonAuthoritative() {
+        // R2-04／S2-04：escape 不單射——原始 U+2028 與字面六字元 `\u2028` 顯示
+        // 相同；身份（switchKey，原文＋長度前綴）仍不同且為授權唯一真相。
+        val cfg = McpServerConfig(id = "s1", baseUrl = "https://mcp.example.com")
+        val rawTool = "a\u2028b"
+        val literalTool = "a\\u2028b"
+        assertEquals(
+            "原始 U+2028 與字面 \\u2028 的展示名碰撞",
+            McpScope.toToolDef(cfg, rawTool).name,
+            McpScope.toToolDef(cfg, literalTool).name,
+        )
+        assertNotEquals(
+            "toolName 碰撞不影響授權鍵",
+            McpScope.switchKey("s1", rawTool),
+            McpScope.switchKey("s1", literalTool),
+        )
+        val rawId = "s\u2028"
+        val literalId = "s\\u2028"
+        assertEquals(
+            "原始 U+2028 與字面 \\u2028 的 id 展示名碰撞",
+            McpScope.toToolDef(cfg.copy(id = rawId), "search").name,
+            McpScope.toToolDef(cfg.copy(id = literalId), "search").name,
+        )
+        assertNotEquals(
+            "id 碰撞不影響授權鍵",
+            McpScope.switchKey(rawId, "search"),
+            McpScope.switchKey(literalId, "search"),
+        )
     }
 }

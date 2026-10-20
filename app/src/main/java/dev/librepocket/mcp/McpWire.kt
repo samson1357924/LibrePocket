@@ -201,6 +201,13 @@ internal object McpWire {
      * JSON text，但不屬本子集，一律 bad envelope；[parseList]/[parseCall] 再要求 object）、
      * 嚴格走訪、尾隨僅空白；每層重複 key（解碼後比對）拋 `mcp: duplicate key`；
      * 深度 > 64 拋 `mcp: too deep`；其餘形狀錯誤拋 `mcp: bad envelope`。
+     *
+     * 記憶體放大（RT-02，已知取捨）：raw-span DOM 對每個容器／字串節點保存
+     * `json.substring(...)`（JVM 會複製字元），深度 d 的巢狀鏈最壞保留
+     * O(body × depth) 字元——本檔上界約 64 × 64,000 ≈ 4.1M UTF-16 units 的
+     * 暫態配置。上界由 [McpTransport.RESPONSE_MAX_CHARS]（64k）與 [MAX_DEPTH]
+     * 固定，非無界；擴大 depth 或 body cap 前須重評。此為免依賴 parser 的
+     * 已知放大取捨（見 THREAT_MODEL MCP 行），不改變解析語義。
      */
     internal fun parseStrictDoc(json: String): JVal {
         if (json.length > McpTransport.RESPONSE_MAX_CHARS) {
@@ -476,11 +483,26 @@ internal object McpWire {
      * 安全端點預驗（fail-closed，供 [McpServer] 在碰 vault／發送前呼叫）。
      *
      * - 空白即拋 `mcp: blank endpoint`；
-     * - 經 [endpoint] 正規化後必須能解析為 http(s) URL，否則拋 `mcp: bad endpoint`
-     *   （解析在 userinfo 檢查之前——含 userinfo 的畸形 URL 會先得到 `mcp: bad endpoint`）；
-     * - 解析後 URL 不得含 userinfo（`user@host`／`user:pass@host`，拋
-     *   `mcp: userinfo not allowed in endpoint`）——顯示主機與實際連線主機可被
+     * - 經 [endpoint] 正規化後**只認 scheme 分隔點**：在**第一個** `:` 之後必須緊接
+     *   `//`（`<scheme>://…`），否則拋 `mcp: bad endpoint`。刻意不用
+     *   `indexOf("://")`——path／query／fragment 內的 `://` 不是 scheme 分隔點
+     *   （R2-01／S2-01：`https:/evil-host?x=://trusted.example` 曾以 attacker
+     *   可控的尾段當 authority 檢查，實際卻連線到 `evil-host`；單斜線／
+     *   scheme-only 形經 [endpoint] 正規化後亦不得 fail-open 成單標籤 host `mcp`）；
+     * - 由該分隔點起取**原始 authority**（第一個 `/`／`?`／`#` 之前；刻意不在 `\`
+     *   停下——WHATWG 以反斜線作 authority/path 分隔，必須留著檢查，否則
+     *   `https://evil.example\@trusted.example/mcp` 會以可見的 `@trusted.example`
+     *   尾段通過 userinfo 檢查而實際連線到 `evil.example`）；
+     * - 原始 authority 含 `\` 即拋 `mcp: bad endpoint`（**先於 `@` 判定**，避免
+     *   對 `\@` 形誤報 userinfo）；
+     * - 原始 authority 含 `@`（含空 userinfo `https://@host`／`https://:@host`）即拋
+     *   `mcp: userinfo not allowed in endpoint`——顯示主機與實際連線主機可被
      *   分離（貼錯／釣魚網址形），Bearer 與 arguments 會送達與使用者認知不同的主機；
+     * - 原始 authority 為空（`https://`／`https:/`／`https:`／`https:///`／
+     *   `https://?x=1`／`https://#f`，或任何未以 `<scheme>://` 開頭者）、或解析後
+     *   host 為空，一律拋 `mcp: bad endpoint`；
+     * - 經 [endpoint] 正規化後必須能解析為 http(s) URL，否則拋 `mcp: bad endpoint`；
+     * - 解析後 URL 亦不得含 userinfo（防禦深度，與原始 authority 檢查同訊息）；
      * - 僅放行 `https`，以及回環 `http`（`localhost`／`127.0.0.1`／`[::1]`，
      *   供 MockWebServer／本機開發；其餘 `http` 一律拋 `mcp: insecure endpoint`）。
      * 回傳正規化後 endpoint（可直接發送）。
@@ -488,14 +510,43 @@ internal object McpWire {
     fun requireSecureEndpoint(baseUrl: String): String {
         if (baseUrl.isBlank()) throw IllegalArgumentException("mcp: blank endpoint")
         val url = endpoint(baseUrl)
+        // 原始 authority 必須由 **scheme 分隔點**界定（R2-01／S2-01）：第一個 `:`
+        // 之後緊接 `//`，否則 path／query／fragment 內的 `://` 會被誤認為 scheme
+        // 分隔點（`https:/evil-host?x=://trusted.example` 實際連線到 `evil-host`）。
+        val schemeEnd = url.indexOf(':')
+        if (schemeEnd <= 0 || !url.startsWith("//", schemeEnd + 1)) {
+            throw IllegalArgumentException("mcp: bad endpoint")
+        }
+        val authStart = schemeEnd + 3
+        // 原始 authority：分隔點之後、第一個 `/`／`?`／`#` 之前。不在 `\` 停下——
+        // 反斜線是 WHATWG authority/path 分隔符，必須留在 authority 內檢查（F-01）。
+        var authEnd = url.length
+        for (i in authStart until url.length) {
+            val c = url[i]
+            if (c == '/' || c == '?' || c == '#') {
+                authEnd = i
+                break
+            }
+        }
+        val rawAuthority = url.substring(authStart, authEnd)
+        // 空 authority（scheme-only／`https:///`／`https://?x=1` 等）fail-closed（F-02）。
+        if (rawAuthority.isEmpty()) throw IllegalArgumentException("mcp: bad endpoint")
+        // authority 內反斜線：顯示主機與實際連線主機可被分離（F-01）。
+        // **先於 `@` 判定**：`https://evil.example\@trusted.example/mcp` 內沒有
+        // userinfo，報 `mcp: bad endpoint` 才不會誤導（R2-03）。
+        if ('\\' in rawAuthority) throw IllegalArgumentException("mcp: bad endpoint")
+        // 任何 `@`（含空 userinfo）一律拒（F-01）。
+        if ('@' in rawAuthority) {
+            throw IllegalArgumentException("mcp: userinfo not allowed in endpoint")
+        }
         val parsed = try {
             url.toHttpUrlOrNull()
         } catch (_: Exception) {
             null
         } ?: throw IllegalArgumentException("mcp: bad endpoint")
-        // userinfo（user@host／user:pass@host）拒收：顯示主機與實際連線主機可被混淆
-        // （釣魚網址形），Bearer／arguments 會送達與使用者認知不同的主機
-        //（在 scheme 檢查之前擋下；okhttp 對無 userinfo 的 URL 回空字串，故用 isNullOrEmpty）。
+        // 空 parsed host 不得 fail-open（舊路徑曾把 scheme-only 輸入解析成 host `mcp`）。
+        if (parsed.host.isEmpty()) throw IllegalArgumentException("mcp: bad endpoint")
+        // 防禦深度：原始 authority 已拒 `@`；解析後 userinfo 非空亦同訊息。
         if (parsed.username.isNotEmpty() || !parsed.password.isNullOrEmpty()) {
             throw IllegalArgumentException("mcp: userinfo not allowed in endpoint")
         }
@@ -799,10 +850,12 @@ internal object McpWire {
      *   及保留 server 範圍 −32099..−32000（見 [SERVER_ERROR_RANGE]）
      *   → 拋 [McpProtocol]（[McpServer] 映射 PROTOCOL + 計熔斷，breaker 能得知不互通）；
      * - `-32602`（invalid params）與範圍外未知碼 → 拋 [McpToolFailure]（工具級中性；
-     *   message 經 [escapeControlUnits] 消毒——C0/DEL 換成可見 `\\uXXXX` 轉義、
-     *   上限 [ERROR_MESSAGE_MAX_UNITS] UTF-16 code units（轉義/surrogate 邊界截斷，
-     *   不切 surrogate pair、不裸露 C0/DEL——bidi 方向控制字元 U+202A..U+202E、
-     *   C1（U+0085 等）、U+2028/2029 刻意不轉義，邊界見該函 KDoc）、
+     *   message 經 [escapeControlUnits] 消毒——C0/DEL、C1、U+2028/2029、bidi 控制
+     *   （U+061C／U+200E／U+200F／U+202A..U+202E／U+2066..U+2069）與零寬
+     *   （U+200B..U+200D／U+2060／U+FEFF）換成可見 `\\uXXXX` 轉義、上限
+     *   [ERROR_MESSAGE_MAX_UNITS] UTF-16 code units
+     *   （轉義/surrogate 邊界截斷，不切 surrogate pair、不裸露上述控制/格式字元；
+     *   其餘 Cf 仍原樣，屬名混淆殘餘 S2-03，邊界見該函 KDoc）、
      *   空／純空白 message 填靜態 `jsonrpc error <code>`（B-03：伺服器不得以空
      *   message 讓錯誤不可辨識；code 為本地解析整數，插值非伺服器自由文字；
      *   blank 判同時覆蓋**原始**與**消毒後**——預算截斷可把「<200 空白>x」切成
@@ -882,9 +935,11 @@ internal object McpWire {
             // 原文層 blank 判先行且涵蓋 C0 空白（TAB 等）：這類輸入直接走靜態
             // 替代、不消毒（B-03 語意「空白＝無可辨識訊息」，不產出 \u0009 之類
             // 的轉義空白充當訊息）。
-            // A-02（控制字元消毒）：非空 message 經 escapeControlUnits 把 C0/DEL
-            // 換成可見 \uXXXX 轉義（≤ERROR_MESSAGE_MAX_UNITS units、轉義邊界截斷、
-            // surrogate 安全），不裸露 C0/DEL、預算內不靜默丟字。
+            // A-02（控制/格式字元消毒）：非空 message 經 escapeControlUnits 把 C0/DEL、
+            // C1、LS/PS、bidi 控制與零寬（U+200B..U+200D／U+2060／U+FEFF）換成可見
+            // \uXXXX 轉義（≤ERROR_MESSAGE_MAX_UNITS units、轉義邊界截斷、
+            // surrogate 安全），不裸露上述字元、預算內不靜默丟字；其餘 Cf 仍原樣
+            //（名混淆殘餘 S2-03，非換行/重排通道）。
             // S3-R01（post-escape blank 防繞過）：200 units 預算截斷可能把
             //「<200 個空白>x」切成**轉義後仍純空白**的字串——對 escape 結果
             // 再判一次 blank，仍補同一靜態替代（兩分支各消毒至多一次，正常
@@ -1006,38 +1061,69 @@ internal object McpWire {
      * 避免孤立 surrogate 序列化成 U+FFFD／'?'（出站名錯字、渲染亂碼）。
      */
     internal fun truncateUnits(s: String, maxUnits: Int): String {
+        // 非正預算（RT-05）：`take(0).last()` 會拋 NoSuchElementException（非 IAE），
+        // 空預算語意就是空字串——先短路，與空輸入同結果。
+        if (maxUnits <= 0) return ""
         if (s.length <= maxUnits) return s
         val cut = s.take(maxUnits)
         return if (cut.last().isHighSurrogate()) cut.dropLast(1) else cut
     }
 
     /**
-     * 顯示消毒（Stage3 A-02 errorMessage＋A-01 稽核面 tool 欄，單一真相）：
-     * C0（U+0000..U+001F）、DEL（U+007F）與**孤立 surrogate**（未成對的 high/low，
-     * S3-D02——出站 [callBody] 對孤立 surrogate 亦 fail-closed 拒，稽核面不得
-     * 原樣放行讓日誌損壞編碼）逐一替換為**可見的六字元字面** `\\uXXXX`
-     *（小寫 hex，與 [esc] 的 C0 分支同格式）；其餘字元（含**成對** surrogate、
-     * bidi 方向控制字元 U+202A..U+202E、C1（U+0080..U+009F，如 U+0085 NEL）、
-     * U+2028/U+2029、非 BMP）原樣保留——本函轉義範圍**刻意只有** C0/DEL＋
-     * 孤立 surrogate，擴大即是政策變更（政策邊界 pin：
-     * `bidiC1AndLineSeparatorsPassThroughUnescaped`、`loneSurrogateIsEscapedNotPassthrough`）。
+     * 顯示面需轉義的字元集合（[escapeControlUnits] 單一真相）：C0、DEL、C1、
+     * 行/段落分隔、bidi 控制/isolate、零寬（U+200B–200D／U+2060／U+FEFF）。
+     * 成對 surrogate 不在此列（於 [escapeControlUnits] 另以 pair 分支原樣保留）。
+     * **非全部 `Cf`**：其餘（U+00AD、U+180E、U+2061–2064、U+206A–206F、
+     * U+FFF9–FFFB、tag U+E0000–E007F 等）仍原樣，屬名混淆殘餘（S2-03）。
+     */
+    private fun needsDisplayEscape(c: Char): Boolean = when (c.code) {
+        in 0x00..0x1F, 0x7F, in 0x80..0x9F -> true
+        0x061C, 0x200E, 0x200F, in 0x202A..0x202E, in 0x2066..0x2069 -> true
+        0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF -> true
+        0x2028, 0x2029 -> true
+        else -> false
+    }
+
+    /**
+     * 顯示消毒（Stage3 A-02 errorMessage＋A-01 稽核面，單一真相；PR #93 F-03 擴大）：
+     * 下列字元逐一替換為**可見的六字元字面** `\\uXXXX`（小寫 hex，與 [esc] 的 C0
+     * 分支同格式）：
+     * - C0（U+0000..U+001F）與 DEL（U+007F）；
+     * - **孤立 surrogate**（未成對的 high/low，S3-D02——出站 [callBody] 對孤立
+     *   surrogate 亦 fail-closed 拒，稽核面不得原樣放行讓日誌損壞編碼）；
+     * - C1 控制字元（U+0080..U+009F，含 U+0085 NEL——部分行導向工具視為換行）；
+     * - 行／段落分隔 U+2028／U+2029（JSONL/日誌工具常視為換行）；
+     * - bidi 控制／isolate（U+061C、U+200E、U+200F、U+202A..U+202E、
+     *   U+2066..U+2069——視覺重排／Trojan Source 類偽裝）；
+     * - 零寬（U+200B、U+200C、U+200D、U+2060、U+FEFF——名混淆）。
+     * 其餘字元（含**成對** surrogate／emoji、CJK、重音字元、一般空白）原樣保留。
+     * **殘餘（S2-03，誠實揭露）**：本集合**不是**全部 Unicode `Cf`——U+00AD、
+     * U+180E、U+2061–U+2064、U+206A–U+206F、U+FFF9–U+FFFB、tag 字元
+     * U+E0000–U+E007F（以及 U+115F／U+1160、U+2800、U+3164、U+FFA0 等非
+     * `Cf` 不可見填充）仍原樣輸出。它們不能換行或重排顯示（line/bidi 集合
+     * 已完整），屬**名混淆／稽核可讀性殘餘**，不是換行偽造或視覺重排通道。
      * 取捨（KDoc 文件化）：
      * - **預算內不靜默丟字**：轉義形式保留「是哪個控制字元」的診斷資訊（對照
      *   U+FFFD 替換——1:1 不展開但資訊全失，且 U+FFFD 本身語意是「解碼錯」
      *   誤導）；「預算外捨棄」（預算放不下完整六字元轉義或 surrogate pair 即止）
      *   屬截斷語意，非本條所稱的「靜默丟字」——邊界由
      *   `escapeTruncationStopsAtEscapeBoundaryWithoutHalfEscapeOrTail` pin；
-     * - **不讓裸 C0/DEL 外顯**：CR/LF 偽造稽核列、ESC 干擾終端的通道關閉
-     *   （轉義後是純可列印文字）；
+     * - **不讓上述字元裸外顯**：CR/LF/NEL/LS/PS 偽造稽核列、ESC 干擾終端、
+     *   bidi 視覺偽裝、零寬名混淆的通道關閉（轉義後是純可列印文字）；其餘 `Cf`
+     *   殘餘見上，不屬換行/重排通道（S2-03）；
      * - **不得超過 [maxUnits] 上限**（UTF-16 code units）：轉義展開**計入預算**，
      *   截斷落在轉義邊界（放不下完整六字元即止，不留半截 `\u00`）與 surrogate
      *   邊界（pair 放不下即止，不切斷代理對；孤立 surrogate 經本函只會被轉義
      *   **消除**——本函不產生新的孤立 surrogate）。
+     * 政策釘面：`bidiC1AndLineSeparatorsAreEscaped`、
+     * `formatOnlyMessageEscapedWithoutStaticFallback`、
+     * `displayEscapeCoversC1SeparatorsBidiAndZeroWidth`、
+     * `loneSurrogateIsEscapedNotPassthrough`。
      *
      * 與 [esc] 的差異（兩者不可互換）：[esc] 是**出站 JSON 編碼**（toolName 經
      * [callBody] 已先拒 C0/DEL，其 C0 分支屬防禦深度）；本函是**入站伺服器文字／
-     * 呼叫端字串的顯示消毒**（[McpCallResult.errorMessage]、auditMap/toString 的
-     * tool 欄），不產出 JSON，只保證安全呈現。
+     * 呼叫端字串的顯示消毒**（[McpCallResult.errorMessage]、`auditMap`/`toString`
+     * 的 serverId 與 tool/tools 欄），不產出 JSON，只保證安全呈現。
      *
      * @param maxUnits 預算上限；預設不設限——[McpCallResult.auditMap] 的 tool 欄
      *   對**被拒**名只轉義不截斷（呼叫端自備字串，保留完整診斷；合法名恆 ≤
@@ -1060,9 +1146,9 @@ internal object McpWire {
                     i += 2
                 }
                 // S3-D02：走到這裡的 surrogate 必為孤立（成對 high+low 已於上分支
-                // 以 i+=2 消耗——low 無前導 high、high 無後繼 low）：與 C0/DEL 同
-                // 待遇轉成 \uXXXX（計入預算）。成對 surrogate 原樣保留。
-                c.isSurrogate() || c.code < 0x20 || c.code == 0x7F -> {
+                // 以 i+=2 消耗——low 無前導 high、high 無後繼 low）：與控制/格式
+                // 字元同待遇轉成 \uXXXX（計入預算）。成對 surrogate 原樣保留。
+                c.isSurrogate() || needsDisplayEscape(c) -> {
                     val escText = "\\u%04x".format(c.code)
                     if (escText.length > budget) return sb.toString()
                     sb.append(escText)

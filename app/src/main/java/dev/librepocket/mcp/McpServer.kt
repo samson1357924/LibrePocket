@@ -1,6 +1,7 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
 import kotlinx.coroutines.CancellationException
 
@@ -21,7 +22,7 @@ import kotlinx.coroutines.CancellationException
  *   error 依 code 分類：協議/伺服器碼（-32700/-32600/-32601/-32603，及 JSON-RPC
  *   保留 server 範圍 −32099..−32000）→ PROTOCOL＋計熔斷，
  *   `-32602`/範圍外未知碼 → TOOL_ERROR 中性（message 消毒後透傳
- *   [McpCallResult.errorMessage]——C0/DEL → `\\uXXXX` 轉義、空/純空白 → 靜態
+ *   [McpCallResult.errorMessage]——C0/DEL、C1、LS/PS、bidi、零寬（U+200B–200D／U+2060／U+FEFF）→ `\\uXXXX` 轉義、空/純空白 → 靜態
  *   `jsonrpc error <code>`，見 [McpWire.parseCall]；不進稽核）；非空 `nextCursor` → PARTIAL（不回 OK 假完整）；
  *   HTTP 401/403 → UNAUTHORIZED＋**不計熔斷**（C-06：認證錯與 vault-miss／Bearer 預檢
  *   同待遇，換 key／修權限後立即恢復）、HTTP 400/404/405 → PROTOCOL＋計熔斷（非暫態配置錯；
@@ -32,7 +33,9 @@ import kotlinx.coroutines.CancellationException
  *   error 包）為中性，不重置亦不累計；協議碼與保留 server 範圍 error 包計熔斷
  *   （見上方法段）；result 兩鍵皆無屬形狀不完整 → 一律 PROTOCOL＋計熔斷
  *   （含 `isError=true` 但無內容的變體，見 [McpWire.parseCall]）；
- * - 超時：單次 15–30s（[McpTimeouts.clamp]），超時映射 TIMEOUT，不重試；
+ * - 超時：單次 15–30s（[McpTimeouts.clamp]），超時映射 TIMEOUT，不重試；OkHttp
+ *   callTimeout／HTTP-2／Okio 寫入等以 [InterruptedIOException] 呈現的超時亦同
+ *   （RT-06：catch 於一般 Exception 之前，與 [SocketTimeoutException] 同待遇）；
  * - 傳輸安全：僅放行 `https`，以及回環 `http`（測試／本機；見 [McpWire.requireSecureEndpoint]），
  *   其餘明文一律 PROTOCOL、不碰 vault、不發送、不計熔斷；
  *   傳輸層不自動跟隨 redirect（3xx 終端 → PROTOCOL + 計熔斷，
@@ -178,6 +181,12 @@ class McpServer(
             //（非 TRANSPORT——超時是暫態、可重試語義，分類應為 TIMEOUT）。
             breaker.onFailure()
             return McpListResult(config.id, emptyList(), McpStatus.TIMEOUT, elapsedMs(start))
+        } catch (_: InterruptedIOException) {
+            // RT-06：OkHttp callTimeout／HTTP-2／Okio 寫入超時以 InterruptedIOException
+            //（多為 message "timeout"）呈現；SocketTimeoutException 已於上一分支接住，
+            // 其餘超時形 IOException 同映射 TIMEOUT + 計熔斷（非 TRANSPORT）。
+            breaker.onFailure()
+            return McpListResult(config.id, emptyList(), McpStatus.TIMEOUT, elapsedMs(start))
         } catch (_: Exception) {
             breaker.onFailure()
             return McpListResult(config.id, emptyList(), McpStatus.TRANSPORT, elapsedMs(start))
@@ -314,8 +323,9 @@ class McpServer(
                 // 僅 -32602/範圍外未知碼 error 包會到此（協議碼與保留 server 範圍
                 // −32099..−32000 於 parseCall 拋 McpProtocol → 下方 IAE catch
                 // → PROTOCOL + 計熔斷）；工具級錯誤中性，不碰熔斷計數。
-                // errorMessage 為 wire 層已消毒的 message（C0/DEL → \uXXXX 轉義、
-                // 空/純空白 → 靜態 `jsonrpc error <code>`，見 McpWire.parseCall）；
+                // errorMessage 為 wire 層已消毒的 message（C0/DEL、C1、LS/PS、bidi、
+                // 零寬 U+200B–200D／U+2060／U+FEFF → \uXXXX 轉義；其餘 Cf 仍原樣，
+                // 屬名混淆殘餘 S2-03；空/純空白 → 靜態 `jsonrpc error <code>`，見 McpWire.parseCall）；
                 // 下列鉗制是防禦性 no-op（消毒後已 ≤上限，單一真相在
                 // McpWire.ERROR_MESSAGE_MAX_UNITS；不進 auditMap）。
                 breaker.onNeutral()
@@ -348,6 +358,10 @@ class McpServer(
             return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, elapsedMs(start))
         } catch (_: SocketTimeoutException) {
             // 讀/連線超時（非本層 deadline）：與本層 deadline 同待遇 → TIMEOUT + 計熔斷。
+            breaker.onFailure()
+            return McpCallResult(config.id, toolName, McpStatus.TIMEOUT, elapsedMs(start))
+        } catch (_: InterruptedIOException) {
+            // RT-06：同 listTools——callTimeout／HTTP-2／Okio 寫入超時 → TIMEOUT + 計熔斷。
             breaker.onFailure()
             return McpCallResult(config.id, toolName, McpStatus.TIMEOUT, elapsedMs(start))
         } catch (_: Exception) {

@@ -1,6 +1,7 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import java.io.InterruptedIOException
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
@@ -117,6 +118,50 @@ class McpServerAccountingTest {
             assertNotNull(got)
             assertEquals("callTool socket 超時映射 TIMEOUT", McpStatus.TIMEOUT, got!!.status)
             assertEquals(1, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    // ---- RT-06：InterruptedIOException（callTimeout／HTTP-2／Okio 寫入超時）→ TIMEOUT ----
+
+    /** 以 application interceptor 直接拋 [InterruptedIOException]（不經真實網路）。 */
+    private fun interruptedTransport(): McpTransport = McpTransport(
+        OkHttpClient.Builder()
+            .addInterceptor { throw InterruptedIOException("timeout") }
+            .build(),
+    )
+
+    @Test fun interruptedIoOnListToolsMapsToTimeoutAndCountsOneFailure() = runBlocking {
+        // RT-06：OkHttp callTimeout 等以 InterruptedIOException("timeout") 呈現——
+        // 舊碼只 catch SocketTimeoutException，會落入一般 Exception → TRANSPORT。
+        // 新碼在 generic catch 前接住 → TIMEOUT（映射正確）＋計熔斷恰一次。
+        val web = MockWebServer()
+        web.start()
+        try {
+            val breaker = McpCircuitBreaker()
+            val s = server(web, interruptedTransport(), breaker)
+            val got = withTimeoutOrNull(5_000) { s.listTools(McpTimeouts.MIN_MS) }
+            assertNotNull(got)
+            assertEquals("InterruptedIOException → TIMEOUT", McpStatus.TIMEOUT, got!!.status)
+            assertEquals("計熔斷恰一次", 1, breaker.failureCount())
+            assertEquals("interceptor 早於網路，不得發送請求", 0, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun interruptedIoOnCallToolMapsToTimeoutAndCountsOneFailure() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            val breaker = McpCircuitBreaker()
+            val s = server(web, interruptedTransport(), breaker)
+            val got = withTimeoutOrNull(5_000) { s.callTool("t", "{}", McpTimeouts.MIN_MS) }
+            assertNotNull(got)
+            assertEquals("callTool InterruptedIOException → TIMEOUT", McpStatus.TIMEOUT, got!!.status)
+            assertEquals("callTool 計熔斷恰一次", 1, breaker.failureCount())
+            assertEquals(0, web.requestCount)
         } finally {
             web.shutdown()
         }

@@ -5,6 +5,7 @@ import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okio.Buffer
@@ -542,12 +543,109 @@ class McpProtocolContractsTest {
                 // 預期 fail-closed。
             }
         }
+        // F-02：scheme-only／空 raw authority（endpoint() 正規化後已無 `://`）不得
+        // fail-open 成單標籤 host `mcp`——一律 `mcp: bad endpoint`（精確訊息）。
+        for (bad in listOf("https://", "https:/", "https:", "https:///", "https://?x=1", "https://#f")) {
+            try {
+                McpWire.requireSecureEndpoint(bad)
+                fail("空 authority 必須 fail-closed：$bad")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("空 authority 訊息：$bad", "mcp: bad endpoint", e.message)
+            }
+        }
+        // F-01：authority 內反斜線是 WHATWG 的 authority/path 分隔符——不得讓
+        // `\@trusted` 這類可見尾段繞過 userinfo 檢查（無 `@` 時亦直接 bad endpoint）。
+        for (bad in listOf("https://evil.example\\trusted.example/mcp")) {
+            try {
+                McpWire.requireSecureEndpoint(bad)
+                fail("authority 內反斜線必須拒：$bad")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("mcp: bad endpoint", e.message)
+            }
+        }
         try {
             McpWire.requireSecureEndpoint("   ")
             fail("空白必須拒絕")
         } catch (_: IllegalArgumentException) {
             // 預期。
         }
+    }
+
+    @Test fun rawAuthorityMustComeFromSchemeDelimiter() {
+        // R2-01／S2-01：authority 必須由 scheme 分隔點（第一個 `:` 後緊接 `//`）
+        // 界定。以下每個輸入經 endpoint() 正規化後，path／query／fragment 內仍有
+        // `://`；舊 `indexOf("://")` 會拿 attacker 可控尾段當 authority 檢查，
+        // 而 OkHttp 實際連到前段 host（`evil-host`／`evil`／單標籤 `mcp`）。
+        for (bad in listOf(
+            // fail-open 成 host `mcp`（F-02 類）。
+            "https://?x=://evil.example",
+            "https://#x=://evil.example",
+            "https://#://evil.example",
+            "https:?x=://evil.example",
+            "https:/?x=://evil.example",
+            "https:///?x=://evil.example",
+            "https:///?://evil.example",
+            "https://#?://evil.example",
+            "https:\\#://evil.example",
+            // 顯示/實際 host split（F-01 類）：實際 host 是前段。
+            "https:/evil-host?x=://trusted.example",
+            "https:/evil-host#://trusted.example",
+            "https:/evil/host://trusted.example",
+            "https:/evil/x?y=://trusted.example",
+            "https:\\\\evil\\x://trusted.example",
+        )) {
+            try {
+                McpWire.requireSecureEndpoint(bad)
+                fail("suffix :// 不得冒充 scheme 分隔點：$bad")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("suffix :// 訊息：$bad", "mcp: bad endpoint", e.message)
+            }
+        }
+    }
+
+    @Test fun acceptedEndpointHostIsAuthorityAfterSchemeDelimiter() {
+        // 正對照（R2-01）：合法 path／query 內的 `://` 仍須放行，且 OkHttp 採用的
+        // host 必須等於 scheme 分隔點後、第一個 `/`／`?`／`#` 前的 raw authority
+        // host——guards 檢查的位元組與實際連線目標不可分離。
+        val legit = listOf(
+            "https://trusted.example/mcp?next=://evil.example",
+            "https://trusted.example/a://b",
+            "https://trusted.example/deep/path/://x",
+            "https://mcp.example.com/a@b/mcp",
+            "https://mcp.example.com/a%40b/mcp",
+            "https://mcp.example.com/mcp?x=1#frag",
+            "http://localhost:8080/mcp",
+        )
+        for (input in legit) {
+            val out = McpWire.requireSecureEndpoint(input)
+            val schemeEnd = out.indexOf(':')
+            assertTrue("正規化後必須有 scheme：$input -> $out", schemeEnd > 0)
+            assertTrue("scheme 後必須緊接 //：$input -> $out", out.startsWith("//", schemeEnd + 1))
+            val authStart = schemeEnd + 3
+            var authEnd = out.length
+            for (i in authStart until out.length) {
+                if (out[i] == '/' || out[i] == '?' || out[i] == '#') {
+                    authEnd = i
+                    break
+                }
+            }
+            val authorityHost = out.substring(authStart, authEnd).substringBefore(':')
+            assertEquals(
+                "OkHttp host 必須等於 raw authority host：$input -> $out",
+                authorityHost,
+                out.toHttpUrl().host,
+            )
+        }
+        // 報告中的直接正對照。
+        assertEquals(
+            "trusted.example",
+            McpWire.requireSecureEndpoint("https://trusted.example/mcp?next=://evil.example")
+                .toHttpUrl().host,
+        )
+        assertEquals(
+            "trusted.example",
+            McpWire.requireSecureEndpoint("https://trusted.example/a://b").toHttpUrl().host,
+        )
     }
 
     @Test fun isLoopbackHostNegativePinsRejectLookalikes() {
@@ -596,6 +694,9 @@ class McpProtocolContractsTest {
             "http://127.0.0.1@evil.com/mcp",
             "http://user@127.0.0.1/mcp",
             "https://user%40x@evil.com/mcp",
+            // F-01：空 userinfo 亦拒（`@` 本身即可疑）。
+            "https://@evil.com/mcp",
+            "https://:@evil.com/mcp",
         )) {
             try {
                 McpWire.requireSecureEndpoint(bad)
@@ -603,6 +704,14 @@ class McpProtocolContractsTest {
             } catch (e: IllegalArgumentException) {
                 assertEquals("mcp: userinfo not allowed in endpoint", e.message)
             }
+        }
+        // R2-03：`\` 先於 `@` 判定——raw authority 內沒有 userinfo 的 `\@`
+        // 形是 `mcp: bad endpoint`（舊序誤報 userinfo；兩者皆 fail-closed）。
+        try {
+            McpWire.requireSecureEndpoint("https://evil.example\\@trusted.example/mcp")
+            fail("反斜線 authority 必須拒")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("mcp: bad endpoint", e.message)
         }
         // 無 userinfo 仍放行（bare-origin 自動補 /mcp 不變）。
         assertEquals(

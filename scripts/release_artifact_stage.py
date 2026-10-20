@@ -299,11 +299,13 @@ def _assert_stage_integrity(
 
 
 def _run_policy(flavor: str, apk: Path, *, root: Path) -> None:
-    if flavor not in ("play", "foss"):
+    if flavor not in ("play", "foss", "github"):
         return
     command = ["sh", str(root / "scripts" / "play_policy_check.sh")]
     if flavor == "foss":
         command.append("--foss")
+    elif flavor == "github":
+        command.append("--github")
     command.append(str(apk))
     result = _run(command, cwd=root, timeout_seconds=360)
     if result.returncode != 0:

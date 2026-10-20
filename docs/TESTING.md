@@ -471,6 +471,7 @@ python3 scripts/check_junit_durations.py
 # and rejected before credentials/build by the local release builder.
 scripts/play_policy_check.sh app/build/outputs/apk/play/debug/app-play-debug.apk
 scripts/play_policy_check.sh --foss app/build/outputs/apk/foss/debug/app-foss-debug.apk
+scripts/play_policy_check.sh --github app/build/outputs/apk/github/debug/app-github-debug.apk
 ```
 
 Release-acceptance helpers (Issue #12, local-only, no secrets, no publishing;

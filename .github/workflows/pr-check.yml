@@ -308,12 +308,27 @@ jobs:
             exit 1
           fi
 
-      # Fixture self-test first (D-02): proves the guard still rejects every
-      # zero-wiring bypass surface — each wiring vector (out-of-package, in-
-      # package outbound, manifest FQN + relative component, new module) and
-      # each discovery fail-closed path (no manifests / no src roots /
-      # unreadable or zero production sources) — before trusting its PASSED
-      # on this repo.
+      # Fixture self-test first (D-02): proves the guard still rejects each
+      # enumerated zero-wiring bypass surface — manifest registration parsed as
+      # XML (component element/attribute, relative basename incl. backticked
+      # Kotlin type names, entity-encoded FQN, package attribute/placeholder),
+      # gradle injection (any standalone MCP literal in a scanned gradle file;
+      # manifestPlaceholders incl. add/set/get and case-insensitive spelling,
+      # any srcFile/setSrcFile token incl. alias/.apply{} forms — AGP's real
+      # API is manifest.srcFile(...), namespace/applicationId +
+      # setNamespace/setApplicationId, incl. triple-quoted/slashy strings,
+      # Property .set/.convention/.value, comments/space normalisation, and a
+      # cross-line value after `=`; decoded Unicode escapes, gradle.properties
+      # literals and `\` continuations), package-based split (recursive Kotlin
+      # string-template lexer incl. Java text-block escapes, Java JLS Unicode
+      # escape decoding + ESC pre-scan that masks only the package header,
+      # comments/strings stripped, >1 declaration fails closed, subpackages
+      # and comment/whitespace/backtick-split declarations in-package),
+      # out-of-package references / new modules (string-aware comment
+      # stripping, backtick/space-normalised FQN), in-package imports
+      # (comment/semicolon-normalised allowlist) and FQNs, and each discovery
+      # fail-closed path (no manifests / no src roots / unreadable or zero
+      # production sources) — before trusting its PASSED on this repo.
       - name: Run docs claim check self-test
         run: |
           chmod +x scripts/test_docs_claim_check.sh

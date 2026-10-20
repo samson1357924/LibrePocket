@@ -26,11 +26,27 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `scripts/tests/test_release_artifact_verifier.py`,
 `scripts/tests/test_build_release_identity.py`,
 `.github/workflows/pr-check.yml`) outputs. `docs-guard` always runs the
-fixture self-test `scripts/test_docs_claim_check.sh` (synthetic repos for every
-zero-wiring bypass surface — each wiring vector and each discovery fail-closed
-path —, CWD-independent) followed by the static grep guard
-`scripts/docs_claim_check.sh` (no Gradle, no emulator; requires `python3` with
-PyYAML for workflow YAML validation); `pr-gate` (`always()`, needs all prior jobs) resolves a skipped Gradle
+fixture self-test `scripts/test_docs_claim_check.sh` (synthetic repos for each
+enumerated zero-wiring bypass surface — each wiring vector and each discovery
+fail-closed path —, CWD-independent) followed by the static grep + manifest XML
+parse + gradle-injection scan guard `scripts/docs_claim_check.sh` (no Gradle
+execution, no emulator; requires `python3` — stdlib `xml.etree` for the C2
+manifest/XML scan plus PyYAML for workflow YAML validation; the C2b
+gradle-injection scan decodes Unicode `\uXXXX` escapes, then reads every
+`*.gradle`/`*.gradle.kts`/`gradle.properties` found by `find` — a superset of
+tracked files, so untracked local injections also fail closed — and matches
+`manifestPlaceholders` case-insensitively (covering
+`add`/`set`/`getManifestPlaceholders`, including getter `.put`), setter
+`setNamespace`/`setApplicationId`, any `srcFile`/`setSrcFile` token
+(receiver-less/alias/`.apply {}` forms included; AGP's real API is
+`manifest.srcFile(...)`), and namespace/applicationId assignments, including
+a value on the following line, triple-quoted/slashy strings, Gradle Property
+`.set`/`.convention`/`.value` forms, and comments/space around dots. Any
+standalone MCP literal in a scanned gradle file is itself fail-closed because
+it can feed a dynamic property; `gradle.properties` logical lines are joined
+across `\` continuations before decoding. C4 uses a string-aware comment
+normaliser, so a `//` inside a URL/string cannot truncate a later FQN.
+`pr-gate` (`always()`, needs all prior jobs) resolves a skipped Gradle
 stage as pass only when the corresponding `changes` output is explicitly
 `false`, and fails closed otherwise.
 

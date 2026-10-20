@@ -39,6 +39,10 @@ import org.robolectric.annotation.Config
  *   LaunchApp 候選回顯上限、Music 空白 query builder 守衛、degraded 環境先驗證、
  *   guardedToolBuild 白名單穿透、USER_DISABLED 矩陣擴充；(b) 的 `<queries>` 釘選
  *   併入 SOUND_SETTINGS 條目。
+ * - Phase 4 review 修復批次（P2×2＋P3＋NIT）：calendar update/delete 的
+ *   NEED_PERMISSION 話術授權分流（fallbackUpdate/fallbackDelete 按原因碼）、
+ *   navigation 空白三段話術逐字 pin、LaunchApp single-fuzzy auto-launch pin、
+ *   回顯 cap 的 literal 32/64 絕對值斷言。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
@@ -824,9 +828,12 @@ class IntentAdapterStage1Test {
     assertEquals(ReasonCodes.NEED_PERMISSION, writeDenied.reasonCode)
   }
 
-  @Test fun calendar_noApp_needPermissionMessage_matchesFallback() {
-    // 無 App 的 NEED_PERMISSION 話術應與 NoHandler 用手動降級話術一致，
-    // 且必須含「手動」與原因碼（直接斷言，避免只與 fallback 相對比較）。
+  @Test fun calendar_noApp_needPermissionMessage_matchesPermissionBranch() {
+    // 無 App 的 NEED_PERMISSION 話術走授權分流（P2 修復釘選）：靜態無系統
+    // 日曆 App 時「開啟日曆 App」是明知不可行的指引（insert 的 UNAVAILABLE
+    // 分支同一論證，CalendarTool KDoc #14/#15 決策）——話術必須與
+    // fallbackUpdate/fallbackDelete 的 NEED_PERMISSION 分支逐字一致
+    //（授權語句），且不得再含「開啟日曆 App」。
     val noApp = env.copy(hasCalendarApp = false)
     val u = CalendarTool.executeUpdate(
       CalendarTool.UpdateParams(eventId = "7", title = "例會"), noApp,
@@ -836,15 +843,40 @@ class IntentAdapterStage1Test {
       CalendarTool.fallbackUpdate(CalendarTool.UpdateParams(eventId = "7", title = "例會"), ReasonCodes.NEED_PERMISSION).userMessage,
       u.message,
     )
-    assertTrue(u.message, "手動" in u.message)
+    assertTrue(u.message, "需要你允許日曆權限" in u.message)
     assertTrue(u.message, "（${ReasonCodes.NEED_PERMISSION}）" in u.message)
+    assertFalse("靜態無 App 不得再指引開啟日曆 App", u.message.contains("開啟日曆 App"))
     val d = CalendarTool.executeDelete(CalendarTool.DeleteParams("9"), noApp, IntentLauncher { LaunchResult.Success })
     assertEquals(
       CalendarTool.fallbackDelete(CalendarTool.DeleteParams("9"), ReasonCodes.NEED_PERMISSION).userMessage,
       d.message,
     )
-    assertTrue(d.message, "手動" in d.message)
+    assertTrue(d.message, "需要你允許日曆權限" in d.message)
     assertTrue(d.message, "（${ReasonCodes.NEED_PERMISSION}）" in d.message)
+    assertFalse("靜態無 App 不得再指引開啟日曆 App", d.message.contains("開啟日曆 App"))
+  }
+
+  @Test fun calendar_discoveredNoHandler_updateDelete_manualMessage_matchesFallback() {
+    // 分流契約的另一側（P2 修復釘選）：發現式缺席（靜態有 App、發射時無
+    // 處理者）保留手動日曆話術（App 極可能仍在、僅對我方不可見）——話術與
+    // fallbackUpdate/fallbackDelete 的 NO_HANDLER 分支逐字一致，含「開啟日曆 App」。
+    val noHandler = IntentLauncher { LaunchResult.NoHandler }
+    val u = CalendarTool.executeUpdate(
+      CalendarTool.UpdateParams(eventId = "7", title = "例會"), env, noHandler,
+    )
+    assertEquals(
+      CalendarTool.fallbackUpdate(CalendarTool.UpdateParams(eventId = "7", title = "例會"), ReasonCodes.NO_HANDLER).userMessage,
+      u.message,
+    )
+    assertTrue(u.message, "手動在系統日曆編輯" in u.message)
+    assertTrue(u.message, "開啟日曆 App 修改後儲存" in u.message)
+    val d = CalendarTool.executeDelete(CalendarTool.DeleteParams("9"), env, noHandler)
+    assertEquals(
+      CalendarTool.fallbackDelete(CalendarTool.DeleteParams("9"), ReasonCodes.NO_HANDLER).userMessage,
+      d.message,
+    )
+    assertTrue(d.message, "手動在系統日曆刪除" in d.message)
+    assertTrue(d.message, "開啟日曆 App 長按刪除" in d.message)
   }
 
   @Test fun calendar_checkDelete_delegatesToCheckUpdate() {
@@ -1061,6 +1093,13 @@ class IntentAdapterStage1Test {
     assertEquals(ReasonCodes.NEED_CLARIFICATION, r.reasonCode)
     assertNull(r.spec)
     assertFalse("空白目的地不得發射 intent", called)
+    // 三段話術模板逐字 pin（P3 修復：補「→ 可替代 Y」中段，比照 MusicTool
+    // 空白 query 同模板——澄清不只問，也指到手動替代）。
+    assertEquals(
+      "導航去哪裡（${ReasonCodes.NEED_CLARIFICATION}）？" +
+        "→ 可替代在地圖 App 手動輸入目的地 → 需要你說出目的地（地名或座標）",
+      r.message,
+    )
   }
 
   @Test fun launcher_deleteSpec_rejectsWithInternal_evenWhenResolved() {
@@ -1176,6 +1215,12 @@ class IntentAdapterStage1Test {
     assertFalse(d.message, big.take(cap + 1) in d.message)
     assertEquals(IntentActions.DELETE, d.spec?.action)
     assertEquals("${CalendarTool.EVENTS_CONTENT_URI}/$big", d.spec?.dataUri)
+    // 絕對值斷言（防常量漂移自應綠）：回顯段長度恰為 literal 64——cap==cap 的
+    // 相對斷言在 MAX_EVENT_ID_ECHO_LEN 改值後仍綠，此逐字長度 pin 必紅。
+    for ((side, msg) in listOf("update" to u.message, "delete" to d.message)) {
+      val echoed = msg.substringAfter("「").substringBefore("」")
+      assertEquals("eventId 回顯長度須為 literal 64（$side）", 64, echoed.length)
+    }
   }
 
   @Test fun navigation_queryLabelLength_bounds() {
@@ -1342,6 +1387,11 @@ class IntentAdapterStage1Test {
     assertEquals(ReasonCodes.NO_HANDLER, fb.reasonCode)
     assertTrue(fb.userMessage, "「${long.take(cap)}」" in fb.userMessage)
     assertFalse(fb.userMessage, long.take(cap + 1) in fb.userMessage)
+    // 絕對值斷言（防常量漂移自應綠）：query 回顯段長度恰為 literal 32。
+    for ((side, msg) in listOf("execute" to r.message, "fallback" to fb.userMessage)) {
+      val echoed = msg.substringAfter("「").substringBefore("」")
+      assertEquals("query 回顯長度須為 literal 32（$side）", 32, echoed.length)
+    }
   }
 
   // ---- l. Phase 4 增補：LaunchApp 候選回顯上限、Music 空白守衛、degraded 先驗證 ----
@@ -1373,6 +1423,14 @@ class IntentAdapterStage1Test {
     assertFalse(r.message, "x".repeat(cap + 1) in r.message)
     assertFalse(r.message, long1 in r.message)
     assertFalse(r.message, long2 in r.message)
+    // 絕對值斷言（防常量漂移自應綠）：候選截斷後同構（long1/long2 前 64 字元皆
+    // 全 x，'y' 被截掉）——候選段逐字＝64 x、分隔符、64 x（literal cap 64 以
+    // 總形狀 pin，cap 改值時必紅）。
+    assertEquals(
+      "候選回顯逐字＝64x＋«、»＋64x",
+      "x".repeat(64) + "、" + "x".repeat(64),
+      r.message.substringAfter("→ 可替代候選：").substringBefore(" → 需要你選一個"),
+    )
     // execute 話術與 fallback 同模板（F4c 契約，逐字 pin）。
     assertEquals(LaunchAppTool.fallback(LaunchAppTool.Params("x"), e).userMessage, r.message)
   }

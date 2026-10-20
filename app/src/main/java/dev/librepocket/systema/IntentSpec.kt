@@ -47,7 +47,10 @@ sealed interface IntentExtra {
  * 以本 helper 讀必填 extra（缺參/錯型明確拋錯，禁預設猜測執行，#19）。
  * 未來 dispatcher 必須在呼叫 parse 側包 try-catch（ISE/IAE），收斂為
  * `ToolResult(INTERNAL)`，不得讓異常穿透生產迴圈；builder 側同形收斂統一以
- * [guardedToolBuild] 實作（見各工具 execute）。
+ * [guardedToolBuild] 實作（見各工具 execute）。dispatcher 接線分型決策：
+ * builder 範圍違規（hour=25／越界座標／超長欄位）語義屬澄清族訊息，接線 PR
+ * 時可分流為 NEED_CLARIFICATION；本層（接線前 PR）一律保留 INTERNAL
+ * fail-closed。
  */
 inline fun <reified T : IntentExtra> Map<String, IntentExtra>.requireExtra(key: String): T {
   val v = this[key]
@@ -225,7 +228,10 @@ private fun ToolResult.tagInternalCause(cause: Throwable): ToolResult =
  * 自持，形狀不變）；`CancellationException` 照拋（取消語義不得吞；CE 繼承
  * ISE，與 [guardedToolBuild] 統一為「先 CE → 再 IAE/ISE」形狀）。現行採用：
  * [NavigationTool.fallback]、[MusicTool.fallback]
- * 的 play 分支；新增 fallback 若會構建 intent，必須經此收斂。
+ * 的 play 分支；新增 fallback 若會構建 intent，必須經此收斂。豁免註記（常量
+ * 構建不可拋）：無 builder 守衛可違反的純常量 IntentSpec（如
+ * [VolumeTool.volumePanelSpec] 的音量面板 spec）可豁免不包裝——本 guard 的
+ * 範圍是「呼叫可拋守衛的 builder」，意圖守衛常量不在此列。
  */
 internal inline fun <T> guardedFallbackAlternative(builder: () -> T): T? =
   try {

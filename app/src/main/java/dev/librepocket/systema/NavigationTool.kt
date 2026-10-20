@@ -14,9 +14,9 @@ import java.net.URLEncoder
  *   真機 handler E2E 仍 UNVERIFIED。
  * - query 形狀為刻意近似：`geo:lat,lng?q=label` 非官式合成
  *   `geo:0,0?q=lat,lng(label)`（括號需轉義）；多數地圖 App 以「座標＋搜尋詞」
- *   語意照收，保守起見保留現行形狀並以測試鎖定。座標存在時 q 來源優先序為
- *   label → query（空白 label 時以非空 query 補位，理由見 [buildGeoIntent]
- *   註解；禁靜默縮減合法輸入）。
+ *   語意照收，保守起見保留現行形狀並以測試鎖定。兩分支（座標存在／無座標）
+ *   的 q 來源優先序皆為 label → query（空白 label 時以非空 query 補位，理由
+ *   見 [buildGeoIntent] 註解；禁靜默縮減合法輸入）。
  * - query/label 長度上限（[MAX_QUERY_LEN]=500，間隔註記見 IntentSpec KDoc 長度
  *   政策）為本層自訂 Binder 傳輸防禦（官方契約無此上限）：兩個 builder 端
  *   fail-closed 拒絕，越界經 [execute] 收斂 INTERNAL；上限以**編碼前欄位長度**
@@ -75,7 +75,17 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
       val q = if (params.label.isNotBlank()) params.label else params.query
       if (q.isNotBlank()) "$base?q=${encode(q)}" else base
     } else {
-      "geo:0,0?q=${encode(params.query)}"
+      // q 來源優先序（無座標時）：label → query——與座標分支**同一優先序**
+      //（label 非空即採用：label 是地圖搜尋的地名語意；與 [buildWebIntent]
+      // 的 query 優先差異為刻意決策——web 是句子查詢，q 取整句；geo 的 q
+      // 是地圖搜尋詞，label 即地名）。兩分支同一契約：禁靜默縮減合法輸入
+      //（label-only 舊行為會丟 label 發射空 q 的無意義查詢）。
+      // 兩者皆空白時不造空 q：fail-fast IAE，經 [guardedToolBuild] 收斂
+      // INTERNAL——[execute] 的空白前置守衛先攔（NEED_CLARIFICATION），
+      // 此 INTERNAL 分支不可達屬故意縱深（與座標分支「裸座標不造空 q」同向）。
+      val q = params.label.ifBlank { params.query }
+      require(q.isNotBlank()) { "query/label must not both be blank" }
+      "geo:0,0?q=${encode(q)}"
     }
     return IntentSpec(action = IntentActions.VIEW, dataUri = data)
   }
@@ -95,6 +105,12 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
         "${params.latitude},${params.longitude}"
       else -> ""
     }
+    // 兩者皆空白且無座標時不造空查詢 URL（`?query=` 空搜尋對使用者毫無意義，
+    // 禁靜默組空查詢）：fail-fast IAE，經 [guardedToolBuild] 收斂 INTERNAL——
+    // [execute] 的空白前置守衛先攔（NEED_CLARIFICATION），此 INTERNAL 分支
+    // 不可達屬故意縱深、直呼 builder 才及（與 [buildGeoIntent] 無座標分支的
+    // all-blank require 同式樣同訊息）。
+    require(q.isNotBlank()) { "query/label must not both be blank" }
     return IntentSpec(
       action = IntentActions.VIEW,
       dataUri = "https://www.openstreetmap.org/search?query=${encode(q)}",
@@ -117,7 +133,10 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
     ) {
       return ToolResult(
         false, false, null, ReasonCodes.NEED_CLARIFICATION,
-        "導航去哪裡（${ReasonCodes.NEED_CLARIFICATION}）？→ 需要你說出目的地（地名或座標）",
+        // 三段話術模板（FallbackSpec KDoc 形狀；比照 MusicTool 空白 query 的
+        // 「→ 可替代 Y」中段——澄清不只問，也指到手動替代）。
+        "導航去哪裡（${ReasonCodes.NEED_CLARIFICATION}）？→ 可替代在地圖 App 手動輸入目的地" +
+          " → 需要你說出目的地（地名或座標）",
       )
     }
     // fail-closed：resolve 的座標守衛 IAE（單側座標/越界）收斂為 INTERNAL，不穿透

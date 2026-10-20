@@ -104,12 +104,18 @@ object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
     QUERY_WHITELIST[q]?.let { pkg ->
       return LaunchResolution.Single(pkg, launchSpec(pkg))
     }
-    // 模糊：別名或包名包含查詢子串 → 候選澄清（上限 5 個，排序穩定）。
+    // 模糊：別名或包名包含查詢子串 → 候選（上限 5 個，distinct 保持穩定順序：
+    // 排序來源＝白名單別名/包名子串命中在前、可見包子串命中在後）。
     val candidates = (QUERY_WHITELIST.entries
       .filter { (alias, pkg) -> alias.contains(q) || pkg.lowercase().contains(q) }
       .map { it.value } +
       visiblePackages.filter { it.lowercase().contains(q) })
       .distinct().take(5)
+    // single-fuzzy auto-launch 決策（成文）：**唯一模糊命中即採用**——子串
+    // 訊號已排除第二解釋（唯一候選即最可能目標），launch_app 的 descriptor 為
+    // READ 級開啟、誤啟動風險已記錄且可撤銷，不再等一輪澄清；不精確命中
+    //（≥2 候選）→ clarify 條件清單（話術回顯經 [MAX_CANDIDATE_ECHO_LEN] 截斷，
+    // spec/比對仍以完整值運行）；零命中 → Unknown（禁猜包名）。
     return when {
       candidates.size == 1 ->
         LaunchResolution.Single(candidates.single(), launchSpec(candidates.single()))

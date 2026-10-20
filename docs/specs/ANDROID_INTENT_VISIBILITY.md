@@ -42,7 +42,7 @@
 | `android.intent.action.SET_ALARM` | `AlarmTool` | 執行期 Intent 無 data，action-only 即可匹配時鐘 App 過濾器 |
 | `android.intent.action.INSERT` + `mimeType vnd.android.cursor.dir/event` | `CalendarTool.buildInsertIntent` | 以 `CalendarContract.Events.CONTENT_TYPE`（dir/event）匹配日曆 App 過濾器 |
 | `android.intent.action.EDIT` + `mimeType vnd.android.cursor.item/event` | `CalendarTool.buildEditIntent` | 以 `CalendarContract.Events.CONTENT_ITEM_TYPE`（item/event）匹配；mimeType 常量與 queries 條目精確對應（pin：`IntentAdapterStage1Test` 的字面 cross-check） |
-| `android.intent.action.VIEW` + `scheme geo` | `NavigationTool`（網頁地圖查詢） | scheme-only 條目 |
+| `android.intent.action.VIEW` + `scheme geo` | `NavigationTool`（地圖 App，本機 geo intent） | scheme-only 條目 |
 | `android.intent.action.VIEW` + `scheme https` | `MusicTool`（網頁搜尋）與 `NavigationTool`（網頁地圖） | scheme-only 條目 |
 | `android.settings.SOUND_SETTINGS` | `VolumeTool` 降級取系統音量面板（打不開 AudioManager 的替代） | 同 targetSdk 36 過濾，未宣告時與 geo/https 同形矛盾 |
 

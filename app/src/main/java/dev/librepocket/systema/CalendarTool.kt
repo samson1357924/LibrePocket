@@ -14,6 +14,10 @@ package dev.librepocket.systema
  *   （免 `WRITE_CALENDAR`）；無系統日曆 App 時純側僅回待寫描述
  *  （ok=false + usedFallback=true，NEED_PERMISSION），由端側持
  *   `WRITE_CALENDAR` 再調 ContentResolver 直寫（[checkUpdate]/[checkDelete] 斷言）。
+ *   話術按原因碼分流（[fallbackUpdate]/[fallbackDelete]）：NEED_PERMISSION
+ *  （靜態無 App）→ 授權語句（無 App 可開，「開啟日曆 App」是明知不可行的
+ *   指引，與上方 UNAVAILABLE 分支同一論證）；NO_HANDLER（發現式缺席）→
+ *   保留手動日曆話術。
  * - 三風味皆允許；Play 需申報日曆權限 + 用途披露。
  * - 可見性（#14）：主 manifest `<queries>` 已宣告 INSERT（dir/event）/EDIT
  *   （item/event）；API 30+ 無宣告時 `resolveActivity` 被過濾為 null。
@@ -218,7 +222,9 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
     return EventParams(title, begin, end, location, description)
   }
 
-  /** Provider 查詢的 content URI + selection 摘要（純側；端側再拼 Cursor）。 */
+  /** Provider 查詢的 content URI + selection 摘要（**測試建模用途**，同
+   *  [MusicTool.buildPlayIntent] 的註記式樣：純側摘要方便斷言形狀；生產讀側
+   *  由端側依此組 Cursor 直查，新呼叫方禁無腦透傳為查詢入口）。 */
   fun buildQueryDescriptor(params: QueryParams): Pair<String, String> {
     val uri = "$EVENTS_CONTENT_URI?start=${params.startMillis}&end=${params.endMillis}"
     val selection = "dtstart>=? AND dtend<=?"
@@ -392,22 +398,42 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
   )
 
   /**
-   * 改事件降級（S1-C）：一律手動替代，引用原因碼。
+   * 改事件降級（S1-C）：話術按 [reasonCode] 分流（P2 修復）——
+   * - [ReasonCodes.NEED_PERMISSION]（靜態無系統日曆 App 的待寫路徑）：此域
+   *   已知無日曆 App 可開（與建事件 UNAVAILABLE 分支拒給手動話術同一論證，
+   *   見類 KDoc #14/#15 決策）——「開啟日曆 App」是明知不可行的指引，改授權
+   *   語句：授權日曆寫入後由端側持權直接寫入。
+   * - [ReasonCodes.NO_HANDLER]（發現式缺席：靜態有 App 但發射時無處理者）：
+   *   保留手動日曆話術（App 極可能仍在、僅對我方不可見，見類 KDoc）；
+   *   其它原因碼（USER_DISABLED 等）走 else 段同形渲染。
    * eventId 回顯經 [MAX_EVENT_ID_ECHO_LEN] 截斷（話術有界；spec/URI 不受影響）。
    */
   fun fallbackUpdate(params: UpdateParams, reasonCode: String): FallbackSpec = FallbackSpec(
     reasonCode = reasonCode,
-    userMessage = "做不到更新事件「${params.eventId.take(MAX_EVENT_ID_ECHO_LEN)}」（$reasonCode）" +
-      "→ 可替代手動在系統日曆編輯 → 需要你開啟日曆 App 修改後儲存",
+    userMessage = when (reasonCode) {
+      ReasonCodes.NEED_PERMISSION ->
+        "做不到更新事件「${params.eventId.take(MAX_EVENT_ID_ECHO_LEN)}」（$reasonCode）" +
+          "→ 可替代：授權日曆寫入後由本 App 直接寫入 → 需要你允許日曆權限"
+      else ->
+        "做不到更新事件「${params.eventId.take(MAX_EVENT_ID_ECHO_LEN)}」（$reasonCode）" +
+          "→ 可替代手動在系統日曆編輯 → 需要你開啟日曆 App 修改後儲存"
+    },
   )
 
   /**
-   * 刪事件降級（S1-C）：一律手動替代，引用原因碼。
+   * 刪事件降級（S1-C）：與 [fallbackUpdate] 同一原因碼分流（NEED_PERMISSION
+   * → 授權語句；NO_HANDLER → 手動日曆話術；理由見該函式 KDoc）。
    * eventId 回顯經 [MAX_EVENT_ID_ECHO_LEN] 截斷（話術有界；spec/URI 不受影響）。
    */
   fun fallbackDelete(params: DeleteParams, reasonCode: String): FallbackSpec = FallbackSpec(
     reasonCode = reasonCode,
-    userMessage = "做不到刪除事件「${params.eventId.take(MAX_EVENT_ID_ECHO_LEN)}」（$reasonCode）" +
-      "→ 可替代手動在系統日曆刪除 → 需要你開啟日曆 App 長按刪除",
+    userMessage = when (reasonCode) {
+      ReasonCodes.NEED_PERMISSION ->
+        "做不到刪除事件「${params.eventId.take(MAX_EVENT_ID_ECHO_LEN)}」（$reasonCode）" +
+          "→ 可替代：授權日曆寫入後由本 App 直接寫入 → 需要你允許日曆權限"
+      else ->
+        "做不到刪除事件「${params.eventId.take(MAX_EVENT_ID_ECHO_LEN)}」（$reasonCode）" +
+          "→ 可替代手動在系統日曆刪除 → 需要你開啟日曆 App 長按刪除"
+    },
   )
 }

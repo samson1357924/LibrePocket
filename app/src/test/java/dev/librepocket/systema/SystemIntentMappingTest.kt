@@ -114,6 +114,24 @@ class SystemIntentMappingTest {
     assertEquals(ReasonCodes.NEED_CLARIFICATION, exec.reasonCode)
   }
 
+  @Test fun launchApp_fuzzySingleHit_autoLaunches() {
+    // single-fuzzy auto-launch 決策 pin（成文見 LaunchAppTool.resolve 註解）：
+    // fuzzy **唯一**命中即採用（子串訊號已排除第二解釋；誤啟動風險已記錄，
+    // 不等一輪澄清）；「music」≥2 候選才澄清（上一案反向控制）。
+    // "spotif" 非精確別名/包名（走 fuzzy 分支）：alias「spotify」與可見包
+    // com.spotify.music 皆含該子串，distinct 後唯一候選 → Single。
+    val r = LaunchAppTool.resolve("spotif", fullEnv.installedPackages)
+    assertTrue(r is LaunchAppTool.LaunchResolution.Single)
+    assertEquals(
+      "com.spotify.music",
+      (r as LaunchAppTool.LaunchResolution.Single).packageName,
+    )
+    // 執行面同釘選：唯一模糊命中經 execute 直達啟動（非 NEED_CLARIFICATION）。
+    val exec = LaunchAppTool.execute(LaunchAppTool.Params("spotif"), fullEnv, okLauncher)
+    assertTrue(exec.ok)
+    assertEquals(IntentActions.MAIN, exec.spec?.action)
+  }
+
   @Test fun launchApp_unknown_fallsBack() {
     val r = LaunchAppTool.resolve("不存在的AppXYZ", fullEnv.installedPackages)
     assertTrue(r is LaunchAppTool.LaunchResolution.Unknown)

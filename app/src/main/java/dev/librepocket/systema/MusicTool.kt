@@ -26,7 +26,7 @@ package dev.librepocket.systema
  *   現 keyCode extra 冒充官方契約。
  * - 前台要求：實際播放必須跑在前台服務（`FOREGROUND_SERVICE_MEDIA_PLAYBACK`
  *   + 常駐通知），否則後台會被系統回收；本層僅建模，端側強制。
- * - 模糊目標（如「放點輕音樂」）不猜包名：先澄清或走預設播放器。
+ * - 模糊目標（如「放點輕音樂」）不猜包名：先澄清或走 YT Music 網頁搜尋。
  * - [buildPlayIntent] 的 `targetPackage` 參數為**測試建模**用途（純映射方便
  *   斷言 extras/flags）；生產**不傳**（OEM/播放器包名各異，本層不代選 app，
  *   與 manifest 「直啟不採用 setPackage」註記一致）——新呼叫方禁無腦透傳。
@@ -67,7 +67,7 @@ object MusicTool : SystemTool<MusicTool.Params> {
     return if (env.hasMusicApp) {
       CheckResult.native("媒體 Intent 可用（前台 MediaSession）")
     } else {
-      CheckResult.degraded(ReasonCodes.NO_HANDLER, "無播放器，降級開啟預設播放器頁")
+      CheckResult.degraded(ReasonCodes.NO_HANDLER, "無播放器，降級走 YT Music 網頁搜尋")
     }
   }
 
@@ -85,6 +85,9 @@ object MusicTool : SystemTool<MusicTool.Params> {
     )
   }
 
+  /** 鍵碼查表的純映射（**測試建模用途**，同 [buildPlayIntent] 的 `targetPackage`
+   *  註記式樣：純映射方便斷言鍵碼；生產構建走 [buildControlIntent]，呼叫方
+   *  禁把本函式當作構建入口）。 */
   fun buildControl(control: Control): ControlSpec {
     // 鍵碼查表缺項以 ISE 快速失敗（可被 [guardedToolBuild] 收斂為 INTERNAL），
     // 而非讓穿透性的 NoSuchElementException（guard 不可捕）漏出生產迴圈；
@@ -133,7 +136,16 @@ object MusicTool : SystemTool<MusicTool.Params> {
         LaunchResult.NoHandler -> ToolResult(
           false, true, spec, ReasonCodes.NO_HANDLER, fallback(params, env).userMessage,
         )
-        else -> launched.toToolResult(spec, "控制播放")
+        // Success/Internal 走共用收斂：control 與 play 沿用**同一降級真相**——
+        // 主前提是 launcher 語意（MEDIA_BUTTON 無 activity handler）：發射
+        //「成功」不可能是真實控制；播放器可見性（靜態無播放器的 check
+        // DEGRADED）為次、同向成立，故 usedFallbackOnSuccess/successReason
+        // 沿用 play 路徑同一參數形狀（成功分支攜 NO_HANDLER 標記；NATIVE
+        // 下不生效，兩分支禁漂移）。
+        else -> launched.toToolResult(
+          spec, "控制播放",
+          usedFallbackOnSuccess = !env.hasMusicApp, successReason = check.reasonCode,
+        )
       }
     }
     if (params.query.isBlank()) {

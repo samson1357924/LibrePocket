@@ -18,6 +18,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows
 import org.robolectric.annotation.Config
+import java.net.URLEncoder
 
 /**
  * D2：typed extras / flags allowlist / resolve 失敗分型（Robolectric + 純 JVM）。
@@ -567,13 +568,24 @@ class IntentTypedD2Test {
     assertTrue(play.ok)
     assertTrue(play.usedFallback)
     assertEquals(ReasonCodes.NO_HANDLER, play.reasonCode)
-    // 控制路徑現語義：成功不帶 fallback/reason（成功分支 reasonCode 重構列 follow-up，不在此改）。
+    // 控制路徑與 play 同一降級真相（P3 修復釘選）：主前提是 launcher 語意
+    //（MEDIA_BUTTON 無 activity handler，發射「成功」不可能是真實控制），
+    // 播放器可見性（此 pin 的靜態無播放器環境）為次、同向成立——
+    // usedFallbackOnSuccess + successReason 沿用 play 路徑同一參數，禁兩分支漂移。
     val control = MusicTool.execute(
       MusicTool.Params(control = MusicTool.Control.NEXT), noMusic, IntentLauncher { LaunchResult.Success },
     )
     assertTrue(control.ok)
-    assertFalse(control.usedFallback)
-    assertNull(control.reasonCode)
+    assertTrue(control.usedFallback)
+    assertEquals(ReasonCodes.NO_HANDLER, control.reasonCode)
+    // 反向控制：NATIVE（有播放器）下的控制成功不帶降級標記——參數為條件式，
+    // 僅 DEGRADED 環境生效，generic 成功形狀不變。
+    val nativeControl = MusicTool.execute(
+      MusicTool.Params(control = MusicTool.Control.NEXT), env, IntentLauncher { LaunchResult.Success },
+    )
+    assertTrue(nativeControl.ok)
+    assertFalse(nativeControl.usedFallback)
+    assertNull(nativeControl.reasonCode)
   }
 
   // ---- 13. Stage 3：navigation geo ----
@@ -680,6 +692,69 @@ class IntentTypedD2Test {
       NavigationTool.Params(latitude = 25.0, longitude = 121.0),
     )
     assertEquals("geo:25.0,121.0", bare.dataUri)
+  }
+
+  @Test fun navigation_geo_labelOnlyNoCoords_qUsesLabel_notEmptyQ() {
+    // P2 修復釘選：無座標分支照座標分支**同一 q 來源優先序**（label → query，
+    // 見建構函式註解）。label-only 輸入（舊行為＝丟 label 發射空查詢
+    // `geo:0,0?q=`——execute 空白守衛要求全 blank，攔不到只帶 label 的輸入）
+    // 得出 q==label 的非空查詢。
+    val geo = NavigationTool.buildGeoIntent(
+      NavigationTool.Params(query = "", label = "夜市"),
+    )
+    assertEquals("geo:0,0?q=%E5%A4%9C%E5%B8%82", geo.dataUri)
+  }
+
+  @Test fun navigation_execute_labelOnlyNoCoords_launchesLabeledQuery() {
+    // 執行面同釘選：label-only 經 execute（NATIVE 地圖）發射的 intent q=label，
+    // 不再是「空 q」舊契約。
+    var launched: IntentSpec? = null
+    val r = NavigationTool.execute(
+      NavigationTool.Params(label = "夜市"), env,
+      IntentLauncher { launched = it; LaunchResult.Success },
+    )
+    assertTrue(r.ok)
+    assertEquals("geo:0,0?q=%E5%A4%9C%E5%B8%82", launched?.dataUri)
+  }
+
+  @Test fun navigation_geo_noCoords_bothBlank_throws() {
+    // 兩者皆空白＋無座標 → builder fail-fast IAE（禁造空 q）。呼叫方契約：
+    // execute 的空白前置守衛先攔（NEED_CLARIFICATION），故直接呼叫 builder 的
+    // INTERNAL 收斂（guardedToolBuild）不可達屬故意縱深——本案鎖 builder 本體
+    // 的守衛訊息（deterministic，不回顯內容）。
+    try {
+      NavigationTool.buildGeoIntent(NavigationTool.Params())
+      fail("expected IllegalArgumentException for all-blank no-coords params")
+    } catch (e: IllegalArgumentException) {
+      assertTrue(e.message ?: "", "blank" in (e.message ?: ""))
+    }
+  }
+
+  @Test fun navigation_web_noCoords_bothBlank_throws() {
+    // geo/web 對稱性：all-blank 無座標輸入在 web 分支同樣 fail-fast IAE
+    //（禁靜默組空查詢 OSM URL）。呼叫方契約同 geo：execute 的空白前置守衛
+    // 先攔（NEED_CLARIFICATION），直呼 builder 的 INTERNAL 收斂不可達屬故意
+    // 縱深——守衛訊息與 geo 分支逐字相同（deterministic，不回顯內容）。
+    try {
+      NavigationTool.buildWebIntent(NavigationTool.Params())
+      fail("expected IllegalArgumentException for all-blank no-coords web params")
+    } catch (e: IllegalArgumentException) {
+      assertTrue(e.message ?: "", "blank" in (e.message ?: ""))
+    }
+  }
+
+  @Test fun navigation_labelOnly_geoAndWeb_sameNonEmptyQuery() {
+    // geo/web 對同一 label-only 輸入**皆得出非空查詢**（相同搜尋詞）：
+    // geo 無座標分支與 web 同以 label 補位，兩 URI 攜同一編碼詞（label 優先序
+    // 一致；geo 是 `?q=`、web 是 `?query=`，前綴差異非搜尋詞差異）。
+    val encoded = URLEncoder.encode("夜市", Charsets.UTF_8.name())
+    val geo = NavigationTool.buildGeoIntent(NavigationTool.Params(label = "夜市")).dataUri ?: ""
+    val web = NavigationTool.buildWebIntent(NavigationTool.Params(label = "夜市")).dataUri ?: ""
+    assertTrue("geo 須攜非空 q：$geo", geo.startsWith("geo:0,0?q=") && geo.endsWith(encoded))
+    assertTrue(
+      "web 須攜同一非空查詢：$web",
+      web.startsWith("https://www.openstreetmap.org/search?query=") && web.endsWith(encoded),
+    )
   }
 
   // ---- 14. Stage 3：navigation blank 判斷的雙側座標契約 ----

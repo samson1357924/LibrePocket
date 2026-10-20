@@ -110,6 +110,9 @@ object VolumeTool : SystemTool<VolumeTool.Params> {
 
   override fun fallback(params: Params, env: SystemEnv): FallbackSpec = FallbackSpec(
     reasonCode = ReasonCodes.NO_PRIVILEGE,
+    // alternative 為直接的常量構建（不經 [guardedFallbackAlternative] 收斂）：
+    // [volumePanelSpec] 是純 IntentSpec 常量、無 builder 守衛可違反（不可拋），
+    // 屬意圖守衛的常量豁免（見 [guardedFallbackAlternative] KDoc 豁免註記）。
     alternative = volumePanelSpec(),
     userMessage = "做不到直接調音量（${ReasonCodes.NO_PRIVILEGE}）" +
       "→ 可替代開啟系統音量面板 → 需要你手動拖動滑桿",

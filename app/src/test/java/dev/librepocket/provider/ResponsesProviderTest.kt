@@ -457,6 +457,47 @@ class ResponsesProviderTest {
     }
 
     @Test
+    fun emptyItemIdDoesNotAliasDistinctOutputIndexes() {
+        // Empty item_id is the id-less shape. It must stay positional per
+        // output_index, not collapse every block onto output_0.
+        val mapper = ResponsesMapper()
+        mapper.mapPayload(
+            """{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"alpha"}""",
+        )
+        mapper.mapPayload(
+            """{"type":"response.output_text.delta","output_index":1,"content_index":0,"item_id":"","delta":"beta"}""",
+        )
+        val events = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"alpha"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"beta"}]}]}}""",
+        )
+        assertTrue(
+            "distinct positional blocks must not merge: $events",
+            events.filterIsInstance<StreamEvent.TextDelta>().isEmpty(),
+        )
+        assertEquals(StreamEvent.Done("stop"), events.last())
+    }
+
+    @Test
+    fun distinctItemIdsAtOnePositionFailClosed() {
+        // msg_b at the same position must not append into msg_a's buffer and
+        // then be accepted by position; the identity conflict is non-retryable.
+        val mapper = ResponsesMapper()
+        mapper.mapPayload(
+            """{"type":"response.output_text.delta","item_id":"msg_a","output_index":0,"content_index":0,"delta":"Hel"}""",
+        )
+        mapper.mapPayload(
+            """{"type":"response.output_text.delta","item_id":"msg_b","output_index":0,"content_index":0,"delta":"lo"}""",
+        )
+        val events = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_b","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}]}}""",
+        )
+        val failed = events.filterIsInstance<StreamEvent.Failed>().single()
+        assertEquals("RESPONSES_OUTPUT_MISMATCH", failed.message)
+        assertFalse(failed.retryable)
+        assertTrue(events.none { it is StreamEvent.Done })
+    }
+
+    @Test
     fun functionCallFramesWithoutAnyIdentityFailTypedNonRetryable() {
         // No non-empty item_id/id AND no output_index: the call cannot be
         // paired with any bucket. Dropping such a frame would silently lose

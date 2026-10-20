@@ -275,6 +275,11 @@ internal class ResponsesMapper(val round: Int = 0) {
     private val textKeyByOutputIndex = LinkedHashMap<Pair<Int, Int>, String>()
     private var streamedTextChars = 0
     private var textTrackingDisabled = false
+    // A second DISTINCT non-empty item id at one (output_index, content_index)
+    // is malformed identity churn. Keep the sticky first key and latch the
+    // conflict so terminal reconciliation fails closed (never merges msg_b's
+    // suffix into msg_a's buffer and then accepts msg_b by position).
+    private var textIdentityConflict = false
     // P1-1: any presence marker already emitted during streaming
     // (reasoning item added/done); completed reconciliation emits at most
     // one more marker for terminal-only reasoning items.
@@ -696,6 +701,7 @@ internal class ResponsesMapper(val round: Int = 0) {
         streamedTextByBlock.clear()
         textKeyByOutputIndex.clear()
         streamedTextChars = 0
+        textIdentityConflict = false
     }
 
     /**
@@ -713,6 +719,7 @@ internal class ResponsesMapper(val round: Int = 0) {
         itemIndex: Int,
         out: MutableList<StreamEvent>,
     ): StreamEvent.Failed? {
+        if (textIdentityConflict) return outputMismatch()
         val content = item.arr("content")?.items.orEmpty()
         for ((contentIndex, j) in content.withIndex()) {
             val part = j as? MiniJson.JObj ?: continue
@@ -764,7 +771,10 @@ internal class ResponsesMapper(val round: Int = 0) {
      */
     private fun streamingTextKey(itemId: String?, outputIndex: Int?, contentIndex: Int): String {
         val positionalKey = textBlockKey(null, outputIndex, contentIndex)
-        val idKey = itemId?.let { textBlockKey(it, null, contentIndex) }
+        // Empty item_id is the id-less shape everywhere else; filtering it is
+        // essential here because textBlockKey("", ...) would otherwise alias
+        // every output_index onto output_0#contentIndex.
+        val idKey = itemId?.takeIf { it.isNotEmpty() }?.let { textBlockKey(it, null, contentIndex) }
         if (idKey != null) requireToolIdBudget(idKey.length)
         if (outputIndex == null) return idKey ?: positionalKey
         val position = outputIndex to contentIndex
@@ -781,9 +791,11 @@ internal class ResponsesMapper(val round: Int = 0) {
                 idKey
             }
             // A second distinct id at one position is malformed; keep the
-            // sticky key so terminal reconciliation still fails closed rather
-            // than silently switching identity mid-block.
-            else -> existing
+            // sticky key and latch the conflict for terminal reconciliation.
+            else -> {
+                textIdentityConflict = true
+                existing
+            }
         }
         if (existing != null || textKeyByOutputIndex.size < MAX_TOOL_CALLS_PER_ATTEMPT) {
             textKeyByOutputIndex[position] = chosen

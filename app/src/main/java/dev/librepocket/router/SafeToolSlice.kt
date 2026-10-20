@@ -118,6 +118,18 @@ class SafeToolSlice(
          * could split a UTF-16 surrogate pair and emit a lone surrogate.
          */
         const val MAX_STRING_CHARS = 500
+
+        /**
+         * Raw backend-owned field bound applied BEFORE `Redactor.redact`.
+         * Redaction makes multiple full passes/allocations; an unbounded
+         * backend string (future MCP bridge) could otherwise burn CPU/heap
+         * before the 500-char echo cap. The cap is deliberately wider than
+         * [MAX_STRING_CHARS] so redaction can inflate a value and still have
+         * its post-redaction truncation decision made at 500. Omitted raw
+         * suffix never reaches the wire, so a pre-cap is fail-closed, not a
+         * leak.
+         */
+        const val RAW_BACKEND_FIELD_MAX_CHARS = MAX_STRING_CHARS * 4
         /** Per-input cap for model-controlled `query` / `pathPrefix` (fail-closed). */
         const val MAX_INPUT_CHARS = 4096
         /** Total cap for serialized tool result JSON (fail-closed continuation budget). */
@@ -213,24 +225,23 @@ class SafeToolSlice(
          * `oauthAuth`) is fail-safe over-redaction of an echo, never a leak;
          * contains-style matching is deliberate collateral — benign keys
          * merely containing a family word (`author`, `tokenizer`,
-         * `secretary`) are over-redacted on purpose too. Caveat: a
-         * secret-keyed OBJECT recurses through the normal walk, so nesting
-         * is a documented bypass (`{"password":{"z":"<value>"}}` echoes
-         * under an inner non-secret key) — the policy targets the
-         * conventional well-named key case; full structural marking is out
-         * of scope for this echo.
+         * `secretary`) are over-redacted on purpose too. Any value under a
+         * secret-family key — including an object or array — collapses to the
+         * one fixed receipt: recursing into a secret-keyed object would echo
+         * inner values under non-secret keys (`{"password":{"z":"<value>"}}`),
+         * which is a structural bypass. Over-redaction is intentional.
          */
         private val SECRET_KEY_FAMILY =
             Regex("(?i)(secret|token|password|passwd|auth|api[_-]?key)")
 
         /**
          * Wire-safe redacted echo of a tool call's arguments: parse-then-redact
-         * (token-level inside each JSON string, and KEY-AWARE: a string member
-         * under a secret-family key ([SECRET_KEY_FAMILY]) collapses to the
-         * fixed [SECRET_VALUE_RECEIPT], because bare key names never match the
-         * secret rules and plain values carry no secret shape — isolation-only
-         * redaction leaks `{"password":"…"}` verbatim) and re-serialize a
-         * still-valid JSON object. Provider adapters re-parse this echo before
+         * (token-level inside each JSON string, and KEY-AWARE: any member
+         * value under a secret-family key ([SECRET_KEY_FAMILY]) collapses to
+         * the fixed [SECRET_VALUE_RECEIPT], because bare key names never match
+         * the secret rules and plain values carry no secret shape —
+         * isolation-only redaction leaks `{"password":"…"}` verbatim) and
+         * re-serialize a still-valid JSON object. Provider adapters re-parse this echo before
          * serializing the continuation (`validateToolPairing`), so a raw-text
          * redact or a `take` would corrupt the structure (several redaction
          * rules swallow the terminating `"`/`}` of a value) and turn a working
@@ -276,16 +287,17 @@ class SafeToolSlice(
 
         /** Deep-walks a JSON value, redacting object keys and every string
          *  primitive's content (keys are model-controlled and ride the echo
-         *  too), KEY-AWARE: a string member — or an array of strings — under
-         *  a secret-family key ([SECRET_KEY_FAMILY]) collapses to the fixed
-         *  [SECRET_VALUE_RECEIPT] (isolated value redaction alone cannot catch
-         *  secret-keyed plain values). Numbers/booleans under a secret key are
-         *  never fabricated — a non-string value carries no secret shape — and
-         *  secret-keyed objects keep the normal walk so structural safety is
-         *  preserved. Recursion depth is bounded by the caller's pre-parse
-         *  fan-close ([redactedArgsEcho] rejects depth > [MAX_NESTING_DEPTH]
-         *  via [jsonNestingDepth], the same bound [parseArgs] fans closed
-         *  with) — never call this on unguarded input. */
+         *  too), KEY-AWARE: a member under a secret-family key
+         *  ([SECRET_KEY_FAMILY]) collapses the ENTIRE value — string, array,
+         *  or object — to the fixed [SECRET_VALUE_RECEIPT] (isolated value
+         *  redaction alone cannot catch secret-keyed plain values, and
+         *  recursing into a secret-keyed object would leak its inner
+         *  non-secret-keyed values). Numbers/booleans under a secret key are
+         *  never fabricated — a non-string primitive carries no secret shape.
+         *  Recursion depth is bounded by the caller's pre-parse fan-close
+         *  ([redactedArgsEcho] rejects depth > [MAX_NESTING_DEPTH] via
+         *  [jsonNestingDepth], the same bound [parseArgs] fans closed with) —
+         *  never call this on unguarded input. */
         private fun redactJsonStrings(element: JsonElement): JsonElement = when (element) {
             is JsonPrimitive ->
                 if (element.isString) {
@@ -301,8 +313,8 @@ class SafeToolSlice(
                 // yet safe (over-redaction only): the echo stays valid JSON.
                 element.entries.associate { (k, v) ->
                     dev.librepocket.redact.Redactor.redact(k).text to when {
-                        // Pre-redact key decides: the receipt applies to the
-                        // VALUE (string or array of strings) only.
+                        // Pre-redact key decides: the receipt replaces the
+                        // whole value, whatever its JSON shape.
                         SECRET_KEY_FAMILY.containsMatchIn(k) -> secretValueReceipt(v)
                         else -> redactJsonStrings(v)
                     }
@@ -311,13 +323,12 @@ class SafeToolSlice(
             is JsonArray -> JsonArray(element.map { redactJsonStrings(it) })
         }
 
-        /** Secret-keyed member value: every string (deep into nested arrays)
-         *  becomes the fixed receipt; arrays of objects hand members to the
-         *  normal walk; non-string primitives pass untouched. */
+        /** Secret-keyed member value: any string or structured value becomes
+         *  the single fixed receipt; non-string primitives carry no secret
+         *  shape and pass untouched. */
         private fun secretValueReceipt(v: JsonElement): JsonElement = when (v) {
             is JsonPrimitive -> if (v.isString) JsonPrimitive(SECRET_VALUE_RECEIPT) else v
-            is JsonArray -> JsonArray(v.map { secretValueReceipt(it) })
-            is JsonObject -> redactJsonStrings(v)
+            is JsonArray, is JsonObject -> JsonPrimitive(SECRET_VALUE_RECEIPT)
         }
 
         /** Computes max JSON nesting depth while ignoring string contents. */
@@ -444,6 +455,14 @@ class SafeToolSlice(
         coroutineContext.ensureActive()
         if (calls.size > maxCallsPerTurn) {
             return calls.map { deny(it, DenyCodes.BUDGET_EXCEEDED, "at most $maxCallsPerTurn tool calls per round") }
+        }
+        // Direct-API defense in depth: the turn engine dedups by redacted id
+        // before calling, but a future caller must not execute two calls that
+        // re-bind to one wire pairing id (both would execute, then the
+        // continuation would fail non-retryably with a duplicate pair).
+        val pairingIds = calls.map { boundedRedactedId(it.id) }
+        if (pairingIds.size != pairingIds.toSet().size) {
+            return calls.map { deny(it, DenyCodes.SCHEMA_INVALID, "duplicate call id in one round") }
         }
         return calls.map { executeOne(it) }
     }
@@ -637,7 +656,13 @@ class SafeToolSlice(
             // string, so it takes the same pipeline rather than a bare cap.
             put("tool", cappedTake(dev.librepocket.redact.Redactor.redact(call.name).text, MAX_STRING_CHARS))
             put("callId", boundedRedactedId(call.id))
-            put("detail", cappedTake(dev.librepocket.redact.Redactor.redact(detail).text, MAX_STRING_CHARS))
+            put(
+                "detail",
+                cappedTake(
+                    dev.librepocket.redact.Redactor.redact(boundedRawBackendField(detail)).text,
+                    MAX_STRING_CHARS,
+                ),
+            )
             put("clockMillis", clock.millis())
         }.toString()
         return ToolResult(call.id, call.name, json, denied = true, denyCode = code)
@@ -649,6 +674,11 @@ class SafeToolSlice(
         } else {
             value
         }
+
+    /** Pre-redaction bound for backend-owned strings (see [RAW_BACKEND_FIELD_MAX_CHARS]). */
+    private fun boundedRawBackendField(value: String): String =
+        if (value.length <= RAW_BACKEND_FIELD_MAX_CHARS) value
+        else cappedTake(value, RAW_BACKEND_FIELD_MAX_CHARS)
 
     private fun ok(call: ToolCall, query: String, outcome: LspTools.SymbolsOutcome.Ok): ToolResult {
         // Snapshot the bounded projection ONCE inside the typed-error
@@ -671,9 +701,9 @@ class SafeToolSlice(
             // string may exceed the cap after redaction — decide there.
             var truncatedFlag = false
             redactedSymbols = available.map { s ->
-                val rn = dev.librepocket.redact.Redactor.redact(s.name).text
-                val rk = dev.librepocket.redact.Redactor.redact(s.kind).text
-                val rp = dev.librepocket.redact.Redactor.redact(s.path).text
+                val rn = dev.librepocket.redact.Redactor.redact(boundedRawBackendField(s.name)).text
+                val rk = dev.librepocket.redact.Redactor.redact(boundedRawBackendField(s.kind)).text
+                val rp = dev.librepocket.redact.Redactor.redact(boundedRawBackendField(s.path)).text
                 if (rn.length > MAX_STRING_CHARS || rk.length > MAX_STRING_CHARS || rp.length > MAX_STRING_CHARS) {
                     truncatedFlag = true
                 }
@@ -755,7 +785,7 @@ class SafeToolSlice(
         // Name and arguments echo the model's own strings into the provider
         // continuation/transcript exactly like `tool`/`callId` above — they
         // get redaction + a bounded echo (no raw echo past the redaction
-        // pipeline R1–R14, with secret-keyed string members collapsing to
+        // pipeline R1–R14, with secret-keyed member values collapsing to
         // the fixed receipt — see [redactedArgsEcho]).
         // Call ids ARE re-bound on this path — never verbatim: each call/id
         // here and each result's `toolCallId` below is replaced with its
@@ -775,6 +805,9 @@ class SafeToolSlice(
                 name = cappedTake(dev.librepocket.redact.Redactor.redact(it.name).text, MAX_STRING_CHARS),
                 argumentsJson = redactedArgsEcho(it.argumentsJson),
             )
+        }
+        require(normalizedCalls.map { it.id }.toSet().size == normalizedCalls.size) {
+            "duplicate normalized call id"
         }
         out.add(ChatMessage(role = "assistant", text = "", toolCalls = normalizedCalls))
         for (r in results) {

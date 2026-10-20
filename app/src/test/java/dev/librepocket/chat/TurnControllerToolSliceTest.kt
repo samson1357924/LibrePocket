@@ -1543,7 +1543,10 @@ class TurnControllerToolSliceTest {
         assertEquals(2, provider.seenRequests.size)
         c.cancel()
         contGate.complete(Unit)
-        job.join()
+        assertTrue(
+            "send did not settle after cancel",
+            withTimeoutOrNull(8_000) { job.join(); true } ?: false,
+        )
 
         assertEquals(1, backend.invocations.get())
         assertEquals(ChatStatus.CANCELLED, c.uiState.value.status)
@@ -1990,7 +1993,10 @@ class TurnControllerToolSliceTest {
         assertTrue("execute never entered", entered.await(8, TimeUnit.SECONDS))
         c.cancel()
         gate.complete(Unit)
-        job.join()
+        assertTrue(
+            "send did not settle after cancel",
+            withTimeoutOrNull(8_000) { job.join(); true } ?: false,
+        )
 
         assertEquals(0, backend.invocations.get())
         assertEquals(1, provider.seenRequests.size)

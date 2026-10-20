@@ -262,14 +262,16 @@ internal class ResponsesMapper(val round: Int = 0) {
     // throws the same typed non-retryable per-key overflow as every other
     // Responses keyed collection, before any retention.
     private val streamedTextByBlock = LinkedHashMap<String, StringBuilder>()
-    // Mixed-identity correlation (best-effort, bounded by the same cap): an
-    // id-carrying streamed block registers its `(output_index,
-    // content_index)` position, so a terminal message item that omits `id`
-    // still rejoins the streamed prefix by position instead of emitting the
-    // full terminal text as a duplicate suffix. Registration is skipped once
-    // the cap is reached (adversarial id churn degrades to the documented
-    // positional fallback, never to unbounded growth); the map is dropped
-    // with text tracking.
+    // Sticky mixed-identity correlation: every streamed text block registers
+    // its `(output_index, content_index)` position (id-less deltas to the
+    // positional key, id-carrying deltas to the id key; an id appearing after
+    // a positional prefix promotes that prefix onto the id key). A terminal
+    // message item that omits `id` therefore rejoins the streamed prefix by
+    // position instead of emitting the full terminal text as a duplicate
+    // suffix, and a suffix keeps the streamed block's `output_index` even
+    // when the terminal array is reordered. Registration is skipped once the
+    // cap is reached (the maps are dropped with text tracking); the map is
+    // bounded by the same per-attempt block cap.
     private val textKeyByOutputIndex = LinkedHashMap<Pair<Int, Int>, String>()
     private var streamedTextChars = 0
     private var textTrackingDisabled = false
@@ -331,18 +333,12 @@ internal class ResponsesMapper(val round: Int = 0) {
                     val outputIndex = root.int("output_index")
                     val contentIndex = root.int("content_index") ?: 0
                     val blockKey =
-                        textBlockKey(root.string("item_id"), outputIndex, contentIndex)
+                        streamingTextKey(root.string("item_id"), outputIndex, contentIndex)
                     // Same per-key length guard as the tool maps, before any
                     // retention: a frame-budget-sized item_id can never be
                     // stored as a map key.
                     requireToolIdBudget(blockKey.length)
-                    val tracked = trackStreamedText(blockKey, delta)
-                    val positionalKey = textBlockKey(null, outputIndex, contentIndex)
-                    if (tracked && outputIndex != null && blockKey != positionalKey &&
-                        textKeyByOutputIndex.size < MAX_TOOL_CALLS_PER_ATTEMPT
-                    ) {
-                        textKeyByOutputIndex[outputIndex to contentIndex] = blockKey
-                    }
+                    trackStreamedText(blockKey, delta)
                     out.add(StreamEvent.TextDelta(round, blockOf(root), delta))
                 }
             }
@@ -738,16 +734,90 @@ internal class ResponsesMapper(val round: Int = 0) {
             // terminal item omits `id` rather than emitting a duplicate.
             val correlatedKey = textKeyByOutputIndex[itemIndex to contentIndex]
             val positionalKey = textBlockKey(null, itemIndex, contentIndex)
-            val streamed = (
-                idKey?.let { streamedTextByBlock[it] }
-                    ?: correlatedKey?.let { streamedTextByBlock[it] }
-                    ?: streamedTextByBlock[positionalKey]
-                )?.toString().orEmpty()
+            val trackedKey = when {
+                idKey != null && streamedTextByBlock.containsKey(idKey) -> idKey
+                correlatedKey != null && streamedTextByBlock.containsKey(correlatedKey) -> correlatedKey
+                streamedTextByBlock.containsKey(positionalKey) -> positionalKey
+                else -> null
+            }
+            val streamed = trackedKey?.let { streamedTextByBlock[it]?.toString() }.orEmpty()
             if (!terminalText.startsWith(streamed)) return outputMismatch()
             val suffix = terminalText.substring(streamed.length)
-            if (suffix.isNotEmpty()) out.add(StreamEvent.TextDelta(round, block, suffix))
+            if (suffix.isNotEmpty()) {
+                // Keep the streamed block's own identity for the suffix: a
+                // reordered terminal array position is not necessarily the
+                // streamed `output_index`.
+                val suffixBlock = trackedKey?.let { blockIndexOfTextKey(it) } ?: block
+                out.add(StreamEvent.TextDelta(round, suffixBlock, suffix))
+                appendReconciledText(trackedKey ?: idKey ?: positionalKey, suffix)
+            }
         }
         return null
+    }
+
+    /**
+     * Sticky streaming key per `(output_index, content_index)`: an id-less
+     * delta followed by an id-carrying delta (or the reverse) must append to
+     * ONE block buffer, not split "Hel" + "lo" into two buffers that later
+     * compare as a mismatch or duplicate the suffix. When an id first appears,
+     * the positional prefix is promoted onto the id key exactly once.
+     */
+    private fun streamingTextKey(itemId: String?, outputIndex: Int?, contentIndex: Int): String {
+        val positionalKey = textBlockKey(null, outputIndex, contentIndex)
+        val idKey = itemId?.let { textBlockKey(it, null, contentIndex) }
+        if (idKey != null) requireToolIdBudget(idKey.length)
+        if (outputIndex == null) return idKey ?: positionalKey
+        val position = outputIndex to contentIndex
+        val existing = textKeyByOutputIndex[position]
+        val chosen = when {
+            existing == null -> {
+                if (idKey != null) promoteTextPrefix(positionalKey, idKey)
+                idKey ?: positionalKey
+            }
+            idKey == null -> existing
+            existing == idKey -> existing
+            existing == positionalKey -> {
+                promoteTextPrefix(positionalKey, idKey)
+                idKey
+            }
+            // A second distinct id at one position is malformed; keep the
+            // sticky key so terminal reconciliation still fails closed rather
+            // than silently switching identity mid-block.
+            else -> existing
+        }
+        if (existing != null || textKeyByOutputIndex.size < MAX_TOOL_CALLS_PER_ATTEMPT) {
+            textKeyByOutputIndex[position] = chosen
+        }
+        return chosen
+    }
+
+    private fun promoteTextPrefix(from: String, to: String) {
+        if (from == to) return
+        streamedTextByBlock.remove(from)?.let { prefix ->
+            streamedTextByBlock.getOrPut(to) { StringBuilder() }.append(prefix)
+        }
+    }
+
+    private fun blockIndexOfTextKey(key: String): Int? =
+        textKeyByOutputIndex.entries.firstOrNull { it.value == key }?.key?.let { (oi, ci) ->
+            oi * 1000 + ci
+        }
+
+    /** Advance the tracked buffer after a reconciled suffix so a duplicate
+     *  terminal item is a replay no-op (never emits the suffix twice). */
+    private fun appendReconciledText(key: String, suffix: String) {
+        if (textTrackingDisabled) return
+        if (!streamedTextByBlock.containsKey(key) &&
+            streamedTextByBlock.size >= MAX_TOOL_CALLS_PER_ATTEMPT
+        ) {
+            return
+        }
+        if (streamedTextChars.toLong() + suffix.length > MAX_TURN_TEXT_CHARS) {
+            disableTextTracking()
+            return
+        }
+        streamedTextByBlock.getOrPut(key) { StringBuilder() }.append(suffix)
+        streamedTextChars += suffix.length
     }
 
     /** P1-1: typed non-retryable terminal for a streamed/terminal text contradiction. */

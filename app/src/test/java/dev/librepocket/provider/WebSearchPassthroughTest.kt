@@ -238,6 +238,22 @@ class WebSearchPassthroughTest {
     }
 
     @Test
+    fun repeatedCitationAnnotationsEmitOneServerToolMarker() {
+        val mapper = ChatCompletionsMapper()
+        val citation =
+            """{"type":"url_citation","url_citation":{"url":"https://example.com/a","title":"t"}}"""
+        val first = mapper.mapPayload(
+            """{"choices":[{"delta":{"content":"a","annotations":[$citation]}}]}""",
+        )
+        val second = mapper.mapPayload(
+            """{"choices":[{"delta":{"content":"b","annotations":[$citation]}}]}""",
+        )
+        val markers = (first + second).filterIsInstance<StreamEvent.TextDelta>()
+            .filter { ServerToolTranscript.isServerToolMarker(it.delta) }
+        assertEquals(1, markers.size)
+    }
+
+    @Test
     fun chatWithoutCitationEmitsNoMarker() {
         val mapper = ChatCompletionsMapper()
         val events = mapper.mapPayload("""{"choices":[{"delta":{"content":"hi"}}]}""")

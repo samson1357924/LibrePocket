@@ -245,7 +245,7 @@ class ProviderErrorTest {
             )
         }
         // The guard still wins over the marker: never FATAL_CODES, never 501.
-        for (c in listOf(400, 401, 402, 403, 422)) {
+        for (c in listOf(400, 401, 402, 403, 404, 422)) {
             assertEquals(
                 "code $c must never be softened",
                 FailureKind.FATAL,

@@ -2,6 +2,7 @@ package dev.librepocket.agent.ui.setup
 
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import dev.librepocket.agent.ui.chat.VaultSource
+import dev.librepocket.agent.ui.chat.cancelAndJoinChatTestScopes
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
 import dev.librepocket.policy.Verdict
@@ -55,8 +56,10 @@ class SetupLogoutInFlightTest {
 
     @After
     fun tearDown() {
+        // Same #96 Main-leak ordering as SetupCrossVmJournalTest: cancel and
+        // JOIN DataStore collectors while Main is still installed, then reset.
+        cancelAndJoinChatTestScopes(scopes)
         Dispatchers.resetMain()
-        scopes.forEach { it.cancel() }
         tmpDirs.forEach { it.deleteRecursively() }
     }
 

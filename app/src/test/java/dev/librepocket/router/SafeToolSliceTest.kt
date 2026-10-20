@@ -79,11 +79,13 @@ class SafeToolSliceTest {
         backend: LspTools.Backend = CountingBackend(),
         clock: Clock = fixedClock,
         timeoutMillisForTest: Long? = null,
+        maxCallsPerTurn: Int = 1,
     ) = SafeToolSlice(
         ctxSupplier = { ctx },
         policy = policy,
         backend = backend,
         clock = clock,
+        maxCallsPerTurn = maxCallsPerTurn,
     ).also { it.backendTimeoutMillisForTest = timeoutMillisForTest }
 
     private fun call(name: String = "lsp.symbols", args: String = """{"query":"Foo"}""", id: String = "call-1") =
@@ -976,9 +978,61 @@ class SafeToolSliceTest {
         assertFalse(echo.contains("simplevalue2"))
         assertFalse(echo.contains("AlphaBetaGamma42"))
         assertTrue(echo.contains("⟦REDACTED⟧"))
-        // Non-secret members still echo normally.
+        // `creds` itself is not a secret-family key, so its non-secret `note`
+        // stays; the nested secret-keyed members were still collapsed.
         assertTrue(echo.contains("plain note"))
         assertTrue(echo.contains("\"query\":\"q\""))
+    }
+
+    @Test fun secretKeyedObjectCollapsesWholeValue() = runBlocking {
+        // A secret-family key whose value is an OBJECT must collapse the whole
+        // value: recursing would echo inner values under non-secret inner keys.
+        val s = slice()
+        val calls = listOf(
+            call(
+                id = "call-1",
+                args = """{"query":"q","password":{"z":"nestedvalue9"},"token":[{"v":"arrayvalue8"}]}""",
+            ),
+        )
+        val msgs = s.continuationMessages(calls, listOf(SafeToolSlice.ToolResult("call-1", "n", "{}")))
+        val echo = msgs[0].toolCalls.single().argumentsJson
+        assertFalse(echo.contains("nestedvalue9"))
+        assertFalse(echo.contains("arrayvalue8"))
+        val body = Json.parseToJsonElement(echo).jsonObject
+        assertEquals("⟦REDACTED⟧", body["password"]!!.jsonPrimitive.content)
+        assertEquals("⟦REDACTED⟧", body["token"]!!.jsonPrimitive.content)
+    }
+
+    @Test fun executeRejectsDuplicatePairingIdsBeforeBackend() = runBlocking {
+        // Direct-API defense in depth: TurnController dedups first, but a
+        // future caller must not execute two calls that re-bind to one wire id.
+        val backend = CountingBackend()
+        val s = slice(backend = backend, maxCallsPerTurn = 2)
+        val results = s.execute(listOf(call(id = "dup"), call(id = "dup")))
+        assertEquals(2, results.size)
+        assertTrue(results.all { it.denied })
+        assertTrue(results.all { it.denyCode == SafeToolSlice.DenyCodes.SCHEMA_INVALID })
+        assertEquals("duplicate id must not touch the backend", 0, backend.invocations.get())
+    }
+
+    @Test fun hugeBackendFieldsAreRawCappedBeforeRedaction() = runBlocking {
+        // Backend fields are redacted before the 500-char echo cap, so an
+        // unbounded future backend string must be pre-bounded or it can burn
+        // full-pass redaction CPU/heap first.
+        val huge = "S".repeat(1_000_000)
+        val backend = object : LspTools.Backend {
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+                listOf(LspTools.Symbol(huge, huge, huge, 1))
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val result = slice(backend = backend).execute(listOf(call())).single()
+        assertFalse(result.denied)
+        assertTrue(
+            "result must stay within MAX_RESULT_CHARS, was ${result.resultJson.length}",
+            result.resultJson.length <= SafeToolSlice.MAX_RESULT_CHARS,
+        )
+        assertFalse("raw megabyte field must not survive", result.resultJson.contains("S".repeat(10_000)))
+        assertTrue(result.resultJson.contains("[truncated 2000→500]"))
     }
 
     @Test fun continuationArgsEchoRedactsTopLevelSecretKey() = runBlocking {
@@ -1191,7 +1245,10 @@ class SafeToolSliceTest {
         val r = s.execute(listOf(call(id = "err-1"))).single()
         assertTrue(r.denied)
         assertEquals(SafeToolSlice.DenyCodes.POLICY_DENIED, r.denyCode)
-        assertTrue("fixed ERROR receipt", r.resultJson.contains("ERROR"))
+        assertEquals(
+            "ERROR",
+            Json.parseToJsonElement(r.resultJson).jsonObject["detail"]!!.jsonPrimitive.content,
+        )
         assertEquals(0, backend.invocations.get())
     }
 }

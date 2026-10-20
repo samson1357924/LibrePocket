@@ -1426,7 +1426,7 @@ internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): L
         filtered.map {
             ChatMessage(
                 role = it.kind,
-                text = cappedHistoryText(it.text),
+                text = cappedHistoryText(it.text, compactMarkers = it.kind == "assistant"),
                 hasReasoning = it.kind == "assistant" &&
                     (it.runId in scan.reasoningRunIds || incomplete),
             )
@@ -2076,10 +2076,18 @@ internal suspend fun hasWithheldSwitchMarker(store: SessionStore, sessionId: Str
  * bounds each marker to `[tool:<name> …]` before the cap; ordinary (≤20k)
  * rows bypass compaction and replay byte-identical.
  */
-internal fun cappedHistoryText(text: String): String {
+internal fun cappedHistoryText(
+    text: String,
+    compactMarkers: Boolean = true,
+): String {
     if (text.length <= MODEL_HISTORY_MAX_CHARS_PER_MESSAGE) return text
-    val compacted = compactToolMarkers(text)
-    return capAvoidingPartialToolMarker(compacted) + HISTORY_TRUNCATION_MARKER
+    val compacted = if (compactMarkers) compactToolMarkers(text) else text
+    val capped = capAvoidingPartialToolMarker(compacted)
+    // Compaction alone may bring an over-cap row under the per-message cap.
+    // Only an actual cap cut is a truncation; otherwise the omitted args are
+    // already visible as the compacted marker and a truncation suffix would
+    // falsely claim content was lost.
+    return if (capped.length < compacted.length) capped + HISTORY_TRUNCATION_MARKER else compacted
 }
 
 /**
@@ -2094,7 +2102,15 @@ internal fun cappedHistoryText(text: String): String {
  * prefix stay intact.
  */
 private fun capAvoidingPartialToolMarker(compacted: String): String {
-    val cut = compacted.take(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE)
+    var cutLen = minOf(compacted.length, MODEL_HISTORY_MAX_CHARS_PER_MESSAGE)
+    // Never end on a lone high surrogate: the low half belongs to the same
+    // user-visible character and would otherwise be dropped/replaced.
+    if (cutLen < compacted.length && cutLen > 0 &&
+        compacted[cutLen - 1].isHighSurrogate() && compacted[cutLen].isLowSurrogate()
+    ) {
+        cutLen--
+    }
+    val cut = compacted.substring(0, cutLen)
     var open = cut.indexOf(TOOL_MARKER_OPEN, cut.lastIndexOf(']') + 1)
     while (open >= 0 && !isProducerMarkerOpener(cut, open)) {
         open = cut.indexOf(TOOL_MARKER_OPEN, open + 1)
@@ -2157,18 +2173,27 @@ internal fun compactToolMarkers(text: String): String {
             sb.append(text, i, text.length)
             break
         }
-        val end = text.indexOf(']', start + TOOL_MARKER_OPEN.length)
+        // Producer markers are line-start (or whole-string) only. A closed
+        // `[tool:...]` in ordinary prose must stay verbatim; compacting it
+        // would silently rewrite user-visible text.
+        if (!isProducerMarkerOpener(text, start)) {
+            sb.append(text, i, start + TOOL_MARKER_OPEN.length)
+            i = start + TOOL_MARKER_OPEN.length
+            continue
+        }
+        val end = producerMarkerEnd(text, start)
         if (end < 0) {
             sb.append(text, i, text.length)
             break
         }
         val nameStart = start + TOOL_MARKER_OPEN.length
-        val nameEnd = text.indexOf(' ', nameStart)
+        val firstSpace = text.indexOf(' ', nameStart)
+        val nameEnd = if (firstSpace in nameStart until end) firstSpace else end
         val first = text.getOrNull(nameStart)
         val nameLooksReal = first != null &&
             (first.isLetterOrDigit() || first == '.' || first == '_' || first == '-')
-        val hasArgs = nameEnd > nameStart && nameEnd < end
-        val nameLimit = if (hasArgs) nameEnd else end
+        val hasArgs = nameEnd < end
+        val nameLimit = nameEnd
         val nameTooLong = nameLimit - nameStart > TOOL_MARKER_NAME_MAX_CHARS
         if (!nameLooksReal || nameEnd == nameStart) {
             // Marker-shaped fragment (no plausible name); keep it verbatim
@@ -2192,6 +2217,52 @@ internal fun compactToolMarkers(text: String): String {
         i = end + 1
     }
     return sb.toString()
+}
+
+/**
+ * End index of a producer marker whose opener starts at [start]. JSON string
+ * state and bracket depth are tracked so a `]` inside quoted args (or inside
+ * a nested array) does not close the marker early. Returns -1 when the marker
+ * is unterminated.
+ */
+private fun producerMarkerEnd(text: String, start: Int): Int {
+    val nameStart = start + TOOL_MARKER_OPEN.length
+    var i = nameStart
+    while (i < text.length) {
+        val c = text[i]
+        if (c == ']') return i
+        if (c == '\n') return -1
+        if (c == ' ') break
+        i++
+    }
+    if (i >= text.length || text[i] == ']') return if (i < text.length) i else -1
+    // Skip the single separator before the JSON args echo.
+    var depth = 0
+    var inString = false
+    var escaped = false
+    i++
+    while (i < text.length) {
+        val c = text[i]
+        if (inString) {
+            if (escaped) {
+                escaped = false
+            } else if (c == '\\') {
+                escaped = true
+            } else if (c == '"') {
+                inString = false
+            }
+        } else {
+            when (c) {
+                '"' -> inString = true
+                '{', '[' -> depth++
+                '}' -> if (depth > 0) depth--
+                ']' -> if (depth == 0) return i else depth--
+                '\n' -> return -1
+            }
+        }
+        i++
+    }
+    return -1
 }
 
 /** First [TOOL_MARKER_NAME_MAX_CHARS] units of the name, never splitting a pair. */

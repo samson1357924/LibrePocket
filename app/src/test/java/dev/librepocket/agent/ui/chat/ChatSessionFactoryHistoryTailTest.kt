@@ -237,7 +237,47 @@ class ChatSessionFactoryHistoryTailTest {
         assertTrue("marker survives in bounded form", capped.contains("[tool:lsp.symbols …]"))
         assertFalse("args echo must be dropped", capped.contains("a".repeat(32)))
         assertTrue("answer after the marker must not be pushed out", capped.contains("z".repeat(1_000)))
-        assertTrue(capped.endsWith(HISTORY_TRUNCATION_MARKER))
+        // Compaction alone brought this row under the cap: no cap cut happened,
+        // so a "history truncated" suffix would falsely claim content loss.
+        assertFalse(capped.endsWith(HISTORY_TRUNCATION_MARKER))
+    }
+
+    @Test fun cappedHistoryText_preservesClosedMidLineMarkerProse() {
+        // Only line-start producer markers are compacted. A closed marker shape
+        // inside ordinary prose is user text and must survive over-cap capping
+        // beside the rest of the prefix.
+        val text = "start [tool:note keep these args] " + "y".repeat(30_000)
+        val capped = cappedHistoryText(text)
+        assertTrue(capped.contains("start [tool:note keep these args]"))
+        assertFalse(capped.contains("[tool:note …]"))
+    }
+
+    @Test fun cappedHistoryText_roleAwareCompactionKeepsUserArgs() {
+        val marker = "\n[tool:lsp.symbols {\"query\":\"" + "a".repeat(1_000) + "\"}]"
+        val text = marker + "z".repeat(30_000)
+        val user = cappedHistoryText(text, compactMarkers = false)
+        assertTrue("user rows must not be rewritten", user.contains("a".repeat(32)))
+        val assistant = cappedHistoryText(text, compactMarkers = true)
+        assertTrue(assistant.contains("[tool:lsp.symbols …]"))
+    }
+
+    @Test fun compactToolMarkers_respectsClosingBracketInsideQuotedArgs() {
+        // The args echo is JSON; a `]` inside a quoted value must not close the
+        // marker early and strand the remainder as ordinary text.
+        val marker = "[tool:lsp.symbols {\"query\":\"a]b\"}]"
+        val tail = "z".repeat(100)
+        assertEquals(
+            "[tool:lsp.symbols …]$tail",
+            compactToolMarkers(marker + tail),
+        )
+    }
+
+    @Test fun cappedHistoryText_neverSplitsSurrogateAtCap() {
+        val text = "a".repeat(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE - 1) + "😀" +
+            "b".repeat(100)
+        val body = cappedHistoryText(text).removeSuffix(HISTORY_TRUNCATION_MARKER)
+        assertEquals(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE - 1, body.length)
+        assertFalse("cap must not leave a lone high surrogate", body.last().isHighSurrogate())
     }
 
     @Test fun cappedHistoryText_neverEndsInsideToolMarker() {

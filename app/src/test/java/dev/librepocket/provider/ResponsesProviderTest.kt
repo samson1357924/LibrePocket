@@ -380,6 +380,83 @@ class ResponsesProviderTest {
     }
 
     @Test
+    fun mixedTextIdentityMidStreamPromotesOneBlock() {
+        // An id-less delta followed by an id-carrying delta for the same block
+        // must share one buffer: "Hel" + "lo" = "Hello", so the terminal item
+        // emits no duplicate suffix and no false mismatch.
+        val mapper = ResponsesMapper()
+        mapper.mapPayload(
+            """{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Hel"}""",
+        )
+        mapper.mapPayload(
+            """{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"lo"}""",
+        )
+        val events = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}]}}""",
+        )
+        assertTrue(
+            "terminal must not duplicate the merged prefix: $events",
+            events.filterIsInstance<StreamEvent.TextDelta>().isEmpty(),
+        )
+        assertEquals(StreamEvent.Done("stop"), events.last())
+    }
+
+    @Test
+    fun textIdentityDisappearsMidStreamKeepsIdBuffer() {
+        // Reverse mixed identity: the id appears first, then an id-less delta
+        // must append to the sticky id buffer instead of creating a positional
+        // twin that later re-emits "lo" after the terminal suffix.
+        val mapper = ResponsesMapper()
+        mapper.mapPayload(
+            """{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"Hel"}""",
+        )
+        mapper.mapPayload(
+            """{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"lo"}""",
+        )
+        val events = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}]}}""",
+        )
+        assertTrue(
+            "terminal must not duplicate the id buffer: $events",
+            events.filterIsInstance<StreamEvent.TextDelta>().isEmpty(),
+        )
+        assertEquals(StreamEvent.Done("stop"), events.last())
+    }
+
+    @Test
+    fun duplicateTerminalMessageItemEmitsSuffixOnce() {
+        // A duplicated terminal item is a replay: advancing the buffer after
+        // the first suffix makes the second item a no-op, not "lo" twice.
+        val mapper = ResponsesMapper()
+        mapper.mapPayload(
+            """{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"Hel"}""",
+        )
+        val events = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Hello"}]},{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}]}}""",
+        )
+        assertEquals(listOf("lo"), events.filterIsInstance<StreamEvent.TextDelta>().map { it.delta })
+        assertEquals(StreamEvent.Done("stop"), events.last())
+    }
+
+    @Test
+    fun reorderedTerminalTextSuffixUsesStreamedBlockIndex() {
+        // A reordered terminal array must not relabel the suffix with the
+        // array position: the streamed block identity is output_index 5.
+        val mapper = ResponsesMapper()
+        mapper.mapPayload(
+            """{"type":"response.output_text.delta","item_id":"msg_a","output_index":5,"content_index":0,"delta":"hello"}""",
+        )
+        val events = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_a","role":"assistant","content":[{"type":"output_text","text":"hello!"}]}]}}""",
+        )
+        assertEquals(
+            listOf(StreamEvent.TextDelta(0, 5_000, "!")),
+            events.filterIsInstance<StreamEvent.TextDelta>(),
+        )
+        assertEquals(StreamEvent.Done("stop"), events.last())
+    }
+
+    @Test
     fun functionCallFramesWithoutAnyIdentityFailTypedNonRetryable() {
         // No non-empty item_id/id AND no output_index: the call cannot be
         // paired with any bucket. Dropping such a frame would silently lose

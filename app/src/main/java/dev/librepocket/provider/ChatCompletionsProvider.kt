@@ -217,6 +217,7 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
     // generated here at finish(), never decremented).
     private var totalAggChars = 0
     private var finishReason: String? = null
+    private var webSearchCitationEmitted = false
     private var usage: StreamEvent.Usage? = null
     private var sawDone = false
     private var failed: StreamEvent.Failed? = null
@@ -300,7 +301,8 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
             }
             // 服务端搜索引用标注：之前直接忽略，现以 SERVER_TOOL 文本标记透出；
             // 无标注时零行为变化，且永不产生 ToolDelta/ToolDone。
-            if (hasWebSearchCitation(delta)) {
+            if (hasWebSearchCitation(delta) && !webSearchCitationEmitted) {
+                webSearchCitationEmitted = true
                 switchTo(Kind.TEXT)
                 out.add(StreamEvent.TextDelta(round, blockIndex, ServerToolTranscript.webSearchMarker("completed")))
             }

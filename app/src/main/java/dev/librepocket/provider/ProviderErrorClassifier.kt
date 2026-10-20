@@ -182,5 +182,5 @@ object ProviderErrorClassifier {
     }
 
     private val RETRYABLE_CODES = setOf(408, 409, 425, 429)
-    private val FATAL_CODES = setOf(400, 401, 402, 403, 422, 501)
+    private val FATAL_CODES = setOf(400, 401, 402, 403, 404, 422, 501)
 }

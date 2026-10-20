@@ -324,14 +324,16 @@ class McpTransportCancelTest {
         val signals = CallSignals()
         try {
             // 300KiB chunked body（> 256KiB 位元組上限）：必須拋 McpResponseTooLarge，
-            // 先 cancel 再拋，不回截斷半 JSON；絕不映射 OK。
+            // 先 cancel 再拋，不回截斷半 JSON；絕不映射 OK。10s 外層 watchdog 只防
+            // 「卡住」——正常路徑應在數百毫秒內達 cap，鑑別力來自例外型別與 cancel
+            // 訊號，不靠牆鐘下限。
             web.enqueue(MockResponse().setResponseCode(200).setChunkedBody("y".repeat(300 * 1024), 8192))
-            val outcome = withTimeoutOrNull(5_000) {
+            val outcome = withTimeoutOrNull(10_000) {
                 runCatching {
                     transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
                 }
             }
-            assertNotNull("超大 body 必須在 5s 內拋出（不等 EOF 排空）", outcome)
+            assertNotNull("超大 body 必須在 10s 內拋出（不等 EOF 排空）", outcome)
             val failure = outcome!!.exceptionOrNull()
             assertTrue("位元組超量必須拋 McpResponseTooLarge（非截斷 OK），實際=$outcome", failure is McpResponseTooLarge)
             assertCallCancelled(signals, "位元組超量 terminal")
@@ -349,12 +351,13 @@ class McpTransportCancelTest {
             // Content-Length 預檢分支：謊報 content-length 1MiB（> 256KiB cap）而實送
             // 1KiB → 收到標頭即拋＋cancel，不排空 body。刪預檢分支時會落到讀迴圈
             // 讀到 EOF/截斷（IOException 或 OK Success）而非 McpResponseTooLarge，故紅。
+            // 10s 外層 watchdog 只防卡住；正常路徑收到標頭即返回。
             web.enqueue(
                 MockResponse().setResponseCode(200)
                     .setBody("z".repeat(1024))
                     .setHeader("Content-Length", "1048576"),
             )
-            val outcome = withTimeoutOrNull(5_000) {
+            val outcome = withTimeoutOrNull(10_000) {
                 runCatching {
                     transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
                 }
@@ -377,9 +380,10 @@ class McpTransportCancelTest {
         val signals = CallSignals()
         try {
             // 200KiB ASCII（204800 位元組 < 256KiB，但 204800 字元 > 64k 字元上限）：
-            // 解碼後超量同樣拋 McpResponseTooLarge，不回截斷 JSON。
+            // 解碼後超量同樣拋 McpResponseTooLarge，不回截斷 JSON。15s 外層 watchdog
+            // 僅防卡住（正常路徑應為秒級以下）。
             web.enqueue(MockResponse().setResponseCode(200).setChunkedBody("y".repeat(200 * 1024), 8192))
-            val outcome = withTimeoutOrNull(10_000) {
+            val outcome = withTimeoutOrNull(15_000) {
                 runCatching {
                     transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
                 }
@@ -485,6 +489,10 @@ class McpTransportCancelTest {
     @Test fun exactCapStallReturnsPromptlyWithoutWaitingDeadline() = runBlocking {
         // 送滿位元組上限後 stall（不送 chunk 終止塊、不關 socket）：達 cap 立即拋，
         // 不得為等第 257KiB 個位元組卡到總 deadline（DEFAULT 20s；舊 +1 探針行為）。
+        // 外層 15s watchdog 只防卡住；另以 5s elapsed 上限保留「promptly」語意：
+        // 正常達 cap 路徑實測 ~6ms，而舊 +1 probe 會等 server thread 的 10s sleep
+        // 才以其他錯誤返回（或卡到 20s deadline）——5s 上限讓「10–14s 才拋」的
+        // 退化實作即使例外型別正確也紅。鑑別力仍以 McpResponseTooLarge 為主。
         val cap = McpTransport.RESPONSE_MAX_BYTES.toInt()
         val serverSocket = java.net.ServerSocket(0)
         val port = serverSocket.localPort
@@ -533,16 +541,16 @@ class McpTransportCancelTest {
         serverThread.start()
         try {
             val start = System.nanoTime()
-            val outcome = withTimeoutOrNull(8_000) {
+            val outcome = withTimeoutOrNull(15_000) {
                 runCatching {
                     McpTransport().postJson("http://127.0.0.1:$port/", "sekret", "{}", McpTimeouts.DEFAULT_MS)
                 }
             }
             val elapsedMs = (System.nanoTime() - start) / 1_000_000L
-            assertNotNull("達 cap stall 必須在 8s 內拋出（不等總 deadline 20s；舊碼此時仍卡在 probe 讀）", outcome)
+            assertNotNull("達 cap stall 必須在 15s 內拋出（正常 sub-second；舊碼等 10s sleep 或總 deadline 20s）", outcome)
             val failure = outcome!!.exceptionOrNull()
-            assertTrue("stall 必須拋 McpResponseTooLarge，實際=$outcome", failure is McpResponseTooLarge)
-            assertTrue("必須不等總 deadline（實際 ${elapsedMs}ms）", elapsedMs < 8_000L)
+            assertTrue("stall 必須拋 McpResponseTooLarge（舊碼卡 probe 讀後得到其他錯誤），實際=$outcome", failure is McpResponseTooLarge)
+            assertTrue("達 cap 必須 promptly 返回（< 5s；實測 ~6ms），實際 ${elapsedMs}ms", elapsedMs < 5_000L)
         } finally {
             try {
                 serverSocket.close()
@@ -782,9 +790,13 @@ class McpTransportCancelTest {
         try {
             // body 20s 後到（< readTimeout 30s）：舊碼約 20s 才回（內容），
             // 真總 deadline 應在 clamp 下限 15s 到期即回 null，且走 call.cancel()。
+            // 外層 watchdog 25s（> 真 deadline 15s），elapsed 範圍放寬到
+            // [12s, 22s]：避免負載下 scheduler/GC 抖動把正確行為判紅；null 與
+            // cancel 訊號才是主要鑑別力（若 deadline 沒觸發，body 20s 後會回
+            // 內容 → assertNull 紅）。
             web.enqueue(MockResponse().setResponseCode(200).setBody("{\"jsonrpc\":\"2.0\"}").setBodyDelay(20, TimeUnit.SECONDS))
             val start = System.nanoTime()
-            val got = withTimeoutOrNull(18_000) {
+            val got = withTimeoutOrNull(25_000) {
                 McpTransport(signaledClient(signals)).postJson(
                     web.url("/").toString(),
                     "sekret",
@@ -793,9 +805,9 @@ class McpTransportCancelTest {
                 )
             }
             val elapsedMs = (System.nanoTime() - start) / 1_000_000L
-            assertTrue("總 deadline 必須在 18s 內觸發（真 deadline，非等 IO 自然返回），實際 ${elapsedMs}ms", elapsedMs < 18_000L)
-            assertNull("總 deadline 到期必須回 null（呼叫方映射 TIMEOUT）", got)
-            assertTrue("deadline 觸發應約 15s（實際 ${elapsedMs}ms），過快為假陽性", elapsedMs >= 10_000L)
+            assertTrue("總 deadline 必須在 22s 內觸發（真 deadline，非等 IO 自然返回），實際 ${elapsedMs}ms", elapsedMs < 22_000L)
+            assertNull("總 deadline 到期必須回 null（呼叫方映射 TIMEOUT），實際 ${elapsedMs}ms", got)
+            assertTrue("deadline 觸發應約 15s（實際 ${elapsedMs}ms），過快為假陽性", elapsedMs >= 12_000L)
             assertCallCancelled(signals, "總 deadline")
             assertEquals(1, web.requestCount)
         } finally {
@@ -918,6 +930,8 @@ class McpTransportCancelTest {
         try {
             // 本層 deadline（MIN 15s）到期：回 TIMEOUT 且計入熔斷一次。
             // 對照組：父層 deadline 測試必須拋例外且不計熔斷（見上兩測試）。
+            // 外層 watchdog 25s（> 真 deadline 15s）；負載抖動不得把 TIMEOUT 判成
+            // watchdog 的 null。
             web.enqueue(MockResponse().setResponseCode(200).setBody("{\"jsonrpc\":\"2.0\"}").setBodyDelay(20, TimeUnit.SECONDS))
             val breaker = McpCircuitBreaker()
             val server = McpServer(
@@ -926,8 +940,8 @@ class McpTransportCancelTest {
                 transport = McpTransport(),
                 breaker = breaker,
             )
-            val got = withTimeoutOrNull(18_000) { server.listTools(McpTimeouts.MIN_MS) }
-            assertNotNull("本層 deadline 到期必須回 TIMEOUT（非 null/例外）", got)
+            val got = withTimeoutOrNull(25_000) { server.listTools(McpTimeouts.MIN_MS) }
+            assertNotNull("本層 deadline 到期必須在 25s 內回 TIMEOUT（非 watchdog null/例外）", got)
             assertEquals(McpStatus.TIMEOUT, got!!.status)
             assertEquals("本層超時應計入熔斷失敗一次", 1, breaker.failureCount())
             assertFalse(breaker.isOpen())

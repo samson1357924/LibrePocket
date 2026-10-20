@@ -140,6 +140,59 @@ class McpTransportSecurityTest {
         }
     }
 
+    @Test fun redirect300And304AreTerminalAndNeverReachTarget() = runBlocking {
+        // 300/304 也屬「3xx→PROTOCOL」契約：304 無 body 不代表可當 2xx 空結果，
+        // 300 有 Location 也不得跟隨。逐一用獨立 origin/target/breaker；target
+        // 預先佇列 okCall，若政策回歸而跟隨，斷言會看到 1 發（而非 watchdog）。
+        for (code in listOf(300, 304)) {
+            val origin = MockWebServer()
+            val target = MockWebServer()
+            origin.start()
+            target.start()
+            try {
+                origin.enqueue(redirect(code, target.url("/collect").toString()))
+                target.enqueue(okCall())
+                val breaker = McpCircuitBreaker()
+                val server = server(origin, breaker)
+                val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }
+                assertNotNull("$code 5s 內未回傳（watchdog 到期或佇列阻塞）", got)
+                assertEquals("$code 必須是終端 PROTOCOL", McpStatus.PROTOCOL, got!!.status)
+                assertEquals("$code 第二端點不得收到任何請求", 0, target.requestCount)
+                assertEquals("$code origin 恰一發（不跟隨、不重送）", 1, origin.requestCount)
+                assertEquals("$code 重定向計熔斷一次", 1, breaker.failureCount())
+            } finally {
+                origin.shutdown()
+                target.shutdown()
+            }
+        }
+    }
+
+    @Test fun redirect300And304OnListToolsNeverReachTarget() = runBlocking {
+        // 同 callTool 列，但走 listTools 分支（生產碼兩處各自判斷 3xx）；target
+        // 預先佇列 okCall，任何跟隨都會讓 target.requestCount 變成 1。
+        for (code in listOf(300, 304)) {
+            val origin = MockWebServer()
+            val target = MockWebServer()
+            origin.start()
+            target.start()
+            try {
+                origin.enqueue(redirect(code, target.url("/collect").toString()))
+                target.enqueue(okCall())
+                val breaker = McpCircuitBreaker()
+                val server = server(origin, breaker)
+                val got = withTimeoutOrNull(5_000) { server.listTools() }
+                assertNotNull("$code listTools 5s 內未回傳（watchdog 到期或佇列阻塞）", got)
+                assertEquals("$code listTools 必須是終端 PROTOCOL", McpStatus.PROTOCOL, got!!.status)
+                assertEquals("$code listTools 第二端點不得收到任何請求", 0, target.requestCount)
+                assertEquals("$code listTools origin 恰一發（不跟隨、不重送）", 1, origin.requestCount)
+                assertEquals("$code listTools 重定向計熔斷一次", 1, breaker.failureCount())
+            } finally {
+                origin.shutdown()
+                target.shutdown()
+            }
+        }
+    }
+
     // ---- 3. 注入的 permissive client 一律正規化 ----
 
     @Test fun injectedClientWithRedirectsEnabledIsNeutralized() = runBlocking {

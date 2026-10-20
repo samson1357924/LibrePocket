@@ -141,10 +141,9 @@ class McpRegistryTest {
     }
 
     @Test fun listAllAcceptsTimeoutParamOnHappyPath() = runBlocking {
-        // 注意：本測試只驗 listAll 接受 timeoutMs 參數並走通呼叫路徑（快速回應，
-        // 不觸發超時）。它**不**宣稱驗證 timeoutMs 真的逐服轉發——那需 ≥15s 延遲
-        // 或可注入 fake server（McpServer 為 final），超出單元測試範圍，故不以
-        // 「forward」命名誤導（外部 review P2）。
+        // 快速回應路徑：確認 listAll(timeoutMs) 接受參數並走通呼叫。真正的
+        // 「timeoutMs 逐服轉發」由 listAllForwardsPerServerTimeout 以 15s deadline
+        // 對 18s 延遲伺服器驗證（timeout 不再只是被接受）。
         val web = MockWebServer()
         web.start()
         try {
@@ -157,6 +156,46 @@ class McpRegistryTest {
             assertEquals(1, web.requestCount)
         } finally {
             web.shutdown()
+        }
+    }
+
+    @Test fun listAllForwardsPerServerTimeout() = runBlocking {
+        // TQ-03：listAll(timeoutMs) 必須把呼叫方上限**逐服轉發**給 listTools。
+        // 慢服 body 延遲 18s：若轉發 MIN_MS（15s）→ 15s 到期 TIMEOUT；若 listAll
+        // 丟掉參數改用 DEFAULT_MS（20s），18s 時 body 已到 → OK。故 15s/18s/20s
+        // 三個數字使本測對「參數被忽略」有鑑別力（不是只驗參數被接受）。
+        // 快服立即回 OK，證明逾時是逐服而非整體（慢服 15s 不會拖垮快服）。
+        val slow = MockWebServer()
+        val fast = MockWebServer()
+        slow.start()
+        fast.start()
+        try {
+            slow.enqueue(
+                MockResponse().setResponseCode(200)
+                    .setBody(goodListBody())
+                    .setBodyDelay(18, TimeUnit.SECONDS),
+            )
+            fast.enqueue(MockResponse().setResponseCode(200).setBody(goodListBody()))
+            val slowServer = server(slow, "slow")
+            val fastServer = server(fast, "fast")
+            val reg = McpRegistry(
+                linkedMapOf("slow" to slowServer, "fast" to fastServer),
+            )
+            val got = withTimeoutOrNull(25_000) { reg.listAll(McpTimeouts.MIN_MS) }
+            assertNotNull("listAll 必須在 watchdog 25s 內回傳（慢服 15s deadline）", got)
+            assertEquals(
+                "慢服必須因轉發的 15s deadline 而 TIMEOUT（若用預設 20s，18s body 會到 → OK）",
+                McpStatus.TIMEOUT,
+                got!!.getValue("slow").status,
+            )
+            assertEquals("快服必須獨立 OK（逐服預算，非整體縮短）", McpStatus.OK, got.getValue("fast").status)
+            assertEquals("慢服恰一發（timeout 不重送）", 1, slow.requestCount)
+            assertEquals("快服恰一發", 1, fast.requestCount)
+            assertEquals("慢服 TIMEOUT 必須計熔斷一次", 1, slowServer.breaker().failureCount())
+            assertEquals("快服成功不得計熔斷", 0, fastServer.breaker().failureCount())
+        } finally {
+            slow.shutdown()
+            fast.shutdown()
         }
     }
 

@@ -13,8 +13,8 @@ import org.junit.Test
  * Stage4 A-03：HTTP 狀態 × 重試預算矩陣的端到端釘（純測試補強，不改生產碼）。
  *
  * 誠實分類（與現行實作一致，非理想化矩陣）：
- * - 301/303（＋既有 302/307/308 覆蓋）：redirect 是終端回應、不跟隨、恰一發
- *   → PROTOCOL＋計熔斷；
+ * - 300/301/303/304（＋既有 302/307/308 覆蓋）：redirect 是終端回應、不跟隨、恰一發
+ *   → PROTOCOL＋計熔斷（`callTool` 與 `listTools` 兩條分支分別覆蓋）；
  * - 408/429：暫態 → TRANSPORT＋計熔斷，恰一發（one-shot body 擋 OkHttp 408 重送）；
  * - 503：TRANSPORT＋計熔斷；`Retry-After` 無論 delta-seconds／HTTP-date／垃圾值
  *   一律被 [RetryAfterStrip] 於 503 剝除 → 預算外重送不可達、恰一發；
@@ -89,6 +89,49 @@ class McpHttpBudgetMatrixTest {
             assertEquals("3xx 計熔斷一次", 1, breaker.failureCount())
         } finally {
             web.shutdown()
+        }
+    }
+
+    @Test fun redirect300And304OnCallToolAreTerminalProtocolWithSingleRequest() = runBlocking {
+        // 300（Multiple Choices）與 304（Not Modified）也是 3xx 終端回應：不得被
+        // 特別當成 OK／無 body 成功，也不得跟隨或重送。逐一用獨立 MockWebServer
+        // 與 breaker，避免前一 code 的熔斷狀態污染下一 code。
+        for (code in listOf(300, 304)) {
+            val web = MockWebServer()
+            web.start()
+            try {
+                web.enqueue(redirect(code, web.url("/moved").toString()))
+                val breaker = McpCircuitBreaker()
+                val s = server(web, breaker)
+                val got = deadline { s.callTool("t", "{}") }
+                assertNotNull("$code 必須在 5s 內原樣回到呼叫方（不跟隨、不重送）", got)
+                assertEquals("$code 必須映射 PROTOCOL（非 OK/TRANSPORT）", McpStatus.PROTOCOL, got!!.status)
+                assertEquals("$code 恰一發（body 不重放、不跟隨 Location）", 1, web.requestCount)
+                assertEquals("$code 計熔斷一次", 1, breaker.failureCount())
+            } finally {
+                web.shutdown()
+            }
+        }
+    }
+
+    @Test fun redirect300And304OnListToolsAreTerminalProtocolWithSingleRequest() = runBlocking {
+        // 3xx 分支在 McpServer.listTools 與 callTool 各有一份；只測 callTool 會讓
+        // listTools 對 300/304 的特例（例如把 304 當空成功）逃過。此列逐一用
+        // 獨立 MockWebServer/breaker 覆蓋 listTools 的 300 與 304。
+        for (code in listOf(300, 304)) {
+            val web = MockWebServer()
+            web.start()
+            try {
+                web.enqueue(redirect(code, web.url("/moved").toString()))
+                val breaker = McpCircuitBreaker()
+                val got = deadline { server(web, breaker).listTools() }
+                assertNotNull("$code listTools 必須在 5s 內原樣回到呼叫方（不跟隨、不重送）", got)
+                assertEquals("$code listTools 必須映射 PROTOCOL（非 OK/TRANSPORT）", McpStatus.PROTOCOL, got!!.status)
+                assertEquals("$code listTools 恰一發（不跟隨 Location）", 1, web.requestCount)
+                assertEquals("$code listTools 計熔斷一次", 1, breaker.failureCount())
+            } finally {
+                web.shutdown()
+            }
         }
     }
 

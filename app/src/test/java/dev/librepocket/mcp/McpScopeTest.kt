@@ -118,22 +118,48 @@ class McpScopeTest {
     }
 
     @Test fun scopeApiSignaturesPinNoSideEffectParameter() {
-        // S2-R02 API 形狀 pin（Java 反射鎖定 JVM 簽名）：check/canExecute/toToolDef
-        // **不得**再長出 sideEffect 參數——即使帶預設值（呼叫端可傳 READ 降級），
-        // JVM 方法參數表一變，下列 getMethod 即 NoSuchMethodException → 本測紅。
+        // S2-R02 API 形狀 pin（Java 反射鎖定 JVM 簽名）：check/canExecute/project/
+        // toToolDef **不得**再長出 sideEffect 參數——即使帶預設值（呼叫端可傳 READ
+        // 降級）。舊版只列舉 getMethod：新增多載
+        // `check(config, toolName, confirmed, ctx, sideEffect)` 會讓舊多載續存，
+        // 測試仍綠；故此處改為**公開方法簽名精確集合**（多載、別名、額外入口
+        // 皆會讓集合不等 → 紅）。`declaredMethods` 同時涵蓋 object 的私有限定名
+        // helper，故只取 public；Kotlin 預設參數會生成 `$default` 靜態 helper
+        // （呼叫端無法直接呼叫的多載），與 synthetic 方法一併排除。
         val cls = McpScope::class.java
-        cls.getMethod(
-            "check",
-            McpServerConfig::class.java,
-            String::class.java,
-            Boolean::class.javaPrimitiveType,
-            ProjectionContext::class.java,
+        val expected = sortedSetOf(
+            "switchKey(java.lang.String,java.lang.String):java.lang.String",
+            "requireBareToolName(java.lang.String):void",
+            "toToolDef(dev.librepocket.mcp.McpServerConfig,java.lang.String,java.lang.String)" +
+                ":dev.librepocket.tool.ToolDef",
+            "project(dev.librepocket.mcp.McpServerConfig,java.lang.String," +
+                "dev.librepocket.tool.ProjectionContext):dev.librepocket.tool.Projection",
+            "check(dev.librepocket.mcp.McpServerConfig,java.lang.String,boolean," +
+                "dev.librepocket.tool.ProjectionContext):dev.librepocket.mcp.McpGate",
+            "canExecute(dev.librepocket.mcp.McpServerConfig,java.lang.String,boolean," +
+                "dev.librepocket.tool.ProjectionContext):boolean",
         )
+        val actual = cls.declaredMethods
+            .filter { java.lang.reflect.Modifier.isPublic(it.modifiers) }
+            .filterNot { it.isSynthetic }
+            .filterNot { it.name == "<clinit>" || it.name.contains("\$default") }
+            .map { m ->
+                "${m.name}(${m.parameterTypes.joinToString(",") { it.typeName }}):" +
+                    m.returnType.typeName
+            }
+            .toSortedSet()
+        assertEquals(
+            "McpScope 公開 JVM 介面必須恰為契約集合——任何新增多載（含 SideEffect 參數）" +
+                "或新入口都必須先更新本 pin 並接受審查",
+            expected,
+            actual,
+        )
+        // 文件化：明確釘住 project 與 toToolDef 的既有 getMethod 形狀（若上述集合
+        // 斷言被誤放寬，這兩個呼叫仍會以 NoSuchMethodException 提供第二道防線）。
         cls.getMethod(
-            "canExecute",
+            "project",
             McpServerConfig::class.java,
             String::class.java,
-            Boolean::class.javaPrimitiveType,
             ProjectionContext::class.java,
         )
         cls.getMethod(
@@ -142,7 +168,55 @@ class McpScopeTest {
             String::class.java,
             String::class.java,
         )
-        // 簽名存在即通過；明確失敗訊息由 NoSuchMethodException 提供（上方無 assert 亦可）。
+        // 縱深防禦：即使未來有人刻意把簽名集合改成含 SideEffect 參數，公開入口
+        // 仍不得收該型別——class name 比對涵蓋任何套件下的 SideEffect。
+        val sideEffectParams = cls.declaredMethods
+            .filter { java.lang.reflect.Modifier.isPublic(it.modifiers) && !it.isSynthetic }
+            .flatMap { m ->
+                m.parameterTypes
+                    .filter { it.typeName.contains("SideEffect") }
+                    .map { "${m.name}(${it.typeName})" }
+            }
+        assertTrue(
+            "McpScope 公開方法不得有任何 SideEffect 參數（呼叫端不得以 READ 降級）：" +
+                sideEffectParams,
+            sideEffectParams.isEmpty(),
+        )
+    }
+
+    @Test fun modelSurfacesHaveNoSideEffectParameter() {
+        // TQ-01 延伸：授權／結果模型也不得長出「呼叫端可傳 SideEffect」的入口。
+        // 資料類別自動生成的 copy／componentN（以及 equals／hashCode／toString）
+        // 是 Kotlin 值語意機制，不是政策入口——copy 會鏡像既有 sideEffect 欄位
+        // （McpTool.copy(..., sideEffect)），若一併掃描會誤報；故排除 `copy`、
+        // `componentN` 與 `$default` helper。掃描只看**參數型別**：McpTool 的
+        // sideEffect 欄位 getter（無參數）不在此列。
+        val generatedDataClassMethods = setOf("copy", "equals", "hashCode", "toString")
+        val offenders = mutableListOf<String>()
+        for (model in listOf(
+            McpServerConfig::class.java,
+            McpTool::class.java,
+            McpCallResult::class.java,
+            McpListResult::class.java,
+            McpGate::class.java,
+        )) {
+            for (m in model.declaredMethods) {
+                if (!java.lang.reflect.Modifier.isPublic(m.modifiers)) continue
+                if (m.isSynthetic) continue
+                if (m.name in generatedDataClassMethods) continue
+                if (m.name.matches(Regex("component\\d+"))) continue
+                if (m.name.contains("\$default")) continue
+                for (p in m.parameterTypes) {
+                    if (p.typeName.contains("SideEffect")) {
+                        offenders += "${model.simpleName}.${m.name}(${p.typeName})"
+                    }
+                }
+            }
+        }
+        assertTrue(
+            "MCP 模型公開方法不得有 SideEffect 參數（授權一律按 WRITE）：$offenders",
+            offenders.isEmpty(),
+        )
     }
 
     @Test fun unavailableDeniedEvenWhenConfirmed() {

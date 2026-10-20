@@ -4,7 +4,7 @@
 
 - **Scope:** Repository CI, local JVM/Robolectric tests, static policy gates, and separately scheduled Android device tests.
 - **Owner role:** CI/build maintainer; no individual is assigned here.
-- **Source of truth:** `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`, `.github/workflows/security-audit.yml`, `scripts/docs_claim_check.sh`, `scripts/test_docs_claim_check.sh`, `scripts/apk_policy_inspect.py`, `scripts/summarize_junit.py`, `scripts/tests/test_apk_policy_check.py`, `scripts/tests/test_summarize_junit.py`, test source sets, Gradle wrapper/catalog, and the command results from the exact commit being assessed.
+- **Source of truth:** `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`, `.github/workflows/security-audit.yml`, `scripts/docs_claim_check.sh`, `scripts/test_docs_claim_check.sh`, `scripts/mcp_scan.py`, `scripts/requirements-docs.txt`, `scripts/apk_policy_inspect.py`, `scripts/summarize_junit.py`, `scripts/tests/test_apk_policy_check.py`, `scripts/tests/test_summarize_junit.py`, test source sets, Gradle wrapper/catalog, and the command results from the exact commit being assessed.
 - **Update trigger:** CI, test source-set, Android SDK/JDK, policy-script, or merge-gate changes.
 
 ## Current CI scope
@@ -31,7 +31,9 @@ enumerated zero-wiring bypass surface — each wiring vector and each discovery
 fail-closed path —, CWD-independent) followed by the static grep + manifest XML
 parse + gradle-injection scan guard `scripts/docs_claim_check.sh` (no Gradle
 execution, no emulator; requires `python3` — stdlib `xml.etree` for the C2
-manifest/XML scan plus PyYAML for workflow YAML validation; the C2b
+manifest/XML scan plus PyYAML for workflow YAML validation; CI installs the
+pinned, hash-checked `PyYAML==6.0.3` from `scripts/requirements-docs.txt`
+(with `--require-hashes`) rather than relying on the runner image; the C2b
 gradle-injection scan decodes Unicode `\uXXXX` escapes, then reads every
 `*.gradle`/`*.gradle.kts`/`gradle.properties` found by `find` — a superset of
 tracked files, so untracked local injections also fail closed — and matches
@@ -49,6 +51,19 @@ normaliser, so a `//` inside a URL/string cannot truncate a later FQN.
 `pr-gate` (`always()`, needs all prior jobs) resolves a skipped Gradle
 stage as pass only when the corresponding `changes` output is explicitly
 `false`, and fails closed otherwise.
+
+The docs guard and its fixture self-test share one stdlib-only scanner,
+`scripts/mcp_scan.py` (subcommands `discover`, `module-roots`, `types`,
+`outbound`). `discover` derives module roots from `settings.gradle[.kts]` and
+enumerates production Kotlin/Java sources (excluding real Gradle test source
+sets, including files outside `src/`); `types` extracts declared type names from
+the comment/string-stripped, Java-Unicode-decoded source view; `outbound`
+parses each in-package import independently and checks it against the exact
+allowlist plus the surrounding outbound `dev.librepocket.*` references. The
+fixture self-test copies that same script into its synthetic repositories, so
+the real gate and every fixture exercise the same parser instead of two drifting
+implementations. It is a zero-wiring gate helper, not a general-purpose
+security scanner.
 
 When `code == true`, the workflow uses JDK 25 and runs these Gradle stages:
 

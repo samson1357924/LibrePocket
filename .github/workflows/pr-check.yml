@@ -289,6 +289,10 @@ jobs:
           path: app/build/outputs/apk/**/*.apk
           retention-days: 7
 
+  # The docs gate fails closed (a violation turns this job red), but a red job
+  # does not by itself block merge: `main` has no branch-protection required
+  # checks configured yet. Merge blocking requires repository branch
+  # protection/rulesets (optionally CODEOWNERS for gate scripts/docs/workflows).
   docs-guard:
     name: Docs Claim Check
     runs-on: ubuntu-latest
@@ -297,16 +301,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # Pin the docs-guard dependency instead of relying on the runner image:
       # PyYAML is a hard dependency of the docs claim check (A0 parses every
-      # checked-in workflow). Missing PyYAML is already fail-closed there, but
-      # the traceback message is misleading; fail here with an actionable hint.
-      - name: Verify PyYAML
+      # checked-in workflow). The requirement + all accepted artifact hashes
+      # live in scripts/requirements-docs.txt (cp310-cp314 manylinux x86_64
+      # wheels + sdist); `pip install --hash` is not a CLI option, so the pin
+      # must be consumed as a requirements file. --ignore-installed forces
+      # downloading the hashed artifact even when the runner already has
+      # PyYAML 6.0.3 (otherwise no hash is checked); the exact version
+      # assertion below remains fail-closed.
+      - name: Install pinned PyYAML
+        env:
+          # Ubuntu 24.04 marks the system Python as externally managed; --user
+          # installs remain user-scoped while allowing pip to proceed.
+          PIP_BREAK_SYSTEM_PACKAGES: "1"
         run: |
           set -euo pipefail
-          if ! python3 -c 'import yaml'; then
-            echo "PyYAML is required by scripts/docs_claim_check.sh; install python3-yaml" >&2
-            exit 1
-          fi
+          python3 -m pip install --user --disable-pip-version-check --ignore-installed --require-hashes -r scripts/requirements-docs.txt
+          python3 -c 'import yaml; assert yaml.__version__ == "6.0.3", yaml.__version__'
 
       # Fixture self-test first (D-02): proves the guard still rejects each
       # enumerated zero-wiring bypass surface — manifest registration parsed as
@@ -366,6 +378,9 @@ jobs:
         working-directory: github_bot
         run: npm run build
 
+  # pr-gate aggregates the required jobs and fails when any did not succeed,
+  # but this check is informational until it is configured as a required status
+  # check in repository branch protection/rulesets (see docs/TESTING.md).
   pr-gate:
     name: PR Gate
     runs-on: ubuntu-latest

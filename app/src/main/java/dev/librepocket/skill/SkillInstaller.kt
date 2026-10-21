@@ -1105,7 +1105,7 @@ object SkillInstaller {
                     }
                 }
             }
-            // tid 僅用於 staging 產名唯一性：main 用 getId()（API 1 起存在、與
+            // tid 僅用於 staging／bak 產名唯一性：main 用 getId()（API 1 起存在、與
             // threadId() 同值）以保 API 33+（threadId() 需 API 36+）；host JVM
             // 測試端製作殘留檔名時用 threadId()。
             val tid = Thread.currentThread().id

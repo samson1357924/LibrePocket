@@ -796,6 +796,26 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '    A: android:fullBackupContent(0x010104eb)=\"@xml/backup_rules;junk\" (Raw: \"@xml/backup_rules;junk\")' \\\n"
             "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
             "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' ;;\n"
+            "        backup-id-junk)\n"
+            "          # The BACKUP binding ID form plus trailing junk (symmetric with\n"
+            "          # the literal-junk fixture above): a prefix re.match would take\n"
+            "          # \"@0x7f010000;junk\" at face value - same hex id, suffix the\n"
+            "          # runtime cannot dereference. The id branch must full-match the\n"
+            "          # whole value; the composite then drops to the string authorities\n"
+            "          # and fails closed, named.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000;junk' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' ;;\n"
+            "        nsc-id-junk)\n"
+            "          # The NSC binding ID form plus trailing junk: the same whole-value\n"
+            "          # contract as the backup pair - the truncated id must never resolve\n"
+            "          # on a prefix match. The composite falls to _xmltree_attr_value and\n"
+            "          # fails closed on the unknown encoding, named.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002;junk' ;;\n"
             "        data-rules-rebound-id)\n"
             "          # Per-attribute proof: ONLY android:dataExtractionRules carries\n"
             "          # an id with NO entry in the resources table (default FAKE_AAPT\n"
@@ -949,10 +969,30 @@ class ApkPolicyHarness(unittest.TestCase):
         )
         self.dexdump_path.chmod(0o755)
 
+    def _toolless_path(self) -> str:
+        # PATH directory carrying NO aapt/dexdump: some hosts (including this
+        # repo's dev machines) expose a real aapt and dexdump in /usr/bin,
+        # which would silently satisfy discovery via the gate's
+        # `command -v` fallback and flip every named-fail premise here.
+        # /bin may be a merger symlink of /usr/bin, so both names must stay
+        # unreached: only the external commands the gate itself needs are
+        # symlinked in (basename-noise tolerated; anything missing is from an
+        # already-non-POSIX environment).
+        shim = self.tmp / "path-shim"
+        shim.mkdir(exist_ok=True)
+        for name in ("sh", "python3", "dirname", "grep", "find", "sort", "tr", "ls", "sed"):
+            source = shutil.which(name)
+            if source:
+                target = shim / name
+                if not target.exists():
+                    target.symlink_to(source)
+        return str(shim)
+
     def _env(
         self,
         *,
         sdk: Path | None = None,
+        path: str | None = None,
         aapt_mode: str = "ok",
         dexdump_mode: str = "ok",
         xmltree_mode: str = "bindings",
@@ -967,7 +1007,7 @@ class ApkPolicyHarness(unittest.TestCase):
             {
                 "ANDROID_HOME": str(sdk or self.sdk),
                 "HOME": str(self.home),
-                "PATH": f"{self.fake_bin}:/usr/bin:/bin",
+                "PATH": path if path is not None else f"{self.fake_bin}:/usr/bin:/bin",
                 "FAKE_AAPT_MODE": aapt_mode,
                 "FAKE_DEXDUMP_MODE": dexdump_mode,
                 "FAKE_AAPT_XMLTREE": xmltree_mode,
@@ -987,6 +1027,7 @@ class ApkPolicyHarness(unittest.TestCase):
         apk: Path,
         *,
         foss: bool = False,
+        aapt_override: str | None = None,
         aapt_mode: str = "ok",
         dexdump_mode: str = "ok",
         xmltree_mode: str = "bindings",
@@ -994,18 +1035,24 @@ class ApkPolicyHarness(unittest.TestCase):
         nsc_mode: str = "ok",
         rules_mode: str = "ok",
         sdk: Path | None = None,
+        path: str | None = None,
         permissions: str = "",
         resources_count_file: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = ["sh", str(POLICY_CHECK)]
         if foss:
             command.append("--foss")
+        if aapt_override is not None:
+            # Flag ordering matches release_artifact_stage._run_policy: mode
+            # flag first, then --aapt <path>, the APK operand stays last.
+            command.extend(("--aapt", aapt_override))
         command.append(str(apk))
         return subprocess.run(
             command,
             cwd=ROOT,
             env=self._env(
                 sdk=sdk,
+                path=path,
                 aapt_mode=aapt_mode,
                 dexdump_mode=dexdump_mode,
                 xmltree_mode=xmltree_mode,
@@ -1391,6 +1438,23 @@ class ApkPolicyHarness(unittest.TestCase):
             "binding is a raw string, not a resource reference", result.stdout
         )
 
+    def test_merged_backup_id_with_trailing_junk_rejected(self) -> None:
+        # Symmetric with the literal-junk fixture: the ID branch must
+        # full-match the whole attr value too. "@0x7f010000;junk" is a
+        # composite the runtime cannot dereference - a prefix re.match would
+        # have resolved the truncated hex id and licensed the binding. The
+        # composite must drop to the string authorities and fail closed with
+        # the named raw-string message, never resolve from a prefix.
+        apk = complete_apk(
+            self.tmp / "backup-id-junk.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, xmltree_mode="backup-id-junk")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "binding is a raw string, not a resource reference", result.stdout
+        )
+
     def test_merged_data_extraction_rules_unresolvable_id_rejected(self) -> None:
         # e2e per-attr proof: android:dataExtractionRules bound to an id with
         # NO entry in the (default) resources table must fail the whole run -
@@ -1454,6 +1518,45 @@ class ApkPolicyHarness(unittest.TestCase):
                 '    A: android:dataExtractionRules(0x0101063e)=@xml/data_extraction_rules\n',
                 lambda: "",
             )
+
+    def test_backup_binding_id_branch_full_value_match(self) -> None:
+        # Direct matrix for the ID branch (mirror of the string-branch matrix
+        # above): a trailing-junk composite "@0x7f010000;junk" used to pass a
+        # prefix re.match with the same hex id, licensing the binding on bytes
+        # the runtime could never dereference. The gate must reject the
+        # composite through the raw-string authority instead of resolving the
+        # truncated id, while the whole-value clean id form still resolves.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            "binding is a raw string, not a resource reference",
+        ):
+            policy_inspect._assert_merged_backup_bindings(
+                "  E: application\n"
+                "    A: android:fullBackupContent(0x010104eb)=@0x7f010000;junk\n"
+                '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001\n',
+                lambda: "",
+            )
+        # Whole-value positive control: the clean id form still resolves
+        # through the table (the fullmatch never narrowed acceptance of the
+        # legitimate spellings: plain and aapt2 "@res/0x..." both whole-match).
+        table = (
+            "      spec resource 0x7f010000 dev.librepocket.agent:xml/backup_rules:"
+            " flags=0x00000000\n"
+            "      spec resource 0x7f010001 dev.librepocket.agent:xml/data_extraction_rules:"
+            " flags=0x00000000\n"
+        )
+        policy_inspect._assert_merged_backup_bindings(
+            "  E: application\n"
+            "    A: android:fullBackupContent(0x010104eb)=@0x7f010000\n"
+            "    A: android:dataExtractionRules(0x0101063e)=@0x7f010001\n",
+            lambda: table,
+        )
+        policy_inspect._assert_merged_backup_bindings(
+            "  E: application\n"
+            "    A: android:fullBackupContent(0x010104eb)=@res/0x7f010000\n"
+            "    A: android:dataExtractionRules(0x0101063e)=@res/0x7f010001\n",
+            lambda: table,
+        )
 
     def test_merged_backup_binding_per_attribute_unresolvable_id_rejected(self) -> None:
         # Either backup attr bound to an id the table does not carry fails the
@@ -2029,6 +2132,36 @@ class ApkPolicyHarness(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("rebound networkSecurityConfig binding", result.stdout)
 
+    def test_merged_nsc_id_with_trailing_junk_rejected(self) -> None:
+        # Symmetric with the literal-junk pin above: the ID branch must
+        # full-match the whole attr value too. "@0x7f010002;junk" falls
+        # through the id gate into _xmltree_attr_value, which rejects the
+        # unknown composite encoding with a named PolicyError - a prefix
+        # match must never resolve the truncated id.
+        apk = complete_apk(
+            self.tmp / "nsc-id-junk.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, xmltree_mode="nsc-id-junk")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("unrecognized attribute value encoding", result.stdout)
+
+    def test_merged_nsc_binding_id_junk_rejected_direct(self) -> None:
+        # Direct unit-level pin of the same whole-value rule: the composite
+        # reaches the decoder with its label, so the failure names the
+        # attribute it rejects.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            "unrecognized attribute value encoding '@0x7f010002;junk'",
+        ):
+            policy_inspect._assert_merged_network_security_config(
+                "/unused/aapt",
+                self.tmp / "unused.apk",
+                "  E: application\n"
+                "    A: android:networkSecurityConfig(0x01010527)=@0x7f010002;junk\n",
+                lambda: "",
+            )
+
     def test_merged_nsc_binding_outside_application_rejected(self) -> None:
         # Same <application>-block scoping as the backup pair.
         with self.assertRaisesRegex(
@@ -2576,6 +2709,145 @@ class ApkPolicyHarness(unittest.TestCase):
         self.assert_rejected(
             complete_apk(self.tmp / "missing-aapt.apk"), sdk=empty_sdk
         )
+
+    def test_aapt_override_broken_path_fails_named(self) -> None:
+        # --aapt pins the ruler explicitly: a NONEXISTENT, NON-EXECUTABLE, or
+        # SYMLINKED override must fail NAMED at the gate (before any
+        # source/artifact work), never silently falling back to tool
+        # discovery (two rulers for the same staged bytes) nor surfacing as
+        # an opaque scanner error deep inside the native scan. The third
+        # shape is the strongest arm: a symlink to a VALID executable still
+        # fails - the [ ! -L ] arm demands binary identity of the pinned
+        # ruler, not merely its executability.
+        apk = complete_apk(self.tmp / "aapt-override-broken.apk")
+        non_executable = self.tmp / "dead-aapt"
+        non_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+        symlinked = self.tmp / "symlinked-aapt"
+        symlinked.symlink_to(self.build_tools / "aapt")
+        for bad in (str(self.tmp / "no-such-aapt"), str(non_executable), str(symlinked)):
+            with self.subTest(override=bad):
+                result = self.run_policy(apk, aapt_override=bad)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("aapt override", result.stdout)
+                self.assertIn(
+                    "not an existing non-symlink executable file", result.stdout
+                )
+
+    def test_aapt_override_runs_the_caller_executable(self) -> None:
+        # Adoption sentinel: --aapt must EXECUTE the caller's path, not
+        # merely accept it. The wrapper records its own invocation in a
+        # sentinel file and forwards to the fixture aapt; the SDK pair stays
+        # complete so plain discovery works for dexdump - only the override
+        # can ever produce the sentinel (executed-side proof, not just an
+        # exit-status pass that a parsed-but-ignored flag would also earn).
+        sentinel = self.tmp / "aapt-override-sentinel"
+        wrapper = self.tmp / "wrapped-aapt"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f"printf x >> '{sentinel}'\n"
+            f"exec '{self.build_tools / 'aapt'}' \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        apk = complete_apk(self.tmp / "aapt-override-adopted.apk")
+        result = self.run_policy(apk, aapt_override=str(wrapper))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertTrue(
+            sentinel.is_file() and sentinel.stat().st_size > 0,
+            "the gated artifact scan must execute the override aapt (wrapper sentinel)",
+        )
+        # Control: the same clean APK WITHOUT the override never touches the
+        # wrapper - discovery selects only SDK build-tools executables.
+        sentinel.unlink()
+        no_override = self.run_policy(apk)
+        self.assertEqual(no_override.returncode, 0, no_override.stdout)
+        self.assertFalse(
+            sentinel.exists(), "auto-discovery must not call the override wrapper"
+        )
+
+    def test_aapt_override_passes_when_the_sdk_carries_only_a_dexdump(self) -> None:
+        # find_dexdump's motivation branch, on rails: the fake SDK layout
+        # carries ONLY the dexdump (in the build-tools spot beside where the
+        # caller-forwarded aapt would sit in a complete dir; the caller's own
+        # aapt lives OUTSIDE the probed SDK tree), so no probed directory
+        # holds the aapt+dexdump pair and find_tool_pair - the pre-fork
+        # requirement - fails named. The SAME environment plus --aapt must
+        # PASS: the fork exists exactly so the gate stops demanding a
+        # DISCOVERED aapt just to accept an override that already bounds its
+        # ruler.
+        dexdump_only_sdk = self.tmp / "sdk-dexdump-only"
+        dexdump_only_build_tools = dexdump_only_sdk / "build-tools" / "36.0.0"
+        dexdump_only_build_tools.mkdir(parents=True)
+        (dexdump_only_build_tools / "dexdump").write_text(
+            self.dexdump_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        (dexdump_only_build_tools / "dexdump").chmod(0o755)
+        caller_tools = self.tmp / "caller-side"  # beside the fake SDK tree
+        caller_tools.mkdir()
+        caller_aapt = caller_tools / "aapt"
+        caller_aapt.write_text(
+            (self.build_tools / "aapt").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        caller_aapt.chmod(0o755)
+        apk = complete_apk(self.tmp / "dexdump-only-sdk.apk")
+        toolless_path = self._toolless_path()
+        # Control: WITHOUT the override the same layout fails named on the
+        # MISSING discovered pair - the toolless PATH keeps a host-supplied
+        # aapt from satisfying `command -v` and quietly opening the lane;
+        # only the override opens this branch.
+        without_override = self.run_policy(apk, sdk=dexdump_only_sdk, path=toolless_path)
+        self.assertNotEqual(without_override.returncode, 0, without_override.stdout)
+        self.assertIn(
+            "required Android build-tools aapt and dexdump were not both found"
+            " (set ANDROID_HOME)",
+            without_override.stdout,
+        )
+        result = self.run_policy(
+            apk, aapt_override=str(caller_aapt), sdk=dexdump_only_sdk, path=toolless_path
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_aapt_override_lane_still_fails_named_without_any_dexdump(self) -> None:
+        # The fork narrows the REQUIRED DISCOVERY to dexdump only; aapt rides
+        # the override. An override that VALIDATES (the fixture aapt is an
+        # existing non-symlink executable) but an environment with NO dexdump
+        # anywhere must still fail NAMED - the exact gate wording, quoted
+        # verbatim - with the PAIR wording absent: it never claims the aapt
+        # side is missing (the override was accepted, never re-derived), and
+        # the dexdump responsibility is not silently dropped.
+        dexdump_less_sdk = self.tmp / "sdk-without-dexdump"
+        (dexdump_less_sdk / "build-tools" / "36.0.0").mkdir(parents=True)
+        apk = complete_apk(self.tmp / "override-lane-no-dexdump.apk")
+        result = self.run_policy(
+            apk,
+            aapt_override=str(self.build_tools / "aapt"),
+            sdk=dexdump_less_sdk,
+            path=self._toolless_path(),
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "required Android build-tools dexdump was not found (set ANDROID_HOME)",
+            result.stdout,
+        )
+        self.assertNotIn("aapt and dexdump were not both found", result.stdout)
+
+    def test_aapt_override_apk_token_gets_the_misplaced_flag_hint(self) -> None:
+        # --aapt consumes the NEXT token unconditionally (POSIX case has no
+        # lookahead): a misordered invocation like "... --aapt x.apk" feeds
+        # the APK operand into the override slot. The gate cannot reorder the
+        # caller's arguments, but the named failure must surface the likely
+        # misuse: a token ending in .apk cannot BE a tool - the message must
+        # point at the misplaced flag (message-text clarification only; the
+        # exit remains the standard named aapt-override failure, no behavior
+        # change).
+        misplaced = self.tmp / "misplaced-operands.apk"
+        misplaced.write_text("not an executable tool at all\n", encoding="utf-8")
+        apk = complete_apk(self.tmp / "aapt-override-hint.apk")
+        result = self.run_policy(apk, aapt_override=str(misplaced))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("not an existing non-symlink executable file", result.stdout)
+        self.assertIn("misplaced", result.stdout)
+        self.assertIn("consumes the next token unconditionally", result.stdout)
 
     def test_aab_is_rejected_before_bitwarden_or_gradle_is_invoked(self) -> None:
         # The current builder defaults to AAB. A fake Bitwarden executable logs
@@ -6177,6 +6449,22 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             or "ZIP structure" in proc.stderr,
             proc.stderr,
         )
+
+    def test_aapt_override_missing_path_fails_named_at_the_gate(self) -> None:
+        # Shell-layer `--aapt` contract on the REAL gate script (sandbox
+        # tree): a nonexistent override path fails with the NAMED aapt-override
+        # diagnosis before any source/artifact work - never a silent ruler
+        # swap back to discovery, never an opaque later error. This rides the
+        # same sandbox as the source-stage pins (the aapt validation fires
+        # even with a nonexistent ANDROID_HOME, proving the check precedes
+        # tool discovery entirely).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            with_override = self._run_gate(
+                root, "--aapt", str(root / "no-such-aapt")
+            )
+            self.assertNotEqual(with_override.returncode, 0, with_override.stderr)
+            self.assertIn("aapt override", with_override.stderr)
 
     def test_valid_tree_source_stage_passes(self) -> None:
         # A fully valid tree must sail through every source-stage check — the

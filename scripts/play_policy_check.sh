@@ -6,6 +6,16 @@
 #   scripts/play_policy_check.sh <play-apk> [second-play-apk ...]
 #   scripts/play_policy_check.sh --foss <foss-apk> [second-foss-apk ...]
 #   scripts/play_policy_check.sh --github <github-apk> [...]
+#   scripts/play_policy_check.sh [--foss|--github] --aapt <path> <apk> [...]
+#
+# --aapt overrides the gate's automatic aapt discovery with the CALLER's
+# executable (existence + executability validated, named fail otherwise).
+# Without it, discovery is unchanged (newest build-tools dir carrying BOTH
+# aapt and dexdump; see find_tool_pair below). The release verifier pins its
+# aapt by an explicit caller path (verify_release_apk.py --aapt); when this
+# gate runs inside that flow (release_artifact_stage.py::_run_policy) the
+# SAME path is forwarded here so one staged traffic of bytes is measured by
+# one ruler - not by two independently discovered aapt binaries.
 #
 # The common manifest policy (P2-1: NO SMS / MANAGE_EXTERNAL_STORAGE / VPN in
 # ANY flavor) is enforced at source level in EVERY lane -- see the
@@ -44,8 +54,23 @@ case "${1:-}" in
         shift
         ;;
 esac
+# --aapt <path> must be parsed BEFORE the artifact-argument loop (an override
+# path is not an APK and must never reach the *.apk extension filter). It
+# rides --foss/--github and precedes the APK operands: options before
+# operands, first arg still the mode flag, last arg still the primary APK.
+AAPT_OVERRIDE=
+case "${1:-}" in
+    --aapt)
+        if [ "$#" -lt 2 ]; then
+            printf 'usage: %s [--foss|--github] [--aapt <path>] <apk> [...]; AAB is unsupported\n' "$0" >&2
+            exit 2
+        fi
+        AAPT_OVERRIDE=$2
+        shift 2
+        ;;
+esac
 if [ "$#" -lt 1 ]; then
-    printf 'usage: %s [--foss|--github] <apk> [...]; AAB is unsupported\n' "$0" >&2
+    printf 'usage: %s [--foss|--github] [--aapt <path>] <apk> [...]; AAB is unsupported\n' "$0" >&2
     exit 2
 fi
 
@@ -90,6 +115,34 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 # The backup-rules validator (source-level) runs before the artifact loop, so
 # require python3 up front rather than failing later with an opaque message.
 command -v python3 >/dev/null 2>&1 || fail 'python3 is required for the backup rules validator and APK policy scanner'
+
+# --aapt override validation (named fail, never a silent fallback): the
+# override must be an existing, non-symlink, executable regular file - the
+# same shape build_release.sh demands of its caller-supplied aapt. A broken
+# override fails HERE (before any source/artifact work) so the release flow
+# cannot (a) silently rebuild the ruler via auto-discovery when the caller's
+# tool wiring is broken, nor (b) surface the defect as an opaque scanner
+# error deep inside the native scan. Misuse surface (message text only, no
+# behavior change): the --aapt case above consumes the NEXT token
+# UNCONDITIONALLY as the override path (options-before-operands is
+# documented here, not re-ordered by lookahead), so a misordered invocation
+# feeds the APK operand into the override slot and fails in THIS check
+# rather than as a usage error; the named message therefore points at the
+# likely misplaced flag, with an extra cue when the rejected token itself
+# ends in .apk (the APK operand was eaten as the override path).
+if [ -n "$AAPT_OVERRIDE" ]; then
+    if [ ! -L "$AAPT_OVERRIDE" ] && [ -f "$AAPT_OVERRIDE" ] && [ -x "$AAPT_OVERRIDE" ]; then
+        :
+    else
+        aapt_hint='; --aapt consumes the next token unconditionally (option order: [--foss|--github] --aapt <path> <apk> [...]): if this token is actually the APK operand, the --aapt flag is likely misplaced'
+        case "$AAPT_OVERRIDE" in
+            *.apk|*.APK)
+                aapt_hint="${aapt_hint}; this token itself ends with .apk - the APK operand was likely eaten as the override path"
+                ;;
+        esac
+        fail "aapt override is not an existing non-symlink executable file: $AAPT_OVERRIDE${aapt_hint}"
+    fi
+fi
 
 # Preserve source-level checks as defense in depth; artifact checks remain the
 # authority for the bytes supplied to this gate. The Play permission blacklist
@@ -228,7 +281,9 @@ esac
 # （network-security.xml）均列入，未來 flavor overlay 以別名新增 NSC 時也不
 # 能漏驗；檔名放寬只能讓 find 掃到「更多檔」，不可能放寬內容判準
 # （nsc_check.py 以 XML root/shape fail-closed 驗證每一個被掃到的檔，與 NSC
-# 本體檔名無關的檔會被拒）。find 依舊非管線代入取自身狀態（POSIX 賦值狀態＝
+# 本體檔名無關的檔會被拒）。如實記錄清單寬度：雙 `*` 碎片核取連「無分隔符全
+# 連寫」形 networksecurityconfig.xml 也一併命中（network * 空 * security），
+# 清單不含的情況不存在於此側。find 依舊非管線代入取自身狀態（POSIX 賦值狀態＝
 # 最後管段，find 不得與 sort 同管），fail-closed。
 NSC_LIST="$(find "$ROOT/app/src" -type f -name '*network*security*.xml')" ||
     fail 'network security config scan failed'
@@ -299,11 +354,24 @@ done
 # 重複驗證無害。find 失敗不可靜默：POSIX 管道無 pipefail，assignment 的狀態
 # 取自最後一個管段（sort），故 find 不得與 sort 同管——先以非管道代入取
 # find 自身狀態（fail-closed），再由近不會失敗的 printf|sort 做排序。
+# 如實記錄清單邊界：這份別名集合概不含「無分隔符全連寫」形——
+# dataextractionrules.xml 不命中任何 -name 碎片（對照 NSC 側的
+# *network*security* 連 networksecurityconfig.xml 都會命中）。被清單漏掉的
+# 拼法若真被 runtime 綁定，由 manifest 精確綁定 pin 兜底：本門的
+# --check-manifest「有設則必須等值」只認 @xml/backup_rules /
+# @xml/data_extraction_rules 字面值，rebind 別名一律 named fail；main 面另
+# 由固定路徑 --expect-root 全值驗證把關。
 BACKUP_RULES_LIST="$(find "$ROOT/app/src" -type f \( -name '*backup*rules*.xml' -o -name '*data_extraction*rules*.xml' -o -name '*data-extraction*rules*.xml' \) )" ||
     fail 'deep-scan of backup rules resources failed'
 BACKUP_RULES_FILES="$(printf '%s\n' "$BACKUP_RULES_LIST" | sort)"
 while IFS= read -r f; do
     [ -n "$f" ] || continue
+    # 歸屬分派為 case first-match：每個 arm 假設檔名拼字只屬「單一」語意家族。
+    # 混合拼法（例 backup_rules-data-extraction.xml 同時命中 *backup*rules* 與
+    # *data-extraction*rules*）會落在第一個 arm、以 full-backup-content root
+    # 為判準——誤判屬 fail-closed 方向（root 不符必 FAIL，不死放行），但 FAIL
+    # 訊息不指向真因。混合命名視為一種「新規範」：需要時必須在此明確新增
+    # dedicated arm，不得依賴隱式 first-match 語意。
     case "$f" in
         *backup*rules*.xml) broot=full-backup-content ;;
         *data_extraction*rules*.xml) broot=data-extraction-rules ;;
@@ -350,8 +418,52 @@ find_tool_pair() {
     return 1
 }
 
-if ! find_tool_pair; then
-    fail 'required Android build-tools aapt and dexdump were not both found (set ANDROID_HOME)'
+find_dexdump() {
+    # Dexdump-only discovery for the --aapt override lane: aapt comes from the
+    # caller there, so demanding a DISCOVERED aapt just to accept the override
+    # would reject a healthy environment (e.g. an SDK layout carrying only a
+    # dexdump next to the caller-forwarded aapt) over a tool the override
+    # already bounds. Same probing order, IFS/newline discipline, and
+    # version-sort preference as find_tool_pair above - only the required
+    # executable set narrows to dexdump.
+    for sdk in "${ANDROID_HOME:-}" "$HOME/Android/Sdk"; do
+        [ -n "$sdk" ] || continue
+        if [ -d "$sdk/build-tools" ]; then
+            candidates=$(ls -d "$sdk"/build-tools/* 2>/dev/null | sort -V -r || true)
+            _old_ifs=$IFS
+            IFS='
+'
+            set -f
+            for candidate in $candidates; do
+                if [ -x "$candidate/dexdump" ]; then
+                    DEXDUMP="$candidate/dexdump"
+                    IFS=$_old_ifs
+                    set +f
+                    return 0
+                fi
+            done
+            IFS=$_old_ifs
+            set +f
+        fi
+    done
+    if command -v dexdump >/dev/null 2>&1; then
+        DEXDUMP=$(command -v dexdump)
+        return 0
+    fi
+    return 1
+}
+
+if [ -n "$AAPT_OVERRIDE" ]; then
+    # Override lane: aapt is the caller-validated path (same bytes, same ruler
+    # as the release verifier); dexdump is still the gate's responsibility.
+    AAPT=$AAPT_OVERRIDE
+    if ! find_dexdump; then
+        fail 'required Android build-tools dexdump was not found (set ANDROID_HOME)'
+    fi
+else
+    if ! find_tool_pair; then
+        fail 'required Android build-tools aapt and dexdump were not both found (set ANDROID_HOME)'
+    fi
 fi
 
 for ART in "$@"; do

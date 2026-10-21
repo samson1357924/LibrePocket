@@ -987,7 +987,14 @@ def _assert_merged_backup_bindings(
             )
         value = match.group(1).strip()
         # aapt v1 prints "@0x7f010000"; aapt2 may spell it "@res/0x7f010000".
-        reference = re.match(r"@(?:res/)?0x([0-9a-fA-F]+)", value)
+        # The ID form must match the WHOLE value (fullmatch, the same
+        # whole-value contract the string branch enforces on the decoded
+        # payload below): a prefix match would take "@0x7f010000;junk" at
+        # face value - same hex id, suffix the runtime cannot dereference.
+        # The composite therefore falls through to the string authorities
+        # and fails closed there; only a whole-value reference may be
+        # resolved against the resources table.
+        reference = re.fullmatch(r"@(?:res/)?0x([0-9a-fA-F]+)", value)
         if reference is not None:
             proven_ids.append((name, resource, int(reference.group(1), 16)))
             continue
@@ -1335,7 +1342,12 @@ def _assert_merged_network_security_config(
             "default"
         )
     value = match.group(1).strip()
-    bound_by_id = re.match(r"@(?:res/)?0x([0-9a-fA-F]+)", value)
+    # The id column must match the WHOLE value (fullmatch, mirrored with the
+    # backup pair above): a "@0x7f010002;junk" composite must never resolve
+    # the truncated id as authoritative - it falls through to
+    # _xmltree_attr_value, which fails closed with a named unknown-encoding
+    # error. Only a whole-value reference may be proven against the table.
+    bound_by_id = re.fullmatch(r"@(?:res/)?0x([0-9a-fA-F]+)", value)
     if bound_by_id is not None:
         # The id column is the merger-proof half of the pin: prove the
         # referenced id IS xml/network_security_config in the table (an id

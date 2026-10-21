@@ -23,11 +23,19 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `scripts/tests/test_summarize_junit.py`,
 `scripts/tests/test_check_test_budgets.py`,
 `scripts/tests/test_check_junit_durations.py`,
+`scripts/build_release.sh`, `scripts/verify_release_apk.py`,
+`scripts/release_artifact_stage.py`, `scripts/check_release_pins.py`,
+`scripts/check_release_tag_version.py`, `scripts/fake_keystore_rehearsal.py`,
+`scripts/release_signer_pins.example.json`,
+`scripts/tests/test_release_artifact_verifier.py`,
+`scripts/tests/test_build_release_identity.py`,
 `.github/workflows/pr-check.yml`) outputs. The `policy` list ends with a
-trailing `- 'scripts/**'` catch-all: the explicit entries exist for
-readability/history, and the catch-all defaults any new `scripts/`
-harness code (checker or script test) into the gate with no filter edit
-(`PolicyCiGateControl` pins the catch-all in the parsed filter list).
+trailing `- 'scripts/**'` catch-all: the explicit entries above mirror the
+full filter in `pr-check.yml` (no silent drift between docs and workflow),
+they exist for readability/history, and the catch-all defaults any new
+`scripts/` harness code (checker or script test) into the gate with no
+filter edit (`PolicyCiGateControl` pins the catch-all in the parsed filter
+list and never parses this document).
 `docs-guard` always runs the
 static grep guard `scripts/docs_claim_check.sh` (no Gradle, no emulator);
 `pr-gate` (`always()`, needs all prior jobs) resolves a skipped Gradle

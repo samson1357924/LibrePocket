@@ -81,6 +81,10 @@ object ProviderErrorClassifier {
         "invalid_prompt",
         "model_not_found",
         "context_length_exceeded",
+        // Deterministic stream-contract failures are never retryable, even
+        // when a retryable body/structured token rides the same envelope.
+        "responses_output_mismatch",
+        "responses_identity_missing",
     )
     private val retryableStructuredTokens = setOf(
         "rate_limit_exceeded",

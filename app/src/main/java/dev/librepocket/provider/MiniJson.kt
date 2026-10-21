@@ -79,7 +79,7 @@ internal object MiniJson {
     data class JObj(val map: Map<String, J>) : J
     data class JArr(val items: List<J>) : J
     data class JStr(val v: String) : J
-    data class JNum(val v: Double) : J
+    data class JNum(val v: Double, val raw: String = v.toString()) : J
     data class JBool(val v: Boolean) : J
     object JNull : J
 
@@ -311,7 +311,7 @@ internal object MiniJson {
             val raw = s.substring(start, pos)
             val v = raw.toDouble()
             if (!v.isFinite()) fail("non-finite number '$raw'")
-            return JNum(v)
+            return JNum(v, raw)
         }
 
         fun expect(word: String) {

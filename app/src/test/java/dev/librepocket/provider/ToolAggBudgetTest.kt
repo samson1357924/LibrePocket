@@ -46,6 +46,16 @@ class ToolAggBudgetTest {
         error("unreachable")
     }
 
+    /** A latched identity/args conflict projects exactly one non-retryable mismatch. */
+    private fun assertOnlyOutputMismatch(events: List<StreamEvent>) {
+        assertEquals(
+            listOf(StreamEvent.Failed("RESPONSES_OUTPUT_MISMATCH", retryable = false)),
+            events,
+        )
+        assertTrue("no Done after a mismatch", events.none { it is StreamEvent.Done })
+        assertTrue("no ToolDone after a mismatch", events.none { it is StreamEvent.ToolDone })
+    }
+
     @Test
     fun requireToolAggBudgetExactBoundary() {
         requireToolAggBudget(349_525, 0)
@@ -519,33 +529,81 @@ class ToolAggBudgetTest {
     }
 
     @Test
-    fun responsesDoneOverwriteLegalEmitsNewValues() {
+    fun responsesDoneOverwriteIdentityFailsClosedWithoutOverwrite() {
+        // P1B-B: the added call_id is the bucket identity. A done frame that
+        // re-identifies the same item must latch the non-retryable mismatch;
+        // it may neither overwrite the old pair nor emit a second ToolDone.
         val mapper = ResponsesMapper()
         mapper.mapPayload(
             """{"type":"response.output_item.added","item_id":"it1","item":{"type":"function_call","call_id":"old-id","name":"old-name"}}""",
         )
-        val out = mapper.mapPayload(
-            """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"new-id","name":"new-name","arguments":"{}"}}""",
+        val first = mapper.mapPayload(
+            """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"old-id","name":"old-name","arguments":"{}"}}""",
+        ).filterIsInstance<StreamEvent.ToolDone>().single()
+        assertEquals("old-id", first.id)
+        assertEquals("old-name", first.name)
+        assertEquals("{}", first.argumentsJson)
+        assertOnlyOutputMismatch(
+            mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"new-id","name":"new-name","arguments":"{}"}}""",
+            ),
         )
-        val done = out.filterIsInstance<StreamEvent.ToolDone>().single()
-        assertEquals("new-id", done.id)
-        assertEquals("new-name", done.name)
-        assertEquals("{}", done.argumentsJson)
+        // The old pair stays the only emitted ToolDone; the latch also
+        // suppresses a later terminal/drain instead of resurrecting the call.
+        assertTrue("identity conflict must latch the terminal", mapper.terminalReached)
+        assertEquals(emptyList<StreamEvent>(), mapper.finish())
     }
 
     @Test
-    fun responsesDoneIgnoresFullWhenArgsPresentNoDoubleCount() {
-        // Deltas already hold 1k args; a hostile 400k terminal full must be
-        // ignored (not appended, not budgeted) when args are non-empty.
+    fun responsesDoneConflictingFullWithBufferedArgsFailsClosed() {
+        // P1B-B: when deltas already buffered args, a terminal full with
+        // different semantics is a contradiction, not an ignorable duplicate.
+        // Fail closed instead of executing the stale buffered arguments. A
+        // 400k hostile full keeps the original oversized-replay shape, but the
+        // semantic conflict wins before any budget/append.
         val mapper = ResponsesMapper()
-        mapper.mapPayload("""{"type":"response.function_call_arguments.delta","item_id":"it1","delta":"${"x".repeat(1_000)}"}""")
-        val big = "y".repeat(400_000)
+        mapper.mapPayload(
+            """{"type":"response.function_call_arguments.delta","item_id":"it1","delta":"{\"a\":1}"}""",
+        )
+        val big = """{"y":"${"y".repeat(400_000)}"}"""
+        // Escape the JSON quotes so the outer SSE payload itself is valid.
+        val bigJson = big.replace("\"", "\\\"")
+        assertOnlyOutputMismatch(
+            mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"c1","name":"f","arguments":"$bigJson"}}""",
+            ),
+        )
+        assertTrue("no ToolDone may execute the buffered args", mapper.terminalReached)
+        assertEquals(emptyList<StreamEvent>(), mapper.finish())
+    }
+
+    @Test
+    fun responsesDoneEquivalentFullWhitespaceKeyOrderEmitsOnce() {
+        // Positive control for the fail-closed full comparison: whitespace and
+        // key order are not semantic differences. The single buffered pair is
+        // emitted once, and an equivalent replay emits nothing (no duplicate
+        // ToolDone).
+        val mapper = ResponsesMapper()
+        mapper.mapPayload(
+            """{"type":"response.function_call_arguments.delta","item_id":"it1","delta":"{\"b\": [2, 3], \"a\": 1}"}""",
+        )
         val out = mapper.mapPayload(
-            """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"c1","name":"f","arguments":"$big"}}""",
+            """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"c1","name":"f","arguments":"{ \"a\" : 1, \"b\": [2, 3] }"}}""",
         )
         val done = out.filterIsInstance<StreamEvent.ToolDone>().single()
-        assertEquals(1_000, done.argumentsJson.length)
-        assertTrue(done.argumentsJson.all { it == 'x' })
+        assertEquals("c1", done.id)
+        assertEquals("f", done.name)
+        assertEquals("""{"b": [2, 3], "a": 1}""", done.argumentsJson)
+        assertEquals(
+            emptyList<StreamEvent>(),
+            mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"c1","name":"f","arguments":"{\"a\":1,\"b\":[2,3]}"}}""",
+            ),
+        )
+        assertEquals(
+            StreamEvent.Done("stop"),
+            mapper.mapPayload("""{"type":"response.completed","response":{"output":[]}}""").last(),
+        )
     }
 
     // ---- P1-2: function_call_arguments.done authoritative-full budgeting ----
@@ -659,58 +717,77 @@ class ToolAggBudgetTest {
     // ---- Stage 1 (F2): emittedToolIds dedup-set bound (same distinct cap) ----
 
     @Test
-    fun responsesDoneRotatingCallIdTripsEmittedIdCapTyped() {
-        // Hostile: one fixed item_id re-done with a rotating equal-length
-        // call_id. Per-candidate round-total growth stays 0 (equal lengths) and
-        // item_id is fixed, so requireToolAggBudget / requireTotalToolAggBudget
-        // / the callsByItem distinct count all stay silent. The only unbounded
-        // surface is emittedToolIds (and the emitted ToolDone count), which the
-        // same distinct per-attempt cap must now bound: the 65th distinct
-        // (toolIndex, id) throws typed, non-retryable.
+    fun responsesDoneChangingCallIdSameItemFailsClosedAfterFirstEmit() {
+        // P1B-B: one item/bucket owns exactly one call_id for the attempt. A
+        // second distinct call_id is identity churn, not a new call: it must
+        // project the non-retryable mismatch immediately and never emit a
+        // second ToolDone. This replaces the old rotating-id emitted-cap
+        // premise (rotation is now rejected before it can grow the set).
         val mapper = ResponsesMapper()
-        val over = toolFailureOf {
-            for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT + 1) {
-                val callId = String.format("c%03d", i) // 4 chars throughout
-                mapper.mapPayload(
-                    """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"$callId","name":"f"}}""",
-                )
-            }
-        }
-        assertAggOverflow(over)
-    }
-
-    @Test
-    fun responsesDoneDistinctIdsAtCapAllEmit() {
-        // Up to MAX_TOOL_CALLS_PER_ATTEMPT distinct (toolIndex, id) ToolDones
-        // are legal: 64 equal-length rotating re-dones all emit, none throw,
-        // and the round total never grows beyond one candidate (growth 0), so
-        // the emitted-id cap fires only on the 65th — not before it.
-        val mapper = ResponsesMapper()
-        var emitted = 0
-        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
-            val callId = String.format("c%03d", i)
+        val first = mapper.mapPayload(
+            """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"c000","name":"f"}}""",
+        ).filterIsInstance<StreamEvent.ToolDone>().single()
+        assertEquals("c000", first.id)
+        var emitted = 1
+        for (i in 1 until MAX_TOOL_CALLS_PER_ATTEMPT + 1) {
+            val callId = String.format("c%03d", i) // 4 chars throughout
             val out = mapper.mapPayload(
                 """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"$callId","name":"f"}}""",
             )
+            if (i == 1) {
+                assertOnlyOutputMismatch(out)
+            } else {
+                assertTrue("a latched conflict suppresses later frames", out.isEmpty())
+            }
             emitted += out.filterIsInstance<StreamEvent.ToolDone>().size
         }
+        assertEquals("only the first identity may ever be emitted", 1, emitted)
+        assertTrue("the second call_id latches the terminal", mapper.terminalReached)
+        assertEquals(emptyList<StreamEvent>(), mapper.finish())
+    }
+
+    @Test
+    fun responsesDoneDistinctItemsAtCapAllEmit() {
+        // Legal 64-call boundary: distinct item ids + distinct call_ids are
+        // genuine calls, so all MAX_TOOL_CALLS_PER_ATTEMPT ToolDones emit and
+        // the count cap is not hit early. (Rotation of one item's call_id is
+        // no longer a legal way to reach this boundary; see the mismatch test
+        // above and the 65th-call guard in the emitted-cap boundary test.)
+        val mapper = ResponsesMapper()
+        var emitted = 0
+        val toolIndexes = HashSet<Int>()
+        val ids = HashSet<String>()
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            val out = mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it$i","item":{"type":"function_call","call_id":"c$i","name":"f","arguments":"{}"}}""",
+            )
+            val done = out.filterIsInstance<StreamEvent.ToolDone>().single()
+            emitted++
+            toolIndexes.add(done.toolIndex)
+            ids.add(done.id)
+        }
         assertEquals(MAX_TOOL_CALLS_PER_ATTEMPT, emitted)
+        assertEquals(MAX_TOOL_CALLS_PER_ATTEMPT, toolIndexes.size)
+        assertEquals(MAX_TOOL_CALLS_PER_ATTEMPT, ids.size)
     }
 
     @Test
     fun responsesDoneResendAcceptedIdAtCapDuplicateIsTrueNoOp() {
-        // Emit-once per (toolIndex, id) pair: at-cap re-send of an
-        // already-emitted pair emits NOTHING (output no-op, no throw) — the
-        // guard charges only genuinely-new pairs, so a legal duplicate after
-        // the cap is never misread as an overflow and never re-emits.
+        // Emit-once per (toolIndex, id) pair: fill the legal 64-call boundary
+        // with distinct items/call_ids, then re-send an already-emitted pair.
+        // The replay emits NOTHING (output no-op, no throw): the guard charges
+        // only genuinely-new pairs, so a legal duplicate after the cap is never
+        // misread as an overflow and never re-emits.
         val mapper = ResponsesMapper()
+        var emitted = 0
         for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
-            mapper.mapPayload(
-                """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"${String.format("c%03d", i)}","name":"f"}}""",
-            )
+            emitted += mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it$i","item":{"type":"function_call","call_id":"c$i","name":"f","arguments":"{}"}}""",
+            ).filterIsInstance<StreamEvent.ToolDone>().size
         }
+        assertEquals(MAX_TOOL_CALLS_PER_ATTEMPT, emitted)
         val out = mapper.mapPayload(
-            """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"c000","name":"f"}}""",
+            """{"type":"response.output_item.done","item_id":"it0","item":{"type":"function_call","call_id":"c0","name":"f","arguments":"{}"}}""",
         )
         assertTrue("duplicate of an already-emitted pair emits nothing", out.isEmpty())
     }
@@ -1557,9 +1634,10 @@ class ToolAggBudgetTest {
     // Responses done-path guard order is id (4096) -> per-call -> total ->
     // emitted-count. A 10KB rotating call_id trips the per-key id guard on the
     // very first arrival (iteration 0); per-candidate growth is irrelevant and
-    // total/emitted are never reached. A 4-char rotation keeps every char
-    // guard silent (equal lengths => growth 0) so the emitted-count cap wins
-    // deterministically on the 65th distinct pair (iteration 64).
+    // total/emitted are never reached. P1B-B changed the small-rotation shape:
+    // the second distinct call_id is now identity churn and latches the
+    // non-retryable mismatch instead of growing the emitted set toward the old
+    // 65th-pair cap (which genuine distinct calls cover separately).
 
     @Test
     fun responsesRotatingGiantCallIdIdGuardWinsFirstIteration() {
@@ -1593,35 +1671,75 @@ class ToolAggBudgetTest {
     }
 
     @Test
-    fun responsesRotatingSmallCallIdEmittedWinsAtSixtyFifth() {
-        // Same fixed item_id, 4-char rotating call_ids ("c000".."c064"): every
-        // candidate is ~5 chars, growth 0 after the first, so per-call/total
-        // stay silent and only the emitted (toolIndex, id) count can trip —
-        // deterministically on the 65th distinct pair (iteration 64).
+    fun responsesRotatingSmallCallIdFailsMismatchWithoutNewEmit() {
+        // P1B-B: a fixed item_id with rotating 4-char call_ids is identity
+        // churn. The second distinct call_id latches the non-retryable
+        // mismatch on iteration 1; no later frame may add an emitted pair.
+        // (The old emitted-count premise is unreachable now: one bucket can
+        // only ever own one pair.)
         val mapper = ResponsesMapper()
-        var firstIteration = -1
-        var failure: ProviderFailure? = null
-        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT + 1) {
+        val first = mapper.mapPayload(
+            """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"c000","name":"f"}}""",
+        ).filterIsInstance<StreamEvent.ToolDone>().single()
+        assertEquals("c000", first.id)
+        var emitted = 1
+        var firstMismatchIteration = -1
+        for (i in 1 until MAX_TOOL_CALLS_PER_ATTEMPT + 1) {
             val callId = String.format("c%03d", i)
-            try {
-                mapper.mapPayload(
-                    """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"$callId","name":"f"}}""",
-                )
-            } catch (e: ProviderFailure) {
-                if (failure == null) {
-                    failure = e
-                    firstIteration = i
-                    break
-                }
+            val out = mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"$callId","name":"f"}}""",
+            )
+            if (firstMismatchIteration < 0) {
+                assertOnlyOutputMismatch(out)
+                firstMismatchIteration = i
+            } else {
+                assertTrue("post-latch rotation must not emit", out.isEmpty())
             }
+            emitted += out.filterIsInstance<StreamEvent.ToolDone>().size
         }
-        assertTrue("small rotation must trip the emitted cap", failure != null)
-        assertEquals(
-            "emitted-count wins deterministically on the 65th pair (iteration 64)",
-            MAX_TOOL_CALLS_PER_ATTEMPT,
-            firstIteration,
+        assertEquals("the second distinct call_id wins immediately", 1, firstMismatchIteration)
+        assertEquals("rotation never adds an emitted pair", 1, emitted)
+        assertTrue(mapper.terminalReached)
+        assertEquals(emptyList<StreamEvent>(), mapper.finish())
+    }
+
+    @Test
+    fun responsesDoneDistinctCallsAtEmittedCapBoundary() {
+        // Legal boundary for the shared emitted/admission cap. Rotation can no
+        // longer reach it, so fill it with 64 genuine distinct calls: all 64
+        // emit, an at-cap replay is a no-op, and the 65th distinct call trips
+        // the same typed non-retryable aggregation failure before any insert
+        // or emit. This preserves the budget coverage the old rotating test
+        // lost without weakening the identity rule.
+        val mapper = ResponsesMapper()
+        var emitted = 0
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            emitted += mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it$i","item":{"type":"function_call","call_id":"c$i","name":"f","arguments":"{}"}}""",
+            ).filterIsInstance<StreamEvent.ToolDone>().size
+        }
+        assertEquals(MAX_TOOL_CALLS_PER_ATTEMPT, emitted)
+        assertTrue(
+            "an already-emitted pair is a legal no-op at the cap",
+            mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it0","item":{"type":"function_call","call_id":"c0","name":"f","arguments":"{}"}}""",
+            ).isEmpty(),
         )
-        assertAggOverflow(failure!!)
+        val over = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it$MAX_TOOL_CALLS_PER_ATTEMPT","item":{"type":"function_call","call_id":"c$MAX_TOOL_CALLS_PER_ATTEMPT","name":"f","arguments":"{}"}}""",
+            )
+        }
+        assertAggOverflow(over)
+        val tail = mapper.finish()
+        assertTrue(
+            "the rejected 65th call must never be emitted",
+            tail.filterIsInstance<StreamEvent.ToolDone>().isEmpty(),
+        )
+        assertEquals(
+            StreamEvent.Failed("SSE_TRUNCATED", retryable = true),
+            tail.single(),
+        )
     }
 
     // ---- S4: finishPendingTools drain executes at the cap (2x loose bound) ----

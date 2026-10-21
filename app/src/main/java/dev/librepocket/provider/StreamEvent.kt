@@ -157,7 +157,10 @@ internal fun requireTotalToolAggBudget(totalChars: Int, incomingChars: Int) =
  * - Responses `emittedToolIds`: one entry per distinct (`toolIndex`, id)
  *   pair already emitted (its `output_item.done` path is pre-checked here;
  *   the `finishPendingTools` drain adds at most one pair per already-capped
- *   `callsByItem` entry, so the set stays within 2x the cap);
+ *   `callsByItem` entry, so the set stays within 2x the cap). The companion
+ *   `emittedCalls` map retains only a bounded SHA-256 payload fingerprint
+ *   (name + canonical args + length) per pair, never a second full args copy,
+ *   so call-id rotation cannot multiply large payload retention;
  * - Responses `streamedTextByBlock`: one entry per distinct streamed
  *   `output_text` block key; Responses `webSearchStates`: one entry per
  *   distinct web-search item key; the two mixed-identity correlation maps

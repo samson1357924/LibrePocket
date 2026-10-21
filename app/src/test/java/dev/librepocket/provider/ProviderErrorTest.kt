@@ -156,6 +156,8 @@ class ProviderErrorTest {
             "invalid_prompt",
             "model_not_found",
             "context_length_exceeded",
+            "responses_output_mismatch",
+            "responses_identity_missing",
         )
         for (token in fatalTokens) {
             assertEquals(
@@ -309,6 +311,34 @@ class ProviderErrorTest {
                 marker,
                 FailureKind.FATAL,
                 ProviderErrorClassifier.classify(null, null, marker),
+            )
+        }
+    }
+
+    @Test
+    fun deterministicStreamContractStructuredTokensBeatRetryableBody() {
+        // Structured code/type tokens must stay fatal even when the same body
+        // also carries retryable wording (500/429 would otherwise retry).
+        for (token in listOf("responses_output_mismatch", "responses_identity_missing")) {
+            assertEquals(
+                "code $token",
+                FailureKind.FATAL,
+                ProviderErrorClassifier.classify(
+                    500,
+                    null,
+                    "rate_limit_exceeded, timeout, try again",
+                    structuredCode = token,
+                ),
+            )
+            assertEquals(
+                "type $token",
+                FailureKind.FATAL,
+                ProviderErrorClassifier.classify(
+                    429,
+                    null,
+                    "overloaded_error",
+                    structuredType = token,
+                ),
             )
         }
     }

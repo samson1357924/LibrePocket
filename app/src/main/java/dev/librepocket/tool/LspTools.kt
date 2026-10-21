@@ -9,6 +9,13 @@ package dev.librepocket.tool
  *   未傳入時一律走本地樁；
  * - 開關 `lsp` 預設 false（投影未開啟時為 UNAVAILABLE + USER_DISABLED）。
  *
+ * Execution readiness & session composition:
+ * - `lsp.symbols` is marked `executionReady = true` in `ToolRegistry` as a
+ *   registry readiness flag for `visibleTools` eligibility only.
+ * - `lsp.diagnostics` remains `executionReady = false`.
+ * - Production session composition builds with `toolSlice = null`
+ *   (records-only), meaning neither tool has a production execution path.
+ *
  * 純 JVM（無 Android API），可在單元測試直接執行。
  */
 object LspTools {

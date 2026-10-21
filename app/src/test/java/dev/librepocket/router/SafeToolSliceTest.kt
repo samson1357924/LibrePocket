@@ -273,6 +273,18 @@ class SafeToolSliceTest {
         assertEquals(0, backend.invocations.get())
     }
 
+    @Test fun lspDiagnosticsDeniedNotReadyBecauseExecutionReadyFalse() = runBlocking {
+        assertTrue(ToolRegistry.find("lsp.symbols")!!.executionReady)
+        assertFalse(ToolRegistry.find("lsp.diagnostics")!!.executionReady)
+
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        val r = s.execute(listOf(call(name = "lsp.diagnostics", args = """{"path":"src/Main.kt"}"""))).single()
+        assertTrue(r.denied)
+        assertEquals(SafeToolSlice.DenyCodes.NOT_READY, r.denyCode)
+        assertEquals(0, backend.invocations.get())
+    }
+
     @Test fun policyDenyAndAskDenyWithZeroSideEffects() = runBlocking {
         val backend = CountingBackend()
         val denyPolicy = InMemoryPolicyStore(
@@ -329,6 +341,31 @@ class SafeToolSliceTest {
         assertTrue(msgs[1].text.contains(SafeToolSlice.DenyCodes.BUDGET_EXCEEDED))
         assertTrue(msgs[2].text.contains(SafeToolSlice.DenyCodes.BUDGET_EXCEEDED))
         assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun budgetExceededWithDuplicateCallIdsNormalizesReceiptWireIds() = runBlocking {
+        val backend = CountingBackend()
+        val s = slice(backend = backend, maxCallsPerTurn = 1)
+        val calls = listOf(
+            call(id = "dup", args = """{"query":"A"}"""),
+            call(id = "dup", args = """{"query":"B"}"""),
+        )
+        val results = s.execute(calls)
+        assertEquals(2, results.size)
+        assertTrue(results.all { it.denied })
+        assertTrue(results.all { it.denyCode == SafeToolSlice.DenyCodes.BUDGET_EXCEEDED })
+        assertEquals(0, backend.invocations.get())
+
+        val msgs = s.continuationMessages(calls, results)
+        val continuationToolMessages = msgs.filter { it.role == "tool" }
+        assertEquals(calls.size, continuationToolMessages.size)
+        for (i in calls.indices) {
+            val receiptCallId = Json.parseToJsonElement(results[i].resultJson).jsonObject["callId"]!!.jsonPrimitive.content
+            assertEquals(continuationToolMessages[i].toolCallId, receiptCallId)
+            assertEquals(msgs[i + 1].toolCallId, receiptCallId)
+        }
+        assertEquals("dup", continuationToolMessages[0].toolCallId)
+        assertEquals("dup_2", continuationToolMessages[1].toolCallId)
     }
 
     @Test fun continuationMessagesPairCallsAndResults() = runBlocking {

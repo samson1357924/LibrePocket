@@ -931,7 +931,7 @@ private fun MessageBubble(
             ),
         ) {
             Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-                val displayText = if (msg.role == "assistant") displayAssistantText(msg.text) else msg.text
+                val displayText = displayAssistantText(msg.role, msg.text)
                 Text(
                     text = if (msg.isPartial) displayText + " ▍" else displayText,
                     style = MaterialTheme.typography.bodyLarge,

@@ -602,7 +602,13 @@ class SafeToolSlice(
             }
         }
         if (calls.size > maxCallsPerTurn) {
-            return calls.map { deny(it, DenyCodes.BUDGET_EXCEEDED, "at most $maxCallsPerTurn tool calls per round") }
+            // normalizedWireIds ensures that whole-round budget denials with
+            // duplicate or over-cap IDs match the wire IDs on continuation
+            // messages without discrepancy.
+            val normalizedWireIds = uniqueBoundedIds(wireCallIds(calls).map { boundedRedactedId(it) })
+            return calls.mapIndexed { i, c ->
+                deny(c, DenyCodes.BUDGET_EXCEEDED, "at most $maxCallsPerTurn tool calls per round", wireId = normalizedWireIds[i])
+            }
         }
         // Direct-API defense in depth: the turn engine dedups by redacted id
         // before calling, but a future caller must not execute two calls that

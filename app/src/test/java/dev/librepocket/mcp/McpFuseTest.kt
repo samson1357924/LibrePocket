@@ -82,10 +82,12 @@ class McpFuseTest {
             }
             assertTrue(breaker.isOpen())
             assertEquals(3, web.requestCount)
-            // 開路期間短路：不發 HTTP。
+            // 開路期間短路：不發 HTTP（call 與 list 兩端獨立分支，各自驗證）。
             val shorted = s.callTool("search", arg)
             assertEquals(McpStatus.CIRCUIT_OPEN, shorted.status)
             assertEquals(3, web.requestCount)
+            assertEquals(McpStatus.CIRCUIT_OPEN, s.listTools().status)
+            assertEquals("list 短路不得發 HTTP", 3, web.requestCount)
         } finally {
             web.shutdown()
         }
@@ -133,7 +135,7 @@ class McpFuseTest {
         }
     }
 
-    @Test fun unauthorizedCountsAsFailure() = runBlocking {
+    @Test fun unauthorizedDoesNotTripBreaker() = runBlocking {
         val web = MockWebServer()
         web.start()
         try {
@@ -144,7 +146,96 @@ class McpFuseTest {
             repeat(3) {
                 assertEquals(McpStatus.UNAUTHORIZED, s.callTool("t", "{}").status)
             }
-            assertTrue(breaker.isOpen())
+            // C-06：401 認證錯不計熔斷（與 vault-miss／Bearer 預檢同待遇，換 key
+            // 後立即恢復）。三次呼叫必須全部真的發送（未被短路）。
+            // mutation（把 401 分支加回 breaker.onFailure()）此測即紅。
+            assertFalse(breaker.isOpen())
+            assertEquals("401 不得計入熔斷失敗", 0, breaker.failureCount())
+            assertEquals("401 每次都須真發送（不短路）", 3, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun unauthorizedDoesNotResetExistingFailureCount() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // C-06 缺口補釘（SF-3，callTool 端 401 分支）：401 不只「不計入」，
+            // 更不得「清除」既有 failures——500,500,401,500 交錯若 401 誤計成功
+            // （onSuccess），第 4 發 500 只會把計數帶回 1、熔斷永不開路。
+            // mutation（401 分支改 breaker.onSuccess()）此測即紅。
+            web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
+            web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
+            web.enqueue(MockResponse().setResponseCode(401).setBody("no"))
+            web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
+            val clock = Clock(0L)
+            val breaker = McpCircuitBreaker(maxFailures = 3, openMs = 60_000L, clockMs = clock::get)
+            val s = server(web, clock, breaker)
+            assertEquals(McpStatus.TRANSPORT, s.callTool("t", "{}").status)
+            assertEquals(McpStatus.TRANSPORT, s.callTool("t", "{}").status)
+            assertEquals("前兩發 500：failures=2、未開路", 2, breaker.failureCount())
+            assertFalse(breaker.isOpen())
+            assertEquals(McpStatus.UNAUTHORIZED, s.callTool("t", "{}").status)
+            assertEquals("401 不得清除既有 failures", 2, breaker.failureCount())
+            assertFalse("401 後仍不得開路", breaker.isOpen())
+            assertEquals(McpStatus.TRANSPORT, s.callTool("t", "{}").status)
+            assertTrue("第 3 個失敗（500）必須開路", breaker.isOpen())
+            assertEquals("四發各恰一發（無重送、無短路）", 4, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun forbiddenOnListDoesNotResetExistingFailureCount() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // 同 unauthorizedDoesNotResetExistingFailureCount 情境、403 × listTools
+            // 端分支（McpServer listTools 的 401/403 early-return）：403 同樣不得
+            // 清除既有 failures。mutation（403 分支改 breaker.onSuccess()）此測即紅。
+            web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
+            web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
+            web.enqueue(MockResponse().setResponseCode(403).setBody("forbidden"))
+            web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
+            val clock = Clock(0L)
+            val breaker = McpCircuitBreaker(maxFailures = 3, openMs = 60_000L, clockMs = clock::get)
+            val s = server(web, clock, breaker)
+            assertEquals(McpStatus.TRANSPORT, s.listTools().status)
+            assertEquals(McpStatus.TRANSPORT, s.listTools().status)
+            assertEquals("前兩發 500：failures=2、未開路", 2, breaker.failureCount())
+            assertFalse(breaker.isOpen())
+            assertEquals(McpStatus.UNAUTHORIZED, s.listTools().status)
+            assertEquals("403 不得清除既有 failures", 2, breaker.failureCount())
+            assertFalse("403 後仍不得開路", breaker.isOpen())
+            assertEquals(McpStatus.TRANSPORT, s.listTools().status)
+            assertTrue("第 3 個失敗（500）必須開路", breaker.isOpen())
+            assertEquals("四發各恰一發（無重送、無短路）", 4, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun listEnd403DoesNotCountBut429And408StillDo() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // list 端矩陣（C-06 與原 A-03 清單共同缺口）：403 認證錯不計熔斷；
+            // 429/408 暫態照計；恰三發＝各一發、408 不隱性重送。
+            web.enqueue(MockResponse().setResponseCode(403).setBody("forbidden"))
+            web.enqueue(MockResponse().setResponseCode(429).setBody("slow down"))
+            web.enqueue(MockResponse().setResponseCode(408).setBody("timeout"))
+            val clock = Clock(0L)
+            val breaker = McpCircuitBreaker(maxFailures = 3, openMs = 60_000L, clockMs = clock::get)
+            val s = server(web, clock, breaker)
+            assertEquals(McpStatus.UNAUTHORIZED, s.listTools().status)
+            assertEquals("list 403 不得計熔斷", 0, breaker.failureCount())
+            assertEquals(McpStatus.TRANSPORT, s.listTools().status)
+            assertEquals("list 429 必須計熔斷一次", 1, breaker.failureCount())
+            assertEquals(McpStatus.TRANSPORT, s.listTools().status)
+            assertEquals("list 408 必須計熔斷一次", 2, breaker.failureCount())
+            assertFalse(breaker.isOpen())
+            assertEquals("403/429/408 各恰一發、408 不得隱性重送", 3, web.requestCount)
         } finally {
             web.shutdown()
         }
@@ -172,6 +263,29 @@ class McpFuseTest {
             assertFalse("args leaked into audit", audit.contains(secretArg))
             assertFalse("token leaked into audit", audit.contains("sekret-token-1"))
             assertTrue(audit.contains("search"))
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun nonStringDescriptionMapsToProtocolEndToEnd() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // B-05 E2E：tools/list 的 description 為數字 → 整頁 PROTOCOL＋計熔斷
+            //（不被降級成「空描述的合法頁」回 OK）。mutation（生產碼改回寬容降級）
+            // 此測即紅（status 變 OK、failureCount 變 0）。
+            val body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                "[{\"name\":\"search\",\"description\":42,\"inputSchema\":{\"type\":\"object\"}}]}}"
+            web.enqueue(MockResponse().setResponseCode(200).setBody(body))
+            val clock = Clock(0L)
+            val breaker = McpCircuitBreaker(clockMs = clock::get)
+            val s = server(web, clock, breaker)
+            val r = s.listTools()
+            assertEquals(McpStatus.PROTOCOL, r.status)
+            assertTrue(r.tools.isEmpty())
+            assertEquals("B-05 拒頁必須計入熔斷失敗一次", 1, breaker.failureCount())
+            assertEquals(1, web.requestCount)
         } finally {
             web.shutdown()
         }
@@ -267,9 +381,11 @@ class McpFuseTest {
                 "[{\"name\":\"search\",\"description\":\"d\",\"inputSchema\":$schema}]}}"
             web.enqueue(MockResponse().setResponseCode(200).setBody(body))
             val clock = Clock(0L)
-            val s = server(web, clock, McpCircuitBreaker(clockMs = clock::get))
+            val breaker = McpCircuitBreaker(clockMs = clock::get)
+            val s = server(web, clock, breaker)
             val r = s.listTools()
             assertEquals(McpStatus.PROTOCOL, r.status)
+            assertEquals("PROTOCOL 必須計入熔斷失敗一次", 1, breaker.failureCount())
         } finally {
             web.shutdown()
         }
@@ -283,9 +399,11 @@ class McpFuseTest {
                 "\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"isError\":false}}"
             web.enqueue(MockResponse().setResponseCode(200).setBody(body))
             val clock = Clock(0L)
-            val s = server(web, clock, McpCircuitBreaker(clockMs = clock::get))
+            val breaker = McpCircuitBreaker(clockMs = clock::get)
+            val s = server(web, clock, breaker)
             val r = s.callTool("search", "{}")
             assertEquals(McpStatus.PROTOCOL, r.status)
+            assertEquals("PROTOCOL 必須計入熔斷失敗一次", 1, breaker.failureCount())
         } finally {
             web.shutdown()
         }
@@ -299,9 +417,11 @@ class McpFuseTest {
             val body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[],\"isError\":True}}"
             web.enqueue(MockResponse().setResponseCode(200).setBody(body))
             val clock = Clock(0L)
-            val s = server(web, clock, McpCircuitBreaker(clockMs = clock::get))
+            val breaker = McpCircuitBreaker(clockMs = clock::get)
+            val s = server(web, clock, breaker)
             val r = s.callTool("search", "{}")
             assertEquals(McpStatus.PROTOCOL, r.status)
+            assertEquals("PROTOCOL 必須計入熔斷失敗一次", 1, breaker.failureCount())
         } finally {
             web.shutdown()
         }
@@ -318,9 +438,11 @@ class McpFuseTest {
             assertTrue(body.length > McpTransport.RESPONSE_MAX_CHARS)
             web.enqueue(MockResponse().setResponseCode(200).setBody(body))
             val clock = Clock(0L)
-            val s = server(web, clock, McpCircuitBreaker(clockMs = clock::get))
+            val breaker = McpCircuitBreaker(clockMs = clock::get)
+            val s = server(web, clock, breaker)
             val r = s.callTool("search", "{}")
             assertEquals(McpStatus.PROTOCOL, r.status)
+            assertEquals("PROTOCOL 必須計入熔斷失敗一次", 1, breaker.failureCount())
         } finally {
             web.shutdown()
         }

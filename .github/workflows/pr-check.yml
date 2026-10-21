@@ -403,6 +403,10 @@ jobs:
           path: app/build/outputs/apk/**/*.apk
           retention-days: 7
 
+  # The docs gate fails closed (a violation turns this job red). `main`
+  # requires the `PR Gate` status check, and `pr-gate` fails when
+  # `docs-guard` is not success, so a red docs gate blocks merge.
+  # `enforce_admins` is off; no repository rulesets and no CODEOWNERS.
   docs-guard:
     name: Docs Claim Check
     runs-on: ubuntu-latest
@@ -410,6 +414,51 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Pin the docs-guard dependency instead of relying on the runner image:
+      # PyYAML is a hard dependency of the docs claim check (A0 parses every
+      # checked-in workflow). The requirement + all accepted artifact hashes
+      # live in scripts/requirements-docs.txt (cp310-cp314 manylinux x86_64
+      # wheels + sdist); `pip install --hash` is not a CLI option, so the pin
+      # must be consumed as a requirements file. --ignore-installed forces
+      # downloading the hashed artifact even when the runner already has
+      # PyYAML 6.0.3 (otherwise no hash is checked); the exact version
+      # assertion below remains fail-closed.
+      - name: Install pinned PyYAML
+        env:
+          # Ubuntu 24.04 marks the system Python as externally managed; --user
+          # installs remain user-scoped while allowing pip to proceed.
+          PIP_BREAK_SYSTEM_PACKAGES: "1"
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user --disable-pip-version-check --ignore-installed --require-hashes -r scripts/requirements-docs.txt
+          python3 -c 'import yaml; assert yaml.__version__ == "6.0.3", yaml.__version__'
+
+      # Fixture self-test first (D-02): proves the guard still rejects each
+      # enumerated zero-wiring bypass surface — manifest registration parsed as
+      # XML (component element/attribute, relative basename incl. backticked
+      # Kotlin type names, entity-encoded FQN, package attribute/placeholder),
+      # gradle injection (any standalone MCP literal in a scanned gradle file;
+      # manifestPlaceholders incl. add/set/get and case-insensitive spelling,
+      # any srcFile/setSrcFile token incl. alias/.apply{} forms — AGP's real
+      # API is manifest.srcFile(...), namespace/applicationId +
+      # setNamespace/setApplicationId, incl. triple-quoted/slashy strings,
+      # Property .set/.convention/.value, comments/space normalisation, and a
+      # cross-line value after `=`; decoded Unicode escapes, gradle.properties
+      # literals and `\` continuations), package-based split (recursive Kotlin
+      # string-template lexer incl. Java text-block escapes, Java JLS Unicode
+      # escape decoding + ESC pre-scan that masks only the package header,
+      # comments/strings stripped, >1 declaration fails closed, subpackages
+      # and comment/whitespace/backtick-split declarations in-package),
+      # out-of-package references / new modules (string-aware comment
+      # stripping, backtick/space-normalised FQN), in-package imports
+      # (comment/semicolon-normalised allowlist) and FQNs, and each discovery
+      # fail-closed path (no manifests / no src roots / unreadable or zero
+      # production sources) — before trusting its PASSED on this repo.
+      - name: Run docs claim check self-test
+        run: |
+          chmod +x scripts/test_docs_claim_check.sh
+          scripts/test_docs_claim_check.sh
 
       - name: Run docs claim check
         run: |
@@ -443,6 +492,10 @@ jobs:
         working-directory: github_bot
         run: npm run build
 
+  # pr-gate aggregates the required jobs and fails when any did not succeed.
+  # `main` requires the `PR Gate` status check, and `pr-gate` fails when
+  # `docs-guard` is not success, so the docs gate is merge-blocking.
+  # `enforce_admins` is off; no repository rulesets and no CODEOWNERS.
   pr-gate:
     name: PR Gate
     runs-on: ubuntu-latest

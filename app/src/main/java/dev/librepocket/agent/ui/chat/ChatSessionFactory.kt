@@ -2087,12 +2087,22 @@ internal fun cappedHistoryText(
 ): String {
     if (text.length <= MODEL_HISTORY_MAX_CHARS_PER_MESSAGE) return text
     val compacted = if (compactMarkers) compactToolMarkers(text) else text
-    val capped = capAvoidingPartialToolMarker(compacted)
+    val capped = if (compactMarkers) capAvoidingPartialToolMarker(compacted) else surrogateSafeCap(compacted)
     // Compaction alone may bring an over-cap row under the per-message cap.
     // Only an actual cap cut is a truncation; otherwise the omitted args are
     // already visible as the compacted marker and a truncation suffix would
     // falsely claim content was lost.
     return if (capped.length < compacted.length) capped + HISTORY_TRUNCATION_MARKER else compacted
+}
+
+private fun surrogateSafeCap(text: String): String {
+    var cutLen = minOf(text.length, MODEL_HISTORY_MAX_CHARS_PER_MESSAGE)
+    if (cutLen < text.length && cutLen > 0 &&
+        text[cutLen - 1].isHighSurrogate() && text[cutLen].isLowSurrogate()
+    ) {
+        cutLen--
+    }
+    return text.substring(0, cutLen)
 }
 
 /**
@@ -2116,42 +2126,70 @@ private fun capAvoidingPartialToolMarker(compacted: String): String {
         cutLen--
     }
     val cut = compacted.substring(0, cutLen)
-    var open = cut.indexOf(TOOL_MARKER_OPEN, cut.lastIndexOf(']') + 1)
-    while (open >= 0 && !isProducerMarkerOpener(cut, open)) {
-        open = cut.indexOf(TOOL_MARKER_OPEN, open + 1)
-    }
+    var open = nextProducerToolMarkerOpener(cut, cut.lastIndexOf(']') + 1)
     val body = if (open < 0) cut else cut.take(open)
     // Repeat: trimming one prefix can expose an overlapping one ("[tool:[").
     // Track an end index instead of repeated dropLast (avoids O(n²) copies).
+    // Consider both opener spellings so a partial `[tool-result:` is trimmed too.
     var end = body.length
     trim@ while (end > 0) {
-        val maxPrefix = minOf(TOOL_MARKER_OPEN.length, end)
-        for (len in maxPrefix downTo 1) {
-            var isPrefix = true
-            for (j in 0 until len) {
-                if (body[end - len + j] != TOOL_MARKER_OPEN[j]) {
-                    isPrefix = false
+        val openers = listOf(TOOL_MARKER_OPEN, TOOL_RESULT_MARKER_OPEN)
+        var trimmed = false
+        for (opener in openers) {
+            val maxPrefix = minOf(opener.length, end)
+            for (len in maxPrefix downTo 1) {
+                var isPrefix = true
+                for (j in 0 until len) {
+                    if (body[end - len + j] != opener[j]) {
+                        isPrefix = false
+                        break
+                    }
+                }
+                if (isPrefix) {
+                    end -= len
+                    trimmed = true
                     break
                 }
             }
-            if (isPrefix) {
-                end -= len
-                continue@trim
-            }
+            if (trimmed) continue@trim
         }
         break
     }
     return body.substring(0, end)
 }
 
+private fun nextProducerToolMarkerOpener(text: String, from: Int): Int {
+    var i = from.coerceAtLeast(0)
+    while (i < text.length) {
+        val toolIdx = text.indexOf(TOOL_MARKER_OPEN, i)
+        val resultIdx = text.indexOf(TOOL_RESULT_MARKER_OPEN, i)
+        val candidates = listOf(toolIdx, resultIdx).filter { it >= 0 }
+        if (candidates.isEmpty()) return -1
+        val idx = candidates.min()
+        if (isProducerMarkerOpener(text, idx)) return idx
+        i = idx + 1
+    }
+    return -1
+}
+
 /** Producer markers are appended as `\n[tool:<name> <args>]` (TurnController). */
 private fun isProducerMarkerOpener(text: String, index: Int): Boolean {
     if (index > 0 && text[index - 1] != '\n') return false
-    val first = text.getOrNull(index + TOOL_MARKER_OPEN.length) ?: return false
+    val isResult = text.startsWith(TOOL_RESULT_MARKER_OPEN, index)
+    val isOpen = text.startsWith(TOOL_MARKER_OPEN, index)
+    if (!isResult && !isOpen) return false
+    val openLen = if (isResult) TOOL_RESULT_MARKER_OPEN.length else TOOL_MARKER_OPEN.length
+    val first = text.getOrNull(index + openLen) ?: return false
     return first.isLetterOrDigit() || first == '.' || first == '_' || first == '-'
 }
 
+internal fun displayAssistantText(text: String): String = compactToolMarkers(text)
+
+internal fun displayAssistantText(role: String, text: String): String =
+    if (role == "assistant") compactToolMarkers(text) else text
+
 private const val TOOL_MARKER_OPEN = "[tool:"
+private const val TOOL_RESULT_MARKER_OPEN = "[tool-result:"
 private const val TOOL_MARKER_COMPACTED_ARGS = "…"
 private const val TOOL_MARKER_NAME_MAX_CHARS = 64
 
@@ -2169,21 +2207,50 @@ private const val TOOL_MARKER_NAME_MAX_CHARS = 64
  * (crafted/partial text: the normal producer always closes the marker).
  */
 internal fun compactToolMarkers(text: String): String {
-    if (!text.contains(TOOL_MARKER_OPEN)) return text
+    if (!text.contains(TOOL_MARKER_OPEN) && !text.contains(TOOL_RESULT_MARKER_OPEN)) return text
     val sb = StringBuilder(text.length)
     var i = 0
     while (i < text.length) {
-        val start = text.indexOf(TOOL_MARKER_OPEN, i)
-        if (start < 0) {
+        val toolIdx = text.indexOf(TOOL_MARKER_OPEN, i)
+        val resultIdx = text.indexOf(TOOL_RESULT_MARKER_OPEN, i)
+        val candidates = listOf(toolIdx, resultIdx).filter { it >= 0 }
+        if (candidates.isEmpty()) {
             sb.append(text, i, text.length)
             break
         }
+        val start = candidates.min()
+        if (start > i) {
+            sb.append(text, i, start)
+            i = start
+            continue
+        }
+        val isResult = text.startsWith(TOOL_RESULT_MARKER_OPEN, start)
         // Producer markers are line-start (or whole-string) only. A closed
-        // `[tool:...]` in ordinary prose must stay verbatim; compacting it
+        // marker shape in ordinary prose must stay verbatim; compacting it
         // would silently rewrite user-visible text.
         if (!isProducerMarkerOpener(text, start)) {
-            sb.append(text, i, start + TOOL_MARKER_OPEN.length)
-            i = start + TOOL_MARKER_OPEN.length
+            val openLen = if (isResult) TOOL_RESULT_MARKER_OPEN.length else TOOL_MARKER_OPEN.length
+            sb.append(text, i, start + openLen)
+            i = start + openLen
+            continue
+        }
+        if (isResult) {
+            val end = toolResultMarkerEnd(text, start)
+            if (end < 0) {
+                sb.append(text, i, start + TOOL_RESULT_MARKER_OPEN.length)
+                i = start + TOOL_RESULT_MARKER_OPEN.length
+                continue
+            }
+            val nameStart = start + TOOL_RESULT_MARKER_OPEN.length
+            val nameEnd = text.indexOf(':', nameStart).takeIf { it in nameStart until end } ?: end
+            val lenStart = nameEnd + 1
+            val lenEnd = text.indexOf(':', lenStart).takeIf { it in lenStart until end } ?: end
+            val lenText = text.substring(lenStart, lenEnd)
+            val lenValue = lenText.toIntOrNull() ?: 0
+            sb.append(text, i, nameStart)
+            sb.append(markerNamePrefix(text, nameStart, nameEnd))
+            sb.append(':').append(lenValue.toString()).append(':').append(TOOL_MARKER_COMPACTED_ARGS).append(']')
+            i = end + 1
             continue
         }
         val end = producerMarkerEnd(text, start)
@@ -2222,6 +2289,49 @@ internal fun compactToolMarkers(text: String): String {
         i = end + 1
     }
     return sb.toString()
+}
+
+private fun toolResultMarkerEnd(text: String, start: Int): Int {
+    val openLen = TOOL_RESULT_MARKER_OPEN.length
+    val nameStart = start + openLen
+    var i = nameStart
+    // name (reasonable chars) until ':'
+    if (i >= text.length) return -1
+    while (i < text.length && text[i] != ':') {
+        val c = text[i]
+        if (!(c.isLetterOrDigit() || c == '.' || c == '_' || c == '-')) return -1
+        i++
+    }
+    val nameEnd = i
+    if (nameEnd == nameStart) return -1
+    if (i >= text.length || text[i] != ':') return -1
+    val lenStart = i + 1
+    i = lenStart
+    while (i < text.length && text[i].isDigit()) i++
+    if (i == lenStart) return -1
+    val lenEnd = i
+    if (i >= text.length || text[i] != ':') return -1
+    val jsonStart = i + 1
+    val lenText = text.substring(lenStart, lenEnd)
+    // canonical decimal len: non-empty, digits only, no sign, no leading zero
+    // (except "0"), bounded length.
+    if (lenText.isEmpty()) return -1
+    if (lenText.length > 10) return -1
+    if (lenText[0] == '0' && lenText.length > 1) return -1
+    if (!lenText.all { it.isDigit() }) return -1
+    val lenValue = lenText.toIntOrNull() ?: return -1
+    if (lenValue < 0) return -1
+    // overflow-safe: jsonStart <= text.length
+    if (lenValue > text.length - jsonStart) return -1
+    val jsonEnd = jsonStart + lenValue
+    if (jsonEnd >= text.length) return -1
+    if (text[jsonEnd] != ']') return -1
+    // no raw CR/LF anywhere in the marker
+    for (j in start..jsonEnd) {
+        val c = text[j]
+        if (c == '\r' || c == '\n') return -1
+    }
+    return jsonEnd
 }
 
 /**

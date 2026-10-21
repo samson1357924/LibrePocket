@@ -261,4 +261,39 @@ class TurnControllerWireEstimateTest {
         )
         assertBodiesWithinEstimate(request, "tool-result continuation")
     }
+
+
+    @Test
+    fun requestWireEstimate_includesLongModelId() {
+        val messages = listOf(ChatMessage(role = "user", text = "hi"))
+        val base = requestWireEstimate(messages)
+        val longModel = "m".repeat(5000)
+        val withModel = requestWireEstimate(messages, longModel)
+        assertTrue("estimate must grow by at least model length", withModel - base >= longModel.length)
+        assertEquals(base + jsonEscapedChars(longModel), withModel)
+    }
+
+    @Test
+    fun requestWireEstimate_defaultModelNullCompatible() {
+        val messages = listOf(ChatMessage(role = "user", text = "hi"))
+        assertEquals(requestWireEstimate(messages, null), requestWireEstimate(messages))
+    }
+
+    @Test
+    fun serializedBodiesStayWithinEstimateWithLongModel() {
+        val request = adversarialRequest().copy(model = "m".repeat(5000))
+        val estimate = requestWireEstimate(request.messages, request.model)
+        val bodies = mapOf(
+            "Chat Completions" to ChatCompletionsProvider(chatConfig(), { null }).buildBody(request),
+            "Responses" to ResponsesProvider(responsesConfig(), { null }).buildBody(request),
+            "Anthropic" to AnthropicProvider(anthropicConfig(), { null }).buildBody(request),
+        )
+        for ((adapter, body) in bodies) {
+            assertTrue(
+                "long model: $adapter body ${body.length} exceeds estimate $estimate",
+                body.length <= estimate,
+            )
+        }
+    }
+
 }

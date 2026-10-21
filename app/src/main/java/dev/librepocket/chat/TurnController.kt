@@ -5735,7 +5735,7 @@ class TurnController(
     // over-counted: a text-only sum under-counts everything that actually
     // serializes into the outgoing request (quote-dense text can triple).
     val baseMessages = base.messages.toMutableList()
-    var totalChars = requestWireEstimate(baseMessages + contMessages)
+    var totalChars = requestWireEstimate(baseMessages + contMessages, base.model)
     var drop = 0
     while (drop < baseMessages.size - 1 && totalChars > MAX_REQUEST_CHARS) {
       totalChars -= baseMessages[drop].wirePayloadChars()
@@ -6115,12 +6115,15 @@ internal const val TOOL_CALL_WRAPPER_CHARS = 96
 
 /**
  * Conservative per-request envelope allowance for [requestWireEstimate]:
- * `model`, stream flags and the `messages`/`input` array scaffolding of one
- * outgoing request (Chat ~41, Responses ~52, Anthropic ~58 measured, plus the
- * model value and header separators). Counted ONCE per request, never per
- * side of a merged message list. Tool arrays are empty on continuation
- * requests by construction (no `allowTools`), and production never sets
- * `systemPromptOverride`, so those bytes are outside the continuation budget.
+ * stream flags and the `messages`/`input` array scaffolding of one outgoing
+ * request (Chat ~41, Responses ~52, Anthropic ~58 measured, plus header
+ * separators). The `model` value is NOT part of this envelope: it is counted
+ * separately via the optional `model` parameter of [requestWireEstimate]
+ * (`requestWireEstimate(..., model)`), exactly once per request. Counted ONCE
+ * per request, never per side of a merged message list. Tool arrays are empty
+ * on continuation requests by construction (no `allowTools`), and production
+ * never sets `systemPromptOverride`, so those bytes are outside the
+ * continuation budget.
  */
 internal const val REQUEST_ENVELOPE_CHARS = 160
 
@@ -6215,8 +6218,8 @@ internal fun ChatMessage.wirePayloadChars(): Int =
  * terms (as `buildToolContinuation` does) keeps the total consistent with the
  * request that ships.
  */
-internal fun requestWireEstimate(messages: List<ChatMessage>): Int =
-  messages.sumOf { it.wirePayloadChars() } + REQUEST_ENVELOPE_CHARS
+internal fun requestWireEstimate(messages: List<ChatMessage>, model: String? = null): Int =
+  messages.sumOf { it.wirePayloadChars() } + REQUEST_ENVELOPE_CHARS + (model?.let { jsonEscapedChars(it) } ?: 0)
 
 /**
  * Pure fallback detector for the warn path: true only when a non-blank

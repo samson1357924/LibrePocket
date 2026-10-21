@@ -711,4 +711,163 @@ class ChatSessionFactoryHistoryTailTest {
         assertEquals("a-max", scan.events.last().text)
         assertEquals("u0", scan.events.first().text)
     }
+
+
+    @Test fun historyTail_toolResultMarkerHydratesBoundedAndPersistsRaw() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        val json = "x".repeat(20_000)
+        val marker = "\n[tool-result:lsp.symbols:${json.length}:$json]"
+        val huge = "answer prefix" + marker + "\nFINAL ANSWER"
+        transcripts.appendEvent(event(sid, "r-tool", "user", "q"))
+        transcripts.appendEvent(event(sid, "r-tool", "assistant", huge))
+
+        val provider = TailFakeProvider {
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "fresh"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val opened = factoryWith(transcripts, provider).open(sampleEndpoint(), sid)
+        try {
+            opened.session.send("q-new")
+            val hydrated = provider.seenRequests.single().messages[1].text
+            assertTrue(hydrated.contains("[tool-result:lsp.symbols:${json.length}:…]"))
+            assertTrue(hydrated.contains("FINAL ANSWER"))
+            assertFalse(hydrated.contains("x".repeat(32)))
+            val raw = transcripts.loadEvents(sid, 0, 10).first { it.kind == "assistant" }.text
+            assertEquals(huge, raw)
+        } finally {
+            opened.session.close()
+        }
+    }
+
+    @Test fun compactToolMarkers_toolResultNestedBracketsAndQuotedClose() {
+        val json = """[{"a]b":["c]d",{"e":"f]g"}]}"""
+        val tail = "\nTAIL"
+        assertEquals(
+            "\n[tool-result:lsp.symbols:${json.length}:…]$tail",
+            compactToolMarkers("\n[tool-result:lsp.symbols:${json.length}:$json]$tail"),
+        )
+    }
+
+    @Test fun compactToolMarkers_toolResultMalformedLenNotRewritten() {
+        for (marker in listOf(
+            "\n[tool-result:lsp.symbols:999:{\"x\":1}]\nANSWER",
+            "\n[tool-result:lsp.symbols:abc:{\"x\":1}]\nANSWER",
+            "\n[tool-result:lsp.symbols:-1:{\"x\":1}]\nANSWER",
+            "\n[tool-result:lsp.symbols:5:{\"x\":1}]\nANSWER",
+        )) {
+            assertEquals(marker, compactToolMarkers(marker))
+        }
+    }
+
+    @Test fun compactToolMarkers_toolResultUnterminatedPreservesTail() {
+        val text = "head\n[tool-result:lsp.symbols:5:{\"x\""
+        val out = compactToolMarkers(text + "\nANSWER")
+        assertTrue(out.contains("ANSWER"))
+    }
+
+    @Test fun cappedHistoryText_malformedToolResultCapDoesNotSplitOpener() {
+        val text = "ANSWER\n[tool-result:lsp.symbols:abc:{}] " + "z".repeat(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE)
+        val capped = cappedHistoryText(text)
+        val body = capped.removeSuffix(HISTORY_TRUNCATION_MARKER)
+        assertFalse(body.contains("[tool-result:lsp.symbols:abc:…]"))
+        assertFalse(body.endsWith("[tool-result:") || body.endsWith("[tool:"))
+        assertTrue(body.contains("ANSWER"))
+    }
+
+    @Test fun cappedHistoryText_userRowUnterminatedToolMarkerPureCap() {
+        val opener = "\n[tool:note "
+        val text = "u".repeat(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE - 5) + opener + "z".repeat(100)
+        val capped = cappedHistoryText(text, compactMarkers = false)
+        val body = capped.removeSuffix(HISTORY_TRUNCATION_MARKER)
+        assertEquals(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE, body.length)
+        assertEquals(text.take(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE), body)
+    }
+
+    @Test fun displayAssistantText_boundsAndPreserves() {
+        val text = "intro\n[tool:lsp.symbols {\"q\":\"x\"}]\n[tool-result:lsp.symbols:7:{\"a\":1}]\nFINAL"
+        val out = displayAssistantText(text)
+        assertTrue(out.contains("[tool:lsp.symbols …]"))
+        assertTrue(out.contains("[tool-result:lsp.symbols:7:…]"))
+        assertTrue(out.contains("FINAL"))
+        assertEquals(text, displayAssistantText("user", text))
+        val inline = "see [tool:note keep] here"
+        assertEquals(inline, displayAssistantText(inline))
+        val partial = "head\n[tool:note " + "x".repeat(10)
+        assertEquals(partial, displayAssistantText(partial))
+        val after = "ANSWER\n[tool:t {}]"
+        assertTrue(displayAssistantText(after).contains("ANSWER"))
+    }
+
+    @Test fun compactToolMarkers_resultMarkerNameBoundaries() {
+        val json = "{}"
+        val longName = "n".repeat(200)
+        val longMarker = "\n[tool-result:$longName:${json.length}:$json]"
+        val longOut = compactToolMarkers(longMarker)
+        assertTrue(longOut.contains("[tool-result:${"n".repeat(64)}:${json.length}:…]"))
+
+        // Empty name is not a valid result marker -> left verbatim.
+        val emptyMarker = "\n[tool-result::${json.length}:$json]"
+        assertEquals(emptyMarker, compactToolMarkers(emptyMarker))
+
+        // Surrogate-bearing name must not crash and must stay bounded.
+        val surrName = "n".repeat(63) + "\uD83D"
+        val surrMarker = "\n[tool-result:$surrName:${json.length}:$json]"
+        val surrOut = compactToolMarkers(surrMarker)
+        assertTrue(surrOut.length <= surrMarker.length)
+    }
+
+    @Test fun compactToolMarkers_hugeLenNotRewritten() {
+        for (marker in listOf(
+            "\n[tool-result:lsp.symbols:2147483647:{}]\nANSWER",
+            "\n[tool-result:lsp.symbols:2147483648:{}]\nANSWER",
+            "\n[tool-result:lsp.symbols:999999999999999999999:{}]\nANSWER",
+        )) {
+            assertEquals(marker, compactToolMarkers(marker))
+            assertTrue(compactToolMarkers(marker).contains("ANSWER"))
+            assertFalse(compactToolMarkers(marker).contains("\u2026]"))
+        }
+    }
+
+    @Test fun compactToolMarkers_leadingZeroMillionNotGiantReceipt() {
+        val marker = "\n[tool-result:lsp.symbols:${"0".repeat(5000)}1:{}]\nANSWER"
+        val out = compactToolMarkers(marker)
+        assertEquals(marker, out)
+        assertTrue(out.contains("ANSWER"))
+        assertTrue(out.length <= marker.length + 1)
+        assertFalse(out.contains("\u2026]"))
+    }
+
+    @Test fun compactToolMarkers_invalidResultMarkerThenValidMarkerCompacted() {
+        val text = "head\n[tool-result:lsp.symbols:abc:{}]\n[tool:lisp {\"q\":\"x\"}]\n[tool-result:lsp.symbols:7:{\"a\":1}]\nANSWER"
+        val out = compactToolMarkers(text)
+        assertTrue(out.contains("ANSWER"))
+        assertTrue(out.contains("[tool:lisp \u2026]"))
+        assertTrue(out.contains("[tool-result:lsp.symbols:7:\u2026]"))
+        assertFalse(out.contains("[tool-result:lsp.symbols:abc:\u2026]"))
+    }
+
+    @Test fun compactToolMarkers_unterminatedResultMarkerThenValidMarker() {
+        val text = "head\n[tool-result:lsp.symbols:5:{\"x\"\n[tool:lisp {\"q\":\"x\"}]\nANSWER"
+        val out = compactToolMarkers(text)
+        assertTrue(out.contains("ANSWER"))
+        assertTrue(out.contains("[tool:lisp \u2026]"))
+    }
+
+    @Test fun compactToolMarkers_lenExceedsRemainingByOneNotRewritten() {
+        var found: String? = null
+        for (L in 1..200) {
+            val m = "\n[tool-result:lsp.symbols:$L:abc]\nANSWER"
+            val jsonStart = m.indexOf("abc")
+            val remaining = m.length - jsonStart
+            if (L == remaining + 1) { found = m; break }
+        }
+        requireNotNull(found) { "no boundary marker found" }
+        assertEquals(found, compactToolMarkers(found))
+        assertTrue(compactToolMarkers(found).contains("ANSWER"))
+        assertFalse(compactToolMarkers(found).contains("\u2026]"))
+    }
+
 }

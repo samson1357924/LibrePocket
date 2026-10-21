@@ -931,17 +931,18 @@ private fun MessageBubble(
             ),
         ) {
             Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                val displayText = if (msg.role == "assistant") displayAssistantText(msg.text) else msg.text
                 Text(
-                    text = if (msg.isPartial) msg.text + " ▍" else msg.text,
+                    text = if (msg.isPartial) displayText + " ▍" else displayText,
                     style = MaterialTheme.typography.bodyLarge,
                 )
                 // S2 系統 TTS：助理氣泡加朗讀鈕（系統語音引擎處理，
                 // 離線能力與資料傳輸取決於已安裝的引擎，非「本地保證」；
                 // 零新權限；開關關閉時隱藏）。朗讀為逐則手勢，
                 // 引擎揭露見按鈕無障礙文案（VoiceTts.SPEAK_BUTTON_DESCRIPTION）。
-                if (!isUser && msg.text.isNotBlank() && !msg.isPartial && showSpeak) {
+                if (!isUser && displayText.isNotBlank() && !msg.isPartial && showSpeak) {
                     IconButton(
-                        onClick = { onSpeak(msg.id, msg.text) },
+                        onClick = { onSpeak(msg.id, displayText) },
                         modifier = Modifier.size(32.dp),
                     ) {
                         Icon(

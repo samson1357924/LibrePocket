@@ -856,6 +856,105 @@ class ChatSessionFactoryHistoryTailTest {
         assertTrue(out.contains("[tool:lisp \u2026]"))
     }
 
+    /**
+     * F2: an unterminated (producer-shaped) opener must not abort the whole
+     * compaction scan. The markers behind it still have to be compacted —
+     * otherwise their args echo keeps the row over the cap and pushes the
+     * answer past the cut. The malformed opener text itself is preserved
+     * (it may be crafted prose), never dropped.
+     */
+    @Test fun compactToolMarkers_unterminatedProducerOpenerStillCompactsLaterMarkers() {
+        val text = "head\n[tool:foo {\"q\":\"\n[tool:lisp {\"q\":\"x\"}]\n" +
+            "[tool-result:lsp.symbols:7:{\"a\":1}]\nANSWER"
+        val out = compactToolMarkers(text)
+        assertTrue("later producer marker must be compacted", out.contains("[tool:lisp \u2026]"))
+        assertTrue("later result marker must be compacted", out.contains("[tool-result:lsp.symbols:7:\u2026]"))
+        assertTrue("answer must survive", out.contains("ANSWER"))
+        assertTrue("malformed opener text must be preserved", out.contains("[tool:foo"))
+        assertTrue("prose must be preserved", out.contains("{\"q\":\""))
+    }
+
+    /**
+     * F1: a malformed opener in front of a valid marker must not take the
+     * valid marker (or the answer behind it) down with it. The raw
+     * "last `]`" heuristic treated the first malformed opener as the start of
+     * an unterminated region and dropped everything behind it.
+     */
+    @Test fun cappedHistoryText_malformedProducerOpenerKeepsLaterMarkerAndAnswer() {
+        val text = "head\n[tool:foo {\"q\":\"" + "z".repeat(100) + "\n[tool:lsp.symbols " +
+            "a".repeat(30_000) + "]\nANSWER"
+        val capped = cappedHistoryText(text)
+        assertTrue("later valid marker must survive", capped.contains("[tool:lsp.symbols \u2026]"))
+        assertTrue("answer must survive", capped.contains("ANSWER"))
+        assertFalse(
+            "no cap cut happened: no truncation suffix",
+            capped.endsWith(HISTORY_TRUNCATION_MARKER),
+        )
+    }
+
+    /**
+     * F3: a `]` inside quoted args does not close the marker. The cut must
+     * not land inside such a marker and leave a partial `[tool:foo` fragment
+     * behind (the old raw-last-`]` heuristic believed the quoted `]` closed
+     * the marker).
+     */
+    @Test fun cappedHistoryText_quotedBracketInsideArgsDoesNotKeepPartialMarker() {
+        val text = "head\n[tool:foo {\"a\":\"]" + "b".repeat(30_000)
+        val capped = cappedHistoryText(text)
+        val body = capped.removeSuffix(HISTORY_TRUNCATION_MARKER)
+        assertFalse("partial marker fragment must be dropped", body.contains("[tool:foo"))
+        assertFalse("no marker opener may survive", body.contains("[tool:"))
+        // Only the prose head survives; the separator newline in front of the
+        // marker is kept (same shape as `cappedHistoryText_neverEndsInsideToolMarker`).
+        assertEquals("head\n", body)
+    }
+
+    /** F3, result-marker shape: a quoted `]` inside the result payload. */
+    @Test fun cappedHistoryText_quotedBracketInsideResultArgsDoesNotKeepPartialMarker() {
+        val text = "head\n[tool-result:lsp.symbols:7:{\"a\":\"]" + "b".repeat(30_000)
+        val capped = cappedHistoryText(text)
+        val body = capped.removeSuffix(HISTORY_TRUNCATION_MARKER)
+        assertFalse("partial result marker fragment must be dropped", body.contains("[tool-result:"))
+        assertFalse("no marker opener may survive", body.contains("[tool:"))
+        // Only the prose head survives (the separator newline is kept).
+        assertEquals("head\n", body)
+    }
+
+    /**
+     * The compaction rewrites a result payload to `…`, so the declared length
+     * no longer matches the shortened row. The marker-aware cut must still
+     * see the compacted marker as COMPLETE — otherwise it drops the marker
+     * (and the answer behind it) from an otherwise intact row.
+     */
+    @Test fun cappedHistoryText_keepsCompactedResultMarkerWithDeclaredLength() {
+        val json = "x".repeat(20_000)
+        val text = "answer prefix\n[tool-result:lsp.symbols:${json.length}:$json]\nFINAL ANSWER"
+        val capped = cappedHistoryText(text)
+        assertTrue(
+            "compacted result marker must survive",
+            capped.contains("[tool-result:lsp.symbols:${json.length}:\u2026]"),
+        )
+        assertTrue("answer behind the marker must survive", capped.contains("FINAL ANSWER"))
+        assertFalse("the payload echo must be dropped", capped.contains("x".repeat(32)))
+    }
+
+    /**
+     * F3/P3-5: compaction alone brought the row under the cap and the
+     * marker-aware cut only trimmed the trailing partial opener. No cap cut
+     * happened, so no "history truncated" suffix may be added — the compacted
+     * marker is the visible record of the dropped args.
+     */
+    @Test fun cappedHistoryText_compactionOnlyTrimAddsNoTruncationSuffix() {
+        val text = "head\n[tool:big " + "a".repeat(30_000) + "]\n[tool:note " + "z".repeat(50)
+        val capped = cappedHistoryText(text)
+        assertTrue("compacted marker must survive", capped.contains("[tool:big \u2026]"))
+        assertFalse("trailing partial opener must be gone", capped.contains("[tool:note"))
+        assertFalse(
+            "no cap cut happened: no truncation suffix",
+            capped.endsWith(HISTORY_TRUNCATION_MARKER),
+        )
+    }
+
     @Test fun compactToolMarkers_lenExceedsRemainingByOneNotRewritten() {
         var found: String? = null
         for (L in 1..200) {

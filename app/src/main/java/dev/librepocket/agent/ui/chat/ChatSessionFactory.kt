@@ -2069,7 +2069,9 @@ internal suspend fun hasWithheldSwitchMarker(store: SessionStore, sessionId: Str
  * whenever the cap actually removes text, so the omission is observable in
  * the payload itself, never silent. Compaction may bring an over-cap row
  * under the cap by itself; in that case the compacted marker is the visible
- * record of the dropped args and no truncation suffix is added.
+ * record of the dropped args and no truncation suffix is added. The same holds
+ * when the marker-aware cut only trims a trailing partial opener without a
+ * cap cut: nothing was truncated, so no suffix is added.
  *
  * P2 tool markers are compacted first: local tool calls replay inline as
  * `[tool:<name> <args>]` assistant text (see `TurnController`), and the args
@@ -2088,11 +2090,21 @@ internal fun cappedHistoryText(
     if (text.length <= MODEL_HISTORY_MAX_CHARS_PER_MESSAGE) return text
     val compacted = if (compactMarkers) compactToolMarkers(text) else text
     val capped = if (compactMarkers) capAvoidingPartialToolMarker(compacted) else surrogateSafeCap(compacted)
-    // Compaction alone may bring an over-cap row under the per-message cap.
-    // Only an actual cap cut is a truncation; otherwise the omitted args are
-    // already visible as the compacted marker and a truncation suffix would
-    // falsely claim content was lost.
-    return if (capped.length < compacted.length) capped + HISTORY_TRUNCATION_MARKER else compacted
+    // Only a real cap cut is a truncation. Compaction alone may bring an
+    // over-cap row under the cap, and the marker-aware cut may still trim a
+    // trailing partial opener (or a marker the cut landed inside) — neither
+    // is a truncation, so the suffix is added only when the cap actually cut
+    // the row. Otherwise the omitted args are already visible as the
+    // compacted marker and a truncation suffix would falsely claim content
+    // was lost.
+    return if (
+        compacted.length > MODEL_HISTORY_MAX_CHARS_PER_MESSAGE &&
+        capped.length < compacted.length
+    ) {
+        capped + HISTORY_TRUNCATION_MARKER
+    } else {
+        capped
+    }
 }
 
 private fun surrogateSafeCap(text: String): String {
@@ -2108,13 +2120,26 @@ private fun surrogateSafeCap(text: String): String {
 /**
  * Take the per-row prefix without ending inside a `[tool:` marker.
  *
- * Every opener after the last closing `]` is necessarily unterminated. Only
- * producer-shaped openers (line-start `[tool:` plus a plausible name) are
- * treated that way: dropping at an arbitrary mid-line `[tool:` fragment would
- * silently throw away most of an otherwise ordinary over-cap row. The cut can
- * also land inside the opener itself (`[`, `[t`, … `[tool:`), so trim any
- * trailing proper prefix of the opener. Complete markers earlier in the
- * prefix stay intact.
+ * The scan is marker-aware: it follows real marker structure (producer
+ * openers, the closing `]`, and the JSON/bracket state inside the args)
+ * instead of the raw "last `]`" heuristic. A `]` inside quoted args does not
+ * close a marker, so the heuristic could place the cut inside a marker whose
+ * closing bracket was quoted (or miss the marker entirely).
+ *
+ * - A marker that starts before the cut and closes after it (or never
+ *   closes) is trimmed at its start: the prefix never ends inside a marker.
+ * - A closed marker's body is skipped, so a `[tool:` inside quoted args is
+ *   never mistaken for another marker.
+ * - An unterminated opener is trimmed only when no closed producer marker
+ *   follows it. A malformed fragment that is followed by a valid marker keeps
+ *   that marker (and the prose behind it): dropping the whole region would
+ *   silently lose a valid marker and the answer after it.
+ * - Only producer-shaped openers (line start plus a plausible name) count;
+ *   dropping at an arbitrary mid-line `[tool:` fragment would silently throw
+ *   away most of an otherwise ordinary over-cap row.
+ * - The cut can also land inside the opener itself (`[`, `[t`, … `[tool:`), so
+ *   any trailing proper prefix of the opener is trimmed as well. Complete
+ *   markers earlier in the prefix stay intact.
  */
 private fun capAvoidingPartialToolMarker(compacted: String): String {
     var cutLen = minOf(compacted.length, MODEL_HISTORY_MAX_CHARS_PER_MESSAGE)
@@ -2126,8 +2151,7 @@ private fun capAvoidingPartialToolMarker(compacted: String): String {
         cutLen--
     }
     val cut = compacted.substring(0, cutLen)
-    var open = nextProducerToolMarkerOpener(cut, cut.lastIndexOf(']') + 1)
-    val body = if (open < 0) cut else cut.take(open)
+    val body = cut.substring(0, markerSafePrefixLength(compacted, cutLen))
     // Repeat: trimming one prefix can expose an overlapping one ("[tool:[").
     // Track an end index instead of repeated dropLast (avoids O(n²) copies).
     // Consider both opener spellings so a partial `[tool-result:` is trimmed too.
@@ -2156,6 +2180,129 @@ private fun capAvoidingPartialToolMarker(compacted: String): String {
         break
     }
     return body.substring(0, end)
+}
+
+/**
+ * Length of the prefix of a capped row that cannot end inside a producer
+ * tool marker.
+ *
+ * Scans the whole compacted row (not just the cut) so a marker that starts
+ * before the cut but closes after it is recognised as crossing the cut, and
+ * so a closed marker's body can be skipped as one unit. Returns the number of
+ * characters of [compacted] that may be kept (never more than [cutLen]).
+ */
+private fun markerSafePrefixLength(compacted: String, cutLen: Int): Int {
+    val opens = ArrayList<Int>()
+    val ends = ArrayList<Int>()
+    var pos = 0
+    while (true) {
+        val open = nextProducerToolMarkerOpener(compacted, pos)
+        if (open < 0) break
+        val isResult = compacted.startsWith(TOOL_RESULT_MARKER_OPEN, open)
+        val end = if (isResult) {
+            cappedToolResultMarkerEnd(compacted, open)
+        } else {
+            producerMarkerEnd(compacted, open)
+        }
+        opens.add(open)
+        ends.add(end)
+        // Skip a closed marker's body so a nested `[tool:` inside quoted args
+        // is never mistaken for another marker. An unterminated marker owns
+        // at most its own line (producer markers are single-line), so resume
+        // at the next line break to still see the markers behind it.
+        pos = if (end >= 0) end + 1 else nextLineBreakIndex(compacted, open + 1)
+        if (pos <= open) pos = open + 1
+    }
+    // (1) The cut lands inside a closed marker: trim at that marker's start.
+    var lastClosedEnd = 0
+    for (i in opens.indices) {
+        val open = opens[i]
+        val end = ends[i]
+        if (open >= cutLen || end < 0) continue
+        if (end >= cutLen) return open
+        lastClosedEnd = end + 1
+    }
+    // (2) An unterminated producer opener behind the last closed marker:
+    // trim there. An unterminated opener that is followed by another closed
+    // producer marker keeps the later marker (and the prose behind it) —
+    // dropping the whole region would silently lose a valid marker and the
+    // answer after it.
+    for (i in opens.indices) {
+        val open = opens[i]
+        if (ends[i] >= 0) continue
+        if (open < lastClosedEnd || open >= cutLen) continue
+        return open
+    }
+    return cutLen
+}
+
+/** Index of the next CR/LF at or after [from], or [text].length when absent. */
+private fun nextLineBreakIndex(text: String, from: Int): Int {
+    var i = from
+    while (i < text.length) {
+        val c = text[i]
+        if (c == '\n' || c == '\r') return i
+        i++
+    }
+    return text.length
+}
+
+/**
+ * End index of a result marker inside an ALREADY COMPACTED row.
+ *
+ * [toolResultMarkerEnd] checks the declared payload length against the text.
+ * The compaction rewrites the payload to `…`, so the declared length no
+ * longer matches the shortened text and the strict check would call the
+ * compacted marker unterminated — dropping the marker (and the answer behind
+ * it) even though the row is complete. The fallback therefore accepts the
+ * first `]` that closes the payload at bracket depth 0 outside a quoted
+ * string. A `]` inside quoted args still does not close the marker, so an
+ * actually unterminated marker is still detected.
+ */
+private fun cappedToolResultMarkerEnd(text: String, start: Int): Int {
+    val strict = toolResultMarkerEnd(text, start)
+    if (strict >= 0) return strict
+    val openLen = TOOL_RESULT_MARKER_OPEN.length
+    val nameStart = start + openLen
+    var i = nameStart
+    while (i < text.length && text[i] != ':') {
+        val c = text[i]
+        if (!(c.isLetterOrDigit() || c == '.' || c == '_' || c == '-')) return -1
+        i++
+    }
+    if (i == nameStart) return -1
+    if (i >= text.length || text[i] != ':') return -1
+    i++
+    // Declared length (may be malformed — the payload scan below does not
+    // depend on it).
+    while (i < text.length && text[i] != ':') i++
+    if (i >= text.length) return -1
+    i++
+    var depth = 0
+    var inString = false
+    var escaped = false
+    while (i < text.length) {
+        val c = text[i]
+        if (c == '\n' || c == '\r') return -1
+        if (inString) {
+            if (escaped) {
+                escaped = false
+            } else if (c == '\\') {
+                escaped = true
+            } else if (c == '"') {
+                inString = false
+            }
+        } else {
+            when (c) {
+                '"' -> inString = true
+                '{', '[' -> depth++
+                '}' -> if (depth > 0) depth--
+                ']' -> if (depth == 0) return i else depth--
+            }
+        }
+        i++
+    }
+    return -1
 }
 
 private fun nextProducerToolMarkerOpener(text: String, from: Int): Int {
@@ -2255,8 +2402,15 @@ internal fun compactToolMarkers(text: String): String {
         }
         val end = producerMarkerEnd(text, start)
         if (end < 0) {
-            sb.append(text, i, text.length)
-            break
+            // Unterminated (or malformed) producer marker: keep the opener
+            // text verbatim and KEEP SCANNING. Aborting the whole scan here
+            // left every later valid marker uncompacted, so the args echo of
+            // a later marker could still push the answer past the per-row
+            // cap. The malformed opener text itself is preserved (it may be
+            // crafted prose), never dropped.
+            sb.append(text, i, start + TOOL_MARKER_OPEN.length)
+            i = start + TOOL_MARKER_OPEN.length
+            continue
         }
         val nameStart = start + TOOL_MARKER_OPEN.length
         val firstSpace = text.indexOf(' ', nameStart)

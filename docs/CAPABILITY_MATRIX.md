@@ -1,6 +1,6 @@
 # LibrePocket 能力與接線狀態
 
-> **Current snapshot**：依 `82f2a0a8` 核對（2026-10-22，S1–S7＋R27＋R28-1＋#96 P2 tool-slice 及 Phase 3 硬化（`pathPrefix` Cf 全拒、空白 call id／續聊 index 精確配對、重複／redaction 碰撞 id 可續聊拒絕、非 object args 回退固定物件、backend 欄位省略 receipt 固定、timeout 分流、secret 家族值收斂、history marker-aware 裁切、Responses canonical 數字比較、MCP `baseUrl` preflight））；executionReady 由 0→1 於 `b804ce89e99588cd5ca7c9cc3556e4dc37df6911`，為 registry readiness 旗標；production 未附掛 tool slice，見 Built-in tools 列）。#93 已合併（`c3ae01fb`），本分支已完成 rebase。本文件不把規格列出的能力當成已可用功能。
+> **Current snapshot**：依 `82f2a0a8` 核對（2026-10-22，S1–S7＋R27＋R28-1＋#96 P2 tool-slice 及 Phase 3 硬化（`pathPrefix` Cf 全拒、空白 call id／續聊 index 精確配對、重複／redaction 碰撞 id 可續聊拒絕、非 object args 回退固定物件、backend 欄位省略 receipt 固定、timeout 分流、secret 家族值收斂、history marker-aware 裁切、Responses canonical 數字比較、MCP `baseUrl` preflight；Stage 1 & 2 硬化：`ChatViewModel` `restoreOpForFailedSend` 確立 notice-last 順序不變量消除跨分支發送競態、`SafeToolSlice` 預算超限正規化收據 wire ID））；executionReady 由 0→1 於 `b804ce89e99588cd5ca7c9cc3556e4dc37df6911`，為 registry readiness 旗標；production 未附掛 tool slice，見 Built-in tools 列）。#93 已合併（`c3ae01fb`），本分支已完成 rebase。本文件不把規格列出的能力當成已可用功能。
 >
 > - **範圍：** built-in tools、provider adapters、三個 flavor 的 source/manifest 邊界。
 > - **Owner role：** app/runtime 維護者；未指派個人。
@@ -20,7 +20,7 @@
 
 | 項目 | Current evidence | 不可推論為 |
 |---|---|---|
-| Chat provider adapters | `Chat Completions`, `Responses`, `Anthropic Messages` adapter 與 factory 存在 | 對每個相容宣稱的 endpoint 均已互通或認證 |
+| Chat provider adapters | `Chat Completions`, `Responses`, `Anthropic Messages` adapter 與 factory 存在；`ChatViewModel.restoreOpForFailedSend` 確立 notice-last 不變量並消除跨分支發送競態；`SafeToolSlice` 於預算超限（budget-exceeded）時正規化收據 wire ID | 對每個相容宣稱的 endpoint 均已互通或認證 |
 | Session transcript | production chat/session path 使用 Room；JSONL codec/import-export 有 library code | JSONL 是 canonical store；有可供使用者操作的匯出/遷移 UI |
 | Ledger durability (`flushDurable`) | `TurnController.flushDurable` 八檢查合取（排空＋無 PENDING/CLAIMED receipt＋無未補償 SEALED＋admission／promotion／host／sticky 證明＋failure epoch 三讀 fail-last），永不 true-and-dangling；close 以 cancel-receipt barrier＋remaining-budget 線性化交接；同源 hydrate 保證僅限 R4-1 後新建/fork 的 ledger（pre-R4-1 混雜 id 須手動隔離，見威脅模型） | `true` 代表跨重啟耐久；fake session 的 `true` 可作耐久證據；SEALED 等同 settled |
 | Prune family-aware（R27） | Room raw cut＋family fixup 同一 tx（kill→rollback→pre-prune）；fixup 無條件、無界收斂、shape-aware suspect；新 prune 跨重啟無頭孤兒進 model context／快照 | crash-mid-fixup 仍是已知限制；interior／pre-R26 既有孤兒會被 fixup 刪除；測試 fake 的 suspect 可作耐久證據 |

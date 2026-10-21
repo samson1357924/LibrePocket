@@ -1120,7 +1120,6 @@ class ChatViewModel(
                             // Only CaptureDeniedException maps to POLICY_DENIED
                             // here; a non-Capture SecurityException falls
                             // through to the outer NO_ENDPOINT branch.
-                            setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
                             restoreOpForFailedSend(opId, "POLICY_DENIED")
                             return@launch
                         }
@@ -1162,25 +1161,21 @@ class ChatViewModel(
                                 // drain or explicit discard) owns this op.
                                 return@launch
                             } catch (_: ApprovalRequiredException) {
-                                setNoticeIfCurrent(operationGeneration, "CHAT_APPROVAL_REQUIRED")
                                 restoreOpForFailedSend(opId, "CHAT_APPROVAL_REQUIRED")
                                 return@launch
                             } catch (_: PolicyEvaluationException) {
-                                setNoticeIfCurrent(operationGeneration, "CHAT_POLICY_UNAVAILABLE")
                                 restoreOpForFailedSend(opId, "CHAT_POLICY_UNAVAILABLE")
                                 return@launch
                             } catch (_: SecurityException) {
                                 // Fresh chat.send deny is projected by the
                                 // controller; keep the text recoverable. Distinct
                                 // code from key.read POLICY_DENIED: key.read passed.
-                                setNoticeIfCurrent(operationGeneration, "CHAT_SEND_DENIED")
                                 restoreOpForFailedSend(opId, "CHAT_SEND_DENIED")
                                 return@launch
                             } catch (_: InputTooLongException) {
                                 // R4-4 admission fail-fast: single-turn input +
                                 // time block exceeds MAX_REQUEST_CHARS. Never
                                 // sent; keep the text recoverable (draft).
-                                setNoticeIfCurrent(operationGeneration, "CHAT_INPUT_TOO_LONG")
                                 restoreOpForFailedSend(opId, "CHAT_INPUT_TOO_LONG")
                                 return@launch
                             } catch (_: TranscriptPendingException) {
@@ -1200,7 +1195,6 @@ class ChatViewModel(
                                 // bounded timeout (store stall/seal). Same
                                 // restore semantics as InputTooLong (notice +
                                 // draft, caller retains the text for retry).
-                                setNoticeIfCurrent(operationGeneration, "CHAT_STORE_UNAVAILABLE")
                                 restoreOpForFailedSend(opId, "CHAT_STORE_UNAVAILABLE")
                                 return@launch
                             }
@@ -1255,7 +1249,6 @@ class ChatViewModel(
                         drainNextRecoverableToInput()
                     }
                     EndpointAccess.Denied -> {
-                        setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
                         restoreOpForFailedSend(opId, "POLICY_DENIED")
                     }
                     is EndpointAccess.ConfirmRequired -> {
@@ -1265,7 +1258,6 @@ class ChatViewModel(
                         emitKeyReadConfirmRequired(access.generation, access.binding, opId = opId)
                     }
                     EndpointAccess.Missing -> {
-                        setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
                         restoreOpForFailedSend(opId, "NO_ENDPOINT")
                     }
                     EndpointAccess.Stale -> pendingOps.remove(opId)
@@ -1273,7 +1265,6 @@ class ChatViewModel(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
-                setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
                 restoreOpForFailedSend(opId, "NO_ENDPOINT")
             }
         }
@@ -1362,7 +1353,6 @@ class ChatViewModel(
                             // Only CaptureDeniedException maps to POLICY_DENIED
                             // here; a non-Capture SecurityException falls
                             // through to the outer NO_ENDPOINT branch.
-                            setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
                             restoreOpForFailedSend(opId, "POLICY_DENIED")
                             return@launch
                         }
@@ -1399,24 +1389,20 @@ class ChatViewModel(
                                 // drain or explicit discard) owns this op.
                                 return@launch
                             } catch (_: ApprovalRequiredException) {
-                                setNoticeIfCurrent(operationGeneration, "CHAT_APPROVAL_REQUIRED")
                                 restoreOpForFailedSend(opId, "CHAT_APPROVAL_REQUIRED")
                                 return@launch
                             } catch (_: PolicyEvaluationException) {
-                                setNoticeIfCurrent(operationGeneration, "CHAT_POLICY_UNAVAILABLE")
                                 restoreOpForFailedSend(opId, "CHAT_POLICY_UNAVAILABLE")
                                 return@launch
                             } catch (_: SecurityException) {
                                 // Fresh chat.send deny is projected by the
                                 // controller; keep the text recoverable.
-                                setNoticeIfCurrent(operationGeneration, "CHAT_SEND_DENIED")
                                 restoreOpForFailedSend(opId, "CHAT_SEND_DENIED")
                                 return@launch
                             } catch (_: InputTooLongException) {
                                 // R4-4 admission fail-fast: single-turn input +
                                 // time block exceeds MAX_REQUEST_CHARS. Never
                                 // sent; keep the text recoverable (draft).
-                                setNoticeIfCurrent(operationGeneration, "CHAT_INPUT_TOO_LONG")
                                 restoreOpForFailedSend(opId, "CHAT_INPUT_TOO_LONG")
                                 return@launch
                             } catch (_: TranscriptPendingException) {
@@ -1428,7 +1414,6 @@ class ChatViewModel(
                             } catch (_: TranscriptDurabilityException) {
                                 // Stage 6 (R4-3) admission fail-closed: same
                                 // restore semantics as InputTooLong.
-                                setNoticeIfCurrent(operationGeneration, "CHAT_STORE_UNAVAILABLE")
                                 restoreOpForFailedSend(opId, "CHAT_STORE_UNAVAILABLE")
                                 return@launch
                             }
@@ -1482,7 +1467,6 @@ class ChatViewModel(
                         drainNextRecoverableToInput()
                     }
                     EndpointAccess.Denied -> {
-                        setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
                         restoreOpForFailedSend(opId, "POLICY_DENIED")
                     }
                     is EndpointAccess.ConfirmRequired -> {
@@ -1491,7 +1475,6 @@ class ChatViewModel(
                         emitKeyReadConfirmRequired(access.generation, access.binding, opId = opId)
                     }
                     EndpointAccess.Missing -> {
-                        setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
                         restoreOpForFailedSend(opId, "NO_ENDPOINT")
                     }
                     EndpointAccess.Stale -> pendingOps.remove(opId)
@@ -1499,7 +1482,6 @@ class ChatViewModel(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
-                setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
                 restoreOpForFailedSend(opId, "NO_ENDPOINT")
             } finally {
                 retryAttempt?.takeUnless { it.queuedRetry }?.let(::finishRetryAttempt)
@@ -3837,6 +3819,9 @@ class ChatViewModel(
         if (recoverableOps.any { it.opId == opId } || inputDraft?.opId == opId) {
             val stashed = recoverableOps.firstOrNull { it.opId == opId }
             if (stashed != null && isGenerationCurrent(stashed.generation)) setRetryableIfNewer(stashed)
+            if ((stashed != null && isGenerationCurrent(stashed.generation)) || (inputDraft?.opId == opId && isGenerationCurrent(lifecycleGeneration))) {
+                _notice.value = noticeValue
+            }
             return
         }
         val op = pendingOps.remove(opId) ?: return
@@ -3849,9 +3834,9 @@ class ChatViewModel(
         if (_input.value.isNotBlank()) {
             addRecoverable(recoverable)
             syncRecoveryCount()
-            return
+        } else {
+            setInput(recoverable.text, recoverable.opId, recoverable.text, recoverable.recoverySequence)
         }
-        setInput(recoverable.text, recoverable.opId, recoverable.text, recoverable.recoverySequence)
         _notice.value = noticeValue
     }
 
@@ -3924,7 +3909,6 @@ class ChatViewModel(
             // dropped it). Flip to retryable UNAVAILABLE; the text is retained
             // for explicit retry, never auto-resent.
             if (pendingOps.containsKey(opId)) {
-                setNoticeIfCurrent(generation, "CHAT_STORE_UNAVAILABLE")
                 restoreOpForFailedSend(opId, "CHAT_STORE_UNAVAILABLE")
             } else if (_notice.value == "CHAT_STORE_PENDING") {
                 _notice.value = "CHAT_STORE_UNAVAILABLE"

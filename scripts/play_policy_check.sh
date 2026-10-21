@@ -57,7 +57,9 @@ esac
 # --aapt <path> must be parsed BEFORE the artifact-argument loop (an override
 # path is not an APK and must never reach the *.apk extension filter). It
 # rides --foss/--github and precedes the APK operands: options before
-# operands, first arg still the mode flag, last arg still the primary APK.
+# operands, in the order optional mode flag, optional --aapt <path>, then
+# the APK operands with the primary APK still last (the release stager
+# appends the APK operand after forwarding --aapt).
 AAPT_OVERRIDE=
 case "${1:-}" in
     --aapt)

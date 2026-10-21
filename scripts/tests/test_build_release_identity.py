@@ -589,6 +589,25 @@ class ReleaseBuilderHarness(unittest.TestCase):
         self.assertNotEqual(first_root, second_root)
 
 
+class PolicyTimeoutBudgetTest(unittest.TestCase):
+    """The per-flavor policy timeout budget is part of the release lane's named fail-closed contract, not a silent knob."""
+
+    def test_policy_timeout_seconds_mapping_is_pinned_per_flavor(self) -> None:
+        # release_artifact_stage resolves its verify_release_apk sibling via a
+        # bare import, so it only loads with scripts/ on sys.path (as when run
+        # directly); import it that way for the pin, closing over no calls.
+        try:
+            sys.path.insert(0, str(ROOT / "scripts"))
+            import release_artifact_stage as stager
+        finally:
+            sys.path.pop(0)
+
+        self.assertEqual(
+            stager.POLICY_TIMEOUT_SECONDS,
+            {"play": 720, "foss": 720, "github": 360},
+        )
+
+
 class SignerPinRegistryTest(unittest.TestCase):
     """Pin-file shape controls for the Issue #12 signer-pin registry gap."""
 

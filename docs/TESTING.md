@@ -300,6 +300,13 @@ PR CI never scanned until release staging
 The upload step keeps both faces (`Upload Debug & Release APKs`, artifact
 `assembled-apks`).
 
+Release staging adds a same-ruler binding over the staged snapshot bytes: the
+local `build_release.sh` → `release_artifact_stage.py` delegate forwards the
+verifier's caller-validated `aapt` through the gate's `--aapt` override, so
+`verify_release_apk.py` and `play_policy_check.sh` read one staged set of
+bytes with one aapt binary rather than two independently discovered tools;
+the CI gate above keeps automatic aapt discovery.
+
 Two adjacent shell findings were made fail-closed in the same pass. A missing
 flavor/overlay manifest no longer makes the whole structured permission stage
 silently absent (the retired `[ -f "$m" ] || continue` skip): every lane now

@@ -19,8 +19,11 @@ import java.io.File
  *   NOFOLLOW 遞迴刪除（內部遭植入 symlink 亦不波及外部）；
  * - 每次啟動刪除類處置設 [SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN] 上限、
  *   還原型另有同源獨立的 [SkillInstaller.MAX_RESTORES_PER_RUN] 上限（兩預算
- *   不互相擠兌；上限計工作嘗試（attempt）——失敗亦在車道入口、首 I/O 前計入，
- *   超出者本 run KEPT 且零 I/O、下次啟動收斂，attempt 縫／注入釘見
+ *   不互相擠兌；上限計工作嘗試（attempt）——失敗亦在車道入口、其首 I/O 前計入
+ *  （I/O＝車道工作量——tree walk／unlink／rename／SKILL.md 讀取＋解析，單一
+ *   定義見 SkillInstaller 的 RunBudget KDoc；枚舉與 NOFOLLOW 分類探針為 O(N)
+ *   固定成本、不占預算、不隨超限取消），超出者本 run KEPT 且零車道 I/O，
+ *   attempt 縫／注入釘見
  *   SkillAtomicCommitTest 的 restoreAttempts_／proofAttempts_／deleteAttempts_
  *   三釘）：超出者本 run 保留、下次啟動繼續收斂（分見
  *   cleanup_deleteBudget_cappedPerRun／cleanup_restoreBudget_cappedPerRun；
@@ -60,7 +63,7 @@ class SkillStartupRecoveryTest {
         // 崩潰後數秒的 .bak（target 缺席）：即使未達 24h 預設期限也必須立即恢復。
         val root = tempRoot()
         try {
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val bak = File(root, ".fresh-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(skillMd("fresh-skill", "舊版正文"), Charsets.UTF_8)
@@ -80,7 +83,7 @@ class SkillStartupRecoveryTest {
         // 進行中安裝保護：新鮮 staging 不受預設 24h 期限刪除（避免誤刪他方剛啟動的安裝）。
         val root = tempRoot()
         try {
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val staging = File(root, ".inflight-skill.tmp-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(skillMd("inflight-skill", "新版正文"), Charsets.UTF_8)
@@ -103,7 +106,7 @@ class SkillStartupRecoveryTest {
                 parentFile!!.mkdirs()
                 writeText(skillMd(name, "現行版"), Charsets.UTF_8)
             }
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val bak = File(root, ".$name.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(skillMd(name, "舊版"), Charsets.UTF_8)
@@ -248,7 +251,7 @@ class SkillStartupRecoveryTest {
         val parent = tempRoot()
         try {
             val root = File(parent, "skills").apply { mkdirs() }
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val id = "dangslot-skill"
             val link = File(root, id)
             try {
@@ -304,7 +307,7 @@ class SkillStartupRecoveryTest {
             val root = File(parent, "skills").apply { mkdirs() }
             val outside = File(parent, "outside").apply { mkdirs() }
             val sentinel = File(outside, "sentinel.txt").apply { writeText("keep", Charsets.UTF_8) }
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val id = "linkdir-skill"
             val link = File(root, id)
             try {
@@ -413,7 +416,7 @@ class SkillStartupRecoveryTest {
         try {
             val extra = 7
             val total = SkillInstaller.MAX_RESTORES_PER_RUN + extra
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val ids = (0 until total).map { "rstcap-" + it.toString().padStart(3, '0') }
             val baks = ids.map { id ->
                 File(root, ".$id.bak-${Math.abs(System.nanoTime())}-$tid").apply {
@@ -469,7 +472,7 @@ class SkillStartupRecoveryTest {
                     setLastModified(now - (25L * 60 * 60 * 1000))
                 }
             }
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val bak = File(root, ".rst-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(skillMd("rst-skill", "舊版正文"), Charsets.UTF_8)
@@ -500,7 +503,7 @@ class SkillStartupRecoveryTest {
             val root = File(parent, "skills").apply { mkdirs() }
             val outside = File(parent, "outside").apply { mkdirs() }
             val sentinel = File(outside, "sentinel.txt").apply { writeText("keep", Charsets.UTF_8) }
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val extra = 7
             val total = SkillInstaller.MAX_CLEANUP_ENTRIES_PER_RUN + extra
             val links = (0 until total).map { i ->
@@ -532,7 +535,7 @@ class SkillStartupRecoveryTest {
     @Test fun cleanup_twoStaleBaksWithLiveTarget_convergentDelete() {
         val root = tempRoot()
         try {
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val id = "bakconv-skill"
             // target 仍在：同 id 的孤兒 .bak 形狀注定不可還原，屬純垃圾——
             // 不得因「同 id 多份」歧義而永久滯留，應在刪除預算內逐次清空。
@@ -564,7 +567,7 @@ class SkillStartupRecoveryTest {
     @Test fun cleanup_twoStaleBaksWithoutTarget_ambiguityKept_forRestore() {
         val root = tempRoot()
         try {
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val id = "bakamb-skill"
             // target 缺席 + 同 id 多份（形狀須匹配 BACKUP_RE 的 \d+-\d+ 尾碼，
             // 否則本測試空轉）：還原路徑無法證明新舊，全保留（資料防遺失）。
@@ -595,7 +598,7 @@ class SkillStartupRecoveryTest {
             } catch (e: java.io.IOException) {
                 org.junit.Assume.assumeNoException("cannot create symlink", e)
             }
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             File(link, ".sym-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(skillMd("sym-skill", "舊版"), Charsets.UTF_8)
@@ -623,7 +626,7 @@ class SkillStartupRecoveryTest {
             }
             // 直接在 symlink 目標（real）建立「過期」條目：若無 symlink 防衛，
             // listResiduals(link) 會 follow symlink 而列出它；有防衛則回空。
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             File(real, ".sym-skill.tmp-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 setLastModified(System.currentTimeMillis() - (25L * 60 * 60 * 1000))

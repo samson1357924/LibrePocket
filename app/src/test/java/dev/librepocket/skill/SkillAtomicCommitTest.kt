@@ -297,7 +297,7 @@ class SkillAtomicCommitTest {
         try {
             // P1-2：同 id 兩份不同內容 expired .bak + target 缺席。
             // nanoTime 後綴非 wall-clock，不可用於選「最新」；歧義時全保留、不還原、不刪除。
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val bakV1 = File(root, ".dup-skill.bak-111-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(
@@ -335,7 +335,7 @@ class SkillAtomicCommitTest {
         try {
             // 一份新鮮 + 一份過期同 id .bak + target 缺席：同樣無法判定，
             // 逕行恢復過期版可能是錯版勝出，故全保留、不還原、不計數。
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val bakFresh = File(root, ".dup-skill.bak-111-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(
@@ -461,7 +461,7 @@ class SkillAtomicCommitTest {
         val root = tempRoot()
         try {
             installV1(root)
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
 
             val now = System.currentTimeMillis()
             val stale = File(root, ".atomic-skill.tmp-${now * 1000L}-$tid").apply {
@@ -491,7 +491,7 @@ class SkillAtomicCommitTest {
         val root = tempRoot()
         try {
             // 模擬崩潰窗口：backup 已搬離、target 缺席（真實 nano-tid 格式名）。
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val bak = File(root, ".orphan-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(
@@ -562,7 +562,7 @@ class SkillAtomicCommitTest {
         val root = tempRoot()
         try {
             // 形狀符合但 id 非法（NAME_RE 拒大寫）：只刪不恢復。
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val bad = File(root, ".UPPER.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText("junk")
@@ -583,7 +583,7 @@ class SkillAtomicCommitTest {
         run {
             val root = tempRoot()
             try {
-                val tid = Thread.currentThread().id
+                val tid = Thread.currentThread().threadId()
                 val staging = File(root, ".w1-skill.tmp-${Math.abs(System.nanoTime())}-$tid").apply {
                     mkdirs()
                     File(this, "SKILL.md").writeText(skillMd(name = "w1-skill", body = "新版正文"))
@@ -600,7 +600,7 @@ class SkillAtomicCommitTest {
         run {
             val root = tempRoot()
             try {
-                val tid = Thread.currentThread().id
+                val tid = Thread.currentThread().threadId()
                 File(root, ".w2-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                     mkdirs()
                     File(this, "SKILL.md").writeText(skillMd(name = "w2-skill", body = "舊版正文"))
@@ -624,7 +624,7 @@ class SkillAtomicCommitTest {
         run {
             val root = tempRoot()
             try {
-                val tid = Thread.currentThread().id
+                val tid = Thread.currentThread().threadId()
                 File(root, "w3-skill").apply {
                     mkdirs()
                     File(this, "SKILL.md").writeText(skillMd(name = "w3-skill", body = "新版正文"))
@@ -859,7 +859,7 @@ class SkillAtomicCommitTest {
         val root = tempRoot()
         try {
             installV1(root)
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val now = System.currentTimeMillis()
             val stale = File(root, ".atomic-skill.tmp-${now * 1000L}-$tid").apply {
                 mkdirs()
@@ -898,7 +898,7 @@ class SkillAtomicCommitTest {
         try {
             // 同 id 兩份 expired .bak + target 缺席：清理全保留（0），
             // 觀察仍列出兩份供人工核對（見 SkillInstaller KDoc）。
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val bakV1 = File(root, ".dup-skill.bak-111-$tid").apply {
                 mkdirs()
                 setLastModified(System.currentTimeMillis() - 120_000L)
@@ -986,7 +986,7 @@ class SkillAtomicCommitTest {
         // 未來 mtime（時鐘偏斜）：now-lastModified<0<maxAge，視為 fresh 不刪除（釘選行為）。
         val root = tempRoot()
         try {
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val future = File(root, ".atomic-skill.tmp-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 assertTrue("setLastModified must succeed", setLastModified(System.currentTimeMillis() + 600_000L))
@@ -1003,7 +1003,7 @@ class SkillAtomicCommitTest {
         // 檔案型 .bak（非目錄）：只刪不恢復，不計歧義。
         val root = tempRoot()
         try {
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val fileBak = File(root, ".orphan2-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 writeText("not a dir")
                 setLastModified(System.currentTimeMillis() - 120_000L)
@@ -1025,7 +1025,7 @@ class SkillAtomicCommitTest {
             val r = SkillInstaller.installZip(zip, root, replace = false)
             assertTrue("expected success, got $r", r is SkillInstaller.Result.Success)
             assertTrue(File(root, "a.b-c/SKILL.md").isFile)
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val stale = File(root, ".a.b-c.tmp-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 assertTrue(setLastModified(System.currentTimeMillis() - 120_000L))
@@ -1129,7 +1129,7 @@ class SkillAtomicCommitTest {
         // other-name 皆不得出現）、不刪除；listResiduals 照常列出供人工核對。
         val root = tempRoot()
         try {
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val bak = File(root, ".mismatch-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(
@@ -1157,7 +1157,7 @@ class SkillAtomicCommitTest {
         // 兩者皆「無法證明歸屬」：KEPT、不還原、不刪除（listResiduals 照常列出）。
         val root = tempRoot()
         try {
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val missing = File(root, ".mdmiss-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "orphan").writeText("not a skill", Charsets.UTF_8)
@@ -1188,7 +1188,7 @@ class SkillAtomicCommitTest {
         // 證明尺寸閘獨立於解析、超限即無法證明歸屬：KEPT、不還原、不刪除。
         val root = tempRoot()
         try {
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val mdText = skillMd(name = "oversize-skill", body = "正文") + "\n" +
                 "A".repeat(SkillInstaller.MAX_SINGLE_FILE_BYTES.toInt() + 1)
             val bak = File(root, ".oversize-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
@@ -1222,7 +1222,7 @@ class SkillAtomicCommitTest {
             val sentinel = File(outside, "sentinel.txt").apply {
                 writeText(skillMd(name = "linkbak-skill"), Charsets.UTF_8)
             }
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val bak = File(root, ".linkbak-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply { mkdirs() }
             try {
                 java.nio.file.Files.createSymbolicLink(
@@ -1261,18 +1261,20 @@ class SkillAtomicCommitTest {
         // 嘗試）+ 1 份已知合法 bak。單 run：17 份候選只付 cap 份 attempt
         //（cleanupAttemptsForTest().second 恰 cap；first==0 對照還原車道不占刪除
         // 帳），rename 嘗試 ≤ cap，合法 bak 本 run 不得被還原（attempt 被失敗型
-        // 耗盡便零 I/O，或其 rename 被注入拒絕——皆 KEPT、內容完整、仍在 bak 形
+        // 耗盡便零車道 I/O——讀證與 rename 皆不付（枚舉／分類探針仍付 O(N)），
+        // 或其 rename 被注入拒絕——皆 KEPT、內容完整、仍在 bak 形
         // 狀），人工移除失敗型 bak 後的下個 run 才還原（跨 run 收斂誠實）。
         // 舊行為（成功才改帳）：失敗型永不耗額——17 份全部付全額（lstat＋全檔讀
         // ＋解析，rename 車者再加 rename），合法 bak 同 run 被扶正；attempt 縫在
         // 舊計法下為 0～1（僅計成功）， 非 cap——本測以縫為主殺死形。
         // 誠實註記（列舉順序）：`listFiles()` 順序未定義，合法 bak 可能位於 cap
-        // 之內——此形其 attempt 已付、rename 由 hook 拒絕；「cap 後零 I/O 的 17th」
+        // 之內——此形其 attempt 已付、rename 由 hook 拒絕；「cap 後零車道 I/O
+        //（讀證／rename 不付、探針仍付 O(N)）的 17th」
         // 形由 attempt 縫恰 cap＋車道序（bindRestore 先於 bakManifestName）佐證，
         // 讀取本身無注入縫，屬手動審計（同 proofAttempts_ 款）。
         val root = tempRoot()
         try {
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val cap = SkillInstaller.MAX_RESTORES_PER_RUN
             val wrongIds = (0 until cap / 2).map { "atmw-" + it.toString().padStart(3, '0') }
             val renameFailIds = (cap / 2 until cap).map { "atmr-" + it.toString().padStart(3, '0') }
@@ -1347,7 +1349,7 @@ class SkillAtomicCommitTest {
         try {
             val extra = 7
             val total = SkillInstaller.MAX_RESTORES_PER_RUN + extra
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val filler = "A".repeat(60_000)
             val baks = (0 until total).map { i ->
                 val id = "proof-" + i.toString().padStart(3, '0')
@@ -1388,7 +1390,8 @@ class SkillAtomicCommitTest {
         // 刪除類 attempt 釘（殺死舊 success-counting 計法的刪除側）：cap+7 個過期
         // staging 條目 + deleteHook=false（skip-fail 語意：attempt 已計入、真實
         // I/O 本 run 跳過）。單 run：hook 調用恰 cap（有額才調——cap 後條目無額
-        // 不調、零 I/O），removed==0，全部條目（含其內 sentinel）原樣——「65th
+        // 不調、零車道 I/O——無額即不發起 tree walk，N 枚舉與分類探針照常付），
+        // removed==0，全部條目（含其內 sentinel）原樣——「65th
         // 仍在」由全員 survive 佐證（誰恰逢第 65 位不可控，hook=false 下全員
         // KEPT）。舊行為：敗刪不改帳——cap+7 個全都會被 hook 調用（71≠cap，
         // 本測 behavioral 主殺死形，不僅靠縫）。hook 清回 null 後 64→7→0 跨 run

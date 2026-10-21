@@ -136,10 +136,15 @@ object SkillInstaller {
      * 每次清理呼叫最多「刪除類」工作嘗試（attempt）數——超出者保留、留待下次啟動收斂。
      *
      * 上限約束的是**有償工作嘗試**而非「成功」：遞迴刪除與 symlink unlink 各自的
-     * attempt 都在車道入口（**首 I/O 之前**）計入，**失敗亦計入**（walk 部分失敗回
+     * attempt 都在車道入口、其首 I/O 之前計入（**I/O＝車道工作量**——tree walk／
+     * unlink／rename／SKILL.md 讀取＋解析；單一定義見 [RunBudget] KDoc，
+     * NOFOLLOW 分類探針屬枚舉／分類成本、不占額），**失敗亦計入**（walk 部分失敗回
      * false、unlink 刪不掉皆不退回）——否則失敗佔多的殘留會讓單次啟動做無界 I/O
      * （成功計數不改帳，失敗候選永不耗盡本 run 額度；P2-1 的症狀形）。超限後的
-     * 候選一律 KEPT 且本 run 零 I/O，下次啟動繼續收斂；成功數另由
+     * 候選一律 KEPT 且本 run 零車道 I/O（不做 tree walk／unlink／rename／
+     * SKILL.md 讀取＋解析；`listFiles()` 枚舉、NOFOLLOW 分類探針與齡期閘的
+     * `lastModified()` stat 為 O(N) 固定成本、不占預算，不隨超限取消），下次
+     * 啟動繼續收斂；成功數另由
      * [cleanupStaleStaging] 的回傳（removed）單獨計，供啟動 log。
      * 崩潰還原（same-dir rename，O(1)）**不共用在刪除預算**（兩者不互相擠兌，
      * 見下），但另受同源的 [MAX_RESTORES_PER_RUN] 專屬上限約束。
@@ -152,11 +157,15 @@ object SkillInstaller {
      * 誠實筆記：每個還原**不止**一次 rename（O(1)）——還要先跨檔讀 bak 內
      * `SKILL.md`（受 [MAX_SINGLE_FILE_BYTES] 上限）、解析 frontmatter，加上
      * 呼叫方與 per-skill 鎖內各一次的 NOFOLLOW 目標槽探針。本上限約束的正是
-     * 這些**有償工作嘗試**而非「成功」：attempt 在歧義守衛之後、NOFOLLOW 重探
-     * 之前（首 I/O 前）計入，**失敗亦計入**——錯名／損毀（解析失敗）bak 的內容
+     * 這些**有償工作嘗試**而非「成功」：attempt 在歧義守衛之後計入（其後最先的
+     * NOFOLLOW 重探屬分類成本、非 I/O——I/O 單一定義見 [RunBudget] KDoc；
+     * 本 attempt 對應的車道首 I/O 是跨檔 SKILL.md 讀取＋解析，消耗點在其
+     * 之前），**失敗亦計入**——錯名／損毀（解析失敗）bak 的內容
      * 證明、改名失敗的 rename 皆不退回；success-counting 舊計法（成功才改帳）
      * 下失敗候選永不耗盡額度，單次啟動可對同批殘留反覆付全額 I/O（P2-1）。
-     * 超限後的候選本 run KEPT 且零 I/O，下次啟動繼續收斂。歧義候選（同 id 多份、
+     * 超限後的候選本 run KEPT 且零車道 I/O（不做 SKILL.md 讀取＋解析與 rename；
+     * 枚舉、NOFOLLOW 分類探針與齡期閘的 `lastModified()` stat 為 O(N) 固定
+     * 成本、不占預算，不隨超限取消），下次啟動繼續收斂。歧義候選（同 id 多份、
      * 全保留待人工）刻意**不消耗** attempt：歧義永不收斂，若占額會讓其後的合法
      * crash-bak 永遠等不到還原機會；其查詢本身維持 O(1)/free。新殘留 ≤ 上限的
      * 常態崩潰窗口仍受「process restart 即恢復」保護，僅極端堆積時把耗費攤到
@@ -278,13 +287,21 @@ object SkillInstaller {
      * readNBytes）——lstat 通過後到全文讀取前檔案被撐大的殘餘窗口內，實際
      * 讀得超限即視為無法證明（回 null），不再依賴無界 readText 全量讀取；
      * 解析僅吃這份受讀位元組前綴。
+     *
+     * 開檔一律以 [java.nio.file.LinkOption.NOFOLLOW_LINKS] 發起：lstat 預閘與
+     * open 之間的換靶窗 fail-closed——窗口內 md 被（再）換成 symlink 時 open
+     * 直接失敗（NOFOLLOW 下對 link 開檔即 ELOOP），經既有 catch 收斂 null
+     *（與上段尺寸成長窗並列的縱深）。
      */
     private fun bakManifestName(bakDir: File): String? = try {
         val md = File(bakDir, SKILL_MD)
         if (isSymlinkOrUnknown(md) || !md.isFile || md.length() > MAX_SINGLE_FILE_BYTES) {
             null
         } else {
-            java.nio.file.Files.newInputStream(md.toPath()).use { ins ->
+            java.nio.file.Files.newInputStream(
+                md.toPath(),
+                java.nio.file.LinkOption.NOFOLLOW_LINKS,
+            ).use { ins ->
                 // 至多 MAX+1 位元組：恰好 MAX 位元組照常可解析（與預閘一致），
                 // 讀滿 MAX+1 即「窗口內被撐大到超限」，無法證明。
                 val prefix = ins.readNBytes((MAX_SINGLE_FILE_BYTES + 1).toInt())
@@ -367,8 +384,9 @@ object SkillInstaller {
      * 生產不得設定、測試須於 `@After` 重置為 null；`@VisibleForTesting internal`
      * 同 VoiceSpeaker hook 慣例，annotation 供 lint 靜態把關）。
      *
-     * 刪除車道 attempt 注入縫：在刪除類 attempt 消耗點（車道入口、首 I/O 前，
-     * 見 [MAX_CLEANUP_ENTRIES_PER_RUN] 的 attempt 語意）以條目名調用——回 true
+     * 刪除車道 attempt 注入縫：在刪除類 attempt 消耗點（車道入口、其首 I/O 前
+     * ——I/O＝車道工作量，單一定義見 [RunBudget] KDoc；attempt 語意另見
+     * [MAX_CLEANUP_ENTRIES_PER_RUN] 的 KDoc）以條目名調用——回 true
      * （或 null 預設）照常執行真實刪除（[unlinkEntry]／[deleteTreeSafe]）；回
      * false 表「attempt 已計入、真實 I/O 本 run 跳過（skip-fail）」：條目 KEPT
      * 原狀、下次啟動收斂。生產路徑恆為 null，零成本 no-op（null 短路，不建
@@ -406,8 +424,17 @@ object SkillInstaller {
      * 單次清理 run 的 attempt 預算（刪除類／還原型同源獨立兩帳；語意見兩常量
      * KDoc——上限計「工作嘗試」而非「成功」，失敗亦計入）。
      *
-     * 消耗點在各工作車道入口、**首 I/O 之前**（[bindDelete] 於 unlink／
-     * deleteTreeSafe 前、[bindRestore] 於還原的 NOFOLLOW 重探前）；成功數由
+     * **「I/O」在清理契約中的單一定義處**：本物件與兩常量／各清理 KDoc 所說的
+     * I/O 一律指**車道工作量**——tree walk（[deleteTreeSafe]）、unlink
+     *（[unlinkEntry]）、rename、還原讀證與跨檔 SKILL.md 讀取＋解析
+     *（[bakManifestName]）等有償寫讀；`listFiles()`／`bakCountById` 枚舉、
+     * NOFOLLOW 分類探針（[isSymlinkOrUnknown]／[targetStateNoFollow]，lstat 類）
+     * 與齡期閘的 `lastModified()` stat 屬 O(N)／O(1) 的**分類成本**，不占額、
+     * 不計做 I/O。其餘 KDoc 不重複完整定義、至多簡引本段或併列簡式。
+     *
+     * 消耗點在各工作車道入口、其首 I/O 之前（[bindDelete] 在刪除車道的首 I/O
+     *（unlink／deleteTreeSafe）之前；[bindRestore] 在還原車道的 NOFOLLOW
+     * 分類重探與其首 I/O（跨檔 SKILL.md 讀取＋解析）之前）；成功數由
      * 呼叫方另行計數（removed 回傳值），不反映在本物件。
      */
     private class RunBudget(private val maxDeletes: Int, private val maxRestores: Int) {
@@ -420,7 +447,8 @@ object SkillInstaller {
         val restoreAvailable: Boolean get() = restoreAttempts < maxRestores
 
         /**
-         * 刪除車道入口（首 I/O 前）：有額則計入 attempt 並過 [SkillInstaller.deleteHook]
+         * 刪除車道入口（其首 I/O 前——I/O＝車道工作量，單一定義見 [RunBudget] KDoc）：
+         * 有額則計入 attempt 並過 [SkillInstaller.deleteHook]
          * （false＝本 run 跳過真實 I/O、KEPT 待下次收斂）；無額回 false（不消耗、不調 hook）。
          */
         fun bindDelete(name: String): Boolean {
@@ -429,7 +457,7 @@ object SkillInstaller {
             return SkillInstaller.deleteHook?.invoke(name) ?: true
         }
 
-        /** 還原車道入口（首 I/O 前）：有額才計入 attempt（其後的 NOFOLLOW 重探、內容證明、rename 皆在本額之內）。 */
+        /** 還原車道入口（其分類重探與首 I/O——跨檔 SKILL.md 讀取＋解析——之前；I/O 單一定義見 [RunBudget] KDoc）：有額才計入 attempt（其後的 NOFOLLOW 重探屬分類成本、不占額，內容證明與 rename 屬本 attempt 對應的車道工作）。 */
         fun bindRestore(): Boolean {
             if (restoreAttempts >= maxRestores) return false
             restoreAttempts++
@@ -497,10 +525,13 @@ object SkillInstaller {
      *
      * 每次呼叫的「刪除類」工作嘗試（attempt）有 [MAX_CLEANUP_ENTRIES_PER_RUN]
      * 上限、還原型 attempt 有同源獨立的 [MAX_RESTORES_PER_RUN] 上限（兩預算
-     * 不互相擠兌；上限計 attempt 而非成功——失敗亦在車道入口、首 I/O 前計入，
-     * 還原除 rename 外每候選還有跨檔 SKILL.md 讀取＋解析成本，不是純 O(1)，
-     * 語意見該兩常量 KDoc）：超出者保留原狀（本 run 零 I/O）、留待下次啟動
-     * 繼續收斂（避免單次啟動無界 I/O）。
+     * 不互相擠兌；上限計 attempt 而非成功——失敗亦在車道入口、其首 I/O 前計入
+     *（I/O＝車道工作量，單一定義見 [RunBudget] KDoc；還原除 rename 外每候選
+     * 還有跨檔 SKILL.md 讀取＋解析成本，不是純 O(1)），語意見該兩常量 KDoc）：
+     * 超出者保留原狀、本 run 零車道 I/O（不做 tree walk／unlink／rename／
+     * SKILL.md 讀取＋解析；`listFiles()` 枚舉、NOFOLLOW 分類探針與齡期閘的
+     * `lastModified()` stat 為 O(N) 固定成本、不占預算，不隨超限取消）、
+     * 留待下次啟動繼續收斂（避免單次啟動無界 I/O）。
      *
      * 呼叫方契約：不應與 [installZip]/[installFiles] 對同一 [destRoot] 併發調用；
      * 本函式內僅對同一 id 取 per-skill 鎖做 best-effort 互斥（防與安裝提交交錯），
@@ -539,6 +570,11 @@ object SkillInstaller {
         // 同樣無法判定，逕行恢復過期版可能是錯版勝出，故亦視為歧義。
         // target 仍在的孤兒 bak 不受歧義保護：其形狀注定不可還原，照常入
         // 刪除預算逐次收斂（避免永久滯留，見 [handleCleanupEntry]）。
+        // 自支收斂（無死鎖）註記：同 id「一份可還原 bak ＋ 一份待刪垃圾 bak」
+        //（後者如非目錄形 bak——無還原形狀、target 缺席下照常入刪除車道）時，
+        // 歧義只是延遲而非死結：本 run 的計數快照把兩者同帳，垃圾那份先由
+        // 刪除車道在本 run（未過期者為下個過齡期的 run）附清，下輪 count
+        // 回落為 1、可還原那份即獲還原——計數隨刪除自支收斂、無死鎖。
         val bakCountById = HashMap<String, Int>()
         for (f in entries) {
             val bakId = BACKUP_RE.matchEntire(f.name)?.groupValues?.get(1) ?: continue
@@ -547,7 +583,7 @@ object SkillInstaller {
         }
         var removed = 0
         // 每次啟動的刪除類／還原型工作預算（同源獨立帳，attempt 語意見兩常量
-        // KDoc）：失敗亦在車道入口（首 I/O 前）計入，避免單次啟動無界 I/O
+        // KDoc）：失敗亦在車道入口（其首 I/O 前）計入，避免單次啟動無界 I/O
         // （超出者本 run 保留、待下次收斂）；成功數另計於 removed。
         for (f in entries) {
             val n = f.name
@@ -640,8 +676,14 @@ object SkillInstaller {
      * [MAX_CLEANUP_ENTRIES_PER_RUN] 約束，超出者保留待下次收斂。
      *
      * attempt 預算語意（[RunBudget]）：刪除類（unlink／deleteTreeSafe）與還原型
-     * 的 attempt 都在**各工作車道入口、首 I/O 前**消耗——失敗（回 false／解析
-     * 失敗／改名失敗）不退回，budget 耗盡後的候選直接 KEPT、本 run 零 I/O。
+     * 的 attempt 都在**各工作車道入口、其首 I/O 前**消耗（I/O＝車道工作量，單一
+     * 定義見 [RunBudget] KDoc）——失敗（回 false／解析
+     * 失敗／改名失敗）不退回，budget 耗盡後的候選直接 KEPT、本 run 零車道 I/O
+     *（不做 tree walk／unlink／rename／SKILL.md 讀取＋解析）。枚舉（呼叫方的
+     * `listFiles()`／`bakCountById`）與縱深分類探針——子條目
+     * [isSymlinkOrUnknown] 防衛（本函式 1) 步）與 [targetStateNoFollow] 槽位
+     * 探針（bak 分支 when）——**先於** attempt 消耗點執行，屬 O(N) 固定成本、
+     * 不占預算、不隨超限取消（超限候選每 run 仍照付這些分類探針）。
      * 還原車道的歧義守衛刻意在消耗點**之前**且不消耗 attempt（O(1)/free）：
      * 歧義候選永不收斂（全保留待人工），若占額會讓其後的合法 crash-bak 永遠
      * 等不到還原機會。
@@ -693,7 +735,9 @@ object SkillInstaller {
                     // 可能是錯版勝出）。查詢為 O(1)/free、不消耗 attempt（見上）。
                     if ((bakCountById[bakId] ?: 0) > 1) return Disposition.KEPT
                     //（f 已通過上方 NOFOLLOW 檢查；還原型共用同源 attempt 預算，不占刪除預算。）
-                    // 消耗還原 attempt（首 I/O 前）：其後的 NOFOLLOW 重探、跨檔
+                    // 消耗還原 attempt（於其分類重探與首 I/O——跨檔 SKILL.md 讀取
+                    // ＋解析——之前，I/O 單一定義見 [RunBudget] KDoc）：其後的
+                    // NOFOLLOW 重探屬分類成本，跨檔
                     // SKILL.md 內容證明、rename 皆屬有償工作，解析失敗／改名失敗
                     // 亦不退回——超限者本 run KEPT、下次啟動收斂。
                     if (!budget.bindRestore()) return Disposition.KEPT
@@ -725,7 +769,8 @@ object SkillInstaller {
             // 沿用下方刪除路徑（占刪除 attempt 預算，啟動間收斂），不因同 id 歧義滯留。
         }
         // staging、target 槽被佔的孤兒 bak、或 id 非法者：只刪不恢復。
-        // 刪除類 attempt 在 deleteTreeSafe 前（首 I/O 前）計入；walk 部分失敗
+        // 刪除類 attempt 在 deleteTreeSafe 前（其首 I/O——tree walk——前，I/O
+        // 單一定義見 [RunBudget] KDoc）計入；walk 部分失敗
         //（回 false）亦不退回——超出者保留待下次收斂。
         if (!budget.bindDelete(f.name)) return Disposition.KEPT
         return if (deleteTreeSafe(f)) Disposition.DELETED else Disposition.KEPT
@@ -752,10 +797,15 @@ object SkillInstaller {
             //（回 null，覆蓋照常進行，不因揭露失敗受阻），防對植入的
             // 超限 frontmatter 做無界 readText。
             if (md.length() > MAX_SINGLE_FILE_BYTES) return null
-            // lstat 與 readText 之間存在 swap 增長窗（同 bakManifestName 的
+            // lstat 與 readText 之間存在 swap 增長窗（同 [bakManifestName] 的
             // 修正）：以 bounded read 兜底——超過單檔上限的字首一律視為
-            // 不可讀，讀取量本身有界。
-            val bytes = md.inputStream().use { s ->
+            // 不可讀，讀取量本身有界。開檔同 [bakManifestName] 以 NOFOLLOW
+            // 發起（lstat 與 open 之間的換靶窗 fail-closed：窗口內被換成
+            // symlink 即開檔失敗〔ELOOP 類〕，經下方 catch 收斂 null）。
+            val bytes = java.nio.file.Files.newInputStream(
+                md.toPath(),
+                java.nio.file.LinkOption.NOFOLLOW_LINKS,
+            ).use { s ->
                 s.readNBytes(MAX_SINGLE_FILE_BYTES.toInt() + 1)
             }
             if (bytes.size > MAX_SINGLE_FILE_BYTES) return null
@@ -1031,6 +1081,11 @@ object SkillInstaller {
             //（既有契約保留）；[TargetState.UNKNOWN]（屬性不可判定）→
             // fail-closed 拒裝（訊息與真 symlink 收斂，同 destRoot 探針慣例：
             // 不洩更多檔案系統屬性、僅含檔名）。
+            // 縱深註記：本探針不是唯一守門——staging 寫入（可全量、有耗時）
+            // 之後的 commit 點再做一次同形三態重探（見下方 fsync 之後的
+            // when），探針到 commit 之間的同 uid 置換窗由該重探 fail-closed
+            // 收口（link／UNKNOWN 拒裝、真實被佔依 [replace] 契約走
+            // ALREADY_EXISTS 或替換車道；訊息與本探針車道收斂）。
             when (targetStateNoFollow(target)) {
                 TargetState.ABSENT -> Unit
                 TargetState.UNKNOWN ->
@@ -1050,6 +1105,9 @@ object SkillInstaller {
                     }
                 }
             }
+            // tid 僅用於 staging 產名唯一性：main 用 getId()（API 1 起存在、與
+            // threadId() 同值）以保 API 33+（threadId() 需 API 36+）；host JVM
+            // 測試端製作殘留檔名時用 threadId()。
             val tid = Thread.currentThread().id
             // 產名一律 abs(nanoTime)（見 STAGING_RE 產名形狀合約）：nanoTime 規格
             // 允許為負，負值直拼會掉出 STAGING_RE 形狀、殘留永不收斂。
@@ -1086,73 +1144,108 @@ object SkillInstaller {
                     fsyncBestEffort(out)
                 }
                 fsyncBestEffort(staging)
-                if (!target.exists()) {
-                    if (!rename(staging, target)) {
+                // commit 點 NOFOLLOW 三態重探（fail-closed，與 [handleCleanupEntry]
+                // 還原路徑 rename 前的重驗同向；見上方 target 探針的縱深註記）：
+                // 探針到本點之間存在同 uid 置換窗，舊寫法僅以跟隨式 exists() 重判
+                // 新鮮／替換分支——懸空 link 的 exists() 會誤判「缺席」→ 新鮮
+                // rename 把自植 link 吃掉；窗內置入的真實條目則被誤入替換車道
+                //（!replace 契約下更會搬走並刪除他人條目）。改以三態定案
+                //（不洩屬性；拒絕訊息與探針車道同一字句；分支分派後一切車道
+                // 本體與訊息與舊寫法逐字相同）：
+                when (targetStateNoFollow(target)) {
+                    // 確定缺席 → 新鮮 commit（rollback 語意同舊形）。
+                    TargetState.ABSENT -> {
+                        if (!rename(staging, target)) {
+                            deleteTreeSafe(staging)
+                            return Result.Failure(
+                                Failure.IO_ERROR,
+                                "commit failed: rename staging ${staging.name} -> ${target.name}",
+                            )
+                        }
+                        fsyncBestEffort(destRoot)
+                    }
+                    // 屬性不可判定：不可信（探針車道同款 fail-closed）——staging
+                    // 先清不留半成品，訊息沿用「target must not be symlink」收斂
+                    // 字句（同探針慣例：不洩更多檔案系統屬性）。
+                    TargetState.UNKNOWN -> {
                         deleteTreeSafe(staging)
-                        return Result.Failure(
-                            Failure.IO_ERROR,
-                            "commit failed: rename staging ${staging.name} -> ${target.name}",
-                        )
+                        return Result.Failure(Failure.IO_ERROR, "target must not be symlink: ${target.name}")
                     }
-                    fsyncBestEffort(destRoot)
-                } else {
-                    // 降版揭露：先快照舊版 version（best-effort，失敗即 null），成功時帶回。
-                    replacedVersion = installedVersion(target)
-                    // 產名同取 abs(nanoTime)（同一產名形狀合約，見 STAGING_RE 註記），
-                    // backup 名與 BACKUP_RE 掃描點匹配（規格層 Long.MIN_VALUE 死角見同處，不重述）。
-                    val backup = File(destRoot, ".$root.bak-${Math.abs(System.nanoTime())}-$tid")
-                    // positive exists() 安全註記（與 staging 同理由）：fresh 產名
-                    // 由本程序自產；planted 正 link 經 NOFOLLOW deleteTreeSafe 只是
-                    // unlink 本身、dangling 會被不跟隨的 rename 覆蓋——外部內容保持
-                    // 完整（勿併發前提見 installFiles KDoc）。
-                    if (backup.exists()) deleteTreeSafe(backup)
-                    if (!rename(target, backup)) {
-                        deleteTreeSafe(staging)
-                        return Result.Failure(
-                            Failure.IO_ERROR,
-                            "commit failed: backup old version ${target.name} -> ${backup.name}",
-                        )
-                    }
-                    // 第二次 rename：回傳 false 與拋例外（renameTo 的 SecurityException、
-                    // renameHook 拋錯）統一走同一回滾區塊，維持「失敗保留舊版」。
-                    val commitError: String? = try {
-                        if (rename(staging, target)) null else "rename returned false"
-                    } catch (e: Exception) {
-                        e.message ?: e.javaClass.simpleName
-                    }
-                    if (commitError != null) {
-                        val rollbackError: String? = try {
-                            if (rename(backup, target)) null else "rename returned false"
+                    // 被佔（lstat 讀得屬性即算被佔，與探針同立場）：先分離 link 型
+                    // fail-closed，再按既有契約分派。
+                    TargetState.PRESENT -> {
+                        // 探針後被置入／置換進槽位的 link（正 link 或 dangling）→
+                        // 拒絕：不對 link rename→bak、不讓新鮮 rename 吃掉 link；
+                        // staging 清淨後回 IO_ERROR（訊息同探針車道字句）。
+                        if (isSymlinkOrUnknown(target)) {
+                            deleteTreeSafe(staging)
+                            return Result.Failure(Failure.IO_ERROR, "target must not be symlink: ${target.name}")
+                        }
+                        // 非 link 的真實被佔槽位：需 replace 契約才動（即使探針時
+                        // 判缺席、置換窗內才出現者——照探針同一契約以 ALREADY_EXISTS
+                        // 拒絕：不搬、不自刪，被佔既有條目原樣保留）。
+                        if (!replace) {
+                            deleteTreeSafe(staging)
+                            return Result.Failure(Failure.ALREADY_EXISTS, "skill '$root' already installed")
+                        }
+                        // 降版揭露：先快照舊版 version（best-effort，失敗即 null），成功時帶回。
+                        replacedVersion = installedVersion(target)
+                        // 產名同取 abs(nanoTime)（同一產名形狀合約，見 STAGING_RE 註記），
+                        // backup 名與 BACKUP_RE 掃描點匹配（規格層 Long.MIN_VALUE 死角見同處，不重述）。
+                        val backup = File(destRoot, ".$root.bak-${Math.abs(System.nanoTime())}-$tid")
+                        // positive exists() 安全註記（與 staging 同理由）：fresh 產名
+                        // 由本程序自產；planted 正 link 經 NOFOLLOW deleteTreeSafe 只是
+                        // unlink 本身、dangling 會被不跟隨的 rename 覆蓋——外部內容保持
+                        // 完整（勿併發前提見 installFiles KDoc）。
+                        if (backup.exists()) deleteTreeSafe(backup)
+                        if (!rename(target, backup)) {
+                            deleteTreeSafe(staging)
+                            return Result.Failure(
+                                Failure.IO_ERROR,
+                                "commit failed: backup old version ${target.name} -> ${backup.name}",
+                            )
+                        }
+                        // 第二次 rename：回傳 false 與拋例外（renameTo 的 SecurityException、
+                        // renameHook 拋錯）統一走同一回滾區塊，維持「失敗保留舊版」。
+                        val commitError: String? = try {
+                            if (rename(staging, target)) null else "rename returned false"
                         } catch (e: Exception) {
                             e.message ?: e.javaClass.simpleName
                         }
-                        try {
-                            deleteTreeSafe(staging)
-                        } catch (_: Exception) {
-                            // best-effort：清不掉不影響已組好的失敗訊息與回滾結果。
+                        if (commitError != null) {
+                            val rollbackError: String? = try {
+                                if (rename(backup, target)) null else "rename returned false"
+                            } catch (e: Exception) {
+                                e.message ?: e.javaClass.simpleName
+                            }
+                            try {
+                                deleteTreeSafe(staging)
+                            } catch (_: Exception) {
+                                // best-effort：清不掉不影響已組好的失敗訊息與回滾結果。
+                            }
+                            return if (rollbackError == null) {
+                                fsyncBestEffort(destRoot)
+                                Result.Failure(
+                                    Failure.IO_ERROR,
+                                    "commit failed: rename staging ${staging.name} -> ${target.name} " +
+                                        "failed ($commitError), rolled back",
+                                )
+                            } else {
+                                Result.Failure(
+                                    Failure.IO_ERROR,
+                                    "commit failed: rename staging ${staging.name} -> ${target.name} " +
+                                        "failed ($commitError), rollback failed ($rollbackError), " +
+                                        "backup kept at ${backup.name}",
+                                )
+                            }
                         }
-                        return if (rollbackError == null) {
-                            fsyncBestEffort(destRoot)
-                            Result.Failure(
-                                Failure.IO_ERROR,
-                                "commit failed: rename staging ${staging.name} -> ${target.name} " +
-                                    "failed ($commitError), rolled back",
-                            )
-                        } else {
-                            Result.Failure(
-                                Failure.IO_ERROR,
-                                "commit failed: rename staging ${staging.name} -> ${target.name} " +
-                                    "failed ($commitError), rollback failed ($rollbackError), " +
-                                    "backup kept at ${backup.name}",
-                            )
-                        }
+                        // 成功路徑的 bak 刪除為 best-effort：回傳忽略，
+                        // 殘留由下次 [cleanupStaleStaging] 收斂。NOFOLLOW 刪除
+                        // （[deleteTreeSafe]）：live skill 內若遭植入 symlink，
+                        // 只解除 link 本身、不波及外部內容。
+                        deleteTreeSafe(backup)
+                        fsyncBestEffort(destRoot)
                     }
-                    // 成功路徑的 bak 刪除為 best-effort：回傳忽略，
-                    // 殘留由下次 [cleanupStaleStaging] 收斂。NOFOLLOW 刪除
-                    // （[deleteTreeSafe]）：live skill 內若遭植入 symlink，
-                    // 只解除 link 本身、不波及外部內容。
-                    deleteTreeSafe(backup)
-                    fsyncBestEffort(destRoot)
                 }
             } catch (e: Exception) {
                 deleteTreeSafe(staging)

@@ -37,7 +37,7 @@ class LibrePocketAppStartupTest {
         val root = SkillPaths.skillRoot(app)
         root.deleteRecursively()
         try {
-            val tid = Thread.currentThread().id
+            val tid = Thread.currentThread().threadId()
             val bak = File(root, ".boot-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
                 mkdirs()
                 File(this, "SKILL.md").writeText(skillMd("boot-skill", "舊版正文"), Charsets.UTF_8)

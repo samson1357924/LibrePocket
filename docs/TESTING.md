@@ -430,11 +430,16 @@ the bak id — otherwise it converges to KEPT (still listed by
 work are budgeted per run and the caps bind **attempts**, not successes: the
 deletion budget `MAX_CLEANUP_ENTRIES_PER_RUN` (64) and the same-source
 independent restore budget `MAX_RESTORES_PER_RUN` (16) each count a work
-attempt consumed at the lane entry **before the first I/O of that work**
-(unlink / `deleteTreeSafe` / the restore lane's post-ambiguity content proof
-and rename), so failures consume the budget too (wrong-name or corrupt baks
+attempt consumed at the lane entry **before the lane's first I/O** (unlink /
+`deleteTreeSafe` / the restore lane's post-ambiguity content proof and rename;
+"lane I/O" = paid workload — tree walk / unlink / rename / SKILL.md read+parse —
+while per-entry enumeration and the NOFOLLOW classification probes are fixed
+O(1)-per-entry (O(N) per run) costs outside the budget, paid even past the cap),
+so failures consume the budget too (wrong-name or corrupt baks
 that fully read+parse SKILL.md, denied renames, partially failing delete
-walks); past the cap a candidate is KEPT with zero I/O this run and the same
+walks); past the cap a candidate is KEPT with zero lane I/O this run (no
+tree walk/unlink/rename or SKILL.md read+parse — enumeration and
+classification probes remain O(N)) and the same
 startup budget runs converge on later startups
 (`cleanup_restoreBudget_cappedPerRun` for the all-succeed shape;
 `SkillAtomicCommitTest.restoreAttempts_cappedOnFailures_goodBakWaitsNextRun`,
@@ -450,7 +455,19 @@ count (restores + deletes), not the attempt tally.
 `SkillAtomicCommitTest` pins the replace path to
 all-or-nothing: staging-rename/backup/rollback failures keep the old bytes
 intact with no half-product and no leftovers, reporting `IO_ERROR` with the
-backup location when rollback itself fails.
+backup location when rollback itself fails. The install commit re-verifies the
+target slot with the same NOFOLLOW three-state probe immediately before the
+rename (the
+probe→commit swap window is fail-closed: a link — dangling or pointing outside
+— or undecidable attributes converge to `IO_ERROR` "target must not be
+symlink" with staging cleared; a real non-link entrant under `!replace`
+converges to `ALREADY_EXISTS` with the incumbent untouched). The race shape
+itself has no injection seam in the JVM test suite (same honesty tier as the
+destRoot unreadable-attrs case) — the contract is code + KDoc consistency,
+verified only by manual audit; the pinned link-refusal tests
+(`installOntoSymlinkTarget_isRefused_ioError`,
+`installOntoDanglingLinkTarget_isRefused_ioError_withControls`) cover the
+probe-time refusal that precedes it.
 
 ### Honest Assume-skip semantics (Current, skip≠pass)
 

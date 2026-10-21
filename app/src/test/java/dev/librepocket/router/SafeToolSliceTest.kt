@@ -10,7 +10,14 @@ import dev.librepocket.tool.Flavor
 import dev.librepocket.tool.LspTools
 import dev.librepocket.tool.ProjectionContext
 import dev.librepocket.tool.ToolRegistry
+import dev.librepocket.provider.AnthropicProvider
+import dev.librepocket.provider.ChatCompletionsProvider
+import dev.librepocket.provider.ChatRequest
+import dev.librepocket.provider.ProviderConfig
+import dev.librepocket.provider.ProviderProtocol
+import dev.librepocket.provider.ResponsesProvider
 import dev.librepocket.provider.ToolCall
+import dev.librepocket.provider.ToolSchema
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -21,6 +28,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -92,6 +100,60 @@ class SafeToolSliceTest {
 
     private fun call(name: String = "lsp.symbols", args: String = """{"query":"Foo"}""", id: String = "call-1") =
         ToolCall(id = id, name = name, argumentsJson = args)
+
+    // ---- Real-adapter (cross-layer) helpers ----
+    // The three REAL providers are used only for their `buildBody` (no IO:
+    // the HTTP client is lazy and never touched by a body build). The api key
+    // supplier is never called by `buildBody` either.
+
+    /** The slice tool schema the cross-layer test offers to the adapters. */
+    private fun sliceToolSchema(): ToolSchema = ToolSchema(
+        name = SafeToolSlice.TOOL_NAME,
+        description = "search symbols",
+        jsonSchema = """{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}""",
+    )
+
+    private fun providerConfig(protocol: ProviderProtocol): ProviderConfig = ProviderConfig(
+        id = "cfg-${protocol.name.lowercase()}",
+        label = protocol.name,
+        baseUrl = "https://example.invalid",
+        protocol = protocol,
+        apiKeyRef = "ref",
+    )
+
+    private fun chatProvider() =
+        ChatCompletionsProvider(providerConfig(ProviderProtocol.CHAT_COMPLETIONS), apiKey = { null })
+
+    private fun responsesProvider() =
+        ResponsesProvider(providerConfig(ProviderProtocol.RESPONSES), apiKey = { null })
+
+    private fun anthropicProvider() =
+        AnthropicProvider(providerConfig(ProviderProtocol.ANTHROPIC), apiKey = { null })
+
+    /** Chat Completions: `messages[].tool_calls[].function.arguments` (a JSON STRING). */
+    private fun chatWireArguments(body: String): JsonObject {
+        val messages = Json.parseToJsonElement(body).jsonObject["messages"]!!.jsonArray
+        val assistant = messages.first { it.jsonObject["tool_calls"] != null }.jsonObject
+        val call = assistant["tool_calls"]!!.jsonArray[0].jsonObject
+        val arguments = call["function"]!!.jsonObject["arguments"]!!.jsonPrimitive.content
+        return Json.parseToJsonElement(arguments).jsonObject
+    }
+
+    /** Responses: `input[].arguments` of the `function_call` item (a JSON STRING). */
+    private fun responsesWireArguments(body: String): JsonObject {
+        val input = Json.parseToJsonElement(body).jsonObject["input"]!!.jsonArray
+        val call = input.first { it.jsonObject["type"]!!.jsonPrimitive.content == "function_call" }.jsonObject
+        return Json.parseToJsonElement(call["arguments"]!!.jsonPrimitive.content).jsonObject
+    }
+
+    /** Anthropic: `messages[].content[].input` of the `tool_use` block (a JSON OBJECT). */
+    private fun anthropicWireInput(body: String): JsonObject {
+        val messages = Json.parseToJsonElement(body).jsonObject["messages"]!!.jsonArray
+        val assistant = messages.first { it.jsonObject["role"]!!.jsonPrimitive.content == "assistant" }.jsonObject
+        val block = assistant["content"]!!.jsonArray
+            .first { it.jsonObject["type"]!!.jsonPrimitive.content == "tool_use" }.jsonObject
+        return block["input"]!!.jsonObject
+    }
 
     private fun mutableSlice(
         switches: MutableMap<String, Boolean> = mutableMapOf("lsp" to true),
@@ -1204,13 +1266,57 @@ class SafeToolSliceTest {
     @Test fun executeRejectsDuplicatePairingIdsBeforeBackend() = runBlocking {
         // Direct-API defense in depth: TurnController dedups first, but a
         // future caller must not execute two calls that re-bind to one wire id.
+        //
+        // The denial must stay CONTINUABLE: the wire ids are re-bound
+        // deterministically (first occurrence keeps its id, a later duplicate
+        // gets `_2`, `_3`, …), so the continuation can still ship unique,
+        // properly paired `call`/`tool` ids. Before that, the duplicate
+        // `call`/`tool` pair died on the wire with the non-retryable
+        // `TOOL_CALL_DUPLICATE_ID` AFTER the round.
         val backend = CountingBackend()
         val s = slice(backend = backend, maxCallsPerTurn = 2)
-        val results = s.execute(listOf(call(id = "dup"), call(id = "dup")))
+        val calls = listOf(call(id = "dup"), call(id = "dup"))
+        val results = s.execute(calls)
         assertEquals(2, results.size)
         assertTrue(results.all { it.denied })
         assertTrue(results.all { it.denyCode == SafeToolSlice.DenyCodes.SCHEMA_INVALID })
         assertEquals("duplicate id must not touch the backend", 0, backend.invocations.get())
+        // Continuable: the builder must not throw, the wire ids must be
+        // unique, and every tool message must carry its paired call id.
+        val msgs = s.continuationMessages(calls, results)
+        assertEquals(3, msgs.size)
+        val wireIds = msgs[0].toolCalls.map { it.id }
+        assertEquals(2, wireIds.size)
+        assertEquals("dup", wireIds[0])
+        assertEquals("dup_2", wireIds[1])
+        assertEquals("wire ids must be unique", wireIds.size, wireIds.toSet().size)
+        assertEquals(wireIds[0], msgs[1].toolCallId)
+        assertEquals(wireIds[1], msgs[2].toolCallId)
+
+        // The REDACTION collision: two DISTINCT raw ids that normalize to the
+        // same bounded pairing id (both e-mail addresses redact to the same
+        // receipt). The round is denied whole-round (zero backend), and the
+        // denial must still be continuable — the normalized (wire) ids are
+        // disambiguated, never shipped as a duplicate pair.
+        val emailCalls = listOf(call(id = "user1@example.com"), call(id = "user2@example.com"))
+        val emailResults = s.execute(emailCalls)
+        assertEquals(2, emailResults.size)
+        assertTrue(emailResults.all { it.denied })
+        assertTrue(emailResults.all { it.denyCode == SafeToolSlice.DenyCodes.SCHEMA_INVALID })
+        assertEquals("redaction collision must not touch the backend", 0, backend.invocations.get())
+        val emailMsgs = s.continuationMessages(emailCalls, emailResults)
+        assertEquals(3, emailMsgs.size)
+        val emailIds = emailMsgs[0].toolCalls.map { it.id }
+        assertEquals(2, emailIds.size)
+        assertEquals("normalized ids must be unique", emailIds.size, emailIds.toSet().size)
+        assertEquals(emailIds[0], emailMsgs[1].toolCallId)
+        assertEquals(emailIds[1], emailMsgs[2].toolCallId)
+        // No raw e-mail address rides the wire.
+        for (id in emailIds) {
+            assertFalse("raw id must not ride the wire: $id", id.contains("@"))
+        }
+        // The second id is the first one plus the deterministic suffix.
+        assertEquals("${emailIds[0]}_2", emailIds[1])
     }
 
     @Test fun executeRejectsBlankCallIdBeforeBackend() = runBlocking {
@@ -1442,7 +1548,13 @@ class SafeToolSliceTest {
             result.resultJson.length <= SafeToolSlice.MAX_RESULT_CHARS,
         )
         assertFalse("raw megabyte field must not survive", result.resultJson.contains("S".repeat(10_000)))
-        assertTrue(result.resultJson.contains("[backend field omitted: 1000000 chars]"))
+        assertTrue(result.resultJson.contains("[backend field omitted]"))
+        // The omission receipt is FIXED: the omitted length is model/backend
+        // controlled information and must not ride the wire.
+        assertFalse("the omitted length must not leak", result.resultJson.contains("1000000"))
+        val receipts = Regex("\\[backend field omitted[^\\\"]*\\]").findAll(result.resultJson).map { it.value }.toList()
+        assertTrue("the omission receipt must be present", receipts.isNotEmpty())
+        assertTrue("the omission receipt must carry no digits: $receipts", receipts.all { r -> r.none { c -> c.isDigit() } })
         val body = Json.parseToJsonElement(result.resultJson).jsonObject
         assertEquals("true", body["truncated"]!!.jsonPrimitive.content)
     }
@@ -1460,7 +1572,12 @@ class SafeToolSliceTest {
         val result = slice(backend = backend).execute(listOf(call())).single()
         assertFalse(result.denied)
         assertFalse("credential prefix must not survive omission", result.resultJson.contains("hunter2"))
-        assertTrue(result.resultJson.contains("[backend field omitted:"))
+        assertTrue(result.resultJson.contains("[backend field omitted]"))
+        // Fixed receipt: no length, no digits — the omitted size is
+        // model/backend controlled and must not ride the wire.
+        val receipts = Regex("\\[backend field omitted[^\\\"]*\\]").findAll(result.resultJson).map { it.value }.toList()
+        assertTrue("the omission receipt must be present", receipts.isNotEmpty())
+        assertTrue("the omission receipt must carry no digits: $receipts", receipts.all { r -> r.none { c -> c.isDigit() } })
     }
 
     @Test fun continuationArgsEchoRedactsTopLevelSecretKey() = runBlocking {
@@ -1492,6 +1609,111 @@ class SafeToolSliceTest {
         }
         assertEquals(ToolRegistry.ALL.size - 1, swept)
         assertEquals(0, backend.invocations.get())
+    }
+
+    // ---- Cross-layer regression: a non-object args root must stay continuable ----
+
+    @Test fun nonObjectArgsRootsStayContinuableThroughTheRealAdapters() = runBlocking {
+        // The args root of a model tool call is MODEL-controlled. A non-object
+        // root (array / number / string / boolean / null) is denied by the
+        // slice's own schema gate (SCHEMA_INVALID, zero backend), but the
+        // CONTINUATION still echoes the arguments to the wire — and every
+        // adapter re-parses that echo: a non-object `arguments` fails the
+        // provider pairing validator NON-RETRYABLY
+        // (`TOOL_ARGUMENTS_MUST_BE_OBJECT`) AFTER the round, killing a
+        // perfectly continuable typed denial. The echo must therefore be the
+        // FIXED object for every non-object root.
+        //
+        // This is a CROSS-LAYER pin: the messages are fed through the REAL
+        // ChatCompletionsProvider / ResponsesProvider / AnthropicProvider
+        // `buildBody`, so the wire shape is the production one (Chat/Responses
+        // `arguments` are JSON STRINGS, Anthropic `input` is a parsed JSON
+        // OBJECT).
+        val schema = sliceToolSchema()
+        val chat = chatProvider()
+        val responses = responsesProvider()
+        val anthropic = anthropicProvider()
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        val nonObjectRoots = listOf("[1,2]", "123", "\"str\"", "true", "null")
+        for (root in nonObjectRoots) {
+            val calls = listOf(call(id = "call-1", args = root))
+            val results = s.execute(calls)
+            assertTrue(root, results.single().denied)
+            assertEquals(root, SafeToolSlice.DenyCodes.SCHEMA_INVALID, results.single().denyCode)
+            // The denial is continuable and the echo is the FIXED object —
+            // never the non-object root itself.
+            val msgs = s.continuationMessages(calls, results)
+            assertEquals(root, 2, msgs.size)
+            assertEquals(root, """{"echo":"args redacted/capped"}""", msgs[0].toolCalls.single().argumentsJson)
+            // Every adapter must accept the round and carry an OBJECT.
+            val request = ChatRequest(model = "test-model", messages = msgs, tools = listOf(schema))
+            val wires = listOf(
+                "chat" to chatWireArguments(chat.buildBody(request)),
+                "responses" to responsesWireArguments(responses.buildBody(request)),
+                "anthropic" to anthropicWireInput(anthropic.buildBody(request)),
+            )
+            for ((adapter, wire) in wires) {
+                assertEquals("$adapter/$root", 1, wire.size)
+                assertEquals("$adapter/$root", "args redacted/capped", wire["echo"]!!.jsonPrimitive.content)
+            }
+        }
+        // None of the non-object roots ever reached the backend.
+        assertEquals(0, backend.invocations.get())
+
+        // The pin is NOT vacuous: a benign OBJECT root round-trips unchanged
+        // (identity echo) through the very same adapters.
+        val benignCalls = listOf(call(id = "call-ok", args = """{"query":"Foo"}"""))
+        val benignResults = s.execute(benignCalls)
+        assertFalse(benignResults.single().denied)
+        val benignMsgs = s.continuationMessages(benignCalls, benignResults)
+        assertEquals("""{"query":"Foo"}""", benignMsgs[0].toolCalls.single().argumentsJson)
+        val benignRequest = ChatRequest(model = "test-model", messages = benignMsgs, tools = listOf(schema))
+        assertEquals("Foo", chatWireArguments(chat.buildBody(benignRequest))["query"]!!.jsonPrimitive.content)
+        assertEquals("Foo", responsesWireArguments(responses.buildBody(benignRequest))["query"]!!.jsonPrimitive.content)
+        assertEquals("Foo", anthropicWireInput(anthropic.buildBody(benignRequest))["query"]!!.jsonPrimitive.content)
+        assertEquals(1, backend.invocations.get())
+    }
+
+    @Test fun argsEchoBudgetFallsBackAtTheSerializedBoundary() = runBlocking {
+        // The echo budget ([MAX_INPUT_CHARS]) applies to the SERIALIZED form,
+        // so the JSON envelope costs characters on top of the query value:
+        // the largest query that survives the echo is the input cap MINUS the
+        // envelope overhead. This is a deliberate over-redaction (bounded
+        // continuation), NOT a claim that every legal echo survives.
+        val s = slice()
+        val envelope = Json.parseToJsonElement("""{"query":""}""").toString().length
+        assertEquals("""{"query":""}""", Json.parseToJsonElement("""{"query":""}""").toString())
+        assertEquals("the envelope overhead is the JSON syntax around the value", 12, envelope)
+        val maxEchoedQuery = SafeToolSlice.MAX_INPUT_CHARS - envelope
+        assertEquals(4084, maxEchoedQuery)
+
+        fun echoOf(queryLength: Int, id: String): String = s.continuationMessages(
+            listOf(call(id = id, args = """{"query":"${"N".repeat(queryLength)}"}""")),
+            listOf(SafeToolSlice.ToolResult(id, "n", "{}")),
+        )[0].toolCalls.single().argumentsJson
+
+        // The largest surviving query is echoed verbatim (round-trip identity).
+        val echoed = echoOf(maxEchoedQuery, "call-1")
+        assertEquals(maxEchoedQuery, Json.parseToJsonElement(echoed).jsonObject["query"]!!.jsonPrimitive.content.length)
+        assertTrue("echo must stay within MAX_INPUT_CHARS", echoed.length <= SafeToolSlice.MAX_INPUT_CHARS)
+
+        // One character more: the serialized form exceeds the budget → the
+        // fixed object.
+        assertEquals("""{"echo":"args redacted/capped"}""", echoOf(maxEchoedQuery + 1, "call-2"))
+
+        // A LEGAL query at the exact input cap serializes ABOVE the echo
+        // budget (the envelope costs 12 chars) → deliberately falls back to
+        // the fixed object. The same holds for a 4095-char query.
+        assertEquals("""{"echo":"args redacted/capped"}""", echoOf(SafeToolSlice.MAX_INPUT_CHARS, "call-3"))
+        assertEquals("""{"echo":"args redacted/capped"}""", echoOf(4095, "call-4"))
+        // The fallback is always a valid JSON object carrying the fixed echo.
+        for (len in listOf(maxEchoedQuery + 1, 4095, SafeToolSlice.MAX_INPUT_CHARS)) {
+            val fallback = echoOf(len, "call-fb-$len")
+            val body = Json.parseToJsonElement(fallback).jsonObject
+            assertEquals(1, body.size)
+            assertEquals("args redacted/capped", body["echo"]!!.jsonPrimitive.content)
+        }
     }
 
     // ---- Phase-0 review bundle (D/F3) ----

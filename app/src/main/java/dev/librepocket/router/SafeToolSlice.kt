@@ -86,6 +86,14 @@ import kotlin.coroutines.coroutineContext
  * is re-bound deterministically (`_2`, `_3`, …) instead of failing the
  * round — the model id is never touched, and the wire ids stay unique.
  *
+ * A DUPLICATE MODEL-SUPPLIED id (the same id twice in one round) is denied
+ * whole-round by [execute] before the backend (zero backend invocations),
+ * but the denial stays CONTINUABLE: the wire-id builder keeps the FIRST
+ * occurrence and re-binds the later ones deterministically (`<id>_2`,
+ * `<id>_3`, …) so the continuation can still ship a properly paired (and
+ * unique) `call`/`tool` pair. Two DISTINCT raw ids that redact to the SAME
+ * bounded id are disambiguated the same way on the normalized (wire) ids.
+ *
  * Denials are TYPED RESULTS (not throws, except [CancellationException]):
  * every model call gets a paired `tool` message (call-id pairing preserved
  * per the T1 provider contracts), so DENY/cancel/schema-error paths are
@@ -314,7 +322,22 @@ class SafeToolSlice(
          * still a valid object): the input exceeds [parseArgs]'s gross size cap
          * ([MAX_GROSS_ARGS_CHARS] = [MAX_INPUT_CHARS] × 4) or its nesting-depth
          * fan-close (> [MAX_NESTING_DEPTH] — see [jsonNestingDepth]), parsing
-         * itself fails, or the re-serialized form exceeds [MAX_INPUT_CHARS].
+         * itself fails, the parsed ROOT IS NOT A JSON OBJECT (an array /
+         * number / string / boolean / null root — the provider pairing
+         * validator rejects a non-object `arguments` non-retryably, so such a
+         * root must never ride the wire), or the re-serialized form exceeds
+         * [MAX_INPUT_CHARS].
+         *
+         * NOT EVERY LEGAL ECHO SURVIVES (deliberate over-redaction): the echo
+         * budget applies to the SERIALIZED form, so a LEGAL input whose
+         * serialization is slightly above the budget falls back to the fixed
+         * object. Concretely, a legal `query` at the exact [MAX_INPUT_CHARS]
+         * input cap serializes to `{"query":"…"}` — the JSON envelope adds
+         * characters on top of the value — which is ABOVE the echo budget, so
+         * it deliberately falls back to the fixed object (bounded
+         * continuation, zero leak). This is a deliberate over-redaction, not
+         * a claim that every legal echo survives; the largest query that
+         * survives is the input cap minus the JSON envelope overhead.
          *
          * The depth fan-close is the ONLY structural recursion bound here and it
          * is deliberately checked BEFORE parsing: this echo is parsed from the
@@ -344,6 +367,15 @@ class SafeToolSlice(
             } catch (_: Exception) {
                 return fallback
             }
+            // The echo must be a JSON OBJECT: the provider pairing validator
+            // re-parses this text and rejects a non-object `arguments`
+            // NON-RETRYABLY (`TOOL_ARGUMENTS_MUST_BE_OBJECT`) AFTER the round
+            // already ran. A non-object root (array / number / string /
+            // boolean / null) is denied by [parseArgs] anyway (zero backend),
+            // but its echo used to be the non-object root itself — the round
+            // was continuable on paper and died on the wire. Fail closed to
+            // the same fixed object instead.
+            if (root !is JsonObject) return fallback
             val redacted = redactJsonStrings(root).toString()
             return if (redacted.length <= MAX_INPUT_CHARS) redacted else fallback
         }
@@ -518,6 +550,13 @@ class SafeToolSlice(
      * re-binds it again, `_2`, `_3`, …, if it collides with a model-supplied
      * id in the same round).
      *
+     * A DUPLICATE pairing id (the same raw id twice, or two distinct raw ids
+     * that redact to the same bounded id) denies the whole round with
+     * `SCHEMA_INVALID` (zero backend invocations): two calls that re-bind to
+     * one wire pairing id must never execute. The denial stays CONTINUABLE —
+     * [continuationMessages] re-binds the duplicate ids deterministically
+     * (`_2`, `_3`, …) so the wire still carries unique, properly paired ids.
+     *
      * Durability: the exec-once guarantee is turn-layer, not process-level.
      * The engine marks the round executed before calling [execute], so a
      * same-turn retry never re-executes, and no tool round resumes on reopen.
@@ -571,7 +610,15 @@ class SafeToolSlice(
         // continuation would fail non-retryably with a duplicate pair).
         val pairingIds = calls.map { boundedRedactedId(it.id) }
         if (pairingIds.size != pairingIds.toSet().size) {
-            return calls.map { deny(it, DenyCodes.SCHEMA_INVALID, "duplicate call id in one round") }
+            // The denial stays CONTINUABLE: the receipt carries the SAME
+            // disambiguated wire id the continuation will use for that call
+            // ([wireCallIds] is a pure function of the call list), so the
+            // receipt and the wire pair never disagree about which id the
+            // denial belongs to.
+            val wireIds = wireCallIds(calls)
+            return calls.mapIndexed { i, c ->
+                deny(c, DenyCodes.SCHEMA_INVALID, "duplicate call id in one round", wireId = wireIds[i])
+            }
         }
         return calls.map { executeOne(it) }
     }
@@ -580,36 +627,104 @@ class SafeToolSlice(
      * The wire ids of one round: one id per call, in call order — the exact
      * ids that ride the wire (assistant `toolCalls` + `tool` messages).
      *
-     * A NON-BLANK model id is used verbatim. A BLANK model id is re-bound to
-     * its deterministic synthetic id ([blankWireCallId]) — but only while
-     * that id is still free: the synthetic id can collide with a
-     * MODEL-SUPPLIED id in the same round (or with another synthetic id),
-     * and a duplicate `call`/`tool` pair fails the provider pairing
-     * validator NON-RETRYABLY after the calls already ran. So on a
-     * collision the synthetic id is re-bound deterministically (`_2`, `_3`,
-     * …) until it is unique; the model-supplied id is never touched.
+     * MODEL-SUPPLIED IDS KEEP THEIR SLOT: a NON-BLANK model id is used
+     * verbatim for its FIRST occurrence in the round. A LATER occurrence of
+     * the same id is re-bound deterministically (`<id>_2`, `<id>_3`, …):
+     * duplicate raw ids are denied whole-round by [execute] (zero backend
+     * invocations), but the denial must stay CONTINUABLE, and two calls
+     * carrying the SAME wire id would fail the provider pairing validator
+     * NON-RETRYABLY (`TOOL_CALL_DUPLICATE_ID`) after the round. The re-bound
+     * id never steals another model id's slot (every model-supplied id is
+     * reserved up front) and never repeats inside the round.
+     *
+     * A BLANK model id is re-bound to its deterministic synthetic id
+     * ([blankWireCallId]) — but only while that id is still free: the
+     * synthetic id can collide with a MODEL-SUPPLIED id in the same round
+     * (or with another synthetic id), and a duplicate `call`/`tool` pair
+     * fails the provider pairing validator NON-RETRYABLY after the calls
+     * already ran. So on a collision the synthetic id is re-bound
+     * deterministically (`_2`, `_3`, …) until it is unique; the
+     * model-supplied id is never touched.
      *
      * The result is a pure function of the call list (same round → same
      * wire ids), which is what lets [execute] (the denial receipt) and
      * [continuationMessages] (the wire pair) agree on the id.
      */
     private fun wireCallIds(calls: List<ToolCall>): List<String> {
-        // Model-supplied ids occupy their wire slot FIRST: a synthetic id
-        // must never steal a model id's slot (the model id is the one the
-        // provider pairing validator saw in the request).
-        val used = calls.mapNotNullTo(HashSet()) { it.id.takeIf { id -> id.isNotBlank() } }
-        return calls.mapIndexed { i, c ->
-            if (c.id.isNotBlank()) {
-                c.id
+        // Every model-supplied id is reserved BEFORE any re-bind: a re-bound
+        // duplicate (or a synthetic id) must never take a slot a model id
+        // owns (the model id is the one the provider pairing validator saw
+        // in the request).
+        val modelIds = calls.mapNotNullTo(HashSet()) { it.id.takeIf { id -> id.isNotBlank() } }
+        val assigned = HashSet<String>()
+        val out = arrayOfNulls<String>(calls.size)
+        // Pass 1: model-supplied ids keep their own slot (first occurrence
+        // wins); a later duplicate is re-bound (`_2`, `_3`, …) around every
+        // reserved and already-assigned id.
+        for ((i, c) in calls.withIndex()) {
+            if (c.id.isBlank()) continue
+            if (assigned.add(c.id)) {
+                out[i] = c.id
+                continue
+            }
+            var suffix = 2
+            var candidate = "${c.id}_$suffix"
+            // `assigned.add` returns false when the candidate is taken.
+            while (candidate in modelIds || !assigned.add(candidate)) {
+                suffix++
+                candidate = "${c.id}_$suffix"
+            }
+            out[i] = candidate
+        }
+        // Pass 2: blank ids get their deterministic synthetic id, re-bound
+        // while it collides with a model id or an assigned id (the synthetic
+        // never renames itself into a model id's slot).
+        for ((i, c) in calls.withIndex()) {
+            if (c.id.isNotBlank()) continue
+            val base = blankWireCallId(i)
+            var candidate = base
+            var suffix = 2
+            while (candidate in modelIds || candidate in assigned) {
+                candidate = "${base}_$suffix"
+                suffix++
+            }
+            assigned.add(candidate)
+            out[i] = candidate
+        }
+        return out.map { it!! }
+    }
+
+    /**
+     * Deterministic, collision-free re-binding of an id list: the FIRST
+     * occurrence of an id keeps it; a LATER occurrence of the SAME id is
+     * re-bound to `<id>_2`, `<id>_3`, … — the first free candidate that
+     * collides with neither another id in the list nor an already-assigned
+     * candidate.
+     *
+     * The suffix is appended through [cappedTake], so a re-bound id NEVER
+     * exceeds [MAX_STRING_CHARS] (a plain `base + "_2"` of a 500-char id
+     * would be 502) and never splits a surrogate pair at the cut.
+     *
+     * Used for the NORMALIZED (bounded redacted) wire ids: two DISTINCT
+     * wire ids can normalize to the SAME bounded id (two distinct raw ids
+     * that redact to one string, e.g. two e-mail addresses), and a
+     * duplicate pairing id would fail the provider pairing validator
+     * NON-RETRYABLY (`TOOL_CALL_DUPLICATE_ID`) after the round.
+     */
+    private fun uniqueBoundedIds(bases: List<String>): List<String> {
+        val allBases = bases.toSet()
+        val assigned = HashSet<String>()
+        return bases.map { base ->
+            if (assigned.add(base)) {
+                base
             } else {
-                val base = blankWireCallId(i)
-                var candidate = base
                 var suffix = 2
-                // `used.add` returns false when the candidate is taken.
-                while (!used.add(candidate)) {
-                    candidate = "${base}_$suffix"
+                var candidate: String
+                do {
+                    val tail = "_$suffix"
+                    candidate = cappedTake(base, MAX_STRING_CHARS - tail.length) + tail
                     suffix++
-                }
+                } while (candidate in allBases || !assigned.add(candidate))
                 candidate
             }
         }
@@ -884,10 +999,16 @@ class SafeToolSlice(
 
     /** Pre-redaction bound for backend-owned strings (see [RAW_BACKEND_FIELD_MAX_CHARS]).
      *  Over-bound values are replaced whole by a fixed receipt: a truncated
-     *  prefix could defeat suffix-anchored redaction rules. */
+     *  prefix could defeat suffix-anchored redaction rules.
+     *
+     *  The receipt is FIXED (`[backend field omitted]`, no length): the
+     *  omitted length is MODEL/BACKEND-controlled information, and echoing it
+     *  back tells the model how much data it fed in — a free side channel
+     *  (and an unnecessary leak) on a receipt whose only job is to say
+     *  "something was dropped here". */
     private fun boundedRawBackendField(value: String): String =
         if (value.length <= RAW_BACKEND_FIELD_MAX_CHARS) value
-        else "[backend field omitted: ${value.length} chars]"
+        else "[backend field omitted]"
 
     private fun ok(
         call: ToolCall,
@@ -1013,38 +1134,47 @@ class SafeToolSlice(
      * shipping the duplicate would fail the provider pairing validator
      * non-retryably AFTER the calls already ran.
      *
-     * The pairing stays INDEX-EXACT: a result may carry a blank id only
-     * when the call at the same index is blank too (then it inherits that
-     * call's synthetic id); every other mismatch — a swapped pair, a blank
-     * result against a non-blank call, a non-blank result against a blank
-     * call — is an [IllegalArgumentException], because an orphan pair
-     * would fail the provider pairing validator non-retryably AFTER the
-     * calls already ran.
+     * A DUPLICATE MODEL id is re-bound the same way ([wireCallIds] keeps the
+     * first occurrence and re-binds the later ones to `_2`, `_3`, …): the
+     * duplicate round is DENIED whole-round by [execute] (zero backend
+     * invocations), but the typed denial is a result and the round must
+     * stay CONTINUABLE — shipping two calls with the same id would fail the
+     * provider pairing validator non-retryably (`TOOL_CALL_DUPLICATE_ID`)
+     * after the round.
+     *
+     * The pairing stays INDEX-EXACT: a result belongs to the call at the
+     * same index, and it must carry that call's RAW id (blank against blank
+     * included); every other mismatch — a swapped pair, a blank result
+     * against a non-blank call, a non-blank result against a blank call —
+     * is an [IllegalArgumentException], because an orphan pair would fail
+     * the provider pairing validator non-retryably AFTER the calls already
+     * ran.
      */
     fun continuationMessages(calls: List<ToolCall>, results: List<ToolResult>): List<ChatMessage> {
         require(calls.size == results.size) { "calls/results size mismatch" }
         // Wire ids: a blank call id is replaced by its deterministic
         // synthetic id (re-bound again on a collision with a model-supplied
         // id — deterministically, `_2`, `_3`, … — so a collision is never
-        // fatal); a non-blank id is kept as is.
+        // fatal); a non-blank id is kept as is for its FIRST occurrence and
+        // re-bound (`_2`, `_3`, …) for a later duplicate.
         val callIds = wireCallIds(calls)
-        // Result-side ids: a blank result id is only meaningful against a
-        // blank call id (it then inherits that call's synthetic wire id); a
-        // non-blank result id is used verbatim and must match its call.
+        // Result-side ids: a result belongs to the call at the same index and
+        // must carry that call's RAW id (a blank result id only pairs with a
+        // blank call id — it then inherits that call's synthetic wire id).
+        // The wire id is the CALL's disambiguated id, never the result's own
+        // raw id: the raw id may be a duplicate of another call's raw id, and
+        // the wire must still carry distinct ids.
         val resultWireIds = results.mapIndexed { i, r ->
-            if (r.callId.isBlank()) {
-                require(calls[i].id.isBlank()) { "blank result call id" }
-                callIds[i]
-            } else {
-                r.callId
-            }
+            val paired = r.callId == calls[i].id ||
+                (r.callId.isBlank() && calls[i].id.isBlank())
+            require(paired) { "calls/results pairing mismatch" }
+            callIds[i]
         }
         // The wire ids must be distinct (a duplicate `call`/`tool` pair fails
-        // the provider pairing validator non-retryably). A blank id can no
-        // longer reach the wire — `wireCallIds` guarantees a non-blank id
-        // for every call — so the only remaining collision source is a
-        // DUPLICATE NON-BLANK model id (the same model id twice in one
-        // round), which stays a hard failure.
+        // the provider pairing validator non-retryably). `wireCallIds`
+        // guarantees that by construction (model ids keep their slot, later
+        // duplicates and colliding synthetic ids are re-bound), so this is
+        // an invariant guard, not a reachable failure.
         require(callIds.toSet().size == callIds.size) { "duplicate wire call id" }
         require(calls.indices.all { callIds[it] == resultWireIds[it] }) { "calls/results pairing mismatch" }
         val out = ArrayList<ChatMessage>(1 + results.size)
@@ -1065,9 +1195,17 @@ class SafeToolSlice(
         // pairing validator with a non-retryable `TOOL_CALL_DUPLICATE_ID`
         // after execution. Two distinct long ids sharing the capped prefix no
         // longer collide: the suffix keeps them distinct and both execute.
+        //
+        // Two DISTINCT wire ids can still NORMALIZE to the same bounded id
+        // (two distinct raw ids that redact to one string, e.g. two e-mail
+        // addresses): the normalized ids are therefore disambiguated
+        // deterministically ([uniqueBoundedIds] — first occurrence keeps its
+        // id, a later one gets `_2`, `_3`, … within [MAX_STRING_CHARS]), and
+        // the SAME normalized id rides both sides of the pair.
+        val normalizedIds = uniqueBoundedIds(callIds.map { boundedRedactedId(it) })
         val normalizedCalls = calls.mapIndexed { i, c ->
             c.copy(
-                id = boundedRedactedId(callIds[i]),
+                id = normalizedIds[i],
                 name = cappedTake(dev.librepocket.redact.Redactor.redact(c.name).text, MAX_STRING_CHARS),
                 argumentsJson = redactedArgsEcho(c.argumentsJson),
             )
@@ -1081,7 +1219,7 @@ class SafeToolSlice(
                 ChatMessage(
                     role = "tool",
                     text = r.resultJson,
-                    toolCallId = boundedRedactedId(resultWireIds[i]),
+                    toolCallId = normalizedIds[i],
                 ),
             )
         }

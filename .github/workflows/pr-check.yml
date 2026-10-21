@@ -49,6 +49,8 @@ jobs:
             policy:
               - 'scripts/play_policy_check.sh'
               - 'scripts/apk_policy_inspect.py'
+              - 'scripts/backup_rules_check.py'
+              - 'scripts/nsc_check.py'
               - 'scripts/summarize_junit.py'
               - 'scripts/check_test_budgets.py'
               - 'scripts/check_junit_durations.py'
@@ -69,9 +71,19 @@ jobs:
               # tests that pin the workflow wiring (defense in depth; a
               # workflow edit already counts as code, so Gradle stages run).
               - '.github/workflows/pr-check.yml'
+              # Trailing catch-all: the explicit entries above exist for
+              # readability/history; this glob defaults new scripts/ harness
+              # code (any new checker or script test) into the policy gate
+              # with no filter edit needed. Pinned by PolicyCiGateControl.
+              - 'scripts/**'
             bot:
               - 'github_bot/**'
               - '.github/workflows/pocketguard.yml'
+              # Kept (same defense-in-depth rationale as the policy list):
+              # this workflow owns the bot test lane (node version, npm
+              # ci/test/typecheck, pr-gate BOT case), and pocketguard.yml
+              # runs the bot but never its tests — a wiring edit must
+              # re-execute them here.
               - '.github/workflows/pr-check.yml'
 
   unit-tests:
@@ -85,6 +97,10 @@ jobs:
         flavor: [play, foss, github]
     # 單風味實測約 7m（編譯 3.5m + 測試）；三 job 並跑，wall 取決於最慢分片。
     timeout-minutes: 20
+    # Python-only: keeps __pycache__ off runners for the bare python3 gate
+    # steps (write-budget + duration gates); Gradle steps are unaffected.
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -224,6 +240,12 @@ jobs:
     if: needs.changes.outputs.policy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Job-level env: every python3 invocation in this job stays byte-import
+    # clean. The inline PYTHONDONTWRITEBYTECODE=1 prefixes on the step run
+    # lines below are redundant at runtime but kept verbatim —
+    # PolicyCiGateControl pins those exact step lines (env prefix included).
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -244,6 +266,10 @@ jobs:
     if: needs.changes.outputs.code == 'true' || needs.changes.outputs.policy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # Python-only: keeps __pycache__ off runners for the bare python3
+    # artifact-authority steps below; Gradle steps are unaffected.
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -259,8 +285,14 @@ jobs:
         with:
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
-      - name: Assemble Debug APKs
-        run: ./gradlew :app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug
+      # P2: the release variants merge buildType (app/src/release) and
+      # <flavor><BuildType> source sets that Debug APKs never contain, so
+      # PR CI assembles all six variants. The release APKs are UNSIGNED
+      # (this job runs without -PreleaseSigning; see app/build.gradle.kts
+      # L82-95: no signing config assigned -> unsigned output) — a staging
+      # identity question, not a policy-scan blocker.
+      - name: Assemble Debug & Unsigned Release APKs
+        run: ./gradlew :app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug :app:assemblePlayRelease :app:assembleFossRelease :app:assembleGithubRelease
 
       - name: Configure Android SDK build-tools for aapt & dexdump
         run: |
@@ -281,11 +313,93 @@ jobs:
           chmod +x scripts/play_policy_check.sh
           scripts/play_policy_check.sh --foss app/build/outputs/apk/foss/debug/app-foss-debug.apk
 
-      - name: Upload Debug APKs
+      # The Github debug APK has no flavor-specific policy gate, but it ships
+      # through the same manifest/resource merger paths. Run the
+      # mode-independent artifact authorities (merged-manifest backup binding
+      # + compiled backup-rules bytes + networkSecurityConfig binding and
+      # compiled NSC) on it as well; --mode github runs exactly that subset
+      # (no Play/Foss DEX class-table policy). Both tools resolve from the
+      # build-tools dir prepended to PATH above; a missing tool fails the
+      # step (fail-closed), it can never be softly skipped.
+      #
+      # P2-1: the source-level COMMON manifest policy (backup_rules_check.py,
+      # the same structured CLI the shell gate runs per branch) also covers
+      # this lane - an SMS/all-files-access/VPN uses-permission re-declared
+      # in app/src/main or app/src/github without a tools:node="remove"
+      # marker must fail here too (BIND_ACCESSIBILITY_SERVICE is deliberately
+      # NOT in the common set: the github overlay legally declares the
+      # accessibility service).
+      #
+      # P2: the scan runs over the PER-LANE UNIVERSE (AGP merge: variant >
+      # buildType > flavor > main), not the old two fixed paths: main and
+      # the github overlay by fixed path (named failure when missing), then
+      # every glob-encountered app/src/*/AndroidManifest.xml case-filtered
+      # into buildType overlays (app/src/{debug,release}), the github
+      # overlay + its <flavor><BuildType> variant dirs (githubRelease/...,
+      # prefix match), while other flavors' overlays and the test source
+      # sets (test*/androidTest) are outside the universe. A rogue
+      # app/src/release/AndroidManifest.xml previously survived this lane
+      # (Debug APKs never contain the release source set); it cannot now.
+      - name: Run Github Flavor Artifact Binding Check (mode-independent)
+        run: |
+          # set -e turns a bare failing `X=$(command -v ...)` into an opaque
+          # exit 1; report the missing tool named (fail-closed, not skipped).
+          AAPT=$(command -v aapt) || { echo "::error::aapt not found: build-tools PATH step failed"; exit 1; }
+          DEXDUMP=$(command -v dexdump) || { echo "::error::dexdump not found: build-tools PATH step failed"; exit 1; }
+          python3 scripts/apk_policy_inspect.py --mode github --apk app/build/outputs/apk/github/debug/app-github-debug.apk --aapt "$AAPT" --dexdump "$DEXDUMP"
+          main=app/src/main/AndroidManifest.xml
+          overlay=app/src/github/AndroidManifest.xml
+          for m in "$main" "$overlay"; do
+            [ -f "$m" ] || { echo "::error::missing manifest: $m"; exit 1; }
+            python3 scripts/backup_rules_check.py --check-permission-removals "SEND_SMS,RECEIVE_SMS,READ_SMS,MANAGE_EXTERNAL_STORAGE,BIND_VPN_SERVICE" "$m"
+          done
+          for m in app/src/*/AndroidManifest.xml; do
+            case "$m" in
+              app/src/main/AndroidManifest.xml|app/src/github/AndroidManifest.xml) continue ;;
+              app/src/debug/AndroidManifest.xml|app/src/release/AndroidManifest.xml) ;;
+              app/src/github*/AndroidManifest.xml) ;;
+              app/src/test*/AndroidManifest.xml|app/src/androidTest*/AndroidManifest.xml) continue ;;
+              *) continue ;;
+            esac
+            python3 scripts/backup_rules_check.py --check-permission-removals "SEND_SMS,RECEIVE_SMS,READ_SMS,MANAGE_EXTERNAL_STORAGE,BIND_VPN_SERVICE" "$m"
+          done
+
+      # P2 release artifact tier: the SAME policy as the debug face, applied
+      # to the APKs that actually merge the release source set (the reviewer
+      # sandbox case: a rogue app/src/release SEND_SMSd APK stayed green
+      # through the debug-only wiring until release staging). The output-dir
+      # glob fails closed when no APK was produced and tolerates AGP's
+      # unsigned naming (app-<flavor>-release-unsigned.apk: PR assembly runs
+      # without -PreleaseSigning, see app/build.gradle.kts).
+      - name: Run Play Release Policy Check (ROADMAP D07)
+        run: |
+          chmod +x scripts/play_policy_check.sh
+          set -- app/build/outputs/apk/play/release/*.apk
+          [ -f "$1" ] || { echo "::error::no assembled release APK for play under app/build/outputs/apk/play/release/"; exit 1; }
+          scripts/play_policy_check.sh "$@"
+
+      - name: Run Foss Release Policy Check (ROADMAP D07)
+        run: |
+          chmod +x scripts/play_policy_check.sh
+          set -- app/build/outputs/apk/foss/release/*.apk
+          [ -f "$1" ] || { echo "::error::no assembled release APK for foss under app/build/outputs/apk/foss/release/"; exit 1; }
+          scripts/play_policy_check.sh --foss "$@"
+
+      - name: Run Github Release Artifact Binding Check (mode-independent)
+        run: |
+          AAPT=$(command -v aapt) || { echo "::error::aapt not found: build-tools PATH step failed"; exit 1; }
+          DEXDUMP=$(command -v dexdump) || { echo "::error::dexdump not found: build-tools PATH step failed"; exit 1; }
+          set -- app/build/outputs/apk/github/release/*.apk
+          [ -f "$1" ] || { echo "::error::no assembled release APK for github under app/build/outputs/apk/github/release/"; exit 1; }
+          for apk in "$@"; do
+            python3 scripts/apk_policy_inspect.py --mode github --apk "$apk" --aapt "$AAPT" --dexdump "$DEXDUMP"
+          done
+
+      - name: Upload Debug & Release APKs
         if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: debug-apks
+          name: assembled-apks
           path: app/build/outputs/apk/**/*.apk
           retention-days: 7
 

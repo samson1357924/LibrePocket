@@ -1,5 +1,6 @@
 package dev.librepocket.chat
 
+import androidx.annotation.VisibleForTesting
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -152,7 +153,8 @@ class OrderedTranscriptSink(
    * same-opId retry stay retryable) but never count toward
    * [hasDurableFailures]/[flushDurable]. A later successful retry of the same
    * op (fresh id) drains cleanly and [flushDurable] returns true again, while
-   * genuine store failures (delegate IOException, teardown mid-entry, seal)
+   * genuine store failures (any non-cancellation Exception from the
+   * delegate, e.g. store IOException, plus teardown mid-entry and seal)
    * stay in [interrupted] and keep poisoning durability as before. Seal checks
    * [resolvedUndelivered] under [poisonLock] before poisoning and skips an
    * already-resolved ghost (never dual-poison); the seal/resolve winner is
@@ -164,8 +166,9 @@ class OrderedTranscriptSink(
   private val resolvedUndelivered = java.util.Collections.synchronizedSet(mutableSetOf<String>())
   /**
    * R23-1 genuine store-failure poison (guarded by [poisonLock], same compound
-   * discipline as [interrupted]): runIds whose writer block threw (store
-   * IOException, teardown/fatal mid-entry) as opposed to drain-timeout /
+   * discipline as [interrupted]): runIds whose writer block threw (any
+   * non-cancellation Exception from the delegate, e.g. store IOException,
+   * plus teardown/fatal mid-entry) as opposed to drain-timeout /
    * seal-race / fail-fast marks (an admitted entry the writer never got to
    * run before the bounded teardown gave up on waiting). A late commit clears
    * a timeout mark (the row IS durable — see the success-path
@@ -250,8 +253,11 @@ class OrderedTranscriptSink(
    *   flag shape with guaranteed admission; a cancel landing here must map to
    *   UNKNOWN, never NOT_ADMITTED.
    */
+  @VisibleForTesting
   internal var onAdmissionReservedForTest: ((Long) -> Unit)? = null
+  @VisibleForTesting
   internal var beforeSendForTest: (suspend (Long) -> Unit)? = null
+  @VisibleForTesting
   internal var afterSendForTest: (suspend (Long) -> Unit)? = null
   /**
    * D15-1 gap-coverage seams (G3): deterministic await-entrance signals
@@ -269,7 +275,9 @@ class OrderedTranscriptSink(
    *   G2 deterministically observe a flush parked in [awaitAdmissionTail]
    *   before its timeout/cancel. Must not throw/suspend.
    */
+  @VisibleForTesting
   internal var onPrevAwaitEnteredForTest: ((Long) -> Unit)? = null
+  @VisibleForTesting
   internal var onFlushTailAwaitEnteredForTest: (() -> Unit)? = null
   /**
    * D15-2 test seam: runs in the writer `finally` after the commit count is
@@ -280,7 +288,27 @@ class OrderedTranscriptSink(
    * ack drains. Must not throw (a throw is swallowed so an already-durable
    * commit never fails its ack on hook error).
    */
+  @VisibleForTesting
   internal var afterCommitBeforeAckForTest: ((String) -> Unit)? = null
+
+  /**
+   * Sink-seal-race test seam (flush barrier only, null in production).
+   *
+   * Serial flush barrier after firing: runs strictly after the barrier entry
+   * is buffered in [channel] (send returned) and its admission gate was
+   * released, but before the barrier await — the deterministic proof point
+   * that "the barrier is buffered behind whatever is currently in flight and
+   * the admission chain is clear". A test observing this hook signal knows
+   * any later writer death will fail THIS barrier via the [sealWriter]
+   * orphan drain with the seal cause (a teardown CE maps to not-drained per
+   * the seal-race mapping in [flush]; a fatal Error instead escapes [flush]
+   * verbatim, fail-loud); the hook may suspend to park the flush there while
+   * the test arms the teardown. Must not run under [admissionLock] (checked
+   * like the other hooks); a hook throw propagates like any post-send caller
+   * fault.
+   */
+  @VisibleForTesting
+  internal var afterBarrierSendForTest: (suspend () -> Unit)? = null
 
   /**
    * Reserves one admission slot (ticket + chain link) in a single tiny
@@ -320,11 +348,12 @@ class OrderedTranscriptSink(
   }
 
   private fun releaseAdmission(gate: CompletableDeferred<Unit>) {
-    try {
-      gate.complete(Unit)
-    } catch (_: Exception) {
-      // Idempotent best effort: a cancelled/completed gate still wakes.
-    }
+    // complete() is non-throwing and idempotent (returns false if already
+    // completed or cancelled): a completed gate re-completes harmlessly
+    // returning false, and a cancelled gate's awaiters were already released
+    // by their own cancellation (complete() there is just a late no-op), so
+    // no defensive try/catch is needed here.
+    gate.complete(Unit)
     admissionChain.compareAndSet(gate, null)
   }
 
@@ -413,9 +442,16 @@ class OrderedTranscriptSink(
             // cancellation (shutdown) still propagates below.
             failure = null
           } else {
-            // Writer teardown (shutdown scope cancel): remember the failure so
-            // the finally below fails the ack explicitly instead of reporting a
-            // false durable ack, then propagate so the writer ends.
+            // Writer teardown (scope cancel) OR a CE thrown by the delegate
+            // block itself (e.g. an inner withTimeout): remember the failure
+            // so the finally below fails the ack explicitly instead of
+            // reporting a false durable ack, then propagate so the writer ends.
+            // Reach note: every core and non-best-effort notice entry CE
+            // lands in this else; the two best-effort usage notices (onUsage
+            // + flushBufferedUsageBestEffort) land in the swallow branch
+            // above while the scope is active — a self-thrown CE and the
+            // bounded-timeout CE alike; a best-effort entry reaches this
+            // else only at teardown, when writerScope is already inactive.
             failure = e
             throw e
           }
@@ -431,8 +467,13 @@ class OrderedTranscriptSink(
         } catch (e: Throwable) {
           // Fatal Error (e.g. store AssertionError/LinkageError): fail this
           // entry's ack explicitly instead of reporting a false durable ack,
-          // then propagate so the writer seals like teardown. Never swallow
-          // and never continue draining behind a fatal.
+          // then propagate so the writer seals like teardown. The Error also
+          // LEAKS to the submitting caller on purpose: the failed ack delivers
+          // it verbatim to whoever is awaiting this entry (type and payload
+          // pinned by OrderedTranscriptSinkErrorTest). Never swallow, and
+          // never continue draining behind a fatal: after the seal the later
+          // cores fail fast instead of pretending durability survived an
+          // invariant break.
           failure = e
           if (entry.bestEffort && !(e is VirtualMachineError || e is ThreadDeath)) {
             // Non-VM fatal in an accounting entry must not seal the writer
@@ -1142,7 +1183,28 @@ class OrderedTranscriptSink(
    * Suspends until every event admitted so far is persisted, bounded by
    * [timeoutMs]. Returns true when the barrier drained (or, after [shutdown]
    * seals the channel, when the writer finished pre-seal work in time);
-   * false on timeout. Cancellation of the caller still propagates.
+   * false on timeout, and false when a buffered barrier was failed
+   * exceptionally by a writer-teardown seal race (the mapped seal-race
+   * shape below — the durable truth then flows through
+   * [hasDurableFailures]/[flushDurable] as usual). Cancellation of the
+   * caller still propagates.
+   *
+   * Enumerated false/throw shapes completing the list above:
+   * - post-seal-join timeout: the "already sealed" path waits on
+   *   [writer.join] INSIDE the same [withTimeoutOrNull] budget (see the
+   *   [ClosedSendChannelException] guard below), so that join timing out
+   *   also yields false — only a completed post-seal join returns true;
+   * - [timeoutMs] <= 0: [withTimeoutOrNull] returns null for a non-positive
+   *   budget WITHOUT running this body (verified against
+   *   kotlinx-coroutines 1.10.1) — no admission-tail await, no barrier send,
+   *   no exception; [flush] short-circuits to false;
+   * - test-hook throw: [afterBarrierSendForTest] (null in production) runs
+   *   INSIDE this body right after the barrier send. A [CancellationException]
+   *   from the hook is rethrown unchanged by the dedicated catch below (a
+   *   hook CE is not caller cancellation, but it is never swallowed), and any
+   *   non-CE fault escapes [flush] verbatim (fail-loud) — which inside
+   *   [shutdown]'s bounded flush call lands in the teardown swallow lane
+   *   (`flushed = false`), never a false drained.
    *
    * Note on durability: [flush] returns true once the barrier drains through the
    * writer, even if individual core entries encountered store exceptions and were
@@ -1166,8 +1228,33 @@ class OrderedTranscriptSink(
    * behind the barrier. A timeout abandoning the reserved slot completes it
    * normally so successors are never stuck.
    * PG-W2: barrier reservation follows the [reserveAdmission] lock-order contract.
+   *
+   * Writer-teardown seal race: if the writer dies while a buffered barrier
+   * is still queued behind it, [sealWriter]'s orphan drain fails that
+   * barrier with the seal cause — two shapes, per the catch in the body:
+   * - teardown CE (scope-cancel death): [flush] maps that race to `false`
+   *   (not drained) instead of rethrowing the foreign teardown exception —
+   *   the durable-failure truth then flows through
+   *   [hasDurableFailures]/[flushDurable] as usual;
+   * - fatal Error / VM-fatal: the seal cause is the Error itself, which is
+   *   no CancellationException and escapes [flush] verbatim (fail-loud,
+   *   pinned by #bestEffortVmFatalStillSeals in OrderedTranscriptSinkTest).
+   * A caller cancellation, and any CE from a still-unsealed
+   * writer, keep propagating (see the catch in the body).
+   * Contrast with the post-seal shape: a flush that arrives AFTER the seal
+   * never enqueues a barrier (ClosedSendChannelException) and instead joins
+   * the still-draining pre-seal tail ([writer.join]) — that writer-join
+   * wait completes normally and [flush] returns true even for a fatally
+   * sealed writer ([flushDurable] stays false; the post-fatal control pins
+   * both). The seal race only falsifies a barrier defeated mid-flight,
+   * never a barrier issued after the seal.
    */
   suspend fun flush(timeoutMs: Long = DEFAULT_FLUSH_TIMEOUT_MS): Boolean {
+    // Writer-teardown seal-race signal: set when the buffered barrier was
+    // completed exceptionally by [sealWriter]'s orphan drain (see the catch
+    // below). Timeout shapes keep `null` (withTimeoutOrNull); an armed seal
+    // race forces `false` even though the body otherwise returned.
+    var barrierSealed = false
     try {
       return withTimeoutOrNull(timeoutMs) {
         awaitAdmissionTail()
@@ -1203,7 +1290,49 @@ class OrderedTranscriptSink(
           // may proceed while this caller waits. Idempotent with the finally
           // below, which covers timeout/cancel abandonment paths.
           releaseAdmission(reservation.gate)
-          barrier.await()
+          // Seal-race test seam: exactly here the barrier is buffered and the
+          // admission chain is clear — the deterministic proof point that the
+          // writer teardown (whenever the test then arms it) will fail THIS
+          // barrier via the [sealWriter] orphan drain (null in production).
+          checkNotHoldingAdmissionLock("afterBarrierSendForTest:flush")
+          afterBarrierSendForTest?.invoke()
+          try {
+            barrier.await()
+          } catch (e: CancellationException) {
+            // Writer-teardown race on a buffered barrier (CI flake root):
+            // while this barrier sits in the channel behind a still-running
+            // entry, the writer can die and [sealWriter]'s orphan drain then
+            // completes this VERY barrier exceptionally — with the seal
+            // cause from the writer finally
+            // (`lastFailure ?: CancellationException("transcript writer dead")`),
+            // which has TWO shapes the mapping below only covers one of:
+            // - teardown CE (scope-cancel death, no fatal Error): the seal
+            //   cause is the teardown's CancellationException —
+            //   "transcript writer dead" only when no per-entry *propagating*
+            //   failure (a CancellationException or a non-Exception)
+            //   preceded the death — a routine Exception-tier entry failure
+            //   neither seals the writer nor sets lastFailure — otherwise
+            //   that per-entry teardown CE itself. Not caller cancellation,
+            //   and rethrowing it would
+            //   surface a foreign teardown exception through [flushDurable]
+            //   (which promises a fail-closed Boolean).
+            // - fatal delegate Error / VM-fatal: the lastFailure filter passes
+            //   the Error through, so the seal cause IS that Error — no
+            //   CancellationException, this catch never sees it, and it
+            //   escapes [flush] verbatim (fail-loud; pinned by
+            //   #bestEffortVmFatalStillSeals in OrderedTranscriptSinkTest).
+            // Mapping, in catch order:
+            // - caller coroutine cancelled, or writer not yet sealed (some
+            //   unrelated cancellation): rethrow — cancellation semantics
+            //   unchanged;
+            // - sealed writer: treat as NOT drained (barrierSealed). The
+            //   seal already marked every unacked core under [poisonLock],
+            //   so [hasDurableFailures] is true when any core was
+            //   outstanding; with none outstanding, `flush() == false`
+            //   alone keeps [flushDurable] fail-closed instead of throwing.
+            if (coroutineContext[Job]?.isCancelled == true || !isSealed()) throw e
+            barrierSealed = true
+          }
         } finally {
           // D15-1: a timeout/cancel abandoning the reserved slot before the
           // send defers to the forwarder (never an immediate complete past a
@@ -1212,19 +1341,51 @@ class OrderedTranscriptSink(
           if (sendInvoked) releaseAdmission(reservation.gate)
           else releaseAbandoned(reservation)
         }
-      } != null
+      } != null && !barrierSealed
     } catch (e: CancellationException) {
       throw e
     }
   }
 
   /**
-   * True if any admitted core event failed during persistence or was interrupted by teardown/timeout.
+   * True while the sink's durability truth is poisoned: `[interrupted]` is
+   * non-empty. The set only ever holds two mark tiers with different
+   * permanence AND different lift windows —
+   * - a genuine persistence failure ([markStoreFailure]): pinned by
+   *   [storeFailed], never cleared — [clearTimeoutMarkOnCommit] refuses it.
+   *   Note the tier breadth: the writer finally routes EVERY non-null
+   *   core-entry failure into [markStoreFailure], so an in-flight mid-entry
+   *   teardown [CancellationException] and a delegate block's own self-thrown
+   *   CE are genuine-tier too (the [markStoreFailure] KDoc's
+   *   "teardown/fatal mid-entry" clause names the teardown shape; the
+   *   delegate-CE shape rides the same writer-finally routing) —
+   *   never lifted, by the same [storeFailed] pin;
+   * - a drain-timeout / seal / fail-fast orphan mark ([markInterrupted], plus
+   *   the [sealWriter] poison loops and the fail-fast gates of
+   *   [writeCoreTracked]/[writeCoreWithAck]): provisional, but ONLY inside
+   *   the channel-close window — the late-commit lift
+   *   ([clearTimeoutMarkOnCommit]) lives solely in the writer success path,
+   *   so a mark of this tier is lifted only while the writer still drains
+   *   and can run a same-id entry to completion (R23-1); never once
+   *   [writerDead] is set. A [sealWriter] mark is therefore provisional in
+   *   tier (not [storeFailed]-pinned) but permanent in effect — the writer
+   *   is already dead when [sealWriter] runs, so no success-path lift is
+   *   reachable again.
    *
-   * R23-1: a drain-timeout/seal mark is not a persistence failure — when the
-   * still-running writer later commits the row, the success path clears that
-   * id (the row is durable); a genuine store failure ([markStoreFailure])
-   * never clears. Either way a failing read stays fail-closed (true).
+   * So `true` never means "permanently failed" for the second tier inside
+   * that window: a failing read is the fail-closed provisional truth while
+   * the writer can still prove the row durable, and a later proven commit
+   * for the same runId legitimately restores a clean read. Once the writer
+   * is dead the distinction stops mattering to this boolean — both tiers
+   * read terminal there (no lift is reachable), only the [storeFailed] pin
+   * additionally closes the still-draining window for genuine failures.
+   * Deliberately outside this set (and outside this boolean): proven
+   * never-delivered ghosts ([resolvedUndelivered] / [markNeverAdmitted]) —
+   * they stay visible via [interruptedRunIds] only and never poison
+   * durability truth — including a follow-up genuine store failure for an
+   * already-resolved id, which records nothing (fresh-runId retry contract;
+   * see the contract-boundary comments at the two early-returns in
+   * [markInterrupted]/[markStoreFailure]).
    */
   fun hasDurableFailures(): Boolean = synchronized(poisonLock) { interrupted.isNotEmpty() }
 
@@ -1261,7 +1422,7 @@ class OrderedTranscriptSink(
       withContext(NonCancellable) {
         try {
           withTimeoutOrNull(drainTimeoutMs) { settle() }
-        } catch (_: Throwable) {
+        } catch (e: Throwable) {
           // D15-4 fail-closed + Security Finding3 (Stage-3, intentional
           // teardown swallow): settle is best-effort, so an Error from it
           // (like an Exception, including a CancellationException from a
@@ -1269,7 +1430,14 @@ class OrderedTranscriptSink(
           // a settle bug, never an outer-scope cancel) still falls through
           // to the drain attempt below instead of aborting the teardown.
           // Durability truth stays in interrupted/hasDurableFailures, never
-          // a false success from this swallow.
+          // a false success from this swallow. EXCEPT VM-fatal: OOM /
+          // StackOverflowError / ThreadDeath is never swallowed here —
+          // rethrown per the S3-F1 house pattern (TurnController); other
+          // Errors (e.g. AssertionError/LinkageError) stay in this
+          // best-effort swallow. Honest cost: teardown aborts early on OOM
+          // and the drain is not attempted, which is the correct
+          // fail-loud choice.
+          if (e is VirtualMachineError || e is ThreadDeath) throw e
         }
         val flushed = try {
           flush(drainTimeoutMs)
@@ -1317,12 +1485,18 @@ class OrderedTranscriptSink(
         withTimeoutOrNull(drainTimeoutMs) {
           try {
             writer.join()
-          } catch (_: Throwable) {
+          } catch (e: Throwable) {
             // D15-4 fail-closed + Security Finding3 (Stage-3, intentional
             // teardown swallow): a failed writer (including a fatal Error
             // it rethrew to seal) still falls through to the scope cancel
             // below instead of aborting the teardown. Best effort: the
-            // ack/interrupt marks already carry the failure.
+            // ack/interrupt marks already carry the failure. EXCEPT
+            // VM-fatal: OOM / StackOverflowError / ThreadDeath is never
+            // swallowed here — rethrown per the S3-F1 house pattern
+            // (TurnController); honest cost: teardown aborts early on OOM
+            // (the final scope cancel below is skipped), which is the
+            // correct fail-loud choice.
+            if (e is VirtualMachineError || e is ThreadDeath) throw e
           }
         }
         writerScope.cancel()
@@ -1425,6 +1599,17 @@ class OrderedTranscriptSink(
     // handler below (the resolver fails the ghost ack exceptionally, which
     // re-enters here). Keep it only in the resolved set. Atomic with
     // tryResolve/seal under [poisonLock]: check-then-add has no gap.
+    // Contract boundary (F2): the early-return below also swallows a
+    // post-resolve GENUINE store failure — [markStoreFailure] mirrors this
+    // guard — so that failure records nothing and [hasDurableFailures] reads
+    // false-clean afterwards. Safe today ONLY under the fresh-runId retry
+    // contract (TurnController.settlePendingAdmission: the resolved ghost is
+    // rolled back with the SAME opId retryable on a FRESH id;
+    // GhostUndeliveredDurableTest#controllerGhostBarrierProofRetryKeepsFlushDurableClean
+    // pins the fresh retry id): reusing a resolved runId as a real admission
+    // id is documented-unsupported — the resolve tier owns the poison slot
+    // and the genuine failure tier cannot record into it (poison gap; any
+    // future reuse support must extend the poison logic first).
     synchronized(poisonLock) {
       if (resolvedUndelivered.contains(runId)) {
         pendingCore.remove(runId)
@@ -1455,7 +1640,8 @@ class OrderedTranscriptSink(
 
   /**
    * R23-1 genuine store-failure poison: the writer block for [runId] threw
-   * (store IOException, teardown/fatal mid-entry), so the row provably never
+   * (any non-cancellation Exception from the delegate, e.g. store
+   * IOException, plus teardown/fatal mid-entry), so the row provably never
    * persisted. Records the durable mark like [markInterrupted] plus the
    * [storeFailed] tier, which the success-path late-commit clear honors: a
    * drain-timeout/seal orphan that later commits lifts its mark (the row is
@@ -1465,6 +1651,17 @@ class OrderedTranscriptSink(
    * poison mutation (A1 order).
    */
   internal fun markStoreFailure(runId: String) {
+    // Contract boundary (F2, mirror of [markInterrupted]'s same guard): an
+    // id already in [resolvedUndelivered] records NOTHING here, so a
+    // genuine store failure AFTER a ghost resolve in the same session would
+    // leave [hasDurableFailures] false-clean. This is intended ONLY under
+    // the fresh-runId retry contract (TurnController.settlePendingAdmission:
+    // every post-resolve retry of the same opId mints a FRESH id; pinned by
+    // GhostUndeliveredDurableTest#controllerGhostBarrierProofRetryKeepsFlushDurableClean
+    // where the retry id provably differs): reusing a resolved runId as a
+    // real admission id is documented-unsupported — poison gap, the resolve
+    // tier wins the slot and this genuine tier cannot mark it (any future
+    // reuse support must extend the poison logic first).
     synchronized(poisonLock) {
       if (resolvedUndelivered.contains(runId)) {
         pendingCore.remove(runId)

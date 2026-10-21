@@ -143,6 +143,8 @@ FAKE_POLICY = r'''#!/bin/sh
 set -eu
 if [ "${1:-}" = "--foss" ]; then
     flavor=foss
+elif [ "${1:-}" = "--github" ]; then
+    flavor=github
 else
     flavor=play
 fi
@@ -345,9 +347,10 @@ class ReleaseBuilderHarness(unittest.TestCase):
         self.assertEqual(transaction.parent, self.output_parent)
         self.assertTrue(transaction.is_dir())
         policy_calls = self.policy_log.read_text().splitlines()
-        self.assertEqual(len(policy_calls), 2, policy_calls)
+        self.assertEqual(len(policy_calls), 3, policy_calls)
         self.assertTrue(policy_calls[0].startswith("play\t"), policy_calls)
         self.assertTrue(policy_calls[1].startswith("foss\t"), policy_calls)
+        self.assertTrue(policy_calls[2].startswith("github\t"), policy_calls)
         for flavor in FLAVORS:
             stage = transaction / flavor
             apk = stage / "release.apk"
@@ -363,11 +366,14 @@ class ReleaseBuilderHarness(unittest.TestCase):
             digest, relative = line.split("  ", 1)
             self.assertEqual(hashlib.sha256((transaction / relative).read_bytes()).hexdigest(), digest)
 
-    def test_github_only_does_not_run_play_or_foss_policy(self) -> None:
+    def test_github_only_runs_common_policy_not_play_or_foss(self) -> None:
         result = self.run_builder(self.command(("github",)))
 
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertFalse(self.policy_log.exists())
+        policy_calls = self.policy_log.read_text().splitlines()
+        self.assertEqual(len(policy_calls), 1, policy_calls)
+        self.assertTrue(policy_calls[0].startswith("github\t"), policy_calls)
+        self.assertTrue(policy_calls[0].endswith("/github/release.apk"), policy_calls)
         self.assertEqual(set(json.loads(result.stdout.strip().splitlines()[-1])["flavors"]), {"github"})
 
     def test_missing_expected_certificate_fails_before_credentials_or_build(self) -> None:
@@ -453,6 +459,21 @@ class ReleaseBuilderHarness(unittest.TestCase):
         policy_calls = self.policy_log.read_text().splitlines()
         self.assertEqual(len(policy_calls), 2, policy_calls)
 
+    def test_github_common_policy_rejection_cleans_transaction(self) -> None:
+        # Negative fixture: legal identity/signature bytes but the staged
+        # github APK fails the common policy gate. The failure must be named
+        # against the github flavor and leave zero staged output behind;
+        # same fake-policy paradigm as the foss rejection above.
+        result = self.run_builder(self.command(("github",)), policy_mode="fail-github")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("READY", result.stdout)
+        self.assertIn("github artifact policy rejected", result.stdout)
+        self.assertEqual(self._output_roots(), [])
+        policy_calls = self.policy_log.read_text().splitlines()
+        self.assertEqual(len(policy_calls), 1, policy_calls)
+        self.assertTrue(policy_calls[0].startswith("github\t"), policy_calls)
+
     def test_policy_mutation_is_detected_and_transaction_removed(self) -> None:
         result = self.run_builder(policy_mode="mutate-play")
 
@@ -460,6 +481,22 @@ class ReleaseBuilderHarness(unittest.TestCase):
         self.assertNotIn("READY", result.stdout)
         self.assertIn("checksum", result.stdout.lower())
         self.assertEqual(self._output_roots(), [])
+
+    def test_github_policy_mutation_is_detected_and_transaction_removed(self) -> None:
+        # Negative fixture: legal identity/signature bytes but the staged
+        # github APK is mutated by the common policy gate (same fake-policy
+        # paradigm as mutate-play above). The post-policy checksum recheck
+        # must fail closed, leave zero staged output behind, and never
+        # print READY; only the github flavor's policy invocation ran.
+        result = self.run_builder(self.command(("github",)), policy_mode="mutate-github")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("READY", result.stdout)
+        self.assertIn("checksum", result.stdout.lower())
+        self.assertEqual(self._output_roots(), [])
+        policy_calls = self.policy_log.read_text().splitlines()
+        self.assertEqual(len(policy_calls), 1, policy_calls)
+        self.assertTrue(policy_calls[0].startswith("github\t"), policy_calls)
 
     def test_policy_output_is_capped_before_full_capture_and_transaction_removed(self) -> None:
         result = self.run_builder(policy_mode="flood-play")
@@ -550,6 +587,25 @@ class ReleaseBuilderHarness(unittest.TestCase):
         first_root = json.loads(first.stdout.strip().splitlines()[-1])["outputDirectory"]
         second_root = json.loads(second.stdout.strip().splitlines()[-1])["outputDirectory"]
         self.assertNotEqual(first_root, second_root)
+
+
+class PolicyTimeoutBudgetTest(unittest.TestCase):
+    """The per-flavor policy timeout budget is part of the release lane's named fail-closed contract, not a silent knob."""
+
+    def test_policy_timeout_seconds_mapping_is_pinned_per_flavor(self) -> None:
+        # release_artifact_stage resolves its verify_release_apk sibling via a
+        # bare import, so it only loads with scripts/ on sys.path (as when run
+        # directly); import it that way for the pin, closing over no calls.
+        try:
+            sys.path.insert(0, str(ROOT / "scripts"))
+            import release_artifact_stage as stager
+        finally:
+            sys.path.pop(0)
+
+        self.assertEqual(
+            stager.POLICY_TIMEOUT_SECONDS,
+            {"play": 720, "foss": 720, "github": 360},
+        )
 
 
 class SignerPinRegistryTest(unittest.TestCase):

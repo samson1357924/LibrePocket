@@ -29,6 +29,28 @@ MAX_MANIFEST_BYTES = 64 * 1024
 MAX_POLICY_OUTPUT_BYTES = 2 * 1024 * 1024
 _ACTIVE_POLICY_PROCESS: subprocess.Popen[bytes] | None = None
 
+# Per-mode wall-clock budget (seconds) for ONE play_policy_check.sh run,
+# named rather than inlined so the basis is reviewable. Basis: a bounded
+# budget chosen ABOVE the observed healthy envelope for the DEX-parsing
+# lanes (DEX parsing dominates one gate run); it is NOT a sum-of-caps
+# derivation. Summing the gate's child caps is not a meaningful envelope:
+# apk_policy_inspect.py caps EVERY native child (each aapt dump AND the
+# per-shard `dexdump` sanity parse) at its TOOL_TIMEOUT_SECONDS = 120s, and
+# play/foss parse DEX, so the shards alone can read "17-20 shards x 120s
+# ~ 2.0-2.4ks" on paper -- but those are per-child maxima, not cumulative
+# healthy-run cost (a healthy run aborts no child, and no shard parses
+# anywhere near its cap). Provenance for that figure: the "17-20 root DEX
+# shards / 65-80MB total DEX" inventory comes from the
+# scripts/apk_policy_inspect.py header, which self-declares it as a
+# parent-provided debug-APK inventory that this helper has NOT verified.
+# Rationale for 720: a single flat 360s could cut a healthy multi-shard
+# release APK off deep in the shard loop, so the DEX-parsing lanes get a
+# bounded 720s budget that STILL FAILS CLOSED with the same named timeout
+# (an oversized run dies there rather than being read as a pass); the
+# github mode returns BEFORE any DEX table parsing (manifest/resource
+# authorities only), so its lighter child set keeps 360s.
+POLICY_TIMEOUT_SECONDS = {"play": 720, "foss": 720, "github": 360}
+
 
 class StageError(Exception):
     """A release artifact transaction failed closed."""
@@ -298,14 +320,25 @@ def _assert_stage_integrity(
         _fail(f"{stage_dir.name} identity manifest does not match trusted caller inputs")
 
 
-def _run_policy(flavor: str, apk: Path, *, root: Path) -> None:
-    if flavor not in ("play", "foss"):
+def _run_policy(flavor: str, apk: Path, *, root: Path, aapt: str) -> None:
+    """Run the per-flavor policy gate over the staged APK bytes.
+
+    ``aapt`` is the caller-validated tool (``_validate_tool``), forwarded
+    through the gate's ``--aapt`` override so the gate reads the SAME aapt
+    the release verifier used: one staged set of bytes, one ruler, no second
+    independent tool discovery in between. The apk operand stays last so the
+    gate's flag parsing keeps it as the primary APK argument.
+    """
+    if flavor not in ("play", "foss", "github"):
         return
     command = ["sh", str(root / "scripts" / "play_policy_check.sh")]
     if flavor == "foss":
         command.append("--foss")
+    elif flavor == "github":
+        command.append("--github")
+    command.extend(("--aapt", aapt))
     command.append(str(apk))
-    result = _run(command, cwd=root, timeout_seconds=360)
+    result = _run(command, cwd=root, timeout_seconds=POLICY_TIMEOUT_SECONDS[flavor])
     if result.returncode != 0:
         detail = _output_text(result.stderr) or _output_text(result.stdout)
         _fail(f"{flavor} artifact policy rejected staged APK (exit {result.returncode}): {detail.strip()}")
@@ -375,7 +408,7 @@ def _run_transaction(args: argparse.Namespace) -> dict[str, object]:
             )
             digest = str(result["sha256"])
             _assert_stage_integrity(stage_dir, digest, identities[flavor])
-            _run_policy(flavor, stage_dir / APK_NAME, root=root)
+            _run_policy(flavor, stage_dir / APK_NAME, root=root, aapt=aapt)
             _assert_stage_integrity(stage_dir, digest, identities[flavor])
             results[flavor] = {
                 "apk": str(stage_dir / APK_NAME),

@@ -184,7 +184,11 @@ class OrderedTranscriptSinkSealTest {
             }
           }
           val elapsed = System.currentTimeMillis() - started
-          assertTrue("post-death core must fail fast, took ${elapsed}ms", elapsed < 4_000L)
+          // 直接快訊閘：外層 blanket catch(_: CancellationException)/(_: Exception)
+          // 無法區分真正 fail-fast 與 withTimeout 的 TCE，故以短於外層預算的
+          // 上限（1s vs 4s）作為 hang 訊號——fail-fast 本身為 ms 級，1s 餘裕
+          //足以吸收 CI 停頓（與 ErrorTest 三姊妹 pin 的理由一致）。
+          assertTrue("post-death core must fail fast, took ${elapsed}ms", elapsed < 1_000L)
           assertTrue(sink.interruptedRunIds().contains("run-2"))
           assertTrue(sink.pendingRunIds().isEmpty())
           sink.shutdown()?.join()

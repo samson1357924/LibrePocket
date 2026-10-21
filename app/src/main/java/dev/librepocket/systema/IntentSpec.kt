@@ -5,14 +5,29 @@ package dev.librepocket.systema
  * [AndroidIntentLauncher] 轉成真正的 `android.content.Intent` 並執行
  * resolveActivity → startActivity；單元測試只斷言本層映射。
  *
+ * 長度政策註記：本層字串長度上限（[AlarmTool.MAX_MESSAGE_LEN]、
+ * [CalendarTool.MAX_TITLE_LEN]/[CalendarTool.MAX_LOCATION_LEN]/
+ * [CalendarTool.MAX_DESCRIPTION_LEN]、[NavigationTool.MAX_QUERY_LEN]
+ * （其 label 同限）、[MusicTool.MAX_QUERY_LEN]）皆為**本層自訂 fail-closed
+ * 政策**（Binder 傳輸防禦），非官方契約；builder/parse 兩側同值，改動須同步
+ * （[NavigationTool.MAX_QUERY_LEN]/[MusicTool.MAX_QUERY_LEN] 目前僅 builder 側
+ * 守衛，同步點分別為 geo/web 兩 builder 與 play builder）。
+ * [CalendarTool.MAX_EVENT_ID_ECHO_LEN] 與 [LaunchAppTool.MAX_QUERY_ECHO_LEN]
+ * 則僅限制話術回顯長度（參數校驗/守衛仍以完整值進行），同屬防回顯政策。
+ *
  * D2 型別化 extras：D1 的全 String 會讓端側 `getIntExtra /
  * getLongExtra / getBooleanExtra` 讀回預設值（系統鬧鐘/日曆 App 直接忽略），
  * 故改為密封型別，launcher 按型別 putExtra。
  *
  * 決策註記：float/double 需求出現時再加 DoubleVal + toIntent 分支
- * （不預先加型別；此處 when 為 statement position，新增子類不會編譯期
- * 報錯，故 toIntent 另以 `else -> throw` 保底，防靜默掉 extra；實測編譯器
- * 拒絕測試源集新增子類，故該分支僅未來主模組新增子類時可達，刻意不單測）。
+ * （不預先加型別；[AndroidIntentLauncher.toIntent] 以窮舉 `when` 表達式
+ * （賦值迫使編譯器檢查）保證新增子類未補分支即編譯錯，fail-closed 於編譯期）。
+ *
+ * SystemEnv Status（原懸掛於 [IntentSpec] 上方的孤兒 KDoc，併入檔首以免誤掛）：
+ * Target（純側契約，未接線未 E2E）。`SystemEnv` 目前無生產 producer
+ * （無 `PackageManager.resolveActivity → SystemEnv` 映射，見各工具 `check`
+ * KDoc）；測試以假 `SystemEnv` + 假 `IntentLauncher` 直調驗證映射語義，
+ * 不得當作端到端能力證據。
  */
 sealed interface IntentExtra {
   data class Str(val value: String) : IntentExtra
@@ -22,16 +37,39 @@ sealed interface IntentExtra {
 }
 
 /**
- * 型別化讀取：讀側必須用 `is`/`requireExtra`，禁 unsafe cast。
+ * 型別化讀取：讀側必須用 `is`/`requireExtra`/`optionalExtra`，禁 unsafe cast。
  *
  * 錯型別或缺 key 一律拋 [IllegalStateException]（帶 key + 期望型別），
  * 避免 `ClassCastException` 訊息無 key 難定位。
  *
- * 目前生產側尚未採用此 helper 讀 extras，後續接線 PR 需遷移讀側。
+ * Status: Target（純側契約，未接線未 E2E；矩陣層 `executionReady=false` 概念）。
+ * 生產採用（#14）：[AlarmTool.parseParams]、[CalendarTool.parseInsertParams]
+ * 以本 helper 讀必填 extra（缺參/錯型明確拋錯，禁預設猜測執行，#19）。
+ * 未來 dispatcher 必須在呼叫 parse 側包 try-catch（ISE/IAE），收斂為
+ * `ToolResult(INTERNAL)`，不得讓異常穿透生產迴圈；builder 側同形收斂統一以
+ * [guardedToolBuild] 實作（見各工具 execute）。dispatcher 接線分型決策：
+ * builder 範圍違規（hour=25／越界座標／超長欄位）語義屬澄清族訊息，接線 PR
+ * 時可分流為 NEED_CLARIFICATION；本層（接線前 PR）一律保留 INTERNAL
+ * fail-closed。
  */
 inline fun <reified T : IntentExtra> Map<String, IntentExtra>.requireExtra(key: String): T {
   val v = this[key]
     ?: throw IllegalStateException("extra missing: key=$key expected=${T::class.simpleName}")
+  if (v !is T) {
+    throw IllegalStateException(
+      "extra type mismatch: key=$key expected=${T::class.simpleName} actual=${v::class.simpleName}",
+    )
+  }
+  return v
+}
+
+/**
+ * 選填 extra 讀取（與 [requireExtra] 同錯誤形狀）：缺席回 null（呼叫方套用
+ * 各工具 Params 記載的預設值）；出現但錯型仍拋 [IllegalStateException]，禁靜默忽略
+ * 或退回預設（fail-closed，#19 猜測執行禁令）。
+ */
+inline fun <reified T : IntentExtra> Map<String, IntentExtra>.optionalExtra(key: String): T? {
+  val v = this[key] ?: return null
   if (v !is T) {
     throw IllegalStateException(
       "extra type mismatch: key=$key expected=${T::class.simpleName} actual=${v::class.simpleName}",
@@ -66,6 +104,26 @@ object IntentFlags {
   fun sanitize(flags: Int): Int = flags and ALLOWED_MASK
 }
 
+/**
+ * 純側 intent 描述：launcher 的唯一輸入形狀（KDoc 見檔案頂部契約說明；
+ * 欄位語意：`dataUri` 與 `mimeType` 同設時由 launcher 併為
+ * `setDataAndType`，`targetPackage` 僅契約白名單場景使用）。
+ *
+ * `categories`（預設空值＝既有呼叫面零破壞；欄位放最後，避免既有 positional
+ * 呼叫斷裂）：由 launcher 逐項 `addCategory` 映射（見
+ * [AndroidIntentLauncher.toIntent]）。契約：**僅允許 framework 常量字面值**，
+ * 目前唯一使用點為 `android.intent.category.LAUNCHER`（[LaunchAppTool.launchSpec]
+ * 的 ACTION_MAIN+setPackage 隱式啟動——launcher activity 的 manifest filter
+ * 通常僅 MAIN+LAUNCHER，隱式 intent 缺 category 則 filter 匹配不可達，與
+ * geo/https 同形的真機恆 NoHandler 矛盾，為本欄存在的理由）；未來新增值必須
+ * 先對照官方 manifest `<intent-filter>` 匹配契約（含 `CATEGORY_DEFAULT` 的
+ * MATCH_DEFAULT_ONLY 語義），不得在工具層自造 category。
+ *
+ * 精確度警告：本欄為必要條件而非充分條件——`resolveActivity`
+ * （MATCH_DEFAULT_ONLY）對 launcher-only filter 仍不可達（launcher filter
+ * 無 `CATEGORY_DEFAULT`）；真機可發射的充分條件是接線 PR 的顯式
+ * component 派生，不得據本欄誤判本層已可發射。
+ */
 data class IntentSpec(
   val action: String,
   val dataUri: String? = null,
@@ -73,6 +131,7 @@ data class IntentSpec(
   val targetPackage: String? = null,
   val extras: Map<String, IntentExtra> = emptyMap(),
   val flags: Int = 0,
+  val categories: List<String> = emptyList(),
 )
 
 /**
@@ -119,6 +178,72 @@ internal fun LaunchResult.toToolResult(
     )
 }
 
+/**
+ * fail-closed builder guard 的結果（[guardedToolBuild] 回傳）：builder 成功值
+ * 或收斂好的 INTERNAL 失敗 [ToolResult]。
+ */
+internal sealed interface Guarded<out T> {
+  /** builder 成功：呼叫方續行既有流程。 */
+  data class Built<out T>(val value: T) : Guarded<T>
+
+  /** builder 違規：攜帶收斂好的失敗結果，呼叫方直接回傳它。 */
+  data class Internal(val result: ToolResult) : Guarded<Nothing>
+}
+
+/**
+ * fail-closed builder guard（多個工具 execute 的 inline catch 收斂點）：
+ * builder 拋 `IllegalArgumentException`／`IllegalStateException`（範圍/長度/
+ * 形狀違規，非取消）時回 [Guarded.Internal]，不讓異常滲出生產迴圈；
+ * `CancellationException` 照拋（取消語義不得吞；CE 繼承 ISE，catch 形狀與
+ * [guardedFallbackAlternative] 統一為「先 CE → 再 IAE/ISE」，避免「內嵌 CE
+ * 檢查」與「先捕 CE」兩種寫法在兩個 guard 間漂移）。各工具 inline catch 的
+ * 重複與訊息漂移在此單一化；失敗 ToolResult 由呼叫方提供（保留各自話術），
+ * 並附加 cause 類名（與 [LaunchResult.toToolResult] 的 launch 路徑對稱，
+ * 讓分派層可區分「參數被本層政策拒絕」與「系統拒絕」；僅附類名，不附
+ * 訊息體/參數值，防輸入回顯——`require` 訊息可能內嵌輸入形狀）。
+ */
+internal inline fun <T> guardedToolBuild(
+  internalFailure: ToolResult,
+  builder: () -> T,
+): Guarded<T> =
+  try {
+    Guarded.Built(builder())
+  } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+    throw e
+  } catch (e: IllegalArgumentException) {
+    Guarded.Internal(internalFailure.tagInternalCause(e))
+  } catch (e: IllegalStateException) {
+    Guarded.Internal(internalFailure.tagInternalCause(e))
+  }
+
+/** INTERNAL 失敗訊息附加 cause 類名（`做不到 X（INTERNAL）` → `…（INTERNAL）[IAE 類名]`）。 */
+private fun ToolResult.tagInternalCause(cause: Throwable): ToolResult =
+  copy(message = "$message[${cause.javaClass.simpleName}]")
+
+/**
+ * fail-closed fallback 的 alternative 構建收斂點（[guardedToolBuild] 的「報告
+ * 失敗」側對稱）：fallback 是回報降級的路徑，自身不得反拋例外打穿呼叫方——
+ * builder 拋 `IllegalArgumentException`／`IllegalStateException`（座標/長度等
+ * 守衛違規，非取消）時降為 null（僅「無預建 intent 可替代」，話術由呼叫方
+ * 自持，形狀不變）；`CancellationException` 照拋（取消語義不得吞；CE 繼承
+ * ISE，與 [guardedToolBuild] 統一為「先 CE → 再 IAE/ISE」形狀）。現行採用：
+ * [NavigationTool.fallback]、[MusicTool.fallback]
+ * 的 play 分支；新增 fallback 若會構建 intent，必須經此收斂。豁免註記（常量
+ * 構建不可拋）：無 builder 守衛可違反的純常量 IntentSpec（如
+ * [VolumeTool.volumePanelSpec] 的音量面板 spec）可豁免不包裝——本 guard 的
+ * 範圍是「呼叫可拋守衛的 builder」，意圖守衛常量不在此列。
+ */
+internal inline fun <T> guardedFallbackAlternative(builder: () -> T): T? =
+  try {
+    builder()
+  } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+    throw e
+  } catch (e: IllegalArgumentException) {
+    null
+  } catch (e: IllegalStateException) {
+    null
+  }
+
 data class ToolResult(
   val ok: Boolean,
   val usedFallback: Boolean,
@@ -128,7 +253,7 @@ data class ToolResult(
 )
 
 /**
- * 降級分支描述。話術必須遵守矩陣 §5 模板：
+ * 降級分支描述。話術必須遵守能力矩陣 Current evidence 模板：
  * `做不到 X（原因碼）→ 可替代 Y → 需要你做 Z`。
  */
 data class FallbackSpec(

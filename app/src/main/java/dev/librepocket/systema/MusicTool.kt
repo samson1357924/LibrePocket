@@ -1,17 +1,43 @@
 package dev.librepocket.systema
 
 /**
- * 音樂工具：媒體 Intent + MediaSession 前台（三風味皆完整，矩陣 §1 列 10）。
+ * 音樂工具：媒體 Intent + MediaSession 前台。
  *
- * - 點播：VIEW Intent 帶曲目/搜尋 URI，交給系統播放器。
- * - 控制（暫停/下一首等）：MEDIA_BUTTON 語義的 [ControlSpec]，
- *   端側經 MediaSession 回調落地。斷言僅自洽，未接真實播放器：
- *   單元測試只鎖 keyCode 映射與 Intent 形狀，未驗證端側 MediaSession 回調落地。
+ * Status: Target（純側契約，未接線未 E2E）。
+ *
+ * - 點播契約為**刻意近似**：官定 `INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH`
+ *   （EXTRA_MEDIA_FOCUS + query extra）需要播放器逐一實作 focus 型別，
+ *   非通用路徑；本層以 VIEW 到 YT Music 網頁搜尋近似（真實可用、只依瀏覽器，
+ *   非官方契約直譯——近似屬明寫決策，不冒充官方契約）。
+ *   query 長度上限（[MAX_QUERY_LEN]=500）為本層 Binder 傳輸防禦（官方契約
+ *   無此上限），builder fail-closed 拒絕，越界經 [execute] 收斂 INTERNAL。
+ * - 可見性（#14）：主 manifest `<queries>` 已宣告 VIEW geo/https scheme-only，
+ *   targetSdk 36 下 resolve-first launcher 不再被過濾成假 NO_HANDLER；
+ *   真機 handler E2E（瀏覽器/播放器實際接起）仍 UNVERIFIED。
+ * - 控制（暫停/下一首等）：MEDIA_BUTTON 是 broadcast 語義、無 activity handler
+ *   可 resolve——launcher 必回 NoHandler，屬已記錄的端側未接線缺口
+ *   （MediaController 路徑，見下）；NoHandler 話術走 [fallback] 控制分支的
+ *   完整三段計畫（alternative 為 null：控制語意下「播放 search」亦非替代）。
+ *   單元測試僅鎖 keyCode 映射與話術形狀，未驗證端側 MediaSession 回調落地。
+ *   官方契約 gap（明寫，防誤導接線者）：official contract uses EXTRA_KEY_EVENT
+ *   （`android.intent.extra.KEY_EVENT`，型別 KeyEvent）；本 spec 的 `keyCode`
+ *   Int 是內部建模近似——接線者最終必須對齊 EXTRA_KEY_EVENT（由 keyCode
+ *   構建 KeyEvent extra）或改調 MediaController/媒體會話 API 直控，不得以
+ *   現 keyCode extra 冒充官方契約。
  * - 前台要求：實際播放必須跑在前台服務（`FOREGROUND_SERVICE_MEDIA_PLAYBACK`
  *   + 常駐通知），否則後台會被系統回收；本層僅建模，端側強制。
- * - 模糊目標（如「放點輕音樂」）不猜包名：先澄清或走預設播放器。
+ * - 模糊目標（如「放點輕音樂」）不猜包名：先澄清或走 YT Music 網頁搜尋。
+ * - [buildPlayIntent] 的 `targetPackage` 參數為**測試建模**用途（純映射方便
+ *   斷言 extras/flags）；生產**不傳**（OEM/播放器包名各異，本層不代選 app，
+ *   與 manifest 「直啟不採用 setPackage」註記一致）——新呼叫方禁無腦透傳。
+ * - 與姊妹工具同契約：execute 內 builder 一律經 [guardedToolBuild] 收斂
+ *   （控制映射與 play 編碼的拋例不再穿透生產迴圈）。
  */
 object MusicTool : SystemTool<MusicTool.Params> {
+
+  /** Binder 傳輸上限防禦：query 過長在 builder 即拒（本層自訂政策，非官方
+   *  契約；與 [AlarmTool.MAX_MESSAGE_LEN]/[NavigationTool.MAX_QUERY_LEN] 同值同源）。 */
+  const val MAX_QUERY_LEN = 500
 
   enum class Control { PLAY, PAUSE, TOGGLE, NEXT, PREVIOUS }
 
@@ -41,26 +67,53 @@ object MusicTool : SystemTool<MusicTool.Params> {
     return if (env.hasMusicApp) {
       CheckResult.native("媒體 Intent 可用（前台 MediaSession）")
     } else {
-      CheckResult.degraded(ReasonCodes.NO_HANDLER, "無播放器，降級開啟預設播放器頁")
+      CheckResult.degraded(ReasonCodes.NO_HANDLER, "無播放器，降級走 YT Music 網頁搜尋")
     }
   }
 
-  fun buildPlayIntent(params: Params, defaultPlayerPackage: String? = null): IntentSpec =
-    IntentSpec(
+  fun buildPlayIntent(params: Params, defaultPlayerPackage: String? = null): IntentSpec {
+    // 空白 query 是呼叫方契約前置：[execute] 的空白路徑先收斂 NEED_CLARIFICATION
+    // 才到 builder；fallback 經 [guardedFallbackAlternative] 依此守衛降
+    // alternative=null（不構建空搜尋 intent，#19 猜測執行禁令同向）。
+    require(params.query.isNotBlank()) { "query must not be blank" }
+    // Binder 傳輸上限防禦：URLEncoder 前以欄位長度計（見 IntentSpec KDoc 長度政策）。
+    require(params.query.length <= MAX_QUERY_LEN) { "query too long: ${params.query.length} > $MAX_QUERY_LEN" }
+    return IntentSpec(
       action = IntentActions.VIEW,
-      dataUri = if (params.query.isBlank()) null
-      else "https://music.youtube.com/search?q=${java.net.URLEncoder.encode(params.query, Charsets.UTF_8.name())}",
+      dataUri = "https://music.youtube.com/search?q=${java.net.URLEncoder.encode(params.query, Charsets.UTF_8.name())}",
       targetPackage = defaultPlayerPackage,
     )
+  }
 
-  fun buildControl(control: Control): ControlSpec =
-    ControlSpec(control, CONTROL_KEY_CODES.getValue(control))
+  /** 鍵碼查表的純映射（**測試建模用途**，同 [buildPlayIntent] 的 `targetPackage`
+   *  註記式樣：純映射方便斷言鍵碼；生產構建走 [buildControlIntent]，呼叫方
+   *  禁把本函式當作構建入口）。 */
+  fun buildControl(control: Control): ControlSpec {
+    // 鍵碼查表缺項以 ISE 快速失敗（可被 [guardedToolBuild] 收斂為 INTERNAL），
+    // 而非讓穿透性的 NoSuchElementException（guard 不可捕）漏出生產迴圈；
+    // 新增 Control 未補鍵碼時層面即收斂、話術保持一致（Phase2 收斂點真實性）。
+    // 缺鍵碼守衛與 [buildControlIntent] 共用 [keyCodeOrThrow]（單一實作）。
+    return ControlSpec(control, keyCodeOrThrow(control))
+  }
 
-  fun buildControlIntent(control: Control): IntentSpec = IntentSpec(
-    action = IntentActions.MEDIA_BUTTON,
-    // D2 型別化：keyCode 用 Int，端側 MediaSession 回調按 int 讀回。
-    extras = mapOf("keyCode" to IntentExtra.IntVal(CONTROL_KEY_CODES.getValue(control))),
-  )
+  fun buildControlIntent(control: Control): IntentSpec {
+    // 同 [buildControl]：缺鍵碼 ISE（非 NoSuchElementException，共用
+    // [keyCodeOrThrow]），確保 guardedToolBuild 真實收斂；D2 型別化：keyCode 用
+    // Int，端側 MediaSession 回調按 int 讀回。契約 gap 見檔 KDoc 控制段：
+    // 官方形狀為 EXTRA_KEY_EVENT（KeyEvent），此 keyCode Int 為內部建模近似——
+    // 接線須對齊或改直控，不得冒充官方契約。
+    return IntentSpec(
+      action = IntentActions.MEDIA_BUTTON,
+      extras = mapOf("keyCode" to IntentExtra.IntVal(keyCodeOrThrow(control))),
+    )
+  }
+
+  /** 控制鍵碼查表的共用快路：缺項拋 ISE 快速失敗（可被 [guardedToolBuild] 收斂為
+   *  INTERNAL），[buildControl]／[buildControlIntent] 兩份 builder 只有這一份
+   *  缺鍵碼守衛——ISE 訊息字面與抽取前的 inline 版本逐字相同。 */
+  private fun keyCodeOrThrow(control: Control): Int =
+    CONTROL_KEY_CODES[control]
+      ?: throw IllegalStateException("no keyCode mapping for Control.${control.name}")
 
   override fun execute(params: Params, env: SystemEnv, launcher: IntentLauncher): ToolResult {
     val check = check(env)
@@ -68,8 +121,32 @@ object MusicTool : SystemTool<MusicTool.Params> {
       return ToolResult(false, false, null, check.reasonCode, "做不到播放音樂（${check.reasonCode}）")
     }
     if (params.control != null) {
-      val spec = buildControlIntent(params.control)
-      return launcher.launchCatching(spec).toToolResult(spec, "控制播放")
+      // fail-closed：MEDIA_BUTTON 映射（keyCode 查表缺項拋 ISE）一律收斂為
+      // INTERNAL，不穿透生產迴圈（收斂點 [guardedToolBuild]，話術形狀同姊妹工具）。
+      val controlFailure =
+        ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到控制播放（${ReasonCodes.INTERNAL}）")
+      val spec = when (val build = guardedToolBuild(controlFailure) { buildControlIntent(params.control) }) {
+        is Guarded.Internal -> return build.result
+        is Guarded.Built -> build.value
+      }
+      return when (val launched = launcher.launchCatching(spec)) {
+        // MEDIA_BUTTON 為 broadcast 語義，resolve-first launcher 恆回 NoHandler：
+        // 話術取 [fallback] 控制分支（完整三段計畫；generic toToolResult 的
+        // 無計畫尾段話術不滿足話術模板，見 FallbackSpec KDoc）。
+        LaunchResult.NoHandler -> ToolResult(
+          false, true, spec, ReasonCodes.NO_HANDLER, fallback(params, env).userMessage,
+        )
+        // Success/Internal 走共用收斂：control 與 play 沿用**同一降級真相**——
+        // 主前提是 launcher 語意（MEDIA_BUTTON 無 activity handler）：發射
+        //「成功」不可能是真實控制；播放器可見性（靜態無播放器的 check
+        // DEGRADED）為次、同向成立，故 usedFallbackOnSuccess/successReason
+        // 沿用 play 路徑同一參數形狀（成功分支攜 NO_HANDLER 標記；NATIVE
+        // 下不生效，兩分支禁漂移）。
+        else -> launched.toToolResult(
+          spec, "控制播放",
+          usedFallbackOnSuccess = !env.hasMusicApp, successReason = check.reasonCode,
+        )
+      }
     }
     if (params.query.isBlank()) {
       return ToolResult(
@@ -77,17 +154,49 @@ object MusicTool : SystemTool<MusicTool.Params> {
         "放什麼音樂（${ReasonCodes.NEED_CLARIFICATION}）？→ 可替代預設歌單 → 需要你說出曲名或歌手",
       )
     }
-    val spec = buildPlayIntent(params)
-    return launcher.launchCatching(spec).toToolResult(
-      spec, "播放音樂",
-      usedFallbackOnSuccess = !env.hasMusicApp, successReason = check.reasonCode,
-    )
+    // fail-closed 收斂範圍（精確版）：play builder 的 query 長度守衛（IAE）經
+    // [guardedToolBuild] 收斂為 INTERNAL；`URLEncoder.encode`（固定 UTF-8）按
+    // 規格宣告的 `UnsupportedEncodingException` 屬 IOException 族、不在 guard
+    // 白名單——固定 charset 下實務不可達，charset 可配置化前無收斂缺口，
+    // 禁再宣稱「URLEncoder 若拋亦收斂」。
+    val playFailure =
+      ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到播放音樂（${ReasonCodes.INTERNAL}）")
+    val spec = when (val build = guardedToolBuild(playFailure) { buildPlayIntent(params) }) {
+      is Guarded.Internal -> return build.result
+      is Guarded.Built -> build.value
+    }
+    return when (val launched = launcher.launchCatching(spec)) {
+      // 發現式缺席（靜態有播放器但發射無處理者：被移除/停用/不可見）與靜態
+      // DEGRADED 同語義：走 [fallback] 話術（可替代網頁播放器），spec 保留。
+      LaunchResult.NoHandler -> ToolResult(
+        false, true, spec, ReasonCodes.NO_HANDLER, fallback(params, env).userMessage,
+      )
+      // Success/Internal 走共用收斂（Internal 收斂為 INTERNAL）。
+      else -> launched.toToolResult(
+        spec, "播放音樂",
+        usedFallbackOnSuccess = !env.hasMusicApp, successReason = check.reasonCode,
+      )
+    }
   }
 
-  override fun fallback(params: Params, env: SystemEnv): FallbackSpec = FallbackSpec(
-    reasonCode = ReasonCodes.NO_HANDLER,
-    alternative = buildPlayIntent(params),
-    userMessage = "做不到開啟播放器（${ReasonCodes.NO_HANDLER}）" +
-      "→ 可替代網頁播放器 → 需要你手動點播放",
-  )
+  override fun fallback(params: Params, env: SystemEnv): FallbackSpec {
+    if (params.control != null) {
+      // 控制路徑沒有 intent 可替代（「播放 search」不是暫停/下一首的替代）：
+      // alternative 留 null，話術指向使用者可立即達成的手動替代。
+      return FallbackSpec(
+        reasonCode = ReasonCodes.NO_HANDLER,
+        alternative = null,
+        userMessage = "做不到控制播放（${ReasonCodes.NO_HANDLER}）" +
+          "→ 可替代螢幕/通知欄的播放控制 → 需要你手動按暫停或下一首",
+      )
+    }
+    return FallbackSpec(
+      reasonCode = ReasonCodes.NO_HANDLER,
+      // 防拋收斂（[guardedFallbackAlternative]，同 [NavigationTool.fallback]）：
+      // query 守衛違規時降為 null，話術形狀不變；fallback 不得反拋打穿呼叫方。
+      alternative = guardedFallbackAlternative { buildPlayIntent(params) },
+      userMessage = "做不到開啟播放器（${ReasonCodes.NO_HANDLER}）" +
+        "→ 可替代網頁播放器 → 需要你手動點播放",
+    )
+  }
 }

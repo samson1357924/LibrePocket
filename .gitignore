@@ -25,3 +25,10 @@ google-services.json
 # Built artifacts (covered by /build/ too, belt and suspenders for strays).
 *.apk
 *.aab
+# Local verification/device logs must never be committed (explicit filename patterns only, not blanket *.log).
+device_*.log
+verify_*.log
+# Python bytecode from policy scripts (local runs set PYTHONDONTWRITEBYTECODE=1;
+# some CI steps invoke python directly, so their bytecode artifacts are ignored here).
+__pycache__/
+*.pyc

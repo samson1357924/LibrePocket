@@ -35,6 +35,17 @@ class SystemIntentMappingTest {
     assertEquals(6, ToolRegistry.all().size)
   }
 
+  @Test fun registry_duplicateName_rejected_stateStable() {
+    // fail-closed 拒絕：重複名稱 require（IAE），且註冊表狀態不變——
+    // 靜默覆寫會把 descriptor 換人而不留痕跡（見 ToolRegistry.register KDoc）。
+    val before = ToolRegistry.all()
+    val thrown = runCatching {
+      ToolRegistry.register(ToolDescriptor(ToolRegistry.NAVIGATE, SideEffectLevel.READ, 10_000))
+    }.exceptionOrNull()
+    assertTrue("重複註冊應被拒絕（IAE）：$thrown", thrown is IllegalArgumentException)
+    assertEquals("拒絕不得改動註冊表", before, ToolRegistry.all())
+  }
+
   // ---- 1. 導航 ----
 
   @Test fun navigate_placeQuery_mapsToGeoIntent() {
@@ -101,6 +112,24 @@ class SystemIntentMappingTest {
     )
     assertFalse(exec.ok)
     assertEquals(ReasonCodes.NEED_CLARIFICATION, exec.reasonCode)
+  }
+
+  @Test fun launchApp_fuzzySingleHit_autoLaunches() {
+    // single-fuzzy auto-launch 決策 pin（成文見 LaunchAppTool.resolve 註解）：
+    // fuzzy **唯一**命中即採用（子串訊號已排除第二解釋；誤啟動風險已記錄，
+    // 不等一輪澄清）；「music」≥2 候選才澄清（上一案反向控制）。
+    // "spotif" 非精確別名/包名（走 fuzzy 分支）：alias「spotify」與可見包
+    // com.spotify.music 皆含該子串，distinct 後唯一候選 → Single。
+    val r = LaunchAppTool.resolve("spotif", fullEnv.installedPackages)
+    assertTrue(r is LaunchAppTool.LaunchResolution.Single)
+    assertEquals(
+      "com.spotify.music",
+      (r as LaunchAppTool.LaunchResolution.Single).packageName,
+    )
+    // 執行面同釘選：唯一模糊命中經 execute 直達啟動（非 NEED_CLARIFICATION）。
+    val exec = LaunchAppTool.execute(LaunchAppTool.Params("spotif"), fullEnv, okLauncher)
+    assertTrue(exec.ok)
+    assertEquals(IntentActions.MAIN, exec.spec?.action)
   }
 
   @Test fun launchApp_unknown_fallsBack() {

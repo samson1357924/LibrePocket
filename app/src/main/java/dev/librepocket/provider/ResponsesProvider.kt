@@ -1289,6 +1289,29 @@ internal class ResponsesMapper(val round: Int = 0) {
         null
     }
 
+    /**
+     * Canonical JSON used for structural tool-args equality and for the
+     * emitted-call fingerprint. Object keys are sorted, whitespace is dropped
+     * and strings are re-escaped canonically, so a replay that differs only in
+     * formatting is not mistaken for a contradiction.
+     *
+     * Numbers are canonicalized from their RAW literal via
+     * `BigDecimal(raw).stripTrailingZeros().toPlainString()` — never from the
+     * parsed `Double` ([MiniJson.JNum.v]) and never from the raw text:
+     *
+     * - `1`, `1.0` and `1e2`/`100` denote the same decimal value and must
+     *   compare EQUAL, so an aliasing replay is not reported as a mismatch;
+     * - integers above 2^53 (e.g. `9007199254740993`) are NOT representable
+     *   as Double, so a Double-based canonical form would fold
+     *   `9007199254740993` onto `9007199254740992` and silently accept a
+     *   contradictory replay as if it were the same call. Canonicalizing the
+     *   exact decimal literal keeps such values DISTINCT.
+     *
+     * This is replay-identity relevant: the canonical form decides whether a
+     * terminal replay is the same tool call (safe to emit) or a contradiction
+     * (must fail closed with RESPONSES_OUTPUT_MISMATCH), and it feeds the
+     * bounded payload fingerprint that detects a replay with different args.
+     */
     private fun StringBuilder.appendCanonicalJson(value: MiniJson.J) {
         when (value) {
             is MiniJson.JObj -> {
@@ -1313,6 +1336,8 @@ internal class ResponsesMapper(val round: Int = 0) {
             }
             is MiniJson.JStr -> appendJsonString(value.v)
             is MiniJson.JNum -> {
+                // Canonical number: the exact decimal literal, never the
+                // Double value (see the invariant on appendCanonicalJson).
                 val normalized = try {
                     java.math.BigDecimal(value.raw).stripTrailingZeros().toPlainString()
                 } catch (_: Throwable) {

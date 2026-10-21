@@ -1601,6 +1601,81 @@ class ResponsesProviderTest {
         assertEquals(StreamEvent.Done("stop"), events.last())
     }
 
+    /**
+     * Canonical numbers are compared on their exact decimal value, so the
+     * trailing-zero scale variant of the same integer is the SAME call, not a
+     * contradiction. `9007199254740993` is above 2^53 and must survive
+     * canonicalization byte-exact (a Double round-trip would fold it onto
+     * 9007199254740992).
+     */
+    @Test
+    fun completedFullBigNumberEquivalentScaleCompletes() {
+        val mapper = ResponsesMapper()
+        mapper.mapPayload(
+            """{"type":"response.function_call_arguments.done","item_id":"it1","arguments":"{\"n\":9007199254740993}"}""",
+        )
+        val events = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"function_call","item_id":"it1","id":"it1","call_id":"c1","name":"f","arguments":"{\"n\":9007199254740993.0}"}]}}""",
+        )
+        assertEquals("c1", events.filterIsInstance<StreamEvent.ToolDone>().single().id)
+        assertTrue(events.none { it is StreamEvent.Failed })
+        assertEquals(StreamEvent.Done("stop"), events.last())
+    }
+
+    /**
+     * An exponent alias (`1e2`) is the same decimal value as `100` and must
+     * not be read as a contradicting replay.
+     */
+    @Test
+    fun completedFullBigNumberExponentEquivalentCompletes() {
+        val mapper = ResponsesMapper()
+        mapper.mapPayload(
+            """{"type":"response.function_call_arguments.done","item_id":"it1","arguments":"{\"n\":1e2}"}""",
+        )
+        val events = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"function_call","item_id":"it1","id":"it1","call_id":"c1","name":"f","arguments":"{\"n\":100}"}]}}""",
+        )
+        assertEquals("c1", events.filterIsInstance<StreamEvent.ToolDone>().single().id)
+        assertTrue(events.none { it is StreamEvent.Failed })
+        assertEquals(StreamEvent.Done("stop"), events.last())
+    }
+
+    /** A decimal scale alias (`1.0`) is the same value as the integer `1`. */
+    @Test
+    fun completedFullDecimalEquivalentCompletes() {
+        val mapper = ResponsesMapper()
+        mapper.mapPayload(
+            """{"type":"response.function_call_arguments.done","item_id":"it1","arguments":"{\"n\":1.0}"}""",
+        )
+        val events = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"function_call","item_id":"it1","id":"it1","call_id":"c1","name":"f","arguments":"{\"n\":1}"}]}}""",
+        )
+        assertEquals("c1", events.filterIsInstance<StreamEvent.ToolDone>().single().id)
+        assertTrue(events.none { it is StreamEvent.Failed })
+        assertEquals(StreamEvent.Done("stop"), events.last())
+    }
+
+    /**
+     * Canonicalization must NOT collapse distinct values. Above 2^53 the
+     * neighbouring integers 9007199254740993 and 9007199254740992 are not
+     * representable as Double, so a Double-based canonical form would fold
+     * them onto one another and silently accept a contradictory replay. The
+     * mapper must fail closed instead.
+     */
+    @Test
+    fun completedFullDistinctAbove2_53FailsClosed() {
+        val mapper = ResponsesMapper()
+        mapper.mapPayload(
+            """{"type":"response.function_call_arguments.done","item_id":"it1","arguments":"{\"n\":9007199254740993}"}""",
+        )
+        assertOnlyOutputMismatch(
+            mapper.mapPayload(
+                """{"type":"response.completed","response":{"output":[{"type":"function_call","item_id":"it1","id":"it1","call_id":"c1","name":"f","arguments":"{\"n\":9007199254740992}"}]}}""",
+            ),
+        )
+        assertTrue(mapper.terminalReached)
+    }
+
     @Test
     fun outputItemDoneFullDifferentFromDeltasFailsClosed() {
         val mapper = ResponsesMapper()

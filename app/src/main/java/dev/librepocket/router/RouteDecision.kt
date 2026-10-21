@@ -22,10 +22,12 @@ data class ToolCall(
  * - [projectedTools]: projection snapshot (flavor/switch/permission passed,
  *   i.e. `ToolRegistry.projectedTools` names). Audit-only; a projected tool
  *   is NOT necessarily executable this round.
- * - [visibleTools]: the model-visible list (`ToolRegistry.visibleTools`
- *   names: projected AND `executionReady`). This is the ONLY list that may
- *   be sent to the model; empty until the wiring PR lands. Audits prove
- *   "what the model saw" from THIS field, not from [projectedTools].
+ * - [visibleTools]: a registry CAPABILITY snapshot (`ToolRegistry.visibleTools`
+ *   names: projected AND `executionReady`). It is NOT a per-ChatRequest wire
+ *   guarantee: production stays records-only with no slice attached, the
+ *   continuation path carries `allowTools=false`, and when the slice/context
+ *   is unavailable the wire tool list may be empty. Audits must not treat this
+ *   header field as proof of what was actually sent on the wire.
  *
  * [reasonCode] is the [DenyReason] name or null.
  */

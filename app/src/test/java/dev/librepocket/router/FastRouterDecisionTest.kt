@@ -353,6 +353,25 @@ class FastRouterDecisionTest {
         assertFalse(b.fallbackMessage!!.contains("NEED_CLARIFICATION"))
     }
 
+    @Test fun headerVisibleToolsMirrorsRegistrySnapshot() {
+        // `header.visibleTools` 是 registry capability 快照（`ToolRegistry.visibleTools`
+        // 的視圖）：它反映「registry 在這個 projection 下看得見什麼」，不描述
+        // wire。實際上了線的 `ChatRequest.tools` 由 TurnController 端的測試覆蓋
+        // （續傳路徑 allowTools=false、production composition 是 records-only，
+        // slice/context 不可用時 wire 上的 tools 可以是空）——這裡不重複那份
+        // 保證，只釘住「快照 = registry 視圖」這個不變量，並用一個 registry
+        // 可見但 production 從不送線的工具（lsp.symbols）說明快照與 wire 之間
+        // 的落差；不改變任何行為。
+        val ctx = play.copy(userSwitches = mapOf("lsp" to true))
+        val d = decide("幫我截圖", ctx)
+        assertEquals(ToolRegistry.visibleTools(ctx).map { it.name }, d.header.visibleTools)
+        // 快照裡有 executionReady 的 lsp.symbols，但這不代表它上了線。
+        assertTrue(d.header.visibleTools.contains("lsp.symbols"))
+        // 關掉開關後快照同步收斂（快照是 registry 視圖，不是固定清單）。
+        val off = play.copy(userSwitches = mapOf("lsp" to false))
+        assertFalse(decide("幫我截圖", off).header.visibleTools.contains("lsp.symbols"))
+    }
+
     @Test fun phoneCandidateFirstMaxTieBreakIsDeterministic() {
         // (c) tie: two equal-digit candidates → same decision; maxByOrNull
         // keeps the FIRST max (stdlib tie-break, documented — both tie

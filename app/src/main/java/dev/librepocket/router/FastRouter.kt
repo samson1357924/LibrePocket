@@ -31,6 +31,13 @@ import java.util.concurrent.atomic.AtomicLong
  * execution gate.
  *
  * Pure logic, no Android dependencies.
+ *
+ * Note: the [TranscriptHeader.visibleTools] snapshot carried by every outcome
+ * is a registry capability snapshot, not a per-ChatRequest wire guarantee —
+ * production stays records-only with no slice attached, the continuation path
+ * carries `allowTools=false`, and when the slice/context is unavailable the
+ * wire tool list may be empty. Audits must not treat the header as proof of
+ * what was actually sent on the wire.
  */
 class FastRouter(
     private val registry: ToolRegistry = ToolRegistry,

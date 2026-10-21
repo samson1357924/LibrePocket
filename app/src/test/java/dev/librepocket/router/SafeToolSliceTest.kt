@@ -28,8 +28,10 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.text.Normalizer
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
@@ -404,6 +406,116 @@ class SafeToolSliceTest {
         assertEquals(3, backend.invocations.get())
     }
 
+    @Test fun pathPrefixUnicodeFormatCharsAreSchemaRejected() = runBlocking {
+        // Unicode FORMAT code points (Cf) are invisible (ZWSP/BOM) or reorder
+        // the visible text (RLO): `trimStart()` does NOT remove them, so
+        // "\u200B/etc/passwd" used to pass the leading-`/` check and name an
+        // absolute scope while looking relative. The shared predicate must
+        // reject the whole Cf category, with ZERO backend invocations.
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        // The bypass shapes from the review: a format char in front of an
+        // absolute scope, and one in front of a traversal marker.
+        val bypass = listOf(
+            "\u200B/etc/passwd",
+            "\u202E/etc/passwd",
+            "\uFEFF/etc/passwd",
+            "\u200B../etc",
+            // SUPPLEMENTARY-plane format characters (a surrogate PAIR):
+            // U+E0001 (LANGUAGE TAG) and U+E0020 (TAG SPACE) — encoded as
+            // \uDB40\uDC01 / \uDB40\uDC20. Their halves report SURROGATE,
+            // never FORMAT, so a char-level scan let them through and the
+            // absolute scope behind them stayed hidden. The scan is by CODE
+            // POINT, so the whole Cf category is rejected.
+            "\uDB40\uDC01/etc/passwd",
+            "\uDB40\uDC20/etc/passwd",
+        )
+        // The DISCRIMINATING shapes: a format char alone (no `..`, no leading
+        // `/`, no `%`, no `:`) — before the fix these were ALLOWED, so they
+        // prove the Cf rule itself and not one of the other branches.
+        val formatOnly = listOf(
+            "a\u200Bb",
+            "a\u202Eb",
+            "a\uFEFFb",
+            "\u200B",
+            // The supplementary-plane counterparts: a char-level scan sees two
+            // SURROGATE halves here (never FORMAT), so these slipped through
+            // entirely — they pin the code-point iteration itself.
+            "a\uDB40\uDC01b",
+            "\uDB40\uDC20",
+        )
+        var n = 0
+        for (prefix in bypass + formatOnly) {
+            // Precondition: NFKC leaves these strings unchanged, so the
+            // NFKC-equality branch is NOT the discriminator here (the
+            // assertion would fail loudly if that ever changed).
+            assertEquals(
+                "NFKC must be stable for $prefix",
+                prefix,
+                Normalizer.normalize(prefix, Normalizer.Form.NFKC),
+            )
+            // Precondition: the supplementary shapes really are FORMAT code
+            // points whose UTF-16 halves report SURROGATE — that is exactly
+            // why the old char-level scan missed them (and why a silently
+            // mistyped escape could not degrade this pin into "some other
+            // rejection").
+            for (cp in listOf(0xE0001, 0xE0020)) {
+                assertEquals(
+                    "U+%X must be a FORMAT code point".format(cp),
+                    Character.FORMAT.toInt(),
+                    Character.getType(cp),
+                )
+                assertEquals(
+                    "U+%X high half must be a SURROGATE".format(cp),
+                    Character.SURROGATE.toInt(),
+                    Character.getType(Character.highSurrogate(cp)),
+                )
+            }
+            val r = s.execute(
+                listOf(call(args = """{"query":"Foo","pathPrefix":"$prefix"}""", id = "fmt-$n")),
+            ).single()
+            assertTrue(prefix, r.denied)
+            assertEquals(prefix, SafeToolSlice.DenyCodes.SCHEMA_INVALID, r.denyCode)
+            n++
+        }
+        assertEquals(0, backend.invocations.get())
+        // Benign buffer: the plain relative scope still runs, so the pins
+        // discriminate the Cf rule rather than a blanket deny.
+        val ok = s.execute(
+            listOf(call(args = """{"query":"Foo","pathPrefix":"a/b"}""", id = "fmt-ok")),
+        ).single()
+        assertFalse(ok.denied)
+        assertEquals(1, backend.invocations.get())
+    }
+
+    @Test fun pathPrefixFormatRejectionHasCleanTwin() = runBlocking {
+        // Attribution pin for the Cf rule: for every rejected format code
+        // point there is a CLEAN TWIN whose only difference is the format
+        // character itself ("a<fmt>b" vs "ab"). Without the twin a denial
+        // could be blamed on any other branch (NFKC, traversal, percent,
+        // colon); with it, the denial is attributable to the Cf character
+        // itself. The backend invocation count equals the number of clean
+        // twins (the rejected inputs never reach the backend).
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        // U+200B ZWSP, U+202E RLO, U+FEFF BOM (BMP) and U+E0001 LANGUAGE
+        // TAG / U+E0020 TAG SPACE (supplementary plane, a surrogate PAIR).
+        val formats = listOf("\u200B", "\u202E", "\uFEFF", "\uDB40\uDC01", "\uDB40\uDC20")
+        for ((i, fmt) in formats.withIndex()) {
+            val rejected = s.execute(
+                listOf(call(args = """{"query":"Foo","pathPrefix":"a${fmt}b"}""", id = "twin-bad-$i")),
+            ).single()
+            assertTrue(fmt, rejected.denied)
+            assertEquals(fmt, SafeToolSlice.DenyCodes.SCHEMA_INVALID, rejected.denyCode)
+            // The clean twin differs ONLY by the format character.
+            val clean = s.execute(
+                listOf(call(args = """{"query":"Foo","pathPrefix":"ab"}""", id = "twin-ok-$i")),
+            ).single()
+            assertFalse(fmt, clean.denied)
+        }
+        assertEquals(formats.size, backend.invocations.get())
+    }
+
     @Test fun policyFlipAfterOfferDenies() = runBlocking {
         val backend = CountingBackend()
         val policy = allowPolicy()
@@ -559,7 +671,20 @@ class SafeToolSliceTest {
         assertTrue(idB.length <= SafeToolSlice.MAX_STRING_CHARS)
         // Deterministic: the same raw id always maps to the same wire id.
         assertEquals(idA, SafeToolSlice.redactedPairingId(rawA))
-        assertTrue("suffix identifies the full redacted id", Regex("#[0-9a-f]{8}$").containsMatchIn(idA))
+        // The suffix is a 128-bit (32 hex) SHA-256 prefix of the FULL
+        // redacted id: an 8-hex (32-bit) suffix would collide by birthday
+        // bound on a bounded id space, so two long ids could re-bind to one
+        // pairing key and silently drop the second execution.
+        assertTrue(
+            "suffix identifies the full redacted id",
+            Regex("#[0-9a-f]{${SafeToolSlice.PAIRING_SUFFIX_CHARS - 1}}$").containsMatchIn(idA),
+        )
+        assertTrue(Regex("#[0-9a-f]{${SafeToolSlice.PAIRING_SUFFIX_CHARS - 1}}$").containsMatchIn(idB))
+        // The suffix is derived from the WHOLE id, not the capped prefix:
+        // two ids that differ only after the cut stay distinct.
+        val rawC = prefix + "C"
+        val rawD = prefix + "D"
+        assertNotEquals(SafeToolSlice.redactedPairingId(rawC), SafeToolSlice.redactedPairingId(rawD))
         val s = slice()
         val calls = listOf(call(id = rawA, args = """{"query":"A"}"""), call(id = rawB, args = """{"query":"B"}"""))
         val results = listOf(
@@ -612,6 +737,54 @@ class SafeToolSliceTest {
         // A timeout is a paired denial for the model call, not a lost pairing.
         assertEquals("call-1", r.callId)
         assertEquals("lsp.symbols", r.name)
+    }
+
+    @Test fun backendOwnTimeoutMapsToExecErrorNotExecDenied() = runBlocking {
+        // The backend's OWN timer fired (its internal withTimeout), not the
+        // slice's budget: the slice must not forge an EXEC_DENIED timeout it
+        // never observed. A backend-raised TimeoutCancellationException is a
+        // backend failure → typed EXEC_ERROR.
+        val backend = object : LspTools.Backend {
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+                // The backend's own deadline expires → TimeoutCancellationException
+                // raised by the BACKEND, while the slice's scope stays active.
+                withTimeout(1) { delay(60_000) }
+                return emptyList()
+            }
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val r = slice(backend = backend, timeoutMillisForTest = 30_000)
+            .execute(listOf(call()))
+            .single()
+        assertTrue(r.denied)
+        assertEquals(SafeToolSlice.DenyCodes.EXEC_ERROR, r.denyCode)
+        assertEquals(
+            "backend failed",
+            Json.parseToJsonElement(r.resultJson).jsonObject["detail"]!!.jsonPrimitive.content,
+        )
+    }
+
+    @Test fun nonPositiveBackendTimeoutIsTypedExecDeniedWithZeroInvocations() = runBlocking {
+        // Documented contract (regression pin): a NON-POSITIVE budget is an
+        // IMMEDIATE typed timeout — `withTimeout` with a non-positive
+        // deadline throws TimeoutCancellationException BEFORE the backend
+        // body is entered, so the outcome is the same typed EXEC_DENIED
+        // ("backend timed out") with ZERO backend invocations. The slice
+        // never forges a timeout it did not observe — here the timeout IS
+        // observed (the deadline expires before the body runs).
+        val backend = CountingBackend()
+        for (budget in listOf(0L, -1L, -5000L)) {
+            val s = slice(backend = backend, timeoutMillisForTest = budget)
+            val r = s.execute(listOf(call())).single()
+            assertTrue("budget=$budget", r.denied)
+            assertEquals("budget=$budget", SafeToolSlice.DenyCodes.EXEC_DENIED, r.denyCode)
+            assertEquals(
+                "budget=$budget",
+                "backend timed out",
+                Json.parseToJsonElement(r.resultJson).jsonObject["detail"]!!.jsonPrimitive.content,
+            )
+            assertEquals("budget=$budget", 0, backend.invocations.get())
+        }
     }
 
     @Test fun cancelInsideBackendPropagatesAsCancellation() = runBlocking {
@@ -984,6 +1157,31 @@ class SafeToolSliceTest {
         assertTrue(echo.contains("\"query\":\"q\""))
     }
 
+    @Test fun secretKeyedPrimitiveValuesCollapseToReceipt() = runBlocking {
+        // A secret-family key must collapse EVERY value shape to the fixed
+        // receipt — including the primitives the old walk passed through
+        // untouched (number/boolean/null). A bare `123`/`true`/`null` under
+        // `password`/`token`/`api_key` still says something about the secret
+        // (its type/length), and the walk must not echo it verbatim.
+        val s = slice()
+        val calls = listOf(
+            call(
+                id = "call-1",
+                args = """{"query":"q","password":123,"token":true,"api_key":null,"count":7,"flag":false,"nothing":null}""",
+            ),
+        )
+        val msgs = s.continuationMessages(calls, listOf(SafeToolSlice.ToolResult("call-1", "n", "{}")))
+        val echo = msgs[0].toolCalls.single().argumentsJson
+        val body = Json.parseToJsonElement(echo).jsonObject
+        assertEquals("⟦REDACTED⟧", body["password"]!!.jsonPrimitive.content)
+        assertEquals("⟦REDACTED⟧", body["token"]!!.jsonPrimitive.content)
+        assertEquals("⟦REDACTED⟧", body["api_key"]!!.jsonPrimitive.content)
+        // Non-secret members keep their exact values (no blanket redaction).
+        assertEquals("7", body["count"]!!.jsonPrimitive.content)
+        assertEquals("false", body["flag"]!!.jsonPrimitive.content)
+        assertEquals("null", body["nothing"]!!.jsonPrimitive.content)
+    }
+
     @Test fun secretKeyedObjectCollapsesWholeValue() = runBlocking {
         // A secret-family key whose value is an OBJECT must collapse the whole
         // value: recursing would echo inner values under non-secret inner keys.
@@ -1013,6 +1211,217 @@ class SafeToolSliceTest {
         assertTrue(results.all { it.denied })
         assertTrue(results.all { it.denyCode == SafeToolSlice.DenyCodes.SCHEMA_INVALID })
         assertEquals("duplicate id must not touch the backend", 0, backend.invocations.get())
+    }
+
+    @Test fun executeRejectsBlankCallIdBeforeBackend() = runBlocking {
+        // A blank model call id cannot carry a provider pairing id: the
+        // continuation would ship an unpairable `tool_call_id`. The whole
+        // round denies with SCHEMA_INVALID (before budget/dedup) and the
+        // backend is never touched.
+        //
+        // ORDERING PIN (discriminating): the budget is 1 while the round has
+        // TWO calls, so the budget branch WOULD fire (BUDGET_EXCEEDED) if it
+        // were ordered before the blank branch. The blank branch wins → both
+        // results are SCHEMA_INVALID, never BUDGET_EXCEEDED.
+        val backend = CountingBackend()
+        val s = slice(backend = backend, maxCallsPerTurn = 1)
+        val results = s.execute(listOf(call(id = ""), call(id = "call-2")))
+        assertEquals(2, results.size)
+        assertTrue(results.all { it.denied })
+        assertTrue(results.all { it.denyCode == SafeToolSlice.DenyCodes.SCHEMA_INVALID })
+        assertEquals(0, backend.invocations.get())
+        // Per-call detail: the BLANK call names the problem, the NON-BLANK
+        // sibling names the round-level denial. Both are FIXED constants
+        // (no raw id rides the wire in the detail).
+        assertEquals(
+            "blank call id",
+            Json.parseToJsonElement(results[0].resultJson).jsonObject["detail"]!!.jsonPrimitive.content,
+        )
+        assertEquals(
+            "round denied: sibling call id is blank",
+            Json.parseToJsonElement(results[1].resultJson).jsonObject["detail"]!!.jsonPrimitive.content,
+        )
+        // The receipt of the BLANK call carries the deterministic synthetic
+        // wire id (a blank id must never land on the wire — not even as the
+        // receipt's own `callId` echo), while the internal result keeps the
+        // RAW id for the audit trail. Its non-blank sibling keeps its own id.
+        assertEquals("", results[0].callId)
+        assertEquals(
+            SafeToolSlice.blankWireCallId(0),
+            Json.parseToJsonElement(results[0].resultJson).jsonObject["callId"]!!.jsonPrimitive.content,
+        )
+        assertEquals("call-2", results[1].callId)
+        assertEquals(
+            "call-2",
+            Json.parseToJsonElement(results[1].resultJson).jsonObject["callId"]!!.jsonPrimitive.content,
+        )
+        // A single blank-id call is denied the same way (it must not slip
+        // through the duplicate check because there is nothing to duplicate).
+        val single = slice(backend = backend).execute(listOf(call(id = "  "))).single()
+        assertTrue(single.denied)
+        assertEquals(SafeToolSlice.DenyCodes.SCHEMA_INVALID, single.denyCode)
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun blankCallIdBranchPrecedesDuplicateIdBranch() = runBlocking {
+        // Second ORDERING PIN: the round also contains a DUPLICATE model id,
+        // so the duplicate branch would report "duplicate call id in one
+        // round". The blank branch runs FIRST, so the first result's detail
+        // is exactly "blank call id" — a swapped branch order would report
+        // the duplicate detail instead (the pin is discriminating, not just
+        // "some denial").
+        val backend = CountingBackend()
+        val s = slice(backend = backend, maxCallsPerTurn = 3)
+        val results = s.execute(listOf(call(id = ""), call(id = "dup"), call(id = "dup")))
+        assertEquals(3, results.size)
+        assertTrue(results.all { it.denied })
+        assertTrue(results.all { it.denyCode == SafeToolSlice.DenyCodes.SCHEMA_INVALID })
+        assertEquals(
+            "blank call id",
+            Json.parseToJsonElement(results[0].resultJson).jsonObject["detail"]!!.jsonPrimitive.content,
+        )
+        // The non-blank siblings are denied because of the BLANK sibling
+        // (their own ids are fine — including the duplicated one).
+        assertEquals(
+            "round denied: sibling call id is blank",
+            Json.parseToJsonElement(results[1].resultJson).jsonObject["detail"]!!.jsonPrimitive.content,
+        )
+        assertEquals(
+            "round denied: sibling call id is blank",
+            Json.parseToJsonElement(results[2].resultJson).jsonObject["detail"]!!.jsonPrimitive.content,
+        )
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun blankCallIdDenialStillContinuesWithSyntheticWireIds() = runBlocking {
+        // The blank-id denial is a TYPED RESULT, so the round must remain
+        // continuable: the continuation re-binds the blank id to a
+        // deterministic synthetic wire id on BOTH sides of the pair (the
+        // assistant tool call and the `tool` message). Without that
+        // normalization the typed denial could not be continued at all (the
+        // builder rejected every blank result id) and the model would never
+        // see WHY its call was refused.
+        val backend = CountingBackend()
+        val s = slice(backend = backend, maxCallsPerTurn = 2)
+        val calls = listOf(call(id = ""), call(id = "call-2"))
+        val results = s.execute(calls)
+        val msgs = s.continuationMessages(calls, results)
+        assertEquals(3, msgs.size)
+        assertEquals("assistant", msgs[0].role)
+        val wireIds = msgs[0].toolCalls.map { it.id }
+        assertEquals(2, wireIds.size)
+        // No blank id on the wire, and the blank call keeps its own
+        // deterministic synthetic id (the sibling keeps its own id).
+        assertTrue("wire ids must never be blank", wireIds.all { it.isNotBlank() })
+        assertEquals(SafeToolSlice.blankWireCallId(0), wireIds[0])
+        assertEquals("call-2", wireIds[1])
+        // Both sides of each pair carry the SAME id (the pairing validator
+        // compares them).
+        assertEquals(wireIds[0], msgs[1].toolCallId)
+        assertEquals(wireIds[1], msgs[2].toolCallId)
+        // The denial receipt rides the `tool` message and names the same
+        // synthetic id — no blank id anywhere in the wire payload.
+        assertTrue(msgs[1].text.contains(SafeToolSlice.DenyCodes.SCHEMA_INVALID))
+        assertFalse("no blank call id may ride the wire", msgs[1].text.contains("\"callId\":\"\""))
+        assertEquals(
+            wireIds[0],
+            Json.parseToJsonElement(msgs[1].text).jsonObject["callId"]!!.jsonPrimitive.content,
+        )
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun blankResultIdIsOnlyPairedWithABlankCall() {
+        // The pairing rule is index-exact and one-directional: a BLANK
+        // result id may only belong to a BLANK call (it then inherits that
+        // call's synthetic wire id). A blank result against a non-blank
+        // call, or a non-blank result against a blank call, is an
+        // IllegalArgumentException — an orphan pair would fail the provider
+        // pairing validator non-retryably AFTER the calls already ran.
+        val s = slice()
+        // Blank result against a non-blank call → IAE.
+        assertThrows(IllegalArgumentException::class.java) {
+            s.continuationMessages(
+                listOf(call(id = "call-1")),
+                listOf(SafeToolSlice.ToolResult("", "lsp.symbols", "{}")),
+            )
+        }
+        // Non-blank result against a blank call → IAE (the ids would not
+        // pair after the blank call is re-bound to its synthetic id).
+        assertThrows(IllegalArgumentException::class.java) {
+            s.continuationMessages(
+                listOf(call(id = "")),
+                listOf(SafeToolSlice.ToolResult("call-9", "lsp.symbols", "{}")),
+            )
+        }
+        // The matching pair (blank call + blank result) builds and inherits
+        // the synthetic wire id (the pin is discriminating).
+        val ok = s.continuationMessages(
+            listOf(call(id = "")),
+            listOf(SafeToolSlice.ToolResult("", "lsp.symbols", "{}")),
+        )
+        assertEquals(2, ok.size)
+        assertEquals(SafeToolSlice.blankWireCallId(0), ok[0].toolCalls.single().id)
+        assertEquals(SafeToolSlice.blankWireCallId(0), ok[1].toolCallId)
+        // A synthetic id that collides with a model-supplied id is RE-BOUND
+        // (deterministically), NOT fatal: the model id keeps its own slot
+        // and the synthetic id gets the `_2` suffix, so the wire ids stay
+        // unique (a duplicate `call`/`tool` pair would fail the provider
+        // pairing validator non-retryably) and the round stays continuable.
+        val collided = s.continuationMessages(
+            listOf(call(id = ""), call(id = SafeToolSlice.blankWireCallId(0))),
+            listOf(
+                SafeToolSlice.ToolResult("", "lsp.symbols", "{}"),
+                SafeToolSlice.ToolResult(SafeToolSlice.blankWireCallId(0), "lsp.symbols", "{}"),
+            ),
+        )
+        assertEquals(3, collided.size)
+        val collidedIds = collided[0].toolCalls.map { it.id }
+        assertEquals(SafeToolSlice.blankWireCallId(0) + "_2", collidedIds[0])
+        assertEquals(SafeToolSlice.blankWireCallId(0), collidedIds[1])
+        // Both sides of each pair carry the SAME id (the pairing validator
+        // compares them).
+        assertEquals(collidedIds[0], collided[1].toolCallId)
+        assertEquals(collidedIds[1], collided[2].toolCallId)
+    }
+
+    @Test fun continuationMessagesRejectsMismatchedCallResultPairing() {
+        // Same size is NOT enough: a result whose callId does not match the
+        // call at the same index would build an orphan pair (a `tool` message
+        // with no matching assistant tool call), which the provider pairing
+        // validator rejects non-retryably AFTER the calls already ran.
+        val s = slice()
+        val calls = listOf(call(id = "call-1"), call(id = "call-2"))
+        val swapped = listOf(
+            SafeToolSlice.ToolResult("call-2", "lsp.symbols", "{}"),
+            SafeToolSlice.ToolResult("call-1", "lsp.symbols", "{}"),
+        )
+        val e = assertThrows(IllegalArgumentException::class.java) {
+            s.continuationMessages(calls, swapped)
+        }
+        // Fixed message: the raw ids must not leak into the exception text.
+        assertFalse("raw ids must not leak: ${e.message}", e.message!!.contains("call-1"))
+        assertFalse("raw ids must not leak: ${e.message}", e.message!!.contains("call-2"))
+        // A blank result call id is equally unpairable.
+        assertThrows(IllegalArgumentException::class.java) {
+            s.continuationMessages(
+                calls,
+                listOf(
+                    SafeToolSlice.ToolResult("call-1", "lsp.symbols", "{}"),
+                    SafeToolSlice.ToolResult("   ", "lsp.symbols", "{}"),
+                ),
+            )
+        }
+        // The correctly paired round still builds (the pin is discriminating).
+        val ok = s.continuationMessages(
+            calls,
+            listOf(
+                SafeToolSlice.ToolResult("call-1", "lsp.symbols", "{}"),
+                SafeToolSlice.ToolResult("call-2", "lsp.symbols", "{}"),
+            ),
+        )
+        assertEquals(3, ok.size)
+        assertEquals("call-1", ok[1].toolCallId)
+        assertEquals("call-2", ok[2].toolCallId)
     }
 
     @Test fun hugeBackendFieldsAreOmittedBeforeRedaction() = runBlocking {
@@ -1092,7 +1501,7 @@ class SafeToolSliceTest {
      * surrogate must be immediately followed by its low partner; a low
      * surrogate must be immediately preceded by its high partner). The
      * capped strings are UTF-16-unit-safe only when this holds — a lone
-     * surrogate degrades to U+FFFD at UTF-8 encode.
+     * surrogate is encoded as `?` (0x3F) at UTF-8 encode (not U+FFFD).
      */
     private fun assertNoLoneSurrogate(s: String) {
         var i = 0
@@ -1184,22 +1593,33 @@ class SafeToolSliceTest {
     @Test fun surrogateCapAppliesToCallIdEchoesToo() = runBlocking {
         // The same bounded-id helper governs the call-id wire forms (deny/ok
         // receipt + continuation re-bind): an emoji near the cap is not split,
-        // and the hash suffix keeps the capped id within the cap and distinct
-        // (the capped prefix here ends before the pair, so the full cap is
-        // usable).
+        // and the hash suffix keeps the capped id within the cap and distinct.
+        //
+        // The prefix cut is DERIVED from the suffix length (never hard-coded):
+        // the bounded id is `cappedTake(id, MAX_STRING_CHARS - suffix.length) +
+        // suffix`, so the cut sits at `MAX_STRING_CHARS - PAIRING_SUFFIX_CHARS`
+        // for the `#` + 32-hex (128-bit) suffix. Placing the pair exactly
+        // across that cut is the only way to prove the step-back logic (a
+        // plain `take` at the cut would split the pair and emit a lone
+        // surrogate).
         val emoji = "\uD83D\uDE00"
-        // Place the pair exactly across the capped-prefix boundary: the cap
-        // reserves 9 chars for the hash suffix, so the prefix cut is at 491
-        // and the high surrogate sits at index 490. A plain take(491) would
-        // split the pair and this test would emit a lone surrogate.
-        val emojiId = "I".repeat(490) + emoji + "I".repeat(20)
+        val suffixLength = SafeToolSlice.PAIRING_SUFFIX_CHARS
+        assertEquals("# + 32 hex chars", 1 + 32, suffixLength)
+        val prefixCut = SafeToolSlice.MAX_STRING_CHARS - suffixLength
+        // The high surrogate sits at the cut position (index prefixCut-1).
+        val emojiId = "I".repeat(prefixCut - 1) + emoji + "I".repeat(100)
+        assertTrue("the raw id must exceed the cap", emojiId.length > SafeToolSlice.MAX_STRING_CHARS)
         val s = slice(backend = CountingBackend())
         val unknown = s.execute(listOf(call(id = emojiId, name = "nope.tool"))).single()
         assertTrue(unknown.denied)
         assertNoLoneSurrogate(unknown.resultJson)
         val denyBody = Json.parseToJsonElement(unknown.resultJson).jsonObject
-        assertEquals(SafeToolSlice.MAX_STRING_CHARS - 1, denyBody["callId"]!!.jsonPrimitive.content.length)
-        assertNoLoneSurrogate(denyBody["callId"]!!.jsonPrimitive.content)
+        val denyId = denyBody["callId"]!!.jsonPrimitive.content
+        // Split case: the pair stepped out intact, so the wire id is one unit
+        // short of the cap (the suffix rides in the freed unit).
+        assertEquals(SafeToolSlice.MAX_STRING_CHARS - 1, denyId.length)
+        assertNoLoneSurrogate(denyId)
+        assertTrue("the hash suffix must survive", Regex("#[0-9a-f]{${SafeToolSlice.PAIRING_SUFFIX_CHARS - 1}}$").containsMatchIn(denyId))
         // Internal pairing keeps the full id; the continuation re-bind uses
         // the same bounded, surrogate-safe form.
         assertEquals(emojiId, unknown.callId)

@@ -287,6 +287,19 @@ class ApkPolicyHarness(unittest.TestCase):
         aapt.write_text(
             "#!/bin/sh\n"
             "set -eu\n"
+            "# Member-path normalization: the release artifact obfuscates the\n"
+            "# compiled entry names (res/xml/backup_rules.xml -> res/Qq.xml).\n"
+            "# The scanner resolves the ACTUAL compiled path via aapt2 and\n"
+            "# passes THAT to `aapt dump xmltree`, so this fake folds the three\n"
+            "# known obfuscated spellings back onto the canonical member names\n"
+            "# the dump dispatch below is written against. Anything else (e.g.\n"
+            "# AndroidManifest.xml) passes through unchanged.\n"
+            "MEMBER=\"${4:-}\"\n"
+            "case \"$MEMBER\" in\n"
+            "  res/Qq.xml) MEMBER=res/xml/backup_rules.xml ;;\n"
+            "  res/4j.xml) MEMBER=res/xml/data_extraction_rules.xml ;;\n"
+            "  res/8G.xml) MEMBER=res/xml/network_security_config.xml ;;\n"
+            "esac\n"
             "case \"${FAKE_AAPT_MODE:-ok}\" in\n"
             "  error) echo 'synthetic aapt parse failure' >&2; exit 23 ;;\n"
             "  empty) exit 0 ;;\n"
@@ -302,7 +315,7 @@ class ApkPolicyHarness(unittest.TestCase):
             "      printf '%s\\n' \"uses-permission: android.permission.${token}\"\n"
             "    done ;;\n"
             "  'dump xmltree')\n"
-            "    if [ \"${4:-}\" = \"res/xml/network_security_config.xml\" ]; then\n"
+            "    if [ \"${MEMBER}\" = \"res/xml/network_security_config.xml\" ]; then\n"
             "      # Compiled-NSC fixtures mirror the real aapt v1 xmltree shape\n"
             "      # (measured on a real debug APK): two-space depth steps,\n"
             "      # booleans as (type 0x12)0x0 / 0xffffffff, strings as\n"
@@ -487,7 +500,7 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '  E: base-config (line=2)' \\\n"
             "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' ;;\n"
             "      esac\n"
-            "    elif [ \"${4:-}\" = \"res/xml/backup_rules.xml\" ] || [ \"${4:-}\" = \"res/xml/data_extraction_rules.xml\" ]; then\n"
+            "    elif [ \"${MEMBER}\" = \"res/xml/backup_rules.xml\" ] || [ \"${MEMBER}\" = \"res/xml/data_extraction_rules.xml\" ]; then\n"
             "      # Compiled backup-rules fixtures mirror the real aapt v1 xmltree\n"
             "      # shape: rule attributes carry NO namespace, so they print\n"
             "      # exactly like the NSC src attribute does (A: domain=\"x\"\n"
@@ -499,13 +512,13 @@ class ApkPolicyHarness(unittest.TestCase):
             "          # Missing-compiled-resource surface: the ERROR line goes to\n"
             "          # STDOUT and builds differ on the exit status - fail closed\n"
             "          # via the tree parser, exactly like the NSC control.\n"
-            "          printf 'ERROR: dump failed because resource %s not found\\n' \"${4##*/}\" ;;\n"
+            "          printf 'ERROR: dump failed because resource %s not found\\n' \"${MEMBER##*/}\" ;;\n"
             "        empty) : ;;\n"
             "        missing-one)\n"
             "          # The file/librepocket_keysets exclude drops out of EVERY\n"
             "          # section: the exact-set rule must reject the compiled\n"
             "          # bytes in both members (dump succeeds, content differs).\n"
-            "          if [ \"${4:-}\" = \"res/xml/backup_rules.xml\" ]; then\n"
+            "          if [ \"${MEMBER}\" = \"res/xml/backup_rules.xml\" ]; then\n"
             "            printf '%s\\n' \\\n"
             "              'E: full-backup-content (line=1)' \\\n"
             "              '  E: exclude (line=2)' \\\n"
@@ -556,7 +569,7 @@ class ApkPolicyHarness(unittest.TestCase):
             "          # to EVERY section: the exact-set rule must reject the\n"
             "          # compiled bytes in both members (dump succeeds, content\n"
             "          # differs).\n"
-            "          if [ \"${4:-}\" = \"res/xml/backup_rules.xml\" ]; then\n"
+            "          if [ \"${MEMBER}\" = \"res/xml/backup_rules.xml\" ]; then\n"
             "            printf '%s\\n' \\\n"
             "              'E: full-backup-content (line=1)' \\\n"
             "              '  E: exclude (line=2)' \\\n"
@@ -623,7 +636,7 @@ class ApkPolicyHarness(unittest.TestCase):
             "          # Android 16 QPR2's third PLATFORM section inside the\n"
             "          # COMPILED bytes: the validate_tree parity must refuse it\n"
             "          # regardless of the section's content (undecided policy).\n"
-            "          if [ \"${4:-}\" = \"res/xml/data_extraction_rules.xml\" ]; then\n"
+            "          if [ \"${MEMBER}\" = \"res/xml/data_extraction_rules.xml\" ]; then\n"
             "            printf '%s\\n' \\\n"
             "              'E: data-extraction-rules (line=1)' \\\n"
             "              '  E: cloud-backup (line=2)' \\\n"
@@ -684,7 +697,7 @@ class ApkPolicyHarness(unittest.TestCase):
             "        *)  # ok (default): exactly the REQUIRED_EXCLUDES set under\n"
             "            # both roots, so the default artifacts stay positive\n"
             "            # controls for the compiled-bytes authority\n"
-            "          if [ \"${4:-}\" = \"res/xml/backup_rules.xml\" ]; then\n"
+            "          if [ \"${MEMBER}\" = \"res/xml/backup_rules.xml\" ]; then\n"
             "            printf '%s\\n' \\\n"
             "              'E: full-backup-content (line=1)' \\\n"
             "              '  E: exclude (line=2)' \\\n"
@@ -954,6 +967,69 @@ class ApkPolicyHarness(unittest.TestCase):
         )
         aapt.chmod(0o755)
 
+    def _write_fake_aapt2(self) -> Path:
+        """Write the sibling aapt2 the compiled-member resolver derives.
+
+        Only the tests that exercise NAME-based compiled-member resolution
+        install it: the default harness leaves the build-tools directory
+        without aapt2, so every pre-existing test keeps running the
+        fixed-canonical-path fallback (behavior unchanged). Modes:
+
+          * ok (default): the canonical real names, as a debug build stores
+            them (`res/xml/backup_rules.xml` ...);
+          * release: the obfuscated short names a release build stores
+            (`res/Qq.xml`, `res/4j.xml`, `res/8G.xml`) - the fixture mirrors
+            the measured build-tools 35/36 output shape (header line then an
+            indented `() (file) <path> type=XML` line);
+          * missing-name: no entry for the pinned names;
+          * no-file: the header exists but carries no `(file)` value;
+          * ambiguous: two default-config file values for one name;
+          * error: aapt2 exits nonzero (fail-closed resolution).
+        """
+        aapt2 = self.build_tools / "aapt2"
+        aapt2.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "case \"${1:-} ${2:-}\" in\n"
+            "  'dump resources')\n"
+            "    case \"${FAKE_AAPT2_MODE:-ok}\" in\n"
+            "      error) echo 'synthetic aapt2 dump failure' >&2; exit 41 ;;\n"
+            "      missing-name)\n"
+            "        printf '%s\\n' \\\n"
+            "          '    resource 0x7f0100ff xml/something_else' \\\n"
+            "          '      () (file) res/zz.xml type=XML' ;;\n"
+            "      no-file)\n"
+            "        printf '%s\\n' \\\n"
+            "          '    resource 0x7f010000 xml/backup_rules' ;;\n"
+            "      ambiguous)\n"
+            "        printf '%s\\n' \\\n"
+            "          '    resource 0x7f010000 xml/backup_rules' \\\n"
+            "          '      () (file) res/Qq.xml type=XML' \\\n"
+            "          '      () (file) res/Qq2.xml type=XML' ;;\n"
+            "      release)\n"
+            "        printf '%s\\n' \\\n"
+            "          '    resource 0x7f010000 xml/backup_rules' \\\n"
+            "          '      () (file) res/Qq.xml type=XML' \\\n"
+            "          '    resource 0x7f010001 xml/data_extraction_rules' \\\n"
+            "          '      () (file) res/4j.xml type=XML' \\\n"
+            "          '    resource 0x7f010002 xml/network_security_config' \\\n"
+            "          '      () (file) res/8G.xml type=XML' ;;\n"
+            "      *)  # ok: canonical real names (the debug artifact shape)\n"
+            "        printf '%s\\n' \\\n"
+            "          '    resource 0x7f010000 xml/backup_rules' \\\n"
+            "          '      () (file) res/xml/backup_rules.xml type=XML' \\\n"
+            "          '    resource 0x7f010001 xml/data_extraction_rules' \\\n"
+            "          '      () (file) res/xml/data_extraction_rules.xml type=XML' \\\n"
+            "          '    resource 0x7f010002 xml/network_security_config' \\\n"
+            "          '      () (file) res/xml/network_security_config.xml type=XML' ;;\n"
+            "    esac ;;\n"
+            "  *) echo 'unexpected fake aapt2 invocation' >&2; exit 42 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        aapt2.chmod(0o755)
+        return aapt2
+
     def _write_dexdump(self) -> None:
         self.dexdump_path.write_text(
             "#!/bin/sh\n"
@@ -994,6 +1070,7 @@ class ApkPolicyHarness(unittest.TestCase):
         sdk: Path | None = None,
         path: str | None = None,
         aapt_mode: str = "ok",
+        aapt2_mode: str = "ok",
         dexdump_mode: str = "ok",
         xmltree_mode: str = "bindings",
         resources_mode: str = "table",
@@ -1009,6 +1086,7 @@ class ApkPolicyHarness(unittest.TestCase):
                 "HOME": str(self.home),
                 "PATH": path if path is not None else f"{self.fake_bin}:/usr/bin:/bin",
                 "FAKE_AAPT_MODE": aapt_mode,
+                "FAKE_AAPT2_MODE": aapt2_mode,
                 "FAKE_DEXDUMP_MODE": dexdump_mode,
                 "FAKE_AAPT_XMLTREE": xmltree_mode,
                 "FAKE_AAPT_RESOURCES": resources_mode,
@@ -1029,6 +1107,7 @@ class ApkPolicyHarness(unittest.TestCase):
         foss: bool = False,
         aapt_override: str | None = None,
         aapt_mode: str = "ok",
+        aapt2_mode: str = "ok",
         dexdump_mode: str = "ok",
         xmltree_mode: str = "bindings",
         resources_mode: str = "table",
@@ -1054,6 +1133,7 @@ class ApkPolicyHarness(unittest.TestCase):
                 sdk=sdk,
                 path=path,
                 aapt_mode=aapt_mode,
+                aapt2_mode=aapt2_mode,
                 dexdump_mode=dexdump_mode,
                 xmltree_mode=xmltree_mode,
                 resources_mode=resources_mode,
@@ -1833,6 +1913,333 @@ class ApkPolicyHarness(unittest.TestCase):
             # required excludes are refused, not tolerated.
             self.assertIs(engine_call.kwargs.get("exact_excludes"), True)
 
+    # -- compiled-member path resolution (release resource-name obfuscation) --
+
+    _RELEASE_MEMBER_DUMP = (
+        "    resource 0x7f0b0000 xml/backup_rules\n"
+        "      () (file) res/Qq.xml type=XML\n"
+        "    resource 0x7f0b0001 xml/data_extraction_rules\n"
+        "      () (file) res/4j.xml type=XML\n"
+        "    resource 0x7f0b0002 xml/network_security_config\n"
+        "      () (file) res/8G.xml type=XML\n"
+    )
+
+    def _release_member_apk(self, name: str) -> Path:
+        # A release-shaped artifact: the compiled xml members live under the
+        # obfuscated short names an AGP release build emits. The member bytes
+        # are irrelevant here (the fake aapt does not read them); the archive
+        # listing is what the resolver's existence proof consults.
+        return write_apk(
+            self.tmp / name,
+            {
+                "AndroidManifest.xml": b"synthetic compiled manifest fixture",
+                "classes.dex": minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+                "res/Qq.xml": b"compiled backup rules",
+                "res/4j.xml": b"compiled data extraction rules",
+                "res/8G.xml": b"compiled network security config",
+            },
+        )
+
+    def test_aapt2_resource_paths_parse_name_to_path(self) -> None:
+        # Measured aapt2 grammar (build-tools 35/36 identical): a header line
+        # `resource <id> <type>/<name>` followed by an indented
+        # `(<config>) (<kind>) <value> type=<vtype>` value line. Only (file)
+        # values name compiled members; banner lines and non-file values
+        # (attr/string8) must never leak into the map.
+        # Headers with non-0x7f package IDs (e.g. library dependencies) are
+        # skipped so foreign resources never collide or enter the table.
+        dump = (
+            "Binary APK\n"
+            "Package name=dev.librepocket.agent id=7f\n"
+            "  type attr id=01 entryCount=2\n"
+            "    resource 0x7f010000 attr/alpha\n"
+            "      () (attr) type=float\n"
+            "    resource 0x7f010001 attr/label\n"
+            '      () (string8) "x" type=string\n'
+            "  type xml id=0b entryCount=3\n"
+            "    resource 0x7f0b0000 xml/backup_rules\n"
+            "      () (file) res/Qq.xml type=XML\n"
+            "    resource 0x7f0b0001 xml/data_extraction_rules\n"
+            "      () (file) res/4j.xml type=XML\n"
+            "    resource 0x7f0b0002 xml/network_security_config\n"
+            "      (en) (file) res/8G-en.xml type=XML\n"
+            "      () (file) res/8G.xml type=XML\n"
+            "Package name=com.example.foreign id=80\n"
+            "  type xml id=0b entryCount=2\n"
+            "    resource 0x800b0000 xml/foreign_rules\n"
+            "      () (file) res/foreign.xml type=XML\n"
+            "    resource 0x800b0001 xml/backup_rules\n"
+            "      () (file) res/foreign_backup.xml type=XML\n"
+        )
+        table = policy_inspect._parse_aapt2_resource_paths(dump)
+        self.assertEqual(table["xml/backup_rules"], [("", "res/Qq.xml")])
+        self.assertEqual(table["xml/data_extraction_rules"], [("", "res/4j.xml")])
+        # Every (file) value under 0x7f is kept in dump order.
+        self.assertEqual(
+            table["xml/network_security_config"],
+            [("en", "res/8G-en.xml"), ("", "res/8G.xml")],
+        )
+        # Non-file resources are indexed with no file values (fail-closed
+        # shape, not a missing key).
+        self.assertEqual(table["attr/alpha"], [])
+        self.assertEqual(table["attr/label"], [])
+        # Non-0x7f resources are completely ignored and not indexed in table.
+        self.assertNotIn("xml/foreign_rules", table)
+
+    def test_resolve_compiled_member_path_rejects_multi_configuration_split(self) -> None:
+        apk = write_apk(
+            self.tmp / "resolve.apk",
+            {
+                "res/Qq.xml": b"x",
+                "res/4j.xml": b"w",
+                "res/8G.xml": b"z",
+                "res/8G-en.xml": b"y",
+            },
+        )
+        dump = self._RELEASE_MEMBER_DUMP.replace(
+            "      () (file) res/8G.xml type=XML\n",
+            "      (en) (file) res/8G-en.xml type=XML\n"
+            "      () (file) res/8G.xml type=XML\n",
+        )
+        resolve = lambda member: policy_inspect._resolve_compiled_member_path(
+            lambda: dump, member, apk
+        )
+        self.assertEqual(resolve("res/xml/backup_rules.xml"), "res/Qq.xml")
+        self.assertEqual(resolve("res/xml/data_extraction_rules.xml"), "res/4j.xml")
+        # Multi-config (en, default): strictly rejected to prevent configuration-split bypass.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            r"aapt2 resources table lists 2 configurations for @xml/network_security_config "
+            r"\(en, default\); security policy resources must define exactly one "
+            r"configuration to prevent configuration-split bypass",
+        ):
+            resolve("res/xml/network_security_config.xml")
+
+    def test_resolve_compiled_member_path_fail_closed(self) -> None:
+        apk = write_apk(
+            self.tmp / "resolve-fail.apk",
+            {"res/Qq.xml": b"x", "res/4j.xml": b"y", "res/8G.xml": b"z"},
+        )
+
+        def resolve(dump: str, member: str) -> str:
+            return policy_inspect._resolve_compiled_member_path(
+                lambda: dump, member, apk
+            )
+
+        # Name absent from the table -> named fail-closed (NO fallback to the
+        # canonical path, which would be a silent skip).
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            r"carries no compiled member for @xml/backup_rules",
+        ):
+            resolve(
+                "    resource 0x7f0b0000 xml/something_else\n"
+                "      () (file) res/zz.xml type=XML\n",
+                "res/xml/backup_rules.xml",
+            )
+        # Header present but no (file) value -> named fail-closed.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, r"carries no compiled member"
+        ):
+            resolve(
+                "    resource 0x7f0b0000 xml/backup_rules\n",
+                "res/xml/backup_rules.xml",
+            )
+        # Resolved path missing from the archive -> named fail-closed.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, r"the APK carries no such member"
+        ):
+            resolve(
+                "    resource 0x7f0b0000 xml/backup_rules\n"
+                "      () (file) res/NOPE.xml type=XML\n",
+                "res/xml/backup_rules.xml",
+            )
+        # Several default-config paths -> configuration-split bypass rejected.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            r"lists 2 configurations for @xml/backup_rules \(default, default\); "
+            r"security policy resources must define exactly one configuration to prevent configuration-split bypass",
+        ):
+            resolve(
+                "    resource 0x7f0b0000 xml/backup_rules\n"
+                "      () (file) res/Qq.xml type=XML\n"
+                "      () (file) res/Qq2.xml type=XML\n",
+                "res/xml/backup_rules.xml",
+            )
+        # Qualified configuration split (e.g. default vs v31) -> rejected.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            r"lists 2 configurations for @xml/backup_rules \(default, v31\); "
+            r"security policy resources must define exactly one configuration to prevent configuration-split bypass",
+        ):
+            resolve(
+                "    resource 0x7f0b0000 xml/backup_rules\n"
+                "      () (file) res/Qq.xml type=XML\n"
+                "      (v31) (file) res/Qq-v31.xml type=XML\n",
+                "res/xml/backup_rules.xml",
+            )
+        # A non-canonical member shape is a wiring defect, never coerced.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError,
+            r"unsupported canonical resource member shape",
+        ):
+            policy_inspect._canonical_member_resource("res/backup_rules.xml")
+
+    def test_compiled_member_resolver_derives_sibling_and_falls_back(self) -> None:
+        # No aapt2 beside the caller's aapt: the canonical path is returned
+        # unchanged so the caller's dump stays the fail-closed authority.
+        self.assertIsNone(
+            policy_inspect._aapt2_sibling(str(self.build_tools / "aapt"))
+        )
+        fallback = policy_inspect._compiled_member_resolver(
+            str(self.build_tools / "aapt"), self.tmp / "unused.apk"
+        )
+        self.assertEqual(
+            fallback("res/xml/backup_rules.xml"), "res/xml/backup_rules.xml"
+        )
+
+        # With the sibling aapt2 installed, the resolver reads the name->path
+        # table and returns the compiled (obfuscated) path.
+        aapt2 = self._write_fake_aapt2()
+        self.assertEqual(
+            policy_inspect._aapt2_sibling(str(self.build_tools / "aapt")),
+            str(aapt2),
+        )
+        apk = write_apk(self.tmp / "sibling.apk", {"res/Qq.xml": b"x"})
+        resolve = policy_inspect._compiled_member_resolver(
+            str(self.build_tools / "aapt"), apk
+        )
+        with mock.patch.dict(os.environ, {"FAKE_AAPT2_MODE": "release"}):
+            self.assertEqual(resolve("res/xml/backup_rules.xml"), "res/Qq.xml")
+
+    def test_compiled_member_resolver_memoizes_apk_members_listing(self) -> None:
+        self._write_fake_aapt2()
+        apk = self._release_member_apk("memoize-members.apk")
+        resolver = policy_inspect._compiled_member_resolver(
+            str(self.build_tools / "aapt"), apk
+        )
+        with mock.patch.dict(os.environ, {"FAKE_AAPT2_MODE": "release"}):
+            with mock.patch.object(
+                policy_inspect,
+                "_apk_member_names",
+                wraps=policy_inspect._apk_member_names,
+            ) as mocked_names:
+                self.assertEqual(resolver("res/xml/backup_rules.xml"), "res/Qq.xml")
+                self.assertEqual(
+                    resolver("res/xml/data_extraction_rules.xml"), "res/4j.xml"
+                )
+                self.assertEqual(
+                    resolver("res/xml/network_security_config.xml"), "res/8G.xml"
+                )
+                # Central directory listing is memoized across all 3 security resource checks:
+                self.assertEqual(mocked_names.call_count, 1)
+
+    def test_release_obfuscated_compiled_members_pass_via_aapt2(self) -> None:
+        # The release regression: the canonical res/xml/*.xml members do not
+        # exist in the artifact (obfuscated to res/Qq.xml / res/4j.xml /
+        # res/8G.xml). With the sibling aapt2 present the scanner resolves the
+        # real paths and BOTH compiled-XML authorities (backup rules + NSC)
+        # PASS through the fake aapt's dump of the obfuscated member.
+        self._write_fake_aapt2()
+        apk = self._release_member_apk("release-obfuscated.apk")
+        result = self._run_scanner_cli(apk, "play", aapt2_mode="release")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_debug_real_member_names_resolve_via_aapt2(self) -> None:
+        # Debug keeps the real names: the same resolver maps each canonical
+        # member to itself and the scan PASSES (aapt2 `ok` mode).
+        self._write_fake_aapt2()
+        apk = write_apk(
+            self.tmp / "debug-real-names.apk",
+            {
+                "AndroidManifest.xml": b"synthetic compiled manifest fixture",
+                "classes.dex": minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+                "res/xml/backup_rules.xml": b"compiled backup rules",
+                "res/xml/data_extraction_rules.xml": b"compiled data extraction rules",
+                "res/xml/network_security_config.xml": b"compiled nsc",
+            },
+        )
+        result = self._run_scanner_cli(apk, "play", aapt2_mode="ok")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_release_obfuscated_member_dump_failure_fails_closed(self) -> None:
+        # Even once the obfuscated path is resolved, a bad compiled dump still
+        # fails closed: the resolved member's ERROR line must reject.
+        self._write_fake_aapt2()
+        apk = self._release_member_apk("release-obfuscated-bad-dump.apk")
+        result = self._run_scanner_cli(
+            apk, "play", aapt2_mode="release", rules_mode="error"
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_release_aapt2_resolution_failures_fail_closed(self) -> None:
+        # aapt2 present but unable to prove the member path (nonzero exit,
+        # missing name, no file value, ambiguous configs) must reject with a
+        # named error - never a silent skip or a fallback that skips the gate.
+        self._write_fake_aapt2()
+        apk = self._release_member_apk("release-aapt2-unresolvable.apk")
+        for aapt2_mode in ("error", "missing-name", "no-file", "ambiguous"):
+            with self.subTest(aapt2_mode=aapt2_mode):
+                result = self._run_scanner_cli(
+                    apk, "play", aapt2_mode=aapt2_mode
+                )
+                self.assertNotEqual(
+                    result.returncode, 0, result.stderr + result.stdout
+                )
+
+    def test_compiled_authorities_dump_resolved_member_paths(self) -> None:
+        # In-process wiring proof: both compiled-XML authorities hand the
+        # RESOLVED member (not the canonical path) to `aapt dump xmltree`.
+        apk = write_apk(
+            self.tmp / "wired.apk",
+            {"res/Qq.xml": b"x", "res/4j.xml": b"y", "res/8G.xml": b"z"},
+        )
+        resolver = lambda member: policy_inspect._resolve_compiled_member_path(
+            lambda: self._RELEASE_MEMBER_DUMP, member, apk
+        )
+        recorded: list[list[str]] = []
+
+        def fake_bounded(command, label, max_bytes=0):
+            recorded.append(list(command))
+            return "E: stub (line=1)\n"
+
+        nsc_xmltree = (
+            "  E: application\n"
+            "    A: android:networkSecurityConfig(0x01010527)=@0x7f010002\n"
+        )
+        get_resources = lambda: (
+            "      spec resource 0x7f010002 "
+            "dev.librepocket.agent:xml/network_security_config: flags=0x00000000"
+        )
+        # Stub the tree parser and both rule engines so the wiring assertion
+        # is about the dumped OPERAND only: every resolved member must reach
+        # `aapt dump xmltree`, and the validation content is not under test.
+        with mock.patch.object(
+            policy_inspect, "_parse_aapt_xmltree", return_value=mock.MagicMock()
+        ), mock.patch.object(
+            policy_inspect, "_run_bounded_stdout", side_effect=fake_bounded
+        ), mock.patch.object(
+            policy_inspect._load_backup_rules_check(), "validate_tree", return_value=[]
+        ), mock.patch.object(
+            policy_inspect._load_nsc_rules(), "validate_tree", return_value=[]
+        ):
+            policy_inspect._assert_merged_backup_rules_bytes(
+                str(self.build_tools / "aapt"), apk, resolver
+            )
+            policy_inspect._assert_merged_network_security_config(
+                str(self.build_tools / "aapt"),
+                apk,
+                nsc_xmltree,
+                get_resources,
+                resolver,
+            )
+        dumped = [
+            command[4]
+            for command in recorded
+            if len(command) > 4 and command[1:3] == ["dump", "xmltree"]
+        ]
+        self.assertEqual(dumped, ["res/Qq.xml", "res/4j.xml", "res/8G.xml"])
+
     # -- github artifact mode (mode-independent authorities only) --
 
     def _run_scanner_cli(
@@ -1845,6 +2252,7 @@ class ApkPolicyHarness(unittest.TestCase):
         resources_mode: str = "table",
         nsc_mode: str = "ok",
         permissions: str = "",
+        aapt2_mode: str = "ok",
     ) -> subprocess.CompletedProcess[str]:
         env = self._env(
             rules_mode=rules_mode,
@@ -1852,6 +2260,7 @@ class ApkPolicyHarness(unittest.TestCase):
             resources_mode=resources_mode,
             nsc_mode=nsc_mode,
             permissions=permissions,
+            aapt2_mode=aapt2_mode,
         )
         return subprocess.run(
             [

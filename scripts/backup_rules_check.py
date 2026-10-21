@@ -73,11 +73,13 @@ This module parses the XML with the stdlib parser and enforces:
 The artifact-level scanner (``scripts/apk_policy_inspect.py``) reuses the
 SAME engine for the compiled bytes: ``ARTIFACT_RULE_MEMBERS`` names the
 canonical resource members (``res/xml/backup_rules.xml``,
-``res/xml/data_extraction_rules.xml``); the scanner dumps them via
-``aapt dump xmltree``, rebuilds the tree and calls ``validate_tree`` with
-``exact_excludes=True`` - the compiled exclude set must equal
-``REQUIRED_EXCLUDES`` EXACTLY (missing AND unexpected entries are failures,
-order-free). Source-level presence-only validation cannot see such a rewrite.
+``res/xml/data_extraction_rules.xml``); the scanner resolves each to the
+artifact's actual compiled path by NAME (release obfuscation renames the
+entry), dumps it via ``aapt dump xmltree``, rebuilds the tree and calls
+``validate_tree`` with ``exact_excludes=True`` - the compiled exclude set
+must equal ``REQUIRED_EXCLUDES`` EXACTLY (missing AND unexpected entries are
+failures, order-free). Source-level presence-only validation cannot see such
+a rewrite.
 
 It is invoked by the shell gate and is directly unit-tested against negative
 fixtures. Run with:
@@ -111,11 +113,14 @@ EXPECTED_ROOT_BACKUP_RULES = "full-backup-content"
 EXPECTED_ROOT_DATA_EXTRACTION = "data-extraction-rules"
 
 # Artifact-level scan targets (consumed by ``apk_policy_inspect.py``): the
-# COMPILED rule resources are addressed by their canonical res/ member path
-# (aapt v1 xmltree only resolves that form - the same constraint the NSC
-# member pin works under), each paired with the root the runtime expects for
-# that filename. The catalog pins the filenames↔roots here so the artifact
-# scanner and the gate can never drift apart.
+# COMPILED rule resources are pinned by their canonical res/<type>/<name>.xml
+# member, each paired with the root the runtime expects for that filename. The
+# scanner resolves that canonical member to the ACTUAL compiled path by
+# resource NAME through aapt2 before dumping it (an AGP release build
+# obfuscates entry names, e.g. res/xml/backup_rules.xml -> res/Qq.xml); the
+# canonical spelling is the stable label and the fixed-path fallback when no
+# aapt2 can be derived. The catalog pins the filenames↔roots here so the
+# artifact scanner and the gate can never drift apart.
 ARTIFACT_RULE_MEMBERS: tuple[tuple[str, str], ...] = (
     ("res/xml/backup_rules.xml", EXPECTED_ROOT_BACKUP_RULES),
     ("res/xml/data_extraction_rules.xml", EXPECTED_ROOT_DATA_EXTRACTION),

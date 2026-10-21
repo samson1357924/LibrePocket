@@ -59,7 +59,12 @@ alone. So both compiled resources are dumped with ``aapt dump xmltree``,
 rebuilt into trees, and re-validated by the source gate's own engine
 (``backup_rules_check.validate_tree``) demanding the EXACT
 ``REQUIRED_EXCLUDES`` set (BackupPolicy.KEY_FILES_EXCLUDED, order-free): a
-dump failure, a missing entry, or a set difference fails closed.
+dump failure, a missing entry, or a set difference fails closed. The member
+path dumped is resolved by RESOURCE NAME through the sibling aapt2
+(``_compiled_member_resolver``): an AGP release build obfuscates the
+compiled entry names (``res/xml/backup_rules.xml`` becomes ``res/Qq.xml``),
+so the canonical path is only the label/fallback, never a hard-coded dump
+operand.
 
 Modes: ``--mode play`` / ``--mode foss`` run every scanner policy.  The
 additional ``--mode github`` runs ONLY the mode-independent artifact
@@ -149,10 +154,11 @@ _BACKUP_BINDING_ATTRS: tuple[tuple[str, str, str], ...] = (
 # guessed): android:networkSecurityConfig = 0x01010527,
 # android:debuggable = 0x0101000f. The resource NAME is the pin from
 # nsc_check.py EXPECTED_MANIFEST_RESOURCE ("@xml/network_security_config" minus
-# the "@xml/" prefix); aapt v1 xmltree only resolves the compiled member by its
-# canonical res/<type>/<name> path (a literal 0x… id or type/name form answers
-# "resource ... not found"), so the tree dump goes through that path after the
-# id↔name mapping is proven against the resources table.
+# the "@xml/" prefix); _NETWORK_SECURITY_MEMBER is the CANONICAL member the
+# tree dump labels itself with and the fixed-path fallback, while the path
+# actually handed to ``aapt dump xmltree`` is resolved by NAME through aapt2
+# (see _compiled_member_resolver) because a release build obfuscates the
+# compiled entry name.
 _NETWORK_SECURITY_ATTR_NAME = "networkSecurityConfig"
 _NETWORK_SECURITY_ATTR_ID = "0x01010527"
 _NETWORK_SECURITY_RESOURCE = "network_security_config"
@@ -781,6 +787,264 @@ def _resources_dump_resolver(aapt: str, apk: Path) -> Callable[[], str]:
     return resolve
 
 
+# Compiled-member path resolution (release resource-name obfuscation).
+#
+# An AGP RELEASE build obfuscates resource entry names: the compiled
+# ``res/xml/backup_rules.xml`` is stored under a short name (``res/Qq.xml``),
+# so the fixed canonical path the scanner used to hand to ``aapt dump
+# xmltree`` no longer exists in the release APK and the dump fails
+# ("resource res/xml/backup_rules.xml not found"). The debug APK keeps the
+# real names, which is why only the release gate broke.
+#
+# aapt v1's ``dump resources`` NEVER prints res/ member paths (debug and
+# release alike): it only prints the id↔name pairing. aapt2's ``dump
+# resources`` DOES print the compiled member path per configuration, so the
+# scanner derives the sibling aapt2 from the caller-pinned aapt and reads the
+# name→path mapping there.
+#
+# Measured aapt2 grammar (build-tools 35.0.0 and 36.0.0 print the identical
+# shape; only the value differs between the obfuscated release and the
+# unobfuscated debug artifact):
+#
+#     resource 0x7f0b0000 xml/backup_rules
+#       () (file) res/Qq.xml type=XML
+#
+# The header carries ``<type>/<name>`` with NO package prefix; every following
+# indented line carries ``(<config>) (<kind>) <value> type=<value-type>``.
+# Only ``(file)`` values name a compiled archive member, and security policy
+# resources (backup_rules, data_extraction_rules, network_security_config) must
+# define exactly one configuration to prevent configuration-split bypass.
+# Non-file values (``(string8) "…"``, ``(attr)``, ``(enum)``,
+# ``(reference)``…) and nested enum/flag lines are ignored: they never match
+# the file grammar. The parse tolerates the version drift actually observed
+# (identical 35/36) and is fail-closed on everything else - a header that
+# does not match, a non-0x7f package resource, a name with no file value,
+# multiple configurations (configuration-split bypass attempt), or a resolved
+# path absent from the APK archive all raise ``PolicyError`` rather than
+# silently falling back to a path that may not exist.
+_AAPT2_RESOURCE_HEADER = re.compile(
+    r"^\s*resource\s+(0x7[fF][0-9a-fA-F]{6})\s+([A-Za-z0-9_]+/[A-Za-z0-9_.]+)\s*$"
+)
+_AAPT2_OTHER_RESOURCE_HEADER = re.compile(
+    r"^\s*resource\s+0x[0-9a-fA-F]+\s+"
+)
+_AAPT2_RESOURCE_FILE = re.compile(
+    r"^\s*\(([^)]*)\)\s+\(file\)\s+(\S+)(?:\s+type=\S+)?\s*$"
+)
+
+
+def _aapt2_sibling(aapt: str) -> str | None:
+    """Derive the aapt2 shipped beside the caller-pinned aapt, or ``None``.
+
+    The gate's aapt and aapt2 always live in the SAME build-tools directory
+    (``…/build-tools/<ver>/aapt`` and ``…/aapt2``), including when the release
+    verifier pins its aapt explicitly. Both the literal parent and the
+    symlink-resolved parent are probed so a wrapped/symlinked caller path
+    still finds the sibling. A missing or non-executable aapt2 is NOT an
+    error here: the caller then falls back to the canonical member path and
+    the dump itself stays the fail-closed authority.
+    """
+    directories: list[Path] = []
+    for directory in (Path(aapt).parent, Path(os.path.realpath(aapt)).parent):
+        if directory not in directories:
+            directories.append(directory)
+    for directory in directories:
+        for name in ("aapt2", "aapt2.exe"):
+            tool = directory / name
+            if tool.is_file() and os.access(tool, os.X_OK):
+                return str(tool)
+    return None
+
+
+def _aapt2_resources_dump_resolver(aapt2: str, apk: Path) -> Callable[[], str]:
+    """One bounded ``aapt2 dump resources`` execution per APK (memoized).
+
+    Same per-APK closure discipline as ``_resources_dump_resolver``: the
+    compiled-member authority runs for three resources (the backup pair plus
+    networkSecurityConfig) against ONE aapt2 dump. A first invocation that
+    fails leaves the cache empty and simply propagates the named
+    ``PolicyError``.
+    """
+    dump: list[str] = []
+
+    def resolve() -> str:
+        if not dump:
+            dump.append(
+                _run_bounded_stdout(
+                    [aapt2, "dump", "resources", str(apk)],
+                    "aapt2 dump resources",
+                    max_bytes=MAX_RESOURCES_DUMP_BYTES,
+                )
+            )
+        return dump[0]
+
+    return resolve
+
+
+def _parse_aapt2_resource_paths(dump: str) -> dict[str, list[tuple[str, str]]]:
+    """Index aapt2's ``dump resources`` output as ``name -> [(config, path)]``.
+
+    Keys are the ``<type>/<name>`` spelling the header carries
+    (``xml/backup_rules``), values are the ``(config, member)`` pairs of every
+    ``(file)`` value line under that header, in dump order.
+
+    Only resources belonging to the application package (package ID ``0x7f``)
+    are indexed. Non-``0x7f`` package resources (e.g. library dependencies
+    defining same-named resources) are skipped and their value lines ignored
+    so foreign resources cannot collide with or confuse the application's
+    security policy resources.
+
+    Non-file value lines and unrelated output (package/type banners, nested
+    enum/flag lines) are skipped; a name that carries no file value maps to an
+    empty list so the caller can fail closed on it.
+    """
+    entries: dict[str, list[tuple[str, str]]] = {}
+    current: str | None = None
+    for line in dump.splitlines():
+        header = _AAPT2_RESOURCE_HEADER.match(line)
+        if header is not None:
+            current = header.group(2)
+            entries.setdefault(current, [])
+            continue
+        if _AAPT2_OTHER_RESOURCE_HEADER.match(line):
+            current = None
+            continue
+        if current is None:
+            continue
+        value = _AAPT2_RESOURCE_FILE.match(line)
+        if value is not None:
+            entries[current].append((value.group(1).strip(), value.group(2)))
+    return entries
+
+
+def _canonical_member_resource(canonical_member: str) -> str:
+    """Map a canonical member (``res/xml/backup_rules.xml``) to ``xml/backup_rules``.
+
+    The canonical ``res/<type>/<name>.xml`` form is the only shape the
+    artifact authorities pin (``backup_rules_check.ARTIFACT_RULE_MEMBERS`` and
+    ``_NETWORK_SECURITY_MEMBER``); anything else is a wiring defect and fails
+    closed instead of being coerced.
+    """
+    parts = canonical_member.split("/")
+    if len(parts) != 3 or parts[0] != "res" or not parts[2].endswith(".xml"):
+        raise PolicyError(
+            "unsupported canonical resource member shape (expected "
+            f"res/<type>/<name>.xml): {canonical_member!r}"
+        )
+    return f"{parts[1]}/{parts[2][:-len('.xml')]}"
+
+
+def _apk_member_names(apk: Path) -> frozenset[str]:
+    """The APK's member paths, for proving a resolved member really exists."""
+    try:
+        with zipfile.ZipFile(apk, "r") as archive:
+            return frozenset(info.filename for info in archive.infolist())
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise PolicyError(
+            f"cannot read APK archive while resolving a compiled member: {exc}"
+        ) from exc
+
+
+def _apk_members_resolver(apk: Path) -> Callable[[], frozenset[str]]:
+    """One memoized APK central-directory listing for compiled-member checks.
+
+    Same per-APK closure discipline as ``_aapt2_resources_dump_resolver``: the
+    compiled-member authority checks member existence for up to three policy
+    resources against ONE central-directory listing rather than re-reading the
+    archive 3 times.
+    """
+    members: list[frozenset[str]] = []
+
+    def resolve() -> frozenset[str]:
+        if not members:
+            members.append(_apk_member_names(apk))
+        return members[0]
+
+    return resolve
+
+
+def _resolve_compiled_member_path(
+    resolve_aapt2_resources: Callable[[], str],
+    canonical_member: str,
+    apk: Path | frozenset[str] | Callable[[], frozenset[str]],
+) -> str:
+    """Resolve a canonical member to the compiled path aapt must dump.
+
+    Given the canonical ``res/<type>/<name>.xml`` member the authorities pin,
+    look the resource NAME up in ``aapt2 dump resources`` and return the
+    compiled archive member the release build actually stored (real name on
+    debug, obfuscated short name on release). Fail-closed at every step:
+
+      * the name must be carried by the aapt2 table (a missing name means the
+        pinned resource cannot be dumped - never a silent skip);
+      * security policy resources must define exactly one configuration;
+        multiple configurations (such as locale qualifiers or API-level
+        qualifiers like ``(v31)`` or ``(en)``) are strictly forbidden to
+        prevent configuration-split bypass where a device-specific configuration
+        is loaded by Android at runtime while the gate inspects another;
+      * the resolved path must exist in the APK archive, so a table that names
+        a member the artifact does not carry fails closed here (the
+        subsequent dump failure would also fail closed, but this keeps the
+        named error precise).
+    """
+    table = _parse_aapt2_resource_paths(resolve_aapt2_resources())
+    resource = _canonical_member_resource(canonical_member)
+    paths = table.get(resource)
+    if not paths:
+        raise PolicyError(
+            f"aapt2 resources table carries no compiled member for "
+            f"@{resource} (canonical {canonical_member}) - the compiled "
+            "resource cannot be located; refusing to guess a path"
+        )
+    if len(paths) == 1:
+        resolved = paths[0][1]
+    else:
+        configs = [c if c else "default" for c, _ in paths]
+        raise PolicyError(
+            f"aapt2 resources table lists {len(paths)} configurations for "
+            f"@{resource} ({', '.join(configs)}); security policy resources "
+            "must define exactly one configuration to prevent configuration-split bypass"
+        )
+    if callable(apk):
+        archive_members = apk()
+    elif isinstance(apk, (set, frozenset)):
+        archive_members = apk
+    else:
+        archive_members = _apk_member_names(apk)
+    if resolved not in archive_members:
+        raise PolicyError(
+            f"aapt2 resolved @{resource} to {resolved!r}, but the APK carries "
+            "no such member (stale resources table or rewritten archive)"
+        )
+    return resolved
+
+
+def _compiled_member_resolver(aapt: str, apk: Path) -> Callable[[str], str]:
+    """Build the canonical-member -> compiled-path resolver for one APK.
+
+    When aapt2 is derivable next to the caller-pinned aapt, the mapping comes
+    from ONE memoized ``aapt2 dump resources`` run and every failure mode
+    above raises ``PolicyError`` (no skip, no silent fallback). When no aapt2
+    can be derived (e.g. an SDK layout without it), the canonical path is
+    returned unchanged so the caller's ``aapt dump xmltree`` stays the
+    authority: on a release artifact that dump fails closed on the missing
+    canonical member, and on debug the real names already are the canonical
+    paths - so the fallback can never turn a missing member into a PASS.
+    """
+    aapt2 = _aapt2_sibling(aapt)
+    if aapt2 is None:
+        return lambda canonical_member: canonical_member
+    get_aapt2_dump = _aapt2_resources_dump_resolver(aapt2, apk)
+    get_apk_members = _apk_members_resolver(apk)
+
+    def resolve(canonical_member: str) -> str:
+        return _resolve_compiled_member_path(
+            get_aapt2_dump, canonical_member, get_apk_members
+        )
+
+    return resolve
+
+
 def _validate_aapt_output(aapt: str, apk: Path) -> tuple[str, str]:
     permissions = _run_bounded_stdout(
         [aapt, "dump", "permissions", str(apk)], "aapt dump permissions"
@@ -1033,37 +1297,50 @@ def _assert_merged_backup_bindings(
         _resources_table_carries_name(resources, resource, name)
 
 
-def _assert_merged_backup_rules_bytes(aapt: str, apk: Path) -> None:
+def _assert_merged_backup_rules_bytes(
+    aapt: str,
+    apk: Path,
+    resolve_member: Callable[[str], str] | None = None,
+) -> None:
     """Assert the COMPILED backup rules still exclude exactly the key files.
 
     The manifest binding pins only the filenames ``@xml/backup_rules`` /
     ``@xml/data_extraction_rules`` - it cannot see what a resources overlay or
     the merger wrote INTO the compiled XML while leaving those filenames
     unchanged. So both compiled rule resources are dumped via
-    ``aapt dump xmltree`` (canonical res/ member paths, the same resolution
-    form ``_assert_merged_network_security_config`` proves works), rebuilt
-    with ``_parse_aapt_xmltree`` (ERROR lines / empty / truncated dumps fail
-    closed), and validated by the source gate's own engine
-    (``backup_rules_check.validate_tree``) with ``exact_excludes=True``: the
-    exclude set must equal ``BackupPolicy.KEY_FILES_EXCLUDED`` EXACTLY
-    (missing AND unexpected entries are set differences, order-free).
-    Source-level rules validation cannot reach this rewrite; this is the
-    artifact-level authority on the rules bytes.
+    ``aapt dump xmltree``, rebuilt with ``_parse_aapt_xmltree`` (ERROR lines /
+    empty / truncated dumps fail closed), and validated by the source gate's
+    own engine (``backup_rules_check.validate_tree``) with
+    ``exact_excludes=True``: the exclude set must equal
+    ``BackupPolicy.KEY_FILES_EXCLUDED`` EXACTLY (missing AND unexpected
+    entries are set differences, order-free). Source-level rules validation
+    cannot reach this rewrite; this is the artifact-level authority on the
+    rules bytes.
+
+    The dumped member path is the RESOLVED compiled path
+    (``_compiled_member_resolver``): a release build obfuscates the resource
+    entry name, so the canonical ``res/xml/<name>.xml`` no longer exists in
+    the artifact. The canonical member stays the label the validator reports
+    (stable diagnostics) and the fixed-path fallback when no aapt2 is
+    derivable; resolution failure is a named ``PolicyError``, never a skip.
     """
+    if resolve_member is None:
+        resolve_member = _compiled_member_resolver(aapt, apk)
     backup_rules_check = _load_backup_rules_check()
-    for member, expected_root in backup_rules_check.ARTIFACT_RULE_MEMBERS:
+    for canonical_member, expected_root in backup_rules_check.ARTIFACT_RULE_MEMBERS:
+        member = resolve_member(canonical_member)
         rules_dump = _run_bounded_stdout(
             [aapt, "dump", "xmltree", str(apk), member],
-            f"aapt dump xmltree (backup rules: {member})",
+            f"aapt dump xmltree (backup rules: {canonical_member})",
             max_bytes=MAX_RESOURCES_DUMP_BYTES,
         )
-        root = _parse_aapt_xmltree(rules_dump, f"aapt xmltree {member}")
+        root = _parse_aapt_xmltree(rules_dump, f"aapt xmltree {canonical_member}")
         errors = backup_rules_check.validate_tree(
-            root, member, expected_root, exact_excludes=True
+            root, canonical_member, expected_root, exact_excludes=True
         )
         if errors:
             raise PolicyError(
-                f"compiled {member} fails the exact backup-rules set "
+                f"compiled {canonical_member} fails the exact backup-rules set "
                 f"(artifact-level authority): {'; '.join(errors)}"
             )
 
@@ -1294,6 +1571,7 @@ def _assert_merged_network_security_config(
     apk: Path,
     xmltree: str,
     get_resources: Callable[[], str],
+    resolve_member: Callable[[str], str] | None = None,
 ) -> None:
     """Assert the merged NSC binding AND the compiled XML's policy shape.
 
@@ -1310,6 +1588,13 @@ def _assert_merged_network_security_config(
     source undetected - then validated with ``scripts/nsc_check.py
     .validate_tree`` under the mode derived from ``android:debuggable``.
 
+    The dumped member path is RESOLVED through ``_compiled_member_resolver``
+    for the same reason as the backup pair: release resource-name obfuscation
+    renames the compiled entry, so the canonical
+    ``res/xml/network_security_config.xml`` must not be hard-coded. The
+    canonical member stays the validator's label; a resolution failure is a
+    named ``PolicyError``, never a skip.
+
     Both the binding ``A:`` line and the ``android:debuggable`` mode input
     are anchored at the <application> element's OWN attribute level
     (``app_indent + 2``, aapt's two-space hierarchy step): a decoy CHILD
@@ -1320,6 +1605,8 @@ def _assert_merged_network_security_config(
     ``app_indent + 4``, so the exact-level anchor leaves them nothing to
     match and the gate fails with its mandatory errors.
     """
+    if resolve_member is None:
+        resolve_member = _compiled_member_resolver(aapt, apk)
     application_block, app_indent = _application_manifest_block(xmltree)
     mode = _network_security_mode(application_block, app_indent)
     application_attr_anchor = _application_attr_anchor(app_indent)
@@ -1386,8 +1673,9 @@ def _assert_merged_network_security_config(
             _NETWORK_SECURITY_ATTR_NAME,
             binding_kind="networkSecurityConfig",
         )
+    nsc_member = resolve_member(_NETWORK_SECURITY_MEMBER)
     nsc_dump = _run_bounded_stdout(
-        [aapt, "dump", "xmltree", str(apk), _NETWORK_SECURITY_MEMBER],
+        [aapt, "dump", "xmltree", str(apk), nsc_member],
         "aapt dump xmltree (network security config)",
         max_bytes=MAX_RESOURCES_DUMP_BYTES,
     )
@@ -1517,17 +1805,26 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str) -> None:
     # networkSecurityConfig binding authorities resolve through this SAME
     # dump result (threaded callable; no module-global cache).
     get_resources = _resources_dump_resolver(aapt, apk)
+    # One bounded ``aapt2 dump resources`` execution per APK resolves the
+    # COMPILED member path of each pinned xml resource: a release build
+    # obfuscates the entry names (res/xml/backup_rules.xml -> res/Qq.xml), so
+    # the canonical path cannot be hard-coded. The resolver is threaded to
+    # both compiled-XML authorities so they share the single aapt2 dump and
+    # the same fail-closed name->path proof.
+    resolve_member = _compiled_member_resolver(aapt, apk)
     # Backup bindings on the MERGED manifest (artifact-level authority) run
     # for every policy mode: Play and Foss ship the same binding contract.
     _assert_merged_backup_bindings(xmltree, get_resources)
     # Compiled backup-rules BYTES (the binding itself pins filenames only;
     # the compiled content must still carry the exact key-file exclude set).
-    _assert_merged_backup_rules_bytes(aapt, apk)
+    _assert_merged_backup_rules_bytes(aapt, apk, resolve_member)
     # networkSecurityConfig binding + compiled-XML rule check (same
     # artifact-level authority, scripts/nsc_check.py rule engine); joined
     # execution with the backup gate so one merged-manifest difference keeps
     # every policy contract provable in this artifact.
-    _assert_merged_network_security_config(aapt, apk, xmltree, get_resources)
+    _assert_merged_network_security_config(
+        aapt, apk, xmltree, get_resources, resolve_member
+    )
 
     # Common flavor permission policy (P2-1): forbidden SMS / all-files-access
     # / VPN declarations fail EVERY mode, including github (which otherwise

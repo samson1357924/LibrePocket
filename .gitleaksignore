@@ -9,11 +9,11 @@
 # dummy credential. The exec failure answers a fixed typed receipt, so the
 # message never reaches the wire; the head copy was reworded. This entry keeps
 # the commit fingerprinted below clean for range scans on this branch.
-0d1ae7000c957e66038817ce1bd4bc8d22e9c232:app/src/test/java/dev/librepocket/router/SafeToolSliceTest.kt:generic-api-key:303
+0cdbefc640df0ebc62fd091e89f67e0215e61a84:app/src/test/java/dev/librepocket/router/SafeToolSliceTest.kt:generic-api-key:303
 
 # False positive: synthetic URL-token coverage fixture in
 # continuationArgsEchoStaysWireValidWithSecretPatternsInside (the Redactor's
 # URL_TOKEN_PARAM rule keys on the `token=` param, not value randomness).
 # The head copy uses a low-entropy dummy; this entry keeps the commit
 # fingerprinted below clean for range scans on this branch.
-442441c8a29575ceb22b6ef9373bfc42e393073e:app/src/test/java/dev/librepocket/router/SafeToolSliceTest.kt:generic-api-key:608
+f16c2e9d4e7530b11228dcfa68e1510f9bc1686a:app/src/test/java/dev/librepocket/router/SafeToolSliceTest.kt:generic-api-key:608

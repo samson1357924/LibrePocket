@@ -15,6 +15,74 @@ Observed current debug APK inventory (provided by the parent, not verified by
 this helper): about 17-20 root DEX shards, largest shard about 43.8 MB, and
 about 65-80 MB total DEX. Limits below leave headroom for that inventory; they
 are resource limits, not evidence that any real APK passed this scanner.
+
+Backup-binding authority: this scanner asserts that the MERGED manifest
+(what the final APK will actually run) still carries
+``android:fullBackupContent``/``android:dataExtractionRules`` bound to the
+pinned xml resources. Source-level checks (``backup_rules_check.py``) cannot
+see what a manifest-merger marker (``tools:node="replace"``, ``tools:remove``)
+stripped, so this artifact-level check is the authoritative proof that the
+bindings survived the merge. Runtime impact when missing: AOSP FullBackup
+treats both refs as absent and copies EVERYTHING (including the key files the
+whole policy exists to protect).
+
+Every binding value must be proven against ``aapt dump resources`` (one
+bounded execution per APK, shared by the backup and networkSecurityConfig
+authorities via a resolver callable - no module-global cache). An id-form
+``@0x…`` value must map to the pinned ``xml/<name>`` resource in the table;
+a reference-NAME form (older aapt prints the typed reference as the literal
+``@xml/<name>``) must be an exact match over the WHOLE decoded payload and
+the name must exist in the same table. Any other payload (``@xml/backup_rules;
+junk``, plain text, unknown encodings) is a raw string the runtime would
+never dereference - Auto Backup would run rule-less / the NSC would fall
+back - so it fails closed instead of satisfying a prefix search.
+
+Network-security-config authority (same artifact-level reasoning): the merged
+manifest must still carry ``android:networkSecurityConfig`` pinned to
+``@xml/network_security_config``, AND the compiled resource itself is parsed
+out of ``aapt dump xmltree`` of the APK and re-validated with the EXACT rules
+of ``scripts/nsc_check.py``. The source stage greps/validates source XML files,
+but the merged artifact is what ships: a resource overlay, an alias flip, or a
+merger rebind would never be visible at source level. The validation mode is
+derived fail-closed from the merged manifest's own ``android:debuggable``
+(attr 0x0101000f) = true (type 0x12)0xffffffff → debug rules (loopback-only
+cleartext); anything else (absent/false/unparseable) → the release deny-all
+rules, so a build that cannot PROVE it is debuggable is checked with the
+stricter contract. The binding value carries the same proof contract as the
+backup pair: reference form only, and only through the resources table.
+
+Compiled backup-rules BYTES (third artifact-level authority): the merged
+manifest binding only pins the FILENAMES ``@xml/backup_rules`` /
+``@xml/data_extraction_rules`` - it cannot observe what a resources overlay
+or merger rewrite put INTO the compiled XML while leaving those filenames
+alone. So both compiled resources are dumped with ``aapt dump xmltree``,
+rebuilt into trees, and re-validated by the source gate's own engine
+(``backup_rules_check.validate_tree``) demanding the EXACT
+``REQUIRED_EXCLUDES`` set (BackupPolicy.KEY_FILES_EXCLUDED, order-free): a
+dump failure, a missing entry, or a set difference fails closed. The member
+path dumped is resolved by RESOURCE NAME through the sibling aapt2
+(``_compiled_member_resolver``): an AGP release build obfuscates the
+compiled entry names (``res/xml/backup_rules.xml`` becomes ``res/Qq.xml``),
+so the canonical path is only the label/fallback, never a hard-coded dump
+operand.
+
+Modes: ``--mode play`` / ``--mode foss`` run every scanner policy.  The
+additional ``--mode github`` runs ONLY the mode-independent artifact
+authorities (merged manifest backup bindings, compiled backup-rules bytes,
+merged networkSecurityConfig binding + compiled NSC) plus the COMMON flavor
+permission policy below: the Github debug artifact is neither a Play nor a
+Foss package, so the flavor DEX class-table policies do not apply, while the
+same manifest/resource merger paths this scanner exists to police are shared
+by all three flavors.
+
+Common manifest policy (P2-1): SMS, MANAGE_EXTERNAL_STORAGE, and VPN
+declarations are forbidden in EVERY flavor (``COMMON_FORBIDDEN_PERMISSIONS``
+plus ``vpnservice``-shaped merged-manifest references). The scan consumes the
+same permissions/xmltree dumps the play policy reads and runs before the mode
+split, so the github early-return can never skip it. Accessibility stays a
+play-only extra: the foss/github overlays legally declare accessibility
+services (locked decision), so the a11y token must never enter the common
+set.
 """
 
 from __future__ import annotations
@@ -32,10 +100,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import zipfile
 import zlib
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 SUPPORTED_DEX_VERSIONS = frozenset((b"035", b"037", b"038", b"039", b"040"))
 LITTLE_ENDIAN_TAG = 0x12345678
@@ -60,16 +130,70 @@ MAX_DEX_DESCRIPTOR_ENCODED_BYTES = 12 * 1024 * 1024
 MAX_APK_DESCRIPTOR_UTF16_UNITS = 16 * 1024 * 1024
 MAX_APK_DESCRIPTOR_ENCODED_BYTES = 48 * 1024 * 1024
 MAX_AAPT_OUTPUT_BYTES = 8 * 1024 * 1024
+# ``aapt dump resources`` prints one line per (entry, config) pair (~100-160
+# bytes each); a real app-wide table can reach several MB, while the compact
+# manifest-only dumps stay ~KBs. A larger per-call bound keeps the shared
+# manifest-dump budget (and with it the manifest parse scope) unchanged.
+MAX_RESOURCES_DUMP_BYTES = 32 * 1024 * 1024
 TOOL_TIMEOUT_SECONDS = 120.0
 
-PLAY_FORBIDDEN_PERMISSIONS = (
+# Merged-manifest backup bindings (the artifact-level authority). Resource-id
+# constants are stable SDK definitions of the android attrs:
+# android:fullBackupContent = 0x010104eb, android:dataExtractionRules =
+# 0x0101063e. The resource NAMES are the pins from backup_rules_check.py
+# EXPECTED_MANIFEST_ATTRS (values "@xml/backup_rules" /
+# "@xml/data_extraction_rules" minus the "@xml/" prefix).
+_BACKUP_BINDING_ATTRS: tuple[tuple[str, str, str], ...] = (
+    ("fullBackupContent", "0x010104eb", "backup_rules"),
+    ("dataExtractionRules", "0x0101063e", "data_extraction_rules"),
+)
+
+# Merged-manifest networkSecurityConfig binding (same artifact-level authority
+# as the backup pair). Resource-id constants are MEASURED SDK definitions
+# (platform data/res/values/public-final.xml, android-36 == android-37.0, not
+# guessed): android:networkSecurityConfig = 0x01010527,
+# android:debuggable = 0x0101000f. The resource NAME is the pin from
+# nsc_check.py EXPECTED_MANIFEST_RESOURCE ("@xml/network_security_config" minus
+# the "@xml/" prefix); _NETWORK_SECURITY_MEMBER is the CANONICAL member the
+# tree dump labels itself with and the fixed-path fallback, while the path
+# actually handed to ``aapt dump xmltree`` is resolved by NAME through aapt2
+# (see _compiled_member_resolver) because a release build obfuscates the
+# compiled entry name.
+_NETWORK_SECURITY_ATTR_NAME = "networkSecurityConfig"
+_NETWORK_SECURITY_ATTR_ID = "0x01010527"
+_NETWORK_SECURITY_RESOURCE = "network_security_config"
+_NETWORK_SECURITY_MEMBER = "res/xml/network_security_config.xml"
+_DEBUGGABLE_ATTR_ID = "0x0101000f"
+
+# P2-1 common manifest policy (locked decision, see the flavor overlay
+# headers in app/src/foss/AndroidManifest.xml and
+# app/src/github/AndroidManifest.xml): NO SMS, NO MANAGE_EXTERNAL_STORAGE,
+# NO VPN in ANY flavor. These tokens are forbidden on every artifact face
+# and are enforced by ``_check_common_permissions`` for all modes (play,
+# foss AND github - the github mode previously early-returned without any
+# permission scan). Accessibility MUST stay out of this tuple: the foss and
+# github overlays legally declare accessibility services, so the a11y token
+# remains a play-only extra in PLAY_FORBIDDEN_PERMISSIONS below.
+COMMON_FORBIDDEN_PERMISSIONS = (
     "SEND_SMS",
     "RECEIVE_SMS",
     "READ_SMS",
     "MANAGE_EXTERNAL_STORAGE",
-    "BIND_ACCESSIBILITY_SERVICE",
     "BIND_VPN_SERVICE",
 )
+# Play = the common flavor policy plus the play-only extras (at minimum
+# BIND_ACCESSIBILITY_SERVICE). Keep the exact existing token strings.
+PLAY_ONLY_FORBIDDEN_PERMISSIONS = ("BIND_ACCESSIBILITY_SERVICE",)
+PLAY_FORBIDDEN_PERMISSIONS = (
+    COMMON_FORBIDDEN_PERMISSIONS + PLAY_ONLY_FORBIDDEN_PERMISSIONS
+)
+# VPN registration is forbidden by the COMMON policy: beyond the
+# ``BIND_VPN_SERVICE`` uses-permission token, a bare ``<service>`` / intent
+# filter spelling out a VpnService subclass ("vpnservice", case-insensitive)
+# in the merged xmltree ships a VPN without the permission. Play-only DEX
+# superclass analysis stays in _check_play; the xmltree surface here runs
+# for every mode (no DEX parsing needed for the github mode).
+COMMON_VPN_REFERENCE_RE = re.compile(r"vpnservice", re.IGNORECASE)
 PLAY_DEFINED_CLASS_PREFIXES = (
     "Ldev/librepocket/agent/github/",
     "Ldev/librepocket/agent/foss/",
@@ -581,7 +705,7 @@ def _kill_and_reap(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
-def _run_bounded_stdout(command: list[str], label: str) -> str:
+def _run_bounded_stdout(command: list[str], label: str, max_bytes: int = MAX_AAPT_OUTPUT_BYTES) -> str:
     try:
         process = subprocess.Popen(
             command,
@@ -606,12 +730,12 @@ def _run_bounded_stdout(command: list[str], label: str) -> str:
                 raise PolicyError(f"{label} timed out after {TOOL_TIMEOUT_SECONDS:g}s")
             if not selector.select(remaining):
                 raise PolicyError(f"{label} timed out after {TOOL_TIMEOUT_SECONDS:g}s")
-            read_limit = min(64 * 1024, MAX_AAPT_OUTPUT_BYTES + 1 - len(output))
+            read_limit = min(64 * 1024, max_bytes + 1 - len(output))
             chunk = os.read(file_descriptor, read_limit)
             if not chunk:
                 break
             output.extend(chunk)
-            if len(output) > MAX_AAPT_OUTPUT_BYTES:
+            if len(output) > max_bytes:
                 raise PolicyError(f"{label} output exceeds bounded parser limit")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -637,6 +761,290 @@ def _run_bounded_stdout(command: list[str], label: str) -> str:
         raise PolicyError(f"{label} output is not valid UTF-8") from exc
 
 
+def _resources_dump_resolver(aapt: str, apk: Path) -> Callable[[], str]:
+    """One bounded ``aapt dump resources`` execution per APK.
+
+    Both merged-manifest binding authorities (the backup pair and
+    networkSecurityConfig) resolve through the SAME dump instead of each
+    spawning its own ``aapt dump resources`` subprocess. The memo lives in a
+    per-APK closure (pure parameter threading - no module-global state); a
+    first invocation that fails leaves the cache empty and simply propagates.
+    The budget/label of the underlying dump is unchanged.
+    """
+    dump: list[str] = []
+
+    def resolve() -> str:
+        if not dump:
+            dump.append(
+                _run_bounded_stdout(
+                    [aapt, "dump", "resources", str(apk)],
+                    "aapt dump resources",
+                    max_bytes=MAX_RESOURCES_DUMP_BYTES,
+                )
+            )
+        return dump[0]
+
+    return resolve
+
+
+# Compiled-member path resolution (release resource-name obfuscation).
+#
+# An AGP RELEASE build obfuscates resource entry names: the compiled
+# ``res/xml/backup_rules.xml`` is stored under a short name (``res/Qq.xml``),
+# so the fixed canonical path the scanner used to hand to ``aapt dump
+# xmltree`` no longer exists in the release APK and the dump fails
+# ("resource res/xml/backup_rules.xml not found"). The debug APK keeps the
+# real names, which is why only the release gate broke.
+#
+# aapt v1's ``dump resources`` NEVER prints res/ member paths (debug and
+# release alike): it only prints the id↔name pairing. aapt2's ``dump
+# resources`` DOES print the compiled member path per configuration, so the
+# scanner derives the sibling aapt2 from the caller-pinned aapt and reads the
+# name→path mapping there.
+#
+# Measured aapt2 grammar (build-tools 35.0.0 and 36.0.0 print the identical
+# shape; only the value differs between the obfuscated release and the
+# unobfuscated debug artifact):
+#
+#     resource 0x7f0b0000 xml/backup_rules
+#       () (file) res/Qq.xml type=XML
+#
+# The header carries ``<type>/<name>`` with NO package prefix; every following
+# indented line carries ``(<config>) (<kind>) <value> type=<value-type>``.
+# Only ``(file)`` values name a compiled archive member, and security policy
+# resources (backup_rules, data_extraction_rules, network_security_config) must
+# define exactly one configuration to prevent configuration-split bypass.
+# Non-file values (``(string8) "…"``, ``(attr)``, ``(enum)``,
+# ``(reference)``…) and nested enum/flag lines are ignored: they never match
+# the file grammar. The parse tolerates the version drift actually observed
+# (identical 35/36) and is fail-closed on everything else - a header that
+# does not match, a non-0x7f package resource, a name with no file value,
+# multiple configurations (configuration-split bypass attempt), or a resolved
+# path absent from the APK archive all raise ``PolicyError`` rather than
+# silently falling back to a path that may not exist.
+_AAPT2_RESOURCE_HEADER = re.compile(
+    r"^\s*resource\s+(0x7[fF][0-9a-fA-F]{6})\s+([A-Za-z0-9_]+/[A-Za-z0-9_.]+)\s*$"
+)
+_AAPT2_OTHER_RESOURCE_HEADER = re.compile(
+    r"^\s*resource\s+0x[0-9a-fA-F]+\s+"
+)
+_AAPT2_RESOURCE_FILE = re.compile(
+    r"^\s*\(([^)]*)\)\s+\(file\)\s+(\S+)(?:\s+type=\S+)?\s*$"
+)
+
+
+def _aapt2_sibling(aapt: str) -> str | None:
+    """Derive the aapt2 shipped beside the caller-pinned aapt, or ``None``.
+
+    The gate's aapt and aapt2 always live in the SAME build-tools directory
+    (``…/build-tools/<ver>/aapt`` and ``…/aapt2``), including when the release
+    verifier pins its aapt explicitly. Both the literal parent and the
+    symlink-resolved parent are probed so a wrapped/symlinked caller path
+    still finds the sibling. A missing or non-executable aapt2 is NOT an
+    error here: the caller then falls back to the canonical member path and
+    the dump itself stays the fail-closed authority.
+    """
+    directories: list[Path] = []
+    for directory in (Path(aapt).parent, Path(os.path.realpath(aapt)).parent):
+        if directory not in directories:
+            directories.append(directory)
+    for directory in directories:
+        for name in ("aapt2", "aapt2.exe"):
+            tool = directory / name
+            if tool.is_file() and os.access(tool, os.X_OK):
+                return str(tool)
+    return None
+
+
+def _aapt2_resources_dump_resolver(aapt2: str, apk: Path) -> Callable[[], str]:
+    """One bounded ``aapt2 dump resources`` execution per APK (memoized).
+
+    Same per-APK closure discipline as ``_resources_dump_resolver``: the
+    compiled-member authority runs for three resources (the backup pair plus
+    networkSecurityConfig) against ONE aapt2 dump. A first invocation that
+    fails leaves the cache empty and simply propagates the named
+    ``PolicyError``.
+    """
+    dump: list[str] = []
+
+    def resolve() -> str:
+        if not dump:
+            dump.append(
+                _run_bounded_stdout(
+                    [aapt2, "dump", "resources", str(apk)],
+                    "aapt2 dump resources",
+                    max_bytes=MAX_RESOURCES_DUMP_BYTES,
+                )
+            )
+        return dump[0]
+
+    return resolve
+
+
+def _parse_aapt2_resource_paths(dump: str) -> dict[str, list[tuple[str, str]]]:
+    """Index aapt2's ``dump resources`` output as ``name -> [(config, path)]``.
+
+    Keys are the ``<type>/<name>`` spelling the header carries
+    (``xml/backup_rules``), values are the ``(config, member)`` pairs of every
+    ``(file)`` value line under that header, in dump order.
+
+    Only resources belonging to the application package (package ID ``0x7f``)
+    are indexed. Non-``0x7f`` package resources (e.g. library dependencies
+    defining same-named resources) are skipped and their value lines ignored
+    so foreign resources cannot collide with or confuse the application's
+    security policy resources.
+
+    Non-file value lines and unrelated output (package/type banners, nested
+    enum/flag lines) are skipped; a name that carries no file value maps to an
+    empty list so the caller can fail closed on it.
+    """
+    entries: dict[str, list[tuple[str, str]]] = {}
+    current: str | None = None
+    for line in dump.splitlines():
+        header = _AAPT2_RESOURCE_HEADER.match(line)
+        if header is not None:
+            current = header.group(2)
+            entries.setdefault(current, [])
+            continue
+        if _AAPT2_OTHER_RESOURCE_HEADER.match(line):
+            current = None
+            continue
+        if current is None:
+            continue
+        value = _AAPT2_RESOURCE_FILE.match(line)
+        if value is not None:
+            entries[current].append((value.group(1).strip(), value.group(2)))
+    return entries
+
+
+def _canonical_member_resource(canonical_member: str) -> str:
+    """Map a canonical member (``res/xml/backup_rules.xml``) to ``xml/backup_rules``.
+
+    The canonical ``res/<type>/<name>.xml`` form is the only shape the
+    artifact authorities pin (``backup_rules_check.ARTIFACT_RULE_MEMBERS`` and
+    ``_NETWORK_SECURITY_MEMBER``); anything else is a wiring defect and fails
+    closed instead of being coerced.
+    """
+    parts = canonical_member.split("/")
+    if len(parts) != 3 or parts[0] != "res" or not parts[2].endswith(".xml"):
+        raise PolicyError(
+            "unsupported canonical resource member shape (expected "
+            f"res/<type>/<name>.xml): {canonical_member!r}"
+        )
+    return f"{parts[1]}/{parts[2][:-len('.xml')]}"
+
+
+def _apk_member_names(apk: Path) -> frozenset[str]:
+    """The APK's member paths, for proving a resolved member really exists."""
+    try:
+        with zipfile.ZipFile(apk, "r") as archive:
+            return frozenset(info.filename for info in archive.infolist())
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise PolicyError(
+            f"cannot read APK archive while resolving a compiled member: {exc}"
+        ) from exc
+
+
+def _apk_members_resolver(apk: Path) -> Callable[[], frozenset[str]]:
+    """One memoized APK central-directory listing for compiled-member checks.
+
+    Same per-APK closure discipline as ``_aapt2_resources_dump_resolver``: the
+    compiled-member authority checks member existence for up to three policy
+    resources against ONE central-directory listing rather than re-reading the
+    archive 3 times.
+    """
+    members: list[frozenset[str]] = []
+
+    def resolve() -> frozenset[str]:
+        if not members:
+            members.append(_apk_member_names(apk))
+        return members[0]
+
+    return resolve
+
+
+def _resolve_compiled_member_path(
+    resolve_aapt2_resources: Callable[[], str],
+    canonical_member: str,
+    apk: Path | frozenset[str] | Callable[[], frozenset[str]],
+) -> str:
+    """Resolve a canonical member to the compiled path aapt must dump.
+
+    Given the canonical ``res/<type>/<name>.xml`` member the authorities pin,
+    look the resource NAME up in ``aapt2 dump resources`` and return the
+    compiled archive member the release build actually stored (real name on
+    debug, obfuscated short name on release). Fail-closed at every step:
+
+      * the name must be carried by the aapt2 table (a missing name means the
+        pinned resource cannot be dumped - never a silent skip);
+      * security policy resources must define exactly one configuration;
+        multiple configurations (such as locale qualifiers or API-level
+        qualifiers like ``(v31)`` or ``(en)``) are strictly forbidden to
+        prevent configuration-split bypass where a device-specific configuration
+        is loaded by Android at runtime while the gate inspects another;
+      * the resolved path must exist in the APK archive, so a table that names
+        a member the artifact does not carry fails closed here (the
+        subsequent dump failure would also fail closed, but this keeps the
+        named error precise).
+    """
+    table = _parse_aapt2_resource_paths(resolve_aapt2_resources())
+    resource = _canonical_member_resource(canonical_member)
+    paths = table.get(resource)
+    if not paths:
+        raise PolicyError(
+            f"aapt2 resources table carries no compiled member for "
+            f"@{resource} (canonical {canonical_member}) - the compiled "
+            "resource cannot be located; refusing to guess a path"
+        )
+    if len(paths) == 1:
+        resolved = paths[0][1]
+    else:
+        configs = [c if c else "default" for c, _ in paths]
+        raise PolicyError(
+            f"aapt2 resources table lists {len(paths)} configurations for "
+            f"@{resource} ({', '.join(configs)}); security policy resources "
+            "must define exactly one configuration to prevent configuration-split bypass"
+        )
+    if callable(apk):
+        archive_members = apk()
+    elif isinstance(apk, (set, frozenset)):
+        archive_members = apk
+    else:
+        archive_members = _apk_member_names(apk)
+    if resolved not in archive_members:
+        raise PolicyError(
+            f"aapt2 resolved @{resource} to {resolved!r}, but the APK carries "
+            "no such member (stale resources table or rewritten archive)"
+        )
+    return resolved
+
+
+def _compiled_member_resolver(aapt: str, apk: Path) -> Callable[[str], str]:
+    """Build the canonical-member -> compiled-path resolver for one APK.
+
+    When aapt2 is derivable next to the caller-pinned aapt, the mapping comes
+    from ONE memoized ``aapt2 dump resources`` run and every failure mode
+    above raises ``PolicyError`` (no skip, no silent fallback). When no aapt2
+    can be derived (e.g. an SDK layout without it), the canonical path is
+    returned unchanged so the caller's ``aapt dump xmltree`` stays the
+    authority: on a release artifact that dump fails closed on the missing
+    canonical member, and on debug the real names already are the canonical
+    paths - so the fallback can never turn a missing member into a PASS.
+    """
+    aapt2 = _aapt2_sibling(aapt)
+    if aapt2 is None:
+        return lambda canonical_member: canonical_member
+    get_aapt2_dump = _aapt2_resources_dump_resolver(aapt2, apk)
+    get_apk_members = _apk_members_resolver(apk)
+
+    def resolve(canonical_member: str) -> str:
+        return _resolve_compiled_member_path(
+            get_aapt2_dump, canonical_member, get_apk_members
+        )
+
+    return resolve
+
+
 def _validate_aapt_output(aapt: str, apk: Path) -> tuple[str, str]:
     permissions = _run_bounded_stdout(
         [aapt, "dump", "permissions", str(apk)], "aapt dump permissions"
@@ -650,6 +1058,636 @@ def _validate_aapt_output(aapt: str, apk: Path) -> tuple[str, str]:
     if not re.search(r"(?im)^\s*E:\s*manifest\b", xmltree):
         raise PolicyError("aapt xmltree output lacks a manifest root")
     return permissions, xmltree
+
+
+def _application_manifest_block(xmltree: str) -> tuple[str, int]:
+    """Slice the merged <application> element's dump lines out of the tree.
+
+    aapt prints one line per element/attribute with two-space indent steps
+    (``  E: application``); the block ends at the next ``E:`` element line of
+    the same or shallower indentation. A manifest without an application
+    element cannot carry either backup binding, so absence fails closed.
+
+    Alongside the slice this returns the application element line's leading
+    whitespace length so the binding gates can anchor their ``A:`` matches at
+    the application's OWN attribute level (indent + 2, aapt's two-space
+    hierarchy step): a decoy CHILD's attributes print at indent + 4, so a
+    text search without this anchor would accept a merged ``<service>`` that
+    wears ``android:fullBackupContent`` / ``android:dataExtractionRules``
+    while the ``<application>`` itself lost both bindings.
+    """
+    lines = xmltree.splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(r"^(\s*)E:\s*application\b", line)
+        if match is None:
+            continue
+        indent = match.group(1)
+        end = len(lines)
+        for follow in range(index + 1, len(lines)):
+            sibling = re.match(r"^(\s*)E:\s", lines[follow])
+            if sibling and len(sibling.group(1)) <= len(indent):
+                end = follow
+                break
+        return "\n".join(lines[index:end]), len(indent)
+    raise PolicyError(
+        "merged manifest lacks an <application> element - the backup and "
+        "network security bindings cannot survive a manifest that has no "
+        "application to bind"
+    )
+
+
+def _application_attr_anchor(app_indent: int) -> str:
+    """Regex prefix for ``A:`` lines at the application's OWN attr level.
+
+    aapt prints every element's attributes exactly two spaces past the
+    element line (``  E: application`` / ``    A: android:...``), so the
+    application element at ``app_indent`` spaces carries its attributes at
+    ``app_indent + 2``. The exact-width quantifier (not ``\\s*``) is the
+    decoy-child anchor: a CHILD's attributes print at ``app_indent + 4`` and
+    a sibling's block is already excluded by
+    ``_application_manifest_block``, so only lines at this exact level can
+    ever satisfy the application-scoped binding gates.
+    """
+    return r"^[ ]{%d}" % (app_indent + 2)
+
+
+def _resources_table_resolves(
+    resources: str,
+    identifier: int,
+    resource: str,
+    attr_name: str,
+    binding_kind: str = "backup",
+) -> None:
+    """Assert ``identifier`` maps to ``@xml/<resource>`` in a resources dump.
+
+    Shared by the backup and the networkSecurityConfig binding authorities -
+    the id↔name column is the merger-proof half of the pin (the attr value
+    alone can name a resource another id owns). The aapt spelling tolerance
+    (v1 ``spec … pkg:xml/<name>:`` form and aapt2 plain form) prevents an
+    output-format change from silently bypassing the check.
+    """
+    resource_name = re.escape("xml/" + resource)
+    # aapt v1: "spec resource 0x7f010000 pkg:xml/backup_rules: flags=…"
+    spec_line = re.compile(
+        r"^\s*(?:spec\s+)?resource 0x%08x\s+\S+:%s\s*:" % (identifier, resource_name),
+        re.MULTILINE,
+    )
+    # aapt2: "resource 0x7f010000 xml/backup_rules …" (no spec/pkg form).
+    aapt2_line = re.compile(
+        r"^\s*resource 0x%08x\s+%s\b" % (identifier, resource_name),
+        re.MULTILINE,
+    )
+    if not (spec_line.search(resources) or aapt2_line.search(resources)):
+        raise PolicyError(
+            f"merged manifest android:{attr_name} resource id 0x{identifier:08x} "
+            f"does not resolve to @xml/{resource} in the resources table "
+            f"- rebound {binding_kind} binding"
+        )
+
+
+def _resources_table_carries_name(
+    resources: str,
+    resource: str,
+    attr_name: str,
+    binding_kind: str = "backup",
+) -> None:
+    """Assert SOME resources-table id carries the name ``xml/<resource>``.
+
+    The inverse proof of ``_resources_table_resolves`` for NAME-form bindings
+    (older aapt prints the typed reference as the literal ``@xml/<name>``
+    instead of an id): the runtime resolves that name through this table, so a
+    table that carries no entry of the name means the binding could never
+    survive a dereference. The same two aapt spellings are accepted (v1
+    ``spec … pkg:xml/<name>:`` form and aapt2 plain form) so an output-format
+    change cannot silently weaken the proof.
+    """
+    resource_name = re.escape("xml/" + resource)
+    # aapt v1: "spec resource 0x7f010000 pkg:xml/backup_rules: flags=…"
+    spec_line = re.compile(
+        r"^\s*(?:spec\s+)?resource (0x[0-9a-fA-F]{8})\s+\S+:%s\s*:" % resource_name,
+        re.MULTILINE,
+    )
+    # aapt2: "resource 0x7f010000 xml/backup_rules …" (no spec/pkg form).
+    aapt2_line = re.compile(
+        r"^\s*resource (0x[0-9a-fA-F]{8})\s+%s\b" % resource_name,
+        re.MULTILINE,
+    )
+    if spec_line.search(resources) is None and aapt2_line.search(resources) is None:
+        raise PolicyError(
+            f"merged manifest android:{attr_name} references @xml/{resource} but "
+            f"the resources table carries no resource with that name "
+            f"({binding_kind} binding cannot survive a runtime dereference)"
+        )
+
+
+def _assert_merged_backup_bindings(
+    xmltree: str,
+    get_resources: Callable[[], str],
+) -> None:
+    """Assert the merged <application> still binds the backup rules resources.
+
+    The manifest merger runs between the validated source manifests and the
+    bytes aapt sees; a marker such as ``tools:node="replace"`` or
+    ``tools:remove="android:fullBackupContent"`` silently deletes the binding,
+    and at runtime AOSP FullBackup then copies EVERYTHING (key files included).
+    This artifact-level assertion is the authority on the merged bytes - the
+    source-level manifest validation (``backup_rules_check.py``) cannot observe
+    what the merger does. Both aapt spellings are accepted: the namespace is
+    spelled ``android:...`` by aapt v1 dumps and
+    ``http://schemas.android.com/apk/res/android:...`` by aapt2; aapt v1 prints
+    resource references as ``=@0x…`` and string values as the raw literal.
+
+    The proof is MANDATORY and per attribute - there is no skip-return:
+      * an id-form ``@0x…`` value must resolve to the pinned ``xml/<name>``
+        resource inside ``aapt dump resources`` (id↔name pairing);
+      * a reference-NAME form must match the pinned ``@xml/<name>`` over the
+        WHOLE decoded payload and the name must be carried by the same table
+        (name↔id pairing, via ``_resources_table_carries_name``);
+      * any other payload (``@xml/backup_rules;junk``, plain text, unknown
+        encodings) is a raw string: the runtime never dereferences it, Auto
+        Backup would run rule-less, so it fails closed here.
+
+    The matched ``A:`` line must sit at the application element's OWN
+    attribute level (``app_indent + 2`` leading spaces, aapt's two-space
+    hierarchy step). The block alone is not enough: a decoy CHILD such as
+    the merged ``<service>`` observed in the reviewer repro can carry BOTH
+    binding attributes (id values that fully resolve through the resources
+    table) while ``<application>`` lost them - its ``A:`` lines print at
+    ``app_indent + 4``, so the exact-level anchor leaves nothing for them to
+    match and the gate fails with the mandatory "lost the backup binding"
+    error.
+    """
+    proven_ids: list[tuple[str, str, int]] = []
+    proven_names: list[tuple[str, str]] = []
+    # Scope the attribute search to the merged <application> block AND to the
+    # application element's OWN attribute line level: aapt indents an
+    # element's attributes exactly two spaces past its element line, so the
+    # anchor is app_indent + 2, while a decoy CHILD's attributes print at
+    # app_indent + 4 - e.g. a merged <service> that wears
+    # android:fullBackupContent / android:dataExtractionRules after the
+    # merger stripped them from <application> must NOT satisfy this gate
+    # either. A binding line on any other node must not satisfy this gate
+    # (and a manifest with no application element cannot carry the bindings
+    # at all).
+    application_block, app_indent = _application_manifest_block(xmltree)
+    application_attr_anchor = _application_attr_anchor(app_indent)
+    for name, resource_id, resource in _BACKUP_BINDING_ATTRS:
+        match = re.search(
+            application_attr_anchor
+            + r"A:\s+(?:android:|http://schemas\.android\.com/apk/res/android:)"
+            + re.escape(name)
+            + r"\(\s*"
+            + re.escape(resource_id)
+            + r"\s*\)=(.+)$",
+            application_block,
+            re.MULTILINE,
+        )
+        if match is None:
+            raise PolicyError(
+                "merged manifest lost the backup binding "
+                f"android:{name} ({resource_id}) on <application>: a "
+                'manifest-merger marker (tools:node="replace" / tools:remove) '
+                "can strip it; Auto Backup would then copy the protected key files"
+            )
+        value = match.group(1).strip()
+        # aapt v1 prints "@0x7f010000"; aapt2 may spell it "@res/0x7f010000".
+        # The ID form must match the WHOLE value (fullmatch, the same
+        # whole-value contract the string branch enforces on the decoded
+        # payload below): a prefix match would take "@0x7f010000;junk" at
+        # face value - same hex id, suffix the runtime cannot dereference.
+        # The composite therefore falls through to the string authorities
+        # and fails closed there; only a whole-value reference may be
+        # resolved against the resources table.
+        reference = re.fullmatch(r"@(?:res/)?0x([0-9a-fA-F]+)", value)
+        if reference is not None:
+            proven_ids.append((name, resource, int(reference.group(1), 16)))
+            continue
+        # Older aapt prints the typed reference as a STRING payload instead of
+        # an id ("Raw string values without an id guess"). Decode the FULL
+        # payload first (quoted/Raw shapes; unrecognized encodings fail closed
+        # inside _xmltree_attr_value - the fallback keeps the unquoted
+        # reference spelling legible without ever widening acceptance) and
+        # then demand the reference over the ENTIRE value: payloads such as
+        # "@xml/backup_rules;junk" are raw strings the runtime would never
+        # dereference, so a search()-style prefix match must not pass them.
+        try:
+            decoded = _xmltree_attr_value(value, f"merged manifest android:{name}")
+        except PolicyError:
+            decoded = value
+        if re.fullmatch(r"@[\w/]+", decoded) is not None:
+            if decoded != f"@xml/{resource}":
+                raise PolicyError(
+                    f"merged manifest android:{name} does not reference "
+                    f"@xml/{resource} (got {decoded}) - rebound backup binding"
+                )
+            # Name-form reference: the runtime resolves the name through the
+            # resources table, so the name must exist there (proven below
+            # against the one shared dump).
+            proven_names.append((name, resource))
+            continue
+        raise PolicyError(
+            f"merged manifest android:{name} binding is a raw string, not a "
+            "resource reference - runtime would not dereference it (Auto "
+            f"Backup would run rule-less), got: {decoded!r} from {value!r}"
+        )
+    resources = get_resources()
+    for name, resource, identifier in proven_ids:
+        _resources_table_resolves(resources, identifier, resource, name)
+    for name, resource in proven_names:
+        _resources_table_carries_name(resources, resource, name)
+
+
+def _assert_merged_backup_rules_bytes(
+    aapt: str,
+    apk: Path,
+    resolve_member: Callable[[str], str] | None = None,
+) -> None:
+    """Assert the COMPILED backup rules still exclude exactly the key files.
+
+    The manifest binding pins only the filenames ``@xml/backup_rules`` /
+    ``@xml/data_extraction_rules`` - it cannot see what a resources overlay or
+    the merger wrote INTO the compiled XML while leaving those filenames
+    unchanged. So both compiled rule resources are dumped via
+    ``aapt dump xmltree``, rebuilt with ``_parse_aapt_xmltree`` (ERROR lines /
+    empty / truncated dumps fail closed), and validated by the source gate's
+    own engine (``backup_rules_check.validate_tree``) with
+    ``exact_excludes=True``: the exclude set must equal
+    ``BackupPolicy.KEY_FILES_EXCLUDED`` EXACTLY (missing AND unexpected
+    entries are set differences, order-free). Source-level rules validation
+    cannot reach this rewrite; this is the artifact-level authority on the
+    rules bytes.
+
+    The dumped member path is the RESOLVED compiled path
+    (``_compiled_member_resolver``): a release build obfuscates the resource
+    entry name, so the canonical ``res/xml/<name>.xml`` no longer exists in
+    the artifact. The canonical member stays the label the validator reports
+    (stable diagnostics) and the fixed-path fallback when no aapt2 is
+    derivable; resolution failure is a named ``PolicyError``, never a skip.
+    """
+    if resolve_member is None:
+        resolve_member = _compiled_member_resolver(aapt, apk)
+    backup_rules_check = _load_backup_rules_check()
+    for canonical_member, expected_root in backup_rules_check.ARTIFACT_RULE_MEMBERS:
+        member = resolve_member(canonical_member)
+        rules_dump = _run_bounded_stdout(
+            [aapt, "dump", "xmltree", str(apk), member],
+            f"aapt dump xmltree (backup rules: {canonical_member})",
+            max_bytes=MAX_RESOURCES_DUMP_BYTES,
+        )
+        root = _parse_aapt_xmltree(rules_dump, f"aapt xmltree {canonical_member}")
+        errors = backup_rules_check.validate_tree(
+            root, canonical_member, expected_root, exact_excludes=True
+        )
+        if errors:
+            raise PolicyError(
+                f"compiled {canonical_member} fails the exact backup-rules set "
+                f"(artifact-level authority): {'; '.join(errors)}"
+            )
+
+
+def _unescape_dump_string(value: str) -> str:
+    """Decode aapt's C-style escapes in dumped quoted strings.
+
+    aapt prints string payloads with ``"\\n"``/``"\\t"``/``"\\r"``/``"\\""``
+    /``"\\\\"`` escapes inside the quotes. Unknown escapes are kept literal
+    rather than guessed away: the downstream schema checks (nsc_check.py)
+    fail closed on the resulting value in both directions, so decoding must
+    not become a bypass channel.
+    """
+    decoded: list[str] = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == "\\" and index + 1 < len(value):
+            following = value[index + 1]
+            mapped = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\"}.get(following)
+            if mapped is not None:
+                decoded.append(mapped)
+                index += 2
+                continue
+        decoded.append(character)
+        index += 1
+    return "".join(decoded)
+
+
+def _xmltree_attr_value(raw_value: str, label: str) -> str:
+    """Decode one printed ``A: <name>=<value>`` payload from a xmltree dump.
+
+    Measured aapt encodings (real APK dumps, build-tools 35/36):
+      * booleans print without quotes as ``(type 0x12)0x0`` /
+        ``(type 0x12)0xffffffff``; a boolean exists only as these two values
+        in compiled binary XML, so any other typed encoding fails closed
+        instead of being guessed into the tree;
+      * strings print as ``"value" (Raw: "value")`` - the RAW payload wins
+        when both spellings appear and both go through the escape decoder;
+      * resource references print unquoted (``@0x…``, ``@res/0x…``,
+        ``?0x…``) and pass through verbatim; schema checks reject them
+        wherever non-string values are illegal.
+    """
+    value = raw_value.strip()
+    typed = re.match(r"^\(type\s+[^\s)]+\)(.*)$", value)
+    if typed is not None:
+        payload = typed.group(1).strip()
+        if payload == "0x0":
+            return "false"
+        if payload == "0xffffffff":
+            return "true"
+        raise PolicyError(
+            f"{label}: unrecognized compiled attribute encoding {value!r}"
+        )
+    quoted = re.match(
+        r'^"((?:[^"\\]|\\.)*)"\s*(?:\(Raw:\s*"((?:[^"\\]|\\.)*)"\s*\))?(?:\s*)?$', value
+    )
+    if quoted is not None:
+        if quoted.group(2) is not None:
+            return _unescape_dump_string(quoted.group(2))
+        return _unescape_dump_string(quoted.group(1))
+    if re.fullmatch(r"@(?:res/)?0x[0-9a-fA-F]+", value) or re.fullmatch(
+        r"\?0x[0-9a-fA-F]+", value
+    ):
+        return value
+    raise PolicyError(f"{label}: unrecognized attribute value encoding {value!r}")
+
+
+def _xmltree_text_value(raw_text: str, label: str) -> str:
+    """Decode one printed ``C:`` chardata payload (always quoted+escaped)."""
+    quoted = re.fullmatch(r'"((?:[^"\\]|\\.)*)"', raw_text.strip())
+    if quoted is None:
+        raise PolicyError(f"{label}: unrecognized chardata encoding {raw_text!r}")
+    return _unescape_dump_string(quoted.group(1))
+
+
+_XMLTREE_ELEMENT = re.compile(r"^(\s*)E:\s*([^(\s]+)\s*(?:\(line=\d+\))?\s*$")
+_XMLTREE_ATTRIBUTE = re.compile(r"^(\s*)A:\s+([^=]+)=(.*)$")
+_XMLTREE_TEXT = re.compile(r"^(\s*)C:\s+(.*)$")
+_XMLTREE_ERROR = re.compile(r"^\s*ERROR:")
+_XMLTREE_ATTR_ID_PARENS = re.compile(r"\(\s*0x[0-9a-fA-F]+\s*\)\s*$")
+
+
+def _parse_aapt_xmltree(dump: str, label: str) -> ET.Element:
+    """Rebuild one ElementTree from ``aapt dump xmltree`` output (fail closed).
+
+    aapt prints one line per element/attribute with two-space indent steps:
+    elements ``E: <tag> (line=N)``, attributes ``A: <name>[(<id>)]=<value>``,
+    chardata ``C: "text"``, namespace declarations ``N: prefix=uri``. The N:
+    lines only rename attribute prefixes and are dropped; indentation defines
+    the hierarchy RELATIVE to the first element line, so a dump whose root
+    sits deeper (namespace lines above it) still rebuilds.
+
+    Beyond this shape everything fails closed: ERROR lines are detected here
+    because at least one observed aapt exits 0 after printing ``ERROR: dump
+    failed because resource … not found`` (never trust the exit status
+    alone), a second root at indent depth 0 is a parse anomaly, and text
+    segments are concatenated (fine for schema checks; the NSC schema allows
+    text only where no children may appear).
+    """
+    root: ET.Element | None = None
+    stack: list[tuple[int, ET.Element]] = []
+    for line in dump.splitlines():
+        if not line.strip():
+            continue
+        if _XMLTREE_ERROR.match(line):
+            raise PolicyError(
+                f"{label} reported a dump ERROR line (fail closed): {line.strip()}"
+            )
+        element_match = _XMLTREE_ELEMENT.match(line)
+        if element_match is not None:
+            indent, tag = element_match.group(1), element_match.group(2)
+            element = ET.Element(tag)
+            while stack and stack[-1][0] >= indent:
+                stack.pop()
+            if stack:
+                stack[-1][1].append(element)
+            else:
+                if root is not None:
+                    raise PolicyError(f"{label} contains multiple root elements")
+                root = element
+            stack.append((indent, element))
+            continue
+        attribute_match = _XMLTREE_ATTRIBUTE.match(line)
+        if attribute_match is not None:
+            if not stack:
+                raise PolicyError(f"{label} has an attribute outside any element")
+            name = _XMLTREE_ATTR_ID_PARENS.sub("", attribute_match.group(2).strip())
+            stack[-1][1].set(name, _xmltree_attr_value(attribute_match.group(3), label))
+            continue
+        text_match = _XMLTREE_TEXT.match(line)
+        if text_match is not None:
+            if not stack:
+                raise PolicyError(f"{label} has text outside any element")
+            current = stack[-1][1]
+            current.text = (current.text or "") + _xmltree_text_value(
+                text_match.group(2), label
+            )
+            continue
+        if line.lstrip().startswith("N:"):
+            continue
+        raise PolicyError(f"{label}: unrecognized dump line: {line.strip()!r}")
+    if root is None:
+        raise PolicyError(f"{label} contains no element tree")
+    return root
+
+
+def _load_nsc_rules() -> types.ModuleType:
+    """Load the shared network-security rule engine (``scripts/nsc_check.py``).
+
+    Inserting this file's own directory keeps ``import nsc_check`` resolving
+    when this scanner runs as a bare script (sys.path[0] = scripts/) AND as
+    the ``scripts.apk_policy_inspect`` package module (repo root on sys.path):
+    either way the compiled XML is validated with the exact rules the source
+    gate runs, never a divergent local reimplementation.
+    """
+    scripts_dir = str(Path(__file__).resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import nsc_check
+
+    return nsc_check
+
+
+def _load_backup_rules_check() -> types.ModuleType:
+    """Load the shared backup-rules engine (``scripts/backup_rules_check.py``).
+
+    Same path contract as ``_load_nsc_rules``: the compiled backup rules are
+    validated with the exact ``REQUIRED_EXCLUDES``/file↔root engine the source
+    gate runs, never a divergent local reimplementation (drift between the
+    two copies would be an invisible gate weakening).
+    """
+    scripts_dir = str(Path(__file__).resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import backup_rules_check
+
+    return backup_rules_check
+
+
+def _network_security_mode(application_block: str, app_indent: int | None = None) -> str:
+    """Derive the NSC rule mode from the merged manifest's debuggable attr.
+
+    Measured merged-manifest encoding (real debug APK):
+    ``android:debuggable(0x0101000f)=(type 0x12)0xffffffff`` when the build
+    is debuggable; absence and ``(type 0x12)0x0`` are the non-debug forms.
+    ONLY the exact true encoding proves DEBUG mode - everything else
+    (absent/false/unknown spelling) is validated with the stricter release
+    deny-all rules, fail-closed against proof-by-promise.
+
+    The match is anchored at the <application> element's OWN attribute level
+    (``app_indent + 2``, exactly like the binding gates): aapt prints a CHILD
+    element's attributes at ``app_indent + 4``, so a decoy child carrying
+    android:debuggable cannot flip the mode to debug (a debug face merely
+    RELAXES the loopback cleartext rules, so an unproven surface must stay
+    on the release deny-all side). ``app_indent`` is the production anchor
+    returned by ``_application_manifest_block``; when it is omitted, the
+    anchor is self-derived from the FIRST ``E: application`` line inside the
+    block, and only a block that carries no application element line at all
+    (the direct unit-level call shape) keeps the legacy level-free match.
+    """
+    indent = app_indent
+    if indent is None:
+        anchor_match = re.search(
+            r"^([ \t]*)E:\s*application\b", application_block, re.MULTILINE
+        )
+        if anchor_match is not None:
+            indent = len(anchor_match.group(1))
+    anchor = (
+        _application_attr_anchor(indent) if indent is not None else r"^\s*"
+    )
+    debuggable = re.search(
+        anchor
+        + r"A:\s+(?:android:|http://schemas\.android\.com/apk/res/android:)"
+        + r"debuggable\(\s*"
+        + re.escape(_DEBUGGABLE_ATTR_ID)
+        + r"\s*\)=(.+)$",
+        application_block,
+        re.MULTILINE,
+    )
+    if debuggable is not None and debuggable.group(1).strip() == "(type 0x12)0xffffffff":
+        return "debug"
+    return "release"
+
+
+def _assert_merged_network_security_config(
+    aapt: str,
+    apk: Path,
+    xmltree: str,
+    get_resources: Callable[[], str],
+    resolve_member: Callable[[str], str] | None = None,
+) -> None:
+    """Assert the merged NSC binding AND the compiled XML's policy shape.
+
+    Both halves are artifact-level authority (the source stage cannot observe
+    what ships): a merger marker can strip ``android:networkSecurityConfig``
+    so cleartext falls back to the platform default, or rebind it to a
+    resource no source gate ever validated. The binding value must be proven
+    through the SAME one-execute-per-APK resources dump as the backup pair
+    (id-form ids must map to the pinned xml name; reference-NAME form must be
+    an exact whole-payload match AND the name must be carried by the table).
+    Once the pin survives, the
+    compiled resource itself is dumped via ``aapt dump xmltree`` and rebuilt
+    by ``_parse_aapt_xmltree`` - a compiled-XML alias cannot differ from
+    source undetected - then validated with ``scripts/nsc_check.py
+    .validate_tree`` under the mode derived from ``android:debuggable``.
+
+    The dumped member path is RESOLVED through ``_compiled_member_resolver``
+    for the same reason as the backup pair: release resource-name obfuscation
+    renames the compiled entry, so the canonical
+    ``res/xml/network_security_config.xml`` must not be hard-coded. The
+    canonical member stays the validator's label; a resolution failure is a
+    named ``PolicyError``, never a skip.
+
+    Both the binding ``A:`` line and the ``android:debuggable`` mode input
+    are anchored at the <application> element's OWN attribute level
+    (``app_indent + 2``, aapt's two-space hierarchy step): a decoy CHILD
+    observed in the reviewer repro can wear
+    ``android:networkSecurityConfig`` (fully resolvable through the
+    resources table) or ``android:debuggable=true`` while ``<application>``
+    itself carries neither - the child's ``A:`` lines print at
+    ``app_indent + 4``, so the exact-level anchor leaves them nothing to
+    match and the gate fails with its mandatory errors.
+    """
+    if resolve_member is None:
+        resolve_member = _compiled_member_resolver(aapt, apk)
+    application_block, app_indent = _application_manifest_block(xmltree)
+    mode = _network_security_mode(application_block, app_indent)
+    application_attr_anchor = _application_attr_anchor(app_indent)
+    match = re.search(
+        application_attr_anchor
+        + r"A:\s+(?:android:|http://schemas\.android\.com/apk/res/android:)"
+        + re.escape(_NETWORK_SECURITY_ATTR_NAME)
+        + r"\(\s*"
+        + re.escape(_NETWORK_SECURITY_ATTR_ID)
+        + r"\s*\)=(.+)$",
+        application_block,
+        re.MULTILINE,
+    )
+    if match is None:
+        raise PolicyError(
+            "merged manifest lost the network security config binding "
+            "android:networkSecurityConfig (0x01010527) on <application>: a "
+            'manifest-merger marker (tools:node="replace" / tools:remove) '
+            "can strip it; cleartext policy would fall back to the platform "
+            "default"
+        )
+    value = match.group(1).strip()
+    # The id column must match the WHOLE value (fullmatch, mirrored with the
+    # backup pair above): a "@0x7f010002;junk" composite must never resolve
+    # the truncated id as authoritative - it falls through to
+    # _xmltree_attr_value, which fails closed with a named unknown-encoding
+    # error. Only a whole-value reference may be proven against the table.
+    bound_by_id = re.fullmatch(r"@(?:res/)?0x([0-9a-fA-F]+)", value)
+    if bound_by_id is not None:
+        # The id column is the merger-proof half of the pin: prove the
+        # referenced id IS xml/network_security_config in the table (an id
+        # snapshot alias to another name must not pass). An id with NO entry
+        # at all fails closed here - there is no silent skip.
+        _resources_table_resolves(
+            get_resources(),
+            int(bound_by_id.group(1), 16),
+            _NETWORK_SECURITY_RESOURCE,
+            _NETWORK_SECURITY_ATTR_NAME,
+            binding_kind="networkSecurityConfig",
+        )
+    else:
+        # Older aapt prints the resource reference as a quoted string literal
+        # instead of an id. Decode the FULL payload first (the Raw spelling is
+        # the authority; unknown encodings fail closed inside
+        # _xmltree_attr_value) and then demand an EXACT match on the whole
+        # decoded value: a search()-style prefix hit would let trailing junk
+        # such as "@xml/network_security_config;" satisfy this pin while the
+        # runtime actually resolves - or fails to resolve - a different value.
+        decoded = _xmltree_attr_value(
+            value, f"merged manifest android:{_NETWORK_SECURITY_ATTR_NAME}"
+        )
+        if decoded != f"@xml/{_NETWORK_SECURITY_RESOURCE}":
+            raise PolicyError(
+                f"merged manifest android:{_NETWORK_SECURITY_ATTR_NAME} does not "
+                f"reference @xml/{_NETWORK_SECURITY_RESOURCE} (got {decoded}) - "
+                "rebound networkSecurityConfig binding"
+            )
+        # A clean literal is only the older-aapt PRINT of a typed reference, so
+        # the same table proof applies: the pinned name must exist in the
+        # resources table or the binding cannot survive a dereference.
+        _resources_table_carries_name(
+            get_resources(),
+            _NETWORK_SECURITY_RESOURCE,
+            _NETWORK_SECURITY_ATTR_NAME,
+            binding_kind="networkSecurityConfig",
+        )
+    nsc_member = resolve_member(_NETWORK_SECURITY_MEMBER)
+    nsc_dump = _run_bounded_stdout(
+        [aapt, "dump", "xmltree", str(apk), nsc_member],
+        "aapt dump xmltree (network security config)",
+        max_bytes=MAX_RESOURCES_DUMP_BYTES,
+    )
+    root = _parse_aapt_xmltree(nsc_dump, "aapt xmltree network security config")
+    errors = _load_nsc_rules().validate_tree(
+        root, mode, _NETWORK_SECURITY_MEMBER
+    )
+    if errors:
+        raise PolicyError(
+            f"compiled {_NETWORK_SECURITY_MEMBER} fails the {mode} network "
+            f"security rules (artifact-level authority): {'; '.join(errors)}"
+        )
 
 
 def _validate_dexdump(dexdump: str, dex_name: str, dex_bytes: bytes) -> None:
@@ -680,13 +1718,49 @@ def _validate_dexdump(dexdump: str, dex_name: str, dex_bytes: bytes) -> None:
         raise PolicyError(f"native dexdump rejected {dex_name} (exit {return_code})")
 
 
+def _check_common_permissions(permissions: str, xmltree: str) -> None:
+    """Assert the COMMON flavor permission policy on the merged manifest.
+
+    The locked manifest policy (the decision noted in
+    ``app/src/foss/AndroidManifest.xml`` / ``app/src/github/AndroidManifest.xml``)
+    forbids SMS, MANAGE_EXTERNAL_STORAGE, and VPN declarations in EVERY
+    flavor, so this check runs for ALL modes in ``inspect_apk`` BEFORE the
+    github early-return (which previously scanned no permissions at all),
+    closing the common-manifest enforcement gap for Foss/Github.
+
+    Surface: the same two dumps the play scan consumes - ``aapt dump
+    permissions`` output plus the merged-manifest ``aapt dump xmltree`` - so
+    the check adds no new tool contract and is grounded in the compiled
+    artifact bytes. VPN registration is caught both by the
+    ``BIND_VPN_SERVICE`` uses-permission token and by ``vpnservice``-shaped
+    xmltree element references (a bare ``<service>`` advertising a
+    ``VpnService`` subclass ships a VPN without the permission); the
+    play-only DEX superclass analysis stays in ``_check_play``. Accessibility
+    is deliberately NOT part of the common set: the foss/github overlays
+    legally declare accessibility services, and the a11y token must never
+    fail them (see ``_check_play`` for the play-only halves).
+    """
+    manifest_dump = (permissions + "\n" + xmltree).upper()
+    for token in COMMON_FORBIDDEN_PERMISSIONS:
+        if token in manifest_dump:
+            raise PolicyError(
+                f"merged manifest declares forbidden permission/reference "
+                f"{token} (common flavor policy: fail-closed in every mode)"
+            )
+    if COMMON_VPN_REFERENCE_RE.search(xmltree):
+        raise PolicyError(
+            "merged manifest registers a VpnService (common flavor policy: "
+            "fail-closed in every mode)"
+        )
+
+
 def _check_play(permissions: str, xmltree: str, infos: Iterable[zipfile.ZipInfo], dexes: list[ParsedDex]) -> None:
     manifest_dump = (permissions + "\n" + xmltree).upper()
     for token in PLAY_FORBIDDEN_PERMISSIONS:
         if token in manifest_dump:
             raise PolicyError(f"Play APK declares forbidden permission/reference {token}")
-    if re.search(r"accessibilityservice|vpnservice", xmltree, re.IGNORECASE):
-        raise PolicyError("Play APK manifest registers an AccessibilityService/VpnService")
+    if re.search(r"accessibilityservice", xmltree, re.IGNORECASE):
+        raise PolicyError("Play APK manifest registers an AccessibilityService")
 
     for dex in dexes:
         for descriptor in dex.defined_classes:
@@ -727,6 +1801,57 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str) -> None:
 
     infos, dex_infos = _validate_archive(apk)
     permissions, xmltree = _validate_aapt_output(aapt, apk)
+    # One bounded ``aapt dump resources`` execution per APK: the backup and
+    # networkSecurityConfig binding authorities resolve through this SAME
+    # dump result (threaded callable; no module-global cache).
+    get_resources = _resources_dump_resolver(aapt, apk)
+    # One bounded ``aapt2 dump resources`` execution per APK resolves the
+    # COMPILED member path of each pinned xml resource: a release build
+    # obfuscates the entry names (res/xml/backup_rules.xml -> res/Qq.xml), so
+    # the canonical path cannot be hard-coded. The resolver is threaded to
+    # both compiled-XML authorities so they share the single aapt2 dump and
+    # the same fail-closed name->path proof.
+    resolve_member = _compiled_member_resolver(aapt, apk)
+    # Backup bindings on the MERGED manifest (artifact-level authority) run
+    # for every policy mode: Play and Foss ship the same binding contract.
+    _assert_merged_backup_bindings(xmltree, get_resources)
+    # Compiled backup-rules BYTES (the binding itself pins filenames only;
+    # the compiled content must still carry the exact key-file exclude set).
+    _assert_merged_backup_rules_bytes(aapt, apk, resolve_member)
+    # networkSecurityConfig binding + compiled-XML rule check (same
+    # artifact-level authority, scripts/nsc_check.py rule engine); joined
+    # execution with the backup gate so one merged-manifest difference keeps
+    # every policy contract provable in this artifact.
+    _assert_merged_network_security_config(
+        aapt, apk, xmltree, get_resources, resolve_member
+    )
+
+    # Common flavor permission policy (P2-1): forbidden SMS / all-files-access
+    # / VPN declarations fail EVERY mode, including github (which otherwise
+    # early-returns below). Play-only extras (accessibility) stay in
+    # _check_play; the common scan adds no new tool contract - the same
+    # permissions/manifest dumps the play scan consumes.
+    _check_common_permissions(permissions, xmltree)
+
+    if mode == "github":
+        # Github debug is neither a Play nor a Foss package: no flavor DEX
+        # class-table policy applies. It already proved the mode-independent
+        # artifact authorities (merged backup binding + compiled rules bytes
+        # + NSC binding compiled check) plus the COMMON flavor permission
+        # policy above - that is the entire contract here. The aapt/dexdump
+        # tool contract is still enforced above, so a wrong tool invocation
+        # cannot silently degrade the mode.
+        print(
+            f"  structure: APK ZIP/manifest OK ({len(dex_infos)} root DEX "
+            "shard(s), DEX tables not parsed)"
+        )
+        print(
+            "  policy: github OK (mode-independent artifact authorities "
+            "only: merged-manifest backup/NSC bindings + compiled backup "
+            "rules bytes + compiled NSC)"
+        )
+        return
+
     parsed_dexes: list[ParsedDex] = []
     descriptor_budget = DescriptorBudget()
     with zipfile.ZipFile(apk, "r") as archive:
@@ -751,7 +1876,7 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("play", "foss"), required=True)
+    parser.add_argument("--mode", choices=("play", "foss", "github"), required=True)
     parser.add_argument("--apk", required=True)
     parser.add_argument("--aapt", required=True)
     parser.add_argument("--dexdump", required=True)

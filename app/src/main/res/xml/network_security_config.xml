@@ -7,7 +7,9 @@
   network_security_config.xml, which additionally permits loopback +
   emulator-host cleartext so LlmProvider.validateBaseUrl's http:// dev
   allowlist can connect; LAN entries must never land here (use adb reverse).
-  Release artifacts always use THIS file (asserted by play_policy_check.sh).
+  Release artifacts always use THIS file; play_policy_check.sh fail-closed
+  scans EVERY network_security_config.xml under app/src (guarded find,
+  not only main's fixed path).
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="false">

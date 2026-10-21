@@ -3,12 +3,54 @@ package dev.librepocket.systema
 /**
  * 鬧鐘工具：`ALARM_CLOCK`（SET_ALARM）Intent 委託系統鬧鐘 App。
  *
- * 主路徑無需任何權限；降級「自有提醒」才需要精準鬧鐘申報
+ * Status: Target（純側契約，未接線未 E2E；矩陣層 `executionReady=false` 概念，
+ * 非 `ToolDescriptor` 欄位；目前尚無生產呼叫方，接線 PR 啟用；`SystemEnv` 無生產 producer，
+ * `timeoutMs` 僅宣告未強制，見 [ToolRegistry]）。
+ *
+ * 本層守衛多為**本層自訂的 fail-closed 政策**，較官方契約嚴格：官方
+ * Common Intents 對 HOUR/MINUTES 未定義數值範圍、對 MESSAGE 未定義長度
+ * 上限（皆無）；本層 0-23/0-59/500 字元為 Binder 傳輸防禦（超界一律
+ * INTERNAL 而非照送），未來 dispatcher 接線時模型端須知「官方合法但
+ * 本層拒絕」的可能。
+ * P2 收斂：本校驗經 [execute] 的 [guardedToolBuild] 於能力分支（DEGRADED/
+ * launch）之前一律執行；靜態無系統鬧鐘 App 的降級路徑先驗證後降級，非法
+ * 參數在任何可執行分支皆得 INTERNAL（USER_DISABLED 除外：能力問題先於
+ * 參數問題，見測試 USER_DISABLED 釘選）。驗證刻意留在 builder 本體（build/
+ * parse 兩側已有同值守衛；另抽 validateParams 會成第三份須同步的守衛集，
+ * 故以 [guardedToolBuild] 於執行點收斂取代）。
+ *
+ * 權限決策（#14：發送端需宣告 normal 級 `com.android.alarm.permission.SET_ALARM`）：
+ * 官方 Common Intents 明確要求「要發送 ACTION_SET_ALARM，App 必須持有
+ * `com.android.alarm.permission.SET_ALARM`」。接收端 activity（Google Clock /
+ * AOSP DeskClock 的 SET_ALARM handler）以 `android:permission` 保護時，該屬性
+ * 限制的是**呼叫端**：未持有此權限的發送 App 在 `startActivity` 會被系統以
+ * `SecurityException` 拒絕。此為 normal 級權限（安裝即自動授權、非高風險，
+ * Play 不需申報或 Data Safety 披露），故於 common manifest 宣告，三風味一致。
+ * 個別時鐘 App 若未以該權限保護，亦不影響：持有 normal 權限者一律可發射。
+ * 若未來時鐘 App 改變保護方式而觸發其他 `SecurityException`，[AndroidIntentLauncher]
+ * 已收斂為 `INTERNAL`（fail-closed，不靜默退回猜測執行；僅附 cause 類名，
+ * 不含 message/PII，亦無 audit——intent 層不審計，由未來 dispatcher 層統一審計）。
+ * 降級「自有提醒」才需要精準鬧鐘申報
  * （`SCHEDULE_EXACT_ALARM`，API 31+；或 `USE_EXACT_ALARM`，
  * Play 需在 Data Safety + 商店描述中披露用途，見 [fallback] 的
  * requiresDeclaration）。三風味皆允許。
+ *
+ * 可見性（#14）：主 manifest `<queries>` 已宣告 SET_ALARM；API 30+ 無宣告時
+ * `resolveActivity` 被過濾為 null → 誤判 NO_HANDLER。靜態 [check] 通過但發射
+ * 時仍無處理者（實現被移除/停用/不可見），一律走自有提醒降級（見 [execute]），
+ * 與靜態 DEGRADED 同語義。
+ *
+ * 確認門（ASK 不默許 ALLOW）：[Params.skipUi] 為 true 時僅是「請求免確認直設」，
+ * 仍由系統鬧鐘 App 決定是否尊重；未來 dispatcher 若把模型參數透傳給
+ * [parseParams]，必須在 `skipUi=true` 時要求 `confirmed + 不可變操作快照
+ * （hour/minute/message + requestId + generation）` 全等，否則回 `NeedConfirm`
+ *（接線 PR 需先補 requestId/generation/confirmed/NeedConfirm 型別，現僅 KDoc 約束）。
+ * 本層不代行確認，不靜默直設.
  */
 object AlarmTool : SystemTool<AlarmTool.Params> {
+
+  /** Binder 傳輸上限防禦：訊息過長在 builder/parse 即拒，不等到 TransactionTooLarge。 */
+  const val MAX_MESSAGE_LEN = 500
 
   data class Params(
     val hour: Int,
@@ -35,8 +77,11 @@ object AlarmTool : SystemTool<AlarmTool.Params> {
   fun buildSetAlarmIntent(params: Params): IntentSpec {
     require(params.hour in 0..23) { "hour out of range: ${params.hour}" }
     require(params.minute in 0..59) { "minute out of range: ${params.minute}" }
+    require(params.message.length <= MAX_MESSAGE_LEN) { "message too long: ${params.message.length} > $MAX_MESSAGE_LEN" }
     // D2 型別化：HOUR/MINUTES 用 Int（AlarmClock.EXTRA_* 為 int），
     // SKIP_UI 用 Boolean；系統鬧鐘 App 才能正確讀回（getIntExtra/getBooleanExtra）。
+    // 空白正規化：build 丟棄全空白 message（isNotBlank），parse 缺席回 ""；
+    // 故 Params(7,30," ") round-trip 後為 ""，屬刻意正規化（見測試釘選）。
     val extras = mutableMapOf<String, IntentExtra>(
       IntentActions.EXTRA_ALARM_HOUR to IntentExtra.IntVal(params.hour),
       IntentActions.EXTRA_ALARM_MINUTES to IntentExtra.IntVal(params.minute),
@@ -50,27 +95,78 @@ object AlarmTool : SystemTool<AlarmTool.Params> {
     return IntentSpec(action = IntentActions.SET_ALARM, extras = extras)
   }
 
+  /**
+   * 從 extras 還原 [Params]（#14 生產讀側採用 [requireExtra]，#19 猜測執行禁令）。
+   *
+   * HOUR/MINUTES 必填 Int（缺參/錯型拋 `IllegalStateException`，帶 key + 期望型別，
+   * 禁 `getIntExtra(key, 0)` 式預設猜測——缺 hour 就設 00:00 是猜測執行）；
+   * MESSAGE 選填（缺席=空）；SKIP_UI 選填（缺席=false，見 [Params.skipUi]）。
+   * 範圍守衛與 [buildSetAlarmIntent] 同訊息，dispatcher 不得繞過 builder 校驗。
+   * 未來 dispatcher 將模型參數轉 Params 的唯一入口；目前尚無生產呼叫方（接線 PR 啟用）。
+   */
+  fun parseParams(extras: Map<String, IntentExtra>): Params {
+    val hour = extras.requireExtra<IntentExtra.IntVal>(IntentActions.EXTRA_ALARM_HOUR).value
+    val minute = extras.requireExtra<IntentExtra.IntVal>(IntentActions.EXTRA_ALARM_MINUTES).value
+    val message = extras.optionalExtra<IntentExtra.Str>(IntentActions.EXTRA_ALARM_MESSAGE)?.value.orEmpty()
+    val skipUi = extras.optionalExtra<IntentExtra.Bool>(IntentActions.EXTRA_ALARM_SKIP_UI)?.value ?: false
+    require(hour in 0..23) { "hour out of range: $hour" }
+    require(minute in 0..59) { "minute out of range: $minute" }
+    require(message.length <= MAX_MESSAGE_LEN) { "message too long: ${message.length} > $MAX_MESSAGE_LEN" }
+    return Params(hour, minute, message, skipUi)
+  }
+
   override fun execute(params: Params, env: SystemEnv, launcher: IntentLauncher): ToolResult {
     val check = check(env)
     if (!check.executable) {
       return ToolResult(false, false, null, check.reasonCode, "做不到設定鬧鐘（${check.reasonCode}）")
     }
-    if (check.availability == Availability.DEGRADED) {
-      return ToolResult(
-        false, true, null, check.reasonCode,
-        "做不到呼叫系統鬧鐘（${check.reasonCode}）→ 可替代自有提醒 → 需要你授權精準鬧鐘",
-      )
+    // fail-closed：builder IAE/ISE（範圍/長度）收斂為 INTERNAL，且必須早於
+    // DEGRADED 分支——靜態無系統鬧鐘 App 的降級路徑同樣不得繞過參數校驗
+    //（P2 修復：此前 hour=25/超長 message 走 fallback 話術原樣回顯「25:00」
+    // 與整段 label，KDoc「越界一律 INTERNAL」失實）。收斂點 [guardedToolBuild]：
+    // 話術由呼叫方提供，訊息與原 inline catch 逐字相同；DEGRADED 契約維持
+    // spec=null（驗證後即棄 build 產物，不攜帶嘗試過的 spec）。
+    val internalFailure =
+      ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到設定鬧鐘（${ReasonCodes.INTERNAL}）")
+    val spec = when (val build = guardedToolBuild(internalFailure) { buildSetAlarmIntent(params) }) {
+      is Guarded.Internal -> return build.result
+      is Guarded.Built -> build.value
     }
-    val spec = buildSetAlarmIntent(params)
-    return launcher.launchCatching(spec).toToolResult(spec, "設定鬧鐘")
+    if (check.availability == Availability.DEGRADED) {
+      // 靜態無系統鬧鐘 App：與執行期 NoHandler 同語義（自有提醒降級），
+      // 話術統一取 [fallback]（含 label 與通知授權提示，與姊妹工具一致）。
+      return ToolResult(false, true, null, check.reasonCode, fallback(params, env).userMessage)
+    }
+    return when (val launched = launcher.launchCatching(spec)) {
+      // 發現式缺席（靜態 check 通過但 resolve 為空：實現被移除/停用/不可見）：
+      // 與靜態 DEGRADED 同語義（自有提醒降級），話術統一取 [fallback]，
+      // 禁靜默吞掉或猜測執行。
+      LaunchResult.NoHandler -> ToolResult(
+        false, true, spec, ReasonCodes.NO_HANDLER, fallback(params, env).userMessage,
+      )
+      // Success/Internal 走共用收斂。
+      else -> launched.toToolResult(spec, "設定鬧鐘")
+    }
   }
 
+  /**
+   * 降級分支僅用於 NO_HANDLER（靜態無 App 或執行期發現式缺席）。
+   * USER_DISABLED 等不可執行路徑由 [execute] 早期回傳，不經此函式；
+   * 未來呼叫方不得以 USER_DISABLED 調用本函式取 NO_HANDLER 話術。
+   * 參數契約：本函式收到的 params 已經由 [buildSetAlarmIntent]（或 parse 側）
+   * 完成同一組 fail-closed 校驗（0-23/0-59/≤[MAX_MESSAGE_LEN]），且 [execute]
+   * 的守衛在能力分支之前一律執行。label/time 渲染**刻意不做 take 截斷**：500
+   * 字上限已保證話術長度有界，臨時截斷反而改變合法上限輸入的話術（見測試
+   * `alarm_execute_degraded_validKeepsFallbackCopyWithFullLabel` 釘選）。
+   */
   override fun fallback(params: Params, env: SystemEnv): FallbackSpec {
     val label = if (params.message.isNotBlank()) "「${params.message}」" else "鬧鐘"
     return FallbackSpec(
       reasonCode = ReasonCodes.NO_HANDLER,
       requiresDeclaration = "自有提醒需申報 SCHEDULE_EXACT_ALARM（API 31+）或 USE_EXACT_ALARM，" +
-        "並請求 POST_NOTIFICATIONS；触发時間 %02d:%02d".format(params.hour, params.minute),
+        "並請求 POST_NOTIFICATIONS；觸發時間 " +
+        // Locale.ROOT：時間用拉丁數字，與話術的 zh-Hant 一致（禁依裝置 locale 變體數字）。
+        String.format(java.util.Locale.ROOT, "%02d:%02d", params.hour, params.minute),
       userMessage = "做不到呼叫系統鬧鐘（${ReasonCodes.NO_HANDLER}）" +
         "→ 可替代 App 內自有提醒$label → 需要你授權精準鬧鐘與通知",
     )

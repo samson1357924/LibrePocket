@@ -3,10 +3,13 @@ package dev.librepocket.systema
 /**
  * 快通道工具契約：每個 A 組工具都實現 check / execute / fallback 三件套。
  *
- * builder 的 `require` IAE 目前由呼叫方直接外洩、不收斂為 [ToolResult]
- *（[execute]/[fallback] 內調 builder 無 try-catch；生產尚無 dispatcher 接線，
- * 目前不可達，僅測試直調）。Target：未來 dispatcher（或 caller-catch）須將
- * builder IAE 收斂為 `ToolResult`，不讓 IAE 穿透生產迴圈。
+ * builder 的 `require` IAE/ISE 由各工具 `execute` 經 [guardedToolBuild] 收斂為
+ * [ToolResult]（INTERNAL，spec=null），不穿透生產迴圈：
+ * [AlarmTool.execute]、[CalendarTool.execute]/[executeUpdate]/[executeDelete]、
+ * [MusicTool.execute]、[VolumeTool.execute]、[NavigationTool.execute] 皆已收斂（#15）。
+ * parse 側（模型參數 → Params，未來 dispatcher 唯一入口）同樣拋 IAE/ISE，
+ * 未來 dispatcher 須在呼叫 parse 側包 try-catch 收斂為 `ToolResult`；
+ * 生產尚無 dispatcher 接線，目前 parse 僅測試直調。
  *
  * @param P 該工具的參數型別（純資料）。
  */
@@ -20,14 +23,18 @@ interface SystemTool<P> {
 data class ToolDescriptor(
   val name: String,
   val level: SideEffectLevel,
-  /** 單次執行的超時毫秒（ARCH §9.1：每個快通道工具宣告超時）。 */
+  /** 單次執行的超時毫秒（每個快通道工具宣告超時；目前僅宣告未強制，見各工具 KDoc）。 */
   val timeoutMs: Long,
   val description: String = "",
 )
 
 /**
- * 工具註冊表。A 組 6 項在此註冊，FastRouter 按名取用。
- * 原創命名：`system.*` 前綴保留給快通道系統操作。
+ * 工具註冊表（原創命名：`system.*` 前綴保留給快通道系統操作）。
+ *
+ * 注意：與 `dev.librepocket.tool.ToolRegistry` 同名——FastRouter 實際查詢的
+ * 是後者（裝配提示的 slow 通道表，見其檔案說明）；本表目前僅由 [init] 填入、
+ * 以 `names()`（A 組 6 項）供測試/契約自述使用，生產執行器尚未接線
+ *（未來 dispatcher 按名取用時須另接線，勿誤以為已掛在 FastRouter）。
  */
 object ToolRegistry {
   const val NAVIGATE = "system.navigate"
@@ -48,7 +55,17 @@ object ToolRegistry {
     register(ToolDescriptor(MUSIC, SideEffectLevel.WRITE, 10_000, "音樂：媒體 Intent + MediaSession 前台"))
   }
 
+  /**
+   * 註冊（fail-closed）：重複名稱直接拒絕（`require`）——靜默覆寫會在 initializer
+   * 順序或 flavor 類覆疊出錯時把 descriptor 換人而不留痕跡。
+   *
+   * 呼叫契約：僅限物件 initializer（類初始化單執行緒保證）；backing map 為
+   * 非 thread-safe 的 `linkedMapOf`，未來若開放執行期註冊須先加同步。
+   */
   fun register(descriptor: ToolDescriptor) {
+    require(!descriptors.containsKey(descriptor.name)) {
+      "duplicate tool registration: ${descriptor.name}"
+    }
     descriptors[descriptor.name] = descriptor
   }
 

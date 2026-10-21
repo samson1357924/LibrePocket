@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   Common manifest for all flavors. Only store-safe permissions live here.
-  High-risk permissions (SMS, all-files access) and privileged services
-  (Accessibility, VPN) are declared exclusively in the src/github + src/foss overlays,
-  so the play flavor can never inherit them.
+  High-risk uses-permissions (SMS, all-files access, VPN) are effectively
+  absent in all three flavors: the base manifest never declares them, and the
+  play overlay adds 6x tools:node="remove" anchors as a drift guard; a11y
+  service is declared only in src/foss + src/github overlays (service
+  hardening relies on DEX superclass + xmltree gates).
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -12,20 +14,45 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
-    <!-- S2 系統語音辨識：委託系統 RecognizerIntent（無 RECORD_AUDIO 新權限）。
-         queries 僅宣告可見性，供 PackageManager 解析辨識服務；
-         action 必須是 RECOGNIZE_SPEECH（與 VoiceStt.ACTION 同字面值），
-         不可用 RecognitionService（服務類名，非 intent action，解析不到）；
-         無服務時 ChatScreen 降級手動輸入（NO_PRIVILEGE）。
-         S2 系統語音輸出：TTS_SERVICE 可見性供 getEngines() 引擎探測；
-         targetSdk 36 package-visibility 過濾下若缺此宣告，引擎表可能為空
-         而被誤判 NO_ENGINE。 -->
+    <!-- #14 SET_ALARM 發送端權限：接收端的 SET_ALARM handler 保護「呼叫端」，
+         發送 App 未持有即在 startActivity 遭 SecurityException（normal 級，
+         Play 無需申報）。完整理由與 <queries> 可見性契約：
+         docs/specs/ANDROID_INTENT_VISIBILITY.md -->
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+
+    <!-- queries 可見性（S2 語音 + #14 intent adapter）：targetSdk 36 package
+         visibility 會把未宣告的隱式 Intent 過濾掉，resolve-first launcher 即
+         resolve null＝必然假 NO_HANDLER（static check 已宣稱 NATIVE，屬契約
+         自相矛盾）。逐條理由、MIME 對應與刻意不宣告清單（launch-app 按
+         LaunchAppTool KDoc 缺口註記／DELETE）：docs/specs/ANDROID_INTENT_VISIBILITY.md -->
     <queries>
         <intent>
             <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
         </intent>
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SET_ALARM" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.INSERT" />
+            <data android:mimeType="vnd.android.cursor.dir/event" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.EDIT" />
+            <data android:mimeType="vnd.android.cursor.item/event" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="geo" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.settings.SOUND_SETTINGS" />
         </intent>
     </queries>
 

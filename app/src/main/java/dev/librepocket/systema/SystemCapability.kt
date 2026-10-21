@@ -3,7 +3,7 @@ package dev.librepocket.systema
 /**
  * A 組快通道的能力投影原語（純 JVM，無 Android 依賴）。
  *
- * 對齊 CAPABILITY_MATRIX §1/§5：每個工具的 [SystemTool.check] 都回傳
+ * 對齊能力矩陣 Current evidence：每個工具的 [SystemTool.check] 都回傳
  * [CheckResult]，攜帶 [Availability] + 原因碼，供模型生成降級話術：
  * `做不到 X（原因碼）→ 可替代 Y → 需要你做 Z`。
  */
@@ -11,10 +11,10 @@ enum class Flavor { PLAY, FOSS, GITHUB }
 
 enum class Availability { NATIVE, DEGRADED, UNAVAILABLE }
 
-/** 副作用分級（ARCH §5.2）：READ 可重試；WRITE 需確認/冪等；PRIVILEGED 走系統接管。 */
+/** 副作用分級：READ 可重試；WRITE 需確認/冪等；PRIVILEGED 走系統接管。 */
 enum class SideEffectLevel { READ, WRITE, PRIVILEGED }
 
-/** 原因碼封閉集合（矩陣 §5 + 路由補充），禁止模型自由發揮。 */
+/** 原因碼封閉集合（能力矩陣 Current evidence + 路由補充），禁止模型自由發揮。 */
 object ReasonCodes {
   const val FLAVOR_BLOCKED = "FLAVOR_BLOCKED"
   const val NO_PRIVILEGE = "NO_PRIVILEGE"
@@ -39,6 +39,11 @@ object ReasonCodes {
  *   有系統日曆 App 時更新/刪除優先 EDIT 委託，免寫權限）。
  * @param exactAlarmGranted 精準鬧鐘是否可用（自有提醒降級路徑）。
  * @param hasMusicApp 是否有可處理媒體 Intent 的播放器。
+ *
+ * 接線註記：`calendarRead/WriteGranted` 與 `exactAlarmGranted` 目前在任何
+ * flavor manifest 皆未宣告對應權限（READ_CALENDAR/WRITE_CALENDAR/
+ * SCHEDULE_EXACT_ALARM），且本類無生產 producer——相關 NATIVE 分支在生產
+ * 不可達，屬 Target 語意的一部分；權限接線（含 Play 披露）刻意留給接線 PR。
  */
 data class SystemEnv(
   val flavor: Flavor = Flavor.PLAY,

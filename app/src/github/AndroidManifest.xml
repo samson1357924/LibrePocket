@@ -3,7 +3,7 @@
   GitHub flavor overlay (direct download only, never Play).
   Decision (locked): NO SMS, NO MANAGE_EXTERNAL_STORAGE, NO VPN in any
   flavor. GitHub adds ONLY the accessibility automation service (default off,
-  two-step consent). See CAPABILITY_MATRIX §1-§2 + BACKLOG D15.
+  two-step consent). See CAPABILITY_MATRIX「Current：可確認的邊界」+ BACKLOG B5.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 

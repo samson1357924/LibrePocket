@@ -615,9 +615,19 @@ class SafeToolSlice(
             // ([wireCallIds] is a pure function of the call list), so the
             // receipt and the wire pair never disagree about which id the
             // denial belongs to.
-            val wireIds = wireCallIds(calls)
+            //
+            // The wire id is NORMALIZED the same way the continuation
+            // normalizes it ([uniqueBoundedIds] over the bounded redacted
+            // ids): two DISTINCT raw ids can redact to ONE bounded id (e.g.
+            // two e-mail addresses), and the continuation disambiguates the
+            // later one (`<id>_2`, `<id>_3`, …). The receipt must ride the
+            // SAME normalized id, or the second denial receipt would echo
+            // the un-suffixed base while the tool message's `toolCallId`
+            // carries the suffixed one — the receipt would then point at a
+            // pairing id that no `tool` message carries.
+            val normalizedWireIds = uniqueBoundedIds(wireCallIds(calls).map { boundedRedactedId(it) })
             return calls.mapIndexed { i, c ->
-                deny(c, DenyCodes.SCHEMA_INVALID, "duplicate call id in one round", wireId = wireIds[i])
+                deny(c, DenyCodes.SCHEMA_INVALID, "duplicate call id in one round", wireId = normalizedWireIds[i])
             }
         }
         return calls.map { executeOne(it) }

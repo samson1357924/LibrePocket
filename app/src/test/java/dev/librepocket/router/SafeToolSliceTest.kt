@@ -1292,6 +1292,11 @@ class SafeToolSliceTest {
         assertEquals("wire ids must be unique", wireIds.size, wireIds.toSet().size)
         assertEquals(wireIds[0], msgs[1].toolCallId)
         assertEquals(wireIds[1], msgs[2].toolCallId)
+        // The denial receipt echoes the SAME id the wire pair carries (the
+        // receipt's `callId` must never point at a pairing id that no
+        // `tool` message carries).
+        val rawReceiptIds = results.map { Json.parseToJsonElement(it.resultJson).jsonObject["callId"]!!.jsonPrimitive.content }
+        assertEquals(wireIds, rawReceiptIds)
 
         // The REDACTION collision: two DISTINCT raw ids that normalize to the
         // same bounded pairing id (both e-mail addresses redact to the same
@@ -1311,6 +1316,12 @@ class SafeToolSliceTest {
         assertEquals("normalized ids must be unique", emailIds.size, emailIds.toSet().size)
         assertEquals(emailIds[0], emailMsgs[1].toolCallId)
         assertEquals(emailIds[1], emailMsgs[2].toolCallId)
+        // The denial receipt echoes the SAME (normalized, disambiguated) id
+        // the wire pair carries: the second receipt must carry
+        // `⟦REDACTED:EMAIL⟧_2` — the id its `tool` message pairs with — and
+        // not the un-suffixed base.
+        val receiptIds = emailResults.map { Json.parseToJsonElement(it.resultJson).jsonObject["callId"]!!.jsonPrimitive.content }
+        assertEquals(emailIds, receiptIds)
         // No raw e-mail address rides the wire.
         for (id in emailIds) {
             assertFalse("raw id must not ride the wire: $id", id.contains("@"))

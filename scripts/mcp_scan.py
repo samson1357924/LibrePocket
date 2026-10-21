@@ -995,24 +995,26 @@ def _project_dir_literal(rhs):
 def _parse_settings(directory, roots, visited, depth=0):
     """Add the modules declared by `directory`'s settings file.
 
-    Returns True only when every include/includeBuild/projectDir declaration
-    is a top-level statement with a literal (or literal-only concatenated)
-    argument.  A call hidden in a string, a conditional/lambda/function, a
-    variable argument, or a non-literal projectDir makes the whole settings
-    file untrusted, so discovery falls back to the repo root only.
+    Returns "ok" when every include/includeBuild/projectDir declaration is a
+    top-level statement with a literal (or literal-only concatenated)
+    argument, "absent" when there is no settings file, and "untrusted" when a
+    settings file exists but a call is hidden in a string, a
+    conditional/lambda/function, has a variable argument, or has a non-literal
+    projectDir.  The caller decides whether untrusted means a root-only
+    fallback (discovery) or a hard failure (strict module-roots).
     """
     if depth > 8:
-        return False
+        return "untrusted"
     settings = _settings_path(directory)
     if settings is None:
-        return False
+        return "absent"
     if settings in visited:
-        return True
+        return "ok"
     visited.add(settings)
     try:
         keep = _strip_gradle_comments(read_text(settings))
     except OSError:
-        return False
+        return "untrusted"
     code = _blank_gradle_strings(keep)
     tokens = _token_view(keep)
     depths = _depth_table(code)
@@ -1089,7 +1091,8 @@ def _parse_settings(directory, roots, visited, depth=0):
         roots.add(included)
         # Follow an included build's own settings when it has one.
         if _settings_path(included) is not None:
-            if not _parse_settings(included, roots, visited, depth + 1):
+            if _parse_settings(included, roots, visited, depth + 1) \
+                    == "untrusted":
                 parsed = False
 
     for match in PROJECT_CALL_RE.finditer(code):
@@ -1125,29 +1128,44 @@ def _parse_settings(directory, roots, visited, depth=0):
         projects[project] = module
 
     if not found_call:
-        # A root settings file with no include/includeBuild at all tells us
-        # nothing about module layout: only the repo root may prune `build/`.
-        return False
+        # A settings file with no include/includeBuild/projectDir at all tells
+        # us the root declares no modules: only the repo root may prune
+        # `build/`.  This is a fully determined layout, not an untrusted parse.
+        return "ok"
     if not parsed:
-        return False
+        return "untrusted"
     roots.update(projects.values())
-    return True
+    return "ok"
 
 
-def module_roots(root):
+class SettingsUntrustedError(RuntimeError):
+    pass
+
+
+def module_roots(root, strict=False):
     """Return the dirs whose `build/` is a real Gradle output root.
 
     Root-settings-driven when a root settings file exists (includes,
     includeBuild, projectDir overrides).  A nested inert settings/build file
     inside a source package is never a module root.  Without root settings,
     only the repo root and depth-1 children with build.gradle[.kts] + src/
-    qualify (the real `app` is depth 1).  If a root settings file exists but
-    cannot be parsed, fail closed: only the repo root may prune `build/`.
+    qualify (the real `app` is depth 1).
+
+    A settings file that exists but cannot be fully parsed is untrusted.  In
+    non-strict mode discovery keeps the historical root-only fallback (the
+    gate separately rejects untrusted settings); strict mode raises
+    SettingsUntrustedError so `module-roots` can fail closed instead of
+    silently pruning a real module named `build`.
     """
     root = os.path.abspath(root)
     roots = {root}
-    if _settings_path(root) is not None:
-        if not _parse_settings(root, roots, set()):
+    settings = _settings_path(root)
+    if settings is not None:
+        if _parse_settings(root, roots, set()) == "untrusted":
+            if strict:
+                raise SettingsUntrustedError(
+                    "settings file present but module roots cannot be fully "
+                    f"determined: {rel_to(root, settings)}")
             return {root}
         return roots
     try:
@@ -1176,10 +1194,13 @@ def _prune_dir(name, parent, root, module_roots):
         return True
     if name == "build":
         full = os.path.normpath(os.path.join(parent, name))
-        # A *module* may itself be named `build` (include(":build")).  Its
-        # sources are production sources; only its own `<module>/build`
-        # child is a pruned output tree.
-        if full in module_roots:
+        # A *module* may itself be named `build` (include(":build")), or a
+        # literal projectDir may place a module below an output tree
+        # (`build/renamed`).  Keep the ancestor traversable in either case;
+        # only the module's own child `<module>/build` is pruned output.
+        prefix = full + os.sep
+        if any(root == full or root.startswith(prefix)
+               for root in module_roots):
             return False
         return parent == root or parent in module_roots
     return False
@@ -1369,7 +1390,12 @@ def main(argv):
         if len(argv) != 3:
             print("usage: mcp_scan.py module-roots ROOT")
             return 2
-        for path in sorted(module_roots(argv[2])):
+        try:
+            roots = module_roots(argv[2], strict=True)
+        except SettingsUntrustedError as exc:
+            print(f"module roots untrusted (fail closed): {exc}")
+            return 2
+        for path in sorted(roots):
             print(path)
         return 0
     if command in ("types", "outbound"):

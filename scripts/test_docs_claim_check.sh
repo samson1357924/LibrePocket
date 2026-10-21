@@ -222,6 +222,23 @@
 #      path (P1/P2/P4/P5/P6/P7)
 #  1bx. srcDir("build/generated/ksp") stays an accepted fail-closed over-block
 #      (P3; explicit main srcDirs under build are not added to discovery)
+#  1by. an explicit main receiver on the srcDir call wins over an enclosing test
+#      block (F-1: direct call, .apply, .also, sourceSets.test property block);
+#      a balanced lambda before `.java.srcDir` is crossed (apply/also/multiline);
+#      with(...)/safe-call/asserted-call/require/check receivers resolve; a
+#      newline/comment before the with block and chained run/apply/let/also
+#      blocks resolve (including a later chain after an earlier lambda); bare
+#      and nested wrapper arguments resolve; receiver
+#      aliases (direct, after apply, with, sourceSets) resolve or fail closed;
+#      an opaque helper/listOf argument mention fails closed (F-1/F-3)
+#  1bz. a module literally named build has its build.gradle.kts scanned for a
+#      main srcDir and for manifestPlaceholders (F-2 N3/N9); untrusted settings
+#      fail closed instead of silently pruning that module; a literal projectDir
+#      below build/ keeps its ancestor traversable, including nested production
+#      sources; a root build/generated file next to that projectDir is a
+#      documented accepted over-block and stays red
+#  1ca. the same module's build/src/main sources are still discovered (N3b)
+#  1cb. the same module's AndroidManifest is scanned, not pruned as output
 #   7. discovery: no manifests at all (fail closed, never silent pass)
 #   8. discovery: no */src source roots at all
 #   9. discovery: unreadable production source (chmod 000 → scan fails closed)
@@ -3251,6 +3268,632 @@ expect_fail "$TMP/srcdir_g24_d2_multiline_main" \
   "a multi-line main receiver is still flagged (G-24 D2)" \
   "main source set adds a test/build source dir"
 
+# --- Final gate F-1: an explicit main receiver wins inside a test block ----
+# The enclosing test block must not hide a direct main mutation at the call
+# site.  Each fixture puts the wired production-shaped file under src/test and
+# widens main to it; only the main-srcDir guard can catch it.
+
+mkdir -p "$TMP/srcdir_f1_wire/app/src/test/java/com/example"
+cat > "$TMP/srcdir_f1_wire/app/src/test/java/com/example/Wired.java" <<'JAVA'
+package com.example;
+class Wired { Object x = dev.librepocket.mcp.McpServer.class; }
+JAVA
+
+for case_name in n1 n2 n10 n11; do
+  d="$TMP/srcdir_f1_$case_name"
+  cp -r "$TMP/clean" "$d"
+  mkdir -p "$d/app/src/test/java/com/example"
+  cp "$TMP/srcdir_f1_wire/app/src/test/java/com/example/Wired.java" \
+    "$d/app/src/test/java/com/example/Wired.java"
+  case "$case_name" in
+    n1) snippet='    sourceSets.getByName("test") {
+        java.srcDir("src/testResources")
+        sourceSets.getByName("main").java.srcDir("src/test")
+    }' ;;
+    n2) snippet='    sourceSets.getByName("test").apply {
+        sourceSets.getByName("main").java.srcDir("src/test")
+    }' ;;
+    n10) snippet='    sourceSets.getByName("test").also {
+        sourceSets.getByName("main").java.srcDir("src/test")
+    }' ;;
+    n11) snippet='    sourceSets.test {
+        sourceSets.getByName("main").java.srcDir("src/test")
+    }' ;;
+  esac
+  printf '
+android {
+%s
+}
+' "$snippet" >> "$d/app/build.gradle.kts"
+  expect_fail "$d" \
+    "direct main receiver wins over an enclosing test block ($case_name, F-1)" \
+    "main source set adds a test/build source dir"
+done
+
+# A lambda before `.java.srcDir` is part of the receiver chain.  The chain walk
+# must cross the balanced `}` instead of falling back to the enclosing test
+# block.  Cover one-line apply/also and a multi-line chained form.
+for case_name in apply also multiline; do
+  d="$TMP/srcdir_f1_lambda_$case_name"
+  cp -r "$TMP/clean" "$d"
+  mkdir -p "$d/app/src/test/java/com/example"
+  cp "$TMP/srcdir_f1_wire/app/src/test/java/com/example/Wired.java" \
+    "$d/app/src/test/java/com/example/Wired.java"
+  case "$case_name" in
+    apply) snippet='    sourceSets.getByName("test") {
+        sourceSets.getByName("main").apply {
+        }.java.srcDir("src/test")
+    }' ;;
+    also) snippet='    sourceSets.getByName("test") {
+        sourceSets.getByName("main").also {
+        }.java.srcDir("src/test")
+    }' ;;
+    multiline) snippet='    sourceSets.getByName("test") {
+        sourceSets.getByName("main")
+            .apply {
+            }
+            .java
+            .srcDir("src/test")
+    }' ;;
+  esac
+  printf '
+android {
+%s
+}
+' "$snippet" >> "$d/app/build.gradle.kts"
+  expect_fail "$d" \
+    "a lambda receiver chain is not truncated before srcDir ($case_name, F-1)" \
+    "main source set adds a test/build source dir"
+done
+
+# A source-set mention inside a helper call argument is not the receiver of
+# srcDir.  There is deliberately no enclosing source-set block, so the old
+# receiver matcher would treat the argument as the context and pass.
+cp -r "$TMP/clean" "$TMP/srcdir_f1_helper_arg_noblock"
+mkdir -p "$TMP/srcdir_f1_helper_arg_noblock/app/src/test/java/com/example"
+cp "$TMP/srcdir_f1_wire/app/src/test/java/com/example/Wired.java" \
+  "$TMP/srcdir_f1_helper_arg_noblock/app/src/test/java/com/example/Wired.java"
+cat >> "$TMP/srcdir_f1_helper_arg_noblock/app/build.gradle.kts" <<'KTS'
+
+android {
+    helper(sourceSets.getByName("test")).java.srcDir("src/test")
+}
+KTS
+expect_fail "$TMP/srcdir_f1_helper_arg_noblock" \
+  "an opaque helper argument mention fails closed (F-1)" \
+  "main source set source dir cannot be resolved to a safe path (fail closed)"
+
+# `with(<source-set>)` creates a source-set receiver block; safe-call `?.` and
+# asserted-call `!!` are receiver-chain operators; `requireNotNull` is a
+# transparent wrapper.  In all cases the direct main receiver must beat the
+# enclosing test block.  `listOf(...).single()` is opaque and must fail closed
+# rather than fall back to the enclosing test block.
+for case_name in with_block with_this safe_call not_null require_not_null \
+    checknotnull_main listof_single with_bare_main; do
+  d="$TMP/srcdir_f1_receiver_$case_name"
+  cp -r "$TMP/clean" "$d"
+  mkdir -p "$d/app/src/test/java/com/example"
+  cp "$TMP/srcdir_f1_wire/app/src/test/java/com/example/Wired.java" \
+    "$d/app/src/test/java/com/example/Wired.java"
+  case "$case_name" in
+    with_block) snippet='    sourceSets.getByName("test") {
+        with(sourceSets.getByName("main")) {
+            java.srcDir("src/test")
+        }
+    }' ;;
+    with_this) snippet='    sourceSets.getByName("test") {
+        with(sourceSets.getByName("main")) { this }.java.srcDir("src/test")
+    }' ;;
+    safe_call) snippet='    sourceSets.getByName("test") {
+        sourceSets.getByName("main")?.java?.srcDir("src/test")
+    }' ;;
+    not_null) snippet='    sourceSets.getByName("test") {
+        sourceSets.getByName("main")!!.java.srcDir("src/test")
+    }' ;;
+    require_not_null) snippet='    sourceSets.getByName("test") {
+        requireNotNull(sourceSets.getByName("main")).java.srcDir("src/test")
+    }' ;;
+    checknotnull_main) snippet='    sourceSets.getByName("test") {
+        checkNotNull(sourceSets.getByName("main")).java.srcDir("src/test")
+    }' ;;
+    listof_single) snippet='    sourceSets.getByName("test") {
+        listOf(sourceSets.getByName("main")).single().java.srcDir("src/test")
+    }' ;;
+    with_bare_main) snippet='    sourceSets.getByName("test") {
+        with(main) { java.srcDir("src/test") }
+    }' ;;
+  esac
+  printf '\nandroid {\n%s\n}\n' "$snippet" >> "$d/app/build.gradle.kts"
+  if [ "$case_name" = listof_single ]; then
+    expect_fail "$d" \
+      "opaque receiver argument fails closed ($case_name, F-1)" \
+      "main source set source dir cannot be resolved to a safe path (fail closed)"
+  else
+    expect_fail "$d" \
+      "receiver form reaches the direct main source set ($case_name, F-1)" \
+      "main source set adds a test/build source dir"
+  fi
+done
+
+# The same transparent wrappers around a test source set stay green.  These
+# are top-level (or inside main), not nested in an enclosing test block, so
+# removing wrapper recognition makes HEAD red: the controls are non-vacuous
+# (R-2).
+for case_name in with_test with_bare_test require_test checknotnull_test; do
+  d="$TMP/srcdir_f1_receiver_${case_name}_control"
+  cp -r "$TMP/clean" "$d"
+  case "$case_name" in
+    with_test) snippet='with(sourceSets.getByName("test")) {
+    java.srcDir("src/test")
+}' ;;
+    with_bare_test) snippet='with(test) {
+    java.srcDir("src/test")
+}' ;;
+    require_test) snippet='requireNotNull(test).java.srcDir("src/test")' ;;
+    checknotnull_test) snippet='checkNotNull(test).java.srcDir("src/test")' ;;
+  esac
+  printf '\nandroid {\n    %s\n}\n' "$snippet" >> "$d/app/build.gradle.kts"
+  expect_pass "$d" \
+    "receiver wrapper around test stays green ($case_name, F-1)"
+done
+
+# Newline/comment before the `with` block body; chained run/apply/let/also
+# wrappers; bare and nested transparent arguments.  Each must resolve to main
+# instead of falling back to the enclosing test block.
+for case_name in with_source_newline with_source_comment_newline \
+    with_bare_comment_newline with_run_chain with_apply_chain with_let_it \
+    with_also_it with_source_run with_source_let with_source_also \
+    with_apply_then_run with_run_then_also source_apply_then_run \
+    require_bare check_bare nested_require; do
+  d="$TMP/srcdir_f1_wrapper_$case_name"
+  cp -r "$TMP/clean" "$d"
+  mkdir -p "$d/app/src/test/java/com/example"
+  cp "$TMP/srcdir_f1_wire/app/src/test/java/com/example/Wired.java" \
+    "$d/app/src/test/java/com/example/Wired.java"
+  case "$case_name" in
+    with_source_newline) payload='
+android {
+    sourceSets.getByName("test") {
+        with(sourceSets.getByName("main"))
+        { java.srcDir("src/test") }
+    }
+}' ; expected="main source set adds a test/build source dir" ;;
+    with_source_comment_newline) payload='
+android {
+    sourceSets.getByName("test") {
+        with(sourceSets.getByName("main")) /* c */
+        { java.srcDir("src/test") }
+    }
+}' ; expected="main source set adds a test/build source dir" ;;
+    with_bare_comment_newline) payload='
+android {
+    sourceSets.getByName("test") {
+        with(main) /* c */
+        { java.srcDir("src/test") }
+    }
+}' ; expected="main source set adds a test/build source dir" ;;
+    with_run_chain) payload='
+android {
+    sourceSets.getByName("test") {
+        with(main).run { java.srcDir("src/test") }
+    }
+}' ; expected="main source set adds a test/build source dir" ;;
+    with_apply_chain) payload='
+android {
+    sourceSets.getByName("test") {
+        with(main).apply { java.srcDir("src/test") }
+    }
+}' ; expected="main source set adds a test/build source dir" ;;
+    with_let_it) payload='
+android {
+    sourceSets.getByName("test") {
+        with(main).let { it.java.srcDir("src/test") }
+    }
+}' ; expected="main source set source dir cannot be resolved to a safe path (fail closed)" ;;
+    with_also_it) payload='
+android {
+    sourceSets.getByName("test") {
+        with(main).also { it.java.srcDir("src/test") }
+    }
+}' ; expected="main source set source dir cannot be resolved to a safe path (fail closed)" ;;
+    with_source_run) payload='
+android {
+    sourceSets.getByName("test") {
+        with(sourceSets.getByName("main")).run { java.srcDir("src/test") }
+    }
+}' ; expected="main source set adds a test/build source dir" ;;
+    with_source_let) payload='
+android {
+    sourceSets.getByName("test") {
+        with(sourceSets.getByName("main")).let { it.java.srcDir("src/test") }
+    }
+}' ; expected="main source set source dir cannot be resolved to a safe path (fail closed)" ;;
+    with_source_also) payload='
+android {
+    sourceSets.getByName("test") {
+        with(sourceSets.getByName("main")).also { it.java.srcDir("src/test") }
+    }
+}' ; expected="main source set source dir cannot be resolved to a safe path (fail closed)" ;;
+    with_apply_then_run) payload='
+android {
+    sourceSets.getByName("test") {
+        with(main).apply { }.run { java.srcDir("src/test") }
+    }
+}' ; expected="main source set source dir cannot be resolved to a safe path (fail closed)" ;;
+    with_run_then_also) payload='
+android {
+    sourceSets.getByName("test") {
+        with(main).run { }.also { java.srcDir("src/test") }
+    }
+}' ; expected="main source set source dir cannot be resolved to a safe path (fail closed)" ;;
+    source_apply_then_run) payload='
+android {
+    sourceSets.getByName("test") {
+        sourceSets.getByName("main").apply { }.run { java.srcDir("src/test") }
+    }
+}' ; expected="main source set source dir cannot be resolved to a safe path (fail closed)" ;;
+    require_bare) payload='
+android {
+    sourceSets.getByName("test") {
+        requireNotNull(main).java.srcDir("src/test")
+    }
+}' ; expected="main source set adds a test/build source dir" ;;
+    check_bare) payload='
+android {
+    sourceSets.getByName("test") {
+        checkNotNull(main).java.srcDir("src/test")
+    }
+}' ; expected="main source set adds a test/build source dir" ;;
+    nested_require) payload='
+android {
+    sourceSets.getByName("test") {
+        with(requireNotNull(main)) { java.srcDir("src/test") }
+    }
+}' ; expected="main source set adds a test/build source dir" ;;
+  esac
+  printf '%s\n' "$payload" >> "$d/app/build.gradle.kts"
+  expect_fail "$d" \
+    "wrapper/chained receiver resolves or fails closed ($case_name, F-1)" \
+    "$expected"
+done
+
+# Same-file receiver aliases: direct, with(...), after apply, alias of
+# sourceSets, shadowing, unresolved alias, and assigned var.  A resolvable
+# main alias is red; unresolved/assigned receivers fail closed.
+for case_name in alias_receiver alias_declared_outside alias_with_block \
+    alias_java_chain alias_apply_chain alias_sourcesets alias_shadow \
+    unknown_bare_receiver var_alias_assigned; do
+  d="$TMP/srcdir_f1_alias_$case_name"
+  cp -r "$TMP/clean" "$d"
+  mkdir -p "$d/app/src/test/java/com/example"
+  cp "$TMP/srcdir_f1_wire/app/src/test/java/com/example/Wired.java" \
+    "$d/app/src/test/java/com/example/Wired.java"
+  case "$case_name" in
+    alias_receiver) payload='
+android {
+    sourceSets.getByName("test") {
+        val mainSet = sourceSets.getByName("main")
+        mainSet.java.srcDir("src/test")
+    }
+}' ; expected="main source set adds a test/build source dir" ;;
+    alias_declared_outside) payload='
+val mainSet = sourceSets.getByName("main")
+
+android {
+    sourceSets.getByName("test") {
+        mainSet.java.srcDir("src/test")
+    }
+}' ; expected="main source set adds a test/build source dir" ;;
+    alias_with_block) payload='
+android {
+    sourceSets.getByName("test") {
+        val mainSet = sourceSets.getByName("main")
+        with(mainSet) { java.srcDir("src/test") }
+    }
+}' ; expected="main source set adds a test/build source dir" ;;
+    alias_java_chain) payload='
+android {
+    sourceSets.getByName("test") {
+        val mainJava = sourceSets.getByName("main").java
+        mainJava.srcDir("src/test")
+    }
+}' ; expected="main source set adds a test/build source dir" ;;
+    alias_apply_chain) payload='
+android {
+    sourceSets.getByName("test") {
+        val mainSet = sourceSets.getByName("main").apply { }
+        mainSet.java.srcDir("src/test")
+    }
+}' ; expected="main source set adds a test/build source dir" ;;
+    alias_sourcesets) payload='
+android {
+    sourceSets.getByName("test") {
+        val ss = sourceSets
+        ss.getByName("main").java.srcDir("src/test")
+    }
+}' ; expected="main source set adds a test/build source dir" ;;
+    alias_shadow) payload='
+val mainSet = sourceSets.getByName("test")
+
+android {
+    sourceSets.getByName("test") {
+        val mainSet = sourceSets.getByName("main")
+        mainSet.java.srcDir("src/test")
+    }
+}' ; expected="main source set adds a test/build source dir" ;;
+    unknown_bare_receiver) payload='
+android {
+    sourceSets.getByName("test") {
+        mystery.java.srcDir("src/test")
+    }
+}' ; expected="main source set source dir cannot be resolved to a safe path (fail closed)" ;;
+    var_alias_assigned) payload='
+android {
+    sourceSets.getByName("test") {
+        var mainSet = sourceSets.getByName("test")
+        mainSet = sourceSets.getByName("main")
+        mainSet.java.srcDir("src/test")
+    }
+}' ; expected="main source set source dir cannot be resolved to a safe path (fail closed)" ;;
+  esac
+  printf '%s\n' "$payload" >> "$d/app/build.gradle.kts"
+  expect_fail "$d" \
+    "receiver alias is resolved or fails closed ($case_name, F-3)" \
+    "$expected"
+done
+
+# A test-source-set alias remains legitimate and is green on HEAD too through
+# the enclosing test block; the current resolver must not turn it red.
+cp -r "$TMP/clean" "$TMP/srcdir_f1_alias_test_inside"
+cat >> "$TMP/srcdir_f1_alias_test_inside/app/build.gradle.kts" <<'KTS'
+
+android {
+    sourceSets.getByName("test") {
+        val testSs = sourceSets.getByName("test")
+        testSs.java.srcDir("src/test")
+    }
+}
+KTS
+expect_pass "$TMP/srcdir_f1_alias_test_inside" \
+  "a test source-set receiver alias stays green (F-3 testSs control)"
+
+# --- Re-review 4: alias shadowing, trailing lambdas, grouping/casts --------
+# A same-file declaration shadows a built-in source-set name.  These fixtures
+# are the exact fail-open shapes reported in Re-review 4: without resolver
+# precedence, `test`/`androidTest`/`testFixtures` (and `var` reassignment)
+# silently select the built-in test source set and the gate goes green.
+for case_name in r4_alias_test_inside r4_alias_test_outside \
+    r4_alias_androidtest_outside r4_alias_testfixtures_outside \
+    r4_alias_test_require_inside r4_alias_test_with_inside \
+    r4_alias_test_with_outside r4_var_test_inside r4_var_test_outside \
+    r4_var_androidtest_outside; do
+  d="$TMP/srcdir_r4_$case_name"
+  cp -r "$TMP/clean" "$d"
+  mkdir -p "$d/app/src/test/java/com/example"
+  cp "$TMP/srcdir_f1_wire/app/src/test/java/com/example/Wired.java" \
+    "$d/app/src/test/java/com/example/Wired.java"
+  case "$case_name" in
+    r4_alias_test_inside) payload='    sourceSets.getByName("test") {
+        val test = sourceSets.getByName("main")
+        test.java.srcDir("src/test")
+    }' ;;
+    r4_alias_test_outside) payload='    val test = sourceSets.getByName("main")
+    test.java.srcDir("src/test")' ;;
+    r4_alias_androidtest_outside) payload='    val androidTest = sourceSets.getByName("main")
+    androidTest.java.srcDir("src/test")' ;;
+    r4_alias_testfixtures_outside) payload='    val testFixtures = sourceSets.getByName("main")
+    testFixtures.java.srcDir("src/test")' ;;
+    r4_alias_test_require_inside) payload='    sourceSets.getByName("test") {
+        val test = sourceSets.getByName("main")
+        requireNotNull(test).java.srcDir("src/test")
+    }' ;;
+    r4_alias_test_with_inside) payload='    sourceSets.getByName("test") {
+        val test = sourceSets.getByName("main")
+        with(test) { java.srcDir("src/test") }
+    }' ;;
+    r4_alias_test_with_outside) payload='    val test = sourceSets.getByName("main")
+    with(test) { java.srcDir("src/test") }' ;;
+    r4_var_test_inside) payload='    sourceSets.getByName("test") {
+        var test = sourceSets.getByName("test")
+        test = sourceSets.getByName("main")
+        test.java.srcDir("src/test")
+    }' ;;
+    r4_var_test_outside) payload='    var test = sourceSets.getByName("test")
+    test = sourceSets.getByName("main")
+    test.java.srcDir("src/test")' ;;
+    r4_var_androidtest_outside) payload='    var androidTest = sourceSets.getByName("test")
+    androidTest = sourceSets.getByName("main")
+    androidTest.java.srcDir("src/test")' ;;
+  esac
+  printf '\nandroid {\n%s\n}\n' "$payload" >> "$d/app/build.gradle.kts"
+  if [ "$case_name" = r4_var_test_inside ] ||
+    [ "$case_name" = r4_var_test_outside ] ||
+    [ "$case_name" = r4_var_androidtest_outside ]; then
+    expect_fail "$d" \
+      "reassigned var shadows a built-in source-set name ($case_name, R4)" \
+      "main source set source dir cannot be resolved to a safe path (fail closed)"
+  else
+    expect_fail "$d" \
+      "alias shadows a built-in source-set name ($case_name, R4)" \
+      "main source set adds a test/build source dir"
+  fi
+done
+
+# Trailing-lambda results decide the receiver of a following call.  The last
+# expression is `main` in every red case; `this`/test expressions are green.
+for case_name in r4_with_lambda_main_outside r4_with_lambda_main_inside \
+    r4_with_let_main_outside r4_with_let_main_inside \
+    r4_source_let_main_outside r4_source_run_main_outside \
+    r4_test_let_main_outside r4_test_let_main_inside \
+    r4_test_run_main_inside r4_require_let_main_inside \
+    r4_with_lambda_comment_outside r4_with_lambda_comment_inside \
+    r4_with_let_notnull_inside r4_with_let_safe_inside \
+    r4_with_require_lambda_main r4_with_run_this_test \
+    r4_with_this_test r4_with_explicit_test_body \
+    r4_let_explicit_main_body r4_run_explicit_main_body \
+    r4_alias_lambda_body r4_apply_body_main r4_also_body_main \
+    r4_last_expr_test_then_main r4_last_expr_newline \
+    r4_with_unknown_body r4_with_body_java_inside \
+    r4_lambda_body_alias_test_positive r4_lambda_body_alias_main; do
+  d="$TMP/srcdir_r4_lambda_$case_name"
+  cp -r "$TMP/clean" "$d"
+  mkdir -p "$d/app/src/test/java/com/example"
+  cp "$TMP/srcdir_f1_wire/app/src/test/java/com/example/Wired.java" \
+    "$d/app/src/test/java/com/example/Wired.java"
+  case "$case_name" in
+    r4_with_lambda_main_outside) payload='    with(test) { main }.java.srcDir("src/test")' ;;
+    r4_with_lambda_main_inside) payload='    sourceSets.getByName("test") {
+        with(test) { main }.java.srcDir("src/test")
+    }' ;;
+    r4_with_let_main_outside) payload='    with(test).let { main }.java.srcDir("src/test")' ;;
+    r4_with_let_main_inside) payload='    sourceSets.getByName("test") {
+        with(test).let { main }.java.srcDir("src/test")
+    }' ;;
+    r4_source_let_main_outside) payload='    sourceSets.getByName("test").let { main }.java.srcDir("src/test")' ;;
+    r4_source_run_main_outside) payload='    sourceSets.getByName("test").run { main }.java.srcDir("src/test")' ;;
+    r4_test_let_main_outside) payload='    test.let { main }.java.srcDir("src/test")' ;;
+    r4_test_let_main_inside) payload='    sourceSets.getByName("test") {
+        test.let { main }.java.srcDir("src/test")
+    }' ;;
+    r4_test_run_main_inside) payload='    sourceSets.getByName("test") {
+        test.run { main }.java.srcDir("src/test")
+    }' ;;
+    r4_require_let_main_inside) payload='    sourceSets.getByName("test") {
+        requireNotNull(test).let { main }.java.srcDir("src/test")
+    }' ;;
+    r4_with_lambda_comment_outside) payload='    with(test) /* c */
+    .let { main }
+    .java.srcDir("src/test")' ;;
+    r4_with_lambda_comment_inside) payload='    sourceSets.getByName("test") {
+        with(test) /* c */
+        .let { main }
+        .java.srcDir("src/test")
+    }' ;;
+    r4_with_let_notnull_inside) payload='    sourceSets.getByName("test") {
+        with(test)!!.let { main }!!.java.srcDir("src/test")
+    }' ;;
+    r4_with_let_safe_inside) payload='    sourceSets.getByName("test") {
+        with(test)?.let { main }?.java?.srcDir("src/test")
+    }' ;;
+    r4_with_require_lambda_main) payload='    with(requireNotNull(test)) { main }.java.srcDir("src/test")' ;;
+    r4_with_run_this_test) payload='    with(test).run { this }.java.srcDir("src/test")' ;;
+    r4_with_this_test) payload='    with(test) { this }.java.srcDir("src/test")' ;;
+    r4_with_explicit_test_body) payload='    with(test) { sourceSets.getByName("test") }.java.srcDir("src/test")' ;;
+    r4_let_explicit_main_body) payload='    with(test).let { sourceSets.getByName("main") }.java.srcDir("src/test")' ;;
+    r4_run_explicit_main_body) payload='    sourceSets.getByName("test").run { sourceSets.getByName("main") }.java.srcDir("src/test")' ;;
+    r4_alias_lambda_body) payload='    val mainSet = sourceSets.getByName("main")
+    with(test) { mainSet }.java.srcDir("src/test")' ;;
+    r4_apply_body_main) payload='    with(test).apply { main }.java.srcDir("src/test")' ;;
+    r4_also_body_main) payload='    with(test).also { main }.java.srcDir("src/test")' ;;
+    r4_last_expr_test_then_main) payload='    with(test) { test; main }.java.srcDir("src/test")' ;;
+    r4_last_expr_newline) payload='    with(test) {
+        test
+        main
+    }.java.srcDir("src/test")' ;;
+    r4_with_unknown_body) payload='    with(test) { mystery }.java.srcDir("src/test")' ;;
+    r4_with_body_java_inside) payload='    sourceSets.getByName("test") {
+        with(test) { java }.java.srcDir("src/test")
+    }' ;;
+    r4_lambda_body_alias_test_positive) payload='    with(test) {
+        val testSet = sourceSets.getByName("test")
+        testSet
+    }.java.srcDir("src/test")' ;;
+    r4_lambda_body_alias_main) payload='    with(test) {
+        val mainSet = sourceSets.getByName("main")
+        mainSet
+    }.java.srcDir("src/test")' ;;
+  esac
+  printf '\nandroid {\n%s\n}\n' "$payload" >> "$d/app/build.gradle.kts"
+  case "$case_name" in
+    r4_with_run_this_test|r4_with_this_test|r4_with_explicit_test_body|\
+    r4_apply_body_main|r4_also_body_main|r4_lambda_body_alias_test_positive)
+      expect_pass "$d" \
+        "trailing-lambda result resolves to the test source set ($case_name, R4)" ;;
+    r4_with_unknown_body|r4_with_body_java_inside)
+      expect_fail "$d" \
+        "an unprovable trailing-lambda result fails closed ($case_name, R4)" \
+        "main source set source dir cannot be resolved to a safe path (fail closed)" ;;
+    *)
+      expect_fail "$d" \
+        "trailing-lambda result reaches main ($case_name, R4)" \
+        "main source set adds a test/build source dir" ;;
+  esac
+done
+
+# Grouping parentheses and casts are stripped before alias resolution; an
+# unresolved base still fails closed instead of inheriting the test block.
+for case_name in r4_alias_grouped_inside r4_alias_cast_inside \
+    r4_alias_cast_nullable r4_alias_asserted r4_alias_double_group \
+    r4_grouped_with_alias r4_grouped_explicit_main \
+    r4_grouped_explicit_test r4_alias_grouped_test_positive \
+    r4_cast_test_positive r4_unknown_cast; do
+  d="$TMP/srcdir_r4_group_$case_name"
+  cp -r "$TMP/clean" "$d"
+  mkdir -p "$d/app/src/test/java/com/example"
+  cp "$TMP/srcdir_f1_wire/app/src/test/java/com/example/Wired.java" \
+    "$d/app/src/test/java/com/example/Wired.java"
+  case "$case_name" in
+    r4_alias_grouped_inside) payload='    sourceSets.getByName("test") {
+        val mainSet = sourceSets.getByName("main")
+        (mainSet).java.srcDir("src/test")
+    }' ;;
+    r4_alias_cast_inside) payload='    sourceSets.getByName("test") {
+        val mainSet = sourceSets.getByName("main")
+        (mainSet as SourceSet).java.srcDir("src/test")
+    }' ;;
+    r4_alias_cast_nullable) payload='    val mainSet = sourceSets.getByName("main")
+    (mainSet as SourceSet?).java.srcDir("src/test")' ;;
+    r4_alias_asserted) payload='    val mainSet = sourceSets.getByName("main")
+    (mainSet)!!.java.srcDir("src/test")' ;;
+    r4_alias_double_group) payload='    val mainSet = sourceSets.getByName("main")
+    ((mainSet)).java.srcDir("src/test")' ;;
+    r4_grouped_with_alias) payload='    val mainSet = sourceSets.getByName("main")
+    with((mainSet)) { java.srcDir("src/test") }' ;;
+    r4_grouped_explicit_main) payload='    (sourceSets.getByName("main")).java.srcDir("src/test")' ;;
+    r4_grouped_explicit_test) payload='    (sourceSets.getByName("test")).java.srcDir("src/test")' ;;
+    r4_alias_grouped_test_positive) payload='    val testSet = sourceSets.getByName("test")
+    (testSet).java.srcDir("src/test")' ;;
+    r4_cast_test_positive) payload='    val testSet = sourceSets.getByName("test")
+    with((testSet) as SourceSet) { java.srcDir("src/test") }' ;;
+    r4_unknown_cast) payload='    (mystery as SourceSet).java.srcDir("src/test")' ;;
+  esac
+  printf '\nandroid {\n%s\n}\n' "$payload" >> "$d/app/build.gradle.kts"
+  if [ "$case_name" = r4_grouped_explicit_test ] ||
+    [ "$case_name" = r4_alias_grouped_test_positive ] ||
+    [ "$case_name" = r4_cast_test_positive ]; then
+    expect_pass "$d" \
+      "grouped/cast test receiver stays green ($case_name, R4)"
+  elif [ "$case_name" = r4_unknown_cast ]; then
+    expect_fail "$d" \
+      "unresolved grouped/cast receiver fails closed ($case_name, R4)" \
+      "main source set source dir cannot be resolved to a safe path (fail closed)"
+  else
+    expect_fail "$d" \
+      "grouped/cast receiver resolves to main ($case_name, R4)" \
+      "main source set adds a test/build source dir"
+  fi
+done
+
+# The four top-level Re-review 4 positives must also stay green.
+for case_name in r4p_checknotnull_test r4p_require_test \
+    r4p_with_bare_test r4p_with_test; do
+  d="$TMP/srcdir_r4pos_$case_name"
+  cp -r "$TMP/clean" "$d"
+  case "$case_name" in
+    r4p_checknotnull_test) snippet='    checkNotNull(test).java.srcDir("src/test")' ;;
+    r4p_require_test) snippet='    requireNotNull(test).java.srcDir("src/test")' ;;
+    r4p_with_bare_test) snippet='    with(test) {
+        java.srcDir("src/test")
+    }' ;;
+    r4p_with_test) snippet='    with(sourceSets.getByName("test")) {
+        java.srcDir("src/test")
+    }' ;;
+  esac
+  printf '\nandroid {\n%s\n}\n' "$snippet" >> "$d/app/build.gradle.kts"
+  expect_pass "$d" \
+    "top-level test receiver wrapper stays green ($case_name, R4)"
+done
+
 # --- Stage1 fix4: scope-aware val/var/def resolution (G-19) ----------------
 # A sibling test-block declaration must not shadow a main declaration, and a
 # declaration named srcDir is not an assignment.
@@ -3999,6 +4642,224 @@ KT
 expect_fail "$TMP/module_g22_named_core" \
   "include(:core) production sources are scanned (G-22 X18b)" \
   "outside dev/librepocket/mcp/ references MCP types"
+
+# --- Final gate F-2: a module literally named build is not an output tree ---
+# Its own build.gradle.kts must be scanned; only <module-root>/build output
+# directories are pruned.
+
+cp -r "$TMP/clean" "$TMP/module_f2_named_build_srcdir"
+cat > "$TMP/module_f2_named_build_srcdir/settings.gradle.kts" <<'KTS'
+include(":app")
+include(":build")
+KTS
+mkdir -p "$TMP/module_f2_named_build_srcdir/build/src/test/java/com/example"
+cat > "$TMP/module_f2_named_build_srcdir/build/src/test/java/com/example/Wired.java" <<'JAVA'
+package com.example;
+class Wired { Object x = dev.librepocket.mcp.McpServer.class; }
+JAVA
+cat > "$TMP/module_f2_named_build_srcdir/build/build.gradle.kts" <<'KTS'
+plugins { id("com.android.library") }
+android {
+    namespace = "com.example.buildmod"
+    sourceSets.getByName("main").java.srcDir("src/test")
+}
+KTS
+expect_fail "$TMP/module_f2_named_build_srcdir" \
+  "include(:build) build file main srcDir is scanned (F-2 N3)" \
+  "main source set adds a test/build source dir"
+
+cp -r "$TMP/clean" "$TMP/module_f2_named_build_placeholder"
+cat > "$TMP/module_f2_named_build_placeholder/settings.gradle.kts" <<'KTS'
+include(":app")
+include(":build")
+KTS
+mkdir -p "$TMP/module_f2_named_build_placeholder/build/src/test/java/com/example"
+cat > "$TMP/module_f2_named_build_placeholder/build/src/test/java/com/example/Wired.java" <<'JAVA'
+package com.example;
+class Wired { Object x = dev.librepocket.mcp.McpServer.class; }
+JAVA
+cat > "$TMP/module_f2_named_build_placeholder/build/build.gradle.kts" <<'KTS'
+plugins { id("com.android.library") }
+android {
+    namespace = "com.example.buildmod"
+    defaultConfig { manifestPlaceholders["mcpHost"] = "dev.librepocket.mcp.McpServer" }
+}
+KTS
+expect_fail "$TMP/module_f2_named_build_placeholder" \
+  "include(:build) build file manifestPlaceholders is scanned (F-2 N9)" \
+  "manifest placeholders request MCP components"
+
+# An untrusted root settings file cannot prove that `build` is output.  The
+# module-roots helper must fail closed instead of returning only the repo root,
+# otherwise this build file (and the module's sources/manifest) are pruned.
+cp -r "$TMP/clean" "$TMP/module_f2_untrusted_named_build"
+cat > "$TMP/module_f2_untrusted_named_build/settings.gradle.kts" <<'KTS'
+rootProject.name = "fixture"
+include(":app")
+include(":build")
+include(providers.gradleProperty("extraModules").get())
+KTS
+mkdir -p "$TMP/module_f2_untrusted_named_build/build/src/test/java/com/example"
+cat > "$TMP/module_f2_untrusted_named_build/build/src/test/java/com/example/Wired.java" <<'JAVA'
+package com.example;
+class Wired { Object x = dev.librepocket.mcp.McpServer.class; }
+JAVA
+cat > "$TMP/module_f2_untrusted_named_build/build/build.gradle.kts" <<'KTS'
+plugins { id("com.android.library") }
+android {
+    namespace = "com.example.buildmod"
+    defaultConfig { manifestPlaceholders["mcpHost"] = "dev.librepocket.mcp.McpServer" }
+}
+KTS
+expect_fail "$TMP/module_f2_untrusted_named_build" \
+  "untrusted settings cannot prune a module named build (F-2 R5)" \
+  "cannot determine Gradle module roots (fail closed)"
+
+# A literal projectDir can put a real module below the root project's build
+# tree.  The ancestor `build/` must stay traversable, but its own generated
+# output and the nested module's own build/ output are still pruned.
+cp -r "$TMP/clean" "$TMP/module_f2_projectdir_nested_build"
+cat > "$TMP/module_f2_projectdir_nested_build/settings.gradle.kts" <<'KTS'
+rootProject.name = "fixture"
+include(":app")
+include(":renamed")
+project(":renamed").projectDir = file("build/renamed")
+KTS
+mkdir -p "$TMP/module_f2_projectdir_nested_build/build/renamed/src/test/java/com/example"
+cat > "$TMP/module_f2_projectdir_nested_build/build/renamed/src/test/java/com/example/Wired.java" <<'JAVA'
+package com.example;
+class Wired { Object x = dev.librepocket.mcp.McpServer.class; }
+JAVA
+cat > "$TMP/module_f2_projectdir_nested_build/build/renamed/build.gradle.kts" <<'KTS'
+plugins { id("com.android.library") }
+android {
+    namespace = "com.example.renamed"
+    sourceSets.getByName("main").java.srcDir("src/test")
+}
+KTS
+expect_fail "$TMP/module_f2_projectdir_nested_build" \
+  "projectDir module below build/ is scanned (F-2 ancestor pruning)" \
+  "main source set adds a test/build source dir"
+
+# Real production sources of a nested projectDir module must be scanned even
+# though the module is below the root build/ tree.  This is the R-3 companion
+# to the nested source-set fixture above.
+cp -r "$TMP/clean" "$TMP/module_f2_projectdir_nested_source"
+cat > "$TMP/module_f2_projectdir_nested_source/settings.gradle.kts" <<'KTS'
+rootProject.name = "fixture"
+include(":app")
+include(":renamed")
+project(":renamed").projectDir = file("build/renamed")
+KTS
+mkdir -p "$TMP/module_f2_projectdir_nested_source/build/renamed/src/main/java/com/example"
+cat > "$TMP/module_f2_projectdir_nested_source/build/renamed/src/main/java/com/example/Leak.java" <<'JAVA'
+package com.example;
+class Leak { Object x = dev.librepocket.mcp.McpServer.class; }
+JAVA
+cat > "$TMP/module_f2_projectdir_nested_source/build/renamed/build.gradle.kts" <<'KTS'
+plugins { id("com.android.library") }
+android { namespace = "com.example.renamed" }
+KTS
+expect_fail "$TMP/module_f2_projectdir_nested_source" \
+  "nested projectDir production sources are scanned (F-2 R-3)" \
+  "production Kotlin/Java outside dev/librepocket/mcp/ references MCP types"
+
+# A nested projectDir keeps the root build/ ancestor traversable.  Therefore a
+# root build/generated Gradle file is accepted over-block, as documented: it
+# is scanned and stays red rather than being silently pruned.
+cp -r "$TMP/clean" "$TMP/module_f2_projectdir_nested_root_output"
+cat > "$TMP/module_f2_projectdir_nested_root_output/settings.gradle.kts" <<'KTS'
+rootProject.name = "fixture"
+include(":app")
+include(":renamed")
+project(":renamed").projectDir = file("build/renamed")
+KTS
+mkdir -p "$TMP/module_f2_projectdir_nested_root_output/build/renamed"
+cat > "$TMP/module_f2_projectdir_nested_root_output/build/renamed/build.gradle.kts" <<'KTS'
+plugins { id("com.android.library") }
+android { namespace = "com.example.renamed" }
+KTS
+mkdir -p "$TMP/module_f2_projectdir_nested_root_output/build/generated"
+cat > "$TMP/module_f2_projectdir_nested_root_output/build/generated/Leak.gradle.kts" <<'KTS'
+android { defaultConfig { manifestPlaceholders["mcpHost"] = "dev.librepocket.mcp.McpServer" } }
+KTS
+expect_fail "$TMP/module_f2_projectdir_nested_root_output" \
+  "documented over-block: root build/generated is scanned with nested projectDir (F-2 R-1)" \
+  "manifest placeholders request MCP components"
+
+# app/build output remains pruned even while the root build/ ancestor is kept
+# traversable for the nested module.
+cp -r "$TMP/clean" "$TMP/module_f2_projectdir_nested_build_app_output"
+cat > "$TMP/module_f2_projectdir_nested_build_app_output/settings.gradle.kts" <<'KTS'
+rootProject.name = "fixture"
+include(":app")
+include(":renamed")
+project(":renamed").projectDir = file("build/renamed")
+KTS
+mkdir -p "$TMP/module_f2_projectdir_nested_build_app_output/build/renamed"
+cat > "$TMP/module_f2_projectdir_nested_build_app_output/build/renamed/build.gradle.kts" <<'KTS'
+plugins { id("com.android.library") }
+android { namespace = "com.example.renamed" }
+KTS
+mkdir -p "$TMP/module_f2_projectdir_nested_build_app_output/app/build/generated"
+cat > "$TMP/module_f2_projectdir_nested_build_app_output/app/build/generated/Leak.gradle.kts" <<'KTS'
+android { defaultConfig { manifestPlaceholders["mcpHost"] = "dev.librepocket.mcp.McpServer" } }
+KTS
+expect_pass "$TMP/module_f2_projectdir_nested_build_app_output" \
+  "app/build generated output stays pruned with a nested projectDir module (F-2)"
+
+# In a normal layout the root build/ tree is still output and pruned.
+cp -r "$TMP/clean" "$TMP/module_f2_root_build_output"
+cat > "$TMP/module_f2_root_build_output/settings.gradle.kts" <<'KTS'
+rootProject.name = "fixture"
+include(":app")
+KTS
+mkdir -p "$TMP/module_f2_root_build_output/build/generated"
+cat > "$TMP/module_f2_root_build_output/build/generated/Leak.gradle.kts" <<'KTS'
+android { defaultConfig { manifestPlaceholders["mcpHost"] = "dev.librepocket.mcp.McpServer" } }
+KTS
+expect_pass "$TMP/module_f2_root_build_output" \
+  "root build generated output stays pruned without a nested module (F-2)"
+
+cp -r "$TMP/clean" "$TMP/module_f2_named_build_main"
+cat > "$TMP/module_f2_named_build_main/settings.gradle.kts" <<'KTS'
+include(":app")
+include(":build")
+KTS
+mkdir -p "$TMP/module_f2_named_build_main/build/src/main/java/com/example"
+cat > "$TMP/module_f2_named_build_main/build/src/main/java/com/example/Wired.java" <<'JAVA'
+package com.example;
+class Wired { Object x = dev.librepocket.mcp.McpServer.class; }
+JAVA
+cat > "$TMP/module_f2_named_build_main/build/build.gradle.kts" <<'KTS'
+plugins { id("com.android.library") }
+android { namespace = "com.example.buildmod" }
+KTS
+expect_fail "$TMP/module_f2_named_build_main" \
+  "include(:build) production sources are still discovered (F-2 N3b)" \
+  "outside dev/librepocket/mcp/ references MCP types"
+
+cp -r "$TMP/clean" "$TMP/module_f2_named_build_manifest"
+cat > "$TMP/module_f2_named_build_manifest/settings.gradle.kts" <<'KTS'
+include(":app")
+include(":build")
+KTS
+mkdir -p "$TMP/module_f2_named_build_manifest/build/src/main"
+cat > "$TMP/module_f2_named_build_manifest/build/src/main/AndroidManifest.xml" <<'XML'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <application>
+    <service android:name="dev.librepocket.mcp.McpServer" />
+  </application>
+</manifest>
+XML
+cat > "$TMP/module_f2_named_build_manifest/build/build.gradle.kts" <<'KTS'
+plugins { id("com.android.library") }
+android { namespace = "com.example.buildmod" }
+KTS
+expect_fail "$TMP/module_f2_named_build_manifest" \
+  "include(:build) AndroidManifest is scanned (F-2 manifest control)" \
+  "Android manifest registers MCP"
 
 cp -r "$TMP/clean" "$TMP/module_g22_no_settings_build"
 rm -f "$TMP/module_g22_no_settings_build/settings.gradle.kts"

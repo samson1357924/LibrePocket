@@ -112,6 +112,48 @@ if [ ! -r "$MCP_SCAN" ]; then
 fi
 if [ "$fail" -ne 0 ]; then exit 1; fi
 
+# Settings-derived Gradle module roots.  A `build` directory is pruned only
+# when it is a real Gradle output tree (`<module-root>/build`) and is not
+# itself a module root (`include(":build")`).  Discovery shares this rule, so
+# a module literally named `build` keeps its manifests, sources and build
+# files while generated `<module>/build` output stays excluded.
+MODULE_ROOTS=()
+if ! ROOTS_OUT="$(python3 "$MCP_SCAN" module-roots "$ROOT" 2>&1)"; then
+  report "cannot determine Gradle module roots (fail closed): $ROOTS_OUT"
+elif [ -z "$ROOTS_OUT" ]; then
+  report "module-roots returned no roots (fail closed)"
+else
+  while IFS= read -r module_root; do
+    [ -n "$module_root" ] && MODULE_ROOTS+=("$module_root")
+  done <<< "$ROOTS_OUT"
+fi
+BUILD_PRUNE_ARGS=()
+for module_root in "${MODULE_ROOTS[@]}"; do
+  build_dir="$module_root/build"
+  is_module=0
+  for other_root in "${MODULE_ROOTS[@]}"; do
+    # A module can itself be named `build`, or a literal projectDir can nest a
+    # module below an output tree (`build/renamed`).  In both cases the
+    # ancestor must stay traversable so the module's build file/sources/manifest
+    # are scanned; only its own child `build/` directory is generated output.
+    if [ "$other_root" = "$build_dir" ] \
+        || [[ "$other_root" == "$build_dir"/* ]]; then
+      is_module=1
+      break
+    fi
+  done
+  if [ "$is_module" -eq 0 ]; then
+    BUILD_PRUNE_ARGS+=(-path "$build_dir" -prune -o)
+  fi
+done
+find_repo_candidates() {
+  local find_type="$1"
+  shift
+  find "$ROOT" -path '*/.git' -prune -o -path '*/.gradle' -prune \
+    -o -path '*/node_modules' -prune -o \
+    "${BUILD_PRUNE_ARGS[@]}" -type "$find_type" "$@" -print
+}
+
 # --- A. Workflow run: lines vs docs/TESTING.md ---
 # Gradle tasks CI runs (from ./gradlew invocations in the workflow).
 mapfile -t WF_TASKS < <(grep -oE ':app:[A-Za-z0-9_]+' "$WORKFLOW" | sort -u || true)
@@ -241,9 +283,7 @@ fi
 # closed with a diagnostic rather than silently skipping them.
 # The zero-src-root sanity check is kept: a repo with no `*/src` directory at
 # all means parser/checkout drift, never a silent pass.
-if ! SRC_LIST="$(find "$ROOT" -type d -name src \
-  -not -path '*/build/*' -not -path '*/.gradle/*' -not -path '*/.git/*' \
-  -not -path '*/node_modules/*' 2>&1)"; then
+if ! SRC_LIST="$(find_repo_candidates d -name src 2>&1)"; then
   report "find over source roots failed (fail closed): $SRC_LIST"
   SRC_LIST=""
 fi
@@ -846,8 +886,7 @@ fi
 #      symlinks, and the merged manifest is not inspected.
 #        - unreadable/invalid XML, or python3 unavailable => fail.
 #          (defence in depth; A0/A already require python3)
-if ! MF_LIST="$(find "$ROOT" -type f -name 'AndroidManifest*.xml' \
-  -not -path '*/build/*' -not -path '*/.gradle/*' -not -path '*/.git/*' 2>&1)"; then
+if ! MF_LIST="$(find_repo_candidates f -name 'AndroidManifest*.xml' 2>&1)"; then
   report "find over manifests failed (fail closed): $MF_LIST"
   MF_LIST=""
 fi
@@ -1130,15 +1169,18 @@ fi
 # preserved for diagnostics); the raw view is still scanned so a token that
 # only appears in a comment remains fail-closed.
 # Discovery is `find` over every gradle file, gradle.properties and *.toml
-# (build/.gradle/.git excluded) — a superset of git-tracked files, so an
-# untracked local injection also fails closed. Find/read/parse errors fail
-# closed. Residual: string-concatenation-built gradle literals
-# (`"dev.librepocket." + "mcp."`), non-literal dynamic property resolution
-# (environment/system property with no MCP literal anywhere in a scanned
-# gradle/properties/toml file), and injection expressed only in buildSrc or a
-# convention plugin `.kt` file stay outside this text guard.
-if ! GRADLE_LIST="$(find "$ROOT" -type f \( -name '*.gradle' -o -name '*.gradle.kts' \) \
-  -not -path '*/build/*' -not -path '*/.gradle/*' -not -path '*/.git/*' 2>&1)"; then
+# (.git/.gradle/node_modules excluded) — a superset of git-tracked files, so
+# an untracked local injection also fails closed.  A `build` directory is
+# pruned only when it is a real Gradle output tree (`<module-root>/build`),
+# not when the module itself is literally named `build` (`include(":build")`);
+# the roots come from the same settings-derived helper as source discovery.
+# Find/read/parse errors fail closed. Residual: string-concatenation-built
+# gradle literals (`"dev.librepocket." + "mcp."`), non-literal dynamic property
+# resolution (environment/system property with no MCP literal anywhere in a
+# scanned gradle/properties/toml file), and injection expressed only in
+# buildSrc or a convention plugin `.kt` file stay outside this text guard.
+if ! GRADLE_LIST="$(find_repo_candidates f \
+  \( -name '*.gradle' -o -name '*.gradle.kts' \) 2>&1)"; then
   report "find over gradle files failed (fail closed): $GRADLE_LIST"
   GRADLE_LIST=""
 fi
@@ -1147,8 +1189,7 @@ while IFS= read -r f; do
   [ -n "$f" ] && GRADLE_FILES+=("$f")
 done <<< "$GRADLE_LIST"
 
-if ! GRP_LIST="$(find "$ROOT" -type f -name 'gradle.properties' \
-  -not -path '*/build/*' -not -path '*/.gradle/*' -not -path '*/.git/*' 2>&1)"; then
+if ! GRP_LIST="$(find_repo_candidates f -name 'gradle.properties' 2>&1)"; then
   report "find over gradle.properties failed (fail closed): $GRP_LIST"
   GRP_LIST=""
 fi
@@ -1157,8 +1198,7 @@ while IFS= read -r f; do
   [ -n "$f" ] && PROPERTIES_FILES+=("$f")
 done <<< "$GRP_LIST"
 
-if ! TOML_LIST="$(find "$ROOT" -type f -name '*.toml' \
-  -not -path '*/build/*' -not -path '*/.gradle/*' -not -path '*/.git/*' 2>&1)"; then
+if ! TOML_LIST="$(find_repo_candidates f -name '*.toml' 2>&1)"; then
   report "find over toml files failed (fail closed): $TOML_LIST"
   TOML_LIST=""
 fi
@@ -1927,6 +1967,459 @@ def source_set_from_text(text, shape_text, allow_bare=False):
     return max(candidates)[1] if candidates else None
 
 
+def _call_opener(shape, index):
+    """True when bracket `index` opens a call/index expression, not grouping."""
+    j = index - 1
+    while j >= 0 and shape[j].isspace():
+        j -= 1
+    if j < 0:
+        return False
+    return shape[j].isalnum() or shape[j] in "_$)"
+
+
+def _call_name(shape, index):
+    """Name of the callee immediately before an opening call bracket."""
+    j = index - 1
+    while j >= 0 and shape[j].isspace():
+        j -= 1
+    end = j + 1
+    while j >= 0 and (shape[j].isalnum() or shape[j] in "_$"):
+        j -= 1
+    return shape[j + 1:end] or None
+
+
+# Wrappers whose argument is the receiver value itself.  A source-set mention
+# in their argument is therefore a receiver mention, unlike `helper(...)` or
+# `listOf(...)` where the argument is opaque to this text guard.
+TRANSPARENT_WRAPPER_CALLS = frozenset({
+    "with", "requireNotNull", "checkNotNull",
+})
+TRANSPARENT_BARE_ARGUMENT = re.compile(
+    r"(?<![\w$.])(?:with|requireNotNull|checkNotNull)"
+    r"\s*\(\s*(main|test|androidTest)\s*\)")
+
+
+def receiver_source_set_candidates(text, shape_text, resolver=None,
+                                    use_pos=None, use_block=None):
+    """Return (receiver candidates, opaque_argument_mention).
+
+    `source_set_candidates` also matches mentions inside call arguments, e.g.
+    `helper(sourceSets.getByName("test")).java.srcDir(...)`.  Such a mention is
+    not necessarily the receiver of `srcDir`.  Mentions nested only in
+    transparent wrappers (`with`, `requireNotNull`, `checkNotNull`) remain
+    receiver evidence; mentions inside any other call are marked opaque so the
+    caller can fail closed instead of falling back to an enclosing test block.
+    Grouping parentheses `(sourceSets.getByName("main"))` are allowed.
+    """
+    candidates = source_set_candidates(text, shape_text)
+    by_pos = {pos: name for pos, name in candidates}
+    # Bare `main`/`test` arguments are receiver evidence only for transparent
+    # wrappers; `helper(test)` and other arbitrary calls stay opaque.
+    for match in TRANSPARENT_BARE_ARGUMENT.finditer(shape_text):
+        name = match.group(1)
+        if (resolver is not None
+                and resolver.has_declaration(name, use_pos, use_block)):
+            # A same-file declaration shadows the Gradle source-set name.
+            # Let the root/wrapper resolution below inspect the declaration.
+            continue
+        by_pos[match.start(1)] = name
+
+    result = []
+    opaque = False
+    stack = []
+    for index, char in enumerate(shape_text):
+        if index in by_pos:
+            call_names = [name for _, is_call, name in stack if is_call]
+            if all(name in TRANSPARENT_WRAPPER_CALLS
+                   for name in call_names):
+                result.append((index, by_pos[index]))
+            else:
+                opaque = True
+        if char in "([{":
+            is_call = char in "([" and _call_opener(shape_text, index)
+            name = _call_name(shape_text, index) if is_call else None
+            stack.append((char, is_call, name))
+        elif char in ")]}" and stack:
+            stack.pop()
+    return result, opaque
+
+
+ALIAS_MAX_DEPTH = 8
+SOURCE_SET_NAMES = frozenset({
+    "main", "test", "androidTest", "testFixtures",
+})
+# Receivers that name a source-dir collection, not a same-file alias.  These
+# keep working through the enclosing block context (D21/D22).
+KNOWN_SOURCE_DIR_HANDLERS = frozenset({
+    "java", "kotlin", "resources", "res", "assets", "jniLibs", "jni",
+    "aidl", "renderscript", "manifest", "shaders", "ml", "prefab", "this",
+})
+
+
+def _transparent_call_argument(shape_text, root_match):
+    """Argument span of a transparent wrapper call at the chain root."""
+    open_index = root_match.end()
+    while open_index < len(shape_text) and shape_text[open_index].isspace():
+        open_index += 1
+    if open_index >= len(shape_text) or shape_text[open_index] != "(":
+        return None
+    close_index = balanced_end(shape_text, open_index)
+    if close_index >= len(shape_text):
+        return None
+    return open_index + 1, close_index
+
+
+CAST_SUFFIX = re.compile(
+    r"\s+as\s+[A-Za-z_$][\w$.]*(?:\s*\?)?\s*$")
+LAMBDA_RESULT_METHODS = frozenset({"let", "run"})
+LAMBDA_RECEIVER_METHODS = frozenset({"apply", "also"})
+CONTROL_FLOW_EXPR = re.compile(
+    r"(?<![\w$])(?:if|when|try|for|while|return|throw|break|continue)\b")
+_NO_TRAILING_LAMBDA = object()
+
+
+def _strip_trailing_cast(text, shape_text):
+    """Remove a trailing `as Type` cast.  None means an empty base."""
+    changed = False
+    while True:
+        match = CAST_SUFFIX.search(shape_text)
+        if match is None:
+            return text, shape_text, changed
+        text = text[:match.start()].rstrip()
+        shape_text = shape_text[:match.start()].rstrip()
+        changed = True
+        if not text.strip():
+            return None, None, changed
+
+
+def _has_top_level_chars(shape_text, chars):
+    depth = 0
+    for char in shape_text:
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif depth == 0 and char in chars:
+            return True
+    return False
+
+
+def _strip_leading_groups(text, shape_text):
+    """Strip balanced grouping parentheses around the receiver root.
+
+    `(mainSet).java`, `((mainSet)).java`, and
+    `(mainSet as SourceSet?).java` all reduce to `mainSet.java`.  An empty or
+    structurally ambiguous group returns None so callers fail closed.
+    """
+    while True:
+        index = 0
+        while index < len(shape_text) and shape_text[index].isspace():
+            index += 1
+        if index >= len(shape_text) or shape_text[index] != "(":
+            return text, shape_text
+        close_index = balanced_end(shape_text, index)
+        if close_index >= len(shape_text):
+            return None, None
+        after = close_index + 1
+        while after < len(shape_text) and shape_text[after].isspace():
+            after += 1
+        if after < len(shape_text) and shape_text[after] not in ".?!{)[":
+            # A leading group that is not followed by a chain continuation
+            # cannot be proven to be a receiver, so fail closed.
+            return None, None
+        inner = text[index + 1:close_index]
+        inner_shape = shape_text[index + 1:close_index]
+        inner, inner_shape, _ = _strip_trailing_cast(inner, inner_shape)
+        if inner is None or not inner.strip():
+            return None, None
+        if _has_top_level_chars(inner_shape, ",;+-*/%&|<>=:"):
+            return None, None
+        text = text[:index] + inner + text[close_index + 1:]
+        shape_text = (shape_text[:index] + blank_strings_len(inner) +
+                      shape_text[close_index + 1:])
+
+
+def _top_level_brace_blocks(shape_text):
+    """Return the top-level `{...}` spans, or None when unbalanced."""
+    blocks = []
+    stack = []
+    for index, char in enumerate(shape_text):
+        if char == "{":
+            if not stack:
+                blocks.append([index, None])
+            stack.append(index)
+        elif char == "}":
+            if not stack:
+                return None
+            stack.pop()
+            if not stack:
+                blocks[-1][1] = index
+    if stack:
+        return None
+    return blocks
+
+
+def _trailing_call(prefix, prefix_shape):
+    """Classify the call whose trailing lambda starts after `prefix`.
+
+    Returns `(method-or-with, receiver-prefix, receiver-shape)` and excludes
+    the `.method` suffix from the receiver prefix.  None means the syntax is
+    opaque and the caller must fail closed.
+    """
+    index = len(prefix_shape) - 1
+    while index >= 0 and prefix_shape[index].isspace():
+        index -= 1
+    while index >= 0 and prefix_shape[index] in "?!":
+        index -= 1
+        while index >= 0 and prefix_shape[index].isspace():
+            index -= 1
+    if index < 0:
+        return None
+    if prefix_shape[index] == ")":
+        open_index = _matching_open(prefix_shape, index)
+        if open_index is None:
+            return None
+        before = open_index - 1
+        while before >= 0 and prefix_shape[before].isspace():
+            before -= 1
+        end = before + 1
+        while before >= 0 and (prefix_shape[before].isalnum()
+                               or prefix_shape[before] in "_$"):
+            before -= 1
+        name = prefix_shape[before + 1:end]
+        if name == "with":
+            return "with", prefix, prefix_shape
+        return None
+    if not (prefix_shape[index].isalnum() or prefix_shape[index] in "_$"):
+        return None
+    end = index + 1
+    while index >= 0 and (prefix_shape[index].isalnum()
+                          or prefix_shape[index] in "_$"):
+        index -= 1
+    name = prefix_shape[index + 1:end]
+    before = index
+    while before >= 0 and prefix_shape[before].isspace():
+        before -= 1
+    if before >= 0 and prefix_shape[before] == ".":
+        return name, prefix[:before], prefix_shape[:before]
+    return None
+
+
+def _is_statement_boundary(shape_text, index):
+    previous = index - 1
+    while previous >= 0 and shape_text[previous].isspace():
+        previous -= 1
+    following = index + 1
+    while following < len(shape_text) and shape_text[following].isspace():
+        following += 1
+    if previous >= 0 and shape_text[previous] in ".+-*/%=,:?(":
+        return False
+    if following < len(shape_text) and shape_text[following] in ".?!,)]}":
+        return False
+    return True
+
+
+def _last_expression(text, shape_text):
+    """Last top-level expression of a lambda body.
+
+    Returns `(text, shape, offset)` with the offset relative to the body, or
+    `(None, None, None)` when unprovable.
+    """
+    if CONTROL_FLOW_EXPR.search(shape_text):
+        return None, None, None
+    segments = []
+    start = 0
+    depth = 0
+    for index, char in enumerate(shape_text):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif depth == 0 and char == ";":
+            raw = text[start:index]
+            segment = raw.strip()
+            if segment:
+                lead = len(raw) - len(raw.lstrip())
+                segments.append((segment, shape_text[start:index].strip(),
+                                 start + lead))
+            start = index + 1
+        elif depth == 0 and char == "\n" and _is_statement_boundary(
+                shape_text, index):
+            raw = text[start:index]
+            segment = raw.strip()
+            if segment:
+                lead = len(raw) - len(raw.lstrip())
+                segments.append((segment, shape_text[start:index].strip(),
+                                 start + lead))
+            start = index + 1
+    raw = text[start:]
+    segment = raw.strip()
+    if segment:
+        lead = len(raw) - len(raw.lstrip())
+        segments.append((segment, shape_text[start:].strip(), start + lead))
+    if not segments:
+        return None, None, None
+    return segments[-1]
+
+
+def _trailing_lambda_context(text, shape_text, resolver, use_pos, use_block,
+                             depth, origin=None):
+    """Resolve the value returned by a trailing lambda in a receiver chain.
+
+    The right-most top-level lambda decides the chain value.  `let`/`run`/
+    `with` return their body's last expression; `apply`/`also` return their
+    receiver.  Anything opaque returns AMBIGUOUS instead of inheriting an
+    enclosing test block.
+    """
+    blocks = _top_level_brace_blocks(shape_text)
+    if blocks is None:
+        return AMBIGUOUS_SOURCE_SET
+    if not blocks:
+        return _NO_TRAILING_LAMBDA
+    open_index, close_index = blocks[-1]
+    prefix = text[:open_index]
+    prefix_shape = shape_text[:open_index]
+    body = text[open_index + 1:close_index]
+    body_shape = shape_text[open_index + 1:close_index]
+    call = _trailing_call(prefix, prefix_shape)
+    if call is None:
+        return AMBIGUOUS_SOURCE_SET
+    kind, receiver_prefix, receiver_shape = call
+    if kind in LAMBDA_RECEIVER_METHODS:
+        if not receiver_prefix.strip():
+            return AMBIGUOUS_SOURCE_SET
+        return receiver_context_from_text(
+            receiver_prefix, receiver_shape, resolver, use_pos, use_block,
+            depth + 1, origin)
+    if kind not in LAMBDA_RESULT_METHODS and kind != "with":
+        return AMBIGUOUS_SOURCE_SET
+
+    expression, expression_shape, expression_offset = _last_expression(
+        body, body_shape)
+    if expression is None:
+        return AMBIGUOUS_SOURCE_SET
+    expression, expression_shape, _ = _strip_trailing_cast(
+        expression, expression_shape)
+    if expression is None:
+        return AMBIGUOUS_SOURCE_SET
+    grouped, grouped_shape = _strip_leading_groups(
+        expression, expression_shape)
+    if grouped is None:
+        return AMBIGUOUS_SOURCE_SET
+    expression = grouped.strip()
+    expression_shape = grouped_shape.strip()
+    if expression == "this":
+        # `with` and `run` lambdas have the receiver as `this`; a `let`
+        # lambda's `this` is an enclosing receiver, so it cannot prove the
+        # chain value.
+        if kind not in ("with", "run") or not receiver_prefix.strip():
+            return AMBIGUOUS_SOURCE_SET
+        value = receiver_context_from_text(
+            receiver_prefix, receiver_shape, resolver, use_pos, use_block,
+            depth + 1, origin)
+        return AMBIGUOUS_SOURCE_SET if value is None else value
+    # Resolve body aliases at the body expression itself.  A `val` declared
+    # inside the lambda is in scope there, while the trailing `srcDir` call
+    # that follows the closing brace is not.
+    expression_pos = use_pos
+    expression_origin = origin
+    if origin is not None:
+        expression_pos = origin + open_index + 1 + expression_offset
+        expression_origin = expression_pos
+    value = receiver_context_from_text(
+        expression, expression_shape, resolver, expression_pos, use_block,
+        depth + 1, expression_origin)
+    return AMBIGUOUS_SOURCE_SET if value is None else value
+
+
+def receiver_context_from_text(text, shape_text, resolver, use_pos, use_block,
+                               depth=0, origin=None):
+    """Resolve a receiver chain to main/test/ambiguous, or None.
+
+    Literal evidence wins.  A bare alias receiver is resolved through the
+    existing same-file `ValResolver` and the chain is retried with the
+    declaration expression substituted.  Transparent calls at the root
+    (`with`, `requireNotNull`, `checkNotNull`) are resolved recursively.
+    Trailing lambdas are evaluated conservatively because their last
+    expression, not the call argument, is the receiver of a following call.
+
+    Unknown bare receivers are not allowed to fall back to an enclosing test
+    block; they return AMBIGUOUS_SOURCE_SET.  Known source-dir handlers
+    (`java`, `kotlin`, ...) return None so the caller can use the block context.
+    """
+    if depth > ALIAS_MAX_DEPTH:
+        return AMBIGUOUS_SOURCE_SET
+    text, shape_text, _ = _strip_trailing_cast(text, shape_text)
+    if text is None:
+        return AMBIGUOUS_SOURCE_SET
+    text, shape_text = _strip_leading_groups(text, shape_text)
+    if text is None:
+        return AMBIGUOUS_SOURCE_SET
+
+    trailing = _trailing_lambda_context(
+        text, shape_text, resolver, use_pos, use_block, depth, origin)
+    if trailing is not _NO_TRAILING_LAMBDA:
+        return trailing
+
+    candidates, opaque_argument = receiver_source_set_candidates(
+        text, shape_text, resolver, use_pos, use_block)
+    names = {name for _, name in candidates}
+    if len(names) > 1:
+        return AMBIGUOUS_SOURCE_SET
+    if names:
+        return names.pop()
+    if opaque_argument:
+        return AMBIGUOUS_SOURCE_SET
+
+    root_match = re.match(r"\s*([A-Za-z_$][\w$]*)", shape_text)
+    if not root_match:
+        # No direct receiver means the enclosing block context decides (for
+        # example plain `java.srcDir(...)`).  A non-empty chain with no
+        # resolvable root is opaque and must fail closed instead.
+        return None if not shape_text.strip() else AMBIGUOUS_SOURCE_SET
+    root = root_match.group(1)
+
+    if root in TRANSPARENT_WRAPPER_CALLS:
+        argument_span = _transparent_call_argument(shape_text, root_match)
+        if argument_span is None:
+            return AMBIGUOUS_SOURCE_SET
+        start, end = argument_span
+        shifted_origin = None if origin is None else origin + start
+        value = receiver_context_from_text(
+            text[start:end], shape_text[start:end], resolver,
+            use_pos, use_block, depth + 1, shifted_origin)
+        return AMBIGUOUS_SOURCE_SET if value is None else value
+
+    declaration = None
+    if resolver is not None:
+        declaration = resolver.resolve(root, use_pos, use_block)
+    if declaration is not None:
+        expression = declaration["expr"].strip()
+        if not expression:
+            return AMBIGUOUS_SOURCE_SET
+        start, end = root_match.span(1)
+        return receiver_context_from_text(
+            text[:start] + expression + text[end:],
+            shape_text[:start] + blank_strings_len(expression) +
+            shape_text[end:],
+            resolver, use_pos, use_block, depth + 1, origin)
+    if resolver is not None and resolver.has_declaration(
+            root, use_pos, use_block):
+        # The name has a declaration in scope (for example a reassigned
+        # `var`), but its value cannot be proven.  It shadows the built-in
+        # Gradle source set and must not fall through to it.
+        return AMBIGUOUS_SOURCE_SET
+
+    if root in SOURCE_SET_NAMES:
+        return root
+
+    if root in KNOWN_SOURCE_DIR_HANDLERS:
+        return None
+    # Unknown bare receiver inside a test block: fail closed instead of
+    # treating it as test.
+    return AMBIGUOUS_SOURCE_SET
+
+
 def is_source_sets_block(block):
     return bool(re.search(r"(?<![\w$])sourceSets\s*$", block.header))
 
@@ -1937,25 +2430,72 @@ def source_set_receiver_header(text):
     return bool(re.match(r"\s*(?:android\s*\.\s*)?sourceSets\b", text))
 
 
-def block_source_set(block):
+WITH_CALL = re.compile(r"(?<![\w$.])with\s*\(")
+CHAIN_SUFFIX = re.compile(
+    r"\s*(?:\.\s*[A-Za-z_$][\w$]*\s*(?:\(\s*\))?\s*)*$")
+CHAIN_RECEIVER_HEADER = re.compile(
+    r"(?:^|\.)\s*(?:apply|run|let|also)\s*$")
+
+
+def with_block_source_set(block, resolver=None, use_pos=None):
+    """Source set named by a `with(<source-set>) ... { ... }` block.
+
+    Use `long_header` so a newline/comment between `with(...)` and `{` still
+    works.  The last `with(...)` whose suffix is only a run/apply/let/also
+    chain is the block receiver; earlier complete statements are not absorbed.
+    """
+    text = block.long_header
+    shape = block.shape_long_header
+    for match in reversed(list(WITH_CALL.finditer(shape))):
+        open_index = match.end() - 1
+        close_index = balanced_end(shape, open_index)
+        if close_index >= len(shape):
+            continue
+        if not CHAIN_SUFFIX.fullmatch(shape[close_index + 1:]):
+            continue
+        argument = text[open_index + 1:close_index].strip()
+        context = source_set_from_text(argument, argument, allow_bare=True)
+        if context:
+            return context
+        context = receiver_context_from_text(
+            argument, blank_strings_len(argument), resolver,
+            use_pos if use_pos is not None else block.open, block)
+        return AMBIGUOUS_SOURCE_SET if context is None else context
+    return None
+
+
+def block_source_set(block, resolver=None, use_pos=None):
+    context = with_block_source_set(block, resolver, use_pos)
+    if context:
+        return context
     context = None
     if source_set_receiver_header(block.header):
         context = source_set_from_text(block.header, block.shape_header)
-    if not context and (APPLY_HEADER.search(block.header)
+    if not context and (CHAIN_RECEIVER_HEADER.search(block.header)
                         or block.header.strip() in (")", "]", "}")):
         allow_bare = (block.parent is not None
                       and is_source_sets_block(block.parent))
-        apply_match = re.search(
-            r"(?:^|\.)\s*apply\s*$", block.long_header)
-        if apply_match:
-            # Only the receiver chain directly left of `.apply`; never an
-            # earlier statement in the same block (G-24).
+        chain_match = CHAIN_RECEIVER_HEADER.search(block.long_header)
+        if chain_match:
+            # Only the receiver chain directly left of the chained block;
+            # never an earlier statement in the same block (G-24).
             start = receiver_chain_start(
-                block.shape_long_header, apply_match.start())
+                block.shape_long_header, chain_match.start())
+            receiver = block.long_header[start:chain_match.start()]
+            receiver_shape = block.shape_long_header[
+                start:chain_match.start()]
             context = source_set_from_text(
-                block.long_header[start:apply_match.start()],
-                block.shape_long_header[start:apply_match.start()],
-                allow_bare=allow_bare)
+                receiver, receiver_shape, allow_bare=allow_bare)
+            if not context:
+                context = receiver_context_from_text(
+                    receiver, receiver_shape, resolver,
+                    use_pos if use_pos is not None else block.open, block)
+            if not context:
+                # A chained block whose receiver cannot be proven (including a
+                # chain after an earlier lambda, where `long_header` starts
+                # after the closing `}`) must not fall back to an enclosing
+                # test block.
+                return AMBIGUOUS_SOURCE_SET
         else:
             context = source_set_from_text(
                 block.long_header, block.shape_long_header,
@@ -1975,7 +2515,7 @@ def block_source_set(block):
 
 
 def _matching_open(shape, close_index):
-    pairs = {")": "(", "]": "["}
+    pairs = {")": "(", "]": "[", "}": "{"}
     opener = pairs.get(shape[close_index])
     if opener is None:
         return None
@@ -2010,8 +2550,43 @@ def receiver_chain_start(shape, pos):
             if shape[j] == "\n":
                 saw_newline = True
             j -= 1
-        if j < 0 or shape[j] in ";{}":
+        if j < 0 or shape[j] in ";{":
             return i
+        if shape[j] == "}":
+            # A balanced lambda/block is part of the receiver chain only when
+            # the chain continues with `.` after it, optionally through a
+            # safe-call/asserted-call operator run (`}?.java`, `}!!.java`).
+            # Do not absorb a complete earlier statement that merely ends in
+            # `}` (G-24).
+            k = j + 1
+            while k < len(shape):
+                if shape[k].isspace() or shape[k] in "?!":
+                    k += 1
+                    continue
+                break
+            if k >= len(shape) or shape[k] != ".":
+                return i
+            open_index = _matching_open(shape, j)
+            if open_index is None:
+                return i
+            i = open_index
+            # Let the next step cross whitespace/newline between the matching
+            # `{` and its `.apply`/`.also`/call receiver.
+            crossed_dot = True
+            continue
+        if shape[j] in "?!":
+            # Safe-call `?.` and asserted-call `!!` are part of the receiver
+            # chain.  Cross only an operator run that continues with `.`, so a
+            # complete prior statement is still not absorbed (G-24).
+            k = j + 1
+            while k < len(shape) and (shape[k].isspace()
+                                      or shape[k] == "!"):
+                k += 1
+            if k >= len(shape) or shape[k] != ".":
+                return i
+            i = j
+            crossed_dot = True
+            continue
         if saw_newline and not crossed_dot and shape[j] != ".":
             return i
         crossed_dot = False
@@ -2043,28 +2618,32 @@ def receiver_chain_start(shape, pos):
     return i
 
 
-def source_set_context(keep, shape, blocks, pos):
-    # Prefer a provably enclosing source-set block.  This is the actual
-    # lexical context of the call; mentions in other statements of the block
+AMBIGUOUS_SOURCE_SET = "__ambiguous_source_set__"
+
+
+def source_set_context(keep, shape, blocks, pos, resolver=None):
+    # The receiver chain directly left of the srcDir token is the most
+    # specific evidence: `sourceSets.getByName("main").java.srcDir(...)` inside
+    # an enclosing test block still mutates MAIN (F-1).  A bare same-file `val`
+    # receiver is resolved through the existing declaration resolver rather
+    # than falling through to the test block (F-3).
+    start = receiver_chain_start(shape, pos)
+    use_block = block_at(blocks, pos)
+    context = receiver_context_from_text(
+        keep[start:pos], shape[start:pos], resolver, pos, use_block,
+        origin=start)
+    if context is not None:
+        return context
+
+    # No source set or alias on the direct receiver chain: use a provably
+    # enclosing source-set block.  Mentions in other statements of the block
     # must not override it (G-24).
-    current = block_at(blocks, pos)
+    current = use_block
     while current is not None:
-        context = block_source_set(current)
+        context = block_source_set(current, resolver, pos)
         if context:
             return context
         current = current.parent
-
-    # No enclosing source-set block: inspect only the receiver chain directly
-    # left of the srcDir token (multi-line receivers included).
-    start = receiver_chain_start(shape, pos)
-    candidates = source_set_candidates(
-        keep[start:pos], shape[start:pos])
-    names = {name for _, name in candidates}
-    if len(names) > 1:
-        # More than one source-set receiver in one chain is ambiguous.
-        return None
-    if names:
-        return names.pop()
     return None
 
 
@@ -2072,6 +2651,25 @@ class ValResolver:
     def __init__(self, declarations, assignments):
         self.declarations = declarations
         self.assignments = assignments
+
+    def has_declaration(self, name, use_pos, use_block=None):
+        """True when a declaration for `name` is in scope at the use.
+
+        This is deliberately separate from `resolve()`: a `var` declaration
+        that was reassigned has a declaration in scope even though its value
+        cannot be proven, and callers must fail closed rather than fall back
+        to a same-named built-in source set.
+        """
+        for decl in self.declarations:
+            if decl["name"] != name or decl["pos"] >= use_pos:
+                continue
+            block = decl["block"]
+            if block is not None and not (
+                    block.open < use_pos
+                    and (block.close is None or use_pos < block.close)):
+                continue
+            return True
+        return False
 
     def resolve(self, name, use_pos, use_block):
         best = None
@@ -2156,7 +2754,12 @@ def main_srcdir_lines(text, build_path):
         return any(start <= pos < end for start, end in decl_name_spans)
 
     def check(start, expr):
-        context = source_set_context(keep, code, blocks, start)
+        context = source_set_context(keep, code, blocks, start, resolver)
+        if context == AMBIGUOUS_SOURCE_SET:
+            # A direct receiver chain naming several source sets has no single
+            # provable context; refuse to treat it as a test source dir.
+            unresolved.append(text.count("\n", 0, start) + 1)
+            return
         # A test source set's own srcDir is legitimate (P4).  An unknown
         # receiver is treated as main: fail closed rather than skip.
         if context and re.match(r"(?:test|androidTest)", context):

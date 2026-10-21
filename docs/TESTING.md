@@ -65,6 +65,28 @@ the real gate and every fixture exercise the same parser instead of two drifting
 implementations. It is a zero-wiring gate helper, not a general-purpose
 security scanner.
 
+The zero-wiring gate is fail-closed, so it deliberately over-blocks in a
+few layouts rather than risk a missed wiring. A module whose `projectDir`
+sits below another module's or the root project's `build/` output tree
+keeps that ancestor tree traversable, so the nested module is never
+pruned and the generated files still in that tree are scanned instead of
+skipped — an MCP literal in one of them turns the gate red (accepted
+over-block). A `srcDir`/`srcDirs` call names a source set only when the
+gate can prove one: a receiver-less `java.srcDir(...)` is resolved through
+the enclosing source-set block (`sourceSets.getByName("main") { … }`,
+`with(sourceSets.getByName("main")) { … }`), and wrappers
+(`with`/`let`/`run`/`apply`/`also`), `?.`/`!!` chains, grouped or cast
+receivers and same-file aliases are resolved when they name a known source
+set. Only a receiver the gate cannot resolve to a known source set is
+recorded as unresolved and fails closed, never assumed to be a test source
+set: that covers an unknown bare receiver, an opaque call argument, a
+chain naming several source sets, and a trailing lambda whose result is
+unknown. A source-set name that a same-file declaration shadows
+(`val test = …`) is resolved through that alias resolver instead of
+selecting the built-in test source set, and a `var` that is reassigned
+stays unresolved. These are over-blocks (false reds), not misses; the
+fixture self-test pins each of these shapes.
+
 When `code == true`, the workflow uses JDK 25 and runs these Gradle stages:
 
 1. `:app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest` (including Robolectric tests available in those source sets). The unit-tests job fans out over a flavor matrix with fail-fast disabled, so each flavor runs on its own runner and wall time is the slowest shard rather than the sum. Test report artifacts now include both HTML reports and structured JUnit XML (`app/build/test-results/`), retained for 14 days; results are parsed in real time into GitHub Actions Step Summary (`$GITHUB_STEP_SUMMARY`) to surface failure counts, skipped tests, and assertion summaries directly without requiring artifact downloads. The parser (`scripts/summarize_junit.py`, covered by `scripts/tests/test_summarize_junit.py`) is reporting-only and never a gate: it emits an explicit `Status:` line that reads `PASS` only when every XML file is readable, `tests > 0`, `failures == 0`, `errors == 0`, and every suite's counters exactly equal its direct `<testcase>` detail (`tests` vs case count, `failures+errors` vs failed cases, `skipped` vs skipped cases, either direction) — otherwise `FAIL`, `PARTIAL` (unreadable files), `INCOMPLETE` (empty or contradictory totals, including any per-suite mismatch), or `NO_RESULTS` (no XML). Only outermost suites are counted (a `<testsuite>` root counts itself; a `<testsuites>` root counts its direct `<testsuite>` children; nested suites are ignored for counting with a warning and force `INCOMPLETE`, since outer counters alone cannot prove completeness; Gradle never emits nested suites, so flat real-world results are unaffected). Rendered output is capped at 900 KiB of UTF-8 bytes (idents, messages, every warning, and the flavor title each truncated to 300 characters); overflow drops tail entries and records `omitted N failures / M skips; see XML artifact` (plus `omitted K warning(s); see XML artifact` when warnings themselves overflow), never raising.
@@ -135,8 +157,14 @@ unfiltered. Secret scanning (`gitleaks`) and `dependency-review` in
 `.github/workflows/security-audit.yml` still run on every pull request,
 including docs-only ones.
 
-No branch-protection required checks are configured on `main`; `pr-gate`
-and the checks above are informational until protection is configured.
+`main` configures branch protection and lists `PR Gate` as a required status
+check (with `Dependency Vulnerability Review` and `Secret Leak Detection
+(Gitleaks)`); `pr-gate` fails when `docs-guard` is not success, so the
+checks above — the docs gate in particular — block merge. `enforce_admins`
+is not enabled, repository rulesets are 0, required approving reviews are
+0, and CODEOWNERS is not configured, so the required status checks are the
+enforcement (not review or admin enforcement). Re-check the current
+configuration with `gh api repos/<owner>/<repo>/branches/main/protection`.
 
 The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy and release-identity harnesses (standard library only) run in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. The command is `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py`. These tests use synthetic APK-like files and fake Gradle/SDK/policy commands; they do not prove real APK or SDK behavior. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
 

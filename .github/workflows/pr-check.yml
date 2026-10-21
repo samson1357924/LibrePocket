@@ -289,10 +289,10 @@ jobs:
           path: app/build/outputs/apk/**/*.apk
           retention-days: 7
 
-  # The docs gate fails closed (a violation turns this job red), but a red job
-  # does not by itself block merge: `main` has no branch-protection required
-  # checks configured yet. Merge blocking requires repository branch
-  # protection/rulesets (optionally CODEOWNERS for gate scripts/docs/workflows).
+  # The docs gate fails closed (a violation turns this job red). `main`
+  # requires the `PR Gate` status check, and `pr-gate` fails when
+  # `docs-guard` is not success, so a red docs gate blocks merge.
+  # `enforce_admins` is off; no repository rulesets and no CODEOWNERS.
   docs-guard:
     name: Docs Claim Check
     runs-on: ubuntu-latest
@@ -378,9 +378,10 @@ jobs:
         working-directory: github_bot
         run: npm run build
 
-  # pr-gate aggregates the required jobs and fails when any did not succeed,
-  # but this check is informational until it is configured as a required status
-  # check in repository branch protection/rulesets (see docs/TESTING.md).
+  # pr-gate aggregates the required jobs and fails when any did not succeed.
+  # `main` requires the `PR Gate` status check, and `pr-gate` fails when
+  # `docs-guard` is not success, so the docs gate is merge-blocking.
+  # `enforce_admins` is off; no repository rulesets and no CODEOWNERS.
   pr-gate:
     name: PR Gate
     runs-on: ubuntu-latest

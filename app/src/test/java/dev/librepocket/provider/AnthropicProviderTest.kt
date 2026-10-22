@@ -120,6 +120,53 @@ class AnthropicProviderTest {
     }
 
     @Test
+    fun emptyTextDeltaFrameYieldsNoEvent() {
+        // Empty-delta suppression (parity with ChatCompletions): an empty
+        // text_delta frame yields NO TextDelta — an empty increment must
+        // never pose as final-answer evidence downstream (continuation
+        // completeness, maintainer P1). A following non-empty frame on the
+        // same block still lands (guard, not arm-level mute).
+        val mapper = AnthropicMapper()
+        mapper.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}""",
+        )
+        assertEquals(
+            emptyList<StreamEvent>(),
+            mapper.mapPayload(
+                """{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}""",
+            ),
+        )
+        val real = mapper.mapPayload(
+            """{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"real"}}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "real")), real)
+    }
+
+    @Test
+    fun emptyThinkingDeltaFrameYieldsNoEvent() {
+        // Same suppression on the thinking arm: an empty thinking frame is
+        // dropped (zero payload must not flip the downstream reasoning-source
+        // flag either). The block-start presence marker is unchanged.
+        val mapper = AnthropicMapper()
+        assertEquals(
+            listOf(StreamEvent.ReasoningPresent),
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}""",
+            ),
+        )
+        assertEquals(
+            emptyList<StreamEvent>(),
+            mapper.mapPayload(
+                """{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}""",
+            ),
+        )
+        val real = mapper.mapPayload(
+            """{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reasoning payload"}}""",
+        )
+        assertEquals(listOf(StreamEvent.ReasoningDelta(0, 0, "reasoning payload")), real)
+    }
+
+    @Test
     fun unclosedBlockAtMessageStopFailsRetryable() {
         val mapper = AnthropicMapper()
         mapper.mapPayload(
@@ -132,6 +179,210 @@ class AnthropicProviderTest {
         mapper.mapPayload("""{"type":"message_delta","delta":{"stop_reason":"end_turn"}}""")
         val events = mapper.mapPayload("""{"type":"message_stop"}""")
         assertEquals(StreamEvent.Failed("SSE_TRUNCATED", retryable = true), events.last())
+    }
+
+    // ---- Phase-0 review (C): blank tool id / name at content_block_stop ----
+
+    @Test
+    fun toolUseStartWithoutIdSynthesizesRepairIdAtStop() {
+        // A tool_use block started without an id must not emit an empty
+        // tool-call id at content_block_stop: internal pairing validation
+        // (TOOL_CALL_MISSING_ID, non-retryable) and providers fail closed on
+        // one. Repair parity with ResponsesProvider's output_item.done:
+        // `call_` + 8 chars — and no empty id ever rides the done event.
+        val mapper = AnthropicMapper()
+        mapper.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"get_weather"}}""",
+        )
+        val stopEvents = mapper.mapPayload("""{"type":"content_block_stop","index":0}""")
+        val done = stopEvents.filterIsInstance<StreamEvent.ToolDone>().single()
+        assertTrue("expected call_-prefixed synthetic id, was: ${done.id}", done.id.startsWith("call_"))
+        assertEquals("call_XXXXXXXX".length, done.id.length)
+        assertEquals("get_weather", done.name)
+    }
+
+    @Test
+    fun mixedTextAndTwoToolBlocksProjectInOrderWithDistinctIds() {
+        // Multi-call/mixed stream: a text block plus two tool_use blocks (one
+        // explicit id, one blank repaired at stop). The mapper must keep
+        // native indexes, preserve the explicit id, synthesize a distinct
+        // non-empty id for the blank call, and still end on message_stop.
+        val mapper = AnthropicMapper()
+        assertEquals(
+            emptyList<StreamEvent>(),
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}""",
+            ),
+        )
+        assertEquals(
+            listOf(StreamEvent.TextDelta(0, 0, "lookup: ")),
+            mapper.mapPayload(
+                """{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lookup: "}}""",
+            ),
+        )
+        mapper.mapPayload(
+            """{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_a","name":"get_weather"}}""",
+        )
+        mapper.mapPayload(
+            """{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Taipei\"}"}}""",
+        )
+        mapper.mapPayload("""{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","name":"get_time"}}""")
+        mapper.mapPayload(
+            """{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"tz\":\"UTC\"}"}}""",
+        )
+        mapper.mapPayload("""{"type":"content_block_stop","index":0}""")
+        val first = mapper.mapPayload("""{"type":"content_block_stop","index":1}""")
+            .filterIsInstance<StreamEvent.ToolDone>().single()
+        val second = mapper.mapPayload("""{"type":"content_block_stop","index":2}""")
+            .filterIsInstance<StreamEvent.ToolDone>().single()
+        mapper.mapPayload("""{"type":"message_delta","delta":{"stop_reason":"tool_use"}}""")
+        assertEquals(listOf(StreamEvent.Done("tool_use")), mapper.mapPayload("""{"type":"message_stop"}"""))
+
+        assertEquals(1, first.toolIndex)
+        assertEquals("toolu_a", first.id)
+        assertEquals("get_weather", first.name)
+        assertEquals("""{"city":"Taipei"}""", first.argumentsJson)
+        assertEquals(2, second.toolIndex)
+        assertTrue("blank id must be repaired, was: ${second.id}", second.id.startsWith("call_"))
+        assertTrue(
+            "repaired id must keep the canonical call_ + 8-hex shape, was: ${second.id}",
+            Regex("call_[0-9a-f]{8}").matches(second.id),
+        )
+        assertEquals("get_time", second.name)
+        assertEquals("""{"tz":"UTC"}""", second.argumentsJson)
+    }
+
+    @Test
+    fun toolUseStartWithoutNameRidesBlankNameNoFabrication() {
+        // Blank tool NAME: no synthesis by design — a nameless tool_use
+        // rides its (empty) name verbatim; the turn layer's records-only
+        // gate on the exact slice tool name can never execute a nameless
+        // call (fail-closed downstream, never a wrong-name execution).
+        val mapper = AnthropicMapper()
+        mapper.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_wx8f"}}""",
+        )
+        val done = mapper.mapPayload("""{"type":"content_block_stop","index":0}""")
+            .filterIsInstance<StreamEvent.ToolDone>().single()
+        assertEquals("toolu_wx8f", done.id)
+        assertEquals("", done.name)
+    }
+
+    // ---- P1-3: block-protocol latch + idempotent duplicate stop ----
+
+    @Test
+    fun duplicateContentBlockStopIsIdempotentSingleToolDone() {
+        val mapper = AnthropicMapper()
+        mapper.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"get_weather"}}""",
+        )
+        val first = mapper.mapPayload("""{"type":"content_block_stop","index":0}""")
+            .filterIsInstance<StreamEvent.ToolDone>().single()
+        assertTrue("expected call_-prefixed synthetic id", first.id.startsWith("call_"))
+        // Duplicate stop: same block already closed -> idempotent empty,
+        // no second ToolDone, no second synthetic id.
+        assertEquals(emptyList<StreamEvent>(), mapper.mapPayload("""{"type":"content_block_stop","index":0}"""))
+        mapper.mapPayload("""{"type":"message_delta","delta":{"stop_reason":"tool_use"}}""")
+        assertEquals(listOf(StreamEvent.Done("tool_use")), mapper.mapPayload("""{"type":"message_stop"}"""))
+    }
+
+    @Test
+    fun unknownIndexDeltaLatchesAndMessageStopFailsWithoutDone() {
+        val mapper = AnthropicMapper()
+        mapper.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}""",
+        )
+        assertEquals(
+            emptyList<StreamEvent>(),
+            mapper.mapPayload(
+                """{"type":"content_block_delta","index":5,"delta":{"type":"text_delta","text":"ghost"}}""",
+            ),
+        )
+        mapper.mapPayload("""{"type":"content_block_stop","index":0}""")
+        mapper.mapPayload("""{"type":"message_delta","delta":{"stop_reason":"end_turn"}}""")
+        val stop = mapper.mapPayload("""{"type":"message_stop"}""")
+        assertEquals(
+            listOf(StreamEvent.Failed("SSE_TRUNCATED", retryable = true)),
+            stop,
+        )
+        assertTrue(stop.none { it is StreamEvent.Done })
+    }
+
+    @Test
+    fun unknownIndexStopLatchesAndMessageStopFails() {
+        val mapper = AnthropicMapper()
+        assertEquals(
+            emptyList<StreamEvent>(),
+            mapper.mapPayload("""{"type":"content_block_stop","index":7}"""),
+        )
+        mapper.mapPayload("""{"type":"message_delta","delta":{"stop_reason":"end_turn"}}""")
+        assertEquals(
+            listOf(StreamEvent.Failed("SSE_TRUNCATED", retryable = true)),
+            mapper.mapPayload("""{"type":"message_stop"}"""),
+        )
+    }
+
+    @Test
+    fun deltaForClosedBlockLatchesAndMessageStopFails() {
+        val mapper = AnthropicMapper()
+        mapper.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}""",
+        )
+        mapper.mapPayload("""{"type":"content_block_stop","index":0}""")
+        assertEquals(
+            emptyList<StreamEvent>(),
+            mapper.mapPayload(
+                """{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"late"}}""",
+            ),
+        )
+        mapper.mapPayload("""{"type":"message_delta","delta":{"stop_reason":"end_turn"}}""")
+        assertEquals(
+            listOf(StreamEvent.Failed("SSE_TRUNCATED", retryable = true)),
+            mapper.mapPayload("""{"type":"message_stop"}"""),
+        )
+    }
+
+    @Test
+    fun toolUseStopReasonWithoutAnyToolBlockFailsRetryable() {
+        val mapper = AnthropicMapper()
+        mapper.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}""",
+        )
+        mapper.mapPayload("""{"type":"content_block_stop","index":0}""")
+        mapper.mapPayload("""{"type":"message_delta","delta":{"stop_reason":"tool_use"}}""")
+        val stop = mapper.mapPayload("""{"type":"message_stop"}""")
+        assertEquals(
+            listOf(StreamEvent.Failed("SSE_TRUNCATED", retryable = true)),
+            stop,
+        )
+        assertTrue(stop.none { it is StreamEvent.Done })
+    }
+
+    // ---- P1-4: structured Anthropic error types ----
+
+    @Test
+    fun structuredAnthropicErrorTypesClassify() {
+        val fatalAuth = AnthropicMapper().mapPayload(
+            """{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}""",
+        ).filterIsInstance<StreamEvent.Failed>().single()
+        assertFalse(fatalAuth.retryable)
+
+        val fatalRequest = AnthropicMapper().mapPayload(
+            """{"type":"error","error":{"type":"invalid_request_error","message":"malformed request"}}""",
+        ).filterIsInstance<StreamEvent.Failed>().single()
+        assertFalse(fatalRequest.retryable)
+
+        val retryable = AnthropicMapper().mapPayload(
+            """{"type":"message_error","error":{"type":"overloaded_error","message":"Overloaded"}}""",
+        ).filterIsInstance<StreamEvent.Failed>().single()
+        assertTrue(retryable.retryable)
+
+        val mapper = AnthropicMapper()
+        val events = mapper.mapPayload(
+            """{"type":"error","error":{"type":"authentication_error","message":"bad"}}""",
+        )
+        assertTrue(mapper.terminalReached)
+        assertTrue(events.none { it is StreamEvent.Done })
     }
 
     @Test

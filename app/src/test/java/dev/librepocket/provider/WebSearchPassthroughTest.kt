@@ -152,6 +152,59 @@ class WebSearchPassthroughTest {
     }
 
     @Test
+    fun responsesWebSearchMarkersDedupePerItemAcrossAllSources() {
+        // P2-7: the three lifecycle sources (web_search_call.*, added,
+        // done) share one per-item last-state map; an unchanged state emits
+        // nothing, a changed state emits exactly one marker.
+        val mapper = ResponsesMapper()
+        val out = ArrayList<StreamEvent>()
+        out += mapper.mapPayload(
+            """{"type":"response.output_item.added","output_index":1,"item_id":"ws_1","item":{"type":"web_search_call","id":"ws_1"}}""",
+        )
+        out += mapper.mapPayload(
+            """{"type":"response.web_search_call.searching","output_index":1,"item_id":"ws_1"}""",
+        )
+        out += mapper.mapPayload(
+            """{"type":"response.web_search_call.searching","output_index":1,"item_id":"ws_1"}""",
+        )
+        out += mapper.mapPayload(
+            """{"type":"response.output_item.done","output_index":1,"item_id":"ws_1","item":{"type":"web_search_call","id":"ws_1"}}""",
+        )
+        out += mapper.mapPayload(
+            """{"type":"response.output_item.done","output_index":1,"item_id":"ws_1","item":{"type":"web_search_call","id":"ws_1"}}""",
+        )
+        val markers = out.filterIsInstance<StreamEvent.TextDelta>()
+            .filter { ServerToolTranscript.isServerToolMarker(it.delta) }
+        assertEquals(
+            "started + searching + completed, repeats suppressed",
+            3,
+            markers.size,
+        )
+        assertTrue(out.filterIsInstance<StreamEvent.ToolDone>().isEmpty())
+        assertTrue(out.filterIsInstance<StreamEvent.ToolDelta>().isEmpty())
+    }
+
+    @Test
+    fun responsesWebSearchMarkerKeyFallsBackToOutputIndex() {
+        // No item_id/id on the wire: the output_index fallback keys the item,
+        // so repeated same-state frames for one position still dedupe.
+        val mapper = ResponsesMapper()
+        val first = mapper.mapPayload(
+            """{"type":"response.web_search_call.searching","output_index":3}""",
+        )
+        // Same blockOf projection as every other text marker: output_index*1000.
+        assertEquals(
+            listOf(StreamEvent.TextDelta(0, 3000, ServerToolTranscript.webSearchMarker("searching"))),
+            first,
+        )
+        assertTrue(
+            mapper.mapPayload(
+                """{"type":"response.web_search_call.searching","output_index":3}""",
+            ).isEmpty(),
+        )
+    }
+
+    @Test
     fun responsesLocalFunctionCallSemanticsUnchanged() {
         val mapper = ResponsesMapper()
         val out = ArrayList<StreamEvent>()
@@ -182,6 +235,22 @@ class WebSearchPassthroughTest {
         assertEquals(1, markers.size)
         assertTrue(markers[0].delta.contains("web_search"))
         assertTrue(events.filterIsInstance<StreamEvent.ToolDone>().isEmpty())
+    }
+
+    @Test
+    fun repeatedCitationAnnotationsEmitOneServerToolMarker() {
+        val mapper = ChatCompletionsMapper()
+        val citation =
+            """{"type":"url_citation","url_citation":{"url":"https://example.com/a","title":"t"}}"""
+        val first = mapper.mapPayload(
+            """{"choices":[{"delta":{"content":"a","annotations":[$citation]}}]}""",
+        )
+        val second = mapper.mapPayload(
+            """{"choices":[{"delta":{"content":"b","annotations":[$citation]}}]}""",
+        )
+        val markers = (first + second).filterIsInstance<StreamEvent.TextDelta>()
+            .filter { ServerToolTranscript.isServerToolMarker(it.delta) }
+        assertEquals(1, markers.size)
     }
 
     @Test

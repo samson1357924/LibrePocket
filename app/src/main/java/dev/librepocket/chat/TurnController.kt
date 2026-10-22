@@ -10,6 +10,7 @@ import dev.librepocket.provider.ProviderFailure
 import dev.librepocket.provider.ProviderFailureCode
 import dev.librepocket.provider.SseFrameParser
 import dev.librepocket.provider.StreamEvent
+import dev.librepocket.provider.ServerToolTranscript
 import dev.librepocket.provider.TEXT_TOO_LARGE
 import dev.librepocket.provider.TOOL_ARGS_TOO_LARGE
 import dev.librepocket.provider.FailureKind
@@ -21,6 +22,7 @@ import dev.librepocket.provider.requireTotalToolAggBudget
 import dev.librepocket.provider.requireTurnTextBudget
 import dev.librepocket.redact.Redactor
 import java.io.IOException
+import dev.librepocket.router.SafeToolSlice
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -49,17 +51,26 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.coroutineContext
+import kotlin.jvm.Volatile
 
 /**
- * The sole retry budget for one logical turn (at most 3 retries / 4 requests).
- * Provider adapters make one classified attempt and never multiply this budget.
+ * The sole retry budget for one logical turn: at most 3 retries after a
+ * failing attempt (4 provider requests for a plain chat turn). Provider
+ * adapters make one classified attempt and never multiply this budget.
+ *
+ * P2 tool-slice path: a turn that executes the safe tool slice can issue up
+ * to 5 provider requests — the initial tool request, the same-turn
+ * continuation, and up to 3 retries of the frozen-pair continuation. The
+ * retry budget itself is unchanged (3 retries after the failing request);
+ * the extra request is the initial tool round, not an extra retry. Pinned by
+ * `TurnControllerToolSliceTest.slicePathIssuesAtMostFiveProviderRequests`.
  */
 data class TurnRetryConfig(
   val maxRetries: Int = 3,
   val retryDelaysMs: List<Long> = listOf(2_000L, 4_000L, 8_000L),
 ) {
   init {
-    require(maxRetries in 0..3) { "a turn may make at most four provider attempts" }
+    require(maxRetries in 0..3) { "a turn may configure at most three retries" }
   }
 
   /** 1-based retry index → delay. Extra retry indices reuse the last delay. */
@@ -96,6 +107,25 @@ class PolicyEvaluationException(cause: Exception) :
 class ApprovalRequiredException : Exception("chat.send approval required")
 
 /**
+ * Fail-closed signal for the P2 slice continuation budget: the serialized
+ * request payload (message text + the tool-result `ChatMessage.toolCallId` +
+ * the structured assistant `toolCalls` id/name/argumentsJson) exceeds
+ * [TurnController.MAX_REQUEST_CHARS] even
+ * after the full history-prefix trim (the newest base row + the structured
+ * round cannot be shrunk further). Within one logical turn history only
+ * grows, so this is never retried; `runTurnLoop` converts it into a typed
+ * non-retryable terminal and no over-cap request is shipped to the provider.
+ *
+ * Image carve-out (aligned with [TurnController.MAX_REQUEST_CHARS]):
+ * [MAX_REQUEST_CHARS] is a TEXT-basis cap — image payload bytes ride OUTSIDE
+ * this accounting (never counted in `text.length`), so an over-budget image
+ * attachment can never trip this exception on byte volume alone; image
+ * size/rejection is governed separately (spec §4 byte caps and
+ * ImageFallbackPolicy).
+ */
+class ContinuationOverBudgetException : Exception("continuation request over budget")
+
+/**
  * Outgoing context window for one [ChatRequest], and the resumed-history
  * prefix bound (Phase 3).
  *
@@ -104,10 +134,18 @@ class ApprovalRequiredException : Exception("chat.send approval required")
  * the total reaches the cap. Oldest-first truncation at whole-message
  * boundaries. Tool-pair integrity
  * is structural — tool calls ride inline in their assistant block
- * (`[tool:name args]` marker text, never separate provider `tool` messages)
- * — so whole-message truncation can never detach a tool result from its
- * call. Any truncation is observable via [TurnController.droppedHistoryCount],
- * never silent.
+ * (`[tool:name args]` marker text, never separate provider `tool` messages
+ * in the persisted replay) — so whole-message truncation can never detach a
+ * tool result from its call. The wire-only continuation round (structured
+ * assistant `toolCalls` + `tool` messages, single-turn — see
+ * [buildToolContinuation]) is exempt from this appends-after-trim window
+ * argument by construction: its own accounting includes the structured
+ * payload, and when even the untrimmable minimum (newest base row + the
+ * round) still exceeds `MAX_REQUEST_CHARS` it fails closed (throw caught
+ * in runTurnLoop → typed non-retryable terminal) rather than shipping
+ * over cap. Any trimming is
+ * observable via [TurnController.droppedHistoryCount] and the
+ * continuation's own trim publication, never silent.
  *
  * The default is [Unbounded] (window everything, truncate nothing): no
  * on-device token/context measurement exists in this branch to justify a
@@ -244,17 +282,31 @@ internal enum class DurableAdmission {
  * (marker text + [TranscriptSink.onToolDone]) so tool calls are never dropped,
  * [StreamEvent.Usage] is recorded ([TranscriptSink.onUsage] + [lastUsage]).
  * Retry ownership is here: each retryable terminal failure gets a new runId
- * and isolated assistant/tool aggregation, with at most four provider attempts
- * per logical turn.
+ * and isolated assistant/tool aggregation. The retry budget allows at most
+ * four requests per logical turn (the failing request + 3 retries); the P2
+ * tool-slice path spends that budget on the continuation and its retries,
+ * with the initial tool round as the extra request (up to five — see
+ * [TurnRetryConfig]).
  *
- * SCAFFOLD (PR#1 re-review, P1 scope): this PR records ToolDone only and never
- * executes tools — no ToolDispatcher/FastRouter/PrivilegeGate/ElevatedDispatch
- * product wiring yet. Projection NATIVE means switch/flavor semantics only;
- * model visibility additionally requires `ToolDef.executionReady` (see
+ * Records-only default (production: toolSlice=null): without a loop this
+ * controller records ToolDone only and never executes tools. Projection
+ * NATIVE means switch/flavor semantics only; model visibility
+ * additionally requires `ToolDef.executionReady` (see
  * [ToolRegistry.visibleTools], the ONLY list that may be sent to the model),
- * which is false for all 41 tools in this PR.
- * The true product tool loop (dispatcher + grant/confirm + Android executors +
- * E2E) lands in the wiring PR, which flips tools to ready one by one.
+ * which is true for exactly one tool (the P2 slice `lsp.symbols`; reference
+ * it via [SafeToolSlice.TOOL_NAME], not a hardcoded count) and false
+ * for the others. The remaining product tool loop (grant/confirm + Android
+ * executors + E2E per tool) still lands tool-by-tool in wiring PRs.
+ * P2 slice opt-in (see below) attaches the single-tool closed loop.
+ *
+ * P2 safe slice (#19, default-off): when constructed with a [SafeToolSlice],
+ * the single `executionReady` tool (`lsp.symbols`; the loop exists only when a
+ * caller attaches a slice, and production attaches none)
+ * runs a same-turn closed loop — request tools → model ToolDone → schema
+ * validation → latest scope/policy re-check → executor → typed result →
+ * provider continuation → final UI/transcript. All other tools stay
+ * records-only; without a loop (null, the production composition) nothing
+ * executes and the request stays pure-chat.
  *
  * Execution-basis policy: every turn (including steered follow-ups) is gated
  * by [PolicyStore.evaluateFresh]. [PolicyStore.evaluate] is UI pre-display
@@ -429,6 +481,14 @@ class TurnController(
    * legacy-path tests as well; production 60 is shared by both paths.
    */
   private val cancelReceiptMaxRounds: Int = CANCEL_RECEIPT_MAX_ROUNDS,
+  /**
+   * P2 safe slice (#19, default-off): the single-tool closed loop. Null
+   * (production composition and all pre-slice tests) keeps records-only
+   * behavior: ToolDone markers persist, nothing executes, requests carry no
+   * tools. Non-null runs the `lsp.symbols` same-turn continuation (request
+   * tools → execute → typed result → one continuation request → final).
+   */
+  private val toolSlice: SafeToolSlice? = null,
 ) {
   companion object {
     const val POLICY_ACTION = "chat.send"
@@ -769,7 +829,7 @@ class TurnController(
    * load-time total stays observable separately via the factory's
    * historyDroppedCount. The UI list and transcript keep everything.
    */
-  var droppedHistoryCount: Int = (initialHistory.size - cappedHistory.size).coerceAtLeast(0)
+  @Volatile var droppedHistoryCount: Int = (initialHistory.size - cappedHistory.size).coerceAtLeast(0)
     private set
 
   /**
@@ -892,7 +952,10 @@ class TurnController(
   /**
    * R5-5: [lastRequestTrimmedCount] as a StateFlow, emitted synchronously in
    * [buildRequest] alongside the AtomicInteger set (one emission per attempt,
-   * at most 4 per send — negligible cost; last attempt wins). Distinct from
+   * at most 4 per send — negligible cost; last attempt wins); a tool
+   * continuation (`buildToolContinuation`) additionally emits its total once
+   * per tool round, adding the continuation's own prefix trim on top of the
+   * base request's count. Distinct from
    * the load-time [droppedHistoryCount] (DB tail cap): this counts send-time
    * per-request 100k-char trims. Never summed with resume omission; surfaced
    * via ChatSession/VM as `requestTrimmedCount`. Rejections before any request
@@ -4687,329 +4750,164 @@ class TurnController(
     lastUsage = null
     var attempt = 0
     var attemptRunId = logicalTurnId
+    // P2 slice budget: at most one tool round per turn, including retries.
+    // A retryable continuation failure starts a fresh attempt whose request
+    // drops the failed partial fragment but re-attaches the executed pair
+    // (tools=[] on the wire) — without this flag the model could re-emit the
+    // call and the slice would execute it a second time.
+    var sliceExecutedThisTurn = false
+    // The one executed round, frozen at execution time. A post-execution
+    // continuation failure re-attaches this pair on the retry request so the
+    // provider still sees the executed result instead of answering blind.
+    // Frozen (never re-derived from the live per-attempt accumulation list)
+    // so record-only re-emitted calls on retries cannot desync the
+    // calls/results sizes that `continuationMessages` requires. The
+    // `executedSliceResults.isNotEmpty()` loop-top guard also fails safe to
+    // the old pure-chat request shape in the (cancel-only) window where
+    // execute() throws before returning — keep the freeze AFTER execute().
+    var executedSliceCalls: List<dev.librepocket.provider.ToolCall> = emptyList()
+    var executedSliceResults: List<SafeToolSlice.ToolResult> = emptyList()
     while (true) {
       appendAssistantPlaceholder(attemptRunId)
-      val request = buildRequest(images)
       var failed: StreamEvent.Failed? = null
       var done = false
-      // Per-attempt visible-text budget (#83): TextDelta + ReasoningDelta
-      // chars accepted into this attempt's block. Tool markers are excluded
-      // (own budgets below). Retries start fresh (attempt isolation).
-      var visibleTextChars = 0
-      // Tool aggregation for this attempt: deltas without a terminal ToolDone
-      // are flushed as pending records so they are never silently dropped.
-      val toolArgText = mutableMapOf<Int, StringBuilder>()
-      val toolIdText = mutableMapOf<Int, StringBuilder>()
-      val toolNameText = mutableMapOf<Int, StringBuilder>()
-      val toolDoneSeen = mutableSetOf<Int>()
-      // Per-attempt whole-round tool total + distinct-index set (Finding #1):
-      // many small ToolDeltas across many indexes must still trip the shared
-      // budget. Monotonic within the attempt (ToolDone arrivals never
-      // decrement it); retries start a fresh attempt with fresh counters.
-      var totalToolAggChars = 0
-      val distinctToolIndexes = mutableSetOf<Int>()
-      suspend fun flushPendingTools() {
-        // Atomicity: preflight every pending index (including the synthetic
-        // id/name defaults, which delta billing never sees) before any
-        // marker/transcript side effect, so a later index overflowing cannot
-        // leave an earlier index committed. Already-completed ToolDone
-        // records are skipped in both passes (written inline at collection).
-        // (Plain holder class: no copy/componentN needed.)
-        class PendingTool(val index: Int, val id: String, val name: String, val args: String)
-        val pending = toolArgText.mapNotNull { (index, args) ->
-          if (index in toolDoneSeen) null
-          else {
-            val id = toolIdText[index]?.toString().orEmpty().ifEmpty { "call_pending_$index" }
-            val name = toolNameText[index]?.toString().orEmpty().ifEmpty { "pending" }
-            PendingTool(index, id, name, args.toString())
+      // P2 slice: completed model calls for the single slice tool, executed
+      // after a successful collect (same turn). Calls for any other tool stay
+      // records-only (marker + transcript, never executed).
+      val sliceCalls = mutableListOf<dev.librepocket.provider.ToolCall>()
+      // Shared aggregation state, fresh per attempt (see ToolAggState).
+      val toolState = ToolAggState()
+      try {
+        // Request build sits inside the attempt try so a builder failure
+        // (notably the continuation budget fail-close below) becomes a
+        // typed terminal, never an escaped turn crash.
+        val request =
+          if (sliceExecutedThisTurn && executedSliceResults.isNotEmpty() && toolSlice != null) {
+            // Post-execution retry: same shape as the first continuation —
+            // re-attach the frozen executed pair with `tools=[]`. The provider
+            // sees the already-executed result; no re-execution, no second
+            // tools offer.
+            // Completeness invariant: a frozen-pair retry is a continuation
+            // too and is held to the same final-answer evidence bar as the
+            // first continuation (the post-collect gate below): a Done with
+            // zero non-blank visible text fails retryable instead of
+            // finalizing an empty assistant row. The executed result still
+            // rides unchanged and nothing re-executes.
+            buildToolContinuation(images, executedSliceCalls, executedSliceResults, toolSlice)
+          } else {
+            buildRequest(images, allowTools = !sliceExecutedThisTurn)
+          }
+        val streamOutcome = collectStream(
+          request,
+          attemptRunId,
+          toolState,
+          onWiredToolDone = { call -> sliceCalls.add(call) },
+        )
+        failed = streamOutcome.failed
+        done = streamOutcome.done
+        // P2 slice: a frozen-pair retry is a continuation too. Symmetric with
+        // the first-continuation gate below: Done without visible final-answer
+        // evidence (invisible-only TextDeltas — blank, control, or format
+        // characters — plus reasoning-only, server-tool markers, and
+        // record-only ToolDones) is an incomplete continuation, never a
+        // successful empty reply. Only
+        // applies after a slice executed; the first executed round's
+        // continuation is gated via contOutcome.finalAnswerEvidence below.
+        if (failed == null && done && sliceExecutedThisTurn &&
+            toolState.finalAnswerEvidence == 0
+        ) {
+          failed = StreamEvent.Failed("incomplete tool continuation", retryable = true)
+        }
+        // P2 slice (default-off): same-turn tool continuation for the single
+        // slice tool. Cancel between collect and execution aborts here with
+        // zero further effects (ensureActive + the loop's own checks throw
+        // CancellationException, which the catch below rethrows). A failed
+        // continuation falls into the existing retry/terminal logic below.
+        // Budget: exactly one tool round per turn — continuation ToolDones
+        // are recorded, never executed (see collectToolContinuation), and a
+        // retried attempt never re-executes (sliceExecutedThisTurn): the
+        // executed pair is frozen at execution time and re-attached on the
+        // retry request with tools=[], so the provider keeps seeing the
+        // executed result. A call newly re-emitted on a retried attempt is
+        // recorded-only and stays out of that re-attached pair, pinned by
+        // test.
+        val loop = toolSlice
+        if (failed == null && done && loop != null && sliceCalls.isNotEmpty() && !sliceExecutedThisTurn) {
+          coroutineContext.ensureActive()
+          // Mark before executing: even an unexpected non-cancel throw below
+          // must not grant a second round on retry (fail-closed direction).
+          sliceExecutedThisTurn = true
+          val sliceResults = loop.execute(sliceCalls)
+          executedSliceCalls = sliceCalls.toList()
+          executedSliceResults = sliceResults
+          for (r in sliceResults) {
+            coroutineContext.ensureActive()
+            // Length-prefixed marker: resultJson embeds `]` (symbols array)
+            // and model-controlled text, so a bare `]` terminator would be
+            // ambiguous. Format: [tool-result:<name>:<len>:<json>], where
+            // <len> is String.length (UTF-16 units, matching substring
+            // slicing). Sanitize the name so model-controlled call names cannot
+            // inject framing/colons into the persisted marker.
+            val safeName = r.name.filter { it.isLetterOrDigit() || it == '.' || it == '_' || it == '-' }.ifBlank { "tool" }
+            appendAssistantText(attemptRunId, "\n[tool-result:$safeName:${r.resultJson.length}:${r.resultJson}]")
+          }
+          coroutineContext.ensureActive()
+          val contRequest = buildToolContinuation(images, sliceCalls, sliceResults, loop)
+          val contOutcome =
+            collectToolContinuation(contRequest, attemptRunId, toolState.totalChars, toolState.visibleTextChars)
+          toolState.totalChars = contOutcome.totalToolAggChars
+          toolState.visibleTextChars = contOutcome.visibleTextChars
+          if (contOutcome.failed != null) {
+            failed = contOutcome.failed
+          } else if (contOutcome.finalAnswerEvidence == 0) {
+            // A tool round that yields no final answer is not a complete
+            // success; force retry/terminal handling instead of silently
+            // finalizing an empty/partial fragment. Evidence is gated to
+            // NON-BLANK, visible text that is not a server-tool marker
+            // (ToolAggState.finalAnswerEvidence — maintainer P1): an
+            // invisible-only TextDelta (whitespace including non-breaking
+            // spaces, C0/C1 controls, Unicode format characters such as
+            // ZWSP/BOM), a web-search marker
+            // delta, or a reasoning-only stream no longer satisfies the
+            // check; a zero-evidence round — including the pre-existing
+            // zero-EVENT round — fails retryable here exactly as before.
+            failed = StreamEvent.Failed("incomplete tool continuation", retryable = true)
           }
         }
-        for (p in pending) {
-          // Terminal guard (Finding #4): whole pending ToolDone must fit
-          // the per-call budget before any marker/transcript side effect.
-          // Throws typed AGG_TOO_LARGE; the try-path catch turns it into
-          // the typed terminal without poison-adjacent records.
-          // Stage E invariant: NO full re-billing here — the delta path
-          // already billed received bytes; only the unbilled synthetic-default
-          // growth (see the round-total guard below) is billed, so nothing is
-          // double-counted.
-          // currentChars=0: pending was never per-call-billed; delta path already counted total/count, Stage E here is per-call only.
-          requireToolAggBudget(0, p.id.length + p.name.length + p.args.length)
-        }
-        // Round-total guard: synthetic pending id/name defaults were never
-        // delta-billed, so bill their growth (projected minus already-billed,
-        // floor 0) against the per-attempt total before any side effect.
-        // No new indexes are admitted here, so the distinct-index cap needs
-        // no re-check. Throws typed AGG_TOO_LARGE like the per-call guard.
-        var totalGrowth = 0
-        for (p in pending) {
-          val billed =
-            p.args.length +
-              (toolIdText[p.index]?.length ?: 0) +
-              (toolNameText[p.index]?.length ?: 0)
-          totalGrowth += (p.id.length + p.name.length + p.args.length - billed).coerceAtLeast(0)
-        }
-        requireTotalToolAggBudget(totalToolAggChars, totalGrowth)
-        for (p in pending) {
-          appendAssistantText(attemptRunId, "\n[tool:${p.name} ${p.args}]")
-          writeNotice { orderedTranscript.onToolDone(attemptRunId, p.index, p.id, p.name, p.args) }
-        }
-      }
-      // Flush pending tools unless the terminal says discard. The preflight
-      // above throws before any side effect; this stays as a last-resort net
-      // converting a budget overflow to the typed terminal instead of
-      // escaping the attempt scope and skipping terminal bookkeeping. Only
-      // ProviderFailure is converted; cancellation still propagates.
-      suspend fun flushCatchingBudgetOverflow() {
+        // Catch parity with the pre-extraction loop: the slice block only
+        // throws CancellationException in practice (typed denials cover the
+        // rest). An unexpected non-cancel throw does NOT become a terminal
+        // like the old inline typed catches: it lands in the generic catch
+        // below as a RETRYABLE attempt failure (retry first; terminal only
+        // when the retry budget is exhausted). The single-round/no-re-exec
+        // invariant holds either way — sliceExecutedThisTurn is already set
+        // before this comment point, so no retry can re-execute the slice.
+      } catch (e: ContinuationOverBudgetException) {
+        // Fail closed (P2 continuation budget): the serialized continuation
+        // payload cannot fit MAX_REQUEST_CHARS even after the full
+        // history-prefix trim. Within one logical turn history only grows
+        // (a retry cannot shrink the request) — terminal without shipping
+        // an over-cap request, and never a second tool round.
+        failed = StreamEvent.Failed(
+          e.message ?: "continuation request over budget",
+          retryable = false,
+        )
+      } catch (e: CancellationException) {
+        throw e
+      } catch (e: Exception) {
+        failed = StreamEvent.Failed(e.message ?: "provider error", retryable = true)
         if (!shouldDiscardPendingTools(failed)) {
           try {
-            flushPendingTools()
-          } catch (e: ProviderFailure) {
+            flushPendingTools(toolState, attemptRunId)
+          } catch (pf: ProviderFailure) {
             failed = StreamEvent.Failed(
-              e.message ?: "provider error",
+              pf.message ?: "provider error",
               retryable = false,
-              code = e.code?.name ?: inferAggFailureCodeName(e.message),
+              code = pf.code?.name ?: inferAggFailureCodeName(pf.message),
             )
           }
         }
-      }
-      try {
-        provider.stream(request).collect { event ->
-          coroutineContext.ensureActive()
-          // A provider terminal is authoritative; ignore buggy/legacy events
-          // that an implementation emits after Done or Failed.
-          if (done || failed != null) return@collect
-          when (event) {
-            is StreamEvent.TextDelta -> {
-              // Fail-closed visible-text budget (#83): a hostile stream of
-              // tiny text fragments must not grow memory without bound.
-              // Throws typed non-retryable TEXT_TOO_LARGE (never silent
-              // truncation); the catch below turns it into the typed terminal
-              // with the accepted fragment kept partial, like the tool
-              // budgets. Checked BEFORE buffering/display: the tripping delta
-              // is never retained and never counted.
-              requireTurnTextBudget(visibleTextChars, event.delta.length)
-              visibleTextChars += event.delta.length
-              _streamedTextDeltaCount.incrementAndGet()
-              appendAssistantText(attemptRunId, event.delta)
-            }
-            // Reasoning stays in the same assistant block: P1 keeps one visible
-            // stream and never loses thinking content. The block is additionally
-            // flagged reasoning-sourced so tool-dependent / thinking-mode
-            // follow-up rebuilds fail closed (ordinary no-tools ones continue).
-            // Shares the visible-text budget above (one block, one budget).
-            is StreamEvent.ReasoningDelta -> {
-              requireTurnTextBudget(visibleTextChars, event.delta.length)
-              visibleTextChars += event.delta.length
-              _streamedTextDeltaCount.incrementAndGet()
-              appendReasoningDelta(attemptRunId, event.delta)
-            }
-            // Opaque reasoning marker: no visible text, only the source flag
-            // (covers reasoning origins with no replayable payload).
-            is StreamEvent.ReasoningPresent -> markAssistantReasoning(attemptRunId)
-            is StreamEvent.ToolDelta -> {
-              // Fail-closed per-call aggregation budget: a hostile stream of
-              // tiny fragments (args or id/name chunks) must not grow memory
-              // without bound. Throws typed non-retryable TOOL_ARGS_TOO_LARGE
-              // (never silent truncation); the catch below skips the pending
-              // flush so poison-adjacent fragments are never recorded.
-              // The same budget additionally guards the per-attempt total
-              // across all indexes, plus a distinct-index cap — all one
-              // failure semantics.
-              // Finding #5 first-chunk-wins: id/name winners are the first
-              // non-empty chunk only (same rule as ChatCompletionsMapper);
-              // repeats contribute 0 and are never appended. Args stay
-              // full-volume.
-              val bufferedArgs = toolArgText[event.toolIndex]?.length ?: 0
-              val bufferedId = toolIdText[event.toolIndex]?.length ?: 0
-              val bufferedName = toolNameText[event.toolIndex]?.length ?: 0
-              val idIncoming =
-                if (event.idChunk != null && event.idChunk.isNotEmpty() && bufferedId == 0) {
-                  event.idChunk.length
-                } else {
-                  0
-                }
-              val nameIncoming =
-                if (event.nameChunk != null && event.nameChunk.isNotEmpty() && bufferedName == 0) {
-                  event.nameChunk.length
-                } else {
-                  0
-                }
-              val toolIncoming = event.argsChunk.length + idIncoming + nameIncoming
-              if (!distinctToolIndexes.contains(event.toolIndex)) {
-                requireToolCountBudget(distinctToolIndexes.size + 1)
-                distinctToolIndexes.add(event.toolIndex)
-              }
-              requireToolAggBudget(
-                bufferedArgs + bufferedId + bufferedName,
-                toolIncoming,
-              )
-              requireTotalToolAggBudget(totalToolAggChars, toolIncoming)
-              toolArgText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.argsChunk)
-              if (idIncoming > 0) {
-                toolIdText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.idChunk!!)
-              }
-              if (nameIncoming > 0) {
-                toolNameText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.nameChunk!!)
-              }
-              totalToolAggChars += toolIncoming
-            }
-            is StreamEvent.ToolDone -> {
-              // Terminal-only guard (Stage E): a direct ToolDone that never
-              // went through delta budgeting must still fit ALL budgets
-              // before any marker/transcript side effect. Per-call first,
-              // then distinct-index cap (BEFORE-insert), then round-total
-              // growth (candidate minus already-buffered delta bytes, floor
-              // 0 — delta-then-done never double-bills). Throws typed
-              // AGG_TOO_LARGE; the catch below turns it into the typed
-              // terminal with no marker and no transcript record for the
-              // tripping index (already-emitted ToolDones stay).
-              // Duplicate ToolDone for an already-completed index is ignored
-              // outright: no second billing, no second record.
-              if (event.toolIndex in toolDoneSeen) return@collect
-              val toolDoneCandidate =
-                event.id.length + event.name.length + event.argumentsJson.length
-              requireToolAggBudget(0, toolDoneCandidate)
-              if (event.toolIndex !in distinctToolIndexes) {
-                requireToolCountBudget(distinctToolIndexes.size + 1)
-              }
-              val toolDoneBuffered =
-                (toolArgText[event.toolIndex]?.length ?: 0) +
-                  (toolIdText[event.toolIndex]?.length ?: 0) +
-                  (toolNameText[event.toolIndex]?.length ?: 0)
-              val toolDoneGrowth = (toolDoneCandidate - toolDoneBuffered).coerceAtLeast(0)
-              requireTotalToolAggBudget(totalToolAggChars, toolDoneGrowth)
-              distinctToolIndexes.add(event.toolIndex)
-              totalToolAggChars += toolDoneGrowth
-              toolDoneSeen.add(event.toolIndex)
-              appendAssistantText(attemptRunId, "\n[tool:${event.name} ${event.argumentsJson}]")
-              writeNotice {
-                orderedTranscript.onToolDone(attemptRunId, event.toolIndex, event.id, event.name, event.argumentsJson)
-              }
-            }
-            is StreamEvent.Usage -> {
-              // Authoritative per-attempt usage (#84): merge last-wins (null
-              // fields keep the previous value) and write once before the
-              // attempt terminal below — never one notice per event. An
-              // Anthropic normal turn (dual Usage) persists exactly one row
-              // with the final values; a flood still persists one row
-              // (capped: frozen at MAX_USAGE_EVENTS_PER_ATTEMPT, never a
-              // failure). Attempt isolation: each retry merges into its own
-              // attempt id. [lastUsage] holds the merged authoritative value.
-              val counter = attemptUsageSeen.computeIfAbsent(attemptRunId) { AtomicInteger(0) }
-              // Freeze the per-attempt flood counter at the cap (sink parity):
-              // once MAX_USAGE_EVENTS_PER_ATTEMPT is reached, neither the
-              // counter nor the merge advances.
-              if (counter.get() < MAX_USAGE_EVENTS_PER_ATTEMPT) {
-                counter.incrementAndGet()
-                val merged = mergeUsage(attemptUsages[attemptRunId], event)
-                attemptUsages[attemptRunId] = merged
-                lastUsage = merged
-              }
-            }
-            is StreamEvent.Done -> {
-              // Finalization waits until post-collection flush succeeds and
-              // no failure terminal exists (see the success block below): a
-              // flush budget failure after Done must keep isPartial=true so
-              // the failed fragment is never replayed as settled history.
-              done = true
-            }
-            is StreamEvent.Failed -> failed = event
-            is StreamEvent.Retrying -> {
-              // Compatibility with legacy/custom providers. Built-in adapters
-              // do not retry; this controller owns retries from Failed events.
-              // A per-attempt provider notice keeps the attempt id.
-              writeNotice { orderedTranscript.onTurnRetried(attemptRunId, event.attempt, event.maxAttempts, event.delayMs) }
-            }
-          }
-        }
-        // Finding #3: a provider resource-exhausted Failed (typed AGG_TOO_LARGE
-        // code or overflow markers) must not flush poison-adjacent pending
-        // ToolDeltas; already-completed ToolDone records stay (emitted inline
-        // at collection time). Truncated fallback (failed == null) still
-        // flushes: shouldDiscardPendingTools(null) is false.
-        // P1 residual: an unknown-runtime Failed (typed UNKNOWN_RUNTIME code
-        // from streamingFlow) must also not flush, while other fatal events
-        // (401/validation with code == null) keep the historical flush.
-        // If this flush throws ProviderFailure (budget overflow), the catch
-        // below records it as the typed terminal and the helper there
-        // short-circuits (the new failure already discards), so no second
-        // flush can occur.
-        if (!shouldDiscardPendingTools(failed)) {
-          flushPendingTools()
-        }
-        if (!done && failed == null) {
-          failed = StreamEvent.Failed("truncated stream", retryable = true)
-        }
-      } catch (e: CancellationException) {
-        throw e
-      } catch (e: ProviderFailure) {
-        coroutineContext.ensureActive()
-        failed = StreamEvent.Failed(
-          e.message ?: "provider error",
-          retryable = e.retryable,
-          code = e.code?.name ?: inferAggFailureCodeName(e.message),
-        )
-        flushCatchingBudgetOverflow()
-        // AGG_TOO_LARGE is this collector's own guard: fail closed without
-        // recording poison-adjacent pending tools (the typed terminal error
-        // is the observable record). Accepted visible text stays buffered and
-        // is flushed exact by the terminal path below (see flushAssistantText).
-      } catch (e: IllegalArgumentException) {
-        // Validation fail-closed (mirrors streamingFlow's IAE branch):
-        // malformed request/arguments never retry. Flush stays, guarded by
-        // the same discard predicate as the Failed-event path (an overflow
-        // marker in the message still discards, reported as AGG_TOO_LARGE
-        // like every other projection).
-        coroutineContext.ensureActive()
-        failed = StreamEvent.Failed(
-          e.message ?: "provider error",
-          retryable = false,
-          code = inferAggFailureCodeName(e.message),
-        )
-        flushCatchingBudgetOverflow()
-      } catch (e: IOException) {
-        // Direct transport failure (synchronously thrown by stream() or by
-        // the returned Flow before any terminal event): classify like
-        // streamingFlow's IOException branch so transient failures retry
-        // regardless of throw site. An aggregation-overflow marker dominates
-        // the classifier (poisoned streams never retry). The pending flush
-        // stays, guarded by the same discard predicate as the Failed-event
-        // path (code == null without overflow markers flushes on both paths).
-        coroutineContext.ensureActive()
-        val kind = ProviderErrorClassifier.classify(null, e, null)
-        val aggCode = inferAggFailureCodeName(e.message)
-        failed = StreamEvent.Failed(
-          e.message ?: "provider error",
-          retryable = kind == FailureKind.RETRYABLE && aggCode == null,
-          code = aggCode,
-        )
-        flushCatchingBudgetOverflow()
-      } catch (e: Exception) {
-        // Unknown runtime failure fails closed: never retry, never persist
-        // possibly-poisoned pending tool fragments (mirrors the Error branch
-        // below). TurnController is the sole retry owner; only explicit
-        // retryable Failed terminals retry. Carries UNKNOWN_RUNTIME so a
-        // forwarded terminal stays distinguishable from flushable fatals
-        // (an overflow marker in the message still reports AGG_TOO_LARGE,
-        // like the ProviderFailure projection above).
-        coroutineContext.ensureActive()
-        failed = StreamEvent.Failed(
-          e.message ?: "provider error",
-          retryable = false,
-          code = inferAggFailureCodeName(e.message) ?: ProviderFailureCode.UNKNOWN_RUNTIME.name,
-        )
       } catch (e: Throwable) {
-        // S3-F1 Error symmetry (Current, option (a)): fatal Error from the
-        // provider stream (e.g. AssertionError/LinkageError from a buggy
-        // adapter) is a non-retryable terminal like AGG_TOO_LARGE — never
-        // flush poison-adjacent pending ToolDeltas (like the unknown-Exception
-        // branch above, which also fails closed), never retry. The outer
-        // hostedTurn Throwable catch below
-        // (or the retry-exhausted terminal path here) still projects
-        // sanitizeError → UI ERROR. CancellationException never lands here
-        // (rethrown first above), so CE semantics are unchanged. VM-fatal
-        // always propagates (contrast OrderedTranscriptSink fail+throw+seal).
         if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
         coroutineContext.ensureActive()
         failed = StreamEvent.Failed(
@@ -5200,6 +5098,706 @@ class TurnController(
   }
 
   /**
+   * Shared per-response tool-aggregation state for stream collects.
+   * Per-attempt whole-round tool total + distinct-index set (Finding #1):
+   * many small ToolDeltas across many indexes must still trip the shared
+   * budget. Monotonic within the attempt (ToolDone arrivals never
+   * decrement it); retries start a fresh attempt with fresh counters.
+   * `seenCallIds` additionally dedups the execution path by the REDACTED
+   * pairing key ([SafeToolSlice.redactedPairingId] — the same form the
+   * continuation re-binds ids to on the wire): a duplicate raw id at two
+   * indexes executes once, and so do two distinct raw ids that redact to
+   * one key; later occurrences stay records-only so calls/results pairing
+   * stays unique.
+   *
+   * Per-attempt visible-text budget (#94): text/reasoning deltas check
+   * [requireTurnTextBudget] against [visibleTextChars] before buffering (the
+   * tripping delta is never retained and never counted); tool markers are
+   * excluded (their own budgets live in the tool-agg fields above). The
+   * budget accumulates across the tool-continuation rounds of one attempt
+   * (seeded by [collectToolContinuation]) — retries start a fresh attempt
+   * with fresh counters.
+   *
+   * Continuation final-answer evidence ([finalAnswerEvidence]): count of
+   * visible, non-server-tool-marker TextDeltas. Invisible deltas (blank,
+   * C0/C1 controls, Unicode format characters — see
+   * [hasVisibleAnswerText]) and `[SERVER_TOOL:…]` markers are not visible
+   * final-answer text, and
+   * Reasoning Deltas do NOT count (a reasoning-only continuation is not a
+   * final answer). Consumed only by the continuation completeness check in
+   * [runTurnLoop]; the lifetime arrival counter stays untouched (cost-metric
+   * contract — AggBudget/char/cadence pins depend on it).
+   */
+  private class ToolAggState(
+    var totalChars: Int = 0,
+    var visibleTextChars: Int = 0,
+    val distinctIndexes: MutableSet<Int> = mutableSetOf(),
+    val argText: MutableMap<Int, StringBuilder> = mutableMapOf(),
+    val idText: MutableMap<Int, StringBuilder> = mutableMapOf(),
+    val nameText: MutableMap<Int, StringBuilder> = mutableMapOf(),
+    val doneSeen: MutableSet<Int> = mutableSetOf(),
+    val seenCallIds: MutableSet<String> = mutableSetOf(),
+    /**
+     * Raw model id -> wire id, cached only when that raw id aliases a
+     * synthesized/reserved id and therefore had to be re-bound. Identity
+     * mappings are deliberately not cached: a later blank allocation may
+     * reserve that same string, and a subsequent genuine call must still be
+     * recognized as non-duplicate at that point.
+     */
+    val wireIdAliases: MutableMap<String, String> = mutableMapOf(),
+    /** Synthesized/re-bound ids that later model-supplied ids must not alias. */
+    val reservedWireIds: MutableSet<String> = mutableSetOf(),
+    /**
+     * Evidence that the continuation produced a final answer: count of
+     * visible, non-server-tool-marker TextDeltas (invisible-only deltas —
+     * blank, control, or Unicode format characters — do not count).
+     * Reasoning deltas do NOT count (a reasoning-only continuation is not a
+     * final answer). Consumed only by the continuation completeness check.
+     */
+    var finalAnswerEvidence: Int = 0,
+  )
+
+  /** Outcome of one shared stream collect: terminal failure (if any) plus Done. */
+  private data class StreamOutcome(val failed: StreamEvent.Failed?, val done: Boolean)
+
+  private suspend fun flushPendingTools(state: ToolAggState, attemptRunId: String) {
+    coroutineContext.ensureActive()
+    // Phase-0 P3-5 residual (recorded): a truncated stream can flush
+    // "[tool:pending …]" crumbs for indexes that buffered only empty ToolDelta
+    // frames, and they ride later requests as audit noise. Accepted/deferred:
+    // redaction posture is pinned (flushedPendingMarkerMatchesRedactionPolicy)
+    // and poison-adjacent discard is governed by shouldDiscardPendingTools;
+    // no filtering or behavior work this phase.
+    // Atomicity: preflight every pending index (including the synthetic
+    // id/name defaults, which delta billing never sees) before any
+    // marker/transcript side effect, so a later index overflowing cannot
+    // leave an earlier index committed. Already-completed ToolDone
+    // records are skipped in both passes (written inline at collection).
+    class PendingTool(val index: Int, val id: String, val name: String, val args: String)
+    val pending = state.argText.mapNotNull { (index, args) ->
+      if (index in state.doneSeen) null
+      else {
+        // Blank-id synthesis with the same recognizable prefix as
+        // noteToolDone (`call_blank_pending_$index`). Records-only: the
+        // flushed pair is marker + transcript truth, never an execution
+        // candidate, so a model-supplied id that aliases this audit form
+        // cannot suppress or duplicate execution.
+        val id = state.idText[index]?.toString().orEmpty().ifEmpty { "call_blank_pending_$index" }
+        val name = state.nameText[index]?.toString().orEmpty().ifEmpty { "pending" }
+        PendingTool(index, id, name, args.toString())
+      }
+    }
+    for (p in pending) {
+      coroutineContext.ensureActive()
+      // Terminal guard (Finding #4): whole pending ToolDone must fit
+      // the per-call budget before any marker/transcript side effect.
+      requireToolAggBudget(0, p.id.length + p.name.length + p.args.length)
+    }
+    // Round-total guard: synthetic pending id/name defaults were never
+    // delta-billed, so bill their growth (projected minus already-billed,
+    // floor 0) against the per-attempt total before any side effect.
+    var totalGrowth = 0
+    for (p in pending) {
+      coroutineContext.ensureActive()
+      val billed =
+        p.args.length +
+          (state.idText[p.index]?.length ?: 0) +
+          (state.nameText[p.index]?.length ?: 0)
+      totalGrowth += (p.id.length + p.name.length + p.args.length - billed).coerceAtLeast(0)
+    }
+    requireTotalToolAggBudget(state.totalChars, totalGrowth)
+    state.totalChars += totalGrowth
+    for (p in pending) {
+      coroutineContext.ensureActive()
+      val safeName = p.name.filter { it.isLetterOrDigit() || it == '.' || it == '_' || it == '-' }.ifBlank { "tool" }
+      // Redact THEN scrub (full parity with noteToolDone): the flushed
+      // pending marker rides assistant text, which buildRequest re-sends to
+      // the provider on every later attempt/turn, so the crumb args take the
+      // same structural redaction posture as the continuation echo. Scrub
+      // AFTER redaction — a valid echo legitimately contains `[`/`]`. The
+      // CR/LF fold is belt-and-braces only: post-redaction echo output
+      // carries no raw control chars (the JSON serializer escapes them; a
+      // parse-fail collapses to the fixed receipt), so it is inert today but
+      // guards future edits to the echo path. Redact-then-scrub; audit stays
+      // raw by design.
+      val safeArgs = SafeToolSlice.redactedArgsEcho(p.args)
+        .replace("[", "［").replace("]", "］").replace("\n", " ")
+        .replace("\r", " ")
+      appendAssistantText(attemptRunId, "\n[tool:$safeName $safeArgs]")
+      writeNotice { orderedTranscript.onToolDone(attemptRunId, p.index, p.id, p.name, p.args) }
+      state.doneSeen.add(p.index)
+    }
+  }
+
+  private fun noteToolDelta(state: ToolAggState, event: StreamEvent.ToolDelta) {
+    // Fail-closed per-call aggregation budget: a hostile stream of
+    // tiny fragments (args or id/name chunks) must not grow memory
+    // without bound. Throws typed non-retryable TOOL_ARGS_TOO_LARGE
+    // (never silent truncation); the collect catch skips the pending
+    // flush so poison-adjacent fragments are never recorded.
+    // The same budget additionally guards the per-attempt total
+    // across all indexes, plus a distinct-index cap — all one
+    // failure semantics.
+    // Finding #5 first-chunk-wins: id/name winners are the first
+    // non-empty chunk only (same rule as ChatCompletionsMapper);
+    // repeats contribute 0 and are never appended. Args stay
+    // full-volume.
+    val bufferedArgs = state.argText[event.toolIndex]?.length ?: 0
+    val bufferedId = state.idText[event.toolIndex]?.length ?: 0
+    val bufferedName = state.nameText[event.toolIndex]?.length ?: 0
+    val idIncoming =
+      if (event.idChunk != null && event.idChunk.isNotEmpty() && bufferedId == 0) {
+        event.idChunk.length
+      } else {
+        0
+      }
+    val nameIncoming =
+      if (event.nameChunk != null && event.nameChunk.isNotEmpty() && bufferedName == 0) {
+        event.nameChunk.length
+      } else {
+        0
+      }
+    val toolIncoming = event.argsChunk.length + idIncoming + nameIncoming
+    if (!state.distinctIndexes.contains(event.toolIndex)) {
+      requireToolCountBudget(state.distinctIndexes.size + 1)
+      state.distinctIndexes.add(event.toolIndex)
+    }
+    requireToolAggBudget(
+      bufferedArgs + bufferedId + bufferedName,
+      toolIncoming,
+    )
+    requireTotalToolAggBudget(state.totalChars, toolIncoming)
+    state.argText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.argsChunk)
+    if (idIncoming > 0) {
+      state.idText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.idChunk!!)
+    }
+    if (nameIncoming > 0) {
+      state.nameText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.nameChunk!!)
+    }
+    state.totalChars += toolIncoming
+  }
+
+  private suspend fun noteToolDone(
+    state: ToolAggState,
+    event: StreamEvent.ToolDone,
+    attemptRunId: String,
+    onWiredToolDone: ((dev.librepocket.provider.ToolCall) -> Unit)?,
+  ) {
+    // Terminal-only guard (Stage E): a direct ToolDone that never
+    // went through delta budgeting must still fit ALL budgets
+    // before any marker/transcript side effect. Per-call first,
+    // then distinct-index cap (BEFORE-insert), then round-total
+    // growth (candidate minus already-buffered delta bytes, floor
+    // 0 — delta-then-done never double-bills). Throws typed
+    // AGG_TOO_LARGE; the collect catch turns it into the typed
+    // terminal with no marker and no transcript record for the
+    // tripping index (already-emitted ToolDones stay).
+    // Duplicate ToolDone for an already-completed index is ignored
+    // outright: no second billing, no second record.
+    if (event.toolIndex in state.doneSeen) return
+    val toolDoneCandidate =
+      event.id.length + event.name.length + event.argumentsJson.length
+    requireToolAggBudget(0, toolDoneCandidate)
+    if (event.toolIndex !in state.distinctIndexes) {
+      requireToolCountBudget(state.distinctIndexes.size + 1)
+    }
+    val toolDoneBuffered =
+      (state.argText[event.toolIndex]?.length ?: 0) +
+        (state.idText[event.toolIndex]?.length ?: 0) +
+        (state.nameText[event.toolIndex]?.length ?: 0)
+    val toolDoneGrowth = (toolDoneCandidate - toolDoneBuffered).coerceAtLeast(0)
+    requireTotalToolAggBudget(state.totalChars, toolDoneGrowth)
+    state.distinctIndexes.add(event.toolIndex)
+    state.totalChars += toolDoneGrowth
+    state.doneSeen.add(event.toolIndex)
+    val safeName = event.name.filter { it.isLetterOrDigit() || it == '.' || it == '_' || it == '-' }.ifBlank { "tool" }
+    // Redact THEN scrub: the inline marker rides assistant text, which
+    // buildRequest re-sends to the provider on every later attempt/turn, so
+    // the args take the same structural redaction posture as the continuation
+    // echo (SafeToolSlice.redactedArgsEcho — parse/size/depth failures already
+    // collapse to a fixed receipt). Scrubbing happens AFTER redaction, because
+    // a valid echo legitimately contains `[`/`]` array framing. The CR/LF
+    // fold below is belt-and-braces only: post-redaction echo output carries
+    // no raw control chars (the JSON serializer escapes them; the fallback
+    // receipt is fixed), so it is inert today but guards future edits to the
+    // echo path. The durable transcript audit record below deliberately keeps
+    // the RAW args (audit truth, never provider-visible text).
+    val safeArgs = SafeToolSlice.redactedArgsEcho(event.argumentsJson)
+      .replace("[", "［").replace("]", "］").replace("\n", " ").replace("\r", " ")
+    appendAssistantText(attemptRunId, "\n[tool:$safeName $safeArgs]")
+    writeNotice {
+      orderedTranscript.onToolDone(attemptRunId, event.toolIndex, event.id, event.name, event.argumentsJson)
+    }
+    // P2 slice: only the single slice tool proceeds to execution
+    // (after a successful collect, same turn); everything else stays
+    // records-only even when a loop is attached. A null callback means
+    // record-only (tool continuation second round).
+    // Execution-path id intake hardening:
+    // (a) a duplicate execution candidate is deduped by the REDACTED pairing
+    //     key, not the raw id: the continuation below re-binds every id to
+    //     its redacted form (SafeToolSlice.continuationMessages), so two
+    //     distinct raw ids that redact to one string would otherwise both
+    //     execute and then ride the wire as a duplicate call/result pair —
+    //     the internal pairing validator (ProviderJson
+    //     TOOL_CALL_DUPLICATE_ID, non-retryable) would kill the turn AFTER
+    //     both calls already executed. The colliding second call stays
+    //     records-only (its marker + transcript record above are kept).
+    //     The dedup routes through the SafeToolSlice seam
+    //     (redactedPairingId) — the turn engine must not import the
+    //     redactor for this key;
+    // (b) a blank id synthesizes the deterministic per-index wire id
+    //     (`call_blank_${event.toolIndex}`). Prefixing alone is not enough:
+    //     a later model-supplied literal `call_blank_3` would still alias
+    //     the earlier blank call, satisfy the seen-set, and silently skip
+    //     execution. Synthesized ids are therefore reserved; a model id that
+    //     aliases one is re-bound to a unique `_2` suffix (idempotently per
+    //     raw id), so genuine calls execute while exact duplicate raw ids
+    //     still dedup. The internal pairing validator (ProviderJson
+    //     TOOL_CALL_MISSING_ID, non-retryable) and providers alike fail
+    //     closed on an empty tool-call id; providers whose mapper carries no
+    //     blank-id repair still rely on this fallback. The transcript record
+    //     above deliberately keeps the RAW event id for audit truth.
+    val wireId = if (event.id.isBlank()) {
+      allocateWireCallId("call_blank_${event.toolIndex}", state).also {
+        state.reservedWireIds.add(it)
+      }
+    } else {
+      state.wireIdAliases[event.id] ?: if (event.id in state.reservedWireIds) {
+        allocateWireCallId(event.id, state).also {
+          state.reservedWireIds.add(it)
+          state.wireIdAliases[event.id] = it
+        }
+      } else {
+        event.id
+      }
+    }
+    val pairingId = SafeToolSlice.redactedPairingId(wireId)
+    if (
+      onWiredToolDone != null &&
+      toolSlice != null &&
+      event.name == SafeToolSlice.TOOL_NAME &&
+      pairingId !in state.seenCallIds
+    ) {
+      state.seenCallIds.add(pairingId)
+      onWiredToolDone(
+        dev.librepocket.provider.ToolCall(
+          id = wireId,
+          name = event.name,
+          argumentsJson = event.argumentsJson,
+        ),
+      )
+    }
+  }
+
+  /**
+   * Allocate a wire id that cannot alias an already-seen execution candidate
+   * or a reserved synthesized/renamed id. Suffixes are deterministic in
+   * allocation order so duplicate events keep deduping instead of fanning out.
+   */
+  private fun allocateWireCallId(preferred: String, state: ToolAggState): String {
+    var candidate = preferred
+    var suffix = 2
+    while (
+      SafeToolSlice.redactedPairingId(candidate) in state.seenCallIds ||
+      candidate in state.reservedWireIds
+    ) {
+      candidate = "${preferred}_${suffix++}"
+    }
+    return candidate
+  }
+
+  /**
+   * True when [text] contains at least one character a user could see as
+   * final-answer content.
+   *
+   * Continuation evidence must not be satisfied by invisible frames:
+   * whitespace/space separators (including non-breaking spaces), C0/C1
+   * controls, Unicode `Cf` format characters (ZWSP, BOM, LRM/RLM, ...), and
+   * default-ignorable/blank fillers (variation selectors, combining
+   * grapheme joiner, Hangul fillers, braille blank) are not visible answer
+   * text. Iteration is by code point so supplementary-plane visible
+   * characters (emoji, CJK extensions) still count. The direction is
+   * fail-closed: an invisible-only delta leaves the continuation at zero
+   * evidence, so it retries instead of finalizing an empty assistant row.
+   */
+  private fun hasVisibleAnswerText(text: String): Boolean {
+    var i = 0
+    while (i < text.length) {
+      val codePoint = text.codePointAt(i)
+      val type = Character.getType(codePoint)
+      if (!Character.isWhitespace(codePoint) &&
+        !Character.isSpaceChar(codePoint) &&
+        !Character.isISOControl(codePoint) &&
+        type != Character.FORMAT.toInt() &&
+        !isDefaultIgnorableOrBlank(codePoint)
+      ) {
+        return true
+      }
+      i += Character.charCount(codePoint)
+    }
+    return false
+  }
+
+  /**
+   * Default-ignorable or visually blank code points outside the `Cf`
+   * (format), whitespace, and control categories: variation selectors,
+   * combining grapheme joiner, Hangul fillers, Khmer inherent vowels, and
+   * the braille blank. Excluding them keeps an invisible-only delta from
+   * counting as final-answer evidence while visible base characters in the
+   * same grapheme still count.
+   */
+  private fun isDefaultIgnorableOrBlank(codePoint: Int): Boolean = when (codePoint) {
+    0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800, 0x3164, 0xFFA0 -> true
+    in 0x180B..0x180F -> true
+    in 0xFE00..0xFE0F -> true
+    in 0xE0100..0xE01EF -> true
+    else -> false
+  }
+
+  /**
+   * Shared stream-event collect for the attempt loop and the P2 tool
+   * continuation. Text/reasoning deltas run the shared per-attempt
+   * visible-text budget ([ToolAggState.visibleTextChars] +
+   * [requireTurnTextBudget]); visible, non-server-tool-marker TextDeltas
+   * additionally accumulate [ToolAggState.finalAnswerEvidence] (the
+   * continuation completeness input — ReasoningDelta is never evidence);
+   * Usage events merge into the per-attempt
+   * authoritative value (#84) — one [flushAttemptUsage] notice before the
+   * attempt terminal, never one per event; notice handling identical; plus
+   * the same Failed/Retrying/Done/truncated-terminal semantics as the old
+   * inline loop. ToolDone optionally forwarded to [onWiredToolDone] (attempt
+   * loop) or recorded only (continuation, null callback — one tool round per
+   * turn).
+   */
+  private suspend fun collectStream(
+    request: ChatRequest,
+    attemptRunId: String,
+    state: ToolAggState,
+    onWiredToolDone: ((dev.librepocket.provider.ToolCall) -> Unit)?,
+  ): StreamOutcome {
+    coroutineContext.ensureActive()
+    var done = false
+    var failed: StreamEvent.Failed? = null
+    try {
+      provider.stream(request).collect { event ->
+        coroutineContext.ensureActive()
+        // A provider terminal is authoritative; ignore buggy/legacy events
+        // that an implementation emits after Done or Failed.
+        if (done || failed != null) return@collect
+        when (event) {
+          is StreamEvent.TextDelta -> {
+            // Fail-closed per-turn visible-text budget (#94): a hostile
+            // stream of tiny text fragments must not grow memory without
+            // bound. Throws typed non-retryable TEXT_TOO_LARGE (never silent
+            // truncation); the catch below turns it into the typed terminal
+            // with the accepted fragment kept partial, like the tool
+            // budgets. Checked BEFORE buffering/display: the tripping delta
+            // is never retained and never counted. Enforced against the
+            // shared [ToolAggState] so both collect paths count one budget
+            // per attempt block.
+            requireTurnTextBudget(state.visibleTextChars, event.delta.length)
+            state.visibleTextChars += event.delta.length
+            _streamedTextDeltaCount.incrementAndGet()
+            // Continuation final-answer evidence: only visible text (not
+            // blank/control/format-only — see hasVisibleAnswerText) that is
+            // not a `SERVER_TOOL` marker counts — an invisible-only
+            // TextDelta or a web-search marker frame
+            // (`\n[SERVER_TOOL:web_search …]\n`, see
+            // ServerToolTranscript.webSearchMarker) is not a final answer.
+            // Reasoning Deltas below never count (reasoning-only continuation
+            // is not a final answer). The lifetime counter above and the
+            // budget accounting stay untouched (cost-metric contracts).
+            // Deferred rationale (recorded, separate design round):
+            // isServerToolMarker is a CONTAINS predicate, so ONE delta that
+            // merges visible text AND the marker frame is over-excluded
+            // wholesale — its text half does not count as evidence and may
+            // yield a false-incomplete retry. The over-exclusion direction is
+            // fail-closed (never a false complete) and is the accepted Phase-1
+            // trade-off; splitting a merged text+marker delta is future work.
+            if (hasVisibleAnswerText(event.delta) && !ServerToolTranscript.isServerToolMarker(event.delta)) {
+              state.finalAnswerEvidence++
+            }
+            appendAssistantText(attemptRunId, event.delta)
+          }
+          // Reasoning stays in the same assistant block: P1 keeps one visible
+          // stream and never loses thinking content. The block is additionally
+          // flagged reasoning-sourced so tool-dependent / thinking-mode
+          // follow-up rebuilds fail closed (ordinary no-tools ones continue).
+          // Single _uiState.update (text + flag) to avoid two full maps per delta.
+          // Shares the visible-text budget above (reasoning + text are one
+          // assistant block, one budget).
+          is StreamEvent.ReasoningDelta -> {
+            requireTurnTextBudget(state.visibleTextChars, event.delta.length)
+            state.visibleTextChars += event.delta.length
+            _streamedTextDeltaCount.incrementAndGet()
+            appendReasoningDelta(attemptRunId, event.delta)
+          }
+          // Opaque reasoning marker: no visible text, only the source flag
+          // (covers reasoning origins with no replayable payload).
+          is StreamEvent.ReasoningPresent -> markAssistantReasoning(attemptRunId)
+          is StreamEvent.ToolDelta -> noteToolDelta(state, event)
+          is StreamEvent.ToolDone -> noteToolDone(state, event, attemptRunId, onWiredToolDone)
+          is StreamEvent.Usage -> {
+            // Authoritative per-attempt usage (#84): merge last-wins (null
+            // fields keep the previous value) and write once before the
+            // attempt terminal below — never one notice per event. An
+            // Anthropic normal turn (dual Usage) persists exactly one row
+            // with the final values; a flood still persists one row
+            // (capped: frozen at MAX_USAGE_EVENTS_PER_ATTEMPT, never a
+            // failure). Attempt isolation: each retry merges into its own
+            // attempt id. [lastUsage] holds the merged authoritative value.
+            val counter = attemptUsageSeen.computeIfAbsent(attemptRunId) { AtomicInteger(0) }
+            // Freeze the per-attempt flood counter at the cap (sink parity):
+            // once MAX_USAGE_EVENTS_PER_ATTEMPT is reached, neither the
+            // counter nor the merge advances.
+            if (counter.get() < MAX_USAGE_EVENTS_PER_ATTEMPT) {
+              counter.incrementAndGet()
+              val merged = mergeUsage(attemptUsages[attemptRunId], event)
+              attemptUsages[attemptRunId] = merged
+              lastUsage = merged
+            }
+          }
+          is StreamEvent.Done -> {
+            done = true
+          }
+          is StreamEvent.Failed -> failed = event
+          is StreamEvent.Retrying -> {
+            // Compatibility with legacy/custom providers. Built-in adapters
+            // do not retry; this controller owns retries from Failed events.
+            // A per-attempt provider notice keeps the attempt id.
+            writeNotice { orderedTranscript.onTurnRetried(attemptRunId, event.attempt, event.maxAttempts, event.delayMs) }
+          }
+        }
+      }
+      // Finding #3: a provider resource-exhausted Failed (typed AGG_TOO_LARGE
+      // code or overflow markers) must not flush poison-adjacent pending
+      // ToolDeltas; already-completed ToolDone records stay (emitted inline
+      // at collection time). Truncated fallback (failed == null) still
+      // flushes: isResourceExhausted(null) is false.
+      if (!shouldDiscardPendingTools(failed)) {
+        flushPendingTools(state, attemptRunId)
+      }
+      if (!done && failed == null) {
+        failed = StreamEvent.Failed("truncated stream", retryable = true)
+      }
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: ProviderFailure) {
+      coroutineContext.ensureActive()
+      failed = StreamEvent.Failed(
+        e.message ?: "provider error",
+        retryable = e.retryable,
+        code = e.code?.name ?: inferAggFailureCodeName(e.message),
+      )
+      // AGG_TOO_LARGE is this collector's own guard: fail closed without
+      // recording poison-adjacent pending tools (the typed terminal error
+      // is the observable record). Other failures flush, guarded by the
+      // same discard predicate as the Failed-event path.
+      if (e.code != ProviderFailureCode.AGG_TOO_LARGE && !shouldDiscardPendingTools(failed)) {
+        try {
+          flushPendingTools(state, attemptRunId)
+        } catch (pf: ProviderFailure) {
+          failed = StreamEvent.Failed(
+            pf.message ?: "provider error",
+            retryable = false,
+            code = pf.code?.name ?: inferAggFailureCodeName(pf.message),
+          )
+        }
+      }
+    } catch (e: IllegalArgumentException) {
+      coroutineContext.ensureActive()
+      failed = StreamEvent.Failed(
+        e.message ?: "provider error",
+        retryable = false,
+        code = inferAggFailureCodeName(e.message),
+      )
+      if (!shouldDiscardPendingTools(failed)) {
+        try {
+          flushPendingTools(state, attemptRunId)
+        } catch (pf: ProviderFailure) {
+          failed = StreamEvent.Failed(
+            pf.message ?: "provider error",
+            retryable = false,
+            code = pf.code?.name ?: inferAggFailureCodeName(pf.message),
+          )
+        }
+      }
+    } catch (e: IOException) {
+      coroutineContext.ensureActive()
+      val kind = ProviderErrorClassifier.classify(null, e, null)
+      val aggCode = inferAggFailureCodeName(e.message)
+      failed = StreamEvent.Failed(
+        e.message ?: "provider error",
+        retryable = kind == FailureKind.RETRYABLE && aggCode == null,
+        code = aggCode,
+      )
+      if (!shouldDiscardPendingTools(failed)) {
+        try {
+          flushPendingTools(state, attemptRunId)
+        } catch (pf: ProviderFailure) {
+          failed = StreamEvent.Failed(
+            pf.message ?: "provider error",
+            retryable = false,
+            code = pf.code?.name ?: inferAggFailureCodeName(pf.message),
+          )
+        }
+      }
+    } catch (e: Exception) {
+      coroutineContext.ensureActive()
+      failed = StreamEvent.Failed(
+        e.message ?: "provider error",
+        retryable = false,
+        code = inferAggFailureCodeName(e.message) ?: ProviderFailureCode.UNKNOWN_RUNTIME.name,
+      )
+    } catch (e: Throwable) {
+      // S3-F1 Error symmetry (Current, option (a)): fatal Error from the
+      // provider stream (e.g. AssertionError/LinkageError from a buggy
+      // adapter) is a non-retryable terminal like AGG_TOO_LARGE — never
+      // flush poison-adjacent pending ToolDeltas (like Exception, which
+      // now also discards), never retry. The outer hostedTurn Throwable catch below
+      // (or the retry-exhausted terminal path here) still projects
+      // sanitizeError → UI ERROR. CancellationException never lands here
+      // (rethrown first above), so CE semantics are unchanged. VM-fatal
+      // always propagates (contrast OrderedTranscriptSink fail+throw+seal).
+      if (e is VirtualMachineError || e is ThreadDeath) throw e
+      coroutineContext.ensureActive()
+      failed = StreamEvent.Failed(e.message ?: "provider error", retryable = false)
+    }
+    return StreamOutcome(failed, done)
+  }
+
+  /**
+   * Outcome of the P2 slice continuation collect: terminal failure (if any),
+   * the updated per-attempt tool total, and the [ToolAggState.finalAnswerEvidence]
+   * accumulated in this continuation round — the completeness input for
+   * runTurnLoop's "incomplete tool continuation" failure (evidence counts
+   * visible, non-server-tool-marker TextDeltas only; a zero-evidence round,
+   * including invisible-only and the pre-existing zero-EVENT rounds, is
+   * never a completed final answer).
+   */
+  private data class ContinuationOutcome(
+    val failed: StreamEvent.Failed?,
+    val totalToolAggChars: Int,
+    val visibleTextChars: Int,
+    val finalAnswerEvidence: Int,
+  )
+
+  /**
+   * P2 slice continuation request: the current history/user context plus the
+   * structured tool round (assistant `toolCalls` + paired `tool` results —
+   * pairing is total within one executed round). Markers stay inline in the
+   * assistant text AND the structured round rides alongside (double carry
+   * within one request). This builder runs once for the live continuation,
+   * then is re-derived once per post-execution retry attempt — each retry
+   * re-attaches the frozen executed pair after a retryable continuation
+   * failure (a provider `Failed` or the forced incomplete-round failure —
+   * see runTurnLoop). The
+   * failed attempt's partial inline markers do not survive that retry, the
+   * structured pair does. Re-attached requests inherit the attempt-0
+   * continuation's `requireNoReasoningHistory` semantics unchanged: with a
+   * reasoning-sourced settled history a post-exec continuation failure
+   * terminals instead of succeeding blind (fail-closed by construction, not
+   * a new adapter refusal class). NO tools are
+   * advertised (`allowTools = false`): the continuation request carries no
+   * `tools` array. If the model still emits a second-round call it is
+   * recorded (markers + transcript, `onWiredToolDone = null`) but never
+   * executed — the one-tool-round-per-turn budget holds on the wire, not
+   * only in code.
+   *
+   * When the structured round pushes the request past [MAX_REQUEST_CHARS],
+   * history-prefix trimming (oldest-first, whole messages, tool pairing kept
+   * atomic, the structured payload counted) is additionally published on
+   * [lastRequestTrimmedCount]/[requestTrimmedCount]
+   * as the total head trim of the outgoing request (added on top of the
+   * base request's own emission) — never silent. If even the untrimmable
+   * minimum (the newest base row + the structured round) exceeds the cap,
+   * this throws [ContinuationOverBudgetException]: runTurnLoop fails the
+   * turn with a typed non-retryable terminal instead of shipping an
+   * over-cap request (a retry cannot shrink history that only grows).
+   */
+
+  private fun buildToolContinuation(
+    images: List<ChatImageRef>,
+    calls: List<dev.librepocket.provider.ToolCall>,
+    results: List<SafeToolSlice.ToolResult>,
+    loop: SafeToolSlice,
+  ): ChatRequest {
+    val base = buildRequest(images, allowTools = false)
+    val contMessages = loop.continuationMessages(calls, results)
+    // Keep tool-call/tool-result pairing atomic: trim only the history prefix
+    // when the structured round pushes the request over MAX_REQUEST_CHARS.
+    // Payload accounting is the conservative full-request estimate
+    // (`requestWireEstimate`: per-message terms for the base AND the
+    // structured round, plus the request envelope once) and includes the
+    // structured assistant toolCalls (id/name/args echo — the echo can reach
+    // MAX_INPUT_CHARS) and the tool-result `ChatMessage.toolCallId` (every
+    // adapter serializes it on the wire), with JSON-escaping expansion
+    // over-counted: a text-only sum under-counts everything that actually
+    // serializes into the outgoing request (quote-dense text can triple).
+    val baseMessages = base.messages.toMutableList()
+    var totalChars = requestWireEstimate(baseMessages + contMessages, base.model)
+    var drop = 0
+    while (drop < baseMessages.size - 1 && totalChars > MAX_REQUEST_CHARS) {
+      totalChars -= baseMessages[drop].wirePayloadChars()
+      drop++
+    }
+    if (totalChars > MAX_REQUEST_CHARS) {
+      // Untrimmable: the newest base row + the structured round exceed the
+      // cap even at the minimum prefix (the trim never removes the newest
+      // row). History only grows within one logical turn, so a retry cannot
+      // shrink this request — fail closed (typed, non-retryable) instead of
+      // silently shipping an over-cap request.
+      // Trim-count contract: on this throw path requestTrimmedCount
+      // retains only the base request's published dropCount (the request
+      // was never shipped); the next build resets it per request.
+      throw ContinuationOverBudgetException()
+    }
+    val finalBase = if (drop > 0) baseMessages.drop(drop) else baseMessages
+    // Publish the continuation's own prefix trim (never silent): buildRequest
+    // already emitted the base request's context-window trim, so this adds on
+    // top — lastRequestTrimmedCount then reflects the TOTAL head trim of the
+    // outgoing continuation request. Single-writer (same coroutine), so the
+    // read-add-set is exact.
+    if (drop > 0) {
+      val total = _lastRequestTrimmedCount.get() + drop
+      _lastRequestTrimmedCount.set(total)
+      _requestTrimmedCount.value = total
+    }
+    return base.copy(messages = finalBase + contMessages)
+  }
+
+  /**
+   * P2 slice continuation collect: delegates to [collectStream] with
+   * record-only tool semantics (`onWiredToolDone = null`) — ToolDone/pending
+   * ToolDeltas get markers + transcript records but are never executed,
+   * enforcing the one-tool-round-per-turn budget. Aggregation budgets share
+   * the attempt total ([attemptTotalChars] in, updated total out);
+   * index-keyed maps are fresh per response (provider tool indexes restart
+   * per response, so cross-round sharing would forge false duplicates).
+   *
+   * Round identity: continuation records share this attempt's [attemptRunId]
+   * with the first round (both are append-only rows, never upserts, so no
+   * overwrite). Rounds are distinguished by order only in the durable
+   * transcript (markers hold name+args; call ids reach in-memory sinks but
+   * are not persisted); a typed per-round transcript event is future work
+   * (not this slice). The visible-text budget is seeded from the attempt's
+   * running [ToolAggState.visibleTextChars] (main's per-attempt budget keeps
+   * accumulating across the rounds of one same-block attempt); the
+   * index-keyed tool-agg floors above stay fresh per round as reasoned here.
+   */
+  private suspend fun collectToolContinuation(
+    request: ChatRequest,
+    attemptRunId: String,
+    attemptTotalChars: Int,
+    attemptVisibleTextChars: Int,
+  ): ContinuationOutcome {
+    coroutineContext.ensureActive()
+    val state = ToolAggState(totalChars = attemptTotalChars, visibleTextChars = attemptVisibleTextChars)
+    val outcome = collectStream(request, attemptRunId, state, onWiredToolDone = null)
+    return ContinuationOutcome(outcome.failed, state.totalChars, state.visibleTextChars, state.finalAnswerEvidence)
+  }
+
+  /**
    * Maps the resumed history plus the current (settled) UI history plus this
    * turn's images to one [ChatRequest]: the capped history prefix first, then
    * live messages. The current user message is already in [uiState] (appended
@@ -5216,8 +5814,15 @@ class TurnController(
    * copy of the last user message only. No user message means no injection
    * (never fabricates a message for the clock). UI state and transcript keep
    * the raw user text.
+   *
+   * `allowTools` gates the structured `tools` offer: `true` (attempt round,
+   * default) offers the slice tool when the loop is attached; the tool
+   * continuation round passes `false` so the wire carries NO tool array
+   * (one-tool-round-per-turn enforced on the request shape). Kotlin default
+   * args compile to a SINGLE JVM method `(List, boolean)` (+ the `$default`
+   * bridge) — reflection callers must use the two-param signature.
    */
-  private fun buildRequest(images: List<ChatImageRef>): ChatRequest {
+  private fun buildRequest(images: List<ChatImageRef>, allowTools: Boolean = true): ChatRequest {
     val live = _uiState.value.messages
       .filter { !it.isPartial }
       .map { ChatMessage(role = it.role, text = it.text, hasReasoning = it.hasReasoning) }
@@ -5226,6 +5831,9 @@ class TurnController(
     combined.addAll(live)
     val base = applyHistoryCap(combined, historyCap).toMutableList()
     droppedHistoryCount = (combined.size - base.size).coerceAtLeast(0)
+    // Per-request image re-load/decode is an accepted cost trade-off;
+    // decoder-level reuse/caching is deliberately deferred (bounds documented
+    // in defaultChatImageLoader's KDoc).
     val loaded = runCatching { imageLoader(images) }.getOrDefault(emptyList())
     if (loaded.isNotEmpty()) {
       val lastUser = base.indexOfLast { it.role == "user" }
@@ -5252,11 +5860,17 @@ class TurnController(
     _lastRequestTrimmedCount.set(dropCount)
     _requestTrimmedCount.value = dropCount
     val finalMessages = if (dropCount > 0) base.drop(dropCount) else base
-    return ChatRequest(model = model, messages = finalMessages)
-    // NOTE (PR#1 scope-down): tools deliberately NOT attached here.
-    // ChatRequest.tools may only carry ToolRegistry.visibleTools() output
-    // (projection + executionReady); all 41 tools are executionReady=false
-    // in this scaffold PR, so the request stays pure-chat by construction.
+    // P2 slice: tools attach ONLY the loop's offer (visibleTools ∩ slice,
+    // empty when the loop is absent — the production composition — or when
+    // the slice projects unavailable). ChatRequest.tools may only carry
+    // ToolRegistry.visibleTools() output (projection + executionReady); 40
+    // tools stay executionReady=false, so a non-slice request is pure-chat
+    // by construction.
+    // P2 slice: after a tool round has executed this turn, never advertise
+    // tools again (continuation or retry) — only paired result/terminal
+    // semantics, no second tool round.
+    val offered = if (allowTools) toolSlice?.offeredTools().orEmpty() else emptyList()
+    return ChatRequest(model = model, messages = finalMessages, tools = offered)
   }
 
   /**
@@ -5477,6 +6091,135 @@ class TurnController(
     attemptTextBuffers[runId]?.hasReasoning == true ||
       (_uiState.value.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.hasReasoning == true)
 }
+
+/**
+ * Conservative per-message structural allowance for [ChatMessage.wirePayloadChars]:
+ * role/content/tool-call wrapper keys and separators all three adapters emit
+ * per message, measured against `ResponsesProvider`, `AnthropicProvider` and
+ * `ChatCompletionsProvider` with margin (worst measured single-message wrapper
+ * is ~80 chars: the Anthropic tool-result frame; the assistant tool-call
+ * message lands near 52). Over-estimating by design: the estimate must
+ * never under-count a serialization that actually ships.
+ */
+internal const val MESSAGE_WRAPPER_CHARS = 128
+
+/**
+ * Conservative per-tool-call structural allowance for
+ * [ChatMessage.wirePayloadChars]: `id`/`type`/`function.name`/`arguments`
+ * (Chat), `call_id`/`name`/`arguments` (Responses) and `id`/`name`/`input`
+ * (Anthropic) wrapper keys and braces. Worst measured wrapper is the Chat
+ * Completions `tool_calls[]` element at 67 chars (`arguments:"{}"` with empty
+ * ids); 96 leaves margin for adapter drift.
+ */
+internal const val TOOL_CALL_WRAPPER_CHARS = 96
+
+/**
+ * Conservative per-request envelope allowance for [requestWireEstimate]:
+ * stream flags and the `messages`/`input` array scaffolding of one outgoing
+ * request (Chat ~41, Responses ~52, Anthropic ~58 measured, plus header
+ * separators). The `model` value is NOT part of this envelope: it is counted
+ * separately via the optional `model` parameter of [requestWireEstimate]
+ * (`requestWireEstimate(..., model)`), exactly once per request. Counted ONCE
+ * per request, never per side of a merged message list. Tool arrays are empty
+ * on continuation requests by construction (no `allowTools`), and production
+ * never sets `systemPromptOverride`, so those bytes are outside the
+ * continuation budget.
+ */
+internal const val REQUEST_ENVELOPE_CHARS = 160
+
+/**
+ * Conservative over-count (in UTF-16 units) of the JSON-encoded string
+ * content the three adapters emit for one raw Kotlin string — the shared
+ * escaping term of [ChatMessage.wirePayloadChars].
+ *
+ * Covers every escaper the adapters use: `jsonEscape`/`q`
+ * (`ProviderTransport.kt`, Responses/Chat/Anthropic `buildBody`) and the
+ * kotlinx `JsonPrimitive` path behind `buildJsonObject`
+ * (`ProviderJson.kt` tool fragments). Per code unit:
+ * - `"` and `\` -> 2 (`\"` / `\\`),
+ * - `\b`, `\f`, `\n`, `\r`, `\t` -> 2 (`\b` / `\f` / …),
+ * - any other U+0000-U+001F -> 6 (`\u00XX`),
+ * - valid surrogate pair -> 2 (both escapers keep the pair raw),
+ * - lone surrogate -> 6 (the `\uXXXX` cost, so the estimate stays an
+ *   over-count even if an escaper starts escaping unpaired surrogates),
+ * - everything else -> 1.
+ *
+ * O(n) single pass by index, no allocation. `internal` visibility so
+ * same-module tests can pin the estimate against the REAL escapers instead
+ * of a re-derived formula.
+ */
+internal fun jsonEscapedChars(s: String): Int {
+  var total = 0
+  var i = 0
+  while (i < s.length) {
+    val c = s[i]
+    when {
+      c == '"' || c == '\\' -> { total += 2; i++ }
+      c == '\b' || c == '\u000C' || c == '\n' || c == '\r' || c == '\t' -> { total += 2; i++ }
+      c < ' ' -> { total += 6; i++ }
+      Character.isHighSurrogate(c) ->
+        if (i + 1 < s.length && Character.isLowSurrogate(s[i + 1])) {
+          total += 2; i += 2
+        } else {
+          total += 6; i++
+        }
+      Character.isLowSurrogate(c) -> { total += 6; i++ }
+      else -> { total += 1; i++ }
+    }
+  }
+  return total
+}
+
+/**
+ * Serialized-size estimate of one [ChatMessage] on the outgoing request —
+ * the SINGLE SOURCE OF TRUTH for the continuation budget accounting
+ * (`buildToolContinuation`'s trim + fail-close sums it; the
+ * TurnControllerToolSliceTest pins call this same function, so production
+ * arithmetic and test arithmetic cannot drift).
+ *
+ * Counts a CONSERVATIVE over-count of everything that serializes for one
+ * message: [ChatMessage.text], the tool-result `ChatMessage.toolCallId`
+ * (all three adapters serialize it on the wire — `tool_call_id` /
+ * `function_call_output.call_id` / `tool_result.tool_use_id` — so role="tool"
+ * rows count its escaped form alongside the text), every structured assistant
+ * `toolCalls` field (id/name/argumentsJson), plus per-message and per-tool-call
+ * structural wrapper allowances ([MESSAGE_WRAPPER_CHARS] /
+ * [TOOL_CALL_WRAPPER_CHARS]) measured across the three adapters.
+ *
+ * Fail-close invariant: every term is an over-count of the corresponding
+ * serialized bytes (string escaping via [jsonEscapedChars], wrappers with
+ * margin), so if a cap check against [TurnController.MAX_REQUEST_CHARS]
+ * passes, the serialized request's text/tool JSON is ≤ the cap — never the
+ * old raw-`String.length` under-count (`q` escaping alone can triple
+ * quote-dense text). Image carve-out (aligned with MAX_REQUEST_CHARS's
+ * boundary invariant): this stays a TEXT-basis estimate — image payload
+ * bytes ride OUTSIDE the accounting (never counted in `text.length`;
+ * ImageFallbackPolicy governs them separately).
+ *
+ * `internal` visibility is deliberate: same-module unit tests must reach the
+ * exact production formula directly (no reflection pin needed); keep the
+ * per-message arithmetic in sync ONLY through this function.
+ */
+internal fun ChatMessage.wirePayloadChars(): Int =
+  MESSAGE_WRAPPER_CHARS +
+    jsonEscapedChars(text) +
+    (toolCallId?.let { jsonEscapedChars(it) } ?: 0) +
+    toolCalls.sumOf { tc ->
+      TOOL_CALL_WRAPPER_CHARS +
+        jsonEscapedChars(tc.id) +
+        jsonEscapedChars(tc.name) +
+        jsonEscapedChars(tc.argumentsJson)
+    }
+
+/**
+ * Serialized-size estimate of a whole outgoing request: per-message estimates
+ * ([wirePayloadChars]) plus the one-per-request [REQUEST_ENVELOPE_CHARS]
+ * envelope. The envelope is counted exactly once, so trimming per-message
+ * terms (as `buildToolContinuation` does) keeps the total consistent with the
+ * request that ships.
+ */
+internal fun requestWireEstimate(messages: List<ChatMessage>, model: String? = null): Int =
+  messages.sumOf { it.wirePayloadChars() } + REQUEST_ENVELOPE_CHARS + (model?.let { jsonEscapedChars(it) } ?: 0)
 
 /**
  * Pure fallback detector for the warn path: true only when a non-blank

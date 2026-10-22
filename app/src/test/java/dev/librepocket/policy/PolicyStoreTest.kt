@@ -1,5 +1,6 @@
 package dev.librepocket.policy
 
+import dev.librepocket.router.SafeToolSlice
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -49,12 +50,36 @@ class PolicyStoreTest {
 
   @Test fun unknownActionIsDenyFailClosed() {
     val s = InMemoryPolicyStore()
-    val d = s.evaluate("tool.exec", "anything")
+    // `tool.exec` is now a KNOWN slice action (see SafeToolSlice); probe with
+    // a still-unknown action so the closed-set pin keeps its meaning.
+    val d = s.evaluate("tool.delete", "anything")
     assertEquals(Verdict.DENY, d.verdict)
     assertNull(d.matchedRule)
     // Even an explicit rule for an unknown action never authorizes it.
-    val s2 = store(PolicyRule("tool.exec:*", Verdict.ALLOW, 99))
-    assertEquals(Verdict.DENY, s2.evaluate("tool.exec", "x").verdict)
+    val s2 = store(PolicyRule("tool.delete:*", Verdict.ALLOW, 99))
+    assertEquals(Verdict.DENY, s2.evaluate("tool.delete", "x").verdict)
+  }
+
+  @Test fun toolExecIsKnownButDefaultsToAsk() {
+    // Stage2 slice basis: known (explicit rules apply), but the default
+    // ruleset has no slice rule — only `*:*` ASK matches, so the slice
+    // (which requires ALLOW) denies fail-closed until explicitly allowed.
+    val s = InMemoryPolicyStore()
+    val d = s.evaluate(SafeToolSlice.POLICY_ACTION, SafeToolSlice.TOOL_NAME)
+    assertEquals(Verdict.ASK, d.verdict)
+  }
+
+  @Test fun toolExecDefaultAskHoldsOnFreshRecheck() = runBlocking {
+    // Pin the same ASK default on the execution-basis path the slice uses.
+    val s = InMemoryPolicyStore()
+    assertEquals(Verdict.ASK, s.evaluateFresh(SafeToolSlice.POLICY_ACTION, SafeToolSlice.TOOL_NAME).verdict)
+  }
+
+  @Test fun toolExecExplicitAllowAuthorizes() = runBlocking {
+    val s = store(PolicyRule("${SafeToolSlice.POLICY_ACTION}:${SafeToolSlice.TOOL_NAME}", Verdict.ALLOW, 10))
+    assertEquals(Verdict.ALLOW, s.evaluateFresh(SafeToolSlice.POLICY_ACTION, SafeToolSlice.TOOL_NAME).verdict)
+    // Other tools stay denied without their own rule.
+    assertEquals(Verdict.DENY, s.evaluateFresh(SafeToolSlice.POLICY_ACTION, "shell.exec").verdict)
   }
 
   @Test fun noMatchIsDeny() {

@@ -107,15 +107,24 @@ object PrivilegeGate {
     fun isElevatedRequest(args: Map<String, String>): Boolean =
         !args["reasonCode"].isNullOrBlank()
 
-    /** `fullText=true` (or `1`) requests the privileged body path. */
-    fun isFullTextRequest(args: Map<String, String>): Boolean {
-        val v = args["fullText"]?.trim()?.lowercase() ?: return false
-        return v == "true" || v == "1"
-    }
+    /**
+     * `fullText=true` (or `1`) requests the privileged body path. The key
+     * lookup is case-insensitive so a case-varied key (`"fulltext"`) cannot
+     * slip under the consent gate — matching the IGNORE_CASE JSON-args
+     * variant (fail-safe by over-detection); multiple case variants are
+     * OR-ed.
+     */
+    fun isFullTextRequest(args: Map<String, String>): Boolean =
+        args.entries.any { (k, v) ->
+            k.equals("fullText", ignoreCase = true) &&
+                (v.trim().lowercase() == "true" || v.trim().lowercase() == "1")
+        }
+
+    private val FULL_TEXT_RE = Regex(""""fullText"\s*:\s*(true|"true"|1|"1")(?=\s*[,}\]])""", RegexOption.IGNORE_CASE)
 
     /** JSON-args variant for FastRouter `argumentsJson` (tolerates `"true"`/`1`；詞界+結尾錨定避免 `10`/`truex` 誤判）。 */
     fun isFullTextRequestJson(argumentsJson: String): Boolean =
-        Regex(""""fullText"\s*:\s*(true|"true"|1)(?=\s*[,}\]])""").containsMatchIn(argumentsJson)
+        FULL_TEXT_RE.containsMatchIn(argumentsJson)
 
     fun canExecute(tool: ToolDef, confirmed: Boolean, projection: Projection): Boolean =
         check(tool, confirmed, projection) is GateResult.Allowed

@@ -1,5 +1,6 @@
 package dev.librepocket.models
 
+import dev.librepocket.provider.MiniJson
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -217,6 +218,60 @@ class ModelsDevSnapshotTest {
             ModelsDevSnapshot.parse(body, nowMs = 1_700_000_000_000L)
         }
         assertEquals("MODELS_SNAPSHOT_SHAPE", e.message)
+    }
+
+    @Test
+    fun nodeCeilingIsDerivedFromTheByteCeiling() {
+        // The snapshot is byte-bounded (MAX_SNAPSHOT_BYTES checked before
+        // parse). The densest legal JSON document is a flat array `[0,0,…]`:
+        // N nodes need 2N-1 bytes, so a body within the byte ceiling can never
+        // exceed MAX_SNAPSHOT_BYTES/2 nodes. The ceiling must be exactly that
+        // worst case (no legitimate full-size snapshot regresses), and the
+        // 2N-1 bytes-per-N-nodes floor must stay inside the byte ceiling.
+        assertEquals(2 * 1024 * 1024, ModelsDevSnapshot.MODELS_DEV_MAX_NODES)
+        assertTrue(
+            "2N-1 must fit the byte ceiling",
+            2L * ModelsDevSnapshot.MODELS_DEV_MAX_NODES - 1 <=
+                ModelsDevSnapshot.MAX_SNAPSHOT_BYTES.toLong(),
+        )
+    }
+
+    @Test
+    fun nodeCeilingPassthroughAcceptsAboveDefaultButWithinSnapshotCeiling() {
+        // 25,000 legacy entries = 3 + 3*25,000 = 75,003 nodes, above
+        // MiniJson.MAX_NODES (65,536). This only parses when parse() actually
+        // forwards MODELS_DEV_MAX_NODES to MiniJson; a cheap passthrough pin
+        // without building a 4 MiB / 2,097,152-node end-to-end document.
+        val body = buildString {
+            append("""{"models":[""")
+            for (i in 0 until 25_000) {
+                if (i > 0) append(',')
+                append("""{"id":"p/$i"}""")
+            }
+            append("]}")
+        }
+        val snapshot = ModelsDevSnapshot.parse(body, nowMs = 1_700_000_000_000L)
+        assertEquals(25_000, snapshot.models.size)
+        assertEquals("p", snapshot.models.first().providerId)
+        assertEquals("0", snapshot.models.first().wireId)
+        assertEquals("24999", snapshot.models.last().wireId)
+    }
+
+    @Test
+    fun overCeilingDocumentFailsTypedAsSnapshotParse() {
+        // Cheap fatal-path probe: a depth breach maps through the same
+        // MiniJsonException -> SnapshotException("MODELS_SNAPSHOT_PARSE")
+        // branch as a node-count breach (no 4 MiB/2M-node document needed).
+        val levels = MiniJson.MAX_DEPTH + 1
+        val deep = "[".repeat(levels) + "0" + "]".repeat(levels)
+        val e = assertThrows(ModelsDevSnapshot.SnapshotException::class.java) {
+            ModelsDevSnapshot.parse(deep, nowMs = 1_700_000_000_000L)
+        }
+        assertEquals("MODELS_SNAPSHOT_PARSE", e.message)
+        assertTrue(
+            "the fatal parser subtype must be preserved as the cause",
+            e.cause is MiniJson.MiniJsonFatalException,
+        )
     }
 
     @Test

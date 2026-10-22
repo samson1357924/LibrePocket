@@ -21,6 +21,7 @@ package dev.librepocket.skill
  */
 object SkillParser {
     internal val NAME_RE = Regex("^[a-z0-9][a-z0-9._-]{1,63}$")
+    private val TOKEN_RE = Regex("^[A-Za-z0-9._-]+$")
     private const val MAX_FRONTMATTER_CHARS = 8_192
     private const val MAX_BODY_CHARS = 64_000
     private const val MAX_DESCRIPTION_CHARS = 500
@@ -66,7 +67,7 @@ object SkillParser {
 
         val allowedTools = parseStringSet(fields["allowed-tools"] ?: fields["tools"] ?: "")
         for (t in allowedTools) {
-            if (t.isEmpty() || t.length > 128 || !Regex("^[A-Za-z0-9._-]+$").matches(t)) {
+            if (t.isEmpty() || t.length > 128 || !TOKEN_RE.matches(t)) {
                 throw ParseException("frontmatter: illegal tool '$t'")
             }
         }

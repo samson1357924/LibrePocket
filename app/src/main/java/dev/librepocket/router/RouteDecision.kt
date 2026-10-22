@@ -22,10 +22,12 @@ data class ToolCall(
  * - [projectedTools]: projection snapshot (flavor/switch/permission passed,
  *   i.e. `ToolRegistry.projectedTools` names). Audit-only; a projected tool
  *   is NOT necessarily executable this round.
- * - [visibleTools]: the model-visible list (`ToolRegistry.visibleTools`
- *   names: projected AND `executionReady`). This is the ONLY list that may
- *   be sent to the model; empty until the wiring PR lands. Audits prove
- *   "what the model saw" from THIS field, not from [projectedTools].
+ * - [visibleTools]: a registry CAPABILITY snapshot (`ToolRegistry.visibleTools`
+ *   names: projected AND `executionReady`). It is NOT a per-ChatRequest wire
+ *   guarantee: production stays records-only with no slice attached, the
+ *   continuation path carries `allowTools=false`, and when the slice/context
+ *   is unavailable the wire tool list may be empty. Audits must not treat this
+ *   header field as proof of what was actually sent on the wire.
  *
  * [reasonCode] is the [DenyReason] name or null.
  */
@@ -78,4 +80,13 @@ object FallbackMessages {
             userStep = "手動操作或補充細節",
         )
     }
+
+    /**
+     * Stage1 補參/澄清話術（P2 safe slice）：猜測執行一律轉澄清，不猜時間、
+     * 不猜號碼、不送空欄位模板。仍引用 [DenyReason.NEED_CLARIFICATION]
+     * 原文以供審計與話術斷言，並攜帶工具名以便轉錄追蹤。
+     */
+    fun forClarification(toolName: String, question: String, fallbackHint: String): String =
+        "需要補充${toolName}的資訊（${DenyReason.NEED_CLARIFICATION.name}）" +
+            "→ ${question} → 需要你做：補充後重試（可替代：${fallbackHint}）"
 }

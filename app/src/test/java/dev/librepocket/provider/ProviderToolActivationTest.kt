@@ -17,7 +17,10 @@ import org.junit.Test
  *
  * Production still sends no tools (`TurnController.buildRequest` stays
  * pure-chat per TurnController.kt人工核實，本測試未直接覆蓋該 private 方法；
- * `ToolRegistry.visibleTools` is empty for all tools); these
+ * production attaches no tool slice (`toolSlice=null`)); under the P2 safe
+ * slice (#19/#96) `ToolRegistry.visibleTools` is empty for EVERY tool except
+ * `lsp.symbols` — the single `executionReady` tool, visible only when the
+ * `lsp` switch is on; these
  * tests only validate explicit scaffold histories via `buildBody`.
  *
  * `strictObj` 僅為嚴格 JSON 解析（合法輸出可 parse），不代表 schema／pairing
@@ -674,10 +677,17 @@ class ProviderToolActivationTest {
         )
         // 真空防護：先證 context 真 permissive（投影非空），再證可見為空（雙閘）。
         assertTrue(ToolRegistry.projectedTools(permissive).isNotEmpty())
-        assertTrue(ToolRegistry.visibleTools(permissive).isEmpty())
-        assertTrue(ToolRegistry.ALL.all { !it.executionReady })
-        // PLAY 對照：flavor-gated 工具在 PLAY 下同樣隱藏（wiring 前全空）。
+        // P2 safe slice (#19): with lsp switch on, exactly one tool (lsp.symbols, READ-only) is visible/executionReady
+        assertEquals(listOf("lsp.symbols"), ToolRegistry.visibleTools(permissive).map { it.name })
+        assertEquals(1, ToolRegistry.ALL.count { it.executionReady })
+        assertTrue(ToolRegistry.find("lsp.symbols")!!.executionReady)
+        assertTrue(ToolRegistry.ALL.filter { it.name != "lsp.symbols" }.all { !it.executionReady })
+        // PLAY 對照：slice 工具本身跨風味（SafeToolSliceTest.offeredToolsSingleAcrossFlavors
+        // 已釘住 PLAY/FOSS/GITHUB 三風味皆提供），故 PLAY 下開關開啟時同樣恰為 [lsp.symbols]；
+        // 預設關閉時為空；生產端沒有工具曝光，是因為 production composition 以 toolSlice=null 建 session。
         val playPermissive = permissive.copy(flavor = Flavor.PLAY)
-        assertTrue(ToolRegistry.visibleTools(playPermissive).isEmpty())
+        assertEquals(listOf("lsp.symbols"), ToolRegistry.visibleTools(playPermissive).map { it.name })
+        val playDefault = permissive.copy(flavor = Flavor.PLAY, userSwitches = emptyMap())
+        assertTrue(ToolRegistry.visibleTools(playDefault).isEmpty())
     }
 }

@@ -155,6 +155,15 @@ object ProotExec {
                     ShellDeny.BLACKLISTED,
                     "linux.exec privilege denied；$FALLBACK_HINT；${LinuxTools.PERF_NOTICE}",
                 )
+            // Exhaustiveness branch: the linux gate never produces
+            // NEED_CLARIFICATION today (only FastRouter uses it for missing
+            // args); if a future helper ever returns it, fail closed to
+            // BLACKLISTED here — never surface it as a clarification.
+            DenyReason.NEED_CLARIFICATION ->
+                return ShellResult.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "linux.exec veto: unexpected clarify state, fail-closed；$FALLBACK_HINT；${LinuxTools.PERF_NOTICE}",
+                )
             null -> Unit
         }
         if (LinuxEnv.containerVeto(filesDir, container) != null) {

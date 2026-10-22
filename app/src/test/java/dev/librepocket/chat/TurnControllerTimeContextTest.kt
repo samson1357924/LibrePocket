@@ -242,12 +242,20 @@ class TurnControllerTimeContextTest {
   }
 
   @Test fun buildRequestWithNoUserMessageInjectsNothingAndDoesNotCrash() {
-    val method = TurnController::class.java.getDeclaredMethod("buildRequest", List::class.java)
+    // Kotlin default args compile to a single JVM method (List, boolean); there
+    // is no 1-arg overload, so reflect the real signature and pass the pre-round
+    // default (allowTools=true) explicitly.
+    val method = TurnController::class.java.getDeclaredMethod(
+      "buildRequest",
+      List::class.java,
+      Boolean::class.javaPrimitiveType,
+    )
     method.isAccessible = true
 
     // No history, image loader empty: nothing to attach to, request stays empty.
     val emptyImages = controller(TimeFakeProvider(), imageLoader = { emptyList() })
-    val emptyReq = method.invoke(emptyImages, emptyList<ChatImageRef>()) as ChatRequest
+    val emptyReq =
+      method.invoke(emptyImages, emptyList<ChatImageRef>(), true) as ChatRequest
     assertTrue(emptyReq.messages.none { it.text.contains("Runtime time context") })
 
     // No history but an image arrives: the pre-existing image fallback owns the
@@ -258,7 +266,8 @@ class TurnControllerTimeContextTest {
         refs.map { ChatImage(bytes = byteArrayOf(9), mimeType = it.mimeType) }
       },
     )
-    val imageReq = method.invoke(withImage, listOf(ChatImageRef("p", "image/png"))) as ChatRequest
+    val imageReq =
+      method.invoke(withImage, listOf(ChatImageRef("p", "image/png")), true) as ChatRequest
     assertEquals(1, imageReq.messages.count { it.role == "user" })
   }
 

@@ -86,10 +86,12 @@ internal fun chatToolCallJson(tc: ToolCall): String = buildJsonObject {
 /**
  * Phase 2: role / call-id pairing + round-trip semantics.
  *
- * Production still sends no tools ([dev.librepocket.chat.TurnController]
- * stays pure-chat); these helpers only validate explicit test/scaffold
- * histories. Any illegal pairing throws [ProviderFailure] (fail-closed,
- * retryable=false) so no request is sent.
+ * Production tool traffic is the P2 slice (PR #96): the offer is the single
+ * registered slice tool when the tool loop is attached, and this layer
+ * fail-closes on any pairing violation in the emitted continuation round.
+ * These helpers also validate explicit test/scaffold histories. Any illegal
+ * pairing throws [ProviderFailure] (fail-closed, retryable=false) so no
+ * request is sent.
  *
  * Non-thinking only: reasoning-bearing histories fail closed via
  * [requireNoReasoningHistory] (see below) before any pairing check.
@@ -98,10 +100,11 @@ internal fun chatToolCallJson(tc: ToolCall): String = buildJsonObject {
 /**
  * Phase 2 (P1 follow-up): single-chronological-pass exactly-once tool pairing.
  *
- * Production still sends no tools ([dev.librepocket.chat.TurnController]
- * stays pure-chat); this only validates explicit test/scaffold histories.
- * Any illegal pairing throws [ProviderFailure] (fail-closed,
- * retryable=false) so no request is sent.
+ * Production rides this validator for the P2 slice round (PR #96: the offer
+ * is the single registered slice tool when the tool loop is attached);
+ * explicit test/scaffold histories validate the same way. Any illegal
+ * pairing throws [ProviderFailure] (fail-closed, retryable=false) so no
+ * request is sent.
  *
  * State machine over one chronological scan:
  * - `seen`: every declared call id (rejects TOOL_CALL_DUPLICATE_ID).
@@ -189,7 +192,10 @@ internal fun validateToolPairing(messages: List<ChatMessage>, allowChatBackfill:
  *
  * Scoped (Stage 1 ordinary-chat regression fix): plain-text follow-ups
  * must not fail. Production [dev.librepocket.chat.TurnController.buildRequest]
- * always sends `tools == []`, `serverTools == []`, `thinking == null`, and
+ * sends `tools == []` whenever the tool loop is absent; with the P2 slice
+ * attached (PR #96) the offer is exactly the registered slice tool, and
+ * continuation rounds carry their structural tool content only through
+ * the slice's own envelope. `serverTools == []`, `thinking == null`, and
  * `UiMessage` has no `toolCalls` field (`ToolDone` only merges a text
  * marker), so a pure-chat history never carries structural tool content.
  * The `hasReasoning` refusal therefore applies only when the turn is

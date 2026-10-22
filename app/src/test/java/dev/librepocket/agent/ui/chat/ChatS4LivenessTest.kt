@@ -232,6 +232,14 @@ class ChatS4LivenessTest {
         return out
     }
 
+    private fun isSessionMutexLocked(vm: ChatViewModel): Boolean {
+        val f = ChatViewModel::class.java.getDeclaredField("sessionMutex")
+        f.isAccessible = true
+        var locked = false
+        runBlocking { chatMain.run { locked = (f.get(vm) as kotlinx.coroutines.sync.Mutex).isLocked } }
+        return locked
+    }
+
     /**
      * F1: fence==null + idle unsealed session (no completion proof) unexpired
      * must stay live. Block expired + ledger dangling + stored dead would
@@ -273,8 +281,8 @@ class ChatS4LivenessTest {
         // Expiry reopen (same-ID, prevLive=idle with hang gate). Settle hangs on
         // T2 join (T2 suspends on flush gate) holding mutex, before tryPromote.
         onMain { vm.openSession(oldId) }
-        // Wait until T2 entered flush gate (settle hanging, mutex held).
-        awaitTrue(timeoutMs = 15000) { idleSession.flushCalls.get() >= 1 }
+        // Wait until T2 entered flush gate and openSession holds mutex (settle hanging, takeOutstanding has completed).
+        awaitTrue(timeoutMs = 15000) { idleSession.flushCalls.get() >= 1 && isSessionMutexLocked(vm) }
         // Inject UNEXPIRED fence-null outstanding while hanging (after take,
         // before tryPromote). Idle unsealed, no streaming – old peek false, new true.
         val injectedIdle = S4IdleSession()
@@ -331,7 +339,7 @@ class ChatS4LivenessTest {
         // First same-ID reopen (slow: detaches prevLive, T2 hangs on flush gate
         // holding mutex via join, before tryPromote/open).
         onMain { vm.openSession(oldId) }
-        awaitTrue(timeoutMs = 15000) { prevLive.flushCalls.get() >= 1 }
+        awaitTrue(timeoutMs = 15000) { prevLive.flushCalls.get() >= 1 && isSessionMutexLocked(vm) }
         // Second double-tap while first hangs on settle (mutex held).
         onMain { vm.openSession(oldId) }
         // Ownership must not be stolen synchronously: first park still holds

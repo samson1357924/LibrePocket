@@ -416,17 +416,24 @@ class JevClient(
                                 currentCoroutineContext().ensureActive()
                                 throw e
                             } catch (e: IOException) {
+                                if (call.isCanceled()) {
+                                    currentCoroutineContext().ensureActive()
+                                    throw CancellationException("call was cancelled", e)
+                                }
                                 currentCoroutineContext().ensureActive()
                                 null
                             }
                             code to text
                         }
                     }
+                } catch (e: JevFailure) {
+                    currentCoroutineContext().ensureActive()
+                    throw e
                 } catch (e: IOException) {
-                    // call.cancel() 中斷 execute()/read() 會拋 IOException；若起因是
-                    // withTimeout 超時，內層 Job 已取消，ensureActive 轉為拋
-                    // TimeoutCancellationException（外層映射為 TIMEOUT/null）。
-                    // 唯有內層 Job 視角能看到超時，外層 ensureActive 看不到。
+                    if (call.isCanceled()) {
+                        currentCoroutineContext().ensureActive()
+                        throw CancellationException("call was cancelled", e)
+                    }
                     currentCoroutineContext().ensureActive()
                     throw e
                 } finally {

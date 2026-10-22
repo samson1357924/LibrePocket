@@ -96,4 +96,30 @@ class PrivilegeGateTest {
         assertFalse(PrivilegeGate.isFullTextRequestJson("{\"fullText\": 11}"))
         assertFalse(PrivilegeGate.isFullTextRequestJson("{\"limit\": 10}"))
     }
+
+    @Test fun fullTextMapVariantDetectsCaseVariedKeys() {
+        // Fail-safe over-detection: a case-varied key must not slip under the
+        // consent gate (matches the IGNORE_CASE JSON-args variant).
+        assertTrue(PrivilegeGate.isFullTextRequest(mapOf("fulltext" to "true")))
+        assertTrue(PrivilegeGate.isFullTextRequest(mapOf("FULLTEXT" to "1")))
+        assertTrue(PrivilegeGate.isFullTextRequest(mapOf("FullText" to " true ")))
+        assertFalse(PrivilegeGate.isFullTextRequest(mapOf("fulltext" to "false")))
+        assertFalse(PrivilegeGate.isFullTextRequest(mapOf("fullText" to "0")))
+        // Disagreement among case variants resolves to the fail-safe side.
+        assertTrue(PrivilegeGate.isFullTextRequest(mapOf("fullText" to "false", "fulltext" to "true")))
+    }
+
+    @Test fun fullTextJsonVariantDetectsCaseVariedKeysAndValues() {
+        // Phase-0 pin (D): the JSON-args twin of the map-variant pins above —
+        // the consent gate's regex is IGNORE_CASE on BOTH the key and the
+        // value, so a lowercase `"fulltext"` key and a capitalized `"True"` /
+        // `"1"` string value still trip the gate (fail-safe over-detection),
+        // while non-affirming values stay out.
+        assertTrue(PrivilegeGate.isFullTextRequestJson("""{"fulltext": true}"""))
+        assertTrue(PrivilegeGate.isFullTextRequestJson("""{"fulltext": "True"}"""))
+        assertTrue(PrivilegeGate.isFullTextRequestJson("""{"FULLTEXT": "1"}"""))
+        assertFalse(PrivilegeGate.isFullTextRequestJson("""{"fulltext": "False"}"""))
+        assertFalse(PrivilegeGate.isFullTextRequestJson("""{"fulltext": "truex"}"""))
+        assertFalse(PrivilegeGate.isFullTextRequestJson("""{"otherFulltext": "true"}"""))
+    }
 }

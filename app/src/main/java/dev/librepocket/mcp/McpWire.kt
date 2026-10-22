@@ -1,5 +1,6 @@
 package dev.librepocket.mcp
 
+import java.util.Locale
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /**
@@ -11,7 +12,8 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  *     {"name":"..","description":"..","inputSchema":{...}}, ... ]}}`
  * - tools/call 請求：`{"jsonrpc":"2.0","id":<n>,"method":"tools/call",
  *     "params":{"name":"..","arguments":{... raw json ...}}}`
- *   `argumentsJson` 呼叫方可預檢，本函仍自驗證 fail-closed（非 object 即拋，不發送）。
+ *   `argumentsJson` 呼叫方可預檢，本函仍自驗證 fail-closed（非 object 即拋，不發送）；
+ *   [callBody] 建構期以 [parseStrictDoc] fail-closed 釘住該約定（上層已過 Schema 校驗）。
  * - tools/call 回應：`{"jsonrpc":"2.0","id":<n>,"result":{
  *     "content":[...],"isError":false}}`；或 `{"error":{"code":..,"message":".."}}`
  *   （`code` 必備整數、`message` 必備字串——JSON-RPC 2.0 §5.1，缺/型別錯一律拒）。
@@ -33,11 +35,13 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  * （`McpEnvelopeTest.expectedIdHasNoImplicitDefaultOnAnyParserEntryPoint` 釘面）。
  *
  * 修訂立場（#11 Stage2 本 PR 選型，非 Accepted ADR；單一傳輸子集起步）：
- * `2025-11-25` 與 `2026-07-28`（#11 提及的候選修訂號，repo 內無文本）
- * 皆為候選未採納（repo 內無規格文本、無外網可核對，不寫差異表）；本物件只保證
- * `tools/list`＋`tools/call` 單頁 POST 子集，不送 `initialize`、不接 SSE stream、
- * 不跟隨 `nextCursor` 分頁、不協商 `protocolVersion`。契約見
- * `McpProtocolContractsTest`；修訂支援須先納規格文本再逐項補契約。
+ * 依 #11 的 2026-10-07 review 引註，`2026-07-28` 是現行 revision（per-request metadata
+ * 模式）、`2025-11-25` 是前一版（需 `initialize`／`initialized` 與條件式 session header）；
+ * 兩者皆為 #11 提及的候選修訂號（repo 內無規格文本、無外網可核對，不寫差異表），
+ * 故皆未採納——本物件不對任一 revision 宣稱相容：只保證 `tools/list`＋`tools/call`
+ * 單頁 POST 子集，不送 `initialize`、不接 SSE stream、不跟隨 `nextCursor` 分頁、
+ * 不協商 `protocolVersion`。契約見 `McpProtocolContractsTest`（由 #93 引入並已合併進 main）；
+ * 修訂支援須先納規格文本再逐項補契約。
  */
 internal object McpWire {
 
@@ -467,6 +471,69 @@ internal object McpWire {
         )
     }
 
+    /**
+     * 驗證 baseUrl 可形成有效的 http(s) endpoint（供 [McpServer] 在 vault read /
+     * HTTP / breaker failure 之前 fail-closed 使用）。
+     *
+     * blank 或 malformed 一律 false：呼叫端據此回 UNAUTHORIZED（零 vault / 零 HTTP /
+     * 零熔斷計數），不得讓壞地址落到傳輸層——否則 transport 會拋
+     * IllegalArgumentException，被外層 catch 映射成 TRANSPORT 並計一次熔斷失敗
+     * （配置錯誤會污染熔斷器）。
+     *
+     * 判定分四層（皆對「使用者寫的原始地址」判定，不是對 [endpoint] 的改寫結果）：
+     * 1. `scheme://` 必須存在且為 http/https：無 scheme（`not-a-url`）、單斜線
+     *    （`https:/host`）、非 http(s)（`ftp://host`）一律拒絕——OkHttp 的 parser
+     *    對單斜線很寬鬆，會把 `https:/host` 讀成 host `host`；
+     * 2. authority（`://` 與第一個 `/`、`?`、`#` 之間）不得為空、不得含空白：
+     *    `http://` 根本沒有 host；
+     * 3. OkHttp `toHttpUrlOrNull` 形狀檢查（IDN/punycode、host 字元、埠號範圍）；
+     * 4. 真正上線的 [endpoint] 結果也必須可解析。
+     *
+     * 空白規則（刻意比 OkHttp 嚴，fail-closed）：authority 內任何位置出現空白
+     * 一律拒絕——包含 userinfo（`https://user:pa ss@host/mcp`）。OkHttp 會把
+     * 空白 percent-encode 成 `%20` 後照樣解析成功（於是 userinfo 裡的空白會
+     * 靜默變成合法 token）；本檢查寧可誤拒也不放行（misconfiguration 早失敗，
+     * 好過帶著一個被改寫過的憑證上線）。
+     *
+     * 刻意拒絕的「搶救家族」（salvage family）：`http://`、`https://`（無 host）、
+     * 單斜線 `https:/host`、`https:///mcp` 這類 OkHttp 寬容解析器「猜得回」
+     * 的形狀一律拒絕——它們多半是設定打錯（少一個斜線、多一個斜線、漏了 host），
+     * 讓 OkHttp 猜一個 host 只會把設定錯誤變成對錯主機的請求。
+     *
+     * 方向性（differential）：`isValidBaseUrl` 絕不可放行一個
+     * `endpoint().toHttpUrlOrNull()` 會拒絕的地址（放行 = 壞地址掉到傳輸層
+     * → TRANSPORT + 計熔斷）；反之，`endpoint()` 補出的 `/mcp` 形式能被
+     * OkHttp 解析是必要不充分條件（`http://` 補完成 `http:/mcp` 仍會被當成
+     * host `mcp`——所以必須對「原始地址」判定）。
+     *
+     * 為何不只看 [endpoint]：endpoint() 對 bare origin 補 `/mcp`，而
+     * `trimEnd('/')` 會把 `http://` 削成 `http:`，補完即成 `http:/mcp`——
+     * OkHttp 會把它讀成 host `mcp`（合法 URL！），於是「沒有 host 的地址」被
+     * 驗成有效，壞設定反而通過了 pre-flight。原始地址沒有這條補救路徑。
+     *
+     * 與 [requireSecureEndpoint] 的分工（兩者並存、不取代）：本函只答「形狀是否
+     * 成立」（設定問題 → UNAUTHORIZED、零熔斷）；[requireSecureEndpoint] 答
+     * 「傳輸是否允許」（明文非回環 → PROTOCOL）。後者更嚴（另拒 userinfo／backslash／
+     * 單標籤 authority），於是形狀合法但傳輸不允許的地址仍由它擋下。
+     */
+    internal fun isValidBaseUrl(baseUrl: String): Boolean {
+        val trimmed = baseUrl.trim()
+        if (trimmed.isEmpty()) return false
+        val schemeEnd = trimmed.indexOf("://")
+        if (schemeEnd <= 0) return false
+        val scheme = trimmed.substring(0, schemeEnd).lowercase(Locale.US)
+        if (scheme != "http" && scheme != "https") return false
+        val authority = trimmed.substring(schemeEnd + 3)
+        val hostEnd = authority.indexOfFirst { it == '/' || it == '?' || it == '#' }
+        val hostPart = if (hostEnd < 0) authority else authority.substring(0, hostEnd)
+        if (hostPart.isEmpty() || hostPart.any { it.isWhitespace() }) return false
+        val url = trimmed.toHttpUrlOrNull() ?: return false
+        if (url.host.isEmpty()) return false
+        if (url.scheme != "http" && url.scheme != "https") return false
+        endpoint(trimmed).toHttpUrlOrNull() ?: return false
+        return true
+    }
+
     /** endpoint() 是否會自動補 `/mcp`（bare-origin 判斷；供傳輸層 warning 用）。 */
     internal fun isBareOrigin(baseUrl: String): Boolean {
         val mainTrimmed = splitMainAndSuffix(baseUrl).main.trimEnd('/')
@@ -580,7 +647,8 @@ internal object McpWire {
      *   不再一致，工具識別錯位，故發送前 fail-closed）；
      *   （名形狀驗證順序：空白 → 超限 → C0/DEL → 孤立 surrogate，與下方程式一致）；
      * - `argumentsJson` 必須是合法 JSON object 文本（空字串視為 `{}`），
-     *   非 object（`null`／陣列／畸形）即拋，不發送；
+     *   非 object（`null`／陣列／畸形）即拋 [McpProtocol]（`mcp: bad envelope`），
+     *   由 [McpServer.callTool] 映射為 PROTOCOL，在 vault 讀取、HTTP 傳輸與 breaker 前 fail-closed；
      *   字元數超 [ARGUMENTS_MAX_CHARS] 即拋（訊息明指 arguments，非 response）；
      * - `toolName` 經 [esc] 轉義：C0/DEL 已先在此拒（其 [esc] C0 分支屬防禦深度，
      *   見該函 KDoc），實際會走到的只剩引號／反斜線等 JSON 必要編碼。
@@ -604,12 +672,17 @@ internal object McpWire {
         }
         // fail-closed：arguments 必須是合法 JSON object 文本（上層不再另行保證，
         // 此處直接驗證；非法即拋，呼叫方在發送前擋下，不送畸形 JSON-RPC）。
+        // P2 slice 硬化：惡形／非 object 的 arguments 與其他惡形包**同型**
+        // （[McpProtocol] `mcp: bad envelope`）——[McpProtocol] 是
+        // [IllegalArgumentException] 子類，既有的 `catch (IllegalArgumentException)`
+        // 契約不變，而 [McpServer.callTool] 據此映射為 PROTOCOL（零 vault、
+        // 零發送、零熔斷——client-arg 錯不得被誤標成傳輸失敗）。
         val parsed = try {
             parseStrictDoc(args)
-        } catch (e: McpProtocol) {
-            throw IllegalArgumentException("mcp: bad arguments: ${e.message}")
+        } catch (_: McpProtocol) {
+            throw McpProtocol("mcp: bad envelope")
         }
-        if (parsed !is JObj) throw IllegalArgumentException("mcp: bad arguments")
+        if (parsed !is JObj) throw McpProtocol("mcp: bad envelope")
         return """{"jsonrpc":"2.0","id":$id,"method":"tools/call"""" +
             ""","params":{"name":"${esc(toolName)}","arguments":$args}}"""
     }
@@ -1169,6 +1242,10 @@ internal object McpWire {
      * 出站 JSON 字串編碼（引號／反斜線／C0 短形式與 `\\u00XX`；DEL 原樣——
      * 它不是 JSON 控制字元）。
      *
+     * 孤立 surrogate 亦轉義（P2 slice 硬化）：`\uD800` 等無伴的 high/low
+     * 以 `\\uXXXX`（小寫 4-hex）輸出——UTF-8 encode 會把它換成 `?` (0x3F)，
+     * 讓上線值與解析值不一致；**成對** surrogate 原樣輸出（不切開、不重組）。
+     *
      * 注意（Stage3 A-01）：[callBody] 對 **toolName** 已先拒 C0/DEL（識別欄位
      * 不編碼、一律拒），本函的 C0 分支對 toolName 路徑是**防禦深度**
      *（單元測試直呼覆蓋）；`argumentsJson` 是遠端資料通道，控制字元屬合法
@@ -1177,21 +1254,36 @@ internal object McpWire {
      */
     internal fun esc(raw: String): String {
         val sb = StringBuilder(raw.length)
-        for (c in raw) {
-            when (c) {
-                '"' -> sb.append("\\\"")
-                '\\' -> sb.append("\\\\")
-                '\b' -> sb.append("\\b")
-                '\u000C' -> sb.append("\\f")
-                '\n' -> sb.append("\\n")
-                '\r' -> sb.append("\\r")
-                '\t' -> sb.append("\\t")
-                else -> if (c.code < 0x20) {
-                    sb.append("\\u%04x".format(c.code))
-                } else {
-                    sb.append(c)
+        var i = 0
+        while (i < raw.length) {
+            val c = raw[i]
+            when {
+                c == '"' -> sb.append("\\\"")
+                c == '\\' -> sb.append("\\\\")
+                c == '\b' -> sb.append("\\b")
+                c == '\u000C' -> sb.append("\\f")
+                c == '\n' -> sb.append("\\n")
+                c == '\r' -> sb.append("\\r")
+                c == '\t' -> sb.append("\\t")
+                c.code < 0x20 -> sb.append("\\u%04x".format(c.code))
+                // Lone surrogate（無伴的 high/low）：OkHttp/okio 在 UTF-8 encode
+                // 時把孤立 surrogate 靜默換成 `?` (0x3F)（**不是** U+FFFD），
+                // 故上線值會與解析值不同——以確定性 \uXXXX 轉義（與 C0 分支
+                // 同小寫 4-hex 約定）。**成對** surrogate 原樣通過（兩個原始
+                // UTF-16 單元成對輸出，不重組 code point、不切開）。
+                c.isSurrogate() -> {
+                    val paired = c.isHighSurrogate() &&
+                        i + 1 < raw.length && raw[i + 1].isLowSurrogate()
+                    if (paired) {
+                        sb.append(c).append(raw[i + 1])
+                        i++
+                    } else {
+                        sb.append("\\u%04x".format(c.code))
+                    }
                 }
+                else -> sb.append(c)
             }
+            i++
         }
         return sb.toString()
     }

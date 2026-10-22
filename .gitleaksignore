@@ -1,5 +1,19 @@
 # False positive: synthetic fixture in saveRejectsMalformedRef, deliberately
 # key-looking to prove save() rejects pasted key material in the ref field.
-# Worktree copy already switched to an allowlisted fixture (b0effb9); this
-# entry silences the pre-fix commit (8a5bedf) under full-history scans.
+# The head copy uses an allowlisted fixture; this entry keeps the commit
+# fingerprinted below clean under full-history scans.
 8a5bedfcddd7e8e83c3a8554444f80dd51d9cf06:app/src/test/java/dev/librepocket/agent/ui/setup/EndpointStoreTest.kt:generic-api-key:136
+
+# False positive: synthetic fixture in throwingBackendWithSecretMessage
+# DoesNotLeak — a throwing backend whose message carries an sk-live-shaped
+# dummy credential. The exec failure answers a fixed typed receipt, so the
+# message never reaches the wire; the head copy was reworded. This entry keeps
+# the commit fingerprinted below clean for range scans on this branch.
+0cdbefc640df0ebc62fd091e89f67e0215e61a84:app/src/test/java/dev/librepocket/router/SafeToolSliceTest.kt:generic-api-key:303
+
+# False positive: synthetic URL-token coverage fixture in
+# continuationArgsEchoStaysWireValidWithSecretPatternsInside (the Redactor's
+# URL_TOKEN_PARAM rule keys on the `token=` param, not value randomness).
+# The head copy uses a low-entropy dummy; this entry keeps the commit
+# fingerprinted below clean for range scans on this branch.
+f16c2e9d4e7530b11228dcfa68e1510f9bc1686a:app/src/test/java/dev/librepocket/router/SafeToolSliceTest.kt:generic-api-key:608

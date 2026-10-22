@@ -2,6 +2,7 @@ package dev.librepocket.agent.ui.setup
 
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import dev.librepocket.agent.ui.chat.VaultSource
+import dev.librepocket.agent.ui.chat.cancelAndJoinChatTestScopes
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
 import dev.librepocket.policy.Verdict
@@ -55,8 +56,10 @@ class SetupLogoutInFlightTest {
 
     @After
     fun tearDown() {
+        // Same #96 Main-leak ordering as SetupCrossVmJournalTest: cancel and
+        // JOIN DataStore collectors while Main is still installed, then reset.
+        cancelAndJoinChatTestScopes(scopes)
         Dispatchers.resetMain()
-        scopes.forEach { it.cancel() }
         tmpDirs.forEach { it.deleteRecursively() }
     }
 
@@ -130,20 +133,29 @@ class SetupLogoutInFlightTest {
             delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
             store.save(inFlightPreseed())
         }
+        // Gate the success path before asserting the in-flight flag: without a
+        // gate the IO delete/clear can complete before the next assertion and
+        // reset the flag, making the assertion order-dependent (observed once
+        // in a combined run). The adjacent tests use the same gate.
+        val gating = DeleteGatingLogoutVault(delegate)
         val vm = SetupViewModel(
             store = store,
-            vaultSource = VaultSource { CountingVault(delegate) },
+            vaultSource = VaultSource { gating },
             policy = MutablePolicy(Verdict.ALLOW),
             buildProvider = noProvider,
         )
         val done = CompletableDeferred<Boolean>()
         vm.logout { done.complete(it) }
         assertTrue(vm.form.value.logoutInFlight)
+        runBlocking { withTimeout(10_000) { gating.deleteEntered.await() } }
+        assertTrue("inFlight must stay true while the lock body runs", vm.form.value.logoutInFlight)
+        gating.deleteRelease.complete(Unit)
         val ok = runBlocking { withTimeout(10_000) { done.await() } }
         assertTrue(ok)
         assertNull(vm.form.value.errorCode)
         assertFalse(vm.form.value.logoutInFlight)
         assertEquals("", vm.form.value.apiKey)
+        assertEquals(1, gating.deleteKeys)
     }
 
     @Test

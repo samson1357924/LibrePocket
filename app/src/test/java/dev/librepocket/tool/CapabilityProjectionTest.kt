@@ -24,7 +24,7 @@ class CapabilityProjectionTest {
         grantedPermissions = setOf("android.permission.READ_CALENDAR", "listener:notification"),
     )
 
-    @Test fun fastToolsCountIsEighteen() {
+    @Test fun fastToolsCountIsNineteen() {
         // P2 11 + S1-C 7（shell.exec + calendar.query/update/delete + contact.search/list/get）
         // + S3 1（shell.elevated，自裝風味提權橋）。
         assertEquals(19, ToolRegistry.FAST_TOOLS.size)
@@ -177,6 +177,10 @@ class CapabilityProjectionTest {
         // executionReady=false 的工具即使投影通過（開關全開），也不得進
         // visibleTools（唯一可送模型的名單）；投影（projectedTools）保持完整，
         // 供 gates/headers/audit 使用。接線 PR 逐工具翻 true 時同步更新本測試。
+        //
+        // P2 slice (#19)：`lsp.symbols` 是唯一完成接線的工具（見 SafeToolSlice），
+        // 故開關全開下 model 名單恰為 [lsp.symbols]；其餘（含 8 個 SCAFFOLD）
+        // 仍不得洩漏。
         val permissiveGithub = ProjectionContext(
             flavor = Flavor.GITHUB,
             automationEnabled = true,
@@ -228,8 +232,12 @@ class CapabilityProjectionTest {
         // 投影本身不受 executionReady 影響（gates/headers/audit 照常用）。
         val projected = ToolRegistry.projectedTools(permissiveGithub).map { it.name }.toSet()
         assertTrue("projection lost scaffold: ${scaffoldNames - projected}", projected.containsAll(scaffoldNames))
-        // 本 PR 無任何工具完成接線：開關全開下 model 名單為空（與
-        // TurnController.buildRequest 不帶 tools 一致；接線 PR 翻 flag 時更新）。
-        assertTrue("expected empty model list in scaffold phase, got $model", model.isEmpty())
+        // P2 slice：開關全開下 model 名單恰為 [lsp.symbols]（與接了 loop 的
+        // TurnController.buildRequest 一致；無 loop 時請求仍是純聊天）。
+        assertEquals(setOf("lsp.symbols"), model)
+        // 41/1/40：總數不變，恰一 ready，其餘全 false。
+        assertEquals(41, ToolRegistry.ALL.size)
+        assertEquals(1, ToolRegistry.ALL.count { it.executionReady })
+        assertTrue(ToolRegistry.find("lsp.symbols")!!.executionReady)
     }
 }

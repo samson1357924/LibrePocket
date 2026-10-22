@@ -2,8 +2,10 @@ package dev.librepocket.agent.ui.setup
 
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.edit
+import androidx.lifecycle.viewModelScope
 import dev.librepocket.agent.ui.Routes
 import dev.librepocket.agent.ui.chat.VaultSource
+import dev.librepocket.agent.ui.chat.cancelAndJoinChatTestScopes
 import dev.librepocket.agent.ui.effectiveLogoutGuardError
 import dev.librepocket.agent.ui.shouldNavigateToSettings
 import dev.librepocket.agent.ui.shouldNavigateToSetup
@@ -19,7 +21,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -58,6 +59,7 @@ class SetupCrossVmJournalTest {
 
     private val tmpDirs = ArrayList<java.io.File>()
     private val scopes = ArrayList<CoroutineScope>()
+    private val viewModels = ArrayList<SetupViewModel>()
 
     @Before
     fun setUp() {
@@ -66,10 +68,13 @@ class SetupCrossVmJournalTest {
 
     @After
     fun tearDown() {
-        // D2: cancel DataStore scopes BEFORE resetMain — pendingTeardown/gate
-        // collect store flows via viewModelScope(Main); cancelling after reset
-        // would dispatch via a reset Main and fail teardown (not the test).
-        scopes.forEach { it.cancel() }
+        // Root cause of the #96 "Dispatchers.Main is used concurrently with
+        // setting it" flake: SetupViewModel owns stateIn(WhileSubscribed(5s))
+        // collectors in viewModelScope(Main). Cancelling only the DataStore
+        // scopes left those Main users alive into the next test, so setMain/
+        // resetMain could hit the NonConcurrent guard. Cancel AND JOIN the VM
+        // scopes (plus DataStore scopes) while Main is still installed.
+        cancelAndJoinChatTestScopes(viewModels.map { it.viewModelScope } + scopes)
         Dispatchers.resetMain()
         tmpDirs.forEach { it.deleteRecursively() }
     }
@@ -105,7 +110,7 @@ class SetupCrossVmJournalTest {
             vaultSource = VaultSource { vault },
             policy = MutablePolicy(Verdict.ALLOW),
             buildProvider = noProvider,
-        )
+        ).also { viewModels.add(it) }
 
     private fun awaitSaveSettled(vm: SetupViewModel, timeoutMs: Long = 8000) {
         val end = System.currentTimeMillis() + timeoutMs

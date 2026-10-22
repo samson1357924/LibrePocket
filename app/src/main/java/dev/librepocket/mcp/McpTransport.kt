@@ -31,9 +31,11 @@ import okio.BufferedSink
  *
  * 最小子集警示（#11 Stage2 本 PR 選型，非 Accepted ADR）：本層只發 `tools/list`／`tools/call` 單次 POST；
  * 不送 `initialize` 交握、不接 SSE event-stream、不跟隨 `nextCursor` 分頁、
- * 不協商 `protocolVersion`（`2025-11-25`／`2026-07-28` 為 #11 提及的候選修訂號，
- * repo 內無文本，皆為候選未採納）。
- * SSE 文本餵給 [McpWire] 一律 `mcp: bad envelope`（見 `McpProtocolContractsTest`）。
+ * 不協商 `protocolVersion`（現行 `2026-07-28`／前一版 `2025-11-25` 皆未採納；
+ * `2025-11-25`／`2026-07-28` 為 #11 提及的候選修訂號，repo 內無文本，皆為候選未採納；
+ * 見 [McpWire] 修訂立場）。
+ * SSE 文本餵給 [McpWire] 一律 `mcp: bad envelope`（見 `McpProtocolContractsTest`，
+ * 由 #93 引入並已合併進 main）。
  *
  * 安全約定：
  * - [bearer] 只放 `Authorization` 標頭，永不拼進 body，不寫 log；

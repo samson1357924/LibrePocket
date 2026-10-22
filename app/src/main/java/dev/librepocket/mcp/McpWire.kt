@@ -647,7 +647,8 @@ internal object McpWire {
      *   不再一致，工具識別錯位，故發送前 fail-closed）；
      *   （名形狀驗證順序：空白 → 超限 → C0/DEL → 孤立 surrogate，與下方程式一致）；
      * - `argumentsJson` 必須是合法 JSON object 文本（空字串視為 `{}`），
-     *   非 object（`null`／陣列／畸形）即拋，不發送；
+     *   非 object（`null`／陣列／畸形）即拋 [McpProtocol]（`mcp: bad envelope`），
+     *   由 [McpServer.callTool] 映射為 PROTOCOL，在 vault 讀取、HTTP 傳輸與 breaker 前 fail-closed；
      *   字元數超 [ARGUMENTS_MAX_CHARS] 即拋（訊息明指 arguments，非 response）；
      * - `toolName` 經 [esc] 轉義：C0/DEL 已先在此拒（其 [esc] C0 分支屬防禦深度，
      *   見該函 KDoc），實際會走到的只剩引號／反斜線等 JSON 必要編碼。

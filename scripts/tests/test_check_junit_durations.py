@@ -28,11 +28,15 @@ def _xml(name: str, secs: float, *, with_suite_time: bool = True) -> str:
     )
 
 
-def _write_results(root: Path, cases: dict[str, str]) -> None:
-    d = root / "app" / "build" / "test-results" / "testFossDebugUnitTest"
+def _write_flavor_results(root: Path, flavor: str, cases: dict[str, str]) -> None:
+    d = root / "app" / "build" / "test-results" / flavor
     d.mkdir(parents=True, exist_ok=True)
     for fname, content in cases.items():
         (d / fname).write_text(content, encoding="utf-8")
+
+
+def _write_results(root: Path, cases: dict[str, str]) -> None:
+    _write_flavor_results(root, "testFossDebugUnitTest", cases)
 
 
 class CheckJunitDurationsTest(unittest.TestCase):
@@ -178,6 +182,41 @@ class CheckJunitDurationsTest(unittest.TestCase):
                 "</testsuite>"
             )
             _write_results(Path(d), {"TEST-0.xml": content})
+            self.assertEqual(1, check_junit_durations.main(d))
+
+    def test_multi_flavor_does_not_sum_across_runs_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _write_flavor_results(
+                root,
+                "testPlayDebugUnitTest",
+                {"TEST-shared.xml": _xml("com.example.Shared", 70.0)},
+            )
+            _write_flavor_results(
+                root,
+                "testFossDebugUnitTest",
+                {"TEST-shared.xml": _xml("com.example.Shared", 70.0)},
+            )
+            durations = check_junit_durations.collect_durations(d)
+            self.assertEqual(durations["com.example.Shared"], 70.0)
+            self.assertLessEqual(durations["com.example.Shared"], 120.0)
+            self.assertEqual(0, check_junit_durations.main(d))
+
+    def test_multi_flavor_slow_in_one_flavor_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _write_flavor_results(
+                root,
+                "testPlayDebugUnitTest",
+                {"TEST-shared.xml": _xml("com.example.Shared", 50.0)},
+            )
+            _write_flavor_results(
+                root,
+                "testFossDebugUnitTest",
+                {"TEST-shared.xml": _xml("com.example.Shared", 125.0)},
+            )
+            durations = check_junit_durations.collect_durations(d)
+            self.assertEqual(durations["com.example.Shared"], 125.0)
             self.assertEqual(1, check_junit_durations.main(d))
 
 

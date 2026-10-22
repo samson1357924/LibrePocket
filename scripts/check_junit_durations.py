@@ -8,7 +8,9 @@ Reads `app/build/test-results/**/TEST-*.xml` (same glob as
 `scripts/summarize_junit.py`, which stays reporting-only). Per-class time is
 the greater of the `<testsuite time="...">` attribute and the sum of its
 direct `<testcase time="...">` children (a zeroed/NaN suite total cannot hide
-slow cases). Malformed values (unparseable, NaN/inf, negative), unreadable
+slow cases). Across runs or flavors sharing the same class name, the maximum
+run duration represents the class so multi-flavor local runs do not sum
+together. Malformed values (unparseable, NaN/inf, negative), unreadable
 files, unrecognized roots, reports with zero suites, and suites with no
 usable timestamp at all are explicit ERRORS that fail the gate — a
 present-but-unreadable (or present-but-timeless) report never silently
@@ -97,9 +99,10 @@ def analyze(root: str) -> tuple[dict[str, float], list[str]]:
                 # to judge, so this is an error, not a pass.
                 errors.append(f"{path}: suite {name!r} has no usable time")
                 continue
-            totals[name] = totals.get(name, 0.0) + max(
+            suite_duration = max(
                 suite_time if suite_time is not None else 0.0, case_total
             )
+            totals[name] = max(totals.get(name, 0.0), suite_duration)
     return totals, errors
 
 

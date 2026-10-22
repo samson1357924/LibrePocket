@@ -2,6 +2,9 @@
   "name": "pocketguard-bot",
   "version": "1.0.0",
   "private": true,
+  "engines": {
+    "node": ">=24.22.1"
+  },
   "scripts": {
     "build": "tsc",
     "test": "ts-node test/run_tests.ts"
@@ -10,7 +13,7 @@
     "@octokit/rest": "^20.0.2"
   },
   "devDependencies": {
-    "@types/node": "^20.11.0",
+    "@types/node": "^24.0.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.3"
   }

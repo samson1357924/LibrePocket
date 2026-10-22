@@ -9,7 +9,7 @@
 
 ## JDK and Gradle
 
-CI uses JDK 25. Use JDK 25 for closest CI parity; older local JDKs (such as 21) may still build locally, but they are not the CI baseline. The repository pins the Gradle wrapper; a system Gradle installation is not needed, and `gradle/wrapper/gradle-wrapper.properties` enforces `distributionSha256Sum` verification to protect against distribution tampering.
+CI uses JDK 25 (enforcing the latest security patch with check-latest: true for CVE-2026-91403 eMudhra intermediate CA compromise mitigation). Use JDK 25 for closest CI parity; older local JDKs (such as 21) may still build locally, but they are not the CI baseline. The repository pins the Gradle wrapper; a system Gradle installation is not needed, and `gradle/wrapper/gradle-wrapper.properties` enforces `distributionSha256Sum` verification to protect against distribution tampering.
 
 ```sh
 java -version

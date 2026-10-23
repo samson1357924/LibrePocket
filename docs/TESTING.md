@@ -195,7 +195,11 @@ silently downgrade redaction or writes):
 - `scripts/check_junit_durations.py` (covered by
   `scripts/tests/test_check_junit_durations.py`) runs AFTER the suite in each
   flavor job and fails when any single test class exceeds 120s (same JUnit XML
-  glob as `summarize_junit.py`, which stays reporting-only). No XML skips green
+  glob as `summarize_junit.py`, which stays reporting-only). Durations are
+  evaluated with two-level aggregation: intra-flavor suites/shards of the same
+  class are accumulated (summed) against the 120s threshold, while cross-flavor
+  runs evaluate the peak (maximum) duration per class to avoid false-positive
+  timeouts in multi-flavor local runs (`./gradlew test`). No XML skips green
   (Gradle governs that case). Local: `python3 scripts/check_junit_durations.py`
   (needs `app/build/test-results/**/TEST-*.xml` from a prior Gradle run).
 - Known slow classes (budgets, Current): PR-slim byte-cap

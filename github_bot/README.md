@@ -6,6 +6,8 @@ This directory implements deterministic change tagging, three-role Android revie
 
 ## Modes
 
+Requires Node.js `>= 24.22.1` (pinned locally via `.nvmrc`, enforced via `engine-strict=true` in `.npmrc`).
+
 Run from this directory after installing the committed lockfile with `npm ci --ignore-scripts`:
 
 - `node_modules/.bin/ts-node src/github_runner.ts --mode=tag` classifies eligible comment commands and emits deterministic label/context JSON. It does not call OpenAI.

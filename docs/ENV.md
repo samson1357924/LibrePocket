@@ -1,6 +1,6 @@
 # Build Environment — LibrePocket
 
-**Status:** Current checked-in build baseline, checked 2026-10-14 against `d5a98bd35e919083b0475027c9b2e74b703e4e58` (committed 2026-10-13).
+**Status:** Current checked-in build baseline, checked 2026-10-24 against `d5a98bd35e919083b0475027c9b2e74b703e4e58` (committed 2026-10-13).
 
 - **Scope:** Local build prerequisites and checked-in Android toolchain values.
 - **Owner role:** Build/CI maintainer; no individual assigned.
@@ -37,6 +37,14 @@ The checked-in app configuration currently uses:
 | Gradle wrapper | 9.7.1 |
 
 Install the matching Android platforms and build tools required by the wrapper/build. The Gradle wrapper pin in `gradle/wrapper/gradle-wrapper.properties` enforces `distributionSha256Sum` verification to protect against distribution tampering. Do not infer installation paths or current Google Play policy deadlines from this table; the values above describe this source revision, not a store approval.
+
+## Node.js (PocketGuard Bot)
+
+Requires Node.js `>= 24.22.1` (enforcing the October 2026 security release). Pinned locally via `github_bot/.nvmrc` (`24.22.1`). CI workflows enforce `check-latest: true` and npm enforces `engine-strict=true`.
+
+```sh
+cd github_bot && nvm use && node -v
+```
 
 ## Flavors and IDs
 

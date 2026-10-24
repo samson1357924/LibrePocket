@@ -11,10 +11,10 @@ direct `<testcase time="...">` children (a zeroed/NaN suite total cannot hide
 slow cases).
 
 Two-level aggregation:
-1. Within each flavor/task directory (`app/build/test-results/<taskName>/TEST-*.xml`),
+1. Within each flavor/task directory (`app/build/test-results/<taskName>/...`),
    durations for the same class name are accumulated (summed) across suites
-   and files to prevent sharded or multi-suite tests from evading the budget
-   (preventing the 140s evasion vulnerability).
+   and files (including nested shards) to prevent sharded or multi-suite tests
+   from evading the budget (preventing the 140s evasion vulnerability).
 2. Across flavors/tasks, the maximum (peak) duration represents the class so
    multi-flavor local runs do not sum together.
 
@@ -38,6 +38,7 @@ import math
 import os
 import sys
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 JUNIT_GLOB = "app/build/test-results/**/TEST-*.xml"
 PER_CLASS_BUDGET_SECONDS = 120.0
@@ -57,13 +58,27 @@ def _valid_time(raw: str | None) -> float | None:
     return value
 
 
+def _task_key(path: str, test_results_dir: str) -> str:
+    """Derive task key as the top-level directory directly under test-results/."""
+    try:
+        rel = os.path.relpath(path, test_results_dir)
+        parts = Path(rel).parts
+        if len(parts) > 1 and parts[0] != "..":
+            return parts[0]
+    except (ValueError, Exception):
+        pass
+    return os.path.dirname(path)
+
+
 def analyze(root: str) -> tuple[dict[str, float], list[str]]:
     """Per-class durations plus explicit error entries (never silent).
 
-    Durations are accumulated per class within each flavor/task directory,
-    and then aggregated across flavors/tasks by taking the peak (maximum).
+    Durations are accumulated per class within each flavor/task directory
+    (top-level directory directly under test-results/), and then aggregated
+    across flavors/tasks by taking the peak (maximum).
     """
     pattern = os.path.join(root, JUNIT_GLOB)
+    test_results_dir = os.path.join(root, "app", "build", "test-results")
     flavor_totals: dict[str, dict[str, float]] = {}
     errors: list[str] = []
     paths = sorted(glob.glob(pattern, recursive=True))
@@ -84,9 +99,9 @@ def analyze(root: str) -> tuple[dict[str, float], list[str]]:
         if not suites:
             errors.append(f"{path}: report contains no <testsuite>")
             continue
-        flavor = os.path.dirname(path)
-        if flavor not in flavor_totals:
-            flavor_totals[flavor] = {}
+        task_key = _task_key(path, test_results_dir)
+        if task_key not in flavor_totals:
+            flavor_totals[task_key] = {}
         for suite in suites:
             name = suite.get("name") or os.path.basename(path)
             suite_time = _valid_time(suite.get("time"))
@@ -117,8 +132,8 @@ def analyze(root: str) -> tuple[dict[str, float], list[str]]:
             suite_duration = max(
                 suite_time if suite_time is not None else 0.0, case_total
             )
-            flavor_totals[flavor][name] = (
-                flavor_totals[flavor].get(name, 0.0) + suite_duration
+            flavor_totals[task_key][name] = (
+                flavor_totals[task_key].get(name, 0.0) + suite_duration
             )
 
     totals: dict[str, float] = {}

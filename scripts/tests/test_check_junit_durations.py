@@ -2,9 +2,10 @@
 
 Pins: per-class >120s fails, exactly-120s passes, missing XML skips green,
 suite-time fallback (sum of testcase times) works, max(suite, case-sum) wins,
-per-flavor accumulation with peak across flavors, and malformed reports
-(corrupt XML, unrecognized root, unsupported encoding, NaN/inf/negative,
-suite/case mismatch) fail the gate via main() exit codes (PR #87 P2-3).
+per-flavor accumulation (including nested shards) with peak across flavors,
+and malformed reports (corrupt XML, unrecognized root, unsupported encoding,
+NaN/inf/negative, suite/case mismatch) fail the gate via main() exit codes
+(PR #87 P2-3).
 
 Run with: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_check_junit_durations.py
 """
@@ -248,6 +249,23 @@ class CheckJunitDurationsTest(unittest.TestCase):
             )
             durations = check_junit_durations.collect_durations(d)
             self.assertAlmostEqual(durations["com.example.Sharded"], 130.0)
+            self.assertEqual(1, check_junit_durations.main(d))
+
+    def test_single_flavor_nested_shards_same_class_sums_and_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d) / "app" / "build" / "test-results" / "testFossDebugUnitTest"
+            shard1 = base / "shard-1"
+            shard2 = base / "shard-2" / "nested"
+            shard1.mkdir(parents=True, exist_ok=True)
+            shard2.mkdir(parents=True, exist_ok=True)
+            (shard1 / "TEST-s1.xml").write_text(
+                _xml("com.example.NestedSharded", 70.0), encoding="utf-8"
+            )
+            (shard2 / "TEST-s2.xml").write_text(
+                _xml("com.example.NestedSharded", 60.0), encoding="utf-8"
+            )
+            durations = check_junit_durations.collect_durations(d)
+            self.assertAlmostEqual(durations["com.example.NestedSharded"], 130.0)
             self.assertEqual(1, check_junit_durations.main(d))
 
     def test_multi_flavor_with_split_suites_accumulates_per_flavor_and_takes_peak(self) -> None:

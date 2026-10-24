@@ -151,10 +151,10 @@ dependencies {
     // Session JSONL export/import codec.
     implementation(libs.serialization.json)
     // Chat/policy state + streaming (explicit; also pulled transitively by room/datastore).
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
+    implementation(libs.kotlinx.coroutines.android)
     // Unit tests (M3/M6).
-    testImplementation("junit:junit:4.13.2")
-    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.1")
+    testImplementation(libs.junit4)
+    testImplementation(libs.kotlinx.coroutines.test)
     // Unit tests (M2/M4/M5: Android-dependent vault/Room paths run under Robolectric).
     testImplementation(libs.robolectric)
     testImplementation(libs.room.testing)

@@ -2,15 +2,15 @@
 
 Pins: per-class >120s fails, exactly-120s passes, missing XML skips green,
 suite-time fallback (sum of testcase times) works, max(suite, case-sum) wins,
-and malformed reports (corrupt XML, NaN/inf/negative, suite/case mismatch)
-fail the gate via main() exit codes (PR #87 P2-3).
+per-flavor accumulation with peak across flavors, and malformed reports
+(corrupt XML, unrecognized root, unsupported encoding, NaN/inf/negative,
+suite/case mismatch) fail the gate via main() exit codes (PR #87 P2-3).
 
 Run with: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_check_junit_durations.py
 """
 
 from __future__ import annotations
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,11 +28,15 @@ def _xml(name: str, secs: float, *, with_suite_time: bool = True) -> str:
     )
 
 
-def _write_results(root: Path, cases: dict[str, str]) -> None:
-    d = root / "app" / "build" / "test-results" / "testFossDebugUnitTest"
+def _write_flavor_results(root: Path, flavor: str, cases: dict[str, str]) -> None:
+    d = root / "app" / "build" / "test-results" / flavor
     d.mkdir(parents=True, exist_ok=True)
     for fname, content in cases.items():
         (d / fname).write_text(content, encoding="utf-8")
+
+
+def _write_results(root: Path, cases: dict[str, str]) -> None:
+    _write_flavor_results(root, "testFossDebugUnitTest", cases)
 
 
 class CheckJunitDurationsTest(unittest.TestCase):
@@ -178,6 +182,117 @@ class CheckJunitDurationsTest(unittest.TestCase):
                 "</testsuite>"
             )
             _write_results(Path(d), {"TEST-0.xml": content})
+            self.assertEqual(1, check_junit_durations.main(d))
+
+    def test_multi_flavor_does_not_sum_across_runs_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _write_flavor_results(
+                root,
+                "testPlayDebugUnitTest",
+                {"TEST-shared.xml": _xml("com.example.Shared", 70.0)},
+            )
+            _write_flavor_results(
+                root,
+                "testFossDebugUnitTest",
+                {"TEST-shared.xml": _xml("com.example.Shared", 70.0)},
+            )
+            durations = check_junit_durations.collect_durations(d)
+            self.assertEqual(durations["com.example.Shared"], 70.0)
+            self.assertLessEqual(durations["com.example.Shared"], 120.0)
+            self.assertEqual(0, check_junit_durations.main(d))
+
+    def test_multi_flavor_slow_in_one_flavor_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _write_flavor_results(
+                root,
+                "testPlayDebugUnitTest",
+                {"TEST-shared.xml": _xml("com.example.Shared", 50.0)},
+            )
+            _write_flavor_results(
+                root,
+                "testFossDebugUnitTest",
+                {"TEST-shared.xml": _xml("com.example.Shared", 125.0)},
+            )
+            durations = check_junit_durations.collect_durations(d)
+            self.assertEqual(durations["com.example.Shared"], 125.0)
+            self.assertEqual(1, check_junit_durations.main(d))
+
+    def test_single_flavor_multiple_suites_same_class_sums_and_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            content = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<testsuites>'
+                '  <testsuite name="com.example.MultiSuite" tests="1" failures="0" errors="0" skipped="0" time="70.0">'
+                '    <testcase classname="com.example.MultiSuite" name="part1" time="70.0"/>'
+                '  </testsuite>'
+                '  <testsuite name="com.example.MultiSuite" tests="1" failures="0" errors="0" skipped="0" time="60.0">'
+                '    <testcase classname="com.example.MultiSuite" name="part2" time="60.0"/>'
+                '  </testsuite>'
+                '</testsuites>'
+            )
+            _write_results(Path(d), {"TEST-multi.xml": content})
+            durations = check_junit_durations.collect_durations(d)
+            self.assertAlmostEqual(durations["com.example.MultiSuite"], 130.0)
+            self.assertEqual(1, check_junit_durations.main(d))
+
+    def test_single_flavor_multiple_files_same_class_sums(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            _write_results(
+                Path(d),
+                {
+                    "TEST-shard1.xml": _xml("com.example.Sharded", 70.0),
+                    "TEST-shard2.xml": _xml("com.example.Sharded", 60.0),
+                },
+            )
+            durations = check_junit_durations.collect_durations(d)
+            self.assertAlmostEqual(durations["com.example.Sharded"], 130.0)
+            self.assertEqual(1, check_junit_durations.main(d))
+
+    def test_multi_flavor_with_split_suites_accumulates_per_flavor_and_takes_peak(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            # Flavor A has split suites summing to <=120s (50.0s + 60.0s = 110.0s)
+            _write_flavor_results(
+                root,
+                "testPlayDebugUnitTest",
+                {
+                    "TEST-a1.xml": _xml("com.example.Split", 50.0),
+                    "TEST-a2.xml": _xml("com.example.Split", 60.0),
+                },
+            )
+            # Flavor B has split suites summing to >120s (70.0s + 60.0s = 130.0s)
+            _write_flavor_results(
+                root,
+                "testFossDebugUnitTest",
+                {
+                    "TEST-b1.xml": _xml("com.example.Split", 70.0),
+                    "TEST-b2.xml": _xml("com.example.Split", 60.0),
+                },
+            )
+            durations = check_junit_durations.collect_durations(d)
+            self.assertAlmostEqual(durations["com.example.Split"], 130.0)
+            self.assertEqual(1, check_junit_durations.main(d))
+
+    def test_main_unrecognized_root_exit_1(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            _write_results(
+                Path(d),
+                {"TEST-unknown.xml": '<?xml version="1.0" encoding="UTF-8"?><unknownroot/>'},
+            )
+            self.assertEqual(1, check_junit_durations.main(d))
+
+    def test_main_unsupported_encoding_exit_1(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "app" / "build" / "test-results" / "testFossDebugUnitTest"
+            p.mkdir(parents=True, exist_ok=True)
+            (p / "TEST-unsupported.xml").write_bytes(
+                b'<?xml version="1.0" encoding="unsupported-encoding"?><testsuite name="com.example.Enc" tests="1"/>'
+            )
+            durations, errors = check_junit_durations.analyze(d)
+            self.assertEqual(len(errors), 1)
+            self.assertIn("unreadable report", errors[0])
             self.assertEqual(1, check_junit_durations.main(d))
 
 

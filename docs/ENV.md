@@ -9,7 +9,7 @@
 
 ## JDK and Gradle
 
-CI uses JDK 25. Use JDK 25 for closest CI parity; older local JDKs (such as 21) may still build locally, but they are not the CI baseline. The repository pins the Gradle wrapper; a system Gradle installation is not needed.
+CI uses JDK 25. Use JDK 25 for closest CI parity; older local JDKs (such as 21) may still build locally, but they are not the CI baseline. The repository pins the Gradle wrapper; a system Gradle installation is not needed, and `gradle/wrapper/gradle-wrapper.properties` enforces `distributionSha256Sum` verification to protect against distribution tampering.
 
 ```sh
 java -version
@@ -36,7 +36,7 @@ The checked-in app configuration currently uses:
 | Kotlin | 2.4.20 |
 | Gradle wrapper | 9.7.1 |
 
-Install the matching Android platforms and build tools required by the wrapper/build. Do not infer installation paths or current Google Play policy deadlines from this table; the values above describe this source revision, not a store approval.
+Install the matching Android platforms and build tools required by the wrapper/build. The Gradle wrapper pin in `gradle/wrapper/gradle-wrapper.properties` enforces `distributionSha256Sum` verification to protect against distribution tampering. Do not infer installation paths or current Google Play policy deadlines from this table; the values above describe this source revision, not a store approval.
 
 ## Flavors and IDs
 

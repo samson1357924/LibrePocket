@@ -5,10 +5,20 @@ exceeds 120 seconds wall time. Only rejects / alerts — never silently
 downgrades redaction or writes.
 
 Reads `app/build/test-results/**/TEST-*.xml` (same glob as
-`scripts/summarize_junit.py`, which stays reporting-only). Per-class time is
+`scripts/summarize_junit.py`, which stays reporting-only). Per-suite time is
 the greater of the `<testsuite time="...">` attribute and the sum of its
 direct `<testcase time="...">` children (a zeroed/NaN suite total cannot hide
-slow cases). Malformed values (unparseable, NaN/inf, negative), unreadable
+slow cases).
+
+Two-level aggregation:
+1. Within each flavor/task directory (`app/build/test-results/<taskName>/...`),
+   durations for the same class name are accumulated (summed) across suites
+   and files (including nested shards) to prevent sharded or multi-suite tests
+   from evading the budget (preventing the 140s evasion vulnerability).
+2. Across flavors/tasks, the maximum (peak) duration represents the class so
+   multi-flavor local runs do not sum together.
+
+Malformed values (unparseable, unknown encoding, NaN/inf, negative), unreadable
 files, unrecognized roots, reports with zero suites, and suites with no
 usable timestamp at all are explicit ERRORS that fail the gate — a
 present-but-unreadable (or present-but-timeless) report never silently
@@ -28,6 +38,7 @@ import math
 import os
 import sys
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 JUNIT_GLOB = "app/build/test-results/**/TEST-*.xml"
 PER_CLASS_BUDGET_SECONDS = 120.0
@@ -47,16 +58,34 @@ def _valid_time(raw: str | None) -> float | None:
     return value
 
 
+def _task_key(path: str, test_results_dir: str) -> str:
+    """Derive task key as the top-level directory directly under test-results/."""
+    try:
+        rel = os.path.relpath(path, test_results_dir)
+        parts = Path(rel).parts
+        if len(parts) > 1 and parts[0] != "..":
+            return parts[0]
+    except (ValueError, Exception):
+        pass
+    return os.path.dirname(path)
+
+
 def analyze(root: str) -> tuple[dict[str, float], list[str]]:
-    """Per-class durations plus explicit error entries (never silent)."""
+    """Per-class durations plus explicit error entries (never silent).
+
+    Durations are accumulated per class within each flavor/task directory
+    (top-level directory directly under test-results/), and then aggregated
+    across flavors/tasks by taking the peak (maximum).
+    """
     pattern = os.path.join(root, JUNIT_GLOB)
-    totals: dict[str, float] = {}
+    test_results_dir = os.path.join(root, "app", "build", "test-results")
+    flavor_totals: dict[str, dict[str, float]] = {}
     errors: list[str] = []
     paths = sorted(glob.glob(pattern, recursive=True))
     for path in paths:
         try:
             tree = ET.parse(path)
-        except (ET.ParseError, OSError) as e:
+        except (ET.ParseError, OSError, LookupError) as e:
             errors.append(f"{path}: unreadable report ({e})")
             continue
         xml_root = tree.getroot()
@@ -70,6 +99,9 @@ def analyze(root: str) -> tuple[dict[str, float], list[str]]:
         if not suites:
             errors.append(f"{path}: report contains no <testsuite>")
             continue
+        task_key = _task_key(path, test_results_dir)
+        if task_key not in flavor_totals:
+            flavor_totals[task_key] = {}
         for suite in suites:
             name = suite.get("name") or os.path.basename(path)
             suite_time = _valid_time(suite.get("time"))
@@ -97,9 +129,17 @@ def analyze(root: str) -> tuple[dict[str, float], list[str]]:
                 # to judge, so this is an error, not a pass.
                 errors.append(f"{path}: suite {name!r} has no usable time")
                 continue
-            totals[name] = totals.get(name, 0.0) + max(
+            suite_duration = max(
                 suite_time if suite_time is not None else 0.0, case_total
             )
+            flavor_totals[task_key][name] = (
+                flavor_totals[task_key].get(name, 0.0) + suite_duration
+            )
+
+    totals: dict[str, float] = {}
+    for class_durations in flavor_totals.values():
+        for name, duration in class_durations.items():
+            totals[name] = max(totals.get(name, 0.0), duration)
     return totals, errors
 
 

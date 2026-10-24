@@ -30,8 +30,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -564,7 +566,7 @@ class FlushDurableObligationBarrierTest {
     val provider = P1GateProvider(handler = {
       flow {
         hostEntered.countDown()
-        hostGate.await()
+        withContext(NonCancellable) { hostGate.await() }
         emit(StreamEvent.TextDelta(0, 0, "ok"))
         emit(StreamEvent.Done("stop"))
       }

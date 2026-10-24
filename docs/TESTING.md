@@ -4,7 +4,7 @@
 
 - **Scope:** Repository CI, local JVM/Robolectric tests, static policy gates, and separately scheduled Android device tests.
 - **Owner role:** CI/build maintainer; no individual is assigned here.
-- **Source of truth:** `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`, `.github/workflows/security-audit.yml`, `scripts/docs_claim_check.sh`, `scripts/test_docs_claim_check.sh`, `scripts/mcp_scan.py`, `scripts/requirements-docs.txt`, `scripts/apk_policy_inspect.py`, `scripts/play_policy_check.sh`, `scripts/backup_rules_check.py`, `scripts/summarize_junit.py`, `scripts/tests/test_apk_policy_check.py`, `scripts/tests/test_summarize_junit.py`, test source sets, Gradle wrapper/catalog, and the command results from the exact commit being assessed.
+- **Source of truth:** `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`, `.github/workflows/security-audit.yml`, `scripts/docs_claim_check.sh`, `scripts/test_docs_claim_check.sh`, `scripts/mcp_scan.py`, `scripts/requirements-docs.txt`, `scripts/apk_policy_inspect.py`, `scripts/play_policy_check.sh`, `scripts/backup_rules_check.py`, `scripts/summarize_junit.py`, `scripts/tests/test_apk_policy_check.py`, `scripts/tests/test_summarize_junit.py`, `scripts/tests/test_gradle_wrapper_checksum.py`, test source sets, Gradle wrapper/catalog, and the command results from the exact commit being assessed.
 - **Update trigger:** CI, test source-set, Android SDK/JDK, policy-script, or merge-gate changes.
 
 ## Current CI scope
@@ -31,6 +31,7 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `scripts/release_signer_pins.example.json`,
 `scripts/tests/test_release_artifact_verifier.py`,
 `scripts/tests/test_build_release_identity.py`,
+`scripts/tests/test_gradle_wrapper_checksum.py`,
 `.github/workflows/pr-check.yml`) outputs. The `policy` list ends with a
 trailing `- 'scripts/**'` catch-all: the explicit entries above mirror the
 full filter in `pr-check.yml` (no silent drift between docs and workflow),
@@ -179,7 +180,7 @@ is not enabled, repository rulesets are 0, required approving reviews are
 enforcement (not review or admin enforcement). Re-check the current
 configuration with `gh api repos/<owner>/<repo>/branches/main/protection`.
 
-The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy and release-identity harnesses (standard library only) run in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. The command is `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py`. These tests use synthetic APK-like files and fake Gradle/SDK/policy commands; they do not prove real APK or SDK behavior. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
+The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy and release-identity harnesses (standard library only) run in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. The command is `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py scripts/tests/test_gradle_wrapper_checksum.py`. These tests use synthetic APK-like files and fake Gradle/SDK/policy commands; they do not prove real APK or SDK behavior. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
 
 Issue #86 Phase C guardrails (Current, gates — only reject/alert, never
 silently downgrade redaction or writes):
@@ -195,7 +196,11 @@ silently downgrade redaction or writes):
 - `scripts/check_junit_durations.py` (covered by
   `scripts/tests/test_check_junit_durations.py`) runs AFTER the suite in each
   flavor job and fails when any single test class exceeds 120s (same JUnit XML
-  glob as `summarize_junit.py`, which stays reporting-only). No XML skips green
+  glob as `summarize_junit.py`, which stays reporting-only). Durations are
+  evaluated with two-level aggregation: intra-flavor suites/shards of the same
+  class are accumulated (summed) against the 120s threshold, while cross-flavor
+  runs evaluate the peak (maximum) duration per class to avoid false-positive
+  timeouts in multi-flavor local runs (`./gradlew test`). No XML skips green
   (Gradle governs that case). Local: `python3 scripts/check_junit_durations.py`
   (needs `app/build/test-results/**/TEST-*.xml` from a prior Gradle run).
 - Known slow classes (budgets, Current): PR-slim byte-cap
@@ -591,7 +596,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
   scripts/tests/test_build_release_identity.py \
   scripts/tests/test_summarize_junit.py \
   scripts/tests/test_check_test_budgets.py \
-  scripts/tests/test_check_junit_durations.py
+  scripts/tests/test_check_junit_durations.py \
+  scripts/tests/test_gradle_wrapper_checksum.py
 
 # Issue #86 Phase C guardrails (static, no Gradle)
 python3 scripts/check_test_budgets.py

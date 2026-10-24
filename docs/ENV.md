@@ -9,7 +9,7 @@
 
 ## JDK and Gradle
 
-CI uses JDK 25, requesting the latest patch via `check-latest: true` and enforcing a minimum security floor of 25.0.5 via `scripts/verify_jdk_floor.sh` for CVE-2026-91403 (eMudhra intermediate CA compromise mitigation; see Oracle CVE-2026-91403 advisory: https://www.oracle.com/security-alerts/alert-cve-2026-91403.html). Use JDK 25 (>= 25.0.5) for closest CI parity; older local JDKs (such as 21) may still build locally, but they are not the CI baseline. The repository pins the Gradle wrapper; a system Gradle installation is not needed, and `gradle/wrapper/gradle-wrapper.properties` enforces `distributionSha256Sum` verification to protect against distribution tampering.
+CI uses JDK 25, requesting the latest patch via `check-latest: true` and enforcing a minimum security floor of Temurin 25.0.5+8 via `scripts/verify_jdk_floor.sh` for CVE-2026-91403 (eMudhra intermediate CA compromise mitigation; see Oracle CVE-2026-91403 advisory: https://www.oracle.com/security-alerts/alert-cve-2026-91403.html). Use JDK 25 (>= 25.0.5+8) for closest CI parity; older local JDKs (such as 21) may still build locally, but they are not the CI baseline. The repository pins the Gradle wrapper; a system Gradle installation is not needed, and `gradle/wrapper/gradle-wrapper.properties` enforces `distributionSha256Sum` verification to protect against distribution tampering.
 
 ```sh
 java -version

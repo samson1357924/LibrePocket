@@ -6,7 +6,7 @@ This directory implements deterministic change tagging, three-role Android revie
 
 ## Modes
 
-Requires Node.js `>= 24.22.1` (pinned locally via `.nvmrc`, enforced via `engine-strict=true` in `.npmrc`).
+Requires Node.js `>= 24.22.1`. The `.nvmrc` file is the single source of truth for CI workflows (referenced via `node-version-file: 'github_bot/.nvmrc'`) and local development, enforced via `engine-strict=true` in `.npmrc`.
 
 Run from this directory after installing the committed lockfile with `npm ci --ignore-scripts`:
 

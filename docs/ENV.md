@@ -9,7 +9,7 @@
 
 ## JDK and Gradle
 
-CI uses JDK 25 (enforcing the latest security patch with check-latest: true for CVE-2026-91403 eMudhra intermediate CA compromise mitigation). Use JDK 25 for closest CI parity; older local JDKs (such as 21) may still build locally, but they are not the CI baseline. The repository pins the Gradle wrapper; a system Gradle installation is not needed, and `gradle/wrapper/gradle-wrapper.properties` enforces `distributionSha256Sum` verification to protect against distribution tampering.
+CI uses JDK 25, requesting the latest patch via `check-latest: true` and enforcing a minimum security floor of 25.0.5 via `scripts/verify_jdk_floor.sh` for CVE-2026-91403 (eMudhra intermediate CA compromise mitigation; see Oracle CVE-2026-91403 advisory: https://www.oracle.com/security-alerts/alert-cve-2026-91403.html). Use JDK 25 (>= 25.0.5) for closest CI parity; older local JDKs (such as 21) may still build locally, but they are not the CI baseline. The repository pins the Gradle wrapper; a system Gradle installation is not needed, and `gradle/wrapper/gradle-wrapper.properties` enforces `distributionSha256Sum` verification to protect against distribution tampering.
 
 ```sh
 java -version
@@ -40,7 +40,7 @@ Install the matching Android platforms and build tools required by the wrapper/b
 
 ## Node.js (PocketGuard Bot)
 
-Requires Node.js `>= 24.22.1` (enforcing the October 2026 security release). Pinned locally via `github_bot/.nvmrc` (`24.22.1`). CI workflows enforce `check-latest: true` and npm enforces `engine-strict=true`.
+Requires Node.js `>= 24.22.1` (enforcing the October 2026 security release; see Node.js security release: https://nodejs.org/en/blog/release/v24.22.1/). `github_bot/.nvmrc` is the single source of truth for Node.js 24.22.1 across workflows (via `node-version-file: 'github_bot/.nvmrc'`) and local development, and npm enforces `engine-strict=true`.
 
 ```sh
 cd github_bot && nvm use && node -v

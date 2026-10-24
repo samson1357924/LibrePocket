@@ -113,6 +113,9 @@ jobs:
           java-version: '25'
           check-latest: true
 
+      - name: Verify JDK 25 security floor (CVE-2026-91403)
+        run: bash scripts/verify_jdk_floor.sh
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
         with:
@@ -221,6 +224,9 @@ jobs:
           java-version: '25'
           check-latest: true
 
+      - name: Verify JDK 25 security floor (CVE-2026-91403)
+        run: bash scripts/verify_jdk_floor.sh
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
         with:
@@ -283,6 +289,9 @@ jobs:
           distribution: 'temurin'
           java-version: '25'
           check-latest: true
+
+      - name: Verify JDK 25 security floor (CVE-2026-91403)
+        run: bash scripts/verify_jdk_floor.sh
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
@@ -482,8 +491,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '24.22.1'
-          check-latest: true
+          node-version-file: 'github_bot/.nvmrc'
 
       - name: Install locked dependencies
         working-directory: github_bot

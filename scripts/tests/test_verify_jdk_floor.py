@@ -300,20 +300,139 @@ class VerifyJdkFloorTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 1)
             self.assertIn("does not exist or is not executable", proc.stderr)
 
-        # 4. Directory with executable bin/java whose realpath differs from command -v java
-        with tempfile.TemporaryDirectory() as d:
-            bin_dir = Path(d) / "bin"
-            bin_dir.mkdir()
-            fake_java = bin_dir / "java"
-            fake_java.write_text("#!/bin/sh\nexit 0\n")
-            fake_java.chmod(fake_java.stat().st_mode | stat.S_IXUSR)
+        # 4. Two distinct executable java binaries: JAVA_HOME points at one,
+        #    PATH resolves to the other. This is hermetic and does not depend on
+        #    a host-provided java being present.
+        with (
+            tempfile.TemporaryDirectory() as home_d,
+            tempfile.TemporaryDirectory() as path_d,
+        ):
+            home_bin = Path(home_d) / "bin"
+            home_bin.mkdir()
+            home_java = home_bin / "java"
+            home_java.write_text("#!/bin/sh\nexit 0\n")
+            home_java.chmod(home_java.stat().st_mode | stat.S_IXUSR)
+
+            path_bin = Path(path_d) / "bin"
+            path_bin.mkdir()
+            path_java = path_bin / "java"
+            path_java.write_text("#!/bin/sh\nexit 0\n")
+            path_java.chmod(path_java.stat().st_mode | stat.S_IXUSR)
+
+            current_path = os.environ.get("PATH", "")
             proc = self.run_verify(
                 ["--version-string", "Temurin-25.0.5+8"],
-                env_extra={"JAVA_HOME": d},
+                env_extra={
+                    "JAVA_HOME": home_d,
+                    "PATH": f"{path_bin}:{current_path}",
+                },
                 clear_java_home=False,
             )
             self.assertEqual(proc.returncode, 1)
             self.assertIn("does not match 'java' on PATH", proc.stderr)
+
+    def test_leading_zero_min_build_uses_decimal(self) -> None:
+        """--min-build values with leading zeros are decimal, not octal."""
+        proc = self.run_verify(["--version-string", "25.0.5+7", "--min-build", "08"])
+        self.assertEqual(
+            proc.returncode,
+            1,
+            f"Expected rejection, got {proc.returncode}. Output:\n{proc.stdout}\n{proc.stderr}",
+        )
+        self.assertIn("FAILED", proc.stderr)
+
+        proc = self.run_verify(["--version-string", "25.0.5+8", "--min-build", "08"])
+        self.assertEqual(
+            proc.returncode,
+            0,
+            f"Expected success, got {proc.returncode}. Output:\n{proc.stdout}\n{proc.stderr}",
+        )
+        self.assertIn("PASSED", proc.stdout)
+
+        proc = self.run_verify(["--version-string", "25.0.5+8", "--min-build", "010"])
+        self.assertEqual(
+            proc.returncode,
+            1,
+            f"Expected rejection, got {proc.returncode}. Output:\n{proc.stdout}\n{proc.stderr}",
+        )
+        self.assertIn("FAILED", proc.stderr)
+
+        proc = self.run_verify(["--version-string", "25.0.5+10", "--min-build", "010"])
+        self.assertEqual(
+            proc.returncode,
+            0,
+            f"Expected success, got {proc.returncode}. Output:\n{proc.stdout}\n{proc.stderr}",
+        )
+        self.assertIn("PASSED", proc.stdout)
+
+    def test_build_banner_parsing_boundaries(self) -> None:
+        """Version-like values after 'build' are not mistaken for build numbers."""
+        proc = self.run_verify(["--version-string", "(build 25.0.5)"])
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("no build suffix found", proc.stderr)
+
+        # A real legacy '(build 8)' suffix is still accepted.
+        proc = self.run_verify(
+            ["--version-string", 'openjdk version "25.0.5" (build 8)']
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            f"Expected success, got {proc.returncode}. Output:\n{proc.stdout}\n{proc.stderr}",
+        )
+        self.assertIn("PASSED", proc.stdout)
+
+    def test_oversized_components_fail_closed(self) -> None:
+        """Components/build suffixes longer than 18 digits fail closed."""
+        for version in (
+            'openjdk version "1234567890123456789.0.5"',
+            'openjdk version "25.0.1234567890123456789"',
+            "25.0.5+1234567890123456789",
+        ):
+            with self.subTest(version=version):
+                proc = self.run_verify(["--version-string", version])
+                self.assertEqual(
+                    proc.returncode,
+                    1,
+                    f"Expected rejection for '{version}', got {proc.returncode}. Output:\n{proc.stdout}\n{proc.stderr}",
+                )
+                self.assertIn("ERROR", proc.stderr)
+                self.assertIn("too large", proc.stderr)
+
+    def test_java_home_symlink_matches_path_java(self) -> None:
+        """A symlinked java on PATH is equivalent to JAVA_HOME/bin/java."""
+        with (
+            tempfile.TemporaryDirectory() as home_d,
+            tempfile.TemporaryDirectory() as link_d,
+        ):
+            home = Path(home_d)
+            bin_dir = home / "bin"
+            bin_dir.mkdir()
+            fake_java = bin_dir / "java"
+            fake_java.write_text('#!/bin/sh\necho "Temurin-25.0.5+8"\n')
+            fake_java.chmod(
+                fake_java.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+            )
+
+            link_java = Path(link_d) / "java"
+            link_java.symlink_to(fake_java)
+
+            current_path = os.environ.get("PATH", "")
+            proc = self.run_verify(
+                [],
+                env_extra={
+                    "JAVA_HOME": str(home),
+                    "PATH": f"{link_d}:{current_path}",
+                },
+                clear_java_home=False,
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"Expected success, got {proc.returncode}. Output:\n{proc.stdout}\n{proc.stderr}",
+            )
+            self.assertIn("verified $JAVA_HOME consistency", proc.stdout)
+            self.assertIn("PASSED", proc.stdout)
 
     def test_java_home_matching_and_distrust_policy_inspection(self) -> None:
         """When JAVA_HOME matches PATH java, consistency passes and distrust configuration is inspected."""

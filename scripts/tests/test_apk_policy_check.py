@@ -3613,6 +3613,7 @@ class PolicyCiGateControl(unittest.TestCase):
             "scripts/tests/test_check_test_budgets.py",
             "scripts/tests/test_check_junit_durations.py",
             "scripts/tests/test_gradle_wrapper_checksum.py",
+            "scripts/tests/test_verify_jdk_floor.py",
             ".github/workflows/pr-check.yml",
             # Trailing catch-all (kept LAST in the yml list): defaults any
             # new scripts/ harness code into the policy gate without a
@@ -3761,13 +3762,46 @@ class PolicyCiGateControl(unittest.TestCase):
             "scripts/tests/test_release_artifact_verifier.py",
             "scripts/tests/test_build_release_identity.py",
             "scripts/tests/test_summarize_junit.py",
+            "scripts/tests/test_check_test_budgets.py",
+            "scripts/tests/test_check_junit_durations.py",
+            "scripts/tests/test_gradle_wrapper_checksum.py",
+            "scripts/tests/test_verify_jdk_floor.py",
         ):
             with self.subTest(test_path=test_path):
                 self.assertIn(test_path, workflow)
+        self.assertIn("scripts/tests/test_verify_jdk_floor.py", workflow)
         self.assertIn(
-            "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py",
+            "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py scripts/tests/test_gradle_wrapper_checksum.py scripts/tests/test_verify_jdk_floor.py",
             workflow,
         )
+
+    def test_every_jdk_floor_invocation_requires_temurin_vendor(self) -> None:
+        """Every verify_jdk_floor.sh call in CI must pin the Temurin vendor.
+
+        The floor script only checks the installed feature version by default;
+        a non-Temurin distribution at the same version would satisfy it. The
+        vendor flag makes the CI lanes fail closed on a drifted distribution.
+        """
+        for workflow_name in (
+            "pr-check.yml",
+            "codeql.yml",
+            "nightly-instrumented.yml",
+        ):
+            workflow_path = ROOT / ".github" / "workflows" / workflow_name
+            workflow = workflow_path.read_text(encoding="utf-8")
+            invocations = [
+                line.strip()
+                for line in workflow.splitlines()
+                if "scripts/verify_jdk_floor.sh" in line
+            ]
+            with self.subTest(workflow=workflow_name):
+                self.assertTrue(
+                    invocations,
+                    f"{workflow_name} must invoke scripts/verify_jdk_floor.sh",
+                )
+            for invocation in invocations:
+                with self.subTest(workflow=workflow_name, line=invocation):
+                    self.assertIn("--require-vendor Temurin", invocation)
 
 
 class BackupRulesValidator(unittest.TestCase):

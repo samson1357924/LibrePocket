@@ -68,10 +68,15 @@ jobs:
               - 'scripts/tests/test_release_artifact_verifier.py'
               - 'scripts/tests/test_build_release_identity.py'
               - 'scripts/tests/test_gradle_wrapper_checksum.py'
+              - 'scripts/tests/test_verify_jdk_floor.py'
               # The PR workflow itself: wiring changes must run the harness
               # tests that pin the workflow wiring (defense in depth; a
               # workflow edit already counts as code, so Gradle stages run).
               - '.github/workflows/pr-check.yml'
+              # Sibling workflows that also invoke verify_jdk_floor.sh: the
+              # harness pins their vendor flag, so edits must re-run the gate.
+              - '.github/workflows/codeql.yml'
+              - '.github/workflows/nightly-instrumented.yml'
               # Trailing catch-all: the explicit entries above exist for
               # readability/history; this glob defaults new scripts/ harness
               # code (any new checker or script test) into the policy gate
@@ -114,7 +119,7 @@ jobs:
           check-latest: true
 
       - name: Verify JDK 25 security floor (CVE-2026-91403)
-        run: bash scripts/verify_jdk_floor.sh
+        run: bash scripts/verify_jdk_floor.sh --require-vendor Temurin
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
@@ -225,7 +230,7 @@ jobs:
           check-latest: true
 
       - name: Verify JDK 25 security floor (CVE-2026-91403)
-        run: bash scripts/verify_jdk_floor.sh
+        run: bash scripts/verify_jdk_floor.sh --require-vendor Temurin
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
@@ -291,7 +296,7 @@ jobs:
           check-latest: true
 
       - name: Verify JDK 25 security floor (CVE-2026-91403)
-        run: bash scripts/verify_jdk_floor.sh
+        run: bash scripts/verify_jdk_floor.sh --require-vendor Temurin
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3

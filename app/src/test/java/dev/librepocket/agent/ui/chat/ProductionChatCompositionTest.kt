@@ -37,9 +37,10 @@ import java.util.concurrent.atomic.AtomicReference
  * Regression tests pinning production composition guard (#19):
  * - Production composition [ChatViewModelFactory.sessions.toolSlice] is strictly null.
  * - Sessions created from production composition send empty tools to model.
- * - When model returns [StreamEvent.ToolDone], production composition records it
- *   as [tool:...] only, NEVER executes the tool, NEVER continues the turn, and
- *   NEVER emits [tool-result:].
+ * - For scripted [StreamEvent.ToolDone] responses, tests assert a [tool:...]
+ *   marker, one provider request (no continuation), and no [tool-result:] marker.
+ * - The null slice and production composition imply no tool execution path;
+ *   these tests do not directly count tool executions.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
@@ -220,7 +221,7 @@ class ProductionChatCompositionTest {
             // 2. Records ToolDone into transcript as [tool:...] only
             assertTrue("transcript must record tool call marker: $final", final.text.contains("[tool:lsp.symbols"))
 
-            // 3. NEVER executes tool, NEVER emits [tool-result:]
+            // 3. The final transcript has no [tool-result:] marker (not an execution count).
             assertFalse("production composition must never emit tool-result marker: $final", final.text.contains("[tool-result:"))
 
             // 4. No other events in store emit tool-result

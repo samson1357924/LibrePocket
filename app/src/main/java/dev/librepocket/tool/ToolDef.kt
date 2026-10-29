@@ -46,8 +46,8 @@ data class ToolAnnotations(
  *
  * @param executionReady registry readiness flag:
  *   true indicates registry readiness (schema and handlers are present in
- *   [ToolRegistry] and [SafeToolSlice]), while production composition
- *   ([ChatViewModelFactory]) remains records-only (`toolSlice = null`)
+ *   [ToolRegistry] and [dev.librepocket.router.SafeToolSlice]), while production composition
+ *   ([dev.librepocket.agent.ui.chat.ChatViewModelFactory]) remains records-only (`toolSlice = null`)
  *   until the full production dispatcher, confirmation pipeline, and
  *   device-verified E2E acceptance are implemented. Only
  *   [ToolRegistry.visibleTools] (which additionally requires this flag)

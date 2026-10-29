@@ -70,7 +70,9 @@ def load_pins(path_value: str, *, require_flavors: tuple[str, ...] | None = None
     if path.is_symlink():
         raise PinError(f"pins file must not be a symlink: {path}")
 
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    # Opening a FIFO without a writer would otherwise block before fstat can reject it.
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_NONBLOCK", 0))
     try:
         fd = os.open(path, flags)
     except OSError as exc:

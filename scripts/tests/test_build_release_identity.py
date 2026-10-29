@@ -353,12 +353,13 @@ class ReleaseBuilderHarness(unittest.TestCase):
         mode: str = "pass",
         policy_mode: str = "pass",
         passwords: bool = True,
+        extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         self.policy_mode_file.write_text(policy_mode, encoding="utf-8")
         return subprocess.run(
             command or self.command(),
             cwd=self.root,
-            env=self.env(mode=mode, policy_mode=policy_mode, passwords=passwords),
+            env={**self.env(mode=mode, policy_mode=policy_mode, passwords=passwords), **(extra_env or {})},
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -796,7 +797,7 @@ class ReleaseBuilderHarness(unittest.TestCase):
         orig_content = fake_py.read_text(encoding="utf-8")
         fake_py.write_text(
             "#!/bin/sh\n"
-            "if [ \"${1:-}\" = \"-c\" ] && printf '%s' \"${2:-}\" | grep -q 'sys.version_info >= (3, 11)'; then\n"
+            "if [ \"${1:-}\" = \"-I\" ] && [ \"${2:-}\" = \"-c\" ] && printf '%s' \"${3:-}\" | grep -q 'sys.version_info >= (3, 11)'; then\n"
             "    exit 1\n"
             "fi\n"
             f"exec '{sys.executable}' \"$@\"\n",
@@ -810,6 +811,45 @@ class ReleaseBuilderHarness(unittest.TestCase):
         finally:
             fake_py.write_text(orig_content, encoding="utf-8")
             fake_py.chmod(0o755)
+
+    def test_preflight_ignores_poisoned_pythonpath_including_version_probe(self) -> None:
+        poison = self.tmp / "poison"
+        poison.mkdir()
+        marker = self.tmp / "poison-executed"
+        (poison / "sitecustomize.py").write_text(
+            f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n",
+            encoding="utf-8",
+        )
+        for module in ("re", "json"):
+            (poison / f"{module}.py").write_text("raise RuntimeError('poisoned import')\n", encoding="utf-8")
+        calls = self.tmp / "python-calls"
+        self._write_executable(
+            self.fake_bin / "python3",
+            f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\nexec '{sys.executable}' \"$@\"\n",
+        )
+        pins = self._create_pins_file(flavors=("play",))
+        command = self.command(("play",)) + ["--tag", "v1.2.3", "--pins", str(pins)]
+        env = {"PYTHONPATH": str(poison)}
+        result = self.run_builder(command, passwords=False, extra_env=env)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("BW_SESSION is not set", result.stdout)
+        self.assertFalse(self.gradle_log.exists())
+        self.assertFalse(marker.exists())
+        invocations = calls.read_text().splitlines()
+        self.assertGreaterEqual(len(invocations), 6)
+        self.assertTrue(invocations[0].startswith("-I -c "), invocations)
+        self.assertTrue(all(line.startswith("-I ") for line in invocations), invocations)
+
+        for extra, expected in ((["--tag", "v9.9.9"], "release tag/version check failed"),
+                                (["--pins", str(pins)], "invalid expected identity")):
+            with self.subTest(expected=expected):
+                bad = self.command(("play",)) + extra
+                if expected == "invalid expected identity":
+                    bad[bad.index("--expected-package") + 1] = "play=invalid"
+                result = self.run_builder(bad, passwords=False, extra_env=env)
+                self._assert_preflight_rejected(result)
+                self.assertIn(expected, result.stdout)
+                self.assertFalse(marker.exists())
 
     def test_subset_flavor_build_with_tag_and_pins_verifies_selected_only(self) -> None:
         pins_file = self._create_pins_file(flavors=("play",))
@@ -1028,6 +1068,18 @@ class SignerPinRegistryTest(unittest.TestCase):
         path = self.tmp / name
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
+
+    @unittest.skipUnless(hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"), "requires nonblocking FIFO support")
+    def test_fifo_without_writer_is_rejected_promptly(self) -> None:
+        fifo = self.tmp / "pins.fifo"
+        os.mkfifo(fifo)
+        result = subprocess.run(
+            [sys.executable, str(PINS_CHECKER), "--pins", str(fifo)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False, timeout=3,
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("pins file must be a regular file", result.stdout)
 
     def test_valid_single_flavor_pin_normalizes_cert_to_lowercase(self) -> None:
         path = self._write(

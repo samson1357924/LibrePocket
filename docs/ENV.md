@@ -74,7 +74,7 @@ cd github_bot && nvm install && nvm use && node -v
 
 ## Python
 
-Requires Python `>= 3.11` (standard library only, no external dependencies required for release builders and policy checkers). Python 3.11+ is strictly required for `python3 -P` (safe `sys.path` isolation) across release builders and policy checkers to prevent local import-shadowing attacks by disallowing prepending the current working directory or script directory to `sys.path`.
+Requires Python `>= 3.11` (standard library only, no external dependencies required for release builders and policy checkers). The local release builder requires Python 3.11+ and uses `python3 -I` for its Python preflight, including the version probe: it ignores `PYTHONPATH` and other Python environment variables and excludes the script/current directory and user site-packages. Its post-build stage instead runs plain `python3` under an `env -i` allowlist, retaining normal script-directory/system site behavior. Standalone policy checkers and other direct Python invocations do not automatically inherit the builder’s isolation; neither boundary is a sandbox.
 
 ```sh
 python3 --version

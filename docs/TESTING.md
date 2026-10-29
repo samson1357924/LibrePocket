@@ -928,9 +928,9 @@ python3 scripts/check_release_tag_version.py \
 python3 scripts/fake_keystore_rehearsal.py
 
 # Local release builder invocation with preflight tag & signer-pin verification
-# (local-only, requires Python >= 3.11 for python3 -P safe sys.path isolation;
+# (local-only, requires Python >= 3.11; preflight uses python3 -I;
 # subset build for flavor 'play' with caller-supplied identity and pins registry):
-scripts/build_release.sh --apk play \
+sh scripts/build_release.sh --apk play \
   --tag v0.1.0 \
   --pins /path/to/release_signer_pins.json \
   --expected-package play=dev.librepocket.agent \
@@ -950,7 +950,7 @@ JSON, so the harness runs them on helper-only diffs. The synthetic fixtures
 prove the gate's fail-closed matrix only; they are not real-APK/SDK evidence,
 not a signing/build rehearsal, and not a basis for closing Issue #12.
 
-The local APK release integration is `scripts/build_release.sh`; it requires `--apk`, explicit per-flavor trusted identity values, explicit SDK parser paths, and an existing output parent before it reaches credential lookup or build. Optional `--tag` and `--pins` preflight flags verify release tag format / Gradle consistency and signer-pin registry values against expected identity fail-closed before reading credentials or invoking Gradle. All preflight checks and helpers execute under `python3 -P` (requiring Python >= 3.11) to isolate `sys.path` and prevent local import-shadowing attacks.
+The local APK release integration is `scripts/build_release.sh`; it requires `--apk`, explicit per-flavor trusted identity values, explicit SDK parser paths, and an existing output parent before it reaches credential lookup or build. Optional `--tag` and `--pins` preflight flags verify release tag format / Gradle consistency and signer-pin registry values against expected identity fail-closed before reading credentials or invoking Gradle. Python preflight invocations, including the version probe, use `python3 -I`: this ignores Python environment variables such as `PYTHONPATH` and excludes the script/current directory and user site-packages from `sys.path`. Python >= 3.11 remains required. After Gradle, the stage helper instead runs plain `python3` under an `env -i` allowlist; it is not run with `-I` and retains normal script-directory/system site behavior. Gradle and credential lookup are not covered by either Python isolation boundary; neither boundary is a sandbox.
 
 Preflight identity validation for `--tag` and `--pins` is comprehensively tested in `scripts/tests/test_build_release_identity.py` (via `ReleaseBuilderHarness`, `SignerPinRegistryTest`, and `ReleaseTagVersionTest`), covering:
 - **Subset flavor builds:** verifying that building a subset of flavors (such as `--apk play` with a full three-flavor pins registry) verifies only the selected flavors and succeeds, while unselected registry entries are ignored; conversely, missing pin entries for selected flavors fails preflight closed before credentials or Gradle.
@@ -959,7 +959,7 @@ Preflight identity validation for `--tag` and `--pins` is comprehensively tested
 - **Directory symlinks:** pins path pointing to directories or directory symlinks (and file symlinks) fail preflight closed.
 - **Missing checker scripts:** missing or unreadable `scripts/check_release_tag_version.py` or `scripts/check_release_pins.py` fail preflight closed before credentials or build.
 - **Version boundary limits:** `versionCode` outside `1..2147483647` (such as `0`, `-1`, or `2147483648`) in `app/build.gradle.kts` fails preflight closed, and release tags must strictly match ASCII semver `vX.Y.Z` and equal `versionName`.
-- **Python version floor:** Python environments below 3.11 fail preflight closed before any subprocess execution.
+- **Python version floor:** Python environments below 3.11 fail at the isolated version probe before credential lookup or Gradle.
 
 It remains a local staging/verification path only, not a publishing workflow or release-readiness claim. Its helpers `scripts/release_artifact_stage.py` and `scripts/verify_release_apk.py` (covered by `scripts/tests/test_release_artifact_verifier.py` and `scripts/tests/test_build_release_identity.py`) stage and verify the release artifact for that local path; `pr-check.yml` lists them only as `policy` path triggers (not as invoked CI commands), and `scripts/docs_claim_check.sh` Section A requires every script the workflow references to be documented here.
 

@@ -151,8 +151,8 @@ FLAVORS="$*"
 [ -n "$AAPT" ] || die "--aapt is required"
 [ -n "$OUTPUT_PARENT" ] || die "--output-parent is required"
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1 \
-    || die "python3 >= 3.11 is required for safe isolated execution (-P)"
+python3 -I -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1 \
+    || die "python3 >= 3.11 is required for isolated preflight execution (-I)"
 command -v mktemp >/dev/null 2>&1 || die "mktemp is required"
 command -v env >/dev/null 2>&1 || die "env is required"
 [ ! -L "$APKSIGNER" ] && [ -f "$APKSIGNER" ] && [ -x "$APKSIGNER" ] || die "apksigner is unavailable or not executable: $APKSIGNER"
@@ -165,7 +165,7 @@ OUTPUT_PARENT=$(CDPATH= cd -- "$OUTPUT_PARENT" && pwd -P) \
     || die "cannot resolve output parent"
 
 validate_identity() {
-    python3 -P - "$1" "$2" "$3" "$4" "$5" <<'PY'
+    python3 -I - "$1" "$2" "$3" "$4" "$5" <<'PY'
 import re
 import sys
 
@@ -217,11 +217,11 @@ done
 if [ "$TAG_SEEN" -eq 1 ]; then
     [ -n "$TAG" ] || die "--tag requires a non-empty tag"
     [ -r "$SCRIPT_DIR/check_release_tag_version.py" ] || die "release tag/version checker is missing"
-    TAG_RESULT=$(python3 -P "$SCRIPT_DIR/check_release_tag_version.py" \
+    TAG_RESULT=$(python3 -I "$SCRIPT_DIR/check_release_tag_version.py" \
         --tag "$TAG" \
         --app-build-gradle "$ROOT/app/build.gradle.kts") \
         || die "release tag/version check failed"
-    TAG_VARS=$(python3 -P - "$TAG_RESULT" <<'PY'
+    TAG_VARS=$(python3 -I - "$TAG_RESULT" <<'PY'
 import json
 import sys
 
@@ -269,10 +269,10 @@ if [ "$PINS_SEEN" -eq 1 ]; then
     [ -f "$PINS_FILE" ] || die "pins file must be an existing regular file: $PINS_FILE"
     [ -r "$PINS_FILE" ] || die "pins file is not readable: $PINS_FILE"
     [ -r "$SCRIPT_DIR/check_release_pins.py" ] || die "release pins checker is missing"
-    PINS_RESULT=$(python3 -P "$SCRIPT_DIR/check_release_pins.py" \
+    PINS_RESULT=$(python3 -I "$SCRIPT_DIR/check_release_pins.py" \
         --pins "$PINS_FILE") \
         || die "release pins check failed"
-    python3 -P - "$PINS_RESULT" "$FLAVORS" \
+    python3 -I - "$PINS_RESULT" "$FLAVORS" \
         "$PACKAGE_PLAY" "$CERT_PLAY" \
         "$PACKAGE_FOSS" "$CERT_FOSS" \
         "$PACKAGE_GITHUB" "$CERT_GITHUB" <<'PY' || die "expected identity does not match release pins"

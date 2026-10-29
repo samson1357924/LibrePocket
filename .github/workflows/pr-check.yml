@@ -68,10 +68,15 @@ jobs:
               - 'scripts/tests/test_release_artifact_verifier.py'
               - 'scripts/tests/test_build_release_identity.py'
               - 'scripts/tests/test_gradle_wrapper_checksum.py'
+              - 'scripts/tests/test_verify_jdk_floor.py'
               # The PR workflow itself: wiring changes must run the harness
               # tests that pin the workflow wiring (defense in depth; a
               # workflow edit already counts as code, so Gradle stages run).
               - '.github/workflows/pr-check.yml'
+              # Sibling workflows that also invoke verify_jdk_floor.sh: the
+              # harness pins their vendor flag, so edits must re-run the gate.
+              - '.github/workflows/codeql.yml'
+              - '.github/workflows/nightly-instrumented.yml'
               # Trailing catch-all: the explicit entries above exist for
               # readability/history; this glob defaults new scripts/ harness
               # code (any new checker or script test) into the policy gate
@@ -111,6 +116,10 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '25'
+          check-latest: true
+
+      - name: Verify JDK 25 security floor (CVE-2026-91403)
+        run: bash scripts/verify_jdk_floor.sh --require-vendor Temurin
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
@@ -218,6 +227,10 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '25'
+          check-latest: true
+
+      - name: Verify JDK 25 security floor (CVE-2026-91403)
+        run: bash scripts/verify_jdk_floor.sh --require-vendor Temurin
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
@@ -252,7 +265,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Run APK policy and release-identity harnesses (stdlib only)
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py scripts/tests/test_gradle_wrapper_checksum.py
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py scripts/tests/test_gradle_wrapper_checksum.py scripts/tests/test_verify_jdk_floor.py
 
       # PR #87 P2-4: script-only diffs (code == false) skip the unit-tests job
       # that hosts the write-budget gate, so the repo-wide scan runs here too —
@@ -280,6 +293,10 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '25'
+          check-latest: true
+
+      - name: Verify JDK 25 security floor (CVE-2026-91403)
+        run: bash scripts/verify_jdk_floor.sh --require-vendor Temurin
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
@@ -476,10 +493,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Set up Node.js 24
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version-file: 'github_bot/.nvmrc'
 
       - name: Install locked dependencies
         working-directory: github_bot

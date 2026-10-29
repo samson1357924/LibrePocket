@@ -485,6 +485,9 @@ class CancelReceiptPreDispatchTest {
                 sessions.backfillFlags.size >= 2
             }
             awaitCond(10_000, "VM must reattach the same ledger") { vm.currentSessionId.value == oldId }
+            awaitCond(10_000, "VM must post HISTORY_SNAPSHOT_INCOMPLETE notice") {
+                vm.notice.value == "HISTORY_SNAPSHOT_INCOMPLETE"
+            }
             assertEquals(listOf(true, false), sessions.backfillFlags.toList())
             assertEquals("HISTORY_SNAPSHOT_INCOMPLETE", vm.notice.value)
             assertTrue(interruptedMarkers(inner, oldId).isEmpty())
@@ -527,6 +530,9 @@ class CancelReceiptPreDispatchTest {
                 sessions.backfillFlags.size >= 3
             }
             awaitCond(10_000, "VM must reattach the same ledger") { vm.currentSessionId.value == oldId }
+            awaitCond(10_000, "VM must post HISTORY_SNAPSHOT_INCOMPLETE notice") {
+                vm.notice.value == "HISTORY_SNAPSHOT_INCOMPLETE"
+            }
             assertEquals(
                 "expiry while the writer may still land its terminal must renew, not promote",
                 listOf(true, false, false),

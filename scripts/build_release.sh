@@ -19,6 +19,7 @@
 #
 # Usage:
 #   sh scripts/build_release.sh --apk [play] [foss] [github] \
+#     [--tag vX.Y.Z] [--pins /path/to/pins.json] \
 #     --expected-package play=PACKAGE --expected-version-code play=CODE \
 #     --expected-version-name play=NAME --expected-cert-sha256 play=HEX64 \
 #     --expected-package foss=PACKAGE --expected-version-code foss=CODE \
@@ -27,6 +28,14 @@
 #     --expected-version-name github=NAME --expected-cert-sha256 github=HEX64 \
 #     --apksigner /sdk/build-tools/VERSION/apksigner \
 #     --aapt /sdk/build-tools/VERSION/aapt --output-parent /existing/output-dir
+#
+# Preflight identity verification options:
+#   --tag vX.Y.Z
+#     Validates release tag format and consistency with app/build.gradle.kts
+#     (versionCode and versionName), and verifies matching expected values.
+#   --pins /path/to/pins.json
+#     Validates trusted signer-pin registry file (non-symlink) for selected
+#     flavors, and verifies matching expected package and cert SHA-256.
 #
 # Artifact identity must be supplied by the trusted caller; it is never inferred
 # from the candidate APK. Public release/publisher workflows remain disabled.
@@ -43,6 +52,10 @@ FLAVORS=""
 APKSIGNER=""
 AAPT=""
 OUTPUT_PARENT=""
+TAG=""
+PINS_FILE=""
+TAG_SEEN=0
+PINS_SEEN=0
 PACKAGE_PLAY=""; VERSION_CODE_PLAY=""; VERSION_NAME_PLAY=""; CERT_PLAY=""
 PACKAGE_FOSS=""; VERSION_CODE_FOSS=""; VERSION_NAME_FOSS=""; CERT_FOSS=""
 PACKAGE_GITHUB=""; VERSION_CODE_GITHUB=""; VERSION_NAME_GITHUB=""; CERT_GITHUB=""
@@ -79,6 +92,14 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --apk) WANT_APK=1; shift ;;
         --aab) die "AAB is unsupported; only final APK verification is implemented" ;;
+        --tag)
+            [ "$#" -ge 2 ] || die "--tag requires a release tag"
+            [ "$TAG_SEEN" -eq 0 ] || die "duplicate --tag"
+            TAG_SEEN=1; TAG=$2; shift 2 ;;
+        --pins)
+            [ "$#" -ge 2 ] || die "--pins requires a pins file"
+            [ "$PINS_SEEN" -eq 0 ] || die "duplicate --pins"
+            PINS_SEEN=1; PINS_FILE=$2; shift 2 ;;
         --expected-package)
             [ "$#" -ge 2 ] || die "--expected-package requires FLAVOR=PACKAGE"
             set_expected_identity package "$2"; shift 2 ;;
@@ -119,6 +140,8 @@ done
 if [ -z "$FLAVORS" ]; then
     FLAVORS="play foss github"
 fi
+set -- $FLAVORS
+FLAVORS="$*"
 
 # Reject unsupported mode and validate every trusted identity/tool/output input
 # before reading password variables, invoking Bitwarden, or starting Gradle.
@@ -186,6 +209,75 @@ for f in play foss github; do
             esac ;;
     esac
 done
+
+# --- optional release tag & signer-pins preflight verification -----------------
+if [ "$TAG_SEEN" -eq 1 ]; then
+    [ -n "$TAG" ] || die "--tag requires a non-empty tag"
+    [ -r "$SCRIPT_DIR/check_release_tag_version.py" ] || die "release tag/version checker is missing"
+    TAG_RESULT=$(python3 -P "$SCRIPT_DIR/check_release_tag_version.py" \
+        --tag "$TAG" \
+        --app-build-gradle "$ROOT/app/build.gradle.kts") \
+        || die "release tag/version check failed"
+    TAG_VARS=$(python3 -P - "$TAG_RESULT" <<'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+print(f"{data['versionName']} {data['versionCode']}")
+PY
+    ) || die "failed to parse tag check output"
+    TAG_VERSION_NAME=${TAG_VARS%% *}
+    TAG_VERSION_CODE=${TAG_VARS#* }
+    for f in $FLAVORS; do
+        case "$f" in
+            play) f_code="$VERSION_CODE_PLAY"; f_name="$VERSION_NAME_PLAY" ;;
+            foss) f_code="$VERSION_CODE_FOSS"; f_name="$VERSION_NAME_FOSS" ;;
+            github) f_code="$VERSION_CODE_GITHUB"; f_name="$VERSION_NAME_GITHUB" ;;
+        esac
+        [ "$f_name" = "$TAG_VERSION_NAME" ] \
+            || die "expected versionName for $f ($f_name) does not match tag versionName ($TAG_VERSION_NAME)"
+        [ "$f_code" = "$TAG_VERSION_CODE" ] \
+            || die "expected versionCode for $f ($f_code) does not match Gradle versionCode ($TAG_VERSION_CODE)"
+    done
+fi
+
+if [ "$PINS_SEEN" -eq 1 ]; then
+    [ -n "$PINS_FILE" ] || die "--pins requires a non-empty file path"
+    [ ! -L "$PINS_FILE" ] || die "pins file must not be a symlink: $PINS_FILE"
+    [ -f "$PINS_FILE" ] || die "pins file must be an existing regular file: $PINS_FILE"
+    [ -r "$PINS_FILE" ] || die "pins file is not readable: $PINS_FILE"
+    [ -r "$SCRIPT_DIR/check_release_pins.py" ] || die "release pins checker is missing"
+    PINS_RESULT=$(python3 -P "$SCRIPT_DIR/check_release_pins.py" \
+        --pins "$PINS_FILE" \
+        --require-flavors "$FLAVORS") \
+        || die "release pins check failed"
+    python3 -P - "$PINS_RESULT" "$FLAVORS" \
+        "$PACKAGE_PLAY" "$CERT_PLAY" \
+        "$PACKAGE_FOSS" "$CERT_FOSS" \
+        "$PACKAGE_GITHUB" "$CERT_GITHUB" <<'PY' || die "expected identity does not match release pins"
+import json
+import sys
+
+pins_json, flavors_str, pkg_play, cert_play, pkg_foss, cert_foss, pkg_github, cert_github = sys.argv[1:9]
+pins_data = json.loads(pins_json)["flavors"]
+expected = {
+    "play": (pkg_play, cert_play),
+    "foss": (pkg_foss, cert_foss),
+    "github": (pkg_github, cert_github),
+}
+for f in flavors_str.split():
+    if f not in pins_data:
+        raise SystemExit(f"missing pin entry for flavor: {f}")
+    exp_pkg, exp_cert = expected[f]
+    pin_entry = pins_data[f]
+    if exp_pkg != pin_entry["package"]:
+        raise SystemExit(
+            f"expected package for {f} ({exp_pkg}) does not match pinned package ({pin_entry['package']})"
+        )
+    if exp_cert.lower() != pin_entry["cert_sha256"].lower():
+        raise SystemExit(
+            f"expected cert SHA-256 for {f} ({exp_cert}) does not match pinned cert ({pin_entry['cert_sha256']})"
+        )
+PY
+fi
 
 # --- resolve passwords (env wins, else Bitwarden) ------------------------------
 need_bw=0

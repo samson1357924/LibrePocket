@@ -194,6 +194,17 @@ class ReleaseBuilderHarness(unittest.TestCase):
         shutil.copy2(BUILDER, self.root / "scripts" / "build_release.sh")
         shutil.copy2(VERIFIER, self.root / "scripts" / "verify_release_apk.py")
         shutil.copy2(STAGER, self.root / "scripts" / "release_artifact_stage.py")
+        shutil.copy2(TAG_CHECKER, self.root / "scripts" / "check_release_tag_version.py")
+        shutil.copy2(PINS_CHECKER, self.root / "scripts" / "check_release_pins.py")
+        (self.root / "app" / "build.gradle.kts").write_text(
+            "android {\n"
+            "    defaultConfig {\n"
+            "        versionCode = 7\n"
+            '        versionName = "1.2.3"\n'
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
 
         self.fake_bin = self.tmp / "bin"
         self.fake_bin.mkdir()
@@ -243,6 +254,27 @@ class ReleaseBuilderHarness(unittest.TestCase):
     def _write_executable(path: Path, content: str) -> None:
         path.write_text(content, encoding="utf-8")
         path.chmod(0o755)
+
+    def _create_pins_file(
+        self,
+        flavors: tuple[str, ...] = FLAVORS,
+        *,
+        override: dict[str, dict[str, str]] | None = None,
+        name: str = "signer-pins.json",
+    ) -> Path:
+        pins = {
+            flavor: {
+                "package": EXPECTED[flavor]["package"],
+                "cert_sha256": EXPECTED[flavor]["cert"],
+            }
+            for flavor in flavors
+        }
+        if override:
+            for k, v in override.items():
+                pins[k] = v
+        path = self.tmp / name
+        path.write_text(json.dumps(pins, indent=2), encoding="utf-8")
+        return path
 
     def _identity_args(self, flavors: tuple[str, ...] = FLAVORS) -> list[str]:
         args: list[str] = []
@@ -592,6 +624,154 @@ class ReleaseBuilderHarness(unittest.TestCase):
         first_root = json.loads(first.stdout.strip().splitlines()[-1])["outputDirectory"]
         second_root = json.loads(second.stdout.strip().splitlines()[-1])["outputDirectory"]
         self.assertNotEqual(first_root, second_root)
+
+    def test_valid_tag_and_pins_pass_preflight_and_build(self) -> None:
+        pins_file = self._create_pins_file()
+        command = self.command()
+        command.extend(("--tag", "v1.2.3", "--pins", str(pins_file)))
+
+        result = self.run_builder(command)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        response = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(response["status"], "ready")
+        self.assertEqual(set(response["flavors"]), set(FLAVORS))
+        self.assertEqual(len(self._output_roots()), 1)
+
+    def test_mismatched_expected_version_name_vs_tag_fails_preflight(self) -> None:
+        command = self.command()
+        command.extend(("--tag", "v1.2.3"))
+        idx = command.index("--expected-version-name")
+        command[idx + 1] = "play=1.2.4"
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+        self.assertIn("versionName", result.stdout)
+
+    def test_mismatched_expected_version_code_vs_gradle_fails_preflight(self) -> None:
+        command = self.command()
+        command.extend(("--tag", "v1.2.3"))
+        idx = command.index("--expected-version-code")
+        command[idx + 1] = "play=8"
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+        self.assertIn("versionCode", result.stdout)
+
+    def test_invalid_tag_format_fails_preflight(self) -> None:
+        for bad_tag in ("1.2.3", "v1.2", "v1.2.3-rc1", "v01.02.03", "not-a-tag", ""):
+            with self.subTest(tag=bad_tag):
+                command = self.command()
+                command.extend(("--tag", bad_tag))
+                result = self.run_builder(command, passwords=False)
+                self._assert_preflight_rejected(result)
+
+    def test_mismatched_tag_vs_gradle_fails_preflight(self) -> None:
+        command = self.command()
+        command.extend(("--tag", "v2.0.0"))
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+
+    def test_mismatched_expected_package_vs_pins_fails_preflight(self) -> None:
+        pins_file = self._create_pins_file()
+        command = self.command()
+        command.extend(("--pins", str(pins_file)))
+        idx = command.index("--expected-package")
+        command[idx + 1] = "play=dev.librepocket.wrong"
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+        self.assertIn("package", result.stdout)
+
+    def test_mismatched_expected_cert_sha256_vs_pins_fails_preflight(self) -> None:
+        pins_file = self._create_pins_file()
+        command = self.command()
+        command.extend(("--pins", str(pins_file)))
+        idx = command.index("--expected-cert-sha256")
+        command[idx + 1] = f"play={'44' * 32}"
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+        self.assertIn("cert", result.stdout.lower())
+
+    def test_missing_flavor_in_pins_file_fails_preflight(self) -> None:
+        pins_file = self._create_pins_file(flavors=("play", "foss"))
+        command = self.command()
+        command.extend(("--pins", str(pins_file)))
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+
+    def test_symlink_pins_file_fails_preflight(self) -> None:
+        pins_file = self._create_pins_file()
+        symlink_path = self.tmp / "pins-symlink.json"
+        symlink_path.symlink_to(pins_file)
+        command = self.command()
+        command.extend(("--pins", str(symlink_path)))
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+        self.assertIn("symlink", result.stdout.lower())
+
+    def test_duplicate_tag_or_pins_fails_preflight(self) -> None:
+        pins_file = self._create_pins_file()
+
+        command_tag = self.command()
+        command_tag.extend(("--tag", "v1.2.3", "--tag", "v1.2.3"))
+        result_tag = self.run_builder(command_tag, passwords=False)
+        self._assert_preflight_rejected(result_tag)
+        self.assertIn("duplicate --tag", result_tag.stdout)
+
+        command_pins = self.command()
+        command_pins.extend(("--pins", str(pins_file), "--pins", str(pins_file)))
+        result_pins = self.run_builder(command_pins, passwords=False)
+        self._assert_preflight_rejected(result_pins)
+        self.assertIn("duplicate --pins", result_pins.stdout)
+
+    def test_valid_preflight_with_missing_secrets_fails_closed_before_build(self) -> None:
+        pins_file = self._create_pins_file()
+        command = self.command()
+        command.extend(("--tag", "v1.2.3", "--pins", str(pins_file)))
+
+        result = self.run_builder(command, passwords=False)
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(self.gradle_log.exists(), "Gradle must not run when secrets are missing")
+        self.assertFalse(self.bw_log.exists(), "Bitwarden must not be queried when BW_SESSION is unset")
+        self.assertEqual(self._output_roots(), [], "preflight failure must not create output transaction")
+        self.assertNotIn("READY", result.stdout)
+        self.assertIn("BW_SESSION is not set", result.stdout)
+
+    def test_pins_case_insensitive_cert_sha256_matches(self) -> None:
+        pins_file = self._create_pins_file(
+            override={
+                "play": {
+                    "package": EXPECTED["play"]["package"],
+                    "cert_sha256": EXPECTED["play"]["cert"].upper(),
+                }
+            }
+        )
+        command = self.command()
+        command.extend(("--tag", "v1.2.3", "--pins", str(pins_file)))
+        result = self.run_builder(command)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        response = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(response["status"], "ready")
+
+    def test_missing_or_unreadable_pins_file_fails_preflight(self) -> None:
+        command = self.command()
+        command.extend(("--pins", str(self.tmp / "nonexistent-pins.json")))
+        result = self.run_builder(command, passwords=False)
+        self._assert_preflight_rejected(result)
 
 
 class PolicyTimeoutBudgetTest(unittest.TestCase):

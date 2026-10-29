@@ -1,270 +1,315 @@
 #!/usr/bin/env python3
-"""Supply-chain regression harness for Gradle wrapper integrity and checksum verification.
+"""Regression tests for wrapper bytes and the CI guard wiring (stdlib only)."""
 
-Pins:
-1. gradle/wrapper/gradle-wrapper.properties defines distributionSha256Sum.
-2. distributionSha256Sum matches the canonical Gradle 9.7.1 distribution checksum:
-   acd53f1edaf02f1a8ff99879f8a34b302661a057d9b063ae9e35b552f804d20a.
-3. gradle/wrapper/gradle-wrapper.jar SHA-256 matches the official 9.7.1 wrapper jar:
-   7a9ce74cff467ca1bf60a4fcd9f05185acceda4d0f382434d393e17864262c5d.
-4. validateDistributionUrl is set to 'true'.
-5. networkTimeout is set to '10000'.
-6. Simulated tampering (negative controls): any mismatch or missing security parameter
-   is detected and rejected (fail-closed).
-
-Run with: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_gradle_wrapper_checksum.py
-"""
-
-from __future__ import annotations
-
+import fnmatch
 import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-CANONICAL_GRADLE_DISTRIBUTION_SHA256 = (
-    "acd53f1edaf02f1a8ff99879f8a34b302661a057d9b063ae9e35b552f804d20a"
-)
-OFFICIAL_GRADLE_WRAPPER_JAR_SHA256 = (
-    "7a9ce74cff467ca1bf60a4fcd9f05185acceda4d0f382434d393e17864262c5d"
-)
-EXPECTED_VALIDATE_DISTRIBUTION_URL = "true"
-EXPECTED_NETWORK_TIMEOUT = "10000"
-
 ROOT = Path(__file__).resolve().parents[2]
-PROPERTIES_PATH = ROOT / "gradle" / "wrapper" / "gradle-wrapper.properties"
-WRAPPER_JAR_PATH = ROOT / "gradle" / "wrapper" / "gradle-wrapper.jar"
+CHECKER = ROOT / "scripts/verify_gradle_wrapper.py"
+FILES = ("gradlew", "gradlew.bat", "gradle/wrapper/gradle-wrapper.jar",
+         "gradle/wrapper/gradle-wrapper.properties")
+WORKFLOWS = {
+    "pr-check.yml": {"unit-tests", "lint", "build-and-policy-gate"},
+    "codeql.yml": {"codeql"},
+    "nightly-instrumented.yml": {"nightly-unit-stress", "instrumented-test"},
+}
+# Review every workflow change, including new files and indirect invocations.
+# This is a change-detection convention, not a shell/action call-graph analysis.
+WORKFLOW_SNAPSHOTS = {
+    "codeql.yml": "1f37e9b4fe81cd4b5024302a4b06d16ff51b585ef764ee3b539f9c054398866a",
+    "nightly-instrumented.yml": "8c263fa80c95f5de6f7e97dd94101f0c2e7785cce7fd6f0b8efd9be56893f782",
+    "pocketguard.yml": "9e6d291fe012a4932126c5dba96d0a27e1c68299bbbb1847ea8ab4d69db87df6",
+    "pr-check.yml": "c7392b7b9eabbafc96e4fbf6d937a46f3af1bb34f1d7a426b3cb49af6451892f",
+    "release.yml": "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f",
+    "security-audit.yml": "f836a7d3ed4daf6ecec33baf577375bca6504513d54c89e2d2cb6da4d5d83bfa",
+}
 
 
-def parse_properties(text: str) -> dict[str, str]:
-    """Parse Java .properties file ignoring blank lines and comments (# or !)."""
-    props: dict[str, str] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith(("#", "!")):
-            continue
-        if "=" in line:
-            k, v = line.split("=", 1)
-            props[k.strip()] = v.strip()
-        elif ":" in line:
-            k, v = line.split(":", 1)
-            props[k.strip()] = v.strip()
-    return props
+def workflow_snapshots(directory):
+    return {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in directory.iterdir() if p.suffix.lower() in (".yml", ".yaml")}
 
 
-def compute_sha256(path: Path) -> str:
-    """Compute lowercase SHA-256 hex digest of a file."""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while chunk := f.read(65536):
-            h.update(chunk)
-    return h.hexdigest().lower()
+def workflow_jobs(text):
+    return dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", text))
 
 
-def verify_wrapper_integrity(
-    properties_path: Path,
-    jar_path: Path,
-    *,
-    expected_distribution_sha256: str = CANONICAL_GRADLE_DISTRIBUTION_SHA256,
-    expected_jar_sha256: str = OFFICIAL_GRADLE_WRAPPER_JAR_SHA256,
-    expected_validate_url: str = EXPECTED_VALIDATE_DISTRIBUTION_URL,
-    expected_network_timeout: str = EXPECTED_NETWORK_TIMEOUT,
-) -> list[str]:
-    """Fail-closed integrity check for Gradle wrapper properties and jar.
+def valid_guard(job):
+    # Include unnamed run/uses steps as well as named steps. Snapshots require
+    # human review for indirect invocations; this check covers literal calls.
+    steps = re.split(r"(?m)^      - ", job)[1:]
+    guards = [i for i, step in enumerate(steps) if step.splitlines()[0] == "name: Verify Gradle wrapper integrity"]
+    setups = [i for i, step in enumerate(steps) if re.search(
+        r"(?m)^(?:uses:|        uses:) gradle/actions/setup-gradle@", step)]
+    invocations = [i for i, step in enumerate(steps) if "./gradlew" in step]
+    if len(guards) != 1 or not setups or not invocations:
+        return False
+    if any(guards[0] >= i for i in setups + invocations):
+        return False
+    # An explicit status function (e.g. always() or failure()) can run after a
+    # failed guard. Reject all explicit conditions on protected steps rather
+    # than attempting to interpret the Actions expression language.
+    if any(re.search(r"(?m)^(?:if:|        if:)", steps[i]) for i in setups + invocations):
+        return False
+    step = steps[guards[0]]
+    return bool(re.search(r"(?m)^        run: python3 scripts/verify_gradle_wrapper\.py$", step)) and not re.search(
+        r"(?m)^        (?:if|continue-on-error|working-directory|shell):", step
+    )
 
-    Returns a list of error descriptions; an empty list indicates full integrity.
-    """
-    errors: list[str] = []
-    if not properties_path.is_file():
-        errors.append(f"Missing gradle-wrapper.properties at {properties_path}")
-        return errors
 
-    content = properties_path.read_text(encoding="utf-8")
-    props = parse_properties(content)
-
-    # 1. distributionSha256Sum presence and match
-    if "distributionSha256Sum" not in props:
-        errors.append("gradle-wrapper.properties is missing 'distributionSha256Sum'")
-    else:
-        actual_dist_sum = props["distributionSha256Sum"].lower()
-        if actual_dist_sum != expected_distribution_sha256.lower():
-            errors.append(
-                f"distributionSha256Sum mismatch: expected {expected_distribution_sha256}, "
-                f"got {actual_dist_sum}"
-            )
-
-    # 2. validateDistributionUrl check
-    actual_validate_url = props.get("validateDistributionUrl")
-    if actual_validate_url != expected_validate_url:
-        errors.append(
-            f"validateDistributionUrl must be {expected_validate_url!r}, "
-            f"got {actual_validate_url!r}"
-        )
-
-    # 3. networkTimeout check
-    actual_timeout = props.get("networkTimeout")
-    if actual_timeout != expected_network_timeout:
-        errors.append(
-            f"networkTimeout must be {expected_network_timeout!r}, "
-            f"got {actual_timeout!r}"
-        )
-
-    # 4. wrapper jar existence and sha256 check
-    if not jar_path.is_file():
-        errors.append(f"Missing gradle-wrapper.jar at {jar_path}")
-    else:
-        actual_jar_sha = compute_sha256(jar_path)
-        if actual_jar_sha != expected_jar_sha256.lower():
-            errors.append(
-                f"gradle-wrapper.jar SHA-256 mismatch: expected {expected_jar_sha256}, "
-                f"got {actual_jar_sha}"
-            )
-
-    return errors
+def canonical_properties(content):
+    """Independently require the complete reviewed Java properties format."""
+    return content == (
+        b"distributionBase=GRADLE_USER_HOME\n"
+        b"distributionPath=wrapper/dists\n"
+        b"distributionSha256Sum=acd53f1edaf02f1a8ff99879f8a34b302661a057d9b063ae9e35b552f804d20a\n"
+        b"distributionUrl=https\\://services.gradle.org/distributions/gradle-9.7.1-bin.zip\n"
+        b"networkTimeout=10000\n"
+        b"retries=0\n"
+        b"retryBackOffMs=500\n"
+        b"validateDistributionUrl=true\n"
+        b"zipStoreBase=GRADLE_USER_HOME\n"
+        b"zipStorePath=wrapper/dists\n"
+    )
 
 
 class GradleWrapperChecksumTest(unittest.TestCase):
-    """Test verification and fail-closed security invariants for the Gradle wrapper."""
+    def run_checker(self, root):
+        return subprocess.run([sys.executable, str(CHECKER), "--root", str(root)],
+                              capture_output=True, text=True, check=False)
 
-    def test_repo_wrapper_properties_exists(self) -> None:
-        self.assertTrue(
-            PROPERTIES_PATH.is_file(),
-            f"Expected gradle-wrapper.properties at {PROPERTIES_PATH}",
-        )
+    def copy_wrapper(self, root):
+        for name in FILES:
+            target = root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT / name, target)
 
-    def test_repo_wrapper_properties_contains_distribution_sha256(self) -> None:
-        props = parse_properties(PROPERTIES_PATH.read_text(encoding="utf-8"))
-        self.assertIn(
-            "distributionSha256Sum",
-            props,
-            "gradle-wrapper.properties must contain 'distributionSha256Sum'",
-        )
-        self.assertEqual(len(props["distributionSha256Sum"]), 64)
+    def test_reviewed_repo_passes(self):
+        result = self.run_checker(ROOT)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_repo_distribution_sha256_matches_canonical_gradle_9_7_1(self) -> None:
-        props = parse_properties(PROPERTIES_PATH.read_text(encoding="utf-8"))
-        self.assertEqual(
-            props.get("distributionSha256Sum", "").lower(),
-            CANONICAL_GRADLE_DISTRIBUTION_SHA256.lower(),
-            "distributionSha256Sum does not match canonical Gradle 9.7.1 distribution checksum",
-        )
+    def test_reviewed_properties_and_official_generated_bytes(self):
+        expected = {
+            "gradlew": "a5a5c199ba02189ae8c46a334223371a20599d9c298ef65e7540ede4a3f72d59",
+            "gradlew.bat": "d539676c48b596afda64c963ec8f7ee56c7b3fe7e3b81d1dbe2d1a1e3dd9e9f8",
+            "gradle/wrapper/gradle-wrapper.jar": "7a9ce74cff467ca1bf60a4fcd9f05185acceda4d0f382434d393e17864262c5d",
+            "gradle/wrapper/gradle-wrapper.properties": "d0bebe8133babb74ab29a31ee6616c56ef8985fc801e1fd16c61b5ed2189e907",
+        }
+        for name, digest in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(hashlib.sha256((ROOT / name).read_bytes()).hexdigest(), digest)
 
-    def test_repo_wrapper_jar_sha256_matches_official_gradle_9_7_1(self) -> None:
-        self.assertTrue(
-            WRAPPER_JAR_PATH.is_file(),
-            f"Expected gradle-wrapper.jar at {WRAPPER_JAR_PATH}",
-        )
-        actual_sha256 = compute_sha256(WRAPPER_JAR_PATH)
-        self.assertEqual(
-            actual_sha256,
-            OFFICIAL_GRADLE_WRAPPER_JAR_SHA256.lower(),
-            "gradle-wrapper.jar SHA-256 does not match official Gradle 9.7.1 wrapper jar",
-        )
+    def test_canonical_properties_independent_of_digest(self):
+        original = (ROOT / FILES[-1]).read_bytes()
+        self.assertTrue(canonical_properties(original))
+        for old, new in (
+            (b"gradle-9.7.1-bin.zip", b"gradle-9.7.1-all.zip"),
+            (b"acd53f1edaf02f1a8ff99879f8a34b302661a057d9b063ae9e35b552f804d20a", b"0" * 64),
+            (b"validateDistributionUrl=true", b"validateDistributionUrl=false"),
+            (b"networkTimeout=10000", b"networkTimeout=30000"),
+        ):
+            with self.subTest(old=old):
+                mutated = original.replace(old, new)
+                self.assertNotEqual(mutated, original)
+                # Even if both digest pins were updated to the new bytes, the
+                # independent canonical values still reject the mutation.
+                self.assertFalse(canonical_properties(mutated))
 
-    def test_repo_wrapper_properties_security_settings(self) -> None:
-        props = parse_properties(PROPERTIES_PATH.read_text(encoding="utf-8"))
-        self.assertEqual(
-            props.get("validateDistributionUrl"),
-            EXPECTED_VALIDATE_DISTRIBUTION_URL,
-            "validateDistributionUrl must be 'true'",
-        )
-        self.assertEqual(
-            props.get("networkTimeout"),
-            EXPECTED_NETWORK_TIMEOUT,
-            "networkTimeout must be '10000'",
-        )
+    def test_each_file_missing_or_modified_fails_cli(self):
+        for name in FILES:
+            for mutation in ("missing", "tampered"):
+                with self.subTest(name=name, mutation=mutation), tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    self.copy_wrapper(root)
+                    path = root / name
+                    if mutation == "missing":
+                        path.unlink()
+                    else:
+                        path.write_bytes(path.read_bytes() + b"\n# tampered\n")
+                    result = self.run_checker(root)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(name, result.stderr)
 
-    def test_repo_wrapper_passes_full_integrity_check(self) -> None:
-        errors = verify_wrapper_integrity(PROPERTIES_PATH, WRAPPER_JAR_PATH)
-        self.assertEqual(errors, [], f"Wrapper integrity failed: {errors}")
+    def test_symlink_and_nonregular_pinned_files_fail(self):
+        for name in FILES:
+            for mutation in ("symlink", "directory", "fifo"):
+                with self.subTest(name=name, mutation=mutation), tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    self.copy_wrapper(root)
+                    path = root / name
+                    if mutation == "symlink":
+                        target = root / "identical-copy"
+                        shutil.copyfile(path, target)
+                        path.unlink()
+                        path.symlink_to(target)
+                    else:
+                        path.unlink()
+                        if mutation == "directory":
+                            path.mkdir()
+                        else:
+                            os.mkfifo(path)
+                    result = self.run_checker(root)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(name, result.stderr)
 
-    def test_tampered_distribution_sha256_is_detected_and_rejected(self) -> None:
+    def test_symlinked_wrapper_parents_and_root_fail(self):
+        for name in ("gradle", "gradle/wrapper"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as td:
+                root = Path(td) / "checkout"
+                root.mkdir()
+                self.copy_wrapper(root)
+                path = root / name
+                target = path.with_name(path.name + "-real")
+                path.rename(target)
+                path.symlink_to(target, target_is_directory=True)
+                self.assertNotEqual(self.run_checker(root).returncode, 0)
         with tempfile.TemporaryDirectory() as td:
-            fake_props = Path(td) / "gradle-wrapper.properties"
-            tampered_sha = "0" * 64
-            fake_props.write_text(
-                f"distributionBase=GRADLE_USER_HOME\n"
-                f"distributionPath=wrapper/dists\n"
-                f"distributionSha256Sum={tampered_sha}\n"
-                f"distributionUrl=https\\://services.gradle.org/distributions/gradle-9.7.1-bin.zip\n"
-                f"networkTimeout=10000\n"
-                f"validateDistributionUrl=true\n",
-                encoding="utf-8",
-            )
-            errors = verify_wrapper_integrity(fake_props, WRAPPER_JAR_PATH)
-            self.assertTrue(
-                any("distributionSha256Sum mismatch" in e for e in errors),
-                f"Expected distributionSha256Sum mismatch error, got: {errors}",
-            )
+            root = Path(td) / "checkout"
+            root.mkdir()
+            self.copy_wrapper(root)
+            link = Path(td) / "link"
+            link.symlink_to(root, target_is_directory=True)
+            self.assertNotEqual(self.run_checker(link).returncode, 0)
 
-    def test_missing_distribution_sha256_is_detected_and_rejected(self) -> None:
+    def test_launcher_symlink_to_identical_bytes_beside_unverified_wrapper_fails(self):
         with tempfile.TemporaryDirectory() as td:
-            fake_props = Path(td) / "gradle-wrapper.properties"
-            fake_props.write_text(
-                f"distributionBase=GRADLE_USER_HOME\n"
-                f"distributionPath=wrapper/dists\n"
-                f"distributionUrl=https\\://services.gradle.org/distributions/gradle-9.7.1-bin.zip\n"
-                f"networkTimeout=10000\n"
-                f"validateDistributionUrl=true\n",
-                encoding="utf-8",
-            )
-            errors = verify_wrapper_integrity(fake_props, WRAPPER_JAR_PATH)
-            self.assertTrue(
-                any("missing 'distributionSha256Sum'" in e for e in errors),
-                f"Expected missing distributionSha256Sum error, got: {errors}",
-            )
+            root = Path(td) / "checkout"
+            root.mkdir()
+            self.copy_wrapper(root)
+            alternate = Path(td) / "alternate"
+            alternate.mkdir()
+            shutil.copyfile(root / "gradlew", alternate / "gradlew")
+            (alternate / "gradle/wrapper").mkdir(parents=True)
+            (alternate / "gradle/wrapper/gradle-wrapper.jar").write_bytes(b"unverified jar")
+            (alternate / "gradle/wrapper/gradle-wrapper.properties").write_bytes(b"unverified properties")
+            (root / "gradlew").unlink()
+            (root / "gradlew").symlink_to(alternate / "gradlew")
+            result = self.run_checker(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("gradlew", result.stderr)
 
-    def test_tampered_wrapper_jar_is_detected_and_rejected(self) -> None:
+    def test_all_workflows_require_review_on_change(self):
+        directory = ROOT / ".github/workflows"
+        self.assertEqual(workflow_snapshots(directory), WORKFLOW_SNAPSHOTS,
+                         "Review workflow changes, including indirect Gradle calls, and update snapshots")
         with tempfile.TemporaryDirectory() as td:
-            fake_jar = Path(td) / "gradle-wrapper.jar"
-            fake_jar.write_bytes(b"tampered content")
-            errors = verify_wrapper_integrity(PROPERTIES_PATH, fake_jar)
-            self.assertTrue(
-                any("gradle-wrapper.jar SHA-256 mismatch" in e for e in errors),
-                f"Expected gradle-wrapper.jar SHA-256 mismatch error, got: {errors}",
-            )
+            copy = Path(td)
+            for path in directory.iterdir():
+                if path.suffix.lower() in (".yml", ".yaml"):
+                    shutil.copyfile(path, copy / path.name)
+            self.assertEqual(workflow_snapshots(copy), WORKFLOW_SNAPSHOTS)
+            new = copy / "new.yaml"
+            new.write_text("jobs:\n  build:\n    steps:\n      - run: bash scripts/build_release.sh\n")
+            self.assertNotEqual(workflow_snapshots(copy), WORKFLOW_SNAPSHOTS)
+            new.unlink()
+            path = copy / "release.yml"
+            path.write_text(path.read_text() + "\n# indirect invocation\n# bash scripts/build_release.sh\n")
+            self.assertNotEqual(workflow_snapshots(copy), WORKFLOW_SNAPSHOTS)
+            path.unlink()
+            self.assertNotEqual(workflow_snapshots(copy), WORKFLOW_SNAPSHOTS)
 
-    def test_tampered_validate_distribution_url_is_detected_and_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            fake_props = Path(td) / "gradle-wrapper.properties"
-            fake_props.write_text(
-                f"distributionSha256Sum={CANONICAL_GRADLE_DISTRIBUTION_SHA256}\n"
-                f"distributionUrl=https\\://services.gradle.org/distributions/gradle-9.7.1-bin.zip\n"
-                f"networkTimeout=10000\n"
-                f"validateDistributionUrl=false\n",
-                encoding="utf-8",
-            )
-            errors = verify_wrapper_integrity(fake_props, WRAPPER_JAR_PATH)
-            self.assertTrue(
-                any("validateDistributionUrl" in e for e in errors),
-                f"Expected validateDistributionUrl error, got: {errors}",
-            )
+    def test_java_properties_ambiguities_rejected(self):
+        original = (ROOT / FILES[-1]).read_bytes()
+        variants = (
+            original + b"distributionUrl=https\\://evil.example/gradle.zip\n",
+            original + b"distribution\\u0055rl=https\\://evil.example/gradle.zip\n",
+            original + b"unknownKey=value\n",
+            original.replace(b"distributionUrl=https", b"distributionUrl=\\\n  https"),
+            original.replace(b"distributionSha256Sum=", b"distributionSha256Sum=0"),
+            original.replace(b"validateDistributionUrl=true", b"validateDistributionUrl=false"),
+            original.replace(b"networkTimeout=10000", b"networkTimeout=30000"),
+        )
+        for content in variants:
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as td:
+                self.assertNotEqual(content, original, "mutation must change the properties")
+                # This must fail even if both whole-file digest pins are updated.
+                self.assertFalse(canonical_properties(content))
+                root = Path(td)
+                self.copy_wrapper(root)
+                (root / FILES[-1]).write_bytes(content)
+                self.assertNotEqual(self.run_checker(root).returncode, 0)
 
-    def test_tampered_network_timeout_is_detected_and_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            fake_props = Path(td) / "gradle-wrapper.properties"
-            fake_props.write_text(
-                f"distributionSha256Sum={CANONICAL_GRADLE_DISTRIBUTION_SHA256}\n"
-                f"distributionUrl=https\\://services.gradle.org/distributions/gradle-9.7.1-bin.zip\n"
-                f"networkTimeout=30000\n"
-                f"validateDistributionUrl=true\n",
-                encoding="utf-8",
-            )
-            errors = verify_wrapper_integrity(fake_props, WRAPPER_JAR_PATH)
-            self.assertTrue(
-                any("networkTimeout" in e for e in errors),
-                f"Expected networkTimeout error, got: {errors}",
-            )
+    def test_workflow_job_guards_and_negative_controls(self):
+        for filename, expected in WORKFLOWS.items():
+            jobs = workflow_jobs((ROOT / ".github/workflows" / filename).read_text())
+            executing = {name for name, job in jobs.items() if "./gradlew" in job}
+            self.assertEqual(executing, expected)
+            for name in expected:
+                with self.subTest(workflow=filename, job=name):
+                    job = jobs[name]
+                    self.assertTrue(valid_guard(job))
+                    command = "run: python3 scripts/verify_gradle_wrapper.py"
+                    for replacement in ("run: true", command + "\n        continue-on-error: true", command + "\n        if: false"):
+                        mutated = job.replace(command, replacement)
+                        self.assertNotEqual(mutated, job)
+                        self.assertFalse(valid_guard(mutated))
+                    guard = "      - name: Verify Gradle wrapper integrity\n        run: python3 scripts/verify_gradle_wrapper.py\n\n"
+                    self.assertIn(guard, job)
+                    mutated = job.replace(guard, "") + "\n" + guard
+                    self.assertNotEqual(mutated, job)
+                    self.assertFalse(valid_guard(mutated))
+                    setup = "      - name: Setup Gradle\n"
+                    self.assertIn(setup, job)
+                    # Move the guard just after setup instead, but before calls.
+                    setup_step = re.search(r"(?ms)^      - name: Setup Gradle\n.*?(?=^      - |\Z)", job).group()
+                    mutated = job.replace(guard, "").replace(setup_step, setup_step + guard)
+                    self.assertNotEqual(mutated, job)
+                    self.assertFalse(valid_guard(mutated))
+                    steps = re.split(r"(?m)^      - ", job)[1:]
+                    protected = [step for step in steps if "./gradlew" in step or "gradle/actions/setup-gradle@" in step]
+                    for step in protected:
+                        for condition in ("always()", "failure()", "${{ always() }}"):
+                            replacement = step.replace("\n", "\n        if: " + condition + "\n", 1)
+                            mutated = job.replace("      - " + step, "      - " + replacement)
+                            self.assertNotEqual(mutated, job)
+                            self.assertFalse(valid_guard(mutated))
+                    extra = "      - run: ./gradlew help\n"
+                    mutated = job.replace(guard, extra + guard)
+                    self.assertNotEqual(mutated, job)
+                    self.assertFalse(valid_guard(mutated))
+                    # A later second invocation must be checked too, even if
+                    # the original invocation is properly guarded.
+                    mutated = job + "\n      - run: ./gradlew help\n        if: failure()\n"
+                    self.assertNotEqual(mutated, job)
+                    self.assertFalse(valid_guard(mutated))
 
-    def test_missing_files_fail_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            nonexistent_props = Path(td) / "does_not_exist.properties"
-            nonexistent_jar = Path(td) / "does_not_exist.jar"
-            errors_props = verify_wrapper_integrity(nonexistent_props, WRAPPER_JAR_PATH)
-            self.assertTrue(any("Missing gradle-wrapper.properties" in e for e in errors_props))
-
-            errors_jar = verify_wrapper_integrity(PROPERTIES_PATH, nonexistent_jar)
-            self.assertTrue(any("Missing gradle-wrapper.jar" in e for e in errors_jar))
+    def test_launcher_only_filters_and_gate(self):
+        text = (ROOT / ".github/workflows/pr-check.yml").read_text()
+        for key in ("code", "policy"):
+            section = re.search(rf"(?ms)^            {key}:\n(.*?)(?=^            \w+:)", text).group(1)
+            patterns = re.findall(r"(?m)^\s+- '([^']+)'$", section)
+            for name in FILES[:2]:
+                self.assertTrue(any(fnmatch.fnmatchcase(name, p) for p in patterns), (key, name))
+                self.assertFalse(any(fnmatch.fnmatchcase(name, p) for p in patterns if p != name), (key, name))
+            if key == "policy":
+                self.assertIn(".github/workflows/**", patterns)
+                for workflow in WORKFLOW_SNAPSHOTS:
+                    self.assertTrue(any(fnmatch.fnmatchcase(".github/workflows/" + workflow, p) for p in patterns))
+                self.assertTrue(any(fnmatch.fnmatchcase(".github/workflows/new.yaml", p) for p in patterns))
+        jobs = workflow_jobs(text)
+        self.assertIn("needs.changes.outputs.code == 'true'", jobs["unit-tests"])
+        self.assertIn("needs.changes.outputs.code == 'true'", jobs["lint"])
+        self.assertIn("needs.changes.outputs.policy == 'true'", jobs["policy-harness"])
+        self.assertIn("needs.changes.outputs.policy == 'true'", jobs["build-and-policy-gate"])
+        gate = jobs["pr-gate"]
+        script = gate.split("        run: |\n", 1)[1]
+        script = "\n".join(line[10:] for line in script.splitlines())
+        env = dict(os.environ, CHANGES_RESULT="success", DOCS="success", CODE="true",
+                   POLICY="true", UNIT="success", LINT="success", BUILD="success",
+                   HARNESS="success", BOT="skipped", BOT_PATHS="false")
+        self.assertEqual(subprocess.run(["bash", "-c", script], env=env, capture_output=True).returncode, 0)
+        for job in ("UNIT", "LINT", "BUILD", "HARNESS"):
+            for status in ("skipped", "failure"):
+                with self.subTest(job=job, status=status):
+                    self.assertNotEqual(subprocess.run(["bash", "-c", script], env=dict(env, **{job: status}), capture_output=True).returncode, 0)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@
 
 ## Build and test
 
-Use the checked-in Gradle wrapper and versions. See [Build Environment](docs/ENV.md) and [Testing](docs/TESTING.md) for commands, CI scope, and device-test limitations. Run only the checks relevant to the change, record exactly what ran and its result, and do not describe unrun checks as passing. On constrained machines, serialize Gradle/test execution and use `--max-workers=1 --no-daemon`.
+Use the checked-in Gradle wrapper and versions. See [Build Environment](docs/ENV.md) and [Testing](docs/TESTING.md) for commands, CI scope, and device-test limitations. For dependency and toolchain updates, see the supply chain and update policy in [Build Environment](docs/ENV.md#supply-chain-and-dependency-update-policy). Run only the checks relevant to the change, record exactly what ran and its result, and do not describe unrun checks as passing. On constrained machines, serialize Gradle/test execution and use `--max-workers=1 --no-daemon`.
 
 ## Review expectations
 
@@ -24,6 +24,7 @@ Use the checked-in Gradle wrapper and versions. See [Build Environment](docs/ENV
 - Preserve flavor boundaries and default-off behavior for high-risk capabilities. Declaring or projecting a tool does not make it executable.
 - A reviewer should inspect the complete diff, including generated or staged files. Do not commit local agent instructions or secrets.
 - Documentation-only changes should receive a static link and claim check; they do not require a Gradle run unless the change affects build inputs.
+- Dependency and supply-chain updates (including automated Dependabot PRs) must follow the verification protocol and commit-SHA pinning rules documented in [Supply Chain and Dependency Update Policy](docs/ENV.md#supply-chain-and-dependency-update-policy).
 
 ## Security findings
 

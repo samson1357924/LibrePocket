@@ -42,11 +42,18 @@ jobs:
               - 'app/build.gradle.kts'
               - 'app/lint.xml'
               - 'gradle/**'
+              - 'gradlew'
+              - 'gradlew.bat'
               - 'settings.gradle.kts'
               - 'build.gradle.kts'
               - 'gradle.properties'
               - '.github/workflows/pr-check.yml'
             policy:
+              # The harness runs in parallel; each Gradle job also checks its
+              # own wrapper before invoking Gradle.
+              - 'gradle/wrapper/**'
+              - 'gradlew'
+              - 'gradlew.bat'
               - 'scripts/play_policy_check.sh'
               - 'scripts/apk_policy_inspect.py'
               - 'scripts/backup_rules_check.py'
@@ -77,6 +84,8 @@ jobs:
               # harness pins their vendor flag, so edits must re-run the gate.
               - '.github/workflows/codeql.yml'
               - '.github/workflows/nightly-instrumented.yml'
+              # Any workflow edit must run the workflow review snapshot tests.
+              - '.github/workflows/**'
               # Trailing catch-all: the explicit entries above exist for
               # readability/history; this glob defaults new scripts/ harness
               # code (any new checker or script test) into the policy gate
@@ -120,6 +129,9 @@ jobs:
 
       - name: Verify JDK 25 security floor (CVE-2026-91403)
         run: bash scripts/verify_jdk_floor.sh --require-vendor Temurin
+
+      - name: Verify Gradle wrapper integrity
+        run: python3 scripts/verify_gradle_wrapper.py
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
@@ -232,6 +244,9 @@ jobs:
       - name: Verify JDK 25 security floor (CVE-2026-91403)
         run: bash scripts/verify_jdk_floor.sh --require-vendor Temurin
 
+      - name: Verify Gradle wrapper integrity
+        run: python3 scripts/verify_gradle_wrapper.py
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
         with:
@@ -297,6 +312,9 @@ jobs:
 
       - name: Verify JDK 25 security floor (CVE-2026-91403)
         run: bash scripts/verify_jdk_floor.sh --require-vendor Temurin
+
+      - name: Verify Gradle wrapper integrity
+        run: python3 scripts/verify_gradle_wrapper.py
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
@@ -439,7 +457,7 @@ jobs:
       # live in scripts/requirements-docs.txt (cp310-cp314 manylinux x86_64
       # wheels + sdist); `pip install --hash` is not a CLI option, so the pin
       # must be consumed as a requirements file. --ignore-installed forces
-      # downloading the hashed artifact even when the runner already has
+      # selecting a hashed artifact even when the runner already has
       # PyYAML 6.0.3 (otherwise no hash is checked); the exact version
       # assertion below remains fail-closed.
       - name: Install pinned PyYAML
@@ -451,6 +469,9 @@ jobs:
           set -euo pipefail
           python3 -m pip install --user --disable-pip-version-check --ignore-installed --require-hashes -r scripts/requirements-docs.txt
           python3 -c 'import yaml; assert yaml.__version__ == "6.0.3", yaml.__version__'
+
+      - name: Validate Dependabot and docs dependency policy
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_dependabot_config.py
 
       # Fixture self-test first (D-02): proves the guard still rejects each
       # enumerated zero-wiring bypass surface — manifest registration parsed as

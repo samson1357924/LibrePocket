@@ -919,7 +919,8 @@ python3 scripts/check_release_pins.py --pins /path/to/release_signer_pins.json \
   --require-flavors 'play foss github'
 
 # Tag <-> Gradle version consistency (tag supplied by the trusted caller;
-# tag must equal the current versionName — replace v0.1.0 when it bumps).
+# tag must equal the literal defaultConfig versionName — replace v0.1.0 when it bumps).
+# This static check does not resolve variant overrides; verify the final APK identity.
 python3 scripts/check_release_tag_version.py \
   --tag v0.1.0 --app-build-gradle app/build.gradle.kts
 

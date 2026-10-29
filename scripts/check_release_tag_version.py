@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Check release tag <-> Gradle version consistency (fail-closed, no secrets).
 
-Rule: a release tag ``vX.Y.Z`` must exactly equal the ``versionName`` in
-``app/build.gradle.kts`` (pure ``X.Y.Z`` semver, no suffix), and
+Rule: a release tag ``vX.Y.Z`` must exactly equal the literal ``versionName``
+in ``android.defaultConfig`` (pure ``X.Y.Z`` semver, no suffix), and
 ``versionCode`` must be a positive Android integer (1..2147483647).
+
+This conservative static check does not evaluate Gradle or resolve variant,
+plugin, or other overrides. Verify the final APK's identity independently.
 
 Usage::
 
@@ -48,20 +51,25 @@ def _strip_kotlin_comments(text: str) -> str:
     so commented-out literals can never satisfy the exactly-one gate.
     Double-quoted and triple-quoted strings as well as character literals
     are preserved, so ``//`` or ``/*`` inside a version string is never
-    treated as a comment. Unterminated block comments blank through EOF;
-    unterminated strings/literals are preserved as-is (still fail-closed
-    via the exactly-one gate).
+    treated as a comment. Unterminated literals and comments are rejected.
+    Braced string templates other than simple identifiers are unsupported
+    anywhere: their expressions can contain arbitrary Kotlin and strings.
     """
     out = list(text)
     i, n = 0, len(text)
     while i < n:
         if text.startswith('"""', i):
             end = text.find('"""', i + 3)
-            i = n if end == -1 else end + 3
+            if end == -1:
+                raise TagVersionError("unterminated raw string")
+            if "${" in re.sub(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", "", text[i + 3:end]):
+                raise TagVersionError("braced string templates are unsupported")
+            i = end + 3
         elif text[i] == "'":
             # Kotlin character literal ('a', '\'', '\\', '\uXXXX'): skip it
             # so a '"' inside never opens a phantom string.
             i += 1
+            closed = False
             while i < n and text[i] != "\n":
                 if text[i] == "\\":
                     nxt = text[i + 1 : i + 2]
@@ -75,11 +83,15 @@ def _strip_kotlin_comments(text: str) -> str:
                         i += 2
                 elif text[i] == "'":
                     i += 1
+                    closed = True
                     break
                 else:
                     i += 1
+            if not closed:
+                raise TagVersionError("unterminated character literal")
         elif text[i] == '"':
             i += 1
+            closed = False
             while i < n:
                 if text[i] == "\\":
                     nxt = text[i + 1 : i + 2]
@@ -88,11 +100,19 @@ def _strip_kotlin_comments(text: str) -> str:
                     i += 2
                 elif text[i] == '"':
                     i += 1
+                    closed = True
                     break
+                elif text.startswith("${", i):
+                    simple = re.match(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", text[i:])
+                    if not simple:
+                        raise TagVersionError("expression string templates are unsupported")
+                    i += len(simple.group())
                 elif text[i] == "\n":
                     break  # unterminated string at EOL
                 else:
                     i += 1
+            if not closed:
+                raise TagVersionError("unterminated string")
         elif text.startswith("/*", i):
             depth = 0
             while i < n:
@@ -112,6 +132,8 @@ def _strip_kotlin_comments(text: str) -> str:
                     if text[i] != "\n":
                         out[i] = " "
                     i += 1
+            if depth:
+                raise TagVersionError("unterminated block comment")
         elif text.startswith("//", i):
             while i < n and text[i] != "\n":
                 out[i] = " "
@@ -244,41 +266,117 @@ def _inside_string(pos: int, intervals: list[tuple[int, int]]) -> bool:
     return False
 
 
-def _extract_default_config(stripped: str) -> str | None:
-    """Return the body of the first android { ... defaultConfig { ... } } block.
+def _code_and_depths(text: str) -> tuple[str, list[int]]:
+    """Mask literals and record brace depth, rejecting unbalanced braces."""
+    code = list(text)
+    for start, end in _string_intervals(text):
+        for i in range(start, end):
+            if code[i] != "\n":
+                code[i] = " "
+    code_text = "".join(code)
+    depths = []
+    depth = 0
+    for char in code_text:
+        depths.append(depth)
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth < 0:
+                raise TagVersionError("unbalanced Gradle braces")
+    if depth:
+        raise TagVersionError("unbalanced Gradle braces")
+    return code_text, depths
 
-    Returns None when no such block exists, so callers fall back to the
-    (legacy) whole-file scan for simple/test fixtures.
 
-    String literals are skipped so that an ``android {`` / ``defaultConfig {``
-    sequence appearing inside a (raw or ordinary) string cannot be mistaken
-    for the real block.
+def _has_pending_control(prefix: str) -> bool:
+    """Detect a possibly unbraced control statement before a declaration.
+
+    Only simple, single-line val/var if expressions are recognized as complete;
+    more complicated preceding control flow is intentionally rejected.
+    Braces inside parentheses cannot terminate an enclosing condition.
     """
-    intervals = _string_intervals(stripped)
+    prefix = re.sub(r"`[^`\n]*`", lambda m: " " * len(m.group()), prefix)
+    control = r"\b(?:if|else|for|while|when|do|try|catch|finally)\b"
+
+    def remove_simple_if(match: re.Match[str]) -> str:
+        # A second control keyword can begin an unfinished branch on the next
+        # line (e.g. ``else if (false)``), so do not mask the expression.
+        # A trailing label also leaves the branch awaiting an expression.
+        expression = match.group()
+        return "" if (re.findall(control, expression) == ["if", "else"]
+                      and not re.search(r"@\s*$", expression)) else expression
+
+    prefix = re.sub(
+        r"(?m)^[ \t]*(?:val|var)\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*if\s*\([^(){}\n]*\)\s*[^{};\n]+\s+else\s+[^{};\n]+$",
+        remove_simple_if, prefix,
+    )
+    chars = list(prefix)
+    parens = 0
+    for i, char in enumerate(prefix):
+        if char == "(":
+            parens += 1
+        elif char == ")":
+            parens = max(0, parens - 1)
+        elif parens and char in "{};":
+            chars[i] = " "
+    return bool(re.search(control + r"[^{};]*$", "".join(chars)))
+
+
+def _reject_version_declarations(code: str) -> None:
+    """Reject local declarations that could shadow identity DSL properties."""
+    identifier = r"(?:`version(?:Code|Name)`|version(?:Code|Name)(?![\w`]))"
+    if re.search(r"(?<![\w`])(?:val|var)\s+" + identifier, code) or re.search(
+        r"(?<![\w`])(?:val|var)\s*\([^)]*(?<![\w`])" + identifier + r"(?=\s*[,):])",
+        code,
+    ):
+        raise TagVersionError("version local declaration may shadow defaultConfig property")
+
+
+def _reject_preceding_returns(code: str) -> None:
+    """Conservatively reject returns that could skip an identity declaration."""
+    keyword_code = re.sub(r"`[^`\n]*`", lambda m: " " * len(m.group()), code)
+    if re.search(r"\breturn\b", keyword_code):
+        raise TagVersionError("return before identity declaration is unsupported")
+
+
+def _extract_default_config(stripped: str) -> str | None:
+    """Return the body of a direct top-level android.defaultConfig block."""
+    code, depths = _code_and_depths(stripped)
     android_candidates = [
-        cand for cand in re.finditer(r"(?<![A-Za-z0-9_])android\s*\{", stripped)
-        if not _inside_string(cand.start(), intervals)
+        cand for cand in re.finditer(r"(?<![A-Za-z0-9_])android\s*\{", code)
     ]
     if not android_candidates:
         return None
     if len(android_candidates) > 1:
         raise TagVersionError("Gradle file must contain exactly one android block")
     m = android_candidates[0]
+    if depths[m.start()] != 0 or code[code.rfind("\n", 0, m.start()) + 1:m.start()].strip():
+        raise TagVersionError("android block must be a direct top-level declaration")
+    if _has_pending_control(code[:m.start()]):
+        raise TagVersionError("conditional android block is unsupported")
+    _reject_preceding_returns(code[:m.start()])
+    _reject_version_declarations(code[:m.start()])
     open_idx = m.end() - 1
     close_idx = _find_matching_brace(stripped, open_idx)
     if close_idx == -1:
         return None
     android_body = stripped[open_idx + 1 : close_idx]
-    body_intervals = _string_intervals(android_body)
+    body_code, body_depths = _code_and_depths(android_body)
     default_candidates = [
-        cand for cand in re.finditer(r"(?<![A-Za-z0-9_])defaultConfig\s*\{", android_body)
-        if not _inside_string(cand.start(), body_intervals)
+        cand for cand in re.finditer(r"(?<![A-Za-z0-9_])defaultConfig\s*\{", body_code)
     ]
     if not default_candidates:
         return None
     if len(default_candidates) > 1:
         raise TagVersionError("Gradle file must contain exactly one defaultConfig block")
     dm = default_candidates[0]
+    if body_depths[dm.start()] != 0 or body_code[body_code.rfind("\n", 0, dm.start()) + 1:dm.start()].strip():
+        raise TagVersionError("defaultConfig must be a direct android declaration")
+    if _has_pending_control(body_code[:dm.start()]):
+        raise TagVersionError("conditional defaultConfig is unsupported")
+    _reject_preceding_returns(body_code[:dm.start()])
+    _reject_version_declarations(body_code[:dm.start()])
     open2 = dm.end() - 1
     close2 = _find_matching_brace(android_body, open2)
     if close2 == -1:
@@ -313,42 +411,48 @@ def parse_gradle_version(gradle_path: str) -> tuple[int, str]:
     # Kotlin comments are stripped first so commented-out literals can never
     # satisfy the gate; trailing `//` comments are tolerated.
     stripped = _strip_kotlin_comments(text)
-    # Prefer the authoritative android.defaultConfig block when present so
-    # that literals in raw strings, comments (already stripped) or unrelated
-    # scopes cannot satisfy the gate. Fall back to the whole file for simple
-    # fixtures that do not declare an android block.
-    # An ``android {`` block that is present but cannot be resolved to a
-    # ``defaultConfig {`` block (unterminated/malformed or missing
-    # defaultConfig) must NOT silently fall back to a whole-file scan: that
-    # would let unrelated top-level literals satisfy the gate (fail-open).
-    # Only files with no android block at all use the legacy whole-file scan
-    # (simple/test fixtures).
-    _android_block_re = re.compile(r"(?<![A-Za-z0-9_])android\s*\{")
-    _detection_intervals = _string_intervals(stripped)
-    _has_android_block = any(
-        not _inside_string(candidate.start(), _detection_intervals)
-        for candidate in _android_block_re.finditer(stripped)
-    )
     search_text = _extract_default_config(stripped)
     if search_text is None:
-        if _has_android_block:
-            raise TagVersionError(
-                "Gradle file declares an android block but no parseable "
-                "android.defaultConfig block"
-            )
-        search_text = stripped
-    intervals = _string_intervals(search_text)
+        raise TagVersionError("Gradle file must contain a parseable android.defaultConfig block")
+    # Even a simple identifier template can invoke a property getter. Do not
+    # mask any executable interpolation inside the identity-bearing block.
+    for start, end in _string_intervals(search_text):
+        literal = search_text[start:end]
+        if literal.startswith("'"):
+            continue
+        raw = literal.startswith('"""')
+        i = 3 if raw else 1
+        while i < len(literal):
+            if not raw and literal[i] == "\\":
+                i += 2
+            elif literal[i] == "$" and literal[i + 1:i + 2] and (
+                literal[i + 1] in "_{" or literal[i + 1].isalpha()
+            ):
+                raise TagVersionError("string interpolation in defaultConfig is unsupported")
+            else:
+                i += 1
+    code_text, depths = _code_and_depths(search_text)
+    _reject_version_declarations(code_text)
+    # Unbraced control flow can also make a line-start declaration conditional.
+    keyword_code = re.sub(r"`[^`\n]*`", lambda m: " " * len(m.group()), code_text)
+    if re.search(r"\b(?:if|else|when|for|while|do|try|catch|finally|return)\b", keyword_code):
+        raise TagVersionError("control flow in defaultConfig is unsupported")
+    # Prefix operators may precede an arbitrary qualified receiver, not just
+    # the property itself. Reject them separately from postfix/assignments.
+    if re.search(
+        r"(?:\+\+|--)\s*(?:(?:[\w]+|`[^`\n]+`)(?:\s*@\s*[\w]+)?\s*\??\.\s*)*`?version(?:Code|Name)`?(?![\w`])",
+        code_text,
+    ):
+        raise TagVersionError("version mutation in defaultConfig is unsupported")
     # Reject files that declare more than one versionCode/versionName assignment
     # (e.g. a literal inside a non-executed branch plus an effective dynamic
     # assignment): the exactly-one gate applies to *all* assignments, not only
     # the literal ones.
     generic_code_matches = [
-        m for m in re.finditer(r"(?m)^\s*versionCode\s*=", search_text)
-        if not _inside_string(m.start(), intervals)
+        m for m in re.finditer(r"(?<![A-Za-z0-9_])`?versionCode`?\s*(?:[+*/%\-]?=(?!=)|\+\+|--)", code_text)
     ]
     generic_name_matches = [
-        m for m in re.finditer(r'(?m)^\s*versionName\s*=', search_text)
-        if not _inside_string(m.start(), intervals)
+        m for m in re.finditer(r'(?<![A-Za-z0-9_])`?versionName`?\s*(?:[+*/%\-]?=(?!=)|\+\+|--)', code_text)
     ]
     if len(generic_code_matches) != 1:
         raise TagVersionError(
@@ -360,12 +464,12 @@ def parse_gradle_version(gradle_path: str) -> tuple[int, str]:
             f"(double-quoted, found {len(generic_name_matches)})"
         )
     code_matches = [
-        m for m in re.finditer(r"(?m)^\s*versionCode\s*=\s*([0-9]+)\s*$", search_text)
-        if not _inside_string(m.start(), intervals)
+        m for m in re.finditer(r"(?m)^[ \t]*versionCode[ \t]*=[ \t]*([0-9]+)[ \t]*$", search_text)
+        if m.start() == search_text.rfind("\n", 0, generic_code_matches[0].start()) + 1 and depths[generic_code_matches[0].start()] == 0
     ]
     name_matches = [
-        m for m in re.finditer(r'(?m)^\s*versionName\s*=\s*"([^"]+)"\s*$', search_text)
-        if not _inside_string(m.start(), intervals)
+        m for m in re.finditer(r'(?m)^[ \t]*versionName[ \t]*=[ \t]*"([^"]+)"[ \t]*$', search_text)
+        if m.start() == search_text.rfind("\n", 0, generic_name_matches[0].start()) + 1 and depths[generic_name_matches[0].start()] == 0
     ]
     codes = [m.group(1) for m in code_matches]
     names = [m.group(1) for m in name_matches]

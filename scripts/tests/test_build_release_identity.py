@@ -1333,6 +1333,99 @@ class ReleaseTagVersionTest(unittest.TestCase):
             tag_version.check_tag_version("v1.2.3", code, name)["status"], "ok"
         )
 
+    def test_default_config_early_return_and_prefix_mutations_rejected(self) -> None:
+        path = self.tmp / "control.gradle.kts"
+        for extra in (
+            "return@defaultConfig", "return@defaultConfig Unit",
+            "++versionCode", "--versionCode", "++this.versionCode",
+            "--this@defaultConfig.versionCode", "++holder.nested.`versionCode`",
+            "++this.versionName", "--`versionName`",
+        ):
+            with self.subTest(extra=extra):
+                path.write_text(
+                    'android {\n defaultConfig {\n' + extra + '\n'
+                    'versionCode = 7\nversionName = "1.2.3"\n }\n}\n', encoding="utf-8",
+                )
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.parse_gradle_version(str(path))
+
+    def test_unicode_interpolation_rejected_but_escaped_dollar_allowed(self) -> None:
+        path = self.tmp / "template.gradle.kts"
+        for literal in ('"$é"', '"$变量"', '"$éclair"', '"""$é"""'):
+            with self.subTest(literal=literal):
+                path.write_text(
+                    'android {\n defaultConfig {\nval x = ' + literal + '\n'
+                    'versionCode = 7\nversionName = "1.2.3"\n }\n}\n', encoding="utf-8",
+                )
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.parse_gradle_version(str(path))
+        path.write_text(
+            'android {\n defaultConfig {\nval x = "\\$é"\n'
+            'versionCode = 7\nversionName = "1.2.3"\n }\n}\n', encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+    def test_backticked_control_keywords_are_identifiers(self) -> None:
+        path = self.tmp / "keywords.gradle.kts"
+        path.write_text(
+            'val `if` = 1\nandroid {\n val `when` = 2\n defaultConfig {\n'
+            'val `return` = 3\nval `if` = 4\nversionCode = 7\n'
+            'versionName = "1.2.3"\n }\n}\n', encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+    def test_chained_control_before_identity_blocks_rejected(self) -> None:
+        path = self.tmp / "chained-control.gradle.kts"
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        for prefix in (
+            'val x = if (true) Unit else if (false)\n',
+            'var x = if (true) Unit else if (false) Unit else if (false)\n',
+            'val x = if (true) if (false) Unit else Unit else if (false)\n',
+        ):
+            for location in ("android", "defaultConfig"):
+                with self.subTest(prefix=prefix, location=location):
+                    outer = prefix if location == "android" else ""
+                    inner = prefix if location == "defaultConfig" else ""
+                    path.write_text(
+                        outer + 'android {\n' + inner + 'defaultConfig {\n'
+                        + direct + '}\n}\n', encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(tag_version.TagVersionError, "conditional"):
+                        tag_version.parse_gradle_version(str(path))
+
+    def test_shadowing_version_declarations_rejected(self) -> None:
+        path = self.tmp / "shadow.gradle.kts"
+        for field, typ, value in (("versionCode", "Int", "0"), ("versionName", "String", '"old"')):
+            for name in (field, f"`{field}`"):
+                for declaration in (
+                    f"var {name}: {typ}", f"var {name}: {typ} = {value}",
+                    f"val {name}: {typ} = {value}", f"val ({name}, other) = pair",
+                    f"var /* comment */ {name}\n: {typ}",
+                ):
+                    for location in ("script", "android", "defaultConfig"):
+                        with self.subTest(declaration=declaration, location=location):
+                            prefix = declaration if location == "script" else ""
+                            outer = declaration if location == "android" else ""
+                            inner = declaration if location == "defaultConfig" else ""
+                            path.write_text(
+                                f'{prefix}\nandroid {{\n{outer}\n defaultConfig {{\n{inner}\n'
+                                'versionCode = 7\nversionName = "1.2.3"\n }\n}\n', encoding="utf-8",
+                            )
+                            with self.assertRaisesRegex(tag_version.TagVersionError, "shadow"):
+                                tag_version.parse_gradle_version(str(path))
+
+    def test_unrelated_declarations_and_text_do_not_shadow_versions(self) -> None:
+        path = self.tmp / "no-shadow.gradle.kts"
+        path.write_text(
+            'val versionNameSuffix = "var versionCode: Int"\n'
+            '// val versionName: String\n/* var `versionCode`: Int */\n'
+            'android {\n val versionCodeSuffix: Int = 1\n defaultConfig {\n'
+            'val `versionNameSuffix` = "val versionCode: Int"\n'
+            '// var versionName: String\n/* val `versionCode`: Int */\n'
+            'versionCode = 7\nversionName = "1.2.3"\n }\n}\n', encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
     def test_debug_suffix_line_does_not_create_a_second_version_name(self) -> None:
         path = self._write_gradle(version_code="7", version_name_line='versionName = "1.2.3"')
 
@@ -1394,13 +1487,13 @@ class ReleaseTagVersionTest(unittest.TestCase):
     def test_trailing_comment_is_accepted_and_leading_zero_code_rejected(self) -> None:
         path = self.tmp / "comment.gradle.kts"
         path.write_text(
-            'versionCode = 7 // release code\nversionName = "1.2.3" // comment\n',
+            'android {\n defaultConfig {\nversionCode = 7 // release code\nversionName = "1.2.3" // comment\n }\n}\n',
             encoding="utf-8",
         )
         self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
         leading = self.tmp / "leading.gradle.kts"
         leading.write_text(
-            'versionCode = 007\nversionName = "1.2.3"\n', encoding="utf-8"
+            'android {\n defaultConfig {\nversionCode = 007\nversionName = "1.2.3"\n }\n}\n', encoding="utf-8"
         )
         with self.assertRaisesRegex(tag_version.TagVersionError, "leading zero"):
             tag_version.parse_gradle_version(str(leading))
@@ -1505,7 +1598,7 @@ class ReleaseTagVersionTest(unittest.TestCase):
             tag_version.parse_gradle_version(str(self.tmp / "does-not-exist.gradle.kts"))
         duplicated = self.tmp / "duplicated.gradle.kts"
         duplicated.write_text(
-            'versionCode = 7\nversionCode = 8\nversionName = "1.2.3"\n',
+            'android {\n defaultConfig {\nversionCode = 7\nversionCode = 8\nversionName = "1.2.3"\n }\n}\n',
             encoding="utf-8",
         )
         with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionCode"):
@@ -1514,22 +1607,22 @@ class ReleaseTagVersionTest(unittest.TestCase):
     def test_duplicate_version_name_missing_fields_and_single_quote(self) -> None:
         dup_name = self.tmp / "dup-name.gradle.kts"
         dup_name.write_text(
-            'versionCode = 7\nversionName = "1.2.3"\nversionName = "1.2.3"\n',
+            'android {\n defaultConfig {\nversionCode = 7\nversionName = "1.2.3"\nversionName = "1.2.3"\n }\n}\n',
             encoding="utf-8",
         )
         with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionName"):
             tag_version.parse_gradle_version(str(dup_name))
         missing_code = self.tmp / "missing-code.gradle.kts"
-        missing_code.write_text('versionName = "1.2.3"\n', encoding="utf-8")
+        missing_code.write_text('android {\n defaultConfig {\nversionName = "1.2.3"\n }\n}\n', encoding="utf-8")
         with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionCode"):
             tag_version.parse_gradle_version(str(missing_code))
         missing_name = self.tmp / "missing-name.gradle.kts"
-        missing_name.write_text("versionCode = 7\n", encoding="utf-8")
+        missing_name.write_text("android {\n defaultConfig {\nversionCode = 7\n }\n}\n", encoding="utf-8")
         with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionName"):
             tag_version.parse_gradle_version(str(missing_name))
         single = self.tmp / "single.gradle.kts"
         single.write_text(
-            "versionCode = 7\nversionName = '1.2.3'\n", encoding="utf-8"
+            "android {\n defaultConfig {\nversionCode = 7\nversionName = '1.2.3'\n }\n}\n", encoding="utf-8"
         )
         with self.assertRaisesRegex(tag_version.TagVersionError, "double-quoted"):
             tag_version.parse_gradle_version(str(single))
@@ -1563,7 +1656,7 @@ class ReleaseTagVersionTest(unittest.TestCase):
             "/**\n"
             ' * versionCode = 1\n * versionName = "0.1.0"\n'
             " */\n"
-            'versionCode = 7\nversionName = "1.2.3"\n',
+            'android {\n defaultConfig {\nversionCode = 7\nversionName = "1.2.3"\n }\n}\n',
             encoding="utf-8",
         )
         self.assertEqual(tag_version.parse_gradle_version(str(kdoc)), (7, "1.2.3"))
@@ -1572,14 +1665,14 @@ class ReleaseTagVersionTest(unittest.TestCase):
             "/* outer /* inner */ still comment\n"
             'versionCode = 1\nversionName = "0.1.0"\n'
             "*/\n"
-            'versionCode = 7\nversionName = "1.2.3"\n',
+            'android {\n defaultConfig {\nversionCode = 7\nversionName = "1.2.3"\n }\n}\n',
             encoding="utf-8",
         )
         self.assertEqual(tag_version.parse_gradle_version(str(nested)), (7, "1.2.3"))
         inline = self.tmp / "inline.gradle.kts"
         inline.write_text(
-            "versionCode = 7 /* trailing block */\n"
-            'versionName = "1.2.3" /* trailing block */\n',
+            "android {\n defaultConfig {\nversionCode = 7 /* trailing block */\n"
+            'versionName = "1.2.3" /* trailing block */\n }\n}\n',
             encoding="utf-8",
         )
         self.assertEqual(tag_version.parse_gradle_version(str(inline)), (7, "1.2.3"))
@@ -1589,13 +1682,13 @@ class ReleaseTagVersionTest(unittest.TestCase):
         full_line.write_text(
             "// versionCode = 999\n"
             '// versionName = "9.9.9"\n'
-            'versionCode = 7\nversionName = "1.2.3"\n',
+            'android {\n defaultConfig {\nversionCode = 7\nversionName = "1.2.3"\n }\n}\n',
             encoding="utf-8",
         )
         self.assertEqual(tag_version.parse_gradle_version(str(full_line)), (7, "1.2.3"))
         in_string = self.tmp / "in-string.gradle.kts"
         in_string.write_text(
-            'versionCode = 7\nversionName = "1.2.3 // x"\n', encoding="utf-8"
+            'android {\n defaultConfig {\nversionCode = 7\nversionName = "1.2.3 // x"\n }\n}\n', encoding="utf-8"
         )
         code, name = tag_version.parse_gradle_version(str(in_string))
         self.assertEqual((code, name), (7, "1.2.3 // x"))
@@ -1607,20 +1700,20 @@ class ReleaseTagVersionTest(unittest.TestCase):
         # protects a commented-out value: the commented 999 must not win.
         tricky = self.tmp / "char-literal.gradle.kts"
         tricky.write_text(
-            "val c = '\"'\n"
+            "android {\n defaultConfig {\nval c = '\"'\n"
             "versionCode = 1 // keep\n"
             "/*\n"
             "versionCode = 999\n"
             "*/\n"
-            'versionName = "1.2.3"\n',
+            'versionName = "1.2.3"\n }\n}\n',
             encoding="utf-8",
         )
         self.assertEqual(tag_version.parse_gradle_version(str(tricky)), (1, "1.2.3"))
         escaped = self.tmp / "char-escape.gradle.kts"
         escaped.write_text(
-            "val q = '\\u0027'\n"
+            "android {\n defaultConfig {\nval q = '\\u0027'\n"
             "versionCode = 7 // comment\n"
-            'versionName = "1.2.3"\n',
+            'versionName = "1.2.3"\n }\n}\n',
             encoding="utf-8",
         )
         self.assertEqual(tag_version.parse_gradle_version(str(escaped)), (7, "1.2.3"))
@@ -1765,6 +1858,100 @@ class ReleaseTagVersionTest(unittest.TestCase):
         )
         with self.assertRaises(tag_version.TagVersionError):
             tag_version.parse_gradle_version(str(path))
+
+    def test_unsupported_scopes_and_assignments_are_rejected(self) -> None:
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        cases = {
+            "missing android": direct,
+            "missing defaultConfig": 'android {\n' + direct + '}\n',
+            "unterminated android": 'android {\n defaultConfig {\n' + direct + '}\n',
+            "nested android": 'if (false) {\nandroid {\n defaultConfig {\n' + direct + '}\n}\n}\n',
+            "conditional android": 'if (false)\nandroid {\n defaultConfig {\n' + direct + '}\n}\n',
+            "nested defaultConfig": 'android {\nif (false) {\n defaultConfig {\n' + direct + '}\n}\n}\n',
+            "conditional defaultConfig": 'android {\nif (false)\n defaultConfig {\n' + direct + '}\n}\n',
+            "conditional literals": 'android {\n defaultConfig {\nif (false) {\n' + direct + '}\n}\n}\n',
+            "unbraced conditional": 'android {\n defaultConfig {\nif (false)\n' + direct + '}\n}\n',
+            "nested literals": 'android {\n defaultConfig {\nrun {\n' + direct + '}\n}\n}\n',
+            "inline override": 'android {\n defaultConfig {\n' + direct + 'run { versionName = "9.9.9" }\n}\n}\n',
+            "qualified override": 'android {\n defaultConfig {\n' + direct + 'this.versionCode = 9\n}\n}\n',
+            "compound override": 'android {\n defaultConfig {\n' + direct + 'versionCode += 1\n}\n}\n',
+            "backtick override": 'android {\n defaultConfig {\n' + direct + '`versionName` = "9.9.9"\n}\n}\n',
+            "increment override": 'android {\n defaultConfig {\n' + direct + 'versionCode++\n}\n}\n',
+            "qualified block": 'foo.android {\n defaultConfig {\n' + direct + '}\n}\n',
+        }
+        path = self.tmp / "unsupported.gradle.kts"
+        for label, content in cases.items():
+            with self.subTest(case=label):
+                path.write_text(content, encoding="utf-8")
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.parse_gradle_version(str(path))
+
+    def test_flavor_override_is_outside_static_checker_scope(self) -> None:
+        path = self.tmp / "flavor.gradle.kts"
+        path.write_text(
+            'android {\n defaultConfig {\n versionCode = 7\n versionName = "1.2.3"\n }\n'
+            ' productFlavors { create("play") { versionName = "9.9.9" } }\n}\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+    def test_returns_before_identity_declarations_are_rejected(self) -> None:
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        block = 'android {\n defaultConfig {\n' + direct + '}\n}\n'
+        path = self.tmp / "early-return.gradle.kts"
+        for prefix in ('return@android\n', 'if (true) { return@android }\n',
+                       'run { return@android };\n'):
+            with self.subTest(location="android", prefix=prefix):
+                path.write_text('android {\n' + prefix + 'defaultConfig {\n' + direct + '}\n}\n', encoding="utf-8")
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.parse_gradle_version(str(path))
+        for prefix in ('return\n', 'if (true) { return }\n'):
+            with self.subTest(location="script", prefix=prefix):
+                path.write_text(prefix + block, encoding="utf-8")
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.parse_gradle_version(str(path))
+        for content in ('val x = "return@android" // return\n' + block,
+                        'android {\nval `return` = 1\ndefaultConfig {\n' + direct + '}\nreturn@android\n}\n'):
+            with self.subTest(content=content):
+                path.write_text(content, encoding="utf-8")
+                self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+    def test_templates_conditionals_and_unterminated_lexemes(self) -> None:
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        block = 'android {\n defaultConfig {\n' + direct + '}\n}\n'
+        cases = {
+            "template mutation": 'android {\n defaultConfig {\n' + direct + 'val x = "${run { versionCode = 9 }}"\n}\n}\n',
+            "raw template mutation": 'android {\n defaultConfig {\n' + direct + 'val x = """${run { versionName = "9.9.9" }}"""\n}\n}\n',
+            "identifier template": 'android {\n defaultConfig {\n' + direct + 'val x = "$sideEffect"\n}\n}\n',
+            "conditional android with lambda": 'if (run { false })\n' + block,
+            "conditional default with lambda": 'android {\nif (run { false })\n defaultConfig {\n' + direct + '}\n}\n',
+            "dangling label before android": 'val x = if (true) 1 else label@\n' + block,
+            "dangling label before defaultConfig": 'android {\nval x = if (true) 1 else label@\n defaultConfig {\n' + direct + '}\n}\n',
+            "trailing block comment": block + '/* unfinished',
+            "trailing nested block comment": block + '/* outer /* inner */',
+            "trailing string": block + 'val x = "unfinished',
+            "trailing raw string": block + 'val x = """unfinished',
+            "trailing char": block + "val x = 'a",
+            "newline in string": block + 'val x = "unfinished\n',
+        }
+        path = self.tmp / "lexical.gradle.kts"
+        for label, content in cases.items():
+            with self.subTest(case=label):
+                path.write_text(content, encoding="utf-8")
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.parse_gradle_version(str(path))
+
+        positives = (
+            'val x = if (true) 1 else 2\n' + block,
+            'android {\nval x = if (true) 1 else 2\n defaultConfig {\n' + direct + '}\n}\n',
+            'android {\n defaultConfig {\n' + direct + 'val x = "\\${notATemplate}"\n}\n}\n',
+            'val x = "${prefix}"\n' + block,
+            block + '/* closed /* nested */ comment */\nval x = "closed"\n',
+        )
+        for content in positives:
+            with self.subTest(content=content):
+                path.write_text(content, encoding="utf-8")
+                self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
 
 
 if __name__ == "__main__":

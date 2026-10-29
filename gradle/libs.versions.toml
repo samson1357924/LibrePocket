@@ -6,7 +6,7 @@ composeBom = "2025.09.00"
 activityCompose = "1.10.1"
 lifecycle = "2.8.7"
 navigationCompose = "2.8.5"
-coreSplashscreen = "1.0.1"
+coreSplashscreen = "1.2.0"
 # compileSdk 37 / targetSdk 36 / minSdk 33 — see app/build.gradle.kts
 compileSdk = "37"
 targetSdk = "36"

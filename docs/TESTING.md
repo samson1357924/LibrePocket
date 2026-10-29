@@ -926,6 +926,20 @@ python3 scripts/check_release_tag_version.py \
 # Fake-keystore rehearsal: real verifier gate, synthetic bytes + fake tools,
 # 10-case pass/reject matrix incl. blank-runner same-SHA re-verification.
 python3 scripts/fake_keystore_rehearsal.py
+
+# Local release builder invocation with preflight tag & signer-pin verification
+# (local-only, requires Python >= 3.11 for python3 -P safe sys.path isolation;
+# subset build for flavor 'play' with caller-supplied identity and pins registry):
+scripts/build_release.sh --apk play \
+  --tag v0.1.0 \
+  --pins /path/to/release_signer_pins.json \
+  --expected-package play=dev.librepocket.agent \
+  --expected-version-code play=1 \
+  --expected-version-name play=0.1.0 \
+  --expected-cert-sha256 play=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --apksigner "$ANDROID_HOME/build-tools/36.0.0/apksigner" \
+  --aapt "$ANDROID_HOME/build-tools/36.0.0/aapt" \
+  --output-parent /tmp/release-out
 ```
 
 The new `SignerPinRegistryTest` / `ReleaseTagVersionTest` classes live in the
@@ -936,7 +950,18 @@ JSON, so the harness runs them on helper-only diffs. The synthetic fixtures
 prove the gate's fail-closed matrix only; they are not real-APK/SDK evidence,
 not a signing/build rehearsal, and not a basis for closing Issue #12.
 
-The local APK release integration is `scripts/build_release.sh`; it requires `--apk`, explicit per-flavor trusted identity values, explicit SDK parser paths, and an existing output parent before it reaches credential lookup or build. Optional `--tag` and `--pins` preflight flags verify release tag format / Gradle consistency and signer-pin registry values against expected identity. It remains a local staging/verification path only, not a publishing workflow or release-readiness claim. Its helpers `scripts/release_artifact_stage.py` and `scripts/verify_release_apk.py` (covered by `scripts/tests/test_release_artifact_verifier.py` and `scripts/tests/test_build_release_identity.py`) stage and verify the release artifact for that local path; `pr-check.yml` lists them only as `policy` path triggers (not as invoked CI commands), and `scripts/docs_claim_check.sh` Section A requires every script the workflow references to be documented here.
+The local APK release integration is `scripts/build_release.sh`; it requires `--apk`, explicit per-flavor trusted identity values, explicit SDK parser paths, and an existing output parent before it reaches credential lookup or build. Optional `--tag` and `--pins` preflight flags verify release tag format / Gradle consistency and signer-pin registry values against expected identity fail-closed before reading credentials or invoking Gradle. All preflight checks and helpers execute under `python3 -P` (requiring Python >= 3.11) to isolate `sys.path` and prevent local import-shadowing attacks.
+
+Preflight identity validation for `--tag` and `--pins` is comprehensively tested in `scripts/tests/test_build_release_identity.py` (via `ReleaseBuilderHarness`, `SignerPinRegistryTest`, and `ReleaseTagVersionTest`), covering:
+- **Subset flavor builds:** verifying that building a subset of flavors (such as `--apk play` with a full three-flavor pins registry) verifies only the selected flavors and succeeds, while unselected registry entries are ignored; conversely, missing pin entries for selected flavors fails preflight closed before credentials or Gradle.
+- **Case sensitivity:** exact case sensitivity is enforced for Android package names (`dev.librepocket.Agent` vs `dev.librepocket.agent` fails preflight), whereas certificate SHA-256 fingerprints are compared case-insensitively (normalizing uppercase/lowercase hex).
+- **Malformed, duplicate, or oversize pin files:** invalid JSON syntax, duplicate keys within the registry object (rejected via custom object hook), empty files, and files exceeding the 64 KiB size limit fail preflight closed.
+- **Directory symlinks:** pins path pointing to directories or directory symlinks (and file symlinks) fail preflight closed.
+- **Missing checker scripts:** missing or unreadable `scripts/check_release_tag_version.py` or `scripts/check_release_pins.py` fail preflight closed before credentials or build.
+- **Version boundary limits:** `versionCode` outside `1..2147483647` (such as `0`, `-1`, or `2147483648`) in `app/build.gradle.kts` fails preflight closed, and release tags must strictly match ASCII semver `vX.Y.Z` and equal `versionName`.
+- **Python version floor:** Python environments below 3.11 fail preflight closed before any subprocess execution.
+
+It remains a local staging/verification path only, not a publishing workflow or release-readiness claim. Its helpers `scripts/release_artifact_stage.py` and `scripts/verify_release_apk.py` (covered by `scripts/tests/test_release_artifact_verifier.py` and `scripts/tests/test_build_release_identity.py`) stage and verify the release artifact for that local path; `pr-check.yml` lists them only as `policy` path triggers (not as invoked CI commands), and `scripts/docs_claim_check.sh` Section A requires every script the workflow references to be documented here.
 
 The synthetic Python fixtures and fake `aapt`/`dexdump`/`apksigner`/Gradle/policy commands test bounded parser, policy, identity, transaction, failure-cleanup, and process-cancellation behavior; they do not represent a real APK or prove Android SDK native-tool compatibility. A release/build maintainer should run the APK policy/native-parser gates against fresh debug APKs for all three flavors and record their paths, SHA-256 values, SDK build-tools version, command output, and tested commit. The separate signed-release verifier requires fresh controlled test fixtures/native-tool evidence and explicit trusted identity values; its synthetic harness alone does not establish that validation. Do not infer a pass from historical APK inventory. These are instructions, not a claim that they were run for this documentation change. Version sources are listed in [Build Environment](ENV.md).
 

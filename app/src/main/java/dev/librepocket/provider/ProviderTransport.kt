@@ -2,6 +2,8 @@ package dev.librepocket.provider
 
 import dev.librepocket.redact.Redactor
 import java.io.IOException
+import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
@@ -94,6 +96,22 @@ internal fun inferAggFailureCodeName(message: String?): String? {
         }
         else -> null
     }
+}
+
+internal fun inferAggFailureCodeName(error: Throwable?): String? {
+    if (error == null) return null
+    val seen = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
+    var cur: Throwable? = error
+    while (cur != null && seen.add(cur)) {
+        if (cur is ProviderFailure) {
+            val codeName = cur.code?.name
+            if (codeName != null) return codeName
+        }
+        val match = inferAggFailureCodeName(cur.message)
+        if (match != null) return match
+        cur = cur.cause
+    }
+    return null
 }
 
 private const val MODEL_LIST_RESPONSE_MAX_BYTES = 1024 * 1024
@@ -557,14 +575,14 @@ internal fun postJson(url: String, headers: LinkedHashMap<String, String>, bodyJ
  * transparency for failures thrown by the downstream collector.
  *
  * `code` propagation (Stage D): a [ProviderFailure] becomes
- * [StreamEvent.Failed] with `code = e.code?.name ?: inferAggFailureCodeName(e.message)`,
+ * [StreamEvent.Failed] with `code = e.code?.name ?: inferAggFailureCodeName(e)`,
  * so aggregation/SSE budget overflows (`AGG_TOO_LARGE` with distinct
  * `TOOL_ARGS_TOO_LARGE` / `TEXT_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
  * messages) stay typed end-to-end for TurnController's pending-flush guard.
  * The `IllegalArgumentException` and `IOException` branches carry
- * `code = inferAggFailureCodeName(e.message)` (null for non-aggregation
+ * `code = inferAggFailureCodeName(e)` (null for non-aggregation
  * messages), and the unknown-runtime fallback carries
- * `inferAggFailureCodeName(e.message) ?: UNKNOWN_RUNTIME`, so the controller
+ * `inferAggFailureCodeName(e) ?: UNKNOWN_RUNTIME`, so the controller
  * can discard poison-adjacent pending tools without changing retry semantics
  * of other fatal events (401/validation stay flushable).
  * Unknown runtime failures fail closed (`retryable = false`): only
@@ -585,14 +603,14 @@ internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit)
                     StreamEvent.Failed(
                         redactedError(e.message ?: "PROVIDER_FAILED"),
                         e.retryable,
-                        e.code?.name ?: inferAggFailureCodeName(e.message),
+                        e.code?.name ?: inferAggFailureCodeName(e),
                     ),
                 )
                 is IllegalArgumentException -> emit(
                     StreamEvent.Failed(
                         redactedError("PROVIDER_BAD_REQUEST", e.message),
                         retryable = false,
-                        code = inferAggFailureCodeName(e.message),
+                        code = inferAggFailureCodeName(e),
                     ),
                 )
                 is IOException -> {
@@ -601,7 +619,7 @@ internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit)
                     // classification: an AGG_TOO_LARGE stream is poisoned and
                     // never retries, even when the classifier sees a plain
                     // IOException shape.
-                    val aggCode = inferAggFailureCodeName(e.message)
+                    val aggCode = inferAggFailureCodeName(e)
                     emit(
                         StreamEvent.Failed(
                             redactedError("PROVIDER_TRANSPORT", e.message),
@@ -614,7 +632,7 @@ internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit)
                     StreamEvent.Failed(
                         redactedError(e.message ?: "PROVIDER_FAILURE"),
                         retryable = false,
-                        code = inferAggFailureCodeName(e.message) ?: ProviderFailureCode.UNKNOWN_RUNTIME.name,
+                        code = inferAggFailureCodeName(e) ?: ProviderFailureCode.UNKNOWN_RUNTIME.name,
                     ),
                 )
             }

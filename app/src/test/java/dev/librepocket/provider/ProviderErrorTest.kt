@@ -162,6 +162,52 @@ class ProviderErrorTest {
     }
 
     @Test
+    fun cyclicCauseChainDoesNotLoopInfinitely() {
+        val e1 = Exception("cause 1")
+        val e2 = Exception("cause 2", e1)
+        e1.initCause(e2)
+        assertEquals(FailureKind.RETRYABLE, ProviderErrorClassifier.classify(null, e1, null))
+    }
+
+    @Test
+    fun cyclicCauseChainWithFatalMarkerIsFatal() {
+        val e1 = Exception("cause 1")
+        val e2 = IOException("attempt_deadline_exceeded", e1)
+        e1.initCause(e2)
+        assertEquals(FailureKind.FATAL, ProviderErrorClassifier.classify(null, e1, null))
+    }
+
+    @Test
+    fun fatalMarkersAndExceptionTypesInCurPrecedeRetryableBodyMarkers() {
+        assertEquals(
+            FailureKind.FATAL,
+            ProviderErrorClassifier.classify(
+                null,
+                IOException("attempt_deadline_exceeded"),
+                "rate_limit_exceeded, timeout, try again",
+            ),
+        )
+        assertEquals(
+            FailureKind.FATAL,
+            ProviderErrorClassifier.classify(
+                null,
+                SSLHandshakeException("bad cert"),
+                "rate_limit_exceeded, timeout, try again",
+            ),
+        )
+        assertEquals(
+            FailureKind.FATAL,
+            ProviderErrorClassifier.classify(
+                null,
+                SocketTimeoutException("timed out").apply {
+                    initCause(IOException("sse_total_too_large"))
+                },
+                "rate_limit_exceeded",
+            ),
+        )
+    }
+
+    @Test
     fun nullEverythingDefaultsRetryable() {
         assertEquals(FailureKind.RETRYABLE, ProviderErrorClassifier.classify(null, null, null))
         assertEquals(FailureKind.RETRYABLE, ProviderErrorClassifier.classify(null, null, ""))

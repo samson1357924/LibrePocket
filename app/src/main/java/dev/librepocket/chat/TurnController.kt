@@ -4897,7 +4897,7 @@ class TurnController(
       } catch (e: CancellationException) {
         throw e
       } catch (e: Exception) {
-        val aggCode = inferAggFailureCodeName(e.message)
+        val aggCode = inferAggFailureCodeName(e)
         failed = StreamEvent.Failed(
           message = e.message ?: "provider error",
           retryable = aggCode == null,
@@ -4910,7 +4910,7 @@ class TurnController(
             failed = StreamEvent.Failed(
               pf.message ?: "provider error",
               retryable = false,
-              code = pf.code?.name ?: inferAggFailureCodeName(pf.message),
+              code = pf.code?.name ?: inferAggFailureCodeName(pf),
             )
           }
         }
@@ -4920,7 +4920,7 @@ class TurnController(
         failed = StreamEvent.Failed(
           e.message ?: "provider error",
           retryable = false,
-          code = inferAggFailureCodeName(e.message) ?: ProviderFailureCode.UNKNOWN_RUNTIME.name,
+          code = inferAggFailureCodeName(e) ?: ProviderFailureCode.UNKNOWN_RUNTIME.name,
         )
       }
       val failure = failed
@@ -5594,22 +5594,20 @@ class TurnController(
       failed = StreamEvent.Failed(
         e.message ?: "provider error",
         retryable = e.retryable,
-        code = e.code?.name ?: inferAggFailureCodeName(e.message),
+        code = e.code?.name ?: inferAggFailureCodeName(e),
       )
       // AGG_TOO_LARGE / DEADLINE_EXCEEDED is this collector's own guard: fail closed without
       // recording poison-adjacent pending tools (the typed terminal error
       // is the observable record). Other failures flush, guarded by the
       // same discard predicate as the Failed-event path.
-      if (e.code != ProviderFailureCode.AGG_TOO_LARGE &&
-          e.code != ProviderFailureCode.DEADLINE_EXCEEDED &&
-          !shouldDiscardPendingTools(failed)) {
+      if (!shouldDiscardPendingTools(failed)) {
         try {
           flushPendingTools(state, attemptRunId)
         } catch (pf: ProviderFailure) {
           failed = StreamEvent.Failed(
             pf.message ?: "provider error",
             retryable = false,
-            code = pf.code?.name ?: inferAggFailureCodeName(pf.message),
+            code = pf.code?.name ?: inferAggFailureCodeName(pf),
           )
         }
       }
@@ -5618,7 +5616,7 @@ class TurnController(
       failed = StreamEvent.Failed(
         e.message ?: "provider error",
         retryable = false,
-        code = inferAggFailureCodeName(e.message),
+        code = inferAggFailureCodeName(e),
       )
       if (!shouldDiscardPendingTools(failed)) {
         try {
@@ -5627,14 +5625,14 @@ class TurnController(
           failed = StreamEvent.Failed(
             pf.message ?: "provider error",
             retryable = false,
-            code = pf.code?.name ?: inferAggFailureCodeName(pf.message),
+            code = pf.code?.name ?: inferAggFailureCodeName(pf),
           )
         }
       }
     } catch (e: IOException) {
       coroutineContext.ensureActive()
       val kind = ProviderErrorClassifier.classify(null, e, null)
-      val aggCode = inferAggFailureCodeName(e.message)
+      val aggCode = inferAggFailureCodeName(e)
       failed = StreamEvent.Failed(
         e.message ?: "provider error",
         retryable = kind == FailureKind.RETRYABLE && aggCode == null,
@@ -5647,7 +5645,7 @@ class TurnController(
           failed = StreamEvent.Failed(
             pf.message ?: "provider error",
             retryable = false,
-            code = pf.code?.name ?: inferAggFailureCodeName(pf.message),
+            code = pf.code?.name ?: inferAggFailureCodeName(pf),
           )
         }
       }
@@ -5656,7 +5654,7 @@ class TurnController(
       failed = StreamEvent.Failed(
         e.message ?: "provider error",
         retryable = false,
-        code = inferAggFailureCodeName(e.message) ?: ProviderFailureCode.UNKNOWN_RUNTIME.name,
+        code = inferAggFailureCodeName(e) ?: ProviderFailureCode.UNKNOWN_RUNTIME.name,
       )
     } catch (e: Throwable) {
       // S3-F1 Error symmetry (Current, option (a)): fatal Error from the

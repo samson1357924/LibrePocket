@@ -490,6 +490,105 @@ class TurnControllerResourceExhaustedTest {
       ProviderFailureCode.AGG_TOO_LARGE.name,
       inferAggFailureCodeName("SSE_TOTAL_TOO_LARGE"),
     )
+    assertEquals(
+      null,
+      inferAggFailureCodeName(null as Throwable?),
+    )
+    assertEquals(
+      null,
+      inferAggFailureCodeName(java.io.IOException("generic error")),
+    )
+    assertEquals(
+      ProviderFailureCode.DEADLINE_EXCEEDED.name,
+      inferAggFailureCodeName(
+        java.io.IOException("wrap", java.io.IOException("ATTEMPT_DEADLINE_EXCEEDED")),
+      ),
+    )
+    assertEquals(
+      ProviderFailureCode.AGG_TOO_LARGE.name,
+      inferAggFailureCodeName(
+        java.io.IOException("wrap", java.io.IOException("SSE_TOTAL_TOO_LARGE")),
+      ),
+    )
+    assertEquals(
+      ProviderFailureCode.DEADLINE_EXCEEDED.name,
+      inferAggFailureCodeName(
+        RuntimeException(
+          "wrap",
+          ProviderFailure(false, "deadline", code = ProviderFailureCode.DEADLINE_EXCEEDED),
+        ),
+      ),
+    )
+    // Cause chain cycle detection in inferAggFailureCodeName:
+    val cyclicClean1 = Exception("clean 1")
+    val cyclicClean2 = Exception("clean 2", cyclicClean1)
+    cyclicClean1.initCause(cyclicClean2)
+    assertEquals(null, inferAggFailureCodeName(cyclicClean1))
+
+    val cyclicFatal1 = Exception("fatal 1")
+    val cyclicFatal2 = java.io.IOException("ATTEMPT_DEADLINE_EXCEEDED", cyclicFatal1)
+    cyclicFatal1.initCause(cyclicFatal2)
+    assertEquals(ProviderFailureCode.DEADLINE_EXCEEDED.name, inferAggFailureCodeName(cyclicFatal1))
+  }
+
+  @Test fun wrappedIOExceptionDeadlineExceededSuppressesPendingFlushAndDoesNotRetry() {
+    val provider = ResExhaustFakeProvider()
+    provider.handler = {
+      flow {
+        emit(StreamEvent.ToolDelta(0, "id-0", "f", "{\"a\":1}"))
+        emit(StreamEvent.ToolDelta(0, null, null, "x"))
+        throw java.io.IOException("wrapped transport error", java.io.IOException(ATTEMPT_DEADLINE_EXCEEDED))
+      }
+    }
+    val sink = ResExhaustRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      assertEquals("poisoned stream must not be retried", 1, provider.streamCalls.get())
+      awaitFailed(sink)
+      assertEquals(1, sink.failed.size)
+      assertTrue(sink.failed.single().contains("wrapped transport error"))
+      runBlocking { assertTrue("transcript drain timed out", c.flushTranscript(8_000)) }
+      assertTrue("no poison-adjacent tool records may be persisted, got: ${sink.tools}", sink.tools.isEmpty())
+      val body = c.uiState.value.messages.filter { it.role == "assistant" }.single().text
+      assertFalse("resource-exhausted pending tools must leave no marker, got: ${body.take(120)}", body.contains("[tool:"))
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun wrappedIOExceptionSseTotalTooLargeInStreamingFlowInfersCodeAndSuppressesPendingFlush() {
+    val provider = ResExhaustFakeProvider()
+    provider.handler = {
+      streamingFlow {
+        emit(StreamEvent.ToolDelta(0, "id-0", "f", "{\"a\":1}"))
+        emit(StreamEvent.ToolDelta(0, null, null, "x"))
+        throw java.io.IOException("transport wrap", java.io.IOException(SSE_TOTAL_TOO_LARGE))
+      }
+    }
+    val probe = runBlocking {
+      provider.handler(ChatRequest(model = "m", messages = listOf(ChatMessage("user", "hi")))).toList()
+    }
+    val probeFailed = probe.filterIsInstance<StreamEvent.Failed>().single()
+    assertEquals(ProviderFailureCode.AGG_TOO_LARGE.name, probeFailed.code)
+    assertFalse("wrapped SSE_TOTAL_TOO_LARGE must be non-retryable", probeFailed.retryable)
+
+    val sink = ResExhaustRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      assertEquals("poisoned stream must not be retried", 1, provider.streamCalls.get())
+      awaitFailed(sink)
+      assertEquals(1, sink.failed.size)
+      runBlocking { assertTrue("transcript drain timed out", c.flushTranscript(8_000)) }
+      assertTrue("no poison-adjacent tool records may be persisted, got: ${sink.tools}", sink.tools.isEmpty())
+      val body = c.uiState.value.messages.filter { it.role == "assistant" }.single().text
+      assertFalse("resource-exhausted pending tools must leave no marker, got: ${body.take(120)}", body.contains("[tool:"))
+    } finally {
+      c.close()
+    }
   }
 
   @Test fun completedToolDonePreservedOnAttemptDeadlineExceeded() {

@@ -7,6 +7,8 @@ import java.net.ConnectException
 import java.net.NoRouteToHostException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.Locale
 import javax.net.ssl.SSLException
 
@@ -156,9 +158,9 @@ object ProviderErrorClassifier {
     }
 
     private fun classifyError(error: Throwable, body: String): FailureKind {
-        if (retryableBodyMarkers.any { body.contains(it) }) return FailureKind.RETRYABLE
+        val seen = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
         var cur: Throwable? = error
-        while (cur != null) {
+        while (cur != null && seen.add(cur)) {
             val msg = cur.message?.lowercase(Locale.ROOT)
             if (msg != null && fatalBodyMarkers.any { msg.contains(it) }) return FailureKind.FATAL
             when (cur) {
@@ -168,27 +170,10 @@ object ProviderErrorClassifier {
                 is java.net.MalformedURLException,
                 is java.net.URISyntaxException,
                 -> return FailureKind.FATAL
-                is SocketTimeoutException,
-                is ConnectException,
-                is NoRouteToHostException,
-                is UnknownHostException,
-                is EOFException,
-                is InterruptedIOException,
-                -> return FailureKind.RETRYABLE
-                is IOException -> {
-                    if (msg != null && (
-                        msg.contains("unexpected end of stream") ||
-                        msg.contains("eof") ||
-                        msg.contains("connection reset") ||
-                        msg.contains("broken pipe") ||
-                        msg.contains("stream was reset")
-                    )) {
-                        return FailureKind.RETRYABLE
-                    }
-                }
             }
             cur = cur.cause
         }
+        if (retryableBodyMarkers.any { body.contains(it) }) return FailureKind.RETRYABLE
         return FailureKind.RETRYABLE
     }
 

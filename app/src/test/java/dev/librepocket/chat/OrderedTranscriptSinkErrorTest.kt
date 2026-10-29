@@ -67,10 +67,10 @@ class OrderedTranscriptSinkErrorTest {
           assertTrue(sink.interruptedRunIds().contains("run-fatal"))
           assertTrue(sink.pendingRunIds().isEmpty())
           assertTrue(sink.hasDurableFailures())
-          assertFalse(sink.flushDurable())
-          // Fatal seals like teardown: writer dead, later cores fail fast.
+          // Fatal seals like teardown: wait for writer to seal before asserting post-seal flush.
           withTimeout(5_000) { while (!sink.isSealed()) delay(10) }
           assertTrue(sink.isSealed())
+          assertFalse(sink.flushDurable())
           val started = System.currentTimeMillis()
           withTimeout(4_000) {
             try {
@@ -136,9 +136,10 @@ class OrderedTranscriptSinkErrorTest {
           assertTrue(sink.interruptedRunIds().contains("run-linkage"))
           assertTrue(sink.pendingRunIds().isEmpty())
           assertTrue(sink.hasDurableFailures())
-          assertFalse(sink.flushDurable())
+          // Fatal seals like teardown: wait for writer to seal before asserting post-seal flush.
           withTimeout(5_000) { while (!sink.isSealed()) delay(10) }
           assertTrue(sink.isSealed())
+          assertFalse(sink.flushDurable())
           // Fatal seals like teardown: writer dead, later cores fail fast
           // (same post-fatal control as the sibling test above).
           val started = System.currentTimeMillis()

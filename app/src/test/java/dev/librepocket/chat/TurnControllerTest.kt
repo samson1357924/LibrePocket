@@ -418,7 +418,7 @@ class TurnControllerTest {
     }
     val c = controller(provider)
     c.steer("hello")
-    awaitTrue { assistantsOf(c).any { !it.isPartial } }
+    awaitTrue { c.uiState.value.status == ChatStatus.IDLE && assistantsOf(c).any { !it.isPartial } }
     assertEquals(listOf("hello"), usersOf(c))
     assertEquals(ChatStatus.IDLE, c.uiState.value.status)
   }

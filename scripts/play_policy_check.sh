@@ -198,7 +198,7 @@ esac
 # The repo requires both to exist; a vanished one must stop the gate here.
 for m in "$ROOT/app/src/main/AndroidManifest.xml" "$ROOT/app/src/$FLAVOR_DIR/AndroidManifest.xml"; do
     [ -f "$m" ] || fail "missing manifest: $m"
-    python3 "$SCRIPT_DIR/backup_rules_check.py" \
+    python3 -P "$SCRIPT_DIR/backup_rules_check.py" \
         --check-permission-removals "$PERM_TOKENS" \
         "$m"
 done
@@ -224,7 +224,7 @@ for m in "$ROOT"/app/src/*/AndroidManifest.xml; do
         *) continue ;;
     esac
     [ -f "$m" ] || fail "missing manifest: $m"
-    python3 "$SCRIPT_DIR/backup_rules_check.py" \
+    python3 -P "$SCRIPT_DIR/backup_rules_check.py" \
         --check-permission-removals "$PERM_TOKENS" \
         "$m"
 done
@@ -298,7 +298,7 @@ while IFS= read -r nsconfig; do
         "$ROOT/app/src/debug/"*) nsc_mode=debug ;;
         *) nsc_mode=release ;;
     esac
-    python3 "$SCRIPT_DIR/nsc_check.py" --mode "$nsc_mode" "$nsconfig"
+    python3 -P "$SCRIPT_DIR/nsc_check.py" --mode "$nsc_mode" "$nsconfig"
 done <<EOF
 $NSC_LIST
 EOF
@@ -311,10 +311,10 @@ done
 # 檔名↔root 綁定 fail-closed：backup_rules.xml 必須是 <full-backup-content>、
 # data_extraction_rules.xml 必須是 <data-extraction-rules>——root 與 Android
 # 預期不符時 runtime 會直接丟出解析例外（備份靜默停用），gate 不得誤判 PASS。
-python3 "$SCRIPT_DIR/backup_rules_check.py" \
+python3 -P "$SCRIPT_DIR/backup_rules_check.py" \
     --expect-root full-backup-content \
     "$ROOT/app/src/main/res/xml/backup_rules.xml"
-python3 "$SCRIPT_DIR/backup_rules_check.py" \
+python3 -P "$SCRIPT_DIR/backup_rules_check.py" \
     --expect-root data-extraction-rules \
     "$ROOT/app/src/main/res/xml/data_extraction_rules.xml"
 
@@ -328,11 +328,11 @@ python3 "$SCRIPT_DIR/backup_rules_check.py" \
 # missing flavor manifest 使整段 overlay 綁定驗證靜默失效＝fail-open）。
 MAIN_MANIFEST="$ROOT/app/src/main/AndroidManifest.xml"
 [ -f "$MAIN_MANIFEST" ] || fail "missing manifest: $MAIN_MANIFEST"
-python3 "$SCRIPT_DIR/backup_rules_check.py" --check-manifest --require-both "$MAIN_MANIFEST"
+python3 -P "$SCRIPT_DIR/backup_rules_check.py" --check-manifest --require-both "$MAIN_MANIFEST"
 for m in "$ROOT"/app/src/*/AndroidManifest.xml; do
     case "$m" in "$ROOT/app/src/main/AndroidManifest.xml") continue ;; esac
     [ -f "$m" ] || fail "missing manifest: $m"
-    python3 "$SCRIPT_DIR/backup_rules_check.py" --check-manifest "$m"
+    python3 -P "$SCRIPT_DIR/backup_rules_check.py" --check-manifest "$m"
 done
 # NSC 綁定縱深（attr↔resource）：上方的 source 級深掃只驗證了「存在的 NSC 檔」，
 # 但 merged manifest 若把 android:networkSecurityConfig rebind 到一個未被掃到的
@@ -342,11 +342,11 @@ done
 # 必須等值」。校驗語義（merger markers、quote-tolerant）由 backup_rules_check
 # .validate_manifest 以屬性集參數統一實作，nsc_check.py 只傳入自己的綁定。
 # NSC 綁定 loop 同樣 fail-closed：缺 overlay manifest 即 FAIL，不得靜默略過。
-python3 "$SCRIPT_DIR/nsc_check.py" --check-manifest --require-both "$MAIN_MANIFEST"
+python3 -P "$SCRIPT_DIR/nsc_check.py" --check-manifest --require-both "$MAIN_MANIFEST"
 for m in "$ROOT"/app/src/*/AndroidManifest.xml; do
     case "$m" in "$ROOT/app/src/main/AndroidManifest.xml") continue ;; esac
     [ -f "$m" ] || fail "missing manifest: $m"
-    python3 "$SCRIPT_DIR/nsc_check.py" --check-manifest "$m"
+    python3 -P "$SCRIPT_DIR/nsc_check.py" --check-manifest "$m"
 done
 
 # 縱深：掃描 app/src 下所有語意同形資源（檔名尾段含 backup*rules /
@@ -380,7 +380,7 @@ while IFS= read -r f; do
         *data-extraction*rules*.xml) broot=data-extraction-rules ;;
         *) continue ;;
     esac
-    python3 "$SCRIPT_DIR/backup_rules_check.py" --expect-root "$broot" "$f"
+    python3 -P "$SCRIPT_DIR/backup_rules_check.py" --expect-root "$broot" "$f"
 done <<EOF
 $BACKUP_RULES_FILES
 EOF
@@ -470,7 +470,7 @@ fi
 
 for ART in "$@"; do
     printf '== artifact (%s APK gate): %s ==\n' "$MODE" "$ART"
-    python3 "$ROOT/scripts/apk_policy_inspect.py" \
+    python3 -P "$ROOT/scripts/apk_policy_inspect.py" \
         --mode "$MODE" \
         --apk "$ART" \
         --aapt "$AAPT" \

@@ -4,7 +4,7 @@
 
 - **Scope:** Repository CI, local JVM/Robolectric tests, static policy gates, and separately scheduled Android device tests.
 - **Owner role:** CI/build maintainer; no individual is assigned here.
-- **Source of truth:** `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`, `.github/workflows/security-audit.yml`, `scripts/verify_jdk_floor.sh`, `scripts/docs_claim_check.sh`, `scripts/test_docs_claim_check.sh`, `scripts/mcp_scan.py`, `scripts/requirements-docs.txt`, `scripts/apk_policy_inspect.py`, `scripts/play_policy_check.sh`, `scripts/backup_rules_check.py`, `scripts/summarize_junit.py`, `scripts/tests/test_apk_policy_check.py`, `scripts/tests/test_summarize_junit.py`, `scripts/tests/test_gradle_wrapper_checksum.py`, `scripts/tests/test_verify_jdk_floor.py`, `github_bot/.nvmrc`, test source sets, Gradle wrapper/catalog, and the command results from the exact commit being assessed.
+- **Source of truth:** `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`, `.github/workflows/security-audit.yml`, `scripts/verify_jdk_floor.sh`, `scripts/docs_claim_check.sh`, `scripts/test_docs_claim_check.sh`, `scripts/mcp_scan.py`, `scripts/requirements-docs.txt`, `scripts/apk_policy_inspect.py`, `scripts/play_policy_check.sh`, `scripts/backup_rules_check.py`, `scripts/summarize_junit.py`, `scripts/check_workflow_policy.py`, `scripts/check_python_shadowing.sh`, `scripts/tests/test_apk_policy_check.py`, `scripts/tests/test_summarize_junit.py`, `scripts/tests/test_workflow_policy.py`, `scripts/tests/test_gradle_wrapper_checksum.py`, `scripts/tests/test_verify_jdk_floor.py`, `github_bot/.nvmrc`, test source sets, Gradle wrapper/catalog, and the command results from the exact commit being assessed.
 - **Update trigger:** CI, test source-set, Android SDK/JDK, policy-script, or merge-gate changes.
 
 ## Current CI scope
@@ -35,9 +35,15 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `scripts/tests/test_build_release_identity.py`,
 `scripts/tests/test_gradle_wrapper_checksum.py`,
 `scripts/tests/test_verify_jdk_floor.py`,
+`scripts/check_workflow_policy.py`,
+`scripts/tests/test_workflow_policy.py`,
+`scripts/check_python_shadowing.sh`,
 `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`,
-`.github/workflows/nightly-instrumented.yml`, `.github/workflows/**`, and
-`scripts/**`) outputs. The `policy` list includes workflow and script catch-alls:
+`.github/workflows/nightly-instrumented.yml`, `.github/workflows/**`,
+`.github/actions/**`, and
+`scripts/**`) outputs. There is no separate `workflow` filter or output:
+workflow and composite-action edits are policy inputs. The `policy` list
+includes workflow, action, and script catch-alls:
 the explicit entries above mirror the filter in `pr-check.yml`,
 they exist for readability/history, and the catch-all defaults any new
 `scripts/` harness code (checker or script test) into the gate with no
@@ -95,6 +101,185 @@ syntax of hashes attached to the PyYAML requirement, and specific command lines
 in the named install step. It does not authenticate hashes, establish artifact
 coverage, or guarantee that the workflow or step executes under every event or
 condition. Review the workflow and run results separately.
+
+`workflow-guard` is deliberately unconditional: it has no `needs`, no `if:`,
+and has exactly five steps — pinned checkout, the Python import-shadow
+preflight, the pinned, hash-checked `PyYAML==6.0.3` install from
+`scripts/requirements-docs.txt` (`--require-hashes --no-deps
+--only-binary=:all:`, `PIP_BREAK_SYSTEM_PACKAGES=1`), the checker and the
+harness — with a five-minute timeout. `--no-deps --only-binary=:all:` keeps
+pip from resolving transitive dependencies or building a local sdist/wheel
+before the checker runs, and the shadow preflight byte-pins
+`scripts/requirements-docs.txt` itself so a PR cannot turn the install step
+into code execution by editing the manifest. The commands are
+`python3 -P scripts/check_workflow_policy.py` and
+`PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 python3 -P -m unittest
+scripts/tests/test_workflow_policy.py`; the PyYAML version assertion also runs
+`python3 -P -c ...`. `-P` keeps the current directory and script directory off
+`sys.path` so a repo-local `yaml.py`/`unittest.py` cannot be imported before
+the shadow preflight; `PYTHONPATH="$PWD"` explicitly restores only the repo
+root that `python3 -m unittest scripts/tests/...` needs, and
+`PYTHONDONTWRITEBYTECODE=1` keeps `__pycache__` off the runner. The
+`policy-harness` and `docs-guard` jobs also run the shadow preflight before
+their Python steps; `policy-harness` installs the same PyYAML pin because its
+unittest command includes `scripts/tests/test_workflow_policy.py`.
+
+`scripts/check_python_shadowing.sh` is deliberately a shell script so no
+Python module can shadow the check itself. It enumerates the running
+interpreter's `sys.stdlib_module_names` (plus `yaml`, `_yaml`, `sitecustomize`,
+`usercustomize`, `pip`, `wheel`, `setuptools`) and rejects any top-level
+`.py`/`.pyc`/`.pyd`/`.so` file or package directory with one of those names
+in the two directories that become `sys.path` roots for the CI commands: the
+repo root (for `python3 -m unittest` with `PYTHONPATH="$PWD"`) and `scripts/`
+(for `python3 scripts/...`). This covers `hashlib.py`, `glob.py`, `unittest.py`
+and every other stdlib name, not only PyYAML and the test runner. It also
+rejects any `.pth` file outside `.git` and byte-pins
+`scripts/requirements-docs.txt` to its reviewed SHA-256 before pip consumes
+it. `check_workflow_policy.py` repeats the equivalent stdlib/`.pth`/
+requirements scan so synthetic semantic fixtures (which disable the workflow
+byte hashes) still exercise it. The gate scripts that delegate to a sibling
+module (`apk_policy_inspect.py`, `nsc_check.py`, `release_artifact_stage.py`,
+`fake_keystore_rehearsal.py`) load that exact file with
+`importlib.util.spec_from_file_location` instead of inserting `scripts/` into
+`sys.path`, so a checked-in `scripts/hashlib.py` cannot change the delegated
+gate. CI Python invocations use `-P` for the same reason; `PYTHONPATH="$PWD"`
+is the only explicit path restoration, and it is limited to the unittest
+commands that need the repo package root.
+
+Gating `workflow-guard` on the path filter it validates would let a PR edit
+that filter or the `changes` outputs to skip its own guard. Workflow and
+composite-action edits are therefore `policy` inputs, and a `pr-check.yml`
+edit is additionally `code`, so the full Gradle gate still runs.
+
+All six reviewed workflow files (`codeql.yml`, `nightly-instrumented.yml`,
+`pocketguard.yml`, `pr-check.yml`, `release.yml`, `security-audit.yml`) are
+also pinned to the SHA-256 of their raw checked-in bytes. Any extra-step/no-op
+mutation that the semantic checks do not model changes the bytes and fails the
+checker. An intentional workflow edit must update `EXPECTED_WORKFLOW_SHA256`
+in the same reviewed PR; a separate "make CI green" pin bump is not an
+accepted change. The hash pin is a review regression guard, not tamper-proof:
+a PR that edits the checker and a workflow together can still weaken both.
+The real boundary is branch protection plus CODEOWNERS/review rules; see the
+current `main` settings below.
+
+The checker parses every `.github/workflows/*.yml|*.yaml` and referenced
+`action.yml|yaml` with `yaml.safe_load` plus a duplicate-key-rejecting loader
+(`DuplicateKeySafeLoader`); it fails closed on a missing PyYAML import,
+unreadable/invalid YAML, a non-mapping root, duplicate keys, and YAML 1.1's
+boolean `on:` key collision. YAML merge keys (`<<`) are forbidden at
+construction time by `DuplicateKeySafeLoader`. Flow style, quoted keys,
+next-line scalars and anchors/aliases are resolved by the parser rather than by
+text matching. Comprehensive test coverage for the workflow policy checker is
+maintained in `scripts/tests/test_workflow_policy.py` (198 tests). It fails
+closed with `file:line` diagnostics on these pinned invariants:
+
+- only the reviewed workflow filenames (`codeql.yml`,
+  `nightly-instrumented.yml`, `pocketguard.yml`, `pr-check.yml`,
+  `release.yml`, `security-audit.yml`) may exist; all six are required, and an
+  extra workflow such as `publish.yml` is a finding;
+- workflows must declare an explicit top-level `permissions:` mapping;
+- all `write` permissions are globally rejected; the only allowed exceptions
+  are `pull-requests: write` and `issues: write` exclusively on
+  `pocketguard.yml`, and `security-events: write` exclusively on `codeql.yml`.
+  Every `permissions:` mapping at any indentation rejects `write-all` and
+  `contents: write`, including quoted keys/values, inline flow mappings and
+  anchored mappings;
+- no top-level `env` or `defaults` (and no `defaults` block anywhere);
+- every remote `uses:` is `owner/repo[/path]@` plus a full 40-character
+  lowercase commit SHA; local `./...` actions resolve only below
+  `.github/actions/` (traversal, absolute paths and outside paths are
+  rejected), and referenced composite actions are recursively parsed with the
+  same `uses`/permissions rules; tags, branches, short SHAs, and docker refs
+  are rejected;
+- `pr-check.yml` job keys must strictly match the set of required jobs
+  (`EXPECTED_PR_GATE_NEEDS | {"pr-gate"}`); unexpected jobs cause immediate
+  policy failure;
+- any workflow or local composite action other than `release.yml` is rejected
+  if it has a `push.tags` trigger, contains `gh release`, calls the GitHub
+  releases API (`gh api` or `api.github.com` with a `.../releases` or
+  `.../releases/assets` path), references `secrets.RELEASE_TOKEN` or
+  `secrets.GH_PAT`, or uses an action whose owner/repo/path names
+  `release`/`publish`, so neither a workflow nor a local action can be
+  repurposed as a publisher;
+- `pull_request_target` workflows may not use anchors/aliases or local
+  actions; every checkout `with:` mapping accepts only the lower-case inputs
+  `ref`/`persist-credentials`/`fetch-depth`, where `ref` must be exactly
+  `${{ github.event.repository.default_branch }}` (or omitted),
+  `persist-credentials` must be boolean `false`, and `fetch-depth` must be
+  `0`; case variants, other checkout inputs, PR-head refs, literal branches,
+  `merge_commit_sha` and repository overrides are rejected;
+- `release.yml` pins `on:` to exactly the `push.tags` glob
+  `v[0-9]*.[0-9]*.[0-9]*` plus `workflow_dispatch`, has exactly one
+  `release-disabled` job (keys only `name`/`runs-on`/`steps`) and exactly one
+  step (keys only `name`/`shell`/`run`), `shell: bash`, no `if:`,
+  `continue-on-error`, `env:`, `uses:`, secrets, any `token` word, write
+  permission, `gh release`, or publish word/job; top-level permissions are
+  exactly `contents: read`, and the run block is exactly the checked-in
+  fail-closed echo + `exit 1` body (shell wrappers, conditionals,
+  substitutions and multi-line variants are rejected);
+- `nightly-instrumented.yml` has exactly the `schedule`, `workflow_dispatch`
+  and `pull_request` triggers, the `0 20 * * *` cron, the exact pull_request
+  type set `labeled`/`synchronize`/`opened`/`reopened`, exact concurrency
+  group/`cancel-in-progress` expressions, and exactly the
+  `nightly-unit-stress`/`instrumented-test` jobs; it pins the stress
+  if/timeout constraints, job keys, env `NIGHTLY_STRESS=1` and exact full-stress Gradle command
+  with no `continue-on-error`, plus the instrumented label gate, exact job
+  keys, `fail-fast: false`, matrix `api-level` `[33, 34]`, flavors
+  `[Play, Foss, Github]`, target/arch and the exact emulator
+  connectedAndroidTest command;
+- `security-audit.yml` pins `on:` exactly (push/pull_request on `main`, the
+  Monday 12:00 cron and `workflow_dispatch`) and has exactly the
+  `gitleaks`/`dependency-review` jobs, each using exactly one full-SHA-pinned
+  gitleaks or dependency-review action with pinned step `env`/`with`;
+  `gitleaks` has no job/step `if:` or `continue-on-error`, and
+  `dependency-review`'s job `if:` is exactly
+  `github.event_name == 'pull_request'`; `codeql.yml` pins `on:` and the exact
+  reviewed `paths-ignore` list (no extra/broad patterns), has exactly the
+  `codeql` job, no job/step `if:`/`continue-on-error`, and one pinned
+  `github/codeql-action/init` plus one pinned `github/codeql-action/analyze`
+  step; `pocketguard.yml` pins its
+  `pull_request_target`/`issues`/`issue_comment` types exactly, has exactly
+  `prepare-tag`/`claim-slot`/`review-send`/`publish`, no job-level
+  `continue-on-error`, the exact current job-level `if:` expressions, a
+  non-empty publish step list, and a `review-send` run that actually invokes
+  the bot via node/npm/local script (an `echo`/`true`/`:` decoy does not
+  pass);
+- `pr-check.yml` has exactly the `pull_request`/`push` triggers on `main`
+  (no `pull_request_target`, `paths`, `paths-ignore` or `types`); its job keys
+  must strictly match the set of required jobs (`EXPECTED_PR_GATE_NEEDS | {"pr-gate"}`)
+  with unexpected jobs causing immediate policy failure; the `changes` job has exact keys
+  (`name`/`runs-on`/`timeout-minutes`/`permissions`/`outputs`/`steps`),
+  `permissions: contents: read`, exactly the `code`/`policy`/`bot` outputs
+  mapped to the matching `steps.filter` outputs, and exactly two steps: the
+  pinned checkout with `fetch-depth: 0` and the pinned
+  `dorny/paths-filter` step with `id: filter` and only a `filters` input; the
+  parsed filter sets are exactly `code`/`policy`/`bot` with no negations,
+  whitespace, duplicates or extra patterns, and `policy` includes
+  `.github/workflows/**`/`.github/actions/**` while no `workflow` filter
+  exists;
+- `workflow-guard` has exact keys `name`/`runs-on`/`timeout-minutes`/`steps`
+  (no `needs` or `if:`), and exactly five steps: pinned checkout, Python
+  import-shadow preflight, pinned PyYAML install
+  (`PIP_BREAK_SYSTEM_PACKAGES=1`), checker and harness; no step may add
+  `if:`/`continue-on-error`/`shell`/`working-directory`/unexpected `env`, and
+  `policy-harness`/`docs-guard` must each keep exactly one preflight step;
+- `pr-gate` pins its exact keys/name/`if: always()`, a `needs` set that still
+  includes `workflow-guard`, one `name`/`env`/`run` step, exactly the 11
+  result/output env values (no `WORKFLOW_PATHS`), and a SHA-256-pinned gate
+  script that must explicitly fail unless `WORKFLOW` is `success`;
+- the required PR jobs (`unit-tests`, `lint`, `policy-harness`,
+  `build-and-policy-gate`, `docs-guard`, `bot-tests`) pin their job-level
+  `if:`/`env` and core run commands; each pinned core step allows only
+  `name`/`run` (plus the exact `github_bot` working-directory for bot tests)
+  and rejects step-level `if:`/`continue-on-error`/`shell`/unexpected
+  `working-directory`; `unit-tests` must keep `fail-fast: false` and
+  `matrix.flavor` exactly `[play, foss, github]`, and `policy-harness` must
+  keep the pinned PyYAML install, the import-shadow preflight and the unittest
+  command containing `scripts/tests/test_workflow_policy.py` (198 tests). Separately, the
+  whole `pr-check.yml` is byte-pinned (as are all six reviewed workflows): the
+  per-job checks pin the core commands, not every possible extra step, so the
+  raw-byte SHA-256 pin is what rejects an inserted no-op step anywhere else in
+  the file.
 
 The docs guard and its fixture self-test share one stdlib-only scanner,
 `scripts/mcp_scan.py` (subcommands `discover`, `module-roots`, `types`,
@@ -188,12 +373,14 @@ gates are retained (defense in depth, still reject wasteful huge loops).
 
 What runs by edit type:
 
-- Docs-only (neither `code`, `policy`, nor `bot`, e.g. `docs/**` or root `*.md` edits): unit tests, lint, and build/policy are skipped; `docs-guard` and `pr-gate` still run.
-- Bot-only (`bot == true` and neither `code` nor `policy`, e.g. `github_bot/**` edits including its README): runs `PocketGuard Bot Tests` (`bot-tests`) setting up Node.js via `node-version-file: 'github_bot/.nvmrc'` (24.22.1), running `npm ci --ignore-scripts`, `npm test`, and `npm run build`; `changes`, `docs-guard`, and `pr-gate` still run; Gradle stages are skipped.
-- Policy-script-only (any `policy` path edit, `code == false`): build/policy and the stdlib Python policy harness run; unit tests and lint are skipped and resolved as pass by `pr-gate`. The harness runs both the Python unit tests AND the repo-wide `python3 scripts/check_test_budgets.py` scan (PR #87 P2-4: script-only diffs skip the `unit-tests` job that otherwise hosts that gate, so the scan is wired into `policy-harness` too — pinned by `PolicyCiGateControl.test_policy_harness_runs_repo_budget_guard`). A scanner-only diff therefore cannot pass with all policy validation skipped.
-- Workflow-only edit to `pr-check.yml`: counts as `code`, `policy`, and `bot`, so all Gradle stages, the Python policy harness, and the bot tests run. Any `.github/workflows/**` edit selects `policy`, including `codeql.yml`, `nightly-instrumented.yml`, and new workflows; `pocketguard.yml` also selects `bot`. The workflow snapshot detects workflow file changes, but not changes to indirectly invoked scripts; manual review remains necessary.
-- Mixed docs + code edits (`code == true`): all Gradle stages and `docs-guard` run; the policy harness and bot tests also run if their respective filters match.
-- Mixed docs + policy-only edits (`policy == true`, `code == false`): build/policy, the policy harness, and `docs-guard` run; unit tests and lint are skipped. Bot tests also run if `bot == true`.
+- Docs-only (neither `code` nor `policy` nor `bot`, e.g. `docs/**` or `*.md` edits): unit tests, lint, build/policy, the policy harness, and bot tests are skipped; the unconditional `workflow-guard`, `docs-guard`, and `pr-gate` still run.
+- Bot-only (`bot == true` and neither `code` nor `policy`, e.g. `github_bot/**` edits including its README, or `.github/workflows/pocketguard.yml`): runs `PocketGuard Bot Tests` (`bot-tests`) setting up Node.js via `node-version-file: 'github_bot/.nvmrc'` (24.22.1), running `npm ci --ignore-scripts`, `npm test`, and `npm run build`; the unconditional `workflow-guard`, `changes`, `docs-guard`, and `pr-gate` still run; Gradle stages are skipped.
+- Policy-script-only (any `policy` path edit, `code == false`): the unconditional `workflow-guard`, build/policy, and the Python policy harness (including the pinned PyYAML install) run; unit tests and lint are skipped and resolved as pass by `pr-gate`. The harness runs both the Python unit tests AND the repo-wide `python3 scripts/check_test_budgets.py` scan (PR #87 P2-4: script-only diffs skip the `unit-tests` job that otherwise hosts that gate, so the scan is wired into `policy-harness` too — pinned by `PolicyCiGateControl.test_policy_harness_runs_repo_budget_guard`). A scanner-only diff therefore cannot pass with all policy validation skipped.
+- Workflow or composite-action-only edit to a non-`pr-check.yml` file (e.g. `nightly-instrumented.yml`, `release.yml`, `codeql.yml`, `security-audit.yml`, `pocketguard.yml`, or `.github/actions/**`): the edit is a `policy` input, so `workflow-guard`, the Python policy harness, and `build-and-policy-gate` run while unit tests and lint skip; a `pocketguard.yml` edit is also a `bot` input and runs `bot-tests`. There is no skip path for the guard itself: it runs on every PR.
+- Workflow-policy script-only edit (`scripts/check_workflow_policy.py`, `scripts/tests/test_workflow_policy.py` or `scripts/check_python_shadowing.sh`): `policy == true`, so `workflow-guard`, the Python policy harness, and `build-and-policy-gate` run. The build job performs the six-variant (debug+release × play/foss/github) assembly and APK policy checks; unit tests and lint skip and are resolved as pass by `pr-gate`.
+- Workflow-only edit to `pr-check.yml`: counts as `code`, `policy`, and `bot`, so all Gradle stages, the Python policy harness, `workflow-guard`, and `bot-tests` run. The harness pin tests therefore execute exactly when the wiring they validate changes.
+- Mixed docs + code edits (`code == true`): all Gradle stages, `workflow-guard`, and `docs-guard` run; the policy harness and bot tests also run if their respective filters match.
+- Mixed docs + policy-only edits (`policy == true`, `code == false`): the unconditional `workflow-guard`, build/policy, the policy harness, and `docs-guard` run; unit tests and lint are skipped. Bot tests also run if `bot == true`.
 - Stacked PRs (base is not `main`, e.g. a fix branch targeting a feature branch): no PR Check run attaches to the stacked PR itself. Record local runs (base SHA, exact commands and exit status); `pr-check.yml` cannot be dispatched manually. Once the feature branch has a PR targeting `main`, observe the applicable gate there before closing the related issue.
 
 Static analysis lives outside `pr-check.yml`: CodeQL runs in
@@ -213,7 +400,20 @@ is not enabled, repository rulesets are 0, required approving reviews are
 enforcement (not review or admin enforcement). Re-check the current
 configuration with `gh api repos/<owner>/<repo>/branches/main/protection`.
 
-The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy, release-identity, and JDK floor harnesses (standard library only) run in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. The command is `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py scripts/tests/test_gradle_wrapper_checksum.py scripts/tests/test_verify_jdk_floor.py`. These tests use synthetic APK-like files and fake Gradle/SDK/policy commands; they do not prove real APK or SDK behavior. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
+The workflow checks are static and co-located with the code they validate: a
+PR can edit `scripts/check_workflow_policy.py`, its harness, and a workflow in
+the same commit, and the checks that run are the edited versions. Branch
+protection still requires the new commit's `PR Gate` (and the security
+checks), but it cannot detect a weakened checker. With `enforce_admins` off,
+no repository rulesets, no CODEOWNERS, and zero required approving reviews,
+nothing outside human review prevents a self-consistent weakening of the
+guard. The checker also does not model the Actions expression engine, action
+implementation code, repository settings, or runtime behavior, so it is a
+drift/bypass guard rather than a tamper-proof policy authority. Closing that
+gap needs CODEOWNERS/required reviewers or an external policy source, neither
+of which is currently configured.
+
+The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy, release-identity, and JDK floor harnesses run in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. The job installs the pinned, hash-checked `PyYAML==6.0.3` from `scripts/requirements-docs.txt` before running `PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 python3 -P -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py scripts/tests/test_gradle_wrapper_checksum.py scripts/tests/test_verify_jdk_floor.py scripts/tests/test_workflow_policy.py`. These tests use synthetic APK-like files and fake Gradle/SDK/policy commands; they do not prove real APK or SDK behavior. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
 
 Issue #86 Phase C guardrails (Current, gates — only reject/alert, never
 silently downgrade redaction or writes):

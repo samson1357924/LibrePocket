@@ -2514,8 +2514,8 @@ class ChatSessionLifecycleTest {
             assertEquals(listOf("A", "B"), provider.sent.toList())
             // B's successful Retry surfaces the older denied candidate in the
             // input draft; it does not auto-send it or lose it from recovery.
-            assertEquals("older candidate", vm.input.value)
-            assertEquals(0, vm.pendingRecoveryCount.value)
+            withTimeout(5_000) { vm.input.first { it == "older candidate" } }
+            withTimeout(5_000) { vm.pendingRecoveryCount.first { it == 0 } }
             assertEquals("older candidate must remain explicit recovery, never auto-send", listOf("A", "B"), provider.sent.toList())
 
             chatMain.run { vm.send() }

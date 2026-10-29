@@ -3614,9 +3614,14 @@ class PolicyCiGateControl(unittest.TestCase):
             "scripts/tests/test_check_junit_durations.py",
             "scripts/tests/test_gradle_wrapper_checksum.py",
             "scripts/tests/test_verify_jdk_floor.py",
+            "scripts/check_workflow_policy.py",
+            "scripts/tests/test_workflow_policy.py",
+            "scripts/check_python_shadowing.sh",
             ".github/workflows/pr-check.yml",
             ".github/workflows/codeql.yml",
             ".github/workflows/nightly-instrumented.yml",
+            ".github/workflows/**",
+            ".github/actions/**",
             "gradle/wrapper/**",
             # Trailing catch-all (kept LAST in the yml list): defaults any
             # new scripts/ harness code into the policy gate without a
@@ -3641,9 +3646,13 @@ class PolicyCiGateControl(unittest.TestCase):
             ["scripts/tests/test_check_junit_durations.py"],
             ["scripts/tests/test_gradle_wrapper_checksum.py"],
             ["scripts/tests/test_verify_jdk_floor.py"],
+            ["scripts/check_workflow_policy.py"],
+            ["scripts/tests/test_workflow_policy.py"],
+            ["scripts/check_python_shadowing.sh"],
             [".github/workflows/pr-check.yml"],
             [".github/workflows/codeql.yml"],
             [".github/workflows/nightly-instrumented.yml"],
+            [".github/actions/local-check/action.yml"],
             ["gradle/wrapper/gradle-wrapper.properties"],
             ["gradle/wrapper/gradle-wrapper.jar"],
         ):
@@ -3762,7 +3771,7 @@ class PolicyCiGateControl(unittest.TestCase):
     def test_pr_gate_requires_policy_harness(self) -> None:
         workflow = PR_CHECK_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("policy-harness", workflow)
-        self.assertIn("needs: [changes, unit-tests, lint, build-and-policy-gate, policy-harness, docs-guard, bot-tests]", workflow)
+        self.assertIn("needs: [changes, unit-tests, lint, build-and-policy-gate, policy-harness, workflow-guard, docs-guard, bot-tests]", workflow)
         self.assertIn("needs.policy-harness.result", workflow)
         self.assertIn("policy-harness skipped but policy=", workflow)
         for test_path in (
@@ -3774,11 +3783,106 @@ class PolicyCiGateControl(unittest.TestCase):
             "scripts/tests/test_check_junit_durations.py",
             "scripts/tests/test_gradle_wrapper_checksum.py",
             "scripts/tests/test_verify_jdk_floor.py",
+            "scripts/tests/test_workflow_policy.py",
         ):
             with self.subTest(test_path=test_path):
                 self.assertIn(test_path, workflow)
         self.assertIn(
-            "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py scripts/tests/test_gradle_wrapper_checksum.py scripts/tests/test_verify_jdk_floor.py",
+            'PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 python3 -P -m unittest '
+            "scripts/tests/test_apk_policy_check.py "
+            "scripts/tests/test_release_artifact_verifier.py "
+            "scripts/tests/test_build_release_identity.py "
+            "scripts/tests/test_summarize_junit.py "
+            "scripts/tests/test_check_test_budgets.py "
+            "scripts/tests/test_check_junit_durations.py "
+            "scripts/tests/test_gradle_wrapper_checksum.py "
+            "scripts/tests/test_verify_jdk_floor.py "
+            "scripts/tests/test_workflow_policy.py",
+            workflow,
+        )
+
+    def test_workflow_only_diff_runs_workflow_guard(self) -> None:
+        """A workflow-only edit must not pass through skipped Gradle jobs."""
+        workflow = PR_CHECK_WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("      workflow: ${{ steps.filter.outputs.workflow }}\n", workflow)
+        self.assertNotIn("WORKFLOW_PATHS", workflow)
+        self.assertIn(
+            "      code: ${{ steps.filter.outputs.code }}\n"
+            "      policy: ${{ steps.filter.outputs.policy }}\n"
+            "      bot: ${{ steps.filter.outputs.bot }}\n",
+            workflow,
+        )
+        self.assertIn(
+            "            policy:\n",
+            workflow,
+        )
+        self.assertIn("              - 'gradle/wrapper/**'\n", workflow)
+        self.assertIn("              - '.github/workflows/**'\n", workflow)
+        self.assertIn("              - '.github/actions/**'\n", workflow)
+        self.assertNotIn("            workflow:\n", workflow)
+        self.assertIn(
+            "  workflow-guard:\n"
+            "    name: Workflow Policy Guard\n",
+            workflow,
+        )
+        guard_start = workflow.index("  workflow-guard:\n")
+        guard_end = workflow.index("  unit-tests:\n")
+        guard_block = workflow[guard_start:guard_end]
+        self.assertNotIn("    needs:", guard_block)
+        self.assertNotIn("    if:", guard_block)
+        self.assertIn("    runs-on: ubuntu-latest\n", guard_block)
+        self.assertIn("    timeout-minutes: 5\n", guard_block)
+        self.assertEqual(5, guard_block.count("      - name: "))
+        self.assertIn(
+            "      - name: Reject Python import shadowing\n"
+            "        run: |\n"
+            "          chmod +x scripts/check_python_shadowing.sh\n"
+            "          scripts/check_python_shadowing.sh\n",
+            guard_block,
+        )
+        self.assertIn(
+            "          python3 -P -c 'import yaml; assert yaml.__version__ == "
+            '"6.0.3", yaml.__version__\'\n',
+            guard_block,
+        )
+        self.assertIn(
+            "      - name: Check workflow policy\n"
+            "        run: python3 -P scripts/check_workflow_policy.py\n",
+            workflow,
+        )
+        self.assertIn(
+            "      - name: Run workflow policy harness\n"
+            '        run: PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 '
+            "python3 -P -m unittest scripts/tests/test_workflow_policy.py\n",
+            workflow,
+        )
+        for job_marker, next_marker in (
+            ("  policy-harness:\n", "  build-and-policy-gate:\n"),
+            ("  docs-guard:\n", "  bot-tests:\n"),
+        ):
+            block = workflow[
+                workflow.index(job_marker) : workflow.index(next_marker)
+            ]
+            self.assertEqual(1, block.count("      - name: Reject Python import shadowing\n"))
+        self.assertIn(
+            "          WORKFLOW: ${{ needs.workflow-guard.result }}\n", workflow
+        )
+        self.assertIn(
+            "          if [ \"$WORKFLOW\" != \"success\" ]; then\n"
+            "            echo \"pr-gate: workflow-guard did not succeed (result=$WORKFLOW)\"\n"
+            "            fail=1\n"
+            "          else\n"
+            "            echo \"pr-gate: workflow-guard passed\"\n"
+            "          fi\n",
+            workflow,
+        )
+        self.assertNotIn('case "$WORKFLOW" in', workflow)
+        self.assertNotIn("workflow-guard skipped", workflow)
+        self.assertIn(
+            "          if [ \"$fail\" -ne 0 ]; then\n"
+            "            echo \"pr-gate: FAILED\"\n"
+            "            exit 1\n"
+            "          fi\n",
             workflow,
         )
 
@@ -5418,7 +5522,7 @@ class BackupRulesGateWiring(unittest.TestCase):
             r'for m in "\$ROOT/app/src/main/AndroidManifest\.xml"'
             r' "\$ROOT/app/src/\$FLAVOR_DIR/AndroidManifest\.xml"; do\n'
             r'    \[ -f "\$m" \] \|\| fail "missing manifest: \$m"\n'
-            r'    python3 "\$SCRIPT_DIR/backup_rules_check\.py" \\',
+            r'    python3 -P "\$SCRIPT_DIR/backup_rules_check\.py" \\',
         )
         # Extended per-lane universe: a full glob over every source set's
         # manifest (existence = merge candidate; a future release/ or
@@ -5439,7 +5543,7 @@ class BackupRulesGateWiring(unittest.TestCase):
             r'        \*\) continue ;;\n'
             r'    esac\n'
             r'    \[ -f "\$m" \] \|\| fail "missing manifest: \$m"\n'
-            r'    python3 "\$SCRIPT_DIR/backup_rules_check\.py" \\\n'
+            r'    python3 -P "\$SCRIPT_DIR/backup_rules_check\.py" \\\n'
             r'        --check-permission-removals "\$PERM_TOKENS" \\\n'
             r'        "\$m"\n'
             r'done\n',
@@ -6732,7 +6836,7 @@ class NscGateWiring(unittest.TestCase):
         # Per-file structured validation with the source-set→mode routing
         # (debug source set → debug rules; everything else → release).
         text = POLICY_CHECK.read_text(encoding="utf-8")
-        self.assertIn('python3 "$SCRIPT_DIR/nsc_check.py" --mode "$nsc_mode"', text)
+        self.assertIn('python3 -P "$SCRIPT_DIR/nsc_check.py" --mode "$nsc_mode"', text)
         self.assertIn('case "$nsconfig" in', text)
         self.assertIn('"$ROOT/app/src/debug/"*) nsc_mode=debug ;;', text)
         self.assertIn("*) nsc_mode=release ;;", text)
@@ -6751,7 +6855,7 @@ class NscGateWiring(unittest.TestCase):
         # pins must ride the nsc_check.py CLI, NOT the backup checker.
         text = POLICY_CHECK.read_text(encoding="utf-8")
         self.assertIn(
-            'python3 "$SCRIPT_DIR/nsc_check.py" --check-manifest --require-both "$MAIN_MANIFEST"',
+            'python3 -P "$SCRIPT_DIR/nsc_check.py" --check-manifest --require-both "$MAIN_MANIFEST"',
             text,
         )
         self.assertRegex(text, r"python3 .+nsc_check\.py.+--check-manifest")

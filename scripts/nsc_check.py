@@ -146,9 +146,12 @@ from __future__ import annotations
 
 import base64
 import datetime
+import importlib.util
 import os
 import stat
 import sys
+import types
+from pathlib import Path
 import xml.etree.ElementTree as ET
 from typing import Callable
 
@@ -876,22 +879,39 @@ def validate(path: str, mode: str) -> list[str]:
     return validate_tree(root, mode, path)
 
 
-def _import_backup_rules_check():
-    """Import the sibling ``backup_rules_check`` regardless of the caller's sys.path.
+def _load_sibling_module(name: str) -> types.ModuleType:
+    pkg = __name__.rpartition(".")[0]
+    scoped_name = f"{pkg}.{name}" if pkg else name
+    existing = sys.modules.get(scoped_name) or sys.modules.get(name)
+    if existing is not None:
+        return existing
+    path = Path(__file__).resolve().with_name(f"{name}.py")
+    if not path.is_file():
+        raise FileNotFoundError(f"cannot find sibling module: {path}")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load sibling module: {name} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    if scoped_name != name:
+        sys.modules[scoped_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        if scoped_name != name:
+            sys.modules.pop(scoped_name, None)
+        raise
+    return module
 
-    The shell gate runs this file by absolute path (sys.path[0] = scripts/),
-    while tests import it as ``scripts.nsc_check`` with the repo root on
-    sys.path; inserting this file's own directory keeps the marker-semantics
-    delegation working on both surfaces.
+
+def _import_backup_rules_check() -> types.ModuleType:
+    """Load the sibling ``backup_rules_check`` by file path.
+
+    Adding ``scripts/`` to ``sys.path`` would let a checked-in stdlib shadow
+    module change the delegated marker semantics. Load the exact file instead.
     """
-    from pathlib import Path
-
-    scripts_dir = str(Path(__file__).resolve().parent)
-    if scripts_dir not in sys.path:
-        sys.path.insert(0, scripts_dir)
-    import backup_rules_check
-
-    return backup_rules_check
+    return _load_sibling_module("backup_rules_check")
 
 
 def validate_manifest(path: str, require_both: bool = False) -> list[str]:

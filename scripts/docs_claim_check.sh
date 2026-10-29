@@ -93,7 +93,7 @@ report() { echo "docs_claim_check: $1"; fail=1; }
 # this whole section whenever the script was invoked from another directory.
 for wf in "$ROOT"/.github/workflows/*.yml; do
   [ -f "$wf" ] || continue
-  if ! python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$wf" >/dev/null 2>&1; then
+  if ! python3 -P -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$wf" >/dev/null 2>&1; then
     report "${wf#"$ROOT"/} is not valid YAML (workflow would be disabled)"
   fi
   if grep -nE '^[[:space:]]*//' "$wf" >/dev/null 2>&1; then
@@ -118,7 +118,7 @@ if [ "$fail" -ne 0 ]; then exit 1; fi
 # a module literally named `build` keeps its manifests, sources and build
 # files while generated `<module>/build` output stays excluded.
 MODULE_ROOTS=()
-if ! ROOTS_OUT="$(python3 "$MCP_SCAN" module-roots "$ROOT" 2>&1)"; then
+if ! ROOTS_OUT="$(python3 -P "$MCP_SCAN" module-roots "$ROOT" 2>&1)"; then
   report "cannot determine Gradle module roots (fail closed): $ROOTS_OUT"
 elif [ -z "$ROOTS_OUT" ]; then
   report "module-roots returned no roots (fail closed)"
@@ -306,7 +306,7 @@ elif [ ! -r "$MCP_SCAN" ]; then
   report "helper scripts/mcp_scan.py missing or unreadable (fail closed)"
 else
   set +e
-  PROD_LIST="$(python3 "$MCP_SCAN" discover "$ROOT" 2>&1)"
+  PROD_LIST="$(python3 -P "$MCP_SCAN" discover "$ROOT" 2>&1)"
   DISC_RC=$?
   set -e
   if [ "$DISC_RC" -ne 0 ]; then
@@ -382,7 +382,7 @@ if [ "${#PROD_FILES[@]}" -gt 0 ]; then
     PKG_SCAN_FAILED=1
   else
     set +e
-    PKG_TSV="$(python3 - "$ROOT" "${PROD_FILES[@]}" <<'PY'
+    PKG_TSV="$(python3 -P - "$ROOT" "${PROD_FILES[@]}" <<'PY'
 import os
 import re
 import sys
@@ -812,7 +812,7 @@ if [ "${#IN_PKG_FILES[@]}" -gt 0 ]; then
     report "helper scripts/mcp_scan.py missing or unreadable (fail closed)"
   else
     set +e
-    TYPE_NAMES="$(python3 "$MCP_SCAN" types "$ROOT" \
+    TYPE_NAMES="$(python3 -P "$MCP_SCAN" types "$ROOT" \
       "${IN_PKG_FILES[@]}" 2>&1)"
     TYPE_RC=$?
     set -e
@@ -910,7 +910,7 @@ else
     report "python3 not available for AndroidManifest XML parsing (fail closed)"
   else
     set +e
-    MF_XML_OUT="$(python3 - "$ROOT" "$TYPE_NAMES" \
+    MF_XML_OUT="$(python3 -P - "$ROOT" "$TYPE_NAMES" \
       "${#IN_PKG_FILES[@]}" \
       ${IN_PKG_FILES[@]+"${IN_PKG_FILES[@]}"} "${MANIFESTS[@]}" <<'PY'
 import os
@@ -1213,7 +1213,7 @@ if [ "${#GRADLE_FILES[@]}" -gt 0 ] || [ "${#PROPERTIES_FILES[@]}" -gt 0 ] \
     report "python3 not available for gradle injection scan (fail closed)"
   else
     set +e
-    GR_OUT="$(python3 - "$ROOT" "${#GRADLE_FILES[@]}" \
+    GR_OUT="$(python3 -P - "$ROOT" "${#GRADLE_FILES[@]}" \
       ${GRADLE_FILES[@]+"${GRADLE_FILES[@]}"} \
       "${#PROPERTIES_FILES[@]}" \
       ${PROPERTIES_FILES[@]+"${PROPERTIES_FILES[@]}"} \
@@ -3283,7 +3283,7 @@ if [ "${#IN_PKG_FILES[@]}" -gt 0 ]; then
     report "helper scripts/mcp_scan.py missing or unreadable (fail closed)"
   else
     set +e
-    MCP_OB="$(python3 "$MCP_SCAN" outbound "$ROOT" \
+    MCP_OB="$(python3 -P "$MCP_SCAN" outbound "$ROOT" \
       "${IN_PKG_FILES[@]}" 2>&1)"
     OB_RC=$?
     set -e
@@ -3342,7 +3342,7 @@ if [ "${#OUTSIDE_FILES[@]}" -gt 0 ]; then
     report "python3 not available for production source scan (fail closed)"
   else
     set +e
-    MCP_OUT="$(python3 - "$ROOT" ${OUTSIDE_FILES[@]+"${OUTSIDE_FILES[@]}"} <<'PY'
+    MCP_OUT="$(python3 -P - "$ROOT" ${OUTSIDE_FILES[@]+"${OUTSIDE_FILES[@]}"} <<'PY'
 import os
 import re
 import sys

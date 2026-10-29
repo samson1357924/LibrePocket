@@ -17,3 +17,16 @@
 # The head copy uses a low-entropy dummy; this entry keeps the commit
 # fingerprinted below clean for range scans on this branch.
 f16c2e9d4e7530b11228dcfa68e1510f9bc1686a:app/src/test/java/dev/librepocket/router/SafeToolSliceTest.kt:generic-api-key:608
+
+# False positive: historical synthetic URL-token fixture in
+# legacyOnTurnFailed_usesRedactErrorParity (the Redactor's URL_TOKEN_PARAM
+# rule keys on `api_key=`, not value randomness). The head copy uses a
+# low-entropy dummy; this entry keeps the old commit clean under full-history
+# scans without a path-wide allowlist.
+e8c3682fdd49a7249fe1d37851fc131144523ec9:app/src/test/java/dev/librepocket/agent/ui/chat/ChatSessionFactoryLegacyQuarantineTest.kt:generic-api-key:178
+
+# False positive: documentation of nightly stress environment configuration
+# in docs/TESTING.md placed a comma operator after job keys before the stress
+# env variable, causing Gitleaks' generic-api-key rule to trigger.
+# The head copy was rephrased; this entry keeps the historical commit fingerprinted clean.
+74858e7936966e72c3e8338c9b68f2065c072ded:docs/TESTING.md:generic-api-key:192

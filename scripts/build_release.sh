@@ -139,7 +139,7 @@ OUTPUT_PARENT=$(CDPATH= cd -- "$OUTPUT_PARENT" && pwd -P) \
     || die "cannot resolve output parent"
 
 validate_identity() {
-    python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
+    python3 -P - "$1" "$2" "$3" "$4" "$5" <<'PY'
 import re
 import sys
 
@@ -246,7 +246,7 @@ RESULT=$(env -i \
     PATH="$PATH" HOME="${HOME:-}" ANDROID_HOME="${ANDROID_HOME:-}" \
     ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-}" JAVA_HOME="${JAVA_HOME:-}" \
     TMPDIR="${TMPDIR:-}" LC_ALL=C \
-    python3 "$SCRIPT_DIR/release_artifact_stage.py" \
+    python3 -P "$SCRIPT_DIR/release_artifact_stage.py" \
     --flavors "$FLAVORS" \
     --candidate-root "$ROOT/app/build/outputs/apk" \
     --output-parent "$OUTPUT_PARENT" \

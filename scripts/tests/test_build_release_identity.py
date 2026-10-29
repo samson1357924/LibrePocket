@@ -206,7 +206,12 @@ class ReleaseBuilderHarness(unittest.TestCase):
         self._write_executable(
             self.fake_bin / "python3",
             "#!/bin/sh\n"
-            f"if [ \"${{1:-}}\" = \"{self.root / 'scripts' / 'release_artifact_stage.py'}\" ]; then printf '%s\\n' \"$$\" > '{self.helper_pid_file}'; fi\n"
+            'for arg in "$@"; do\n'
+            f'  if [ "$arg" = "{self.root / "scripts" / "release_artifact_stage.py"}" ]; then\n'
+            f"    printf '%s\\n' \"$$\" > '{self.helper_pid_file}'\n"
+            "    break\n"
+            "  fi\n"
+            "done\n"
             f"exec '{sys.executable}' \"$@\"\n",
         )
         self._write_executable(
@@ -593,14 +598,7 @@ class PolicyTimeoutBudgetTest(unittest.TestCase):
     """The per-flavor policy timeout budget is part of the release lane's named fail-closed contract, not a silent knob."""
 
     def test_policy_timeout_seconds_mapping_is_pinned_per_flavor(self) -> None:
-        # release_artifact_stage resolves its verify_release_apk sibling via a
-        # bare import, so it only loads with scripts/ on sys.path (as when run
-        # directly); import it that way for the pin, closing over no calls.
-        try:
-            sys.path.insert(0, str(ROOT / "scripts"))
-            import release_artifact_stage as stager
-        finally:
-            sys.path.pop(0)
+        from scripts import release_artifact_stage as stager
 
         self.assertEqual(
             stager.POLICY_TIMEOUT_SECONDS,

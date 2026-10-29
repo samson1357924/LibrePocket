@@ -90,6 +90,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import hashlib
+import importlib.util
 import os
 import re
 import selectors
@@ -1488,37 +1489,47 @@ def _parse_aapt_xmltree(dump: str, label: str) -> ET.Element:
     return root
 
 
-def _load_nsc_rules() -> types.ModuleType:
-    """Load the shared network-security rule engine (``scripts/nsc_check.py``).
+def _load_sibling_module(name: str) -> types.ModuleType:
+    """Load a sibling gate module by file path, never via ``sys.path``.
 
-    Inserting this file's own directory keeps ``import nsc_check`` resolving
-    when this scanner runs as a bare script (sys.path[0] = scripts/) AND as
-    the ``scripts.apk_policy_inspect`` package module (repo root on sys.path):
-    either way the compiled XML is validated with the exact rules the source
-    gate runs, never a divergent local reimplementation.
+    Adding ``scripts/`` to ``sys.path`` would let a checked-in
+    ``scripts/hashlib.py`` (or any other stdlib name) shadow the real module
+    inside the delegated gate. Loading the exact file keeps the rule engine
+    shared without widening the import search path.
     """
-    scripts_dir = str(Path(__file__).resolve().parent)
-    if scripts_dir not in sys.path:
-        sys.path.insert(0, scripts_dir)
-    import nsc_check
+    pkg = __name__.rpartition(".")[0]
+    scoped_name = f"{pkg}.{name}" if pkg else name
+    existing = sys.modules.get(scoped_name) or sys.modules.get(name)
+    if existing is not None:
+        return existing
+    path = Path(__file__).resolve().with_name(f"{name}.py")
+    if not path.is_file():
+        raise FileNotFoundError(f"cannot find sibling module: {path}")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load sibling module: {name} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    if scoped_name != name:
+        sys.modules[scoped_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        if scoped_name != name:
+            sys.modules.pop(scoped_name, None)
+        raise
+    return module
 
-    return nsc_check
+
+def _load_nsc_rules() -> types.ModuleType:
+    """Load the shared network-security rule engine (``scripts/nsc_check.py``)."""
+    return _load_sibling_module("nsc_check")
 
 
 def _load_backup_rules_check() -> types.ModuleType:
-    """Load the shared backup-rules engine (``scripts/backup_rules_check.py``).
-
-    Same path contract as ``_load_nsc_rules``: the compiled backup rules are
-    validated with the exact ``REQUIRED_EXCLUDES``/file↔root engine the source
-    gate runs, never a divergent local reimplementation (drift between the
-    two copies would be an invisible gate weakening).
-    """
-    scripts_dir = str(Path(__file__).resolve().parent)
-    if scripts_dir not in sys.path:
-        sys.path.insert(0, scripts_dir)
-    import backup_rules_check
-
-    return backup_rules_check
+    """Load the shared backup-rules engine (``scripts/backup_rules_check.py``)."""
+    return _load_sibling_module("backup_rules_check")
 
 
 def _network_security_mode(application_block: str, app_indent: int | None = None) -> str:

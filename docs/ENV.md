@@ -4,8 +4,8 @@
 
 - **Scope:** Local build prerequisites and checked-in Android toolchain values.
 - **Owner role:** Build/CI maintainer; no individual assigned.
-- **Source of truth:** `gradle/libs.versions.toml`, `gradle/wrapper/gradle-wrapper.properties`, `scripts/verify_gradle_wrapper.py`, `app/build.gradle.kts`, `github_bot/.nvmrc`, `github_bot/package.json`, `scripts/verify_jdk_floor.sh`, `.github/workflows/pr-check.yml`, and `.github/dependabot.yml`.
-- **Update trigger:** Any SDK, AGP, Kotlin, Gradle, JDK, Node.js, flavor, CI image, or dependency update policy change.
+- **Source of truth:** `gradle/libs.versions.toml`, `gradle/wrapper/gradle-wrapper.properties`, `scripts/verify_gradle_wrapper.py`, `app/build.gradle.kts`, `github_bot/.nvmrc`, `github_bot/package.json`, `scripts/verify_jdk_floor.sh`, `scripts/build_release.sh`, `.github/workflows/pr-check.yml`, and `.github/dependabot.yml`.
+- **Update trigger:** Any SDK, AGP, Kotlin, Gradle, JDK, Node.js, Python, flavor, CI image, or dependency update policy change.
 
 ## JDK and Gradle
 
@@ -70,6 +70,14 @@ incompatible Node engines.
 
 ```sh
 cd github_bot && nvm install && nvm use && node -v
+```
+
+## Python
+
+Requires Python `>= 3.11` (standard library only, no external dependencies required for release builders and policy checkers). The local release builder requires Python 3.11+ and uses `python3 -I` for its Python preflight, including the version probe: it ignores `PYTHONPATH` and other Python environment variables and excludes the script/current directory and user site-packages. Its post-build stage instead runs plain `python3` under an `env -i` allowlist, retaining normal script-directory/system site behavior. Standalone policy checkers and other direct Python invocations do not automatically inherit the builder’s isolation; neither boundary is a sandbox.
+
+```sh
+python3 --version
 ```
 
 ## Flavors and IDs

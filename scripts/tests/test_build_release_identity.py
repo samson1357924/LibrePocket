@@ -12,10 +12,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from scripts import check_release_pins as signer_pins
 from scripts import check_release_tag_version as tag_version
 
-ROOT = Path(__file__).resolve().parents[2]
 BUILDER = ROOT / "scripts" / "build_release.sh"
 VERIFIER = ROOT / "scripts" / "verify_release_apk.py"
 STAGER = ROOT / "scripts" / "release_artifact_stage.py"
@@ -25,6 +29,12 @@ TAG_CHECKER = ROOT / "scripts" / "check_release_tag_version.py"
 APP_BUILD_GRADLE = ROOT / "app" / "build.gradle.kts"
 
 FLAVORS = ("play", "foss", "github")
+CONDITIONAL_BACKTICK_GRADLE = (
+    'if (false) {\n val `}` = 1\n android {\n defaultConfig {\n'
+    'versionCode = 7\nversionName = "1.2.3"\n}\n}\n val `{` = 2\n}\n',
+    'android {\n if (false) {\n val `}` = 1\n defaultConfig {\n'
+    'versionCode = 7\nversionName = "1.2.3"\n}\n val `{` = 2\n}\n}\n',
+)
 EXPECTED = {
     flavor: {
         "package": {
@@ -35,9 +45,9 @@ EXPECTED = {
         "version_code": "7",
         "version_name": "1.2.3",
         "cert": {
-            "play": "11" * 32,
-            "foss": "22" * 32,
-            "github": "33" * 32,
+            "play": "1a" * 32,
+            "foss": "2b" * 32,
+            "github": "3c" * 32,
         }[flavor],
     }
     for flavor in FLAVORS
@@ -194,6 +204,17 @@ class ReleaseBuilderHarness(unittest.TestCase):
         shutil.copy2(BUILDER, self.root / "scripts" / "build_release.sh")
         shutil.copy2(VERIFIER, self.root / "scripts" / "verify_release_apk.py")
         shutil.copy2(STAGER, self.root / "scripts" / "release_artifact_stage.py")
+        shutil.copy2(TAG_CHECKER, self.root / "scripts" / "check_release_tag_version.py")
+        shutil.copy2(PINS_CHECKER, self.root / "scripts" / "check_release_pins.py")
+        (self.root / "app" / "build.gradle.kts").write_text(
+            "android {\n"
+            "    defaultConfig {\n"
+            "        versionCode = 7\n"
+            '        versionName = "1.2.3"\n'
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
 
         self.fake_bin = self.tmp / "bin"
         self.fake_bin.mkdir()
@@ -243,6 +264,27 @@ class ReleaseBuilderHarness(unittest.TestCase):
     def _write_executable(path: Path, content: str) -> None:
         path.write_text(content, encoding="utf-8")
         path.chmod(0o755)
+
+    def _create_pins_file(
+        self,
+        flavors: tuple[str, ...] = FLAVORS,
+        *,
+        override: dict[str, dict[str, str]] | None = None,
+        name: str = "signer-pins.json",
+    ) -> Path:
+        pins = {
+            flavor: {
+                "package": EXPECTED[flavor]["package"],
+                "cert_sha256": EXPECTED[flavor]["cert"],
+            }
+            for flavor in flavors
+        }
+        if override:
+            for k, v in override.items():
+                pins[k] = v
+        path = self.tmp / name
+        path.write_text(json.dumps(pins, indent=2), encoding="utf-8")
+        return path
 
     def _identity_args(self, flavors: tuple[str, ...] = FLAVORS) -> list[str]:
         args: list[str] = []
@@ -317,12 +359,13 @@ class ReleaseBuilderHarness(unittest.TestCase):
         mode: str = "pass",
         policy_mode: str = "pass",
         passwords: bool = True,
+        extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         self.policy_mode_file.write_text(policy_mode, encoding="utf-8")
         return subprocess.run(
             command or self.command(),
             cwd=self.root,
-            env=self.env(mode=mode, policy_mode=policy_mode, passwords=passwords),
+            env={**self.env(mode=mode, policy_mode=policy_mode, passwords=passwords), **(extra_env or {})},
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -339,6 +382,8 @@ class ReleaseBuilderHarness(unittest.TestCase):
         self.assertFalse(self.bw_log.exists(), "Bitwarden must not be invoked on preflight failure")
         self.assertEqual(self._output_roots(), [], "preflight failure must not create output transaction")
         self.assertNotIn("READY", result.stdout)
+        self.assertNotIn("BW_SESSION", result.stdout, "failure reached secret resolution instead of failing in preflight")
+        self.assertNotIn("Bitwarden", result.stdout, "failure reached Bitwarden checks instead of failing in preflight")
 
     def test_valid_three_flavor_build_reports_only_complete_verified_transaction(self) -> None:
         result = self.run_builder()
@@ -593,6 +638,435 @@ class ReleaseBuilderHarness(unittest.TestCase):
         second_root = json.loads(second.stdout.strip().splitlines()[-1])["outputDirectory"]
         self.assertNotEqual(first_root, second_root)
 
+    def test_valid_tag_and_pins_pass_preflight_and_build(self) -> None:
+        pins_file = self._create_pins_file()
+        command = self.command()
+        command.extend(("--tag", "v1.2.3", "--pins", str(pins_file)))
+
+        result = self.run_builder(command)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        response = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(response["status"], "ready")
+        self.assertEqual(set(response["flavors"]), set(FLAVORS))
+        self.assertEqual(len(self._output_roots()), 1)
+
+    def test_mismatched_expected_version_name_vs_tag_fails_preflight(self) -> None:
+        command = self.command()
+        command.extend(("--tag", "v1.2.3"))
+        idx = command.index("--expected-version-name")
+        command[idx + 1] = "play=1.2.4"
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+        self.assertIn("versionName", result.stdout)
+
+    def test_mismatched_expected_version_code_vs_gradle_fails_preflight(self) -> None:
+        command = self.command()
+        command.extend(("--tag", "v1.2.3"))
+        idx = command.index("--expected-version-code")
+        command[idx + 1] = "play=8"
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+        self.assertIn("versionCode", result.stdout)
+
+    def test_invalid_tag_format_fails_preflight(self) -> None:
+        for bad_tag in ("1.2.3", "v1.2", "v1.2.3-rc1", "v01.02.03", "not-a-tag", ""):
+            with self.subTest(tag=bad_tag):
+                command = self.command()
+                command.extend(("--tag", bad_tag))
+                result = self.run_builder(command, passwords=False)
+                self._assert_preflight_rejected(result)
+
+    def test_mismatched_tag_vs_gradle_fails_preflight(self) -> None:
+        command = self.command()
+        command.extend(("--tag", "v2.0.0"))
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+
+    def test_backtick_braces_in_conditional_blocks_fail_before_secrets(self) -> None:
+        gradle = self.root / "app" / "build.gradle.kts"
+        for fixture in CONDITIONAL_BACKTICK_GRADLE:
+            with self.subTest(fixture=fixture):
+                gradle.write_text(fixture, encoding="utf-8")
+                command = self.command()
+                command.extend(("--tag", "v1.2.3"))
+                self._assert_preflight_rejected(self.run_builder(command, passwords=False))
+
+    def test_mismatched_expected_package_vs_pins_fails_preflight(self) -> None:
+        pins_file = self._create_pins_file()
+        command = self.command()
+        command.extend(("--pins", str(pins_file)))
+        idx = command.index("--expected-package")
+        command[idx + 1] = "play=dev.librepocket.wrong"
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+        self.assertIn("package", result.stdout)
+
+    def test_mismatched_expected_cert_sha256_vs_pins_fails_preflight(self) -> None:
+        pins_file = self._create_pins_file()
+        command = self.command()
+        command.extend(("--pins", str(pins_file)))
+        idx = command.index("--expected-cert-sha256")
+        command[idx + 1] = f"play={'44' * 32}"
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+        self.assertIn("cert", result.stdout.lower())
+
+    def test_missing_flavor_in_pins_file_fails_preflight(self) -> None:
+        pins_file = self._create_pins_file(flavors=("play", "foss"))
+        command = self.command()
+        command.extend(("--pins", str(pins_file)))
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+
+    def test_symlink_pins_file_fails_preflight(self) -> None:
+        pins_file = self._create_pins_file()
+        symlink_path = self.tmp / "pins-symlink.json"
+        symlink_path.symlink_to(pins_file)
+        command = self.command()
+        command.extend(("--pins", str(symlink_path)))
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+        self.assertIn("symlink", result.stdout.lower())
+
+    def test_duplicate_tag_or_pins_fails_preflight(self) -> None:
+        pins_file = self._create_pins_file()
+
+        command_tag = self.command()
+        command_tag.extend(("--tag", "v1.2.3", "--tag", "v1.2.3"))
+        result_tag = self.run_builder(command_tag, passwords=False)
+        self._assert_preflight_rejected(result_tag)
+        self.assertIn("duplicate --tag", result_tag.stdout)
+
+        command_pins = self.command()
+        command_pins.extend(("--pins", str(pins_file), "--pins", str(pins_file)))
+        result_pins = self.run_builder(command_pins, passwords=False)
+        self._assert_preflight_rejected(result_pins)
+        self.assertIn("duplicate --pins", result_pins.stdout)
+
+    def test_valid_preflight_with_missing_secrets_fails_closed_before_build(self) -> None:
+        pins_file = self._create_pins_file()
+        command = self.command()
+        command.extend(("--tag", "v1.2.3", "--pins", str(pins_file)))
+
+        result = self.run_builder(command, passwords=False)
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(self.gradle_log.exists(), "Gradle must not run when secrets are missing")
+        self.assertFalse(self.bw_log.exists(), "Bitwarden must not be queried when BW_SESSION is unset")
+        self.assertEqual(self._output_roots(), [], "preflight failure must not create output transaction")
+        self.assertNotIn("READY", result.stdout)
+        self.assertIn("BW_SESSION is not set", result.stdout)
+
+    def test_pins_case_insensitive_cert_sha256_matches(self) -> None:
+        pins_file = self._create_pins_file(
+            override={
+                "play": {
+                    "package": EXPECTED["play"]["package"],
+                    "cert_sha256": EXPECTED["play"]["cert"].upper(),
+                }
+            }
+        )
+        command = self.command()
+        command.extend(("--tag", "v1.2.3", "--pins", str(pins_file)))
+        result = self.run_builder(command)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        response = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(response["status"], "ready")
+
+    def test_missing_or_unreadable_pins_file_fails_preflight(self) -> None:
+        command = self.command()
+        command.extend(("--pins", str(self.tmp / "nonexistent-pins.json")))
+        result = self.run_builder(command, passwords=False)
+        self._assert_preflight_rejected(result)
+
+    def test_single_flavor_build_with_all_flavors_in_pins_file_succeeds(self) -> None:
+        pins_file = self._create_pins_file(flavors=FLAVORS)
+        command = self.command(("github",))
+        command.extend(("--pins", str(pins_file)))
+
+        result = self.run_builder(command)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        response = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(response["status"], "ready")
+        self.assertEqual(set(response["flavors"]), {"github"})
+
+    def test_python_version_below_floor_fails_preflight(self) -> None:
+        fake_py = self.fake_bin / "python3"
+        orig_content = fake_py.read_text(encoding="utf-8")
+        fake_py.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${1:-}\" = \"-I\" ] && [ \"${2:-}\" = \"-c\" ] && printf '%s' \"${3:-}\" | grep -q 'sys.version_info >= (3, 11)'; then\n"
+            "    exit 1\n"
+            "fi\n"
+            f"exec '{sys.executable}' \"$@\"\n",
+            encoding="utf-8",
+        )
+        fake_py.chmod(0o755)
+        try:
+            result = self.run_builder(passwords=False)
+            self._assert_preflight_rejected(result)
+            self.assertIn("python3 >= 3.11 is required", result.stdout)
+        finally:
+            fake_py.write_text(orig_content, encoding="utf-8")
+            fake_py.chmod(0o755)
+
+    def test_preflight_ignores_poisoned_pythonpath_including_version_probe(self) -> None:
+        poison = self.tmp / "poison"
+        poison.mkdir()
+        marker = self.tmp / "poison-executed"
+        (poison / "sitecustomize.py").write_text(
+            f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n",
+            encoding="utf-8",
+        )
+        for module in ("re", "json"):
+            (poison / f"{module}.py").write_text("raise RuntimeError('poisoned import')\n", encoding="utf-8")
+        calls = self.tmp / "python-calls"
+        self._write_executable(
+            self.fake_bin / "python3",
+            f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\nexec '{sys.executable}' \"$@\"\n",
+        )
+        pins = self._create_pins_file(flavors=("play",))
+        command = self.command(("play",)) + ["--tag", "v1.2.3", "--pins", str(pins)]
+        env = {"PYTHONPATH": str(poison)}
+        result = self.run_builder(command, passwords=False, extra_env=env)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("BW_SESSION is not set", result.stdout)
+        self.assertFalse(self.gradle_log.exists())
+        self.assertFalse(marker.exists())
+        invocations = calls.read_text().splitlines()
+        self.assertGreaterEqual(len(invocations), 6)
+        self.assertTrue(invocations[0].startswith("-I -c "), invocations)
+        self.assertTrue(all(line.startswith("-I ") for line in invocations), invocations)
+
+        for extra, expected in ((["--tag", "v9.9.9"], "release tag/version check failed"),
+                                (["--pins", str(pins)], "invalid expected identity")):
+            with self.subTest(expected=expected):
+                bad = self.command(("play",)) + extra
+                if expected == "invalid expected identity":
+                    bad[bad.index("--expected-package") + 1] = "play=invalid"
+                result = self.run_builder(bad, passwords=False, extra_env=env)
+                self._assert_preflight_rejected(result)
+                self.assertIn(expected, result.stdout)
+                self.assertFalse(marker.exists())
+
+    def test_subset_flavor_build_with_tag_and_pins_verifies_selected_only(self) -> None:
+        pins_file = self._create_pins_file(flavors=("play",))
+        command = self.command(("play",))
+        command.extend(("--tag", "v1.2.3", "--pins", str(pins_file)))
+
+        result = self.run_builder(command)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        response = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(response["status"], "ready")
+        self.assertEqual(set(response["flavors"]), {"play"})
+        self.assertEqual(len(self._output_roots()), 1)
+        transaction = Path(response["outputDirectory"])
+        self.assertTrue((transaction / "play" / "release.apk").is_file())
+        self.assertFalse((transaction / "foss").exists())
+        self.assertFalse((transaction / "github").exists())
+        policy_calls = self.policy_log.read_text().splitlines()
+        self.assertEqual(len(policy_calls), 1, policy_calls)
+        self.assertTrue(policy_calls[0].startswith("play\t"), policy_calls)
+
+    def test_subset_flavor_build_with_full_pins_registry_succeeds(self) -> None:
+        pins_file = self._create_pins_file(flavors=FLAVORS)
+        command = self.command(("play",))
+        command.extend(("--tag", "v1.2.3", "--pins", str(pins_file)))
+
+        result = self.run_builder(command)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        response = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(response["status"], "ready")
+        self.assertEqual(set(response["flavors"]), {"play"})
+
+    def test_subset_flavor_build_missing_required_flavor_in_pins_fails_preflight(self) -> None:
+        pins_file = self._create_pins_file(flavors=("play",))
+        command = self.command(("play", "foss"))
+        command.extend(("--pins", str(pins_file)))
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+        self.assertIn("missing pin entry for flavor: foss", result.stdout)
+
+    def test_subset_flavor_build_rejects_malformed_unselected_pin(self) -> None:
+        pins_file = self._create_pins_file(
+            flavors=FLAVORS, override={"foss": {"package": "invalid", "cert_sha256": "bad"}}
+        )
+        command = self.command(("play",)) + ["--pins", str(pins_file)]
+        result = self.run_builder(command, passwords=False)
+        self._assert_preflight_rejected(result)
+        self.assertIn("invalid package for foss", result.stdout)
+
+    def test_package_name_case_sensitivity_fails_preflight(self) -> None:
+        pins_file = self._create_pins_file()
+        command = self.command()
+        command.extend(("--pins", str(pins_file)))
+        idx = command.index("--expected-package")
+        command[idx + 1] = "play=dev.librepocket.Agent"
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+        self.assertIn("does not match pinned package", result.stdout)
+
+        pins_file_altered = self._create_pins_file(
+            override={"play": {"package": "dev.librepocket.Agent", "cert_sha256": EXPECTED["play"]["cert"]}}
+        )
+        command_pins = self.command()
+        command_pins.extend(("--pins", str(pins_file_altered)))
+        result_pins = self.run_builder(command_pins, passwords=False)
+        self._assert_preflight_rejected(result_pins)
+        self.assertIn("does not match pinned package", result_pins.stdout)
+
+    def test_pins_case_insensitive_cert_sha256_inverted_case_matches(self) -> None:
+        pins_file = self._create_pins_file()
+        command = self.command()
+        command.extend(("--tag", "v1.2.3", "--pins", str(pins_file)))
+        for i, arg in enumerate(command):
+            if arg == "--expected-cert-sha256":
+                flavor, val = command[i + 1].split("=", 1)
+                command[i + 1] = f"{flavor}={val.upper()}"
+
+        result = self.run_builder(command)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        response = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(response["status"], "ready")
+
+    def test_pins_file_with_invalid_json_fails_preflight(self) -> None:
+        bad_json = self.tmp / "invalid-pins.json"
+        bad_json.write_text("{not json", encoding="utf-8")
+        command = self.command()
+        command.extend(("--pins", str(bad_json)))
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+        self.assertIn("not valid json", result.stdout.lower())
+
+    def test_pins_file_with_duplicate_keys_fails_preflight(self) -> None:
+        dup = self.tmp / "duplicate-keys-pins.json"
+        dup.write_text(
+            '{"play": {"package": "dev.librepocket.agent", "cert_sha256": "'
+            + "1a" * 32
+            + '"}, "play": {"package": "dev.librepocket.agent", "cert_sha256": "'
+            + "2b" * 32
+            + '"}}',
+            encoding="utf-8",
+        )
+        command = self.command()
+        command.extend(("--pins", str(dup)))
+
+        result = self.run_builder(command, passwords=False)
+
+        self._assert_preflight_rejected(result)
+        self.assertIn("duplicate", result.stdout.lower())
+
+    def test_pins_file_empty_or_oversize_fails_preflight(self) -> None:
+        empty = self.tmp / "empty-pins.json"
+        empty.write_text("", encoding="utf-8")
+        command_empty = self.command()
+        command_empty.extend(("--pins", str(empty)))
+        result_empty = self.run_builder(command_empty, passwords=False)
+        self._assert_preflight_rejected(result_empty)
+        self.assertIn("empty", result_empty.stdout.lower())
+
+        oversize = self.tmp / "oversize-pins.json"
+        oversize.write_bytes(
+            b'{"play": {"package": "dev.librepocket.agent", "cert_sha256": "'
+            + b"ab12" * 16384
+            + b'"}}'
+        )
+        command_oversize = self.command()
+        command_oversize.extend(("--pins", str(oversize)))
+        result_oversize = self.run_builder(command_oversize, passwords=False)
+        self._assert_preflight_rejected(result_oversize)
+        self.assertIn("exceeds", result_oversize.stdout.lower())
+
+    def test_directory_symlink_pins_path_fails_preflight(self) -> None:
+        dir_path = self.tmp / "pins-directory"
+        dir_path.mkdir()
+        command_dir = self.command()
+        command_dir.extend(("--pins", str(dir_path)))
+        result_dir = self.run_builder(command_dir, passwords=False)
+        self._assert_preflight_rejected(result_dir)
+
+        symlink_to_dir = self.tmp / "pins-dir-symlink"
+        symlink_to_dir.symlink_to(dir_path)
+        command_symlink = self.command()
+        command_symlink.extend(("--pins", str(symlink_to_dir)))
+        result_symlink = self.run_builder(command_symlink, passwords=False)
+        self._assert_preflight_rejected(result_symlink)
+        self.assertIn("symlink", result_symlink.stdout.lower())
+
+    def test_missing_checker_scripts_fail_preflight(self) -> None:
+        tag_checker = self.root / "scripts" / "check_release_tag_version.py"
+        tag_checker_bak = self.root / "scripts" / "check_release_tag_version.py.bak"
+        tag_checker.rename(tag_checker_bak)
+        try:
+            command = self.command()
+            command.extend(("--tag", "v1.2.3"))
+            result = self.run_builder(command, passwords=False)
+            self._assert_preflight_rejected(result)
+            self.assertIn("checker is missing", result.stdout)
+        finally:
+            tag_checker_bak.rename(tag_checker)
+
+        pins_file = self._create_pins_file()
+        pins_checker = self.root / "scripts" / "check_release_pins.py"
+        pins_checker_bak = self.root / "scripts" / "check_release_pins.py.bak"
+        pins_checker.rename(pins_checker_bak)
+        try:
+            command = self.command()
+            command.extend(("--pins", str(pins_file)))
+            result = self.run_builder(command, passwords=False)
+            self._assert_preflight_rejected(result)
+            self.assertIn("checker is missing", result.stdout)
+        finally:
+            pins_checker_bak.rename(pins_checker)
+
+    def test_gradle_version_code_boundary_limits_fail_preflight(self) -> None:
+        gradle_file = self.root / "app" / "build.gradle.kts"
+        orig_gradle = gradle_file.read_text(encoding="utf-8")
+        try:
+            for bad_code in ("0", "2147483648", "-1"):
+                with self.subTest(version_code=bad_code):
+                    gradle_file.write_text(
+                        "android {\n"
+                        "    defaultConfig {\n"
+                        f"        versionCode = {bad_code}\n"
+                        '        versionName = "1.2.3"\n'
+                        "    }\n"
+                        "}\n",
+                        encoding="utf-8",
+                    )
+                    command = self.command()
+                    command.extend(("--tag", "v1.2.3"))
+                    result = self.run_builder(command, passwords=False)
+                    self._assert_preflight_rejected(result)
+        finally:
+            gradle_file.write_text(orig_gradle, encoding="utf-8")
+
 
 class PolicyTimeoutBudgetTest(unittest.TestCase):
     """The per-flavor policy timeout budget is part of the release lane's named fail-closed contract, not a silent knob."""
@@ -618,6 +1092,18 @@ class SignerPinRegistryTest(unittest.TestCase):
         path = self.tmp / name
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
+
+    @unittest.skipUnless(hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"), "requires nonblocking FIFO support")
+    def test_fifo_without_writer_is_rejected_promptly(self) -> None:
+        fifo = self.tmp / "pins.fifo"
+        os.mkfifo(fifo)
+        result = subprocess.run(
+            [sys.executable, str(PINS_CHECKER), "--pins", str(fifo)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False, timeout=3,
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("pins file must be a regular file", result.stdout)
 
     def test_valid_single_flavor_pin_normalizes_cert_to_lowercase(self) -> None:
         path = self._write(
@@ -806,6 +1292,29 @@ class SignerPinRegistryTest(unittest.TestCase):
         with self.assertRaises(signer_pins.PinError):
             signer_pins.load_pins(str(broken))
 
+    def test_symlink_pins_file_rejected_by_loader(self) -> None:
+        path = self._write(
+            "pins.json",
+            {"play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16}},
+        )
+        symlink_path = self.tmp / "pins-symlink.json"
+        symlink_path.symlink_to(path)
+        with self.assertRaisesRegex(signer_pins.PinError, "must not be a symlink"):
+            signer_pins.load_pins(str(symlink_path))
+
+    def test_directory_pins_file_rejected_by_loader(self) -> None:
+        sub_dir = self.tmp / "a_directory"
+        sub_dir.mkdir()
+        with self.assertRaisesRegex(signer_pins.PinError, "must be a regular file"):
+            signer_pins.load_pins(str(sub_dir))
+
+    def test_recursion_error_in_json_rejected_by_loader(self) -> None:
+        import unittest.mock as mock
+        path = self._write("pins.json", {"play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16}})
+        with mock.patch("json.loads", side_effect=RecursionError("maximum recursion depth exceeded")):
+            with self.assertRaisesRegex(signer_pins.PinError, "not valid JSON"):
+                signer_pins.load_pins(str(path))
+
 
 class ReleaseTagVersionTest(unittest.TestCase):
     """Tag <-> Gradle version consistency controls (Issue #12 acceptance)."""
@@ -847,6 +1356,221 @@ class ReleaseTagVersionTest(unittest.TestCase):
         self.assertEqual(
             tag_version.check_tag_version("v1.2.3", code, name)["status"], "ok"
         )
+
+    def test_default_config_early_return_and_prefix_mutations_rejected(self) -> None:
+        path = self.tmp / "control.gradle.kts"
+        for extra in (
+            "return@defaultConfig", "return@defaultConfig Unit",
+            "++versionCode", "--versionCode", "++this.versionCode",
+            "--this@defaultConfig.versionCode", "++holder.nested.`versionCode`",
+            "++this.versionName", "--`versionName`",
+        ):
+            with self.subTest(extra=extra):
+                path.write_text(
+                    'android {\n defaultConfig {\n' + extra + '\n'
+                    'versionCode = 7\nversionName = "1.2.3"\n }\n}\n', encoding="utf-8",
+                )
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.parse_gradle_version(str(path))
+
+    def test_unicode_interpolation_rejected_but_escaped_dollar_allowed(self) -> None:
+        path = self.tmp / "template.gradle.kts"
+        for literal in ('"$é"', '"$变量"', '"$éclair"', '"""$é"""'):
+            with self.subTest(literal=literal):
+                path.write_text(
+                    'android {\n defaultConfig {\nval x = ' + literal + '\n'
+                    'versionCode = 7\nversionName = "1.2.3"\n }\n}\n', encoding="utf-8",
+                )
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.parse_gradle_version(str(path))
+        path.write_text(
+            'android {\n defaultConfig {\nval x = "\\$é"\n'
+            'versionCode = 7\nversionName = "1.2.3"\n }\n}\n', encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+    def test_backticked_control_keywords_are_identifiers(self) -> None:
+        path = self.tmp / "keywords.gradle.kts"
+        path.write_text(
+            'val `if` = 1\nandroid {\n val `when` = 2\n defaultConfig {\n'
+            'val `return` = 3\nval `if` = 4\nversionCode = 7\n'
+            'versionName = "1.2.3"\n }\n}\n', encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+    def test_backtick_identifiers_do_not_change_structural_depth(self) -> None:
+        path = self.tmp / "backticks.gradle.kts"
+        for fixture in CONDITIONAL_BACKTICK_GRADLE:
+            with self.subTest(fixture=fixture):
+                path.write_text(fixture, encoding="utf-8")
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.parse_gradle_version(str(path))
+        # Braces, quotes and comment markers in identifiers must not start
+        # strings/comments or alter the matching of either DSL block.
+        path.write_text(
+            'val `}"` = 1\nandroid {\n val `{/*` = 2\n defaultConfig {\n'
+            'val `}//` = 3\nversionCode = 7\nversionName = "1.2.3"\n }\n}\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+    def test_unterminated_backtick_identifier_is_rejected(self) -> None:
+        path = self.tmp / "backtick-invalid.gradle.kts"
+        path.write_text('val `unterminated\nandroid {\n defaultConfig {\n'
+                        'versionCode = 7\nversionName = "1.2.3"\n}\n}\n', encoding="utf-8")
+        with self.assertRaises(tag_version.TagVersionError):
+            tag_version.parse_gradle_version(str(path))
+
+    def test_chained_control_before_identity_blocks_rejected(self) -> None:
+        path = self.tmp / "chained-control.gradle.kts"
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        for prefix in (
+            'val x = if (true) Unit else if (false)\n',
+            'var x = if (true) Unit else if (false) Unit else if (false)\n',
+            'val x = if (true) if (false) Unit else Unit else if (false)\n',
+        ):
+            for location in ("android", "defaultConfig"):
+                with self.subTest(prefix=prefix, location=location):
+                    outer = prefix if location == "android" else ""
+                    inner = prefix if location == "defaultConfig" else ""
+                    path.write_text(
+                        outer + 'android {\n' + inner + 'defaultConfig {\n'
+                        + direct + '}\n}\n', encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(tag_version.TagVersionError, "conditional"):
+                        tag_version.parse_gradle_version(str(path))
+
+    def test_pending_elvis_before_identity_blocks_rejected(self) -> None:
+        path = self.tmp / "elvis.gradle.kts"
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        for location in ("android", "defaultConfig"):
+            for prefix in ('val ignored = "already set" ?: \n',
+                           'val ignored = if (true) 1 else 2 ?: /* comment */\n',
+                           'val ignored = "set" ?: label@\n',
+                           'val ignored = "set" ?: @Suppress("UNUSED_EXPRESSION")\n',
+                           'val ignored = "set" ?: label@ @Suppress("UNUSED_EXPRESSION")\n',
+                           'val ignored = "set" ?: /* comment */ `my label`@ other@\n'):
+                with self.subTest(location=location, prefix=prefix):
+                    path.write_text(
+                        (prefix if location == "android" else "") + 'android {\n'
+                        + (prefix if location == "defaultConfig" else "")
+                        + 'defaultConfig {\n' + direct + '}\n}\n', encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(tag_version.TagVersionError, "conditional"):
+                        tag_version.parse_gradle_version(str(path))
+
+        path.write_text('val x = null ?: 1\nandroid {\nval y = null ?: 2\n'
+                        'defaultConfig {\n' + direct + '}\n}\n', encoding="utf-8")
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+        for location in ("android", "defaultConfig"):
+            for rhs in ('1', '"text"', '(2)'):
+                with self.subTest(location=location, rhs=rhs):
+                    prefix = f'val x = null ?: {rhs}\n@Suppress("unused")\nval y = 2\n'
+                    path.write_text(
+                        (prefix if location == "android" else "") + 'android {\n'
+                        + (prefix if location == "defaultConfig" else "")
+                        + 'defaultConfig {\n' + direct + '}\n}\n', encoding="utf-8",
+                    )
+                    self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+        for location in ("android", "defaultConfig"):
+            for opening, closing in (('(', ')'), ('(( ', '))'),
+                                     ('label@ ( `my label`@ (', '))')):
+                with self.subTest(location=location, opening=opening):
+                    prefix = f'val ignored = "set" ?: {opening}\n'
+                    path.write_text(
+                        (prefix if location == "android" else "") + 'android {\n'
+                        + (prefix if location == "defaultConfig" else "")
+                        + 'defaultConfig {\n' + direct + '}\n'
+                        + (closing + '\n' if location == "defaultConfig" else '')
+                        + '}\n' + (closing + '\n' if location == "android" else ''),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(tag_version.TagVersionError, "conditional"):
+                        tag_version.parse_gradle_version(str(path))
+
+        path.write_text('val x = null ?: (1)\nandroid {\nval y = null ?: (2)\n'
+                        'defaultConfig {\n' + direct + '}\n}\n', encoding="utf-8")
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+        for location in ("android", "defaultConfig"):
+            for literal in ('"text"', '"""raw\ntext"""', "'x'",
+                            '"?: label@"', '"""?: label@"""'):
+                with self.subTest(location=location, literal=literal):
+                    prefix = f'val ignored = null ?: {literal}\n'
+                    path.write_text(
+                        (prefix if location == "android" else "") + 'android {\n'
+                        + (prefix if location == "defaultConfig" else "")
+                        + 'defaultConfig {\n' + direct + '}\n}\n', encoding="utf-8",
+                    )
+                    self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+    def test_infix_before_identity_blocks(self) -> None:
+        path = self.tmp / "infix.gradle.kts"
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        for location in ("android", "defaultConfig"):
+            for prefix, accepted in (
+                ('val ignored = 1 to\n', False),
+                ('val ignored = value customInfix /* comment */\n', False),
+                ('val ignored = "text" `custom infix`\n', False),
+                ('val ignored = false && value!! customInfix\n', False),
+                ('val ignored = false && value!! `custom infix` /* comment */\n', False),
+                ('val ignored = false && (value)!! customInfix\n', False),
+                ('val ignored = false && value++ customInfix\n', False),
+                ('val ignored = false && value-- customInfix\n', False),
+                ('val ignored = 1 to 2\n', True),
+                ('val ignored = value customInfix other\n', True),
+                ('val ignored = value!!\n', True),
+                ('val ignored = value++\n', True),
+                ('val ignored = value--\n', True),
+                ('val ignored = value!! customInfix other\n', True),
+                ('val ignored = value customInfix other!!\n', True),
+            ):
+                with self.subTest(location=location, prefix=prefix):
+                    path.write_text(
+                        (prefix if location == "android" else "") + 'android {\n'
+                        + (prefix if location == "defaultConfig" else "")
+                        + 'defaultConfig {\n' + direct + '}\n}\n', encoding="utf-8",
+                    )
+                    if accepted:
+                        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+                    else:
+                        with self.assertRaisesRegex(tag_version.TagVersionError, "conditional"):
+                            tag_version.parse_gradle_version(str(path))
+
+    def test_shadowing_version_declarations_rejected(self) -> None:
+        path = self.tmp / "shadow.gradle.kts"
+        for field, typ, value in (("versionCode", "Int", "0"), ("versionName", "String", '"old"')):
+            for name in (field, f"`{field}`"):
+                for declaration in (
+                    f"var {name}: {typ}", f"var {name}: {typ} = {value}",
+                    f"val {name}: {typ} = {value}", f"val ({name}, other) = pair",
+                    f"var /* comment */ {name}\n: {typ}",
+                ):
+                    for location in ("script", "android", "defaultConfig"):
+                        with self.subTest(declaration=declaration, location=location):
+                            prefix = declaration if location == "script" else ""
+                            outer = declaration if location == "android" else ""
+                            inner = declaration if location == "defaultConfig" else ""
+                            path.write_text(
+                                f'{prefix}\nandroid {{\n{outer}\n defaultConfig {{\n{inner}\n'
+                                'versionCode = 7\nversionName = "1.2.3"\n }\n}\n', encoding="utf-8",
+                            )
+                            with self.assertRaisesRegex(tag_version.TagVersionError, "shadow"):
+                                tag_version.parse_gradle_version(str(path))
+
+    def test_unrelated_declarations_and_text_do_not_shadow_versions(self) -> None:
+        path = self.tmp / "no-shadow.gradle.kts"
+        path.write_text(
+            'val versionNameSuffix = "var versionCode: Int"\n'
+            '// val versionName: String\n/* var `versionCode`: Int */\n'
+            'android {\n val versionCodeSuffix: Int = 1\n defaultConfig {\n'
+            'val `versionNameSuffix` = "val versionCode: Int"\n'
+            '// var versionName: String\n/* val `versionCode`: Int */\n'
+            'versionCode = 7\nversionName = "1.2.3"\n }\n}\n', encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
 
     def test_debug_suffix_line_does_not_create_a_second_version_name(self) -> None:
         path = self._write_gradle(version_code="7", version_name_line='versionName = "1.2.3"')
@@ -909,13 +1633,13 @@ class ReleaseTagVersionTest(unittest.TestCase):
     def test_trailing_comment_is_accepted_and_leading_zero_code_rejected(self) -> None:
         path = self.tmp / "comment.gradle.kts"
         path.write_text(
-            'versionCode = 7 // release code\nversionName = "1.2.3" // comment\n',
+            'android {\n defaultConfig {\nversionCode = 7 // release code\nversionName = "1.2.3" // comment\n }\n}\n',
             encoding="utf-8",
         )
         self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
         leading = self.tmp / "leading.gradle.kts"
         leading.write_text(
-            'versionCode = 007\nversionName = "1.2.3"\n', encoding="utf-8"
+            'android {\n defaultConfig {\nversionCode = 007\nversionName = "1.2.3"\n }\n}\n', encoding="utf-8"
         )
         with self.assertRaisesRegex(tag_version.TagVersionError, "leading zero"):
             tag_version.parse_gradle_version(str(leading))
@@ -1020,31 +1744,54 @@ class ReleaseTagVersionTest(unittest.TestCase):
             tag_version.parse_gradle_version(str(self.tmp / "does-not-exist.gradle.kts"))
         duplicated = self.tmp / "duplicated.gradle.kts"
         duplicated.write_text(
-            'versionCode = 7\nversionCode = 8\nversionName = "1.2.3"\n',
+            'android {\n defaultConfig {\nversionCode = 7\nversionCode = 8\nversionName = "1.2.3"\n }\n}\n',
             encoding="utf-8",
         )
         with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionCode"):
             tag_version.parse_gradle_version(str(duplicated))
 
+    def test_version_assignments_must_be_outside_grouping(self) -> None:
+        path = self.tmp / "grouping.gradle.kts"
+        assignments = {"versionCode": "versionCode = 7", "versionName": 'versionName = "1.2.3"'}
+        for field, assignment in assignments.items():
+            other = assignments["versionName" if field == "versionCode" else "versionCode"]
+            for opening, closing in (("fake(", ")"), ("items[", "]"), ("fake([", "])")):
+                with self.subTest(field=field, opening=opening):
+                    path.write_text(
+                        f"android {{\n defaultConfig {{\n{opening}\n{assignment}\n{closing}\n{other}\n}}\n}}\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(tag_version.TagVersionError, f"exactly one {field}"):
+                        tag_version.parse_gradle_version(str(path))
+
+        path.write_text(
+            'android {\n defaultConfig {\n'
+            'val x = fake(items[0], "([") // ] )\n'
+            'val `identifier([` = 1\n'
+            'versionCode = 7\nversionName = "1.2.3"\n'
+            'val y = fake(items[0])\n}\n}\n', encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
     def test_duplicate_version_name_missing_fields_and_single_quote(self) -> None:
         dup_name = self.tmp / "dup-name.gradle.kts"
         dup_name.write_text(
-            'versionCode = 7\nversionName = "1.2.3"\nversionName = "1.2.3"\n',
+            'android {\n defaultConfig {\nversionCode = 7\nversionName = "1.2.3"\nversionName = "1.2.3"\n }\n}\n',
             encoding="utf-8",
         )
         with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionName"):
             tag_version.parse_gradle_version(str(dup_name))
         missing_code = self.tmp / "missing-code.gradle.kts"
-        missing_code.write_text('versionName = "1.2.3"\n', encoding="utf-8")
+        missing_code.write_text('android {\n defaultConfig {\nversionName = "1.2.3"\n }\n}\n', encoding="utf-8")
         with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionCode"):
             tag_version.parse_gradle_version(str(missing_code))
         missing_name = self.tmp / "missing-name.gradle.kts"
-        missing_name.write_text("versionCode = 7\n", encoding="utf-8")
+        missing_name.write_text("android {\n defaultConfig {\nversionCode = 7\n }\n}\n", encoding="utf-8")
         with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionName"):
             tag_version.parse_gradle_version(str(missing_name))
         single = self.tmp / "single.gradle.kts"
         single.write_text(
-            "versionCode = 7\nversionName = '1.2.3'\n", encoding="utf-8"
+            "android {\n defaultConfig {\nversionCode = 7\nversionName = '1.2.3'\n }\n}\n", encoding="utf-8"
         )
         with self.assertRaisesRegex(tag_version.TagVersionError, "double-quoted"):
             tag_version.parse_gradle_version(str(single))
@@ -1078,7 +1825,7 @@ class ReleaseTagVersionTest(unittest.TestCase):
             "/**\n"
             ' * versionCode = 1\n * versionName = "0.1.0"\n'
             " */\n"
-            'versionCode = 7\nversionName = "1.2.3"\n',
+            'android {\n defaultConfig {\nversionCode = 7\nversionName = "1.2.3"\n }\n}\n',
             encoding="utf-8",
         )
         self.assertEqual(tag_version.parse_gradle_version(str(kdoc)), (7, "1.2.3"))
@@ -1087,14 +1834,14 @@ class ReleaseTagVersionTest(unittest.TestCase):
             "/* outer /* inner */ still comment\n"
             'versionCode = 1\nversionName = "0.1.0"\n'
             "*/\n"
-            'versionCode = 7\nversionName = "1.2.3"\n',
+            'android {\n defaultConfig {\nversionCode = 7\nversionName = "1.2.3"\n }\n}\n',
             encoding="utf-8",
         )
         self.assertEqual(tag_version.parse_gradle_version(str(nested)), (7, "1.2.3"))
         inline = self.tmp / "inline.gradle.kts"
         inline.write_text(
-            "versionCode = 7 /* trailing block */\n"
-            'versionName = "1.2.3" /* trailing block */\n',
+            "android {\n defaultConfig {\nversionCode = 7 /* trailing block */\n"
+            'versionName = "1.2.3" /* trailing block */\n }\n}\n',
             encoding="utf-8",
         )
         self.assertEqual(tag_version.parse_gradle_version(str(inline)), (7, "1.2.3"))
@@ -1104,13 +1851,13 @@ class ReleaseTagVersionTest(unittest.TestCase):
         full_line.write_text(
             "// versionCode = 999\n"
             '// versionName = "9.9.9"\n'
-            'versionCode = 7\nversionName = "1.2.3"\n',
+            'android {\n defaultConfig {\nversionCode = 7\nversionName = "1.2.3"\n }\n}\n',
             encoding="utf-8",
         )
         self.assertEqual(tag_version.parse_gradle_version(str(full_line)), (7, "1.2.3"))
         in_string = self.tmp / "in-string.gradle.kts"
         in_string.write_text(
-            'versionCode = 7\nversionName = "1.2.3 // x"\n', encoding="utf-8"
+            'android {\n defaultConfig {\nversionCode = 7\nversionName = "1.2.3 // x"\n }\n}\n', encoding="utf-8"
         )
         code, name = tag_version.parse_gradle_version(str(in_string))
         self.assertEqual((code, name), (7, "1.2.3 // x"))
@@ -1122,20 +1869,20 @@ class ReleaseTagVersionTest(unittest.TestCase):
         # protects a commented-out value: the commented 999 must not win.
         tricky = self.tmp / "char-literal.gradle.kts"
         tricky.write_text(
-            "val c = '\"'\n"
+            "android {\n defaultConfig {\nval c = '\"'\n"
             "versionCode = 1 // keep\n"
             "/*\n"
             "versionCode = 999\n"
             "*/\n"
-            'versionName = "1.2.3"\n',
+            'versionName = "1.2.3"\n }\n}\n',
             encoding="utf-8",
         )
         self.assertEqual(tag_version.parse_gradle_version(str(tricky)), (1, "1.2.3"))
         escaped = self.tmp / "char-escape.gradle.kts"
         escaped.write_text(
-            "val q = '\\u0027'\n"
+            "android {\n defaultConfig {\nval q = '\\u0027'\n"
             "versionCode = 7 // comment\n"
-            'versionName = "1.2.3"\n',
+            'versionName = "1.2.3"\n }\n}\n',
             encoding="utf-8",
         )
         self.assertEqual(tag_version.parse_gradle_version(str(escaped)), (7, "1.2.3"))
@@ -1280,6 +2027,141 @@ class ReleaseTagVersionTest(unittest.TestCase):
         )
         with self.assertRaises(tag_version.TagVersionError):
             tag_version.parse_gradle_version(str(path))
+
+    def test_unsupported_scopes_and_assignments_are_rejected(self) -> None:
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        cases = {
+            "missing android": direct,
+            "missing defaultConfig": 'android {\n' + direct + '}\n',
+            "unterminated android": 'android {\n defaultConfig {\n' + direct + '}\n',
+            "nested android": 'if (false) {\nandroid {\n defaultConfig {\n' + direct + '}\n}\n}\n',
+            "conditional android": 'if (false)\nandroid {\n defaultConfig {\n' + direct + '}\n}\n',
+            "nested defaultConfig": 'android {\nif (false) {\n defaultConfig {\n' + direct + '}\n}\n}\n',
+            "conditional defaultConfig": 'android {\nif (false)\n defaultConfig {\n' + direct + '}\n}\n',
+            "conditional literals": 'android {\n defaultConfig {\nif (false) {\n' + direct + '}\n}\n}\n',
+            "unbraced conditional": 'android {\n defaultConfig {\nif (false)\n' + direct + '}\n}\n',
+            "nested literals": 'android {\n defaultConfig {\nrun {\n' + direct + '}\n}\n}\n',
+            "inline override": 'android {\n defaultConfig {\n' + direct + 'run { versionName = "9.9.9" }\n}\n}\n',
+            "qualified override": 'android {\n defaultConfig {\n' + direct + 'this.versionCode = 9\n}\n}\n',
+            "compound override": 'android {\n defaultConfig {\n' + direct + 'versionCode += 1\n}\n}\n',
+            "backtick override": 'android {\n defaultConfig {\n' + direct + '`versionName` = "9.9.9"\n}\n}\n',
+            "increment override": 'android {\n defaultConfig {\n' + direct + 'versionCode++\n}\n}\n',
+            "qualified block": 'foo.android {\n defaultConfig {\n' + direct + '}\n}\n',
+        }
+        path = self.tmp / "unsupported.gradle.kts"
+        for label, content in cases.items():
+            with self.subTest(case=label):
+                path.write_text(content, encoding="utf-8")
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.parse_gradle_version(str(path))
+
+    def test_blocks_in_pending_expressions_are_rejected(self) -> None:
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        path = self.tmp / "pending-expression.gradle.kts"
+        wrappers = (
+            ('val x = listOf(\n', '\n)\n'),
+            ('val x = listOf(1,\n', '\n)\n'),
+            ('val x = values[\n', '\n]\n'),
+            ('val x = (listOf(\n', '\n))\n'),
+            ('val x =\n', '\n'),
+            ('val x = other +\n', '\n'),
+        )
+        for location in ('android', 'defaultConfig'):
+            for prefix, suffix in wrappers:
+                with self.subTest(location=location, prefix=prefix):
+                    default = 'defaultConfig {\n' + direct + '}\n'
+                    content = (prefix + 'android {\n' + default + '}\n' + suffix
+                               if location == 'android' else
+                               'android {\n' + prefix + default + suffix + '}\n')
+                    path.write_text(content, encoding='utf-8')
+                    with self.assertRaises(tag_version.TagVersionError):
+                        tag_version.parse_gradle_version(str(path))
+
+        completed = (
+            'val x = listOf(\n  1, 2\n)\n',
+            'val x = listOf("(", "]", "=")\n',
+            'val x = values[0]\n',
+            'counter++\n',
+            'value!!\n',
+            'val x = "unfinished ( [ =" // ( [ =\n',
+            'val `name[(` = 1\n',
+        )
+        for location in ('android', 'defaultConfig'):
+            for prefix in completed:
+                with self.subTest(location=location, prefix=prefix):
+                    default = 'defaultConfig {\n' + direct + '}\n'
+                    content = (prefix + 'android {\n' + default + '}\n'
+                               if location == 'android' else
+                               'android {\n' + prefix + default + '}\n')
+                    path.write_text(content, encoding='utf-8')
+                    self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, '1.2.3'))
+
+    def test_flavor_override_is_outside_static_checker_scope(self) -> None:
+        path = self.tmp / "flavor.gradle.kts"
+        path.write_text(
+            'android {\n defaultConfig {\n versionCode = 7\n versionName = "1.2.3"\n }\n'
+            ' productFlavors { create("play") { versionName = "9.9.9" } }\n}\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+    def test_returns_before_identity_declarations_are_rejected(self) -> None:
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        block = 'android {\n defaultConfig {\n' + direct + '}\n}\n'
+        path = self.tmp / "early-return.gradle.kts"
+        for prefix in ('return@android\n', 'if (true) { return@android }\n',
+                       'run { return@android };\n'):
+            with self.subTest(location="android", prefix=prefix):
+                path.write_text('android {\n' + prefix + 'defaultConfig {\n' + direct + '}\n}\n', encoding="utf-8")
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.parse_gradle_version(str(path))
+        for prefix in ('return\n', 'if (true) { return }\n'):
+            with self.subTest(location="script", prefix=prefix):
+                path.write_text(prefix + block, encoding="utf-8")
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.parse_gradle_version(str(path))
+        for content in ('val x = "return@android" // return\n' + block,
+                        'android {\nval `return` = 1\ndefaultConfig {\n' + direct + '}\nreturn@android\n}\n'):
+            with self.subTest(content=content):
+                path.write_text(content, encoding="utf-8")
+                self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+    def test_templates_conditionals_and_unterminated_lexemes(self) -> None:
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        block = 'android {\n defaultConfig {\n' + direct + '}\n}\n'
+        cases = {
+            "template mutation": 'android {\n defaultConfig {\n' + direct + 'val x = "${run { versionCode = 9 }}"\n}\n}\n',
+            "raw template mutation": 'android {\n defaultConfig {\n' + direct + 'val x = """${run { versionName = "9.9.9" }}"""\n}\n}\n',
+            "identifier template": 'android {\n defaultConfig {\n' + direct + 'val x = "$sideEffect"\n}\n}\n',
+            "conditional android with lambda": 'if (run { false })\n' + block,
+            "conditional default with lambda": 'android {\nif (run { false })\n defaultConfig {\n' + direct + '}\n}\n',
+            "dangling label before android": 'val x = if (true) 1 else label@\n' + block,
+            "dangling label before defaultConfig": 'android {\nval x = if (true) 1 else label@\n defaultConfig {\n' + direct + '}\n}\n',
+            "trailing block comment": block + '/* unfinished',
+            "trailing nested block comment": block + '/* outer /* inner */',
+            "trailing string": block + 'val x = "unfinished',
+            "trailing raw string": block + 'val x = """unfinished',
+            "trailing char": block + "val x = 'a",
+            "newline in string": block + 'val x = "unfinished\n',
+        }
+        path = self.tmp / "lexical.gradle.kts"
+        for label, content in cases.items():
+            with self.subTest(case=label):
+                path.write_text(content, encoding="utf-8")
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.parse_gradle_version(str(path))
+
+        positives = (
+            'val x = if (true) 1 else 2\n' + block,
+            'android {\nval x = if (true) 1 else 2\n defaultConfig {\n' + direct + '}\n}\n',
+            'android {\n defaultConfig {\n' + direct + 'val x = "\\${notATemplate}"\n}\n}\n',
+            'val x = "${prefix}"\n' + block,
+            block + '/* closed /* nested */ comment */\nval x = "closed"\n',
+        )
+        for content in positives:
+            with self.subTest(content=content):
+                path.write_text(content, encoding="utf-8")
+                self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
 
 
 if __name__ == "__main__":

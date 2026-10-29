@@ -782,7 +782,9 @@ object ToolRegistry {
      * projected AND [ToolDef.executionReady]. This is the ONLY list that
      * may be sent to the model (see `ChatRequest.tools`); description text
      * alone (e.g. `SCAFFOLD` markers) can never make a tool model-visible.
-     * Empty until the wiring PR flips tools to ready one by one.
+     * Currently only `lsp.symbols` can qualify (its switch defaults off).
+     * Registry eligibility does not imply production wiring: production
+     * sessions currently send an empty list and remain records-only.
      */
     fun visibleTools(ctx: ProjectionContext): List<ToolDef> =
         ALL.filter { it.project(ctx).level != CapabilityLevel.UNAVAILABLE && it.executionReady }

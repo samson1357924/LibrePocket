@@ -208,6 +208,22 @@ class SafeToolSlice(
         const val MAX_NESTING_DEPTH = 32
 
         /**
+         * Returns true if [s] contains any Unicode FORMAT (Cf) code points.
+         * Scans by code point so supplementary-plane format characters
+         * (surrogate pairs whose individual halves report SURROGATE) are
+         * properly recognized.
+         */
+        internal fun containsFormatCodePoint(s: String): Boolean {
+            var i = 0
+            while (i < s.length) {
+                val codePoint = s.codePointAt(i)
+                if (Character.getType(codePoint) == Character.FORMAT.toInt()) return true
+                i += Character.charCount(codePoint)
+            }
+            return false
+        }
+
+        /**
          * Surrogate-safe cap slice, the single replacement for every
          * `.take([MAX_STRING_CHARS])` string-cap in this file (result-JSON
          * fields, echoes, call ids, continuation re-binds): a plain `take`
@@ -874,7 +890,8 @@ class SafeToolSlice(
         val query = (root["query"] as? JsonPrimitive)?.takeIf { it.isString }?.content
             ?.takeIf { it.isNotBlank() }
             ?.takeIf { it.length <= MAX_INPUT_CHARS }
-            ?.takeIf { it.none { c -> c.isISOControl() || c == '\u0000' } } ?: return null
+            ?.takeIf { it.none { c -> c.isISOControl() || c == '\u0000' } }
+            ?.takeIf { !containsFormatCodePoint(it) } ?: return null
         val limit = when (val raw = root["limit"]) {
             null -> LspTools.DEFAULT_LIMIT
             // Strict integer: a JSON string (even "5") is not an integer.
@@ -952,12 +969,7 @@ class SafeToolSlice(
         // the leading-`/` check (U+200B/U+202E/U+FEFF etc.). Code-point
         // iteration: a supplementary-plane format character is a surrogate
         // pair whose halves report SURROGATE, never FORMAT.
-        var i = 0
-        while (i < v.length) {
-            val codePoint = v.codePointAt(i)
-            if (Character.getType(codePoint) == Character.FORMAT.toInt()) return false
-            i += Character.charCount(codePoint)
-        }
+        if (containsFormatCodePoint(v)) return false
         if (v.trimStart().startsWith("/")) return false
         if (v.contains("\\")) return false
         if (v.contains("\u0000")) return false

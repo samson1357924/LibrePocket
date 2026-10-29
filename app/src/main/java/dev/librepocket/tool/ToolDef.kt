@@ -44,15 +44,17 @@ data class ToolAnnotations(
  * user switches and granted permissions (ARCHITECTURE §6.3): identical
  * input always yields identical output.
  *
- * @param executionReady code-level wiring invariant (PR#1 re-review):
- *   true only when the tool is executable end-to-end this round
- *   (dispatcher + executor + confirmation/grant flow + E2E). Only
+ * @param executionReady registry readiness flag:
+ *   true indicates registry readiness (schema and handlers are present in
+ *   [ToolRegistry] and [dev.librepocket.router.SafeToolSlice]), while production composition
+ *   ([dev.librepocket.agent.ui.chat.ChatViewModelFactory]) remains records-only (`toolSlice = null`)
+ *   until the full production dispatcher, confirmation pipeline, and
+ *   device-verified E2E acceptance are implemented. Only
  *   [ToolRegistry.visibleTools] (which additionally requires this flag)
  *   may be sent to the model; [ToolRegistry.projectedTools] stays
  *   available for gates/headers/audit regardless of this flag.
- *   The wiring PR flips tools to true one by one as each loop lands;
- *   until then new tools default to false (fail-closed: projection text
- *   alone can never make a tool model-visible).
+ *   Tools default to false (fail-closed: projection text alone can never
+ *   make a tool model-visible).
  */
 data class ToolDef(
     val name: String,

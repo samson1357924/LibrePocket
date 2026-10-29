@@ -24,8 +24,10 @@ import androidx.navigation.NavDestination
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.rememberNavController
 import dev.librepocket.agent.ui.settings.SettingsScreen
+import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.setupErrorText
+import dev.librepocket.provider.ProviderProtocol
 import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -294,5 +296,27 @@ class StartupGateWiringTest {
         h.inFlight.value = false
         awaitRoute(h, Routes.SETTINGS)
         assertEquals(Routes.SETTINGS, currentRoute(h))
+    }
+
+    @Test
+    fun drawerContainsImportJsonlItem() {
+        val h = Harness()
+        h.pending.value = false
+        h.gate.value = EndpointGate.Ready(
+            EndpointConfig(
+                providerId = "preset:openai",
+                presetId = "openai",
+                label = "OpenAI",
+                baseUrl = "https://api.openai.com/v1",
+                protocol = ProviderProtocol.CHAT_COMPLETIONS,
+                model = "gpt-4o-mini",
+                apiKeyRef = "provider_key/preset:openai",
+            ),
+        )
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+        composeRule.onNodeWithContentDescription("選單").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("匯入對話 (JSONL)").assertIsDisplayed()
     }
 }

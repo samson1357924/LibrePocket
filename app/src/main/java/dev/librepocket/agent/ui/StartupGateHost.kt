@@ -1,5 +1,8 @@
 package dev.librepocket.agent.ui
 
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -11,6 +14,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ChatBubbleOutline
+import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Settings
@@ -88,6 +92,7 @@ internal fun StartupGateHost(
     onOpenSession: (String) -> Unit = {},
     onEditEndpoint: () -> Unit = {},
     onDrawerOpened: () -> Unit = {},
+    onImportSession: (Uri) -> Unit = {},
     chatContent: @Composable (PaddingValues) -> Unit,
     settingsContent: @Composable (PaddingValues) -> Unit,
     setupContent: @Composable (PaddingValues, Boolean) -> Unit,
@@ -112,6 +117,13 @@ internal fun StartupGateHost(
 ) {
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+    val drawerImportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) {
+            onImportSession(uri)
+        }
+    }
     val backStack by navController.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route
     val hasEndpoint = gate is EndpointGate.Ready
@@ -227,6 +239,15 @@ internal fun StartupGateHost(
                         scope.launch { drawerState.close() }
                     },
                     icon = { Icon(Icons.Filled.Add, contentDescription = null) },
+                )
+                NavigationDrawerItem(
+                    label = { Text("匯入對話 (JSONL)") },
+                    selected = false,
+                    onClick = {
+                        scope.launch { drawerState.close() }
+                        drawerImportLauncher.launch(arrayOf("application/jsonl", "application/json", "text/*", "*/*"))
+                    },
+                    icon = { Icon(Icons.Filled.FileOpen, contentDescription = null) },
                 )
                 if (sessions.isNotEmpty()) {
                     HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))

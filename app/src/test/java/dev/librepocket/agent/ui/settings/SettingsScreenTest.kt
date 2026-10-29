@@ -7,12 +7,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.unit.dp
+import dev.librepocket.agent.ui.chat.ExportUiState
+import dev.librepocket.agent.ui.chat.ImportUiState
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.setupErrorText
@@ -317,5 +322,89 @@ class SettingsScreenTest {
         onLogoutArea("重試清除").performClick()
         assertEquals(0, logoutCalls)
         assertEquals(1, retryCalls)
+    }
+
+    @Test
+    fun transcriptBackupCard_rendersAndExportDisabledWhenNoSession() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                currentSessionId = null,
+            )
+        }
+        onLogoutArea("對話備份與匯出 (JSONL)").assertIsDisplayed()
+        onLogoutArea("（目前無開啟中的對話，請先開啟或建立對話）").assertIsDisplayed()
+        onLogoutArea("匯出目前對話").assertIsNotEnabled()
+        onLogoutArea("匯入對話檔").assertIsEnabled()
+    }
+
+    @Test
+    fun transcriptBackupCard_exportEnabledWhenSessionPresent() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                currentSessionId = "session-1234",
+            )
+        }
+        onLogoutArea("匯出目前對話").assertIsEnabled()
+    }
+
+    @Test
+    fun transcriptBackupCard_showsSuccessAndErrorStates() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                currentSessionId = "session-1234",
+                exportState = ExportUiState.Success,
+                importState = ExportUiState.Error("模擬匯入失敗").let {
+                    ImportUiState.Error("模擬匯入失敗")
+                },
+            )
+        }
+        onLogoutArea("對話已成功匯出！").assertIsDisplayed()
+        onLogoutArea("匯入失敗：模擬匯入失敗").assertIsDisplayed()
+    }
+
+    @Test
+    fun transcriptBackupCard_importSuccessShowsSwitchButtonAndTriggersCallback() {
+        var openedSession: String? = null
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                importState = ImportUiState.Success("imported-sess-999"),
+                onOpenSession = { openedSession = it },
+            )
+        }
+        onLogoutArea("對話已成功匯入！").assertIsDisplayed()
+        onLogoutArea("切換至該對話").assertIsDisplayed()
+        onLogoutArea("切換至該對話").performClick()
+        assertEquals("imported-sess-999", openedSession)
+    }
+
+    @Test
+    fun transcriptBackupCard_dismissButtonsTriggerCallbacks() {
+        var dismissedExport = false
+        var dismissedImport = false
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                currentSessionId = "session-1234",
+                exportState = ExportUiState.Success,
+                importState = ImportUiState.Error("模擬匯入失敗"),
+                onDismissExportState = { dismissedExport = true },
+                onDismissImportState = { dismissedImport = true },
+            )
+        }
+        val dismissButtons = composeRule.onAllNodesWithContentDescription("關閉提示")
+        dismissButtons.assertCountEquals(2)
+        dismissButtons[0].performScrollTo().performClick()
+        assertTrue(dismissedExport)
+        dismissButtons[1].performScrollTo().performClick()
+        assertTrue(dismissedImport)
     }
 }

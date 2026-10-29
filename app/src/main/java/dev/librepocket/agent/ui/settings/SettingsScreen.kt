@@ -10,10 +10,14 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Switch
@@ -26,6 +30,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import dev.librepocket.agent.ui.chat.ExportUiState
+import dev.librepocket.agent.ui.chat.ImportUiState
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.setupErrorText
 import dev.librepocket.automation.AutomationSettingsState
@@ -109,6 +120,15 @@ fun SettingsScreen(
     onRetryStartupRead: () -> Unit = {},
     /** 啟動 replay 落定閘：中性碼 [重試讀取] 鍵的 enabled／spinner 來源。 */
     startupReconcilePending: Boolean = false,
+    /** 當前開啟之對話 ID（為空時停用匯出）。 */
+    currentSessionId: String? = null,
+    exportState: ExportUiState = ExportUiState.Idle,
+    importState: ImportUiState = ImportUiState.Idle,
+    onExportCurrentSession: (Uri) -> Unit = {},
+    onImportSession: (Uri) -> Unit = {},
+    onOpenSession: (String) -> Unit = {},
+    onDismissExportState: () -> Unit = {},
+    onDismissImportState: () -> Unit = {},
 ) {
     var confirmLogout by remember { mutableStateOf(false) }
     // 失敗不自動關 dialog：error 存續即重現確認態（confirm 已手動關閉又回來也一樣）。
@@ -303,6 +323,18 @@ fun SettingsScreen(
                     }
                     Spacer(modifier = Modifier.height(8.dp))
                 }
+                Spacer(modifier = Modifier.height(8.dp))
+                TranscriptBackupCard(
+                    currentSessionId = currentSessionId,
+                    exportState = exportState,
+                    importState = importState,
+                    onExportCurrentSession = onExportCurrentSession,
+                    onImportSession = onImportSession,
+                    onOpenSession = onOpenSession,
+                    onDismissExportState = onDismissExportState,
+                    onDismissImportState = onDismissImportState,
+                )
+                Spacer(modifier = Modifier.height(8.dp))
                 if (!showConfirmLogout) {
                     OutlinedButton(
                         onClick = { confirmLogout = true },
@@ -474,6 +506,17 @@ fun SettingsScreen(
                     ) {
                         Text("前往設定")
                     }
+                    Spacer(modifier = Modifier.height(12.dp))
+                    TranscriptBackupCard(
+                        currentSessionId = currentSessionId,
+                        exportState = exportState,
+                        importState = importState,
+                        onExportCurrentSession = onExportCurrentSession,
+                        onImportSession = onImportSession,
+                        onOpenSession = onOpenSession,
+                        onDismissExportState = onDismissExportState,
+                        onDismissImportState = onDismissImportState,
+                    )
                 } else {
                     Card(
                         colors = CardDefaults.cardColors(
@@ -595,6 +638,235 @@ fun SettingsScreen(
                         Text("重試讀取")
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+fun TranscriptBackupCard(
+    currentSessionId: String?,
+    exportState: ExportUiState,
+    importState: ImportUiState,
+    onExportCurrentSession: (Uri) -> Unit,
+    onImportSession: (Uri) -> Unit,
+    onOpenSession: (String) -> Unit,
+    onDismissExportState: () -> Unit = {},
+    onDismissImportState: () -> Unit = {},
+    modifier: Modifier = Modifier,
+) {
+    val exportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/jsonl"),
+    ) { uri ->
+        if (uri != null) {
+            onExportCurrentSession(uri)
+        }
+    }
+
+    val importLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) {
+            onImportSession(uri)
+        }
+    }
+
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+        ),
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Text("對話備份與匯出 (JSONL)", style = MaterialTheme.typography.titleMedium)
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                "可將對話匯出為標準 JSONL 格式（敏感資訊於匯出時自動脫敏），或匯入先前備份的對話檔至本機資料庫。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // 匯出按鈕
+            OutlinedButton(
+                onClick = {
+                    val defaultName = "librepocket_${currentSessionId?.take(8) ?: "chat"}.jsonl"
+                    exportLauncher.launch(defaultName)
+                },
+                enabled = currentSessionId != null && exportState !is ExportUiState.Exporting,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                if (exportState is ExportUiState.Exporting) {
+                    CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("匯出中…")
+                } else {
+                    Text("匯出目前對話")
+                }
+            }
+            if (currentSessionId == null) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    "（目前無開啟中的對話，請先開啟或建立對話）",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            when (exportState) {
+                is ExportUiState.Success -> {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                        ),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                "對話已成功匯出！",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.weight(1f),
+                            )
+                            IconButton(onClick = onDismissExportState) {
+                                Icon(
+                                    imageVector = Icons.Filled.Close,
+                                    contentDescription = "關閉提示",
+                                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                )
+                            }
+                        }
+                    }
+                }
+                is ExportUiState.Error -> {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer,
+                        ),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                "匯出失敗：${exportState.message}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.weight(1f),
+                            )
+                            IconButton(onClick = onDismissExportState) {
+                                Icon(
+                                    imageVector = Icons.Filled.Close,
+                                    contentDescription = "關閉提示",
+                                    tint = MaterialTheme.colorScheme.onErrorContainer,
+                                )
+                            }
+                        }
+                    }
+                }
+                else -> {}
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // 匯入按鈕
+            OutlinedButton(
+                onClick = {
+                    importLauncher.launch(arrayOf("application/jsonl", "application/json", "text/*", "*/*"))
+                },
+                enabled = importState !is ImportUiState.Importing,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                if (importState is ImportUiState.Importing) {
+                    CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("匯入中…")
+                } else {
+                    Text("匯入對話檔")
+                }
+            }
+            when (importState) {
+                is ImportUiState.Success -> {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                        ),
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    "對話已成功匯入！",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                IconButton(onClick = onDismissImportState) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Close,
+                                        contentDescription = "關閉提示",
+                                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Button(
+                                onClick = { onOpenSession(importState.sessionId) },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("切換至該對話")
+                            }
+                        }
+                    }
+                }
+                is ImportUiState.Error -> {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer,
+                        ),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                "匯入失敗：${importState.message}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.weight(1f),
+                            )
+                            IconButton(onClick = onDismissImportState) {
+                                Icon(
+                                    imageVector = Icons.Filled.Close,
+                                    contentDescription = "關閉提示",
+                                    tint = MaterialTheme.colorScheme.onErrorContainer,
+                                )
+                            }
+                        }
+                    }
+                }
+                else -> {}
             }
         }
     }

@@ -31,6 +31,7 @@ import dev.librepocket.agent.ui.setup.SetupViewModelFactory
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.entry.EntryDispatch
 import dev.librepocket.entry.EntryRoute
+import dev.librepocket.redact.Redactor
 import dev.librepocket.shell.PrivilegeBridgeState
 import dev.librepocket.voice.VoiceSwitchStore
 import dev.librepocket.voice.VoiceSwitchSnapshot
@@ -77,6 +78,8 @@ fun MainScreen(
     // transient 讀失敗／毀損為未確認態（重試讀取），絕不誤報 fresh。
     val pendingTeardown by setupViewModel.pendingTeardown.collectAsStateWithLifecycle()
     val sessions by sessionListViewModel.sessions.collectAsStateWithLifecycle()
+    val exportState by sessionListViewModel.exportState.collectAsStateWithLifecycle()
+    val importState by sessionListViewModel.importState.collectAsStateWithLifecycle()
     val currentSessionId by chatViewModel.currentSessionId.collectAsStateWithLifecycle()
 
     // #3 語音開關真相源（VoiceSwitchStore，DataStore 持久化）：R4-2 三態快照
@@ -180,6 +183,25 @@ fun MainScreen(
         },
         onEditEndpoint = { goSetupForEdit() },
         onDrawerOpened = { sessionListViewModel.refresh() },
+        onImportSession = { uri ->
+            sessionListViewModel.importUri(
+                uri = uri,
+                contentResolver = app.contentResolver,
+                cacheDir = app.cacheDir,
+                onSuccess = { newSessionId ->
+                    chatViewModel.openSession(newSessionId)
+                    navController.navigate(Routes.CHAT) {
+                        popUpTo(Routes.CHAT) { inclusive = false }
+                        launchSingleTop = true
+                    }
+                    android.widget.Toast.makeText(app, "對話匯入成功", android.widget.Toast.LENGTH_SHORT).show()
+                },
+                onError = { e ->
+                    val safeMsg = Redactor.redactError(e.message ?: "未知錯誤")
+                    android.widget.Toast.makeText(app, "對話匯入失敗: $safeMsg", android.widget.Toast.LENGTH_LONG).show()
+                },
+            )
+        },
         // Stage E：四態 journal 傳入 host 派生恢復態（單一來源純函數，見 NavGuard）。
         pendingTeardown = pendingTeardown,
         // Stage F：stale 抑制標籤同源傳入（四參派生；pure 只隱藏，真清卡靠 retry 終端）。
@@ -348,6 +370,35 @@ fun MainScreen(
                     }
                 },
                 startupReconcilePending = startupReconcilePending,
+                currentSessionId = currentSessionId,
+                exportState = exportState,
+                importState = importState,
+                onExportCurrentSession = { uri ->
+                    currentSessionId?.let { sid ->
+                        sessionListViewModel.exportUri(
+                            sessionId = sid,
+                            uri = uri,
+                            contentResolver = app.contentResolver,
+                            cacheDir = app.cacheDir,
+                        )
+                    }
+                },
+                onImportSession = { uri ->
+                    sessionListViewModel.importUri(
+                        uri = uri,
+                        contentResolver = app.contentResolver,
+                        cacheDir = app.cacheDir,
+                    )
+                },
+                onOpenSession = { sessionId ->
+                    chatViewModel.openSession(sessionId)
+                    navController.navigate(Routes.CHAT) {
+                        popUpTo(Routes.CHAT) { inclusive = false }
+                        launchSingleTop = true
+                    }
+                },
+                onDismissExportState = { sessionListViewModel.resetExportState() },
+                onDismissImportState = { sessionListViewModel.resetImportState() },
             )
         },
         setupContent = { padding, isFirstRun ->

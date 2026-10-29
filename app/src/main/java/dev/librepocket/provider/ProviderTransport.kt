@@ -284,6 +284,10 @@ private fun tooLargeProviderFailure() = ProviderFailure(
  * Cancellation is judged by the coroutine Job (ensureActive) only, never by
  * Call.isCanceled(): OkHttp's own callTimeout self-cancels the call, and that
  * timeout must stay a classifiable IOException, not a CancellationException.
+ *
+ * The [deadlineJob] is launched directly on the enclosing coroutine scope without
+ * an explicit dispatcher argument because `executeProviderRequest` runs inside
+ * [withContext(Dispatchers.IO)], inheriting [Dispatchers.IO] automatically.
  */
 @OptIn(InternalCoroutinesApi::class)
 internal suspend fun <T> executeProviderRequest(
@@ -339,6 +343,12 @@ internal suspend fun <T> executeProviderRequest(
  * transport errors are classified as one provider attempt. [onFrame] returns
  * [SsePumpDecision.STOP] when the protocol reaches a terminal frame; the
  * response is then closed immediately without reading later bytes.
+ *
+ * The [deadlineJob] inherits the caller's coroutine context from [coroutineScope]
+ * rather than specifying an explicit dispatcher. `pumpSse` performs blocking IO
+ * on the caller's dispatcher, which [streamingFlow] confines to [Dispatchers.IO]
+ * via `flowOn(Dispatchers.IO)`. Inheriting the enclosing context maintains
+ * structured concurrency and avoids unnecessary dispatcher hops.
  */
 @OptIn(InternalCoroutinesApi::class)
 internal suspend fun pumpSse(
@@ -402,7 +412,6 @@ internal suspend fun pumpSse(
                     )
                 }
                 val body = response.body
-                    ?: throw ProviderFailure(true, "SSE_EMPTY_BODY")
                 val parser = SseFrameParser()
                 val source = body.source()
                 val buf = ByteArray(8192)
@@ -446,7 +455,7 @@ internal suspend fun pumpSse(
                         break
                     }
                     totalWireBytesRead += read.toLong()
-                    if (totalWireBytesRead > httpConfig.maxSseWireBytes) {
+                    if (httpConfig.maxSseWireBytes > 0L && totalWireBytesRead > httpConfig.maxSseWireBytes) {
                         call.cancel()
                         throw ProviderFailure(
                             retryable = false,
@@ -476,6 +485,13 @@ internal suspend fun pumpSse(
                 }
                 if (!protocolTerminalReached) {
                     currentCoroutineContext().ensureActive()
+                    if (deadlineFired.get()) {
+                        throw ProviderFailure(
+                            retryable = false,
+                            message = ATTEMPT_DEADLINE_EXCEEDED,
+                            code = ProviderFailureCode.DEADLINE_EXCEEDED,
+                        )
+                    }
                     if (parser.lineTooLong) {
                         throw ProviderFailure(false, SseFrameParser.LINE_TOO_LONG_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
                     }
@@ -487,7 +503,18 @@ internal suspend fun pumpSse(
         } catch (e: IOException) {
             // A protocol terminal already emitted the authoritative Done/Failed.
             // Do not append a second terminal event if close reports cleanup IO.
-            if (!protocolTerminalReached) throw e
+            if (!protocolTerminalReached) {
+                currentCoroutineContext().ensureActive()
+                if (deadlineFired.get()) {
+                    throw ProviderFailure(
+                        retryable = false,
+                        message = ATTEMPT_DEADLINE_EXCEEDED,
+                        cause = e,
+                        code = ProviderFailureCode.DEADLINE_EXCEEDED,
+                    )
+                }
+                throw e
+            }
         }
     } finally {
         deadlineJob?.cancel()

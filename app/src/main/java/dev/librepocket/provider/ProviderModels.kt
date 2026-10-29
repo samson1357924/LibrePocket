@@ -96,6 +96,9 @@ data class ThinkingConfig(val budgetTokens: Int? = null)
  *
  * @param readTimeoutMs idle timeout waiting for the next SSE chunk,
  *   not a whole-turn deadline. Cancellation closes the active call immediately.
+ * @param attemptDeadlineMs whole-attempt deadline in milliseconds; `<= 0L` disables the deadline.
+ * @param maxSseWireBytes maximum cumulative raw SSE wire bytes allowed before aborting;
+ *   `<= 0L` disables the byte cap (unbounded stream).
  */
 data class ProviderHttpConfig(
     val connectTimeoutMs: Long = 15_000,

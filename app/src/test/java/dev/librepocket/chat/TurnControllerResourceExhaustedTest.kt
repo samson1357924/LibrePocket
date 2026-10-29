@@ -16,6 +16,8 @@ import dev.librepocket.provider.SseFrameParser
 import dev.librepocket.provider.StreamEvent
 import dev.librepocket.provider.TEXT_TOO_LARGE
 import dev.librepocket.provider.TOOL_ARGS_TOO_LARGE
+import dev.librepocket.provider.ATTEMPT_DEADLINE_EXCEEDED
+import dev.librepocket.provider.SSE_TOTAL_TOO_LARGE
 import dev.librepocket.provider.inferAggFailureCodeName
 import dev.librepocket.provider.streamingFlow
 import java.util.Collections
@@ -365,6 +367,249 @@ class TurnControllerResourceExhaustedTest {
       assertEquals(1, sink.failed.size)
       // P3: deterministic tool-delivery latch + drain barrier instead of polls
       // and a 300ms absence sleep (boolean asserted: no vacuous drain timeout).
+      runBlocking { withTimeout(5_000) { sink.toolLatch.await() } }
+      runBlocking { assertTrue("transcript drain timed out", c.flushTranscript(8_000)) }
+      assertEquals("only the completed ToolDone survives, got: ${sink.tools}", 1, sink.tools.size)
+      val kept = sink.tools.single()
+      assertEquals(0, kept.toolIndex)
+      assertEquals("c0", kept.id)
+      assertEquals("f0", kept.name)
+      assertTrue("pending idx1 must leave no record", sink.tools.none { it.toolIndex == 1 })
+      val body = c.uiState.value.messages.filter { it.role == "assistant" }.single().text
+      assertTrue("completed ToolDone marker stays, got: ${body.take(120)}", body.contains("[tool:f0"))
+      assertFalse("pending idx1 must leave no marker, got: ${body.take(200)}", body.contains("[tool:f1"))
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun attemptDeadlineExceededViaCodedStreamingFlowSuppressesPendingFlushAndDoesNotRetry() {
+    val provider = ResExhaustFakeProvider()
+    provider.handler = {
+      streamingFlow {
+        emit(StreamEvent.ToolDelta(0, "id-0", "f", "{\"a\":1}"))
+        emit(StreamEvent.ToolDelta(0, null, null, "x"))
+        throw ProviderFailure(false, ATTEMPT_DEADLINE_EXCEEDED, code = ProviderFailureCode.DEADLINE_EXCEEDED)
+      }
+    }
+    val probe = runBlocking {
+      provider.handler(ChatRequest(model = "m", messages = listOf(ChatMessage("user", "hi")))).toList()
+    }
+    val probeFailed = probe.filterIsInstance<StreamEvent.Failed>().single()
+    assertTrue(probeFailed.message.contains(ATTEMPT_DEADLINE_EXCEEDED))
+    assertEquals(ProviderFailureCode.DEADLINE_EXCEEDED.name, probeFailed.code)
+    assertFalse("ATTEMPT_DEADLINE_EXCEEDED must be non-retryable", probeFailed.retryable)
+
+    val sink = ResExhaustRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertSuppressed(c, provider, sink, ATTEMPT_DEADLINE_EXCEEDED)
+      assertTrue(isResourceExhausted(StreamEvent.Failed(ATTEMPT_DEADLINE_EXCEEDED, retryable = false)))
+      assertTrue(
+        isResourceExhausted(
+          StreamEvent.Failed(
+            ATTEMPT_DEADLINE_EXCEEDED,
+            retryable = false,
+            code = ProviderFailureCode.DEADLINE_EXCEEDED.name,
+          ),
+        ),
+      )
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun sseTotalTooLargeViaCodedStreamingFlowSuppressesPendingFlushAndDoesNotRetry() {
+    val provider = ResExhaustFakeProvider()
+    provider.handler = {
+      streamingFlow {
+        emit(StreamEvent.ToolDelta(0, "id-0", "f", "{\"a\":1}"))
+        emit(StreamEvent.ToolDelta(0, null, null, "x"))
+        throw ProviderFailure(false, SSE_TOTAL_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
+      }
+    }
+    val probe = runBlocking {
+      provider.handler(ChatRequest(model = "m", messages = listOf(ChatMessage("user", "hi")))).toList()
+    }
+    val probeFailed = probe.filterIsInstance<StreamEvent.Failed>().single()
+    assertTrue(probeFailed.message.contains(SSE_TOTAL_TOO_LARGE))
+    assertEquals(ProviderFailureCode.AGG_TOO_LARGE.name, probeFailed.code)
+    assertFalse("SSE_TOTAL_TOO_LARGE must be non-retryable", probeFailed.retryable)
+
+    val sink = ResExhaustRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertSuppressed(c, provider, sink, SSE_TOTAL_TOO_LARGE)
+      assertTrue(isResourceExhausted(StreamEvent.Failed(SSE_TOTAL_TOO_LARGE, retryable = false)))
+      assertTrue(
+        isResourceExhausted(
+          StreamEvent.Failed(
+            SSE_TOTAL_TOO_LARGE,
+            retryable = false,
+            code = ProviderFailureCode.AGG_TOO_LARGE.name,
+          ),
+        ),
+      )
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun attemptDeadlineExceededAndSseTotalTooLargeMarkersAreFatalAndInferCodes() {
+    assertEquals(
+      FailureKind.FATAL,
+      ProviderErrorClassifier.classify(null, null, "error: attempt_deadline_exceeded"),
+    )
+    assertEquals(
+      FailureKind.FATAL,
+      ProviderErrorClassifier.classify(null, null, "error: sse_total_too_large: wire bytes exceeded"),
+    )
+    assertEquals(
+      FailureKind.FATAL,
+      ProviderErrorClassifier.classify(null, java.io.IOException("attempt_deadline_exceeded"), null),
+    )
+    assertEquals(
+      FailureKind.FATAL,
+      ProviderErrorClassifier.classify(null, java.io.IOException("sse_total_too_large"), null),
+    )
+    assertEquals(
+      FailureKind.FATAL,
+      ProviderErrorClassifier.classify(null, java.io.IOException("wrap", java.io.IOException("attempt_deadline_exceeded")), null),
+    )
+    assertEquals(
+      FailureKind.FATAL,
+      ProviderErrorClassifier.classify(null, java.io.IOException("wrap", java.io.IOException("sse_total_too_large")), null),
+    )
+    assertEquals(
+      ProviderFailureCode.DEADLINE_EXCEEDED.name,
+      inferAggFailureCodeName("ATTEMPT_DEADLINE_EXCEEDED"),
+    )
+    assertEquals(
+      ProviderFailureCode.AGG_TOO_LARGE.name,
+      inferAggFailureCodeName("SSE_TOTAL_TOO_LARGE"),
+    )
+    assertEquals(
+      null,
+      inferAggFailureCodeName(null as Throwable?),
+    )
+    assertEquals(
+      null,
+      inferAggFailureCodeName(java.io.IOException("generic error")),
+    )
+    assertEquals(
+      ProviderFailureCode.DEADLINE_EXCEEDED.name,
+      inferAggFailureCodeName(
+        java.io.IOException("wrap", java.io.IOException("ATTEMPT_DEADLINE_EXCEEDED")),
+      ),
+    )
+    assertEquals(
+      ProviderFailureCode.AGG_TOO_LARGE.name,
+      inferAggFailureCodeName(
+        java.io.IOException("wrap", java.io.IOException("SSE_TOTAL_TOO_LARGE")),
+      ),
+    )
+    assertEquals(
+      ProviderFailureCode.DEADLINE_EXCEEDED.name,
+      inferAggFailureCodeName(
+        RuntimeException(
+          "wrap",
+          ProviderFailure(false, "deadline", code = ProviderFailureCode.DEADLINE_EXCEEDED),
+        ),
+      ),
+    )
+    // Cause chain cycle detection in inferAggFailureCodeName:
+    val cyclicClean1 = Exception("clean 1")
+    val cyclicClean2 = Exception("clean 2", cyclicClean1)
+    cyclicClean1.initCause(cyclicClean2)
+    assertEquals(null, inferAggFailureCodeName(cyclicClean1))
+
+    val cyclicFatal1 = Exception("fatal 1")
+    val cyclicFatal2 = java.io.IOException("ATTEMPT_DEADLINE_EXCEEDED", cyclicFatal1)
+    cyclicFatal1.initCause(cyclicFatal2)
+    assertEquals(ProviderFailureCode.DEADLINE_EXCEEDED.name, inferAggFailureCodeName(cyclicFatal1))
+  }
+
+  @Test fun wrappedIOExceptionDeadlineExceededSuppressesPendingFlushAndDoesNotRetry() {
+    val provider = ResExhaustFakeProvider()
+    provider.handler = {
+      flow {
+        emit(StreamEvent.ToolDelta(0, "id-0", "f", "{\"a\":1}"))
+        emit(StreamEvent.ToolDelta(0, null, null, "x"))
+        throw java.io.IOException("wrapped transport error", java.io.IOException(ATTEMPT_DEADLINE_EXCEEDED))
+      }
+    }
+    val sink = ResExhaustRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      assertEquals("poisoned stream must not be retried", 1, provider.streamCalls.get())
+      awaitFailed(sink)
+      assertEquals(1, sink.failed.size)
+      assertTrue(sink.failed.single().contains("wrapped transport error"))
+      runBlocking { assertTrue("transcript drain timed out", c.flushTranscript(8_000)) }
+      assertTrue("no poison-adjacent tool records may be persisted, got: ${sink.tools}", sink.tools.isEmpty())
+      val body = c.uiState.value.messages.filter { it.role == "assistant" }.single().text
+      assertFalse("resource-exhausted pending tools must leave no marker, got: ${body.take(120)}", body.contains("[tool:"))
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun wrappedIOExceptionSseTotalTooLargeInStreamingFlowInfersCodeAndSuppressesPendingFlush() {
+    val provider = ResExhaustFakeProvider()
+    provider.handler = {
+      streamingFlow {
+        emit(StreamEvent.ToolDelta(0, "id-0", "f", "{\"a\":1}"))
+        emit(StreamEvent.ToolDelta(0, null, null, "x"))
+        throw java.io.IOException("transport wrap", java.io.IOException(SSE_TOTAL_TOO_LARGE))
+      }
+    }
+    val probe = runBlocking {
+      provider.handler(ChatRequest(model = "m", messages = listOf(ChatMessage("user", "hi")))).toList()
+    }
+    val probeFailed = probe.filterIsInstance<StreamEvent.Failed>().single()
+    assertEquals(ProviderFailureCode.AGG_TOO_LARGE.name, probeFailed.code)
+    assertFalse("wrapped SSE_TOTAL_TOO_LARGE must be non-retryable", probeFailed.retryable)
+
+    val sink = ResExhaustRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      assertEquals("poisoned stream must not be retried", 1, provider.streamCalls.get())
+      awaitFailed(sink)
+      assertEquals(1, sink.failed.size)
+      runBlocking { assertTrue("transcript drain timed out", c.flushTranscript(8_000)) }
+      assertTrue("no poison-adjacent tool records may be persisted, got: ${sink.tools}", sink.tools.isEmpty())
+      val body = c.uiState.value.messages.filter { it.role == "assistant" }.single().text
+      assertFalse("resource-exhausted pending tools must leave no marker, got: ${body.take(120)}", body.contains("[tool:"))
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun completedToolDonePreservedOnAttemptDeadlineExceeded() {
+    val provider = ResExhaustFakeProvider()
+    provider.handler = {
+      streamingFlow {
+        emit(StreamEvent.ToolDone(0, "c0", "f0", "{}"))
+        emit(StreamEvent.ToolDelta(1, "c1", "f1", "{\"a\":1}"))
+        throw ProviderFailure(false, ATTEMPT_DEADLINE_EXCEEDED, code = ProviderFailureCode.DEADLINE_EXCEEDED)
+      }
+    }
+    val sink = ResExhaustRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      val error = c.uiState.value.error.orEmpty()
+      assertTrue("typed overflow expected, got: $error", error.contains(ATTEMPT_DEADLINE_EXCEEDED))
+      assertEquals("poisoned stream must not be retried", 1, provider.streamCalls.get())
+      awaitFailed(sink)
+      assertEquals(1, sink.failed.size)
       runBlocking { withTimeout(5_000) { sink.toolLatch.await() } }
       runBlocking { assertTrue("transcript drain timed out", c.flushTranscript(8_000)) }
       assertEquals("only the completed ToolDone survives, got: ${sink.tools}", 1, sink.tools.size)

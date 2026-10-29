@@ -2,19 +2,25 @@ package dev.librepocket.provider
 
 import dev.librepocket.redact.Redactor
 import java.io.IOException
+import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.FlowCollector
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -25,10 +31,18 @@ import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.BufferedSink
 import okio.Buffer
 
+internal const val SSE_TOTAL_TOO_LARGE = "SSE_TOTAL_TOO_LARGE"
+internal const val ATTEMPT_DEADLINE_EXCEEDED = "ATTEMPT_DEADLINE_EXCEEDED"
+
 /** Internal transport failure; [retryable] comes from [ProviderErrorClassifier] unless a typed code applies. */
 internal enum class ProviderFailureCode {
     /** Bounded finite body (model list) exceeded its byte budget. */
     TOO_LARGE,
+    /**
+     * Whole-attempt deadline exceeded. Always non-retryable and discards
+     * poison-adjacent pending tool fragments.
+     */
+    DEADLINE_EXCEEDED,
     /**
      * Unknown runtime failure from the provider stream (e.g. an unexpected
      * `RuntimeException` that is neither a typed `ProviderFailure`, validation
@@ -59,23 +73,45 @@ internal class ProviderFailure(
 /**
  * Infer the typed failure-code name from a provider-failure message when
  * [ProviderFailure.code] is absent (legacy throws or message-only paths).
- * Matches the aggregation/SSE overflow markers case-insensitively, consistent
- * with [ProviderErrorClassifier]'s fatal markers; returns
- * `AGG_TOO_LARGE`'s name on a hit, null otherwise. Never infers `TOO_LARGE`
- * (finite model-list budget) here: streaming callers only need the
- * aggregation/SSE code for [StreamEvent.Failed.code] propagation.
+ * Matches aggregation, wire cap, and whole-attempt deadline markers
+ * case-insensitively, consistent with [ProviderErrorClassifier]'s fatal markers;
+ * infers non-retryable fatal aggregation and whole-attempt deadline failure
+ * codes (`AGG_TOO_LARGE` or `DEADLINE_EXCEEDED`), or null otherwise. Never
+ * infers `TOO_LARGE` (finite model-list budget) here: streaming callers only
+ * need the aggregation/SSE/deadline code for [StreamEvent.Failed.code]
+ * propagation.
  */
 internal fun inferAggFailureCodeName(message: String?): String? {
     val lower = message?.lowercase(java.util.Locale.ROOT).orEmpty()
-    return if (lower.contains(TOOL_ARGS_TOO_LARGE.lowercase(java.util.Locale.ROOT)) ||
+    return when {
+        lower.contains(ATTEMPT_DEADLINE_EXCEEDED.lowercase(java.util.Locale.ROOT)) -> {
+            ProviderFailureCode.DEADLINE_EXCEEDED.name
+        }
+        lower.contains(SSE_TOTAL_TOO_LARGE.lowercase(java.util.Locale.ROOT)) ||
+        lower.contains(TOOL_ARGS_TOO_LARGE.lowercase(java.util.Locale.ROOT)) ||
         lower.contains(TEXT_TOO_LARGE.lowercase(java.util.Locale.ROOT)) ||
         lower.contains(SseFrameParser.FRAME_TOO_LARGE_MESSAGE.lowercase(java.util.Locale.ROOT)) ||
-        lower.contains(SseFrameParser.LINE_TOO_LONG_MESSAGE.lowercase(java.util.Locale.ROOT))
-    ) {
-        ProviderFailureCode.AGG_TOO_LARGE.name
-    } else {
-        null
+        lower.contains(SseFrameParser.LINE_TOO_LONG_MESSAGE.lowercase(java.util.Locale.ROOT)) -> {
+            ProviderFailureCode.AGG_TOO_LARGE.name
+        }
+        else -> null
     }
+}
+
+internal fun inferAggFailureCodeName(error: Throwable?): String? {
+    if (error == null) return null
+    val seen = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
+    var cur: Throwable? = error
+    while (cur != null && seen.add(cur)) {
+        if (cur is ProviderFailure) {
+            val codeName = cur.code?.name
+            if (codeName != null) return codeName
+        }
+        val match = inferAggFailureCodeName(cur.message)
+        if (match != null) return match
+        cur = cur.cause
+    }
+    return null
 }
 
 private const val MODEL_LIST_RESPONSE_MAX_BYTES = 1024 * 1024
@@ -268,11 +304,16 @@ private fun tooLargeProviderFailure() = ProviderFailure(
  * Cancellation is judged by the coroutine Job (ensureActive) only, never by
  * Call.isCanceled(): OkHttp's own callTimeout self-cancels the call, and that
  * timeout must stay a classifiable IOException, not a CancellationException.
+ *
+ * The [deadlineJob] is launched directly on the enclosing coroutine scope without
+ * an explicit dispatcher argument because `executeProviderRequest` runs inside
+ * [withContext(Dispatchers.IO)], inheriting [Dispatchers.IO] automatically.
  */
 @OptIn(InternalCoroutinesApi::class)
 internal suspend fun <T> executeProviderRequest(
     client: OkHttpClient,
     request: Request,
+    httpConfig: ProviderHttpConfig = ProviderHttpConfig(),
     consume: (response: Response, cancelCall: () -> Unit) -> T,
 ): T = withContext(Dispatchers.IO) {
     val call = client.newCall(request)
@@ -280,13 +321,48 @@ internal suspend fun <T> executeProviderRequest(
     val cancellation = job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
         if (cause != null) call.cancel()
     }
+    val deadlineFired = AtomicBoolean(false)
+    val deadlineJob = if (httpConfig.attemptDeadlineMs > 0L) {
+        launch {
+            delay(httpConfig.attemptDeadlineMs)
+            deadlineFired.set(true)
+            call.cancel()
+        }
+    } else null
     try {
         currentCoroutineContext().ensureActive()
-        call.execute().use { response -> consume(response) { call.cancel() } }
+        val response = call.execute()
+        val result = try {
+            consume(response) { call.cancel() }
+        } finally {
+            try {
+                response.close()
+            } catch (_: NullPointerException) {
+                // Defensive: OkHttp Response.close() crashes if body is null.
+            }
+        }
+        currentCoroutineContext().ensureActive()
+        if (deadlineFired.get()) {
+            throw ProviderFailure(
+                retryable = false,
+                message = ATTEMPT_DEADLINE_EXCEEDED,
+                code = ProviderFailureCode.DEADLINE_EXCEEDED,
+            )
+        }
+        result
     } catch (e: IOException) {
         currentCoroutineContext().ensureActive()
+        if (deadlineFired.get()) {
+            throw ProviderFailure(
+                retryable = false,
+                message = ATTEMPT_DEADLINE_EXCEEDED,
+                cause = e,
+                code = ProviderFailureCode.DEADLINE_EXCEEDED,
+            )
+        }
         throw e
     } finally {
+        deadlineJob?.cancel()
         cancellation?.dispose()
     }
 }
@@ -296,30 +372,53 @@ internal suspend fun <T> executeProviderRequest(
  * transport errors are classified as one provider attempt. [onFrame] returns
  * [SsePumpDecision.STOP] when the protocol reaches a terminal frame; the
  * response is then closed immediately without reading later bytes.
+ *
+ * The [deadlineJob] inherits the caller's coroutine context from [coroutineScope]
+ * rather than specifying an explicit dispatcher. `pumpSse` performs blocking IO
+ * on the caller's dispatcher, which [streamingFlow] confines to [Dispatchers.IO]
+ * via `flowOn(Dispatchers.IO)`. Inheriting the enclosing context maintains
+ * structured concurrency and avoids unnecessary dispatcher hops.
  */
 @OptIn(InternalCoroutinesApi::class)
 internal suspend fun pumpSse(
     client: OkHttpClient,
     request: Request,
+    httpConfig: ProviderHttpConfig = ProviderHttpConfig(),
     onFrame: suspend (SseFrameParser.Frame) -> SsePumpDecision,
-) {
+) = coroutineScope {
     val call = client.newCall(request)
     val job = currentCoroutineContext()[Job]
     val cancellation = job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
         if (cause != null) call.cancel()
     }
+    val deadlineFired = AtomicBoolean(false)
+    val deadlineJob = if (httpConfig.attemptDeadlineMs > 0L) {
+        launch {
+            delay(httpConfig.attemptDeadlineMs)
+            deadlineFired.set(true)
+            call.cancel()
+        }
+    } else null
     try {
         currentCoroutineContext().ensureActive()
         val response = try {
             call.execute()
         } catch (e: IOException) {
             currentCoroutineContext().ensureActive()
+            if (deadlineFired.get()) {
+                throw ProviderFailure(
+                    retryable = false,
+                    message = ATTEMPT_DEADLINE_EXCEEDED,
+                    cause = e,
+                    code = ProviderFailureCode.DEADLINE_EXCEEDED,
+                )
+            }
             val kind = ProviderErrorClassifier.classify(null, e, null)
             throw ProviderFailure(kind == FailureKind.RETRYABLE, redactedError("SSE_TRANSPORT", e.message), e)
         }
         var protocolTerminalReached = false
         try {
-            response.use { response ->
+            try {
                 if (!response.isSuccessful) {
                     val snippet = try {
                         readProviderErrorPrefix(response.body) { call.cancel() }
@@ -327,24 +426,55 @@ internal suspend fun pumpSse(
                         currentCoroutineContext().ensureActive()
                         null
                     }
+                    currentCoroutineContext().ensureActive()
+                    if (deadlineFired.get()) {
+                        throw ProviderFailure(
+                            retryable = false,
+                            message = ATTEMPT_DEADLINE_EXCEEDED,
+                            code = ProviderFailureCode.DEADLINE_EXCEEDED,
+                        )
+                    }
                     val kind = ProviderErrorClassifier.classify(response.code, null, snippet)
                     throw ProviderFailure(
                         retryable = kind == FailureKind.RETRYABLE,
                         message = redactedError("HTTP ${response.code}", snippet),
                     )
                 }
-                val body = response.body
-                    ?: throw ProviderFailure(true, "SSE_EMPTY_BODY")
+                val body = response.body ?: throw ProviderFailure(true, "SSE_EMPTY_BODY")
                 val parser = SseFrameParser()
                 val source = body.source()
                 val buf = ByteArray(8192)
                 var stopped = false
+                var totalWireBytesRead = 0L
                 while (!stopped) {
                     currentCoroutineContext().ensureActive()
+                    if (deadlineFired.get()) {
+                        call.cancel()
+                        throw ProviderFailure(
+                            retryable = false,
+                            message = ATTEMPT_DEADLINE_EXCEEDED,
+                            code = ProviderFailureCode.DEADLINE_EXCEEDED,
+                        )
+                    }
+                    val maxBytes = httpConfig.maxSseWireBytes
+                    val toRead = if (maxBytes > 0L) {
+                        val remaining = maxBytes - totalWireBytesRead
+                        if (remaining < buf.size) (remaining + 1L).toInt() else buf.size
+                    } else {
+                        buf.size
+                    }
                     val read: Int = try {
-                        source.read(buf, 0, buf.size)
+                        source.read(buf, 0, toRead)
                     } catch (e: IOException) {
                         currentCoroutineContext().ensureActive()
+                        if (deadlineFired.get()) {
+                            throw ProviderFailure(
+                                retryable = false,
+                                message = ATTEMPT_DEADLINE_EXCEEDED,
+                                cause = e,
+                                code = ProviderFailureCode.DEADLINE_EXCEEDED,
+                            )
+                        }
                         val kind = ProviderErrorClassifier.classify(null, e, null)
                         throw ProviderFailure(kind == FailureKind.RETRYABLE, redactedError("SSE_TRANSPORT", e.message), e)
                     }
@@ -360,27 +490,32 @@ internal suspend fun pumpSse(
                         }
                         break
                     }
-                    val frames = parser.feed(buf, 0, read)
-                    for (frame in frames) {
-                        currentCoroutineContext().ensureActive()
-                        if (onFrame(frame) == SsePumpDecision.STOP) {
-                            protocolTerminalReached = true
-                            stopped = true
-                            // Stop reading the body; Response.use closes it on exit.
-                            break
+                    val remaining = if (maxBytes > 0L) maxBytes - totalWireBytesRead else Long.MAX_VALUE
+                    val inBudgetCount = if (maxBytes > 0L) minOf(read.toLong(), remaining).toInt() else read
+                    if (inBudgetCount > 0) {
+                        val frames = parser.feed(buf, 0, inBudgetCount)
+                        for (frame in frames) {
+                            currentCoroutineContext().ensureActive()
+                            if (onFrame(frame) == SsePumpDecision.STOP) {
+                                protocolTerminalReached = true
+                                stopped = true
+                                break
+                            }
                         }
                     }
-                    if (!protocolTerminalReached) {
-                        currentCoroutineContext().ensureActive()
-                        if (parser.lineTooLong) {
-                            throw ProviderFailure(false, SseFrameParser.LINE_TOO_LONG_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
-                        }
-                        if (parser.frameTooLong) {
-                            throw ProviderFailure(false, SseFrameParser.FRAME_TOO_LARGE_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
-                        }
+                    if (protocolTerminalReached) {
+                        totalWireBytesRead += inBudgetCount.toLong()
+                        break
                     }
-                }
-                if (!protocolTerminalReached) {
+                    if (maxBytes > 0L && read > inBudgetCount) {
+                        call.cancel()
+                        throw ProviderFailure(
+                            retryable = false,
+                            message = SSE_TOTAL_TOO_LARGE,
+                            code = ProviderFailureCode.AGG_TOO_LARGE,
+                        )
+                    }
+                    totalWireBytesRead += read.toLong()
                     currentCoroutineContext().ensureActive()
                     if (parser.lineTooLong) {
                         throw ProviderFailure(false, SseFrameParser.LINE_TOO_LONG_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
@@ -389,13 +524,55 @@ internal suspend fun pumpSse(
                         throw ProviderFailure(false, SseFrameParser.FRAME_TOO_LARGE_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
                     }
                 }
+                if (!protocolTerminalReached) {
+                    currentCoroutineContext().ensureActive()
+                    if (deadlineFired.get()) {
+                        throw ProviderFailure(
+                            retryable = false,
+                            message = ATTEMPT_DEADLINE_EXCEEDED,
+                            code = ProviderFailureCode.DEADLINE_EXCEEDED,
+                        )
+                    }
+                    if (parser.lineTooLong) {
+                        throw ProviderFailure(false, SseFrameParser.LINE_TOO_LONG_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
+                    }
+                    if (parser.frameTooLong) {
+                        throw ProviderFailure(false, SseFrameParser.FRAME_TOO_LARGE_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
+                    }
+                }
+            } finally {
+                try {
+                    response.close()
+                } catch (_: NullPointerException) {
+                    // Defensive: OkHttp Response.close() crashes if body is null.
+                }
+            }
+            if (!protocolTerminalReached && deadlineFired.get()) {
+                currentCoroutineContext().ensureActive()
+                throw ProviderFailure(
+                    retryable = false,
+                    message = ATTEMPT_DEADLINE_EXCEEDED,
+                    code = ProviderFailureCode.DEADLINE_EXCEEDED,
+                )
             }
         } catch (e: IOException) {
             // A protocol terminal already emitted the authoritative Done/Failed.
             // Do not append a second terminal event if close reports cleanup IO.
-            if (!protocolTerminalReached) throw e
+            if (!protocolTerminalReached) {
+                currentCoroutineContext().ensureActive()
+                if (deadlineFired.get()) {
+                    throw ProviderFailure(
+                        retryable = false,
+                        message = ATTEMPT_DEADLINE_EXCEEDED,
+                        cause = e,
+                        code = ProviderFailureCode.DEADLINE_EXCEEDED,
+                    )
+                }
+                throw e
+            }
         }
     } finally {
+        deadlineJob?.cancel()
         cancellation?.dispose()
     }
 }
@@ -413,14 +590,14 @@ internal fun postJson(url: String, headers: LinkedHashMap<String, String>, bodyJ
  * transparency for failures thrown by the downstream collector.
  *
  * `code` propagation (Stage D): a [ProviderFailure] becomes
- * [StreamEvent.Failed] with `code = e.code?.name ?: inferAggFailureCodeName(e.message)`,
+ * [StreamEvent.Failed] with `code = e.code?.name ?: inferAggFailureCodeName(e)`,
  * so aggregation/SSE budget overflows (`AGG_TOO_LARGE` with distinct
  * `TOOL_ARGS_TOO_LARGE` / `TEXT_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
  * messages) stay typed end-to-end for TurnController's pending-flush guard.
  * The `IllegalArgumentException` and `IOException` branches carry
- * `code = inferAggFailureCodeName(e.message)` (null for non-aggregation
+ * `code = inferAggFailureCodeName(e)` (null for non-aggregation
  * messages), and the unknown-runtime fallback carries
- * `inferAggFailureCodeName(e.message) ?: UNKNOWN_RUNTIME`, so the controller
+ * `inferAggFailureCodeName(e) ?: UNKNOWN_RUNTIME`, so the controller
  * can discard poison-adjacent pending tools without changing retry semantics
  * of other fatal events (401/validation stay flushable).
  * Unknown runtime failures fail closed (`retryable = false`): only
@@ -441,14 +618,14 @@ internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit)
                     StreamEvent.Failed(
                         redactedError(e.message ?: "PROVIDER_FAILED"),
                         e.retryable,
-                        e.code?.name ?: inferAggFailureCodeName(e.message),
+                        e.code?.name ?: inferAggFailureCodeName(e),
                     ),
                 )
                 is IllegalArgumentException -> emit(
                     StreamEvent.Failed(
                         redactedError("PROVIDER_BAD_REQUEST", e.message),
                         retryable = false,
-                        code = inferAggFailureCodeName(e.message),
+                        code = inferAggFailureCodeName(e),
                     ),
                 )
                 is IOException -> {
@@ -457,7 +634,7 @@ internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit)
                     // classification: an AGG_TOO_LARGE stream is poisoned and
                     // never retries, even when the classifier sees a plain
                     // IOException shape.
-                    val aggCode = inferAggFailureCodeName(e.message)
+                    val aggCode = inferAggFailureCodeName(e)
                     emit(
                         StreamEvent.Failed(
                             redactedError("PROVIDER_TRANSPORT", e.message),
@@ -470,7 +647,7 @@ internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit)
                     StreamEvent.Failed(
                         redactedError(e.message ?: "PROVIDER_FAILURE"),
                         retryable = false,
-                        code = inferAggFailureCodeName(e.message) ?: ProviderFailureCode.UNKNOWN_RUNTIME.name,
+                        code = inferAggFailureCodeName(e) ?: ProviderFailureCode.UNKNOWN_RUNTIME.name,
                     ),
                 )
             }

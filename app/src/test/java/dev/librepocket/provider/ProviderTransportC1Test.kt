@@ -17,6 +17,8 @@ import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Interceptor
 import okhttp3.MediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody
 import okhttp3.mockwebserver.MockResponse
@@ -70,22 +72,27 @@ class ProviderTransportC1Test {
 
     private val fakeKey = "c1-fake-key"
 
-    private fun config(protocol: ProviderProtocol, baseUrl: String) = ProviderConfig(
+    private fun config(
+        protocol: ProviderProtocol,
+        baseUrl: String,
+        http: ProviderHttpConfig = ProviderHttpConfig(readTimeoutMs = TimeUnit.MINUTES.toMillis(5)),
+    ) = ProviderConfig(
         id = "c1-provider",
         label = "c1 test",
         baseUrl = baseUrl,
         protocol = protocol,
         apiKeyRef = "fake-key-ref",
-        http = ProviderHttpConfig(readTimeoutMs = TimeUnit.MINUTES.toMillis(5)),
+        http = http,
     )
 
     private fun providerFor(
         protocol: ProviderProtocol,
         server: MockWebServer,
         client: OkHttpClient? = null,
+        http: ProviderHttpConfig = ProviderHttpConfig(readTimeoutMs = TimeUnit.MINUTES.toMillis(5)),
     ): LlmProvider {
         val base = server.url("/").toString().trimEnd('/')
-        val cfg = config(protocol, base)
+        val cfg = config(protocol, base, http)
         val key = { fakeKey.toCharArray() }
         return when (protocol) {
             ProviderProtocol.CHAT_COMPLETIONS -> ChatCompletionsProvider(cfg, key, client)
@@ -112,6 +119,15 @@ class ProviderTransportC1Test {
         model = "c1-model",
         messages = listOf(ChatMessage("user", "hi")),
     )
+
+    private fun validTerminalBodyFor(protocol: ProviderProtocol): String = when (protocol) {
+        ProviderProtocol.CHAT_COMPLETIONS ->
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+        ProviderProtocol.RESPONSES ->
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n"
+        ProviderProtocol.ANTHROPIC ->
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+    }
 
     /**
      * Counts the bytes the pump actually pulls from the client-side
@@ -758,6 +774,604 @@ class ProviderTransportC1Test {
             } finally {
                 server.shutdown()
             }
+        }
+    }
+
+    @Test
+    fun heartbeatSlowDripHitsAttemptDeadlineFailsTypedNonRetryable() = runBlocking {
+        // Periodic keep-alive comments arrive every 40ms, well within the 5s readTimeout,
+        // but whole-attempt deadline expires at 200ms -> ATTEMPT_DEADLINE_EXCEEDED, non-retryable.
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            server.start()
+            try {
+                val keepAlives = ": keep-alive\n\n".repeat(100)
+                server.enqueue(
+                    MockResponse()
+                        .setHeader("Content-Type", "text/event-stream")
+                        .setChunkedBody(keepAlives, 14)
+                        .throttleBody(14, 40, TimeUnit.MILLISECONDS),
+                )
+                val http = ProviderHttpConfig(
+                    readTimeoutMs = 5_000L,
+                    attemptDeadlineMs = 200L,
+                )
+                val events = withTimeout(10_000) {
+                    providerFor(protocol, server, null, http).stream(request()).toList()
+                }
+                val failure = events.single() as StreamEvent.Failed
+                assertTrue(
+                    "$protocol heartbeat drip must fail with ATTEMPT_DEADLINE_EXCEEDED, got: ${failure.message}",
+                    failure.message.contains(ATTEMPT_DEADLINE_EXCEEDED),
+                )
+                assertFalse("$protocol deadline failure must be non-retryable", failure.retryable)
+                assertEquals(
+                    "$protocol failure code must be DEADLINE_EXCEEDED",
+                    ProviderFailureCode.DEADLINE_EXCEEDED.name,
+                    failure.code,
+                )
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun oneByteDripHitsAttemptDeadlineFailsTypedNonRetryable() = runBlocking {
+        // 1 byte dripping every 20ms never trips 5s idle readTimeout, but hits 80ms deadline.
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            server.start()
+            try {
+                val slowBody = ": d\n\n".repeat(15)
+                server.enqueue(
+                    MockResponse()
+                        .setHeader("Content-Type", "text/event-stream")
+                        .setChunkedBody(slowBody, 1)
+                        .throttleBody(1, 20, TimeUnit.MILLISECONDS),
+                )
+                val http = ProviderHttpConfig(
+                    readTimeoutMs = 5_000L,
+                    attemptDeadlineMs = 80L,
+                )
+                val events = withTimeout(10_000) {
+                    providerFor(protocol, server, null, http).stream(request()).toList()
+                }
+                val failure = events.single() as StreamEvent.Failed
+                assertTrue(
+                    "$protocol 1-byte drip must fail with ATTEMPT_DEADLINE_EXCEEDED, got: ${failure.message}",
+                    failure.message.contains(ATTEMPT_DEADLINE_EXCEEDED),
+                )
+                assertFalse("$protocol deadline failure must be non-retryable", failure.retryable)
+                assertEquals(
+                    "$protocol failure code must be DEADLINE_EXCEEDED",
+                    ProviderFailureCode.DEADLINE_EXCEEDED.name,
+                    failure.code,
+                )
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun cleanEofOnTruncatedStreamHitsAttemptDeadlineFailsTypedNonRetryable() = runBlocking {
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            server.start()
+            try {
+                server.enqueue(
+                    MockResponse()
+                        .setHeader("Content-Type", "text/event-stream")
+                        .setBody(": drip\n\n"),
+                )
+                val client = OkHttpClient.Builder()
+                    .addInterceptor { chain ->
+                        val response = chain.proceed(chain.request())
+                        val body = response.body
+                        val forwardingSource = object : ForwardingSource(body.source()) {
+                            override fun read(sink: Buffer, byteCount: Long): Long {
+                                val read = super.read(sink, byteCount)
+                                if (read == -1L) {
+                                    Thread.sleep(120)
+                                }
+                                return read
+                            }
+                        }
+                        val wrappedBody = object : ResponseBody() {
+                            private val buffered = forwardingSource.buffer()
+                            override fun contentType(): MediaType? = body.contentType()
+                            override fun contentLength(): Long = body.contentLength()
+                            override fun source(): BufferedSource = buffered
+                        }
+                        response.newBuilder().body(wrappedBody).build()
+                    }
+                    .build()
+                val http = ProviderHttpConfig(
+                    readTimeoutMs = 5_000L,
+                    attemptDeadlineMs = 50L,
+                )
+                val events = withTimeout(10_000) {
+                    providerFor(protocol, server, client, http).stream(request()).toList()
+                }
+                val failure = events.single() as StreamEvent.Failed
+                assertTrue(
+                    "$protocol deadline failure must contain ATTEMPT_DEADLINE_EXCEEDED, got: ${failure.message}",
+                    failure.message.contains(ATTEMPT_DEADLINE_EXCEEDED),
+                )
+                assertFalse("$protocol deadline failure must be non-retryable", failure.retryable)
+                assertEquals(
+                    "$protocol failure code must be DEADLINE_EXCEEDED",
+                    ProviderFailureCode.DEADLINE_EXCEEDED.name,
+                    failure.code,
+                )
+                assertFalse(
+                    "$protocol deadline failure must not report SSE_TRUNCATED, got: ${failure.message}",
+                    failure.message.contains("SSE_TRUNCATED"),
+                )
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun listModelsStallHitsAttemptDeadlineFailsTypedNonRetryable() = runBlocking {
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            server.start()
+            try {
+                server.enqueue(
+                    MockResponse()
+                        .setBody("{\"data\":[]}")
+                        .setBodyDelay(2, TimeUnit.SECONDS),
+                )
+                val http = ProviderHttpConfig(
+                    readTimeoutMs = 5_000L,
+                    attemptDeadlineMs = 150L,
+                )
+                try {
+                    providerFor(protocol, server, null, http).listModels()
+                    fail("$protocol listModels stall should throw ATTEMPT_DEADLINE_EXCEEDED")
+                } catch (e: ProviderFailure) {
+                    assertTrue(
+                        "$protocol listModels must fail with ATTEMPT_DEADLINE_EXCEEDED, got: ${e.message}",
+                        e.message.orEmpty().contains(ATTEMPT_DEADLINE_EXCEEDED),
+                    )
+                    assertFalse("$protocol deadline failure must be non-retryable", e.retryable)
+                    assertEquals(
+                        "$protocol failure code must be DEADLINE_EXCEEDED",
+                        ProviderFailureCode.DEADLINE_EXCEEDED,
+                        e.code,
+                    )
+                }
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun zeroOrNegativeWireCapAndDeadlineDisablesLimits() = runBlocking {
+        for (limitValue in listOf(0L, -1L)) {
+            for (protocol in ProviderProtocol.values()) {
+                val server = MockWebServer()
+                server.start()
+                try {
+                    val body = validTerminalBodyFor(protocol)
+                    server.enqueue(
+                        MockResponse()
+                            .setHeader("Content-Type", "text/event-stream")
+                            .setBody(body),
+                    )
+                    val http = ProviderHttpConfig(
+                        attemptDeadlineMs = limitValue,
+                        maxSseWireBytes = limitValue,
+                    )
+                    val events = withTimeout(5_000) {
+                        providerFor(protocol, server, null, http).stream(request()).toList()
+                    }
+                    assertTrue(
+                        "$protocol with limitValue=$limitValue must not fail, got: $events",
+                        events.none { it is StreamEvent.Failed },
+                    )
+                    assertTrue(
+                        "$protocol with limitValue=$limitValue must emit Done, got: $events",
+                        events.any { it is StreamEvent.Done },
+                    )
+                    assertEquals(1, server.requestCount)
+                } finally {
+                    server.shutdown()
+                }
+            }
+        }
+    }
+
+    @Test
+    fun exactWireCapBoundaryPassesAndOneExtraByteFailsTyped() = runBlocking {
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            server.start()
+            try {
+                val body = validTerminalBodyFor(protocol)
+                val bodyBytes = body.toByteArray(Charsets.UTF_8).size.toLong()
+
+                // 1. Exactly maxSseWireBytes passes
+                server.enqueue(
+                    MockResponse()
+                        .setHeader("Content-Type", "text/event-stream")
+                        .setBody(body),
+                )
+                val passHttp = ProviderHttpConfig(maxSseWireBytes = bodyBytes)
+                val passEvents = withTimeout(5_000) {
+                    providerFor(protocol, server, null, passHttp).stream(request()).toList()
+                }
+                assertTrue("$protocol exact cap must pass without failure, got: $passEvents", passEvents.none { it is StreamEvent.Failed })
+                assertTrue("$protocol exact cap must contain Done, got: $passEvents", passEvents.any { it is StreamEvent.Done })
+
+                // 2. maxSseWireBytes - 1 trips SSE_TOTAL_TOO_LARGE
+                server.enqueue(
+                    MockResponse()
+                        .setHeader("Content-Type", "text/event-stream")
+                        .setBody(body),
+                )
+                val tripHttp = ProviderHttpConfig(maxSseWireBytes = bodyBytes - 1L)
+                val tripEvents = withTimeout(5_000) {
+                    providerFor(protocol, server, null, tripHttp).stream(request()).toList()
+                }
+                val failure = tripEvents.last() as StreamEvent.Failed
+                assertTrue(
+                    "$protocol over-cap byte must fail with SSE_TOTAL_TOO_LARGE, got: ${failure.message}",
+                    failure.message.contains(SSE_TOTAL_TOO_LARGE),
+                )
+                assertFalse("$protocol overflow must be non-retryable", failure.retryable)
+                assertEquals(ProviderFailureCode.AGG_TOO_LARGE.name, failure.code)
+                assertTrue("$protocol overflow stream must not commit Done", tripEvents.none { it is StreamEvent.Done })
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun malformedFloodExceedingMaxSseWireBytesAbortsEarlyAndCancelsCall() = runBlocking {
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            val signals = SseBodyReadSignals()
+            server.start()
+            try {
+                val flood = ": spam-comment-stream\n\n".repeat(5_000) // ~115 KB
+                server.enqueue(
+                    MockResponse()
+                        .setHeader("Content-Type", "text/event-stream")
+                        .setBody(flood),
+                )
+                val cap = 16 * 1024L
+                val http = ProviderHttpConfig(maxSseWireBytes = cap)
+                val events = withTimeout(10_000) {
+                    providerFor(protocol, server, signals.client(), http)
+                        .stream(request()).toList()
+                }
+                val failure = events.single() as StreamEvent.Failed
+                assertTrue(
+                    "$protocol flood must fail with SSE_TOTAL_TOO_LARGE, got: ${failure.message}",
+                    failure.message.contains(SSE_TOTAL_TOO_LARGE),
+                )
+                assertFalse("$protocol flood failure must not be retryable", failure.retryable)
+                assertEquals(ProviderFailureCode.AGG_TOO_LARGE.name, failure.code)
+                assertTrue(
+                    "$protocol early abort must not consume the entire flood body, consumed: ${signals.consumedBytes.get()}",
+                    signals.consumedBytes.get() < flood.length,
+                )
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun protocolTerminalBeforeDeadlineOrOverflowCommitsDone() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val chunk1 = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+            val chunk2 = ": trailing-garbage-flood\n\n".repeat(2_000)
+            val body = chunk1 + chunk2
+            val chunk1Bytes = chunk1.toByteArray(Charsets.UTF_8).size
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setChunkedBody(body, chunk1Bytes),
+            )
+            val http = ProviderHttpConfig(
+                maxSseWireBytes = (chunk1Bytes + 100).toLong(),
+                attemptDeadlineMs = 500L,
+            )
+            val events = withTimeout(5_000) {
+                providerFor(ProviderProtocol.CHAT_COMPLETIONS, server, null, http).stream(request()).toList()
+            }
+            assertEquals(1, events.count { it is StreamEvent.Done })
+            assertTrue("terminal race must not append a failure, got: $events", events.none { it is StreamEvent.Failed })
+            assertEquals(StreamEvent.Done("stop"), events.last())
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun externalCoroutineCancelWhileReadingRethrowsCancellationExceptionNotFailed() = runBlocking {
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            val signals = SseBodyReadSignals()
+            server.start()
+            var job: Job? = null
+            try {
+                val partialChars = 32 * 1024
+                val bodyChars = ": " + "x".repeat(partialChars) + "\n\n"
+                server.enqueue(
+                    MockResponse()
+                        .setHeader("Content-Type", "text/event-stream")
+                        .setChunkedBody(bodyChars, 8 * 1024)
+                        .throttleBody(partialChars.toLong(), 60, TimeUnit.SECONDS),
+                )
+                val events = mutableListOf<StreamEvent>()
+                var thrown: Throwable? = null
+                val active = launch(Dispatchers.IO) {
+                    try {
+                        events.addAll(
+                            providerFor(protocol, server, signals.client()).stream(request()).toList(),
+                        )
+                    } catch (e: Throwable) {
+                        thrown = e
+                    }
+                }
+                job = active
+                assertTrue(
+                    "$protocol pump enters the read",
+                    withContext(Dispatchers.IO) { signals.readEntered.await(5, TimeUnit.SECONDS) },
+                )
+                withTimeout(5_000) { active.cancelAndJoin() }
+                assertTrue(
+                    "$protocol external cancel must rethrow CancellationException, got: $thrown",
+                    thrown is CancellationException,
+                )
+                assertTrue(
+                    "$protocol external cancel must never emit StreamEvent.Failed, got: $events",
+                    events.none { it is StreamEvent.Failed },
+                )
+            } finally {
+                job?.cancel()
+                server.shutdown()
+                job?.let { active -> withTimeoutOrNull(5_000) { active.join() } }
+            }
+        }
+    }
+
+    @Test
+    fun terminalBeforeCapInSameReadSucceedsDespiteTrailingGarbageOverCap() = runBlocking {
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            server.start()
+            try {
+                val terminal = validTerminalBodyFor(protocol)
+                val flood = ": trailing-garbage-flood\n\n".repeat(200)
+                val fullPayload = terminal + flood
+                val fullPayloadBytes = fullPayload.toByteArray(Charsets.UTF_8)
+                val terminalBytes = terminal.toByteArray(Charsets.UTF_8).size
+
+                val client = OkHttpClient.Builder()
+                    .addInterceptor { chain ->
+                        val response = chain.proceed(chain.request())
+                        val contentType = response.body?.contentType()
+                        val sourceBuffer = Buffer().write(fullPayloadBytes)
+                        val customBody = object : ResponseBody() {
+                            override fun contentType(): MediaType? = contentType
+                            override fun contentLength(): Long = fullPayloadBytes.size.toLong()
+                            override fun source(): BufferedSource = sourceBuffer
+                        }
+                        response.newBuilder().body(customBody).build()
+                    }
+                    .build()
+
+                server.enqueue(
+                    MockResponse()
+                        .setHeader("Content-Type", "text/event-stream")
+                        .setBody("unused"),
+                )
+
+                val http = ProviderHttpConfig(
+                    maxSseWireBytes = (terminalBytes + 50).toLong(),
+                )
+
+                val events = withTimeout(5_000) {
+                    providerFor(protocol, server, client, http).stream(request()).toList()
+                }
+
+                assertTrue(
+                    "$protocol terminal before cap must succeed with Done, got: $events",
+                    events.any { it is StreamEvent.Done },
+                )
+                assertTrue(
+                    "$protocol must not emit Failed despite trailing garbage over cap, got: $events",
+                    events.none { it is StreamEvent.Failed },
+                )
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun terminalAfterCapInSameReadFailsTypedSseTotalTooLarge() = runBlocking {
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            server.start()
+            try {
+                val padding = ": padding-before-terminal\n\n".repeat(10)
+                val paddingBytes = padding.toByteArray(Charsets.UTF_8).size
+                val terminal = validTerminalBodyFor(protocol)
+                val fullPayload = padding + terminal
+                val fullPayloadBytes = fullPayload.toByteArray(Charsets.UTF_8)
+                val cap = (paddingBytes / 2).toLong()
+
+                val client = OkHttpClient.Builder()
+                    .addInterceptor { chain ->
+                        val response = chain.proceed(chain.request())
+                        val contentType = response.body?.contentType()
+                        val sourceBuffer = Buffer().write(fullPayloadBytes)
+                        val customBody = object : ResponseBody() {
+                            override fun contentType(): MediaType? = contentType
+                            override fun contentLength(): Long = fullPayloadBytes.size.toLong()
+                            override fun source(): BufferedSource = sourceBuffer
+                        }
+                        response.newBuilder().body(customBody).build()
+                    }
+                    .build()
+
+                server.enqueue(
+                    MockResponse()
+                        .setHeader("Content-Type", "text/event-stream")
+                        .setBody("unused"),
+                )
+
+                val http = ProviderHttpConfig(
+                    maxSseWireBytes = cap,
+                )
+
+                val events = withTimeout(5_000) {
+                    providerFor(protocol, server, client, http).stream(request()).toList()
+                }
+
+                val failures = events.filterIsInstance<StreamEvent.Failed>()
+                assertEquals("$protocol must end in exactly one Failed event", 1, failures.size)
+                val failure = failures.single()
+                assertTrue(
+                    "$protocol message must contain SSE_TOTAL_TOO_LARGE, got: ${failure.message}",
+                    failure.message.contains(SSE_TOTAL_TOO_LARGE),
+                )
+                assertFalse("$protocol overflow failure must not be retryable", failure.retryable)
+                assertEquals(
+                    "$protocol failure code must be AGG_TOO_LARGE",
+                    ProviderFailureCode.AGG_TOO_LARGE.name,
+                    failure.code,
+                )
+                assertTrue(
+                    "$protocol over-cap stream must not commit Done, got: $events",
+                    events.none { it is StreamEvent.Done },
+                )
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun maxSseWireBytesLongMaxValueCompletesNormally() = runBlocking {
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            server.start()
+            try {
+                val body = validTerminalBodyFor(protocol)
+                server.enqueue(
+                    MockResponse()
+                        .setHeader("Content-Type", "text/event-stream")
+                        .setBody(body),
+                )
+                val http = ProviderHttpConfig(
+                    maxSseWireBytes = Long.MAX_VALUE,
+                )
+                val events = withTimeout(5_000) {
+                    providerFor(protocol, server, null, http).stream(request()).toList()
+                }
+                assertTrue(
+                    "$protocol with maxSseWireBytes=Long.MAX_VALUE must emit Done, got: $events",
+                    events.any { it is StreamEvent.Done },
+                )
+                assertTrue(
+                    "$protocol with maxSseWireBytes=Long.MAX_VALUE must not fail, got: $events",
+                    events.none { it is StreamEvent.Failed },
+                )
+                assertEquals(1, server.requestCount)
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun listModelsWithEmptyOrNullBodyHandledSafely() = runBlocking {
+        val nullBodyClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val response = Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .build()
+                val bodyField = Response::class.java.getDeclaredField("body")
+                bodyField.isAccessible = true
+                bodyField.set(response, null)
+                response
+            }
+            .build()
+
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            server.start()
+            try {
+                // 1. Empty body returns emptyList()
+                server.enqueue(
+                    MockResponse()
+                        .setResponseCode(200)
+                        .setBody(""),
+                )
+                val emptyResult = providerFor(protocol, server).listModels()
+                assertEquals(
+                    "$protocol listModels with empty body must return emptyList",
+                    emptyList<String>(),
+                    emptyResult,
+                )
+
+                // 2. Null body returns emptyList()
+                server.enqueue(
+                    MockResponse()
+                        .setResponseCode(200),
+                )
+                val nullResult = providerFor(protocol, server, nullBodyClient).listModels()
+                assertEquals(
+                    "$protocol listModels with null body must return emptyList",
+                    emptyList<String>(),
+                    nullResult,
+                )
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun pumpSseWithNullBodyThrowsTypedSseEmptyBody() = runBlocking {
+        val nullBodyClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val response = Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .build()
+                val bodyField = Response::class.java.getDeclaredField("body")
+                bodyField.isAccessible = true
+                bodyField.set(response, null)
+                response
+            }
+            .build()
+        val request = Request.Builder().url("http://localhost/").build()
+        try {
+            pumpSse(nullBodyClient, request) { SsePumpDecision.CONTINUE }
+            fail("pumpSse with null body must throw ProviderFailure")
+        } catch (expected: ProviderFailure) {
+            assertEquals("SSE_EMPTY_BODY", expected.message)
+            assertTrue("SSE_EMPTY_BODY must be retryable", expected.retryable)
         }
     }
 

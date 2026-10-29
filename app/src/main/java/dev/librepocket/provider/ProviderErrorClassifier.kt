@@ -7,6 +7,9 @@ import java.net.ConnectException
 import java.net.NoRouteToHostException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.util.Collections
+import java.util.IdentityHashMap
+import java.util.Locale
 import javax.net.ssl.SSLException
 
 /** Retryable vs fatal, per SPEC §5.2. */
@@ -50,6 +53,8 @@ object ProviderErrorClassifier {
         "image_too_large",
         "sse_line_too_long",
         "sse_frame_too_large",
+        "sse_total_too_large",
+        "attempt_deadline_exceeded",
         "tool_args_too_large",
         "text_too_large",
         // Phase 2 deterministic stream-contract failures: a streamed/terminal
@@ -81,6 +86,8 @@ object ProviderErrorClassifier {
         "invalid_prompt",
         "model_not_found",
         "context_length_exceeded",
+        "sse_total_too_large",
+        "attempt_deadline_exceeded",
         // Deterministic stream-contract failures are never retryable, even
         // when a retryable body/structured token rides the same envelope.
         "responses_output_mismatch",
@@ -151,9 +158,11 @@ object ProviderErrorClassifier {
     }
 
     private fun classifyError(error: Throwable, body: String): FailureKind {
-        if (retryableBodyMarkers.any { body.contains(it) }) return FailureKind.RETRYABLE
+        val seen = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
         var cur: Throwable? = error
-        while (cur != null) {
+        while (cur != null && seen.add(cur)) {
+            val msg = cur.message?.lowercase(Locale.ROOT)
+            if (msg != null && fatalBodyMarkers.any { msg.contains(it) }) return FailureKind.FATAL
             when (cur) {
                 is SSLException,
                 is java.security.cert.CertificateException,
@@ -161,27 +170,10 @@ object ProviderErrorClassifier {
                 is java.net.MalformedURLException,
                 is java.net.URISyntaxException,
                 -> return FailureKind.FATAL
-                is SocketTimeoutException,
-                is ConnectException,
-                is NoRouteToHostException,
-                is UnknownHostException,
-                is EOFException,
-                is InterruptedIOException,
-                -> return FailureKind.RETRYABLE
-                is IOException -> {
-                    val msg = cur.message?.lowercase().orEmpty()
-                    if (msg.contains("unexpected end of stream") ||
-                        msg.contains("eof") ||
-                        msg.contains("connection reset") ||
-                        msg.contains("broken pipe") ||
-                        msg.contains("stream was reset")
-                    ) {
-                        return FailureKind.RETRYABLE
-                    }
-                }
             }
             cur = cur.cause
         }
+        if (retryableBodyMarkers.any { body.contains(it) }) return FailureKind.RETRYABLE
         return FailureKind.RETRYABLE
     }
 

@@ -1,6 +1,7 @@
 package dev.librepocket.provider
 
 import java.io.EOFException
+import java.io.IOException
 import java.net.MalformedURLException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
@@ -129,6 +130,80 @@ class ProviderErrorTest {
         assertEquals(
             FailureKind.FATAL,
             ProviderErrorClassifier.classify(null, IllegalArgumentException("bad url"), null),
+        )
+    }
+
+    @Test
+    fun ioExceptionsWithFatalMarkersEvaluateToFatal() {
+        assertEquals(
+            FailureKind.FATAL,
+            ProviderErrorClassifier.classify(null, IOException("attempt_deadline_exceeded"), null),
+        )
+        assertEquals(
+            FailureKind.FATAL,
+            ProviderErrorClassifier.classify(null, IOException("sse_total_too_large"), null),
+        )
+        assertEquals(
+            FailureKind.FATAL,
+            ProviderErrorClassifier.classify(
+                null,
+                IOException("wrapped transport error", IOException("attempt_deadline_exceeded")),
+                null,
+            ),
+        )
+        assertEquals(
+            FailureKind.FATAL,
+            ProviderErrorClassifier.classify(
+                null,
+                IOException("wrapped transport error", IOException("sse_total_too_large")),
+                null,
+            ),
+        )
+    }
+
+    @Test
+    fun cyclicCauseChainDoesNotLoopInfinitely() {
+        val e1 = Exception("cause 1")
+        val e2 = Exception("cause 2", e1)
+        e1.initCause(e2)
+        assertEquals(FailureKind.RETRYABLE, ProviderErrorClassifier.classify(null, e1, null))
+    }
+
+    @Test
+    fun cyclicCauseChainWithFatalMarkerIsFatal() {
+        val e1 = Exception("cause 1")
+        val e2 = IOException("attempt_deadline_exceeded", e1)
+        e1.initCause(e2)
+        assertEquals(FailureKind.FATAL, ProviderErrorClassifier.classify(null, e1, null))
+    }
+
+    @Test
+    fun fatalMarkersAndExceptionTypesInCurPrecedeRetryableBodyMarkers() {
+        assertEquals(
+            FailureKind.FATAL,
+            ProviderErrorClassifier.classify(
+                null,
+                IOException("attempt_deadline_exceeded"),
+                "rate_limit_exceeded, timeout, try again",
+            ),
+        )
+        assertEquals(
+            FailureKind.FATAL,
+            ProviderErrorClassifier.classify(
+                null,
+                SSLHandshakeException("bad cert"),
+                "rate_limit_exceeded, timeout, try again",
+            ),
+        )
+        assertEquals(
+            FailureKind.FATAL,
+            ProviderErrorClassifier.classify(
+                null,
+                SocketTimeoutException("timed out").apply {
+                    initCause(IOException("sse_total_too_large"))
+                },
+                "rate_limit_exceeded",
+            ),
         )
     }
 

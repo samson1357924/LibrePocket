@@ -96,11 +96,18 @@ data class ThinkingConfig(val budgetTokens: Int? = null)
  *
  * @param readTimeoutMs idle timeout waiting for the next SSE chunk,
  *   not a whole-turn deadline. Cancellation closes the active call immediately.
+ * @param attemptDeadlineMs whole-attempt deadline in milliseconds; `<= 0L` disables the deadline.
+ * @param maxSseWireBytes maximum cumulative decoded response body bytes delivered by
+ *   `ResponseBody.source()` allowed before aborting (which bounds memory expansion and defends
+ *   against gzip decompression bombs, and matches wire bytes when uncompressed);
+ *   `<= 0L` disables the byte cap (unbounded stream).
  */
 data class ProviderHttpConfig(
     val connectTimeoutMs: Long = 15_000,
     val writeTimeoutMs: Long = 30_000,
     val readTimeoutMs: Long = 300_000,
+    val attemptDeadlineMs: Long = 300_000L,
+    val maxSseWireBytes: Long = 8 * 1024 * 1024L,
     @Deprecated("Provider retries are disabled; configure whole-turn retries in TurnRetryConfig.")
     val maxRetries: Int = 3,
     @Deprecated("Provider retries are disabled; configure whole-turn retries in TurnRetryConfig.")

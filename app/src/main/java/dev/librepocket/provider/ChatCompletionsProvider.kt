@@ -43,7 +43,7 @@ class ChatCompletionsProvider(
                 "Authorization" to "Bearer ${String(key)}",
             )
             val mapper = ChatCompletionsMapper()
-            pumpSse(httpClient, postJson(endpoint(config.baseUrl), headers, body)) { frame ->
+            pumpSse(httpClient, postJson(endpoint(config.baseUrl), headers, body), config.http) { frame ->
                 if (frame.isDone) {
                     mapper.markDone()
                     SsePumpDecision.STOP
@@ -67,7 +67,7 @@ class ChatCompletionsProvider(
                 .header("Authorization", "Bearer ${String(key)}")
                 .get()
                 .build()
-            return executeProviderRequest(httpClient, req) { resp, cancelCall ->
+            return executeProviderRequest(httpClient, req, config.http) { resp, cancelCall ->
                 if (!resp.isSuccessful) {
                     val errorPrefix = readProviderErrorPrefix(resp.body, cancelCall).orEmpty()
                     val kind = ProviderErrorClassifier.classify(resp.code, null, errorPrefix)

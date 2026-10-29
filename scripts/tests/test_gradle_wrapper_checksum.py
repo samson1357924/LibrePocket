@@ -29,7 +29,7 @@ WORKFLOW_SNAPSHOTS = {
     "pocketguard.yml": "9e6d291fe012a4932126c5dba96d0a27e1c68299bbbb1847ea8ab4d69db87df6",
     "pr-check.yml": "6f7cf483d18396193071b63c0eeec6eeaa8d5e52b3da15b746dae587f613fa77",
     "release.yml": "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f",
-    "security-audit.yml": "96e9683768cb2bc6f1974d2aac2033cac51895fe68669a8f14c0fef630b36e01",
+    "security-audit.yml": "02c03c353ebaabef272efcb162faa1cf214d23eec07e3d51f71a0ea75b0e5b3c",
 }
 
 

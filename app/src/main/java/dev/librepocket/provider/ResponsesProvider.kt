@@ -168,7 +168,7 @@ class ResponsesProvider(
                         redactedError("HTTP ${resp.code}", errorPrefix),
                     )
                 }
-                val text = readBoundedProviderBody(resp.body, cancelCall)
+                val text = resp.body?.let { readBoundedProviderBody(it, cancelCall) }.orEmpty()
                 extractModelIds(text)
             }
         } finally {

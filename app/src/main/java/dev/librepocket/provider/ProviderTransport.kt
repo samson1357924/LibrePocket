@@ -413,7 +413,7 @@ internal suspend fun pumpSse(
                         message = redactedError("HTTP ${response.code}", snippet),
                     )
                 }
-                val body = response.body
+                val body = response.body ?: throw ProviderFailure(true, "SSE_EMPTY_BODY")
                 val parser = SseFrameParser()
                 val source = body.source()
                 val buf = ByteArray(8192)
@@ -429,8 +429,15 @@ internal suspend fun pumpSse(
                             code = ProviderFailureCode.DEADLINE_EXCEEDED,
                         )
                     }
+                    val maxBytes = httpConfig.maxSseWireBytes
+                    val toRead = if (maxBytes > 0L) {
+                        val remaining = maxBytes - totalWireBytesRead
+                        if (remaining < buf.size) (remaining + 1L).toInt() else buf.size
+                    } else {
+                        buf.size
+                    }
                     val read: Int = try {
-                        source.read(buf, 0, buf.size)
+                        source.read(buf, 0, toRead)
                     } catch (e: IOException) {
                         currentCoroutineContext().ensureActive()
                         if (deadlineFired.get()) {
@@ -456,8 +463,24 @@ internal suspend fun pumpSse(
                         }
                         break
                     }
-                    totalWireBytesRead += read.toLong()
-                    if (httpConfig.maxSseWireBytes > 0L && totalWireBytesRead > httpConfig.maxSseWireBytes) {
+                    val remaining = if (maxBytes > 0L) maxBytes - totalWireBytesRead else Long.MAX_VALUE
+                    val inBudgetCount = if (maxBytes > 0L) minOf(read.toLong(), remaining).toInt() else read
+                    if (inBudgetCount > 0) {
+                        val frames = parser.feed(buf, 0, inBudgetCount)
+                        for (frame in frames) {
+                            currentCoroutineContext().ensureActive()
+                            if (onFrame(frame) == SsePumpDecision.STOP) {
+                                protocolTerminalReached = true
+                                stopped = true
+                                break
+                            }
+                        }
+                    }
+                    if (protocolTerminalReached) {
+                        totalWireBytesRead += inBudgetCount.toLong()
+                        break
+                    }
+                    if (maxBytes > 0L && read > inBudgetCount) {
                         call.cancel()
                         throw ProviderFailure(
                             retryable = false,
@@ -465,24 +488,13 @@ internal suspend fun pumpSse(
                             code = ProviderFailureCode.AGG_TOO_LARGE,
                         )
                     }
-                    val frames = parser.feed(buf, 0, read)
-                    for (frame in frames) {
-                        currentCoroutineContext().ensureActive()
-                        if (onFrame(frame) == SsePumpDecision.STOP) {
-                            protocolTerminalReached = true
-                            stopped = true
-                            // Stop reading the body; Response.use closes it on exit.
-                            break
-                        }
+                    totalWireBytesRead += read.toLong()
+                    currentCoroutineContext().ensureActive()
+                    if (parser.lineTooLong) {
+                        throw ProviderFailure(false, SseFrameParser.LINE_TOO_LONG_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
                     }
-                    if (!protocolTerminalReached) {
-                        currentCoroutineContext().ensureActive()
-                        if (parser.lineTooLong) {
-                            throw ProviderFailure(false, SseFrameParser.LINE_TOO_LONG_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
-                        }
-                        if (parser.frameTooLong) {
-                            throw ProviderFailure(false, SseFrameParser.FRAME_TOO_LARGE_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
-                        }
+                    if (parser.frameTooLong) {
+                        throw ProviderFailure(false, SseFrameParser.FRAME_TOO_LARGE_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
                     }
                 }
                 if (!protocolTerminalReached) {
@@ -501,6 +513,14 @@ internal suspend fun pumpSse(
                         throw ProviderFailure(false, SseFrameParser.FRAME_TOO_LARGE_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
                     }
                 }
+            }
+            if (!protocolTerminalReached && deadlineFired.get()) {
+                currentCoroutineContext().ensureActive()
+                throw ProviderFailure(
+                    retryable = false,
+                    message = ATTEMPT_DEADLINE_EXCEEDED,
+                    code = ProviderFailureCode.DEADLINE_EXCEEDED,
+                )
             }
         } catch (e: IOException) {
             // A protocol terminal already emitted the authoritative Done/Failed.

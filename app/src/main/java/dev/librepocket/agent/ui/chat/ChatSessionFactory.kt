@@ -2552,13 +2552,12 @@ private fun markerNamePrefix(text: String, start: Int, limit: Int): String {
 /** Production wiring for [ChatViewModel] (shares the process-singleton endpoint store). */
 class ChatViewModelFactory(
     app: Application,
-    store: EndpointStore = EndpointStore(app),
+    private val store: EndpointStore = EndpointStore(app),
     policy: PolicyStore? = null,
     buildProvider: ((ProviderConfig, KeyProvider) -> LlmProvider)? = null,
     vaultSource: VaultSource? = null,
     sessionStores: SessionStoreSource? = null,
 ) : ViewModelProvider.Factory {
-    private val store = store
     private val effectivePolicy: PolicyStore = policy ?: DataStorePolicyStore(app)
 
     @Volatile
@@ -2578,6 +2577,7 @@ class ChatViewModelFactory(
         vaultSource = effectiveVaultSource,
         buildProvider = buildProvider ?: { cfg, keys -> DefaultProviderFactory(keys).create(cfg) },
         sessionStores = effectiveSessionStores,
+        toolSlice = null, // Records-only invariant pinned in production composition
     )
 
     @Suppress("UNCHECKED_CAST")

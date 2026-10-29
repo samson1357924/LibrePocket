@@ -384,7 +384,11 @@ class ChatSnapshotAtomicityTest {
 
             val vm = newVm(store, transcripts, answeringFake())
             onMain { vm.openSession(newId) }
-            awaitTrue { vm.currentSessionId.value == newId && vm.messages.value.isNotEmpty() }
+            awaitTrue {
+                vm.currentSessionId.value == newId &&
+                    vm.messages.value.isNotEmpty() &&
+                    vm.notice.value == "HISTORY_SNAPSHOT_INCOMPLETE"
+            }
             assertEquals("HISTORY_SNAPSHOT_INCOMPLETE", vm.notice.value)
             assertEquals(listOf("QB", "AB"), vm.messages.value.map { it.text })
             assertTrue(interruptedMarkers(transcripts, newId).isEmpty())

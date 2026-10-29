@@ -289,13 +289,28 @@ def _code_and_depths(text: str) -> tuple[str, list[int]]:
     return code_text, depths
 
 
-def _has_pending_control(prefix: str) -> bool:
+def _has_pending_control(prefix: str, original: str) -> bool:
     """Detect a possibly unbraced control statement before a declaration.
 
     Only simple, single-line val/var if expressions are recognized as complete;
     more complicated preceding control flow is intentionally rejected.
     Braces inside parentheses cannot terminate an enclosing condition.
     """
+    # Keep a placeholder for each literal so a completed literal RHS is not
+    # mistaken for whitespace. Never expose literal contents as Kotlin code.
+    elvis_code = list(prefix)
+    for start, _ in _string_intervals(original):
+        elvis_code[start] = "0"
+    elvis_prefix = re.sub(r"`[^`\n]*`", "identifier", "".join(elvis_code))
+    # An annotation can precede the RHS expression; its argument parentheses
+    # do not mean the RHS has executed. Conservatively reject annotations
+    # only while the RHS is still pending, not after a completed expression.
+    if re.search(r"\?:\s*(?:(?:[^\W\d]|_)\w*\s*@\s*|\(\s*)*@", elvis_prefix):
+        return True
+    # Labels and grouping parentheses may precede the RHS expression, including
+    # the following DSL call. A closing parenthesis means the RHS has begun.
+    if re.search(r"\?:\s*(?:(?:[^\W\d]|_)\w*\s*@\s*|\(\s*)*$", elvis_prefix):
+        return True
     prefix = re.sub(r"`[^`\n]*`", lambda m: " " * len(m.group()), prefix)
     control = r"\b(?:if|else|for|while|when|do|try|catch|finally)\b"
 
@@ -321,6 +336,46 @@ def _has_pending_control(prefix: str) -> bool:
         elif parens and char in "{};":
             chars[i] = " "
     return bool(re.search(control + r"[^{};]*$", "".join(chars)))
+
+
+def _has_pending_expression(prefix: str, original: str) -> bool:
+    """Reject declarations inside unfinished grouping or after an operator.
+
+    Literals and backtick identifiers are opaque, but count as completed
+    operands when checking the end of the preceding statement.
+    """
+    code = list(prefix)
+    for start, _ in _string_intervals(original):
+        code[start] = "0"
+    code = re.sub(r"`[^`\n]*`", "identifier", "".join(code))
+    stack: list[str] = []
+    for char in code:
+        if char in "([":
+            stack.append(char)
+        elif char in ")]":
+            if not stack or stack.pop() != {')': '(', ']': '['}[char]:
+                return True
+    if stack:
+        return True
+    # Postfix increment/decrement and non-null assertions finish an operand;
+    # unlike a binary operator they do not consume the following DSL call.
+    if re.search(r"[\w\])](?:\+\+|--|!!)\s*$", code):
+        return False
+    # An infix function name consumes the next expression, even across a
+    # newline. Kotlin permits arbitrary identifiers (including backticks),
+    # not just the standard library's `to`. Exclude declaration keywords so
+    # a standalone `val name` is not mistaken for an infix expression.
+    infix = re.search(
+        r"(?<![\w`])(?:[\w\])]+(?:(?:\+\+|--|!!))*[ \t]+)+(?:[^\W\d]|_)\w*\s*$",
+        code,
+    )
+    if infix:
+        tokens = infix.group().split()
+        if (tokens[0] not in {"val", "var", "fun", "class", "object", "typealias", "import", "package"}
+                and len(tokens) % 2 == 0):
+            return True
+    # A newline does not complete an expression after an operator or label.
+    return bool(re.search(r"(?:[=+*/%&|^!<>?,.:-]|@)\s*$", code))
 
 
 def _reject_version_declarations(code: str) -> None:
@@ -353,7 +408,8 @@ def _extract_default_config(stripped: str) -> str | None:
     m = android_candidates[0]
     if depths[m.start()] != 0 or code[code.rfind("\n", 0, m.start()) + 1:m.start()].strip():
         raise TagVersionError("android block must be a direct top-level declaration")
-    if _has_pending_control(code[:m.start()]):
+    if (_has_pending_control(code[:m.start()], stripped[:m.start()])
+            or _has_pending_expression(code[:m.start()], stripped[:m.start()])):
         raise TagVersionError("conditional android block is unsupported")
     _reject_preceding_returns(code[:m.start()])
     _reject_version_declarations(code[:m.start()])
@@ -373,7 +429,8 @@ def _extract_default_config(stripped: str) -> str | None:
     dm = default_candidates[0]
     if body_depths[dm.start()] != 0 or body_code[body_code.rfind("\n", 0, dm.start()) + 1:dm.start()].strip():
         raise TagVersionError("defaultConfig must be a direct android declaration")
-    if _has_pending_control(body_code[:dm.start()]):
+    if (_has_pending_control(body_code[:dm.start()], android_body[:dm.start()])
+            or _has_pending_expression(body_code[:dm.start()], android_body[:dm.start()])):
         raise TagVersionError("conditional defaultConfig is unsupported")
     _reject_preceding_returns(body_code[:dm.start()])
     _reject_version_declarations(body_code[:dm.start()])

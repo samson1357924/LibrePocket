@@ -893,6 +893,15 @@ class ReleaseBuilderHarness(unittest.TestCase):
         self._assert_preflight_rejected(result)
         self.assertIn("missing pin entry for flavor: foss", result.stdout)
 
+    def test_subset_flavor_build_rejects_malformed_unselected_pin(self) -> None:
+        pins_file = self._create_pins_file(
+            flavors=FLAVORS, override={"foss": {"package": "invalid", "cert_sha256": "bad"}}
+        )
+        command = self.command(("play",)) + ["--pins", str(pins_file)]
+        result = self.run_builder(command, passwords=False)
+        self._assert_preflight_rejected(result)
+        self.assertIn("invalid package for foss", result.stdout)
+
     def test_package_name_case_sensitivity_fails_preflight(self) -> None:
         pins_file = self._create_pins_file()
         command = self.command()
@@ -1393,6 +1402,105 @@ class ReleaseTagVersionTest(unittest.TestCase):
                     with self.assertRaisesRegex(tag_version.TagVersionError, "conditional"):
                         tag_version.parse_gradle_version(str(path))
 
+    def test_pending_elvis_before_identity_blocks_rejected(self) -> None:
+        path = self.tmp / "elvis.gradle.kts"
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        for location in ("android", "defaultConfig"):
+            for prefix in ('val ignored = "already set" ?: \n',
+                           'val ignored = if (true) 1 else 2 ?: /* comment */\n',
+                           'val ignored = "set" ?: label@\n',
+                           'val ignored = "set" ?: @Suppress("UNUSED_EXPRESSION")\n',
+                           'val ignored = "set" ?: label@ @Suppress("UNUSED_EXPRESSION")\n',
+                           'val ignored = "set" ?: /* comment */ `my label`@ other@\n'):
+                with self.subTest(location=location, prefix=prefix):
+                    path.write_text(
+                        (prefix if location == "android" else "") + 'android {\n'
+                        + (prefix if location == "defaultConfig" else "")
+                        + 'defaultConfig {\n' + direct + '}\n}\n', encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(tag_version.TagVersionError, "conditional"):
+                        tag_version.parse_gradle_version(str(path))
+
+        path.write_text('val x = null ?: 1\nandroid {\nval y = null ?: 2\n'
+                        'defaultConfig {\n' + direct + '}\n}\n', encoding="utf-8")
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+        for location in ("android", "defaultConfig"):
+            for rhs in ('1', '"text"', '(2)'):
+                with self.subTest(location=location, rhs=rhs):
+                    prefix = f'val x = null ?: {rhs}\n@Suppress("unused")\nval y = 2\n'
+                    path.write_text(
+                        (prefix if location == "android" else "") + 'android {\n'
+                        + (prefix if location == "defaultConfig" else "")
+                        + 'defaultConfig {\n' + direct + '}\n}\n', encoding="utf-8",
+                    )
+                    self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+        for location in ("android", "defaultConfig"):
+            for opening, closing in (('(', ')'), ('(( ', '))'),
+                                     ('label@ ( `my label`@ (', '))')):
+                with self.subTest(location=location, opening=opening):
+                    prefix = f'val ignored = "set" ?: {opening}\n'
+                    path.write_text(
+                        (prefix if location == "android" else "") + 'android {\n'
+                        + (prefix if location == "defaultConfig" else "")
+                        + 'defaultConfig {\n' + direct + '}\n'
+                        + (closing + '\n' if location == "defaultConfig" else '')
+                        + '}\n' + (closing + '\n' if location == "android" else ''),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(tag_version.TagVersionError, "conditional"):
+                        tag_version.parse_gradle_version(str(path))
+
+        path.write_text('val x = null ?: (1)\nandroid {\nval y = null ?: (2)\n'
+                        'defaultConfig {\n' + direct + '}\n}\n', encoding="utf-8")
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+        for location in ("android", "defaultConfig"):
+            for literal in ('"text"', '"""raw\ntext"""', "'x'",
+                            '"?: label@"', '"""?: label@"""'):
+                with self.subTest(location=location, literal=literal):
+                    prefix = f'val ignored = null ?: {literal}\n'
+                    path.write_text(
+                        (prefix if location == "android" else "") + 'android {\n'
+                        + (prefix if location == "defaultConfig" else "")
+                        + 'defaultConfig {\n' + direct + '}\n}\n', encoding="utf-8",
+                    )
+                    self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+    def test_infix_before_identity_blocks(self) -> None:
+        path = self.tmp / "infix.gradle.kts"
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        for location in ("android", "defaultConfig"):
+            for prefix, accepted in (
+                ('val ignored = 1 to\n', False),
+                ('val ignored = value customInfix /* comment */\n', False),
+                ('val ignored = "text" `custom infix`\n', False),
+                ('val ignored = false && value!! customInfix\n', False),
+                ('val ignored = false && value!! `custom infix` /* comment */\n', False),
+                ('val ignored = false && (value)!! customInfix\n', False),
+                ('val ignored = false && value++ customInfix\n', False),
+                ('val ignored = false && value-- customInfix\n', False),
+                ('val ignored = 1 to 2\n', True),
+                ('val ignored = value customInfix other\n', True),
+                ('val ignored = value!!\n', True),
+                ('val ignored = value++\n', True),
+                ('val ignored = value--\n', True),
+                ('val ignored = value!! customInfix other\n', True),
+                ('val ignored = value customInfix other!!\n', True),
+            ):
+                with self.subTest(location=location, prefix=prefix):
+                    path.write_text(
+                        (prefix if location == "android" else "") + 'android {\n'
+                        + (prefix if location == "defaultConfig" else "")
+                        + 'defaultConfig {\n' + direct + '}\n}\n', encoding="utf-8",
+                    )
+                    if accepted:
+                        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+                    else:
+                        with self.assertRaisesRegex(tag_version.TagVersionError, "conditional"):
+                            tag_version.parse_gradle_version(str(path))
+
     def test_shadowing_version_declarations_rejected(self) -> None:
         path = self.tmp / "shadow.gradle.kts"
         for field, typ, value in (("versionCode", "Int", "0"), ("versionName", "String", '"old"')):
@@ -1885,6 +1993,47 @@ class ReleaseTagVersionTest(unittest.TestCase):
                 path.write_text(content, encoding="utf-8")
                 with self.assertRaises(tag_version.TagVersionError):
                     tag_version.parse_gradle_version(str(path))
+
+    def test_blocks_in_pending_expressions_are_rejected(self) -> None:
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        path = self.tmp / "pending-expression.gradle.kts"
+        wrappers = (
+            ('val x = listOf(\n', '\n)\n'),
+            ('val x = listOf(1,\n', '\n)\n'),
+            ('val x = values[\n', '\n]\n'),
+            ('val x = (listOf(\n', '\n))\n'),
+            ('val x =\n', '\n'),
+            ('val x = other +\n', '\n'),
+        )
+        for location in ('android', 'defaultConfig'):
+            for prefix, suffix in wrappers:
+                with self.subTest(location=location, prefix=prefix):
+                    default = 'defaultConfig {\n' + direct + '}\n'
+                    content = (prefix + 'android {\n' + default + '}\n' + suffix
+                               if location == 'android' else
+                               'android {\n' + prefix + default + suffix + '}\n')
+                    path.write_text(content, encoding='utf-8')
+                    with self.assertRaises(tag_version.TagVersionError):
+                        tag_version.parse_gradle_version(str(path))
+
+        completed = (
+            'val x = listOf(\n  1, 2\n)\n',
+            'val x = listOf("(", "]", "=")\n',
+            'val x = values[0]\n',
+            'counter++\n',
+            'value!!\n',
+            'val x = "unfinished ( [ =" // ( [ =\n',
+            'val `name[(` = 1\n',
+        )
+        for location in ('android', 'defaultConfig'):
+            for prefix in completed:
+                with self.subTest(location=location, prefix=prefix):
+                    default = 'defaultConfig {\n' + direct + '}\n'
+                    content = (prefix + 'android {\n' + default + '}\n'
+                               if location == 'android' else
+                               'android {\n' + prefix + default + '}\n')
+                    path.write_text(content, encoding='utf-8')
+                    self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, '1.2.3'))
 
     def test_flavor_override_is_outside_static_checker_scope(self) -> None:
         path = self.tmp / "flavor.gradle.kts"

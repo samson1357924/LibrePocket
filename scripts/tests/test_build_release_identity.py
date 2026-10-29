@@ -29,6 +29,12 @@ TAG_CHECKER = ROOT / "scripts" / "check_release_tag_version.py"
 APP_BUILD_GRADLE = ROOT / "app" / "build.gradle.kts"
 
 FLAVORS = ("play", "foss", "github")
+CONDITIONAL_BACKTICK_GRADLE = (
+    'if (false) {\n val `}` = 1\n android {\n defaultConfig {\n'
+    'versionCode = 7\nversionName = "1.2.3"\n}\n}\n val `{` = 2\n}\n',
+    'android {\n if (false) {\n val `}` = 1\n defaultConfig {\n'
+    'versionCode = 7\nversionName = "1.2.3"\n}\n val `{` = 2\n}\n}\n',
+)
 EXPECTED = {
     flavor: {
         "package": {
@@ -682,6 +688,15 @@ class ReleaseBuilderHarness(unittest.TestCase):
         result = self.run_builder(command, passwords=False)
 
         self._assert_preflight_rejected(result)
+
+    def test_backtick_braces_in_conditional_blocks_fail_before_secrets(self) -> None:
+        gradle = self.root / "app" / "build.gradle.kts"
+        for fixture in CONDITIONAL_BACKTICK_GRADLE:
+            with self.subTest(fixture=fixture):
+                gradle.write_text(fixture, encoding="utf-8")
+                command = self.command()
+                command.extend(("--tag", "v1.2.3"))
+                self._assert_preflight_rejected(self.run_builder(command, passwords=False))
 
     def test_mismatched_expected_package_vs_pins_fails_preflight(self) -> None:
         pins_file = self._create_pins_file()
@@ -1382,6 +1397,29 @@ class ReleaseTagVersionTest(unittest.TestCase):
             'versionName = "1.2.3"\n }\n}\n', encoding="utf-8",
         )
         self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+    def test_backtick_identifiers_do_not_change_structural_depth(self) -> None:
+        path = self.tmp / "backticks.gradle.kts"
+        for fixture in CONDITIONAL_BACKTICK_GRADLE:
+            with self.subTest(fixture=fixture):
+                path.write_text(fixture, encoding="utf-8")
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.parse_gradle_version(str(path))
+        # Braces, quotes and comment markers in identifiers must not start
+        # strings/comments or alter the matching of either DSL block.
+        path.write_text(
+            'val `}"` = 1\nandroid {\n val `{/*` = 2\n defaultConfig {\n'
+            'val `}//` = 3\nversionCode = 7\nversionName = "1.2.3"\n }\n}\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+    def test_unterminated_backtick_identifier_is_rejected(self) -> None:
+        path = self.tmp / "backtick-invalid.gradle.kts"
+        path.write_text('val `unterminated\nandroid {\n defaultConfig {\n'
+                        'versionCode = 7\nversionName = "1.2.3"\n}\n}\n', encoding="utf-8")
+        with self.assertRaises(tag_version.TagVersionError):
+            tag_version.parse_gradle_version(str(path))
 
     def test_chained_control_before_identity_blocks_rejected(self) -> None:
         path = self.tmp / "chained-control.gradle.kts"

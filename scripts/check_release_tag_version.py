@@ -44,6 +44,14 @@ class TagVersionError(Exception):
     """A fail-closed tag/version mismatch."""
 
 
+def _backtick_end(text: str, start: int) -> int:
+    """Return the end of a Kotlin escaped identifier, rejecting malformed input."""
+    end = text.find("`", start + 1)
+    if end == -1 or end == start + 1 or "\n" in text[start:end] or "\r" in text[start:end]:
+        raise TagVersionError("unterminated or empty backticked identifier")
+    return end + 1
+
+
 def _strip_kotlin_comments(text: str) -> str:
     """Replace Kotlin comments with spaces (newlines preserved).
 
@@ -58,7 +66,9 @@ def _strip_kotlin_comments(text: str) -> str:
     out = list(text)
     i, n = 0, len(text)
     while i < n:
-        if text.startswith('"""', i):
+        if text[i] == "`":
+            i = _backtick_end(text, i)
+        elif text.startswith('"""', i):
             end = text.find('"""', i + 3)
             if end == -1:
                 raise TagVersionError("unterminated raw string")
@@ -151,7 +161,10 @@ def _find_matching_brace(text: str, open_index: int) -> int:
     i = open_index
     n = len(text)
     while i < n:
-        if text.startswith('"""', i):
+        if text[i] == "`":
+            i = _backtick_end(text, i)
+            continue
+        elif text.startswith('"""', i):
             end = text.find('"""', i + 3)
             i = n if end == -1 else end + 3
             continue
@@ -209,7 +222,9 @@ def _string_intervals(text: str) -> list[tuple[int, int]]:
     intervals: list[tuple[int, int]] = []
     i, n = 0, len(text)
     while i < n:
-        if text.startswith('"""', i):
+        if text[i] == "`":
+            i = _backtick_end(text, i)
+        elif text.startswith('"""', i):
             end = text.find('"""', i + 3)
             if end == -1:
                 intervals.append((i, n))
@@ -267,12 +282,19 @@ def _inside_string(pos: int, intervals: list[tuple[int, int]]) -> bool:
 
 
 def _code_and_depths(text: str) -> tuple[str, list[int]]:
-    """Mask literals and record brace depth, rejecting unbalanced braces."""
+    """Mask literals and identifier contents; record structural brace depth."""
     code = list(text)
     for start, end in _string_intervals(text):
         for i in range(start, end):
             if code[i] != "\n":
                 code[i] = " "
+    # Preserve identity property names for the shadow/mutation checks. Other
+    # escaped identifiers are opaque but remain identifiers of equal length;
+    # in particular their braces and quotes are never Kotlin structure.
+    for match in re.finditer(r"`[^`\n]*`", "".join(code)):
+        if match.group() not in ("`versionCode`", "`versionName`"):
+            for i in range(match.start() + 1, match.end() - 1):
+                code[i] = "x"
     code_text = "".join(code)
     depths = []
     depth = 0

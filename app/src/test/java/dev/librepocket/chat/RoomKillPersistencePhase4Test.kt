@@ -30,11 +30,15 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -63,18 +67,20 @@ private class KillPolicy : PolicyStore {
 }
 
 /**
- * P1-4 Phase4: 真持久化kill (Room in-memory, 非合成).
+ * P1-4 Phase4: crash-like shutdown window (Room in-memory, not a process kill).
  *
  * 現況缺口: preCompensationDeathSeed為合成 (Fake上手工user+notice)、
  * reopen-twice皆Fake、TerminalAckCancelGap僅一條Room對照。
  *
  * Given: RoomSessionStore (in-memory Room) + 真TurnController跑半截
  *   (user已durable、assistant卡gate)。
- * When: close(drainTimeout=0)模擬kill (不drain、不補償) → 新Factory.open同sid。
+ * When: hold cancellation in the provider until close has sealed the writer,
+ * then release the host and reopen the same sid. This simulates the ordering,
+ * not process death or persistence across a database/process restart.
  * Then (三維 + N/A):
  *   DB: INTERRUPTED恰一、family關閉、第二open零新增;
- *   JSONL: export/import round-trip (isFinal/isPartial/parentRunId/attemptIndex);
- *   reopen: reload等價;
+ *   JSONL: export and decode (isFinal/isPartial/parentRunId/attemptIndex; no import);
+ *   reopen: backfill and second-open idempotence; repeated Room reads agree on runId/text/kind;
  *   UI hydrate與新session flushDurable未斷言 (由siblings覆蓋，本案僅pin kill backfill)。
  */
 @RunWith(RobolectricTestRunner::class)
@@ -115,7 +121,97 @@ class RoomKillPersistencePhase4Test {
     },
   )
 
-  @Test fun roomHalfTurnKill_reopenMarksExactlyOneInterrupted_secondOpenZero() = runBlocking {
+  private suspend fun cleanupController(c: TurnController, host: Job?, failure: Throwable?) {
+    try {
+      withContext(NonCancellable) {
+        c.close(drainTimeoutMs = 0L)
+        withTimeout(8_000) { host?.join() }
+        check(c.flushTranscript(8_000L)) { "controller shutdown did not drain" }
+      }
+    } catch (cleanup: Throwable) {
+      if (failure == null) throw cleanup
+      failure.addSuppressed(cleanup)
+    }
+  }
+
+  private suspend fun <T> withReopenedSession(session: ChatSession, block: suspend () -> T): T {
+    var failure: Throwable? = null
+    try {
+      return block()
+    } catch (t: Throwable) {
+      failure = t
+      throw t
+    } finally {
+      try {
+        withContext(NonCancellable) {
+          session.close()
+          check(session.flushDurable(8_000)) { "reopened session shutdown did not drain" }
+          withTimeout(8_000) {
+            while (!session.isTranscriptWriterCompleted()) delay(15)
+          }
+        }
+      } catch (cleanup: Throwable) {
+        if (failure == null) throw cleanup
+        failure.addSuppressed(cleanup)
+      }
+    }
+  }
+
+  @Test fun roomNormalCancellation_persistsTerminalWithoutBackfill() = runBlocking {
+    val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+    val opened = LibrePocketDb.openInMemory(context)
+    db = opened
+    val store = RoomSessionStore(opened) { 1_700_000_000_000L }
+    val sid = store.createSession("hi", "preset:openai@https://api.openai.com/gpt-4o-mini")
+    val entered = CompletableDeferred<Unit>()
+    val gate = CompletableDeferred<Unit>()
+    val provider = KillProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "half"))
+        entered.complete(Unit)
+        gate.await()
+      }
+    }
+    val n = AtomicInteger(0)
+    val c = TurnController(
+      provider = provider,
+      policy = KillPolicy(),
+      transcript = SessionTranscriptSink(store, sid),
+      retryConfig = TurnRetryConfig(),
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "control-${n.getAndIncrement()}" },
+    )
+    var host: Job? = null
+    var failure: Throwable? = null
+    try {
+      val admission = c.startOrEnqueue("hi")
+      assertTrue(admission is TurnStart.Started)
+      host = (admission as TurnStart.Started).host
+      withTimeout(8_000) { entered.await() }
+      val before = store.loadEvents(sid, 0, 2000)
+      val userRunId = before.single { it.kind == "user" }.runId
+      assertEquals(listOf(userRunId), findDanglingRunIds(before))
+      c.cancel()
+      withTimeout(8_000) { host.join() }
+      assertTrue("normal cancellation must drain", c.flushTranscript(8_000L))
+      val after = store.loadEvents(sid, 0, 2000)
+      assertEquals(1, after.count { it.kind == "assistant" && it.isFinal })
+      assertTrue("normal cancellation must close the family: $after", findDanglingRunIds(after).isEmpty())
+      val reopened = factory(store).open(endpoint(), sid)
+      withReopenedSession(reopened.session) {
+        assertEquals("reopen must not backfill a compensated turn", after, store.loadEvents(sid, 0, 2000))
+      }
+    } catch (t: Throwable) {
+      failure = t
+      throw t
+    } finally {
+      gate.complete(Unit)
+      cleanupController(c, host, failure)
+    }
+  }
+
+  @Test fun roomSealedShutdown_reopenMarksExactlyOneInterrupted_secondOpenZero() = runBlocking {
     // Given: 真Room + 真TurnController半截 (user durable、assistant卡gate)。
     val context = ApplicationProvider.getApplicationContext<android.content.Context>()
     val opened = LibrePocketDb.openInMemory(context)
@@ -124,13 +220,22 @@ class RoomKillPersistencePhase4Test {
     val sid = store.createSession("hi", "preset:openai@https://api.openai.com/gpt-4o-mini")
     val assistantGate = CompletableDeferred<Unit>()
     val assistantEntered = CountDownLatch(1)
+    val cancellationEntered = CompletableDeferred<Unit>()
+    val releaseCancellation = CompletableDeferred<Unit>()
     // Gate the assistant terminal by parking the provider stream (not the
     // store): user row lands durable, terminal never lands.
     val provider = KillProvider {
       flow {
         emit(StreamEvent.TextDelta(0, 0, "half"))
         assistantEntered.countDown()
-        assistantGate.await()
+        try {
+          assistantGate.await()
+        } finally {
+          withContext(NonCancellable) {
+            cancellationEntered.complete(Unit)
+            releaseCancellation.await()
+          }
+        }
         emit(StreamEvent.Done("stop"))
       }
     }
@@ -144,12 +249,13 @@ class RoomKillPersistencePhase4Test {
       sleeper = {},
       newId = { "kill-${n.incrementAndGet() - 1}" },
       cancelSettleTimeoutMs = 300L,
-      cancelCompensationTimeoutMs = 0L,
     )
+    var host: Job? = null
+    var failure: Throwable? = null
     try {
       val admission = c.startOrEnqueue("hi")
       assertTrue("admission must start, was $admission", admission is TurnStart.Started)
-      val host = (admission as TurnStart.Started).host
+      host = (admission as TurnStart.Started).host
       assertTrue("assistant stream never entered", assistantEntered.await(5, TimeUnit.SECONDS))
       // User row must already be durable in Room before the kill.
       withTimeout(8_000) {
@@ -158,15 +264,31 @@ class RoomKillPersistencePhase4Test {
         }
       }
       assertTrue(store.loadEvents(sid, 0, 10).none { it.kind == "assistant" })
-      // When: kill — close with zero drain (no compensation, no backfill yet).
+      // The provider's non-cancellable cleanup holds the host before its
+      // cancellation handler can attempt compensation. Zero drain seals the
+      // writer without waiting for that host, not a literal process kill.
       c.close(drainTimeoutMs = 0L)
-      host.cancel()
-      assistantGate.complete(Unit)
-      host.join()
-      c.flushTranscript(2_000L)
+      withTimeout(8_000) { cancellationEntered.await() }
+      assertTrue("shutdown must finish and seal the writer", c.flushTranscript(8_000L))
+      assertTrue(c.isTranscriptSealed())
+      val beforeRelease = store.loadEvents(sid, 0, 2000)
+      val userRunId = beforeRelease.single { it.kind == "user" }.runId
+      assertEquals(listOf(userRunId), findDanglingRunIds(beforeRelease))
+      assertTrue("no terminal before host release: $beforeRelease", beforeRelease.none { it.kind == "assistant" || it.kind == "system" })
+      releaseCancellation.complete(Unit)
+      withTimeout(8_000) { host.join() }
+      assertTrue("sealed transcript should drain", c.flushTranscript(8_000L))
+      // No seam observes whether the host attempted compensation after sealing.
+      val afterRelease = store.loadEvents(sid, 0, 2000)
+      assertEquals("host release must not change Room after sealed shutdown", beforeRelease, afterRelease)
+      assertEquals(listOf(userRunId), findDanglingRunIds(afterRelease))
+    } catch (t: Throwable) {
+      failure = t
+      throw t
     } finally {
-      runCatching { assistantGate.complete(Unit) }
-      runCatching { c.close() }
+      releaseCancellation.complete(Unit)
+      assistantGate.complete(Unit)
+      cleanupController(c, host, failure)
     }
 
     // When: 新Factory.open同sid (真backfill)。
@@ -174,14 +296,14 @@ class RoomKillPersistencePhase4Test {
     val ep = endpoint()
     val sizeBefore = store.loadEvents(sid, 0, 2000).size
     val first = f.open(ep, sid)
-    try {
+    withReopenedSession(first.session) {
       // Then DB: INTERRUPTED恰一 + family關閉。
       val afterFirst = store.loadEvents(sid, 0, 2000)
       assertEquals(sizeBefore + 1, afterFirst.size)
       val marks = afterFirst.filter { it.kind == "system" && it.text.endsWith("interrupted") }
       assertEquals("kill must backfill exactly one INTERRUPTED, was $afterFirst", 1, marks.size)
       assertTrue(findDanglingRunIds(afterFirst).isEmpty())
-      // JSONL round-trip (export → import preserves flags/linkage)。
+      // Exported JSONL decodes with flags/linkage intact; no import is exercised.
       val dir = Files.createTempDirectory("p14-jsonl").toFile()
       tmpDir = dir
       val dest = File(dir, "kill.jsonl")
@@ -200,23 +322,19 @@ class RoomKillPersistencePhase4Test {
         assertEquals(src.parentRunId, back.parentRunId)
         assertEquals(src.attemptIndex, back.attemptIndex)
       }
-      // Reopen reload等價 (DB reload equals)。
+      // A second Room read agrees on runId/text/kind; session hydration is not asserted.
       val reloaded = store.loadEvents(sid, 0, 2000)
       assertEquals(
         afterFirst.map { it.runId to it.text to it.kind },
         reloaded.map { it.runId to it.text to it.kind },
       )
-    } finally {
-      first.session.close()
     }
     // 第二open零新增。
     val sizeAfterFirst = store.loadEvents(sid, 0, 2000).size
     val second = f.open(ep, sid)
-    try {
+    withReopenedSession(second.session) {
       assertEquals(sizeAfterFirst, store.loadEvents(sid, 0, 2000).size)
       assertTrue(findDanglingRunIds(store.loadEvents(sid, 0, 2000)).isEmpty())
-    } finally {
-      second.session.close()
     }
   }
 }

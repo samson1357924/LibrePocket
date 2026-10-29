@@ -289,6 +289,23 @@ def _code_and_depths(text: str) -> tuple[str, list[int]]:
     return code_text, depths
 
 
+def _grouping_depths(code: str) -> list[int]:
+    """Record parenthesis/bracket depth outside literals and identifiers."""
+    code = re.sub(r"`[^`\n]*`", lambda m: " " * len(m.group()), code)
+    stack: list[str] = []
+    depths = []
+    for char in code:
+        depths.append(len(stack))
+        if char in "([":
+            stack.append(char)
+        elif char in ")]":
+            if not stack or stack.pop() != {')': '(', ']': '['}[char]:
+                raise TagVersionError("unbalanced Gradle parentheses or brackets")
+    if stack:
+        raise TagVersionError("unbalanced Gradle parentheses or brackets")
+    return depths
+
+
 def _has_pending_control(prefix: str, original: str) -> bool:
     """Detect a possibly unbraced control statement before a declaration.
 
@@ -489,6 +506,7 @@ def parse_gradle_version(gradle_path: str) -> tuple[int, str]:
             else:
                 i += 1
     code_text, depths = _code_and_depths(search_text)
+    grouping_depths = _grouping_depths(code_text)
     _reject_version_declarations(code_text)
     # Unbraced control flow can also make a line-start declaration conditional.
     keyword_code = re.sub(r"`[^`\n]*`", lambda m: " " * len(m.group()), code_text)
@@ -522,11 +540,11 @@ def parse_gradle_version(gradle_path: str) -> tuple[int, str]:
         )
     code_matches = [
         m for m in re.finditer(r"(?m)^[ \t]*versionCode[ \t]*=[ \t]*([0-9]+)[ \t]*$", search_text)
-        if m.start() == search_text.rfind("\n", 0, generic_code_matches[0].start()) + 1 and depths[generic_code_matches[0].start()] == 0
+        if m.start() == search_text.rfind("\n", 0, generic_code_matches[0].start()) + 1 and depths[generic_code_matches[0].start()] == 0 and grouping_depths[generic_code_matches[0].start()] == 0
     ]
     name_matches = [
         m for m in re.finditer(r'(?m)^[ \t]*versionName[ \t]*=[ \t]*"([^"]+)"[ \t]*$', search_text)
-        if m.start() == search_text.rfind("\n", 0, generic_name_matches[0].start()) + 1 and depths[generic_name_matches[0].start()] == 0
+        if m.start() == search_text.rfind("\n", 0, generic_name_matches[0].start()) + 1 and depths[generic_name_matches[0].start()] == 0 and grouping_depths[generic_name_matches[0].start()] == 0
     ]
     codes = [m.group(1) for m in code_matches]
     names = [m.group(1) for m in name_matches]

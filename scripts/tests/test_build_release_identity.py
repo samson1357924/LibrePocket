@@ -1712,6 +1712,29 @@ class ReleaseTagVersionTest(unittest.TestCase):
         with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionCode"):
             tag_version.parse_gradle_version(str(duplicated))
 
+    def test_version_assignments_must_be_outside_grouping(self) -> None:
+        path = self.tmp / "grouping.gradle.kts"
+        assignments = {"versionCode": "versionCode = 7", "versionName": 'versionName = "1.2.3"'}
+        for field, assignment in assignments.items():
+            other = assignments["versionName" if field == "versionCode" else "versionCode"]
+            for opening, closing in (("fake(", ")"), ("items[", "]"), ("fake([", "])")):
+                with self.subTest(field=field, opening=opening):
+                    path.write_text(
+                        f"android {{\n defaultConfig {{\n{opening}\n{assignment}\n{closing}\n{other}\n}}\n}}\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(tag_version.TagVersionError, f"exactly one {field}"):
+                        tag_version.parse_gradle_version(str(path))
+
+        path.write_text(
+            'android {\n defaultConfig {\n'
+            'val x = fake(items[0], "([") // ] )\n'
+            'val `identifier([` = 1\n'
+            'versionCode = 7\nversionName = "1.2.3"\n'
+            'val y = fake(items[0])\n}\n}\n', encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
     def test_duplicate_version_name_missing_fields_and_single_quote(self) -> None:
         dup_name = self.tmp / "dup-name.gradle.kts"
         dup_name.write_text(

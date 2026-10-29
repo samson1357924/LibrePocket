@@ -1,15 +1,34 @@
 # Build Environment — LibrePocket
 
-**Status:** Current checked-in build baseline, checked 2026-10-24 against `d5a98bd35e919083b0475027c9b2e74b703e4e58` (committed 2026-10-13).
+**Status:** Current checked-in build baseline, checked 2026-10-29 against `4cf8216b` (committed 2026-10-24).
 
 - **Scope:** Local build prerequisites and checked-in Android toolchain values.
 - **Owner role:** Build/CI maintainer; no individual assigned.
-- **Source of truth:** `gradle/libs.versions.toml`, `gradle/wrapper/gradle-wrapper.properties`, `app/build.gradle.kts`, and `.github/workflows/pr-check.yml`.
-- **Update trigger:** Any SDK, AGP, Kotlin, Gradle, JDK, flavor, or CI image change.
+- **Source of truth:** `gradle/libs.versions.toml`, `gradle/wrapper/gradle-wrapper.properties`, `app/build.gradle.kts`, `github_bot/.nvmrc`, `github_bot/package.json`, `scripts/verify_jdk_floor.sh`, and `.github/workflows/pr-check.yml`.
+- **Update trigger:** Any SDK, AGP, Kotlin, Gradle, JDK, Node.js, flavor, or CI image change.
 
 ## JDK and Gradle
 
-CI uses JDK 25, requesting the latest patch via `check-latest: true` and enforcing a minimum security floor of Temurin 25.0.5+8 via `scripts/verify_jdk_floor.sh` for CVE-2026-91403 (eMudhra intermediate CA compromise mitigation; see Oracle CVE-2026-91403 advisory: https://www.oracle.com/security-alerts/alert-cve-2026-91403.html). Use JDK 25 (>= 25.0.5+8) for closest CI parity; older local JDKs (such as 21) may still build locally, but they are not the CI baseline. The repository pins the Gradle wrapper; a system Gradle installation is not needed, and `gradle/wrapper/gradle-wrapper.properties` enforces `distributionSha256Sum` verification to protect against distribution tampering.
+CI uses JDK 25, requesting the latest patch via `check-latest: true` and enforcing
+a minimum security floor of Temurin 25.0.5+8 via
+`scripts/verify_jdk_floor.sh --require-vendor Temurin` for two October 2026
+security advisories:
+
+- CVE-2026-91403 (eMudhra intermediate CA compromise mitigation; see the Oracle
+  CVE-2026-91403 advisory:
+  https://www.oracle.com/security-alerts/alert-cve-2026-91403.html).
+- CVE-2026-114820 (Oracle eMudhra root-CA advisory:
+  https://www.oracle.com/security-alerts/alert-cve-2026-114820.html). Adoptium
+  issue #317 updates certdata to NSS 3.131.1, removing the compromised eMudhra
+  roots.
+
+The script's `jdk.security.caDistrustPolicies` inspection is informational only;
+the primary gate is the verified Temurin build floor, not the presence of a
+distrust entry. Use JDK 25 (>= 25.0.5+8) for closest CI parity; older local JDKs
+(such as 21) may still build locally, but they are not the CI baseline. The
+repository pins the Gradle wrapper; a system Gradle installation is not needed,
+and `gradle/wrapper/gradle-wrapper.properties` enforces `distributionSha256Sum`
+verification to protect against distribution tampering.
 
 ```sh
 java -version
@@ -40,10 +59,15 @@ Install the matching Android platforms and build tools required by the wrapper/b
 
 ## Node.js (PocketGuard Bot)
 
-Requires Node.js `>= 24.22.1` (enforcing the October 2026 security release; see Node.js security release: https://nodejs.org/en/blog/release/v24.22.1/). `github_bot/.nvmrc` is the single source of truth for Node.js 24.22.1 across workflows (via `node-version-file: 'github_bot/.nvmrc'`) and local development, and npm enforces `engine-strict=true`.
+Requires Node.js `^24.22.1` (or `>= 26.12.1` if running Node 26) to enforce the
+October 2026 security release (see Node.js security release:
+https://nodejs.org/en/blog/release/v24.22.1/). `github_bot/.nvmrc` pins 24.22.1
+as the baseline for CI workflows (via `node-version-file: 'github_bot/.nvmrc'`)
+and local development. `github_bot/.npmrc` sets `engine-strict=true` to reject
+installs on incompatible Node engines.
 
 ```sh
-cd github_bot && nvm use && node -v
+cd github_bot && nvm install && nvm use && node -v
 ```
 
 ## Flavors and IDs

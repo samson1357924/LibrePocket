@@ -7,6 +7,7 @@ import java.net.ConnectException
 import java.net.NoRouteToHostException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.util.Locale
 import javax.net.ssl.SSLException
 
 /** Retryable vs fatal, per SPEC §5.2. */
@@ -158,6 +159,8 @@ object ProviderErrorClassifier {
         if (retryableBodyMarkers.any { body.contains(it) }) return FailureKind.RETRYABLE
         var cur: Throwable? = error
         while (cur != null) {
+            val msg = cur.message?.lowercase(Locale.ROOT)
+            if (msg != null && fatalBodyMarkers.any { msg.contains(it) }) return FailureKind.FATAL
             when (cur) {
                 is SSLException,
                 is java.security.cert.CertificateException,
@@ -173,13 +176,13 @@ object ProviderErrorClassifier {
                 is InterruptedIOException,
                 -> return FailureKind.RETRYABLE
                 is IOException -> {
-                    val msg = cur.message?.lowercase().orEmpty()
-                    if (msg.contains("unexpected end of stream") ||
+                    if (msg != null && (
+                        msg.contains("unexpected end of stream") ||
                         msg.contains("eof") ||
                         msg.contains("connection reset") ||
                         msg.contains("broken pipe") ||
                         msg.contains("stream was reset")
-                    ) {
+                    )) {
                         return FailureKind.RETRYABLE
                     }
                 }

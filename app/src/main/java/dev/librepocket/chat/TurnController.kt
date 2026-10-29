@@ -4897,7 +4897,12 @@ class TurnController(
       } catch (e: CancellationException) {
         throw e
       } catch (e: Exception) {
-        failed = StreamEvent.Failed(e.message ?: "provider error", retryable = true)
+        val aggCode = inferAggFailureCodeName(e.message)
+        failed = StreamEvent.Failed(
+          message = e.message ?: "provider error",
+          retryable = aggCode == null,
+          code = aggCode,
+        )
         if (!shouldDiscardPendingTools(failed)) {
           try {
             flushPendingTools(toolState, attemptRunId)

@@ -71,11 +71,13 @@ internal class ProviderFailure(
 /**
  * Infer the typed failure-code name from a provider-failure message when
  * [ProviderFailure.code] is absent (legacy throws or message-only paths).
- * Matches the aggregation/SSE overflow markers case-insensitively, consistent
- * with [ProviderErrorClassifier]'s fatal markers; returns
- * `AGG_TOO_LARGE`'s name on a hit, null otherwise. Never infers `TOO_LARGE`
- * (finite model-list budget) here: streaming callers only need the
- * aggregation/SSE code for [StreamEvent.Failed.code] propagation.
+ * Matches aggregation, wire cap, and whole-attempt deadline markers
+ * case-insensitively, consistent with [ProviderErrorClassifier]'s fatal markers;
+ * infers non-retryable fatal aggregation and whole-attempt deadline failure
+ * codes (`AGG_TOO_LARGE` or `DEADLINE_EXCEEDED`), or null otherwise. Never
+ * infers `TOO_LARGE` (finite model-list budget) here: streaming callers only
+ * need the aggregation/SSE/deadline code for [StreamEvent.Failed.code]
+ * propagation.
  */
 internal fun inferAggFailureCodeName(message: String?): String? {
     val lower = message?.lowercase(java.util.Locale.ROOT).orEmpty()

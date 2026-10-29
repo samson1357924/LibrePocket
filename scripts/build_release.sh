@@ -127,7 +127,7 @@ while [ "$#" -gt 0 ]; do
         play|foss|github)
             case " $FLAVORS " in
                 *" $1 "*) ;;
-                *) FLAVORS="$FLAVORS $1" ;;
+                *) FLAVORS="${FLAVORS:+$FLAVORS }$1" ;;
             esac
             shift ;;
         -h|--help)
@@ -140,6 +140,7 @@ done
 if [ -z "$FLAVORS" ]; then
     FLAVORS="play foss github"
 fi
+# Intentional whitespace normalization across FLAVORS tokens.
 set -- $FLAVORS
 FLAVORS="$*"
 
@@ -150,6 +151,8 @@ FLAVORS="$*"
 [ -n "$AAPT" ] || die "--aapt is required"
 [ -n "$OUTPUT_PARENT" ] || die "--output-parent is required"
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1 \
+    || die "python3 >= 3.11 is required for safe isolated execution (-P)"
 command -v mktemp >/dev/null 2>&1 || die "mktemp is required"
 command -v env >/dev/null 2>&1 || die "env is required"
 [ ! -L "$APKSIGNER" ] && [ -f "$APKSIGNER" ] && [ -x "$APKSIGNER" ] || die "apksigner is unavailable or not executable: $APKSIGNER"
@@ -219,35 +222,55 @@ if [ "$TAG_SEEN" -eq 1 ]; then
         --app-build-gradle "$ROOT/app/build.gradle.kts") \
         || die "release tag/version check failed"
     TAG_VARS=$(python3 -P - "$TAG_RESULT" <<'PY'
-import json, sys
-data = json.loads(sys.argv[1])
-print(f"{data['versionName']} {data['versionCode']}")
+import json
+import sys
+
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    raise SystemExit("failed to parse tag check output as JSON")
+
+if not isinstance(data, dict):
+    raise SystemExit("tag check output must be a JSON object")
+
+name = "" if data.get("versionName") is None else str(data.get("versionName")).strip()
+code = "" if data.get("versionCode") is None else str(data.get("versionCode")).strip()
+
+if not name or not code or " " in name or " " in code:
+    raise SystemExit("tag check output must contain non-empty whitespace-free versionName and versionCode")
+
+print(f"{name} {code}")
 PY
     ) || die "failed to parse tag check output"
     TAG_VERSION_NAME=${TAG_VARS%% *}
     TAG_VERSION_CODE=${TAG_VARS#* }
     for f in $FLAVORS; do
+        f_code=""
+        f_name=""
         case "$f" in
             play) f_code="$VERSION_CODE_PLAY"; f_name="$VERSION_NAME_PLAY" ;;
             foss) f_code="$VERSION_CODE_FOSS"; f_name="$VERSION_NAME_FOSS" ;;
             github) f_code="$VERSION_CODE_GITHUB"; f_name="$VERSION_NAME_GITHUB" ;;
+            *) die "unknown flavor in tag preflight: $f" ;;
         esac
-        [ "$f_name" = "$TAG_VERSION_NAME" ] \
+        [ -n "$f_name" ] && [ "$f_name" = "$TAG_VERSION_NAME" ] \
             || die "expected versionName for $f ($f_name) does not match tag versionName ($TAG_VERSION_NAME)"
-        [ "$f_code" = "$TAG_VERSION_CODE" ] \
+        [ -n "$f_code" ] && [ "$f_code" = "$TAG_VERSION_CODE" ] \
             || die "expected versionCode for $f ($f_code) does not match Gradle versionCode ($TAG_VERSION_CODE)"
     done
 fi
 
 if [ "$PINS_SEEN" -eq 1 ]; then
     [ -n "$PINS_FILE" ] || die "--pins requires a non-empty file path"
+    PINS_DIR=$(CDPATH= cd -- "$(dirname -- "$PINS_FILE")" 2>/dev/null && pwd -P) \
+        || die "cannot resolve directory for pins file: $PINS_FILE"
+    PINS_FILE="$PINS_DIR/$(basename -- "$PINS_FILE")"
     [ ! -L "$PINS_FILE" ] || die "pins file must not be a symlink: $PINS_FILE"
     [ -f "$PINS_FILE" ] || die "pins file must be an existing regular file: $PINS_FILE"
     [ -r "$PINS_FILE" ] || die "pins file is not readable: $PINS_FILE"
     [ -r "$SCRIPT_DIR/check_release_pins.py" ] || die "release pins checker is missing"
     PINS_RESULT=$(python3 -P "$SCRIPT_DIR/check_release_pins.py" \
-        --pins "$PINS_FILE" \
-        --require-flavors "$FLAVORS") \
+        --pins "$PINS_FILE") \
         || die "release pins check failed"
     python3 -P - "$PINS_RESULT" "$FLAVORS" \
         "$PACKAGE_PLAY" "$CERT_PLAY" \
@@ -256,18 +279,37 @@ if [ "$PINS_SEEN" -eq 1 ]; then
 import json
 import sys
 
+if len(sys.argv) != 9:
+    raise SystemExit("invalid arguments for pins comparison")
+
 pins_json, flavors_str, pkg_play, cert_play, pkg_foss, cert_foss, pkg_github, cert_github = sys.argv[1:9]
-pins_data = json.loads(pins_json)["flavors"]
+
+try:
+    parsed = json.loads(pins_json)
+except Exception:
+    raise SystemExit("invalid JSON from pins checker")
+
+if not isinstance(parsed, dict):
+    raise SystemExit("pins checker output is not a JSON object")
+
+pins_data = parsed.get("flavors")
+if not isinstance(pins_data, dict):
+    raise SystemExit("pins data is not a dict")
+
 expected = {
     "play": (pkg_play, cert_play),
     "foss": (pkg_foss, cert_foss),
     "github": (pkg_github, cert_github),
 }
 for f in flavors_str.split():
+    if f not in expected:
+        raise SystemExit(f"unknown flavor in release pins verification: {f}")
     if f not in pins_data:
         raise SystemExit(f"missing pin entry for flavor: {f}")
     exp_pkg, exp_cert = expected[f]
     pin_entry = pins_data[f]
+    if not isinstance(pin_entry, dict) or "package" not in pin_entry or "cert_sha256" not in pin_entry:
+        raise SystemExit(f"invalid pin entry for flavor: {f}")
     if exp_pkg != pin_entry["package"]:
         raise SystemExit(
             f"expected package for {f} ({exp_pkg}) does not match pinned package ({pin_entry['package']})"

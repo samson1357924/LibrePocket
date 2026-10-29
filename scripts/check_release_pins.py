@@ -36,9 +36,11 @@ input (local maintainer file), not an adversarial path.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -65,28 +67,62 @@ def load_pins(path_value: str, *, require_flavors: tuple[str, ...] | None = None
     if not isinstance(path_value, (str, os.PathLike)):
         raise PinError("pins file path must be a string")
     path = Path(path_value)
+    if path.is_symlink():
+        raise PinError(f"pins file must not be a symlink: {path}")
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
-        size = path.stat().st_size
+        fd = os.open(path, flags)
     except OSError as exc:
-        raise PinError(f"cannot stat pins file: {exc}") from exc
-    if size <= 0:
-        raise PinError("pins file is empty")
-    if size > MAX_PINS_BYTES:
-        raise PinError(f"pins file size exceeds {MAX_PINS_BYTES} bytes")
+        if getattr(exc, "errno", None) in (getattr(errno, "ELOOP", None), getattr(errno, "EMLINK", None)):
+            raise PinError(f"pins file must not be a symlink: {path}") from exc
+        raise PinError(f"cannot open pins file: {exc}") from exc
+
     try:
-        raw = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
-        raise PinError(f"cannot read pins file as UTF-8: {exc}") from exc
-    # Re-check the decoded length: the stat size is advisory (the file may
-    # grow or be replaced between stat and read, e.g. symlink/fd reuse), so
-    # the in-memory snapshot is the binding measurement.
-    if len(raw.encode("utf-8")) > MAX_PINS_BYTES:
+        try:
+            st = os.fstat(fd)
+        except OSError as exc:
+            raise PinError(f"cannot stat pins file: {exc}") from exc
+
+        if not stat.S_ISREG(st.st_mode):
+            raise PinError(f"pins file must be a regular file: {path}")
+        if st.st_size <= 0:
+            raise PinError("pins file is empty")
+        if st.st_size > MAX_PINS_BYTES:
+            raise PinError(f"pins file size exceeds {MAX_PINS_BYTES} bytes")
+
+        raw_chunks = []
+        total = 0
+        limit = MAX_PINS_BYTES + 1
+        try:
+            while total < limit:
+                chunk = os.read(fd, limit - total)
+                if not chunk:
+                    break
+                raw_chunks.append(chunk)
+                total += len(chunk)
+        except OSError as exc:
+            raise PinError(f"cannot read pins file: {exc}") from exc
+        raw_bytes = b"".join(raw_chunks)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    if len(raw_bytes) == 0:
+        raise PinError("pins file is empty")
+    if len(raw_bytes) > MAX_PINS_BYTES:
         raise PinError(f"pins file size exceeds {MAX_PINS_BYTES} bytes")
+
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except (UnicodeError, ValueError) as exc:
+        raise PinError(f"cannot read pins file as UTF-8: {exc}") from exc
+
     try:
         data = json.loads(raw, object_pairs_hook=_no_duplicate_object)
-    except json.JSONDecodeError as exc:
-        raise PinError(f"pins file is not valid JSON: {exc}") from exc
-    except ValueError as exc:
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
         raise PinError(f"pins file is not valid JSON: {exc}") from exc
     if not isinstance(data, dict) or not data:
         raise PinError("pins file must be a non-empty JSON object keyed by flavor")

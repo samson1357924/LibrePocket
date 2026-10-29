@@ -773,6 +773,38 @@ class ReleaseBuilderHarness(unittest.TestCase):
         result = self.run_builder(command, passwords=False)
         self._assert_preflight_rejected(result)
 
+    def test_single_flavor_build_with_all_flavors_in_pins_file_succeeds(self) -> None:
+        pins_file = self._create_pins_file(flavors=FLAVORS)
+        command = self.command(("github",))
+        command.extend(("--pins", str(pins_file)))
+
+        result = self.run_builder(command)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        response = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(response["status"], "ready")
+        self.assertEqual(set(response["flavors"]), {"github"})
+
+    def test_python_version_below_floor_fails_preflight(self) -> None:
+        fake_py = self.fake_bin / "python3"
+        orig_content = fake_py.read_text(encoding="utf-8")
+        fake_py.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${1:-}\" = \"-c\" ] && printf '%s' \"${2:-}\" | grep -q 'sys.version_info >= (3, 11)'; then\n"
+            "    exit 1\n"
+            "fi\n"
+            f"exec '{sys.executable}' \"$@\"\n",
+            encoding="utf-8",
+        )
+        fake_py.chmod(0o755)
+        try:
+            result = self.run_builder(passwords=False)
+            self._assert_preflight_rejected(result)
+            self.assertIn("python3 >= 3.11 is required", result.stdout)
+        finally:
+            fake_py.write_text(orig_content, encoding="utf-8")
+            fake_py.chmod(0o755)
+
 
 class PolicyTimeoutBudgetTest(unittest.TestCase):
     """The per-flavor policy timeout budget is part of the release lane's named fail-closed contract, not a silent knob."""
@@ -985,6 +1017,29 @@ class SignerPinRegistryTest(unittest.TestCase):
         broken.write_text("{not json", encoding="utf-8")
         with self.assertRaises(signer_pins.PinError):
             signer_pins.load_pins(str(broken))
+
+    def test_symlink_pins_file_rejected_by_loader(self) -> None:
+        path = self._write(
+            "pins.json",
+            {"play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16}},
+        )
+        symlink_path = self.tmp / "pins-symlink.json"
+        symlink_path.symlink_to(path)
+        with self.assertRaisesRegex(signer_pins.PinError, "must not be a symlink"):
+            signer_pins.load_pins(str(symlink_path))
+
+    def test_directory_pins_file_rejected_by_loader(self) -> None:
+        sub_dir = self.tmp / "a_directory"
+        sub_dir.mkdir()
+        with self.assertRaisesRegex(signer_pins.PinError, "must be a regular file"):
+            signer_pins.load_pins(str(sub_dir))
+
+    def test_recursion_error_in_json_rejected_by_loader(self) -> None:
+        import unittest.mock as mock
+        path = self._write("pins.json", {"play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16}})
+        with mock.patch("json.loads", side_effect=RecursionError("maximum recursion depth exceeded")):
+            with self.assertRaisesRegex(signer_pins.PinError, "not valid JSON"):
+                signer_pins.load_pins(str(path))
 
 
 class ReleaseTagVersionTest(unittest.TestCase):

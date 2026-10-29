@@ -24,12 +24,12 @@ WORKFLOWS = {
 # Review every workflow change, including new files and indirect invocations.
 # This is a change-detection convention, not a shell/action call-graph analysis.
 WORKFLOW_SNAPSHOTS = {
-    "codeql.yml": "577d533577144ac77f9a249893859485e6d733bec18ebd0bab15ef5fe42cee9e",
-    "nightly-instrumented.yml": "ca9c43a47b238b63a5ddf18e75e9f1436dcf9c00b0a4345e9cab0ba36db7360b",
-    "pocketguard.yml": "9e6d291fe012a4932126c5dba96d0a27e1c68299bbbb1847ea8ab4d69db87df6",
-    "pr-check.yml": "6f7cf483d18396193071b63c0eeec6eeaa8d5e52b3da15b746dae587f613fa77",
+    "codeql.yml": "c22dfb2bc946d510c809dbac5ac25b13ac44b896779d736600989be067d5fdb7",
+    "nightly-instrumented.yml": "706297db88b46bd359c52a070207f9eb26532261f393d574e4ba0b3519254137",
+    "pocketguard.yml": "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564",
+    "pr-check.yml": "037d5784e7ecafe1eb181cf54c91c175e9b205e9df50da523896be734fcefc5d",
     "release.yml": "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f",
-    "security-audit.yml": "02c03c353ebaabef272efcb162faa1cf214d23eec07e3d51f71a0ea75b0e5b3c",
+    "security-audit.yml": "0b4b9b833a50b61b456e4d4c2064fba5f9c6836867157c4f22b1c5887ee4f176",
 }
 
 

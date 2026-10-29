@@ -88,21 +88,21 @@ ALLOWED_WORKFLOW_FILES = frozenset(
 # same reviewed PR as any intentional workflow edit; never in a separate
 # "make CI green" change. This pin is a regression guard, not tamper-proof.
 EXPECTED_WORKFLOW_SHA256 = {
-    "codeql.yml": "577d533577144ac77f9a249893859485e6d733bec18ebd0bab15ef5fe42cee9e",
+    "codeql.yml": "c22dfb2bc946d510c809dbac5ac25b13ac44b896779d736600989be067d5fdb7",
     "nightly-instrumented.yml": (
-        "ca9c43a47b238b63a5ddf18e75e9f1436dcf9c00b0a4345e9cab0ba36db7360b"
+        "706297db88b46bd359c52a070207f9eb26532261f393d574e4ba0b3519254137"
     ),
     "pocketguard.yml": (
-        "9e6d291fe012a4932126c5dba96d0a27e1c68299bbbb1847ea8ab4d69db87df6"
+        "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564"
     ),
     "pr-check.yml": (
-        "6f7cf483d18396193071b63c0eeec6eeaa8d5e52b3da15b746dae587f613fa77"
+        "037d5784e7ecafe1eb181cf54c91c175e9b205e9df50da523896be734fcefc5d"
     ),
     "release.yml": (
         "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f"
     ),
     "security-audit.yml": (
-        "02c03c353ebaabef272efcb162faa1cf214d23eec07e3d51f71a0ea75b0e5b3c"
+        "0b4b9b833a50b61b456e4d4c2064fba5f9c6836867157c4f22b1c5887ee4f176"
     ),
 }
 
@@ -122,7 +122,7 @@ PUBLISH_WORD_RE = re.compile(r"(?i)\bpublish\b")
 PUBLISH_OR_RELEASE_RE = re.compile(r"(?i)\b(?:release|publish)\b")
 DEFAULT_BRANCH_REF = "${{ github.event.repository.default_branch }}"
 EXPECTED_CHECKOUT = (
-    "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 )
 REQUIRED_PR_TYPES = ("labeled", "synchronize", "opened", "reopened")
 EXPECTED_PR_GATE_NEEDS = frozenset(
@@ -266,7 +266,7 @@ EXPECTED_CHANGES_OUTPUTS = {
     for name in ("code", "policy", "bot")
 }
 PATH_FILTER_USES = (
-    "dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad"
+    "dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d"
 )
 EXPECTED_PR_CHECK_ON = {
     "pull_request": {"branches": ["main"]},

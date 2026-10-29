@@ -25,7 +25,7 @@ from scripts.check_workflow_policy import check_repo
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
-PINNED_SHA = "11d5960a326750d5838078e36cf38b85af677262"
+PINNED_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 PR_CHECK = (WORKFLOWS_DIR / "pr-check.yml").read_text(encoding="utf-8")
 NIGHTLY = (
     WORKFLOWS_DIR / "nightly-instrumented.yml"
@@ -48,7 +48,7 @@ WORKFLOW_TEXTS = {
 }
 CHECKOUT_STEP = (
     "      - name: Checkout repository\n"
-    f"        uses: actions/checkout@{PINNED_SHA} # v4.4.0\n"
+    f"        uses: actions/checkout@{PINNED_SHA} # v7.0.1\n"
 )
 
 
@@ -392,7 +392,7 @@ runs:
         self._write(
             "pr-check.yml",
             PR_CHECK.replace(
-                f"        uses: actions/checkout@{PINNED_SHA} # v4.4.0\n",
+                f"        uses: actions/checkout@{PINNED_SHA} # v7.0.1\n",
                 f'        "uses": actions/checkout@{PINNED_SHA[:7]}\n',
                 1,
             ),
@@ -403,7 +403,7 @@ runs:
         self._write(
             "pr-check.yml",
             PR_CHECK.replace(
-                f"        uses: actions/checkout@{PINNED_SHA} # v4.4.0\n",
+                f"        uses: actions/checkout@{PINNED_SHA} # v7.0.1\n",
                 "        uses:\n          actions/checkout@v4\n",
                 1,
             ),

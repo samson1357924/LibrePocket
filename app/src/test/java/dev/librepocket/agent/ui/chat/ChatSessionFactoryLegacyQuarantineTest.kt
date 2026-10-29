@@ -174,12 +174,13 @@ class ChatSessionFactoryLegacyQuarantineTest {
         val store = FakeSessionStore()
         val sid = store.createSession("t", "m")
         val sink = SessionTranscriptSink(store, sid) { 42L }
-        val raw = "down https://example.com/x?api_key=SECRET12345678 tail"
+        val raw = "down https://example.com/x?api_key=example-value tail"
         sink.onTurnFailed("r1", raw)
         val row = store.events.single()
         assertEquals("system", row.kind)
         assertTrue(row.text.startsWith("turn r1 failed: "))
-        assertFalse("raw secret must not persist", row.text.contains("SECRET12345678"))
-        assertFalse("raw query must not persist", row.text.contains("api_key=SECRET"))
+        assertFalse("raw token value must not persist", row.text.contains("example-value"))
+        assertFalse("raw query must not persist", row.text.contains("api_key=example-value"))
+        assertTrue("URL token param must be redacted", row.text.contains("api_key=⟦REDACTED⟧"))
     }
 }

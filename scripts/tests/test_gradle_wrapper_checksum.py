@@ -25,9 +25,9 @@ WORKFLOWS = {
 # This is a change-detection convention, not a shell/action call-graph analysis.
 WORKFLOW_SNAPSHOTS = {
     "codeql.yml": "1f37e9b4fe81cd4b5024302a4b06d16ff51b585ef764ee3b539f9c054398866a",
-    "nightly-instrumented.yml": "8c263fa80c95f5de6f7e97dd94101f0c2e7785cce7fd6f0b8efd9be56893f782",
+    "nightly-instrumented.yml": "ca9c43a47b238b63a5ddf18e75e9f1436dcf9c00b0a4345e9cab0ba36db7360b",
     "pocketguard.yml": "9e6d291fe012a4932126c5dba96d0a27e1c68299bbbb1847ea8ab4d69db87df6",
-    "pr-check.yml": "c7392b7b9eabbafc96e4fbf6d937a46f3af1bb34f1d7a426b3cb49af6451892f",
+    "pr-check.yml": "6f7cf483d18396193071b63c0eeec6eeaa8d5e52b3da15b746dae587f613fa77",
     "release.yml": "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f",
     "security-audit.yml": "f836a7d3ed4daf6ecec33baf577375bca6504513d54c89e2d2cb6da4d5d83bfa",
 }
@@ -304,9 +304,9 @@ class GradleWrapperChecksumTest(unittest.TestCase):
         script = "\n".join(line[10:] for line in script.splitlines())
         env = dict(os.environ, CHANGES_RESULT="success", DOCS="success", CODE="true",
                    POLICY="true", UNIT="success", LINT="success", BUILD="success",
-                   HARNESS="success", BOT="skipped", BOT_PATHS="false")
+                   HARNESS="success", WORKFLOW="success", BOT="skipped", BOT_PATHS="false")
         self.assertEqual(subprocess.run(["bash", "-c", script], env=env, capture_output=True).returncode, 0)
-        for job in ("UNIT", "LINT", "BUILD", "HARNESS"):
+        for job in ("UNIT", "LINT", "BUILD", "HARNESS", "WORKFLOW"):
             for status in ("skipped", "failure"):
                 with self.subTest(job=job, status=status):
                     self.assertNotEqual(subprocess.run(["bash", "-c", script], env=dict(env, **{job: status}), capture_output=True).returncode, 0)

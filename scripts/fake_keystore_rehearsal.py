@@ -36,18 +36,42 @@ Exit 0 only when every case behaves as expected.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import sys
 import tempfile
+import types
 from pathlib import Path
 from typing import Literal
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+def _load_sibling_module(name: str) -> types.ModuleType:
+    pkg = __name__.rpartition(".")[0]
+    scoped_name = f"{pkg}.{name}" if pkg else name
+    existing = sys.modules.get(scoped_name) or sys.modules.get(name)
+    if existing is not None:
+        return existing
+    path = Path(__file__).resolve().with_name(f"{name}.py")
+    if not path.is_file():
+        raise FileNotFoundError(f"cannot find sibling module: {path}")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load sibling module: {name} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    if scoped_name != name:
+        sys.modules[scoped_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        if scoped_name != name:
+            sys.modules.pop(scoped_name, None)
+        raise
+    return module
 
-import verify_release_apk as verifier  # noqa: E402  (needs sys.path guard above)
+
+verifier = _load_sibling_module("verify_release_apk")
 
 if not hasattr(verifier, "build_parser"):
     raise ImportError("verify_release_apk.build_parser is required by the rehearsal")

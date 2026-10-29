@@ -101,6 +101,8 @@ data class ProviderHttpConfig(
     val connectTimeoutMs: Long = 15_000,
     val writeTimeoutMs: Long = 30_000,
     val readTimeoutMs: Long = 300_000,
+    val attemptDeadlineMs: Long = 300_000L,
+    val maxSseWireBytes: Long = 8 * 1024 * 1024L,
     @Deprecated("Provider retries are disabled; configure whole-turn retries in TurnRetryConfig.")
     val maxRetries: Int = 3,
     @Deprecated("Provider retries are disabled; configure whole-turn retries in TurnRetryConfig.")

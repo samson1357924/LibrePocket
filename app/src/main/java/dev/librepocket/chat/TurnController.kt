@@ -13,6 +13,8 @@ import dev.librepocket.provider.StreamEvent
 import dev.librepocket.provider.ServerToolTranscript
 import dev.librepocket.provider.TEXT_TOO_LARGE
 import dev.librepocket.provider.TOOL_ARGS_TOO_LARGE
+import dev.librepocket.provider.SSE_TOTAL_TOO_LARGE
+import dev.librepocket.provider.ATTEMPT_DEADLINE_EXCEEDED
 import dev.librepocket.provider.FailureKind
 import dev.librepocket.provider.ProviderErrorClassifier
 import dev.librepocket.provider.inferAggFailureCodeName
@@ -5589,11 +5591,13 @@ class TurnController(
         retryable = e.retryable,
         code = e.code?.name ?: inferAggFailureCodeName(e.message),
       )
-      // AGG_TOO_LARGE is this collector's own guard: fail closed without
+      // AGG_TOO_LARGE / DEADLINE_EXCEEDED is this collector's own guard: fail closed without
       // recording poison-adjacent pending tools (the typed terminal error
       // is the observable record). Other failures flush, guarded by the
       // same discard predicate as the Failed-event path.
-      if (e.code != ProviderFailureCode.AGG_TOO_LARGE && !shouldDiscardPendingTools(failed)) {
+      if (e.code != ProviderFailureCode.AGG_TOO_LARGE &&
+          e.code != ProviderFailureCode.DEADLINE_EXCEEDED &&
+          !shouldDiscardPendingTools(failed)) {
         try {
           flushPendingTools(state, attemptRunId)
         } catch (pf: ProviderFailure) {
@@ -6281,10 +6285,13 @@ internal fun sanitizeError(raw: String): String = Redactor.redactError(raw)
 internal fun isResourceExhausted(failed: StreamEvent.Failed?): Boolean {
   if (failed == null) return false
   if (failed.code?.equals(ProviderFailureCode.AGG_TOO_LARGE.name, ignoreCase = true) == true) return true
+  if (failed.code?.equals(ProviderFailureCode.DEADLINE_EXCEEDED.name, ignoreCase = true) == true) return true
   return failed.message.contains(TOOL_ARGS_TOO_LARGE, ignoreCase = true) ||
     failed.message.contains(TEXT_TOO_LARGE, ignoreCase = true) ||
     failed.message.contains(SseFrameParser.FRAME_TOO_LARGE_MESSAGE, ignoreCase = true) ||
-    failed.message.contains(SseFrameParser.LINE_TOO_LONG_MESSAGE, ignoreCase = true)
+    failed.message.contains(SseFrameParser.LINE_TOO_LONG_MESSAGE, ignoreCase = true) ||
+    failed.message.contains(SSE_TOTAL_TOO_LARGE, ignoreCase = true) ||
+    failed.message.contains(ATTEMPT_DEADLINE_EXCEEDED, ignoreCase = true)
 }
 
 /**

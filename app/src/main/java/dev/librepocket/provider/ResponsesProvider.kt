@@ -131,7 +131,7 @@ class ResponsesProvider(
             // VirtualMachineError); an interrupted pump rethrows after
             // restoring the thread's interrupt flag.
             try {
-                pumpSse(httpClient, postJson(endpoint(config.baseUrl), headers, body)) { frame ->
+                pumpSse(httpClient, postJson(endpoint(config.baseUrl), headers, body), config.http) { frame ->
                     emitAll(mapper.mapPayload(frame.data))
                     if (mapper.terminalReached) SsePumpDecision.STOP else SsePumpDecision.CONTINUE
                 }
@@ -159,7 +159,7 @@ class ResponsesProvider(
                 .header("Authorization", "Bearer ${String(key)}")
                 .get()
                 .build()
-            return executeProviderRequest(httpClient, req) { resp, cancelCall ->
+            return executeProviderRequest(httpClient, req, config.http) { resp, cancelCall ->
                 if (!resp.isSuccessful) {
                     val errorPrefix = readProviderErrorPrefix(resp.body, cancelCall).orEmpty()
                     val kind = ProviderErrorClassifier.classify(resp.code, null, errorPrefix)

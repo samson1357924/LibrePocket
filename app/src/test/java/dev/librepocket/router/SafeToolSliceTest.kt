@@ -642,18 +642,65 @@ class SafeToolSliceTest {
         assertTrue(loneFormat.denied)
         assertEquals(SafeToolSlice.DenyCodes.SCHEMA_INVALID, loneFormat.denyCode)
 
+        // Edge cases: leading, trailing, and multiple format code points.
+        val edgeCases = listOf(
+            """{"query":"\u200BFoo"}""",
+            """{"query":"Foo\u200B"}""",
+            """{"query":"\u200BFoo\uFEFFBar"}""",
+        )
+        for ((idx, args) in edgeCases.withIndex()) {
+            val invocationsBefore = backend.invocations.get()
+            val rejected = s.execute(
+                listOf(call(args = args, id = "fmt-edge-$idx")),
+            ).single()
+            assertTrue(args, rejected.denied)
+            assertEquals(args, SafeToolSlice.DenyCodes.SCHEMA_INVALID, rejected.denyCode)
+            assertTrue(args, rejected.resultJson.contains("\"denied\":true"))
+            assertEquals("Backend must not be invoked for $args", invocationsBefore, backend.invocations.get())
+        }
+
         assertEquals("Only clean twins must execute on backend", formats.size, backend.invocations.get())
     }
 
     @Test fun containsFormatCodePointIdentifiesFormatCodePoints() {
+        assertFalse(SafeToolSlice.containsFormatCodePoint(""))
         assertFalse(SafeToolSlice.containsFormatCodePoint("normal text"))
         assertFalse(SafeToolSlice.containsFormatCodePoint("path/to/file.kt"))
         assertFalse(SafeToolSlice.containsFormatCodePoint("\uD83D\uDE00")) // Emoji is Symbol, not Format
+
+        // Unpaired surrogates do not report FORMAT and must evaluate to false
+        assertFalse(SafeToolSlice.containsFormatCodePoint("\uD800"))
+        assertFalse(SafeToolSlice.containsFormatCodePoint("\uDC00"))
+        assertFalse(SafeToolSlice.containsFormatCodePoint("\uD800abc"))
+        assertFalse(SafeToolSlice.containsFormatCodePoint("abc\uDC00"))
+        assertFalse(SafeToolSlice.containsFormatCodePoint("\uDC00\uD800"))
+
+        // Format code points at string boundaries (leading / trailing / lone, BMP and supplementary)
+        assertTrue(SafeToolSlice.containsFormatCodePoint("\u200Bstart"))
+        assertTrue(SafeToolSlice.containsFormatCodePoint("end\u200B"))
+        assertTrue(SafeToolSlice.containsFormatCodePoint("\u200B"))
+        assertTrue(SafeToolSlice.containsFormatCodePoint("\uDB40\uDC01start"))
+        assertTrue(SafeToolSlice.containsFormatCodePoint("end\uDB40\uDC01"))
+        assertTrue(SafeToolSlice.containsFormatCodePoint("\uDB40\uDC01"))
+
+        // Supplementary plane tags
+        assertTrue(SafeToolSlice.containsFormatCodePoint("a\uDB40\uDC01b")) // U+E0001 Language Tag
+        assertTrue(SafeToolSlice.containsFormatCodePoint("a\uDB40\uDC20b")) // U+E0020 Tag Space
+        assertTrue(SafeToolSlice.containsFormatCodePoint("a\uDB40\uDC7Fb")) // U+E007F Cancel Tag
+
+        // BMP format characters
         assertTrue(SafeToolSlice.containsFormatCodePoint("a\u200Bb")) // ZWSP U+200B
         assertTrue(SafeToolSlice.containsFormatCodePoint("a\u202Eb")) // RLO U+202E
         assertTrue(SafeToolSlice.containsFormatCodePoint("a\uFEFFb")) // BOM U+FEFF
-        assertTrue(SafeToolSlice.containsFormatCodePoint("a\uDB40\uDC01b")) // U+E0001 Language Tag (surrogate pair)
-        assertTrue(SafeToolSlice.containsFormatCodePoint("a\uDB40\uDC20b")) // U+E0020 Tag Space (surrogate pair)
+
+        // Multiple format characters (consecutive and interspersed)
+        assertTrue(SafeToolSlice.containsFormatCodePoint("\u200B\uFEFF"))
+        assertTrue(SafeToolSlice.containsFormatCodePoint("x\u200By\uFEFFz"))
+        assertTrue(SafeToolSlice.containsFormatCodePoint("\uDB40\uDC01\uDB40\uDC20"))
+
+        // Unpaired surrogate followed by format code point
+        assertTrue(SafeToolSlice.containsFormatCodePoint("\uD800\u200B"))
+        assertTrue(SafeToolSlice.containsFormatCodePoint("\uDC00\uDB40\uDC01"))
     }
 
     @Test fun policyFlipAfterOfferDenies() = runBlocking {

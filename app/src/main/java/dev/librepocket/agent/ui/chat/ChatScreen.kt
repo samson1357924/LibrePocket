@@ -903,7 +903,7 @@ internal fun KeyReadConfirmDialog(
 }
 
 @Composable
-private fun MessageBubble(
+internal fun MessageBubble(
     msg: UiMessage,
     onSpeak: (messageId: String, text: String) -> Unit = { _, _ -> },
     // M2：voice_output 開關（false 即隱藏朗讀鈕，與 ToolRegistry 投影同源）。
@@ -932,17 +932,23 @@ private fun MessageBubble(
         ) {
             Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                 val displayText = displayAssistantText(msg.role, msg.text)
-                Text(
-                    text = if (msg.isPartial) displayText + " ▍" else displayText,
-                    style = MaterialTheme.typography.bodyLarge,
+                ChatMarkdownView(
+                    text = displayText,
+                    isStreaming = msg.isPartial,
+                    textColor = if (isUser) {
+                        MaterialTheme.colorScheme.onPrimaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurface
+                    },
                 )
                 // S2 系統 TTS：助理氣泡加朗讀鈕（系統語音引擎處理，
                 // 離線能力與資料傳輸取決於已安裝的引擎，非「本地保證」；
                 // 零新權限；開關關閉時隱藏）。朗讀為逐則手勢，
                 // 引擎揭露見按鈕無障礙文案（VoiceTts.SPEAK_BUTTON_DESCRIPTION）。
-                if (!isUser && displayText.isNotBlank() && !msg.isPartial && showSpeak) {
+                val speakableText = ChatMarkdownParser.stripThinking(displayText)
+                if (!isUser && speakableText.isNotBlank() && !msg.isPartial && showSpeak) {
                     IconButton(
-                        onClick = { onSpeak(msg.id, displayText) },
+                        onClick = { onSpeak(msg.id, speakableText) },
                         modifier = Modifier.size(32.dp),
                     ) {
                         Icon(

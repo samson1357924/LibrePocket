@@ -4,8 +4,8 @@
 
 - **Scope:** Local build prerequisites and checked-in Android toolchain values.
 - **Owner role:** Build/CI maintainer; no individual assigned.
-- **Source of truth:** `gradle/libs.versions.toml`, `gradle/wrapper/gradle-wrapper.properties`, `app/build.gradle.kts`, `github_bot/.nvmrc`, `github_bot/package.json`, `scripts/verify_jdk_floor.sh`, and `.github/workflows/pr-check.yml`.
-- **Update trigger:** Any SDK, AGP, Kotlin, Gradle, JDK, Node.js, flavor, or CI image change.
+- **Source of truth:** `gradle/libs.versions.toml`, `gradle/wrapper/gradle-wrapper.properties`, `app/build.gradle.kts`, `github_bot/.nvmrc`, `github_bot/package.json`, `scripts/verify_jdk_floor.sh`, `.github/workflows/pr-check.yml`, and `.github/dependabot.yml`.
+- **Update trigger:** Any SDK, AGP, Kotlin, Gradle, JDK, Node.js, flavor, CI image, or dependency update policy change.
 
 ## JDK and Gradle
 
@@ -85,3 +85,21 @@ Do not treat a locally built APK as an official channel artifact. Distribution/s
 ## Build commands
 
 Use the commands and evidence guidance in [Testing](TESTING.md). On constrained systems, serialize Gradle runs with `--max-workers=1 --no-daemon`; do not run multiple Gradle/test JVMs after an OOM.
+
+## Supply Chain and Dependency Update Policy
+
+Automated dependency monitoring, pinning rules, and review protocols protect build integrity and supply-chain authenticity across ecosystems (see issue #20):
+
+1. **Automated Dependency Monitoring:** Dependabot is configured in `.github/dependabot.yml` to monitor dependencies weekly across three package ecosystems:
+   - `github-actions` (workflow root `/`, commit prefix `chore(ci)`),
+   - `gradle` (Android build root `/`, commit prefix `chore(deps)`),
+   - `npm` (PocketGuard bot `/github_bot`, commit prefix `chore(bot)`).
+
+2. **Commit-SHA Pinning for GitHub Actions:** All GitHub Actions workflows (`.github/workflows/*.yml`) enforce supply-chain integrity (#20) by requiring every action step `uses:` to resolve to a full 40-character commit SHA rather than a mutable tag or branch. Dependabot PRs updating Actions will propose upstream version/tag bumps or SHAs; maintainers must ensure the 40-hex SHA pin is maintained (annotated with a trailing version comment, e.g., `# v4.4.0`) before merging.
+
+3. **Verification Protocol for Dependency PRs:**
+   - **GitHub Actions:** Audit the upstream commit SHA on the action repository, verify commit authenticity and author provenance, and check against workflow policy and least-privilege permissions.
+   - **Gradle Dependencies and Toolchain:** Updates must be reflected in the version catalog (`gradle/libs.versions.toml`) or Gradle wrapper (`gradle/wrapper/gradle-wrapper.properties` with an authentic `distributionSha256Sum`). Maintainers must execute the full 3-flavor unit test suite, lint, debug assembly, and artifact policy checks (`:app:testPlayDebugUnitTest`, `:app:testFossDebugUnitTest`, `:app:testGithubDebugUnitTest`, `:app:lintPlayDebug`, `:app:lintFossDebug`, `:app:lintGithubDebug`, `:app:assemblePlayDebug`, `:app:assembleFossDebug`, `:app:assembleGithubDebug`, and `scripts/play_policy_check.sh` on Play and Foss APKs) as documented in [Testing](TESTING.md).
+   - **Node.js (`github_bot`):** Validate lockfile integrity and test suites by executing `npm ci --ignore-scripts && npm test && npm run build` within `github_bot/`.
+
+4. **Residual Note on Offline Dependency Locking:** Full offline dependency locking (`gradle/verification-metadata.xml`) remains an open follow-up milestone for strict transitive byte-level verification against upstream repository tampering.

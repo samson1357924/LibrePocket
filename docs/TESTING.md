@@ -39,7 +39,13 @@ they exist for readability/history, and the catch-all defaults any new
 `scripts/` harness code (checker or script test) into the gate with no
 filter edit (`PolicyCiGateControl` pins the catch-all in the parsed filter
 list and never parses this document).
-`docs-guard` always runs the
+Changes under `gradle/wrapper/**` also set `policy`, so wrapper checksum
+regressions run even when no script changes. The wrapper harness and Gradle
+jobs both depend on `changes` and can run in parallel: the harness contributes
+to the `pr-gate` merge decision, but is not a pre-execution defense preventing
+Gradle from running a changed wrapper. `docs-guard` always runs
+`scripts/tests/test_dependabot_config.py` to validate Dependabot coverage and
+the docs dependency pin, then runs the
 fixture self-test `scripts/test_docs_claim_check.sh` (synthetic repos for each
 enumerated zero-wiring bypass surface — each wiring vector and each discovery
 fail-closed path —, CWD-independent) followed by the static grep + manifest XML
@@ -65,6 +71,12 @@ normaliser, so a `//` inside a URL/string cannot truncate a later FQN.
 `pr-gate` (`always()`, needs all prior jobs) resolves a skipped Gradle
 stage as pass only when the corresponding `changes` output is explicitly
 `false`, and fails closed otherwise.
+
+The Dependabot/docs dependency test checks the expected update entries, the
+syntax of hashes attached to the PyYAML requirement, and specific command lines
+in the named install step. It does not authenticate hashes, establish artifact
+coverage, or guarantee that the workflow or step executes under every event or
+condition. Review the workflow and run results separately.
 
 The docs guard and its fixture self-test share one stdlib-only scanner,
 `scripts/mcp_scan.py` (subcommands `discover`, `module-roots`, `types`,

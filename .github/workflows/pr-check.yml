@@ -47,6 +47,9 @@ jobs:
               - 'gradle.properties'
               - '.github/workflows/pr-check.yml'
             policy:
+              # Wrapper harness is a merge gate, not a prerequisite to Gradle
+              # jobs: they run in parallel after changes.
+              - 'gradle/wrapper/**'
               - 'scripts/play_policy_check.sh'
               - 'scripts/apk_policy_inspect.py'
               - 'scripts/backup_rules_check.py'
@@ -439,7 +442,7 @@ jobs:
       # live in scripts/requirements-docs.txt (cp310-cp314 manylinux x86_64
       # wheels + sdist); `pip install --hash` is not a CLI option, so the pin
       # must be consumed as a requirements file. --ignore-installed forces
-      # downloading the hashed artifact even when the runner already has
+      # selecting a hashed artifact even when the runner already has
       # PyYAML 6.0.3 (otherwise no hash is checked); the exact version
       # assertion below remains fail-closed.
       - name: Install pinned PyYAML
@@ -451,6 +454,9 @@ jobs:
           set -euo pipefail
           python3 -m pip install --user --disable-pip-version-check --ignore-installed --require-hashes -r scripts/requirements-docs.txt
           python3 -c 'import yaml; assert yaml.__version__ == "6.0.3", yaml.__version__'
+
+      - name: Validate Dependabot and docs dependency policy
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_dependabot_config.py
 
       # Fixture self-test first (D-02): proves the guard still rejects each
       # enumerated zero-wiring bypass surface — manifest registration parsed as

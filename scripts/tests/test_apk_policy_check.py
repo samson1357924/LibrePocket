@@ -3617,6 +3617,7 @@ class PolicyCiGateControl(unittest.TestCase):
             ".github/workflows/pr-check.yml",
             ".github/workflows/codeql.yml",
             ".github/workflows/nightly-instrumented.yml",
+            "gradle/wrapper/**",
             # Trailing catch-all (kept LAST in the yml list): defaults any
             # new scripts/ harness code into the policy gate without a
             # filter edit; docs/TESTING.md cites this pin.
@@ -3643,6 +3644,8 @@ class PolicyCiGateControl(unittest.TestCase):
             [".github/workflows/pr-check.yml"],
             [".github/workflows/codeql.yml"],
             [".github/workflows/nightly-instrumented.yml"],
+            ["gradle/wrapper/gradle-wrapper.properties"],
+            ["gradle/wrapper/gradle-wrapper.jar"],
         ):
             with self.subTest(diff=tuple(diff)):
                 matched = any(

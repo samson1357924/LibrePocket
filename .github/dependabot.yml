@@ -23,3 +23,11 @@ updates:
     open-pull-requests-limit: 10
     commit-message:
       prefix: "chore(bot)"
+
+  - package-ecosystem: "pip"
+    directory: "/scripts"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"

@@ -590,7 +590,7 @@ class ChatSessionFactory(
      * loop with fake clock/backend so a REAL factory-built session completes
      * the fake-tool round-trip.
      */
-    private val toolSlice: dev.librepocket.router.SafeToolSlice? = null,
+    internal val toolSlice: dev.librepocket.router.SafeToolSlice? = null,
 ) : ChatSessionProvider {
     // S1: no defaults on overrides (Kotlin forbids defaults on overriding
     // functions): the fail-closed default allowAsk=false lives on the
@@ -2550,26 +2550,38 @@ private fun markerNamePrefix(text: String, start: Int, limit: Int): String {
 }
 
 /** Production wiring for [ChatViewModel] (shares the process-singleton endpoint store). */
-class ChatViewModelFactory(app: Application) : ViewModelProvider.Factory {
-    private val store = EndpointStore(app)
-    private val policy: PolicyStore = DataStorePolicyStore(app)
+class ChatViewModelFactory(
+    app: Application,
+    store: EndpointStore = EndpointStore(app),
+    policy: PolicyStore? = null,
+    buildProvider: ((ProviderConfig, KeyProvider) -> LlmProvider)? = null,
+    vaultSource: VaultSource? = null,
+    sessionStores: SessionStoreSource? = null,
+) : ViewModelProvider.Factory {
+    private val store = store
+    private val effectivePolicy: PolicyStore = policy ?: DataStorePolicyStore(app)
 
     @Volatile
     private var vault: KeyVault? = null
-    private val vaultSource = VaultSource {
+    private val effectiveVaultSource = vaultSource ?: VaultSource {
         vault ?: run {
             val created = withContext(Dispatchers.IO) { EncryptedPrefsVault(app) }
             synchronized(this@ChatViewModelFactory) { vault = vault ?: created }
             vault!!
         }
     }
-    private val sessionStores = SessionStoreSource {
+    private val effectiveSessionStores = sessionStores ?: SessionStoreSource {
         RoomSessionStore(SessionDbHolder.get(app))
     }
-    private val sessions = ChatSessionFactory(policy, vaultSource, sessionStores = sessionStores)
+    internal val sessions = ChatSessionFactory(
+        policy = effectivePolicy,
+        vaultSource = effectiveVaultSource,
+        buildProvider = buildProvider ?: { cfg, keys -> DefaultProviderFactory(keys).create(cfg) },
+        sessionStores = effectiveSessionStores,
+    )
 
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
-        return ChatViewModel(store, sessions, policy) as T
+        return ChatViewModel(store, sessions, effectivePolicy) as T
     }
 }

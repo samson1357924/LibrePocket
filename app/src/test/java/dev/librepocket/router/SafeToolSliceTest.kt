@@ -615,6 +615,47 @@ class SafeToolSliceTest {
         assertEquals(formats.size, backend.invocations.get())
     }
 
+    @Test fun queryContainingFormatCodePointsIsRejectedWithoutBackendExecution() = runBlocking {
+        // Query must also reject any Unicode FORMAT (Cf) code points (matching pathPrefix):
+        // ZWSP U+200B, RLO U+202E, BOM U+FEFF, and supplementary plane tag U+E0001 (surrogate pair \uDB40\uDC01).
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        val formats = listOf("\u200B", "\u202E", "\uFEFF", "\uDB40\uDC01", "\uDB40\uDC20")
+        for ((i, fmt) in formats.withIndex()) {
+            val rejected = s.execute(
+                listOf(call(args = """{"query":"Foo${fmt}Bar"}""", id = "fmt-q-$i")),
+            ).single()
+            assertTrue(fmt, rejected.denied)
+            assertEquals(fmt, SafeToolSlice.DenyCodes.SCHEMA_INVALID, rejected.denyCode)
+            assertTrue(fmt, rejected.resultJson.contains("\"denied\":true"))
+
+            // Clean twin differs only by the format character.
+            val clean = s.execute(
+                listOf(call(args = """{"query":"FooBar"}""", id = "clean-q-$i")),
+            ).single()
+            assertFalse(fmt, clean.denied)
+        }
+        // Format-alone query (such as ZWSP alone) must also be rejected
+        val loneFormat = s.execute(
+            listOf(call(args = """{"query":"\u200B"}""", id = "fmt-lone")),
+        ).single()
+        assertTrue(loneFormat.denied)
+        assertEquals(SafeToolSlice.DenyCodes.SCHEMA_INVALID, loneFormat.denyCode)
+
+        assertEquals("Only clean twins must execute on backend", formats.size, backend.invocations.get())
+    }
+
+    @Test fun containsFormatCodePointIdentifiesFormatCodePoints() {
+        assertFalse(SafeToolSlice.containsFormatCodePoint("normal text"))
+        assertFalse(SafeToolSlice.containsFormatCodePoint("path/to/file.kt"))
+        assertFalse(SafeToolSlice.containsFormatCodePoint("\uD83D\uDE00")) // Emoji is Symbol, not Format
+        assertTrue(SafeToolSlice.containsFormatCodePoint("a\u200Bb")) // ZWSP U+200B
+        assertTrue(SafeToolSlice.containsFormatCodePoint("a\u202Eb")) // RLO U+202E
+        assertTrue(SafeToolSlice.containsFormatCodePoint("a\uFEFFb")) // BOM U+FEFF
+        assertTrue(SafeToolSlice.containsFormatCodePoint("a\uDB40\uDC01b")) // U+E0001 Language Tag (surrogate pair)
+        assertTrue(SafeToolSlice.containsFormatCodePoint("a\uDB40\uDC20b")) // U+E0020 Tag Space (surrogate pair)
+    }
+
     @Test fun policyFlipAfterOfferDenies() = runBlocking {
         val backend = CountingBackend()
         val policy = allowPolicy()

@@ -1,6 +1,6 @@
 # LibrePocket 能力與接線狀態
 
-> **Current snapshot**：依 `82f2a0a8` 核對（2026-10-22，S1–S7＋R27＋R28-1＋#96 P2 tool-slice 及 Phase 3 硬化（`pathPrefix` Cf 全拒、空白 call id／續聊 index 精確配對、重複／redaction 碰撞 id 可續聊拒絕、非 object args 回退固定物件、backend 欄位省略 receipt 固定、timeout 分流、secret 家族值收斂、history marker-aware 裁切、Responses canonical 數字比較、MCP `baseUrl` preflight；Stage 1 & 2 硬化：`ChatViewModel` `restoreOpForFailedSend` 確立 notice-last 順序不變量消除跨分支發送競態、`SafeToolSlice` 預算超限正規化收據 wire ID））；executionReady 由 0→1 於 `b804ce89e99588cd5ca7c9cc3556e4dc37df6911`，為 registry readiness 旗標；`lsp.symbols` 執行在 production composition 為 test-only（`toolSlice = null`），任何未來工具接線均須走完整的 dispatcher/confirmation/executor pipeline；production 未附掛 tool slice，見 Built-in tools 列）。#93 已合併（`c3ae01fb`），本分支已完成 rebase。本文件不把規格列出的能力當成已可用功能。
+> **Current snapshot**：依 `82f2a0a8` 核對（2026-10-22，S1–S7＋R27＋R28-1＋#96 P2 tool-slice 及 Phase 3 硬化（`pathPrefix` 與 `query` Cf 全拒、空白 call id／續聊 index 精確配對、重複／redaction 碰撞 id 可續聊拒絕、非 object args 回退固定物件、backend 欄位省略 receipt 固定、timeout 分流、secret 家族值收斂、history marker-aware 裁切、Responses canonical 數字比較、MCP `baseUrl` preflight；Stage 1 & 2 硬化：`ChatViewModel` `restoreOpForFailedSend` 確立 notice-last 順序不變量消除跨分支發送競態、`SafeToolSlice` 預算超限正規化收據 wire ID；PR4 P2 #19 硬化：`ChatViewModelFactory` 暴露 seam 且由 `ProductionChatCompositionTest` 釘死 `sessions.toolSlice = null`，`query` 提取 `containsFormatCodePoint` 拒絕 Unicode FORMAT 碼點，釐清 `ToolDef.executionReady` 為 registry readiness 定義並列出啟用前置條件清單））；executionReady 由 0→1 於 `b804ce89e99588cd5ca7c9cc3556e4dc37df6911`，為 registry readiness 旗標；`lsp.symbols` 執行在 production composition 為 test-only（`toolSlice = null`），任何未來工具接線均須走完整的 dispatcher/confirmation/executor pipeline；production 未附掛 tool slice，見 Built-in tools 列）。#93 已合併（`c3ae01fb`），本分支已完成 rebase。本文件不把規格列出的能力當成已可用功能。
 >
 > - **範圍：** built-in tools、provider adapters、三個 flavor 的 source/manifest 邊界。
 > - **Owner role：** app/runtime 維護者；未指派個人。
@@ -25,7 +25,7 @@
 | Ledger durability (`flushDurable`) | `TurnController.flushDurable` 八檢查合取（排空＋無 PENDING/CLAIMED receipt＋無未補償 SEALED＋admission／promotion／host／sticky 證明＋failure epoch 三讀 fail-last），永不 true-and-dangling；close 以 cancel-receipt barrier＋remaining-budget 線性化交接；同源 hydrate 保證僅限 R4-1 後新建/fork 的 ledger（pre-R4-1 混雜 id 須手動隔離，見威脅模型） | `true` 代表跨重啟耐久；fake session 的 `true` 可作耐久證據；SEALED 等同 settled |
 | Prune family-aware（R27） | Room raw cut＋family fixup 同一 tx（kill→rollback→pre-prune）；fixup 無條件、無界收斂、shape-aware suspect；新 prune 跨重啟無頭孤兒進 model context／快照 | crash-mid-fixup 仍是已知限制；interior／pre-R26 既有孤兒會被 fixup 刪除；測試 fake 的 suspect 可作耐久證據 |
 | Cancel receipt / admission proofs | `hasUnsettledCancelReceipts`（PENDING/CLAIMED）、`hasSealedUncompensatedReceipts`（SEALED truth）、`hasUnsettledAdmission`（direct／promotion／UNKNOWN ghost／orphan；R22 由 direct-only 擴大）皆為 production 實作並合取進 `flushDurable`，且由 ViewModel 證據檢查直接讀取（無未接線 follow-up）；同源 hydrate 保證僅限 R4-1 後新建/fork 的 ledger（pre-R4-1 混雜 id 須手動隔離，見威脅模型） | 僅有 KDoc／介面預設即代表已接線；介面預設 `false` 可作耐久證據 |
-| Built-in tools | registry 有 41 個 definitions；恰 1 個 `executionReady=true`（P2 slice `lsp.symbols`：READ-only StubBackend 回顯、每 turn 至多一工具輪、fresh `tool.exec` ALLOW＋最新投影重驗、拒絕／取消／schema 錯零副作用，見 `SafeToolSlice`；`executionReady` 是 registry readiness 旗標）；其餘 40 維持 `false`；開關全開下 registry 可見（`ToolRegistry.visibleTools`）內建工具集合為 `["lsp.symbols"]`（`lsp` 開關預設關，預設為空）；production `ChatRequest.tools` 一律為空（無 slice 附掛）；production composition（`ChatViewModelFactory` 建 `ChatSessionFactory` 時未傳 `toolSlice`，預設 null）為 records-only，`lsp.symbols` 執行為 test-only（無 production dispatcher 或 confirmation pipeline），任何未來工具接線均須走完整的 dispatcher/confirmation/executor pipeline 而非測試 slice 迴圈——本快照無 production 工具執行路徑 | 模型可以執行 schema 中描述的動作（任一工具皆否：`lsp.symbols` 執行在 production composition 為 test-only（`toolSlice = null`），任何未來工具接線必須走完整的 dispatcher/confirmation/executor pipeline；slice 亦僅測試附掛）；投影、readiness 或 model-visible 可作執行證據 |
+| Built-in tools | registry 有 41 個 definitions；恰 1 個 `executionReady=true`（P2 slice `lsp.symbols`：READ-only StubBackend 回顯、每 turn 至多一工具輪、fresh `tool.exec` ALLOW＋最新投影重驗、拒絕／取消／schema 錯零副作用，見 `SafeToolSlice`；`executionReady` 是 registry readiness 旗標，非 E2E 生產就緒）；其餘 40 維持 `false`；開關全開下 registry 可見（`ToolRegistry.visibleTools`）內建工具集合為 `["lsp.symbols"]`（`lsp` 開關預設關，預設為空）；production `ChatRequest.tools` 一律為空（無 slice 附掛）；production composition（`ChatViewModelFactory` 暴露 seam 且由 `ProductionChatCompositionTest` 釘死 `sessions.toolSlice = null`）嚴格為 records-only，模型回傳 `ToolDone` 僅記錄 `[tool:...]`、絕不執行（`executedCalls == 0`）、絕不繼續 turn、絕不發射 `[tool-result:]`；`lsp.symbols` 執行為 test-only（無 production dispatcher 或 confirmation pipeline），任何未來工具接線均須滿足「內建工具啟用前置清單」走完整的 dispatcher/confirmation/executor pipeline 而非測試 slice 迴圈——本快照無 production 工具執行路徑 | 模型可以執行 schema 中描述的動作（任一工具皆否：`lsp.symbols` 執行在 production composition 為 test-only（`toolSlice = null`），任何未來工具接線必須走完整的 dispatcher/confirmation/executor pipeline；slice 亦僅測試附掛）；投影、readiness 或 model-visible 可作執行證據 |
 | `play` | base application ID；Play overlay 移除高風險權限/service | 商店已上架或政策已被商店批准 |
 | `foss` | `.foss` application ID；Foss manifest/source set 有 accessibility service 與 OSS vision dependencies | 與 `github` 有相同能力或已由 F-Droid 發布 |
 | `github` | `.github` application ID；含 accessibility service 及 GitHub-only ML Kit/Azure Speech/Shizuku dependencies | 「完整版」意指所有設計能力均已接線 |
@@ -42,6 +42,18 @@
 ## Target：工具接線前的驗收
 
 每個工具需單獨列明 flavor、使用的實體資源、權限要求、使用者確認、fresh policy evaluation、dispatcher/executor、取消與錯誤語義、持久化/審計路徑，以及正向與拒絕控制測試。未完成上述驗收時保持 `executionReady=false`。不要把 41 項一次改為 ready。
+
+### 內建工具啟用前置清單（Built-in Tool Activation Prerequisites Checklist）
+
+所有內建工具目前在生產組合（`ChatViewModelFactory`）中皆未接線（`toolSlice = null`，經由 `ProductionChatCompositionTest` 釘死）。`ToolDef.executionReady` 為 registry readiness 旗標（表示 `ToolRegistry` 與 `SafeToolSlice` 中具備 schema 及 handlers），**不等於端到端生產可執行**。在任何工具轉為生產可用前，必須滿足以下前置條件清單：
+
+1. **Production Dispatcher 接線**：必須實作正式的生產分派器（production dispatcher），不可直接把測試 slice 迴圈當成生產接線；`ChatViewModelFactory` 必須有顯式、受控的接線路徑。
+2. **不可變確認快照管線（Immutable Confirmation Snapshot Pipeline）**：高風險或非 READ 操作必須經由確認對話框取得使用者授權；確認必須綁定當下的不可變快照 `(tool, identity, arguments)`，在執行副作用前重新評估授權（`ASK` 絕不默認為 `ALLOW`）。
+3. **Flavor 與權限防護**：各 flavor 邊界明確隔離（如 `play` 禁止未授權敏感權限、`foss` 維持純開源、`github` 特有依賴不外洩）；執行前驗證 Android 執行時期權限與前景狀態。
+4. **取消與逾時語意**：取消操作必須能解除底層 blocking I/O，不可僅更新 UI 狀態；逾時必須映射為 typed denials（如 `EXEC_DENIED`），且非取消異常不得使 turn 崩潰。
+5. **持久化與稽核路徑**：完整的 Room transcript 稽核紀錄，長度上限與脫敏（redaction）防護，且重啟重新載入具備等價性（reopen reload equivalence）。
+6. **負向控制與競態測試**：必須具備 schema 驗證失敗、Unicode FORMAT（Cf）碼點拒絕（`containsFormatCodePoint` 涵蓋 `query` 與 `pathPrefix`）、逾時、重複 call ID、權限拒絕及併發取消等負向路徑測試。
+7. **裝置端到端驗證（Device-verified E2E acceptance）**：必須在真實裝置或模擬器上完成端到端驗收測試，單純 JVM unit test 或 Fake 不能代替裝置驗證。
 
 ### MCP 啟用／接線 gate 清單
 

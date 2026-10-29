@@ -144,7 +144,7 @@ class RoomKillPersistencePhase4Test {
       sleeper = {},
       newId = { "kill-${n.incrementAndGet() - 1}" },
       cancelSettleTimeoutMs = 300L,
-      cancelCompensationTimeoutMs = 5_000L,
+      cancelCompensationTimeoutMs = 0L,
     )
     try {
       val admission = c.startOrEnqueue("hi")
@@ -162,6 +162,8 @@ class RoomKillPersistencePhase4Test {
       c.close(drainTimeoutMs = 0L)
       host.cancel()
       assistantGate.complete(Unit)
+      host.join()
+      c.flushTranscript(2_000L)
     } finally {
       runCatching { assistantGate.complete(Unit) }
       runCatching { c.close() }

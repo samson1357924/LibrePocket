@@ -39,6 +39,9 @@ jobs:
       - name: Verify JDK 25 security floor (CVE-2026-91403)
         run: bash scripts/verify_jdk_floor.sh --require-vendor Temurin
 
+      - name: Verify Gradle wrapper integrity
+        run: python3 scripts/verify_gradle_wrapper.py
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
         with:
@@ -85,6 +88,9 @@ jobs:
 
       - name: Verify JDK 25 security floor (CVE-2026-91403)
         run: bash scripts/verify_jdk_floor.sh --require-vendor Temurin
+
+      - name: Verify Gradle wrapper integrity
+        run: python3 scripts/verify_gradle_wrapper.py
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3

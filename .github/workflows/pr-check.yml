@@ -42,14 +42,18 @@ jobs:
               - 'app/build.gradle.kts'
               - 'app/lint.xml'
               - 'gradle/**'
+              - 'gradlew'
+              - 'gradlew.bat'
               - 'settings.gradle.kts'
               - 'build.gradle.kts'
               - 'gradle.properties'
               - '.github/workflows/pr-check.yml'
             policy:
-              # Wrapper harness is a merge gate, not a prerequisite to Gradle
-              # jobs: they run in parallel after changes.
+              # The harness runs in parallel; each Gradle job also checks its
+              # own wrapper before invoking Gradle.
               - 'gradle/wrapper/**'
+              - 'gradlew'
+              - 'gradlew.bat'
               - 'scripts/play_policy_check.sh'
               - 'scripts/apk_policy_inspect.py'
               - 'scripts/backup_rules_check.py'
@@ -80,6 +84,8 @@ jobs:
               # harness pins their vendor flag, so edits must re-run the gate.
               - '.github/workflows/codeql.yml'
               - '.github/workflows/nightly-instrumented.yml'
+              # Any workflow edit must run the workflow review snapshot tests.
+              - '.github/workflows/**'
               # Trailing catch-all: the explicit entries above exist for
               # readability/history; this glob defaults new scripts/ harness
               # code (any new checker or script test) into the policy gate
@@ -123,6 +129,9 @@ jobs:
 
       - name: Verify JDK 25 security floor (CVE-2026-91403)
         run: bash scripts/verify_jdk_floor.sh --require-vendor Temurin
+
+      - name: Verify Gradle wrapper integrity
+        run: python3 scripts/verify_gradle_wrapper.py
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
@@ -235,6 +244,9 @@ jobs:
       - name: Verify JDK 25 security floor (CVE-2026-91403)
         run: bash scripts/verify_jdk_floor.sh --require-vendor Temurin
 
+      - name: Verify Gradle wrapper integrity
+        run: python3 scripts/verify_gradle_wrapper.py
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
         with:
@@ -300,6 +312,9 @@ jobs:
 
       - name: Verify JDK 25 security floor (CVE-2026-91403)
         run: bash scripts/verify_jdk_floor.sh --require-vendor Temurin
+
+      - name: Verify Gradle wrapper integrity
+        run: python3 scripts/verify_gradle_wrapper.py
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3

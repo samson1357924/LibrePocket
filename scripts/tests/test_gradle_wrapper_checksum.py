@@ -70,8 +70,8 @@ def canonical_properties(content):
     return content == (
         b"distributionBase=GRADLE_USER_HOME\n"
         b"distributionPath=wrapper/dists\n"
-        b"distributionSha256Sum=acd53f1edaf02f1a8ff99879f8a34b302661a057d9b063ae9e35b552f804d20a\n"
-        b"distributionUrl=https\\://services.gradle.org/distributions/gradle-9.7.1-bin.zip\n"
+        b"distributionSha256Sum=21bd5da2de49b642904077f38c0efdc7778e92b3ed0889392dca61b97e389607\n"
+        b"distributionUrl=https\\://services.gradle.org/distributions/gradle-9.8.2-bin.zip\n"
         b"networkTimeout=10000\n"
         b"retries=0\n"
         b"retryBackOffMs=500\n"
@@ -99,9 +99,9 @@ class GradleWrapperChecksumTest(unittest.TestCase):
     def test_reviewed_properties_and_official_generated_bytes(self):
         expected = {
             "gradlew": "a5a5c199ba02189ae8c46a334223371a20599d9c298ef65e7540ede4a3f72d59",
-            "gradlew.bat": "d539676c48b596afda64c963ec8f7ee56c7b3fe7e3b81d1dbe2d1a1e3dd9e9f8",
-            "gradle/wrapper/gradle-wrapper.jar": "7a9ce74cff467ca1bf60a4fcd9f05185acceda4d0f382434d393e17864262c5d",
-            "gradle/wrapper/gradle-wrapper.properties": "d0bebe8133babb74ab29a31ee6616c56ef8985fc801e1fd16c61b5ed2189e907",
+            "gradlew.bat": "f17917f8dbe61182b149273ee78090fec1197442c3f38276af907bfa5190db16",
+            "gradle/wrapper/gradle-wrapper.jar": "3b8a25775a69158b5ad2b1d17a80a88dc7b40a352a73eb27d06c612a7ce68e98",
+            "gradle/wrapper/gradle-wrapper.properties": "62779c1edca4389b50577428c5cab724a2ddd3ea4cac0685ce48bab709cce6c6",
         }
         for name, digest in expected.items():
             with self.subTest(name=name):
@@ -111,8 +111,8 @@ class GradleWrapperChecksumTest(unittest.TestCase):
         original = (ROOT / FILES[-1]).read_bytes()
         self.assertTrue(canonical_properties(original))
         for old, new in (
-            (b"gradle-9.7.1-bin.zip", b"gradle-9.7.1-all.zip"),
-            (b"acd53f1edaf02f1a8ff99879f8a34b302661a057d9b063ae9e35b552f804d20a", b"0" * 64),
+            (b"gradle-9.8.2-bin.zip", b"gradle-9.8.2-all.zip"),
+            (b"21bd5da2de49b642904077f38c0efdc7778e92b3ed0889392dca61b97e389607", b"0" * 64),
             (b"validateDistributionUrl=true", b"validateDistributionUrl=false"),
             (b"networkTimeout=10000", b"networkTimeout=30000"),
         ):

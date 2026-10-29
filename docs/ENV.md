@@ -53,7 +53,7 @@ The checked-in app configuration currently uses:
 | `compileSdk` | 37 |
 | Android Gradle Plugin | 9.5.0 |
 | Kotlin | 2.4.21 |
-| Gradle wrapper | 9.7.1 |
+| Gradle wrapper | 9.8.2 |
 
 Install the matching Android platforms and build tools required by the wrapper/build. The Gradle wrapper pin in `gradle/wrapper/gradle-wrapper.properties` enforces `distributionSha256Sum` verification to protect against distribution tampering. Do not infer installation paths or current Google Play policy deadlines from this table; the values above describe this source revision, not a store approval.
 

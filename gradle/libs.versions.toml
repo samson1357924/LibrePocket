@@ -32,7 +32,7 @@ mockwebserver = "5.5.0"
 testExtJunit = "1.2.1"
 espressoCore = "3.6.1"
 # Long-term key vault (P2; P1 keeps stub only)
-tink = "1.23.0"
+tink = "1.24.0"
 # Phase1 flavors: OCR / scan / on-device inference (foss+github = OSS, github-only = ML Kit)
 mlkitBarcodeScanning = "17.3.0"
 mlkitTextRecognition = "16.0.1"

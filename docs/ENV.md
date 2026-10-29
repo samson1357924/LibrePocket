@@ -51,7 +51,7 @@ The checked-in app configuration currently uses:
 | `minSdk` | 33 |
 | `targetSdk` | 36 |
 | `compileSdk` | 37 |
-| Android Gradle Plugin | 9.4.1 |
+| Android Gradle Plugin | 9.5.0 |
 | Kotlin | 2.4.21 |
 | Gradle wrapper | 9.7.1 |
 

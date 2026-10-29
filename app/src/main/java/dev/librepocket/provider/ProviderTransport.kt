@@ -331,7 +331,16 @@ internal suspend fun <T> executeProviderRequest(
     } else null
     try {
         currentCoroutineContext().ensureActive()
-        val result = call.execute().use { response -> consume(response) { call.cancel() } }
+        val response = call.execute()
+        val result = try {
+            consume(response) { call.cancel() }
+        } finally {
+            try {
+                response.close()
+            } catch (_: NullPointerException) {
+                // Defensive: OkHttp Response.close() crashes if body is null.
+            }
+        }
         currentCoroutineContext().ensureActive()
         if (deadlineFired.get()) {
             throw ProviderFailure(
@@ -409,7 +418,7 @@ internal suspend fun pumpSse(
         }
         var protocolTerminalReached = false
         try {
-            response.use { response ->
+            try {
                 if (!response.isSuccessful) {
                     val snippet = try {
                         readProviderErrorPrefix(response.body) { call.cancel() }
@@ -530,6 +539,12 @@ internal suspend fun pumpSse(
                     if (parser.frameTooLong) {
                         throw ProviderFailure(false, SseFrameParser.FRAME_TOO_LARGE_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
                     }
+                }
+            } finally {
+                try {
+                    response.close()
+                } catch (_: NullPointerException) {
+                    // Defensive: OkHttp Response.close() crashes if body is null.
                 }
             }
             if (!protocolTerminalReached && deadlineFired.get()) {

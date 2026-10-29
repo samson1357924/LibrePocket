@@ -111,7 +111,8 @@ Robolectric SDK pin (Current): JVM unit tests run with `sdk=33` pinned in
 `app/src/test/resources/robolectric.properties`, while `targetSdk` is 36
 (see [Build Environment](ENV.md)). A green run on API 33 does **not** imply
 API 34–36 behavior is verified; version-sensitive Android API behavior needs
-a separate higher-API smoke pass (Proposed, not a current CI gate). The pin
+separate higher-API device evidence. An API 36 Foss emulator lane is configured
+outside the PR gate; its execution evidence is tracked below. The pin
 itself and any `@Config` SDK matrix expansion are out of scope for the
 current deflake work — do not change them here.
 
@@ -684,17 +685,35 @@ does not enter `pr-gate` merge evaluation). The `nightly-unit-stress` job
 (Issue #86 Phase B, Foss `ChatSnapshotByteCapFullStressTest` with
 `NIGHTLY_STRESS=1`) runs on schedule / `workflow_dispatch` only
 (`if: github.event_name != 'pull_request'`), never on PR; JUnit XML retained
-14 days, non-gating (not in `pr-check.yml` `pr-gate`). The emulator matrix
-covers API levels 33 and 34 across the Play/Foss/Github flavors, plus target
-API 36 smoke coverage on Foss (`include:` with `api-level: 36`, `flavor: Foss`,
-`target: google_apis`, `arch: x86_64`).
+14 days, non-gating (not in `pr-check.yml` `pr-gate`). The configured emulator
+matrix runs API levels 33 and 34 across the Play/Foss/Github flavors, plus a
+targetSdk-level API 36 Foss lane (`include:` with `api-level: 36`,
+`flavor: Foss`, `target: google_apis`, `arch: x86_64`). A single Foss lane
+limits emulator cost while sampling target-level behavior; it does not verify
+the other flavors on API 36. It runs the same app-module connected instrumentation
+task, `connectedFossDebugAndroidTest`, as the API 33 and 34 Foss lanes, with no
+reduced test selection configured. On 2026-10-29,
+[dispatch 40831562611](https://github.com/samson1357924/LibrePocket/actions/runs/40831562611)
+completed successfully at SHA `f3c363384710e3e62ab3d3dbc3cd17e322fa59d8`;
+all seven instrumented jobs and the nightly stress job succeeded. The
+[Foss API 36 job](https://github.com/samson1357924/LibrePocket/actions/runs/40831562611/job/123306736606)
+succeeded; its downloaded [HTML report artifact](https://github.com/samson1357924/LibrePocket/actions/runs/40831562611/artifacts/12879331442)
+reported 14 tests, 0 failures and 0 skipped: 4 vault, 9 permission-policy,
+and 1 Room concurrency test. The artifact expires on 2026-11-12; this result
+is evidence for that run and SHA, not for subsequent changes or other devices.
 
 While `minSdk` is 33, `targetSdk` is 36, and `compileSdk` is 37 (`app/build.gradle.kts`),
 several open device testing gaps remain:
-- Matrix coverage gaps: Absence of API 35 and API 37 emulator coverage in CI.
+- Matrix coverage gaps: API 35 and API 37 emulator lanes are not configured in this workflow; API 36 is Foss-only.
 - Journey and lifecycle gaps: Absence of Compose UI end-to-end journey tests and activity process-recreation / configuration-change restoration device tests in `app/src/androidTest` (current instrumented tests cover only Room concurrency, `EncryptedPrefsVault`, and Play permission policy test fixtures).
-- Timing determinism gaps: Existing test sources still rely on `Thread.sleep` calls rather than deterministic synchronization mechanisms (e.g. idling resources, async latches, or bounded condition polling), presenting flake risks under CI load.
-This section states Current coverage only; any matrix expansion is Proposed until it is wired and run.
+
+The JVM/Robolectric `app/src/test/java/dev/librepocket/session/SessionListTest.kt`
+has a `Thread.sleep(2)` between session creations, but its injected incrementing
+clock supplies the timestamps used for ordering, so the sleep is redundant for
+that assertion, not evidence of scheduler-dependent ordering. Other sleeps
+must be evaluated in context; this is not an androidTest sleep finding.
+Additional matrix lanes are Proposed until wired; any configured lane still
+needs run-specific evidence before its execution is claimed.
 
 Instrumented tests are a separate device-dependent tier. The existing [P1 androidTest runbook](specs/P1_ANDROIDTEST_RUNBOOK.md) lists test classes and sample commands, but its device matrix and prior status notes are not current CI evidence. Before treating a device matrix as a merge/release gate, maintainers must name the required API/flavor/device coverage, run it, and retain results tied to the tested SHA. Do not report a device pass when no device was used.
 

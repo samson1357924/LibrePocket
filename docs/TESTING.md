@@ -9,12 +9,14 @@
 
 ## Current CI scope
 
-`pr-check.yml` is path-gated. A `changes` job classifies each pull request
+`pr-check.yml` triggers on pull requests targeting `main` and pushes to `main`
+only; it has no `workflow_dispatch` trigger. Within a triggered run, a
+`changes` job classifies changed paths
 with `dorny/paths-filter` into `code` (`app/src/**`,
 `app/build.gradle.kts`, `app/lint.xml`, `gradle/**`,
 `settings.gradle.kts`, `build.gradle.kts`, `gradle.properties`,
 `.github/workflows/pr-check.yml`) and `policy`
-(`scripts/play_policy_check.sh`, `scripts/apk_policy_inspect.py`,
+(`gradle/wrapper/**`, `scripts/play_policy_check.sh`, `scripts/apk_policy_inspect.py`,
 `scripts/backup_rules_check.py`,
 `scripts/nsc_check.py`,
 `scripts/summarize_junit.py`, `scripts/check_test_budgets.py`,
@@ -32,7 +34,9 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `scripts/tests/test_release_artifact_verifier.py`,
 `scripts/tests/test_build_release_identity.py`,
 `scripts/tests/test_gradle_wrapper_checksum.py`,
-`.github/workflows/pr-check.yml`) outputs. The `policy` list ends with a
+`scripts/tests/test_verify_jdk_floor.py`,
+`.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`,
+`.github/workflows/nightly-instrumented.yml`) outputs. The `policy` list ends with a
 trailing `- 'scripts/**'` catch-all: the explicit entries above mirror the
 full filter in `pr-check.yml` (no silent drift between docs and workflow),
 they exist for readability/history, and the catch-all defaults any new
@@ -43,7 +47,8 @@ Changes under `gradle/wrapper/**` also set `policy`, so wrapper checksum
 regressions run even when no script changes. The wrapper harness and Gradle
 jobs both depend on `changes` and can run in parallel: the harness contributes
 to the `pr-gate` merge decision, but is not a pre-execution defense preventing
-Gradle from running a changed wrapper. `docs-guard` always runs
+Gradle from running a changed wrapper. `docs-guard` has no path filter in a
+triggered workflow run; it is not triggered for other branches by itself. It runs
 `scripts/tests/test_dependabot_config.py` to validate Dependabot coverage and
 the docs dependency pin, then runs the
 fixture self-test `scripts/test_docs_claim_check.sh` (synthetic repos for each
@@ -173,8 +178,9 @@ What runs by edit type:
 - Bot-only (`bot == true` and neither `code` nor `policy`, e.g. `github_bot/**` edits including its README, or `.github/workflows/pocketguard.yml`): runs `PocketGuard Bot Tests` (`bot-tests`) setting up Node.js via `node-version-file: 'github_bot/.nvmrc'` (24.22.1), running `npm ci --ignore-scripts`, `npm test`, and `npm run build`; `changes`, `docs-guard`, and `pr-gate` still run; Gradle stages are skipped.
 - Policy-script-only (any `policy` path edit, `code == false`): build/policy and the stdlib Python policy harness run; unit tests and lint are skipped and resolved as pass by `pr-gate`. The harness runs both the Python unit tests AND the repo-wide `python3 scripts/check_test_budgets.py` scan (PR #87 P2-4: script-only diffs skip the `unit-tests` job that otherwise hosts that gate, so the scan is wired into `policy-harness` too — pinned by `PolicyCiGateControl.test_policy_harness_runs_repo_budget_guard`). A scanner-only diff therefore cannot pass with all policy validation skipped.
 - Workflow-only edit to `pr-check.yml`: counts as `code`, `policy`, and `bot`, so all Gradle stages, the Python policy harness, and the bot tests run. The harness pin tests therefore execute exactly when the wiring they validate changes. Editing `.github/workflows/codeql.yml` or `.github/workflows/nightly-instrumented.yml` counts as `policy` (both invoke `scripts/verify_jdk_floor.sh --require-vendor Temurin`), so the policy harness re-runs.
-- Mixed docs + code/policy edits: full Gradle stages plus `docs-guard` run.
-- Stacked PRs (base is not `main`, e.g. a fix branch targeting a feature branch): `pr-check.yml` only triggers on `main`, so no PR Check runs attach to the stacked PR itself — verification rests on local runs (base SHA, exact commands, exit status recorded) plus `workflow_dispatch` evidence; merging the stack into the feature branch re-enters that branch's own `main`-targeted gate, which is where the three-flavor green must be observed before closing the related issue.
+- Mixed docs + code edits (`code == true`): all Gradle stages and `docs-guard` run; the policy harness and bot tests also run if their respective filters match.
+- Mixed docs + policy-only edits (`policy == true`, `code == false`): build/policy, the policy harness, and `docs-guard` run; unit tests and lint are skipped. Bot tests also run if `bot == true`.
+- Stacked PRs (base is not `main`, e.g. a fix branch targeting a feature branch): no PR Check run attaches to the stacked PR itself. Record local runs (base SHA, exact commands and exit status); `pr-check.yml` cannot be dispatched manually. Once the feature branch has a PR targeting `main`, observe the applicable gate there before closing the related issue.
 
 Static analysis lives outside `pr-check.yml`: CodeQL runs in
 `.github/workflows/codeql.yml`, which skips docs-only push/PR events via
@@ -646,6 +652,30 @@ cd github_bot && npm ci --ignore-scripts && npm test && npm run build && cd ..
 scripts/play_policy_check.sh app/build/outputs/apk/play/debug/app-play-debug.apk
 scripts/play_policy_check.sh --foss app/build/outputs/apk/foss/debug/app-foss-debug.apk
 scripts/play_policy_check.sh --github app/build/outputs/apk/github/debug/app-github-debug.apk
+```
+
+For release artifact policy, run the following from the repository root after
+the successful six-variant assembly above. Use fresh outputs from the tested
+commit (do not rely on old APKs). This mirrors CI's release glob and its
+Play/Foss gates; the GitHub shell gate also performs the common source-manifest
+scan that CI runs in its GitHub debug step. It runs the same mode-independent
+artifact checks for each GitHub release APK. Install Android SDK build-tools
+with `aapt` and `dexdump` available as described by the policy script; missing
+tools or APKs fail rather than skip. The subshell stops on the first failure.
+
+```sh
+(
+  set -eu
+  for flavor in play foss github; do
+    set -- app/build/outputs/apk/"$flavor"/release/*.apk
+    [ -f "$1" ] || { echo "No release APK for $flavor" >&2; exit 1; }
+    case "$flavor" in
+      play) scripts/play_policy_check.sh "$@" ;;
+      foss) scripts/play_policy_check.sh --foss "$@" ;;
+      github) scripts/play_policy_check.sh --github "$@" ;;
+    esac
+  done
+)
 ```
 
 Release-acceptance helpers (Issue #12, local-only, no secrets, no publishing;

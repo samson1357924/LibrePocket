@@ -467,6 +467,22 @@ class TurnControllerResourceExhaustedTest {
       ProviderErrorClassifier.classify(null, null, "error: sse_total_too_large: wire bytes exceeded"),
     )
     assertEquals(
+      FailureKind.FATAL,
+      ProviderErrorClassifier.classify(null, java.io.IOException("attempt_deadline_exceeded"), null),
+    )
+    assertEquals(
+      FailureKind.FATAL,
+      ProviderErrorClassifier.classify(null, java.io.IOException("sse_total_too_large"), null),
+    )
+    assertEquals(
+      FailureKind.FATAL,
+      ProviderErrorClassifier.classify(null, java.io.IOException("wrap", java.io.IOException("attempt_deadline_exceeded")), null),
+    )
+    assertEquals(
+      FailureKind.FATAL,
+      ProviderErrorClassifier.classify(null, java.io.IOException("wrap", java.io.IOException("sse_total_too_large")), null),
+    )
+    assertEquals(
       ProviderFailureCode.DEADLINE_EXCEEDED.name,
       inferAggFailureCodeName("ATTEMPT_DEADLINE_EXCEEDED"),
     )

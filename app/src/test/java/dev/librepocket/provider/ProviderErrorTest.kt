@@ -1,6 +1,7 @@
 package dev.librepocket.provider
 
 import java.io.EOFException
+import java.io.IOException
 import java.net.MalformedURLException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
@@ -129,6 +130,34 @@ class ProviderErrorTest {
         assertEquals(
             FailureKind.FATAL,
             ProviderErrorClassifier.classify(null, IllegalArgumentException("bad url"), null),
+        )
+    }
+
+    @Test
+    fun ioExceptionsWithFatalMarkersEvaluateToFatal() {
+        assertEquals(
+            FailureKind.FATAL,
+            ProviderErrorClassifier.classify(null, IOException("attempt_deadline_exceeded"), null),
+        )
+        assertEquals(
+            FailureKind.FATAL,
+            ProviderErrorClassifier.classify(null, IOException("sse_total_too_large"), null),
+        )
+        assertEquals(
+            FailureKind.FATAL,
+            ProviderErrorClassifier.classify(
+                null,
+                IOException("wrapped transport error", IOException("attempt_deadline_exceeded")),
+                null,
+            ),
+        )
+        assertEquals(
+            FailureKind.FATAL,
+            ProviderErrorClassifier.classify(
+                null,
+                IOException("wrapped transport error", IOException("sse_total_too_large")),
+                null,
+            ),
         )
     }
 

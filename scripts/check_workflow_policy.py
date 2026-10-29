@@ -88,7 +88,7 @@ ALLOWED_WORKFLOW_FILES = frozenset(
 # same reviewed PR as any intentional workflow edit; never in a separate
 # "make CI green" change. This pin is a regression guard, not tamper-proof.
 EXPECTED_WORKFLOW_SHA256 = {
-    "codeql.yml": "1f37e9b4fe81cd4b5024302a4b06d16ff51b585ef764ee3b539f9c054398866a",
+    "codeql.yml": "577d533577144ac77f9a249893859485e6d733bec18ebd0bab15ef5fe42cee9e",
     "nightly-instrumented.yml": (
         "ca9c43a47b238b63a5ddf18e75e9f1436dcf9c00b0a4345e9cab0ba36db7360b"
     ),

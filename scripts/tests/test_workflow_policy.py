@@ -1965,7 +1965,7 @@ jobs:
             "codeql.yml",
             CODEQL.replace(
                 "        uses: github/codeql-action/init@"
-                "9f759ee644a3e7c15c1390abf49868036c00067b # v3.38.3\n",
+                "9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1\n",
                 "        run: 'true'\n",
                 1,
             ),

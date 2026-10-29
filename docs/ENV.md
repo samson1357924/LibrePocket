@@ -60,11 +60,13 @@ Install the matching Android platforms and build tools required by the wrapper/b
 ## Node.js (PocketGuard Bot)
 
 Requires Node.js `^24.22.1` (or `>= 26.12.1` if running Node 26) to enforce the
-October 2026 security release (see Node.js security release:
-https://nodejs.org/en/blog/release/v24.22.1/). `github_bot/.nvmrc` pins 24.22.1
-as the baseline for CI workflows (via `node-version-file: 'github_bot/.nvmrc'`)
-and local development. `github_bot/.npmrc` sets `engine-strict=true` to reject
-installs on incompatible Node engines.
+October 2026 security release addressing CVE-2026-105482, CVE-2026-105483,
+CVE-2026-106069, CVE-2026-111497 (Brotli RCE), and Undici vulnerabilities
+(see Node.js security release: https://nodejs.org/en/blog/release/v24.22.1/).
+`github_bot/.nvmrc` pins 24.22.1 as the baseline for CI workflows (via
+`node-version-file: 'github_bot/.nvmrc'`) and local development.
+`github_bot/.npmrc` sets `engine-strict=true` to reject installs on
+incompatible Node engines.
 
 ```sh
 cd github_bot && nvm install && nvm use && node -v

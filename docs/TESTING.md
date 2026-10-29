@@ -14,9 +14,9 @@ only; it has no `workflow_dispatch` trigger. Within a triggered run, a
 `changes` job classifies changed paths
 with `dorny/paths-filter` into `code` (`app/src/**`,
 `app/build.gradle.kts`, `app/lint.xml`, `gradle/**`,
-`settings.gradle.kts`, `build.gradle.kts`, `gradle.properties`,
+`settings.gradle.kts`, `build.gradle.kts`, `gradle.properties`, `gradlew`, `gradlew.bat`,
 `.github/workflows/pr-check.yml`) and `policy`
-(`gradle/wrapper/**`, `scripts/play_policy_check.sh`, `scripts/apk_policy_inspect.py`,
+(`gradle/wrapper/**`, `gradlew`, `gradlew.bat`, `scripts/play_policy_check.sh`, `scripts/apk_policy_inspect.py`,
 `scripts/backup_rules_check.py`,
 `scripts/nsc_check.py`,
 `scripts/summarize_junit.py`, `scripts/check_test_budgets.py`,
@@ -36,18 +36,31 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `scripts/tests/test_gradle_wrapper_checksum.py`,
 `scripts/tests/test_verify_jdk_floor.py`,
 `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`,
-`.github/workflows/nightly-instrumented.yml`) outputs. The `policy` list ends with a
-trailing `- 'scripts/**'` catch-all: the explicit entries above mirror the
-full filter in `pr-check.yml` (no silent drift between docs and workflow),
+`.github/workflows/nightly-instrumented.yml`, `.github/workflows/**`, and
+`scripts/**`) outputs. The `policy` list includes workflow and script catch-alls:
+the explicit entries above mirror the filter in `pr-check.yml`,
 they exist for readability/history, and the catch-all defaults any new
 `scripts/` harness code (checker or script test) into the gate with no
 filter edit (`PolicyCiGateControl` pins the catch-all in the parsed filter
 list and never parses this document).
-Changes under `gradle/wrapper/**` also set `policy`, so wrapper checksum
-regressions run even when no script changes. The wrapper harness and Gradle
-jobs both depend on `changes` and can run in parallel: the harness contributes
-to the `pr-gate` merge decision, but is not a pre-execution defense preventing
-Gradle from running a changed wrapper. `docs-guard` has no path filter in a
+Changes under `gradle/wrapper/**` and either root launcher select both `code`
+and `policy`; changes to `scripts/verify_gradle_wrapper.py` select `policy`
+through the scripts catch-all. The wrapper harness and Gradle jobs can run in
+parallel, but each Gradle job independently runs `python3
+scripts/verify_gradle_wrapper.py` before invoking the wrapper. The same check
+precedes Gradle in CodeQL and both nightly jobs. It pins exact bytes of
+`gradlew`, `gradlew.bat`, the wrapper JAR and the entire properties file,
+including its distribution URL and checksum. This is a consistency check, not
+a trust boundary: the checker, pins, workflow and wrapper come from the same PR
+checkout, so coordinated malicious modifications are not prevented. The wrapper
+harness independently pins literal property lines and whole-file digests; it
+does not parse Java properties semantics. Its workflow snapshots detect changes
+to workflow files, not modifications to indirectly invoked scripts that can run
+before the guard. Manually review those scripts and their execution order, as
+well as workflow changes. It does
+not verify resolved dependencies, and the local `scripts/build_release.sh` is
+not covered by these CI checks. For reviewed updates see the [wrapper update
+protocol](ENV.md#supply-chain-and-dependency-update-policy). `docs-guard` has no path filter in a
 triggered workflow run; it is not triggered for other branches by itself. It runs
 `scripts/tests/test_dependabot_config.py` to validate Dependabot coverage and
 the docs dependency pin, then runs the
@@ -175,9 +188,9 @@ gates are retained (defense in depth, still reject wasteful huge loops).
 What runs by edit type:
 
 - Docs-only (neither `code`, `policy`, nor `bot`, e.g. `docs/**` or root `*.md` edits): unit tests, lint, and build/policy are skipped; `docs-guard` and `pr-gate` still run.
-- Bot-only (`bot == true` and neither `code` nor `policy`, e.g. `github_bot/**` edits including its README, or `.github/workflows/pocketguard.yml`): runs `PocketGuard Bot Tests` (`bot-tests`) setting up Node.js via `node-version-file: 'github_bot/.nvmrc'` (24.22.1), running `npm ci --ignore-scripts`, `npm test`, and `npm run build`; `changes`, `docs-guard`, and `pr-gate` still run; Gradle stages are skipped.
+- Bot-only (`bot == true` and neither `code` nor `policy`, e.g. `github_bot/**` edits including its README): runs `PocketGuard Bot Tests` (`bot-tests`) setting up Node.js via `node-version-file: 'github_bot/.nvmrc'` (24.22.1), running `npm ci --ignore-scripts`, `npm test`, and `npm run build`; `changes`, `docs-guard`, and `pr-gate` still run; Gradle stages are skipped.
 - Policy-script-only (any `policy` path edit, `code == false`): build/policy and the stdlib Python policy harness run; unit tests and lint are skipped and resolved as pass by `pr-gate`. The harness runs both the Python unit tests AND the repo-wide `python3 scripts/check_test_budgets.py` scan (PR #87 P2-4: script-only diffs skip the `unit-tests` job that otherwise hosts that gate, so the scan is wired into `policy-harness` too — pinned by `PolicyCiGateControl.test_policy_harness_runs_repo_budget_guard`). A scanner-only diff therefore cannot pass with all policy validation skipped.
-- Workflow-only edit to `pr-check.yml`: counts as `code`, `policy`, and `bot`, so all Gradle stages, the Python policy harness, and the bot tests run. The harness pin tests therefore execute exactly when the wiring they validate changes. Editing `.github/workflows/codeql.yml` or `.github/workflows/nightly-instrumented.yml` counts as `policy` (both invoke `scripts/verify_jdk_floor.sh --require-vendor Temurin`), so the policy harness re-runs.
+- Workflow-only edit to `pr-check.yml`: counts as `code`, `policy`, and `bot`, so all Gradle stages, the Python policy harness, and the bot tests run. Any `.github/workflows/**` edit selects `policy`, including `codeql.yml`, `nightly-instrumented.yml`, and new workflows; `pocketguard.yml` also selects `bot`. The workflow snapshot detects workflow file changes, but not changes to indirectly invoked scripts; manual review remains necessary.
 - Mixed docs + code edits (`code == true`): all Gradle stages and `docs-guard` run; the policy harness and bot tests also run if their respective filters match.
 - Mixed docs + policy-only edits (`policy == true`, `code == false`): build/policy, the policy harness, and `docs-guard` run; unit tests and lint are skipped. Bot tests also run if `bot == true`.
 - Stacked PRs (base is not `main`, e.g. a fix branch targeting a feature branch): no PR Check run attaches to the stacked PR itself. Record local runs (base SHA, exact commands and exit status); `pr-check.yml` cannot be dispatched manually. Once the feature branch has a PR targeting `main`, observe the applicable gate there before closing the related issue.
@@ -607,6 +620,8 @@ reviewer-side judgment on the report, not an assertion the reporter makes.
 
 Use one Gradle execution at a time on constrained machines. The repo's maintenance guidance requires `--max-workers=1 --no-daemon`; do not run a parallel flavor matrix after an OOM.
 
+For Python dependency updates, follow the [Python docs guard update protocol](ENV.md#supply-chain-and-dependency-update-policy), including independent hash and artifact-coverage review. The docs checks below require PyYAML. Use a fresh virtual environment for the hash-enforced install: pip does not reverify already-installed packages against the requirements hashes.
+
 ```sh
 # Synthetic APK/DEX policy, release identity, and JDK floor harnesses (Python stdlib only)
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
@@ -623,9 +638,22 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
 python3 scripts/check_test_budgets.py
 python3 scripts/check_junit_durations.py
 
-# Docs/claims guard and its fixture self-test (static, no Gradle)
-bash scripts/docs_claim_check.sh
-bash scripts/test_docs_claim_check.sh
+# Check wrapper bytes against reviewed pins before local Gradle execution
+python3 scripts/verify_gradle_wrapper.py
+
+# Docs dependency and configuration checks (static, no Gradle)
+(
+  set -eu
+  docs_venv_dir="$(mktemp -d "${TMPDIR:-/tmp}/librepocket-docs.XXXXXXXX")"
+  python3 -m venv "$docs_venv_dir/venv"
+  "$docs_venv_dir/venv/bin/python" -m pip install --require-hashes -r scripts/requirements-docs.txt
+  PATH="$docs_venv_dir/venv/bin:$PATH"
+  export PATH
+  PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_dependabot_config.py
+  bash scripts/docs_claim_check.sh
+  bash scripts/test_docs_claim_check.sh
+  echo "Fresh docs environment retained at $docs_venv_dir"
+)
 
 # JDK security floor check for CVE-2026-91403 and CVE-2026-114820
 # (Temurin vendor + floor 25.0.5+8)

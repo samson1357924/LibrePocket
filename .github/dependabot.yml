@@ -24,6 +24,9 @@ updates:
     commit-message:
       prefix: "chore(bot)"
 
+  # PyYAML updates also require the independent workflow version assertion to
+  # be updated and hashes reviewed; CI may fail until the assertion is amended.
+  # See docs/ENV.md's Python update protocol.
   - package-ecosystem: "pip"
     directory: "/scripts"
     schedule:

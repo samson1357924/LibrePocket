@@ -12,7 +12,7 @@ compileSdk = "37"
 targetSdk = "36"
 minSdk = "33"
 # Networking (streaming HTTP, e.g. SSE)
-okhttpSse = "5.5.0"
+okhttpSse = "5.5.1"
 okhttpTls = "5.5.0"
 # Local persistence
 room = "2.8.5"

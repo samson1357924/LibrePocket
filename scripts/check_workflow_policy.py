@@ -102,7 +102,7 @@ EXPECTED_WORKFLOW_SHA256 = {
         "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f"
     ),
     "security-audit.yml": (
-        "f836a7d3ed4daf6ecec33baf577375bca6504513d54c89e2d2cb6da4d5d83bfa"
+        "96e9683768cb2bc6f1974d2aac2033cac51895fe68669a8f14c0fef630b36e01"
     ),
 }
 

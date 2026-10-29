@@ -1953,7 +1953,7 @@ jobs:
             "security-audit.yml",
             SECURITY_AUDIT.replace(
                 "        uses: gitleaks/gitleaks-action@"
-                "ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9\n",
+                "e0c47f4fc60447087851a4f009ee13d80093635a # v3.0.0\n",
                 "        run: 'true'\n",
                 1,
             ),
@@ -2087,9 +2087,9 @@ jobs:
             "security-audit.yml",
             SECURITY_AUDIT.replace(
                 "        uses: actions/dependency-review-action@"
-                "2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0\n",
+                "a1d282b3dbe92b7fb3f84860b295be1522f74154 # v5.0.0\n",
                 "        uses: actions/dependency-review-action@"
-                "2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0\n"
+                "a1d282b3dbe92b7fb3f84860b295be1522f74154 # v5.0.0\n"
                 "        with:\n          fail-on-severity: low\n",
                 1,
             ),

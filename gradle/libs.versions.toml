@@ -16,7 +16,7 @@ okhttpSse = "5.5.0"
 okhttpTls = "5.5.0"
 # Local persistence
 room = "2.8.5"
-datastore = "1.2.1"
+datastore = "1.3.0"
 # Encrypted storage
 securityCrypto = "1.1.0"
 # Structured text codec (session JSONL export/import)

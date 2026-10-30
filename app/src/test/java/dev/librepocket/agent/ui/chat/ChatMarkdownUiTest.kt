@@ -7,6 +7,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
@@ -31,6 +34,7 @@ import dev.librepocket.chat.UiMessage
 import dev.librepocket.voice.VoiceTts
 import java.util.Locale
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -160,6 +164,47 @@ class ChatMarkdownUiTest {
         // Verify copy feedback and clipboard contents
         composeRule.onNodeWithText(copiedText).assertIsDisplayed()
         assertEquals(codeText, fakeClipboard.getText()?.text)
+    }
+
+    @Test
+    fun codeBlockView_copyButton_autoResetsAfterTwoSeconds() {
+        val fakeClipboard = FakeClipboardManager()
+        val codeText = "val x = 42"
+        val block = ChatContentBlock.CodeBlock(
+            language = "kotlin",
+            code = codeText,
+            isStreaming = false,
+        )
+
+        composeRule.setContent {
+            CompositionLocalProvider(LocalClipboardManager provides fakeClipboard) {
+                MaterialTheme {
+                    CodeBlockView(block = block)
+                }
+            }
+        }
+
+        val copyText = context.getString(R.string.chat_code_copy)
+        val copiedText = context.getString(R.string.chat_code_copied)
+
+        // Initially displays "Copy"
+        composeRule.onNodeWithText(copyText).assertIsDisplayed()
+        composeRule.onNodeWithText(copiedText).assertDoesNotExist()
+
+        // Click "Copy" button
+        composeRule.onNodeWithText(copyText).performClick()
+
+        // Displays "Copied" and writes to clipboard
+        composeRule.onNodeWithText(copiedText).assertIsDisplayed()
+        composeRule.onNodeWithText(copyText).assertDoesNotExist()
+        assertEquals(codeText, fakeClipboard.getText()?.text)
+
+        // Advance virtual time by 2000ms
+        composeRule.mainClock.advanceTimeBy(2000)
+
+        // Automatically resets back to "Copy"
+        composeRule.onNodeWithText(copyText).assertIsDisplayed()
+        composeRule.onNodeWithText(copiedText).assertDoesNotExist()
     }
 
     @Test
@@ -315,6 +360,149 @@ class ChatMarkdownUiTest {
     }
 
     @Test
+    fun messageBubble_thinkingWithAttributes_rendersThinkingAndBody_speaksOnlyBodyText() {
+        val msg = UiMessage(
+            id = "msg-attr-thinking",
+            role = "assistant",
+            text = "<think id=\"1\">內心思考</think>回答正文",
+            isPartial = false,
+        )
+        var spokenId: String? = null
+        var spokenText: String? = null
+
+        composeRule.setContent {
+            MaterialTheme {
+                MessageBubble(
+                    msg = msg,
+                    showSpeak = true,
+                    onSpeak = { id, text ->
+                        spokenId = id
+                        spokenText = text
+                    },
+                )
+            }
+        }
+
+        val thinkingTitle = context.getString(R.string.chat_thinking_title)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+
+        // UI renders ThinkingBlock title and answer body
+        composeRule.onNodeWithText(thinkingTitle).assertIsDisplayed()
+        composeRule.onNodeWithText("回答正文").assertIsDisplayed()
+
+        // Verify ThinkingBlock content can be expanded and inspected
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("內心思考").assertDoesNotExist()
+
+        composeRule.onNodeWithText(thinkingTitle).performClick()
+        composeRule.onNodeWithText("內心思考").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+
+        // TTS button is displayed
+        composeRule.onNodeWithContentDescription(VoiceTts.SPEAK_BUTTON_DESCRIPTION).assertIsDisplayed()
+
+        // Click TTS button: spoken text must strictly contain only "回答正文" without thinking tags or content
+        composeRule.onNodeWithContentDescription(VoiceTts.SPEAK_BUTTON_DESCRIPTION).performClick()
+        assertEquals("msg-attr-thinking", spokenId)
+        assertEquals("回答正文", spokenText)
+    }
+
+    @Test
+    fun messageBubble_pureThinkingWithAttributes_doesNotShowSpeakButton() {
+        val msg = UiMessage(
+            id = "msg-secret-thought",
+            role = "assistant",
+            text = "<thought status=\"secret\">純機密思考</thought>",
+            isPartial = false,
+        )
+        var speakInvoked = false
+
+        composeRule.setContent {
+            MaterialTheme {
+                MessageBubble(
+                    msg = msg,
+                    showSpeak = true,
+                    onSpeak = { _, _ ->
+                        speakInvoked = true
+                    },
+                )
+            }
+        }
+
+        val thinkingTitle = context.getString(R.string.chat_thinking_title)
+
+        // UI renders ThinkingBlock title
+        composeRule.onNodeWithText(thinkingTitle).assertIsDisplayed()
+
+        // Verify thinking content inside block
+        composeRule.onNodeWithText(thinkingTitle).performClick()
+        composeRule.onNodeWithText("純機密思考").assertIsDisplayed()
+
+        // TTS button must strictly NOT be displayed (Fail-Closed)
+        composeRule.onNodeWithContentDescription(VoiceTts.SPEAK_BUTTON_DESCRIPTION).assertDoesNotExist()
+        assertFalse(speakInvoked)
+    }
+
+    @Test
+    fun messageBubble_thinkingWithWhitespaceAndAttributes_rendersUIAndSuppressesTtsProperly() {
+        val msg = UiMessage(
+            id = "msg-whitespace-attr",
+            role = "assistant",
+            text = "<think   id=\"1\"  >內心思考</think   >回答正文",
+            isPartial = false,
+        )
+        var spokenId: String? = null
+        var spokenText: String? = null
+
+        composeRule.setContent {
+            MaterialTheme {
+                MessageBubble(
+                    msg = msg,
+                    showSpeak = true,
+                    onSpeak = { id, text ->
+                        spokenId = id
+                        spokenText = text
+                    },
+                )
+            }
+        }
+
+        val thinkingTitle = context.getString(R.string.chat_thinking_title)
+
+        composeRule.onNodeWithText(thinkingTitle).assertIsDisplayed()
+        composeRule.onNodeWithText("回答正文").assertIsDisplayed()
+
+        composeRule.onNodeWithContentDescription(VoiceTts.SPEAK_BUTTON_DESCRIPTION).assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(VoiceTts.SPEAK_BUTTON_DESCRIPTION).performClick()
+
+        assertEquals("msg-whitespace-attr", spokenId)
+        assertEquals("回答正文", spokenText)
+    }
+
+    @Test
+    fun messageBubble_pureThinkingWithWhitespaceInTags_doesNotShowSpeakButton() {
+        val msg = UiMessage(
+            id = "msg-whitespace-pure",
+            role = "assistant",
+            text = "<thinking   >純空白思考</thinking   >",
+            isPartial = false,
+        )
+
+        composeRule.setContent {
+            MaterialTheme {
+                MessageBubble(
+                    msg = msg,
+                    showSpeak = true,
+                )
+            }
+        }
+
+        composeRule.onNodeWithText(context.getString(R.string.chat_thinking_title)).assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(VoiceTts.SPEAK_BUTTON_DESCRIPTION).assertDoesNotExist()
+    }
+
+    @Test
     fun messageBubble_userRole_doesNotShowSpeakButton() {
         val msg = UiMessage(
             id = "msg-user",
@@ -377,6 +565,123 @@ class ChatMarkdownUiTest {
         // Now collapsed even though isStreaming is true
         composeRule.onNodeWithText("Streaming steps... ▍").assertDoesNotExist()
         composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+    }
+
+    @Test
+    fun thinkingBlockView_streamingTransition_autoCollapsesWhenNoUserIntervention() {
+        var block by mutableStateOf(
+            ChatContentBlock.ThinkingBlock(
+                content = "Analyzing the algorithm...",
+                isStreaming = true,
+            )
+        )
+
+        composeRule.setContent {
+            MaterialTheme {
+                ThinkingBlockView(block = block)
+            }
+        }
+
+        val title = context.getString(R.string.chat_thinking_title)
+        val inProgress = context.getString(R.string.chat_thinking_in_progress)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+
+        // During streaming: initially expanded by default
+        composeRule.onNodeWithText(title).assertIsDisplayed()
+        composeRule.onNodeWithText(inProgress).assertIsDisplayed()
+        composeRule.onNodeWithText("Analyzing the algorithm... ▍").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+
+        // Transition: streaming finishes without user intervention
+        block = block.copy(isStreaming = false)
+
+        // Automatically transitions to collapsed state
+        composeRule.onNodeWithText(title).assertIsDisplayed()
+        composeRule.onNodeWithText(inProgress).assertDoesNotExist()
+        composeRule.onNodeWithText("Analyzing the algorithm... ▍").assertDoesNotExist()
+        composeRule.onNodeWithText("Analyzing the algorithm...").assertDoesNotExist()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+    }
+
+    @Test
+    fun thinkingBlockView_streamingTransition_preservesUserPreferenceWhenManuallyExpandedOrCollapsed() {
+        var block by mutableStateOf(
+            ChatContentBlock.ThinkingBlock(
+                content = "Reasoning step 1...",
+                isStreaming = true,
+            )
+        )
+
+        composeRule.setContent {
+            MaterialTheme {
+                ThinkingBlockView(block = block)
+            }
+        }
+
+        val title = context.getString(R.string.chat_thinking_title)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+
+        // 1. Manually collapse during streaming
+        composeRule.onNodeWithText("Reasoning step 1... ▍").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithText("Reasoning step 1... ▍").assertDoesNotExist()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+
+        // Transition to non-streaming: user's collapsed preference is preserved
+        block = block.copy(isStreaming = false)
+        composeRule.onNodeWithText("Reasoning step 1...").assertDoesNotExist()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+
+        // 2. Manually expand while non-streaming
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithText("Reasoning step 1...").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+
+        // Subsequent update preserves user's expanded preference
+        block = block.copy(content = "Reasoning step 1 completed")
+        composeRule.onNodeWithText("Reasoning step 1 completed").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+    }
+
+    @Test
+    fun thinkingBlockView_streamingTransition_manualExpandDuringStreaming_remainsExpandedAfterStreamingStops() {
+        var block by mutableStateOf(
+            ChatContentBlock.ThinkingBlock(
+                content = "Detailed chain-of-thought...",
+                isStreaming = true,
+            )
+        )
+
+        composeRule.setContent {
+            MaterialTheme {
+                ThinkingBlockView(block = block)
+            }
+        }
+
+        val title = context.getString(R.string.chat_thinking_title)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+
+        // Initially expanded during streaming
+        composeRule.onNodeWithText("Detailed chain-of-thought... ▍").assertIsDisplayed()
+
+        // User clicks to collapse then clicks to explicitly re-expand (userExpanded becomes true)
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("Detailed chain-of-thought... ▍").assertIsDisplayed()
+
+        // Transition from streaming to non-streaming:
+        // Unlike default (which collapses when userExpanded is null), userExpanded is true, so it remains expanded!
+        block = block.copy(isStreaming = false)
+
+        composeRule.onNodeWithText("Detailed chain-of-thought...").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
     }
 
     @Test

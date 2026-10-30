@@ -1,5 +1,12 @@
 package dev.librepocket.agent.ui.chat
 
+import android.content.ContentProvider
+import android.content.ContentValues
+import android.content.pm.ProviderInfo
+import android.database.Cursor
+import android.net.Uri
+import android.os.Looper
+import android.os.ParcelFileDescriptor
 import androidx.test.core.app.ApplicationProvider
 import dev.librepocket.session.LibrePocketDb
 import dev.librepocket.session.RoomSessionStore
@@ -7,6 +14,8 @@ import dev.librepocket.session.TranscriptEvent
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileNotFoundException
+import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -23,7 +32,9 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowContentResolver
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
@@ -65,6 +76,153 @@ class SessionListViewModelTest {
         text = text,
         createdAt = now,
     )
+
+    class ExportProvider : ContentProvider() {
+        lateinit var destination: File
+        var rejectTruncate = false
+        val modes = mutableListOf<String>()
+
+        override fun onCreate() = true
+        override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
+            modes.add(mode)
+            if (rejectTruncate && mode == "wt") throw FileNotFoundException("unsupported mode")
+            return ParcelFileDescriptor.open(destination, ParcelFileDescriptor.parseMode(mode))
+        }
+        override fun query(uri: Uri, projection: Array<out String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): Cursor? = null
+        override fun getType(uri: Uri): String? = null
+        override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+        override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?) = 0
+        override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?) = 0
+    }
+
+    private fun awaitExport(completed: () -> Boolean) {
+        val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10)
+        while (!completed() && System.nanoTime() < deadline) {
+            shadowOf(Looper.getMainLooper()).idle()
+            Thread.sleep(10)
+        }
+        shadowOf(Looper.getMainLooper()).idle()
+        assertTrue("export callback timed out", completed())
+    }
+
+    private fun registerExportProvider(authority: String, provider: ExportProvider) {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        provider.attachInfo(context, ProviderInfo().apply { this.authority = authority })
+        ShadowContentResolver.registerProviderInternal(authority, provider)
+    }
+
+    @Test
+    fun exportUri_truncatesExistingProviderDocument(): Unit = runBlocking {
+        val sid = store.createSession("Title", "model")
+        store.appendEvent(event(sid))
+        val expected = File(tmpDir, "expected").also { store.exportJsonl(sid, it) }.readBytes()
+        val destination = File(tmpDir, "document").apply { writeBytes(ByteArray(expected.size + 1000) { 'x'.code.toByte() }) }
+        val provider = ExportProvider().apply { this.destination = destination }
+        registerExportProvider("export.test", provider)
+        val resolver = ApplicationProvider.getApplicationContext<android.content.Context>().contentResolver
+        var success = false
+        var failure: Throwable? = null
+
+        viewModel.exportUri(sid, Uri.parse("content://export.test/document"), resolver, tmpDir,
+            onSuccess = { success = true }, onError = { failure = it })
+        awaitExport { success || failure != null }
+
+        assertEquals(null, failure)
+        assertTrue(success)
+        assertEquals(listOf("wt"), provider.modes)
+        val actual = destination.readBytes()
+        assertEquals("randomized IDs have fixed length; no old tail may remain", expected.size, actual.size)
+        val expectedEvent = dev.librepocket.session.JsonlCodec.decode(1, expected.toString(Charsets.UTF_8).trimEnd())
+        val actualEvent = dev.librepocket.session.JsonlCodec.decode(1, actual.toString(Charsets.UTF_8).trimEnd())
+        assertTrue(actualEvent.runId.matches(Regex("[a-p]{32}")))
+        assertEquals(expectedEvent.copy(runId = actualEvent.runId), actualEvent)
+        assertEquals(ExportUiState.Success, viewModel.exportState.value)
+    }
+
+    @Test
+    fun exportUri_unsupportedTruncateFailsWithoutFallback(): Unit = runBlocking {
+        val sid = store.createSession("Title", "model")
+        store.appendEvent(event(sid))
+        val original = "old document with a tail"
+        val destination = File(tmpDir, "document").apply { writeText(original) }
+        val provider = ExportProvider().apply { this.destination = destination; rejectTruncate = true }
+        registerExportProvider("export.unsupported", provider)
+        val resolver = ApplicationProvider.getApplicationContext<android.content.Context>().contentResolver
+        var success = false
+        var failure: Throwable? = null
+
+        viewModel.exportUri(sid, Uri.parse("content://export.unsupported/document"), resolver, tmpDir,
+            onSuccess = { success = true }, onError = { failure = it })
+        awaitExport { success || failure != null }
+
+        assertFalse(success)
+        assertTrue(failure is IOException)
+        assertTrue((viewModel.exportState.value as ExportUiState.Error).message.contains("截斷寫入"))
+        assertEquals(listOf("wt"), provider.modes)
+        assertEquals(original, destination.readText())
+        assertEquals(listOf("document"), tmpDir.list()!!.toList())
+    }
+
+    @Test
+    fun exportAfterTruncation_writeAndCloseFailuresLeavePartialDestinationAndFail(): Unit = runBlocking {
+        val sid = store.createSession("Title", "model")
+        store.appendEvent(event(sid))
+        for (failOnClose in listOf(false, true)) {
+            val destination = File(tmpDir, "document").apply { writeText("old content that must be truncated") }
+            val file = FileOutputStream(destination, false) // model the provider's successful wt open
+            val output = object : OutputStream() {
+                override fun write(b: Int) { file.write(b) }
+                override fun write(b: ByteArray, off: Int, len: Int) {
+                    if (failOnClose) file.write(b, off, len) else {
+                        file.write(b, off, minOf(8, len))
+                        throw IOException("write failed")
+                    }
+                }
+                override fun close() { file.close(); if (failOnClose) throw IOException("close failed") }
+            }
+            val result = viewModel.exportSessionJsonl(sid, output, tmpDir)
+            assertTrue(result.isFailure)
+            assertTrue(viewModel.exportState.value is ExportUiState.Error)
+            assertTrue(destination.length() > 0)
+            assertFalse(destination.readText().contains("old content"))
+            if (!failOnClose) assertEquals(8L, destination.length())
+            assertEquals(listOf("document"), tmpDir.list()!!.toList())
+        }
+    }
+
+    @Test
+    fun exportAfterTruncation_cancellationLeavesPartialDestinationAndReleasesGate(): Unit = runBlocking {
+        val sid = store.createSession("Title", "model")
+        store.appendEvent(event(sid))
+        val destination = File(tmpDir, "document").apply { writeText("old content") }
+        val file = FileOutputStream(destination, false) // model the provider's successful wt open
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val closed = java.util.concurrent.CountDownLatch(1)
+        val output = object : OutputStream() {
+            override fun write(b: Int) = error("unexpected single-byte write")
+            override fun write(b: ByteArray, off: Int, len: Int) {
+                file.write(b, off, minOf(8, len))
+                entered.countDown()
+                check(closed.await(10, java.util.concurrent.TimeUnit.SECONDS))
+                throw IOException("closed")
+            }
+            override fun close() { file.close(); closed.countDown() }
+        }
+        val job = async(kotlinx.coroutines.Dispatchers.Default) { viewModel.exportSessionJsonl(sid, output, tmpDir) }
+        try {
+            assertTrue(entered.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            job.cancel()
+            try { job.await(); throw AssertionError("expected cancellation") } catch (_: CancellationException) { }
+        } finally {
+            job.cancel()
+            closed.countDown()
+        }
+        assertEquals(ExportUiState.Idle, viewModel.exportState.value)
+        assertEquals(8L, destination.length())
+        assertFalse(destination.readText().contains("old content"))
+        assertEquals(listOf("document"), tmpDir.list()!!.toList())
+        assertTrue(viewModel.exportSessionJsonl(sid, ByteArrayOutputStream(), tmpDir).isSuccess)
+    }
 
     @Test
     fun exportSessionJsonl_successWritesStreamAndCleansUp(): Unit = runBlocking {

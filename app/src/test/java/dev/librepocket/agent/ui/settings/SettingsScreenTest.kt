@@ -56,6 +56,28 @@ class SettingsScreenTest {
     @get:Rule
     val composeRule = createComposeRule()
 
+    @Test
+    fun transcriptBackupWarnsAboutPartialDestinationOnFailureAndCancellation() {
+        var exportState: ExportUiState by mutableStateOf(ExportUiState.Error("write failed"))
+        composeRule.setContent {
+            TranscriptBackupCard(
+                currentSessionId = "session",
+                exportState = exportState,
+                importState = ImportUiState.Idle,
+                onLaunchExport = {}, onLaunchImport = {},
+                exportPickerPending = false, importPickerPending = false,
+                exportPickerFailed = false, importPickerFailed = false,
+                onOpenSession = {},
+            )
+        }
+        val warning = "儲存目的地由文件提供者管理；匯出失敗或取消時，目的地可能留下空檔或部分內容，請自行檢查並刪除。"
+        composeRule.onNodeWithText(warning).assertIsDisplayed()
+        composeRule.onNodeWithText("匯出失敗：write failed").assertIsDisplayed()
+        composeRule.runOnIdle { exportState = ExportUiState.Idle }
+        composeRule.onNodeWithText(warning).assertIsDisplayed()
+        composeRule.onAllNodesWithText("匯出失敗：write failed").assertCountEquals(0)
+    }
+
     private fun readyGate(): EndpointGate.Ready = EndpointGate.Ready(
         EndpointConfig(
             providerId = "preset:openai",

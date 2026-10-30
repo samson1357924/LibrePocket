@@ -7,6 +7,8 @@ import dev.librepocket.redact.Redactor
 import java.io.File
 import java.nio.file.Files
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.joinAll
@@ -255,6 +257,73 @@ class SessionStoreTest {
     }
 
     // ---- JSONL ----
+
+    @Test fun export_missingOrDeletedSessionPreservesDestinationButEmptySessionWorks(): Unit = runBlocking {
+        setUp()
+        val empty = store.createSession("empty", "p/m")
+        val dest = File(tmpDir, "session.jsonl")
+        store.exportJsonl(empty, dest)
+        assertEquals("", dest.readText())
+        store.deleteSession(empty)
+        for (sid in listOf("missing-session", empty)) {
+            dest.writeText("existing")
+            try {
+                store.exportJsonl(sid, dest)
+                fail("missing session must fail")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("unknown session", e.message)
+            }
+            assertEquals("existing", dest.readText())
+            assertEquals(listOf("session.jsonl"), tmpDir.list()!!.sorted())
+        }
+    }
+
+    @Test fun export_invalidEventShapesPreserveDestination(): Unit = runBlocking {
+        setUp()
+        val invalid = listOf(
+            event("unused", kind = "assistant").copy(isFinal = false, isPartial = false),
+            event("unused", kind = "user").copy(imagesOmitted = -1),
+            event("unused", kind = "user").copy(parentRunId = "parent"),
+            event("unused", kind = "user").copy(createdAt = -1),
+        )
+        val dest = File(tmpDir, "invalid.jsonl")
+        for (bad in invalid) {
+            val sid = store.createSession("t", "p/m")
+            store.appendEvent(event(sid, text = "valid first"))
+            store.appendEvent(bad.copy(sessionId = sid))
+            dest.writeText("existing")
+            try {
+                store.exportJsonl(sid, dest)
+                fail("invalid event must fail export")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("import failed at line 2", e.message)
+            }
+            assertEquals("existing", dest.readText())
+            assertEquals(listOf("invalid.jsonl"), tmpDir.list()!!.sorted())
+        }
+    }
+
+    @Test fun export_invalidSequencesIncludingPageBoundaryPreserveDestination(): Unit = runBlocking {
+        setUp()
+        val dest = File(tmpDir, "sequence.jsonl")
+        for (duplicateAtBoundary in listOf(false, true)) {
+            val sid = store.createSession("t", "p/m")
+            if (duplicateAtBoundary) insertLegacyExportRows(sid, RoomSessionStore.EXPORT_PAGE_SIZE, "valid")
+            val seq = if (duplicateAtBoundary) RoomSessionStore.EXPORT_PAGE_SIZE.toLong() else 0L
+            db.sessionDao().insertEvent(TranscriptEventEntity(
+                0, sid, seq, "r", "user", "invalid sequence", false, 0, now, false, null, null, null,
+            ))
+            dest.writeText("existing")
+            try {
+                store.exportJsonl(sid, dest)
+                fail("invalid sequence must fail export")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("export failed: invalid event sequence", e.message)
+            }
+            assertEquals("existing", dest.readText())
+            assertEquals(listOf("sequence.jsonl"), tmpDir.list()!!.sorted())
+        }
+    }
 
     @Test fun export_jsonlLinesParseAsJson(): Unit = runBlocking {
         setUp()
@@ -819,7 +888,6 @@ class SessionStoreTest {
 
     private suspend fun assertExportLimitPreservesDestination(sid: String, expectedMessage: String) {
         val dest = File(tmpDir, "limited.jsonl")
-        val tmp = File(tmpDir, "limited.jsonl.tmp")
         dest.writeText("existing destination", Charsets.UTF_8)
         try {
             store.exportJsonl(sid, dest)
@@ -828,7 +896,7 @@ class SessionStoreTest {
             assertEquals(expectedMessage, e.message)
         }
         assertEquals("existing destination", dest.readText(Charsets.UTF_8))
-        assertTrue("temporary export must be removed", !tmp.exists())
+        assertEquals("temporary export must be removed", listOf(dest.name), tmpDir.list()!!.sorted())
     }
 
     @Test fun export_lineLimitFailureRemovesTmpAndPreservesDestination(): Unit = runBlocking {
@@ -919,7 +987,7 @@ class SessionStoreTest {
 
         store.exportJsonl(sid, dest)
 
-        assertTrue(!File(tmpDir, "unicode.jsonl.tmp").exists())
+        assertEquals(listOf(dest.name), tmpDir.list()!!.sorted())
         assertTrue(dest.length() > dest.readText(Charsets.UTF_8).length)
         val imported = store.importJsonl(dest)
         val original = store.loadEvents(sid, limit = count)
@@ -928,6 +996,117 @@ class SessionStoreTest {
         assertEquals(count, restored.size)
         assertEquals(original.map { it.copy(sessionId = imported, runId = restored.first().runId) }, restored)
         assertTrue(restored.all { it.text == text })
+    }
+
+    @Test fun export_roomSnapshotSurvivesConcurrentMutations(): Unit = runBlocking {
+        setUp()
+        for (operation in listOf("prune", "delete", "append")) {
+            val sid = store.createSession("t", "p/m")
+            val count = RoomSessionStore.EXPORT_PAGE_SIZE + 5
+            insertLegacyExportRows(sid, count, "snapshot")
+            val pageRead = CountDownLatch(1)
+            val resume = CountDownLatch(1)
+            val started = CountDownLatch(1)
+            val finished = CountDownLatch(1)
+            store.exportAfterPageHookForTest = {
+                if (pageRead.count > 0) {
+                    pageRead.countDown()
+                    check(resume.await(10, TimeUnit.SECONDS))
+                }
+            }
+            val dest = File(tmpDir, "$operation.jsonl")
+            val export = async(Dispatchers.IO) { store.exportJsonl(sid, dest) }
+            try {
+                assertTrue(pageRead.await(10, TimeUnit.SECONDS))
+                val mutation = async(Dispatchers.IO) {
+                    started.countDown()
+                    try {
+                        when (operation) {
+                            "prune" -> store.prune(PrunePolicy(maxEventsPerSession = 1))
+                            "delete" -> store.deleteSession(sid)
+                            else -> store.appendEvent(event(sid, text = "later"))
+                        }
+                    } finally {
+                        finished.countDown()
+                    }
+                }
+                assertTrue(started.await(10, TimeUnit.SECONDS))
+                // Give the mutation an opportunity to finish while export is paused.
+                // A timeout is not evidence that it reached a database lock: the
+                // coroutine may still be queued. The content checks below apply in
+                // either ordering and do not claim deterministic lock coverage.
+                finished.await(500, TimeUnit.MILLISECONDS)
+                resume.countDown()
+                export.await()
+                mutation.await()
+                val lines = dest.readLines().mapIndexed { index, line -> JsonlCodec.decode(index + 1, line) }
+                assertEquals((1L..count.toLong()).toList(), lines.map { it.seq })
+                assertTrue(lines.all { it.text == "snapshot" })
+                when (operation) {
+                    "prune" -> assertEquals(1, store.countEvents(sid))
+                    "delete" -> assertNull(store.getSession(sid))
+                    else -> assertEquals(count + 1, store.countEvents(sid))
+                }
+            } finally {
+                resume.countDown()
+                store.exportAfterPageHookForTest = null
+            }
+        }
+    }
+
+    @Test fun export_cancelBetweenPagesPreservesDestinationAndRemovesTemp(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        insertLegacyExportRows(sid, RoomSessionStore.EXPORT_PAGE_SIZE + 1, "snapshot")
+        val pageRead = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        store.exportAfterPageHookForTest = {
+            pageRead.countDown()
+            check(resume.await(10, TimeUnit.SECONDS))
+        }
+        val dest = File(tmpDir, "cancel.jsonl").apply { writeText("existing") }
+        val export = async(Dispatchers.IO) { store.exportJsonl(sid, dest) }
+        try {
+            assertTrue(pageRead.await(10, TimeUnit.SECONDS))
+            assertEquals(1, tmpDir.listFiles()!!.count {
+                it.name.startsWith("jsonl-export-") && it.name.endsWith(".tmp")
+            })
+            export.cancel()
+            resume.countDown()
+            try {
+                export.await()
+                fail("expected cancellation")
+            } catch (_: kotlinx.coroutines.CancellationException) { }
+            assertEquals("existing", dest.readText())
+            assertEquals(listOf("cancel.jsonl"), tmpDir.list()!!.sorted())
+        } finally {
+            resume.countDown()
+            store.exportAfterPageHookForTest = null
+        }
+    }
+
+    @Test fun export_failureReasonUsesFullAndErrorRedaction(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        db.sessionDao().insertEvent(TranscriptEventEntity(
+            0, sid, 1, "r", "assistant", "fragment", false, 0, now, true,
+            "alice@example.com https://example.com/?token=secret", null, null,
+        ))
+        val dest = File(tmpDir, "reason.jsonl")
+        store.exportJsonl(sid, dest)
+        val reason = JsonlCodec.decode(1, dest.readText().trim()).failureReason!!
+        assertTrue(!reason.contains("alice@example.com"))
+        assertTrue(!reason.contains("secret"))
+        assertTrue(reason.contains("⟦REDACTED:EMAIL⟧"))
+        val appended = store.createSession("t", "p/m")
+        store.appendEvent(event(appended, kind = "assistant").copy(
+            isPartial = true, failureReason = "alice@example.com",
+        ))
+        assertTrue(!store.loadEvents(appended).single().failureReason!!.contains("alice@example.com"))
+        val imported = store.importJsonl(
+            """{"seq":1,"runId":"r","kind":"assistant","text":"x","imagesOmitted":0,"createdAt":1,"isPartial":true,"failureReason":"alice@example.com"}""".byteInputStream(),
+        )
+        assertTrue(!store.loadEvents(imported).single().failureReason!!.contains("alice@example.com"))
     }
 
     @Test fun append_concurrentKeepsSeqDense(): Unit = runBlocking {

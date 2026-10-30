@@ -523,7 +523,7 @@ class RoomSessionStore(
         } else {
             redacted to false
         }
-        val reason = event.failureReason?.let { Redactor.redactError(it) }
+        val reason = event.failureReason?.let { redactFailureReason(it) }
         return PreparedEvent(text, event.isTruncated || truncated, reason)
     }
 
@@ -608,6 +608,8 @@ class RoomSessionStore(
             dao.sessionById(sessionId)?.toMeta()
         }
 
+    internal var exportAfterPageHookForTest: (() -> Unit)? = null
+
     override suspend fun exportJsonl(sessionId: String, destFile: File) {
         // Paged streaming export; the ID map is bounded by rows and source ID characters.
         // Writes to a tmp sibling first; destFile appears atomically only on
@@ -618,7 +620,6 @@ class RoomSessionStore(
         if (parent != null && !parent.exists() && !parent.mkdirs()) {
             error("export failed: cannot create directory ${parent.path}")
         }
-        val tmp = File(parent, destFile.name + ".tmp")
         var bytes = 0L
         var chars = 0L
         var rows = 0
@@ -638,12 +639,22 @@ class RoomSessionStore(
             candidate
         }
         withContext(Dispatchers.IO) {
+            ensureActive()
+            val tmp = File.createTempFile("jsonl-export-", ".tmp", parent ?: File("."))
             try {
+                // All pages must observe one Room snapshot, including when prune,
+                // delete or append runs while the export is streaming.
+                db.withTransaction {
+                require(dao.sessionById(sessionId) != null) { "unknown session" }
+                val expectedRows = dao.eventCount(sessionId)
                 tmp.bufferedWriter(Charsets.UTF_8).use { out ->
                     while (true) {
+                        currentCoroutineContext().ensureActive()
                         val page = dao.eventsAfter(sessionId, afterSeq, EXPORT_PAGE_SIZE)
                         if (page.isEmpty()) break
                         for (row in page) {
+                            currentCoroutineContext().ensureActive()
+                            require(row.seq > afterSeq) { "export failed: invalid event sequence" }
                             if (++rows > IMPORT_MAX_ROWS) throw JsonlExportLimitException("export too large")
                             // Inspect the stored text before any read-time redaction:
                             // marker recognition requires the original boundary.
@@ -680,7 +691,7 @@ class RoomSessionStore(
                             val redacted = if (markerTail != null) {
                                 "turn $mappedRunId ${Redactor.redact(markerTail).text}"
                             } else Redactor.redact(event.text).text
-                            val reason = event.failureReason?.let { Redactor.redactError(it) }
+                            val reason = event.failureReason?.let { redactFailureReason(it) }
                             // IDs can contain arbitrary secrets, including in legacy rows.
                             // Use one bijection for both fields, independent for each export.
                             val line = JsonlCodec.encode(event.copy(
@@ -690,6 +701,8 @@ class RoomSessionStore(
                                 failureReason = reason,
                             ), isTruncated = row.isTruncated)
                             if (line.length > IMPORT_MAX_LINE_CHARS) throw JsonlExportLimitException("export line too large")
+                            // Validate the actual transformed line against the import shape gate.
+                            JsonlCodec.decode(rows, line)
                             // Import redacts again before applying its durable text cap.
                             // Reject rather than produce an export that import would truncate.
                             if (Redactor.redact(redacted).text.length > MAX_TEXT_CHARS) {
@@ -703,15 +716,18 @@ class RoomSessionStore(
                             out.newLine()
                             afterSeq = row.seq
                         }
+                        exportAfterPageHookForTest?.invoke()
                     }
                 }
-            } catch (e: Exception) {
+                require(rows == expectedRows) { "export failed: invalid event sequence" }
+                currentCoroutineContext().ensureActive()
+                }
+                ensureActive()
+                if (!tmp.renameTo(destFile)) {
+                    error("export failed: cannot move tmp file into place")
+                }
+            } finally {
                 tmp.delete()
-                throw e
-            }
-            if (!tmp.renameTo(destFile)) {
-                tmp.delete()
-                error("export failed: cannot move tmp file into place")
             }
         }
     }
@@ -845,7 +861,7 @@ class RoomSessionStore(
                             line.imagesOmitted,
                             line.createdAt,
                             line.isPartial,
-                            line.failureReason?.let { Redactor.redactError(it) },
+                            line.failureReason?.let { redactFailureReason(it) },
                             line.parentRunId?.let { remappedIds.getValue(it) },
                             line.attemptIndex,
                             line.isFinal,
@@ -858,6 +874,9 @@ class RoomSessionStore(
             }
         }
     }
+
+    private fun redactFailureReason(reason: String): String =
+        Redactor.redactError(Redactor.redact(reason).text)
 
     private fun terminalTail(runId: String, text: String): String? {
         val prefix = "turn $runId "

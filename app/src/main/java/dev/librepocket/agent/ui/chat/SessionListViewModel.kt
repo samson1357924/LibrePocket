@@ -19,6 +19,8 @@ import java.io.OutputStream
 import java.io.Closeable
 import java.io.FilterInputStream
 import java.io.FilterOutputStream
+import java.io.FileNotFoundException
+import java.io.IOException
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -277,7 +279,15 @@ class SessionListViewModel(
     ) {
         viewModelScope.launch {
             export(sessionId, cacheDir) {
-                contentResolver.openOutputStream(uri) ?: error("無法開啟輸出檔案")
+                try {
+                    contentResolver.openOutputStream(uri, "wt") ?: error("無法開啟輸出檔案")
+                } catch (e: FileNotFoundException) {
+                    throw IOException("無法開啟輸出檔案；文件提供者可能不支援截斷寫入", e)
+                } catch (e: IllegalArgumentException) {
+                    throw IOException("文件提供者不支援截斷寫入", e)
+                } catch (e: UnsupportedOperationException) {
+                    throw IOException("文件提供者不支援截斷寫入", e)
+                }
             }.onSuccess { onSuccess?.invoke() }.onFailure { onError?.invoke(it) }
         }
     }

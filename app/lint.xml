@@ -11,4 +11,6 @@
         <ignore path="src/foss/AndroidManifest.xml" />
         <ignore path="src/github/AndroidManifest.xml" />
     </issue>
+    <!-- Partial localization during Alpha; do not abort build on incomplete translations -->
+    <issue id="MissingTranslation" severity="warning" />
 </lint>

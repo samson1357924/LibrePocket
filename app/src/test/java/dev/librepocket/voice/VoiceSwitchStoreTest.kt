@@ -100,18 +100,20 @@ class VoiceSwitchStoreTest {
 
     @Test
     fun freshStore_defaultsBothOn() = runBlocking {
-        // 無 key 新戶：載入完成後維持預設開（行為不變）。
+        // 無 key 新戶：載入完成後維持預設（input/output 預設開，openai 預設關）。
         val snapshot = newStore().observeSwitches().first { it.loaded }
         assertFalse(snapshot.loadFailed)
         assertEquals(
             mapOf(
                 VoiceTools.SWITCH_INPUT to true,
                 VoiceTools.SWITCH_OUTPUT to true,
+                VoiceTools.SWITCH_OPENAI to false,
             ),
             snapshot.switches,
         )
         assertTrue(VoiceTools.inputEnabled(snapshot))
         assertTrue(VoiceTools.outputEnabled(snapshot))
+        assertFalse(VoiceTools.openAiTtsEnabled(snapshot))
     }
 
     @Test
@@ -120,6 +122,7 @@ class VoiceSwitchStoreTest {
         val first = newStore(dir)
         first.setInputEnabled(false)
         first.setOutputEnabled(false)
+        first.setOpenAiTtsEnabled(true)
         // 同檔不允許雙 active DataStore：先停掉第一個 scope 並等其完全結束
         // （guard 註銷含在 completion 內），再建第二實例讀檔。
         scopes.forEach { it.cancel() }
@@ -130,6 +133,7 @@ class VoiceSwitchStoreTest {
             mapOf(
                 VoiceTools.SWITCH_INPUT to false,
                 VoiceTools.SWITCH_OUTPUT to false,
+                VoiceTools.SWITCH_OPENAI to true,
             ),
             second.observeSwitches().first { it.loaded }.switches,
         )
@@ -144,6 +148,10 @@ class VoiceSwitchStoreTest {
         assertTrue(VoiceTools.inputEnabled(store.observeSwitches().first { it.loaded }))
         store.setOutputEnabled(false)
         assertFalse(VoiceTools.outputEnabled(store.observeSwitches().first { it.loaded }))
+        store.setOpenAiTtsEnabled(true)
+        assertTrue(VoiceTools.openAiTtsEnabled(store.observeSwitches().first { it.loaded }))
+        store.setOpenAiTtsEnabled(false)
+        assertFalse(VoiceTools.openAiTtsEnabled(store.observeSwitches().first { it.loaded }))
     }
 
     @Test
@@ -192,6 +200,7 @@ class VoiceSwitchStoreTest {
         assertTrue(snapshot.loadFailed)
         assertFalse(VoiceTools.inputEnabled(snapshot))
         assertFalse(VoiceTools.outputEnabled(snapshot))
+        assertFalse(VoiceTools.openAiTtsEnabled(snapshot))
         val projected = ToolRegistry.projectAll(
             ProjectionContext(
                 flavor = Flavor.PLAY,
@@ -202,6 +211,8 @@ class VoiceSwitchStoreTest {
         assertEquals(DenyReason.USER_DISABLED, projected.getValue(VoiceTools.TRANSCRIBE_NAME).reason)
         assertEquals(CapabilityLevel.UNAVAILABLE, projected.getValue(VoiceTools.SPEAK_NAME).level)
         assertEquals(DenyReason.USER_DISABLED, projected.getValue(VoiceTools.SPEAK_NAME).reason)
+        assertEquals(CapabilityLevel.UNAVAILABLE, projected.getValue(VoiceTools.OPENAI_SPEAK_NAME).level)
+        assertEquals(DenyReason.USER_DISABLED, projected.getValue(VoiceTools.OPENAI_SPEAK_NAME).reason)
     }
 
     @Test
@@ -222,6 +233,7 @@ class VoiceSwitchStoreTest {
         assertFalse(first.loadFailed)
         assertFalse(VoiceTools.inputEnabled(first))
         assertFalse(VoiceTools.outputEnabled(first))
+        assertFalse(VoiceTools.openAiTtsEnabled(first))
         // 載入完成後仍為關閉（真相源），非失敗。
         val loaded = reader.observeSwitches().first { it.loaded }
         assertFalse(loaded.loadFailed)
@@ -229,6 +241,7 @@ class VoiceSwitchStoreTest {
             mapOf(
                 VoiceTools.SWITCH_INPUT to false,
                 VoiceTools.SWITCH_OUTPUT to false,
+                VoiceTools.SWITCH_OPENAI to false,
             ),
             loaded.switches,
         )

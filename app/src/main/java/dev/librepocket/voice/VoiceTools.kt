@@ -29,6 +29,7 @@ object VoiceTools {
     const val TRANSCRIBE_NAME = "voice.transcribe"
     const val SPEAK_NAME = "voice.speak"
     const val AZURE_SPEAK_NAME = "voice.speak.azure"
+    const val OPENAI_SPEAK_NAME = "voice.speak.openai"
 
     const val SWITCH_INPUT = "voice_input"
     const val SWITCH_INPUT_DEFAULT = true
@@ -39,8 +40,14 @@ object VoiceTools {
     const val SWITCH_AZURE = "azure_tts"
     const val SWITCH_AZURE_DEFAULT = false
 
+    const val SWITCH_OPENAI = "openai_tts"
+    const val SWITCH_OPENAI_DEFAULT = false
+
     /** KeyVault providerId：Azure Speech 金鑰（僅 github 版使用）。 */
     const val AZURE_KEY_REF = "azure_speech"
+
+    /** KeyVault providerId：OpenAI TTS 金鑰。 */
+    const val OPENAI_KEY_REF = "openai_tts"
 
     const val FALLBACK_STT_HINT = "type the message manually in the input box"
     const val FALLBACK_TTS_HINT = "read the message text on screen manually"
@@ -75,6 +82,14 @@ object VoiceTools {
     fun outputEnabled(snapshot: VoiceSwitchSnapshot): Boolean =
         snapshot.loaded && !snapshot.loadFailed && outputEnabled(snapshot.switches)
 
+    /** 見 [outputEnabled]（`openai_tts` 預設關）。 */
+    fun openAiTtsEnabled(switches: Map<String, Boolean>): Boolean =
+        switches.getOrDefault(SWITCH_OPENAI, SWITCH_OPENAI_DEFAULT)
+
+    /** 見 [outputEnabled]（快照三態門禁，`openai_tts` 側）。 */
+    fun openAiTtsEnabled(snapshot: VoiceSwitchSnapshot): Boolean =
+        snapshot.loaded && !snapshot.loadFailed && openAiTtsEnabled(snapshot.switches)
+
     /**
      * 投影用開關（R4-2）：同一快照在 loadFailed 時兩鍵視為關（fail-closed），
      * 避免 UI 隱藏但 tool 仍可用的分叉；loading 態照常回 map（缺鍵即產品預設）。
@@ -84,7 +99,11 @@ object VoiceTools {
      */
     fun projectionSwitches(snapshot: VoiceSwitchSnapshot): Map<String, Boolean> =
         if (snapshot.loadFailed) {
-            snapshot.switches + mapOf(SWITCH_INPUT to false, SWITCH_OUTPUT to false)
+            snapshot.switches + mapOf(
+                SWITCH_INPUT to false,
+                SWITCH_OUTPUT to false,
+                SWITCH_OPENAI to false,
+            )
         } else {
             snapshot.switches
         }

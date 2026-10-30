@@ -10,6 +10,7 @@ import dev.librepocket.linux.LinuxBoot
 import dev.librepocket.linux.LinuxPkg
 import dev.librepocket.linux.LinuxTools
 import dev.librepocket.linux.ProotExec
+import dev.librepocket.voice.VoiceTools
 
 /**
  * Built-in tool registry: the P2 fast-channel tools (BACKLOG B3,
@@ -616,6 +617,27 @@ object ToolRegistry {
                 fallbackHint = "use the system voice output, or read the text on screen manually",
             ),
             supportedFlavors = setOf(Flavor.GITHUB),
+        ),
+        ToolDef(
+            name = VoiceTools.OPENAI_SPEAK_NAME,
+            description = "Cloud voice synthesis via OpenAI TTS; memory-only audio streaming, needs voice_output and openai_tts on, text redacted before upload. SCAFFOLD: full voice pipeline dispatch wiring lands later; calls fall back to system voice until fully wired.",
+            jsonSchema = schema(
+                prop("text", "string", "Text to synthesize via OpenAI"),
+                prop("voice", "string", "Optional OpenAI voice name"),
+                prop("model", "string", "Optional OpenAI TTS model"),
+                prop("speed", "number", "Optional playback speed"),
+                required = "\"text\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = VoiceTools.SWITCH_OPENAI,
+                switchDefault = VoiceTools.SWITCH_OPENAI_DEFAULT,
+                requiresSwitch2 = VoiceTools.SWITCH_OUTPUT,
+                switchDefault2 = VoiceTools.SWITCH_OUTPUT_DEFAULT,
+                fallbackHint = "use the system voice output, or read the text on screen manually",
+            ),
+            supportedFlavors = setOf(Flavor.PLAY, Flavor.FOSS, Flavor.GITHUB),
+            executionReady = false,
         ),
     )
     // S2-ANCHOR-END

@@ -74,7 +74,73 @@ object ChatMarkdownParser {
         return invalid
     }
 
-    private enum class Kind { TEXT, THINKING, CODE, PARTIAL_TAG }
+    // Index the starts of exact-length backtick runs for constant-time span lookup.
+    // Inline spans support one or two backticks; longer runs remain fence syntax.
+    private fun inlineTickRuns(text: String): Array<IntArray> {
+        val single = IntArray(text.length + 1) { -1 }
+        val double = IntArray(text.length + 1) { -1 }
+        var pos = 0
+        while (pos < text.length) {
+            if (text[pos] != '`') {
+                pos++
+                continue
+            }
+            val start = pos
+            while (pos < text.length && text[pos] == '`') pos++
+            when (pos - start) {
+                1 -> single[start] = start
+                2 -> double[start] = start
+            }
+        }
+        for (i in text.length - 1 downTo 0) {
+            if (single[i] < 0) single[i] = single[i + 1]
+            if (double[i] < 0) double[i] = double[i + 1]
+        }
+        return arrayOf(single, double)
+    }
+
+    private fun indentEnd(text: String, start: Int, required: Long = 4L): Int {
+        var pos = start
+        var columns = 0L
+        while (pos < text.length && columns < required) {
+            when (text[pos]) {
+                ' ' -> columns++
+                '\t' -> columns += 4L - columns % 4L
+                else -> return -1
+            }
+            pos++
+        }
+        return if (columns >= required) pos else -1
+    }
+
+    // Recognize the existing unordered markers and their one-to-four-column padding.
+    private fun listContentColumn(text: String, marker: Int, indent: Long): Long {
+        val base = indent + 1L
+        var column = base
+        var pos = marker + 1
+        while (pos < text.length && (text[pos] == ' ' || text[pos] == '\t')) {
+            val next = if (text[pos] == '\t') column + 4L - column % 4L else column + 1L
+            if (next - base > 4L) return base + 1L
+            column = next
+            pos++
+        }
+        return column
+    }
+
+    // Remove boundary blank lines, not indentation on the first nonblank line.
+    private fun trimBoundary(text: String, startsAtLine: Boolean = true): String {
+        var first = 0
+        var lineStart = 0
+        while (first < text.length && text[first].isWhitespace()) {
+            if (text[first] == '\n') lineStart = first + 1
+            first++
+        }
+        if (first == text.length) return ""
+        val start = if (lineStart > 0 || startsAtLine) lineStart else first
+        return text.substring(start).trimEnd()
+    }
+
+    private enum class Kind { TEXT, THINKING, CODE, INDENTED_CODE, PARTIAL_TAG }
 
     private data class Segment(
         val kind: Kind,
@@ -84,6 +150,7 @@ object ChatMarkdownParser {
         val contentEnd: Int = end,
         val language: String? = null,
         val unclosed: Boolean = false,
+        val indentColumns: Long = 4L,
     )
 
     // Each character is visited a bounded number of times. Inline code shields tags,
@@ -94,23 +161,91 @@ object ChatMarkdownParser {
         val escaped = escapedBackticks(text)
         val invalidFence = invalidIndentedFenceOpeners(text)
         val nextNewline = IntArray(length + 1) { -1 }
-        val nextTick = IntArray(length + 1) { -1 }
+        val ticks = inlineTickRuns(text)
         for (i in length - 1 downTo 0) {
             nextNewline[i] = if (text[i] == '\n') i else nextNewline[i + 1]
-            nextTick[i] = if (text[i] == '`') i else nextTick[i + 1]
         }
         var cursor = 0
         var plainStart = 0
+        // Only the existing unordered-list syntax is recognized here. Blank lines
+        // and indented continuation lines retain context; a real block ends it.
+        val listContentColumns = mutableListOf<Long>()
         fun addPlain(end: Int) {
             if (end > plainStart) result.add(Segment(Kind.TEXT, plainStart, end))
         }
         while (cursor < length) {
+            val atLineStart = cursor == 0 || text[cursor - 1] == '\n'
+            val previousBlank = if (atLineStart && cursor > 0) {
+                val prevStart = text.lastIndexOf('\n', cursor - 2) + 1
+                text.substring(prevStart, cursor - 1).isBlank()
+            } else {
+                false
+            }
+            var lineMarker = cursor
+            var indentColumns = 0L
+            if (atLineStart) {
+                while (lineMarker < length && (text[lineMarker] == ' ' || text[lineMarker] == '\t')) {
+                    indentColumns = if (text[lineMarker] == '\t') indentColumns + 4L - indentColumns % 4L else indentColumns + 1L
+                    lineMarker++
+                }
+            }
+            val blankLine = atLineStart && (lineMarker == length || text[lineMarker] == '\r' || text[lineMarker] == '\n')
+            val listItem = atLineStart && lineMarker + 1 < length &&
+                (text[lineMarker] == '-' || text[lineMarker] == '*') && text[lineMarker + 1] == ' '
+            // Returning to a parent's content column closes deeper list contexts.
+            // Each entry is pushed and removed at most once.
+            if (atLineStart && !blankLine) {
+                while (listContentColumns.isNotEmpty() && indentColumns < listContentColumns.last()) {
+                    listContentColumns.removeAt(listContentColumns.lastIndex)
+                }
+            }
+            val previousListItem = listContentColumns.isNotEmpty()
+            // Indented code inside this list begins four columns after its content.
+            val codeIndent = if (previousListItem) listContentColumns.last() + 4L else 4L
+            val listContinuation = previousListItem && indentColumns > 0 && indentColumns < codeIndent
+            val nestedList = previousListItem && listItem && indentColumns < codeIndent
+            val indent = if (atLineStart && !blankLine && !nestedList && !listContinuation &&
+                (cursor == plainStart || previousBlank)) indentEnd(text, cursor, codeIndent) else -1
+            if (indent >= 0 && indent < length && text[indent] != '\n' && text[indent] != '\r') {
+                var end = cursor
+                var line = cursor
+                while (line < length) {
+                    val newline = nextNewline[line]
+                    val lineEnd = if (newline < 0) length else newline
+                    var pos = line
+                    while (pos < lineEnd && (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\r')) pos++
+                    val next = if (newline < 0) length else newline + 1
+                    if (pos == lineEnd) {
+                        line = next
+                        continue
+                    }
+                    if (indentEnd(text, line, codeIndent) < 0) break
+                    end = next
+                    line = next
+                }
+                if (end > cursor) {
+                    addPlain(cursor)
+                    result.add(Segment(Kind.INDENTED_CODE, cursor, end, unclosed = streaming && line == length,
+                        indentColumns = codeIndent))
+                    cursor = end
+                    plainStart = cursor
+                    continue
+                }
+            }
+            if (atLineStart && !blankLine) {
+                if (listItem) {
+                    listContentColumns.add(listContentColumn(text, lineMarker, indentColumns))
+                } else if (!listContinuation) {
+                    listContentColumns.clear()
+                }
+            }
             val pair = if (text[cursor] == '<') {
                 THINK_TAG_PAIRS.firstOrNull { text.regionMatches(cursor, it.first, 0, it.first.length, ignoreCase = true) }
             } else {
                 null
             }
             if (pair != null) {
+                listContentColumns.clear()
                 addPlain(cursor)
                 val start = cursor + pair.first.length
                 val close = text.indexOf(pair.second, start, ignoreCase = true)
@@ -132,6 +267,7 @@ object ChatMarkdownParser {
             } else if (invalidFence[cursor]) {
                 while (cursor < length && text[cursor] == '`') cursor++
             } else if (!escaped[cursor] && text.startsWith(CODE_FENCE, cursor)) {
+                listContentColumns.clear()
                 addPlain(cursor)
                 var afterFence = cursor + CODE_FENCE.length
                 while (afterFence < length && text[afterFence] == '`') afterFence++
@@ -208,13 +344,14 @@ object ChatMarkdownParser {
                 }
                 plainStart = cursor
             } else if (text[cursor] == '`' && !escaped[cursor]) {
-                val close = nextTick[cursor + 1]
-                val newline = nextNewline[cursor + 1]
+                val size = if (cursor + 1 < length && text[cursor + 1] == '`') 2 else 1
+                val close = ticks[size - 1][cursor + size]
+                val newline = nextNewline[cursor + size]
                 cursor = when {
-                    close >= 0 && (newline < 0 || close < newline) -> close + 1
+                    close >= 0 && (newline < 0 || close < newline) -> close + size
                     // An unmatched delimiter is not evidence that tags are literal code.
                     // Keep tag handling identical while streaming and after completion.
-                    else -> cursor + 1
+                    else -> cursor + size
                 }
             } else {
                 cursor++
@@ -236,7 +373,8 @@ object ChatMarkdownParser {
         }
         return segments(text, isStreaming).mapNotNull { segment ->
             when (segment.kind) {
-                Kind.TEXT -> text.substring(segment.start, segment.end).trim().takeIf { it.isNotBlank() }
+                Kind.TEXT -> trimBoundary(text.substring(segment.start, segment.end),
+                    segment.start == 0 || text[segment.start - 1] == '\n').takeIf { it.isNotBlank() }
                     ?.let { ChatContentBlock.ParagraphBlock(parseInline(formatLists(it))) }
                 Kind.THINKING -> ChatContentBlock.ThinkingBlock(
                     text.substring(segment.contentStart, segment.contentEnd).trim(), segment.unclosed && isStreaming,
@@ -244,6 +382,41 @@ object ChatMarkdownParser {
                 Kind.CODE -> ChatContentBlock.CodeBlock(
                     segment.language, text.substring(segment.contentStart, segment.contentEnd), segment.unclosed && isStreaming,
                 )
+                Kind.INDENTED_CODE -> ChatContentBlock.CodeBlock(null, buildString {
+                    var line = segment.start
+                    var first = true
+                    while (line < segment.end) {
+                        val newline = text.indexOf('\n', line).let { if (it < 0 || it >= segment.end) segment.end else it }
+                        var end = newline
+                        if (end > line && text[end - 1] == '\r') end--
+                        if (!first) append('\n')
+                        first = false
+                        // Measure tab stops in the original line. Keep a tab only if it
+                        // spans the same number of columns after dedenting.
+                        var content = line
+                        var columns = 0L
+                        var outputColumns = 0L
+                        while (content < end && (text[content] == ' ' || text[content] == '\t')) {
+                            val tab = text[content] == '\t'
+                            val next = if (tab) columns + 4L - columns % 4L else columns + 1L
+                            if (next > segment.indentColumns) {
+                                val remaining = next - maxOf(columns, segment.indentColumns)
+                                if (tab && columns >= segment.indentColumns && remaining == 4L - outputColumns % 4L) {
+                                    append('\t')
+                                } else {
+                                    repeat(remaining.toInt()) { append(' ') }
+                                }
+                                outputColumns += remaining
+                            }
+                            columns = next
+                            content++
+                        }
+                        if (columns >= segment.indentColumns) {
+                            append(text, content, end)
+                        }
+                        line = if (newline < segment.end) newline + 1 else segment.end
+                    }
+                }, segment.unclosed && isStreaming)
                 Kind.PARTIAL_TAG -> null
             }
         }
@@ -254,7 +427,7 @@ object ChatMarkdownParser {
         for (segment in segments(text, streaming = false)) {
             if (segment.kind != Kind.THINKING) append(text, segment.start, segment.end)
         }
-    }.trim()
+    }.let { trimBoundary(it) }
 
     /**
      * Replaces list prefixes such as `- ` or `* ` at line starts with bullet `• `.
@@ -291,13 +464,12 @@ object ChatMarkdownParser {
         val len = text.length
         val escaped = escapedBackticks(text)
         val nextNewline = IntArray(len + 1) { -1 }
-        val nextTick = IntArray(len + 1) { -1 }
+        val ticks = inlineTickRuns(text)
         val nextDouble = IntArray(len + 1) { -1 }
         val nextTriple = IntArray(len + 1) { -1 }
         val nextSingle = IntArray(len + 1) { -1 }
         for (pos in len - 1 downTo 0) {
             nextNewline[pos] = if (text[pos] == '\n') pos else nextNewline[pos + 1]
-            nextTick[pos] = if (text[pos] == '`') pos else nextTick[pos + 1]
         }
         val inCode = BooleanArray(len)
         var scan = 0
@@ -312,11 +484,12 @@ object ChatMarkdownParser {
                 continue
             }
             val start = scan
-            val lineEnd = nextNewline[start + 1].let { if (it < 0) len else it }
-            val close = nextTick[start + 1]
+            val size = if (start + 1 < len && text[start + 1] == '`') 2 else 1
+            val lineEnd = nextNewline[start + size].let { if (it < 0) len else it }
+            val close = ticks[size - 1][start + size]
             val end = when {
-                close >= 0 && close < lineEnd -> close + 1
-                else -> start + 1
+                close >= 0 && close < lineEnd -> close + size
+                else -> start + size
             }
             if (end > start + 1) for (pos in start until end) inCode[pos] = true
             scan = end
@@ -340,9 +513,10 @@ object ChatMarkdownParser {
                     }
                     continue
                 }
-                val close = nextTick[i + 1]
-                if (close != -1 && (nextNewline[i + 1] == -1 || nextNewline[i + 1] > close)) {
-                    val code = text.substring(i + 1, close)
+                val size = if (i + 1 < len && text[i + 1] == '`') 2 else 1
+                val close = ticks[size - 1][i + size]
+                if (close != -1 && (nextNewline[i + size] == -1 || nextNewline[i + size] > close)) {
+                    val code = text.substring(i + size, close)
                     val start = builder.length
                     builder.append(code)
                     builder.addStyle(
@@ -353,11 +527,11 @@ object ChatMarkdownParser {
                         start,
                         builder.length,
                     )
-                    i = close + 1
+                    i = close + size
                     continue
                 }
-                builder.append('`')
-                i++
+                repeat(size) { builder.append('`') }
+                i += size
                 continue
             }
 

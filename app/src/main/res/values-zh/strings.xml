@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LibrePocket</string>
+    <string name="chat_thinking_title">思考過程</string>
+    <string name="chat_thinking_in_progress">思考中…</string>
+    <string name="chat_thinking_collapse">收折思考過程</string>
+    <string name="chat_thinking_expand">展開思考過程</string>
+    <string name="chat_code_default_language">Code</string>
+    <string name="chat_code_copy_description">複製程式碼</string>
+    <string name="chat_code_copy">複製</string>
+    <string name="chat_code_copied">已複製</string>
+</resources>

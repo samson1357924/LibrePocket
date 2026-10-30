@@ -2,4 +2,12 @@
 <resources>
     <!-- Default label; play pins "LibrePocket", foss overrides with "LibrePocket Foss". -->
     <string name="app_name">LibrePocket</string>
+    <string name="chat_thinking_title">Thinking Process</string>
+    <string name="chat_thinking_in_progress">Thinking…</string>
+    <string name="chat_thinking_collapse">Collapse thinking process</string>
+    <string name="chat_thinking_expand">Expand thinking process</string>
+    <string name="chat_code_default_language">Code</string>
+    <string name="chat_code_copy_description">Copy code</string>
+    <string name="chat_code_copy">Copy</string>
+    <string name="chat_code_copied">Copied</string>
 </resources>

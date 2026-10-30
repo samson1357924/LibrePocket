@@ -92,6 +92,12 @@ class AnthropicProvider(
     internal fun buildBody(request: ChatRequest): String {
         requireNoReasoningHistory(request)
         requireNoAssistantImages(request.messages)
+        when (request.responseFormat) {
+            null, ResponseFormat.Text -> Unit
+            ResponseFormat.JsonObject, is ResponseFormat.JsonSchema -> {
+                throw ProviderFailure(retryable = false, message = "STRUCTURED_OUTPUTS_NOT_SUPPORTED")
+            }
+        }
         val sb = StringBuilder()
         sb.append("{\"model\":${q(request.model)},\"stream\":true")
         sb.append(",\"max_tokens\":${request.maxTokens ?: DEFAULT_MAX_TOKENS}")

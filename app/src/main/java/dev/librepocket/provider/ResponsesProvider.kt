@@ -35,6 +35,7 @@ private val RESPONSES_TERMINAL_TYPES = setOf(
  */
 private val RESPONSES_TEXT_DONE_TYPES = setOf(
     "response.output_text.done",
+    "response.refusal.done",
     "response.content_part.done",
     "response.output_item.done",
 )
@@ -210,6 +211,12 @@ class ResponsesProvider(
                 sb.append(webSearchToolJson(webSearch.contextSize))
             }
             sb.append(']')
+        }
+        when (val rf = request.responseFormat) {
+            null, ResponseFormat.Text -> Unit
+            ResponseFormat.JsonObject, is ResponseFormat.JsonSchema -> {
+                sb.append(",\"text\":").append(responsesTextFormatJson(rf))
+            }
         }
         sb.append(",\"input\":[")
         var first = true
@@ -430,7 +437,9 @@ internal class ResponsesMapper(val round: Int = 0) {
             return out
         }
         when (type) {
-            "response.output_text.delta" -> {
+            "response.output_text.delta",
+            "response.refusal.delta",
+            -> {
                 val delta = root.string("delta") ?: return emptyList()
                 // Empty-delta suppression (parity with ChatCompletions): an
                 // empty frame yields NO event, so it can never park an empty
@@ -470,11 +479,15 @@ internal class ResponsesMapper(val round: Int = 0) {
                     out.add(StreamEvent.TextDelta(round, blockOf(root), delta))
                 }
             }
-            "response.output_text.done" -> {
+            "response.output_text.done",
+            "response.refusal.done",
+            -> {
                 // Authoritative text for one streamed block. Reconcile through
                 // the same buffer as completed: emit only the missing suffix
                 // and advance the buffer so a later completed item is a no-op.
-                val text = root.string("text") ?: return emptyList()
+                val text = (if (type == "response.refusal.done") root.string("refusal") else null)
+                    ?: root.string("text")
+                    ?: return emptyList()
                 val failed = reconcileTextBlock(
                     root.string("item_id"),
                     root.int("output_index"),
@@ -492,8 +505,10 @@ internal class ResponsesMapper(val round: Int = 0) {
             "response.content_part.done" -> {
                 val part = root.obj("part") ?: return emptyList()
                 val partType = part.string("type")
-                if (partType != "output_text" && partType != "text") return emptyList()
-                val text = part.string("text") ?: return emptyList()
+                if (partType != "output_text" && partType != "text" && partType != "refusal") return emptyList()
+                val text = (if (partType == "refusal") part.string("refusal") else null)
+                    ?: part.string("text")
+                    ?: return emptyList()
                 val failed = reconcileTextBlock(
                     root.string("item_id"),
                     root.int("output_index"),
@@ -659,7 +674,7 @@ internal class ResponsesMapper(val round: Int = 0) {
                     emitWebSearchMarker(root, "completed", out)
                     return out
                 }
-                if (item.string("type") == "message") {
+                if (item.string("type") == "message" || item.string("type") == "refusal") {
                     // Authoritative message done: reconcile through the same
                     // streamed-text buffer as `response.completed`, emitting
                     // only a missing suffix (never the full duplicate).
@@ -772,7 +787,7 @@ internal class ResponsesMapper(val round: Int = 0) {
                 for ((itemIndex, j) in output.withIndex()) {
                     val item = j as? MiniJson.JObj ?: continue
                     when (item.string("type")) {
-                        "message" ->
+                        "message", "refusal" ->
                             mismatch = reconcileMessageItem(item, itemIndex, reconciled, streamScoped = false)
                         "function_call" ->
                             mismatch = reconcileFunctionCallItem(
@@ -1044,11 +1059,27 @@ internal class ResponsesMapper(val round: Int = 0) {
         if (textIdentityConflict || toolIdentityConflict) return outputMismatch()
         val content = item.arr("content")?.items.orEmpty()
         val staged = ArrayList<StreamEvent>()
+        if (content.isEmpty() && item.string("type") == "refusal") {
+            val terminalText = item.string("refusal") ?: item.string("text")
+            if (terminalText != null) {
+                val failed = reconcileTextBlock(
+                    item.string("id"),
+                    outputIndex,
+                    0,
+                    terminalText,
+                    staged,
+                    streamScoped = streamScoped,
+                )
+                if (failed != null) return failed
+            }
+        }
         for ((contentIndex, j) in content.withIndex()) {
             val part = j as? MiniJson.JObj ?: continue
             val partType = part.string("type")
-            if (partType != "output_text" && partType != "text") continue
-            val terminalText = part.string("text") ?: continue
+            if (partType != "output_text" && partType != "text" && partType != "refusal") continue
+            val terminalText = (if (partType == "refusal") part.string("refusal") else null)
+                ?: part.string("text")
+                ?: continue
             val failed = reconcileTextBlock(
                 item.string("id"),
                 outputIndex,

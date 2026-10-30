@@ -71,7 +71,28 @@ data class ChatRequest(
     val serverTools: List<ServerTool> = emptyList(),
     /** Thinking/reasoning mode request (null = non-thinking, default). */
     val thinking: ThinkingConfig? = null,
+    val responseFormat: ResponseFormat? = null,
 )
+
+/** Structured Outputs response format selector (§1.2 / OpenAI Structured Outputs compatible). */
+sealed interface ResponseFormat {
+    data object Text : ResponseFormat
+    data object JsonObject : ResponseFormat
+    data class JsonSchema(
+        val name: String,
+        val schemaJson: String,
+        val description: String? = null,
+        val strict: Boolean = true,
+    ) : ResponseFormat {
+        init {
+            require(name.isNotBlank()) { "name must not be blank" }
+            require(name.matches(Regex("^[a-zA-Z0-9_-]{1,64}$"))) {
+                "name must match ^[a-zA-Z0-9_-]{1,64}$, was: $name"
+            }
+            require(schemaJson.isNotBlank()) { "schemaJson must not be blank" }
+        }
+    }
+}
 
 data class ToolSchema(val name: String, val description: String, val jsonSchema: String)
 

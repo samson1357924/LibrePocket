@@ -114,6 +114,12 @@ class ChatCompletionsProvider(
             // Additive：与 tools 并存；厂商不支持时由 HTTP 错误分类为 FATAL 上报。
             sb.append(",${webSearchOptionsJson(webSearch.contextSize)}")
         }
+        when (val rf = request.responseFormat) {
+            null, ResponseFormat.Text -> Unit
+            ResponseFormat.JsonObject, is ResponseFormat.JsonSchema -> {
+                sb.append(",\"response_format\":").append(chatResponseFormatJson(rf))
+            }
+        }
         sb.append(",\"messages\":[")
         var first = true
         val emitMsg = { role: String, contentJson: String ->
@@ -363,14 +369,18 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
     }
 
     private fun deltaText(delta: MiniJson.JObj): String? {
-        delta.string("content")?.let { return it }
-        val parts = delta.arr("content")?.items?.filterIsInstance<MiniJson.JObj>() ?: return null
-        val sb = StringBuilder()
-        for (p in parts) {
-            val t = p.string("text")
-            if (!t.isNullOrEmpty()) sb.append(t)
+        delta.string("content")?.takeIf { it.isNotEmpty() }?.let { return it }
+        val parts = delta.arr("content")?.items?.filterIsInstance<MiniJson.JObj>()
+        if (parts != null) {
+            val sb = StringBuilder()
+            for (p in parts) {
+                val t = p.string("text")
+                if (!t.isNullOrEmpty()) sb.append(t)
+            }
+            sb.toString().ifEmpty { null }?.let { return it }
         }
-        return sb.toString().ifEmpty { null }
+        delta.string("refusal")?.takeIf { it.isNotEmpty() }?.let { return it }
+        return null
     }
 
     private fun deltaReasoning(delta: MiniJson.JObj): String? {

@@ -22,6 +22,7 @@ import dev.librepocket.agent.ui.chat.ChatViewModel
 import dev.librepocket.agent.ui.chat.ChatViewModelFactory
 import dev.librepocket.agent.ui.chat.SessionListViewModel
 import dev.librepocket.agent.ui.chat.SessionListViewModelFactory
+import dev.librepocket.agent.ui.chat.importErrorMessage
 import dev.librepocket.agent.ui.settings.SettingsScreen
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.PendingDelete
@@ -31,7 +32,6 @@ import dev.librepocket.agent.ui.setup.SetupViewModelFactory
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.entry.EntryDispatch
 import dev.librepocket.entry.EntryRoute
-import dev.librepocket.redact.Redactor
 import dev.librepocket.shell.PrivilegeBridgeState
 import dev.librepocket.voice.VoiceSwitchStore
 import dev.librepocket.voice.VoiceSwitchSnapshot
@@ -197,7 +197,7 @@ fun MainScreen(
                     android.widget.Toast.makeText(app, "對話匯入成功", android.widget.Toast.LENGTH_SHORT).show()
                 },
                 onError = { e ->
-                    val safeMsg = Redactor.redactError(e.message ?: "未知錯誤")
+                    val safeMsg = importErrorMessage(e)
                     android.widget.Toast.makeText(app, "對話匯入失敗: $safeMsg", android.widget.Toast.LENGTH_LONG).show()
                 },
             )

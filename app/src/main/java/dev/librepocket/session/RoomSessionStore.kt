@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -211,6 +212,8 @@ class RoomSessionStore(
      * cancelled by the test.
      */
     internal var insideTxAfterInsertHookForTest: ((Job?) -> Unit)? = null
+
+    internal var importAfterInsertHookForTest: ((Job?) -> Unit)? = null
 
     override suspend fun createSession(title: String, model: String): String =
         withContext(Dispatchers.IO) {
@@ -617,6 +620,8 @@ class RoomSessionStore(
         }
         val tmp = File(parent, destFile.name + ".tmp")
         var bytes = 0L
+        var chars = 0L
+        var rows = 0
         var afterSeq = 0L
         withContext(Dispatchers.IO) {
             try {
@@ -632,8 +637,11 @@ class RoomSessionStore(
                             val redacted = Redactor.redact(event.text).text
                             val reason = event.failureReason?.let { Redactor.redactError(it) }
                             val line = JsonlCodec.encode(event.copy(text = redacted, failureReason = reason))
+                            if (line.length > IMPORT_MAX_LINE_CHARS) throw JsonlExportLimitException("export line too large")
+                            chars += line.length
+                            if (chars > IMPORT_MAX_CONTENT_CHARS || ++rows > IMPORT_MAX_ROWS) throw JsonlExportLimitException("export too large")
                             bytes += line.toByteArray(Charsets.UTF_8).size + 1
-                            check(bytes <= EXPORT_MAX_BYTES) { "export too large" }
+                            if (bytes > EXPORT_MAX_BYTES) throw JsonlExportLimitException("export too large")
                             out.write(line)
                             out.newLine()
                             afterSeq = row.seq
@@ -655,18 +663,52 @@ class RoomSessionStore(
         // Refuse oversized files BEFORE reading (export caps at the same bound).
         // A missing file has length 0 and falls through to the reader, which
         // throws FileNotFoundException as before.
-        require(srcFile.length() <= IMPORT_MAX_BYTES) { "import too large" }
-        // Stream line-by-line: memory stays O(file) via the size gate above,
-        // never 2x (readLines + parsed list). Parsing completes before any
-        // write, so a bad line still rolls back the whole batch (transaction).
+        if (srcFile.length() > IMPORT_MAX_BYTES) throw JsonlImportLimitException("import too large")
+        val input = object : java.io.FilterInputStream(srcFile.inputStream()) {
+            private var closed = false
+            override fun close() { if (!closed) { closed = true; super.close() } }
+        }
+        return input.use { importJsonlImpl(it, closeAfterRead = true) }
+    }
+
+    override suspend fun importJsonl(input: java.io.InputStream): String =
+        importJsonlImpl(input, closeAfterRead = false)
+
+    private suspend fun importJsonlImpl(input: java.io.InputStream, closeAfterRead: Boolean): String {
+        // Parse before writing, bounded by the source-byte limit. Parsed objects
+        // can still occupy substantially more memory than the source bytes.
         val parsed = ArrayList<JsonlLine>()
         var lastSeq = 0L
         var lineNumber = 0
+        var contentChars = 0L
         withContext(Dispatchers.IO) {
-            srcFile.bufferedReader(Charsets.UTF_8).useLines { lines ->
-                for (raw in lines) {
+            val bounded = object : java.io.FilterInputStream(input) {
+                var count = 0L
+                override fun read(): Int {
+                    val value = super.read()
+                    if (value != -1 && ++count > IMPORT_MAX_BYTES) throw JsonlImportLimitException("import too large")
+                    return value
+                }
+                override fun read(b: ByteArray, off: Int, len: Int): Int {
+                    val n = super.read(b, off, len)
+                    if (n > 0) {
+                        count += n
+                        if (count > IMPORT_MAX_BYTES) throw JsonlImportLimitException("import too large")
+                    }
+                    return n
+                }
+                override fun close() { if (closeAfterRead) input.close() }
+            }
+            // readLine() is unbounded; reject before constructing an oversized line.
+            java.io.PushbackReader(bounded.bufferedReader(Charsets.UTF_8), 1).use { reader ->
+                while (true) {
+                    ensureActive()
+                    val raw = readLimitedJsonlLine(reader) ?: break
                     lineNumber++
                     if (raw.isBlank()) continue
+                    contentChars += raw.length
+                    if (contentChars > IMPORT_MAX_CONTENT_CHARS || parsed.size >= IMPORT_MAX_ROWS)
+                        throw JsonlImportLimitException("import too large")
                     val line = JsonlCodec.decode(lineNumber, raw)
                     require(line.seq > lastSeq) { "import failed at line $lineNumber" }
                     lastSeq = line.seq
@@ -679,12 +721,11 @@ class RoomSessionStore(
             Redactor.redact(it).text.take(TITLE_CHARS)
         } ?: IMPORT_FALLBACK_TITLE
         return withContext(Dispatchers.IO) {
-            // Deliberately keeps the suspend withTransaction: import has no
-            // durable-ack discriminant to protect (R8-5 blocking mode not
-            // applicable) and retry is inherently non-idempotent (a new
-            // sessionId per attempt), so the COMMIT→resume gap carries no
-            // ack-misclassification risk.
+            // Cancellation after commit but before returning the ID leaves the
+            // outcome unknown to the caller; retry can create a duplicate.
             db.withTransaction {
+                val job = currentCoroutineContext()[Job]
+                job?.ensureActive()
                 val sessionId = UUID.randomUUID().toString()
                 dao.insertSession(
                     SessionEntity(
@@ -697,6 +738,7 @@ class RoomSessionStore(
                     ),
                 )
                 for (line in parsed) {
+                    job?.ensureActive()
                     // Same truncate parity as appendEvent: over-long texts are cut
                     // and flagged instead of bypassing the MAX_TEXT_CHARS bound.
                     val redactedText = Redactor.redact(line.text).text
@@ -723,9 +765,27 @@ class RoomSessionStore(
                             line.isFinal,
                         ),
                     )
+                    importAfterInsertHookForTest?.invoke(job)
                 }
+                job?.ensureActive()
                 sessionId
             }
+        }
+    }
+
+    private fun readLimitedJsonlLine(reader: java.io.PushbackReader): String? {
+        val line = StringBuilder()
+        while (true) {
+            val c = reader.read()
+            if (c == -1) return if (line.isEmpty()) null else line.toString()
+            if (c == '\n'.code) return line.toString()
+            if (c == '\r'.code) {
+                val next = reader.read()
+                if (next != -1 && next != '\n'.code) reader.unread(next)
+                return line.toString()
+            }
+            if (line.length >= IMPORT_MAX_LINE_CHARS) throw JsonlImportLimitException("import line too large")
+            line.append(c.toChar())
         }
     }
 
@@ -944,6 +1004,11 @@ class RoomSessionStore(
         const val MAX_TEXT_CHARS = 100_000
         const val EXPORT_MAX_BYTES = 20 * 1024 * 1024
         const val IMPORT_MAX_BYTES = EXPORT_MAX_BYTES
+        // Characters are UTF-16 code units, measured on the encoded JSONL line.
+        // 1 Mi accommodates escaped 100k-character stored text plus metadata.
+        const val IMPORT_MAX_LINE_CHARS = 1024 * 1024
+        const val IMPORT_MAX_CONTENT_CHARS = 8 * 1024 * 1024
+        const val IMPORT_MAX_ROWS = 10_000
         const val EXPORT_PAGE_SIZE = 500
         const val TITLE_CHARS = 30
         const val AUTO_PRUNE_EVERY = 100

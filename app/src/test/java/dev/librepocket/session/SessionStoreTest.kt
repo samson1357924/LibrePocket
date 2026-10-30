@@ -4,6 +4,7 @@ import androidx.test.core.app.ApplicationProvider
 import java.io.File
 import java.nio.file.Files
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -511,6 +512,81 @@ class SessionStoreTest {
         assertEquals(before, db.sessionDao().allSessions().size)
     }
 
+    @Test fun import_lineAndRowLimitsFailBeforeWriting(): Unit = runBlocking {
+        setUp()
+        val tooLong = " ".repeat(RoomSessionStore.IMPORT_MAX_LINE_CHARS + 1)
+        try {
+            store.importJsonl(tooLong.byteInputStream())
+            fail("oversized blank line must fail")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message!!.contains("line too large"))
+        }
+        val rows = buildString {
+            for (i in 1..RoomSessionStore.IMPORT_MAX_ROWS + 1) {
+                append("{\"seq\":$i,\"runId\":\"r\",\"kind\":\"user\",\"text\":\"x\",\"imagesOmitted\":0,\"createdAt\":1}\n")
+            }
+        }
+        try {
+            store.importJsonl(rows.byteInputStream())
+            fail("too many rows must fail")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message!!.contains("too large"))
+        }
+        assertTrue(store.listSessions().isEmpty())
+    }
+
+    @Test fun import_lineLimitIsInclusiveForLegacyBackup(): Unit = runBlocking {
+        setUp()
+        val prefix = "{\"seq\":1,\"runId\":\"r\",\"kind\":\"user\",\"text\":\""
+        val suffix = "\",\"imagesOmitted\":0,\"createdAt\":1}"
+        val line = prefix + "x".repeat(RoomSessionStore.IMPORT_MAX_LINE_CHARS - prefix.length - suffix.length) + suffix
+        val id = store.importJsonl(line.byteInputStream())
+        assertEquals(1, store.countEvents(id))
+        try {
+            store.importJsonl((line + " ").byteInputStream())
+            fail("line one code unit over the limit must fail")
+        } catch (e: JsonlImportLimitException) {
+            assertTrue(e.message!!.contains("line too large"))
+        }
+        assertEquals(1, store.listSessions().size)
+    }
+
+    @Test fun import_contentLimitAndLineEndings(): Unit = runBlocking {
+        setUp()
+        val prefix = "{\"seq\":%d,\"runId\":\"r\",\"kind\":\"user\",\"text\":\""
+        val suffix = "\",\"imagesOmitted\":0,\"createdAt\":1}"
+        val valid = prefix.format(1) + "\\u0061".repeat(20_000) + suffix + "\r\n" +
+            prefix.format(2) + "b" + suffix + "\r"
+        val id = store.importJsonl(valid.byteInputStream())
+        assertEquals(2, store.countEvents(id))
+        val large = buildString {
+            for (i in 1..10) append(prefix.format(i)).append("x".repeat(900_000)).append(suffix).append('\n')
+        }
+        try {
+            store.importJsonl(large.byteInputStream())
+            fail("aggregate content limit must fail")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message!!.contains("too large"))
+        }
+        assertEquals(1, store.listSessions().size)
+    }
+
+    @Test fun import_cancelDuringTransactionRollsBack(): Unit = runBlocking {
+        setUp()
+        store.importAfterInsertHookForTest = { it?.cancel() }
+        val source = """{"seq":1,"runId":"r","kind":"user","text":"x","imagesOmitted":0,"createdAt":1}"""
+        val result = async { store.importJsonl(source.byteInputStream()) }
+        try {
+            result.await()
+            fail("expected cancellation")
+        } catch (_: kotlinx.coroutines.CancellationException) {
+            // The explicit post-insert gate must abort the transaction.
+        } finally {
+            store.importAfterInsertHookForTest = null
+        }
+        assertTrue(store.listSessions().isEmpty())
+    }
+
     @Test fun export_failureLeavesNoPartialFile(): Unit = runBlocking {
         setUp()
         val sid = store.createSession("t", "p/m")
@@ -526,6 +602,85 @@ class SessionStoreTest {
             // expected (IO or export-failed)
         }
         assertTrue(!dest.exists())
+    }
+
+    private fun insertLegacyExportRows(sid: String, count: Int, text: String, runId: String = "r") {
+        db.runInTransaction {
+            repeat(count) { index ->
+                db.sessionDao().insertEvent(
+                    TranscriptEventEntity(
+                        0, sid, index.toLong() + 1, runId, "user", text,
+                        false, 0, now, false, null, null, null,
+                    ),
+                )
+            }
+        }
+    }
+
+    private suspend fun assertExportLimitPreservesDestination(sid: String, expectedMessage: String) {
+        val dest = File(tmpDir, "limited.jsonl")
+        val tmp = File(tmpDir, "limited.jsonl.tmp")
+        dest.writeText("existing destination", Charsets.UTF_8)
+        try {
+            store.exportJsonl(sid, dest)
+            fail("expected export limit failure")
+        } catch (e: JsonlExportLimitException) {
+            assertEquals(expectedMessage, e.message)
+        }
+        assertEquals("existing destination", dest.readText(Charsets.UTF_8))
+        assertTrue("temporary export must be removed", !tmp.exists())
+    }
+
+    @Test fun export_lineLimitFailureRemovesTmpAndPreservesDestination(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        // A legacy row can exceed current append-time truncation.
+        insertLegacyExportRows(sid, 1, "x".repeat(RoomSessionStore.IMPORT_MAX_LINE_CHARS))
+        assertExportLimitPreservesDestination(sid, "export line too large")
+    }
+
+    @Test fun export_rowLimitFailureRemovesTmpAndPreservesDestination(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        insertLegacyExportRows(sid, RoomSessionStore.IMPORT_MAX_ROWS + 1, "x")
+        assertExportLimitPreservesDestination(sid, "export too large")
+    }
+
+    @Test fun export_contentLimitFailureRemovesTmpAndPreservesDestination(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        // Each encoded line is below the line limit; the total exceeds the character limit.
+        insertLegacyExportRows(sid, 85, "x".repeat(100_000))
+        assertExportLimitPreservesDestination(sid, "export too large")
+    }
+
+    @Test fun export_utf8ByteLimitFailureRemovesTmpAndPreservesDestination(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        // The aggregate remains below the character limit but exceeds 20 MiB in UTF-8.
+        insertLegacyExportRows(sid, 70, "界".repeat(100_000))
+        assertExportLimitPreservesDestination(sid, "export too large")
+    }
+
+    @Test fun export_multibyteAcrossPagesCanBeImported(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        val text = "繁體中文🙂"
+        val count = RoomSessionStore.EXPORT_PAGE_SIZE + 1
+        insertLegacyExportRows(sid, count, text)
+        val dest = File(tmpDir, "unicode.jsonl")
+
+        store.exportJsonl(sid, dest)
+
+        assertTrue(!File(tmpDir, "unicode.jsonl.tmp").exists())
+        assertTrue(dest.length() > dest.readText(Charsets.UTF_8).length)
+        val imported = store.importJsonl(dest)
+        val original = store.loadEvents(sid, limit = count)
+        val restored = store.loadEvents(imported, limit = count)
+        assertNotEquals(sid, imported)
+        assertEquals(count, restored.size)
+        assertEquals(original.map { it.copy(sessionId = imported) }, restored)
+        assertTrue(restored.all { it.text == text })
     }
 
     @Test fun append_concurrentKeepsSeqDense(): Unit = runBlocking {

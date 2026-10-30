@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -35,10 +36,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.librepocket.agent.R
 import kotlinx.coroutines.delay
 
 /**
@@ -69,7 +74,8 @@ fun ThinkingBlockView(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(8.dp))
-                    .clickable { isExpanded = !isExpanded }
+                    .clickable(role = Role.Button) { isExpanded = !isExpanded }
+                    .defaultMinSize(minHeight = 48.dp)
                     .padding(horizontal = 12.dp, vertical = 8.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
@@ -79,13 +85,13 @@ fun ThinkingBlockView(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     Text(
-                        text = "思考過程",
+                        text = stringResource(R.string.chat_thinking_title),
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     if (block.isStreaming) {
                         Text(
-                            text = "思考中…",
+                            text = stringResource(R.string.chat_thinking_in_progress),
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.primary,
                         )
@@ -93,7 +99,7 @@ fun ThinkingBlockView(
                 }
                 Icon(
                     imageVector = if (isExpanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
-                    contentDescription = if (isExpanded) "收折思考過程" else "展開思考過程",
+                    contentDescription = stringResource(if (isExpanded) R.string.chat_thinking_collapse else R.string.chat_thinking_expand),
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(18.dp),
                 )
@@ -149,32 +155,36 @@ fun CodeBlockView(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                val langDisplay = block.language?.ifBlank { null } ?: "Code"
+                val langDisplay = block.language?.ifBlank { null } ?: stringResource(R.string.chat_code_default_language)
                 Text(
                     text = langDisplay,
+                    modifier = Modifier.weight(1f),
                     style = MaterialTheme.typography.labelSmall,
                     fontFamily = FontFamily.Monospace,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
                 Row(
                     modifier = Modifier
                         .clip(RoundedCornerShape(4.dp))
-                        .clickable {
+                        .clickable(role = Role.Button) {
                             clipboardManager.setText(AnnotatedString(block.code))
                             copied = true
                         }
+                        .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                         .padding(horizontal = 6.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     Icon(
                         imageVector = if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
-                        contentDescription = if (copied) "已複製" else "複製代碼",
+                        contentDescription = stringResource(if (copied) R.string.chat_code_copied else R.string.chat_code_copy_description),
                         tint = if (copied) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(14.dp),
                     )
                     Text(
-                        text = if (copied) "已複製" else "複製",
+                        text = stringResource(if (copied) R.string.chat_code_copied else R.string.chat_code_copy),
                         style = MaterialTheme.typography.labelSmall,
                         color = if (copied) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                     )

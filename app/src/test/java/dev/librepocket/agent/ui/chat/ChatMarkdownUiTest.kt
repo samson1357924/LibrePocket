@@ -1,15 +1,28 @@
 package dev.librepocket.agent.ui.chat
 
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.platform.ClipboardManager
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assert
+import androidx.compose.ui.test.assertHeightIsAtLeast
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertWidthIsAtLeast
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.unit.dp
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.voice.VoiceTts
 import org.junit.Assert.assertEquals
@@ -48,7 +61,10 @@ class ChatMarkdownUiTest {
             }
         }
 
-        composeRule.onNodeWithText("思考過程").assertIsDisplayed()
+        composeRule.onNodeWithText("思考過程")
+            .assertIsDisplayed()
+            .assertHeightIsAtLeast(48.dp)
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
         composeRule.onNodeWithText("思考中…").assertIsDisplayed()
         composeRule.onNodeWithText("Analyzing the algorithm... ▍").assertIsDisplayed()
         composeRule.onNodeWithContentDescription("收折思考過程").assertIsDisplayed()
@@ -68,7 +84,10 @@ class ChatMarkdownUiTest {
         }
 
         // Title is visible
-        composeRule.onNodeWithText("思考過程").assertIsDisplayed()
+        composeRule.onNodeWithText("思考過程")
+            .assertIsDisplayed()
+            .assertHeightIsAtLeast(48.dp)
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
         composeRule.onNodeWithContentDescription("展開思考過程").assertIsDisplayed()
 
         // Content initially collapsed
@@ -76,6 +95,9 @@ class ChatMarkdownUiTest {
 
         // Click to expand
         composeRule.onNodeWithText("思考過程").performClick()
+        composeRule.onNodeWithText("思考過程")
+            .assertHeightIsAtLeast(48.dp)
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
         composeRule.onNodeWithText("Detailed reasoning steps here").assertIsDisplayed()
         composeRule.onNodeWithContentDescription("收折思考過程").assertIsDisplayed()
 
@@ -106,7 +128,11 @@ class ChatMarkdownUiTest {
         // Verify language label and code content
         composeRule.onNodeWithText("kotlin").assertIsDisplayed()
         composeRule.onNodeWithText(codeText).assertIsDisplayed()
-        composeRule.onNodeWithText("複製").assertIsDisplayed()
+        composeRule.onNodeWithText("複製")
+            .assertIsDisplayed()
+            .assertWidthIsAtLeast(48.dp)
+            .assertHeightIsAtLeast(48.dp)
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
 
         // Click copy button
         composeRule.onNodeWithText("複製").performClick()
@@ -132,6 +158,38 @@ class ChatMarkdownUiTest {
 
         composeRule.onNodeWithText("Code").assertIsDisplayed()
         composeRule.onNodeWithText("SELECT 1;").assertIsDisplayed()
+    }
+
+    @Test
+    fun codeBlockView_longLanguage_keepsCopyTargetAccessible() {
+        val fakeClipboard = FakeClipboardManager()
+        val block = ChatContentBlock.CodeBlock(
+            language = "a".repeat(200),
+            code = "code",
+            isStreaming = false,
+        )
+
+        composeRule.setContent {
+            CompositionLocalProvider(LocalClipboardManager provides fakeClipboard) {
+                MaterialTheme {
+                    Box(Modifier.size(width = 160.dp, height = 120.dp).clipToBounds()) {
+                        CodeBlockView(
+                            block = block,
+                            modifier = Modifier.wrapContentHeight(align = Alignment.Top, unbounded = true),
+                        )
+                    }
+                }
+            }
+        }
+
+        composeRule.onNodeWithText("複製")
+            .assertIsDisplayed()
+            .assertWidthIsAtLeast(48.dp)
+            .assertHeightIsAtLeast(48.dp)
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
+            .performClick()
+        composeRule.onNodeWithText("已複製").assertIsDisplayed()
+        assertEquals("code", fakeClipboard.getText()?.text)
     }
 
     @Test
@@ -252,6 +310,20 @@ class ChatMarkdownUiTest {
         }
 
         composeRule.onNodeWithText("User message text").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(VoiceTts.SPEAK_BUTTON_DESCRIPTION).assertDoesNotExist()
+    }
+
+    @Test
+    fun messageBubble_userThinkingTags_areDisplayedLiterally() {
+        val text = "Before <think>literal</think> <thought>note</thought> <thinking>unfinished **text**"
+        val msg = UiMessage(id = "msg-user-tags", role = "user", text = text, isPartial = false)
+
+        composeRule.setContent {
+            MaterialTheme { MessageBubble(msg = msg) }
+        }
+
+        composeRule.onNodeWithText(text).assertIsDisplayed()
+        composeRule.onNodeWithText("思考過程").assertDoesNotExist()
         composeRule.onNodeWithContentDescription(VoiceTts.SPEAK_BUTTON_DESCRIPTION).assertDoesNotExist()
     }
 }

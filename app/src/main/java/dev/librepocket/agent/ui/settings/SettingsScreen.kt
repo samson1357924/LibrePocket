@@ -61,10 +61,12 @@ fun SettingsScreen(
      */
     voiceInputEnabled: Boolean = VoiceTools.SWITCH_INPUT_DEFAULT,
     voiceOutputEnabled: Boolean = VoiceTools.SWITCH_OUTPUT_DEFAULT,
+    openAiTtsEnabled: Boolean = VoiceTools.SWITCH_OPENAI_DEFAULT,
     voiceSwitchesEnabled: Boolean = true,
     voiceLoadFailed: Boolean = false,
     onVoiceInputSwitch: (Boolean) -> Unit = {},
     onVoiceOutputSwitch: (Boolean) -> Unit = {},
+    onOpenAiTtsSwitch: (Boolean) -> Unit = {},
     /**
      * 登出失敗碼（僅 `LOGOUT_*` 顯示；呼叫方由 form.errorCode 過濾傳入）。
      * 非 null 即顯示失敗卡；失敗不自動關 dialog（見 [showConfirmLogout]）。
@@ -186,6 +188,14 @@ fun SettingsScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            "雲端語音（OpenAI）支援所有版本，需同時開啟「語音輸出」與「OpenAI 語音」" +
+                                "（後者預設關閉）；需設定 OpenAI API 金鑰；音檔採純記憶體串流播放不落地；" +
+                                "送雲前會再次遮罩敏感內容（SCAFFOLD：管線接線尚在收斂，未接妥前降級走系統語音）。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                         Spacer(modifier = Modifier.height(8.dp))
                         // R4-2 三態提示（沿用既有文字樣式；失敗態開關不可撥，
                         // 避免在未知真相源上寫入）。
@@ -233,6 +243,21 @@ fun SettingsScreen(
                                 checked = voiceOutputEnabled,
                                 onCheckedChange = onVoiceOutputSwitch,
                                 enabled = voiceSwitchesEnabled,
+                            )
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                "OpenAI 語音",
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Switch(
+                                checked = openAiTtsEnabled,
+                                onCheckedChange = onOpenAiTtsSwitch,
+                                enabled = voiceSwitchesEnabled && voiceOutputEnabled,
                             )
                         }
                     }

@@ -524,7 +524,7 @@ class RoomSessionStore(
             redacted to false
         }
         val reason = event.failureReason?.let { Redactor.redactError(it) }
-        return PreparedEvent(text, truncated, reason)
+        return PreparedEvent(text, event.isTruncated || truncated, reason)
     }
 
     private data class PreparedEvent(val text: String, val truncated: Boolean, val reason: String?)
@@ -609,7 +609,7 @@ class RoomSessionStore(
         }
 
     override suspend fun exportJsonl(sessionId: String, destFile: File) {
-        // Paged streaming export: memory stays O(page), not O(session).
+        // Paged streaming export; the ID map is bounded by rows and source ID characters.
         // Writes to a tmp sibling first; destFile appears atomically only on
         // success, so a failure or oversize abort never leaves a half file.
         // The byte budget is enforced DURING the write (not after
@@ -623,6 +623,20 @@ class RoomSessionStore(
         var chars = 0L
         var rows = 0
         var afterSeq = 0L
+        val ids = HashMap<String, String>()
+        val assignedIds = HashSet<String>()
+        var idChars = 0L
+        fun exportId(id: String): String = ids.getOrPut(id) {
+            if (id.length > IMPORT_MAX_LINE_CHARS || idChars + id.length > IMPORT_MAX_CONTENT_CHARS) {
+                throw JsonlExportLimitException("export IDs too large")
+            }
+            idChars += id.length
+            var candidate: String
+            do {
+                candidate = redactionSafeExportId(UUID.randomUUID())
+            } while (!assignedIds.add(candidate))
+            candidate
+        }
         withContext(Dispatchers.IO) {
             try {
                 tmp.bufferedWriter(Charsets.UTF_8).use { out ->
@@ -630,16 +644,59 @@ class RoomSessionStore(
                         val page = dao.eventsAfter(sessionId, afterSeq, EXPORT_PAGE_SIZE)
                         if (page.isEmpty()) break
                         for (row in page) {
-                            val event = row.toEvent()
+                            if (++rows > IMPORT_MAX_ROWS) throw JsonlExportLimitException("export too large")
+                            // Inspect the stored text before any read-time redaction:
+                            // marker recognition requires the original boundary.
+                            val event = row.toEvent().copy(text = row.text)
                             // B1 defense-in-depth: legacy rows may predate write-time
                             // redaction, so re-redact at export time before touching disk.
                             // Mirrors TranscriptExport.exportRedacted semantics.
-                            val redacted = Redactor.redact(event.text).text
+                            val mappedRunId = exportId(event.runId)
+                            // Match the original marker before redaction, and only on system rows.
+                            // A marker already redacted on write may no longer contain its
+                            // runId; it cannot be safely identified or reconstructed here.
+                            // Legacy failure suffixes remain free text and still need redaction.
+                            val markerPrefix = "turn ${event.runId} "
+                            val markerTail = if (event.kind == "system" && event.text.startsWith(markerPrefix)) {
+                                event.text.substring(markerPrefix.length).takeIf {
+                                    it == "cancelled" || it == "interrupted" || it.startsWith("failed")
+                                }
+                            } else null
+                            val redactedPrefix = Redactor.redact(markerPrefix).text
+                            if (markerTail == null && event.kind == "system" && redactedPrefix != markerPrefix &&
+                                event.text.startsWith(redactedPrefix) &&
+                                event.text.substring(redactedPrefix.length).let {
+                                    it == "cancelled" || it == "interrupted" || it.startsWith("failed")
+                                }
+                            ) throw JsonlExportLimitException("export cannot identify redacted terminal marker")
+                            if (markerTail == null && event.kind == "system" &&
+                                listOf("cancelled", "interrupted", "failed").any { tail ->
+                                    val original = markerPrefix + tail
+                                    val masked = Redactor.redact(original).text
+                                    masked != original && (event.text == masked ||
+                                        (tail == "failed" && event.text.startsWith(masked)))
+                                }
+                            ) throw JsonlExportLimitException("export cannot identify redacted terminal marker")
+                            val redacted = if (markerTail != null) {
+                                "turn $mappedRunId ${Redactor.redact(markerTail).text}"
+                            } else Redactor.redact(event.text).text
                             val reason = event.failureReason?.let { Redactor.redactError(it) }
-                            val line = JsonlCodec.encode(event.copy(text = redacted, failureReason = reason))
+                            // IDs can contain arbitrary secrets, including in legacy rows.
+                            // Use one bijection for both fields, independent for each export.
+                            val line = JsonlCodec.encode(event.copy(
+                                runId = mappedRunId,
+                                parentRunId = event.parentRunId?.let { exportId(it) },
+                                text = redacted,
+                                failureReason = reason,
+                            ), isTruncated = row.isTruncated)
                             if (line.length > IMPORT_MAX_LINE_CHARS) throw JsonlExportLimitException("export line too large")
+                            // Import redacts again before applying its durable text cap.
+                            // Reject rather than produce an export that import would truncate.
+                            if (Redactor.redact(redacted).text.length > MAX_TEXT_CHARS) {
+                                throw JsonlExportLimitException("export text exceeds import limit (100000 characters)")
+                            }
                             chars += line.length
-                            if (chars > IMPORT_MAX_CONTENT_CHARS || ++rows > IMPORT_MAX_ROWS) throw JsonlExportLimitException("export too large")
+                            if (chars > IMPORT_MAX_CONTENT_CHARS) throw JsonlExportLimitException("export too large")
                             bytes += line.toByteArray(Charsets.UTF_8).size + 1
                             if (bytes > EXPORT_MAX_BYTES) throw JsonlExportLimitException("export too large")
                             out.write(line)
@@ -700,21 +757,51 @@ class RoomSessionStore(
                 override fun close() { if (closeAfterRead) input.close() }
             }
             // readLine() is unbounded; reject before constructing an oversized line.
-            java.io.PushbackReader(bounded.bufferedReader(Charsets.UTF_8), 1).use { reader ->
-                while (true) {
-                    ensureActive()
-                    val raw = readLimitedJsonlLine(reader) ?: break
-                    lineNumber++
-                    if (raw.isBlank()) continue
-                    contentChars += raw.length
-                    if (contentChars > IMPORT_MAX_CONTENT_CHARS || parsed.size >= IMPORT_MAX_ROWS)
-                        throw JsonlImportLimitException("import too large")
-                    val line = JsonlCodec.decode(lineNumber, raw)
-                    require(line.seq > lastSeq) { "import failed at line $lineNumber" }
-                    lastSeq = line.seq
-                    parsed.add(line)
+            val decoder = Charsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+            try {
+                java.io.PushbackReader(java.io.InputStreamReader(bounded, decoder).buffered(), 1).use { reader ->
+                    while (true) {
+                        ensureActive()
+                        val raw = readLimitedJsonlLine(reader) ?: break
+                        lineNumber++
+                        if (raw.isBlank()) continue
+                        contentChars += raw.length
+                        if (contentChars > IMPORT_MAX_CONTENT_CHARS || parsed.size >= IMPORT_MAX_ROWS)
+                            throw JsonlImportLimitException("import too large")
+                        val line = JsonlCodec.decode(lineNumber, raw)
+                        require(line.seq > lastSeq) { "import failed at line $lineNumber" }
+                        if (line.kind == "system" && terminalTail(line.runId, line.text) == null &&
+                            isAmbiguousRedactedTerminal(line.runId, line.text)
+                        ) throw IllegalArgumentException("import failed at line $lineNumber")
+                        if (Redactor.redact(line.text).text.length > MAX_TEXT_CHARS) {
+                            throw JsonlImportLimitException("import failed at line $lineNumber")
+                        }
+                        lastSeq = line.seq
+                        parsed.add(line)
+                    }
                 }
+            } catch (_: java.nio.charset.CharacterCodingException) {
+                throw IllegalArgumentException("import failed: invalid UTF-8")
             }
+        }
+        // Never persist source IDs: arbitrary input may contain sensitive data.
+        // One injective map preserves all run/parent relationships across rows.
+        val assignedIds = HashSet<String>()
+        for (line in parsed) {
+            assignedIds.add(line.runId)
+            line.parentRunId?.let { assignedIds.add(it) }
+        }
+        val remappedIds = HashMap<String, String>()
+        fun mapId(source: String): String = remappedIds.getOrPut(source) {
+            var id: String
+            do { id = redactionSafeExportId(UUID.randomUUID()) } while (!assignedIds.add(id))
+            id
+        }
+        for (line in parsed) {
+            mapId(line.runId)
+            line.parentRunId?.let { mapId(it) }
         }
         val now = clock()
         val title = parsed.firstOrNull { it.kind == "user" }?.text?.let {
@@ -739,28 +826,27 @@ class RoomSessionStore(
                 )
                 for (line in parsed) {
                     job?.ensureActive()
-                    // Same truncate parity as appendEvent: over-long texts are cut
-                    // and flagged instead of bypassing the MAX_TEXT_CHARS bound.
-                    val redactedText = Redactor.redact(line.text).text
-                    val (text, truncated) = if (redactedText.length > MAX_TEXT_CHARS) {
-                        redactedText.take(MAX_TEXT_CHARS) to true
-                    } else {
-                        redactedText to false
+                    val mappedRunId = remappedIds.getValue(line.runId)
+                    val tail = if (line.kind == "system") terminalTail(line.runId, line.text) else null
+                    val text = if (tail != null) "turn $mappedRunId $tail" else line.text
+                    val redactedText = Redactor.redact(text).text
+                    if (redactedText.length > MAX_TEXT_CHARS) {
+                        throw JsonlImportLimitException("import text exceeds limit")
                     }
                     dao.insertEvent(
                         TranscriptEventEntity(
                             0,
                             sessionId,
                             line.seq,
-                            line.runId,
+                            mappedRunId,
                             line.kind,
-                            text,
-                            truncated,
+                            redactedText,
+                            line.isTruncated,
                             line.imagesOmitted,
                             line.createdAt,
                             line.isPartial,
                             line.failureReason?.let { Redactor.redactError(it) },
-                            line.parentRunId,
+                            line.parentRunId?.let { remappedIds.getValue(it) },
                             line.attemptIndex,
                             line.isFinal,
                         ),
@@ -770,6 +856,29 @@ class RoomSessionStore(
                 job?.ensureActive()
                 sessionId
             }
+        }
+    }
+
+    private fun terminalTail(runId: String, text: String): String? {
+        val prefix = "turn $runId "
+        if (!text.startsWith(prefix)) return null
+        return text.substring(prefix.length).takeIf {
+            it == "cancelled" || it == "interrupted" || it.startsWith("failed")
+        }
+    }
+
+    private fun isAmbiguousRedactedTerminal(runId: String, text: String): Boolean {
+        val prefix = "turn $runId "
+        val maskedPrefix = Redactor.redact(prefix).text
+        if (maskedPrefix != prefix && text.startsWith(maskedPrefix) &&
+            text.substring(maskedPrefix.length).let {
+                it == "cancelled" || it == "interrupted" || it.startsWith("failed")
+            }
+        ) return true
+        return listOf("cancelled", "interrupted", "failed").any { tail ->
+            val original = prefix + tail
+            val masked = Redactor.redact(original).text
+            masked != original && (text == masked || (tail == "failed" && text.startsWith(masked)))
         }
     }
 
@@ -988,6 +1097,7 @@ class RoomSessionStore(
         parentRunId = parentRunId,
         attemptIndex = attemptIndex,
         isFinal = isFinalFlag,
+        isTruncated = isTruncated,
     )
 
     private fun SessionEntity.toMeta(): SessionMeta = SessionMeta(
@@ -1015,5 +1125,12 @@ class RoomSessionStore(
         const val MILLIS_PER_DAY = 86_400_000L
         const val IMPORT_MODEL = "imported/unknown"
         const val IMPORT_FALLBACK_TITLE = "imported"
+    }
+}
+
+/** Encode all UUID hex nibbles as a-p: no digits or punctuation for redaction to rewrite. */
+internal fun redactionSafeExportId(id: UUID): String = buildString(32) {
+    for (char in id.toString()) {
+        if (char != '-') append('a' + char.digitToInt(16))
     }
 }

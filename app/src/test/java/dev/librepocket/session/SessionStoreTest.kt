@@ -1,8 +1,12 @@
 package dev.librepocket.session
 
 import androidx.test.core.app.ApplicationProvider
+import dev.librepocket.agent.ui.chat.findDanglingRunIds
+import dev.librepocket.agent.ui.chat.snapshotSwitchHistory
+import dev.librepocket.redact.Redactor
 import java.io.File
 import java.nio.file.Files
+import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.joinAll
@@ -289,12 +293,13 @@ class SessionStoreTest {
         assertEquals(original.size, back.size)
         for ((a, b) in original.zip(back)) {
             assertEquals(a.seq, b.seq)
-            assertEquals(a.runId, b.runId)
             assertEquals(a.kind, b.kind)
             assertEquals(a.text, b.text)
             assertEquals(a.imagesOmitted, b.imagesOmitted)
             assertEquals(a.createdAt, b.createdAt)
         }
+        assertEquals(back[0].runId, back[1].runId)
+        assertNotEquals(back[0].runId, back[2].runId)
         val meta = db.sessionDao().sessionById(imported)!!
         assertEquals("first message here", meta.title)
     }
@@ -314,7 +319,7 @@ class SessionStoreTest {
         val back = store.loadEvents(imported)
         assertEquals(listOf("user", "assistant", "reasoning"), back.map { it.kind })
         val marker = back.single { it.kind == "reasoning" }
-        assertEquals("r1", marker.runId)
+        assertEquals(back.first { it.kind == "assistant" }.runId, marker.runId)
         assertEquals("", marker.text)
     }
 
@@ -388,6 +393,9 @@ class SessionStoreTest {
         assertEquals(100_000, loaded.length)
         val flag = db.sessionDao().allEvents(sid).single().isTruncated
         assertTrue(flag)
+        assertTrue(store.loadEvents(sid).single().isTruncated)
+        assertTrue(store.loadTailEvents(sid, 1).single().isTruncated)
+        assertTrue(store.loadEventsBefore(sid, Long.MAX_VALUE, 1).single().isTruncated)
     }
 
     @Test fun import_redactsSensitiveContent(): Unit = runBlocking {
@@ -459,6 +467,91 @@ class SessionStoreTest {
         assertTrue(out.contains("⟦REDACTED"))
     }
 
+    @Test fun export_idEncodingSurvivesRedactionAtNumericBoundaries() {
+        val uuids = listOf(
+            "00000000-0000-4000-8000-0900123456ff",
+            "41111111-1111-4111-8111-111111111111",
+            "ffffffff-ffff-4fff-bfff-ffffffffffff",
+        )
+        val ids = uuids.map { redactionSafeExportId(UUID.fromString(it)) }
+        assertEquals(ids.size, ids.toSet().size)
+        for (id in ids) {
+            assertTrue(id.matches(Regex("[a-p]{32}")))
+            for (tail in listOf("cancelled", "interrupted", "failed: safe")) {
+                val marker = "turn $id $tail"
+                assertEquals(marker, Redactor.redact(marker).text)
+            }
+        }
+        assertNotEquals("turn ${uuids[0]} cancelled", Redactor.redact("turn ${uuids[0]} cancelled").text)
+    }
+
+    @Test fun export_alreadyRedactedMarkerFailsWithoutReplacingDestination(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        val run = "user@example.com"
+        store.appendEvent(event(sid, kind = "user", text = "q", run = run))
+        store.appendEvent(event(sid, kind = "system", text = "turn $run cancelled", run = run))
+        val stored = store.loadEvents(sid)
+        assertEquals("turn ⟦REDACTED:EMAIL⟧ cancelled", stored[1].text)
+        assertExportLimitPreservesDestination(sid, "export cannot identify redacted terminal marker")
+    }
+
+    @Test fun export_bearerRedactionThatConsumedTerminalFailsClosed(): Unit = runBlocking {
+        setUp()
+        for (tail in listOf("cancelled", "interrupted", "failed: synthetic")) {
+            val sid = store.createSession("t", "p/m")
+            val run = "bearer syntheticSecret123"
+            store.appendEvent(event(sid, kind = "user", text = "q", run = run))
+            store.appendEvent(event(sid, kind = "system", text = "turn $run $tail", run = run))
+            assertTrue(!store.loadEvents(sid)[1].text.contains("syntheticSecret123"))
+            assertExportLimitPreservesDestination(sid, "export cannot identify redacted terminal marker")
+        }
+    }
+
+    @Test fun export_remapsSensitiveIdsAcrossPagesAndImport(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        val logical = "private-user@example.com"
+        val attempt = "sk-abcDEF1234567890"
+        val other = "sk-abcDEF1234567891"
+        // Import maps arbitrary IDs before persistence; export maps them again.
+        val source = File(tmpDir, "ids.jsonl")
+        val events = (1..RoomSessionStore.EXPORT_PAGE_SIZE + 1).map { seq ->
+            TranscriptEvent(
+                seq = seq.toLong(), sessionId = sid,
+                runId = if (seq == 1) logical else if (seq == 2) other else attempt,
+                kind = if (seq == 1) "user" else "assistant", text = "safe",
+                createdAt = now, parentRunId = if (seq == 1) null else logical,
+                attemptIndex = if (seq == 1) null else 1,
+            )
+        }
+        source.writeText(events.joinToString("\n") { JsonlCodec.encode(it) } + "\n")
+        val imported = store.importJsonl(source)
+        val dest = File(tmpDir, "ids-export.jsonl")
+        store.exportJsonl(imported, dest)
+        val raw = dest.readText()
+        for (secret in listOf(logical, attempt, other)) assertTrue(!raw.contains(secret))
+        val lines = dest.readLines().mapIndexed { i, line -> JsonlCodec.decode(i + 1, line) }
+        assertEquals(lines[0].runId, lines[1].parentRunId)
+        assertEquals(lines[0].runId, lines.last().parentRunId)
+        assertEquals(lines[2].runId, lines.last().runId)
+        assertNotEquals(lines[1].runId, lines[2].runId)
+        assertNotEquals(lines[0].runId, lines[2].runId)
+        val restored = store.loadEvents(store.importJsonl(dest), limit = events.size)
+        assertEquals(restored[0].runId, restored[1].parentRunId)
+        assertEquals(restored[0].runId, restored.last().parentRunId)
+        assertEquals(restored[2].runId, restored.last().runId)
+        assertNotEquals(restored[1].runId, restored[2].runId)
+        assertEquals(events.map { it.attemptIndex }, restored.map { it.attemptIndex })
+        // Export must not rewrite existing Room data.
+        val stored = store.loadEvents(imported, limit = events.size)
+        assertTrue(stored.none { it.runId in listOf(logical, attempt, other) || it.parentRunId == logical })
+        assertEquals(stored[0].runId, stored.last().parentRunId)
+        val second = File(tmpDir, "ids-export-again.jsonl")
+        store.exportJsonl(imported, second)
+        assertNotEquals(lines[0].runId, JsonlCodec.decode(1, second.readLines().first()).runId)
+    }
+
     @Test fun import_rejectsBadFieldValues(): Unit = runBlocking {
         setUp()
         val cases = listOf(
@@ -483,18 +576,124 @@ class SessionStoreTest {
         }
     }
 
-    @Test fun import_truncatesHugeTextWithFlag(): Unit = runBlocking {
+    @Test fun import_mapsAllIdsAndRewritesTerminalsBeforePersistence(): Unit = runBlocking {
         setUp()
-        val big = "z".repeat(100_001)
-        val f = File(tmpDir, "big.jsonl")
-        f.writeText(
-            "{\"seq\":1,\"runId\":\"r\",\"kind\":\"user\",\"text\":\"$big\",\"imagesOmitted\":0,\"createdAt\":1}\n",
-            Charsets.UTF_8,
-        )
-        val imported = store.importJsonl(f)
-        val loaded = store.loadEvents(imported).single().text
-        assertEquals(RoomSessionStore.MAX_TEXT_CHARS, loaded.length)
+        val logical = "person@example.com"
+        val attempt = "sk-abcDEF1234567890"
+        for (tail in listOf("cancelled", "interrupted", "failed: synthetic")) {
+            val events = listOf(
+                event("unused", kind = "user", text = "question", run = logical).copy(seq = 1),
+                event("unused", kind = "assistant", text = "answer", run = attempt)
+                    .copy(seq = 2, parentRunId = logical, attemptIndex = 1),
+                event("unused", kind = "system", text = "turn $logical $tail", run = logical).copy(seq = 3),
+            )
+            val imported = store.importJsonl(events.joinToString("\n") { JsonlCodec.encode(it) }.byteInputStream())
+            val rows = db.sessionDao().allEvents(imported)
+            assertEquals(rows[0].runId, rows[1].parentRunId)
+            assertEquals(rows[0].runId, rows[2].runId)
+            assertNotEquals(rows[0].runId, rows[1].runId)
+            assertEquals("turn ${rows[0].runId} $tail", rows[2].text)
+            assertTrue(rows.none { it.runId == logical || it.runId == attempt || it.parentRunId == logical })
+            assertTrue(findDanglingRunIds(store.loadEvents(imported)).isEmpty())
+        }
+    }
+
+    @Test fun import_alreadyRedactedTerminalFailsBeforeWriting(): Unit = runBlocking {
+        setUp()
+        for (run in listOf("person@example.com", "bearer syntheticSecret123")) {
+            for (tail in listOf("cancelled", "interrupted", "failed: synthetic")) {
+                val marker = Redactor.redact("turn $run $tail").text
+                val first = event("unused", kind = "user", text = "q", run = run).copy(seq = 1)
+                val second = event("unused", kind = "system", text = marker, run = run).copy(seq = 2)
+                val source = listOf(first, second).joinToString("\n") { JsonlCodec.encode(it) }
+                try {
+                    store.importJsonl(source.byteInputStream())
+                    fail("unidentifiable terminal must fail")
+                } catch (e: IllegalArgumentException) {
+                    assertEquals("import failed at line 2", e.message)
+                }
+                assertTrue(store.listSessions().isEmpty())
+            }
+        }
+    }
+
+    @Test fun import_rejectsMalformedUtf8WithoutWriting(): Unit = runBlocking {
+        setUp()
+        val valid = JsonlCodec.encode(event("unused", text = "valid", run = "r").copy(seq = 1))
+        val prefix = "\n{\"seq\":2,\"runId\":\"r\",\"kind\":\"user\",\"text\":\"".toByteArray()
+        val suffix = "\",\"imagesOmitted\":0,\"createdAt\":1}".toByteArray()
+        for (invalid in listOf(byteArrayOf(0xc3.toByte(), 0x28), byteArrayOf(0xe2.toByte(), 0x82.toByte()))) {
+            val bytes = valid.toByteArray() + prefix + invalid + suffix
+            try {
+                store.importJsonl(bytes.inputStream())
+                fail("malformed UTF-8 must fail")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("import failed: invalid UTF-8", e.message)
+            }
+            assertTrue(store.listSessions().isEmpty())
+        }
+        val id = store.importJsonl(JsonlCodec.encode(event("unused", text = "合法�字", run = "r").copy(seq = 1)).byteInputStream())
+        assertEquals("合法�字", store.loadEvents(id).single().text)
+    }
+
+    @Test fun import_rejectsOversizedRedactedTextWithoutCreatingSession(): Unit = runBlocking {
+        setUp()
+        for (big in listOf("z".repeat(100_001), "x".repeat(99_990) + " a@b.co")) {
+            val valid = JsonlCodec.encode(event("unused").copy(seq = 1))
+            val invalid = JsonlCodec.encode(event("unused", text = big).copy(seq = 2))
+            try {
+                store.importJsonl("$valid\n$invalid\n".byteInputStream())
+                fail("oversized redacted text must fail")
+            } catch (e: JsonlImportLimitException) {
+                assertEquals("import failed at line 2", e.message)
+            }
+            assertTrue(store.listSessions().isEmpty())
+        }
+    }
+
+    @Test fun export_preservesTruncationFlagAndRejectsInvalidFlag(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        store.appendEvent(event(sid, text = "x".repeat(100_001)))
+        val dest = File(tmpDir, "truncated.jsonl")
+        store.exportJsonl(sid, dest)
+        val line = dest.readText().trimEnd()
+        assertTrue(JsonlCodec.decode(1, line).isTruncated)
+        val imported = store.importJsonl(dest)
         assertTrue(db.sessionDao().allEvents(imported).single().isTruncated)
+        assertTrue(store.loadEvents(imported).single().isTruncated)
+        assertEquals(100_000, store.loadEvents(imported).single().text.length)
+        val before = store.listSessions().size
+        for (invalid in listOf("null", "1", "\"true\"", "{}")) {
+            try {
+                store.importJsonl(line.replace("\"isTruncated\":true", "\"isTruncated\":$invalid").byteInputStream())
+                fail("invalid flag must fail")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("import failed at line 1", e.message)
+            }
+            assertEquals(before, store.listSessions().size)
+        }
+        assertTrue(!JsonlCodec.decode(1, JsonlCodec.encode(event(sid).copy(seq = 1))).isTruncated)
+        assertTrue(JsonlCodec.decode(1, JsonlCodec.encode(event(sid).copy(seq = 1, isTruncated = true))).isTruncated)
+    }
+
+    @Test fun snapshot_preservesExistingAndNewTruncationFlags(): Unit = runBlocking {
+        setUp()
+        val source = store.createSession("source", "p/m")
+        val target = store.createSession("target", "p/m")
+        store.appendEvent(event(source, text = "already shortened").copy(isTruncated = true))
+        store.appendEvent(event(source, kind = "assistant", text = "answer"))
+        store.appendEvents(listOf(
+            event(source, text = "x".repeat(RoomSessionStore.MAX_TEXT_CHARS + 1), run = "other"),
+            event(source, kind = "assistant", text = "complete", run = "other"),
+        ))
+        val original = store.loadEvents(source)
+        assertEquals(listOf(true, false, true, false), original.map { it.isTruncated })
+
+        assertEquals(4, snapshotSwitchHistory(store, source, target, "old", "new", false))
+        val copied = store.loadEvents(target).filter { it.kind == "user" || it.kind == "assistant" }
+        assertEquals(original.map { it.text }, copied.map { it.text })
+        assertEquals(listOf(true, false, true, false), copied.map { it.isTruncated })
     }
 
     @Test fun import_tooLargeRefusedBeforeReading(): Unit = runBlocking {
@@ -537,7 +736,7 @@ class SessionStoreTest {
 
     @Test fun import_lineLimitIsInclusiveForLegacyBackup(): Unit = runBlocking {
         setUp()
-        val prefix = "{\"seq\":1,\"runId\":\"r\",\"kind\":\"user\",\"text\":\""
+        val prefix = "{\"seq\":1,\"runId\":\"r\",\"kind\":\"user\",\"text\":\"x\",\"padding\":\""
         val suffix = "\",\"imagesOmitted\":0,\"createdAt\":1}"
         val line = prefix + "x".repeat(RoomSessionStore.IMPORT_MAX_LINE_CHARS - prefix.length - suffix.length) + suffix
         val id = store.importJsonl(line.byteInputStream())
@@ -560,7 +759,8 @@ class SessionStoreTest {
         val id = store.importJsonl(valid.byteInputStream())
         assertEquals(2, store.countEvents(id))
         val large = buildString {
-            for (i in 1..10) append(prefix.format(i)).append("x".repeat(900_000)).append(suffix).append('\n')
+            for (i in 1..10) append(prefix.format(i)).append("x\",\"padding\":\"")
+                .append("x".repeat(900_000)).append(suffix).append('\n')
         }
         try {
             store.importJsonl(large.byteInputStream())
@@ -639,6 +839,53 @@ class SessionStoreTest {
         assertExportLimitPreservesDestination(sid, "export line too large")
     }
 
+    @Test fun export_legacyTextOverImportCapPreservesDestination(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        insertLegacyExportRows(sid, 1, "x".repeat(100_001))
+        assertExportLimitPreservesDestination(sid, "export text exceeds import limit (100000 characters)")
+    }
+
+    @Test fun export_redactionExpansionOverImportCapPreservesDestination(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        insertLegacyExportRows(sid, 1, "x".repeat(99_990) + " a@b.co")
+        assertExportLimitPreservesDestination(sid, "export text exceeds import limit (100000 characters)")
+    }
+
+    @Test fun export_textAtImportCapRoundTripsWithoutTruncation(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        val text = "x".repeat(100_000)
+        insertLegacyExportRows(sid, 1, text)
+        val dest = File(tmpDir, "at-cap.jsonl")
+        store.exportJsonl(sid, dest)
+        val imported = store.importJsonl(dest)
+        assertEquals(text, store.loadEvents(imported).single().text)
+        assertTrue(!db.sessionDao().allEvents(imported).single().isTruncated)
+    }
+
+    @Test fun export_oversizedLegacyIdPreservesDestination(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        insertLegacyExportRows(sid, 1, "safe", "x".repeat(RoomSessionStore.IMPORT_MAX_LINE_CHARS + 1))
+        assertExportLimitPreservesDestination(sid, "export IDs too large")
+    }
+
+    @Test fun export_totalDistinctLegacyIdsAreBounded(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        db.runInTransaction {
+            repeat(9) { index ->
+                db.sessionDao().insertEvent(TranscriptEventEntity(
+                    0, sid, index.toLong() + 1, "$index" + "x".repeat(1_000_000), "user", "safe",
+                    false, 0, now, false, null, null, null,
+                ))
+            }
+        }
+        assertExportLimitPreservesDestination(sid, "export IDs too large")
+    }
+
     @Test fun export_rowLimitFailureRemovesTmpAndPreservesDestination(): Unit = runBlocking {
         setUp()
         val sid = store.createSession("t", "p/m")
@@ -679,7 +926,7 @@ class SessionStoreTest {
         val restored = store.loadEvents(imported, limit = count)
         assertNotEquals(sid, imported)
         assertEquals(count, restored.size)
-        assertEquals(original.map { it.copy(sessionId = imported) }, restored)
+        assertEquals(original.map { it.copy(sessionId = imported, runId = restored.first().runId) }, restored)
         assertTrue(restored.all { it.text == text })
     }
 

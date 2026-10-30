@@ -12,6 +12,7 @@ import dev.librepocket.session.JsonlImportLimitException
 import dev.librepocket.session.JsonlExportLimitException
 import dev.librepocket.session.SessionMeta
 import dev.librepocket.session.SessionStore
+import dev.librepocket.session.TranscriptEvent
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
@@ -87,6 +88,13 @@ class SessionListViewModel(
             loadSessions()
         }
     }
+
+    /** Read-only, bounded page; never attaches the session to chat or a provider. */
+    suspend fun readTranscriptPage(sessionId: String, afterSeq: Long): List<TranscriptEvent> =
+        withContext(Dispatchers.IO) {
+            require(store.getSession(sessionId) != null) { "找不到對話" }
+            store.loadEvents(sessionId, afterSeq, 100)
+        }
 
     private suspend fun loadSessions() {
         val generation = synchronized(stateLock) { ++refreshGeneration }

@@ -26,6 +26,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -42,6 +43,72 @@ import dev.librepocket.agent.ui.setup.setupErrorText
 import dev.librepocket.automation.AutomationSettingsState
 import dev.librepocket.voice.VoiceTools
 import dev.librepocket.voice.VoiceTts
+
+data class TranscriptPickers(
+    val exportPickerPending: Boolean = false,
+    val exportPickerFailed: Boolean = false,
+    val importPickerPending: Boolean = false,
+    val importPickerFailed: Boolean = false,
+    val launchExport: (String?) -> Unit = {},
+    val launchImport: () -> Unit = {},
+)
+
+/** Lives above navigation/loading so pending document results retain their original target. */
+@Composable
+fun rememberTranscriptPickers(
+    onExportCurrentSession: (String, Uri) -> Unit,
+    onImportSession: (Uri) -> Unit,
+    onDismissExportState: () -> Unit,
+    onDismissImportState: () -> Unit,
+): TranscriptPickers {
+    var pendingExportSessionId by rememberSaveable { mutableStateOf<String?>(null) }
+    var exportPickerFailed by rememberSaveable { mutableStateOf(false) }
+    var importPickerFailed by rememberSaveable { mutableStateOf(false) }
+    var importPickerPending by rememberSaveable { mutableStateOf(false) }
+    val exportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/jsonl"),
+    ) { uri ->
+        val sessionId = pendingExportSessionId
+        pendingExportSessionId = null
+        if (uri != null && sessionId != null) onExportCurrentSession(sessionId, uri)
+    }
+    val importLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        importPickerPending = false
+        if (uri != null) onImportSession(uri)
+    }
+    val launchExport: (String?) -> Unit = { sessionId ->
+        sessionId?.let { sessionId ->
+            onDismissExportState()
+            pendingExportSessionId = sessionId
+            exportPickerFailed = false
+            try {
+                exportLauncher.launch("librepocket_${sessionId.take(8)}.jsonl")
+            } catch (e: Exception) {
+                pendingExportSessionId = null
+                exportPickerFailed = true
+            }
+        }
+    }
+    val launchImport: () -> Unit = {
+        if (!importPickerPending) {
+            onDismissImportState()
+            importPickerFailed = false
+            importPickerPending = true
+            try {
+                importLauncher.launch(arrayOf("application/jsonl", "application/json", "text/*", "*/*"))
+            } catch (e: Exception) {
+                importPickerPending = false
+                importPickerFailed = true
+            }
+        }
+    }
+    return TranscriptPickers(
+        pendingExportSessionId != null, exportPickerFailed, importPickerPending, importPickerFailed,
+        launchExport, launchImport,
+    )
+}
 
 @Composable
 fun SettingsScreen(
@@ -124,13 +191,17 @@ fun SettingsScreen(
     currentSessionId: String? = null,
     exportState: ExportUiState = ExportUiState.Idle,
     importState: ImportUiState = ImportUiState.Idle,
-    onExportCurrentSession: (Uri) -> Unit = {},
-    onImportSession: (Uri) -> Unit = {},
+    pickers: TranscriptPickers = TranscriptPickers(),
     onOpenSession: (String) -> Unit = {},
     onDismissExportState: () -> Unit = {},
     onDismissImportState: () -> Unit = {},
 ) {
     var confirmLogout by remember { mutableStateOf(false) }
+    val launchExport = { pickers.launchExport(currentSessionId) }
+    val launchImport = pickers.launchImport
+    val exportPickerFailed = pickers.exportPickerFailed
+    val importPickerFailed = pickers.importPickerFailed
+    val importPickerPending = pickers.importPickerPending
     // 失敗不自動關 dialog：error 存續即重現確認態（confirm 已手動關閉又回來也一樣）。
     val showConfirmLogout = confirmLogout || logoutErrorCode != null
     Column(
@@ -328,8 +399,12 @@ fun SettingsScreen(
                     currentSessionId = currentSessionId,
                     exportState = exportState,
                     importState = importState,
-                    onExportCurrentSession = onExportCurrentSession,
-                    onImportSession = onImportSession,
+                    onLaunchExport = launchExport,
+                    onLaunchImport = launchImport,
+                    exportPickerPending = pickers.exportPickerPending,
+                    importPickerPending = importPickerPending,
+                    exportPickerFailed = exportPickerFailed,
+                    importPickerFailed = importPickerFailed,
                     onOpenSession = onOpenSession,
                     onDismissExportState = onDismissExportState,
                     onDismissImportState = onDismissImportState,
@@ -511,8 +586,12 @@ fun SettingsScreen(
                         currentSessionId = currentSessionId,
                         exportState = exportState,
                         importState = importState,
-                        onExportCurrentSession = onExportCurrentSession,
-                        onImportSession = onImportSession,
+                        onLaunchExport = launchExport,
+                        onLaunchImport = launchImport,
+                        exportPickerPending = pickers.exportPickerPending,
+                        importPickerPending = importPickerPending,
+                        exportPickerFailed = exportPickerFailed,
+                        importPickerFailed = importPickerFailed,
                         onOpenSession = onOpenSession,
                         onDismissExportState = onDismissExportState,
                         onDismissImportState = onDismissImportState,
@@ -644,33 +723,21 @@ fun SettingsScreen(
 }
 
 @Composable
-fun TranscriptBackupCard(
+internal fun TranscriptBackupCard(
     currentSessionId: String?,
     exportState: ExportUiState,
     importState: ImportUiState,
-    onExportCurrentSession: (Uri) -> Unit,
-    onImportSession: (Uri) -> Unit,
+    onLaunchExport: () -> Unit,
+    onLaunchImport: () -> Unit,
+    exportPickerPending: Boolean,
+    importPickerPending: Boolean,
+    exportPickerFailed: Boolean,
+    importPickerFailed: Boolean,
     onOpenSession: (String) -> Unit,
     onDismissExportState: () -> Unit = {},
     onDismissImportState: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
-    val exportLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("application/jsonl"),
-    ) { uri ->
-        if (uri != null) {
-            onExportCurrentSession(uri)
-        }
-    }
-
-    val importLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument(),
-    ) { uri ->
-        if (uri != null) {
-            onImportSession(uri)
-        }
-    }
-
     Card(
         modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
@@ -681,7 +748,12 @@ fun TranscriptBackupCard(
             Text("對話備份與匯出 (JSONL)", style = MaterialTheme.typography.titleMedium)
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                "可將對話匯出為標準 JSONL 格式（敏感資訊於匯出時自動脫敏），或匯入先前備份的對話檔至本機資料庫。",
+                "匯出會嘗試脫敏，但無法保證移除所有敏感資訊；分享前請自行檢查檔案。匯入建立本機副本，不驗證來源或真實性；可唯讀檢視，開啟對話可能建立不含歷史的新副本。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "儲存目的地由文件提供者管理；匯出失敗或取消時，目的地可能留下空檔或部分內容，請自行檢查並刪除。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -689,11 +761,8 @@ fun TranscriptBackupCard(
 
             // 匯出按鈕
             OutlinedButton(
-                onClick = {
-                    val defaultName = "librepocket_${currentSessionId?.take(8) ?: "chat"}.jsonl"
-                    exportLauncher.launch(defaultName)
-                },
-                enabled = currentSessionId != null && exportState !is ExportUiState.Exporting,
+                onClick = onLaunchExport,
+                enabled = currentSessionId != null && !exportPickerPending && exportState !is ExportUiState.Exporting,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 if (exportState is ExportUiState.Exporting) {
@@ -703,6 +772,9 @@ fun TranscriptBackupCard(
                 } else {
                     Text("匯出目前對話")
                 }
+            }
+            if (exportPickerFailed) {
+                Text("無法開啟儲存選擇器，請重試。", color = MaterialTheme.colorScheme.error)
             }
             if (currentSessionId == null) {
                 Spacer(modifier = Modifier.height(4.dp))
@@ -780,10 +852,8 @@ fun TranscriptBackupCard(
 
             // 匯入按鈕
             OutlinedButton(
-                onClick = {
-                    importLauncher.launch(arrayOf("application/jsonl", "application/json", "text/*", "*/*"))
-                },
-                enabled = importState !is ImportUiState.Importing,
+                onClick = onLaunchImport,
+                enabled = !importPickerPending && importState !is ImportUiState.Importing,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 if (importState is ImportUiState.Importing) {
@@ -793,6 +863,9 @@ fun TranscriptBackupCard(
                 } else {
                     Text("匯入對話檔")
                 }
+            }
+            if (importPickerFailed) {
+                Text("無法開啟檔案選擇器，請重試。", color = MaterialTheme.colorScheme.error)
             }
             when (importState) {
                 is ImportUiState.Success -> {
@@ -831,7 +904,7 @@ fun TranscriptBackupCard(
                                 onClick = { onOpenSession(importState.sessionId) },
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
-                                Text("切換至該對話")
+                                Text("唯讀檢視匯入內容")
                             }
                         }
                     }

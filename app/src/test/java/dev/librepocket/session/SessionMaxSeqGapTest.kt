@@ -229,12 +229,11 @@ class SessionMaxSeqGapRoomTest {
         assertEquals(before.size, after.size)
         for (i in before.indices) {
             assertEquals(before[i].seq, after[i].seq)
-            assertEquals(before[i].runId, after[i].runId)
             assertEquals(before[i].kind, after[i].kind)
             assertEquals(before[i].text, after[i].text)
             assertEquals(before[i].isPartial, after[i].isPartial)
             assertEquals(before[i].isFinal, after[i].isFinal)
-            assertEquals(before[i].parentRunId, after[i].parentRunId)
+            assertEquals(before[i].parentRunId == null, after[i].parentRunId == null)
             assertEquals(before[i].attemptIndex, after[i].attemptIndex)
             assertEquals(before[i].failureReason, after[i].failureReason)
         }
@@ -246,7 +245,7 @@ class SessionMaxSeqGapRoomTest {
         assertEquals(0, partial.attemptIndex)
         val terminal = after.last { it.kind == "assistant" && !it.isPartial }
         assertEquals("ok", terminal.text)
-        assertEquals("L", terminal.parentRunId)
+        assertEquals(after.first { it.kind == "user" }.runId, terminal.parentRunId)
         assertEquals(1, terminal.attemptIndex)
         assertTrue(terminal.isFinal)
     }

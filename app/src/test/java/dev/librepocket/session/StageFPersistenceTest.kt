@@ -259,7 +259,8 @@ class StageFPersistenceTest {
         assertFalse(back[1].isFinal)
         assertTrue(back[3].isFinal)
         assertEquals("half", back[1].text)
-        assertEquals("turn L cancelled", back[3].text)
+        assertEquals(back[0].runId, back[3].runId)
+        assertEquals("turn ${back[3].runId} cancelled", back[3].text)
     }
 
     @Test fun jsonlCodec_missingKeyDefaultsFinal() {

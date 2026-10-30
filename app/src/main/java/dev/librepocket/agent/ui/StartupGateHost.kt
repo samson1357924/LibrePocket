@@ -1,16 +1,12 @@
 package dev.librepocket.agent.ui
 
-import android.net.Uri
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ChatBubbleOutline
@@ -39,6 +35,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.disabled
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
@@ -92,7 +90,10 @@ internal fun StartupGateHost(
     onOpenSession: (String) -> Unit = {},
     onEditEndpoint: () -> Unit = {},
     onDrawerOpened: () -> Unit = {},
-    onImportSession: (Uri) -> Unit = {},
+    onImportPickerStart: () -> Unit = {},
+    importBusy: Boolean = false,
+    importPickerFailed: Boolean = false,
+    onViewTranscript: (String) -> Unit = {},
     chatContent: @Composable (PaddingValues) -> Unit,
     settingsContent: @Composable (PaddingValues) -> Unit,
     setupContent: @Composable (PaddingValues, Boolean) -> Unit,
@@ -117,13 +118,6 @@ internal fun StartupGateHost(
 ) {
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
-    val drawerImportLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument(),
-    ) { uri ->
-        if (uri != null) {
-            onImportSession(uri)
-        }
-    }
     val backStack by navController.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route
     val hasEndpoint = gate is EndpointGate.Ready
@@ -220,7 +214,8 @@ internal fun StartupGateHost(
         gesturesEnabled = hasEndpoint || effectiveGuardError != null,
         drawerContent = {
             ModalDrawerSheet {
-                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                LazyColumn(modifier = Modifier.testTag("sessionDrawerList")) {
+                  item {
                     Text(
                         text = appName,
                         modifier = Modifier.fillMaxWidth()
@@ -243,13 +238,25 @@ internal fun StartupGateHost(
                 NavigationDrawerItem(
                     label = { Text("匯入對話 (JSONL)") },
                     selected = false,
+                    modifier = if (importBusy) Modifier.semantics { disabled() } else Modifier,
                     onClick = {
-                        scope.launch { drawerState.close() }
-                        drawerImportLauncher.launch(arrayOf("application/jsonl", "application/json", "text/*", "*/*"))
+                        if (!importBusy) {
+                            scope.launch { drawerState.close() }
+                            onImportPickerStart()
+                        }
                     },
                     icon = { Icon(Icons.Filled.FileOpen, contentDescription = null) },
                 )
-                if (sessions.isNotEmpty()) {
+                Text(
+                    "匯入會建立新的本機對話副本，不驗證來源或真實性。可從歷史對話唯讀檢視；開啟對話可能建立不含歷史的新副本。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                )
+                if (importPickerFailed) Text("無法開啟檔案選擇器，請重試。")
+                  }
+                  if (sessions.isNotEmpty()) {
+                    item {
                     HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
                     Text(
                         text = "歷史對話",
@@ -257,7 +264,8 @@ internal fun StartupGateHost(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                     )
-                    sessions.take(20).forEach { meta ->
+                    }
+                    items(sessions, key = { it.sessionId }) { meta ->
                         NavigationDrawerItem(
                             label = {
                                 Text(
@@ -277,9 +285,15 @@ internal fun StartupGateHost(
                                 }
                             },
                             icon = { Icon(Icons.Filled.ChatBubbleOutline, contentDescription = null) },
+                            badge = {
+                                IconButton(onClick = { onViewTranscript(meta.sessionId); scope.launch { drawerState.close() } }) {
+                                    Icon(Icons.Filled.FileOpen, contentDescription = "唯讀檢視 ${meta.title}")
+                                }
+                            },
                         )
                     }
                 }
+                item {
                 NavigationDrawerItem(
                     label = { Text("API 設定") },
                     selected = currentRoute == Routes.SETUP,
@@ -298,6 +312,7 @@ internal fun StartupGateHost(
                     },
                     icon = { Icon(Icons.Filled.Settings, contentDescription = null) },
                 )
+                }
                 }
             }
         },

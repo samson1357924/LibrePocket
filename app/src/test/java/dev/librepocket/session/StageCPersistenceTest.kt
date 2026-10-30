@@ -240,7 +240,7 @@ class StageCPersistenceTest {
         assertEquals("boom", partial.failureReason)
         val success = back.last { it.kind == "assistant" && !it.isPartial }
         assertEquals("ok", success.text)
-        assertEquals("L", success.parentRunId)
+        assertEquals(back.first { it.kind == "user" }.runId, success.parentRunId)
         assertEquals(1, success.attemptIndex)
     }
 

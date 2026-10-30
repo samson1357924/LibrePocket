@@ -72,6 +72,7 @@ data class TranscriptEvent(
     val parentRunId: String? = null, // Stage C: logical turn id for attempt assistant terminals; null for user/retry/legacy rows
     val attemptIndex: Int? = null, // Stage C: 0-based attempt number for attempt rows; null for user/legacy rows
     val isFinal: Boolean = true, // Stage F: false only for retryable-failed intermediate partials; missing key/old rows default final
+    val isTruncated: Boolean = false, // known stored-text truncation; false does not prove older imports were complete
 )
 
 /** Prune knobs (spec §8.3). */

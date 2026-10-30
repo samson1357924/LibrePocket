@@ -18,9 +18,14 @@ import okio.ForwardingSource
 import okio.buffer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * Responses adapter tests (SPEC §3.2 / §3.5 / §10.3).
@@ -1881,5 +1886,369 @@ class ResponsesProviderTest {
         assertEquals("https://h/v1/responses", provider.endpoint("https://h/v1"))
         assertEquals("https://h/v1/responses", provider.endpoint("https://h/v1/"))
         assertEquals("https://h/v1/responses", provider.endpoint("https://h/v1/responses"))
+    }
+
+    @Test
+    fun buildBodySerializesJsonSchemaInTextFormat() {
+        val provider = ResponsesProvider(testConfig(), { null })
+        val rf = ResponseFormat.JsonSchema(
+            name = "math_solution",
+            schemaJson = """{"type":"object","properties":{"answer":{"type":"number"}},"required":["answer"],"additionalProperties":false}""",
+            description = "Math problem solution",
+            strict = true,
+        )
+        val body = provider.buildBody(
+            ChatRequest(
+                model = "gpt-4o",
+                messages = listOf(ChatMessage("user", "Solve 2+2")),
+                responseFormat = rf,
+            ),
+        )
+
+        val root = Json.parseToJsonElement(body).jsonObject
+        assertTrue(root.containsKey("text"))
+        val textObj = root["text"]!!.jsonObject
+        val formatObj = textObj["format"]!!.jsonObject
+        assertEquals("json_schema", formatObj["type"]!!.jsonPrimitive.content)
+        assertEquals("math_solution", formatObj["name"]!!.jsonPrimitive.content)
+        assertEquals("Math problem solution", formatObj["description"]!!.jsonPrimitive.content)
+        assertEquals(true, formatObj["strict"]!!.jsonPrimitive.boolean)
+
+        val schemaObj = formatObj["schema"]!!.jsonObject
+        assertEquals("object", schemaObj["type"]!!.jsonPrimitive.content)
+        assertTrue(schemaObj.containsKey("properties"))
+    }
+
+    @Test
+    fun buildBodySerializesJsonSchemaWithoutDescriptionAndNonStrict() {
+        val provider = ResponsesProvider(testConfig(), { null })
+        val rf = ResponseFormat.JsonSchema(
+            name = "solution",
+            schemaJson = """{"type":"object"}""",
+            description = null,
+            strict = false,
+        )
+        val body = provider.buildBody(
+            ChatRequest(
+                model = "gpt-4o",
+                messages = listOf(ChatMessage("user", "Solve 2+2")),
+                responseFormat = rf,
+            ),
+        )
+
+        val root = Json.parseToJsonElement(body).jsonObject
+        val formatObj = root["text"]!!.jsonObject["format"]!!.jsonObject
+        assertEquals("solution", formatObj["name"]!!.jsonPrimitive.content)
+        assertNull(formatObj["description"])
+        assertEquals(false, formatObj["strict"]!!.jsonPrimitive.boolean)
+        assertEquals("object", formatObj["schema"]!!.jsonObject["type"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun buildBodySerializesJsonObjectInTextFormat() {
+        val provider = ResponsesProvider(testConfig(), { null })
+        val body = provider.buildBody(
+            ChatRequest(
+                model = "gpt-4o",
+                messages = listOf(ChatMessage("user", "Hello")),
+                responseFormat = ResponseFormat.JsonObject,
+            ),
+        )
+
+        val root = Json.parseToJsonElement(body).jsonObject
+        assertTrue(root.containsKey("text"))
+        val formatObj = root["text"]!!.jsonObject["format"]!!.jsonObject
+        assertEquals("json_object", formatObj["type"]!!.jsonPrimitive.content)
+        assertFalse(formatObj.containsKey("schema"))
+    }
+
+    @Test
+    fun buildBodyNullAndTextResponseFormatOmitted() {
+        val provider = ResponsesProvider(testConfig(), { null })
+
+        val nullBody = provider.buildBody(
+            ChatRequest(
+                model = "gpt-4o",
+                messages = listOf(ChatMessage("user", "Hello")),
+                responseFormat = null,
+            ),
+        )
+        val nullRoot = Json.parseToJsonElement(nullBody).jsonObject
+        assertFalse(nullRoot.containsKey("text"))
+
+        val textBody = provider.buildBody(
+            ChatRequest(
+                model = "gpt-4o",
+                messages = listOf(ChatMessage("user", "Hello")),
+                responseFormat = ResponseFormat.Text,
+            ),
+        )
+        val textRoot = Json.parseToJsonElement(textBody).jsonObject
+        assertFalse(textRoot.containsKey("text"))
+    }
+
+    @Test
+    fun responsesTextFormatJsonDirect() {
+        assertEquals("""{"format":{"type":"text"}}""", responsesTextFormatJson(ResponseFormat.Text))
+        assertEquals("""{"format":{"type":"json_object"}}""", responsesTextFormatJson(ResponseFormat.JsonObject))
+
+        val rf = ResponseFormat.JsonSchema(
+            name = "output_schema",
+            schemaJson = """{"type":"object"}""",
+            description = "output description",
+            strict = true,
+        )
+        val json = responsesTextFormatJson(rf)
+        val formatObj = Json.parseToJsonElement(json).jsonObject["format"]!!.jsonObject
+        assertEquals("json_schema", formatObj["type"]!!.jsonPrimitive.content)
+        assertEquals("output_schema", formatObj["name"]!!.jsonPrimitive.content)
+        assertEquals("output description", formatObj["description"]!!.jsonPrimitive.content)
+        assertEquals(true, formatObj["strict"]!!.jsonPrimitive.boolean)
+        assertEquals("object", formatObj["schema"]!!.jsonObject["type"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun responseFormatSchemaInvalidJsonFailsClosed() {
+        val provider = ResponsesProvider(testConfig(), { null })
+        val invalidInputs = listOf("not-json", "{ unclosed", "{},\"injected\":true}")
+        for (invalidJson in invalidInputs) {
+            val rf = ResponseFormat.JsonSchema(name = "test_schema", schemaJson = invalidJson)
+            try {
+                provider.buildBody(
+                    ChatRequest(
+                        model = "gpt-4o",
+                        messages = listOf(ChatMessage("user", "Hello")),
+                        responseFormat = rf,
+                    ),
+                )
+                fail("expected buildBody to fail for invalid schema: $invalidJson")
+            } catch (e: ProviderFailure) {
+                assertFalse("failure must not be retryable", e.retryable)
+                assertEquals("RESPONSE_FORMAT_SCHEMA_INVALID", e.message)
+            }
+
+            try {
+                responsesTextFormatJson(rf)
+                fail("expected responsesTextFormatJson to fail for invalid schema: $invalidJson")
+            } catch (e: ProviderFailure) {
+                assertFalse("failure must not be retryable", e.retryable)
+                assertEquals("RESPONSE_FORMAT_SCHEMA_INVALID", e.message)
+            }
+        }
+    }
+
+    @Test
+    fun responseFormatSchemaWrongRootTypeFailsClosed() {
+        val provider = ResponsesProvider(testConfig(), { null })
+        val nonObjectRoots = listOf("[]", "\"abc\"", "123", "null", "true")
+        for (nonObject in nonObjectRoots) {
+            val rf = ResponseFormat.JsonSchema(name = "test_schema", schemaJson = nonObject)
+            try {
+                provider.buildBody(
+                    ChatRequest(
+                        model = "gpt-4o",
+                        messages = listOf(ChatMessage("user", "Hello")),
+                        responseFormat = rf,
+                    ),
+                )
+                fail("expected buildBody to fail for non-object root: $nonObject")
+            } catch (e: ProviderFailure) {
+                assertFalse("failure must not be retryable", e.retryable)
+                assertEquals("RESPONSE_FORMAT_SCHEMA_MUST_BE_OBJECT", e.message)
+            }
+
+            try {
+                responsesTextFormatJson(rf)
+                fail("expected responsesTextFormatJson to fail for non-object root: $nonObject")
+            } catch (e: ProviderFailure) {
+                assertFalse("failure must not be retryable", e.retryable)
+                assertEquals("RESPONSE_FORMAT_SCHEMA_MUST_BE_OBJECT", e.message)
+            }
+        }
+    }
+
+    @Test
+    fun responseFormatSchemaInjectionSafeEncoding() {
+        val provider = ResponsesProvider(testConfig(), { null })
+        val injectionSchema = """{"type":"object","properties":{"malicious":{"description":"}\",\"injected\":true,"}}}"""
+        val rf = ResponseFormat.JsonSchema(
+            name = "safe_schema",
+            schemaJson = injectionSchema,
+        )
+        val body = provider.buildBody(
+            ChatRequest(
+                model = "gpt-4o",
+                messages = listOf(ChatMessage("user", "Hello")),
+                responseFormat = rf,
+            ),
+        )
+
+        val root = Json.parseToJsonElement(body).jsonObject
+        assertFalse("root must not contain injected property", root.containsKey("injected"))
+
+        val textObj = root["text"]!!.jsonObject
+        assertFalse("text must not contain injected property", textObj.containsKey("injected"))
+
+        val formatObj = textObj["format"]!!.jsonObject
+        assertFalse("format must not contain injected property", formatObj.containsKey("injected"))
+
+        val schema = formatObj["schema"]!!.jsonObject
+        val desc = schema["properties"]!!.jsonObject["malicious"]!!.jsonObject["description"]!!.jsonPrimitive.content
+        assertEquals("}\",\"injected\":true,", desc)
+    }
+
+    @Test
+    fun refusalDeltaAndDoneEmitTextDelta() {
+        val mapper = ResponsesMapper()
+        val deltaEvents1 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","output_index":0,"content_index":0,"delta":"I "}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "I ")), deltaEvents1)
+
+        val deltaEvents2 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","output_index":0,"content_index":0,"delta":"cannot"}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "cannot")), deltaEvents2)
+
+        val doneEvents = mapper.mapPayload(
+            """{"type":"response.refusal.done","output_index":0,"content_index":0,"refusal":"I cannot fulfill this request"}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, " fulfill this request")), doneEvents)
+
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I cannot fulfill this request"}]}]}}""",
+        )
+        assertTrue(
+            "completed must not repeat the consumed suffix: $completed",
+            completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty(),
+        )
+        assertEquals(StreamEvent.Done("stop"), completed.last())
+    }
+
+    @Test
+    fun contentPartDoneWithRefusalEmitsOnlyMissingSuffix() {
+        val mapper = ResponsesMapper()
+        val deltaEvents1 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","output_index":0,"content_index":0,"delta":"I "}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "I ")), deltaEvents1)
+
+        val deltaEvents2 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","output_index":0,"content_index":0,"delta":"cannot"}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "cannot")), deltaEvents2)
+
+        val done = mapper.mapPayload(
+            """{"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"refusal","refusal":"I cannot fulfill this request"}}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, " fulfill this request")), done)
+
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I cannot fulfill this request"}]}]}}""",
+        )
+        assertTrue(
+            "completed must not repeat the consumed suffix: $completed",
+            completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty(),
+        )
+        assertEquals(StreamEvent.Done("stop"), completed.last())
+    }
+
+    @Test
+    fun outputItemDoneWithRefusalEmitsOnlyMissingSuffix() {
+        val mapper = ResponsesMapper()
+        val deltaEvents1 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"I "}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "I ")), deltaEvents1)
+
+        val deltaEvents2 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"cannot"}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "cannot")), deltaEvents2)
+
+        val done = mapper.mapPayload(
+            """{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"refusal","refusal":"I cannot fulfill this request"}]}}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, " fulfill this request")), done)
+
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"refusal","refusal":"I cannot fulfill this request"}]}]}}""",
+        )
+        assertTrue(
+            "completed must not repeat the consumed suffix: $completed",
+            completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty(),
+        )
+        assertEquals(StreamEvent.Done("stop"), completed.last())
+    }
+
+    @Test
+    fun outputItemDoneWithTopLevelRefusalEmitsOnlyMissingSuffix() {
+        val mapper = ResponsesMapper()
+        val deltaEvents1 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","item_id":"ref_1","output_index":0,"content_index":0,"delta":"I "}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "I ")), deltaEvents1)
+
+        val deltaEvents2 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","item_id":"ref_1","output_index":0,"content_index":0,"delta":"cannot"}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "cannot")), deltaEvents2)
+
+        val done = mapper.mapPayload(
+            """{"type":"response.output_item.done","output_index":0,"item":{"type":"refusal","id":"ref_1","refusal":"I cannot fulfill this request"}}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, " fulfill this request")), done)
+
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"refusal","id":"ref_1","refusal":"I cannot fulfill this request"}]}}""",
+        )
+        assertTrue(
+            "completed must not repeat the consumed suffix: $completed",
+            completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty(),
+        )
+        assertEquals(StreamEvent.Done("stop"), completed.last())
+    }
+
+    @Test
+    fun multiChunkRefusalCascadingDoneFramesEmitMissingSuffixOnceAndCompletedIsNoop() {
+        val mapper = ResponsesMapper()
+        val d1 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"I "}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "I ")), d1)
+
+        val d2 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"cannot "}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "cannot ")), d2)
+
+        val d3 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"fulfill "}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "fulfill ")), d3)
+
+        val refusalDone = mapper.mapPayload(
+            """{"type":"response.refusal.done","item_id":"msg_1","output_index":0,"content_index":0,"refusal":"I cannot fulfill this request"}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "this request")), refusalDone)
+
+        val partDone = mapper.mapPayload(
+            """{"type":"response.content_part.done","item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"refusal","refusal":"I cannot fulfill this request"}}""",
+        )
+        assertTrue(partDone.filterIsInstance<StreamEvent.TextDelta>().isEmpty())
+
+        val itemDone = mapper.mapPayload(
+            """{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"refusal","refusal":"I cannot fulfill this request"}]}}""",
+        )
+        assertTrue(itemDone.filterIsInstance<StreamEvent.TextDelta>().isEmpty())
+
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"refusal","refusal":"I cannot fulfill this request"}]}]}}""",
+        )
+        assertTrue(
+            "completed must not repeat the consumed suffix: $completed",
+            completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty(),
+        )
+        assertEquals(StreamEvent.Done("stop"), completed.last())
     }
 }

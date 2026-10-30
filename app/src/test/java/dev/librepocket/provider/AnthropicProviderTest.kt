@@ -3,6 +3,7 @@ package dev.librepocket.provider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 /**
@@ -423,5 +424,68 @@ class AnthropicProviderTest {
         assertEquals("https://h/v1/messages", provider.endpoint("https://h"))
         assertEquals("https://h/v1/messages", provider.endpoint("https://h/"))
         assertEquals("https://h/v1/messages", provider.endpoint("https://h/v1/messages"))
+    }
+
+    @Test
+    fun responseFormatJsonSchemaFailsClosed() {
+        val provider = AnthropicProvider(testConfig(), { null })
+        val rf = ResponseFormat.JsonSchema(
+            name = "math_answer",
+            schemaJson = """{"type":"object"}""",
+        )
+        try {
+            provider.buildBody(
+                ChatRequest(
+                    model = "claude-3-5-sonnet",
+                    messages = listOf(ChatMessage("user", "hi")),
+                    responseFormat = rf,
+                ),
+            )
+            fail("expected ProviderFailure for JsonSchema on Anthropic")
+        } catch (e: ProviderFailure) {
+            assertFalse(e.retryable)
+            assertEquals("STRUCTURED_OUTPUTS_NOT_SUPPORTED", e.message)
+        }
+    }
+
+    @Test
+    fun responseFormatJsonObjectFailsClosed() {
+        val provider = AnthropicProvider(testConfig(), { null })
+        try {
+            provider.buildBody(
+                ChatRequest(
+                    model = "claude-3-5-sonnet",
+                    messages = listOf(ChatMessage("user", "hi")),
+                    responseFormat = ResponseFormat.JsonObject,
+                ),
+            )
+            fail("expected ProviderFailure for JsonObject on Anthropic")
+        } catch (e: ProviderFailure) {
+            assertFalse(e.retryable)
+            assertEquals("STRUCTURED_OUTPUTS_NOT_SUPPORTED", e.message)
+        }
+    }
+
+    @Test
+    fun responseFormatNullAndTextAllowed() {
+        val provider = AnthropicProvider(testConfig(), { null })
+
+        val nullBody = provider.buildBody(
+            ChatRequest(
+                model = "claude-3-5-sonnet",
+                messages = listOf(ChatMessage("user", "hi")),
+                responseFormat = null,
+            ),
+        )
+        assertTrue(nullBody.contains("\"messages\":"))
+
+        val textBody = provider.buildBody(
+            ChatRequest(
+                model = "claude-3-5-sonnet",
+                messages = listOf(ChatMessage("user", "hi")),
+                responseFormat = ResponseFormat.Text,
+            ),
+        )
+        assertTrue(textBody.contains("\"messages\":"))
     }
 }

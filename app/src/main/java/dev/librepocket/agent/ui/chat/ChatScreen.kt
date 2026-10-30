@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.speech.RecognizerIntent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.VisibleForTesting
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,10 +32,10 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
@@ -902,6 +903,7 @@ internal fun KeyReadConfirmDialog(
     )
 }
 
+@VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
 @Composable
 internal fun MessageBubble(
     msg: UiMessage,
@@ -949,16 +951,18 @@ internal fun MessageBubble(
                 // 離線能力與資料傳輸取決於已安裝的引擎，非「本地保證」；
                 // 零新權限；開關關閉時隱藏）。朗讀為逐則手勢，
                 // 引擎揭露見按鈕無障礙文案（VoiceTts.SPEAK_BUTTON_DESCRIPTION）。
-                val speakableText = ChatMarkdownParser.stripThinking(displayText)
-                if (!isUser && speakableText.isNotBlank() && !msg.isPartial && showSpeak) {
-                    IconButton(
-                        onClick = { onSpeak(msg.id, speakableText) },
-                        modifier = Modifier.size(32.dp),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.VolumeUp,
-                            contentDescription = VoiceTts.SPEAK_BUTTON_DESCRIPTION,
-                        )
+                if (!isUser && !msg.isPartial && showSpeak) {
+                    val speakableText = remember(displayText) { ChatMarkdownParser.stripThinking(displayText) }
+                    if (speakableText.isNotBlank()) {
+                        IconButton(
+                            onClick = { onSpeak(msg.id, speakableText) },
+                            modifier = Modifier.size(32.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.VolumeUp,
+                                contentDescription = VoiceTts.SPEAK_BUTTON_DESCRIPTION,
+                            )
+                        }
                     }
                 }
             }

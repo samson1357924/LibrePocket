@@ -27,6 +27,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -48,15 +49,16 @@ import kotlinx.coroutines.delay
 
 /**
  * Collapsible reasoning card for displaying thinking processes.
- * Defaults to expanded during streaming with a blinking cursor,
+ * Defaults to expanded during streaming with a static cursor indicator (no blinking animation),
  * and collapses by default once streaming completes.
  */
 @Composable
-fun ThinkingBlockView(
+internal fun ThinkingBlockView(
     block: ChatContentBlock.ThinkingBlock,
     modifier: Modifier = Modifier,
 ) {
-    var isExpanded by rememberSaveable(block.isStreaming) { mutableStateOf(block.isStreaming) }
+    var userExpanded by rememberSaveable { mutableStateOf<Boolean?>(null) }
+    val isExpanded = userExpanded ?: block.isStreaming
 
     Card(
         modifier = modifier.fillMaxWidth(),
@@ -65,16 +67,17 @@ fun ThinkingBlockView(
             containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
         ),
     ) {
+        val animationModifier = if (!block.isStreaming) Modifier.animateContentSize() else Modifier
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .animateContentSize(),
+                .then(animationModifier),
         ) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(8.dp))
-                    .clickable(role = Role.Button) { isExpanded = !isExpanded }
+                    .clickable(role = Role.Button) { userExpanded = !isExpanded }
                     .defaultMinSize(minHeight = 48.dp)
                     .padding(horizontal = 12.dp, vertical = 8.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -126,7 +129,7 @@ fun ThinkingBlockView(
  * language badge, and a copy button with brief success feedback.
  */
 @Composable
-fun CodeBlockView(
+internal fun CodeBlockView(
     block: ChatContentBlock.CodeBlock,
     modifier: Modifier = Modifier,
 ) {
@@ -144,7 +147,7 @@ fun CodeBlockView(
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(8.dp),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+            containerColor = MaterialTheme.colorScheme.surface,
         ),
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
@@ -169,8 +172,12 @@ fun CodeBlockView(
                     modifier = Modifier
                         .clip(RoundedCornerShape(4.dp))
                         .clickable(role = Role.Button) {
-                            clipboardManager.setText(AnnotatedString(block.code))
-                            copied = true
+                            try {
+                                clipboardManager.setText(AnnotatedString(block.code))
+                                copied = true
+                            } catch (_: Exception) {
+                                // Ignore clipboard failures gracefully (e.g. MDM policies, window focus loss, payload too large)
+                            }
                         }
                         .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                         .padding(horizontal = 6.dp, vertical = 4.dp),
@@ -179,7 +186,7 @@ fun CodeBlockView(
                 ) {
                     Icon(
                         imageVector = if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
-                        contentDescription = stringResource(if (copied) R.string.chat_code_copied else R.string.chat_code_copy_description),
+                        contentDescription = null,
                         tint = if (copied) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(14.dp),
                     )
@@ -208,6 +215,7 @@ fun CodeBlockView(
                     fontFamily = FontFamily.Monospace,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    softWrap = false,
                 )
             }
         }
@@ -218,7 +226,7 @@ fun CodeBlockView(
  * Renders structured markdown and thinking blocks within a message bubble.
  */
 @Composable
-fun ChatMarkdownView(
+internal fun ChatMarkdownView(
     text: String,
     modifier: Modifier = Modifier,
     isStreaming: Boolean = false,
@@ -243,28 +251,30 @@ fun ChatMarkdownView(
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         blocks.forEachIndexed { index, block ->
-            when (block) {
-                is ChatContentBlock.ThinkingBlock -> {
-                    ThinkingBlockView(block = block)
-                }
-                is ChatContentBlock.CodeBlock -> {
-                    CodeBlockView(block = block)
-                }
-                is ChatContentBlock.ParagraphBlock -> {
-                    val isLast = index == blocks.size - 1
-                    val content = if (isStreaming && isLast) {
-                        buildAnnotatedString {
-                            append(block.annotatedText)
-                            append(" ▍")
-                        }
-                    } else {
-                        block.annotatedText
+            key(index, block.javaClass) {
+                when (block) {
+                    is ChatContentBlock.ThinkingBlock -> {
+                        ThinkingBlockView(block = block)
                     }
-                    Text(
-                        text = content,
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = textColor,
-                    )
+                    is ChatContentBlock.CodeBlock -> {
+                        CodeBlockView(block = block)
+                    }
+                    is ChatContentBlock.ParagraphBlock -> {
+                        val isLast = index == blocks.size - 1
+                        val content = if (isStreaming && isLast) {
+                            buildAnnotatedString {
+                                append(block.annotatedText)
+                                append(" ▍")
+                            }
+                        } else {
+                            block.annotatedText
+                        }
+                        Text(
+                            text = content,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = textColor,
+                        )
+                    }
                 }
             }
         }

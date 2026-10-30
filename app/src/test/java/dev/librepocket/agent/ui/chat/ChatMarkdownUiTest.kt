@@ -32,10 +32,15 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
-private class FakeClipboardManager : ClipboardManager {
+private class FakeClipboardManager(
+    private val throwOnSet: Boolean = false,
+) : ClipboardManager {
     private var clipboardContent: AnnotatedString? = null
     override fun getText(): AnnotatedString? = clipboardContent
     override fun setText(annotatedString: AnnotatedString) {
+        if (throwOnSet) {
+            throw SecurityException("Clipboard access denied by MDM policy")
+        }
         clipboardContent = annotatedString
     }
     override fun hasText(): Boolean = clipboardContent != null
@@ -325,5 +330,53 @@ class ChatMarkdownUiTest {
         composeRule.onNodeWithText(text).assertIsDisplayed()
         composeRule.onNodeWithText("思考過程").assertDoesNotExist()
         composeRule.onNodeWithContentDescription(VoiceTts.SPEAK_BUTTON_DESCRIPTION).assertDoesNotExist()
+    }
+
+    @Test
+    fun thinkingBlockView_streaming_userCanManuallyCollapse() {
+        val block = ChatContentBlock.ThinkingBlock(
+            content = "Streaming steps...",
+            isStreaming = true,
+        )
+
+        composeRule.setContent {
+            MaterialTheme {
+                ThinkingBlockView(block = block)
+            }
+        }
+
+        // Initially expanded
+        composeRule.onNodeWithText("Streaming steps... ▍").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription("收折思考過程").assertIsDisplayed()
+
+        // User clicks to collapse
+        composeRule.onNodeWithText("思考過程").performClick()
+
+        // Now collapsed even though isStreaming is true
+        composeRule.onNodeWithText("Streaming steps... ▍").assertDoesNotExist()
+        composeRule.onNodeWithContentDescription("展開思考過程").assertIsDisplayed()
+    }
+
+    @Test
+    fun codeBlockView_clipboardException_handledGracefully() {
+        val throwingClipboard = FakeClipboardManager(throwOnSet = true)
+        val block = ChatContentBlock.CodeBlock(
+            language = "kotlin",
+            code = "val x = 1",
+            isStreaming = false,
+        )
+
+        composeRule.setContent {
+            CompositionLocalProvider(LocalClipboardManager provides throwingClipboard) {
+                MaterialTheme {
+                    CodeBlockView(block = block)
+                }
+            }
+        }
+
+        // Click copy button; should not crash
+        composeRule.onNodeWithText("複製").performClick()
+        // Should remain "複製" rather than crash
+        composeRule.onNodeWithText("複製").assertIsDisplayed()
     }
 }

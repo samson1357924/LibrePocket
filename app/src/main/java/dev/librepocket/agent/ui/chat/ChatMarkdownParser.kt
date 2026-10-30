@@ -38,179 +38,223 @@ object ChatMarkdownParser {
     )
     private const val CODE_FENCE = "```"
 
-    /**
-     * Parses the given [text] into a list of [ChatContentBlock]s.
-     *
-     * @param text The input message text to parse.
-     * @param isStreaming Whether the message is currently being streamed.
-     */
-    fun parse(
-        text: String,
-        isStreaming: Boolean = false,
-    ): List<ChatContentBlock> {
-        if (text.isEmpty()) {
-            return if (isStreaming) {
-                listOf(ChatContentBlock.ParagraphBlock(AnnotatedString("")))
+    // Backslashes are preserved in output. An odd-length run escapes an inline
+    // opener, but backslashes inside a code span cannot escape its closer.
+    private fun escapedBackticks(text: String): BooleanArray {
+        val escaped = BooleanArray(text.length)
+        var oddBackslashes = false
+        for (i in text.indices) {
+            if (text[i] == '\\') {
+                oddBackslashes = !oddBackslashes
             } else {
-                emptyList()
+                if (text[i] == '`') escaped[i] = oddBackslashes
+                oddBackslashes = false
             }
         }
+        return escaped
+    }
 
-        val blocks = mutableListOf<ChatContentBlock>()
-        var cursor = 0
+    // Preserve legacy inline fence openers, but do not treat an indented-code
+    // line (four spaces or a tab before the fence) as a fenced block opener.
+    private fun invalidIndentedFenceOpeners(text: String): BooleanArray {
+        val invalid = BooleanArray(text.length)
+        var lineStart = 0
+        while (lineStart < text.length) {
+            var pos = lineStart
+            var tab = false
+            while (pos < text.length && (text[pos] == ' ' || text[pos] == '\t')) {
+                if (text[pos] == '\t') tab = true
+                pos++
+            }
+            if ((tab || pos - lineStart > 3) && text.startsWith(CODE_FENCE, pos)) invalid[pos] = true
+            val newline = text.indexOf('\n', pos)
+            if (newline < 0) break
+            lineStart = newline + 1
+        }
+        return invalid
+    }
+
+    private enum class Kind { TEXT, THINKING, CODE, PARTIAL_TAG }
+
+    private data class Segment(
+        val kind: Kind,
+        val start: Int,
+        val end: Int,
+        val contentStart: Int = start,
+        val contentEnd: Int = end,
+        val language: String? = null,
+        val unclosed: Boolean = false,
+    )
+
+    // Each character is visited a bounded number of times. Inline code shields tags,
+    // and fenced code and thinking blocks shield everything until their own closer.
+    private fun segments(text: String, streaming: Boolean): List<Segment> {
+        val result = mutableListOf<Segment>()
         val length = text.length
-
+        val escaped = escapedBackticks(text)
+        val invalidFence = invalidIndentedFenceOpeners(text)
+        val nextNewline = IntArray(length + 1) { -1 }
+        val nextTick = IntArray(length + 1) { -1 }
+        for (i in length - 1 downTo 0) {
+            nextNewline[i] = if (text[i] == '\n') i else nextNewline[i + 1]
+            nextTick[i] = if (text[i] == '`') i else nextTick[i + 1]
+        }
+        var cursor = 0
+        var plainStart = 0
+        fun addPlain(end: Int) {
+            if (end > plainStart) result.add(Segment(Kind.TEXT, plainStart, end))
+        }
         while (cursor < length) {
-            // Find earliest thinking tag
-            var earliestThinkStart = -1
-            var matchedOpenTag = ""
-            var matchedCloseTag = ""
-
-            for ((openTag, closeTag) in THINK_TAG_PAIRS) {
-                val start = text.indexOf(openTag, cursor, ignoreCase = true)
-                if (start != -1 && (earliestThinkStart == -1 || start < earliestThinkStart)) {
-                    earliestThinkStart = start
-                    matchedOpenTag = openTag
-                    matchedCloseTag = closeTag
+            val pair = if (text[cursor] == '<') {
+                THINK_TAG_PAIRS.firstOrNull { text.regionMatches(cursor, it.first, 0, it.first.length, ignoreCase = true) }
+            } else {
+                null
+            }
+            if (pair != null) {
+                addPlain(cursor)
+                val start = cursor + pair.first.length
+                val close = text.indexOf(pair.second, start, ignoreCase = true)
+                var end = if (close < 0) length else close
+                // Do not flash a partial closing tag as reasoning during streaming.
+                if (close < 0 && streaming) {
+                    val lastTag = text.lastIndexOf('<')
+                    if (lastTag >= start && isTagPrefix(text, lastTag, pair.second)) end = lastTag
                 }
-            }
-
-            // Find earliest code fence
-            val codeStart = text.indexOf(CODE_FENCE, cursor)
-
-            val nextSpecial = when {
-                earliestThinkStart != -1 && codeStart != -1 -> minOf(earliestThinkStart, codeStart)
-                earliestThinkStart != -1 -> earliestThinkStart
-                codeStart != -1 -> codeStart
-                else -> -1
-            }
-
-            if (nextSpecial == -1) {
-                // Remainder is plain text / paragraph
-                val remaining = text.substring(cursor).trim()
-                if (remaining.isNotBlank()) {
-                    blocks.add(ChatContentBlock.ParagraphBlock(parseInlineMarkdown(remaining)))
+                val next = if (close < 0) length else close + pair.second.length
+                result.add(Segment(Kind.THINKING, cursor, next, start, end, unclosed = close < 0))
+                cursor = next
+                plainStart = cursor
+            } else if (streaming && text[cursor] == '<' && THINK_TAG_PAIRS.any { isTagPrefix(text, cursor, it.first) }) {
+                addPlain(cursor)
+                result.add(Segment(Kind.PARTIAL_TAG, cursor, length))
+                cursor = length
+                plainStart = cursor
+            } else if (invalidFence[cursor]) {
+                while (cursor < length && text[cursor] == '`') cursor++
+            } else if (!escaped[cursor] && text.startsWith(CODE_FENCE, cursor)) {
+                addPlain(cursor)
+                var afterFence = cursor + CODE_FENCE.length
+                while (afterFence < length && text[afterFence] == '`') afterFence++
+                val fenceLength = afterFence - cursor
+                val newline = nextNewline[afterFence]
+                val headerEnd = if (newline < 0) length else newline
+                var scan = afterFence
+                var inlineClose = -1
+                var inlineCloseEnd = -1
+                while (scan < headerEnd) {
+                    if (text[scan] != '`') {
+                        scan++
+                    } else {
+                        val runStart = scan
+                        while (scan < headerEnd && text[scan] == '`') scan++
+                        if (scan - runStart >= fenceLength) {
+                            inlineClose = runStart
+                            inlineCloseEnd = scan
+                            break
+                        }
+                    }
                 }
-                break
-            }
-
-            // Paragraph before the special block
-            if (nextSpecial > cursor) {
-                val preText = text.substring(cursor, nextSpecial).trim()
-                if (preText.isNotBlank()) {
-                    blocks.add(ChatContentBlock.ParagraphBlock(parseInlineMarkdown(preText)))
-                }
-            }
-
-            if (nextSpecial == earliestThinkStart) {
-                val contentStart = earliestThinkStart + matchedOpenTag.length
-                val thinkEnd = text.indexOf(matchedCloseTag, contentStart, ignoreCase = true)
-                if (thinkEnd != -1) {
-                    val content = text.substring(contentStart, thinkEnd).trim()
-                    blocks.add(ChatContentBlock.ThinkingBlock(content = content, isStreaming = false))
-                    cursor = thinkEnd + matchedCloseTag.length
-                } else {
-                    // Unclosed thinking tag
-                    val content = text.substring(contentStart).trim()
-                    blocks.add(ChatContentBlock.ThinkingBlock(content = content, isStreaming = isStreaming))
+                if (inlineClose >= 0) {
+                    val next = inlineCloseEnd
+                    result.add(Segment(Kind.CODE, cursor, next, afterFence, inlineClose,
+                        unclosed = streaming && next == length))
+                    cursor = next
+                } else if (newline < 0) {
+                    result.add(Segment(Kind.CODE, cursor, length, length, length,
+                        text.substring(afterFence).trim().ifEmpty { null }, unclosed = true))
                     cursor = length
+                } else {
+                    val language = text.substring(afterFence, newline).trim().ifEmpty { null }
+                    val start = newline + 1
+                    var lineStart = start
+                    var close = -1
+                    var closeEnd = -1
+                    var pendingClose = false
+                    while (lineStart < length) {
+                        var pos = lineStart
+                        while (pos < length && text[pos] == ' ') pos++
+                        if (pos - lineStart <= 3 && pos < length && text[pos] == '`') {
+                            var tail = pos
+                            while (tail < length && text[tail] == '`') tail++
+                            val runEnd = tail
+                            // A short trailing run may still become a closer in the next chunk.
+                            if (streaming && runEnd == length && runEnd - pos < fenceLength) {
+                                close = pos
+                                pendingClose = true
+                                break
+                            }
+                            while (tail < length && (text[tail] == ' ' || text[tail] == '\t' || text[tail] == '\r')) tail++
+                            // A suffix such as ```Done is ambiguous; preserve it as code,
+                            // including any following tags, until a valid closer is found.
+                            if (runEnd - pos >= fenceLength && (tail == length || text[tail] == '\n')) {
+                                close = pos
+                                closeEnd = runEnd
+                                pendingClose = streaming && tail == length
+                                break
+                            }
+                        }
+                        val nextLine = text.indexOf('\n', lineStart)
+                        if (nextLine < 0) break
+                        lineStart = nextLine + 1
+                    }
+                    var end = if (close < 0) length else lineStart
+                    if (close >= 0 && end > start && text[end - 1] == '\n') {
+                        end--
+                        if (end > start && text[end - 1] == '\r') end--
+                    }
+                    val next = if (close < 0 || pendingClose) length else closeEnd
+                    result.add(Segment(Kind.CODE, cursor, next, start, end, language, close < 0 || pendingClose))
+                    cursor = next
+                }
+                plainStart = cursor
+            } else if (text[cursor] == '`' && !escaped[cursor]) {
+                val close = nextTick[cursor + 1]
+                val newline = nextNewline[cursor + 1]
+                cursor = when {
+                    close >= 0 && (newline < 0 || close < newline) -> close + 1
+                    // An unmatched delimiter is not evidence that tags are literal code.
+                    // Keep tag handling identical while streaming and after completion.
+                    else -> cursor + 1
                 }
             } else {
-                // Code block fence
-                val afterFence = codeStart + CODE_FENCE.length
-                val firstNewline = text.indexOf('\n', afterFence)
-
-                if (firstNewline != -1) {
-                    val lang = text.substring(afterFence, firstNewline).trim().ifEmpty { null }
-                    val codeContentStart = firstNewline + 1
-                    val closingFence = text.indexOf(CODE_FENCE, codeContentStart)
-
-                    if (closingFence != -1) {
-                        var codeContent = text.substring(codeContentStart, closingFence)
-                        if (codeContent.endsWith("\r\n")) {
-                            codeContent = codeContent.dropLast(2)
-                        } else if (codeContent.endsWith("\n") || codeContent.endsWith("\r")) {
-                            codeContent = codeContent.dropLast(1)
-                        }
-                        blocks.add(
-                            ChatContentBlock.CodeBlock(
-                                language = lang,
-                                code = codeContent,
-                                isStreaming = false,
-                            ),
-                        )
-                        cursor = closingFence + CODE_FENCE.length
-                    } else {
-                        // Unclosed code block
-                        val codeContent = text.substring(codeContentStart)
-                        blocks.add(
-                            ChatContentBlock.CodeBlock(
-                                language = lang,
-                                code = codeContent,
-                                isStreaming = isStreaming,
-                            ),
-                        )
-                        cursor = length
-                    }
-                } else {
-                    // No newline after code fence
-                    val closingFence = text.indexOf(CODE_FENCE, afterFence)
-                    if (closingFence != -1) {
-                        blocks.add(
-                            ChatContentBlock.CodeBlock(
-                                language = null,
-                                code = text.substring(afterFence, closingFence),
-                                isStreaming = false,
-                            ),
-                        )
-                        cursor = closingFence + CODE_FENCE.length
-                    } else {
-                        val lang = text.substring(afterFence).trim().ifEmpty { null }
-                        blocks.add(
-                            ChatContentBlock.CodeBlock(
-                                language = lang,
-                                code = "",
-                                isStreaming = isStreaming,
-                            ),
-                        )
-                        cursor = length
-                    }
-                }
+                cursor++
             }
         }
-
-        return blocks
+        addPlain(length)
+        return result
     }
 
-    /**
-     * Strips thinking blocks from text for audio TTS or clean plain text usage.
-     */
-    fun stripThinking(text: String): String {
-        var result = text
-        for ((openTag, closeTag) in THINK_TAG_PAIRS) {
-            if (!result.contains(openTag, ignoreCase = true)) continue
-            val sb = java.lang.StringBuilder(result.length)
-            var cursor = 0
-            while (cursor < result.length) {
-                val start = result.indexOf(openTag, cursor, ignoreCase = true)
-                if (start == -1) {
-                    sb.append(result, cursor, result.length)
-                    break
-                }
-                if (start > cursor) {
-                    sb.append(result, cursor, start)
-                }
-                val end = result.indexOf(closeTag, start + openTag.length, ignoreCase = true)
-                if (end != -1) {
-                    cursor = end + closeTag.length
-                } else {
-                    break
-                }
-            }
-            result = sb.toString()
+    private fun isTagPrefix(text: String, start: Int, tag: String): Boolean {
+        val remaining = text.length - start
+        return remaining > 0 && remaining < tag.length &&
+            text.regionMatches(start, tag, 0, remaining, ignoreCase = true)
+    }
+
+    fun parse(text: String, isStreaming: Boolean = false): List<ChatContentBlock> {
+        if (text.isEmpty()) {
+            return if (isStreaming) listOf(ChatContentBlock.ParagraphBlock(AnnotatedString(""))) else emptyList()
         }
-        return result.trim()
+        return segments(text, isStreaming).mapNotNull { segment ->
+            when (segment.kind) {
+                Kind.TEXT -> text.substring(segment.start, segment.end).trim().takeIf { it.isNotBlank() }
+                    ?.let { ChatContentBlock.ParagraphBlock(parseInline(formatLists(it))) }
+                Kind.THINKING -> ChatContentBlock.ThinkingBlock(
+                    text.substring(segment.contentStart, segment.contentEnd).trim(), segment.unclosed && isStreaming,
+                )
+                Kind.CODE -> ChatContentBlock.CodeBlock(
+                    segment.language, text.substring(segment.contentStart, segment.contentEnd), segment.unclosed && isStreaming,
+                )
+                Kind.PARTIAL_TAG -> null
+            }
+        }
     }
+
+    /** Removes exactly the thinking segments recognized by the non-streaming display parser. */
+    fun stripThinking(text: String): String = buildString {
+        for (segment in segments(text, streaming = false)) {
+            if (segment.kind != Kind.THINKING) append(text, segment.start, segment.end)
+        }
+    }.trim()
 
     /**
      * Replaces list prefixes such as `- ` or `* ` at line starts with bullet `• `.
@@ -238,48 +282,100 @@ object ChatMarkdownParser {
     /**
      * Parses inline markdown styles (inline code, bold, italic, bold+italic) into [AnnotatedString].
      */
-    fun parseInlineMarkdown(rawText: String): AnnotatedString {
-        val text = formatLists(rawText)
+    fun parseInlineMarkdown(rawText: String): AnnotatedString = parseInline(formatLists(rawText))
+
+    // Nested styles receive already formatted text: list formatting belongs to the paragraph only.
+    private fun parseInline(text: String): AnnotatedString {
         val builder = AnnotatedString.Builder()
         var i = 0
         val len = text.length
+        val escaped = escapedBackticks(text)
+        val nextNewline = IntArray(len + 1) { -1 }
+        val nextTick = IntArray(len + 1) { -1 }
+        val nextDouble = IntArray(len + 1) { -1 }
+        val nextTriple = IntArray(len + 1) { -1 }
+        val nextSingle = IntArray(len + 1) { -1 }
+        for (pos in len - 1 downTo 0) {
+            nextNewline[pos] = if (text[pos] == '\n') pos else nextNewline[pos + 1]
+            nextTick[pos] = if (text[pos] == '`') pos else nextTick[pos + 1]
+        }
+        val inCode = BooleanArray(len)
+        var scan = 0
+        while (scan < len) {
+            if (text[scan] != '`' || escaped[scan]) {
+                scan++
+                continue
+            }
+            // Triple runs left in a paragraph are literal, not inline code spans.
+            if (text.startsWith(CODE_FENCE, scan)) {
+                while (scan < len && text[scan] == '`') scan++
+                continue
+            }
+            val start = scan
+            val lineEnd = nextNewline[start + 1].let { if (it < 0) len else it }
+            val close = nextTick[start + 1]
+            val end = when {
+                close >= 0 && close < lineEnd -> close + 1
+                else -> start + 1
+            }
+            if (end > start + 1) for (pos in start until end) inCode[pos] = true
+            scan = end
+        }
+        for (pos in len - 1 downTo 0) {
+            nextDouble[pos] = if (!inCode[pos] && text.startsWith("**", pos)) pos else nextDouble[pos + 1]
+            nextTriple[pos] = if (!inCode[pos] && text.startsWith("***", pos)) pos else nextTriple[pos + 1]
+            nextSingle[pos] = if (!inCode[pos] && text[pos] == '*' && (pos == 0 || text[pos - 1] != '*') &&
+                (pos + 1 == len || text[pos + 1] != '*')) pos else nextSingle[pos + 1]
+        }
 
         while (i < len) {
             val c = text[i]
 
             // Inline code: `code`
-            if (c == '`') {
-                val close = text.indexOf('`', i + 1)
-                if (close != -1) {
-                    val code = text.substring(i + 1, close)
-                    if (!code.contains('\n')) {
-                        val start = builder.length
-                        builder.append(code)
-                        builder.addStyle(
-                            SpanStyle(
-                                fontFamily = FontFamily.Monospace,
-                                background = Color(0x1F888888),
-                            ),
-                            start,
-                            builder.length,
-                        )
-                        i = close + 1
-                        continue
+            if (c == '`' && !escaped[i]) {
+                if (text.startsWith(CODE_FENCE, i)) {
+                    while (i < len && text[i] == '`') {
+                        builder.append('`')
+                        i++
                     }
+                    continue
+                }
+                val close = nextTick[i + 1]
+                if (close != -1 && (nextNewline[i + 1] == -1 || nextNewline[i + 1] > close)) {
+                    val code = text.substring(i + 1, close)
+                    val start = builder.length
+                    builder.append(code)
+                    builder.addStyle(
+                        SpanStyle(
+                            fontFamily = FontFamily.Monospace,
+                            background = Color(0x1F888888),
+                        ),
+                        start,
+                        builder.length,
+                    )
+                    i = close + 1
+                    continue
                 }
                 builder.append('`')
                 i++
                 continue
             }
 
+            if (inCode[i]) {
+                builder.append(c)
+                i++
+                continue
+            }
+
             // Bold & Italic: ***text***
             if (text.startsWith("***", i) && i + 3 < len && !text[i + 3].isWhitespace()) {
-                val close = text.indexOf("***", i + 3)
-                if (close != -1 && !text[close - 1].isWhitespace()) {
+                val close = nextTriple[i + 3]
+                if (close != -1 && !text[close - 1].isWhitespace() &&
+                    (nextNewline[i] == -1 || nextNewline[i] > close)) {
                     val content = text.substring(i + 3, close)
                     if (!content.contains('\n') && content.isNotBlank()) {
                         val start = builder.length
-                        builder.append(content)
+                        builder.append(parseInline(content))
                         builder.addStyle(
                             SpanStyle(
                                 fontWeight = FontWeight.Bold,
@@ -296,12 +392,13 @@ object ChatMarkdownParser {
 
             // Bold: **text**
             if (text.startsWith("**", i) && i + 2 < len && !text[i + 2].isWhitespace()) {
-                val close = text.indexOf("**", i + 2)
-                if (close != -1 && !text[close - 1].isWhitespace()) {
+                val close = nextDouble[i + 2]
+                if (close != -1 && !text[close - 1].isWhitespace() &&
+                    (nextNewline[i] == -1 || nextNewline[i] > close)) {
                     val content = text.substring(i + 2, close)
                     if (!content.contains('\n') && content.isNotBlank()) {
                         val start = builder.length
-                        builder.append(content)
+                        builder.append(parseInline(content))
                         builder.addStyle(
                             SpanStyle(fontWeight = FontWeight.Bold),
                             start,
@@ -315,12 +412,13 @@ object ChatMarkdownParser {
 
             // Italic: *text*
             if (c == '*' && i + 1 < len && !text[i + 1].isWhitespace() && text[i + 1] != '*') {
-                val close = text.indexOf('*', i + 1)
-                if (close != -1 && !text[close - 1].isWhitespace()) {
+                val close = nextSingle[i + 1]
+                if (close != -1 && !text[close - 1].isWhitespace() &&
+                    (nextNewline[i] == -1 || nextNewline[i] > close)) {
                     val content = text.substring(i + 1, close)
                     if (!content.contains('\n') && content.isNotBlank()) {
                         val start = builder.length
-                        builder.append(content)
+                        builder.append(parseInline(content))
                         builder.addStyle(
                             SpanStyle(fontStyle = FontStyle.Italic),
                             start,

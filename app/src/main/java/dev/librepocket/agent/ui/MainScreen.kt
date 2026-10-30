@@ -22,7 +22,10 @@ import dev.librepocket.agent.ui.chat.ChatViewModel
 import dev.librepocket.agent.ui.chat.ChatViewModelFactory
 import dev.librepocket.agent.ui.chat.SessionListViewModel
 import dev.librepocket.agent.ui.chat.SessionListViewModelFactory
+import dev.librepocket.agent.ui.chat.ImportUiState
+import dev.librepocket.agent.ui.chat.TranscriptViewer
 import dev.librepocket.agent.ui.settings.SettingsScreen
+import dev.librepocket.agent.ui.settings.rememberTranscriptPickers
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.PendingDelete
 import dev.librepocket.agent.ui.setup.SetupScreen
@@ -77,6 +80,9 @@ fun MainScreen(
     // transient 讀失敗／毀損為未確認態（重試讀取），絕不誤報 fresh。
     val pendingTeardown by setupViewModel.pendingTeardown.collectAsStateWithLifecycle()
     val sessions by sessionListViewModel.sessions.collectAsStateWithLifecycle()
+    val exportState by sessionListViewModel.exportState.collectAsStateWithLifecycle()
+    val importState by sessionListViewModel.importState.collectAsStateWithLifecycle()
+    var viewedSessionId by remember { mutableStateOf<String?>(null) }
     val currentSessionId by chatViewModel.currentSessionId.collectAsStateWithLifecycle()
 
     // #3 語音開關真相源（VoiceSwitchStore，DataStore 持久化）：R4-2 三態快照
@@ -161,6 +167,20 @@ fun MainScreen(
         navController.navigate(Routes.SETUP) { launchSingleTop = true }
     }
 
+    val pickers = rememberTranscriptPickers(
+        onExportCurrentSession = { sid, uri ->
+            sessionListViewModel.exportUri(sid, uri, app.contentResolver, app.cacheDir)
+        },
+        onImportSession = { uri ->
+            sessionListViewModel.importUri(uri, app.contentResolver, app.cacheDir,
+                onSuccess = { android.widget.Toast.makeText(app, "匯入完成，可在設定或歷史對話唯讀檢視", android.widget.Toast.LENGTH_LONG).show() },
+                onError = { android.widget.Toast.makeText(app, "匯入失敗，請至設定查看詳情", android.widget.Toast.LENGTH_LONG).show() },
+            )
+        },
+        onDismissExportState = { sessionListViewModel.resetExportState() },
+        onDismissImportState = { sessionListViewModel.resetImportState() },
+    )
+
     StartupGateHost(
         gate = gate,
         startupReconcilePending = startupReconcilePending,
@@ -180,6 +200,10 @@ fun MainScreen(
         },
         onEditEndpoint = { goSetupForEdit() },
         onDrawerOpened = { sessionListViewModel.refresh() },
+        onImportPickerStart = pickers.launchImport,
+        importBusy = pickers.importPickerPending || importState is ImportUiState.Importing,
+        importPickerFailed = pickers.importPickerFailed,
+        onViewTranscript = { viewedSessionId = it },
         // Stage E：四態 journal 傳入 host 派生恢復態（單一來源純函數，見 NavGuard）。
         pendingTeardown = pendingTeardown,
         // Stage F：stale 抑制標籤同源傳入（四參派生；pure 只隱藏，真清卡靠 retry 終端）。
@@ -348,6 +372,15 @@ fun MainScreen(
                     }
                 },
                 startupReconcilePending = startupReconcilePending,
+                currentSessionId = currentSessionId,
+                exportState = exportState,
+                importState = importState,
+                pickers = pickers,
+                onOpenSession = { sessionId ->
+                    viewedSessionId = sessionId
+                },
+                onDismissExportState = { sessionListViewModel.resetExportState() },
+                onDismissImportState = { sessionListViewModel.resetImportState() },
             )
         },
         setupContent = { padding, isFirstRun ->
@@ -364,4 +397,7 @@ fun MainScreen(
             )
         },
     )
+    viewedSessionId?.let { id ->
+        TranscriptViewer(id, sessionListViewModel::readTranscriptPage) { viewedSessionId = null }
+    }
 }

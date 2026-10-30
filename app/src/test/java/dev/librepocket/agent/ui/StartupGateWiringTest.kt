@@ -1,9 +1,16 @@
 package dev.librepocket.agent.ui
 
 import android.os.Bundle
+import android.net.Uri
+import androidx.activity.compose.LocalActivityResultRegistryOwner
+import androidx.activity.result.ActivityResultRegistry
+import androidx.activity.result.ActivityResultRegistryOwner
+import androidx.activity.result.contract.ActivityResultContract
+import androidx.core.app.ActivityOptionsCompat
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -19,13 +26,20 @@ import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
+import androidx.compose.ui.test.hasText
 import androidx.navigation.NavController
 import androidx.navigation.NavDestination
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.rememberNavController
 import dev.librepocket.agent.ui.settings.SettingsScreen
+import dev.librepocket.agent.ui.settings.rememberTranscriptPickers
+import dev.librepocket.session.SessionMeta
+import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.setupErrorText
+import dev.librepocket.provider.ProviderProtocol
 import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -69,6 +83,13 @@ class StartupGateWiringTest {
         val inFlight = MutableStateFlow(false)
         var logoutCalls = 0
         var retryLogoutCalls = 0
+        val imported = mutableListOf<Uri>()
+        val opened = mutableListOf<String>()
+        val viewed = mutableListOf<String>()
+        val exported = mutableListOf<Pair<String, Uri>>()
+        val currentSession = MutableStateFlow<String?>(null)
+        val sessions = MutableStateFlow<List<SessionMeta>>(emptyList())
+        val importing = MutableStateFlow(false)
         lateinit var nav: NavHostController
         val visited = mutableListOf<String?>()
     }
@@ -80,6 +101,14 @@ class StartupGateWiringTest {
         val p by pending.collectAsState()
         val e by error.collectAsState()
         val b by inFlight.collectAsState()
+        val session by currentSession.collectAsState()
+        val history by sessions.collectAsState()
+        val busy by importing.collectAsState()
+        val pickers = rememberTranscriptPickers(
+            onExportCurrentSession = { id, uri -> exported.add(id to uri) },
+            onImportSession = { imported.add(it) },
+            onDismissExportState = {}, onDismissImportState = {},
+        )
         DisposableEffect(nav) {
             val listener = object : NavController.OnDestinationChangedListener {
                 override fun onDestinationChanged(
@@ -100,6 +129,13 @@ class StartupGateWiringTest {
             logoutInFlight = b,
             navController = nav,
             appName = "TestApp",
+            sessions = history,
+            currentSessionId = session,
+            onNewChat = { currentSession.value = null },
+            onImportPickerStart = pickers.launchImport,
+            importBusy = pickers.importPickerPending || busy,
+            onOpenSession = { opened.add(it); currentSession.value = it },
+            onViewTranscript = { viewed.add(it) },
             chatContent = { padding ->
                 Text("CHAT_BODY", modifier = Modifier.padding(padding))
             },
@@ -107,6 +143,7 @@ class StartupGateWiringTest {
                 SettingsScreen(
                     padding = padding,
                     gate = g,
+                    currentSessionId = session, pickers = pickers,
                     onLogout = { logoutCalls++ },
                     logoutErrorCode = e,
                     logoutInFlight = b,
@@ -295,4 +332,159 @@ class StartupGateWiringTest {
         awaitRoute(h, Routes.SETTINGS)
         assertEquals(Routes.SETTINGS, currentRoute(h))
     }
+
+    @Test
+    fun drawerContainsImportJsonlItem() {
+        val h = Harness()
+        h.pending.value = false
+        h.gate.value = EndpointGate.Ready(
+            EndpointConfig(
+                providerId = "preset:openai",
+                presetId = "openai",
+                label = "OpenAI",
+                baseUrl = "https://api.openai.com/v1",
+                protocol = ProviderProtocol.CHAT_COMPLETIONS,
+                model = "gpt-4o-mini",
+                apiKeyRef = "provider_key/preset:openai",
+            ),
+        )
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+        composeRule.onNodeWithContentDescription("選單").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("匯入對話 (JSONL)").assertIsDisplayed()
+        composeRule.onNodeWithText("匯入會建立新的本機對話副本，不驗證來源或真實性。可從歷史對話唯讀檢視；開啟對話可能建立不含歷史的新副本。").assertIsDisplayed()
+    }
+
+    @Test
+    fun drawerImportDoesNotNavigateOrOpenSession() {
+        val registry = object : ActivityResultRegistry() {
+            var request = -1
+            override fun <I : Any?, O : Any?> onLaunch(
+                requestCode: Int, contract: ActivityResultContract<I, O>, input: I,
+                options: ActivityOptionsCompat?,
+            ) { request = requestCode }
+        }
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val h = Harness()
+        h.pending.value = false
+        h.gate.value = EndpointGate.Ready(
+            EndpointConfig("preset:openai", "openai", "OpenAI", "https://api.openai.com/v1",
+                ProviderProtocol.CHAT_COMPLETIONS, "gpt-4o-mini", "provider_key/preset:openai"),
+        )
+        composeRule.setContent {
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) { h.Content() }
+        }
+        awaitRoute(h, Routes.CHAT)
+        composeRule.onNodeWithContentDescription("選單").performClick()
+        composeRule.onNodeWithText("匯入對話 (JSONL)").performClick()
+        composeRule.onNodeWithContentDescription("選單").performClick()
+        composeRule.onNodeWithText("匯入對話 (JSONL)").assertIsNotEnabled()
+        val uri = Uri.parse("content://test/import")
+        composeRule.runOnIdle { h.importing.value = true; registry.dispatchResult(registry.request, uri) }
+        composeRule.onNodeWithText("匯入對話 (JSONL)").assertIsNotEnabled()
+        composeRule.runOnIdle {
+            assertEquals(listOf(uri), h.imported)
+            assertTrue(h.opened.isEmpty())
+            assertEquals(Routes.CHAT, h.nav.currentDestination?.route)
+            h.importing.value = false
+        }
+        composeRule.onNodeWithText("匯入對話 (JSONL)").assertIsEnabled()
+    }
+    @Test
+    fun settingsPickerResultSurvivesHostLoadingAndSessionChanges() {
+        val registry = object : ActivityResultRegistry() {
+            var request = -1
+            override fun <I : Any?, O : Any?> onLaunch(
+                requestCode: Int, contract: ActivityResultContract<I, O>, input: I,
+                options: ActivityOptionsCompat?,
+            ) { request = requestCode }
+        }
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val h = Harness()
+        h.pending.value = false
+        h.currentSession.value = "original"
+        h.sessions.value = listOf(SessionMeta("other", "other conversation", 0, 0, "model"))
+        h.gate.value = EndpointGate.Ready(
+            EndpointConfig("preset:openai", "openai", "OpenAI", "https://api.openai.com/v1",
+                ProviderProtocol.CHAT_COMPLETIONS, "gpt-4o-mini", "provider_key/preset:openai"),
+        )
+        composeRule.setContent {
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) { h.Content() }
+        }
+        awaitRoute(h, Routes.CHAT)
+        composeRule.runOnIdle { h.nav.navigate(Routes.SETTINGS) }
+        composeRule.onNodeWithText("匯出目前對話").performScrollTo().performClick()
+        composeRule.onNodeWithContentDescription("選單").performClick()
+        composeRule.onNodeWithText("新對話").performClick()
+        composeRule.onNodeWithContentDescription("選單").performClick()
+        composeRule.onNodeWithTag("sessionDrawerList").performScrollToNode(hasText("other conversation"))
+        composeRule.onNodeWithText("other conversation").performClick()
+        composeRule.runOnIdle { h.pending.value = true }
+        composeRule.onNodeWithTag("startupLoading").assertIsDisplayed()
+        val uri = Uri.parse("content://test/export-loading")
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.request, uri)
+            assertEquals(listOf("original" to uri), h.exported)
+            assertEquals(listOf("other"), h.opened)
+        }
+        composeRule.runOnIdle { h.pending.value = false }
+        awaitRoute(h, Routes.CHAT)
+        composeRule.runOnIdle { h.nav.navigate(Routes.SETTINGS) }
+        composeRule.onNodeWithText("匯入對話檔").performScrollTo().performClick()
+        composeRule.runOnIdle { h.pending.value = true; h.currentSession.value = null }
+        composeRule.onNodeWithTag("startupLoading").assertIsDisplayed()
+        val importedUri = Uri.parse("content://test/import-loading")
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.request, importedUri)
+            assertEquals(listOf(importedUri), h.imported)
+            assertEquals(listOf("other"), h.opened)
+        }
+    }
+
+    @Test
+    fun drawerOldHistoryIsReachableOnlyByExplicitClick() {
+        val h = Harness()
+        h.pending.value = false
+        h.gate.value = EndpointGate.Ready(
+            EndpointConfig("preset:openai", "openai", "OpenAI", "https://api.openai.com/v1",
+                ProviderProtocol.CHAT_COMPLETIONS, "gpt-4o-mini", "provider_key/preset:openai"),
+        )
+        h.sessions.value = (0..24).map { SessionMeta("id-$it", "history-$it", 0, 0, "model") }
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+        composeRule.onNodeWithContentDescription("選單").performClick()
+        composeRule.onNodeWithTag("sessionDrawerList").performScrollToNode(hasText("history-24"))
+        composeRule.onNodeWithText("history-24").performClick()
+        composeRule.runOnIdle {
+            assertEquals(listOf("id-24"), h.opened)
+            assertEquals(Routes.CHAT, h.nav.currentDestination?.route)
+        }
+    }
+
+    @Test
+    fun drawerReadOnlyEntryDoesNotOpenChat() {
+        val h = Harness()
+        h.pending.value = false
+        h.gate.value = EndpointGate.Ready(
+            EndpointConfig("preset:openai", "openai", "OpenAI", "https://api.openai.com/v1",
+                ProviderProtocol.CHAT_COMPLETIONS, "gpt-4o-mini", "provider_key/preset:openai"),
+        )
+        h.sessions.value = listOf(SessionMeta("imported", "imported title", 0, 0, "imported/unknown"))
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+        composeRule.onNodeWithContentDescription("選單").performClick()
+        composeRule.onNodeWithTag("sessionDrawerList").performScrollToNode(hasText("imported title"))
+        composeRule.onNodeWithContentDescription("唯讀檢視 imported title").performClick()
+        composeRule.runOnIdle {
+            assertEquals(listOf("imported"), h.viewed)
+            assertTrue(h.opened.isEmpty())
+            assertEquals(Routes.CHAT, h.nav.currentDestination?.route)
+        }
+    }
+
 }

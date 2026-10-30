@@ -6,6 +6,7 @@ import dev.librepocket.agent.ui.chat.SessionStoreSource
 import dev.librepocket.agent.ui.chat.VaultSource
 import dev.librepocket.agent.ui.chat.allowKeyReadPolicy
 import dev.librepocket.agent.ui.chat.findDanglingRunIds
+import dev.librepocket.agent.ui.chat.isSwitchSnapshotTerminalMark
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
@@ -23,6 +24,7 @@ import dev.librepocket.session.RoomSessionStore
 import dev.librepocket.session.SessionStore
 import dev.librepocket.session.SessionTranscriptSink
 import dev.librepocket.session.TranscriptEvent
+import dev.librepocket.session.TranscriptEventEntity
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
@@ -154,6 +156,92 @@ class RoomKillPersistencePhase4Test {
         if (failure == null) throw cleanup
         failure.addSuppressed(cleanup)
       }
+    }
+  }
+
+  @Test fun terminalMarkersRemainTerminalAcrossExportImportAndReopen() = runBlocking {
+    val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+    val opened = LibrePocketDb.openInMemory(context)
+    db = opened
+    val store = RoomSessionStore(opened) { 1_700_000_000_000L }
+    val sid = store.createSession("hi", "preset:openai@https://api.openai.com/gpt-4o-mini")
+    val ids = listOf("private-user@example.com", "interrupted-id", "failure-id", "bearer syntheticToken123")
+    val tails = listOf("cancelled", "interrupted", "failed: contact private-user@example.com", "cancelled")
+    opened.runInTransaction {
+      ids.forEachIndexed { i, id ->
+        opened.sessionDao().insertEvent(TranscriptEventEntity(
+          0, sid, (2 * i + 1).toLong(), id, "user", "question", false, 0, 1L, false, null, null, null,
+        ))
+        opened.sessionDao().insertEvent(TranscriptEventEntity(
+          0, sid, (2 * i + 2).toLong(), id, "system", "turn $id ${tails[i]}", false, 0, 1L, false, null, null, null,
+        ))
+      }
+      opened.sessionDao().insertEvent(TranscriptEventEntity(
+        0, sid, 9L, "notice-id", "system", "turn different cancelled", false, 0, 1L, false, null, null, null,
+      ))
+    }
+    val dir = Files.createTempDirectory("markers-jsonl").toFile()
+    tmpDir = dir
+    val dest = File(dir, "markers.jsonl")
+    store.exportJsonl(sid, dest)
+    val raw = dest.readText()
+    assertTrue(ids.none { raw.contains(it) })
+    val imported = store.importJsonl(dest)
+    val events = store.loadEvents(imported, 0, 2000)
+    val marks = events.filter { it.kind == "system" }
+    assertEquals(5, marks.size)
+    assertEquals("turn ${marks[0].runId} cancelled", marks[0].text)
+    assertEquals("turn ${marks[1].runId} interrupted", marks[1].text)
+    assertTrue(marks[2].text.startsWith("turn ${marks[2].runId} failed"))
+    assertEquals("turn ${marks[3].runId} cancelled", marks[3].text)
+    assertTrue(marks.take(4).all(::isSwitchSnapshotTerminalMark))
+    assertEquals("turn different cancelled", marks[4].text)
+    assertTrue(!isSwitchSnapshotTerminalMark(marks[4]))
+    assertTrue(findDanglingRunIds(events).isEmpty())
+    assertTrue(!isSwitchSnapshotTerminalMark(marks[0].copy(text = "turn different cancelled")))
+    assertTrue(!isSwitchSnapshotTerminalMark(marks[0].copy(kind = "user")))
+    val reopened = factory(store).open(endpoint(), imported)
+    withReopenedSession(reopened.session) {
+      assertEquals(events, store.loadEvents(imported, 0, 2000))
+    }
+  }
+
+  @Test fun bearerMarkerBoundariesSurviveRawImportExportAndReopen() = runBlocking {
+    val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+    val opened = LibrePocketDb.openInMemory(context)
+    db = opened
+    val store = RoomSessionStore(opened) { 1_700_000_000_000L }
+    val ids = listOf("bearer", "bearer syntheticSecret123", "user@example.com")
+    val tails = listOf("cancelled", "interrupted", "failed: bearer suffixSecret123")
+    val dir = Files.createTempDirectory("bearer-markers").toFile()
+    tmpDir = dir
+    val source = File(dir, "source.jsonl")
+    val rows = ids.flatMapIndexed { index, id ->
+      listOf(
+        TranscriptEvent(seq = (2 * index + 1).toLong(), sessionId = "source", runId = id,
+          kind = "user", text = "question", createdAt = 1L),
+        TranscriptEvent(seq = (2 * index + 2).toLong(), sessionId = "source", runId = id,
+          kind = "system", text = "turn $id ${tails[index]}", createdAt = 1L),
+      )
+    }
+    source.writeText(rows.joinToString("\n") { JsonlCodec.encode(it) } + "\n")
+    val first = store.importJsonl(source)
+    val importedRows = store.loadEvents(first, 0, 100)
+    assertTrue(findDanglingRunIds(importedRows).isEmpty())
+    assertTrue(importedRows.filter { it.kind == "system" }.all(::isSwitchSnapshotTerminalMark))
+    val dest = File(dir, "export.jsonl")
+    store.exportJsonl(first, dest)
+    val raw = dest.readText()
+    assertTrue(!raw.contains("syntheticSecret123"))
+    assertTrue(!raw.contains("suffixSecret123"))
+    assertTrue(!raw.contains("user@example.com"))
+    val second = store.importJsonl(dest)
+    val restored = store.loadEvents(second, 0, 100)
+    assertTrue(findDanglingRunIds(restored).isEmpty())
+    assertTrue(restored.filter { it.kind == "system" }.all(::isSwitchSnapshotTerminalMark))
+    val reopened = factory(store).open(endpoint(), second)
+    withReopenedSession(reopened.session) {
+      assertEquals(restored, store.loadEvents(second, 0, 100))
     }
   }
 
@@ -314,14 +402,15 @@ class RoomKillPersistencePhase4Test {
       for ((i, line) in lines.withIndex()) {
         val back = JsonlCodec.decode(i + 1, line)
         val src = afterFirst[i]
-        assertEquals(src.runId, back.runId)
         assertEquals(src.kind, back.kind)
-        assertEquals(src.text, back.text)
+        assertEquals(if (src.kind == "system") "turn ${back.runId} interrupted" else src.text, back.text)
         assertEquals(src.isFinal, back.isFinal)
         assertEquals(src.isPartial, back.isPartial)
-        assertEquals(src.parentRunId, back.parentRunId)
+        assertEquals(src.parentRunId == null, back.parentRunId == null)
         assertEquals(src.attemptIndex, back.attemptIndex)
       }
+      val decoded = lines.mapIndexed { i, line -> JsonlCodec.decode(i + 1, line) }
+      assertEquals(decoded.first { it.kind == "user" }.runId, decoded.first { it.kind == "system" }.runId)
       // A second Room read agrees on runId/text/kind; session hydration is not asserted.
       val reloaded = store.loadEvents(sid, 0, 2000)
       assertEquals(

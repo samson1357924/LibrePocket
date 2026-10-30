@@ -1,18 +1,31 @@
 package dev.librepocket.agent.ui.settings
 
+import android.net.Uri
+import androidx.activity.compose.LocalActivityResultRegistryOwner
+import androidx.activity.result.ActivityResultRegistry
+import androidx.activity.result.ActivityResultRegistryOwner
+import androidx.activity.result.contract.ActivityResultContract
+import androidx.core.app.ActivityOptionsCompat
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.junit4.StateRestorationTester
+import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.unit.dp
+import dev.librepocket.agent.ui.chat.ExportUiState
+import dev.librepocket.agent.ui.chat.ImportUiState
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.setupErrorText
@@ -42,6 +55,28 @@ class SettingsScreenTest {
 
     @get:Rule
     val composeRule = createComposeRule()
+
+    @Test
+    fun transcriptBackupWarnsAboutPartialDestinationOnFailureAndCancellation() {
+        var exportState: ExportUiState by mutableStateOf(ExportUiState.Error("write failed"))
+        composeRule.setContent {
+            TranscriptBackupCard(
+                currentSessionId = "session",
+                exportState = exportState,
+                importState = ImportUiState.Idle,
+                onLaunchExport = {}, onLaunchImport = {},
+                exportPickerPending = false, importPickerPending = false,
+                exportPickerFailed = false, importPickerFailed = false,
+                onOpenSession = {},
+            )
+        }
+        val warning = "儲存目的地由文件提供者管理；匯出失敗或取消時，目的地可能留下空檔或部分內容，請自行檢查並刪除。"
+        composeRule.onNodeWithText(warning).assertIsDisplayed()
+        composeRule.onNodeWithText("匯出失敗：write failed").assertIsDisplayed()
+        composeRule.runOnIdle { exportState = ExportUiState.Idle }
+        composeRule.onNodeWithText(warning).assertIsDisplayed()
+        composeRule.onAllNodesWithText("匯出失敗：write failed").assertCountEquals(0)
+    }
 
     private fun readyGate(): EndpointGate.Ready = EndpointGate.Ready(
         EndpointConfig(
@@ -317,5 +352,207 @@ class SettingsScreenTest {
         onLogoutArea("重試清除").performClick()
         assertEquals(0, logoutCalls)
         assertEquals(1, retryCalls)
+    }
+
+    @Test
+    fun transcriptBackupCard_rendersAndExportDisabledWhenNoSession() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                currentSessionId = null,
+            )
+        }
+        onLogoutArea("對話備份與匯出 (JSONL)").assertIsDisplayed()
+        onLogoutArea("（目前無開啟中的對話，請先開啟或建立對話）").assertIsDisplayed()
+        onLogoutArea("匯出目前對話").assertIsNotEnabled()
+        onLogoutArea("匯入對話檔").assertIsEnabled()
+        onLogoutArea("匯出會嘗試脫敏，但無法保證移除所有敏感資訊；分享前請自行檢查檔案。匯入建立本機副本，不驗證來源或真實性；可唯讀檢視，開啟對話可能建立不含歷史的新副本。").assertIsDisplayed()
+        onLogoutArea("儲存目的地由文件提供者管理；匯出失敗或取消時，目的地可能留下空檔或部分內容，請自行檢查並刪除。").assertIsDisplayed()
+    }
+
+    @Test
+    fun exportPickerBindsOriginalSessionAcrossRestoreSwitchAndCancellation() {
+        val registry = object : ActivityResultRegistry() {
+            var request = -1
+            override fun <I : Any?, O : Any?> onLaunch(
+                requestCode: Int, contract: ActivityResultContract<I, O>, input: I,
+                options: ActivityOptionsCompat?,
+            ) { request = requestCode }
+        }
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        var session by mutableStateOf<String?>("original")
+        val exported = mutableListOf<Pair<String, Uri>>()
+        val restoration = StateRestorationTester(composeRule)
+        restoration.setContent {
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                val pickers = rememberTranscriptPickers(
+                    onExportCurrentSession = { id, uri -> exported.add(id to uri) },
+                    onImportSession = {}, onDismissExportState = {}, onDismissImportState = {},
+                )
+                SettingsScreen(
+                    padding = PaddingValues(0.dp), gate = readyGate(), pickers = pickers,
+                    currentSessionId = session,
+                    exportState = ExportUiState.Idle,
+                    importState = ImportUiState.Idle,
+                    onOpenSession = {},
+                )
+            }
+        }
+        onLogoutArea("匯出目前對話").performClick()
+        composeRule.runOnIdle { session = null }
+        restoration.emulateSavedInstanceStateRestore()
+        val uri = Uri.parse("content://test/export")
+        composeRule.runOnIdle { registry.dispatchResult(registry.request, uri) }
+        composeRule.runOnIdle { assertEquals(listOf("original" to uri), exported) }
+
+        composeRule.runOnIdle { session = "next" }
+        onLogoutArea("匯出目前對話").performClick()
+        composeRule.runOnIdle { registry.dispatchResult<Uri?>(registry.request, null) }
+        composeRule.onNodeWithText("匯出目前對話").assertIsEnabled()
+        composeRule.runOnIdle { assertEquals(1, exported.size) }
+    }
+
+    @Test
+    fun pickerSurvivesGateBranchChangesAndUsesOriginalSession() {
+        val registry = object : ActivityResultRegistry() {
+            var request = -1
+            override fun <I : Any?, O : Any?> onLaunch(
+                requestCode: Int, contract: ActivityResultContract<I, O>, input: I,
+                options: ActivityOptionsCompat?,
+            ) { request = requestCode }
+        }
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        var gate: EndpointGate by mutableStateOf(readyGate())
+        var session by mutableStateOf("original")
+        val exported = mutableListOf<Pair<String, Uri>>()
+        composeRule.setContent {
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                val pickers = rememberTranscriptPickers(
+                    onExportCurrentSession = { id, uri -> exported.add(id to uri) },
+                    onImportSession = {}, onDismissExportState = {}, onDismissImportState = {},
+                )
+                SettingsScreen(
+                    padding = PaddingValues(0.dp), gate = gate, currentSessionId = session, pickers = pickers,
+                )
+            }
+        }
+        onLogoutArea("匯出目前對話").performClick()
+        composeRule.runOnIdle { gate = EndpointGate.ReadFailure; session = "other" }
+        val uri = Uri.parse("content://test/export")
+        composeRule.runOnIdle { registry.dispatchResult(registry.request, uri) }
+        composeRule.runOnIdle { assertEquals(listOf("original" to uri), exported); gate = EndpointGate.NoEndpoint }
+        onLogoutArea("匯出目前對話").assertIsEnabled()
+    }
+
+    @Test
+    fun pickerLaunchFailureClearsOldSuccessAndAllowsRetry() {
+        val registry = object : ActivityResultRegistry() {
+            override fun <I : Any?, O : Any?> onLaunch(
+                requestCode: Int, contract: ActivityResultContract<I, O>, input: I,
+                options: ActivityOptionsCompat?,
+            ) { throw android.content.ActivityNotFoundException() }
+        }
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        var exportState: ExportUiState by mutableStateOf(ExportUiState.Success)
+        var importState: ImportUiState by mutableStateOf(ImportUiState.Success("old"))
+        composeRule.setContent {
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                val pickers = rememberTranscriptPickers(
+                    onExportCurrentSession = { _, _ -> }, onImportSession = {},
+                    onDismissExportState = { exportState = ExportUiState.Idle },
+                    onDismissImportState = { importState = ImportUiState.Idle },
+                )
+                SettingsScreen(
+                    padding = PaddingValues(0.dp), gate = readyGate(), currentSessionId = "session",
+                    exportState = exportState, importState = importState, pickers = pickers,
+                    onDismissExportState = { exportState = ExportUiState.Idle },
+                    onDismissImportState = { importState = ImportUiState.Idle },
+                )
+            }
+        }
+        onLogoutArea("匯出目前對話").performClick()
+        onLogoutArea("無法開啟儲存選擇器，請重試。").assertIsDisplayed()
+        onLogoutArea("匯出目前對話").assertIsEnabled()
+        composeRule.onAllNodesWithText("對話已成功匯出！").assertCountEquals(0)
+        onLogoutArea("匯入對話檔").performClick()
+        onLogoutArea("無法開啟檔案選擇器，請重試。").assertIsDisplayed()
+        onLogoutArea("匯入對話檔").assertIsEnabled()
+        composeRule.onAllNodesWithText("唯讀檢視匯入內容").assertCountEquals(0)
+    }
+
+    @Test
+    fun transcriptBackupCard_exportEnabledWhenSessionPresent() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                currentSessionId = "session-1234",
+            )
+        }
+        onLogoutArea("匯出目前對話").assertIsEnabled()
+    }
+
+    @Test
+    fun transcriptBackupCard_showsSuccessAndErrorStates() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                currentSessionId = "session-1234",
+                exportState = ExportUiState.Success,
+                importState = ExportUiState.Error("模擬匯入失敗").let {
+                    ImportUiState.Error("模擬匯入失敗")
+                },
+            )
+        }
+        onLogoutArea("對話已成功匯出！").assertIsDisplayed()
+        onLogoutArea("匯入失敗：模擬匯入失敗").assertIsDisplayed()
+    }
+
+    @Test
+    fun transcriptBackupCard_importSuccessShowsSwitchButtonAndTriggersCallback() {
+        var openedSession: String? = null
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                importState = ImportUiState.Success("imported-sess-999"),
+                onOpenSession = { openedSession = it },
+            )
+        }
+        onLogoutArea("對話已成功匯入！").assertIsDisplayed()
+        onLogoutArea("唯讀檢視匯入內容").assertIsDisplayed()
+        onLogoutArea("唯讀檢視匯入內容").performClick()
+        assertEquals("imported-sess-999", openedSession)
+    }
+
+    @Test
+    fun transcriptBackupCard_dismissButtonsTriggerCallbacks() {
+        var dismissedExport = false
+        var dismissedImport = false
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                currentSessionId = "session-1234",
+                exportState = ExportUiState.Success,
+                importState = ImportUiState.Error("模擬匯入失敗"),
+                onDismissExportState = { dismissedExport = true },
+                onDismissImportState = { dismissedImport = true },
+            )
+        }
+        val dismissButtons = composeRule.onAllNodesWithContentDescription("關閉提示")
+        dismissButtons.assertCountEquals(2)
+        dismissButtons[0].performScrollTo().performClick()
+        assertTrue(dismissedExport)
+        dismissButtons[1].performScrollTo().performClick()
+        assertTrue(dismissedImport)
     }
 }

@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -211,6 +212,8 @@ class RoomSessionStore(
      * cancelled by the test.
      */
     internal var insideTxAfterInsertHookForTest: ((Job?) -> Unit)? = null
+
+    internal var importAfterInsertHookForTest: ((Job?) -> Unit)? = null
 
     override suspend fun createSession(title: String, model: String): String =
         withContext(Dispatchers.IO) {
@@ -520,8 +523,8 @@ class RoomSessionStore(
         } else {
             redacted to false
         }
-        val reason = event.failureReason?.let { Redactor.redactError(it) }
-        return PreparedEvent(text, truncated, reason)
+        val reason = event.failureReason?.let { redactFailureReason(it) }
+        return PreparedEvent(text, event.isTruncated || truncated, reason)
     }
 
     private data class PreparedEvent(val text: String, val truncated: Boolean, val reason: String?)
@@ -605,8 +608,10 @@ class RoomSessionStore(
             dao.sessionById(sessionId)?.toMeta()
         }
 
+    internal var exportAfterPageHookForTest: (() -> Unit)? = null
+
     override suspend fun exportJsonl(sessionId: String, destFile: File) {
-        // Paged streaming export: memory stays O(page), not O(session).
+        // Paged streaming export; the ID map is bounded by rows and source ID characters.
         // Writes to a tmp sibling first; destFile appears atomically only on
         // success, so a failure or oversize abort never leaves a half file.
         // The byte budget is enforced DURING the write (not after
@@ -615,38 +620,114 @@ class RoomSessionStore(
         if (parent != null && !parent.exists() && !parent.mkdirs()) {
             error("export failed: cannot create directory ${parent.path}")
         }
-        val tmp = File(parent, destFile.name + ".tmp")
         var bytes = 0L
+        var chars = 0L
+        var rows = 0
         var afterSeq = 0L
+        val ids = HashMap<String, String>()
+        val assignedIds = HashSet<String>()
+        var idChars = 0L
+        fun exportId(id: String): String = ids.getOrPut(id) {
+            if (id.length > IMPORT_MAX_LINE_CHARS || idChars + id.length > IMPORT_MAX_CONTENT_CHARS) {
+                throw JsonlExportLimitException("export IDs too large")
+            }
+            idChars += id.length
+            var candidate: String
+            do {
+                candidate = redactionSafeExportId(UUID.randomUUID())
+            } while (!assignedIds.add(candidate))
+            candidate
+        }
         withContext(Dispatchers.IO) {
+            ensureActive()
+            val tmp = File.createTempFile("jsonl-export-", ".tmp", parent ?: File("."))
             try {
+                // All pages must observe one Room snapshot, including when prune,
+                // delete or append runs while the export is streaming.
+                db.withTransaction {
+                require(dao.sessionById(sessionId) != null) { "unknown session" }
+                val expectedRows = dao.eventCount(sessionId)
                 tmp.bufferedWriter(Charsets.UTF_8).use { out ->
                     while (true) {
+                        currentCoroutineContext().ensureActive()
                         val page = dao.eventsAfter(sessionId, afterSeq, EXPORT_PAGE_SIZE)
                         if (page.isEmpty()) break
                         for (row in page) {
-                            val event = row.toEvent()
+                            currentCoroutineContext().ensureActive()
+                            require(row.seq > afterSeq) { "export failed: invalid event sequence" }
+                            if (++rows > IMPORT_MAX_ROWS) throw JsonlExportLimitException("export too large")
+                            // Inspect the stored text before any read-time redaction:
+                            // marker recognition requires the original boundary.
+                            val event = row.toEvent().copy(text = row.text)
                             // B1 defense-in-depth: legacy rows may predate write-time
                             // redaction, so re-redact at export time before touching disk.
                             // Mirrors TranscriptExport.exportRedacted semantics.
-                            val redacted = Redactor.redact(event.text).text
-                            val reason = event.failureReason?.let { Redactor.redactError(it) }
-                            val line = JsonlCodec.encode(event.copy(text = redacted, failureReason = reason))
+                            val mappedRunId = exportId(event.runId)
+                            // Match the original marker before redaction, and only on system rows.
+                            // A marker already redacted on write may no longer contain its
+                            // runId; it cannot be safely identified or reconstructed here.
+                            // Legacy failure suffixes remain free text and still need redaction.
+                            val markerPrefix = "turn ${event.runId} "
+                            val markerTail = if (event.kind == "system" && event.text.startsWith(markerPrefix)) {
+                                event.text.substring(markerPrefix.length).takeIf {
+                                    it == "cancelled" || it == "interrupted" || it.startsWith("failed")
+                                }
+                            } else null
+                            val redactedPrefix = Redactor.redact(markerPrefix).text
+                            if (markerTail == null && event.kind == "system" && redactedPrefix != markerPrefix &&
+                                event.text.startsWith(redactedPrefix) &&
+                                event.text.substring(redactedPrefix.length).let {
+                                    it == "cancelled" || it == "interrupted" || it.startsWith("failed")
+                                }
+                            ) throw JsonlExportLimitException("export cannot identify redacted terminal marker")
+                            if (markerTail == null && event.kind == "system" &&
+                                listOf("cancelled", "interrupted", "failed").any { tail ->
+                                    val original = markerPrefix + tail
+                                    val masked = Redactor.redact(original).text
+                                    masked != original && (event.text == masked ||
+                                        (tail == "failed" && event.text.startsWith(masked)))
+                                }
+                            ) throw JsonlExportLimitException("export cannot identify redacted terminal marker")
+                            val redacted = if (markerTail != null) {
+                                "turn $mappedRunId ${Redactor.redact(markerTail).text}"
+                            } else Redactor.redact(event.text).text
+                            val reason = event.failureReason?.let { redactFailureReason(it) }
+                            // IDs can contain arbitrary secrets, including in legacy rows.
+                            // Use one bijection for both fields, independent for each export.
+                            val line = JsonlCodec.encode(event.copy(
+                                runId = mappedRunId,
+                                parentRunId = event.parentRunId?.let { exportId(it) },
+                                text = redacted,
+                                failureReason = reason,
+                            ), isTruncated = row.isTruncated)
+                            if (line.length > IMPORT_MAX_LINE_CHARS) throw JsonlExportLimitException("export line too large")
+                            // Validate the actual transformed line against the import shape gate.
+                            JsonlCodec.decode(rows, line)
+                            // Import redacts again before applying its durable text cap.
+                            // Reject rather than produce an export that import would truncate.
+                            if (Redactor.redact(redacted).text.length > MAX_TEXT_CHARS) {
+                                throw JsonlExportLimitException("export text exceeds import limit (100000 characters)")
+                            }
+                            chars += line.length
+                            if (chars > IMPORT_MAX_CONTENT_CHARS) throw JsonlExportLimitException("export too large")
                             bytes += line.toByteArray(Charsets.UTF_8).size + 1
-                            check(bytes <= EXPORT_MAX_BYTES) { "export too large" }
+                            if (bytes > EXPORT_MAX_BYTES) throw JsonlExportLimitException("export too large")
                             out.write(line)
                             out.newLine()
                             afterSeq = row.seq
                         }
+                        exportAfterPageHookForTest?.invoke()
                     }
                 }
-            } catch (e: Exception) {
+                require(rows == expectedRows) { "export failed: invalid event sequence" }
+                currentCoroutineContext().ensureActive()
+                }
+                ensureActive()
+                if (!tmp.renameTo(destFile)) {
+                    error("export failed: cannot move tmp file into place")
+                }
+            } finally {
                 tmp.delete()
-                throw e
-            }
-            if (!tmp.renameTo(destFile)) {
-                tmp.delete()
-                error("export failed: cannot move tmp file into place")
             }
         }
     }
@@ -655,36 +736,99 @@ class RoomSessionStore(
         // Refuse oversized files BEFORE reading (export caps at the same bound).
         // A missing file has length 0 and falls through to the reader, which
         // throws FileNotFoundException as before.
-        require(srcFile.length() <= IMPORT_MAX_BYTES) { "import too large" }
-        // Stream line-by-line: memory stays O(file) via the size gate above,
-        // never 2x (readLines + parsed list). Parsing completes before any
-        // write, so a bad line still rolls back the whole batch (transaction).
+        if (srcFile.length() > IMPORT_MAX_BYTES) throw JsonlImportLimitException("import too large")
+        val input = object : java.io.FilterInputStream(srcFile.inputStream()) {
+            private var closed = false
+            override fun close() { if (!closed) { closed = true; super.close() } }
+        }
+        return input.use { importJsonlImpl(it, closeAfterRead = true) }
+    }
+
+    override suspend fun importJsonl(input: java.io.InputStream): String =
+        importJsonlImpl(input, closeAfterRead = false)
+
+    private suspend fun importJsonlImpl(input: java.io.InputStream, closeAfterRead: Boolean): String {
+        // Parse before writing, bounded by the source-byte limit. Parsed objects
+        // can still occupy substantially more memory than the source bytes.
         val parsed = ArrayList<JsonlLine>()
         var lastSeq = 0L
         var lineNumber = 0
+        var contentChars = 0L
         withContext(Dispatchers.IO) {
-            srcFile.bufferedReader(Charsets.UTF_8).useLines { lines ->
-                for (raw in lines) {
-                    lineNumber++
-                    if (raw.isBlank()) continue
-                    val line = JsonlCodec.decode(lineNumber, raw)
-                    require(line.seq > lastSeq) { "import failed at line $lineNumber" }
-                    lastSeq = line.seq
-                    parsed.add(line)
+            val bounded = object : java.io.FilterInputStream(input) {
+                var count = 0L
+                override fun read(): Int {
+                    val value = super.read()
+                    if (value != -1 && ++count > IMPORT_MAX_BYTES) throw JsonlImportLimitException("import too large")
+                    return value
                 }
+                override fun read(b: ByteArray, off: Int, len: Int): Int {
+                    val n = super.read(b, off, len)
+                    if (n > 0) {
+                        count += n
+                        if (count > IMPORT_MAX_BYTES) throw JsonlImportLimitException("import too large")
+                    }
+                    return n
+                }
+                override fun close() { if (closeAfterRead) input.close() }
             }
+            // readLine() is unbounded; reject before constructing an oversized line.
+            val decoder = Charsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+            try {
+                java.io.PushbackReader(java.io.InputStreamReader(bounded, decoder).buffered(), 1).use { reader ->
+                    while (true) {
+                        ensureActive()
+                        val raw = readLimitedJsonlLine(reader) ?: break
+                        lineNumber++
+                        if (raw.isBlank()) continue
+                        contentChars += raw.length
+                        if (contentChars > IMPORT_MAX_CONTENT_CHARS || parsed.size >= IMPORT_MAX_ROWS)
+                            throw JsonlImportLimitException("import too large")
+                        val line = JsonlCodec.decode(lineNumber, raw)
+                        require(line.seq > lastSeq) { "import failed at line $lineNumber" }
+                        if (line.kind == "system" && terminalTail(line.runId, line.text) == null &&
+                            isAmbiguousRedactedTerminal(line.runId, line.text)
+                        ) throw IllegalArgumentException("import failed at line $lineNumber")
+                        if (Redactor.redact(line.text).text.length > MAX_TEXT_CHARS) {
+                            throw JsonlImportLimitException("import failed at line $lineNumber")
+                        }
+                        lastSeq = line.seq
+                        parsed.add(line)
+                    }
+                }
+            } catch (_: java.nio.charset.CharacterCodingException) {
+                throw IllegalArgumentException("import failed: invalid UTF-8")
+            }
+        }
+        // Never persist source IDs: arbitrary input may contain sensitive data.
+        // One injective map preserves all run/parent relationships across rows.
+        val assignedIds = HashSet<String>()
+        for (line in parsed) {
+            assignedIds.add(line.runId)
+            line.parentRunId?.let { assignedIds.add(it) }
+        }
+        val remappedIds = HashMap<String, String>()
+        fun mapId(source: String): String = remappedIds.getOrPut(source) {
+            var id: String
+            do { id = redactionSafeExportId(UUID.randomUUID()) } while (!assignedIds.add(id))
+            id
+        }
+        for (line in parsed) {
+            mapId(line.runId)
+            line.parentRunId?.let { mapId(it) }
         }
         val now = clock()
         val title = parsed.firstOrNull { it.kind == "user" }?.text?.let {
             Redactor.redact(it).text.take(TITLE_CHARS)
         } ?: IMPORT_FALLBACK_TITLE
         return withContext(Dispatchers.IO) {
-            // Deliberately keeps the suspend withTransaction: import has no
-            // durable-ack discriminant to protect (R8-5 blocking mode not
-            // applicable) and retry is inherently non-idempotent (a new
-            // sessionId per attempt), so the COMMIT→resume gap carries no
-            // ack-misclassification risk.
+            // Cancellation after commit but before returning the ID leaves the
+            // outcome unknown to the caller; retry can create a duplicate.
             db.withTransaction {
+                val job = currentCoroutineContext()[Job]
+                job?.ensureActive()
                 val sessionId = UUID.randomUUID().toString()
                 dao.insertSession(
                     SessionEntity(
@@ -697,35 +841,79 @@ class RoomSessionStore(
                     ),
                 )
                 for (line in parsed) {
-                    // Same truncate parity as appendEvent: over-long texts are cut
-                    // and flagged instead of bypassing the MAX_TEXT_CHARS bound.
-                    val redactedText = Redactor.redact(line.text).text
-                    val (text, truncated) = if (redactedText.length > MAX_TEXT_CHARS) {
-                        redactedText.take(MAX_TEXT_CHARS) to true
-                    } else {
-                        redactedText to false
+                    job?.ensureActive()
+                    val mappedRunId = remappedIds.getValue(line.runId)
+                    val tail = if (line.kind == "system") terminalTail(line.runId, line.text) else null
+                    val text = if (tail != null) "turn $mappedRunId $tail" else line.text
+                    val redactedText = Redactor.redact(text).text
+                    if (redactedText.length > MAX_TEXT_CHARS) {
+                        throw JsonlImportLimitException("import text exceeds limit")
                     }
                     dao.insertEvent(
                         TranscriptEventEntity(
                             0,
                             sessionId,
                             line.seq,
-                            line.runId,
+                            mappedRunId,
                             line.kind,
-                            text,
-                            truncated,
+                            redactedText,
+                            line.isTruncated,
                             line.imagesOmitted,
                             line.createdAt,
                             line.isPartial,
-                            line.failureReason?.let { Redactor.redactError(it) },
-                            line.parentRunId,
+                            line.failureReason?.let { redactFailureReason(it) },
+                            line.parentRunId?.let { remappedIds.getValue(it) },
                             line.attemptIndex,
                             line.isFinal,
                         ),
                     )
+                    importAfterInsertHookForTest?.invoke(job)
                 }
+                job?.ensureActive()
                 sessionId
             }
+        }
+    }
+
+    private fun redactFailureReason(reason: String): String =
+        Redactor.redactError(Redactor.redact(reason).text)
+
+    private fun terminalTail(runId: String, text: String): String? {
+        val prefix = "turn $runId "
+        if (!text.startsWith(prefix)) return null
+        return text.substring(prefix.length).takeIf {
+            it == "cancelled" || it == "interrupted" || it.startsWith("failed")
+        }
+    }
+
+    private fun isAmbiguousRedactedTerminal(runId: String, text: String): Boolean {
+        val prefix = "turn $runId "
+        val maskedPrefix = Redactor.redact(prefix).text
+        if (maskedPrefix != prefix && text.startsWith(maskedPrefix) &&
+            text.substring(maskedPrefix.length).let {
+                it == "cancelled" || it == "interrupted" || it.startsWith("failed")
+            }
+        ) return true
+        return listOf("cancelled", "interrupted", "failed").any { tail ->
+            val original = prefix + tail
+            val masked = Redactor.redact(original).text
+            masked != original && (text == masked || (tail == "failed" && text.startsWith(masked)))
+        }
+    }
+
+    private fun readLimitedJsonlLine(reader: java.io.PushbackReader): String? {
+        val line = StringBuilder()
+        while (true) {
+            val c = reader.read()
+            if (c == -1) return if (line.isEmpty()) null else line.toString()
+            if (c == '\n'.code) return line.toString()
+            if (c == '\r'.code) {
+                val next = reader.read()
+                if (next != -1 && next != '\n'.code) reader.unread(next)
+                return line.toString()
+            }
+            if (line.length >= IMPORT_MAX_LINE_CHARS) throw JsonlImportLimitException("import line too large")
+            line.append(c.toChar())
         }
     }
 
@@ -928,6 +1116,7 @@ class RoomSessionStore(
         parentRunId = parentRunId,
         attemptIndex = attemptIndex,
         isFinal = isFinalFlag,
+        isTruncated = isTruncated,
     )
 
     private fun SessionEntity.toMeta(): SessionMeta = SessionMeta(
@@ -944,11 +1133,23 @@ class RoomSessionStore(
         const val MAX_TEXT_CHARS = 100_000
         const val EXPORT_MAX_BYTES = 20 * 1024 * 1024
         const val IMPORT_MAX_BYTES = EXPORT_MAX_BYTES
+        // Characters are UTF-16 code units, measured on the encoded JSONL line.
+        // 1 Mi accommodates escaped 100k-character stored text plus metadata.
+        const val IMPORT_MAX_LINE_CHARS = 1024 * 1024
+        const val IMPORT_MAX_CONTENT_CHARS = 8 * 1024 * 1024
+        const val IMPORT_MAX_ROWS = 10_000
         const val EXPORT_PAGE_SIZE = 500
         const val TITLE_CHARS = 30
         const val AUTO_PRUNE_EVERY = 100
         const val MILLIS_PER_DAY = 86_400_000L
         const val IMPORT_MODEL = "imported/unknown"
         const val IMPORT_FALLBACK_TITLE = "imported"
+    }
+}
+
+/** Encode all UUID hex nibbles as a-p: no digits or punctuation for redaction to rewrite. */
+internal fun redactionSafeExportId(id: UUID): String = buildString(32) {
+    for (char in id.toString()) {
+        if (char != '-') append('a' + char.digitToInt(16))
     }
 }

@@ -10,6 +10,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -82,7 +83,7 @@ fun MainScreen(
     val sessions by sessionListViewModel.sessions.collectAsStateWithLifecycle()
     val exportState by sessionListViewModel.exportState.collectAsStateWithLifecycle()
     val importState by sessionListViewModel.importState.collectAsStateWithLifecycle()
-    var viewedSessionId by remember { mutableStateOf<String?>(null) }
+    var viewedSessionId by rememberSaveable { mutableStateOf<String?>(null) }
     val currentSessionId by chatViewModel.currentSessionId.collectAsStateWithLifecycle()
 
     // #3 語音開關真相源（VoiceSwitchStore，DataStore 持久化）：R4-2 三態快照

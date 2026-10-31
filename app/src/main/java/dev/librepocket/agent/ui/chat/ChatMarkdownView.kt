@@ -39,6 +39,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -168,12 +170,25 @@ internal fun CodeBlockView(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                val copyDescription = stringResource(
+                    if (copied) R.string.chat_code_copied else R.string.chat_code_copy_description
+                )
+                val copyEnabled = !block.isStreaming
+                val copyColor = when {
+                    !copyEnabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
+                    copied -> MaterialTheme.colorScheme.primary
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                }
                 Row(
                     modifier = Modifier
                         .clip(RoundedCornerShape(4.dp))
-                        .clickable(role = Role.Button) {
+                        .semantics { contentDescription = copyDescription }
+                        .clickable(
+                            enabled = copyEnabled,
+                            role = Role.Button,
+                        ) {
                             try {
-                                clipboardManager.setText(AnnotatedString(block.code))
+                                clipboardManager.setText(AnnotatedString(sanitizeCodeForClipboard(block.code)))
                                 copied = true
                             } catch (_: Exception) {
                                 // Ignore clipboard failures gracefully (e.g. MDM policies, window focus loss, payload too large)
@@ -187,13 +202,13 @@ internal fun CodeBlockView(
                     Icon(
                         imageVector = if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
                         contentDescription = null,
-                        tint = if (copied) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        tint = copyColor,
                         modifier = Modifier.size(14.dp),
                     )
                     Text(
                         text = stringResource(if (copied) R.string.chat_code_copied else R.string.chat_code_copy),
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (copied) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = copyColor,
                     )
                 }
             }
@@ -278,5 +293,44 @@ internal fun ChatMarkdownView(
                 }
             }
         }
+
+        if (isStreaming) {
+            val lastBlock = blocks.lastOrNull()
+            val lastBlockIsStreaming = when (lastBlock) {
+                is ChatContentBlock.ThinkingBlock -> lastBlock.isStreaming
+                is ChatContentBlock.CodeBlock -> lastBlock.isStreaming
+                is ChatContentBlock.ParagraphBlock -> true
+                null -> false
+            }
+            if (!lastBlockIsStreaming) {
+                Text(
+                    text = "▍",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = textColor,
+                )
+            }
+        }
     }
+}
+
+/**
+ * Sanitizes code snippets before copying to clipboard.
+ *
+ * - Normalizes Windows CRLF (`\r\n`) to LF (`\n`).
+ * - Strips isolated CR (`\r`) characters to prevent terminal line overwrite attacks.
+ * - Strips Unicode BiDi formatting characters:
+ *   - LRE, RLE, PDF, LRO, RLO (`\u202A`..`\u202E`)
+ *   - LRI, RLI, FSI, PDI (`\u2066`..`\u2069`)
+ */
+internal fun sanitizeCodeForClipboard(text: String): String {
+    val normalized = text.replace("\r\n", "\n").replace("\r", "")
+    val sb = StringBuilder(normalized.length)
+    for (i in 0 until normalized.length) {
+        val ch = normalized[i]
+        if (ch in '\u202A'..'\u202E' || ch in '\u2066'..'\u2069') {
+            continue
+        }
+        sb.append(ch)
+    }
+    return sb.toString()
 }

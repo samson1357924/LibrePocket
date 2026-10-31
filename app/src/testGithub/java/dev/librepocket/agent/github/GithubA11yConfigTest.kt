@@ -58,4 +58,13 @@ class GithubA11yConfigTest {
             assertTrue(configText().contains("android:canPerformGestures=\"true\""))
         }
     }
+
+    @Test fun accessibilityDescriptionLocalizedInChinese() {
+        val zhStrings = findSource(
+            "src/github/res/values-zh/strings.xml",
+            "app/src/github/res/values-zh/strings.xml",
+        ).readText()
+        assertTrue(zhStrings.contains("name=\"accessibility_description\""))
+        assertTrue(zhStrings.contains("LibrePocket 小幫手：螢幕逐步協助（預設關閉；付款／刪除／發送步驟一律先詢問）。"))
+    }
 }

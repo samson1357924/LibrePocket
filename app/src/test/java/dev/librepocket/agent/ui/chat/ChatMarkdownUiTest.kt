@@ -21,6 +21,8 @@ import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertHeightIsAtLeast
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertWidthIsAtLeast
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -35,6 +37,7 @@ import dev.librepocket.voice.VoiceTts
 import java.util.Locale
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -724,6 +727,8 @@ class ChatMarkdownUiTest {
         assertEquals("複製程式碼", zhContext.getString(R.string.chat_code_copy_description))
         assertEquals("複製", zhContext.getString(R.string.chat_code_copy))
         assertEquals("已複製", zhContext.getString(R.string.chat_code_copied))
+        // Verify flavor app_name is preserved in Chinese locale rather than overridden by main
+        assertEquals(context.getString(R.string.app_name), zhContext.getString(R.string.app_name))
     }
 
     @Test
@@ -761,5 +766,173 @@ class ChatMarkdownUiTest {
         composeRule.onNodeWithText("思考中…").assertIsDisplayed()
         composeRule.onNodeWithText("分析演算法中... ▍").assertIsDisplayed()
         composeRule.onNodeWithContentDescription("收折思考過程").assertIsDisplayed()
+    }
+
+    @Test
+    fun sanitizeCodeForClipboard_stripsBidiAndCarriageReturns() {
+        // BiDi override, embedding, and isolate characters (\u202A..\u202E and \u2066..\u2069)
+        val bidiChars = "\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069"
+        val raw = "line1\r\nline2\rline3\u202Eevil${bidiChars}rest"
+        val cleaned = sanitizeCodeForClipboard(raw)
+        assertEquals("line1\nline2line3evilrest", cleaned)
+    }
+
+    @Test
+    fun codeBlockView_streaming_copyButtonDisabledAndDoesNotCopy() {
+        val fakeClipboard = FakeClipboardManager()
+        val codeText = "fun inProgress() {\n    val s = 1"
+        val block = ChatContentBlock.CodeBlock(
+            language = "kotlin",
+            code = codeText,
+            isStreaming = true,
+        )
+
+        composeRule.setContent {
+            CompositionLocalProvider(LocalClipboardManager provides fakeClipboard) {
+                MaterialTheme {
+                    CodeBlockView(block = block)
+                }
+            }
+        }
+
+        val copyDesc = context.getString(R.string.chat_code_copy_description)
+
+        // Verify copy button accessibility description exists and is disabled during streaming
+        composeRule.onNodeWithContentDescription(copyDesc)
+            .assertIsDisplayed()
+            .assertIsNotEnabled()
+
+        // Attempting click must not populate clipboard
+        try {
+            composeRule.onNodeWithContentDescription(copyDesc).performClick()
+        } catch (_: AssertionError) {
+            // Disabled semantic nodes reject performClick in Compose rule
+        }
+        assertNull(fakeClipboard.getText())
+    }
+
+    @Test
+    fun codeBlockView_nonStreaming_copyButtonEnabledAndCopiesSanitizedCode() {
+        val fakeClipboard = FakeClipboardManager()
+        val dirtyCode = "rm -rf /\r\n# innocent\u202E\rpython test.py"
+        val block = ChatContentBlock.CodeBlock(
+            language = "bash",
+            code = dirtyCode,
+            isStreaming = false,
+        )
+
+        composeRule.setContent {
+            CompositionLocalProvider(LocalClipboardManager provides fakeClipboard) {
+                MaterialTheme {
+                    CodeBlockView(block = block)
+                }
+            }
+        }
+
+        val copyDesc = context.getString(R.string.chat_code_copy_description)
+        val copiedDesc = context.getString(R.string.chat_code_copied)
+        composeRule.onNodeWithContentDescription(copyDesc)
+            .assertIsDisplayed()
+            .assertIsEnabled()
+            .performClick()
+
+        val copied = fakeClipboard.getText()?.text
+        assertEquals("rm -rf /\n# innocentpython test.py", copied)
+
+        // Verify content description updates to "Copied" for TalkBack screen reader
+        composeRule.onNodeWithContentDescription(copiedDesc).assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(copyDesc).assertDoesNotExist()
+
+        // Advance virtual time by 2000ms to verify auto-reset back to default description
+        composeRule.mainClock.advanceTimeBy(2000)
+        composeRule.onNodeWithContentDescription(copyDesc).assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(copiedDesc).assertDoesNotExist()
+    }
+
+    @Test
+    fun messageBubble_pureThinkingMessages_hidesSpeakButton() {
+        val pureThinkingSamples = listOf(
+            "<think>Single closed reasoning</think>",
+            "<thought>Alternative tag content</thought>",
+            "<thinking>Another variant</thinking>",
+            "<think>Step 1</think><thought>Step 2</thought>",
+            "<think>Step 1</think>\n\n<thought>Step 2</thought>",
+            "<think>Unclosed reasoning in progress...",
+            "<thought>",
+            "</think>",
+            "<thinking></thinking>",
+            "<think class=\"reasoning\">Styled think</think>",
+            "   <think>Indented think</think>   ",
+        )
+
+        var currentMsg by mutableStateOf(
+            UiMessage(
+                id = "pure-think-init",
+                role = "assistant",
+                text = pureThinkingSamples.first(),
+                isPartial = false,
+            )
+        )
+
+        composeRule.setContent {
+            MaterialTheme {
+                MessageBubble(
+                    msg = currentMsg,
+                    showSpeak = true,
+                )
+            }
+        }
+
+        pureThinkingSamples.forEach { sampleText ->
+            currentMsg = UiMessage(
+                id = "pure-think-sample",
+                role = "assistant",
+                text = sampleText,
+                isPartial = false,
+            )
+            composeRule.waitForIdle()
+            composeRule.onNodeWithContentDescription(VoiceTts.SPEAK_BUTTON_DESCRIPTION)
+                .assertDoesNotExist()
+        }
+    }
+
+    @Test
+    fun chatMarkdownView_streamingThinkingBlockClosed_rendersTrailingCursor() {
+        // Thinking block is closed, so ThinkingBlock.isStreaming = false,
+        // but the message turn is still streaming (e.g. waiting for answer tokens).
+        val text = "<think>Reasoning complete.</think>"
+
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(
+                    text = text,
+                    isStreaming = true,
+                )
+            }
+        }
+
+        // Thinking card is rendered (collapsed by default when isStreaming is false on the block)
+        composeRule.onNodeWithText(context.getString(R.string.chat_thinking_title)).assertIsDisplayed()
+        // Trailing cursor is displayed at the bottom of the column to prevent UI stall feeling
+        composeRule.onNodeWithText("▍").assertIsDisplayed()
+    }
+
+    @Test
+    fun chatMarkdownView_streamingCodeBlockClosed_rendersTrailingCursor() {
+        // Code block is closed (``` closed with trailing newline), so CodeBlock.isStreaming = false,
+        // but stream turn is still ongoing (e.g. waiting for trailing text).
+        val text = "```kotlin\nval x = 1\n```\n"
+
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(
+                    text = text,
+                    isStreaming = true,
+                )
+            }
+        }
+
+        composeRule.onNodeWithText("kotlin").assertIsDisplayed()
+        composeRule.onNodeWithText("▍").assertIsDisplayed()
     }
 }

@@ -778,10 +778,14 @@ class RoomSessionStore(
                 .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
             try {
                 java.io.PushbackReader(java.io.InputStreamReader(bounded, decoder).buffered(), 1).use { reader ->
+                    var totalLinesRead = 0
                     while (true) {
                         ensureActive()
                         val raw = readLimitedJsonlLine(reader) ?: break
                         lineNumber++
+                        if (++totalLinesRead > IMPORT_MAX_ROWS * 2) {
+                            throw JsonlImportLimitException("import too large")
+                        }
                         if (raw.isBlank()) continue
                         contentChars += raw.length
                         if (contentChars > IMPORT_MAX_CONTENT_CHARS || parsed.size >= IMPORT_MAX_ROWS)

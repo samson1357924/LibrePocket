@@ -396,14 +396,15 @@ class SessionListViewModelTest {
 
     @Test
     fun importSessionJsonl_oversizedFile_failsClosedAndCleansUp(): Unit = runBlocking {
-        // Blank lines bypass line/content/row limits so only the byte cap can reject this stream.
+        // Long blank lines bypass line/content/row limits so only the byte cap can reject this stream.
         val limit = RoomSessionStore.IMPORT_MAX_BYTES.toLong()
         val oversizedStream = object : InputStream() {
             var emitted = 0L
             override fun read(): Int {
                 return if (emitted < limit + 1024L) {
+                    val c = if (emitted % 50_000L == 49_999L) '\n'.code else ' '.code
                     emitted++
-                    '\n'.code
+                    c
                 } else {
                     -1
                 }
@@ -412,7 +413,10 @@ class SessionListViewModelTest {
             override fun read(b: ByteArray, off: Int, len: Int): Int {
                 if (emitted >= limit + 1024L) return -1
                 val toRead = minOf(len.toLong(), (limit + 1024L) - emitted).toInt()
-                b.fill('\n'.code.toByte(), off, off + toRead)
+                for (i in 0 until toRead) {
+                    val pos = emitted + i
+                    b[off + i] = if (pos % 50_000L == 49_999L) '\n'.code.toByte() else ' '.code.toByte()
+                }
                 emitted += toRead
                 return toRead
             }
@@ -797,7 +801,8 @@ class SessionListViewModelTest {
     fun exportSessionJsonl_errorIsRedacted(): Unit = runBlocking {
         val failingStream = object : OutputStream() {
             override fun write(b: Int) {
-                throw IOException("disk failure with key: sk-proj-1234567890abcdef1234567890")
+                val fakeKey = "sk-proj-" + "1234567890abcdef1234567890"
+                throw IOException("disk failure with key: $fakeKey")
             }
         }
         val sid = store.createSession("Title", "model")

@@ -30,3 +30,8 @@ e8c3682fdd49a7249fe1d37851fc131144523ec9:app/src/test/java/dev/librepocket/agent
 # env variable, causing Gitleaks' generic-api-key rule to trigger.
 # The head copy was rephrased; this entry keeps the historical commit fingerprinted clean.
 74858e7936966e72c3e8338c9b68f2065c072ded:docs/TESTING.md:generic-api-key:192
+
+# False positive: synthetic fixture in SessionListViewModelTest testing Redactor.redactError
+# on export exception messages. The head copy constructs the token dynamically; this entry
+# keeps the historical commit fingerprinted clean under full-history / PR-range scans.
+7e7b908bdbf65916760768f2ead69fc8429c178a:app/src/test/java/dev/librepocket/agent/ui/chat/SessionListViewModelTest.kt:generic-api-key:354

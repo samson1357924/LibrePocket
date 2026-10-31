@@ -1,5 +1,6 @@
 package dev.librepocket.session
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.booleanOrNull
@@ -87,6 +88,37 @@ data class JsonlLine(
  * - F11 types: every field read is gated so `null`/object/array/wrong-primitive
  *   all surface as `IAE("import failed at line N")` with no content echo.
  */
+/** Fast, allocation-free nesting depth validator. */
+internal fun validateNestingDepth(line: String, maxDepth: Int = 2): Boolean {
+    var inString = false
+    var escape = false
+    var depth = 0
+    for (i in 0 until line.length) {
+        val c = line[i]
+        if (inString) {
+            if (escape) {
+                escape = false
+            } else if (c == '\\') {
+                escape = true
+            } else if (c == '"') {
+                inString = false
+            }
+        } else {
+            if (c == '"') {
+                inString = true
+            } else if (c == '{' || c == '[') {
+                depth++
+                if (depth > maxDepth) return false
+            } else if (c == '}' || c == ']') {
+                if (depth > 0) {
+                    depth--
+                }
+            }
+        }
+    }
+    return !inString && depth == 0
+}
+
 object JsonlCodec {
     private val json = Json
 
@@ -95,6 +127,9 @@ object JsonlCodec {
 
     /** S2 F7: reason cap (4096) sits far above `Redactor.ERROR_MAX_CHARS` (500) — generous, never clips legit rows. */
     const val MAX_FAILURE_REASON_CHARS = 4096
+
+    internal fun validateNestingDepth(line: String, maxDepth: Int = 2): Boolean =
+        dev.librepocket.session.validateNestingDepth(line, maxDepth)
 
     fun encode(event: TranscriptEvent, isTruncated: Boolean = event.isTruncated): String =
         buildJsonObject {
@@ -116,9 +151,12 @@ object JsonlCodec {
     fun decode(lineNumber: Int, line: String): JsonlLine {
         fun fail(cause: Throwable? = null): Nothing =
             throw IllegalArgumentException("import failed at line $lineNumber", cause)
+        if (!validateNestingDepth(line)) fail()
         val obj = try {
             json.parseToJsonElement(line).jsonObject
-        } catch (e: Exception) {
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
             fail(e)
         }
         // F11: every field read is gated so a JsonNull/object/array (whose

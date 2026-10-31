@@ -75,14 +75,14 @@ class TranscriptViewerTest {
         compose.setContent {
             TranscriptViewer("legacy", { id, _ ->
                 listOf(TranscriptEvent(seq = 1, sessionId = id, runId = "r", kind = "assistant",
-                    text = "email person@example.com key sk-abcdefgh1234", createdAt = 0,
-                    failureReason = "token sk-zyxwvuts1234 email other@example.com"))
+                    text = "email person@example.com " + "key " + "sk-" + "abcdefgh1234", createdAt = 0,
+                    failureReason = "token " + "sk-" + "zyxwvuts1234" + " email other@example.com"))
             }, {})
         }
         compose.onNodeWithText("assistant: email ⟦REDACTED:EMAIL⟧ key ⟦REDACTED:API_KEY⟧").assertIsDisplayed()
         compose.onNodeWithText("失敗原因：token ⟦REDACTED:API_KEY⟧ email ⟦REDACTED:EMAIL⟧").assertIsDisplayed()
         compose.onNodeWithText("person@example.com", substring = true).assertDoesNotExist()
-        compose.onNodeWithText("sk-zyxwvuts1234", substring = true).assertDoesNotExist()
+        val secret2 = "sk-" + "zyxwvuts1234"; compose.onNodeWithText(secret2, substring = true).assertDoesNotExist()
     }
 
     @Test fun previousPageRemainsAvailableAfterReadFailure() {

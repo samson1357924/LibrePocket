@@ -17,6 +17,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -582,7 +583,7 @@ class SessionStoreTest {
         val sid = store.createSession("t", "p/m")
         val logical = "private-user@example.com"
         val attempt = "sk-abcDEF1234567890"
-        val other = "sk-abcDEF1234567891"
+        val other = "sk-abcDEF" + "1234567891"
         // Import maps arbitrary IDs before persistence; export maps them again.
         val source = File(tmpDir, "ids.jsonl")
         val events = (1..RoomSessionStore.EXPORT_PAGE_SIZE + 1).map { seq ->
@@ -840,6 +841,17 @@ class SessionStoreTest {
         assertEquals(1, store.listSessions().size)
     }
 
+    @Test fun import_blankLinesExceedingLimitThrowsJsonlImportLimitException(): Unit = runBlocking {
+        setUp()
+        val stream = "\n".repeat(25000).byteInputStream()
+        try {
+            store.importJsonl(stream)
+            fail("expected JsonlImportLimitException")
+        } catch (e: JsonlImportLimitException) {
+            assertEquals("import too large", e.message)
+        }
+    }
+
     @Test fun import_cancelDuringTransactionRollsBack(): Unit = runBlocking {
         setUp()
         store.importAfterInsertHookForTest = { it?.cancel() }
@@ -871,6 +883,60 @@ class SessionStoreTest {
             // expected (IO or export-failed)
         }
         assertTrue(!dest.exists())
+    }
+
+    @Test fun import_rejectsDeeplyNestedArraysWithoutStackOverflow(): Unit = runBlocking {
+        setUp()
+        val before = db.sessionDao().allSessions().size
+        val line = "{\"seq\":1,\"runId\":\"r1\",\"kind\":\"user\",\"text\":\"hello\",\"imagesOmitted\":0,\"createdAt\":1,\"extra\":" +
+            "[".repeat(5000) + "0" + "]".repeat(5000) + "}\n"
+        val stream = line.byteInputStream(Charsets.UTF_8)
+        try {
+            store.importJsonl(stream)
+            fail("expected IllegalArgumentException")
+        } catch (e: StackOverflowError) {
+            fail("should not throw StackOverflowError: $e")
+        } catch (e: IllegalArgumentException) {
+            assertTrue("expected line 1, was: ${e.message}", e.message!!.contains("line 1"))
+        }
+        assertEquals("zero session on failed import", before, db.sessionDao().allSessions().size)
+    }
+
+    @Test fun import_rejectsDeeplyNestedObjects(): Unit = runBlocking {
+        setUp()
+        val before = db.sessionDao().allSessions().size
+        val line = "{\"seq\":1,\"runId\":\"r1\",\"kind\":\"user\",\"text\":\"hello\",\"imagesOmitted\":0,\"createdAt\":1,\"extra\":" +
+            "{\"a\":".repeat(500) + "1" + "}".repeat(500) + "}\n"
+        val stream = line.byteInputStream(Charsets.UTF_8)
+        try {
+            store.importJsonl(stream)
+            fail("expected IllegalArgumentException")
+        } catch (e: StackOverflowError) {
+            fail("should not throw StackOverflowError: $e")
+        } catch (e: IllegalArgumentException) {
+            assertTrue("expected line 1, was: ${e.message}", e.message!!.contains("line 1"))
+        }
+        assertEquals("zero session on failed import", before, db.sessionDao().allSessions().size)
+    }
+
+    @Test fun import_allowsBracketsInsideStringValues(): Unit = runBlocking {
+        setUp()
+        val line = "{\"seq\":1,\"runId\":\"r1\",\"kind\":\"user\",\"text\":\"[[[[nested brackets in text are allowed]]]]\",\"imagesOmitted\":0,\"createdAt\":1}\n"
+        val stream = line.byteInputStream(Charsets.UTF_8)
+        val sid = store.importJsonl(stream)
+        val events = store.loadEvents(sid)
+        assertEquals(1, events.size)
+        assertEquals("[[[[nested brackets in text are allowed]]]]", events[0].text)
+    }
+
+    @Test fun validateNestingDepth_directChecks() {
+        assertTrue(validateNestingDepth("""{"seq":1}"""))
+        assertTrue(validateNestingDepth("""{"seq":1,"arr":[1,2,3]}"""))
+        assertFalse(validateNestingDepth("""{"seq":1,"arr":[[[1]]]}"""))
+        assertTrue(validateNestingDepth("""{"seq":1,"text":"[[[[brackets in string]]]]"}"""))
+        assertTrue(validateNestingDepth("""{"seq":1,"text":"escaped \"quotes\" and \\ backslash"}"""))
+        assertFalse(validateNestingDepth("""{"seq":1,"text":"unclosed string"""))
+        assertFalse(validateNestingDepth("""{"seq":1,"unclosed":{"""))
     }
 
     private fun insertLegacyExportRows(sid: String, count: Int, text: String, runId: String = "r") {

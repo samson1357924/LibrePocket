@@ -610,16 +610,22 @@ class RoomSessionStore(
 
     internal var exportAfterPageHookForTest: (() -> Unit)? = null
 
-    override suspend fun exportJsonl(sessionId: String, destFile: File) {
-        // Paged streaming export; the ID map is bounded by rows and source ID characters.
+    override suspend fun exportJsonl(sessionId: String, destFile: File): Unit = withContext(Dispatchers.IO) {
+        // Reads an entity snapshot from Room first, decoupling database reading
+        // from file I/O, redaction, and JSON serialization.
         // Writes to a tmp sibling first; destFile appears atomically only on
         // success, so a failure or oversize abort never leaves a half file.
         // The byte budget is enforced DURING the write (not after
         // materializing everything) to avoid OOM on huge sessions.
+        ensureActive()
         val parent = destFile.parentFile
         if (parent != null && !parent.exists() && !parent.mkdirs()) {
             error("export failed: cannot create directory ${parent.path}")
         }
+        require(dao.sessionById(sessionId) != null) { "unknown session" }
+        val entities = dao.allEvents(sessionId)
+        if (entities.size > IMPORT_MAX_ROWS) throw JsonlExportLimitException("export too large")
+
         var bytes = 0L
         var chars = 0L
         var rows = 0
@@ -638,101 +644,90 @@ class RoomSessionStore(
             } while (!assignedIds.add(candidate))
             candidate
         }
-        withContext(Dispatchers.IO) {
-            ensureActive()
-            val tmp = File.createTempFile("jsonl-export-", ".tmp", parent ?: File("."))
-            try {
-                // All pages must observe one Room snapshot, including when prune,
-                // delete or append runs while the export is streaming.
-                db.withTransaction {
-                require(dao.sessionById(sessionId) != null) { "unknown session" }
-                val expectedRows = dao.eventCount(sessionId)
-                tmp.bufferedWriter(Charsets.UTF_8).use { out ->
-                    while (true) {
-                        currentCoroutineContext().ensureActive()
-                        val page = dao.eventsAfter(sessionId, afterSeq, EXPORT_PAGE_SIZE)
-                        if (page.isEmpty()) break
-                        for (row in page) {
-                            currentCoroutineContext().ensureActive()
-                            require(row.seq > afterSeq) { "export failed: invalid event sequence" }
-                            if (++rows > IMPORT_MAX_ROWS) throw JsonlExportLimitException("export too large")
-                            // Inspect the stored text before any read-time redaction:
-                            // marker recognition requires the original boundary.
-                            val event = row.toEvent().copy(text = row.text)
-                            // B1 defense-in-depth: legacy rows may predate write-time
-                            // redaction, so re-redact at export time before touching disk.
-                            // Mirrors TranscriptExport.exportRedacted semantics.
-                            val mappedRunId = exportId(event.runId)
-                            // Match the original marker before redaction, and only on system rows.
-                            // A marker already redacted on write may no longer contain its
-                            // runId; it cannot be safely identified or reconstructed here.
-                            // Legacy failure suffixes remain free text and still need redaction.
-                            val markerPrefix = "turn ${event.runId} "
-                            val markerTail = if (event.kind == "system" && event.text.startsWith(markerPrefix)) {
-                                event.text.substring(markerPrefix.length).takeIf {
-                                    it == "cancelled" || it == "interrupted" || it.startsWith("failed")
-                                }
-                            } else null
-                            val redactedPrefix = Redactor.redact(markerPrefix).text
-                            if (markerTail == null && event.kind == "system" && redactedPrefix != markerPrefix &&
-                                event.text.startsWith(redactedPrefix) &&
-                                event.text.substring(redactedPrefix.length).let {
-                                    it == "cancelled" || it == "interrupted" || it.startsWith("failed")
-                                }
-                            ) throw JsonlExportLimitException("export cannot identify redacted terminal marker")
-                            if (markerTail == null && event.kind == "system" &&
-                                listOf("cancelled", "interrupted", "failed").any { tail ->
-                                    val original = markerPrefix + tail
-                                    val masked = Redactor.redact(original).text
-                                    masked != original && (event.text == masked ||
-                                        (tail == "failed" && event.text.startsWith(masked)))
-                                }
-                            ) throw JsonlExportLimitException("export cannot identify redacted terminal marker")
-                            val redacted = if (markerTail != null) {
-                                "turn $mappedRunId ${Redactor.redact(markerTail).text}"
-                            } else Redactor.redact(event.text).text
-                            val reason = event.failureReason?.let { redactFailureReason(it) }
-                            // IDs can contain arbitrary secrets, including in legacy rows.
-                            // Use one bijection for both fields, independent for each export.
-                            val line = JsonlCodec.encode(event.copy(
-                                runId = mappedRunId,
-                                parentRunId = event.parentRunId?.let { exportId(it) },
-                                text = redacted,
-                                failureReason = reason,
-                            ), isTruncated = row.isTruncated)
-                            if (line.length > IMPORT_MAX_LINE_CHARS) throw JsonlExportLimitException("export line too large")
-                            // Validate the actual transformed line against the import shape gate.
-                            JsonlCodec.decode(rows, line)
-                            // Import redacts again before applying its durable text cap.
-                            // Reject rather than produce an export that import would truncate.
-                            if (Redactor.redact(redacted).text.length > MAX_TEXT_CHARS) {
-                                throw JsonlExportLimitException("export text exceeds import limit (100000 characters)")
-                            }
-                            chars += line.length
-                            if (chars > IMPORT_MAX_CONTENT_CHARS) throw JsonlExportLimitException("export too large")
-                            bytes += line.toByteArray(Charsets.UTF_8).size + 1
-                            if (bytes > EXPORT_MAX_BYTES) throw JsonlExportLimitException("export too large")
-                            out.write(line)
-                            out.newLine()
-                            afterSeq = row.seq
+
+        val tmp = File.createTempFile("jsonl-export-", ".tmp", parent ?: File("."))
+        try {
+            tmp.bufferedWriter(Charsets.UTF_8).use { out ->
+                for (row in entities) {
+                    currentCoroutineContext().ensureActive()
+                    require(row.seq > afterSeq) { "export failed: invalid event sequence" }
+                    if (++rows > IMPORT_MAX_ROWS) throw JsonlExportLimitException("export too large")
+                    // Inspect the stored text before any read-time redaction:
+                    // marker recognition requires the original boundary.
+                    val event = row.toEvent().copy(text = row.text)
+                    // B1 defense-in-depth: legacy rows may predate write-time
+                    // redaction, so re-redact at export time before touching disk.
+                    // Mirrors TranscriptExport.exportRedacted semantics.
+                    val mappedRunId = exportId(event.runId)
+                    // Match the original marker before redaction, and only on system rows.
+                    // A marker already redacted on write may no longer contain its
+                    // runId; it cannot be safely identified or reconstructed here.
+                    // Legacy failure suffixes remain free text and still need redaction.
+                    val markerPrefix = "turn ${event.runId} "
+                    val markerTail = if (event.kind == "system" && event.text.startsWith(markerPrefix)) {
+                        event.text.substring(markerPrefix.length).takeIf {
+                            it == "cancelled" || it == "interrupted" || it.startsWith("failed")
                         }
+                    } else null
+                    val redactedPrefix = Redactor.redact(markerPrefix).text
+                    if (markerTail == null && event.kind == "system" && redactedPrefix != markerPrefix &&
+                        event.text.startsWith(redactedPrefix) &&
+                        event.text.substring(redactedPrefix.length).let {
+                            it == "cancelled" || it == "interrupted" || it.startsWith("failed")
+                        }
+                    ) throw JsonlExportLimitException("export cannot identify redacted terminal marker")
+                    if (markerTail == null && event.kind == "system" &&
+                        listOf("cancelled", "interrupted", "failed").any { tail ->
+                            val original = markerPrefix + tail
+                            val masked = Redactor.redact(original).text
+                            masked != original && (event.text == masked ||
+                                (tail == "failed" && event.text.startsWith(masked)))
+                        }
+                    ) throw JsonlExportLimitException("export cannot identify redacted terminal marker")
+                    val redacted = if (markerTail != null) {
+                        "turn $mappedRunId ${Redactor.redact(markerTail).text}"
+                    } else Redactor.redact(event.text).text
+                    val reason = event.failureReason?.let { redactFailureReason(it) }
+                    // IDs can contain arbitrary secrets, including in legacy rows.
+                    // Use one bijection for both fields, independent for each export.
+                    val line = JsonlCodec.encode(event.copy(
+                        runId = mappedRunId,
+                        parentRunId = event.parentRunId?.let { exportId(it) },
+                        text = redacted,
+                        failureReason = reason,
+                    ), isTruncated = row.isTruncated)
+                    if (line.length > IMPORT_MAX_LINE_CHARS) throw JsonlExportLimitException("export line too large")
+                    // Validate the actual transformed line against the import shape gate.
+                    JsonlCodec.decode(rows, line)
+                    // Import redacts again before applying its durable text cap.
+                    // Reject rather than produce an export that import would truncate.
+                    if (Redactor.redact(redacted).text.length > MAX_TEXT_CHARS) {
+                        throw JsonlExportLimitException("export text exceeds import limit (100000 characters)")
+                    }
+                    chars += line.length
+                    if (chars > IMPORT_MAX_CONTENT_CHARS) throw JsonlExportLimitException("export too large")
+                    bytes += line.toByteArray(Charsets.UTF_8).size + 1
+                    if (bytes > EXPORT_MAX_BYTES) throw JsonlExportLimitException("export too large")
+                    out.write(line)
+                    out.newLine()
+                    afterSeq = row.seq
+                    if (rows % EXPORT_PAGE_SIZE == 0 || rows == entities.size) {
                         exportAfterPageHookForTest?.invoke()
+                        currentCoroutineContext().ensureActive()
                     }
                 }
-                require(rows == expectedRows) { "export failed: invalid event sequence" }
-                currentCoroutineContext().ensureActive()
-                }
-                ensureActive()
-                if (!tmp.renameTo(destFile)) {
-                    error("export failed: cannot move tmp file into place")
-                }
-            } finally {
-                tmp.delete()
             }
+            require(rows == entities.size) { "export failed: invalid event sequence" }
+            ensureActive()
+            if (!tmp.renameTo(destFile)) {
+                error("export failed: cannot move tmp file into place")
+            }
+        } finally {
+            tmp.delete()
         }
     }
 
-    override suspend fun importJsonl(srcFile: File): String {
+    override suspend fun importJsonl(srcFile: File): String = withContext(Dispatchers.IO) {
         // Refuse oversized files BEFORE reading (export caps at the same bound).
         // A missing file has length 0 and falls through to the reader, which
         // throws FileNotFoundException as before.
@@ -741,7 +736,7 @@ class RoomSessionStore(
             private var closed = false
             override fun close() { if (!closed) { closed = true; super.close() } }
         }
-        return input.use { importJsonlImpl(it, closeAfterRead = true) }
+        input.use { importJsonlImpl(it, closeAfterRead = true) }
     }
 
     override suspend fun importJsonl(input: java.io.InputStream): String =

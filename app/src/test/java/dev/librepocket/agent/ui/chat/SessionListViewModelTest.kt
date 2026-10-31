@@ -668,6 +668,44 @@ class SessionListViewModelTest {
     }
 
     @Test
+    fun exportSessionJsonl_cancelledBetweenPagesResetsStateToIdleAndCleansCache(): Unit = runBlocking {
+        val sid = store.createSession("Paged Session", "preset/gpt-4o")
+        for (i in 1..(RoomSessionStore.EXPORT_PAGE_SIZE + 5)) {
+            store.appendEvent(event(sid, kind = "user", text = "msg $i"))
+        }
+        val pageRead = java.util.concurrent.CountDownLatch(1)
+        val resume = java.util.concurrent.CountDownLatch(1)
+        store.exportAfterPageHookForTest = {
+            pageRead.countDown()
+            check(resume.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        }
+        val out = ByteArrayOutputStream()
+        val job = async(kotlinx.coroutines.Dispatchers.Default) {
+            viewModel.exportSessionJsonl(sid, out, tmpDir)
+        }
+        try {
+            assertTrue(pageRead.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            assertEquals(ExportUiState.Exporting, viewModel.exportState.value)
+            job.cancel()
+            resume.countDown()
+            try {
+                job.await()
+                throw AssertionError("expected cancellation")
+            } catch (_: CancellationException) { }
+            assertEquals(ExportUiState.Idle, viewModel.exportState.value)
+            val remaining = tmpDir.listFiles() ?: emptyArray()
+            assertEquals("no temporary files should remain in cacheDir after cancellation", 0, remaining.size)
+            // Verify lock is released and another export can succeed
+            val secondOut = ByteArrayOutputStream()
+            assertTrue(viewModel.exportSessionJsonl(sid, secondOut, tmpDir).isSuccess)
+        } finally {
+            resume.countDown()
+            job.cancel()
+            store.exportAfterPageHookForTest = null
+        }
+    }
+
+    @Test
     fun rejectedSuppliedStreamsCloseOffCallerThread(): Unit = runBlocking {
         val sid = store.createSession("Title", "model")
         store.appendEvent(event(sid))
@@ -802,7 +840,7 @@ class SessionListViewModelTest {
         val failingStream = object : OutputStream() {
             override fun write(b: Int) {
                 val fakeKey = "sk-proj-" + "1234567890abcdef1234567890"
-                throw IOException("disk failure with key: $fakeKey")
+                throw IOException("disk failure with key: $fakeKey for user@example.com")
             }
         }
         val sid = store.createSession("Title", "model")
@@ -814,14 +852,16 @@ class SessionListViewModelTest {
         assertTrue(state is ExportUiState.Error)
         val msg = (state as ExportUiState.Error).message
         assertFalse("error message should not contain raw secret", msg.contains("sk-proj-"))
+        assertFalse("error message should not contain raw email", msg.contains("user@example.com"))
         assertTrue("error message should contain redacted marker", msg.contains("⟦REDACTED"))
+        assertTrue("error message should contain redacted email marker", msg.contains("⟦REDACTED:EMAIL⟧"))
     }
 
     @Test
     fun importSessionJsonl_errorIsRedacted(): Unit = runBlocking {
         val failingStream = object : InputStream() {
             override fun read(): Int {
-                throw IOException("network failure with token: Bearer abcdef123456")
+                throw IOException("network failure with token: Bearer abcdef123456 for user@example.com")
             }
         }
 
@@ -831,6 +871,39 @@ class SessionListViewModelTest {
         assertTrue(state is ImportUiState.Error)
         val msg = (state as ImportUiState.Error).message
         assertFalse("error message should not contain raw token", msg.contains("abcdef123456"))
+        assertFalse("error message should not contain raw email", msg.contains("user@example.com"))
         assertTrue("error message should contain redacted marker", msg.contains("⟦REDACTED"))
+        assertTrue("error message should contain redacted email marker", msg.contains("⟦REDACTED:EMAIL⟧"))
+    }
+
+    @Test
+    fun refresh_failurePreservesCachedSessions(): Unit = runBlocking {
+        val sid = store.createSession("Original Session", "preset/gpt-4o")
+        var shouldFail = false
+        val customStore = object : dev.librepocket.session.SessionStore by store {
+            override suspend fun listSessions(): List<dev.librepocket.session.SessionMeta> {
+                if (shouldFail) throw IOException("simulated database failure")
+                return store.listSessions()
+            }
+        }
+        val vm = SessionListViewModel(customStore)
+        vm.refresh()
+        val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5)
+        while (vm.sessions.value.isEmpty() && System.nanoTime() < deadline) {
+            shadowOf(Looper.getMainLooper()).idle()
+            Thread.sleep(10)
+        }
+        assertEquals(1, vm.sessions.value.size)
+        assertEquals(sid, vm.sessions.value.first().sessionId)
+
+        // Trigger refresh with failure; cached list must not be cleared
+        shouldFail = true
+        vm.refresh()
+        shadowOf(Looper.getMainLooper()).idle()
+        Thread.sleep(50)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(1, vm.sessions.value.size)
+        assertEquals(sid, vm.sessions.value.first().sessionId)
     }
 }

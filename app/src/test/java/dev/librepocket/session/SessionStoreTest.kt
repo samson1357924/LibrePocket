@@ -323,6 +323,7 @@ class SessionStoreTest {
             }
             assertEquals("existing", dest.readText())
             assertEquals(listOf("sequence.jsonl"), tmpDir.list()!!.sorted())
+            assertEquals(0, tmpDir.listFiles()!!.count { it.name.startsWith("jsonl-export-") && it.name.endsWith(".tmp") })
         }
     }
 
@@ -745,6 +746,22 @@ class SessionStoreTest {
         }
         assertTrue(!JsonlCodec.decode(1, JsonlCodec.encode(event(sid).copy(seq = 1))).isTruncated)
         assertTrue(JsonlCodec.decode(1, JsonlCodec.encode(event(sid).copy(seq = 1, isTruncated = true))).isTruncated)
+    }
+
+    @Test fun import_legacyJsonlWithoutTruncatedField_defaultsToFalseAndOmitsFieldOnExport(): Unit = runBlocking {
+        setUp()
+        val legacyLine = """{"seq":1,"runId":"legacyRun1","kind":"user","text":"hello legacy","imagesOmitted":0,"createdAt":$now,"isPartial":false,"isFinal":true}"""
+        val importedSid = store.importJsonl(legacyLine.byteInputStream())
+        val events = store.loadEvents(importedSid)
+        assertEquals(1, events.size)
+        assertFalse("legacy line without isTruncated should default to false", events.single().isTruncated)
+        assertFalse("stored entity without isTruncated should default to false", db.sessionDao().allEvents(importedSid).single().isTruncated)
+
+        val dest = File(tmpDir, "exported-legacy.jsonl")
+        store.exportJsonl(importedSid, dest)
+        val exportedLine = dest.readText().trimEnd()
+        assertFalse("exported line must omit isTruncated field when false", exportedLine.contains("isTruncated"))
+        assertFalse("exported line must decode to isTruncated == false", JsonlCodec.decode(1, exportedLine).isTruncated)
     }
 
     @Test fun snapshot_preservesExistingAndNewTruncationFlags(): Unit = runBlocking {

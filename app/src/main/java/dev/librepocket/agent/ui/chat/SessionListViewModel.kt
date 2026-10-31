@@ -52,7 +52,7 @@ sealed interface ImportUiState {
 fun importErrorMessage(error: Throwable): String = if (error is JsonlImportLimitException) {
     "備份超過目前的匯入限制，舊版備份也可能受影響。請保留原檔，將備份分割或縮小後再試。"
 } else {
-    Redactor.redactError(error.message ?: "匯入失敗")
+    Redactor.redactError(Redactor.redact(error.message ?: "匯入失敗").text)
 }
 
 /**
@@ -78,11 +78,19 @@ class SessionListViewModel(
     private var refreshGeneration = 0L
 
     fun resetExportState() {
-        synchronized(stateLock) { if (!exporting) _exportState.value = ExportUiState.Idle }
+        synchronized(stateLock) {
+            if (_exportState.value !is ExportUiState.Exporting) {
+                _exportState.value = ExportUiState.Idle
+            }
+        }
     }
 
     fun resetImportState() {
-        synchronized(stateLock) { if (!importing) _importState.value = ImportUiState.Idle }
+        synchronized(stateLock) {
+            if (_importState.value !is ImportUiState.Importing) {
+                _importState.value = ImportUiState.Idle
+            }
+        }
     }
 
     fun refresh() {
@@ -104,7 +112,7 @@ class SessionListViewModel(
             withContext(Dispatchers.IO) { store.listSessions() }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
-            emptyList()
+            return
         }
         synchronized(stateLock) { if (refreshGeneration == generation) _sessions.value = sessions }
     }
@@ -148,10 +156,7 @@ class SessionListViewModel(
                     }
                     Result.success(Unit)
                 } finally {
-                    tempFile?.let {
-                        it.delete()
-                        File(it.parentFile, it.name + ".tmp").delete()
-                    }
+                    tempFile?.delete()
                 }
             } } catch (e: Throwable) {
                 preparationFailure = e
@@ -171,7 +176,7 @@ class SessionListViewModel(
             _exportState.value = ExportUiState.Error(if (e is JsonlExportLimitException) {
                 "對話超過目前的匯出限制，無法匯出。請縮小對話內容後再試。"
             } else {
-                Redactor.redactError(e.message ?: "匯出失敗")
+                Redactor.redactError(Redactor.redact(e.message ?: "匯出失敗").text)
             })
             return Result.failure(e)
         } finally {

@@ -163,15 +163,25 @@ object ChatMarkdownParser {
 
     private fun isOpenThinkTagPrefix(text: String, pos: Int): Boolean {
         if (pos >= text.length || text[pos] != '<') return false
-        val sub = text.substring(pos)
-        if (sub.contains('>')) return false
+        val rem = text.length - pos
+        if (rem > 32) return false
+        for (i in pos until text.length) {
+            val ch = text[i]
+            if (ch == '>' || ch == '\n' || ch == '\r') return false
+        }
         for (name in THINK_TAG_NAMES) {
-            val openPrefix = "<$name"
-            if (openPrefix.startsWith(sub, ignoreCase = true)) return true
-            if (sub.length > openPrefix.length &&
-                sub.regionMatches(0, openPrefix, 0, openPrefix.length, ignoreCase = true) &&
-                (sub[openPrefix.length].isWhitespace() || sub[openPrefix.length] == '/')) {
-                return true
+            val prefixLen = 1 + name.length
+            if (rem <= prefixLen) {
+                if (text.regionMatches(pos + 1, name, 0, rem - 1, ignoreCase = true)) {
+                    return true
+                }
+            } else {
+                if (text.regionMatches(pos + 1, name, 0, name.length, ignoreCase = true)) {
+                    val nextChar = text[pos + prefixLen]
+                    if (nextChar.isWhitespace() || nextChar == '/') {
+                        return true
+                    }
+                }
             }
         }
         return false
@@ -179,18 +189,36 @@ object ChatMarkdownParser {
 
     private fun isCloseThinkTagPrefix(text: String, pos: Int, targetTagName: String? = null): Boolean {
         if (pos >= text.length || text[pos] != '<') return false
-        val sub = text.substring(pos)
-        if (sub.contains('>')) return false
-        val names = if (targetTagName != null) listOf(targetTagName) else THINK_TAG_NAMES
-        for (name in names) {
-            val closePrefix = "</$name"
-            if (closePrefix.startsWith(sub, ignoreCase = true)) return true
-            if (sub.length >= closePrefix.length &&
-                sub.regionMatches(0, closePrefix, 0, closePrefix.length, ignoreCase = true)) {
-                if ((closePrefix.length until sub.length).all { sub[it].isWhitespace() }) return true
-            }
+        val rem = text.length - pos
+        if (rem > 32) return false
+        for (i in pos until text.length) {
+            val ch = text[i]
+            if (ch == '>' || ch == '\n' || ch == '\r') return false
+        }
+        if (rem == 1) return true
+        if (text[pos + 1] != '/') return false
+
+        if (targetTagName != null) {
+            return isCloseTagNamePrefix(text, pos, rem, targetTagName)
+        }
+        for (name in THINK_TAG_NAMES) {
+            if (isCloseTagNamePrefix(text, pos, rem, name)) return true
         }
         return false
+    }
+
+    private fun isCloseTagNamePrefix(text: String, pos: Int, rem: Int, name: String): Boolean {
+        val closePrefixLen = 2 + name.length
+        if (rem <= closePrefixLen) {
+            return text.regionMatches(pos + 2, name, 0, rem - 2, ignoreCase = true)
+        }
+        if (!text.regionMatches(pos + 2, name, 0, name.length, ignoreCase = true)) {
+            return false
+        }
+        for (i in (pos + closePrefixLen) until text.length) {
+            if (!text[i].isWhitespace()) return false
+        }
+        return true
     }
 
     // Backslashes are preserved in output. An odd-length run escapes an inline
@@ -308,6 +336,15 @@ object ChatMarkdownParser {
         val indentColumns: Long = 4L,
     )
 
+    private fun isRangeBlank(text: String, start: Int, end: Int): Boolean {
+        val s = maxOf(0, start)
+        val e = minOf(text.length, end)
+        for (i in s until e) {
+            if (!text[i].isWhitespace()) return false
+        }
+        return true
+    }
+
     // Each character is visited a bounded number of times. Inline code shields tags,
     // and fenced code and thinking blocks shield everything until their own closer.
     private fun segments(text: String, streaming: Boolean): List<Segment> {
@@ -333,7 +370,7 @@ object ChatMarkdownParser {
             val atLineStart = cursor == 0 || text[cursor - 1] == '\n'
             val previousBlank = if (atLineStart && cursor > 0) {
                 val prevStart = text.lastIndexOf('\n', cursor - 2) + 1
-                text.substring(prevStart, cursor - 1).isBlank()
+                isRangeBlank(text, prevStart, cursor - 1)
             } else {
                 false
             }
@@ -608,12 +645,6 @@ object ChatMarkdownParser {
         return result
     }
 
-    private fun isTagPrefix(text: String, start: Int, tag: String): Boolean {
-        val remaining = text.length - start
-        return remaining > 0 && remaining < tag.length &&
-            text.regionMatches(start, tag, 0, remaining, ignoreCase = true)
-    }
-
     fun parse(text: String, isStreaming: Boolean = false): List<ChatContentBlock> {
         if (text.isEmpty()) {
             return if (isStreaming) listOf(ChatContentBlock.ParagraphBlock(AnnotatedString(""))) else emptyList()
@@ -720,12 +751,16 @@ object ChatMarkdownParser {
         val builder = AnnotatedString.Builder()
         var i = 0
         val len = text.length
+        val starOrTickCount = IntArray(len + 1)
+        for (pos in 0 until len) {
+            val ch = text[pos]
+            starOrTickCount[pos + 1] = starOrTickCount[pos] + if (ch == '*' || ch == '`') 1 else 0
+        }
         val escaped = escapedBackticks(text)
         val nextNewline = IntArray(len + 1) { -1 }
         val ticks = inlineTickRuns(text)
         val nextDouble = IntArray(len + 1) { -1 }
         val nextTriple = IntArray(len + 1) { -1 }
-        val nextSingle = IntArray(len + 1) { -1 }
         for (pos in len - 1 downTo 0) {
             nextNewline[pos] = if (text[pos] == '\n') pos else nextNewline[pos + 1]
         }
@@ -756,8 +791,6 @@ object ChatMarkdownParser {
         for (pos in len - 1 downTo 0) {
             nextDouble[pos] = if (!inCode[pos] && text.startsWith("**", pos)) pos else nextDouble[pos + 1]
             nextTriple[pos] = if (!inCode[pos] && text.startsWith("***", pos)) pos else nextTriple[pos + 1]
-            nextSingle[pos] = if (!inCode[pos] && text[pos] == '*' && (pos == 0 || text[pos - 1] != '*') &&
-                (pos + 1 == len || text[pos + 1] != '*')) pos else nextSingle[pos + 1]
             nextAsteriskCloser[pos] = if (!inCode[pos] && text[pos] == '*' && (pos == 0 || text[pos - 1] != '*') &&
                 pos > 0 && !text[pos - 1].isWhitespace()) pos else nextAsteriskCloser[pos + 1]
         }
@@ -766,20 +799,16 @@ object ChatMarkdownParser {
         // Indexing both directions permits shared triple closers without rescans.
         val openItalic = IntArray(len) { -1 }
         val openBold = IntArray(len) { -1 }
-        val openTriple = IntArray(len) { -1 }
         var italic = -1
         var bold = -1
-        var triple = -1
         var pos = 0
         while (pos < len) {
             if (text[pos] == '\n') {
                 italic = -1
                 bold = -1
-                triple = -1
             }
             openItalic[pos] = italic
             openBold[pos] = bold
-            openTriple[pos] = triple
             if (inCode[pos] || text[pos] != '*') {
                 pos++
                 continue
@@ -789,7 +818,6 @@ object ChatMarkdownParser {
             val size = pos - start
             if (size == 1) {
                 bold = -1
-                triple = -1
                 if (italic >= 0 && start > 0 && !text[start - 1].isWhitespace()) {
                     italic = -1
                 } else if (pos < len && !text[pos].isWhitespace()) {
@@ -797,7 +825,6 @@ object ChatMarkdownParser {
                 }
             } else if (size == 2) {
                 italic = -1
-                triple = -1
                 bold = if (bold >= 0 && start > 0 && !text[start - 1].isWhitespace()) {
                     -1
                 } else if (pos < len && !text[pos].isWhitespace()) {
@@ -808,29 +835,10 @@ object ChatMarkdownParser {
             } else if (size == 3) {
                 italic = -1
                 bold = -1
-                triple = if (triple >= 0 && start > 0 && !text[start - 1].isWhitespace()) {
-                    -1
-                } else if (pos < len && !text[pos].isWhitespace()) {
-                    start
-                } else {
-                    -1
-                }
             } else {
                 italic = -1
                 bold = -1
-                triple = -1
             }
-        }
-        // Index only triple runs that can close an earlier bold opener. Looking
-        // up the first triple of any kind would let an unrelated ***both***
-        // hide a later shared closer; scanning past it per opener is quadratic.
-        val nextBoldItalicClose = IntArray(len + 1) { -1 }
-        for (index in len - 1 downTo 0) {
-            val opener = openBold[index]
-            nextBoldItalicClose[index] = if (!inCode[index] && opener >= 0 && index > opener + 2 &&
-                text.startsWith("***", index) && (index == 0 || text[index - 1] != '*') &&
-                (index + 3 == len || text[index + 3] != '*') &&
-                !text[index - 1].isWhitespace()) index else nextBoldItalicClose[index + 1]
         }
 
         while (i < len) {
@@ -933,12 +941,8 @@ object ChatMarkdownParser {
                 val lineEnd = nextNewline[i].let { if (it < 0) len else it }
                 var close = -1
                 var scanCloser = nextAsteriskCloser[i + 1]
-                fun hasStarsOrTicks(from: Int, to: Int): Boolean {
-                    for (idx in from until to) {
-                        if (text[idx] == '*' || text[idx] == '`') return true
-                    }
-                    return false
-                }
+                fun hasStarsOrTicks(from: Int, to: Int): Boolean =
+                    from < to && (starOrTickCount[to] - starOrTickCount[from] > 0)
                 while (scanCloser in (i + 1) until lineEnd) {
                     var runLen = 0
                     while (scanCloser + runLen < len && text[scanCloser + runLen] == '*' && !inCode[scanCloser + runLen]) {

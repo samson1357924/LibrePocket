@@ -1215,4 +1215,52 @@ class ChatMarkdownParserTest {
         val paragraph = blocks[1] as ChatContentBlock.ParagraphBlock
         assertEquals("Actual answer", paragraph.annotatedText.text)
     }
+
+    @Test(timeout = 3000)
+    fun bounds_malformedUnclosedTags_streamingCompletesLinearly() {
+        val input = "<x".repeat(10000)
+        val start = System.currentTimeMillis()
+        val blocks = ChatMarkdownParser.parse(input, isStreaming = true)
+        val elapsed = System.currentTimeMillis() - start
+
+        assertTrue("Expected streaming parse of '<x'x10000 to complete in milliseconds (< 1000ms), took ${elapsed}ms", elapsed < 1000)
+        assertEquals(1, blocks.size)
+        assertTrue(blocks[0] is ChatContentBlock.ParagraphBlock)
+    }
+
+    @Test(timeout = 3000)
+    fun bounds_malformedThinkingTags_completesLinearly() {
+        val inputThink = "<think ".repeat(5000)
+        val startThink = System.currentTimeMillis()
+        val blocksThink = ChatMarkdownParser.parse(inputThink, isStreaming = true)
+        val elapsedThink = System.currentTimeMillis() - startThink
+        assertTrue("Expected streaming parse of '<think 'x5000 to complete in milliseconds (< 1000ms), took ${elapsedThink}ms", elapsedThink < 1000)
+        assertEquals(1, blocksThink.size)
+        assertTrue(blocksThink[0] is ChatContentBlock.ParagraphBlock)
+
+        val inputThought = "<thought>".repeat(5000)
+        val startThought = System.currentTimeMillis()
+        val blocksThought = ChatMarkdownParser.parse(inputThought, isStreaming = true)
+        val elapsedThought = System.currentTimeMillis() - startThought
+        assertTrue("Expected streaming parse of '<thought>'x5000 to complete in milliseconds (< 1000ms), took ${elapsedThought}ms", elapsedThought < 1000)
+        assertTrue(blocksThought.isNotEmpty())
+    }
+
+    @Test(timeout = 3000)
+    fun bounds_maliciousInlineFormatting_completesLinearlyWithoutAnr() {
+        val input = "*a\\` ".repeat(2000) + "x**y ".repeat(2000)
+        val start = System.currentTimeMillis()
+        val blocks = ChatMarkdownParser.parse(input, isStreaming = false)
+        val elapsed = System.currentTimeMillis() - start
+
+        assertTrue("Expected inline formatting to complete in milliseconds (< 1000ms), took ${elapsed}ms", elapsed < 1000)
+        assertEquals(1, blocks.size)
+        assertTrue(blocks[0] is ChatContentBlock.ParagraphBlock)
+
+        val startInline = System.currentTimeMillis()
+        val annotated = ChatMarkdownParser.parseInlineMarkdown(input)
+        val elapsedInline = System.currentTimeMillis() - startInline
+        assertTrue("Expected parseInlineMarkdown to complete in milliseconds (< 1000ms), took ${elapsedInline}ms", elapsedInline < 1000)
+        assertTrue(annotated.text.isNotEmpty())
+    }
 }

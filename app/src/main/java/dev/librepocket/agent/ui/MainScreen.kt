@@ -173,7 +173,10 @@ fun MainScreen(
         },
         onImportSession = { uri ->
             sessionListViewModel.importUri(uri, app.contentResolver, app.cacheDir,
-                onSuccess = { android.widget.Toast.makeText(app, "匯入完成，可在設定或歷史對話唯讀檢視", android.widget.Toast.LENGTH_LONG).show() },
+                onSuccess = { newSessionId ->
+                    viewedSessionId = newSessionId
+                    android.widget.Toast.makeText(app, "匯入完成，已開啟唯讀檢視", android.widget.Toast.LENGTH_LONG).show()
+                },
                 onError = { android.widget.Toast.makeText(app, "匯入失敗，請至設定查看詳情", android.widget.Toast.LENGTH_LONG).show() },
             )
         },
@@ -376,7 +379,7 @@ fun MainScreen(
                 exportState = exportState,
                 importState = importState,
                 pickers = pickers,
-                onOpenSession = { sessionId ->
+                onViewTranscript = { sessionId ->
                     viewedSessionId = sessionId
                 },
                 onDismissExportState = { sessionListViewModel.resetExportState() },

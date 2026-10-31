@@ -67,7 +67,7 @@ class SettingsScreenTest {
                 onLaunchExport = {}, onLaunchImport = {},
                 exportPickerPending = false, importPickerPending = false,
                 exportPickerFailed = false, importPickerFailed = false,
-                onOpenSession = {},
+                onViewTranscript = {},
             )
         }
         val warning = "儲存目的地由文件提供者管理；匯出失敗或取消時，目的地可能留下空檔或部分內容，請自行檢查並刪除。"
@@ -397,7 +397,7 @@ class SettingsScreenTest {
                     currentSessionId = session,
                     exportState = ExportUiState.Idle,
                     importState = ImportUiState.Idle,
-                    onOpenSession = {},
+                    onViewTranscript = {},
                 )
             }
         }
@@ -413,6 +413,50 @@ class SettingsScreenTest {
         composeRule.runOnIdle { registry.dispatchResult<Uri?>(registry.request, null) }
         composeRule.onNodeWithText("匯出目前對話").assertIsEnabled()
         composeRule.runOnIdle { assertEquals(1, exported.size) }
+    }
+
+    @Test
+    fun importPickerStateRestoresAcrossRecreation() {
+        val registry = object : ActivityResultRegistry() {
+            var request = -1
+            override fun <I : Any?, O : Any?> onLaunch(
+                requestCode: Int, contract: ActivityResultContract<I, O>, input: I,
+                options: ActivityOptionsCompat?,
+            ) { request = requestCode }
+        }
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val imported = mutableListOf<Uri>()
+        val restoration = StateRestorationTester(composeRule)
+        restoration.setContent {
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                val pickers = rememberTranscriptPickers(
+                    onExportCurrentSession = { _, _ -> },
+                    onImportSession = { imported.add(it) },
+                    onDismissExportState = {},
+                    onDismissImportState = {},
+                )
+                SettingsScreen(
+                    padding = PaddingValues(0.dp),
+                    gate = readyGate(),
+                    pickers = pickers,
+                    exportState = ExportUiState.Idle,
+                    importState = ImportUiState.Idle,
+                    onViewTranscript = {},
+                )
+            }
+        }
+        onLogoutArea("匯入對話檔").performClick()
+        onLogoutArea("匯入對話檔").assertIsNotEnabled()
+        restoration.emulateSavedInstanceStateRestore()
+        onLogoutArea("匯入對話檔").assertIsNotEnabled()
+        val uri = Uri.parse("content://test/import-restored")
+        composeRule.runOnIdle { registry.dispatchResult(registry.request, uri) }
+        composeRule.runOnIdle {
+            assertEquals(listOf(uri), imported)
+        }
+        onLogoutArea("匯入對話檔").assertIsEnabled()
     }
 
     @Test
@@ -524,7 +568,7 @@ class SettingsScreenTest {
                 padding = PaddingValues(0.dp),
                 gate = readyGate(),
                 importState = ImportUiState.Success("imported-sess-999"),
-                onOpenSession = { openedSession = it },
+                onViewTranscript = { openedSession = it },
             )
         }
         onLogoutArea("對話已成功匯入！").assertIsDisplayed()

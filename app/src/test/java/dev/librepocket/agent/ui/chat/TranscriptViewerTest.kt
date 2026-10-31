@@ -2,7 +2,10 @@ package dev.librepocket.agent.ui.chat
 
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
@@ -97,6 +100,74 @@ class TranscriptViewerTest {
         compose.onNodeWithTag("transcriptPages").performScrollToNode(hasText("下一頁"))
         compose.onNodeWithText("下一頁").performClick()
         compose.onNodeWithText("無法讀取對話，請關閉後重試。").assertIsDisplayed()
+        compose.onNodeWithText("上一頁").assertIsDisplayed()
+        compose.onNodeWithText("上一頁").assertIsNotEnabled()
+    }
+
+    @Test fun previousPageButtonVisibilityAndDisabledWhileRowsNull() = kotlinx.coroutines.test.runTest {
+        val page2Deferred = kotlinx.coroutines.CompletableDeferred<List<TranscriptEvent>>()
+        compose.setContent {
+            TranscriptViewer("imported", { id, cursor ->
+                if (cursor == 0L) {
+                    (1L..100L).map {
+                        TranscriptEvent(seq = it, sessionId = id, runId = "r", kind = "user", text = "row $it", createdAt = 0)
+                    }
+                } else {
+                    page2Deferred.await()
+                }
+            }, {})
+        }
+        // Initial page: previous button is NOT visible
+        compose.onAllNodesWithText("上一頁").assertCountEquals(0)
+        compose.onNodeWithText("user: row 1").assertIsDisplayed()
+
+        // Next button is visible
+        compose.onNodeWithTag("transcriptPages").performScrollToNode(hasText("下一頁"))
+        compose.onNodeWithText("下一頁").assertIsEnabled()
+        compose.onNodeWithText("下一頁").performClick()
+
+        // While page 2 is loading (rows == null): previous button is visible, but disabled!
+        compose.onNodeWithText("上一頁").assertIsDisplayed()
+        compose.onNodeWithText("上一頁").assertIsNotEnabled()
+        compose.onNodeWithText("載入中…").assertIsDisplayed()
+
+        // Complete page 2
+        page2Deferred.complete(
+            listOf(TranscriptEvent(seq = 101L, sessionId = "imported", runId = "r", kind = "assistant", text = "last", createdAt = 0))
+        )
+        compose.waitForIdle()
+
+        // On subsequent page loaded: previous button is enabled
+        compose.onNodeWithText("上一頁").assertIsEnabled()
+        compose.onNodeWithText("assistant: last").assertIsDisplayed()
+
+        // Click previous page
+        compose.onNodeWithText("上一頁").performClick()
+        compose.onNodeWithText("user: row 1").assertIsDisplayed()
+
+        // Returned to initial page: previous button is NOT visible again
+        compose.onAllNodesWithText("上一頁").assertCountEquals(0)
+    }
+
+    @Test fun cursorAndPreviousCursorsRestoreAcrossRecreation() {
+        val restoration = StateRestorationTester(compose)
+        restoration.setContent {
+            TranscriptViewer("imported", { id, cursor ->
+                if (cursor == 0L) (1L..100L).map {
+                    TranscriptEvent(seq = it, sessionId = id, runId = "r", kind = "user", text = "row $it", createdAt = 0)
+                } else listOf(TranscriptEvent(seq = 101L, sessionId = id, runId = "r", kind = "assistant", text = "last", createdAt = 0))
+            }, {})
+        }
+        compose.onNodeWithText("user: row 1").assertIsDisplayed()
+        compose.onNodeWithTag("transcriptPages").performScrollToNode(hasText("下一頁"))
+        compose.onNodeWithText("下一頁").performClick()
+        compose.onNodeWithText("assistant: last").assertIsDisplayed()
+        compose.onNodeWithText("上一頁").assertIsDisplayed()
+
+        restoration.emulateSavedInstanceStateRestore()
+
+        compose.onNodeWithText("assistant: last").assertIsDisplayed()
+        compose.onNodeWithText("上一頁").assertIsDisplayed()
         compose.onNodeWithText("上一頁").performClick()
         compose.onNodeWithText("user: row 1").assertIsDisplayed()
     }

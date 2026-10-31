@@ -134,6 +134,7 @@ class StartupGateWiringTest {
             onNewChat = { currentSession.value = null },
             onImportPickerStart = pickers.launchImport,
             importBusy = pickers.importPickerPending || busy,
+            importPickerFailed = pickers.importPickerFailed,
             onOpenSession = { opened.add(it); currentSession.value = it },
             onViewTranscript = { viewed.add(it) },
             chatContent = { padding ->
@@ -479,7 +480,8 @@ class StartupGateWiringTest {
         awaitRoute(h, Routes.CHAT)
         composeRule.onNodeWithContentDescription("選單").performClick()
         composeRule.onNodeWithTag("sessionDrawerList").performScrollToNode(hasText("imported title"))
-        composeRule.onNodeWithContentDescription("唯讀檢視 imported title").performClick()
+        composeRule.onNodeWithText("唯讀").assertIsDisplayed()
+        composeRule.onNodeWithText("imported title").performClick()
         composeRule.runOnIdle {
             assertEquals(listOf("imported"), h.viewed)
             assertTrue(h.opened.isEmpty())
@@ -487,4 +489,53 @@ class StartupGateWiringTest {
         }
     }
 
+    @Test
+    fun drawerRegularSessionClickCallsOpenSession() {
+        val h = Harness()
+        h.pending.value = false
+        h.gate.value = EndpointGate.Ready(
+            EndpointConfig("preset:openai", "openai", "OpenAI", "https://api.openai.com/v1",
+                ProviderProtocol.CHAT_COMPLETIONS, "gpt-4o-mini", "provider_key/preset:openai"),
+        )
+        h.sessions.value = listOf(SessionMeta("reg-1", "regular title", 0, 0, "gpt-4o-mini"))
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+        composeRule.onNodeWithContentDescription("選單").performClick()
+        composeRule.onNodeWithTag("sessionDrawerList").performScrollToNode(hasText("regular title"))
+        composeRule.onAllNodesWithText("唯讀").assertCountEquals(0)
+        composeRule.onNodeWithContentDescription("唯讀檢視 regular title").assertIsDisplayed()
+        composeRule.onNodeWithText("regular title").performClick()
+        composeRule.runOnIdle {
+            assertEquals(listOf("reg-1"), h.opened)
+            assertTrue(h.viewed.isEmpty())
+            assertEquals(Routes.CHAT, h.nav.currentDestination?.route)
+        }
+    }
+
+    @Test
+    fun drawerImportPickerFailedShowsErrorMessage() {
+        val registry = object : ActivityResultRegistry() {
+            override fun <I : Any?, O : Any?> onLaunch(
+                requestCode: Int, contract: ActivityResultContract<I, O>, input: I,
+                options: ActivityOptionsCompat?,
+            ) { throw android.content.ActivityNotFoundException() }
+        }
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val h = Harness()
+        h.pending.value = false
+        h.gate.value = EndpointGate.Ready(
+            EndpointConfig("preset:openai", "openai", "OpenAI", "https://api.openai.com/v1",
+                ProviderProtocol.CHAT_COMPLETIONS, "gpt-4o-mini", "provider_key/preset:openai"),
+        )
+        composeRule.setContent {
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) { h.Content() }
+        }
+        awaitRoute(h, Routes.CHAT)
+        composeRule.onNodeWithContentDescription("選單").performClick()
+        composeRule.onNodeWithText("匯入對話 (JSONL)").performClick()
+        composeRule.onNodeWithContentDescription("選單").performClick()
+        composeRule.onNodeWithText("無法開啟檔案選擇器，請重試。").assertIsDisplayed()
+    }
 }

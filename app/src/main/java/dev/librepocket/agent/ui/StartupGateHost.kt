@@ -2,9 +2,12 @@ package dev.librepocket.agent.ui
 
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
@@ -253,7 +256,14 @@ internal fun StartupGateHost(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                 )
-                if (importPickerFailed) Text("無法開啟檔案選擇器，請重試。")
+                if (importPickerFailed) {
+                    Text(
+                        text = "無法開啟檔案選擇器，請重試。",
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                    )
+                }
                   }
                   if (sessions.isNotEmpty()) {
                     item {
@@ -266,28 +276,57 @@ internal fun StartupGateHost(
                     )
                     }
                     items(sessions, key = { it.sessionId }) { meta ->
+                        val isImported = meta.model == "imported/unknown" || meta.model.startsWith("imported")
                         NavigationDrawerItem(
                             label = {
-                                Text(
-                                    text = meta.title.ifBlank { "(無標題)" },
-                                    maxLines = 1,
-                                )
+                                if (isImported) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            text = meta.title.ifBlank { "(無標題)" },
+                                            maxLines = 1,
+                                            modifier = Modifier.weight(1f, fill = false),
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = "唯讀",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.outline,
+                                        )
+                                    }
+                                } else {
+                                    Text(
+                                        text = meta.title.ifBlank { "(無標題)" },
+                                        maxLines = 1,
+                                    )
+                                }
                             },
                             selected = currentRoute == Routes.CHAT && currentSessionId == meta.sessionId,
                             onClick = {
                                 scope.launch {
-                                    onOpenSession(meta.sessionId)
-                                    navController.navigate(Routes.CHAT) {
-                                        popUpTo(Routes.CHAT) { inclusive = false }
-                                        launchSingleTop = true
-                                    }
                                     drawerState.close()
+                                    if (isImported) {
+                                        onViewTranscript(meta.sessionId)
+                                    } else {
+                                        onOpenSession(meta.sessionId)
+                                        navController.navigate(Routes.CHAT) {
+                                            popUpTo(Routes.CHAT) { inclusive = false }
+                                            launchSingleTop = true
+                                        }
+                                    }
                                 }
                             },
-                            icon = { Icon(Icons.Filled.ChatBubbleOutline, contentDescription = null) },
-                            badge = {
-                                IconButton(onClick = { onViewTranscript(meta.sessionId); scope.launch { drawerState.close() } }) {
-                                    Icon(Icons.Filled.FileOpen, contentDescription = "唯讀檢視 ${meta.title}")
+                            icon = {
+                                if (isImported) {
+                                    Icon(Icons.Filled.FileOpen, contentDescription = null)
+                                } else {
+                                    Icon(Icons.Filled.ChatBubbleOutline, contentDescription = null)
+                                }
+                            },
+                            badge = if (isImported) null else {
+                                {
+                                    IconButton(onClick = { onViewTranscript(meta.sessionId); scope.launch { drawerState.close() } }) {
+                                        Icon(Icons.Filled.FileOpen, contentDescription = "唯讀檢視 ${meta.title}")
+                                    }
                                 }
                             },
                         )

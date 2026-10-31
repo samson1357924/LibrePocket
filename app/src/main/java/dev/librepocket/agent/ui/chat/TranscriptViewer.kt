@@ -14,6 +14,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -29,8 +31,14 @@ internal fun TranscriptViewer(
     loadPage: suspend (String, Long) -> List<TranscriptEvent>,
     onClose: () -> Unit,
 ) {
-    var cursor by remember(sessionId) { mutableLongStateOf(0L) }
-    var previousCursors by remember(sessionId) { mutableStateOf(emptyList<Long>()) }
+    var cursor by rememberSaveable(sessionId) { mutableLongStateOf(0L) }
+    var previousCursors by rememberSaveable(
+        sessionId,
+        stateSaver = listSaver(
+            save = { it },
+            restore = { it.toList() },
+        ),
+    ) { mutableStateOf(emptyList<Long>()) }
     var rows by remember(sessionId) { mutableStateOf<List<TranscriptEvent>?>(null) }
     var failed by remember(sessionId) { mutableStateOf(false) }
     val listState = rememberLazyListState()
@@ -54,10 +62,15 @@ internal fun TranscriptViewer(
                 item { Text("內容僅供檢視，來源與真實性未經驗證；不會加入對話或傳送給模型。") }
                 item { Text("舊備份可能未記錄截斷狀態；未標示截斷不代表內容完整。") }
                 if (previousCursors.isNotEmpty()) item {
-                    Button(onClick = {
-                        cursor = previousCursors.last()
-                        previousCursors = previousCursors.dropLast(1)
-                    }) { Text("上一頁") }
+                    Button(
+                        onClick = {
+                            if (rows != null && previousCursors.isNotEmpty()) {
+                                cursor = previousCursors.last()
+                                previousCursors = previousCursors.dropLast(1)
+                            }
+                        },
+                        enabled = rows != null && !failed,
+                    ) { Text("上一頁") }
                 }
                 if (failed) item { Text("無法讀取對話，請關閉後重試。") }
                 else if (rows == null) item { Text("載入中…") }
@@ -71,10 +84,15 @@ internal fun TranscriptViewer(
                         if (event.imagesOmitted > 0) Text("已省略圖片：${event.imagesOmitted}")
                     }
                     if (page.size == 100 && page.last().seq < Long.MAX_VALUE) item {
-                        Button(onClick = {
-                            previousCursors = previousCursors + cursor
-                            cursor = page.last().seq
-                        }) { Text("下一頁") }
+                        Button(
+                            onClick = {
+                                if (rows != null) {
+                                    previousCursors = previousCursors + cursor
+                                    cursor = page.last().seq
+                                }
+                            },
+                            enabled = rows != null && !failed,
+                        ) { Text("下一頁") }
                     }
                 }
             }

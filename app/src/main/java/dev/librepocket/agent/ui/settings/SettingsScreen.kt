@@ -192,7 +192,7 @@ fun SettingsScreen(
     exportState: ExportUiState = ExportUiState.Idle,
     importState: ImportUiState = ImportUiState.Idle,
     pickers: TranscriptPickers = TranscriptPickers(),
-    onOpenSession: (String) -> Unit = {},
+    onViewTranscript: (String) -> Unit = {},
     onDismissExportState: () -> Unit = {},
     onDismissImportState: () -> Unit = {},
 ) {
@@ -405,7 +405,7 @@ fun SettingsScreen(
                     importPickerPending = importPickerPending,
                     exportPickerFailed = exportPickerFailed,
                     importPickerFailed = importPickerFailed,
-                    onOpenSession = onOpenSession,
+                    onViewTranscript = onViewTranscript,
                     onDismissExportState = onDismissExportState,
                     onDismissImportState = onDismissImportState,
                 )
@@ -592,7 +592,7 @@ fun SettingsScreen(
                         importPickerPending = importPickerPending,
                         exportPickerFailed = exportPickerFailed,
                         importPickerFailed = importPickerFailed,
-                        onOpenSession = onOpenSession,
+                        onViewTranscript = onViewTranscript,
                         onDismissExportState = onDismissExportState,
                         onDismissImportState = onDismissImportState,
                     )
@@ -733,7 +733,7 @@ internal fun TranscriptBackupCard(
     importPickerPending: Boolean,
     exportPickerFailed: Boolean,
     importPickerFailed: Boolean,
-    onOpenSession: (String) -> Unit,
+    onViewTranscript: (String) -> Unit,
     onDismissExportState: () -> Unit = {},
     onDismissImportState: () -> Unit = {},
     modifier: Modifier = Modifier,
@@ -901,7 +901,7 @@ internal fun TranscriptBackupCard(
                             }
                             Spacer(modifier = Modifier.height(4.dp))
                             Button(
-                                onClick = { onOpenSession(importState.sessionId) },
+                                onClick = { onViewTranscript(importState.sessionId) },
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
                                 Text("唯讀檢視匯入內容")

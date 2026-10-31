@@ -574,8 +574,8 @@ class ChatMarkdownParserTest {
     fun stripThinking_usesSameOrderingAsDisplayForMixedAndUnclosedTags() {
         val input = "before <thought>outer <think>inner</thought> visible </think> after"
         val blocks = ChatMarkdownParser.parse(input)
-        assertEquals("outer <think>inner", (blocks[1] as ChatContentBlock.ThinkingBlock).content)
-        assertEquals("before  visible </think> after", ChatMarkdownParser.stripThinking(input))
+        assertEquals("outer <think>inner</thought> visible", (blocks[1] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("before  after", ChatMarkdownParser.stripThinking(input))
         assertEquals("before", ChatMarkdownParser.stripThinking("before <thinking>unclosed <think>x</think>"))
     }
 
@@ -1150,5 +1150,69 @@ class ChatMarkdownParserTest {
 
         val textWithUnclosedNested = "Prompt <thinking mode=\"deep\"><thinking>nested unfinished"
         assertEquals("Prompt", ChatMarkdownParser.stripThinking(textWithUnclosedNested))
+    }
+
+    @Test
+    fun parse_mixedNestedThinkingTags_isolatedWithoutLeak() {
+        val input = "<thought>outer <think>inner</thought>PRIVATE</think>"
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        assertFalse("stripThinking must not contain PRIVATE", stripped.contains("PRIVATE"))
+        assertEquals("", stripped)
+
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(1, blocks.size)
+        val thinking = blocks[0] as ChatContentBlock.ThinkingBlock
+        assertEquals("outer <think>inner</thought>PRIVATE", thinking.content)
+        assertFalse(thinking.isStreaming)
+    }
+
+    @Test
+    fun parse_thinkingTagHeaderNewlineProtection() {
+        val input = "<think\nReasoning\n</think>\nActual response"
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        assertEquals("Actual response", stripped)
+
+        val blocks = ChatMarkdownParser.parse(input)
+        assertTrue("Actual response must not be swallowed into thinking card", blocks.any {
+            it is ChatContentBlock.ParagraphBlock && it.annotatedText.text == "Actual response"
+        })
+    }
+
+    @Test
+    fun parse_selfClosingThinkingTags_handledSafely() {
+        for (input in listOf("<think/>Hello", "<think />Hello", "<thought/>Hello", "<thinking />Hello")) {
+            assertEquals("Hello", ChatMarkdownParser.stripThinking(input))
+            val blocks = ChatMarkdownParser.parse(input)
+            assertEquals(2, blocks.size)
+            val thinking = blocks[0] as ChatContentBlock.ThinkingBlock
+            assertEquals("", thinking.content)
+            assertFalse(thinking.isStreaming)
+            val paragraph = blocks[1] as ChatContentBlock.ParagraphBlock
+            assertEquals("Hello", paragraph.annotatedText.text)
+        }
+    }
+
+    @Test
+    fun parse_englishSentenceWithComparison_doesNotSwallowIntoThinkingCard() {
+        val input = "I <think that 5 > 3 is true> then answer"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertTrue("Must not contain thinking block", blocks.none { it is ChatContentBlock.ThinkingBlock })
+        assertEquals(1, blocks.size)
+        val paragraph = blocks[0] as ChatContentBlock.ParagraphBlock
+        assertEquals("I <think that 5 > 3 is true> then answer", paragraph.annotatedText.text)
+        assertEquals(input, ChatMarkdownParser.stripThinking(input))
+    }
+
+    @Test
+    fun stripThinking_isolatedClosingTagPrefillCot_isolatedFailClosed() {
+        val input = "Reasoning step 1\n</think>\nActual answer"
+        assertEquals("Actual answer", ChatMarkdownParser.stripThinking(input))
+
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(2, blocks.size)
+        val thinking = blocks[0] as ChatContentBlock.ThinkingBlock
+        assertEquals("Reasoning step 1", thinking.content)
+        val paragraph = blocks[1] as ChatContentBlock.ParagraphBlock
+        assertEquals("Actual answer", paragraph.annotatedText.text)
     }
 }

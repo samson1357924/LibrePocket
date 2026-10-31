@@ -34,7 +34,58 @@ object ChatMarkdownParser {
     private val THINK_TAG_NAMES = listOf("thinking", "thought", "think")
     private const val CODE_FENCE = "```"
 
-    private data class OpenThinkTag(val tagName: String, val tagEnd: Int)
+    private data class OpenThinkTag(
+        val tagName: String,
+        val tagEnd: Int,
+        val isSelfClosing: Boolean = false,
+    )
+
+    private data class CloseThinkTag(
+        val tagName: String,
+        val tagEnd: Int,
+    )
+
+    private fun isXmlNameStartChar(c: Char): Boolean =
+        (c in 'a'..'z') || (c in 'A'..'Z') || c == '_' || c == ':'
+
+    private fun isXmlNameChar(c: Char): Boolean =
+        isXmlNameStartChar(c) || (c in '0'..'9') || c == '-' || c == '.'
+
+    private fun validateAttributes(rawAttrs: String): Boolean {
+        if (rawAttrs.isBlank()) return true
+        var i = 0
+        val len = rawAttrs.length
+        while (i < len) {
+            while (i < len && (rawAttrs[i] == ' ' || rawAttrs[i] == '\t')) i++
+            if (i == len) break
+
+            if (!isXmlNameStartChar(rawAttrs[i])) return false
+            i++
+            while (i < len && isXmlNameChar(rawAttrs[i])) i++
+
+            while (i < len && (rawAttrs[i] == ' ' || rawAttrs[i] == '\t')) i++
+            if (i >= len || rawAttrs[i] != '=') return false
+            i++
+
+            while (i < len && (rawAttrs[i] == ' ' || rawAttrs[i] == '\t')) i++
+            if (i >= len) return false
+
+            val quote = rawAttrs[i]
+            if (quote == '"' || quote == '\'') {
+                i++
+                val quoteEnd = rawAttrs.indexOf(quote, i)
+                if (quoteEnd == -1) return false
+                i = quoteEnd + 1
+            } else {
+                val valStart = i
+                while (i < len && !rawAttrs[i].isWhitespace() && rawAttrs[i] != '"' && rawAttrs[i] != '\'' && rawAttrs[i] != '=' && rawAttrs[i] != '<' && rawAttrs[i] != '>' && rawAttrs[i] != '`') {
+                    i++
+                }
+                if (i == valStart) return false
+            }
+        }
+        return true
+    }
 
     private fun matchOpenThinkTag(text: String, pos: Int, targetTagName: String? = null): OpenThinkTag? {
         if (pos >= text.length || text[pos] != '<') return null
@@ -50,23 +101,64 @@ object ChatMarkdownParser {
             } ?: return null
         }
         val afterTag = pos + 1 + matchedName.length
-        if (afterTag == text.length) return null
-        return when {
-            text[afterTag] == '>' -> OpenThinkTag(matchedName, afterTag + 1)
-            text[afterTag].isWhitespace() -> {
-                val gt = text.indexOf('>', afterTag + 1)
-                if (gt >= 0) OpenThinkTag(matchedName, gt + 1) else null
-            }
-            else -> null
+        if (afterTag >= text.length) return null
+        val firstChar = text[afterTag]
+        if (firstChar != '>' && firstChar != '/' && firstChar != ' ' && firstChar != '\t') {
+            return null
         }
+
+        val maxScan = minOf(text.length, afterTag + 128)
+        var gt = -1
+        var p = afterTag
+        while (p < maxScan) {
+            val ch = text[p]
+            if (ch == '\n' || ch == '\r' || ch == '<') return null
+            if (ch == '>') {
+                gt = p
+                break
+            }
+            p++
+        }
+        if (gt == -1) return null
+
+        val isSelfClosing = gt > afterTag && text[gt - 1] == '/'
+        val attrEnd = if (isSelfClosing) gt - 1 else gt
+        val rawAttrs = text.substring(afterTag, attrEnd)
+        if (!validateAttributes(rawAttrs)) return null
+
+        return OpenThinkTag(matchedName, gt + 1, isSelfClosing)
     }
 
-    private fun matchCloseThinkTag(text: String, pos: Int, targetTagName: String): Int? {
+    private fun matchCloseThinkTag(text: String, pos: Int, targetTagName: String? = null): CloseThinkTag? {
         if (!text.startsWith("</", pos)) return null
-        if (!text.regionMatches(pos + 2, targetTagName, 0, targetTagName.length, ignoreCase = true)) return null
-        var p = pos + 2 + targetTagName.length
-        while (p < text.length && text[p].isWhitespace()) p++
-        return if (p < text.length && text[p] == '>') p + 1 else null
+        val matchedName = if (targetTagName != null) {
+            if (text.regionMatches(pos + 2, targetTagName, 0, targetTagName.length, ignoreCase = true)) {
+                targetTagName
+            } else {
+                return null
+            }
+        } else {
+            THINK_TAG_NAMES.firstOrNull { name ->
+                text.regionMatches(pos + 2, name, 0, name.length, ignoreCase = true)
+            } ?: return null
+        }
+        val afterTag = pos + 2 + matchedName.length
+        if (afterTag > text.length) return null
+        if (afterTag < text.length) {
+            val c = text[afterTag]
+            if (c.isLetterOrDigit() || c == '_' || c == '-') return null
+        }
+        val maxScan = minOf(text.length, afterTag + 128)
+        var p = afterTag
+        while (p < maxScan) {
+            val ch = text[p]
+            if (ch == '\n' || ch == '\r' || ch == '<') return null
+            if (ch == '>') {
+                return CloseThinkTag(matchedName, p + 1)
+            }
+            p++
+        }
+        return null
     }
 
     private fun isOpenThinkTagPrefix(text: String, pos: Int): Boolean {
@@ -78,22 +170,25 @@ object ChatMarkdownParser {
             if (openPrefix.startsWith(sub, ignoreCase = true)) return true
             if (sub.length > openPrefix.length &&
                 sub.regionMatches(0, openPrefix, 0, openPrefix.length, ignoreCase = true) &&
-                sub[openPrefix.length].isWhitespace()) {
+                (sub[openPrefix.length].isWhitespace() || sub[openPrefix.length] == '/')) {
                 return true
             }
         }
         return false
     }
 
-    private fun isCloseThinkTagPrefix(text: String, pos: Int, tagName: String): Boolean {
+    private fun isCloseThinkTagPrefix(text: String, pos: Int, targetTagName: String? = null): Boolean {
         if (pos >= text.length || text[pos] != '<') return false
         val sub = text.substring(pos)
         if (sub.contains('>')) return false
-        val closePrefix = "</$tagName"
-        if (closePrefix.startsWith(sub, ignoreCase = true)) return true
-        if (sub.length >= closePrefix.length &&
-            sub.regionMatches(0, closePrefix, 0, closePrefix.length, ignoreCase = true)) {
-            return (closePrefix.length until sub.length).all { sub[it].isWhitespace() }
+        val names = if (targetTagName != null) listOf(targetTagName) else THINK_TAG_NAMES
+        for (name in names) {
+            val closePrefix = "</$name"
+            if (closePrefix.startsWith(sub, ignoreCase = true)) return true
+            if (sub.length >= closePrefix.length &&
+                sub.regionMatches(0, closePrefix, 0, closePrefix.length, ignoreCase = true)) {
+                if ((closePrefix.length until sub.length).all { sub[it].isWhitespace() }) return true
+            }
         }
         return false
     }
@@ -227,6 +322,7 @@ object ChatMarkdownParser {
         }
         var cursor = 0
         var plainStart = 0
+        var hasSeenOpenThinkTag = false
         // Only the existing unordered-list syntax is recognized here. Blank lines
         // and indented continuation lines retain context; a real block ends it.
         val listContentColumns = mutableListOf<Long>()
@@ -327,12 +423,24 @@ object ChatMarkdownParser {
                 }
             }
             val openMatch = if (text[cursor] == '<') matchOpenThinkTag(text, cursor) else null
+            val orphanCloseMatch = if (openMatch == null && !hasSeenOpenThinkTag && result.isEmpty() && text[cursor] == '<') {
+                matchCloseThinkTag(text, cursor)
+            } else {
+                null
+            }
             if (openMatch != null) {
+                hasSeenOpenThinkTag = true
                 listContentColumns.clear()
                 addPlain(cursor)
-                val tagName = openMatch.tagName
+                if (openMatch.isSelfClosing) {
+                    result.add(Segment(Kind.THINKING, cursor, openMatch.tagEnd, openMatch.tagEnd, openMatch.tagEnd, unclosed = false))
+                    cursor = openMatch.tagEnd
+                    plainStart = cursor
+                    continue
+                }
                 val contentStart = openMatch.tagEnd
-                var depth = 1
+                val tagStack = mutableListOf<String>()
+                tagStack.add(openMatch.tagName.lowercase())
                 var scan = contentStart
                 var closeTagStart = -1
                 var closeTagEnd = -1
@@ -340,23 +448,37 @@ object ChatMarkdownParser {
                 while (scan < length) {
                     val nextLt = text.indexOf('<', scan)
                     if (nextLt == -1) break
-                    val innerOpen = matchOpenThinkTag(text, nextLt, targetTagName = tagName)
+                    val innerOpen = matchOpenThinkTag(text, nextLt)
                     if (innerOpen != null) {
-                        depth++
+                        if (!innerOpen.isSelfClosing) {
+                            tagStack.add(innerOpen.tagName.lowercase())
+                        }
                         scan = innerOpen.tagEnd
                         continue
                     }
-                    val innerClose = matchCloseThinkTag(text, nextLt, targetTagName = tagName)
+                    val innerClose = matchCloseThinkTag(text, nextLt)
                     if (innerClose != null) {
-                        depth--
-                        if (depth == 0) {
-                            closeTagStart = nextLt
-                            closeTagEnd = innerClose
-                            break
+                        val closeName = innerClose.tagName.lowercase()
+                        if (tagStack.isNotEmpty() && tagStack.last() == closeName) {
+                            tagStack.removeAt(tagStack.lastIndex)
+                            if (tagStack.isEmpty()) {
+                                closeTagStart = nextLt
+                                closeTagEnd = innerClose.tagEnd
+                                break
+                            }
                         } else {
-                            scan = innerClose
-                            continue
+                            val idx = tagStack.lastIndexOf(closeName)
+                            if (idx != -1) {
+                                tagStack.removeAt(idx)
+                                if (tagStack.isEmpty()) {
+                                    closeTagStart = nextLt
+                                    closeTagEnd = innerClose.tagEnd
+                                    break
+                                }
+                            }
                         }
+                        scan = innerClose.tagEnd
+                        continue
                     }
                     scan = nextLt + 1
                 }
@@ -370,7 +492,7 @@ object ChatMarkdownParser {
                     var end = length
                     if (streaming) {
                         val lastLt = text.lastIndexOf('<')
-                        if (lastLt >= contentStart && isCloseThinkTagPrefix(text, lastLt, tagName)) {
+                        if (lastLt >= contentStart && isCloseThinkTagPrefix(text, lastLt)) {
                             end = lastLt
                         }
                     }
@@ -378,6 +500,12 @@ object ChatMarkdownParser {
                     cursor = length
                     plainStart = cursor
                 }
+            } else if (orphanCloseMatch != null) {
+                hasSeenOpenThinkTag = true
+                listContentColumns.clear()
+                result.add(Segment(Kind.THINKING, start = 0, end = orphanCloseMatch.tagEnd, contentStart = 0, contentEnd = cursor, unclosed = false))
+                cursor = orphanCloseMatch.tagEnd
+                plainStart = cursor
             } else if (streaming && isOpenThinkTagPrefix(text, cursor)) {
                 addPlain(cursor)
                 result.add(Segment(Kind.PARTIAL_TAG, cursor, length))

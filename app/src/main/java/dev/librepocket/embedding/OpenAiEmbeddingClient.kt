@@ -19,6 +19,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
@@ -184,7 +185,7 @@ class OpenAiEmbeddingClient(
                     currentCoroutineContext().ensureActive()
                     if (!response.isSuccessful) {
                         val errorSnippet = readBoundedErrorPrefix(response.body) { call.cancel() }.orEmpty()
-                        val (code, retryable) = classifyHttpError(response.code)
+                        val (code, retryable) = classifyHttpError(response.code, errorSnippet)
                         val snippet = safeSnippet(errorSnippet, keyChars)
                         val safeMsg = if (snippet.isEmpty()) "HTTP ${response.code}" else "HTTP ${response.code}: $snippet"
                         throw EmbeddingException(
@@ -408,7 +409,7 @@ class OpenAiEmbeddingClient(
                 val path = httpUrl.encodedPath.trimEnd('/')
                 val newPath = when {
                     path.endsWith("/v1/embeddings") -> path
-                    path.endsWith("/embeddings") -> path
+                    path.endsWith("/embeddings") -> path.removeSuffix("/embeddings") + "/v1/embeddings"
                     path.endsWith("/v1") -> "$path/embeddings"
                     path.isEmpty() -> "/v1/embeddings"
                     else -> "$path/v1/embeddings"
@@ -423,7 +424,7 @@ class OpenAiEmbeddingClient(
             val trimmed = baseUrl.trimEnd('/')
             return when {
                 trimmed.endsWith("/v1/embeddings") -> trimmed
-                trimmed.endsWith("/embeddings") -> trimmed
+                trimmed.endsWith("/embeddings") -> trimmed.removeSuffix("/embeddings") + "/v1/embeddings"
                 trimmed.endsWith("/v1") -> "$trimmed/embeddings"
                 else -> "$trimmed/v1/embeddings"
             }
@@ -921,14 +922,78 @@ class OpenAiEmbeddingClient(
             return buffer.readUtf8()
         }
 
-        internal fun classifyHttpError(statusCode: Int): Pair<EmbeddingErrorCode, Boolean> = when (statusCode) {
+        private val NON_RETRYABLE_429_CODES = setOf(
+            "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "organization_usage_limit_exceeded",
+            "insufficient_quota",
+            "billing_hard_limit_reached",
+        )
+
+        internal data class ParsedErrorPayload(
+            val code: String? = null,
+            val type: String? = null,
+        )
+
+        internal fun parseErrorPayload(errorBody: String?): ParsedErrorPayload {
+            if (errorBody.isNullOrBlank()) return ParsedErrorPayload()
+            val trimmed = errorBody.trim()
+            if (trimmed.startsWith("{")) {
+                try {
+                    val element = Json.parseToJsonElement(trimmed)
+                    if (element is JsonObject) {
+                        val errorObj = element["error"] as? JsonObject
+                        val codePrim = errorObj?.get("code") as? JsonPrimitive
+                        val typePrim = errorObj?.get("type") as? JsonPrimitive
+                        val code = if (codePrim != null && codePrim !is JsonNull) codePrim.content else null
+                        val type = if (typePrim != null && typePrim !is JsonNull) typePrim.content else null
+                        return ParsedErrorPayload(code, type)
+                    }
+                } catch (_: Exception) {
+                    // Not valid JSON or parse failed
+                }
+            }
+            val lower = trimmed.lowercase()
+            for (nonRetryable in NON_RETRYABLE_429_CODES) {
+                if (lower.contains(nonRetryable)) {
+                    return ParsedErrorPayload(code = nonRetryable)
+                }
+            }
+            return ParsedErrorPayload(code = trimmed)
+        }
+
+        internal fun isNonRetryable429(code: String?, type: String?): Boolean {
+            val codeToken = code?.trim()?.lowercase()
+            val typeToken = type?.trim()?.lowercase()
+            if (codeToken != null && codeToken in NON_RETRYABLE_429_CODES) return true
+            if (typeToken != null && typeToken in NON_RETRYABLE_429_CODES) return true
+            return false
+        }
+
+        internal fun classifyHttpError(
+            statusCode: Int,
+            errorCode: String?,
+            errorType: String?,
+        ): Pair<EmbeddingErrorCode, Boolean> = when (statusCode) {
             400, 404 -> EmbeddingErrorCode.INVALID_REQUEST to false
             401, 403 -> EmbeddingErrorCode.UNAUTHORIZED to false
-            429 -> EmbeddingErrorCode.RATE_LIMITED to true
+            429 -> {
+                val isNonRetryable = isNonRetryable429(errorCode, errorType)
+                EmbeddingErrorCode.RATE_LIMITED to !isNonRetryable
+            }
+            500, 502, 504 -> EmbeddingErrorCode.SERVER_ERROR to true
             503 -> EmbeddingErrorCode.SERVICE_UNAVAILABLE to true
-            504 -> EmbeddingErrorCode.SERVER_ERROR to true
             in 500..599 -> EmbeddingErrorCode.SERVER_ERROR to false
             else -> EmbeddingErrorCode.INVALID_REQUEST to false
+        }
+
+        internal fun classifyHttpError(
+            statusCode: Int,
+            errorBody: String? = null,
+        ): Pair<EmbeddingErrorCode, Boolean> {
+            val parsed = parseErrorPayload(errorBody)
+            return classifyHttpError(statusCode, parsed.code, parsed.type)
         }
 
         internal fun classifyNetworkError(ioe: IOException): Pair<EmbeddingErrorCode, Boolean> {

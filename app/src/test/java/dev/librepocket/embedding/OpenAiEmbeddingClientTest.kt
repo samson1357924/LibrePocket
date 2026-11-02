@@ -412,7 +412,7 @@ class OpenAiEmbeddingClientTest {
         }
         assertEquals(500, ex.statusCode)
         assertEquals(EmbeddingErrorCode.SERVER_ERROR, ex.errorCode)
-        assertFalse("500 must be non-retryable", ex.retryable)
+        assertTrue("500 must be retryable", ex.retryable)
     }
 
     @Test
@@ -833,15 +833,15 @@ class OpenAiEmbeddingClientTest {
 
     @Test
     fun retryableClassificationHttpCodes() {
-        // Explicit transient errors: 429, 503, 504 are retryable
+        // Explicit transient errors: 429, 500, 502, 503, 504 are retryable
         assertEquals(true, OpenAiEmbeddingClient.classifyHttpError(429).second)
+        assertEquals(true, OpenAiEmbeddingClient.classifyHttpError(500).second)
+        assertEquals(true, OpenAiEmbeddingClient.classifyHttpError(502).second)
         assertEquals(true, OpenAiEmbeddingClient.classifyHttpError(503).second)
         assertEquals(true, OpenAiEmbeddingClient.classifyHttpError(504).second)
 
-        // Server errors other than 503 and 504 are non-retryable
-        assertEquals(false, OpenAiEmbeddingClient.classifyHttpError(500).second)
+        // Server errors other than transient 500/502/503/504 are non-retryable
         assertEquals(false, OpenAiEmbeddingClient.classifyHttpError(501).second)
-        assertEquals(false, OpenAiEmbeddingClient.classifyHttpError(502).second)
         assertEquals(false, OpenAiEmbeddingClient.classifyHttpError(505).second)
         assertEquals(false, OpenAiEmbeddingClient.classifyHttpError(520).second)
 
@@ -1761,5 +1761,299 @@ class OpenAiEmbeddingClientTest {
         assertEquals("test cancellation", ex.message)
         assertTrue(ex.stackTrace.isEmpty())
         assertNull(ex.createCopy())
+    }
+
+    // --- Finding 1: Retryable classification for transient vs quota/spend errors ---
+
+    @Test
+    fun http500And502Retryable() = runBlocking {
+        // 500 Internal Server Error must be retryable
+        server.enqueue(MockResponse().setResponseCode(500).setBody("Internal Server Error"))
+        val client = OpenAiEmbeddingClient(
+            baseUrl = server.url("/").toString(),
+            apiKey = { "key".toCharArray() },
+            allowTestLoopback = true,
+        )
+        val ex500 = assertThrows(EmbeddingException::class.java) {
+            runBlocking { client.createEmbeddings(EmbeddingRequest(input = listOf("test"))) }
+        }
+        assertEquals(500, ex500.statusCode)
+        assertEquals(EmbeddingErrorCode.SERVER_ERROR, ex500.errorCode)
+        assertTrue("500 must be retryable", ex500.retryable)
+
+        // 502 Bad Gateway must be retryable
+        server.enqueue(MockResponse().setResponseCode(502).setBody("Bad Gateway"))
+        val ex502 = assertThrows(EmbeddingException::class.java) {
+            runBlocking { client.createEmbeddings(EmbeddingRequest(input = listOf("test"))) }
+        }
+        assertEquals(502, ex502.statusCode)
+        assertEquals(EmbeddingErrorCode.SERVER_ERROR, ex502.errorCode)
+        assertTrue("502 must be retryable", ex502.retryable)
+    }
+
+    @Test
+    fun http429RateLimitAndSlowDownRetryable() = runBlocking {
+        val client = OpenAiEmbeddingClient(
+            baseUrl = server.url("/").toString(),
+            apiKey = { "key".toCharArray() },
+            allowTestLoopback = true,
+        )
+
+        // 429 with rate_limit_exceeded code
+        val rateLimitBody = """{
+            "error": {
+                "message": "Rate limit reached for model on tokens per min",
+                "type": "tokens",
+                "code": "rate_limit_exceeded"
+            }
+        }""".trimIndent()
+        server.enqueue(MockResponse().setResponseCode(429).setBody(rateLimitBody))
+        val exRateLimit = assertThrows(EmbeddingException::class.java) {
+            runBlocking { client.createEmbeddings(EmbeddingRequest(input = listOf("test"))) }
+        }
+        assertEquals(429, exRateLimit.statusCode)
+        assertEquals(EmbeddingErrorCode.RATE_LIMITED, exRateLimit.errorCode)
+        assertTrue("429 rate_limit_exceeded must be retryable", exRateLimit.retryable)
+
+        // 429 with slow_down code
+        val slowDownBody = """{
+            "error": {
+                "message": "Please slow down your requests.",
+                "type": "requests",
+                "code": "slow_down"
+            }
+        }""".trimIndent()
+        server.enqueue(MockResponse().setResponseCode(429).setBody(slowDownBody))
+        val exSlowDown = assertThrows(EmbeddingException::class.java) {
+            runBlocking { client.createEmbeddings(EmbeddingRequest(input = listOf("test"))) }
+        }
+        assertEquals(429, exSlowDown.statusCode)
+        assertEquals(EmbeddingErrorCode.RATE_LIMITED, exSlowDown.errorCode)
+        assertTrue("429 slow_down must be retryable", exSlowDown.retryable)
+
+        // 429 with unparseable / generic body
+        server.enqueue(MockResponse().setResponseCode(429).setBody("Too Many Requests"))
+        val exGeneric = assertThrows(EmbeddingException::class.java) {
+            runBlocking { client.createEmbeddings(EmbeddingRequest(input = listOf("test"))) }
+        }
+        assertEquals(429, exGeneric.statusCode)
+        assertEquals(EmbeddingErrorCode.RATE_LIMITED, exGeneric.errorCode)
+        assertTrue("429 generic must default to retryable", exGeneric.retryable)
+    }
+
+    @Test
+    fun http429CreditBalanceExhaustedNonRetryable() = runBlocking {
+        val client = OpenAiEmbeddingClient(
+            baseUrl = server.url("/").toString(),
+            apiKey = { "key".toCharArray() },
+            allowTestLoopback = true,
+        )
+
+        val creditExhaustedBody = """{
+            "error": {
+                "message": "You have run out of credits, please top up your balance.",
+                "type": "insufficient_quota",
+                "code": "credit_balance_exhausted"
+            }
+        }""".trimIndent()
+        server.enqueue(MockResponse().setResponseCode(429).setBody(creditExhaustedBody))
+        val ex = assertThrows(EmbeddingException::class.java) {
+            runBlocking { client.createEmbeddings(EmbeddingRequest(input = listOf("test"))) }
+        }
+        assertEquals(429, ex.statusCode)
+        assertEquals(EmbeddingErrorCode.RATE_LIMITED, ex.errorCode)
+        assertFalse("429 credit_balance_exhausted must NOT be retryable", ex.retryable)
+    }
+
+    @Test
+    fun http429SpendAndUsageLimitNonRetryable() = runBlocking {
+        val client = OpenAiEmbeddingClient(
+            baseUrl = server.url("/").toString(),
+            apiKey = { "key".toCharArray() },
+            allowTestLoopback = true,
+        )
+
+        val nonRetryableCodes = listOf(
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "organization_usage_limit_exceeded",
+            "insufficient_quota",
+        )
+
+        for (code in nonRetryableCodes) {
+            val body = """{
+                "error": {
+                    "message": "Limit exceeded for $code",
+                    "type": "insufficient_quota",
+                    "code": "$code"
+                }
+            }""".trimIndent()
+            server.enqueue(MockResponse().setResponseCode(429).setBody(body))
+            val ex = assertThrows(EmbeddingException::class.java) {
+                runBlocking { client.createEmbeddings(EmbeddingRequest(input = listOf("test"))) }
+            }
+            assertEquals(429, ex.statusCode)
+            assertEquals(EmbeddingErrorCode.RATE_LIMITED, ex.errorCode)
+            assertFalse("429 with code $code must NOT be retryable", ex.retryable)
+        }
+
+        // Test with type = "insufficient_quota" and null code
+        val bodyTypeOnly = """{
+            "error": {
+                "message": "Quota exceeded",
+                "type": "insufficient_quota",
+                "code": null
+            }
+        }""".trimIndent()
+        server.enqueue(MockResponse().setResponseCode(429).setBody(bodyTypeOnly))
+        val exTypeOnly = assertThrows(EmbeddingException::class.java) {
+            runBlocking { client.createEmbeddings(EmbeddingRequest(input = listOf("test"))) }
+        }
+        assertEquals(429, exTypeOnly.statusCode)
+        assertEquals(EmbeddingErrorCode.RATE_LIMITED, exTypeOnly.errorCode)
+        assertFalse("429 with type insufficient_quota must NOT be retryable", exTypeOnly.retryable)
+    }
+
+    @Test
+    fun classifyHttpErrorStructuredVariations() {
+        // Retryable rate limits
+        assertTrue(OpenAiEmbeddingClient.classifyHttpError(429, errorCode = "slow_down", errorType = "requests").second)
+        assertTrue(OpenAiEmbeddingClient.classifyHttpError(429, errorCode = "rate_limit_exceeded", errorType = null).second)
+        assertTrue(OpenAiEmbeddingClient.classifyHttpError(429, errorCode = null, errorType = "requests").second)
+        assertTrue(OpenAiEmbeddingClient.classifyHttpError(429, errorBody = null).second)
+
+        // Non-retryable quota / spend / balance errors
+        assertFalse(OpenAiEmbeddingClient.classifyHttpError(429, errorCode = "credit_balance_exhausted", errorType = null).second)
+        assertFalse(OpenAiEmbeddingClient.classifyHttpError(429, errorCode = "organization_spend_limit_exceeded", errorType = null).second)
+        assertFalse(OpenAiEmbeddingClient.classifyHttpError(429, errorCode = "project_spend_limit_exceeded", errorType = null).second)
+        assertFalse(OpenAiEmbeddingClient.classifyHttpError(429, errorCode = "organization_usage_limit_exceeded", errorType = null).second)
+        assertFalse(OpenAiEmbeddingClient.classifyHttpError(429, errorCode = "insufficient_quota", errorType = null).second)
+        assertFalse(OpenAiEmbeddingClient.classifyHttpError(429, errorCode = null, errorType = "insufficient_quota").second)
+        assertFalse(OpenAiEmbeddingClient.classifyHttpError(429, errorCode = "billing_hard_limit_reached", errorType = null).second)
+
+        // Case insensitivity and whitespace trimming
+        assertFalse(OpenAiEmbeddingClient.classifyHttpError(429, errorCode = "  CREDIT_BALANCE_EXHAUSTED  ", errorType = null).second)
+        assertFalse(OpenAiEmbeddingClient.classifyHttpError(429, errorCode = null, errorType = " INSUFFICIENT_QUOTA ").second)
+    }
+
+    // --- Finding 4: Endpoint resolution normalizes /embeddings to /v1/embeddings ---
+
+    @Test
+    fun resolveEndpointNormalizesEmbeddingsPath() {
+        // Official OpenAI endpoints
+        assertEquals(
+            "https://api.openai.com/v1/embeddings",
+            OpenAiEmbeddingClient.resolveEndpoint("https://api.openai.com/embeddings")
+        )
+        assertEquals(
+            "https://api.openai.com/v1/embeddings",
+            OpenAiEmbeddingClient.resolveEndpoint("https://api.openai.com/embeddings/")
+        )
+        assertEquals(
+            "https://api.openai.com/v1/embeddings",
+            OpenAiEmbeddingClient.resolveEndpoint("https://api.openai.com/v1/embeddings")
+        )
+        assertEquals(
+            "https://api.openai.com/v1/embeddings",
+            OpenAiEmbeddingClient.resolveEndpoint("https://api.openai.com/v1/embeddings/")
+        )
+        assertEquals(
+            "https://api.openai.com/v1/embeddings",
+            OpenAiEmbeddingClient.resolveEndpoint("https://api.openai.com/v1")
+        )
+        assertEquals(
+            "https://api.openai.com/v1/embeddings",
+            OpenAiEmbeddingClient.resolveEndpoint("https://api.openai.com")
+        )
+        assertEquals(
+            "https://api.openai.com/v1/embeddings",
+            OpenAiEmbeddingClient.resolveEndpoint("https://api.openai.com/")
+        )
+
+        // Custom / loopback proxy endpoints
+        assertEquals(
+            "http://127.0.0.1:8080/v1/embeddings",
+            OpenAiEmbeddingClient.resolveEndpoint("http://127.0.0.1:8080/embeddings")
+        )
+        assertEquals(
+            "http://127.0.0.1:8080/custom/v1/embeddings",
+            OpenAiEmbeddingClient.resolveEndpoint("http://127.0.0.1:8080/custom/embeddings")
+        )
+    }
+
+    @Test
+    fun clientWithEmbeddingsBaseUrlResolvesToV1EmbeddingsRoute() = runBlocking {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(jsonEmbeddingResponse(listOf(floatArrayOf(0.1f, 0.2f))))
+        )
+
+        val client = OpenAiEmbeddingClient(
+            baseUrl = server.url("/embeddings").toString(),
+            apiKey = { "key".toCharArray() },
+            allowTestLoopback = true,
+        )
+
+        val response = client.createEmbeddings(EmbeddingRequest(input = listOf("test")))
+        assertEquals(1, response.data.size)
+
+        val recorded = server.takeRequest(5, TimeUnit.SECONDS)
+        assertNotNull(recorded)
+        assertEquals("/v1/embeddings", recorded!!.path)
+    }
+
+    @Test
+    fun maxBatchAndMaxDimensionsPayloadFitsWithinDefaultResponseCap() = runBlocking {
+        // Deterministic boundary test:
+        // MAX_BATCH_SIZE = 100 items, MAX_DIMENSIONS = 3072 floats
+        // Total floats = 100 * 3072 = 307,200 floats
+        // Wire size with typical ~11 bytes per float + JSON envelope ≈ 3.4 MB < 5 MiB (MAX_RESPONSE_BYTES)
+        val batchSize = EmbeddingRequest.MAX_BATCH_SIZE
+        val dims = EmbeddingRequest.MAX_DIMENSIONS
+        assertEquals(100, batchSize)
+        assertEquals(3072, dims)
+
+        val sb = StringBuilder(4 * 1024 * 1024)
+        sb.append("""{"object":"list","data":[""")
+        for (i in 0 until batchSize) {
+            if (i > 0) sb.append(",")
+            sb.append("""{"object":"embedding","index":$i,"embedding":[""")
+            for (d in 0 until dims) {
+                if (d > 0) sb.append(",")
+                sb.append("0.12345678")
+            }
+            sb.append("]}")
+        }
+        sb.append("""],"model":"text-embedding-3-large","usage":{"prompt_tokens":$batchSize,"total_tokens":$batchSize}}""")
+        val responseBody = sb.toString()
+        val responseBytes = responseBody.toByteArray(Charsets.UTF_8).size
+
+        // Wire response payload must fit safely under default 5 MiB cap
+        assertTrue(
+            "Response size ($responseBytes bytes) must be less than MAX_RESPONSE_BYTES (${OpenAiEmbeddingClient.MAX_RESPONSE_BYTES} bytes)",
+            responseBytes < OpenAiEmbeddingClient.MAX_RESPONSE_BYTES
+        )
+
+        server.enqueue(MockResponse().setResponseCode(200).setBody(responseBody))
+
+        val client = OpenAiEmbeddingClient(
+            baseUrl = server.url("/").toString(),
+            apiKey = { "key".toCharArray() },
+            allowTestLoopback = true,
+            // Uses default maxResponseBytes = 5 MiB
+        )
+
+        val response = client.createEmbeddings(
+            EmbeddingRequest(
+                input = List(batchSize) { "item $it" },
+                model = "text-embedding-3-large",
+                dimensions = dims,
+            )
+        )
+
+        assertEquals(batchSize, response.data.size)
+        assertEquals(dims, response.data[0].embedding.size)
+        assertEquals(dims, response.data[batchSize - 1].embedding.size)
     }
 }

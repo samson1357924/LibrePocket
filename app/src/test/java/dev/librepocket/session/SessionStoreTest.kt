@@ -1116,11 +1116,7 @@ class SessionStoreTest {
                         }
                     }
                     assertTrue(started.await(10, TimeUnit.SECONDS))
-                    // Give the mutation an opportunity to finish while export is paused.
-                    // A timeout is not evidence that it reached a database lock: the
-                    // coroutine may still be queued. The content checks below apply in
-                    // either ordering and do not claim deterministic lock coverage.
-                    finished.await(500, TimeUnit.MILLISECONDS)
+                    assertTrue(finished.await(10, TimeUnit.SECONDS))
                     resume.countDown()
                     if (operation == "prune" || operation == "delete") {
                         try {
@@ -1187,6 +1183,34 @@ class SessionStoreTest {
         }
     }
 
+    @Test fun export_pruneClearsAndReusesSeq_failsClosedAndPreservesDestination(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        val count = RoomSessionStore.EXPORT_PAGE_SIZE + 5
+        insertLegacyExportRows(sid, count, "old")
+        val dest = File(tmpDir, "reuse_seq.jsonl").apply { writeText("preserved-original") }
+        var hookExecuted = false
+        store.exportAfterPageHookForTest = {
+            if (!hookExecuted) {
+                hookExecuted = true
+                db.sessionDao().deleteEventsBeyondLimit(sid, 0)
+                insertLegacyExportRows(sid, count, "new")
+            }
+        }
+        try {
+            store.exportJsonl(sid, dest)
+            fail("expected export to fail closed when seq numbers are reused")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("export failed: invalid event sequence", e.message)
+        } finally {
+            store.exportAfterPageHookForTest = null
+        }
+        assertTrue("hook must have been executed after page 1", hookExecuted)
+        assertEquals("preserved-original", dest.readText())
+        assertEquals(listOf("reuse_seq.jsonl"), tmpDir.list()!!.sorted())
+        assertEquals(0, tmpDir.listFiles()!!.count { it.name.startsWith("jsonl-export-") && it.name.endsWith(".tmp") })
+    }
+
     @Test fun export_oversizedEventCount_rejectedBeforeMaterialization(): Unit = runBlocking {
         setUp()
         val sid = "oversized-session-id"
@@ -1208,6 +1232,14 @@ class SessionStoreTest {
             override fun allEvents(s: String): List<TranscriptEventEntity> {
                 eventsRead = true
                 throw AssertionError("allEvents must not be called when eventCount > IMPORT_MAX_ROWS")
+            }
+            override fun eventRowIds(sid: String): List<Long> {
+                eventsRead = true
+                throw AssertionError("eventRowIds must not be called when eventCount > IMPORT_MAX_ROWS")
+            }
+            override fun eventsByRowIds(rowIds: List<Long>): List<TranscriptEventEntity> {
+                eventsRead = true
+                throw AssertionError("eventsByRowIds must not be called when eventCount > IMPORT_MAX_ROWS")
             }
         }
         val customDb = object : LibrePocketDb() {

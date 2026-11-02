@@ -48,6 +48,12 @@ public interface SessionDao {
                     + "ORDER BY seq ASC LIMIT :limit")
     List<TranscriptEventEntity> eventsBetween(String sid, long after, long maxSeq, int limit);
 
+    @Query("SELECT rowId FROM transcript_events WHERE sessionId = :sid ORDER BY seq ASC")
+    List<Long> eventRowIds(String sid);
+
+    @Query("SELECT * FROM transcript_events WHERE rowId IN (:rowIds) ORDER BY seq ASC")
+    List<TranscriptEventEntity> eventsByRowIds(List<Long> rowIds);
+
 
     @Query(
             "SELECT * FROM transcript_events WHERE sessionId = :sid "

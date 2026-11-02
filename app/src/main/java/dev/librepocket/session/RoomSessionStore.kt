@@ -626,7 +626,8 @@ class RoomSessionStore(
         require(initialSession != null) { "unknown session" }
         val expectedRows = dao.eventCount(sessionId)
         if (expectedRows > IMPORT_MAX_ROWS) throw JsonlExportLimitException("export too large")
-        val maxSeq = dao.maxSeq(sessionId)
+        val rowIds = dao.eventRowIds(sessionId)
+        if (rowIds.size > IMPORT_MAX_ROWS) throw JsonlExportLimitException("export too large")
 
         var bytes = 0L
         var chars = 0L
@@ -650,12 +651,13 @@ class RoomSessionStore(
         val tmp = File.createTempFile("jsonl-export-", ".tmp", parent ?: File("."))
         try {
             tmp.bufferedWriter(Charsets.UTF_8).use { out ->
-                while (rows < expectedRows && (maxSeq == 0L || afterSeq < maxSeq)) {
-                    val page = dao.eventsBetween(sessionId, afterSeq, maxSeq, EXPORT_PAGE_SIZE)
-                    if (page.isEmpty()) break
-                    for (row in page) {
-                        currentCoroutineContext().ensureActive()
-                        require(row.seq > afterSeq && (maxSeq == 0L || row.seq <= maxSeq)) { "export failed: invalid event sequence" }
+                for (chunk in rowIds.chunked(EXPORT_PAGE_SIZE)) {
+                    currentCoroutineContext().ensureActive()
+                    val page = dao.eventsByRowIds(chunk)
+                    require(page.size == chunk.size) { "export failed: invalid event sequence" }
+                    for ((index, row) in page.withIndex()) {
+                        require(row.rowId == chunk[index]) { "export failed: invalid event sequence" }
+                        require(row.seq > afterSeq) { "export failed: invalid event sequence" }
                         if (++rows > IMPORT_MAX_ROWS) throw JsonlExportLimitException("export too large")
                         // Inspect the stored text before any read-time redaction:
                         // marker recognition requires the original boundary.
@@ -723,9 +725,7 @@ class RoomSessionStore(
             }
             val endSession = dao.sessionById(sessionId)
             require(endSession != null) { "unknown session" }
-            require(rows == expectedRows) { "export failed: invalid event sequence" }
-            val endCount = dao.eventCount(sessionId)
-            require(endCount >= expectedRows) { "export failed: invalid event sequence" }
+            require(rows == rowIds.size) { "export failed: invalid event sequence" }
             ensureActive()
             if (!tmp.renameTo(destFile)) {
                 error("export failed: cannot move tmp file into place")

@@ -441,8 +441,8 @@ internal class ResponsesMapper(val round: Int = 0) {
             "response.output_text.delta",
             "response.refusal.delta",
             -> {
-                if (type == "response.refusal.delta") sawRefusal = true
                 val delta = root.string("delta") ?: root.string("refusal") ?: return emptyList()
+                if (type == "response.refusal.delta") sawRefusal = true
                 // Empty-delta suppression (parity with ChatCompletions): an
                 // empty frame yields NO event, so it can never park an empty
                 // block in the UI or masquerade as final-answer evidence
@@ -484,13 +484,13 @@ internal class ResponsesMapper(val round: Int = 0) {
             "response.output_text.done",
             "response.refusal.done",
             -> {
-                if (type == "response.refusal.done") sawRefusal = true
                 // Authoritative text for one streamed block. Reconcile through
                 // the same buffer as completed: emit only the missing suffix
                 // and advance the buffer so a later completed item is a no-op.
                 val text = (if (type == "response.refusal.done") root.string("refusal") else null)
                     ?: root.string("text")
                     ?: return emptyList()
+                if (type == "response.refusal.done") sawRefusal = true
                 val failed = reconcileTextBlock(
                     root.string("item_id"),
                     root.int("output_index"),
@@ -507,10 +507,11 @@ internal class ResponsesMapper(val round: Int = 0) {
             }
             "response.content_part.done" -> {
                 val part = root.obj("part") ?: return emptyList()
-                if (part.string("type") == "refusal" || part.string("refusal") != null) {
+                val partType = part.string("type")
+                val partRefusal = part.string("refusal") ?: (if (partType == "refusal") part.string("text") else null)
+                if (partRefusal != null) {
                     sawRefusal = true
                 }
-                val partType = part.string("type")
                 if (partType != "output_text" && partType != "text" && partType != "refusal") return emptyList()
                 val text = (if (partType == "refusal") part.string("refusal") else null)
                     ?: part.string("text")
@@ -1051,9 +1052,12 @@ internal class ResponsesMapper(val round: Int = 0) {
     }
 
     private fun hasRefusal(item: MiniJson.JObj): Boolean {
-        if (item.string("type") == "refusal" || item.string("refusal") != null) return true
+        val itemType = item.string("type")
+        if (item.string("refusal") != null || (itemType == "refusal" && item.string("text") != null)) return true
         val content = item.arr("content")?.items?.filterIsInstance<MiniJson.JObj>() ?: return false
-        return content.any { it.string("type") == "refusal" || it.string("refusal") != null }
+        return content.any { part ->
+            part.string("refusal") != null || (part.string("type") == "refusal" && part.string("text") != null)
+        }
     }
 
     /**

@@ -62,6 +62,45 @@ class EmbeddingModelsTest {
         assertThrows(IllegalArgumentException::class.java) {
             EmbeddingRequest(input = listOf("valid"), dimensions = -512)
         }
+        assertThrows(IllegalArgumentException::class.java) {
+            EmbeddingRequest(input = listOf("valid"), dimensions = 3073)
+        }
+    }
+
+    @Test
+    fun embeddingRequestMaxDimensionsValidation() {
+        assertEquals(3072, EmbeddingRequest.MAX_DIMENSIONS)
+
+        // Valid boundary: exactly MAX_DIMENSIONS (3072)
+        val reqMax = EmbeddingRequest(input = listOf("valid"), dimensions = EmbeddingRequest.MAX_DIMENSIONS)
+        assertEquals(3072, reqMax.dimensions)
+
+        // Invalid: MAX_DIMENSIONS + 1 (3073)
+        val exOver = assertThrows(IllegalArgumentException::class.java) {
+            EmbeddingRequest(input = listOf("valid"), dimensions = EmbeddingRequest.MAX_DIMENSIONS + 1)
+        }
+        assertEquals(
+            "dimensions must be positive and <= 3072, got: 3073",
+            exOver.message
+        )
+
+        // Invalid: 0
+        val exZero = assertThrows(IllegalArgumentException::class.java) {
+            EmbeddingRequest(input = listOf("valid"), dimensions = 0)
+        }
+        assertEquals(
+            "dimensions must be positive and <= 3072, got: 0",
+            exZero.message
+        )
+
+        // Invalid: negative
+        val exNeg = assertThrows(IllegalArgumentException::class.java) {
+            EmbeddingRequest(input = listOf("valid"), dimensions = -1)
+        }
+        assertEquals(
+            "dimensions must be positive and <= 3072, got: -1",
+            exNeg.message
+        )
     }
 
     @Test
@@ -249,6 +288,24 @@ class EmbeddingModelsTest {
         assertTrue("Similarity $sim should be <= 1.0f", sim <= 1.0f)
         assertTrue("Similarity $sim should be >= -1.0f", sim >= -1.0f)
         assertEquals(1.0f, sim, 1e-5f)
+    }
+
+    @Test
+    fun vectorMathCosineSimilarityNegativeZeroNormalized() {
+        val a = floatArrayOf(1.0f, 0.0f)
+        val b = floatArrayOf(0.0f, -1.0f)
+        val sim = VectorMath.cosineSimilarity(a, b)
+        assertEquals(0.0f, sim, 0.0f)
+        assertEquals(0, java.lang.Float.floatToRawIntBits(sim))
+        assertEquals(Float.POSITIVE_INFINITY, 1.0f / sim, 0.0f)
+
+        // Also test with explicit negative zero components
+        val c = floatArrayOf(0.0f, 1.0f)
+        val d = floatArrayOf(-0.0f, 0.0f)
+        val sim2 = VectorMath.cosineSimilarity(c, d)
+        assertEquals(0.0f, sim2, 0.0f)
+        assertEquals(0, java.lang.Float.floatToRawIntBits(sim2))
+        assertEquals(Float.POSITIVE_INFINITY, 1.0f / sim2, 0.0f)
     }
 
     @Test

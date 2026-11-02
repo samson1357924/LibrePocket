@@ -21,12 +21,15 @@ data class EmbeddingRequest(
         require(input.isNotEmpty()) { "input cannot be empty" }
         require(input.size <= MAX_BATCH_SIZE) { "batch size ${input.size} exceeds maximum limit of $MAX_BATCH_SIZE" }
         require(input.none { it.isBlank() }) { "input items cannot be blank" }
-        require(dimensions == null || dimensions > 0) { "dimensions must be positive" }
+        require(dimensions == null || (dimensions > 0 && dimensions <= MAX_DIMENSIONS)) {
+            "dimensions must be positive and <= $MAX_DIMENSIONS, got: $dimensions"
+        }
     }
 
     companion object {
         const val DEFAULT_MODEL = "text-embedding-3-small"
         const val MAX_BATCH_SIZE = 2048
+        const val MAX_DIMENSIONS = 3072
     }
 }
 
@@ -215,7 +218,7 @@ object VectorMath {
             return 0.0f
         }
 
-        return sim.coerceIn(-1.0f, 1.0f)
+        return if (sim == 0.0f) 0.0f else sim.coerceIn(-1.0f, 1.0f)
     }
 
     /**

@@ -14,6 +14,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.supervisorScope
 import kotlinx.serialization.json.Json
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -1084,57 +1085,151 @@ class SessionStoreTest {
     @Test fun export_roomSnapshotSurvivesConcurrentMutations(): Unit = runBlocking {
         setUp()
         for (operation in listOf("prune", "delete", "append")) {
+            supervisorScope {
+                val sid = store.createSession("t", "p/m")
+                val count = RoomSessionStore.EXPORT_PAGE_SIZE + 5
+                insertLegacyExportRows(sid, count, "snapshot")
+                val pageRead = CountDownLatch(1)
+                val resume = CountDownLatch(1)
+                val started = CountDownLatch(1)
+                val finished = CountDownLatch(1)
+                store.exportAfterPageHookForTest = {
+                    if (pageRead.count > 0) {
+                        pageRead.countDown()
+                        check(resume.await(10, TimeUnit.SECONDS))
+                    }
+                }
+                val dest = File(tmpDir, "$operation.jsonl").apply { writeText("existing") }
+                val export = async(Dispatchers.IO) { store.exportJsonl(sid, dest) }
+                try {
+                    assertTrue(pageRead.await(10, TimeUnit.SECONDS))
+                    val mutation = async(Dispatchers.IO) {
+                        started.countDown()
+                        try {
+                            when (operation) {
+                                "prune" -> store.prune(PrunePolicy(maxEventsPerSession = 1))
+                                "delete" -> store.deleteSession(sid)
+                                else -> store.appendEvent(event(sid, text = "later"))
+                            }
+                        } finally {
+                            finished.countDown()
+                        }
+                    }
+                    assertTrue(started.await(10, TimeUnit.SECONDS))
+                    // Give the mutation an opportunity to finish while export is paused.
+                    // A timeout is not evidence that it reached a database lock: the
+                    // coroutine may still be queued. The content checks below apply in
+                    // either ordering and do not claim deterministic lock coverage.
+                    finished.await(500, TimeUnit.MILLISECONDS)
+                    resume.countDown()
+                    if (operation == "prune" || operation == "delete") {
+                        try {
+                            export.await()
+                            fail("expected fail-closed export rejection on concurrent $operation")
+                        } catch (e: IllegalArgumentException) {
+                            assertTrue(e.message == "unknown session" || e.message == "export failed: invalid event sequence")
+                        }
+                        mutation.await()
+                        assertEquals("existing", dest.readText())
+                    } else {
+                        export.await()
+                        mutation.await()
+                        val lines = dest.readLines().mapIndexed { index, line -> JsonlCodec.decode(index + 1, line) }
+                        assertEquals((1L..count.toLong()).toList(), lines.map { it.seq })
+                        assertTrue(lines.all { it.text == "snapshot" })
+                    }
+                    when (operation) {
+                        "prune" -> assertEquals(1, store.countEvents(sid))
+                        "delete" -> assertNull(store.getSession(sid))
+                        else -> assertEquals(count + 1, store.countEvents(sid))
+                    }
+                    assertTrue(tmpDir.listFiles()!!.none { it.name.startsWith("jsonl-export-") && it.name.endsWith(".tmp") })
+                } finally {
+                    resume.countDown()
+                    store.exportAfterPageHookForTest = null
+                }
+            }
+        }
+    }
+
+    @Test fun export_deletedSessionDuringPaging_failsClosedAndPreservesDestination(): Unit = runBlocking {
+        setUp()
+        supervisorScope {
             val sid = store.createSession("t", "p/m")
             val count = RoomSessionStore.EXPORT_PAGE_SIZE + 5
-            insertLegacyExportRows(sid, count, "snapshot")
+            insertLegacyExportRows(sid, count, "payload")
+            val dest = File(tmpDir, "deleted_during_paging.jsonl").apply { writeText("original-data") }
             val pageRead = CountDownLatch(1)
             val resume = CountDownLatch(1)
-            val started = CountDownLatch(1)
-            val finished = CountDownLatch(1)
             store.exportAfterPageHookForTest = {
                 if (pageRead.count > 0) {
                     pageRead.countDown()
                     check(resume.await(10, TimeUnit.SECONDS))
                 }
             }
-            val dest = File(tmpDir, "$operation.jsonl")
             val export = async(Dispatchers.IO) { store.exportJsonl(sid, dest) }
             try {
                 assertTrue(pageRead.await(10, TimeUnit.SECONDS))
-                val mutation = async(Dispatchers.IO) {
-                    started.countDown()
-                    try {
-                        when (operation) {
-                            "prune" -> store.prune(PrunePolicy(maxEventsPerSession = 1))
-                            "delete" -> store.deleteSession(sid)
-                            else -> store.appendEvent(event(sid, text = "later"))
-                        }
-                    } finally {
-                        finished.countDown()
-                    }
-                }
-                assertTrue(started.await(10, TimeUnit.SECONDS))
-                // Give the mutation an opportunity to finish while export is paused.
-                // A timeout is not evidence that it reached a database lock: the
-                // coroutine may still be queued. The content checks below apply in
-                // either ordering and do not claim deterministic lock coverage.
-                finished.await(500, TimeUnit.MILLISECONDS)
+                store.deleteSession(sid)
                 resume.countDown()
-                export.await()
-                mutation.await()
-                val lines = dest.readLines().mapIndexed { index, line -> JsonlCodec.decode(index + 1, line) }
-                assertEquals((1L..count.toLong()).toList(), lines.map { it.seq })
-                assertTrue(lines.all { it.text == "snapshot" })
-                when (operation) {
-                    "prune" -> assertEquals(1, store.countEvents(sid))
-                    "delete" -> assertNull(store.getSession(sid))
-                    else -> assertEquals(count + 1, store.countEvents(sid))
+                try {
+                    export.await()
+                    fail("expected export to fail closed when session is deleted mid-export")
+                } catch (e: IllegalArgumentException) {
+                    assertTrue(e.message == "unknown session" || e.message == "export failed: invalid event sequence")
                 }
+                assertEquals("original-data", dest.readText())
+                assertEquals(listOf("deleted_during_paging.jsonl"), tmpDir.list()!!.sorted())
             } finally {
                 resume.countDown()
                 store.exportAfterPageHookForTest = null
             }
         }
+    }
+
+    @Test fun export_oversizedEventCount_rejectedBeforeMaterialization(): Unit = runBlocking {
+        setUp()
+        val sid = "oversized-session-id"
+        var eventsRead = false
+        val customDao = object : SessionDao by db.sessionDao() {
+            override fun sessionById(s: String): SessionEntity? =
+                SessionEntity(sid, "t", "m", now, now, false)
+            override fun eventCount(s: String): Int =
+                RoomSessionStore.IMPORT_MAX_ROWS + 1
+            override fun maxSeq(s: String): Long = 100L
+            override fun eventsBetween(s: String, after: Long, maxSeq: Long, limit: Int): List<TranscriptEventEntity> {
+                eventsRead = true
+                throw AssertionError("eventsBetween must not be called when eventCount > IMPORT_MAX_ROWS")
+            }
+            override fun eventsAfter(s: String, after: Long, limit: Int): List<TranscriptEventEntity> {
+                eventsRead = true
+                throw AssertionError("eventsAfter must not be called when eventCount > IMPORT_MAX_ROWS")
+            }
+            override fun allEvents(s: String): List<TranscriptEventEntity> {
+                eventsRead = true
+                throw AssertionError("allEvents must not be called when eventCount > IMPORT_MAX_ROWS")
+            }
+        }
+        val customDb = object : LibrePocketDb() {
+            override fun sessionDao(): SessionDao = customDao
+            override fun createInvalidationTracker(): androidx.room.InvalidationTracker =
+                throw UnsupportedOperationException()
+            override fun clearAllTables() = Unit
+        }
+        val customStore = RoomSessionStore(customDb) { now }
+        var hookCalled = false
+        customStore.exportAfterPageHookForTest = { hookCalled = true }
+        val dest = File(tmpDir, "oversized.jsonl").apply { writeText("preserved") }
+        try {
+            customStore.exportJsonl(sid, dest)
+            fail("expected JsonlExportLimitException")
+        } catch (e: JsonlExportLimitException) {
+            assertEquals("export too large", e.message)
+        }
+        assertFalse("events must not be read when expectedRows exceeds limit", eventsRead)
+        assertFalse("page hook must not be called", hookCalled)
+        assertEquals("preserved", dest.readText())
+        assertEquals(listOf("oversized.jsonl"), tmpDir.list()!!.sorted())
     }
 
     @Test fun export_cancelBetweenPagesPreservesDestinationAndRemovesTemp(): Unit = runBlocking {

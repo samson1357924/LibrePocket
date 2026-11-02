@@ -45,9 +45,10 @@ internal fun TranscriptViewer(
     LaunchedEffect(sessionId, cursor) {
         rows = null
         failed = false
-        listState.scrollToItem(0)
         try {
-            rows = loadPage(sessionId, cursor)
+            val page = loadPage(sessionId, cursor)
+            rows = page
+            listState.scrollToItem(0)
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {

@@ -154,9 +154,8 @@ object JsonlCodec {
         if (!validateNestingDepth(line)) fail()
         val obj = try {
             json.parseToJsonElement(line).jsonObject
-        } catch (e: CancellationException) {
-            throw e
         } catch (e: Throwable) {
+            if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
             fail(e)
         }
         // F11: every field read is gated so a JsonNull/object/array (whose

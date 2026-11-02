@@ -1,8 +1,8 @@
 # LibrePocket 能力與接線狀態
 
 > **Current snapshot (Dual-baseline)**：
-> 1. **核心基礎架構快照**：依 `82f2a0a8` 核對（2026-10-22，S1–S7＋R27＋R28-1＋#96 P2 tool-slice 及 Phase 3 硬化（`pathPrefix` 與 `query` Cf 全拒、空白 call id／續聊 index 精確配對、重複／redaction 碰撞 id 可續聊拒絕、非 object args 回退固定物件、backend 欄位省略 receipt 固定、timeout 分流、secret 家族值收斂、history marker-aware 裁切、Responses canonical 數字比較、MCP `baseUrl` preflight；Stage 1 & 2 硬化：`ChatViewModel` `restoreOpForFailedSend` 確立 notice-last 順序不變量消除跨分支發送競態、`SafeToolSlice` 預算超限正規化收據 wire ID；PR4 P2 #19 硬化：`ChatViewModelFactory` 暴露 seam 且由 `ProductionChatCompositionTest` 釘死 `sessions.toolSlice = null`，`query` 提取 `containsFormatCodePoint` 拒絕 Unicode FORMAT 碼點，釐清 `ToolDef.executionReady` 為 registry readiness 定義並列出啟用前置條件清單；FIX-09 階段三架構契約：Structured Outputs 與 Refusal streaming mapping 於 OpenAI Chat Completions 與 Responses 為 implemented、NOT wired to UI/ViewModel、JVM unit verified；Anthropic Messages 為 fail-closed unsupported（`ProviderFailure("STRUCTURED_OUTPUTS_NOT_SUPPORTED")`）、JVM unit verified）；executionReady 由 0→1 於 `b804ce89e99588cd5ca7c9cc3556e4dc37df6911`，為 registry readiness 旗標；`lsp.symbols` 執行在 production composition 為 test-only（`toolSlice = null`），任何未來工具接線均須走完整的 dispatcher/confirmation/executor pipeline；production 未附掛 tool slice，見 Built-in tools 列）。#93 已合併（`c3ae01fb`），本分支已完成 rebase。
-> 2. **PR #130 head 增量快照**：依 `b5eed78c` 核對（2026-11-03，PR #130 head；涵蓋 Structured Outputs `ResponseFormat` 密封階層、OpenAI Chat Completions 與 Responses 之 JSON AST / schema 注入防護與流式增量映射、跨協議 `sawRefusal` latch 終態統一正規化為 `StreamEvent.Done("refusal")`、Anthropic 官方協議 vs Adapter 範圍釐清（官方協議支援，但 LibrePocket adapter 尚未實作映射採嚴格 fail-closed 拒絕）及相應 JVM 單元測試；尚未接線至 UI/ViewModel，無裝置驗證）。
+> 1. **核心基礎架構快照**：依 `82f2a0a8` 核對（2026-10-22，S1–S7＋R27＋R28-1＋#96 P2 tool-slice 及 Phase 3 硬化（`pathPrefix` 與 `query` Cf 全拒、空白 call id／續聊 index 精確配對、重複／redaction 碰撞 id 可續聊拒絕、非 object args 回退固定物件、backend 欄位省略 receipt 固定、timeout 分流、secret 家族值收斂、history marker-aware 裁切、Responses canonical 數字比較、MCP `baseUrl` preflight；Stage 1 & 2 硬化：`ChatViewModel` `restoreOpForFailedSend` 確立 notice-last 順序不變量消除跨分支發送競態、`SafeToolSlice` 預算超限正規化收據 wire ID；PR4 P2 #19 硬化：`ChatViewModelFactory` 暴露 seam 且由 `ProductionChatCompositionTest` 釘死 `sessions.toolSlice = null`，`query` 提取 `containsFormatCodePoint` 拒絕 Unicode FORMAT 碼點，釐清 `ToolDef.executionReady` 為 registry readiness 定義並列出啟用前置條件清單）；executionReady 由 0→1 於 `b804ce89e99588cd5ca7c9cc3556e4dc37df6911`，為 registry readiness 旗標；`lsp.symbols` 執行在 production composition 為 test-only（`toolSlice = null`），任何未來工具接線均須走完整的 dispatcher/confirmation/executor pipeline；production 未附掛 tool slice，見 Built-in tools 列）。#93 已合併（`c3ae01fb`），本分支已完成 rebase。
+> 2. **PR #130 變更快照**：依本 PR 變更範圍核對（涵蓋 Structured Outputs `ResponseFormat` 密封階層、OpenAI Chat Completions 與 Responses 之 JSON AST / schema 注入防護與流式增量映射、跨協議 `sawRefusal` latch 終態正規化、Anthropic 官方協議 vs Adapter 範圍釐清（官方協議支援，但 LibrePocket adapter 尚未實作映射採嚴格 fail-closed 拒絕）及相應 JVM 單元測試；尚未接線至 UI/ViewModel，無裝置驗證）。
 >
 > 本文件不把規格列出的能力當成已可用功能。
 >
@@ -25,7 +25,7 @@
 | 項目 | Current evidence | 不可推論為 |
 |---|---|---|
 | Chat provider adapters | `Chat Completions`, `Responses`, `Anthropic Messages` adapter 與 factory 存在；`ChatViewModel.restoreOpForFailedSend` 確立 notice-last 不變量並消除跨分支發送競態；`SafeToolSlice` 於預算超限（budget-exceeded）時正規化收據 wire ID；Structured Outputs 與 Refusal streaming 支援狀況詳見「Provider / Chat Adapters 支援矩陣」 | 對每個相容宣稱的 endpoint 均已互通或認證；不可推論為 Structured Outputs 已接線至 UI/ViewModel 或已有裝置端驗證 |
-| Structured Outputs 與 Refusal streaming mapping | `ResponseFormat` 密封階層（`Text`、`JsonObject`、`JsonSchema`）於 `ProviderModels` declared；OpenAI Chat Completions 與 Responses 為 implemented、NOT wired to UI/ViewModel、JVM unit verified（正反向 AST 嵌入、Schema 注入防護、`refusal` streaming 到 `TextDelta` 映射、Responses 多 chunk 對齊去重，且流式 refusal 經 `sawRefusal` latch 將終態統一正規化投影為 `StreamEvent.Done("refusal")`）；Anthropic 官方協議已支援 Structured Outputs，但 LibrePocket Anthropic adapter 尚未實作此映射，因此目前在 `buildBody` 請求建構階段採嚴格 fail-closed 策略（遇 `JsonObject`/`JsonSchema` 拋出非重試性 `ProviderFailure("STRUCTURED_OUTPUTS_NOT_SUPPORTED")`）、NOT wired to UI/ViewModel、JVM unit verified（詳見下節支援矩陣） | 已接線至 UI/ViewModel；使用者可在介面選擇或強制 JSON Schema；已在真實 Android 裝置端到端驗證；不可推論 LibrePocket adapter 已支援結構化輸出（亦不可推論 Anthropic 官方協議不支援） |
+| Structured Outputs 與 Refusal streaming mapping [核於 PR #130] | `ResponseFormat` 密封階層（`Text`、`JsonObject`、`JsonSchema`）於 `ProviderModels` declared；OpenAI Chat Completions 與 Responses 為 implemented、NOT wired to UI/ViewModel、JVM unit verified（正反向 AST 嵌入、Schema 注入防護、`refusal` streaming 到 `TextDelta` 映射、Responses 多 chunk 對齊去重，且流式 refusal 經 `sawRefusal` latch 將終態統一正規化投影為 `StreamEvent.Done("refusal")`）；Anthropic 官方協議已支援 Structured Outputs，但 LibrePocket Anthropic adapter 尚未實作此映射，因此目前在 `buildBody` 請求建構階段採嚴格 fail-closed 策略（遇 `JsonObject`/`JsonSchema` 拋出非重試性 `ProviderFailure("STRUCTURED_OUTPUTS_NOT_SUPPORTED")`）、NOT wired to UI/ViewModel、JVM unit verified（詳見下節支援矩陣） | 已接線至 UI/ViewModel；使用者可在介面選擇或強制 JSON Schema；已在真實 Android 裝置端到端驗證；不可推論 LibrePocket adapter 已支援結構化輸出（亦不可推論 Anthropic 官方協議不支援） |
 | Session transcript | production chat/session path 使用 Room（canonical store）；JSONL 匯出／匯入透過 SAF 接線；匯出盡力脫敏並逐次映射 ID，無法保證匿名；匯入為未驗證來源的獨立副本；兩者有大小限制 | JSONL 是 canonical store；脫敏必然移除所有秘密；本機匯出／匯入等同零資料傳輸或繞過授權邊界 |
 | Ledger durability (`flushDurable`) | `TurnController.flushDurable` 八檢查合取（排空＋無 PENDING/CLAIMED receipt＋無未補償 SEALED＋admission／promotion／host／sticky 證明＋failure epoch 三讀 fail-last），永不 true-and-dangling；close 以 cancel-receipt barrier＋remaining-budget 線性化交接；同源 hydrate 保證僅限 R4-1 後新建/fork 的 ledger（pre-R4-1 混雜 id 須手動隔離，見威脅模型） | `true` 代表跨重啟耐久；fake session 的 `true` 可作耐久證據；SEALED 等同 settled |
 | Prune family-aware（R27） | Room raw cut＋family fixup 同一 tx（kill→rollback→pre-prune）；fixup 無條件、無界收斂、shape-aware suspect；新 prune 跨重啟無頭孤兒進 model context／快照 | crash-mid-fixup 仍是已知限制；interior／pre-R26 既有孤兒會被 fixup 刪除；測試 fake 的 suspect 可作耐久證據 |
@@ -46,7 +46,7 @@
 
 ### Provider / Chat Adapters 支援矩陣（Structured Outputs 與 Refusal Streaming）
 
-依據核心契約規範（Capability state 必須嚴格區分 Declared、Implemented、Wired 與 Verified），下表記錄目前各 Provider Adapter 對 Structured Outputs（`ResponseFormat` / JSON Schema / JSON Object）與 Refusal streaming mapping 的支援現況：
+依據核心契約規範（Capability state 必須嚴格區分 Declared、Implemented、Wired 與 Verified），下表記錄目前各 Provider Adapter 對 Structured Outputs（`ResponseFormat` / JSON Schema / JSON Object）與 Refusal streaming mapping 的支援現況（本小節核於 PR #130）：
 
 | Provider / 協議 | Declared | Implemented | Wired | Verified | 邊界與不可推論宣稱 |
 |---|---|---|---|---|---|
@@ -62,8 +62,8 @@
    目前驗證完全由 JVM 單元測試覆蓋（包含 AST 安全嵌入、惡意 JSON 注入防禦、非 object 根節點拒絕、多 chunk refusal 聚合去重、SSE flow streaming 邊界與 fail-closed 錯誤類型斷言），尚未於真實 Android 裝置或模擬器環境完成端到端驗收，不可宣稱 device verified。
 3. **Anthropic 官方協議 vs Adapter 範圍釐清（Fail-Closed 策略）**：
    Anthropic 官方協議已支援 Structured Outputs，但 LibrePocket Anthropic adapter 尚未實作此映射，因此目前在 `buildBody` 請求建構階段採嚴格 fail-closed 策略（拋出非重試 `ProviderFailure(retryable = false, message = "STRUCTURED_OUTPUTS_NOT_SUPPORTED")`），杜絕未定義行為或無效輸出。不可推論 LibrePocket adapter 已支援結構化輸出（亦不可推論官方協議不支援）。
-4. **Refusal Terminal 跨 Provider 統一契約（`sawRefusal` Latch）**：
-   OpenAI Chat Completions 與 Responses 在流式期間解析到 refusal 時，內部皆以 `sawRefusal` latch 鎖定；即使真實服務端 wire finish_reason 為 `"stop"`，終態均統一正規化投影為 `StreamEvent.Done("refusal")`，確保跨協議的 refusal terminal 語意一致性。
+4. **Refusal Terminal 跨 Provider 統一契約（`sawRefusal` Latch 與優先級規則）**：
+   OpenAI Chat Completions 與 Responses 在流式期間解析到有效 refusal 內容時，內部皆以 `sawRefusal` latch 鎖定。終態投影規則為：當真實服務端 wire finish_reason 為 `"stop"` 或 Responses status 為 `"completed"` 時，統一正規化投影為 `StreamEvent.Done("refusal")`；若 Chat Completions 端點回傳特定截斷原因（例如 token 耗盡之 `"length"` 或安全機制之 `"content_filter"`），則優先保留該原生終端原因，忠實回報截斷狀態。
 
 ## Target：工具接線前的驗收
 

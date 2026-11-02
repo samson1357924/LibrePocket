@@ -264,7 +264,7 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
         val out = ArrayList<StreamEvent>()
         val choices = root.arr("choices")?.items?.filterIsInstance<MiniJson.JObj>()
         val choice = choices?.firstOrNull()
-        val delta = choice?.obj("delta")
+        val delta = choice?.obj("delta") ?: choice?.obj("message")
         if (delta != null) {
             // Text (string or multimodal parts array).
             val text = deltaText(delta)

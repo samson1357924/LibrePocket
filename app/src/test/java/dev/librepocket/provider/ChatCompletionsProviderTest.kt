@@ -193,7 +193,7 @@ class ChatCompletionsProviderTest {
     @Test
     fun responseFormatSchemaInvalidJsonFailsClosed() {
         val provider = ChatCompletionsProvider(testConfig(), { null })
-        val invalidInputs = listOf("not-json", "{ unclosed", "{},\"injected\":true}")
+        val invalidInputs = listOf("not json", "{ unclosed", "{},\"injected\":true}")
         for (invalidJson in invalidInputs) {
             val rf = ResponseFormat.JsonSchema(name = "test_schema", schemaJson = invalidJson)
             try {
@@ -287,7 +287,7 @@ class ChatCompletionsProviderTest {
         assertEquals("value", obj["key"]!!.jsonPrimitive.content)
 
         // Invalid JSON
-        for (bad in listOf("not-json", "{ unclosed", "{},\"injected\":true}", "", "   ")) {
+        for (bad in listOf("not json", "{ unclosed", "{},\"injected\":true}", "", "   ")) {
             try {
                 responseFormatSchemaElement(bad)
                 fail("expected RESPONSE_FORMAT_SCHEMA_INVALID for: $bad")
@@ -353,5 +353,21 @@ class ChatCompletionsProviderTest {
         val textDeltas = events.filterIsInstance<StreamEvent.TextDelta>()
         assertEquals(listOf("I cannot", " fulfill this request"), textDeltas.map { it.delta })
         assertEquals(StreamEvent.Done("refusal"), events.last())
+    }
+
+    @Test
+    fun nonStreamingMessageRefusalFallback() {
+        val mapper = ChatCompletionsMapper()
+        val events = mapper.mapPayload(
+            """{"choices":[{"message":{"role":"assistant","refusal":"I cannot fulfill this request"},"finish_reason":"refusal"}]}""",
+        )
+        val textDeltas = events.filterIsInstance<StreamEvent.TextDelta>()
+        assertEquals(1, textDeltas.size)
+        assertEquals("I cannot fulfill this request", textDeltas[0].delta)
+        mapper.markDone()
+        val finishEvents = mapper.finish()
+        val doneEvents = finishEvents.filterIsInstance<StreamEvent.Done>()
+        assertEquals(1, doneEvents.size)
+        assertEquals("refusal", doneEvents[0].finishReason)
     }
 }

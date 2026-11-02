@@ -74,6 +74,8 @@ data class ChatRequest(
     val responseFormat: ResponseFormat? = null,
 )
 
+private val SCHEMA_NAME_REGEX = Regex("^[a-zA-Z0-9_-]{1,64}$")
+
 /** Structured Outputs response format selector (§1.2 / OpenAI Structured Outputs compatible). */
 sealed interface ResponseFormat {
     data object Text : ResponseFormat
@@ -86,7 +88,7 @@ sealed interface ResponseFormat {
     ) : ResponseFormat {
         init {
             require(name.isNotBlank()) { "name must not be blank" }
-            require(name.matches(Regex("^[a-zA-Z0-9_-]{1,64}$"))) {
+            require(name.matches(SCHEMA_NAME_REGEX)) {
                 "name must match ^[a-zA-Z0-9_-]{1,64}$, was: $name"
             }
             require(schemaJson.isNotBlank()) { "schemaJson must not be blank" }

@@ -440,7 +440,7 @@ internal class ResponsesMapper(val round: Int = 0) {
             "response.output_text.delta",
             "response.refusal.delta",
             -> {
-                val delta = root.string("delta") ?: return emptyList()
+                val delta = root.string("delta") ?: root.string("refusal") ?: return emptyList()
                 // Empty-delta suppression (parity with ChatCompletions): an
                 // empty frame yields NO event, so it can never park an empty
                 // block in the UI or masquerade as final-answer evidence
@@ -1059,7 +1059,7 @@ internal class ResponsesMapper(val round: Int = 0) {
         if (textIdentityConflict || toolIdentityConflict) return outputMismatch()
         val content = item.arr("content")?.items.orEmpty()
         val staged = ArrayList<StreamEvent>()
-        if (content.isEmpty() && item.string("type") == "refusal") {
+        if (content.isEmpty()) {
             val terminalText = item.string("refusal") ?: item.string("text")
             if (terminalText != null) {
                 val failed = reconcileTextBlock(

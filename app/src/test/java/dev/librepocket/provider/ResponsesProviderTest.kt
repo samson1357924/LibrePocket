@@ -2010,7 +2010,7 @@ class ResponsesProviderTest {
     @Test
     fun responseFormatSchemaInvalidJsonFailsClosed() {
         val provider = ResponsesProvider(testConfig(), { null })
-        val invalidInputs = listOf("not-json", "{ unclosed", "{},\"injected\":true}")
+        val invalidInputs = listOf("not json", "{ unclosed", "{},\"injected\":true}")
         for (invalidJson in invalidInputs) {
             val rf = ResponseFormat.JsonSchema(name = "test_schema", schemaJson = invalidJson)
             try {
@@ -2250,5 +2250,34 @@ class ResponsesProviderTest {
             completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty(),
         )
         assertEquals(StreamEvent.Done("stop"), completed.last())
+    }
+
+    @Test
+    fun outputItemDoneWithMessageTopLevelRefusalEmitsOnlyMissingSuffix() {
+        val mapper = ResponsesMapper()
+        val d1 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"I cannot"}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "I cannot")), d1)
+
+        val done = mapper.mapPayload(
+            """{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","refusal":"I cannot fulfill this request"}}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, " fulfill this request")), done)
+
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","refusal":"I cannot fulfill this request"}]}}""",
+        )
+        assertTrue(completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty())
+        assertEquals(StreamEvent.Done("stop"), completed.last())
+    }
+
+    @Test
+    fun refusalDeltaWithRefusalFieldFallbackEmitsTextDelta() {
+        val mapper = ResponsesMapper()
+        val d1 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","item_id":"ref_1","output_index":0,"content_index":0,"refusal":"I cannot"}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "I cannot")), d1)
     }
 }

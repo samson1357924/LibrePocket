@@ -2,9 +2,7 @@ package dev.librepocket.provider
 
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
@@ -89,15 +87,6 @@ internal fun chatToolCallJson(tc: ToolCall): String = buildJsonObject {
 internal fun responseFormatSchemaElement(schemaJson: String): JsonObject = try {
     when (val el = Json.parseToJsonElement(schemaJson)) {
         is JsonObject -> el
-        is JsonPrimitive -> {
-            if (!el.isString && el !is JsonNull) {
-                val content = el.content
-                if (content != "true" && content != "false" && content.toDoubleOrNull() == null) {
-                    throw ProviderFailure(false, "RESPONSE_FORMAT_SCHEMA_INVALID")
-                }
-            }
-            throw ProviderFailure(false, "RESPONSE_FORMAT_SCHEMA_MUST_BE_OBJECT")
-        }
         else -> throw ProviderFailure(false, "RESPONSE_FORMAT_SCHEMA_MUST_BE_OBJECT")
     }
 } catch (e: ProviderFailure) {

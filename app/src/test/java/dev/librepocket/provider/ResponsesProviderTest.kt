@@ -2258,6 +2258,10 @@ class ResponsesProviderTest {
             """{"type":"response.refusal.delta","item_id":"ref_1","output_index":0,"content_index":0,"refusal":"I cannot"}""",
         )
         assertEquals(listOf(StreamEvent.TextDelta(0, 0, "I cannot")), d1)
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"refusal","id":"ref_1","refusal":"I cannot"}]}}""",
+        )
+        assertEquals(listOf(StreamEvent.Done("refusal")), completed)
     }
 
     // ---- FIX-07: Refusal edge cases and end-to-end stream flow collection ----

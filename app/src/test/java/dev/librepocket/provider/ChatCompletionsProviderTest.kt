@@ -358,7 +358,10 @@ class ChatCompletionsProviderTest {
         val mapper = ChatCompletionsMapper()
         val events = ArrayList<StreamEvent>()
         events += mapper.mapPayload(
-            """{"choices":[{"delta":{"refusal":"I cannot fulfill this request"},"finish_reason":"refusal"}]}""",
+            """{"choices":[{"delta":{"refusal":"I cannot fulfill this request"},"finish_reason":null}]}""",
+        )
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{},"finish_reason":"stop"}]}""",
         )
         mapper.markDone()
         events += mapper.finish()
@@ -376,8 +379,9 @@ class ChatCompletionsProviderTest {
     fun streamRefusalChunkedYieldsTextDeltasAndDoneRefusal() {
         val parser = SseFrameParser()
         val mapper = ChatCompletionsMapper()
-        val sse = "data: {\"choices\":[{\"delta\":{\"refusal\":\"I cannot\"}}]}\n\n" +
-            "data: {\"choices\":[{\"delta\":{\"refusal\":\" fulfill this request\"},\"finish_reason\":\"refusal\"}]}\n\n" +
+        val sse = "data: {\"choices\":[{\"delta\":{\"refusal\":\"I cannot\"},\"finish_reason\":null}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"refusal\":\" fulfill this request\"},\"finish_reason\":null}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
             "data: [DONE]\n\n"
         val events = ArrayList<StreamEvent>()
         for (frame in parser.feed(sse.toByteArray())) {
@@ -406,7 +410,7 @@ class ChatCompletionsProviderTest {
     fun nonStreamingMessageRefusalFallback() {
         val mapper = ChatCompletionsMapper()
         val events = mapper.mapPayload(
-            """{"choices":[{"message":{"role":"assistant","refusal":"I cannot fulfill this request"},"finish_reason":"refusal"}]}""",
+            """{"choices":[{"message":{"role":"assistant","refusal":"I cannot fulfill this request"},"finish_reason":"stop"}]}""",
         )
         assertEquals(
             listOf(StreamEvent.TextDelta(0, 0, "I cannot fulfill this request")),
@@ -436,26 +440,19 @@ class ChatCompletionsProviderTest {
     }
 
     @Test
-    fun streamRefusalFinishReasonWithEmptyDeltaYieldsOnlyDoneRefusal() {
-        // Case 1: Empty delta object with finish_reason: refusal
-        val mapper1 = ChatCompletionsMapper()
-        val events1 = ArrayList<StreamEvent>()
-        events1 += mapper1.mapPayload(
-            """{"choices":[{"delta":{},"finish_reason":"refusal"}]}""",
+    fun streamRefusalEmptyDeltaYieldsOnlyDoneRefusal() {
+        // Explicit empty string refusal in delta followed by terminal stop yields Done("refusal") without TextDelta
+        val mapper = ChatCompletionsMapper()
+        val events = ArrayList<StreamEvent>()
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{"refusal":""},"finish_reason":null}]}""",
         )
-        mapper1.markDone()
-        events1 += mapper1.finish()
-        assertEquals(listOf(StreamEvent.Done("refusal")), events1)
-
-        // Case 2: Explicit empty string refusal with finish_reason: refusal
-        val mapper2 = ChatCompletionsMapper()
-        val events2 = ArrayList<StreamEvent>()
-        events2 += mapper2.mapPayload(
-            """{"choices":[{"delta":{"refusal":""},"finish_reason":"refusal"}]}""",
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{},"finish_reason":"stop"}]}""",
         )
-        mapper2.markDone()
-        events2 += mapper2.finish()
-        assertEquals(listOf(StreamEvent.Done("refusal")), events2)
+        mapper.markDone()
+        events += mapper.finish()
+        assertEquals(listOf(StreamEvent.Done("refusal")), events)
     }
 
     @Test
@@ -465,7 +462,10 @@ class ChatCompletionsProviderTest {
 
         val events = ArrayList<StreamEvent>()
         events += mapper.mapPayload(
-            """{"choices":[{"delta":{"refusal":"Refusal at round 2"},"finish_reason":"refusal"}]}""",
+            """{"choices":[{"delta":{"refusal":"Refusal at round 2"},"finish_reason":null}]}""",
+        )
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{},"finish_reason":"stop"}]}""",
         )
         mapper.markDone()
         events += mapper.finish()
@@ -515,8 +515,9 @@ class ChatCompletionsProviderTest {
         server.start()
         try {
             val body =
-                "data: {\"choices\":[{\"delta\":{\"refusal\":\"I cannot \"}}]}\n\n" +
-                    "data: {\"choices\":[{\"delta\":{\"refusal\":\"comply with this request.\"},\"finish_reason\":\"refusal\"}]}\n\n" +
+                "data: {\"choices\":[{\"delta\":{\"refusal\":\"I cannot \"},\"finish_reason\":null}]}\n\n" +
+                    "data: {\"choices\":[{\"delta\":{\"refusal\":\"comply with this request.\"},\"finish_reason\":null}]}\n\n" +
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
                     "data: [DONE]\n\n"
             server.enqueue(
                 MockResponse()
@@ -620,7 +621,7 @@ class ChatCompletionsProviderTest {
     }
 
     @Test
-    fun proxyFinishReasonRefusalWithoutRefusalInDeltaYieldsDoneRefusal() {
+    fun proxyNativeFinishReasonRefusalSupported() {
         val mapper = ChatCompletionsMapper()
         val events = ArrayList<StreamEvent>()
         // Proxy natively sends finish_reason: "refusal" without refusal in delta

@@ -32,7 +32,9 @@ class SemanticMemoryIndexTest {
 
     @After
     fun tearDown() {
-        server.shutdown()
+        if (::server.isInitialized) {
+            runCatching { server.shutdown() }
+        }
     }
 
     private fun jsonEmbeddingResponse(
@@ -637,16 +639,18 @@ class SemanticMemoryIndexTest {
             index.addAll(mutableItems)
         }
 
-        // Wait until addAll has sent the HTTP request and is suspended waiting for the response
-        assertTrue(requestReceived.await(5, TimeUnit.SECONDS))
+        try {
+            // Wait until addAll has sent the HTTP request and is suspended waiting for the response
+            assertTrue(requestReceived.await(5, TimeUnit.SECONDS))
 
-        // Mutate caller's original MutableList while addAll is suspended
-        mutableItems.clear()
-        mutableItems.add(Triple("tampered_item", "tampered text", 999))
-        mutableItems.add(Triple("another_tampered", "another text", 888))
-
-        // Let the mock response proceed
-        proceedResponse.countDown()
+            // Mutate caller's original MutableList while addAll is suspended
+            mutableItems.clear()
+            mutableItems.add(Triple("tampered_item", "tampered text", 999))
+            mutableItems.add(Triple("another_tampered", "another text", 888))
+        } finally {
+            // Let the mock response proceed
+            proceedResponse.countDown()
+        }
         val results = deferred.await()
 
         // Verify that the operation completed with original snapshot items
@@ -1450,5 +1454,237 @@ class SemanticMemoryIndexTest {
         assertEquals(1, result.size)
         assertEquals(1, index.size())
         assertEquals(1, server.requestCount)
+    }
+
+    @Test
+    fun addDirectRejectsNanAndInf() {
+        val index = SemanticMemoryIndex<Unit>()
+        val exNan = assertThrows(IllegalArgumentException::class.java) {
+            index.addDirect("id1", "text", floatArrayOf(Float.NaN, 0.5f))
+        }
+        assertTrue(exNan.message!!.contains("finite"))
+
+        val exInf = assertThrows(IllegalArgumentException::class.java) {
+            index.addDirect("id2", "text", floatArrayOf(Float.POSITIVE_INFINITY, 0.5f))
+        }
+        assertTrue(exInf.message!!.contains("finite"))
+    }
+
+    @Test
+    fun searchByVectorRejectsNanAndInf() {
+        val index = SemanticMemoryIndex<Unit>()
+        index.addDirect("id1", "text", floatArrayOf(0.1f, 0.2f))
+
+        val exNan = assertThrows(IllegalArgumentException::class.java) {
+            index.searchByVector(floatArrayOf(Float.NaN, 0.2f))
+        }
+        assertTrue(exNan.message!!.contains("finite"))
+
+        val exInf = assertThrows(IllegalArgumentException::class.java) {
+            index.searchByVector(floatArrayOf(0.1f, Float.NEGATIVE_INFINITY))
+        }
+        assertTrue(exInf.message!!.contains("finite"))
+    }
+
+    @Test
+    fun metadataValidatorInvokedAndCanRejectLargePayloads() {
+        val index = SemanticMemoryIndex<String>(
+            metadataValidator = { meta ->
+                if (meta != null && meta.length > 50) {
+                    throw IllegalArgumentException("metadata too large")
+                }
+            }
+        )
+
+        // Valid short metadata passes
+        index.addDirect("id1", "text1", floatArrayOf(0.1f, 0.2f), metadata = "short")
+        assertEquals(1, index.size())
+
+        // Exceeding metadata fails
+        assertThrows(IllegalArgumentException::class.java) {
+            index.addDirect("id2", "text2", floatArrayOf(0.1f, 0.2f), metadata = "x".repeat(100))
+        }
+    }
+
+    @Test
+    fun metadataValidatorFailsFastInAddAndAddAllWithoutNetworkCall() = runBlocking {
+        val client = createTestClient()
+        val index = SemanticMemoryIndex<String>(
+            client = client,
+            metadataValidator = { meta ->
+                if (meta == "invalid") throw IllegalArgumentException("blocked metadata")
+            }
+        )
+
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking { index.add("id1", "valid text", metadata = "invalid") }
+        }
+        assertEquals(0, server.requestCount)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                index.addAll(listOf(Triple("id2", "text", "invalid")))
+            }
+        }
+        assertEquals(0, server.requestCount)
+    }
+
+    // --- Regression Tests for Stage 4: Finite Validation, MetadataValidator, Min-Heap, & Teardown Safety ---
+
+    @Test
+    fun finiteValidationAcceptsValidFloatsAndRejectsAllNonFiniteVariants() {
+        val index = SemanticMemoryIndex<Unit>()
+
+        // Accepts positive, negative, zero, subnormal
+        val valid = floatArrayOf(0.0f, -0.0f, 1.0f, -1.0f, Float.MIN_VALUE, 1e-10f)
+        index.addDirect("valid", "text", valid)
+        assertEquals(1, index.size())
+
+        // Rejects negative infinity in addDirect
+        val errNegInf = assertThrows(IllegalArgumentException::class.java) {
+            index.addDirect("neg_inf", "text", floatArrayOf(0.5f, Float.NEGATIVE_INFINITY, 0.1f, 0.2f, 0.3f, 0.4f))
+        }
+        assertTrue(errNegInf.message!!.contains("finite"))
+
+        // Rejects NaN in query vector
+        val errQueryNan = assertThrows(IllegalArgumentException::class.java) {
+            index.searchByVector(floatArrayOf(0.1f, 0.2f, Float.NaN, 0.4f, 0.5f, 0.6f))
+        }
+        assertTrue(errQueryNan.message!!.contains("finite"))
+
+        // Rejects positive infinity in query vector
+        val errQueryInf = assertThrows(IllegalArgumentException::class.java) {
+            index.searchByVector(floatArrayOf(0.1f, 0.2f, 0.3f, Float.POSITIVE_INFINITY, 0.5f, 0.6f))
+        }
+        assertTrue(errQueryInf.message!!.contains("finite"))
+    }
+
+    @Test
+    fun metadataValidatorAllowsNullWhenPermitted() {
+        var invocations = 0
+        val index = SemanticMemoryIndex<String>(
+            metadataValidator = { meta ->
+                invocations++
+                if (meta != null && meta == "forbidden") {
+                    throw IllegalArgumentException("forbidden metadata")
+                }
+            }
+        )
+
+        index.addDirect("id1", "text1", floatArrayOf(0.1f, 0.2f), metadata = null)
+        assertEquals(1, invocations)
+        assertEquals(1, index.size())
+
+        index.addDirect("id2", "text2", floatArrayOf(0.2f, 0.3f), metadata = "allowed")
+        assertEquals(2, invocations)
+        assertEquals(2, index.size())
+
+        val err = assertThrows(IllegalArgumentException::class.java) {
+            index.addDirect("id3", "text3", floatArrayOf(0.3f, 0.4f), metadata = "forbidden")
+        }
+        assertEquals("forbidden metadata", err.message)
+        assertEquals(3, invocations)
+        assertEquals(2, index.size())
+    }
+
+    @Test
+    fun boundedMinHeapRankingAccuracyLargeDataset() {
+        val index = SemanticMemoryIndex<Int>(maxEntries = 500)
+        val n = 200
+
+        // Vector of dimension 2: (cos(theta), sin(theta))
+        // Query is (1.0, 0.0), so cosine similarity with (cos(theta), sin(theta)) is cos(theta).
+        // Let theta_i = i * (PI / 2) / (n - 1).
+        // theta_0 = 0 -> cos = 1.0 (highest score).
+        // theta_i strictly increases, so cos(theta_i) strictly decreases.
+        // Insert items in reverse order to ensure min-heap dynamically updates top-k correctly.
+        for (i in (n - 1) downTo 0) {
+            val theta = i.toDouble() * (Math.PI / 2.0) / (n - 1).toDouble()
+            val x = Math.cos(theta).toFloat()
+            val y = Math.sin(theta).toFloat()
+            index.addDirect("doc_$i", "text $i", floatArrayOf(x, y), metadata = i)
+        }
+        assertEquals(n, index.size())
+
+        val query = floatArrayOf(1.0f, 0.0f)
+        val k = 10
+        val results = index.searchByVector(query, k = k)
+
+        assertEquals(k, results.size)
+        // Verify results are strictly doc_0 through doc_9 in descending score order
+        for (j in 0 until k) {
+            assertEquals("doc_$j", results[j].entry.id)
+            assertEquals(j, results[j].entry.metadata)
+            val expectedTheta = j.toDouble() * (Math.PI / 2.0) / (n - 1).toDouble()
+            val expectedScore = Math.cos(expectedTheta).toFloat()
+            assertEquals(expectedScore, results[j].score, 1e-4f)
+
+            if (j > 0) {
+                assertTrue("Scores must be strictly descending", results[j - 1].score > results[j].score)
+            }
+        }
+
+        // Test k = 1
+        val top1 = index.searchByVector(query, k = 1)
+        assertEquals(1, top1.size)
+        assertEquals("doc_0", top1[0].entry.id)
+        assertEquals(1.0f, top1[0].score, 1e-5f)
+
+        // Test candidate count < k
+        val smallIndex = SemanticMemoryIndex<Unit>()
+        smallIndex.addDirect("a", "text a", floatArrayOf(1.0f, 0.0f))
+        smallIndex.addDirect("b", "text b", floatArrayOf(0.7071f, 0.7071f))
+        smallIndex.addDirect("c", "text c", floatArrayOf(0.0f, 1.0f))
+
+        val smallResults = smallIndex.searchByVector(query, k = 10)
+        assertEquals(3, smallResults.size)
+        assertEquals("a", smallResults[0].entry.id)
+        assertEquals("b", smallResults[1].entry.id)
+        assertEquals("c", smallResults[2].entry.id)
+        assertTrue(smallResults[0].score > smallResults[1].score)
+        assertTrue(smallResults[1].score > smallResults[2].score)
+    }
+
+    @Test
+    fun boundedMinHeapIdenticalScoresHandling() {
+        val index = SemanticMemoryIndex<Unit>()
+        // Insert 10 items with identical vectors
+        for (i in 1..10) {
+            index.addDirect("id_$i", "text $i", floatArrayOf(0.6f, 0.8f))
+        }
+
+        val results = index.searchByVector(floatArrayOf(0.6f, 0.8f), k = 5)
+        assertEquals(5, results.size)
+        for (result in results) {
+            assertEquals(1.0f, result.score, 1e-5f)
+        }
+    }
+
+    @Test
+    fun teardownSafetyAndIndexReset() {
+        val index = SemanticMemoryIndex<String>()
+        index.addDirect("id1", "sample 1", floatArrayOf(1.0f, 2.0f, 3.0f), "meta1")
+        assertEquals(3, index.currentDimension)
+        assertEquals(1, index.size())
+
+        // Clear resets dimension and state safely
+        index.clear()
+        assertNull(index.currentDimension)
+        assertEquals(0, index.size())
+
+        // Can be re-used with a different dimension after clear
+        index.addDirect("id2", "sample 2", floatArrayOf(0.5f, 0.5f), "meta2")
+        assertEquals(2, index.currentDimension)
+        assertEquals(1, index.size())
+
+        // Multiple clears in succession are idempotent and safe
+        index.clear()
+        index.clear()
+        assertNull(index.currentDimension)
+        assertEquals(0, index.size())
+
+        // MockWebServer teardown safety check: multiple shutdowns do not throw
+        server.shutdown()
+        runCatching { server.shutdown() }
     }
 }

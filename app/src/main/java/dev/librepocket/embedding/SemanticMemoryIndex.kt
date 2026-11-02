@@ -1,5 +1,6 @@
 package dev.librepocket.embedding
 
+import java.util.PriorityQueue
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
@@ -102,6 +103,7 @@ class SemanticMemoryIndex<T>(
     private val client: OpenAiEmbeddingClient? = null,
     val maxEntries: Int = DEFAULT_MAX_ENTRIES,
     val model: String = DEFAULT_MODEL,
+    val metadataValidator: ((T?) -> Unit)? = null,
 ) {
     init {
         require(maxEntries in 1..MAX_ALLOWED_ENTRIES) {
@@ -135,14 +137,9 @@ class SemanticMemoryIndex<T>(
      *                                  [text] exceeds [MAX_TEXT_CHARS], or vector dimension mismatches.
      */
     suspend fun add(id: String, text: String, metadata: T? = null): SemanticEntry<T> {
-        require(id.isNotBlank()) { "id cannot be blank" }
-        require(id.length <= MAX_ID_CHARS) {
-            "id length ${id.length} exceeds maximum allowed length of $MAX_ID_CHARS characters"
-        }
-        require(text.isNotBlank()) { "text cannot be blank" }
-        require(text.length <= MAX_TEXT_CHARS) {
-            "text length ${text.length} exceeds maximum allowed length of $MAX_TEXT_CHARS characters"
-        }
+        validateId(id)
+        validateText(text)
+        metadataValidator?.invoke(metadata)
 
         val nonNullClient = client
             ?: throw IllegalStateException("OpenAiEmbeddingClient is required for text embedding operations")
@@ -202,27 +199,19 @@ class SemanticMemoryIndex<T>(
         }
         if (stableItems.isEmpty()) return emptyList()
 
-        require(stableItems.size <= minOf(maxEntries, MAX_BATCH_SIZE)) {
-            "Batch size (${stableItems.size}) exceeds MAX_BATCH_SIZE ($MAX_BATCH_SIZE)"
+        for ((id, text, meta) in stableItems) {
+            validateId(id)
+            validateText(text)
+            metadataValidator?.invoke(meta)
         }
 
-        for ((id, text, _) in stableItems) {
-            require(id.isNotBlank()) { "id cannot be blank" }
-            require(id.length <= MAX_ID_CHARS) {
-                "id length ${id.length} exceeds maximum allowed length of $MAX_ID_CHARS characters"
-            }
-            require(text.isNotBlank()) { "text cannot be blank" }
-            require(text.length <= MAX_TEXT_CHARS) {
-                "text length ${text.length} exceeds maximum allowed length of $MAX_TEXT_CHARS characters"
-            }
-        }
-
-        val convergedItems = stableItems.associateBy { it.first }.values.toList()
+        val convergedMap = stableItems.associateBy { it.first }
+        val convergedItems = convergedMap.values.toList()
+        val uniqueNewIds = convergedMap.keys
 
         val nonNullClient = client
             ?: throw IllegalStateException("OpenAiEmbeddingClient is required for text embedding operations")
 
-        val uniqueNewIds = convergedItems.map { it.first }.toSet()
         rwLock.read {
             val newCount = uniqueNewIds.count { !entries.containsKey(it) }
             if (entries.size + newCount > maxEntries) {
@@ -233,7 +222,7 @@ class SemanticMemoryIndex<T>(
         }
 
         val allEmbeddings = ArrayList<FloatArray>(convergedItems.size)
-        for (chunk in convergedItems.chunked(EmbeddingRequest.MAX_BATCH_SIZE)) {
+        for (chunk in convergedItems.chunked(MAX_BATCH_SIZE)) {
             val response = nonNullClient.createEmbeddings(
                 EmbeddingRequest(
                     input = chunk.map { it.second },
@@ -256,10 +245,7 @@ class SemanticMemoryIndex<T>(
 
             var targetDim = dimension
             for (emb in allEmbeddings) {
-                require(emb.isNotEmpty()) { "embedding cannot be empty" }
-                require(emb.size <= MAX_SUPPORTED_DIMENSION) {
-                    "Embedding dimension ${emb.size} exceeds maximum supported dimension of $MAX_SUPPORTED_DIMENSION"
-                }
+                validateEmbedding(emb)
                 if (targetDim == null) {
                     targetDim = emb.size
                 } else if (targetDim != emb.size) {
@@ -286,18 +272,10 @@ class SemanticMemoryIndex<T>(
      *                                  or exceeds [MAX_SUPPORTED_DIMENSION], or dimension mismatches.
      */
     fun addDirect(id: String, text: String, embedding: FloatArray, metadata: T? = null): SemanticEntry<T> {
-        require(id.isNotBlank()) { "id cannot be blank" }
-        require(id.length <= MAX_ID_CHARS) {
-            "id length ${id.length} exceeds maximum allowed length of $MAX_ID_CHARS characters"
-        }
-        require(text.isNotBlank()) { "text cannot be blank" }
-        require(text.length <= MAX_TEXT_CHARS) {
-            "text length ${text.length} exceeds maximum allowed length of $MAX_TEXT_CHARS characters"
-        }
-        require(embedding.isNotEmpty()) { "embedding cannot be empty" }
-        require(embedding.size <= MAX_SUPPORTED_DIMENSION) {
-            "Embedding dimension ${embedding.size} exceeds maximum supported dimension of $MAX_SUPPORTED_DIMENSION"
-        }
+        validateId(id)
+        validateText(text)
+        validateEmbedding(embedding)
+        metadataValidator?.invoke(metadata)
 
         return rwLock.write {
             if (!entries.containsKey(id) && entries.size >= maxEntries) {
@@ -357,10 +335,7 @@ class SemanticMemoryIndex<T>(
      *                                  [k] is not in 1..[MAX_SEARCH_K], [minScore] is NaN, or dimensions mismatch.
      */
     fun searchByVector(queryVector: FloatArray, k: Int = 5, minScore: Float = 0.0f): List<SemanticSearchResult<T>> {
-        require(queryVector.isNotEmpty()) { "queryVector cannot be empty" }
-        require(queryVector.size <= MAX_SUPPORTED_DIMENSION) {
-            "Query vector dimension ${queryVector.size} exceeds maximum supported dimension of $MAX_SUPPORTED_DIMENSION"
-        }
+        validateQueryVector(queryVector)
         require(k in 1..MAX_SEARCH_K) { "k must be in 1..$MAX_SEARCH_K, was: $k" }
         require(!minScore.isNaN()) { "minScore cannot be NaN" }
 
@@ -372,19 +347,22 @@ class SemanticMemoryIndex<T>(
                 throw IllegalArgumentException("Query vector dimension mismatch: expected $curDim, got ${queryVector.size}")
             }
 
-            val candidates = ArrayList<ScoredEntry<T>>()
+            val minHeap = PriorityQueue<ScoredEntry<T>>(k + 1, compareBy { it.score })
             for (entry in entries.values) {
                 val score = VectorMath.cosineSimilarity(queryVector, entry.embedding)
                 if (score >= minScore) {
-                    candidates.add(ScoredEntry(entry, score))
+                    if (minHeap.size < k || score > minHeap.peek()!!.score) {
+                        minHeap.add(ScoredEntry(entry, score))
+                        if (minHeap.size > k) {
+                            minHeap.poll()
+                        }
+                    }
                 }
             }
 
-            candidates.sortByDescending { it.score }
-            val count = minOf(k, candidates.size)
-            val results = ArrayList<SemanticSearchResult<T>>(count)
-            for (i in 0 until count) {
-                val scored = candidates[i]
+            val results = ArrayList<SemanticSearchResult<T>>(minHeap.size)
+            while (minHeap.isNotEmpty()) {
+                val scored = minHeap.poll()!!
                 results.add(
                     SemanticSearchResult(
                         entry = scored.entry.copy(embedding = scored.entry.embedding.copyOf()),
@@ -392,6 +370,7 @@ class SemanticMemoryIndex<T>(
                     )
                 )
             }
+            results.reverse()
             results
         }
     }
@@ -403,10 +382,7 @@ class SemanticMemoryIndex<T>(
      * @throws IllegalArgumentException if [id] is blank or exceeds [MAX_ID_CHARS].
      */
     fun remove(id: String): Boolean {
-        require(id.isNotBlank()) { "id cannot be blank" }
-        require(id.length <= MAX_ID_CHARS) {
-            "id length ${id.length} exceeds maximum allowed length of $MAX_ID_CHARS characters"
-        }
+        validateId(id)
         return rwLock.write {
             val removed = entries.remove(id) != null
             if (entries.isEmpty()) {
@@ -437,12 +413,43 @@ class SemanticMemoryIndex<T>(
      * @throws IllegalArgumentException if [id] is blank or exceeds [MAX_ID_CHARS].
      */
     fun get(id: String): SemanticEntry<T>? {
+        validateId(id)
+        return rwLock.read {
+            entries[id]?.let { it.copy(embedding = it.embedding.copyOf()) }
+        }
+    }
+
+    private fun validateId(id: String) {
         require(id.isNotBlank()) { "id cannot be blank" }
         require(id.length <= MAX_ID_CHARS) {
             "id length ${id.length} exceeds maximum allowed length of $MAX_ID_CHARS characters"
         }
-        return rwLock.read {
-            entries[id]?.let { it.copy(embedding = it.embedding.copyOf()) }
+    }
+
+    private fun validateText(text: String) {
+        require(text.isNotBlank()) { "text cannot be blank" }
+        require(text.length <= MAX_TEXT_CHARS) {
+            "text length ${text.length} exceeds maximum allowed length of $MAX_TEXT_CHARS characters"
+        }
+    }
+
+    private fun validateEmbedding(embedding: FloatArray) {
+        require(embedding.isNotEmpty()) { "embedding cannot be empty" }
+        require(embedding.size <= MAX_SUPPORTED_DIMENSION) {
+            "Embedding dimension ${embedding.size} exceeds maximum supported dimension of $MAX_SUPPORTED_DIMENSION"
+        }
+        for (x in embedding) {
+            require(x.isFinite()) { "embedding components must be finite (no NaN or Infinity)" }
+        }
+    }
+
+    private fun validateQueryVector(queryVector: FloatArray) {
+        require(queryVector.isNotEmpty()) { "queryVector cannot be empty" }
+        require(queryVector.size <= MAX_SUPPORTED_DIMENSION) {
+            "Query vector dimension ${queryVector.size} exceeds maximum supported dimension of $MAX_SUPPORTED_DIMENSION"
+        }
+        for (x in queryVector) {
+            require(x.isFinite()) { "queryVector components must be finite (no NaN or Infinity)" }
         }
     }
 

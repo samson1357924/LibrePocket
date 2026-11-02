@@ -2118,11 +2118,7 @@ class ResponsesProviderTest {
         val completed = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I cannot fulfill this request"}]}]}}""",
         )
-        assertTrue(
-            "completed must not repeat the consumed suffix: $completed",
-            completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty(),
-        )
-        assertEquals(StreamEvent.Done("stop"), completed.last())
+        assertEquals(listOf(StreamEvent.Done("stop")), completed)
     }
 
     @Test
@@ -2146,11 +2142,7 @@ class ResponsesProviderTest {
         val completed = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I cannot fulfill this request"}]}]}}""",
         )
-        assertTrue(
-            "completed must not repeat the consumed suffix: $completed",
-            completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty(),
-        )
-        assertEquals(StreamEvent.Done("stop"), completed.last())
+        assertEquals(listOf(StreamEvent.Done("stop")), completed)
     }
 
     @Test
@@ -2174,11 +2166,7 @@ class ResponsesProviderTest {
         val completed = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"refusal","refusal":"I cannot fulfill this request"}]}]}}""",
         )
-        assertTrue(
-            "completed must not repeat the consumed suffix: $completed",
-            completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty(),
-        )
-        assertEquals(StreamEvent.Done("stop"), completed.last())
+        assertEquals(listOf(StreamEvent.Done("stop")), completed)
     }
 
     @Test
@@ -2202,11 +2190,7 @@ class ResponsesProviderTest {
         val completed = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"refusal","id":"ref_1","refusal":"I cannot fulfill this request"}]}}""",
         )
-        assertTrue(
-            "completed must not repeat the consumed suffix: $completed",
-            completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty(),
-        )
-        assertEquals(StreamEvent.Done("stop"), completed.last())
+        assertEquals(listOf(StreamEvent.Done("stop")), completed)
     }
 
     @Test
@@ -2235,21 +2219,17 @@ class ResponsesProviderTest {
         val partDone = mapper.mapPayload(
             """{"type":"response.content_part.done","item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"refusal","refusal":"I cannot fulfill this request"}}""",
         )
-        assertTrue(partDone.filterIsInstance<StreamEvent.TextDelta>().isEmpty())
+        assertEquals(emptyList<StreamEvent>(), partDone)
 
         val itemDone = mapper.mapPayload(
             """{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"refusal","refusal":"I cannot fulfill this request"}]}}""",
         )
-        assertTrue(itemDone.filterIsInstance<StreamEvent.TextDelta>().isEmpty())
+        assertEquals(emptyList<StreamEvent>(), itemDone)
 
         val completed = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"refusal","refusal":"I cannot fulfill this request"}]}]}}""",
         )
-        assertTrue(
-            "completed must not repeat the consumed suffix: $completed",
-            completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty(),
-        )
-        assertEquals(StreamEvent.Done("stop"), completed.last())
+        assertEquals(listOf(StreamEvent.Done("stop")), completed)
     }
 
     @Test
@@ -2268,8 +2248,7 @@ class ResponsesProviderTest {
         val completed = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","refusal":"I cannot fulfill this request"}]}}""",
         )
-        assertTrue(completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty())
-        assertEquals(StreamEvent.Done("stop"), completed.last())
+        assertEquals(listOf(StreamEvent.Done("stop")), completed)
     }
 
     @Test
@@ -2292,15 +2271,14 @@ class ResponsesProviderTest {
         )
         assertEquals(
             listOf(StreamEvent.TextDelta(0, 0, "I cannot assist with this request.")),
-            doneEvents.filterIsInstance<StreamEvent.TextDelta>(),
+            doneEvents,
         )
 
         // Following completed does not re-emit the text
         val completedEvents = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"refusal","refusal":"I cannot assist with this request."}]}]}}""",
         )
-        assertTrue(completedEvents.filterIsInstance<StreamEvent.TextDelta>().isEmpty())
-        assertEquals(StreamEvent.Done("stop"), completedEvents.last())
+        assertEquals(listOf(StreamEvent.Done("stop")), completedEvents)
 
         // Direct output_item.done with top-level refusal item
         val mapperTopLevel = ResponsesMapper()
@@ -2309,14 +2287,13 @@ class ResponsesProviderTest {
         )
         assertEquals(
             listOf(StreamEvent.TextDelta(0, 0, "Top-level refusal without delta")),
-            doneTopLevel.filterIsInstance<StreamEvent.TextDelta>(),
+            doneTopLevel,
         )
 
         val completedTopLevel = mapperTopLevel.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"refusal","id":"ref_top","refusal":"Top-level refusal without delta"}]}}""",
         )
-        assertTrue(completedTopLevel.filterIsInstance<StreamEvent.TextDelta>().isEmpty())
-        assertEquals(StreamEvent.Done("stop"), completedTopLevel.last())
+        assertEquals(listOf(StreamEvent.Done("stop")), completedTopLevel)
     }
 
     @Test
@@ -2327,10 +2304,12 @@ class ResponsesProviderTest {
             """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"Immediate terminal refusal"}]}]}}""",
         )
         assertEquals(
-            listOf(StreamEvent.TextDelta(0, 0, "Immediate terminal refusal")),
-            events.filterIsInstance<StreamEvent.TextDelta>(),
+            listOf(
+                StreamEvent.TextDelta(0, 0, "Immediate terminal refusal"),
+                StreamEvent.Done("stop"),
+            ),
+            events,
         )
-        assertEquals(StreamEvent.Done("stop"), events.last())
 
         // Top-level refusal item shape in response.completed without prior frames
         val mapperTopLevel = ResponsesMapper()
@@ -2338,10 +2317,12 @@ class ResponsesProviderTest {
             """{"type":"response.completed","response":{"output":[{"type":"refusal","id":"ref_2","refusal":"Direct completed refusal"}]}}""",
         )
         assertEquals(
-            listOf(StreamEvent.TextDelta(0, 0, "Direct completed refusal")),
-            eventsTopLevel.filterIsInstance<StreamEvent.TextDelta>(),
+            listOf(
+                StreamEvent.TextDelta(0, 0, "Direct completed refusal"),
+                StreamEvent.Done("stop"),
+            ),
+            eventsTopLevel,
         )
-        assertEquals(StreamEvent.Done("stop"), eventsTopLevel.last())
     }
 
     @Test
@@ -2373,11 +2354,7 @@ class ResponsesProviderTest {
         val completed = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_text","role":"assistant","content":[{"type":"output_text","text":"Hello! I can explain the rules."}]},{"type":"message","id":"msg_refusal","role":"assistant","content":[{"type":"refusal","refusal":"However, I cannot bypass security."}]}]}}""",
         )
-        assertTrue(
-            "completed must not duplicate consumed text or refusal: $completed",
-            completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty(),
-        )
-        assertEquals(StreamEvent.Done("stop"), completed.last())
+        assertEquals(listOf(StreamEvent.Done("stop")), completed)
     }
 
     @Test
@@ -2397,13 +2374,12 @@ class ResponsesProviderTest {
         val done = mapper.mapPayload(
             """{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Safe preamble. "},{"type":"refusal","refusal":"Cannot execute command."}]}}""",
         )
-        assertTrue(done.filterIsInstance<StreamEvent.TextDelta>().isEmpty())
+        assertEquals(emptyList<StreamEvent>(), done)
 
         val completed = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Safe preamble. "},{"type":"refusal","refusal":"Cannot execute command."}]}]}}""",
         )
-        assertTrue(completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty())
-        assertEquals(StreamEvent.Done("stop"), completed.last())
+        assertEquals(listOf(StreamEvent.Done("stop")), completed)
     }
 
     @Test
@@ -2429,11 +2405,14 @@ class ResponsesProviderTest {
                     ChatRequest(model = "gpt-4o", messages = listOf(ChatMessage("user", "Hello"))),
                 ).toList()
             }
-            val textDeltas = events.filterIsInstance<StreamEvent.TextDelta>()
-            assertEquals(listOf("Hello", " world!"), textDeltas.map { it.delta })
-            assertTrue("last event must be Done: $events", events.last() is StreamEvent.Done)
-            assertEquals("stop", (events.last() as StreamEvent.Done).finishReason)
-            assertTrue("must not have any Failed event: $events", events.none { it is StreamEvent.Failed })
+            assertEquals(
+                listOf(
+                    StreamEvent.TextDelta(0, 0, "Hello"),
+                    StreamEvent.TextDelta(0, 0, " world!"),
+                    StreamEvent.Done("stop"),
+                ),
+                events,
+            )
         } finally {
             server.shutdown()
         }
@@ -2466,11 +2445,14 @@ class ResponsesProviderTest {
                     ),
                 ).toList()
             }
-            val textDeltas = events.filterIsInstance<StreamEvent.TextDelta>()
-            assertEquals(listOf("I cannot ", "comply."), textDeltas.map { it.delta })
-            val done = events.last() as StreamEvent.Done
-            assertEquals("stop", done.finishReason)
-            assertTrue("must not have any Failed event: $events", events.none { it is StreamEvent.Failed })
+            assertEquals(
+                listOf(
+                    StreamEvent.TextDelta(0, 0, "I cannot "),
+                    StreamEvent.TextDelta(0, 0, "comply."),
+                    StreamEvent.Done("stop"),
+                ),
+                events,
+            )
         } finally {
             server.shutdown()
         }

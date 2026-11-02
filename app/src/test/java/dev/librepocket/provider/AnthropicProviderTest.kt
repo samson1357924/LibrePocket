@@ -504,12 +504,9 @@ class AnthropicProviderTest {
             responseFormat = ResponseFormat.JsonObject,
         )
         val jsonObjectEvents = provider.stream(jsonObjectRequest).toList()
-        assertEquals(1, jsonObjectEvents.size)
-        val jsonObjectFailed = jsonObjectEvents.single() as StreamEvent.Failed
-        assertFalse("failure must not be retryable", jsonObjectFailed.retryable)
-        assertTrue(
-            "failure message must contain STRUCTURED_OUTPUTS_NOT_SUPPORTED: ${jsonObjectFailed.message}",
-            jsonObjectFailed.message.contains("STRUCTURED_OUTPUTS_NOT_SUPPORTED"),
+        assertEquals(
+            listOf(StreamEvent.Failed("STRUCTURED_OUTPUTS_NOT_SUPPORTED", retryable = false)),
+            jsonObjectEvents,
         )
 
         // ResponseFormat.JsonSchema
@@ -522,12 +519,9 @@ class AnthropicProviderTest {
             ),
         )
         val jsonSchemaEvents = provider.stream(jsonSchemaRequest).toList()
-        assertEquals(1, jsonSchemaEvents.size)
-        val jsonSchemaFailed = jsonSchemaEvents.single() as StreamEvent.Failed
-        assertFalse("failure must not be retryable", jsonSchemaFailed.retryable)
-        assertTrue(
-            "failure message must contain STRUCTURED_OUTPUTS_NOT_SUPPORTED: ${jsonSchemaFailed.message}",
-            jsonSchemaFailed.message.contains("STRUCTURED_OUTPUTS_NOT_SUPPORTED"),
+        assertEquals(
+            listOf(StreamEvent.Failed("STRUCTURED_OUTPUTS_NOT_SUPPORTED", retryable = false)),
+            jsonSchemaEvents,
         )
     }
 }

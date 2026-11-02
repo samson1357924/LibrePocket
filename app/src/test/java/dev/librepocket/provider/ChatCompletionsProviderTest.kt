@@ -1,9 +1,14 @@
 package dev.librepocket.provider
 
+import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -13,10 +18,10 @@ import org.junit.Test
 
 class ChatCompletionsProviderTest {
 
-    private fun testConfig() = ProviderConfig(
+    private fun testConfig(baseUrl: String = "https://api.openai.com/v1") = ProviderConfig(
         id = "00000000-0000-0000-0000-000000000001",
         label = "test",
-        baseUrl = "https://api.openai.com/v1",
+        baseUrl = baseUrl,
         protocol = ProviderProtocol.CHAT_COMPLETIONS,
         apiKeyRef = "provider_key/00000000-0000-0000-0000-000000000001",
     )
@@ -48,7 +53,7 @@ class ChatCompletionsProviderTest {
             ResponseFormat.JsonSchema(name = "invalid name with spaces", schemaJson = "{}")
             fail("expected invalid name to throw")
         } catch (e: IllegalArgumentException) {
-            assertTrue(e.message?.contains("name must match") == true)
+            assertEquals("name must match ^[a-zA-Z0-9_-]{1,64}$, was: invalid name with spaces", e.message)
         }
 
         // Overlength name (> 64 chars) rejected
@@ -56,7 +61,7 @@ class ChatCompletionsProviderTest {
             ResponseFormat.JsonSchema(name = "a".repeat(65), schemaJson = "{}")
             fail("expected >64 name to throw")
         } catch (e: IllegalArgumentException) {
-            assertTrue(e.message?.contains("name must match") == true)
+            assertEquals("name must match ^[a-zA-Z0-9_-]{1,64}$, was: ${"a".repeat(65)}", e.message)
         }
 
         // Blank schemaJson rejected
@@ -85,7 +90,7 @@ class ChatCompletionsProviderTest {
             ResponseFormat.JsonSchema(name = "a".repeat(65), schemaJson = "{}")
             fail("expected name of length 65 to throw IllegalArgumentException")
         } catch (e: IllegalArgumentException) {
-            assertTrue(e.message?.contains("name must match") == true)
+            assertEquals("name must match ^[a-zA-Z0-9_-]{1,64}$, was: ${"a".repeat(65)}", e.message)
         }
 
         // Invalid characters: @, ., /, $, and Chinese characters
@@ -102,7 +107,7 @@ class ChatCompletionsProviderTest {
                 ResponseFormat.JsonSchema(name = badName, schemaJson = "{}")
                 fail("expected invalid name '$badName' to throw IllegalArgumentException")
             } catch (e: IllegalArgumentException) {
-                assertTrue(e.message?.contains("name must match") == true)
+                assertEquals("name must match ^[a-zA-Z0-9_-]{1,64}$, was: $badName", e.message)
             }
         }
     }
@@ -358,15 +363,13 @@ class ChatCompletionsProviderTest {
         mapper.markDone()
         events += mapper.finish()
 
-        val textDeltas = events.filterIsInstance<StreamEvent.TextDelta>()
-        assertEquals(1, textDeltas.size)
-        assertEquals("I cannot fulfill this request", textDeltas[0].delta)
-        assertEquals(0, textDeltas[0].round)
-        assertEquals(0, textDeltas[0].blockIndex)
-
-        val doneEvents = events.filterIsInstance<StreamEvent.Done>()
-        assertEquals(1, doneEvents.size)
-        assertEquals("refusal", doneEvents[0].finishReason)
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "I cannot fulfill this request"),
+                StreamEvent.Done("refusal"),
+            ),
+            events,
+        )
     }
 
     @Test
@@ -389,9 +392,14 @@ class ChatCompletionsProviderTest {
         }
         events += mapper.finish()
 
-        val textDeltas = events.filterIsInstance<StreamEvent.TextDelta>()
-        assertEquals(listOf("I cannot", " fulfill this request"), textDeltas.map { it.delta })
-        assertEquals(StreamEvent.Done("refusal"), events.last())
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "I cannot"),
+                StreamEvent.TextDelta(0, 0, " fulfill this request"),
+                StreamEvent.Done("refusal"),
+            ),
+            events,
+        )
     }
 
     @Test
@@ -400,14 +408,13 @@ class ChatCompletionsProviderTest {
         val events = mapper.mapPayload(
             """{"choices":[{"message":{"role":"assistant","refusal":"I cannot fulfill this request"},"finish_reason":"refusal"}]}""",
         )
-        val textDeltas = events.filterIsInstance<StreamEvent.TextDelta>()
-        assertEquals(1, textDeltas.size)
-        assertEquals("I cannot fulfill this request", textDeltas[0].delta)
+        assertEquals(
+            listOf(StreamEvent.TextDelta(0, 0, "I cannot fulfill this request")),
+            events,
+        )
         mapper.markDone()
         val finishEvents = mapper.finish()
-        val doneEvents = finishEvents.filterIsInstance<StreamEvent.Done>()
-        assertEquals(1, doneEvents.size)
-        assertEquals("refusal", doneEvents[0].finishReason)
+        assertEquals(listOf(StreamEvent.Done("refusal")), finishEvents)
     }
 
     @Test
@@ -416,16 +423,16 @@ class ChatCompletionsProviderTest {
         val emptyEvents = mapper.mapPayload(
             """{"choices":[{"delta":{"refusal":""}}]}""",
         )
-        assertTrue("empty refusal delta must not produce TextDelta: $emptyEvents", emptyEvents.filterIsInstance<StreamEvent.TextDelta>().isEmpty())
-        assertTrue("empty refusal delta must produce no events: $emptyEvents", emptyEvents.isEmpty())
+        assertEquals(emptyList<StreamEvent>(), emptyEvents)
 
         // Following non-empty refusal delta produces TextDelta
         val nextEvents = mapper.mapPayload(
             """{"choices":[{"delta":{"refusal":"I cannot fulfill this request"}}]}""",
         )
-        val textDeltas = nextEvents.filterIsInstance<StreamEvent.TextDelta>()
-        assertEquals(1, textDeltas.size)
-        assertEquals("I cannot fulfill this request", textDeltas.single().delta)
+        assertEquals(
+            listOf(StreamEvent.TextDelta(0, 0, "I cannot fulfill this request")),
+            nextEvents,
+        )
     }
 
     @Test
@@ -438,10 +445,6 @@ class ChatCompletionsProviderTest {
         )
         mapper1.markDone()
         events1 += mapper1.finish()
-        assertTrue("events must not contain TextDelta: $events1", events1.none { it is StreamEvent.TextDelta })
-        val doneEvents1 = events1.filterIsInstance<StreamEvent.Done>()
-        assertEquals(1, doneEvents1.size)
-        assertEquals("refusal", doneEvents1.single().finishReason)
         assertEquals(listOf(StreamEvent.Done("refusal")), events1)
 
         // Case 2: Explicit empty string refusal with finish_reason: refusal
@@ -452,10 +455,6 @@ class ChatCompletionsProviderTest {
         )
         mapper2.markDone()
         events2 += mapper2.finish()
-        assertTrue("events must not contain TextDelta: $events2", events2.none { it is StreamEvent.TextDelta })
-        val doneEvents2 = events2.filterIsInstance<StreamEvent.Done>()
-        assertEquals(1, doneEvents2.size)
-        assertEquals("refusal", doneEvents2.single().finishReason)
         assertEquals(listOf(StreamEvent.Done("refusal")), events2)
     }
 
@@ -471,16 +470,13 @@ class ChatCompletionsProviderTest {
         mapper.markDone()
         events += mapper.finish()
 
-        val textDeltas = events.filterIsInstance<StreamEvent.TextDelta>()
-        assertEquals(1, textDeltas.size)
-        val textDelta = textDeltas.single()
-        assertEquals(2, textDelta.round)
-        assertEquals("Refusal at round 2", textDelta.delta)
-        assertEquals(0, textDelta.blockIndex)
-
-        val doneEvents = events.filterIsInstance<StreamEvent.Done>()
-        assertEquals(1, doneEvents.size)
-        assertEquals("refusal", doneEvents.single().finishReason)
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(2, 0, "Refusal at round 2"),
+                StreamEvent.Done("refusal"),
+            ),
+            events,
+        )
     }
 
     @Test
@@ -489,28 +485,114 @@ class ChatCompletionsProviderTest {
         val r1 = mapper.mapPayload(
             """{"choices":[{"delta":{"reasoning_content":"Thinking about safety guidelines..."}}]}""",
         )
-        val reasoningDeltas = r1.filterIsInstance<StreamEvent.ReasoningDelta>()
-        assertEquals(1, reasoningDeltas.size)
-        assertEquals(0, reasoningDeltas.single().blockIndex)
-        assertEquals("Thinking about safety guidelines...", reasoningDeltas.single().delta)
+        assertEquals(
+            listOf(StreamEvent.ReasoningDelta(0, 0, "Thinking about safety guidelines...")),
+            r1,
+        )
 
         // Immediately followed by refusal delta -> blockIndex switches from reasoning to text
         val r2 = mapper.mapPayload(
             """{"choices":[{"delta":{"refusal":"I cannot fulfill this request."}}]}""",
         )
-        val textDeltas = r2.filterIsInstance<StreamEvent.TextDelta>()
-        assertEquals(1, textDeltas.size)
-        val refusalDelta = textDeltas.single()
-        assertEquals("blockIndex must increment when switching from reasoning to refusal", 1, refusalDelta.blockIndex)
-        assertEquals("I cannot fulfill this request.", refusalDelta.delta)
+        assertEquals(
+            listOf(StreamEvent.TextDelta(0, 1, "I cannot fulfill this request.")),
+            r2,
+        )
 
         // Continuation refusal chunks keep the switched blockIndex
         val r3 = mapper.mapPayload(
             """{"choices":[{"delta":{"refusal":" Policy forbids this action."}}]}""",
         )
-        val textDeltasCont = r3.filterIsInstance<StreamEvent.TextDelta>()
-        assertEquals(1, textDeltasCont.size)
-        assertEquals(1, textDeltasCont.single().blockIndex)
-        assertEquals(" Policy forbids this action.", textDeltasCont.single().delta)
+        assertEquals(
+            listOf(StreamEvent.TextDelta(0, 1, " Policy forbids this action.")),
+            r3,
+        )
+    }
+
+    @Test
+    fun streamFlowCollectsRefusalDeltasAndDoneSuccessfully() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val body =
+                "data: {\"choices\":[{\"delta\":{\"refusal\":\"I cannot \"}}]}\n\n" +
+                    "data: {\"choices\":[{\"delta\":{\"refusal\":\"comply with this request.\"},\"finish_reason\":\"refusal\"}]}\n\n" +
+                    "data: [DONE]\n\n"
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(body),
+            )
+            val provider = ChatCompletionsProvider(
+                testConfig(server.url("/").toString().trimEnd('/')),
+                { "test_api_key".toCharArray() },
+            )
+            val events = withTimeout(10_000) {
+                provider.stream(
+                    ChatRequest(
+                        model = "gpt-4o",
+                        messages = listOf(ChatMessage("user", "Do something bad")),
+                        responseFormat = ResponseFormat.JsonObject,
+                    ),
+                ).toList()
+            }
+            assertEquals(
+                listOf(
+                    StreamEvent.TextDelta(0, 0, "I cannot "),
+                    StreamEvent.TextDelta(0, 0, "comply with this request."),
+                    StreamEvent.Done("refusal"),
+                ),
+                events,
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun streamFlowCollectsJsonSchemaDeltasAndDoneSuccessfully() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val body =
+                "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"status\\\":\\\"ok\\\"}\"},\"finish_reason\":\"stop\"}]}\n\n" +
+                    "data: [DONE]\n\n"
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(body),
+            )
+            val provider = ChatCompletionsProvider(
+                testConfig(server.url("/").toString().trimEnd('/')),
+                { "test_api_key".toCharArray() },
+            )
+            val rf = ResponseFormat.JsonSchema(
+                name = "test_status",
+                schemaJson = """{"type":"object"}""",
+            )
+            val events = withTimeout(10_000) {
+                provider.stream(
+                    ChatRequest(
+                        model = "gpt-4o",
+                        messages = listOf(ChatMessage("user", "Give status")),
+                        responseFormat = rf,
+                    ),
+                ).toList()
+            }
+            val recorded = server.takeRequest()
+            val requestBody = recorded.body.readUtf8()
+            val root = Json.parseToJsonElement(requestBody).jsonObject
+            assertEquals("json_schema", root["response_format"]!!.jsonObject["type"]!!.jsonPrimitive.content)
+
+            assertEquals(
+                listOf(
+                    StreamEvent.TextDelta(0, 0, "{\"status\":\"ok\"}"),
+                    StreamEvent.Done("stop"),
+                ),
+                events,
+            )
+        } finally {
+            server.shutdown()
+        }
     }
 }

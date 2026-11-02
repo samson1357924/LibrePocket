@@ -1,6 +1,7 @@
 package dev.librepocket.voice
 
 import dev.librepocket.tool.DenyReason
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -70,6 +71,33 @@ class VoiceDisclosureTest {
         assertTrue(VoiceTts.SPEAK_BUTTON_DESCRIPTION.contains(VoiceTts.ENGINE_DISCLOSURE))
         assertFalse(VoiceTts.SPEAK_BUTTON_DESCRIPTION.contains("本地"))
         assertFalse(VoiceTts.ENGINE_DISCLOSURE.contains("本地"))
+    }
+
+    @Test fun openAiVoiceDisclosure_containsAiAndBoundedBufferCopy() {
+        assertTrue(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("本功能語音為 AI 生成，非真人聲音（AI-generated voice, not a human voice）"))
+        assertTrue(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("音檔採受限記憶體緩衝播放（不寫入儲存空間，上限 25MB）"))
+        assertEquals(
+            "本功能語音為 AI 生成，非真人聲音（AI-generated voice, not a human voice）",
+            VoiceTools.OPENAI_VOICE_AI_DISCLOSURE,
+        )
+        assertEquals(
+            "音檔採受限記憶體緩衝播放（不寫入儲存空間，上限 25MB）",
+            VoiceTools.OPENAI_VOICE_BUFFER_DISCLOSURE,
+        )
+    }
+
+    @Test fun openAiTts_legacyBridgeAndTransitionConstants() {
+        assertEquals("2027-01-06", OpenAiTtsModels.SUNSET_DATE)
+        assertEquals("gpt-realtime-2.1-mini", OpenAiTtsModels.MIGRATION_TARGET)
+        assertTrue(OpenAiTtsModels.IS_LEGACY_BRIDGE)
+
+        assertEquals(OpenAiTtsModels.SUNSET_DATE, OpenAiTtsClient.SUNSET_DATE)
+        assertEquals(OpenAiTtsModels.MIGRATION_TARGET, OpenAiTtsClient.MIGRATION_TARGET)
+        assertTrue(OpenAiTtsClient.IS_LEGACY_BRIDGE)
+
+        assertEquals(OpenAiTtsModels.SUNSET_DATE, OpenAiSpeechEngine.SUNSET_DATE)
+        assertEquals(OpenAiTtsModels.MIGRATION_TARGET, OpenAiSpeechEngine.MIGRATION_TARGET)
+        assertTrue(OpenAiSpeechEngine.IS_LEGACY_BRIDGE)
     }
 
     // ---- 首次揭露確認（#2 行為，不釘原始碼字串） ----
@@ -174,6 +202,15 @@ class VoiceDisclosureTest {
         ).readText()
         assertTrue(settings.contains("VoiceTts.ENGINE_DISCLOSURE"))
         assertFalse(settings.contains("本地引擎"))
+    }
+
+    @Test fun settings_openAiVoiceCardDisclosesAiAndBoundedBufferCopy() {
+        val settings = findSource(
+            "src/main/java/dev/librepocket/agent/ui/settings/SettingsScreen.kt",
+            "app/src/main/java/dev/librepocket/agent/ui/settings/SettingsScreen.kt",
+        ).readText()
+        assertTrue(settings.contains("VoiceTools.OPENAI_VOICE_DISCLOSURE"))
+        assertFalse(settings.contains("音檔採純記憶體串流播放不落地"))
     }
 
     @Test fun manifestDeclaresTtsServiceVisibility() {

@@ -14,21 +14,23 @@ import dev.librepocket.redact.Redactor
  *   在此之前投影 NATIVE 僅表示開關語義，實際呼叫走系統語音降級
  *   （見 ToolRegistry fallbackHint）。接線 PR 翻轉此註記並附端到端測試。
  *
- * 隱私不變量（S2 鎖定）：
+ * 隱私不變量與揭露（S2 鎖定 / Phase B 校準）：
  * - 語音正文寫入 [RoomSessionStore][dev.librepocket.session.RoomSessionStore]
  *   前一律走 [Redactor.redact]（該類寫路徑已全覆蓋，此處再收斂一次）；
  * - 音檔不落地：麥克風音訊只駐留記憶體，絕不寫檔；
- * - 送雲（Azure）前再 redact 一次，設定頁明示此行為。
+ * - 雲端語音（Azure / OpenAI）自動上傳路徑維持送雲前 redact（[redactForCloud]），設定頁明示此行為；
+ * - 雲端語音（OpenAI）明確揭露為 AI 生成非真人聲音（[OPENAI_VOICE_AI_DISCLOSURE]），
+ *   音檔採受限記憶體緩衝播放（上限 25MB，不寫入儲存空間，見 [OPENAI_VOICE_BUFFER_DISCLOSURE]）；
  * - 系統 TTS 手勢路徑採明確揭露（逐則點按 + 引擎揭露文案，
  *   見 [VoiceTts.SPEAK_BUTTON_DESCRIPTION][dev.librepocket.voice.VoiceTts]），
- *   不做送引擎前 redact（避免朗讀遮罩 token；可見原文即使用者點按的當則訊息）；
- *   雲端（Azure）自動上傳路徑維持送雲前 redact（[redactForCloud]）。
+ *   不做送引擎前 redact（避免朗讀遮罩 token；可見原文即使用者點按的當則訊息）。
  */
 object VoiceTools {
 
     const val TRANSCRIBE_NAME = "voice.transcribe"
     const val SPEAK_NAME = "voice.speak"
     const val AZURE_SPEAK_NAME = "voice.speak.azure"
+    const val OPENAI_SPEAK_NAME = "voice.speak.openai"
 
     const val SWITCH_INPUT = "voice_input"
     const val SWITCH_INPUT_DEFAULT = true
@@ -39,8 +41,24 @@ object VoiceTools {
     const val SWITCH_AZURE = "azure_tts"
     const val SWITCH_AZURE_DEFAULT = false
 
+    const val SWITCH_OPENAI = "openai_tts"
+    const val SWITCH_OPENAI_DEFAULT = false
+
     /** KeyVault providerId：Azure Speech 金鑰（僅 github 版使用）。 */
     const val AZURE_KEY_REF = "azure_speech"
+
+    /** KeyVault providerId：OpenAI TTS 金鑰。 */
+    const val OPENAI_KEY_REF = "openai_tts"
+
+    /**
+     * OpenAI TTS 揭露常數：
+     * - AI 生成語音說明：本功能語音為 AI 生成，非真人聲音（AI-generated voice, not a human voice）
+     * - 受限記憶體緩衝播放說明：音檔採受限記憶體緩衝播放（不寫入儲存空間，上限 25MB）
+     */
+    const val OPENAI_VOICE_AI_DISCLOSURE = "本功能語音為 AI 生成，非真人聲音（AI-generated voice, not a human voice）"
+    const val OPENAI_VOICE_BUFFER_DISCLOSURE = "音檔採受限記憶體緩衝播放（不寫入儲存空間，上限 25MB）"
+    const val OPENAI_VOICE_DISCLOSURE =
+        OPENAI_VOICE_AI_DISCLOSURE + "；" + OPENAI_VOICE_BUFFER_DISCLOSURE
 
     const val FALLBACK_STT_HINT = "type the message manually in the input box"
     const val FALLBACK_TTS_HINT = "read the message text on screen manually"
@@ -75,6 +93,14 @@ object VoiceTools {
     fun outputEnabled(snapshot: VoiceSwitchSnapshot): Boolean =
         snapshot.loaded && !snapshot.loadFailed && outputEnabled(snapshot.switches)
 
+    /** 見 [outputEnabled]（`openai_tts` 預設關）。 */
+    fun openAiTtsEnabled(switches: Map<String, Boolean>): Boolean =
+        switches.getOrDefault(SWITCH_OPENAI, SWITCH_OPENAI_DEFAULT)
+
+    /** 見 [outputEnabled]（快照三態門禁，`openai_tts` 側）。 */
+    fun openAiTtsEnabled(snapshot: VoiceSwitchSnapshot): Boolean =
+        snapshot.loaded && !snapshot.loadFailed && openAiTtsEnabled(snapshot.switches)
+
     /**
      * 投影用開關（R4-2）：同一快照在 loadFailed 時兩鍵視為關（fail-closed），
      * 避免 UI 隱藏但 tool 仍可用的分叉；loading 態照常回 map（缺鍵即產品預設）。
@@ -84,7 +110,11 @@ object VoiceTools {
      */
     fun projectionSwitches(snapshot: VoiceSwitchSnapshot): Map<String, Boolean> =
         if (snapshot.loadFailed) {
-            snapshot.switches + mapOf(SWITCH_INPUT to false, SWITCH_OUTPUT to false)
+            snapshot.switches + mapOf(
+                SWITCH_INPUT to false,
+                SWITCH_OUTPUT to false,
+                SWITCH_OPENAI to false,
+            )
         } else {
             snapshot.switches
         }

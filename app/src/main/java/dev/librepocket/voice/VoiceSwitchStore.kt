@@ -21,6 +21,7 @@ private val Context.voiceDataStore by preferencesDataStore(
 
 internal val VOICE_INPUT_ENABLED_KEY = booleanPreferencesKey(VoiceTools.SWITCH_INPUT)
 internal val VOICE_OUTPUT_ENABLED_KEY = booleanPreferencesKey(VoiceTools.SWITCH_OUTPUT)
+internal val VOICE_OPENAI_TTS_ENABLED_KEY = booleanPreferencesKey(VoiceTools.SWITCH_OPENAI)
 internal val VOICE_TTS_DISCLOSURE_ACK_KEY = booleanPreferencesKey("voice_tts_disclosure_ack")
 
 // 語音持久化讀取失敗的可觀測性（仿 MainScreen 類名字串 TAG 的 Log.w 先例）。
@@ -98,13 +99,14 @@ class VoiceSwitchStore(
 ) {
     constructor(context: Context) : this(context.applicationContext.voiceDataStore)
 
-    /** 開關快照三態（首發射為 loading；兩鍵恆在，缺鍵填預設值；讀錯為 loadFailed 全關）。 */
+    /** 開關快照三態（首發射為 loading；三鍵恆在，缺鍵填預設值；讀錯為 loadFailed 全關）。 */
     fun observeSwitches(): Flow<VoiceSwitchSnapshot> = dataStore.data
         .map { prefs ->
             VoiceSwitchSnapshot(
                 switches = mapOf(
                     VoiceTools.SWITCH_INPUT to (prefs[VOICE_INPUT_ENABLED_KEY] ?: VoiceTools.SWITCH_INPUT_DEFAULT),
                     VoiceTools.SWITCH_OUTPUT to (prefs[VOICE_OUTPUT_ENABLED_KEY] ?: VoiceTools.SWITCH_OUTPUT_DEFAULT),
+                    VoiceTools.SWITCH_OPENAI to (prefs[VOICE_OPENAI_TTS_ENABLED_KEY] ?: VoiceTools.SWITCH_OPENAI_DEFAULT),
                 ),
                 loaded = true,
                 loadFailed = false,
@@ -124,6 +126,7 @@ class VoiceSwitchStore(
                         switches = mapOf(
                             VoiceTools.SWITCH_INPUT to false,
                             VoiceTools.SWITCH_OUTPUT to false,
+                            VoiceTools.SWITCH_OPENAI to false,
                         ),
                         loaded = true,
                         loadFailed = true,
@@ -164,6 +167,12 @@ class VoiceSwitchStore(
     suspend fun setOutputEnabled(enabled: Boolean) {
         withContext(ioDispatcher) {
             dataStore.edit { prefs -> prefs[VOICE_OUTPUT_ENABLED_KEY] = enabled }
+        }
+    }
+
+    suspend fun setOpenAiTtsEnabled(enabled: Boolean) {
+        withContext(ioDispatcher) {
+            dataStore.edit { prefs -> prefs[VOICE_OPENAI_TTS_ENABLED_KEY] = enabled }
         }
     }
 

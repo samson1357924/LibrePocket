@@ -263,6 +263,7 @@ fun MainScreen(
                 privilegeAuditCount = privilegeAuditCount,
                 voiceInputEnabled = VoiceTools.inputEnabled(voiceEffectiveSnapshot),
                 voiceOutputEnabled = VoiceTools.outputEnabled(voiceEffectiveSnapshot),
+                openAiTtsEnabled = VoiceTools.openAiTtsEnabled(voiceEffectiveSnapshot),
                 voiceSwitchesEnabled = voiceEffectiveSnapshot.loaded && !voiceEffectiveSnapshot.loadFailed,
                 voiceLoadFailed = voiceEffectiveSnapshot.loadFailed,
                 onVoiceInputSwitch = { enabled ->
@@ -284,6 +285,17 @@ fun MainScreen(
                             throw e
                         } catch (e: Exception) {
                             Log.w(TAG, "voice output switch persist failed", e)
+                        }
+                    }
+                },
+                onOpenAiTtsSwitch = { enabled ->
+                    scope.launch {
+                        try {
+                            voiceStore.setOpenAiTtsEnabled(enabled)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "openai tts switch persist failed", e)
                         }
                     }
                 },

@@ -1346,4 +1346,97 @@ class ChatMarkdownParserTest {
             assertTrue(annotated.text.isNotEmpty())
         }
     }
+
+    @Test(timeout = 3000)
+    fun bounds_malformedUnclosedSuspectTags_stripThinkingCompletesLinearlyWithoutAnr() {
+        val input = "<think ??? malformed >".repeat(10000)
+        val start = System.currentTimeMillis()
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        val elapsed = System.currentTimeMillis() - start
+
+        assertTrue(
+            "Expected stripThinking on 10000 malformed unclosed tags to complete in milliseconds (< 500ms), took ${elapsed}ms",
+            elapsed < 500
+        )
+        assertEquals(input, stripped)
+
+        val inputWithNonThinkCloser = "<think ??? malformed >".repeat(10000) + "</other>"
+        val startNonThink = System.currentTimeMillis()
+        val strippedNonThink = ChatMarkdownParser.stripThinking(inputWithNonThinkCloser)
+        val elapsedNonThink = System.currentTimeMillis() - startNonThink
+
+        assertTrue(
+            "Expected stripThinking with non-think closer to complete in milliseconds (< 500ms), took ${elapsedNonThink}ms",
+            elapsedNonThink < 500
+        )
+        assertEquals(inputWithNonThinkCloser, strippedNonThink)
+    }
+
+    @Test(timeout = 3000)
+    fun bounds_malformedSuspectTagsWithSingleCloser_stripThinkingCompletesLinearly() {
+        val input = "<think ??? malformed >".repeat(10000) + "</think>"
+        val start = System.currentTimeMillis()
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        val elapsed = System.currentTimeMillis() - start
+
+        assertTrue(
+            "Expected stripThinking on 10000 malformed suspect tags with single closer to complete in milliseconds (< 200ms), took ${elapsed}ms",
+            elapsed < 200
+        )
+        assertEquals("", stripped)
+
+        val inputAfterValidThink = "<think>init</think>" + "<think ??? malformed >".repeat(10000) + "</think>"
+        val startAfterValid = System.currentTimeMillis()
+        val strippedAfterValid = ChatMarkdownParser.stripThinking(inputAfterValidThink)
+        val elapsedAfterValid = System.currentTimeMillis() - startAfterValid
+
+        assertTrue(
+            "Expected stripThinking on 10000 malformed suspect tags after valid tag to complete in milliseconds (< 200ms), took ${elapsedAfterValid}ms",
+            elapsedAfterValid < 200
+        )
+        val expectedAfterValid = "<think ??? malformed >".repeat(9999).trim()
+        assertEquals(expectedAfterValid, strippedAfterValid)
+        assertFalse("</think> must be stripped", strippedAfterValid.contains("</think>"))
+
+        val inputPairs = ("<think ??? malformed >" + "</think>").repeat(5000)
+        val startPairs = System.currentTimeMillis()
+        val strippedPairs = ChatMarkdownParser.stripThinking(inputPairs)
+        val elapsedPairs = System.currentTimeMillis() - startPairs
+
+        assertTrue(
+            "Expected stripThinking on 5000 matched pairs to complete in milliseconds (< 200ms), took ${elapsedPairs}ms",
+            elapsedPairs < 200
+        )
+        assertEquals("", strippedPairs)
+
+        val inputNested = "<think>init</think>" + "<think ??? malformed >".repeat(2500) + "</think>".repeat(2500)
+        val startNested = System.currentTimeMillis()
+        val strippedNested = ChatMarkdownParser.stripThinking(inputNested)
+        val elapsedNested = System.currentTimeMillis() - startNested
+
+        assertTrue(
+            "Expected stripThinking on 2500 nested tags to complete in milliseconds (< 200ms), took ${elapsedNested}ms",
+            elapsedNested < 200
+        )
+        assertEquals("", strippedNested)
+    }
+
+    @Test
+    fun stripThinking_unclosedMalformedSuspectTagFollowedByClosedMalformedSuspectTag() {
+        val input = "<think>init</think> <think ??? unclosed> text <think ??? malformed>CONFIDENTIAL</think> after"
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        assertFalse("CONFIDENTIAL must be stripped", stripped.contains("CONFIDENTIAL"))
+        assertFalse("</think> must be stripped", stripped.contains("</think>"))
+    }
+
+    @Test
+    fun stripThinking_selfClosingSuspectTags_strippedWithoutPollutingOpenStarts() {
+        val input = "<think/> <think ??? malformed /> <think ??? unclosed> text <think ??? malformed>SECRET</think> after"
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        assertFalse("SECRET must be stripped", stripped.contains("SECRET"))
+        assertFalse("self-closing think must be stripped", stripped.contains("<think/>"))
+        assertFalse("malformed self-closing think must be stripped", stripped.contains("<think ??? malformed />"))
+        assertFalse("</think> must be stripped", stripped.contains("</think>"))
+        assertTrue("unclosed suspect tag must remain", stripped.contains("<think ??? unclosed>"))
+    }
 }

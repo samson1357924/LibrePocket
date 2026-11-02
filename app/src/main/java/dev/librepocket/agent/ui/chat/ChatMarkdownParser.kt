@@ -52,6 +52,12 @@ object ChatMarkdownParser {
         val tagEnd: Int,
     )
 
+    private data class SuspectOpenTag(
+        val isSelfClosing: Boolean,
+        val tagEnd: Int,
+        val nextScanPos: Int,
+    )
+
     private fun isXmlNameStartChar(c: Char): Boolean =
         (c in 'a'..'z') || (c in 'A'..'Z') || c == '_' || c == ':'
 
@@ -724,18 +730,59 @@ object ChatMarkdownParser {
         }
     }
 
-    private fun isSuspectOpenThinkTag(text: String, pos: Int): Boolean {
-        if (pos >= text.length || text[pos] != '<') return false
+    private fun matchSuspectOpenThinkTag(text: String, pos: Int): SuspectOpenTag? {
+        if (pos >= text.length || text[pos] != '<') return null
         for (name in THINK_TAG_NAMES) {
             val next = pos + 1 + name.length
             if (text.regionMatches(pos + 1, name, 0, name.length, ignoreCase = true)) {
                 if (next < text.length && (text[next] == ' ' || text[next] == '\t' || text[next] == '/' || text[next] == '>')) {
-                    return true
+                    val maxScan = minOf(text.length, next + 512)
+                    var gt = -1
+                    var p = next
+                    var inQuote = '\u0000'
+                    while (p < maxScan) {
+                        val ch = text[p]
+                        if (ch == '\n' || ch == '\r') break
+                        if (inQuote != '\u0000') {
+                            if (ch == inQuote) {
+                                inQuote = '\u0000'
+                            }
+                        } else {
+                            if (ch == '<') break
+                            if (ch == '"' || ch == '\'') {
+                                inQuote = ch
+                            } else if (ch == '>') {
+                                gt = p
+                                break
+                            }
+                        }
+                        p++
+                    }
+
+                    if (gt != -1 && inQuote == '\u0000') {
+                        var s = gt - 1
+                        while (s >= next && (text[s] == ' ' || text[s] == '\t')) s--
+                        val isSelfClosing = s >= next && text[s] == '/'
+                        return SuspectOpenTag(
+                            isSelfClosing = isSelfClosing,
+                            tagEnd = gt + 1,
+                            nextScanPos = gt + 1,
+                        )
+                    }
+
+                    return SuspectOpenTag(
+                        isSelfClosing = false,
+                        tagEnd = next,
+                        nextScanPos = next,
+                    )
                 }
             }
         }
-        return false
+        return null
     }
+
+    private fun isSuspectOpenThinkTag(text: String, pos: Int): Boolean =
+        matchSuspectOpenThinkTag(text, pos) != null
 
     private fun stripMalformedThinkingTags(text: String): String {
         val len = text.length
@@ -747,8 +794,10 @@ object ChatMarkdownParser {
             nextNewline[i] = if (text[i] == '\n') i else nextNewline[i + 1]
         }
 
-        val sb = java.lang.StringBuilder(len)
+        val removedIntervals = mutableListOf<IntRange>()
+        val openStarts = ArrayList<Int>()
         var i = 0
+
         while (i < len) {
             if (text[i] == '`' && !escaped[i]) {
                 if (text.startsWith(CODE_FENCE, i)) {
@@ -757,7 +806,6 @@ object ChatMarkdownParser {
                     val fenceLen = fenceEnd - i
                     val nextFence = text.indexOf(text.substring(i, fenceEnd), fenceEnd)
                     val close = if (nextFence >= 0) nextFence + fenceLen else len
-                    sb.append(text, i, close)
                     i = close
                     continue
                 }
@@ -765,44 +813,52 @@ object ChatMarkdownParser {
                 val close = ticks[size - 1][i + size]
                 val newline = nextNewline[i + size]
                 if (close >= 0 && (newline < 0 || close < newline)) {
-                    sb.append(text, i, close + size)
                     i = close + size
                     continue
                 }
             }
 
-            if (text[i] == '<' && isSuspectOpenThinkTag(text, i)) {
-                var scan = i + 1
-                var depth = 1
-                var closeTagEnd = -1
-                while (scan < len) {
-                    val nextLt = text.indexOf('<', scan)
-                    if (nextLt == -1) break
-                    if (isSuspectOpenThinkTag(text, nextLt)) {
-                        depth++
-                        scan = nextLt + 1
+            if (text[i] == '<') {
+                val openMatch = matchSuspectOpenThinkTag(text, i)
+                if (openMatch != null) {
+                    if (openMatch.isSelfClosing) {
+                        removedIntervals.add(i until openMatch.tagEnd)
+                        i = openMatch.tagEnd
                         continue
                     }
-                    val close = matchCloseThinkTag(text, nextLt)
-                    if (close != null) {
-                        depth--
-                        if (depth == 0) {
-                            closeTagEnd = close.tagEnd
-                            break
-                        }
-                        scan = close.tagEnd
-                        continue
-                    }
-                    scan = nextLt + 1
+                    openStarts.add(i)
+                    i = openMatch.nextScanPos
+                    continue
                 }
-                if (closeTagEnd >= 0) {
-                    i = closeTagEnd
+                val close = matchCloseThinkTag(text, i)
+                if (close != null) {
+                    if (openStarts.isNotEmpty()) {
+                        val start = openStarts.removeAt(openStarts.lastIndex)
+                        while (removedIntervals.isNotEmpty() && removedIntervals.last().first >= start) {
+                            removedIntervals.removeAt(removedIntervals.lastIndex)
+                        }
+                        removedIntervals.add(start until close.tagEnd)
+                    }
+                    i = close.tagEnd
                     continue
                 }
             }
 
-            sb.append(text[i])
             i++
+        }
+
+        if (removedIntervals.isEmpty()) return text
+
+        val sb = java.lang.StringBuilder(len)
+        var cursor = 0
+        for (range in removedIntervals) {
+            if (range.first > cursor) {
+                sb.append(text, cursor, range.first)
+            }
+            cursor = range.last + 1
+        }
+        if (cursor < len) {
+            sb.append(text, cursor, len)
         }
         return sb.toString()
     }

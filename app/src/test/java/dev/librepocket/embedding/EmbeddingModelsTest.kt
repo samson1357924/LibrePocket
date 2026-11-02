@@ -1,6 +1,7 @@
 package dev.librepocket.embedding
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertThrows
@@ -105,17 +106,49 @@ class EmbeddingModelsTest {
 
     @Test
     fun embeddingRequestBatchSizeLimit() {
-        // Max batch size of 2048 should succeed
-        val validBatch = List(2048) { "item $it" }
-        val req = EmbeddingRequest(input = validBatch)
-        assertEquals(2048, req.input.size)
+        assertEquals(100, EmbeddingRequest.MAX_BATCH_SIZE)
 
-        // Exceeding 2048 should throw
-        val overBatch = List(2049) { "item $it" }
+        // Max batch size of 100 should succeed
+        val validBatch = List(100) { "item $it" }
+        val req = EmbeddingRequest(input = validBatch)
+        assertEquals(100, req.input.size)
+
+        // Exceeding 100 should throw
+        val overBatch = List(101) { "item $it" }
         val ex = assertThrows(IllegalArgumentException::class.java) {
             EmbeddingRequest(input = overBatch)
         }
         assertTrue(ex.message!!.contains("exceeds maximum limit"))
+    }
+
+    @Test
+    fun batchSizeAndDimensionsTiedToResponseBudgetContract() {
+        // Mathematical boundary contract tying MAX_BATCH_SIZE * MAX_DIMENSIONS to the 5 MiB response budget:
+        val maxBatch = EmbeddingRequest.MAX_BATCH_SIZE
+        val maxDims = EmbeddingRequest.MAX_DIMENSIONS
+        assertEquals(100, maxBatch)
+        assertEquals(3072, maxDims)
+
+        val totalFloats = maxBatch * maxDims // 307,200
+        assertEquals(307_200, totalFloats)
+
+        // Worst-case float JSON length: sign + '0.' + 8 decimals + comma + space <= 14 bytes
+        // Even with a pessimistic 16 bytes/float + envelope overhead:
+        val estimatedWorstCaseBytes = (totalFloats * 16L) + 8192L // 4,923,392 bytes
+        val responseCap = 5 * 1024 * 1024L // 5,242,880 bytes
+
+        assertTrue(
+            "Max batch * max dimensions under worst-case float encoding must fit under 5 MiB cap",
+            estimatedWorstCaseBytes < responseCap
+        )
+
+        // Conversely, prove why the former 2048 batch size was mathematically impossible:
+        // Even for text-embedding-3-small (1536 dims), 2048 * 1536 = 3,145,728 floats.
+        // Even in the impossible theoretical minimum of 2 bytes per float ("0,"),
+        // 3,145,728 * 2 = 6,291,456 bytes > 5 MiB.
+        val oldBatchSmallFloats = 2048L * 1536L
+        val minPossibleOldPayloadBytes = oldBatchSmallFloats * 2L
+        assertTrue(minPossibleOldPayloadBytes > responseCap)
     }
 
     @Test
@@ -130,6 +163,37 @@ class EmbeddingModelsTest {
         assertNotEquals(item1, item3)
         assertNotEquals(item1, item4)
         assertTrue(item1.toString().contains("2 dimensions"))
+    }
+
+    @Test
+    fun embeddingRequestToStringRedactsInputAndUser() {
+        val sensitiveInput1 = "super-secret user query about passwords"
+        val sensitiveInput2 = "confidential medical report data"
+        val sensitiveUser = "user-id-sensitive-999"
+
+        val req = EmbeddingRequest(
+            input = listOf(sensitiveInput1, sensitiveInput2),
+            model = "text-embedding-3-small",
+            dimensions = 512,
+            user = sensitiveUser,
+        )
+
+        val str = req.toString()
+        assertFalse("Raw input item 1 must not be leaked in toString", str.contains(sensitiveInput1))
+        assertFalse("Raw input item 2 must not be leaked in toString", str.contains(sensitiveInput2))
+        assertFalse("Raw user id must not be leaked in toString", str.contains(sensitiveUser))
+
+        assertEquals("EmbeddingRequest(input=<2 items>, model=text-embedding-3-small, dimensions=512, user=<redacted>)", str)
+
+        val reqNoUser = EmbeddingRequest(
+            input = listOf("single-input"),
+            model = "text-embedding-3-small",
+            dimensions = null,
+            user = null,
+        )
+        val strNoUser = reqNoUser.toString()
+        assertFalse(strNoUser.contains("single-input"))
+        assertEquals("EmbeddingRequest(input=<1 items>, model=text-embedding-3-small, dimensions=null, user=null)", strNoUser)
     }
 
     @Test

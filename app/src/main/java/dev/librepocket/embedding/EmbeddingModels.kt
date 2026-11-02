@@ -26,9 +26,19 @@ data class EmbeddingRequest(
         }
     }
 
+    override fun toString(): String =
+        "EmbeddingRequest(input=<${input.size} items>, model=$model, dimensions=$dimensions, user=${if (user != null) "<redacted>" else "null"})"
+
     companion object {
         const val DEFAULT_MODEL = "text-embedding-3-small"
-        const val MAX_BATCH_SIZE = 2048
+        /**
+         * Hard upper bound on input items per request.
+         *
+         * Constrained to 100 items so that max-dimension payloads (100 * 3072 = 307,200 floats)
+         * fit safely within the default 5 MiB response budget (5,242,880 bytes) and align with
+         * [SemanticMemoryIndex.MAX_BATCH_SIZE].
+         */
+        const val MAX_BATCH_SIZE = 100
         const val MAX_DIMENSIONS = 3072
     }
 }

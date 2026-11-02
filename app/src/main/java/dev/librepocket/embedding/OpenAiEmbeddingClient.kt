@@ -42,6 +42,12 @@ import okio.Buffer
 
 /**
  * Cancellation exception with an empty stack trace used when the API key supplier cancels.
+ *
+ * Implements [CopyableThrowable] with `createCopy() = null` to instruct kotlinx.coroutines'
+ * stack trace recovery mechanism not to clone or reconstruct the exception across coroutine
+ * suspension boundaries. In combination with clearing [stackTrace], this guarantees that no
+ * internal coroutine machinery, key-supplier stack frames, or memory references leak through
+ * unhandled exception reporting or crash handlers.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 internal class CleanCancellationException(message: String) :
@@ -77,7 +83,7 @@ internal class CleanCancellationException(message: String) :
  *   in all error messages before passing through [Redactor.redactError].
  * - Configurable input redaction: [redactInput] applies [Redactor.redact] to all input texts.
  * - Response size capping: Responses are read in bounded chunks up to [maxResponseBytes]
- *   (default 5MB); exceeding the cap cancels the OkHttp Call and fails with [EmbeddingErrorCode.RESPONSE_TOO_LARGE].
+ *   (default 10MB); exceeding the cap cancels the OkHttp Call and fails with [EmbeddingErrorCode.RESPONSE_TOO_LARGE].
  * - Prompt coroutine cancellation: OkHttp call is cancelled immediately when the parent Job is cancelled.
  */
 class OpenAiEmbeddingClient(
@@ -282,6 +288,17 @@ class OpenAiEmbeddingClient(
         return response.data.first().embedding
     }
 
+    /**
+     * Creates an OkHttp [Call] bound to the coroutine [job] cancellation lifecycle.
+     *
+     * Note on [@OptIn(InternalCoroutinesApi::class)]:
+     * Invokes `Job.invokeOnCompletion(onCancelling = true, invokeImmediately = true)`, an internal
+     * coroutines API. Passing `onCancelling = true` ensures that the underlying OkHttp [Call.cancel]
+     * is triggered immediately at the moment cancellation begins (in the 'Cancelling' state),
+     * rather than waiting for all child coroutines to complete (the 'Cancelled' state).
+     * This promptly aborts the active network socket and terminates the HTTP connection without
+     * blocking on downstream coroutine cleanup.
+     */
     @OptIn(InternalCoroutinesApi::class)
     internal fun newCancellableCall(
         request: Request,
@@ -298,7 +315,7 @@ class OpenAiEmbeddingClient(
 
     companion object {
         const val DEFAULT_BASE_URL = "https://api.openai.com"
-        const val MAX_RESPONSE_BYTES = 5 * 1024 * 1024L // 5 MB (safely bounds decoded response-body bytes on mobile)
+        const val MAX_RESPONSE_BYTES = 10 * 1024 * 1024L // 10 MB (safely bounds decoded response-body bytes on mobile)
         const val CALL_TIMEOUT_SECONDS = 60L
         const val MAX_SUPPORTED_DIMENSION = 3072
         const val BEARER_MAX_CHARS = 8_192
@@ -477,6 +494,28 @@ class OpenAiEmbeddingClient(
             }
         }
 
+        /**
+         * Hand-rolled streaming recursive-descent JSON parser.
+         *
+         * Architectural Justification over kotlinx.serialization / reflection-based parsers:
+         * 1. Zero-Boxing Memory Efficiency:
+         *    Embedding responses can contain up to 307,200 floats (100 items x 3072 dimensions).
+         *    Standard JSON parsers (e.g. kotlinx.serialization with JsonTree or intermediate models)
+         *    allocate millions of boxed [java.lang.Float] objects and [JsonElement] AST nodes,
+         *    generating tens of megabytes of short-lived heap churn and triggering frequent GC pauses.
+         *    This streaming parser decodes primitive floating-point numbers directly from the JSON
+         *    string into flat primitive [FloatArray] buffers with zero object boxing.
+         * 2. Eager Fail-Fast Dimension Bounds:
+         *    Validates [MAX_SUPPORTED_DIMENSION] (3072) and [expectedDimensions] incrementally while
+         *    reading float tokens, aborting immediately upon exceeding limits rather than parsing
+         *    unbounded payloads into memory.
+         * 3. Strict RFC 8259 Conformance & Injection Defense:
+         *    Rejects non-compliant JSON syntax (leading zeros, leading '+', trailing commas) and
+         *    validates [Float.isFinite] to block NaN/Infinity injection attacks.
+         * 4. Bounded Call Stack:
+         *    Recursion depth is strictly capped (max depth 64 via [skipValue]) to prevent
+         *    [StackOverflowError] Denial of Service from deeply nested malicious payloads.
+         */
         private fun parseStreamingResponse(
             json: String,
             fallbackModel: String,

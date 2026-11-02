@@ -123,7 +123,7 @@ class EmbeddingModelsTest {
 
     @Test
     fun batchSizeAndDimensionsTiedToResponseBudgetContract() {
-        // Mathematical boundary contract tying MAX_BATCH_SIZE * MAX_DIMENSIONS to the 5 MiB response budget:
+        // Mathematical boundary contract tying MAX_BATCH_SIZE * MAX_DIMENSIONS to the 10 MiB response budget:
         val maxBatch = EmbeddingRequest.MAX_BATCH_SIZE
         val maxDims = EmbeddingRequest.MAX_DIMENSIONS
         assertEquals(100, maxBatch)
@@ -132,14 +132,26 @@ class EmbeddingModelsTest {
         val totalFloats = maxBatch * maxDims // 307,200
         assertEquals(307_200, totalFloats)
 
-        // Worst-case float JSON length: sign + '0.' + 8 decimals + comma + space <= 14 bytes
-        // Even with a pessimistic 16 bytes/float + envelope overhead:
-        val estimatedWorstCaseBytes = (totalFloats * 16L) + 8192L // 4,923,392 bytes
-        val responseCap = 5 * 1024 * 1024L // 5,242,880 bytes
+        // Official OpenAI docs and real responses format floats with ~21-23 characters before commas:
+        // "-0.006929283495992422" (22 chars), "-0.005336422007530928" (21 chars),
+        // "-4.547132266452536e-5" (21 chars), "-0.024047505110502243" (22 chars).
+        // With comma and optional space: ~23-25 bytes per component.
+        // Worst-case 25 bytes/float + envelope overhead:
+        val estimatedWorstCaseBytes = (totalFloats * 25L) + 8192L // 7,688,192 bytes (~7.33 MiB)
+        val responseCap = OpenAiEmbeddingClient.MAX_RESPONSE_BYTES // 10 * 1024 * 1024L (10,485,760 bytes)
 
         assertTrue(
-            "Max batch * max dimensions under worst-case float encoding must fit under 5 MiB cap",
+            "Max batch * max dimensions under worst-case float encoding (~7.69 MB) must fit under 10 MiB cap ($responseCap bytes)",
             estimatedWorstCaseBytes < responseCap
+        )
+
+        // Prove why the former 5 MiB cap was broken for real-world float formatting:
+        // Even at 22 bytes per float: 307,200 * 22 = 6,758,400 bytes > 5 MiB (5,242,880 bytes).
+        val realisticMinBytes = totalFloats * 22L
+        val old5MiBCap = 5 * 1024 * 1024L
+        assertTrue(
+            "Realistic float responses exceed the former 5 MiB cap",
+            realisticMinBytes > old5MiBCap
         )
 
         // Conversely, prove why the former 2048 batch size was mathematically impossible:
@@ -148,7 +160,7 @@ class EmbeddingModelsTest {
         // 3,145,728 * 2 = 6,291,456 bytes > 5 MiB.
         val oldBatchSmallFloats = 2048L * 1536L
         val minPossibleOldPayloadBytes = oldBatchSmallFloats * 2L
-        assertTrue(minPossibleOldPayloadBytes > responseCap)
+        assertTrue(minPossibleOldPayloadBytes > old5MiBCap)
     }
 
     @Test

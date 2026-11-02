@@ -35,7 +35,8 @@ data class EmbeddingRequest(
          * Hard upper bound on input items per request.
          *
          * Constrained to 100 items so that max-dimension payloads (100 * 3072 = 307,200 floats)
-         * fit safely within the default 5 MiB response budget (5,242,880 bytes) and align with
+         * under realistic high-precision floating-point formatting (~21–25 bytes/component, ~7.4 MB wire payload)
+         * fit safely within the default 10 MiB response budget (10,485,760 bytes) and align with
          * [SemanticMemoryIndex.MAX_BATCH_SIZE].
          */
         const val MAX_BATCH_SIZE = 100

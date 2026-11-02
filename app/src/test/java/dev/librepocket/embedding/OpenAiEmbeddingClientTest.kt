@@ -433,7 +433,7 @@ class OpenAiEmbeddingClientTest {
 
     @Test
     fun maxResponseBytesConstantContract() {
-        assertEquals(5 * 1024 * 1024L, OpenAiEmbeddingClient.MAX_RESPONSE_BYTES)
+        assertEquals(10 * 1024 * 1024L, OpenAiEmbeddingClient.MAX_RESPONSE_BYTES)
     }
 
     @Test
@@ -2008,20 +2008,28 @@ class OpenAiEmbeddingClientTest {
         // Deterministic boundary test:
         // MAX_BATCH_SIZE = 100 items, MAX_DIMENSIONS = 3072 floats
         // Total floats = 100 * 3072 = 307,200 floats
-        // Wire size with typical ~11 bytes per float + JSON envelope ≈ 3.4 MB < 5 MiB (MAX_RESPONSE_BYTES)
+        // Wire size with realistic ~21-23 characters per float + commas + JSON envelope ≈ 6.8-7.4 MB
+        // Exceeds the former 5 MiB cap, but fits safely under 10 MiB (MAX_RESPONSE_BYTES)
         val batchSize = EmbeddingRequest.MAX_BATCH_SIZE
         val dims = EmbeddingRequest.MAX_DIMENSIONS
         assertEquals(100, batchSize)
         assertEquals(3072, dims)
 
-        val sb = StringBuilder(4 * 1024 * 1024)
+        val realisticFloats = arrayOf(
+            "-0.006929283495992422",
+            "-0.005336422007530928",
+            "-4.547132266452536e-5",
+            "-0.024047505110502243",
+        )
+
+        val sb = StringBuilder(8 * 1024 * 1024)
         sb.append("""{"object":"list","data":[""")
         for (i in 0 until batchSize) {
             if (i > 0) sb.append(",")
             sb.append("""{"object":"embedding","index":$i,"embedding":[""")
             for (d in 0 until dims) {
                 if (d > 0) sb.append(",")
-                sb.append("0.12345678")
+                sb.append(realisticFloats[(i + d) % realisticFloats.size])
             }
             sb.append("]}")
         }
@@ -2029,7 +2037,13 @@ class OpenAiEmbeddingClientTest {
         val responseBody = sb.toString()
         val responseBytes = responseBody.toByteArray(Charsets.UTF_8).size
 
-        // Wire response payload must fit safely under default 5 MiB cap
+        // Wire response payload exceeds the old 5 MiB limit
+        assertTrue(
+            "Response size ($responseBytes bytes) must exceed old 5 MiB limit (5242880 bytes)",
+            responseBytes > 5 * 1024 * 1024L
+        )
+
+        // Wire response payload must fit safely under default 10 MiB cap
         assertTrue(
             "Response size ($responseBytes bytes) must be less than MAX_RESPONSE_BYTES (${OpenAiEmbeddingClient.MAX_RESPONSE_BYTES} bytes)",
             responseBytes < OpenAiEmbeddingClient.MAX_RESPONSE_BYTES
@@ -2041,7 +2055,7 @@ class OpenAiEmbeddingClientTest {
             baseUrl = server.url("/").toString(),
             apiKey = { "key".toCharArray() },
             allowTestLoopback = true,
-            // Uses default maxResponseBytes = 5 MiB
+            // Uses default maxResponseBytes = 10 MiB
         )
 
         val response = client.createEmbeddings(
@@ -2055,5 +2069,8 @@ class OpenAiEmbeddingClientTest {
         assertEquals(batchSize, response.data.size)
         assertEquals(dims, response.data[0].embedding.size)
         assertEquals(dims, response.data[batchSize - 1].embedding.size)
+        // Verify precision and scientific notation parsed properly
+        assertEquals(-0.0069292835f, response.data[0].embedding[0], 1e-6f)
+        assertEquals(-4.5471324e-5f, response.data[0].embedding[2], 1e-9f)
     }
 }

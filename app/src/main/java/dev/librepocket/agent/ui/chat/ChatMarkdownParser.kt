@@ -7,32 +7,91 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 
+/**
+ * Structured content block parsed from chat turn text.
+ * Each block provides a [stableKey] used by Compose to maintain UI state
+ * (such as expansion in [ThinkingBlock] or copy feedback in [CodeBlock])
+ * across streaming updates, block insertions, and content progress.
+ */
 sealed interface ChatContentBlock {
+    fun stableKey(index: Int = 0): Any
+
     data class ThinkingBlock(
         val content: String,
         val isStreaming: Boolean,
-    ) : ChatContentBlock
+    ) : ChatContentBlock {
+        override fun stableKey(index: Int): Any =
+            "think_${content.take(32).hashCode()}"
+    }
 
     data class CodeBlock(
         val language: String?,
         val code: String,
         val isStreaming: Boolean,
-    ) : ChatContentBlock
+    ) : ChatContentBlock {
+        override fun stableKey(index: Int): Any =
+            "code_${language.orEmpty()}_${code.take(32).hashCode()}"
+    }
 
     data class ParagraphBlock(
         val annotatedText: AnnotatedString,
-    ) : ChatContentBlock
+    ) : ChatContentBlock {
+        override fun stableKey(index: Int): Any =
+            "para_${annotatedText.text.take(32).hashCode()}_$index"
+    }
 }
 
 /**
- * Robust, linear O(N) parser for thinking blocks (<think>...</think>),
- * code blocks (```lang ... ```), and inline markdown (bold, italic, inline code, lists).
+ * Robust, linear O(N) parser for thinking blocks (`<think>...</think>`),
+ * code blocks (```` ```lang ... ``` ````), and inline markdown (bold, italic, inline code, lists).
  * Strictly avoids backtracking regular expressions to ensure immunity against ReDoS attacks.
+ *
+ * ### Core Invariants
+ *
+ * 1. **Delimiter Precedence (定界符優先級)**:
+ *    - Structural block-level delimiters (fenced code blocks, indented code blocks, and XML-like thinking tags)
+ *      have strict precedence over inline delimiters.
+ *    - Code blocks (both fenced and indented) shield all enclosed content: thinking tags and inline markdown markers
+ *      (`*`, `_`, `` ` ``) are treated as literal text.
+ *    - Inline code spans (`` `...` `` or ```` ``...`` ````) shield enclosed content from inline style parsing and XML tags.
+ *    - Inline formatting precedence evaluates triple asterisks (`***` bold+italic) first, followed by double (`**` bold)
+ *      and single (`*` italic), disambiguating shared triple closers with left-to-right lookahead.
+ *
+ * 2. **Streaming Cursor Mutual Exclusion (串流游標互斥與單調推進)**:
+ *    - The parser progresses text linearly through a monotonically advancing cursor (`cursor++` or segment skips)
+ *      with zero backtracking, guaranteeing strict O(N) runtime.
+ *    - At each cursor position, candidate token constructs mutually exclude each other: an indented code line,
+ *      a thinking tag opener/closer, a fenced code block opener, an inline backtick run, or plain text.
+ *    - During streaming (`isStreaming = true`), trailing partial tag prefixes (e.g. `<think`, `</think`)
+ *      are classified into [Kind.PARTIAL_TAG] or held back from content emission, preventing transient raw syntax
+ *      leakage before subsequent stream chunks arrive.
+ *
+ * 3. **Bracket Matching & Monotonic Interval Absorption (括號匹配與單調區間吸收)**:
+ *    - Nested thinking tags maintain a depth-counted stack ([tagStack] and [tagCounts]) with O(1) membership checks.
+ *    - In [stripMalformedThinkingTags], open tag positions are pushed onto a LIFO stack. When a valid closing tag
+ *      is matched, the enclosing range `[start, close.tagEnd)` is absorbed. Any previously recorded inner intervals
+ *      starting at or after `start` are popped and superseded by the outer enclosing interval in a single monotonic pass.
+ *    - This guarantees strict O(N) linear time with zero quadratic allocation or substring rebuilding overhead.
  */
 object ChatMarkdownParser {
 
     private val THINK_TAG_NAMES = listOf("thinking", "thought", "think")
     private const val CODE_FENCE = "```"
+
+    /** Number of distinct recognized thinking tag types (thinking, thought, think). */
+    private const val THINK_TAG_KIND_COUNT = 3
+
+    /** Maximum characters to scan within a tag looking for closing '>' before giving up. */
+    private const val MAX_TAG_ATTRIBUTE_SCAN_CHARS = 512
+
+    /** Maximum character buffer length to inspect for trailing partial tag prefixes during streaming. */
+    private const val MAX_PARTIAL_TAG_PREFIX_CHARS = 32
+
+    /** Maximum spaces of indentation allowed before a fenced code block opener per CommonMark. */
+    private const val MAX_FENCE_INDENT_SPACES = 3
+
+    /** Standard column width for tabs and indented code blocks per CommonMark. */
+    private const val INDENT_CODE_COLUMNS = 4L
 
     private fun thinkTagId(name: String): Int = when (name.lowercase()) {
         "thinking" -> 0
@@ -120,7 +179,7 @@ object ChatMarkdownParser {
             return null
         }
 
-        val maxScan = minOf(text.length, afterTag + 512)
+        val maxScan = minOf(text.length, afterTag + MAX_TAG_ATTRIBUTE_SCAN_CHARS)
         var gt = -1
         var p = afterTag
         var inQuote = '\u0000'
@@ -181,7 +240,7 @@ object ChatMarkdownParser {
     private fun isOpenThinkTagPrefix(text: String, pos: Int): Boolean {
         if (pos >= text.length || text[pos] != '<') return false
         val rem = text.length - pos
-        if (rem > 32) return false
+        if (rem > MAX_PARTIAL_TAG_PREFIX_CHARS) return false
         for (i in pos until text.length) {
             val ch = text[i]
             if (ch == '>' || ch == '\n' || ch == '\r') return false
@@ -207,7 +266,7 @@ object ChatMarkdownParser {
     private fun isCloseThinkTagPrefix(text: String, pos: Int, targetTagName: String? = null): Boolean {
         if (pos >= text.length || text[pos] != '<') return false
         val rem = text.length - pos
-        if (rem > 32) return false
+        if (rem > MAX_PARTIAL_TAG_PREFIX_CHARS) return false
         for (i in pos until text.length) {
             val ch = text[i]
             if (ch == '>' || ch == '\n' || ch == '\r') return false
@@ -266,7 +325,7 @@ object ChatMarkdownParser {
                 if (text[pos] == '\t') tab = true
                 pos++
             }
-            if ((tab || pos - lineStart > 3) && text.startsWith(CODE_FENCE, pos)) invalid[pos] = true
+            if ((tab || pos - lineStart > MAX_FENCE_INDENT_SPACES) && text.startsWith(CODE_FENCE, pos)) invalid[pos] = true
             val newline = text.indexOf('\n', pos)
             if (newline < 0) break
             lineStart = newline + 1
@@ -299,13 +358,13 @@ object ChatMarkdownParser {
         return arrayOf(single, double)
     }
 
-    private fun indentEnd(text: String, start: Int, required: Long = 4L): Int {
+    private fun indentEnd(text: String, start: Int, required: Long = INDENT_CODE_COLUMNS): Int {
         var pos = start
         var columns = 0L
         while (pos < text.length && columns < required) {
             when (text[pos]) {
                 ' ' -> columns++
-                '\t' -> columns += 4L - columns % 4L
+                '\t' -> columns += INDENT_CODE_COLUMNS - columns % INDENT_CODE_COLUMNS
                 else -> return -1
             }
             pos++
@@ -319,8 +378,8 @@ object ChatMarkdownParser {
         var column = base
         var pos = marker + markerLength
         while (pos < text.length && (text[pos] == ' ' || text[pos] == '\t')) {
-            val next = if (text[pos] == '\t') column + 4L - column % 4L else column + 1L
-            if (next - base > 4L) return base + 1L
+            val next = if (text[pos] == '\t') column + INDENT_CODE_COLUMNS - column % INDENT_CODE_COLUMNS else column + 1L
+            if (next - base > INDENT_CODE_COLUMNS) return base + 1L
             column = next
             pos++
         }
@@ -362,8 +421,15 @@ object ChatMarkdownParser {
         return true
     }
 
-    // Each character is visited a bounded number of times. Inline code shields tags,
-    // and fenced code and thinking blocks shield everything until their own closer.
+    /**
+     * Splits raw input text into non-overlapping, sequential [Segment] records in linear O(N) time.
+     *
+     * Invariants enforced:
+     * - Monotonic cursor progression: cursor advances strictly forward with no backtracking.
+     * - Delimiter shielding: code blocks and thinking blocks shield internal characters until closed.
+     * - Streaming mutual exclusion: trailing partial tag prefixes are isolated as [Kind.PARTIAL_TAG]
+     *   so that unclosed delimiters do not pollute user-visible text while streaming.
+     */
     private fun segments(text: String, streaming: Boolean): List<Segment> {
         val result = mutableListOf<Segment>()
         val length = text.length
@@ -438,7 +504,7 @@ object ChatMarkdownParser {
             }
             val previousListItem = listContentColumns.isNotEmpty()
             // Indented code inside this list begins four columns after its content.
-            val codeIndent = if (previousListItem) listContentColumns.last() + 4L else 4L
+            val codeIndent = if (previousListItem) listContentColumns.last() + INDENT_CODE_COLUMNS else INDENT_CODE_COLUMNS
             val listContinuation = previousListItem && indentColumns > 0 && indentColumns < codeIndent
             val nestedList = previousListItem && listItem && indentColumns < codeIndent
             val indent = if (atLineStart && !blankLine && !nestedList && !listContinuation &&
@@ -494,7 +560,7 @@ object ChatMarkdownParser {
                 }
                 val contentStart = openMatch.tagEnd
                 val tagStack = ArrayList<Int>()
-                val tagCounts = IntArray(3)
+                val tagCounts = IntArray(THINK_TAG_KIND_COUNT)
                 val rootId = thinkTagId(openMatch.tagName)
                 if (rootId >= 0) {
                     tagStack.add(rootId)
@@ -623,7 +689,7 @@ object ChatMarkdownParser {
                     while (lineStart < length) {
                         var pos = lineStart
                         while (pos < length && text[pos] == ' ') pos++
-                        if (pos - lineStart <= 3 && pos < length && text[pos] == '`') {
+                        if (pos - lineStart <= MAX_FENCE_INDENT_SPACES && pos < length && text[pos] == '`') {
                             var tail = pos
                             while (tail < length && text[tail] == '`') tail++
                             val runEnd = tail
@@ -675,6 +741,14 @@ object ChatMarkdownParser {
         return result
     }
 
+    /**
+     * Parses the incoming chat text into a list of [ChatContentBlock] instances.
+     *
+     * @param text The complete raw text of the message turn received so far.
+     * @param isStreaming Whether generation is actively ongoing. When true, unclosed blocks
+     *                    are flagged with `isStreaming = true` to allow streaming cursor rendering,
+     *                    and trailing partial tags are buffered.
+     */
     fun parse(text: String, isStreaming: Boolean = false): List<ChatContentBlock> {
         if (text.isEmpty()) {
             return if (isStreaming) listOf(ChatContentBlock.ParagraphBlock(AnnotatedString(""))) else emptyList()
@@ -706,10 +780,10 @@ object ChatMarkdownParser {
                         var outputColumns = 0L
                         while (content < end && (text[content] == ' ' || text[content] == '\t')) {
                             val tab = text[content] == '\t'
-                            val next = if (tab) columns + 4L - columns % 4L else columns + 1L
+                            val next = if (tab) columns + INDENT_CODE_COLUMNS - columns % INDENT_CODE_COLUMNS else columns + 1L
                             if (next > segment.indentColumns) {
                                 val remaining = next - maxOf(columns, segment.indentColumns)
-                                if (tab && columns >= segment.indentColumns && remaining == 4L - outputColumns % 4L) {
+                                if (tab && columns >= segment.indentColumns && remaining == INDENT_CODE_COLUMNS - outputColumns % INDENT_CODE_COLUMNS) {
                                     append('\t')
                                 } else {
                                     repeat(remaining.toInt()) { append(' ') }
@@ -736,7 +810,7 @@ object ChatMarkdownParser {
             val next = pos + 1 + name.length
             if (text.regionMatches(pos + 1, name, 0, name.length, ignoreCase = true)) {
                 if (next < text.length && (text[next] == ' ' || text[next] == '\t' || text[next] == '/' || text[next] == '>')) {
-                    val maxScan = minOf(text.length, next + 512)
+                    val maxScan = minOf(text.length, next + MAX_TAG_ATTRIBUTE_SCAN_CHARS)
                     var gt = -1
                     var p = next
                     var inQuote = '\u0000'
@@ -784,6 +858,19 @@ object ChatMarkdownParser {
     private fun isSuspectOpenThinkTag(text: String, pos: Int): Boolean =
         matchSuspectOpenThinkTag(text, pos) != null
 
+    /**
+     * Strips malformed or residual thinking tags from text using single-pass bracket matching
+     * and monotonic interval absorption.
+     *
+     * Invariants enforced:
+     * - Monotonic Interval Absorption: [openStarts] tracks matched opening bracket indices. When a matching
+     *   closing tag is found at `close.tagEnd`, any previously recorded inner intervals starting at or after
+     *   `start` are discarded from [removedIntervals] because they are completely encompassed by the outer
+     *   range `start until close.tagEnd`.
+     * - Delimiter Shielding: Code blocks and inline code spans shield XML tags from being considered as thinking tags.
+     * - Strict Linear Time O(N): The text is traversed linearly, and each character is processed at most a bounded
+     *   number of times without string rebuilding until the final interval subtraction phase.
+     */
     private fun stripMalformedThinkingTags(text: String): String {
         val len = text.length
         if (len == 0) return ""
@@ -913,7 +1000,17 @@ object ChatMarkdownParser {
      */
     fun parseInlineMarkdown(rawText: String): AnnotatedString = parseInline(formatLists(rawText))
 
-    // Nested styles receive already formatted text: list formatting belongs to the paragraph only.
+    /**
+     * Parses inline markdown styles (inline code, bold, italic, bold+italic) into an [AnnotatedString] in linear O(N) time.
+     *
+     * Invariants enforced:
+     * - Delimiter Precedence: Inline code spans (`` ` `` or ```` `` ````) take absolute precedence over asterisk styles.
+     *   Any asterisks inside code spans are preserved literally.
+     * - Formatting Hierarchy: Triple delimiters (`***`) take precedence over double (`**`), which in turn take precedence
+     *   over single (`*`).
+     * - Shared Triple Closer Disambiguation: Precomputed lookup arrays (`nextDouble`, `nextTriple`, `openBold`, `openItalic`)
+     *   resolve ambiguous closures (such as `**bold *italic***`) in O(1) without exponential backtracking.
+     */
     private fun parseInline(text: String): AnnotatedString {
         val builder = AnnotatedString.Builder()
         var i = 0

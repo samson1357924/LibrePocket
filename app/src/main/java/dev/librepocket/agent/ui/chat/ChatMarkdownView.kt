@@ -265,8 +265,13 @@ internal fun ChatMarkdownView(
         modifier = modifier,
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        val keyTracker = HashSet<Any>()
         blocks.forEachIndexed { index, block ->
-            key(index, block.javaClass) {
+            var itemKey = block.stableKey(index)
+            if (!keyTracker.add(itemKey)) {
+                itemKey = "${itemKey}_$index"
+            }
+            key(itemKey) {
                 when (block) {
                     is ChatContentBlock.ThinkingBlock -> {
                         ThinkingBlockView(block = block)

@@ -935,4 +935,98 @@ class ChatMarkdownUiTest {
         composeRule.onNodeWithText("kotlin").assertIsDisplayed()
         composeRule.onNodeWithText("▍").assertIsDisplayed()
     }
+
+    @Test
+    fun chatMarkdownView_streamingBlockInsertion_preservesThinkingBlockExpandedState() {
+        // Initially, streaming message contains a closed thinking block
+        var text by mutableStateOf("<think>Analyzing user query and planning response step 1</think>")
+        val isStreaming by mutableStateOf(true)
+
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(
+                    text = text,
+                    isStreaming = isStreaming,
+                )
+            }
+        }
+
+        val thinkingTitle = context.getString(R.string.chat_thinking_title)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+
+        // Thinking block is closed, so by default it collapses
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+
+        // User manually expands the thinking block
+        composeRule.onNodeWithText(thinkingTitle).performClick()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("Analyzing user query and planning response step 1").assertIsDisplayed()
+
+        // A preceding paragraph appears before the thinking block (shifting thinking block from index 0 to 1),
+        // and streaming text progresses
+        text = "Leading context paragraph before thinking.\n\n<think>Analyzing user query and planning response step 1\nStep 2: verifying</think>\n\nFinal answer starting..."
+        composeRule.waitForIdle()
+
+        // Verify that the preceding paragraph is rendered
+        composeRule.onNodeWithText("Leading context paragraph before thinking.").assertIsDisplayed()
+
+        // Verify that the thinking block retained its manually expanded state!
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("Analyzing user query and planning response step 1\nStep 2: verifying").assertIsDisplayed()
+
+        // Text progresses further with additional streaming chunks
+        text = "Leading context paragraph before thinking.\n\n<think>Analyzing user query and planning response step 1\nStep 2: verifying</think>\n\nFinal answer starting... and completed!"
+        composeRule.waitForIdle()
+
+        // Thinking block continues to retain its expanded state without reset or misapplication
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("Analyzing user query and planning response step 1\nStep 2: verifying").assertIsDisplayed()
+    }
+
+    @Test
+    fun chatMarkdownView_streamingBlockInsertion_doesNotMisapplyCopiedState() {
+        val fakeClipboard = FakeClipboardManager()
+        var text by mutableStateOf("```kotlin\nval x = 1\n```")
+
+        composeRule.setContent {
+            CompositionLocalProvider(LocalClipboardManager provides fakeClipboard) {
+                MaterialTheme {
+                    ChatMarkdownView(text = text, isStreaming = false)
+                }
+            }
+        }
+
+        val copyText = context.getString(R.string.chat_code_copy)
+        val copiedText = context.getString(R.string.chat_code_copied)
+
+        // Initial state: click copy on the Kotlin code block
+        composeRule.onNodeWithText(copyText).performClick()
+        composeRule.onNodeWithText(copiedText).assertIsDisplayed()
+
+        // Prepend a Python code block before the Kotlin code block
+        text = "```python\nprint('new')\n```\n\n```kotlin\nval x = 1\n```"
+        composeRule.waitForIdle()
+
+        // The newly inserted Python block must have "Copy", while the existing Kotlin block retains "Copied"
+        composeRule.onNodeWithText(copyText).assertIsDisplayed()
+        composeRule.onNodeWithText(copiedText).assertIsDisplayed()
+    }
+
+    @Test
+    fun chatContentBlock_stableKey_generatesConsistentKeys() {
+        val think1 = ChatContentBlock.ThinkingBlock("Analyzing user query and planning step 1", isStreaming = true)
+        val think2 = ChatContentBlock.ThinkingBlock("Analyzing user query and planning step 1\nwith more text appended", isStreaming = true)
+        // Thinking block key depends on first 32 chars: appending text preserves key
+        assertEquals(think1.stableKey(0), think2.stableKey(1))
+
+        val code1 = ChatContentBlock.CodeBlock("kotlin", "val x = 1\nval y = 2", isStreaming = false)
+        val code2 = ChatContentBlock.CodeBlock("kotlin", "val x = 1\nval y = 2", isStreaming = true)
+        // Code block key depends on language and code prefix
+        assertEquals(code1.stableKey(0), code2.stableKey(1))
+
+        val para = ChatContentBlock.ParagraphBlock(AnnotatedString("Hello world"))
+        assertEquals("para_${"Hello world".hashCode()}_0", para.stableKey(0))
+        assertEquals("para_${"Hello world".hashCode()}_1", para.stableKey(1))
+    }
 }

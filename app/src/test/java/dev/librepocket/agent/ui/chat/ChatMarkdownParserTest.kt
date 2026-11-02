@@ -1263,4 +1263,87 @@ class ChatMarkdownParserTest {
         assertTrue("Expected parseInlineMarkdown to complete in milliseconds (< 1000ms), took ${elapsedInline}ms", elapsedInline < 1000)
         assertTrue(annotated.text.isNotEmpty())
     }
+
+    @Test
+    fun parse_invalidCloseThinkTags_doNotPrematurelyCloseThinkingScope() {
+        val invalidCloserInput = "<think>\nStep 1\n</think?>\nStep 2\n</think!>\nStep 3\n</think .>\nFinal\n</think>"
+        val blocks = ChatMarkdownParser.parse(invalidCloserInput)
+        assertEquals(1, blocks.size)
+        assertTrue("Must be a single ThinkingBlock", blocks[0] is ChatContentBlock.ThinkingBlock)
+        val thinking = blocks[0] as ChatContentBlock.ThinkingBlock
+        assertEquals("Step 1\n</think?>\nStep 2\n</think!>\nStep 3\n</think .>\nFinal", thinking.content)
+
+        val stripped = ChatMarkdownParser.stripThinking(invalidCloserInput)
+        assertEquals("Pure thinking message with invalid closer tags must strip completely", "", stripped)
+        assertTrue("TTS read button must not be shown for stripped empty text", stripped.isBlank())
+
+        val withAnswer = "<think>Reasoning </think?> more thinking </think>Real answer"
+        val answerBlocks = ChatMarkdownParser.parse(withAnswer)
+        assertEquals(2, answerBlocks.size)
+        assertEquals("Reasoning </think?> more thinking", (answerBlocks[0] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("Real answer", (answerBlocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("Real answer", ChatMarkdownParser.stripThinking(withAnswer))
+    }
+
+    @Test
+    fun parse_quoteAwareAndOverlongThinkingTags_cotIsolatedAndTtsShielded() {
+        // Quote-aware attribute containing '>' after a previously closed thinking block
+        val input = "<think>prior</think><think note=\"a>b\">SECRET</think>"
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        assertFalse("stripThinking must strictly filter SECRET", stripped.contains("SECRET"))
+        assertEquals("", stripped)
+        assertTrue("TTS speak button must not be shown", stripped.isBlank())
+
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(2, blocks.size)
+        assertEquals("prior", (blocks[0] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("SECRET", (blocks[1] as ChatContentBlock.ThinkingBlock).content)
+
+        // Single quote variant
+        val singleQuote = "<think note='x>y'>PRIVATE</think>"
+        assertEquals("", ChatMarkdownParser.stripThinking(singleQuote))
+
+        // Attribute length exceeding 512 characters
+        val overlongAttr = "<think note=\"" + "a".repeat(600) + "\">OVERLONG_SECRET</think>"
+        val strippedOverlong = ChatMarkdownParser.stripThinking(overlongAttr)
+        assertFalse("Overlong attribute tag must fail-closed in stripThinking", strippedOverlong.contains("OVERLONG_SECRET"))
+        assertEquals("", strippedOverlong)
+
+        // Malformed attribute syntax
+        val malformedAttr = "<think ??? malformed >MALFORMED_SECRET</think>"
+        val strippedMalformed = ChatMarkdownParser.stripThinking(malformedAttr)
+        assertFalse("Malformed tag must fail-closed in stripThinking", strippedMalformed.contains("MALFORMED_SECRET"))
+        assertEquals("", strippedMalformed)
+    }
+
+    @Test(timeout = 3000)
+    fun bounds_mismatchedClosingTags_completesInMillisecondsWithoutQuadraticSlowdown() {
+        val input = "<think>".repeat(5000) + "</thought>".repeat(5000)
+        val start = System.currentTimeMillis()
+        val blocks = ChatMarkdownParser.parse(input, isStreaming = false)
+        val elapsed = System.currentTimeMillis() - start
+
+        assertTrue("Expected 5000 mismatched closing tags to complete in milliseconds (< 500ms), took ${elapsed}ms", elapsed < 500)
+        assertEquals(1, blocks.size)
+        assertTrue(blocks[0] is ChatContentBlock.ThinkingBlock)
+
+        val startStrip = System.currentTimeMillis()
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        val elapsedStrip = System.currentTimeMillis() - startStrip
+        assertTrue("Expected stripThinking on 5000 mismatched tags to complete in milliseconds (< 500ms), took ${elapsedStrip}ms", elapsedStrip < 500)
+        assertEquals("", stripped)
+    }
+
+    @Test(timeout = 3000)
+    fun bounds_italicCloserSearch_scalesLinearlyWithoutQuadraticSlowdown() {
+        for (n in listOf(100, 200, 400, 800)) {
+            val input = "*a\\` ".repeat(n) + "x**y ".repeat(n)
+            val start = System.currentTimeMillis()
+            val annotated = ChatMarkdownParser.parseInlineMarkdown(input)
+            val elapsed = System.currentTimeMillis() - start
+
+            assertTrue("Expected n=$n to complete in milliseconds (< 300ms), took ${elapsed}ms", elapsed < 300)
+            assertTrue(annotated.text.isNotEmpty())
+        }
+    }
 }

@@ -18,6 +18,7 @@ import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.unit.dp
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
@@ -270,11 +271,11 @@ class StartupGateReadFailureWiringTest {
         composeRule.onNodeWithText("重試讀取").performClick()
         assertEquals(1, h.retryReadCalls)
         composeRule.waitUntil(timeoutMillis = 10_000) {
-            vm.gate.value is EndpointGate.Ready
+            composeRule.onAllNodesWithText("OpenAI").fetchSemanticsNodes().isNotEmpty()
         }
         val ready = vm.gate.value as EndpointGate.Ready
         assertEquals("m-old", ready.config.model)
-        composeRule.onNodeWithText("OpenAI").assertIsDisplayed()
+        composeRule.onNodeWithText("OpenAI").performScrollTo().assertIsDisplayed()
         assertEquals(Routes.SETTINGS, currentRoute(h))
         composeRule.runOnIdle { assertTrue(h.visited.none { it == Routes.SETUP }) }
     }

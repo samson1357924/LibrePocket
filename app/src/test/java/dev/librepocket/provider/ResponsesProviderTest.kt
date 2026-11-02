@@ -2461,4 +2461,165 @@ class ResponsesProviderTest {
             server.shutdown()
         }
     }
+
+    // ---- Reviewer Finding 1: Negative / malformed refusal frames do not latch sawRefusal ----
+
+    @Test
+    fun malformedRefusalDeltaMissingDeltaPreservesStopTerminal() {
+        val mapper = ResponsesMapper()
+        // Missing delta and refusal in response.refusal.delta frame
+        val malformedEvents = mapper.mapPayload(
+            """{"type":"response.refusal.delta","output_index":0,"content_index":0}""",
+        )
+        assertEquals(emptyList<StreamEvent>(), malformedEvents)
+
+        // Followed by normal completed output_text -> must finish with Done("stop"), NOT Done("refusal")
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Normal answer"}]}]}}""",
+        )
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "Normal answer"),
+                StreamEvent.Done("stop"),
+            ),
+            completed,
+        )
+    }
+
+    @Test
+    fun malformedRefusalDoneMissingRefusalPreservesStopTerminal() {
+        val mapper = ResponsesMapper()
+        // Missing refusal and text in response.refusal.done frame
+        val malformedEvents = mapper.mapPayload(
+            """{"type":"response.refusal.done","output_index":0,"content_index":0}""",
+        )
+        assertEquals(emptyList<StreamEvent>(), malformedEvents)
+
+        // Followed by normal completed output_text -> must finish with Done("stop")
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Normal answer"}]}]}}""",
+        )
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "Normal answer"),
+                StreamEvent.Done("stop"),
+            ),
+            completed,
+        )
+    }
+
+    @Test
+    fun malformedContentPartDoneRefusalMissingPayloadPreservesStopTerminal() {
+        val mapper = ResponsesMapper()
+        // Part of type "refusal", but missing refusal and text fields
+        val malformedEvents = mapper.mapPayload(
+            """{"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"refusal"}}""",
+        )
+        assertEquals(emptyList<StreamEvent>(), malformedEvents)
+
+        // Followed by normal completed output_text -> must finish with Done("stop")
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Normal answer"}]}]}}""",
+        )
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "Normal answer"),
+                StreamEvent.Done("stop"),
+            ),
+            completed,
+        )
+    }
+
+    @Test
+    fun malformedCompletedOutputRefusalWithoutPayloadPreservesStopTerminal() {
+        val mapper = ResponsesMapper()
+        // Completed frame containing a malformed refusal item (type "refusal" at output_index 0 without refusal/text)
+        // alongside normal output_text message at output_index 1 (blockIndex 1000)
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"refusal"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Normal answer"}]}]}}""",
+        )
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 1000, "Normal answer"),
+                StreamEvent.Done("stop"),
+            ),
+            completed,
+        )
+
+        // Also verify malformed refusal part inside message content
+        val mapperPart = ResponsesMapper()
+        val completedPart = mapperPart.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"refusal"},{"type":"output_text","text":"Normal answer"}]}]}}""",
+        )
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 1, "Normal answer"),
+                StreamEvent.Done("stop"),
+            ),
+            completedPart,
+        )
+    }
+
+    @Test
+    fun malformedRefusalFramesSequenceFollowedByNormalOutputCompletesWithStop() {
+        val mapper = ResponsesMapper()
+        // Sequence of negative malformed refusal frames
+        val e1 = mapper.mapPayload("""{"type":"response.refusal.delta","output_index":0,"content_index":0}""")
+        assertEquals(emptyList<StreamEvent>(), e1)
+
+        val e2 = mapper.mapPayload("""{"type":"response.refusal.done","output_index":0,"content_index":0}""")
+        assertEquals(emptyList<StreamEvent>(), e2)
+
+        val e3 = mapper.mapPayload("""{"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"refusal"}}""")
+        assertEquals(emptyList<StreamEvent>(), e3)
+
+        // Followed by normal streamed output text delta
+        val e4 = mapper.mapPayload(
+            """{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Normal streamed text"}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "Normal streamed text")), e4)
+
+        // Terminal completed normal output
+        val e5 = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Normal streamed text"}]}]}}""",
+        )
+        assertEquals(listOf(StreamEvent.Done("stop")), e5)
+    }
+
+    @Test
+    fun streamFlowIgnoresMalformedRefusalFramesAndCompletesWithStop() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val body =
+                "data: {\"type\":\"response.refusal.delta\",\"output_index\":0,\"content_index\":0}\n\n" +
+                    "data: {\"type\":\"response.refusal.done\",\"output_index\":0,\"content_index\":0}\n\n" +
+                    "data: {\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"refusal\"}}\n\n" +
+                    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Valid response\"}\n\n" +
+                    "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Valid response\"}]}]}}\n\n"
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(body),
+            )
+            val provider = ResponsesProvider(
+                testConfig(server.url("/").toString().trimEnd('/')),
+                { "test_api_key".toCharArray() },
+            )
+            val events = withTimeout(10_000) {
+                provider.stream(
+                    ChatRequest(model = "gpt-4o", messages = listOf(ChatMessage("user", "Hello"))),
+                ).toList()
+            }
+            assertEquals(
+                listOf(
+                    StreamEvent.TextDelta(0, 0, "Valid response"),
+                    StreamEvent.Done("stop"),
+                ),
+                events,
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
 }

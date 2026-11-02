@@ -681,4 +681,48 @@ class ChatCompletionsProviderTest {
             server.shutdown()
         }
     }
+
+    @Test
+    fun refusalFollowedByFinishReasonLengthPreservesLength() {
+        val mapper = ChatCompletionsMapper()
+        val events = ArrayList<StreamEvent>()
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{"refusal":"I cannot fulfill this request due to length limit"},"finish_reason":null}]}""",
+        )
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{},"finish_reason":"length"}]}""",
+        )
+        mapper.markDone()
+        events += mapper.finish()
+
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "I cannot fulfill this request due to length limit"),
+                StreamEvent.Done("length"),
+            ),
+            events,
+        )
+    }
+
+    @Test
+    fun refusalFollowedByFinishReasonContentFilterPreservesContentFilter() {
+        val mapper = ChatCompletionsMapper()
+        val events = ArrayList<StreamEvent>()
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{"refusal":"I cannot fulfill this request due to policy"},"finish_reason":null}]}""",
+        )
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{},"finish_reason":"content_filter"}]}""",
+        )
+        mapper.markDone()
+        events += mapper.finish()
+
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "I cannot fulfill this request due to policy"),
+                StreamEvent.Done("content_filter"),
+            ),
+            events,
+        )
+    }
 }

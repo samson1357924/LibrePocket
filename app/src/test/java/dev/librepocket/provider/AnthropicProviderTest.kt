@@ -1,5 +1,7 @@
 package dev.librepocket.provider
 
+import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -478,6 +480,7 @@ class AnthropicProviderTest {
             ),
         )
         assertTrue(nullBody.contains("\"messages\":"))
+        assertFalse(nullBody.contains("\"response_format\""))
 
         val textBody = provider.buildBody(
             ChatRequest(
@@ -487,5 +490,44 @@ class AnthropicProviderTest {
             ),
         )
         assertTrue(textBody.contains("\"messages\":"))
+        assertFalse(textBody.contains("\"response_format\""))
+    }
+
+    @Test
+    fun streamWithUnsupportedResponseFormatEmitsFailedWithoutThrowing() = runBlocking {
+        val provider = AnthropicProvider(testConfig(), { "test-api-key".toCharArray() })
+
+        // ResponseFormat.JsonObject
+        val jsonObjectRequest = ChatRequest(
+            model = "claude-3-5-sonnet",
+            messages = listOf(ChatMessage("user", "hi")),
+            responseFormat = ResponseFormat.JsonObject,
+        )
+        val jsonObjectEvents = provider.stream(jsonObjectRequest).toList()
+        assertEquals(1, jsonObjectEvents.size)
+        val jsonObjectFailed = jsonObjectEvents.single() as StreamEvent.Failed
+        assertFalse("failure must not be retryable", jsonObjectFailed.retryable)
+        assertTrue(
+            "failure message must contain STRUCTURED_OUTPUTS_NOT_SUPPORTED: ${jsonObjectFailed.message}",
+            jsonObjectFailed.message.contains("STRUCTURED_OUTPUTS_NOT_SUPPORTED"),
+        )
+
+        // ResponseFormat.JsonSchema
+        val jsonSchemaRequest = ChatRequest(
+            model = "claude-3-5-sonnet",
+            messages = listOf(ChatMessage("user", "hi")),
+            responseFormat = ResponseFormat.JsonSchema(
+                name = "test_schema",
+                schemaJson = """{"type":"object"}""",
+            ),
+        )
+        val jsonSchemaEvents = provider.stream(jsonSchemaRequest).toList()
+        assertEquals(1, jsonSchemaEvents.size)
+        val jsonSchemaFailed = jsonSchemaEvents.single() as StreamEvent.Failed
+        assertFalse("failure must not be retryable", jsonSchemaFailed.retryable)
+        assertTrue(
+            "failure message must contain STRUCTURED_OUTPUTS_NOT_SUPPORTED: ${jsonSchemaFailed.message}",
+            jsonSchemaFailed.message.contains("STRUCTURED_OUTPUTS_NOT_SUPPORTED"),
+        )
     }
 }

@@ -2280,4 +2280,199 @@ class ResponsesProviderTest {
         )
         assertEquals(listOf(StreamEvent.TextDelta(0, 0, "I cannot")), d1)
     }
+
+    // ---- FIX-07: Refusal edge cases and end-to-end stream flow collection ----
+
+    @Test
+    fun zeroDeltaOneShotRefusalViaOutputItemDoneAndCompleted() {
+        // Direct output_item.done without any prior refusal delta (message with refusal part)
+        val mapper = ResponsesMapper()
+        val doneEvents = mapper.mapPayload(
+            """{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"refusal","refusal":"I cannot assist with this request."}]}}""",
+        )
+        assertEquals(
+            listOf(StreamEvent.TextDelta(0, 0, "I cannot assist with this request.")),
+            doneEvents.filterIsInstance<StreamEvent.TextDelta>(),
+        )
+
+        // Following completed does not re-emit the text
+        val completedEvents = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"refusal","refusal":"I cannot assist with this request."}]}]}}""",
+        )
+        assertTrue(completedEvents.filterIsInstance<StreamEvent.TextDelta>().isEmpty())
+        assertEquals(StreamEvent.Done("stop"), completedEvents.last())
+
+        // Direct output_item.done with top-level refusal item
+        val mapperTopLevel = ResponsesMapper()
+        val doneTopLevel = mapperTopLevel.mapPayload(
+            """{"type":"response.output_item.done","output_index":0,"item":{"type":"refusal","id":"ref_top","refusal":"Top-level refusal without delta"}}""",
+        )
+        assertEquals(
+            listOf(StreamEvent.TextDelta(0, 0, "Top-level refusal without delta")),
+            doneTopLevel.filterIsInstance<StreamEvent.TextDelta>(),
+        )
+
+        val completedTopLevel = mapperTopLevel.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"refusal","id":"ref_top","refusal":"Top-level refusal without delta"}]}}""",
+        )
+        assertTrue(completedTopLevel.filterIsInstance<StreamEvent.TextDelta>().isEmpty())
+        assertEquals(StreamEvent.Done("stop"), completedTopLevel.last())
+    }
+
+    @Test
+    fun zeroDeltaOneShotRefusalViaTerminalCompletedOnly() {
+        // Direct response.completed without any prior delta or done frames (terminal-only message with refusal content)
+        val mapper = ResponsesMapper()
+        val events = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"Immediate terminal refusal"}]}]}}""",
+        )
+        assertEquals(
+            listOf(StreamEvent.TextDelta(0, 0, "Immediate terminal refusal")),
+            events.filterIsInstance<StreamEvent.TextDelta>(),
+        )
+        assertEquals(StreamEvent.Done("stop"), events.last())
+
+        // Top-level refusal item shape in response.completed without prior frames
+        val mapperTopLevel = ResponsesMapper()
+        val eventsTopLevel = mapperTopLevel.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"refusal","id":"ref_2","refusal":"Direct completed refusal"}]}}""",
+        )
+        assertEquals(
+            listOf(StreamEvent.TextDelta(0, 0, "Direct completed refusal")),
+            eventsTopLevel.filterIsInstance<StreamEvent.TextDelta>(),
+        )
+        assertEquals(StreamEvent.Done("stop"), eventsTopLevel.last())
+    }
+
+    @Test
+    fun mixedTextAndRefusalMultipleOutputItemsCoordinated() {
+        val mapper = ResponsesMapper()
+        // Stream text for item 0
+        val t1 = mapper.mapPayload(
+            """{"type":"response.output_text.delta","item_id":"msg_text","output_index":0,"content_index":0,"delta":"Hello! "}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "Hello! ")), t1)
+
+        val t2 = mapper.mapPayload(
+            """{"type":"response.output_text.done","item_id":"msg_text","output_index":0,"content_index":0,"text":"Hello! I can explain the rules."}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "I can explain the rules.")), t2)
+
+        // Stream refusal for item 1
+        val r1 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","item_id":"msg_refusal","output_index":1,"content_index":0,"delta":"However, "}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 1000, "However, ")), r1)
+
+        val r2 = mapper.mapPayload(
+            """{"type":"response.refusal.done","item_id":"msg_refusal","output_index":1,"content_index":0,"refusal":"However, I cannot bypass security."}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 1000, "I cannot bypass security.")), r2)
+
+        // Terminal completed with both items reconciles without duplicate and finishes
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_text","role":"assistant","content":[{"type":"output_text","text":"Hello! I can explain the rules."}]},{"type":"message","id":"msg_refusal","role":"assistant","content":[{"type":"refusal","refusal":"However, I cannot bypass security."}]}]}}""",
+        )
+        assertTrue(
+            "completed must not duplicate consumed text or refusal: $completed",
+            completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty(),
+        )
+        assertEquals(StreamEvent.Done("stop"), completed.last())
+    }
+
+    @Test
+    fun mixedTextAndRefusalMultiplePartsInSingleMessage() {
+        val mapper = ResponsesMapper()
+        // Part 0 is text, Part 1 is refusal within the same message
+        val p0 = mapper.mapPayload(
+            """{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"Safe preamble. "}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 0, "Safe preamble. ")), p0)
+
+        val p1 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","item_id":"msg_1","output_index":0,"content_index":1,"delta":"Cannot execute command."}""",
+        )
+        assertEquals(listOf(StreamEvent.TextDelta(0, 1, "Cannot execute command.")), p1)
+
+        val done = mapper.mapPayload(
+            """{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Safe preamble. "},{"type":"refusal","refusal":"Cannot execute command."}]}}""",
+        )
+        assertTrue(done.filterIsInstance<StreamEvent.TextDelta>().isEmpty())
+
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Safe preamble. "},{"type":"refusal","refusal":"Cannot execute command."}]}]}}""",
+        )
+        assertTrue(completed.filterIsInstance<StreamEvent.TextDelta>().isEmpty())
+        assertEquals(StreamEvent.Done("stop"), completed.last())
+    }
+
+    @Test
+    fun streamFlowCollectsTextDeltasAndDoneSuccessfully() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val body =
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\n" +
+                    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\" world!\"}\n\n" +
+                    "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello world!\"}]}]}}\n\n"
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(body),
+            )
+            val provider = ResponsesProvider(
+                testConfig(server.url("/").toString().trimEnd('/')),
+                { "test_api_key".toCharArray() },
+            )
+            val events = withTimeout(10_000) {
+                provider.stream(
+                    ChatRequest(model = "gpt-4o", messages = listOf(ChatMessage("user", "Hello"))),
+                ).toList()
+            }
+            val textDeltas = events.filterIsInstance<StreamEvent.TextDelta>()
+            assertEquals(listOf("Hello", " world!"), textDeltas.map { it.delta })
+            assertTrue("last event must be Done: $events", events.last() is StreamEvent.Done)
+            assertEquals("stop", (events.last() as StreamEvent.Done).finishReason)
+            assertTrue("must not have any Failed event: $events", events.none { it is StreamEvent.Failed })
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun streamFlowCollectsRefusalDeltasAndDoneSuccessfully() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val body =
+                "data: {\"type\":\"response.refusal.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"I cannot \"}\n\n" +
+                    "data: {\"type\":\"response.refusal.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"comply.\"}\n\n" +
+                    "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"I cannot comply.\"}]}]}}\n\n"
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(body),
+            )
+            val provider = ResponsesProvider(
+                testConfig(server.url("/").toString().trimEnd('/')),
+                { "test_api_key".toCharArray() },
+            )
+            val events = withTimeout(10_000) {
+                provider.stream(
+                    ChatRequest(
+                        model = "gpt-4o",
+                        messages = listOf(ChatMessage("user", "Do something bad")),
+                        responseFormat = ResponseFormat.JsonObject,
+                    ),
+                ).toList()
+            }
+            val textDeltas = events.filterIsInstance<StreamEvent.TextDelta>()
+            assertEquals(listOf("I cannot ", "comply."), textDeltas.map { it.delta })
+            val done = events.last() as StreamEvent.Done
+            assertEquals("stop", done.finishReason)
+            assertTrue("must not have any Failed event: $events", events.none { it is StreamEvent.Failed })
+        } finally {
+            server.shutdown()
+        }
+    }
 }

@@ -69,6 +69,45 @@ class ChatCompletionsProviderTest {
     }
 
     @Test
+    fun jsonSchemaNameBoundaryAndCharacterConstraints() {
+        // Boundary lengths: 1 and 64 are valid
+        val minLen = ResponseFormat.JsonSchema(name = "a", schemaJson = "{}")
+        assertEquals("a", minLen.name)
+        val minLenOther = ResponseFormat.JsonSchema(name = "_", schemaJson = "{}")
+        assertEquals("_", minLenOther.name)
+
+        val maxName = "a".repeat(64)
+        val maxLen = ResponseFormat.JsonSchema(name = maxName, schemaJson = "{}")
+        assertEquals(maxName, maxLen.name)
+
+        // Boundary length: 65 is rejected
+        try {
+            ResponseFormat.JsonSchema(name = "a".repeat(65), schemaJson = "{}")
+            fail("expected name of length 65 to throw IllegalArgumentException")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message?.contains("name must match") == true)
+        }
+
+        // Invalid characters: @, ., /, $, and Chinese characters
+        val invalidNames = listOf(
+            "name@test",
+            "name.test",
+            "name/test",
+            "name\$test",
+            "name_測試",
+            "測試名稱",
+        )
+        for (badName in invalidNames) {
+            try {
+                ResponseFormat.JsonSchema(name = badName, schemaJson = "{}")
+                fail("expected invalid name '$badName' to throw IllegalArgumentException")
+            } catch (e: IllegalArgumentException) {
+                assertTrue(e.message?.contains("name must match") == true)
+            }
+        }
+    }
+
+    @Test
     fun buildBodySerializesJsonSchemaWithDescription() {
         val provider = ChatCompletionsProvider(testConfig(), { null })
         val rf = ResponseFormat.JsonSchema(
@@ -369,5 +408,109 @@ class ChatCompletionsProviderTest {
         val doneEvents = finishEvents.filterIsInstance<StreamEvent.Done>()
         assertEquals(1, doneEvents.size)
         assertEquals("refusal", doneEvents[0].finishReason)
+    }
+
+    @Test
+    fun streamRefusalEmptyDeltaSuppressed() {
+        val mapper = ChatCompletionsMapper()
+        val emptyEvents = mapper.mapPayload(
+            """{"choices":[{"delta":{"refusal":""}}]}""",
+        )
+        assertTrue("empty refusal delta must not produce TextDelta: $emptyEvents", emptyEvents.filterIsInstance<StreamEvent.TextDelta>().isEmpty())
+        assertTrue("empty refusal delta must produce no events: $emptyEvents", emptyEvents.isEmpty())
+
+        // Following non-empty refusal delta produces TextDelta
+        val nextEvents = mapper.mapPayload(
+            """{"choices":[{"delta":{"refusal":"I cannot fulfill this request"}}]}""",
+        )
+        val textDeltas = nextEvents.filterIsInstance<StreamEvent.TextDelta>()
+        assertEquals(1, textDeltas.size)
+        assertEquals("I cannot fulfill this request", textDeltas.single().delta)
+    }
+
+    @Test
+    fun streamRefusalFinishReasonWithEmptyDeltaYieldsOnlyDoneRefusal() {
+        // Case 1: Empty delta object with finish_reason: refusal
+        val mapper1 = ChatCompletionsMapper()
+        val events1 = ArrayList<StreamEvent>()
+        events1 += mapper1.mapPayload(
+            """{"choices":[{"delta":{},"finish_reason":"refusal"}]}""",
+        )
+        mapper1.markDone()
+        events1 += mapper1.finish()
+        assertTrue("events must not contain TextDelta: $events1", events1.none { it is StreamEvent.TextDelta })
+        val doneEvents1 = events1.filterIsInstance<StreamEvent.Done>()
+        assertEquals(1, doneEvents1.size)
+        assertEquals("refusal", doneEvents1.single().finishReason)
+        assertEquals(listOf(StreamEvent.Done("refusal")), events1)
+
+        // Case 2: Explicit empty string refusal with finish_reason: refusal
+        val mapper2 = ChatCompletionsMapper()
+        val events2 = ArrayList<StreamEvent>()
+        events2 += mapper2.mapPayload(
+            """{"choices":[{"delta":{"refusal":""},"finish_reason":"refusal"}]}""",
+        )
+        mapper2.markDone()
+        events2 += mapper2.finish()
+        assertTrue("events must not contain TextDelta: $events2", events2.none { it is StreamEvent.TextDelta })
+        val doneEvents2 = events2.filterIsInstance<StreamEvent.Done>()
+        assertEquals(1, doneEvents2.size)
+        assertEquals("refusal", doneEvents2.single().finishReason)
+        assertEquals(listOf(StreamEvent.Done("refusal")), events2)
+    }
+
+    @Test
+    fun streamRefusalWithRoundGreaterThanZero() {
+        val mapper = ChatCompletionsMapper(round = 2)
+        assertEquals(2, mapper.round)
+
+        val events = ArrayList<StreamEvent>()
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{"refusal":"Refusal at round 2"},"finish_reason":"refusal"}]}""",
+        )
+        mapper.markDone()
+        events += mapper.finish()
+
+        val textDeltas = events.filterIsInstance<StreamEvent.TextDelta>()
+        assertEquals(1, textDeltas.size)
+        val textDelta = textDeltas.single()
+        assertEquals(2, textDelta.round)
+        assertEquals("Refusal at round 2", textDelta.delta)
+        assertEquals(0, textDelta.blockIndex)
+
+        val doneEvents = events.filterIsInstance<StreamEvent.Done>()
+        assertEquals(1, doneEvents.size)
+        assertEquals("refusal", doneEvents.single().finishReason)
+    }
+
+    @Test
+    fun streamReasoningFollowedByRefusalSwitchesBlockIndex() {
+        val mapper = ChatCompletionsMapper()
+        val r1 = mapper.mapPayload(
+            """{"choices":[{"delta":{"reasoning_content":"Thinking about safety guidelines..."}}]}""",
+        )
+        val reasoningDeltas = r1.filterIsInstance<StreamEvent.ReasoningDelta>()
+        assertEquals(1, reasoningDeltas.size)
+        assertEquals(0, reasoningDeltas.single().blockIndex)
+        assertEquals("Thinking about safety guidelines...", reasoningDeltas.single().delta)
+
+        // Immediately followed by refusal delta -> blockIndex switches from reasoning to text
+        val r2 = mapper.mapPayload(
+            """{"choices":[{"delta":{"refusal":"I cannot fulfill this request."}}]}""",
+        )
+        val textDeltas = r2.filterIsInstance<StreamEvent.TextDelta>()
+        assertEquals(1, textDeltas.size)
+        val refusalDelta = textDeltas.single()
+        assertEquals("blockIndex must increment when switching from reasoning to refusal", 1, refusalDelta.blockIndex)
+        assertEquals("I cannot fulfill this request.", refusalDelta.delta)
+
+        // Continuation refusal chunks keep the switched blockIndex
+        val r3 = mapper.mapPayload(
+            """{"choices":[{"delta":{"refusal":" Policy forbids this action."}}]}""",
+        )
+        val textDeltasCont = r3.filterIsInstance<StreamEvent.TextDelta>()
+        assertEquals(1, textDeltasCont.size)
+        assertEquals(1, textDeltasCont.single().blockIndex)
+        assertEquals(" Policy forbids this action.", textDeltasCont.single().delta)
     }
 }

@@ -448,6 +448,42 @@ class ChatMarkdownUiTest {
     }
 
     @Test
+    fun messageBubble_unclosedOverlongAttributeThinking_doesNotShowSpeakButton() {
+        val overlongTag = "<think note=\"" + "a".repeat(600) + "\">UNCLOSED_SECRET_THOUGHT"
+        val msg = UiMessage(
+            id = "msg-unclosed-overlong-thinking",
+            role = "assistant",
+            text = overlongTag,
+            isPartial = false,
+        )
+        var currentMsg by mutableStateOf(msg)
+
+        composeRule.setContent {
+            MaterialTheme {
+                MessageBubble(
+                    msg = currentMsg,
+                    showSpeak = true,
+                )
+            }
+        }
+
+        // TTS button must strictly NOT be displayed for unclosed overlong attribute thinking
+        composeRule.onNodeWithContentDescription(VoiceTts.SPEAK_BUTTON_DESCRIPTION).assertDoesNotExist()
+
+        val msgWithPrior = UiMessage(
+            id = "msg-unclosed-prior-thinking",
+            role = "assistant",
+            text = "<think>prior</think><think note=\"" + "a".repeat(600) + "\">PRIVATE",
+            isPartial = false,
+        )
+
+        currentMsg = msgWithPrior
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithContentDescription(VoiceTts.SPEAK_BUTTON_DESCRIPTION).assertDoesNotExist()
+    }
+
+    @Test
     fun messageBubble_thinkingWithWhitespaceAndAttributes_rendersUIAndSuppressesTtsProperly() {
         val msg = UiMessage(
             id = "msg-whitespace-attr",
@@ -1004,8 +1040,8 @@ class ChatMarkdownUiTest {
         composeRule.onNodeWithText(copyText).performClick()
         composeRule.onNodeWithText(copiedText).assertIsDisplayed()
 
-        // Prepend a Python code block before the Kotlin code block
-        text = "```python\nprint('new')\n```\n\n```kotlin\nval x = 1\n```"
+        // Append a Python code block after the Kotlin code block
+        text = "```kotlin\nval x = 1\n```\n\n```python\nprint('new')\n```"
         composeRule.waitForIdle()
 
         // The newly inserted Python block must have "Copy", while the existing Kotlin block retains "Copied"
@@ -1014,19 +1050,67 @@ class ChatMarkdownUiTest {
     }
 
     @Test
-    fun chatContentBlock_stableKey_generatesConsistentKeys() {
-        val think1 = ChatContentBlock.ThinkingBlock("Analyzing user query and planning step 1", isStreaming = true)
-        val think2 = ChatContentBlock.ThinkingBlock("Analyzing user query and planning step 1\nwith more text appended", isStreaming = true)
-        // Thinking block key depends on first 32 chars: appending text preserves key
-        assertEquals(think1.stableKey(0), think2.stableKey(1))
+    fun chatMarkdownView_streamingThinking_preservesCollapsedStateAcrossShortContentUpdates() {
+        var text by mutableStateOf("<think>Pl")
 
-        val code1 = ChatContentBlock.CodeBlock("kotlin", "val x = 1\nval y = 2", isStreaming = false)
-        val code2 = ChatContentBlock.CodeBlock("kotlin", "val x = 1\nval y = 2", isStreaming = true)
-        // Code block key depends on language and code prefix
-        assertEquals(code1.stableKey(0), code2.stableKey(1))
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(
+                    text = text,
+                    isStreaming = true,
+                )
+            }
+        }
 
-        val para = ChatContentBlock.ParagraphBlock(AnnotatedString("Hello world"))
-        assertEquals("para_${"Hello world".hashCode()}_0", para.stableKey(0))
-        assertEquals("para_${"Hello world".hashCode()}_1", para.stableKey(1))
+        val title = context.getString(R.string.chat_thinking_title)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+
+        // Initial state during streaming: thinking card is expanded by default
+        composeRule.onNodeWithText(title).assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("Pl ▍").assertIsDisplayed()
+
+        // User manually collapses the thinking card at <think>Pl
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("Pl ▍").assertDoesNotExist()
+
+        // Progressively stream chunks (< 32 characters): Pla -> Plan -> Planning
+        text = "<think>Pla"
+        composeRule.waitForIdle()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("Pla ▍").assertDoesNotExist()
+
+        text = "<think>Plan"
+        composeRule.waitForIdle()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("Plan ▍").assertDoesNotExist()
+
+        text = "<think>Planning"
+        composeRule.waitForIdle()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("Planning ▍").assertDoesNotExist()
+    }
+
+    @Test
+    fun chatContentBlock_key_generatesStructuralKeys() {
+        val blocks = ChatMarkdownParser.parse("<think>Analyzing user query</think>\n\nHello\n\n```kotlin\nval x = 1\n```\n\n<think>Second</think>")
+        assertEquals("think_0", blocks[0].key)
+        assertEquals("para_0", blocks[1].key)
+        assertEquals("code_0", blocks[2].key)
+        assertEquals("think_1", blocks[3].key)
+
+        val think1 = ChatContentBlock.ThinkingBlock("Analyzing user query and planning step 1", isStreaming = true, key = "think_0")
+        val think2 = ChatContentBlock.ThinkingBlock("Analyzing user query and planning step 1\nwith more text appended", isStreaming = true, key = "think_0")
+        assertEquals(think1.key, think2.key)
+
+        val code1 = ChatContentBlock.CodeBlock("kotlin", "val x = 1\nval y = 2", isStreaming = false, key = "code_0")
+        val code2 = ChatContentBlock.CodeBlock("kotlin", "val x = 1\nval y = 2", isStreaming = true, key = "code_0")
+        assertEquals(code1.key, code2.key)
+
+        val para = ChatContentBlock.ParagraphBlock(AnnotatedString("Hello world"), key = "para_0")
+        assertEquals("para_0", para.key)
     }
 }

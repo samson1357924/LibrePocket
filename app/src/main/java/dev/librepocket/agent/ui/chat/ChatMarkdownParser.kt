@@ -9,36 +9,32 @@ import androidx.compose.ui.text.font.FontWeight
 
 /**
  * Structured content block parsed from chat turn text.
- * Each block provides a [stableKey] used by Compose to maintain UI state
- * (such as expansion in [ThinkingBlock] or copy feedback in [CodeBlock])
- * across streaming updates, block insertions, and content progress.
+ * Each block provides a [key] structural identity anchor used by Compose
+ * to maintain UI state (such as expansion in [ThinkingBlock] or copy feedback in [CodeBlock])
+ * across streaming updates and content progress without recreating nodes.
  */
 sealed interface ChatContentBlock {
-    fun stableKey(index: Int = 0): Any
+    val key: String
+
+    fun stableKey(index: Int = 0): Any = key
 
     data class ThinkingBlock(
         val content: String,
         val isStreaming: Boolean,
-    ) : ChatContentBlock {
-        override fun stableKey(index: Int): Any =
-            "think_${content.take(32).hashCode()}"
-    }
+        override val key: String = "think_0",
+    ) : ChatContentBlock
 
     data class CodeBlock(
         val language: String?,
         val code: String,
         val isStreaming: Boolean,
-    ) : ChatContentBlock {
-        override fun stableKey(index: Int): Any =
-            "code_${language.orEmpty()}_${code.take(32).hashCode()}"
-    }
+        override val key: String = "code_0",
+    ) : ChatContentBlock
 
     data class ParagraphBlock(
         val annotatedText: AnnotatedString,
-    ) : ChatContentBlock {
-        override fun stableKey(index: Int): Any =
-            "para_${annotatedText.text.take(32).hashCode()}_$index"
-    }
+        override val key: String = "para_0",
+    ) : ChatContentBlock
 }
 
 /**
@@ -67,10 +63,13 @@ sealed interface ChatContentBlock {
  *      leakage before subsequent stream chunks arrive.
  *
  * 3. **Bracket Matching & Monotonic Interval Absorption (括號匹配與單調區間吸收)**:
- *    - Nested thinking tags maintain a depth-counted stack ([tagStack] and [tagCounts]) with O(1) membership checks.
+ *    - Nested thinking tags maintain a doubly-linked tag stack with [lastNodeOfKind] pointers for O(1) push,
+ *      pop, and middle unlink without array copies or linear stack searches.
  *    - In [stripMalformedThinkingTags], open tag positions are pushed onto a LIFO stack. When a valid closing tag
  *      is matched, the enclosing range `[start, close.tagEnd)` is absorbed. Any previously recorded inner intervals
  *      starting at or after `start` are popped and superseded by the outer enclosing interval in a single monotonic pass.
+ *    - If unclosed suspect open tags remain at EOF, all intervals from the earliest unclosed start to EOF are absorbed
+ *      under fail-closed handling to prevent thinking content leakage.
  *    - This guarantees strict O(N) linear time with zero quadratic allocation or substring rebuilding overhead.
  */
 object ChatMarkdownParser {
@@ -98,6 +97,63 @@ object ChatMarkdownParser {
         "thought" -> 1
         "think" -> 2
         else -> -1
+    }
+
+    private class TagNode(
+        val tagId: Int,
+        var prev: TagNode? = null,
+        var next: TagNode? = null,
+        var prevSameKind: TagNode? = null,
+    )
+
+    private class TagTracker {
+        private var head: TagNode? = null
+        private var tail: TagNode? = null
+        private val lastNodeOfKind = arrayOfNulls<TagNode>(THINK_TAG_KIND_COUNT)
+        var totalCount: Int = 0
+            private set
+
+        fun push(tagId: Int) {
+            if (tagId !in 0 until THINK_TAG_KIND_COUNT) return
+            val node = TagNode(
+                tagId = tagId,
+                prev = tail,
+                next = null,
+                prevSameKind = lastNodeOfKind[tagId],
+            )
+            if (tail != null) {
+                tail!!.next = node
+            } else {
+                head = node
+            }
+            tail = node
+            lastNodeOfKind[tagId] = node
+            totalCount++
+        }
+
+        fun pop(tagId: Int): Boolean {
+            if (tagId !in 0 until THINK_TAG_KIND_COUNT) return false
+            val node = lastNodeOfKind[tagId] ?: return false
+            lastNodeOfKind[tagId] = node.prevSameKind
+
+            val p = node.prev
+            val n = node.next
+            if (p != null) {
+                p.next = n
+            } else {
+                head = n
+            }
+            if (n != null) {
+                n.prev = p
+            } else {
+                tail = p
+            }
+            node.prev = null
+            node.next = null
+
+            totalCount--
+            return totalCount == 0
+        }
     }
 
     private data class OpenThinkTag(
@@ -559,12 +615,10 @@ object ChatMarkdownParser {
                     continue
                 }
                 val contentStart = openMatch.tagEnd
-                val tagStack = ArrayList<Int>()
-                val tagCounts = IntArray(THINK_TAG_KIND_COUNT)
+                val tagTracker = TagTracker()
                 val rootId = thinkTagId(openMatch.tagName)
                 if (rootId >= 0) {
-                    tagStack.add(rootId)
-                    tagCounts[rootId]++
+                    tagTracker.push(rootId)
                 }
                 var scan = contentStart
                 var closeTagStart = -1
@@ -578,8 +632,7 @@ object ChatMarkdownParser {
                         if (!innerOpen.isSelfClosing) {
                             val openId = thinkTagId(innerOpen.tagName)
                             if (openId >= 0) {
-                                tagStack.add(openId)
-                                tagCounts[openId]++
+                                tagTracker.push(openId)
                             }
                         }
                         scan = innerOpen.tagEnd
@@ -588,26 +641,11 @@ object ChatMarkdownParser {
                     val innerClose = matchCloseThinkTag(text, nextLt)
                     if (innerClose != null) {
                         val closeId = thinkTagId(innerClose.tagName)
-                        if (closeId >= 0 && tagCounts[closeId] > 0) {
-                            if (tagStack.isNotEmpty() && tagStack.last() == closeId) {
-                                tagStack.removeAt(tagStack.lastIndex)
-                                tagCounts[closeId]--
-                                if (tagStack.isEmpty()) {
-                                    closeTagStart = nextLt
-                                    closeTagEnd = innerClose.tagEnd
-                                    break
-                                }
-                            } else {
-                                val idx = tagStack.lastIndexOf(closeId)
-                                if (idx != -1) {
-                                    tagStack.removeAt(idx)
-                                    tagCounts[closeId]--
-                                    if (tagStack.isEmpty()) {
-                                        closeTagStart = nextLt
-                                        closeTagEnd = innerClose.tagEnd
-                                        break
-                                    }
-                                }
+                        if (closeId >= 0) {
+                            if (tagTracker.pop(closeId)) {
+                                closeTagStart = nextLt
+                                closeTagEnd = innerClose.tagEnd
+                                break
                             }
                         }
                         scan = innerClose.tagEnd
@@ -751,57 +789,98 @@ object ChatMarkdownParser {
      */
     fun parse(text: String, isStreaming: Boolean = false): List<ChatContentBlock> {
         if (text.isEmpty()) {
-            return if (isStreaming) listOf(ChatContentBlock.ParagraphBlock(AnnotatedString(""))) else emptyList()
+            return if (isStreaming) listOf(ChatContentBlock.ParagraphBlock(AnnotatedString(""), key = "para_0")) else emptyList()
         }
-        return segments(text, isStreaming).mapNotNull { segment ->
+        val segments = segments(text, isStreaming)
+        var thinkingIndex = 0
+        var codeIndex = 0
+        var paraIndex = 0
+
+        val blocks = ArrayList<ChatContentBlock>(segments.size)
+        for (segment in segments) {
             when (segment.kind) {
-                Kind.TEXT -> trimBoundary(text.substring(segment.start, segment.end),
-                    segment.start == 0 || text[segment.start - 1] == '\n').takeIf { it.isNotBlank() }
-                    ?.let { ChatContentBlock.ParagraphBlock(parseInline(formatLists(it))) }
-                Kind.THINKING -> ChatContentBlock.ThinkingBlock(
-                    text.substring(segment.contentStart, segment.contentEnd).trim(), segment.unclosed && isStreaming,
-                )
-                Kind.CODE -> ChatContentBlock.CodeBlock(
-                    segment.language, text.substring(segment.contentStart, segment.contentEnd), segment.unclosed && isStreaming,
-                )
-                Kind.INDENTED_CODE -> ChatContentBlock.CodeBlock(null, buildString {
-                    var line = segment.start
-                    var first = true
-                    while (line < segment.end) {
-                        val newline = text.indexOf('\n', line).let { if (it < 0 || it >= segment.end) segment.end else it }
-                        var end = newline
-                        if (end > line && text[end - 1] == '\r') end--
-                        if (!first) append('\n')
-                        first = false
-                        // Measure tab stops in the original line. Keep a tab only if it
-                        // spans the same number of columns after dedenting.
-                        var content = line
-                        var columns = 0L
-                        var outputColumns = 0L
-                        while (content < end && (text[content] == ' ' || text[content] == '\t')) {
-                            val tab = text[content] == '\t'
-                            val next = if (tab) columns + INDENT_CODE_COLUMNS - columns % INDENT_CODE_COLUMNS else columns + 1L
-                            if (next > segment.indentColumns) {
-                                val remaining = next - maxOf(columns, segment.indentColumns)
-                                if (tab && columns >= segment.indentColumns && remaining == INDENT_CODE_COLUMNS - outputColumns % INDENT_CODE_COLUMNS) {
-                                    append('\t')
-                                } else {
-                                    repeat(remaining.toInt()) { append(' ') }
-                                }
-                                outputColumns += remaining
-                            }
-                            columns = next
-                            content++
-                        }
-                        if (columns >= segment.indentColumns) {
-                            append(text, content, end)
-                        }
-                        line = if (newline < segment.end) newline + 1 else segment.end
+                Kind.TEXT -> {
+                    val trimmed = trimBoundary(
+                        text.substring(segment.start, segment.end),
+                        segment.start == 0 || text[segment.start - 1] == '\n',
+                    )
+                    if (trimmed.isNotBlank()) {
+                        blocks.add(
+                            ChatContentBlock.ParagraphBlock(
+                                annotatedText = parseInline(formatLists(trimmed)),
+                                key = "para_${paraIndex++}",
+                            )
+                        )
                     }
-                }, segment.unclosed && isStreaming)
-                Kind.PARTIAL_TAG -> null
+                }
+                Kind.THINKING -> {
+                    blocks.add(
+                        ChatContentBlock.ThinkingBlock(
+                            content = text.substring(segment.contentStart, segment.contentEnd).trim(),
+                            isStreaming = segment.unclosed && isStreaming,
+                            key = "think_${thinkingIndex++}",
+                        )
+                    )
+                }
+                Kind.CODE -> {
+                    blocks.add(
+                        ChatContentBlock.CodeBlock(
+                            language = segment.language,
+                            code = text.substring(segment.contentStart, segment.contentEnd),
+                            isStreaming = segment.unclosed && isStreaming,
+                            key = "code_${codeIndex++}",
+                        )
+                    )
+                }
+                Kind.INDENTED_CODE -> {
+                    val codeContent = buildString {
+                        var line = segment.start
+                        var first = true
+                        while (line < segment.end) {
+                            val newline = text.indexOf('\n', line).let { if (it < 0 || it >= segment.end) segment.end else it }
+                            var end = newline
+                            if (end > line && text[end - 1] == '\r') end--
+                            if (!first) append('\n')
+                            first = false
+                            // Measure tab stops in the original line. Keep a tab only if it
+                            // spans the same number of columns after dedenting.
+                            var content = line
+                            var columns = 0L
+                            var outputColumns = 0L
+                            while (content < end && (text[content] == ' ' || text[content] == '\t')) {
+                                val tab = text[content] == '\t'
+                                val next = if (tab) columns + INDENT_CODE_COLUMNS - columns % INDENT_CODE_COLUMNS else columns + 1L
+                                if (next > segment.indentColumns) {
+                                    val remaining = next - maxOf(columns, segment.indentColumns)
+                                    if (tab && columns >= segment.indentColumns && remaining == INDENT_CODE_COLUMNS - outputColumns % INDENT_CODE_COLUMNS) {
+                                        append('\t')
+                                    } else {
+                                        repeat(remaining.toInt()) { append(' ') }
+                                    }
+                                    outputColumns += remaining
+                                }
+                                columns = next
+                                content++
+                            }
+                            if (columns >= segment.indentColumns) {
+                                append(text, content, end)
+                            }
+                            line = if (newline < segment.end) newline + 1 else segment.end
+                        }
+                    }
+                    blocks.add(
+                        ChatContentBlock.CodeBlock(
+                            language = null,
+                            code = codeContent,
+                            isStreaming = segment.unclosed && isStreaming,
+                            key = "code_${codeIndex++}",
+                        )
+                    )
+                }
+                Kind.PARTIAL_TAG -> Unit
             }
         }
+        return blocks
     }
 
     private fun matchSuspectOpenThinkTag(text: String, pos: Int): SuspectOpenTag? {
@@ -932,6 +1011,14 @@ object ChatMarkdownParser {
             }
 
             i++
+        }
+
+        if (openStarts.isNotEmpty()) {
+            val unclosedStart = openStarts.first()
+            while (removedIntervals.isNotEmpty() && removedIntervals.last().first >= unclosedStart) {
+                removedIntervals.removeAt(removedIntervals.lastIndex)
+            }
+            removedIntervals.add(unclosedStart until len)
         }
 
         if (removedIntervals.isEmpty()) return text

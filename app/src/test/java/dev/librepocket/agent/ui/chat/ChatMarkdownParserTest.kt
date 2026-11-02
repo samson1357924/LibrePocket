@@ -1200,7 +1200,7 @@ class ChatMarkdownParserTest {
         assertEquals(1, blocks.size)
         val paragraph = blocks[0] as ChatContentBlock.ParagraphBlock
         assertEquals("I <think that 5 > 3 is true> then answer", paragraph.annotatedText.text)
-        assertEquals(input, ChatMarkdownParser.stripThinking(input))
+        assertEquals("I", ChatMarkdownParser.stripThinking(input))
     }
 
     @Test
@@ -1358,7 +1358,7 @@ class ChatMarkdownParserTest {
             "Expected stripThinking on 10000 malformed unclosed tags to complete in milliseconds (< 500ms), took ${elapsed}ms",
             elapsed < 500
         )
-        assertEquals(input, stripped)
+        assertEquals("", stripped)
 
         val inputWithNonThinkCloser = "<think ??? malformed >".repeat(10000) + "</other>"
         val startNonThink = System.currentTimeMillis()
@@ -1369,7 +1369,7 @@ class ChatMarkdownParserTest {
             "Expected stripThinking with non-think closer to complete in milliseconds (< 500ms), took ${elapsedNonThink}ms",
             elapsedNonThink < 500
         )
-        assertEquals(inputWithNonThinkCloser, strippedNonThink)
+        assertEquals("", strippedNonThink)
     }
 
     @Test(timeout = 3000)
@@ -1394,9 +1394,7 @@ class ChatMarkdownParserTest {
             "Expected stripThinking on 10000 malformed suspect tags after valid tag to complete in milliseconds (< 200ms), took ${elapsedAfterValid}ms",
             elapsedAfterValid < 200
         )
-        val expectedAfterValid = "<think ??? malformed >".repeat(9999).trim()
-        assertEquals(expectedAfterValid, strippedAfterValid)
-        assertFalse("</think> must be stripped", strippedAfterValid.contains("</think>"))
+        assertEquals("", strippedAfterValid)
 
         val inputPairs = ("<think ??? malformed >" + "</think>").repeat(5000)
         val startPairs = System.currentTimeMillis()
@@ -1427,6 +1425,7 @@ class ChatMarkdownParserTest {
         val stripped = ChatMarkdownParser.stripThinking(input)
         assertFalse("CONFIDENTIAL must be stripped", stripped.contains("CONFIDENTIAL"))
         assertFalse("</think> must be stripped", stripped.contains("</think>"))
+        assertEquals("", stripped)
     }
 
     @Test
@@ -1437,6 +1436,48 @@ class ChatMarkdownParserTest {
         assertFalse("self-closing think must be stripped", stripped.contains("<think/>"))
         assertFalse("malformed self-closing think must be stripped", stripped.contains("<think ??? malformed />"))
         assertFalse("</think> must be stripped", stripped.contains("</think>"))
-        assertTrue("unclosed suspect tag must remain", stripped.contains("<think ??? unclosed>"))
+        assertFalse("unclosed suspect tag must be stripped", stripped.contains("<think ??? unclosed>"))
+        assertEquals("", stripped)
+    }
+
+    @Test
+    fun stripThinking_unclosedSuspectTagPrecededByValidClosedTag_failsClosedWithoutLeak() {
+        val overlongTag = "<think note=\"" + "a".repeat(600) + "\">PRIVATE"
+        val input = "<think>prior</think>$overlongTag"
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        assertFalse("stripThinking must not contain PRIVATE", stripped.contains("PRIVATE"))
+        assertEquals("", stripped)
+
+        val malformedTag = "<think note=\"...\" >PRIVATE"
+        val inputMalformed = "<think>prior</think>$malformedTag"
+        val strippedMalformed = ChatMarkdownParser.stripThinking(inputMalformed)
+        assertFalse("stripThinking must not contain PRIVATE", strippedMalformed.contains("PRIVATE"))
+        assertEquals("", strippedMalformed)
+
+        // Pure unclosed thinking messages must yield empty string
+        assertEquals("", ChatMarkdownParser.stripThinking(overlongTag))
+        assertEquals("", ChatMarkdownParser.stripThinking(malformedTag))
+        assertEquals("", ChatMarkdownParser.stripThinking("<think>PRIVATE"))
+        assertEquals("", ChatMarkdownParser.stripThinking("<thought>PRIVATE"))
+        assertEquals("", ChatMarkdownParser.stripThinking("<thinking>PRIVATE"))
+    }
+
+    @Test(timeout = 10000)
+    fun bounds_interleavedCrossKindThinkingTags_scalesLinearlyWithoutQuadraticSlowdown() {
+        // Warm up JIT
+        val warmInput = "<think>".repeat(500) + "<thought>".repeat(500) + "</think>".repeat(500)
+        ChatMarkdownParser.parse(warmInput)
+
+        val sizes = listOf(1000, 2000, 4000)
+        for (n in sizes) {
+            val input = "<think>".repeat(n) + "<thought>".repeat(n) + "</think>".repeat(n)
+            val start = System.currentTimeMillis()
+            val blocks = ChatMarkdownParser.parse(input)
+            val elapsed = System.currentTimeMillis() - start
+
+            assertEquals(1, blocks.size)
+            assertTrue(blocks[0] is ChatContentBlock.ThinkingBlock)
+            assertTrue("Expected n=$n to complete in milliseconds (< 1500ms), took ${elapsed}ms", elapsed < 1500)
+        }
     }
 }

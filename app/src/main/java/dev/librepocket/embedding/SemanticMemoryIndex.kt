@@ -34,7 +34,7 @@ data class SemanticEntry<T>(
     }
 
     override fun toString(): String =
-        "SemanticEntry(id=$id, text=$text, embedding=<${embedding.size} dimensions>, metadata=$metadata)"
+        "SemanticEntry(id=$id, text=<${text.length} chars>, embedding=<${embedding.size} dimensions>, metadata=${if (metadata != null) "<redacted>" else "null"})"
 }
 
 /**

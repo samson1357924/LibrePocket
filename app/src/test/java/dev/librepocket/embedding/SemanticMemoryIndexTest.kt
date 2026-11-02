@@ -1687,4 +1687,34 @@ class SemanticMemoryIndexTest {
         server.shutdown()
         runCatching { server.shutdown() }
     }
+
+    @Test
+    fun semanticEntryToStringRedactsTextAndMetadata() {
+        val secretText = "confidential personal financial notes"
+        val secretMeta = mapOf("ssn" to "123-45-6789", "tags" to listOf("private"))
+
+        val entryWithMeta = SemanticEntry(
+            id = "entry-42",
+            text = secretText,
+            embedding = floatArrayOf(0.1f, 0.2f, 0.3f),
+            metadata = secretMeta,
+        )
+
+        val strWithMeta = entryWithMeta.toString()
+        assertFalse("Raw text must not be leaked in toString", strWithMeta.contains(secretText))
+        assertFalse("Metadata content must not be leaked in toString", strWithMeta.contains("123-45-6789"))
+        assertFalse("Metadata content must not be leaked in toString", strWithMeta.contains("private"))
+        assertEquals("SemanticEntry(id=entry-42, text=<${secretText.length} chars>, embedding=<3 dimensions>, metadata=<redacted>)", strWithMeta)
+
+        val entryWithoutMeta = SemanticEntry<Unit>(
+            id = "entry-99",
+            text = "plain message",
+            embedding = floatArrayOf(0.5f, 0.5f),
+            metadata = null,
+        )
+
+        val strWithoutMeta = entryWithoutMeta.toString()
+        assertFalse("Raw text must not be leaked in toString", strWithoutMeta.contains("plain message"))
+        assertEquals("SemanticEntry(id=entry-99, text=<13 chars>, embedding=<2 dimensions>, metadata=null)", strWithoutMeta)
+    }
 }

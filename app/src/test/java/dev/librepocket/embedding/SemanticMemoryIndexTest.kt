@@ -4,9 +4,11 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
@@ -1716,5 +1718,36 @@ class SemanticMemoryIndexTest {
         val strWithoutMeta = entryWithoutMeta.toString()
         assertFalse("Raw text must not be leaked in toString", strWithoutMeta.contains("plain message"))
         assertEquals("SemanticEntry(id=entry-99, text=<13 chars>, embedding=<2 dimensions>, metadata=null)", strWithoutMeta)
+    }
+
+    @Test
+    fun searchExecutesVectorMathOnDefaultDispatcherOffCallingThread() = runBlocking {
+        val client = createTestClient()
+        val index = SemanticMemoryIndex<Unit>(client = client)
+        index.addDirect("id1", "item1", floatArrayOf(1.0f, 0.0f))
+
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(jsonEmbeddingResponse(listOf(floatArrayOf(1.0f, 0.0f))))
+        )
+
+        val callerThreadName = "caller-ui-simulation-thread"
+        val customDispatcher = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, callerThreadName)
+        }.asCoroutineDispatcher()
+
+        try {
+            withContext(customDispatcher) {
+                assertTrue(Thread.currentThread().name.startsWith(callerThreadName))
+                val results = index.search("item1", k = 1)
+                assertEquals(1, results.size)
+                assertEquals("id1", results[0].entry.id)
+                // Caller context was preserved upon resumption
+                assertTrue(Thread.currentThread().name.startsWith(callerThreadName))
+            }
+        } finally {
+            customDispatcher.close()
+        }
     }
 }

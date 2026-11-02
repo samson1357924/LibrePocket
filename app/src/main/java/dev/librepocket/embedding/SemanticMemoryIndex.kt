@@ -4,6 +4,8 @@ import java.util.PriorityQueue
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * An indexed entry containing an identifier, text, embedding vector, and optional metadata.
@@ -118,7 +120,7 @@ class SemanticMemoryIndex<T>(
     private val rwLock = ReentrantReadWriteLock()
     private val entries = LinkedHashMap<String, SemanticEntry<T>>()
 
-    @Volatile
+    // Volatile is redundant because all mutations and reads are strictly guarded by rwLock.
     private var dimension: Int? = null
 
     /**
@@ -319,7 +321,9 @@ class SemanticMemoryIndex<T>(
             ?: throw IllegalStateException("OpenAiEmbeddingClient is required for text search operations")
 
         val queryVector = nonNullClient.embed(text = query, model = model)
-        return searchByVector(queryVector = queryVector, k = k, minScore = minScore)
+        return withContext(Dispatchers.Default) {
+            searchByVector(queryVector = queryVector, k = k, minScore = minScore)
+        }
     }
 
     /**

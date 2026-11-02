@@ -10,6 +10,7 @@ import javax.net.ssl.SSLException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CopyableThrowable
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.DisposableHandle
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.Job
@@ -28,6 +29,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import okhttp3.Call
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
@@ -41,7 +43,7 @@ import okio.Buffer
  * Cancellation exception with an empty stack trace used when the API key supplier cancels.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
-class CleanCancellationException(message: String) :
+internal class CleanCancellationException(message: String) :
     CancellationException(message),
     CopyableThrowable<CleanCancellationException> {
 
@@ -115,7 +117,6 @@ class OpenAiEmbeddingClient(
     /**
      * Creates vector embeddings for the given [request].
      */
-    @OptIn(InternalCoroutinesApi::class)
     suspend fun createEmbeddings(
         request: EmbeddingRequest,
         redactInput: Boolean = this.redactInput,
@@ -150,113 +151,107 @@ class OpenAiEmbeddingClient(
             safeMessage = "API key is missing or empty",
         )
 
-        if (keyChars.isEmpty()) {
-            throw EmbeddingException(
-                statusCode = 401,
-                errorCode = EmbeddingErrorCode.UNAUTHORIZED,
-                retryable = false,
-                safeMessage = "API key is missing or empty",
-            )
-        }
-
-        val activeKeyString = String(keyChars)
-        val httpRequest: Request
         try {
-            val endpoint = resolveEndpoint(baseUrl)
-            val bodyJson = buildRequestBodyJson(request.copy(input = safeInput), redactInput)
-            val requestBody = bodyJson.toRequestBody(JSON_MEDIA_TYPE)
-            httpRequest = Request.Builder()
-                .url(endpoint)
-                .addHeader("Content-Type", "application/json")
-                .addHeader("Authorization", "Bearer $activeKeyString")
-                .post(requestBody)
-                .build()
-        } finally {
-            keyChars.fill('\u0000')
-        }
+            validateApiKey(keyChars)
 
-        fun redactErrMsg(msg: String): String = redactError(msg, activeKeyString)
-
-        val call = client.newCall(httpRequest)
-        val job = currentCoroutineContext()[Job]
-        val cancellation = job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
-            if (cause != null) {
-                call.cancel()
+            val httpRequest: Request = try {
+                val endpoint = resolveEndpoint(baseUrl)
+                val bodyJson = buildRequestBodyJson(request.copy(input = safeInput), redactInput)
+                val requestBody = bodyJson.toRequestBody(JSON_MEDIA_TYPE)
+                Request.Builder()
+                    .url(endpoint)
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + String(keyChars))
+                    .post(requestBody)
+                    .build()
+            } catch (iae: IllegalArgumentException) {
+                val safeMsg = redactError("Invalid request configuration: ${iae.message}", keyChars)
+                throw EmbeddingException(
+                    statusCode = null,
+                    errorCode = EmbeddingErrorCode.INVALID_REQUEST,
+                    retryable = false,
+                    safeMessage = safeMsg,
+                    cause = null,
+                )
             }
-        }
 
-        try {
-            currentCoroutineContext().ensureActive()
-            val response = call.execute()
+            val (call, cancellation) = newCancellableCall(httpRequest, currentCoroutineContext()[Job])
+
             try {
                 currentCoroutineContext().ensureActive()
-                if (!response.isSuccessful) {
-                    val errorSnippet = readBoundedErrorPrefix(response.body) { call.cancel() }.orEmpty()
-                    val (code, retryable) = classifyHttpError(response.code)
-                    val snippet = safeSnippet(errorSnippet, activeKeyString)
-                    val safeMsg = if (snippet.isEmpty()) "HTTP ${response.code}" else "HTTP ${response.code}: $snippet"
-                    throw EmbeddingException(
+                val response = call.execute()
+                try {
+                    currentCoroutineContext().ensureActive()
+                    if (!response.isSuccessful) {
+                        val errorSnippet = readBoundedErrorPrefix(response.body) { call.cancel() }.orEmpty()
+                        val (code, retryable) = classifyHttpError(response.code)
+                        val snippet = safeSnippet(errorSnippet, keyChars)
+                        val safeMsg = if (snippet.isEmpty()) "HTTP ${response.code}" else "HTTP ${response.code}: $snippet"
+                        throw EmbeddingException(
+                            statusCode = response.code,
+                            errorCode = code,
+                            retryable = retryable,
+                            safeMessage = safeMsg,
+                        )
+                    }
+
+                    val body = response.body
+
+                    val responseString = readBoundedBody(
+                        body = body,
+                        maxBytes = maxResponseBytes,
+                        cancelCall = { call.cancel() },
                         statusCode = response.code,
-                        errorCode = code,
-                        retryable = retryable,
-                        safeMessage = safeMsg,
                     )
+
+                    currentCoroutineContext().ensureActive()
+                    parseResponseBodyJson(
+                        responseString = responseString,
+                        fallbackModel = request.model,
+                        statusCode = response.code,
+                        expectedInputSize = safeInput.size,
+                        expectedDimensions = request.dimensions,
+                    )
+                } finally {
+                    try {
+                        response.close()
+                    } catch (_: NullPointerException) {
+                        // Defensive: OkHttp Response.close() crashes if body is null in rare cases
+                    }
                 }
-
-                val body = response.body
-
-                val responseString = readBoundedBody(
-                    body = body,
-                    maxBytes = maxResponseBytes,
-                    cancelCall = { call.cancel() },
-                    statusCode = response.code,
-                )
-
+            } catch (ce: CancellationException) {
+                call.cancel()
+                throw ce
+            } catch (ee: EmbeddingException) {
+                throw ee
+            } catch (ioe: IOException) {
                 currentCoroutineContext().ensureActive()
-                parseResponseBodyJson(
-                    responseString = responseString,
-                    fallbackModel = request.model,
-                    statusCode = response.code,
-                    expectedInputSize = safeInput.size,
-                    expectedDimensions = request.dimensions,
+                val (code, retryable) = classifyNetworkError(ioe)
+                val safeMsg = redactError("Network error: ${ioe.message}", keyChars)
+                val safeCause = IOException(safeMsg).apply { stackTrace = emptyArray() }
+                throw EmbeddingException(
+                    statusCode = null,
+                    errorCode = code,
+                    retryable = retryable,
+                    safeMessage = safeMsg,
+                    cause = safeCause,
+                )
+            } catch (se: SecurityException) {
+                currentCoroutineContext().ensureActive()
+                val safeMsg = redactError("Security error: ${se.message}", keyChars)
+                val safeCause = SecurityException(safeMsg).apply { stackTrace = emptyArray() }
+                throw EmbeddingException(
+                    statusCode = null,
+                    errorCode = EmbeddingErrorCode.NETWORK_ERROR,
+                    retryable = false,
+                    safeMessage = safeMsg,
+                    cause = safeCause,
                 )
             } finally {
-                try {
-                    response.close()
-                } catch (_: NullPointerException) {
-                    // Defensive: OkHttp Response.close() crashes if body is null in rare cases
-                }
+                cancellation?.dispose()
             }
-        } catch (ce: CancellationException) {
-            call.cancel()
-            throw ce
-        } catch (ee: EmbeddingException) {
-            throw ee
-        } catch (ioe: IOException) {
-            currentCoroutineContext().ensureActive()
-            val (code, retryable) = classifyNetworkError(ioe)
-            val safeMsg = redactErrMsg("Network error: ${ioe.message}")
-            val safeCause = IOException(safeMsg).apply { stackTrace = emptyArray() }
-            throw EmbeddingException(
-                statusCode = null,
-                errorCode = code,
-                retryable = retryable,
-                safeMessage = safeMsg,
-                cause = safeCause,
-            )
-        } catch (se: SecurityException) {
-            currentCoroutineContext().ensureActive()
-            val safeMsg = redactErrMsg("Security error: ${se.message}")
-            val safeCause = SecurityException(safeMsg).apply { stackTrace = emptyArray() }
-            throw EmbeddingException(
-                statusCode = null,
-                errorCode = EmbeddingErrorCode.NETWORK_ERROR,
-                retryable = false,
-                safeMessage = safeMsg,
-                cause = safeCause,
-            )
         } finally {
-            cancellation?.dispose()
+            keyChars.fill('\u0000')
         }
     }
 
@@ -286,13 +281,57 @@ class OpenAiEmbeddingClient(
         return response.data.first().embedding
     }
 
+    @OptIn(InternalCoroutinesApi::class)
+    internal fun newCancellableCall(
+        request: Request,
+        job: Job? = null,
+    ): Pair<Call, DisposableHandle?> {
+        val call = client.newCall(request)
+        val cancellation = job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+            if (cause != null) {
+                call.cancel()
+            }
+        }
+        return call to cancellation
+    }
+
     companion object {
         const val DEFAULT_BASE_URL = "https://api.openai.com"
         const val MAX_RESPONSE_BYTES = 5 * 1024 * 1024L // 5 MB (safely bounds decoded response-body bytes on mobile)
         const val CALL_TIMEOUT_SECONDS = 60L
         const val MAX_SUPPORTED_DIMENSION = 3072
+        const val BEARER_MAX_CHARS = 8_192
         private const val CHUNK_SIZE = 8192L
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+        internal fun validateApiKey(keyChars: CharArray) {
+            if (keyChars.isEmpty()) {
+                throw EmbeddingException(
+                    statusCode = 401,
+                    errorCode = EmbeddingErrorCode.UNAUTHORIZED,
+                    retryable = false,
+                    safeMessage = "API key is missing or empty",
+                )
+            }
+            if (keyChars.size > BEARER_MAX_CHARS) {
+                throw EmbeddingException(
+                    statusCode = 401,
+                    errorCode = EmbeddingErrorCode.UNAUTHORIZED,
+                    retryable = false,
+                    safeMessage = "API key exceeds maximum allowed length of $BEARER_MAX_CHARS characters",
+                )
+            }
+            for (c in keyChars) {
+                if (c.code !in 0x21..0x7E) {
+                    throw EmbeddingException(
+                        statusCode = 401,
+                        errorCode = EmbeddingErrorCode.UNAUTHORIZED,
+                        retryable = false,
+                        safeMessage = "API key contains invalid characters (must be printable ASCII)",
+                    )
+                }
+            }
+        }
 
         internal fun isLoopbackHost(host: String): Boolean {
             val h = host.lowercase().trim('[', ']').trimEnd('.')
@@ -307,7 +346,9 @@ class OpenAiEmbeddingClient(
         internal fun isOpenAiOfficialEndpoint(url: HttpUrl): Boolean {
             val scheme = url.scheme.lowercase()
             val host = url.host.lowercase()
-            return scheme == "https" && host == "api.openai.com" && url.port == 443
+            val path = url.encodedPath.trimEnd('/')
+            val validOfficialPath = path.isEmpty() || path == "/v1" || path == "/v1/embeddings" || path == "/embeddings"
+            return scheme == "https" && host == "api.openai.com" && url.port == 443 && validOfficialPath
         }
 
         internal fun validateEndpoint(baseUrl: String, allowTestLoopback: Boolean): HttpUrl {
@@ -318,6 +359,22 @@ class OpenAiEmbeddingClient(
                     retryable = false,
                     safeMessage = "Invalid baseUrl: cannot parse URL",
                 )
+            if (httpUrl.query != null || httpUrl.fragment != null) {
+                throw EmbeddingException(
+                    statusCode = null,
+                    errorCode = EmbeddingErrorCode.ENDPOINT_NOT_ALLOWED,
+                    retryable = false,
+                    safeMessage = "Disallowed endpoint: baseUrl cannot contain query parameters or fragments",
+                )
+            }
+            if (httpUrl.username.isNotEmpty() || httpUrl.password.isNotEmpty()) {
+                throw EmbeddingException(
+                    statusCode = null,
+                    errorCode = EmbeddingErrorCode.ENDPOINT_NOT_ALLOWED,
+                    retryable = false,
+                    safeMessage = "Disallowed endpoint: baseUrl cannot contain credentials",
+                )
+            }
             val isOfficialOpenAi = isOpenAiOfficialEndpoint(httpUrl)
             val host = httpUrl.host.lowercase()
             val isLoopback = isLoopbackHost(host)
@@ -346,6 +403,23 @@ class OpenAiEmbeddingClient(
         }
 
         internal fun resolveEndpoint(baseUrl: String): String {
+            val httpUrl = baseUrl.toHttpUrlOrNull()
+            if (httpUrl != null) {
+                val path = httpUrl.encodedPath.trimEnd('/')
+                val newPath = when {
+                    path.endsWith("/v1/embeddings") -> path
+                    path.endsWith("/embeddings") -> path
+                    path.endsWith("/v1") -> "$path/embeddings"
+                    path.isEmpty() -> "/v1/embeddings"
+                    else -> "$path/v1/embeddings"
+                }
+                return httpUrl.newBuilder()
+                    .encodedPath(newPath)
+                    .query(null)
+                    .fragment(null)
+                    .build()
+                    .toString()
+            }
             val trimmed = baseUrl.trimEnd('/')
             return when {
                 trimmed.endsWith("/v1/embeddings") -> trimmed
@@ -477,6 +551,35 @@ class OpenAiEmbeddingClient(
                 error("unterminated string")
             }
 
+            fun skipString() {
+                skipWs()
+                if (pos >= len || json[pos] != '"') error("expected string quote")
+                pos++
+                while (pos < len) {
+                    val c = json[pos++]
+                    if (c == '"') return
+                    if (c < ' ') error("unescaped control character in string")
+                    if (c == '\\') {
+                        if (pos >= len) error("unexpected EOF in string escape")
+                        when (val esc = json[pos++]) {
+                            '"', '\\', '/', 'b', 'f', 'n', 'r', 't' -> {}
+                            'u' -> {
+                                if (pos + 4 > len) error("unexpected EOF in unicode escape")
+                                for (i in 0..3) {
+                                    val hc = json[pos + i]
+                                    if (hc !in '0'..'9' && hc !in 'a'..'f' && hc !in 'A'..'F') {
+                                        error("invalid unicode escape '\\u${json.substring(pos, pos + 4)}'")
+                                    }
+                                }
+                                pos += 4
+                            }
+                            else -> error("invalid escape sequence '\\$esc'")
+                        }
+                    }
+                }
+                error("unterminated string")
+            }
+
             fun skipValue(depth: Int = 0) {
                 if (depth > 64) error("Nesting depth limit exceeded (max 64)")
                 skipWs()
@@ -495,7 +598,7 @@ class OpenAiEmbeddingClient(
                                 if (pos < len && json[pos] == '}') error("trailing comma in skipped object")
                             }
                             first = false
-                            readString()
+                            skipString()
                             expect(':')
                             skipValue(depth + 1)
                         }
@@ -516,17 +619,17 @@ class OpenAiEmbeddingClient(
                             skipValue(depth + 1)
                         }
                     }
-                    '"' -> readString()
+                    '"' -> skipString()
                     't' -> {
-                        if (pos + 4 <= len && json.substring(pos, pos + 4) == "true") pos += 4
+                        if (json.startsWith("true", pos)) pos += 4
                         else error("invalid literal")
                     }
                     'f' -> {
-                        if (pos + 5 <= len && json.substring(pos, pos + 5) == "false") pos += 5
+                        if (json.startsWith("false", pos)) pos += 5
                         else error("invalid literal")
                     }
                     'n' -> {
-                        if (pos + 4 <= len && json.substring(pos, pos + 4) == "null") pos += 4
+                        if (json.startsWith("null", pos)) pos += 4
                         else error("invalid literal")
                     }
                     in '0'..'9', '-' -> {
@@ -655,7 +758,7 @@ class OpenAiEmbeddingClient(
                                         skipWs()
                                         expect('[')
                                         var count = 0
-                                        var capacity = 512
+                                        var capacity = minOf(MAX_SUPPORTED_DIMENSION, expectedDimensions ?: 1536)
                                         var buf = FloatArray(capacity)
                                         var firstFloat = true
                                         while (true) {
@@ -906,9 +1009,12 @@ class OpenAiEmbeddingClient(
             return false
         }
 
-        internal fun safeSnippet(raw: String?, activeKey: String? = null, limit: Int = 200): String {
+        internal fun safeSnippet(raw: String?, activeKey: String? = null, limit: Int = 200): String =
+            safeSnippet(raw, activeKey?.toCharArray(), limit)
+
+        internal fun safeSnippet(raw: String?, keyChars: CharArray?, limit: Int = 200): String {
             if (raw.isNullOrBlank()) return ""
-            val redacted = redactError(raw, activeKey)
+            val redacted = redactError(raw, keyChars)
             val oneLine = redacted.replace(Regex("\\s+"), " ").trim()
             if (oneLine.length <= limit) return oneLine
 
@@ -917,11 +1023,50 @@ class OpenAiEmbeddingClient(
             val closeBracket = oneLine.lastIndexOf("⟧", cutIndex)
             if (openBracket != -1 && openBracket > closeBracket) {
                 val nextClose = oneLine.indexOf("⟧", cutIndex)
-                if (nextClose != -1) {
+                if (nextClose != -1 && nextClose <= limit + 64) {
                     cutIndex = nextClose + 1
                 }
             }
             return if (cutIndex >= oneLine.length) oneLine else oneLine.take(cutIndex) + "…"
+        }
+
+        internal fun redactKey(message: String, keyChars: CharArray?): String {
+            if (keyChars == null || keyChars.isEmpty()) return message
+            val keyLen = keyChars.size
+            val msgLen = message.length
+            if (msgLen < keyLen) return message
+
+            var out: StringBuilder? = null
+            var cursor = 0
+            var i = 0
+            while (i <= msgLen - keyLen) {
+                var matches = true
+                for (j in 0 until keyLen) {
+                    val mc = message[i + j]
+                    val kc = keyChars[j]
+                    if (mc.lowercaseChar() != kc.lowercaseChar()) {
+                        matches = false
+                        break
+                    }
+                }
+                if (matches) {
+                    if (out == null) out = StringBuilder(msgLen + 32)
+                    out.append(message, cursor, i)
+                    out.append("⟦REDACTED:API_KEY⟧")
+                    cursor = i + keyLen
+                    i = cursor
+                } else {
+                    i++
+                }
+            }
+            if (out == null) return message
+            if (cursor < msgLen) out.append(message, cursor, msgLen)
+            return out.toString()
+        }
+
+        internal fun redactError(message: String, keyChars: CharArray?): String {
+            val text = redactKey(message, keyChars)
+            return Redactor.redactError(text)
         }
 
         internal fun redactError(message: String, activeKey: String?): String {

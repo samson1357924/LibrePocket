@@ -50,7 +50,9 @@ class OpenAiEmbeddingClientTest {
 
     @After
     fun tearDown() {
-        server.shutdown()
+        if (::server.isInitialized) {
+            runCatching { server.shutdown() }
+        }
     }
 
     private fun jsonEmbeddingResponse(
@@ -495,30 +497,35 @@ class OpenAiEmbeddingClientTest {
             allowTestLoopback = true,
         )
 
-        // Hang socket so execute waits for headers and stays blocked until cancel
-        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        try {
+            // Hang socket so execute waits for headers and stays blocked until cancel
+            server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
 
-        val job = launch(Dispatchers.IO) {
-            try {
-                client.createEmbeddings(EmbeddingRequest(input = listOf("test")))
-            } catch (_: CancellationException) {
-                // Expected on cancellation
+            val job = launch(Dispatchers.IO) {
+                try {
+                    client.createEmbeddings(EmbeddingRequest(input = listOf("test")))
+                } catch (_: CancellationException) {
+                    // Expected on cancellation
+                }
             }
+
+            // Wait until server receives request
+            val req = server.takeRequest(5, TimeUnit.SECONDS)
+            assertNotNull(req)
+
+            // Cancel the coroutine
+            job.cancelAndJoin()
+
+            // Verify OkHttp call was cancelled
+            val cancelled = withContext(Dispatchers.IO) {
+                callCancelled.await(5, TimeUnit.SECONDS)
+            }
+            assertTrue("OkHttp Call.cancel must be invoked on coroutine cancellation", cancelled)
+            assertTrue(cancelObserved.get())
+        } finally {
+            customClient.dispatcher.executorService.shutdownNow()
+            customClient.connectionPool.evictAll()
         }
-
-        // Wait until server receives request
-        val req = server.takeRequest(5, TimeUnit.SECONDS)
-        assertNotNull(req)
-
-        // Cancel the coroutine
-        job.cancelAndJoin()
-
-        // Verify OkHttp call was cancelled
-        val cancelled = withContext(Dispatchers.IO) {
-            callCancelled.await(3, TimeUnit.SECONDS)
-        }
-        assertTrue("OkHttp Call.cancel must be invoked on coroutine cancellation", cancelled)
-        assertTrue(cancelObserved.get())
     }
 
     @Test
@@ -1576,5 +1583,183 @@ class OpenAiEmbeddingClientTest {
         }
         assertEquals(EmbeddingErrorCode.INVALID_RESPONSE, ex.errorCode)
         assertTrue(ex.safeMessage.contains("Embedding dimension mismatch: expected 256, got 2"))
+    }
+
+    @Test
+    fun apiKeyWithControlCharactersThrowsUnauthorized() = runBlocking {
+        val clientCrLf = OpenAiEmbeddingClient(
+            baseUrl = server.url("/").toString(),
+            apiKey = { "sk-test\r\nHost: evil.com".toCharArray() },
+            allowTestLoopback = true,
+        )
+        val ex = assertThrows(EmbeddingException::class.java) {
+            runBlocking { clientCrLf.createEmbeddings(EmbeddingRequest(input = listOf("test"))) }
+        }
+        assertEquals(EmbeddingErrorCode.UNAUTHORIZED, ex.errorCode)
+        assertEquals(401, ex.statusCode)
+        assertTrue(ex.safeMessage.contains("invalid characters"))
+        assertFalse(ex.safeMessage.contains("sk-test"))
+    }
+
+    @Test
+    fun apiKeyExceedingBearerMaxCharsThrowsUnauthorized() = runBlocking {
+        val hugeKey = CharArray(OpenAiEmbeddingClient.BEARER_MAX_CHARS + 1) { 'a' }
+        val client = OpenAiEmbeddingClient(
+            baseUrl = server.url("/").toString(),
+            apiKey = { hugeKey },
+            allowTestLoopback = true,
+        )
+        val ex = assertThrows(EmbeddingException::class.java) {
+            runBlocking { client.createEmbeddings(EmbeddingRequest(input = listOf("test"))) }
+        }
+        assertEquals(EmbeddingErrorCode.UNAUTHORIZED, ex.errorCode)
+        assertEquals(401, ex.statusCode)
+        assertTrue(ex.safeMessage.contains("exceeds maximum allowed length"))
+    }
+
+    @Test
+    fun baseUrlWithQueryOrFragmentThrowsEndpointNotAllowed() {
+        val exQuery = assertThrows(EmbeddingException::class.java) {
+            OpenAiEmbeddingClient.validateEndpoint("https://api.openai.com?leak=1", allowTestLoopback = false)
+        }
+        assertEquals(EmbeddingErrorCode.ENDPOINT_NOT_ALLOWED, exQuery.errorCode)
+
+        val exFrag = assertThrows(EmbeddingException::class.java) {
+            OpenAiEmbeddingClient.validateEndpoint("https://api.openai.com#frag", allowTestLoopback = false)
+        }
+        assertEquals(EmbeddingErrorCode.ENDPOINT_NOT_ALLOWED, exFrag.errorCode)
+    }
+
+    @Test
+    fun baseUrlWithCredentialsThrowsEndpointNotAllowed() {
+        val ex = assertThrows(EmbeddingException::class.java) {
+            OpenAiEmbeddingClient.validateEndpoint("https://user:pass@api.openai.com", allowTestLoopback = false)
+        }
+        assertEquals(EmbeddingErrorCode.ENDPOINT_NOT_ALLOWED, ex.errorCode)
+    }
+
+    @Test
+    fun officialEndpointWithInvalidPathThrowsEndpointNotAllowed() {
+        val ex = assertThrows(EmbeddingException::class.java) {
+            OpenAiEmbeddingClient.validateEndpoint("https://api.openai.com/other/path", allowTestLoopback = false)
+        }
+        assertEquals(EmbeddingErrorCode.ENDPOINT_NOT_ALLOWED, ex.errorCode)
+    }
+
+    @Test
+    fun redactKeyMatchesCaseInsensitivelyAndMultipleOccurrences() {
+        val key = "dummy-redact-token-123".toCharArray()
+        val msg = "Error: Key DUMMY-REDACT-TOKEN-123 failed, retrying with dummy-redact-token-123 at the end: Dummy-Redact-Token-123"
+        val redacted = OpenAiEmbeddingClient.redactKey(msg, key)
+        assertEquals(
+            "Error: Key ⟦REDACTED:API_KEY⟧ failed, retrying with ⟦REDACTED:API_KEY⟧ at the end: ⟦REDACTED:API_KEY⟧",
+            redacted
+        )
+    }
+
+    @Test
+    fun newCancellableCallCancelsOnJobCancellation(): Unit = runBlocking {
+        val client = OpenAiEmbeddingClient(
+            baseUrl = server.url("/").toString(),
+            apiKey = { "key".toCharArray() },
+            allowTestLoopback = true,
+        )
+        val request = okhttp3.Request.Builder()
+            .url(server.url("/v1/embeddings"))
+            .build()
+        val job = kotlinx.coroutines.Job()
+        val (call, handle) = client.newCancellableCall(request, job)
+        assertNotNull(handle)
+        assertFalse(call.isCanceled())
+
+        job.cancel()
+        assertTrue(call.isCanceled())
+        handle?.dispose()
+    }
+
+    @Test
+    fun newCancellableCallDisposePreventsCancel(): Unit = runBlocking {
+        val client = OpenAiEmbeddingClient(
+            baseUrl = server.url("/").toString(),
+            apiKey = { "key".toCharArray() },
+            allowTestLoopback = true,
+        )
+        val request = okhttp3.Request.Builder()
+            .url(server.url("/v1/embeddings"))
+            .build()
+        val job = kotlinx.coroutines.Job()
+        val (call, handle) = client.newCancellableCall(request, job)
+        assertNotNull(handle)
+        handle?.dispose()
+
+        job.cancel()
+        assertFalse(call.isCanceled())
+    }
+
+    @Test
+    fun parseStreamingResponseSkipsLiteralsTrueFalseNull() {
+        val jsonWithLiterals = """{
+            "object": "list",
+            "boolean_flag": true,
+            "another_flag": false,
+            "null_field": null,
+            "data": [
+                {
+                    "object": "embedding",
+                    "index": 0,
+                    "embedding": [0.1, 0.2]
+                }
+            ],
+            "model": "text-embedding-3-small",
+            "usage": {
+                "prompt_tokens": 5,
+                "total_tokens": 5
+            }
+        }""".trimIndent()
+
+        val resp = OpenAiEmbeddingClient.parseResponseBodyJson(
+            responseString = jsonWithLiterals,
+            fallbackModel = "fallback",
+            statusCode = 200,
+            expectedInputSize = 1,
+        )
+        assertEquals(1, resp.data.size)
+        assertEquals(2, resp.data[0].embedding.size)
+    }
+
+    @Test
+    fun parseStreamingResponseSkipsStringWithValidEscapes() {
+        val jsonWithEscapedString = """{
+            "object": "list",
+            "ignored_str": "hello \n \t \r \b \f \" \\ \/ \u0041 world",
+            "nested_obj": {
+                "inner_str": "escaped \"quotes\" and \\slash"
+            },
+            "data": [
+                {
+                    "object": "embedding",
+                    "index": 0,
+                    "embedding": [0.1, 0.2]
+                }
+            ],
+            "model": "text-embedding-3-small"
+        }""".trimIndent()
+
+        val resp = OpenAiEmbeddingClient.parseResponseBodyJson(
+            responseString = jsonWithEscapedString,
+            fallbackModel = "fallback",
+            statusCode = 200,
+            expectedInputSize = 1,
+        )
+        assertEquals(1, resp.data.size)
+        assertEquals(2, resp.data[0].embedding.size)
+    }
+
+    @Test
+    fun cleanCancellationExceptionProperties() {
+        val ex = CleanCancellationException("test cancellation")
+        assertEquals("test cancellation", ex.message)
+        assertTrue(ex.stackTrace.isEmpty())
+        assertNull(ex.createCopy())
     }
 }

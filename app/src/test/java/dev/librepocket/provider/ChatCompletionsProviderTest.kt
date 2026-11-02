@@ -595,4 +595,89 @@ class ChatCompletionsProviderTest {
             server.shutdown()
         }
     }
+
+    @Test
+    fun refusalDeltaWithFinishReasonStopYieldsDoneRefusal() {
+        val mapper = ChatCompletionsMapper()
+        val events = ArrayList<StreamEvent>()
+        // Real OpenAI wire sends refusal in delta, but finish_reason: "stop"
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{"refusal":"I cannot fulfill this request"}}]}""",
+        )
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{},"finish_reason":"stop"}]}""",
+        )
+        mapper.markDone()
+        events += mapper.finish()
+
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "I cannot fulfill this request"),
+                StreamEvent.Done("refusal"),
+            ),
+            events,
+        )
+    }
+
+    @Test
+    fun proxyFinishReasonRefusalWithoutRefusalInDeltaYieldsDoneRefusal() {
+        val mapper = ChatCompletionsMapper()
+        val events = ArrayList<StreamEvent>()
+        // Proxy natively sends finish_reason: "refusal" without refusal in delta
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{"content":"I cannot help."}}]}""",
+        )
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{},"finish_reason":"refusal"}]}""",
+        )
+        mapper.markDone()
+        events += mapper.finish()
+
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "I cannot help."),
+                StreamEvent.Done("refusal"),
+            ),
+            events,
+        )
+    }
+
+    @Test
+    fun streamFlowCollectsRefusalWithFinishReasonStopYieldsDoneRefusal() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val body =
+                "data: {\"choices\":[{\"delta\":{\"refusal\":\"I cannot comply.\"}}]}\n\n" +
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+                    "data: [DONE]\n\n"
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(body),
+            )
+            val provider = ChatCompletionsProvider(
+                testConfig(server.url("/").toString().trimEnd('/')),
+                { "test_api_key".toCharArray() },
+            )
+            val events = withTimeout(10_000) {
+                provider.stream(
+                    ChatRequest(
+                        model = "gpt-4o",
+                        messages = listOf(ChatMessage("user", "Do something bad")),
+                        responseFormat = ResponseFormat.JsonObject,
+                    ),
+                ).toList()
+            }
+            assertEquals(
+                listOf(
+                    StreamEvent.TextDelta(0, 0, "I cannot comply."),
+                    StreamEvent.Done("refusal"),
+                ),
+                events,
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
 }

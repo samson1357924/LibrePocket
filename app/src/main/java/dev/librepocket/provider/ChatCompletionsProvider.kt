@@ -223,6 +223,7 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
     // generated here at finish(), never decremented).
     private var totalAggChars = 0
     private var finishReason: String? = null
+    private var sawRefusal = false
     private var webSearchCitationEmitted = false
     private var usage: StreamEvent.Usage? = null
     private var sawDone = false
@@ -313,7 +314,9 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
                 out.add(StreamEvent.TextDelta(round, blockIndex, ServerToolTranscript.webSearchMarker("completed")))
             }
         }
-        choice?.string("finish_reason")?.let { if (it.isNotEmpty() && it != "null") finishReason = it }
+        val reason = choice?.string("finish_reason")
+        if (reason == "refusal") sawRefusal = true
+        if (!reason.isNullOrEmpty() && reason != "null") finishReason = reason
         root.obj("usage")?.let { u ->
             val inp = u.int("prompt_tokens")
             val outp = u.int("completion_tokens")
@@ -356,7 +359,8 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
         }
         // Usage was already emitted inline when seen; keep terminal compact.
         if (finishReason != null && sawDone) {
-            out.add(StreamEvent.Done(finishReason!!))
+            val effectiveReason = if (sawRefusal && finishReason == "stop") "refusal" else finishReason!!
+            out.add(StreamEvent.Done(effectiveReason))
         } else {
             out.add(StreamEvent.Failed("SSE_TRUNCATED", retryable = true))
         }
@@ -369,6 +373,10 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
     }
 
     private fun deltaText(delta: MiniJson.JObj): String? {
+        val refusal = delta.string("refusal")
+        if (refusal != null) {
+            sawRefusal = true
+        }
         delta.string("content")?.takeIf { it.isNotEmpty() }?.let { return it }
         val parts = delta.arr("content")?.items?.filterIsInstance<MiniJson.JObj>()
         if (parts != null) {
@@ -379,7 +387,7 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
             }
             sb.toString().ifEmpty { null }?.let { return it }
         }
-        delta.string("refusal")?.takeIf { it.isNotEmpty() }?.let { return it }
+        if (!refusal.isNullOrEmpty()) return refusal
         return null
     }
 

@@ -371,6 +371,7 @@ internal class ResponsesMapper(val round: Int = 0) {
     // (reasoning item added/done); completed reconciliation emits at most
     // one more marker for terminal-only reasoning items.
     private var reasoningPresentSeen = false
+    private var sawRefusal = false
     // P2-7: last emitted web-search state per item key, so a repeated
     // lifecycle frame for the same item emits only on a state change.
     private val webSearchStates = LinkedHashMap<String, String>()
@@ -440,6 +441,7 @@ internal class ResponsesMapper(val round: Int = 0) {
             "response.output_text.delta",
             "response.refusal.delta",
             -> {
+                if (type == "response.refusal.delta") sawRefusal = true
                 val delta = root.string("delta") ?: root.string("refusal") ?: return emptyList()
                 // Empty-delta suppression (parity with ChatCompletions): an
                 // empty frame yields NO event, so it can never park an empty
@@ -482,6 +484,7 @@ internal class ResponsesMapper(val round: Int = 0) {
             "response.output_text.done",
             "response.refusal.done",
             -> {
+                if (type == "response.refusal.done") sawRefusal = true
                 // Authoritative text for one streamed block. Reconcile through
                 // the same buffer as completed: emit only the missing suffix
                 // and advance the buffer so a later completed item is a no-op.
@@ -504,6 +507,9 @@ internal class ResponsesMapper(val round: Int = 0) {
             }
             "response.content_part.done" -> {
                 val part = root.obj("part") ?: return emptyList()
+                if (part.string("type") == "refusal" || part.string("refusal") != null) {
+                    sawRefusal = true
+                }
                 val partType = part.string("type")
                 if (partType != "output_text" && partType != "text" && partType != "refusal") return emptyList()
                 val text = (if (partType == "refusal") part.string("refusal") else null)
@@ -669,6 +675,7 @@ internal class ResponsesMapper(val round: Int = 0) {
             }
             "response.output_item.done" -> {
                 val item = root.obj("item") ?: return emptyList()
+                if (hasRefusal(item)) sawRefusal = true
                 if (item.string("type") == "web_search_call") {
                     if (textIdentityConflict || toolIdentityConflict) return emptyList()
                     emitWebSearchMarker(root, "completed", out)
@@ -750,6 +757,9 @@ internal class ResponsesMapper(val round: Int = 0) {
                 if (latchedConflict(out)) return out
                 val response = root.obj("response")
                 val output = response?.arr("output")?.items
+                output?.forEach { j ->
+                    (j as? MiniJson.JObj)?.let { if (hasRefusal(it)) sawRefusal = true }
+                }
                 val terminalUsage = usageOf(response)
                 if (output == null || output.isEmpty()) {
                     // Authoritative terminal with empty output: recover from the
@@ -768,7 +778,7 @@ internal class ResponsesMapper(val round: Int = 0) {
                         out.add(it)
                     }
                     finishPendingTools(out)
-                    terminal = StreamEvent.Done("stop")
+                    terminal = StreamEvent.Done(if (sawRefusal) "refusal" else "stop")
                     out.add(terminal!!)
                     terminalReached = true
                     return out
@@ -830,7 +840,7 @@ internal class ResponsesMapper(val round: Int = 0) {
                     out.add(it)
                 }
                 out.addAll(reconciled)
-                terminal = StreamEvent.Done("stop")
+                terminal = StreamEvent.Done(if (sawRefusal) "refusal" else "stop")
                 out.add(terminal!!)
                 terminalReached = true
             }
@@ -1038,6 +1048,12 @@ internal class ResponsesMapper(val round: Int = 0) {
         // closedTextBlocks is likewise retained: a delta after an already
         // closed `*.done` must still fail even if the text buffers were
         // dropped by the cap.
+    }
+
+    private fun hasRefusal(item: MiniJson.JObj): Boolean {
+        if (item.string("type") == "refusal" || item.string("refusal") != null) return true
+        val content = item.arr("content")?.items?.filterIsInstance<MiniJson.JObj>() ?: return false
+        return content.any { it.string("type") == "refusal" || it.string("refusal") != null }
     }
 
     /**

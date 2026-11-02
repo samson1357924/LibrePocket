@@ -2118,7 +2118,7 @@ class ResponsesProviderTest {
         val completed = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I cannot fulfill this request"}]}]}}""",
         )
-        assertEquals(listOf(StreamEvent.Done("stop")), completed)
+        assertEquals(listOf(StreamEvent.Done("refusal")), completed)
     }
 
     @Test
@@ -2142,7 +2142,7 @@ class ResponsesProviderTest {
         val completed = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I cannot fulfill this request"}]}]}}""",
         )
-        assertEquals(listOf(StreamEvent.Done("stop")), completed)
+        assertEquals(listOf(StreamEvent.Done("refusal")), completed)
     }
 
     @Test
@@ -2166,7 +2166,7 @@ class ResponsesProviderTest {
         val completed = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"refusal","refusal":"I cannot fulfill this request"}]}]}}""",
         )
-        assertEquals(listOf(StreamEvent.Done("stop")), completed)
+        assertEquals(listOf(StreamEvent.Done("refusal")), completed)
     }
 
     @Test
@@ -2190,7 +2190,7 @@ class ResponsesProviderTest {
         val completed = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"refusal","id":"ref_1","refusal":"I cannot fulfill this request"}]}}""",
         )
-        assertEquals(listOf(StreamEvent.Done("stop")), completed)
+        assertEquals(listOf(StreamEvent.Done("refusal")), completed)
     }
 
     @Test
@@ -2229,7 +2229,7 @@ class ResponsesProviderTest {
         val completed = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"refusal","refusal":"I cannot fulfill this request"}]}]}}""",
         )
-        assertEquals(listOf(StreamEvent.Done("stop")), completed)
+        assertEquals(listOf(StreamEvent.Done("refusal")), completed)
     }
 
     @Test
@@ -2248,7 +2248,7 @@ class ResponsesProviderTest {
         val completed = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","refusal":"I cannot fulfill this request"}]}}""",
         )
-        assertEquals(listOf(StreamEvent.Done("stop")), completed)
+        assertEquals(listOf(StreamEvent.Done("refusal")), completed)
     }
 
     @Test
@@ -2278,7 +2278,7 @@ class ResponsesProviderTest {
         val completedEvents = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"refusal","refusal":"I cannot assist with this request."}]}]}}""",
         )
-        assertEquals(listOf(StreamEvent.Done("stop")), completedEvents)
+        assertEquals(listOf(StreamEvent.Done("refusal")), completedEvents)
 
         // Direct output_item.done with top-level refusal item
         val mapperTopLevel = ResponsesMapper()
@@ -2293,7 +2293,7 @@ class ResponsesProviderTest {
         val completedTopLevel = mapperTopLevel.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"refusal","id":"ref_top","refusal":"Top-level refusal without delta"}]}}""",
         )
-        assertEquals(listOf(StreamEvent.Done("stop")), completedTopLevel)
+        assertEquals(listOf(StreamEvent.Done("refusal")), completedTopLevel)
     }
 
     @Test
@@ -2306,7 +2306,7 @@ class ResponsesProviderTest {
         assertEquals(
             listOf(
                 StreamEvent.TextDelta(0, 0, "Immediate terminal refusal"),
-                StreamEvent.Done("stop"),
+                StreamEvent.Done("refusal"),
             ),
             events,
         )
@@ -2319,7 +2319,7 @@ class ResponsesProviderTest {
         assertEquals(
             listOf(
                 StreamEvent.TextDelta(0, 0, "Direct completed refusal"),
-                StreamEvent.Done("stop"),
+                StreamEvent.Done("refusal"),
             ),
             eventsTopLevel,
         )
@@ -2354,7 +2354,7 @@ class ResponsesProviderTest {
         val completed = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_text","role":"assistant","content":[{"type":"output_text","text":"Hello! I can explain the rules."}]},{"type":"message","id":"msg_refusal","role":"assistant","content":[{"type":"refusal","refusal":"However, I cannot bypass security."}]}]}}""",
         )
-        assertEquals(listOf(StreamEvent.Done("stop")), completed)
+        assertEquals(listOf(StreamEvent.Done("refusal")), completed)
     }
 
     @Test
@@ -2379,7 +2379,7 @@ class ResponsesProviderTest {
         val completed = mapper.mapPayload(
             """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Safe preamble. "},{"type":"refusal","refusal":"Cannot execute command."}]}]}}""",
         )
-        assertEquals(listOf(StreamEvent.Done("stop")), completed)
+        assertEquals(listOf(StreamEvent.Done("refusal")), completed)
     }
 
     @Test
@@ -2449,7 +2449,7 @@ class ResponsesProviderTest {
                 listOf(
                     StreamEvent.TextDelta(0, 0, "I cannot "),
                     StreamEvent.TextDelta(0, 0, "comply."),
-                    StreamEvent.Done("stop"),
+                    StreamEvent.Done("refusal"),
                 ),
                 events,
             )

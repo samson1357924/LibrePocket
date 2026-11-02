@@ -1,5 +1,6 @@
 package dev.librepocket.session
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.booleanOrNull
@@ -42,6 +43,8 @@ val VALID_KINDS: Set<String> = setOf("user", "assistant", "tool", "steer", "retr
  * `isPartial=false` would dangle forever yet still enter model context, so
  * decode rejects it fail-closed. `reasoning` flag-only markers legitimately
  * carry `isFinal=false` with `isPartial=false` and stay accepted.
+ * `isTruncated` records Room's prior text truncation; absent in older files
+ * defaults to false and cannot establish that their original text was complete.
  */
 data class JsonlLine(
     val seq: Long,
@@ -55,6 +58,7 @@ data class JsonlLine(
     val parentRunId: String? = null,
     val attemptIndex: Int? = null,
     val isFinal: Boolean = true,
+    val isTruncated: Boolean = false,
 )
 
 /**
@@ -77,14 +81,44 @@ data class JsonlLine(
  * - F7 caps: `runId`/`parentRunId` ≤ 256 chars, `failureReason` ≤ 4096 chars
  *   (production `failureReason` is `Redactor.redactError`-capped at 500, so
  *   4096 is a generous safety margin sitting well above any legit row;
- *   `text` stays bounded by `RoomSessionStore.MAX_TEXT_CHARS` on
- *   write with truncation, not decode rejection — the decode caps exist to fail
+ *   `text` is bounded after redaction by the importer — the decode caps exist to fail
  *   a single 19MB id/reason column before it reaches the DB).
  *   `createdAt` has no decode upper bound by design (clock skew must not kill
  *   an import); only negativity is rejected.
  * - F11 types: every field read is gated so `null`/object/array/wrong-primitive
  *   all surface as `IAE("import failed at line N")` with no content echo.
  */
+/** Fast, allocation-free nesting depth validator. */
+internal fun validateNestingDepth(line: String, maxDepth: Int = 2): Boolean {
+    var inString = false
+    var escape = false
+    var depth = 0
+    for (i in 0 until line.length) {
+        val c = line[i]
+        if (inString) {
+            if (escape) {
+                escape = false
+            } else if (c == '\\') {
+                escape = true
+            } else if (c == '"') {
+                inString = false
+            }
+        } else {
+            if (c == '"') {
+                inString = true
+            } else if (c == '{' || c == '[') {
+                depth++
+                if (depth > maxDepth) return false
+            } else if (c == '}' || c == ']') {
+                if (depth > 0) {
+                    depth--
+                }
+            }
+        }
+    }
+    return !inString && depth == 0
+}
+
 object JsonlCodec {
     private val json = Json
 
@@ -94,7 +128,10 @@ object JsonlCodec {
     /** S2 F7: reason cap (4096) sits far above `Redactor.ERROR_MAX_CHARS` (500) — generous, never clips legit rows. */
     const val MAX_FAILURE_REASON_CHARS = 4096
 
-    fun encode(event: TranscriptEvent): String =
+    internal fun validateNestingDepth(line: String, maxDepth: Int = 2): Boolean =
+        dev.librepocket.session.validateNestingDepth(line, maxDepth)
+
+    fun encode(event: TranscriptEvent, isTruncated: Boolean = event.isTruncated): String =
         buildJsonObject {
             put("seq", event.seq)
             put("runId", event.runId)
@@ -104,6 +141,7 @@ object JsonlCodec {
             put("createdAt", event.createdAt)
             put("isPartial", event.isPartial)
             put("isFinal", event.isFinal)
+            if (isTruncated) put("isTruncated", true)
             if (event.failureReason != null) put("failureReason", event.failureReason)
             if (event.parentRunId != null) put("parentRunId", event.parentRunId)
             if (event.attemptIndex != null) put("attemptIndex", event.attemptIndex)
@@ -113,9 +151,11 @@ object JsonlCodec {
     fun decode(lineNumber: Int, line: String): JsonlLine {
         fun fail(cause: Throwable? = null): Nothing =
             throw IllegalArgumentException("import failed at line $lineNumber", cause)
+        if (!validateNestingDepth(line)) fail()
         val obj = try {
             json.parseToJsonElement(line).jsonObject
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
+            if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
             fail(e)
         }
         // F11: every field read is gated so a JsonNull/object/array (whose
@@ -218,6 +258,16 @@ object JsonlCodec {
                 }
             }
         }
+        val isTruncated: Boolean = gated {
+            when (val raw = obj["isTruncated"]) {
+                null -> false
+                else -> {
+                    val prim = raw.jsonPrimitive
+                    if (prim.isString) fail()
+                    prim.booleanOrNull ?: fail()
+                }
+            }
+        }
         val parsed = JsonlLine(
             seq = seq,
             runId = str("runId"),
@@ -230,6 +280,7 @@ object JsonlCodec {
             parentRunId = parentRunId,
             attemptIndex = attemptIndex,
             isFinal = isFinal,
+            isTruncated = isTruncated,
         )
         if (parsed.kind !in VALID_KINDS) fail()
         // Phase 5: an assistant intermediate partial must stay partial. A

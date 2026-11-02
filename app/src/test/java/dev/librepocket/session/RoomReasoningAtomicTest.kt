@@ -316,11 +316,16 @@ class RoomReasoningAtomicTest {
             val src = File(tmpDir, "oldest-boundary.jsonl")
             src.writeText(rows.joinToString("\n") { JsonlCodec.encode(it) } + "\n", Charsets.UTF_8)
             val sid = store.importJsonl(src)
+            val importedRows = store.loadEvents(sid, limit = cap + 1)
+            val mappedOld = importedRows.first().runId
+            assertTrue("import must remap the original ID", mappedOld != "r-old")
+            assertEquals(mappedOld, importedRows[1].runId)
+            assertTrue(importedRows.drop(2).none { it.runId == mappedOld })
 
             val scan = loadModelHistoryScan(store, sid)
             assertEquals(cap, scan.events.size)
             assertTrue("cap saturated: scan stays suspect", scan.reasoningIncomplete)
-            assertTrue("boundary scan must collect the adjacent marker", "r-old" in scan.reasoningRunIds)
+            assertTrue("boundary scan must collect the adjacent marker", mappedOld in scan.reasoningRunIds)
 
             val loaded = loadModelHistory(store, sid)
             assertEquals(0, loaded.droppedCount)
@@ -426,6 +431,12 @@ class RoomReasoningAtomicTest {
             val src = File(tmpDir, "far-marker.jsonl")
             src.writeText(rows.joinToString("\n") { JsonlCodec.encode(it) } + "\n", Charsets.UTF_8)
             val sid = store.importJsonl(src)
+            val importedRows = store.loadEvents(sid, limit = cap + 201)
+            val mappedOld = importedRows.first().runId
+            assertTrue("import must remap the original ID", mappedOld != old)
+            assertEquals(mappedOld, importedRows[201].runId)
+            assertTrue(importedRows.drop(1).take(200).none { it.runId == mappedOld })
+            assertTrue(importedRows.drop(202).none { it.runId == mappedOld })
 
             assertEquals(cap, store.countHistoryEvents(sid, includePartial = false))
             val scan = loadModelHistoryScan(store, sid)
@@ -436,7 +447,7 @@ class RoomReasoningAtomicTest {
             assertTrue("capHit conservative, true even at exact CAP", scan.reasoningIncomplete)
             assertTrue(
                 "far marker must be missed by the one-page boundary scan (201..2 only)",
-                old !in scan.reasoningRunIds,
+                mappedOld !in scan.reasoningRunIds,
             )
             assertTrue("far marker below the extra-page floor must set the probe", scan.hasFarReasoning)
             assertTrue(

@@ -1,6 +1,13 @@
 package dev.librepocket.session
 
 import java.io.File
+import java.io.InputStream
+
+/** A JSONL source exceeds a resource limit, including backups created by older versions. */
+class JsonlImportLimitException(message: String) : IllegalArgumentException(message)
+
+/** A session exceeds the limits for an importable JSONL export. */
+class JsonlExportLimitException(message: String) : IllegalStateException(message)
 
 /** Session header (spec §1.5). */
 data class SessionMeta(
@@ -65,6 +72,7 @@ data class TranscriptEvent(
     val parentRunId: String? = null, // Stage C: logical turn id for attempt assistant terminals; null for user/retry/legacy rows
     val attemptIndex: Int? = null, // Stage C: 0-based attempt number for attempt rows; null for user/legacy rows
     val isFinal: Boolean = true, // Stage F: false only for retryable-failed intermediate partials; missing key/old rows default final
+    val isTruncated: Boolean = false, // known stored-text truncation; false does not prove older imports were complete
 )
 
 /** Prune knobs (spec §8.3). */
@@ -262,8 +270,19 @@ interface SessionStore {
     /** Export one session as pure JSONL (no header; `jq`-parseable, spec §8.5). */
     suspend fun exportJsonl(sessionId: String, destFile: File)
 
-    /** Import JSONL; validates every line, rewrites to a new sessionId (spec §8.5). */
+    /**
+     * Import JSONL; validates every line, rewrites to a new sessionId (spec §8.5).
+     * Cancellation or failure after a database commit can leave the caller without
+     * the new ID; retry is not idempotent and may create a duplicate session.
+     * Room checks cancellation before and during insertion; a cancellation observed
+     * before commit rolls back, but a request racing the final check or commit
+     * cannot guarantee rollback or delivery of the ID.
+     */
     suspend fun importJsonl(srcFile: File): String
+
+    /** Import from a caller-owned stream without persisting the unredacted source; same commit uncertainty applies. */
+    suspend fun importJsonl(input: InputStream): String =
+        throw UnsupportedOperationException("stream import unavailable")
 
     /** Apply [PrunePolicy] (spec §8.3). */
     suspend fun prune(policy: PrunePolicy): PruneResult

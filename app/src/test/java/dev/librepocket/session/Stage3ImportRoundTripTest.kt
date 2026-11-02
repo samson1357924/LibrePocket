@@ -14,7 +14,7 @@ import org.robolectric.annotation.Config
 
 /**
  * Stage-3 tests P2-9: crafted success-shape import → export → reimport is
- * field-equivalent over runId/kind/text/isPartial/isFinal/parentRunId/
+ * equivalent over ID relationships and kind/text/isPartial/isFinal/
  * attemptIndex/failureReason: `isFinal=false` intermediate partials,
  * payload-free `reasoning` markers, and full family linkage
  * (`parentRunId`/`attemptIndex`/`failureReason`) all survive both legs.
@@ -77,19 +77,24 @@ class Stage3ImportRoundTripTest {
             for (i in lines1.indices) {
                 val a = JsonlCodec.decode(i + 1, lines1[i])
                 val b = JsonlCodec.decode(i + 1, lines2[i])
-                assertEquals("line ${i + 1} runId", a.runId, b.runId)
                 assertEquals("line ${i + 1} kind", a.kind, b.kind)
                 assertEquals("line ${i + 1} text", a.text, b.text)
                 assertEquals("line ${i + 1} isPartial", a.isPartial, b.isPartial)
                 assertEquals("line ${i + 1} isFinal", a.isFinal, b.isFinal)
-                assertEquals("line ${i + 1} parentRunId", a.parentRunId, b.parentRunId)
+                assertEquals("line ${i + 1} parent presence", a.parentRunId == null, b.parentRunId == null)
                 assertEquals("line ${i + 1} attemptIndex", a.attemptIndex, b.attemptIndex)
                 assertEquals("line ${i + 1} failureReason", a.failureReason, b.failureReason)
             }
             // Spot pins: the fragile shapes survived, not just row counts.
             val partial = lines1.map { JsonlCodec.decode(1, it) }.single { it.isFinal == false }
             assertEquals(true, partial.isPartial)
-            assertEquals("r2", partial.parentRunId)
+            val decoded1 = lines1.map { JsonlCodec.decode(1, it) }
+            val decoded2 = lines2.map { JsonlCodec.decode(1, it) }
+            for (i in decoded1.indices) for (j in decoded1.indices) {
+                assertEquals(decoded1[i].runId == decoded1[j].runId, decoded2[i].runId == decoded2[j].runId)
+                assertEquals(decoded1[i].parentRunId == decoded1[j].runId, decoded2[i].parentRunId == decoded2[j].runId)
+            }
+            assertEquals(decoded1[3].runId, partial.parentRunId)
             assertEquals(1, partial.attemptIndex)
             assertTrue(lines1.map { JsonlCodec.decode(1, it) }.any { it.kind == "reasoning" })
         } finally {

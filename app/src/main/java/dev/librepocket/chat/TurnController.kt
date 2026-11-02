@@ -3671,7 +3671,12 @@ class TurnController(
     } catch (_: Exception) {
       // Best effort: the drain below still waits for what was admitted.
     }
-    return orderedTranscript.flush(timeoutMs)
+    return try {
+      orderedTranscript.flush(timeoutMs)
+    } catch (e: Throwable) {
+      if (e is CancellationException || e is VirtualMachineError || e is ThreadDeath) throw e
+      false
+    }
   }
 
   /** True if any admitted transcript event encountered a durable store failure or interruption. */

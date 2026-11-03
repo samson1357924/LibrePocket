@@ -441,7 +441,7 @@ class ChatCompletionsProviderTest {
 
     @Test
     fun streamRefusalEmptyDeltaYieldsOnlyDoneRefusal() {
-        // Explicit empty string refusal in delta followed by terminal stop yields Done("refusal") without TextDelta
+        // Explicit empty string refusal in delta followed by terminal stop yields Done("stop") without TextDelta
         val mapper = ChatCompletionsMapper()
         val events = ArrayList<StreamEvent>()
         events += mapper.mapPayload(
@@ -452,7 +452,67 @@ class ChatCompletionsProviderTest {
         )
         mapper.markDone()
         events += mapper.finish()
-        assertEquals(listOf(StreamEvent.Done("refusal")), events)
+        assertEquals(listOf(StreamEvent.Done("stop")), events)
+    }
+
+    @Test
+    fun deltaWithContentAndEmptyRefusalFieldEmitsContentAndCompletesWithStop() {
+        val mapper = ChatCompletionsMapper()
+        val events = ArrayList<StreamEvent>()
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{"content":"Hello world","refusal":""},"finish_reason":null}]}""",
+        )
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{},"finish_reason":"stop"}]}""",
+        )
+        mapper.markDone()
+        events += mapper.finish()
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "Hello world"),
+                StreamEvent.Done("stop"),
+            ),
+            events,
+        )
+    }
+
+    @Test
+    fun deltaWithContentAndStrayRefusalPrioritizesContentAndPreservesStop() {
+        val mapper = ChatCompletionsMapper()
+        val events = ArrayList<StreamEvent>()
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{"content":"Valid answer","refusal":"stray refusal"},"finish_reason":null}]}""",
+        )
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{},"finish_reason":"stop"}]}""",
+        )
+        mapper.markDone()
+        events += mapper.finish()
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "Valid answer"),
+                StreamEvent.Done("stop"),
+            ),
+            events,
+        )
+    }
+
+    @Test
+    fun standaloneEmptyRefusalDeltaFollowedByStopCompletesWithStop() {
+        val mapper = ChatCompletionsMapper()
+        val events = ArrayList<StreamEvent>()
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{"refusal":""},"finish_reason":null}]}""",
+        )
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{},"finish_reason":"stop"}]}""",
+        )
+        mapper.markDone()
+        events += mapper.finish()
+        assertEquals(
+            listOf(StreamEvent.Done("stop")),
+            events,
+        )
     }
 
     @Test
@@ -724,5 +784,81 @@ class ChatCompletionsProviderTest {
             ),
             events,
         )
+    }
+
+    @Test
+    fun streamFlowDeltaWithContentAndEmptyRefusalCompletesWithDoneStop() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val body =
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Valid response\",\"refusal\":\"\"},\"finish_reason\":null}]}\n\n" +
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+                    "data: [DONE]\n\n"
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(body),
+            )
+            val provider = ChatCompletionsProvider(
+                testConfig(server.url("/").toString().trimEnd('/')),
+                { "test_api_key".toCharArray() },
+            )
+            val events = withTimeout(10_000) {
+                provider.stream(
+                    ChatRequest(
+                        model = "gpt-4o",
+                        messages = listOf(ChatMessage("user", "Hello")),
+                    ),
+                ).toList()
+            }
+            assertEquals(
+                listOf(
+                    StreamEvent.TextDelta(0, 0, "Valid response"),
+                    StreamEvent.Done("stop"),
+                ),
+                events,
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun streamFlowRefusalFollowedByLengthPrecedencePreservedOverWireSSE() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val body =
+                "data: {\"choices\":[{\"delta\":{\"refusal\":\"I cannot finish because\"},\"finish_reason\":null}]}\n\n" +
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n" +
+                    "data: [DONE]\n\n"
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(body),
+            )
+            val provider = ChatCompletionsProvider(
+                testConfig(server.url("/").toString().trimEnd('/')),
+                { "test_api_key".toCharArray() },
+            )
+            val events = withTimeout(10_000) {
+                provider.stream(
+                    ChatRequest(
+                        model = "gpt-4o",
+                        messages = listOf(ChatMessage("user", "Do something bad")),
+                    ),
+                ).toList()
+            }
+            assertEquals(
+                listOf(
+                    StreamEvent.TextDelta(0, 0, "I cannot finish because"),
+                    StreamEvent.Done("length"),
+                ),
+                events,
+            )
+        } finally {
+            server.shutdown()
+        }
     }
 }

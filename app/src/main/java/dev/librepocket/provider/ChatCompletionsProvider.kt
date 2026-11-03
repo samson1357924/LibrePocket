@@ -373,21 +373,27 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
     }
 
     private fun deltaText(delta: MiniJson.JObj): String? {
-        val refusal = delta.string("refusal")
-        if (refusal != null) {
-            sawRefusal = true
-        }
-        delta.string("content")?.takeIf { it.isNotEmpty() }?.let { return it }
+        val refusal = delta.string("refusal")?.takeIf { it.isNotEmpty() }
+        val content = delta.string("content")?.takeIf { it.isNotEmpty() }
         val parts = delta.arr("content")?.items?.filterIsInstance<MiniJson.JObj>()
-        if (parts != null) {
+        val partText = if (parts != null) {
             val sb = StringBuilder()
             for (p in parts) {
                 val t = p.string("text")
                 if (!t.isNullOrEmpty()) sb.append(t)
             }
-            sb.toString().ifEmpty { null }?.let { return it }
+            sb.toString().ifEmpty { null }
+        } else null
+
+        val text = content ?: partText
+        if (text != null) {
+            // Valid text content takes priority: stray/empty refusal must NOT poison sawRefusal
+            return text
         }
-        if (!refusal.isNullOrEmpty()) return refusal
+        if (refusal != null) {
+            sawRefusal = true
+            return refusal
+        }
         return null
     }
 

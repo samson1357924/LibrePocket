@@ -19,12 +19,14 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assert
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertHeightIsAtLeast
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertWidthIsAtLeast
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -38,6 +40,7 @@ import java.util.Locale
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -999,9 +1002,11 @@ class ChatMarkdownUiTest {
         composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
         composeRule.onNodeWithText("Analyzing user query and planning response step 1").assertIsDisplayed()
 
-        // A preceding paragraph appears before the thinking block (shifting thinking block from index 0 to 1),
-        // and streaming text progresses
-        text = "Leading context paragraph before thinking.\n\n<think>Analyzing user query and planning response step 1\nStep 2: verifying</think>\n\nFinal answer starting..."
+        // A preceding paragraph appears before the thinking block. The closed thinking
+        // content itself is final (growth happens while streaming/unclosed, covered by
+        // streaming-key tests), so its content-identity key is unchanged and expansion stays
+        // on the same card instead of shifting positionally.
+        text = "Leading context paragraph before thinking.\n\n<think>Analyzing user query and planning response step 1</think>\n\nFinal answer starting..."
         composeRule.waitForIdle()
 
         // Verify that the preceding paragraph is rendered
@@ -1009,15 +1014,15 @@ class ChatMarkdownUiTest {
 
         // Verify that the thinking block retained its manually expanded state!
         composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
-        composeRule.onNodeWithText("Analyzing user query and planning response step 1\nStep 2: verifying").assertIsDisplayed()
+        composeRule.onNodeWithText("Analyzing user query and planning response step 1").assertIsDisplayed()
 
-        // Text progresses further with additional streaming chunks
-        text = "Leading context paragraph before thinking.\n\n<think>Analyzing user query and planning response step 1\nStep 2: verifying</think>\n\nFinal answer starting... and completed!"
+        // Text progresses further with additional streaming chunks (answer grows, thinking unchanged)
+        text = "Leading context paragraph before thinking.\n\n<think>Analyzing user query and planning response step 1</think>\n\nFinal answer starting... and completed!"
         composeRule.waitForIdle()
 
         // Thinking block continues to retain its expanded state without reset or misapplication
         composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
-        composeRule.onNodeWithText("Analyzing user query and planning response step 1\nStep 2: verifying").assertIsDisplayed()
+        composeRule.onNodeWithText("Analyzing user query and planning response step 1").assertIsDisplayed()
     }
 
     @Test
@@ -1099,32 +1104,38 @@ class ChatMarkdownUiTest {
     @Test
     fun chatContentBlock_key_generatesStructuralKeys() {
         val blocks = ChatMarkdownParser.parse("<think>Analyzing user query</think>\n\nHello\n\n```kotlin\nval x = 1\n```\n\n<think>Second</think>")
-        assertEquals("think_0", blocks[0].key)
+        val expectedThinkA = "think_c_${ChatMarkdownParser.contentHashHex16("Analyzing user query")}"
+        val expectedThinkB = "think_c_${ChatMarkdownParser.contentHashHex16("Second")}"
+        assertEquals(expectedThinkA, blocks[0].key)
         assertEquals("para_0", blocks[1].key)
-        val expectedCodeKey = "code_kotlin_${"val x = 1".hashCode()}"
+        val expectedCodeKey = "code_fenced_kotlin_${ChatMarkdownParser.contentHashHex16("val x = 1")}"
         assertEquals(expectedCodeKey, blocks[2].key)
-        assertEquals("think_1", blocks[3].key)
+        assertEquals(expectedThinkB, blocks[3].key)
 
-        val think1 = ChatContentBlock.ThinkingBlock("Analyzing user query and planning step 1", isStreaming = true, key = "think_0")
-        val think2 = ChatContentBlock.ThinkingBlock("Analyzing user query and planning step 1\nwith more text appended", isStreaming = true, key = "think_0")
+        val think1 = ChatContentBlock.ThinkingBlock("Analyzing user query and planning step 1", isStreaming = true, key = "think_streaming_0")
+        val think2 = ChatContentBlock.ThinkingBlock("Analyzing user query and planning step 1\nwith more text appended", isStreaming = true, key = "think_streaming_0")
         assertEquals(think1.key, think2.key)
 
-        val code1 = ChatContentBlock.CodeBlock("kotlin", "val x = 1\nval y = 2", isStreaming = false, key = "code_kotlin_123")
-        val code2 = ChatContentBlock.CodeBlock("kotlin", "val x = 1\nval y = 2", isStreaming = true, key = "code_kotlin_123")
+        val code1 = ChatContentBlock.CodeBlock("kotlin", "val x = 1\nval y = 2", isStreaming = false, key = "code_fenced_kotlin_123")
+        val code2 = ChatContentBlock.CodeBlock("kotlin", "val x = 1\nval y = 2", isStreaming = true, key = "code_fenced_kotlin_123")
         assertEquals(code1.key, code2.key)
 
         val para = ChatContentBlock.ParagraphBlock(AnnotatedString("Hello world"), key = "para_0")
         assertEquals("para_0", para.key)
 
-        // Duplicate code blocks in the same message are disambiguated
+        // Duplicate code blocks in the same message are disambiguated as base, base_dup2, ...
         val dupBlocks = ChatMarkdownParser.parse("```kotlin\nval x = 1\n```\n\n```kotlin\nval x = 1\n```")
-        val baseCodeKey = "code_kotlin_${"val x = 1".hashCode()}"
+        val baseCodeKey = "code_fenced_kotlin_${ChatMarkdownParser.contentHashHex16("val x = 1")}"
         assertEquals(baseCodeKey, dupBlocks[0].key)
-        assertEquals("${baseCodeKey}_dup", dupBlocks[1].key)
+        assertEquals("${baseCodeKey}_dup2", dupBlocks[1].key)
 
         // Streaming code blocks use streaming counter keys
         val streamingBlocks = ChatMarkdownParser.parse("```kotlin\nval x = 1", isStreaming = true)
         assertEquals("code_streaming_0", (streamingBlocks[0] as ChatContentBlock.CodeBlock).key)
+
+        // Streaming thinking blocks use streaming keys stable across growth
+        val streamingThink = ChatMarkdownParser.parse("<think>Pl", isStreaming = true)
+        assertEquals("think_streaming_0", (streamingThink[0] as ChatContentBlock.ThinkingBlock).key)
     }
 
     @Test
@@ -1169,5 +1180,105 @@ class ChatMarkdownUiTest {
         }
 
         composeRule.onNodeWithContentDescription(VoiceTts.SPEAK_BUTTON_DESCRIPTION).assertDoesNotExist()
+    }
+
+    @Test
+    fun chatMarkdownView_thinkingPrepend_preservesWhichCardIsExpanded() {
+        // Regression for positional think_0/think_1 misbinding: prepending a *different*
+        // thinking card must not move the user's expansion to the new card.
+        var text by mutableStateOf("<think>Old reasoning content</think>\n\nAnswer")
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(text = text, isStreaming = false)
+            }
+        }
+        val title = context.getString(R.string.chat_thinking_title)
+        // Only one card initially: expand it.
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithText("Old reasoning content").assertIsDisplayed()
+
+        // Prepend a different thinking block before the old one.
+        text = "<think>New reasoning content</think>\n\n<think>Old reasoning content</think>\n\nAnswer"
+        composeRule.waitForIdle()
+
+        // Old card (second) must retain expansion; new card (first) stays collapsed by default.
+        composeRule.onNodeWithText("Old reasoning content").assertIsDisplayed()
+        composeRule.onNodeWithText("New reasoning content").assertDoesNotExist()
+        // Two thinking cards rendered.
+        composeRule.onAllNodesWithText(title).assertCountEquals(2)
+    }
+
+    @Test
+    fun chatMarkdownView_codeCollisionSwap_copiedFollowsContentNotPosition() {
+        // "Aa"/"BB" collide under String.hashCode(); with content-identity keys Copied must
+        // stay attached to the Aa card after order swap — verified per-card via layout
+        // position, not mere existence of one Copied node.
+        val fakeClipboard = FakeClipboardManager()
+        var text by mutableStateOf("```kotlin\nAa\n```\n\n```kotlin\nBB\n```")
+        composeRule.setContent {
+            CompositionLocalProvider(LocalClipboardManager provides fakeClipboard) {
+                MaterialTheme {
+                    ChatMarkdownView(text = text, isStreaming = false)
+                }
+            }
+        }
+        val copyText = context.getString(R.string.chat_code_copy)
+        val copiedText = context.getString(R.string.chat_code_copied)
+
+        // Click Copy on the first card (Aa). Both cards initially show Copy.
+        composeRule.onAllNodesWithText(copyText).assertCountEquals(2)
+        composeRule.onAllNodesWithText(copyText)[0].performClick()
+        composeRule.waitForIdle()
+        fun yOf(matchText: String): Float =
+            composeRule.onNodeWithText(matchText).fetchSemanticsNode().positionInRoot.y
+        // Cards lay out top-to-bottom; each card's copy button sits above its code text.
+        // Aa is the first card, so its Copied button must sit above BB's Copy button.
+        assertTrue("Aa card must be first", yOf("Aa") < yOf("BB"))
+        assertTrue("Copied must follow Aa card", yOf(copiedText) < yOf(copyText))
+
+        // Swap order: BB first, Aa second. Copied must follow Aa to the second card.
+        text = "```kotlin\nBB\n```\n\n```kotlin\nAa\n```"
+        composeRule.waitForIdle()
+        assertTrue("Aa card must now be second", yOf("BB") < yOf("Aa"))
+        assertTrue(
+            "Copied must follow Aa card after swap",
+            yOf(copyText) < yOf(copiedText),
+        )
+        // BB card shows Copy (single Copy node remains).
+        composeRule.onAllNodesWithText(copyText).assertCountEquals(1)
+        composeRule.onAllNodesWithText(copiedText).assertCountEquals(1)
+    }
+
+    @Test
+    fun chatMarkdownView_streamingToCompletedCode_pinsKeyChangeSemantics() {
+        // Pin test: streaming→completed changes block.key (code_streaming_0 →
+        // code_fenced_*), so Compose recreates the node and horizontal scroll resets.
+        // Content and copy affordance must survive; scroll preservation is a P3 limitation.
+        val streamingBlocks = ChatMarkdownParser.parse("```kotlin\npartial", isStreaming = true)
+        val completedBlocks = ChatMarkdownParser.parse("```kotlin\npartial\n```", isStreaming = false)
+        val streamingKey = (streamingBlocks[0] as ChatContentBlock.CodeBlock).key
+        val completedKey = (completedBlocks[0] as ChatContentBlock.CodeBlock).key
+        assertEquals("code_streaming_0", streamingKey)
+        assertFalse(streamingKey == completedKey)
+
+        val fakeClipboard = FakeClipboardManager()
+        var text by mutableStateOf("```kotlin\npartial")
+        var streaming by mutableStateOf(true)
+        composeRule.setContent {
+            CompositionLocalProvider(LocalClipboardManager provides fakeClipboard) {
+                MaterialTheme {
+                    ChatMarkdownView(text = text, isStreaming = streaming)
+                }
+            }
+        }
+        // Streaming: code + cursor visible, copy disabled.
+        composeRule.onNodeWithText("partial ▍").assertIsDisplayed()
+
+        // Complete the fence: same content, copy becomes enabled.
+        text = "```kotlin\npartial\n```"
+        streaming = false
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("partial").assertIsDisplayed()
+        composeRule.onNodeWithText(context.getString(R.string.chat_code_copy)).assertIsDisplayed()
     }
 }

@@ -1506,15 +1506,102 @@ class ChatMarkdownParserTest {
         val code2 = blocks[1] as ChatContentBlock.CodeBlock
         val code3 = blocks[2] as ChatContentBlock.CodeBlock
 
-        val expectedKotlinKey = "code_kotlin_${"val x = 1".hashCode()}"
-        val expectedPythonKey = "code_python_${"print(1)".hashCode()}"
+        val expectedKotlinKey = "code_fenced_kotlin_${ChatMarkdownParser.contentHashHex16("val x = 1")}"
+        val expectedPythonKey = "code_fenced_python_${ChatMarkdownParser.contentHashHex16("print(1)")}"
 
         assertEquals(expectedKotlinKey, code1.key)
         assertEquals(expectedPythonKey, code2.key)
-        assertEquals("${expectedKotlinKey}_dup", code3.key)
+        assertEquals("${expectedKotlinKey}_dup2", code3.key)
 
         val streamingBlocks = ChatMarkdownParser.parse("```kotlin\nval x = 1", isStreaming = true)
         val streamingCode = streamingBlocks[0] as ChatContentBlock.CodeBlock
         assertEquals("code_streaming_0", streamingCode.key)
+    }
+
+    @Test
+    fun parse_thinkingPrepend_sameContentKeyStable_differentContentDistinct() {
+        // Old card content unchanged across prepend: key must be stable (content identity,
+        // not positional ordinal), so Compose keeps expansion state on the old card.
+        val before = ChatMarkdownParser.parse("<think>Alpha content</think>\n\nAnswer A")
+        val beforeThink = before[0] as ChatContentBlock.ThinkingBlock
+        val after = ChatMarkdownParser.parse("<think>Beta content</think>\n\n<think>Alpha content</think>\n\nAnswer A")
+        assertEquals(3, after.size)
+        val newThink = after[0] as ChatContentBlock.ThinkingBlock
+        val oldThink = after[1] as ChatContentBlock.ThinkingBlock
+        assertEquals("Beta content", newThink.content)
+        assertEquals("Alpha content", oldThink.content)
+        assertEquals(beforeThink.key, oldThink.key)
+        assertTrue("Different thinking contents must not share keys", newThink.key != oldThink.key)
+        assertTrue(newThink.key.startsWith("think_c_"))
+        assertTrue(oldThink.key.startsWith("think_c_"))
+    }
+
+    @Test
+    fun parse_thinkingStreamingKey_stableDuringGrowth_changesOnCompletion() {
+        // Streaming growth keeps think_streaming_0; closing the tag switches to content key.
+        // The switch intentionally recreates the Compose node (documented semantics).
+        val growing1 = ChatMarkdownParser.parse("<think>Pl", isStreaming = true)
+        val growing2 = ChatMarkdownParser.parse("<think>Plan", isStreaming = true)
+        assertEquals("think_streaming_0", (growing1[0] as ChatContentBlock.ThinkingBlock).key)
+        assertEquals("think_streaming_0", (growing2[0] as ChatContentBlock.ThinkingBlock).key)
+        val completed = ChatMarkdownParser.parse("<think>Plan</think>")
+        val completedKey = (completed[0] as ChatContentBlock.ThinkingBlock).key
+        assertTrue(completedKey.startsWith("think_c_"))
+        assertTrue(completedKey != "think_streaming_0")
+    }
+
+    @Test
+    fun parse_codeHashCollisionAaBb_distinctKeysAndOrderStable() {
+        // "Aa" and "BB" collide under 32-bit String.hashCode() (both 2112); SHA-256 must separate them.
+        assertEquals("Aa".hashCode(), "BB".hashCode())
+        val forward = ChatMarkdownParser.parse("```kotlin\nAa\n```\n\n```kotlin\nBB\n```")
+        assertEquals(2, forward.size)
+        val forwardAa = forward[0] as ChatContentBlock.CodeBlock
+        val forwardBb = forward[1] as ChatContentBlock.CodeBlock
+        assertEquals("Aa", forwardAa.code)
+        assertEquals("BB", forwardBb.code)
+        assertTrue("Collision contents must yield distinct baseKeys", forwardAa.key != forwardBb.key)
+        val swapped = ChatMarkdownParser.parse("```kotlin\nBB\n```\n\n```kotlin\nAa\n```")
+        val swappedBb = swapped[0] as ChatContentBlock.CodeBlock
+        val swappedAa = swapped[1] as ChatContentBlock.CodeBlock
+        assertEquals(forwardAa.key, swappedAa.key)
+        assertEquals(forwardBb.key, swappedBb.key)
+        assertEquals("Aa", swappedAa.code)
+        assertEquals("BB", swappedBb.code)
+    }
+
+    @Test
+    fun parse_codeTripleDuplicate_namingConsistentAndKindNamespacesSeparate() {
+        val triple = ChatMarkdownParser.parse("```kotlin\nsame\n```\n\n```kotlin\nsame\n```\n\n```kotlin\nsame\n```")
+        assertEquals(3, triple.size)
+        val base = "code_fenced_kotlin_${ChatMarkdownParser.contentHashHex16("same")}"
+        assertEquals(base, (triple[0] as ChatContentBlock.CodeBlock).key)
+        assertEquals("${base}_dup2", (triple[1] as ChatContentBlock.CodeBlock).key)
+        assertEquals("${base}_dup3", (triple[2] as ChatContentBlock.CodeBlock).key)
+
+        // Fenced without language vs indented with identical code must not share namespace.
+        val mixed = ChatMarkdownParser.parse("```\nsame\n```\n\n    same\n")
+        assertEquals(2, mixed.size)
+        val fenced = mixed[0] as ChatContentBlock.CodeBlock
+        val indented = mixed[1] as ChatContentBlock.CodeBlock
+        assertEquals("same", fenced.code)
+        assertEquals("same", indented.code)
+        assertTrue(fenced.key.startsWith("code_fenced_"))
+        assertTrue(indented.key.startsWith("code_indented_"))
+        assertTrue(fenced.key != indented.key)
+    }
+
+    @Test
+    fun parse_streamingToCompletedCodeKeyChange_pinned() {
+        // Pin streaming→completed key-change semantics: scroll/state recreation is expected (P3).
+        val streaming = ChatMarkdownParser.parse("```kotlin\npartial", isStreaming = true)
+        val streamingCode = streaming[0] as ChatContentBlock.CodeBlock
+        assertTrue(streamingCode.isStreaming)
+        assertEquals("code_streaming_0", streamingCode.key)
+        val completed = ChatMarkdownParser.parse("```kotlin\npartial\n```", isStreaming = false)
+        val completedCode = completed[0] as ChatContentBlock.CodeBlock
+        assertFalse(completedCode.isStreaming)
+        assertTrue(completedCode.key.startsWith("code_fenced_kotlin_"))
+        assertTrue(completedCode.key != streamingCode.key)
     }
 }

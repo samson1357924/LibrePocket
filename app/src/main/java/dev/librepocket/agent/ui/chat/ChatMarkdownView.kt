@@ -59,7 +59,11 @@ internal fun ThinkingBlockView(
     block: ChatContentBlock.ThinkingBlock,
     modifier: Modifier = Modifier,
 ) {
-    var userExpanded by rememberSaveable { mutableStateOf<Boolean?>(null) }
+    var userExpanded by rememberSaveable(block.key) { mutableStateOf<Boolean?>(null) }
+    // Explicit block.key input: state is scoped to this content identity and resets when the
+    // identity changes (e.g. streaming `think_streaming_0` → completed `think_c_<hex>`).
+    // Prepend/reorder stability relies on the outer key(block.key) in ChatMarkdownView keeping
+    // each card's node (and thus this rememberSaveable) attached to the same content.
     val isExpanded = userExpanded ?: block.isStreaming
 
     Card(
@@ -136,7 +140,9 @@ internal fun CodeBlockView(
     modifier: Modifier = Modifier,
 ) {
     val clipboardManager = LocalClipboardManager.current
-    var copied by remember { mutableStateOf(false) }
+    // Bind feedback to content identity (defense-in-depth alongside outer key(block.key)):
+    // even on a (negligible-probability) key hash collision, Copied follows block.code.
+    var copied by remember(block.key, block.code) { mutableStateOf(false) }
 
     LaunchedEffect(copied) {
         if (copied) {
@@ -221,6 +227,11 @@ internal fun CodeBlockView(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
+                    // P3 limitation: streaming→completed changes block.key
+                    // (code_streaming_N → code_fenced_*/code_indented_*), so the outer
+                    // key(block.key) recreates this node and horizontal scroll resets.
+                    // Hoisting ScrollState above the keyed node keyed by ordinal would
+                    // misplace offsets on prepend; accepted tradeoff, pinned by test.
                     .horizontalScroll(rememberScrollState())
                     .padding(12.dp),
             ) {

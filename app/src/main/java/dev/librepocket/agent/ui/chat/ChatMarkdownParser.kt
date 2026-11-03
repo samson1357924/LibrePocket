@@ -10,22 +10,37 @@ import androidx.compose.ui.text.font.FontWeight
 /**
  * Structured content block parsed from chat turn text.
  * Each block provides a [key] structural identity anchor used by Compose
- * to maintain UI state (such as expansion in [ThinkingBlock] or copy feedback in [CodeBlock])
- * across streaming updates and content progress without recreating nodes.
+ * (via `key(block.key)`) to maintain UI state (such as expansion in [ThinkingBlock]
+ * or copy feedback in [CodeBlock]) across streaming updates without misbinding
+ * state to a different card when blocks are prepended or reordered.
  *
  * Invariants:
- * - [CodeBlock]: Non-streaming code blocks bind their key directly to their content identity
- *   (`code_${language.orEmpty()}_${code.hashCode()}`), disambiguated with `_dup` if duplicates exist.
- *   This prevents state mismatch (such as copy success indicators) when new code blocks are prepended.
- *   Streaming code blocks use `code_streaming_$index` to prevent node recreation while chunks arrive.
- * - [ThinkingBlock]: Uses `think_$index` so that streaming chunk growth (`<think>Pl` -> `<think>Plan`)
- *   maintains a stable key, preserving user collapse/expansion state.
- * - [ParagraphBlock]: Uses `para_$index` to anchor rendered markdown paragraphs.
+ * - [CodeBlock]: Completed blocks bind their key to content identity:
+ *   fenced `code_fenced_<language>_<sha256hex16>`, indented `code_indented_<sha256hex16>`
+ *   (`<sha256hex16>` = first 16 hex chars / 64 bits of SHA-256 over the block code).
+ *   Identical bases within one parse are disambiguated as `<base>_dup2`, `<base>_dup3`, ...
+ *   (first occurrence has no suffix). The fenced/indented kind prefix plus language keeps
+ *   fenced-no-language and indented blocks with identical code in separate namespaces.
+ *   64-bit truncation collision probability is negligible; even on collision the `_dupN`
+ *   occurrence suffix keeps keys distinct (at worst two different contents share a prefix).
+ *   Prepending different content does not shift existing keys. Same-content duplicates are
+ *   positional (document order) and may shift under prepend — documented limitation.
+ *   Streaming blocks (unclosed while `isStreaming`) use `code_streaming_<ordinal>` (ordinal
+ *   among streaming code blocks in parse order), stable while chunks grow. The
+ *   streaming→completed transition intentionally changes the key (expected recreation;
+ *   horizontal scroll resets — P3 limitation, see `ChatMarkdownView`).
+ * - [ThinkingBlock]: Completed blocks (closed, or unclosed with `isStreaming = false`) use
+ *   `think_c_<sha256hex16>` over trimmed content, with `_o2`/`_o3` for same-content duplicates
+ *   (same positional limitation as code). Streaming unclosed blocks use
+ *   `think_streaming_<ordinal>` (ordinal among streaming thinking blocks), stable while
+ *   `<think>Pl` grows to `<think>Plan`. The streaming→completed transition changes the key
+ *   from `think_streaming_*` to `think_c_*` (expected recreation; expansion falls back to
+ *   defaults unless the user explicitly toggled, which is then bound to the new key).
+ * - [ParagraphBlock]: Uses positional `para_<index>`. Paragraphs hold no interactive state,
+ *   so positional shifting on prepend/reorder is harmless.
  */
 sealed interface ChatContentBlock {
     val key: String
-
-    fun stableKey(index: Int = 0): Any = key
 
     data class ThinkingBlock(
         val content: String,
@@ -100,6 +115,24 @@ object ChatMarkdownParser {
 
     /** Standard column width for tabs and indented code blocks per CommonMark. */
     private const val INDENT_CODE_COLUMNS = 4L
+
+    /**
+     * First 16 hex chars (64 bits) of SHA-256 over UTF-8 bytes.
+     * Used for content-identity block keys to avoid 32-bit `hashCode()` collisions
+     * (e.g. "Aa"/"BB" both hash to 2112). 64-bit collision probability is negligible
+     * for chat-size inputs; residual collisions still yield distinct keys via `_dupN`/`_oN`.
+     */
+    internal fun contentHashHex16(input: String): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(input.toByteArray(Charsets.UTF_8))
+        val sb = StringBuilder(16)
+        for (i in 0 until 8) {
+            val b = digest[i].toInt() and 0xFF
+            if (b < 16) sb.append('0')
+            sb.append(b.toString(16))
+        }
+        return sb.toString()
+    }
 
     private fun thinkTagId(name: String): Int = when (name.lowercase()) {
         "thinking" -> 0
@@ -791,6 +824,20 @@ object ChatMarkdownParser {
     /**
      * Parses the incoming chat text into a list of [ChatContentBlock] instances.
      *
+     * Key stability guarantees (see [ChatContentBlock] invariants):
+     * - Completed thinking/code keys bind to content identity (SHA-256 truncated to 64 bits),
+     *   so prepending different content or reordering distinct blocks does not misplace
+     *   expansion / copy-feedback state. Same-content duplicates within one parse are
+     *   disambiguated by occurrence (`_o2`/`_dup2` ...) in document order and may shift
+     *   if an identical block is prepended — documented limitation.
+     * - Streaming unclosed blocks (while [isStreaming]) use `*_streaming_<ordinal>` keys,
+     *   stable while that block's content grows. The streaming→completed transition changes
+     *   the key (e.g. `think_streaming_0` → `think_c_<hex>`); Compose recreates the node,
+     *   which resets transient UI such as horizontal scroll — accepted P3 limitation.
+     *
+     * Segmentation itself advances a monotonic cursor with no backtracking (linear in input
+     * length); key derivation hashes each block once (linear in total block content).
+     *
      * @param text The complete raw text of the message turn received so far.
      * @param isStreaming Whether generation is actively ongoing. When true, unclosed blocks
      *                    are flagged with `isStreaming = true` to allow streaming cursor rendering,
@@ -802,7 +849,8 @@ object ChatMarkdownParser {
         }
         val segments = segments(text, isStreaming)
         val codeKeyCounts = HashMap<String, Int>()
-        var thinkingIndex = 0
+        val thinkKeyCounts = HashMap<String, Int>()
+        var streamingThinkIndex = 0
         var streamingCodeIndex = 0
         var paraIndex = 0
 
@@ -824,11 +872,21 @@ object ChatMarkdownParser {
                     }
                 }
                 Kind.THINKING -> {
+                    val thinkContent = text.substring(segment.contentStart, segment.contentEnd).trim()
+                    val isBlockStreaming = segment.unclosed && isStreaming
+                    val key = if (isBlockStreaming) {
+                        "think_streaming_${streamingThinkIndex++}"
+                    } else {
+                        val baseKey = "think_c_${contentHashHex16(thinkContent)}"
+                        val count = thinkKeyCounts[baseKey] ?: 0
+                        thinkKeyCounts[baseKey] = count + 1
+                        if (count == 0) baseKey else "${baseKey}_o${count + 1}"
+                    }
                     blocks.add(
                         ChatContentBlock.ThinkingBlock(
-                            content = text.substring(segment.contentStart, segment.contentEnd).trim(),
-                            isStreaming = segment.unclosed && isStreaming,
-                            key = "think_${thinkingIndex++}",
+                            content = thinkContent,
+                            isStreaming = isBlockStreaming,
+                            key = key,
                         )
                     )
                 }
@@ -838,10 +896,10 @@ object ChatMarkdownParser {
                     val key = if (isBlockStreaming) {
                         "code_streaming_${streamingCodeIndex++}"
                     } else {
-                        val baseKey = "code_${segment.language.orEmpty()}_${codeContent.hashCode()}"
+                        val baseKey = "code_fenced_${segment.language.orEmpty()}_${contentHashHex16(codeContent)}"
                         val count = codeKeyCounts[baseKey] ?: 0
                         codeKeyCounts[baseKey] = count + 1
-                        if (count == 0) baseKey else if (count == 1) "${baseKey}_dup" else "${baseKey}_dup$count"
+                        if (count == 0) baseKey else "${baseKey}_dup${count + 1}"
                     }
                     blocks.add(
                         ChatContentBlock.CodeBlock(
@@ -892,10 +950,10 @@ object ChatMarkdownParser {
                     val key = if (isBlockStreaming) {
                         "code_streaming_${streamingCodeIndex++}"
                     } else {
-                        val baseKey = "code__${codeContent.hashCode()}"
+                        val baseKey = "code_indented_${contentHashHex16(codeContent)}"
                         val count = codeKeyCounts[baseKey] ?: 0
                         codeKeyCounts[baseKey] = count + 1
-                        if (count == 0) baseKey else if (count == 1) "${baseKey}_dup" else "${baseKey}_dup$count"
+                        if (count == 0) baseKey else "${baseKey}_dup${count + 1}"
                     }
                     blocks.add(
                         ChatContentBlock.CodeBlock(

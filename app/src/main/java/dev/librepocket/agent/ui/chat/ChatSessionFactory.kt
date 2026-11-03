@@ -15,6 +15,8 @@ import dev.librepocket.chat.TurnController
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.KeyVault
 import dev.librepocket.policy.DataStorePolicyStore
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkOptInStore
 import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.preset.ProviderCatalog
@@ -24,8 +26,10 @@ import dev.librepocket.provider.KeyProvider
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderConfig
 import dev.librepocket.redact.Redactor
+import dev.librepocket.router.SafeToolSlice
 import dev.librepocket.session.LibrePocketDb
 import dev.librepocket.session.RoomSessionStore
+import dev.librepocket.session.SessionMeta
 import dev.librepocket.session.SessionStore
 import dev.librepocket.session.SessionTranscriptSink
 import dev.librepocket.session.TranscriptEvent
@@ -597,7 +601,15 @@ class ChatSessionFactory(
      * loop with fake clock/backend so a REAL factory-built session completes
      * the fake-tool round-trip.
      */
-    internal val toolSlice: dev.librepocket.router.SafeToolSlice? = null,
+    internal val toolSlice: SafeToolSlice? = null,
+    /**
+     * S2 (Issue #135 A2): per-endpoint 網路 opt-in 解析。Null（預設）即
+     * deny-all（HTTPS_ONLY）；測試／後續 UI 接線注入 `NetworkOptInStore`
+     *（已 `confirm` 的迴環／LAN endpoint 才放行，變更即失效需重綁）。
+     * Play production 只允許預設建構（`allowTierUpgrade = false`）或 null；
+     * 升級-capable 的 store 屬 foss／github pilot 接線（見 `NetworkOptInStore`）。
+     */
+    private val networkOptInStore: NetworkOptInStore? = null,
 ) : ChatSessionProvider {
     // S1: no defaults on overrides (Kotlin forbids defaults on overriding
     // functions): the fail-closed default allowAsk=false lives on the
@@ -613,7 +625,7 @@ class ChatSessionFactory(
         // Stage1 compat (see requireCurrentEndpointId): legacy rows never
         // reach the vault read below.
         requireCurrentEndpointId(endpoint)
-        val config = endpoint.toProviderConfig()
+        val config = endpoint.toProviderConfig(optInFor(endpoint))
         require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
         val model = modelFor(endpoint)
         var credential: SessionCredential? = null
@@ -799,7 +811,7 @@ class ChatSessionFactory(
         // Stage1 compat (see requireCurrentEndpointId): legacy rows never
         // reach the vault read below.
         requireCurrentEndpointId(endpoint)
-        val config = endpoint.toProviderConfig()
+        val config = endpoint.toProviderConfig(optInFor(endpoint))
         require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
         requireCurrentBinding(keyIsCurrent)
         val store = requireNotNull(sessionStores?.store()) { "UNKNOWN_SESSION" }
@@ -924,7 +936,7 @@ class ChatSessionFactory(
         endpoint: EndpointConfig,
         config: ProviderConfig,
         oldSessionId: String,
-        oldMeta: dev.librepocket.session.SessionMeta,
+        oldMeta: SessionMeta,
         keyIsCurrent: suspend () -> Boolean,
         allowAsk: Boolean,
     ): CreatedSession {
@@ -1067,9 +1079,11 @@ class ChatSessionFactory(
         null
     }
 
+    // 同包頂層同名函式的委派：成員遮蔽頂層，全限定為 load-bearing（import 無法消歧），故保留。
     internal fun cappedHistoryText(text: String): String = dev.librepocket.agent.ui.chat.cappedHistoryText(text)
 
     internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): LoadedModelHistory =
+        // 同上：成員遮蔽同包頂層，全限定保留。
         dev.librepocket.agent.ui.chat.loadModelHistory(store, sessionId)
 
     /** Effective model id for an endpoint (user text, preset default, or "default"). */
@@ -1104,6 +1118,15 @@ class ChatSessionFactory(
     private fun requireCurrentEndpointId(endpoint: EndpointConfig) {
         if (SetupValidation.isLegacyEndpoint(endpoint)) throw CaptureDeniedException("ENDPOINT_ID_LEGACY")
     }
+
+    /**
+     * S2 opt-in 解析：經 [networkOptInStore] 查已確認 tier，綁定
+     * (`providerId`＋`baseUrl`＋`configRevision`) 全等才放行升級，否則
+     * deny-all。Null store（預設／production 未接 UI 前）即 HTTPS_ONLY。
+     */
+    private fun optInFor(endpoint: EndpointConfig): EndpointNetworkOptIn =
+        networkOptInStore?.optInFor(endpoint.providerId, endpoint.baseUrl, endpoint.configRevision)
+            ?: EndpointNetworkOptIn()
 
     private suspend fun requireCurrentBinding(keyIsCurrent: suspend () -> Boolean) {
         if (!keyIsCurrent()) throw CancellationException("ENDPOINT_BINDING_STALE")

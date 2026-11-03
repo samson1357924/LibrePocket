@@ -57,6 +57,14 @@ object ProviderErrorClassifier {
         "attempt_deadline_exceeded",
         "tool_args_too_large",
         "text_too_large",
+        // S2 (Issue #135 A2): 網路政策阻擋一律 fatal 不重試（縱深：即使某路徑
+        // 誤走 classifier，訊息內的 deny 碼仍鎖 FATAL）。
+        "network_policy_blocked",
+        "cleartext_not_permitted",
+        "private_address_blocked",
+        "metadata_address_blocked",
+        "redirect_blocked",
+        "dns_pin_miss",
         // Phase 2 deterministic stream-contract failures: a streamed/terminal
         // text contradiction or an unidentifiable function-call frame must
         // never be retried if the message is later routed through the

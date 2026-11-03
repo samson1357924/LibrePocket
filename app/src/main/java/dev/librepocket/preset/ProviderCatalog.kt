@@ -1,6 +1,9 @@
 package dev.librepocket.preset
 
 import dev.librepocket.models.ModelsDevSnapshot
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.HostResolver
+import dev.librepocket.policy.SystemHostResolver
 import dev.librepocket.provider.ProviderConfig
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.validateBaseUrl
@@ -199,11 +202,14 @@ object ProviderCatalog {
      * - 複用 `provider.validateBaseUrl` 做 https 校验（loopback 例外同轉接器）。
      * - [apiKeyRef] 只是 KeyVault 別名（形如 `provider_key/<uuid>`），絕不帶明文 key。
      * - `custom` 請走 [fromCustom]；誤傳時拋 `PRESET_CUSTOM_NEEDS_BASE_URL`。
+     * - S2：[networkOptIn] 預設 deny-all；play 維持此值，永不升級。
      */
     fun fromPreset(
         presetId: String,
         apiKeyRef: String,
         providerId: String? = null,
+        networkOptIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+        networkResolver: HostResolver = SystemHostResolver,
     ): ProviderConfig {
         val preset = requirePreset(presetId)
         require(preset.id != CUSTOM_ID) { "PRESET_CUSTOM_NEEDS_BASE_URL" }
@@ -215,12 +221,16 @@ object ProviderCatalog {
             baseUrl = preset.baseUrl,
             protocol = preset.protocol,
             apiKeyRef = apiKeyRef,
+            networkOptIn = networkOptIn,
+            networkResolver = networkResolver,
         )
     }
 
     /**
      * 手填自訂 provider：[baseUrl] 原樣保留（不做正規化、不補斜線），
      * 僅做 [validateBaseUrl] 校验；[apiKeyRef] 同 [fromPreset] 為別名。
+     * S2：[networkOptIn] 預設 deny-all；LAN http 需經 `NetworkOptInStore.confirm`
+     * 明示確認（play 永不升級）。
      */
     fun fromCustom(
         baseUrl: String,
@@ -228,6 +238,8 @@ object ProviderCatalog {
         label: String = "自訂",
         protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS,
         providerId: String? = null,
+        networkOptIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+        networkResolver: HostResolver = SystemHostResolver,
     ): ProviderConfig {
         require(apiKeyRef.isNotBlank()) { "PROVIDER_KEY_REF_BLANK" }
         validateBaseUrl(baseUrl)
@@ -237,6 +249,8 @@ object ProviderCatalog {
             baseUrl = baseUrl,
             protocol = protocol,
             apiKeyRef = apiKeyRef,
+            networkOptIn = networkOptIn,
+            networkResolver = networkResolver,
         )
     }
 

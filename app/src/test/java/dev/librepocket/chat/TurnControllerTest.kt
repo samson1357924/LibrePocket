@@ -1,5 +1,7 @@
 package dev.librepocket.chat
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkEgressPolicy
 import dev.librepocket.policy.PolicyDecision
 import dev.librepocket.policy.PolicyRule
 import dev.librepocket.policy.PolicyStore
@@ -16,6 +18,7 @@ import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.ProviderProtocol as ProviderProto
 import dev.librepocket.provider.StreamEvent
 import dev.librepocket.provider.streamingFlow
+import dev.librepocket.redact.Redactor
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -770,6 +773,9 @@ class TurnControllerTest {
           baseUrl = server.url("/").toString().trimEnd('/'),
           protocol = ProviderProtocol.CHAT_COMPLETIONS,
           apiKeyRef = "fake-key-ref",
+          networkOptIn = EndpointNetworkOptIn(
+              NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+          ),
           // Retained compatibility fields must not create a provider retry loop.
           http = ProviderHttpConfig(maxRetries = 3, retryDelaysMs = listOf(0L)),
         ),
@@ -817,6 +823,9 @@ class TurnControllerTest {
           baseUrl = server.url("/").toString().trimEnd('/'),
           protocol = ProviderProtocol.CHAT_COMPLETIONS,
           apiKeyRef = "fake-key-ref",
+          networkOptIn = EndpointNetworkOptIn(
+              NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+          ),
           http = ProviderHttpConfig(maxRetries = 3, retryDelaysMs = listOf(0L)),
         ),
         { "stage5-fake-key".toCharArray() },
@@ -872,6 +881,9 @@ class TurnControllerTest {
           baseUrl = server.url("/").toString().trimEnd('/'),
           protocol = ProviderProtocol.CHAT_COMPLETIONS,
           apiKeyRef = "fake-key-ref",
+          networkOptIn = EndpointNetworkOptIn(
+              NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+          ),
           // Legacy provider retries are deliberately immediate so the old nested
           // retry owner fails by request count rather than sleeping or hanging.
           http = ProviderHttpConfig(maxRetries = 3, retryDelaysMs = listOf(0L, 0L, 0L)),
@@ -918,6 +930,9 @@ class TurnControllerTest {
           baseUrl = server.url("/").toString().trimEnd('/'),
           protocol = ProviderProtocol.CHAT_COMPLETIONS,
           apiKeyRef = "fake-key-ref",
+          networkOptIn = EndpointNetworkOptIn(
+              NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+          ),
         ),
         { "stage5-fake-key".toCharArray() },
       )
@@ -1500,7 +1515,7 @@ class TurnControllerTest {
 
   @Test fun sanitizeErrorMatchesRedactor() {
     assertEquals(
-      dev.librepocket.redact.Redactor.redactError("Bearer abcdef123456 boom"),
+      Redactor.redactError("Bearer abcdef123456 boom"),
       sanitizeError("Bearer abcdef123456 boom"),
     )
   }

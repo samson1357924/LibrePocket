@@ -1,6 +1,9 @@
 package dev.librepocket.agent.ui.chat
 
 import dev.librepocket.agent.ui.setup.EndpointConfig
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.HostResolver
+import dev.librepocket.policy.SystemHostResolver
 import dev.librepocket.preset.ProviderCatalog
 import dev.librepocket.provider.ProviderConfig
 import dev.librepocket.provider.ProviderProtocol
@@ -10,8 +13,15 @@ import java.util.Locale
 /**
  * Maps the persisted endpoint (Setup) to the transport config (provider).
  * Single source of truth for the EndpointConfig -> ProviderConfig boundary.
+ *
+ * S2 (Issue #135 A2): per-endpoint opt-in 經 [networkOptIn] 傳入，預設
+ * deny-all（HTTPS_ONLY）。Play 維持此 tier，永不升級（註解＋測試釘死）；
+ * foss／github pilot 才可經 `NetworkOptInStore.confirm` 明示確認升級。
  */
-fun EndpointConfig.toProviderConfig(): ProviderConfig =
+fun EndpointConfig.toProviderConfig(
+    networkOptIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+    networkResolver: HostResolver = SystemHostResolver,
+): ProviderConfig =
     if (presetId == ProviderCatalog.CUSTOM_ID) {
         ProviderCatalog.fromCustom(
             baseUrl = baseUrl,
@@ -19,12 +29,16 @@ fun EndpointConfig.toProviderConfig(): ProviderConfig =
             label = label.ifBlank { "自訂" },
             protocol = protocol,
             providerId = providerId,
+            networkOptIn = networkOptIn,
+            networkResolver = networkResolver,
         )
     } else {
         ProviderCatalog.fromPreset(
             presetId = presetId,
             apiKeyRef = apiKeyRef,
             providerId = providerId,
+            networkOptIn = networkOptIn,
+            networkResolver = networkResolver,
         )
     }
 

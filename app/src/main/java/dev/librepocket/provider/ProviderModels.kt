@@ -1,5 +1,9 @@
 package dev.librepocket.provider
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.HostResolver
+import dev.librepocket.policy.SystemHostResolver
+
 /** Wire protocol selector (SPEC §1.2). Baseline is [CHAT_COMPLETIONS]. */
 enum class ProviderProtocol {
     CHAT_COMPLETIONS,
@@ -144,4 +148,18 @@ data class ProviderConfig(
     val protocol: ProviderProtocol,
     val apiKeyRef: String, // keystore reference, never plaintext
     val http: ProviderHttpConfig = ProviderHttpConfig(),
+    /**
+     * S2 (Issue #135 A2): per-endpoint 網路 opt-in（預設 deny-all）。
+     * Play 維持 [dev.librepocket.policy.NetworkEgressPolicy.HTTPS_ONLY]，
+     * 永不經此升級（註解＋測試釘死）；foss／github pilot 才可經
+     * `NetworkOptInStore.confirm` 明示確認升級。
+     */
+    val networkOptIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+    /**
+     * S2 首跳解析 seam：production 傳入經 `evaluateUrl` 釘住後的
+     * `PinnedNetworkDns`（或預設 [SystemHostResolver] 過渡）；測試注入 fake。
+     * Transport 在建連前先 `evaluateUrl(rawUrl, networkOptIn, networkResolver)`，
+     * 拒絕即 typed fatal，不送 credential／body。
+     */
+    val networkResolver: HostResolver = SystemHostResolver,
 )

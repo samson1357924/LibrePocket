@@ -1,0 +1,180 @@
+package dev.librepocket.policy
+
+import java.security.MessageDigest
+import java.util.Locale
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+
+/**
+ * S2 (Issue #135 A2): per-endpoint 網路 opt-in 的綁定與 one-shot 確認。
+ *
+ * 純 JVM、可單測；不碰 Android／DataStore（持久化沿用 [EndpointStore] 的
+ * metadata 槽位或後續 DataStore 擴充前，先以記憶體持有本次確認；見底部署 TODO）。
+ *
+ * 綁定（變更即失效，沿用 S4-C 顯式重綁姿態，不與 chat key 共用 namespace）：
+ * - `endpointId`：`preset:<presetId>`（內建）或 `custom:<sha256-32hex>`（自訂，
+ *   與 `SetupValidation.deriveEndpointId` 同形；此處只驗形狀，不重算）；
+ * - `baseUrl` 全字串（僅 trim，不做正規化；任何重寫即新身份）；
+ * - `scheme`＋有效埠（`HttpUrl` 視角，預設埠正規化）；
+ * - `policy` tier＋`configRevision`（`EndpointStore` 的單調 revision）。
+ *
+ * One-shot 確認：呼叫方（設定頁）必須在明示明文警告後調 [confirm]  mint 一次
+ * 確認；任何綁定欄位變動使舊確認經 [confirmedPolicyFor] 自動失效為
+ * [NetworkEgressPolicy.HTTPS_ONLY]（fail-closed），必須重新明示確認。
+ *
+ * Play 姿態：play 維持 deny-all（HTTPS-only）。預設建構（`allowTierUpgrade
+ * = false`，即 play 姿態）拒收一切非 [NetworkEgressPolicy.HTTPS_ONLY] 的
+ * [confirm]（`NETWORK_OPTIN_TIER_NOT_ALLOWED`）；foss／github pilot 另以
+ * `allowTierUpgrade = true` 顯式建構才可經確認升級。真正的 flavor／sourceSet
+ * gate（BuildConfig／flavor source set 內建構）待後續 UI 接線 followup，
+ * 在此之前以此顯式旗標 fail-closed（見 `confirm`）。
+ * 測試另行釘死（見 `NetworkPolicyS2Test.playStaysHttpsOnly`）。
+ */
+class NetworkOptInStore(
+  /**
+   * 是否允許經 [confirm] 升級到 HTTPS_ONLY 之外的 tier。
+   * 預設 false（play 姿態，deny-all）；foss／github pilot 接線必須顯式傳
+   * true。Flavor 未傳遞到本層前，以此旗標承擔 gate，預設拒絕為 fail-closed。
+   */
+  private val allowTierUpgrade: Boolean = false,
+) {
+
+  /** 已確認綁定（單一真相；`endpointId` 為 key，一 endpoint 一條）。 */
+  data class ConfirmedOptIn(
+    val endpointId: String,
+    val baseUrl: String,
+    val scheme: String,
+    val port: Int,
+    val policy: NetworkEgressPolicy,
+    val configRevision: Long,
+  )
+
+  private val lock = Any()
+  private val confirmed = mutableMapOf<String, ConfirmedOptIn>()
+
+  /**
+   * 明示確認（one-shot）：呼叫前 UI 必須已明示明文警告。
+   * 同一 endpoint 重複確認覆寫（新綁定即新確認）；`policy == HTTPS_ONLY`
+   * 視為降級回預設，一併記錄（使舊高 tier 立即失效）。
+   *
+   * Play gate：本 store 未以 `allowTierUpgrade = true` 顯式建構時（預設即
+   * play 姿態），非 HTTPS_ONLY 的確認一律拒收（fail-closed，不記錄）。
+   * Flavor 尚未傳遞到本層，真正的 flavor／sourceSet gate 待後續 UI 接線
+   * followup 誠實補上；在那之前 play production 只允許預設建構。
+   */
+  fun confirm(
+    endpointId: String,
+    baseUrl: String,
+    policy: NetworkEgressPolicy,
+    configRevision: Long,
+  ): ConfirmedOptIn {
+    require(policy == NetworkEgressPolicy.HTTPS_ONLY || allowTierUpgrade) {
+      "NETWORK_OPTIN_TIER_NOT_ALLOWED"
+    }
+    val bound = boundOf(endpointId, baseUrl, policy, configRevision)
+    synchronized(lock) { confirmed[endpointId] = bound }
+    return bound
+  }
+
+  /**
+   * 查詢有效 tier：綁定全等才回已確認 tier；任何欄位不符（URL／scheme／port／
+   * revision 變動）一律回 [NetworkEgressPolicy.HTTPS_ONLY]（fail-closed，
+   * 舊確認自動失效，需重新 [confirm]）。查詢期 baseUrl 形變（malformed／
+   * 非 http(s)）不拋 [IllegalArgumentException]，一律 fail-closed 回
+   * HTTPS_ONLY（確認寫入期 [confirm] 仍嚴格拒收 malformed）。
+   */
+  fun confirmedPolicyFor(endpointId: String, baseUrl: String, configRevision: Long): NetworkEgressPolicy {
+    val cur = synchronized(lock) { confirmed[endpointId] } ?: return NetworkEgressPolicy.HTTPS_ONLY
+    val want = try {
+      boundOf(endpointId, baseUrl, cur.policy, configRevision)
+    } catch (_: IllegalArgumentException) {
+      return NetworkEgressPolicy.HTTPS_ONLY
+    }
+    // 比對除 policy 外的綁定欄位＋revision；policy 取已存值（tier 本身是確認內容）。
+    if (cur.baseUrl != want.baseUrl || cur.scheme != want.scheme || cur.port != want.port ||
+      cur.configRevision != configRevision
+    ) {
+      return NetworkEgressPolicy.HTTPS_ONLY
+    }
+    return cur.policy
+  }
+
+  /** 轉 [EndpointNetworkOptIn]（供 transport 接線；預設即 deny-all）。 */
+  fun optInFor(endpointId: String, baseUrl: String, configRevision: Long): EndpointNetworkOptIn {
+    val policy = confirmedPolicyFor(endpointId, baseUrl, configRevision)
+    return EndpointNetworkOptIn(policy = policy, configRevision = configRevision)
+  }
+
+  /** 單條失效（輪換／登出時調用；不存在亦成功）。 */
+  fun invalidate(endpointId: String) {
+    synchronized(lock) { confirmed.remove(endpointId) }
+  }
+
+  fun snapshot(endpointId: String): ConfirmedOptIn? = synchronized(lock) { confirmed[endpointId] }
+
+  companion object {
+    /**
+     * 確認 token：綁 `endpointId + baseUrl + scheme + port + policy + revision`
+     * 的 SHA-256（32hex，與 endpoint id 同形，便於稽核比對）。
+     * Token 本身不是授權（授權以 [ConfirmedOptIn] 綁定全等為準），僅供
+     * UI／audit 顯示這次 one-shot 確認的身份。
+     */
+    fun confirmationTokenFor(
+      endpointId: String,
+      baseUrl: String,
+      policy: NetworkEgressPolicy,
+      configRevision: Long,
+    ): String {
+      val bound = boundOf(endpointId, baseUrl, policy, configRevision)
+      val material = "${bound.endpointId}|${bound.baseUrl}|${bound.scheme}|${bound.port}|${bound.policy.name}|${bound.configRevision}"
+      val digest = try {
+        MessageDigest.getInstance("SHA-256")
+      } catch (e: java.security.NoSuchAlgorithmException) {
+        throw IllegalStateException("NETWORK_OPTIN_HASH_UNAVAILABLE", e)
+      }
+      val bytes = digest.digest(material.toByteArray(Charsets.UTF_8))
+      val hex = buildString(bytes.size * 2) {
+        for (b in bytes) {
+          val v = b.toInt() and 0xFF
+          append("0123456789abcdef"[v ushr 4])
+          append("0123456789abcdef"[v and 0x0F])
+        }
+      }
+      return hex.take(32)
+    }
+
+    /**
+     * Play tier gate：play 僅接受 [NetworkEgressPolicy.HTTPS_ONLY]。
+     * foss／github pilot 的升級另由 [confirm]＋UI 明示確認承載（且該 store
+     * 須以 `allowTierUpgrade = true` 顯式建構，預設建構的 `confirm` 直接拒收
+     * 升級），play 永不調 [confirm] 升級（註解＋測試釘死）。
+     */
+    fun checkPlayTierAllows(policy: NetworkEgressPolicy): Boolean =
+      policy == NetworkEgressPolicy.HTTPS_ONLY
+
+    internal fun boundOf(
+      endpointId: String,
+      baseUrl: String,
+      policy: NetworkEgressPolicy,
+      configRevision: Long,
+    ): ConfirmedOptIn {
+      require(endpointId.isNotBlank()) { "NETWORK_OPTIN_ENDPOINT_BLANK" }
+      require(endpointId.startsWith("preset:") || endpointId.startsWith("custom:")) {
+        "NETWORK_OPTIN_ENDPOINT_MALFORMED"
+      }
+      val trimmed = baseUrl.trim()
+      require(trimmed.isNotEmpty()) { "NETWORK_OPTIN_URL_BLANK" }
+      val url = trimmed.toHttpUrlOrNull() ?: throw IllegalArgumentException("NETWORK_OPTIN_URL_MALFORMED")
+      val scheme = url.scheme.lowercase(Locale.ROOT)
+      require(scheme == "http" || scheme == "https") { "NETWORK_OPTIN_SCHEME_UNSUPPORTED" }
+      // HttpUrl.port 已含預設埠正規化（http 80／https 443）。
+      return ConfirmedOptIn(
+        endpointId = endpointId,
+        baseUrl = trimmed,
+        scheme = scheme,
+        port = url.port,
+        policy = policy,
+        configRevision = configRevision,
+      )
+    }
+  }
+}

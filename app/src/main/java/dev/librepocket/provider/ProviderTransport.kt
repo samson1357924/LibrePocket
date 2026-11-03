@@ -1,5 +1,12 @@
 package dev.librepocket.provider
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.HostResolver
+import dev.librepocket.policy.NetworkDenyCode
+import dev.librepocket.policy.NetworkEvaluation
+import dev.librepocket.policy.NetworkPolicy
+import dev.librepocket.policy.PinnedNetworkDns
+import dev.librepocket.policy.SystemHostResolver
 import dev.librepocket.redact.Redactor
 import java.io.IOException
 import java.util.Collections
@@ -22,6 +29,7 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -43,6 +51,12 @@ internal enum class ProviderFailureCode {
      * poison-adjacent pending tool fragments.
      */
     DEADLINE_EXCEEDED,
+    /**
+     * S2 (Issue #135 A2): 網路政策阻擋（cleartext／私有／metadata／redirect）。
+     * 一律 fatal 不重試；訊息首段即 `NETWORK_POLICY_BLOCKED:<DenyCode>`，
+     * `Failed.code` 取此名，`Failed.message` 另帶 `HTTP <code>`（3xx 相容舊斷言）。
+     */
+    NETWORK_POLICY_BLOCKED,
     /**
      * Unknown runtime failure from the provider stream (e.g. an unexpected
      * `RuntimeException` that is neither a typed `ProviderFailure`, validation
@@ -149,6 +163,86 @@ fun defaultOkHttpClient(http: ProviderHttpConfig): OkHttpClient = OkHttpClient.B
 internal fun providerTransportClient(client: OkHttpClient): OkHttpClient = client.newBuilder()
     .denyUnbudgetedResends()
     .build()
+
+/**
+ * S2 (Issue #135 A2): 建連前政策閘。
+ *
+ * 呼叫方（各 provider 的 `stream`／`listModels`）必須在讀 key、組 body 之前
+ * 先調此閘：拒絕即 typed fatal [ProviderFailure]
+ *（`NETWORK_POLICY_BLOCKED:<DenyCode>`，retryable=false），不送 credential／body、
+ * 不建連。Transport 的 `executeProviderRequest`／`pumpSse` 另在 `call.execute()`
+ * 前重驗一次（縱深，防直接調用繞過）。
+ */
+internal fun requireNetworkPolicyAllowed(
+    rawUrl: String,
+    optIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+    resolver: HostResolver = SystemHostResolver,
+): NetworkEvaluation {
+    val eval = NetworkPolicy.evaluateUrl(rawUrl, optIn, resolver)
+    if (!eval.allowed) throw networkPolicyFailure(eval)
+    return eval
+}
+
+/** 拒絕決策 → typed fatal（訊息經 redact，不含 key／body／明文位址）。 */
+internal fun networkPolicyFailure(eval: NetworkEvaluation): ProviderFailure {
+    val code = eval.denyCode ?: NetworkDenyCode.INVALID_HOST
+    return ProviderFailure(
+        retryable = false,
+        message = redactedError("NETWORK_POLICY_BLOCKED:${code.name}"),
+        code = ProviderFailureCode.NETWORK_POLICY_BLOCKED,
+    )
+}
+
+/** 3xx 專用 typed fatal（訊息另帶 `HTTP <code>` 以相容既有 redirect 斷言）。 */
+internal fun redirectBlockedFailure(httpCode: Int): ProviderFailure = ProviderFailure(
+    retryable = false,
+    message = redactedError("NETWORK_POLICY_BLOCKED:${NetworkDenyCode.REDIRECT_BLOCKED.name} HTTP $httpCode"),
+    code = ProviderFailureCode.NETWORK_POLICY_BLOCKED,
+)
+
+/**
+ * S2 redirect 逐跳重驗 hook（0-follow 執行面）。
+ *
+ * Provider／MCP 永不跟隨：任何 3xx 一律 [redirectBlockedFailure] 終端，
+ * 絕不重送 credential／body。若 `Location` 存在，嘗試對其做一次
+ * `evaluateUrl`（for audit，結果僅供除錯，不影響阻擋——即使 target 評估為
+ * allow 也照擋；WebFetch 逐跳重驗待 A4，此處誠實揭露為單跳阻擋）。
+ */
+internal fun evaluateRedirectTargetHook(
+    location: String?,
+    optIn: EndpointNetworkOptIn,
+    resolver: HostResolver,
+): NetworkEvaluation? {
+    if (location.isNullOrBlank()) return null
+    return try {
+        NetworkPolicy.evaluateUrl(location, optIn, resolver)
+    } catch (_: Exception) {
+        null
+    }
+}
+
+/**
+ * Provider 入口共用：先閘後釘（讀 key 之前）。
+ *
+ * 回傳 `(pinnedClient, pinnedResolver)`：呼叫方用 pinnedClient 建連，
+ * 並把 pinnedResolver 傳回 `executeProviderRequest`／`pumpSse` 做縱深重驗
+ *（重驗走釘住值，不做二次解析，無 TOCTOU）。
+ * 拒絕即拋 typed fatal，不觸碰 key／body。
+ */
+internal fun pinnedTransportFor(
+    baseClient: OkHttpClient,
+    fullUrl: String,
+    optIn: EndpointNetworkOptIn,
+    resolver: HostResolver,
+): Pair<OkHttpClient, PinnedNetworkDns> {
+    val eval = requireNetworkPolicyAllowed(fullUrl, optIn, resolver)
+    val host = fullUrl.toHttpUrl().host
+    val pinned = PinnedNetworkDns.forHost(host, eval.resolvedAddresses, resolver)
+    val pinnedClient = providerTransportClient(baseClient).newBuilder()
+        .dns(pinned)
+        .build()
+    return pinnedClient to pinned
+}
 
 /** A redirect is a terminal response: never replay credentials or request bodies. */
 internal enum class SsePumpDecision { CONTINUE, STOP }
@@ -314,8 +408,13 @@ internal suspend fun <T> executeProviderRequest(
     client: OkHttpClient,
     request: Request,
     httpConfig: ProviderHttpConfig = ProviderHttpConfig(),
+    optIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+    resolver: HostResolver = SystemHostResolver,
     consume: (response: Response, cancelCall: () -> Unit) -> T,
 ): T = withContext(Dispatchers.IO) {
+    // S2 接線（縱深）：建連前重驗政策。Provider 入口已在讀 key 前驗過一次，
+    // 此處防直接調用繞過；拒絕即 typed fatal，不建連。
+    requireNetworkPolicyAllowed(request.url.toString(), optIn, resolver)
     val call = client.newCall(request)
     val job = currentCoroutineContext()[Job]
     val cancellation = job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
@@ -332,6 +431,16 @@ internal suspend fun <T> executeProviderRequest(
     try {
         currentCoroutineContext().ensureActive()
         val response = call.execute()
+        // S2 redirect 執行面：0-follow，任何 3xx 即 REDIRECT_BLOCKED 終端
+        //（不重送 credential／body；Location 逐跳重驗 hook 僅供 audit，照擋）。
+        if (NetworkPolicy.isRedirectStatus(response.code)) {
+            evaluateRedirectTargetHook(response.header("Location"), optIn, resolver)
+            try {
+                response.close()
+            } catch (_: NullPointerException) {
+            }
+            throw redirectBlockedFailure(response.code)
+        }
         val result = try {
             consume(response) { call.cancel() }
         } finally {
@@ -384,8 +493,12 @@ internal suspend fun pumpSse(
     client: OkHttpClient,
     request: Request,
     httpConfig: ProviderHttpConfig = ProviderHttpConfig(),
+    optIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+    resolver: HostResolver = SystemHostResolver,
     onFrame: suspend (SseFrameParser.Frame) -> SsePumpDecision,
 ) = coroutineScope {
+    // S2 接線（縱深）：建連前重驗政策，防直接調用繞過入口閘。
+    requireNetworkPolicyAllowed(request.url.toString(), optIn, resolver)
     val call = client.newCall(request)
     val job = currentCoroutineContext()[Job]
     val cancellation = job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
@@ -419,6 +532,15 @@ internal suspend fun pumpSse(
         var protocolTerminalReached = false
         try {
             try {
+                // S2 redirect 執行面：0-follow，任何 3xx 即 REDIRECT_BLOCKED 終端。
+                if (NetworkPolicy.isRedirectStatus(response.code)) {
+                    evaluateRedirectTargetHook(response.header("Location"), optIn, resolver)
+                    try {
+                        response.close()
+                    } catch (_: NullPointerException) {
+                    }
+                    throw redirectBlockedFailure(response.code)
+                }
                 if (!response.isSuccessful) {
                     val snippet = try {
                         readProviderErrorPrefix(response.body) { call.cancel() }

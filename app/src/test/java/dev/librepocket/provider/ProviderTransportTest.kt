@@ -1,5 +1,7 @@
 package dev.librepocket.provider
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkEgressPolicy
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.util.concurrent.Callable
@@ -75,6 +77,11 @@ class ProviderTransportTest {
         protocol = protocol,
         apiKeyRef = "fake-key-ref",
         http = http,
+        // S2：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in；
+        // production 預設仍 deny-all（HTTPS_ONLY）。
+        networkOptIn = EndpointNetworkOptIn(
+            NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+        ),
     )
 
     private fun anthropic(

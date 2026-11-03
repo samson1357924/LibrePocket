@@ -1,5 +1,8 @@
 package dev.librepocket.provider
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.HostResolver
+import dev.librepocket.policy.NetworkEgressPolicy
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
@@ -83,6 +86,11 @@ class ProviderTransportC1Test {
         protocol = protocol,
         apiKeyRef = "fake-key-ref",
         http = http,
+        // S2：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in；
+        // production 預設仍 deny-all（HTTPS_ONLY）。
+        networkOptIn = EndpointNetworkOptIn(
+            NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+        ),
     )
 
     private fun providerFor(
@@ -1366,8 +1374,16 @@ class ProviderTransportC1Test {
             }
             .build()
         val request = Request.Builder().url("http://localhost/").build()
+        // S2：直接調用 transport 亦受政策閘，須顯式迴環明文 opt-in＋fake 解析。
+        val loopback = HostResolver { host ->
+            if (host == "localhost") listOf(java.net.InetAddress.getByName("127.0.0.1"))
+            else throw java.net.UnknownHostException(host)
+        }
+        val optIn = EndpointNetworkOptIn(
+            NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+        )
         try {
-            pumpSse(nullBodyClient, request) { SsePumpDecision.CONTINUE }
+            pumpSse(nullBodyClient, request, optIn = optIn, resolver = loopback) { SsePumpDecision.CONTINUE }
             fail("pumpSse with null body must throw ProviderFailure")
         } catch (expected: ProviderFailure) {
             assertEquals("SSE_EMPTY_BODY", expected.message)

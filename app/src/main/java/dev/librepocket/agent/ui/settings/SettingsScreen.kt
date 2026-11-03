@@ -40,6 +40,8 @@ import dev.librepocket.agent.ui.chat.ExportUiState
 import dev.librepocket.agent.ui.chat.ImportUiState
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.setupErrorText
+import dev.librepocket.agent.assistant.AssistantSettingsState
+import dev.librepocket.agent.assistant.assistantReasonText
 import dev.librepocket.automation.AutomationSettingsState
 import dev.librepocket.voice.VoiceTools
 import dev.librepocket.voice.VoiceTts
@@ -147,6 +149,15 @@ fun SettingsScreen(
     onVoiceInputSwitch: (Boolean) -> Unit = {},
     onVoiceOutputSwitch: (Boolean) -> Unit = {},
     onOpenAiTtsSwitch: (Boolean) -> Unit = {},
+    /**
+     * C1 系統預設助理（Issue #137 C1b，三 flavor 共用 main 接線）：
+     * null（未接線）時整卡隱藏（仿 automation 模式）；非 null 顯示狀態＋
+     * 「設為預設助理」一鍵（RoleManager 流程）＋「語音輸入設定」fallback。
+     * C1 不新增麥克風／浮窗／截圖權限。
+     */
+    assistant: AssistantSettingsState? = null,
+    onRequestAssistantRole: () -> Unit = {},
+    onOpenVoiceInputSettings: () -> Unit = {},
     /**
      * 登出失敗碼（僅 `LOGOUT_*` 顯示；呼叫方由 form.errorCode 過濾傳入）。
      * 非 null 即顯示失敗卡；失敗不自動關 dialog（見 [showConfirmLogout]）。
@@ -359,6 +370,55 @@ fun SettingsScreen(
                     }
                 }
                 Spacer(modifier = Modifier.height(8.dp))
+                // C1 系統預設助理（Issue #137 C1b）：僅 main 接線傳入非 null 才顯示
+                // （三 flavor 共用；play 不加 a11y overlay，本卡與 a11y 無關）。
+                // 被拒／撤銷／OEM 不支援／請求失敗皆顯示原因並提供 fallback 入口。
+                if (assistant != null) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                        ),
+                    ) {
+                        Column(modifier = Modifier.padding(14.dp)) {
+                            Text("預設助理（系統助手）", style = MaterialTheme.typography.titleMedium)
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                when {
+                                    assistant.roleHeld -> "已設為預設助理：長按首頁鍵或系統手勢可叫出 LibrePocket。"
+                                    !assistant.roleAvailable -> "此裝置不支援系統助理角色，可改用語音輸入設定。"
+                                    else -> "尚未設為預設助理；授予後長按首頁鍵或系統手勢可叫出 LibrePocket。"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            assistant.reasonCode?.let { code ->
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    assistantReasonText(code),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Button(
+                                onClick = onRequestAssistantRole,
+                                enabled = assistant.roleAvailable && !assistant.roleHeld,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("設為預設助理")
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedButton(
+                                onClick = onOpenVoiceInputSettings,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("語音輸入設定")
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
                 // S3 提權橋揭露 + 一鍵收回（矩陣 §3：每次跨權限邊界呼叫攜原因碼寫審計，
                 // 審計只記雜湊計數；此處一鍵清表並關閉提權橋開關）。
                 Card(

@@ -87,5 +87,37 @@
                 <data android:mimeType="text/plain" />
             </intent-filter>
         </activity>
+        <!-- C1 系統預設助理（Issue #137 C1a，三 flavor 共用，無新增權限；
+             play 不加 a11y service overlay：本 PR 完全不碰 a11y）。
+             VoiceInteractionService：BIND_VOICE_INTERACTION 門檻＋
+             VoiceInteractionService action＋android.voice_interaction meta-data。 -->
+        <service
+            android:name=".assistant.LibreVoiceInteractionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_VOICE_INTERACTION">
+            <intent-filter>
+                <action android:name="android.service.voice.VoiceInteractionService" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <meta-data
+                android:name="android.voice_interaction"
+                android:resource="@xml/voice_interaction" />
+        </service>
+        <service
+            android:name=".assistant.LibreVoiceInteractionSessionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_VOICE_INTERACTION">
+            <intent-filter>
+                <action android:name="android.service.voice.VoiceInteractionSessionService" />
+            </intent-filter>
+        </service>
+        <service
+            android:name=".assistant.LibreRecognitionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_RECOGNITION_SERVICE">
+            <intent-filter>
+                <action android:name="android.speech.RecognitionService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

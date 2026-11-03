@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- C1 系統預設助理 voice-interaction meta-data（Issue #137 C1a）。
+     必須同時含 sessionService 與 recognitionService；supportsAssist=true
+     表示支援 ASSIST 喚起（保留現有 ASSIST／SEND 入口，不新增權限）。 -->
+<voice-interaction-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:sessionService="dev.librepocket.agent.assistant.LibreVoiceInteractionSessionService"
+    android:recognitionService="dev.librepocket.agent.assistant.LibreRecognitionService"
+    android:supportsAssist="true" />

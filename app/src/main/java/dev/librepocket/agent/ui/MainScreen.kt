@@ -32,6 +32,7 @@ import dev.librepocket.agent.ui.setup.PendingDelete
 import dev.librepocket.agent.ui.setup.SetupScreen
 import dev.librepocket.agent.ui.setup.SetupViewModel
 import dev.librepocket.agent.ui.setup.SetupViewModelFactory
+import dev.librepocket.agent.assistant.rememberAssistantRole
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.entry.EntryDispatch
 import dev.librepocket.entry.EntryRoute
@@ -137,6 +138,10 @@ fun MainScreen(
     // 橋接授權三位一體；一鍵收回原子清表、關開關、撤授權（見 PrivilegeBridgeState）。
     val privilegeState = remember { PrivilegeBridgeState() }
     var privilegeAuditCount by remember { mutableIntStateOf(privilegeState.auditCount()) }
+
+    // C1 系統預設助理（Issue #137 C1b，三 flavor 共用 main 接線）：
+    // RoleManager 快照＋一鍵要求＋fallback launcher（見 rememberAssistantRole）。
+    val assistantRole = rememberAssistantRole()
 
     // Gate first, dispatch later: stash the normalized entry text until an
     // endpoint exists, then send-now when idle or steer when busy.
@@ -403,6 +408,9 @@ fun MainScreen(
                 },
                 onDismissExportState = { sessionListViewModel.resetExportState() },
                 onDismissImportState = { sessionListViewModel.resetImportState() },
+                assistant = assistantRole.state,
+                onRequestAssistantRole = assistantRole.request,
+                onOpenVoiceInputSettings = assistantRole.openFallback,
             )
         },
         setupContent = { padding, isFirstRun ->

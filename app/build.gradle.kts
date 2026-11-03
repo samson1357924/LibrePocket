@@ -181,6 +181,9 @@ dependencies {
     // S2 cloud voice fallback (Azure Speech) → github-only, default off.
     // foss/play must never reference com.microsoft.cognitiveservices.speech
     // (HardeningPolicy.FOSS_STRING_BLACKLIST + foss gate assert this).
+    // Jackson BOM: lift the SDK's transitive 2.18.7 to the patched 2.18 line
+    // (16 advisories in issue #132 are fixed in 2.18.8+).
+    "githubImplementation"(platform(libs.jackson.bom))
     "githubImplementation"(libs.azure.speech)
     "fossImplementation"(libs.zxing.core)
     "githubImplementation"(libs.zxing.core)

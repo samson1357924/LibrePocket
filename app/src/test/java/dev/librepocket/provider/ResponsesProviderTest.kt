@@ -2622,4 +2622,254 @@ class ResponsesProviderTest {
             server.shutdown()
         }
     }
+
+    // ---- PR #130 Stage 1: Robust refusal latching regression tests ----
+
+    @Test
+    fun unsupportedContentPartWithRefusalFieldPreservesStopTerminal() {
+        val mapper = ResponsesMapper()
+        // Content part done with unsupported type (e.g. image_url) carrying a refusal field
+        val partDoneEvents = mapper.mapPayload(
+            """{"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"image_url","refusal":"fake refusal text","url":"https://example.com/test.png"}}""",
+        )
+        assertEquals(emptyList<StreamEvent>(), partDoneEvents)
+
+        // Followed by normal completed output_text -> must finish with Done("stop")
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Normal answer"}]}]}}""",
+        )
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "Normal answer"),
+                StreamEvent.Done("stop"),
+            ),
+            completed,
+        )
+
+        // Also verify completed frame containing message with unsupported part type carrying refusal field
+        val mapperPart = ResponsesMapper()
+        val completedPart = mapperPart.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"image_url","refusal":"fake refusal text"},{"type":"output_text","text":"Normal answer"}]}]}}""",
+        )
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 1, "Normal answer"),
+                StreamEvent.Done("stop"),
+            ),
+            completedPart,
+        )
+    }
+
+    @Test
+    fun unsupportedOutputItemWithRefusalFieldPreservesStopTerminal() {
+        // Output item done for unsupported type (custom_tool) carrying refusal
+        val mapperCustom = ResponsesMapper()
+        val customItemEvents = mapperCustom.mapPayload(
+            """{"type":"response.output_item.done","output_index":0,"item":{"type":"custom_tool","id":"ct_1","refusal":"custom refusal"}}""",
+        )
+        assertEquals(emptyList<StreamEvent>(), customItemEvents)
+
+        val customCompleted = mapperCustom.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"custom_tool","id":"ct_1","refusal":"custom refusal"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Normal answer"}]}]}}""",
+        )
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 1000, "Normal answer"),
+                StreamEvent.Done("stop"),
+            ),
+            customCompleted,
+        )
+
+        // Output item done for function_call carrying refusal field
+        val mapperFunc = ResponsesMapper()
+        val funcItemEvents = mapperFunc.mapPayload(
+            """{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"{}","refusal":"func refusal"}}""",
+        )
+        assertEquals(
+            listOf(
+                StreamEvent.ToolDone(0, "call_1", "get_weather", "{}"),
+            ),
+            funcItemEvents,
+        )
+
+        val funcCompleted = mapperFunc.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"{}"}]}}""",
+        )
+        assertEquals(
+            listOf(StreamEvent.Done("stop")),
+            funcCompleted,
+        )
+    }
+
+    @Test
+    fun messageWithTopLevelRefusalAndNonEmptyContentEmitsTextAndPreservesStop() {
+        val mapper = ResponsesMapper()
+        // Message output_item.done with top-level refusal AND non-empty content
+        val itemDoneEvents = mapper.mapPayload(
+            """{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","refusal":"Ignored top-level refusal","content":[{"type":"output_text","text":"Valid answer text"}]}}""",
+        )
+        assertEquals(
+            listOf(StreamEvent.TextDelta(0, 0, "Valid answer text")),
+            itemDoneEvents,
+        )
+
+        // Authoritative completed frame with the same message
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","role":"assistant","refusal":"Ignored top-level refusal","content":[{"type":"output_text","text":"Valid answer text"}]}]}}""",
+        )
+        assertEquals(
+            listOf(StreamEvent.Done("stop")),
+            completed,
+        )
+
+        // Direct response.completed without prior output_item.done
+        val mapperDirect = ResponsesMapper()
+        val directCompleted = mapperDirect.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_direct","role":"assistant","refusal":"Ignored top-level refusal","content":[{"type":"output_text","text":"Direct valid text"}]}]}}""",
+        )
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "Direct valid text"),
+                StreamEvent.Done("stop"),
+            ),
+            directCompleted,
+        )
+    }
+
+    @Test
+    fun emptyStringRefusalDeltaDoesNotLatchSawRefusal() {
+        val mapper = ResponsesMapper()
+        val e1 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","output_index":0,"content_index":0,"delta":""}""",
+        )
+        assertEquals(emptyList<StreamEvent>(), e1)
+
+        val e2 = mapper.mapPayload(
+            """{"type":"response.refusal.delta","output_index":0,"content_index":0,"refusal":""}""",
+        )
+        assertEquals(emptyList<StreamEvent>(), e2)
+
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Normal answer"}]}]}}""",
+        )
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "Normal answer"),
+                StreamEvent.Done("stop"),
+            ),
+            completed,
+        )
+    }
+
+    @Test
+    fun streamFlowUnsupportedPartsAndItemsWithRefusalFollowedByTextCompletesWithStop() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val body =
+                "data: {\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"image_url\",\"refusal\":\"ignored part refusal\"}}\n\n" +
+                    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"custom_tool\",\"id\":\"ct_1\",\"refusal\":\"ignored item refusal\"}}\n\n" +
+                    "data: {\"type\":\"response.refusal.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"\"}\n\n" +
+                    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Streamed valid answer\"}\n\n" +
+                    "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Streamed valid answer\"}]}]}}\n\n"
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(body),
+            )
+            val provider = ResponsesProvider(
+                testConfig(server.url("/").toString().trimEnd('/')),
+                { "test_api_key".toCharArray() },
+            )
+            val events = withTimeout(10_000) {
+                provider.stream(
+                    ChatRequest(model = "gpt-4o", messages = listOf(ChatMessage("user", "Hello"))),
+                ).toList()
+            }
+            assertEquals(
+                listOf(
+                    StreamEvent.TextDelta(0, 0, "Streamed valid answer"),
+                    StreamEvent.Done("stop"),
+                ),
+                events,
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun outputTextContentPartWithRefusalFieldPreservesStopTerminal() {
+        val mapper = ResponsesMapper()
+        val partDoneEvents = mapper.mapPayload(
+            """{"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"output_text","text":"Normal answer","refusal":"fake refusal"}}""",
+        )
+        assertEquals(
+            listOf(StreamEvent.TextDelta(0, 0, "Normal answer")),
+            partDoneEvents,
+        )
+
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Normal answer"}]}]}}""",
+        )
+        assertEquals(
+            listOf(StreamEvent.Done("stop")),
+            completed,
+        )
+    }
+
+    @Test
+    fun completedOutputTextMessageWithRefusalFieldPreservesStopTerminal() {
+        val mapper = ResponsesMapper()
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Normal answer","refusal":"fake refusal"}]}]}}""",
+        )
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "Normal answer"),
+                StreamEvent.Done("stop"),
+            ),
+            completed,
+        )
+    }
+
+    @Test
+    fun emptyRefusalWithFallbackTextInRefusalDone() {
+        val mapper = ResponsesMapper()
+        val doneEvents = mapper.mapPayload(
+            """{"type":"response.refusal.done","output_index":0,"content_index":0,"refusal":"","text":"I refuse"}""",
+        )
+        assertEquals(
+            listOf(StreamEvent.TextDelta(0, 0, "I refuse")),
+            doneEvents,
+        )
+
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"refusal","id":"ref_1","refusal":"I refuse"}]}}""",
+        )
+        assertEquals(
+            listOf(StreamEvent.Done("refusal")),
+            completed,
+        )
+    }
+
+    @Test
+    fun emptyDeltaWithFallbackRefusalInRefusalDelta() {
+        val mapper = ResponsesMapper()
+        val deltaEvents = mapper.mapPayload(
+            """{"type":"response.refusal.delta","output_index":0,"content_index":0,"delta":"","refusal":"I refuse"}""",
+        )
+        assertEquals(
+            listOf(StreamEvent.TextDelta(0, 0, "I refuse")),
+            deltaEvents,
+        )
+
+        val completed = mapper.mapPayload(
+            """{"type":"response.completed","response":{"output":[{"type":"refusal","id":"ref_1","refusal":"I refuse"}]}}""",
+        )
+        assertEquals(
+            listOf(StreamEvent.Done("refusal")),
+            completed,
+        )
+    }
 }

@@ -60,6 +60,9 @@ class ElevatedRunnerTest {
         bridgeGranted = bridgeGranted,
         pingBinder = { true },
         spawn = spawn::spawn,
+        // B2：狀態門需假 Available（真實 getVersion 在 JVM 無 Shizuku 即
+        // VersionUnsupported；單測只斷 runner 語義，不斷探測）。
+        status = { ShizukuStatus.Available(15) },
     )
 
     private fun rootRunner(
@@ -71,6 +74,8 @@ class ElevatedRunnerTest {
         quota = quota,
         bridgeGranted = bridgeGranted,
         spawn = spawn::spawn,
+        // B2：su 經可信絕對路徑（單測注入假路徑，不碰真實 FS/su）。
+        suBinary = "/system/bin/su",
     )
 
     @Test fun nonWhitelistedBinaryPassesOnlyViaElevated() {
@@ -80,9 +85,10 @@ class ElevatedRunnerTest {
         }
         val spawn = SpawnCounter()
         // Root 走 su -c 傳送層：內層 argv 原樣包覆，外層 cwd 釘死（cd + exec 雙保險）。
+        // B2：su 本體為可信絕對路徑（不再是 bare "su"）。
         rootRunner(spawn).run(ElevatedRequest(listOf("dumpsys", "activity"), reasonCode = "D09-T"))
         assertEquals(
-            listOf("su", "-c", "cd $privateRoot && exec dumpsys activity"),
+            listOf("/system/bin/su", "-c", "cd $privateRoot && exec dumpsys activity"),
             spawn.lastArgv,
         )
     }
@@ -122,9 +128,14 @@ class ElevatedRunnerTest {
             bridgeGranted = true,
             pingBinder = { false },
             spawn = spawn::spawn,
+            // B2：binder 不可達經狀態門回 typed Denied（舊碼回 Failed）；
+            // 假狀態直接給不可達，不碰真實 binder。
+            status = { ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN) },
         )
         val r = runner.run(ElevatedRequest(listOf("id"), reasonCode = "D09-T"))
-        assertTrue("$r", r is ShellResult.Failed)
+        assertTrue("$r", r is ShellResult.Denied)
+        assertEquals(ShellDeny.NOT_WHITELISTED, (r as ShellResult.Denied).reason)
+        assertTrue(r.message.contains(ShizukuStatus.REASON_BINDER_DOWN))
         assertEquals(0, spawn.calls)
     }
 

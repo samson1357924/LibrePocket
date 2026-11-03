@@ -1,5 +1,6 @@
 package dev.librepocket.privilege.github
 
+import dev.librepocket.redact.Redactor
 import dev.librepocket.shell.ElevatedRequest
 import dev.librepocket.shell.ElevatedShellRunner
 import dev.librepocket.shell.ShellDeny
@@ -8,14 +9,25 @@ import dev.librepocket.shell.ShellQuota
 import dev.librepocket.shell.ShellResult
 import dev.librepocket.shell.Validation
 import dev.librepocket.tool.Flavor
+import java.io.File
 
 /**
  * Root 提權執行器（S3，BACKLOG D09，矩陣 §3，僅 github 風味，極客可選）。
  *
  * 執行順序：[ShellPolicy.validateElevated] 先行 → 原因碼 → 配額 →
- * `su -c` argv 直達 → 超時殺 → 輸出截斷。策略拒絕/配額拒絕一律不建子進程；
- * su 不可用（二進位缺失/拒絕提權）回 [ShellResult.Failed] 並附降級話術，
- * 呼叫方回落免 Root 路徑。
+ * 可信 su 解析 → `su -c` argv 直達 → 超時殺（整組） → 輸出截斷。
+ * 策略拒絕/配額拒絕一律不建子進程；su 不可用（二進位缺席/拒絕提權）回
+ * typed Denied/Failed 並附降級話術，呼叫方回落免 Root 路徑。
+ *
+ * B2 修正（Issue #136 B2）：
+ * - su exit 語義：拒絕（[isSuDenied]）回 `Denied(NOT_WHITELISTED)`，
+ *   一般非零回 `Failed`，皆不回 `Ok`（舊碼 90-95 誤回 Ok）；
+ *   訊息內 stderr 經 `Redactor.redactError` 收斂（保留 redacted，不洩密）；
+ * - 超時/cancel 走 [ElevatedProcessKiller.killTree]（整組殺，舊碼只殺 `su`
+ *   本體，見 `RootSuRunner.kt:47-50`）＋ [isCancelled] 輪詢鉤，解除 blocking I/O；
+ * - su 本體經 [SuBinaryResolver] 解析可信絕對路徑（舊碼 bare `"su"` 走 PATH，
+ *   可劫持），缺席即 Failed 且零 spawn；
+ * - 二進位通道：[runBinary] 以 [ByteArray] 直達，[run] 僅為文字相容殼。
  *
  * - 白名單外二進位僅允許走本提權通道（直接 exec 仍由
  *   [ShellPolicy.validate] 拒絕）；黑名單（`rm`/`dd`/`reboot`/
@@ -23,7 +35,7 @@ import dev.librepocket.tool.Flavor
  * - 校驗對象是內層 argv（`su` 本體不在校驗內，`su -c` 只是傳送層）；
  *   內層參數已先過參數衛生（串接/重定向/子命令字元全拒），此處再對含
  *   非安全字元的參數做單引號包覆（縱深防禦，`su -c` 在裝置側必經一次
- *   字串解析，見 [run] 的傳送層註解）；
+ *   字串解析，見 [runBinary] 的傳送層註解）；
  * - 跨域路徑語義同 [ShizukuShellRunner]：需
  *   [dev.librepocket.files.FileScope.decide] 回 needsBridge 且橋接已授權
  *   （[bridgeGranted]，對應 `privilege_bridge` 開關）。
@@ -35,9 +47,16 @@ class RootSuRunner(
     private val bridgeGranted: Boolean = false,
     private val flavor: Flavor = Flavor.GITHUB,
     private val spawn: ((List<String>) -> Process)? = null,
-) : ElevatedShellRunner {
+    private val suBinary: String? = null,
+    private val suExists: (String) -> Boolean = { path -> File(path).exists() },
+    private val killer: (Process) -> Unit = { ElevatedProcessKiller.killTree(it) },
+    private val isCancelled: () -> Boolean = { Thread.currentThread().isInterrupted },
+) : ElevatedShellRunner, BinaryElevatedRunner {
 
-    override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult {
+    override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult =
+        runBinary(request, timeoutMs).toShellResult()
+
+    override fun runBinary(request: ElevatedRequest, timeoutMs: Long): ElevatedBinaryResult {
         when (
             val v = ShellPolicy.validateElevated(
                 request.argv,
@@ -47,14 +66,21 @@ class RootSuRunner(
                 bridgeGranted,
             )
         ) {
-            is Validation.Denied -> return ShellResult.Denied(v.reason, v.message)
+            is Validation.Denied -> return ElevatedBinaryResult.Denied(v.reason, v.message)
             is Validation.Allowed -> Unit
         }
         if (request.reasonCode.isBlank()) {
-            return ShellResult.Denied(ShellDeny.BAD_ARGUMENT, "reasonCode required (matrix §3 audit)")
+            return ElevatedBinaryResult.Denied(ShellDeny.BAD_ARGUMENT, "reasonCode required (matrix §3 audit)")
         }
         if (!quota.tryAcquire()) {
-            return ShellResult.Denied(ShellDeny.QUOTA_EXCEEDED, "elevated shell quota exceeded")
+            return ElevatedBinaryResult.Denied(ShellDeny.QUOTA_EXCEEDED, "elevated shell quota exceeded")
+        }
+        val su = suBinary ?: SuBinaryResolver.resolve(suExists)
+        if (su == null) {
+            return ElevatedBinaryResult.Failed("su unavailable (no trusted su binary; fallback to unprivileged path)")
+        }
+        if (!SuBinaryResolver.isTrusted(su)) {
+            return ElevatedBinaryResult.Failed("su untrusted path (fail-closed, no spawn)")
         }
         // su -c 傳送層：內層 argv 已校驗，此處 joinToString 拼成單一
         // `-c` 字串（裝置側 `su` 必經一次字串解析，非 argv 直達；
@@ -69,33 +95,43 @@ class RootSuRunner(
         } else {
             inner
         }
-        val wrapped = listOf("su", "-c", shellScript)
+        val wrapped = listOf(su, "-c", shellScript)
         val process: Process = try {
             (spawn ?: ::pinnedSpawn)(wrapped)
         } catch (e: Exception) {
-            return ShellResult.Failed("su spawn failed: ${e.message}")
+            val redacted = Redactor.redactError(e.message ?: e.javaClass.simpleName)
+            return ElevatedBinaryResult.Failed("su spawn failed: $redacted")
         }
-        val raw = ElevatedProcessIo.drain(process, timeoutMs)
+        val raw = ElevatedProcessIo.drain(process, timeoutMs, killer, isCancelled)
         val out = ShellPolicy.truncate(raw.stdout)
         val err = ShellPolicy.truncate(raw.stderr)
         val truncated = out.truncated || err.truncated
         if (raw.timedOut) {
-            return ShellResult.TimedOut(
-                partialStdout = out.bytes.toUtf8Lossy(),
-                partialStderr = err.bytes.toUtf8Lossy(),
+            return ElevatedBinaryResult.TimedOut(
+                partialStdout = out.bytes,
+                partialStderr = err.bytes,
                 timeoutMs = timeoutMs,
                 truncated = truncated,
             )
         }
-        return ShellResult.Ok(
-            stdout = out.bytes.toUtf8Lossy(),
-            stderr = err.bytes.toUtf8Lossy(),
+        if (raw.exitCode != 0) {
+            val redacted = Redactor.redactError(String(err.bytes, Charsets.UTF_8))
+            return if (isSuDenied(err.bytes, raw.exitCode)) {
+                ElevatedBinaryResult.Denied(
+                    ShellDeny.NOT_WHITELISTED,
+                    "su denied exit=${raw.exitCode} (NO_PRIVILEGE; fallback to unprivileged path): $redacted",
+                )
+            } else {
+                ElevatedBinaryResult.Failed("su failed exit=${raw.exitCode}: $redacted")
+            }
+        }
+        return ElevatedBinaryResult.Ok(
+            stdout = out.bytes,
+            stderr = err.bytes,
             exitCode = raw.exitCode,
             truncated = truncated,
         )
     }
-
-    private fun ByteArray.toUtf8Lossy(): String = String(this, Charsets.UTF_8)
 
     /**
      * P0 cwd 釘死：真實建子進程時把工作目錄釘到 privateRoot。

@@ -1,5 +1,6 @@
 package dev.librepocket.privilege.github
 
+import dev.librepocket.redact.Redactor
 import dev.librepocket.shell.ElevatedRequest
 import dev.librepocket.shell.ElevatedShellRunner
 import dev.librepocket.shell.ShellDeny
@@ -11,13 +12,19 @@ import dev.librepocket.tool.Flavor
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.TimeUnit
 import rikka.shizuku.Shizuku
-import rikka.shizuku.ShizukuBinderWrapper
 
 /**
  * 提權子進程 IO 共用（github 源集內部）：超時讀取 + 硬上限防 OOM。
  * 截斷標記沿用 [ShellPolicy.MAX_OUTPUT_BYTES]，由各 Runner 呼叫
  * [ShellPolicy.truncate] 後判定（與 [dev.librepocket.shell.RestrictedShell]
  * 同語義）。
+ *
+ * B2 修正（Issue #136 B2）：
+ * - 超時/cancel 走 [ElevatedProcessKiller.killTree]（整組殺，舊碼只殺本體）；
+ * - 殺後關流以解除 gobbler 的 blocking I/O（舊碼流殘留可卡住 join）；
+ * - 輪詢式等待（50ms 切片）＋ [isCancelled] 鉤：協程取消（Thread 中斷或
+ *   外部旗標）即殺整組並帶 partial 回，不 мок 在 `waitFor(timeout)` 內；
+ * - [killer]/[isCancelled] 可注入，JVM 單測以假進程斷言「超時/cancel 必殺」。
  */
 internal object ElevatedProcessIo {
     data class Drained(
@@ -27,7 +34,15 @@ internal object ElevatedProcessIo {
         val timedOut: Boolean,
     )
 
-    fun drain(process: Process, timeoutMs: Long): Drained {
+    fun drain(process: Process, timeoutMs: Long): Drained =
+        drain(process, timeoutMs, { ElevatedProcessKiller.killTree(it) }, { Thread.currentThread().isInterrupted })
+
+    fun drain(
+        process: Process,
+        timeoutMs: Long,
+        killer: (Process) -> Unit,
+        isCancelled: () -> Boolean,
+    ): Drained {
         val out = CappedPipe()
         val err = CappedPipe()
         val tOut = Thread({ copyCapped(process.inputStream, out) }, "elevated-stdout").also {
@@ -38,14 +53,35 @@ internal object ElevatedProcessIo {
             it.isDaemon = true
             it.start()
         }
-        val finished = try {
-            process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-            false
+        var finished = false
+        try {
+            // 單調時鐘：nanoTime 不受 wall-clock 回撥/校時影響，避免超時拉長或提前。
+            val deadlineNanos = System.nanoTime() +
+                TimeUnit.MILLISECONDS.toNanos(timeoutMs.coerceAtLeast(0L))
+            while (true) {
+                if (runCatching { isCancelled() }.getOrDefault(false)) break
+                val remaining = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime())
+                if (remaining <= 0) break
+                val slice = minOf(remaining, 50L)
+                val done = try {
+                    process.waitFor(slice, TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+                if (done) {
+                    finished = true
+                    break
+                }
+            }
+        } catch (_: Exception) {
+            // 輪詢異常一律視為未完成，走下方整組清理。
         }
         if (!finished) {
-            runCatching { process.destroyForcibly() }
+            runCatching { killer(process) }
+            // 關流以解除 gobbler 阻塞（killer 內已關，此處縱深再關一次）。
+            runCatching { process.inputStream.close() }
+            runCatching { process.errorStream.close() }
             runCatching { process.waitFor(5, TimeUnit.SECONDS) }
         }
         runCatching { tOut.join(5_000L) }
@@ -89,18 +125,23 @@ internal object ElevatedProcessIo {
 /**
  * Shizuku 提權執行器（S3，BACKLOG D09，矩陣 §3，僅 github 風味）。
  *
- * 執行順序：ShizukuBinder 可達性 → [ShellPolicy.validateElevated] 先行 →
- * 原因碼 → 配額 → 遠端建子進程 → 超時殺 → 輸出截斷。策略拒絕/配額拒絕/
- * binder 不可達一律不建遠端進程；Shizuku 不可用時回 [ShellResult.Failed]
- * 並附降級話術，呼叫方回落免 Root 路徑（卸載 Shizuku 冒烟仍過）。
+ * 執行順序：[ShizukuStatusGate]（B2：binder/授權/版本 typed 門，拒絕即
+ * Denied 且零 spawn）→ [ShellPolicy.validateElevated] 先行 →
+ * 原因碼 → 配額 → 遠端建子進程 → 超時殺（整組） → 輸出截斷。
+ * 策略拒絕/配額拒絕/門拒絕一律不建遠端進程；Shizuku 不可用時回 typed
+ * Denied（B2：舊碼回 Failed，現對齊 B1 門語義），spawn 異常回
+ * [ShellResult.Failed]，呼叫方回落免 Root 路徑。
  *
  * - 遠端進程經 Shizuku 13.x `newProcess(argv, env, dir)`（private，
- *   反射呼叫；binder 死亡/版本差異經 runCatching 收斂為 [ShellResult.Failed]）；
+ *   反射呼叫；回傳物經 [ShizukuRemoteProcess.wrap] 包裝，永不直 cast
+ *   `Process`，binder 死亡/版本差異經 runCatching 收斂為 [ShellResult.Failed]）；
  * - 白名單外二進位僅允許走本通道（[ShellPolicy.validateElevated] 語義），
  *   黑名單（`rm -rf /` 類）即使提權仍拒；
  * - 跨域路徑需 [dev.librepocket.files.FileScope.decide] 回 needsBridge
  *   且橋接已授權（[bridgeGranted]，對應 `privilege_bridge` 開關），
  *   否則拒絕 —— 私有域/SAF 直行優先，呼叫方應優先走 SAF。
+ * - 二進位通道：[runBinary] 以 [ByteArray] 直達（B2；截圖 PNG 等不可經
+ *   String），[run] 僅為文字相容殼；非零 exit 回 Failed（redacted），不回 Ok。
  */
 class ShizukuShellRunner(
     private val privateRoot: String? = null,
@@ -110,14 +151,17 @@ class ShizukuShellRunner(
     private val flavor: Flavor = Flavor.GITHUB,
     private val pingBinder: () -> Boolean = { ShizukuProbe.ping() },
     private val spawn: ((List<String>) -> Process)? = null,
-) : ElevatedShellRunner {
+    private val status: () -> ShizukuStatus = { ShizukuStatusProbe.status(pingBinder = pingBinder) },
+    private val killer: (Process) -> Unit = { ElevatedProcessKiller.killTree(it) },
+    private val isCancelled: () -> Boolean = { Thread.currentThread().isInterrupted },
+) : ElevatedShellRunner, BinaryElevatedRunner {
 
-    override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult {
-        if (!isBinderLive()) {
-            return ShellResult.Failed(
-                "shizuku binder unreachable; fallback to unprivileged path (NO_PRIVILEGE)",
-            )
-        }
+    override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult =
+        runBinary(request, timeoutMs).toShellResult()
+
+    override fun runBinary(request: ElevatedRequest, timeoutMs: Long): ElevatedBinaryResult {
+        ShizukuStatusGate.denyFor(runCatching { status() }.getOrDefault(ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN)))
+            ?.let { return ElevatedBinaryResult.Denied(it.reason, it.message) }
         when (
             val v = ShellPolicy.validateElevated(
                 request.argv,
@@ -127,55 +171,44 @@ class ShizukuShellRunner(
                 bridgeGranted,
             )
         ) {
-            is Validation.Denied -> return ShellResult.Denied(v.reason, v.message)
+            is Validation.Denied -> return ElevatedBinaryResult.Denied(v.reason, v.message)
             is Validation.Allowed -> Unit
         }
         if (request.reasonCode.isBlank()) {
-            return ShellResult.Denied(ShellDeny.BAD_ARGUMENT, "reasonCode required (matrix §3 audit)")
+            return ElevatedBinaryResult.Denied(ShellDeny.BAD_ARGUMENT, "reasonCode required (matrix §3 audit)")
         }
         if (!quota.tryAcquire()) {
-            return ShellResult.Denied(ShellDeny.QUOTA_EXCEEDED, "elevated shell quota exceeded")
+            return ElevatedBinaryResult.Denied(ShellDeny.QUOTA_EXCEEDED, "elevated shell quota exceeded")
         }
         val process: Process = try {
             (spawn ?: ::pinnedSpawn)(request.argv)
         } catch (e: Exception) {
-            return ShellResult.Failed("shizuku spawn failed: ${e.message}")
+            val redacted = Redactor.redactError(e.message ?: e.javaClass.simpleName)
+            return ElevatedBinaryResult.Failed("shizuku spawn failed: $redacted")
         }
-        val raw = ElevatedProcessIo.drain(process, timeoutMs)
+        val raw = ElevatedProcessIo.drain(process, timeoutMs, killer, isCancelled)
         val out = ShellPolicy.truncate(raw.stdout)
         val err = ShellPolicy.truncate(raw.stderr)
         val truncated = out.truncated || err.truncated
         if (raw.timedOut) {
-            return ShellResult.TimedOut(
-                partialStdout = out.bytes.toUtf8Lossy(),
-                partialStderr = err.bytes.toUtf8Lossy(),
+            return ElevatedBinaryResult.TimedOut(
+                partialStdout = out.bytes,
+                partialStderr = err.bytes,
                 timeoutMs = timeoutMs,
                 truncated = truncated,
             )
         }
-        return ShellResult.Ok(
-            stdout = out.bytes.toUtf8Lossy(),
-            stderr = err.bytes.toUtf8Lossy(),
+        if (raw.exitCode != 0) {
+            val redacted = Redactor.redactError(String(err.bytes, Charsets.UTF_8))
+            return ElevatedBinaryResult.Failed("shizuku command failed exit=${raw.exitCode}: $redacted")
+        }
+        return ElevatedBinaryResult.Ok(
+            stdout = out.bytes,
+            stderr = err.bytes,
             exitCode = raw.exitCode,
             truncated = truncated,
         )
     }
-
-    /**
-     * ShizukuBinder 存活檢查：先經 [ShizukuBinderWrapper] 包裝實體 binder
-     * ping（binder 層），再經 [Shizuku.pingBinder]（服務層），任一活即視為
-     * 可達；任何異常 runCatching 收斂為 false。
-     */
-    private fun isBinderLive(): Boolean {
-        val wrapperAlive = runCatching {
-            val binder = Shizuku.getBinder() ?: return@runCatching false
-            ShizukuBinderWrapper(binder).pingBinder()
-        }.getOrDefault(false)
-        if (wrapperAlive) return true
-        return runCatching { pingBinder() }.getOrDefault(false)
-    }
-
-    private fun ByteArray.toUtf8Lossy(): String = String(this, Charsets.UTF_8)
 
     /**
      * P0 cwd 釘死：遠端建子進程時把 `dir` 釘到 privateRoot（原 `null` 會落在
@@ -189,6 +222,7 @@ class ShizukuShellRunner(
          * 預設遠端建子進程：Shizuku 13.x 的 `newProcess` 為 private，
          * 此處反射呼叫（argv 直達，不經 `sh -c`，不拼字串）。
          * P0 修正：`dir` 傳 privateRoot（非 null），不再傳 null。
+         * B2 修正：回傳物經 [ShizukuRemoteProcess.wrap] 包裝，永不直 cast。
          */
         @Deprecated(
             "僅測試/舊碼相容，產品碼禁用：未釘死 cwd（dir=null）。產品一律走實例 pinnedSpawn。",
@@ -205,8 +239,8 @@ class ShizukuShellRunner(
                 String::class.java,
             )
             method.isAccessible = true
-            @Suppress("UNCHECKED_CAST")
-            return (method.invoke(null, argv.toTypedArray(), null, dir) as Process)
+            val raw = method.invoke(null, argv.toTypedArray(), null, dir)
+            return ShizukuRemoteProcess.wrap(raw)
         }
     }
 }

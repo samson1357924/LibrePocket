@@ -33,6 +33,12 @@ enum class FrameSource {
  * + 配額 + reasonCode 非空 + bridgeGranted，後 [PrivilegeAuditLog.recordResult]，
  * 全路徑留痕），禁止傳入繞過提權通道的裸子進程 lambda。
  *
+ * B2 二進位修正（Issue #136 B2）：舊 `screencapViaElevated` 經
+ * `ShellResult.Ok.stdout.toByteArray(UTF_8)` 往返，非 UTF-8 位元組（PNG）
+ * 即損毀；現若 runner 實作 [BinaryElevatedRunner] 即走 [runBinary] 位元組
+ * 直達（[screencapViaBinary]/[fb0ViaBinary]），否則回落舊 String 路徑
+ * （僅相容 [dev.librepocket.shell.DenyingElevatedRunner] 等文字 runner）。
+ *
  * 讀取函數可注入，JVM 單測直接斷言優先序與摘要語義。
  */
 class RootFramebufferCapture(
@@ -72,18 +78,25 @@ class RootFramebufferCapture(
          * 配額 + reasonCode 非空 + bridgeGranted，執行後
          * [PrivilegeAuditLog.recordResult] 留痕，只記雜湊計數）。
          * 通道拒絕/失敗回 null（呼叫方降級手動截圖）。
+         *
+         * B2：runner 若為 [BinaryElevatedRunner] 即走位元組直達
+         * （[screencapViaBinary]），否則回落 String 路徑。
          */
         fun screencapViaElevated(
             runner: ElevatedShellRunner,
             audit: PrivilegeAuditLog,
             reasonCode: String,
             timeoutMs: Long = TIMEOUT_MS,
-        ): () -> ByteArray? = {
-            val request = ElevatedRequest(listOf("screencap", "-p"), reasonCode)
-            val result = runner.run(request, timeoutMs)
-            audit.recordResult(request, result)
-            (result as? ShellResult.Ok)
-                ?.stdout?.toByteArray(Charsets.UTF_8)?.takeIf { it.isNotEmpty() }
+        ): () -> ByteArray? {
+            val binary = runner as? BinaryElevatedRunner
+            if (binary != null) return screencapViaBinary(binary, audit, reasonCode, timeoutMs)
+            return {
+                val request = ElevatedRequest(listOf("screencap", "-p"), reasonCode)
+                val result = runner.run(request, timeoutMs)
+                audit.recordResult(request, result)
+                (result as? ShellResult.Ok)
+                    ?.stdout?.toByteArray(Charsets.UTF_8)?.takeIf { it.isNotEmpty() }
+            }
         }
 
         /**
@@ -91,18 +104,56 @@ class RootFramebufferCapture(
          *（跨域路徑，需 [dev.librepocket.files.FileScope.decide] 回 needsBridge
          * 且橋接已授權；其餘門禁與審計同 [screencapViaElevated]）。
          * 通道拒絕/失敗回 null（呼叫方降級手動截圖）。
+         *
+         * B2：同 [screencapViaElevated]，二進位 runner 走位元組直達。
          */
         fun fb0ViaElevated(
             runner: ElevatedShellRunner,
             audit: PrivilegeAuditLog,
             reasonCode: String,
             timeoutMs: Long = TIMEOUT_MS,
+        ): () -> ByteArray? {
+            val binary = runner as? BinaryElevatedRunner
+            if (binary != null) return fb0ViaBinary(binary, audit, reasonCode, timeoutMs)
+            return {
+                val request = ElevatedRequest(listOf("cat", "/dev/graphics/fb0"), reasonCode)
+                val result = runner.run(request, timeoutMs)
+                audit.recordResult(request, result)
+                (result as? ShellResult.Ok)
+                    ?.stdout?.toByteArray(Charsets.UTF_8)?.takeIf { it.isNotEmpty() }
+            }
+        }
+
+        /**
+         * B2 位元組直達版 screencap：經 [BinaryElevatedRunner.runBinary]，
+         * PNG 位元組不經 String，審計僅記 verdict（不記明文）。
+         */
+        fun screencapViaBinary(
+            runner: BinaryElevatedRunner,
+            audit: PrivilegeAuditLog,
+            reasonCode: String,
+            timeoutMs: Long = TIMEOUT_MS,
+        ): () -> ByteArray? = {
+            val request = ElevatedRequest(listOf("screencap", "-p"), reasonCode)
+            val result = runner.runBinary(request, timeoutMs)
+            audit.record(request.argv, request.reasonCode, result.verdict())
+            (result as? ElevatedBinaryResult.Ok)?.stdout?.takeIf { it.isNotEmpty() }
+        }
+
+        /**
+         * B2 位元組直達版 fb0：同 [screencapViaBinary]，執行
+         * `cat /dev/graphics/fb0`（跨域需 needsBridge＋橋授權）。
+         */
+        fun fb0ViaBinary(
+            runner: BinaryElevatedRunner,
+            audit: PrivilegeAuditLog,
+            reasonCode: String,
+            timeoutMs: Long = TIMEOUT_MS,
         ): () -> ByteArray? = {
             val request = ElevatedRequest(listOf("cat", "/dev/graphics/fb0"), reasonCode)
-            val result = runner.run(request, timeoutMs)
-            audit.recordResult(request, result)
-            (result as? ShellResult.Ok)
-                ?.stdout?.toByteArray(Charsets.UTF_8)?.takeIf { it.isNotEmpty() }
+            val result = runner.runBinary(request, timeoutMs)
+            audit.record(request.argv, request.reasonCode, result.verdict())
+            (result as? ElevatedBinaryResult.Ok)?.stdout?.takeIf { it.isNotEmpty() }
         }
     }
 }

@@ -1604,4 +1604,118 @@ class ChatMarkdownParserTest {
         assertTrue(completedCode.key.startsWith("code_fenced_kotlin_"))
         assertTrue(completedCode.key != streamingCode.key)
     }
+
+    @Test
+    fun stripThinking_kindMismatchedCloser_isIgnoredAndDisplayConsistent() {
+        // P1-1: kind-strict matching — `</thought>` inside `<think>` closes nothing
+        // on either path; both absorb it inside the `<think>` scope (fail-closed).
+        val input = "<think>A</thought>B</think>C"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(2, blocks.size)
+        assertEquals("A</thought>B", (blocks[0] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("C", (blocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("C", ChatMarkdownParser.stripThinking(input))
+
+        // Suspect opener with a matching closer: both paths hide the same prefix.
+        val suspect = "<think ??? malformed >X</think>Z"
+        val suspectBlocks = ChatMarkdownParser.parse(suspect)
+        assertEquals(2, suspectBlocks.size)
+        assertEquals("<think ??? malformed >X", (suspectBlocks[0] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("Z", (suspectBlocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("Z", ChatMarkdownParser.stripThinking(suspect))
+    }
+
+    @Test
+    fun stripThinking_orphanCloserAfterCodeBlock_preservesCode() {
+        // P2-1: a fenced code block before a stray closer disables orphan
+        // absorption on both paths; the closer stays literal like display.
+        val input = "```kotlin\nval x = 1\n```\n</think>\nanswer"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertTrue(blocks.any { it is ChatContentBlock.CodeBlock })
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        assertTrue(stripped.contains("val x = 1"))
+        assertTrue(stripped.contains("answer"))
+        assertTrue(stripped.contains("</think>"))
+
+        // Indented code behaves the same.
+        val indented = "    val y = 2\n</think>\nanswer"
+        assertTrue(ChatMarkdownParser.parse(indented).any { it is ChatContentBlock.CodeBlock })
+        val strippedIndented = ChatMarkdownParser.stripThinking(indented)
+        assertTrue(strippedIndented.contains("val y = 2"))
+        assertTrue(strippedIndented.contains("answer"))
+    }
+
+    @Test
+    fun stripThinking_englishComparisonSentence_ttsFailClosedPinned() {
+        // P2-2 documented divergence (deliberately NOT converged): display renders
+        // the prose verbatim while TTS absorbs from the suspect opener to EOF.
+        // Fail-closed prefers hiding a possible thought over speaking it; the
+        // limitation is noted at the ChatScreen speak pipeline.
+        val input = "I <think that 5 > 3 is true> then answer"
+        assertEquals("I", ChatMarkdownParser.stripThinking(input))
+        assertEquals("I", ChatMarkdownParser.speakableText(input))
+    }
+
+    @Test
+    fun speakableText_verbalizesCodeAndToolMarkers() {
+        // P2-3 minimal verbalizer: fence delimiters and tool-marker lines are
+        // dropped, inline code keeps content without markers.
+        val input = "Here is code:\n```kotlin\nval x = 1\n```\nUse `val x` now.\n[tool:read …]\nDone"
+        val speakable = ChatMarkdownParser.speakableText(input)
+        assertFalse(speakable.contains("```"))
+        assertFalse(speakable.contains("[tool:"))
+        assertTrue(speakable.contains("val x = 1"))
+        assertTrue(speakable.contains("Use val x now."))
+        assertTrue(speakable.contains("Done"))
+        // Scope limit pin: emphasis markers are left verbatim, never rewritten.
+        assertEquals("**bold**", ChatMarkdownParser.speakableText("**bold**"))
+    }
+
+    @Test
+    fun speakableText_pureThinking_hasNoSpeakableText() {
+        // Fail-closed preserved through the verbalizer: blank speakable text
+        // keeps the speak button hidden in ChatScreen.
+        assertEquals("", ChatMarkdownParser.speakableText("<think>secret</think>"))
+        assertTrue(ChatMarkdownParser.speakableText("<think>secret</think>").isBlank())
+        assertEquals("", ChatMarkdownParser.speakableText("<think>unclosed"))
+    }
+
+    @Test
+    fun speakableText_indentedFenceDelimitersAreKeptVerbatim() {
+        // Display (segments/invalidIndentedFenceOpeners) treats 4-space/tab-indented
+        // ``` as literal text, not a fence delimiter; the verbalizer must match and
+        // keep the line instead of dropping it (previous bug dropped it for TTS).
+        val indentedOpener = "hello\n    ```\nworld"
+        assertEquals(indentedOpener, ChatMarkdownParser.speakableText(indentedOpener))
+
+        val tabOpener = "hello\n\t```\nworld"
+        assertEquals(tabOpener, ChatMarkdownParser.speakableText(tabOpener))
+
+        // A 4-space indented ``` inside a block is content, not a closer.
+        val block = "```\ncode\n    ```\nmore\n```\nend"
+        assertEquals("code\n    ```\nmore\nend", ChatMarkdownParser.speakableText(block))
+    }
+
+    @Test
+    fun speakableText_leavesHeadingsBulletsLinksVerbatim() {
+        // Scope-limit pin: headings, list bullets and links are prose and stay
+        // verbatim — the verbalizer only drops fence/tool syntax and unwraps code.
+        assertEquals("# Title", ChatMarkdownParser.speakableText("# Title"))
+        assertEquals("- item", ChatMarkdownParser.speakableText("- item"))
+        assertEquals("[link](https://example.com)", ChatMarkdownParser.speakableText("[link](https://example.com)"))
+    }
+
+    @Test
+    fun stripThinking_inlineCodePrefixStillAbsorbsOrphanCloser() {
+        // Inline code spans fold into TEXT on display (not CODE segments), so a
+        // stray closer after inline code still absorbs the prefix on both paths —
+        // unlike a fenced/indented code block which disables orphan absorption.
+        val input = "`code`\n</think>\nanswer"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(2, blocks.size)
+        assertEquals("`code`", (blocks[0] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("answer", (blocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("answer", ChatMarkdownParser.stripThinking(input))
+        assertEquals("answer", ChatMarkdownParser.speakableText(input))
+    }
 }

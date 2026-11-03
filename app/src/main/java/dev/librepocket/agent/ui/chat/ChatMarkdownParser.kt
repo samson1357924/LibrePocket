@@ -87,13 +87,23 @@ sealed interface ChatContentBlock {
  *      leakage before subsequent stream chunks arrive.
  *
  * 3. **Bracket Matching & Monotonic Interval Absorption (括號匹配與單調區間吸收)**:
- *    - Nested thinking tags maintain a doubly-linked tag stack with [lastNodeOfKind] pointers for O(1) push,
- *      pop, and middle unlink without array copies or linear stack searches.
- *    - In [stripThinking], open tag positions are pushed onto a LIFO stack. When a valid closing tag
- *      is matched, the enclosing range `[start, close.tagEnd)` is absorbed. Any previously recorded inner intervals
- *      starting at or after `start` are popped and superseded by the outer enclosing interval in a single monotonic pass.
- *    - If unclosed suspect open tags remain at EOF, all intervals from the earliest unclosed start to EOF are absorbed
- *      under fail-closed handling to prevent thinking content leakage.
+ *    - Nested thinking tags match kind-strictly on both paths: display ([segments] via [TagTracker]
+ *      per-kind pointers) and TTS ([stripThinking] via [OpenScopeTracker]). A closer pops the most
+ *      recent open of the same tag kind (possibly in the middle); a closer with no open of its kind
+ *      is ignored and stays inside the scope. The absorbed range always spans from the scope root
+ *      (first open), so both paths absorb mismatched nesting identically (fail-closed).
+ *    - In [stripThinking] ([OpenScopeTracker]), open scopes are tracked per tag kind.
+ *      A valid closing tag unlinks the most recent open of the same kind (possibly in the middle);
+ *      the enclosing range `[scopeRoot, close.tagEnd)` is absorbed only once the scope fully closes.
+ *      Any previously recorded inner intervals starting at or after `scopeRoot` are discarded
+ *      and superseded by the outer enclosing interval in a single monotonic pass.
+ *    - If unclosed scopes (strict or suspect openers) remain at EOF, all intervals from the earliest unclosed start to EOF are absorbed
+ *      under fail-closed handling to prevent thinking content leakage. Suspect (attribute-malformed) openers
+ *      therefore absorb English prose resembling a tag (e.g. `I <think that 5 > 3 is true>`) to EOF on the TTS
+ *      path while display renders it verbatim — documented divergence, pinned by test.
+ *    - A lone orphan closer absorbs only a pure-text prefix; a fenced/indented code block before it
+ *      disables orphan absorption on both paths (display records a CODE segment, TTS sets [seenCodeBlock]),
+ *      so code is never swallowed and the stray closer stays literal.
  *    - This guarantees strict O(N) linear time with zero quadratic allocation or substring rebuilding overhead.
  */
 object ChatMarkdownParser {
@@ -213,6 +223,7 @@ object ChatMarkdownParser {
         val isSelfClosing: Boolean,
         val tagEnd: Int,
         val nextScanPos: Int,
+        val tagId: Int,
     )
 
     private fun isXmlNameStartChar(c: Char): Boolean =
@@ -1007,6 +1018,7 @@ object ChatMarkdownParser {
                             isSelfClosing = isSelfClosing,
                             tagEnd = gt + 1,
                             nextScanPos = gt + 1,
+                            tagId = thinkTagId(name),
                         )
                     }
 
@@ -1014,6 +1026,7 @@ object ChatMarkdownParser {
                         isSelfClosing = false,
                         tagEnd = next,
                         nextScanPos = next,
+                        tagId = thinkTagId(name),
                     )
                 }
             }
@@ -1025,19 +1038,73 @@ object ChatMarkdownParser {
      * Strips all thinking tags and their content from the entire raw message in a single monotonic pass.
      *
      * Invariants enforced:
-     * - Scope Absorption: When [openStarts] is not empty, all enclosed text, inline code, and code blocks
-     *   are treated as internal reasoning content and absorbed into the thinking scope.
-     * - Delimiter Shielding Outside Thinking: When [openStarts] is empty, fenced code blocks, inline code spans,
+     * - Scope Absorption (kind-strict): [scopes] tracks matched opening scopes per tag kind,
+     *   mirroring the display path ([TagTracker] in [segments]). A closing tag pops the most
+     *   recent open of the same kind (possibly in the middle); a closer with no open of its
+     *   kind is ignored and stays inside the scope. The enclosing range absorbs from [scopeRoot]
+     *   (the first open of the current scope) only once the scope fully closes, so display and
+     *   TTS absorb mismatched nesting identically (fail-closed).
+     * - Delimiter Shielding Outside Thinking: When [scopes] is empty, fenced code blocks, inline code spans,
      *   and indented code blocks shield XML tags from being considered as thinking openers.
-     * - Monotonic Interval Absorption: [openStarts] tracks matched opening bracket indices. When a matching
-     *   closing tag is found at `close.tagEnd`, any previously recorded inner intervals starting at or after
-     *   `start` are discarded from [removedIntervals] because they are completely encompassed by the outer
-     *   range `start until close.tagEnd`.
-     * - Fail-Closed Unclosed Scope at EOF: If any unclosed thinking tag remains at EOF, all text from the earliest
+     * - Monotonic Interval Absorption: When a scope fully closes at `close.tagEnd`, any previously recorded
+     *   inner intervals starting at or after [scopeRoot] (e.g. self-closing tags inside) are discarded
+     *   from [removedIntervals] because they are completely encompassed by the outer
+     *   range `scopeRoot until close.tagEnd`.
+     * - Fail-Closed Unclosed Scope at EOF: If any unclosed thinking scope remains at EOF, all text from the earliest
      *   unclosed start index to EOF is strictly absorbed into [removedIntervals] to prevent thinking leakage to TTS.
+     *   This covers suspect (attribute-malformed) openers too; as a documented consequence, English prose
+     *   resembling a malformed opener (e.g. `I <think that 5 > 3 is true>`) is absorbed to EOF while display
+     *   renders it verbatim (P2-2 divergence, pinned by test).
+     * - Orphan Closer: a lone `</think>`-family closer with no prior open tag absorbs the pure-text prefix
+     *   (`0 until close.tagEnd`) so prefill-style CoT leaks stay hidden. The orphan rule does NOT fire after
+     *   a fenced/indented code block was skipped ([seenCodeBlock]): the display path records a CODE segment
+     *   there and likewise skips orphan absorption, so code survives on both paths and the stray closer
+     *   stays literal. A stray closer that matches neither rule is kept literal (display renders it as text).
      * - Linear Time O(N): The text is traversed linearly, and each character is processed at most a bounded
      *   number of times without string rebuilding until the final interval subtraction phase.
      */
+    /**
+     * O(1) per-kind open-scope tracker mirroring [TagTracker]: pushes append,
+     * [popLastOfKind] unlinks the most recent open of one tag kind (possibly in
+     * the middle, like [TagTracker.pop]), so display ([segments]) and TTS
+     * ([stripThinking]) apply exactly the same kind-strict matching.
+     */
+    private class OpenScopeTracker {
+        private data class Node(
+            val tagId: Int,
+            val start: Int,
+            val prevSameKind: Int,
+        )
+
+        private val nodes = ArrayList<Node>()
+        private val lastOfKind = IntArray(THINK_TAG_KIND_COUNT) { -1 }
+        var totalCount: Int = 0
+            private set
+
+        fun push(tagId: Int, start: Int) {
+            if (tagId !in 0 until THINK_TAG_KIND_COUNT) return
+            nodes.add(Node(tagId, start, lastOfKind[tagId]))
+            lastOfKind[tagId] = nodes.size - 1
+            totalCount++
+        }
+
+        /**
+         * Removes the most recent open of [tagId]; returns true when anything was
+         * removed, false when no open of that kind exists (closer is ignored and
+         * stays inside the scope, matching [TagTracker.pop] on a missing kind).
+         */
+        fun popLastOfKind(tagId: Int): Boolean {
+            if (tagId !in 0 until THINK_TAG_KIND_COUNT) return false
+            val idx = lastOfKind[tagId]
+            if (idx < 0) return false
+            lastOfKind[tagId] = nodes[idx].prevSameKind
+            totalCount--
+            return true
+        }
+
+        fun isEmpty(): Boolean = totalCount == 0
+    }
+
     fun stripThinking(text: String): String {
         val len = text.length
         if (len == 0) return ""
@@ -1050,8 +1117,19 @@ object ChatMarkdownParser {
         }
 
         val removedIntervals = mutableListOf<IntRange>()
-        val openStarts = ArrayList<Int>()
+        val scopes = OpenScopeTracker()
+        // Start of the current outermost scope (set on push-when-empty, cleared when
+        // the scope fully closes). Intervals absorb from here — mirroring segments(),
+        // where a thinking segment always spans from its first open — so middle
+        // unlinks never leak an outer prefix at EOF.
+        var scopeRoot = -1
         var hasSeenOpen = false
+        // Set when a fenced/indented code block is skipped with no open scope.
+        // Mirrors segments(): a CODE segment makes its result non-empty and disables
+        // orphan absorption, so a code prefix is never swallowed by a stray closer.
+        // Inline code spans are NOT code blocks here (display folds them into TEXT
+        // and still absorbs the prefix), so skipping them sets no flag.
+        var seenCodeBlock = false
         val listContentColumns = mutableListOf<Long>()
         var i = 0
 
@@ -1112,7 +1190,7 @@ object ChatMarkdownParser {
             val nestedList = previousListItem && listItem && indentColumns < codeIndent
             val indent = if (atLineStart && !blankLine && !nestedList && !listContinuation &&
                 (i == 0 || previousBlank)) indentEnd(text, i, codeIndent) else -1
-            if (openStarts.isEmpty() && indent >= 0 && indent < len && text[indent] != '\n' && text[indent] != '\r') {
+            if (scopes.isEmpty() && indent >= 0 && indent < len && text[indent] != '\n' && text[indent] != '\r') {
                 var end = i
                 var line = i
                 while (line < len) {
@@ -1130,11 +1208,12 @@ object ChatMarkdownParser {
                     line = next
                 }
                 if (end > i) {
+                    seenCodeBlock = true
                     i = end
                     continue
                 }
             }
-            if (openStarts.isEmpty() && atLineStart && !blankLine) {
+            if (scopes.isEmpty() && atLineStart && !blankLine) {
                 if (listItem) {
                     listContentColumns.add(listContentColumn(text, lineMarker, indentColumns, listMarkerLength))
                 } else if (!listContinuation) {
@@ -1142,12 +1221,13 @@ object ChatMarkdownParser {
                 }
             }
 
-            if (openStarts.isEmpty() && invalidFence[i]) {
+            if (scopes.isEmpty() && invalidFence[i]) {
                 while (i < len && text[i] == '`') i++
                 continue
-            } else if (openStarts.isEmpty() && text[i] == '`' && !escaped[i]) {
+            } else if (scopes.isEmpty() && text[i] == '`' && !escaped[i]) {
                 if (text.startsWith(CODE_FENCE, i)) {
                     listContentColumns.clear()
+                    seenCodeBlock = true
                     var afterFence = i + CODE_FENCE.length
                     while (afterFence < len && text[afterFence] == '`') afterFence++
                     val fenceLength = afterFence - i
@@ -1227,7 +1307,8 @@ object ChatMarkdownParser {
                         i = openMatch.tagEnd
                         continue
                     }
-                    openStarts.add(i)
+                    if (scopes.isEmpty()) scopeRoot = i
+                    scopes.push(thinkTagId(openMatch.tagName), i)
                     i = openMatch.tagEnd
                     continue
                 }
@@ -1240,7 +1321,8 @@ object ChatMarkdownParser {
                         i = suspectOpen.tagEnd
                         continue
                     }
-                    openStarts.add(i)
+                    if (scopes.isEmpty()) scopeRoot = i
+                    scopes.push(suspectOpen.tagId, i)
                     i = suspectOpen.nextScanPos
                     continue
                 }
@@ -1248,17 +1330,33 @@ object ChatMarkdownParser {
                 val close = matchCloseThinkTag(text, i)
                 if (close != null) {
                     listContentColumns.clear()
-                    if (openStarts.isNotEmpty()) {
-                        val start = openStarts.removeAt(openStarts.lastIndex)
-                        while (removedIntervals.isNotEmpty() && removedIntervals.last().first >= start) {
-                            removedIntervals.removeAt(removedIntervals.lastIndex)
+                    if (!scopes.isEmpty()) {
+                        // Kind-strict (P1-1): pop the most recent open of the same
+                        // tag kind (possibly in the middle), mirroring TagTracker
+                        // in segments(). A closer with no open of its kind is
+                        // ignored and stays inside the scope, so display and TTS
+                        // absorb it identically. The enclosing range absorbs from
+                        // scopeRoot only once the scope fully closes.
+                        if (scopes.popLastOfKind(thinkTagId(close.tagName)) && scopes.isEmpty()) {
+                            while (removedIntervals.isNotEmpty() && removedIntervals.last().first >= scopeRoot) {
+                                removedIntervals.removeAt(removedIntervals.lastIndex)
+                            }
+                            removedIntervals.add(scopeRoot until close.tagEnd)
+                            scopeRoot = -1
                         }
-                        removedIntervals.add(start until close.tagEnd)
-                    } else if (!hasSeenOpen && removedIntervals.isEmpty()) {
+                        i = close.tagEnd
+                        continue
+                    }
+                    if (!hasSeenOpen && removedIntervals.isEmpty() && !seenCodeBlock) {
                         hasSeenOpen = true
                         removedIntervals.add(0 until close.tagEnd)
+                        i = close.tagEnd
+                        continue
                     }
-                    i = close.tagEnd
+                    // Stray closer with no open scope (orphan after a code
+                    // block, or a duplicate after a closed scope): keep it
+                    // literal, matching display where it renders as text.
+                    i++
                     continue
                 }
             }
@@ -1266,12 +1364,11 @@ object ChatMarkdownParser {
             i++
         }
 
-        if (openStarts.isNotEmpty()) {
-            val unclosedStart = openStarts.first()
-            while (removedIntervals.isNotEmpty() && removedIntervals.last().first >= unclosedStart) {
+        if (!scopes.isEmpty()) {
+            while (removedIntervals.isNotEmpty() && removedIntervals.last().first >= scopeRoot) {
                 removedIntervals.removeAt(removedIntervals.lastIndex)
             }
-            removedIntervals.add(unclosedStart until len)
+            removedIntervals.add(scopeRoot until len)
         }
 
         if (removedIntervals.isEmpty()) return trimBoundary(text)
@@ -1288,6 +1385,131 @@ object ChatMarkdownParser {
             sb.append(text, cursor, len)
         }
         return trimBoundary(sb.toString())
+    }
+
+    /**
+     * TTS-facing speakable text for one assistant message (P2-3 verbalizer).
+     *
+     * Pipeline: [stripThinking] first (fail-closed: pure-thinking input yields `""`
+     * and the caller hides the speak button on [String.isBlank]), then a minimal
+     * line-based verbalization over the stripped text:
+     * - fenced code block delimiters (```` ```lang ```` openers, ```` ``` ```` closers) are dropped,
+     *   block content lines are kept;
+     * - whole-line producer tool markers (`[tool:…]`, `[tool-result:…]`, as compacted by
+     *   display) are dropped;
+     * - single/double-backtick inline code spans keep their content with the markers removed;
+     *   unmatched backticks stay verbatim.
+     *
+     * Deliberate scope limits (pinned by test): emphasis markers (`*`, `**`), headings, list
+     * bullets and links are left verbatim — the verbalizer removes TTS noise from code/tool
+     * syntax only and never rewrites prose. Runs in O(N) with no backtracking expressions.
+     */
+    fun speakableText(text: String): String = verbalizeForTts(stripThinking(text))
+
+    internal fun verbalizeForTts(stripped: String): String {
+        if (stripped.isEmpty()) return ""
+        val kept = ArrayList<String>()
+        var inFence = false
+        for (rawLine in stripped.lines()) {
+            // Mirror segments()/invalidIndentedFenceOpeners: a fenced delimiter is
+            // valid only with 0-3 leading spaces and no tabs. A 4-space/tab-indented
+            // ``` line is literal text on display and must be kept for TTS.
+            var indentEnd = 0
+            var hasTab = false
+            while (indentEnd < rawLine.length && (rawLine[indentEnd] == ' ' || rawLine[indentEnd] == '\t')) {
+                if (rawLine[indentEnd] == '\t') hasTab = true
+                indentEnd++
+            }
+            val fenceCandidate = !hasTab && indentEnd <= MAX_FENCE_INDENT_SPACES &&
+                rawLine.startsWith(CODE_FENCE, indentEnd)
+            if (fenceCandidate) {
+                val trimmed = rawLine.substring(indentEnd)
+                var runEnd = 0
+                while (runEnd < trimmed.length && trimmed[runEnd] == '`') runEnd++
+                val rest = trimmed.substring(runEnd)
+                if (runEnd >= CODE_FENCE.length && '`' !in rest) {
+                    if (!inFence) {
+                        inFence = true
+                        continue
+                    }
+                    // Inside a block only a bare run (+ trailing spaces) closes;
+                    // e.g. a ```Done line is content and falls through below.
+                    if (rest.isBlank()) {
+                        inFence = false
+                        continue
+                    }
+                }
+            }
+            val trimmed = rawLine.trimStart(' ', '\t')
+            if (!inFence && (trimmed.startsWith("[tool:") || trimmed.startsWith("[tool-result:"))) {
+                continue
+            }
+            kept.add(unwrapInlineCode(rawLine))
+        }
+        return kept.joinToString("\n").trim()
+    }
+
+    /**
+     * Removes single/double-backtick inline span markers while keeping their content.
+     * Runs pair greedily left-to-right per length; unmatched or escaped runs and
+     * runs of length 3+ (fence syntax) stay verbatim. Linear in the line length.
+     */
+    private fun unwrapInlineCode(line: String): String {
+        if ('`' !in line) return line
+        val len = line.length
+        val escaped = BooleanArray(len)
+        var oddBackslashes = false
+        for (i in 0 until len) {
+            if (line[i] == '\\') {
+                oddBackslashes = !oddBackslashes
+            } else {
+                if (line[i] == '`') escaped[i] = oddBackslashes
+                oddBackslashes = false
+            }
+        }
+        // Collect unescaped runs of length 1-2; longer runs are fence syntax.
+        val runStarts = ArrayList<Int>()
+        val runLens = ArrayList<Int>()
+        var i = 0
+        while (i < len) {
+            if (line[i] != '`' || escaped[i]) {
+                i++
+                continue
+            }
+            val start = i
+            while (i < len && line[i] == '`' && !escaped[i]) i++
+            if (i - start <= 2) {
+                runStarts.add(start)
+                runLens.add(i - start)
+            }
+        }
+        // Greedy same-length pairing; matched markers are dropped.
+        val drop = BooleanArray(len)
+        var r = 0
+        while (r < runStarts.size) {
+            var s = r + 1
+            while (s < runStarts.size && runLens[s] != runLens[r]) s++
+            if (s < runStarts.size) {
+                for (k in runStarts[r] until runStarts[r] + runLens[r]) drop[k] = true
+                for (k in runStarts[s] until runStarts[s] + runLens[s]) drop[k] = true
+                r = s + 1
+            } else {
+                r++
+            }
+        }
+        var anyDrop = false
+        for (d in drop) {
+            if (d) {
+                anyDrop = true
+                break
+            }
+        }
+        if (!anyDrop) return line
+        val sb = StringBuilder(len)
+        for (j in 0 until len) {
+            if (!drop[j]) sb.append(line[j])
+        }
+        return sb.toString()
     }
 
     /**

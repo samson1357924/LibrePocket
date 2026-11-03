@@ -952,7 +952,13 @@ internal fun MessageBubble(
                 // 零新權限；開關關閉時隱藏）。朗讀為逐則手勢，
                 // 引擎揭露見按鈕無障礙文案（VoiceTts.SPEAK_BUTTON_DESCRIPTION）。
                 if (!isUser && !msg.isPartial && showSpeak) {
-                    val speakableText = remember(displayText) { ChatMarkdownParser.stripThinking(displayText) }
+                    // TTS pipeline (P2-3): strip thinking (fail-closed) then verbalize
+                    // (drop fence delimiters/tool-marker lines, unwrap inline code).
+                    // P2-2 documented divergence: English prose resembling a malformed
+                    // opener (e.g. `I <think that 5 > 3 is true>`) is absorbed to EOF
+                    // here while display renders it verbatim — fail-closed prefers
+                    // hiding a possible thought over speaking it.
+                    val speakableText = remember(displayText) { ChatMarkdownParser.speakableText(displayText) }
                     if (speakableText.isNotBlank()) {
                         IconButton(
                             onClick = { onSpeak(msg.id, speakableText) },

@@ -92,11 +92,29 @@ object OpenAiTtsModels {
 
     const val DEFAULT_BASE_URL = "https://api.openai.com"
     /**
-     * 音檔採受限記憶體緩衝播放（不寫入儲存空間，上限 25MB）。
+     * Canonical speech endpoint path. Single source of truth for the
+     * `POST /v1/audio/speech` path; [OpenAiTtsClient.resolveEndpoint] must build
+     * endpoint URLs from this constant instead of duplicating path literals.
+     */
+    const val SPEECH_ENDPOINT_PATH = "/v1/audio/speech"
+    /**
+     * 預設音訊位元組上限（25MB）。
+     * 音檔採受限記憶體緩衝播放（不寫入儲存空間）。25MB 是預設值而非絕對上限：
+     * 呼叫方可依需求上調，但不得超過 [MAX_SUPPORTED_AUDIO_BYTES]。
      * 誠實說明：網路下載後全額緩衝於記憶體中（Bounded in-memory buffering），
      * 峰值時存在多份 ByteArray 拷貝，25MB 上限可降低但無法杜絕極限情況的 OOM 風險。
      */
     const val MAX_AUDIO_BYTES = 25 * 1024 * 1024 // 25 MB
+    /**
+     * 絕對硬上限（64MB）：[MAX_AUDIO_BYTES] 預設值之上、呼叫方可配置的最大值。
+     *
+     * 選 64MB 的理由：約為預設 25MB 的 2.5 倍，保留未來較長文本／高位元率格式的
+     * 成長空間；同時仍是有意義的上界——峰值瞬態拷貝約 3 倍（OkHttp chunk 讀取緩衝、
+     * 累計緩衝、下游播放器防禦性拷貝），64MB × 3 仍在 fail-closed 可控範圍內。
+     * 此前 `Long.MAX_VALUE` 作為上界是無意義的空轉（錯誤訊息亦會印出該無意義數字），
+     * 現以此具名硬上限取代；構造器維持 `maxAudioBytes <= MAX_SUPPORTED_AUDIO_BYTES` 檢查。
+     */
+    const val MAX_SUPPORTED_AUDIO_BYTES = 64L * 1024 * 1024 // 64 MB
 }
 
 /**
@@ -183,7 +201,7 @@ data class OpenAiTtsRequest(
                 safeMessage = "Response format must not be blank",
             )
         }
-        if (speed !in MIN_SPEED..MAX_SPEED) {
+        if (!speed.isFinite() || speed !in MIN_SPEED..MAX_SPEED) {
             throw OpenAiTtsException(
                 statusCode = null,
                 errorCode = OpenAiTtsErrorCode.INVALID_INPUT,

@@ -3,6 +3,8 @@ package dev.librepocket.voice
 import java.io.IOException
 import java.io.PrintWriter
 import java.io.StringWriter
+import java.net.InetSocketAddress
+import java.net.Proxy
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -16,6 +18,7 @@ import kotlinx.serialization.json.floatOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Call
+import okhttp3.Authenticator
 import okhttp3.EventListener
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
@@ -28,6 +31,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
@@ -1000,13 +1004,13 @@ class OpenAiTtsClientTest {
 
     @Test
     fun isLoopbackHost_strictlyValidatesLoopbackPatterns() {
+        // Strict allow-list (F7): ONLY the "localhost" name itself, 127.0.0.0/8, and ::1.
+        // "*.localhost" subdomains are NOT loopback (wildcard DNS can escape the sandbox).
         val loopbacks = listOf(
             "localhost",
             "LOCALHOST",
-            "sub.localhost",
-            "api.backend.localhost",
             "localhost.",
-            "sub.localhost.",
+            "LOCALHOST.",
             "127.0.0.1",
             "127.0.0.2",
             "127.1.0.1",
@@ -1022,6 +1026,10 @@ class OpenAiTtsClientTest {
         }
 
         val nonLoopbacks = listOf(
+            "sub.localhost",
+            "api.backend.localhost",
+            "sub.localhost.",
+            "SUB.LOCALHOST",
             "127.attacker.example",
             "127.0.0.1.nip.io",
             "127.0.0.1.evil.com",
@@ -1296,7 +1304,37 @@ class OpenAiTtsClientTest {
     }
 
     @Test
-    fun successfulSynthesize_withMaxAudioBytesLongMaxValue_readsNonEmptyAudioStreamWithoutOverflow() = runBlocking {
+    fun constructor_maxAudioBytesAboveHardCap_throwsIllegalArgumentException() {
+        // F4: Long.MAX_VALUE is no longer an accepted bound; the hard cap is 64MB.
+        try {
+            OpenAiTtsClient(
+                baseUrl = server.url("/").toString(),
+                allowTestLoopback = true,
+                apiKey = { "test-key".toCharArray() },
+                maxAudioBytes = Long.MAX_VALUE,
+            )
+            fail("Expected IllegalArgumentException for maxAudioBytes = Long.MAX_VALUE")
+        } catch (e: IllegalArgumentException) {
+            assertEquals(
+                "maxAudioBytes must not exceed ${OpenAiTtsClient.MAX_SUPPORTED_AUDIO_BYTES}, was: ${Long.MAX_VALUE}",
+                e.message,
+            )
+        }
+        try {
+            OpenAiTtsClient(
+                baseUrl = server.url("/").toString(),
+                allowTestLoopback = true,
+                apiKey = { "test-key".toCharArray() },
+                maxAudioBytes = OpenAiTtsClient.MAX_SUPPORTED_AUDIO_BYTES + 1,
+            )
+            fail("Expected IllegalArgumentException for maxAudioBytes above hard cap")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message!!.contains("must not exceed"))
+        }
+    }
+
+    @Test
+    fun successfulSynthesize_withMaxSupportedAudioBytes_readsNonEmptyAudioStreamWithoutOverflow() = runBlocking {
         val sampleAudio = byteArrayOf(0x49, 0x44, 0x33, 0x03, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03)
         server.enqueue(
             MockResponse()
@@ -1309,10 +1347,10 @@ class OpenAiTtsClientTest {
             baseUrl = server.url("/").toString(),
             allowTestLoopback = true,
             apiKey = { "test-key".toCharArray() },
-            maxAudioBytes = Long.MAX_VALUE,
+            maxAudioBytes = OpenAiTtsClient.MAX_SUPPORTED_AUDIO_BYTES,
         )
 
-        val result = client.synthesize(OpenAiTtsRequest(input = "Long.MAX_VALUE audio stream test"))
+        val result = client.synthesize(OpenAiTtsRequest(input = "Hard-cap audio stream test"))
 
         assertArrayEquals(sampleAudio, result.audioBytes)
         assertEquals(sampleAudio.size, result.audioBytes.size)
@@ -1559,6 +1597,256 @@ class OpenAiTtsClientTest {
                 "Safe message should contain fully parsed message despite throttling: ${e.safeMessage}",
                 e.safeMessage.contains("Rate limit exceeded for model tts-1"),
             )
+        }
+    }
+
+    @Test
+    fun responseAudio_emptyBody200_rejectedAsUnexpected() = runBlocking {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/mpeg")
+                .setBody(Buffer()),
+        )
+
+        val client = OpenAiTtsClient(
+            baseUrl = server.url("/").toString(),
+            allowTestLoopback = true,
+            apiKey = { "test-key".toCharArray() },
+        )
+
+        try {
+            client.synthesize(OpenAiTtsRequest(input = "Empty body test"))
+            fail("Expected OpenAiTtsException for empty 200 audio body")
+        } catch (e: OpenAiTtsException) {
+            assertEquals(200, e.statusCode)
+            assertEquals(OpenAiTtsErrorCode.UNEXPECTED, e.errorCode)
+            assertFalse(e.retryable)
+            assertTrue("Safe message should mention empty body: ${e.safeMessage}", e.safeMessage.contains("empty", ignoreCase = true))
+        }
+    }
+
+    @Test
+    fun errorHandling_404And410_appendSunsetMigrationHint() = runBlocking {
+        for (code in listOf(404, 410)) {
+            server.enqueue(
+                MockResponse()
+                    .setResponseCode(code)
+                    .setHeader("Content-Type", "application/json")
+                    .setBody("""{"error":{"message":"Model not found","type":"not_found"}}"""),
+            )
+
+            val client = OpenAiTtsClient(
+                baseUrl = server.url("/").toString(),
+                allowTestLoopback = true,
+                apiKey = { "test-key".toCharArray() },
+            )
+
+            try {
+                client.synthesize(OpenAiTtsRequest(input = "Sunset hint test $code"))
+                fail("Expected OpenAiTtsException for $code")
+            } catch (e: OpenAiTtsException) {
+                assertEquals(code, e.statusCode)
+                assertFalse(e.retryable)
+                assertTrue(
+                    "Safe message must carry sunset date: ${e.safeMessage}",
+                    e.safeMessage.contains(OpenAiTtsClient.SUNSET_DATE),
+                )
+                assertTrue(
+                    "Safe message must carry migration target: ${e.safeMessage}",
+                    e.safeMessage.contains(OpenAiTtsClient.MIGRATION_TARGET),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun errorHandling_jsonMessageWithControlChars_isSingleLineAndBounded() = runBlocking {
+        // \n stays a JSON escape inside triple-quoted Kotlin (no escape processing),
+        // so the parsed server message contains real newlines — a log-forging attempt.
+        val rawBody = """{"error":{"message":"Line one\nLine two   evil   spacing ${"x".repeat(500)}","type":"bad"}}"""
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(400)
+                .setHeader("Content-Type", "application/json")
+                .setBody(rawBody),
+        )
+
+        val client = OpenAiTtsClient(
+            baseUrl = server.url("/").toString(),
+            allowTestLoopback = true,
+            apiKey = { "test-key".toCharArray() },
+        )
+
+        try {
+            client.synthesize(OpenAiTtsRequest(input = "Log forging test"))
+            fail("Expected OpenAiTtsException for 400")
+        } catch (e: OpenAiTtsException) {
+            assertEquals(400, e.statusCode)
+            assertFalse("Safe message must not contain raw newline: ${e.safeMessage}", e.safeMessage.contains('\n'))
+            assertFalse("Safe message must not contain raw CR: ${e.safeMessage}", e.safeMessage.contains('\r'))
+            assertTrue(
+                "Safe message must be bounded to prefix + 200 chars (was ${e.safeMessage.length}): ${e.safeMessage}",
+                e.safeMessage.length <= "HTTP 400: ".length + 200,
+            )
+        }
+    }
+
+    @Test
+    fun constructor_defaultAllowTestLoopback_isFalse_productionSafe() {
+        // F1 pin: production default must never admit loopback; base URL single-sourced.
+        val client = OpenAiTtsClient(apiKey = { "test-key".toCharArray() })
+        assertFalse("Production default must not admit loopback", client.allowTestLoopback)
+        assertEquals("https://api.openai.com", client.baseUrl)
+        assertEquals(OpenAiTtsModels.DEFAULT_BASE_URL, OpenAiTtsClient.DEFAULT_BASE_URL)
+        assertEquals(OpenAiTtsModels.SPEECH_ENDPOINT_PATH, OpenAiTtsClient.SPEECH_ENDPOINT_PATH)
+        assertEquals("/v1/audio/speech", OpenAiTtsClient.SPEECH_ENDPOINT_PATH)
+        assertEquals(
+            OpenAiTtsModels.MAX_SUPPORTED_AUDIO_BYTES,
+            OpenAiTtsClient.MAX_SUPPORTED_AUDIO_BYTES,
+        )
+    }
+
+    @Test
+    fun httpClient_stripsAuthenticatorAndProxy_fromInjectedClient() {
+        // F3 pin: even a hostile injected client must not survive into execution with an
+        // authenticator (cross-host key attachment) or proxy (traffic observation).
+        val injected = OkHttpClient.Builder()
+            .proxy(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", 9)))
+            .authenticator { _, _ -> null }
+            .followRedirects(true)
+            .build()
+
+        val client = OpenAiTtsClient(
+            baseUrl = server.url("/").toString(),
+            allowTestLoopback = true,
+            client = injected,
+            apiKey = { "test-key".toCharArray() },
+        )
+
+        assertSame(Authenticator.NONE, client.httpClient.authenticator)
+        assertEquals(Proxy.NO_PROXY, client.httpClient.proxy)
+        assertFalse("Redirects must stay disabled", client.httpClient.followRedirects)
+        assertFalse("SSL redirects must stay disabled", client.httpClient.followSslRedirects)
+        assertFalse("Retry on connection failure must stay disabled", client.httpClient.retryOnConnectionFailure)
+    }
+
+    @Test
+    fun validateEndpointUrl_rejectsNonHttpSchemes_evenForLoopback() {
+        for (url in listOf(
+            "ftp://localhost:8080/v1/audio/speech",
+            "gopher://127.0.0.1:8080/v1/audio/speech",
+            "file:///v1/audio/speech",
+        )) {
+            try {
+                OpenAiTtsClient.validateEndpointUrl(url, allowTestLoopback = true)
+                fail("Expected OpenAiTtsException for non-http(s) scheme: $url")
+            } catch (e: OpenAiTtsException) {
+                assertEquals(OpenAiTtsErrorCode.INVALID_INPUT, e.errorCode)
+            }
+        }
+    }
+
+    @Test
+    fun validateEndpointUrl_rejectsOfficialHostWithNonCanonicalPath() {
+        for (url in listOf(
+            "https://api.openai.com/evil",
+            "https://api.openai.com/evil/v1/audio/speech",
+            "https://api.openai.com/v1/audio/speech/extra",
+        )) {
+            try {
+                OpenAiTtsClient.validateEndpointUrl(url, allowTestLoopback = false)
+                fail("Expected OpenAiTtsException for non-canonical official path: $url")
+            } catch (e: OpenAiTtsException) {
+                assertEquals(OpenAiTtsErrorCode.INVALID_INPUT, e.errorCode)
+            }
+        }
+        // Canonical resolved endpoints stay admissible on both branches.
+        OpenAiTtsClient.validateEndpointUrl("https://api.openai.com/v1/audio/speech", allowTestLoopback = false)
+        OpenAiTtsClient.validateEndpointUrl("http://localhost:8080/v1/audio/speech", allowTestLoopback = true)
+        OpenAiTtsClient.validateEndpointUrl("https://127.0.0.1:8080/v1/audio/speech", allowTestLoopback = true)
+    }
+
+    @Test
+    fun insecureEndpoint_officialHostWithEvilPath_rejectedBeforeSending() = runBlocking {
+        var supplierCalled = false
+        val client = OpenAiTtsClient(
+            baseUrl = "https://api.openai.com/evil",
+            apiKey = {
+                supplierCalled = true
+                "test-key".toCharArray()
+            },
+        )
+
+        try {
+            client.synthesize(OpenAiTtsRequest(input = "Hello"))
+            fail("Expected OpenAiTtsException for official host with evil path")
+        } catch (e: OpenAiTtsException) {
+            assertNull(e.statusCode)
+            assertEquals(OpenAiTtsErrorCode.INVALID_INPUT, e.errorCode)
+            assertFalse(e.retryable)
+            assertFalse("Key supplier must not be called for evil-path endpoint", supplierCalled)
+        }
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun insecureEndpoint_loopbackSubdomain_rejectedEvenWithFlag() = runBlocking {
+        var supplierCalled = false
+        val client = OpenAiTtsClient(
+            baseUrl = "http://sub.localhost:8080",
+            allowTestLoopback = true,
+            apiKey = {
+                supplierCalled = true
+                "test-key".toCharArray()
+            },
+        )
+
+        try {
+            client.synthesize(OpenAiTtsRequest(input = "Hello"))
+            fail("Expected OpenAiTtsException for *.localhost even with allowTestLoopback = true")
+        } catch (e: OpenAiTtsException) {
+            assertNull(e.statusCode)
+            assertEquals(OpenAiTtsErrorCode.INVALID_INPUT, e.errorCode)
+            assertFalse(e.retryable)
+            assertFalse("Key supplier must not be called for *.localhost", supplierCalled)
+        }
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun synthesize_paddedKey_trimmedToSingleBearerValue() = runBlocking {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/mpeg")
+                .setBody(Buffer().write(byteArrayOf(1, 2, 3))),
+        )
+
+        val client = OpenAiTtsClient(
+            baseUrl = server.url("/").toString(),
+            allowTestLoopback = true,
+            apiKey = { "  padded-key-123  ".toCharArray() },
+        )
+
+        val result = client.synthesize(OpenAiTtsRequest(input = "Hello"))
+
+        assertArrayEquals(byteArrayOf(1, 2, 3), result.audioBytes)
+        val recorded = server.takeRequest(5, TimeUnit.SECONDS)
+        assertNotNull(recorded)
+        assertEquals("Bearer padded-key-123", recorded!!.getHeader("Authorization"))
+    }
+
+    @Test
+    fun inputValidation_speedNaNAndInfinite_rejected() {
+        for (bad in listOf(Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY)) {
+            try {
+                OpenAiTtsRequest(input = "Hello", speed = bad)
+                fail("Expected OpenAiTtsException for speed=$bad")
+            } catch (e: OpenAiTtsException) {
+                assertEquals(OpenAiTtsErrorCode.INVALID_INPUT, e.errorCode)
+                assertFalse(e.retryable)
+            }
         }
     }
 }

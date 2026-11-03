@@ -3,6 +3,7 @@ package dev.librepocket.voice
 import dev.librepocket.redact.Redactor
 import java.io.IOException
 import java.io.InterruptedIOException
+import java.net.Proxy
 import java.net.SocketTimeoutException
 import java.net.URI
 import java.util.Locale
@@ -20,6 +21,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.Call
+import okhttp3.Authenticator
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
@@ -49,10 +51,17 @@ import okio.utf8Size
  * - OkHttp Header Limitation: OkHttp's internal header model stores header values as immutable Java [String]s
  *   ("Bearer $keyString"). The immutable string remains in memory until collected by GC; we do not make false security
  *   claims of zero heap exposure for OkHttp request headers.
- * - Scheme & loopback restriction: URLs must be the official OpenAI endpoint (`https://api.openai.com`),
- *   unless connecting to local loopback (`localhost`, `127.0.0.1`, `::1`) with [allowTestLoopback] set to true.
+ * - Scheme & loopback restriction: URLs must be the official OpenAI endpoint (`https://api.openai.com`
+ *   with exactly the canonical path `/v1/audio/speech`),
+ *   unless connecting to local loopback (`localhost`, `127.0.0.0/8`, `::1`) with [allowTestLoopback] set to true.
  *   Third-party hosts and unisolated plaintext remote endpoints are strictly rejected with
  *   [OpenAiTtsErrorCode.INVALID_INPUT] before invoking the key supplier or dispatching network requests.
+ *   Loopback endpoints are likewise restricted to `http`/`https` schemes (`gopher`, `ftp`, etc. refused).
+ * - [allowTestLoopback] is TEST-ONLY (default `false`; production code must always leave it `false`).
+ *   Plaintext `http` loopback traffic and MockWebServer-style test doubles must never carry real keys
+ *   in production. This module has no `BuildConfig` gate, so the guard is documentation + default-false
+ *   + unit-test pinning (see `constructor_defaultAllowTestLoopback_isFalse_productionSafe`): no production
+ *   source passes `true`.
  * - Resource bounding: Responses are streamed in bounded chunks up to [maxAudioBytes] (default 25MB). If the response
  *   exceeds this limit or declares a Content-Length exceeding it, the call is cancelled immediately and fails closed with
  *   [OpenAiTtsErrorCode.RESPONSE_TOO_LARGE] to reduce Out-Of-Memory (OOM) risk (note: 25MB cap reduces but cannot eliminate OOM under extreme low-memory conditions).
@@ -63,8 +72,31 @@ import okio.utf8Size
  *   the active API key string is explicitly replaced with `⟦REDACTED:API_KEY⟧` to prevent leaking non-standard keys.
  * - Exception cause encapsulation: Exceptions are never chained with raw, unredacted cause instances.
  * - Privacy: Text sent to cloud is unconditionally sanitized with [VoiceTools.redactForCloud] before network dispatch.
- * - Cancellation: Blocking network I/O is cancelled immediately when the parent coroutine is cancelled.
+ *   Redaction-anchor note: `redactForCloud` currently shares its redaction policy implementation with
+ *   `redactForStore`, but the two anchors differ semantically (cloud-upload vs store-write). A policy
+ *   change to either side must be reviewed against the other; the two must not silently diverge in
+ *   coverage, nor be "unified" without auditing both call-site contracts.
+ * - Sunset runtime notice: HTTP 404/410 responses append a migration hint
+ *   (`sunset 2027-01-06, migrate to gpt-realtime-2.1-mini`, see [SUNSET_DATE]/[MIGRATION_TARGET]).
  * - Transport security: HTTP redirects are disabled to prevent credential leaking across origins.
+ *   The execution client additionally strips injected authenticators/proxies
+ *   ([Authenticator.NONE]/[Proxy.NO_PROXY]); never inject a client carrying logging interceptors —
+ *   the `Authorization` header value would leak the key to logcat.
+ * - Cancellation: Blocking network I/O is cancelled immediately when the parent coroutine is cancelled.
+ *
+ * @param baseUrl Endpoint base URL (default official `https://api.openai.com`).
+ * @param client Base OkHttp client. WARNING: never pass a client carrying logging interceptors
+ *   (e.g. `HttpLoggingInterceptor` at BODY/HEADERS level) — the `Authorization` header value would
+ *   leak the live API key to logcat. Injected authenticators/proxies are stripped defensively
+ *   ([Authenticator.NONE]/[Proxy.NO_PROXY]); interceptors are intentionally preserved so tests can
+ *   observe dispatch, hence the logging-interceptor prohibition must be honored by callers.
+ * @param apiKey Key supplier returning `CharArray?`, strictly zeroed after Request construction.
+ * @param maxAudioBytes Per-response audio cap (default 25MB, absolute max 64MB — 25MB is the default,
+ *   not the absolute maximum).
+ * @param allowTestLoopback TEST-ONLY escape hatch (default `false`). Admits `http`/`https` loopback
+ *   endpoints (`localhost`, `127.0.0.0/8`, `::1`) for MockWebServer-style tests. Plaintext loopback
+ *   traffic can expose keys to local observers — production code must always leave this `false`
+ *   (pinned by unit test; no production source passes `true`).
  */
 class OpenAiTtsClient(
     val baseUrl: String = DEFAULT_BASE_URL,
@@ -88,10 +120,22 @@ class OpenAiTtsClient(
 
     val hasApiKeySupplier: Boolean get() = apiKey != null
 
+    /**
+     * Hardened execution client derived from the injected base client.
+     *
+     * Defensive strips: redirects off (no cross-origin credential leak), connection-failure retry
+     * off (no duplicate keyed dispatches), [Authenticator.NONE] (an injected authenticator could
+     * otherwise attach the key to unexpected challenges/hosts), [Proxy.NO_PROXY] (an injected
+     * proxy could otherwise observe plaintext loopback traffic or exfiltrate the key).
+     * Interceptors from the injected client are intentionally preserved so tests can observe
+     * dispatch timing — therefore callers must NEVER inject logging interceptors.
+     */
     val httpClient: OkHttpClient = client.newBuilder()
         .followRedirects(false)
         .followSslRedirects(false)
         .retryOnConnectionFailure(false)
+        .authenticator(Authenticator.NONE)
+        .proxy(Proxy.NO_PROXY)
         .apply {
             if (client.callTimeoutMillis == 0) {
                 callTimeout(DEFAULT_CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
@@ -108,16 +152,27 @@ class OpenAiTtsClient(
         const val MIGRATION_TARGET = OpenAiTtsModels.MIGRATION_TARGET
         const val IS_LEGACY_BRIDGE = OpenAiTtsModels.IS_LEGACY_BRIDGE
 
-        const val DEFAULT_BASE_URL = "https://api.openai.com"
-        const val SPEECH_ENDPOINT_PATH = "/v1/audio/speech"
+        const val DEFAULT_BASE_URL = OpenAiTtsModels.DEFAULT_BASE_URL
+        /**
+         * Canonical speech endpoint path — single-sourced from [OpenAiTtsModels.SPEECH_ENDPOINT_PATH].
+         * [resolveEndpoint] builds URLs from this constant; [validateEndpointUrl] admits only this
+         * exact resolved path.
+         */
+        const val SPEECH_ENDPOINT_PATH = OpenAiTtsModels.SPEECH_ENDPOINT_PATH
         /**
          * 預設最大音訊位元組限制（25MB）。
-         * 音檔採受限記憶體緩衝播放（不寫入儲存空間，上限 25MB）。
+         * 音檔採受限記憶體緩衝播放（不寫入儲存空間）。25MB 是預設值而非絕對上限：
+         * 可經 [OpenAiTtsClient.maxAudioBytes] 上調，但不得超過 [MAX_SUPPORTED_AUDIO_BYTES]。
          * 誠實說明：網路下載後全額緩衝於記憶體中（Bounded in-memory buffering），
          * 在峰值時存在多份 ByteArray 拷貝，25MB 上限可降低但無法杜絕極限情況的 OOM 風險。
          */
         const val DEFAULT_MAX_AUDIO_BYTES = OpenAiTtsModels.MAX_AUDIO_BYTES.toLong()
-        const val MAX_SUPPORTED_AUDIO_BYTES = Long.MAX_VALUE
+        /**
+         * 絕對硬上限（64MB）——單一來源 [OpenAiTtsModels.MAX_SUPPORTED_AUDIO_BYTES]。
+         * 構造器維持 `maxAudioBytes <= MAX_SUPPORTED_AUDIO_BYTES` 檢查；此前 `Long.MAX_VALUE`
+         * 的無意義上界（含錯誤訊息印出該值的空轉）已移除。
+         */
+        const val MAX_SUPPORTED_AUDIO_BYTES = OpenAiTtsModels.MAX_SUPPORTED_AUDIO_BYTES
         const val DEFAULT_CALL_TIMEOUT_SECONDS = 60L
         const val KEY_SUPPLIER_FAILED_MESSAGE = "Key supplier failed to provide API key"
         private const val MAX_ERROR_BODY_BYTES = 4096L
@@ -136,17 +191,22 @@ class OpenAiTtsClient(
                 .build()
 
         /**
-         * Resolves the target speech endpoint URL.
-         * If [baseUrl] already ends with `/audio/speech`, it is preserved to avoid duplication.
-         * If [baseUrl] ends with `/v1`, `/audio/speech` is appended.
-         * Otherwise `/v1/audio/speech` is appended.
+         * Resolves the target speech endpoint URL from a base URL, built from [SPEECH_ENDPOINT_PATH].
+         * If [baseUrl] already ends with the audio/speech suffix, it is preserved to avoid duplication.
+         * If [baseUrl] ends with `/v1`, the audio/speech suffix is appended.
+         * Otherwise the full [SPEECH_ENDPOINT_PATH] is appended.
+         *
+         * NOTE: path allow-listing is enforced by [validateEndpointUrl], which only admits the exact
+         * canonical path — preserved non-standard prefixes never reach the network.
          */
         internal fun resolveEndpoint(baseUrl: String): String {
             val trimmed = baseUrl.trim().trimEnd('/')
+            val audioSpeechSuffix = SPEECH_ENDPOINT_PATH.removePrefix("/v1")
             return when {
-                trimmed.endsWith("/audio/speech") -> trimmed
-                trimmed.endsWith("/v1") -> "$trimmed/audio/speech"
-                else -> "$trimmed/v1/audio/speech"
+                trimmed.endsWith(SPEECH_ENDPOINT_PATH) -> trimmed
+                trimmed.endsWith(audioSpeechSuffix) -> trimmed
+                trimmed.endsWith("/v1") -> "$trimmed$audioSpeechSuffix"
+                else -> "$trimmed$SPEECH_ENDPOINT_PATH"
             }
         }
 
@@ -154,9 +214,17 @@ class OpenAiTtsClient(
             """^127(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}$"""
         )
 
+        /**
+         * Tests whether [host] is a loopback host admissible in test mode.
+         *
+         * Strictly admits ONLY: the `localhost` name itself, the full `127.0.0.0/8` range, and `::1`.
+         * `*.localhost` subdomains are intentionally REJECTED: wildcard DNS can resolve
+         * attacker-controlled names such as `sub.localhost` to non-loopback addresses outside the
+         * test sandbox, so test mode must not treat the suffix as proof of loopback.
+         */
         internal fun isLoopbackHost(host: String): Boolean {
             val h = host.trim().trim('[', ']').removeSuffix(".").lowercase(Locale.ROOT)
-            if (h == "localhost" || (h.endsWith(".localhost") && h.length > ".localhost".length)) {
+            if (h == "localhost") {
                 return true
             }
             if (h == "::1" || h == "0:0:0:0:0:0:0:1") {
@@ -219,12 +287,39 @@ class OpenAiTtsClient(
                 )
             }
 
+            // Scheme whitelist applies to BOTH branches (official and loopback): only http/https.
+            // (`toHttpUrlOrNull` already rejects most exotic schemes, but enforce explicitly to
+            // refuse `gopher`, `ftp`, etc. even when pointed at a loopback host.)
+            val scheme = parsed.scheme.lowercase(Locale.ROOT)
+            if (scheme != "http" && scheme != "https") {
+                throw OpenAiTtsException(
+                    statusCode = null,
+                    errorCode = OpenAiTtsErrorCode.INVALID_INPUT,
+                    retryable = false,
+                    safeMessage = "Endpoint URL scheme must be http or https: ${Redactor.redactError(endpointUrl)}",
+                )
+            }
+
+            // Resolved-path allow-list (official branch included): the final path must be exactly
+            // the canonical speech path. Official base URLs carrying non-standard paths
+            // (e.g. `https://api.openai.com/evil`) resolve to a non-canonical path and are rejected
+            // here as INVALID_INPUT before the key supplier is invoked.
+            if (parsed.encodedPath != SPEECH_ENDPOINT_PATH) {
+                throw OpenAiTtsException(
+                    statusCode = null,
+                    errorCode = OpenAiTtsErrorCode.INVALID_INPUT,
+                    retryable = false,
+                    safeMessage = "Endpoint path must be exactly $SPEECH_ENDPOINT_PATH: ${Redactor.redactError(endpointUrl)}",
+                )
+            }
+
             val host = parsed.host
 
             if (isOpenAiOfficialEndpoint(endpointUrl)) {
                 return
             }
 
+            // TEST-ONLY: plaintext http loopback is admitted solely under the explicit flag.
             if (allowTestLoopback && isLoopbackHost(host)) {
                 return
             }
@@ -309,7 +404,10 @@ class OpenAiTtsClient(
         }
 
         val (httpRequest, activeKey) = try {
-            // Force redaction for cloud upload
+            // Force redaction for cloud upload. Anchor note: redactForCloud currently shares its
+            // policy implementation with redactForStore, but anchors different semantics
+            // (cloud-upload vs store-write) — a policy change on either side must be reviewed
+            // against the other.
             val redactedInput = VoiceTools.redactForCloud(request.input)
             if (redactedInput.isBlank()) {
                 throw OpenAiTtsException(
@@ -337,7 +435,14 @@ class OpenAiTtsClient(
             }.toString()
 
             val requestBody = OneShotJsonBody(jsonBody)
-            val keyString = String(keyChars).trim()
+            // Single-copy trim: trim the CharArray bounds first so only ONE immutable String
+            // is ever materialized (vs `String(keyChars).trim()`, which leaves both the
+            // untrimmed and trimmed copies on the heap until GC).
+            var keyStart = 0
+            while (keyStart < keyChars.size && keyChars[keyStart].isWhitespace()) keyStart++
+            var keyEnd = keyChars.size
+            while (keyEnd > keyStart && keyChars[keyEnd - 1].isWhitespace()) keyEnd--
+            val keyString = String(keyChars, keyStart, keyEnd - keyStart)
 
             // Security Note:
             // [keyChars] is strictly zeroed with fill('\u0000') immediately in this finally block,
@@ -373,13 +478,17 @@ class OpenAiTtsClient(
 
     /**
      * Synthesizes audio with explicit arguments.
+     *
+     * NOTE: parameters carry NO defaults — callers must pass explicit values (sourced from
+     * [OpenAiTtsModels], the single source of truth). Default pass-through via companion
+     * constants is intentionally absent so default triples cannot silently diverge.
      */
     suspend fun synthesize(
         text: String,
-        model: String = OpenAiTtsRequest.DEFAULT_MODEL,
-        voice: String = OpenAiTtsRequest.DEFAULT_VOICE,
-        responseFormat: String = OpenAiTtsRequest.DEFAULT_RESPONSE_FORMAT,
-        speed: Float = OpenAiTtsRequest.DEFAULT_SPEED,
+        model: String,
+        voice: String,
+        responseFormat: String,
+        speed: Float,
         apiKeyOverride: (suspend () -> CharArray?)? = null,
     ): OpenAiTtsResult = synthesize(
         request = OpenAiTtsRequest(
@@ -499,6 +608,17 @@ class OpenAiTtsClient(
                 buffer.write(chunk, read)
             }
 
+            // Fail closed on empty success bodies: HTTP 200 with 0 bytes is a contract
+            // violation, never valid audio. Never return "success" with empty audio.
+            if (totalBytesRead == 0L) {
+                throw OpenAiTtsException(
+                    statusCode = code,
+                    errorCode = OpenAiTtsErrorCode.UNEXPECTED,
+                    retryable = false,
+                    safeMessage = "Response audio body was empty (HTTP $code with 0 bytes)",
+                )
+            }
+
             val bytes = buffer.readByteArray()
             val contentType = response.header("Content-Type")
                 ?: body.contentType()?.toString()
@@ -512,11 +632,18 @@ class OpenAiTtsClient(
         val errorBody = readBoundedErrorBody(response)
         val rawMessage = extractErrorMessage(response, errorBody)
         val (errorCode, retryable) = classifyHttpError(code)
+        // Runtime sunset notice: 404/410 on the legacy speech endpoint likely signal the
+        // announced retirement — append the migration hint (see SUNSET_DATE/MIGRATION_TARGET).
+        val safeMessage = if (code == 404 || code == 410) {
+            "$rawMessage (note: POST /v1/audio/speech sunset $SUNSET_DATE, migrate to $MIGRATION_TARGET)"
+        } else {
+            rawMessage
+        }
         throw OpenAiTtsException(
             statusCode = code,
             errorCode = errorCode,
             retryable = retryable,
-            safeMessage = rawMessage,
+            safeMessage = safeMessage,
             activeKey = activeKey,
         )
     }
@@ -555,8 +682,11 @@ class OpenAiTtsClient(
             }
         } else null
 
+        // Log-forging guard: BOTH branches (parsed JSON message and raw body) are flattened to
+        // a single line and bounded, so embedded newlines/control sequences in server error text
+        // cannot forge log lines or bloat messages.
         val detail = when {
-            !parsedMsg.isNullOrBlank() -> parsedMsg.trim()
+            !parsedMsg.isNullOrBlank() -> parsedMsg.trim().replace(Regex("\\s+"), " ").take(200)
             !errorBody.isNullOrBlank() -> errorBody.trim().replace(Regex("\\s+"), " ").take(200)
             response.message.isNotBlank() -> response.message
             else -> "HTTP ${response.code}"

@@ -1586,6 +1586,69 @@ class OpenAiEmbeddingClientTest {
     }
 
     @Test
+    fun parseResponseBodyJsonRejectsCrossItemDimensionMismatchWhenDimensionsOmitted() {
+        // Two-item regression test: index 0 has 2 dimensions, index 1 has 3 dimensions.
+        // When dimensions is omitted, dimension binds to the first item and requires subsequent items to match.
+        val jsonShortFirst = """{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1, 0.2]},{"object":"embedding","index":1,"embedding":[0.1, 0.2, 0.3]}],"model":"text-embedding-3-small"}"""
+        val exShortFirst = assertThrows(EmbeddingException::class.java) {
+            OpenAiEmbeddingClient.parseResponseBodyJson(
+                responseString = jsonShortFirst,
+                fallbackModel = "text-embedding-3-small",
+                statusCode = 200,
+                expectedInputSize = 2,
+                expectedDimensions = null,
+            )
+        }
+        assertEquals(EmbeddingErrorCode.INVALID_RESPONSE, exShortFirst.errorCode)
+        assertTrue(exShortFirst.safeMessage.contains("Embedding dimension mismatch: expected 2, got 3"))
+
+        // Reverse case: index 0 has 3 dimensions, index 1 has 2 dimensions.
+        val jsonLongFirst = """{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1, 0.2, 0.3]},{"object":"embedding","index":1,"embedding":[0.1, 0.2]}],"model":"text-embedding-3-small"}"""
+        val exLongFirst = assertThrows(EmbeddingException::class.java) {
+            OpenAiEmbeddingClient.parseResponseBodyJson(
+                responseString = jsonLongFirst,
+                fallbackModel = "text-embedding-3-small",
+                statusCode = 200,
+                expectedInputSize = 2,
+                expectedDimensions = null,
+            )
+        }
+        assertEquals(EmbeddingErrorCode.INVALID_RESPONSE, exLongFirst.errorCode)
+        assertTrue(exLongFirst.safeMessage.contains("Embedding dimension mismatch: expected 3, got 2"))
+    }
+
+    @Test
+    fun createEmbeddingsRejectsCrossItemDimensionMismatchWhenDimensionsOmitted() = runBlocking {
+        val json = """{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1, 0.2]},{"object":"embedding","index":1,"embedding":[0.1, 0.2, 0.3]}],"model":"text-embedding-3-small"}"""
+        server.enqueue(MockResponse().setResponseCode(200).setBody(json))
+        val client = OpenAiEmbeddingClient(
+            baseUrl = server.url("/").toString(),
+            apiKey = { "key".toCharArray() },
+            allowTestLoopback = true,
+        )
+        val ex = assertThrows(EmbeddingException::class.java) {
+            runBlocking { client.createEmbeddings(EmbeddingRequest(input = listOf("item1", "item2"), dimensions = null)) }
+        }
+        assertEquals(EmbeddingErrorCode.INVALID_RESPONSE, ex.errorCode)
+        assertTrue(ex.safeMessage.contains("Embedding dimension mismatch: expected 2, got 3"))
+    }
+
+    @Test
+    fun parseResponseBodyJsonAcceptsConsistentVectorDimensionsWhenDimensionsOmitted() {
+        val json = """{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1, 0.2]},{"object":"embedding","index":1,"embedding":[0.3, 0.4]}],"model":"text-embedding-3-small"}"""
+        val response = OpenAiEmbeddingClient.parseResponseBodyJson(
+            responseString = json,
+            fallbackModel = "text-embedding-3-small",
+            statusCode = 200,
+            expectedInputSize = 2,
+            expectedDimensions = null,
+        )
+        assertEquals(2, response.data.size)
+        assertEquals(2, response.data[0].embedding.size)
+        assertEquals(2, response.data[1].embedding.size)
+    }
+
+    @Test
     fun apiKeyWithControlCharactersThrowsUnauthorized() = runBlocking {
         val clientCrLf = OpenAiEmbeddingClient(
             baseUrl = server.url("/").toString(),

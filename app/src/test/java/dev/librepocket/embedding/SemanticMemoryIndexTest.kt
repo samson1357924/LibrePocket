@@ -3,6 +3,9 @@ package dev.librepocket.embedding
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.CoroutineContext
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
@@ -17,6 +20,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -1721,9 +1725,35 @@ class SemanticMemoryIndexTest {
     }
 
     @Test
+    fun defaultSearchDispatcherIsDispatchersDefault() {
+        val index = SemanticMemoryIndex<Unit>()
+        assertSame(Dispatchers.Default, index.searchDispatcher)
+    }
+
+    @Test
     fun searchExecutesVectorMathOnDefaultDispatcherOffCallingThread() = runBlocking {
         val client = createTestClient()
-        val index = SemanticMemoryIndex<Unit>(client = client)
+        val callerThreadName = "caller-ui-simulation-thread"
+        val customDispatcher = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, callerThreadName)
+        }.asCoroutineDispatcher()
+
+        val searchExecutionThread = AtomicReference<String>()
+        val dispatchCount = AtomicInteger(0)
+        val trackingDefaultDispatcher = object : CoroutineDispatcher() {
+            override fun dispatch(context: CoroutineContext, block: Runnable) {
+                dispatchCount.incrementAndGet()
+                Dispatchers.Default.dispatch(context, Runnable {
+                    searchExecutionThread.set(Thread.currentThread().name)
+                    block.run()
+                })
+            }
+        }
+
+        val index = SemanticMemoryIndex<Unit>(
+            client = client,
+            searchDispatcher = trackingDefaultDispatcher,
+        )
         index.addDirect("id1", "item1", floatArrayOf(1.0f, 0.0f))
 
         server.enqueue(
@@ -1732,22 +1762,66 @@ class SemanticMemoryIndexTest {
                 .setBody(jsonEmbeddingResponse(listOf(floatArrayOf(1.0f, 0.0f))))
         )
 
-        val callerThreadName = "caller-ui-simulation-thread"
-        val customDispatcher = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-            Thread(r, callerThreadName)
-        }.asCoroutineDispatcher()
-
         try {
             withContext(customDispatcher) {
                 assertTrue(Thread.currentThread().name.startsWith(callerThreadName))
                 val results = index.search("item1", k = 1)
                 assertEquals(1, results.size)
                 assertEquals("id1", results[0].entry.id)
+
+                // Vector math / searchByVector actually executed on a background Default dispatcher thread, NOT on calling thread
+                assertEquals(1, dispatchCount.get())
+                val threadName = searchExecutionThread.get()
+                assertNotNull("Vector search execution thread should be captured", threadName)
+                assertFalse("Vector search must not execute on calling thread", threadName!!.startsWith(callerThreadName))
+
                 // Caller context was preserved upon resumption
                 assertTrue(Thread.currentThread().name.startsWith(callerThreadName))
             }
         } finally {
             customDispatcher.close()
+        }
+    }
+
+    @Test
+    fun searchExecutesOnConfiguredSearchDispatcher() = runBlocking {
+        val client = createTestClient()
+        val customSearchThreadName = "custom-search-worker-thread"
+        val customExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, customSearchThreadName)
+        }
+        val customDispatcher = customExecutor.asCoroutineDispatcher()
+
+        val searchExecutionThread = AtomicReference<String>()
+        val trackingDispatcher = object : CoroutineDispatcher() {
+            override fun dispatch(context: CoroutineContext, block: Runnable) {
+                customDispatcher.dispatch(context, Runnable {
+                    searchExecutionThread.set(Thread.currentThread().name)
+                    block.run()
+                })
+            }
+        }
+
+        val index = SemanticMemoryIndex<Unit>(
+            client = client,
+            searchDispatcher = trackingDispatcher,
+        )
+        index.addDirect("id1", "item1", floatArrayOf(1.0f, 0.0f))
+
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(jsonEmbeddingResponse(listOf(floatArrayOf(1.0f, 0.0f))))
+        )
+
+        try {
+            val results = index.search("item1", k = 1)
+            assertEquals(1, results.size)
+            assertEquals("id1", results[0].entry.id)
+            assertEquals(customSearchThreadName, searchExecutionThread.get())
+        } finally {
+            customDispatcher.close()
+            customExecutor.shutdown()
         }
     }
 }

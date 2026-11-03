@@ -508,7 +508,8 @@ class OpenAiEmbeddingClient(
          * 2. Eager Fail-Fast Dimension Bounds:
          *    Validates [MAX_SUPPORTED_DIMENSION] (3072) and [expectedDimensions] incrementally while
          *    reading float tokens, aborting immediately upon exceeding limits rather than parsing
-         *    unbounded payloads into memory.
+         *    unbounded payloads into memory. When [expectedDimensions] is null, binds to the dimension
+         *    of the first item and requires all subsequent items in the batch to match.
          * 3. Strict RFC 8259 Conformance & Injection Defense:
          *    Rejects non-compliant JSON syntax (leading zeros, leading '+', trailing commas) and
          *    validates [Float.isFinite] to block NaN/Infinity injection attacks.
@@ -766,6 +767,7 @@ class OpenAiEmbeddingClient(
                         expect('[')
                         val list = ArrayList<EmbeddingItem>()
                         var firstItem = true
+                        var boundDimensions: Int? = expectedDimensions
                         while (true) {
                             skipWs()
                             if (pos >= len) error("unexpected EOF in data array")
@@ -798,7 +800,7 @@ class OpenAiEmbeddingClient(
                                         skipWs()
                                         expect('[')
                                         var count = 0
-                                        var capacity = minOf(MAX_SUPPORTED_DIMENSION, expectedDimensions ?: 1536)
+                                        var capacity = minOf(MAX_SUPPORTED_DIMENSION, boundDimensions ?: 1536)
                                         var buf = FloatArray(capacity)
                                         var firstFloat = true
                                         while (true) {
@@ -822,8 +824,12 @@ class OpenAiEmbeddingClient(
                                         }
                                         if (count == 0) error("empty embedding array in item")
                                         floatArr = if (buf.size == count) buf else buf.copyOf(count)
-                                        if (expectedDimensions != null && floatArr.size != expectedDimensions) {
-                                            error("Embedding dimension mismatch: expected $expectedDimensions, got ${floatArr.size}")
+                                        if (boundDimensions != null) {
+                                            if (floatArr.size != boundDimensions) {
+                                                error("Embedding dimension mismatch: expected $boundDimensions, got ${floatArr.size}")
+                                            }
+                                        } else {
+                                            boundDimensions = floatArr.size
                                         }
                                     }
                                     else -> skipValue()

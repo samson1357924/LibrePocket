@@ -4,6 +4,7 @@ import java.util.PriorityQueue
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -100,12 +101,15 @@ private class ScoredEntry<T>(
  *                   Combined with [MAX_SUPPORTED_DIMENSION] (3072), [MAX_TEXT_CHARS] (2048), and [MAX_ID_CHARS] (256),
  *                   strictly bounds index-managed memory consumption.
  * @param model Model identifier used when invoking [client] for text embeddings (max length [MAX_MODEL_CHARS]).
+ * @param metadataValidator Optional validator invoked on caller-supplied metadata.
+ * @param searchDispatcher Coroutine dispatcher used for vector math and search ranking (defaults to [Dispatchers.Default]).
  */
 class SemanticMemoryIndex<T>(
     private val client: OpenAiEmbeddingClient? = null,
     val maxEntries: Int = DEFAULT_MAX_ENTRIES,
     val model: String = DEFAULT_MODEL,
     val metadataValidator: ((T?) -> Unit)? = null,
+    val searchDispatcher: CoroutineDispatcher = Dispatchers.Default,
 ) {
     init {
         require(maxEntries in 1..MAX_ALLOWED_ENTRIES) {
@@ -321,7 +325,7 @@ class SemanticMemoryIndex<T>(
             ?: throw IllegalStateException("OpenAiEmbeddingClient is required for text search operations")
 
         val queryVector = nonNullClient.embed(text = query, model = model)
-        return withContext(Dispatchers.Default) {
+        return withContext(searchDispatcher) {
             searchByVector(queryVector = queryVector, k = k, minScore = minScore)
         }
     }

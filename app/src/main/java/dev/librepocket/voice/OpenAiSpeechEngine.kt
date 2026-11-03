@@ -55,27 +55,33 @@ interface AudioPlayer {
  * 直接自 [data] ByteArray 讀取串流，保證音訊位元組永不落地（零檔案系統 I/O）。
  * 注意：內部持有 [data] 的防禦性副本（defensive copy clone），以防外部修改；此處會額外佔用一份 ByteArray 拷貝。
  */
-class ByteArrayMediaDataSource(data: ByteArray) : MediaDataSource() {
-    private val data: ByteArray = data.clone()
+class ByteArrayMediaDataSource(
+    data: ByteArray,
+    copy: Boolean = true,
+) : MediaDataSource() {
+    @Volatile
+    private var data: ByteArray? = if (copy) data.clone() else data
     @Volatile
     private var isClosed: Boolean = false
 
     override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
         if (isClosed) return -1
-        if (position < 0 || position >= data.size) return -1
+        val currentData = data ?: return -1
+        if (position < 0 || position >= currentData.size) return -1
         if (size <= 0) return 0
         if (offset < 0 || offset >= buffer.size) return 0
-        val remaining = (data.size - position).toInt()
+        val remaining = (currentData.size - position).toInt()
         val toCopy = minOf(size, remaining, buffer.size - offset)
         if (toCopy <= 0) return 0
-        System.arraycopy(data, position.toInt(), buffer, offset, toCopy)
+        System.arraycopy(currentData, position.toInt(), buffer, offset, toCopy)
         return toCopy
     }
 
-    override fun getSize(): Long = if (isClosed) 0L else data.size.toLong()
+    override fun getSize(): Long = if (isClosed) 0L else (data?.size?.toLong() ?: 0L)
 
     override fun close() {
         isClosed = true
+        data = null
     }
 }
 
@@ -115,13 +121,21 @@ class AndroidAudioPlayer(
 
     private fun safelyReleasePlayer(player: MediaPlayer?, dataSource: ByteArrayMediaDataSource?) {
         if (player != null) {
-            try {
-                player.reset()
-            } catch (_: Throwable) {
-            }
-            try {
-                player.release()
-            } catch (_: Throwable) {
+            synchronized(player) {
+                try {
+                    player.setOnPreparedListener(null)
+                    player.setOnCompletionListener(null)
+                    player.setOnErrorListener(null)
+                } catch (_: Throwable) {
+                }
+                try {
+                    player.reset()
+                } catch (_: Throwable) {
+                }
+                try {
+                    player.release()
+                } catch (_: Throwable) {
+                }
             }
         }
         if (dataSource != null) {
@@ -143,7 +157,15 @@ class AndroidAudioPlayer(
             }
             return@suspendCancellableCoroutine
         }
-        val dataSource = ByteArrayMediaDataSource(audioBytes)
+        val dataSource = try {
+            ByteArrayMediaDataSource(audioBytes, copy = false)
+        } catch (e: Throwable) {
+            safelyReleasePlayer(player, null)
+            if (continuation.isActive) {
+                continuation.resumeWithException(e)
+            }
+            return@suspendCancellableCoroutine
+        }
 
         val oldDetached = synchronized(lock) {
             if (!continuation.isActive) {
@@ -178,67 +200,80 @@ class AndroidAudioPlayer(
             }
         }
 
-        val shouldProceed = synchronized(lock) {
-            continuation.isActive && activePlayer === player
-        }
-        if (!shouldProceed) {
-            return@suspendCancellableCoroutine
-        }
-
         try {
-            player.setDataSource(dataSource)
-            player.setOnPreparedListener { mp ->
-                val shouldStart = synchronized(lock) {
-                    activePlayer === player
+            val proceeded = synchronized(player) {
+                val shouldProceed = synchronized(lock) {
+                    continuation.isActive && activePlayer === player
                 }
-                if (!shouldStart) return@setOnPreparedListener
+                if (!shouldProceed) {
+                    false
+                } else {
+                    player.setDataSource(dataSource)
+                    player.setOnPreparedListener { mp ->
+                        val shouldStart = synchronized(lock) {
+                            activePlayer === player
+                        }
+                        if (!shouldStart) return@setOnPreparedListener
 
-                var startException: Exception? = null
-                try {
-                    mp.start()
-                } catch (e: Exception) {
-                    startException = e
-                }
+                        var startException: Exception? = null
+                        try {
+                            synchronized(player) {
+                                val stillActive = synchronized(lock) {
+                                    activePlayer === player
+                                }
+                                if (stillActive) {
+                                    mp.start()
+                                }
+                            }
+                        } catch (e: Exception) {
+                            startException = e
+                        }
 
-                if (startException != null) {
-                    val detached = synchronized(lock) {
-                        detachIfActiveLocked(player)
-                    }
-                    if (detached != null) {
-                        safelyReleasePlayer(detached.player, detached.dataSource)
-                        if (detached.continuation?.isActive == true) {
-                            detached.continuation.resumeWithException(startException)
+                        if (startException != null) {
+                            val detached = synchronized(lock) {
+                                detachIfActiveLocked(player)
+                            }
+                            if (detached != null) {
+                                safelyReleasePlayer(detached.player, detached.dataSource)
+                                if (detached.continuation?.isActive == true) {
+                                    detached.continuation.resumeWithException(startException)
+                                }
+                            }
                         }
                     }
-                }
-            }
-            player.setOnCompletionListener {
-                val detached = synchronized(lock) {
-                    detachIfActiveLocked(player)
-                }
-                if (detached != null) {
-                    safelyReleasePlayer(detached.player, detached.dataSource)
-                    if (detached.continuation?.isActive == true) {
-                        detached.continuation.resume(Unit)
+                    player.setOnCompletionListener {
+                        val detached = synchronized(lock) {
+                            detachIfActiveLocked(player)
+                        }
+                        if (detached != null) {
+                            safelyReleasePlayer(detached.player, detached.dataSource)
+                            if (detached.continuation?.isActive == true) {
+                                detached.continuation.resume(Unit)
+                            }
+                        }
                     }
-                }
-            }
-            player.setOnErrorListener { _, what, extra ->
-                val detached = synchronized(lock) {
-                    detachIfActiveLocked(player)
-                }
-                if (detached != null) {
-                    safelyReleasePlayer(detached.player, detached.dataSource)
-                    if (detached.continuation?.isActive == true) {
-                        detached.continuation.resumeWithException(
-                            IOException("MediaPlayer 播放錯誤：what=$what, extra=$extra"),
-                        )
+                    player.setOnErrorListener { _, what, extra ->
+                        val detached = synchronized(lock) {
+                            detachIfActiveLocked(player)
+                        }
+                        if (detached != null) {
+                            safelyReleasePlayer(detached.player, detached.dataSource)
+                            if (detached.continuation?.isActive == true) {
+                                detached.continuation.resumeWithException(
+                                    IOException("MediaPlayer 播放錯誤：what=$what, extra=$extra"),
+                                )
+                            }
+                        }
+                        true
                     }
+                    // 使用非同步 prepareAsync，不阻塞當前執行緒與鎖，讓 stop() 能隨時即時獲得鎖並中斷
+                    player.prepareAsync()
+                    true
                 }
-                true
             }
-            // 使用非同步 prepareAsync，不阻塞當前執行緒與鎖，讓 stop() 能隨時即時獲得鎖並中斷
-            player.prepareAsync()
+            if (!proceeded) {
+                return@suspendCancellableCoroutine
+            }
         } catch (e: Exception) {
             val detached = synchronized(lock) {
                 detachIfActiveLocked(player)
@@ -286,7 +321,7 @@ class AndroidAudioPlayer(
  *    誠實校準記憶體行為描述：音訊在網路下載後全額緩衝於記憶體中（Bounded in-memory buffering），
  *    在合成與播放峰值時存在多份 ByteArray 拷貝（OkHttp response buffer、合成結果 ByteArray、
  *    ByteArrayMediaDataSource 內部 clone 等），25MB 上限可降低但無法杜絕極限情況的 OOM 風險；
- * 5. 支援中斷與世代防護：透過 [speechEpoch] 世代機制與 [activeJobs] 追蹤，[stop] 遞增世代並取消 activeJob 與停止播放器，
+ * 5. 支援中斷與世代防護：透過 [speechEpoch] 與 [stopEpoch] 世代機制與 [activeJobs] 追蹤，[stop] 遞增世代並取消 activeJob 與停止播放器，
  *    後續完成的合成或延遲回調若發現世代不符則立即拋棄，絕不送出播放；
  * 6. 金鑰彈性來源：除獨立的 `VoiceTools.OPENAI_KEY_REF`（`"openai_tts"`），亦支援可選 key supplier 或作用中 OpenAI endpoint；
  * 7. 測試友善：支援注入 [AudioPlayer] 與 [OpenAiTtsClient]，便於 JVM 單元測試。
@@ -303,6 +338,7 @@ class OpenAiSpeechEngine(
     private val activeJob = AtomicReference<Job?>(null)
     private val activeJobs = ConcurrentHashMap.newKeySet<Job>()
     private val speechEpoch = AtomicLong(0L)
+    private val stopEpoch = AtomicLong(0L)
 
     companion object {
         /**
@@ -668,7 +704,7 @@ class OpenAiSpeechEngine(
         apiKeyOverrideOriginUrl: String? = null,
         allowTestLoopback: Boolean = this.allowTestLoopback,
     ): SynthOutcome = withContext(Dispatchers.IO) {
-        val preCheckEpoch = speechEpoch.get()
+        val preCheckStopEpoch = stopEpoch.get()
         val callerJob = coroutineContext[Job]
         if (callerJob?.isActive == false) {
             return@withContext SynthOutcome.Failed(
@@ -730,7 +766,7 @@ class OpenAiSpeechEngine(
         }
 
         // 檢查期間若發生 stop 或呼叫端協程已被取消，直接返回取消，不進入合成流程
-        if (speechEpoch.get() != preCheckEpoch || callerJob?.isActive == false) {
+        if (stopEpoch.get() != preCheckStopEpoch || callerJob?.isActive == false) {
             return@withContext SynthOutcome.Failed(
                 detail = DETAIL_CANCELLED,
                 message = "語音合成已被中斷",
@@ -832,14 +868,15 @@ class OpenAiSpeechEngine(
      * 立即中斷播放並取消所有進行中的合成請求。
      */
     fun stop() {
-        val stopEpoch = speechEpoch.incrementAndGet()
+        val currentStopEpoch = stopEpoch.incrementAndGet()
+        val currentSpeechEpoch = speechEpoch.incrementAndGet()
         val oldJob = activeJob.getAndSet(null)
         val jobs = synchronized(activeJobs) {
             val list = (activeJobs + listOfNotNull(oldJob)).distinct()
             activeJobs.clear()
             list
         }
-        jobs.forEach { it.cancel(CancellationException("Speech synthesis stopped (epoch $stopEpoch)")) }
+        jobs.forEach { it.cancel(CancellationException("Speech synthesis stopped (epoch $currentSpeechEpoch)")) }
         player.stop()
     }
 }

@@ -20,8 +20,10 @@ import dev.librepocket.preset.ProviderCatalog
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.tool.DenyReason
 import dev.librepocket.tool.Flavor
+import android.media.MediaPlayer
 import java.io.IOException
 import java.nio.file.Files
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -92,7 +94,7 @@ class OpenAiSpeechEngineTest {
     }
 
     private class FakeKeyVault(
-        private val keys: MutableMap<String, CharArray> = mutableMapOf(),
+        private val keys: MutableMap<String, CharArray> = ConcurrentHashMap(),
         var throwOnHasKey: Boolean = false,
         var throwOnGetKey: Boolean = false,
         var onHasKeyAction: (suspend (String) -> Unit)? = null,
@@ -779,33 +781,33 @@ class OpenAiSpeechEngineTest {
         assertTrue(failed.message.contains("播放失敗"))
     }
 
-    private open class TestMediaPlayer : android.media.MediaPlayer() {
-        var prepareAsyncCalled = false
-        var startCalled = false
-        var stopCalled = false
-        var resetCalled = false
-        var releaseCalled = false
-        var throwOnSetDataSource: Exception? = null
-        var throwOnPrepareAsync: Exception? = null
-        var throwOnStart: Exception? = null
-        var throwOnReset: Throwable? = null
-        var preparedListener: android.media.MediaPlayer.OnPreparedListener? = null
-        var errorListener: android.media.MediaPlayer.OnErrorListener? = null
-        var completionListener: android.media.MediaPlayer.OnCompletionListener? = null
+    private open class TestMediaPlayer : MediaPlayer() {
+        @Volatile var prepareAsyncCalled = false
+        @Volatile var startCalled = false
+        @Volatile var stopCalled = false
+        @Volatile var resetCalled = false
+        @Volatile var releaseCalled = false
+        @Volatile var throwOnSetDataSource: Exception? = null
+        @Volatile var throwOnPrepareAsync: Exception? = null
+        @Volatile var throwOnStart: Exception? = null
+        @Volatile var throwOnReset: Throwable? = null
+        @Volatile var preparedListener: MediaPlayer.OnPreparedListener? = null
+        @Volatile var errorListener: MediaPlayer.OnErrorListener? = null
+        @Volatile var completionListener: MediaPlayer.OnCompletionListener? = null
 
         override fun setDataSource(dataSource: android.media.MediaDataSource) {
             throwOnSetDataSource?.let { throw it }
         }
 
-        override fun setOnPreparedListener(listener: android.media.MediaPlayer.OnPreparedListener?) {
+        override fun setOnPreparedListener(listener: MediaPlayer.OnPreparedListener?) {
             preparedListener = listener
         }
 
-        override fun setOnCompletionListener(listener: android.media.MediaPlayer.OnCompletionListener?) {
+        override fun setOnCompletionListener(listener: MediaPlayer.OnCompletionListener?) {
             completionListener = listener
         }
 
-        override fun setOnErrorListener(listener: android.media.MediaPlayer.OnErrorListener?) {
+        override fun setOnErrorListener(listener: MediaPlayer.OnErrorListener?) {
             errorListener = listener
         }
 
@@ -2250,6 +2252,43 @@ class OpenAiSpeechEngineTest {
     }
 
     @Test
+    fun byteArrayMediaDataSource_closeClearsDataAndSubsequentCallsReturnZeroAndNegativeOne() {
+        val original = byteArrayOf(10, 20, 30, 40)
+        val ds = ByteArrayMediaDataSource(original)
+        assertEquals(4L, ds.size)
+
+        val buffer = ByteArray(2)
+        val bytesRead = ds.readAt(0, buffer, 0, 2)
+        assertEquals(2, bytesRead)
+        assertEquals(10.toByte(), buffer[0])
+        assertEquals(20.toByte(), buffer[1])
+
+        // 呼叫 close()，驗證 data 被清空為 null 且 isClosed 為 true
+        ds.close()
+
+        // 後續 getSize 回傳 0L
+        assertEquals(0L, ds.size)
+        // 後續 readAt 安全回傳 -1
+        assertEquals(-1, ds.readAt(0, buffer, 0, 2))
+        assertEquals(-1, ds.readAt(2, buffer, 0, 2))
+    }
+
+    @Test
+    fun byteArrayMediaDataSource_copyFalseDoesNotCloneArray() {
+        val original = byteArrayOf(1, 2, 3)
+        val ds = ByteArrayMediaDataSource(original, copy = false)
+
+        val buffer = ByteArray(1)
+        ds.readAt(0, buffer, 0, 1)
+        assertEquals(1.toByte(), buffer[0])
+
+        // 外部直接修改 byte array，因 copy = false 未建立防禦性副本，內部資料同步變更
+        original[0] = 77
+        ds.readAt(0, buffer, 0, 1)
+        assertEquals(77.toByte(), buffer[0])
+    }
+
+    @Test
     fun androidAudioPlayer_stopDoesNotCallPlayerStopDirectly() = runBlocking {
         val testMp = TestMediaPlayer()
         val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp })
@@ -2267,6 +2306,39 @@ class OpenAiSpeechEngineTest {
         assertFalse("player.stop() should NOT be called directly", testMp.stopCalled)
         assertTrue("player.reset() must be called", testMp.resetCalled)
         assertTrue("player.release() must be called", testMp.releaseCalled)
+    }
+
+    @Test
+    fun androidAudioPlayer_stop_safelyClearsListenersAndReleasesPlayerWithoutErrors() = runBlocking {
+        val testMp = TestMediaPlayer()
+        val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp })
+
+        val job = launch(Dispatchers.IO) {
+            player.play(byteArrayOf(0x01, 0x02))
+        }
+
+        awaitCondition {
+            testMp.prepareAsyncCalled &&
+                testMp.preparedListener != null &&
+                testMp.completionListener != null &&
+                testMp.errorListener != null
+        }
+
+        assertNotNull("PreparedListener must be present before stop", testMp.preparedListener)
+        assertNotNull("CompletionListener must be present before stop", testMp.completionListener)
+        assertNotNull("ErrorListener must be present before stop", testMp.errorListener)
+
+        // 呼叫 stop() 執行安全釋放流程
+        player.stop()
+        job.join()
+
+        // 驗證重構安全契約：在 reset/release 之前已安全清空所有 listeners
+        assertNull("PreparedListener must be cleared after stop", testMp.preparedListener)
+        assertNull("CompletionListener must be cleared after stop", testMp.completionListener)
+        assertNull("ErrorListener must be cleared after stop", testMp.errorListener)
+        assertTrue("reset() must have been called", testMp.resetCalled)
+        assertTrue("release() must have been called", testMp.releaseCalled)
+        assertFalse("start() must NOT have been called after stop", testMp.startCalled)
     }
 
     @Test
@@ -2343,6 +2415,68 @@ class OpenAiSpeechEngineTest {
         job1.join()
         assertFalse("Job 1 must complete normally, not cancelled", job1.isCancelled)
         assertEquals(1, player.playCount.get())
+    }
+
+    @Test
+    fun synthesizeAndPlay_concurrentRequestsDuringPreCheck_doNotFailDueToStopEpochCollision() = runBlocking {
+        val fakeAudio1 = byteArrayOf(0x01, 0x02)
+        val fakeAudio2 = byteArrayOf(0x03, 0x04)
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/mpeg")
+                .setBody(Buffer().write(fakeAudio1)),
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/mpeg")
+                .setBody(Buffer().write(fakeAudio2)),
+        )
+
+        val player = FakeAudioPlayer()
+        val client = OpenAiTtsClient(
+            baseUrl = server.url("/").toString(),
+            apiKey = { "test-key".toCharArray() },
+            allowTestLoopback = true,
+        )
+        val engine = OpenAiSpeechEngine(client = client, player = player, allowTestLoopback = true)
+
+        val deferred1 = async(Dispatchers.IO) {
+            try {
+                engine.synthesizeAndPlay(
+                    text = "First concurrent synthesis request",
+                    voiceOutputOn = true,
+                    openAiTtsOn = true,
+                )
+            } catch (e: CancellationException) {
+                null
+            }
+        }
+        val deferred2 = async(Dispatchers.IO) {
+            try {
+                engine.synthesizeAndPlay(
+                    text = "Second concurrent synthesis request",
+                    voiceOutputOn = true,
+                    openAiTtsOn = true,
+                )
+            } catch (e: CancellationException) {
+                null
+            }
+        }
+
+        val res1 = deferred1.await()
+        val res2 = deferred2.await()
+
+        val results = listOfNotNull(res1, res2)
+        // 至少一個請求成功完成 Ok，且未因前置檢查期 stopEpoch 碰撞而回傳 Failed(DETAIL_CANCELLED)
+        assertTrue("At least one request should succeed Ok", results.any { it is OpenAiSpeechEngine.Companion.SynthOutcome.Ok })
+        for (res in results) {
+            assertFalse(
+                "Neither request should fail with DETAIL_CANCELLED outcome due to pre-check epoch collision",
+                res is OpenAiSpeechEngine.Companion.SynthOutcome.Failed && res.detail == OpenAiSpeechEngine.DETAIL_CANCELLED,
+            )
+        }
     }
 
     // ---- 階段 2：回歸測試套件加固與全矩陣驗證 ----

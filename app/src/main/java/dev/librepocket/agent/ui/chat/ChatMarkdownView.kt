@@ -250,6 +250,13 @@ internal fun CodeBlockView(
 
 /**
  * Renders structured markdown and thinking blocks within a message bubble.
+ *
+ * Streaming contract: [ChatMarkdownView] re-parses the full [text] prefix on every chunk
+ * via `remember(text, isStreaming) { parse(text, ...) }`. Each call is O(N) in the current
+ * prefix length (see [ChatMarkdownParser] cost model), so M growth steps with chunk size c
+ * cost Theta(N^2 / c) cumulatively. Incremental or tail-segment re-parsing (only re-scan
+ * the changed suffix) is explicitly future work and is not implemented here; the current
+ * full re-parse keeps key stability and fail-closed guarantees simple at chat sizes.
  */
 @Composable
 internal fun ChatMarkdownView(

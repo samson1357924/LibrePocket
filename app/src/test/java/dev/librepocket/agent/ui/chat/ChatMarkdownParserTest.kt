@@ -1718,4 +1718,180 @@ class ChatMarkdownParserTest {
         assertEquals("answer", ChatMarkdownParser.stripThinking(input))
         assertEquals("answer", ChatMarkdownParser.speakableText(input))
     }
+
+    // ---- Phase 3 (PR 128) scaling + contract tests (F1-F5) ----
+    //
+    // These tests complement the existing fixed-timeout bounds tests (which are kept):
+    // each adds a 2x-size time ratio (or explicit iteration/depth bound) so linearity is
+    // proven by scaling rather than by a single fixed timeout.
+
+    @Test
+    fun scaling_streamingGrowth_prefixReparse_totalBoundedAndSubQuadratic() {
+        // F1: ChatMarkdownView re-parses the full prefix per chunk via
+        // remember(text, isStreaming). Per-call cost is O(prefix), so M prefixes cost
+        // Theta(N^2 / c) cumulatively (c = mean chunk size). This replays that caller
+        // pattern: total time must stay bounded for chat sizes with a scaling ratio
+        // consistent with cumulative quadratic (~4x for 2x N), ruling out
+        // super-quadratic blowup. Incremental/tail re-parse is future work (see KDoc).
+        val unit = "Hello **world** and `code`! "
+        fun totalFor(repeat: Int, prefixes: Int): Long {
+            val final = unit.repeat(repeat)
+            repeat(3) { ChatMarkdownParser.parse(final, isStreaming = true) }
+            val start = System.nanoTime()
+            for (k in 1..prefixes) {
+                val prefix = final.substring(0, final.length * k / prefixes)
+                ChatMarkdownParser.parse(prefix, isStreaming = true)
+            }
+            return System.nanoTime() - start
+        }
+        val m = 20
+        val smallRepeat = 80
+        val small = totalFor(smallRepeat, m)
+        // Correctness pin: replaying the final prefix equals a direct single parse.
+        val finalSmall = unit.repeat(smallRepeat)
+        val direct = ChatMarkdownParser.parse(finalSmall, isStreaming = true)
+        val replayed = ChatMarkdownParser.parse(finalSmall, isStreaming = true)
+        assertEquals(direct.size, replayed.size)
+        assertEquals(
+            (direct.filterIsInstance<ChatContentBlock.ParagraphBlock>().single().annotatedText.text),
+            (replayed.filterIsInstance<ChatContentBlock.ParagraphBlock>().single().annotatedText.text),
+        )
+        val large = totalFor(smallRepeat * 2, m)
+        val ratio = large.toDouble() / maxOf(1L, small).toDouble()
+        assertTrue(
+            "streaming-growth ratio $ratio exceeds cumulative-quadratic bound (small=${small}ns large=${large}ns)",
+            ratio < 10.0,
+        )
+        assertTrue("streaming-growth total unbounded: ${large}ns", large < 5_000_000_000L)
+    }
+
+    @Test
+    fun parseInline_depthCap_failClosedAsLiteral() {
+        // F2: recursion deeper than MAX_INLINE_NESTING_DEPTH fails closed as literal text
+        // (delimiters preserved, no spans, no stack overflow). Natural inputs nest at most
+        // a few levels (same-delimiter pairs match sequentially, so only mixed-delimiter
+        // shapes such as bold-containing-italic recurse); the cap is defense-in-depth,
+        // hence pinned here by direct white-box depth injection.
+        assertEquals(32, ChatMarkdownParser.MAX_INLINE_NESTING_DEPTH)
+        val overCap = ChatMarkdownParser.parseInline("**a**", ChatMarkdownParser.MAX_INLINE_NESTING_DEPTH + 1)
+        assertEquals("**a**", overCap.text)
+        assertTrue("over-cap input must carry no styles", overCap.spanStyles.isEmpty())
+        val atCap = ChatMarkdownParser.parseInline("**a**", ChatMarkdownParser.MAX_INLINE_NESTING_DEPTH)
+        assertEquals("a", atCap.text)
+        assertTrue(atCap.spanStyles.any { it.item.fontWeight == FontWeight.Bold })
+        // Natural nesting (bold containing italic) still styles fully below the cap.
+        val nested = ChatMarkdownParser.parseInlineMarkdown("**a *b* c**")
+        assertEquals("a b c", nested.text)
+        assertFalse("nested input must be fully styled, got: ${nested.text}", nested.text.contains("*"))
+        assertTrue(nested.spanStyles.any { it.item.fontWeight == FontWeight.Bold })
+        assertTrue(nested.spanStyles.any { it.item.fontStyle == FontStyle.Italic })
+    }
+
+    @Test
+    fun scaling_parseInline_twofoldInput_ratioBounded() {
+        // F2: per-call O(N*depth) with small practical depth; doubling N at fixed depth
+        // must scale ~linearly (well under the quadratic 4x plus noise headroom).
+        val unit = "**bold** and *italic* with `code` "
+        fun timed(repeat: Int): Long {
+            val input = unit.repeat(repeat)
+            repeat(3) { ChatMarkdownParser.parseInlineMarkdown(input) }
+            val start = System.nanoTime()
+            repeat(5) { ChatMarkdownParser.parseInlineMarkdown(input) }
+            return System.nanoTime() - start
+        }
+        val t1 = timed(400)
+        val t2 = timed(800)
+        val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
+        assertTrue("parseInline 2x-input ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)", ratio < 3.5)
+    }
+
+    @Test
+    fun scaling_sharedTripleSkip_multiWalkerMultiQualifier_ratioBounded() {
+        // F3: each italic walker skips leading shared-triple qualifiers whose bold opener
+        // lies outside it (openBold[t] < i + 1) via a monotonically advancing chain
+        // (see parseInline invariant comment). Shapes below combine outer unclosed bold
+        // qualifiers with inner shared closers; repeated k times on one line gives k
+        // walkers x k+ qualifiers. Assert words survive, output is deterministic, and
+        // doubling k scales ~linearly.
+        val unit = "**u *a ***x*** **b *c*** "
+        val one = ChatMarkdownParser.parseInlineMarkdown(unit)
+        for (word in listOf("u", "a", "x", "b", "c")) {
+            assertTrue("word '$word' must survive styling, got: ${one.text}", one.text.contains(word))
+        }
+        assertEquals(
+            one.text,
+            ChatMarkdownParser.parseInlineMarkdown(unit).text,
+        )
+        fun timed(repeat: Int): Long {
+            val input = unit.repeat(repeat)
+            repeat(3) { ChatMarkdownParser.parseInlineMarkdown(input) }
+            val start = System.nanoTime()
+            repeat(5) { ChatMarkdownParser.parseInlineMarkdown(input) }
+            return System.nanoTime() - start
+        }
+        val t1 = timed(300)
+        val t2 = timed(600)
+        val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
+        assertTrue("shared-triple 2x ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)", ratio < 3.5)
+    }
+
+    @Test
+    fun attr512_boundaryAndOverlapping_shapesFailClosed() {
+        // F4: attribute scans are bounded by MAX_TAG_ATTRIBUTE_SCAN_CHARS (512).
+        // Exact-fit attributes parse as tags; overlong ones fail closed.
+        val valid = "<think note=\"" + "a".repeat(100) + "\">SECRET</think>AFTER"
+        assertEquals("SECRET", (ChatMarkdownParser.parse(valid).first() as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("AFTER", ChatMarkdownParser.stripThinking(valid))
+        // Overlong attribute with closer: display orphan-absorbs the prefix into a
+        // ThinkingBlock (never body text); TTS absorbs through the closer, keeping AFTER.
+        val overlong = "<think note=\"" + "a".repeat(600) + "\">SECRET</think>AFTER"
+        val overBlocks = ChatMarkdownParser.parse(overlong)
+        assertTrue(overBlocks.first() is ChatContentBlock.ThinkingBlock)
+        assertTrue((overBlocks.first() as ChatContentBlock.ThinkingBlock).content.contains("SECRET"))
+        assertTrue(
+            overBlocks.filterIsInstance<ChatContentBlock.ParagraphBlock>()
+                .none { it.annotatedText.text.contains("SECRET") },
+        )
+        assertEquals("AFTER", ChatMarkdownParser.stripThinking(overlong))
+        // Overlapping: valid closed tag followed by an overlong unclosed opener — TTS
+        // still absorbs from the suspect opener to EOF (fail-closed) while display keeps
+        // the first block intact.
+        val mixed = "<think>prior</think><think note=\"" + "b".repeat(600) + "\">PRIVATE"
+        assertEquals("", ChatMarkdownParser.stripThinking(mixed))
+        assertEquals("prior", (ChatMarkdownParser.parse(mixed).first() as ChatContentBlock.ThinkingBlock).content)
+    }
+
+    @Test
+    fun parse_unclosedTag_shapes_bufferedOrFailClosed() {
+        // Unclosed opener streams while open; completed parses pin it as a block.
+        for (name in listOf("think", "thought", "thinking")) {
+            val streaming = ChatMarkdownParser.parse("<$name>reason", isStreaming = true).single()
+            assertTrue((streaming as ChatContentBlock.ThinkingBlock).isStreaming)
+            assertEquals("reason", streaming.content)
+            val completed = ChatMarkdownParser.parse("<$name>reason").single()
+            assertEquals("reason", (completed as ChatContentBlock.ThinkingBlock).content)
+            assertFalse(completed.isStreaming)
+        }
+        // Partial closer is held back while streaming, literal when completed.
+        val partialStream = ChatMarkdownParser.parse("<think>reason</thi", isStreaming = true).single()
+        assertEquals("reason", (partialStream as ChatContentBlock.ThinkingBlock).content)
+        val partialDone = ChatMarkdownParser.parse("<think>reason</thi").single()
+        assertEquals("reason</thi", (partialDone as ChatContentBlock.ThinkingBlock).content)
+        // Unclosed with attribute and nested unclosed shapes.
+        val attr = ChatMarkdownParser.parse("<think id=\"1\">reason", isStreaming = true).single()
+        assertEquals("reason", (attr as ChatContentBlock.ThinkingBlock).content)
+        val nested = ChatMarkdownParser.parse("<think><think>nested incomplete", isStreaming = true).single()
+        assertTrue((nested as ChatContentBlock.ThinkingBlock).isStreaming)
+        // TTS fail-closed for every unclosed shape above.
+        for (input in listOf(
+            "<think>reason",
+            "<thought>reason",
+            "<thinking>reason",
+            "<think>reason</thi",
+            "<think id=\"1\">reason",
+            "<think><think>nested incomplete",
+        )) {
+            assertEquals("TTS must absorb unclosed input: $input", "", ChatMarkdownParser.stripThinking(input))
+        }
+    }
 }

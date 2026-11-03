@@ -62,9 +62,23 @@ sealed interface ChatContentBlock {
 }
 
 /**
- * Robust, linear O(N) parser for thinking blocks (`<think>...</think>`),
+ * Robust parser for thinking blocks (`<think>...</think>`),
  * code blocks (```` ```lang ... ``` ````), and inline markdown (bold, italic, inline code, lists).
  * Strictly avoids backtracking regular expressions to ensure immunity against ReDoS attacks.
+ *
+ * Cost model (per single full-text call, N = `text.length`):
+ * - [segments], [stripThinking] and [verbalizeForTts] each traverse the input once with a
+ *   monotonically advancing cursor and no backtracking: O(N) per call, with O(N)-sized
+ *   transient index tables allocated per call and released afterwards.
+ * - [parseInline] costs O(N * depth) per call, where `depth` is the style-nesting depth;
+ *   nesting deeper than [MAX_INLINE_NESTING_DEPTH] fails closed as literal text (see below).
+ * - Tag attribute scans are bounded by [MAX_TAG_ATTRIBUTE_SCAN_CHARS] (512) per candidate tag,
+ *   so overlong/malformed attributes fail closed in constant time.
+ * - Streaming callers (see `ChatMarkdownView`) re-parse the full prefix on every chunk:
+ *   M chunks of mean size N/2 cost Theta(N^2 / c) cumulatively for chunk size c. That
+ *   cumulative cost is a caller-level contract, not a per-call regression. Incremental or
+ *   tail-segment re-parsing is explicitly future work (not implemented; scope too large
+ *   for this change) and is tracked as a follow-up, not claimed here.
  *
  * ### Core Invariants
  *
@@ -79,7 +93,7 @@ sealed interface ChatContentBlock {
  *
  * 2. **Streaming Cursor Mutual Exclusion (串流游標互斥與單調推進)**:
  *    - The parser progresses text linearly through a monotonically advancing cursor (`cursor++` or segment skips)
- *      with zero backtracking, guaranteeing strict O(N) runtime.
+ *      with zero backtracking: O(N) per single full-text call (see cost model above).
  *    - At each cursor position, candidate token constructs mutually exclude each other: an indented code line,
  *      a thinking tag opener/closer, a fenced code block opener, an inline backtick run, or plain text.
  *    - During streaming (`isStreaming = true`), trailing partial tag prefixes (e.g. `<think`, `</think`)
@@ -104,7 +118,8 @@ sealed interface ChatContentBlock {
  *    - A lone orphan closer absorbs only a pure-text prefix; a fenced/indented code block before it
  *      disables orphan absorption on both paths (display records a CODE segment, TTS sets [seenCodeBlock]),
  *      so code is never swallowed and the stray closer stays literal.
- *    - This guarantees strict O(N) linear time with zero quadratic allocation or substring rebuilding overhead.
+ *    - This runs in O(N) per single full-text call with linear transient tables
+ *      (no quadratic allocation or substring rebuilding across the scan).
  */
 object ChatMarkdownParser {
 
@@ -122,6 +137,14 @@ object ChatMarkdownParser {
 
     /** Maximum spaces of indentation allowed before a fenced code block opener per CommonMark. */
     private const val MAX_FENCE_INDENT_SPACES = 3
+
+    /**
+     * Maximum inline style nesting depth accepted by [parseInline].
+     * Content nested deeper fails closed as literal text (delimiters preserved, no crash):
+     * each nesting level re-scans its own span, so worst-case cost is O(N * depth) per
+     * full-text call with depth <= this bound (practical chat inputs nest far shallower).
+     */
+    internal const val MAX_INLINE_NESTING_DEPTH = 32
 
     /** Standard column width for tabs and indented code blocks per CommonMark. */
     private const val INDENT_CODE_COLUMNS = 4L
@@ -531,7 +554,9 @@ object ChatMarkdownParser {
     }
 
     /**
-     * Splits raw input text into non-overlapping, sequential [Segment] records in linear O(N) time.
+     * Splits raw input text into non-overlapping, sequential [Segment] records.
+     * Runs in O(N) per single full-text call (N = `text.length`); streaming callers
+     * re-invoke per chunk so cumulative streaming cost is Theta(N^2 / c) (see class KDoc).
      *
      * Invariants enforced:
      * - Monotonic cursor progression: cursor advances strictly forward with no backtracking.
@@ -846,8 +871,10 @@ object ChatMarkdownParser {
      *   the key (e.g. `think_streaming_0` → `think_c_<hex>`); Compose recreates the node,
      *   which resets transient UI such as horizontal scroll — accepted P3 limitation.
      *
-     * Segmentation itself advances a monotonic cursor with no backtracking (linear in input
-     * length); key derivation hashes each block once (linear in total block content).
+     * Segmentation itself advances a monotonic cursor with no backtracking (O(N) per
+     * single full-text call); key derivation hashes each block once (linear in total
+     * block content). Streaming callers re-parse the full prefix per chunk, so M growth
+     * steps cost Theta(N^2 / c) cumulatively — incremental re-parsing is future work.
      *
      * @param text The complete raw text of the message turn received so far.
      * @param isStreaming Whether generation is actively ongoing. When true, unclosed blocks
@@ -1060,7 +1087,7 @@ object ChatMarkdownParser {
      *   a fenced/indented code block was skipped ([seenCodeBlock]): the display path records a CODE segment
      *   there and likewise skips orphan absorption, so code survives on both paths and the stray closer
      *   stays literal. A stray closer that matches neither rule is kept literal (display renders it as text).
-     * - Linear Time O(N): The text is traversed linearly, and each character is processed at most a bounded
+     * - Linear Time per single full-text call O(N): The text is traversed linearly, and each character is processed at most a bounded
      *   number of times without string rebuilding until the final interval subtraction phase.
      */
     /**
@@ -1402,7 +1429,8 @@ object ChatMarkdownParser {
      *
      * Deliberate scope limits (pinned by test): emphasis markers (`*`, `**`), headings, list
      * bullets and links are left verbatim — the verbalizer removes TTS noise from code/tool
-     * syntax only and never rewrites prose. Runs in O(N) with no backtracking expressions.
+     * syntax only and never rewrites prose. Runs in O(N) per single full-text call
+     * with no backtracking expressions.
      */
     fun speakableText(text: String): String = verbalizeForTts(stripThinking(text))
 
@@ -1552,7 +1580,37 @@ object ChatMarkdownParser {
     fun parseInlineMarkdown(rawText: String): AnnotatedString = parseInline(formatLists(rawText))
 
     /**
-     * Parses inline markdown styles (inline code, bold, italic, bold+italic) into an [AnnotatedString] in linear O(N) time.
+     * Single-pass equivalent of `!text.substring(start, end).contains('\n') && isNotBlank()`
+     * over the `[start, end)` range: one scan, zero allocation. Returns false for empty
+     * ranges and for any range containing `'\n'`; otherwise true iff some char is
+     * non-whitespace. Callers only allocate the candidate substring after this passes.
+     */
+    private fun isSingleLineNonBlankRange(text: String, start: Int, end: Int): Boolean {
+        if (start >= end) return false
+        var hasNonBlank = false
+        for (k in start until end) {
+            val ch = text[k]
+            if (ch == '\n') return false
+            if (!ch.isWhitespace()) hasNonBlank = true
+        }
+        return hasNonBlank
+    }
+
+    /**
+     * Parses inline markdown styles (inline code, bold, italic, bold+italic) into an [AnnotatedString].
+     * Costs O(N * depth) per single full-text call (N = `text.length`, `depth` = style-nesting
+     * depth): each nesting level re-scans only its own span via the precomputed tables below.
+     * Nesting deeper than [MAX_INLINE_NESTING_DEPTH] fails closed as literal text (delimiters
+     * preserved) to bound worst-case cost and stack use; practical chat inputs nest far shallower.
+     * Transient per-call tables (~10 O(N) Int/Boolean arrays) are freed on return; tag-attribute
+     * scans elsewhere stay bounded by [MAX_TAG_ATTRIBUTE_SCAN_CHARS].
+     *
+     * Visible `internal` (module-only) for white-box depth-cap testing; production
+     * callers ([parse], [parseInlineMarkdown]) always enter at `depth = 0`.
+     *
+     * Single-line guard: the `!contains('\n') && isNotBlank()` shape is evaluated as one
+     * range scan ([isSingleLineNonBlankRange]) without allocating the candidate substring
+     * first, so rejected (unmatched/multi-line) spans cost one pass and zero copies.
      *
      * Invariants enforced:
      * - Delimiter Precedence: Inline code spans (`` ` `` or ```` `` ````) take absolute precedence over asterisk styles.
@@ -1562,7 +1620,13 @@ object ChatMarkdownParser {
      * - Shared Triple Closer Disambiguation: Precomputed lookup arrays (`nextDouble`, `nextTriple`, `openBold`, `openItalic`)
      *   resolve ambiguous closures (such as `**bold *italic***`) in O(1) without exponential backtracking.
      */
-    private fun parseInline(text: String): AnnotatedString {
+    internal fun parseInline(text: String, depth: Int = 0): AnnotatedString {
+        if (depth > MAX_INLINE_NESTING_DEPTH) {
+            // Fail-closed depth bound (F2): over-nested styles render literally so
+            // adversarial "***...**...*" nesting cannot blow stack or cost O(N*depth)
+            // without bound. Shallow practical inputs never reach this branch.
+            return AnnotatedString(text)
+        }
         val builder = AnnotatedString.Builder()
         var i = 0
         val len = text.length
@@ -1712,10 +1776,9 @@ object ChatMarkdownParser {
                 val close = nextTriple[i + 3]
                 if (close != -1 && !text[close - 1].isWhitespace() &&
                     (nextNewline[i] == -1 || nextNewline[i] > close)) {
-                    val content = text.substring(i + 3, close)
-                    if (!content.contains('\n') && content.isNotBlank()) {
+                    if (isSingleLineNonBlankRange(text, i + 3, close)) {
                         val start = builder.length
-                        builder.append(parseInline(content))
+                        builder.append(parseInline(text.substring(i + 3, close), depth + 1))
                         builder.addStyle(
                             SpanStyle(
                                 fontWeight = FontWeight.Bold,
@@ -1747,10 +1810,9 @@ object ChatMarkdownParser {
                 }
                 if (close != -1 && !text[close - 1].isWhitespace() &&
                     (nextNewline[i] == -1 || nextNewline[i] > close)) {
-                    val content = text.substring(i + 2, close)
-                    if (!content.contains('\n') && content.isNotBlank()) {
+                    if (isSingleLineNonBlankRange(text, i + 2, close)) {
                         val start = builder.length
-                        builder.append(parseInline(content))
+                        builder.append(parseInline(text.substring(i + 2, close), depth + 1))
                         builder.addStyle(
                             SpanStyle(fontWeight = FontWeight.Bold),
                             start,
@@ -1790,6 +1852,16 @@ object ChatMarkdownParser {
 
                 if (close == -1) {
                     val s = nextSingleCloser[i + 1]
+                    // Shared-triple skip invariant (F3): nextSharedTriple[p] is non-(-1) only
+                    // when a "***" run at p is preceded by non-whitespace AND has a live
+                    // "**" opener (openBold[p] >= 0). For the current italic opener at i,
+                    // only triples opened strictly inside it (openBold[t] >= i + 1) may
+                    // donate their last two stars as the italic closer (t + 2). Earlier
+                    // triples (openBold[t] < i + 1) belong to an outer/previous bold span
+                    // and must be skipped via the precomputed chain; each link advances
+                    // by >= 3 chars, so the walk terminates within the line. Multiple
+                    // italic walkers on one line each re-walk from their own i + 1, and
+                    // multiple triple qualifiers chain monotonically (t strictly grows).
                     var t = nextSharedTriple[i + 1]
                     while (t in (i + 1) until lineEnd && openBold[t] < i + 1) {
                         t = nextSharedTriple[t + 3]
@@ -1806,10 +1878,9 @@ object ChatMarkdownParser {
                 }
                 if (close != -1 && !text[close - 1].isWhitespace() &&
                     (nextNewline[i] == -1 || nextNewline[i] > close)) {
-                    val content = text.substring(i + 1, close)
-                    if (!content.contains('\n') && content.isNotBlank()) {
+                    if (isSingleLineNonBlankRange(text, i + 1, close)) {
                         val start = builder.length
-                        builder.append(parseInline(content))
+                        builder.append(parseInline(text.substring(i + 1, close), depth + 1))
                         builder.addStyle(
                             SpanStyle(fontStyle = FontStyle.Italic),
                             start,

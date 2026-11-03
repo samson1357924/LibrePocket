@@ -23,6 +23,7 @@ import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -40,6 +41,11 @@ interface AudioPlayer {
     /**
      * 受限記憶體緩衝播放位元組，掛起直到播放結束或發生例外。
      *
+     * 零拷貝契約（RequiresNoMutation 語義）：
+     * 實作得以零拷貝引用 [audioBytes]（不 clone），以降低峰值記憶體。
+     * 因此呼叫端在 play 返回或被取消前**絕對不可修改**該陣列內容；
+     * 若違反，播放讀取結果未定義。測試以 copyFalse 釘選此語義。
+     *
      * @param audioBytes 記憶體中的音訊二進位資料。
      */
     suspend fun play(audioBytes: ByteArray)
@@ -53,7 +59,12 @@ interface AudioPlayer {
 /**
  * Android [MediaDataSource] 受限記憶體實作。
  * 直接自 [data] ByteArray 進行受限記憶體區塊讀取（bounded in-memory read），保證音訊位元組永不落地（零檔案系統 I/O）。
- * 注意：內部持有 [data] 的防禦性副本（defensive copy clone），以防外部修改；此處會額外佔用一份 ByteArray 拷貝。
+ * 注意：預設以 `copy = true` 持有 [data] 的防禦性副本（defensive copy clone），以防外部修改；此處會額外佔用一份 ByteArray 拷貝。
+ * 若以 `copy = false` 建構則不建立防禦性副本，直接引用傳入陣列；此為零拷貝路徑（RequiresNoMutation 語義，
+ * 刻意保留 copy=false 以降低峰值記憶體，見 `byteArrayMediaDataSource_copyFalseDoesNotCloneArray` 釘選測試）。
+ * 此路徑依賴傳入 array 在播放期間不可修改，
+ * 呼叫端必須保證播放完成前不寫入該陣列，否則讀取結果未定義（[AndroidAudioPlayer.play] 即採用此路徑以避免額外拷貝，
+ * 其傳入的 `result.audioBytes` 由 client 全新配置，天然滿足不可變契約）。
  */
 class ByteArrayMediaDataSource(
     data: ByteArray,
@@ -87,55 +98,131 @@ class ByteArrayMediaDataSource(
 
 /**
  * Android 生產環境預設播放器，利用 [MediaPlayer] 搭配 [ByteArrayMediaDataSource] 達成受限記憶體緩衝播放。
- * 內部對 [MediaPlayer] 採用無鎖釋放與世代安全架構，嚴格禁止在持有 Java 鎖期間呼叫 MediaPlayer 的 native 阻塞方法，
- * 徹底解除 AB-BA 死鎖，且 [stop] 能可靠停止所有進行中的播放。
+ * 併發與生命週期保證（世代柵欄 + 非阻塞釋放）：
+ * - 僅以 [lock] 保護狀態（activePlayer/activeDataSource/activeContinuation/activeEpoch），絕不在持有任何 Java monitor
+ *   時呼叫 MediaPlayer native 阻塞方法（setDataSource/prepareAsync/start/reset/release），避免 AB-BA 死鎖；
+ * - 每次 play 以遞增世代（epoch）佔位，native 前後皆以世代柵欄複檢，失格即釋放並取消，遲到回呼永不 start；
+ * - [stop] 僅做 detach + cancel（持 [lock] 短臨界），native reset/release 投遞至背景釋放執行緒，呼叫線程永不被 native 阻塞；
+ * - prepare 另設 [PREPARE_TIMEOUT_MS] 超時，逾時即 detach + 釋放 + resumeWithException。
  *
- * 採用 [MediaPlayer.prepareAsync] 非同步準備，在鎖外執行非同步準備與 native 呼叫，確保 [stop] 與新播放能隨時即時中斷。
+ * 採用 [MediaPlayer.prepareAsync] 非同步準備，所有 native 呼叫皆在鎖外執行，確保 [stop] 與新播放能隨時即時中斷。
  */
 class AndroidAudioPlayer(
     private val mediaPlayerFactory: () -> MediaPlayer = { MediaPlayer() },
 ) : AudioPlayer {
+    companion object {
+        /** prepare 非同步等待上限（毫秒），逾時視為播放失敗並主動釋放。 */
+        const val PREPARE_TIMEOUT_MS = 15_000L
+    }
+
     private var activePlayer: MediaPlayer? = null
     private var activeDataSource: ByteArrayMediaDataSource? = null
     private var activeContinuation: CancellableContinuation<Unit>? = null
+    private var activeEpoch: Long = 0L
+    private var sessionEpoch: Long = 0L
     private val lock = Any()
+
+    private val releaseExecutor: java.util.concurrent.ExecutorService =
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "AndroidAudioPlayer-release").apply { isDaemon = true }
+        }
+    private val timeoutScheduler: java.util.concurrent.ScheduledExecutorService =
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "AndroidAudioPlayer-timeout").apply { isDaemon = true }
+        }
+
+    // prepare 超時任務追蹤：epoch -> ScheduledFuture，避免完成後仍持有 player+continuation 15s。
+    // 終端路徑（completion/error/start 異常/stop/detach 成功）一律 cancel(false)。
+    private val timeoutFutures = java.util.concurrent.ConcurrentHashMap<Long, java.util.concurrent.ScheduledFuture<*>>()
+
+    private fun cancelTimeout(epoch: Long) {
+        try {
+            timeoutFutures.remove(epoch)?.cancel(false)
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 釋放內部背景執行緒池（release + timeout）。
+     * 兩池皆為 daemon 線程，不關閉亦不會阻塞 JVM/測試結束；但長期持有（每實例兩池）
+     * 會在大量測試中累積閒置線程，故提供顯式關閉。呼叫後新的 releaseAsync 會退回同步釋放。
+     */
+    fun release() {
+        // Orderly shutdown：先丟棄 pending prepare 超時（stop 已 cancel 對應 epoch，丟棄無洩漏），
+        // 再 orderly 關閉 release 池，確保 shutdown 前由 stop() enqueue 的 releaseAsync 不被丟棄。
+        // 切勿對 releaseExecutor 用 shutdownNow：會丟棄佇列中剛 enqueue 的 native reset/release 造成洩漏。
+        try {
+            timeoutScheduler.shutdownNow()
+        } catch (_: Throwable) {
+        }
+        try {
+            releaseExecutor.shutdown()
+        } catch (_: Throwable) {
+        }
+        try {
+            releaseExecutor.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** [release] 的別名，供 try-with-resources / Closeable 語義使用。 */
+    fun close() = release()
 
     private data class DetachedSession(
         val player: MediaPlayer?,
         val dataSource: ByteArrayMediaDataSource?,
         val continuation: CancellableContinuation<Unit>?,
+        val epoch: Long,
     )
 
-    private fun detachIfActiveLocked(player: MediaPlayer): DetachedSession? {
-        if (activePlayer === player) {
+    private fun detachIfActiveLocked(player: MediaPlayer, epoch: Long): DetachedSession? {
+        if (activePlayer === player && activeEpoch == epoch) {
             val p = activePlayer
             val ds = activeDataSource
             val cont = activeContinuation
+            val ep = activeEpoch
             activePlayer = null
             activeDataSource = null
             activeContinuation = null
-            return DetachedSession(p, ds, cont)
+            return DetachedSession(p, ds, cont, ep)
         }
         return null
     }
 
+    private fun detachAnyLocked(): DetachedSession {
+        val p = activePlayer
+        val ds = activeDataSource
+        val cont = activeContinuation
+        val ep = activeEpoch
+        activePlayer = null
+        activeDataSource = null
+        activeContinuation = null
+        return DetachedSession(p, ds, cont, ep)
+    }
+
+    // 注意：此函式絕對不可在 synchronized(lock) 或 synchronized(player) 內呼叫，
+    // 所有 native（listener 清除/reset/release）皆在鎖外執行，避免阻塞持有鎖的 stop()/play()。
     private fun safelyReleasePlayer(player: MediaPlayer?, dataSource: ByteArrayMediaDataSource?) {
         if (player != null) {
-            synchronized(player) {
-                try {
-                    player.setOnPreparedListener(null)
-                    player.setOnCompletionListener(null)
-                    player.setOnErrorListener(null)
-                } catch (_: Throwable) {
-                }
-                try {
-                    player.reset()
-                } catch (_: Throwable) {
-                }
-                try {
-                    player.release()
-                } catch (_: Throwable) {
-                }
+            try {
+                player.setOnPreparedListener(null)
+            } catch (_: Throwable) {
+            }
+            try {
+                player.setOnCompletionListener(null)
+            } catch (_: Throwable) {
+            }
+            try {
+                player.setOnErrorListener(null)
+            } catch (_: Throwable) {
+            }
+            try {
+                player.reset()
+            } catch (_: Throwable) {
+            }
+            try {
+                player.release()
+            } catch (_: Throwable) {
             }
         }
         if (dataSource != null) {
@@ -146,161 +233,310 @@ class AndroidAudioPlayer(
         }
     }
 
+    private fun releaseAsync(detached: DetachedSession) {
+        if (detached.player == null && detached.dataSource == null) return
+        try {
+            releaseExecutor.execute {
+                safelyReleasePlayer(detached.player, detached.dataSource)
+            }
+        } catch (_: Throwable) {
+            // 執行緒池已關閉等極端情況，退回同步釋放，避免洩漏
+            safelyReleasePlayer(detached.player, detached.dataSource)
+        }
+    }
+
+    private fun tryResumeUnit(cont: CancellableContinuation<Unit>) {
+        try {
+            cont.resume(Unit)
+        } catch (_: IllegalStateException) {
+            // TOCTOU：已被 resume/cancel，忽略
+        } catch (_: CancellationException) {
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun tryResumeException(cont: CancellableContinuation<Unit>, e: Throwable) {
+        try {
+            cont.resumeWithException(e)
+        } catch (_: IllegalStateException) {
+            // TOCTOU：已被 resume/cancel，忽略
+        } catch (_: CancellationException) {
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun tryCancel(cont: CancellableContinuation<Unit>?, message: String) {
+        if (cont == null) return
+        try {
+            cont.cancel(CancellationException(message))
+        } catch (_: Throwable) {
+        }
+    }
+
     override suspend fun play(audioBytes: ByteArray): Unit = suspendCancellableCoroutine { continuation ->
         if (!continuation.isActive) return@suspendCancellableCoroutine
 
         val player = try {
             mediaPlayerFactory()
         } catch (e: Throwable) {
-            if (continuation.isActive) {
-                continuation.resumeWithException(e)
-            }
+            tryResumeException(continuation, e)
             return@suspendCancellableCoroutine
         }
         val dataSource = try {
+            // copy=false：零拷貝路徑，避免額外 ByteArray 拷貝（記憶體考量）。
+            // RequiresNoMutation 語義：傳入 array 在播放期間不可被呼叫端修改，
+            // 否則讀取結果未定義。result.audioBytes 由 client 全新配置，滿足此契約。
+            // 詳見 ByteArrayMediaDataSource KDoc 與 copyFalse 釘選測試。
             ByteArrayMediaDataSource(audioBytes, copy = false)
         } catch (e: Throwable) {
-            safelyReleasePlayer(player, null)
-            if (continuation.isActive) {
-                continuation.resumeWithException(e)
-            }
+            // resume 先行，釋放投背景，避免阻塞呼叫線程。
+            tryResumeException(continuation, e)
+            releaseAsync(DetachedSession(player, null, null, -1L))
             return@suspendCancellableCoroutine
         }
 
-        val oldDetached = synchronized(lock) {
+        val myEpoch: Long?
+        val oldDetached: DetachedSession?
+        synchronized(lock) {
             if (!continuation.isActive) {
-                return@synchronized null
+                myEpoch = null
+                oldDetached = null
+            } else {
+                sessionEpoch += 1
+                myEpoch = sessionEpoch
+                oldDetached = DetachedSession(activePlayer, activeDataSource, activeContinuation, activeEpoch)
+                activePlayer = player
+                activeDataSource = dataSource
+                activeContinuation = continuation
+                activeEpoch = myEpoch
             }
-            // 確保前一個播放器在啟動新播放器前正確釋放
-            val p = activePlayer
-            val ds = activeDataSource
-            val cont = activeContinuation
-            activePlayer = player
-            activeDataSource = dataSource
-            activeContinuation = continuation
-            DetachedSession(p, ds, cont)
         }
 
-        if (oldDetached == null) {
-            safelyReleasePlayer(player, dataSource)
+        if (myEpoch == null || oldDetached == null) {
+            // 進入鎖前已被取消：從未成為 active，直接釋放新建資源並主動取消，避免懸掛。
+            // resume 先行，釋放投背景。
+            tryCancel(continuation, "Audio play cancelled before claim (epoch pending)")
+            releaseAsync(DetachedSession(player, dataSource, null, -1L))
             return@suspendCancellableCoroutine
         }
+        val epoch: Long = myEpoch
 
-        safelyReleasePlayer(oldDetached.player, oldDetached.dataSource)
-        if (oldDetached.continuation?.isActive == true) {
-            oldDetached.continuation.cancel()
+        // 釋放被取代的舊世代：cancel 原因攜帶 epoch；native 釋放走背景執行緒，不阻塞新播放。
+        // 同時取消舊世代的 prepare 超時任務，避免其持有舊 player+continuation 15s。
+        if (oldDetached.player != null || oldDetached.continuation != null || oldDetached.dataSource != null) {
+            tryCancel(oldDetached.continuation, "Superseded by audio play epoch $epoch")
+            cancelTimeout(oldDetached.epoch)
+            releaseAsync(oldDetached)
         }
 
         continuation.invokeOnCancellation {
             val detached = synchronized(lock) {
-                detachIfActiveLocked(player)
+                detachIfActiveLocked(player, epoch)
             }
             if (detached != null) {
-                safelyReleasePlayer(detached.player, detached.dataSource)
+                cancelTimeout(epoch)
+                releaseAsync(detached)
             }
         }
 
-        try {
-            val proceeded = synchronized(player) {
-                val shouldProceed = synchronized(lock) {
-                    continuation.isActive && activePlayer === player
-                }
-                if (!shouldProceed) {
-                    false
-                } else {
-                    player.setDataSource(dataSource)
-                    player.setOnPreparedListener { mp ->
-                        val shouldStart = synchronized(lock) {
-                            activePlayer === player
-                        }
-                        if (!shouldStart) return@setOnPreparedListener
+        fun isStillActive(): Boolean =
+            synchronized(lock) { activePlayer === player && activeEpoch == epoch } && continuation.isActive
 
-                        var startException: Exception? = null
-                        try {
-                            synchronized(player) {
-                                val stillActive = synchronized(lock) {
-                                    activePlayer === player
-                                }
-                                if (stillActive) {
-                                    mp.start()
-                                }
-                            }
-                        } catch (e: Exception) {
-                            startException = e
-                        }
-
-                        if (startException != null) {
-                            val detached = synchronized(lock) {
-                                detachIfActiveLocked(player)
-                            }
-                            if (detached != null) {
-                                safelyReleasePlayer(detached.player, detached.dataSource)
-                                if (detached.continuation?.isActive == true) {
-                                    detached.continuation.resumeWithException(startException)
-                                }
-                            }
-                        }
-                    }
-                    player.setOnCompletionListener {
-                        val detached = synchronized(lock) {
-                            detachIfActiveLocked(player)
-                        }
-                        if (detached != null) {
-                            safelyReleasePlayer(detached.player, detached.dataSource)
-                            if (detached.continuation?.isActive == true) {
-                                detached.continuation.resume(Unit)
-                            }
-                        }
-                    }
-                    player.setOnErrorListener { _, what, extra ->
-                        val detached = synchronized(lock) {
-                            detachIfActiveLocked(player)
-                        }
-                        if (detached != null) {
-                            safelyReleasePlayer(detached.player, detached.dataSource)
-                            if (detached.continuation?.isActive == true) {
-                                detached.continuation.resumeWithException(
-                                    IOException("MediaPlayer 播放錯誤：what=$what, extra=$extra"),
-                                )
-                            }
-                        }
-                        true
-                    }
-                    // 使用非同步 prepareAsync，不阻塞當前執行緒與鎖，讓 stop() 能隨時即時獲得鎖並中斷
-                    player.prepareAsync()
-                    true
-                }
-            }
-            if (!proceeded) {
-                return@suspendCancellableCoroutine
-            }
-        } catch (e: Exception) {
+        // 世代柵欄：已失格（被 stop/新 play 取代）即主動釋放並取消，不依賴外部。
+        if (!isStillActive()) {
             val detached = synchronized(lock) {
-                detachIfActiveLocked(player)
+                detachIfActiveLocked(player, epoch)
             }
             if (detached != null) {
-                safelyReleasePlayer(detached.player, detached.dataSource)
+                tryCancel(continuation, "Audio play superseded before setDataSource (epoch $epoch)")
+                cancelTimeout(epoch)
+                releaseAsync(detached)
+            } else {
+                tryCancel(continuation, "Audio play superseded before setDataSource (epoch $epoch, detached)")
             }
-            if (continuation.isActive) {
-                continuation.resumeWithException(e)
+            return@suspendCancellableCoroutine
+        }
+
+        // native setDataSource：在鎖外執行，若被 stop 阻塞中，stop 僅 detach+cancel 不等待此處。
+        try {
+            player.setDataSource(dataSource)
+        } catch (e: Throwable) {
+            val detached = synchronized(lock) {
+                detachIfActiveLocked(player, epoch)
             }
+            if (detached != null) {
+                // resume 先行，釋放投背景，避免阻塞呼叫線程。
+                // setDataSource 失敗屬播放失敗（非取消），以原例外恢復，避免誤報 CANCELLED。
+                tryResumeException(continuation, e)
+                cancelTimeout(epoch)
+                releaseAsync(detached)
+            }
+            return@suspendCancellableCoroutine
+        }
+
+        if (!isStillActive()) {
+            val detached = synchronized(lock) {
+                detachIfActiveLocked(player, epoch)
+            }
+            if (detached != null) {
+                tryCancel(continuation, "Audio play superseded after setDataSource (epoch $epoch)")
+                cancelTimeout(epoch)
+                releaseAsync(detached)
+            } else {
+                tryCancel(continuation, "Audio play superseded after setDataSource (epoch $epoch, detached)")
+            }
+            return@suspendCancellableCoroutine
+        }
+
+        try {
+            player.setOnPreparedListener { mp ->
+                val shouldStart =
+                    synchronized(lock) { activePlayer === mp && activeEpoch == epoch } && continuation.isActive
+                if (!shouldStart) return@setOnPreparedListener
+
+                var startException: Exception? = null
+                try {
+                    // start 前再次柵欄確認，native 本身在鎖外執行
+                    val ok =
+                        synchronized(lock) { activePlayer === mp && activeEpoch == epoch } && continuation.isActive
+                    if (ok) {
+                        mp.start()
+                    }
+                } catch (e: Exception) {
+                    startException = e
+                }
+
+                if (startException != null) {
+                    val detached = synchronized(lock) {
+                        detachIfActiveLocked(mp, epoch)
+                    }
+                    if (detached != null) {
+                        // resume 先行，釋放投背景，避免在（可能為主線程的）回呼線程阻塞 native。
+                        tryResumeException(continuation, startException)
+                        cancelTimeout(epoch)
+                        releaseAsync(detached)
+                    }
+                }
+            }
+            player.setOnCompletionListener {
+                val detached = synchronized(lock) {
+                    detachIfActiveLocked(player, epoch)
+                }
+                if (detached != null) {
+                    // resume 先行，釋放投背景。
+                    tryResumeUnit(continuation)
+                    cancelTimeout(epoch)
+                    releaseAsync(detached)
+                }
+            }
+            player.setOnErrorListener { _, what, extra ->
+                val detached = synchronized(lock) {
+                    detachIfActiveLocked(player, epoch)
+                }
+                if (detached != null) {
+                    // resume 先行，釋放投背景。
+                    tryResumeException(
+                        continuation,
+                        IOException("MediaPlayer 播放錯誤：what=$what, extra=$extra (epoch $epoch)"),
+                    )
+                    cancelTimeout(epoch)
+                    releaseAsync(detached)
+                }
+                true
+            }
+        } catch (e: Throwable) {
+            val detached = synchronized(lock) {
+                detachIfActiveLocked(player, epoch)
+            }
+            if (detached != null) {
+                tryResumeException(continuation, e)
+                cancelTimeout(epoch)
+                releaseAsync(detached)
+            }
+            return@suspendCancellableCoroutine
+        }
+
+        if (!isStillActive()) {
+            val detached = synchronized(lock) {
+                detachIfActiveLocked(player, epoch)
+            }
+            if (detached != null) {
+                tryCancel(continuation, "Audio play superseded before prepareAsync (epoch $epoch)")
+                cancelTimeout(epoch)
+                releaseAsync(detached)
+            } else {
+                tryCancel(continuation, "Audio play superseded before prepareAsync (epoch $epoch, detached)")
+            }
+            return@suspendCancellableCoroutine
+        }
+
+        try {
+            // 非同步 prepareAsync 本身在鎖外呼叫，不阻塞鎖；stop 可隨時 detach。
+            player.prepareAsync()
+        } catch (e: Throwable) {
+            val detached = synchronized(lock) {
+                detachIfActiveLocked(player, epoch)
+            }
+            if (detached != null) {
+                tryResumeException(continuation, e)
+                cancelTimeout(epoch)
+                releaseAsync(detached)
+            }
+            return@suspendCancellableCoroutine
+        }
+
+        // prepare 超時守衛：逾時即 detach + 釋放 + resumeWithException，不永久懸掛。
+        // ScheduledFuture 保留於 timeoutFutures，終端路徑一律 cancel(false)，避免持有 player+continuation 15s。
+        try {
+            val future = timeoutScheduler.schedule({
+                val detached = synchronized(lock) {
+                    if (activePlayer === player && activeEpoch == epoch && continuation.isActive) {
+                        detachIfActiveLocked(player, epoch)
+                    } else {
+                        null
+                    }
+                }
+                if (detached != null) {
+                    timeoutFutures.remove(epoch)
+                    // resume 先行，釋放投背景。
+                    tryResumeException(
+                        continuation,
+                        java.util.concurrent.TimeoutException(
+                            "MediaPlayer prepare timed out after $PREPARE_TIMEOUT_MS ms (epoch $epoch)",
+                        ),
+                    )
+                    releaseAsync(detached)
+                } else {
+                    timeoutFutures.remove(epoch)
+                }
+            }, PREPARE_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+            // 僅當仍為 active 才保留，否則立即取消（已在排程期間被 stop/取代）。
+            val stillActive = synchronized(lock) { activePlayer === player && activeEpoch == epoch }
+            if (stillActive) {
+                timeoutFutures[epoch] = future
+            } else {
+                try {
+                    future.cancel(false)
+                } catch (_: Throwable) {
+                }
+            }
+        } catch (_: Throwable) {
+            // 排程失敗不影響播放主流程
         }
     }
 
     override fun stop() {
         val detached = synchronized(lock) {
-            val p = activePlayer
-            val ds = activeDataSource
-            val cont = activeContinuation
-            activePlayer = null
-            activeDataSource = null
-            activeContinuation = null
-            DetachedSession(p, ds, cont)
+            val d = detachAnyLocked()
+            // 遞增世代使進行中 play 的柵欄失效，遲到回呼永不 start
+            sessionEpoch += 1
+            activeEpoch = sessionEpoch
+            d
         }
-        safelyReleasePlayer(detached.player, detached.dataSource)
-        if (detached.continuation?.isActive == true) {
-            detached.continuation.cancel()
-        }
+        tryCancel(detached.continuation, "AndroidAudioPlayer stopped (epoch ${detached.epoch})")
+        cancelTimeout(detached.epoch)
+        // native 釋放在背景執行緒，呼叫線程僅做 detach+cancel，有界返回
+        releaseAsync(detached)
     }
 }
 
@@ -339,6 +575,15 @@ class OpenAiSpeechEngine(
     private val activeJobs = ConcurrentHashMap.newKeySet<Job>()
     private val speechEpoch = AtomicLong(0L)
     private val stopEpoch = AtomicLong(0L)
+    // 世代躍遷互斥：speechEpoch 遞增 + 舊工作快照/清除 + 新工作註冊必須在同一臨界區完成，
+    // 使僅有 winner 能取消舊世代，舊請求絕不取消新請求。stop() 亦使用同一鎖。
+    private val generationLock = Any()
+
+    /** 測試專用柵欄：在世代躍遷臨界區外、遞增 epoch 後回調，允許測試暫停舊請求以驗證 winner 語義。生產為 null。
+   * 僅測試使用，呼叫端必須自帶超時（例如 `CountDownLatch.await(5, SECONDS)`），且絕不在持有
+   * [generationLock] 時阻塞，以免卡住 [stop]。實作上柵欄已移出鎖外，stop 可隨時中斷。 */
+    @Volatile
+    internal var epochClaimBarrierForTest: ((Long) -> Unit)? = null
 
     companion object {
         /**
@@ -674,6 +919,13 @@ class OpenAiSpeechEngine(
     /**
      * 雲端語音合成並於受限記憶體緩衝中播放音訊（不寫入儲存空間，上限 25MB）。
      *
+     * 取消契約（統一）：
+     * 因新請求取代（superseded）或 [stop] 中斷而失格者，一律正常回傳 `Failed(DETAIL_CANCELLED)`，
+     * 不拋出 [CancellationException]；僅當呼叫端 parent Job 本身已被外部明確取消（scope cancel）
+     * 時，才重新拋出 [CancellationException]（標準結構化併發語義，優先於世代/stop 狀態）。
+     * 所有內部取消原因皆攜帶世代/原因（`Superseded by speech request epoch …` /
+     * `Speech synthesis stopped (epoch …)`），與 [AndroidAudioPlayer] 取消原因格式統一。
+     *
      * @param text 要合成的文字（送雲前會先執行 [VoiceTools.redactForCloud] 脫敏）。
      * @param vault 提供 OpenAI API 金鑰的 [KeyVault]（未傳則使用建構子注入者）。
      * @param voiceOutputOn 系統語音輸出開關狀態（預設 true）。
@@ -703,7 +955,12 @@ class OpenAiSpeechEngine(
         endpointStore: EndpointStore? = null,
         apiKeyOverrideOriginUrl: String? = null,
         allowTestLoopback: Boolean = this.allowTestLoopback,
-    ): SynthOutcome = withContext(Dispatchers.IO) {
+    ): SynthOutcome {
+        // 外層取消轉換：withContext 子 Job 被取代/stop 取消時，內層 return Failed 會被 withContext 覆寫為拋出，
+        // 故在呼叫端上下文統一轉換。結構化取消優先：只要呼叫端 parent Job 已取消，一律重拋
+        // CancellationException；僅 parent 未取消（內部取代/stop）才回 Failed(CANCELLED)。
+        try {
+            return withContext(Dispatchers.IO) {
         val preCheckStopEpoch = stopEpoch.get()
         val callerJob = coroutineContext[Job]
         if (callerJob?.isActive == false) {
@@ -773,30 +1030,58 @@ class OpenAiSpeechEngine(
             )
         }
 
-        // 前置檢查確認通過後，才遞增 speechEpoch 並取消舊工作
-        val callEpoch = speechEpoch.incrementAndGet()
-        val oldJob = activeJob.getAndSet(null)
-        val oldJobs = synchronized(activeJobs) {
-            val list = (activeJobs + listOfNotNull(oldJob)).distinct()
-            activeJobs.clear()
-            list
-        }
-        oldJobs.forEach { it.cancel(CancellationException("Superseded by speech request epoch $callEpoch")) }
-
+        // 前置檢查確認通過後，才在同一受控躍遷臨界區內決定 winner：遞增世代、快照舊工作並註冊新工作。
+        // 僅 winner 能取消舊世代；舊請求快照不含新工作，故絕不取消新請求。
+        // 測試柵欄刻意置於鎖外（僅測試用且呼叫端自帶超時），避免阻塞 stop()。
         val currentJob = coroutineContext[Job]
-        if (callEpoch != speechEpoch.get() || currentJob?.isActive == false) {
+        val callEpoch: Long
+        val jobsToCancel: List<Job>
+        val claimAborted: Boolean
+        synchronized(generationLock) {
+            if (stopEpoch.get() != preCheckStopEpoch || currentJob?.isActive == false) {
+                callEpoch = -1L
+                jobsToCancel = emptyList()
+                claimAborted = true
+            } else {
+                val epoch = speechEpoch.incrementAndGet()
+                val prevActive = activeJob.get()
+                val snapshot = (activeJobs.toList() + listOfNotNull(prevActive))
+                    .distinct()
+                    .filter { it !== currentJob }
+                activeJobs.clear()
+                if (currentJob != null) {
+                    activeJobs.add(currentJob)
+                    activeJob.set(currentJob)
+                } else {
+                    activeJob.set(null)
+                }
+                callEpoch = epoch
+                jobsToCancel = snapshot
+                claimAborted = false
+            }
+        }
+        // 測試專用柵欄：已移出 generationLock，避免持有鎖阻塞 stop/新請求。
+        // 僅測試注入且必須自帶超時；生產為 null。此處暫停舊 claim，讓新請求有機會成為 winner，
+        // 語義與鎖內暫停等價（舊 epoch 已佔位，新請求將遞增為更大 epoch 成為 winner）。
+        if (!claimAborted) {
+            try {
+                epochClaimBarrierForTest?.invoke(callEpoch)
+            } catch (_: Throwable) {
+            }
+        }
+        if (claimAborted) {
             return@withContext SynthOutcome.Failed(
                 detail = DETAIL_CANCELLED,
                 message = "語音合成已被中斷",
             )
         }
-        activeJob.set(currentJob)
-        if (currentJob != null) {
-            synchronized(activeJobs) {
-                if (callEpoch == speechEpoch.get() && currentJob.isActive) {
-                    activeJobs.add(currentJob)
-                }
-            }
+        jobsToCancel.forEach { it.cancel(CancellationException("Superseded by speech request epoch $callEpoch")) }
+
+        if (callEpoch != speechEpoch.get() || currentJob?.isActive == false) {
+            return@withContext SynthOutcome.Failed(
+                detail = DETAIL_CANCELLED,
+                message = "語音合成已被中斷",
+            )
         }
 
         try {
@@ -842,14 +1127,15 @@ class OpenAiSpeechEngine(
             }
 
             SynthOutcome.Ok
-        } catch (e: CancellationException) {
-            throw e
         } catch (e: OpenAiTtsException) {
             SynthOutcome.Failed(
                 detail = e.errorCode.name,
                 message = e.safeMessage,
             )
         } catch (e: Exception) {
+            // CancellationException 已由 Kotlin 協程單獨處理（見外層 catch），此處僅處理非取消失敗。
+            // 若上游拋出 CancellationException 子類但非取消語義，仍視為播放失敗，避免誤吞外部取消。
+            if (e is CancellationException) throw e
             SynthOutcome.Failed(
                 detail = DETAIL_PLAYBACK_ERROR,
                 message = "播放失敗：${Redactor.redactError(e.message ?: e.javaClass.simpleName)}",
@@ -857,26 +1143,63 @@ class OpenAiSpeechEngine(
         } finally {
             activeJob.compareAndSet(currentJob, null)
             if (currentJob != null) {
-                synchronized(activeJobs) {
+                synchronized(generationLock) {
                     activeJobs.remove(currentJob)
                 }
             }
+        }
+            }
+        } catch (e: CancellationException) {
+            // 統一取消契約（外層、呼叫端上下文）：結構化取消優先——
+            // 只要呼叫端 parent Job 已取消，一律重拋 CancellationException；
+            // 僅 parent 未取消（內部取代/stop/播放器內部取消）才回 Failed(CANCELLED)。
+            val callerCancelled = try {
+                currentCoroutineContext()[Job]?.isCancelled == true
+            } catch (_: Throwable) {
+                false
+            }
+            if (callerCancelled) throw e
+            // 世代失格（被取代/stop）或播放器內部取消：正常回傳，不拋出。
+            return SynthOutcome.Failed(
+                detail = DETAIL_CANCELLED,
+                message = "語音合成已被中斷",
+            )
         }
     }
 
     /**
      * 立即中斷播放並取消所有進行中的合成請求。
+     * 與 [synthesizeAndPlay] 的世代躍遷共用 [generationLock]，保證原子性。
      */
     fun stop() {
-        val currentStopEpoch = stopEpoch.incrementAndGet()
-        val currentSpeechEpoch = speechEpoch.incrementAndGet()
-        val oldJob = activeJob.getAndSet(null)
-        val jobs = synchronized(activeJobs) {
-            val list = (activeJobs + listOfNotNull(oldJob)).distinct()
+        val jobs: List<Job>
+        val currentSpeechEpoch: Long
+        synchronized(generationLock) {
+            stopEpoch.incrementAndGet()
+            currentSpeechEpoch = speechEpoch.incrementAndGet()
+            val oldJob = activeJob.getAndSet(null)
+            val snapshot = (activeJobs.toList() + listOfNotNull(oldJob)).distinct()
             activeJobs.clear()
-            list
+            jobs = snapshot
         }
         jobs.forEach { it.cancel(CancellationException("Speech synthesis stopped (epoch $currentSpeechEpoch)")) }
         player.stop()
+    }
+
+    /**
+     * 關閉引擎持有的播放器資源。
+     * 若底層 [player] 為 [AndroidAudioPlayer]，轉調其 `release()` 關閉內部
+     * release/timeout 背景池（兩池皆為 daemon，不關閉亦不阻塞 JVM 結束，但顯式關閉可避免測試累積閒置線程）。
+     * 非 AndroidAudioPlayer 實作則僅執行 [stop]。
+     */
+    fun shutdown() {
+        try {
+            player.stop()
+        } catch (_: Throwable) {
+        }
+        try {
+            (player as? AndroidAudioPlayer)?.release()
+        } catch (_: Throwable) {
+        }
     }
 }

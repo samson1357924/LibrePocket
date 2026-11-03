@@ -501,6 +501,7 @@ class OpenAiSpeechEngineTest {
         assertFalse(player.stopped)
         engine.stop()
         assertTrue(player.stopped)
+        engine.shutdown()
     }
 
     @Test
@@ -530,11 +531,15 @@ class OpenAiSpeechEngineTest {
         )
         val engine = OpenAiSpeechEngine(client = client, player = player, allowTestLoopback = true)
 
+        // 統一取消契約：內部 stop 中斷一律回傳 Failed(CANCELLED)，不拋出；僅外部明確取消才重拋。
+        val outcomeRef = java.util.concurrent.atomic.AtomicReference<OpenAiSpeechEngine.Companion.SynthOutcome?>()
         val job = launch(Dispatchers.IO) {
-            engine.synthesizeAndPlay(
-                text = "streaming test",
-                voiceOutputOn = true,
-                openAiTtsOn = true,
+            outcomeRef.set(
+                engine.synthesizeAndPlay(
+                    text = "streaming test",
+                    voiceOutputOn = true,
+                    openAiTtsOn = true,
+                ),
             )
         }
 
@@ -544,7 +549,9 @@ class OpenAiSpeechEngineTest {
         job.join()
 
         assertTrue(player.stopped)
-        assertTrue(job.isCancelled)
+        val outcome = outcomeRef.get()
+        assertTrue("Stopped playback must return Failed(CANCELLED), was: $outcome", outcome is OpenAiSpeechEngine.Companion.SynthOutcome.Failed && outcome.detail == OpenAiSpeechEngine.DETAIL_CANCELLED)
+        assertFalse("Unified contract: internal stop returns Failed, not CancellationException", job.isCancelled)
     }
 
     @Test
@@ -659,7 +666,11 @@ class OpenAiSpeechEngineTest {
     @Test
     fun androidAudioPlayer_stopWhenIdle_isSafe() {
         val player = AndroidAudioPlayer()
-        player.stop()
+        try {
+            player.stop()
+        } finally {
+            player.release()
+        }
     }
 
     // ---- 錯誤傳播測試 (401, 429, 網路異常, 播放異常) ----
@@ -782,6 +793,11 @@ class OpenAiSpeechEngineTest {
     }
 
     private open class TestMediaPlayer : MediaPlayer() {
+        // 注意：prepareAsync 為空實作（no-op），不會自動回調 prepared/completion；
+        // 測試必須手動觸發 preparedListener/errorListener/completionListener 來模擬 native 非同步回調。
+        // 此設計刻意用於驗證世代柵欄：遲到 onPrepared 永不 start（見 stopDuringAsyncPrepare），
+        // 而正常 onPrepared 會 start 並可經 completion 正常返回（見 preparedTriggersStartWhenActive，
+        // 此成功路徑證明 mock 具備判別力——若柵欄損壞，遲到回呼測試即會失敗）。
         @Volatile var prepareAsyncCalled = false
         @Volatile var startCalled = false
         @Volatile var stopCalled = false
@@ -1355,12 +1371,15 @@ class OpenAiSpeechEngineTest {
         )
         val engine = OpenAiSpeechEngine(client = client, player = player, allowTestLoopback = true)
 
-        // 發起第一個呼叫
+        // 發起第一個呼叫（統一取消契約：被取代者回傳 Failed(CANCELLED)，不拋出）
+        val outcome1Ref = java.util.concurrent.atomic.AtomicReference<OpenAiSpeechEngine.Companion.SynthOutcome?>()
         val job1 = launch(Dispatchers.IO) {
-            engine.synthesizeAndPlay(
-                text = "First request text",
-                voiceOutputOn = true,
-                openAiTtsOn = true,
+            outcome1Ref.set(
+                engine.synthesizeAndPlay(
+                    text = "First request text",
+                    voiceOutputOn = true,
+                    openAiTtsOn = true,
+                ),
             )
         }
 
@@ -1375,9 +1394,15 @@ class OpenAiSpeechEngineTest {
             openAiTtsOn = true,
         )
 
-        // 第一個呼叫應被立即取消，不必等待 3 秒延遲
+        // 第一個呼叫應被立即取代，不必等待 3 秒延遲：回傳 Failed(CANCELLED) 而非拋出
         job1.join()
-        assertTrue("First job must be cancelled by the second call", job1.isCancelled)
+        val outcome1 = outcome1Ref.get()
+        assertTrue(
+            "First call must return Failed(CANCELLED) when superseded, was: $outcome1",
+            outcome1 is OpenAiSpeechEngine.Companion.SynthOutcome.Failed &&
+                outcome1.detail == OpenAiSpeechEngine.DETAIL_CANCELLED,
+        )
+        assertFalse("Unified contract: superseded returns Failed, not CancellationException", job1.isCancelled)
 
         // 第二個呼叫應順利完成並播放音訊
         assertEquals(OpenAiSpeechEngine.Companion.SynthOutcome.Ok, outcome2)
@@ -1392,46 +1417,55 @@ class OpenAiSpeechEngineTest {
             throwOnPrepareAsync = IllegalStateException("MediaPlayer initialization failed: native codec error")
         }
         val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp })
+        try {
+            val exception = try {
+                player.play(byteArrayOf(0x01, 0x02))
+                null
+            } catch (e: Exception) {
+                e
+            }
 
-        val exception = try {
-            player.play(byteArrayOf(0x01, 0x02))
-            null
-        } catch (e: Exception) {
-            e
+            assertNotNull("Expected exception to be thrown", exception)
+            assertTrue("Exception must be IllegalStateException, was: $exception", exception is IllegalStateException)
+            assertFalse("Exception must NOT be CancellationException", exception is CancellationException)
+            awaitCondition(timeoutMs = 5000L) { testMp.releaseCalled }
+            assertTrue(testMp.releaseCalled)
+        } finally {
+            player.release()
         }
-
-        assertNotNull("Expected exception to be thrown", exception)
-        assertTrue("Exception must be IllegalStateException, was: $exception", exception is IllegalStateException)
-        assertFalse("Exception must NOT be CancellationException", exception is CancellationException)
-        assertTrue(testMp.releaseCalled)
     }
 
     @Test
     fun androidAudioPlayer_mediaPlayerOnErrorListener_resumesWithIoExceptionRatherThanCancel() = runBlocking {
         val testMp = TestMediaPlayer()
         val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp })
-
-        val job = async(Dispatchers.IO) {
-            try {
-                player.play(byteArrayOf(0x01, 0x02))
-                null
-            } catch (e: Exception) {
-                e
+        try {
+            val job = async(Dispatchers.IO) {
+                try {
+                    player.play(byteArrayOf(0x01, 0x02))
+                    null
+                } catch (e: Exception) {
+                    e
+                }
             }
+
+            // 等待 prepareAsync 被呼叫且 errorListener 被註冊
+            awaitCondition { testMp.errorListener != null }
+
+            // 觸發 MediaPlayer 錯誤回呼
+            testMp.errorListener!!.onError(testMp, 1, -1004)
+
+            val exception = job.await()
+            assertNotNull("Expected exception to be thrown", exception)
+            assertTrue("Exception must be IOException, was: $exception", exception is IOException)
+            assertFalse("Exception must NOT be CancellationException", exception is CancellationException)
+            assertTrue(exception!!.message!!.contains("what=1, extra=-1004"))
+            // error 路徑 resume 先行、釋放走背景，需等待終將釋放
+            awaitCondition(timeoutMs = 5000L) { testMp.releaseCalled }
+            assertTrue(testMp.releaseCalled)
+        } finally {
+            player.release()
         }
-
-        // 等待 prepareAsync 被呼叫且 errorListener 被註冊
-        awaitCondition { testMp.errorListener != null }
-
-        // 觸發 MediaPlayer 錯誤回呼
-        testMp.errorListener!!.onError(testMp, 1, -1004)
-
-        val exception = job.await()
-        assertNotNull("Expected exception to be thrown", exception)
-        assertTrue("Exception must be IOException, was: $exception", exception is IOException)
-        assertFalse("Exception must NOT be CancellationException", exception is CancellationException)
-        assertTrue(exception!!.message!!.contains("what=1, extra=-1004"))
-        assertTrue(testMp.releaseCalled)
     }
 
     @Test
@@ -1455,41 +1489,122 @@ class OpenAiSpeechEngineTest {
             allowTestLoopback = true,
         )
         val engine = OpenAiSpeechEngine(client = client, player = player, allowTestLoopback = true)
+        try {
+            val outcome = engine.synthesizeAndPlay(
+                text = "test player failing in prepareAsync",
+                voiceOutputOn = true,
+                openAiTtsOn = true,
+            )
 
-        val outcome = engine.synthesizeAndPlay(
-            text = "test player failing in prepareAsync",
-            voiceOutputOn = true,
-            openAiTtsOn = true,
-        )
-
-        assertTrue("Expected Failed outcome, was $outcome", outcome is OpenAiSpeechEngine.Companion.SynthOutcome.Failed)
-        val failed = outcome as OpenAiSpeechEngine.Companion.SynthOutcome.Failed
-        assertEquals(OpenAiSpeechEngine.DETAIL_PLAYBACK_ERROR, failed.detail)
-        assertTrue(failed.message.contains("Corrupt media audio track") || failed.message.contains("播放失敗"))
+            assertTrue("Expected Failed outcome, was $outcome", outcome is OpenAiSpeechEngine.Companion.SynthOutcome.Failed)
+            val failed = outcome as OpenAiSpeechEngine.Companion.SynthOutcome.Failed
+            assertEquals(OpenAiSpeechEngine.DETAIL_PLAYBACK_ERROR, failed.detail)
+            assertTrue(failed.message.contains("Corrupt media audio track") || failed.message.contains("播放失敗"))
+        } finally {
+            engine.shutdown()
+        }
     }
 
     @Test
     fun androidAudioPlayer_stopDuringAsyncPrepare_releasesPlayerAndCancelsWithoutDeadlock() = runBlocking {
         val testMp = TestMediaPlayer()
         val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp })
+        try {
+            val job = launch(Dispatchers.IO) {
+                player.play(byteArrayOf(0x01, 0x02))
+            }
 
-        val job = launch(Dispatchers.IO) {
-            player.play(byteArrayOf(0x01, 0x02))
+            // 等待 prepareAsync 被呼叫
+            awaitCondition { testMp.prepareAsyncCalled }
+
+            // 在準備中狀態立即呼叫 stop()
+            player.stop()
+
+            job.join()
+            assertTrue("Job must be cancelled by stop()", job.isCancelled)
+            // stop 的 native 釋放走背景執行緒，終將釋放
+            awaitCondition(timeoutMs = 5000L) { testMp.releaseCalled }
+            assertTrue("Player must be released on stop", testMp.releaseCalled)
+
+            // 若 onPrepared 於 stop 後遲到回呼，不可呼叫 start()
+            testMp.preparedListener?.onPrepared(testMp)
+            assertFalse("start() must not be called after stop()", testMp.startCalled)
+        } finally {
+            player.release()
         }
+    }
 
-        // 等待 prepareAsync 被呼叫
-        awaitCondition { testMp.prepareAsyncCalled }
+    @Test
+    fun androidAudioPlayer_preparedTriggersStartWhenActive_provesMockDiscrimination() = runBlocking {
+        // 成功路徑對照組：證明 TestMediaPlayer mock 具備判別力——正常 onPrepared 會 start，
+        // 若世代柵欄損壞，遲到回呼測試（stopDuringAsyncPrepare）即會失敗，而本測試保障 mock 本身可 start。
+        // prepareAsync 為空實作，需手動觸發 preparedListener 模擬 native 非同步回調。
+        val testMp = TestMediaPlayer()
+        val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp })
+        try {
+            val job = async(Dispatchers.IO) {
+                player.play(byteArrayOf(0x01, 0x02))
+            }
+            awaitCondition { testMp.preparedListener != null }
 
-        // 在準備中狀態立即呼叫 stop()
-        player.stop()
+            // 正常時序的 onPrepared（仍為 active）：必須 start
+            testMp.preparedListener!!.onPrepared(testMp)
+            awaitCondition { testMp.startCalled }
+            assertTrue("start() must be called for active onPrepared", testMp.startCalled)
 
-        job.join()
-        assertTrue("Job must be cancelled by stop()", job.isCancelled)
-        assertTrue("Player must be released on stop", testMp.releaseCalled)
+            // 模擬播放完成，play 應正常返回（非取消、非異常）
+            testMp.completionListener!!.onCompletion(testMp)
+            job.await()
+            assertTrue("Job must complete normally on completion", job.isCompleted && !job.isCancelled)
+            awaitCondition(timeoutMs = 5000L) { testMp.releaseCalled }
+            assertTrue("Player must be released after completion", testMp.releaseCalled)
+        } finally {
+            player.release()
+        }
+    }
 
-        // 若 onPrepared 於 stop 後遲到回呼，不可呼叫 start()
-        testMp.preparedListener?.onPrepared(testMp)
-        assertFalse("start() must not be called after stop()", testMp.startCalled)
+    @Test
+    fun byteArrayMediaDataSource_copyFalse_zeroCopyContract_passesSameReferenceWithoutClone() = runBlocking {
+        // RequiresNoMutation 契約釘選測試（對應 copy=false 保留決策，記憶體考量）：
+        // AndroidAudioPlayer.play 以 copy=false 建構 ByteArrayMediaDataSource，不做防禦性拷貝；
+        // 呼叫端在播放期間絕對不可修改原陣列，否則讀取結果未定義。
+        // 本測試擷取傳入 MediaDataSource 並驗證其直接引用原陣列（外部修改即時可見），釘死零拷貝語義。
+        var captured: android.media.MediaDataSource? = null
+        val testMp = object : TestMediaPlayer() {
+            override fun setDataSource(dataSource: android.media.MediaDataSource) {
+                captured = dataSource
+                super.setDataSource(dataSource)
+            }
+        }
+        val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp })
+        try {
+            val original = byteArrayOf(0x01, 0x02, 0x03)
+            val job = launch(Dispatchers.IO) {
+                try {
+                    player.play(original)
+                } catch (_: CancellationException) {
+                } catch (_: Exception) {
+                }
+            }
+            awaitCondition { captured != null }
+            val dataSource = captured!!
+            // 讀取初始值
+            val buf = ByteArray(1)
+            assertEquals(1, dataSource.readAt(0, buf, 0, 1))
+            assertEquals(0x01.toByte(), buf[0])
+            // 外部修改即時可見 = 證明未 clone（零拷貝）；同時警示呼叫端不可如此修改。
+            original[0] = 0x77
+            assertEquals(1, dataSource.readAt(0, buf, 0, 1))
+            assertEquals(
+                "copy=false must not clone: external mutation must be visible (RequiresNoMutation contract)",
+                0x77.toByte(),
+                buf[0],
+            )
+            player.stop()
+            job.join()
+        } finally {
+            player.release()
+        }
     }
 
     // ---- P1: 實際請求目標與金鑰來源綁定測試 (Reviewer finding 1) ----
@@ -2121,34 +2236,38 @@ class OpenAiSpeechEngineTest {
         val player = AndroidAudioPlayer(mediaPlayerFactory = {
             if (factoryCount++ == 0) activeMp else secondMp
         })
-
-        // 啟動第一個播放工作使其成為 activePlayer
-        val activeJob = launch(Dispatchers.IO) {
-            player.play(byteArrayOf(0x01, 0x02))
-        }
-        awaitCondition { activeMp.prepareAsyncCalled }
-        assertFalse("Active player must not be released yet", activeMp.releaseCalled)
-        assertFalse("Active player must not be reset yet", activeMp.resetCalled)
-
-        // 啟動第二個工作，但在進入 play() 前已處於取消狀態
-        val cancelledJob = launch(Dispatchers.IO) {
-            currentCoroutineContext().cancel(CancellationException("Already cancelled before play"))
-            try {
-                player.play(byteArrayOf(0x03, 0x04))
-            } catch (_: CancellationException) {
+        try {
+            // 啟動第一個播放工作使其成為 activePlayer
+            val activeJob = launch(Dispatchers.IO) {
+                player.play(byteArrayOf(0x01, 0x02))
             }
+            awaitCondition { activeMp.prepareAsyncCalled }
+            assertFalse("Active player must not be released yet", activeMp.releaseCalled)
+            assertFalse("Active player must not be reset yet", activeMp.resetCalled)
+
+            // 啟動第二個工作，但在進入 play() 前已處於取消狀態
+            val cancelledJob = launch(Dispatchers.IO) {
+                currentCoroutineContext().cancel(CancellationException("Already cancelled before play"))
+                try {
+                    player.play(byteArrayOf(0x03, 0x04))
+                } catch (_: CancellationException) {
+                }
+            }
+            cancelledJob.join()
+
+            // 驗證原本正在播放的 activePlayer 絕未被 reset 或 release
+            assertFalse("Active player must NOT be released by cancelled play call", activeMp.releaseCalled)
+            assertFalse("Active player must NOT be reset by cancelled play call", activeMp.resetCalled)
+            assertFalse("Second player must NOT prepare", secondMp.prepareAsyncCalled)
+
+            // 清理第一個播放（stop 僅 detach+cancel，native 釋放走背景執行緒，需等待終將釋放）
+            player.stop()
+            activeJob.join()
+            awaitCondition(timeoutMs = 5000L) { activeMp.releaseCalled }
+            assertTrue("Active player released after stop", activeMp.releaseCalled)
+        } finally {
+            player.release()
         }
-        cancelledJob.join()
-
-        // 驗證原本正在播放的 activePlayer 絕未被 reset 或 release
-        assertFalse("Active player must NOT be released by cancelled play call", activeMp.releaseCalled)
-        assertFalse("Active player must NOT be reset by cancelled play call", activeMp.resetCalled)
-        assertFalse("Second player must NOT prepare", secondMp.prepareAsyncCalled)
-
-        // 清理第一個播放
-        player.stop()
-        activeJob.join()
-        assertTrue("Active player released after stop", activeMp.releaseCalled)
     }
 
     @Test
@@ -2166,30 +2285,35 @@ class OpenAiSpeechEngineTest {
                 secondMp
             }
         })
-
-        val activeJob = launch(Dispatchers.IO) {
-            player.play(byteArrayOf(0x01, 0x02))
-        }
-        awaitCondition { activeMp.prepareAsyncCalled }
-
-        // 使用 CoroutineStart.LAZY 確保在 secondJob 啟動執行前已完成 secondJobRef 指派，
-        // 避免協程在指派前調用工廠導致 secondJobRef?.cancel 為空而引發逾時。
-        val secondJob = launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
-            try {
-                player.play(byteArrayOf(0x03, 0x04))
-            } catch (_: CancellationException) {
+        try {
+            val activeJob = launch(Dispatchers.IO) {
+                player.play(byteArrayOf(0x01, 0x02))
             }
+            awaitCondition { activeMp.prepareAsyncCalled }
+
+            // 使用 CoroutineStart.LAZY 確保在 secondJob 啟動執行前已完成 secondJobRef 指派，
+            // 避免協程在指派前調用工廠導致 secondJobRef?.cancel 為空而引發逾時。
+            val secondJob = launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
+                try {
+                    player.play(byteArrayOf(0x03, 0x04))
+                } catch (_: CancellationException) {
+                }
+            }
+            secondJobRef = secondJob
+            secondJob.start()
+            secondJob.join()
+
+            assertFalse("Active player must NOT be released", activeMp.releaseCalled)
+            assertFalse("Active player must NOT be reset", activeMp.resetCalled)
+            // 進入鎖前被取消的新建資源走 releaseAsync（背景釋放），需等待終將釋放
+            awaitCondition(timeoutMs = 5000L) { secondMp.releaseCalled }
+            assertTrue("Second player created before lock should be cleaned up", secondMp.releaseCalled)
+
+            player.stop()
+            activeJob.join()
+        } finally {
+            player.release()
         }
-        secondJobRef = secondJob
-        secondJob.start()
-        secondJob.join()
-
-        assertFalse("Active player must NOT be released", activeMp.releaseCalled)
-        assertFalse("Active player must NOT be reset", activeMp.resetCalled)
-        assertTrue("Second player created before lock should be cleaned up", secondMp.releaseCalled)
-
-        player.stop()
-        activeJob.join()
     }
 
     // ---- P2: reset() 失敗不得跳過 release() 測試 (Reviewer finding 3) ----
@@ -2200,18 +2324,23 @@ class OpenAiSpeechEngineTest {
             throwOnReset = IllegalStateException("Native MediaPlayer reset failure")
         }
         val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp })
+        try {
+            val job = launch(Dispatchers.IO) {
+                player.play(byteArrayOf(0x01, 0x02))
+            }
+            awaitCondition { testMp.prepareAsyncCalled }
 
-        val job = launch(Dispatchers.IO) {
-            player.play(byteArrayOf(0x01, 0x02))
+            // 呼叫 stop() 觸發釋放流程（背景執行緒終將釋放）
+            player.stop()
+            job.join()
+
+            awaitCondition(timeoutMs = 5000L) { testMp.resetCalled }
+            awaitCondition(timeoutMs = 5000L) { testMp.releaseCalled }
+            assertTrue("reset() must have been called", testMp.resetCalled)
+            assertTrue("release() must still be called even if reset() threw exception", testMp.releaseCalled)
+        } finally {
+            player.release()
         }
-        awaitCondition { testMp.prepareAsyncCalled }
-
-        // 呼叫 stop() 觸發釋放流程
-        player.stop()
-        job.join()
-
-        assertTrue("reset() must have been called", testMp.resetCalled)
-        assertTrue("release() must still be called even if reset() threw exception", testMp.releaseCalled)
     }
 
     // ---- 階段一：音訊引擎核心與並發重構測試 ----
@@ -2275,6 +2404,8 @@ class OpenAiSpeechEngineTest {
 
     @Test
     fun byteArrayMediaDataSource_copyFalseDoesNotCloneArray() {
+        // RequiresNoMutation 契約釘選：copy=false 為零拷貝路徑（保留決策：記憶體考量，見 AudioPlayer.play KDoc）。
+        // 外部修改即時可見 = 證明未 clone；呼叫端在播放期間絕對不可如此修改。
         val original = byteArrayOf(1, 2, 3)
         val ds = ByteArrayMediaDataSource(original, copy = false)
 
@@ -2292,53 +2423,65 @@ class OpenAiSpeechEngineTest {
     fun androidAudioPlayer_stopDoesNotCallPlayerStopDirectly() = runBlocking {
         val testMp = TestMediaPlayer()
         val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp })
+        try {
+            val job = launch(Dispatchers.IO) {
+                player.play(byteArrayOf(0x01, 0x02))
+            }
 
-        val job = launch(Dispatchers.IO) {
-            player.play(byteArrayOf(0x01, 0x02))
+            awaitCondition { testMp.prepareAsyncCalled }
+
+            player.stop()
+            job.join()
+
+            // 驗證解除死鎖重構：直接 reset 與 release，嚴格禁止呼叫 player.stop() 與 isPlaying
+            // 背景釋放需等待終將釋放
+            awaitCondition(timeoutMs = 5000L) { testMp.resetCalled }
+            awaitCondition(timeoutMs = 5000L) { testMp.releaseCalled }
+            assertFalse("player.stop() should NOT be called directly", testMp.stopCalled)
+            assertTrue("player.reset() must be called", testMp.resetCalled)
+            assertTrue("player.release() must be called", testMp.releaseCalled)
+        } finally {
+            player.release()
         }
-
-        awaitCondition { testMp.prepareAsyncCalled }
-
-        player.stop()
-        job.join()
-
-        // 驗證解除死鎖重構：直接 reset 與 release，嚴格禁止呼叫 player.stop() 與 isPlaying
-        assertFalse("player.stop() should NOT be called directly", testMp.stopCalled)
-        assertTrue("player.reset() must be called", testMp.resetCalled)
-        assertTrue("player.release() must be called", testMp.releaseCalled)
     }
 
     @Test
     fun androidAudioPlayer_stop_safelyClearsListenersAndReleasesPlayerWithoutErrors() = runBlocking {
         val testMp = TestMediaPlayer()
         val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp })
+        try {
+            val job = launch(Dispatchers.IO) {
+                player.play(byteArrayOf(0x01, 0x02))
+            }
 
-        val job = launch(Dispatchers.IO) {
-            player.play(byteArrayOf(0x01, 0x02))
+            awaitCondition {
+                testMp.prepareAsyncCalled &&
+                    testMp.preparedListener != null &&
+                    testMp.completionListener != null &&
+                    testMp.errorListener != null
+            }
+
+            assertNotNull("PreparedListener must be present before stop", testMp.preparedListener)
+            assertNotNull("CompletionListener must be present before stop", testMp.completionListener)
+            assertNotNull("ErrorListener must be present before stop", testMp.errorListener)
+
+            // 呼叫 stop() 執行安全釋放流程（背景執行緒終將釋放）
+            player.stop()
+            job.join()
+
+            // 驗證重構安全契約：在 reset/release 之前已安全清空所有 listeners
+            // listeners 清除發生於背景釋放，需等待
+            awaitCondition(timeoutMs = 5000L) { testMp.preparedListener == null }
+            awaitCondition(timeoutMs = 5000L) { testMp.releaseCalled }
+            assertNull("PreparedListener must be cleared after stop", testMp.preparedListener)
+            assertNull("CompletionListener must be cleared after stop", testMp.completionListener)
+            assertNull("ErrorListener must be cleared after stop", testMp.errorListener)
+            assertTrue("reset() must have been called", testMp.resetCalled)
+            assertTrue("release() must have been called", testMp.releaseCalled)
+            assertFalse("start() must NOT have been called after stop", testMp.startCalled)
+        } finally {
+            player.release()
         }
-
-        awaitCondition {
-            testMp.prepareAsyncCalled &&
-                testMp.preparedListener != null &&
-                testMp.completionListener != null &&
-                testMp.errorListener != null
-        }
-
-        assertNotNull("PreparedListener must be present before stop", testMp.preparedListener)
-        assertNotNull("CompletionListener must be present before stop", testMp.completionListener)
-        assertNotNull("ErrorListener must be present before stop", testMp.errorListener)
-
-        // 呼叫 stop() 執行安全釋放流程
-        player.stop()
-        job.join()
-
-        // 驗證重構安全契約：在 reset/release 之前已安全清空所有 listeners
-        assertNull("PreparedListener must be cleared after stop", testMp.preparedListener)
-        assertNull("CompletionListener must be cleared after stop", testMp.completionListener)
-        assertNull("ErrorListener must be cleared after stop", testMp.errorListener)
-        assertTrue("reset() must have been called", testMp.resetCalled)
-        assertTrue("release() must have been called", testMp.releaseCalled)
-        assertFalse("start() must NOT have been called after stop", testMp.startCalled)
     }
 
     @Test
@@ -2469,12 +2612,17 @@ class OpenAiSpeechEngineTest {
         val res2 = deferred2.await()
 
         val results = listOfNotNull(res1, res2)
-        // 至少一個請求成功完成 Ok，且未因前置檢查期 stopEpoch 碰撞而回傳 Failed(DETAIL_CANCELLED)
+        // 統一取消契約：兩併發請求其一必取代另一，勝者 Ok、敗者正常回傳 Failed(CANCELLED)（非拋出）。
+        // 前置檢查期 stopEpoch 碰撞不得造成雙敗；合法取代造成之單一 CANCELLED 屬預期。
+        assertEquals("Both concurrent requests must return (not throw)", 2, results.size)
         assertTrue("At least one request should succeed Ok", results.any { it is OpenAiSpeechEngine.Companion.SynthOutcome.Ok })
-        for (res in results) {
-            assertFalse(
-                "Neither request should fail with DETAIL_CANCELLED outcome due to pre-check epoch collision",
-                res is OpenAiSpeechEngine.Companion.SynthOutcome.Failed && res.detail == OpenAiSpeechEngine.DETAIL_CANCELLED,
+        val failed = results.filterIsInstance<OpenAiSpeechEngine.Companion.SynthOutcome.Failed>()
+        assertTrue("At most one superseded loser", failed.size <= 1)
+        for (f in failed) {
+            assertEquals(
+                "Superseded loser must be DETAIL_CANCELLED",
+                OpenAiSpeechEngine.DETAIL_CANCELLED,
+                f.detail,
             )
         }
     }
@@ -2674,5 +2822,135 @@ class OpenAiSpeechEngineTest {
         assertEquals("Zero HTTP requests dispatched", 0, server.requestCount)
         assertEquals(0, player.playCount.get())
         assertFalse("Must never check or downgrade to preset:openai on read failure", hasKeyCalls.contains("preset:openai"))
+    }
+
+    // ---- Stage-1 P1: setDataSource 阻塞時 stop 有界返回、永不 start、終將釋放 ----
+
+    @Test
+    fun androidAudioPlayer_blockedSetDataSource_stopReturnsBoundedNeverStartsEventuallyReleases() = runBlocking {
+        val enterSetDataSource = CountDownLatch(1)
+        val unblockSetDataSource = CountDownLatch(1)
+        val testMp = object : TestMediaPlayer() {
+            override fun setDataSource(dataSource: android.media.MediaDataSource) {
+                enterSetDataSource.countDown()
+                // 故意阻塞 native setDataSource，模擬 P1 死鎖場景
+                unblockSetDataSource.await(10, TimeUnit.SECONDS)
+                super.setDataSource(dataSource)
+            }
+        }
+        val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp })
+
+        val playJob = launch(Dispatchers.IO) {
+            try {
+                player.play(byteArrayOf(0x01, 0x02, 0x03))
+            } catch (_: CancellationException) {
+            } catch (_: Exception) {
+            }
+        }
+        try {
+            assertTrue("play must enter blocked setDataSource", enterSetDataSource.await(5, TimeUnit.SECONDS))
+
+            // 獨立線程 stop() 必須有界返回，不得被阻塞的 native 卡住
+            var stopReturned = false
+            val stopThread = kotlin.concurrent.thread(isDaemon = true) {
+                player.stop()
+                stopReturned = true
+            }
+            // 放寬 join 時限至 5000ms，避免 CI 高負載 flaky（stop 本身有界返回，僅等待調度）。
+            stopThread.join(5000)
+            assertFalse("stop() must return bounded while setDataSource blocked", stopThread.isAlive)
+            assertTrue("stop() must have returned", stopReturned)
+
+            // 釋放阻塞後，失格播放永不可 start，且資源終將釋放
+            unblockSetDataSource.countDown()
+            playJob.join()
+            assertFalse("start() must never be called after stop during blocked setDataSource", testMp.startCalled)
+            awaitCondition(timeoutMs = 5000L) { testMp.releaseCalled }
+            assertTrue("Player must eventually be released", testMp.releaseCalled)
+        } finally {
+            // 若斷言前失敗，仍需放行阻塞避免懸掛
+            unblockSetDataSource.countDown()
+            player.release()
+        }
+    }
+
+    // ---- Stage-1 P2: 舊 claim 不可取消新 winner 屏障測試 ----
+
+    @Test
+    fun synthesizeAndPlay_oldClaimCannotCancelNewWinner_barrier() = runBlocking {
+        val fakeAudio1 = byteArrayOf(0x01, 0x02)
+        val fakeAudio2 = byteArrayOf(0x03, 0x04)
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/mpeg")
+                .setBody(Buffer().write(fakeAudio1)),
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/mpeg")
+                .setBody(Buffer().write(fakeAudio2)),
+        )
+
+        val player = FakeAudioPlayer()
+        val client = OpenAiTtsClient(
+            baseUrl = server.url("/").toString(),
+            apiKey = { "test-key".toCharArray() },
+            allowTestLoopback = true,
+        )
+        val engine = OpenAiSpeechEngine(client = client, player = player, allowTestLoopback = true)
+
+        try {
+            val aClaimed = CountDownLatch(1)
+            val releaseA = CountDownLatch(1)
+            val firstClaim = java.util.concurrent.atomic.AtomicBoolean(true)
+            engine.epochClaimBarrierForTest = {
+                if (firstClaim.getAndSet(false)) {
+                    aClaimed.countDown()
+                    // A 在躍遷臨界區內暫停，讓 B 有機會成為 winner
+                    releaseA.await(5, TimeUnit.SECONDS)
+                }
+            }
+
+            val outcomeARef = java.util.concurrent.atomic.AtomicReference<OpenAiSpeechEngine.Companion.SynthOutcome?>()
+            val jobA = launch(Dispatchers.IO) {
+                outcomeARef.set(
+                    engine.synthesizeAndPlay(
+                        text = "A barrier claim",
+                        voiceOutputOn = true,
+                        openAiTtsOn = true,
+                    ),
+                )
+            }
+            assertTrue("A must reach epoch claim barrier", aClaimed.await(5, TimeUnit.SECONDS))
+
+            // B 在 A 持有 generationLock 期間發起，將阻塞等待鎖，待 A 釋放後成為 winner
+            val deferredB = async(Dispatchers.IO) {
+                engine.synthesizeAndPlay(
+                    text = "B winner claim",
+                    voiceOutputOn = true,
+                    openAiTtsOn = true,
+                )
+            }
+            delay(200)
+            releaseA.countDown()
+
+            val outcomeB = deferredB.await()
+            jobA.join()
+            val outcomeA = outcomeARef.get()
+
+            // B 為 winner 必須 Ok，不被 A 取消；A 為舊世代回傳 Failed(CANCELLED)。
+            // 僅斷言 outcomes（不釘死 playCount/playedBytes）：A 可能在網路前即被取消，
+            // B 取到的可能是佇列首個回應，且併發調度下播放次數可能抖動，故放寬以避免 flaky。
+            assertEquals(OpenAiSpeechEngine.Companion.SynthOutcome.Ok, outcomeB)
+            assertTrue(
+                "Old claim A must return Failed(CANCELLED), was: $outcomeA",
+                outcomeA is OpenAiSpeechEngine.Companion.SynthOutcome.Failed &&
+                    outcomeA.detail == OpenAiSpeechEngine.DETAIL_CANCELLED,
+            )
+        } finally {
+            engine.epochClaimBarrierForTest = null
+        }
     }
 }

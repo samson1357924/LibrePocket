@@ -12,6 +12,15 @@ import androidx.compose.ui.text.font.FontWeight
  * Each block provides a [key] structural identity anchor used by Compose
  * to maintain UI state (such as expansion in [ThinkingBlock] or copy feedback in [CodeBlock])
  * across streaming updates and content progress without recreating nodes.
+ *
+ * Invariants:
+ * - [CodeBlock]: Non-streaming code blocks bind their key directly to their content identity
+ *   (`code_${language.orEmpty()}_${code.hashCode()}`), disambiguated with `_dup` if duplicates exist.
+ *   This prevents state mismatch (such as copy success indicators) when new code blocks are prepended.
+ *   Streaming code blocks use `code_streaming_$index` to prevent node recreation while chunks arrive.
+ * - [ThinkingBlock]: Uses `think_$index` so that streaming chunk growth (`<think>Pl` -> `<think>Plan`)
+ *   maintains a stable key, preserving user collapse/expansion state.
+ * - [ParagraphBlock]: Uses `para_$index` to anchor rendered markdown paragraphs.
  */
 sealed interface ChatContentBlock {
     val key: String
@@ -65,7 +74,7 @@ sealed interface ChatContentBlock {
  * 3. **Bracket Matching & Monotonic Interval Absorption (括號匹配與單調區間吸收)**:
  *    - Nested thinking tags maintain a doubly-linked tag stack with [lastNodeOfKind] pointers for O(1) push,
  *      pop, and middle unlink without array copies or linear stack searches.
- *    - In [stripMalformedThinkingTags], open tag positions are pushed onto a LIFO stack. When a valid closing tag
+ *    - In [stripThinking], open tag positions are pushed onto a LIFO stack. When a valid closing tag
  *      is matched, the enclosing range `[start, close.tagEnd)` is absorbed. Any previously recorded inner intervals
  *      starting at or after `start` are popped and superseded by the outer enclosing interval in a single monotonic pass.
  *    - If unclosed suspect open tags remain at EOF, all intervals from the earliest unclosed start to EOF are absorbed
@@ -792,8 +801,9 @@ object ChatMarkdownParser {
             return if (isStreaming) listOf(ChatContentBlock.ParagraphBlock(AnnotatedString(""), key = "para_0")) else emptyList()
         }
         val segments = segments(text, isStreaming)
+        val codeKeyCounts = HashMap<String, Int>()
         var thinkingIndex = 0
-        var codeIndex = 0
+        var streamingCodeIndex = 0
         var paraIndex = 0
 
         val blocks = ArrayList<ChatContentBlock>(segments.size)
@@ -823,12 +833,22 @@ object ChatMarkdownParser {
                     )
                 }
                 Kind.CODE -> {
+                    val isBlockStreaming = segment.unclosed && isStreaming
+                    val codeContent = text.substring(segment.contentStart, segment.contentEnd)
+                    val key = if (isBlockStreaming) {
+                        "code_streaming_${streamingCodeIndex++}"
+                    } else {
+                        val baseKey = "code_${segment.language.orEmpty()}_${codeContent.hashCode()}"
+                        val count = codeKeyCounts[baseKey] ?: 0
+                        codeKeyCounts[baseKey] = count + 1
+                        if (count == 0) baseKey else if (count == 1) "${baseKey}_dup" else "${baseKey}_dup$count"
+                    }
                     blocks.add(
                         ChatContentBlock.CodeBlock(
                             language = segment.language,
-                            code = text.substring(segment.contentStart, segment.contentEnd),
-                            isStreaming = segment.unclosed && isStreaming,
-                            key = "code_${codeIndex++}",
+                            code = codeContent,
+                            isStreaming = isBlockStreaming,
+                            key = key,
                         )
                     )
                 }
@@ -868,12 +888,21 @@ object ChatMarkdownParser {
                             line = if (newline < segment.end) newline + 1 else segment.end
                         }
                     }
+                    val isBlockStreaming = segment.unclosed && isStreaming
+                    val key = if (isBlockStreaming) {
+                        "code_streaming_${streamingCodeIndex++}"
+                    } else {
+                        val baseKey = "code__${codeContent.hashCode()}"
+                        val count = codeKeyCounts[baseKey] ?: 0
+                        codeKeyCounts[baseKey] = count + 1
+                        if (count == 0) baseKey else if (count == 1) "${baseKey}_dup" else "${baseKey}_dup$count"
+                    }
                     blocks.add(
                         ChatContentBlock.CodeBlock(
                             language = null,
                             code = codeContent,
-                            isStreaming = segment.unclosed && isStreaming,
-                            key = "code_${codeIndex++}",
+                            isStreaming = isBlockStreaming,
+                            key = key,
                         )
                     )
                 }
@@ -934,26 +963,28 @@ object ChatMarkdownParser {
         return null
     }
 
-    private fun isSuspectOpenThinkTag(text: String, pos: Int): Boolean =
-        matchSuspectOpenThinkTag(text, pos) != null
-
     /**
-     * Strips malformed or residual thinking tags from text using single-pass bracket matching
-     * and monotonic interval absorption.
+     * Strips all thinking tags and their content from the entire raw message in a single monotonic pass.
      *
      * Invariants enforced:
+     * - Scope Absorption: When [openStarts] is not empty, all enclosed text, inline code, and code blocks
+     *   are treated as internal reasoning content and absorbed into the thinking scope.
+     * - Delimiter Shielding Outside Thinking: When [openStarts] is empty, fenced code blocks, inline code spans,
+     *   and indented code blocks shield XML tags from being considered as thinking openers.
      * - Monotonic Interval Absorption: [openStarts] tracks matched opening bracket indices. When a matching
      *   closing tag is found at `close.tagEnd`, any previously recorded inner intervals starting at or after
      *   `start` are discarded from [removedIntervals] because they are completely encompassed by the outer
      *   range `start until close.tagEnd`.
-     * - Delimiter Shielding: Code blocks and inline code spans shield XML tags from being considered as thinking tags.
-     * - Strict Linear Time O(N): The text is traversed linearly, and each character is processed at most a bounded
+     * - Fail-Closed Unclosed Scope at EOF: If any unclosed thinking tag remains at EOF, all text from the earliest
+     *   unclosed start index to EOF is strictly absorbed into [removedIntervals] to prevent thinking leakage to TTS.
+     * - Linear Time O(N): The text is traversed linearly, and each character is processed at most a bounded
      *   number of times without string rebuilding until the final interval subtraction phase.
      */
-    private fun stripMalformedThinkingTags(text: String): String {
+    fun stripThinking(text: String): String {
         val len = text.length
         if (len == 0) return ""
         val escaped = escapedBackticks(text)
+        val invalidFence = invalidIndentedFenceOpeners(text)
         val ticks = inlineTickRuns(text)
         val nextNewline = IntArray(len + 1) { -1 }
         for (i in len - 1 downTo 0) {
@@ -962,18 +993,157 @@ object ChatMarkdownParser {
 
         val removedIntervals = mutableListOf<IntRange>()
         val openStarts = ArrayList<Int>()
+        var hasSeenOpen = false
+        val listContentColumns = mutableListOf<Long>()
         var i = 0
 
         while (i < len) {
-            if (text[i] == '`' && !escaped[i]) {
-                if (text.startsWith(CODE_FENCE, i)) {
-                    var fenceEnd = i + CODE_FENCE.length
-                    while (fenceEnd < len && text[fenceEnd] == '`') fenceEnd++
-                    val fenceLen = fenceEnd - i
-                    val nextFence = text.indexOf(text.substring(i, fenceEnd), fenceEnd)
-                    val close = if (nextFence >= 0) nextFence + fenceLen else len
-                    i = close
+            val atLineStart = i == 0 || text[i - 1] == '\n'
+            val previousBlank = if (atLineStart && i > 0) {
+                val prevStart = text.lastIndexOf('\n', i - 2) + 1
+                isRangeBlank(text, prevStart, i - 1)
+            } else {
+                false
+            }
+            var lineMarker = i
+            var indentColumns = 0L
+            if (atLineStart) {
+                while (lineMarker < len && (text[lineMarker] == ' ' || text[lineMarker] == '\t')) {
+                    indentColumns = if (text[lineMarker] == '\t') indentColumns + 4L - indentColumns % 4L else indentColumns + 1L
+                    lineMarker++
+                }
+            }
+            val blankLine = atLineStart && (lineMarker == len || text[lineMarker] == '\r' || text[lineMarker] == '\n')
+            var listMarkerLength = 0
+            if (atLineStart && !blankLine) {
+                var d = lineMarker
+                while (d < len && text[d].isDigit()) d++
+                val numDigits = d - lineMarker
+                if (numDigits in 1..9 && d + 1 < len && text[d] == '.' && (text[d + 1] == ' ' || text[d + 1] == '\t')) {
+                    listMarkerLength = numDigits + 1
+                } else if (lineMarker + 1 < len &&
+                    (text[lineMarker] == '-' || text[lineMarker] == '*' || text[lineMarker] == '+') &&
+                    (text[lineMarker + 1] == ' ' || text[lineMarker + 1] == '\t')) {
+                    val markerChar = text[lineMarker]
+                    val lineEnd = nextNewline[lineMarker].let { if (it < 0) len else it }
+                    var markerCount = 0
+                    var onlyMarkersAndSpaces = true
+                    for (idx in lineMarker until lineEnd) {
+                        val ch = text[idx]
+                        if (ch == markerChar) {
+                            markerCount++
+                        } else if (ch != ' ' && ch != '\t' && ch != '\r') {
+                            onlyMarkersAndSpaces = false
+                            break
+                        }
+                    }
+                    if (!(onlyMarkersAndSpaces && markerCount >= 3) && !onlyMarkersAndSpaces) {
+                        listMarkerLength = 1
+                    }
+                }
+            }
+            val listItem = listMarkerLength > 0
+            if (atLineStart && !blankLine) {
+                while (listContentColumns.isNotEmpty() && indentColumns < listContentColumns.last()) {
+                    listContentColumns.removeAt(listContentColumns.lastIndex)
+                }
+            }
+            val previousListItem = listContentColumns.isNotEmpty()
+            val codeIndent = if (previousListItem) listContentColumns.last() + INDENT_CODE_COLUMNS else INDENT_CODE_COLUMNS
+            val listContinuation = previousListItem && indentColumns > 0 && indentColumns < codeIndent
+            val nestedList = previousListItem && listItem && indentColumns < codeIndent
+            val indent = if (atLineStart && !blankLine && !nestedList && !listContinuation &&
+                (i == 0 || previousBlank)) indentEnd(text, i, codeIndent) else -1
+            if (openStarts.isEmpty() && indent >= 0 && indent < len && text[indent] != '\n' && text[indent] != '\r') {
+                var end = i
+                var line = i
+                while (line < len) {
+                    val newline = nextNewline[line]
+                    val lineEnd = if (newline < 0) len else newline
+                    var pos = line
+                    while (pos < lineEnd && (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\r')) pos++
+                    val next = if (newline < 0) len else newline + 1
+                    if (pos == lineEnd) {
+                        line = next
+                        continue
+                    }
+                    if (indentEnd(text, line, codeIndent) < 0) break
+                    end = next
+                    line = next
+                }
+                if (end > i) {
+                    i = end
                     continue
+                }
+            }
+            if (openStarts.isEmpty() && atLineStart && !blankLine) {
+                if (listItem) {
+                    listContentColumns.add(listContentColumn(text, lineMarker, indentColumns, listMarkerLength))
+                } else if (!listContinuation) {
+                    listContentColumns.clear()
+                }
+            }
+
+            if (openStarts.isEmpty() && invalidFence[i]) {
+                while (i < len && text[i] == '`') i++
+                continue
+            } else if (openStarts.isEmpty() && text[i] == '`' && !escaped[i]) {
+                if (text.startsWith(CODE_FENCE, i)) {
+                    listContentColumns.clear()
+                    var afterFence = i + CODE_FENCE.length
+                    while (afterFence < len && text[afterFence] == '`') afterFence++
+                    val fenceLength = afterFence - i
+                    val newline = nextNewline[afterFence]
+                    val headerEnd = if (newline < 0) len else newline
+                    var scan = afterFence
+                    var inlineClose = -1
+                    var inlineCloseEnd = -1
+                    while (scan < headerEnd) {
+                        if (text[scan] != '`') {
+                            scan++
+                        } else {
+                            val runStart = scan
+                            while (scan < headerEnd && text[scan] == '`') scan++
+                            if (scan - runStart >= fenceLength) {
+                                inlineClose = runStart
+                                inlineCloseEnd = scan
+                                break
+                            }
+                        }
+                    }
+                    if (inlineClose >= 0) {
+                        i = inlineCloseEnd
+                        continue
+                    } else if (newline < 0) {
+                        i = len
+                        continue
+                    } else {
+                        val start = newline + 1
+                        var lineStart = start
+                        var close = -1
+                        var closeEnd = -1
+                        while (lineStart < len) {
+                            var pos = lineStart
+                            while (pos < len && text[pos] == ' ') pos++
+                            if (pos - lineStart <= MAX_FENCE_INDENT_SPACES && pos < len && text[pos] == '`') {
+                                var tail = pos
+                                while (tail < len && text[tail] == '`') tail++
+                                val runEnd = tail
+                                while (tail < len && (text[tail] == ' ' || text[tail] == '\t' || text[tail] == '\r')) tail++
+                                if (runEnd - pos >= fenceLength && (tail == len || text[tail] == '\n')) {
+                                    close = pos
+                                    closeEnd = runEnd
+                                    break
+                                }
+                            }
+                            val nextLine = text.indexOf('\n', lineStart)
+                            if (nextLine < 0) break
+                            lineStart = nextLine + 1
+                        }
+                        val next = if (close < 0) len else (if (closeEnd < len && text[closeEnd] == '\n') closeEnd + 1 else if (closeEnd + 1 < len && text[closeEnd] == '\r' && text[closeEnd + 1] == '\n') closeEnd + 2 else closeEnd)
+                        i = next
+                        continue
+                    }
                 }
                 val size = if (i + 1 < len && text[i + 1] == '`') 2 else 1
                 val close = ticks[size - 1][i + size]
@@ -981,29 +1151,54 @@ object ChatMarkdownParser {
                 if (close >= 0 && (newline < 0 || close < newline)) {
                     i = close + size
                     continue
+                } else {
+                    i += size
+                    continue
                 }
             }
 
+            if (i >= len) break
+
             if (text[i] == '<') {
-                val openMatch = matchSuspectOpenThinkTag(text, i)
+                val openMatch = matchOpenThinkTag(text, i)
                 if (openMatch != null) {
+                    hasSeenOpen = true
+                    listContentColumns.clear()
                     if (openMatch.isSelfClosing) {
                         removedIntervals.add(i until openMatch.tagEnd)
                         i = openMatch.tagEnd
                         continue
                     }
                     openStarts.add(i)
-                    i = openMatch.nextScanPos
+                    i = openMatch.tagEnd
                     continue
                 }
+                val suspectOpen = matchSuspectOpenThinkTag(text, i)
+                if (suspectOpen != null) {
+                    hasSeenOpen = true
+                    listContentColumns.clear()
+                    if (suspectOpen.isSelfClosing) {
+                        removedIntervals.add(i until suspectOpen.tagEnd)
+                        i = suspectOpen.tagEnd
+                        continue
+                    }
+                    openStarts.add(i)
+                    i = suspectOpen.nextScanPos
+                    continue
+                }
+
                 val close = matchCloseThinkTag(text, i)
                 if (close != null) {
+                    listContentColumns.clear()
                     if (openStarts.isNotEmpty()) {
                         val start = openStarts.removeAt(openStarts.lastIndex)
                         while (removedIntervals.isNotEmpty() && removedIntervals.last().first >= start) {
                             removedIntervals.removeAt(removedIntervals.lastIndex)
                         }
                         removedIntervals.add(start until close.tagEnd)
+                    } else if (!hasSeenOpen && removedIntervals.isEmpty()) {
+                        hasSeenOpen = true
+                        removedIntervals.add(0 until close.tagEnd)
                     }
                     i = close.tagEnd
                     continue
@@ -1021,7 +1216,7 @@ object ChatMarkdownParser {
             removedIntervals.add(unclosedStart until len)
         }
 
-        if (removedIntervals.isEmpty()) return text
+        if (removedIntervals.isEmpty()) return trimBoundary(text)
 
         val sb = java.lang.StringBuilder(len)
         var cursor = 0
@@ -1034,19 +1229,8 @@ object ChatMarkdownParser {
         if (cursor < len) {
             sb.append(text, cursor, len)
         }
-        return sb.toString()
+        return trimBoundary(sb.toString())
     }
-
-    /** Removes exactly the thinking segments recognized by the non-streaming display parser. */
-    fun stripThinking(text: String): String = buildString {
-        for (segment in segments(text, streaming = false)) {
-            when (segment.kind) {
-                Kind.THINKING -> Unit
-                Kind.TEXT -> append(stripMalformedThinkingTags(text.substring(segment.start, segment.end)))
-                else -> append(text, segment.start, segment.end)
-            }
-        }
-    }.let { trimBoundary(it) }
 
     /**
      * Replaces unordered list prefixes such as `- `, `* `, or `+ ` at line starts with bullet `• `.

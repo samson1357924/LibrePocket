@@ -1480,4 +1480,41 @@ class ChatMarkdownParserTest {
             assertTrue("Expected n=$n to complete in milliseconds (< 1500ms), took ${elapsed}ms", elapsed < 1500)
         }
     }
+
+    @Test
+    fun stripThinking_malformedOuterThinkingScope_absorbsInnerBlockAndCodeWithoutTtsLeak() {
+        val raw = "<think ??? >OUTER <think>inner</think>LEAK"
+        assertEquals("", ChatMarkdownParser.stripThinking(raw))
+
+        val rawWithCode = "<think ??? >OUTER \n```\ncode\n```\nLEAK"
+        assertEquals("", ChatMarkdownParser.stripThinking(rawWithCode))
+
+        val rawWithInlineCode = "<think ??? >OUTER `val x = 1` LEAK"
+        assertEquals("", ChatMarkdownParser.stripThinking(rawWithInlineCode))
+
+        val closedOuter = "<think ??? >OUTER <think>inner</think>END</think>VALID ANSWER"
+        assertEquals("VALID ANSWER", ChatMarkdownParser.stripThinking(closedOuter))
+    }
+
+    @Test
+    fun parse_codeBlockKey_bindsToContentIdentityAndDisambiguatesDuplicates() {
+        val input = "```kotlin\nval x = 1\n```\n\n```python\nprint(1)\n```\n\n```kotlin\nval x = 1\n```"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(3, blocks.size)
+
+        val code1 = blocks[0] as ChatContentBlock.CodeBlock
+        val code2 = blocks[1] as ChatContentBlock.CodeBlock
+        val code3 = blocks[2] as ChatContentBlock.CodeBlock
+
+        val expectedKotlinKey = "code_kotlin_${"val x = 1".hashCode()}"
+        val expectedPythonKey = "code_python_${"print(1)".hashCode()}"
+
+        assertEquals(expectedKotlinKey, code1.key)
+        assertEquals(expectedPythonKey, code2.key)
+        assertEquals("${expectedKotlinKey}_dup", code3.key)
+
+        val streamingBlocks = ChatMarkdownParser.parse("```kotlin\nval x = 1", isStreaming = true)
+        val streamingCode = streamingBlocks[0] as ChatContentBlock.CodeBlock
+        assertEquals("code_streaming_0", streamingCode.key)
+    }
 }

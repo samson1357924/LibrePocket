@@ -1040,11 +1040,13 @@ class ChatMarkdownUiTest {
         composeRule.onNodeWithText(copyText).performClick()
         composeRule.onNodeWithText(copiedText).assertIsDisplayed()
 
-        // Append a Python code block after the Kotlin code block
-        text = "```kotlin\nval x = 1\n```\n\n```python\nprint('new')\n```"
+        // Prepend a Python code block before the Kotlin code block
+        text = "```python\nprint('new')\n```\n\n```kotlin\nval x = 1\n```"
         composeRule.waitForIdle()
 
-        // The newly inserted Python block must have "Copy", while the existing Kotlin block retains "Copied"
+        // The newly prepended Python block must have "Copy", while the existing Kotlin block retains "Copied"
+        composeRule.onNodeWithText("python").assertIsDisplayed()
+        composeRule.onNodeWithText("kotlin").assertIsDisplayed()
         composeRule.onNodeWithText(copyText).assertIsDisplayed()
         composeRule.onNodeWithText(copiedText).assertIsDisplayed()
     }
@@ -1099,18 +1101,73 @@ class ChatMarkdownUiTest {
         val blocks = ChatMarkdownParser.parse("<think>Analyzing user query</think>\n\nHello\n\n```kotlin\nval x = 1\n```\n\n<think>Second</think>")
         assertEquals("think_0", blocks[0].key)
         assertEquals("para_0", blocks[1].key)
-        assertEquals("code_0", blocks[2].key)
+        val expectedCodeKey = "code_kotlin_${"val x = 1".hashCode()}"
+        assertEquals(expectedCodeKey, blocks[2].key)
         assertEquals("think_1", blocks[3].key)
 
         val think1 = ChatContentBlock.ThinkingBlock("Analyzing user query and planning step 1", isStreaming = true, key = "think_0")
         val think2 = ChatContentBlock.ThinkingBlock("Analyzing user query and planning step 1\nwith more text appended", isStreaming = true, key = "think_0")
         assertEquals(think1.key, think2.key)
 
-        val code1 = ChatContentBlock.CodeBlock("kotlin", "val x = 1\nval y = 2", isStreaming = false, key = "code_0")
-        val code2 = ChatContentBlock.CodeBlock("kotlin", "val x = 1\nval y = 2", isStreaming = true, key = "code_0")
+        val code1 = ChatContentBlock.CodeBlock("kotlin", "val x = 1\nval y = 2", isStreaming = false, key = "code_kotlin_123")
+        val code2 = ChatContentBlock.CodeBlock("kotlin", "val x = 1\nval y = 2", isStreaming = true, key = "code_kotlin_123")
         assertEquals(code1.key, code2.key)
 
         val para = ChatContentBlock.ParagraphBlock(AnnotatedString("Hello world"), key = "para_0")
         assertEquals("para_0", para.key)
+
+        // Duplicate code blocks in the same message are disambiguated
+        val dupBlocks = ChatMarkdownParser.parse("```kotlin\nval x = 1\n```\n\n```kotlin\nval x = 1\n```")
+        val baseCodeKey = "code_kotlin_${"val x = 1".hashCode()}"
+        assertEquals(baseCodeKey, dupBlocks[0].key)
+        assertEquals("${baseCodeKey}_dup", dupBlocks[1].key)
+
+        // Streaming code blocks use streaming counter keys
+        val streamingBlocks = ChatMarkdownParser.parse("```kotlin\nval x = 1", isStreaming = true)
+        assertEquals("code_streaming_0", (streamingBlocks[0] as ChatContentBlock.CodeBlock).key)
+    }
+
+    @Test
+    fun messageBubble_malformedSuspectScopeOverInnerBlock_doesNotShowSpeakButton() {
+        val raw = "<think ??? >OUTER <think>inner</think>LEAK"
+        val msg = UiMessage(
+            id = "msg-malformed-scope-inner-leak",
+            role = "assistant",
+            text = raw,
+            isPartial = false,
+        )
+
+        composeRule.setContent {
+            MaterialTheme {
+                MessageBubble(
+                    msg = msg,
+                    showSpeak = true,
+                )
+            }
+        }
+
+        composeRule.onNodeWithContentDescription(VoiceTts.SPEAK_BUTTON_DESCRIPTION).assertDoesNotExist()
+    }
+
+    @Test
+    fun messageBubble_malformedSuspectScopeOverCodeBlock_doesNotShowSpeakButton() {
+        val rawWithCode = "<think ??? >OUTER \n```\ncode\n```\nLEAK"
+        val msg = UiMessage(
+            id = "msg-malformed-scope-code-leak",
+            role = "assistant",
+            text = rawWithCode,
+            isPartial = false,
+        )
+
+        composeRule.setContent {
+            MaterialTheme {
+                MessageBubble(
+                    msg = msg,
+                    showSpeak = true,
+                )
+            }
+        }
+
+        composeRule.onNodeWithContentDescription(VoiceTts.SPEAK_BUTTON_DESCRIPTION).assertDoesNotExist()
     }
 }

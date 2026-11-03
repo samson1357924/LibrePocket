@@ -432,7 +432,9 @@ object ToolRegistry {
             // dispatcher + grant/confirm + executor + E2E land here first (see
             // SafeToolSlice: READ-only StubBackend echo, one tool round per
             // turn, fresh `tool.exec` ALLOW + latest projection re-check, zero
-            // side effects on deny/cancel/schema-error). All other 41 stay false.
+            // side effects on deny/cancel/schema-error). All others stay false
+            // (only the slice tool above is ready; the exact count is pinned
+            // by tests, not by this comment).
             executionReady = true,
         ),
         ToolDef(
@@ -565,7 +567,17 @@ object ToolRegistry {
     //   Azure cloud fallback; additionally requires voice_output on (dual-switch,
     //   enforced by AzureSpeechGate AND by the second switch below, so the
     //   projection never diverges from the gate); text is redacted again before
-    //   the cloud call.
+    //   the cloud call. Switch keys/defaults reference VoiceTools constants.
+    // - voice.speak.openai (WRITE, all flavors, switch openai_tts default false):
+    //   OpenAI cloud synthesis; additionally requires voice_output on (dual-switch,
+    //   enforced by OpenAiSpeechGate AND by the second switch below); text is
+    //   redacted again before the cloud call; audio is bounded in-memory
+    //   buffered (mp3, see OpenAiTtsModels.MAX_AUDIO_BYTES); per-call budget
+    //   60s aligned with OkHttp callTimeout. executionReady=false (scaffold).
+    //   Schema voice/responseFormat lists are recommendations only, not enforced:
+    //   the client accepts any non-blank string and the server performs final
+    //   validation (see OpenAiTtsModels.SUPPORTED_VOICES /
+    //   SUPPORTED_RESPONSE_FORMATS KDoc); speed is bounded 0.25-4.0.
     val VOICE_TOOLS: List<ToolDef> = listOf(
         ToolDef(
             name = "voice.transcribe",
@@ -607,25 +619,26 @@ object ToolRegistry {
             // dual-switch (azure_tts default false + voice_output) is sufficient, no
             // per-call PRIVILEGED confirm required. Text is redacted before upload.
             annotations = ToolAnnotations(
-                requiresSwitch = "azure_tts",
-                switchDefault = false,
+                requiresSwitch = VoiceTools.SWITCH_AZURE,
+                switchDefault = VoiceTools.SWITCH_AZURE_DEFAULT,
                 // M1 雙開關自訂投影：azure_tts 關閉或 voice_output 關閉，
                 // 任一即 UNAVAILABLE + USER_DISABLED（與 AzureSpeechGate 同語義；
-                // 預設值與 VoiceTools.SWITCH_AZURE_DEFAULT / SWITCH_OUTPUT_DEFAULT 同源）。
-                requiresSwitch2 = "voice_output",
-                switchDefault2 = true,
+                // 開關 key 與預設值皆引 VoiceTools 常數，與投影/Gate 同源）。
+                requiresSwitch2 = VoiceTools.SWITCH_OUTPUT,
+                switchDefault2 = VoiceTools.SWITCH_OUTPUT_DEFAULT,
                 fallbackHint = "use the system voice output, or read the text on screen manually",
             ),
             supportedFlavors = setOf(Flavor.GITHUB),
         ),
         ToolDef(
             name = VoiceTools.OPENAI_SPEAK_NAME,
-            description = "Cloud voice synthesis via OpenAI TTS; bounded in-memory audio buffering, needs voice_output and openai_tts on, text redacted before upload. SCAFFOLD: full voice pipeline dispatch wiring lands later; calls fall back to system voice until fully wired.",
+            description = "Cloud voice synthesis via OpenAI TTS (mp3); bounded in-memory audio buffering, needs voice_output and openai_tts on, text redacted before upload. SCAFFOLD: full voice pipeline dispatch wiring lands later; calls fall back to system voice until fully wired.",
             jsonSchema = schema(
                 prop("text", "string", "Text to synthesize via OpenAI"),
-                prop("voice", "string", "Optional OpenAI voice name"),
+                prop("voice", "string", "Optional OpenAI voice name (recommendation only, not enforced; the server performs final validation)"),
                 prop("model", "string", "Optional OpenAI TTS model"),
-                prop("speed", "number", "Optional playback speed"),
+                "\"responseFormat\": {\"type\": \"string\", \"description\": \"Optional audio format, fixed mp3 in this schema (recommendation only, not enforced; the server performs final validation)\"}",
+                "\"speed\": {\"type\": \"number\", \"description\": \"Optional playback speed, 0.25-4.0\", \"minimum\": 0.25, \"maximum\": 4.0}",
                 required = "\"text\"",
             ),
             sideEffect = SideEffect.WRITE,
@@ -634,6 +647,10 @@ object ToolRegistry {
                 switchDefault = VoiceTools.SWITCH_OPENAI_DEFAULT,
                 requiresSwitch2 = VoiceTools.SWITCH_OUTPUT,
                 switchDefault2 = VoiceTools.SWITCH_OUTPUT_DEFAULT,
+                // Per-call budget aligned with OpenAiTtsClient callTimeout
+                // (DEFAULT_CALL_TIMEOUT_SECONDS = 60s): TTS synthesis needs a
+                // >=60s-class timeout, not the 10s ToolAnnotations default.
+                timeoutMs = 60_000L,
                 fallbackHint = "use the system voice output, or read the text on screen manually",
             ),
             supportedFlavors = setOf(Flavor.PLAY, Flavor.FOSS, Flavor.GITHUB),

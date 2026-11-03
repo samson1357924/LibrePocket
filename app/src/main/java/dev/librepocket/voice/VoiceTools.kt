@@ -13,6 +13,22 @@ import dev.librepocket.redact.Redactor
  *   朗讀鏈路 fallback）尚未落地，[AzureSpeechEngine] 尚無產品呼叫者；
  *   在此之前投影 NATIVE 僅表示開關語義，實際呼叫走系統語音降級
  *   （見 ToolRegistry fallbackHint）。接線 PR 翻轉此註記並附端到端測試。
+ * - `voice.speak.openai`（WRITE，全風味）：OpenAI 雲端語音，需同時開啟
+ *   `voice_output`（預設開）且 `openai_tts`（預設關）。
+ *   SCAFFOLD：完整語音管線分派接線尚未落地，[OpenAiSpeechEngine] 尚無產品呼叫者；
+ *   在此之前投影 NATIVE 僅表示雙開關語義，實際呼叫一律走系統語音
+ *   （見 ToolRegistry fallbackHint）。接線 PR 翻轉此註記並附端到端測試。
+ *   Schema 的 voice/responseFormat 清單僅為推薦、非強制：客戶端接受任意非空白
+ *   字串，最終校驗由伺服器執行
+ *   （見 OpenAiTtsModels.SUPPORTED_VOICES / SUPPORTED_RESPONSE_FORMATS）；
+ *   speed 邊界 0.25–4.0 由客戶端強制。
+ *
+ * 三鍵預設與生效面（設定頁／MainScreen／投影同源）：
+ * - `voice_input` 預設開（系統語音輸入入口）、`voice_output` 預設開（系統朗讀入口）、
+ * - `openai_tts` 預設關（SCAFFOLD，目前無作用，切換僅持久化開關值）。
+ * - 生效面：開關關閉即隱藏對應 UI 入口（ChatScreen）且 tool 投影同步拒絕
+ *   （USER_DISABLED，見 [projectionSwitches]）；`openai_tts` 開啟在接線前不產生
+ *   任何雲端呼叫，朗讀一律走系統語音。
  *
  * 隱私不變量與揭露（S2 鎖定 / Phase B 校準）：
  * - 語音正文寫入 [RoomSessionStore][dev.librepocket.session.RoomSessionStore]

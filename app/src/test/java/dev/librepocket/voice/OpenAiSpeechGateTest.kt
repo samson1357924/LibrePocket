@@ -6,10 +6,14 @@ import dev.librepocket.tool.Flavor
 import dev.librepocket.tool.ProjectionContext
 import dev.librepocket.tool.SideEffect
 import dev.librepocket.tool.ToolRegistry
+import kotlinx.coroutines.runBlocking
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 /**
@@ -209,5 +213,62 @@ class OpenAiSpeechGateTest {
             (tool.annotations.requiresPermission ?: "")
         assertFalse(blob.contains("RECORD_AUDIO"))
         assertFalse(blob.contains("SEND_SMS"))
+    }
+
+    // ---- B2: 請求邊界通過釘（與 OpenAiTtsClientTest 的拒絕釘對稱，不衝突） ----
+
+    @Test
+    fun openAiRequest_exact4096Chars_passesValidation() {
+        // 上限恰好 4096 通過（>4096 才拒，見 OpenAiTtsClientTest 回絕側）。
+        val req = OpenAiTtsRequest(input = "A".repeat(OpenAiTtsRequest.MAX_INPUT_LENGTH))
+        assertEquals(OpenAiTtsRequest.MAX_INPUT_LENGTH, req.input.length)
+        assertEquals(OpenAiTtsModels.MAX_INPUT_LENGTH, OpenAiTtsRequest.MAX_INPUT_LENGTH)
+        assertEquals(4096, OpenAiTtsRequest.MAX_INPUT_LENGTH)
+    }
+
+    @Test
+    fun openAiRequest_speedEndpoints_passValidation() {
+        // speed 端點 0.25 / 4.0 通過（區間外才拒，見 OpenAiTtsClientTest 回絕側）。
+        for (speed in listOf(OpenAiTtsRequest.MIN_SPEED, OpenAiTtsRequest.MAX_SPEED)) {
+            val req = OpenAiTtsRequest(input = "Hello", speed = speed)
+            assertEquals(speed, req.speed)
+        }
+        assertEquals(0.25f, OpenAiTtsRequest.MIN_SPEED)
+        assertEquals(4.0f, OpenAiTtsRequest.MAX_SPEED)
+    }
+
+    // ---- B3: redirect 不跟隨釘（302+Location 單發即停） ----
+    //
+    // 非 JSON 200 截斷側已有 OpenAiTtsClientTest 覆蓋
+    //（errorHandling_502HtmlError：HTML 錯誤體截斷；
+    // errorHandling_jsonMessageWithControlChars_isSingleLineAndBounded：200 字元截斷），
+    // 此處不再重複。
+
+    @Test
+    fun openAiClient_doesNotFollowRedirect_302WithLocation() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(
+                MockResponse()
+                    .setResponseCode(302)
+                    .setHeader("Location", "https://evil.example.invalid/v1/audio/speech"),
+            )
+            val client = OpenAiTtsClient(
+                baseUrl = server.url("/").toString(),
+                allowTestLoopback = true,
+                apiKey = { "test-key".toCharArray() },
+            )
+            try {
+                client.synthesize(OpenAiTtsRequest(input = "Hello"))
+                fail("Expected OpenAiTtsException for 302 redirect")
+            } catch (e: OpenAiTtsException) {
+                assertEquals(302, e.statusCode)
+                // 不跟隨跳轉：恰一發，無第二發外送憑證。
+                assertEquals(1, server.requestCount)
+            }
+        } finally {
+            server.shutdown()
+        }
     }
 }

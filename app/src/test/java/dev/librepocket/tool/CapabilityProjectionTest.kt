@@ -71,7 +71,8 @@ class CapabilityProjectionTest {
         // shell.exec（開關預設關）與全量聯繫人（play FLAVOR_BLOCKED）隱藏；
         // S3 shell.elevated（自裝風味 + privilege_bridge 預設關）同樣隱藏。
         // + S1-A 6（clipboard.read/write 前台預設開；file.edit/patch/search/attach 開關 files 預設開）。
-        // + S2 2（voice.transcribe / voice.speak 開關預設開；voice.speak.azure 僅 GITHUB，play 隱藏）。
+        // + S2 2（voice.transcribe / voice.speak 開關預設開；voice.speak.azure 僅
+        //   GITHUB，play 隱藏；voice.speak.openai 開關預設關，play 預設隱藏）。
         val visible = ToolRegistry.projectedTools(
             playBase.copy(grantedPermissions = setOf("android.permission.READ_CALENDAR")),
         ).map { it.name }
@@ -155,8 +156,9 @@ class CapabilityProjectionTest {
 
     @Test fun scaffoldToolsHonestlyMarkedUntilWired() {
         // PR#1 re-review P1 scope：無產品 dispatcher 接線的工具必須標 SCAFFOLD，
-        // 避免「模型看得到、App 做不到」。8 個：shell.exec/shell.elevated +
-        // web.fetch + db.query/exec + gui.automate + linux.boot + voice.azure。
+        // 避免「模型看得到、App 做不到」。9 個：shell.exec/shell.elevated +
+        // web.fetch + db.query/exec + gui.automate + linux.boot + voice.azure +
+        // voice.openai。
         for (name in listOf(
             "shell.exec",
             "shell.elevated",
@@ -166,6 +168,7 @@ class CapabilityProjectionTest {
             ToolRegistry.SLOW_TOOL_NAME,
             "linux.boot",
             "voice.speak.azure",
+            "voice.speak.openai",
         )) {
             val desc = ToolRegistry.find(name)!!.description
             assertTrue("$name desc=$desc", desc.contains("SCAFFOLD"))
@@ -179,8 +182,9 @@ class CapabilityProjectionTest {
         // 供 gates/headers/audit 使用。接線 PR 逐工具翻 true 時同步更新本測試。
         //
         // P2 slice (#19)：`lsp.symbols` 是唯一完成接線的工具（見 SafeToolSlice），
-        // 故開關全開下 model 名單恰為 [lsp.symbols]；其餘（含 8 個 SCAFFOLD）
-        // 仍不得洩漏。
+        // 故開關全開下 model 名單恰為 [lsp.symbols]；其餘（含 9 個 SCAFFOLD）
+        // 仍不得洩漏。`voice.speak.openai` 另有雙閘：即使雙開關全開使投影 NATIVE，
+        // executionReady=false 仍將其擋在 model 名單外（見下新增斷言）。
         val permissiveGithub = ProjectionContext(
             flavor = Flavor.GITHUB,
             automationEnabled = true,
@@ -206,6 +210,7 @@ class CapabilityProjectionTest {
                 "voice_input" to true,
                 "voice_output" to true,
                 "azure_tts" to true,
+                "openai_tts" to true,
                 "linux" to true,
                 "compile" to true,
                 "decompile" to true,
@@ -220,6 +225,7 @@ class CapabilityProjectionTest {
             ToolRegistry.SLOW_TOOL_NAME,
             "linux.boot",
             "voice.speak.azure",
+            "voice.speak.openai",
         )
         for (name in scaffoldNames) {
             assertFalse(
@@ -239,5 +245,22 @@ class CapabilityProjectionTest {
         assertEquals(42, ToolRegistry.ALL.size)
         assertEquals(1, ToolRegistry.ALL.count { it.executionReady })
         assertTrue(ToolRegistry.find("lsp.symbols")!!.executionReady)
+    }
+
+    @Test fun openAiSpeak_dualGatedOutOfModelListEvenWhenBothSwitchesOn() {
+        // B1 雙閘釘：雙開關全開使投影 NATIVE，但 executionReady=false 仍將
+        // voice.speak.openai 擋在 model 名單外（投影可見 ≠ 模型可見）。
+        val ctx = ProjectionContext(
+            flavor = Flavor.GITHUB,
+            userSwitches = mapOf(
+                "voice_input" to true,
+                "voice_output" to true,
+                "openai_tts" to true,
+            ),
+        )
+        val projected = ToolRegistry.projectAll(ctx)["voice.speak.openai"]!!
+        assertEquals(CapabilityLevel.NATIVE, projected.level)
+        assertTrue(ToolRegistry.projectedTools(ctx).any { it.name == "voice.speak.openai" })
+        assertFalse(ToolRegistry.visibleTools(ctx).any { it.name == "voice.speak.openai" })
     }
 }

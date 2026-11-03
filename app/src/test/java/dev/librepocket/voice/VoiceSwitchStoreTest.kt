@@ -158,8 +158,10 @@ class VoiceSwitchStoreTest {
     fun gateHelpers_missingKeyFallsBackToDefault() {
         assertTrue(VoiceTools.inputEnabled(emptyMap()))
         assertTrue(VoiceTools.outputEnabled(emptyMap()))
+        assertFalse(VoiceTools.openAiTtsEnabled(emptyMap()))
         assertFalse(VoiceTools.inputEnabled(mapOf(VoiceTools.SWITCH_INPUT to false)))
         assertFalse(VoiceTools.outputEnabled(mapOf(VoiceTools.SWITCH_OUTPUT to false)))
+        assertTrue(VoiceTools.openAiTtsEnabled(mapOf(VoiceTools.SWITCH_OPENAI to true)))
     }
 
     @Test
@@ -255,6 +257,7 @@ class VoiceSwitchStoreTest {
             switches = mapOf(
                 VoiceTools.SWITCH_INPUT to true,
                 VoiceTools.SWITCH_OUTPUT to true,
+                VoiceTools.SWITCH_OPENAI to true,
             ),
             loaded = true,
             loadFailed = true,
@@ -269,12 +272,14 @@ class VoiceSwitchStoreTest {
         assertEquals(DenyReason.USER_DISABLED, projected.getValue(VoiceTools.TRANSCRIBE_NAME).reason)
         assertEquals(CapabilityLevel.UNAVAILABLE, projected.getValue(VoiceTools.SPEAK_NAME).level)
         assertEquals(DenyReason.USER_DISABLED, projected.getValue(VoiceTools.SPEAK_NAME).reason)
+        assertEquals(CapabilityLevel.UNAVAILABLE, projected.getValue(VoiceTools.OPENAI_SPEAK_NAME).level)
+        assertEquals(DenyReason.USER_DISABLED, projected.getValue(VoiceTools.OPENAI_SPEAK_NAME).reason)
     }
 
     @Test
     fun projection_loadingKeepsExistingDefaults() {
         // loading 態沿用既有預設（缺鍵即開；tool 側無 UI 等待語義，且語音工具
-        // 現階段 executionReady=false 不進模型名單）。
+        // 現階段 executionReady=false 不進模型名單）；openai 預設關故為 UNAVAILABLE。
         val projected = ToolRegistry.projectAll(
             ProjectionContext(
                 flavor = Flavor.PLAY,
@@ -283,6 +288,8 @@ class VoiceSwitchStoreTest {
         )
         assertEquals(CapabilityLevel.NATIVE, projected.getValue(VoiceTools.TRANSCRIBE_NAME).level)
         assertEquals(CapabilityLevel.NATIVE, projected.getValue(VoiceTools.SPEAK_NAME).level)
+        assertEquals(CapabilityLevel.UNAVAILABLE, projected.getValue(VoiceTools.OPENAI_SPEAK_NAME).level)
+        assertEquals(DenyReason.USER_DISABLED, projected.getValue(VoiceTools.OPENAI_SPEAK_NAME).reason)
     }
 
     @Test
@@ -356,6 +363,7 @@ class VoiceSwitchStoreTest {
             switches = mapOf(
                 VoiceTools.SWITCH_INPUT to true,
                 VoiceTools.SWITCH_OUTPUT to false,
+                VoiceTools.SWITCH_OPENAI to false,
             ),
             loaded = true,
             loadFailed = false,
@@ -364,6 +372,7 @@ class VoiceSwitchStoreTest {
             switches = mapOf(
                 VoiceTools.SWITCH_INPUT to false,
                 VoiceTools.SWITCH_OUTPUT to false,
+                VoiceTools.SWITCH_OPENAI to false,
             ),
             loaded = true,
             loadFailed = true,
@@ -388,6 +397,7 @@ class VoiceSwitchStoreTest {
             switches = mapOf(
                 VoiceTools.SWITCH_INPUT to false,
                 VoiceTools.SWITCH_OUTPUT to false,
+                VoiceTools.SWITCH_OPENAI to false,
             ),
         )
         assertEquals(loadedOff, VoiceSwitchSnapshot.decideEffective(loaded, loadedOff))
@@ -401,6 +411,7 @@ class VoiceSwitchStoreTest {
             switches = mapOf(
                 VoiceTools.SWITCH_INPUT to true,
                 VoiceTools.SWITCH_OUTPUT to true,
+                VoiceTools.SWITCH_OPENAI to false,
             ),
             loaded = true,
             loadFailed = false,
@@ -409,6 +420,7 @@ class VoiceSwitchStoreTest {
             switches = mapOf(
                 VoiceTools.SWITCH_INPUT to false,
                 VoiceTools.SWITCH_OUTPUT to false,
+                VoiceTools.SWITCH_OPENAI to false,
             ),
             loaded = true,
             loadFailed = true,
@@ -430,6 +442,7 @@ class VoiceSwitchStoreTest {
             switches = mapOf(
                 VoiceTools.SWITCH_INPUT to true,
                 VoiceTools.SWITCH_OUTPUT to true,
+                VoiceTools.SWITCH_OPENAI to false,
             ),
             loaded = true,
             loadFailed = false,

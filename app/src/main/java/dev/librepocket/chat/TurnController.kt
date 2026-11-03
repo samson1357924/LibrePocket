@@ -4101,6 +4101,10 @@ class TurnController(
         onCancelSettleWaitEnteredForTest?.invoke()
         withContext(NonCancellable) {
           withTimeoutOrNull(cancelSettleTimeoutMs) {
+            // C1 說明：此處為有界輪詢而非 awaitCancellation——需週期性重讀
+            // coreSubmitTruth 快照（pending 翻 false 即提前結束，不必等足超時），
+            // 且外層 withTimeoutOrNull 已給定上限；awaitCancellation 會無限期
+            // 等待、失去「提交完成即提前收斂」語義，故保留短間隔 delay 輪詢。
             while (orderedTranscript.coreSubmitTruth(cancelId).pending) delay(10)
           }
         }
@@ -5875,8 +5879,8 @@ class TurnController(
     // P2 slice: tools attach ONLY the loop's offer (visibleTools ∩ slice,
     // empty when the loop is absent — the production composition — or when
     // the slice projects unavailable). ChatRequest.tools may only carry
-    // ToolRegistry.visibleTools() output (projection + executionReady); 41
-    // tools stay executionReady=false, so a non-slice request is pure-chat
+    // ToolRegistry.visibleTools() output (projection + executionReady); all
+    // other tools stay executionReady=false, so a non-slice request is pure-chat
     // by construction.
     // P2 slice: after a tool round has executed this turn, never advertise
     // tools again (continuation or retry) — only paired result/terminal

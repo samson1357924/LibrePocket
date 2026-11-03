@@ -213,6 +213,22 @@ class VoiceDisclosureTest {
         assertFalse(settings.contains("音檔採純記憶體串流播放不落地"))
     }
 
+    @Test fun settings_openAiVoiceCardHonestAboutUnwiredDefaultOffAndKeyAndCost() {
+        // 脆弱性：見本節說明。Stage-3 誠實性釘：未接線開關必須明示預設關閉／無作用、
+        // 金鑰可達路徑（KeyVault providerId）、費用揭露與 SCAFFOLD 標記皆不可靜默消失。
+        val settings = findSource(
+            "src/main/java/dev/librepocket/agent/ui/settings/SettingsScreen.kt",
+            "app/src/main/java/dev/librepocket/agent/ui/settings/SettingsScreen.kt",
+        ).readText()
+        assertTrue(settings.contains("預設關閉"))
+        assertTrue(settings.contains("API 金鑰"))
+        assertTrue(settings.contains("SCAFFOLD"))
+        assertTrue(settings.contains("尚未接線，目前無作用"))
+        assertTrue(settings.contains("依其定價產生費用"))
+        assertTrue(settings.contains("未接線前一律使用系統語音"))
+        assertFalse("must not claim fallback-before-wired as downgrade", settings.contains("未接妥前降級走系統語音"))
+    }
+
     @Test fun manifestDeclaresTtsServiceVisibility() {
         // Stage1 manifest 修復的對應測試：TTS_SERVICE 可見性供 getEngines() 引擎探測；
         // targetSdk 36 package-visibility 過濾下若缺此宣告，引擎表可能為空而被誤判 NO_ENGINE。

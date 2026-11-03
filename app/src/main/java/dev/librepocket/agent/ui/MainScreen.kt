@@ -118,7 +118,13 @@ fun MainScreen(
     val voiceUiSwitches = if (voiceEffectiveSnapshot.loaded && !voiceEffectiveSnapshot.loadFailed) {
         voiceEffectiveSnapshot.switches
     } else {
-        mapOf(VoiceTools.SWITCH_INPUT to false, VoiceTools.SWITCH_OUTPUT to false)
+        // fail-closed 全關：與 VoiceTools.projectionSwitches 同形（三鍵皆 false），
+        // 避免 UI 隱藏但 tool 投影仍可用的分叉。
+        mapOf(
+            VoiceTools.SWITCH_INPUT to false,
+            VoiceTools.SWITCH_OUTPUT to false,
+            VoiceTools.SWITCH_OPENAI to false,
+        )
     }
     // R5-1: ack 同 pattern，只為穩定 Flow 身分（其上游重收本就只重發當前值，
     // 無 LOADING 閃斷）；初值 false 保持未確認語義。勿改回內聯。

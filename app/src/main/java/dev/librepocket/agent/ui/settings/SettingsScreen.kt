@@ -131,7 +131,9 @@ fun SettingsScreen(
     onOpenSystemA11y: () -> Unit = {},
     /**
      * #3 語音開關（DataStore 持久化，單一真相源見 `VoiceSwitchStore`）：
-     * 預設皆開；關閉即隱藏聊天頁對應入口（mic 鈕／朗讀鈕，與投影層同 key）。
+     * 三鍵預設：`voice_input` 開、`voice_output` 開、`openai_tts` 關（SCAFFOLD，
+     * 目前尚未接線，切換僅持久化開關值、無任何作用）；
+     * 關閉即隱藏聊天頁對應入口（mic 鈕／朗讀鈕，與投影層同 key）。
      * 形狀仿無障礙自動化開關（checked + onCheckedChange 回調）。
      * R4-2 三態：[voiceSwitchesEnabled] 為 `loaded && !loadFailed`（loading／
      * 失敗態禁用開關，避免在未知真相源上寫入）；[voiceLoadFailed] 時另顯示
@@ -282,9 +284,11 @@ fun SettingsScreen(
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
                             "雲端語音（OpenAI）支援所有版本，需同時開啟「語音輸出」與「OpenAI 語音」" +
-                                "（後者預設關閉）；需設定 OpenAI API 金鑰；" +
+                                "（後者預設關閉，目前尚未接線，切換無作用）；" +
+                                "需經端點設定（KeyVault providerId \"openai_tts\"）設定 OpenAI API 金鑰；" +
                                 VoiceTools.OPENAI_VOICE_DISCLOSURE + "；" +
-                                "送雲前會再次遮罩敏感內容（SCAFFOLD：管線接線尚在收斂，未接妥前降級走系統語音）。",
+                                "送雲前會再次遮罩敏感內容；使用 OpenAI 語音會依其定價產生費用" +
+                                "（SCAFFOLD：管線接線尚在收斂，未接線前一律使用系統語音）。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -342,7 +346,7 @@ fun SettingsScreen(
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text(
-                                "OpenAI 語音",
+                                "OpenAI 語音（尚未接線，目前無作用）",
                                 style = MaterialTheme.typography.bodyMedium,
                                 modifier = Modifier.weight(1f),
                             )

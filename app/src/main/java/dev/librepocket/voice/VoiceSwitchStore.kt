@@ -33,8 +33,8 @@ private const val TAG = "VoiceSwitchStore"
  * Map 形狀無法區分的三種情形在此顯式分開：
  * - loading（[loaded]=false）：首發射前／DataStore 尚未吐值，[switches] 為空，
  *   UI 門禁一律視為關閉（fail-closed），不經產品預設開；
- * - loaded（[loaded]=true，[loadFailed]=false）：[switches] 兩鍵恆在，
- *   無 key 照常填產品預設 true；
+ * - loaded（[loaded]=true，[loadFailed]=false）：[switches] 三鍵恆在，
+ *   缺鍵照常填各自產品預設（input/output 開，openai 關）；
  * - loadFailed（[loadFailed]=true）：讀取拋預期 IO 例外，[switches] 為全關
  *   fail-closed 值，UI 門禁與 tool 投影皆視為關閉。
  */
@@ -73,14 +73,19 @@ data class VoiceSwitchSnapshot(
 /**
  * 語音開關單一真相源（#3，Stage3 完整接線）。
  *
- * - DataStore 持久化 `voice_input` / `voice_output`（key 名與
- *   [VoiceTools.SWITCH_INPUT] / [VoiceTools.SWITCH_OUTPUT] 一致，缺鍵即預設開）；
+ * - DataStore 持久化 `voice_input` / `voice_output` / `openai_tts`（key 名與
+ *   [VoiceTools.SWITCH_INPUT] / [VoiceTools.SWITCH_OUTPUT] /
+ *   [VoiceTools.SWITCH_OPENAI] 一致；缺鍵即預設值：input/output 開，openai 關）；
  * - [observeSwitches] 回傳 [VoiceSwitchSnapshot] 三態（loading／loaded／loadFailed）：
- *   UI 門禁經 `VoiceTools.inputEnabled(snapshot)`／`outputEnabled(snapshot)` 讀快照
+ *   UI 門禁經 `VoiceTools.inputEnabled(snapshot)`／`outputEnabled(snapshot)`／
+ *   `openAiTtsEnabled(snapshot)` 讀快照
  *   （`!loaded || loadFailed` 一律關閉），`ChatScreen(userSwitches=...)` 仍收 Map
  *   （呼叫方傳 fail-closed 後的 map，見 MainScreen），`ProjectionContext(userSwitches=...)`
- *   經 `VoiceTools.projectionSwitches` 同一快照轉換（loadFailed 視為關），三處讀同一真相源、
- *   預設一致（見 [VoiceTools.inputEnabled] / [VoiceTools.outputEnabled]）；
+ *   經 `VoiceTools.projectionSwitches` 同一快照轉換（loadFailed 視為關，三鍵同形），
+ *   三處讀同一真相源、預設一致
+ *   （見 [VoiceTools.inputEnabled] / [VoiceTools.outputEnabled] /
+ *   [VoiceTools.openAiTtsEnabled]）；`openai_tts` 生效面在接線前僅為開關值持久化，
+ *   不觸發任何雲端呼叫；
  * - 生產路徑 tool 投影目前並無其他 userSwitches 來源（policy store 存的是
  *   ruleset 而非開關；`TurnController` 尚未把工具掛上請求），故本 store 即
  *   未來投影接線時唯一的開關讀取點；

@@ -67,4 +67,26 @@ class GithubA11yConfigTest {
         assertTrue(zhStrings.contains("name=\"accessibility_description\""))
         assertTrue(zhStrings.contains("LibrePocket 小幫手：螢幕逐步協助（預設關閉；付款／刪除／發送步驟一律先詢問）。"))
     }
+
+    @Test fun chatSharedStringsPresentInBothLocales() {
+        // PR 128 Phase 4: thinking state + streaming indicator strings live in the shared
+        // main source set. The shared ChatMarkdownUiTest locale tests run in all three
+        // flavor unit-test tasks (testPlay/testFoss/testGithub); this file-content check
+        // pins the main values/values-zh presence from this flavor's task as well.
+        fun mainRes(dir: String): String = findSource(
+            "src/main/res/$dir/strings.xml",
+            "app/src/main/res/$dir/strings.xml",
+        ).readText()
+        val en = mainRes("values")
+        val zh = mainRes("values-zh")
+        for (name in listOf(
+            "chat_thinking_state_expanded",
+            "chat_thinking_state_collapsed",
+            "chat_streaming_status",
+            "chat_streaming_label",
+        )) {
+            assertTrue(en.contains("name=\"$name\""))
+            assertTrue(zh.contains("name=\"$name\""))
+        }
+    }
 }

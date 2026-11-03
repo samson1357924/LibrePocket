@@ -15,6 +15,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.platform.ClipboardManager
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.SemanticsMatcher
@@ -762,10 +763,14 @@ class ChatMarkdownUiTest {
         assertEquals("思考中…", zhContext.getString(R.string.chat_thinking_in_progress))
         assertEquals("收折思考過程", zhContext.getString(R.string.chat_thinking_collapse))
         assertEquals("展開思考過程", zhContext.getString(R.string.chat_thinking_expand))
+        assertEquals("已展開", zhContext.getString(R.string.chat_thinking_state_expanded))
+        assertEquals("已收合", zhContext.getString(R.string.chat_thinking_state_collapsed))
         assertEquals("Code", zhContext.getString(R.string.chat_code_default_language))
         assertEquals("複製程式碼", zhContext.getString(R.string.chat_code_copy_description))
         assertEquals("複製", zhContext.getString(R.string.chat_code_copy))
         assertEquals("已複製", zhContext.getString(R.string.chat_code_copied))
+        assertEquals("正在串流回覆", zhContext.getString(R.string.chat_streaming_status))
+        assertEquals("串流中…", zhContext.getString(R.string.chat_streaming_label))
         // Verify flavor app_name is preserved in Chinese locale rather than overridden by main
         assertEquals(context.getString(R.string.app_name), zhContext.getString(R.string.app_name))
     }
@@ -781,10 +786,14 @@ class ChatMarkdownUiTest {
         assertEquals("Thinking…", enContext.getString(R.string.chat_thinking_in_progress))
         assertEquals("Collapse thinking process", enContext.getString(R.string.chat_thinking_collapse))
         assertEquals("Expand thinking process", enContext.getString(R.string.chat_thinking_expand))
+        assertEquals("Expanded", enContext.getString(R.string.chat_thinking_state_expanded))
+        assertEquals("Collapsed", enContext.getString(R.string.chat_thinking_state_collapsed))
         assertEquals("Code", enContext.getString(R.string.chat_code_default_language))
         assertEquals("Copy code", enContext.getString(R.string.chat_code_copy_description))
         assertEquals("Copy", enContext.getString(R.string.chat_code_copy))
         assertEquals("Copied", enContext.getString(R.string.chat_code_copied))
+        assertEquals("Streaming reply in progress", enContext.getString(R.string.chat_streaming_status))
+        assertEquals("Streaming…", enContext.getString(R.string.chat_streaming_label))
     }
 
     @Test
@@ -1280,5 +1289,185 @@ class ChatMarkdownUiTest {
         composeRule.waitForIdle()
         composeRule.onNodeWithText("partial").assertIsDisplayed()
         composeRule.onNodeWithText(context.getString(R.string.chat_code_copy)).assertIsDisplayed()
+    }
+
+    @Test
+    fun thinkingBlockView_header_exposesExpandedCollapsedStateDescription() {
+        var block by mutableStateOf(
+            ChatContentBlock.ThinkingBlock(
+                content = "Reasoning...",
+                isStreaming = false,
+            )
+        )
+
+        composeRule.setContent {
+            MaterialTheme {
+                ThinkingBlockView(block = block)
+            }
+        }
+
+        val title = context.getString(R.string.chat_thinking_title)
+        val collapsedState = context.getString(R.string.chat_thinking_state_collapsed)
+        val expandedState = context.getString(R.string.chat_thinking_state_expanded)
+
+        // Collapsed by default when not streaming: header announces collapsed state.
+        composeRule.onNodeWithText(title)
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, collapsedState))
+
+        // Expand: announced state flips to expanded.
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithText(title)
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, expandedState))
+
+        // Collapse again: announced state flips back.
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithText(title)
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, collapsedState))
+    }
+
+    @Test
+    fun thinkingBlockView_streamingHeader_announcesExpandedStateByDefault() {
+        val block = ChatContentBlock.ThinkingBlock(
+            content = "Streaming...",
+            isStreaming = true,
+        )
+
+        composeRule.setContent {
+            MaterialTheme {
+                ThinkingBlockView(block = block)
+            }
+        }
+
+        composeRule.onNodeWithText(context.getString(R.string.chat_thinking_title))
+            .assert(
+                SemanticsMatcher.expectValue(
+                    SemanticsProperties.StateDescription,
+                    context.getString(R.string.chat_thinking_state_expanded),
+                )
+            )
+    }
+
+    @Test
+    fun codeBlockView_copyButton_isPoliteLiveRegion() {
+        val block = ChatContentBlock.CodeBlock(
+            language = "kotlin",
+            code = "val x = 1",
+            isStreaming = false,
+        )
+
+        composeRule.setContent {
+            MaterialTheme {
+                CodeBlockView(block = block)
+            }
+        }
+
+        // Copy/Copied feedback is text-only, so the button must be a polite live region
+        // for TalkBack to announce the Copied confirmation.
+        composeRule.onNodeWithContentDescription(context.getString(R.string.chat_code_copy_description))
+            .assert(
+                SemanticsMatcher.expectValue(
+                    SemanticsProperties.LiveRegion,
+                    LiveRegionMode.Polite,
+                )
+            )
+    }
+
+    @Test
+    fun codeBlockView_streamingCursor_announcesPlainCodeWithoutGlyph() {
+        val code = "val streaming = true"
+
+        composeRule.setContent {
+            MaterialTheme {
+                CodeBlockView(
+                    block = ChatContentBlock.CodeBlock(
+                        language = "kotlin",
+                        code = code,
+                        isStreaming = true,
+                    )
+                )
+            }
+        }
+
+        // Visual text keeps the cursor...
+        composeRule.onNodeWithText("$code \u258D").assertIsDisplayed()
+        // ...but the announcement is the plain code without the cursor glyph.
+        composeRule.onNodeWithContentDescription(code).assertIsDisplayed()
+    }
+
+    @Test
+    fun thinkingBlockView_streamingCursor_announcesPlainContentWithoutGlyph() {
+        val content = "Reasoning in progress"
+
+        composeRule.setContent {
+            MaterialTheme {
+                ThinkingBlockView(
+                    block = ChatContentBlock.ThinkingBlock(
+                        content = content,
+                        isStreaming = true,
+                    )
+                )
+            }
+        }
+
+        composeRule.onNodeWithText("$content \u258D").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(content).assertIsDisplayed()
+    }
+
+    @Test
+    fun chatMarkdownView_emptyStreaming_announcesStreamingLabelInsteadOfCursor() {
+        // Blank input yields no blocks, hitting the standalone-cursor branch.
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(text = "   ", isStreaming = true)
+            }
+        }
+
+        val label = context.getString(R.string.chat_streaming_label)
+        composeRule.onNodeWithText("\u258D").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(label).assertIsDisplayed()
+    }
+
+    @Test
+    fun chatMarkdownView_streamingParagraph_announcesTextWithoutCursor() {
+        val body = "Streaming paragraph body"
+
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(text = body, isStreaming = true)
+            }
+        }
+
+        composeRule.onNodeWithText("$body \u258D").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(body).assertIsDisplayed()
+    }
+
+    @Test
+    fun chatMarkdownView_trailingCursor_announcesStreamingLabel() {
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(
+                    text = "<think>Reasoning complete.</think>",
+                    isStreaming = true,
+                )
+            }
+        }
+
+        val label = context.getString(R.string.chat_streaming_label)
+        composeRule.onNodeWithText("\u258D").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(label).assertIsDisplayed()
+    }
+
+    @Test
+    fun sanitizeCodeForClipboard_stripsEscAndZeroWidthCharacters() {
+        val raw = "ab\u001B[2Jcd\u200Be\u200Cf\u200Dg\u200Eh\u200Fi\uFEFFj\u2060k\u2061l\u2062m\u2063n\u2064o"
+        assertEquals("ab[2Jcdefghijklmno", sanitizeCodeForClipboard(raw))
+    }
+
+    @Test
+    fun sanitizeCodeForClipboard_stripsLineAndParagraphSeparators() {
+        assertEquals("abcd", sanitizeCodeForClipboard("ab\u2028cd"))
+        assertEquals("abcd", sanitizeCodeForClipboard("ab\u2029cd"))
+        // Plain newlines are preserved (multi-line paste risk is documented, not removed).
+        assertEquals("a\nb", sanitizeCodeForClipboard("a\nb"))
     }
 }

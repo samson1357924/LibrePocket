@@ -60,12 +60,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import dev.librepocket.agent.R
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.tool.DenyReason
@@ -438,12 +440,14 @@ fun ChatScreen(
                 }
                 if (streaming) {
                     item {
+                        val streamingStatus = stringResource(R.string.chat_streaming_status)
+                        val streamingLabel = stringResource(R.string.chat_streaming_label)
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .semantics {
                                     liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite
-                                    contentDescription = "正在串流回覆"
+                                    contentDescription = streamingStatus
                                 },
                             horizontalArrangement = Arrangement.Start,
                         ) {
@@ -458,10 +462,14 @@ fun ChatScreen(
                                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 ) {
                                     CircularProgressIndicator(
-                                        modifier = Modifier.padding(2.dp),
+                                        modifier = Modifier
+                                            .padding(2.dp)
+                                            .semantics {
+                                                contentDescription = streamingStatus
+                                            },
                                         strokeWidth = 2.dp,
                                     )
-                                    Text("串流中…")
+                                    Text(streamingLabel)
                                 }
                             }
                         }
@@ -939,6 +947,9 @@ internal fun MessageBubble(
                         text = if (msg.isPartial) displayText + " ▍" else displayText,
                         style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        // Streaming cursor "▍" is visual only: announce the plain text
+                        // so TalkBack skips the cursor glyph.
+                        modifier = Modifier.semantics { contentDescription = displayText },
                     )
                 } else {
                     ChatMarkdownView(

@@ -38,9 +38,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -65,6 +68,12 @@ internal fun ThinkingBlockView(
     // Prepend/reorder stability relies on the outer key(block.key) in ChatMarkdownView keeping
     // each card's node (and thus this rememberSaveable) attached to the same content.
     val isExpanded = userExpanded ?: block.isStreaming
+    // Accessibility: the header is a Button whose expanded/collapsed state is exposed
+    // via stateDescription (TalkBack announces it alongside the title). The chevron
+    // Icon keeps its expand/collapse description as a redundant affordance cue.
+    val stateDesc = stringResource(
+        if (isExpanded) R.string.chat_thinking_state_expanded else R.string.chat_thinking_state_collapsed
+    )
 
     Card(
         modifier = modifier.fillMaxWidth(),
@@ -83,6 +92,7 @@ internal fun ThinkingBlockView(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(8.dp))
+                    .semantics { stateDescription = stateDesc }
                     .clickable(role = Role.Button) { userExpanded = !isExpanded }
                     .defaultMinSize(minHeight = 48.dp)
                     .padding(horizontal = 12.dp, vertical = 8.dp),
@@ -119,11 +129,16 @@ internal fun ThinkingBlockView(
                     color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
                     thickness = 0.5.dp,
                 )
+                // The streaming cursor "▍" is visual only: expose the plain content as the
+                // contentDescription so TalkBack reads the reasoning text without the
+                // cursor glyph, while the visible Text keeps the cursor.
                 Text(
                     text = if (block.isStreaming) block.content + " ▍" else block.content,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.85f),
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    modifier = Modifier
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                        .semantics { contentDescription = block.content },
                 )
             }
         }
@@ -188,12 +203,20 @@ internal fun CodeBlockView(
                 Row(
                     modifier = Modifier
                         .clip(RoundedCornerShape(4.dp))
-                        .semantics { contentDescription = copyDescription }
+                        // Copy/Copied feedback is text-only visually, so mark the button as a
+                        // polite live region: TalkBack announces the Copied confirmation.
+                        .semantics {
+                            contentDescription = copyDescription
+                            liveRegion = LiveRegionMode.Polite
+                        }
                         .clickable(
                             enabled = copyEnabled,
                             role = Role.Button,
                         ) {
                             try {
+                                // Residual risk: the clipboard is system-globally readable and
+                                // has no auto-clear; the copied snippet stays there until
+                                // overwritten. Users should avoid copying secrets.
                                 clipboardManager.setText(AnnotatedString(sanitizeCodeForClipboard(block.code)))
                                 copied = true
                             } catch (_: Exception) {
@@ -236,12 +259,15 @@ internal fun CodeBlockView(
                     .padding(12.dp),
             ) {
                 val displayCode = if (block.isStreaming) block.code + " ▍" else block.code
+                // Streaming cursor "▍" is visual only (see ThinkingBlockView): announce the
+                // plain code so TalkBack skips the cursor glyph.
                 Text(
                     text = displayCode,
                     fontFamily = FontFamily.Monospace,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     softWrap = false,
+                    modifier = Modifier.semantics { contentDescription = block.code },
                 )
             }
         }
@@ -270,11 +296,16 @@ internal fun ChatMarkdownView(
     }
 
     if (blocks.isEmpty() && isStreaming) {
+        // Decorative streaming cursor: visual only, announced via the streaming label
+        // so TalkBack does not read the "▍" glyph.
+        val cursorDescription = stringResource(R.string.chat_streaming_label)
         Text(
             text = "▍",
             style = MaterialTheme.typography.bodyLarge,
             color = textColor,
-            modifier = modifier,
+            modifier = modifier.semantics {
+                contentDescription = cursorDescription
+            },
         )
         return
     }
@@ -302,10 +333,15 @@ internal fun ChatMarkdownView(
                         } else {
                             block.annotatedText
                         }
+                        // Streaming cursor "▍" is visual only: announce the paragraph text
+                        // without the cursor glyph.
                         Text(
                             text = content,
                             style = MaterialTheme.typography.bodyLarge,
                             color = textColor,
+                            modifier = Modifier.semantics {
+                                contentDescription = block.annotatedText.text
+                            },
                         )
                     }
                 }
@@ -321,10 +357,15 @@ internal fun ChatMarkdownView(
                 null -> false
             }
             if (!lastBlockIsStreaming) {
+                // Decorative trailing cursor (see empty-streaming case above).
+                val trailingCursorDescription = stringResource(R.string.chat_streaming_label)
                 Text(
                     text = "▍",
                     style = MaterialTheme.typography.bodyLarge,
                     color = textColor,
+                    modifier = Modifier.semantics {
+                        contentDescription = trailingCursorDescription
+                    },
                 )
             }
         }
@@ -334,18 +375,39 @@ internal fun ChatMarkdownView(
 /**
  * Sanitizes code snippets before copying to clipboard.
  *
- * - Normalizes Windows CRLF (`\r\n`) to LF (`\n`).
- * - Strips isolated CR (`\r`) characters to prevent terminal line overwrite attacks.
- * - Strips Unicode BiDi formatting characters:
- *   - LRE, RLE, PDF, LRO, RLO (`\u202A`..`\u202E`)
- *   - LRI, RLI, FSI, PDI (`\u2066`..`\u2069`)
+ * Single O(N) pass over the normalized text (one StringBuilder append per kept char).
+ *
+ * - Normalizes Windows CRLF to LF.
+ * - Strips isolated CR characters to prevent terminal line overwrite attacks.
+ * - Strips ASCII ESC to block ANSI terminal escape sequences
+ *   (cursor movement, alternate screen, title setting) hidden in copied code.
+ * - Strips Unicode BiDi formatting characters (LRE/RLE/PDF/LRO/RLO and
+ *   LRI/RLI/FSI/PDI ranges).
+ * - Strips zero-width / invisible characters that alter rendering or pasted bytes
+ *   (ZWSP/ZWNJ/ZWJ, LRM/RLM, ZWNBSP/BOM, word joiner and invisible operators).
+ * - Strips Unicode line/paragraph separators, which some terminals and editors
+ *   treat as line breaks.
+ *
+ * Residual risk (documented, not eliminated): newlines themselves are preserved, so
+ * pasting multi-line output into a terminal still executes it line by line. Review
+ * pasted code before running it. The clipboard is also system-globally readable with
+ * no auto-clear: the sanitized snippet stays there until overwritten, so avoid
+ * copying secrets.
  */
 internal fun sanitizeCodeForClipboard(text: String): String {
     val normalized = text.replace("\r\n", "\n").replace("\r", "")
     val sb = StringBuilder(normalized.length)
     for (i in 0 until normalized.length) {
         val ch = normalized[i]
+        if (ch == '\u001B') {
+            continue
+        }
         if (ch in '\u202A'..'\u202E' || ch in '\u2066'..'\u2069') {
+            continue
+        }
+        if (ch in '\u200B'..'\u200D' || ch in '\u200E'..'\u200F' || ch == '\uFEFF'
+            || ch in '\u2060'..'\u2064' || ch in '\u2028'..'\u2029'
+        ) {
             continue
         }
         sb.append(ch)

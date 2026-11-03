@@ -20,9 +20,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -40,6 +41,7 @@ private class SlowThenFastListProvider(
     val entered: CountDownLatch = CountDownLatch(1),
     val release: CountDownLatch = CountDownLatch(1),
     val slowDone: CountDownLatch = CountDownLatch(1),
+    val fastDone: CountDownLatch = CountDownLatch(1),
     val calls: AtomicInteger = AtomicInteger(0),
 ) : LlmProvider {
     override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
@@ -48,14 +50,9 @@ private class SlowThenFastListProvider(
      * Deterministic slow/fast race (F2): call order is fixed by the gate, not
      * by thread scheduling.
      *
-     * The first call (slow attempt A) signals [entered] then blocks on
-     * [release] until Main has launched the fast attempt B. After release it
-     * delays 300ms so it always finishes AFTER B: on pre-A2 code (no
-     * cancel/generation guard) A overwrites B and the terminal value is the
-     * 5-item slow list (RED); on post-A2 code A is cancelled at the edit (or
-     * stale-discarded by the generation guard) and the terminal value is the
-     * 2-item fast list (GREEN). [calls] proves both attempts ran, so the
-     * assertion checks discard rather than a lucky single-run value.
+     * H2 sleep-free：固定 delay(300) 改為條件手遞——慢 A 等快 B 完成後才回，
+     * 保證慢後快先，無時間猜測。pre-A2（無 cancel／generation guard）慢覆寫為
+     * 5（RED）；post-A2 丟棄為 2（GREEN）。[calls] 證明雙跑，斷言釘住丟棄。
      */
     override fun stream(request: ChatRequest): Flow<StreamEvent> = emptyFlow()
 
@@ -65,13 +62,17 @@ private class SlowThenFastListProvider(
             entered.countDown()
             if (!release.await(10, TimeUnit.SECONDS)) error("slow gate timeout")
             try {
-                delay(300)
+                if (!fastDone.await(10, TimeUnit.SECONDS)) error("fast completion gate timeout")
                 return listOf("slow-1", "slow-2", "slow-3", "slow-4", "slow-5")
             } finally {
                 slowDone.countDown()
             }
         } else {
-            return listOf("fast-1", "fast-2")
+            try {
+                return listOf("fast-1", "fast-2")
+            } finally {
+                fastDone.countDown()
+            }
         }
     }
 }
@@ -228,7 +229,7 @@ class SetupEditKeepExistingTest {
     }
 
     @Test
-    fun slowTestConnectionDoesNotOverwriteNewer() {
+    fun slowTestConnectionDoesNotOverwriteNewer() = runBlocking {
         val store = newStore()
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         val fake = SlowThenFastListProvider()
@@ -248,14 +249,15 @@ class SetupEditKeepExistingTest {
         // Release slow AFTER fast launched so slow always finishes last: pre-A2
         // overwrites to 5 (RED), post-A2 discards to 2 (GREEN).
         fake.release.countDown()
-        // Wait for the slow attempt's stale write to have been attempted
-        // (discarded post-A2), then settle: the terminal value must be fast's.
+        // H2 sleep-free：固定 Thread.sleep(500) 改為 first+withTimeout 負向控制——
+        // 慢 5-item 若出現（pre-A2 覆寫）即 first 命中紅；1s 內無慢即丟棄成立綠。
+        // [calls] 證明雙跑，斷言釘住丟棄而非單次幸運值。
         assertTrue("slow attempt never finished", fake.slowDone.await(10, TimeUnit.SECONDS))
         awaitTestIdle(vm)
-        // Allow the stale IO update (if any) to land before asserting the
-        // terminal value — otherwise a pre-A2 overwrite racing the assert
-        // could read as a false GREEN.
-        Thread.sleep(500)
+        val slowAppeared = withTimeoutOrNull(1_000) {
+            vm.form.first { it.testModels == 5 }
+        }
+        assertNull("slow result must be discarded (stale write appeared)", slowAppeared)
         assertNull(vm.form.value.errorCode)
         assertEquals(2, vm.form.value.testModels)
         // Both attempts ran; the slow 5-item result was discarded, not terminal.

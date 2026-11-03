@@ -1779,8 +1779,13 @@ class ProviderTransportTest {
                 withTimeout(20_000) {
                     while (signals.consumedBytes.get() < MODEL_LIST_BODY_LIMIT_BYTES - 64 * 1024) delay(50)
                 }
-                // Let in-flight 8KiB reads advance into the stall block.
-                delay(300)
+                // H2 sleep-free：固定 delay(300) 改為條件確認——cap 已達＋Job 仍活
+                // 即證明卡在 stall 讀（throttle 保證 5s 檔牆），直接取消，無時間猜測。
+                // RED：若未達 cap 即取消，cancelled 斷言仍會因未進入 stall 而紅。
+                withTimeout(5_000) {
+                    while (!active.isActive) delay(10)
+                    check(active.isActive) { "stall job must still be active before cancel" }
+                }
                 withTimeout(1_500) { active.cancelAndJoin() }
                 assertCallCancelled(signals, "$protocol stalled chunked body")
                 withTimeoutOrNull(1_500) { active.join() }

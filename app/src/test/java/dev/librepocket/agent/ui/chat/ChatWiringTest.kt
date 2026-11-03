@@ -18,7 +18,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.emptyFlow
@@ -734,11 +733,14 @@ class ChatWiringTest {
     fun steerWhileBusyQueuesFollowUp() {
         val store = newStore()
         runBlocking { store.save(sampleEndpoint()) }
+        // H2 sleep-free：固定 delay(300) 改為條件閘——provider 停在閘上，
+        // 測試以 STREAMING＋pendingSteer 條件放行，無時間猜測。
+        // RED：若閘未被正確等待（例如移回固定 delay），busy 競態即 flaky 紅。
+        val gate = CompletableDeferred<Unit>()
         val fake = FakeChatProvider { _ ->
             flow {
                 emit(StreamEvent.TextDelta(0, 0, "part"))
-                // Provider stub stimulus: bounded streaming gap, fenced by awaitTrue below.
-                delay(300)
+                gate.await()
                 emit(StreamEvent.Done("stop"))
             }
         }
@@ -748,6 +750,7 @@ class ChatWiringTest {
         awaitTrue { vm.sessionState.value.status == ChatStatus.STREAMING }
         onMain { vm.steer("follow") }
         awaitTrue { vm.sessionState.value.pendingSteerCount == 1 || vm.messages.value.size == 4 }
+        gate.complete(Unit)
         awaitTrue(timeoutMs = 12000) { vm.messages.value.size == 4 }
         assertEquals("follow", vm.messages.value[2].text)
     }

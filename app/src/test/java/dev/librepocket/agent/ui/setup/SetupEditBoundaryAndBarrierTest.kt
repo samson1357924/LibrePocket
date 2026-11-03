@@ -23,11 +23,13 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -40,6 +42,7 @@ private class SlowRefreshListProvider(
     val entered: CountDownLatch = CountDownLatch(1),
     val release: CountDownLatch = CountDownLatch(1),
     val slowDone: CountDownLatch = CountDownLatch(1),
+    val fastDone: CountDownLatch = CountDownLatch(1),
     val calls: AtomicInteger = AtomicInteger(0),
 ) : LlmProvider {
     override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
@@ -51,13 +54,19 @@ private class SlowRefreshListProvider(
             entered.countDown()
             if (!release.await(10, TimeUnit.SECONDS)) error("slow refresh gate timeout")
             try {
-                delay(300)
+                // H2 sleep-free：固定 delay(300) 改為條件手遞——慢 A 等快 B 完成後才回，
+                // 保證「慢後快先」排序，無時間猜測；pre-barrier 下慢覆寫仍必現（紅）。
+                if (!fastDone.await(10, TimeUnit.SECONDS)) error("fast completion gate timeout")
                 return listOf("slow-r1", "slow-r2", "slow-r3", "slow-r4", "slow-r5")
             } finally {
                 slowDone.countDown()
             }
         } else {
-            return listOf("fast-r1", "fast-r2")
+            try {
+                return listOf("fast-r1", "fast-r2")
+            } finally {
+                fastDone.countDown()
+            }
         }
     }
 }
@@ -334,6 +343,8 @@ class SetupEditBoundaryAndBarrierTest {
         // 非同步 revision barrier（refresh 側）：慢 A 完成晚於快 B，舊結果丟棄。
         // 與 SetupEditKeepExistingTest.slowTestConnectionDoesNotOverwriteNewer 對稱；
         // 雙閘（entryRevision＋modelRefreshGeneration）缺一即此測試轉紅。
+        // H2 sleep-free：終端 delay(500) 改為 first+withTimeout 負向控制——
+        // 慢結果若出現（pre-barrier 覆寫）即 first 命中紅；1s 內無慢即丟棄成立綠。
         val store = newStore()
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         val fake = SlowRefreshListProvider()
@@ -353,8 +364,10 @@ class SetupEditBoundaryAndBarrierTest {
         fake.release.countDown()
         assertTrue("slow refresh never finished", fake.slowDone.await(10, TimeUnit.SECONDS))
         awaitModelsIdle(vm)
-        // 讓 stale 寫回窗口先落定（若有），再斷言終值——否則 pre-barrier 覆寫會誤判綠。
-        delay(500)
+        val slowAppeared = withTimeoutOrNull(1_000) {
+            vm.form.first { it.modelOptions.any { o -> o.startsWith("slow-r") } }
+        }
+        assertNull("slow result must be discarded (stale write appeared): $slowAppeared", slowAppeared)
         assertNull(vm.form.value.errorCode)
         assertFalse(vm.form.value.modelsLoading)
         val options = vm.form.value.modelOptions

@@ -52,7 +52,7 @@ interface AudioPlayer {
 
 /**
  * Android [MediaDataSource] 受限記憶體實作。
- * 直接自 [data] ByteArray 讀取串流，保證音訊位元組永不落地（零檔案系統 I/O）。
+ * 直接自 [data] ByteArray 進行受限記憶體區塊讀取（bounded in-memory read），保證音訊位元組永不落地（零檔案系統 I/O）。
  * 注意：內部持有 [data] 的防禦性副本（defensive copy clone），以防外部修改；此處會額外佔用一份 ByteArray 拷貝。
  */
 class ByteArrayMediaDataSource(

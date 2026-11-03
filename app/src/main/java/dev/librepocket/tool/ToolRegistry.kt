@@ -432,7 +432,7 @@ object ToolRegistry {
             // dispatcher + grant/confirm + executor + E2E land here first (see
             // SafeToolSlice: READ-only StubBackend echo, one tool round per
             // turn, fresh `tool.exec` ALLOW + latest projection re-check, zero
-            // side effects on deny/cancel/schema-error). All other 40 stay false.
+            // side effects on deny/cancel/schema-error). All other 41 stay false.
             executionReady = true,
         ),
         ToolDef(
@@ -620,7 +620,7 @@ object ToolRegistry {
         ),
         ToolDef(
             name = VoiceTools.OPENAI_SPEAK_NAME,
-            description = "Cloud voice synthesis via OpenAI TTS; memory-only audio streaming, needs voice_output and openai_tts on, text redacted before upload. SCAFFOLD: full voice pipeline dispatch wiring lands later; calls fall back to system voice until fully wired.",
+            description = "Cloud voice synthesis via OpenAI TTS; bounded in-memory audio buffering, needs voice_output and openai_tts on, text redacted before upload. SCAFFOLD: full voice pipeline dispatch wiring lands later; calls fall back to system voice until fully wired.",
             jsonSchema = schema(
                 prop("text", "string", "Text to synthesize via OpenAI"),
                 prop("voice", "string", "Optional OpenAI voice name"),

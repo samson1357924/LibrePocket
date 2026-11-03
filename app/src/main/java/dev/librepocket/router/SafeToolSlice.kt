@@ -37,7 +37,7 @@ import kotlin.coroutines.coroutineContext
  * Owns exactly one tool ([TOOL_NAME] = `lsp.symbols`, READ-only, deterministic
  * [LspTools.StubBackend] echo): request-tools offer → schema validation →
  * latest scope/policy re-check → executor → typed result → continuation
- * messages. All other 40 tools stay `executionReady=false` and are never
+ * messages. All other 41 tools stay `executionReady=false` and are never
  * executed here (unknown names are typed denials, never dispatched).
  *
  * Stage order per model tool call (fresh every call — "latest" policy/scope):

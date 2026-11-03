@@ -42,8 +42,10 @@ object OpenAiTtsModels {
 
     /**
      * Recommended voices currently supported by OpenAI TTS.
+     * Legacy `tts-1` / `tts-1-hd` models officially support 9 voices (`alloy, echo, fable, onyx, nova, shimmer, ash, coral, sage`),
+     * while `ballad, verse, marin, cedar` are supported on newer OpenAI models (`gpt-4o-mini-tts`, Realtime API).
      * Note: [OpenAiTtsRequest] validates non-blank strings only and delegates final voice validation
-     * to the API server, ensuring forward compatibility with newly added OpenAI voices without client drift.
+     * to the API server without artificial client-side rejection, ensuring forward compatibility with newly added OpenAI voices.
      */
     val SUPPORTED_VOICES = setOf(
         VOICE_ALLOY,
@@ -121,7 +123,9 @@ data class OpenAiTtsRequest(
         const val DEFAULT_VOICE = OpenAiTtsModels.DEFAULT_VOICE
         /**
          * Recommended voices currently supported by OpenAI TTS.
-         * The client permits any non-blank voice string; final validation is performed by the API server.
+         * Legacy `tts-1` / `tts-1-hd` models officially support 9 voices (`alloy, echo, fable, onyx, nova, shimmer, ash, coral, sage`),
+         * while `ballad, verse, marin, cedar` are supported on newer OpenAI models (`gpt-4o-mini-tts`, Realtime API).
+         * The client permits any non-blank voice string; final validation is delegated to the API server without artificial client-side rejection.
          */
         val SUPPORTED_VOICES = OpenAiTtsModels.SUPPORTED_VOICES
 

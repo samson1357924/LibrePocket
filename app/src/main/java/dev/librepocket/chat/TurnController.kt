@@ -5875,7 +5875,7 @@ class TurnController(
     // P2 slice: tools attach ONLY the loop's offer (visibleTools ∩ slice,
     // empty when the loop is absent — the production composition — or when
     // the slice projects unavailable). ChatRequest.tools may only carry
-    // ToolRegistry.visibleTools() output (projection + executionReady); 40
+    // ToolRegistry.visibleTools() output (projection + executionReady); 41
     // tools stay executionReady=false, so a non-slice request is pure-chat
     // by construction.
     // P2 slice: after a tool round has executed this turn, never advertise

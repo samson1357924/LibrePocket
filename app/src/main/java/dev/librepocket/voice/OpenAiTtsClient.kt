@@ -55,7 +55,7 @@ import okio.utf8Size
  *   [OpenAiTtsErrorCode.INVALID_INPUT] before invoking the key supplier or dispatching network requests.
  * - Resource bounding: Responses are streamed in bounded chunks up to [maxAudioBytes] (default 25MB). If the response
  *   exceeds this limit or declares a Content-Length exceeding it, the call is cancelled immediately and fails closed with
- *   [OpenAiTtsErrorCode.RESPONSE_TOO_LARGE] to prevent Out-Of-Memory (OOM).
+ *   [OpenAiTtsErrorCode.RESPONSE_TOO_LARGE] to reduce Out-Of-Memory (OOM) risk (note: 25MB cap reduces but cannot eliminate OOM under extreme low-memory conditions).
  * - Overall timeout: OkHttp's `callTimeout` (default 60 seconds) governs the complete call lifetime.
  * - Conservative retryability: Only explicit transient conditions (HTTP 429, 503, 504, and confirmed connection/socket timeouts)
  *   are marked [retryable = true]. 500, 501, 502, client errors, and unknown TLS/transport failures are marked non-retryable.

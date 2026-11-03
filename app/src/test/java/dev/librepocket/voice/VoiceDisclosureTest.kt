@@ -75,13 +75,20 @@ class VoiceDisclosureTest {
 
     @Test fun openAiVoiceDisclosure_containsAiAndBoundedBufferCopy() {
         assertTrue(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("本功能語音為 AI 生成，非真人聲音（AI-generated voice, not a human voice）"))
-        assertTrue(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("音檔採受限記憶體緩衝播放（不寫入儲存空間，上限 25MB）"))
+        assertTrue(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("app 層不寫入檔案系統（零 File 引用）"))
+        assertTrue(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("框架層(MediaPlayer/OEM)是否落盤依實作而定"))
+        assertTrue(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("上限 25MB"))
+        assertFalse(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("不寫入儲存空間"))
+        assertFalse(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("絕不寫入"))
+        assertFalse(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("永不落地"))
+        assertFalse(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("零磁碟"))
+        assertFalse(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("零檔案系統"))
         assertEquals(
             "本功能語音為 AI 生成，非真人聲音（AI-generated voice, not a human voice）",
             VoiceTools.OPENAI_VOICE_AI_DISCLOSURE,
         )
         assertEquals(
-            "音檔採受限記憶體緩衝播放（不寫入儲存空間，上限 25MB）",
+            "音檔採受限記憶體緩衝播放，上限 25MB；app 層不寫入檔案系統（零 File 引用）；框架層(MediaPlayer/OEM)是否落盤依實作而定",
             VoiceTools.OPENAI_VOICE_BUFFER_DISCLOSURE,
         )
     }
@@ -210,7 +217,15 @@ class VoiceDisclosureTest {
             "app/src/main/java/dev/librepocket/agent/ui/settings/SettingsScreen.kt",
         ).readText()
         assertTrue(settings.contains("VoiceTools.OPENAI_VOICE_DISCLOSURE"))
+        assertTrue(settings.contains("best-effort 已知樣式遮罩，非匿名化"))
+        assertTrue(settings.contains("朗讀文本將送 OpenAI 依其條款處理"))
         assertFalse(settings.contains("音檔採純記憶體串流播放不落地"))
+        assertFalse(settings.contains("送雲前會再次遮罩敏感內容"))
+        assertFalse(settings.contains("不寫入儲存空間"))
+        assertFalse(settings.contains("不落地存檔"))
+        assertFalse(settings.contains("絕不寫入"))
+        assertFalse(settings.contains("永不落地"))
+        assertFalse(settings.contains("零磁碟"))
     }
 
     @Test fun settings_openAiVoiceCardHonestAboutUnwiredDefaultOffAndKeyAndCost() {

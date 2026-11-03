@@ -43,7 +43,7 @@ import okio.utf8Size
  *
  * Security and privacy guarantees & 記憶體行為校準：
  * - 受限記憶體緩衝播放與記憶體行為校準（Bounded in-memory buffering）：
- *   音訊資料絕不寫入儲存空間（零磁碟 I/O）。誠實校準記憶體行為描述：網路下載後全額緩衝於記憶體中（Bounded in-memory buffering），
+ *   音訊採受限記憶體緩衝播放，app 層不寫入檔案系統（零 File 引用）；框架層(MediaPlayer/OEM)是否落盤依實作而定。誠實校準記憶體行為描述：網路下載後全額緩衝於記憶體中（Bounded in-memory buffering），
  *   在峰值時存在多份 ByteArray 拷貝（OkHttp 內部 chunk 讀取緩衝、ByteArrayOutputStream / 累計 ByteArray、
  *   下游播放器的防禦性拷貝等）。25MB 上限（[DEFAULT_MAX_AUDIO_BYTES]）可降低但無法杜絕極限情況的 OOM 風險。
  * - Credentials & zeroing: [apiKey] supplier returns `CharArray?`. The array is strictly wiped with `fill('\u0000')`
@@ -68,10 +68,13 @@ import okio.utf8Size
  * - Overall timeout: OkHttp's `callTimeout` (default 60 seconds) governs the complete call lifetime.
  * - Conservative retryability: Only explicit transient conditions (HTTP 429, 503, 504, and confirmed connection/socket timeouts)
  *   are marked [retryable = true]. 500, 501, 502, client errors, and unknown TLS/transport failures are marked non-retryable.
+ *   engine 永不隱性重試：[retryable] 僅為呼叫端分類標籤，client/engine 本身不做任何自動重試（含 429/503/504 亦只回標籤不重送）；
+ *   未來 UI 若重試需指數退避＋尊重 Retry-After＋上限＋同 epoch/手勢（同一次使用者手勢／同一世代內才可重試，失敗不自動重試）。
  * - Comprehensive error redaction: Error messages and exception causes are sanitized via [Redactor.redactError] and
  *   the active API key string is explicitly replaced with `⟦REDACTED:API_KEY⟧` to prevent leaking non-standard keys.
  * - Exception cause encapsulation: Exceptions are never chained with raw, unredacted cause instances.
- * - Privacy: Text sent to cloud is unconditionally sanitized with [VoiceTools.redactForCloud] before network dispatch.
+ * - Privacy (best-effort, not anonymization): Text sent to cloud passes [VoiceTools.redactForCloud]
+ *   (best-effort 已知樣式遮罩，非匿名化) before network dispatch; 朗讀文本將送 OpenAI 依其條款處理。
  *   Redaction-anchor note: `redactForCloud` currently shares its redaction policy implementation with
  *   `redactForStore`, but the two anchors differ semantically (cloud-upload vs store-write). A policy
  *   change to either side must be reviewed against the other; the two must not silently diverge in
@@ -161,7 +164,7 @@ class OpenAiTtsClient(
         const val SPEECH_ENDPOINT_PATH = OpenAiTtsModels.SPEECH_ENDPOINT_PATH
         /**
          * 預設最大音訊位元組限制（25MB）。
-         * 音檔採受限記憶體緩衝播放（不寫入儲存空間）。25MB 是預設值而非絕對上限：
+         * 音檔採受限記憶體緩衝播放，app 層不寫入檔案系統（零 File 引用）；框架層(MediaPlayer/OEM)是否落盤依實作而定。25MB 是預設值而非絕對上限：
          * 可經 [OpenAiTtsClient.maxAudioBytes] 上調，但不得超過 [MAX_SUPPORTED_AUDIO_BYTES]。
          * 誠實說明：網路下載後全額緩衝於記憶體中（Bounded in-memory buffering），
          * 在峰值時存在多份 ByteArray 拷貝，25MB 上限可降低但無法杜絕極限情況的 OOM 風險。

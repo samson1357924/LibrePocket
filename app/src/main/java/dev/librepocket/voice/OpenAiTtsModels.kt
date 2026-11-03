@@ -99,7 +99,7 @@ object OpenAiTtsModels {
     const val SPEECH_ENDPOINT_PATH = "/v1/audio/speech"
     /**
      * 預設音訊位元組上限（25MB）。
-     * 音檔採受限記憶體緩衝播放（不寫入儲存空間）。25MB 是預設值而非絕對上限：
+     * 音檔採受限記憶體緩衝播放；app 層不寫入檔案系統（零 File 引用）；框架層(MediaPlayer/OEM)是否落盤依實作而定。25MB 是預設值而非絕對上限：
      * 呼叫方可依需求上調，但不得超過 [MAX_SUPPORTED_AUDIO_BYTES]。
      * 誠實說明：網路下載後全額緩衝於記憶體中（Bounded in-memory buffering），
      * 峰值時存在多份 ByteArray 拷貝，25MB 上限可降低但無法杜絕極限情況的 OOM 風險。

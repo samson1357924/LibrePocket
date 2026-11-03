@@ -33,10 +33,10 @@ import dev.librepocket.redact.Redactor
  * 隱私不變量與揭露（S2 鎖定 / Phase B 校準）：
  * - 語音正文寫入 [RoomSessionStore][dev.librepocket.session.RoomSessionStore]
  *   前一律走 [Redactor.redact]（該類寫路徑已全覆蓋，此處再收斂一次）；
- * - 音檔不落地：麥克風音訊只駐留記憶體，絕不寫檔；
- * - 雲端語音（Azure / OpenAI）自動上傳路徑維持送雲前 redact（[redactForCloud]），設定頁明示此行為；
+ * - 音檔不落地：麥克風音訊只駐留記憶體，app 層不寫入檔案系統（零 File 引用）；框架層(MediaPlayer/OEM)是否落盤依實作而定；
+ * - 雲端語音（Azure / OpenAI）自動上傳路徑維持送雲前 redact（[redactForCloud]，best-effort 已知樣式遮罩，非匿名化），設定頁明示此行為；
  * - 雲端語音（OpenAI）明確揭露為 AI 生成非真人聲音（[OPENAI_VOICE_AI_DISCLOSURE]），
- *   音檔採受限記憶體緩衝播放（上限 25MB，不寫入儲存空間，見 [OPENAI_VOICE_BUFFER_DISCLOSURE]）；
+ *   音檔採受限記憶體緩衝播放，上限 25MB，見 [OPENAI_VOICE_BUFFER_DISCLOSURE]；app 層不寫入檔案系統（零 File 引用）；框架層(MediaPlayer/OEM)是否落盤依實作而定；
  * - 系統 TTS 手勢路徑採明確揭露（逐則點按 + 引擎揭露文案，
  *   見 [VoiceTts.SPEAK_BUTTON_DESCRIPTION][dev.librepocket.voice.VoiceTts]），
  *   不做送引擎前 redact（避免朗讀遮罩 token；可見原文即使用者點按的當則訊息）。
@@ -69,10 +69,10 @@ object VoiceTools {
     /**
      * OpenAI TTS 揭露常數：
      * - AI 生成語音說明：本功能語音為 AI 生成，非真人聲音（AI-generated voice, not a human voice）
-     * - 受限記憶體緩衝播放說明：音檔採受限記憶體緩衝播放（不寫入儲存空間，上限 25MB）
+     * - 受限記憶體緩衝播放說明：app 層不寫入檔案系統（零 File 引用）；框架層(MediaPlayer/OEM)是否落盤依實作而定（上限 25MB）
      */
     const val OPENAI_VOICE_AI_DISCLOSURE = "本功能語音為 AI 生成，非真人聲音（AI-generated voice, not a human voice）"
-    const val OPENAI_VOICE_BUFFER_DISCLOSURE = "音檔採受限記憶體緩衝播放（不寫入儲存空間，上限 25MB）"
+    const val OPENAI_VOICE_BUFFER_DISCLOSURE = "音檔採受限記憶體緩衝播放，上限 25MB；app 層不寫入檔案系統（零 File 引用）；框架層(MediaPlayer/OEM)是否落盤依實作而定"
     const val OPENAI_VOICE_DISCLOSURE =
         OPENAI_VOICE_AI_DISCLOSURE + "；" + OPENAI_VOICE_BUFFER_DISCLOSURE
 
@@ -82,7 +82,7 @@ object VoiceTools {
     /** 寫入轉錄庫前的正文收斂（冪等；底層 Room 寫路徑亦會再 redact）。 */
     fun redactForStore(text: String): String = Redactor.redact(text).text
 
-    /** 送雲（Azure）前的正文收斂：雲端只收已遮罩文字。 */
+    /** 送雲（Azure）前的正文收斂：best-effort 已知樣式遮罩，非匿名化；送雲文本將依雲端條款處理。 */
     fun redactForCloud(text: String): String = Redactor.redact(text).text
 
     /**

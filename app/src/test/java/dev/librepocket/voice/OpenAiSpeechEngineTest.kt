@@ -734,6 +734,35 @@ class OpenAiSpeechEngineTest {
     }
 
     @Test
+    fun engineNeverImplicitlyRetries_onRetryable429_singleDispatch() = runBlocking {
+        // Stage-4 收斂釘：engine 永不隱性重試 — 即使 429（retryable=true）亦恰一發，不自動重送；
+        // 未來 UI 若重試需指數退避＋尊重 Retry-After＋上限＋同 epoch/手勢。
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(429)
+                .setBody("""{"error":{"message":"Rate limit exceeded","type":"requests"}}"""),
+        )
+
+        val player = FakeAudioPlayer()
+        val client = OpenAiTtsClient(
+            baseUrl = server.url("/").toString(),
+            apiKey = { "key".toCharArray() },
+            allowTestLoopback = true,
+        )
+        val engine = OpenAiSpeechEngine(client = client, player = player, allowTestLoopback = true)
+
+        val outcome = engine.synthesizeAndPlay(
+            text = "test no implicit retry",
+            voiceOutputOn = true,
+            openAiTtsOn = true,
+        )
+
+        assertTrue(outcome is OpenAiSpeechEngine.Companion.SynthOutcome.Failed)
+        assertEquals(1, server.requestCount)
+        assertEquals(0, player.playCount.get())
+    }
+
+    @Test
     fun errorPropagation_networkError_returnsFailed() = runBlocking {
         server.enqueue(
             MockResponse()

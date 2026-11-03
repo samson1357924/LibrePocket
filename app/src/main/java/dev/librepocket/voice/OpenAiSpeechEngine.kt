@@ -30,12 +30,13 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /**
  * 記憶體音訊播放介面。
- * 遵循「音檔不落地（受限記憶體緩衝播放）」安全契約，直接從記憶體 ByteArray 播放，絕不寫入檔案系統。
+ * 遵循「音檔不落地（受限記憶體緩衝播放）」安全契約，直接從記憶體 ByteArray 播放，app 層不寫入檔案系統（零 File 引用）；框架層(MediaPlayer/OEM)是否落盤依實作而定。
  *
  * 記憶體行為校準（Bounded in-memory buffering）：
  * 音訊在網路下載後全額緩衝於記憶體中，在峰值時存在多份 ByteArray 拷貝（OkHttp 內部下載緩衝、
  * 合成結果陣列、以及 [ByteArrayMediaDataSource] 內部之防禦性副本等）。25MB 上限可降低但無法杜絕
- * 極限低記憶體設備情況下的 OOM 風險。
+ * 極限低記憶體設備情況下的 OOM 風險。音訊緩衝僅 GC 回收不主動抹除；框架層（MediaPlayer/OEM）是否落盤依 OEM 而定；
+ * 峰值約 2x＋OkHttp 內部緩衝（合成結果＋播放引用＋client 側緩衝）。
  */
 interface AudioPlayer {
     /**
@@ -58,7 +59,7 @@ interface AudioPlayer {
 
 /**
  * Android [MediaDataSource] 受限記憶體實作。
- * 直接自 [data] ByteArray 進行受限記憶體區塊讀取（bounded in-memory read），保證音訊位元組永不落地（零檔案系統 I/O）。
+ * 直接自 [data] ByteArray 進行受限記憶體區塊讀取（bounded in-memory read），app 層不寫入檔案系統（零 File 引用）；框架層(MediaPlayer/OEM)是否落盤依實作而定。
  * 注意：預設以 `copy = true` 持有 [data] 的防禦性副本（defensive copy clone），以防外部修改；此處會額外佔用一份 ByteArray 拷貝。
  * 若以 `copy = false` 建構則不建立防禦性副本，直接引用傳入陣列；此為零拷貝路徑（RequiresNoMutation 語義，
  * 刻意保留 copy=false 以降低峰值記憶體，見 `byteArrayMediaDataSource_copyFalseDoesNotCloneArray` 釘選測試）。
@@ -550,17 +551,22 @@ class AndroidAudioPlayer(
  *
  * 安全不變量與架構保證：
  * 1. 雙開關門禁：`voice_output` 與 `openai_tts` 皆開才可用（見 [OpenAiSpeechGate]）；
- * 2. 脫敏送雲：送往 OpenAI 之前一律透過 [VoiceTools.redactForCloud] 遮罩敏感資訊；
+ * 2. 脫敏送雲（best-effort，非匿名化）：送往 OpenAI 之前先經 [VoiceTools.redactForCloud]
+ *   （best-effort 已知樣式遮罩，非匿名化）處理；朗讀文本將送 OpenAI 依其條款處理；
  * 3. AI 生成語音揭露：本功能語音為 AI 生成，非真人聲音（AI-generated voice, not a human voice）；
- * 4. 受限記憶體緩衝播放（記憶體行為校準）：遵循音檔不寫入儲存空間之契約，透過 [AudioPlayer]（預設 [AndroidAudioPlayer] + [ByteArrayMediaDataSource]）
- *    直接從記憶體 byte array 播放，絕不寫入檔案系統（零 File/TempFile 引用）。
+ * 4. 受限記憶體緩衝播放（記憶體行為校準）：遵循音檔 app 層不寫入檔案系統（零 File 引用）之契約，透過 [AudioPlayer]（預設 [AndroidAudioPlayer] + [ByteArrayMediaDataSource]）
+ *    直接從記憶體 byte array 播放，app 層不寫入檔案系統（零 File 引用）；框架層(MediaPlayer/OEM)是否落盤依實作而定。
  *    誠實校準記憶體行為描述：音訊在網路下載後全額緩衝於記憶體中（Bounded in-memory buffering），
  *    在合成與播放峰值時存在多份 ByteArray 拷貝（OkHttp response buffer、合成結果 ByteArray、
  *    ByteArrayMediaDataSource 內部 clone 等），25MB 上限可降低但無法杜絕極限情況的 OOM 風險；
+ *    音訊緩衝僅 GC 回收不主動抹除；框架層（MediaPlayer/OEM）是否落盤依 OEM 而定；峰值約 2x＋OkHttp 內部緩衝；
  * 5. 支援中斷與世代防護：透過 [speechEpoch] 與 [stopEpoch] 世代機制與 [activeJobs] 追蹤，[stop] 遞增世代並取消 activeJob 與停止播放器，
  *    後續完成的合成或延遲回調若發現世代不符則立即拋棄，絕不送出播放；
  * 6. 金鑰彈性來源：除獨立的 `VoiceTools.OPENAI_KEY_REF`（`"openai_tts"`），亦支援可選 key supplier 或作用中 OpenAI endpoint；
  * 7. 測試友善：支援注入 [AudioPlayer] 與 [OpenAiTtsClient]，便於 JVM 單元測試。
+ * 8. 重試契約：engine 永不隱性重試（[OpenAiTtsException.retryable] 僅為呼叫端分類標籤，單次呼叫恰一發，不自動重送）；
+ *    未來 UI 若重試需指數退避＋尊重 Retry-After＋上限＋同 epoch/手勢（同一次使用者手勢／同一世代內才可重試，失敗不自動重試）。
+ *    另無 pinning 與成本護欄：信任系統錨無 pinning；無去抖/預算；已發送取消照計費，UI 層需去抖＋失敗不自動重試。
  */
 class OpenAiSpeechEngine(
     val client: OpenAiTtsClient = OpenAiTtsClient(),
@@ -695,10 +701,10 @@ class OpenAiSpeechEngine(
 
         /**
          * 驗證金鑰與目標端點的綁定安全契約：
-         * 在 OpenAI TTS 路徑中，安全契約嚴格限制為「僅允許官方 OpenAI 端點（https://api.openai.com），測試環境（allowTestLoopback = true）才額外允許 loopback」。
+         * 在 OpenAI TTS 路徑中，安全契約嚴格限制為「僅允許官方 OpenAI 端點（https://api.openai.com），測試環境（allowTestLoopback 為 true 時）才額外允許 loopback」。
          * 一律拒絕任何第三方非官方端點綁定，不允許將金鑰發往任何非官方端點。
          *
-         * 1. targetBaseUrl 必須是官方 OpenAI 端點（isOpenAiOfficialEndpoint），或在明確啟用測試隔離旗標（allowTestLoopback == true）時為本機 loopback 端點。其餘第三方端點一律拒絕。
+         * 1. targetBaseUrl 必須是官方 OpenAI 端點（isOpenAiOfficialEndpoint），或在明確啟用測試隔離旗標（allowTestLoopback 為 true）時為本機 loopback 端點。其餘第三方端點一律拒絕。
          * 2. 若取用的金鑰是官方 OpenAI 來源（KEY_REF 或 preset:openai），遵循上述安全政策。
          * 3. 若金鑰來自 EndpointStore 的特定端點：該端點必須為官方 OpenAI 端點，若為第三方自訂端點一律拒絕。
          * 4. 自訂金鑰供應器（ResolvedKey.CustomSupplier）：
@@ -917,7 +923,7 @@ class OpenAiSpeechEngine(
     ): Check = Companion.check(voiceOutputOn, openAiTtsOn, hasKey, flavor)
 
     /**
-     * 雲端語音合成並於受限記憶體緩衝中播放音訊（不寫入儲存空間，上限 25MB）。
+     * 雲端語音合成並於受限記憶體緩衝中播放音訊（app 層不寫入檔案系統（零 File 引用），上限 25MB；框架層(MediaPlayer/OEM)是否落盤依實作而定）。
      *
      * 取消契約（統一）：
      * 因新請求取代（superseded）或 [stop] 中斷而失格者，一律正常回傳 `Failed(DETAIL_CANCELLED)`，
@@ -926,7 +932,10 @@ class OpenAiSpeechEngine(
      * 所有內部取消原因皆攜帶世代/原因（`Superseded by speech request epoch …` /
      * `Speech synthesis stopped (epoch …)`），與 [AndroidAudioPlayer] 取消原因格式統一。
      *
-     * @param text 要合成的文字（送雲前會先執行 [VoiceTools.redactForCloud] 脫敏）。
+     * 重試契約：engine 永不隱性重試（單次呼叫恰一發，[retryable] 僅為分類標籤不觸發重送）；
+     * 未來 UI 若重試需指數退避＋尊重 Retry-After＋上限＋同 epoch/手勢（同一次使用者手勢／同一世代內才可重試，失敗不自動重試）。
+     *
+     * @param text 要合成的文字（送雲前先經 [VoiceTools.redactForCloud] best-effort 已知樣式遮罩，非匿名化；朗讀文本將送 OpenAI 依其條款處理）。
      * @param vault 提供 OpenAI API 金鑰的 [KeyVault]（未傳則使用建構子注入者）。
      * @param voiceOutputOn 系統語音輸出開關狀態（預設 true）。
      * @param openAiTtsOn OpenAI 語音開關狀態（預設 false，fail-closed）。

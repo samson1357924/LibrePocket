@@ -269,7 +269,7 @@ fun SettingsScreen(
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
                             "語音輸入走系統辨識、語音輸出走系統朗讀，不新增任何權限；" +
-                                "麥克風音檔只駐留記憶體、不落地存檔；辨識正文寫入紀錄前會先遮罩敏感內容；" +
+                                "麥克風音檔只駐留記憶體，app 層不寫入檔案系統（零 File 引用）；辨識正文寫入紀錄前會先經 best-effort 已知樣式遮罩（非匿名化）處理；" +
                                 "系統朗讀由" + VoiceTts.ENGINE_DISCLOSURE + "，離線能力因引擎而異。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -277,7 +277,7 @@ fun SettingsScreen(
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
                             "雲端語音（Azure）僅直接下載版可用，需同時開啟「語音輸出」與「Azure 語音」" +
-                                "（後者預設關閉）；送雲前會再次遮罩敏感內容。",
+                                "（後者預設關閉）；送雲前經 best-effort 已知樣式遮罩，非匿名化；送雲文本將依雲端條款處理。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -287,7 +287,7 @@ fun SettingsScreen(
                                 "（後者預設關閉，目前尚未接線，切換無作用）；" +
                                 "需經端點設定（KeyVault providerId \"openai_tts\"）設定 OpenAI API 金鑰；" +
                                 VoiceTools.OPENAI_VOICE_DISCLOSURE + "；" +
-                                "送雲前會再次遮罩敏感內容；使用 OpenAI 語音會依其定價產生費用" +
+                                "送雲前經 best-effort 已知樣式遮罩，非匿名化；朗讀文本將送 OpenAI 依其條款處理；使用 OpenAI 語音會依其定價產生費用" +
                                 "（SCAFFOLD：管線接線尚在收斂，未接線前一律使用系統語音）。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,

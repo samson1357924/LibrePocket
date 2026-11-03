@@ -337,7 +337,7 @@ class OpenAiTtsClient(
             }.toString()
 
             val requestBody = OneShotJsonBody(jsonBody)
-            val keyString = String(keyChars)
+            val keyString = String(keyChars).trim()
 
             // Security Note:
             // [keyChars] is strictly zeroed with fill('\u0000') immediately in this finally block,
@@ -345,12 +345,23 @@ class OpenAiTtsClient(
             // However, OkHttp's Request.Builder header internals store header values as immutable Java Strings
             // ("Bearer $keyString"). That immutable String reference remains in memory until garbage collected.
             // We do not make false security claims of zero heap exposure for OkHttp header strings.
-            val req = Request.Builder()
-                .url(endpoint)
-                .header("Authorization", "Bearer $keyString")
-                .header("Content-Type", "application/json")
-                .post(requestBody)
-                .build()
+            val req = try {
+                Request.Builder()
+                    .url(endpoint)
+                    .header("Authorization", "Bearer $keyString")
+                    .header("Content-Type", "application/json")
+                    .post(requestBody)
+                    .build()
+            } catch (e: IllegalArgumentException) {
+                throw OpenAiTtsException(
+                    statusCode = null,
+                    errorCode = OpenAiTtsErrorCode.INVALID_INPUT,
+                    retryable = false,
+                    safeMessage = "Failed to construct Authorization header: invalid characters in API key",
+                    cause = e,
+                    activeKey = keyString,
+                )
+            }
 
             req to keyString
         } finally {
@@ -405,7 +416,10 @@ class OpenAiTtsClient(
                 throw e
             } catch (e: IOException) {
                 if (job?.isCancelled == true) {
-                    throw CancellationException("TTS request coroutine was cancelled", e)
+                    val safeCause = OpenAiTtsException.sanitizeCause(e, activeKey)
+                    throw CancellationException("TTS request coroutine was cancelled", safeCause).apply {
+                        stackTrace = emptyArray()
+                    }
                 }
                 currentCoroutineContext().ensureActive()
                 val isTimeout = isConfirmedTimeout(e)
@@ -419,7 +433,10 @@ class OpenAiTtsClient(
                 )
             } catch (e: Exception) {
                 if (job?.isCancelled == true) {
-                    throw CancellationException("TTS request coroutine was cancelled", e)
+                    val safeCause = OpenAiTtsException.sanitizeCause(e, activeKey)
+                    throw CancellationException("TTS request coroutine was cancelled", safeCause).apply {
+                        stackTrace = emptyArray()
+                    }
                 }
                 currentCoroutineContext().ensureActive()
                 throw OpenAiTtsException(

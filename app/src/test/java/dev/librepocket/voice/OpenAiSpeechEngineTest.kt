@@ -883,6 +883,68 @@ class OpenAiSpeechEngineTest {
     }
 
     @Test
+    fun isOpenAiEndpoint_enforcesPresetIdentityAndProviderNamespace() {
+        val validOpenAiConfig = EndpointConfig(
+            providerId = SetupValidation.deriveProviderId(ProviderCatalog.OPENAI_ID),
+            presetId = ProviderCatalog.OPENAI_ID,
+            label = "OpenAI",
+            baseUrl = ProviderCatalog.OPENAI_BASE_URL,
+            protocol = ProviderProtocol.CHAT_COMPLETIONS,
+            model = "gpt-4o-mini",
+            apiKeyRef = "provider_key/preset:openai",
+        )
+        assertTrue(OpenAiSpeechEngine.isOpenAiEndpoint(validOpenAiConfig))
+
+        val customEndpointId = SetupValidation.deriveEndpointId(ProviderCatalog.CUSTOM_ID, ProviderCatalog.OPENAI_BASE_URL)
+        val validCustomConfig = EndpointConfig(
+            providerId = customEndpointId,
+            presetId = ProviderCatalog.CUSTOM_ID,
+            label = "Custom OpenAI",
+            baseUrl = ProviderCatalog.OPENAI_BASE_URL,
+            protocol = ProviderProtocol.CHAT_COMPLETIONS,
+            model = "gpt-4o-mini",
+            apiKeyRef = SetupValidation.deriveApiKeyRef(customEndpointId),
+        )
+        assertTrue(OpenAiSpeechEngine.isOpenAiEndpoint(validCustomConfig))
+
+        // Anthropic preset with OpenAI URL -> false
+        val anthropicConfig = EndpointConfig(
+            providerId = SetupValidation.deriveProviderId(ProviderCatalog.ANTHROPIC_ID),
+            presetId = ProviderCatalog.ANTHROPIC_ID,
+            label = "Anthropic with OpenAI URL",
+            baseUrl = ProviderCatalog.OPENAI_BASE_URL,
+            protocol = ProviderProtocol.ANTHROPIC,
+            model = "claude-3-5-sonnet",
+            apiKeyRef = "provider_key/preset:anthropic",
+        )
+        assertFalse(OpenAiSpeechEngine.isOpenAiEndpoint(anthropicConfig))
+
+        // Gemini preset with OpenAI URL -> false
+        val geminiConfig = EndpointConfig(
+            providerId = SetupValidation.deriveProviderId(ProviderCatalog.GEMINI_ID),
+            presetId = ProviderCatalog.GEMINI_ID,
+            label = "Gemini with OpenAI URL",
+            baseUrl = ProviderCatalog.OPENAI_BASE_URL,
+            protocol = ProviderProtocol.CHAT_COMPLETIONS,
+            model = "gemini-1.5-flash",
+            apiKeyRef = "provider_key/preset:gemini",
+        )
+        assertFalse(OpenAiSpeechEngine.isOpenAiEndpoint(geminiConfig))
+
+        // Custom preset with legacy/mismatched providerId -> false
+        val legacyCustomConfig = EndpointConfig(
+            providerId = "preset:custom",
+            presetId = ProviderCatalog.CUSTOM_ID,
+            label = "Legacy Custom",
+            baseUrl = ProviderCatalog.OPENAI_BASE_URL,
+            protocol = ProviderProtocol.CHAT_COMPLETIONS,
+            model = "gpt-4o-mini",
+            apiKeyRef = "provider_key/preset:custom",
+        )
+        assertFalse(OpenAiSpeechEngine.isOpenAiEndpoint(legacyCustomConfig))
+    }
+
+    @Test
     fun resolveKeyRef_withAttackerEndpointInStore_doesNotResolveAttackerKey() = runBlocking {
         val dir = Files.createTempDirectory("attacker-endpoint-test").toFile().also { tmpDirs.add(it) }
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -1126,6 +1188,119 @@ class OpenAiSpeechEngineTest {
             OpenAiSpeechEngine.Companion.ResolvedKey.EndpointStoreBound(stagedAlias, ProviderCatalog.OPENAI_BASE_URL),
             resolved,
         )
+    }
+
+    @Test
+    fun resolveBoundKey_anthropicPresetWithOpenAiUrl_failsClosedWithoutVaultReads() = runBlocking {
+        val (endpointStore, _, _) = newTempEndpointStore()
+        endpointStore.save(
+            EndpointConfig(
+                providerId = "preset:anthropic",
+                presetId = ProviderCatalog.ANTHROPIC_ID,
+                label = "Anthropic with OpenAI URL",
+                baseUrl = ProviderCatalog.OPENAI_BASE_URL,
+                protocol = ProviderProtocol.ANTHROPIC,
+                model = "claude-3-5-sonnet",
+                apiKeyRef = "provider_key/preset:anthropic",
+            ),
+        )
+
+        val vault = FakeKeyVault()
+        vault.putKey("preset:anthropic", "anthropic-secret-key".toCharArray())
+        val hasKeyCalls = mutableListOf<String>()
+        vault.onHasKeyAction = { hasKeyCalls.add(it) }
+
+        val resolved = OpenAiSpeechEngine.resolveBoundKey(vault, endpointStore)
+        assertNull("Anthropic preset with OpenAI URL must fail-closed and return null", resolved)
+        assertFalse("Vault hasKey must never be called for preset:anthropic", hasKeyCalls.contains("preset:anthropic"))
+        assertEquals("Vault getKey must never be called", 0, vault.getKeyCount.get())
+    }
+
+    @Test
+    fun synthesizeAndPlay_anthropicPresetWithOpenAiUrl_failsClosedWithoutRequestsOrVaultReads() = runBlocking {
+        val (endpointStore, _, _) = newTempEndpointStore()
+        endpointStore.save(
+            EndpointConfig(
+                providerId = "preset:anthropic",
+                presetId = ProviderCatalog.ANTHROPIC_ID,
+                label = "Anthropic with OpenAI URL",
+                baseUrl = ProviderCatalog.OPENAI_BASE_URL,
+                protocol = ProviderProtocol.ANTHROPIC,
+                model = "claude-3-5-sonnet",
+                apiKeyRef = "provider_key/preset:anthropic",
+            ),
+        )
+
+        val vault = FakeKeyVault()
+        vault.putKey("preset:anthropic", "anthropic-secret-key".toCharArray())
+        val hasKeyCalls = mutableListOf<String>()
+        vault.onHasKeyAction = { hasKeyCalls.add(it) }
+
+        val player = FakeAudioPlayer()
+        val client = OpenAiTtsClient(
+            baseUrl = server.url("/").toString(),
+            allowTestLoopback = true,
+        )
+        val engine = OpenAiSpeechEngine(
+            client = client,
+            player = player,
+            vault = vault,
+            endpointStore = endpointStore,
+            allowTestLoopback = true,
+        )
+
+        val outcome = engine.synthesizeAndPlay(
+            text = "Hello",
+            voiceOutputOn = true,
+            openAiTtsOn = true,
+        )
+
+        assertTrue(
+            "Expected Denied (NO_PRIVILEGE) or Failed outcome, was: $outcome",
+            (outcome is OpenAiSpeechEngine.Companion.SynthOutcome.Denied && outcome.reason == DenyReason.NO_PRIVILEGE) ||
+                (outcome is OpenAiSpeechEngine.Companion.SynthOutcome.Failed && (outcome.detail == "DETAIL_NO_PRIVILEGE" || outcome.detail == "DETAIL_RESOLVE_FAILED" || outcome.detail == OpenAiSpeechEngine.DETAIL_NO_KEY)),
+        )
+        if (outcome is OpenAiSpeechEngine.Companion.SynthOutcome.Denied) {
+            assertEquals(DenyReason.NO_PRIVILEGE, outcome.reason)
+            assertEquals(OpenAiSpeechEngine.DETAIL_NO_KEY, outcome.detail)
+        }
+        assertEquals("0 HTTP requests were sent to MockWebServer", 0, server.requestCount)
+        assertEquals("0 vault reads occurred for Anthropic key", 0, vault.getKeyCount.get())
+        assertFalse("Vault hasKey was never called for preset:anthropic", hasKeyCalls.contains("preset:anthropic"))
+        assertEquals(0, player.playCount.get())
+    }
+
+    @Test
+    fun resolveBoundKey_customPresetWithOpenAiOfficialUrl_resolvesEndpointStoreBound() = runBlocking {
+        val (endpointStore, _, _) = newTempEndpointStore()
+        val customEndpointId = SetupValidation.deriveEndpointId(ProviderCatalog.CUSTOM_ID, ProviderCatalog.OPENAI_BASE_URL)
+        val apiKeyRef = SetupValidation.deriveApiKeyRef(customEndpointId)
+        val alias = SetupValidation.aliasFromRef(apiKeyRef)
+
+        endpointStore.save(
+            EndpointConfig(
+                providerId = customEndpointId,
+                presetId = ProviderCatalog.CUSTOM_ID,
+                label = "Custom OpenAI",
+                baseUrl = ProviderCatalog.OPENAI_BASE_URL,
+                protocol = ProviderProtocol.CHAT_COMPLETIONS,
+                model = "gpt-4o-mini",
+                apiKeyRef = apiKeyRef,
+            ),
+        )
+
+        val vault = FakeKeyVault()
+        vault.putKey(alias, "custom-openai-key".toCharArray())
+
+        val resolved = OpenAiSpeechEngine.resolveBoundKey(vault, endpointStore)
+        assertNotNull("Custom endpoint with official OpenAI URL should resolve", resolved)
+        assertTrue(
+            "Resolved key must be EndpointStoreBound, was: $resolved",
+            resolved is OpenAiSpeechEngine.Companion.ResolvedKey.EndpointStoreBound,
+        )
+        val bound = resolved as OpenAiSpeechEngine.Companion.ResolvedKey.EndpointStoreBound
+        assertEquals(alias, bound.keyRef)
+        assertEquals(ProviderCatalog.OPENAI_BASE_URL, bound.endpointBaseUrl)
     }
 
     @Test
@@ -1454,6 +1629,14 @@ class OpenAiSpeechEngineTest {
             keyRef = "preset:openai",
             endpointBaseUrl = "https://api.openai.com/v1",
         )
+        val customEndpointKey = OpenAiSpeechEngine.Companion.ResolvedKey.EndpointStoreBound(
+            keyRef = SetupValidation.deriveEndpointId(ProviderCatalog.CUSTOM_ID, "https://api.openai.com/v1"),
+            endpointBaseUrl = "https://api.openai.com/v1",
+        )
+        val foreignEndpointKeyWithOpenAiUrl = OpenAiSpeechEngine.Companion.ResolvedKey.EndpointStoreBound(
+            keyRef = "preset:anthropic",
+            endpointBaseUrl = "https://api.openai.com/v1",
+        )
         val unboundSupplier = OpenAiSpeechEngine.Companion.ResolvedKey.CustomSupplier(originTargetUrl = null)
         val boundSupplier = OpenAiSpeechEngine.Companion.ResolvedKey.CustomSupplier(
             originTargetUrl = "https://custom.provider.org/v1",
@@ -1492,8 +1675,10 @@ class OpenAiSpeechEngineTest {
         assertFalse(OpenAiSpeechEngine.isKeyTargetBindingAllowed(endpointKey, "https://thirdparty.example.com/v1"))
         assertFalse(OpenAiSpeechEngine.isKeyTargetBindingAllowed(endpointKey, "http://127.0.0.1:8080"))
 
-        // EndpointStore 官方端點金鑰：生產禁 loopback，測試隔離允許
+        // EndpointStore 官方端點金鑰：生產禁 loopback，測試隔離允許；且必須在 OpenAI 命名空間
         assertTrue(OpenAiSpeechEngine.isKeyTargetBindingAllowed(officialEndpointKey, "https://api.openai.com/v1"))
+        assertTrue(OpenAiSpeechEngine.isKeyTargetBindingAllowed(customEndpointKey, "https://api.openai.com/v1"))
+        assertFalse(OpenAiSpeechEngine.isKeyTargetBindingAllowed(foreignEndpointKeyWithOpenAiUrl, "https://api.openai.com/v1"))
         assertFalse(OpenAiSpeechEngine.isKeyTargetBindingAllowed(officialEndpointKey, "http://127.0.0.1:8080"))
         assertTrue(OpenAiSpeechEngine.isKeyTargetBindingAllowed(officialEndpointKey, "http://127.0.0.1:8080", allowTestLoopback = true))
         assertFalse(OpenAiSpeechEngine.isKeyTargetBindingAllowed(officialEndpointKey, "https://thirdparty.example.com/v1"))

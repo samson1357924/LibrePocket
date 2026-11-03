@@ -362,10 +362,19 @@ class OpenAiSpeechEngine(
 
         /**
          * 判定端點組態是否為官方 OpenAI 端點。
-         * 必須嚴格驗證 baseUrl 為官方端點，避免自訂或惡意端點金鑰被取用或誤送。
+         * 必須嚴格驗證預設識別碼、命名空間與 baseUrl 為官方端點，避免自訂或惡意端點金鑰被取用或誤送。
          */
-        internal fun isOpenAiEndpoint(config: EndpointConfig): Boolean =
-            isOpenAiOfficialEndpoint(config.baseUrl)
+        internal fun isOpenAiEndpoint(config: EndpointConfig): Boolean = when (config.presetId) {
+            ProviderCatalog.OPENAI_ID -> {
+                config.providerId == SetupValidation.deriveProviderId(ProviderCatalog.OPENAI_ID) &&
+                    isOpenAiOfficialEndpoint(config.baseUrl)
+            }
+            ProviderCatalog.CUSTOM_ID -> {
+                config.providerId == SetupValidation.deriveEndpointId(ProviderCatalog.CUSTOM_ID, config.baseUrl) &&
+                    isOpenAiOfficialEndpoint(config.baseUrl)
+            }
+            else -> false
+        }
 
         /**
          * 檢查目標端點是否為本機測試 loopback（localhost, 127.0.0.1, ::1 等）。
@@ -427,7 +436,13 @@ class OpenAiSpeechEngine(
             return when (resolvedKey) {
                 is ResolvedKey.OfficialOpenAi -> true
                 is ResolvedKey.EndpointStoreBound -> {
-                    isOpenAiOfficialEndpoint(resolvedKey.endpointBaseUrl)
+                    if (!isOpenAiOfficialEndpoint(resolvedKey.endpointBaseUrl)) return false
+                    val openAiProviderId = SetupValidation.deriveProviderId(ProviderCatalog.OPENAI_ID)
+                    val customEndpointId = SetupValidation.deriveEndpointId(ProviderCatalog.CUSTOM_ID, resolvedKey.endpointBaseUrl)
+                    val apiKeyRef = SetupValidation.deriveApiKeyRef(resolvedKey.keyRef)
+                    resolvedKey.keyRef == openAiProviderId ||
+                        SetupValidation.aliasInNamespace(openAiProviderId, apiKeyRef) ||
+                        SetupValidation.aliasInNamespace(customEndpointId, apiKeyRef)
                 }
                 is ResolvedKey.CustomSupplier -> {
                     when {

@@ -1,5 +1,6 @@
 package dev.librepocket.voice
 
+import java.io.IOException
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.util.concurrent.CountDownLatch
@@ -867,6 +868,110 @@ class OpenAiTtsClientTest {
                 e.stackTrace.isEmpty(),
             )
             assertEquals(0, server.requestCount)
+        }
+    }
+
+    @Test
+    fun cancellationDuringNetworkExecution_sanitizesCauseAndDoesNotLeakSecret() = runBlocking {
+        val secretKey = "sk-super-secret-network-key-98765"
+        val requestReceivedLatch = CountDownLatch(1)
+        val callCanceledLatch = CountDownLatch(1)
+        val testHttpClient = OkHttpClient.Builder()
+            .addNetworkInterceptor { chain ->
+                requestReceivedLatch.countDown()
+                while (!chain.call().isCanceled()) {
+                    Thread.sleep(10)
+                }
+                callCanceledLatch.countDown()
+                throw IOException("Network failed while handling secret: $secretKey")
+            }
+            .build()
+
+        val client = OpenAiTtsClient(
+            baseUrl = server.url("/").toString(),
+            allowTestLoopback = true,
+            client = testHttpClient,
+            apiKey = { secretKey.toCharArray() },
+        )
+
+        server.enqueue(MockResponse().setResponseCode(200).setBody("audio"))
+
+        var caughtException: CancellationException? = null
+        val job = launch(Dispatchers.IO) {
+            try {
+                client.synthesize(OpenAiTtsRequest(input = "Hello"))
+            } catch (e: CancellationException) {
+                caughtException = e
+            }
+        }
+
+        assertTrue("Network interceptor should be reached", requestReceivedLatch.await(5, TimeUnit.SECONDS))
+        job.cancel()
+        assertTrue("OkHttp call must receive cancel", callCanceledLatch.await(5, TimeUnit.SECONDS))
+        job.join()
+
+        assertNotNull("Expected CancellationException to be caught", caughtException)
+        val e = caughtException!!
+        assertFalse("CancellationException message must not contain secret", e.message?.contains(secretKey) == true)
+        assertFalse("CancellationException toString must not contain secret", e.toString().contains(secretKey))
+
+        val sw = StringWriter()
+        e.printStackTrace(PrintWriter(sw))
+        assertFalse("CancellationException printStackTrace must not contain secret", sw.toString().contains(secretKey))
+
+        val cause = e.cause
+        if (cause != null) {
+            assertFalse("Cause message must not contain secret: ${cause.message}", cause.message?.contains(secretKey) == true)
+            assertFalse("Cause toString must not contain secret: $cause", cause.toString().contains(secretKey))
+            val causeSw = StringWriter()
+            cause.printStackTrace(PrintWriter(causeSw))
+            assertFalse("Cause printStackTrace must not contain secret", causeSw.toString().contains(secretKey))
+        }
+
+        // Direct assertion on network exception cause sanitization during cancellation
+        val rawNetworkException = IOException("Network failed while handling secret: $secretKey")
+        val sanitizedCause = OpenAiTtsException.sanitizeCause(rawNetworkException, secretKey)
+        assertNotNull(sanitizedCause)
+        assertTrue("Sanitized cause stackTrace must be empty", sanitizedCause!!.stackTrace.isEmpty())
+        assertFalse("Sanitized cause message must not contain secret: ${sanitizedCause.message}", sanitizedCause.message?.contains(secretKey) == true)
+        assertFalse("Sanitized cause toString must not contain secret: $sanitizedCause", sanitizedCause.toString().contains(secretKey))
+        assertTrue("Sanitized cause message must contain redacted marker: ${sanitizedCause.message}", sanitizedCause.message?.contains("⟦REDACTED") == true)
+        val sanitizedSw = StringWriter()
+        sanitizedCause.printStackTrace(PrintWriter(sanitizedSw))
+        assertFalse("Sanitized cause printStackTrace must not contain secret", sanitizedSw.toString().contains(secretKey))
+    }
+
+    @Test
+    fun headerConstruction_withInvalidKeyChars_throwsSanitizedExceptionAndDoesNotLeakKey() = runBlocking {
+        val secretKey = "sk-super-secret-key-12345\ninvalid-newline"
+        val client = OpenAiTtsClient(
+            baseUrl = server.url("/").toString(),
+            allowTestLoopback = true,
+            apiKey = { secretKey.toCharArray() },
+        )
+
+        try {
+            client.synthesize(OpenAiTtsRequest(input = "Hello"))
+            fail("Expected OpenAiTtsException for invalid key chars in header")
+        } catch (e: OpenAiTtsException) {
+            assertEquals(OpenAiTtsErrorCode.INVALID_INPUT, e.errorCode)
+            assertFalse(e.retryable)
+            assertEquals("Failed to construct Authorization header: invalid characters in API key", e.safeMessage)
+            assertFalse("Exception message must not contain secret key: ${e.message}", e.message?.contains("sk-super-secret-key-12345") == true)
+            assertFalse("Exception safeMessage must not contain secret key: ${e.safeMessage}", e.safeMessage.contains("sk-super-secret-key-12345"))
+            assertFalse("Exception toString must not contain secret key: $e", e.toString().contains("sk-super-secret-key-12345"))
+
+            val cause = e.cause
+            assertNotNull("Cause must be present", cause)
+            assertFalse("Cause message must not contain secret key: ${cause?.message}", cause?.message?.contains("sk-super-secret-key-12345") == true)
+            assertFalse("Cause toString must not contain secret key: $cause", cause?.toString()?.contains("sk-super-secret-key-12345") == true)
+            assertTrue("Cause stackTrace must be empty", cause!!.stackTrace.isEmpty())
+
+            val sw = StringWriter()
+            cause.printStackTrace(PrintWriter(sw))
+            assertFalse("Cause printStackTrace must not contain secret key", sw.toString().contains("sk-super-secret-key-12345"))
+
+            assertEquals("Zero HTTP requests should be dispatched", 0, server.requestCount)
         }
     }
 

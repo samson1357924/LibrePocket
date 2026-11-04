@@ -155,13 +155,23 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * token/context measurement — the factory hydration path already applies its
  * own interim per-row 20k char truncation upstream, and this window only
  * bounds the outgoing request *copy*. The char counterpart closes the
- * reconciliation gap: for every [buildRequest] the combined (capped prefix +
- * live) text chars equal `droppedHistoryChars + lastRequestTrimmedChars +
- * lastRequestChars` up to the ephemeral time-block delta (the time block is
- * suffixed after the window trim, so it is counted in the request side only;
- * see [TurnController.droppedHistoryChars]). Message counts reconcile
- * exactly (`combined.size == droppedHistoryCount + lastRequestTrimmedCount +
- * final.size`); chars reconcile with that one documented delta.
+ * reconciliation gap: for every plain [buildRequest] shipment the combined
+ * (capped prefix + live) text chars equal `droppedHistoryChars +
+ * lastRequestTrimmedChars + lastRequestChars` up to the ephemeral
+ * time-block delta (the time block is suffixed after the window trim, so it
+ * is counted in the request side only; see
+ * [TurnController.droppedHistoryChars]). A tool continuation
+ * ([buildToolContinuation]) ships the structured round alongside, so both
+ * sides of the identity gain its text (see
+ * [TurnController.lastRequestChars] for the extended formula). Message
+ * counts reconcile exactly (`combined.size == droppedHistoryCount +
+ * lastRequestTrimmedCount + final.size`), except the image-only synthetic
+ * user row: with no user message in the windowed base, [buildRequest]
+ * appends one empty-text row for the images after the cap, so `base.size`
+ * may be window + 1 and the count identity is off by that one row (chars
+ * unaffected: its own text is empty, the time block it carries is the
+ * accounted delta). Chars reconcile with the one documented time-block
+ * delta.
  *
  * The default is [Unbounded] (window everything, truncate nothing): no
  * on-device token/context measurement exists in this branch to justify a
@@ -993,13 +1003,26 @@ class TurnController(
   /**
    * H1 (#16 residual): char counterpart of [lastRequestTrimmedCount] — the
    * `String.length` sum trimmed from the head of the request to fit within
-   * [MAX_REQUEST_CHARS] (time-block included: the ephemeral block is already
-   * suffixed when this trim runs, so its chars are part of the trimmed/final
-   * split — unlike [droppedHistoryChars] which excludes it; see the
-   * [HistoryWindowCap] reconciliation note). Updated on every [buildRequest]
-   * with that request's trim; a tool continuation (`buildToolContinuation`)
-   * adds its own prefix trim on top (same total-head-trim contract as the
-   * count). Read-only observability: never gates truncation.
+   * [MAX_REQUEST_CHARS]. The ephemeral time block is already suffixed when
+   * the [buildRequest] trim runs, but its `maxDropLimit` stops the head trim
+   * before the time-block-carrying last-user row, so on the [buildRequest]
+   * path the trimmed prefix never contains time-block chars and
+   * the whole time-block delta lands in [lastRequestChars] (unlike
+   * [droppedHistoryChars] which excludes it by construction; see the
+   * [HistoryWindowCap] reconciliation note). A tool continuation
+   * ([buildToolContinuation]) adds its own prefix trim on top (same
+   * total-head-trim contract as the count), bounded by `size - 1`: it
+   * guarantees only the single newest base row, so the time-block row is
+   * protected there only when it happens to be that newest row — stated
+   * factually, the [buildRequest]-path guard does not extend here.
+   * Wire-vs-text: the continuation's drop *decision* sums wire-estimate
+   * units (`requestWireEstimate`/`wirePayloadChars`, wrapper + escaping
+   * included) while this published cell stays in `text.length` units — the
+   * two agree on the drop partition only, never inter-convertible. Throw
+   * path: [ContinuationOverBudgetException] leaves both char cells at the
+   * base request's published values (the continuation was never shipped),
+   * mirroring the count contract. Read-only observability: never gates
+   * truncation.
    */
   private val _lastRequestTrimmedChars = AtomicLong(0L)
   var lastRequestTrimmedChars: Long
@@ -1013,9 +1036,19 @@ class TurnController(
    * message texts after every trim (window + [MAX_REQUEST_CHARS] + the
    * continuation's own prefix trim when present), time-block included. Together
    * with [droppedHistoryChars] and [lastRequestTrimmedChars] this closes the
-   * attempt/request window reconciliation: the combined text chars plus the
-   * time-block delta equal `droppedHistoryChars + lastRequestTrimmedChars +
-   * lastRequestChars`. Read-only observability: never gates truncation.
+   * attempt/request window reconciliation for plain [buildRequest] shipments:
+   * the combined text chars plus the time-block delta equal
+   * `droppedHistoryChars + lastRequestTrimmedChars + lastRequestChars`.
+   * Tool-continuation clause: after [buildToolContinuation] ships, the
+   * structured round rides alongside, so the identity gains its text on both
+   * sides — `combined + timeDelta + structuredChars == dropped + trimmed +
+   * final`, where `structuredChars` is the continuation messages' text
+   * (counts gain `+ contMessages.size` likewise). Consistency boundary: the
+   * three char cells are written dispersedly across [buildRequest] /
+   * [buildToolContinuation] on the turn host coroutine (single-writer), so
+   * they agree only once the turn completes — a concurrent poll may observe
+   * a mixed snapshot (document-only; no snapshot class is added).
+   * Read-only observability: never gates truncation.
    */
   @Volatile var lastRequestChars: Long = 0L
     private set
@@ -5791,11 +5824,16 @@ class TurnController(
    * [lastRequestTrimmedCount]/[requestTrimmedCount] (counts) and
    * [lastRequestTrimmedChars]/[lastRequestChars] (chars)
    * as the total head trim of the outgoing request (added on top of the
-   * base request's own emission) — never silent. If even the untrimmable
-   * minimum (the newest base row + the structured round) exceeds the cap,
-   * this throws [ContinuationOverBudgetException]: runTurnLoop fails the
-   * turn with a typed non-retryable terminal instead of shipping an
-   * over-cap request (a retry cannot shrink history that only grows).
+   * base request's own emission) — never silent. Wire-vs-text: the drop
+   * *decision* sums wire-estimate units (`requestWireEstimate`, wrapper +
+   * escaping included) while the published cells stay in `text.length`
+   * units — same drop partition, never inter-convertible. If even the
+   * untrimmable minimum (the newest base row + the structured round) exceeds
+   * the cap, this throws [ContinuationOverBudgetException]: runTurnLoop fails
+   * the turn with a typed non-retryable terminal instead of shipping an
+   * over-cap request (a retry cannot shrink history that only grows); on
+   * that throw path the char cells keep the base request's published values
+   * (mirroring the count contract below — the request was never shipped).
    */
 
   private fun buildToolContinuation(
@@ -5831,7 +5869,8 @@ class TurnController(
       // silently shipping an over-cap request.
       // Trim-count contract: on this throw path requestTrimmedCount
       // retains only the base request's published dropCount (the request
-      // was never shipped); the next build resets it per request.
+      // was never shipped); the next build resets it per request. Char
+      // cells likewise keep the base values (mirrors the count contract).
       throw ContinuationOverBudgetException()
     }
     val finalBase = if (drop > 0) baseMessages.drop(drop) else baseMessages
@@ -5839,10 +5878,10 @@ class TurnController(
     // already emitted the base request's context-window trim, so this adds on
     // top — lastRequestTrimmedCount then reflects the TOTAL head trim of the
     // outgoing continuation request. Single-writer (same coroutine), so the
-    // read-add-set is exact. Char side mirrors the count: the continuation
-    // drop chars (text.length units, same unit as buildRequest) add on top of
-    // the base trim, and lastRequestChars is refreshed to the shipped
-    // continuation size (finalBase + structured round). Observability only.
+    // read-add-set is exact, char side likewise (text.length units, never the
+    // wire-estimate units that drove the drop decision); lastRequestChars is
+    // refreshed to the shipped continuation size (finalBase + structured
+    // round). Observability only.
     if (drop > 0) {
       val total = _lastRequestTrimmedCount.get() + drop
       _lastRequestTrimmedCount.set(total)
@@ -5962,9 +6001,12 @@ class TurnController(
     _requestTrimmedCount.value = dropCount
     val finalMessages = if (dropCount > 0) base.drop(dropCount) else base
     // H1 char reconciliation (observability only): MAX_REQUEST_CHARS trim in
-    // text chars (time-block included — it is already suffixed above) and the
-    // final request text size. `combinedChars + timeDelta ==
-    // droppedHistoryChars + lastRequestTrimmedChars + lastRequestChars`.
+    // text chars (head trim only — maxDropLimit stops before the time-blocked
+    // last-user row suffixed above, so the block lands in the final size as
+    // the timeDelta) and the final request text size. `combinedChars +
+    // timeDelta == droppedHistoryChars + lastRequestTrimmedChars +
+    // lastRequestChars` (plain buildRequest shipments; the continuation
+    // extends both sides — see lastRequestChars).
     var trimmedChars = 0L
     for (i in 0 until dropCount) trimmedChars += base[i].text.length
     lastRequestTrimmedChars = trimmedChars

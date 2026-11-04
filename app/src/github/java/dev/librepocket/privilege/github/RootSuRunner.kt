@@ -70,6 +70,11 @@ import java.io.File
  * [ElevatedProcessIo.BINARY_SCREENSHOT_HARD_CAP_BYTES] 硬讀取，OOM 上界每流 8M）；
  * 其餘通用命令走舊 64K/512K 軌（[ShellPolicy.MAX_OUTPUT_BYTES]／
  * [ShellPolicy.HARD_READ_CAP_BYTES]）。[BinaryElevatedRunner] 介面簽名不變。
+ *
+ * R3-A 取消限制（owner P2-5）：[isCancelled] 預設只看 Thread 中斷
+ * （`Thread.currentThread().isInterrupted`），coroutine `Job` 取消不保證中斷
+ * blocking `waitFor`；coroutine 呼叫方應顯式傳
+ * `isCancelled = { !job.isActive }`（或 `!coroutineContext.isActive`）。
  */
 class RootSuRunner(
     private val privateRoot: String? = null,

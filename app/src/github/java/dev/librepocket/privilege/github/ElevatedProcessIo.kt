@@ -14,9 +14,16 @@ import java.util.concurrent.TimeUnit
  * B2 修正（Issue #136 B2）：
  * - 超時/cancel 走 [ElevatedProcessKiller.killTree]（盡力整組，舊碼只殺本體）；
  * - 殺後關流以解除 gobbler 的 blocking I/O（舊碼流殘留可卡住 join）；
- * - 輪詢式等待（50ms 切片）＋ [isCancelled] 鉤：協程取消（Thread 中斷或
- *   外部旗標）即盡力殺整組並帶 partial 回，不 мок 在 `waitFor(timeout)` 內；
+ * - 輪詢式等待（50ms 切片）＋ [isCancelled] 鉤：外部取消（Thread 中斷或
+ *   外部旗標）即盡力殺整組並帶 partial 回，不卡在 `waitFor(timeout)` 內；
  * - [killer]/[isCancelled] 可注入，JVM 單測以假進程斷言「超時/cancel 必殺」。
+ *
+ * R3-A 取消限制（owner P2-5）：預設 [isCancelled] 只看 Thread 中斷
+ * （`Thread.currentThread().isInterrupted`），coroutine `Job` 取消不保證中斷
+ * blocking `waitFor`；coroutine 呼叫方應顯式傳
+ * `isCancelled = { !job.isActive }`（或 `!coroutineContext.isActive`），
+ * 否則取消可能要等到 timeout 才收斂。抛異常的鉤一律折為未取消
+ * （fail-closed：不斷流、不誤殺，見 drain 內 `getOrDefault(false)`）。
  *
  * P1-B review（成功路徑有界等待，超界即 truncated）：
  * - 成功路徑亦有界等待（上界 `SUCCESS_JOIN_MS` 10s，見 [drain]）：
@@ -37,6 +44,9 @@ import java.util.concurrent.TimeUnit
  *   本檔只提供可選參數 `hardCapBytes`（預設 512K，截圖傳 8M）與截斷常數，
  *   不做 argv 判定；[Drained] 結構不變（仍為 stdout/stderr/exitCode/
  *   timedOut/truncated，`truncated` 另含硬上限溢出標記，見 [CappedPipe]）。
+ *
+ * R3-B（PocketGuard SUGGESTION，ExecutorService）：維持現狀 —— 固定 2 daemon
+ * threads＋有界 join 已防洩漏/hang，ExecutorService 為未來選項（B3）。
  */
 internal object ElevatedProcessIo {
     /** R1-A 截圖二進位容量：`screencap -p` / `cat /dev/graphics/fb0` 的截斷上限（8M）。 */
@@ -82,6 +92,10 @@ internal object ElevatedProcessIo {
      * R1-A 雙軌：`hardCapBytes` 預設 [ShellPolicy.HARD_READ_CAP_BYTES]（512K，通用命令）；
      * 截圖二進位傳 [BINARY_SCREENSHOT_HARD_CAP_BYTES]（8M）。[Drained] 結構不變，
      * `truncated` 含 join 未完成或硬上限溢出（任一流丟棄即 true，絕不靜默短讀不標）。
+     *
+     * R3-A 取消限制（owner P2-5）：[isCancelled] 預設只看 Thread 中斷，
+     * coroutine 呼叫方應傳 `isCancelled = { !job.isActive }`
+     * （或 `!coroutineContext.isActive`）；鉤抛異常折為未取消（fail-closed）。
      */
     fun drain(
         process: Process,

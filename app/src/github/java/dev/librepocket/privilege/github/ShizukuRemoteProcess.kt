@@ -20,6 +20,8 @@ import java.util.concurrent.TimeUnit
  * - 零真機依賴：單測以「同名方法但非 Process」的假物件斷言委派，證明無 cast。
  * P2-A 可見性：僅 [ShizukuShellRunner]＋同模組單測使用，收斂為 internal；
  * 外部一律經 `Process` 介面（[wrap] 回傳型別）互動，不直接依賴本類。
+ * R3-B（PocketGuard WARN 反射）：fail-closed＋版本漂移收斂已在上；Shizuku
+ * 升級時跑 ShizukuRemoteProcessTest 即知，不改行為。
  */
 internal class ShizukuRemoteProcess(private val remote: Any) : Process() {
     private fun call(name: String, vararg args: Any?): Any? {

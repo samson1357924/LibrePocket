@@ -61,6 +61,7 @@ class RootCaptureTest {
         )
     }
 
+    @Suppress("DEPRECATION")
     @Test fun gatedReadersRefuseWithoutReasonCodeAndAuditDenial() {
         // D09 門禁：無 reasonCode 時 runner 拒絕，讀取回 null 且寫 DENY 審計。
         val audit = dev.librepocket.shell.PrivilegeAuditLog()
@@ -73,6 +74,7 @@ class RootCaptureTest {
         assertEquals(mapOf("DENY" to 2), audit.countByVerdict())
     }
 
+    @Suppress("DEPRECATION")
     @Test fun truncatedOkYieldsNullWithoutSummarizingPartialFrame() {
         // 終審 MAJOR：Ok.truncated 部分幀不可摘要，必須回 null（呼叫方降級手動截圖）；
         // 審計仍記 verdict（OK），只清單元行為（binary + string 雙路徑）。
@@ -91,6 +93,24 @@ class RootCaptureTest {
         assertNull(RootFramebufferCapture.screencapViaElevated(stringRunner, stringAudit, "T")())
         assertNull(RootFramebufferCapture.fb0ViaElevated(stringRunner, stringAudit, "T")())
         assertEquals(mapOf("OK" to 2), stringAudit.countByVerdict())
+    }
+
+    @Test fun binaryOverloadBypassesStringFallback() {
+        // R3-B：Binary 多載直接走位元組直達（無 as?）；run() 蓄意回損毀文字，
+        // 若誤走 String 路徑即回 "lossy-garbage" 而非 PNG，位元組比對即抓包。
+        val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0xFF.toByte(), 0x00, 0x01)
+        val audit = PrivilegeAuditLog()
+        val runner: BinaryElevatedRunner = object : BinaryElevatedRunner {
+            override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult =
+                ShellResult.Ok("lossy-garbage", "", 0, false)
+            override fun runBinary(request: ElevatedRequest, timeoutMs: Long): ElevatedBinaryResult =
+                ElevatedBinaryResult.Ok(png, ByteArray(0), 0, false)
+        }
+        val screen = RootFramebufferCapture.screencapViaElevated(runner, audit, "T")()
+        assertTrue(screen!!.contentEquals(png))
+        val fb = RootFramebufferCapture.fb0ViaElevated(runner, audit, "T")()
+        assertTrue(fb!!.contentEquals(png))
+        assertEquals(mapOf("OK" to 2), audit.countByVerdict())
     }
 
     private class TruncatedBinaryRunner(

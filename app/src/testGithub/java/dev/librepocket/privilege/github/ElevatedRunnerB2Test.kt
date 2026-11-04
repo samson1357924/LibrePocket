@@ -10,6 +10,7 @@ import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Job
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -802,5 +803,64 @@ class ElevatedRunnerB2Test {
         val rb = root.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 0L)
         assertTrue("$rb", rb is ElevatedBinaryResult.TimedOut)
         assertEquals(1, rootKills)
+    }
+
+    // ---- R3-A Job 取消（owner P2-5）：真 kotlinx.coroutines Job 驅動清理 ----
+
+    @Test fun coroutineJobCancelDrivesCleanup() {
+        // R3-A：預設 isCancelled 只看 Thread 中斷，coroutine 呼叫方須顯式傳
+        // `isCancelled = { !job.isActive }`；此處以前 N 次 false 後讀 job 狀態
+        // 的鉤模擬「輪詢中被取消」：hang FakeProcess 保證非超時路徑（10s 上界），
+        // 第 3 次輪詢時 job.cancel()，之後鉤讀到 !isActive 即殺整組回 TimedOut。
+        // 零真機/零真掛起：hang FakeProcess 的 waitFor 切片可被 killer 立即解除。
+        val job = Job()
+        var polls = 0
+        var kills = 0
+        val runner = RootSuRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
+            suBinary = "/system/bin/su",
+            killer = {
+                kills++
+                it.destroy()
+            },
+            isCancelled = {
+                ++polls
+                if (polls == 3) job.cancel()
+                !job.isActive
+            },
+        )
+        val b = runner.runBinary(ElevatedRequest(listOf("id"), "R3A-T"), 10_000L)
+        assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
+        assertEquals(1, kills)
+        assertTrue("polls=$polls", polls >= 3)
+        assertTrue(job.isCancelled)
+
+        // 同一 Job 語義走 Shizuku 側亦回 TimedOut（兩 runner 同源 drain）。
+        val shizukuJob = Job()
+        var shizukuPolls = 0
+        var shizukuKills = 0
+        val shizuku = ShizukuShellRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            pingBinder = { true },
+            spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
+            status = { ShizukuStatus.Available(15) },
+            killer = {
+                shizukuKills++
+                it.destroy()
+            },
+            isCancelled = {
+                ++shizukuPolls
+                if (shizukuPolls == 3) shizukuJob.cancel()
+                !shizukuJob.isActive
+            },
+        )
+        val sb = shizuku.runBinary(ElevatedRequest(listOf("id"), "R3A-T"), 10_000L)
+        assertTrue("$sb", sb is ElevatedBinaryResult.TimedOut)
+        assertEquals(1, shizukuKills)
+        assertTrue("shizukuPolls=$shizukuPolls", shizukuPolls >= 3)
+        assertTrue(shizukuJob.isCancelled)
     }
 }

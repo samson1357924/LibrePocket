@@ -51,6 +51,11 @@ import rikka.shizuku.Shizuku
  * [ElevatedProcessIo.BINARY_SCREENSHOT_HARD_CAP_BYTES] 硬讀取，OOM 上界每流 8M）；
  * 其餘通用命令走舊 64K/512K 軌（[ShellPolicy.MAX_OUTPUT_BYTES]／
  * [ShellPolicy.HARD_READ_CAP_BYTES]）。[BinaryElevatedRunner] 介面簽名不變。
+ *
+ * R3-A 取消限制（owner P2-5）：[isCancelled] 預設只看 Thread 中斷
+ * （`Thread.currentThread().isInterrupted`），coroutine `Job` 取消不保證中斷
+ * blocking `waitFor`；coroutine 呼叫方應顯式傳
+ * `isCancelled = { !job.isActive }`（或 `!coroutineContext.isActive`）。
  */
 class ShizukuShellRunner(
     private val privateRoot: String? = null,
@@ -168,15 +173,24 @@ class ShizukuShellRunner(
          * 禁止產品使用（已釘死 cwd：`dir=null` 落在 system_server 預設
          * cwd，不可控；產品一律走實例 [pinnedSpawn]）；死相容殼不刪除
          * （測試/舊碼引用不斷），B3 前刪除。
+         *
+         * R3-B（PocketGuard WARN）：grep 確認測試零引用，收斂為 internal
+         * （產品源集僅 [pinnedSpawn] 經 [defaultSpawnWithDir] 間接使用；
+         * 外部模組不可見）；Deprecated 保留，B3 前刪除。
          */
         @Deprecated(
             "禁止產品使用（已釘死 cwd，dir=null 不可控）；死相容殼，B3 前刪除。產品一律走實例 pinnedSpawn。",
         )
-        val defaultSpawn: (List<String>) -> Process = { argv ->
+        internal val defaultSpawn: (List<String>) -> Process = { argv ->
             defaultSpawnWithDir(argv, null)
         }
 
-        fun defaultSpawnWithDir(argv: List<String>, dir: String?): Process {
+        /**
+         * R3-B：grep 確認測試零引用，收斂為 internal（僅 [pinnedSpawn]
+         * 內部使用＋同模組可見）；B3 前與 [defaultSpawn] 一併重審
+         * （刪除或保留內部實現）。
+         */
+        internal fun defaultSpawnWithDir(argv: List<String>, dir: String?): Process {
             val method = Shizuku::class.java.getDeclaredMethod(
                 "newProcess",
                 Array<String>::class.java,

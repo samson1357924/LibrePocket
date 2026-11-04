@@ -141,6 +141,9 @@ fun MainScreen(
 
     // C1 系統預設助理（Issue #137 C1b，三 flavor 共用 main 接線）：
     // RoleManager 快照＋一鍵要求＋fallback launcher（見 rememberAssistantRole）。
+    // state／request／openFallback 已是 remember 穩定（Phase 2），此處不再重包。
+    // 僅 Ready 分支渲染由 SettingsScreen when(gate) 控制（MainScreen 恆傳非 null，
+    // null 隱藏僅供測試/未來 flavor 門禁）。
     val assistantRole = rememberAssistantRole()
 
     // Gate first, dispatch later: stash the normalized entry text until an

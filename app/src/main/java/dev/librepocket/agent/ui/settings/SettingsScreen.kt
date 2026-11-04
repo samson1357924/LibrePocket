@@ -30,6 +30,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -40,6 +41,7 @@ import dev.librepocket.agent.ui.chat.ExportUiState
 import dev.librepocket.agent.ui.chat.ImportUiState
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.setupErrorText
+import dev.librepocket.agent.assistant.AssistantReasonCode
 import dev.librepocket.agent.assistant.AssistantSettingsState
 import dev.librepocket.agent.assistant.assistantReasonText
 import dev.librepocket.automation.AutomationSettingsState
@@ -397,7 +399,17 @@ fun SettingsScreen(
                                 Text(
                                     assistantReasonText(code),
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    // A 原因碼色彩：被拒／撤銷／請求失敗走 error；
+                                    // 不支援中性（頭部已是不支援文案，原因段不追加紅字）；
+                                    // GRANTED 正常不顯示（held=>null 已清除），若顯示亦中性。
+                                    color = when (code) {
+                                        AssistantReasonCode.DENIED,
+                                        AssistantReasonCode.REVOKED,
+                                        AssistantReasonCode.REQUEST_FAILED ->
+                                            MaterialTheme.colorScheme.error
+                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                    modifier = Modifier.testTag("assistantReason"),
                                 )
                             }
                             Spacer(modifier = Modifier.height(8.dp))
@@ -408,12 +420,32 @@ fun SettingsScreen(
                             ) {
                                 Text("設為預設助理")
                             }
+                            // B held 指引：取消須走系統設定（RoleManager 無應用側取消入口）。
+                            if (assistant.roleHeld) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    "如需取消，請至系統設定 → 預設應用程式",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.testTag("assistantCancelHint"),
+                                )
+                            }
                             Spacer(modifier = Modifier.height(8.dp))
                             OutlinedButton(
                                 onClick = onOpenVoiceInputSettings,
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
                                 Text("語音輸入設定")
+                            }
+                            // C fallback 失敗回饋：設定頁打不開時紅字提示（不跳轉）。
+                            if (assistant.fallbackFailed) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    "無法開啟語音輸入設定",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.testTag("assistantFallbackFailed"),
+                                )
                             }
                         }
                     }

@@ -14,7 +14,7 @@ import android.provider.Settings
  *   `createRequestRoleIntent` 皆為同步呼叫；失敗一律 fallback
  *   [Settings.ACTION_VOICE_INPUT_SETTINGS]，fail-closed，不靜默退回。
  * - 原因碼（[assistantReasonText]）：被拒／撤銷／OEM 不支援／請求失敗
- *   皆有對應文案，UI 只顯示、不分支。
+ *   皆有對應文案，UI 只顯示文案不做流程分支，色彩可按失敗/中性區分（見 SettingsScreen）。
  */
 data class AssistantRoleSnapshot(
     val roleAvailable: Boolean,
@@ -26,6 +26,8 @@ data class AssistantSettingsState(
     val roleHeld: Boolean,
     val roleAvailable: Boolean,
     val reasonCode: String? = null,
+    /** fallback 設定頁打不開（resolve null／非系統／拋異常）：卡內紅字提示，不跳轉。 */
+    val fallbackFailed: Boolean = false,
 )
 
 sealed interface AssistantRoleDecision {
@@ -81,7 +83,7 @@ fun effectiveAssistantReason(
         stored
     }
 
-/** 原因碼 → 顯示文案（UI 只顯示、不分支；未知碼原樣回報，不偽造語義）。 */
+/** 原因碼 → 顯示文案（UI 只顯示文案不做流程分支，色彩可按失敗/中性區分（見 SettingsScreen）；未知碼原樣回報，不偽造語義）。 */
 fun assistantReasonText(code: String): String =
     when (code) {
         AssistantReasonCode.GRANTED ->

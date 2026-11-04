@@ -73,6 +73,8 @@ fun rememberAssistantRole(): AssistantRoleUi {
     }
     var storedReason by rememberSaveable { mutableStateOf<String?>(null) }
     var refreshTick by remember { mutableIntStateOf(0) }
+    // C: fallback 失敗回饋（rememberSaveable 撐過旋轉；成功開啟即清回 false）。
+    var fallbackFailed by rememberSaveable { mutableStateOf(false) }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -103,24 +105,29 @@ fun rememberAssistantRole(): AssistantRoleUi {
                 // 無法區分「哪一個系統應用」，但第三方劫持已被擋。
                 if (resolved?.activityInfo == null) {
                     Log.w(TAG, "VOICE_INPUT_SETTINGS not resolvable; skip fallback")
+                    fallbackFailed = true
                 } else if ((resolved.activityInfo.applicationInfo.flags and ApplicationInfo.FLAG_SYSTEM) == 0) {
                     Log.w(TAG, "fallback resolved to non-system app, skip")
+                    fallbackFailed = true
                 } else {
                     appContext.startActivity(intent)
+                    fallbackFailed = false
                 }
             } catch (e: Exception) {
                 // Fallback 設定頁亦不可開：保留原因碼，UI 只顯示、不再跳轉。
                 Log.w(TAG, "openFallback failed", e)
+                fallbackFailed = true
             }
         }
     }
     val launcher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult(),
     ) { result ->
-        storedReason = if (result.resultCode == Activity.RESULT_OK) {
-            AssistantReasonCode.GRANTED
+        if (result.resultCode == Activity.RESULT_OK) {
+            storedReason = AssistantReasonCode.GRANTED
+            fallbackFailed = false
         } else {
-            AssistantReasonCode.DENIED
+            storedReason = AssistantReasonCode.DENIED
         }
         // GRANTED／DENIED 皆重讀快照：REVOKED／held 調和經 effectiveAssistantReason 生效。
         refreshTick++
@@ -128,8 +135,10 @@ fun rememberAssistantRole(): AssistantRoleUi {
     val request: () -> Unit = remember(snapshot, roleManager, launcher, openFallback) {
         {
             when (decideAssistantRole(snapshot)) {
-                AssistantRoleDecision.AlreadyHeld ->
+                AssistantRoleDecision.AlreadyHeld -> {
                     storedReason = AssistantReasonCode.GRANTED
+                    fallbackFailed = false
+                }
                 AssistantRoleDecision.UnsupportedFallback -> {
                     storedReason = AssistantReasonCode.UNSUPPORTED
                     openFallback()
@@ -144,6 +153,8 @@ fun rememberAssistantRole(): AssistantRoleUi {
                         storedReason = AssistantReasonCode.REQUEST_FAILED
                         openFallback()
                     } else {
+                        // 新一輪要求開始：清除舊的 fallback 失敗旗，避免等待 RESULT 期間殘留紅字。
+                        fallbackFailed = false
                         try {
                             launcher.launch(intent)
                         } catch (_: Exception) {
@@ -155,12 +166,17 @@ fun rememberAssistantRole(): AssistantRoleUi {
             }
         }
     }
-    val state = remember(snapshot, storedReason) {
+    val state = remember(snapshot, storedReason, fallbackFailed) {
         AssistantSettingsState(
             roleHeld = snapshot.roleHeld,
             roleAvailable = snapshot.roleAvailable,
             reasonCode = effectiveAssistantReason(storedReason, snapshot),
+            fallbackFailed = fallbackFailed,
         )
     }
-    return AssistantRoleUi(state = state, request = request, openFallback = openFallback)
+    return AssistantRoleUi(
+        state = state,
+        request = request,
+        openFallback = openFallback,
+    )
 }

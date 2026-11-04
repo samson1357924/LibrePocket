@@ -57,6 +57,7 @@
 5. **持久化與稽核路徑**：完整的 Room transcript 稽核紀錄，長度上限與脫敏（redaction）防護，且重啟重新載入具備等價性（reopen reload equivalence）。
 6. **負向控制與競態測試**：必須具備 schema 驗證失敗、Unicode FORMAT（Cf）碼點拒絕（`containsFormatCodePoint` 涵蓋 `query` 與 `pathPrefix`）、逾時、重複 call ID、權限拒絕及併發取消等負向路徑測試。
 7. **裝置端到端驗證（Device-verified E2E acceptance）**：必須在真實裝置或模擬器上完成端到端驗收測試，單純 JVM unit test 或 Fake 不能代替裝置驗證。
+8. **`voice.speak.openai` 接線前置**：`voice.speak.openai`（scaffold，`executionReady=false`）接線前須完成正式 dispatcher／confirmation／executor pipeline（不可直連測試 slice 迴圈），並完成 AI voice disclosure 端到端驗收（含 AI 生成語音揭露＋受限緩衝 25MB 文案的裝置 E2E）與 Realtime migration 決策（Legacy Bridge `POST /v1/audio/speech` 於 2027-01-06 退場後的 `gpt-realtime-2.1-mini` 遷移）；未完成前維持 `executionReady=false` 且不向 production 模型提供該工具定義。
 
 ### MCP 啟用／接線 gate 清單
 

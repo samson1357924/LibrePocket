@@ -1,6 +1,7 @@
 package dev.librepocket.privilege.github
 
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.datastore.preferences.core.edit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -10,6 +11,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import java.io.File
@@ -100,5 +102,63 @@ class ShizukuGrantTest {
         assertNull(store.load())
         val check = store.check("preset:openai", 7L)
         assertTrue("$check", check is GrantCheck.Invalid)
+    }
+
+    @Test fun serviceVersionChangeKeepsValid() {
+        // serviceVersion 只留存稽核，不參與有效性判定：版本變更仍 Valid。
+        val old = ShizukuGrantPolicy.grant("preset:openai", 3L, 15)
+        val newer = ShizukuGrantPolicy.grant("preset:openai", 3L, 99)
+        assertTrue(ShizukuGrantPolicy.check(old, "preset:openai", 3L) is GrantCheck.Valid)
+        assertTrue(ShizukuGrantPolicy.check(newer, "preset:openai", 3L) is GrantCheck.Valid)
+    }
+
+    @Test fun grantedAtMsDoesNotAffectCheck() {
+        // grantedAtMs 為任意時間戳，不影響判定。
+        val epoch = ShizukuGrantPolicy.grant("preset:openai", 3L, 15, atMs = 0L)
+        val future = ShizukuGrantPolicy.grant("preset:openai", 3L, 15, atMs = Long.MAX_VALUE)
+        assertTrue(ShizukuGrantPolicy.check(epoch, "preset:openai", 3L) is GrantCheck.Valid)
+        assertTrue(ShizukuGrantPolicy.check(future, "preset:openai", 3L) is GrantCheck.Valid)
+    }
+
+    @Test fun saveBlankProviderThrows() {
+        // policy 層先擋空白 providerId。
+        try {
+            ShizukuGrantPolicy.grant("  ", 3L, 15)
+            fail("blank providerId must throw")
+        } catch (_: IllegalArgumentException) {
+            // 預期。
+        }
+        // store 層亦擋（繞過 policy 直構造仍不得寫入）。
+        runBlocking {
+            val store = store()
+            try {
+                store.save(ShizukuGrant("", 3L, 0L, 15))
+                fail("blank providerId save must throw")
+            } catch (_: IllegalArgumentException) {
+                // 預期。
+            }
+        }
+    }
+
+    @Test fun loadMissingKeysYieldsNull() = runBlocking {
+        // 全空 DataStore → null（從未授權）。
+        assertNull(store().load())
+        // 缺鍵（只寫 providerId）→ null。
+        val partial = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "partial_${System.nanoTime()}.preferences_pb")
+        }
+        partial.edit { it[SHIZUKU_GRANT_PROVIDER_ID] = "preset:openai" }
+        assertNull(ShizukuGrantStore(partial).load())
+        // 空白 providerId（繞過 save 校驗直寫）→ null。
+        val blank = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "blank_${System.nanoTime()}.preferences_pb")
+        }
+        blank.edit {
+            it[SHIZUKU_GRANT_PROVIDER_ID] = "  "
+            it[SHIZUKU_GRANT_CONFIG_REVISION] = 3L
+            it[SHIZUKU_GRANT_AT_MS] = 0L
+            it[SHIZUKU_GRANT_SERVICE_VERSION] = 15
+        }
+        assertNull(ShizukuGrantStore(blank).load())
     }
 }

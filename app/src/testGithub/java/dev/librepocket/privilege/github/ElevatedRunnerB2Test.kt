@@ -4,6 +4,7 @@ import dev.librepocket.shell.ElevatedRequest
 import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellQuota
 import dev.librepocket.shell.ShellResult
+import dev.librepocket.tool.Flavor
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
@@ -11,6 +12,7 @@ import java.io.OutputStream
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -341,6 +343,32 @@ class ElevatedRunnerB2Test {
         assertTrue(!SuBinaryResolver.isTrusted("/tmp/evil/su"))
     }
 
+    @Test fun suResolverExistsThrowFoldsToNull() {
+        // 存在性檢查抛＝缺席（fail-closed），整表掃完回 null，不外抛。
+        assertEquals(null, SuBinaryResolver.resolve { throw SecurityException("denied") })
+        assertEquals(null, SuBinaryResolver.resolve { throw RuntimeException("i/o") })
+    }
+
+    @Test fun suExistsThrowFoldsToUnavailable() {
+        // RootSuRunner 側 suExists 抛→解析收斂為 null→typed Failed，不崩且零 spawn。
+        var spawns = 0
+        val runner = RootSuRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            spawn = {
+                spawns++
+                FakeProcess("ok".toByteArray())
+            },
+            suExists = { throw SecurityException("denied") },
+        )
+        val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
+        assertTrue("$r", r is ShellResult.Failed)
+        assertEquals(0, spawns)
+        val rb = runner.runBinary(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
+        assertTrue("$rb", rb is ElevatedBinaryResult.Failed)
+        assertEquals(0, spawns)
+    }
+
     @Test fun shizukuGateBlocksSpawnWhenNotAvailable() {
         for (status in listOf(
             ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN),
@@ -381,5 +409,398 @@ class ElevatedRunnerB2Test {
         )
         assertTrue(runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L) is ShellResult.Ok)
         assertEquals(1, spawns)
+    }
+
+    // ---- 5. 二進位邊界：超時 partial／capture 回落 null／大小寫 ----
+
+    @Test fun binaryTimedOutPreservesPartialBytes() {
+        val partial = "partial-bytes".toByteArray()
+        val runner = RootSuRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            spawn = { FakeProcess(partial, ByteArray(0), 0, hang = true) },
+            suBinary = "/system/bin/su",
+        )
+        val b = runner.runBinary(ElevatedRequest(listOf("id"), "B2-T"), 120L)
+        assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
+        val timedOut = b as ElevatedBinaryResult.TimedOut
+        assertTrue(timedOut.partialStdout.contentEquals(partial))
+        assertTrue(timedOut.partialStderr.isEmpty())
+        // 文字相容殼同樣攜帶 partial（lossy 解碼，純 ASCII 往返無損）。
+        val text = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 120L)
+        assertTrue("$text", text is ShellResult.TimedOut)
+        assertEquals("partial-bytes", (text as ShellResult.TimedOut).partialStdout)
+    }
+
+    /** 定值二進位 runner：capture 回落語義專用替身。 */
+    private class CannedBinaryRunner(
+        private val result: ElevatedBinaryResult,
+    ) : BinaryElevatedRunner {
+        override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult =
+            result.toShellResult()
+        override fun runBinary(request: ElevatedRequest, timeoutMs: Long): ElevatedBinaryResult =
+            result
+    }
+
+    @Test fun binaryDeniedAndFailedYieldNull() {
+        // capture 側：非 Ok（Denied/Failed/TimedOut）一律回 null，呼叫方降級手動截圖。
+        val audit = dev.librepocket.shell.PrivilegeAuditLog()
+        for (result in listOf(
+            ElevatedBinaryResult.Denied(ShellDeny.NOT_WHITELISTED, "nope"),
+            ElevatedBinaryResult.Failed("boom"),
+            ElevatedBinaryResult.TimedOut(ByteArray(0), ByteArray(0), 100L, false),
+        )) {
+            val runner = CannedBinaryRunner(result)
+            assertNull("$result", RootFramebufferCapture.screencapViaBinary(runner, audit, "B2-T", 1_000L)())
+            assertNull("$result", RootFramebufferCapture.fb0ViaBinary(runner, audit, "B2-T", 1_000L)())
+        }
+    }
+
+    @Test fun suDeniedCaseInsensitive() {
+        // 全大寫拒絕訊號仍命中（Locale.ROOT 折疊，不隨裝置語系漂移）。
+        assertTrue(isSuDenied("PERMISSION DENIED".toByteArray(), 1))
+        assertTrue(isSuDenied("Su: Permission Denied".toByteArray(), 1))
+        assertTrue(isSuDenied("OPERATION NOT PERMITTED".toByteArray(), 1))
+        assertTrue(isSuDenied("REQUEST REJECTED".toByteArray(), 1))
+    }
+
+    // ---- P3-A 補強：超時/cancel/注入異常/門禁邊界（只斷 verdict＋計數＋位元組，不斷耗時） ----
+
+    @Test fun shizukuTimeoutKillsAndReturnsBinaryTimedOut() {
+        val partial = "part-bytes".toByteArray()
+        var kills = 0
+        val runner = ShizukuShellRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            pingBinder = { true },
+            spawn = { FakeProcess(partial, ByteArray(0), 0, hang = true) },
+            status = { ShizukuStatus.Available(15) },
+            killer = {
+                kills++
+                it.destroy()
+            },
+        )
+        val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 150L)
+        assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
+        assertEquals(1, kills)
+        b as ElevatedBinaryResult.TimedOut
+        assertEquals(150L, b.timeoutMs)
+        assertTrue(b.partialStdout.contentEquals(partial))
+    }
+
+    @Test fun shizukuCancelKillsAndUnblocks() {
+        var kills = 0
+        var polls = 0
+        val runner = ShizukuShellRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            pingBinder = { true },
+            spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
+            status = { ShizukuStatus.Available(15) },
+            killer = {
+                kills++
+                it.destroy()
+            },
+            isCancelled = { ++polls > 2 },
+        )
+        val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 10_000L)
+        assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
+        assertEquals(1, kills)
+        assertTrue("polls=$polls", polls > 2)
+    }
+
+    @Test fun isCancelledThrowFoldsToNotCancelled() {
+        val shizuku = ShizukuShellRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            pingBinder = { true },
+            spawn = { FakeProcess("ok".toByteArray(), ByteArray(0), 0) },
+            status = { ShizukuStatus.Available(15) },
+            isCancelled = { throw IllegalStateException("cancel boom") },
+        )
+        val b = shizuku.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
+        assertTrue("$b", b is ElevatedBinaryResult.Ok)
+
+        val root = RootSuRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            spawn = { FakeProcess("ok".toByteArray(), ByteArray(0), 0) },
+            suBinary = "/system/bin/su",
+            isCancelled = { throw IllegalStateException("cancel boom") },
+        )
+        val r = root.run(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
+        assertTrue("$r", r is ShellResult.Ok)
+    }
+
+    @Test fun killerThrowStillReturnsTimedOut() {
+        var kills = 0
+        val runner = RootSuRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
+            suBinary = "/system/bin/su",
+            killer = {
+                kills++
+                throw IllegalStateException("kill boom")
+            },
+        )
+        val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 150L)
+        assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
+        assertEquals(1, kills)
+    }
+
+    @Test fun rootQuotaExceededDeniesWithoutSpawn() {
+        var spawns = 0
+        val quota = ShellQuota(maxCalls = 1, windowMs = 60_000L)
+        assertTrue(quota.tryAcquire())
+        val runner = RootSuRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            quota = quota,
+            spawn = {
+                spawns++
+                FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+            },
+            suBinary = "/system/bin/su",
+        )
+        val r = runner.run(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
+        assertTrue("$r", r is ShellResult.Denied)
+        assertEquals(ShellDeny.QUOTA_EXCEEDED, (r as ShellResult.Denied).reason)
+        assertEquals(0, spawns)
+        val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
+        assertTrue("$b", b is ElevatedBinaryResult.Denied)
+        assertEquals(ShellDeny.QUOTA_EXCEEDED, (b as ElevatedBinaryResult.Denied).reason)
+        assertEquals(0, spawns)
+    }
+
+    @Test fun rootBlankReasonDeniedWithoutSpawn() {
+        for (reason in listOf("", "   ")) {
+            var spawns = 0
+            val runner = RootSuRunner(
+                privateRoot = privateRoot,
+                bridgeGranted = true,
+                spawn = {
+                    spawns++
+                    FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+                },
+                suBinary = "/system/bin/su",
+            )
+            val r = runner.run(ElevatedRequest(listOf("id"), reason), 2_000L)
+            assertTrue("reason='$reason' -> $r", r is ShellResult.Denied)
+            assertEquals(ShellDeny.BAD_ARGUMENT, (r as ShellResult.Denied).reason)
+            assertEquals(0, spawns)
+        }
+    }
+
+    @Test fun rootEmptyArgvDenied() {
+        var spawns = 0
+        val runner = RootSuRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            spawn = {
+                spawns++
+                FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+            },
+            suBinary = "/system/bin/su",
+        )
+        val r = runner.run(ElevatedRequest(emptyList(), "P3-T"), 2_000L)
+        assertTrue("$r", r is ShellResult.Denied)
+        assertEquals(0, spawns)
+        val b = runner.runBinary(ElevatedRequest(emptyList(), "P3-T"), 2_000L)
+        assertTrue("$b", b is ElevatedBinaryResult.Denied)
+        assertEquals(0, spawns)
+    }
+
+    @Test fun shizukuSpawnThrowMapsToFailedRedacted() {
+        val secret = "boom bearer ABCDEFGHIJ123456 ip=10.9.9.9"
+        val runner = ShizukuShellRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            pingBinder = { true },
+            spawn = { throw IllegalStateException(secret) },
+            status = { ShizukuStatus.Available(15) },
+        )
+        val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
+        assertTrue("$b", b is ElevatedBinaryResult.Failed)
+        val msg = (b as ElevatedBinaryResult.Failed).message
+        assertTrue("msg=$msg", msg.contains("spawn failed"))
+        assertTrue("msg=$msg", !msg.contains("ABCDEFGH"))
+        assertTrue("msg=$msg", !msg.contains("10.9.9.9"))
+    }
+
+    @Test fun rootSpawnThrowMapsToFailedRedacted() {
+        val secret = "boom bearer ABCDEFGHIJ123456 ip=10.9.9.9"
+        val runner = RootSuRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            spawn = { throw IllegalStateException(secret) },
+            suBinary = "/system/bin/su",
+        )
+        val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
+        assertTrue("$b", b is ElevatedBinaryResult.Failed)
+        val msg = (b as ElevatedBinaryResult.Failed).message
+        assertTrue("msg=$msg", msg.contains("spawn failed"))
+        assertTrue("msg=$msg", !msg.contains("ABCDEFGH"))
+        assertTrue("msg=$msg", !msg.contains("10.9.9.9"))
+    }
+
+    @Test fun statusThrowFoldsToBinderDownWithoutSpawn() {
+        var spawns = 0
+        val runner = ShizukuShellRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            pingBinder = { true },
+            spawn = {
+                spawns++
+                FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+            },
+            status = { throw IllegalStateException("status boom") },
+        )
+        val r = runner.run(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
+        assertTrue("$r", r is ShellResult.Denied)
+        assertEquals(ShellDeny.NOT_WHITELISTED, (r as ShellResult.Denied).reason)
+        assertTrue(r.message.contains(ShizukuStatus.REASON_BINDER_DOWN))
+        assertEquals(0, spawns)
+        val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
+        assertTrue("$b", b is ElevatedBinaryResult.Denied)
+        assertEquals(ShellDeny.NOT_WHITELISTED, (b as ElevatedBinaryResult.Denied).reason)
+        assertEquals(0, spawns)
+    }
+
+    @Test fun playFlavorCrossDomainDenied() {
+        val argv = listOf("cat", "/sdcard/Download/x.txt")
+        var shizukuSpawns = 0
+        val shizuku = ShizukuShellRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            flavor = Flavor.PLAY,
+            pingBinder = { true },
+            spawn = {
+                shizukuSpawns++
+                FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+            },
+            status = { ShizukuStatus.Available(15) },
+        )
+        val sr = shizuku.run(ElevatedRequest(argv, "P3-T"), 2_000L)
+        assertTrue("$sr", sr is ShellResult.Denied)
+        assertEquals(0, shizukuSpawns)
+
+        var rootSpawns = 0
+        val root = RootSuRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            flavor = Flavor.PLAY,
+            spawn = {
+                rootSpawns++
+                FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+            },
+            suBinary = "/system/bin/su",
+        )
+        val rr = root.run(ElevatedRequest(argv, "P3-T"), 2_000L)
+        assertTrue("$rr", rr is ShellResult.Denied)
+        assertEquals(0, rootSpawns)
+    }
+
+    @Test fun bridgeGrantedFalseDeniesWithoutSpawn() {
+        val argv = listOf("cat", "/sdcard/Download/x.txt")
+        var shizukuSpawns = 0
+        val shizuku = ShizukuShellRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = false,
+            flavor = Flavor.GITHUB,
+            pingBinder = { true },
+            spawn = {
+                shizukuSpawns++
+                FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+            },
+            status = { ShizukuStatus.Available(15) },
+        )
+        val sr = shizuku.run(ElevatedRequest(argv, "P3-T"), 2_000L)
+        assertTrue("$sr", sr is ShellResult.Denied)
+        assertEquals(0, shizukuSpawns)
+
+        var rootSpawns = 0
+        val root = RootSuRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = false,
+            flavor = Flavor.GITHUB,
+            spawn = {
+                rootSpawns++
+                FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+            },
+            suBinary = "/system/bin/su",
+        )
+        val rr = root.run(ElevatedRequest(argv, "P3-T"), 2_000L)
+        assertTrue("$rr", rr is ShellResult.Denied)
+        assertEquals(0, rootSpawns)
+    }
+
+    @Test fun suUntrustedExplicitPathFailsWithoutSpawn() {
+        var spawns = 0
+        val runner = RootSuRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            spawn = {
+                spawns++
+                FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+            },
+            suBinary = "/tmp/evil/su",
+        )
+        val r = runner.run(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
+        assertTrue("$r", r is ShellResult.Failed)
+        assertEquals(0, spawns)
+        val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
+        assertTrue("$b", b is ElevatedBinaryResult.Failed)
+        assertEquals(0, spawns)
+    }
+
+    @Test fun suAutoResolvePrefersFirstInTableOrder() {
+        var lastArgv: List<String> = emptyList()
+        val runner = RootSuRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            spawn = { argv ->
+                lastArgv = argv
+                FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+            },
+            suExists = { it == "/system/bin/su" || it == "/sbin/su" },
+        )
+        assertTrue(runner.run(ElevatedRequest(listOf("id"), "P3-T"), 2_000L) is ShellResult.Ok)
+        assertEquals(RootSuProbe.SU_BINARIES[0], lastArgv[0])
+        assertEquals("/system/bin/su", lastArgv[0])
+    }
+
+    @Test fun zeroTimeoutReturnsTimedOut() {
+        var shizukuKills = 0
+        val shizuku = ShizukuShellRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            pingBinder = { true },
+            spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
+            status = { ShizukuStatus.Available(15) },
+            killer = {
+                shizukuKills++
+                it.destroy()
+            },
+        )
+        val sb = shizuku.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 0L)
+        assertTrue("$sb", sb is ElevatedBinaryResult.TimedOut)
+        assertEquals(1, shizukuKills)
+        assertEquals(0L, (sb as ElevatedBinaryResult.TimedOut).timeoutMs)
+
+        var rootKills = 0
+        val root = RootSuRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = true,
+            spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
+            suBinary = "/system/bin/su",
+            killer = {
+                rootKills++
+                it.destroy()
+            },
+        )
+        val rb = root.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 0L)
+        assertTrue("$rb", rb is ElevatedBinaryResult.TimedOut)
+        assertEquals(1, rootKills)
     }
 }

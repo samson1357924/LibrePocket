@@ -73,6 +73,7 @@ class ShizukuStatusTest {
         assertTrue("$down", down is ShizukuStatus.BinderUnreachable)
     }
 
+    @Suppress("DEPRECATION")
     @Test fun gateDeniesTypedWithoutSpawn() {
         val cases = listOf(
             ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN),
@@ -108,6 +109,7 @@ class ShizukuStatusTest {
         assertTrue(old.message.contains(ShizukuStatus.REASON_VERSION_UNSUPPORTED))
     }
 
+    @Suppress("DEPRECATION")
     @Test fun availableDelegatesToSpawn() {
         var spawns = 0
         val result = ShizukuStatusGate.runIfAvailable(
@@ -139,5 +141,49 @@ class ShizukuStatusTest {
     @Test fun attachWithoutBinderEnvironmentDoesNotThrow() {
         // JVM 單測無 Shizuku 服務：註冊異常由 attach 內部收斂，不得外抛。
         ShizukuBinderEvents().attach()
+    }
+
+    @Test fun evaluateExtremeVersions() {
+        // 極大版本照常放行；-1/null 一律 fail-closed 為不相容。
+        val huge = ShizukuStatus.evaluate(true, true, Int.MAX_VALUE)
+        assertTrue("$huge", huge is ShizukuStatus.Available)
+        val negative = ShizukuStatus.evaluate(true, true, -1)
+        assertTrue("$negative", negative is ShizukuStatus.VersionUnsupported)
+        val unknown = ShizukuStatus.evaluate(true, true, null)
+        assertTrue("$unknown", unknown is ShizukuStatus.VersionUnsupported)
+        assertFalse(negative.canExecute)
+        assertFalse(unknown.canExecute)
+    }
+
+    @Test fun canExecuteMatrix() {
+        // 僅 Available 可執行，其餘三態全不可。
+        assertTrue(ShizukuStatus.Available(15).canExecute)
+        assertFalse(ShizukuStatus.PermissionDenied(15).canExecute)
+        assertFalse(ShizukuStatus.VersionUnsupported(-1).canExecute)
+        assertFalse(ShizukuStatus.VersionUnsupported(10).canExecute)
+        assertFalse(ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN).canExecute)
+    }
+
+    @Test fun serviceVersionNullFoldsToUnsupported() {
+        // getVersion 抛→null→VersionUnsupported（serviceVersion 攜帶 -1），不可執行。
+        val status = ShizukuStatusProbe.status(
+            pingBinder = { true },
+            checkPermission = { true },
+            serviceVersion = { throw IllegalStateException("no service") },
+        )
+        assertTrue("$status", status is ShizukuStatus.VersionUnsupported)
+        assertEquals(-1, (status as ShizukuStatus.VersionUnsupported).serviceVersion)
+        assertFalse(status.canExecute)
+    }
+
+    @Test fun deadCallbackFaultIsolated() {
+        // dead 回呼抛異常被隔離，後續回呼照常分發（與 received 側對稱）。
+        val events = ShizukuBinderEvents()
+        val seen = mutableListOf<String>()
+        events.onDead { seen += "a" }
+        events.onDead { throw IllegalStateException("bad dead callback") }
+        events.onDead { seen += "b" }
+        events.emitDead()
+        assertEquals(listOf("a", "b"), seen)
     }
 }

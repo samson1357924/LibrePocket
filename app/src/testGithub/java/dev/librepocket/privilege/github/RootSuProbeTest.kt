@@ -57,4 +57,49 @@ class RootSuProbeTest {
         val report = RootSuProbe.probe(exists = { throw SecurityException("denied") })
         assertFalse(report.anyAvailable)
     }
+
+    @Test fun multipleMarkersCombinedReport() {
+        val report = probe("/system/bin/su", "/sbin/.magisk", "/data/adb/ksu", "/data/adb/ap")
+        assertTrue(report.anyAvailable)
+        assertEquals(listOf("/system/bin/su"), report.suBinaries)
+        assertTrue(report.suExecutableAvailable)
+        assertTrue(report.magisk)
+        assertTrue(report.kernelSu)
+        assertTrue(report.aPatch)
+    }
+
+    @Test fun secondaryMarkersDetected() {
+        assertTrue(probe("/data/adb/magisk").magisk)
+        assertTrue(probe("/data/adb/ksud").kernelSu)
+        assertTrue(probe("/data/adb/ap").aPatch)
+        val daemonsu = probe("/system/xbin/daemonsu")
+        assertEquals(listOf("/system/xbin/daemonsu"), daemonsu.suBinaries)
+        assertTrue(daemonsu.suExecutableAvailable)
+        assertTrue(daemonsu.anyAvailable)
+        // 第二標記單獨出現時不污染他道判定。
+        val magiskOnly = probe("/data/adb/magisk")
+        assertTrue(magiskOnly.anyAvailable)
+        assertTrue(magiskOnly.magisk)
+        assertFalse(magiskOnly.kernelSu)
+        assertFalse(magiskOnly.aPatch)
+        assertTrue(magiskOnly.suBinaries.isEmpty())
+    }
+
+    @Test fun partialExistsThrowStillReportsRest() {
+        val report = RootSuProbe.probe(exists = {
+            if (it == "/system/bin/su") throw SecurityException("denied")
+            it == "/sbin/.magisk"
+        })
+        // 抛的折缺席，其餘照常報告，整體仍 available。
+        assertTrue(report.suBinaries.isEmpty())
+        assertFalse(report.suExecutableAvailable)
+        assertTrue(report.magisk)
+        assertTrue(report.anyAvailable)
+    }
+
+    @Test fun markerOnlyIsAvailableButNotExecutable() {
+        val report = probe("/sbin/.magisk")
+        assertTrue(report.anyAvailable)
+        assertFalse(report.suExecutableAvailable)
+    }
 }

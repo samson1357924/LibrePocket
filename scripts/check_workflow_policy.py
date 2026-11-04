@@ -96,7 +96,7 @@ EXPECTED_WORKFLOW_SHA256 = {
         "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564"
     ),
     "pr-check.yml": (
-        "d09ef9b8bc422953ffed856551f5648f61a0a73e0ead01046d5f5ee60432ed7e"
+        "a407f82bfaa54ffc9c26e3449909084ed65fc91f5aeba9143bc34c7e0725abf0"
     ),
     "release.yml": (
         "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f"
@@ -213,6 +213,8 @@ EXPECTED_CODE_FILTER_PATHS = frozenset(
 EXPECTED_POLICY_FILTER_PATHS = frozenset(
     {
         "gradle/wrapper/**",
+        "gradle/**",
+        "gradle.properties",
         "gradlew",
         "gradlew.bat",
         "scripts/play_policy_check.sh",

@@ -52,6 +52,12 @@ jobs:
               # The harness runs in parallel; each Gradle job also checks its
               # own wrapper before invoking Gradle.
               - 'gradle/wrapper/**'
+              # Dependency metadata and catalog edits must run the harness too.
+              # gradle/** covers verification-metadata.xml, libs.versions.toml
+              # and future files under gradle/, but not the root-level
+              # gradle.properties (no slash), which needs its own entry.
+              - 'gradle/**'
+              - 'gradle.properties'
               - 'gradlew'
               - 'gradlew.bat'
               - 'scripts/play_policy_check.sh'

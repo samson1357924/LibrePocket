@@ -16,7 +16,7 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `app/build.gradle.kts`, `app/lint.xml`, `gradle/**`,
 `settings.gradle.kts`, `build.gradle.kts`, `gradle.properties`, `gradlew`, `gradlew.bat`,
 `.github/workflows/pr-check.yml`) and `policy`
-(`gradle/wrapper/**`, `gradlew`, `gradlew.bat`, `scripts/play_policy_check.sh`, `scripts/apk_policy_inspect.py`,
+(`gradle/wrapper/**`, `gradle/**`, `gradle.properties`, `gradlew`, `gradlew.bat`, `scripts/play_policy_check.sh`, `scripts/apk_policy_inspect.py`,
 `scripts/backup_rules_check.py`,
 `scripts/nsc_check.py`,
 `scripts/summarize_junit.py`, `scripts/check_test_budgets.py`,
@@ -49,8 +49,11 @@ they exist for readability/history, and the catch-all defaults any new
 `scripts/` harness code (checker or script test) into the gate with no
 filter edit (`PolicyCiGateControl` pins the catch-all in the parsed filter
 list and never parses this document).
-Changes under `gradle/wrapper/**` and either root launcher select both `code`
-and `policy`; changes to `scripts/verify_gradle_wrapper.py` select `policy`
+Changes under `gradle/**` (including `gradle/verification-metadata.xml` and
+`gradle/libs.versions.toml`), `gradle.properties`, `gradle/wrapper/**`, and
+either root launcher select both `code` and `policy`, so metadata/catalog-only
+diffs run the policy harness and build/policy gates; changes to
+`scripts/verify_gradle_wrapper.py` select `policy`
 through the scripts catch-all. The wrapper harness and Gradle jobs can run in
 parallel, but each Gradle job independently runs `python3
 scripts/verify_gradle_wrapper.py` before invoking the wrapper. The same check
@@ -170,7 +173,7 @@ boolean `on:` key collision. YAML merge keys (`<<`) are forbidden at
 construction time by `DuplicateKeySafeLoader`. Flow style, quoted keys,
 next-line scalars and anchors/aliases are resolved by the parser rather than by
 text matching. Comprehensive test coverage for the workflow policy checker is
-maintained in `scripts/tests/test_workflow_policy.py` (198 tests). It fails
+maintained in `scripts/tests/test_workflow_policy.py` (201 tests). It fails
 closed with `file:line` diagnostics on these pinned invariants:
 
 - only the reviewed workflow filenames (`codeql.yml`,
@@ -275,7 +278,7 @@ closed with `file:line` diagnostics on these pinned invariants:
   `working-directory`; `unit-tests` must keep `fail-fast: false` and
   `matrix.flavor` exactly `[play, foss, github]`, and `policy-harness` must
   keep the pinned PyYAML install, the import-shadow preflight and the unittest
-  command containing `scripts/tests/test_workflow_policy.py` (198 tests). Separately, the
+  command containing `scripts/tests/test_workflow_policy.py` (201 tests). Separately, the
   whole `pr-check.yml` is byte-pinned (as are all six reviewed workflows): the
   per-job checks pin the core commands, not every possible extra step, so the
   raw-byte SHA-256 pin is what rejects an inserted no-op step anywhere else in

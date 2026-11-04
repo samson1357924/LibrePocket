@@ -298,6 +298,7 @@ class SetupEditKeepExistingTest {
             // finally below): wait until the collector has observed B-terminal
             // before releasing A; otherwise release + A's whole writeback could
             // complete before the collector's first emission (vacuous pin).
+            // seen is a plain synchronized list (collector pushes), hence poll; bounded 10s, first emission immediate post-B-terminal in practice.
             withTimeout(10_000) { while (seen.isEmpty()) delay(5) }
             fake.release.countDown()
             assertTrue("slow attempt never finished", fake.slowDone.await(10, TimeUnit.SECONDS))

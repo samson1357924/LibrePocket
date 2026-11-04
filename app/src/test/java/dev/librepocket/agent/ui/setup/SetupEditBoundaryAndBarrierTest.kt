@@ -423,6 +423,7 @@ class SetupEditBoundaryAndBarrierTest {
         val stale = try {
             // Handshake（try 內第一句，超時亦走下方 finally）：等 collector 已觀測到
             // B 終值才放行 A；否則放行＋A 整段寫回可能搶在 collector 首次發射前完成（空洞釘）。
+            // seen 為 plain synchronized list（collector 推入）故須 poll；bounded 10s，B-terminal 後首個發射即時到達。
             withTimeout(10_000) { while (seen.isEmpty()) delay(5) }
             fake.release.countDown()
             assertTrue("slow refresh never finished", fake.slowDone.await(10, TimeUnit.SECONDS))

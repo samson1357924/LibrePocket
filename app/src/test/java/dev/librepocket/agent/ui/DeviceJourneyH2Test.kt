@@ -204,6 +204,8 @@ class DeviceJourneyH2Test {
         // 訊息，重開後為空，故以 messages.size == 2 為條件）。
         val sid = checkNotNull(chatVm.currentSessionId.value) { "first send must create session" }
         assertTrue(transcripts.metas.containsKey(sid))
+        // Writer-drain poll: FakeSessionStore.events is a plain ArrayList with no Flow seam, so a condition wait is impossible without a prod seam.
+        // Bounded 10s; drains in ms in practice.
         withTimeout(10_000) {
             while (transcripts.events.count { it.kind == "user" || it.kind == "assistant" } < 2) delay(5)
         }

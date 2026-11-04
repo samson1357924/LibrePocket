@@ -312,6 +312,8 @@ class ProviderTransportTest {
                             // Daemon threads are fire-and-forget: no executor
                             // lifecycle to leak into other tests, and the only
                             // observable behavior change is the extra latch.
+                            // Lifecycle: each watchdog auto-exits ~1s after its read returns (sleep+flag check), daemon so never blocks JVM exit,
+                            // count bounded by read count (transient), no @After/teardown needed.
                             val readDone = AtomicBoolean(false)
                             val watchdog = Thread {
                                 try {
@@ -1815,6 +1817,7 @@ class ProviderTransportTest {
                 // (up to ~64KiB+framing may still be in flight). Note: the
                 // threshold poll below still uses delay polling — this file is
                 // not fully sleep-free.
+                // S7 residual: threshold-poll delay(50) stays (AtomicLong has no Flow; converting signals to StateFlow would touch 15+ tests — deferred).
                 withTimeout(20_000) {
                     while (signals.consumedBytes.get() < MODEL_LIST_BODY_LIMIT_BYTES - 64 * 1024) delay(50)
                 }

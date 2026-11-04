@@ -14,6 +14,8 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performTextInput
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import dev.librepocket.agent.ui.chat.ChatSessionFactory
+import dev.librepocket.agent.ui.chat.ChatTestMainDispatcher
+import dev.librepocket.agent.ui.chat.ChatTestViewModelStore
 import dev.librepocket.agent.ui.chat.ChatViewModel
 import dev.librepocket.agent.ui.chat.SessionStoreSource
 import dev.librepocket.agent.ui.chat.VaultSource
@@ -22,6 +24,7 @@ import dev.librepocket.agent.ui.chat.cancelAndJoinChatTestScopes
 import dev.librepocket.agent.ui.setup.CountingVault
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
+import dev.librepocket.agent.ui.setup.SetupValidation
 import dev.librepocket.agent.ui.setup.SetupViewModel
 import dev.librepocket.agent.ui.setup.VerdictPolicy
 import dev.librepocket.chat.ChatStatus
@@ -59,7 +62,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 private class H2FakeProvider(
-    var handler: (ChatRequest) -> Flow<StreamEvent> = { emptyFlow() },
+    val handler: (ChatRequest) -> Flow<StreamEvent> = { emptyFlow() },
 ) : LlmProvider {
     override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
     override fun stream(request: ChatRequest): Flow<StreamEvent> = flow { emitAll(handler(request)) }
@@ -87,8 +90,8 @@ class DeviceJourneyH2Test {
 
     private val tmpDirs = ArrayList<File>()
     private val scopes = ArrayList<CoroutineScope>()
-    private val chatMain = dev.librepocket.agent.ui.chat.ChatTestMainDispatcher()
-    private val chatStores = dev.librepocket.agent.ui.chat.ChatTestViewModelStore()
+    private val chatMain = ChatTestMainDispatcher()
+    private val chatStores = ChatTestViewModelStore()
 
     @Before
     fun setUp() {
@@ -224,7 +227,9 @@ class DeviceJourneyH2Test {
         assertEquals("gpt-4o", withTimeout(10_000) { store.snapshotStrict() }?.model)
 
         // logout 清除：store＋vault 鍵皆空。
-        val liveAlias = checkNotNull(withTimeout(10_000) { store.snapshotStrict() }?.apiKeyRef) { "model-only edit must persist endpoint" }.removePrefix("provider_key/")
+        val liveAlias = checkNotNull(withTimeout(10_000) { store.snapshotStrict() }?.apiKeyRef) {
+            "model-only edit must persist endpoint"
+        }.removePrefix("provider_key/")
         check(liveAlias.isNotBlank()) { "live alias must not be blank" }
         val done = CompletableDeferred<Boolean>()
         onMain { editVm.logout { done.complete(it) } }
@@ -235,7 +240,7 @@ class DeviceJourneyH2Test {
     }
 
     private fun customConfig(url: String, model: String = "local"): EndpointConfig {
-        val id = dev.librepocket.agent.ui.setup.SetupValidation.deriveEndpointId("custom", url)
+        val id = SetupValidation.deriveEndpointId("custom", url)
         return EndpointConfig(
             providerId = id,
             presetId = "custom",
@@ -243,7 +248,7 @@ class DeviceJourneyH2Test {
             baseUrl = url,
             protocol = ProviderProtocol.CHAT_COMPLETIONS,
             model = model,
-            apiKeyRef = dev.librepocket.agent.ui.setup.SetupValidation.deriveApiKeyRef(id),
+            apiKeyRef = SetupValidation.deriveApiKeyRef(id),
         )
     }
 
@@ -259,11 +264,9 @@ class DeviceJourneyH2Test {
         val urlB = "http://127.0.0.1:11443/v1"
         val store = newStore()
         val vault = CountingVault(EncryptedPrefsVault(InMemoryPrefs()))
-        val idA = dev.librepocket.agent.ui.setup.SetupValidation.deriveEndpointId("custom", urlA)
-        runBlocking {
-            vault.putKey(idA, "fake-h2-cross-key-12345678".toCharArray())
-            store.save(customConfig(urlA))
-        }
+        val idA = SetupValidation.deriveEndpointId("custom", urlA)
+        vault.putKey(idA, "fake-h2-cross-key-12345678".toCharArray())
+        store.save(customConfig(urlA))
         val putsBefore = vault.putKeys
         val vm = SetupViewModel(
             store = store,

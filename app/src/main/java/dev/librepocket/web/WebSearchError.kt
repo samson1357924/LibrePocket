@@ -7,23 +7,29 @@ package dev.librepocket.web
  * 純 JVM 分類器：[WebFailureReason.fallbackAllowed] 為 false 者呼叫方
  * 不得換下一個 provider；[WebUnavailableReason] 一律不 fallback。
  */
-enum class WebUnavailableReason(val detail: String) {
-    EMPTY_QUERY("EMPTY_QUERY"),
-    NO_PROVIDER("NO_PROVIDER"),
-    PROVIDER_DISABLED("PROVIDER_DISABLED"),
-    MISSING_KEY("MISSING_KEY"),
-    MISSING_URL("MISSING_URL"),
-    PINNED_UNAVAILABLE("PINNED_UNAVAILABLE"),
-    HOSTED_NOT_SUPPORTED("HOSTED_NOT_SUPPORTED"),
+enum class WebUnavailableReason {
+    EMPTY_QUERY,
+    NO_PROVIDER,
+    PROVIDER_DISABLED,
+    MISSING_KEY,
+    MISSING_URL,
+    PINNED_UNAVAILABLE,
+    HOSTED_NOT_SUPPORTED;
+
+    /** 除錯／transcript 用的穩定字串，恆等於 [name]（去重：不再為每個 entry 存一份拷貝）。 */
+    val detail: String get() = name
 }
 
-enum class WebFailureReason(val detail: String, val fallbackAllowed: Boolean) {
-    AUTH("AUTH", false),
-    PROTOCOL("PROTOCOL", false),
-    TRANSPORT("TRANSPORT", true),
-    TIMEOUT("TIMEOUT", true),
-    BAD_RESPONSE("BAD_RESPONSE", true),
-    SUPPLIER_ERROR("SUPPLIER_ERROR", true),
+enum class WebFailureReason(val fallbackAllowed: Boolean) {
+    AUTH(false),
+    PROTOCOL(false),
+    TRANSPORT(true),
+    TIMEOUT(true),
+    BAD_RESPONSE(true),
+    SUPPLIER_ERROR(true);
+
+    /** 除錯／transcript 用的穩定字串，恆等於 [name]（去重：不再為每個 entry 存一份拷貝）。 */
+    val detail: String get() = name
 }
 
 sealed interface WebSearchOutcome {

@@ -13,6 +13,11 @@ import kotlinx.coroutines.withContext
  * D2 cache＋single-flight 包裝（#138 Scope：同 query 第二次零 upstream、`cached=true`；
  * 併發同 query 合流為一次 upstream；純 JVM，不接線）。
  *
+ * Composable／registry-ready：本類自身實作 [WebSearchProvider]，可直接註冊進
+ * [WebSearchRegistry]（[id]／[capabilities]／[probe] 全委派給底層 delegate），
+ * 也可巢狀包裝（Service 包 Service；快取按 providerId＋query＋count 分 key，
+ * 不會互撞，見「快取隔離」）。
+ *
  * - 命中快取 → `Ok.copy(cached = true)`，零 upstream。
  * - 未命中 → 同 key 併發呼叫共用同一個 upstream（leader 執行、
  *   follower `await()`；follower 取消不影響 leader，只中斷自己的等待）。
@@ -38,7 +43,14 @@ import kotlinx.coroutines.withContext
 class WebSearchService(
     private val delegate: WebSearchProvider,
     private val cache: WebSearchCache = WebSearchCache(),
-) {
+) : WebSearchProvider {
+    override val id: String get() = delegate.id
+
+    override val capabilities: Set<WebCapability> get() = delegate.capabilities
+
+    override suspend fun probe(): WebProbe = delegate.probe()
+
+    @Deprecated("Use id", ReplaceWith("id"))
     val providerId: String get() = delegate.id
 
     /** 清空底層快取（委派至 `cache.clear()`）。 */
@@ -47,7 +59,7 @@ class WebSearchService(
     private val mutex = Mutex()
     private val inFlight = mutableMapOf<String, CompletableDeferred<WebSearchOutcome>>()
 
-    suspend fun search(query: String, count: Int): WebSearchOutcome {
+    override suspend fun search(query: String, count: Int): WebSearchOutcome {
         if (query.isBlank()) return delegate.search(query, count)
         val n = WebSearchBudgets.countOf(count)
         val key = cache.key(delegate.id, query, n)

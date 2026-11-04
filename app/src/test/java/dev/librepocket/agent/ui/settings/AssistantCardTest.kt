@@ -211,6 +211,26 @@ class AssistantCardTest {
             .assertTextEquals(assistantReasonText(AssistantReasonCode.GRANTED))
     }
 
+    /**
+     * re-review #3 finding #1 [P2]：VERIFYING 原因行渲染（[assistantReasonText]
+     * 同源比對）。生產管線經 rememberAssistantRole 調和：RESULT_OK 後首幀即
+     * VERIFYING（stored=null＋pendingVerify），held 確認即清除、超時收斂
+     * （!everHeld→null 隱藏本行、everHeld→REVOKED），此處僅鎖定渲染層輸入。
+     */
+    @Test
+    fun reasonVerifying_showsExactText() {
+        setSettings(
+            AssistantSettingsState(
+                roleHeld = false,
+                roleAvailable = true,
+                reasonCode = AssistantReasonCode.VERIFYING,
+            ),
+        )
+        composeRule.onNodeWithTag("assistantReason")
+            .performScrollTo().assertIsDisplayed()
+            .assertTextEquals("要求已送出，正在向系統確認角色狀態…")
+    }
+
     /** C7：reason==null 時原因行與 DENIED 文案皆不存在。 */
     @Test
     fun nullReason_hidesDeniedTextAndReasonTag() {

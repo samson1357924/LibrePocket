@@ -412,6 +412,11 @@ fun SettingsScreen(
                                         AssistantReasonCode.REVOKED,
                                         AssistantReasonCode.REQUEST_FAILED ->
                                             MaterialTheme.colorScheme.error
+                                        // VERIFYING 明確中性：驗證中不宣稱成功／失敗
+                                        // （re-review #3 finding #1；else 同中性，
+                                        // 列出以鎖定語義）。
+                                        AssistantReasonCode.VERIFYING ->
+                                            MaterialTheme.colorScheme.onSurfaceVariant
                                         else -> MaterialTheme.colorScheme.onSurfaceVariant
                                     },
                                     modifier = Modifier.testTag("assistantReason"),

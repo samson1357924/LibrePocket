@@ -12,6 +12,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -23,6 +24,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner // lifecycle-runtime-compose 2.8.7（見 gradle/libs.versions.toml）≥2.7.0 穩定，非實驗。
+import kotlinx.coroutines.delay
 
 /**
  * C1b RoleManager 生產接線（Issue #137：Settings 一鍵 `ROLE_ASSISTANT`）。
@@ -31,27 +33,37 @@ import androidx.lifecycle.compose.LocalLifecycleOwner // lifecycle-runtime-compo
  *   `createRequestRoleIntent(ROLE_ASSISTANT)`＋`StartActivityForResult`；
  *   Unsupported／ReadError→直接 fallback／no-op，fail-closed）＋失敗 fallback
  *   [assistantFallbackIntent]（`ACTION_VOICE_INPUT_SETTINGS`）。
- * - 結果：`RESULT_OK`→GRANTED（重讀快照；若已非持有則 [effectiveAssistantReason]
- *   覆寫為 REVOKED）；非 OK→DENIED（只記原因碼，不自動跳轉——跳轉留給
+ * - 結果：`RESULT_OK`→驗證中（`stored=null`＋`pendingVerify=true`＋
+ *   `verifyAttempt=0`＋`refreshTick++`：OK 只代表要求被接受，不代表系統已落盤，
+ *   故不寫 GRANTED——re-review #3 finding #1 [P2]；調和此時回 VERIFYING，
+ *   既不宣稱授予亦不判撤銷）；非 OK→DENIED（只記原因碼，不自動跳轉——跳轉留給
  *   「語音輸入設定」按鈕 [AssistantRoleUi.openFallback]）。兩路徑皆 `refreshTick++`
- *   重讀快照，讓 REVOKED／held 調和經 [effectiveAssistantReason] 生效。
+ *   重讀快照，讓 VERIFYING／held 調和經 [effectiveAssistantReason] 生效。
  * - ON_RESUME 刷新：`LifecycleEventObserver(ON_RESUME)→refreshTick++`，從授權頁／
- *   系統設定返回即重讀快照（GRANTED 落盤延遲／外部撤銷皆被調和，不依賴回調單一路徑）。
- *   ON_RESUME 只 `tick++`、不清驗證旗（Stage 2 finding B：消耗點是重讀提交後的
- *   `SideEffect`，與回調／resume 相對時序無關，詳見 [consumePendingVerify]）。
- * - 外部撤銷：`everHeld` sticky（曾觀察 Known held 即置 true）＋
+ *   系統設定返回即重讀快照（落盤延遲／外部撤銷皆被調和，不依賴回調單一路徑）。
+ *   ON_RESUME 只 `tick++`、不清驗證旗、不計重試次數（Stage 2 finding B：結束點是
+ *   重讀提交後的 `SideEffect`＋重試計數，與回調／resume 相對時序無關，
+ *   詳見 [consumePendingVerify]）。
+ * - 外部撤銷：`everHeld` sticky（曾確認 Known held 即置位，確認語義）＋
  *   SharedPreferences `"assistant_role"`／`"ever_held"` 持久化（process death
  *   後仍可判定）；調和經 [effectiveAssistantReason] 三態版
- *   (`stored`／`snapshot`／`everHeld`／`justGranted=pendingVerify`)。
- * - RESULT_OK 競態寬限（Stage 2 finding B：驗證一次即消耗）：
- *   回調設 `pendingVerify=true`＋`stored=GRANTED`，下一次快照重讀幀仍以
- *   true 判定（首幀保持 GRANTED 而非立即誤判 REVOKED），該幀提交後
- *   `SideEffect { pendingVerify = consumePendingVerify(pendingVerify, snapshot) }`
- *   即消耗（僅 Known 消耗；ReadError／Unsupported 不消耗亦無寬限效果）。
- *   新一輪 request 發起清旗（舊寬限不帶入新流程）；`pendingVerify` 僅記憶體態
- *   （remember，不跨 process death——丟失可接受，重進按正常規則判定）。
- *   回調先於 ON_RESUME／後於 ON_RESUME 兩種順序皆收斂到「下一次快照讀取後消耗」
- *   （至多寬限兩幀，見 [consumePendingVerify] KDoc）。
+ *   (`stored`／`snapshot`／`everHeld`／`pendingVerify`)。
+ * - RESULT_OK 驗證協議（re-review #3 finding #1：驗證必須觸發新的讀取，
+ *   驗證代幣被消耗≠觀察到新系統真相）：
+ *   回調設 `pendingVerify=true`＋`stored=null`＋`attempt=0`＋`refreshTick++`
+ *   （首幀即 VERIFYING）；`LaunchedEffect(pendingVerify, verifyAttempt)` 排程
+ *   後續重讀（`delay([VERIFY_RETRY_DELAY_MS])` 後 `attempt++`＋`refreshTick++`，
+ *   上限 [VERIFY_MAX_ATTEMPTS] 次）；每幀提交後
+ *   `SideEffect { pendingVerify = consumePendingVerify(pendingVerify, snapshot,
+ *   verifyAttempt) }` 判定結束（Known held 確認持有即結束；Known(!held) 且次數
+ *   耗盡即超時收斂 `pendingVerify=false`，按正常規則走：`everHeld?REVOKED:
+ *   中性 idle`——從未確認持有不斷言撤銷；ReadError／Unsupported 保留 pending
+ *   並照常重試）。新一輪 request 發起清旗＋`attempt=0`（舊驗證不帶入新流程）；
+ *   `pendingVerify`／`verifyAttempt` 僅記憶體態（remember，不跨 process death——
+ *   丟失可接受，重進後按正常規則判定）。
+ *   回調先於 ON_RESUME／後於 ON_RESUME 兩種順序皆收斂（至多上限次排程重讀
+ *   ＋resume 額外讀，見 [consumePendingVerify] KDoc；`tick++` 不在 effect key
+ *   內故不重啟 delay，無無限循環）。
  * - RoleManager 缺失（OEM 不支援）→ [AssistantSnapshot.Unsupported]＋對應原因碼＋
  *   fallback，fail-closed；讀取異常 → [AssistantSnapshot.ReadError]（與真不支援
  *   區分：頭部「無法確認助理狀態，請稍後重試」＋主按鈕 disabled＋原因行 passthrough，
@@ -105,12 +117,18 @@ fun rememberAssistantRole(): AssistantRoleUi {
         appContext.getSharedPreferences("assistant_role", Context.MODE_PRIVATE)
     }
     var everHeld by rememberSaveable { mutableStateOf(prefs.getBoolean("ever_held", false)) }
-    // Stage 2 finding B：RESULT_OK 競態寬限改為驗證代幣（驗證一次即消耗）。
-    // 回調置 true；消耗點是下一次快照重讀幀提交後的 SideEffect（僅 Known 消耗，
-    // 見 consumePendingVerify），與回調／ON_RESUME 相對時序無關。
+    // Stage 2 finding B（re-review #3 finding #1 語義修正：驗證中＋重試收斂）：
+    // 回調置 true（＋stored=null＋attempt=0，見 launcher）；結束點是重讀提交後的
+    // SideEffect（consumePendingVerify：Known held 確認即結束、Known(!held) 僅
+    // 次數耗盡超時結束、未知態保留），與回調／ON_RESUME 相對時序無關。
     // 僅記憶體態（remember，不跨 process death——丟失可接受，重進按正常規則判定），不落盤。
-    // 新一輪 request 發起清旗（舊寬限不帶入新流程）；ON_RESUME 只 tick++不清旗。
+    // 新一輪 request 發起清旗＋attempt=0（舊驗證不帶入新流程）；ON_RESUME 亦不清旗、不計數。
     var pendingVerify by remember { mutableStateOf(false) }
+    // 驗證重試計數器（re-review #3 finding #1）：排程端遞增（LaunchedEffect delay
+    // 後 attempt++＋tick++），上限 VERIFY_MAX_ATTEMPTS；SideEffect 只讀它判定
+    // 超時（consumePendingVerify），不自行遞增（避免無關重組誤計數）。
+    // 僅記憶體態（remember）；request 入口／RESULT_OK 重置為 0。
+    var verifyAttempt by remember { mutableIntStateOf(0) }
     var refreshTick by remember { mutableIntStateOf(0) }
     // C: fallback 失敗回饋（rememberSaveable 撐過旋轉；成功開啟即清回 false）。
     var fallbackFailed by rememberSaveable { mutableStateOf(false) }
@@ -118,11 +136,12 @@ fun rememberAssistantRole(): AssistantRoleUi {
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                // Stage 2 finding B：只 tick++ 觸發重讀，不清 pendingVerify。
-                // 消耗由重讀提交後的 SideEffect 執行（consumePendingVerify），故
-                // callback-before-resume（回調先設旗，resume 再重讀）與
-                // callback-after-resume（resume 先重讀，回調後再設旗重讀）皆收斂到
-                // 「下一次快照讀取後消耗」，不會因清旗時序提早／延後寬限。
+                // re-review #3 finding #1：只 tick++ 觸發重讀，不清 pendingVerify、
+                // 不計 verifyAttempt（排程 delay 不重啟，見下 LaunchedEffect）。
+                // 結束由重讀提交後的 SideEffect 執行（consumePendingVerify），故
+                // callback-before-resume（回調先設旗，resume 提供額外新鮮讀取）與
+                // callback-after-resume（resume 先重讀，回調後再設旗重讀）皆收斂，
+                // 不會因清旗時序提早／延後驗證。
                 refreshTick++
             }
         }
@@ -136,14 +155,28 @@ fun rememberAssistantRole(): AssistantRoleUi {
     // 外部授予→撤銷鏈路：只在 Known held 才 sticky everHeld 並落盤（未知態不置位，
     // 避免把讀取失敗誤記為持有痕跡）；process death 後仍可判撤銷。
     // composition body 禁止直接寫 state＋SP（重組循環風險），改用 SideEffect。
-    // 驗證代幣消耗同在此：本幀以 pendingVerify 判定後即消耗（僅 Known），
-    // 下次重讀按正常規則走——兩語句皆放 SideEffect（提交後執行），互不干擾。
+    // 驗證結束判定同在此：以 consumePendingVerify(pendingVerify, snapshot,
+    // verifyAttempt) 決策（held 確認／超時收斂置 false，未知態／次數未滿保留），
+    // 次數遞增由排程端 LaunchedEffect 執行（見下），此處不計數。
     SideEffect {
         if (snapshot is AssistantSnapshot.Known && snapshot.held && !everHeld) {
             everHeld = true
             prefs.edit().putBoolean("ever_held", true).apply()
         }
-        pendingVerify = consumePendingVerify(pendingVerify, snapshot)
+        pendingVerify = consumePendingVerify(pendingVerify, snapshot, verifyAttempt)
+    }
+    // 驗證重試排程（re-review #3 finding #1：驗證必須觸發新的讀取）。
+    // key 含 verifyAttempt：每次排程重讀提交後 SideEffect 若保留 pending
+    // （Known(!held) 且次數未滿），attempt 已＋1 使 key 變化→重排下一次；
+    // 達上限（SideEffect 置 pending=false）或 held 確認（同置 false）即停。
+    // tick++ 不在 key 內：ON_RESUME／回調的即時重讀不重啟 delay、不多計次數，
+    // 只提供額外新鮮快照；guard（pending＋attempt 上限）保證終止，無無限循環。
+    LaunchedEffect(pendingVerify, verifyAttempt) {
+        if (pendingVerify && verifyAttempt < VERIFY_MAX_ATTEMPTS) {
+            delay(VERIFY_RETRY_DELAY_MS)
+            verifyAttempt++
+            refreshTick++
+        }
     }
     val openFallback: () -> Unit = remember(appContext) {
         // fallbackFailed 經 MutableState 引用捕獲，非值捕獲，故無需入 remember key。
@@ -192,23 +225,29 @@ fun rememberAssistantRole(): AssistantRoleUi {
         contract = ActivityResultContracts.StartActivityForResult(),
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
-            storedReason = AssistantReasonCode.GRANTED
-            // RESULT_OK 落盤延遲寬限（Stage 2 finding B：驗證代幣）：
-            // 置 true＋refreshTick++，下一次快照重讀幀以 true 判定（首幀 GRANTED），
-            // 該幀提交後 SideEffect 即消耗（僅 Known）。此處不清，ON_RESUME 亦不清。
+            // RESULT_OK 只代表要求被接受，不代表系統已落盤
+            // （re-review #3 finding #1 [P2]）：不寫 GRANTED（否則下次重讀
+            // Known(!held) 會用早期 false 快照斷言撤銷），stored 清 null＋
+            // pendingVerify=true 進入驗證中（調和回 VERIFYING）＋attempt=0，
+            // refreshTick++ 立即重讀第一幀；後續重讀由重試排程驅動，超時收斂
+            // （!everHeld→中性 idle，everHeld→REVOKED）。此處不清，ON_RESUME 亦不清。
+            storedReason = null
             pendingVerify = true
+            verifyAttempt = 0
             fallbackFailed = false
         } else {
             storedReason = AssistantReasonCode.DENIED
             pendingVerify = false
+            verifyAttempt = 0
         }
-        // GRANTED／DENIED 皆重讀快照：REVOKED／held 調和經 effectiveAssistantReason 生效。
+        // 驗證中／DENIED 皆重讀快照：VERIFYING／held／REVOKED 調和經 effectiveAssistantReason 生效。
         refreshTick++
     }
     val request: () -> Unit = remember(snapshot, roleManager, launcher, openFallback) {
         {
-            // 新一輪要求開始即結束上一輪寬限（否則舊 pendingVerify 常駐掩蓋撤銷）。
+            // 新一輪要求開始即結束上一輪驗證（否則舊 pendingVerify 常駐掩蓋撤銷）＋attempt=0。
             pendingVerify = false
+            verifyAttempt = 0
             // Stage 2 finding C：ReadError fail-closed——不發要求、不設
             // UNSUPPORTED 碼（誠實：未知≠不支援）、不開 fallback，純 no-op
             //（主按鈕本就 disabled，此為防禦性分支）。
@@ -217,6 +256,9 @@ fun rememberAssistantRole(): AssistantRoleUi {
             } else {
                 when (decideAssistantRole(snapshot)) {
                     AssistantRoleDecision.AlreadyHeld -> {
+                        // 已確認 held 前提下寫 GRANTED（隨即被 held 規則清除為 null）：
+                        // 此為新流程下 GRANTED sticky 唯一合法來源，具確認語義
+                        // （見 effectiveAssistantReason GRANTED→REVOKED 分支）。
                         storedReason = AssistantReasonCode.GRANTED
                         fallbackFailed = false
                     }

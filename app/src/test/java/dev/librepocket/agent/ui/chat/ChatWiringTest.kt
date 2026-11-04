@@ -745,12 +745,15 @@ class ChatWiringTest {
             }
         }
         val vm = newVm(store, fake)
-        onMain { vm.onInputChange("first") }
-        onMain { vm.send() }
-        awaitTrue { vm.sessionState.value.status == ChatStatus.STREAMING }
-        onMain { vm.steer("follow") }
-        awaitTrue { vm.sessionState.value.pendingSteerCount == 1 || vm.messages.value.size == 4 }
-        gate.complete(Unit)
+        try {
+            onMain { vm.onInputChange("first") }
+            onMain { vm.send() }
+            awaitTrue { vm.sessionState.value.status == ChatStatus.STREAMING }
+            onMain { vm.steer("follow") }
+            awaitTrue { vm.sessionState.value.pendingSteerCount == 1 || vm.messages.value.size == 4 }
+        } finally {
+            gate.complete(Unit)
+        }
         awaitTrue(timeoutMs = 12000) { vm.messages.value.size == 4 }
         assertEquals("follow", vm.messages.value[2].text)
     }

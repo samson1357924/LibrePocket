@@ -48,6 +48,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -159,6 +160,7 @@ class DeviceJourneyH2Test {
         assertTrue(setupVm.form.value.saved)
         val saved = withTimeout(10_000) { store.snapshotStrict() }
         assertEquals("preset:openai", saved?.providerId)
+        assertEquals("gpt-4o-mini", saved?.model)
 
         // chat send（Fake provider 回 ok）：sleep-free 以 first 等待訊息落定。
         val fake = H2FakeProvider { _ ->
@@ -183,6 +185,7 @@ class DeviceJourneyH2Test {
             chatVm.sessionState.first { it.status == ChatStatus.IDLE && it.messages.size == 2 }
         }
         assertEquals("ok", chatVm.sessionState.value.messages.first { it.role == "assistant" }.text)
+        assertEquals("hi h2", chatVm.sessionState.value.messages.first { it.role == "user" }.text)
 
         // resume：同 store 新 VM 可開舊會話（FakeSessionStore 內仍有該會話）。
         val sid = checkNotNull(chatVm.currentSessionId.value) { "first send must create session" }
@@ -196,6 +199,8 @@ class DeviceJourneyH2Test {
             buildProvider = { _, _ -> H2FakeProvider() },
         )
         val putsBefore = vault.putKeys
+        val getsBefore = vault.getKeys
+        val deletesBefore = vault.deleteKeys
         onMain {
             editVm.prefillForEdit(openAiConfig())
             editVm.onModelChange("gpt-4o")
@@ -205,12 +210,21 @@ class DeviceJourneyH2Test {
         assertNull(editVm.form.value.errorCode)
         assertTrue(editVm.form.value.saved)
         assertEquals(putsBefore, vault.putKeys)
+        // Model-only 編輯沿用既有 key：save 本身零 vault get/delete I/O。
+        // 上方 chat send 已做一次 attach-time getKey，故以編輯前計數為基準（非 0）。
+        assertEquals(getsBefore, vault.getKeys)
+        assertEquals(deletesBefore, vault.deleteKeys)
+        assertEquals("gpt-4o", withTimeout(10_000) { store.snapshotStrict() }?.model)
 
         // logout 清除：store＋vault 鍵皆空。
+        val liveAlias = checkNotNull(withTimeout(10_000) { store.snapshotStrict() }?.apiKeyRef) { "model-only edit must persist endpoint" }.removePrefix("provider_key/")
+        check(liveAlias.isNotBlank()) { "live alias must not be blank" }
         val done = CompletableDeferred<Boolean>()
         onMain { editVm.logout { done.complete(it) } }
         assertTrue("logout must succeed", withTimeout(10_000) { done.await() })
-        assertNull(withTimeout(10_000) { store.snapshotStrict() })
+        assertNull("logout must clear endpoint snapshot", withTimeout(10_000) { store.snapshotStrict() })
+        assertFalse("logout must clear live vault key $liveAlias", vault.hasKey(liveAlias))
+        assertNull("logout must clear live vault key bytes $liveAlias", vault.getKey(liveAlias))
     }
 
     private fun customConfig(url: String, model: String = "local"): EndpointConfig {
@@ -243,6 +257,7 @@ class DeviceJourneyH2Test {
             vault.putKey(idA, "fake-h2-cross-key-12345678".toCharArray())
             store.save(customConfig(urlA))
         }
+        val putsBefore = vault.putKeys
         val vm = SetupViewModel(
             store = store,
             vaultSource = VaultSource { vault },
@@ -256,7 +271,13 @@ class DeviceJourneyH2Test {
         }
         withTimeout(10_000) { vm.form.first { !it.saving && (it.saved || it.errorCode != null) } }
         assertEquals("SETUP_KEY_TOO_SHORT", vm.form.value.errorCode)
-        assertEquals(false, vm.form.value.saved)
+        assertFalse(vm.form.value.saved)
+        // 跨 origin 空白 key 須重貼：save 失敗，零 vault 接觸（與
+        // SetupEditBoundaryAndBarrierTest.customCrossOriginBlankRequiresRepasteWithZeroVaultIo 對稱）。
+        assertEquals(putsBefore, vault.putKeys)
+        assertEquals(0, vault.deleteKeys)
+        assertEquals(0, vault.getKeys)
+        assertEquals(0, vault.hasKeys)
     }
 
     /**

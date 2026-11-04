@@ -2,6 +2,7 @@ package dev.librepocket.provider
 
 import java.util.Locale
 import kotlinx.coroutines.flow.Flow
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /**
  * Provider client facade (SPEC §1.2).
@@ -76,17 +77,23 @@ class DefaultProviderFactory(
  * `res/xml/network_security_config.xml`, so even a validated http:// URL only
  * connects in debug builds (whose overlay permits loopback +
  * emulator-host cleartext) — LAN http:// stays refused at runtime by design.
+ *
+ * 解析經 `HttpUrl.toHttpUrlOrNull`（PocketGuard WARN：`java.net.URL` 已棄用語義）。
  */
 fun validateBaseUrl(baseUrl: String) {
-    val url = try {
-        java.net.URL(baseUrl)
-    } catch (e: java.net.MalformedURLException) {
-        throw IllegalArgumentException("PROVIDER_BAD_URL", e)
+    val url = baseUrl.toHttpUrlOrNull() ?: run {
+        // HttpUrl 只解析 http(s)：其餘 scheme 先顯式識別，保留 MUST_BE_HTTPS 細分。
+        val schemePrefix = Regex("""^\s*([A-Za-z][A-Za-z0-9+.-]*):""").find(baseUrl)
+            ?.groupValues?.get(1)?.lowercase(Locale.ROOT)
+        if (schemePrefix != null && schemePrefix != "http" && schemePrefix != "https") {
+            throw IllegalArgumentException("PROVIDER_URL_MUST_BE_HTTPS")
+        }
+        throw IllegalArgumentException("PROVIDER_BAD_URL")
     }
-    val scheme = url.protocol.lowercase(Locale.ROOT)
+    val scheme = url.scheme.lowercase(Locale.ROOT)
     if (scheme == "https") return
     if (scheme == "http") {
-        // URL.getHost() returns bracketed IPv6 ("[::1]"): strip brackets.
+        // HttpUrl.host 已去括號且小寫（IPv6 無方括號）；保留 trim 防禦無害。
         val host = url.host.lowercase(Locale.ROOT).trim('[', ']')
         if (host == "localhost" || host == "127.0.0.1" || host == "::1") return
         // 僅 IPv4 字面精確比對（RFC1918）；域名一律不算 local

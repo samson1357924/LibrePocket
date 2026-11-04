@@ -1,9 +1,13 @@
 package dev.librepocket.provider
 
 import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.HostResolver
 import dev.librepocket.policy.NetworkEgressPolicy
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Proxy
 import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutionException
@@ -340,6 +344,50 @@ class ProviderTransportTest {
         } finally {
             origin.shutdown()
             target.shutdown()
+        }
+    }
+
+    @Test
+    fun pinnedClientIgnoresInjectedProxy() = runBlocking {
+        // Phase A：呼叫方注入帶 proxy 的 baseClient，pinned 必須顯式 NO_PROXY 覆寫
+        //（OkHttp newBuilder 繼承 proxy，不覆寫則建連外包給代理另行解析繞過 pin）。
+        val target = MockWebServer()
+        val proxy = MockWebServer()
+        target.start()
+        proxy.start()
+        try {
+            target.enqueue(
+                MockResponse().setResponseCode(200).setBody("{\"data\":[{\"id\":\"m1\"}]}"),
+            )
+            // 若旁路失效（請求走 proxy），此毒丸讓失敗顯性化而非掛起。
+            proxy.enqueue(
+                MockResponse().setResponseCode(500).setBody("proxied-must-not-happen"),
+            )
+            val baseClient = OkHttpClient.Builder()
+                .proxy(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", proxy.port)))
+                .build()
+            val targetBase = target.url("/").toString().trimEnd('/')
+            val fullUrl = joinEndpoint(targetBase, "/models")
+            val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
+            val loopback: HostResolver = HostResolver { listOf(InetAddress.getByName("127.0.0.1")) }
+            // 直連 pin 斷言：覆寫繼承來的 proxy。
+            val (pinnedClient, _) = pinnedTransportFor(baseClient, fullUrl, optIn, loopback)
+            assertEquals(Proxy.NO_PROXY, pinnedClient.proxy)
+            val cfg = config(ProviderProtocol.CHAT_COMPLETIONS, targetBase).copy(networkResolver = loopback)
+            val provider = ChatCompletionsProvider(
+                cfg,
+                { fakeKey.toCharArray() },
+                baseClient,
+            )
+            val models = withTimeout(5_000) { provider.listModels() }
+            assertEquals(listOf("m1"), models)
+            assertEquals("target receives the direct request", 1, target.requestCount)
+            assertEquals("proxy receives no request", 0, proxy.requestCount)
+            val stray = withContext(Dispatchers.IO) { proxy.takeRequest(500, TimeUnit.MILLISECONDS) }
+            assertNull("no request leaks to the injected proxy", stray)
+        } finally {
+            target.shutdown()
+            proxy.shutdown()
         }
     }
 

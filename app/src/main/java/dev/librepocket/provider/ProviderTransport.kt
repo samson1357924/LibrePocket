@@ -9,6 +9,7 @@ import dev.librepocket.policy.PinnedNetworkDns
 import dev.librepocket.policy.SystemHostResolver
 import dev.librepocket.redact.Redactor
 import java.io.IOException
+import java.net.Proxy
 import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.concurrent.TimeUnit
@@ -261,7 +262,14 @@ private val REDIRECT_SCHEME_PREFIX = Regex("""^\s*([A-Za-z][A-Za-z0-9+.-]*):""")
  *（重驗走釘住值，不做二次解析，無 TOCTOU）。
  * 拒絕即拋 typed fatal，不傳送 credential／body（key 快照由 factory／session 層
  * 持有，僅放行後載入使用；此處保證拒絕路徑零送出）。
- * 連線池獨立（per-request `ConnectionPool()`）：舊 keep-alive 不得繞過 pin。
+ * pinnedClient 強制直連（`Proxy.NO_PROXY`）：OkHttp `newBuilder()`
+ * 繼承 baseClient 的 proxy 設定，必須顯式覆寫，否則呼叫方注入的 proxy 會把
+ * 建連外包給代理另行解析，繞過 DNS pin（pin 只管直連路徑）。
+ * 連線池獨立且無閒置（per-request `ConnectionPool(0, 1, NANOSECONDS)`）：
+ * 舊 keep-alive 不得繞過 pin，且每請求建池不累積 idle socket（per-request
+ * pin 隔離＋不累積 5 分鐘 idle FD 成本，人審 #4）。
+ * 預設 [defaultOkHttpClient] 維持系統預設（走系統 proxy），僅 pinned 強制直連；
+ * proxy 環境下 pin 要求直連，企業 proxy 使用者走 A4 另議。
  */
 internal fun pinnedTransportFor(
     baseClient: OkHttpClient,
@@ -275,7 +283,8 @@ internal fun pinnedTransportFor(
     val pinned = PinnedNetworkDns.forHost(host, eval.resolvedAddresses, resolver)
     val pinnedClient = providerTransportClient(baseClient).newBuilder()
         .dns(pinned)
-        .connectionPool(ConnectionPool())
+        .proxy(Proxy.NO_PROXY)
+        .connectionPool(ConnectionPool(0, 1, TimeUnit.NANOSECONDS))
         .build()
     return pinnedClient to pinned
 }

@@ -28,10 +28,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshots.SnapshotStateMap
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -53,21 +56,60 @@ import dev.librepocket.agent.R
 import kotlinx.coroutines.delay
 
 /**
+ * Saveable holder for hoisted thinking expanded overrides, keyed by
+ * `contentHashHex16(trimmedContent)` (see [ChatMarkdownParser.contentHashHex16]).
+ *
+ * The saver persists the map as a `List<Pair<String, Boolean>>` (both components are
+ * Bundle-saveable primitives) and restores it into a [SnapshotStateMap]. Content-hash
+ * indexing keeps the override attached to the same reasoning text when the parser key
+ * changes (`think_streaming_N` → `think_c_<hex>`) and Compose recreates the node via
+ * `key(block.key)`.
+ *
+ * Documented limitation: same-content duplicates within one message share a single entry;
+ * expanding one expands all cards with identical trimmed content.
+ */
+internal val ThinkingExpandedOverridesSaver:
+    Saver<SnapshotStateMap<String, Boolean>, List<Pair<String, Boolean>>> = Saver(
+    save = { state -> ArrayList(state.toList()) },
+    restore = { saved ->
+        mutableStateMapOf<String, Boolean>().apply { putAll(saved.toMap()) }
+    },
+)
+
+/**
  * Collapsible reasoning card for displaying thinking processes.
  * Defaults to expanded during streaming with a static cursor indicator (no blinking animation),
  * and collapses by default once streaming completes.
+ *
+ * Expanded-override resolution (two sources):
+ * - Hoisted mode: when [onUserExpandedChange] != null (used by [ChatMarkdownView]), the
+ *   effective override is [userExpanded] (null = no explicit override, fall back to
+ *   [ChatContentBlock.ThinkingBlock.isStreaming]). Clicks are forwarded to
+ *   [onUserExpandedChange] with the exact-hash key written by the caller, so streaming→
+ *   completed transitions (same trimmed content, same hash) retain the user's choice even
+ *   though `block.key` changes and the node is recreated.
+ * - Fallback mode: when [onUserExpandedChange] == null (direct rendering, e.g. unit tests
+ *   rendering this composable alone), [userExpanded] is ignored and an internal
+ *   `rememberSaveable(block.key)` holds the override. This preserves the existing direct-
+ *   rendering behaviour; it is no longer the sole state source when hosted in
+ *   [ChatMarkdownView] (hoisted content-hash map wins).
  */
 @Composable
 internal fun ThinkingBlockView(
     block: ChatContentBlock.ThinkingBlock,
     modifier: Modifier = Modifier,
+    userExpanded: Boolean? = null,
+    onUserExpandedChange: ((Boolean) -> Unit)? = null,
 ) {
-    var userExpanded by rememberSaveable(block.key) { mutableStateOf<Boolean?>(null) }
-    // Explicit block.key input: state is scoped to this content identity and resets when the
-    // identity changes (e.g. streaming `think_streaming_0` → completed `think_c_<hex>`).
+    var fallbackExpanded by rememberSaveable(block.key) { mutableStateOf<Boolean?>(null) }
+    // Explicit block.key input: fallback state is scoped to this content identity and resets
+    // when the identity changes (e.g. streaming `think_streaming_0` → completed `think_c_<hex>`).
     // Prepend/reorder stability relies on the outer key(block.key) in ChatMarkdownView keeping
-    // each card's node (and thus this rememberSaveable) attached to the same content.
-    val isExpanded = userExpanded ?: block.isStreaming
+    // each card's node (and thus this fallback) attached to the same content.
+    // In hoisted mode (ChatMarkdownView) this fallback is unused: the caller passes the
+    // migrated content-hash override via [userExpanded] instead.
+    val effectiveOverride = if (onUserExpandedChange != null) userExpanded else fallbackExpanded
+    val isExpanded = effectiveOverride ?: block.isStreaming
     // Accessibility: the header is a Button whose expanded/collapsed state is exposed
     // via stateDescription (TalkBack announces it alongside the title). The chevron
     // Icon keeps its expand/collapse description as a redundant affordance cue.
@@ -93,7 +135,14 @@ internal fun ThinkingBlockView(
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(8.dp))
                     .semantics { stateDescription = stateDesc }
-                    .clickable(role = Role.Button) { userExpanded = !isExpanded }
+                    .clickable(role = Role.Button) {
+                        val next = !isExpanded
+                        if (onUserExpandedChange != null) {
+                            onUserExpandedChange(next)
+                        } else {
+                            fallbackExpanded = next
+                        }
+                    }
                     .defaultMinSize(minHeight = 48.dp)
                     .padding(horizontal = 12.dp, vertical = 8.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -283,6 +332,31 @@ internal fun CodeBlockView(
  * cost Theta(N^2 / c) cumulatively. Incremental or tail-segment re-parsing (only re-scan
  * the changed suffix) is explicitly future work and is not implemented here; the current
  * full re-parse keeps key stability and fail-closed guarantees simple at chat sizes.
+ *
+ * Thinking expanded-override hoisting (streaming→completed retention):
+ * - Overrides live here in a `rememberSaveable` `mutableStateMapOf<contentHashHex16
+ *   (trimmedContent), Boolean>` ([ThinkingExpandedOverridesSaver], persisted as
+ *   `List<Pair<String, Boolean>>`). Each thinking card reads `overrides[hash(content)]`
+ *   (after prune/migrate below) and writes its exact-hash key on click; the default when
+ *   absent is `block.isStreaming`.
+ * - Every recomposition prunes/migrates synchronously before reading: for current thinking
+ *   content set C and each stored key S — S ∈ C keeps its value; else if S's previous
+ *   content (tracked in a non-saveable hash→content cache) is a strict prefix of some
+ *   c ∈ C (streaming growth, e.g. "Plan" → "Planning"), the value migrates to `hash(c)`
+ *   (first document-order match; an existing explicit entry on the target wins and the
+ *   source is dropped); otherwise S is deleted (card disappeared). A newly prepended
+ *   different-content card therefore has no entry and falls back to `block.isStreaming`
+ *   instead of inheriting an unrelated card's choice.
+ * - Because the index is the content hash (not `block.key`), the streaming→completed
+ *   transition (`think_streaming_N` → `think_c_<hex>`, same trimmed text) is an exact-match
+ *   retain: a manual expand during streaming survives appending `</think>` even while the
+ *   message-level [isStreaming] is still true (the block itself is `isStreaming=false` and
+ *   would collapse by default without an override). Untouched cards still auto-collapse on
+ *   close per spec.
+ * - Limitation (documented): same-content duplicates within one message share one entry;
+ *   toggling one toggles all cards with identical trimmed content. The hash→content cache
+ *   is process-local (`remember`); after process recreation only exact-hash matches are
+ *   retained until content is re-observed (prefix migration needs the cached preimage).
  */
 @Composable
 internal fun ChatMarkdownView(
@@ -294,6 +368,58 @@ internal fun ChatMarkdownView(
     val blocks = remember(text, isStreaming) {
         ChatMarkdownParser.parse(text, isStreaming = isStreaming)
     }
+
+    val thinkingOverrides = rememberSaveable(saver = ThinkingExpandedOverridesSaver) {
+        mutableStateMapOf<String, Boolean>()
+    }
+    // Process-local preimages for prefix-migration decisions (hash → trimmed content seen
+    // in a previous composition). Plain remember: no recomposition on update, rebuilt below.
+    val thinkingContentCache = remember { mutableMapOf<String, String>() }
+
+    val currentThinkingContents = remember(blocks) {
+        blocks.filterIsInstance<ChatContentBlock.ThinkingBlock>().map { it.content.trim() }
+    }
+    val currentThinkingHashes = remember(currentThinkingContents) {
+        currentThinkingContents.map { ChatMarkdownParser.contentHashHex16(it) }.toSet()
+    }
+
+    // Synchronously prune/migrate before reads so this composition already observes the
+    // migrated values. Idempotent: a mutating pass schedules one follow-up recomposition
+    // that becomes a no-op.
+    val storedKeysSnapshot = thinkingOverrides.keys.toList()
+    for (storedHash in storedKeysSnapshot) {
+        if (storedHash in currentThinkingHashes) {
+            continue
+        }
+        val storedContent = thinkingContentCache[storedHash]
+        val growthTarget = if (storedContent != null) {
+            currentThinkingContents.firstOrNull { candidate ->
+                candidate != storedContent && candidate.startsWith(storedContent)
+            }
+        } else {
+            null
+        }
+        if (growthTarget != null) {
+            val targetHash = ChatMarkdownParser.contentHashHex16(growthTarget)
+            if (!thinkingOverrides.containsKey(targetHash)) {
+                val migratedValue = thinkingOverrides[storedHash]
+                if (migratedValue != null) {
+                    thinkingOverrides[targetHash] = migratedValue
+                }
+            }
+            thinkingOverrides.remove(storedHash)
+        } else {
+            // Card disappeared (or preimage unknown after recreation): drop so a future
+            // different-content card with an unrelated hash never inherits this value.
+            thinkingOverrides.remove(storedHash)
+        }
+    }
+    val freshCache = HashMap<String, String>(currentThinkingContents.size)
+    for (content in currentThinkingContents) {
+        freshCache[ChatMarkdownParser.contentHashHex16(content)] = content
+    }
+    thinkingContentCache.keys.retainAll(freshCache.keys)
+    thinkingContentCache.putAll(freshCache)
 
     if (blocks.isEmpty() && isStreaming) {
         // Decorative streaming cursor: visual only, announced via the streaming label
@@ -318,7 +444,18 @@ internal fun ChatMarkdownView(
             key(block.key) {
                 when (block) {
                     is ChatContentBlock.ThinkingBlock -> {
-                        ThinkingBlockView(block = block)
+                        val contentHash =
+                            ChatMarkdownParser.contentHashHex16(block.content.trim())
+                        val hoistedOverride = thinkingOverrides[contentHash]
+                        ThinkingBlockView(
+                            block = block,
+                            userExpanded = hoistedOverride,
+                            onUserExpandedChange = { next ->
+                                // Async write: exact-hash key for the clicked content.
+                                // Reads above already observe the migrated value.
+                                thinkingOverrides[contentHash] = next
+                            },
+                        )
                     }
                     is ChatContentBlock.CodeBlock -> {
                         CodeBlockView(block = block)

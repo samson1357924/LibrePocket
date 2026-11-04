@@ -1470,4 +1470,115 @@ class ChatMarkdownUiTest {
         // Plain newlines are preserved (multi-line paste risk is documented, not removed).
         assertEquals("a\nb", sanitizeCodeForClipboard("a\nb"))
     }
+
+    @Test
+    fun chatMarkdownView_streamingToCompleted_retainsManualExpandHoisted() {
+        // Unclosed thinking manually expanded (explicit true via collapse→expand, since
+        // streaming default is already expanded), then append </think> while the message
+        // is still streaming: same trimmed content → same hash → override retained.
+        var text by mutableStateOf("<think>Planning in progress")
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(text = text, isStreaming = true)
+            }
+        }
+
+        val title = context.getString(R.string.chat_thinking_title)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+
+        composeRule.onNodeWithText("Planning in progress ▍").assertIsDisplayed()
+        // First click collapses (null → false), second re-expands (false → true, explicit).
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("Planning in progress ▍").assertIsDisplayed()
+
+        // Close the think tag; message-level isStreaming stays true but the block itself
+        // becomes isStreaming=false. Exact-hash match must keep the manual expand.
+        text = "<think>Planning in progress</think>"
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithText("Planning in progress").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+    }
+
+    @Test
+    fun chatMarkdownView_streamingToCompleted_withoutInteraction_collapsesHoisted() {
+        // No user interaction: appending </think> must auto-collapse per spec, even though
+        // the message-level isStreaming is still true (block.isStreaming is false).
+        var text by mutableStateOf("<think>Plan")
+
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(text = text, isStreaming = true)
+            }
+        }
+
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+
+        composeRule.onNodeWithText("Plan ▍").assertIsDisplayed()
+
+        text = "<think>Plan</think>"
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithText("Plan").assertDoesNotExist()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+    }
+
+    @Test
+    fun chatMarkdownView_streamingGrowth_retainsManualExpandViaPrefixMigration() {
+        // Streaming growth "Plan" → "Planning": stored hash(Plan)=true must migrate to
+        // hash(Planning) because "Plan" is a strict prefix of "Planning".
+        var text by mutableStateOf("<think>Plan")
+
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(text = text, isStreaming = true)
+            }
+        }
+
+        val title = context.getString(R.string.chat_thinking_title)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+
+        composeRule.onNodeWithText("Plan ▍").assertIsDisplayed()
+        // Set explicit true (collapse then re-expand).
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+
+        text = "<think>Planning"
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithText("Planning ▍").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+    }
+
+    @Test
+    fun chatMarkdownView_prependDifferentThinking_doesNotMisapplyHoistedOverride() {
+        // Prepending a different-content thinking card must not steal the old card's
+        // override: old retains expand, new stays at default (collapsed, not streaming).
+        var text by mutableStateOf("<think>Old reasoning content</think>\n\nAnswer")
+
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(text = text, isStreaming = false)
+            }
+        }
+
+        val title = context.getString(R.string.chat_thinking_title)
+
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithText("Old reasoning content").assertIsDisplayed()
+
+        text = "<think>New reasoning content</think>\n\n<think>Old reasoning content</think>\n\nAnswer"
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithText("Old reasoning content").assertIsDisplayed()
+        composeRule.onNodeWithText("New reasoning content").assertDoesNotExist()
+        composeRule.onAllNodesWithText(title).assertCountEquals(2)
+    }
 }

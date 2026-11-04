@@ -96,10 +96,18 @@
         <!-- C1 系統預設助理（Issue #137 C1a，三 flavor 共用，無新增權限；
              play 不加 a11y service overlay：本 PR 完全不碰 a11y）。
              VoiceInteractionService：BIND_VOICE_INTERACTION 門檻＋
-             VoiceInteractionService action＋android.voice_interaction meta-data。 -->
+             VoiceInteractionService action＋android.voice_interaction meta-data。
+             人類 review #4：三服務一律 android:process=":voice"，與主 App process
+             分離；好處是隔離（voice crash/OOM 不拖垮主 process、系統可獨立回收），
+             非省總記憶體（多一份 ART + Application 實例，總 PSS 增加）。
+             註：LibrePocketApp.onCreate 在 :voice 仍執行（含
+             SkillInstaller.cleanupStaleStaging file I/O，見 LibrePocketApp.kt:39-49，
+             無 process 閘門），後續可加 process-name 閘門優化。三 flavor 共用 main
+             manifest，本 PR 無需 flavor overlay。 -->
         <service
             android:name=".assistant.LibreVoiceInteractionService"
             android:exported="true"
+            android:process=":voice"
             android:permission="android.permission.BIND_VOICE_INTERACTION">
             <intent-filter>
                 <action android:name="android.service.voice.VoiceInteractionService" />
@@ -111,6 +119,7 @@
         <service
             android:name=".assistant.LibreVoiceInteractionSessionService"
             android:exported="true"
+            android:process=":voice"
             android:permission="android.permission.BIND_VOICE_INTERACTION">
             <intent-filter>
                 <action android:name="android.service.voice.VoiceInteractionSessionService" />
@@ -119,6 +128,7 @@
         <service
             android:name=".assistant.LibreRecognitionService"
             android:exported="true"
+            android:process=":voice"
             android:permission="android.permission.BIND_RECOGNITION_SERVICE">
             <intent-filter>
                 <action android:name="android.speech.RecognitionService" />

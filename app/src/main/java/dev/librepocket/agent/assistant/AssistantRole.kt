@@ -113,7 +113,12 @@ fun effectiveAssistantReason(
 ): String? =
     effectiveAssistantReason(stored, snapshot, everHeld = false, justGranted = false)
 
-/** 原因碼 → 顯示文案（UI 只顯示文案不做流程分支，色彩可按失敗/中性區分（見 SettingsScreen）；未知碼原樣回報，不偽造語義）。 */
+/** 原因碼 → 顯示文案（UI 只顯示文案不做流程分支，色彩可按失敗/中性區分（見 SettingsScreen）；未知碼原樣回報，不偽造語義）。
+ *
+ * 硬編碼說明（PocketGuard 建議）：本 PR 不做全量 strings.xml 遷移（SettingsScreen
+ * 全檔既有硬編碼＋strings.xml 僅 app_name，專案級重構不宜在本 PR）。
+ * TODO(i18n-followup): 集中遷移＋純函數改 mapper 注入（原因碼→文案改由呼叫方注入 mapper，本檔保持純邏輯可測）。
+ */
 fun assistantReasonText(code: String): String =
     when (code) {
         AssistantReasonCode.GRANTED ->

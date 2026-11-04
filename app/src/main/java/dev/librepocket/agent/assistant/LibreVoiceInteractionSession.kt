@@ -10,6 +10,7 @@ private const val TAG = "LibreVoiceSession"
 
 // TODO(C2-assistant): session 內 UI／STT（Compose＋系統 STT）；follow-up 以
 // voiceInteractionRoot（Activity.isVoiceInteractionRoot）區分可信系統手勢喚起與外部偽造。
+// C2 驗證清單：手勢／鎖屏／返回／多次喚起＋Samsung／Xiaomi 實機。
 
 /**
  * C1 session（Issue #137 C1a／C1b）。
@@ -26,6 +27,15 @@ private const val TAG = "LibreVoiceSession"
  * 區分；C1 不在此斷言手勢來源。
  */
 class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSession(context) {
+    /**
+     * Activity-only 流程（人類 review #5 session UI）：關預設 voice UI window，
+     * 防空白閃爍；實際 UI 由 MainActivity 承載，session 本體不留可見 window。
+     */
+    override fun onPrepareShow(args: Bundle?, showFlags: Int) {
+        super.onPrepareShow(args, showFlags)
+        setUiEnabled(false)
+    }
+
     override fun onShow(args: Bundle?, showFlags: Int) {
         super.onShow(args, showFlags)
         try {

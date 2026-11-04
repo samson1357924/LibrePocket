@@ -1964,6 +1964,30 @@ jobs:
         )
         self._assert_rejected("policy-harness core command must appear exactly once")
 
+    def test_policy_harness_command_includes_verification_metadata_test(self) -> None:
+        workflow = PR_CHECK
+        start = workflow.index("  policy-harness:\n")
+        end = workflow.index("  build-and-policy-gate:\n")
+        block = workflow[start:end]
+        mutated = block.replace(" scripts/tests/test_verification_metadata.py", "", 1)
+        self.assertNotEqual(block, mutated)
+        self._write(
+            "pr-check.yml", workflow[:start] + mutated + workflow[end:]
+        )
+        self._assert_rejected("policy-harness core command must appear exactly once")
+
+    def test_policy_harness_command_includes_osv_scan_test(self) -> None:
+        workflow = PR_CHECK
+        start = workflow.index("  policy-harness:\n")
+        end = workflow.index("  build-and-policy-gate:\n")
+        block = workflow[start:end]
+        mutated = block.replace(" scripts/tests/test_osv_scan.py", "", 1)
+        self.assertNotEqual(block, mutated)
+        self._write(
+            "pr-check.yml", workflow[:start] + mutated + workflow[end:]
+        )
+        self._assert_rejected("policy-harness core command must appear exactly once")
+
     def test_policy_harness_pyyaml_install_is_pinned(self) -> None:
         workflow = PR_CHECK
         start = workflow.index("  policy-harness:\n")

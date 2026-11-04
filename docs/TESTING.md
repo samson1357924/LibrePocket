@@ -173,7 +173,7 @@ boolean `on:` key collision. YAML merge keys (`<<`) are forbidden at
 construction time by `DuplicateKeySafeLoader`. Flow style, quoted keys,
 next-line scalars and anchors/aliases are resolved by the parser rather than by
 text matching. Comprehensive test coverage for the workflow policy checker is
-maintained in `scripts/tests/test_workflow_policy.py` (201 tests). It fails
+maintained in `scripts/tests/test_workflow_policy.py` (203 tests). It fails
 closed with `file:line` diagnostics on these pinned invariants:
 
 - only the reviewed workflow filenames (`codeql.yml`,
@@ -278,7 +278,7 @@ closed with `file:line` diagnostics on these pinned invariants:
   `working-directory`; `unit-tests` must keep `fail-fast: false` and
   `matrix.flavor` exactly `[play, foss, github]`, and `policy-harness` must
   keep the pinned PyYAML install, the import-shadow preflight and the unittest
-  command containing `scripts/tests/test_workflow_policy.py` (201 tests). Separately, the
+  command containing `scripts/tests/test_workflow_policy.py` (203 tests). Separately, the
   whole `pr-check.yml` is byte-pinned (as are all six reviewed workflows): the
   per-job checks pin the core commands, not every possible extra step, so the
   raw-byte SHA-256 pin is what rejects an inserted no-op step anywhere else in

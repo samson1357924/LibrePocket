@@ -252,6 +252,71 @@ class VerificationMetadataTest(unittest.TestCase):
                     (tmp / "gradle.properties").write_text(content, encoding="utf-8")
                     validate_gradle_files(tmp)  # must not raise
 
+    def test_gradle_properties_duplicate_key_last_wins(self):
+        cases = [
+            ("strict then off rejected",
+             "org.gradle.dependency.verification=strict\n"
+             "org.gradle.dependency.verification=off\n", True),
+            ("off then strict passes",
+             "org.gradle.dependency.verification=off\n"
+             "org.gradle.dependency.verification=strict\n", False),
+            ("strict then lenient rejected",
+             "org.gradle.dependency.verification=strict\n"
+             "org.gradle.dependency.verification=lenient\n", True),
+        ]
+        for name, content, rejected in cases:
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    (tmp / "gradle.properties").write_text(content, encoding="utf-8")
+                    if rejected:
+                        with self.assertRaises(ValueError):
+                            validate_gradle_files(tmp)
+                    else:
+                        validate_gradle_files(tmp)  # must not raise
+
+    def test_gradle_properties_escaped_key_rejected(self):
+        cases = {
+            "escaped dot off":
+                "org\\.gradle.dependency.verification = off\n",
+            "escaped dot lenient":
+                "org\\.gradle.dependency.verification = lenient\n",
+            "unicode tail off":
+                "org.gradle.dependency.verificatio\\u006e = off\n",
+            # value-side unicode: Properties.load decodes values too.
+            "unicode value off":
+                "org.gradle.dependency.verification=o\\u0066f\n",
+            "full unicode value off":
+                "org.gradle.dependency.verification=\\u006f\\u0066\\u0066\n",
+        }
+        for name, content in cases.items():
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    (tmp / "gradle.properties").write_text(content, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        validate_gradle_files(tmp)
+
+    def test_gradle_properties_continuation_rejected(self):
+        cases = [
+            ("continued off rejected",
+             "org.gradle.dependency.verification = \\\n   off\n", True),
+            ("continued lenient rejected",
+             "org.gradle.dependency.verification = \\\n\tlenient\n", True),
+            ("continued strict passes",
+             "org.gradle.dependency.verification = \\\n   strict\n", False),
+        ]
+        for name, content, rejected in cases:
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    (tmp / "gradle.properties").write_text(content, encoding="utf-8")
+                    if rejected:
+                        with self.assertRaises(ValueError):
+                            validate_gradle_files(tmp)
+                    else:
+                        validate_gradle_files(tmp)  # must not raise
+
     def test_groovy_build_gradle_scanned(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)

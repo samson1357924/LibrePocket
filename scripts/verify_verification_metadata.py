@@ -12,7 +12,6 @@ Usage: python3 -P scripts/verify_verification_metadata.py
 Exit status: 0 = gate passes, 2 = gate rejected (ValueError).
 """
 
-import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -77,13 +76,85 @@ def validate_tree(root: ET.Element) -> None:
                     raise ValueError(f"artifact {aname} uses weak hash <{weak}> (use sha256+)")
 
 
+def _unescape_prop_key(s: str) -> str:
+    """Unescape a properties key exactly like java.util.Properties.loadConvert.
+
+    Left-to-right single pass: ``\\uXXXX`` (exactly 4 hex digits) decodes to
+    the char; ``\\t \\n \\r \\f \\\\`` decode to control chars/backslash; any
+    other ``\\x`` drops the backslash and keeps ``x`` (covers ``\\.`` ``\\=``
+    ``\\:`` ``\\ `` ``\\!`` ``\\#``). A malformed ``\\u`` (fewer than 4 hex
+    digits) is kept literal: loadConvert throws IllegalArgumentException
+    ("Malformed \\uxxxx encoding") there, so Gradle fails closed with a build
+    error instead of silently bypassing -- keeping it literal cannot hide a
+    real ``off`` from this validator without also breaking the build.
+    """
+    out: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c != "\\":
+            out.append(c)
+            i += 1
+            continue
+        if i + 1 >= n:
+            # Lone trailing backslash: unreachable mid-file (it would have
+            # been consumed as a continuation marker); keep it literal.
+            out.append("\\")
+            i += 1
+            continue
+        nxt = s[i + 1]
+        if nxt == "u":
+            hexpart = s[i + 2 : i + 6]
+            if len(hexpart) == 4 and all(ch in HEX64 for ch in hexpart):
+                out.append(chr(int(hexpart, 16)))
+                i += 6
+            else:
+                out.append("\\")
+                i += 1
+        elif nxt == "t":
+            out.append("\t")
+            i += 2
+        elif nxt == "n":
+            out.append("\n")
+            i += 2
+        elif nxt == "r":
+            out.append("\r")
+            i += 2
+        elif nxt == "f":
+            out.append("\f")
+            i += 2
+        else:
+            out.append(nxt)
+            i += 2
+    return "".join(out)
+
+
 def _properties_verification_mode(lines: list[str]) -> str | None:
-    """Return first org.gradle.dependency.verification value per simplified Java properties semantics."""
-    # Backslash-escaped separators do not split the key (odd backslash count
-    # means escaped); \uXXXX escapes in the key are unescaped before comparing,
-    # mirroring Properties.load, so unicode-obfuscated keys cannot slip past.
+    """Return last org.gradle.dependency.verification value per Java properties semantics."""
+    # Logical-line merging runs BEFORE unescaping, mirroring Properties.load:
+    # a physical line ending in an odd number of backslashes continues (the
+    # final backslash plus the line break are dropped and leading whitespace
+    # of the next line is stripped, per spec); an even count is literal
+    # backslashes and does not continue. Comment/blank detection runs on the
+    # merged logical lines. Duplicate keys are last-wins (Properties.load
+    # overwrites), and key escapes are unescaped before comparing, so
+    # obfuscated/continued/duplicated keys cannot slip past.
     key_wanted = "org.gradle.dependency.verification"
+    logical: list[str] = []
+    buf: str | None = None
     for raw in lines:
+        buf = raw if buf is None else buf + raw.lstrip(" \t\f")
+        trailing = len(buf) - len(buf.rstrip("\\"))
+        if trailing % 2 == 1:
+            buf = buf[:-1]  # drop continuation marker, merge next line
+            continue
+        logical.append(buf)
+        buf = None
+    if buf is not None:
+        logical.append(buf)
+    mode: str | None = None
+    seen = False
+    for raw in logical:
         line = raw.lstrip(" \t\f")
         if not line or line[0] in ("#", "!"):
             continue
@@ -94,7 +165,7 @@ def _properties_verification_mode(lines: list[str]) -> str | None:
         i = 0
         while i < n:
             c = stripped[i]
-            if c in ("=", ":"):
+            if c in ("=", ":", " ", "\t", "\f"):
                 # Count preceding backslashes: odd count means escaped.
                 bs = 0
                 j = i - 1
@@ -103,17 +174,10 @@ def _properties_verification_mode(lines: list[str]) -> str | None:
                     j -= 1
                 if bs % 2 == 0:
                     key_end = i
-                    sep_kind = c
+                    sep_kind = c if c in ("=", ":") else "ws"
                     break
-            elif c in (" ", "\t", "\f"):
-                key_end = i
-                sep_kind = "ws"
-                break
             i += 1
-        key = stripped[:key_end]
-        key = re.sub(
-            r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), key
-        )
+        key = _unescape_prop_key(stripped[:key_end])
         if key != key_wanted:
             continue
         rest = stripped[key_end:]
@@ -130,12 +194,17 @@ def _properties_verification_mode(lines: list[str]) -> str | None:
                 while k < len(rest) and rest[k] in (" ", "\t", "\f"):
                     k += 1
             value = rest[k:].strip()
+        # Java applies the same loadConvert unescaping to values, so value-side
+        # obfuscation (o\u0066f, \u006f\u0066\u0066) must be decoded too --
+        # verified against Properties.load: both load as "off"/"OFF".
+        value = _unescape_prop_key(value)
         if not value:
-            return ""
+            mode, seen = "", True
+            continue
         # Known value domain is only strict/off/lenient; first whitespace
         # token blocks '=off # comment' style inline-comment mixing with zero false kills.
-        return value.lower().split(None, 1)[0]
-    return None
+        mode, seen = value.lower().split(None, 1)[0], True
+    return mode if seen else None
 
 
 def validate_gradle_files(root: Path = ROOT) -> None:

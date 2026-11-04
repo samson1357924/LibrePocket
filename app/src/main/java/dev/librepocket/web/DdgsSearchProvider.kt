@@ -11,7 +11,13 @@ import java.net.URLEncoder
  * - 連結包在 `//duckduckgo.com/l/?uddg=<urlencode>` 轉址裡，解析時解開；
  *   標題／snippet 去 tag＋HTML unescape；`count` 在 client 端 `take(n)`。
  * - Bot 牆（anomaly／challenge 標記）→ `SUPPLIER_ERROR`；空 body → `BAD_RESPONSE`；
- *   合法零命中頁 → `Ok(empty)`（與版式漂移無法廉價區分，見實作註記）。
+ *   合法零命中頁 → `Ok(empty)`（與版式漂移無法廉價區分，見實作註記；零命中仍會被快取，
+ *   為 Phase 2 有意識決定）。
+ * - Ctor 參數順序與 [SearxngSearchProvider] 不同是歷史因素（此處為 httpGet 先）；
+ *   為避免 positional 誤用請 prefer named args；為 binary-compat 不更名。
+ * - Cleartext（http）仍接受（tests＋自架 LAN 需要）；release cleartext 由
+ *   NetworkSecurityConfig 管控，平台底層 cleartext 失敗可能被誤報為 TRANSPORT（已知）。
+ * - TODO(D3): 由 OkHttp adapter 統一發送透明 app User-Agent（此層不加 header，避免 fake 測壞）。
  */
 class DdgsSearchProvider(
     private val httpGet: WebHttpGet,
@@ -26,9 +32,13 @@ class DdgsSearchProvider(
     companion object {
         const val ID = "ddgs"
         const val DDGS_DEFAULT_ENDPOINT = "https://html.duckduckgo.com/html/"
+        const val BOT_MARKER_1 = "anomaly-modal"
+        const val BOT_MARKER_2 = "challenge-form"
     }
 
-    override suspend fun probe(): WebProbe = WebProbe.Ready
+    override suspend fun probe(): WebProbe =
+        if (buildUrl("probe") == null) WebProbe.NotReady(WebUnavailableReason.MISSING_URL)
+        else WebProbe.Ready
 
     override suspend fun search(query: String, count: Int): WebSearchOutcome {
         if (query.isBlank()) return WebSearchOutcome.Unavailable(WebUnavailableReason.EMPTY_QUERY)
@@ -51,10 +61,19 @@ class DdgsSearchProvider(
         }
         if (isBotWall(response.body)) return WebSearchOutcome.Failed(WebFailureReason.SUPPLIER_ERROR)
         val hits = parseDdgsHtml(response.body)
+        val clipped = hits.size > n
         val capped = capResultsForModel(hits.take(n))
-        return WebSearchOutcome.Ok(capped.results, capped.truncated)
+        return WebSearchOutcome.Ok(capped.results, capped.truncated || clipped)
     }
 
+    /**
+     * Endpoint URL 組裝（scheme 非 http/https、缺 host、解析失敗 → null → `PROTOCOL`）。
+     *
+     * 含 userinfo／query／fragment 的 base 視為形狀錯誤一律拒絕（→ null → `PROTOCOL`），
+     * 保持 raw-string concat 形狀以縮小 blast radius（不做 URI-builder 重構）。
+     * http 仍接受（cleartext 由 release NetworkSecurityConfig 管控，見 class KDoc）。
+     * Query 以 form encoding（`+` 表空格）編碼，適用於 query component。
+     */
     internal fun buildUrl(query: String): String? {
         val base = endpoint.trim()
         if (base.isEmpty()) return null
@@ -63,15 +82,16 @@ class DdgsSearchProvider(
             val scheme = uri.scheme?.lowercase()
             if (scheme != "http" && scheme != "https") return null
             if (uri.host.isNullOrBlank()) return null
-            base.trimEnd('/') + "/?q=" + URLEncoder.encode(query.trim(), "UTF-8")
+            if (uri.userInfo != null || uri.query != null || uri.fragment != null) return null
+            base.trimEnd('/') + "/?q=" + URLEncoder.encode(query.trim(), Charsets.UTF_8)
         } catch (_: Exception) {
             null
         }
     }
 
     internal fun isBotWall(body: String): Boolean =
-        body.contains("anomaly-modal", ignoreCase = true) ||
-            body.contains("challenge-form", ignoreCase = true)
+        body.contains(BOT_MARKER_1, ignoreCase = true) ||
+            body.contains(BOT_MARKER_2, ignoreCase = true)
 
     internal fun parseDdgsHtml(body: String): List<WebSearchResult> {
         val out = ArrayList<WebSearchResult>()
@@ -90,8 +110,11 @@ class DdgsSearchProvider(
                 }
                 Html.SNIPPET_LINK.containsMatchIn(attrs) -> {
                     if (pending in out.indices && out[pending].snippet.isEmpty()) {
-                        val r = out[pending]
-                        out[pending] = r.copy(snippet = Html.stripText(inner))
+                        val text = Html.stripText(inner)
+                        if (text.isNotEmpty()) {
+                            val r = out[pending]
+                            out[pending] = r.copy(snippet = text)
+                        }
                     }
                 }
             }
@@ -105,15 +128,15 @@ class DdgsSearchProvider(
         val uddg = Html.UDDG.find(href)?.groupValues?.get(1)
         if (uddg != null) {
             return try {
-                URLDecoder.decode(uddg, "UTF-8").trim().takeIf {
-                    it.startsWith("http://") || it.startsWith("https://")
+                URLDecoder.decode(uddg, Charsets.UTF_8).trim().takeIf {
+                    it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true)
                 }
             } catch (_: Exception) {
                 null
             }
         }
         val trimmed = href.trim()
-        return if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) trimmed else null
+        return if (trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)) trimmed else null
     }
 
     private object Html {

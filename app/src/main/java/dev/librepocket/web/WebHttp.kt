@@ -82,24 +82,32 @@ internal suspend fun fetchWithTimeout(
 /**
  * HTTP 狀態 → typed failure（兩 provider 共用；成功回 null）。
  *
- * - 401／403 → `AUTH`（不 fallback）；408 → `TIMEOUT`；429／5xx → `SUPPLIER_ERROR`。
+ * - 401／403 → `AUTH`（不 fallback）；408／504 → `TIMEOUT`；429／5xx → `SUPPLIER_ERROR`。
  * - 400／404／405／410／422 → `PROTOCOL`（請求形狀或端點錯誤，不 fallback）。
- * - 其餘未知狀態 → `TRANSPORT`（保守允許非 pinned fallback）。
+ * - 其餘未知狀態（含 3xx：D3 OkHttp adapter 對 GET 會跟隨跳轉，理論上不應漏到此層；
+ *   真漏出視為 `TRANSPORT`）→ `TRANSPORT`（保守允許非 pinned fallback）。
+ * - 狀態碼保持字面量（不抽 const），以縮小 diff。
  */
 internal fun failureForStatus(code: Int): WebFailureReason? = when (code) {
+    // Keep literal status codes (no const extraction) to minimize diff.
     in 200..299 -> null
     401, 403 -> WebFailureReason.AUTH
-    408 -> WebFailureReason.TIMEOUT
+    408, 504 -> WebFailureReason.TIMEOUT
     429 -> WebFailureReason.SUPPLIER_ERROR
     in 500..599 -> WebFailureReason.SUPPLIER_ERROR
     400, 404, 405, 410, 422 -> WebFailureReason.PROTOCOL
     else -> WebFailureReason.TRANSPORT
 }
 
-/** URL host 萃取（`siteName` 用；失敗回 null，不拋異常）。 */
+/**
+ * URL host 萃取（`siteName` 用；失敗回 null，不拋異常）。
+ *
+ * Host 先 lowercase 再去 `www.` 前綴；IDN 以 unicode 原形回傳（不做 punycode 正規化，已知限制）。
+ */
 internal fun hostOf(url: String): String? = try {
     java.net.URI(url).host
         ?.takeIf { it.isNotBlank() }
+        ?.lowercase()
         ?.removePrefix("www.")
         ?.takeIf { it.isNotEmpty() }
 } catch (_: Exception) {

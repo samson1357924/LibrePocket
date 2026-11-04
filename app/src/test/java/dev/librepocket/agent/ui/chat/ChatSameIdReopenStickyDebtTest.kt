@@ -680,4 +680,65 @@ class ChatSameIdReopenStickyDebtTest {
             for (s in sessions.attached) runCatching { s.close() }
         }
     }
+
+    @Test fun luhnRunId_interruptedAndFailedMarkersPreservedAndRecognized() = runBlocking {
+        val inner = FakeSessionStore()
+        val sid = inner.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        val luhnRunId = "test-00000000-0000-0000-8164-179543296385"
+
+        // 1. Interrupted marker
+        inner.appendEvent(
+            TranscriptEvent(
+                sessionId = sid,
+                runId = luhnRunId,
+                kind = "user",
+                text = "user message",
+                createdAt = 1000L,
+            ),
+        )
+        inner.appendEvent(
+            TranscriptEvent(
+                sessionId = sid,
+                runId = luhnRunId,
+                kind = INTERRUPTED_MARKER_KIND,
+                text = interruptedMarkerText(luhnRunId),
+                createdAt = 2000L,
+                isFinal = true,
+            ),
+        )
+        val loaded = inner.loadEvents(sid)
+        assertEquals("turn $luhnRunId interrupted", loaded.last().text)
+        assertFalse("Luhn runId in interrupted marker must not be card-redacted", loaded.last().text.contains("⟦REDACTED:CARD⟧"))
+        val dangling = findDanglingRunIds(loaded)
+        assertTrue("dangling must be empty after interrupted marker with Luhn runId", dangling.isEmpty())
+
+        // 2. Failed marker with secret
+        val sid2 = inner.createSession("t2", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        val secretKey = "sk-" + "testSECRET1234567890"
+        inner.appendEvent(
+            TranscriptEvent(
+                sessionId = sid2,
+                runId = luhnRunId,
+                kind = "user",
+                text = "user message 2",
+                createdAt = 3000L,
+            ),
+        )
+        inner.appendEvent(
+            TranscriptEvent(
+                sessionId = sid2,
+                runId = luhnRunId,
+                kind = INTERRUPTED_MARKER_KIND,
+                text = "turn $luhnRunId failed: api key $secretKey",
+                createdAt = 4000L,
+                isFinal = true,
+            ),
+        )
+        val loaded2 = inner.loadEvents(sid2)
+        assertTrue("runId must be preserved in failed marker", loaded2.last().text.startsWith("turn $luhnRunId failed"))
+        assertFalse("user secret must be redacted in failed marker", loaded2.last().text.contains(secretKey))
+        assertTrue("failed marker should have redacted token", loaded2.last().text.contains("⟦REDACTED"))
+        val dangling2 = findDanglingRunIds(loaded2)
+        assertTrue("dangling must be empty after failed marker with Luhn runId", dangling2.isEmpty())
+    }
 }

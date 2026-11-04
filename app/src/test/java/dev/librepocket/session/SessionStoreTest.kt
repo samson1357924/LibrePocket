@@ -1,7 +1,10 @@
 package dev.librepocket.session
 
 import androidx.test.core.app.ApplicationProvider
+import dev.librepocket.agent.ui.chat.cancelledMarkerText
 import dev.librepocket.agent.ui.chat.findDanglingRunIds
+import dev.librepocket.agent.ui.chat.interruptedMarkerText
+import dev.librepocket.agent.ui.chat.isSwitchSnapshotTerminalMark
 import dev.librepocket.agent.ui.chat.snapshotSwitchHistory
 import dev.librepocket.redact.Redactor
 import java.io.File
@@ -456,6 +459,141 @@ class SessionStoreTest {
         assertTrue(!loaded.contains(secret))
     }
 
+    @Test fun append_terminalMarkerIdentityInvariantProtected(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        val runId = "test-00000000-0000-0000-8164-179543296385"
+
+        // Precondition: bare Redactor WOULD redact this runId if unguided
+        val unguidedInterrupted = Redactor.redact(interruptedMarkerText(runId)).text
+        assertTrue("precondition: bare Redactor redacts the Luhn runId", unguidedInterrupted.contains("⟦REDACTED:CARD⟧"))
+
+        // 1. interruptedMarkerText: writing via store.appendEvent preserves exact marker text in Room
+        store.appendEvent(event(sid, kind = "user", text = "turn query", run = runId))
+        store.appendEvent(
+            event(sid, kind = "system", text = interruptedMarkerText(runId), run = runId).copy(isFinal = true),
+        )
+        val events = store.loadEvents(sid)
+        assertEquals(2, events.size)
+        assertEquals("turn test-00000000-0000-0000-8164-179543296385 interrupted", events[1].text)
+        assertFalse("marker text in Room must not be redacted to CARD", events[1].text.contains("⟦REDACTED:CARD⟧"))
+
+        // findDanglingRunIds recognizes it as terminal mark and reports 0 dangling run IDs
+        val dangling = findDanglingRunIds(events)
+        assertEquals(0, dangling.size)
+
+        // 2. cancelledMarkerText: also preserves exact marker text in Room
+        val sid2 = store.createSession("t2", "p/m")
+        store.appendEvent(event(sid2, kind = "user", text = "turn query", run = runId))
+        store.appendEvent(
+            event(sid2, kind = "system", text = cancelledMarkerText(runId), run = runId).copy(isFinal = true),
+        )
+        val events2 = store.loadEvents(sid2)
+        assertEquals(2, events2.size)
+        assertEquals("turn test-00000000-0000-0000-8164-179543296385 cancelled", events2[1].text)
+        assertFalse(events2[1].text.contains("⟦REDACTED:CARD⟧"))
+        assertEquals(0, findDanglingRunIds(events2).size)
+
+        // 3. Failure marker with user secret: runId preserved, user secret redacted
+        val sid3 = store.createSession("t3", "p/m")
+        val secretKey = "sk-" + "testSECRET1234567890"
+        val failedText = "turn $runId failed: api key $secretKey"
+        store.appendEvent(event(sid3, kind = "user", text = "turn query", run = runId))
+        store.appendEvent(
+            event(sid3, kind = "system", text = failedText, run = runId).copy(isFinal = true),
+        )
+        val events3 = store.loadEvents(sid3)
+        assertEquals(2, events3.size)
+        assertTrue(
+            "runId must be preserved in failed marker",
+            events3[1].text.startsWith("turn test-00000000-0000-0000-8164-179543296385 failed"),
+        )
+        assertFalse("user secret must be redacted", events3[1].text.contains(secretKey))
+        assertTrue("user secret should be replaced with redaction marker", events3[1].text.contains("⟦REDACTED"))
+        assertEquals(0, findDanglingRunIds(events3).size)
+
+        // 4. Defensive check: legacy already-redacted markers in the store are recognized
+        val legacyRedactedEvents = listOf(
+            event(sid, kind = "user", text = "turn query", run = runId),
+            event(sid, kind = "system", text = unguidedInterrupted, run = runId).copy(isFinal = true),
+        )
+        assertEquals(0, findDanglingRunIds(legacyRedactedEvents).size)
+        assertTrue(isSwitchSnapshotTerminalMark(legacyRedactedEvents[1]))
+    }
+
+    @Test fun append_untrustedRunIdWithSensitiveDataIsRedacted(): Unit = runBlocking {
+        setUp()
+
+        // Verify trusted run ID validator
+        assertTrue(isTrustedRunId("00000000-0000-0000-0000-000000000000"))
+        assertTrue(isTrustedRunId("test-00000000-0000-0000-8164-179543296385"))
+        assertTrue(isTrustedRunId("switch-00000000-0000-0000-0000-000000000000"))
+        assertTrue(isTrustedRunId("snapshot-incomplete-00000000-0000-0000-0000-000000000000"))
+        assertTrue(isTrustedRunId("steer-00000000-0000-0000-0000-000000000000"))
+        assertFalse(isTrustedRunId("user@example.com"))
+        assertFalse(isTrustedRunId("bearer test-token-123"))
+        assertFalse(isTrustedRunId("sk-" + "testSECRET1234567890"))
+        assertFalse(isTrustedRunId("test-8164-179543296385"))
+
+        // 1. interrupted marker with email runId
+        val sidEmail = store.createSession("t-email", "p/m")
+        val emailRunId = "user@example.com"
+        store.appendEvent(event(sidEmail, kind = "user", text = "query", run = emailRunId))
+        store.appendEvent(
+            event(sidEmail, kind = "system", text = interruptedMarkerText(emailRunId), run = emailRunId).copy(isFinal = true),
+        )
+        val emailEvents = store.loadEvents(sidEmail)
+        assertEquals(2, emailEvents.size)
+        assertEquals("turn ⟦REDACTED:EMAIL⟧ interrupted", emailEvents[1].text)
+        assertFalse(emailEvents[1].text.contains("user@example.com"))
+        assertEquals(0, findDanglingRunIds(emailEvents).size)
+        assertTrue(isSwitchSnapshotTerminalMark(emailEvents[1]))
+
+        // 2. cancelled marker with bearer token runId
+        val sidBearer = store.createSession("t-bearer", "p/m")
+        val bearerRunId = "bearer test-token-123"
+        store.appendEvent(event(sidBearer, kind = "user", text = "query", run = bearerRunId))
+        store.appendEvent(
+            event(sidBearer, kind = "system", text = cancelledMarkerText(bearerRunId), run = bearerRunId).copy(isFinal = true),
+        )
+        val bearerEvents = store.loadEvents(sidBearer)
+        assertEquals(2, bearerEvents.size)
+        val expectedBearerText = Redactor.redact(cancelledMarkerText(bearerRunId)).text
+        assertEquals(expectedBearerText, bearerEvents[1].text)
+        assertTrue(bearerEvents[1].text.contains("⟦REDACTED:TOKEN⟧"))
+        assertFalse(bearerEvents[1].text.contains("test-token-123"))
+        assertEquals(0, findDanglingRunIds(bearerEvents).size)
+        assertTrue(isSwitchSnapshotTerminalMark(bearerEvents[1]))
+
+        // 3. failed marker with email runId
+        val sidFailed = store.createSession("t-failed", "p/m")
+        val failedText = "turn $emailRunId failed: some error"
+        store.appendEvent(event(sidFailed, kind = "user", text = "query", run = emailRunId))
+        store.appendEvent(
+            event(sidFailed, kind = "system", text = failedText, run = emailRunId).copy(isFinal = true),
+        )
+        val failedEvents = store.loadEvents(sidFailed)
+        assertEquals(2, failedEvents.size)
+        assertEquals("turn ⟦REDACTED:EMAIL⟧ failed: some error", failedEvents[1].text)
+        assertFalse(failedEvents[1].text.contains("user@example.com"))
+        assertEquals(0, findDanglingRunIds(failedEvents).size)
+        assertTrue(isSwitchSnapshotTerminalMark(failedEvents[1]))
+
+        // 4. interrupted marker with API key runId
+        val sidKey = store.createSession("t-key", "p/m")
+        val apiKeyRunId = "sk-" + "testSECRET1234567890"
+        store.appendEvent(event(sidKey, kind = "user", text = "query", run = apiKeyRunId))
+        store.appendEvent(
+            event(sidKey, kind = "system", text = interruptedMarkerText(apiKeyRunId), run = apiKeyRunId).copy(isFinal = true),
+        )
+        val keyEvents = store.loadEvents(sidKey)
+        assertEquals(2, keyEvents.size)
+        assertEquals("turn ⟦REDACTED:API_KEY⟧ interrupted", keyEvents[1].text)
+        assertFalse(keyEvents[1].text.contains(apiKeyRunId))
+        assertEquals(0, findDanglingRunIds(keyEvents).size)
+        assertTrue(isSwitchSnapshotTerminalMark(keyEvents[1]))
+    }
+
     @Test fun append_truncatesHugeText(): Unit = runBlocking {
         setUp()
         val sid = store.createSession("t", "p/m")
@@ -562,7 +700,12 @@ class SessionStoreTest {
         val sid = store.createSession("t", "p/m")
         val run = "user@example.com"
         store.appendEvent(event(sid, kind = "user", text = "q", run = run))
-        store.appendEvent(event(sid, kind = "system", text = "turn $run cancelled", run = run))
+        db.sessionDao().insertEvent(
+            TranscriptEventEntity(
+                0, sid, 2L, run, "system", "turn ⟦REDACTED:EMAIL⟧ cancelled",
+                false, 0, now, false, null, null, null,
+            ),
+        )
         val stored = store.loadEvents(sid)
         assertEquals("turn ⟦REDACTED:EMAIL⟧ cancelled", stored[1].text)
         assertExportLimitPreservesDestination(sid, "export cannot identify redacted terminal marker")
@@ -574,7 +717,13 @@ class SessionStoreTest {
             val sid = store.createSession("t", "p/m")
             val run = "bearer syntheticSecret123"
             store.appendEvent(event(sid, kind = "user", text = "q", run = run))
-            store.appendEvent(event(sid, kind = "system", text = "turn $run $tail", run = run))
+            val masked = Redactor.redact("turn $run $tail").text
+            db.sessionDao().insertEvent(
+                TranscriptEventEntity(
+                    0, sid, 2L, run, "system", masked,
+                    false, 0, now, false, null, null, null,
+                ),
+            )
             assertTrue(!store.loadEvents(sid)[1].text.contains("syntheticSecret123"))
             assertExportLimitPreservesDestination(sid, "export cannot identify redacted terminal marker")
         }

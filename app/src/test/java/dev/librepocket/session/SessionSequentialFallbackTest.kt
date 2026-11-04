@@ -91,7 +91,7 @@ class SessionSequentialFallbackTest {
         override suspend fun appendEvent(event: TranscriptEvent): Long {
             require(event.kind in VALID_KINDS) { "unknown event kind: ${event.kind}" }
             require(event.kind != "reasoning" || event.text.isEmpty()) { "reasoning marker must have empty text" }
-            val redacted = Redactor.redact(event.text).text
+            val redacted = prepareEventText(event.kind, event.runId, event.text)
             val text = if (redacted.length > RoomSessionStore.MAX_TEXT_CHARS) {
                 redacted.take(RoomSessionStore.MAX_TEXT_CHARS)
             } else {

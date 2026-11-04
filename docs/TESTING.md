@@ -5,7 +5,7 @@
 - **Scope:** Repository CI, local JVM/Robolectric tests, static policy gates, and separately scheduled Android device tests.
 - **Owner role:** CI/build maintainer; no individual is assigned here.
 - **Source of truth:** `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`, `.github/workflows/security-audit.yml`, `scripts/verify_jdk_floor.sh`, `scripts/docs_claim_check.sh`, `scripts/test_docs_claim_check.sh`, `scripts/mcp_scan.py`, `scripts/requirements-docs.txt`, `scripts/apk_policy_inspect.py`, `scripts/play_policy_check.sh`, `scripts/backup_rules_check.py`, `scripts/summarize_junit.py`, `scripts/check_workflow_policy.py`, `scripts/check_python_shadowing.sh`, `scripts/osv_scan.py`, `scripts/tests/test_apk_policy_check.py`, `scripts/tests/test_summarize_junit.py`, `scripts/tests/test_workflow_policy.py`, `scripts/tests/test_gradle_wrapper_checksum.py`, `scripts/tests/test_verify_jdk_floor.py`, `scripts/tests/test_osv_scan.py`, `scripts/tests/test_verification_metadata.py`, `github_bot/.nvmrc`, test source sets, Gradle wrapper/catalog/verification-metadata, and the command results from the exact commit being assessed.
-- **Update trigger:** CI, test source-set, Android SDK/JDK, policy-script, or merge-gate changes.
+- **Update trigger:** CI, test source-set, Android SDK/JDK, policy-script, or merge-gate changes. Dependency version changes, `verification-metadata.xml` regeneration, and OSV monitor scope changes additionally trigger a review of the supply-chain Local commands below.
 
 ## Current CI scope
 
@@ -413,7 +413,7 @@ drift/bypass guard rather than a tamper-proof policy authority. Closing that
 gap needs CODEOWNERS/required reviewers or an external policy source, neither
 of which is currently configured.
 
-The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy, release-identity, and JDK floor harnesses run in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. The job installs the pinned, hash-checked `PyYAML==6.0.3` from `scripts/requirements-docs.txt` before running `PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 python3 -P -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py scripts/tests/test_gradle_wrapper_checksum.py scripts/tests/test_verify_jdk_floor.py scripts/tests/test_workflow_policy.py`. These tests use synthetic APK-like files and fake Gradle/SDK/policy commands; they do not prove real APK or SDK behavior. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
+The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy, release-identity, and JDK floor harnesses run in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. The job installs the pinned, hash-checked `PyYAML==6.0.3` from `scripts/requirements-docs.txt` before running `PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 python3 -P -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py scripts/tests/test_gradle_wrapper_checksum.py scripts/tests/test_verify_jdk_floor.py scripts/tests/test_workflow_policy.py`. The supply-chain gates (`scripts/tests/test_verification_metadata.py`, `scripts/tests/test_osv_scan.py`) are local/maintainer-run only (see Local commands below) and are not part of that command; wiring them into CI is out of scope here. These tests use synthetic APK-like files and fake Gradle/SDK/policy commands; they do not prove real APK or SDK behavior. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
 
 Issue #86 Phase C guardrails (Current, gates — only reject/alert, never
 silently downgrade redaction or writes):
@@ -844,11 +844,25 @@ python3 scripts/verify_gradle_wrapper.py
 
 # Supply-chain verification gates (H3, static, no Gradle, stdlib only):
 # verification-metadata strict-shape + OSV scanner (fake-server tests, no
-# production OSV contact). The OSV monitor itself needs network; --help is offline.
+# production OSV contact). Both gates are local/maintainer-run only, not
+# CI-wired. The OSV monitor itself needs network; --help is offline.
 PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 python3 -P -m unittest \
   scripts/tests/test_verification_metadata.py \
   scripts/tests/test_osv_scan.py
-python3 -P scripts/osv_scan.py --help
+python3 -P scripts/osv_scan.py --help # offline
+
+# verification-metadata regen (maintainer-run, clean workspace; review the
+# diff, then re-run the same build without --write-verification-metadata to
+# confirm it passes):
+./gradlew --write-verification-metadata sha256 :app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug :app:assemblePlayRelease :app:assembleFossRelease :app:assembleGithubRelease :app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest :app:lintPlayDebug :app:lintFossDebug :app:lintGithubDebug --max-workers=1 --no-daemon
+git status
+git diff --stat
+
+# Real OSV monitor scan (needs network + Python >= 3.11 for tomllib;
+# --output writes a JSON report file, --format controls stdout; --timeout
+# default 30s, --batch-size default 50; exit 0 = clean, 1 = vuln found
+# (monitor signal), 2 = fail-closed error):
+python3 -P scripts/osv_scan.py --format json --output /tmp/osv-report.json
 
 # Docs dependency and configuration checks (static, no Gradle)
 (

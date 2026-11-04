@@ -17,9 +17,12 @@ import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.assistant.AssistantReasonCode
 import dev.librepocket.agent.assistant.AssistantSettingsState
+import dev.librepocket.agent.assistant.AssistantSnapshot
 import dev.librepocket.agent.assistant.assistantReasonText
+import dev.librepocket.agent.assistant.effectiveAssistantReason
 import dev.librepocket.provider.ProviderProtocol
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -382,5 +385,37 @@ class AssistantCardTest {
         )
         composeRule.onNodeWithText("語音輸入設定").performScrollTo().performClick()
         assertEquals(1, fallbacks)
+    }
+
+    /**
+     * re-review #3 finding #2 [P2]：ReadError＋GRANTED 不顯示「已設為…」。
+     * 管線（[effectiveAssistantReason]）將歷史 GRANTED 遮罩為 null（歷史成功≠
+     * 當前持有），故頭部「無法確認」＋原因行「已設為…」不可並存；此處經管線
+     * 同源計算 reasonCode 再灌入渲染層，鎖定端到端隱藏。
+     */
+    @Test
+    fun readErrorGranted_hidesGrantedReasonRow() {
+        // 管線同源計算：ReadError＋GRANTED（everHeld=true 模擬 AlreadyHeld 路徑殘留）
+        // 必須為 null，否則即管線迴歸。
+        val reason = effectiveAssistantReason(
+            AssistantReasonCode.GRANTED,
+            AssistantSnapshot.ReadError,
+            everHeld = true,
+            pendingVerify = false,
+        )
+        assertNull(reason)
+        setSettings(
+            AssistantSettingsState(
+                roleHeld = false,
+                roleAvailable = false,
+                reasonCode = reason,
+                readError = true,
+            ),
+        )
+        composeRule.onNodeWithText("無法確認助理狀態，請稍後重試。")
+            .performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("assistantReason").assertDoesNotExist()
+        composeRule.onNodeWithText(assistantReasonText(AssistantReasonCode.GRANTED))
+            .assertDoesNotExist()
     }
 }

@@ -498,15 +498,19 @@ class AssistantRoleTest {
         }
     }
 
+    /**
+     * 行為變更（re-review #3 finding #2 [P2]，舊名同但鎖定錯誤的 GRANTED passthrough）：
+     * ReadError＋GRANTED 不再 passthrough——未知態不可將歷史成功顯示為當前持有，
+     * 否則頭部「無法確認」＋原因行「已設為…」矛盾並存；GRANTED 一律遮罩為 null。
+     * 其餘碼（DENIED／REVOKED／UNSUPPORTED／REQUEST_FAILED／null／VERIFYING）
+     * 仍 passthrough（VERIFYING 保留另見專測）。
+     */
     @Test
-    fun givenReadError_whenTriReconciled_thenAlwaysPassesThrough() {
-        // ReadError 一律 passthrough：不判撤銷（null＋everHeld 仍 null）、
-        // 不宣稱持有、不因驗證憑空造 VERIFYING。
-        // GRANTED＋pendingVerify 回 GRANTED 是 passthrough（stored 原樣），
-        // 非驗證語義——同值在 pendingVerify=false 時亦成立（下測鎖定）。
+    fun givenReadError_whenTriReconciled_thenPassesThroughExceptGranted() {
+        // ReadError 一律 passthrough（GRANTED 除外且 VERIFYING 另見專測，見上 KDoc）：不判撤銷
+        //（null＋everHeld 仍 null）、不宣稱持有、不因驗證憑空造 VERIFYING。
         val storedCases: List<String?> = listOf(
             null,
-            AssistantReasonCode.GRANTED,
             AssistantReasonCode.DENIED,
             AssistantReasonCode.REVOKED,
             AssistantReasonCode.UNSUPPORTED,
@@ -531,29 +535,44 @@ class AssistantRoleTest {
         }
     }
 
+    /**
+     * 行為變更（re-review #3 finding #2 [P2]）：ReadError＋GRANTED（pendingVerify
+     * 無關）一律遮罩為 null——未知態不可將歷史成功顯示為當前持有。舊行為
+     * （passthrough GRANTED）已廢棄，此測鎖定新語義。
+     */
     @Test
-    fun givenReadErrorGranted_whenVerifyOff_thenStillGrantedProvesPassthrough() {
-        // 對照鎖定：ReadError＋GRANTED 在 pendingVerify=false 時同樣回 GRANTED，
-        // 證明上測的 GRANTED 來自 passthrough 而非驗證語義。
-        assertEquals(
-            AssistantReasonCode.GRANTED,
-            effectiveAssistantReason(
-                AssistantReasonCode.GRANTED,
-                AssistantSnapshot.ReadError,
-                everHeld = false,
-                pendingVerify = false,
-            ),
-        )
+    fun givenReadErrorGranted_whenReconciled_thenMasksToNull() {
+        // 對照鎖定：ReadError＋GRANTED 在 pendingVerify=true／false 皆回 null
+        //（遮罩，非驗證語義；與 Known !held＋GRANTED→REVOKED 對照）。
+        listOf(false, true).forEach { pendingVerify ->
+            listOf(false, true).forEach { everHeld ->
+                assertNull(
+                    "ReadError＋GRANTED 必須遮罩為 null " +
+                        "(pendingVerify=$pendingVerify, everHeld=$everHeld)",
+                    effectiveAssistantReason(
+                        AssistantReasonCode.GRANTED,
+                        AssistantSnapshot.ReadError,
+                        everHeld = everHeld,
+                        pendingVerify = pendingVerify,
+                    ),
+                )
+            }
+        }
     }
 
+    /**
+     * 行為變更（re-review #3 finding #2 [P2]）：Unsupported＋GRANTED 同理遮罩為
+     * null——「不支援」頭部＋「已設為…」原因行矛盾並存。舊二態 (false,false)＋
+     * GRANTED 判 REVOKED、三態初期 passthrough GRANTED，皆已廢棄。
+     */
     @Test
-    fun givenUnsupported_whenTriReconciled_thenAlwaysPassesThrough() {
-        // Unsupported 同理：一律 passthrough。注意語義變更點：
-        // 舊二態 (false,false)＋GRANTED 會判 REVOKED；三態下快照不可讀時
-        // 不斷言撤銷，GRANTED 原樣保留（無快照證據不斷案）。
+    fun givenUnsupported_whenTriReconciled_thenPassesThroughExceptGranted() {
+        // Unsupported：一律 passthrough（GRANTED 除外且 VERIFYING 另見專測，見上 KDoc）。
+        // 注意語義變更點：舊二態 (false,false)＋GRANTED 會判 REVOKED；三態下快照
+        // 不可讀時不斷言撤銷；re-review #3 #2 後 GRANTED 更進一步遮罩為 null
+        //（未知≠持有），而非原樣保留。
         val storedCases: List<String?> = listOf(
             null,
-            AssistantReasonCode.GRANTED,
             AssistantReasonCode.DENIED,
             AssistantReasonCode.REVOKED,
             AssistantReasonCode.UNSUPPORTED,
@@ -579,9 +598,11 @@ class AssistantRoleTest {
     }
 
     /**
-     * 行為變更（re-review #3 finding #1 [P2]，舊名 `…GraceApplies`）：
-     * 驗證中 Known !held 回 VERIFYING（非 GRANTED 斷言）；未知態維持 passthrough
-     * （不憑空造 VERIFYING，stored 原樣——Stage 2 #2 另有遮罩，本 stage 保持）。
+     * 行為變更（re-review #3 finding #1 [P2]，舊名 `…GraceApplies`；再變更
+     * re-review #3 finding #2 [P2]：未知態＋GRANTED 由 passthrough 改為遮罩 null）：
+     * 驗證中 Known !held 回 VERIFYING（非 GRANTED 斷言）；未知態不憑空造
+     * VERIFYING（stored 非 VERIFYING 時不產生它），stored 原樣 passthrough——
+     * 唯 GRANTED 例外遮罩為 null（歷史成功≠當前持有）。
      */
     @Test
     fun givenPendingVerify_whenTriReconciled_thenVerifyingMatrix() {
@@ -626,10 +647,9 @@ class AssistantRoleTest {
                 pendingVerify = true,
             ),
         )
-        // Unknown＋GRANTED＋pendingVerify → passthrough GRANTED（非驗證語義——同值在
-        // pendingVerify=false 時亦成立，未知態不斷案）。
-        assertEquals(
-            AssistantReasonCode.GRANTED,
+        // Unknown＋GRANTED＋pendingVerify → 遮罩 null（re-review #3 finding #2：
+        // 未知態不可將歷史成功顯示為當前持有；pendingVerify 無關）。
+        assertNull(
             effectiveAssistantReason(
                 AssistantReasonCode.GRANTED,
                 AssistantSnapshot.ReadError,
@@ -654,6 +674,125 @@ class AssistantRoleTest {
                     pendingVerify = true,
                 ),
             )
+        }
+    }
+
+    // ---- re-review #3 finding #2 [P2]：未知態遮罩表專測 ----
+
+    @Test
+    fun givenUnknownGranted_whenReconciled_thenMasksToNull() {
+        // Unknown＋GRANTED → null（歷史成功≠當前持有；頭部未知／不支援＋
+        // 原因行「已設為…」不可並存）。everHeld／pendingVerify 無關。
+        listOf(AssistantSnapshot.ReadError, AssistantSnapshot.Unsupported).forEach { snapshot ->
+            listOf(false, true).forEach { everHeld ->
+                listOf(false, true).forEach { pendingVerify ->
+                    assertNull(
+                        "Unknown＋GRANTED 必須遮罩為 null " +
+                            "($snapshot, everHeld=$everHeld, pendingVerify=$pendingVerify)",
+                        effectiveAssistantReason(
+                            AssistantReasonCode.GRANTED,
+                            snapshot,
+                            everHeld,
+                            pendingVerify,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * 防禦性契約（re-review #3 finding #2 [P2]）：`stored == VERIFYING` 生產
+     * 不可達（VERIFYING 僅合成輸出，只進 `state.reasonCode` 不回流 `stored`；
+     * AssistantRoleUi 只寫 null／DENIED／GRANTED／UNSUPPORTED／REQUEST_FAILED）。
+     * 此測僅鎖定純函數防禦 fallthrough（`else stored` 原樣 passthrough），非生產
+     * 路徑。`pending=false` 組合在生產語義下矛盾（VERIFYING 本意味驗證中）故
+     * 刪除，只保留 `pending=true` 兩組（ReadError／Unsupported）。
+     */
+    @Test
+    fun givenUnknownVerifyingStored_whenTriReconciled_thenDefensivePassthrough() {
+        // 防禦性 passthrough：未知幀不合成 VERIFYING，此處僅因 stored 恰為
+        // VERIFYING 而原樣保留；pending 在未知態被忽略（consumePendingVerify
+        // 保留旗供重試排程繼續，但不合成 VERIFYING 顯示）。
+        listOf(AssistantSnapshot.ReadError, AssistantSnapshot.Unsupported).forEach { snapshot ->
+            listOf(false, true).forEach { everHeld ->
+                assertEquals(
+                    "Unknown＋VERIFYING 防禦性 passthrough " +
+                        "($snapshot, everHeld=$everHeld, pendingVerify=true)",
+                    AssistantReasonCode.VERIFYING,
+                    effectiveAssistantReason(
+                        AssistantReasonCode.VERIFYING,
+                        snapshot,
+                        everHeld,
+                        true,
+                    ),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun givenUnknownFutureCode_whenReconciled_thenPassesThrough() {
+        // 未知未來碼原樣 passthrough（不偽造語義、不遮罩；與文案未知分支對照）。
+        listOf(AssistantSnapshot.ReadError, AssistantSnapshot.Unsupported).forEach { snapshot ->
+            listOf(false, true).forEach { everHeld ->
+                listOf(false, true).forEach { pendingVerify ->
+                    assertEquals(
+                        "Unknown＋未來碼必須 passthrough " +
+                            "($snapshot, everHeld=$everHeld, pendingVerify=$pendingVerify)",
+                        "SOME_FUTURE_CODE",
+                        effectiveAssistantReason(
+                            "SOME_FUTURE_CODE",
+                            snapshot,
+                            everHeld,
+                            pendingVerify,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun givenUnknownDenied_whenReconciled_thenPassesThrough() {
+        // Unknown＋DENIED → DENIED 保留（事件記錄非狀態斷言；未知≠已撤銷）。
+        listOf(AssistantSnapshot.ReadError, AssistantSnapshot.Unsupported).forEach { snapshot ->
+            listOf(false, true).forEach { everHeld ->
+                listOf(false, true).forEach { pendingVerify ->
+                    assertEquals(
+                        "Unknown＋DENIED 必須 passthrough " +
+                            "($snapshot, everHeld=$everHeld, pendingVerify=$pendingVerify)",
+                        AssistantReasonCode.DENIED,
+                        effectiveAssistantReason(
+                            AssistantReasonCode.DENIED,
+                            snapshot,
+                            everHeld,
+                            pendingVerify,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun givenUnknownNull_whenReconciled_thenStaysNull() {
+        // Unknown＋null → null（不憑空判撤銷；everHeld 在未知態一律忽略）。
+        listOf(AssistantSnapshot.ReadError, AssistantSnapshot.Unsupported).forEach { snapshot ->
+            listOf(false, true).forEach { everHeld ->
+                listOf(false, true).forEach { pendingVerify ->
+                    assertNull(
+                        "Unknown＋null 必須維持 null " +
+                            "($snapshot, everHeld=$everHeld, pendingVerify=$pendingVerify)",
+                        effectiveAssistantReason(
+                            null,
+                            snapshot,
+                            everHeld,
+                            pendingVerify,
+                        ),
+                    )
+                }
+            }
         }
     }
 

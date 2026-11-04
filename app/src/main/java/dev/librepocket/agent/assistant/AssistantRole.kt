@@ -179,12 +179,23 @@ object AssistantReasonCode {
  *   `everHeld` 曾觀察 held 即 sticky 補上判定）。僅 stored null 時用 everHeld
  *   判撤銷；顯式新鮮碼（DENIED／UNSUPPORTED／REQUEST_FAILED／REVOKED）
  *   一律 passthrough，不被 everHeld 覆寫。
- * - 其餘（含 ReadError／Unsupported 任何 stored／everHeld／pendingVerify 組合）
- *   原樣 passthrough：讀不到快照時不判撤銷（誠實：未知≠已撤銷）、不顯示持有、
- *   驗證中亦 passthrough（未知態不憑空造 VERIFYING——Stage 2 #2 另有遮罩，
- *   本 stage 保持 passthrough）。副作用：Unsupported／ReadError 下既有 GRANTED
- *   sticky 會原樣保留顯示（passthrough），而非覆寫為 REVOKED——快照不可讀時
- *   不斷案。
+ * - 未知態（ReadError／Unsupported）遮罩表（re-review #3 finding #2 [P2]）——
+ *   未知不可將歷史成功顯示為當前持有，否則頭部「無法確認／不支援」與原因行
+ *   「已設為…」同時出現是矛盾斷言：
+ *   - Unknown＋GRANTED → null（隱藏原因行，只留頭部未知／不支援文案；
+ *     GRANTED 歷史成功≠當前持有；舊 stored／AlreadyHeld 路徑殘留皆遮罩）。
+ *   - Unknown＋VERIFYING → 原樣 passthrough，但生產不可達的防禦性
+ *     fallthrough（`else stored` 分支，非合成）：`stored` 永不為 VERIFYING
+ *     （AssistantRoleUi 只寫 null／DENIED／GRANTED／UNSUPPORTED／REQUEST_FAILED；
+ *     `effective` 合成的 VERIFYING 只進 `state.reasonCode` 不回流 `stored`；
+ *     `rememberSaveable` 亦然）。未知態不憑空造 VERIFYING，`stored` 非
+ *     VERIFYING 時不產生它。
+ *   - 其餘（DENIED／UNSUPPORTED／REQUEST_FAILED／REVOKED／null／未知碼）→
+ *     原樣 passthrough（事件記錄非狀態斷言，不掩蓋新鮮判定；未知≠已撤銷，
+ *     故不判 REVOKED、不顯示持有）。
+ *   `everHeld`／`pendingVerify` 在未知態一律忽略（不判撤銷、不合成原因碼；
+ *   `pending` 雖經 [consumePendingVerify] 保留供重試排程繼續，但未知幀不合成
+ *   VERIFYING 顯示）。
  * - 超時收斂（重試耗盡，`pendingVerify` 被置 false 後按正常規則走）：
  *   `stored=null`＋`!everHeld`＋Known(!held) → null（中性 idle「尚未設為…」，
  *   誠實：系統從未確認持有，不斷言撤銷）；`stored=null`＋`everHeld` → REVOKED。
@@ -207,7 +218,12 @@ fun effectiveAssistantReason(
     everHeld: Boolean,
     pendingVerify: Boolean,
 ): String? {
-    val known = snapshot as? AssistantSnapshot.Known ?: return stored
+    val known = snapshot as? AssistantSnapshot.Known
+        // re-review #3 finding #2 [P2]：未知態遮罩歷史 GRANTED（歷史成功≠當前持有，
+        // 否則頭部未知／不支援＋原因行「已設為…」矛盾並存）；其餘 passthrough
+        //（含 VERIFYING 防禦性 fallthrough：stored 生產永不為 VERIFYING，此分支
+        // 生產不可達，僅純函數防禦契約）。
+        ?: return if (stored == AssistantReasonCode.GRANTED) null else stored
     return if (known.held) {
         null
     } else if (pendingVerify &&

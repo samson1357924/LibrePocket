@@ -38,7 +38,7 @@ mlkitBarcodeScanning = "17.3.0"
 mlkitTextRecognition = "16.0.1"
 # S2 cloud voice fallback (github flavor only; foss/play must never reference it —
 # see HardeningPolicy.FOSS_STRING_BLACKLIST + scripts/play_policy_check.sh foss gate).
-azureSpeech = "1.52.0"
+azureSpeech = "1.53.0"
 # 沿 2.18 LTS 線升至 2.18.12，以涵蓋 Issue #132 已知 advisories 與後續
 # Critical CVE-2026-110879 (GHSA-m8xf-2cr7-77ph)；不得以 2.18.8 當通用安全下限。
 jacksonBom = "2.18.12"

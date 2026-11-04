@@ -27,7 +27,7 @@ WORKFLOW_SNAPSHOTS = {
     "codeql.yml": "c22dfb2bc946d510c809dbac5ac25b13ac44b896779d736600989be067d5fdb7",
     "nightly-instrumented.yml": "be179f748ec9eb8196f7ef6fe169e316b56f565d8d2d617947fd29640b11abdb",
     "pocketguard.yml": "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564",
-    "pr-check.yml": "e865c3363b58df73c50d84496ddb9367cbb76c902bbe3fb210935ec92d6126ea",
+    "pr-check.yml": "d09ef9b8bc422953ffed856551f5648f61a0a73e0ead01046d5f5ee60432ed7e",
     "release.yml": "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f",
     "security-audit.yml": "0b4b9b833a50b61b456e4d4c2064fba5f9c6836867157c4f22b1c5887ee4f176",
 }

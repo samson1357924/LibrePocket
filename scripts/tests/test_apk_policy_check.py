@@ -3825,6 +3825,8 @@ class PolicyCiGateControl(unittest.TestCase):
             "scripts/tests/test_gradle_wrapper_checksum.py",
             "scripts/tests/test_verify_jdk_floor.py",
             "scripts/tests/test_workflow_policy.py",
+            "scripts/tests/test_verification_metadata.py",
+            "scripts/tests/test_osv_scan.py",
         ):
             with self.subTest(test_path=test_path):
                 self.assertIn(test_path, workflow)

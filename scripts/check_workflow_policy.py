@@ -96,7 +96,7 @@ EXPECTED_WORKFLOW_SHA256 = {
         "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564"
     ),
     "pr-check.yml": (
-        "e865c3363b58df73c50d84496ddb9367cbb76c902bbe3fb210935ec92d6126ea"
+        "d09ef9b8bc422953ffed856551f5648f61a0a73e0ead01046d5f5ee60432ed7e"
     ),
     "release.yml": (
         "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f"
@@ -192,7 +192,9 @@ EXPECTED_POLICY_HARNESS_RUN = (
     "scripts/tests/test_check_junit_durations.py "
     "scripts/tests/test_gradle_wrapper_checksum.py "
     "scripts/tests/test_verify_jdk_floor.py "
-    "scripts/tests/test_workflow_policy.py"
+    "scripts/tests/test_workflow_policy.py "
+    "scripts/tests/test_verification_metadata.py "
+    "scripts/tests/test_osv_scan.py"
 )
 EXPECTED_CODE_FILTER_PATHS = frozenset(
     {

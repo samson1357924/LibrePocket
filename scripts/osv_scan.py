@@ -38,10 +38,12 @@ production OSV endpoint.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import sys
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +61,22 @@ DEFAULT_BATCH = 50
 def fail(message: str) -> int:
     print(f"osv_scan: ERROR: {message}", file=sys.stderr)
     return 2
+
+
+def _osv_url_allowed(url: str) -> bool:
+    """Exact-match allowlist for --osv-url (no prefix matching)."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    scheme = parsed.scheme.lower()
+    if scheme == "https":
+        return True
+    if scheme == "http":
+        host = (parsed.hostname or "").lower()
+        if host in ("localhost", "127.0.0.1", "::1"):
+            return True
+    return False
 
 
 def parse_catalog(catalog: Path) -> tuple[list[dict[str, str]], list[str]]:
@@ -135,7 +153,7 @@ def query_osv(
     batch_size: int,
 ) -> list[dict[str, Any]]:
     """Query OSV querybatch; return per-package result list aligned with input."""
-    if not osv_url.startswith(("https://", "http://localhost", "http://127.")):
+    if not _osv_url_allowed(osv_url):
         raise RuntimeError(f"refusing non-https OSV URL outside loopback tests: {osv_url}")
     if timeout <= 0 or batch_size <= 0:
         raise RuntimeError(f"invalid timeout/batch-size: {timeout}/{batch_size}")
@@ -168,6 +186,8 @@ def query_osv(
             raise RuntimeError(f"OSV network error for batch @{start}: {exc.reason}") from exc
         except OSError as exc:
             raise RuntimeError(f"OSV connection failed for batch @{start}: {exc}") from exc
+        except http.client.HTTPException as exc:
+            raise RuntimeError(f"OSV protocol error for batch @{start}: {exc}") from exc
         if status != 200:
             raise RuntimeError(f"OSV unexpected status {status} for batch @{start}")
         try:
@@ -248,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
         results = query_osv(packages, args.osv_url, args.timeout, args.batch_size)
     except RuntimeError as exc:
         return fail(str(exc))
+    except Exception as exc:
+        return fail(f"OSV unexpected error: {type(exc).__name__}: {exc}")
 
     affected, lines = summarize(results)
     if args.format == "json" or args.output is not None:

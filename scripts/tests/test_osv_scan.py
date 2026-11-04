@@ -30,7 +30,7 @@ bom-managed = { group = "androidx.compose.ui", name = "ui" }
 
 
 class FakeOsvHandler(BaseHTTPRequestHandler):
-    mode = "clean"  # clean | vuln | error500 | badjson | mismatch
+    mode = "clean"  # clean | vuln | error500 | badjson | mismatch | garbage
 
     def log_message(self, *args):  # silence test server logs
         pass
@@ -61,6 +61,11 @@ class FakeOsvHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"results": []}).encode())
+            return
+        if FakeOsvHandler.mode == "garbage":
+            self.wfile.write(b"GARBAGE-NOT-HTTP\r\n\r\n")
+            self.wfile.flush()
+            self.close_connection = True
             return
         results = []
         for query in queries:
@@ -189,6 +194,49 @@ class OsvScanTest(unittest.TestCase):
             self.assertEqual(report["summary"]["affected"], 1)
             purls = [p["purl"] for p in report["packages"]]
             self.assertIn("pkg:maven/com.example/foo@1.0.0", purls)
+
+    def test_lookalike_loopback_hosts_refused(self):
+        FakeOsvHandler.mode = "clean"
+        with tempfile.TemporaryDirectory() as td:
+            catalog = self.write_catalog(Path(td))
+            for evil in (
+                "http://127.evil.com/v1/querybatch",
+                "http://localhost.evil.com/v1/querybatch",
+            ):
+                with self.subTest(url=evil):
+                    proc = self.run_scan("--catalog", str(catalog),
+                                         "--osv-url", evil)
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    self.assertIn("refusing", proc.stderr.lower())
+
+    def test_osv_url_allowlist_exact_match(self):
+        FakeOsvHandler.mode = "clean"
+        from scripts import osv_scan as osv_scan_mod
+        self.assertTrue(
+            osv_scan_mod._osv_url_allowed("https://api.osv.dev/v1/querybatch"))
+        self.assertTrue(
+            osv_scan_mod._osv_url_allowed("http://127.0.0.1:8080/v1/querybatch"))
+        self.assertTrue(
+            osv_scan_mod._osv_url_allowed("http://localhost:8080/v1/querybatch"))
+        self.assertTrue(
+            osv_scan_mod._osv_url_allowed("http://[::1]:8080/v1/querybatch"))
+        self.assertFalse(
+            osv_scan_mod._osv_url_allowed("http://127.evil.com/v1/querybatch"))
+        self.assertFalse(
+            osv_scan_mod._osv_url_allowed("http://localhost.evil.com/v1/querybatch"))
+        self.assertFalse(
+            osv_scan_mod._osv_url_allowed("ftp://api.osv.dev/v1/querybatch"))
+        self.assertFalse(
+            osv_scan_mod._osv_url_allowed("api.osv.dev/v1/querybatch"))
+
+    def test_garbage_status_line_fails_closed(self):
+        FakeOsvHandler.mode = "garbage"
+        with tempfile.TemporaryDirectory() as td:
+            catalog = self.write_catalog(Path(td))
+            proc = self.run_scan("--catalog", str(catalog), "--osv-url", self.url)
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn("ERROR", proc.stderr)
+            self.assertNotIn("AFFECTED", proc.stdout)
 
 
 if __name__ == "__main__":

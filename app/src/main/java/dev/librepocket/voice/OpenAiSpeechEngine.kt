@@ -100,19 +100,23 @@ class ByteArrayMediaDataSource(
 
 /**
  * Android 生產環境預設播放器，利用 [MediaPlayer] 搭配 [ByteArrayMediaDataSource] 達成受限記憶體緩衝播放。
- * 併發與生命週期保證（世代柵欄 + 非阻塞釋放 + 同步快速靜音）：
+ * 併發與生命週期保證（世代柵欄 + 非阻塞釋放 + 非同步背景靜音）：
  * - 僅以 [lock] 保護狀態（activePlayer/activeDataSource/activeContinuation/activeEpoch/sessionEpoch），絕不在持有任何 Java monitor
  *   時呼叫 MediaPlayer native 阻塞方法（setDataSource/prepareAsync/start/stop/reset/release），避免 AB-BA 死鎖；
  * - 每次 play 以遞增世代（epoch）佔位，native 前後皆以 epoch+session 雙重柵欄複檢，失格即釋放並取消；
- *   onPrepared 另有最終緊貼 start 前柵欄 + start 後殘餘窗口再靜音兜底，遲到回呼永不 start（殘餘數指令窗口亦即時 mute）；
- * - [stop] 先做 detach + cancel（持 [lock] 短臨界），再在鎖外對當前 player 做同步 best-effort 快速靜音
- *  （`stop()`/退回 `pause()` + 同步清除監聽器，不等待釋放佇列），完整 reset/release 投遞至背景釋放執行緒；
- *   呼叫線程有界返回，B 的 native stop 不被 A 的阻塞 release 無界排隊；
+ *   onPrepared 另有最終緊貼 start 前柵欄 + start 後殘餘窗口再靜音兜底，遲到回呼永不 start（殘餘數指令窗口亦排隊背景 mute）；
+ * - [stop] 僅做邏輯取消（持 [lock] 短臨界 detach + cancel + 超時清理），再將真實靜音與完整釋放排入背景執行緒，
+ *   呼叫線程永不直接執行任何 MediaPlayer native（stop/pause/setListener/reset/release），故有界返回；
+ *   真實音訊停止為 best-effort 背景保證（見 [muteAndReleaseAsync]）：邏輯取消有限時間回應，聲音何時確實停止取決於
+ *   背景 mute 任務執行（B 的 mute 與 A 的阻塞 release 分屬不同執行緒池，互不排隊；B 自身 native 阻塞亦只卡住背景線程，不卡呼叫方）；
  * - prepare 另設 prepare 超時（預設 [PREPARE_TIMEOUT_MS]，測試可經 [prepareTimeoutMs] 縮短），
  *   僅涵蓋「尚未 onPrepared」的 PREPARING 階段：onPrepared 成功（epoch 仍 active）即標記已準備並取消計時，
  *   進入 PLAYING 後不再受 prepare timer 影響；逾時僅在仍為 PREPARING 且 epoch 仍 active 時才 detach + 釋放 + resumeWithException。
  *
- * 採用 [MediaPlayer.prepareAsync] 非同步準備，所有 native 呼叫皆在鎖外執行，確保 [stop] 與新播放能隨時即時中斷。
+ * 採用 [MediaPlayer.prepareAsync] 非同步準備，mute/release 相關 native 呼叫在背景執行緒池執行，
+ * play 發起的 setDataSource/prepareAsync/setListener 在呼叫方線程鎖外執行（不持 monitor、不進池），
+ * 確保 [stop] 與新播放能隨時即時中斷。
+ * 不再宣稱同步有界靜音：stop() 返回僅保證邏輯取消完成，不保證返回當下已無聲。
  */
 class AndroidAudioPlayer(
     private val mediaPlayerFactory: () -> MediaPlayer = { MediaPlayer() },
@@ -150,6 +154,17 @@ class AndroidAudioPlayer(
     private val releaseExecutor: java.util.concurrent.ExecutorService =
         java.util.concurrent.Executors.newSingleThreadExecutor { r ->
             Thread(r, "AndroidAudioPlayer-release").apply { isDaemon = true }
+        }
+    /**
+     * Stage-A 第三輪：獨立背景靜音執行緒池（與 [releaseExecutor] 分離）。
+     * stop() 呼叫線程永不直接執行任何 MediaPlayer native，僅將靜音任務 enqueue 即返回；
+     * 真實 `stop()/pause()+clearListener` 由此池背景執行（best-effort，失敗吞掉）。
+     * 採用 cached 池使每次 mute 擁有獨立線程：B 自身 native 阻塞只卡住其背景線程，
+     * 不卡呼叫方，亦不卡後續其他 mute；且 B mute 不被 A 的阻塞 release（另一池）排隊。
+     */
+    private val muteExecutor: java.util.concurrent.ExecutorService =
+        java.util.concurrent.Executors.newCachedThreadPool { r ->
+            Thread(r, "AndroidAudioPlayer-mute").apply { isDaemon = true }
         }
     private val timeoutScheduler: java.util.concurrent.ScheduledExecutorService =
         java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
@@ -202,22 +217,34 @@ class AndroidAudioPlayer(
     }
 
     /**
-     * 釋放內部背景執行緒池（release + timeout）。
-     * 兩池皆為 daemon 線程，不關閉亦不會阻塞 JVM/測試結束；但長期持有（每實例兩池）
-     * 會在大量測試中累積閒置線程，故提供顯式關閉。呼叫後新的 releaseAsync 會退回同步釋放。
+     * 釋放內部背景執行緒池（mute + release + timeout）。
+     * 三池皆為 daemon 線程，不關閉亦不會阻塞 JVM/測試結束；但長期持有（每實例三池）
+     * 會在大量測試中累積閒置線程，故提供顯式關閉。呼叫後新的 releaseAsync/mute 會經 daemon fallback 背景釋放，避免洩漏。
+     * 注意：[release] 本身可能等待有界時間（mute 1s + release 2s），UI 執行緒應在背景呼叫 shutdown；
+     * [stop] 本身永不等待，始終有界返回。
      */
     fun release() {
         // Stage-C P2：先標記 released 使併發 play fail-fast，再關閉執行緒池。冪等。
         isReleased.set(true)
         // Orderly shutdown：先丟棄 pending prepare 超時（stop 已 cancel 對應 epoch，丟棄無洩漏），
-        // 再 orderly 關閉 release 池，確保 shutdown 前由 stop() enqueue 的 releaseAsync 不被丟棄。
+        // 再 orderly 關閉 mute 與 release 池，確保 shutdown 前由 stop() enqueue 的 mute/release 不被丟棄。
         // 切勿對 releaseExecutor 用 shutdownNow：會丟棄佇列中剛 enqueue 的 native reset/release 造成洩漏。
+        // mute 池用 shutdown（非 shutdownNow）：已 enqueue 的 mute 仍會執行並鏈式觸發 releaseAsync；
+        // 若 mute 本身阻塞，await 僅等有界時間（1s），後續解堵後 releaseAsync 經 fallback 仍不洩漏。
         try {
             timeoutScheduler.shutdownNow()
         } catch (_: Throwable) {
         }
         try {
+            muteExecutor.shutdown()
+        } catch (_: Throwable) {
+        }
+        try {
             releaseExecutor.shutdown()
+        } catch (_: Throwable) {
+        }
+        try {
+            muteExecutor.awaitTermination(1, java.util.concurrent.TimeUnit.SECONDS)
         } catch (_: Throwable) {
         }
         try {
@@ -262,8 +289,9 @@ class AndroidAudioPlayer(
     }
 
     // 注意：此函式絕對不可在 synchronized(lock) 或 synchronized(player) 內呼叫，
-    // 所有 native（listener 清除/reset/release）皆在鎖外執行，避免阻塞持有鎖的 stop()/play()。
-    // 另見 [tryImmediateMute]：stop 路徑的同步快速靜音亦遵循同樣約束（鎖外、無 synchronized(player)）。
+    // 所有 native（listener 清除/reset/release）皆在背景執行緒執行，避免阻塞持有鎖的 stop()/play()。
+    // 另見 [muteNow]：stop 路徑的背景靜音亦遵循同樣約束（背景線程、無 synchronized(player)；
+    // stop() 呼叫線程本身永不執行任何 native，僅 enqueue 即返回）。
     private fun safelyReleasePlayer(player: MediaPlayer?, dataSource: ByteArrayMediaDataSource?) {
         if (player != null) {
             try {
@@ -302,22 +330,27 @@ class AndroidAudioPlayer(
                 safelyReleasePlayer(detached.player, detached.dataSource)
             }
         } catch (_: Throwable) {
-            // 執行緒池已關閉等極端情況，退回同步釋放，避免洩漏
-            safelyReleasePlayer(detached.player, detached.dataSource)
+            // 執行緒池已關閉等極端情況：絕不在呼叫線程同步執行可能阻塞的 native，
+            // 改起 daemon 線程背景釋放，避免洩漏亦保持呼叫方有界返回。
+            try {
+                Thread({ safelyReleasePlayer(detached.player, detached.dataSource) }, "AndroidAudioPlayer-release-fallback").apply { isDaemon = true }.start()
+            } catch (_: Throwable) {
+            }
         }
     }
 
     /**
-     * 同步快速靜音（bounded immediate mute，鎖外執行、永不持有任何 Java monitor）。
+     * 背景靜音實作（僅由 [muteExecutor] 背景線程呼叫，永不在呼叫方線程執行）。
      *
-     * Stage-B P1/BLOCK-2：[stop] 的邏輯取消（detach+cancel）之外，必須提供真實媒體靜音/停止保證，
-     * 且不得被 [releaseExecutor] 中先前排隊的阻塞 release（例如 A 的 reset 卡住）無界排隊延遲。
-     * 故在 detach 後（鎖外）對當前 player 做 best-effort 同步 `stop()`（必要時退回 `pause()`），
-     * 失敗（PREPARING 等非法狀態拋 IllegalStateException）一律吞掉，完整 reset/release 仍走背景 [releaseAsync]。
-     * 呼叫線程僅執行短 native（不等待佇列），保持有界返回；絕不在 synchronized(lock)/synchronized(player) 內呼叫，
-     * 不重新引入上輪 P1 已修復的 native monitor 死鎖。
+     * Stage-A 第三輪 P1/BLOCK：stop() 呼叫線程永不直接執行可能無界阻塞的 native
+     * （`stop()/pause()/setListener` 在部分 OEM 上可能同步阻塞），故同步快速靜音已移除。
+     * 此函式為 best-effort 背景靜音：`stop()`（必要時退回 `pause()`）+ 清除監聽器，
+     * 失敗（PREPARING 等非法狀態拋 IllegalStateException，或 OEM 阻塞）一律吞掉；
+     * 完整 reset/release 由鏈式 [releaseAsync] 在 [releaseExecutor] 執行。
+     * 語義：邏輯取消（detach+cancel）有界返回，真實何時無聲為 best-effort 背景保證，
+     * 不再宣稱 stop() 返回當下即無聲。
      */
-    private fun tryImmediateMute(player: MediaPlayer?) {
+    private fun muteNow(player: MediaPlayer?) {
         if (player == null) return
         try {
             player.stop()
@@ -344,12 +377,45 @@ class AndroidAudioPlayer(
     }
 
     /**
-     * 先同步快速靜音、再將完整釋放排入背景佇列。呼叫端必須已在鎖外。
-     * 靜音不等待佇列（解決 B 被 A 阻塞 release 無界排隊），釋放仍有序排隊保證不洩漏。
+     * 非同步靜音 + 釋放（呼叫線程僅 enqueue 即返回，永不執行 native）。
+     * 呼叫端必須已在鎖外。背景鏈：[muteExecutor] 執行 [muteNow] 後，再經 [releaseAsync]
+     * 將完整 reset/release 排入 [releaseExecutor]。靜音與釋放分屬不同池，故 B 的 mute
+     * 不被 A 的阻塞 release 排隊；B 自身 native 阻塞亦只卡住其 mute 背景線程，不卡呼叫方。
+     * 若 mute 池已關閉，退回 daemon 線程背景執行（永不在呼叫線程同步執行 native），仍不洩漏。
      */
     private fun muteAndReleaseAsync(detached: DetachedSession) {
-        tryImmediateMute(detached.player)
-        releaseAsync(detached)
+        if (detached.player == null && detached.dataSource == null) return
+        try {
+            muteExecutor.execute {
+                muteNow(detached.player)
+                releaseAsync(detached)
+            }
+        } catch (_: Throwable) {
+            try {
+                Thread({
+                    muteNow(detached.player)
+                    releaseAsync(detached)
+                }, "AndroidAudioPlayer-mute-fallback").apply { isDaemon = true }.start()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    /**
+     * 無釋放擁有權的純背景靜音（start→stop 殘餘窗口兜底用）。
+     * 僅 enqueue [muteNow]，不排釋放（釋放由勝出的 stop/取代路徑負責），呼叫線程有界返回。
+     * 池關閉時退回 daemon 線程，永不在呼叫線程執行 native。
+     */
+    private fun muteAsync(player: MediaPlayer?) {
+        if (player == null) return
+        try {
+            muteExecutor.execute { muteNow(player) }
+        } catch (_: Throwable) {
+            try {
+                Thread({ muteNow(player) }, "AndroidAudioPlayer-mute-fallback").apply { isDaemon = true }.start()
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     private fun tryResumeUnit(cont: CancellableContinuation<Unit>) {
@@ -436,8 +502,8 @@ class AndroidAudioPlayer(
         }
         val epoch: Long = myEpoch
 
-        // 釋放被取代的舊世代：cancel 原因攜帶 epoch；舊媒體先同步快速靜音（不被佇列阻塞），
-        // 完整 native 釋放走背景執行緒，不阻塞新播放。
+        // 釋放被取代的舊世代：cancel 原因攜帶 epoch；舊媒體靜音與完整釋放皆走背景
+        // （mute 池與 release 池分離，不被阻塞排隊，亦不阻塞新播放呼叫線程）。
         // 同時取消舊世代的 prepare 超時任務，避免其持有舊 player+continuation 15s。
         // 舊世代若已進入 PLAYING，其 prepared 標記亦一併清除，避免集合無界增長。
         if (oldDetached.player != null || oldDetached.continuation != null || oldDetached.dataSource != null) {
@@ -560,12 +626,13 @@ class AndroidAudioPlayer(
                     // 此後播放超過原 deadline 不再受 timer 影響，直到真實 onCompletion/onError。
                     cancelTimeout(epoch)
                     // start→stop 殘餘窗口兜底：若 stop 恰交錯於最終柵欄與 native start 之間（僅數指令寬），
-                    // 此處複檢發現已失格即立即再靜音，將可聽窗口收斂為單次 start 後的瞬時 mute。
-                    // 已 detach 者由勝出的 stop 路徑負責 release，此處僅 best-effort 靜音 + 清標記，不重複排隊。
+                    // 此處複檢發現已失格即排隊背景再靜音，將可聽窗口收斂為短暫輸出後由背景 mute 終止。
+                    // 已 detach 者由勝出的 stop 路徑負責 release，此處僅 best-effort 背景靜音 + 清標記，不重複排隊。
+                    // 回呼線程本身永不直接執行 native，保持有界返回。
                     val stillValid =
                         synchronized(lock) { activePlayer === mp && activeEpoch == epoch && sessionEpoch == epoch } && continuation.isActive
                     if (!stillValid) {
-                        tryImmediateMute(mp)
+                        muteAsync(mp)
                         clearPrepared(epoch)
                     }
                 }
@@ -711,8 +778,9 @@ class AndroidAudioPlayer(
         }
         tryCancel(detached.continuation, "AndroidAudioPlayer stopped (epoch ${detached.epoch})")
         cancelTimeoutAndClearPrepared(detached.epoch)
-        // Stage-B：先同步快速靜音（鎖外、短 native，不等待 release 佇列），再將完整釋放排入背景。
-        // 呼叫線程有界返回；B 的 native stop 不被 A 的阻塞 release 無界排隊。
+        // Stage-A 第三輪：僅做邏輯取消 + enqueue 背景靜音/釋放，呼叫線程永不執行 native。
+        // 呼叫線程有界返回（不被 A 的阻塞 release 排隊，亦不被 B 自身阻塞 native 卡住）；
+        // 真實靜音由 mute 池背景 best-effort 執行，完整釋放隨後排入 release 池。
         muteAndReleaseAsync(detached)
     }
 }
@@ -1396,7 +1464,7 @@ class OpenAiSpeechEngine(
      *    排程失敗被吞（關閉後仍播放或無界掛起）。
      * 關閉冪等：多次 [shutdown] 安全，首輪後僅確保釋放、不再遞增世代。
      * 若底層 [player] 為 [AndroidAudioPlayer]，轉調其 `release()` 關閉內部
-     * release/timeout 背景池（兩池皆為 daemon，不關閉亦不阻塞 JVM 結束，但顯式關閉可避免測試累積閒置線程）。
+     * mute/release/timeout 背景池（三池皆為 daemon，不關閉亦不阻塞 JVM 結束，但顯式關閉可避免測試累積閒置線程）。
      * 非 AndroidAudioPlayer 實作則僅執行 [stop] fencing。
      */
     fun shutdown() {

@@ -115,6 +115,16 @@ class TurnControllerBudgetBenchmarkTest {
     override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
   }
 
+  /** Fat backend for the over-budget fail-closed test (mirrors ToolSliceTest FatBackend). */
+  private class BmFatBackend(private val symbols: List<LspTools.Symbol>) : LspTools.Backend {
+    val invocations = AtomicInteger(0)
+    override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+      invocations.incrementAndGet()
+      return symbols
+    }
+    override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+  }
+
   /** Slice assembly mirrors TurnControllerToolSliceTest.loop(): lsp switch on, ALLOW-all policy. */
   private fun sliceLoop(backend: LspTools.Backend, clock: Clock): SafeToolSlice =
     SafeToolSlice(
@@ -514,6 +524,169 @@ class TurnControllerBudgetBenchmarkTest {
       // Unbounded hydration still drops nothing at the window stage.
       assertEquals(0, c.droppedHistoryCount)
       assertEquals(0L, c.droppedHistoryChars)
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test(timeout = 30_000) fun requestTrimCharsPreciseReconciliationUnderCap() {
+    // Phase B (owner P2-2a): the >0 mirror above cannot catch a value-type
+    // error (e.g. a constant 1L). Same cap/5 fixture as
+    // requestTrimCharsMirrorTrimCountsUnderCap but with a fixed clock/zone so
+    // the time block is byte-deterministic, then an EXACT trim derivation via
+    // the droppedRows prefix-diff pattern (never a re-derived prod formula)
+    // plus the full reconciliation identity under non-zero trim.
+    val fixedClock = Clock.fixed(Instant.parse("2026-10-09T01:41:22Z"), ZoneId.of("UTC"))
+    val fixedZone = { ZoneId.of("UTC") }
+    val cap = TurnController.MAX_REQUEST_CHARS
+    val perRow = cap / 5
+    val history = (0 until 8).map { i ->
+      val role = if (i % 2 == 0) "user" else "assistant"
+      ChatMessage(role = role, text = "hist-$i: " + "x".repeat(perRow))
+    }
+    val liveText = "latest user: " + "y".repeat(perRow)
+    val provider = BmFakeProvider(doneOnce())
+    val c = controller(provider, history, HistoryWindowCap.Unbounded, clock = fixedClock, systemZone = fixedZone)
+    try {
+      runBlocking { c.send(liveText) }
+      val req = provider.seenRequests.single()
+      assertTrue("request must fit the cap", req.messages.sumOf { it.text.length } <= TurnController.MAX_REQUEST_CHARS)
+      // Reconstruct the pre-trim base with the REAL prod functions: the
+      // combined window (capped prefix + live-at-build, Unbounded so the cap
+      // is a no-op) plus the REAL time block prod suffixes to a copy of the
+      // last user row (same clock/userTimezone/sessionStart/zoneSupplier
+      // path as buildRequest; controller defaults userTimezone/sessionStart
+      // to null).
+      val combined = history + listOf(ChatMessage(role = "user", text = liveText))
+      val windowed = applyHistoryCap(combined, HistoryWindowCap.Unbounded)
+      val base = windowed.toMutableList()
+      val lastUser = base.indexOfLast { it.role == "user" }
+      assertTrue("fixture must carry a last user row", lastUser >= 0)
+      val block = buildRuntimeTimeContext(
+        clock = fixedClock,
+        userTimezone = null,
+        sessionStart = null,
+        zoneSupplier = fixedZone,
+      )
+      val timeDelta = ("\n\n" + block).length.toLong()
+      base[lastUser] = base[lastUser].copy(text = base[lastUser].text + "\n\n" + block)
+      // Head-trim derivation: the shipped request must be a suffix of the
+      // pre-trim base; the dropped head prefix is the actual trim.
+      val finalSize = req.messages.size
+      assertTrue("send-time trim must trip, base=${base.size} final=$finalSize", finalSize < base.size)
+      assertEquals(base.takeLast(finalSize), req.messages)
+      // maxDropLimit guard: the trim never contains the time-blocked
+      // last-user row — the newest row is always preserved.
+      assertEquals(base.last(), req.messages.last())
+      val droppedRows = base.take(base.size - finalSize)
+      val expectedCount = droppedRows.size
+      val expectedChars = droppedRows.sumOf { it.text.length.toLong() }
+      assertTrue("trim count must be non-zero, got $expectedCount", expectedCount > 0)
+      assertTrue("trim chars must be non-zero, got $expectedChars", expectedChars > 0)
+      // Precise mirror in both units (+ the StateFlow): a constant-1L
+      // value-type regression fails here while passing a >0 check.
+      assertEquals(expectedCount, c.lastRequestTrimmedCount)
+      assertEquals(expectedChars, c.lastRequestTrimmedChars)
+      assertEquals(expectedCount, c.requestTrimmedCount.value)
+      assertEquals(req.messages.sumOf { it.text.length }.toLong(), c.lastRequestChars)
+      // Unbounded hydration still drops nothing at the window stage.
+      assertEquals(0, c.droppedHistoryCount)
+      assertEquals(0L, c.droppedHistoryChars)
+      // Full reconciliation under non-zero trim (T2 pattern): the combined
+      // text plus the ephemeral delta equals dropped + trimmed + final.
+      val combinedChars = combined.sumOf { it.text.length.toLong() }
+      assertEquals(
+        combinedChars + timeDelta,
+        c.droppedHistoryChars + c.lastRequestTrimmedChars + c.lastRequestChars,
+      )
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test(timeout = 30_000) fun continuationOverBudgetRetainsBaseCells() {
+    // Phase B (owner P2-2b): the ContinuationOverBudgetException throw path
+    // must fail closed with a typed non-retryable terminal AND leave the
+    // char cells at the base request's published values (never shipped, so
+    // no continuation trim is ever added). Fixture mirrors
+    // TurnControllerToolSliceTest.continuationUntrimmableOverBudgetFailsClosedWithoutSending:
+    // a single near-admission-cap live user row (90k text fits the TEXT-basis
+    // admission, so the base needs no trim) plus a fat tool result; the
+    // conservative wire estimate (wrappers + escaping + envelope) pushes the
+    // newest-base-row + structured-round minimum over the cap with no trimmable
+    // prefix (base size 1), so the continuation throws instead of shipping.
+    val fixedClock = Clock.fixed(Instant.parse("2026-10-09T01:41:22Z"), ZoneId.of("UTC"))
+    val fixedZone = { ZoneId.of("UTC") }
+    val fatBackend = BmFatBackend(
+      (1..12).map {
+        LspTools.Symbol(
+          "\"".repeat(SafeToolSlice.MAX_STRING_CHARS),
+          "function",
+          "p".repeat(SafeToolSlice.MAX_STRING_CHARS),
+          it,
+        )
+      },
+    )
+    val provider = BmFakeProvider()
+    val c = controller(
+      provider,
+      history = emptyList(),
+      clock = fixedClock,
+      systemZone = fixedZone,
+      toolSlice = sliceLoop(fatBackend, fixedClock),
+    )
+    // Base cells observed at attempt stream time (the attempt ships with the
+    // tool offer; the continuation never ships, so these are the last
+    // published base values the throw path must retain).
+    var baseTrimmedCount = -1
+    var baseTrimmedChars = -1L
+    var baseLastChars = -1L
+    var baseFlow = -1
+    provider.handler = { _ ->
+      baseTrimmedCount = c.lastRequestTrimmedCount
+      baseTrimmedChars = c.lastRequestTrimmedChars
+      baseLastChars = c.lastRequestChars
+      baseFlow = c.requestTrimmedCount.value
+      flow {
+        emit(
+          StreamEvent.ToolDone(
+            toolIndex = 0,
+            id = "call-a",
+            name = "lsp.symbols",
+            argumentsJson = """{"query":"A"}""",
+          ),
+        )
+        emit(StreamEvent.Done("tool_calls"))
+      }
+    }
+    try {
+      runBlocking { c.send("a".repeat(90_000)) }
+      // Fail-closed terminal: non-retryable ERROR carrying the typed message
+      // (same observable signal as the ToolSliceTest fail-closed pins). No
+      // retry can shrink a history that only grows, so only the attempt
+      // request ever reaches the provider.
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      assertTrue(
+        "terminal must carry the typed over-budget message, got ${c.uiState.value.error}",
+        c.uiState.value.error.orEmpty().contains("over budget"),
+      )
+      assertEquals(1, fatBackend.invocations.get())
+      assertEquals(1, provider.seenRequests.size)
+      val attempt = provider.seenRequests.single()
+      assertEquals(listOf("lsp.symbols"), attempt.tools.map { it.name })
+      // The single-row base fits the TEXT-basis cap (admission-legal), so the
+      // base publishes zero trim; the wire-basis structured round is what
+      // breaches the cap at the untrimmable minimum.
+      assertEquals(0, baseTrimmedCount)
+      assertEquals(0L, baseTrimmedChars)
+      assertEquals(attempt.messages.sumOf { it.text.length }.toLong(), baseLastChars)
+      // Throw path retains the base values in every cell (count + chars +
+      // final + flow) — the continuation was never shipped.
+      assertEquals(baseTrimmedCount, c.lastRequestTrimmedCount)
+      assertEquals(baseTrimmedChars, c.lastRequestTrimmedChars)
+      assertEquals(baseLastChars, c.lastRequestChars)
+      assertEquals(baseFlow, c.requestTrimmedCount.value)
+      assertEquals(attempt.messages.sumOf { it.text.length }.toLong(), c.lastRequestChars)
     } finally {
       c.close()
     }

@@ -29,12 +29,20 @@ import kotlinx.coroutines.withContext
  *   `Failed(TRANSPORT)` 值回傳（fail-closed，允許非 pinned fallback），不 raw throw；
  *   `Error` 仍 `completeExceptionally` 後原樣拋出。
  * - 空 query 直接委派（`Unavailable(EMPTY_QUERY)`），不進 cache／in-flight 表。
+ * - 快取隔離：預設每個 Service 持有自有 [WebSearchCache]，不同 provider 的
+ *   Service 快取互相隔離；如需跨 provider／跨 Service 共用快取，請顯式傳入
+ *   同一 [WebSearchCache] 實例（key 內含 providerId，不會互撞）。
+ * - `inFlight` 未設硬上限：併發同 key 合流、不同 key 各一 deferred，
+ *   實際併發受上游 fetch timeouts 收斂；刻意不設上限以免引入等待正確性風險。
  */
 class WebSearchService(
     private val delegate: WebSearchProvider,
     private val cache: WebSearchCache = WebSearchCache(),
 ) {
     val providerId: String get() = delegate.id
+
+    /** 清空底層快取（委派至 `cache.clear()`）。 */
+    fun invalidate() = cache.clear()
 
     private val mutex = Mutex()
     private val inFlight = mutableMapOf<String, CompletableDeferred<WebSearchOutcome>>()
@@ -44,7 +52,7 @@ class WebSearchService(
         val n = WebSearchBudgets.countOf(count)
         val key = cache.key(delegate.id, query, n)
         while (true) {
-            cache.get(delegate.id, query, n)?.let { return it.copy(cached = true) }
+            cache.getByKey(key)?.let { return it.copy(cached = true) }
 
             val mine: CompletableDeferred<WebSearchOutcome>
             val leader: Boolean
@@ -77,7 +85,7 @@ class WebSearchService(
                 // 吞掉取消的壞 delegate：已取消仍回值時不得寫 cache。
                 currentCoroutineContext().ensureActive()
                 if (outcome is WebSearchOutcome.Ok) {
-                    cache.put(delegate.id, query, n, outcome)
+                    cache.putByKey(key, outcome)
                 }
                 mine.complete(outcome)
                 return outcome

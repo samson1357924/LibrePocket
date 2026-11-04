@@ -60,7 +60,7 @@ fun capResultsForModel(
             // 首筆 title 即超預算：只保留 title 前綴，snippet 清空。
             kept.add(r.copy(title = r.title.take(cap), snippet = ""))
         }
-        return CappedResults(kept, true)
+        return CappedResults(kept.toList(), true)
     }
-    return CappedResults(kept, false)
+    return CappedResults(kept.toList(), false)
 }

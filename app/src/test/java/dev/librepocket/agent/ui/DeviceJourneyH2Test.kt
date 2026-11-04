@@ -42,7 +42,6 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.emptyFlow
@@ -182,6 +181,17 @@ class DeviceJourneyH2Test {
             }
         }
         val transcripts = FakeSessionStore()
+        // Writer-drain hook (installed BEFORE send so every append fires on
+        // the writer thread; the events read inside is same-thread → no
+        // CME/visibility race, unlike the old cross-thread poll below).
+        val drained = CompletableDeferred<Unit>()
+        transcripts.onAppended = {
+            if (transcripts.events.count { it.kind == "user" || it.kind == "assistant" } >= 2 &&
+                !drained.isCompleted
+            ) {
+                drained.complete(Unit)
+            }
+        }
         val factory = ChatSessionFactory(
             policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
@@ -204,12 +214,10 @@ class DeviceJourneyH2Test {
         // 訊息，重開後為空，故以 messages.size == 2 為條件）。
         val sid = checkNotNull(chatVm.currentSessionId.value) { "first send must create session" }
         assertTrue(transcripts.metas.containsKey(sid))
-        // Writer-drain poll: FakeSessionStore.events is a plain ArrayList with no Flow seam, so a condition wait
-        // is impossible without a prod seam.
-        // Bounded 10s; drains in ms in practice.
-        withTimeout(10_000) {
-            while (transcripts.events.count { it.kind == "user" || it.kind == "assistant" } < 2) delay(5)
-        }
+        // Writer-drain via the onAppended hook (installed pre-send above):
+        // the hook fires on the writer thread, so the count read is
+        // same-thread. Bounded 10s; drains in ms in practice.
+        withTimeout(10_000) { drained.await() }
         val vm2 = chatStores.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm2.openSession(sid) }
         withTimeout(10_000) { vm2.messages.first { it.size == 2 } }

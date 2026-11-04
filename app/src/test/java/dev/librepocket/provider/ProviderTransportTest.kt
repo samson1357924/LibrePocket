@@ -1980,6 +1980,14 @@ class ProviderTransportTest {
             )
             assertEquals(-1L, signals.stalledSeq.get())
             assertEquals(1, server.requestCount)
+            // Arming post-completion (empty inFlight) must never unlock —
+            // stronger than never-arming: even an armed monitor with no
+            // in-flight reads must not count down targetStall.
+            signals.armStallWatch()
+            assertFalse(
+                "armed-after-recovery must not fire with no in-flight reads",
+                withContext(Dispatchers.IO) { signals.targetStall.await(1_500, TimeUnit.MILLISECONDS) },
+            )
         } finally {
             signals.closeStallMonitor()
             server.shutdown()

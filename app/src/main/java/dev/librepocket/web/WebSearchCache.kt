@@ -62,6 +62,7 @@ class WebSearchCache(
 
     internal fun getByKey(k: String): WebSearchOutcome.Ok? {
         val entry: Entry?
+        // Collections.synchronizedMap: compound get-check-remove + iteration require external synchronized(map).
         synchronized(map) {
             entry = map[k]
             if (entry != null && clockMs() >= entry.expiresAt) {

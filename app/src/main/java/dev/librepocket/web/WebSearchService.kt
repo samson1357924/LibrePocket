@@ -60,7 +60,7 @@ class WebSearchService(
     fun invalidate() = cache.clear()
 
     private val mutex = Mutex()
-    private val inFlight = mutableMapOf<String, CompletableDeferred<WebSearchOutcome>>()
+    private val inFlight: MutableMap<String, CompletableDeferred<WebSearchOutcome>> = mutableMapOf()
 
     override suspend fun search(query: String, count: Int): WebSearchOutcome {
         if (query.isBlank()) return delegate.search(query, count)

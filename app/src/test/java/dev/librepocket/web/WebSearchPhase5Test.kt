@@ -737,4 +737,15 @@ class WebSearchPhase5Test {
                 DdgsSearchProvider(fake, "https://a/X").cacheNamespace,
         )
     }
+
+    @Test fun buildUrlSpaceEncodesAsPlus() {
+        // Regression pin: query uses form encoding (+ for space), not %20.
+        val fake = WebHttpGet { _, _ -> WebHttpResponse(200, "") }
+        val ddgs = DdgsSearchProvider(fake).buildUrl("a b")
+        assertNotNull(ddgs)
+        assertTrue(ddgs!!.contains("q=a+b"))
+        val searxng = SearxngSearchProvider("https://search.example", fake).buildUrl("a b")
+        assertNotNull(searxng)
+        assertTrue(searxng!!.contains("q=a+b"))
+    }
 }

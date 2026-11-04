@@ -70,11 +70,13 @@ class SearxngSearchProvider(
     }
 
     /**
-     * 快取命名空間用的正規化 base（scheme＋host 小寫、path 保大小寫；
+     * 快取命名空間用的正規化 base（scheme＋host 小寫、raw path 保大小寫＋保編碼；
      * 解析失敗回 raw trimmed；尾 `/` 已去。
      * Explicit default ports (:443/:80) are NOT canonicalized (kept as distinct namespaces —
      * safe direction: extra upstream, never cross-hit); userinfo/query/fragment are dropped
      * because buildUrl rejects such shapes）。
+     * Raw (encoded) path is used so equivalent-decoding paths (e.g. `%2F` vs `/`,
+     * `%41` vs `A`) stay isolated (safe direction: extra upstream, never cross-hit)。
      */
     private fun normalizedBase(): String {
         val raw = baseUrl.trim().trimEnd('/')
@@ -83,7 +85,7 @@ class SearxngSearchProvider(
             val scheme = uri.scheme?.lowercase() ?: return raw
             val host = uri.host?.lowercase() ?: return raw
             val port = if (uri.port != -1) ":${uri.port}" else ""
-            val path = uri.path.orEmpty()
+            val path = uri.rawPath.orEmpty()
             "$scheme://$host$port$path"
         } catch (_: Exception) {
             raw

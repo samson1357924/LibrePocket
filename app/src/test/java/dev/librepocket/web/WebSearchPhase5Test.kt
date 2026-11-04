@@ -775,4 +775,52 @@ class WebSearchPhase5Test {
         assertFalse(third.cached)
         assertEquals(1, httpB.calls.get())
     }
+
+    @Test fun searxngNamespaceEncodedPathIsolated() {
+        val fake = WebHttpGet { _, _ -> WebHttpResponse(200, "") }
+        assertTrue(
+            SearxngSearchProvider("https://search.example/tenant%2Fprivate", fake).cacheNamespace !=
+                SearxngSearchProvider("https://search.example/tenant/private", fake).cacheNamespace,
+        )
+        assertTrue(
+            SearxngSearchProvider("https://search.example/%41", fake).cacheNamespace !=
+                SearxngSearchProvider("https://search.example/A", fake).cacheNamespace,
+        )
+    }
+
+    @Test fun ddgsNamespaceEncodedPathIsolated() {
+        val fake = WebHttpGet { _, _ -> WebHttpResponse(200, "") }
+        assertTrue(
+            DdgsSearchProvider(fake, "https://search.example/tenant%2Fprivate").cacheNamespace !=
+                DdgsSearchProvider(fake, "https://search.example/tenant/private").cacheNamespace,
+        )
+        assertTrue(
+            DdgsSearchProvider(fake, "https://search.example/%41").cacheNamespace !=
+                DdgsSearchProvider(fake, "https://search.example/A").cacheNamespace,
+        )
+    }
+
+    @Test fun sharedCacheDifferentPathsIsolated() = runBlocking {
+        val jsonA = """{"results":[{"title":"A","url":"https://a.example/","content":"sa"}]}"""
+        val jsonB = """{"results":[{"title":"B","url":"https://b.example/","content":"sb"}]}"""
+        val httpA = FakeHttp { WebHttpResponse(200, jsonA) }
+        val httpB = FakeHttp { WebHttpResponse(200, jsonB) }
+        val cache = WebSearchCache()
+        val svcA = WebSearchService(SearxngSearchProvider("https://search.example/tenant%2Fprivate", httpA), cache)
+        val svcB = WebSearchService(SearxngSearchProvider("https://search.example/tenant/private", httpB), cache)
+        val outA = svcA.search("q", 5) as WebSearchOutcome.Ok
+        assertFalse(outA.cached)
+        assertEquals(1, httpA.calls.get())
+        // Same query+count on an equivalent-decoding path must NOT cross-hit.
+        val outB = svcB.search("q", 5) as WebSearchOutcome.Ok
+        assertFalse(outB.cached)
+        assertEquals(1, httpB.calls.get())
+        assertTrue(outA.results.single().url.contains("a.example"))
+        assertTrue(outB.results.single().url.contains("b.example"))
+        // Repeat A → cached, no new upstream.
+        val againA = svcA.search("q", 5) as WebSearchOutcome.Ok
+        assertTrue(againA.cached)
+        assertEquals(1, httpA.calls.get())
+        assertEquals(1, httpB.calls.get())
+    }
 }

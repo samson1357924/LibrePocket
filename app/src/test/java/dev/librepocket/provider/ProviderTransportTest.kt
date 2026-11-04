@@ -42,6 +42,7 @@ import org.junit.Assert.fail
 import org.junit.Test
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -49,7 +50,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -283,6 +283,7 @@ class ProviderTransportTest {
     /** Counts bytes consumed at the client ResponseBody source boundary, not bytes the server queued. */
     private class ResponseBodyReadSignals {
         val consumedBytes = AtomicLong()
+        val thresholdReached = CompletableDeferred<Unit>()
         val readEntered = CountDownLatch(1)
         // GENERATION-SCOPED stall witness (P1-2 fix): the old monotonic
         // stallEntered fired for ANY read blocked >1s — GC/scheduler jitter
@@ -402,7 +403,10 @@ class ProviderTransportTest {
                             inFlight[seq] = System.nanoTime()
                             try {
                                 val read = super.read(sink, byteCount)
-                                if (read > 0L) consumedBytes.addAndGet(read)
+                                if (read > 0L) {
+                                    consumedBytes.addAndGet(read)
+                                    if (consumedBytes.get() >= MODEL_LIST_BODY_LIMIT_BYTES - 64 * 1024) thresholdReached.complete(Unit)
+                                }
                                 return read
                             } finally {
                                 inFlight.remove(seq)
@@ -1889,12 +1893,11 @@ class ProviderTransportTest {
                 job = active
                 // Pre-step: first-period delivery evidence only. Reaching
                 // CAP-64KiB proves bytes flowed, NOT that the read is stalled
-                // (up to ~64KiB+framing may still be in flight). Note: the
-                // threshold poll below still uses delay polling — this file is
-                // not fully sleep-free.
-                // S7 residual: threshold-poll delay(50) stays (AtomicLong has no Flow; converting signals to StateFlow would touch 15+ tests — deferred).
+                // (up to ~64KiB+framing may still be in flight). The
+                // thresholdReached gate fires in read() exactly when the old
+                // threshold poll would exit — same bound (20s), no polling.
                 withTimeout(20_000) {
-                    while (signals.consumedBytes.get() < MODEL_LIST_BODY_LIMIT_BYTES - 64 * 1024) delay(50)
+                    signals.thresholdReached.await()
                 }
                 // Negative control: a single source.read() blocked longer than
                 // STALL_READ_THRESHOLD_MS proves the Job is parked inside a

@@ -429,8 +429,9 @@ class SetupEditBoundaryAndBarrierTest {
         // finally that cancels/joins the scope. (Residual: same-instant
         // conflated writes could still merge upstream — accepted.)
         val seen = Collections.synchronizedList(mutableListOf<Any>())
+        val firstSeen = CompletableDeferred<Unit>()
         val histScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        histScope.launch { vm.form.collect { seen.add(it.modelOptions.toList()) } }
+        histScope.launch { vm.form.collect { seen.add(it.modelOptions.toList()); firstSeen.complete(Unit) } }
         // Release slow AFTER B published so slow always finishes last:
         // pre-barrier overwrites with slow-r (RED), post-barrier discards
         // and the terminal stays fast-only (GREEN).
@@ -448,8 +449,10 @@ class SetupEditBoundaryAndBarrierTest {
         try {
             // Handshake（try 內第一句，超時亦走下方 finally）：等 collector 已觀測到
             // B 終值才放行 A；否則放行＋A 整段寫回可能搶在 collector 首次發射前完成（空洞釘）。
-            // seen 為 plain synchronized list（collector 推入）故須 poll；bounded 10s，B-terminal 後首個發射即時到達。
-            withTimeout(10_000) { while (seen.isEmpty()) delay(5) }
+            // seen 為 plain synchronized list（collector 推入）；firstSeen 閘於
+            // collector 首次發射時觸發，取代舊 poll。同為防空洞目的；
+            // bounded 10s，B-terminal 後首個發射即時到達。
+            withTimeout(10_000) { firstSeen.await() }
             fake.release.countDown()
             val aCoroutine = withTimeout(10_000) { fake.aJob.await() }
             // join() never throws, even on cancelled completion — the 15s

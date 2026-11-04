@@ -24,7 +24,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collect
@@ -308,8 +307,9 @@ class SetupEditKeepExistingTest {
         // finally that cancels/joins the scope. (Residual: same-instant
         // conflated writes could still merge upstream — accepted.)
         val seen = Collections.synchronizedList(mutableListOf<Any?>())
+        val firstSeen = CompletableDeferred<Unit>()
         val histScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        histScope.launch { vm.form.collect { seen.add(it.testModels) } }
+        histScope.launch { vm.form.collect { seen.add(it.testModels); firstSeen.complete(Unit) } }
         // Release slow AFTER B published so slow always finishes last:
         // pre-guard overwrites to 5 (RED), post-guard discards to 2 (GREEN).
         // Completion proof is the [SlowThenFastListProvider.aJob] join below:
@@ -328,9 +328,11 @@ class SetupEditKeepExistingTest {
             // finally below): wait until the collector has observed B-terminal
             // before releasing A; otherwise release + A's whole writeback could
             // complete before the collector's first emission (vacuous pin).
-            // seen is a plain synchronized list (collector pushes), hence poll; bounded 10s, first emission immediate
-            // post-B-terminal in practice.
-            withTimeout(10_000) { while (seen.isEmpty()) delay(5) }
+            // seen is a plain synchronized list (collector pushes); the firstSeen
+            // gate fires on the collector's first emission, replacing the old
+            // poll. Same anti-vacuous purpose; bounded 10s, first emission
+            // immediate post-B-terminal in practice.
+            withTimeout(10_000) { firstSeen.await() }
             fake.release.countDown()
             val aCoroutine = withTimeout(10_000) { fake.aJob.await() }
             // join() never throws, even on cancelled completion — the 15s

@@ -84,10 +84,22 @@ class VerificationMetadataTest(unittest.TestCase):
                 missing.append(f"{pkg['group']}:{pkg['name']}:{pkg['version']}")
         skipped: list[str] = list(warnings)
         self.assertEqual(missing, [], f"catalog direct deps missing from verification: {missing}")
-        # The BOM-managed skip set is part of the gate contract: if it ever
-        # becomes empty (all libs versioned) or grows unexpectedly, this
-        # assertion forces a conscious review of the skip list.
-        self.assertGreater(len(skipped), 0, "expected at least one BOM-managed skip")
+        # The BOM-managed skip set is part of the gate contract, pinned as
+        # an exact allowlist: any drift (an 8th unversioned entry, or a
+        # newly versioned compose alias) forces a conscious review of
+        # EXPECTED_UNVERSIONED_KEYS in scripts/osv_scan.py.
+        skipped_keys = {
+            w.split("skip ", 1)[1].split(":")[0].strip() for w in skipped
+        }
+        self.assertEqual(
+            skipped_keys, set(osv_scan.EXPECTED_UNVERSIONED_KEYS),
+            f"BOM skip set drifted: got {sorted(skipped_keys)}, "
+            f"want {sorted(osv_scan.EXPECTED_UNVERSIONED_KEYS)}",
+        )
+        self.assertEqual(
+            len(skipped), len(osv_scan.EXPECTED_UNVERSIONED_KEYS),
+            "one warning per skipped entry",
+        )
 
     def test_loosened_configuration_rejected(self):
         base = load_metadata()

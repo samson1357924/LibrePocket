@@ -76,6 +76,22 @@ RETRIES_MIN, RETRIES_MAX = 0, 5
 RETRYABLE_OSV_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 USER_AGENT = "LibrePocket-osv-scan/1.0 (+monitor-only)"
 
+# Expected BOM-managed libraries with no catalog version (compose-bom).
+# These 7 aliases intentionally carry no ``version``/``version.ref`` in
+# ``gradle/libs.versions.toml`` because compose-bom pins their versions.
+# Any other version-less ``[libraries]`` entry fails closed (RuntimeError,
+# exit 2). Adding a new BOM-managed dependency requires updating this set
+# after conscious review (and the regression tests that pin it).
+EXPECTED_UNVERSIONED_KEYS: frozenset[str] = frozenset({
+    "compose-ui",
+    "compose-ui-tooling-preview",
+    "compose-foundation",
+    "compose-material3",
+    "compose-material-icons",
+    "compose-ui-test-junit4",
+    "compose-ui-test-manifest",
+})
+
 
 def fail(message: str) -> int:
     print(f"osv_scan: ERROR: {message}", file=sys.stderr)
@@ -210,7 +226,17 @@ def parse_catalog(catalog: Path) -> tuple[list[dict[str, str]], list[str], int]:
         ):
             group, name = entry["group"], entry["name"]
         if "version" not in entry:
-            # No version information at all: BOM-managed, skip with warning.
+            # No version information at all: only the known BOM-managed
+            # allowlist may skip with a warning; any other unversioned
+            # library fails closed so new coverage gaps force review.
+            if key not in EXPECTED_UNVERSIONED_KEYS:
+                raise RuntimeError(
+                    f"unexpected unversioned library '{key}': no version "
+                    f"information in catalog (expected BOM-managed keys: "
+                    f"{sorted(EXPECTED_UNVERSIONED_KEYS)}; if this is a new "
+                    f"BOM-managed dependency, add its key to "
+                    f"EXPECTED_UNVERSIONED_KEYS after conscious review)"
+                )
             if key and group is not None:
                 warnings.append(f"skip {key}: {group}:{name}: no version (BOM-managed?)")
             else:

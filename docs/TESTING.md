@@ -868,7 +868,10 @@ git diff --stat
 # (default 2, total attempts = 1 + retries); header/JSON summary include the
 # skipped (BOM-managed, version unknown) count; catalog parsing accepts
 # group+name, module = "group:name", and "group:name:version" shorthand,
-# failing closed (exit 2) on malformed versioned entries; exit 0 = clean,
+# failing closed (exit 2) on malformed versioned entries; the 7 named BOM
+# skips are pinned as the EXPECTED_UNVERSIONED_KEYS allowlist (any other
+# unversioned library fails closed) and adding a new BOM-managed dependency
+# requires updating that set after conscious review; exit 0 = clean,
 # 1 = vuln found (monitor signal), 2 = fail-closed error):
 python3 -P scripts/osv_scan.py --format json --output /tmp/osv-report.json
 

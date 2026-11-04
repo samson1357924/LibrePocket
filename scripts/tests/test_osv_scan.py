@@ -27,7 +27,7 @@ bar = "2.0.0"
 [libraries]
 foo-lib = { group = "com.example", name = "foo", version.ref = "foo" }
 bar-lib = { group = "com.example", name = "bar", version.ref = "bar" }
-bom-managed = { group = "androidx.compose.ui", name = "ui" }
+compose-ui = { group = "androidx.compose.ui", name = "ui" }
 """
 
 EMPTY_TOML = """\
@@ -35,7 +35,7 @@ EMPTY_TOML = """\
 foo = "1.0.0"
 
 [libraries]
-bom-managed = { group = "androidx.compose.ui", name = "ui" }
+compose-ui = { group = "androidx.compose.ui", name = "ui" }
 """
 
 
@@ -254,6 +254,19 @@ class OsvScanTest(unittest.TestCase):
         self.assertIn("package(s) scanned", proc.stdout)
         # BOM-managed compose entries must be skipped with a warning.
         self.assertIn("BOM-managed", proc.stderr)
+
+    def test_unknown_unversioned_library_fails_closed(self):
+        # An 8th unversioned entry outside EXPECTED_UNVERSIONED_KEYS must
+        # fail closed (exit 2), not silently join the BOM skip set.
+        toml = FAKE_TOML + 'mystery = { group = "com.example", name = "mystery" }\n'
+        with tempfile.TemporaryDirectory() as td:
+            catalog = self.write_catalog(Path(td), content=toml)
+            proc = self.run_scan("--catalog", str(catalog), "--osv-url", self.url)
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn("ERROR", proc.stderr)
+            self.assertIn("unexpected unversioned", proc.stderr)
+            self.assertIn("mystery", proc.stderr)
+            self.assertNotIn("package(s) scanned", proc.stdout)
 
     def test_module_notation_queried_and_affected(self):
         FakeOsvHandler.mode = "vuln"

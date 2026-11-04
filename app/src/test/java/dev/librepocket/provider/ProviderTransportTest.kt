@@ -3,6 +3,7 @@ package dev.librepocket.provider
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.util.concurrent.Callable
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
@@ -283,17 +284,106 @@ class ProviderTransportTest {
     private class ResponseBodyReadSignals {
         val consumedBytes = AtomicLong()
         val readEntered = CountDownLatch(1)
-        // STALL-ENTRY witness: counted down when a single source.read() stays
-        // in-flight longer than STALL_READ_THRESHOLD_MS. A daemon watchdog per
-        // read fires only while that read is still blocked, so awaiting this
-        // latch proves the Job is parked inside a stalled socket read (not
-        // merely mid-download). Threshold 1_000ms is far above localhost
-        // normal read latency (sub-ms..low-ms) yet far below the 5s throttle
-        // period in the stall test, so a healthy stream never trips it while a
-        // truly stalled read always does — long before the 5min readTimeout.
-        val stallEntered = CountDownLatch(1)
+        // GENERATION-SCOPED stall witness (P1-2 fix): the old monotonic
+        // stallEntered fired for ANY read blocked >1s — GC/scheduler jitter
+        // or pre-cap recovered stalls included — with no byte-offset or
+        // generation, so the after-cap await passed without proving the
+        // CURRENT read was stalled at cancel time. The new witness is
+        // generation-scoped and explicitly armed:
+        //  - each read() entry takes a generation seq (readSeq++) and
+        //    registers inFlight[seq]=startNanos; the finally removes it. A
+        //    seq still present in inFlight is provably the same blocked read,
+        //    not a later recovered one.
+        //  - armStallWatch() is called by the test only AFTER the
+        //    consumedBytes threshold poll (i.e. after the cap is reached).
+        //    Before arming, the single monitor thread never starts, so early
+        //    recovered stalls can never fire targetStall (see the
+        //    earlyRecoveredStall negative control).
+        //  - the monitor polls every ~100ms: if armed and some in-flight
+        //    read age exceeds STALL_READ_THRESHOLD_MS, it atomically records
+        //    (stalledSeq, bytesAtStall=consumedBytes at fire time) and counts
+        //    down targetStall, then exits. bytesAtStall is read at fire time
+        //    (cheap volatile read; no per-read byte snapshot needed) — valid
+        //    because the server is silent during the gap, so any byte
+        //    progress between fire and cancel is itself caught by the
+        //    pre-cancel re-verification below.
+        //  - P2 thread-spike fix: ONE lazy daemon thread per signals
+        //    instance, started on first arm; the tests that never arm never
+        //    start it (zero new threads for them). closeStallMonitor()
+        //    stops it; called in stall-test finally blocks.
+        // Threshold 1_000ms is far above localhost normal read latency
+        // (sub-ms..low-ms) yet far below the 5s throttle period / 5min
+        // readTimeout used in the stall test, so a healthy stream never
+        // trips it while a truly stalled read always does — long before the
+        // 5min readTimeout.
+        val targetStall = CountDownLatch(1)
+        val stalledSeq = AtomicLong(-1)
+        val bytesAtStall = AtomicLong(-1)
+
+        private val readSeq = AtomicLong(0)
+        private val inFlight = ConcurrentHashMap<Long, Long>()
+        private val stallArmed = AtomicBoolean(false)
+        private val stallFired = AtomicBoolean(false)
+        private val monitorDone = AtomicBoolean(false)
+
+        @Volatile
+        private var monitorThread: Thread? = null
 
         val calls = CallSignals()
+
+        /** Arm the stall witness after the after-cap threshold is reached. Starts the single monitor lazily. */
+        fun armStallWatch() {
+            stallArmed.set(true)
+            startMonitorOnce()
+        }
+
+        /** True iff generation [seq] is still blocked inside read(). */
+        fun isStillInFlight(seq: Long): Boolean = inFlight.containsKey(seq)
+
+        fun closeStallMonitor() {
+            monitorDone.set(true)
+            monitorThread?.interrupt()
+        }
+
+        private fun startMonitorOnce() {
+            synchronized(this) {
+                if (monitorThread != null) return
+                val t = Thread({
+                    try {
+                        while (!monitorDone.get()) {
+                            if (stallArmed.get() && !stallFired.get()) {
+                                val now = System.nanoTime()
+                                var candidate: Long? = null
+                                for ((seq, startNanos) in inFlight.entries) {
+                                    if (TimeUnit.NANOSECONDS.toMillis(now - startNanos) > STALL_READ_THRESHOLD_MS) {
+                                        candidate = seq
+                                        break
+                                    }
+                                }
+                                if (candidate != null) {
+                                    if (stallFired.compareAndSet(false, true)) {
+                                        stalledSeq.set(candidate)
+                                        bytesAtStall.set(consumedBytes.get())
+                                        targetStall.countDown()
+                                    }
+                                    return@Thread
+                                }
+                            }
+                            try {
+                                Thread.sleep(100)
+                            } catch (_: InterruptedException) {
+                                return@Thread
+                            }
+                        }
+                    } catch (_: InterruptedException) {
+                        // Test teardown: leave the latch uncounted.
+                    }
+                }, "stall-monitor")
+                t.isDaemon = true
+                monitorThread = t
+                t.start()
+            }
+        }
 
         private val countingInterceptor = object : Interceptor {
             override fun intercept(chain: Interceptor.Chain): Response {
@@ -305,32 +395,17 @@ class ProviderTransportTest {
                             // Entry latch: count down before the blocking delegate read so
                             // cancellation tests can prove the Job was inside source.read().
                             readEntered.countDown()
-                            // Arm a stall watchdog for this read only. It counts
-                            // down stallEntered iff this exact read is still
-                            // blocked after the threshold; fast reads finish in
-                            // ms, mark done, and the watchdog becomes a no-op.
-                            // Daemon threads are fire-and-forget: no executor
-                            // lifecycle to leak into other tests, and the only
-                            // observable behavior change is the extra latch.
-                            // Lifecycle: each watchdog auto-exits ~1s after its read returns (sleep+flag check), daemon so never blocks JVM exit,
-                            // count bounded by read count (transient), no @After/teardown needed.
-                            val readDone = AtomicBoolean(false)
-                            val watchdog = Thread {
-                                try {
-                                    Thread.sleep(STALL_READ_THRESHOLD_MS)
-                                    if (!readDone.get()) stallEntered.countDown()
-                                } catch (_: InterruptedException) {
-                                    // Test teardown: leave the latch uncounted.
-                                }
-                            }
-                            watchdog.isDaemon = true
-                            watchdog.start()
+                            // Generation scoping: register this read generation;
+                            // the finally unregisters it, so presence in
+                            // inFlight proves the SAME read is still blocked.
+                            val seq = readSeq.incrementAndGet()
+                            inFlight[seq] = System.nanoTime()
                             try {
                                 val read = super.read(sink, byteCount)
                                 if (read > 0L) consumedBytes.addAndGet(read)
                                 return read
                             } finally {
-                                readDone.set(true)
+                                inFlight.remove(seq)
                             }
                         }
                     }.buffer()
@@ -1823,14 +1898,33 @@ class ProviderTransportTest {
                 }
                 // Negative control: a single source.read() blocked longer than
                 // STALL_READ_THRESHOLD_MS proves the Job is parked inside a
-                // stalled socket read. Cancelling before this latch fires (a
-                // mid-download cancel) now fails here instead of passing
-                // vacuously downstream via CancellationException +
-                // assertCallCancelled. Bound 15s = 5s throttle period + slack
-                // for the 1s witness threshold and CI jitter.
+                // stalled socket read — but ONLY for the CURRENT generation:
+                // the witness is armed after the cap threshold above, so
+                // pre-cap recovered stalls can never fire it. Cancelling
+                // before this latch fires (a mid-download cancel) now fails
+                // here instead of passing vacuously downstream via
+                // CancellationException + assertCallCancelled. Bound 15s = 5s
+                // throttle period + slack for the 1s witness threshold and CI
+                // jitter.
+                signals.armStallWatch()
                 assertTrue(
                     "$protocol read must be stalled before cancel",
-                    withContext(Dispatchers.IO) { signals.stallEntered.await(15, TimeUnit.SECONDS) },
+                    withContext(Dispatchers.IO) { signals.targetStall.await(15, TimeUnit.SECONDS) },
+                )
+                // Generation-scoped re-verification (P1-2): the SAME read
+                // generation must still be blocked with zero byte progress
+                // since the witness fired. The server is silent during the
+                // throttle gap and cancel follows in ms, so any progress here
+                // means the witness fired for a recovered read and the gate
+                // must not pass.
+                assertTrue(
+                    "$protocol stalled generation still in flight at cancel time",
+                    signals.isStillInFlight(signals.stalledSeq.get()),
+                )
+                assertEquals(
+                    "$protocol no byte progress since stall witness fired",
+                    signals.bytesAtStall.get(),
+                    signals.consumedBytes.get(),
                 )
                 check(active.isActive) { "stall job must still be active before cancel" }
                 withTimeout(1_500) { active.cancelAndJoin() }
@@ -1844,10 +1938,48 @@ class ProviderTransportTest {
                 assertReadWithinBudget(signals, MODEL_LIST_BODY_LIMIT_BYTES, "$protocol stalled chunked body")
                 assertEquals("$protocol stalled body remains one request", 1, server.requestCount)
             } finally {
+                signals.closeStallMonitor()
                 job?.cancel()
                 server.shutdown()
                 job?.let { active -> withTimeoutOrNull(1_500) { active.join() } }
             }
+        }
+    }
+
+    @Test
+    fun earlyRecoveredStallDoesNotUnlockAfterCapGate() = runBlocking {
+        // Negative control for the generation-scoped witness: a SMALL
+        // under-cap body with >1s mid-body throttle gaps that still
+        // completes. The monitor is NEVER armed here (arming applies only
+        // after the after-cap threshold, which this under-cap body never
+        // reaches), so targetStall must never fire despite reads blocked
+        // >1s mid-download. This proves early recovered stalls cannot unlock
+        // the after-cap gate.
+        val server = MockWebServer()
+        val signals = ResponseBodyReadSignals()
+        server.start()
+        try {
+            val body = modelListJsonWithExactBytes(256 * 1024)
+            server.enqueue(
+                MockResponse()
+                    .setChunkedBody(body, 8192)
+                    .throttleBody(128 * 1024, 1500, TimeUnit.MILLISECONDS),
+            )
+            val models = withTimeout(30_000) {
+                providerFor(ProviderProtocol.CHAT_COMPLETIONS, server, signals.client()).listModels()
+            }
+            assertEquals(listOf("budget-model"), models)
+            // Body done: a 500ms bound suffices — an unarmed monitor has no
+            // thread at all, so nothing can count down.
+            assertFalse(
+                "unarmed witness must never fire despite >1s mid-body gaps",
+                withContext(Dispatchers.IO) { signals.targetStall.await(500, TimeUnit.MILLISECONDS) },
+            )
+            assertEquals(-1L, signals.stalledSeq.get())
+            assertEquals(1, server.requestCount)
+        } finally {
+            signals.closeStallMonitor()
+            server.shutdown()
         }
     }
 

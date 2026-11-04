@@ -3482,4 +3482,202 @@ class OpenAiSpeechEngineTest {
         player.stop()
         player.release()
     }
+
+    // ---- Stage-B 第三輪 P2-1：並發 double-shutdown（CAS 與 stop 間 barrier） ----
+    @Test
+    fun shutdown_concurrentDoubleShutdown_releaseNeverBeforeStopEnqueue_noFallback() {
+        val testMp = TestMediaPlayer()
+        val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp }, prepareTimeoutMs = 5000L)
+        val engine = OpenAiSpeechEngine(player = player)
+        val enteredBarrier = CountDownLatch(1)
+        val unblockFirst = CountDownLatch(1)
+        engine.shutdownPauseForTest = { stage ->
+            if (stage == "after-cas") {
+                enteredBarrier.countDown()
+                unblockFirst.await(5, TimeUnit.SECONDS)
+            }
+        }
+        try {
+            val firstDone = CountDownLatch(1)
+            var firstEx: Throwable? = null
+            val firstThread = Thread({
+                try {
+                    engine.shutdown()
+                } catch (t: Throwable) {
+                    firstEx = t
+                } finally {
+                    firstDone.countDown()
+                }
+            }, "test-shutdown-first")
+            firstThread.isDaemon = true
+            firstThread.start()
+
+            assertTrue("first shutdown must reach after-cas barrier", enteredBarrier.await(5, TimeUnit.SECONDS))
+            // 首輪暫停於 CAS 與 stop 之間（持 shutdownLock）：池尚未關閉，stop 尚未 enqueue。
+            assertFalse("pools must not be shutdown while first paused", player.isPoolsShutdownForTest())
+            assertTrue("stop must not be enqueued while first paused", !player.testEventLog.contains("stop-enqueued"))
+
+            val secondDone = CountDownLatch(1)
+            var secondEx: Throwable? = null
+            val secondThread = Thread({
+                try {
+                    engine.shutdown()
+                } catch (t: Throwable) {
+                    secondEx = t
+                } finally {
+                    secondDone.countDown()
+                }
+            }, "test-shutdown-second")
+            secondThread.isDaemon = true
+            secondThread.start()
+            // 第二 caller 必須阻塞等待首輪 fencing（ms 級），不可提前關池、不可提前返回。
+            Thread.sleep(300)
+            assertTrue("second shutdown must block until first fencing completes", secondThread.isAlive)
+            assertFalse("second must not close pools before first stop enqueue", player.isPoolsShutdownForTest())
+            assertEquals("no fallback before ordering fixed", 0, player.muteFallbackCount.get())
+            assertEquals("no fallback before ordering fixed", 0, player.releaseFallbackCount.get())
+
+            // 放行首輪：完成 fencing + stop enqueue + CLOSED + release。
+            unblockFirst.countDown()
+            assertTrue("first shutdown must complete", firstDone.await(5, TimeUnit.SECONDS))
+            assertTrue("second shutdown must complete after first", secondDone.await(5, TimeUnit.SECONDS))
+            firstThread.join(5000)
+            secondThread.join(5000)
+            assertNull("first shutdown must not throw, was $firstEx", firstEx)
+            assertNull("second shutdown must not throw, was $secondEx", secondEx)
+
+            val log = player.testEventLog.toList()
+            val stopIdx = log.indexOf("stop-enqueued")
+            val poolIdx = log.indexOf("pools-shutdown")
+            assertTrue("log must contain stop-enqueued, was $log", stopIdx >= 0)
+            assertTrue("log must contain pools-shutdown, was $log", poolIdx >= 0)
+            assertTrue("release must not close pools before stop enqueue, log=$log", stopIdx < poolIdx)
+            // 有序關閉不應觸發任何 rejected fallback（呼叫線程永不執行 native）。
+            assertEquals("mute fallback must be 0, log=$log", 0, player.muteFallbackCount.get())
+            assertEquals("release fallback must be 0, log=$log", 0, player.releaseFallbackCount.get())
+
+            // 冪等且非阻塞：額外 shutdown 有界返回（await 已在背景，不卡 UI）。
+            val t0 = System.nanoTime()
+            engine.shutdown()
+            val elapsedMs = (System.nanoTime() - t0) / 1_000_000
+            assertTrue("idempotent shutdown must be bounded (<1000ms), elapsed=${elapsedMs}ms", elapsedMs < 1000)
+        } finally {
+            engine.shutdownPauseForTest = null
+            try {
+                player.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    // ---- Stage-B 第三輪 P2-2b：PREPARING 中直接 release，play 明確 fail-fast 不永懸 ----
+    @Test
+    fun androidAudioPlayer_releaseDuringPreparing_failsFastWithoutHangOrStart() = runBlocking {
+        val testMp = TestMediaPlayer()
+        // 15s 超時：若 release 未 fence（舊行為 shutdownNow 取消 timer 無 callback），play 將懸掛 15s。
+        val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp }, prepareTimeoutMs = 15_000L)
+        try {
+            var playEx: Throwable? = null
+            val job = launch(Dispatchers.IO) {
+                try {
+                    player.play(byteArrayOf(0x01, 0x02))
+                } catch (e: Throwable) {
+                    playEx = e
+                }
+            }
+            // 等待進入 PREPARING（prepareAsync 已呼叫，timer 已排程，等待 onPrepared）。
+            awaitCondition { testMp.prepareAsyncCalled }
+            assertFalse("must not start before release", testMp.startCalled)
+
+            val t0 = System.nanoTime()
+            // 直接 release（未先 stop）：必須 fence active session + cancel + 背景 mute/release。
+            player.release()
+            val releaseElapsedMs = (System.nanoTime() - t0) / 1_000_000
+            assertTrue("release itself must be bounded (<1000ms), elapsed=${releaseElapsedMs}ms", releaseElapsedMs < 1000)
+
+            // play 必須 fail-fast（CancellationException），不等待 15s 超時，不永懸。
+            withTimeout(5000L) {
+                job.join()
+            }
+            val elapsedMs = (System.nanoTime() - t0) / 1_000_000
+            assertNotNull("play must complete after release, not hang", playEx ?: job.isCompleted)
+            val ex = playEx
+            assertNotNull("play must fail after release during PREPARING", ex)
+            assertTrue("PREPARING release must fail-fast with CancellationException, was: $ex", ex is CancellationException)
+            assertTrue("PREPARING release must fail-fast (<2000ms), elapsed=${elapsedMs}ms", elapsedMs < 2000)
+            assertFalse("start() must never be called after PREPARING release", testMp.startCalled)
+            // 背景釋放終將完成。注意：mute 已於池關閉前 enqueue，但其鏈式 releaseAsync 可能在
+            // releaseExecutor.shutdown() 後才執行而走 daemon fallback（背景線程，永不在呼叫線程同步執行 native）。
+            // 此為有序關閉的預期背景兜底，不視為失敗；關鍵是 play 已 fail-fast 且無同步阻塞。
+            awaitCondition(timeoutMs = 5000L) { testMp.releaseCalled }
+            assertTrue("player must eventually be released", testMp.releaseCalled)
+        } finally {
+            try {
+                player.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    // ---- Stage-B 第三輪 P2-2c：factory latch 與 release 交錯，claim 因 released 拒絕 ----
+    @Test
+    fun androidAudioPlayer_factoryLatchInterleavedWithRelease_claimRejectedWithoutNative() = runBlocking {
+        val factoryEntered = CountDownLatch(1)
+        val factoryUnblock = CountDownLatch(1)
+        // 計數 setDataSource，證明 claim 拒絕後不做任何 native。
+        class CountingMp : TestMediaPlayer() {
+            @Volatile var setDataSourceCalled = false
+            override fun setDataSource(dataSource: android.media.MediaDataSource) {
+                setDataSourceCalled = true
+                super.setDataSource(dataSource)
+            }
+        }
+        val countingMp = CountingMp()
+        val player = AndroidAudioPlayer(
+            mediaPlayerFactory = {
+                factoryEntered.countDown()
+                // 阻塞 factory，製造 release 交錯窗口。
+                factoryUnblock.await(5, TimeUnit.SECONDS)
+                countingMp
+            },
+            prepareTimeoutMs = 5000L,
+        )
+        try {
+            var playEx: Throwable? = null
+            val job = launch(Dispatchers.IO) {
+                try {
+                    player.play(byteArrayOf(0x01, 0x02))
+                } catch (e: Throwable) {
+                    playEx = e
+                }
+            }
+            assertTrue("play must block in factory", factoryEntered.await(5, TimeUnit.SECONDS))
+            // 交錯：release 在 factory 返回前完成並返回（非阻塞）。
+            val t0 = System.nanoTime()
+            player.release()
+            val releaseElapsedMs = (System.nanoTime() - t0) / 1_000_000
+            assertTrue("release must return while factory blocked (<1000ms), elapsed=${releaseElapsedMs}ms", releaseElapsedMs < 1000)
+            assertTrue("pools must be shutdown after release returns", player.isPoolsShutdownForTest())
+            // 再放行 factory：claim 必須因 released 拒絕，不做 setDataSource/prepareAsync。
+            factoryUnblock.countDown()
+            withTimeout(5000L) {
+                job.join()
+            }
+            val ex = playEx
+            assertNotNull("play must fail-fast after interleaved release", ex)
+            assertTrue("interleaved release must fail-fast with CancellationException, was: $ex", ex is CancellationException)
+            assertFalse("setDataSource must never be called after released claim rejection", countingMp.setDataSourceCalled)
+            assertFalse("prepareAsync must never be called after released claim rejection", countingMp.prepareAsyncCalled)
+            assertFalse("start must never be called after released claim rejection", countingMp.startCalled)
+            // 新建資源經 daemon fallback 背景釋放（池已關，enqueue 被拒走背景線程，永不在呼叫線程同步執行 native）。
+            awaitCondition(timeoutMs = 5000L) { countingMp.releaseCalled }
+            assertTrue("factory-created player must eventually be released via background fallback", countingMp.releaseCalled)
+        } finally {
+            factoryUnblock.countDown()
+            try {
+                player.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
 }

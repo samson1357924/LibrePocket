@@ -16,6 +16,7 @@ import java.net.URI
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
@@ -182,6 +183,25 @@ class AndroidAudioPlayer(
      * 避免關閉後仍播放或無界掛起。冪等：多次 [release] 安全。
      */
     private val isReleased = AtomicBoolean(false)
+    /**
+     * Stage-B 第三輪 P2：release 互斥 + 生命週期。
+     * OPEN -> CLOSED 單一 owner：[releaseLock] 保護「detach+fence+enqueue 在池 shutdown 之前」，
+     * 第二 caller 在首輪 enqueue 完成前阻塞於此鎖（ms 級），永不在 stop enqueue 前關池。
+     * 鎖順序：releaseLock -> [lock]，其他路徑僅持 [lock]，無反向依賴，不死鎖。
+     */
+    private val releaseLock = Any()
+    /** fallback 計數：enqueue 被拒（池已關）時走 daemon 背景線程的次數，應為 0（正常關閉有序則不觸發）。 */
+    internal val muteFallbackCount = AtomicInteger(0)
+    internal val releaseFallbackCount = AtomicInteger(0)
+    /** 決定性測試事件序：stop detach/enqueue vs pools shutdown 的先後（見並發 double-shutdown 測試）。 */
+    internal val testEventLog = java.util.concurrent.ConcurrentLinkedQueue<String>()
+    /** 測試用：查詢池是否已發起 shutdown（shutdown() 已呼叫，不代表 terminated）。 */
+    internal fun isPoolsShutdownForTest(): Boolean =
+        try {
+            muteExecutor.isShutdown && releaseExecutor.isShutdown && timeoutScheduler.isShutdown
+        } catch (_: Throwable) {
+            false
+        }
 
     private fun cancelTimeout(epoch: Long) {
         try {
@@ -217,39 +237,89 @@ class AndroidAudioPlayer(
     }
 
     /**
-     * 釋放內部背景執行緒池（mute + release + timeout）。
-     * 三池皆為 daemon 線程，不關閉亦不會阻塞 JVM/測試結束；但長期持有（每實例三池）
-     * 會在大量測試中累積閒置線程，故提供顯式關閉。呼叫後新的 releaseAsync/mute 會經 daemon fallback 背景釋放，避免洩漏。
-     * 注意：[release] 本身可能等待有界時間（mute 1s + release 2s），UI 執行緒應在背景呼叫 shutdown；
-     * [stop] 本身永不等待，始終有界返回。
+     * 釋放內部背景執行緒池（mute + release + timeout）並 fence 進行中 session。
+     *
+     * 生命週期 OPEN -> CLOSED（[releaseLock] 單一 owner）：
+     * 首輪在同一臨界區內完成「標記 released + detach active session + cancel + enqueue
+     * 背景 mute/release」後，才發起三池 orderly shutdown；第二 caller 阻塞於 [releaseLock]
+     * 直到首輪 enqueue 完成（ms 級），永不在 stop/mute enqueue 前關池，故不觸發
+     * [releaseAsync]/mute 的 rejected fallback。
+     *
+     * 自身 fence（P2-2）：即使呼叫端未先調 [stop]，[release] 亦 detach 當前 active session
+     * （含 PREPARING）、cancel continuation、清除 prepare timer、並經 [muteAndReleaseAsync]
+     * 背景靜音+釋放；factory 返回/claim/native 前再查 closed，released 明確 fail-fast
+     * （[CancellationException]），不再依賴 timer 排程例外補救。無需先調 [stop]，
+     * 多次 [release]/[stop]/[close] 冪等安全。
+     *
+     * 非阻塞：呼叫線程僅做 fencing + enqueue + 發起 shutdown 即返回（ms 級）；
+     * `awaitTermination` 移至 daemon 背景線程，不阻塞 UI。
+     * 三池皆為 daemon，呼叫後新的 releaseAsync/mute 走 daemon fallback 背景釋放，不洩漏。
      */
     fun release() {
-        // Stage-C P2：先標記 released 使併發 play fail-fast，再關閉執行緒池。冪等。
-        isReleased.set(true)
-        // Orderly shutdown：先丟棄 pending prepare 超時（stop 已 cancel 對應 epoch，丟棄無洩漏），
-        // 再 orderly 關閉 mute 與 release 池，確保 shutdown 前由 stop() enqueue 的 mute/release 不被丟棄。
-        // 切勿對 releaseExecutor 用 shutdownNow：會丟棄佇列中剛 enqueue 的 native reset/release 造成洩漏。
-        // mute 池用 shutdown（非 shutdownNow）：已 enqueue 的 mute 仍會執行並鏈式觸發 releaseAsync；
-        // 若 mute 本身阻塞，await 僅等有界時間（1s），後續解堵後 releaseAsync 經 fallback 仍不洩漏。
-        try {
-            timeoutScheduler.shutdownNow()
-        } catch (_: Throwable) {
+        var needBackgroundAwait = false
+        synchronized(releaseLock) {
+            if (isReleased.get()) {
+                return
+            }
+            // 單一 owner：標記 closed 使併發 play fail-fast。
+            isReleased.set(true)
+            // 自身 fence：detach 當前 active（含 PREPARING）+ 世代遞增使 in-flight 柵欄失效。
+            // 順序 releaseLock -> lock，與其他路徑（僅持 lock）無反向依賴。
+            val detached = synchronized(lock) {
+                val d = detachAnyLocked()
+                sessionEpoch += 1
+                activeEpoch = sessionEpoch
+                d
+            }
+            try {
+                testEventLog.add("release-fence")
+            } catch (_: Throwable) {
+            }
+            // 取消 + 清 timer（仍在 releaseLock 內，但已釋放 lock；cont.cancel 觸發的
+            // invokeOnCancellation 僅需 lock，此時 lock 空閒，不死鎖）。
+            tryCancel(detached.continuation, "AndroidAudioPlayer released (epoch ${detached.epoch})")
+            cancelTimeoutAndClearPrepared(detached.epoch)
+            // 關鍵順序：先 enqueue 背景 mute/release，再關池，否則 enqueue 被拒走 fallback。
+            muteAndReleaseAsync(detached)
+            try {
+                testEventLog.add("release-enqueued")
+            } catch (_: Throwable) {
+            }
+            // Orderly shutdown：先丟棄 pending prepare 超時，再 orderly 關閉 mute/release 池。
+            // 切勿對 releaseExecutor 用 shutdownNow：會丟棄佇列中剛 enqueue 的 native reset/release。
+            try {
+                timeoutScheduler.shutdownNow()
+            } catch (_: Throwable) {
+            }
+            try {
+                muteExecutor.shutdown()
+            } catch (_: Throwable) {
+            }
+            try {
+                releaseExecutor.shutdown()
+            } catch (_: Throwable) {
+            }
+            try {
+                testEventLog.add("pools-shutdown")
+            } catch (_: Throwable) {
+            }
+            needBackgroundAwait = true
         }
-        try {
-            muteExecutor.shutdown()
-        } catch (_: Throwable) {
-        }
-        try {
-            releaseExecutor.shutdown()
-        } catch (_: Throwable) {
-        }
-        try {
-            muteExecutor.awaitTermination(1, java.util.concurrent.TimeUnit.SECONDS)
-        } catch (_: Throwable) {
-        }
-        try {
-            releaseExecutor.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS)
-        } catch (_: Throwable) {
+        if (needBackgroundAwait) {
+            // await 移至背景，不阻塞呼叫線程（UI）。
+            try {
+                Thread({
+                    try {
+                        muteExecutor.awaitTermination(1, java.util.concurrent.TimeUnit.SECONDS)
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        releaseExecutor.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS)
+                    } catch (_: Throwable) {
+                    }
+                }, "AndroidAudioPlayer-release-await").apply { isDaemon = true }.start()
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -332,6 +402,11 @@ class AndroidAudioPlayer(
         } catch (_: Throwable) {
             // 執行緒池已關閉等極端情況：絕不在呼叫線程同步執行可能阻塞的 native，
             // 改起 daemon 線程背景釋放，避免洩漏亦保持呼叫方有界返回。
+            // 正常有序關閉（stop enqueue 先於池 shutdown）不應觸發此分支；計數供決定性測試斷言。
+            try {
+                releaseFallbackCount.incrementAndGet()
+            } catch (_: Throwable) {
+            }
             try {
                 Thread({ safelyReleasePlayer(detached.player, detached.dataSource) }, "AndroidAudioPlayer-release-fallback").apply { isDaemon = true }.start()
             } catch (_: Throwable) {
@@ -392,6 +467,10 @@ class AndroidAudioPlayer(
             }
         } catch (_: Throwable) {
             try {
+                muteFallbackCount.incrementAndGet()
+            } catch (_: Throwable) {
+            }
+            try {
                 Thread({
                     muteNow(detached.player)
                     releaseAsync(detached)
@@ -411,6 +490,10 @@ class AndroidAudioPlayer(
         try {
             muteExecutor.execute { muteNow(player) }
         } catch (_: Throwable) {
+            try {
+                muteFallbackCount.incrementAndGet()
+            } catch (_: Throwable) {
+            }
             try {
                 Thread({ muteNow(player) }, "AndroidAudioPlayer-mute-fallback").apply { isDaemon = true }.start()
             } catch (_: Throwable) {
@@ -463,6 +546,13 @@ class AndroidAudioPlayer(
             tryResumeException(continuation, e)
             return@suspendCancellableCoroutine
         }
+        // P2-2 TOCTOU：factory 阻塞期間 release 可能已完成（isReleased=true、池已關）。
+        // factory 返回後必須再查 closed，released 明確 fail-fast，不做後續 native。
+        if (isReleased.get() || !continuation.isActive) {
+            tryCancel(continuation, "Audio play cancelled: player released during factory (epoch pending)")
+            releaseAsync(DetachedSession(player, null, null, -1L))
+            return@suspendCancellableCoroutine
+        }
         val dataSource = try {
             // copy=false：零拷貝路徑，避免額外 ByteArray 拷貝（記憶體考量）。
             // RequiresNoMutation 語義：傳入 array 在播放期間不可被呼叫端修改，
@@ -475,11 +565,17 @@ class AndroidAudioPlayer(
             releaseAsync(DetachedSession(player, null, null, -1L))
             return@suspendCancellableCoroutine
         }
+        // dataSource 配置期間亦可能交錯 release，再查一次。
+        if (isReleased.get() || !continuation.isActive) {
+            tryCancel(continuation, "Audio play cancelled: player released before claim (epoch pending)")
+            releaseAsync(DetachedSession(player, dataSource, null, -1L))
+            return@suspendCancellableCoroutine
+        }
 
         val myEpoch: Long?
         val oldDetached: DetachedSession?
         synchronized(lock) {
-            if (!continuation.isActive) {
+            if (!continuation.isActive || isReleased.get()) {
                 myEpoch = null
                 oldDetached = null
             } else {
@@ -494,13 +590,28 @@ class AndroidAudioPlayer(
         }
 
         if (myEpoch == null || oldDetached == null) {
-            // 進入鎖前已被取消：從未成為 active，直接釋放新建資源並主動取消，避免懸掛。
+            // claim 被拒（取消或已 released）：從未成為 active，直接釋放新建資源並明確取消，避免懸掛。
             // resume 先行，釋放投背景。
-            tryCancel(continuation, "Audio play cancelled before claim (epoch pending)")
+            tryCancel(continuation, "Audio play cancelled: player released or superseded before claim (epoch pending)")
             releaseAsync(DetachedSession(player, dataSource, null, -1L))
             return@suspendCancellableCoroutine
         }
         val epoch: Long = myEpoch
+        // claim 成功後緊接再查：release 可能恰交錯於 claim 與此檢查之間。
+        // 若已 released，立即 detach + 明確取消，不做任何 native（setDataSource/prepareAsync）。
+        if (isReleased.get()) {
+            val detached = synchronized(lock) {
+                detachIfActiveLocked(player, epoch)
+            }
+            if (detached != null) {
+                tryCancel(continuation, "Audio play cancelled: player released after claim (epoch $epoch)")
+                cancelTimeoutAndClearPrepared(epoch)
+                releaseAsync(detached)
+            } else {
+                tryCancel(continuation, "Audio play cancelled: player released after claim (epoch $epoch, detached)")
+            }
+            return@suspendCancellableCoroutine
+        }
 
         // 釋放被取代的舊世代：cancel 原因攜帶 epoch；舊媒體靜音與完整釋放皆走背景
         // （mute 池與 release 池分離，不被阻塞排隊，亦不阻塞新播放呼叫線程）。
@@ -523,9 +634,9 @@ class AndroidAudioPlayer(
         }
 
         fun isStillActive(): Boolean =
-            synchronized(lock) { activePlayer === player && activeEpoch == epoch && sessionEpoch == epoch } && continuation.isActive
+            !isReleased.get() && synchronized(lock) { activePlayer === player && activeEpoch == epoch && sessionEpoch == epoch } && continuation.isActive
 
-        // 世代柵欄：已失格（被 stop/新 play 取代）即主動釋放並取消，不依賴外部。
+        // 世代柵欄 + closed 柵欄：已失格（被 stop/新 play 取代）或已 released 即主動釋放並取消，不依賴外部。
         if (!isStillActive()) {
             val detached = synchronized(lock) {
                 detachIfActiveLocked(player, epoch)
@@ -573,9 +684,9 @@ class AndroidAudioPlayer(
 
         try {
             player.setOnPreparedListener { mp ->
-                // 第一重柵欄（epoch + session 雙重）：快速擋下已失格的遲到回呼。
+                // 第一重柵欄（epoch + session 雙重 + closed）：快速擋下已失格/已釋放的遲到回呼。
                 val shouldStart =
-                    synchronized(lock) { activePlayer === mp && activeEpoch == epoch && sessionEpoch == epoch } && continuation.isActive
+                    !isReleased.get() && synchronized(lock) { activePlayer === mp && activeEpoch == epoch && sessionEpoch == epoch } && continuation.isActive
                 if (!shouldStart) return@setOnPreparedListener
 
                 // PREPARING -> PLAYING 躍遷：先標記已準備，使併發的超時任務在同一 lock 下可見並跳過，
@@ -593,10 +704,10 @@ class AndroidAudioPlayer(
                 var startException: Exception? = null
                 var started = false
                 try {
-                    // 最終柵欄（epoch + session 雙重，緊貼 native start 前）：縮小 check→start 競態窗口至最小。
+                    // 最終柵欄（epoch + session 雙重 + closed，緊貼 native start 前）：縮小 check→start 競態窗口至最小。
                     // native 本身在鎖外執行（P1 死鎖修復保留：絕不在持有 lock/monitor 時阻塞於 native）。
                     val ok =
-                        synchronized(lock) { activePlayer === mp && activeEpoch == epoch && sessionEpoch == epoch } && continuation.isActive
+                        !isReleased.get() && synchronized(lock) { activePlayer === mp && activeEpoch == epoch && sessionEpoch == epoch } && continuation.isActive
                     if (ok) {
                         mp.start()
                         started = true
@@ -630,7 +741,7 @@ class AndroidAudioPlayer(
                     // 已 detach 者由勝出的 stop 路徑負責 release，此處僅 best-effort 背景靜音 + 清標記，不重複排隊。
                     // 回呼線程本身永不直接執行 native，保持有界返回。
                     val stillValid =
-                        synchronized(lock) { activePlayer === mp && activeEpoch == epoch && sessionEpoch == epoch } && continuation.isActive
+                        !isReleased.get() && synchronized(lock) { activePlayer === mp && activeEpoch == epoch && sessionEpoch == epoch } && continuation.isActive
                     if (!stillValid) {
                         muteAsync(mp)
                         clearPrepared(epoch)
@@ -776,12 +887,20 @@ class AndroidAudioPlayer(
             activeEpoch = sessionEpoch
             d
         }
+        try {
+            testEventLog.add("stop-fence")
+        } catch (_: Throwable) {
+        }
         tryCancel(detached.continuation, "AndroidAudioPlayer stopped (epoch ${detached.epoch})")
         cancelTimeoutAndClearPrepared(detached.epoch)
         // Stage-A 第三輪：僅做邏輯取消 + enqueue 背景靜音/釋放，呼叫線程永不執行 native。
         // 呼叫線程有界返回（不被 A 的阻塞 release 排隊，亦不被 B 自身阻塞 native 卡住）；
         // 真實靜音由 mute 池背景 best-effort 執行，完整釋放隨後排入 release 池。
         muteAndReleaseAsync(detached)
+        try {
+            testEventLog.add("stop-enqueued")
+        } catch (_: Throwable) {
+        }
     }
 }
 
@@ -834,6 +953,24 @@ class OpenAiSpeechEngine(
     // 世代躍遷互斥：speechEpoch 遞增 + 舊工作快照/清除 + 新工作註冊必須在同一臨界區完成，
     // 使僅有 winner 能取消舊世代，舊請求絕不取消新請求。stop() 亦使用同一鎖。
     private val generationLock = Any()
+    /**
+     * Stage-B 第三輪 P2-1：engine 明確生命週期 OPEN -> SHUTTING_DOWN -> CLOSED + 單一 owner。
+     * [shutdownLock] 保護「CAS/fencing/player.stop enqueue 在池 shutdown 之前」：
+     * 首輪持 [shutdownLock] 完成 CAS + fencing + `player.stop()` enqueue 後才允許 release；
+     * 第二 caller 阻塞於 [shutdownLock] 入口（有界等待 fencing enqueue，ms 級），
+     * 永不在首輪 stop enqueue 完成前關池。`awaitTermination` 已移至背景，不阻塞 UI。
+     * 鎖順序：shutdownLock -> [generationLock]，與 [stop]/claim（僅持 generationLock）無反向依賴。
+     */
+    private enum class EngineLifecycle { OPEN, SHUTTING_DOWN, CLOSED }
+    private val shutdownLock = Any()
+    private var lifecycle: EngineLifecycle = EngineLifecycle.OPEN
+    /**
+     * 測試專用柵欄：首輪 shutdown 持 [shutdownLock] 期間依序回調 "after-cas" / "after-fencing" /
+     * "before-release"，允許決定性並發測試將首輪暫停於 CAS 與 stop 之間，再由第二線程調 shutdown
+     * 驗證其阻塞等待而非提前關池。生產為 null；測試必須自帶超時，不得無限阻塞。
+     */
+    @Volatile
+    internal var shutdownPauseForTest: ((String) -> Unit)? = null
 
     /** 測試專用柵欄：在世代躍遷臨界區外、遞增 epoch 後回調，允許測試暫停舊請求以驗證 winner 語義。生產為 null。
    * 僅測試使用，呼叫端必須自帶超時（例如 `CountDownLatch.await(5, SECONDS)`），且絕不在持有
@@ -1453,45 +1590,73 @@ class OpenAiSpeechEngine(
     }
 
     /**
-     * 關閉引擎持有的播放器資源（Stage-C P2 世代 fencing 缺口修復）。
+     * 關閉引擎持有的播放器資源（Stage-C P2 世代 fencing 缺口修復 + Stage-B 第三輪 P2-1 並發修復）。
+     * 生命週期 OPEN -> SHUTTING_DOWN -> CLOSED（[shutdownLock] 單一 owner）+ 共同 completion：
+     * 首輪持 [shutdownLock] 完成 CAS（[isShutdown] + [lifecycle]) + fencing + `player.stop()`
+     * enqueue 後才允許 release；第二 caller 阻塞於 [shutdownLock] 入口直到首輪 stop enqueue 完成
+     * （有界等待 fencing enqueue，ms 級），永不在首輪 stop enqueue 前關池，故不觸發
+     * `releaseExecutor`/`muteExecutor` 的 rejected fallback（呼叫線程永不執行 native）。
      * 順序不可顛倒：
-     * 1. 先以 CAS 將引擎標記為 closed（[isShutdown]），後續 [synthesizeAndPlay] 立即
+     * 1. 先將引擎標記為 closed（[isShutdown] + SHUTTING_DOWN），後續 [synthesizeAndPlay] 立即
      *    fail-fast 拒絕（`Failed(CANCELLED)`），不再發 HTTP；
      * 2. 再完整 engine stop/cancel fencing（遞增 [stopEpoch]/[speechEpoch]、取消
      *    [activeJobs]/[activeJob]、detach player 經由 `player.stop()`），使阻塞中的
      *    `client.synthesize()` HTTP Job 完成後 epoch 已變、檢查必失格而絕不 `player.play`；
-     * 3. 最後才關 player executors（`release()`），避免先關池導致新 prepare timer
-     *    排程失敗被吞（關閉後仍播放或無界掛起）。
+     * 3. 最後才關 player executors（`release()`，其 `awaitTermination` 已在背景，不阻塞呼叫線程）。
      * 關閉冪等：多次 [shutdown] 安全，首輪後僅確保釋放、不再遞增世代。
      * 若底層 [player] 為 [AndroidAudioPlayer]，轉調其 `release()` 關閉內部
      * mute/release/timeout 背景池（三池皆為 daemon，不關閉亦不阻塞 JVM 結束，但顯式關閉可避免測試累積閒置線程）。
      * 非 AndroidAudioPlayer 實作則僅執行 [stop] fencing。
+     * 注意：[release] 本身已 fence active session 且非阻塞，故無需先調 [stop]；此處先調
+     * `player.stop()` 僅為 engine 世代 fencing（取消 Jobs + player detach），與 player.release 的
+     * fence 互補且冪等。
      */
     fun shutdown() {
-        // 冪等：僅首輪執行 fencing+標記+釋放；後續僅確保釋放且不拋出。
-        if (!isShutdown.compareAndSet(false, true)) {
-            try {
-                (player as? AndroidAudioPlayer)?.release()
-            } catch (_: Throwable) {
+        val isOwner: Boolean
+        synchronized(shutdownLock) {
+            if (lifecycle != EngineLifecycle.OPEN) {
+                isOwner = false
+            } else {
+                lifecycle = EngineLifecycle.SHUTTING_DOWN
+                // fail-fast 立即可見：後續 synthesizeAndPlay 不再發 HTTP。
+                isShutdown.set(true)
+                isOwner = true
             }
-            return
+            if (isOwner) {
+                // 測試縫：持 shutdownLock 暫停，使第二 caller 決定性阻塞於鎖入口。
+                try {
+                    shutdownPauseForTest?.invoke("after-cas")
+                } catch (_: Throwable) {
+                }
+                // 首輪 fencing（與 stop() 同語義），鎖順序 shutdownLock -> generationLock。
+                val jobs: List<Job>
+                val shutdownEpoch: Long
+                synchronized(generationLock) {
+                    stopEpoch.incrementAndGet()
+                    shutdownEpoch = speechEpoch.incrementAndGet()
+                    val oldJob = activeJob.getAndSet(null)
+                    val snapshot = (activeJobs.toList() + listOfNotNull(oldJob)).distinct()
+                    activeJobs.clear()
+                    jobs = snapshot
+                }
+                try {
+                    shutdownPauseForTest?.invoke("after-fencing")
+                } catch (_: Throwable) {
+                }
+                jobs.forEach { it.cancel(CancellationException("Speech synthesis stopped (epoch $shutdownEpoch)")) }
+                try {
+                    player.stop()
+                } catch (_: Throwable) {
+                }
+                try {
+                    shutdownPauseForTest?.invoke("before-release")
+                } catch (_: Throwable) {
+                }
+                lifecycle = EngineLifecycle.CLOSED
+            }
         }
-        // 首輪：先完整 engine stop/cancel fencing（與 stop() 同語義），再關 executors。
-        val jobs: List<Job>
-        val shutdownEpoch: Long
-        synchronized(generationLock) {
-            stopEpoch.incrementAndGet()
-            shutdownEpoch = speechEpoch.incrementAndGet()
-            val oldJob = activeJob.getAndSet(null)
-            val snapshot = (activeJobs.toList() + listOfNotNull(oldJob)).distinct()
-            activeJobs.clear()
-            jobs = snapshot
-        }
-        jobs.forEach { it.cancel(CancellationException("Speech synthesis stopped (epoch $shutdownEpoch)")) }
-        try {
-            player.stop()
-        } catch (_: Throwable) {
-        }
+        // 鎖外共同 completion：首輪與第二 caller 皆在此確保 executors 關閉（冪等、快速、
+        // await 在背景）。因首輪的 stop enqueue 已在鎖內完成，此處 release 永不早於 stop。
         try {
             (player as? AndroidAudioPlayer)?.release()
         } catch (_: Throwable) {

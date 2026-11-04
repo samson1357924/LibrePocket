@@ -21,6 +21,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -748,13 +749,22 @@ class ChatWiringTest {
         try {
             onMain { vm.onInputChange("first") }
             onMain { vm.send() }
-            awaitTrue { vm.sessionState.value.status == ChatStatus.STREAMING }
+            // WARN W2: StateFlow condition wait — no Thread.sleep poll.
+            // STREAMING cannot be missed: the gate blocks the provider after
+            // the first TextDelta, so STREAMING persists until gate.complete.
+            runBlocking {
+                withTimeout(10_000) { vm.sessionState.first { it.status == ChatStatus.STREAMING } }
+            }
             onMain { vm.steer("follow") }
+            // Cross-flow OR (sessionState.pendingSteerCount vs messages.size):
+            // cannot be a single first{} — keep this ONE awaitTrue.
             awaitTrue { vm.sessionState.value.pendingSteerCount == 1 || vm.messages.value.size == 4 }
         } finally {
             gate.complete(Unit)
         }
-        awaitTrue(timeoutMs = 12000) { vm.messages.value.size == 4 }
+        runBlocking {
+            withTimeout(12_000) { vm.messages.first { it.size == 4 } }
+        }
         assertEquals("follow", vm.messages.value[2].text)
     }
 

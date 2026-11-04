@@ -75,7 +75,7 @@ private class H2FakeProvider(
  *
  * - ordering-deterministic, timing still wall-clock：本檔自身等待以
  *   `first {} + withTimeout`／`waitUntil` 條件等待取代固定 delay；但共用
- *   helper（awaitTrue 內 Thread.sleep(10)、DataStore IO、MockWebServer）
+ *   helper（awaitTrue 內 Thread.sleep(10)、DataStore IO、MockWebServer、FakeSessionStore plain-list poll）
  *   仍是 wall-clock，並非全程 sleep-free。
  * - NOT covered：prod ChatScreen 草稿（此處僅 local rememberSaveable stub）、
  *   Room 持久化（僅 FakeSessionStore map）、ASK 同意路徑（僅 ALLOW）、
@@ -204,7 +204,8 @@ class DeviceJourneyH2Test {
         // 訊息，重開後為空，故以 messages.size == 2 為條件）。
         val sid = checkNotNull(chatVm.currentSessionId.value) { "first send must create session" }
         assertTrue(transcripts.metas.containsKey(sid))
-        // Writer-drain poll: FakeSessionStore.events is a plain ArrayList with no Flow seam, so a condition wait is impossible without a prod seam.
+        // Writer-drain poll: FakeSessionStore.events is a plain ArrayList with no Flow seam, so a condition wait
+        // is impossible without a prod seam.
         // Bounded 10s; drains in ms in practice.
         withTimeout(10_000) {
             while (transcripts.events.count { it.kind == "user" || it.kind == "assistant" } < 2) delay(5)

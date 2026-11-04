@@ -28,15 +28,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -309,7 +309,7 @@ class SetupEditKeepExistingTest {
         // conflated writes could still merge upstream — accepted.)
         val seen = Collections.synchronizedList(mutableListOf<Any?>())
         val histScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val collector = histScope.launch { vm.form.collect { seen.add(it.testModels) } }
+        histScope.launch { vm.form.collect { seen.add(it.testModels) } }
         // Release slow AFTER B published so slow always finishes last:
         // pre-guard overwrites to 5 (RED), post-guard discards to 2 (GREEN).
         // Completion proof is the [SlowThenFastListProvider.aJob] join below:
@@ -328,7 +328,8 @@ class SetupEditKeepExistingTest {
             // finally below): wait until the collector has observed B-terminal
             // before releasing A; otherwise release + A's whole writeback could
             // complete before the collector's first emission (vacuous pin).
-            // seen is a plain synchronized list (collector pushes), hence poll; bounded 10s, first emission immediate post-B-terminal in practice.
+            // seen is a plain synchronized list (collector pushes), hence poll; bounded 10s, first emission immediate
+            // post-B-terminal in practice.
             withTimeout(10_000) { while (seen.isEmpty()) delay(5) }
             fake.release.countDown()
             val aCoroutine = withTimeout(10_000) { fake.aJob.await() }

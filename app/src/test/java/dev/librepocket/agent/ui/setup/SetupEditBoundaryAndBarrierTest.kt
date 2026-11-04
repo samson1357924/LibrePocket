@@ -430,7 +430,7 @@ class SetupEditBoundaryAndBarrierTest {
         // conflated writes could still merge upstream — accepted.)
         val seen = Collections.synchronizedList(mutableListOf<Any>())
         val histScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val collector = histScope.launch { vm.form.collect { seen.add(it.modelOptions.toList()) } }
+        histScope.launch { vm.form.collect { seen.add(it.modelOptions.toList()) } }
         // Release slow AFTER B published so slow always finishes last:
         // pre-barrier overwrites with slow-r (RED), post-barrier discards
         // and the terminal stays fast-only (GREEN).

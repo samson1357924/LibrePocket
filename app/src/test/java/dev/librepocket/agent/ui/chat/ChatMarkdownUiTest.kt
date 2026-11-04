@@ -1702,4 +1702,128 @@ class ChatMarkdownUiTest {
         composeRule.onNodeWithText("New reasoning content").assertDoesNotExist()
         composeRule.onAllNodesWithText(title).assertCountEquals(2)
     }
+
+    @Test
+    fun chatMarkdownView_splitCompletedPlusStreaming_retainsManualExpandOnFirst() {
+        // Re-review #9 P2: ["Pl"] -> ["Plan", ""] in one append-only chunk (first card
+        // completes, second empty streaming card starts). Manual expand on "Pl" must
+        // survive on the first card; the second card stays at streaming default.
+        var text by mutableStateOf("<think>Pl")
+
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(text = text, isStreaming = true)
+            }
+        }
+
+        val title = context.getString(R.string.chat_thinking_title)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+
+        // Streaming default is expanded; collapse then re-expand to record explicit true.
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("Pl ▍").assertIsDisplayed()
+
+        // One chunk completes the first card and opens an empty streaming card.
+        text = "<think>Plan</think><think>"
+        composeRule.waitForIdle()
+
+        // First card retains the manual expand (completed default would collapse).
+        composeRule.onNodeWithText("Plan").assertIsDisplayed()
+        // Two thinking cards, both expanded (first via retained true, second via
+        // streaming default).
+        composeRule.onAllNodesWithText(title).assertCountEquals(2)
+        composeRule.onAllNodesWithContentDescription(collapseDesc).assertCountEquals(2)
+        // The retained content belongs to the first card (above the second header).
+        val contentY = composeRule.onNodeWithText("Plan")
+            .fetchSemanticsNode().positionInRoot.y
+        val secondTitleY = composeRule.onAllNodesWithText(title)[1]
+            .fetchSemanticsNode().positionInRoot.y
+        assertTrue(contentY < secondTitleY)
+    }
+
+    @Test
+    fun chatMarkdownView_splitCompletedPlusStreaming_retainsManualCollapseOnFirst() {
+        // Same split as above but starting from a manual collapse: the first card must
+        // stay collapsed and the empty streaming card must NOT inherit the collapse
+        // (consumption: one previous entry feeds at most one current card).
+        var text by mutableStateOf("<think>Pl")
+
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(text = text, isStreaming = true)
+            }
+        }
+
+        val title = context.getString(R.string.chat_thinking_title)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+
+        // Record explicit false on the single streaming card.
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("Pl ▍").assertDoesNotExist()
+
+        text = "<think>Plan</think><think>"
+        composeRule.waitForIdle()
+
+        // First card stays collapsed; second card is at streaming default (expanded).
+        composeRule.onAllNodesWithText(title).assertCountEquals(2)
+        composeRule.onNodeWithText("Plan").assertDoesNotExist()
+        composeRule.onAllNodesWithContentDescription(expandDesc).assertCountEquals(1)
+        composeRule.onAllNodesWithContentDescription(collapseDesc).assertCountEquals(1)
+        // Collapsed card is first (above), expanded streaming card is second (below).
+        val expandY = composeRule.onNodeWithContentDescription(expandDesc)
+            .fetchSemanticsNode().positionInRoot.y
+        val collapseY = composeRule.onNodeWithContentDescription(collapseDesc)
+            .fetchSemanticsNode().positionInRoot.y
+        assertTrue(expandY < collapseY)
+    }
+
+    @Test
+    fun chatMarkdownView_emptyCollapseThenSplit_collapseMovesToFirstAndSecondStaysExpanded() {
+        // Blocking review bug: `[""]` -> `["X", ""]` in one append-only chunk. The
+        // empty card's explicit `false` must move to `X` (step-3 prefix at the same
+        // index); the new empty card reuses the old empty id, so with copy
+        // semantics it would read the stale `false` and collapse instead of
+        // defaulting to expanded while streaming.
+        var text by mutableStateOf("<think>")
+
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(text = text, isStreaming = true)
+            }
+        }
+
+        val title = context.getString(R.string.chat_thinking_title)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+
+        // Empty streaming card defaults to expanded; record explicit false.
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+
+        // One chunk completes the first card and opens an empty streaming card.
+        text = "<think>X</think><think>"
+        composeRule.waitForIdle()
+
+        // Two thinking cards rendered.
+        composeRule.onAllNodesWithText(title).assertCountEquals(2)
+        // First card retains the moved collapse: content hidden, exactly one
+        // expand icon which sits above the second card.
+        composeRule.onNodeWithText("X").assertDoesNotExist()
+        composeRule.onAllNodesWithContentDescription(expandDesc).assertCountEquals(1)
+        // Second (empty streaming) card defaults to expanded: exactly one
+        // collapse icon, positioned below the collapsed first card.
+        composeRule.onAllNodesWithContentDescription(collapseDesc).assertCountEquals(1)
+        val expandY = composeRule.onNodeWithContentDescription(expandDesc)
+            .fetchSemanticsNode().positionInRoot.y
+        val collapseY = composeRule.onNodeWithContentDescription(collapseDesc)
+            .fetchSemanticsNode().positionInRoot.y
+        assertTrue(expandY < collapseY)
+    }
 }

@@ -412,29 +412,41 @@ internal fun CodeBlockView(
  * - Every recomposition aligns synchronously before reading, against the previous
  *   parse's trimmed contents (`prevContents`, also `rememberSaveable` via
  *   [ThinkingPrevContentsSaver]; `null`/empty = unknown, e.g. not yet observed or
- *   over the [ThinkingPrevContentsSaveBytesMax] rotation cap):
- *   - Exact: a current id already present in the previous parse's id set is the same
- *     logical card — its override is retained as-is. This covers the
- *     streaming→completed transition (`think_streaming_N` → `think_c_<hex>`, same
- *     trimmed text, same rank): a manual expand during streaming survives appending
- *     `</think>` even while message-level [isStreaming] is still true. Untouched cards
- *     still auto-collapse on close per spec.
- *   - Migration (current id is new): only when the previous and current thinking card
- *     counts are equal, and the previous parse's content at the same position is a
- *     strict prefix of the current content (empty→non-empty included, so collapsing
- *     `<think>` survives growth to `<think>P…`), the value stored under the previous
- *     position's id is inherited. An existing explicit entry on the target wins.
- *     Card counts differing (prepend/delete of a thinking card) disables migration —
- *     only exact-id matches apply — so a prepended different-content card falls back
- *     to `block.isStreaming` instead of inheriting an unrelated card's choice.
- *   - Otherwise the entry defaults; stale ids (neither exact-retained nor migration
- *     targets) are pruned so a future different-content card never inherits them.
- *     When `prevContents` is unknown, pruning is skipped (deferred to the next
- *     observed parse); exact-id reads still apply.
- * - Limitation (documented): same-content prepend shifts occurrence ranks positionally
- *   (first card's id moves to the prepended card), consistent with the parser's `_o2`
- *   key disambiguation for same-content duplicates. Prepending *different* content does
- *   not misapply overrides (card counts differ → exact-id matching only).
+ *   over the [ThinkingPrevContentsSaveBytesMax] rotation cap). The current cards are
+ *   visited in document order and each takes the first matching step; every previous
+ *   entry is consumed at most once (one-to-one):
+ *   1. Exact id: the current id is in the previous parse's id set and unconsumed —
+ *      the same logical card, retained as-is (no copy; the map entry already sits
+ *      under this id). Covers streaming→completed (`think_streaming_N` →
+ *      `think_c_<hex>`, same trimmed text and rank) and keeps same-content
+ *      duplicate cards independent via distinct ranks.
+ *   2. Content-exact: the first unconsumed previous entry with equal trimmed
+ *      content — inherited (moved under the current id unless the target already
+ *      has an explicit entry) and consumed. Prepend/reorder of different content
+ *      follows the content; same-content prepend stays positional (document-order
+ *      consumption picks the earliest entry), consistent with the parser's `_o2`
+ *      occurrence disambiguation for duplicates.
+ *   3. Strict-prefix growth: an unconsumed previous entry whose content is a strict
+ *      prefix of the current content (`prev != curr && curr.startsWith(prev)`) —
+ *      inherited and consumed. An empty previous content is anchored: it may only
+ *      feed the same index, so an empty card's choice never leaks onto a newly
+ *      inserted different card. A non-empty previous content prefers the same
+ *      index, otherwise the nearest index (`|i - j|`, earliest wins ties); both
+ *      must be unconsumed. Covers empty→non-empty growth and `["Pl"]` →
+ *      `["Plan", ""]` (first card inherits, second falls to default).
+  *      Move semantics: the consumed source key is removed when it differs from
+  *      the target id, so one stored value is never observed by two cards.
+ *   4. Default: `block.isStreaming` (no stored value is written).
+ * - An existing explicit entry on the target always wins (never overwritten); the
+ *   matched previous entry is still consumed to keep the mapping one-to-one.
+ *   Previous ids that remain unconsumed correspond to disappeared cards, so their
+ *   overrides are cleaned by pruning keys absent from the current id set. When
+ *   `prevContents` is unknown, migration and pruning are skipped (deferred to the
+ *   next observed parse); exact-id reads still apply.
+ * - Limitation (documented): same-content prepend shifts occurrence ranks
+ *   positionally (first card's id moves to the prepended card), consistent with
+ *   the parser's `_o2` key disambiguation for same-content duplicates. Prepending
+ *   *different* content does not misapply overrides (exact/content-exact matching).
  */
 @Composable
 internal fun ChatMarkdownView(
@@ -477,27 +489,97 @@ internal fun ChatMarkdownView(
 
     // Synchronously align before reads so this composition already observes the
     // retained/migrated values. Idempotent: a mutating pass schedules one follow-up
-    // recomposition that becomes a no-op.
+    // recomposition that becomes a no-op. Each previous entry is consumed at most
+    // once; consumption order follows the current cards in document order.
     if (prevKnownContents != null && prevOverrideIds != null) {
-        val prevIdSet = prevOverrideIds.toSet()
-        if (prevKnownContents.size == currentThinkingContents.size) {
-            for (i in currentThinkingContents.indices) {
-                val currId = currentOverrideIds[i]
-                // Exact: same logical card, retain as-is.
-                if (currId in prevIdSet) continue
-                // Migration: same position, strict prefix growth (empty→non-empty
-                // included). Card-count equality guards against prepend/delete shifts.
-                val prevContent = prevKnownContents[i]
-                val currContent = currentThinkingContents[i]
+        val prevIdToIndex = HashMap<String, Int>(prevOverrideIds.size)
+        for ((index, id) in prevOverrideIds.withIndex()) {
+            if (!prevIdToIndex.containsKey(id)) {
+                prevIdToIndex[id] = index
+            }
+        }
+        val consumed = BooleanArray(prevKnownContents.size)
+        for (j in currentThinkingContents.indices) {
+            val currId = currentOverrideIds[j]
+            val currContent = currentThinkingContents[j]
+            // Step 1 — exact id: same logical card, retain (value already under currId).
+            val exactIndex = prevIdToIndex[currId]
+            if (exactIndex != null && !consumed[exactIndex]) {
+                consumed[exactIndex] = true
+                continue
+            }
+            // Step 2 — content-exact: first unconsumed equal content in document
+            // order (positional for same-content duplicates, matching parser _o2).
+            var sourceIndex: Int? = null
+            for (i in prevKnownContents.indices) {
+                if (!consumed[i] && prevKnownContents[i] == currContent) {
+                    sourceIndex = i
+                    break
+                }
+            }
+            if (sourceIndex != null) {
+                consumed[sourceIndex] = true
+                val sourceId = prevOverrideIds[sourceIndex]
+                val migratedValue = thinkingOverrides[sourceId]
+                if (migratedValue != null && !thinkingOverrides.containsKey(currId)) {
+                    thinkingOverrides[currId] = migratedValue
+                }
+                // Move (not copy): a consumed source must never be read twice. Drop
+                // the source key when it differs from the target, so a later card
+                // with the same id (e.g. `[""]` → `["X", ""]`: the new empty card
+                // reuses the old empty id) falls back to `block.isStreaming`
+                // instead of observing a stale explicit value. When the source id
+                // is absent from the current id set, pruning would remove it
+                // anyway, so behaviour there is unchanged.
+                if (sourceId != currId) {
+                    thinkingOverrides.remove(sourceId)
+                }
+                continue
+            }
+            // Step 3 — strict-prefix growth. Empty previous content is anchored to
+            // the same index; non-empty prefers the same index, else the nearest.
+            var bestIndex: Int? = null
+            if (j < prevKnownContents.size && !consumed[j]) {
+                val prevContent = prevKnownContents[j]
                 if (prevContent != currContent && currContent.startsWith(prevContent)) {
-                    val migratedValue = thinkingOverrides[prevOverrideIds[i]]
-                    if (migratedValue != null && !thinkingOverrides.containsKey(currId)) {
-                        thinkingOverrides[currId] = migratedValue
+                    bestIndex = j
+                }
+            }
+            if (bestIndex == null) {
+                var bestDistance = Int.MAX_VALUE
+                for (i in prevKnownContents.indices) {
+                    if (consumed[i]) continue
+                    val prevContent = prevKnownContents[i]
+                    if (prevContent.isEmpty()) continue
+                    if (prevContent == currContent) continue
+                    if (!currContent.startsWith(prevContent)) continue
+                    val distance = kotlin.math.abs(i - j)
+                    if (distance < bestDistance) {
+                        bestDistance = distance
+                        bestIndex = i
                     }
                 }
             }
+            if (bestIndex != null) {
+                consumed[bestIndex] = true
+                val sourceId = prevOverrideIds[bestIndex]
+                val migratedValue = thinkingOverrides[sourceId]
+                if (migratedValue != null && !thinkingOverrides.containsKey(currId)) {
+                    thinkingOverrides[currId] = migratedValue
+                }
+                // Move (not copy): see step 2 — drop the consumed source key when
+                // it differs from the target so it cannot be re-read by a later
+                // card (stale `false` on `[""]` → `["X", ""]` must not collapse
+                // the new empty card).
+                if (sourceId != currId) {
+                    thinkingOverrides.remove(sourceId)
+                }
+            }
+            // Step 4 — default: no stored value is written; the card falls back to
+            // block.isStreaming when read.
         }
-        // Prune stale ids (disappeared cards); retained/migrated targets survive.
+        // Prune stale ids (disappeared cards); retained/migrated targets survive
+        // because they sit under current ids.
         val staleKeys = thinkingOverrides.keys.filter { it !in currentIdSet }
         for (stale in staleKeys) {
             thinkingOverrides.remove(stale)

@@ -217,6 +217,52 @@ class VerificationMetadataTest(unittest.TestCase):
             finally:
                 V.METADATA = old
 
+    def test_gradle_properties_whitespace_variants_rejected(self):
+        cases = {
+            "key=off": "org.gradle.dependency.verification=off\n",
+            "key = off": "org.gradle.dependency.verification = off\n",
+            "key tab = tab lenient": "org.gradle.dependency.verification\t=\tlenient\n",
+            "key:off": "org.gradle.dependency.verification:off\n",
+            "key : lenient": "org.gradle.dependency.verification : lenient\n",
+            "key = off inline comment": "org.gradle.dependency.verification = off # comment\n",
+            "unicode-obfuscated key": "\\u006frg.gradle.dependency.verification=off\n",
+        }
+        for name, content in cases.items():
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    (tmp / "gradle.properties").write_text(content, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        validate_gradle_files(tmp)
+
+    def test_gradle_properties_safe_variants_pass(self):
+        cases = {
+            "commented out": "# org.gradle.dependency.verification=off\n",
+            "bang commented out": "! org.gradle.dependency.verification=off\n",
+            "strict no space": "org.gradle.dependency.verification=strict\n",
+            "strict with spaces": "org.gradle.dependency.verification = strict\n",
+        }
+        for name, content in cases.items():
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    (tmp / "gradle.properties").write_text(content, encoding="utf-8")
+                    validate_gradle_files(tmp)  # must not raise
+
+    def test_groovy_build_gradle_scanned(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            (tmp / "app").mkdir()
+            groovy = tmp / "app" / "build.gradle"
+            groovy.write_text(
+                "configurations { x { resolutionStrategy { disableDependencyVerification() } } }\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                validate_gradle_files(tmp)
+            groovy.write_text("// clean\n", encoding="utf-8")
+            validate_gradle_files(tmp)  # must not raise
+
     def test_gradle_bypass_strings_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)

@@ -12,6 +12,7 @@ Usage: python3 -P scripts/verify_verification_metadata.py
 Exit status: 0 = gate passes, 2 = gate rejected (ValueError).
 """
 
+import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -76,6 +77,67 @@ def validate_tree(root: ET.Element) -> None:
                     raise ValueError(f"artifact {aname} uses weak hash <{weak}> (use sha256+)")
 
 
+def _properties_verification_mode(lines: list[str]) -> str | None:
+    """Return first org.gradle.dependency.verification value per simplified Java properties semantics."""
+    # Backslash-escaped separators do not split the key (odd backslash count
+    # means escaped); \uXXXX escapes in the key are unescaped before comparing,
+    # mirroring Properties.load, so unicode-obfuscated keys cannot slip past.
+    key_wanted = "org.gradle.dependency.verification"
+    for raw in lines:
+        line = raw.lstrip(" \t\f")
+        if not line or line[0] in ("#", "!"):
+            continue
+        stripped = line.rstrip("\r\n")
+        n = len(stripped)
+        key_end = n
+        sep_kind = ""  # '=', ':', or 'ws'
+        i = 0
+        while i < n:
+            c = stripped[i]
+            if c in ("=", ":"):
+                # Count preceding backslashes: odd count means escaped.
+                bs = 0
+                j = i - 1
+                while j >= 0 and stripped[j] == "\\":
+                    bs += 1
+                    j -= 1
+                if bs % 2 == 0:
+                    key_end = i
+                    sep_kind = c
+                    break
+            elif c in (" ", "\t", "\f"):
+                key_end = i
+                sep_kind = "ws"
+                break
+            i += 1
+        key = stripped[:key_end]
+        key = re.sub(
+            r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), key
+        )
+        if key != key_wanted:
+            continue
+        rest = stripped[key_end:]
+        if sep_kind in ("=", ":"):
+            value = rest[1:].strip()
+        else:
+            # key terminated by whitespace (or no separator): skip blanks,
+            # then one optional '=' / ':' and blanks, per properties spec.
+            k = 0
+            while k < len(rest) and rest[k] in (" ", "\t", "\f"):
+                k += 1
+            if k < len(rest) and rest[k] in ("=", ":"):
+                k += 1
+                while k < len(rest) and rest[k] in (" ", "\t", "\f"):
+                    k += 1
+            value = rest[k:].strip()
+        if not value:
+            return ""
+        # Known value domain is only strict/off/lenient; first whitespace
+        # token blocks '=off # comment' style inline-comment mixing with zero false kills.
+        return value.lower().split(None, 1)[0]
+    return None
+
+
 def validate_gradle_files(root: Path = ROOT) -> None:
     # Scan Gradle scripts under root; skip generated output dirs (build/)
     # and hidden dirs so future build outputs can never false-positive.
@@ -86,7 +148,12 @@ def validate_gradle_files(root: Path = ROOT) -> None:
             return True
         return not any(part == "build" or part.startswith(".") for part in rel.parts[:-1])
 
-    targets = sorted(p for p in root.rglob("*.gradle.kts") if _scannable(p))
+    targets = sorted(
+        p
+        for pattern in ("*.gradle.kts", "*.gradle")
+        for p in root.rglob(pattern)
+        if _scannable(p)
+    )
     props = root / "gradle.properties"
     if props.is_file():
         targets.append(props)
@@ -98,10 +165,15 @@ def validate_gradle_files(root: Path = ROOT) -> None:
         except ValueError:
             label = str(path)
         text = path.read_text(encoding="utf-8")
+        # Gradle DSL has no properties-style whitespace separator semantics, so substring matching is sufficient here.
         if "disableDependencyVerification" in text:
             raise ValueError(f"{label} disables dependency verification (bypass forbidden)")
-        if "org.gradle.dependency.verification=off" in text or "org.gradle.dependency.verification=lenient" in text:
-            raise ValueError(f"{label} weakens verification mode (strict required)")
+        if path.name == "gradle.properties":
+            mode = _properties_verification_mode(text.splitlines())
+            if mode in ("off", "lenient"):
+                raise ValueError(
+                    f"{label} weakens verification mode (strict required, got {mode!r})"
+                )
 
 
 def load_metadata() -> ET.Element:

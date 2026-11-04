@@ -8,6 +8,12 @@
 
   NOTE: backup `path` is exact-match (no globs): WAL sidecars are listed
   explicitly and keysets live under the files/librepocket_keysets/ directory.
+
+  Device-bound state (NOT part of BackupPolicy.KEY_FILES_EXCLUDED, which is
+  key/vault-only): sharedpref/assistant_role.xml holds `everHeld` for the
+  system ROLE_ASSISTANT grant. Role-hold is a per-device system state — a
+  restored device may not hold the role, and migrating the flag would
+  misreport REVOKED on the new device. It must not travel with backup.
 -->
 <data-extraction-rules>
     <cloud-backup>
@@ -16,6 +22,8 @@
         <exclude domain="database" path="librepocket_vault-wal" />
         <exclude domain="database" path="librepocket_vault-shm" />
         <exclude domain="file" path="librepocket_keysets" />
+        <!-- Device-bound: ROLE_ASSISTANT hold flag must not migrate to a new device. -->
+        <exclude domain="sharedpref" path="assistant_role.xml" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="librepocket_keys.xml" />
@@ -23,5 +31,7 @@
         <exclude domain="database" path="librepocket_vault-wal" />
         <exclude domain="database" path="librepocket_vault-shm" />
         <exclude domain="file" path="librepocket_keysets" />
+        <!-- Device-bound: ROLE_ASSISTANT hold flag must not migrate to a new device. -->
+        <exclude domain="sharedpref" path="assistant_role.xml" />
     </device-transfer>
 </data-extraction-rules>

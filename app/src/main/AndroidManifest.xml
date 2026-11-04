@@ -103,7 +103,8 @@
              註：LibrePocketApp.onCreate 在 :voice 仍執行，但 SkillInstaller
              清理僅 main process 執行（見 LibrePocketApp 進程閘門；:voice 跳過
              並記 log，避免與主行程安裝窗口併發）。三 flavor 共用 main
-             manifest，本 PR 無需 flavor overlay。 -->
+             manifest，本 PR 無需 flavor overlay。
+             C1 三服務同 :voice（stub 無狀態）；C2 接 UI/STT 前將 SessionService（+Recognition）另開 :voice_session 並測量 PSS/啟動時延。TODO(C2-voice-process)。 -->
         <service
             android:name=".assistant.LibreVoiceInteractionService"
             android:exported="true"

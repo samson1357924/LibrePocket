@@ -77,9 +77,10 @@ canonical resource members (``res/xml/backup_rules.xml``,
 artifact's actual compiled path by NAME (release obfuscation renames the
 entry), dumps it via ``aapt dump xmltree``, rebuilds the tree and calls
 ``validate_tree`` with ``exact_excludes=True`` - the compiled exclude set
-must equal ``REQUIRED_EXCLUDES`` EXACTLY (missing AND unexpected entries are
-failures, order-free). Source-level presence-only validation cannot see such
-a rewrite.
+must equal ``REQUIRED_EXCLUDES`` plus the allowlisted device-bound extras
+(``ALLOWED_EXTRA_EXCLUDES``; missing required entries AND unexpected entries
+beyond that union are failures, order-free). Source-level presence-only
+validation cannot see such a rewrite.
 
 It is invoked by the shell gate and is directly unit-tested against negative
 fixtures. Run with:
@@ -105,6 +106,17 @@ REQUIRED_EXCLUDES: tuple[tuple[str, str], ...] = (
     ("database", "librepocket_vault-wal"),
     ("database", "librepocket_vault-shm"),
     ("file", "librepocket_keysets"),
+)
+
+# Allowlisted device-bound extras (NOT key material, NOT part of
+# BackupPolicy.KEY_FILES_EXCLUDED): per-device system state that must not
+# migrate to a restored device. `exact_excludes` mode tolerates exactly this
+# union — any other extra is still an unexpected-entry failure.
+#   - ("sharedpref", "assistant_role.xml"): `everHeld` for the system
+#     ROLE_ASSISTANT grant (finding D [P3]); restoring it onto an
+#     unauthorized device would misreport REVOKED.
+ALLOWED_EXTRA_EXCLUDES: tuple[tuple[str, str], ...] = (
+    ("sharedpref", "assistant_role.xml"),
 )
 
 # File↔root binding (Android's own expectation; a swapped file is silently
@@ -235,21 +247,29 @@ def _missing_exclude_errors(
 def _unexpected_exclude_errors(
     path: str, branch_label: str, present: set[tuple[str, str]]
 ) -> list[str]:
-    """Report excludes BEYOND the required five (exact-set mode only).
+    """Report excludes BEYOND the required set (exact-set mode only).
 
-    Artifact-level authority only: the compiled rule bytes must carry exactly
-    ``REQUIRED_EXCLUDES`` (BackupPolicy.KEY_FILES_EXCLUDED) so any
-    resources-overlay / merger rewrite of the compiled XML - even one that
-    only ADDS entries - fails as the set difference it is (order-free).
-    Source-level third parties may over-shield (extra rules never key-leak),
-    so ``validate`` keeps the presence-only semantics by default.
+    Artifact-level authority only: the compiled rule bytes must carry
+    ``REQUIRED_EXCLUDES`` (BackupPolicy.KEY_FILES_EXCLUDED) plus at most the
+    allowlisted ``ALLOWED_EXTRA_EXCLUDES`` (device-bound state, not key
+    material), so any resources-overlay / merger rewrite of the compiled
+    XML - even one that only ADDS other entries - fails as the set
+    difference it is (order-free). Source-level third parties may
+    over-shield (extra rules never key-leak), so ``validate`` keeps the
+    presence-only semantics by default.
     """
-    extra = sorted(present - set(REQUIRED_EXCLUDES))
+    extra = sorted(present - set(REQUIRED_EXCLUDES) - set(ALLOWED_EXTRA_EXCLUDES))
+    allowed = (
+        f" (allowed beyond KEY_FILES_EXCLUDED: "
+        f"{sorted(set(ALLOWED_EXTRA_EXCLUDES))})"
+        if ALLOWED_EXTRA_EXCLUDES
+        else ""
+    )
     return [
         f"{path}: {_where(branch_label)}unexpected exclude domain={domain} "
-        f"path={rule_path} - the compiled backup rules must carry exactly "
-        "the KEY_FILES_EXCLUDED set "
-        f"({len(REQUIRED_EXCLUDES)} entries), nothing else"
+        f"path={rule_path} - the compiled backup rules must carry the "
+        "KEY_FILES_EXCLUDED set "
+        f"({len(REQUIRED_EXCLUDES)} entries){allowed}, nothing else"
         for domain, rule_path in extra
     ]
 
@@ -303,7 +323,8 @@ def validate_tree(
     ``aapt dump xmltree`` output of the COMPILED resource: both surfaces run
     the exact same rules so a compiled-XML rewrite cannot diverge from source.
     ``exact_excludes=True`` (artifact level only) additionally refuses
-    excludes beyond ``REQUIRED_EXCLUDES`` - see ``_unexpected_exclude_errors``.
+    excludes beyond ``REQUIRED_EXCLUDES`` + ``ALLOWED_EXTRA_EXCLUDES``
+    - see ``_unexpected_exclude_errors``.
     """
     if root.tag != expected_root:
         return [f"{path}: expected root <{expected_root}>, found <{root.tag}>"]

@@ -8,6 +8,7 @@ import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Proxy
+import java.net.UnknownHostException
 import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutionException
@@ -388,6 +389,44 @@ class ProviderTransportTest {
         } finally {
             target.shutdown()
             proxy.shutdown()
+        }
+    }
+
+    @Test
+    fun httpMixedDnsNeverConnectsNorReadsKey() = runBlocking {
+        // Phase A P1 BLOCK：http 混答（PUBLIC+LOOPBACK）即使 cleartext opt-in
+        // 也整組拒；transport 閘在讀 key 前，keyCalls 必須 0，零連線。
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(MockResponse().setResponseCode(200).setBody("{\"data\":[]}"))
+            val mixed: HostResolver = HostResolver { host ->
+                if (host == "mixed.example") {
+                    listOf(InetAddress.getByName("203.0.113.5"), InetAddress.getByName("127.0.0.1"))
+                } else {
+                    throw UnknownHostException(host)
+                }
+            }
+            val keyCalls = AtomicInteger(0)
+            val base = "http://mixed.example:${server.port}/v1"
+            val cfg = config(ProviderProtocol.CHAT_COMPLETIONS, base).copy(networkResolver = mixed)
+            val provider = ChatCompletionsProvider(cfg, { keyCalls.incrementAndGet(); fakeKey.toCharArray() }, null)
+            try {
+                withTimeout(5_000) { provider.listModels() }
+                fail("mixed-DNS http must fail closed")
+            } catch (expected: ProviderFailure) {
+                assertFalse(expected.retryable)
+                assertEquals(ProviderFailureCode.NETWORK_POLICY_BLOCKED, expected.code)
+                assertTrue(
+                    "deny carries CLEARTEXT_NOT_PERMITTED, got: ${expected.message}",
+                    expected.message.orEmpty().contains("CLEARTEXT_NOT_PERMITTED"),
+                )
+            }
+            assertEquals("denied listModels must not fetch key", 0, keyCalls.get())
+            assertEquals("denied http mixed-DNS must send nothing", 0, server.requestCount)
+            assertNull(withContext(Dispatchers.IO) { server.takeRequest(100, TimeUnit.MILLISECONDS) })
+        } finally {
+            server.shutdown()
         }
     }
 

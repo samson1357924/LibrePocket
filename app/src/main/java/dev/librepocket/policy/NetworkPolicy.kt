@@ -24,7 +24,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  * - 預設 [EndpointNetworkOptIn] 即 [NetworkEgressPolicy.HTTPS_ONLY]，
  *   私有與明文預設全拒（deny-all），opt-in 只能 per-endpoint 持有，
  *   沒有全域一鍵開放；
- * - `public http://` 永不開放（non-goal），metadata／link-local／CGNAT／
+ * - `public http://` 永不開放（non-goal）；http 另要求全部已解析答案皆為 LOOPBACK／PRIVATE（逐 IP 檢查，混入 PUBLIC 整組拒，pin 只拿授權集合）；metadata／link-local／CGNAT／
  *   multicast／16-byte IPv4-mapped／IPv4 保留段（0/8、240/4、broadcast）／
  *   NAT64·compat·6to4·Teredo 內嵌非公網 v4／userinfo 即使 opt-in 也永遠阻擋；
  *   字面 `::ffff:a.b.c.d` 經平台正規化後等價內嵌 v4，按 v4 決策（見測試）。
@@ -73,6 +73,11 @@ object NetworkPolicy {
     if (url.scheme == "http") {
       // 明文只對迴環／私有開放，且須最高 tier；public http 永不開放。
       if (merged == AddressClass.PUBLIC || !optIn.allowsCleartext) {
+        return NetworkEvaluation.denied(NetworkDenyCode.CLEARTEXT_NOT_PERMITTED, merged, resolved)
+      }
+      // 混合 DNS（如 PUBLIC+LOOPBACK 經 merge 得 LOOPBACK）：http 要求全部答案皆為
+      // LOOPBACK／PRIVATE，混入其餘整組拒（pin 只拿授權集合）。
+      if (classes.any { it != AddressClass.LOOPBACK && it != AddressClass.PRIVATE }) {
         return NetworkEvaluation.denied(NetworkDenyCode.CLEARTEXT_NOT_PERMITTED, merged, resolved)
       }
     }

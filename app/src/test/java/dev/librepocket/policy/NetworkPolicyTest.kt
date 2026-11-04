@@ -294,6 +294,32 @@ class NetworkPolicyTest {
     assertEquals(2, allowed.resolvedAddresses.size)
   }
 
+  @Test fun httpMixedPublicLoopbackDeniedBothOrders() {
+    // Phase A P1 BLOCK：混合 DNS（PUBLIC+LOOPBACK）經 merge 得 LOOPBACK，
+    // http + ALLOW_CLEARTEXT_PRIVATE 不得放行——逐 IP 檢查，整組拒（順序無關）。
+    val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
+    for (answers in listOf(
+      listOf("203.0.113.5", "127.0.0.1"),
+      listOf("127.0.0.1", "203.0.113.5"),
+    )) {
+      val dns = fakeDns("localhost" to answers)
+      val eval = NetworkPolicy.evaluateUrl("http://localhost:8080/v1", optIn, dns)
+      assertDenied(NetworkDenyCode.CLEARTEXT_NOT_PERMITTED, eval)
+      assertEquals(2, eval.resolvedAddresses.size)
+    }
+    // PUBLIC+PRIVATE 混答同樣整組拒。
+    val mixedPrivate = fakeDns("flaky.example" to listOf("203.0.113.5", "10.9.9.9"))
+    assertDenied(
+      NetworkDenyCode.CLEARTEXT_NOT_PERMITTED,
+      NetworkPolicy.evaluateUrl("http://flaky.example:8080/v1", optIn, mixedPrivate),
+    )
+    // 對照組：全 LOOPBACK http + 同 opt-in 仍放行（防過度收緊）。
+    val loopbackOnly = fakeDns("localhost" to listOf("127.0.0.1"))
+    val allowed = NetworkPolicy.evaluateUrl("http://localhost:8080/v1", optIn, loopbackOnly)
+    assertTrue("expected allow: $allowed", allowed.allowed)
+    assertEquals(AddressClass.LOOPBACK, allowed.addressClass)
+  }
+
   @Test fun publicHttpNeverOpensEvenWithOptIn() {
     val dns = fakeDns("api.example.com" to listOf("203.0.113.10"))
     val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)

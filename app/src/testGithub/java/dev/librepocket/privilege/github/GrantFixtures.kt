@@ -10,5 +10,11 @@ package dev.librepocket.privilege.github
 object GrantFixtures {
     val allowAlways: () -> GrantCheck = { GrantCheck.Valid }
 
+    val bridgeOn: () -> Boolean = { true }
+
+    val bridgeOff: () -> Boolean = { false }
+
+    val activationOn: () -> Boolean = { true }
+
     fun invalid(reason: String): () -> GrantCheck = { GrantCheck.Invalid(reason) }
 }

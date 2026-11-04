@@ -23,11 +23,13 @@ class ElevatedRunnerTest {
     private fun shizukuRunner(
         spawn: SpawnCounter,
         quota: ShellQuota = ShellQuota(),
-        bridgeGranted: Boolean = true,
+        bridgeGranted: () -> Boolean = GrantFixtures.bridgeOn,
+        activationCheck: () -> Boolean = GrantFixtures.activationOn,
     ) = ShizukuShellRunner(
         privateRoot = privateRoot,
         quota = quota,
         bridgeGranted = bridgeGranted,
+        activationCheck = activationCheck,
         pingBinder = { true },
         spawn = spawn::spawn,
         // B2：狀態門需假 Available（真實 getVersion 在 JVM 無 Shizuku 即
@@ -39,11 +41,13 @@ class ElevatedRunnerTest {
     private fun rootRunner(
         spawn: SpawnCounter,
         quota: ShellQuota = ShellQuota(),
-        bridgeGranted: Boolean = true,
+        bridgeGranted: () -> Boolean = GrantFixtures.bridgeOn,
+        activationCheck: () -> Boolean = GrantFixtures.activationOn,
     ) = RootSuRunner(
         privateRoot = privateRoot,
         quota = quota,
         bridgeGranted = bridgeGranted,
+        activationCheck = activationCheck,
         spawn = spawn::spawn,
         // B2：su 經可信絕對路徑（單測注入假路徑，不碰真實 FS/su）。
         suBinary = "/system/bin/su",
@@ -97,7 +101,8 @@ class ElevatedRunnerTest {
         val spawn = SpawnCounter()
         val runner = ShizukuShellRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             pingBinder = { false },
             spawn = spawn::spawn,
             // B2：binder 不可達經狀態門回 typed Denied（舊碼回 Failed）；

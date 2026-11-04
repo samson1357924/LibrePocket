@@ -21,7 +21,8 @@ class ElevatedRunnerScreenshotCapacityTest {
 
     private fun shizukuRunner(spawn: (List<String>) -> Process) = ShizukuShellRunner(
         privateRoot = privateRoot,
-        bridgeGranted = true,
+        bridgeGranted = GrantFixtures.bridgeOn,
+        activationCheck = GrantFixtures.activationOn,
         pingBinder = { true },
         spawn = spawn,
         status = { ShizukuStatus.Available(15) },
@@ -30,7 +31,8 @@ class ElevatedRunnerScreenshotCapacityTest {
 
     private fun rootRunner(spawn: (List<String>) -> Process) = RootSuRunner(
         privateRoot = privateRoot,
-        bridgeGranted = true,
+        bridgeGranted = GrantFixtures.bridgeOn,
+        activationCheck = GrantFixtures.activationOn,
         spawn = spawn,
         suBinary = "/system/bin/su",
         grantCheck = GrantFixtures.allowAlways,

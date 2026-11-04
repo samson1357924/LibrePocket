@@ -13,9 +13,11 @@ import rikka.shizuku.Shizuku
 /**
  * Shizuku 提權執行器（S3，BACKLOG D09，矩陣 §3，僅 github 風味）。
  *
- * 執行順序：[ShellPolicy.validateElevated] 先行 → 原因碼 → grant 門
- * （[grantCheck] 每次呼叫新鮮求值，見 R1-B 段）→
- * [ShizukuStatusGate]（B2：binder/授權/版本 typed 門，拒絕即 Denied 且零 spawn；
+ * 執行順序：[ShellPolicy.validateElevated] 先行（[bridgeGranted] 當次求值） →
+ * 原因碼 → grant 門（[grantCheck] 每次呼叫新鮮求值，見 R1-B 段）→ activation 門
+ *（[activationCheck] 新鮮求值，未就緒即拒，見 U1 段）→ 橋門（[bridgeGranted]
+ * 快照，未授權即拒，對一切命令生效，見 U1 段）→ [ShizukuStatusGate]
+ *（B2：binder/授權/版本 typed 門，拒絕即 Denied 且零 spawn；
  * P1-B：validate 先於 binder IPC，避免黑名單 argv 先打 3 次 binder）→ 配額
  * （P1-B：quota 置於門後，與 RootSuRunner 側一致，門拒絕不耗配額）→ 遠端建子進程
  * → 超時殺（盡力整組，見 [ElevatedProcessKiller]） → 輸出截斷。
@@ -43,14 +45,29 @@ import rikka.shizuku.Shizuku
  *（blocking 包裝由 B3 決定，runner 非 suspend 故不能直調 suspend DataStore）；
  * [GrantCheck.Invalid] 一律 `Denied(NOT_WHITELISTED, reason)` 且零 spawn，
  * [grantCheck] 抛異常同樣 fail-closed `Denied(NOT_WHITELISTED)` 且零 spawn。
- * [bridgeGranted] 構造固定值為已知限制（endpoint 切換/revision 推進/grant clear
- * 無法使已建 runner 失效）；B3 dispatcher 應以 [grantCheck] 為準，不以
- * [bridgeGranted] 做撤銷判定。
  *
- * 測試用明示 allow fixture（見 `GrantFixtures.allowAlways`）。
+ * U1 執行門（owner 新 P1-1＋P1-2）：
+ * 每次 [runBinary] 呼叫新鮮求值 [bridgeGranted] 與 [activationCheck]
+ *（構造時只存 supplier，不快取結果；當次 call 快照一次，供
+ * [ShellPolicy.validateElevated] 路徑 scope 與橋門共用，避免同 call 內
+ * 翻轉造成政策與門禁不一致；同一實例跨 call 翻轉即拒，
+ * 見 runner grant 測試的 bridge 翻轉用例）。
+ * - [activationCheck] 預設讀 [PrivilegeActivation.ELEVATED_RUNNERS_READY]
+ *   （現 `false` 即 default-deny；B3 產品傳明示 allow＋每次重驗，不得快取）；
+ *   未就緒即 `Denied(NOT_WHITELISTED, "activation not ready")` 且零 spawn，
+ *   抛異常同樣 fail-closed `Denied(NOT_WHITELISTED)` 且零 spawn；
+ * - [bridgeGranted] 預設 `{ false }`（default-deny）；`false` 即
+ *   `Denied(NOT_WHITELISTED, "privilege bridge off")` 且零 spawn，
+ *   對一切命令生效（含無路徑的 `id`/`getprop`：validate 只把 bridge 傳給
+ *   路徑 scope，無路徑即 Allowed，故此處顯式再擋），抛異常同樣 fail-closed
+ *   且零 spawn。舊「構造固定值」限制已消除：撤銷後 fresh switch
+ *   同一實例次 call 即拒。
  *
- * 產品接線門：見 [PrivilegeActivation.ELEVATED_RUNNERS_READY]（B1 未完，
- * 產品不得接線 runner）。
+ * 測試用明示 allow fixture（見 `GrantFixtures.allowAlways`／`bridgeOn`／`activationOn`）。
+ *
+ * 產品接線門：[PrivilegeActivation.ELEVATED_RUNNERS_READY] 已被兩 runner 經
+ * `activationCheck` 預設消費（default-deny，未就緒一律零 spawn）；
+ * B3 接線時傳明示 allow＋每次重驗。
  *
  * R1-A 雙軌容量（Issue #136 R1-A，owner P1-2）：
  * 截圖二進位（`screencap -p` / `cat /dev/graphics/fb0`，argv 精確匹配）走
@@ -68,7 +85,8 @@ class ShizukuShellRunner(
     private val privateRoot: String? = null,
     private val safRoots: List<String> = emptyList(),
     private val quota: ShellQuota = ShellQuota(),
-    private val bridgeGranted: Boolean = false,
+    private val bridgeGranted: () -> Boolean = { false },
+    private val activationCheck: () -> Boolean = { PrivilegeActivation.ELEVATED_RUNNERS_READY },
     private val flavor: Flavor = Flavor.GITHUB,
     private val pingBinder: () -> Boolean = { ShizukuProbe.ping() },
     private val spawn: ((List<String>) -> Process)? = null,
@@ -82,16 +100,27 @@ class ShizukuShellRunner(
         runBinary(request, timeoutMs).toShellResult()
 
     override fun runBinary(request: ElevatedRequest, timeoutMs: Long): ElevatedBinaryResult {
-        // P1-B 門順序＋R1-B grant：validate → reasonCode → grantCheck → status 門 → quota → spawn。
+        // P1-B 門順序＋R1-B grant＋U1 執行門：
+        // validate → reasonCode → grantCheck → activation → bridge → status 門 → quota → spawn。
         // validate 先於 binder IPC（status 內 ping 最多 3 次 binder），黑名單 argv
         // 零 IPC 即拒；quota 置於門後（與 RootSuRunner 側一致），門拒絕不耗配額。
+        // U1：bridge 當次 call 新鮮求值快照一次，供 validate 與橋門共用
+        //（同 call 內一致；抛異常即 fail-closed 零 spawn）。
+        val bridge = try {
+            bridgeGranted()
+        } catch (_: Exception) {
+            return ElevatedBinaryResult.Denied(
+                ShellDeny.NOT_WHITELISTED,
+                "privilege bridge check failed (fail-closed, no spawn)",
+            )
+        }
         when (
             val v = ShellPolicy.validateElevated(
                 request.argv,
                 privateRoot,
                 safRoots,
                 flavor,
-                bridgeGranted,
+                bridge,
             )
         ) {
             is Validation.Denied -> return ElevatedBinaryResult.Denied(v.reason, v.message)
@@ -100,7 +129,8 @@ class ShizukuShellRunner(
         if (request.reasonCode.isBlank()) {
             return ElevatedRunnerCommon.missingReasonCode()
         }
-        // R1-B：grant 新鮮求值（validate→reasonCode→grantCheck→status 門→quota→spawn）。
+        // R1-B：grant 新鮮求值
+        //（validate→reasonCode→grantCheck→activation→bridge→status 門→quota→spawn）。
         // Invalid 即 Denied(NOT_WHITELISTED, reason) 且零 spawn；抛異常同樣
         // fail-closed Denied 且零 spawn（不耗 quota，不打 binder IPC，不 spawn）。
         val grant = try {
@@ -114,6 +144,30 @@ class ShizukuShellRunner(
         when (grant) {
             is GrantCheck.Valid -> Unit
             is GrantCheck.Invalid -> return ElevatedBinaryResult.Denied(ShellDeny.NOT_WHITELISTED, grant.reason)
+        }
+        // U1 執行門：activation 未就緒即 Denied 且零 spawn；抛異常同樣
+        // fail-closed Denied 且零 spawn（不打 binder IPC，不耗 quota，不 spawn）。
+        val activated = try {
+            activationCheck()
+        } catch (_: Exception) {
+            return ElevatedBinaryResult.Denied(
+                ShellDeny.NOT_WHITELISTED,
+                "activation check failed (fail-closed, no spawn)",
+            )
+        }
+        if (!activated) {
+            return ElevatedBinaryResult.Denied(
+                ShellDeny.NOT_WHITELISTED,
+                "activation not ready (fail-closed, no spawn)",
+            )
+        }
+        // U1 橋門：bridge off 對一切命令生效（含無路徑的 id/getprop：
+        // validate 只把 bridge 傳給路徑 scope，無路徑即 Allowed，故此處顯式再擋）。
+        if (!bridge) {
+            return ElevatedBinaryResult.Denied(
+                ShellDeny.NOT_WHITELISTED,
+                "privilege bridge off (fail-closed, no spawn)",
+            )
         }
         ShizukuStatusGate.denyFor(runCatching { status() }.getOrDefault(ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN)))
             ?.let { return ElevatedBinaryResult.Denied(it.reason, it.message) }

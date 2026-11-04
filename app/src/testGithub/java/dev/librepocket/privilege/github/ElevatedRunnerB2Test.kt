@@ -30,7 +30,8 @@ class ElevatedRunnerB2Test {
         var spawns = 0
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = { _ ->
                 spawns++
                 FakeProcess(
@@ -54,7 +55,8 @@ class ElevatedRunnerB2Test {
     @Test fun suGenericNonZeroMapsToFailedNotOk() {
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = { FakeProcess("".toByteArray(), "E: something broke".toByteArray(), 2) },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
@@ -85,7 +87,8 @@ class ElevatedRunnerB2Test {
         val secretStderr = "E: fail bearer ABCDEFGHIJ123456 ip=10.9.9.9".toByteArray()
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = { FakeProcess(ByteArray(0), secretStderr, 3) },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
@@ -101,7 +104,8 @@ class ElevatedRunnerB2Test {
     @Test fun suZeroStillOk() {
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = { FakeProcess("ok".toByteArray(), ByteArray(0), 0) },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
@@ -114,7 +118,8 @@ class ElevatedRunnerB2Test {
     @Test fun shizukuNonZeroMapsToFailedNotOk() {
         val runner = ShizukuShellRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             pingBinder = { true },
             spawn = { FakeProcess("".toByteArray(), "boom".toByteArray(), 1) },
             status = { ShizukuStatus.Available(15) },
@@ -131,7 +136,8 @@ class ElevatedRunnerB2Test {
         var lastVictim: Process? = null
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
             suBinary = "/system/bin/su",
             killer = {
@@ -151,7 +157,8 @@ class ElevatedRunnerB2Test {
         var kills = 0
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
             suBinary = "/system/bin/su",
             killer = {
@@ -198,7 +205,8 @@ class ElevatedRunnerB2Test {
         val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0xFF.toByte(), 0x00, 0x01)
         val shizuku = ShizukuShellRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             pingBinder = { true },
             spawn = { FakeProcess(png, ByteArray(0), 0) },
             status = { ShizukuStatus.Available(15) },
@@ -213,7 +221,8 @@ class ElevatedRunnerB2Test {
 
         val root = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = { FakeProcess(png, ByteArray(0), 0) },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
@@ -227,7 +236,8 @@ class ElevatedRunnerB2Test {
         val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0xFF.toByte(), 0x00)
         val runner = ShizukuShellRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             pingBinder = { true },
             spawn = { FakeProcess(png, ByteArray(0), 0) },
             status = { ShizukuStatus.Available(15) },
@@ -246,7 +256,8 @@ class ElevatedRunnerB2Test {
         var lastArgv: List<String> = emptyList()
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = { argv ->
                 lastArgv = argv
                 FakeProcess("ok".toByteArray(), ByteArray(0), 0)
@@ -264,7 +275,8 @@ class ElevatedRunnerB2Test {
         var lastArgv: List<String> = emptyList()
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = { argv ->
                 lastArgv = argv
                 FakeProcess("ok".toByteArray(), ByteArray(0), 0)
@@ -280,7 +292,8 @@ class ElevatedRunnerB2Test {
         var spawns = 0
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = {
                 spawns++
                 FakeProcess("ok".toByteArray())
@@ -311,7 +324,8 @@ class ElevatedRunnerB2Test {
         var spawns = 0
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = {
                 spawns++
                 FakeProcess("ok".toByteArray())
@@ -336,7 +350,8 @@ class ElevatedRunnerB2Test {
             var spawns = 0
             val runner = ShizukuShellRunner(
                 privateRoot = privateRoot,
-                bridgeGranted = true,
+                bridgeGranted = GrantFixtures.bridgeOn,
+                activationCheck = GrantFixtures.activationOn,
                 pingBinder = { true },
                 spawn = {
                     spawns++
@@ -358,7 +373,8 @@ class ElevatedRunnerB2Test {
         var spawns = 0
         val runner = ShizukuShellRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             pingBinder = { true },
             spawn = {
                 spawns++
@@ -377,7 +393,8 @@ class ElevatedRunnerB2Test {
         val partial = "partial-bytes".toByteArray()
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = { FakeProcess(partial, ByteArray(0), 0, hang = true) },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
@@ -432,7 +449,8 @@ class ElevatedRunnerB2Test {
         var kills = 0
         val runner = ShizukuShellRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             pingBinder = { true },
             spawn = { FakeProcess(partial, ByteArray(0), 0, hang = true) },
             status = { ShizukuStatus.Available(15) },
@@ -455,7 +473,8 @@ class ElevatedRunnerB2Test {
         var polls = 0
         val runner = ShizukuShellRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             pingBinder = { true },
             spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
             status = { ShizukuStatus.Available(15) },
@@ -475,7 +494,8 @@ class ElevatedRunnerB2Test {
     @Test fun isCancelledThrowFoldsToNotCancelled() {
         val shizuku = ShizukuShellRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             pingBinder = { true },
             spawn = { FakeProcess("ok".toByteArray(), ByteArray(0), 0) },
             status = { ShizukuStatus.Available(15) },
@@ -487,7 +507,8 @@ class ElevatedRunnerB2Test {
 
         val root = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = { FakeProcess("ok".toByteArray(), ByteArray(0), 0) },
             suBinary = "/system/bin/su",
             isCancelled = { throw IllegalStateException("cancel boom") },
@@ -501,7 +522,8 @@ class ElevatedRunnerB2Test {
         var kills = 0
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
             suBinary = "/system/bin/su",
             killer = {
@@ -521,7 +543,8 @@ class ElevatedRunnerB2Test {
         assertTrue(quota.tryAcquire())
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             quota = quota,
             spawn = {
                 spawns++
@@ -545,7 +568,8 @@ class ElevatedRunnerB2Test {
             var spawns = 0
             val runner = RootSuRunner(
                 privateRoot = privateRoot,
-                bridgeGranted = true,
+                bridgeGranted = GrantFixtures.bridgeOn,
+                activationCheck = GrantFixtures.activationOn,
                 spawn = {
                     spawns++
                     FakeProcess("ok".toByteArray(), ByteArray(0), 0)
@@ -564,7 +588,8 @@ class ElevatedRunnerB2Test {
         var spawns = 0
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = {
                 spawns++
                 FakeProcess("ok".toByteArray(), ByteArray(0), 0)
@@ -584,7 +609,8 @@ class ElevatedRunnerB2Test {
         val secret = "boom bearer ABCDEFGHIJ123456 ip=10.9.9.9"
         val runner = ShizukuShellRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             pingBinder = { true },
             spawn = { throw IllegalStateException(secret) },
             status = { ShizukuStatus.Available(15) },
@@ -602,7 +628,8 @@ class ElevatedRunnerB2Test {
         val secret = "boom bearer ABCDEFGHIJ123456 ip=10.9.9.9"
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = { throw IllegalStateException(secret) },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
@@ -619,7 +646,8 @@ class ElevatedRunnerB2Test {
         var spawns = 0
         val runner = ShizukuShellRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             pingBinder = { true },
             spawn = {
                 spawns++
@@ -644,7 +672,8 @@ class ElevatedRunnerB2Test {
         var shizukuSpawns = 0
         val shizuku = ShizukuShellRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             flavor = Flavor.PLAY,
             pingBinder = { true },
             spawn = {
@@ -661,7 +690,8 @@ class ElevatedRunnerB2Test {
         var rootSpawns = 0
         val root = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             flavor = Flavor.PLAY,
             spawn = {
                 rootSpawns++
@@ -680,7 +710,8 @@ class ElevatedRunnerB2Test {
         var shizukuSpawns = 0
         val shizuku = ShizukuShellRunner(
             privateRoot = privateRoot,
-            bridgeGranted = false,
+            bridgeGranted = GrantFixtures.bridgeOff,
+            activationCheck = GrantFixtures.activationOn,
             flavor = Flavor.GITHUB,
             pingBinder = { true },
             spawn = {
@@ -697,7 +728,8 @@ class ElevatedRunnerB2Test {
         var rootSpawns = 0
         val root = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = false,
+            bridgeGranted = GrantFixtures.bridgeOff,
+            activationCheck = GrantFixtures.activationOn,
             flavor = Flavor.GITHUB,
             spawn = {
                 rootSpawns++
@@ -715,7 +747,8 @@ class ElevatedRunnerB2Test {
         var spawns = 0
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = {
                 spawns++
                 FakeProcess("ok".toByteArray(), ByteArray(0), 0)
@@ -735,7 +768,8 @@ class ElevatedRunnerB2Test {
         var lastArgv: List<String> = emptyList()
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = { argv ->
                 lastArgv = argv
                 FakeProcess("ok".toByteArray(), ByteArray(0), 0)
@@ -752,7 +786,8 @@ class ElevatedRunnerB2Test {
         var shizukuKills = 0
         val shizuku = ShizukuShellRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             pingBinder = { true },
             spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
             status = { ShizukuStatus.Available(15) },
@@ -770,7 +805,8 @@ class ElevatedRunnerB2Test {
         var rootKills = 0
         val root = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
             suBinary = "/system/bin/su",
             killer = {
@@ -797,7 +833,8 @@ class ElevatedRunnerB2Test {
         var kills = 0
         val runner = RootSuRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
             suBinary = "/system/bin/su",
             killer = {
@@ -823,7 +860,8 @@ class ElevatedRunnerB2Test {
         var shizukuKills = 0
         val shizuku = ShizukuShellRunner(
             privateRoot = privateRoot,
-            bridgeGranted = true,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
             pingBinder = { true },
             spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
             status = { ShizukuStatus.Available(15) },
@@ -885,7 +923,8 @@ class ElevatedRunnerB2Test {
         runOneRound { killer, isCancelled ->
             RootSuRunner(
                 privateRoot = privateRoot,
-                bridgeGranted = true,
+                bridgeGranted = GrantFixtures.bridgeOn,
+                activationCheck = GrantFixtures.activationOn,
                 spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
                 suBinary = "/system/bin/su",
                 killer = killer,
@@ -896,7 +935,8 @@ class ElevatedRunnerB2Test {
         runOneRound { killer, isCancelled ->
             ShizukuShellRunner(
                 privateRoot = privateRoot,
-                bridgeGranted = true,
+                bridgeGranted = GrantFixtures.bridgeOn,
+                activationCheck = GrantFixtures.activationOn,
                 pingBinder = { true },
                 spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
                 status = { ShizukuStatus.Available(15) },

@@ -8,13 +8,18 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 
-val Context.shizukuGrantDataStore: DataStore<Preferences> by preferencesDataStore(
+/**
+ * P2-A 可見性：本擴展僅 [ShizukuGrantStore] 內部使用，改為 private，
+ * 外部不得直取 DataStore（經 Store API 讀寫，fail-closed 語義集中）。
+ */
+private val Context.shizukuGrantDataStore: DataStore<Preferences> by preferencesDataStore(
     name = "librepocket_shizuku_grant",
 )
 
@@ -105,7 +110,7 @@ object ShizukuGrantPolicy {
  * - 撤銷＝[clear]：鍵全刪，後續 [load] 回 null，舊授權無殘留。
  */
 class ShizukuGrantStore(
-    internal val dataStore: DataStore<Preferences>,
+    private val dataStore: DataStore<Preferences>,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
     constructor(context: Context) : this(context.applicationContext.shizukuGrantDataStore)
@@ -134,6 +139,8 @@ class ShizukuGrantStore(
                     serviceVersion = prefs[SHIZUKU_GRANT_SERVICE_VERSION] ?: return@map null,
                 )
             }.first()
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             null
         }

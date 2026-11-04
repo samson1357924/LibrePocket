@@ -17,8 +17,9 @@ private val SLASH_RUN = Regex("/+")
  *   為直接覆寫的候選路徑（仍須過 [isTrusted]，否則 fail-closed 拒絕），
  *   [RootSuRunner.suExists] 為 [resolve] 用的存在性檢查；兩者正交，
  *   一個管「用哪條」，一個管「哪條存在」。
+ * P2-A 可見性：僅 [RootSuRunner]＋同模組單測使用，收斂為 internal。
  */
-object SuBinaryResolver {
+internal object SuBinaryResolver {
     fun resolve(exists: (String) -> Boolean = { path -> File(path).exists() }): String? {
         for (candidate in RootSuProbe.SU_BINARIES) {
             val present = runCatching { exists(candidate) }.getOrDefault(false)

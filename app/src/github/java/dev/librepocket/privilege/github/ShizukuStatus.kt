@@ -40,11 +40,13 @@ sealed interface ShizukuStatus {
 
     companion object {
         /**
-         * 最低服務版本（B1 決議，Current）。
+         * 最低服務版本（B1 決議）。
          *
-         * 對應 `Shizuku.isPreV11()` 邊界：pre-V11 缺乏現行授權/binder
-         * 語義，禁止執行提權。`newProcess` 等遠端執行 API 屬 B2 接線範圍，
-         * 本常數只守 B1 狀態門，不代表 B2 已驗證。
+         * 版本來源為 `Shizuku.getVersion()`（見 [ShizukuStatusProbe.status]
+         * 的 `serviceVersion` 預設參數）；邊界取 pre-V11：pre-V11 缺乏現行
+         * 授權/binder 語義（對應 `Shizuku.isPreV11()` 劃分），禁止執行提權。
+         * `newProcess` 等遠端執行 API 屬 B2 接線範圍，本常數只守 B1 狀態門，
+         * 不代表 B2 已驗證。
          */
         const val MIN_SERVICE_VERSION: Int = 11
 
@@ -91,7 +93,17 @@ val ShizukuStatus.canExecute: Boolean
  * [ShellResult.Denied]（reason 為各狀態的原因碼），spawn 永不被呼叫。
  */
 object ShizukuStatusGate {
-    /** 非 Available 回對應 typed Denied；Available 回 null（放行，由呼叫方執行）。 */
+    /**
+     * 非 Available 回 typed [ShellResult.Denied]；Available 回 null
+     * （放行，由呼叫方執行）。
+     *
+     * 語義（P2-B 釐清）：四種非 Available 狀態一律回
+     * [ShellDeny.NOT_WHITELISTED]（[ShellDeny] 無更精確的
+     * binder/授權/版本碼，故不另映射）；細因只放在 `message`
+     *（各狀態的 `REASON_*` 碼＋上下文），呼叫方不得對 `message`
+     * 做程式分支（審計若按 reason 分類會失真：verdict 層只見
+     * NOT_WHITELISTED）。
+     */
     fun denyFor(status: ShizukuStatus): ShellResult.Denied? = when (status) {
         is ShizukuStatus.Available -> null
         is ShizukuStatus.PermissionDenied -> ShellResult.Denied(
@@ -113,6 +125,7 @@ object ShizukuStatusGate {
      * 門控執行：拒絕即回 Denied 且不碰 [spawn]；放行才委派 [spawn]。
      * 純函數可測（spawn 為假 lambda；B2/B3 前真實 runner 不經此函數）。
      */
+    @Deprecated("測試專用，產品走 denyFor；B3 dispatcher 前守衛用 denyFor")
     fun runIfAvailable(
         status: ShizukuStatus,
         request: ElevatedRequest,
@@ -132,6 +145,9 @@ class ShizukuBinderEvents {
     private val receivedCallbacks = mutableListOf<() -> Unit>()
     private val deadCallbacks = mutableListOf<() -> Unit>()
     private val lock = Any()
+
+    /** 是否已向 Shizuku 註冊過 listener（冪等守衛，僅 [attach]/[detach] 內讀寫）。 */
+    private var attached = false
 
     fun onReceived(callback: () -> Unit) {
         synchronized(lock) { receivedCallbacks += callback }
@@ -156,13 +172,36 @@ class ShizukuBinderEvents {
     /**
      * 產品接線：向 Shizuku 註冊 binder received/dead listener，事件轉發進回呼表。
      * 註冊本身異常 runCatching 收斂（未安裝/服務異常時不崩，狀態門仍 fail-closed）。
+     * 冪等：重複呼叫只註冊一次（[attached] 守衛）。
      */
     fun attach() {
+        synchronized(lock) {
+            if (attached) return
+            attached = true
+        }
         runCatching {
             Shizuku.addBinderReceivedListener { emitReceived() }
         }
         runCatching {
             Shizuku.addBinderDeadListener { emitDead() }
+        }
+    }
+
+    /**
+     * 解除接線：清 [attached] 守衛並清空回呼表（synchronized）。
+     * Shizuku 未提供移除 listener API，此處僅清本地分發表；
+     * 已註冊的轉發閉包留空轉（emit 快照為空，無副作用）。
+     */
+    fun detach() {
+        clear()
+    }
+
+    /** 清空回呼表並重置 [attached] 守衛（synchronized；測試/生命週期重建用）。 */
+    fun clear() {
+        synchronized(lock) {
+            receivedCallbacks.clear()
+            deadCallbacks.clear()
+            attached = false
         }
     }
 }

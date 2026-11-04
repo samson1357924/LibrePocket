@@ -18,8 +18,10 @@ import java.util.concurrent.TimeUnit
  *   long/int 由 Number 承接、boolean 由 Boolean 承接），無精確匹配即抛
  *   UnsupportedOperationException，避免 overload 選錯靜默誤調；
  * - 零真機依賴：單測以「同名方法但非 Process」的假物件斷言委派，證明無 cast。
+ * P2-A 可見性：僅 [ShizukuShellRunner]＋同模組單測使用，收斂為 internal；
+ * 外部一律經 `Process` 介面（[wrap] 回傳型別）互動，不直接依賴本類。
  */
-class ShizukuRemoteProcess(private val remote: Any) : Process() {
+internal class ShizukuRemoteProcess(private val remote: Any) : Process() {
     private fun call(name: String, vararg args: Any?): Any? {
         val candidates = remote.javaClass.methods.filter { it.name == name && it.parameterCount == args.size }
         // P1-B 精確匹配：名 + 個數 + 參數型別可賦值性（含 primitive long/int/boolean），

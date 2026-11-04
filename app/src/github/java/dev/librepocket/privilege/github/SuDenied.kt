@@ -47,7 +47,11 @@ private val SU_DENIED_SIGNALS: List<String> = listOf(
     "eperm",
 )
 
-fun isSuDenied(stderr: ByteArray, exitCode: Int): Boolean {
+/**
+ * P2-A 可見性：僅提權通道內部＋同模組單測使用，收斂為 internal；
+ * 跨模組呼叫方應經 Runner typed 結果（Denied/Failed），不得直接做字串啟發式判定.
+ */
+internal fun isSuDenied(stderr: ByteArray, exitCode: Int): Boolean {
     if (exitCode == 0) return false
     // String(bytes, UTF_8) 永不抛（用 Replacement 字元收斂非法序列），不包 try/catch。
     val text = String(stderr, Charsets.UTF_8).lowercase(Locale.ROOT)

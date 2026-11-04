@@ -3,6 +3,7 @@ package dev.librepocket.privilege.github
 import dev.librepocket.shell.ElevatedRequest
 import dev.librepocket.shell.ElevatedShellRunner
 import dev.librepocket.shell.PrivilegeAuditLog
+import dev.librepocket.shell.ShellPolicy
 import dev.librepocket.shell.ShellResult
 
 data class FrameDigest(
@@ -70,7 +71,21 @@ class RootFramebufferCapture(
         )
 
     companion object {
-        private const val TIMEOUT_MS: Long = 10_000L
+        /**
+         * 二進位審計＋位元組抽取共用（P2-A）：兩路 `*ViaBinary` 皆經此記帳，
+         * 避免雙寫 verdict 映射。行為錨定：`audit.record(argv/reason/verdict)`
+         * 只記碼不記明文；僅 [ElevatedBinaryResult.Ok] 回位元組拷貝
+         * （`copyOf().takeIf { isNotEmpty() }`，防下游竄改 runner 緩衝），
+         * 其餘（Denied/TimedOut/Failed）一律回 null（呼叫方降級手動截圖）。
+         */
+        private fun auditAndExtract(
+            request: ElevatedRequest,
+            result: ElevatedBinaryResult,
+            audit: PrivilegeAuditLog,
+        ): ByteArray? {
+            audit.record(request.argv, request.reasonCode, result.verdict())
+            return (result as? ElevatedBinaryResult.Ok)?.stdout?.copyOf()?.takeIf { it.isNotEmpty() }
+        }
 
         /**
          * D09 門禁版 screencap 讀取：經提權通道執行 `screencap -p`
@@ -81,12 +96,20 @@ class RootFramebufferCapture(
          *
          * B2：runner 若為 [BinaryElevatedRunner] 即走位元組直達
          * （[screencapViaBinary]），否則回落 String 路徑。
+         *
+         * P2-A 分發說明：此處 `as? BinaryElevatedRunner` 為相容分發——
+         * 僅實作 [ElevatedShellRunner] 的裝飾器（例如測試替身、舊攔截器）
+         * 即走 String 回落（lossy，僅相容文字 runner）；B3 起新 Runner
+         * 應一律實作 [BinaryElevatedRunner]（多載優先：直接呼叫
+         * [screencapViaBinary]/[fb0ViaBinary] 即走位元組直達，不經此分發）。
+         * 舊路徑不刪（相容 [dev.librepocket.shell.DenyingElevatedRunner]
+         * 等文字 runner）。
          */
         fun screencapViaElevated(
             runner: ElevatedShellRunner,
             audit: PrivilegeAuditLog,
             reasonCode: String,
-            timeoutMs: Long = TIMEOUT_MS,
+            timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS,
         ): () -> ByteArray? {
             val binary = runner as? BinaryElevatedRunner
             if (binary != null) return screencapViaBinary(binary, audit, reasonCode, timeoutMs)
@@ -111,7 +134,7 @@ class RootFramebufferCapture(
             runner: ElevatedShellRunner,
             audit: PrivilegeAuditLog,
             reasonCode: String,
-            timeoutMs: Long = TIMEOUT_MS,
+            timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS,
         ): () -> ByteArray? {
             val binary = runner as? BinaryElevatedRunner
             if (binary != null) return fb0ViaBinary(binary, audit, reasonCode, timeoutMs)
@@ -132,12 +155,11 @@ class RootFramebufferCapture(
             runner: BinaryElevatedRunner,
             audit: PrivilegeAuditLog,
             reasonCode: String,
-            timeoutMs: Long = TIMEOUT_MS,
+            timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS,
         ): () -> ByteArray? = {
             val request = ElevatedRequest(listOf("screencap", "-p"), reasonCode)
             val result = runner.runBinary(request, timeoutMs)
-            audit.record(request.argv, request.reasonCode, result.verdict())
-            (result as? ElevatedBinaryResult.Ok)?.stdout?.takeIf { it.isNotEmpty() }
+            auditAndExtract(request, result, audit)
         }
 
         /**
@@ -148,12 +170,11 @@ class RootFramebufferCapture(
             runner: BinaryElevatedRunner,
             audit: PrivilegeAuditLog,
             reasonCode: String,
-            timeoutMs: Long = TIMEOUT_MS,
+            timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS,
         ): () -> ByteArray? = {
             val request = ElevatedRequest(listOf("cat", "/dev/graphics/fb0"), reasonCode)
             val result = runner.runBinary(request, timeoutMs)
-            audit.record(request.argv, request.reasonCode, result.verdict())
-            (result as? ElevatedBinaryResult.Ok)?.stdout?.takeIf { it.isNotEmpty() }
+            auditAndExtract(request, result, audit)
         }
     }
 }

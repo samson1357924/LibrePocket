@@ -2,7 +2,6 @@ package dev.librepocket.privilege.github
 
 import dev.librepocket.redact.Redactor
 import dev.librepocket.shell.ElevatedRequest
-import dev.librepocket.shell.ElevatedShellRunner
 import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellPolicy
 import dev.librepocket.shell.ShellQuota
@@ -60,7 +59,7 @@ class RootSuRunner(
     private val suExists: (String) -> Boolean = { path -> File(path).exists() },
     private val killer: (Process) -> Unit = { ElevatedProcessKiller.killTree(it) },
     private val isCancelled: () -> Boolean = { Thread.currentThread().isInterrupted },
-) : ElevatedShellRunner, BinaryElevatedRunner {
+) : BinaryElevatedRunner {
 
     override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult =
         runBinary(request, timeoutMs).toShellResult()
@@ -79,7 +78,7 @@ class RootSuRunner(
             is Validation.Allowed -> Unit
         }
         if (request.reasonCode.isBlank()) {
-            return ElevatedBinaryResult.Denied(ShellDeny.BAD_ARGUMENT, "reasonCode required (matrix §3 audit)")
+            return ElevatedRunnerCommon.missingReasonCode()
         }
         val rawSu = suBinary ?: SuBinaryResolver.resolve(suExists)
         if (rawSu == null) {
@@ -92,7 +91,7 @@ class RootSuRunner(
             return ElevatedBinaryResult.Failed("su untrusted path (fail-closed, no spawn)")
         }
         if (!quota.tryAcquire()) {
-            return ElevatedBinaryResult.Denied(ShellDeny.QUOTA_EXCEEDED, "elevated shell quota exceeded")
+            return ElevatedRunnerCommon.quotaExceeded()
         }
         // su -c 傳送層：內層 argv 已校驗，此處 joinToString 拼成單一
         // `-c` 字串（裝置側 `su` 必經一次字串解析，非 argv 直達；
@@ -190,6 +189,9 @@ class RootSuRunner(
          * 呼叫前參數衛生已拒絕串接/重定向字元，此處只處理白名單外字元
          * （傳送層縱深防禦；引號/括號等若出現在此即表示上游衛生有漏，
          * 包覆後仍可安全經一次 `su -c` 字串解析）。
+         *
+         * P2-A 可見性：[ElevatedRunnerTest]/[ElevatedRunnerB2Test] 直接調用，
+         * 故保持 public（同包測試亦可 internal，但跨包相容起見保留 public）。
          */
         fun quoteArg(arg: String): String {
             if (arg.isNotEmpty() && arg.all { it in SAFE_ARG_CHARS }) {

@@ -312,6 +312,119 @@ class TurnControllerBudgetBenchmarkTest {
     }
   }
 
+  @Test(timeout = 30_000) fun continuationTrimAddsOnTopOfNonzeroBaseTrim() {
+    // BLOCK-2b: base MAX_REQUEST_CHARS trim AND the continuation's own prefix
+    // trim are BOTH non-zero; the continuation adds on top (catches a
+    // replace-instead-of-add regression that continuationCharAccountingAddsOnTopOfBase
+    // cannot see because its baseTrim==0).
+    // Fixture sizes are derived from TurnController.MAX_REQUEST_CHARS (never
+    // magic): perRow=cap/100 with 150 history rows + live ≈1.5x the cap, so
+    // the plain buildRequest send-time trim must trip; the structured round
+    // (4k args echo + tool result, same BmSliceBackend/sliceLoop pattern as
+    // the base-zero continuation test) pushes the wire estimate over the cap
+    // again so the continuation head-trims further.
+    val fixedClock = Clock.fixed(Instant.parse("2026-10-09T01:41:22Z"), ZoneId.of("UTC"))
+    val fixedZone = { ZoneId.of("UTC") }
+    val cap = TurnController.MAX_REQUEST_CHARS
+    val perRow = cap / 100
+    val history = (0 until 150).map { i ->
+      val role = if (i % 2 == 0) "user" else "assistant"
+      ChatMessage(role = role, text = "hist-$i: " + "x".repeat(perRow))
+    }
+    val echoArgs = """{"query":"${"x".repeat(4_000)}"}"""
+    val provider = BmFakeProvider()
+    val backend = BmSliceBackend()
+    val c = controller(
+      provider,
+      history = history,
+      clock = fixedClock,
+      systemZone = fixedZone,
+      toolSlice = sliceLoop(backend, fixedClock),
+    )
+    // Same handler-observation pattern as continuationCharAccountingAddsOnTopOfBase:
+    // the attempt sees the base trim, the continuation sees the total. Fixed
+    // clock keeps both builds' time blocks byte-identical.
+    var baseTrimmedCount = -1
+    var baseTrimmedChars = -1L
+    var contSeenTotalCount = -1
+    var contSeenTotalChars = -1L
+    var responses = 0
+    provider.handler = { req ->
+      responses++
+      if (req.tools.isNotEmpty()) {
+        baseTrimmedCount = c.lastRequestTrimmedCount
+        baseTrimmedChars = c.lastRequestTrimmedChars
+      } else {
+        contSeenTotalCount = c.lastRequestTrimmedCount
+        contSeenTotalChars = c.lastRequestTrimmedChars
+      }
+      flow {
+        if (responses == 1) {
+          emit(
+            StreamEvent.ToolDone(
+              toolIndex = 0,
+              id = "call-a",
+              name = "lsp.symbols",
+              argumentsJson = echoArgs,
+            ),
+          )
+          emit(StreamEvent.Done("tool_calls"))
+        } else {
+          emit(StreamEvent.TextDelta(0, 0, "trimmed answer"))
+          emit(StreamEvent.Done("stop"))
+        }
+      }
+    }
+    try {
+      runBlocking { c.send("查 A") }
+      assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+      assertEquals(1, backend.invocations.get())
+      assertEquals(2, provider.seenRequests.size)
+      val attempt = provider.seenRequests[0]
+      val cont = provider.seenRequests[1]
+      // Wire shape: attempt offers the slice tool; continuation ships the
+      // frozen pair with no tools.
+      assertEquals(listOf("lsp.symbols"), attempt.tools.map { it.name })
+      assertTrue("continuation must carry no tools", cont.tools.isEmpty())
+      assertEquals(
+        listOf("call-a"),
+        cont.messages.filter { it.role == "assistant" }.flatMap { it.toolCalls }.map { it.id },
+      )
+      assertTrue("continuation must carry the tool result", cont.messages.any { it.role == "tool" })
+      // 1. Both phases trim in both units (base observed at attempt stream
+      // time; continuation's own drop derived from the message diff below).
+      assertTrue("base trim count must be non-zero, got $baseTrimmedCount", baseTrimmedCount > 0)
+      assertTrue("base trim chars must be non-zero, got $baseTrimmedChars", baseTrimmedChars > 0)
+      // The structured round starts at the assistant message carrying
+      // toolCalls; everything before it is the surviving base suffix. The
+      // dropped head rows' text is the continuation's own trim (droppedRows
+      // pattern, never a re-derived prod formula).
+      val structuredAt = cont.messages.indexOfFirst { it.toolCalls.isNotEmpty() }
+      assertTrue("continuation must attach the structured round", structuredAt >= 0)
+      val finalBase = cont.messages.subList(0, structuredAt)
+      assertEquals(attempt.messages.takeLast(finalBase.size), finalBase)
+      val droppedRows = attempt.messages.take(attempt.messages.size - finalBase.size)
+      assertTrue(
+        "continuation must head-trim on top of a non-zero base, attempt=${attempt.messages.size} finalBase=${finalBase.size}",
+        droppedRows.isNotEmpty(),
+      )
+      val contTrimmedChars = droppedRows.sumOf { it.text.length.toLong() }
+      assertTrue("continuation trim chars must be non-zero, got $contTrimmedChars", contTrimmedChars > 0)
+      // 2. Add-vs-replace: the terminal cells are the SUM of the two phases.
+      assertEquals(baseTrimmedCount + droppedRows.size, c.lastRequestTrimmedCount)
+      assertEquals(baseTrimmedChars + contTrimmedChars, c.lastRequestTrimmedChars)
+      // Handler-observed totals agree with the post-turn cells (the
+      // continuation stream runs after the add-on-top publish).
+      assertEquals(c.lastRequestTrimmedCount, contSeenTotalCount)
+      assertEquals(c.lastRequestTrimmedChars, contSeenTotalChars)
+      // 3. Final size mirrors the shipped continuation exactly, same direction.
+      assertEquals(cont.messages.sumOf { it.text.length }.toLong(), c.lastRequestChars)
+      assertTrue("count flow must agree, got ${c.requestTrimmedCount.value}", c.requestTrimmedCount.value > 0)
+    } finally {
+      c.close()
+    }
+  }
+
   @Test(timeout = 30_000) fun maxCharsHydrationExposesCharDrop() {
     val toolBlock = "answer\n[tool:lookup {\"q\":\"hi\"}]"
     val history = listOf(

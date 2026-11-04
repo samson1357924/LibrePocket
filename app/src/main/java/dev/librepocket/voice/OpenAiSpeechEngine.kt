@@ -99,11 +99,14 @@ class ByteArrayMediaDataSource(
 
 /**
  * Android 生產環境預設播放器，利用 [MediaPlayer] 搭配 [ByteArrayMediaDataSource] 達成受限記憶體緩衝播放。
- * 併發與生命週期保證（世代柵欄 + 非阻塞釋放）：
- * - 僅以 [lock] 保護狀態（activePlayer/activeDataSource/activeContinuation/activeEpoch），絕不在持有任何 Java monitor
- *   時呼叫 MediaPlayer native 阻塞方法（setDataSource/prepareAsync/start/reset/release），避免 AB-BA 死鎖；
- * - 每次 play 以遞增世代（epoch）佔位，native 前後皆以世代柵欄複檢，失格即釋放並取消，遲到回呼永不 start；
- * - [stop] 僅做 detach + cancel（持 [lock] 短臨界），native reset/release 投遞至背景釋放執行緒，呼叫線程永不被 native 阻塞；
+ * 併發與生命週期保證（世代柵欄 + 非阻塞釋放 + 同步快速靜音）：
+ * - 僅以 [lock] 保護狀態（activePlayer/activeDataSource/activeContinuation/activeEpoch/sessionEpoch），絕不在持有任何 Java monitor
+ *   時呼叫 MediaPlayer native 阻塞方法（setDataSource/prepareAsync/start/stop/reset/release），避免 AB-BA 死鎖；
+ * - 每次 play 以遞增世代（epoch）佔位，native 前後皆以 epoch+session 雙重柵欄複檢，失格即釋放並取消；
+ *   onPrepared 另有最終緊貼 start 前柵欄 + start 後殘餘窗口再靜音兜底，遲到回呼永不 start（殘餘數指令窗口亦即時 mute）；
+ * - [stop] 先做 detach + cancel（持 [lock] 短臨界），再在鎖外對當前 player 做同步 best-effort 快速靜音
+ *  （`stop()`/退回 `pause()` + 同步清除監聽器，不等待釋放佇列），完整 reset/release 投遞至背景釋放執行緒；
+ *   呼叫線程有界返回，B 的 native stop 不被 A 的阻塞 release 無界排隊；
  * - prepare 另設 prepare 超時（預設 [PREPARE_TIMEOUT_MS]，測試可經 [prepareTimeoutMs] 縮短），
  *   僅涵蓋「尚未 onPrepared」的 PREPARING 階段：onPrepared 成功（epoch 仍 active）即標記已準備並取消計時，
  *   進入 PLAYING 後不再受 prepare timer 影響；逾時僅在仍為 PREPARING 且 epoch 仍 active 時才 detach + 釋放 + resumeWithException。
@@ -129,6 +132,14 @@ class AndroidAudioPlayer(
     private var activeEpoch: Long = 0L
     private var sessionEpoch: Long = 0L
     private val lock = Any()
+    /**
+     * 測試專用柵欄：在 onPrepared 第一重柵欄通過並標記已準備後、最終 start 前柵欄前回調。
+     * 允許測試將回呼線程暫停於「最後一次 epoch check 之前」，再由主線程呼叫 [stop] 製造決定性交錯；
+     * 實作在柵欄返回後仍會做最終雙重柵欄複檢，故遲到 onPrepared 永不 start。生產為 null。
+     * 僅測試使用，呼叫端必須自帶超時，不得在持有 [lock] 時阻塞。
+     */
+    @Volatile
+    internal var preStartBarrierForTest: ((Long) -> Unit)? = null
     // 已成功 onPrepared 並進入 PLAYING 的世代集合（以 lock 保護）。
     // 超時任務僅在 epoch 未標記已準備（仍為 PREPARING）時才允許 detach，避免長音訊播放超過
     // prepare deadline 被誤殺；同時作為 onPrepared 與超時任務之間的競態柵欄（先標記再 start，
@@ -242,6 +253,7 @@ class AndroidAudioPlayer(
 
     // 注意：此函式絕對不可在 synchronized(lock) 或 synchronized(player) 內呼叫，
     // 所有 native（listener 清除/reset/release）皆在鎖外執行，避免阻塞持有鎖的 stop()/play()。
+    // 另見 [tryImmediateMute]：stop 路徑的同步快速靜音亦遵循同樣約束（鎖外、無 synchronized(player)）。
     private fun safelyReleasePlayer(player: MediaPlayer?, dataSource: ByteArrayMediaDataSource?) {
         if (player != null) {
             try {
@@ -283,6 +295,51 @@ class AndroidAudioPlayer(
             // 執行緒池已關閉等極端情況，退回同步釋放，避免洩漏
             safelyReleasePlayer(detached.player, detached.dataSource)
         }
+    }
+
+    /**
+     * 同步快速靜音（bounded immediate mute，鎖外執行、永不持有任何 Java monitor）。
+     *
+     * Stage-B P1/BLOCK-2：[stop] 的邏輯取消（detach+cancel）之外，必須提供真實媒體靜音/停止保證，
+     * 且不得被 [releaseExecutor] 中先前排隊的阻塞 release（例如 A 的 reset 卡住）無界排隊延遲。
+     * 故在 detach 後（鎖外）對當前 player 做 best-effort 同步 `stop()`（必要時退回 `pause()`），
+     * 失敗（PREPARING 等非法狀態拋 IllegalStateException）一律吞掉，完整 reset/release 仍走背景 [releaseAsync]。
+     * 呼叫線程僅執行短 native（不等待佇列），保持有界返回；絕不在 synchronized(lock)/synchronized(player) 內呼叫，
+     * 不重新引入上輪 P1 已修復的 native monitor 死鎖。
+     */
+    private fun tryImmediateMute(player: MediaPlayer?) {
+        if (player == null) return
+        try {
+            player.stop()
+        } catch (_: Throwable) {
+            try {
+                player.pause()
+            } catch (_: Throwable) {
+            }
+        }
+        // 同步清除監聽器（best-effort）：尚未派發的遲到回呼將直接不觸發；
+        // 已進入派發的回呼仍由 epoch+session 雙重柵欄擋下。背景釋放會再次清除，冪等。
+        try {
+            player.setOnPreparedListener(null)
+        } catch (_: Throwable) {
+        }
+        try {
+            player.setOnCompletionListener(null)
+        } catch (_: Throwable) {
+        }
+        try {
+            player.setOnErrorListener(null)
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 先同步快速靜音、再將完整釋放排入背景佇列。呼叫端必須已在鎖外。
+     * 靜音不等待佇列（解決 B 被 A 阻塞 release 無界排隊），釋放仍有序排隊保證不洩漏。
+     */
+    private fun muteAndReleaseAsync(detached: DetachedSession) {
+        tryImmediateMute(detached.player)
+        releaseAsync(detached)
     }
 
     private fun tryResumeUnit(cont: CancellableContinuation<Unit>) {
@@ -361,13 +418,14 @@ class AndroidAudioPlayer(
         }
         val epoch: Long = myEpoch
 
-        // 釋放被取代的舊世代：cancel 原因攜帶 epoch；native 釋放走背景執行緒，不阻塞新播放。
+        // 釋放被取代的舊世代：cancel 原因攜帶 epoch；舊媒體先同步快速靜音（不被佇列阻塞），
+        // 完整 native 釋放走背景執行緒，不阻塞新播放。
         // 同時取消舊世代的 prepare 超時任務，避免其持有舊 player+continuation 15s。
         // 舊世代若已進入 PLAYING，其 prepared 標記亦一併清除，避免集合無界增長。
         if (oldDetached.player != null || oldDetached.continuation != null || oldDetached.dataSource != null) {
             tryCancel(oldDetached.continuation, "Superseded by audio play epoch $epoch")
             cancelTimeoutAndClearPrepared(oldDetached.epoch)
-            releaseAsync(oldDetached)
+            muteAndReleaseAsync(oldDetached)
         }
 
         continuation.invokeOnCancellation {
@@ -376,12 +434,12 @@ class AndroidAudioPlayer(
             }
             if (detached != null) {
                 cancelTimeoutAndClearPrepared(epoch)
-                releaseAsync(detached)
+                muteAndReleaseAsync(detached)
             }
         }
 
         fun isStillActive(): Boolean =
-            synchronized(lock) { activePlayer === player && activeEpoch == epoch } && continuation.isActive
+            synchronized(lock) { activePlayer === player && activeEpoch == epoch && sessionEpoch == epoch } && continuation.isActive
 
         // 世代柵欄：已失格（被 stop/新 play 取代）即主動釋放並取消，不依賴外部。
         if (!isStillActive()) {
@@ -431,8 +489,9 @@ class AndroidAudioPlayer(
 
         try {
             player.setOnPreparedListener { mp ->
+                // 第一重柵欄（epoch + session 雙重）：快速擋下已失格的遲到回呼。
                 val shouldStart =
-                    synchronized(lock) { activePlayer === mp && activeEpoch == epoch } && continuation.isActive
+                    synchronized(lock) { activePlayer === mp && activeEpoch == epoch && sessionEpoch == epoch } && continuation.isActive
                 if (!shouldStart) return@setOnPreparedListener
 
                 // PREPARING -> PLAYING 躍遷：先標記已準備，使併發的超時任務在同一 lock 下可見並跳過，
@@ -440,12 +499,20 @@ class AndroidAudioPlayer(
                 // 遲到 onPrepared（epoch 已失格）以上述 shouldStart 擋下，永不 start 且不留 timer 洩漏。
                 markPrepared(epoch)
 
+                // 測試縫（Stage-B）：允許測試將回呼暫停於最終柵欄之前，製造「最後一次 check 後、native start 前」
+                // 的決定性 stop 交錯；柵欄返回後仍有最終雙重柵欄，故遲到者永不 start。生產為 null。
+                try {
+                    preStartBarrierForTest?.invoke(epoch)
+                } catch (_: Throwable) {
+                }
+
                 var startException: Exception? = null
                 var started = false
                 try {
-                    // start 前再次柵欄確認，native 本身在鎖外執行
+                    // 最終柵欄（epoch + session 雙重，緊貼 native start 前）：縮小 check→start 競態窗口至最小。
+                    // native 本身在鎖外執行（P1 死鎖修復保留：絕不在持有 lock/monitor 時阻塞於 native）。
                     val ok =
-                        synchronized(lock) { activePlayer === mp && activeEpoch == epoch } && continuation.isActive
+                        synchronized(lock) { activePlayer === mp && activeEpoch == epoch && sessionEpoch == epoch } && continuation.isActive
                     if (ok) {
                         mp.start()
                         started = true
@@ -467,13 +534,22 @@ class AndroidAudioPlayer(
                         clearPrepared(epoch)
                     }
                 } else if (!started) {
-                    // 二次柵欄失格（onPrepared 與 stop/取代競態）：未 start，不觸碰 timer 擁有權，
-                    // 僅清除本次標記；detach/cancel/timeout 由勝出的 stop/取代路徑負責。
+                    // 最終柵欄失格（onPrepared 與 stop/取代競態，含柵欄期間的決定性 stop）：未 start，
+                    // 不觸碰 timer 擁有權，僅清除本次標記；detach/cancel/timeout 由勝出的 stop/取代路徑負責。
                     clearPrepared(epoch)
                 } else {
                     // 成功進入 PLAYING：prepare 階段結束，立即取消 prepare 計時；
                     // 此後播放超過原 deadline 不再受 timer 影響，直到真實 onCompletion/onError。
                     cancelTimeout(epoch)
+                    // start→stop 殘餘窗口兜底：若 stop 恰交錯於最終柵欄與 native start 之間（僅數指令寬），
+                    // 此處複檢發現已失格即立即再靜音，將可聽窗口收斂為單次 start 後的瞬時 mute。
+                    // 已 detach 者由勝出的 stop 路徑負責 release，此處僅 best-effort 靜音 + 清標記，不重複排隊。
+                    val stillValid =
+                        synchronized(lock) { activePlayer === mp && activeEpoch == epoch && sessionEpoch == epoch } && continuation.isActive
+                    if (!stillValid) {
+                        tryImmediateMute(mp)
+                        clearPrepared(epoch)
+                    }
                 }
             }
             player.setOnCompletionListener {
@@ -553,7 +629,7 @@ class AndroidAudioPlayer(
                 val detached = synchronized(lock) {
                     if (preparedEpochs.contains(epoch)) {
                         null
-                    } else if (activePlayer === player && activeEpoch == epoch && continuation.isActive) {
+                    } else if (activePlayer === player && activeEpoch == epoch && sessionEpoch == epoch && continuation.isActive) {
                         detachIfActiveLocked(player, epoch)
                     } else {
                         null
@@ -577,7 +653,7 @@ class AndroidAudioPlayer(
                 }
             }, effectiveTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
             // 僅當仍為 active 才保留，否則立即取消（已在排程期間被 stop/取代）。
-            val stillActive = synchronized(lock) { activePlayer === player && activeEpoch == epoch }
+            val stillActive = synchronized(lock) { activePlayer === player && activeEpoch == epoch && sessionEpoch == epoch }
             if (stillActive) {
                 timeoutFutures[epoch] = future
             } else {
@@ -601,8 +677,9 @@ class AndroidAudioPlayer(
         }
         tryCancel(detached.continuation, "AndroidAudioPlayer stopped (epoch ${detached.epoch})")
         cancelTimeoutAndClearPrepared(detached.epoch)
-        // native 釋放在背景執行緒，呼叫線程僅做 detach+cancel，有界返回
-        releaseAsync(detached)
+        // Stage-B：先同步快速靜音（鎖外、短 native，不等待 release 佇列），再將完整釋放排入背景。
+        // 呼叫線程有界返回；B 的 native stop 不被 A 的阻塞 release 無界排隊。
+        muteAndReleaseAsync(detached)
     }
 }
 

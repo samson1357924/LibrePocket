@@ -2450,6 +2450,9 @@ class OpenAiSpeechEngineTest {
 
     @Test
     fun androidAudioPlayer_stopDoesNotCallPlayerStopDirectly() = runBlocking {
+        // Stage-B P1/BLOCK-2 更新：stop() 在 detach 後做同步快速靜音（鎖外 best-effort stop），
+        // 再將完整 reset/release 排入背景；故 PREPARING 階段的 stop() 亦會嘗試同步 stop（mock 上即 stopCalled）。
+        // 仍保證：絕不在持有 lock/monitor 時阻塞於 native；呼叫線程有界返回；完整釋放終將在背景完成。
         val testMp = TestMediaPlayer()
         val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp })
         try {
@@ -2462,11 +2465,11 @@ class OpenAiSpeechEngineTest {
             player.stop()
             job.join()
 
-            // 驗證解除死鎖重構：直接 reset 與 release，嚴格禁止呼叫 player.stop() 與 isPlaying
+            // Stage-B：同步快速靜音必須已發生（不等背景釋放）
+            assertTrue("Stage-B: player.stop() must be called synchronously for immediate mute", testMp.stopCalled)
             // 背景釋放需等待終將釋放
             awaitCondition(timeoutMs = 5000L) { testMp.resetCalled }
             awaitCondition(timeoutMs = 5000L) { testMp.releaseCalled }
-            assertFalse("player.stop() should NOT be called directly", testMp.stopCalled)
             assertTrue("player.reset() must be called", testMp.resetCalled)
             assertTrue("player.release() must be called", testMp.releaseCalled)
         } finally {
@@ -3043,6 +3046,230 @@ class OpenAiSpeechEngineTest {
             assertFalse("start() must not be called when never prepared", testMp.startCalled)
         } finally {
             player.release()
+        }
+    }
+
+    // ---- Stage-B P1/BLOCK-2: stop 真實媒體停止保證（決定性測試） ----
+
+    @Test
+    fun androidAudioPlayer_stopWhileReleaseBlocked_immediatelyMutesPlayingMedia() = runBlocking {
+        // a. A 的 release 被 latch 擋住、B 已 start 播放中：呼叫 stop 後，在解除 A latch 前 B 不得繼續輸出。
+        val resetEntered = CountDownLatch(1)
+        val unblockA = CountDownLatch(1)
+        val playerA = object : TestMediaPlayer() {
+            override fun reset() {
+                resetEntered.countDown()
+                unblockA.await(10, TimeUnit.SECONDS)
+                super.reset()
+            }
+        }
+        val playerB = TestMediaPlayer()
+        var factoryCount = 0
+        val player = AndroidAudioPlayer(mediaPlayerFactory = {
+            if (factoryCount++ == 0) playerA else playerB
+        })
+        // job 引用需在 finally 中清理，宣告於外層以避免提早返回漏放 latch。
+        var jobA: Job? = null
+        var jobB: Job? = null
+        try {
+            jobA = launch(Dispatchers.IO) {
+                try {
+                    player.play(byteArrayOf(0x01, 0x02))
+                } catch (_: CancellationException) {
+                } catch (_: Exception) {
+                }
+            }
+            awaitCondition { playerA.prepareAsyncCalled }
+            playerA.preparedListener!!.onPrepared(playerA)
+            awaitCondition { playerA.startCalled }
+            assertTrue("A must be playing before supersede", playerA.isPlaying())
+
+            jobB = launch(Dispatchers.IO) {
+                try {
+                    player.play(byteArrayOf(0x03, 0x04))
+                } catch (_: CancellationException) {
+                } catch (_: Exception) {
+                }
+            }
+            awaitCondition { playerB.prepareAsyncCalled }
+            // 舊世代 A 的完整釋放已排入單線程 releaseExecutor 並卡住於 reset（證明佇列阻塞中）。
+            assertTrue("A release must enter blocked reset", resetEntered.await(5, TimeUnit.SECONDS))
+            // B 進入 PLAYING。
+            playerB.preparedListener!!.onPrepared(playerB)
+            awaitCondition { playerB.startCalled }
+            assertTrue("B must be playing before stop", playerB.isPlaying())
+
+            // 關鍵：在解除 A latch 前呼叫 stop，B 必須立即靜音（不等背景佇列輪到 B）。
+            player.stop()
+            assertTrue(
+                "B must be synchronously muted at stop return (stopCalled),不等 A latch",
+                playerB.stopCalled,
+            )
+            assertFalse(
+                "B must not be playing immediately after stop (isPlaying==false),不等 A latch",
+                playerB.isPlaying(),
+            )
+            // B 的完整 reset/release 仍排在 A 後面（背景），此時不應已完成——證明快速靜音與背景釋放分離。
+            assertFalse(
+                "B full release must still be queued behind blocked A (background), not yet done",
+                playerB.releaseCalled,
+            )
+        } finally {
+            unblockA.countDown()
+            try {
+                jobA?.join()
+            } catch (_: Throwable) {
+            }
+            try {
+                jobB?.join()
+            } catch (_: Throwable) {
+            }
+            try {
+                awaitCondition(timeoutMs = 5000L) { playerA.releaseCalled && playerB.releaseCalled }
+            } catch (_: Throwable) {
+            }
+            player.release()
+            // 確保測試縫不洩漏至其他用例。
+            player.preStartBarrierForTest = null
+        }
+    }
+
+    @Test
+    fun androidAudioPlayer_onPreparedRacingWithStop_neverStartsAfterFinalFence() = runBlocking {
+        // b. 最後一次 epoch check 後、native start 前的 stop 交錯：遲到 onPrepared 永不 start。
+        // 以 preStartBarrierForTest 將回呼暫停於「最終柵欄之前」，主線程於暫停期間 stop，再放行——最終柵欄必須擋下。
+        val testMp = TestMediaPlayer()
+        val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp })
+        var job: Job? = null
+        try {
+            job = launch(Dispatchers.IO) {
+                try {
+                    player.play(byteArrayOf(0x01, 0x02))
+                } catch (_: CancellationException) {
+                } catch (_: Exception) {
+                }
+            }
+            awaitCondition { testMp.preparedListener != null }
+
+            val entered = CountDownLatch(1)
+            val proceed = CountDownLatch(1)
+            player.preStartBarrierForTest = {
+                entered.countDown()
+                proceed.await(5, TimeUnit.SECONDS)
+            }
+
+            // onPrepared 於背景線程觸發，進入後將阻塞於最終柵欄前的測試縫。
+            val cbJob = launch(Dispatchers.IO) {
+                testMp.preparedListener!!.onPrepared(testMp)
+            }
+            assertTrue("onPrepared must reach pre-start barrier", entered.await(5, TimeUnit.SECONDS))
+
+            // 決定性交錯：回呼暫停期間 stop（detach+epoch 遞增+同步靜音+背景釋放排隊）。
+            player.stop()
+            // 放行回呼，最終柵欄必須觀察到失格而跳過 start。
+            proceed.countDown()
+            cbJob.join()
+            job.join()
+
+            assertFalse(
+                "Late onPrepared racing with stop must NEVER call start()",
+                testMp.startCalled,
+            )
+            assertTrue(
+                "stop() immediate mute must have been attempted",
+                testMp.stopCalled,
+            )
+            awaitCondition(timeoutMs = 5000L) { testMp.releaseCalled }
+            assertTrue("Player must eventually be released", testMp.releaseCalled)
+        } finally {
+            player.preStartBarrierForTest = null
+            try {
+                job?.join()
+            } catch (_: Throwable) {
+            }
+            player.release()
+        }
+    }
+
+    @Test
+    fun androidAudioPlayer_stopBoundedReturnAndRealMuteAreSeparateAssertions() = runBlocking {
+        // c. stop() 快速返回 與 實際音訊停止 是兩個不同 assertions：前者量測呼叫線程耗時（有界返回，
+        // 不被 A 的阻塞 release 拖住），後者驗證真實媒體已靜音（stopCalled/isPlaying），兩者分開斷言。
+        val resetEntered = CountDownLatch(1)
+        val unblockA = CountDownLatch(1)
+        val playerA = object : TestMediaPlayer() {
+            override fun reset() {
+                resetEntered.countDown()
+                unblockA.await(10, TimeUnit.SECONDS)
+                super.reset()
+            }
+        }
+        val playerB = TestMediaPlayer()
+        var factoryCount = 0
+        val player = AndroidAudioPlayer(mediaPlayerFactory = {
+            if (factoryCount++ == 0) playerA else playerB
+        })
+        var jobA: Job? = null
+        var jobB: Job? = null
+        try {
+            jobA = launch(Dispatchers.IO) {
+                try {
+                    player.play(byteArrayOf(0x01))
+                } catch (_: CancellationException) {
+                } catch (_: Exception) {
+                }
+            }
+            awaitCondition { playerA.prepareAsyncCalled }
+            playerA.preparedListener!!.onPrepared(playerA)
+            awaitCondition { playerA.startCalled }
+
+            jobB = launch(Dispatchers.IO) {
+                try {
+                    player.play(byteArrayOf(0x02))
+                } catch (_: CancellationException) {
+                } catch (_: Exception) {
+                }
+            }
+            awaitCondition { playerB.prepareAsyncCalled }
+            assertTrue(resetEntered.await(5, TimeUnit.SECONDS))
+            playerB.preparedListener!!.onPrepared(playerB)
+            awaitCondition { playerB.startCalled }
+            assertTrue(playerB.isPlaying())
+
+            // Assertion 1（快速返回）：stop() 呼叫本身必須有界（不等待背景佇列），即使 A 仍阻塞。
+            val startNs = System.nanoTime()
+            player.stop()
+            val elapsedMs = (System.nanoTime() - startNs) / 1_000_000
+            assertTrue(
+                "stop() must return bounded (<1000ms) while A release blocked, elapsed=${elapsedMs}ms",
+                elapsedMs < 1000,
+            )
+
+            // Assertion 2（真實停止保證）：與耗時斷言分離——stop 返回當下 B 已靜音/停止，不等 A latch 解除。
+            assertTrue(
+                "Real media mute: B stopCalled must be true immediately after stop return",
+                playerB.stopCalled,
+            )
+            assertFalse(
+                "Real media mute: B isPlaying must be false immediately after stop return",
+                playerB.isPlaying(),
+            )
+        } finally {
+            unblockA.countDown()
+            try {
+                jobA?.join()
+            } catch (_: Throwable) {
+            }
+            try {
+                jobB?.join()
+            } catch (_: Throwable) {
+            }
+            try {
+                awaitCondition(timeoutMs = 5000L) { playerB.releaseCalled }
+            } catch (_: Throwable) {
+            }
+            player.release()
+            player.preStartBarrierForTest = null
         }
     }
 }

@@ -5,10 +5,12 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -525,5 +527,42 @@ class WebSearchPhase5Test {
         val out = withTimeout(5_000) { leader.await() } as WebSearchOutcome.Ok
         assertFalse(out.cached)
         assertEquals(1, calls.get())
+    }
+
+    @Test fun throwPlusCancelFollowerCompletesLeaderThrows() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val calls = AtomicInteger(0)
+        val delegate = object : WebSearchProvider {
+            override val id: String = "x"
+            override val capabilities: Set<WebCapability> = emptySet()
+            override suspend fun probe(): WebProbe = WebProbe.Ready
+            override suspend fun search(query: String, count: Int): WebSearchOutcome {
+                calls.incrementAndGet()
+                entered.complete(Unit)
+                // NonCancellable block: leader.cancel() stays pending until release,
+                // then delegate throws (not CE) so the service Exception arm runs
+                // with a cancelled context — the BLOCK regression window.
+                withContext(NonCancellable) { release.await() }
+                throw RuntimeException("boom")
+            }
+        }
+        val svc = WebSearchService(delegate)
+        val leader = async { svc.search("kotlin", 5) }
+        withTimeout(5_000) { entered.await() }
+        // UNDISPATCHED: follower suspended on the shared deferred before cancel.
+        val follower = async(start = CoroutineStart.UNDISPATCHED) { svc.search("kotlin", 5) }
+        leader.cancel()
+        release.complete(Unit)
+        try {
+            withTimeout(5_000) { leader.await() }
+            fail("leader must throw CE")
+        } catch (_: CancellationException) {
+            // expected: leader cancelled, Exception arm rethrows CE
+        }
+        val out = withTimeout(5_000) { follower.await() }
+        assertTrue(out is WebSearchOutcome.Failed)
+        assertEquals(WebFailureReason.TRANSPORT, (out as WebSearchOutcome.Failed).reason)
+        assertEquals(2, calls.get())
     }
 }

@@ -42,6 +42,7 @@ class DdgsSearchProvider(
 
     override suspend fun search(query: String, count: Int): WebSearchOutcome {
         if (query.isBlank()) return WebSearchOutcome.Unavailable(WebUnavailableReason.EMPTY_QUERY)
+        if (endpoint.isBlank()) return WebSearchOutcome.Unavailable(WebUnavailableReason.MISSING_URL)
         val n = WebSearchBudgets.countOf(count)
         val url = buildUrl(query) ?: return WebSearchOutcome.Failed(WebFailureReason.PROTOCOL)
         val response = when (

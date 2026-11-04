@@ -112,7 +112,8 @@ class WebSearchService(
                 }
                 throw e
             } catch (_: Exception) {
-                currentCoroutineContext().ensureActive()
+                try { currentCoroutineContext().ensureActive() }
+                catch (ce: CancellationException) { mine.completeExceptionally(ce); throw ce }
                 val failed = WebSearchOutcome.Failed(WebFailureReason.TRANSPORT)
                 mine.complete(failed)
                 return failed

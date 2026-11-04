@@ -114,6 +114,12 @@ class ChatCompletionsProvider(
             // Additive：与 tools 并存；厂商不支持时由 HTTP 错误分类为 FATAL 上报。
             sb.append(",${webSearchOptionsJson(webSearch.contextSize)}")
         }
+        when (val rf = request.responseFormat) {
+            null, ResponseFormat.Text -> Unit
+            ResponseFormat.JsonObject, is ResponseFormat.JsonSchema -> {
+                sb.append(",\"response_format\":").append(chatResponseFormatJson(rf))
+            }
+        }
         sb.append(",\"messages\":[")
         var first = true
         val emitMsg = { role: String, contentJson: String ->
@@ -217,6 +223,7 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
     // generated here at finish(), never decremented).
     private var totalAggChars = 0
     private var finishReason: String? = null
+    private var sawRefusal = false
     private var webSearchCitationEmitted = false
     private var usage: StreamEvent.Usage? = null
     private var sawDone = false
@@ -258,7 +265,7 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
         val out = ArrayList<StreamEvent>()
         val choices = root.arr("choices")?.items?.filterIsInstance<MiniJson.JObj>()
         val choice = choices?.firstOrNull()
-        val delta = choice?.obj("delta")
+        val delta = choice?.obj("delta") ?: choice?.obj("message")
         if (delta != null) {
             // Text (string or multimodal parts array).
             val text = deltaText(delta)
@@ -307,7 +314,9 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
                 out.add(StreamEvent.TextDelta(round, blockIndex, ServerToolTranscript.webSearchMarker("completed")))
             }
         }
-        choice?.string("finish_reason")?.let { if (it.isNotEmpty() && it != "null") finishReason = it }
+        val reason = choice?.string("finish_reason")
+        if (reason == "refusal") sawRefusal = true
+        if (!reason.isNullOrEmpty() && reason != "null") finishReason = reason
         root.obj("usage")?.let { u ->
             val inp = u.int("prompt_tokens")
             val outp = u.int("completion_tokens")
@@ -350,7 +359,10 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
         }
         // Usage was already emitted inline when seen; keep terminal compact.
         if (finishReason != null && sawDone) {
-            out.add(StreamEvent.Done(finishReason!!))
+            // Priority rule: sawRefusal normalizes wire finish_reason "stop" to "refusal".
+            // Native truncation/filter reasons ("length", "content_filter") take strict precedence and are preserved.
+            val effectiveReason = if (sawRefusal && finishReason == "stop") "refusal" else finishReason!!
+            out.add(StreamEvent.Done(effectiveReason))
         } else {
             out.add(StreamEvent.Failed("SSE_TRUNCATED", retryable = true))
         }
@@ -363,14 +375,42 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
     }
 
     private fun deltaText(delta: MiniJson.JObj): String? {
-        delta.string("content")?.let { return it }
-        val parts = delta.arr("content")?.items?.filterIsInstance<MiniJson.JObj>() ?: return null
-        val sb = StringBuilder()
-        for (p in parts) {
-            val t = p.string("text")
-            if (!t.isNullOrEmpty()) sb.append(t)
+        val refusal = delta.string("refusal")?.takeIf { it.isNotEmpty() }
+        val content = delta.string("content")?.takeIf { it.isNotEmpty() }
+        val parts = delta.arr("content")?.items?.filterIsInstance<MiniJson.JObj>()
+        var partText: String? = null
+        var partRefusal: String? = null
+        if (parts != null) {
+            val textSb = StringBuilder()
+            val refusalSb = StringBuilder()
+            for (p in parts) {
+                val pType = p.string("type")
+                if (pType == "refusal") {
+                    val r = p.string("refusal")?.takeIf { it.isNotEmpty() }
+                        ?: p.string("text")?.takeIf { it.isNotEmpty() }
+                    if (r != null) refusalSb.append(r)
+                } else {
+                    val t = p.string("text")
+                    if (!t.isNullOrEmpty()) textSb.append(t)
+                }
+            }
+            partText = textSb.toString().ifEmpty { null }
+            partRefusal = refusalSb.toString().ifEmpty { null }
         }
-        return sb.toString().ifEmpty { null }
+
+        val text = content ?: partText
+        if (text != null) {
+            // Per OpenAI Structured Outputs §2.4 refusal specification: valid text content takes
+            // strict priority over refusal (including part-array refusal). When text is present,
+            // stray or mixed refusal parts must NOT poison sawRefusal or supersede content.
+            return text
+        }
+        val effectiveRefusal = refusal ?: partRefusal
+        if (effectiveRefusal != null) {
+            sawRefusal = true
+            return effectiveRefusal
+        }
+        return null
     }
 
     private fun deltaReasoning(delta: MiniJson.JObj): String? {

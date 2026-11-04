@@ -23,6 +23,7 @@ import dev.librepocket.provider.DefaultProviderFactory
 import dev.librepocket.provider.KeyProvider
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderConfig
+import dev.librepocket.redact.Redactor
 import dev.librepocket.session.LibrePocketDb
 import dev.librepocket.session.RoomSessionStore
 import dev.librepocket.session.SessionStore
@@ -135,8 +136,12 @@ internal fun interruptedMarkerText(runId: String): String = "turn $runId interru
  */
 internal fun cancelledMarkerText(runId: String): String = "turn $runId cancelled"
 
-private fun isLegacyFailureText(runId: String, text: String): Boolean =
-    text.startsWith("turn $runId failed")
+private fun isLegacyFailureText(runId: String, text: String): Boolean {
+    val prefix = "turn $runId failed"
+    if (text.startsWith(prefix)) return true
+    val redactedPrefix = Redactor.redact(prefix).text
+    return redactedPrefix != prefix && text.startsWith(redactedPrefix)
+}
 
 /**
  * Logical-family id for one transcript row (Stage C): attempt-bound rows
@@ -233,7 +238,9 @@ internal fun findDanglingRunIds(events: List<TranscriptEvent>): List<String> {
             "system" -> {
                 if (e.isFinal && (e.text == interruptedMarkerText(e.runId) ||
                     e.text == cancelledMarkerText(e.runId) ||
-                    isLegacyFailureText(e.runId, e.text))
+                    isLegacyFailureText(e.runId, e.text) ||
+                    e.text == Redactor.redact(interruptedMarkerText(e.runId)).text ||
+                    e.text == Redactor.redact(cancelledMarkerText(e.runId)).text)
                 ) {
                     terminalFamilies.add(family)
                 }
@@ -1623,7 +1630,9 @@ internal fun isSwitchSnapshotTerminalMark(event: TranscriptEvent): Boolean {
     if (event.kind != INTERRUPTED_MARKER_KIND) return false
     return event.text == interruptedMarkerText(event.runId) ||
         event.text == cancelledMarkerText(event.runId) ||
-        isLegacyFailureText(event.runId, event.text)
+        isLegacyFailureText(event.runId, event.text) ||
+        event.text == Redactor.redact(interruptedMarkerText(event.runId)).text ||
+        event.text == Redactor.redact(cancelledMarkerText(event.runId)).text
 }
 
 /**

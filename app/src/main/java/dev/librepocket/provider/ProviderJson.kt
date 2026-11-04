@@ -83,6 +83,54 @@ internal fun chatToolCallJson(tc: ToolCall): String = buildJsonObject {
     })
 }.toString()
 
+/** Parse a response format schema fragment strictly; must be a JSON object (fail-closed). */
+internal fun responseFormatSchemaElement(schemaJson: String): JsonObject = try {
+    when (val el = Json.parseToJsonElement(schemaJson)) {
+        is JsonObject -> el
+        else -> throw ProviderFailure(false, "RESPONSE_FORMAT_SCHEMA_MUST_BE_OBJECT")
+    }
+} catch (e: ProviderFailure) {
+    throw e
+} catch (_: SerializationException) {
+    throw ProviderFailure(false, "RESPONSE_FORMAT_SCHEMA_INVALID")
+} catch (_: IllegalArgumentException) {
+    throw ProviderFailure(false, "RESPONSE_FORMAT_SCHEMA_INVALID")
+}
+
+/** Chat Completions response format fragment. */
+internal fun chatResponseFormatJson(rf: ResponseFormat): String = when (rf) {
+    ResponseFormat.Text -> "{\"type\":\"text\"}"
+    ResponseFormat.JsonObject -> "{\"type\":\"json_object\"}"
+    is ResponseFormat.JsonSchema -> buildJsonObject {
+        put("type", "json_schema")
+        put("json_schema", buildJsonObject {
+            put("name", rf.name)
+            if (rf.description != null) {
+                put("description", rf.description)
+            }
+            put("strict", rf.strict)
+            put("schema", responseFormatSchemaElement(rf.schemaJson))
+        })
+    }.toString()
+}
+
+/** Responses text format fragment. */
+internal fun responsesTextFormatJson(rf: ResponseFormat): String = when (rf) {
+    ResponseFormat.Text -> "{\"format\":{\"type\":\"text\"}}"
+    ResponseFormat.JsonObject -> "{\"format\":{\"type\":\"json_object\"}}"
+    is ResponseFormat.JsonSchema -> buildJsonObject {
+        put("format", buildJsonObject {
+            put("type", "json_schema")
+            put("name", rf.name)
+            if (rf.description != null) {
+                put("description", rf.description)
+            }
+            put("strict", rf.strict)
+            put("schema", responseFormatSchemaElement(rf.schemaJson))
+        })
+    }.toString()
+}
+
 /**
  * Phase 2: role / call-id pairing + round-trip semantics.
  *

@@ -20,7 +20,13 @@ import kotlinx.coroutines.withContext
  * Room-backed [SessionStore] (M4, spec §8).
  *
  * Write-path guarantees (spec §8.4):
- * - every event text passes [Redactor.redact] before insert;
+ * - every event text passes [Redactor.redact] before insert, with exactly one
+ *   narrow identity-preservation exception: system terminal markers
+ *   (`turn <runId> interrupted/cancelled`, and the prefix of `turn <runId> failed`)
+ *   preserve their exact marker prefix when and only when [isTrustedRunId] validates
+ *   the run ID as a trusted UUID shape (protecting against false-positive card redaction
+ *   on Luhn-valid generated IDs); any untrusted run ID or failure message suffix is
+ *   strictly redacted;
  * - image bytes never reach the DB (only [TranscriptEvent.imagesOmitted]);
  * - `seq` is assigned as (max+1) inside the same transaction as the insert,
  *   with a [Mutex] as the second line of defence for same-session concurrency.
@@ -517,7 +523,7 @@ class RoomSessionStore(
     private fun prepareEvent(event: TranscriptEvent): PreparedEvent {
         require(event.kind in VALID_KINDS) { "unknown event kind: ${event.kind}" }
         require(event.kind != "reasoning" || event.text.isEmpty()) { "reasoning marker must have empty text" }
-        val redacted = Redactor.redact(event.text).text
+        val redacted = prepareEventText(event.kind, event.runId, event.text)
         val (text, truncated) = if (redacted.length > MAX_TEXT_CHARS) {
             redacted.take(MAX_TEXT_CHARS) to true
         } else {
@@ -885,14 +891,6 @@ class RoomSessionStore(
     private fun redactFailureReason(reason: String): String =
         Redactor.redactError(Redactor.redact(reason).text)
 
-    private fun terminalTail(runId: String, text: String): String? {
-        val prefix = "turn $runId "
-        if (!text.startsWith(prefix)) return null
-        return text.substring(prefix.length).takeIf {
-            it == "cancelled" || it == "interrupted" || it.startsWith("failed")
-        }
-    }
-
     private fun isAmbiguousRedactedTerminal(runId: String, text: String): Boolean {
         val prefix = "turn $runId "
         val maskedPrefix = Redactor.redact(prefix).text
@@ -1159,4 +1157,41 @@ internal fun redactionSafeExportId(id: UUID): String = buildString(32) {
     for (char in id.toString()) {
         if (char != '-') append('a' + char.digitToInt(16))
     }
+}
+
+private val TRUSTED_RUN_ID_REGEX = Regex(
+    """^(?:(?:switch|snapshot-incomplete|steer|test)-)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$""",
+)
+internal fun isTrustedRunId(runId: String): Boolean = TRUSTED_RUN_ID_REGEX.matches(runId)
+
+internal fun terminalTail(runId: String, text: String): String? {
+    val prefix = "turn $runId "
+    if (!text.startsWith(prefix)) return null
+    return text.substring(prefix.length).takeIf {
+        it == "cancelled" || it == "interrupted" || it.startsWith("failed")
+    }
+}
+
+/**
+ * Prepares event text for storage under write-path redaction guarantees (spec §8.4):
+ * every event text passes [Redactor.redact] before insert, with exactly one narrow
+ * identity-preservation exception: system terminal markers (`turn <runId> interrupted/cancelled`,
+ * and the prefix of `turn <runId> failed`) preserve their exact marker prefix when and only when
+ * [isTrustedRunId] validates the run ID as a trusted UUID shape (protecting against false-positive
+ * card redaction on Luhn-valid generated IDs); any untrusted run ID or failure message suffix is
+ * strictly redacted.
+ */
+internal fun prepareEventText(kind: String, runId: String, text: String): String {
+    if (kind == "system" && isTrustedRunId(runId)) {
+        val tail = terminalTail(runId, text)
+        if (tail != null) {
+            return when {
+                tail == "interrupted" || tail == "cancelled" -> text
+                tail.startsWith("failed") ->
+                    "turn $runId failed" + Redactor.redact(tail.substring("failed".length)).text
+                else -> Redactor.redact(text).text
+            }
+        }
+    }
+    return Redactor.redact(text).text
 }

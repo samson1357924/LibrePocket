@@ -254,6 +254,34 @@ class SessionFakeParityRegressionTest {
                     (roomEx?.message ?: "").contains("model must not be blank"),
             )
         }
+        // 9. Terminal markers with Luhn runId: both preserve runId without card redaction.
+        run {
+            val luhnRunId = "test-00000000-0000-0000-8164-179543296385"
+            val fake = FakeSessionStore()
+            val fsid = fake.createSession("t", "p/m")
+            fake.appendEvent(event(fsid, kind = "system", text = "turn $luhnRunId interrupted", run = luhnRunId))
+            val rsid = room.createSession("t", "p/m")
+            room.appendEvent(event(rsid, kind = "system", text = "turn $luhnRunId interrupted", run = luhnRunId))
+            val ftext = fake.loadEvents(fsid).single().text
+            val rtext = room.loadEvents(rsid).single().text
+            assertEquals("turn $luhnRunId interrupted", ftext)
+            assertEquals("terminal marker shaping must match", rtext, ftext)
+        }
+        // 10. Terminal failure marker: both preserve runId while redacting suffix secrets.
+        run {
+            val luhnRunId = "test-00000000-0000-0000-8164-179543296385"
+            val secret = "sk-" + "testSECRET1234567890"
+            val fake = FakeSessionStore()
+            val fsid = fake.createSession("t", "p/m")
+            fake.appendEvent(event(fsid, kind = "system", text = "turn $luhnRunId failed: $secret", run = luhnRunId))
+            val rsid = room.createSession("t", "p/m")
+            room.appendEvent(event(rsid, kind = "system", text = "turn $luhnRunId failed: $secret", run = luhnRunId))
+            val ftext = fake.loadEvents(fsid).single().text
+            val rtext = room.loadEvents(rsid).single().text
+            assertEquals("failed marker shaping must match", rtext, ftext)
+            assertTrue(ftext.startsWith("turn $luhnRunId failed:"))
+            assertTrue(!ftext.contains(secret))
+        }
     }
 
     private suspend fun assertBothThrowMessage(

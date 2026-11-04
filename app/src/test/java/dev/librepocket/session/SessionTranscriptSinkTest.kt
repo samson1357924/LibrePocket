@@ -81,7 +81,7 @@ open class FakeSessionStore : SessionStore {
         // bad kind on an unknown session still reports the kind gate.
         require(event.kind in VALID_KINDS) { "unknown event kind: ${event.kind}" }
         require(event.kind != "reasoning" || event.text.isEmpty()) { "reasoning marker must have empty text" }
-        val redacted = Redactor.redact(event.text).text
+        val redacted = prepareEventText(event.kind, event.runId, event.text)
         val text = if (redacted.length > RoomSessionStore.MAX_TEXT_CHARS) {
             redacted.take(RoomSessionStore.MAX_TEXT_CHARS)
         } else {

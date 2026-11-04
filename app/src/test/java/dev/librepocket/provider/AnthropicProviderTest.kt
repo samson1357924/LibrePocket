@@ -1,8 +1,14 @@
 package dev.librepocket.provider
 
+import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 /**
@@ -16,10 +22,10 @@ import org.junit.Test
  */
 class AnthropicProviderTest {
 
-    private fun testConfig() = ProviderConfig(
+    private fun testConfig(baseUrl: String = "https://api.anthropic.com") = ProviderConfig(
         id = "00000000-0000-0000-0000-000000000003",
         label = "test",
-        baseUrl = "https://api.anthropic.com",
+        baseUrl = baseUrl,
         protocol = ProviderProtocol.ANTHROPIC,
         apiKeyRef = "provider_key/00000000-0000-0000-0000-000000000003",
     )
@@ -423,5 +429,189 @@ class AnthropicProviderTest {
         assertEquals("https://h/v1/messages", provider.endpoint("https://h"))
         assertEquals("https://h/v1/messages", provider.endpoint("https://h/"))
         assertEquals("https://h/v1/messages", provider.endpoint("https://h/v1/messages"))
+    }
+
+    @Test
+    fun responseFormatJsonSchemaFailsClosed() {
+        val provider = AnthropicProvider(testConfig(), { null })
+        val rf = ResponseFormat.JsonSchema(
+            name = "math_answer",
+            schemaJson = """{"type":"object"}""",
+        )
+        try {
+            provider.buildBody(
+                ChatRequest(
+                    model = "claude-3-5-sonnet",
+                    messages = listOf(ChatMessage("user", "hi")),
+                    responseFormat = rf,
+                ),
+            )
+            fail("expected ProviderFailure for JsonSchema on Anthropic")
+        } catch (e: ProviderFailure) {
+            assertFalse(e.retryable)
+            assertEquals("STRUCTURED_OUTPUTS_NOT_SUPPORTED", e.message)
+        }
+    }
+
+    @Test
+    fun responseFormatJsonObjectFailsClosed() {
+        val provider = AnthropicProvider(testConfig(), { null })
+        try {
+            provider.buildBody(
+                ChatRequest(
+                    model = "claude-3-5-sonnet",
+                    messages = listOf(ChatMessage("user", "hi")),
+                    responseFormat = ResponseFormat.JsonObject,
+                ),
+            )
+            fail("expected ProviderFailure for JsonObject on Anthropic")
+        } catch (e: ProviderFailure) {
+            assertFalse(e.retryable)
+            assertEquals("STRUCTURED_OUTPUTS_NOT_SUPPORTED", e.message)
+        }
+    }
+
+    @Test
+    fun responseFormatNullAndTextAllowed() {
+        val provider = AnthropicProvider(testConfig(), { null })
+
+        val nullBody = provider.buildBody(
+            ChatRequest(
+                model = "claude-3-5-sonnet",
+                messages = listOf(ChatMessage("user", "hi")),
+                responseFormat = null,
+            ),
+        )
+        assertTrue(nullBody.contains("\"messages\":"))
+        assertFalse(nullBody.contains("\"response_format\""))
+
+        val textBody = provider.buildBody(
+            ChatRequest(
+                model = "claude-3-5-sonnet",
+                messages = listOf(ChatMessage("user", "hi")),
+                responseFormat = ResponseFormat.Text,
+            ),
+        )
+        assertTrue(textBody.contains("\"messages\":"))
+        assertFalse(textBody.contains("\"response_format\""))
+    }
+
+    @Test
+    fun streamWithUnsupportedResponseFormatEmitsFailedWithoutThrowing() = runBlocking {
+        // ResponseFormat.JsonObject
+        val jsonObjectKey = "test-api-key-json-object".toCharArray()
+        val jsonObjectProvider = AnthropicProvider(testConfig(), { jsonObjectKey })
+        val jsonObjectRequest = ChatRequest(
+            model = "claude-3-5-sonnet",
+            messages = listOf(ChatMessage("user", "hi")),
+            responseFormat = ResponseFormat.JsonObject,
+        )
+        val jsonObjectEvents = jsonObjectProvider.stream(jsonObjectRequest).toList()
+        assertEquals(
+            listOf(StreamEvent.Failed("STRUCTURED_OUTPUTS_NOT_SUPPORTED", retryable = false)),
+            jsonObjectEvents,
+        )
+        assertTrue("apiKey must be zeroed in JsonObject fail-closed path", jsonObjectKey.all { it == '\u0000' })
+
+        // ResponseFormat.JsonSchema
+        val jsonSchemaKey = "test-api-key-json-schema".toCharArray()
+        val jsonSchemaProvider = AnthropicProvider(testConfig(), { jsonSchemaKey })
+        val jsonSchemaRequest = ChatRequest(
+            model = "claude-3-5-sonnet",
+            messages = listOf(ChatMessage("user", "hi")),
+            responseFormat = ResponseFormat.JsonSchema(
+                name = "test_schema",
+                schemaJson = """{"type":"object"}""",
+            ),
+        )
+        val jsonSchemaEvents = jsonSchemaProvider.stream(jsonSchemaRequest).toList()
+        assertEquals(
+            listOf(StreamEvent.Failed("STRUCTURED_OUTPUTS_NOT_SUPPORTED", retryable = false)),
+            jsonSchemaEvents,
+        )
+        assertTrue("apiKey must be zeroed in JsonSchema fail-closed path", jsonSchemaKey.all { it == '\u0000' })
+    }
+
+    @Test
+    fun streamWithTextAndNullResponseFormatStreamsSuccessfully() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val sseBody =
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n" +
+                    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello Claude\"}}\n\n" +
+                    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n" +
+                    "data: {\"type\":\"message_stop\"}\n\n"
+
+            // 1. ResponseFormat.Text
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(sseBody),
+            )
+            val textKey = "test-api-key-text".toCharArray()
+            val textProvider = AnthropicProvider(
+                testConfig(server.url("/").toString().trimEnd('/')),
+                { textKey },
+            )
+            val textRequest = ChatRequest(
+                model = "claude-3-5-sonnet",
+                messages = listOf(ChatMessage("user", "hi")),
+                responseFormat = ResponseFormat.Text,
+            )
+            val textEvents = withTimeout(10_000) {
+                textProvider.stream(textRequest).toList()
+            }
+            val textRecorded = server.takeRequest()
+            val textRequestBody = textRecorded.body.readUtf8()
+            assertFalse(textRequestBody.contains("\"response_format\""))
+            assertEquals(
+                listOf(
+                    StreamEvent.Usage(10, null),
+                    StreamEvent.TextDelta(0, 0, "Hello Claude"),
+                    StreamEvent.Usage(10, 5),
+                    StreamEvent.Done("end_turn"),
+                ),
+                textEvents,
+            )
+            assertTrue("apiKey must be zeroed in Text path", textKey.all { it == '\u0000' })
+
+            // 2. null responseFormat
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(sseBody),
+            )
+            val nullKey = "test-api-key-null".toCharArray()
+            val nullProvider = AnthropicProvider(
+                testConfig(server.url("/").toString().trimEnd('/')),
+                { nullKey },
+            )
+            val nullRequest = ChatRequest(
+                model = "claude-3-5-sonnet",
+                messages = listOf(ChatMessage("user", "hi")),
+                responseFormat = null,
+            )
+            val nullEvents = withTimeout(10_000) {
+                nullProvider.stream(nullRequest).toList()
+            }
+            val nullRecorded = server.takeRequest()
+            val nullRequestBody = nullRecorded.body.readUtf8()
+            assertFalse(nullRequestBody.contains("\"response_format\""))
+            assertEquals(
+                listOf(
+                    StreamEvent.Usage(10, null),
+                    StreamEvent.TextDelta(0, 0, "Hello Claude"),
+                    StreamEvent.Usage(10, 5),
+                    StreamEvent.Done("end_turn"),
+                ),
+                nullEvents,
+            )
+            assertTrue("apiKey must be zeroed in null responseFormat path", nullKey.all { it == '\u0000' })
+        } finally {
+            server.shutdown()
+        }
     }
 }

@@ -172,30 +172,8 @@ class ShizukuShellRunner(
 
     companion object {
         /**
-         * 預設遠端建子進程：Shizuku 13.x 的 `newProcess` 為 private，
-         * 此處反射呼叫（argv 直達，不經 `sh -c`，不拼字串）。
-         * P0 修正：`dir` 傳 privateRoot（非 null），不再傳 null。
-         * B2 修正：回傳物經 [ShizukuRemoteProcess.wrap] 包裝，永不直 cast。
-         *
-         * 禁止產品使用（已釘死 cwd：`dir=null` 落在 system_server 預設
-         * cwd，不可控；產品一律走實例 [pinnedSpawn]）；死相容殼不刪除
-         * （測試/舊碼引用不斷），B3 前刪除。
-         *
-         * R3-B（PocketGuard WARN）：grep 確認測試零引用，收斂為 private
-         * （產品源集僅 [pinnedSpawn] 經 [defaultSpawnWithDir] 間接使用；
-         * 外部模組不可見）；Deprecated 保留，B3 前刪除。
-         */
-        @Deprecated(
-            "禁止產品使用（已釘死 cwd，dir=null 不可控）；死相容殼，B3 前刪除。產品一律走實例 pinnedSpawn。",
-        )
-        private val defaultSpawn: (List<String>) -> Process = { argv ->
-            defaultSpawnWithDir(argv, null)
-        }
-
-        /**
          * R3-B：grep 確認測試零引用，收斂為 private（僅 [pinnedSpawn]
-         * 內部使用）；B3 前與 [defaultSpawn] 一併重審
-         * （刪除或保留內部實現）。
+         * 內部使用）；B3 前重審（刪除或保留內部實現）。
          */
         private fun defaultSpawnWithDir(argv: List<String>, dir: String?): Process {
             val method = Shizuku::class.java.getDeclaredMethod(

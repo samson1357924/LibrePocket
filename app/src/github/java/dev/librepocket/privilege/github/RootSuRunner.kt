@@ -56,13 +56,20 @@ import java.io.File
  * R1-B grant 接線（Issue #136 R1-B，owner P1-3＋PocketGuard WARN grant）：
  * 每次 [runBinary] 呼叫新鮮求值 [grantCheck]（構造時只存 supplier，不快取結果；
  * 同一實例跨 call 翻轉即拒，見 runner grant 測試的 flipsAcrossCalls）。
- * 產品 B3 必須供給 `{ store.check(freshProviderId, freshRevision) }`
+ * [grantCheck] 為必填參數（mandatory dependency，無預設值；缺接線編譯失敗，
+ * 一律零 spawn）：呼叫方必須每次供給新鮮 [GrantCheck]，產品 B3 供給
+ * `{ store.check(freshProviderId, freshRevision) }`
  *（blocking 包裝由 B3 決定，runner 非 suspend 故不能直調 suspend DataStore）；
  * [GrantCheck.Invalid] 一律 `Denied(NOT_WHITELISTED, reason)` 且零 spawn，
  * [grantCheck] 抛異常同樣 fail-closed `Denied(NOT_WHITELISTED)` 且零 spawn。
  * [bridgeGranted] 構造固定值為已知限制（endpoint 切換/revision 推進/grant clear
  * 無法使已建 runner 失效）；B3 dispatcher 應以 [grantCheck] 為準，不以
  * [bridgeGranted] 做撤銷判定。
+ *
+ * 測試用明示 allow fixture（見 `GrantFixtures.allowAlways`）。
+ *
+ * 產品接線門：見 [PrivilegeActivation.ELEVATED_RUNNERS_READY]（B1 未完，
+ * 產品不得接線 runner）。
  *
  * R1-A 雙軌容量（Issue #136 R1-A，owner P1-2）：
  * 截圖二進位（`screencap -p` / `cat /dev/graphics/fb0`，argv 精確匹配）走
@@ -87,7 +94,7 @@ class RootSuRunner(
     private val suExists: (String) -> Boolean = { path -> File(path).exists() },
     private val killer: (Process) -> Unit = { ElevatedProcessKiller.killTree(it) },
     private val isCancelled: () -> Boolean = { Thread.currentThread().isInterrupted },
-    private val grantCheck: () -> GrantCheck = { GrantCheck.Valid },
+    private val grantCheck: () -> GrantCheck,
 ) : BinaryElevatedRunner {
 
     override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult =

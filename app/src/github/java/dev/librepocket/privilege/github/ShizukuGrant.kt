@@ -48,6 +48,11 @@ internal val SHIZUKU_GRANT_SERVICE_VERSION = intPreferencesKey("shizuku_grant_se
  * 零 spawn，`grantCheck` 抛異常同樣 fail-closed 零 spawn，跨 call 翻轉同實例即拒）；
  * 全鏈路（endpoint 切換/revision 推進/grant clear→已建 runner 拒絕→零 spawn）
  * 見 runner grant 測試，不在本檔重證。
+ *
+ * S1 fail-closed（owner P1-1 security）：兩 runner 預設不再放行；
+ * [dev.librepocket.privilege.github.RootSuRunner]／[dev.librepocket.privilege.github.ShizukuShellRunner]
+ * 的 `grantCheck` 無預設值（mandatory dependency），缺接線編譯失敗；
+ * B3 產品供給責任：`{ store.check(freshProviderId, freshRevision) }`（每次新鮮求值）。
  * [dev.librepocket.shell.PrivilegeBridgeState.revoke] 與本 Store 的統一路徑為
  * B3 職責（本檔不跨域調 bridge 狀態，避免 main/github 源集耦合）。
  */

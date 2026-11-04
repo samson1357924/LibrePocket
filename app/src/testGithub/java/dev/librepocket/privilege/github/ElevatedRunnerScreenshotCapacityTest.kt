@@ -44,6 +44,7 @@ class ElevatedRunnerScreenshotCapacityTest {
         pingBinder = { true },
         spawn = spawn,
         status = { ShizukuStatus.Available(15) },
+        grantCheck = GrantFixtures.allowAlways,
     )
 
     private fun rootRunner(spawn: (List<String>) -> Process) = RootSuRunner(
@@ -51,6 +52,7 @@ class ElevatedRunnerScreenshotCapacityTest {
         bridgeGranted = true,
         spawn = spawn,
         suBinary = "/system/bin/su",
+        grantCheck = GrantFixtures.allowAlways,
     )
 
     @Test fun screenshotCapacityConstantsAre8M() {

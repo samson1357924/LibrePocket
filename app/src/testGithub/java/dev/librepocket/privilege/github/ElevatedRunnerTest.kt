@@ -63,6 +63,7 @@ class ElevatedRunnerTest {
         // B2：狀態門需假 Available（真實 getVersion 在 JVM 無 Shizuku 即
         // VersionUnsupported；單測只斷 runner 語義，不斷探測）。
         status = { ShizukuStatus.Available(15) },
+        grantCheck = GrantFixtures.allowAlways,
     )
 
     private fun rootRunner(
@@ -76,6 +77,7 @@ class ElevatedRunnerTest {
         spawn = spawn::spawn,
         // B2：su 經可信絕對路徑（單測注入假路徑，不碰真實 FS/su）。
         suBinary = "/system/bin/su",
+        grantCheck = GrantFixtures.allowAlways,
     )
 
     @Test fun nonWhitelistedBinaryPassesOnlyViaElevated() {
@@ -131,6 +133,7 @@ class ElevatedRunnerTest {
             // B2：binder 不可達經狀態門回 typed Denied（舊碼回 Failed）；
             // 假狀態直接給不可達，不碰真實 binder。
             status = { ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN) },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val r = runner.run(ElevatedRequest(listOf("id"), reasonCode = "D09-T"))
         assertTrue("$r", r is ShellResult.Denied)

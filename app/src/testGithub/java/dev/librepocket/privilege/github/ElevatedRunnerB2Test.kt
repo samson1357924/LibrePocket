@@ -79,6 +79,7 @@ class ElevatedRunnerB2Test {
                 )
             },
             suBinary = "/system/bin/su",
+            grantCheck = GrantFixtures.allowAlways,
         )
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Denied)
@@ -95,6 +96,7 @@ class ElevatedRunnerB2Test {
             bridgeGranted = true,
             spawn = { FakeProcess("".toByteArray(), "E: something broke".toByteArray(), 2) },
             suBinary = "/system/bin/su",
+            grantCheck = GrantFixtures.allowAlways,
         )
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Failed)
@@ -125,6 +127,7 @@ class ElevatedRunnerB2Test {
             bridgeGranted = true,
             spawn = { FakeProcess(ByteArray(0), secretStderr, 3) },
             suBinary = "/system/bin/su",
+            grantCheck = GrantFixtures.allowAlways,
         )
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Failed)
@@ -140,6 +143,7 @@ class ElevatedRunnerB2Test {
             bridgeGranted = true,
             spawn = { FakeProcess("ok".toByteArray(), ByteArray(0), 0) },
             suBinary = "/system/bin/su",
+            grantCheck = GrantFixtures.allowAlways,
         )
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Ok)
@@ -153,6 +157,7 @@ class ElevatedRunnerB2Test {
             pingBinder = { true },
             spawn = { FakeProcess("".toByteArray(), "boom".toByteArray(), 1) },
             status = { ShizukuStatus.Available(15) },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Failed)
@@ -173,6 +178,7 @@ class ElevatedRunnerB2Test {
                 lastVictim = it
                 it.destroy()
             },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 120L)
         assertTrue("$r", r is ShellResult.TimedOut)
@@ -192,6 +198,7 @@ class ElevatedRunnerB2Test {
                 it.destroy()
             },
             isCancelled = { true },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val start = System.currentTimeMillis()
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 10_000L)
@@ -252,6 +259,7 @@ class ElevatedRunnerB2Test {
             pingBinder = { true },
             spawn = { FakeProcess(png, ByteArray(0), 0) },
             status = { ShizukuStatus.Available(15) },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val b = shizuku.runBinary(ElevatedRequest(listOf("screencap", "-p"), "B2-T"), 2_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Ok)
@@ -265,6 +273,7 @@ class ElevatedRunnerB2Test {
             bridgeGranted = true,
             spawn = { FakeProcess(png, ByteArray(0), 0) },
             suBinary = "/system/bin/su",
+            grantCheck = GrantFixtures.allowAlways,
         )
         val rb = root.runBinary(ElevatedRequest(listOf("screencap", "-p"), "B2-T"), 2_000L)
         assertTrue("$rb", rb is ElevatedBinaryResult.Ok)
@@ -279,6 +288,7 @@ class ElevatedRunnerB2Test {
             pingBinder = { true },
             spawn = { FakeProcess(png, ByteArray(0), 0) },
             status = { ShizukuStatus.Available(15) },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val audit = dev.librepocket.shell.PrivilegeAuditLog()
         val read = RootFramebufferCapture.screencapViaElevated(runner, audit, "B2-T", 2_000L)
@@ -299,6 +309,7 @@ class ElevatedRunnerB2Test {
                 FakeProcess("ok".toByteArray(), ByteArray(0), 0)
             },
             suBinary = "/system/bin/su",
+            grantCheck = GrantFixtures.allowAlways,
         )
         assertTrue(runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L) is ShellResult.Ok)
         assertTrue(lastArgv.size == 3)
@@ -316,6 +327,7 @@ class ElevatedRunnerB2Test {
                 FakeProcess("ok".toByteArray(), ByteArray(0), 0)
             },
             suExists = { it == "/system/xbin/su" },
+            grantCheck = GrantFixtures.allowAlways,
         )
         assertTrue(runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L) is ShellResult.Ok)
         assertEquals("/system/xbin/su", lastArgv[0])
@@ -331,6 +343,7 @@ class ElevatedRunnerB2Test {
                 FakeProcess("ok".toByteArray())
             },
             suExists = { false },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Failed)
@@ -361,6 +374,7 @@ class ElevatedRunnerB2Test {
                 FakeProcess("ok".toByteArray())
             },
             suExists = { throw SecurityException("denied") },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Failed)
@@ -386,6 +400,7 @@ class ElevatedRunnerB2Test {
                     FakeProcess("ok".toByteArray())
                 },
                 status = { status },
+                grantCheck = GrantFixtures.allowAlways,
             )
             val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
             assertTrue("$status -> $r", r is ShellResult.Denied)
@@ -407,6 +422,7 @@ class ElevatedRunnerB2Test {
                 FakeProcess("ok".toByteArray())
             },
             status = { ShizukuStatus.Available(15) },
+            grantCheck = GrantFixtures.allowAlways,
         )
         assertTrue(runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L) is ShellResult.Ok)
         assertEquals(1, spawns)
@@ -421,6 +437,7 @@ class ElevatedRunnerB2Test {
             bridgeGranted = true,
             spawn = { FakeProcess(partial, ByteArray(0), 0, hang = true) },
             suBinary = "/system/bin/su",
+            grantCheck = GrantFixtures.allowAlways,
         )
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "B2-T"), 120L)
         assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
@@ -480,6 +497,7 @@ class ElevatedRunnerB2Test {
                 kills++
                 it.destroy()
             },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 150L)
         assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
@@ -503,6 +521,7 @@ class ElevatedRunnerB2Test {
                 it.destroy()
             },
             isCancelled = { ++polls > 2 },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 10_000L)
         assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
@@ -518,6 +537,7 @@ class ElevatedRunnerB2Test {
             spawn = { FakeProcess("ok".toByteArray(), ByteArray(0), 0) },
             status = { ShizukuStatus.Available(15) },
             isCancelled = { throw IllegalStateException("cancel boom") },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val b = shizuku.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Ok)
@@ -528,6 +548,7 @@ class ElevatedRunnerB2Test {
             spawn = { FakeProcess("ok".toByteArray(), ByteArray(0), 0) },
             suBinary = "/system/bin/su",
             isCancelled = { throw IllegalStateException("cancel boom") },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val r = root.run(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Ok)
@@ -544,6 +565,7 @@ class ElevatedRunnerB2Test {
                 kills++
                 throw IllegalStateException("kill boom")
             },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 150L)
         assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
@@ -563,6 +585,7 @@ class ElevatedRunnerB2Test {
                 FakeProcess("ok".toByteArray(), ByteArray(0), 0)
             },
             suBinary = "/system/bin/su",
+            grantCheck = GrantFixtures.allowAlways,
         )
         val r = runner.run(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Denied)
@@ -585,6 +608,7 @@ class ElevatedRunnerB2Test {
                     FakeProcess("ok".toByteArray(), ByteArray(0), 0)
                 },
                 suBinary = "/system/bin/su",
+                grantCheck = GrantFixtures.allowAlways,
             )
             val r = runner.run(ElevatedRequest(listOf("id"), reason), 2_000L)
             assertTrue("reason='$reason' -> $r", r is ShellResult.Denied)
@@ -603,6 +627,7 @@ class ElevatedRunnerB2Test {
                 FakeProcess("ok".toByteArray(), ByteArray(0), 0)
             },
             suBinary = "/system/bin/su",
+            grantCheck = GrantFixtures.allowAlways,
         )
         val r = runner.run(ElevatedRequest(emptyList(), "P3-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Denied)
@@ -620,6 +645,7 @@ class ElevatedRunnerB2Test {
             pingBinder = { true },
             spawn = { throw IllegalStateException(secret) },
             status = { ShizukuStatus.Available(15) },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Failed)
@@ -636,6 +662,7 @@ class ElevatedRunnerB2Test {
             bridgeGranted = true,
             spawn = { throw IllegalStateException(secret) },
             suBinary = "/system/bin/su",
+            grantCheck = GrantFixtures.allowAlways,
         )
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Failed)
@@ -656,6 +683,7 @@ class ElevatedRunnerB2Test {
                 FakeProcess("ok".toByteArray(), ByteArray(0), 0)
             },
             status = { throw IllegalStateException("status boom") },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val r = runner.run(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Denied)
@@ -681,6 +709,7 @@ class ElevatedRunnerB2Test {
                 FakeProcess("ok".toByteArray(), ByteArray(0), 0)
             },
             status = { ShizukuStatus.Available(15) },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val sr = shizuku.run(ElevatedRequest(argv, "P3-T"), 2_000L)
         assertTrue("$sr", sr is ShellResult.Denied)
@@ -696,6 +725,7 @@ class ElevatedRunnerB2Test {
                 FakeProcess("ok".toByteArray(), ByteArray(0), 0)
             },
             suBinary = "/system/bin/su",
+            grantCheck = GrantFixtures.allowAlways,
         )
         val rr = root.run(ElevatedRequest(argv, "P3-T"), 2_000L)
         assertTrue("$rr", rr is ShellResult.Denied)
@@ -715,6 +745,7 @@ class ElevatedRunnerB2Test {
                 FakeProcess("ok".toByteArray(), ByteArray(0), 0)
             },
             status = { ShizukuStatus.Available(15) },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val sr = shizuku.run(ElevatedRequest(argv, "P3-T"), 2_000L)
         assertTrue("$sr", sr is ShellResult.Denied)
@@ -730,6 +761,7 @@ class ElevatedRunnerB2Test {
                 FakeProcess("ok".toByteArray(), ByteArray(0), 0)
             },
             suBinary = "/system/bin/su",
+            grantCheck = GrantFixtures.allowAlways,
         )
         val rr = root.run(ElevatedRequest(argv, "P3-T"), 2_000L)
         assertTrue("$rr", rr is ShellResult.Denied)
@@ -746,6 +778,7 @@ class ElevatedRunnerB2Test {
                 FakeProcess("ok".toByteArray(), ByteArray(0), 0)
             },
             suBinary = "/tmp/evil/su",
+            grantCheck = GrantFixtures.allowAlways,
         )
         val r = runner.run(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Failed)
@@ -765,6 +798,7 @@ class ElevatedRunnerB2Test {
                 FakeProcess("ok".toByteArray(), ByteArray(0), 0)
             },
             suExists = { it == "/system/bin/su" || it == "/sbin/su" },
+            grantCheck = GrantFixtures.allowAlways,
         )
         assertTrue(runner.run(ElevatedRequest(listOf("id"), "P3-T"), 2_000L) is ShellResult.Ok)
         assertEquals(RootSuProbe.SU_BINARIES[0], lastArgv[0])
@@ -783,6 +817,7 @@ class ElevatedRunnerB2Test {
                 shizukuKills++
                 it.destroy()
             },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val sb = shizuku.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 0L)
         assertTrue("$sb", sb is ElevatedBinaryResult.TimedOut)
@@ -799,6 +834,7 @@ class ElevatedRunnerB2Test {
                 rootKills++
                 it.destroy()
             },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val rb = root.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 0L)
         assertTrue("$rb", rb is ElevatedBinaryResult.TimedOut)
@@ -830,6 +866,7 @@ class ElevatedRunnerB2Test {
                 if (polls == 3) job.cancel()
                 !job.isActive
             },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "R3A-T"), 10_000L)
         assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
@@ -856,6 +893,7 @@ class ElevatedRunnerB2Test {
                 if (shizukuPolls == 3) shizukuJob.cancel()
                 !shizukuJob.isActive
             },
+            grantCheck = GrantFixtures.allowAlways,
         )
         val sb = shizuku.runBinary(ElevatedRequest(listOf("id"), "R3A-T"), 10_000L)
         assertTrue("$sb", sb is ElevatedBinaryResult.TimedOut)

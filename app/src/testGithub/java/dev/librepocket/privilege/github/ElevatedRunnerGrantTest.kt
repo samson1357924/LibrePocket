@@ -15,8 +15,12 @@ import java.io.ByteArrayOutputStream
  *
  * - 兩 runner 各三測：Invalid 拒（至少 endpoint-changed＋never-granted）／抛異常拒／
  *   同實例跨 call 翻轉（首 call Valid 放行、次 call Invalid 零 spawn，證每次 call 新鮮求值）；
- * - 全 fake（假進程＋假狀態＋假 su），零真機/真 su/真 binder；
- * - 預設 `grantCheck={ Valid }` 保持既有測試全綠，本檔只斷顯式注入分支。
+ * - 兩 runner 各一全鏈路：FakeGrantStore＋可變 endpoint/revision 供給
+ *   `grantCheck = { ShizukuGrantPolicy.check(store.load(), curProvider(), curRev()) }`，
+ *   授權後放行→切換 endpoint 次 call 拒→revoke 後再 call 拒，一律零新增 spawn；
+ * - 全 fake（假進程＋假狀態＋假 su＋記憶體 grant store 同步語義），零真機/真 su/真 binder；
+ * - S1 fail-closed：兩 runner `grantCheck` 無預設值（mandatory），本檔全部明示供給；
+ *   非 grant 主題測試的 allow 接線見 `GrantFixtures.allowAlways`。
  */
 class ElevatedRunnerGrantTest {
 
@@ -165,6 +169,82 @@ class ElevatedRunnerGrantTest {
         val second = runner.runBinary(request(), 2_000L)
         assertTrue("$second", second is ElevatedBinaryResult.Denied)
         assertEquals(ShellDeny.NOT_WHITELISTED, (second as ElevatedBinaryResult.Denied).reason)
+        assertEquals(1, spawn.calls)
+    }
+
+    // ---- S1 全鏈路：FakeGrantStore＋可變 endpoint/revision（同步語義模擬 DataStore） ----
+
+    /**
+     * 記憶體 grant store：同步 save/load/clear，模擬 [ShizukuGrantStore] 的
+     * DataStore 語義（load 讀不到即 null，clear 即撤銷），供全鏈路測試驅動
+     * `ShizukuGrantPolicy.check` 新鮮求值，不碰產品 suspend 簽名。
+     */
+    private class FakeGrantStore {
+        private var grant: ShizukuGrant? = null
+        fun save(grant: ShizukuGrant) {
+            this.grant = grant
+        }
+        fun load(): ShizukuGrant? = grant
+        fun clear() {
+            grant = null
+        }
+    }
+
+    @Test fun shizukuGrantLifecycleEndpointSwitchAndRevokeDeniesWithoutSpawn() {
+        val store = FakeGrantStore()
+        var curProvider: String? = "provider-a"
+        var curRev: Long? = 1L
+        val spawn = SpawnCounter()
+        val runner = shizukuRunner(spawn) {
+            ShizukuGrantPolicy.check(store.load(), curProvider, curRev)
+        }
+        // 授權後放行。
+        store.save(ShizukuGrantPolicy.grant("provider-a", 1L, 15))
+        val first = runner.runBinary(request(), 2_000L)
+        assertTrue("$first", first is ElevatedBinaryResult.Ok)
+        assertEquals(1, spawn.calls)
+        // 切換 endpoint：同一 runner 次 call 即拒，零新增 spawn。
+        curProvider = "provider-b"
+        val second = runner.runBinary(request(), 2_000L)
+        assertTrue("$second", second is ElevatedBinaryResult.Denied)
+        assertEquals(ShellDeny.NOT_WHITELISTED, (second as ElevatedBinaryResult.Denied).reason)
+        assertEquals(ShizukuGrantPolicy.REASON_ENDPOINT_CHANGED, second.message)
+        assertEquals(1, spawn.calls)
+        // revoke（clear）：再 call 仍拒，零新增 spawn。
+        store.clear()
+        val third = runner.runBinary(request(), 2_000L)
+        assertTrue("$third", third is ElevatedBinaryResult.Denied)
+        assertEquals(ShellDeny.NOT_WHITELISTED, (third as ElevatedBinaryResult.Denied).reason)
+        assertEquals(ShizukuGrantPolicy.REASON_NEVER_GRANTED, third.message)
+        assertEquals(1, spawn.calls)
+    }
+
+    @Test fun rootGrantLifecycleEndpointSwitchAndRevokeDeniesWithoutSpawn() {
+        val store = FakeGrantStore()
+        var curProvider: String? = "provider-a"
+        var curRev: Long? = 1L
+        val spawn = SpawnCounter()
+        val runner = rootRunner(spawn) {
+            ShizukuGrantPolicy.check(store.load(), curProvider, curRev)
+        }
+        // 授權後放行。
+        store.save(ShizukuGrantPolicy.grant("provider-a", 1L, 15))
+        val first = runner.runBinary(request(), 2_000L)
+        assertTrue("$first", first is ElevatedBinaryResult.Ok)
+        assertEquals(1, spawn.calls)
+        // 切換 endpoint：同一 runner 次 call 即拒，零新增 spawn。
+        curProvider = "provider-b"
+        val second = runner.runBinary(request(), 2_000L)
+        assertTrue("$second", second is ElevatedBinaryResult.Denied)
+        assertEquals(ShellDeny.NOT_WHITELISTED, (second as ElevatedBinaryResult.Denied).reason)
+        assertEquals(ShizukuGrantPolicy.REASON_ENDPOINT_CHANGED, second.message)
+        assertEquals(1, spawn.calls)
+        // revoke（clear）：再 call 仍拒，零新增 spawn。
+        store.clear()
+        val third = runner.runBinary(request(), 2_000L)
+        assertTrue("$third", third is ElevatedBinaryResult.Denied)
+        assertEquals(ShellDeny.NOT_WHITELISTED, (third as ElevatedBinaryResult.Denied).reason)
+        assertEquals(ShizukuGrantPolicy.REASON_NEVER_GRANTED, third.message)
         assertEquals(1, spawn.calls)
     }
 }

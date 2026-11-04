@@ -359,6 +359,8 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
         }
         // Usage was already emitted inline when seen; keep terminal compact.
         if (finishReason != null && sawDone) {
+            // Priority rule: sawRefusal normalizes wire finish_reason "stop" to "refusal".
+            // Native truncation/filter reasons ("length", "content_filter") take strict precedence and are preserved.
             val effectiveReason = if (sawRefusal && finishReason == "stop") "refusal" else finishReason!!
             out.add(StreamEvent.Done(effectiveReason))
         } else {
@@ -376,23 +378,35 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
         val refusal = delta.string("refusal")?.takeIf { it.isNotEmpty() }
         val content = delta.string("content")?.takeIf { it.isNotEmpty() }
         val parts = delta.arr("content")?.items?.filterIsInstance<MiniJson.JObj>()
-        val partText = if (parts != null) {
-            val sb = StringBuilder()
+        var partText: String? = null
+        var partRefusal: String? = null
+        if (parts != null) {
+            val textSb = StringBuilder()
+            val refusalSb = StringBuilder()
             for (p in parts) {
-                val t = p.string("text")
-                if (!t.isNullOrEmpty()) sb.append(t)
+                val pType = p.string("type")
+                if (pType == "refusal") {
+                    val r = p.string("refusal")?.takeIf { it.isNotEmpty() }
+                        ?: p.string("text")?.takeIf { it.isNotEmpty() }
+                    if (r != null) refusalSb.append(r)
+                } else {
+                    val t = p.string("text")
+                    if (!t.isNullOrEmpty()) textSb.append(t)
+                }
             }
-            sb.toString().ifEmpty { null }
-        } else null
+            partText = textSb.toString().ifEmpty { null }
+            partRefusal = refusalSb.toString().ifEmpty { null }
+        }
 
         val text = content ?: partText
         if (text != null) {
             // Valid text content takes priority: stray/empty refusal must NOT poison sawRefusal
             return text
         }
-        if (refusal != null) {
+        val effectiveRefusal = refusal ?: partRefusal
+        if (effectiveRefusal != null) {
             sawRefusal = true
-            return refusal
+            return effectiveRefusal
         }
         return null
     }

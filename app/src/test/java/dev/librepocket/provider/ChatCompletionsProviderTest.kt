@@ -861,4 +861,98 @@ class ChatCompletionsProviderTest {
             server.shutdown()
         }
     }
+
+    @Test
+    fun contentPartArrayWithRefusalPartEmitsTextDeltaAndDoneRefusal() {
+        val mapper = ChatCompletionsMapper()
+        val events = ArrayList<StreamEvent>()
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{"content":[{"type":"refusal","refusal":"Cannot comply"}]},"finish_reason":"stop"}]}""",
+        )
+        mapper.markDone()
+        events += mapper.finish()
+
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "Cannot comply"),
+                StreamEvent.Done("refusal"),
+            ),
+            events,
+        )
+    }
+
+    @Test
+    fun contentPartArrayWithTextAndRefusalPartPrioritizesTextAndPreservesStop() {
+        val mapper = ChatCompletionsMapper()
+        val events = ArrayList<StreamEvent>()
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{"content":[{"type":"text","text":"Hello"},{"type":"refusal","refusal":"Ignored"}]},"finish_reason":"stop"}]}""",
+        )
+        mapper.markDone()
+        events += mapper.finish()
+
+        assertEquals(
+            listOf(
+                StreamEvent.TextDelta(0, 0, "Hello"),
+                StreamEvent.Done("stop"),
+            ),
+            events,
+        )
+    }
+
+    @Test
+    fun contentPartArrayWithUnsupportedPartCarryingRefusalPreservesStop() {
+        val mapper = ChatCompletionsMapper()
+        val events = ArrayList<StreamEvent>()
+        events += mapper.mapPayload(
+            """{"choices":[{"delta":{"content":[{"type":"image","refusal":"Not an image"}]},"finish_reason":"stop"}]}""",
+        )
+        mapper.markDone()
+        events += mapper.finish()
+
+        assertEquals(
+            listOf(
+                StreamEvent.Done("stop"),
+            ),
+            events,
+        )
+    }
+
+    @Test
+    fun streamFlowContentPartArrayRefusalYieldsDoneRefusal() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val body =
+                "data: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"refusal\",\"refusal\":\"Cannot comply\"}]}}]}\n\n" +
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+                    "data: [DONE]\n\n"
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(body),
+            )
+            val provider = ChatCompletionsProvider(
+                testConfig(server.url("/").toString().trimEnd('/')),
+                { "test_api_key".toCharArray() },
+            )
+            val events = withTimeout(10_000) {
+                provider.stream(
+                    ChatRequest(
+                        model = "gpt-4o",
+                        messages = listOf(ChatMessage("user", "Do something bad")),
+                    ),
+                ).toList()
+            }
+            assertEquals(
+                listOf(
+                    StreamEvent.TextDelta(0, 0, "Cannot comply"),
+                    StreamEvent.Done("refusal"),
+                ),
+                events,
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
 }

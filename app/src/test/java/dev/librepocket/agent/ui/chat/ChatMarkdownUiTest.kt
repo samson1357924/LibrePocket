@@ -1458,17 +1458,31 @@ class ChatMarkdownUiTest {
     }
 
     @Test
-    fun sanitizeCodeForClipboard_stripsEscAndZeroWidthCharacters() {
+    fun sanitizeCodeForClipboard_stripsEscAndInvisibleButPreservesJoinersAndMarks() {
         val raw = "ab\u001B[2Jcd\u200Be\u200Cf\u200Dg\u200Eh\u200Fi\uFEFFj\u2060k\u2061l\u2062m\u2063n\u2064o"
-        assertEquals("ab[2Jcdefghijklmno", sanitizeCodeForClipboard(raw))
+        assertEquals("ab[2Jcde\u200Cf\u200Dg\u200Eh\u200Fijklmno", sanitizeCodeForClipboard(raw))
     }
 
     @Test
-    fun sanitizeCodeForClipboard_stripsLineAndParagraphSeparators() {
-        assertEquals("abcd", sanitizeCodeForClipboard("ab\u2028cd"))
-        assertEquals("abcd", sanitizeCodeForClipboard("ab\u2029cd"))
+    fun sanitizeCodeForClipboard_convertsLineAndParagraphSeparatorsToNewline() {
+        assertEquals("a\nb", sanitizeCodeForClipboard("a\u2028b"))
+        assertEquals("a\nb", sanitizeCodeForClipboard("a\u2029b"))
         // Plain newlines are preserved (multi-line paste risk is documented, not removed).
         assertEquals("a\nb", sanitizeCodeForClipboard("a\nb"))
+    }
+
+    @Test
+    fun sanitizeCodeForClipboard_preservesZwJEmojiSequence() {
+        val emoji = "👩\u200D💻"
+        assertEquals(emoji, sanitizeCodeForClipboard(emoji))
+    }
+
+    @Test
+    fun sanitizeCodeForClipboard_preservesMultilingualJoinersAndMarks() {
+        // ZWNJ inside Persian/Hindi-adjacent text and LRM after Arabic: legitimate
+        // joining / directional marks, kept verbatim for copy fidelity.
+        val multilingual = "می\u200Cخواهم\u200C\u200D test עברית\u200Eالعربية"
+        assertEquals(multilingual, sanitizeCodeForClipboard(multilingual))
     }
 
     @Test

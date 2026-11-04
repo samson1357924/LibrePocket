@@ -512,18 +512,32 @@ internal fun ChatMarkdownView(
 /**
  * Sanitizes code snippets before copying to clipboard.
  *
- * Single O(N) pass over the normalized text (one StringBuilder append per kept char).
+ * Single O(N) pass over the normalized text (one StringBuilder append per kept char;
+ * U+2028/U+2029 append a single '\n').
  *
  * - Normalizes Windows CRLF to LF.
  * - Strips isolated CR characters to prevent terminal line overwrite attacks.
  * - Strips ASCII ESC to block ANSI terminal escape sequences
  *   (cursor movement, alternate screen, title setting) hidden in copied code.
- * - Strips Unicode BiDi formatting characters (LRE/RLE/PDF/LRO/RLO and
- *   LRI/RLI/FSI/PDI ranges).
- * - Strips zero-width / invisible characters that alter rendering or pasted bytes
- *   (ZWSP/ZWNJ/ZWJ, LRM/RLM, ZWNBSP/BOM, word joiner and invisible operators).
- * - Strips Unicode line/paragraph separators, which some terminals and editors
- *   treat as line breaks.
+ * - Strips Unicode BiDi override/embedding/isolate controls (LRE/RLE/PDF/LRO/RLO and
+ *   LRI/RLI/FSI/PDI ranges: U+202A..U+202E, U+2066..U+2069), which reorder
+ *   displayed text versus pasted bytes.
+ * - Strips invisible characters with no legitimate text content (ZWSP U+200B,
+ *   ZWNBSP/BOM U+FEFF, word joiner and invisible operators U+2060..U+2064).
+ * - Preserves legitimate text constituents: ZWNJ U+200C / ZWJ U+200D (emoji ZWJ
+ *   sequences such as U+1F469 U+200D U+1F4BB, Indic/Persian joining behaviour)
+ *   and LRM U+200E / RLM U+200F (non-isolate directional marks with no override
+ *   capability, needed for mixed-direction text). These are kept verbatim so
+ *   visible content survives copy round-trip; that is why the copy button shows
+ *   a plain Copied confirmation without extra disclosure.
+ * - Maps Unicode line/paragraph separators (U+2028/U+2029, genuine separators)
+ *   to LF, preserving the line-break semantics instead of silently joining the
+ *   two sides into one line.
+ *
+ * Distinguishing principle: strip dangerous terminal controls and invisible
+ * characters that alter rendering or pasted bytes; keep legitimate text
+ * constituents even when invisible. Newline semantics (LF, including converted
+ * U+2028/U+2029) are preserved.
  *
  * Residual risk (documented, not eliminated): newlines themselves are preserved, so
  * pasting multi-line output into a terminal still executes it line by line. Review
@@ -542,9 +556,11 @@ internal fun sanitizeCodeForClipboard(text: String): String {
         if (ch in '\u202A'..'\u202E' || ch in '\u2066'..'\u2069') {
             continue
         }
-        if (ch in '\u200B'..'\u200D' || ch in '\u200E'..'\u200F' || ch == '\uFEFF'
-            || ch in '\u2060'..'\u2064' || ch in '\u2028'..'\u2029'
-        ) {
+        if (ch == '\u200B' || ch == '\uFEFF' || ch in '\u2060'..'\u2064') {
+            continue
+        }
+        if (ch == '\u2028' || ch == '\u2029') {
+            sb.append('\n')
             continue
         }
         sb.append(ch)

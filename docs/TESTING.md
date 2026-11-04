@@ -861,8 +861,10 @@ git diff --stat
 
 # Real OSV monitor scan (needs network + Python >= 3.11 for tomllib;
 # --output writes a JSON report file, --format controls stdout; --timeout
-# default 30s, --batch-size default 50; exit 0 = clean, 1 = vuln found
-# (monitor signal), 2 = fail-closed error):
+# 1..300 (default 30s), --batch-size 1..500 (default 50), --retries 0..5
+# (default 2, total attempts = 1 + retries); header/JSON summary include the
+# skipped (BOM-managed, version unknown) count; exit 0 = clean, 1 = vuln
+# found (monitor signal), 2 = fail-closed error):
 python3 -P scripts/osv_scan.py --format json --output /tmp/osv-report.json
 
 # Docs dependency and configuration checks (static, no Gradle)

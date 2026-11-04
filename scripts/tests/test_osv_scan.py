@@ -40,8 +40,9 @@ bom-managed = { group = "androidx.compose.ui", name = "ui" }
 
 
 class FakeOsvHandler(BaseHTTPRequestHandler):
-    mode = "clean"  # clean | vuln | error500 | badjson | mismatch | garbage | nonlist_vulns
+    mode = "clean"  # clean | vuln | error500 | badjson | mismatch | garbage | nonlist_vulns | flaky
     last_queries: list = []
+    flaky_count = 0
 
     def log_message(self, *args):  # silence test server logs
         pass
@@ -57,6 +58,14 @@ class FakeOsvHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         FakeOsvHandler.last_queries.extend(queries)
+        if FakeOsvHandler.mode == "flaky":
+            FakeOsvHandler.flaky_count += 1
+            if FakeOsvHandler.flaky_count <= 2:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b"boom")
+                return
+            # fall through to clean behavior below
         if FakeOsvHandler.mode == "error500":
             self.send_response(500)
             self.end_headers()
@@ -108,8 +117,10 @@ class OsvScanTest(unittest.TestCase):
     def setUp(self):
         FakeOsvHandler.mode = "clean"
         FakeOsvHandler.last_queries = []
+        FakeOsvHandler.flaky_count = 0
         self.addCleanup(setattr, FakeOsvHandler, "mode", "clean")
         self.addCleanup(setattr, FakeOsvHandler, "last_queries", [])
+        self.addCleanup(setattr, FakeOsvHandler, "flaky_count", 0)
         self.assertTrue(SCRIPT.is_file(), f"{SCRIPT} missing")
         self.server = HTTPServer(("127.0.0.1", 0), FakeOsvHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -147,6 +158,11 @@ class OsvScanTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("0 affected", proc.stdout)
             self.assertIn("2 package(s) scanned", proc.stdout)
+            self.assertIn(
+                "osv_scan: 2 package(s) scanned, 1 skipped (BOM-managed, version unknown), "
+                "0 affected, 0 total vuln(s)",
+                proc.stdout,
+            )
             self.assertIn("BOM-managed", proc.stderr)
             self.assertEqual(len(FakeOsvHandler.last_queries), 2)
             for query in FakeOsvHandler.last_queries:
@@ -161,6 +177,11 @@ class OsvScanTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 1, proc.stderr)
             self.assertIn("GHSA-test-0001", proc.stdout)
             self.assertIn("1 affected", proc.stdout)
+            self.assertIn(
+                "osv_scan: 2 package(s) scanned, 1 skipped (BOM-managed, version unknown), "
+                "1 affected, 1 total vuln(s)",
+                proc.stdout,
+            )
             self.assertIn("AFFECTED com.example:foo", proc.stdout)
             self.assertNotIn("AFFECTED com.example:bar", proc.stdout)
             self.assertIn("no upgrade performed", proc.stderr)
@@ -308,6 +329,11 @@ class OsvScanTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 1, proc.stderr)
             self.assertIn("2 package(s) scanned", proc.stdout)
             self.assertIn("1 affected", proc.stdout)
+            self.assertIn(
+                "osv_scan: 2 package(s) scanned, 1 skipped (BOM-managed, version unknown), "
+                "1 affected, 1 total vuln(s)",
+                proc.stdout,
+            )
             self.assertIn("GHSA-test-0001", proc.stdout)
             self.assertIn("AFFECTED com.example:foo", proc.stdout)
             self.assertNotIn("AFFECTED com.example:bar", proc.stdout)
@@ -331,7 +357,7 @@ class OsvScanTest(unittest.TestCase):
                                  "--batch-size", "0")
             self.assertEqual(proc.returncode, 2, proc.stderr)
             self.assertIn("ERROR", proc.stderr)
-            self.assertIn("invalid timeout/batch-size", proc.stderr)
+            self.assertIn("invalid batch-size", proc.stderr)
             self.assertNotIn("package(s) scanned", proc.stdout)
 
     def test_empty_catalog_fails_closed(self):
@@ -343,6 +369,102 @@ class OsvScanTest(unittest.TestCase):
             self.assertIn("ERROR", proc.stderr)
             self.assertIn("no versioned packages", proc.stderr)
             self.assertNotIn("package(s) scanned", proc.stdout)
+
+    def test_flaky_server_retry_behavior(self):
+        FakeOsvHandler.mode = "flaky"
+        with tempfile.TemporaryDirectory() as td:
+            catalog = self.write_catalog(Path(td))
+            FakeOsvHandler.flaky_count = 0
+            proc = self.run_scan("--catalog", str(catalog), "--osv-url", self.url,
+                                 "--retries", "2")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("0 affected", proc.stdout)
+            self.assertIn("2 package(s) scanned, 1 skipped", proc.stdout)
+            FakeOsvHandler.flaky_count = 0
+            proc = self.run_scan("--catalog", str(catalog), "--osv-url", self.url,
+                                 "--retries", "0")
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn("ERROR", proc.stderr)
+            self.assertIn("HTTP error", proc.stderr)
+            self.assertNotIn("package(s) scanned", proc.stdout)
+
+    def test_output_parent_missing_fails_before_network(self):
+        with tempfile.TemporaryDirectory() as td:
+            catalog = self.write_catalog(Path(td))
+            bad_out = Path(td) / "nonexistent-dir-xyz" / "report.json"
+            proc = self.run_scan("--catalog", str(catalog),
+                                 "--osv-url", "http://127.0.0.1:1/v1/querybatch",
+                                 "--output", str(bad_out))
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn("cannot write report", proc.stderr)
+            self.assertIn("nonexistent-dir-xyz", proc.stderr)
+            self.assertNotIn("network error", proc.stderr)
+            self.assertNotIn("connection failed", proc.stderr)
+            self.assertNotIn("package(s) scanned", proc.stdout)
+            self.assertFalse(bad_out.exists())
+
+    def test_invalid_params_fail_closed(self):
+        cases = [
+            (["--timeout", "0"], "invalid timeout"),
+            (["--timeout", "9999"], "invalid timeout"),
+            (["--batch-size", "0"], "invalid batch-size"),
+            (["--batch-size", "99999"], "invalid batch-size"),
+            (["--retries", "99"], "invalid retries"),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            catalog = self.write_catalog(Path(td))
+            for extra, keyword in cases:
+                with self.subTest(extra=extra):
+                    proc = self.run_scan("--catalog", str(catalog),
+                                         "--osv-url", self.url, *extra)
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    self.assertIn("ERROR", proc.stderr)
+                    self.assertIn(keyword, proc.stderr)
+                    self.assertNotIn("package(s) scanned", proc.stdout)
+
+    def test_skipped_count_and_report_keys(self):
+        FakeOsvHandler.mode = "clean"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            catalog = self.write_catalog(root)
+            out = root / "report.json"
+            proc = self.run_scan("--catalog", str(catalog), "--osv-url", self.url,
+                                 "--format", "text", "--output", str(out))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(
+                "osv_scan: 2 package(s) scanned, 1 skipped (BOM-managed, version unknown), "
+                "0 affected, 0 total vuln(s)",
+                proc.stdout,
+            )
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(report["summary"]["scanned"], 2)
+            self.assertEqual(report["summary"]["skipped"], 1)
+            self.assertEqual(report["summary"]["affected"], 0)
+            self.assertEqual(report["summary"]["total_vulns"], 0)
+            for pkg in report["packages"]:
+                self.assertIn("key", pkg)
+            keys = {p["key"] for p in report["packages"]}
+            self.assertEqual(keys, {"foo-lib", "bar-lib"})
+
+    def test_summarize_normalizes_malformed_entries(self):
+        from scripts import osv_scan as osv_scan_mod
+        results = [
+            {"package": {"group": "g", "name": "n", "version": "1"},
+             "vulns": [{"id": 123, "summary": None}, "str", None,
+                       {"id": "X", "summary": "y" * 200}]},
+        ]
+        affected, lines = osv_scan_mod.summarize(results, 2)
+        self.assertEqual(affected, 1)
+        self.assertIn(
+            "osv_scan: 1 package(s) scanned, 2 skipped (BOM-managed, version unknown), "
+            "1 affected, 4 total vuln(s)",
+            lines[0],
+        )
+        self.assertIn("  - 123: None", lines)
+        self.assertEqual(lines.count("  - <malformed vuln entry>"), 2)
+        long_line = next(line for line in lines if line.startswith("  - X: "))
+        self.assertTrue(long_line.endswith("..."))
+        self.assertLessEqual(len(long_line), len("  - X: ") + 120)
 
 
 if __name__ == "__main__":

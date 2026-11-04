@@ -27,7 +27,8 @@ Exit codes:
 
 Usage:
   python3 -P scripts/osv_scan.py [--catalog PATH] [--osv-url URL]
-      [--timeout SEC] [--batch-size N] [--output PATH] [--format text|json]
+      [--timeout SEC] [--batch-size N] [--retries N] [--output PATH]
+      [--format text|json]
 
 Network note: the default OSV endpoint is public and unauthenticated
 (``https://api.osv.dev/v1/querybatch``). Tests must use ``--osv-url`` with a
@@ -40,7 +41,9 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -56,6 +59,14 @@ DEFAULT_OSV_URL = "https://api.osv.dev/v1/querybatch"
 DEFAULT_CATALOG = Path(__file__).resolve().parent.parent / "gradle" / "libs.versions.toml"
 DEFAULT_TIMEOUT = 30
 DEFAULT_BATCH = 50
+DEFAULT_RETRIES = 2
+TIMEOUT_MIN, TIMEOUT_MAX = 1, 300
+BATCH_MIN, BATCH_MAX = 1, 500
+RETRIES_MIN, RETRIES_MAX = 0, 5
+# Transient HTTP statuses worth retrying (with exponential backoff). Other
+# 4xx are permanent client errors: fail closed immediately without retry.
+RETRYABLE_OSV_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+USER_AGENT = "LibrePocket-osv-scan/1.0 (+monitor-only)"
 
 
 def fail(message: str) -> int:
@@ -79,8 +90,14 @@ def _osv_url_allowed(url: str) -> bool:
     return False
 
 
-def parse_catalog(catalog: Path) -> tuple[list[dict[str, str]], list[str]]:
-    """Return (packages, warnings). Each package is group/name/version."""
+def parse_catalog(catalog: Path) -> tuple[list[dict[str, str]], list[str], int]:
+    """Return (packages, warnings, skipped_count).
+
+    Each package is group/name/version/key (key = catalog alias). Every
+    warning corresponds to one skipped library entry (BOM-managed without a
+    catalog version, missing group/name, unresolvable version.ref, ...), so
+    skipped_count == len(warnings).
+    """
     if tomllib is None:
         raise RuntimeError("tomllib is unavailable (requires Python >= 3.11)")
     try:
@@ -143,7 +160,7 @@ def parse_catalog(catalog: Path) -> tuple[list[dict[str, str]], list[str]]:
             continue
         seen.add(gav)
         unique.append(pkg)
-    return unique, warnings
+    return unique, warnings, len(warnings)
 
 
 def query_osv(
@@ -151,12 +168,25 @@ def query_osv(
     osv_url: str,
     timeout: int,
     batch_size: int,
+    retries: int = DEFAULT_RETRIES,
 ) -> list[dict[str, Any]]:
-    """Query OSV querybatch; return per-package result list aligned with input."""
+    """Query OSV querybatch; return per-package result list aligned with input.
+
+    Transient failures (HTTP 408/429/500/502/503/504, URLError, OSError,
+    HTTPException) are retried up to ``retries`` times with exponential
+    backoff (``time.sleep(2 ** attempt)``, attempt from 0), so each batch
+    gets at most 1 + retries attempts. Other 4xx and all semantic errors
+    (non-200 status, invalid JSON, malformed response, length mismatch)
+    fail closed immediately without retry.
+    """
     if not _osv_url_allowed(osv_url):
         raise RuntimeError(f"refusing non-https OSV URL outside loopback tests: {osv_url}")
-    if timeout <= 0 or batch_size <= 0:
-        raise RuntimeError(f"invalid timeout/batch-size: {timeout}/{batch_size}")
+    if not (TIMEOUT_MIN <= timeout <= TIMEOUT_MAX):
+        raise RuntimeError(f"invalid timeout: {timeout} (must be {TIMEOUT_MIN}..{TIMEOUT_MAX})")
+    if not (BATCH_MIN <= batch_size <= BATCH_MAX):
+        raise RuntimeError(f"invalid batch-size: {batch_size} (must be {BATCH_MIN}..{BATCH_MAX})")
+    if not (RETRIES_MIN <= retries <= RETRIES_MAX):
+        raise RuntimeError(f"invalid retries: {retries} (must be {RETRIES_MIN}..{RETRIES_MAX})")
     merged: list[dict[str, Any]] = []
     for start in range(0, len(packages), batch_size):
         batch = packages[start:start + batch_size]
@@ -173,21 +203,46 @@ def query_osv(
         request = urllib.request.Request(
             osv_url,
             data=body,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": USER_AGENT,
+            },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                status = getattr(response, "status", 200)
-                raw = response.read()
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"OSV HTTP error {exc.code} for batch @{start}: {exc.reason}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"OSV network error for batch @{start}: {exc.reason}") from exc
-        except OSError as exc:
-            raise RuntimeError(f"OSV connection failed for batch @{start}: {exc}") from exc
-        except http.client.HTTPException as exc:
-            raise RuntimeError(f"OSV protocol error for batch @{start}: {exc}") from exc
+        attempt = 0
+        while True:
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    status = getattr(response, "status", 200)
+                    raw = response.read()
+            except urllib.error.HTTPError as exc:
+                if exc.code in RETRYABLE_OSV_STATUS and attempt < retries:
+                    time.sleep(2**attempt)
+                    attempt += 1
+                    continue
+                raise RuntimeError(
+                    f"OSV HTTP error {exc.code} for batch @{start}: {exc.reason}"
+                ) from exc
+            except urllib.error.URLError as exc:
+                if attempt < retries:
+                    time.sleep(2**attempt)
+                    attempt += 1
+                    continue
+                raise RuntimeError(f"OSV network error for batch @{start}: {exc.reason}") from exc
+            except OSError as exc:
+                if attempt < retries:
+                    time.sleep(2**attempt)
+                    attempt += 1
+                    continue
+                raise RuntimeError(f"OSV connection failed for batch @{start}: {exc}") from exc
+            except http.client.HTTPException as exc:
+                if attempt < retries:
+                    time.sleep(2**attempt)
+                    attempt += 1
+                    continue
+                raise RuntimeError(f"OSV protocol error for batch @{start}: {exc}") from exc
+            break
         if status != 200:
             raise RuntimeError(f"OSV unexpected status {status} for batch @{start}")
         try:
@@ -214,7 +269,7 @@ def query_osv(
     return merged
 
 
-def summarize(results: list[dict[str, Any]]) -> tuple[int, list[str]]:
+def summarize(results: list[dict[str, Any]], skipped: int = 0) -> tuple[int, list[str]]:
     """Return (vuln_package_count, text_lines)."""
     lines: list[str] = []
     affected = 0
@@ -232,14 +287,17 @@ def summarize(results: list[dict[str, Any]]) -> tuple[int, list[str]]:
             if not isinstance(vuln, dict):
                 lines.append("  - <malformed vuln entry>")
                 continue
-            vid = vuln.get("id", "?")
+            vid = str(vuln.get("id", "?"))
             summary = vuln.get("summary", "")
-            if isinstance(summary, str) and len(summary) > 120:
+            if not isinstance(summary, str):
+                summary = str(summary)
+            if len(summary) > 120:
                 summary = summary[:117] + "..."
             lines.append(f"  - {vid}: {summary}")
     header = (
         f"osv_scan: {len(results)} package(s) scanned, "
-        f"{affected} affected, {total_vulns} vuln(s) total"
+        f"{skipped} skipped (BOM-managed, version unknown), "
+        f"{affected} affected, {total_vulns} total vuln(s)"
     )
     return affected, [header] + lines
 
@@ -248,15 +306,38 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG)
     parser.add_argument("--osv-url", default=DEFAULT_OSV_URL)
-    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH)
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
+                        help="per-request timeout in seconds (1..300, default 30)")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH,
+                        help="packages per querybatch request (1..500, default 50)")
+    parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
+                        help="retries for transient OSV failures "
+                             "(HTTP 408/429/500/502/503/504, network/protocol errors; "
+                             "0..5, default 2; total attempts = 1 + retries)")
     parser.add_argument("--output", type=Path, default=None,
                         help="optional JSON report path (SBOM-lite + vulns)")
     parser.add_argument("--format", choices=("text", "json"), default="text")
     args = parser.parse_args(argv)
 
+    if not (TIMEOUT_MIN <= args.timeout <= TIMEOUT_MAX):
+        return fail(f"invalid timeout: {args.timeout} (must be {TIMEOUT_MIN}..{TIMEOUT_MAX})")
+    if not (BATCH_MIN <= args.batch_size <= BATCH_MAX):
+        return fail(f"invalid batch-size: {args.batch_size} (must be {BATCH_MIN}..{BATCH_MAX})")
+    if not (RETRIES_MIN <= args.retries <= RETRIES_MAX):
+        return fail(f"invalid retries: {args.retries} (must be {RETRIES_MIN}..{RETRIES_MAX})")
+
+    # Fail fast on an unwritable report path before any network request.
+    if args.output is not None:
+        parent = args.output.parent
+        if not parent.is_dir():
+            return fail(f"cannot write report {args.output}: "
+                        f"parent directory does not exist: {parent}")
+        if not os.access(parent, os.W_OK):
+            return fail(f"cannot write report {args.output}: "
+                        f"parent directory not writable: {parent}")
+
     try:
-        packages, warnings = parse_catalog(args.catalog)
+        packages, warnings, skipped = parse_catalog(args.catalog)
     except RuntimeError as exc:
         return fail(str(exc))
     for warning in warnings:
@@ -265,19 +346,20 @@ def main(argv: list[str] | None = None) -> int:
         return fail(f"no versioned packages found in {args.catalog}")
 
     try:
-        results = query_osv(packages, args.osv_url, args.timeout, args.batch_size)
+        results = query_osv(packages, args.osv_url, args.timeout, args.batch_size, args.retries)
     except RuntimeError as exc:
         return fail(str(exc))
     except Exception as exc:
         return fail(f"OSV unexpected error: {type(exc).__name__}: {exc}")
 
-    affected, lines = summarize(results)
+    affected, lines = summarize(results, skipped)
     if args.format == "json" or args.output is not None:
         report = {
             "catalog": str(args.catalog),
             "osv_url": args.osv_url,
             "packages": [
                 {
+                    "key": e["package"]["key"],
                     "group": e["package"]["group"],
                     "name": e["package"]["name"],
                     "version": e["package"]["version"],
@@ -289,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
             "warnings": warnings,
             "summary": {
                 "scanned": len(results),
+                "skipped": skipped,
                 "affected": affected,
                 "total_vulns": sum(len(e["vulns"]) for e in results),
             },

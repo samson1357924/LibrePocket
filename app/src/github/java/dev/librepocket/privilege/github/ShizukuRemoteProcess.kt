@@ -13,13 +13,20 @@ import java.util.concurrent.TimeUnit
  * [wrap] 取 [Process]，永不直 cast。
  *
  * - 反射方法缺失/簽名漂移（版本差異）即抛給呼叫方轉 `Failed`（fail-closed，
- *   不偽造成功）；
+ *   不偽造成功；下游 cast 漂移同理以 IllegalStateException 收斂為 Failed）；
+ * - P1-B：[call] 精確匹配重載（名 + 參數個數 + 參數型別可賦值性，primitive
+ *   long/int 由 Number 承接、boolean 由 Boolean 承接），無精確匹配即抛
+ *   UnsupportedOperationException，避免 overload 選錯靜默誤調；
  * - 零真機依賴：單測以「同名方法但非 Process」的假物件斷言委派，證明無 cast。
  */
 class ShizukuRemoteProcess(private val remote: Any) : Process() {
     private fun call(name: String, vararg args: Any?): Any? {
-        val methods = remote.javaClass.methods.filter { it.name == name && it.parameterCount == args.size }
-        val method = methods.firstOrNull()
+        val candidates = remote.javaClass.methods.filter { it.name == name && it.parameterCount == args.size }
+        // P1-B 精確匹配：名 + 個數 + 參數型別可賦值性（含 primitive long/int/boolean），
+        // 無精確匹配即抛，避免 overload 選錯靜默誤調。
+        val method = candidates.firstOrNull { m ->
+            m.parameterTypes.indices.all { i -> isCompatible(m.parameterTypes[i], args[i]) }
+        }
             ?: throw UnsupportedOperationException("shizuku remote has no $name/${args.size}")
         method.isAccessible = true
         val params = method.parameterTypes
@@ -29,39 +36,60 @@ class ShizukuRemoteProcess(private val remote: Any) : Process() {
         return method.invoke(remote, *coerced)
     }
 
+    private fun isCompatible(type: Class<*>, value: Any?): Boolean {
+        if (value == null) return !type.isPrimitive
+        if (type.isInstance(value)) return true
+        // primitive 承接：invoke 側由 coerceArg 拆箱，選型側先放行。
+        if (type == java.lang.Long.TYPE && value is Number) return true
+        if (type == java.lang.Integer.TYPE && value is Number) return true
+        if (type == java.lang.Boolean.TYPE && value is Boolean) return true
+        return false
+    }
+
     private fun coerceArg(value: Any?, type: Class<*>): Any? {
         if (value == null) return null
         if (type.isInstance(value)) return value
         if (type == java.lang.Long.TYPE && value is Number) return value.toLong()
         if (type == java.lang.Integer.TYPE && value is Number) return value.toInt()
+        if (type == java.lang.Boolean.TYPE && value is Boolean) return value
         return value
     }
 
     override fun getOutputStream(): OutputStream =
-        call("getOutputStream") as OutputStream
+        call("getOutputStream") as? OutputStream
+            ?: throw IllegalStateException("shizuku remote getOutputStream type drift (fail-closed)")
 
     override fun getInputStream(): InputStream =
-        call("getInputStream") as InputStream
+        call("getInputStream") as? InputStream
+            ?: throw IllegalStateException("shizuku remote getInputStream type drift (fail-closed)")
 
     override fun getErrorStream(): InputStream =
-        call("getErrorStream") as InputStream
+        call("getErrorStream") as? InputStream
+            ?: throw IllegalStateException("shizuku remote getErrorStream type drift (fail-closed)")
 
     override fun waitFor(): Int =
-        (call("waitFor") as Number).toInt()
+        (call("waitFor") as? Number)?.toInt()
+            ?: throw IllegalStateException("shizuku remote waitFor type drift (fail-closed)")
 
     override fun waitFor(timeout: Long, unit: TimeUnit): Boolean =
-        call("waitFor", timeout, unit) as Boolean
+        call("waitFor", timeout, unit) as? Boolean
+            ?: throw IllegalStateException("shizuku remote waitFor(timeout) type drift (fail-closed)")
 
     override fun exitValue(): Int =
-        (call("exitValue") as Number).toInt()
+        (call("exitValue") as? Number)?.toInt()
+            ?: throw IllegalStateException("shizuku remote exitValue type drift (fail-closed)")
 
     override fun destroy() {
+        // best-effort：異常由外層 killer runCatching 收斂。
         runCatching { call("destroy") }
     }
 
     override fun destroyForcibly(): Process {
-        runCatching { call("destroyForcibly") }
-        runCatching { call("destroy") }
+        // P1-B：至少一次成功才算成功；皆失敗即抛（由 killer 外層 runCatching
+        // 收斂，但不再靜默謊稱已殺）。
+        val first = runCatching { call("destroyForcibly") }
+        if (first.isSuccess) return this
+        call("destroy")
         return this
     }
 

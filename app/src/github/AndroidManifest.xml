@@ -14,6 +14,8 @@
           getPackageName() + ".shizuku" 自尋 binder）；exported=true 是
           Shizuku Manager 回傳 binder 的必要條件。play/foss 源集無此宣告，
           對應 artifact gate 維持 fail-closed。
+          禁止加 permission（Shizuku 上游要求 exported，不另加 signature
+          permission；鑑權在 Manager 側），以免後人誤加固斷連。
         -->
         <provider
             android:name="rikka.shizuku.ShizukuProvider"

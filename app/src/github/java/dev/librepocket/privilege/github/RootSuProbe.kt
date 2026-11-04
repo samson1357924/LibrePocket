@@ -15,7 +15,12 @@ import java.io.File
  * - 單一路徑探測異常 runCatching 收斂為缺席（fail-closed：未知即無）。
  */
 object RootSuProbe {
-    /** 傳統 su 二進位（含 OEM/變體常見位）。 */
+    /**
+     * 傳統 su 二進位（含 OEM/變體常見位）。
+     *
+     * 非窮舉：例如 `/data/adb/ksu/bin/su`（KernelSU su 變體）等未列入；
+     * 缺席不代表無 root，呼叫方一律 fail-closed 回落到免 Root 路徑。
+     */
     val SU_BINARIES: List<String> = listOf(
         "/system/bin/su",
         "/system/xbin/su",
@@ -25,19 +30,31 @@ object RootSuProbe {
         "/system/xbin/daemonsu",
     )
 
-    /** Magisk 標記：掛載點＋管理器資料 dir（只認存在性，不執行）。 */
+    /**
+     * Magisk 標記：掛載點＋管理器資料 dir（只認存在性，不執行）。
+     *
+     * 路徑存在性僅供參考，版本未 pin（管理器版本升級可能遷移路徑）。
+     */
     val MAGISK_MARKERS: List<String> = listOf(
         "/sbin/.magisk",
         "/data/adb/magisk",
     )
 
-    /** KernelSU 標記。 */
+    /**
+     * KernelSU 標記。
+     *
+     * 路徑存在性僅供參考，版本未 pin（管理器版本升級可能遷移路徑）。
+     */
     val KERNELSU_MARKERS: List<String> = listOf(
         "/data/adb/ksu",
         "/data/adb/ksud",
     )
 
-    /** APatch 標記。 */
+    /**
+     * APatch 標記。
+     *
+     * 路徑存在性僅供參考，版本未 pin（管理器版本升級可能遷移路徑）。
+     */
     val APATCH_MARKERS: List<String> = listOf(
         "/data/adb/ap",
         "/data/adb/apd",
@@ -50,9 +67,24 @@ object RootSuProbe {
         val kernelSu: Boolean,
         val aPatch: Boolean,
     ) {
-        /** 任一通道可用。 */
+        /**
+         * 可直接 spawn 的 su 二進位是否存在（runner 唯一執行依據）。
+         *
+         * probe 稱可用≠可執行：即使本值為 true，提權仍可能被拒
+         * （參見 [dev.librepocket.privilege.github.isSuDenied]）。
+         */
+        val suExecutableAvailable: Boolean
+            get() = suBinaries.isNotEmpty()
+
+        /**
+         * 任一通道可用（含各方案管理器標記）。
+         *
+         * 注意：管理器標記存在≠ su 可執行；[RootSuRunner] 實際以
+         * [SuBinaryResolver.resolve]（同源 [SU_BINARIES]）為準，
+         * 本值只供診斷／UI 展示。
+         */
         val anyAvailable: Boolean
-            get() = suBinaries.isNotEmpty() || magisk || kernelSu || aPatch
+            get() = suExecutableAvailable || magisk || kernelSu || aPatch
     }
 
     fun probe(

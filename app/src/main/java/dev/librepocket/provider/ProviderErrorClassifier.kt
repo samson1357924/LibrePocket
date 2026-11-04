@@ -60,6 +60,7 @@ object ProviderErrorClassifier {
         // S2 (Issue #135 A2): 網路政策阻擋一律 fatal 不重試（縱深：即使某路徑
         // 誤走 classifier，訊息內的 deny 碼仍鎖 FATAL）。
         "network_policy_blocked",
+        "cleartext",
         "cleartext_not_permitted",
         "private_address_blocked",
         "metadata_address_blocked",

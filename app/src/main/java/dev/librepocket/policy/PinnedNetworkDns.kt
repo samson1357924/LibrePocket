@@ -41,11 +41,12 @@ class PinnedNetworkDns(
     }
   }
 
-  /** OkHttp 建連路徑：只認釘住值。 */
+  /** OkHttp 建連路徑：只認釘住值。未釘住訊息為靜態 `DNS_PIN_MISS`
+   *（不帶 hostname；host 只進 audit，不進錯誤字串／UI／transcript）。 */
   override fun lookup(hostname: String): List<InetAddress> {
     val key = normalize(hostname)
     pinned[key]?.let { return it.toList() }
-    if (strict) throw UnknownHostException("DNS_PIN_MISS:$hostname")
+    if (strict) throw UnknownHostException("DNS_PIN_MISS")
     val fresh = delegate.resolve(hostname)
     if (fresh.isEmpty()) throw UnknownHostException(hostname)
     pinned[key] = fresh.toList()

@@ -16,11 +16,14 @@ import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.job
 import kotlinx.coroutines.flow.Flow
@@ -45,9 +48,10 @@ import org.junit.Test
 private class SlowThenFastListProvider(
     val entered: CountDownLatch = CountDownLatch(1),
     val release: CountDownLatch = CountDownLatch(1),
-    val slowDone: CountDownLatch = CountDownLatch(1),
     val fastDone: CountDownLatch = CountDownLatch(1),
     val calls: AtomicInteger = AtomicInteger(0),
+    /** A's ViewModel-coroutine Job, captured on the slow path inside listModels. */
+    val aJob: CompletableDeferred<Job> = CompletableDeferred(),
 ) : LlmProvider {
     override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
 
@@ -62,31 +66,42 @@ private class SlowThenFastListProvider(
      * this surfaces as a stale 5-item write (RED); post-guard it is
      * discarded and the terminal stays 2 (GREEN). [calls] proves both ran.
      *
-     * [fastDone] fires at provider return (listModels finally), i.e. BEFORE
-     * the ViewModel's `_form.update` publishes B — it stays only as a
-     * deadlock guard for A's gate, never as an ordering signal. The
-     * stale-never-written pin is the live history collector in the test
-     * (started pre-release), not this latch. Residual: the collector observes
-     * StateFlow emissions and can still conflate under pathological
-     * same-instant writes (accepted).
+     * Prod structure (verified): `testConnection()` launches ONE
+     * `viewModelScope.launch(Dispatchers.IO)` coroutine per attempt with no
+     * child launch and no `withContext` Job-hop, so `listModels()` executes
+     * INSIDE A's coroutine — `currentCoroutineContext().job` captured here
+     * IS the same Job that performs the guard check plus the possible
+     * `_form.update` writeback. Joining it therefore proves writeback
+     * completion, which no provider-return latch can: [fastDone]/`slowDone`
+     * fire at provider return (listModels finally), i.e. BEFORE the
+     * ViewModel's `_form.update`. A >2s IO stall between provider return
+     * and writeback would let a `slowDone.await` + cancel-collector +
+     * fast-assert sequence pass BEFORE a regressed writeback lands
+     * (derivable false-green). The test joins [aJob] instead.
+     *
+     * [fastDone] fires at provider return, i.e. BEFORE the ViewModel's
+     * `_form.update` publishes B — it stays only as a deadlock guard for
+     * A's gate, never as an ordering signal. The stale-never-written pin is
+     * the live history collector plus the [aJob] join in the test.
+     * Residual: the collector observes StateFlow emissions and can still
+     * conflate under pathological same-instant writes (accepted).
      */
     override fun stream(request: ChatRequest): Flow<StreamEvent> = emptyFlow()
 
     override suspend fun listModels(): List<String> {
         val n = calls.incrementAndGet()
         if (n == 1) {
+            // Capture A's Job: complete() never suspends and returns false
+            // (no-op) if already completed — safe at the head of the slow path.
+            aJob.complete(currentCoroutineContext().job)
             entered.countDown()
             if (!release.await(10, TimeUnit.SECONDS)) error("slow gate timeout")
-            try {
-                // Deadlock guard only (not an ordering signal): wait until B's
-                // provider call has returned so A's slow return always lands
-                // last. B-published-before-A-released is pinned by the test's
-                // ViewModel-terminal wait, not by this latch.
-                if (!fastDone.await(10, TimeUnit.SECONDS)) error("fast completion gate timeout")
-                return listOf("slow-1", "slow-2", "slow-3", "slow-4", "slow-5")
-            } finally {
-                slowDone.countDown()
-            }
+            // Deadlock guard only (not an ordering signal): wait until B's
+            // provider call has returned so A's slow return always lands
+            // last. B-published-before-A-released is pinned by the test's
+            // ViewModel-terminal wait, not by this latch.
+            if (!fastDone.await(10, TimeUnit.SECONDS)) error("fast completion gate timeout")
+            return listOf("slow-1", "slow-2", "slow-3", "slow-4", "slow-5")
         } else {
             try {
                 return listOf("fast-1", "fast-2")
@@ -250,6 +265,17 @@ class SetupEditKeepExistingTest {
 
     @Test
     fun slowTestConnectionDoesNotOverwriteNewer() = runBlocking {
+        // Guard shape under test: the post-listModels `_form.update` discards
+        // unless entryRevision AND generation AND state testConnectionRevision
+        // all still match. This is a 組合 barrier, not single-guard
+        // independent: neutering EITHER dimension alone (entryRevision check
+        // or generation checks) leaves this test GREEN — the other dimension
+        // still discards A. Only neutering BOTH dimensions turns it RED with
+        // a stale 5-item terminal (verified by temporary src/main neuters,
+        // since reverted). Note testConnection's post-listModels path has no
+        // suspension point, so job-cancel alone does NOT suppress A here
+        // (unlike refreshModels, where ensureActive inside fetchSnapshotOutcome
+        // is an additional independent suppression — see the symmetric test).
         val store = newStore()
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         val fake = SlowThenFastListProvider()
@@ -286,14 +312,18 @@ class SetupEditKeepExistingTest {
         val collector = histScope.launch { vm.form.collect { seen.add(it.testModels) } }
         // Release slow AFTER B published so slow always finishes last:
         // pre-guard overwrites to 5 (RED), post-guard discards to 2 (GREEN).
-        // Bounded writeback-settle: slowDone fires at provider return, A's VM
-        // _form.update follows on IO — cancelling the collector (or reading
-        // the terminal) immediately after slowDone races that writeback.
-        // A regressed guard publishes 5 here, failing fast well within the
-        // bound; the green path waits it out. B-published-before-A-released
-        // makes a regressed stale write terminal (nothing overwrites after
-        // A), so this post-release watch cannot miss it.
-        val stale = try {
+        // Completion proof is the [SlowThenFastListProvider.aJob] join below:
+        // a provider-return latch (`slowDone`, now removed) fires BEFORE A's
+        // `_form.update` writeback, so a >2s IO stall between provider return
+        // and writeback would let latch-await + collector-cancel + fast-assert
+        // pass before a regressed writeback lands (false-green). Joining A's
+        // Job covers the guard check plus the possible writeback itself.
+        // B-published-before-A-released makes a regressed stale write
+        // terminal (nothing overwrites after A), so the post-join terminal
+        // and collector asserts cannot miss it — the bounded 2s post-release
+        // `first{slow}` watch is dropped as unneeded (it proved only absence
+        // within a window, never writeback completion).
+        try {
             // Handshake (first statement inside try so a timeout still hits the
             // finally below): wait until the collector has observed B-terminal
             // before releasing A; otherwise release + A's whole writeback could
@@ -301,18 +331,20 @@ class SetupEditKeepExistingTest {
             // seen is a plain synchronized list (collector pushes), hence poll; bounded 10s, first emission immediate post-B-terminal in practice.
             withTimeout(10_000) { while (seen.isEmpty()) delay(5) }
             fake.release.countDown()
-            assertTrue("slow attempt never finished", fake.slowDone.await(10, TimeUnit.SECONDS))
-            awaitTestIdle(vm)
-            withTimeoutOrNull(2_000) { vm.form.first { it.testModels == 5 } }
+            val aCoroutine = withTimeout(10_000) { fake.aJob.await() }
+            // join() never throws, even on cancelled completion — the 15s
+            // bound is failure-only (a stuck A fails instead of hanging).
+            withTimeout(15_000) { aCoroutine.join() }
         } finally {
             histScope.cancel()
             withTimeoutOrNull(5_000) { histScope.coroutineContext.job.join() }
         }
-        // The stale 5-item result must NEVER be written (not even transiently).
-        assertNull("slow result must be discarded (stale write appeared): $stale", stale)
-        assertTrue("slow result must be discarded (collector saw stale): $seen", seen.none { it == 5 })
+        // The stale 5-item result must NEVER be written (not even transiently):
+        // A has fully completed above, so the terminal and the full collector
+        // history are conclusive.
         assertNull(vm.form.value.errorCode)
         assertEquals(2, vm.form.value.testModels)
+        assertTrue("slow result must be discarded (collector saw stale): $seen", seen.none { it == 5 })
         // Both attempts ran; the slow 5-item result was discarded, not terminal.
         assertEquals(2, fake.calls.get())
     }

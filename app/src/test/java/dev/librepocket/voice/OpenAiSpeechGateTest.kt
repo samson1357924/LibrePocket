@@ -271,4 +271,17 @@ class OpenAiSpeechGateTest {
             server.shutdown()
         }
     }
+
+    // ---- PocketGuard BLOCK #4: 揭露組合不變量（與 VoiceDisclosureTest:76 互補，不重釘字面） ----
+
+    @Test
+    fun openAiVoiceDisclosure_isAiPlusBufferComposition() {
+        // 組合不變量：DISCLOSURE 必須等於 AI 段 +「；」+ BUFFER 段，避免悄悄加料/減料。
+        assertEquals(
+            VoiceTools.OPENAI_VOICE_AI_DISCLOSURE + "；" + VoiceTools.OPENAI_VOICE_BUFFER_DISCLOSURE,
+            VoiceTools.OPENAI_VOICE_DISCLOSURE,
+        )
+        // AI 生成揭露不得遺失（英文關鍵字，UI 語言無關）。
+        assertTrue(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("AI-generated"))
+    }
 }

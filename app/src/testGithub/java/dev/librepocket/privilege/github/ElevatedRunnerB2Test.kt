@@ -10,6 +10,8 @@ import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.Job
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -19,7 +21,7 @@ import org.junit.Test
 
 /**
  * B2 runner 修正測試（Issue #136 B2）：
- * su exit 語義／整組殺＋cancel 鉤／Shizuku 包裝／二進位／可信 su／狀態門。
+ * su exit 語義／盡力整組殺 best-effort＋cancel 鉤／Shizuku 包裝／二進位／可信 su／狀態門。
  * 全 fake（假進程＋假存在映射＋假狀態），零真機、零 su、零 binder。
  */
 class ElevatedRunnerB2Test {
@@ -163,7 +165,7 @@ class ElevatedRunnerB2Test {
         assertTrue("$r", r is ShellResult.Failed)
     }
 
-    // ---- 2. process-group kill＋cancel 鉤 ----
+    // ---- 2. process-group kill best-effort＋cancel 鉤 ----
 
     @Test fun timeoutKillsWholeGroupViaKiller() {
         var kills = 0
@@ -847,7 +849,7 @@ class ElevatedRunnerB2Test {
         // R3-A：預設 isCancelled 只看 Thread 中斷，coroutine 呼叫方須顯式傳
         // `isCancelled = { !job.isActive }`；此處以前 N 次 false 後讀 job 狀態
         // 的鉤模擬「輪詢中被取消」：hang FakeProcess 保證非超時路徑（10s 上界），
-        // 第 3 次輪詢時 job.cancel()，之後鉤讀到 !isActive 即殺整組回 TimedOut。
+        // 第 3 次輪詢時 job.cancel()，之後鉤讀到 !isActive 即盡力殺整組 best-effort 回 TimedOut。
         // 零真機/零真掛起：hang FakeProcess 的 waitFor 切片可被 killer 立即解除。
         val job = Job()
         var polls = 0
@@ -900,5 +902,67 @@ class ElevatedRunnerB2Test {
         assertEquals(1, shizukuKills)
         assertTrue("shizukuPolls=$shizukuPolls", shizukuPolls >= 3)
         assertTrue(shizukuJob.isCancelled)
+    }
+
+    // ---- S2-A 真 cancel racing（owner P2-3）：跨執行緒 job.cancel()，不在 callback 內 cancel ----
+
+    @Test fun crossThreadJobCancelRacesDrainToTimedOut() {
+        // S2-A：drain 跑背景執行緒（hang FakeProcess 阻塞在 waitFor 切片），主執行緒
+        // sleep 200ms 後 job.cancel()（真 Job，isCancelled 鉤僅讀 !job.isActive，
+        // 不在 callback 內 cancel，跨執行緒 racing；舊測試在鉤內計數到第 N 次即 cancel
+        // 屬人為同步取消，不算 racing）。斷言背景 drain 回 TimedOut＋killer 被調。
+        // 有界（每路 join 上界 4s，兩路＋sleep 合計 <10s；超界即失敗），
+        // 不斷言精確耗時，只斷 verdict/kill，不 flaky。
+        fun runOneRound(
+            runnerOf: (
+                killer: (Process) -> Unit,
+                isCancelled: () -> Boolean,
+            ) -> BinaryElevatedRunner,
+        ) {
+            val job = Job()
+            val kills = AtomicInteger(0)
+            val runner = runnerOf(
+                {
+                    kills.incrementAndGet()
+                    it.destroy()
+                },
+                { !job.isActive },
+            )
+            val result = AtomicReference<ElevatedBinaryResult?>()
+            val bg = Thread {
+                result.set(runner.runBinary(ElevatedRequest(listOf("id"), "S2A-T"), 10_000L))
+            }.also { it.isDaemon = true; it.start() }
+            Thread.sleep(200L)
+            job.cancel()
+            bg.join(4_000L)
+            assertFalse("background drain should finish within bound", bg.isAlive)
+            val b = result.get()
+            assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
+            assertEquals(1, kills.get())
+            assertTrue(job.isCancelled)
+        }
+        runOneRound { killer, isCancelled ->
+            RootSuRunner(
+                privateRoot = privateRoot,
+                bridgeGranted = true,
+                spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
+                suBinary = "/system/bin/su",
+                killer = killer,
+                isCancelled = isCancelled,
+                grantCheck = GrantFixtures.allowAlways,
+            )
+        }
+        runOneRound { killer, isCancelled ->
+            ShizukuShellRunner(
+                privateRoot = privateRoot,
+                bridgeGranted = true,
+                pingBinder = { true },
+                spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
+                status = { ShizukuStatus.Available(15) },
+                killer = killer,
+                isCancelled = isCancelled,
+                grantCheck = GrantFixtures.allowAlways,
+            )
+        }
     }
 }

@@ -148,6 +148,13 @@ object ShizukuStatusGate {
  * 同理，重試不被冪等守衛吞掉。
  * 上游為靜態 Shizuku 類無法注入失敗，單測只斷言本地語義
  * （守衛＋回呼表）。
+ *
+ * S2-B Binder E2E 誠實化（owner P2-5，僅 KDoc 文件化，行為零變更）：
+ * - JVM 單測走註冊失敗路徑（Shizuku 類初始化失敗，`isAttached` 恆 false）：
+ *   僅斷言本地語義（守衛＋回呼表＋失敗不卡死＋detach 清表），不代表真機 binder 語義；
+ * - 真實 binder attach→detach→attach 不重複（上游不累積、重建後單分發）
+ *   需裝置 E2E 驗收（歸 B3，見 [PrivilegeActivation]；JVM 下上游靜態表無法斷言，
+ *   僅由 [detach] 內同一引用 remove* 保證）。
  */
 class ShizukuBinderEvents {
     private val receivedCallbacks = mutableListOf<() -> Unit>()

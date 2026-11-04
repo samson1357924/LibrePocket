@@ -3,12 +3,33 @@ package dev.librepocket.privilege.github
 import java.lang.reflect.InaccessibleObjectException
 
 /**
- * 提權子進程清理（B2，Issue #136 B2，僅 github 風味；P1-B 誠實化措辭；R2-A 可驗證化）。
+ * 提權子進程清理（B2，Issue #136 B2，僅 github 風味；P1-B 誠實化措辭；R2-A 可驗證化；
+ * S2-A 版本矩陣＋best-effort 宣告，不改行為）。
  *
  * 背景：舊 [ElevatedProcessIo.drain] 只殺 `su` 本體（`destroyForcibly`），
  * 其子孫（`su -c` 拉起的真正命令）殘留為 root 孤兒（Issue #136 §5）。
- * 本物件盡力整組（JVM/新 Android 才真整組）：先殺子孫再殺本體，並關流以
+ * 本物件盡力整組 best-effort（JVM/新 Android 才真整組）：先殺子孫再殺本體，並關流以
  * 解除 gobbler 的 blocking I/O。
+ *
+ * S2-A 版本矩陣（owner P1-2 lifecycle＋P2-3 cancel，不改行為）：
+ * - JVM Host JDK（單測）：JDK 9+ `ProcessHandle` 完整 → 真整組（先殺子孫再殺本體；
+ *   `ElevatedProcessKillerTest` 真 `sh -c "sleep 30 & wait"` 子進程已驗，父死＋子孫無存活）；
+ * - 新 Android（具 `descendants` API）：反射取到 handle＋`descendants` → 同上真整組；
+ * - 舊 Android（缺 API 或 AOSP 樁抛錯）：`NoSuchMethodException`／
+ *   `UnsupportedOperationException` 或 `ProcessHandle` 類缺席（`NoClassDefFoundError`）
+ *   即收斂，實際退化為「關流 + 殺本體 best-effort（單殺 `destroyForcibly`）」，非真整組；
+ * - AOSP libcore `Process.toHandle` 預設實作抛 `UnsupportedOperationException`
+ *   （源碼見 https://cs.android.com/android/platform/superproject/main/+/main:libcore/ojluni/src/main/java/java/lang/Process.java
+ *   ；android.jar 內即 `".toHandle() not supported"` 樁，非公開 API，見 `api-versions.xml`）；
+ * - [ShizukuRemoteProcess] 未覆寫 `toHandle`，沿用 JDK 預設抛 `UnsupportedOperationException`，
+ *   故遠端樹同為單殺（僅本體；子孫列舉一步即收斂）。
+ *
+ * S2-A best-effort 宣告（PocketGuard WARN 回應）：假設僅 JDK 9+／具 `ProcessHandle`＋
+ * `descendants` 的新平台才真整組，舊平台一律 fallback 單殺 `destroyForcibly`
+ * （即上表；版本漂移一律收斂，不崩）。best-effort 單殺，裝置缺口未解；
+ * B2 runner 清理驗收未過；activation blocker 見 [PrivilegeActivation]
+ * （[PrivilegeActivation.ELEVATED_RUNNERS_READY] 仍 `false`，B1 未完，產品不得接線 runner；
+ * 子孫清理裝置 E2E 歸 B3）。
  *
  * 誠實化（P1-B，行為不變）：
  * - Android 上 `Process.toHandle`/`descendants` 若不可用（舊版本缺席，或

@@ -47,6 +47,15 @@ import java.util.concurrent.TimeUnit
  *
  * R3-B（PocketGuard SUGGESTION，ExecutorService）：維持現狀 —— 固定 2 daemon
  * threads＋有界 join 已防洩漏/hang，ExecutorService 為未來選項（B3）。
+ *
+ * S2-B 容量矩陣（owner P2-4，僅 KDoc 文件化，行為零變更）：
+ * - 典型 PNG 截圖 1-3MB：完整通過（<8M，Ok 非 truncated，capture 可摘要）；
+ * - 600KB fb0：完整通過（見容量測試 600KB 雙 runner 通過）；
+ * - 未壓縮 RGBA 1080x2400x4 ≈10.37MB：明確不支援（>8M 即 truncated→null，
+ *   呼叫方降級手動截圖；截斷幀摘要會虛構完整截圖，故不摘要部分幀）；
+ * - 高熵 PNG 超限同理：>8M 即 truncated→null，不分內容熵；
+ * - 裝置容量驗收歸 B3 E2E（見 [PrivilegeActivation]：`ELEVATED_RUNNERS_READY`
+ *   翻 true 前需裝置驗收；JVM 單測僅以假位元組斷言容量邊界，不代表真機幀大小）。
  */
 internal object ElevatedProcessIo {
     /** R1-A 截圖二進位容量：`screencap -p` / `cat /dev/graphics/fb0` 的截斷上限（8M）。 */

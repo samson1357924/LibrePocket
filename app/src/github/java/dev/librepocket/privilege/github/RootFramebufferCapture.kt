@@ -47,6 +47,15 @@ enum class FrameSource {
  * 會損毀 PNG）。審計（R3-B）：grep 產品源集（`app/src/main`＋`app/src/github`）
  * 零呼叫，僅測試引用；產品 B3 接線應使用 Binary 多載。
  *
+ * S2-B 容量矩陣（owner P2-4，僅 KDoc 文件化，行為零變更）：
+ * - 典型 PNG 截圖 1-3MB：完整通過（<8M，Ok 非 truncated，capture 可摘要）；
+ * - 600KB fb0：完整通過；
+ * - 未壓縮 RGBA 1080x2400x4 ≈10.37MB：明確不支援（>8M 即 truncated→null，
+ *   呼叫方降級手動截圖；截斷即 null，不摘要部分幀，見 `auditAndExtract`）；
+ * - 高熵 PNG 超限同理：>8M 即 truncated→null，不分內容熵；
+ * - 容量常數見 [ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES]（8M 截斷＋硬讀取）；
+ *   裝置容量驗收歸 B3 E2E（見 [PrivilegeActivation]）。
+ *
  * 讀取函數可注入，JVM 單測直接斷言優先序與摘要語義。
  */
 class RootFramebufferCapture(

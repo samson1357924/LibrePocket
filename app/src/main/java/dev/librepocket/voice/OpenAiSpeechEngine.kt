@@ -1414,6 +1414,7 @@ class AndroidAudioPlayer(
  * 8. 重試契約：engine 永不隱性重試（[OpenAiTtsException.retryable] 僅為呼叫端分類標籤，單次呼叫恰一發，不自動重送）；
  *    未來 UI 若重試需指數退避＋尊重 Retry-After＋上限＋同 epoch/手勢（同一次使用者手勢／同一世代內才可重試，失敗不自動重試）。
  *    另無 pinning 與成本護欄：信任系統錨無 pinning；無去抖/預算；已發送取消照計費，UI 層需去抖＋失敗不自動重試。
+ * 9. 狀態機總覽索引：engine 生命週期 OPEN -> SHUTTING_DOWN -> CLOSED（[shutdownLock] 擁有，順序 shutdownLock -> generationLock）；播放階段 PREPARING -> PLAYING（[AndroidAudioPlayer.lock] 擁有，prepare 超時僅涵蓋 PREPARING）；release 柵欄 OPEN -> CLOSED（[AndroidAudioPlayer.releaseLock] 擁有，順序 releaseLock -> lock）；鎖間無反向依賴，詳見各 KDoc。
  */
 class OpenAiSpeechEngine(
     val client: OpenAiTtsClient = OpenAiTtsClient(),
@@ -1657,6 +1658,7 @@ class OpenAiSpeechEngine(
                     null
                 }
             }
+            // 非對稱 fail-closed：上分支 endpointStore != null 時已直接 return（成功或 null），僅 null-store 才到此查 preset:openai，嚴禁向下降級。
             if (tryHasKey(vault, OPENAI_ENDPOINT_KEY_REF)) {
                 return ResolvedKey.OfficialOpenAi(OPENAI_ENDPOINT_KEY_REF)
             }

@@ -587,8 +587,8 @@ object ToolRegistry {
             ),
             sideEffect = SideEffect.READ,
             annotations = ToolAnnotations(
-                requiresSwitch = "voice_input",
-                switchDefault = true,
+                requiresSwitch = VoiceTools.SWITCH_INPUT,
+                switchDefault = VoiceTools.SWITCH_INPUT_DEFAULT,
                 fallbackHint = "type the message manually in the input box",
             ),
         ),
@@ -601,8 +601,8 @@ object ToolRegistry {
             ),
             sideEffect = SideEffect.WRITE,
             annotations = ToolAnnotations(
-                requiresSwitch = "voice_output",
-                switchDefault = true,
+                requiresSwitch = VoiceTools.SWITCH_OUTPUT,
+                switchDefault = VoiceTools.SWITCH_OUTPUT_DEFAULT,
                 fallbackHint = "read the message text on screen manually",
             ),
         ),

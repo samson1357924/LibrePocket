@@ -504,6 +504,10 @@ class OpenAiTtsClient(
         apiKeyOverride = apiKeyOverride,
     )
 
+    /**
+     * 版本依賴註記：`invokeOnCompletion(onCancelling = true)` 需 `InternalCoroutinesApi`；
+     * kotlinx.coroutines 升級時需複查是否有穩定替代（stable API）可取代，避免長期依賴 internal。
+     */
     @OptIn(InternalCoroutinesApi::class)
     private suspend fun executeRequest(httpRequest: Request, activeKey: String): OpenAiTtsResult =
         withContext(Dispatchers.IO) {

@@ -474,6 +474,7 @@ internal suspend fun <T> executeProviderRequest(
             try {
                 response.close()
             } catch (_: NullPointerException) {
+                // Defensive: OkHttp Response.close() crashes if body is null.
             }
             throw redirectBlockedFailure(response.code)
         }
@@ -578,6 +579,7 @@ internal suspend fun pumpSse(
                     try {
                         response.close()
                     } catch (_: NullPointerException) {
+                        // Defensive: OkHttp Response.close() crashes if body is null.
                     }
                     throw redirectBlockedFailure(response.code)
                 }

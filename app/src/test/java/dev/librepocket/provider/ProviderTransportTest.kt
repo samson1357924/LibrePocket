@@ -405,7 +405,9 @@ class ProviderTransportTest {
                                 val read = super.read(sink, byteCount)
                                 if (read > 0L) {
                                     consumedBytes.addAndGet(read)
-                                    if (consumedBytes.get() >= MODEL_LIST_BODY_LIMIT_BYTES - 64 * 1024) thresholdReached.complete(Unit)
+                                    if (consumedBytes.get() >= MODEL_LIST_BODY_LIMIT_BYTES - 64 * 1024) {
+                                        thresholdReached.complete(Unit)
+                                    }
                                 }
                                 return read
                             } finally {

@@ -127,7 +127,8 @@ open class FakeSessionStore : SessionStore {
      * pass fixtures with `failureReason == null` and text that needs no
      * redaction; anything else must go through [appendEvent]. Must not be used
      * with fault-injecting subclasses (`appendEvents` does not route here;
-     * only [appendEvent] is virtual).
+     * only [appendEvent] is virtual). Does NOT invoke `onAppended`
+     * (budget-fixture fast path; use [appendEvent] when a drain hook is needed).
      */
     suspend fun appendPreRedactedForBudgetTest(event: TranscriptEvent): Long {
         require(event.kind in VALID_KINDS) { "unknown event kind: ${event.kind}" }

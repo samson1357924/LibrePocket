@@ -5,6 +5,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 /**
@@ -54,12 +55,10 @@ class WebSearchCoreTest {
     // ---- registry ----
 
     @Test fun duplicateIdFailsFast() {
-        try {
+        val e = assertThrows(IllegalArgumentException::class.java) {
             WebSearchRegistry(listOf(FakeOk("a"), FakeOk("a")))
-            throw AssertionError("expected IllegalArgumentException")
-        } catch (e: IllegalArgumentException) {
-            assertTrue(e.message!!.contains("DUPLICATE_PROVIDER_ID"))
         }
+        assertTrue(e.message!!.contains("DUPLICATE_PROVIDER_ID"))
     }
 
     @Test fun registryLookupPreservesOrder() {

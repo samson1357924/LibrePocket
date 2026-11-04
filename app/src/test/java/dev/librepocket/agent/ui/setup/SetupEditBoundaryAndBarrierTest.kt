@@ -12,6 +12,7 @@ import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.StreamEvent
 import java.nio.file.Files
+import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -22,8 +23,10 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
@@ -48,14 +51,37 @@ private class SlowRefreshListProvider(
     override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
     override fun stream(request: ChatRequest): Flow<StreamEvent> = emptyFlow()
 
+    /**
+     * Deterministic slow/fast race: call order is fixed by the gate, not by
+     * thread scheduling. Slow attempt A blocks in listModels until the test
+     * releases it; fast attempt B returns immediately.
+     *
+     * Ordering is B-published-before-A-released: the test waits for B's
+     * ViewModel-terminal value (options contain fast && !modelsLoading)
+     * BEFORE counting down `release`, so A's stale writeback always lands
+     * last. Pre-barrier this surfaces as a stale slow-r write (RED);
+     * post-barrier it is discarded and the terminal stays fast-only (GREEN).
+     * [calls] proves both ran.
+     *
+     * [fastDone] fires at provider return (listModels finally), i.e. BEFORE
+     * the ViewModel's `_form.update` publishes B — it stays only as a
+     * deadlock guard for A's gate, never as an ordering signal. The
+     * stale-never-written pin is the live history collector in the test
+     * (started pre-release), not this latch. Residual: the collector observes
+     * StateFlow emissions and can still conflate under pathological
+     * same-instant writes (accepted).
+     */
+
     override suspend fun listModels(): List<String> {
         val n = calls.incrementAndGet()
         if (n == 1) {
             entered.countDown()
             if (!release.await(10, TimeUnit.SECONDS)) error("slow refresh gate timeout")
             try {
-                // H2 sleep-free：固定 delay(300) 改為條件手遞——慢 A 等快 B 完成後才回，
-                // 保證「慢後快先」排序，無時間猜測；pre-barrier 下慢覆寫仍必現（紅）。
+                // Deadlock guard only (not an ordering signal): wait until B's
+                // provider call has returned so A's slow return always lands
+                // last. B-published-before-A-released is pinned by the test's
+                // ViewModel-terminal wait, not by this latch.
                 if (!fastDone.await(10, TimeUnit.SECONDS)) error("fast completion gate timeout")
                 return listOf("slow-r1", "slow-r2", "slow-r3", "slow-r4", "slow-r5")
             } finally {
@@ -343,9 +369,11 @@ class SetupEditBoundaryAndBarrierTest {
         // 非同步 revision barrier（refresh 側）：慢 A 完成晚於快 B，舊結果丟棄。
         // 與 SetupEditKeepExistingTest.slowTestConnectionDoesNotOverwriteNewer 對稱；
         // 雙閘（entryRevision＋modelRefreshGeneration）缺一即此測試轉紅。
-        // H2 sleep-free：終端 delay(500) 改為 first+withTimeout 負向控制——
-        // 慢結果若出現（pre-barrier 覆寫）即 first 命中紅；1s 內無慢即丟棄成立綠。
-        // (terminal-value negative control; StateFlow-conflated, transient overwrite invisible; 1s green-path cost)
+        // 排序銷定：先等 B 的 ViewModel 終值（modelOptions 含 fast 且
+        // !modelsLoading）再放行 A；B-published-before-A-released。fastDone 只
+        // 是防死鎖，不作排序信號。stale-never-written 由放行前啟動的 live
+        // collector 釘住（終值後再訂閱的 first 會因 StateFlow conflation 漏看
+        // 瞬態慢寫；同拍合併仍為已知殘留）。
         val store = newStore()
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         val fake = SlowRefreshListProvider()
@@ -362,17 +390,53 @@ class SetupEditBoundaryAndBarrierTest {
         // 慢嘗試阻塞中編輯 key＋重刷：新 generation B 必須成為終值。
         vm.onApiKeyChange("fake-boundary-fast-key-FFFFFFFF")
         vm.refreshModels()
-        fake.release.countDown()
-        assertTrue("slow refresh never finished", fake.slowDone.await(10, TimeUnit.SECONDS))
-        awaitModelsIdle(vm)
-        val slowAppeared = withTimeoutOrNull(1_000) {
-            vm.form.first { it.modelOptions.any { o -> o.startsWith("slow-r") } }
+        // FIRST wait for B's ViewModel-terminal publish (provider return is
+        // NOT enough: fastDone fires in listModels' finally, before the
+        // ViewModel's _form.update). Releasing A only after B's terminal value
+        // is published pins B-published-before-A-released, so a regressed
+        // barrier must surface as a stale slow write (RED) instead of an
+        // A-then-B lucky overwrite (false green).
+        val fast = listOf("fast-r1", "fast-r2")
+        withTimeout(10_000) { vm.form.first { it.modelOptions.containsAll(fast) && !it.modelsLoading } }
+        // History collector started BEFORE releasing A: StateFlow is
+        // conflated, so a post-hoc first{slow} subscribed after idle would
+        // miss a transient slow overwritten by B; the live collector observes
+        // every emission from B-terminal onward. (Residual: same-instant
+        // conflated writes could still merge upstream — accepted.)
+        val seen = Collections.synchronizedList(mutableListOf<Any>())
+        val collector = launch(Dispatchers.Default) { vm.form.collect { seen.add(it.modelOptions.toList()) } }
+        // Handshake：等 collector 已觀測到 B 終值才放行 A；否則放行＋A 整段
+        // 寫回可能搶在 collector 首次發射前完成（空洞釘）。
+        withTimeout(10_000) { while (seen.isEmpty()) delay(5) }
+        // Release slow AFTER B published so slow always finishes last:
+        // pre-barrier overwrites with slow-r (RED), post-barrier discards
+        // and the terminal stays fast-only (GREEN).
+        // Bounded writeback-settle: slowDone fires at provider return, A's VM
+        // _form.update follows on IO — cancelling the collector (or reading
+        // the terminal) immediately after slowDone races that writeback. A
+        // regressed barrier publishes slow-r here, failing fast well within
+        // the bound; the green path waits it out. B-published-before-A-
+        // released makes a regressed stale write terminal (nothing overwrites
+        // after A), so this post-release watch cannot miss it.
+        val stale = try {
+            fake.release.countDown()
+            assertTrue("slow refresh never finished", fake.slowDone.await(10, TimeUnit.SECONDS))
+            awaitModelsIdle(vm)
+            withTimeoutOrNull(2_000) { vm.form.first { it.modelOptions.any { o -> o.startsWith("slow-r") } } }
+        } finally {
+            collector.cancel()
+            collector.join()
         }
-        assertNull("slow result must be discarded (stale write appeared): $slowAppeared", slowAppeared)
+        // The stale slow-r result must NEVER be written (not even transiently).
+        assertNull("slow result must be discarded (stale write appeared): $stale", stale)
+        assertTrue(
+            "slow result must be discarded (collector saw stale): $seen",
+            seen.none { opts -> (opts as List<*>).any { o -> (o as String).startsWith("slow-r") } },
+        )
         assertNull(vm.form.value.errorCode)
         assertFalse(vm.form.value.modelsLoading)
         val options = vm.form.value.modelOptions
-        assertTrue("fast result must be terminal, got $options", options.containsAll(listOf("fast-r1", "fast-r2")))
+        assertTrue("fast result must be terminal, got $options", options.containsAll(fast))
         assertTrue("slow result must be discarded, got $options", options.none { it.startsWith("slow-r") })
         assertEquals(2, fake.calls.get())
     }

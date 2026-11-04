@@ -9,6 +9,7 @@ import android.service.voice.VoiceInteractionSessionService
  * `SessionService` action；每個手勢喚起經 [onNewSession] 產生
  * [LibreVoiceInteractionSession]（C1 無狀態、C2 才加 Compose／STT）。
  */
+// TODO(C2-assistant): 隨 session 內 Compose／STT 落地補齊喚起參數與生命週期處理。
 class LibreVoiceInteractionSessionService : VoiceInteractionSessionService() {
     override fun onNewSession(args: Bundle?): VoiceInteractionSession =
         LibreVoiceInteractionSession(this)

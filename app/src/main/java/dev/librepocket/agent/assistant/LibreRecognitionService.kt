@@ -1,22 +1,55 @@
 package dev.librepocket.agent.assistant
 
+import android.content.AttributionSource
 import android.content.Intent
 import android.speech.RecognitionService
+import android.speech.RecognitionSupport
 import android.speech.SpeechRecognizer
+import android.util.Log
+
+private const val TAG = "LibreRecognition"
+
+// TODO(C2-assistant): 在 session 內接系統 STT（串流辨識＋onError 語義），取代本 stub。
 
 /**
  * C1 RecognitionService stub（Issue #137 C1a）。
  *
  * C1 不做語音辨識（C2 才在 session 內接系統 STT）：[onStartListening]
  * 誠實回報 [SpeechRecognizer.ERROR_CLIENT]，不偽造辨識結果；
+ * [onCheckRecognitionSupport] 回報零支援（空語言清單），不偽造能力；
  * [onCancel]／[onStopListening] 無狀態可清，直接 no-op。
  */
 class LibreRecognitionService : RecognitionService() {
     override fun onStartListening(intent: Intent, listener: Callback) {
         try {
             listener.error(SpeechRecognizer.ERROR_CLIENT)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             // Binder 回調失敗即放棄，不重試、不偽造結果。
+            Log.w(TAG, "onStartListening callback failed", e)
+        }
+    }
+
+    override fun onCheckRecognitionSupport(intent: Intent, callback: SupportCallback) {
+        // 雙參版（API 33＋）：C1 無辨識能力，回報空語言清單＝零支援。
+        // 三參 AttributionSource 版見下（同樣回空支援，避免委託方向不確定）。
+        reportNoSupport(callback)
+    }
+
+    override fun onCheckRecognitionSupport(
+        intent: Intent,
+        attributionSource: AttributionSource,
+        callback: SupportCallback,
+    ) {
+        // 三參版（API 33＋）顯式覆寫、同樣回空支援：基類雙參／三參互調方向
+        // 依版本實作而定，只覆寫一邊可能被另一路徑繞過，兩邊同覆寫最穩。
+        reportNoSupport(callback)
+    }
+
+    private fun reportNoSupport(callback: SupportCallback) {
+        try {
+            callback.onSupportResult(RecognitionSupport.Builder().build())
+        } catch (e: Exception) {
+            Log.w(TAG, "onCheckRecognitionSupport callback failed", e)
         }
     }
 

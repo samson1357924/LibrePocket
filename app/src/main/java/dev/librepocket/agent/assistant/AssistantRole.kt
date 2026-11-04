@@ -66,8 +66,8 @@ object AssistantReasonCode {
  * - 其餘原樣 passthrough（含 null 與 DENIED／UNSUPPORTED／REQUEST_FAILED／REVOKED）。
  *
  * 已知 GRANTED 競態：`RESULT_OK` 後系統未即時落盤時，重讀快照仍非持有會
- * 短暫顯示 REVOKED；該 REVOKED sticky 到下次要求／結果回調（本檔與
- * [AssistantRoleUi] 均無 `ON_RESUME` 監聽，Phase 2 補 resume 重讀／防抖）。
+ * 短暫顯示 REVOKED；該 REVOKED sticky 到下次要求／結果回調（ON_RESUME 重讀
+ * 由 AssistantRoleUi Phase 2 已補：LifecycleEventObserver(ON_RESUME)→refreshTick++）。
  */
 fun effectiveAssistantReason(
     stored: String?,
@@ -114,8 +114,8 @@ internal fun assistantVoiceIntent(): Intent = Intent(Intent.ACTION_ASSIST)
 /**
  * 限包 implicit 喚起入口（非真 explicit）：以呼叫方包名限定收件者，降低隱式
  * `ACTION_ASSIST` 被第三方助理應用劫持的風險；但 `setPackage` 仍屬 implicit
- * 解析，並非 `setClass`／`setComponent` 的真 explicit。Phase 2 session 將在
- * 此基礎上再 `setClass` 轉真 explicit。
+ * 解析，並非 `setClass`／`setComponent` 的真 explicit。Session 已在
+ * 此基礎上再 `setClass` 轉真 explicit（見 LibreVoiceInteractionSession）。
  *
  * 有參版契約由 Phase 4 Robolectric 覆蓋（純 JVM 無 context，本 phase 不強加測試）。
  */
@@ -125,9 +125,8 @@ fun assistantVoiceIntent(context: Context): Intent =
 /**
  * C1b fallback：要求失敗／被拒／OEM 不支援時改開系統語音輸入設定。
  *
- * 不加 [Intent.FLAG_ACTIVITY_NEW_TASK]：對 Activity-context 加 NEW_TASK 會
- * 改變 task 語義。flag 責任交給調用方 Phase 2（`openFallback` 內
- * `if (context !is Activity) addFlags(FLAG_ACTIVITY_NEW_TASK)`）。
+ * 不加 [Intent.FLAG_ACTIVITY_NEW_TASK]：本 Intent 自身不帶 task flag，
+ * 調用方用 applicationContext＋無條件 NEW_TASK（見 AssistantRoleUi.openFallback）。
  * Flag 斷言留給 Phase 4 Robolectric。
  */
 fun assistantFallbackIntent(): Intent =

@@ -54,6 +54,12 @@
         <intent>
             <action android:name="android.settings.SOUND_SETTINGS" />
         </intent>
+        <!-- C1b fallback resolve-first 契約：openFallback 先 resolve 再 startActivity，
+             VOICE_INPUT_SETTINGS 須列 queries（startActivity 本身不需 queries，
+             resolve 可見性需要）。 -->
+        <intent>
+            <action android:name="android.settings.VOICE_INPUT_SETTINGS" />
+        </intent>
     </queries>
 
     <application
@@ -97,7 +103,6 @@
             android:permission="android.permission.BIND_VOICE_INTERACTION">
             <intent-filter>
                 <action android:name="android.service.voice.VoiceInteractionService" />
-                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
             <meta-data
                 android:name="android.voice_interaction"

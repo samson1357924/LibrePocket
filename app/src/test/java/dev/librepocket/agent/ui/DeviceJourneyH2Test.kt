@@ -148,7 +148,8 @@ class DeviceJourneyH2Test {
      * RED（若 production 退化即紅）：save 未落盤則快照為空；send 未回 `ok` 則訊息數不足；
      * model-only 空白 key 若被誤拒則 saved=false；logout 未清則快照仍在。皆為條件等待，
      * 無固定 sleep；任一環退化即超時紅，非計數膨脹。
-     * Resume 僅查 FakeSessionStore map 條目存在，未做第二 VM 重開／replay 驗證。
+     * Resume 以第二 VM openSession(sid) 重開並回放驗證 user／assistant 文本
+     * （同一 FakeSessionStore 事件回放；跨重啟持久化仍未覆蓋）。
      */
     @Test
     fun journey_firstRunSetupSendEditLogout() = runBlocking {
@@ -197,9 +198,17 @@ class DeviceJourneyH2Test {
         assertEquals("ok", chatVm.sessionState.value.messages.first { it.role == "assistant" }.text)
         assertEquals("hi h2", chatVm.sessionState.value.messages.first { it.role == "user" }.text)
 
-        // resume：同 store 新 VM 可開舊會話（FakeSessionStore 內仍有該會話）。
+        // resume：同 store 第二 VM 重開舊會話並回放歷史（FakeSessionStore 事件回放）。
+        // 回放內容經 _history 併入 messages（sessionState.messages 僅含 live
+        // 訊息，重開後為空，故以 messages.size == 2 為條件）。
         val sid = checkNotNull(chatVm.currentSessionId.value) { "first send must create session" }
         assertTrue(transcripts.metas.containsKey(sid))
+        val vm2 = chatStores.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        onMain { vm2.openSession(sid) }
+        withTimeout(10_000) { vm2.messages.first { it.size == 2 } }
+        assertEquals(sid, vm2.currentSessionId.value)
+        assertEquals("hi h2", vm2.messages.value.first { it.role == "user" }.text)
+        assertEquals("ok", vm2.messages.value.first { it.role == "assistant" }.text)
 
         // endpoint model-only 編輯沿用（空白 key 免重貼）。
         val editVm = SetupViewModel(
@@ -291,6 +300,8 @@ class DeviceJourneyH2Test {
     }
 
     /**
+     * Compose saveable framework canary (local stub, NOT prod ChatScreen coverage).
+     *
      * Process-recreation：聊天草稿（rememberSaveable）經 emulateSavedInstanceStateRestore 存活。
      *
      * RED：若草稿用純 remember（非 saveable），restore 後為空即紅；此處以 saveable 綠，
@@ -299,7 +310,7 @@ class DeviceJourneyH2Test {
      * 非 prod ChatScreen 輸入框。
      */
     @Test
-    fun compose_draftSurvivesProcessRecreation() {
+    fun compose_saveableFrameworkCanary_draftSurvivesRestore() {
         val restoration = StateRestorationTester(composeRule)
         restoration.setContent {
             Column {
@@ -318,12 +329,14 @@ class DeviceJourneyH2Test {
     }
 
     /**
+     * Compose saveable framework canary (local stub, NOT prod ChatScreen coverage).
+     *
      * 大字體變體：fontScale=1.3 下草稿仍存活且可見（fontScale recreation only，非真旋轉）。
      * 同上，僅 local stub 的 rememberSaveable 接線，非 prod ChatScreen 輸入框。
      */
     @Test
     @Config(sdk = [33], fontScale = 1.3f)
-    fun compose_draftSurvivesRecreationAtLargeFont() {
+    fun compose_saveableFrameworkCanary_draftSurvivesRestoreAtLargeFont() {
         val restoration = StateRestorationTester(composeRule)
         restoration.setContent {
             Column {

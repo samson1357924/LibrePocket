@@ -113,7 +113,7 @@ class TurnControllerBudgetBenchmarkTest {
       assertEquals(0, c.lastRequestTrimmedCount)
       assertEquals(0L, c.lastRequestTrimmedChars)
       // Final size mirrors the shipped request exactly (time-block included).
-      assertEquals(req.messages.sumOf { it.text.length }, c.lastRequestChars)
+      assertEquals(req.messages.sumOf { it.text.length }.toLong(), c.lastRequestChars)
       assertTrue("request must carry the kept prefix", req.messages[0].text == "keep-a2")
     } finally {
       c.close()
@@ -144,7 +144,7 @@ class TurnControllerBudgetBenchmarkTest {
       // in both units (count > 0 and chars > 0), never silent.
       assertTrue("window must drop, got ${c.droppedHistoryCount}", c.droppedHistoryCount > 0)
       assertTrue("char drop must mirror, got ${c.droppedHistoryChars}", c.droppedHistoryChars > 0)
-      assertEquals(req.messages.sumOf { it.text.length }, c.lastRequestChars)
+      assertEquals(req.messages.sumOf { it.text.length }.toLong(), c.lastRequestChars)
       // Tool-pair integrity holds: no half marker survives in the request.
       for (m in req.messages) {
         assertTrue("no half tool marker may ship", !m.text.contains("[tool:") || m.text == toolBlock)
@@ -168,7 +168,7 @@ class TurnControllerBudgetBenchmarkTest {
       assertEquals(0, c.lastRequestTrimmedCount)
       assertEquals(0L, c.lastRequestTrimmedChars)
       val req = provider.seenRequests.single()
-      assertEquals(req.messages.sumOf { it.text.length }, c.lastRequestChars)
+      assertEquals(req.messages.sumOf { it.text.length }.toLong(), c.lastRequestChars)
     } finally {
       c.close()
     }
@@ -189,7 +189,7 @@ class TurnControllerBudgetBenchmarkTest {
       assertTrue("request must fit the cap", req.messages.sumOf { it.text.length } <= TurnController.MAX_REQUEST_CHARS)
       assertTrue("trim count must trip, got ${c.lastRequestTrimmedCount}", c.lastRequestTrimmedCount > 0)
       assertTrue("trim chars must mirror, got ${c.lastRequestTrimmedChars}", c.lastRequestTrimmedChars > 0)
-      assertEquals(req.messages.sumOf { it.text.length }, c.lastRequestChars)
+      assertEquals(req.messages.sumOf { it.text.length }.toLong(), c.lastRequestChars)
       // Unbounded hydration still drops nothing at the window stage.
       assertEquals(0, c.droppedHistoryCount)
       assertEquals(0L, c.droppedHistoryChars)
@@ -240,7 +240,7 @@ class TurnControllerBudgetBenchmarkTest {
       val elapsedMs = (System.nanoTime() - startNs) / 1_000_000
       println("TurnControllerBudgetBenchmark: 2000-row hydration window took ${elapsedMs}ms (JVM skeleton, non-device)")
       val req = provider.seenRequests.single()
-      assertEquals(req.messages.sumOf { it.text.length }, c.lastRequestChars)
+      assertEquals(req.messages.sumOf { it.text.length }.toLong(), c.lastRequestChars)
       assertEquals(req.messages.size + c.droppedHistoryCount + c.lastRequestTrimmedCount, 2000 + 1)
     } finally {
       c.close()

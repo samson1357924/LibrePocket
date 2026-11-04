@@ -870,7 +870,7 @@ class TurnController(
    * observability: never gates truncation, never changes the request.
    */
   @Volatile var droppedHistoryChars: Long =
-    (initialHistory.sumOf { it.text.length }.toLong() - cappedHistory.sumOf { it.text.length }.toLong()).coerceAtLeast(0L)
+    (initialHistory.sumOf { it.text.length.toLong() } - cappedHistory.sumOf { it.text.length.toLong() }).coerceAtLeast(0L)
     private set
 
   /**
@@ -1001,8 +1001,12 @@ class TurnController(
    * adds its own prefix trim on top (same total-head-trim contract as the
    * count). Read-only observability: never gates truncation.
    */
-  @Volatile var lastRequestTrimmedChars: Long = 0L
-    private set
+  private val _lastRequestTrimmedChars = AtomicLong(0L)
+  var lastRequestTrimmedChars: Long
+    get() = _lastRequestTrimmedChars.get()
+    private set(value) {
+      _lastRequestTrimmedChars.set(value)
+    }
 
   /**
    * H1 (#16 residual): `String.length` sum of the last outgoing request's
@@ -1013,7 +1017,7 @@ class TurnController(
    * time-block delta equal `droppedHistoryChars + lastRequestTrimmedChars +
    * lastRequestChars`. Read-only observability: never gates truncation.
    */
-  @Volatile var lastRequestChars: Int = 0
+  @Volatile var lastRequestChars: Long = 0L
     private set
 
   /**
@@ -5845,10 +5849,12 @@ class TurnController(
       _requestTrimmedCount.value = total
       var contTrimmedChars = 0L
       for (i in 0 until drop) contTrimmedChars += baseMessages[i].text.length
-      lastRequestTrimmedChars += contTrimmedChars
+      // Single-writer (same coroutine as the base trim): read-add-set is exact.
+      val totalChars2 = _lastRequestTrimmedChars.get() + contTrimmedChars
+      _lastRequestTrimmedChars.set(totalChars2)
     }
     val shipped = finalBase + contMessages
-    lastRequestChars = shipped.sumOf { it.text.length }
+    lastRequestChars = shipped.sumOf { it.text.length.toLong() }
     return base.copy(messages = shipped)
   }
 
@@ -5925,7 +5931,7 @@ class TurnController(
     // text chars (time-block excluded — it is suffixed below, after the
     // window trim). Same whole-message drop as the count above, never a split.
     droppedHistoryChars =
-      (combined.sumOf { it.text.length }.toLong() - base.sumOf { it.text.length }.toLong()).coerceAtLeast(0L)
+      (combined.sumOf { it.text.length.toLong() } - base.sumOf { it.text.length.toLong() }).coerceAtLeast(0L)
     // Per-request image re-load/decode is an accepted cost trade-off;
     // decoder-level reuse/caching is deliberately deferred (bounds documented
     // in defaultChatImageLoader's KDoc).
@@ -5945,7 +5951,7 @@ class TurnController(
       base[lastUser] = base[lastUser].copy(text = base[lastUser].text + "\n\n" + block)
     }
 
-    var totalChars = base.sumOf { it.text.length }
+    var totalChars = base.sumOf { it.text.length.toLong() }
     var dropCount = 0
     val maxDropLimit = if (lastUser >= 0) lastUser else (base.size - 1).coerceAtLeast(0)
     while (dropCount < maxDropLimit && totalChars > MAX_REQUEST_CHARS) {
@@ -5962,7 +5968,7 @@ class TurnController(
     var trimmedChars = 0L
     for (i in 0 until dropCount) trimmedChars += base[i].text.length
     lastRequestTrimmedChars = trimmedChars
-    lastRequestChars = finalMessages.sumOf { it.text.length }
+    lastRequestChars = finalMessages.sumOf { it.text.length.toLong() }
     // P2 slice: tools attach ONLY the loop's offer (visibleTools ∩ slice,
     // empty when the loop is absent — the production composition — or when
     // the slice projects unavailable). ChatRequest.tools may only carry

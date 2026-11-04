@@ -13,7 +13,7 @@ targetSdk = "36"
 minSdk = "33"
 # Networking (streaming HTTP, e.g. SSE)
 okhttpSse = "5.5.1"
-okhttpTls = "5.5.0"
+okhttpTls = "5.5.1"
 # Local persistence
 room = "2.8.5"
 datastore = "1.3.0"

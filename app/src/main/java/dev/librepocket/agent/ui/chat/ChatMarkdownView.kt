@@ -394,7 +394,8 @@ internal fun ChatMarkdownView(
         val storedContent = thinkingContentCache[storedHash]
         val growthTarget = if (storedContent != null) {
             currentThinkingContents.firstOrNull { candidate ->
-                candidate != storedContent && candidate.startsWith(storedContent)
+                candidate != storedContent && storedContent.isNotEmpty() &&
+                    candidate.startsWith(storedContent)
             }
         } else {
             null

@@ -118,7 +118,7 @@ object VoiceTools {
         snapshot.loaded && !snapshot.loadFailed && openAiTtsEnabled(snapshot.switches)
 
     /**
-     * 投影用開關（R4-2）：同一快照在 loadFailed 時兩鍵視為關（fail-closed），
+     * 投影用開關（R4-2）：同一快照在 loadFailed 時三鍵視為關（fail-closed），
      * 避免 UI 隱藏但 tool 仍可用的分叉；loading 態照常回 map（缺鍵即產品預設）。
      * Tool 側無 UI 等待語義（投影為純函數、無首幀概念，且語音工具現階段皆
      * `executionReady=false` 不進模型名單），故 loading 沿用既有預設而不等待。

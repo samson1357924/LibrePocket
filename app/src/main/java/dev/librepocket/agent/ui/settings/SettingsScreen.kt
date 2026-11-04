@@ -285,7 +285,7 @@ fun SettingsScreen(
                         Text(
                             "雲端語音（OpenAI）支援所有版本，需同時開啟「語音輸出」與「OpenAI 語音」" +
                                 "（後者預設關閉，目前尚未接線，切換無作用）；" +
-                                "需經端點設定（KeyVault providerId \"openai_tts\"）設定 OpenAI API 金鑰；" +
+                                "未來需經端點設定（KeyVault providerId \"openai_tts\"）設定 OpenAI API 金鑰（目前無設定入口）；" +
                                 VoiceTools.OPENAI_VOICE_DISCLOSURE + "；" +
                                 "送雲前經 best-effort 已知樣式遮罩，非匿名化；朗讀文本將送 OpenAI 依其條款處理；使用 OpenAI 語音會依其定價產生費用" +
                                 "（SCAFFOLD：管線接線尚在收斂，未接線前一律使用系統語音）。",

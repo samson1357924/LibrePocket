@@ -9,6 +9,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.GZIPOutputStream
@@ -58,6 +59,10 @@ import kotlinx.coroutines.flow.toList
 private const val MODEL_LIST_BODY_LIMIT_BYTES = 1024 * 1024
 private const val HTTP_ERROR_BODY_LIMIT_BYTES = 16 * 1024
 private const val SOURCE_READ_AHEAD_ALLOWANCE_BYTES = 2 * 8 * 1024
+// Stall-witness threshold for ResponseBodyReadSignals: a single source.read()
+// blocked longer than this counts as STALLED. 1_000ms >> localhost normal read
+// latency (ms) and << the 5s throttle period / 5min readTimeout used below.
+private const val STALL_READ_THRESHOLD_MS = 1_000L
 
 /** Regression coverage for authenticated redirects, cancellation, and SSE terminal reads. */
 class ProviderTransportTest {
@@ -278,6 +283,16 @@ class ProviderTransportTest {
     private class ResponseBodyReadSignals {
         val consumedBytes = AtomicLong()
         val readEntered = CountDownLatch(1)
+        // STALL-ENTRY witness: counted down when a single source.read() stays
+        // in-flight longer than STALL_READ_THRESHOLD_MS. A daemon watchdog per
+        // read fires only while that read is still blocked, so awaiting this
+        // latch proves the Job is parked inside a stalled socket read (not
+        // merely mid-download). Threshold 1_000ms is far above localhost
+        // normal read latency (sub-ms..low-ms) yet far below the 5s throttle
+        // period in the stall test, so a healthy stream never trips it while a
+        // truly stalled read always does — long before the 5min readTimeout.
+        val stallEntered = CountDownLatch(1)
+
         val calls = CallSignals()
 
         private val countingInterceptor = object : Interceptor {
@@ -290,9 +305,31 @@ class ProviderTransportTest {
                             // Entry latch: count down before the blocking delegate read so
                             // cancellation tests can prove the Job was inside source.read().
                             readEntered.countDown()
-                            val read = super.read(sink, byteCount)
-                            if (read > 0L) consumedBytes.addAndGet(read)
-                            return read
+                            // Arm a stall watchdog for this read only. It counts
+                            // down stallEntered iff this exact read is still
+                            // blocked after the threshold; fast reads finish in
+                            // ms, mark done, and the watchdog becomes a no-op.
+                            // Daemon threads are fire-and-forget: no executor
+                            // lifecycle to leak into other tests, and the only
+                            // observable behavior change is the extra latch.
+                            val readDone = AtomicBoolean(false)
+                            val watchdog = Thread {
+                                try {
+                                    Thread.sleep(STALL_READ_THRESHOLD_MS)
+                                    if (!readDone.get()) stallEntered.countDown()
+                                } catch (_: InterruptedException) {
+                                    // Test teardown: leave the latch uncounted.
+                                }
+                            }
+                            watchdog.isDaemon = true
+                            watchdog.start()
+                            try {
+                                val read = super.read(sink, byteCount)
+                                if (read > 0L) consumedBytes.addAndGet(read)
+                                return read
+                            } finally {
+                                readDone.set(true)
+                            }
                         }
                     }.buffer()
 
@@ -1745,14 +1782,13 @@ class ProviderTransportTest {
 
     @Test
     fun stalledChunkedBodyAfterCapIsCancellable() = runBlocking {
-        // Slow chunked stall: the first throttle period delivers the full cap
-        // (~1MiB socket bytes, framing makes it marginally fewer body bytes),
-        // then the remainder stalls for one long period. The transport must
-        // block in source.read (bounded only by readTimeout) and stay
+        // Stall-then-cancel contract: the first throttle period delivers the
+        // full cap (~1MiB socket bytes; chunk framing makes it marginally
+        // fewer body bytes), then the remainder stalls for one 5s period. The
+        // transport must block in source.read (bounded only by the 5min
+        // readTimeout, which this test never approaches) and stay
         // interruptible via call.cancel(): cancelling surfaces
-        // CancellationException, never a TOO_LARGE misfire. Small stall
-        // windows keep this deterministic without approaching the 5min
-        // readTimeout; a full-timeout stall proof is a follow-up, not this PR.
+        // CancellationException, never a TOO_LARGE misfire.
         val oversized = modelListJsonWithExactBytes(MODEL_LIST_BODY_LIMIT_BYTES + 64 * 1024)
         for (protocol in ProviderProtocol.values()) {
             val server = MockWebServer()
@@ -1774,15 +1810,25 @@ class ProviderTransportTest {
                     }
                 }
                 job = active
-                // Wait until the slow first period has delivered (through the
-                // cap region); the overflow byte is still stalled server-side.
+                // Pre-step: first-period delivery evidence only. Reaching
+                // CAP-64KiB proves bytes flowed, NOT that the read is stalled
+                // (up to ~64KiB+framing may still be in flight). Note: the
+                // threshold poll below still uses delay polling — this file is
+                // not fully sleep-free.
                 withTimeout(20_000) {
                     while (signals.consumedBytes.get() < MODEL_LIST_BODY_LIMIT_BYTES - 64 * 1024) delay(50)
                 }
-                // Cap reached (consumedBytes threshold above) + job still active
-                // proves the read is stalled server-side (the throttle holds a
-                // 5s wall), so cancel directly. Note: the threshold poll above
-                // still uses delay polling — this file is not fully sleep-free.
+                // Negative control: a single source.read() blocked longer than
+                // STALL_READ_THRESHOLD_MS proves the Job is parked inside a
+                // stalled socket read. Cancelling before this latch fires (a
+                // mid-download cancel) now fails here instead of passing
+                // vacuously downstream via CancellationException +
+                // assertCallCancelled. Bound 15s = 5s throttle period + slack
+                // for the 1s witness threshold and CI jitter.
+                assertTrue(
+                    "$protocol read must be stalled before cancel",
+                    withContext(Dispatchers.IO) { signals.stallEntered.await(15, TimeUnit.SECONDS) },
+                )
                 check(active.isActive) { "stall job must still be active before cancel" }
                 withTimeout(1_500) { active.cancelAndJoin() }
                 assertCallCancelled(signals, "$protocol stalled chunked body")

@@ -160,6 +160,8 @@ data class ProviderConfig(
      * `PinnedNetworkDns`（或預設 [SystemHostResolver] 過渡）；測試注入 fake。
      * Transport 在建連前先 `evaluateUrl(rawUrl, networkOptIn, networkResolver)`，
      * 拒絕即 typed fatal，不送 credential／body。
+     * 此欄位僅為首跳 seam：transport 內一律重釘，此欄位永不持有
+     * PinnedNetworkDns 長期重用；per-request 經 pinnedTransportFor 另起爐灶。
      */
     val networkResolver: HostResolver = SystemHostResolver,
 )

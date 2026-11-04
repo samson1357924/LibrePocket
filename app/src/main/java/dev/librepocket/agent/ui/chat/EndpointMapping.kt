@@ -7,8 +7,8 @@ import dev.librepocket.policy.SystemHostResolver
 import dev.librepocket.preset.ProviderCatalog
 import dev.librepocket.provider.ProviderConfig
 import dev.librepocket.provider.ProviderProtocol
-import java.net.URL
 import java.util.Locale
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /**
  * Maps the persisted endpoint (Setup) to the transport config (provider).
@@ -61,14 +61,21 @@ data class EndpointSessionBinding(
  * Normalizes a base URL into an RFC 6454-style web origin: scheme://host[:port].
  * Default ports for known schemes (e.g. 80 for http, 443 for https) are omitted.
  * Returns an empty string if baseUrl is invalid or lacks scheme/host.
+ * HttpUrl 視角解析（fail-closed：malformed 回 ""）；userinfo 不納入 origin。
  */
-fun normalizeOrigin(baseUrl: String): String = runCatching {
-    val url = URL(baseUrl)
-    val scheme = url.protocol.lowercase(Locale.ROOT)
+fun normalizeOrigin(baseUrl: String): String {
+    val url = baseUrl.toHttpUrlOrNull() ?: return ""
+    val scheme = url.scheme.lowercase(Locale.ROOT)
     val host = url.host.lowercase(Locale.ROOT)
-    val port = url.port.takeIf { it >= 0 && it != url.defaultPort }?.let { ":$it" }.orEmpty()
-    if (scheme.isNotEmpty() && host.isNotEmpty()) "$scheme://$host$port" else ""
-}.getOrDefault("")
+    if (scheme.isEmpty() || host.isEmpty()) return ""
+    val defaultPort = when (scheme) {
+        "http" -> 80
+        "https" -> 443
+        else -> return ""
+    }
+    val port = if (url.port != defaultPort) ":${url.port}" else ""
+    return "$scheme://$host$port"
+}
 
 fun EndpointConfig.toSessionBinding(model: String): EndpointSessionBinding {
     val effective = toProviderConfig()

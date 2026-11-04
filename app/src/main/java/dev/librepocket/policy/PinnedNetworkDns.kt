@@ -62,13 +62,15 @@ class PinnedNetworkDns(
     pinned[normalize(host)] = addresses.toList()
   }
 
-  /** 已釘住答案（防禦性拷貝），未釘住回 null。 */
+  /** 已釘住答案（防禦性拷貝），未釘住回 null。
+   * 測試／audit helper：transport per-request 重決策建新 pin，mid-stream 不重查。 */
   fun pinnedFor(host: String): List<InetAddress>? = pinned[normalize(host)]?.toList()
 
   /**
    * 主動偵測 rebind：用 [delegate] 重查一次，與釘住值比對（順序無關）。
    * 回傳 null 表示該 host 尚未釘住（無從比對）；true = 發生 rebind，
    * 呼叫方必須視為新決策重走 `evaluateUrl`，不得沿用舊決策。
+   * 測試／audit helper：transport per-request 重決策，mid-stream 不重查。
    */
   fun hasRebind(host: String): Boolean? {
     val key = normalize(host)

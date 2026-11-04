@@ -13,7 +13,8 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  * 綁定（變更即失效，沿用 S4-C 顯式重綁姿態，不與 chat key 共用 namespace）：
  * - `endpointId`：`preset:<presetId>`（內建）或 `custom:<sha256-32hex>`（自訂，
  *   與 `SetupValidation.deriveEndpointId` 同形；此處只驗形狀，不重算）；
- * - `baseUrl` 全字串（僅 trim，不做正規化；任何重寫即新身份）；
+ * - `baseUrl` HttpUrl 正規化後字串（scheme／host 小寫、預設埠歸一、去
+ *   fragment；寫入與查詢兩側同經 boundOf 歸一；任何重寫即新身份）；
  * - `scheme`＋有效埠（`HttpUrl` 視角，預設埠正規化）；
  * - `policy` tier＋`configRevision`（`EndpointStore` 的單調 revision）。
  *
@@ -67,7 +68,7 @@ class NetworkOptInStore(
     policy: NetworkEgressPolicy,
     configRevision: Long,
   ): ConfirmedOptIn {
-    require(policy == NetworkEgressPolicy.HTTPS_ONLY || allowTierUpgrade) {
+    require(checkPlayTierAllows(policy) || allowTierUpgrade) {
       "NETWORK_OPTIN_TIER_NOT_ALLOWED"
     }
     val bound = boundOf(endpointId, baseUrl, policy, configRevision)
@@ -81,6 +82,8 @@ class NetworkOptInStore(
    * 舊確認自動失效，需重新 [confirm]）。查詢期 baseUrl 形變（malformed／
    * 非 http(s)）不拋 [IllegalArgumentException]，一律 fail-closed 回
    * HTTPS_ONLY（確認寫入期 [confirm] 仍嚴格拒收 malformed）。
+   * 查詢期吞 [IllegalArgumentException] 回 HTTPS_ONLY 為稽核可見的
+   * fail-closed（呼叫方可由回傳 tier 觀測到拒絕），不拋例外、不寫 Android Log。
    */
   fun confirmedPolicyFor(endpointId: String, baseUrl: String, configRevision: Long): NetworkEgressPolicy {
     val cur = synchronized(lock) { confirmed[endpointId] } ?: return NetworkEgressPolicy.HTTPS_ONLY
@@ -116,7 +119,7 @@ class NetworkOptInStore(
      * 確認 token：綁 `endpointId + baseUrl + scheme + port + policy + revision`
      * 的 SHA-256（32hex，與 endpoint id 同形，便於稽核比對）。
      * Token 本身不是授權（授權以 [ConfirmedOptIn] 綁定全等為準），僅供
-     * UI／audit 顯示這次 one-shot 確認的身份。
+     * UI／audit 顯示這次 one-shot 確認的身份；僅顯示／稽核，不得用於除錯日誌外比較。
      */
     fun confirmationTokenFor(
       endpointId: String,
@@ -164,12 +167,21 @@ class NetworkOptInStore(
       val trimmed = baseUrl.trim()
       require(trimmed.isNotEmpty()) { "NETWORK_OPTIN_URL_BLANK" }
       val url = trimmed.toHttpUrlOrNull() ?: throw IllegalArgumentException("NETWORK_OPTIN_URL_MALFORMED")
+      // userinfo 永不納入身份：寫入期直接拒收（確認成功後每次請求才擋
+      // USERINFO_BLOCKED 會造成困惑；此處 fail-closed 使含 userinfo 的 URL 連確認都拿不到）。
+      require(url.username.isEmpty() && url.password.isNullOrEmpty()) {
+        "NETWORK_OPTIN_USERINFO_BLOCKED"
+      }
       val scheme = url.scheme.lowercase(Locale.ROOT)
       require(scheme == "http" || scheme == "https") { "NETWORK_OPTIN_SCHEME_UNSUPPORTED" }
+      // 身份正規化：HttpUrl 已做 scheme 小寫、host 小寫、預設埠正規化；此處再去
+      // fragment（大小寫／尾點／顯式預設埠／fragment 形變歸一同一身份）。
+      // endpointId 仍只驗前綴形狀，不重算 derive（保持 fail-closed）。
       // HttpUrl.port 已含預設埠正規化（http 80／https 443）。
+      val normalized = url.newBuilder().fragment(null).build().toString()
       return ConfirmedOptIn(
         endpointId = endpointId,
-        baseUrl = trimmed,
+        baseUrl = normalized,
         scheme = scheme,
         port = url.port,
         policy = policy,

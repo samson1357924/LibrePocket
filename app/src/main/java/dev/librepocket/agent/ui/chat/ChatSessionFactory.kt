@@ -1119,14 +1119,18 @@ class ChatSessionFactory(
         if (SetupValidation.isLegacyEndpoint(endpoint)) throw CaptureDeniedException("ENDPOINT_ID_LEGACY")
     }
 
+    //region S2 per-endpoint opt-in（查詢期快照語義）
     /**
      * S2 opt-in 解析：經 [networkOptInStore] 查已確認 tier，綁定
      * (`providerId`＋`baseUrl`＋`configRevision`) 全等才放行升級，否則
      * deny-all。Null store（預設／production 未接 UI 前）即 HTTPS_ONLY。
+     * 生命週期：僅記憶體持有，重啟即失；live session 取用當下快照，
+     * 持久化待 EndpointStore metadata 接線（確認本身仍經 confirm 明示 mint）。
      */
     private fun optInFor(endpoint: EndpointConfig): EndpointNetworkOptIn =
         networkOptInStore?.optInFor(endpoint.providerId, endpoint.baseUrl, endpoint.configRevision)
             ?: EndpointNetworkOptIn()
+    //endregion
 
     private suspend fun requireCurrentBinding(keyIsCurrent: suspend () -> Boolean) {
         if (!keyIsCurrent()) throw CancellationException("ENDPOINT_BINDING_STALE")

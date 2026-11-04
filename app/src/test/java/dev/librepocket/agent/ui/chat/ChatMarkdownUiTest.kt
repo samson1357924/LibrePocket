@@ -27,6 +27,7 @@ import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertWidthIsAtLeast
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
@@ -1569,6 +1570,112 @@ class ChatMarkdownUiTest {
 
         composeRule.onNodeWithText("Planning ▍").assertIsDisplayed()
         composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+    }
+
+    @Test
+    fun chatMarkdownView_streamingEmptyThinking_retainsManualCollapseAcrossGrowth() {
+        // P2#1: collapsing the empty `<think>` card must survive growth to `<think>P`
+        // and `<think>Plan` (empty string is a strict prefix of any growth).
+        var text by mutableStateOf("<think>")
+
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(text = text, isStreaming = true)
+            }
+        }
+
+        val title = context.getString(R.string.chat_thinking_title)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+
+        // Empty streaming card defaults to expanded.
+        composeRule.onNodeWithText(title).assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+
+        // User manually collapses the empty card.
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+
+        // "" -> "P": manual collapse must be retained via prefix migration.
+        text = "<think>P"
+        composeRule.waitForIdle()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("P ▍").assertDoesNotExist()
+
+        // "P" -> "Plan": retained again.
+        text = "<think>Plan"
+        composeRule.waitForIdle()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("Plan ▍").assertDoesNotExist()
+    }
+
+    @Test
+    fun chatMarkdownView_sameContentThinkingCards_expandFirstOnly() {
+        // P2#2: two completed cards with identical content get distinct occurrence-aware
+        // ids; expanding the first must leave the second collapsed.
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(
+                    text = "<think>Same reasoning</think>\n\n<think>Same reasoning</think>",
+                    isStreaming = false,
+                )
+            }
+        }
+
+        val title = context.getString(R.string.chat_thinking_title)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+
+        composeRule.onAllNodesWithText(title).assertCountEquals(2)
+        composeRule.onAllNodesWithContentDescription(expandDesc).assertCountEquals(2)
+
+        // Expand only the first card.
+        composeRule.onAllNodesWithText(title)[0].performClick()
+        composeRule.waitForIdle()
+
+        // Exactly one card shows its content; the other stays collapsed.
+        composeRule.onAllNodesWithText("Same reasoning").assertCountEquals(1)
+        composeRule.onAllNodesWithContentDescription(collapseDesc).assertCountEquals(1)
+        composeRule.onAllNodesWithContentDescription(expandDesc).assertCountEquals(1)
+        // The visible content belongs to the first card (above the second header).
+        val contentY = composeRule.onNodeWithText("Same reasoning")
+            .fetchSemanticsNode().positionInRoot.y
+        val secondTitleY = composeRule.onAllNodesWithText(title)[1]
+            .fetchSemanticsNode().positionInRoot.y
+        assertTrue(contentY < secondTitleY)
+    }
+
+    @Test
+    fun chatMarkdownView_sameContentThinkingCards_expandSecondOnly() {
+        // Reverse direction: operating the second card must leave the first collapsed.
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(
+                    text = "<think>Same reasoning</think>\n\n<think>Same reasoning</think>",
+                    isStreaming = false,
+                )
+            }
+        }
+
+        val title = context.getString(R.string.chat_thinking_title)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+
+        composeRule.onAllNodesWithText(title).assertCountEquals(2)
+
+        // Expand only the second card.
+        composeRule.onAllNodesWithText(title)[1].performClick()
+        composeRule.waitForIdle()
+
+        composeRule.onAllNodesWithText("Same reasoning").assertCountEquals(1)
+        composeRule.onAllNodesWithContentDescription(collapseDesc).assertCountEquals(1)
+        composeRule.onAllNodesWithContentDescription(expandDesc).assertCountEquals(1)
+        // The visible content belongs to the second card (below the first header).
+        val contentY = composeRule.onNodeWithText("Same reasoning")
+            .fetchSemanticsNode().positionInRoot.y
+        val firstTitleY = composeRule.onAllNodesWithText(title)[0]
+            .fetchSemanticsNode().positionInRoot.y
+        assertTrue(contentY > firstTitleY)
     }
 
     @Test

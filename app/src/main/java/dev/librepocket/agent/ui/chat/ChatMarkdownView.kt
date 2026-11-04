@@ -26,6 +26,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateMapOf
@@ -56,17 +57,17 @@ import dev.librepocket.agent.R
 import kotlinx.coroutines.delay
 
 /**
- * Saveable holder for hoisted thinking expanded overrides, keyed by
- * `contentHashHex16(trimmedContent)` (see [ChatMarkdownParser.contentHashHex16]).
+ * Saveable holder for hoisted thinking expanded overrides, keyed by deterministic
+ * occurrence-aware override id (see [thinkingOverrideId]): `"<contentHashHex16
+ * (trimmedContent)>.<rank>"`, where `rank` is the 0-based occurrence index of the same
+ * trimmed content within one parse.
  *
  * The saver persists the map as a `List<Pair<String, Boolean>>` (both components are
  * Bundle-saveable primitives) and restores it into a [SnapshotStateMap]. Content-hash
  * indexing keeps the override attached to the same reasoning text when the parser key
  * changes (`think_streaming_N` → `think_c_<hex>`) and Compose recreates the node via
- * `key(block.key)`.
- *
- * Documented limitation: same-content duplicates within one message share a single entry;
- * expanding one expands all cards with identical trimmed content.
+ * `key(block.key)`. The occurrence rank disambiguates same-content duplicates within one
+ * message, so toggling one card no longer toggles all cards with identical content.
  */
 internal val ThinkingExpandedOverridesSaver:
     Saver<SnapshotStateMap<String, Boolean>, List<Pair<String, Boolean>>> = Saver(
@@ -77,6 +78,72 @@ internal val ThinkingExpandedOverridesSaver:
 )
 
 /**
+ * Total UTF-8 byte cap for the saveable previous-parse thinking contents
+ * (see [ThinkingPrevContentsSaver]). Keeps rotation persistence bounded at chat sizes.
+ */
+internal const val ThinkingPrevContentsSaveBytesMax = 32 * 1024
+
+/**
+ * Saveable holder for the previous parse's thinking contents (trimmed, document order),
+ * used for cross-parse override alignment (see [ChatMarkdownView]).
+ *
+ * Over-limit behaviour: when the summed UTF-8 bytes exceed
+ * [ThinkingPrevContentsSaveBytesMax], an empty list is persisted instead. An empty (or
+ * never-observed / `null`) previous list is treated as *unknown* by the alignment logic:
+ * exact-id reads still apply, but no prefix migration and no stale-entry pruning happen
+ * until the next parse is observed (pruning is then deferred by one composition).
+ * This is safe because a legitimately empty previous list (no thinking cards) implies no
+ * live entries to prune — the map was already emptied when the cards disappeared.
+ */
+internal val ThinkingPrevContentsSaver: Saver<MutableState<List<String>?>, List<String>> =
+    Saver(
+        save = { state ->
+            val source = state.value ?: emptyList()
+            var totalBytes = 0
+            var fits = true
+            for (entry in source) {
+                totalBytes += entry.toByteArray(Charsets.UTF_8).size
+                if (totalBytes > ThinkingPrevContentsSaveBytesMax) {
+                    fits = false
+                    break
+                }
+            }
+            if (fits) ArrayList(source) else emptyList()
+        },
+        restore = { saved -> mutableStateOf(saved) },
+    )
+
+/**
+ * Deterministic override id for one thinking card: `"<hex16(trimmedContent)>.<rank>"`.
+ *
+ * - `hex16` = [ChatMarkdownParser.contentHashHex16] over the trimmed content (same
+ *   digest the parser uses for `think_c_<hex>` keys).
+ * - `rank` = 0-based occurrence index of the same trimmed content within the current
+ *   parse (first occurrence has rank 0). Counting is keyed by content hash, matching the
+ *   parser's `_o2`/`_o3` disambiguation (document order, positional under same-content
+ *   prepend — same documented limitation).
+ *
+ * Pure function of content: deterministic across rotations and process recreation, and
+ * composed only of Bundle-safe primitives so it can be persisted as a map key.
+ */
+internal fun thinkingOverrideId(trimmedContent: String, rank: Int): String =
+    "${ChatMarkdownParser.contentHashHex16(trimmedContent)}.$rank"
+
+/**
+ * Occurrence-aware override ids for one parse's thinking contents (trimmed, document
+ * order). Ids are unique within the parse: same-content duplicates get distinct ranks.
+ */
+internal fun thinkingOverrideIds(trimmedContents: List<String>): List<String> {
+    val ranks = HashMap<String, Int>(trimmedContents.size)
+    return trimmedContents.map { content ->
+        val hash = ChatMarkdownParser.contentHashHex16(content)
+        val rank = ranks.getOrDefault(hash, 0)
+        ranks[hash] = rank + 1
+        "$hash.$rank"
+    }
+}
+
+/**
  * Collapsible reasoning card for displaying thinking processes.
  * Defaults to expanded during streaming with a static cursor indicator (no blinking animation),
  * and collapses by default once streaming completes.
@@ -85,8 +152,9 @@ internal val ThinkingExpandedOverridesSaver:
  * - Hoisted mode: when [onUserExpandedChange] != null (used by [ChatMarkdownView]), the
  *   effective override is [userExpanded] (null = no explicit override, fall back to
  *   [ChatContentBlock.ThinkingBlock.isStreaming]). Clicks are forwarded to
- *   [onUserExpandedChange] with the exact-hash key written by the caller, so streaming→
- *   completed transitions (same trimmed content, same hash) retain the user's choice even
+ *   [onUserExpandedChange] with the occurrence-aware id (`"<hex16>.<rank>"`) written
+ *   by the caller, so streaming→
+ *   completed transitions (same trimmed content and rank) retain the user's choice even
  *   though `block.key` changes and the node is recreated.
  * - Fallback mode: when [onUserExpandedChange] == null (direct rendering, e.g. unit tests
  *   rendering this composable alone), [userExpanded] is ignored and an internal
@@ -334,29 +402,39 @@ internal fun CodeBlockView(
  * full re-parse keeps key stability and fail-closed guarantees simple at chat sizes.
  *
  * Thinking expanded-override hoisting (streaming→completed retention):
- * - Overrides live here in a `rememberSaveable` `mutableStateMapOf<contentHashHex16
- *   (trimmedContent), Boolean>` ([ThinkingExpandedOverridesSaver], persisted as
- *   `List<Pair<String, Boolean>>`). Each thinking card reads `overrides[hash(content)]`
- *   (after prune/migrate below) and writes its exact-hash key on click; the default when
- *   absent is `block.isStreaming`.
- * - Every recomposition prunes/migrates synchronously before reading: for current thinking
- *   content set C and each stored key S — S ∈ C keeps its value; else if S's previous
- *   content (tracked in a non-saveable hash→content cache) is a strict prefix of some
- *   c ∈ C (streaming growth, e.g. "Plan" → "Planning"), the value migrates to `hash(c)`
- *   (first document-order match; an existing explicit entry on the target wins and the
- *   source is dropped); otherwise S is deleted (card disappeared). A newly prepended
- *   different-content card therefore has no entry and falls back to `block.isStreaming`
- *   instead of inheriting an unrelated card's choice.
- * - Because the index is the content hash (not `block.key`), the streaming→completed
- *   transition (`think_streaming_N` → `think_c_<hex>`, same trimmed text) is an exact-match
- *   retain: a manual expand during streaming survives appending `</think>` even while the
- *   message-level [isStreaming] is still true (the block itself is `isStreaming=false` and
- *   would collapse by default without an override). Untouched cards still auto-collapse on
- *   close per spec.
- * - Limitation (documented): same-content duplicates within one message share one entry;
- *   toggling one toggles all cards with identical trimmed content. The hash→content cache
- *   is process-local (`remember`); after process recreation only exact-hash matches are
- *   retained until content is re-observed (prefix migration needs the cached preimage).
+ * - Overrides live here in a `rememberSaveable` `mutableStateMapOf<overrideId, Boolean>`
+ *   ([ThinkingExpandedOverridesSaver], persisted as `List<Pair<String, Boolean>>`), where
+ *   `overrideId` is `"<contentHashHex16(trimmedContent)>.<rank>"`
+ *   (see [thinkingOverrideId]; `rank` = occurrence index of the same trimmed content in
+ *   this parse, so same-content duplicates get distinct entries). Each thinking card
+ *   reads `overrides[id]` (after align/prune below) and writes its exact occurrence-aware
+ *   id on click; the default when absent is `block.isStreaming`.
+ * - Every recomposition aligns synchronously before reading, against the previous
+ *   parse's trimmed contents (`prevContents`, also `rememberSaveable` via
+ *   [ThinkingPrevContentsSaver]; `null`/empty = unknown, e.g. not yet observed or
+ *   over the [ThinkingPrevContentsSaveBytesMax] rotation cap):
+ *   - Exact: a current id already present in the previous parse's id set is the same
+ *     logical card — its override is retained as-is. This covers the
+ *     streaming→completed transition (`think_streaming_N` → `think_c_<hex>`, same
+ *     trimmed text, same rank): a manual expand during streaming survives appending
+ *     `</think>` even while message-level [isStreaming] is still true. Untouched cards
+ *     still auto-collapse on close per spec.
+ *   - Migration (current id is new): only when the previous and current thinking card
+ *     counts are equal, and the previous parse's content at the same position is a
+ *     strict prefix of the current content (empty→non-empty included, so collapsing
+ *     `<think>` survives growth to `<think>P…`), the value stored under the previous
+ *     position's id is inherited. An existing explicit entry on the target wins.
+ *     Card counts differing (prepend/delete of a thinking card) disables migration —
+ *     only exact-id matches apply — so a prepended different-content card falls back
+ *     to `block.isStreaming` instead of inheriting an unrelated card's choice.
+ *   - Otherwise the entry defaults; stale ids (neither exact-retained nor migration
+ *     targets) are pruned so a future different-content card never inherits them.
+ *     When `prevContents` is unknown, pruning is skipped (deferred to the next
+ *     observed parse); exact-id reads still apply.
+ * - Limitation (documented): same-content prepend shifts occurrence ranks positionally
+ *   (first card's id moves to the prepended card), consistent with the parser's `_o2`
+ *   key disambiguation for same-content duplicates. Prepending *different* content does
+ *   not misapply overrides (card counts differ → exact-id matching only).
  */
 @Composable
 internal fun ChatMarkdownView(
@@ -372,55 +450,62 @@ internal fun ChatMarkdownView(
     val thinkingOverrides = rememberSaveable(saver = ThinkingExpandedOverridesSaver) {
         mutableStateMapOf<String, Boolean>()
     }
-    // Process-local preimages for prefix-migration decisions (hash → trimmed content seen
-    // in a previous composition). Plain remember: no recomposition on update, rebuilt below.
-    val thinkingContentCache = remember { mutableMapOf<String, String>() }
+    // Previous parse's thinking contents (trimmed, document order) for cross-parse
+    // alignment. Saveable: rotation-safe (bounded by ThinkingPrevContentsSaveBytesMax);
+    // null/empty = unknown (not yet observed) → exact-id reads only, no prune/migrate.
+    var prevThinkingContents by rememberSaveable(saver = ThinkingPrevContentsSaver) {
+        mutableStateOf<List<String>?>(null)
+    }
 
     val currentThinkingContents = remember(blocks) {
         blocks.filterIsInstance<ChatContentBlock.ThinkingBlock>().map { it.content.trim() }
     }
-    val currentThinkingHashes = remember(currentThinkingContents) {
-        currentThinkingContents.map { ChatMarkdownParser.contentHashHex16(it) }.toSet()
+    val currentOverrideIds = remember(currentThinkingContents) {
+        thinkingOverrideIds(currentThinkingContents)
+    }
+    val currentIdSet = remember(currentOverrideIds) { currentOverrideIds.toSet() }
+    val thinkingIdByKey = remember(blocks, currentOverrideIds) {
+        blocks.filterIsInstance<ChatContentBlock.ThinkingBlock>()
+            .map { it.key }
+            .zip(currentOverrideIds)
+            .toMap()
+    }
+    val prevKnownContents = prevThinkingContents?.takeIf { it.isNotEmpty() }
+    val prevOverrideIds = remember(prevKnownContents) {
+        prevKnownContents?.let { thinkingOverrideIds(it) }
     }
 
-    // Synchronously prune/migrate before reads so this composition already observes the
-    // migrated values. Idempotent: a mutating pass schedules one follow-up recomposition
-    // that becomes a no-op.
-    val storedKeysSnapshot = thinkingOverrides.keys.toList()
-    for (storedHash in storedKeysSnapshot) {
-        if (storedHash in currentThinkingHashes) {
-            continue
-        }
-        val storedContent = thinkingContentCache[storedHash]
-        val growthTarget = if (storedContent != null) {
-            currentThinkingContents.firstOrNull { candidate ->
-                candidate != storedContent && storedContent.isNotEmpty() &&
-                    candidate.startsWith(storedContent)
-            }
-        } else {
-            null
-        }
-        if (growthTarget != null) {
-            val targetHash = ChatMarkdownParser.contentHashHex16(growthTarget)
-            if (!thinkingOverrides.containsKey(targetHash)) {
-                val migratedValue = thinkingOverrides[storedHash]
-                if (migratedValue != null) {
-                    thinkingOverrides[targetHash] = migratedValue
+    // Synchronously align before reads so this composition already observes the
+    // retained/migrated values. Idempotent: a mutating pass schedules one follow-up
+    // recomposition that becomes a no-op.
+    if (prevKnownContents != null && prevOverrideIds != null) {
+        val prevIdSet = prevOverrideIds.toSet()
+        if (prevKnownContents.size == currentThinkingContents.size) {
+            for (i in currentThinkingContents.indices) {
+                val currId = currentOverrideIds[i]
+                // Exact: same logical card, retain as-is.
+                if (currId in prevIdSet) continue
+                // Migration: same position, strict prefix growth (empty→non-empty
+                // included). Card-count equality guards against prepend/delete shifts.
+                val prevContent = prevKnownContents[i]
+                val currContent = currentThinkingContents[i]
+                if (prevContent != currContent && currContent.startsWith(prevContent)) {
+                    val migratedValue = thinkingOverrides[prevOverrideIds[i]]
+                    if (migratedValue != null && !thinkingOverrides.containsKey(currId)) {
+                        thinkingOverrides[currId] = migratedValue
+                    }
                 }
             }
-            thinkingOverrides.remove(storedHash)
-        } else {
-            // Card disappeared (or preimage unknown after recreation): drop so a future
-            // different-content card with an unrelated hash never inherits this value.
-            thinkingOverrides.remove(storedHash)
+        }
+        // Prune stale ids (disappeared cards); retained/migrated targets survive.
+        val staleKeys = thinkingOverrides.keys.filter { it !in currentIdSet }
+        for (stale in staleKeys) {
+            thinkingOverrides.remove(stale)
         }
     }
-    val freshCache = HashMap<String, String>(currentThinkingContents.size)
-    for (content in currentThinkingContents) {
-        freshCache[ChatMarkdownParser.contentHashHex16(content)] = content
+    if (prevThinkingContents != currentThinkingContents) {
+        prevThinkingContents = currentThinkingContents
     }
-    thinkingContentCache.keys.retainAll(freshCache.keys)
-    thinkingContentCache.putAll(freshCache)
 
     if (blocks.isEmpty() && isStreaming) {
         // Decorative streaming cursor: visual only, announced via the streaming label
@@ -445,16 +530,16 @@ internal fun ChatMarkdownView(
             key(block.key) {
                 when (block) {
                     is ChatContentBlock.ThinkingBlock -> {
-                        val contentHash =
-                            ChatMarkdownParser.contentHashHex16(block.content.trim())
-                        val hoistedOverride = thinkingOverrides[contentHash]
+                        val overrideId = thinkingIdByKey[block.key]
+                            ?: thinkingOverrideId(block.content.trim(), 0)
+                        val hoistedOverride = thinkingOverrides[overrideId]
                         ThinkingBlockView(
                             block = block,
                             userExpanded = hoistedOverride,
                             onUserExpandedChange = { next ->
-                                // Async write: exact-hash key for the clicked content.
-                                // Reads above already observe the migrated value.
-                                thinkingOverrides[contentHash] = next
+                                // Async write: exact occurrence-aware id for the clicked
+                                // card. Reads above already observe the retained value.
+                                thinkingOverrides[overrideId] = next
                             },
                         )
                     }

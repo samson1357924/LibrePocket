@@ -2,11 +2,6 @@ package dev.librepocket.privilege.github
 
 import dev.librepocket.shell.ElevatedRequest
 import dev.librepocket.shell.PrivilegeAuditLog
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
-import java.io.InputStream
-import java.io.OutputStream
-import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -24,20 +19,6 @@ import org.junit.Test
 class ScreenshotCapacityTest {
 
     private val privateRoot = "/data/data/dev.librepocket.agent/files"
-
-    private class FakeProcess(
-        private val stdout: ByteArray,
-        private val stderr: ByteArray = ByteArray(0),
-        private val exit: Int = 0,
-    ) : Process() {
-        override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
-        override fun getInputStream(): InputStream = ByteArrayInputStream(stdout)
-        override fun getErrorStream(): InputStream = ByteArrayInputStream(stderr)
-        override fun waitFor(): Int = exit
-        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = true
-        override fun exitValue(): Int = exit
-        override fun destroy() = Unit
-    }
 
     private fun shizukuRunner(spawn: (List<String>) -> Process) = ShizukuShellRunner(
         privateRoot = privateRoot,

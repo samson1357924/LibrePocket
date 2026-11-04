@@ -130,7 +130,7 @@ class RootFramebufferCapture(
          *
          * R3-B：本通用版已 Deprecated（訊息「二進位優先：傳 BinaryElevatedRunner
          * 走直達；文字 runner 僅相容，會損毀 PNG」），行為不變；新碼一律使用
-         * Binary 多載。審計（R3-B）：產品源集零呼叫，僅測試引用。
+         * Binary 多載。審計（R3-B）：產品源集零呼叫，僅測試引用。B3 前相容保留，不刪除；B3 前重審移除。
          */
         @Deprecated("二進位優先：傳 BinaryElevatedRunner 走直達；文字 runner 僅相容，會損毀 PNG")
         fun screencapViaElevated(
@@ -161,7 +161,7 @@ class RootFramebufferCapture(
          *
          * R3-B：本通用版已 Deprecated（訊息同 [screencapViaElevated]），行為不變；
          * 新碼一律使用 Binary 多載 [fb0ViaElevated]。審計（R3-B）：產品源集零呼叫，
-         * 僅測試引用。
+         * 僅測試引用。B3 前相容保留，不刪除；B3 前重審移除。
          */
         @Deprecated("二進位優先：傳 BinaryElevatedRunner 走直達；文字 runner 僅相容，會損毀 PNG")
         fun fb0ViaElevated(

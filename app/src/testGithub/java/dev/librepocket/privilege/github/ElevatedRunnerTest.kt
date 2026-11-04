@@ -7,8 +7,6 @@ import dev.librepocket.shell.ShellResult
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
 
 /**
  * S3 提權執行器測試（BACKLOG D09）：Shizuku/Root 雙 Runner
@@ -21,34 +19,6 @@ import java.io.ByteArrayOutputStream
 class ElevatedRunnerTest {
 
     private val privateRoot = "/data/data/dev.librepocket.agent/files"
-
-    private class FakeProcess(
-        private val stdout: ByteArray,
-        private val stderr: ByteArray = ByteArray(0),
-        private val exit: Int = 0,
-    ) : Process() {
-        var destroyed = false
-        override fun getOutputStream() = ByteArrayOutputStream()
-        override fun getInputStream() = ByteArrayInputStream(stdout)
-        override fun getErrorStream() = ByteArrayInputStream(stderr)
-        override fun waitFor(): Int = exit
-        override fun exitValue(): Int = exit
-        override fun destroy() {
-            destroyed = true
-        }
-    }
-
-    private class SpawnCounter(
-        private val stdout: ByteArray = "ok".toByteArray(),
-    ) {
-        var calls = 0
-        var lastArgv: List<String> = emptyList()
-        fun spawn(argv: List<String>): Process {
-            calls++
-            lastArgv = argv
-            return FakeProcess(stdout)
-        }
-    }
 
     private fun shizukuRunner(
         spawn: SpawnCounter,

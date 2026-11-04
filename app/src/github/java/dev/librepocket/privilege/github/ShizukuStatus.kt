@@ -124,6 +124,7 @@ object ShizukuStatusGate {
     /**
      * 門控執行：拒絕即回 Denied 且不碰 [spawn]；放行才委派 [spawn]。
      * 純函數可測（spawn 為假 lambda；B2/B3 前真實 runner 不經此函數）。
+     * 測試專用相容殼，B3 前相容保留，不刪除；B3 前重審移除。
      */
     @Deprecated("測試專用，產品走 denyFor；B3 dispatcher 前守衛用 denyFor")
     fun runIfAvailable(

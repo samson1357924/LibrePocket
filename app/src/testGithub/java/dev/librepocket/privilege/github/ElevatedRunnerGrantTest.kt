@@ -6,8 +6,6 @@ import dev.librepocket.shell.ShellResult
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
 
 /**
  * R1-B runner grant 強制測試（Issue #136 R1-B，owner P1-3＋PocketGuard WARN grant）：
@@ -25,27 +23,6 @@ import java.io.ByteArrayOutputStream
 class ElevatedRunnerGrantTest {
 
     private val privateRoot = "/data/data/dev.librepocket.agent/files"
-
-    private class FakeProcess(
-        private val stdout: ByteArray = "ok".toByteArray(),
-        private val stderr: ByteArray = ByteArray(0),
-        private val exit: Int = 0,
-    ) : Process() {
-        override fun getOutputStream() = ByteArrayOutputStream()
-        override fun getInputStream() = ByteArrayInputStream(stdout)
-        override fun getErrorStream() = ByteArrayInputStream(stderr)
-        override fun waitFor(): Int = exit
-        override fun exitValue(): Int = exit
-        override fun destroy() = Unit
-    }
-
-    private class SpawnCounter {
-        var calls = 0
-        fun spawn(argv: List<String>): Process {
-            calls++
-            return FakeProcess()
-        }
-    }
 
     private fun shizukuRunner(spawn: SpawnCounter, grantCheck: () -> GrantCheck) = ShizukuShellRunner(
         privateRoot = privateRoot,

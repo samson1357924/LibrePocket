@@ -222,6 +222,16 @@ internal object ElevatedProcessIo {
         private val sink = ByteArrayOutputStream()
         @Volatile private var overflowed = false
         fun write(buf: ByteArray, n: Int) {
+            // S3 競爭收斂（PocketGuard SUGGESTION，語義不變）：鎖外先讀 size
+            // 快照做快速判斷（room<=0 即標溢出直接返回；n>room 預標溢出），
+            // 鎖內只做最終判定＋寫入。快照僅啟發式（stale 亦無害：溢出位單調，
+            // 早標不錯；最終是否寫／寫多少一律以鎖內 room 為準，故絕不溢寫）。
+            val roomSnap = hardCapBytes - runCatching { sink.size() }.getOrDefault(0)
+            if (roomSnap <= 0) {
+                overflowed = true
+                return
+            }
+            if (n > roomSnap) overflowed = true
             synchronized(sink) {
                 val room = hardCapBytes - sink.size()
                 if (room <= 0) {

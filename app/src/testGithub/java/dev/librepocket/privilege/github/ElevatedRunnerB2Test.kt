@@ -5,10 +5,6 @@ import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellQuota
 import dev.librepocket.shell.ShellResult
 import dev.librepocket.tool.Flavor
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
-import java.io.InputStream
-import java.io.OutputStream
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -27,43 +23,6 @@ import org.junit.Test
 class ElevatedRunnerB2Test {
 
     private val privateRoot = "/data/data/dev.librepocket.agent/files"
-
-    private class FakeProcess(
-        private val stdout: ByteArray,
-        private val stderr: ByteArray = ByteArray(0),
-        private val exit: Int = 0,
-        private val hang: Boolean = false,
-    ) : Process() {
-        var destroyed = false
-        var forciblyDestroyed = false
-        override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
-        override fun getInputStream(): InputStream = ByteArrayInputStream(stdout)
-        override fun getErrorStream(): InputStream = ByteArrayInputStream(stderr)
-        override fun waitFor(): Int = exit
-        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
-            if (destroyed) return true
-            if (hang) {
-                try {
-                    Thread.sleep(unit.toMillis(timeout))
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                }
-                return destroyed
-            }
-            return true
-        }
-
-        override fun exitValue(): Int = exit
-        override fun destroy() {
-            destroyed = true
-        }
-
-        override fun destroyForcibly(): Process {
-            forciblyDestroyed = true
-            destroyed = true
-            return this
-        }
-    }
 
     // ---- 1. su exit 語義：拒絕/exit≠0 不回 Ok；stderr redacted ----
 
@@ -212,24 +171,6 @@ class ElevatedRunnerB2Test {
     }
 
     // ---- 3. ShizukuRemoteProcess 包裝（勿直 cast）＋二進位直達 ----
-
-    /** 非 Process 的遠端假物件：同名方法，直 cast 必 CCE。 */
-    private class FakeRemote(
-        private val stdout: ByteArray,
-        private val stderr: ByteArray = ByteArray(0),
-        private val exit: Int = 0,
-    ) {
-        var destroyed = false
-        fun getInputStream(): InputStream = ByteArrayInputStream(stdout)
-        fun getErrorStream(): InputStream = ByteArrayInputStream(stderr)
-        fun getOutputStream(): OutputStream = ByteArrayOutputStream()
-        fun waitFor(): Int = exit
-        fun waitFor(timeout: Long, unit: TimeUnit): Boolean = true
-        fun exitValue(): Int = exit
-        fun destroy() {
-            destroyed = true
-        }
-    }
 
     @Test fun shizukuRemoteWrapsWithoutCast() {
         val remote = FakeRemote("hi".toByteArray(), ByteArray(0), 0)

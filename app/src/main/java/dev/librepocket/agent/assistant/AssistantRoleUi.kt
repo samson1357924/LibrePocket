@@ -2,6 +2,7 @@ package dev.librepocket.agent.assistant
 
 import android.app.Activity
 import android.app.role.RoleManager
+import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
@@ -87,29 +88,38 @@ fun rememberAssistantRole(): AssistantRoleUi {
         readAssistantSnapshot(roleManager)
     }
     val openFallback: () -> Unit = remember(appContext) {
+        // fallbackFailed 經 MutableState 引用捕獲，非值捕獲，故無需入 remember key。
         {
             try {
-                val intent = assistantFallbackIntent().apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
+                val intent = assistantFallbackIntent()
                 // minSdk 33：用非棄用 ResolveInfoFlags.of，避免 int-flags 棄用警告。
-                val resolved = appContext.packageManager.resolveActivity(
+                // 不用 resolveActivity：多候選無預設時它回傳系統 Resolver 本身
+                // （FLAG_SYSTEM 檢查會誤判通過，後續 implicit 啟動仍彈選單放行
+                // 第三方），故用 queryIntentActivities 全枚舉＋setComponent explicit。
+                val candidates = appContext.packageManager.queryIntentActivities(
                     intent,
                     PackageManager.ResolveInfoFlags.of(
                         PackageManager.MATCH_DEFAULT_ONLY.toLong(),
                     ),
-                )
-                // 劫持 hardening：fallback 必須落在系統應用（OEM Settings 皆 system）。
-                // 第三方應用若搶 ACTION_VOICE_INPUT_SETTINGS 會是非 system，直接擋下、
-                // 不 startActivity。殘餘風險：OEM 自帶 Settings 皆為 system，本檢查
-                // 無法區分「哪一個系統應用」，但第三方劫持已被擋。
-                if (resolved?.activityInfo == null) {
-                    Log.w(TAG, "VOICE_INPUT_SETTINGS not resolvable; skip fallback")
-                    fallbackFailed = true
-                } else if ((resolved.activityInfo.applicationInfo.flags and ApplicationInfo.FLAG_SYSTEM) == 0) {
-                    Log.w(TAG, "fallback resolved to non-system app, skip")
+                ).mapNotNull { resolved ->
+                    val activityInfo = resolved.activityInfo ?: return@mapNotNull null
+                    val pkg = activityInfo.packageName ?: return@mapNotNull null
+                    val cls = activityInfo.name ?: return@mapNotNull null
+                    FallbackCandidate(
+                        packageName = pkg,
+                        className = cls,
+                        isSystem = ((activityInfo.applicationInfo?.flags ?: 0) and ApplicationInfo.FLAG_SYSTEM) != 0,
+                        isResolver = pkg == "android" &&
+                            (cls.contains("ResolverActivity") || cls.contains("ChooserActivity") || cls.contains("Resolver")),
+                    )
+                }
+                val target = selectFallbackTarget(candidates)
+                if (target == null) {
+                    Log.w(TAG, "fallback has no unique system target; skip")
                     fallbackFailed = true
                 } else {
+                    intent.setComponent(ComponentName(target.packageName, target.className))
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     appContext.startActivity(intent)
                     fallbackFailed = false
                 }

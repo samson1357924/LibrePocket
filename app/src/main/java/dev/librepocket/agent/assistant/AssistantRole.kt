@@ -133,3 +133,43 @@ fun assistantVoiceIntent(context: Context): Intent =
  */
 fun assistantFallbackIntent(): Intent =
     Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
+
+/**
+ * Fallback 安全啟動候選（純資料，無 Android 依賴，由呼叫方映射）。
+ *
+ * @param isSystem 是否為系統應用（呼叫方以
+ *   `activityInfo.applicationInfo.flags and ApplicationInfo.FLAG_SYSTEM != 0` 判定）。
+ * @param isResolver 是否為系統選單本身（包名 `android` 且類名含
+ *   `ResolverActivity`／`ChooserActivity`）；此旗標由呼叫方在映射期計算，
+ *   本函數僅做過濾，不做字串判斷。
+ */
+data class FallbackCandidate(
+    val packageName: String,
+    val className: String,
+    val isSystem: Boolean,
+    val isResolver: Boolean,
+)
+
+/**
+ * 從 fallback 候選中選出唯一可安全 explicit 啟動的系統目標。
+ *
+ * Resolver 繞過原理：[android.content.pm.PackageManager.resolveActivity]
+ * 在「多候選且無預設」時回傳的是系統自身的 ResolverActivity／ChooserActivity
+ * （包名 `android` 的系統組件），而非最終會被啟動的應用。因此僅對
+ * `resolveActivity` 結果做 `FLAG_SYSTEM` 檢查會誤判為安全——檢查通過後仍以
+ * implicit intent `startActivity`，系統會彈出選單讓使用者選到第三方應用，
+ * 第三方即拿到 `ACTION_VOICE_INPUT_SETTINGS` 的啟動，原有的「只放行系統」
+ * 保證不成立（官方文件：`resolveActivity` 回傳的是將處理 intent 的 activity，
+ * 無預設且多候選時即為 resolver 本身；實際目標要經由選單才能確定）。
+ *
+ * 規則（fail-closed）：
+ * 1. 先排除 [FallbackCandidate.isResolver] 為 true 者（系統選單本身）；
+ * 2. 再排除 [FallbackCandidate.isSystem] 為 false 者（第三方劫持）；
+ * 3. 剩餘恰 1 個 → 回傳它（呼叫方以 `setComponent` explicit 啟動，不再經選單）；
+ *    剩餘為 0 或 ≥2（多系統候選無法安全決定唯一目標）→ 回傳 null，
+ *    呼叫方顯示失敗，不放行。
+ */
+fun selectFallbackTarget(candidates: List<FallbackCandidate>): FallbackCandidate? {
+    val systemOnly = candidates.filter { !it.isResolver && it.isSystem }
+    return if (systemOnly.size == 1) systemOnly[0] else null
+}

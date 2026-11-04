@@ -214,4 +214,46 @@ class AssistantRoleTest {
         // 空字串走未知分支：原樣回報，不偽造語義、不崩潰。
         assertEquals("未知狀態（）。", assistantReasonText(""))
     }
+
+    // ---- Stage 1 新增：selectFallbackTarget（resolver 繞過 hardening） ----
+
+    @Test
+    fun givenSingleSystemCandidate_whenSelected_thenReturnsIt() {
+        val system = FallbackCandidate("com.android.settings", "VoiceInputSettings", true, false)
+        assertEquals(system, selectFallbackTarget(listOf(system)))
+    }
+
+    @Test
+    fun givenSystemPlusThirdParty_whenSelected_thenReturnsSystem() {
+        val system = FallbackCandidate("com.android.settings", "VoiceInputSettings", true, false)
+        val third = FallbackCandidate("com.evil.app", "HijackActivity", false, false)
+        assertEquals(system, selectFallbackTarget(listOf(system, third)))
+    }
+
+    @Test
+    fun givenResolverPlusSystem_whenSelected_thenExcludesResolver() {
+        val resolver = FallbackCandidate("android", "ResolverActivity", true, true)
+        val system = FallbackCandidate("com.android.settings", "VoiceInputSettings", true, false)
+        assertEquals(system, selectFallbackTarget(listOf(resolver, system)))
+    }
+
+    @Test
+    fun givenOnlyThirdParty_whenSelected_thenReturnsNull() {
+        val third = FallbackCandidate("com.evil.app", "HijackActivity", false, false)
+        assertNull(selectFallbackTarget(listOf(third)))
+    }
+
+    @Test
+    fun givenOnlyResolver_whenSelected_thenReturnsNull() {
+        val resolver = FallbackCandidate("android", "ResolverActivity", true, true)
+        assertNull(selectFallbackTarget(listOf(resolver)))
+    }
+
+    @Test
+    fun givenMultipleSystemCandidates_whenSelected_thenReturnsNull() {
+        // 多系統候選無法安全決定唯一目標：回 null 顯示失敗，不放行。
+        val a = FallbackCandidate("com.android.settings", "VoiceInputSettingsA", true, false)
+        val b = FallbackCandidate("com.oem.settings", "VoiceInputSettingsB", true, false)
+        assertNull(selectFallbackTarget(listOf(a, b)))
+    }
 }

@@ -251,6 +251,7 @@ class SetupEditKeepExistingTest {
         fake.release.countDown()
         // H2 sleep-free：固定 Thread.sleep(500) 改為 first+withTimeout 負向控制——
         // 慢 5-item 若出現（pre-A2 覆寫）即 first 命中紅；1s 內無慢即丟棄成立綠。
+        // (terminal-value negative control; StateFlow-conflated, transient overwrite invisible; 1s green-path cost)
         // [calls] 證明雙跑，斷言釘住丟棄而非單次幸運值。
         assertTrue("slow attempt never finished", fake.slowDone.await(10, TimeUnit.SECONDS))
         awaitTestIdle(vm)

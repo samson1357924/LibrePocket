@@ -345,6 +345,7 @@ class SetupEditBoundaryAndBarrierTest {
         // 雙閘（entryRevision＋modelRefreshGeneration）缺一即此測試轉紅。
         // H2 sleep-free：終端 delay(500) 改為 first+withTimeout 負向控制——
         // 慢結果若出現（pre-barrier 覆寫）即 first 命中紅；1s 內無慢即丟棄成立綠。
+        // (terminal-value negative control; StateFlow-conflated, transient overwrite invisible; 1s green-path cost)
         val store = newStore()
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         val fake = SlowRefreshListProvider()

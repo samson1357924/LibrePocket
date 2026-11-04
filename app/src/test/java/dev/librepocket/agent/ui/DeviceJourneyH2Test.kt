@@ -69,7 +69,13 @@ private class H2FakeProvider(
 /**
  * Batch H2（Issue #18 殘留）：零裝置 journey＋process-recreation（Robolectric/fake）。
  *
- * - 全程 sleep-free：以 `first {} + withTimeout`／`waitUntil` 等條件等待取代固定 delay／sleep。
+ * - ordering-deterministic, timing still wall-clock：本檔自身等待以
+ *   `first {} + withTimeout`／`waitUntil` 條件等待取代固定 delay；但共用
+ *   helper（awaitTrue 內 Thread.sleep(10)、DataStore IO、MockWebServer）
+ *   仍是 wall-clock，並非全程 sleep-free。
+ * - NOT covered：prod ChatScreen 草稿（此處僅 local rememberSaveable stub）、
+ *   Room 持久化（僅 FakeSessionStore map）、ASK 同意路徑（僅 ALLOW）、
+ *   真旋轉（僅 fontScale 變體）。
  * - 測試のみ：不改 production 行為；以 negative control 綁定 red-green（見各測試 KDoc 的 RED 敘述）。
  */
 @RunWith(RobolectricTestRunner::class)
@@ -139,6 +145,7 @@ class DeviceJourneyH2Test {
      * RED（若 production 退化即紅）：save 未落盤則快照為空；send 未回 `ok` 則訊息數不足；
      * model-only 空白 key 若被誤拒則 saved=false；logout 未清則快照仍在。皆為條件等待，
      * 無固定 sleep；任一環退化即超時紅，非計數膨脹。
+     * Resume 僅查 FakeSessionStore map 條目存在，未做第二 VM 重開／replay 驗證。
      */
     @Test
     fun journey_firstRunSetupSendEditLogout() = runBlocking {
@@ -285,6 +292,8 @@ class DeviceJourneyH2Test {
      *
      * RED：若草稿用純 remember（非 saveable），restore 後為空即紅；此處以 saveable 綠，
      * 證明接線非恆過（把 rememberSaveable 換成 remember 即紅，negative control）。
+     * 僅釘住 Robolectric StateRestorationTester＋rememberSaveable 在 local stub 上的接線，
+     * 非 prod ChatScreen 輸入框。
      */
     @Test
     fun compose_draftSurvivesProcessRecreation() {
@@ -306,7 +315,8 @@ class DeviceJourneyH2Test {
     }
 
     /**
-     * 大字體變體：fontScale=1.3 下草稿仍存活且可見（零裝置覆蓋旋轉／字體放大的最小替代）。
+     * 大字體變體：fontScale=1.3 下草稿仍存活且可見（fontScale recreation only，非真旋轉）。
+     * 同上，僅 local stub 的 rememberSaveable 接線，非 prod ChatScreen 輸入框。
      */
     @Test
     @Config(sdk = [33], fontScale = 1.3f)

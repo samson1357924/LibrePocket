@@ -608,6 +608,11 @@ class ChatSessionFactory(
      *（已 `confirm` 的迴環／LAN endpoint 才放行，變更即失效需重綁）。
      * Play production 只允許預設建構（`allowTierUpgrade = false`）或 null；
      * 升級-capable 的 store 屬 foss／github pilot 接線（見 `NetworkOptInStore`）。
+     *
+     * BREAKING（Phase C rollout 決議，#139 起）：既有 debug localhost／
+     * http://10.0.2.2 等自 139 起預設拒絕（HTTPS_ONLY，即使 debug NSC 允許；
+     * 屬刻意先全禁）；opt-in confirm UI 接線前，需經測試注入 store
+     * (allowTierUpgrade=true) 才放行；無遷移（舊本機端點需重新確認）。
      */
     private val networkOptInStore: NetworkOptInStore? = null,
 ) : ChatSessionProvider {

@@ -47,6 +47,7 @@ fun setupErrorText(code: String): String = when (code) {
     "API key too short" -> "金鑰太短（至少 8 字元），請檢查後重貼。"
     "TEST_UNAUTHORIZED" -> "金鑰無效（認證失敗），請檢查後重貼。"
     "TEST_TOO_LARGE" -> "模型列表過大，未能完整載入，請重試。"
+    "TEST_POLICY_BLOCKED" -> "連線被本機網路政策阻擋（非公網／明文位址需先確認）。本機或內網位址請待 opt-in 確認流程開放後重試；公網 https 位址請檢查後重試。"
     "TEST_RETRYABLE" -> "伺服器忙碌或網路不穩，請稍後重試。"
     "POLICY_DENIED_KEY_WRITE" -> "政策拒絕寫入金鑰（key.write DENY），請檢查權限設定。"
     "PROBE_POLICY_DENIED" -> "政策未允許連線探測（provider.call 非 ALLOW），未發出任何請求，請檢查權限設定後重試。"

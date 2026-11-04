@@ -3800,6 +3800,68 @@ class OpenAiSpeechEngineTest {
         }
     }
 
+    // ---- Stage-A 第四輪 BLOCK：factory latch 與 stop 交錯，claim 因快照失格拒絕 ----
+    @Test
+    fun androidAudioPlayer_factoryLatchInterleavedWithStop_claimRejectedWithoutNative() = runBlocking {
+        val factoryEntered = CountDownLatch(1)
+        val factoryUnblock = CountDownLatch(1)
+        class CountingMp : TestMediaPlayer() {
+            @Volatile var setDataSourceCalled = false
+            override fun setDataSource(dataSource: android.media.MediaDataSource) {
+                setDataSourceCalled = true
+                super.setDataSource(dataSource)
+            }
+        }
+        val countingMp = CountingMp()
+        val player = AndroidAudioPlayer(
+            mediaPlayerFactory = {
+                factoryEntered.countDown()
+                // 阻塞 factory，製造 stop 交錯窗口（continuation 仍 active、isReleased 仍 false）。
+                factoryUnblock.await(5, TimeUnit.SECONDS)
+                countingMp
+            },
+            prepareTimeoutMs = 5000L,
+        )
+        try {
+            var playEx: Throwable? = null
+            val job = launch(Dispatchers.IO) {
+                try {
+                    player.play(byteArrayOf(0x01, 0x02))
+                } catch (e: Throwable) {
+                    playEx = e
+                }
+            }
+            assertTrue("play must block in factory", factoryEntered.await(5, TimeUnit.SECONDS))
+            // 交錯：stop 在 factory 返回前完成且有界返回（空 detach + 世代遞增，不取消 in-flight cont）。
+            val t0 = System.nanoTime()
+            player.stop()
+            val stopElapsedMs = (System.nanoTime() - t0) / 1_000_000
+            assertTrue("stop must return bounded (<1000ms) while factory blocked, elapsed=${stopElapsedMs}ms", stopElapsedMs < 1000)
+            // 再放行 factory：claim 必須因快照失格拒絕，不做 setDataSource/prepareAsync/start。
+            factoryUnblock.countDown()
+            withTimeout(5000L) {
+                job.join()
+            }
+            val ex = playEx
+            assertNotNull("play must be cancelled after interleaved stop", ex)
+            assertTrue("interleaved stop must cancel with CancellationException, was: $ex", ex is CancellationException)
+            assertFalse("setDataSource must never be called after stop-stale claim rejection", countingMp.setDataSourceCalled)
+            assertFalse("prepareAsync must never be called after stop-stale claim rejection", countingMp.prepareAsyncCalled)
+            assertFalse("start must never be called after stop-stale claim rejection", countingMp.startCalled)
+            // 工廠產物經背景釋放（池未關，正常排隊；呼叫線程永不執行 native）。
+            awaitCondition(timeoutMs = 5000L) { countingMp.releaseCalled }
+            assertTrue("factory-created player must eventually be released", countingMp.releaseCalled)
+            awaitCondition(timeoutMs = 5000L) { player.retainedSessionsForTest() == 0 }
+            assertEquals(0L, player.retainedBytesForTest())
+        } finally {
+            factoryUnblock.countDown()
+            try {
+                player.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
     // ---- Stage-A 第四輪：無界 cached mute pool 資源耗盡壓力回歸（P1/BLOCK） ----
     @Test
     fun androidAudioPlayer_mutePressureStress_boundedFailClosedAndDrains() = runBlocking {

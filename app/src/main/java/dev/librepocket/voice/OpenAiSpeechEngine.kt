@@ -1019,6 +1019,15 @@ class AndroidAudioPlayer(
             return@suspendCancellableCoroutine
         }
         // 入口原子預佔已涵蓋 factory 等待期間的併發，不再設二次 gate（避免對自身重複拒絕）。
+        // BLOCK 修復：工廠前於 lock 內快照世代（sessionEpoch + activeEpoch）。
+        // factory 可能阻塞任意久；期間 stop()/新 play claim/release 皆遞增 sessionEpoch，
+        // 故返回後必須比對快照，失格即釋放 factory 產物並取消，不進任何 native。
+        val factorySnapshotSession: Long
+        val factorySnapshotActive: Long
+        synchronized(lock) {
+            factorySnapshotSession = sessionEpoch
+            factorySnapshotActive = activeEpoch
+        }
 
         val player = try {
             mediaPlayerFactory()
@@ -1036,8 +1045,22 @@ class AndroidAudioPlayer(
         }
         // P2-2 TOCTOU：factory 阻塞期間 release 可能已完成（isReleased=true、池已關）。
         // factory 返回後必須再查 closed，released 明確 fail-fast，不做後續 native。
+        // （release 擋法保留；stop 語義對等由下方快照柵欄覆蓋。）
         if (isReleased.get() || !continuation.isActive) {
             tryCancel(continuation, "Audio play cancelled: player released during factory (epoch pending)")
+            releaseAsync(DetachedSession(player, null, null, -1L, reservedSize))
+            return@suspendCancellableCoroutine
+        }
+        // P2-2 TOCTOU + BLOCK：factory 阻塞期間 stop/新 play 可能已交錯。
+        // 僅查 isReleased/continuation.isActive 不足：stop() 在空 detach 時僅遞增世代，
+        // continuation 仍 active、isReleased 仍 false，舊 claim 會直接覆寫世代導致 stop 丟失。
+        // 故此處比對工廠前快照，失格（期間有 stop/新 play claim/release）即釋放 player 並取消，
+        // 不建 dataSource、不做後續 native。
+        val factoryStale = !continuation.isActive ||
+            synchronized(lock) { sessionEpoch != factorySnapshotSession || activeEpoch != factorySnapshotActive }
+        if (factoryStale) {
+            // 工廠前快照失格：期間有 stop/新 play/release。從未 claim，不進 native，直接取消。
+            tryCancel(continuation, "Audio play superseded during factory (snapshot $factorySnapshotSession/$factorySnapshotActive stale)")
             releaseAsync(DetachedSession(player, null, null, -1L, reservedSize))
             return@suspendCancellableCoroutine
         }
@@ -1054,9 +1077,17 @@ class AndroidAudioPlayer(
             releaseAsync(DetachedSession(player, null, null, -1L, reservedSize))
             return@suspendCancellableCoroutine
         }
-        // dataSource 配置期間亦可能交錯 release，再查一次。
         if (isReleased.get() || !continuation.isActive) {
             tryCancel(continuation, "Audio play cancelled: player released before claim (epoch pending)")
+            releaseAsync(DetachedSession(player, dataSource, null, -1L, reservedSize))
+            return@suspendCancellableCoroutine
+        }
+        // dataSource 配置期間亦可能交錯 stop/release/新 play，再查快照+closed。
+        // stop() 語義對等：未 claim 的 in-flight 亦須能被取消（比照 resolved 失格路徑）。
+        val preClaimStale = !continuation.isActive ||
+            synchronized(lock) { sessionEpoch != factorySnapshotSession || activeEpoch != factorySnapshotActive }
+        if (preClaimStale) {
+            tryCancel(continuation, "Audio play superseded before claim (snapshot $factorySnapshotSession/$factorySnapshotActive stale)")
             releaseAsync(DetachedSession(player, dataSource, null, -1L, reservedSize))
             return@suspendCancellableCoroutine
         }
@@ -1064,7 +1095,11 @@ class AndroidAudioPlayer(
         val myEpoch: Long?
         val oldDetached: DetachedSession?
         synchronized(lock) {
-            if (!continuation.isActive || isReleased.get()) {
+            // BLOCK claim 柵欄：比對工廠前快照，期間有 stop/新 play/release 即失格，
+            // 失格即回滾（釋放 factory 產物 + 取消，不進 native）。直接覆寫世代會丟失 stop。
+            if (!continuation.isActive || isReleased.get() ||
+                sessionEpoch != factorySnapshotSession || activeEpoch != factorySnapshotActive
+            ) {
                 myEpoch = null
                 oldDetached = null
             } else {

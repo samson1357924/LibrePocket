@@ -10,6 +10,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowApplication
 import java.io.File
 
 /**
@@ -65,6 +66,70 @@ class LibrePocketAppStartupTest {
             (app as LibrePocketApp).onCreate()
             assertFalse("onCreate 不得因無殘留而建立 skills 目錄", root.exists())
         } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    /**
+     * Stage 1 finding A：`:voice` 行程啟動必須跳過清理（不與主行程安裝窗口併發）。
+     *
+     * 以 `ShadowApplication.setProcessName("<pkg>:voice")` 模擬 `:voice` 行程
+     * 啟動：植入崩潰窗口殘留後走 `onCreate`，殘留必須原封不動（不斷言 log，
+     * 只斷言「零 I/O 語意」：target 不出現、`.bak` 不被消費）。`finally` 還原
+     * process name，避免污染同 sandbox 後續測試。
+     */
+    @Test fun onCreate_skipsCleanupInVoiceProcess() {
+        val app = ApplicationProvider.getApplicationContext<Context>()
+        val pkg = app.packageName
+        val root = SkillPaths.skillRoot(app)
+        root.deleteRecursively()
+        ShadowApplication.setProcessName("$pkg:voice")
+        try {
+            val tid = Thread.currentThread().threadId()
+            val bak = File(root, ".boot-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
+                mkdirs()
+                File(this, "SKILL.md").writeText(skillMd("boot-skill", "舊版正文"), Charsets.UTF_8)
+            }
+            assertTrue(bak.exists())
+            assertFalse(File(root, "boot-skill").exists())
+
+            (app as LibrePocketApp).onCreate()
+
+            assertFalse("`:voice` 行程不得還原殘留", File(root, "boot-skill").exists())
+            assertTrue("`:voice` 行程不得消費 .bak", bak.exists())
+        } finally {
+            ShadowApplication.setProcessName(pkg)
+            root.deleteRecursively()
+        }
+    }
+
+    /**
+     * Stage 1 finding A：main 行程（processName == packageName）仍執行清理。
+     *
+     * 明確設定 process name 而非依賴 Robolectric 預設（預設即回 packageName，
+     * 已由 probe 驗證），把正向分支釘死，不受影子預設行為漂移影響。
+     */
+    @Test fun onCreate_runsCleanupInMainProcess() {
+        val app = ApplicationProvider.getApplicationContext<Context>()
+        val pkg = app.packageName
+        val root = SkillPaths.skillRoot(app)
+        root.deleteRecursively()
+        ShadowApplication.setProcessName(pkg)
+        try {
+            val tid = Thread.currentThread().threadId()
+            val bak = File(root, ".boot-skill.bak-${Math.abs(System.nanoTime())}-$tid").apply {
+                mkdirs()
+                File(this, "SKILL.md").writeText(skillMd("boot-skill", "舊版正文"), Charsets.UTF_8)
+            }
+            assertTrue(bak.exists())
+            assertFalse(File(root, "boot-skill").exists())
+
+            (app as LibrePocketApp).onCreate()
+
+            assertTrue("main 行程啟動應恢復崩潰窗口殘留", File(root, "boot-skill/SKILL.md").isFile)
+            assertFalse("恢復後 .bak 應被消費", bak.exists())
+        } finally {
+            ShadowApplication.setProcessName(pkg)
             root.deleteRecursively()
         }
     }

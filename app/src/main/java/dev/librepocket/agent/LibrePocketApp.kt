@@ -30,14 +30,35 @@ import dev.librepocket.skill.SkillPaths
  * `Log.w`（避免無殘留啟動的日誌噪音），計數為**成功**處置（還原＋刪除合併，
  * attempt 總數另有測試縫，見 [SkillInstaller.cleanupAttemptsForTest]；
  * 詳見 [SkillInstaller.cleanupStaleStaging] 的 @return）。
+ * 行程閘門分支（main 才清理／`:voice` 跳過）由 [shouldRunSkillCleanup] 純函數
+ * JVM 單測＋ Robolectric `ShadowApplication.setProcessName` 多行程模擬覆蓋
+ *（見 `LibrePocketAppStartupTest`；Robolectric 預設 `getProcessName()` 即回
+ * `packageName`，等同 main 行程）。
  *
- * 契約：清理必須發生在「任何安裝之前」，且 [SkillInstaller] 的 per-skill 鎖
- * 只在單行程內有效——本 App 目前為單行程、安裝由 UI 觸發，故安全；未來若引入
- * 背景更新或第二行程，須先序列化（見 [SkillInstaller.cleanupStaleStaging] 契約）。
+ * 契約：清理必須發生在「任何安裝之前」。多行程現實（assistant `:voice`
+ * 行程，見主 manifest）：三個 assistant service 跑在
+ * `android:process=":voice"`，其行程啟動同樣建立 [LibrePocketApp] 實例並走
+ * `onCreate`——故清理先過行程閘門：僅 main 行程
+ * （`Application.getProcessName() == packageName`，API 28+，minSdk 33 可直接用）
+ * 執行 [SkillInstaller.cleanupStaleStaging]；`:voice`（及任何非 main／未知
+ * processName）行程跳過清理並記一行 log（fail-closed：`null` 亦跳過）。
+ * 此閘門只防「`:voice` 啟動清理與主行程安裝 commit／rollback 窗口
+ * （rename target→backup 到 rename staging→target 之間 target 缺席）併發」：
+ * [SkillInstaller] 的 per-skill 鎖僅行程內有效，「單一合法 `.bak`＋target
+ * 缺席不問齡期還原」規則在併發下可能與主行程交錯、導致覆蓋安裝失敗／回滾失真；
+ * 跨行程與安裝的序列化仍由 [SkillInstaller.cleanupStaleStaging]
+ * 呼叫方契約約束（不與 install 併發；備份規則本身 Stage 1 不動，留給 Stage 3）。
+ * `onCreate` 目前除清理外無其他初始化（[SkillPaths.skillRoot] 僅拼路徑、
+ * 零 I/O），故只需閘清理一路；`:voice` 下 `filesDir/skills` 不被觸碰。
  */
 class LibrePocketApp : Application() {
     override fun onCreate() {
         super.onCreate()
+        val processName = Application.getProcessName()
+        if (!shouldRunSkillCleanup(processName, packageName)) {
+            Log.i(TAG, "skip skill cleanup in ${processName ?: "unknown"}")
+            return
+        }
         try {
             val recovered = SkillInstaller.cleanupStaleStaging(SkillPaths.skillRoot(this))
             if (recovered > 0) Log.w(TAG, "skill install recovery: $recovered entries")
@@ -52,3 +73,15 @@ class LibrePocketApp : Application() {
         const val TAG = "LibrePocketApp"
     }
 }
+
+/**
+ * 行程閘門純判定（Stage 1 finding A）：僅 main 行程可跑啟動清理。
+ *
+ * `processName == packageName` 即 main 行程；`:voice` 後綴（及任何其他非 main
+ * 名）→ false。`processName` 為 `null`（框架理論上可回 null：無 bound
+ * application 時）→ false（fail-closed：未知行程永不清理）。
+ * 跳過清理的行程只記一行 `"skip skill cleanup in <proc>"`（僅包名／進程後綴，
+ * 無敏感資訊），不觸碰 `filesDir/skills`。
+ */
+internal fun shouldRunSkillCleanup(processName: String?, packageName: String): Boolean =
+    processName == packageName

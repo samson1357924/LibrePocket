@@ -1826,4 +1826,134 @@ class ChatMarkdownUiTest {
             .fetchSemanticsNode().positionInRoot.y
         assertTrue(expandY < collapseY)
     }
+
+    @Test
+    fun chatMarkdownView_growthThenSplit_retainsExpandOnOldCard() {
+        // Re-review #10 P2: `["Plan"]` -> `["Planning", "Plan"]` via non-append-only
+        // raw (closed prev, curr does not start with prev). Identity-only must keep
+        // the manual expand on the old second card; the new first card defaults to
+        // collapsed. Old greedy prefix migration would steal it onto the first card.
+        var text by mutableStateOf("<think>Plan</think>")
+
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(text = text, isStreaming = false)
+            }
+        }
+
+        val title = context.getString(R.string.chat_thinking_title)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+
+        // Single completed card defaults to collapsed; record explicit true.
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Plan").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+
+        // Non-append-only rewrite: first card is new ("Planning"), second is old ("Plan").
+        text = "<think>Planning</think>\n\n<think>Plan</think>"
+        composeRule.waitForIdle()
+
+        composeRule.onAllNodesWithText(title).assertCountEquals(2)
+        // Old card (second) retains expand; new card (first) defaults to collapsed.
+        composeRule.onNodeWithText("Plan").assertIsDisplayed()
+        composeRule.onNodeWithText("Planning").assertDoesNotExist()
+        composeRule.onAllNodesWithContentDescription(expandDesc).assertCountEquals(1)
+        composeRule.onAllNodesWithContentDescription(collapseDesc).assertCountEquals(1)
+        // Collapsed first card sits above the expanded second card.
+        val expandY = composeRule.onNodeWithContentDescription(expandDesc)
+            .fetchSemanticsNode().positionInRoot.y
+        val collapseY = composeRule.onNodeWithContentDescription(collapseDesc)
+            .fetchSemanticsNode().positionInRoot.y
+        assertTrue(expandY < collapseY)
+        // The visible content belongs to the second card (below the first header).
+        val contentY = composeRule.onNodeWithText("Plan")
+            .fetchSemanticsNode().positionInRoot.y
+        val firstTitleY = composeRule.onAllNodesWithText(title)[0]
+            .fetchSemanticsNode().positionInRoot.y
+        assertTrue(contentY > firstTitleY)
+    }
+
+    @Test
+    fun chatMarkdownView_growthThenSplit_retainsCollapseOnOldCard() {
+        // Companion to the expand case: old card holds explicit `false`; the new
+        // first card (completed) defaults to collapsed and the old second card
+        // (streaming) must retain the collapse instead of defaulting to expanded.
+        // Greedy prefix migration would move the collapse onto the first card and
+        // leave the second at its streaming default (visible `Plan` cursor).
+        var text by mutableStateOf("<think>Plan</think>")
+
+        composeRule.setContent {
+            MaterialTheme {
+                ChatMarkdownView(text = text, isStreaming = true)
+            }
+        }
+
+        val title = context.getString(R.string.chat_thinking_title)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+
+        // Completed card in a streaming turn defaults to collapsed; record explicit
+        // false via expand-then-collapse so the map holds `false` (not null).
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Plan").assertIsDisplayed()
+        composeRule.onNodeWithText(title).performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("Plan").assertDoesNotExist()
+
+        // Non-append-only: curr does not start with prev (`</think>` vs `ning...`).
+        text = "<think>Planning</think><think>Plan"
+        composeRule.waitForIdle()
+
+        composeRule.onAllNodesWithText(title).assertCountEquals(2)
+        // Both cards collapsed: first via completed default, second via retained false
+        // (streaming default would be expanded).
+        composeRule.onNodeWithText("Planning").assertDoesNotExist()
+        composeRule.onNodeWithText("Plan").assertDoesNotExist()
+        composeRule.onNodeWithText("Plan \u258D").assertDoesNotExist()
+        composeRule.onAllNodesWithContentDescription(expandDesc).assertCountEquals(2)
+        composeRule.onAllNodesWithContentDescription(collapseDesc).assertCountEquals(0)
+    }
+
+    @Test
+    fun thinkingAlignIdentityOnly_rewriteAllDifferent_scalesLinearly() {
+        // P3: identity-only content-exact uses an O(1) content -> indices lookup built
+        // once per recomposition (O(K)). Rewriting K cards to K fully different cards
+        // must scale ~linearly (well under the quadratic 4x plus noise headroom),
+        // unlike a per-card linear scan over all previous entries.
+        fun timed(k: Int): Long {
+            val prev = List(k) { "prev-content-$it" }
+            val curr = List(k) { "curr-content-$it" }
+            val prevIds = thinkingOverrideIds(prev)
+            val currIds = thinkingOverrideIds(curr)
+            val currSet = currIds.toSet()
+            repeat(3) {
+                alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
+            }
+            val start = System.nanoTime()
+            repeat(5) {
+                alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
+            }
+            return System.nanoTime() - start
+        }
+        val t1 = timed(400)
+        val t2 = timed(800)
+        val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
+        assertTrue(
+            "identity-only 2x-input ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)",
+            ratio < 3.5,
+        )
+        // Correctness pin: all-different rewrite migrates nothing and prunes stale.
+        val prev = listOf("A", "B")
+        val curr = listOf("C", "D")
+        val prevIds = thinkingOverrideIds(prev)
+        val currIds = thinkingOverrideIds(curr)
+        val overrides = mutableMapOf(prevIds[0] to true)
+        alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, overrides, currIds.toSet())
+        assertFalse(overrides.containsKey(prevIds[0]))
+        assertTrue(overrides.isEmpty())
+    }
 }

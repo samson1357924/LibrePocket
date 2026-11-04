@@ -22,6 +22,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
@@ -272,17 +273,17 @@ class SetupEditKeepExistingTest {
         // guard must surface as a stale slow write (RED) instead of an
         // A-then-B lucky overwrite (false green).
         withTimeout(10_000) { vm.form.first { it.testModels == 2 && !it.testing } }
-        // History collector started BEFORE releasing A: StateFlow is
-        // conflated, so a post-hoc first{slow} subscribed after idle would
-        // miss a transient slow overwritten by B; the live collector observes
-        // every emission from B-terminal onward. (Residual: same-instant
+        // History collector on an explicit scope started BEFORE releasing A:
+        // StateFlow is conflated, so a post-hoc first{slow} subscribed after
+        // idle would miss a transient slow overwritten by B; the live collector
+        // observes every emission from B-terminal onward. The explicit histScope
+        // (detached from the test's runBlocking scope) makes cancellation
+        // explicit: even a handshake-timeout throw inside try still runs the
+        // finally that cancels/joins the scope. (Residual: same-instant
         // conflated writes could still merge upstream — accepted.)
         val seen = Collections.synchronizedList(mutableListOf<Any?>())
-        val collector = launch(Dispatchers.Default) { vm.form.collect { seen.add(it.testModels) } }
-        // Handshake: wait until the collector has observed B-terminal before
-        // releasing A; otherwise release + A's whole writeback could complete
-        // before the collector's first emission (vacuous pin).
-        withTimeout(10_000) { while (seen.isEmpty()) delay(5) }
+        val histScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val collector = histScope.launch { vm.form.collect { seen.add(it.testModels) } }
         // Release slow AFTER B published so slow always finishes last:
         // pre-guard overwrites to 5 (RED), post-guard discards to 2 (GREEN).
         // Bounded writeback-settle: slowDone fires at provider return, A's VM
@@ -293,13 +294,18 @@ class SetupEditKeepExistingTest {
         // makes a regressed stale write terminal (nothing overwrites after
         // A), so this post-release watch cannot miss it.
         val stale = try {
+            // Handshake (first statement inside try so a timeout still hits the
+            // finally below): wait until the collector has observed B-terminal
+            // before releasing A; otherwise release + A's whole writeback could
+            // complete before the collector's first emission (vacuous pin).
+            withTimeout(10_000) { while (seen.isEmpty()) delay(5) }
             fake.release.countDown()
             assertTrue("slow attempt never finished", fake.slowDone.await(10, TimeUnit.SECONDS))
             awaitTestIdle(vm)
             withTimeoutOrNull(2_000) { vm.form.first { it.testModels == 5 } }
         } finally {
-            collector.cancel()
-            collector.join()
+            histScope.cancel()
+            withTimeoutOrNull(5_000) { histScope.coroutineContext.job.join() }
         }
         // The stale 5-item result must NEVER be written (not even transiently).
         assertNull("slow result must be discarded (stale write appeared): $stale", stale)

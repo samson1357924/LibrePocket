@@ -22,6 +22,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.emptyFlow
@@ -398,16 +399,17 @@ class SetupEditBoundaryAndBarrierTest {
         // A-then-B lucky overwrite (false green).
         val fast = listOf("fast-r1", "fast-r2")
         withTimeout(10_000) { vm.form.first { it.modelOptions.containsAll(fast) && !it.modelsLoading } }
-        // History collector started BEFORE releasing A: StateFlow is
-        // conflated, so a post-hoc first{slow} subscribed after idle would
-        // miss a transient slow overwritten by B; the live collector observes
-        // every emission from B-terminal onward. (Residual: same-instant
+        // History collector on an explicit scope started BEFORE releasing A:
+        // StateFlow is conflated, so a post-hoc first{slow} subscribed after
+        // idle would miss a transient slow overwritten by B; the live collector
+        // observes every emission from B-terminal onward. The explicit histScope
+        // (detached from the test's runBlocking scope) makes cancellation
+        // explicit: even a handshake-timeout throw inside try still runs the
+        // finally that cancels/joins the scope. (Residual: same-instant
         // conflated writes could still merge upstream — accepted.)
         val seen = Collections.synchronizedList(mutableListOf<Any>())
-        val collector = launch(Dispatchers.Default) { vm.form.collect { seen.add(it.modelOptions.toList()) } }
-        // Handshake：等 collector 已觀測到 B 終值才放行 A；否則放行＋A 整段
-        // 寫回可能搶在 collector 首次發射前完成（空洞釘）。
-        withTimeout(10_000) { while (seen.isEmpty()) delay(5) }
+        val histScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val collector = histScope.launch { vm.form.collect { seen.add(it.modelOptions.toList()) } }
         // Release slow AFTER B published so slow always finishes last:
         // pre-barrier overwrites with slow-r (RED), post-barrier discards
         // and the terminal stays fast-only (GREEN).
@@ -419,13 +421,16 @@ class SetupEditBoundaryAndBarrierTest {
         // released makes a regressed stale write terminal (nothing overwrites
         // after A), so this post-release watch cannot miss it.
         val stale = try {
+            // Handshake（try 內第一句，超時亦走下方 finally）：等 collector 已觀測到
+            // B 終值才放行 A；否則放行＋A 整段寫回可能搶在 collector 首次發射前完成（空洞釘）。
+            withTimeout(10_000) { while (seen.isEmpty()) delay(5) }
             fake.release.countDown()
             assertTrue("slow refresh never finished", fake.slowDone.await(10, TimeUnit.SECONDS))
             awaitModelsIdle(vm)
             withTimeoutOrNull(2_000) { vm.form.first { it.modelOptions.any { o -> o.startsWith("slow-r") } } }
         } finally {
-            collector.cancel()
-            collector.join()
+            histScope.cancel()
+            withTimeoutOrNull(5_000) { histScope.coroutineContext.job.join() }
         }
         // The stale slow-r result must NEVER be written (not even transiently).
         assertNull("slow result must be discarded (stale write appeared): $stale", stale)

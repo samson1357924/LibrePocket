@@ -174,6 +174,11 @@ class AndroidAudioPlayer(
          * 超額才有界洩漏並計 [releaseLeakedCount]（誠實聲明，見 [releaseAsync] KDoc）。
          */
         internal const val MAX_RELEASE_DISCARD_THREADS = 2
+        /**
+         * Stage-B 第四輪 P2-2：決定性測試事件序有界上界（[testEventLog] ring 容量）。
+         * 生產預設不記錄（[eventLogEnabledForTest] 為 false），啟用時亦不超過此容量。
+         */
+        internal const val MAX_EVENT_LOG = 64
     }
 
     private var activePlayer: MediaPlayer? = null
@@ -287,8 +292,34 @@ class AndroidAudioPlayer(
     private val muteInFlight = AtomicInteger(0)
     private val retainedSessions = AtomicInteger(0)
     private val retainedBytes = AtomicLong(0)
-    /** 決定性測試事件序：stop detach/enqueue vs pools shutdown 的先後（見並發 double-shutdown 測試）。 */
+    /** 決定性測試事件序：stop detach/enqueue vs pools shutdown 的先後（見並發 double-shutdown 測試）。
+     * Stage-B 第四輪 P2-2：生產預設不記錄（[eventLogEnabledForTest] 為 false 時零 append，
+     * 長生命週期 idle stop() 不再無界增長）；測試需先置 true 啟用。啟用時亦有界
+     * ([MAX_EVENT_LOG] ring，滿時丟棄最舊保留最新），避免測試大量操作撐爆記憶體。 */
     internal val testEventLog = java.util.concurrent.ConcurrentLinkedQueue<String>()
+    /** 測試專用開關：預設 false（生產零記錄）；決定性並發測試置 true 後才記錄事件序。 */
+    @Volatile
+    internal var eventLogEnabledForTest: Boolean = false
+    private fun logEvent(event: String) {
+        try {
+            if (!eventLogEnabledForTest) return
+            // 有界 ring：滿時丟棄最舊一筆再寫入，確保 size <= MAX_EVENT_LOG。
+            try {
+                if (testEventLog.size >= MAX_EVENT_LOG) {
+                    try {
+                        testEventLog.poll()
+                    } catch (_: Throwable) {
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+            try {
+                testEventLog.offer(event)
+            } catch (_: Throwable) {
+            }
+        } catch (_: Throwable) {
+        }
+    }
     /** 測試用：查詢池是否已發起 shutdown（shutdown() 已呼叫，不代表 terminated）。 */
     internal fun isPoolsShutdownForTest(): Boolean =
         try {
@@ -423,20 +454,17 @@ class AndroidAudioPlayer(
                 activeEpoch = sessionEpoch
                 d
             }
-            try {
-                testEventLog.add("release-fence")
-            } catch (_: Throwable) {
-            }
+            logEvent("release-fence")
             // 取消 + 清 timer（仍在 releaseLock 內，但已釋放 lock；cont.cancel 觸發的
             // invokeOnCancellation 僅需 lock，此時 lock 空閒，不死鎖）。
             tryCancel(detached.continuation, "AndroidAudioPlayer released (epoch ${detached.epoch})")
             cancelTimeoutAndClearPrepared(detached.epoch)
             // 關鍵順序：先 enqueue 背景 mute/release，再關池，否則 enqueue 被拒走 fallback。
+            // Stage-B 第四輪 P2-1：mute 任務已在關池前被接收，其鏈式 release 若在關池後才執行，
+            // 改由同一 mute worker 內同步釋放（見 muteAndReleaseAsync），不散生未追蹤 fallback threads，
+            // 正常關閉零 fallback。
             muteAndReleaseAsync(detached)
-            try {
-                testEventLog.add("release-enqueued")
-            } catch (_: Throwable) {
-            }
+            logEvent("release-enqueued")
             // Orderly shutdown：先丟棄 pending prepare 超時，再 orderly 關閉 mute/release 池。
             // 切勿對 releaseExecutor 用 shutdownNow：會丟棄佇列中剛 enqueue 的 native reset/release。
             try {
@@ -451,10 +479,7 @@ class AndroidAudioPlayer(
                 releaseExecutor.shutdown()
             } catch (_: Throwable) {
             }
-            try {
-                testEventLog.add("pools-shutdown")
-            } catch (_: Throwable) {
-            }
+            logEvent("pools-shutdown")
             needBackgroundAwait = true
         }
         if (needBackgroundAwait) {
@@ -733,7 +758,11 @@ class AndroidAudioPlayer(
      * - 超額（池未關但佇列滿）：呼叫線程仍有界返回，不建新線程；計 [muteRejectedCount]，
      *   跳過 mute 直接經 [releaseAsync] 排釋放（degraded：舊音訊可能短暫殘留；release 亦有界，
      *   若亦滿則走有界丟棄線程/有界洩漏並計 [releaseRejectedCount]/[releaseLeakedCount]）。
-     *   池已關才走 daemon fallback（關閉僅一次，有界）。
+     * - 正常關閉（Stage-B 第四輪 P2-1）：mute 已在關池前被接收，其鏈式 release 若在關池後才執行，
+     *   改由同一 mute worker 內同步執行 `reset/release`（有界 workers 內阻塞，不建新線程、
+     *   不計 fallback/rejected），故正常關閉零 fallback（[muteFallbackCount]/[releaseFallbackCount]
+     *   皆為 0），由 release() 的背景 await 等待收斂。僅「關池後才新到」的 mute enqueue
+     *   才走 daemon fallback（關閉僅一次，有界）。
      */
     private fun muteAndReleaseAsync(detached: DetachedSession) {
         if (detached.player == null && detached.dataSource == null) return
@@ -757,6 +786,10 @@ class AndroidAudioPlayer(
                     }
                 }
                 // 鏈式釋放：已在 retained 預算內佔位，此處不再重複計數，僅排隊；完成後 decrement。
+                // Stage-B 第四輪 P2-1：同一 session cleanup task 內完成 mute+release。
+                // 若 release 池已在關池後才執行到此（正常關閉：mute 已在關池前被接收），
+                // 直接由同一 mute worker 內同步執行 safelyRelease（有界 workers 內阻塞，
+                // 不建新線程、不計 fallback），故正常關閉零 fallback、可確認收斂。
                 try {
                     releaseExecutor.execute {
                         try {
@@ -772,19 +805,13 @@ class AndroidAudioPlayer(
                         true
                     }
                     if (shuttingDown) {
+                        // 正常關閉：同一 worker 內同步釋放，不散生未追蹤 daemon threads，
+                        // 不計 fallback/rejected（預期有序路徑）。呼叫線程早已返回，不阻塞 UI；
+                        // 背景 await 在 release() 的 daemon 線程等待 workers 收斂。
                         try {
-                            releaseFallbackCount.incrementAndGet()
+                            safelyReleasePlayer(detached.player, detached.dataSource)
                         } catch (_: Throwable) {
-                        }
-                        try {
-                            Thread({
-                                try {
-                                    safelyReleasePlayer(detached.player, detached.dataSource)
-                                } finally {
-                                    decrementRetained(bytes)
-                                }
-                            }, "AndroidAudioPlayer-release-fallback").apply { isDaemon = true }.start()
-                        } catch (_: Throwable) {
+                        } finally {
                             decrementRetained(bytes)
                         }
                     } else {
@@ -1350,20 +1377,14 @@ class AndroidAudioPlayer(
             activeEpoch = sessionEpoch
             d
         }
-        try {
-            testEventLog.add("stop-fence")
-        } catch (_: Throwable) {
-        }
+        logEvent("stop-fence")
         tryCancel(detached.continuation, "AndroidAudioPlayer stopped (epoch ${detached.epoch})")
         cancelTimeoutAndClearPrepared(detached.epoch)
         // Stage-A 第三輪：僅做邏輯取消 + enqueue 背景靜音/釋放，呼叫線程永不執行 native。
         // 呼叫線程有界返回（不被 A 的阻塞 release 排隊，亦不被 B 自身阻塞 native 卡住）；
         // 真實靜音由 mute 池背景 best-effort 執行，完整釋放隨後排入 release 池。
         muteAndReleaseAsync(detached)
-        try {
-            testEventLog.add("stop-enqueued")
-        } catch (_: Throwable) {
-        }
+        logEvent("stop-enqueued")
     }
 }
 

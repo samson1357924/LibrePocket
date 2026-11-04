@@ -3488,6 +3488,8 @@ class OpenAiSpeechEngineTest {
     fun shutdown_concurrentDoubleShutdown_releaseNeverBeforeStopEnqueue_noFallback() {
         val testMp = TestMediaPlayer()
         val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp }, prepareTimeoutMs = 5000L)
+        // Stage-B 第四輪 P2-2：事件序記錄需顯式啟用（生產預設關閉）。
+        player.eventLogEnabledForTest = true
         val engine = OpenAiSpeechEngine(player = player)
         val enteredBarrier = CountDownLatch(1)
         val unblockFirst = CountDownLatch(1)
@@ -3606,12 +3608,129 @@ class OpenAiSpeechEngineTest {
             assertTrue("PREPARING release must fail-fast with CancellationException, was: $ex", ex is CancellationException)
             assertTrue("PREPARING release must fail-fast (<2000ms), elapsed=${elapsedMs}ms", elapsedMs < 2000)
             assertFalse("start() must never be called after PREPARING release", testMp.startCalled)
-            // 背景釋放終將完成。注意：mute 已於池關閉前 enqueue，但其鏈式 releaseAsync 可能在
-            // releaseExecutor.shutdown() 後才執行而走 daemon fallback（背景線程，永不在呼叫線程同步執行 native）。
-            // 此為有序關閉的預期背景兜底，不視為失敗；關鍵是 play 已 fail-fast 且無同步阻塞。
+            // 背景釋放終將完成。Stage-B 第四輪 P2-1：mute 已於池關閉前 enqueue，
+            // 其鏈式 release 若在關池後才執行，改由同一 mute worker 內同步釋放，
+            // 不散生未追蹤 daemon threads，故正常關閉零 fallback。
             awaitCondition(timeoutMs = 5000L) { testMp.releaseCalled }
             assertTrue("player must eventually be released", testMp.releaseCalled)
+            assertEquals("normal close must not spawn mute fallback", 0, player.muteFallbackCount.get())
+            assertEquals("normal close must not spawn release fallback", 0, player.releaseFallbackCount.get())
+            assertEquals("normal close must not count muteRejected", 0, player.muteRejectedCount.get())
+            assertEquals("normal close must not count releaseRejected", 0, player.releaseRejectedCount.get())
+            awaitCondition(timeoutMs = 5000L) { player.retainedSessionsForTest() == 0 }
+            assertEquals(0L, player.retainedBytesForTest())
         } finally {
+            try {
+                player.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    // ---- Stage-B 第四輪 P2-1：active mute 阻塞 → release() 返回 → 解除 → 最終釋放零 fallback ----
+    @Test
+    fun androidAudioPlayer_blockedMute_releaseReturnsThenCompletes_zeroFallback() = runBlocking {
+        val muteEntered = CountDownLatch(1)
+        val unblockMute = CountDownLatch(1)
+        class BlockingStopMp : TestMediaPlayer() {
+            override fun stop() {
+                muteEntered.countDown()
+                unblockMute.await(5, TimeUnit.SECONDS)
+                super.stop()
+            }
+        }
+        val testMp = BlockingStopMp()
+        val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp }, prepareTimeoutMs = 5000L)
+        try {
+            var playEx: Throwable? = null
+            val job = launch(Dispatchers.IO) {
+                try {
+                    player.play(byteArrayOf(0x01, 0x02))
+                } catch (e: Throwable) {
+                    playEx = e
+                }
+            }
+            // 等待進入 PREPARING（active session 已佔位）。
+            awaitCondition { testMp.prepareAsyncCalled }
+            assertEquals("active session must hold one reservation", 1, player.retainedSessionsForTest())
+
+            // release() 必須有界返回（僅 fencing + enqueue + 關池，不等待阻塞中的 mute）。
+            val t0 = System.nanoTime()
+            player.release()
+            val releaseElapsedMs = (System.nanoTime() - t0) / 1_000_000
+            assertTrue("release must return while mute blocked (<1000ms), elapsed=${releaseElapsedMs}ms", releaseElapsedMs < 1000)
+            assertTrue("pools must be shutdown after release returns", player.isPoolsShutdownForTest())
+
+            // 已接收的 mute 任務必須已啟動並阻塞於 native（尚未釋放），且未觸發任何 fallback。
+            assertTrue("mute task must have started before unblock", muteEntered.await(5, TimeUnit.SECONDS))
+            // 给 worker 一點時間確認其卡在 stop() 而非已完成釋放。
+            Thread.sleep(200)
+            assertFalse("release must not complete while mute blocked", testMp.releaseCalled)
+            assertEquals("muted close must not spawn mute fallback", 0, player.muteFallbackCount.get())
+            assertEquals("muted close must not spawn release fallback", 0, player.releaseFallbackCount.get())
+            assertEquals("muted close must not count rejected", 0, player.muteRejectedCount.get())
+            assertEquals("muted close must not count releaseRejected", 0, player.releaseRejectedCount.get())
+
+            // 解除阻塞：同一 worker 內同步完成 mute+release，無新線程、可確認收斂。
+            unblockMute.countDown()
+            withTimeout(5000L) {
+                job.join()
+            }
+            assertNotNull("play must be cancelled by release", playEx)
+            assertTrue("play must fail with CancellationException, was $playEx", playEx is CancellationException)
+            awaitCondition(timeoutMs = 5000L) { testMp.stopCalled }
+            assertTrue("muteNow must eventually run", testMp.stopCalled)
+            awaitCondition(timeoutMs = 5000L) { testMp.releaseCalled }
+            assertTrue("player must eventually be released after unblock", testMp.releaseCalled)
+            awaitCondition(timeoutMs = 5000L) { player.retainedSessionsForTest() == 0 }
+            assertEquals(0L, player.retainedBytesForTest())
+            assertEquals("final mute fallback must be 0", 0, player.muteFallbackCount.get())
+            assertEquals("final release fallback must be 0", 0, player.releaseFallbackCount.get())
+            assertEquals("final muteRejected must be 0", 0, player.muteRejectedCount.get())
+            assertEquals("final releaseRejected must be 0", 0, player.releaseRejectedCount.get())
+        } finally {
+            unblockMute.countDown()
+            try {
+                player.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    // ---- Stage-B 第四輪 P2-2：大量 idle stop() 記憶體有界 ----
+    @Test
+    fun androidAudioPlayer_manyIdleStops_boundedMemory() {
+        val player = AndroidAudioPlayer(mediaPlayerFactory = { TestMediaPlayer() }, prepareTimeoutMs = 5000L)
+        try {
+            // 生產預設：事件記錄關閉，大量 idle stop() 零 append、零增長。
+            assertFalse("event log must default to disabled", player.eventLogEnabledForTest)
+            repeat(2000) {
+                player.stop()
+            }
+            assertEquals("disabled log must stay empty after 2000 idle stops", 0, player.testEventLog.size)
+            assertEquals(0, player.retainedSessionsForTest())
+            assertEquals(0L, player.retainedBytesForTest())
+            assertEquals(0, player.muteFallbackCount.get())
+            assertEquals(0, player.releaseFallbackCount.get())
+
+            // 啟用後亦有界：500 次 stop（1000 事件嘗試）必須被 ring 截斷於上界。
+            player.eventLogEnabledForTest = true
+            repeat(500) {
+                player.stop()
+            }
+            val size = try {
+                player.testEventLog.size
+            } catch (_: Throwable) {
+                -1
+            }
+            assertTrue("enabled log must be bounded <=${AndroidAudioPlayer.MAX_EVENT_LOG}, was $size", size in 1..AndroidAudioPlayer.MAX_EVENT_LOG)
+            assertEquals(0, player.retainedSessionsForTest())
+            assertEquals(0L, player.retainedBytesForTest())
+        } finally {
+            try {
+                player.eventLogEnabledForTest = false
+            } catch (_: Throwable) {
+            }
             try {
                 player.release()
             } catch (_: Throwable) {

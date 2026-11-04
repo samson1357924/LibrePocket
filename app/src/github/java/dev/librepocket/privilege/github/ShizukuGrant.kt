@@ -40,6 +40,16 @@ internal val SHIZUKU_GRANT_SERVICE_VERSION = intPreferencesKey("shizuku_grant_se
  *   僅留存稽核，不參與有效性判定，授權只綁 endpoint 身分＋設定版本；
  * - 純策略（[ShizukuGrantPolicy]）零 Android 依賴，JVM 可測；
  *   DataStore 薄封裝（[ShizukuGrantStore]）只做存取，判定全委派策略。
+ *
+ * R1-B 接線說明（Issue #136 R1-B，owner P1-3＋PocketGuard WARN grant）：
+ * Store 隔離測試證 policy（見 `ShizukuGrantTest`：綁定 endpoint/revision、
+ * 撤銷即失效、fail-closed）；runner 強制由 runner 測試證
+ * （見 runner grant 測試：`grantCheck=Invalid` 即 `Denied(NOT_WHITELISTED)` 且
+ * 零 spawn，`grantCheck` 抛異常同樣 fail-closed 零 spawn，跨 call 翻轉同實例即拒）；
+ * 全鏈路（endpoint 切換/revision 推進/grant clear→已建 runner 拒絕→零 spawn）
+ * 見 runner grant 測試，不在本檔重證。
+ * [dev.librepocket.shell.PrivilegeBridgeState.revoke] 與本 Store 的統一路徑為
+ * B3 職責（本檔不跨域調 bridge 狀態，避免 main/github 源集耦合）。
  */
 data class ShizukuGrant(
     val providerId: String,

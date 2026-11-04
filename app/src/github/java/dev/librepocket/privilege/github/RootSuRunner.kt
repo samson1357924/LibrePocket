@@ -13,7 +13,8 @@ import java.io.File
 /**
  * Root 提權執行器（S3，BACKLOG D09，矩陣 §3，僅 github 風味，極客可選）。
  *
- * 執行順序：[ShellPolicy.validateElevated] 先行 → 原因碼 → 可信 su 解析
+ * 執行順序：[ShellPolicy.validateElevated] 先行 → 原因碼 → grant 門
+ * （[grantCheck] 每次呼叫新鮮求值，見 R1-B 段）→ 可信 su 解析
  * （[suBinary] 非空直接用（仍須 [SuBinaryResolver.isTrusted]）；為空才走
  * [SuBinaryResolver.resolve] 以 [suExists] 做存在性檢查）→ 配額 →
  * `su -c` argv 直達 → 超時殺（盡力整組；Android 多數退化為關流+單殺，
@@ -47,6 +48,24 @@ import java.io.File
  * 候選 su 路徑（測試／呼叫方可釘死，仍須過可信判定），[suExists] 為解析時
  * 的存在性檢查（預設走檔案系統，單測可注入假映射）；前者管「用哪條」，
  * 後者管「哪條存在」，正交不合併。
+ *
+ * R1-B grant 接線（Issue #136 R1-B，owner P1-3＋PocketGuard WARN grant）：
+ * 每次 [runBinary] 呼叫新鮮求值 [grantCheck]（構造時只存 supplier，不快取結果；
+ * 同一實例跨 call 翻轉即拒，見 runner grant 測試的 flipsAcrossCalls）。
+ * 產品 B3 必須供給 `{ store.check(freshProviderId, freshRevision) }`
+ *（blocking 包裝由 B3 決定，runner 非 suspend 故不能直調 suspend DataStore）；
+ * [GrantCheck.Invalid] 一律 `Denied(NOT_WHITELISTED, reason)` 且零 spawn，
+ * [grantCheck] 抛異常同樣 fail-closed `Denied(NOT_WHITELISTED)` 且零 spawn。
+ * [bridgeGranted] 構造固定值為已知限制（endpoint 切換/revision 推進/grant clear
+ * 無法使已建 runner 失效）；B3 dispatcher 應以 [grantCheck] 為準，不以
+ * [bridgeGranted] 做撤銷判定。
+ *
+ * R1-A 雙軌容量（Issue #136 R1-A，owner P1-2）：
+ * 截圖二進位（`screencap -p` / `cat /dev/graphics/fb0`，argv 精確匹配）走
+ * 8M 軌（[ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES] 截斷＋
+ * [ElevatedProcessIo.BINARY_SCREENSHOT_HARD_CAP_BYTES] 硬讀取，OOM 上界每流 8M）；
+ * 其餘通用命令走舊 64K/512K 軌（[ShellPolicy.MAX_OUTPUT_BYTES]／
+ * [ShellPolicy.HARD_READ_CAP_BYTES]）。[BinaryElevatedRunner] 介面簽名不變。
  */
 class RootSuRunner(
     private val privateRoot: String? = null,
@@ -59,6 +78,7 @@ class RootSuRunner(
     private val suExists: (String) -> Boolean = { path -> File(path).exists() },
     private val killer: (Process) -> Unit = { ElevatedProcessKiller.killTree(it) },
     private val isCancelled: () -> Boolean = { Thread.currentThread().isInterrupted },
+    private val grantCheck: () -> GrantCheck = { GrantCheck.Valid },
 ) : BinaryElevatedRunner {
 
     override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult =
@@ -79,6 +99,21 @@ class RootSuRunner(
         }
         if (request.reasonCode.isBlank()) {
             return ElevatedRunnerCommon.missingReasonCode()
+        }
+        // R1-B：grant 新鮮求值（validate→reasonCode→grantCheck→su 門→quota→spawn）。
+        // Invalid 即 Denied(NOT_WHITELISTED, reason) 且零 spawn；抛異常同樣
+        // fail-closed Denied 且零 spawn（不吞入 quota，不碰 su 解析/spawn）。
+        val grant = try {
+            grantCheck()
+        } catch (_: Exception) {
+            return ElevatedBinaryResult.Denied(
+                ShellDeny.NOT_WHITELISTED,
+                "grant check failed (fail-closed, no spawn)",
+            )
+        }
+        when (grant) {
+            is GrantCheck.Valid -> Unit
+            is GrantCheck.Invalid -> return ElevatedBinaryResult.Denied(ShellDeny.NOT_WHITELISTED, grant.reason)
         }
         val rawSu = suBinary ?: SuBinaryResolver.resolve(suExists)
         if (rawSu == null) {
@@ -113,9 +148,22 @@ class RootSuRunner(
             val redacted = Redactor.redactError(e.message ?: e.javaClass.simpleName)
             return ElevatedBinaryResult.Failed("su spawn failed: $redacted")
         }
-        val raw = ElevatedProcessIo.drain(process, timeoutMs, killer, isCancelled)
-        val out = ShellPolicy.truncate(raw.stdout)
-        val err = ShellPolicy.truncate(raw.stderr)
+        // R1-A 雙軌：截圖 argv 精確匹配即 8M 軌，其餘走舊 64K/512K。
+        val isScreenshot = request.argv == listOf("screencap", "-p") ||
+            request.argv == listOf("cat", "/dev/graphics/fb0")
+        val hardCapBytes = if (isScreenshot) {
+            ElevatedProcessIo.BINARY_SCREENSHOT_HARD_CAP_BYTES
+        } else {
+            ShellPolicy.HARD_READ_CAP_BYTES
+        }
+        val maxBytes = if (isScreenshot) {
+            ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES
+        } else {
+            ShellPolicy.MAX_OUTPUT_BYTES
+        }
+        val raw = ElevatedProcessIo.drain(process, timeoutMs, killer, isCancelled, hardCapBytes)
+        val out = ShellPolicy.truncate(raw.stdout, maxBytes)
+        val err = ShellPolicy.truncate(raw.stderr, maxBytes)
         val truncated = out.truncated || err.truncated || raw.truncated
         if (raw.timedOut) {
             return ElevatedBinaryResult.TimedOut(

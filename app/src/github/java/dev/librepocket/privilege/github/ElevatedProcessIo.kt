@@ -26,8 +26,25 @@ import java.util.concurrent.TimeUnit
  *
  * P2-B 抽檔（行為零變更）：原內嵌於 `ShizukuShellRunner.kt`，搬至本檔；
  * [ShizukuShellRunner]/[RootSuRunner] 同包直接引用，免 import。
+ *
+ * R1-A 雙軌容量（Issue #136 R1-A，owner P1-2）：
+ * - 通用命令：截斷標記沿用 [ShellPolicy.MAX_OUTPUT_BYTES]（64K），硬讀取上限
+ *   沿用 [ShellPolicy.HARD_READ_CAP_BYTES]（512K），OOM 有界（每流 512K）；
+ * - 截圖二進位（`screencap -p` / `cat /dev/graphics/fb0`）：截斷上限
+ *   [BINARY_SCREENSHOT_MAX_BYTES]（8M），硬讀取上限
+ *   [BINARY_SCREENSHOT_HARD_CAP_BYTES]（8M），OOM 有界（每流 8M）；
+ * - 雙軌由各 Runner 以 argv 精確匹配判定（見兩 Runner 的 `isScreenshot`），
+ *   本檔只提供可選參數 `hardCapBytes`（預設 512K，截圖傳 8M）與截斷常數，
+ *   不做 argv 判定；[Drained] 結構不變（仍為 stdout/stderr/exitCode/
+ *   timedOut/truncated，`truncated` 另含硬上限溢出標記，見 [CappedPipe]）。
  */
 internal object ElevatedProcessIo {
+    /** R1-A 截圖二進位容量：`screencap -p` / `cat /dev/graphics/fb0` 的截斷上限（8M）。 */
+    const val BINARY_SCREENSHOT_MAX_BYTES: Int = 8 * 1024 * 1024
+
+    /** R1-A 截圖二進位硬讀取上限（8M，每流 OOM 上界；溢出經 [Drained.truncated] 帶出）。 */
+    const val BINARY_SCREENSHOT_HARD_CAP_BYTES: Int = 8 * 1024 * 1024
+
     /** P1-B magic number 抽常數（行為不變）：輪詢切片 / gobbler 有界 join / 成功路徑放寬 join / 殺後等待 / 複製緩衝。 */
     private const val POLL_SLICE_MS = 50L
     private const val GOBBLER_JOIN_MS = 5_000L
@@ -40,26 +57,46 @@ internal object ElevatedProcessIo {
         val stderr: ByteArray,
         val exitCode: Int,
         val timedOut: Boolean,
-        /** gobbler 有界 join 未完成（部分讀）：呼叫方須併入 truncated，絕不靜默短讀不標。 */
+        /**
+         * gobbler 有界 join 未完成（部分讀）：呼叫方須併入 truncated，絕不靜默短讀不標。
+         * R1-A：另含硬上限溢出（任一流丟棄即 true，見 [CappedPipe.didOverflow]），
+         * 截圖 8M==8M 時靠此位區分恰上限通過與超限丟棄。
+         */
         val truncated: Boolean = false,
     )
 
-    fun drain(process: Process, timeoutMs: Long): Drained =
-        drain(process, timeoutMs, { ElevatedProcessKiller.killTree(it) }, { Thread.currentThread().isInterrupted })
+    fun drain(
+        process: Process,
+        timeoutMs: Long,
+        hardCapBytes: Int = ShellPolicy.HARD_READ_CAP_BYTES,
+    ): Drained =
+        drain(
+            process,
+            timeoutMs,
+            { ElevatedProcessKiller.killTree(it) },
+            { Thread.currentThread().isInterrupted },
+            hardCapBytes,
+        )
 
+    /**
+     * R1-A 雙軌：`hardCapBytes` 預設 [ShellPolicy.HARD_READ_CAP_BYTES]（512K，通用命令）；
+     * 截圖二進位傳 [BINARY_SCREENSHOT_HARD_CAP_BYTES]（8M）。[Drained] 結構不變，
+     * `truncated` 含 join 未完成或硬上限溢出（任一流丟棄即 true，絕不靜默短讀不標）。
+     */
     fun drain(
         process: Process,
         timeoutMs: Long,
         killer: (Process) -> Unit,
         isCancelled: () -> Boolean,
+        hardCapBytes: Int = ShellPolicy.HARD_READ_CAP_BYTES,
     ): Drained {
         // P1-B：spawn 成功後立即關子進程 stdin（子進程 stdin EOF）：等 stdin EOF 的
         // 子進程（如 cat）不再假性 TimedOut。killer 內已關流，此處縱深再關一次。
         // 約束：本 drain 為無 stdin 模式（起手即關），未來需寫 stdin 必須另開
         // API，不得復用本函數（復用會與起手關流競態，並改變 EOF 語義）。
         runCatching { process.outputStream.close() }
-        val out = CappedPipe()
-        val err = CappedPipe()
+        val out = CappedPipe(hardCapBytes)
+        val err = CappedPipe(hardCapBytes)
         val tOut = Thread({ copyCapped(process.inputStream, out) }, "elevated-stdout").also {
             it.isDaemon = true
             it.start()
@@ -150,21 +187,32 @@ internal object ElevatedProcessIo {
             stderr = err.bytes(),
             exitCode = if (finished) runCatching { process.exitValue() }.getOrDefault(-1) else -1,
             timedOut = !finished,
-            truncated = joinIncomplete,
+            // R1-A：join 未完成或任一流硬上限溢出（>hardCapBytes 丟棄）即 truncated；
+            // 通用 512K 溢出本就經 64K truncate 標記，此處 OR 不改其 verdict；
+            // 截圖 8M==8M 時需此位區分「恰 8M 通過」與「>8M 丟棄」（後者 truncate(8M,8M)
+            // 無法檢出，故必須由溢出位帶出，否則 >8M 會誤判為完整幀）。
+            truncated = joinIncomplete || out.didOverflow() || err.didOverflow(),
         )
     }
 
-    private class CappedPipe {
+    private class CappedPipe(private val hardCapBytes: Int) {
         private val sink = ByteArrayOutputStream()
+        @Volatile private var overflowed = false
         fun write(buf: ByteArray, n: Int) {
             synchronized(sink) {
-                val room = ShellPolicy.HARD_READ_CAP_BYTES - sink.size()
-                if (room <= 0) return
+                val room = hardCapBytes - sink.size()
+                if (room <= 0) {
+                    overflowed = true
+                    return
+                }
+                if (n > room) overflowed = true
                 sink.write(buf, 0, minOf(n, room))
             }
         }
         /** 是否已達硬上限（P1-B review：僅觀測/斷言用；cap 強制由 write 內丟棄承擔）。 */
-        fun isFull(): Boolean = synchronized(sink) { sink.size() >= ShellPolicy.HARD_READ_CAP_BYTES }
+        fun isFull(): Boolean = synchronized(sink) { sink.size() >= hardCapBytes }
+        /** 硬上限溢出（丟棄過任一位元組）：drain 經 [Drained.truncated] 帶出，不靜默短讀。 */
+        fun didOverflow(): Boolean = overflowed
         fun bytes(): ByteArray = synchronized(sink) { sink.toByteArray() }
     }
 
@@ -179,7 +227,8 @@ internal object ElevatedProcessIo {
                     // P1-B review：超標後仍繼續讀丟棄，絕不關流（省 CPU 的優化撤回，
                     // 正確性優先）。提前關讀端會致寫端 EPIPE/SIGPIPE，使本可
                     // exit 0 + truncated 的成功改寫為 141 轉 Failed。
-                    // OOM 防護由 write() 內 HARD_READ_CAP 丟棄超額承擔，語義不變。
+                    // OOM 防護由 write() 內 hardCapBytes 丟棄超額承擔，語義不變
+                    //（通用 512K／截圖 8M，見 drain 的 hardCapBytes）。
                     // （此分支無動作，僅留檢查點明語義；讀丟棄經由下輪 read 繼續。）
                 }
             }

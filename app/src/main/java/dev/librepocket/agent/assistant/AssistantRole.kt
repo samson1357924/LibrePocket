@@ -1,5 +1,6 @@
 package dev.librepocket.agent.assistant
 
+import android.content.Context
 import android.content.Intent
 import android.provider.Settings
 
@@ -8,7 +9,7 @@ import android.provider.Settings
  *
  * - 本檔只含純 Kotlin／平台無關決策（快照 → 決策／原因碼），不直接碰
  *   [android.app.role.RoleManager]，生產接線見 [AssistantRoleUi]，
- *   測試全部用 fake 快照（JVM 單測，無 Robolectric）。
+ *   純邏輯 JVM 單測為主，intent 契約另見 Robolectric。
  * - C1 不新增任何權限：`isRoleAvailable`／`isRoleHeld`／
  *   `createRequestRoleIntent` 皆為同步呼叫；失敗一律 fallback
  *   [Settings.ACTION_VOICE_INPUT_SETTINGS]，fail-closed，不靜默退回。
@@ -54,14 +55,27 @@ object AssistantReasonCode {
 }
 
 /**
- * 撤銷偵測（純函數）：曾經授予（stored == GRANTED）但重讀快照已非持有，
- * 視為角色被撤銷，覆寫為 [AssistantReasonCode.REVOKED]。
+ * 雙向調和（純函數）：快照持有態優先於一切原因碼。
+ *
+ * - 若 `snapshot.roleHeld == true`，直接回 null（清除原因碼）：
+ *   頭部已表達持有態，原因區不再重複顯示（避免 DENIED＋held 矛盾：
+ *   頭部顯示已持有、原因顯示被拒；亦避免 GRANTED＋held 重複文案：
+ *   held 頭部與 GRANTED 原因完全同字串）。
+ * - 否則若曾經授予（stored == GRANTED）但重讀快照已非持有，
+ *   視為角色被撤銷，覆寫為 [AssistantReasonCode.REVOKED]。
+ * - 其餘原樣 passthrough（含 null 與 DENIED／UNSUPPORTED／REQUEST_FAILED／REVOKED）。
+ *
+ * 已知 GRANTED 競態：`RESULT_OK` 後系統未即時落盤時，重讀快照仍非持有會
+ * 短暫顯示 REVOKED；該 REVOKED sticky 到下次要求／結果回調（本檔與
+ * [AssistantRoleUi] 均無 `ON_RESUME` 監聽，Phase 2 補 resume 重讀／防抖）。
  */
 fun effectiveAssistantReason(
     stored: String?,
     snapshot: AssistantRoleSnapshot,
 ): String? =
-    if (stored == AssistantReasonCode.GRANTED && !snapshot.roleHeld) {
+    if (snapshot.roleHeld) {
+        null
+    } else if (stored == AssistantReasonCode.GRANTED) {
         AssistantReasonCode.REVOKED
     } else {
         stored
@@ -89,8 +103,32 @@ fun assistantReasonText(code: String): String =
  * `LibreVoiceInteractionSession.onShow` 在此基礎上掛 MainActivity component
  * 後經 `startVoiceActivity` 發出；onShow 本身即使用者手勢（長按首頁／手勢），
  * EntryGate 以手勢放行，無背景啟動濫用。Robolectric 測 action 斷言。
+ *
+ * 警告：此無參 overload 為隱式 Intent，不可直接 `startActivity`（會劫持到
+ * 任意可處理 `ACTION_ASSIST` 的應用）。僅供 session 接線與測試斷言；
+ * 生產喚起請用有參 overload [assistantVoiceIntent(android.content.Context)]
+ *（限包 implicit，非真 explicit，見該 overload KDoc）。
  */
-fun assistantVoiceIntent(): Intent = Intent(Intent.ACTION_ASSIST)
+internal fun assistantVoiceIntent(): Intent = Intent(Intent.ACTION_ASSIST)
 
-/** C1b fallback：要求失敗／被拒／OEM 不支援時改開系統語音輸入設定。 */
-fun assistantFallbackIntent(): Intent = Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
+/**
+ * 限包 implicit 喚起入口（非真 explicit）：以呼叫方包名限定收件者，降低隱式
+ * `ACTION_ASSIST` 被第三方助理應用劫持的風險；但 `setPackage` 仍屬 implicit
+ * 解析，並非 `setClass`／`setComponent` 的真 explicit。Phase 2 session 將在
+ * 此基礎上再 `setClass` 轉真 explicit。
+ *
+ * 有參版契約由 Phase 4 Robolectric 覆蓋（純 JVM 無 context，本 phase 不強加測試）。
+ */
+fun assistantVoiceIntent(context: Context): Intent =
+    Intent(Intent.ACTION_ASSIST).setPackage(context.packageName)
+
+/**
+ * C1b fallback：要求失敗／被拒／OEM 不支援時改開系統語音輸入設定。
+ *
+ * 不加 [Intent.FLAG_ACTIVITY_NEW_TASK]：對 Activity-context 加 NEW_TASK 會
+ * 改變 task 語義。flag 責任交給調用方 Phase 2（`openFallback` 內
+ * `if (context !is Activity) addFlags(FLAG_ACTIVITY_NEW_TASK)`）。
+ * Flag 斷言留給 Phase 4 Robolectric。
+ */
+fun assistantFallbackIntent(): Intent =
+    Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)

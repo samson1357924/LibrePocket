@@ -344,4 +344,60 @@ class AssistantRoleTest {
             ),
         )
     }
+
+    @Test
+    fun givenRequestFailedWithEverHeld_whenNotHeld_thenRequestFailedPassthrough() {
+        // 新鮮 REQUEST_FAILED 不被陳舊 everHeld 覆寫：請求失敗優先於持有痕跡。
+        val snapshot = AssistantRoleSnapshot(roleAvailable = true, roleHeld = false)
+        assertEquals(
+            AssistantReasonCode.REQUEST_FAILED,
+            effectiveAssistantReason(
+                stored = AssistantReasonCode.REQUEST_FAILED,
+                snapshot = snapshot,
+                everHeld = true,
+                justGranted = false,
+            ),
+        )
+    }
+
+    @Test
+    fun givenGrantedWithEverHeld_whenNotHeld_thenReportsRevoked() {
+        // 四參版：stored GRANTED＋曾持有但當前非持有 → 撤銷（GRANTED 覆寫分支
+        // 優先於 everHeld 分支，everHeld 不改變此判定）。
+        listOf(
+            AssistantRoleSnapshot(roleAvailable = true, roleHeld = false),
+            AssistantRoleSnapshot(roleAvailable = false, roleHeld = false),
+        ).forEach { snapshot ->
+            assertEquals(
+                "GRANTED+everHeld 非持有必須判 REVOKED（avail=${snapshot.roleAvailable}）",
+                AssistantReasonCode.REVOKED,
+                effectiveAssistantReason(
+                    stored = AssistantReasonCode.GRANTED,
+                    snapshot = snapshot,
+                    everHeld = true,
+                    justGranted = false,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun givenNullWithEverHeld_whenHeld_thenStaysNull() {
+        // 四參版：stored null＋held（含 everHeld sticky）→ 維持 null，
+        // 不憑空產生原因碼。
+        listOf(
+            AssistantRoleSnapshot(roleAvailable = true, roleHeld = true),
+            AssistantRoleSnapshot(roleAvailable = false, roleHeld = true),
+        ).forEach { snapshot ->
+            assertNull(
+                "null+held 必須維持 null（avail=${snapshot.roleAvailable}）",
+                effectiveAssistantReason(
+                    stored = null,
+                    snapshot = snapshot,
+                    everHeld = true,
+                    justGranted = false,
+                ),
+            )
+        }
+    }
 }

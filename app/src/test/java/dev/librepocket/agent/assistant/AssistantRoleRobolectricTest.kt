@@ -117,4 +117,32 @@ class AssistantRoleRobolectricTest {
             found.single().serviceInfo.name,
         )
     }
+
+    /**
+     * Stage 3 :voice process 斷言：三 service 皆跑在獨立 ":voice" process（見 main
+     * manifest；manifest 寫相對名 ":voice"，讀出為 "<package>:voice"，故斷言
+     * endWith ":voice"）。Robolectric 讀 serviceInfo.processName；若 Robolectric
+     * 不解析該欄位（null），此測即紅，屆時改跳過並註明——先不斷言跳過，直接驗證。
+     */
+    @Test
+    fun manifest_voiceServices_runInVoiceProcess() {
+        val pm = ApplicationProvider.getApplicationContext<Context>().packageManager
+        val actions = listOf(
+            "android.service.voice.VoiceInteractionService",
+            "android.service.voice.VoiceInteractionSessionService",
+            "android.speech.RecognitionService",
+        )
+        actions.forEach { action ->
+            val found = pm.queryIntentServices(
+                Intent(action),
+                PackageManager.MATCH_ALL,
+            )
+            assertEquals("$action 應恰解析一個 service", 1, found.size)
+            val processName: String? = found.single().serviceInfo.processName
+            assertTrue(
+                "$action process 應為 :voice（實際=$processName）",
+                processName == ":voice" || (processName != null && processName.endsWith(":voice")),
+            )
+        }
+    }
 }

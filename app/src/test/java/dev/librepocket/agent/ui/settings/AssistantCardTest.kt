@@ -123,10 +123,18 @@ class AssistantCardTest {
 
     @Test
     fun unsupported_showsUnsupportedState() {
-        setSettings(AssistantSettingsState(roleHeld = false, roleAvailable = false))
+        var requests = 0
+        setSettings(
+            AssistantSettingsState(roleHeld = false, roleAvailable = false),
+            onRequest = { requests++ },
+        )
+        // 頭部不支援文案仍顯示（Stage 2 review #3：主按鈕改為 enabled「前往語音輸入設定」，
+        // 點擊仍走 onRequestAssistantRole → request() UnsupportedFallback 分支）。
         composeRule.onNodeWithText("此裝置不支援系統助理角色，可改用語音輸入設定。")
             .performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithText("設為預設助理").performScrollTo().assertIsNotEnabled()
+        composeRule.onNodeWithText("前往語音輸入設定").performScrollTo().assertIsEnabled()
+        composeRule.onNodeWithText("前往語音輸入設定").performScrollTo().performClick()
+        assertEquals(1, requests)
     }
 
     /** C4：可要求閒置態顯示「尚未設為…」頭部，請求 enabled，且無原因行。 */
@@ -223,6 +231,10 @@ class AssistantCardTest {
         composeRule.onAllNodesWithText(heldText).assertCountEquals(1)
         composeRule.onAllNodesWithText(heldText)[0].performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithText("設為預設助理").performScrollTo().assertIsNotEnabled()
+        // held 下取消指引恆顯示（取消須走系統設定，見 SettingsScreen B held 指引）。
+        composeRule.onNodeWithTag("assistantCancelHint")
+            .performScrollTo().assertIsDisplayed()
+            .assertTextEquals("如需取消，請至系統設定 → 預設應用程式")
     }
 
     /** C9：held 下 fallback 恆可達（點一次回調一次）。 */

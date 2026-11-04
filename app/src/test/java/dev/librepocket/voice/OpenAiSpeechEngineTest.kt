@@ -2982,4 +2982,67 @@ class OpenAiSpeechEngineTest {
             engine.epochClaimBarrierForTest = null
         }
     }
+
+    // ---- Stage-A P1/BLOCK-1: prepare timeout 僅涵蓋 PREPARING，PLAYING 不被誤殺 ----
+
+    @Test
+    fun androidAudioPlayer_preparedPlaybackExceedingPrepareDeadline_isNotKilled() = runBlocking {
+        // 縮短 timeout seam（200ms）決定性重現：onPrepared 成功後即使播放超過 deadline，
+        // 仍不被 detach/TimeoutException/release，直到真實 onCompletion 才正常結束。
+        val testMp = TestMediaPlayer()
+        val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp }, prepareTimeoutMs = 200L)
+        try {
+            val job = async(Dispatchers.IO) {
+                player.play(byteArrayOf(0x01, 0x02))
+            }
+            awaitCondition { testMp.preparedListener != null }
+            testMp.preparedListener!!.onPrepared(testMp)
+            awaitCondition { testMp.startCalled }
+            assertTrue("start() must be called for active onPrepared", testMp.startCalled)
+
+            // 超過 prepare deadline（200ms）後仍在 PLAYING：不得被超時截斷。
+            delay(600)
+            assertTrue("play must still be active after prepare deadline when PLAYING", job.isActive)
+            assertFalse("player must NOT be released while PLAYING past deadline", testMp.releaseCalled)
+
+            // 真實 onCompletion 才正常結束。
+            testMp.completionListener!!.onCompletion(testMp)
+            job.await()
+            assertTrue("Job must complete normally on completion", job.isCompleted && !job.isCancelled)
+            awaitCondition(timeoutMs = 5000L) { testMp.releaseCalled }
+            assertTrue("Player must be released after completion", testMp.releaseCalled)
+        } finally {
+            player.release()
+        }
+    }
+
+    @Test
+    fun androidAudioPlayer_neverPrepared_stillTimesOut() = runBlocking {
+        // 對照組：永不 onPrepared 時仍確實 timeout（PREPARING 逾時語義保留）。
+        val testMp = TestMediaPlayer()
+        val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp }, prepareTimeoutMs = 200L)
+        try {
+            val deferred = async(Dispatchers.IO) {
+                try {
+                    player.play(byteArrayOf(0x01, 0x02))
+                    null
+                } catch (e: Exception) {
+                    e
+                }
+            }
+            // 永不觸發 onPrepared，等待超時（200ms + 調度餘裕）。
+            val exception = deferred.await()
+            assertNotNull("Expected TimeoutException when never prepared", exception)
+            assertTrue(
+                "Exception must be TimeoutException, was: $exception",
+                exception is java.util.concurrent.TimeoutException,
+            )
+            assertFalse("Timeout must NOT be CancellationException", exception is CancellationException)
+            awaitCondition(timeoutMs = 5000L) { testMp.releaseCalled }
+            assertTrue("Player must be released on prepare timeout", testMp.releaseCalled)
+            assertFalse("start() must not be called when never prepared", testMp.startCalled)
+        } finally {
+            player.release()
+        }
+    }
 }

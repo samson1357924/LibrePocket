@@ -104,15 +104,22 @@ class ByteArrayMediaDataSource(
  *   時呼叫 MediaPlayer native 阻塞方法（setDataSource/prepareAsync/start/reset/release），避免 AB-BA 死鎖；
  * - 每次 play 以遞增世代（epoch）佔位，native 前後皆以世代柵欄複檢，失格即釋放並取消，遲到回呼永不 start；
  * - [stop] 僅做 detach + cancel（持 [lock] 短臨界），native reset/release 投遞至背景釋放執行緒，呼叫線程永不被 native 阻塞；
- * - prepare 另設 [PREPARE_TIMEOUT_MS] 超時，逾時即 detach + 釋放 + resumeWithException。
+ * - prepare 另設 prepare 超時（預設 [PREPARE_TIMEOUT_MS]，測試可經 [prepareTimeoutMs] 縮短），
+ *   僅涵蓋「尚未 onPrepared」的 PREPARING 階段：onPrepared 成功（epoch 仍 active）即標記已準備並取消計時，
+ *   進入 PLAYING 後不再受 prepare timer 影響；逾時僅在仍為 PREPARING 且 epoch 仍 active 時才 detach + 釋放 + resumeWithException。
  *
  * 採用 [MediaPlayer.prepareAsync] 非同步準備，所有 native 呼叫皆在鎖外執行，確保 [stop] 與新播放能隨時即時中斷。
  */
 class AndroidAudioPlayer(
     private val mediaPlayerFactory: () -> MediaPlayer = { MediaPlayer() },
+    private val prepareTimeoutMs: Long = PREPARE_TIMEOUT_MS,
 ) : AudioPlayer {
     companion object {
-        /** prepare 非同步等待上限（毫秒），逾時視為播放失敗並主動釋放。 */
+        /**
+         * prepare 非同步等待上限（毫秒），僅涵蓋「尚未 onPrepared」的 PREPARING 階段。
+         * onPrepared 成功（epoch 仍 active）即取消計時，進入 PLAYING 後不再受此 timer 影響；
+         * 逾時僅在仍為 PREPARING 且 epoch 仍 active 時才 detach + 釋放 + resumeWithException。
+         */
         const val PREPARE_TIMEOUT_MS = 15_000L
     }
 
@@ -122,6 +129,11 @@ class AndroidAudioPlayer(
     private var activeEpoch: Long = 0L
     private var sessionEpoch: Long = 0L
     private val lock = Any()
+    // 已成功 onPrepared 並進入 PLAYING 的世代集合（以 lock 保護）。
+    // 超時任務僅在 epoch 未標記已準備（仍為 PREPARING）時才允許 detach，避免長音訊播放超過
+    // prepare deadline 被誤殺；同時作為 onPrepared 與超時任務之間的競態柵欄（先標記再 start，
+    // 超時側在同一 lock 下複檢標記，即使 cancel(false) 未能攔下已排程任務也不會截斷 PLAYING）。
+    private val preparedEpochs = mutableSetOf<Long>()
 
     private val releaseExecutor: java.util.concurrent.ExecutorService =
         java.util.concurrent.Executors.newSingleThreadExecutor { r ->
@@ -134,6 +146,7 @@ class AndroidAudioPlayer(
 
     // prepare 超時任務追蹤：epoch -> ScheduledFuture，避免完成後仍持有 player+continuation 15s。
     // 終端路徑（completion/error/start 異常/stop/detach 成功）一律 cancel(false)。
+    // 超時僅涵蓋 PREPARING：onPrepared 成功即標記 preparedEpochs + cancel，PLAYING 不再受 timer 影響。
     private val timeoutFutures = java.util.concurrent.ConcurrentHashMap<Long, java.util.concurrent.ScheduledFuture<*>>()
 
     private fun cancelTimeout(epoch: Long) {
@@ -141,6 +154,32 @@ class AndroidAudioPlayer(
             timeoutFutures.remove(epoch)?.cancel(false)
         } catch (_: Throwable) {
         }
+    }
+
+    private fun markPrepared(epoch: Long) {
+        try {
+            synchronized(lock) { preparedEpochs.add(epoch) }
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun clearPrepared(epoch: Long) {
+        try {
+            synchronized(lock) { preparedEpochs.remove(epoch) }
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun isPrepared(epoch: Long): Boolean =
+        try {
+            synchronized(lock) { preparedEpochs.contains(epoch) }
+        } catch (_: Throwable) {
+            false
+        }
+
+    private fun cancelTimeoutAndClearPrepared(epoch: Long) {
+        cancelTimeout(epoch)
+        clearPrepared(epoch)
     }
 
     /**
@@ -324,9 +363,10 @@ class AndroidAudioPlayer(
 
         // 釋放被取代的舊世代：cancel 原因攜帶 epoch；native 釋放走背景執行緒，不阻塞新播放。
         // 同時取消舊世代的 prepare 超時任務，避免其持有舊 player+continuation 15s。
+        // 舊世代若已進入 PLAYING，其 prepared 標記亦一併清除，避免集合無界增長。
         if (oldDetached.player != null || oldDetached.continuation != null || oldDetached.dataSource != null) {
             tryCancel(oldDetached.continuation, "Superseded by audio play epoch $epoch")
-            cancelTimeout(oldDetached.epoch)
+            cancelTimeoutAndClearPrepared(oldDetached.epoch)
             releaseAsync(oldDetached)
         }
 
@@ -335,7 +375,7 @@ class AndroidAudioPlayer(
                 detachIfActiveLocked(player, epoch)
             }
             if (detached != null) {
-                cancelTimeout(epoch)
+                cancelTimeoutAndClearPrepared(epoch)
                 releaseAsync(detached)
             }
         }
@@ -350,7 +390,7 @@ class AndroidAudioPlayer(
             }
             if (detached != null) {
                 tryCancel(continuation, "Audio play superseded before setDataSource (epoch $epoch)")
-                cancelTimeout(epoch)
+                cancelTimeoutAndClearPrepared(epoch)
                 releaseAsync(detached)
             } else {
                 tryCancel(continuation, "Audio play superseded before setDataSource (epoch $epoch, detached)")
@@ -369,7 +409,7 @@ class AndroidAudioPlayer(
                 // resume 先行，釋放投背景，避免阻塞呼叫線程。
                 // setDataSource 失敗屬播放失敗（非取消），以原例外恢復，避免誤報 CANCELLED。
                 tryResumeException(continuation, e)
-                cancelTimeout(epoch)
+                cancelTimeoutAndClearPrepared(epoch)
                 releaseAsync(detached)
             }
             return@suspendCancellableCoroutine
@@ -381,7 +421,7 @@ class AndroidAudioPlayer(
             }
             if (detached != null) {
                 tryCancel(continuation, "Audio play superseded after setDataSource (epoch $epoch)")
-                cancelTimeout(epoch)
+                cancelTimeoutAndClearPrepared(epoch)
                 releaseAsync(detached)
             } else {
                 tryCancel(continuation, "Audio play superseded after setDataSource (epoch $epoch, detached)")
@@ -395,13 +435,20 @@ class AndroidAudioPlayer(
                     synchronized(lock) { activePlayer === mp && activeEpoch == epoch } && continuation.isActive
                 if (!shouldStart) return@setOnPreparedListener
 
+                // PREPARING -> PLAYING 躍遷：先標記已準備，使併發的超時任務在同一 lock 下可見並跳過，
+                // 即使 cancel(false) 未能攔下已在執行的超時任務也不會誤殺 PLAYING。
+                // 遲到 onPrepared（epoch 已失格）以上述 shouldStart 擋下，永不 start 且不留 timer 洩漏。
+                markPrepared(epoch)
+
                 var startException: Exception? = null
+                var started = false
                 try {
                     // start 前再次柵欄確認，native 本身在鎖外執行
                     val ok =
                         synchronized(lock) { activePlayer === mp && activeEpoch == epoch } && continuation.isActive
                     if (ok) {
                         mp.start()
+                        started = true
                     }
                 } catch (e: Exception) {
                     startException = e
@@ -414,9 +461,19 @@ class AndroidAudioPlayer(
                     if (detached != null) {
                         // resume 先行，釋放投背景，避免在（可能為主線程的）回呼線程阻塞 native。
                         tryResumeException(continuation, startException)
-                        cancelTimeout(epoch)
+                        cancelTimeoutAndClearPrepared(epoch)
                         releaseAsync(detached)
+                    } else {
+                        clearPrepared(epoch)
                     }
+                } else if (!started) {
+                    // 二次柵欄失格（onPrepared 與 stop/取代競態）：未 start，不觸碰 timer 擁有權，
+                    // 僅清除本次標記；detach/cancel/timeout 由勝出的 stop/取代路徑負責。
+                    clearPrepared(epoch)
+                } else {
+                    // 成功進入 PLAYING：prepare 階段結束，立即取消 prepare 計時；
+                    // 此後播放超過原 deadline 不再受 timer 影響，直到真實 onCompletion/onError。
+                    cancelTimeout(epoch)
                 }
             }
             player.setOnCompletionListener {
@@ -426,7 +483,7 @@ class AndroidAudioPlayer(
                 if (detached != null) {
                     // resume 先行，釋放投背景。
                     tryResumeUnit(continuation)
-                    cancelTimeout(epoch)
+                    cancelTimeoutAndClearPrepared(epoch)
                     releaseAsync(detached)
                 }
             }
@@ -440,7 +497,7 @@ class AndroidAudioPlayer(
                         continuation,
                         IOException("MediaPlayer 播放錯誤：what=$what, extra=$extra (epoch $epoch)"),
                     )
-                    cancelTimeout(epoch)
+                    cancelTimeoutAndClearPrepared(epoch)
                     releaseAsync(detached)
                 }
                 true
@@ -451,7 +508,7 @@ class AndroidAudioPlayer(
             }
             if (detached != null) {
                 tryResumeException(continuation, e)
-                cancelTimeout(epoch)
+                cancelTimeoutAndClearPrepared(epoch)
                 releaseAsync(detached)
             }
             return@suspendCancellableCoroutine
@@ -463,7 +520,7 @@ class AndroidAudioPlayer(
             }
             if (detached != null) {
                 tryCancel(continuation, "Audio play superseded before prepareAsync (epoch $epoch)")
-                cancelTimeout(epoch)
+                cancelTimeoutAndClearPrepared(epoch)
                 releaseAsync(detached)
             } else {
                 tryCancel(continuation, "Audio play superseded before prepareAsync (epoch $epoch, detached)")
@@ -480,18 +537,23 @@ class AndroidAudioPlayer(
             }
             if (detached != null) {
                 tryResumeException(continuation, e)
-                cancelTimeout(epoch)
+                cancelTimeoutAndClearPrepared(epoch)
                 releaseAsync(detached)
             }
             return@suspendCancellableCoroutine
         }
 
-        // prepare 超時守衛：逾時即 detach + 釋放 + resumeWithException，不永久懸掛。
-        // ScheduledFuture 保留於 timeoutFutures，終端路徑一律 cancel(false)，避免持有 player+continuation 15s。
+        // prepare 超時守衛：僅涵蓋 PREPARING（尚未 onPrepared）。
+        // onPrepared 成功即 markPrepared + cancel，PLAYING 不再受 timer 影響；超時任務在同一 lock 下
+        // 複檢 prepared 標記，即使與 onPrepared 競態（cancel 未能攔下已在執行的任務）也不誤殺 PLAYING。
+        // ScheduledFuture 保留於 timeoutFutures，終端路徑一律 cancel(false)，避免持有 player+continuation。
         try {
+            val effectiveTimeoutMs = prepareTimeoutMs.coerceAtLeast(1L)
             val future = timeoutScheduler.schedule({
                 val detached = synchronized(lock) {
-                    if (activePlayer === player && activeEpoch == epoch && continuation.isActive) {
+                    if (preparedEpochs.contains(epoch)) {
+                        null
+                    } else if (activePlayer === player && activeEpoch == epoch && continuation.isActive) {
                         detachIfActiveLocked(player, epoch)
                     } else {
                         null
@@ -499,18 +561,21 @@ class AndroidAudioPlayer(
                 }
                 if (detached != null) {
                     timeoutFutures.remove(epoch)
+                    clearPrepared(epoch)
                     // resume 先行，釋放投背景。
                     tryResumeException(
                         continuation,
                         java.util.concurrent.TimeoutException(
-                            "MediaPlayer prepare timed out after $PREPARE_TIMEOUT_MS ms (epoch $epoch)",
+                            "MediaPlayer prepare timed out after $effectiveTimeoutMs ms (epoch $epoch)",
                         ),
                     )
                     releaseAsync(detached)
                 } else {
                     timeoutFutures.remove(epoch)
+                    // 遲到 onPrepared（已失格）或已進入 PLAYING/終端者不做任何事，避免洩漏 timer。
+                    // PLAYING 分支的 prepared 標記由 completion/error/stop 清除，此處不清除以免與其競態。
                 }
-            }, PREPARE_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+            }, effectiveTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
             // 僅當仍為 active 才保留，否則立即取消（已在排程期間被 stop/取代）。
             val stillActive = synchronized(lock) { activePlayer === player && activeEpoch == epoch }
             if (stillActive) {
@@ -535,7 +600,7 @@ class AndroidAudioPlayer(
             d
         }
         tryCancel(detached.continuation, "AndroidAudioPlayer stopped (epoch ${detached.epoch})")
-        cancelTimeout(detached.epoch)
+        cancelTimeoutAndClearPrepared(detached.epoch)
         // native 釋放在背景執行緒，呼叫線程僅做 detach+cancel，有界返回
         releaseAsync(detached)
     }

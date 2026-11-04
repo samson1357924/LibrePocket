@@ -29,6 +29,15 @@ interface WebSearchProvider {
     /** Registry 內唯一（重複 id 在 [WebSearchRegistry] 建構時 fail-fast）。 */
     val id: String
 
+    /**
+     * 快取／in-flight 命名空間（[WebSearchService] 以此切 cache key 與合流 key）。
+     *
+     * 預設為 [id]；具 per-origin 設定（如 baseUrl／endpoint 不同即不同上游）的
+     * provider 必須覆寫，把正規化後的 origin 納入（同源沿用舊命中、異源不再互撞）。
+     * Registry 身份仍以 [id] 為準（同一 registry 內多實例仍 fail-fast，不以此欄區分）。
+     */
+    val cacheNamespace: String get() = id
+
     val capabilities: Set<WebCapability>
 
     /** 可用性探測（缺 key／缺 URL 回 [WebProbe.NotReady]，不拋異常）。 */

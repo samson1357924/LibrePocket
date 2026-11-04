@@ -10,7 +10,8 @@ import java.net.URLEncoder
  *   非官方 endpoint 警語是 D3 設定 UX 的事（見 #138 Scope）。
  * - 連結包在 `//duckduckgo.com/l/?uddg=<urlencode>` 轉址裡，解析時解開；
  *   標題／snippet 去 tag＋HTML unescape；`count` 在 client 端 `take(n)`。
- * - Bot 牆（anomaly／challenge 標記）→ `SUPPLIER_ERROR`；空 body → `BAD_RESPONSE`；
+ * - Bot 牆（anomaly／challenge 標記，含 403 附標記）→ `SUPPLIER_ERROR`；401／無標記
+ *   403 仍 `AUTH`；空 body → `BAD_RESPONSE`；
  *   合法零命中頁 → `Ok(empty)`（與版式漂移無法廉價區分，見實作註記；零命中仍會被快取，
  *   為 Phase 2 有意識決定）。
  * - Ctor 參數順序與 [SearxngSearchProvider] 不同是歷史因素（此處為 httpGet 先）；
@@ -28,6 +29,7 @@ class DdgsSearchProvider(
 
     override val id: String = ID
     override val capabilities: Set<WebCapability> = emptySet()
+    override val cacheNamespace: String get() = "ddgs@" + normalizedEndpoint()
 
     companion object {
         const val ID = "ddgs"
@@ -56,6 +58,7 @@ class DdgsSearchProvider(
             is FetchOut.Fail -> return WebSearchOutcome.Failed(fetched.reason)
             is FetchOut.Resp -> fetched.response
         }
+        if (response.code == 403 && isBotWall(response.body)) return WebSearchOutcome.Failed(WebFailureReason.SUPPLIER_ERROR)
         failureForStatus(response.code)?.let { return WebSearchOutcome.Failed(it) }
         if (response.body.isBlank() || response.body.length > maxBodyChars.coerceAtLeast(1)) {
             return WebSearchOutcome.Failed(WebFailureReason.BAD_RESPONSE)
@@ -65,6 +68,24 @@ class DdgsSearchProvider(
         val clipped = hits.size > n
         val capped = capResultsForModel(hits.take(n))
         return WebSearchOutcome.Ok(capped.results, capped.truncated || clipped)
+    }
+
+    /**
+     * 快取命名空間用的正規化 endpoint（scheme＋host 小寫、path 保大小寫；
+     * 解析失敗回 raw trimmed；尾 `/` 已去；與 Searxng 對稱）。
+     */
+    private fun normalizedEndpoint(): String {
+        val raw = endpoint.trim().trimEnd('/')
+        return try {
+            val uri = java.net.URI(raw)
+            val scheme = uri.scheme?.lowercase() ?: return raw
+            val host = uri.host?.lowercase() ?: return raw
+            val port = if (uri.port != -1) ":${uri.port}" else ""
+            val path = uri.path.orEmpty()
+            "$scheme://$host$port$path"
+        } catch (_: Exception) {
+            raw
+        }
     }
 
     /**

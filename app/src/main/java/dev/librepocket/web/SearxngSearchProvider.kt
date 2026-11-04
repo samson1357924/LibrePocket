@@ -32,6 +32,7 @@ class SearxngSearchProvider(
 
     override val id: String = ID
     override val capabilities: Set<WebCapability> = setOf(WebCapability.REQUIRES_URL)
+    override val cacheNamespace: String get() = "searxng@" + normalizedBase()
 
     companion object {
         const val ID = "searxng"
@@ -66,6 +67,24 @@ class SearxngSearchProvider(
         val clipped = hits.size > n
         val capped = capResultsForModel(hits.take(n))
         return WebSearchOutcome.Ok(capped.results, capped.truncated || clipped)
+    }
+
+    /**
+     * 快取命名空間用的正規化 base（scheme＋host 小寫、path 保大小寫；
+     * 解析失敗回 raw trimmed；尾 `/` 已去）。
+     */
+    private fun normalizedBase(): String {
+        val raw = baseUrl.trim().trimEnd('/')
+        return try {
+            val uri = URI(raw)
+            val scheme = uri.scheme?.lowercase() ?: return raw
+            val host = uri.host?.lowercase() ?: return raw
+            val port = if (uri.port != -1) ":${uri.port}" else ""
+            val path = uri.path.orEmpty()
+            "$scheme://$host$port$path"
+        } catch (_: Exception) {
+            raw
+        }
     }
 
     /**

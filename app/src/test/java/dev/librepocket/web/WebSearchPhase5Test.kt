@@ -655,4 +655,86 @@ class WebSearchPhase5Test {
             assertTrue("cap=$c total=$total", total <= c)
         }
     }
+
+    // ---- Round-2 P2: shared-cache origin isolation / DDGS 403 bot-wall ----
+
+    @Test fun sharedCacheIsolatesOrigins() = runBlocking {
+        val jsonA = """{"results":[{"title":"A","url":"https://a.example/","content":"sa"}]}"""
+        val jsonB = """{"results":[{"title":"B","url":"https://b.example/","content":"sb"}]}"""
+        val httpA = FakeHttp { WebHttpResponse(200, jsonA) }
+        val httpB = FakeHttp { WebHttpResponse(200, jsonB) }
+        val cache = WebSearchCache()
+        val svcA = WebSearchService(SearxngSearchProvider("https://search-a.example", httpA), cache)
+        val svcB = WebSearchService(SearxngSearchProvider("https://search-b.example", httpB), cache)
+        val outA = svcA.search("q", 5) as WebSearchOutcome.Ok
+        assertFalse(outA.cached)
+        assertEquals(1, httpA.calls.get())
+        // Same query+count on a different origin must NOT hit A's entry.
+        val outB = svcB.search("q", 5) as WebSearchOutcome.Ok
+        assertFalse(outB.cached)
+        assertEquals(1, httpB.calls.get())
+        assertTrue(outA.results.single().url.contains("a.example"))
+        assertTrue(outB.results.single().url.contains("b.example"))
+        // Repeat A → cached, no new upstream.
+        val againA = svcA.search("q", 5) as WebSearchOutcome.Ok
+        assertTrue(againA.cached)
+        assertEquals(1, httpA.calls.get())
+        assertEquals(1, httpB.calls.get())
+    }
+
+    @Test fun sameOriginSharesCache() = runBlocking {
+        val json = """{"results":[{"title":"T","url":"https://example.com/","content":"s"}]}"""
+        val httpA = FakeHttp { WebHttpResponse(200, json) }
+        val httpB = FakeHttp { WebHttpResponse(200, json) }
+        val cache = WebSearchCache()
+        val svcA = WebSearchService(SearxngSearchProvider("https://search.example", httpA), cache)
+        val svcB = WebSearchService(SearxngSearchProvider("https://search.example", httpB), cache)
+        svcA.search("q", 5)
+        assertEquals(1, httpA.calls.get())
+        // Same origin → same namespace → second Service hits cache, zero upstream.
+        val second = svcB.search("q", 5) as WebSearchOutcome.Ok
+        assertTrue(second.cached)
+        assertEquals(0, httpB.calls.get())
+    }
+
+    @Test fun ddgs403BotWallIsSupplierError() = runBlocking {
+        for (body in listOf(
+            """<html><body><div class="anomaly-modal">challenge</div></body></html>""",
+            """<html><body><form class="challenge-form">x</form></body></html>""",
+        )) {
+            val out = DdgsSearchProvider(FakeHttp { WebHttpResponse(403, body) }).search("q", 5)
+            assertTrue("body=$body", out is WebSearchOutcome.Failed)
+            assertEquals("body=$body", WebFailureReason.SUPPLIER_ERROR, (out as WebSearchOutcome.Failed).reason)
+            assertTrue("body=$body", out.fallbackAllowed)
+        }
+        // 403 without markers stays AUTH (no fallback).
+        val plain = DdgsSearchProvider(FakeHttp { WebHttpResponse(403, "forbidden") }).search("q", 5)
+        assertTrue(plain is WebSearchOutcome.Failed)
+        assertEquals(WebFailureReason.AUTH, (plain as WebSearchOutcome.Failed).reason)
+        assertFalse(plain.fallbackAllowed)
+    }
+
+    @Test fun searxngNamespaceNormalization() {
+        val fake = WebHttpGet { _, _ -> WebHttpResponse(200, "") }
+        assertEquals(
+            SearxngSearchProvider("https://a", fake).cacheNamespace,
+            SearxngSearchProvider("https://A/", fake).cacheNamespace,
+        )
+        assertTrue(
+            SearxngSearchProvider("https://a/x", fake).cacheNamespace !=
+                SearxngSearchProvider("https://a/X", fake).cacheNamespace,
+        )
+    }
+
+    @Test fun ddgsNamespaceNormalization() {
+        val fake = WebHttpGet { _, _ -> WebHttpResponse(200, "") }
+        assertEquals(
+            DdgsSearchProvider(fake, "https://a").cacheNamespace,
+            DdgsSearchProvider(fake, "https://A/").cacheNamespace,
+        )
+        assertTrue(
+            DdgsSearchProvider(fake, "https://a/x").cacheNamespace !=
+                DdgsSearchProvider(fake, "https://a/X").cacheNamespace,
+        )
+    }
 }

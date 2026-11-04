@@ -15,7 +15,7 @@ import kotlinx.coroutines.withContext
  *
  * Composable／registry-ready：本類自身實作 [WebSearchProvider]，可直接註冊進
  * [WebSearchRegistry]（[id]／[capabilities]／[probe] 全委派給底層 delegate），
- * 也可巢狀包裝（Service 包 Service；快取按 providerId＋query＋count 分 key，
+ * 也可巢狀包裝（Service 包 Service；快取按 cacheNamespace＋query＋count 分 key，
  * 不會互撞，見「快取隔離」）。
  *
  * - 命中快取 → `Ok.copy(cached = true)`，零 upstream。
@@ -36,7 +36,10 @@ import kotlinx.coroutines.withContext
  * - 空 query 直接委派（`Unavailable(EMPTY_QUERY)`），不進 cache／in-flight 表。
  * - 快取隔離：預設每個 Service 持有自有 [WebSearchCache]，不同 provider 的
  *   Service 快取互相隔離；如需跨 provider／跨 Service 共用快取，請顯式傳入
- *   同一 [WebSearchCache] 實例（key 內含 providerId，不會互撞）。
+ *   同一 [WebSearchCache] 實例。共用快取以 [WebSearchProvider.cacheNamespace]
+ *   切 key（非 [WebSearchProvider.id]）：same-scheme same-origin shares hits
+ *  （僅本版本內同源共用；key 已改為 namespaced 格式，不跨版本沿用舊條目）；
+ *   異源（如兩個 Searxng 不同 baseUrl）不再互撞——同 query 各自打一次 upstream。
  * - `inFlight` 未設硬上限：併發同 key 合流、不同 key 各一 deferred，
  *   實際併發受上游 fetch timeouts 收斂；刻意不設上限以免引入等待正確性風險。
  */
@@ -62,7 +65,7 @@ class WebSearchService(
     override suspend fun search(query: String, count: Int): WebSearchOutcome {
         if (query.isBlank()) return delegate.search(query, count)
         val n = WebSearchBudgets.countOf(count)
-        val key = cache.key(delegate.id, query, n)
+        val key = cache.key(delegate.cacheNamespace, query, n)
         while (true) {
             cache.getByKey(key)?.let { return it.copy(cached = true) }
 

@@ -1,5 +1,6 @@
 package dev.librepocket.provider
 
+import java.util.Locale
 import kotlinx.coroutines.flow.Flow
 
 /**
@@ -82,11 +83,11 @@ fun validateBaseUrl(baseUrl: String) {
     } catch (e: java.net.MalformedURLException) {
         throw IllegalArgumentException("PROVIDER_BAD_URL", e)
     }
-    val scheme = url.protocol.lowercase()
+    val scheme = url.protocol.lowercase(Locale.ROOT)
     if (scheme == "https") return
     if (scheme == "http") {
         // URL.getHost() returns bracketed IPv6 ("[::1]"): strip brackets.
-        val host = url.host.lowercase().trim('[', ']')
+        val host = url.host.lowercase(Locale.ROOT).trim('[', ']')
         if (host == "localhost" || host == "127.0.0.1" || host == "::1") return
         // 僅 IPv4 字面精確比對（RFC1918）；域名一律不算 local
         //（如 10.evil.com 不再放行）。不用 DNS，只做字面比對。
@@ -105,9 +106,4 @@ private fun isPrivateIpv4Literal(host: String): Boolean {
     if (parts[0] == 192 && parts[1] == 168) return true // 192.168/16
     if (parts[0] == 172 && parts[1] in 16..31) return true // 172.16/12
     return false
-}
-
-private fun isPrivate172(host: String): Boolean {
-    // 保留相容：精確字面語義（域名如 172.16.evil.com 不再誤判）。
-    return isPrivateIpv4Literal(host)
 }

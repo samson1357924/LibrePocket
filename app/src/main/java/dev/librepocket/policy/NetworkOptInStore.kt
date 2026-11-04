@@ -14,7 +14,8 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  * - `endpointId`：`preset:<presetId>`（內建）或 `custom:<sha256-32hex>`（自訂，
  *   與 `SetupValidation.deriveEndpointId` 同形；此處只驗形狀，不重算）；
  * - `baseUrl` HttpUrl 正規化後字串（scheme／host 小寫、預設埠歸一、去
- *   fragment；寫入與查詢兩側同經 boundOf 歸一；任何重寫即新身份）；
+ *   fragment；尾點保留（視為不同身份，fail-closed，需重確認）；寫入與查詢兩側
+ *   同經 boundOf 歸一；任何重寫即新身份）；
  * - `scheme`＋有效埠（`HttpUrl` 視角，預設埠正規化）；
  * - `policy` tier＋`configRevision`（`EndpointStore` 的單調 revision）。
  *
@@ -175,7 +176,8 @@ class NetworkOptInStore(
       val scheme = url.scheme.lowercase(Locale.ROOT)
       require(scheme == "http" || scheme == "https") { "NETWORK_OPTIN_SCHEME_UNSUPPORTED" }
       // 身份正規化：HttpUrl 已做 scheme 小寫、host 小寫、預設埠正規化；此處再去
-      // fragment（大小寫／尾點／顯式預設埠／fragment 形變歸一同一身份）。
+      // fragment。尾點保留不歸一（HttpUrl 保留尾點，視為不同身份，fail-closed，
+      // 需重確認）；大小寫／顯式預設埠／fragment 形變歸一同一身份。
       // endpointId 仍只驗前綴形狀，不重算 derive（保持 fail-closed）。
       // HttpUrl.port 已含預設埠正規化（http 80／https 443）。
       val normalized = url.newBuilder().fragment(null).build().toString()

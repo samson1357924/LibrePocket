@@ -267,6 +267,82 @@ class ProviderTransportTest {
         }
     }
 
+    @Test
+    fun privateIpRedirectTargetFailsClosedWithoutFollowing() = runBlocking {
+        // Phase4：Location 指私有字面 https://10.1.2.3/ —— transport 0-follow，
+        // 照擋 REDIRECT_BLOCKED，不觸 DNS、不建第二連線、不把 credential 送往 target。
+        val origin = MockWebServer()
+        val target = MockWebServer()
+        origin.start()
+        target.start()
+        try {
+            target.enqueue(MockResponse().setResponseCode(200).setBody("accepted"))
+            origin.enqueue(
+                MockResponse()
+                    .setResponseCode(307)
+                    .addHeader("Location", "https://10.1.2.3/collect"),
+            )
+            val keyCalls = AtomicInteger(0)
+            val base = origin.url("/").toString().trimEnd('/')
+            val cfg = config(ProviderProtocol.CHAT_COMPLETIONS, base)
+            val provider = ChatCompletionsProvider(cfg, { keyCalls.incrementAndGet(); fakeKey.toCharArray() }, null)
+            val events = withTimeout(3_000) { provider.stream(request()).toList() }
+            val failed = events.filterIsInstance<StreamEvent.Failed>().single()
+            assertFalse("private redirect is terminal/fatal", failed.retryable)
+            assertEquals(ProviderFailureCode.NETWORK_POLICY_BLOCKED.name, failed.code)
+            assertTrue("redirect carries REDIRECT_BLOCKED, got: ${failed.message}", failed.message.contains("REDIRECT_BLOCKED"))
+            assertTrue("redirect carries HTTP code, got: ${failed.message}", failed.message.contains("HTTP 307"))
+            assertFalse("redirect failure leaks no target address, got: ${failed.message}", failed.message.contains("10.1.2.3"))
+            // Origin 仍收到已認證首跳（key 只為 origin 讀一次）；target 零請求。
+            assertEquals("key read once for origin only", 1, keyCalls.get())
+            assertEquals(1, origin.requestCount)
+            val received = withContext(Dispatchers.IO) { origin.takeRequest(2, TimeUnit.SECONDS) }
+            assertNotNull("origin request recorded", received)
+            assertEquals("POST", received!!.method)
+            assertEquals(fakeKey, received.getHeader("Authorization")?.removePrefix("Bearer "))
+            assertEquals("redirect target must receive no request", 0, target.requestCount)
+            assertNull("no second request follows the redirect", origin.takeRequest(100, TimeUnit.MILLISECONDS))
+        } finally {
+            origin.shutdown()
+            target.shutdown()
+        }
+    }
+
+    @Test
+    fun privateIpRedirectTargetFailsClosedForListModels() = runBlocking {
+        // Phase4：listModels 同走 0-follow——307 到私有字面即 typed fatal，不建 target 連線。
+        val origin = MockWebServer()
+        val target = MockWebServer()
+        origin.start()
+        target.start()
+        try {
+            target.enqueue(MockResponse().setResponseCode(200).setBody("accepted"))
+            origin.enqueue(
+                MockResponse()
+                    .setResponseCode(307)
+                    .addHeader("Location", "https://10.1.2.3/models"),
+            )
+            val keyCalls = AtomicInteger(0)
+            val base = origin.url("/").toString().trimEnd('/')
+            val cfg = config(ProviderProtocol.CHAT_COMPLETIONS, base)
+            val provider = ChatCompletionsProvider(cfg, { keyCalls.incrementAndGet(); fakeKey.toCharArray() }, null)
+            try {
+                withTimeout(3_000) { provider.listModels() }
+                fail("private redirect must fail closed")
+            } catch (expected: ProviderFailure) {
+                assertFalse(expected.retryable)
+                assertEquals(ProviderFailureCode.NETWORK_POLICY_BLOCKED, expected.code)
+                assertTrue(expected.message.orEmpty().contains("REDIRECT_BLOCKED"))
+                assertFalse(expected.message.orEmpty().contains("10.1.2.3"))
+            }
+            assertEquals(1, origin.requestCount)
+            assertEquals("redirect target must receive no request", 0, target.requestCount)
+        } finally {
+            origin.shutdown()
+            target.shutdown()
+        }
+    }
+
     private class CallSignals {
         val headers = CountDownLatch(1)
         val cancelled = CountDownLatch(1)

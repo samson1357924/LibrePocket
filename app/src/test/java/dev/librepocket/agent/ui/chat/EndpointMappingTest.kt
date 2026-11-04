@@ -66,4 +66,14 @@ class EndpointMappingTest {
         assertEquals("http://localhost", normalizeOrigin("http://localhost:80/path"))
         assertEquals("", normalizeOrigin("invalid-url"))
     }
+
+    @Test
+    fun normalizeOriginBracketsIpv6() {
+        // Phase4：字面 IPv6 補括號才成合法 origin；預設埠照樣省略。
+        assertEquals("http://[::1]:8080", normalizeOrigin("http://[::1]:8080/v1"))
+        assertEquals("http://[::1]", normalizeOrigin("http://[::1]:80/"))
+        assertEquals("https://[fd00::1]", normalizeOrigin("https://[fd00::1]/v1"))
+        assertEquals("https://[fd00::1]:8443", normalizeOrigin("https://[fd00::1]:8443/v1"))
+        assertEquals("", normalizeOrigin("http://[::1"))
+    }
 }

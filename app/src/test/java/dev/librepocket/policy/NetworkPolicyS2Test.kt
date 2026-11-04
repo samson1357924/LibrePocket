@@ -20,16 +20,22 @@ import dev.librepocket.provider.networkPolicyFailure
 import dev.librepocket.provider.pinnedTransportFor
 import dev.librepocket.provider.redirectBlockedFailure
 import dev.librepocket.provider.requireNetworkPolicyAllowed
+import dev.librepocket.provider.streamingFlow
 import java.net.InetAddress
 import java.net.UnknownHostException
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -346,5 +352,140 @@ class NetworkPolicyS2Test {
     val pinned = PinnedNetworkDns.forHost("[::1]", listOf(addr("::1")))
     assertEquals(listOf(addr("::1")), pinned.lookup("::1"))
     assertEquals(listOf(addr("::1")), pinned.pinnedFor("[::1]."))
+  }
+
+  // —— Phase4：confirm 降級／invalidate ——
+
+  @Test fun confirmDowngradeAndInvalidate() {
+    val store = NetworkOptInStore(allowTierUpgrade = true)
+    val endpointId = "preset:openai"
+    val baseUrl = "https://api.openai.com/v1"
+    // 升級確認。
+    store.confirm(endpointId, baseUrl, NetworkEgressPolicy.ALLOW_PRIVATE_DNS, 1L)
+    assertEquals(NetworkEgressPolicy.ALLOW_PRIVATE_DNS, store.confirmedPolicyFor(endpointId, baseUrl, 1L))
+    // 降級確認（HTTPS_ONLY）：舊高 tier 立即失效。
+    store.confirm(endpointId, baseUrl, NetworkEgressPolicy.HTTPS_ONLY, 1L)
+    assertEquals(NetworkEgressPolicy.HTTPS_ONLY, store.confirmedPolicyFor(endpointId, baseUrl, 1L))
+    // 再升級後 invalidate → 回 HTTPS_ONLY。
+    store.confirm(endpointId, baseUrl, NetworkEgressPolicy.ALLOW_PRIVATE_DNS, 1L)
+    assertEquals(NetworkEgressPolicy.ALLOW_PRIVATE_DNS, store.confirmedPolicyFor(endpointId, baseUrl, 1L))
+    store.invalidate(endpointId)
+    assertEquals(NetworkEgressPolicy.HTTPS_ONLY, store.confirmedPolicyFor(endpointId, baseUrl, 1L))
+    // 不存在亦成功（冪等）。
+    store.invalidate(endpointId)
+    assertEquals(NetworkEgressPolicy.HTTPS_ONLY, store.confirmedPolicyFor(endpointId, baseUrl, 1L))
+  }
+
+  // —— Phase4：opt-in 變更端到端（MockWebServer 明文迴環，零真網） ——
+
+  private fun sseOk(): MockResponse = MockResponse()
+    .setHeader("Content-Type", "text/event-stream")
+    .setBody(
+      "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+        "data: [DONE]\n\n",
+    )
+
+  @Test fun cleartextDeniedWithoutConfirmSendsNothing() = runBlocking {
+    val server = MockWebServer()
+    server.start()
+    try {
+      val base = "http://127.0.0.1:${server.port}/v1"
+      val endpointId = "preset:openai"
+      val store = NetworkOptInStore(allowTierUpgrade = true)
+      // 未確認：預設 deny-all。
+      val optIn = store.optInFor(endpointId, base, 1L)
+      assertEquals(NetworkEgressPolicy.HTTPS_ONLY, optIn.policy)
+      val keyCalls = AtomicInteger(0)
+      val cfg = ProviderConfig(
+        id = endpointId,
+        label = "t",
+        baseUrl = base,
+        protocol = ProviderProtocol.CHAT_COMPLETIONS,
+        apiKeyRef = "fake-ref",
+        networkOptIn = optIn,
+        // 字面迴環不觸 DNS：exploding resolver 被呼叫即失敗。
+        networkResolver = HostResolver { throw UnknownHostException("must not resolve literals") },
+      )
+      val provider = ChatCompletionsProvider(cfg, { keyCalls.incrementAndGet(); "K".toCharArray() }, OkHttpClient())
+      val events = withTimeout(5_000) { provider.stream(ChatRequest("m", listOf(ChatMessage("user", "hi")))).toList() }
+      val failed = events.filterIsInstance<StreamEvent.Failed>().single()
+      assertFalse(failed.retryable)
+      assertEquals(ProviderFailureCode.NETWORK_POLICY_BLOCKED.name, failed.code)
+      assertTrue("deny carries code, got: ${failed.message}", failed.message.contains("CLEARTEXT_NOT_PERMITTED"))
+      assertEquals("credential must not be fetched on deny", 0, keyCalls.get())
+      assertEquals("denied stream sends nothing", 0, server.requestCount)
+      assertNull(server.takeRequest(100, TimeUnit.MILLISECONDS))
+    } finally {
+      server.shutdown()
+    }
+  }
+
+  @Test fun cleartextAllowedAfterConfirmStreamsOnce() = runBlocking {
+    val server = MockWebServer()
+    server.start()
+    try {
+      val base = "http://127.0.0.1:${server.port}/v1"
+      val endpointId = "preset:openai"
+      val store = NetworkOptInStore(allowTierUpgrade = true)
+      store.confirm(endpointId, base, NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE, 1L)
+      val optIn = store.optInFor(endpointId, base, 1L)
+      assertEquals(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE, optIn.policy)
+      server.enqueue(sseOk())
+      val keyCalls = AtomicInteger(0)
+      val cfg = ProviderConfig(
+        id = endpointId,
+        label = "t",
+        baseUrl = base,
+        protocol = ProviderProtocol.CHAT_COMPLETIONS,
+        apiKeyRef = "fake-ref",
+        networkOptIn = optIn,
+        networkResolver = HostResolver { throw UnknownHostException("must not resolve literals") },
+      )
+      val provider = ChatCompletionsProvider(cfg, { keyCalls.incrementAndGet(); "K".toCharArray() }, OkHttpClient())
+      val events = withTimeout(5_000) { provider.stream(ChatRequest("m", listOf(ChatMessage("user", "hi")))).toList() }
+      assertTrue("expected Done, got: $events", events.last() is StreamEvent.Done)
+      assertTrue(events.none { it is StreamEvent.Failed })
+      assertEquals(1, keyCalls.get())
+      assertEquals(1, server.requestCount)
+      val recorded = server.takeRequest(2, TimeUnit.SECONDS)
+      assertTrue(recorded?.path.orEmpty().endsWith("/chat/completions"))
+    } finally {
+      server.shutdown()
+    }
+  }
+
+  // —— Phase4：provider 層不重試（輕量，不起 TurnController） ——
+
+  @Test fun networkPolicyBlockedNeverRetriesAtProviderLayer() = runBlocking {
+    // 單一 attempt 即 typed fatal：retryable=false＋classifier FATAL（TurnController 層無需重試）。
+    val dns = fakeDns("example.com" to listOf("10.1.2.3"))
+    val eval = NetworkPolicy.evaluateUrl("https://example.com/", resolver = dns)
+    assertFalse(eval.allowed)
+    val failure = networkPolicyFailure(eval)
+    assertFalse(failure.retryable)
+    assertEquals(ProviderFailureCode.NETWORK_POLICY_BLOCKED, failure.code)
+    assertEquals(FailureKind.FATAL, ProviderErrorClassifier.classify(null, failure, failure.message))
+    // 經 streamingFlow 仍是單一非重試終端（calls==1 由單 attempt 結構保證）。
+    val events = withTimeout(5_000) { streamingFlow { throw failure }.toList() }
+    val failed = events.filterIsInstance<StreamEvent.Failed>().single()
+    assertFalse(failed.retryable)
+    assertEquals(ProviderFailureCode.NETWORK_POLICY_BLOCKED.name, failed.code)
+  }
+
+  // —— Phase4：失敗訊息不洩漏位址／host 明文 ——
+
+  @Test fun policyFailureMessageLeaksNoAddressOrHost() {
+    val dns = fakeDns("example.com" to listOf("10.1.2.3"))
+    for (url in listOf("https://example.com/", "http://10.1.2.3/", "https://192.168.1.20/")) {
+      val eval = NetworkPolicy.evaluateUrl(url, resolver = dns)
+      assertFalse("expected deny for $url", eval.allowed)
+      val msg = networkPolicyFailure(eval).message.orEmpty()
+      assertFalse("policy message must not leak address/host: $msg", msg.contains("10.1.2.3") || msg.contains("192.168") || msg.contains("example.com"))
+    }
+    // redirect typed fatal 亦不帶 Location 明文（僅 REDIRECT_BLOCKED＋HTTP code）。
+    val redir = redirectBlockedFailure(307)
+    assertTrue(redir.message.orEmpty().contains("REDIRECT_BLOCKED"))
+    assertFalse(redir.message.orEmpty().contains("10.1.2.3"))
   }
 }

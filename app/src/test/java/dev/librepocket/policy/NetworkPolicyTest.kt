@@ -434,4 +434,55 @@ class NetworkPolicyTest {
     val mapped = java.net.Inet6Address.getByAddress(null, raw, 0)
     assertEquals(AddressClass.IPV4_MAPPED, NetworkPolicy.classifyAddress(mapped))
   }
+
+  // —— Phase4：IDN/大小寫/尾點/形變 host（確定性、零真網） ——
+
+  @Test fun onionUppercaseNeverResolves() {
+    // 大小寫形變仍是 onion：lowercase 後擋下，neverResolve 被呼叫即失敗。
+    assertDenied(NetworkDenyCode.INVALID_HOST, NetworkPolicy.evaluateUrl("http://SECRET.ONION/", resolver = neverResolve))
+    assertDenied(NetworkDenyCode.INVALID_HOST, NetworkPolicy.evaluateUrl("https://SECRET.ONION/", resolver = neverResolve))
+  }
+
+  @Test fun onionTrailingDotNeverResolves() {
+    assertDenied(NetworkDenyCode.INVALID_HOST, NetworkPolicy.evaluateUrl("http://secret.onion./", resolver = neverResolve))
+    assertDenied(NetworkDenyCode.INVALID_HOST, NetworkPolicy.evaluateUrl("https://secret.onion./", resolver = neverResolve))
+  }
+
+  @Test fun uppercasePublicNameAllows() {
+    // HttpUrl 視角 host 已小寫；resolveHost 另做 lowercase，fake 表只記小寫即可。
+    val dns = fakeDns("example.com" to listOf("203.0.113.21"))
+    val eval = NetworkPolicy.evaluateUrl("https://EXAMPLE.COM/v1", resolver = dns)
+    assertTrue("expected allow: $eval", eval.allowed)
+    assertEquals(AddressClass.PUBLIC, eval.addressClass)
+  }
+
+  @Test fun trailingDotPublicNameAllows() {
+    // 政策層 resolveHost 去尾點（與 opt-in 綁定層保留尾點不同，見 NetworkOptInStore）。
+    val dns = fakeDns("example.com" to listOf("203.0.113.22"))
+    val eval = NetworkPolicy.evaluateUrl("https://example.com./v1", resolver = dns)
+    assertTrue("expected allow: $eval", eval.allowed)
+    assertEquals(AddressClass.PUBLIC, eval.addressClass)
+  }
+
+  @Test fun underscoreLabelAllows() {
+    // isValidDnsName 允底線（如 _dmarc）：fake DNS 回公網即放行。
+    val dns = fakeDns("_dmarc.example.com" to listOf("203.0.113.23"))
+    val eval = NetworkPolicy.evaluateUrl("https://_dmarc.example.com/", resolver = dns)
+    assertTrue("expected allow: $eval", eval.allowed)
+    assertEquals(AddressClass.PUBLIC, eval.addressClass)
+  }
+
+  @Test fun overlongLabelFailsClosedWithoutDns() {
+    // 單 label 64 字元（>63）非法，查 DNS 前就拒。
+    val longLabel = "a".repeat(64)
+    assertDenied(NetworkDenyCode.INVALID_HOST, NetworkPolicy.evaluateUrl("https://$longLabel.example/", resolver = neverResolve))
+  }
+
+  @Test fun userinfoWithCredentialsBlocked() {
+    assertDenied(NetworkDenyCode.USERINFO_BLOCKED, NetworkPolicy.evaluateUrl("https://user:pass@example.com/", resolver = neverResolve))
+  }
+
+  @Test fun ftpSchemeUnsupported() {
+    assertDenied(NetworkDenyCode.UNSUPPORTED_SCHEME, NetworkPolicy.evaluateUrl("ftp://example.com/file", resolver = neverResolve))
+  }
 }

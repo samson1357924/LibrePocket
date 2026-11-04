@@ -74,7 +74,9 @@ fun normalizeOrigin(baseUrl: String): String {
         else -> return ""
     }
     val port = if (url.port != defaultPort) ":${url.port}" else ""
-    return "$scheme://$host$port"
+    // HttpUrl.host 對 IPv6 去括號：含 ':' 即字面 IPv6，補回括號才成合法 origin。
+    val bracketed = if (':' in host) "[$host]" else host
+    return "$scheme://$bracketed$port"
 }
 
 fun EndpointConfig.toSessionBinding(model: String): EndpointSessionBinding {

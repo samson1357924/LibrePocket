@@ -748,4 +748,31 @@ class WebSearchPhase5Test {
         assertNotNull(searxng)
         assertTrue(searxng!!.contains("q=a+b"))
     }
+
+    @Test fun nestedServiceStaysOriginNamespaced() = runBlocking {
+        val json = """{"results":[{"title":"T","url":"https://example.com/","content":"s"}]}"""
+        val httpA = FakeHttp { WebHttpResponse(200, json) }
+        val shared = WebSearchCache()
+        val inner = WebSearchService(SearxngSearchProvider("https://search.example", httpA), shared)
+        val outer = WebSearchService(inner, shared)
+        // Outer must stay origin-namespaced, not collapse to id.
+        assertEquals(inner.cacheNamespace, outer.cacheNamespace)
+        assertEquals("searxng@https://search.example", outer.cacheNamespace)
+        val first = outer.search("q", 5) as WebSearchOutcome.Ok
+        assertFalse(first.cached)
+        assertEquals(1, httpA.calls.get())
+        // Same shared cache: direct inner search hits outer-populated entry.
+        val second = inner.search("q", 5) as WebSearchOutcome.Ok
+        assertTrue(second.cached)
+        assertEquals(1, httpA.calls.get())
+        // Different origin sharing the cache must not cross-hit.
+        val httpB = FakeHttp { WebHttpResponse(200, json) }
+        val outerB = WebSearchService(
+            WebSearchService(SearxngSearchProvider("https://other.example", httpB), shared),
+            shared,
+        )
+        val third = outerB.search("q", 5) as WebSearchOutcome.Ok
+        assertFalse(third.cached)
+        assertEquals(1, httpB.calls.get())
+    }
 }

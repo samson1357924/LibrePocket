@@ -49,6 +49,8 @@ class WebSearchService(
 ) : WebSearchProvider {
     override val id: String get() = delegate.id
 
+    override val cacheNamespace: String get() = delegate.cacheNamespace
+
     override val capabilities: Set<WebCapability> get() = delegate.capabilities
 
     override suspend fun probe(): WebProbe = delegate.probe()

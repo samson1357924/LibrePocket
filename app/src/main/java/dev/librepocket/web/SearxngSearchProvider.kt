@@ -71,7 +71,10 @@ class SearxngSearchProvider(
 
     /**
      * 快取命名空間用的正規化 base（scheme＋host 小寫、path 保大小寫；
-     * 解析失敗回 raw trimmed；尾 `/` 已去）。
+     * 解析失敗回 raw trimmed；尾 `/` 已去。
+     * Explicit default ports (:443/:80) are NOT canonicalized (kept as distinct namespaces —
+     * safe direction: extra upstream, never cross-hit); userinfo/query/fragment are dropped
+     * because buildUrl rejects such shapes）。
      */
     private fun normalizedBase(): String {
         val raw = baseUrl.trim().trimEnd('/')

@@ -51,6 +51,11 @@ class WebSearchCache(
             },
         )
 
+    /**
+     * Cache key.
+     *
+     * @param providerId cache namespace — callers MUST pass WebSearchProvider.cacheNamespace (which equals id for single-origin providers).
+     */
     fun key(providerId: String, query: String, count: Int): String {
         val q = query.trim()
         return "${providerId.length}:$providerId\u0001${q.length}:$q\u0001$count"

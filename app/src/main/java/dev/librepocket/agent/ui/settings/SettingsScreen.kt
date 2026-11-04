@@ -413,12 +413,24 @@ fun SettingsScreen(
                                 )
                             }
                             Spacer(modifier = Modifier.height(8.dp))
+                            // Stage 2 review #3：不支援分支可達——!available 時主按鈕保持
+                            // enabled（僅 held 才 disabled），文案改為「前往語音輸入設定」；
+                            // 點擊仍走 onRequestAssistantRole → request() UnsupportedFallback
+                            // 分支（設 UNSUPPORTED＋openFallback），與下方 OutlinedButton 同效。
+                            // 行為變更：舊測 unsupported_showsUnsupportedState 斷言此態 disabled
+                            // 將破，留 Stage 4 統一修測，本 stage 不改測試檔。
                             Button(
                                 onClick = onRequestAssistantRole,
-                                enabled = assistant.roleAvailable && !assistant.roleHeld,
+                                enabled = !assistant.roleHeld,
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
-                                Text("設為預設助理")
+                                Text(
+                                    when {
+                                        assistant.roleHeld -> "設為預設助理"
+                                        !assistant.roleAvailable -> "前往語音輸入設定"
+                                        else -> "設為預設助理"
+                                    },
+                                )
                             }
                             // B held 指引：取消須走系統設定（RoleManager 無應用側取消入口）。
                             if (assistant.roleHeld) {

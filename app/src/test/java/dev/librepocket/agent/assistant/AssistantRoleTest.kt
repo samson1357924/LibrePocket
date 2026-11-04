@@ -256,4 +256,92 @@ class AssistantRoleTest {
         val b = FallbackCandidate("com.oem.settings", "VoiceInputSettingsB", true, false)
         assertNull(selectFallbackTarget(listOf(a, b)))
     }
+
+    // ---- Stage 2 新增：四參版調和（everHeld＋justGranted） ----
+
+    @Test
+    fun givenEverHeldButStoredNull_whenNotHeld_thenReportsRevoked() {
+        // 外部授予→撤銷鏈路：stored 雖 null（未經本應用回調），但曾觀察 held 即判撤銷。
+        val revoked = effectiveAssistantReason(
+            stored = null,
+            snapshot = AssistantRoleSnapshot(roleAvailable = true, roleHeld = false),
+            everHeld = true,
+            justGranted = false,
+        )
+        assertEquals(AssistantReasonCode.REVOKED, revoked)
+    }
+
+    @Test
+    fun givenJustGranted_whenNotHeld_thenKeepsGranted() {
+        // RESULT_OK 落盤延遲寬限：回調後首幀保持 GRANTED，不立即誤判 REVOKED。
+        val kept = effectiveAssistantReason(
+            stored = AssistantReasonCode.GRANTED,
+            snapshot = AssistantRoleSnapshot(roleAvailable = true, roleHeld = false),
+            everHeld = false,
+            justGranted = true,
+        )
+        assertEquals(AssistantReasonCode.GRANTED, kept)
+    }
+
+    @Test
+    fun givenHeld_whenJustGranted_thenHeldClearsFirst() {
+        // held 優先於 justGranted：持有態一律清除原因碼，不殘留 GRANTED。
+        listOf(
+            AssistantRoleSnapshot(roleAvailable = true, roleHeld = true),
+            AssistantRoleSnapshot(roleAvailable = false, roleHeld = true),
+        ).forEach { snapshot ->
+            assertNull(
+                "held+justGranted 必須清除（avail=${snapshot.roleAvailable}）",
+                effectiveAssistantReason(
+                    stored = AssistantReasonCode.GRANTED,
+                    snapshot = snapshot,
+                    everHeld = true,
+                    justGranted = true,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun givenNeverHeldAndStoredNull_whenNotHeld_thenPassThroughNull() {
+        // 從未持有＋stored null：無授予痕跡，原樣 passthrough null（不憑空判撤銷）。
+        assertNull(
+            effectiveAssistantReason(
+                stored = null,
+                snapshot = AssistantRoleSnapshot(roleAvailable = true, roleHeld = false),
+                everHeld = false,
+                justGranted = false,
+            ),
+        )
+    }
+
+    @Test
+    fun givenDeniedWithEverHeld_whenNotHeld_thenDeniedPassthrough() {
+        // 新鮮 DENIED 不被陳舊 everHeld 覆寫：拒絕優先於持有痕跡。
+        val snapshot = AssistantRoleSnapshot(roleAvailable = true, roleHeld = false)
+        assertEquals(
+            AssistantReasonCode.DENIED,
+            effectiveAssistantReason(
+                stored = AssistantReasonCode.DENIED,
+                snapshot = snapshot,
+                everHeld = true,
+                justGranted = false,
+            ),
+        )
+    }
+
+    @Test
+    fun givenUnsupportedWithEverHeld_whenNotHeld_thenUnsupportedPassthrough() {
+        // 新鮮 UNSUPPORTED 同理 passthrough，不判撤銷。
+        val snapshot = AssistantRoleSnapshot(roleAvailable = false, roleHeld = false)
+        assertEquals(
+            AssistantReasonCode.UNSUPPORTED,
+            effectiveAssistantReason(
+                stored = AssistantReasonCode.UNSUPPORTED,
+                snapshot = snapshot,
+                everHeld = true,
+                justGranted = false,
+            ),
+        )
+    }
 }

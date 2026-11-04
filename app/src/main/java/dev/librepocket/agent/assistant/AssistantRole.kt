@@ -59,29 +59,59 @@ object AssistantReasonCode {
 /**
  * 雙向調和（純函數）：快照持有態優先於一切原因碼。
  *
+ * 四參版（Stage 2 人類 review #2＋#3）：
  * - 若 `snapshot.roleHeld == true`，直接回 null（清除原因碼）：
  *   頭部已表達持有態，原因區不再重複顯示（避免 DENIED＋held 矛盾：
  *   頭部顯示已持有、原因顯示被拒；亦避免 GRANTED＋held 重複文案：
  *   held 頭部與 GRANTED 原因完全同字串）。
- * - 否則若曾經授予（stored == GRANTED）但重讀快照已非持有，
- *   視為角色被撤銷，覆寫為 [AssistantReasonCode.REVOKED]。
+ * - 否則若 `justGranted == true`，回 [AssistantReasonCode.GRANTED]：
+ *   `RESULT_OK` 後系統落盤有延遲，重讀快照仍非持有是預期競態，
+ *   此寬限旗保證回調後首幀不立即誤判 REVOKED；下次 ON_RESUME／快照重讀
+ *   後由 [AssistantRoleUi] 清回 false，寬限即結束。
+ * - 否則若 `stored == GRANTED`，覆寫為 [AssistantReasonCode.REVOKED]：
+ *   曾經授予（sticky GRANTED 碼）但重讀快照已非持有，視為角色被撤銷。
+ * - 否則若 `stored == null && everHeld == true`，回 [AssistantReasonCode.REVOKED]：
+ *   外部授予→撤銷鏈路：使用者曾在系統設定頁手動授予（未經本應用 request
+ *   回調，故 `stored` 仍為 null），之後又在系統側被撤銷；僅憑 `stored`
+ *   無法捕捉，須以 `everHeld`（曾經觀察到 `roleHeld == true` 即 sticky）
+ *   補上撤銷判定。僅 stored null 時才用 everHeld 判撤銷；顯式新鮮碼
+ *  （DENIED／UNSUPPORTED／REQUEST_FAILED／REVOKED）一律 passthrough，
+ *   不被 everHeld 覆寫（新鮮拒絕優先於陳舊持有痕跡）。
  * - 其餘原樣 passthrough（含 null 與 DENIED／UNSUPPORTED／REQUEST_FAILED／REVOKED）。
+ *
+ * `everHeld` 由 SharedPreferences（`"assistant_role"`／`"ever_held"`）持久化，
+ * process death 後仍能判定外部撤銷；`justGranted` 僅記憶體態（remember，
+ * 下次重讀即清），不落盤。
  *
  * 已知 GRANTED 競態：`RESULT_OK` 後系統未即時落盤時，重讀快照仍非持有會
  * 短暫顯示 REVOKED；該 REVOKED sticky 到下次要求／結果回調（ON_RESUME 重讀
- * 由 AssistantRoleUi Phase 2 已補：LifecycleEventObserver(ON_RESUME)→refreshTick++）。
+ * 由 AssistantRoleUi Phase 2 已補：LifecycleEventObserver(ON_RESUME)→refreshTick++；
+ * 本 Stage 另加 `justGranted` 寬限，首幀保持 GRANTED）。
  */
 fun effectiveAssistantReason(
     stored: String?,
     snapshot: AssistantRoleSnapshot,
+    everHeld: Boolean,
+    justGranted: Boolean,
 ): String? =
     if (snapshot.roleHeld) {
         null
+    } else if (justGranted && stored == AssistantReasonCode.GRANTED) {
+        AssistantReasonCode.GRANTED
     } else if (stored == AssistantReasonCode.GRANTED) {
+        AssistantReasonCode.REVOKED
+    } else if (stored == null && everHeld) {
         AssistantReasonCode.REVOKED
     } else {
         stored
     }
+
+/** 雙參相容 overload：轉調四參版（`everHeld=false, justGranted=false`，舊測語義不變）。 */
+fun effectiveAssistantReason(
+    stored: String?,
+    snapshot: AssistantRoleSnapshot,
+): String? =
+    effectiveAssistantReason(stored, snapshot, everHeld = false, justGranted = false)
 
 /** 原因碼 → 顯示文案（UI 只顯示文案不做流程分支，色彩可按失敗/中性區分（見 SettingsScreen）；未知碼原樣回報，不偽造語義）。 */
 fun assistantReasonText(code: String): String =

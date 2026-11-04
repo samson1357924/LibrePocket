@@ -3,6 +3,7 @@ package dev.librepocket.agent.assistant
 import android.app.Activity
 import android.app.role.RoleManager
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
@@ -11,6 +12,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -35,6 +37,14 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
  *   重讀快照，讓 REVOKED／held 調和經 [effectiveAssistantReason] 生效。
  * - ON_RESUME 刷新：`LifecycleEventObserver(ON_RESUME)→refreshTick++`，從授權頁／
  *   系統設定返回即重讀快照（GRANTED 落盤延遲／外部撤銷皆被調和，不依賴回調單一路徑）。
+ *   ON_RESUME 同時清 `justGranted=false`（寬限只保回調後首幀），新一輪 request
+ *   發起亦先清 `justGranted=false`。
+ * - 外部撤銷：`everHeld` sticky（曾觀察 `roleHeld==true` 即置 true）＋
+ *   SharedPreferences `"assistant_role"`／`"ever_held"` 持久化（process death
+ *   後仍可判定）；調和經 [effectiveAssistantReason] 四參版
+ *   (`stored`／`snapshot`／`everHeld`／`justGranted`)。
+ * - RESULT_OK 競態寬限：回調設 `justGranted=true`＋`stored=GRANTED`，首幀保持
+ *   GRANTED 而非立即誤判 REVOKED；詳見 [effectiveAssistantReason] KDoc。
  *   RoleManager 缺失（OEM 不支援）→對應原因碼＋fallback，fail-closed。
  * - 讀取失敗一律視為不支援（[AssistantRoleSnapshot] 全 false），不靜默放行。
  */
@@ -73,19 +83,44 @@ fun rememberAssistantRole(): AssistantRoleUi {
         }
     }
     var storedReason by rememberSaveable { mutableStateOf<String?>(null) }
+    // Stage 2 review #2：everHeld sticky＋SharedPreferences 持久化（process death
+    // 後仍判外部撤銷）；初始值讀盤，之後 snapshot.roleHeld==true 即置 true 並寫盤。
+    val prefs = remember(appContext) {
+        appContext.getSharedPreferences("assistant_role", Context.MODE_PRIVATE)
+    }
+    var everHeld by rememberSaveable { mutableStateOf(prefs.getBoolean("ever_held", false)) }
+    // Stage 2 review #2：RESULT_OK 競態寬限旗（回調置 true；ON_RESUME／下次重讀／
+    // 新 request 發起清 false）。僅記憶體態（remember，不跨 process death），不落盤。
+    // 寬限僅一幀：launcher 回調設 true 後 refreshTick++ 重讀當幀仍 true（寬限生效一次）；
+    // 下次 ON_RESUME 先清 false 再 tick++ 重讀（同一幀生效），故不會掩蓋真實撤銷。
+    var justGranted by remember { mutableStateOf(false) }
     var refreshTick by remember { mutableIntStateOf(0) }
     // C: fallback 失敗回饋（rememberSaveable 撐過旋轉；成功開啟即清回 false）。
     var fallbackFailed by rememberSaveable { mutableStateOf(false) }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) refreshTick++
+            if (event == Lifecycle.Event.ON_RESUME) {
+                // 寬限只保回調後首幀：下次重讀前先清，否則 GRANTED 常駐掩蓋真實撤銷。
+                // 順序必須先清再 tick++（同一幀生效）：外部撤銷的 ON_RESUME 會先清
+                // justGranted 再重讀，故不會掩蓋真實撤銷。
+                justGranted = false
+                refreshTick++
+            }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
     val snapshot = remember(roleManager, refreshTick) {
         readAssistantSnapshot(roleManager)
+    }
+    // 外部授予→撤銷鏈路：只要觀察到 held 即 sticky everHeld 並落盤（process death 後仍可判撤銷）。
+    // composition body 禁止直接寫 state＋SP（重組循環風險），改用 SideEffect。
+    SideEffect {
+        if (snapshot.roleHeld && !everHeld) {
+            everHeld = true
+            prefs.edit().putBoolean("ever_held", true).apply()
+        }
     }
     val openFallback: () -> Unit = remember(appContext) {
         // fallbackFailed 經 MutableState 引用捕獲，非值捕獲，故無需入 remember key。
@@ -135,15 +170,22 @@ fun rememberAssistantRole(): AssistantRoleUi {
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
             storedReason = AssistantReasonCode.GRANTED
+            // RESULT_OK 落盤延遲寬限：首幀保持 GRANTED，不立即誤判 REVOKED。
+            // 此處不立即清 justGranted，保留寬限一幀（refreshTick++ 重讀當幀仍 true）；
+            // 寬限由下次 ON_RESUME／新 request 入口清 false，state 計算後不清。
+            justGranted = true
             fallbackFailed = false
         } else {
             storedReason = AssistantReasonCode.DENIED
+            justGranted = false
         }
         // GRANTED／DENIED 皆重讀快照：REVOKED／held 調和經 effectiveAssistantReason 生效。
         refreshTick++
     }
     val request: () -> Unit = remember(snapshot, roleManager, launcher, openFallback) {
         {
+            // 新一輪要求開始即結束上一輪寬限（否則舊 justGranted 常駐掩蓋撤銷）。
+            justGranted = false
             when (decideAssistantRole(snapshot)) {
                 AssistantRoleDecision.AlreadyHeld -> {
                     storedReason = AssistantReasonCode.GRANTED
@@ -176,11 +218,11 @@ fun rememberAssistantRole(): AssistantRoleUi {
             }
         }
     }
-    val state = remember(snapshot, storedReason, fallbackFailed) {
+    val state = remember(snapshot, storedReason, everHeld, justGranted, fallbackFailed) {
         AssistantSettingsState(
             roleHeld = snapshot.roleHeld,
             roleAvailable = snapshot.roleAvailable,
-            reasonCode = effectiveAssistantReason(storedReason, snapshot),
+            reasonCode = effectiveAssistantReason(storedReason, snapshot, everHeld, justGranted),
             fallbackFailed = fallbackFailed,
         )
     }

@@ -254,6 +254,15 @@ internal fun requireToolIdBudget(idLength: Int) {
  * Per-attempt visible-text budget (chars of `TextDelta` + `ReasoningDelta`
  * accepted into one attempt's assistant block, #83).
  *
+ * Per-attempt means per provider request attempt, NOT per logical turn (H1
+ * documentation of the closed #83 decision): retries mint fresh attempt ids
+ * with fresh cells (see `TurnControllerUsageTextBudgetTest.textBudgetResetsAcrossRetryableRetry`),
+ * so a logical turn with up to 3 retries (4 provider requests plain, up to 5
+ * wire requests on the P2 tool-slice path) can accept up to 4 x 100_000
+ * visible chars in total — each attempt still fails closed at its own
+ * 100_000. The P2 tool-slice continuation round shares its attempt's budget
+ * (seeded from the attempt's running `visibleTextChars`, never a fresh cell).
+ *
  * The value reuses the durable-row cap ([dev.librepocket.session.RoomSessionStore.MAX_TEXT_CHARS]):
  * a text-only attempt that passes this budget fits the store without silent
  * truncation, so exceeding it fails closed here instead. Tool-marker text

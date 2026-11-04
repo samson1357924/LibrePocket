@@ -823,4 +823,54 @@ class WebSearchPhase5Test {
         assertEquals(1, httpA.calls.get())
         assertEquals(1, httpB.calls.get())
     }
+
+    @Test fun decimalEmojiDecodesCorrectly() {
+        val p = DdgsSearchProvider(FakeHttp { WebHttpResponse(200, "") })
+        val hits = p.parseDdgsHtml(
+            """<a class="result__a" href="https://x.example/">&#128512;</a>""",
+        )
+        assertEquals(1, hits.size)
+        assertEquals("😀", hits.single().title)
+    }
+
+    @Test fun hexEmojiDecodesCorrectly() {
+        val p = DdgsSearchProvider(FakeHttp { WebHttpResponse(200, "") })
+        val hits = p.parseDdgsHtml(
+            """<a class="result__a" href="https://x.example/">&#x1F600;</a>""",
+        )
+        assertEquals(1, hits.size)
+        assertEquals("😀", hits.single().title)
+    }
+
+    @Test fun invalidCodePointsKept() {
+        val p = DdgsSearchProvider(FakeHttp { WebHttpResponse(200, "") })
+        // > U+10FFFF stays literal.
+        val over = p.parseDdgsHtml(
+            """<a class="result__a" href="https://x.example/">&#x110000;</a>""",
+        )
+        assertEquals("&#x110000;", over.single().title)
+        // Lone surrogate stays literal.
+        val surrogate = p.parseDdgsHtml(
+            """<a class="result__a" href="https://x.example/">&#55296;</a>""",
+        )
+        assertEquals("&#55296;", surrogate.single().title)
+        // NUL is scalar-valid per impl: decodes to U+0000 (pinned via inner text
+        // so stripText trim does not collapse a lone NUL title to the url fallback).
+        val nul = p.parseDdgsHtml(
+            """<a class="result__a" href="https://x.example/">A&#0;B</a>""",
+        )
+        assertEquals("A B", nul.single().title)
+    }
+
+    @Test fun bmpEntitiesStillDecode() {
+        val p = DdgsSearchProvider(FakeHttp { WebHttpResponse(200, "") })
+        val dec = p.parseDdgsHtml(
+            """<a class="result__a" href="https://x.example/">&#65;</a>""",
+        )
+        assertEquals("A", dec.single().title)
+        val hex = p.parseDdgsHtml(
+            """<a class="result__a" href="https://x.example/">&#x41;</a>""",
+        )
+        assertEquals("A", hex.single().title)
+    }
 }

@@ -193,6 +193,9 @@ class DdgsSearchProvider(
          * HTML entity 解碼（`&lt;`／`&gt;`／`&quot;`／`&#39;`／數字／hex 先解，
          * `&amp;` 最後解，避免 `&amp;lt;` 被二次解成 `<`）。
          */
+        private fun decodeCodePoint(cp: Int?): String? =
+            if (cp != null && cp in 0..0x10FFFF && (cp < 0xD800 || cp > 0xDFFF)) String(Character.toChars(cp)) else null
+
         fun unescapeHtml(raw: String): String {
             var s = raw
                 .replace("&lt;", "<")
@@ -200,10 +203,10 @@ class DdgsSearchProvider(
                 .replace("&quot;", "\"")
                 .replace("&#39;", "'")
             s = NUMERIC_ENTITY.replace(s) { m ->
-                m.groupValues[1].toIntOrNull()?.toChar()?.toString() ?: m.value
+                decodeCodePoint(m.groupValues[1].toIntOrNull()) ?: m.value
             }
             s = HEX_ENTITY.replace(s) { m ->
-                m.groupValues[1].toIntOrNull(16)?.toChar()?.toString() ?: m.value
+                decodeCodePoint(m.groupValues[1].toIntOrNull(16)) ?: m.value
             }
             s = s.replace("&amp;", "&")
             return s

@@ -686,6 +686,7 @@ class ChatSessionFactory(
                 null
             }
             val createdSession = buildSession(
+                endpoint,
                 config,
                 model,
                 transcript,
@@ -879,6 +880,7 @@ class ChatSessionFactory(
             requireCurrentBinding(keyIsCurrent)
             val sessionStart = meta.createdAt.toInstantOrNull()
             val openedSession = buildSession(
+                endpoint,
                 config,
                 model,
                 SessionTranscriptSink(store, sessionId),
@@ -1000,6 +1002,7 @@ class ChatSessionFactory(
             val sessionStart = forkMeta?.createdAt?.toInstantOrNull()
             requireCurrentBinding(keyIsCurrent)
             val openedSession = buildSession(
+                endpoint,
                 config,
                 model,
                 SessionTranscriptSink(store, newSessionId),
@@ -1119,13 +1122,22 @@ class ChatSessionFactory(
         if (SetupValidation.isLegacyEndpoint(endpoint)) throw CaptureDeniedException("ENDPOINT_ID_LEGACY")
     }
 
-    //region S2 per-endpoint opt-in（查詢期快照語義）
+    //region S2 per-endpoint opt-in（store 接線時 live，否則快照）
     /**
      * S2 opt-in 解析：經 [networkOptInStore] 查已確認 tier，綁定
      * (`providerId`＋`baseUrl`＋`configRevision`) 全等才放行升級，否則
      * deny-all。Null store（預設／production 未接 UI 前）即 HTTPS_ONLY。
-     * 生命週期：僅記憶體持有，重啟即失；live session 取用當下快照，
-     * 持久化待 EndpointStore metadata 接線（確認本身仍經 confirm 明示 mint）。
+     * 生命週期：僅記憶體持有，重啟即失；持久化待 EndpointStore metadata
+     * 接線（確認本身仍經 confirm 明示 mint）。
+     *
+     * Phase B live 語義：此函數仍取當下快照做初始 [ProviderConfig.networkOptIn]
+     *（create／open 建 session 的 transport 起點），但 store 接線時
+     * [buildSession] 會再包一層 [OptInResolvingProvider]，使活躍 session 的
+     * 每個 `stream`／`listModels` 入口重解 `optInFor`——`invalidate()` 或
+     * `confirm(HTTPS_ONLY)` 後同一 session 物件再送即用 fresh HTTPS_ONLY 被
+     * transport 閘擋下（typed NETWORK_POLICY_BLOCKED＋0 request）。Null store
+     * 時無 live 層，仍為建時快照語義。直接持 [ProviderConfig] 快照的調用方
+     *（Setup probe 無 store）同樣仍為快照語義。
      */
     private fun optInFor(endpoint: EndpointConfig): EndpointNetworkOptIn =
         networkOptInStore?.optInFor(endpoint.providerId, endpoint.baseUrl, endpoint.configRevision)
@@ -1197,7 +1209,14 @@ class ChatSessionFactory(
         return SessionCredential(endpoint.apiKeyRef, key)
     }
 
+    /**
+     * Phase B live 接線：[endpoint]＋建時 [config] 快照共同決定 transport 起點；
+     * [networkOptInStore] 非 null 時包 [OptInResolvingProvider] 使活躍 session
+     * 每 turn 重解 opt-in（revoke／降級後同一物件再送即被擋）；null 時維持建時
+     * 快照（deny-all 預設）。private 可加參，不影響 public API。
+     */
     private fun buildSession(
+        endpoint: EndpointConfig,
         config: ProviderConfig,
         model: String,
         transcript: TranscriptSink,
@@ -1213,7 +1232,10 @@ class ChatSessionFactory(
         val keys = KeyProvider { ref ->
             if (keyIsCurrent()) credential.copyFor(ref) else null
         }
-        val provider = buildProvider(config, keys)
+        val optInStore = networkOptInStore
+        val provider =
+            if (optInStore != null) OptInResolvingProvider(endpoint, optInStore, config, keys, buildProvider)
+            else buildProvider(config, keys)
         val session = ChatSessionImpl(
             provider,
             policy,

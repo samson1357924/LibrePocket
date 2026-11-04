@@ -30,6 +30,13 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  * gate（BuildConfig／flavor source set 內建構）待後續 UI 接線 followup，
  * 在此之前以此顯式旗標 fail-closed（見 `confirm`）。
  * 測試另行釘死（見 `NetworkPolicyS2Test.playStaysHttpsOnly`）。
+ *
+ * Phase B live 語義：[confirm] 降級（HTTPS_ONLY）／[invalidate] 後查詢即失效
+ *（[confirmedPolicyFor]/[optInFor] 回 HTTPS_ONLY），且經
+ * `OptInResolvingProvider` 路徑的活躍 session 每 turn 重解，生即生效——同一
+ * session 物件再送即被 transport 閘擋下。直接持 `ProviderConfig` 快照的調用方
+ *（Setup probe 無 store，建時 `toProviderConfig()` 一次）仍為快照語義：
+ * 建後降級不影響已建出的 config，需重建才生效。
  */
 class NetworkOptInStore(
   /**

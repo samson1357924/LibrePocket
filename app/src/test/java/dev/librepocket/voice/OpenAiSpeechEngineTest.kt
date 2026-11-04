@@ -42,6 +42,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -3271,5 +3272,129 @@ class OpenAiSpeechEngineTest {
             player.release()
             player.preStartBarrierForTest = null
         }
+    }
+
+    // ---- Stage-C P2: engine.shutdown 世代 fencing 缺口（人類第五輪） ----
+
+    @Test
+    fun shutdown_cancelsBlockedRequest_noPlayAfterUnblock_secondCallRejected_idempotent() = runBlocking {
+        // 雲端回應阻塞（headers 延遲 2s 模擬進行中 HTTP），shutdown 必須取消該 Job，
+        // 解除回應後絕不 player.play；關閉後再次呼叫明確拒絕且不再發 HTTP；多次 shutdown 冪等。
+        val fakeAudio = byteArrayOf(0x01, 0x02)
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/mpeg")
+                .setHeadersDelay(2, TimeUnit.SECONDS)
+                .setBody(Buffer().write(fakeAudio)),
+        )
+        // 此回應永不應被消耗：關閉後的新呼叫必須在發 HTTP 前即 fail-fast。
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/mpeg")
+                .setBody(Buffer().write(byteArrayOf(0x03, 0x04))),
+        )
+
+        val player = FakeAudioPlayer()
+        val client = OpenAiTtsClient(
+            baseUrl = server.url("/").toString(),
+            apiKey = { "test-key".toCharArray() },
+            allowTestLoopback = true,
+        )
+        val engine = OpenAiSpeechEngine(client = client, player = player, allowTestLoopback = true)
+
+        val outcomeRef = java.util.concurrent.atomic.AtomicReference<OpenAiSpeechEngine.Companion.SynthOutcome?>()
+        val job = launch(Dispatchers.IO) {
+            outcomeRef.set(
+                engine.synthesizeAndPlay(
+                    text = "blocked request to be shutdown",
+                    voiceOutputOn = true,
+                    openAiTtsOn = true,
+                ),
+            )
+        }
+
+        // 確認雲端請求已在阻塞中
+        val request1 = server.takeRequest(5, TimeUnit.SECONDS)
+        assertNotNull("First request must reach MockWebServer before shutdown", request1)
+        delay(200)
+
+        val startNs = System.nanoTime()
+        engine.shutdown()
+        job.join()
+        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000
+
+        // HTTP cancellation：不必等待完整 2s 延遲即返回，且為 Failed(CANCELLED) 而非拋出。
+        assertTrue(
+            "Shutdown must cancel blocked request fast (<1500ms), elapsed=${elapsedMs}ms",
+            elapsedMs < 1500,
+        )
+        val outcome = outcomeRef.get()
+        assertTrue(
+            "Blocked request after shutdown must return Failed(CANCELLED), was: $outcome",
+            outcome is OpenAiSpeechEngine.Companion.SynthOutcome.Failed &&
+                outcome.detail == OpenAiSpeechEngine.DETAIL_CANCELLED,
+        )
+        assertFalse("Unified contract: shutdown cancel returns Failed, not CancellationException", job.isCancelled)
+        // 世代 fencing：解除回應（延遲窗口過去）後仍絕不播放。
+        assertEquals(0, player.playCount.get())
+        assertTrue("shutdown fencing must detach player (stop called)", player.stopped)
+
+        // 等待原延遲窗口過去，確認無遲到播放（若 epoch 未遞增，解除後將誤播放）。
+        delay(2500)
+        assertEquals("No late play after delayed response unblocked", 0, player.playCount.get())
+
+        // 關閉後再次呼叫明確拒絕，不再發 HTTP。
+        val before = server.requestCount
+        assertEquals("Only first request sent before shutdown", 1, before)
+        val second = engine.synthesizeAndPlay(
+            text = "after shutdown must reject",
+            voiceOutputOn = true,
+            openAiTtsOn = true,
+        )
+        assertTrue(
+            "Call after shutdown must be rejected Failed(CANCELLED), was: $second",
+            second is OpenAiSpeechEngine.Companion.SynthOutcome.Failed &&
+                second.detail == OpenAiSpeechEngine.DETAIL_CANCELLED,
+        )
+        assertEquals("No new HTTP after shutdown", before, server.requestCount)
+        assertEquals(0, player.playCount.get())
+
+        // 資源關閉冪等：多次 shutdown + stop 安全無拋出。
+        engine.shutdown()
+        engine.shutdown()
+        engine.stop()
+        engine.shutdown()
+    }
+
+    @Test
+    fun androidAudioPlayer_playAfterRelease_failsFastWithoutStartOrHang() = runBlocking {
+        // Stage-C P2：play 在 released 狀態明確 fail-fast，不悄悄略過 timeout（不無界掛起、不 start）。
+        val testMp = TestMediaPlayer()
+        val player = AndroidAudioPlayer(mediaPlayerFactory = { testMp }, prepareTimeoutMs = 200L)
+        player.release()
+        // 多次 release 冪等安全。
+        player.release()
+
+        val startNs = System.nanoTime()
+        val ex = try {
+            withTimeout(2000L) {
+                player.play(byteArrayOf(0x01, 0x02))
+            }
+            null
+        } catch (e: Exception) {
+            e
+        }
+        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000
+        assertNotNull("play after release must fail fast, not hang", ex)
+        assertTrue("play after release must be CancellationException, was: $ex", ex is CancellationException)
+        assertTrue("play after release must fail fast (<1000ms), elapsed=${elapsedMs}ms", elapsedMs < 1000)
+        assertFalse("start() must never be called after release", testMp.startCalled)
+        assertFalse("prepareAsync must never be called after release", testMp.prepareAsyncCalled)
+
+        // stop/release after release 安全。
+        player.stop()
+        player.release()
     }
 }

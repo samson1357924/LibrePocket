@@ -15,6 +15,7 @@ import java.io.IOException
 import java.net.URI
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
@@ -160,6 +161,13 @@ class AndroidAudioPlayer(
     // 超時僅涵蓋 PREPARING：onPrepared 成功即標記 preparedEpochs + cancel，PLAYING 不再受 timer 影響。
     private val timeoutFutures = java.util.concurrent.ConcurrentHashMap<Long, java.util.concurrent.ScheduledFuture<*>>()
 
+    /**
+     * Stage-C P2：released 世代柵欄。`release()` 成功後即置 true，此後 [play] 一律 fail-fast
+     * 拋出 [CancellationException]，不再發起 native 播放；排程失敗亦不再悄悄略過，
+     * 避免關閉後仍播放或無界掛起。冪等：多次 [release] 安全。
+     */
+    private val isReleased = AtomicBoolean(false)
+
     private fun cancelTimeout(epoch: Long) {
         try {
             timeoutFutures.remove(epoch)?.cancel(false)
@@ -199,6 +207,8 @@ class AndroidAudioPlayer(
      * 會在大量測試中累積閒置線程，故提供顯式關閉。呼叫後新的 releaseAsync 會退回同步釋放。
      */
     fun release() {
+        // Stage-C P2：先標記 released 使併發 play fail-fast，再關閉執行緒池。冪等。
+        isReleased.set(true)
         // Orderly shutdown：先丟棄 pending prepare 超時（stop 已 cancel 對應 epoch，丟棄無洩漏），
         // 再 orderly 關閉 release 池，確保 shutdown 前由 stop() enqueue 的 releaseAsync 不被丟棄。
         // 切勿對 releaseExecutor 用 shutdownNow：會丟棄佇列中剛 enqueue 的 native reset/release 造成洩漏。
@@ -370,8 +380,16 @@ class AndroidAudioPlayer(
         }
     }
 
-    override suspend fun play(audioBytes: ByteArray): Unit = suspendCancellableCoroutine { continuation ->
-        if (!continuation.isActive) return@suspendCancellableCoroutine
+    override suspend fun play(audioBytes: ByteArray) {
+        // Stage-C P2：released 後明確 fail-fast，不再悄悄發起 native 播放。
+        if (isReleased.get()) throw CancellationException("AndroidAudioPlayer released")
+        return suspendCancellableCoroutine { continuation ->
+        if (isReleased.get() || !continuation.isActive) {
+            if (isReleased.get()) {
+                tryCancel(continuation, "AndroidAudioPlayer released before claim")
+            }
+            return@suspendCancellableCoroutine
+        }
 
         val player = try {
             mediaPlayerFactory()
@@ -663,7 +681,23 @@ class AndroidAudioPlayer(
                 }
             }
         } catch (_: Throwable) {
-            // 排程失敗不影響播放主流程
+            // Stage-C P2：排程失敗不再悄悄略過。已 released 或已失格即明確取消，
+            // 避免關閉後仍播放或無界掛起；仍 active 且未 released 的偶發排程失敗才保留原行為。
+            val shouldFailFast = isReleased.get() ||
+                !(synchronized(lock) { activePlayer === player && activeEpoch == epoch && sessionEpoch == epoch } && continuation.isActive)
+            if (shouldFailFast) {
+                val detached = synchronized(lock) {
+                    detachIfActiveLocked(player, epoch)
+                }
+                if (detached != null) {
+                    tryCancel(continuation, "Audio play cancelled: player released or superseded (epoch $epoch)")
+                    cancelTimeoutAndClearPrepared(epoch)
+                    releaseAsync(detached)
+                } else {
+                    tryCancel(continuation, "Audio play cancelled: player released or superseded (epoch $epoch, detached)")
+                }
+            }
+        }
         }
     }
 
@@ -723,6 +757,12 @@ class OpenAiSpeechEngine(
     private val activeJobs = ConcurrentHashMap.newKeySet<Job>()
     private val speechEpoch = AtomicLong(0L)
     private val stopEpoch = AtomicLong(0L)
+    /**
+     * Stage-C P2：關閉世代柵欄。`shutdown()` 首輪以 CAS 置 true，此後 [synthesizeAndPlay]
+     * 一律 fail-fast 回傳 `Failed(CANCELLED)`，不再發 HTTP、不再遞增世代、不再觸碰播放器。
+     * 與 [generationLock] 內的 claim 檢查結合，杜絕關閉後新 claim 滑入。
+     */
+    private val isShutdown = AtomicBoolean(false)
     // 世代躍遷互斥：speechEpoch 遞增 + 舊工作快照/清除 + 新工作註冊必須在同一臨界區完成，
     // 使僅有 winner 能取消舊世代，舊請求絕不取消新請求。stop() 亦使用同一鎖。
     private val generationLock = Any()
@@ -1107,6 +1147,13 @@ class OpenAiSpeechEngine(
         apiKeyOverrideOriginUrl: String? = null,
         allowTestLoopback: Boolean = this.allowTestLoopback,
     ): SynthOutcome {
+        // Stage-C P2：closed 後立即 fail-fast 拒絕，不再發 HTTP、不再遞增世代。
+        if (isShutdown.get()) {
+            return SynthOutcome.Failed(
+                detail = DETAIL_CANCELLED,
+                message = "語音合成已被中斷",
+            )
+        }
         // 外層取消轉換：withContext 子 Job 被取代/stop 取消時，內層 return Failed 會被 withContext 覆寫為拋出，
         // 故在呼叫端上下文統一轉換。結構化取消優先：只要呼叫端 parent Job 已取消，一律重拋
         // CancellationException；僅 parent 未取消（內部取代/stop）才回 Failed(CANCELLED)。
@@ -1114,7 +1161,7 @@ class OpenAiSpeechEngine(
             return withContext(Dispatchers.IO) {
         val preCheckStopEpoch = stopEpoch.get()
         val callerJob = coroutineContext[Job]
-        if (callerJob?.isActive == false) {
+        if (isShutdown.get() || callerJob?.isActive == false) {
             return@withContext SynthOutcome.Failed(
                 detail = DETAIL_CANCELLED,
                 message = "語音合成已被中斷",
@@ -1173,8 +1220,8 @@ class OpenAiSpeechEngine(
             is Check.Allowed -> Unit
         }
 
-        // 檢查期間若發生 stop 或呼叫端協程已被取消，直接返回取消，不進入合成流程
-        if (stopEpoch.get() != preCheckStopEpoch || callerJob?.isActive == false) {
+        // 檢查期間若發生 stop/shutdown 或呼叫端協程已被取消，直接返回取消，不進入合成流程
+        if (isShutdown.get() || stopEpoch.get() != preCheckStopEpoch || callerJob?.isActive == false) {
             return@withContext SynthOutcome.Failed(
                 detail = DETAIL_CANCELLED,
                 message = "語音合成已被中斷",
@@ -1189,7 +1236,7 @@ class OpenAiSpeechEngine(
         val jobsToCancel: List<Job>
         val claimAborted: Boolean
         synchronized(generationLock) {
-            if (stopEpoch.get() != preCheckStopEpoch || currentJob?.isActive == false) {
+            if (isShutdown.get() || stopEpoch.get() != preCheckStopEpoch || currentJob?.isActive == false) {
                 callEpoch = -1L
                 jobsToCancel = emptyList()
                 claimAborted = true
@@ -1228,7 +1275,7 @@ class OpenAiSpeechEngine(
         }
         jobsToCancel.forEach { it.cancel(CancellationException("Superseded by speech request epoch $callEpoch")) }
 
-        if (callEpoch != speechEpoch.get() || currentJob?.isActive == false) {
+        if (isShutdown.get() || callEpoch != speechEpoch.get() || currentJob?.isActive == false) {
             return@withContext SynthOutcome.Failed(
                 detail = DETAIL_CANCELLED,
                 message = "語音合成已被中斷",
@@ -1236,7 +1283,7 @@ class OpenAiSpeechEngine(
         }
 
         try {
-            if (callEpoch != speechEpoch.get() || currentJob?.isActive == false) {
+            if (isShutdown.get() || callEpoch != speechEpoch.get() || currentJob?.isActive == false) {
                 return@withContext SynthOutcome.Failed(
                     detail = DETAIL_CANCELLED,
                     message = "語音合成已被中斷",
@@ -1260,8 +1307,8 @@ class OpenAiSpeechEngine(
                 apiKeyOverride = keySupplier,
             )
 
-            // 音訊合成完成後，播放前確認目前 epoch 依然匹配，避免已被 stop 的舊音訊播放
-            if (callEpoch != speechEpoch.get() || currentJob?.isActive == false) {
+            // 音訊合成完成後，播放前確認目前 epoch 依然匹配，避免已被 stop/shutdown 的舊音訊播放
+            if (isShutdown.get() || callEpoch != speechEpoch.get() || currentJob?.isActive == false) {
                 return@withContext SynthOutcome.Failed(
                     detail = DETAIL_CANCELLED,
                     message = "語音合成已被中斷",
@@ -1270,7 +1317,7 @@ class OpenAiSpeechEngine(
 
             player.play(result.audioBytes)
 
-            if (callEpoch != speechEpoch.get() || currentJob?.isActive == false) {
+            if (isShutdown.get() || callEpoch != speechEpoch.get() || currentJob?.isActive == false) {
                 return@withContext SynthOutcome.Failed(
                     detail = DETAIL_CANCELLED,
                     message = "語音合成已被中斷",
@@ -1338,12 +1385,41 @@ class OpenAiSpeechEngine(
     }
 
     /**
-     * 關閉引擎持有的播放器資源。
+     * 關閉引擎持有的播放器資源（Stage-C P2 世代 fencing 缺口修復）。
+     * 順序不可顛倒：
+     * 1. 先以 CAS 將引擎標記為 closed（[isShutdown]），後續 [synthesizeAndPlay] 立即
+     *    fail-fast 拒絕（`Failed(CANCELLED)`），不再發 HTTP；
+     * 2. 再完整 engine stop/cancel fencing（遞增 [stopEpoch]/[speechEpoch]、取消
+     *    [activeJobs]/[activeJob]、detach player 經由 `player.stop()`），使阻塞中的
+     *    `client.synthesize()` HTTP Job 完成後 epoch 已變、檢查必失格而絕不 `player.play`；
+     * 3. 最後才關 player executors（`release()`），避免先關池導致新 prepare timer
+     *    排程失敗被吞（關閉後仍播放或無界掛起）。
+     * 關閉冪等：多次 [shutdown] 安全，首輪後僅確保釋放、不再遞增世代。
      * 若底層 [player] 為 [AndroidAudioPlayer]，轉調其 `release()` 關閉內部
      * release/timeout 背景池（兩池皆為 daemon，不關閉亦不阻塞 JVM 結束，但顯式關閉可避免測試累積閒置線程）。
-     * 非 AndroidAudioPlayer 實作則僅執行 [stop]。
+     * 非 AndroidAudioPlayer 實作則僅執行 [stop] fencing。
      */
     fun shutdown() {
+        // 冪等：僅首輪執行 fencing+標記+釋放；後續僅確保釋放且不拋出。
+        if (!isShutdown.compareAndSet(false, true)) {
+            try {
+                (player as? AndroidAudioPlayer)?.release()
+            } catch (_: Throwable) {
+            }
+            return
+        }
+        // 首輪：先完整 engine stop/cancel fencing（與 stop() 同語義），再關 executors。
+        val jobs: List<Job>
+        val shutdownEpoch: Long
+        synchronized(generationLock) {
+            stopEpoch.incrementAndGet()
+            shutdownEpoch = speechEpoch.incrementAndGet()
+            val oldJob = activeJob.getAndSet(null)
+            val snapshot = (activeJobs.toList() + listOfNotNull(oldJob)).distinct()
+            activeJobs.clear()
+            jobs = snapshot
+        }
+        jobs.forEach { it.cancel(CancellationException("Speech synthesis stopped (epoch $shutdownEpoch)")) }
         try {
             player.stop()
         } catch (_: Throwable) {

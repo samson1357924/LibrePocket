@@ -74,9 +74,13 @@ class RootFramebufferCapture(
         /**
          * 二進位審計＋位元組抽取共用（P2-A）：兩路 `*ViaBinary` 皆經此記帳，
          * 避免雙寫 verdict 映射。行為錨定：`audit.record(argv/reason/verdict)`
-         * 只記碼不記明文；僅 [ElevatedBinaryResult.Ok] 回位元組拷貝
+         * 只記碼不記明文；僅 [ElevatedBinaryResult.Ok] 且 `truncated==false`
+         * 回位元組拷貝
          * （`copyOf().takeIf { isNotEmpty() }`，防下游竄改 runner 緩衝），
-         * 其餘（Denied/TimedOut/Failed）一律回 null（呼叫方降級手動截圖）。
+         * 其餘（Denied/TimedOut/Failed，以及 Ok 但 truncated==true 的部分幀）
+         * 一律回 null（呼叫方降級手動截圖）。截斷即 null，不摘要部分幀：
+         * 截斷 PNG 仍被當成功幀摘要會虛構完整截圖，故視為不可用；
+         * 審計仍記 verdict（Ok 截斷仍記 OK，只是不回位元組）。
          */
         private fun auditAndExtract(
             request: ElevatedRequest,
@@ -84,7 +88,9 @@ class RootFramebufferCapture(
             audit: PrivilegeAuditLog,
         ): ByteArray? {
             audit.record(request.argv, request.reasonCode, result.verdict())
-            return (result as? ElevatedBinaryResult.Ok)?.stdout?.copyOf()?.takeIf { it.isNotEmpty() }
+            val ok = result as? ElevatedBinaryResult.Ok ?: return null
+            if (ok.truncated) return null
+            return ok.stdout.copyOf().takeIf { it.isNotEmpty() }
         }
 
         /**
@@ -117,8 +123,9 @@ class RootFramebufferCapture(
                 val request = ElevatedRequest(listOf("screencap", "-p"), reasonCode)
                 val result = runner.run(request, timeoutMs)
                 audit.recordResult(request, result)
-                (result as? ShellResult.Ok)
-                    ?.stdout?.toByteArray(Charsets.UTF_8)?.takeIf { it.isNotEmpty() }
+                val ok = result as? ShellResult.Ok
+                if (ok == null || ok.truncated) null
+                else ok.stdout.toByteArray(Charsets.UTF_8).takeIf { it.isNotEmpty() }
             }
         }
 
@@ -142,8 +149,9 @@ class RootFramebufferCapture(
                 val request = ElevatedRequest(listOf("cat", "/dev/graphics/fb0"), reasonCode)
                 val result = runner.run(request, timeoutMs)
                 audit.recordResult(request, result)
-                (result as? ShellResult.Ok)
-                    ?.stdout?.toByteArray(Charsets.UTF_8)?.takeIf { it.isNotEmpty() }
+                val ok = result as? ShellResult.Ok
+                if (ok == null || ok.truncated) null
+                else ok.stdout.toByteArray(Charsets.UTF_8).takeIf { it.isNotEmpty() }
             }
         }
 

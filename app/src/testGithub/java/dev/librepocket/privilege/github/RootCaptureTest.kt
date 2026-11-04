@@ -1,5 +1,9 @@
 package dev.librepocket.privilege.github
 
+import dev.librepocket.shell.ElevatedRequest
+import dev.librepocket.shell.ElevatedShellRunner
+import dev.librepocket.shell.PrivilegeAuditLog
+import dev.librepocket.shell.ShellResult
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -67,5 +71,40 @@ class RootCaptureTest {
         assertNull(screen())
         assertEquals(2, audit.size())
         assertEquals(mapOf("DENY" to 2), audit.countByVerdict())
+    }
+
+    @Test fun truncatedOkYieldsNullWithoutSummarizingPartialFrame() {
+        // 終審 MAJOR：Ok.truncated 部分幀不可摘要，必須回 null（呼叫方降級手動截圖）；
+        // 審計仍記 verdict（OK），只清單元行為（binary + string 雙路徑）。
+        val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x01)
+
+        // 二進位路徑：screencap + fb0 皆 null。
+        val binaryAudit = PrivilegeAuditLog()
+        val binaryRunner = TruncatedBinaryRunner(png)
+        assertNull(RootFramebufferCapture.screencapViaBinary(binaryRunner, binaryAudit, "T")())
+        assertNull(RootFramebufferCapture.fb0ViaBinary(binaryRunner, binaryAudit, "T")())
+        assertEquals(mapOf("OK" to 2), binaryAudit.countByVerdict())
+
+        // String 回落路徑：同樣 truncated 即 null（審計仍記 OK）。
+        val stringAudit = PrivilegeAuditLog()
+        val stringRunner = TruncatedStringRunner()
+        assertNull(RootFramebufferCapture.screencapViaElevated(stringRunner, stringAudit, "T")())
+        assertNull(RootFramebufferCapture.fb0ViaElevated(stringRunner, stringAudit, "T")())
+        assertEquals(mapOf("OK" to 2), stringAudit.countByVerdict())
+    }
+
+    private class TruncatedBinaryRunner(
+        private val bytes: ByteArray,
+    ) : BinaryElevatedRunner {
+        override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult =
+            ShellResult.Ok("unused", "", 0, false)
+
+        override fun runBinary(request: ElevatedRequest, timeoutMs: Long): ElevatedBinaryResult =
+            ElevatedBinaryResult.Ok(bytes, ByteArray(0), 0, true)
+    }
+
+    private class TruncatedStringRunner : ElevatedShellRunner {
+        override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult =
+            ShellResult.Ok("partial-png", "", 0, true)
     }
 }

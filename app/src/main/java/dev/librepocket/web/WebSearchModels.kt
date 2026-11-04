@@ -20,7 +20,7 @@ object WebSearchBudgets {
     const val MAX_COUNT = 10
     const val DEFAULT_COUNT = 5
 
-    /** Model 可見總字元預算（結果集 title＋snippet＋url 加總，超限截斷並標記）。 */
+    /** Model 可見總字元預算（結果集 title＋snippet＋url＋siteName＋published 加總，超限截斷並標記）。 */
     const val MAX_MODEL_CHARS = 20_000
 
     fun countOf(raw: Int?): Int = (raw ?: DEFAULT_COUNT).coerceIn(MIN_COUNT, MAX_COUNT)
@@ -43,11 +43,13 @@ private fun String.takeUtf16Prefix(n: Int): String {
 /**
  * 按 [WebSearchBudgets.MAX_MODEL_CHARS] 截斷結果集。
  *
- * 逐筆保留完整 item；邊界筆只截 `snippet`（保留 title／url 可追溯；
- * `room == 0` 時保留空 snippet 的邊界筆，仍標記 `truncated=true`）；
+ * 逐筆保留：固定部（title／url／siteName／published）完整保留（可追溯）、
+ * `snippet` 截至剩餘預算（`room == 0` 保留邊界 item 且 snippet 為空；僅在實際丟棄／裁切內容時
+ *（整筆跳過或 snippet 變短）才標記 `truncated=true`）；
+ * 固定部即超預算的 hit 整筆跳過（即使首筆；繼續後續更小的 hit），並標記 `truncated=true`；
  * 空輸入回傳空＋`truncated=false`，永不拋異常。
  *
- * Cost 含 url（`title.length + snippet.length + url.length`），避免長 URL
+ * Cost 為 model 可見總和（`title.length + snippet.length + url.length + siteName + published`），避免長 URL
  * 繞過預算；`maxChars.coerceAtLeast(1)` 是呼叫方 bug 的保護性箝制
  *（`maxChars <= 0` 視為 1，不拋異常）。
  * 截斷使用 [takeUtf16Prefix]，不切斷 surrogate pair。
@@ -58,24 +60,20 @@ fun capResultsForModel(
 ): CappedResults {
     val cap = maxChars.coerceAtLeast(1)
     var used = 0
+    var truncated = false
     val kept = ArrayList<WebSearchResult>(results.size)
     for (r in results) {
-        val cost = r.title.length + r.snippet.length + r.url.length
-        if (used + cost <= cap) {
-            kept.add(r)
-            used += cost
+        val fixed = r.title.length + r.url.length +
+            (r.siteName?.length ?: 0) + (r.published?.length ?: 0)
+        val room = cap - used - fixed
+        if (room < 0) {
+            truncated = true
             continue
         }
-        // 邊界筆：title＋url 完整保留（可追溯），snippet 截斷至剩餘預算。
-        // room == 0 仍保留（空 snippet），故用 >= 0。
-        val room = cap - used - r.title.length - r.url.length
-        if (room >= 0) {
-            kept.add(r.copy(snippet = r.snippet.takeUtf16Prefix(room)))
-        } else if (kept.isEmpty()) {
-            // 首筆 title 即超預算：只保留 title 前綴，snippet 清空。
-            kept.add(r.copy(title = r.title.takeUtf16Prefix(cap), snippet = ""))
-        }
-        return CappedResults(kept.toList(), true)
+        val snippet = r.snippet.takeUtf16Prefix(room)
+        if (snippet.length < r.snippet.length) truncated = true
+        kept.add(r.copy(snippet = snippet))
+        used += fixed + snippet.length
     }
-    return CappedResults(kept.toList(), false)
+    return CappedResults(kept.toList(), truncated)
 }

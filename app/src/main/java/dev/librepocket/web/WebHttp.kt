@@ -44,7 +44,11 @@ internal sealed interface FetchOut {
  * 帶可注入 timeout 的抓取＋typed error 映射（兩 provider 共用）。
  *
  * - [TimeoutCancellationException]／[SocketTimeoutException]／[InterruptedIOException]
- *   （OkHttp callTimeout／HTTP-2／Okio 寫入超時形態）→ `TIMEOUT`。
+ *   （OkHttp callTimeout／HTTP-2／Okio 寫入超時形態）→ `TIMEOUT`；但外層
+ *   [withTimeout] 的取消同樣以 [TimeoutCancellationException] 送達，故 TCE
+ *   catch 首行先 `ensureActive()` 區分：自家 timeout → 外層仍 active → guard
+ *   通過 → 回 `TIMEOUT`；外層取消 → guard 拋 [CancellationException] 透傳
+ *   （不映射、不快取、不 fallback）。catch 順序保持 TCE 在 CE 之前。
  * - 外部取消（[CancellationException]，非超時）原樣透傳：不映射、不快取、不 fallback。
  * - 其他 [IOException] → `TRANSPORT`；fetcher 拋出的其他異常 → `TRANSPORT`
  *  （fail-closed 且允許非 pinned fallback；見 [WebSearchSelector.mayFallback]）。
@@ -58,6 +62,9 @@ internal suspend fun fetchWithTimeout(
     val response = try {
         withTimeout(timeoutMs.coerceAtLeast(1)) { httpGet.get(url, headers) }
     } catch (e: TimeoutCancellationException) {
+        // TCE 可能是自家 withTimeout，也可能是外層取消：ensureActive 區分。
+        // 自家超時 → 外層仍 active → 通過 → TIMEOUT；外層取消 → 拋 CE 透傳。
+        currentCoroutineContext().ensureActive()
         return FetchOut.Fail(WebFailureReason.TIMEOUT)
     } catch (e: CancellationException) {
         throw e

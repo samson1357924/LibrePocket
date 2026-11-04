@@ -6,9 +6,11 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -403,13 +405,14 @@ class WebSearchPhase5Test {
 
     // ---- Models ----
 
-    @Test fun firstItemTitleOverflowTruncatesTitle() {
+    @Test fun firstItemFixedOverflowDropsHit() {
+        // Strict budget (human-review-requested): a hit whose fixed part
+        // (title+url+siteName+published) already exceeds cap is dropped whole,
+        // even when first (old behavior kept a title-prefix slice; removed).
         val r = WebSearchResult("A".repeat(100), "https://e.com/", "s")
         val out = capResultsForModel(listOf(r), maxChars = 10)
         assertTrue(out.truncated)
-        assertEquals(1, out.results.size)
-        assertEquals("", out.results.single().snippet)
-        assertEquals(10, out.results.single().title.length)
+        assertTrue(out.results.isEmpty())
     }
 
     @Test fun roomZeroKeepsBoundaryWithEmptySnippet() {
@@ -434,7 +437,8 @@ class WebSearchPhase5Test {
         for (cap in listOf(0, -5)) {
             val out = capResultsForModel(listOf(r), maxChars = cap)
             assertTrue("cap=$cap", out.truncated)
-            assertEquals("cap=$cap", 1, out.results.size)
+            // Strict budget: fixed part (2+1=3) > coerced cap (1) -> dropped whole.
+            assertTrue("cap=$cap", out.results.isEmpty())
         }
     }
 
@@ -564,5 +568,91 @@ class WebSearchPhase5Test {
         assertTrue(out is WebSearchOutcome.Failed)
         assertEquals(WebFailureReason.TRANSPORT, (out as WebSearchOutcome.Failed).reason)
         assertEquals(2, calls.get())
+    }
+
+    // ---- Round-2 P1: outer-timeout is cancel (no fallback) / strict budget ----
+
+    @Test fun outerTimeoutIsCancelNotFallback() = runBlocking {
+        val http = FakeHttp {
+            delay(30_000) // cooperative suspend: outer withTimeout can interrupt
+            WebHttpResponse(200, """{"results":[]}""")
+        }
+        val p = SearxngSearchProvider("https://search.example", http, timeoutMs = 10_000)
+        try {
+            withTimeout(75) { p.search("q", 5) }
+            fail("outer withTimeout must throw CE, not return Failed(TIMEOUT)")
+        } catch (e: CancellationException) {
+            // Expected: outer cancel surfaces (as TCE) and propagates —
+            // not mapped to Failed(TIMEOUT), no fallback value.
+            assertTrue(e is TimeoutCancellationException)
+        }
+        assertEquals(1, http.calls.get()) // one upstream attempt, no retry/value
+    }
+
+    @Test fun innerTimeoutStillMapsToFailedTimeout() = runBlocking {
+        var observedCancel = false
+        val http = FakeHttp {
+            try {
+                delay(30_000)
+                WebHttpResponse(200, """{"results":[]}""")
+            } catch (e: CancellationException) {
+                observedCancel = true
+                throw e
+            }
+        }
+        // No outer timeout: own timeoutMs fires -> Failed(TIMEOUT), fallback allowed.
+        val out = SearxngSearchProvider("https://search.example", http, timeoutMs = 50).search("q", 5)
+        assertTrue(out is WebSearchOutcome.Failed)
+        assertEquals(WebFailureReason.TIMEOUT, (out as WebSearchOutcome.Failed).reason)
+        assertTrue(out.fallbackAllowed)
+        assertTrue(observedCancel)
+    }
+
+    @Test fun firstItemHugeUrlDropped() {
+        val huge = WebSearchResult("T", "https://example.com/" + "x".repeat(25_000), "s")
+        val out = capResultsForModel(listOf(huge), maxChars = 20_000)
+        // fixed part (1 + 25020) > cap -> dropped whole.
+        assertTrue(out.truncated)
+        assertTrue(out.results.isEmpty())
+        // Mixed: after skipping huge, the fitting hit is still kept.
+        val small = WebSearchResult("t", "https://example.com/s", "snippet")
+        val mixed = capResultsForModel(listOf(huge, small), maxChars = 20_000)
+        assertTrue(mixed.truncated)
+        assertEquals(1, mixed.results.size)
+        assertEquals(small.url, mixed.results.single().url)
+        for (r in mixed.results) {
+            assertTrue(r.title.length + r.snippet.length + r.url.length <= 20_000)
+        }
+    }
+
+    @Test fun siteNamePublishedCountTowardBudget() {
+        val heavy = WebSearchResult(
+            title = "T",
+            url = "https://example.com/",
+            snippet = "hello",
+            published = "p".repeat(500),
+            siteName = "s".repeat(500),
+        )
+        // fixed = 1+20+500+500 = 1021 > 100 -> dropped whole.
+        val dropped = capResultsForModel(listOf(heavy), maxChars = 100)
+        assertTrue(dropped.truncated)
+        assertTrue(dropped.results.isEmpty())
+        // Property-style: every output's model-visible total stays within cap.
+        val cases = listOf(
+            2_000 to listOf(heavy),
+            60 to listOf(
+                WebSearchResult("a", "https://e.com/1", "s1", "2024-01-02", "e.com"),
+                WebSearchResult("b", "https://e.com/2", "s2".repeat(50), "2024-01-03", "e.com"),
+                WebSearchResult("c", "https://e.com/3", "s3"),
+            ),
+        )
+        for ((c, hits) in cases) {
+            val capped = capResultsForModel(hits, maxChars = c)
+            val total = capped.results.sumOf {
+                it.title.length + it.snippet.length + it.url.length +
+                    (it.siteName?.length ?: 0) + (it.published?.length ?: 0)
+            }
+            assertTrue("cap=$c total=$total", total <= c)
+        }
     }
 }

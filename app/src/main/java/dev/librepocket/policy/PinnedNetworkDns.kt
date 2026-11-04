@@ -4,6 +4,7 @@ import java.net.InetAddress
 import java.net.UnknownHostException
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CancellationException
 import okhttp3.Dns
 
 /**
@@ -22,6 +23,9 @@ import okhttp3.Dns
  *
  * 純 JVM，可單測；production 由 provider transport 按次建構（per-request），
  * 不做全域單例（避免跨 endpoint 污染）。
+ *
+ * 直連視角：proxy 環境下實際建連地址由代理決定，本 pin 不生效，
+ * 代理鏈政策由 A4 處理（此處行為不變，僅聲明假設）。
  */
 class PinnedNetworkDns(
   pinned: Map<String, List<InetAddress>> = emptyMap(),
@@ -70,8 +74,10 @@ class PinnedNetworkDns(
     val old = pinned[key] ?: return null
     val fresh = try {
       delegate.resolve(host)
-    } catch (_: Exception) {
-      // 重查失敗 fail-closed：視為可疑，呼叫方重驗（回 true 比吞掉更安全）。
+    } catch (e: Exception) {
+      // 重查失敗 fail-closed：視為可疑，呼叫方重驗（回 true 比吞掉更安全）；
+      // 唯協程取消必須透傳，不可吞沒。
+      if (e is CancellationException) throw e
       return true
     }
     if (fresh.isEmpty()) return true
@@ -79,8 +85,26 @@ class PinnedNetworkDns(
   }
 
   companion object {
-    internal fun normalize(host: String): String =
-      host.trim().trimEnd('.').lowercase(Locale.ROOT)
+    /**
+     * 與 OkHttp `HttpUrl.host` 正規化對齊：去首尾空白／IPv6 方括號／尾點後小寫
+     * （`toHttpUrl().host` 無括號，但 lookup 側可能帶括號如 `[::1]`，須同一鍵）。
+     * 循環剝（先括號再尾點，反覆至穩定）：`[::1].`、`[::1.]` 皆歸一為 `::1`。
+     */
+    internal fun normalize(host: String): String {
+      var s = host.trim()
+      while (true) {
+        if (s.length >= 2 && s.startsWith('[') && s.endsWith(']')) {
+          s = s.substring(1, s.length - 1)
+          continue
+        }
+        if (s.endsWith('.')) {
+          s = s.dropLast(1)
+          continue
+        }
+        break
+      }
+      return s.lowercase(Locale.ROOT)
+    }
 
     /** 由一次放行決策建構 per-request pinning DNS（只釘該 host）。 */
     fun forHost(host: String, addresses: List<InetAddress>, delegate: HostResolver = SystemHostResolver): PinnedNetworkDns {

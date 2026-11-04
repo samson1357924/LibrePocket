@@ -397,4 +397,41 @@ class NetworkPolicyTest {
       NetworkPolicy.evaluateUrl("http://192.168.1.20/", EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS), neverResolve),
     )
   }
+
+  // —— 補釘：保留段／內嵌 v4／括號正規化（review MAJOR-2） ——
+
+  @Test fun reservedV4IsUnspecifiedAlwaysBlocked() {
+    // 0/8、240/4、broadcast：isAnyLocalAddress 漏判，此處位元組精確補擋，opt-in 也打不開。
+    for (ip in listOf("0.1.2.3", "240.0.0.1", "255.255.255.255")) {
+      assertEquals(ip, AddressClass.UNSPECIFIED, NetworkPolicy.classifyAddress(addr(ip)))
+    }
+    val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
+    for (ip in listOf("0.1.2.3", "240.0.0.1", "255.255.255.255")) {
+      assertDenied(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("https://$ip/", resolver = neverResolve))
+      assertDenied(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("http://$ip/", optIn, neverResolve))
+    }
+  }
+
+  @Test fun nat64EmbeddedPrivateDecision() {
+    // 64:ff9b::c0a8:101 內嵌 192.168.1.1：按 v4 重走為 PRIVATE（預設拒、opt-in 放行）。
+    assertEquals(AddressClass.PRIVATE, NetworkPolicy.classifyAddress(addr("64:ff9b::c0a8:101")))
+    assertDenied(
+      NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED,
+      NetworkPolicy.evaluateUrl("https://[64:ff9b::c0a8:101]/", resolver = neverResolve),
+    )
+    val allowed = NetworkPolicy.evaluateUrl(
+      "https://[64:ff9b::c0a8:101]/",
+      EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS),
+      neverResolve,
+    )
+    assertTrue("expected allow: $allowed", allowed.allowed)
+    assertEquals(AddressClass.PRIVATE, allowed.addressClass)
+  }
+
+  @Test fun ipv4MappedLoopbackStaysMapped() {
+    // 16-byte ::ffff:127.0.0.1 經位元組分類仍為 IPV4_MAPPED（永遠阻擋），不因內嵌 v4 是迴環而降級為 LOOPBACK。
+    val raw = ByteArray(10) + byteArrayOf(0xff.toByte(), 0xff.toByte()) + byteArrayOf(127, 0, 0, 1)
+    val mapped = java.net.Inet6Address.getByAddress(null, raw, 0)
+    assertEquals(AddressClass.IPV4_MAPPED, NetworkPolicy.classifyAddress(mapped))
+  }
 }

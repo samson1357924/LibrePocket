@@ -203,9 +203,9 @@ internal fun redirectBlockedFailure(httpCode: Int): ProviderFailure = ProviderFa
 /**
  * S2 redirect 逐跳重驗 hook（0-follow 執行面）。
  *
- * Provider／MCP 永不跟隨：任何 3xx 一律 [redirectBlockedFailure] 終端，
- * 絕不重送 credential／body。若 `Location` 存在，嘗試對其做一次
- * `evaluateUrl`（for audit，結果僅供除錯，不影響阻擋——即使 target 評估為
+ * Provider／MCP 永不跟隨：301/302/303/307/308 (304/305/306 明確排除)一律
+ * [redirectBlockedFailure] 終端，絕不重送 credential／body。若 `Location` 存在，
+ * 嘗試對其做一次 `evaluateUrl`（for audit，結果僅供除錯，不影響阻擋——即使 target 評估為
  * allow 也照擋；WebFetch 逐跳重驗待 A4，此處誠實揭露為單跳阻擋）。
  */
 internal fun evaluateRedirectTargetHook(
@@ -216,7 +216,8 @@ internal fun evaluateRedirectTargetHook(
     if (location.isNullOrBlank()) return null
     return try {
         NetworkPolicy.evaluateUrl(location, optIn, resolver)
-    } catch (_: Exception) {
+    } catch (e: Exception) {
+        if (e is CancellationException) throw e
         null
     }
 }
@@ -431,7 +432,7 @@ internal suspend fun <T> executeProviderRequest(
     try {
         currentCoroutineContext().ensureActive()
         val response = call.execute()
-        // S2 redirect 執行面：0-follow，任何 3xx 即 REDIRECT_BLOCKED 終端
+        // S2 redirect 執行面：0-follow，301/302/303/307/308 (304/305/306 明確排除)即 REDIRECT_BLOCKED 終端
         //（不重送 credential／body；Location 逐跳重驗 hook 僅供 audit，照擋）。
         if (NetworkPolicy.isRedirectStatus(response.code)) {
             evaluateRedirectTargetHook(response.header("Location"), optIn, resolver)
@@ -532,7 +533,7 @@ internal suspend fun pumpSse(
         var protocolTerminalReached = false
         try {
             try {
-                // S2 redirect 執行面：0-follow，任何 3xx 即 REDIRECT_BLOCKED 終端。
+                // S2 redirect 執行面：0-follow，301/302/303/307/308 (304/305/306 明確排除)即 REDIRECT_BLOCKED 終端。
                 if (NetworkPolicy.isRedirectStatus(response.code)) {
                     evaluateRedirectTargetHook(response.header("Location"), optIn, resolver)
                     try {

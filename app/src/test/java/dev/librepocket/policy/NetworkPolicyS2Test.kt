@@ -327,4 +327,24 @@ class NetworkPolicyS2Test {
     assertNotNull(client)
     assertEquals(listOf(addr("10.1.2.3")), pinned.pinnedFor("example.com"))
   }
+
+  @Test fun redirectStatusCodesOnlyTrueRedirects() {
+    // 301/302/303/307/308 為真跳轉；304/305/306 無 Location 跳轉語義，明確排除。
+    for (code in listOf(300, 301, 302, 303, 307, 308)) {
+      assertTrue("$code must be redirect", NetworkPolicy.isRedirectStatus(code))
+    }
+    for (code in listOf(200, 304, 305, 306)) {
+      assertFalse("$code must not be redirect", NetworkPolicy.isRedirectStatus(code))
+    }
+  }
+
+  @Test fun pinnedNormalizeStripsBracketsAndTrailingDot() {
+    assertEquals("::1", PinnedNetworkDns.normalize("[::1]"))
+    assertEquals("::1", PinnedNetworkDns.normalize("[::1]."))
+    assertEquals("example.com", PinnedNetworkDns.normalize("Example.COM."))
+    // pin 與 lookup 同一鍵：括號形 pin 無括號形查。
+    val pinned = PinnedNetworkDns.forHost("[::1]", listOf(addr("::1")))
+    assertEquals(listOf(addr("::1")), pinned.lookup("::1"))
+    assertEquals(listOf(addr("::1")), pinned.pinnedFor("[::1]."))
+  }
 }

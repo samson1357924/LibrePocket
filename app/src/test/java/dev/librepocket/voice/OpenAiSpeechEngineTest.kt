@@ -3680,4 +3680,441 @@ class OpenAiSpeechEngineTest {
             }
         }
     }
+
+    // ---- Stage-A 第四輪：無界 cached mute pool 資源耗盡壓力回歸（P1/BLOCK） ----
+    @Test
+    fun androidAudioPlayer_mutePressureStress_boundedFailClosedAndDrains() = runBlocking {
+        // 阻塞 native stop（latch 不解除），連續 N=20 次 play/stop：
+        // 有界池（2 workers + 8 queue + retained 8 sessions/128MiB）不得隨 N 線性增長，
+        // 超額新 play 必須 fail-closed 明確拒絕（CancellationException），且解除 latch 後全釋放。
+        val n = 20
+        val unblockStop = CountDownLatch(1)
+        val created = java.util.Collections.synchronizedList(mutableListOf<TestMediaPlayer>())
+        val player = AndroidAudioPlayer(
+            mediaPlayerFactory = {
+                val mp = object : TestMediaPlayer() {
+                    override fun stop() {
+                        unblockStop.await(10, TimeUnit.SECONDS)
+                        super.stop()
+                    }
+                }
+                created.add(mp)
+                mp
+            },
+            prepareTimeoutMs = 5000L,
+        )
+        try {
+            var accepted = 0
+            var rejected = 0
+            repeat(n) { idx ->
+                val before = created.size
+                var playEx: Throwable? = null
+                val job = launch(Dispatchers.IO) {
+                    try {
+                        player.play(byteArrayOf(0x01, 0x02))
+                    } catch (e: Throwable) {
+                        playEx = e
+                    }
+                }
+                // 等待進入 PREPARING（accepted）或快速拒絕（rejected）；任一即繼續 stop。
+                val startMs = System.currentTimeMillis()
+                var observedPreparing = false
+                while (System.currentTimeMillis() - startMs < 2000L) {
+                    if (job.isCompleted) break
+                    val sz = try {
+                        created.size
+                    } catch (_: Throwable) {
+                        before
+                    }
+                    if (sz > before) {
+                        val last = try {
+                            created.lastOrNull()
+                        } catch (_: Throwable) {
+                            null
+                        }
+                        if (last != null && last.prepareAsyncCalled) {
+                            observedPreparing = true
+                            break
+                        }
+                    }
+                    delay(10)
+                }
+                val t0 = System.nanoTime()
+                player.stop()
+                val elapsedMs = (System.nanoTime() - t0) / 1_000_000
+                assertTrue("stop #$idx must be bounded (<1000ms) while mute blocked, elapsed=${elapsedMs}ms", elapsedMs < 1000)
+                withTimeout(5000L) {
+                    job.join()
+                }
+                assertTrue("play job #$idx must complete bounded, not hang", !job.isActive)
+                val after = try {
+                    created.size
+                } catch (_: Throwable) {
+                    before
+                }
+                if (after > before) {
+                    accepted += 1
+                    // accepted 經 stop 取消，應為 CancellationException（統一取消契約）。
+                    assertTrue("accepted play #$idx must be cancelled, was $playEx", playEx is CancellationException)
+                } else {
+                    rejected += 1
+                    assertTrue("rejected play #$idx must be explicit CancellationException, was $playEx", playEx is CancellationException)
+                }
+                // 施壓期間即時上界（不隨 N 線性增長）。
+                assertTrue(
+                    "live workers bounded <=${AndroidAudioPlayer.MAX_MUTE_WORKERS}, was ${player.muteInFlightForTest()}",
+                    player.muteInFlightForTest() <= AndroidAudioPlayer.MAX_MUTE_WORKERS,
+                )
+                assertTrue(
+                    "mute queue bounded <=${AndroidAudioPlayer.MAX_MUTE_QUEUE}, was ${player.muteQueueDepthForTest()}",
+                    player.muteQueueDepthForTest() <= AndroidAudioPlayer.MAX_MUTE_QUEUE,
+                )
+                assertTrue(
+                    "retained sessions bounded <=${AndroidAudioPlayer.MAX_RETAINED_SESSIONS}, was ${player.retainedSessionsForTest()}",
+                    player.retainedSessionsForTest() <= AndroidAudioPlayer.MAX_RETAINED_SESSIONS,
+                )
+                assertTrue(
+                    "retained bytes bounded <=${AndroidAudioPlayer.MAX_RETAINED_BYTES}, was ${player.retainedBytesForTest()}",
+                    player.retainedBytesForTest() <= AndroidAudioPlayer.MAX_RETAINED_BYTES,
+                )
+            }
+            assertTrue("accepted=$accepted must be bounded < N=$n (not linear)", accepted < n)
+            assertTrue(
+                "accepted=$accepted must fit atomic gate bound (<=${AndroidAudioPlayer.MAX_RETAINED_SESSIONS})",
+                accepted <= AndroidAudioPlayer.MAX_RETAINED_SESSIONS,
+            )
+            assertTrue("must have explicit rejections, rejected=$rejected", rejected > 0)
+            assertTrue(
+                "playRejectedCount must be >0 under pressure (atomic gate), was ${player.playRejectedCount.get()}",
+                player.playRejectedCount.get() > 0,
+            )
+            assertEquals(
+                "play saturation must not pollute muteRejectedCount, was ${player.muteRejectedCount.get()}",
+                0,
+                player.muteRejectedCount.get(),
+            )
+            assertEquals(
+                "pressure must not spawn fallback threads (bounded, no new threads)",
+                0,
+                player.muteFallbackCount.get(),
+            )
+            assertEquals(
+                "atomic gate must prevent release pressure (no bounded leak), releaseRejected=${player.releaseRejectedCount.get()}, leaked=${player.releaseLeakedCount.get()}",
+                0,
+                player.releaseRejectedCount.get(),
+            )
+            assertEquals(
+                "no bounded leak under sequential gate pressure, leaked=${player.releaseLeakedCount.get()}",
+                0,
+                player.releaseLeakedCount.get(),
+            )
+            assertTrue(
+                "retained stays bounded, was ${player.retainedSessionsForTest()}",
+                player.retainedSessionsForTest() <= AndroidAudioPlayer.MAX_RETAINED_SESSIONS,
+            )
+            // 解除 latch：背景 mute 逐一完成，鏈式 release 全成，無洩漏。
+            unblockStop.countDown()
+            awaitCondition(timeoutMs = 5000L) { player.retainedSessionsForTest() == 0 }
+            awaitCondition(timeoutMs = 5000L) { player.muteInFlightForTest() == 0 && player.muteQueueDepthForTest() == 0 }
+            awaitCondition(timeoutMs = 5000L) {
+                try {
+                    created.all { it.releaseCalled }
+                } catch (_: Throwable) {
+                    false
+                }
+            }
+            assertTrue("all retained sessions must eventually release after unblock", created.all { it.releaseCalled })
+            assertEquals(0, player.retainedSessionsForTest())
+            assertEquals(0L, player.retainedBytesForTest())
+            assertEquals(0, player.muteInFlightForTest())
+        } finally {
+            unblockStop.countDown()
+            try {
+                player.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    @Test
+    fun synthesizeAndPlay_playerSaturatedCancellation_returnsFailedCancelled() = runBlocking {
+        // Engine 層 fail-closed 映射：player 因 mute 飽和拒絕（CancellationException）
+        // 時，synthesizeAndPlay 必須回 Failed(CANCELLED) 而非拋出/懸掛（呼叫端未取消時）。
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/mpeg")
+                .setBody(Buffer().write(byteArrayOf(0x01, 0x02))),
+        )
+        val saturatingPlayer = FakeAudioPlayer(
+            throwOnPlay = CancellationException("muted pool saturated (test)"),
+        )
+        val client = OpenAiTtsClient(
+            baseUrl = server.url("/").toString(),
+            apiKey = { "test-key".toCharArray() },
+            allowTestLoopback = true,
+        )
+        val engine = OpenAiSpeechEngine(client = client, player = saturatingPlayer, allowTestLoopback = true)
+        try {
+            val outcome = engine.synthesizeAndPlay(
+                text = "saturated mapping",
+                voiceOutputOn = true,
+                openAiTtsOn = true,
+            )
+            assertTrue(
+                "saturated player must map to Failed(CANCELLED), was: $outcome",
+                outcome is OpenAiSpeechEngine.Companion.SynthOutcome.Failed &&
+                    outcome.detail == OpenAiSpeechEngine.DETAIL_CANCELLED,
+            )
+            assertEquals(1, saturatingPlayer.playCount.get())
+        } finally {
+            try {
+                engine.shutdown()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    // ---- Stage-A 第四輪 review：bytes 上界 + 併發 burst + queue 滿 Abort ----
+
+    private fun setRetainedForTest(player: AndroidAudioPlayer, sessions: Int, bytes: Long) {
+        try {
+            val sessionsField = AndroidAudioPlayer::class.java.getDeclaredField("retainedSessions")
+            sessionsField.isAccessible = true
+            (sessionsField.get(player) as AtomicInteger).set(sessions)
+            val bytesField = AndroidAudioPlayer::class.java.getDeclaredField("retainedBytes")
+            bytesField.isAccessible = true
+            (bytesField.get(player) as java.util.concurrent.atomic.AtomicLong).set(bytes)
+        } catch (e: Throwable) {
+            throw AssertionError("reflection setRetained failed: $e")
+        }
+    }
+
+    @Test
+    fun androidAudioPlayer_bytesGate_largePayloadRejectedAndCountedSeparately() = runBlocking {
+        // bytes 上界觸發：預填 retainedBytes 至 MAX-1MiB，再以 2MiB 大 payload 觸發 bytes gate。
+        // 驗證原子預佔回滾、計 playRejectedCount（不混入 muteRejectedCount）、factory 未被呼叫（無 native）。
+        val factoryCalls = AtomicInteger(0)
+        val player = AndroidAudioPlayer(
+            mediaPlayerFactory = {
+                factoryCalls.incrementAndGet()
+                TestMediaPlayer()
+            },
+            prepareTimeoutMs = 5000L,
+        )
+        try {
+            val oneMiB = 1024L * 1024L
+            setRetainedForTest(player, 0, AndroidAudioPlayer.MAX_RETAINED_BYTES - oneMiB)
+            val beforeSessions = player.retainedSessionsForTest()
+            val beforeBytes = player.retainedBytesForTest()
+            val largePayload = ByteArray((2 * 1024 * 1024)) { 0x07 }
+
+            var playEx: Throwable? = null
+            try {
+                player.play(largePayload)
+            } catch (e: Throwable) {
+                playEx = e
+            }
+            assertNotNull("large payload exceeding bytes bound must be rejected", playEx)
+            assertTrue("bytes gate must fail-closed with CancellationException, was: $playEx", playEx is CancellationException)
+            assertEquals("factory must not be called on bytes-gate rejection", 0, factoryCalls.get())
+            assertEquals("bytes-gate rejection must count playRejectedCount", 1, player.playRejectedCount.get())
+            assertEquals("bytes-gate rejection must not pollute muteRejectedCount", 0, player.muteRejectedCount.get())
+            assertEquals("sessions must rollback on bytes-gate rejection", beforeSessions, player.retainedSessionsForTest())
+            assertEquals("bytes must rollback on bytes-gate rejection", beforeBytes, player.retainedBytesForTest())
+            // 小 payload 在乾淨狀態下可通過 gate（sessions=0 未觸發 sessions 界，證明大 payload 拒絕確為 bytes 界）。
+            setRetainedForTest(player, 0, 0)
+            val smallPayload = byteArrayOf(0x01, 0x02)
+            // 小 payload 僅預佔不觸發 bytes 界，但會進入 PREPARING；用超時保護避免懸掛。
+            val job = launch(Dispatchers.IO) {
+                try {
+                    player.play(smallPayload)
+                } catch (_: Throwable) {
+                }
+            }
+            // 等待進入 PREPARING（factory 已呼叫）即取消，避免 5s 超時拖慢測試。
+            val startMs = System.currentTimeMillis()
+            while (System.currentTimeMillis() - startMs < 2000L) {
+                if (factoryCalls.get() > 0) break
+                delay(10)
+            }
+            assertTrue("small payload must pass bytes gate and reach factory", factoryCalls.get() > 0)
+            job.cancel()
+            withTimeout(5000L) { job.join() }
+            // 取消後預佔最終回滾（背景釋放完成）。
+            awaitCondition(timeoutMs = 5000L) { player.retainedSessionsForTest() == 0 }
+            assertEquals(0L, player.retainedBytesForTest())
+        } finally {
+            try {
+                player.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    @Test
+    fun androidAudioPlayer_concurrentBurst_atomicGateBoundsTotal() = runBlocking {
+        // 併發 burst：20 併發 play，factory 阻塞以最大化重疊，原子預佔保證總量 <= MAX（無 gate+併發度 burst）。
+        // 通過 gate 者 = factory 進入數（<=MAX）；未通過者即時 gate 拒絕（計 playRejectedCount）。
+        // 通過者隨後互相取代：僅最後勝者留存 PREPARING，其餘 superseded 取消（CancellationException，
+        // 但不計 playRejectedCount）；勝者最終因 prepare 超時而 TimeoutException。
+        val n = 20
+        val factoryEntered = AtomicInteger(0)
+        val factoryUnblock = CountDownLatch(1)
+        val created = java.util.Collections.synchronizedList(mutableListOf<TestMediaPlayer>())
+        val player = AndroidAudioPlayer(
+            mediaPlayerFactory = {
+                factoryEntered.incrementAndGet()
+                // 阻塞 factory，製造最大併發重疊；所有通過 gate 者皆卡於此持有預佔。
+                factoryUnblock.await(5, TimeUnit.SECONDS)
+                val mp = TestMediaPlayer()
+                created.add(mp)
+                mp
+            },
+            prepareTimeoutMs = 800L,
+        )
+        try {
+            val results = java.util.Collections.synchronizedList(mutableListOf<Throwable?>())
+            val jobs = (0 until n).map {
+                launch(Dispatchers.IO) {
+                    var ex: Throwable? = null
+                    try {
+                        player.play(byteArrayOf(0x01, 0x02))
+                    } catch (e: Throwable) {
+                        ex = e
+                    }
+                    results.add(ex)
+                }
+            }
+            // 等待通過 gate 者全部進入 factory（至多 MAX 個），其餘應已快速拒絕。
+            val startMs = System.currentTimeMillis()
+            while (System.currentTimeMillis() - startMs < 3000L) {
+                if (factoryEntered.get() >= AndroidAudioPlayer.MAX_RETAINED_SESSIONS) break
+                // 若已有一批完成（rejected 快速返回），也可能 factory 未滿 MAX 即穩定。
+                if (results.size + factoryEntered.get() >= n) break
+                delay(10)
+            }
+            // 給快速拒絕留一點時間完成。
+            delay(200)
+            // 此時通過 gate 的應 <= MAX，且已計 playRejected（部分拒絕可能仍在返回中，寬鬆檢查）。
+            assertTrue(
+                "concurrent factory entries bounded <=${AndroidAudioPlayer.MAX_RETAINED_SESSIONS}, was ${factoryEntered.get()}",
+                factoryEntered.get() <= AndroidAudioPlayer.MAX_RETAINED_SESSIONS,
+            )
+            assertTrue(
+                "retained sessions bounded <=${AndroidAudioPlayer.MAX_RETAINED_SESSIONS}, was ${player.retainedSessionsForTest()}",
+                player.retainedSessionsForTest() <= AndroidAudioPlayer.MAX_RETAINED_SESSIONS,
+            )
+            // 放行 factory，讓通過者進入 PREPARING。
+            factoryUnblock.countDown()
+            withTimeout(10000L) {
+                jobs.forEach { it.join() }
+            }
+            // gate 通過數即 factory 進入數（<=MAX）；gate 拒絕數 = n - factoryEntered。
+            val gatePassed = factoryEntered.get()
+            val gateRejected = n - gatePassed
+            assertTrue("burst gate-passed bounded <=MAX, was $gatePassed", gatePassed <= AndroidAudioPlayer.MAX_RETAINED_SESSIONS)
+            assertTrue("burst must have gate rejections, gateRejected=$gateRejected", gateRejected > 0)
+            assertEquals(
+                "gate rejections must be counted in playRejectedCount, gateRejected=$gateRejected, counted=${player.playRejectedCount.get()}",
+                gateRejected,
+                player.playRejectedCount.get(),
+            )
+            assertEquals("burst must not pollute muteRejectedCount", 0, player.muteRejectedCount.get())
+            // 通過者中僅勝者留存 PREPARING 至超時，其餘 superseded 取消；總 CancellationException 包含
+            // gate 拒絕 + superseded，故僅檢查其 >= gateRejected（不要求相等）。
+            val cancelled = results.count { it is CancellationException }
+            assertTrue(
+                "cancelled (gate+superseded) must cover gate rejections, cancelled=$cancelled, gateRejected=$gateRejected",
+                cancelled >= gateRejected,
+            )
+            assertTrue(
+                "retained stays bounded, was ${player.retainedSessionsForTest()}",
+                player.retainedSessionsForTest() <= AndroidAudioPlayer.MAX_RETAINED_SESSIONS,
+            )
+            // 清理：取消所有 PREPARING（stop  detach active + 排釋放），等待回滾歸零。
+            player.stop()
+            awaitCondition(timeoutMs = 5000L) { player.retainedSessionsForTest() == 0 }
+            assertEquals(0L, player.retainedBytesForTest())
+        } finally {
+            factoryUnblock.countDown()
+            try {
+                player.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    @Test
+    fun androidAudioPlayer_muteQueueFullAbort_countedAndBounded() = runBlocking {
+        // queue 滿 Abort 釘選：直接佔滿 mute workers(2)+queue(8)，再以 stop 觸發一次 Abort。
+        // 驗證 muteRejectedCount+1、呼叫線程有界返回、最終無洩漏。
+        val player = AndroidAudioPlayer(
+            mediaPlayerFactory = { TestMediaPlayer() },
+            prepareTimeoutMs = 5000L,
+        )
+        try {
+            // 先建立一個 active（play 掛起於 PREPARING，持有預佔）。
+            var playEx: Throwable? = null
+            val playJob = launch(Dispatchers.IO) {
+                try {
+                    player.play(byteArrayOf(0x01, 0x02))
+                } catch (e: Throwable) {
+                    playEx = e
+                }
+            }
+            // 等待進入 PREPARING。
+            val startMs = System.currentTimeMillis()
+            while (System.currentTimeMillis() - startMs < 2000L) {
+                if (player.retainedSessionsForTest() == 1) break
+                delay(10)
+            }
+            assertEquals("play must hold one reservation", 1, player.retainedSessionsForTest())
+
+            // 以反射取得 muteExecutor，填滿 workers+queue（共 10 個阻塞任務）。
+            val muteExecField = AndroidAudioPlayer::class.java.getDeclaredField("muteExecutor")
+            muteExecField.isAccessible = true
+            val muteExec = muteExecField.get(player) as java.util.concurrent.ExecutorService
+            val mutePool = muteExec as java.util.concurrent.ThreadPoolExecutor
+            val blockLatch = CountDownLatch(1)
+            repeat(AndroidAudioPlayer.MAX_MUTE_WORKERS + AndroidAudioPlayer.MAX_MUTE_QUEUE) {
+                mutePool.execute {
+                    try {
+                        blockLatch.await(5, TimeUnit.SECONDS)
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+            awaitCondition(timeoutMs = 3000L) { mutePool.queue.size >= AndroidAudioPlayer.MAX_MUTE_QUEUE }
+            assertTrue(
+                "mute queue must be full (${AndroidAudioPlayer.MAX_MUTE_QUEUE}), was ${mutePool.queue.size}",
+                mutePool.queue.size >= AndroidAudioPlayer.MAX_MUTE_QUEUE,
+            )
+            val beforeMuteRejected = player.muteRejectedCount.get()
+            val t0 = System.nanoTime()
+            player.stop()
+            val elapsedMs = (System.nanoTime() - t0) / 1_000_000
+            assertTrue("stop must stay bounded (<1000ms) when mute queue full, elapsed=${elapsedMs}ms", elapsedMs < 1000)
+            assertEquals(
+                "mute queue-full Abort must count muteRejectedCount",
+                beforeMuteRejected + 1,
+                player.muteRejectedCount.get(),
+            )
+            assertEquals("queue-full path is mute pressure, not play gate", 0, player.playRejectedCount.get())
+            // 解除阻塞：mute 任務逐一完成，stop 的 detached 經 releaseAsync 背景釋放，最終歸零。
+            blockLatch.countDown()
+            withTimeout(5000L) { playJob.join() }
+            awaitCondition(timeoutMs = 5000L) { player.retainedSessionsForTest() == 0 }
+            awaitCondition(timeoutMs = 5000L) { player.muteInFlightForTest() == 0 && player.muteQueueDepthForTest() == 0 }
+            assertEquals(0L, player.retainedBytesForTest())
+            // release 路徑有界：無丟棄洩漏（release 池未滿，正常排隊）。
+            assertEquals(0, player.releaseLeakedCount.get())
+            assertTrue("play must be cancelled by stop, was $playEx", playEx is CancellationException)
+        } finally {
+            try {
+                player.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
 }

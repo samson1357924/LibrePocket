@@ -29,24 +29,33 @@ import androidx.lifecycle.compose.LocalLifecycleOwner // lifecycle-runtime-compo
  *
  * - 流程：[decideAssistantRole]（Held→顯示狀態；Request→
  *   `createRequestRoleIntent(ROLE_ASSISTANT)`＋`StartActivityForResult`；
- *   Unsupported→直接 fallback）＋失敗 fallback [assistantFallbackIntent]
- *   （`ACTION_VOICE_INPUT_SETTINGS`）。
+ *   Unsupported／ReadError→直接 fallback／no-op，fail-closed）＋失敗 fallback
+ *   [assistantFallbackIntent]（`ACTION_VOICE_INPUT_SETTINGS`）。
  * - 結果：`RESULT_OK`→GRANTED（重讀快照；若已非持有則 [effectiveAssistantReason]
  *   覆寫為 REVOKED）；非 OK→DENIED（只記原因碼，不自動跳轉——跳轉留給
  *   「語音輸入設定」按鈕 [AssistantRoleUi.openFallback]）。兩路徑皆 `refreshTick++`
  *   重讀快照，讓 REVOKED／held 調和經 [effectiveAssistantReason] 生效。
  * - ON_RESUME 刷新：`LifecycleEventObserver(ON_RESUME)→refreshTick++`，從授權頁／
  *   系統設定返回即重讀快照（GRANTED 落盤延遲／外部撤銷皆被調和，不依賴回調單一路徑）。
- *   ON_RESUME 同時清 `justGranted=false`（寬限只保回調後首幀），新一輪 request
- *   發起亦先清 `justGranted=false`。
- * - 外部撤銷：`everHeld` sticky（曾觀察 `roleHeld==true` 即置 true）＋
+ *   ON_RESUME 只 `tick++`、不清驗證旗（Stage 2 finding B：消耗點是重讀提交後的
+ *   `SideEffect`，與回調／resume 相對時序無關，詳見 [consumePendingVerify]）。
+ * - 外部撤銷：`everHeld` sticky（曾觀察 Known held 即置 true）＋
  *   SharedPreferences `"assistant_role"`／`"ever_held"` 持久化（process death
- *   後仍可判定）；調和經 [effectiveAssistantReason] 四參版
- *   (`stored`／`snapshot`／`everHeld`／`justGranted`)。
- * - RESULT_OK 競態寬限：回調設 `justGranted=true`＋`stored=GRANTED`，首幀保持
- *   GRANTED 而非立即誤判 REVOKED；詳見 [effectiveAssistantReason] KDoc。
- *   RoleManager 缺失（OEM 不支援）→對應原因碼＋fallback，fail-closed。
- * - 讀取失敗一律視為不支援（[AssistantRoleSnapshot] 全 false），不靜默放行。
+ *   後仍可判定）；調和經 [effectiveAssistantReason] 三態版
+ *   (`stored`／`snapshot`／`everHeld`／`justGranted=pendingVerify`)。
+ * - RESULT_OK 競態寬限（Stage 2 finding B：驗證一次即消耗）：
+ *   回調設 `pendingVerify=true`＋`stored=GRANTED`，下一次快照重讀幀仍以
+ *   true 判定（首幀保持 GRANTED 而非立即誤判 REVOKED），該幀提交後
+ *   `SideEffect { pendingVerify = consumePendingVerify(pendingVerify, snapshot) }`
+ *   即消耗（僅 Known 消耗；ReadError／Unsupported 不消耗亦無寬限效果）。
+ *   新一輪 request 發起清旗（舊寬限不帶入新流程）；`pendingVerify` 僅記憶體態
+ *   （remember，不跨 process death——丟失可接受，重進按正常規則判定）。
+ *   回調先於 ON_RESUME／後於 ON_RESUME 兩種順序皆收斂到「下一次快照讀取後消耗」
+ *   （至多寬限兩幀，見 [consumePendingVerify] KDoc）。
+ * - RoleManager 缺失（OEM 不支援）→ [AssistantSnapshot.Unsupported]＋對應原因碼＋
+ *   fallback，fail-closed；讀取異常 → [AssistantSnapshot.ReadError]（與真不支援
+ *   區分：頭部「無法確認助理狀態，請稍後重試」＋主按鈕 disabled＋原因行 passthrough，
+ *   不判撤銷；Stage 2 finding C）。
  */
 data class AssistantRoleUi(
     val state: AssistantSettingsState,
@@ -56,17 +65,24 @@ data class AssistantRoleUi(
 
 private const val TAG = "AssistantRoleUi"
 
-/** 同步重讀快照；RoleManager 缺失或讀取異常 → 全 false（不支援）。 */
+/**
+ * 舊同步快照（遺留相容）。
+ *
+ * 未知態（null／異常）一律折疊為全 false，與真不支援不可區分（Stage 2 finding C
+ * 指出此為誤報根源）。保留僅供舊呼叫方編譯；新產線一律用 [snapshotOf]
+ * （三態：Unsupported／ReadError 可區分）。
+ */
 fun readAssistantSnapshot(roleManager: RoleManager?): AssistantRoleSnapshot {
-    if (roleManager == null) return AssistantRoleSnapshot(false, false)
-    return try {
-        AssistantRoleSnapshot(
-            roleAvailable = roleManager.isRoleAvailable(RoleManager.ROLE_ASSISTANT),
-            roleHeld = roleManager.isRoleHeld(RoleManager.ROLE_ASSISTANT),
-        )
-    } catch (e: Exception) {
-        Log.w(TAG, "readAssistantSnapshot failed; treat as unsupported", e)
-        AssistantRoleSnapshot(roleAvailable = false, roleHeld = false)
+    return when (val s = snapshotOf(roleManager)) {
+        is AssistantSnapshot.Known ->
+            AssistantRoleSnapshot(roleAvailable = s.available, roleHeld = s.held)
+
+        AssistantSnapshot.Unsupported,
+        AssistantSnapshot.ReadError,
+        -> {
+            Log.w(TAG, "readAssistantSnapshot: non-known ($s); legacy fold to (false, false)")
+            AssistantRoleSnapshot(false, false)
+        }
     }
 }
 
@@ -89,11 +105,12 @@ fun rememberAssistantRole(): AssistantRoleUi {
         appContext.getSharedPreferences("assistant_role", Context.MODE_PRIVATE)
     }
     var everHeld by rememberSaveable { mutableStateOf(prefs.getBoolean("ever_held", false)) }
-    // Stage 2 review #2：RESULT_OK 競態寬限旗（回調置 true；ON_RESUME／下次重讀／
-    // 新 request 發起清 false）。僅記憶體態（remember，不跨 process death），不落盤。
-    // 寬限僅一幀：launcher 回調設 true 後 refreshTick++ 重讀當幀仍 true（寬限生效一次）；
-    // 下次 ON_RESUME 先清 false 再 tick++ 重讀（同一幀生效），故不會掩蓋真實撤銷。
-    var justGranted by remember { mutableStateOf(false) }
+    // Stage 2 finding B：RESULT_OK 競態寬限改為驗證代幣（驗證一次即消耗）。
+    // 回調置 true；消耗點是下一次快照重讀幀提交後的 SideEffect（僅 Known 消耗，
+    // 見 consumePendingVerify），與回調／ON_RESUME 相對時序無關。
+    // 僅記憶體態（remember，不跨 process death——丟失可接受，重進按正常規則判定），不落盤。
+    // 新一輪 request 發起清旗（舊寬限不帶入新流程）；ON_RESUME 只 tick++不清旗。
+    var pendingVerify by remember { mutableStateOf(false) }
     var refreshTick by remember { mutableIntStateOf(0) }
     // C: fallback 失敗回饋（rememberSaveable 撐過旋轉；成功開啟即清回 false）。
     var fallbackFailed by rememberSaveable { mutableStateOf(false) }
@@ -101,26 +118,32 @@ fun rememberAssistantRole(): AssistantRoleUi {
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                // 寬限只保回調後首幀：下次重讀前先清，否則 GRANTED 常駐掩蓋真實撤銷。
-                // 順序必須先清再 tick++（同一幀生效）：外部撤銷的 ON_RESUME 會先清
-                // justGranted 再重讀，故不會掩蓋真實撤銷。
-                justGranted = false
+                // Stage 2 finding B：只 tick++ 觸發重讀，不清 pendingVerify。
+                // 消耗由重讀提交後的 SideEffect 執行（consumePendingVerify），故
+                // callback-before-resume（回調先設旗，resume 再重讀）與
+                // callback-after-resume（resume 先重讀，回調後再設旗重讀）皆收斂到
+                // 「下一次快照讀取後消耗」，不會因清旗時序提早／延後寬限。
                 refreshTick++
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
-    val snapshot = remember(roleManager, refreshTick) {
-        readAssistantSnapshot(roleManager)
+    // Stage 2 finding C：三態快照（Known／Unsupported／ReadError 可區分）。
+    val snapshot: AssistantSnapshot = remember(roleManager, refreshTick) {
+        snapshotOf(roleManager)
     }
-    // 外部授予→撤銷鏈路：只要觀察到 held 即 sticky everHeld 並落盤（process death 後仍可判撤銷）。
+    // 外部授予→撤銷鏈路：只在 Known held 才 sticky everHeld 並落盤（未知態不置位，
+    // 避免把讀取失敗誤記為持有痕跡）；process death 後仍可判撤銷。
     // composition body 禁止直接寫 state＋SP（重組循環風險），改用 SideEffect。
+    // 驗證代幣消耗同在此：本幀以 pendingVerify 判定後即消耗（僅 Known），
+    // 下次重讀按正常規則走——兩語句皆放 SideEffect（提交後執行），互不干擾。
     SideEffect {
-        if (snapshot.roleHeld && !everHeld) {
+        if (snapshot is AssistantSnapshot.Known && snapshot.held && !everHeld) {
             everHeld = true
             prefs.edit().putBoolean("ever_held", true).apply()
         }
+        pendingVerify = consumePendingVerify(pendingVerify, snapshot)
     }
     val openFallback: () -> Unit = remember(appContext) {
         // fallbackFailed 經 MutableState 引用捕獲，非值捕獲，故無需入 remember key。
@@ -170,60 +193,70 @@ fun rememberAssistantRole(): AssistantRoleUi {
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
             storedReason = AssistantReasonCode.GRANTED
-            // RESULT_OK 落盤延遲寬限：首幀保持 GRANTED，不立即誤判 REVOKED。
-            // 此處不立即清 justGranted，保留寬限一幀（refreshTick++ 重讀當幀仍 true）；
-            // 寬限由下次 ON_RESUME／新 request 入口清 false，state 計算後不清。
-            justGranted = true
+            // RESULT_OK 落盤延遲寬限（Stage 2 finding B：驗證代幣）：
+            // 置 true＋refreshTick++，下一次快照重讀幀以 true 判定（首幀 GRANTED），
+            // 該幀提交後 SideEffect 即消耗（僅 Known）。此處不清，ON_RESUME 亦不清。
+            pendingVerify = true
             fallbackFailed = false
         } else {
             storedReason = AssistantReasonCode.DENIED
-            justGranted = false
+            pendingVerify = false
         }
         // GRANTED／DENIED 皆重讀快照：REVOKED／held 調和經 effectiveAssistantReason 生效。
         refreshTick++
     }
     val request: () -> Unit = remember(snapshot, roleManager, launcher, openFallback) {
         {
-            // 新一輪要求開始即結束上一輪寬限（否則舊 justGranted 常駐掩蓋撤銷）。
-            justGranted = false
-            when (decideAssistantRole(snapshot)) {
-                AssistantRoleDecision.AlreadyHeld -> {
-                    storedReason = AssistantReasonCode.GRANTED
-                    fallbackFailed = false
-                }
-                AssistantRoleDecision.UnsupportedFallback -> {
-                    storedReason = AssistantReasonCode.UNSUPPORTED
-                    openFallback()
-                }
-                AssistantRoleDecision.RequestRole -> {
-                    val intent = try {
-                        roleManager?.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT)
-                    } catch (_: Exception) {
-                        null
-                    }
-                    if (intent == null) {
-                        storedReason = AssistantReasonCode.REQUEST_FAILED
-                        openFallback()
-                    } else {
-                        // 新一輪要求開始：清除舊的 fallback 失敗旗，避免等待 RESULT 期間殘留紅字。
+            // 新一輪要求開始即結束上一輪寬限（否則舊 pendingVerify 常駐掩蓋撤銷）。
+            pendingVerify = false
+            // Stage 2 finding C：ReadError fail-closed——不發要求、不設
+            // UNSUPPORTED 碼（誠實：未知≠不支援）、不開 fallback，純 no-op
+            //（主按鈕本就 disabled，此為防禦性分支）。
+            if (snapshot is AssistantSnapshot.ReadError) {
+                Log.w(TAG, "request skipped: snapshot read error (fail-closed)")
+            } else {
+                when (decideAssistantRole(snapshot)) {
+                    AssistantRoleDecision.AlreadyHeld -> {
+                        storedReason = AssistantReasonCode.GRANTED
                         fallbackFailed = false
-                        try {
-                            launcher.launch(intent)
+                    }
+                    AssistantRoleDecision.UnsupportedFallback -> {
+                        storedReason = AssistantReasonCode.UNSUPPORTED
+                        openFallback()
+                    }
+                    AssistantRoleDecision.RequestRole -> {
+                        val intent = try {
+                            roleManager?.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT)
                         } catch (_: Exception) {
+                            null
+                        }
+                        if (intent == null) {
                             storedReason = AssistantReasonCode.REQUEST_FAILED
                             openFallback()
+                        } else {
+                            // 新一輪要求開始：清除舊的 fallback 失敗旗，避免等待 RESULT 期間殘留紅字。
+                            fallbackFailed = false
+                            try {
+                                launcher.launch(intent)
+                            } catch (_: Exception) {
+                                storedReason = AssistantReasonCode.REQUEST_FAILED
+                                openFallback()
+                            }
                         }
                     }
                 }
             }
         }
     }
-    val state = remember(snapshot, storedReason, everHeld, justGranted, fallbackFailed) {
+    val state = remember(snapshot, storedReason, everHeld, pendingVerify, fallbackFailed) {
+        val known = snapshot as? AssistantSnapshot.Known
         AssistantSettingsState(
-            roleHeld = snapshot.roleHeld,
-            roleAvailable = snapshot.roleAvailable,
-            reasonCode = effectiveAssistantReason(storedReason, snapshot, everHeld, justGranted),
+            // 未知態不宣稱任何狀態（皆 false，見 AssistantSettingsState.readError）。
+            roleHeld = known?.held ?: false,
+            roleAvailable = known?.available ?: false,
+            reasonCode = effectiveAssistantReason(storedReason, snapshot, everHeld, pendingVerify),
             fallbackFailed = fallbackFailed,
+            readError = snapshot is AssistantSnapshot.ReadError,
         )
     }
     return AssistantRoleUi(

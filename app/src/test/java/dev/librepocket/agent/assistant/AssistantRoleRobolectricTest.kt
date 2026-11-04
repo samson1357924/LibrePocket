@@ -59,6 +59,12 @@ class AssistantRoleRobolectricTest {
         assertEquals(context.packageName, intent.`package`)
     }
 
+    /** Stage 2 finding C：RoleManager 缺失 → Unsupported（與讀取失敗可區分）。 */
+    @Test
+    fun snapshotOf_nullRoleManager_isUnsupported() {
+        assertEquals(AssistantSnapshot.Unsupported, snapshotOf(null))
+    }
+
     @Test
     fun fallbackIntent_opensVoiceInputSettings() {
         // 用常數比對而非硬編碼字串：字串改名時由編譯器把關。

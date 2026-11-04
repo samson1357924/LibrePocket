@@ -1,5 +1,6 @@
 package dev.librepocket.agent.assistant
 
+import android.app.role.RoleManager
 import android.content.Context
 import android.content.Intent
 import android.provider.Settings
@@ -7,19 +8,66 @@ import android.provider.Settings
 /**
  * C1 系統預設助理：RoleManager 流程純邏輯（Issue #137 C1b）。
  *
- * - 本檔只含純 Kotlin／平台無關決策（快照 → 決策／原因碼），不直接碰
- *   [android.app.role.RoleManager]，生產接線見 [AssistantRoleUi]，
- *   純邏輯 JVM 單測為主，intent 契約另見 Robolectric。
+ * - 本檔含平台無關決策（快照 → 決策／原因碼）＋三態快照讀取
+ *  （[snapshotOf] 直接讀 [android.app.role.RoleManager]，異常→ReadError），
+ *   生產接線見 AssistantRoleUi，純邏輯 JVM 單測為主，
+ *   intent 契約另見 Robolectric。
  * - C1 不新增任何權限：`isRoleAvailable`／`isRoleHeld`／
  *   `createRequestRoleIntent` 皆為同步呼叫；失敗一律 fallback
  *   [Settings.ACTION_VOICE_INPUT_SETTINGS]，fail-closed，不靜默退回。
  * - 原因碼（[assistantReasonText]）：被拒／撤銷／OEM 不支援／請求失敗
  *   皆有對應文案，UI 只顯示文案不做流程分支，色彩可按失敗/中性區分（見 SettingsScreen）。
+ * - Stage 2 B＋C：快照三態（[AssistantSnapshot]）＋驗證一次即消耗
+ *   （[consumePendingVerify]）：讀取異常與真不支援不再混同；
+ *   撤銷只在 Known(!held) 判定；ReadError／Unsupported 一律 passthrough。
  */
 data class AssistantRoleSnapshot(
     val roleAvailable: Boolean,
     val roleHeld: Boolean,
 )
+
+/**
+ * 三態快照（Stage 2 finding C [P2]）。
+ *
+ * - [Known]：讀取成功，`available`／`held` 如實回報（舊
+ *   [AssistantRoleSnapshot] 語義；決策／調和只在此態做持有／撤銷判定）。
+ * - [Unsupported]：`RoleManager == null`（OEM 無此服務）。fail-closed：
+ *   [decideAssistantRole] 回 Fallback，不發要求。
+ * - [ReadError]：讀取拋異常（暫時性失敗，可能是系統抖動）。
+ *   fail-closed：決策同 Fallback（不發要求），但 UI 頭部必須與
+ *   「不支援」區分（「無法確認助理狀態，請稍後重試」），且調和一律
+ *   passthrough（不判撤銷、不宣稱持有）。
+ *
+ * 舊 [AssistantRoleSnapshot] 保留相容：`readAssistantSnapshot`（見
+ * AssistantRoleUi）仍回傳它（未知態一律折疊為全 false，
+ * 與真不支援不可區分——遺留行為，新產線一律用 [snapshotOf]）。
+ */
+sealed interface AssistantSnapshot {
+    data class Known(val available: Boolean, val held: Boolean) : AssistantSnapshot
+    data object Unsupported : AssistantSnapshot
+    data object ReadError : AssistantSnapshot
+}
+
+/**
+ * 同步重讀三態快照。
+ *
+ * - `null` → [AssistantSnapshot.Unsupported]；拋異常 → [AssistantSnapshot.ReadError]
+ *   （不折疊為全 false，與真不支援可區分；刻意不打 Log，保持本檔純邏輯
+ *   可在 JVM 單測編譯，呼叫方需記錄時自行在 catch 處打點）。
+ * - 本函數需 [RoleManager] 實例，純 JVM 單測不直接呼叫（以 fake
+ *   [AssistantSnapshot.Known] 測決策／調和）；有機覆蓋另見 Robolectric。
+ */
+fun snapshotOf(roleManager: RoleManager?): AssistantSnapshot {
+    if (roleManager == null) return AssistantSnapshot.Unsupported
+    return try {
+        AssistantSnapshot.Known(
+            available = roleManager.isRoleAvailable(RoleManager.ROLE_ASSISTANT),
+            held = roleManager.isRoleHeld(RoleManager.ROLE_ASSISTANT),
+        )
+    } catch (_: Exception) {
+        AssistantSnapshot.ReadError
+    }
+}
 
 /** Settings 卡中立狀態（仿 AutomationSettingsState：null 即整卡隱藏）。 */
 data class AssistantSettingsState(
@@ -28,6 +76,14 @@ data class AssistantSettingsState(
     val reasonCode: String? = null,
     /** fallback 設定頁打不開（resolve null／非系統／拋異常）：卡內紅字提示，不跳轉。 */
     val fallbackFailed: Boolean = false,
+    /**
+     * 快照讀取失敗（[AssistantSnapshot.ReadError]，Stage 2 finding C）。
+     * true 時 `roleHeld`／`roleAvailable` 皆為 false（不宣稱任何狀態）；
+     * SettingsScreen 頭部顯示「無法確認助理狀態，請稍後重試」、
+     * 主按鈕 disabled（fail-closed），原因行照常 passthrough。
+     * 與真不支援（false／「此裝置不支援…」）區分，預設 false 保舊構造相容。
+     */
+    val readError: Boolean = false,
 )
 
 sealed interface AssistantRoleDecision {
@@ -48,6 +104,31 @@ fun decideAssistantRole(snapshot: AssistantRoleSnapshot): AssistantRoleDecision 
         else -> AssistantRoleDecision.UnsupportedFallback
     }
 
+/**
+ * 三態決策（Stage 2 finding C）。
+ *
+ * - [AssistantSnapshot.Known] → 轉調舊版（held／available 語義不變）。
+ * - [AssistantSnapshot.Unsupported]／[AssistantSnapshot.ReadError] →
+ *   [AssistantRoleDecision.UnsupportedFallback]（fail-closed，不發要求）。
+ *   兩者決策同值但 UI 文案必須區分：Unsupported 頭部「此裝置不支援…」、
+ *   ReadError 頭部「無法確認助理狀態，請稍後重試」（見 [AssistantSettingsState.readError]
+ *   與 SettingsScreen），且 request() 入口對 ReadError 不設 UNSUPPORTED 碼、
+ *   不開 fallback（純 no-op，按钮本就 disabled，防禦性 fail-closed）。
+ */
+fun decideAssistantRole(snapshot: AssistantSnapshot): AssistantRoleDecision =
+    when (snapshot) {
+        is AssistantSnapshot.Known ->
+            decideAssistantRole(
+                AssistantRoleSnapshot(
+                    roleAvailable = snapshot.available,
+                    roleHeld = snapshot.held,
+                ),
+            )
+        AssistantSnapshot.Unsupported,
+        AssistantSnapshot.ReadError,
+        -> AssistantRoleDecision.UnsupportedFallback
+    }
+
 object AssistantReasonCode {
     const val GRANTED = "ASSISTANT_GRANTED"
     const val DENIED = "ASSISTANT_DENIED"
@@ -59,42 +140,50 @@ object AssistantReasonCode {
 /**
  * 雙向調和（純函數）：快照持有態優先於一切原因碼。
  *
- * 四參版（Stage 2 人類 review #2＋#3）：
- * - 若 `snapshot.roleHeld == true`，直接回 null（清除原因碼）：
- *   頭部已表達持有態，原因區不再重複顯示（避免 DENIED＋held 矛盾：
- *   頭部顯示已持有、原因顯示被拒；亦避免 GRANTED＋held 重複文案：
+ * 三態版（Stage 2 finding B＋C；本函數為主入口）：
+ * - 若 `snapshot` 是 [AssistantSnapshot.Known] 且 `held == true`，直接回 null
+ *   （清除原因碼）：頭部已表達持有態，原因區不再重複顯示（避免 DENIED＋held
+ *   矛盾：頭部顯示已持有、原因顯示被拒；亦避免 GRANTED＋held 重複文案：
  *   held 頭部與 GRANTED 原因完全同字串）。
- * - 否則若 `justGranted == true`，回 [AssistantReasonCode.GRANTED]：
+ * - 否則（Known 且非持有）若 `justGranted == true` 且
+ *   `stored == GRANTED`，回 [AssistantReasonCode.GRANTED]：
  *   `RESULT_OK` 後系統落盤有延遲，重讀快照仍非持有是預期競態，
- *   此寬限旗保證回調後首幀不立即誤判 REVOKED；下次 ON_RESUME／快照重讀
- *   後由 [AssistantRoleUi] 清回 false，寬限即結束。
- * - 否則若 `stored == GRANTED`，覆寫為 [AssistantReasonCode.REVOKED]：
- *   曾經授予（sticky GRANTED 碼）但重讀快照已非持有，視為角色被撤銷。
- * - 否則若 `stored == null && everHeld == true`，回 [AssistantReasonCode.REVOKED]：
- *   外部授予→撤銷鏈路：使用者曾在系統設定頁手動授予（未經本應用 request
- *   回調，故 `stored` 仍為 null），之後又在系統側被撤銷；僅憑 `stored`
- *   無法捕捉，須以 `everHeld`（曾經觀察到 `roleHeld == true` 即 sticky）
- *   補上撤銷判定。僅 stored null 時才用 everHeld 判撤銷；顯式新鮮碼
- *  （DENIED／UNSUPPORTED／REQUEST_FAILED／REVOKED）一律 passthrough，
- *   不被 everHeld 覆寫（新鮮拒絕優先於陳舊持有痕跡）。
- * - 其餘原樣 passthrough（含 null 與 DENIED／UNSUPPORTED／REQUEST_FAILED／REVOKED）。
+ *   此寬限旗保證驗證幀不立即誤判 REVOKED；寬限僅此一幀（見
+ *   [consumePendingVerify]：UI 在該幀提交後即消耗，下次重讀按正常規則走）。
+ *   寬限僅 Known 生效：ReadError／Unsupported 下不宣稱 GRANTED。
+ * - 否則（Known 且非持有）若 `stored == GRANTED`，覆寫為
+ *   [AssistantReasonCode.REVOKED]：曾經授予（sticky GRANTED 碼）但重讀快照
+ *   已非持有，視為角色被撤銷。
+ * - 否則（Known 且非持有）若 `stored == null && everHeld == true`，回
+ *   [AssistantReasonCode.REVOKED]：外部授予→撤銷鏈路（使用者曾在系統設定頁
+ *   手動授予，未經本應用 request 回調故 `stored` 仍 null，之後又在系統側被
+ *   撤銷；須以 `everHeld` 曾觀察 held 即 sticky 補上判定）。僅 stored null
+ *   時用 everHeld 判撤銷；顯式新鮮碼（DENIED／UNSUPPORTED／REQUEST_FAILED／
+ *   REVOKED）一律 passthrough，不被 everHeld 覆寫。
+ * - 其餘（含 ReadError／Unsupported 任何 stored／everHeld／justGranted 組合）
+ *   原樣 passthrough：讀不到快照時不判撤銷（誠實：未知≠已撤銷）、不顯示持有、
+ *   不因寬限憑空宣稱 GRANTED（`stored == null + justGranted` 仍回 null）。
+ *   副作用：Unsupported／ReadError 下既有 GRANTED sticky 會原樣保留顯示
+ *   （passthrough），而非覆寫為 REVOKED——快照不可讀時不斷言撤銷。
  *
  * `everHeld` 由 SharedPreferences（`"assistant_role"`／`"ever_held"`）持久化，
- * process death 後仍能判定外部撤銷；`justGranted` 僅記憶體態（remember，
- * 下次重讀即清），不落盤。
+ * process death 後仍能判定外部撤銷；`justGranted` 實為 UI 層驗證代幣
+ * （`pendingVerify`，remember 僅記憶體，下次 Known 讀取後即消耗），不落盤，
+ * process death 丟失可接受（重進後按正常規則重讀判定，不殘留過期寬限）。
  *
  * 已知 GRANTED 競態：`RESULT_OK` 後系統未即時落盤時，重讀快照仍非持有會
- * 短暫顯示 REVOKED；該 REVOKED sticky 到下次要求／結果回調（ON_RESUME 重讀
- * 由 AssistantRoleUi Phase 2 已補：LifecycleEventObserver(ON_RESUME)→refreshTick++；
- * 本 Stage 另加 `justGranted` 寬限，首幀保持 GRANTED）。
+ * 短暫顯示 REVOKED；ON_RESUME 重讀（`refreshTick++`）＋本寬限（首幀 GRANTED）
+ * 共同收斂；寬限消耗時點只與「可觀測的後續快照讀取」有關，與回調／resume
+ * 相對時序無關（見 [consumePendingVerify] KDoc 兩種時序）。
  */
 fun effectiveAssistantReason(
     stored: String?,
-    snapshot: AssistantRoleSnapshot,
+    snapshot: AssistantSnapshot,
     everHeld: Boolean,
     justGranted: Boolean,
-): String? =
-    if (snapshot.roleHeld) {
+): String? {
+    val known = snapshot as? AssistantSnapshot.Known ?: return stored
+    return if (known.held) {
         null
     } else if (justGranted && stored == AssistantReasonCode.GRANTED) {
         AssistantReasonCode.GRANTED
@@ -105,6 +194,27 @@ fun effectiveAssistantReason(
     } else {
         stored
     }
+}
+
+/**
+ * 舊四參相容 overload：轉調三態版（`Known(available, held)`，語義不變；
+ * 既有測試全數保留）。
+ */
+fun effectiveAssistantReason(
+    stored: String?,
+    snapshot: AssistantRoleSnapshot,
+    everHeld: Boolean,
+    justGranted: Boolean,
+): String? =
+    effectiveAssistantReason(
+        stored,
+        AssistantSnapshot.Known(
+            available = snapshot.roleAvailable,
+            held = snapshot.roleHeld,
+        ),
+        everHeld,
+        justGranted,
+    )
 
 /** 雙參相容 overload：轉調四參版（`everHeld=false, justGranted=false`，舊測語義不變）。 */
 fun effectiveAssistantReason(
@@ -112,6 +222,43 @@ fun effectiveAssistantReason(
     snapshot: AssistantRoleSnapshot,
 ): String? =
     effectiveAssistantReason(stored, snapshot, everHeld = false, justGranted = false)
+
+/** 三態雙參便利 overload（`everHeld=false, justGranted=false`）。 */
+fun effectiveAssistantReason(
+    stored: String?,
+    snapshot: AssistantSnapshot,
+): String? =
+    effectiveAssistantReason(stored, snapshot, everHeld = false, justGranted = false)
+
+/**
+ * 驗證代幣消耗（Stage 2 finding B [P2]，純函數；UI 在 `SideEffect` 內呼叫）。
+ *
+ * 語義：`pendingVerify == true`（回調剛設）且本幀快照是 [AssistantSnapshot.Known]
+ * → 回 false（消耗：寬限僅此一幀）；否則原樣回傳。
+ * ReadError／Unsupported 下不消耗（保留到下一次 Known 讀取；反正調和在未知態
+ * 忽略寬限，無掩蓋風險）。
+ *
+ * 時序收斂（關鍵：消耗點是「可觀測的後續快照讀取提交後」，與回調／resume
+ * 相對順序無關）：
+ * - callback-after-resume：resume 先 `tick++` 重讀（pending false，無事發生）；
+ *   回調後設 true＋`tick++`，下一次重讀幀以 true 判定（GRANTED 一幀），
+ *   `SideEffect` 隨即消耗。
+ * - callback-before-resume：回調先設 true＋`tick++`（首幀已寬限顯示）；
+ *   緊接 ON_RESUME 再 `tick++` 重讀——若首幀 `SideEffect` 已消耗，次幀按正常
+ *   規則走；若 resume 搶在首幀 effect 前，次幀仍帶 true 再寬限一幀後消耗。
+ *   兩種交錯至多寬限兩幀，隨後必收斂（未知態更不掩蓋：直接 passthrough）。
+ *
+ * 呼叫方契約（見 AssistantRoleUi）：`SideEffect { pendingVerify =
+ * consumePendingVerify(pendingVerify, snapshot) }`；ON_RESUME 只 `tick++`
+ * 不清旗；request 入口（新一輪開始）清旗；`RESULT_OK` 置 true、
+ * 非 OK 置 false。`pendingVerify` 僅 `remember`（記憶體），process death
+ * 丟失可接受（重進按正常規則判定，不殘留過期寬限）。
+ */
+fun consumePendingVerify(
+    pendingVerify: Boolean,
+    snapshot: AssistantSnapshot,
+): Boolean =
+    if (pendingVerify && snapshot is AssistantSnapshot.Known) false else pendingVerify
 
 /** 原因碼 → 顯示文案（UI 只顯示文案不做流程分支，色彩可按失敗/中性區分（見 SettingsScreen）；未知碼原樣回報，不偽造語義）。
  *

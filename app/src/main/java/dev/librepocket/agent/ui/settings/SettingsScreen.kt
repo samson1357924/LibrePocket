@@ -387,6 +387,11 @@ fun SettingsScreen(
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
                                 when {
+                                    // Stage 2 finding C：讀取失敗與真不支援區分。
+                                    // ReadError 不宣稱任何狀態（roleHeld／roleAvailable 皆 false，
+                                    // 見 AssistantSettingsState.readError），頭部誠實顯示未知，
+                                    // 主按鈕 disabled（fail-closed），原因行照常 passthrough。
+                                    assistant.readError -> "無法確認助理狀態，請稍後重試。"
                                     assistant.roleHeld -> "已設為預設助理：長按首頁鍵或系統手勢可叫出 LibrePocket。"
                                     !assistant.roleAvailable -> "此裝置不支援系統助理角色，可改用語音輸入設定。"
                                     else -> "尚未設為預設助理；授予後長按首頁鍵或系統手勢可叫出 LibrePocket。"
@@ -417,13 +422,17 @@ fun SettingsScreen(
                             // enabled（僅 held 才 disabled），文案改為「前往語音輸入設定」；
                             // 點擊仍走 onRequestAssistantRole → request() UnsupportedFallback
                             // 分支（設 UNSUPPORTED＋openFallback），與下方 OutlinedButton 同效。
+                            // Stage 2 finding C：ReadError 時主按鈕 disabled（fail-closed，
+                            // request() 內亦防禦性 no-op）；文案維持「設為預設助理」
+                            //（未知態不暗示可跳 fallback，OutlinedButton 仍可達）。
                             Button(
                                 onClick = onRequestAssistantRole,
-                                enabled = !assistant.roleHeld,
+                                enabled = !assistant.roleHeld && !assistant.readError,
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
                                 Text(
                                     when {
+                                        assistant.readError -> "設為預設助理"
                                         assistant.roleHeld -> "設為預設助理"
                                         !assistant.roleAvailable -> "前往語音輸入設定"
                                         else -> "設為預設助理"

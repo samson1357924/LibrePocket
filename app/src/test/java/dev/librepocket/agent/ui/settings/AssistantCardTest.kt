@@ -297,4 +297,70 @@ class AssistantCardTest {
             .performScrollTo().assertIsDisplayed()
             .assertTextEquals(assistantReasonText(AssistantReasonCode.DENIED))
     }
+
+    // ---- Stage 2 finding C：ReadError 頭部／主按鈕 fail-closed ----
+
+    /** ReadError 顯示「無法確認…」未知文案（與「不支援」區分），主按鈕 disabled。 */
+    @Test
+    fun readError_showsUnknownHeaderAndDisablesRequest() {
+        setSettings(
+            AssistantSettingsState(
+                roleHeld = false,
+                roleAvailable = false,
+                readError = true,
+            ),
+        )
+        composeRule.onNodeWithText("無法確認助理狀態，請稍後重試。")
+            .performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("設為預設助理").performScrollTo().assertIsNotEnabled()
+    }
+
+    /** ReadError 原因行 passthrough：stored 碼照常顯示（此處以 DENIED 為例）。 */
+    @Test
+    fun readError_passesThroughStoredReason() {
+        setSettings(
+            AssistantSettingsState(
+                roleHeld = false,
+                roleAvailable = false,
+                reasonCode = AssistantReasonCode.DENIED,
+                readError = true,
+            ),
+        )
+        composeRule.onNodeWithText("無法確認助理狀態，請稍後重試。")
+            .performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("assistantReason")
+            .performScrollTo().assertIsDisplayed()
+            .assertTextEquals(assistantReasonText(AssistantReasonCode.DENIED))
+    }
+
+    /** ReadError 無 stored 碼時原因行不存在（passthrough null，不憑空判撤銷）。 */
+    @Test
+    fun readErrorWithoutReason_hidesReasonTag() {
+        setSettings(
+            AssistantSettingsState(
+                roleHeld = false,
+                roleAvailable = false,
+                readError = true,
+            ),
+        )
+        composeRule.onNodeWithTag("assistantReason").assertDoesNotExist()
+        composeRule.onNodeWithText(assistantReasonText(AssistantReasonCode.REVOKED))
+            .assertDoesNotExist()
+    }
+
+    /** ReadError 下 fallback 按鈕仍可達（未知態只擋主按鈕，不擋語音輸入設定）。 */
+    @Test
+    fun readError_fallbackStillReachable() {
+        var fallbacks = 0
+        setSettings(
+            AssistantSettingsState(
+                roleHeld = false,
+                roleAvailable = false,
+                readError = true,
+            ),
+            onFallback = { fallbacks++ },
+        )
+        composeRule.onNodeWithText("語音輸入設定").performScrollTo().performClick()
+        assertEquals(1, fallbacks)
+    }
 }

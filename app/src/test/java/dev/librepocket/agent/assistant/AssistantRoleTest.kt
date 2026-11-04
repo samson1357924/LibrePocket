@@ -400,4 +400,337 @@ class AssistantRoleTest {
             )
         }
     }
+
+    // ---- Stage 2 B＋C：三態調和矩陣（AssistantSnapshot） ----
+
+    @Test
+    fun givenKnownHeld_whenTriReconciled_thenClearsRegardless() {
+        // Known held 優先於一切：所有 stored／everHeld／justGranted 組合皆清 null。
+        listOf(
+            AssistantSnapshot.Known(available = true, held = true),
+            AssistantSnapshot.Known(available = false, held = true),
+        ).forEach { snapshot ->
+            listOf(
+                null,
+                AssistantReasonCode.GRANTED,
+                AssistantReasonCode.DENIED,
+                AssistantReasonCode.REVOKED,
+                AssistantReasonCode.UNSUPPORTED,
+                AssistantReasonCode.REQUEST_FAILED,
+            ).forEach { stored ->
+                listOf(false, true).forEach { everHeld ->
+                    listOf(false, true).forEach { justGranted ->
+                        assertNull(
+                            "Known held 必須清除（$snapshot, stored=$stored, " +
+                                "everHeld=$everHeld, justGranted=$justGranted）",
+                            effectiveAssistantReason(stored, snapshot, everHeld, justGranted),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun givenKnownNotHeldGranted_whenTriReconciled_thenReportsRevoked() {
+        // Known !held＋GRANTED（無寬限）→ REVOKED；avail 無關。
+        listOf(
+            AssistantSnapshot.Known(available = true, held = false),
+            AssistantSnapshot.Known(available = false, held = false),
+        ).forEach { snapshot ->
+            assertEquals(
+                "Known !held＋GRANTED 必須判 REVOKED（$snapshot）",
+                AssistantReasonCode.REVOKED,
+                effectiveAssistantReason(
+                    stored = AssistantReasonCode.GRANTED,
+                    snapshot = snapshot,
+                    everHeld = false,
+                    justGranted = false,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun givenKnownNotHeldNullEverHeld_whenTriReconciled_thenReportsRevoked() {
+        // Known !held＋null＋everHeld → REVOKED（外部撤銷鏈路）。
+        listOf(
+            AssistantSnapshot.Known(available = true, held = false),
+            AssistantSnapshot.Known(available = false, held = false),
+        ).forEach { snapshot ->
+            assertEquals(
+                "Known !held＋null＋everHeld 必須判 REVOKED（$snapshot）",
+                AssistantReasonCode.REVOKED,
+                effectiveAssistantReason(
+                    stored = null,
+                    snapshot = snapshot,
+                    everHeld = true,
+                    justGranted = false,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun givenReadError_whenTriReconciled_thenAlwaysPassesThrough() {
+        // ReadError 一律 passthrough：不判撤銷（null＋everHeld 仍 null）、
+        // 不宣稱持有、不因寬限憑空造 GRANTED。
+        // GRANTED＋justGranted 回 GRANTED 是 passthrough（stored 原樣），
+        // 非寬限——同值在 justGranted=false 時亦成立（下測鎖定）。
+        val storedCases: List<String?> = listOf(
+            null,
+            AssistantReasonCode.GRANTED,
+            AssistantReasonCode.DENIED,
+            AssistantReasonCode.REVOKED,
+            AssistantReasonCode.UNSUPPORTED,
+            AssistantReasonCode.REQUEST_FAILED,
+        )
+        storedCases.forEach { stored ->
+            listOf(false, true).forEach { everHeld ->
+                listOf(false, true).forEach { justGranted ->
+                    assertEquals(
+                        "ReadError 必須 passthrough（stored=$stored, " +
+                            "everHeld=$everHeld, justGranted=$justGranted）",
+                        stored,
+                        effectiveAssistantReason(
+                            stored,
+                            AssistantSnapshot.ReadError,
+                            everHeld,
+                            justGranted,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun givenReadErrorGranted_whenGraceOff_thenStillGrantedProvesPassthrough() {
+        // 對照鎖定：ReadError＋GRANTED 在 justGranted=false 時同樣回 GRANTED，
+        // 證明上測的 GRANTED 來自 passthrough 而非寬限。
+        assertEquals(
+            AssistantReasonCode.GRANTED,
+            effectiveAssistantReason(
+                AssistantReasonCode.GRANTED,
+                AssistantSnapshot.ReadError,
+                everHeld = false,
+                justGranted = false,
+            ),
+        )
+    }
+
+    @Test
+    fun givenUnsupported_whenTriReconciled_thenAlwaysPassesThrough() {
+        // Unsupported 同理：一律 passthrough。注意語義變更點：
+        // 舊二態 (false,false)＋GRANTED 會判 REVOKED；三態下快照不可讀時
+        // 不斷言撤銷，GRANTED 原樣保留（無快照證據不斷案）。
+        val storedCases: List<String?> = listOf(
+            null,
+            AssistantReasonCode.GRANTED,
+            AssistantReasonCode.DENIED,
+            AssistantReasonCode.REVOKED,
+            AssistantReasonCode.UNSUPPORTED,
+            AssistantReasonCode.REQUEST_FAILED,
+        )
+        storedCases.forEach { stored ->
+            listOf(false, true).forEach { everHeld ->
+                listOf(false, true).forEach { justGranted ->
+                    assertEquals(
+                        "Unsupported 必須 passthrough（stored=$stored, " +
+                            "everHeld=$everHeld, justGranted=$justGranted）",
+                        stored,
+                        effectiveAssistantReason(
+                            stored,
+                            AssistantSnapshot.Unsupported,
+                            everHeld,
+                            justGranted,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun givenJustGranted_whenOnlyKnown_thenGraceApplies() {
+        // 寬限僅 Known 生效：
+        // - Known !held＋GRANTED＋justGranted → GRANTED（寬限）。
+        // - ReadError／Unsupported＋null＋justGranted → null（不憑空造 GRANTED）。
+        assertEquals(
+            AssistantReasonCode.GRANTED,
+            effectiveAssistantReason(
+                AssistantReasonCode.GRANTED,
+                AssistantSnapshot.Known(available = true, held = false),
+                everHeld = false,
+                justGranted = true,
+            ),
+        )
+        assertNull(
+            effectiveAssistantReason(
+                null,
+                AssistantSnapshot.ReadError,
+                everHeld = false,
+                justGranted = true,
+            ),
+        )
+        assertNull(
+            effectiveAssistantReason(
+                null,
+                AssistantSnapshot.Unsupported,
+                everHeld = false,
+                justGranted = true,
+            ),
+        )
+        // ReadError＋everHeld＋null＋justGranted 亦不判撤銷（未知≠已撤銷）。
+        assertNull(
+            effectiveAssistantReason(
+                null,
+                AssistantSnapshot.ReadError,
+                everHeld = true,
+                justGranted = true,
+            ),
+        )
+    }
+
+    @Test
+    fun givenTriSnapshot_whenDecided_thenMapsCorrectly() {
+        // Known 映射與舊版一致；Unsupported／ReadError 皆 fail-closed。
+        assertEquals(
+            AssistantRoleDecision.AlreadyHeld,
+            decideAssistantRole(AssistantSnapshot.Known(available = true, held = true)),
+        )
+        assertEquals(
+            AssistantRoleDecision.AlreadyHeld,
+            decideAssistantRole(AssistantSnapshot.Known(available = false, held = true)),
+        )
+        assertEquals(
+            AssistantRoleDecision.RequestRole,
+            decideAssistantRole(AssistantSnapshot.Known(available = true, held = false)),
+        )
+        assertEquals(
+            AssistantRoleDecision.UnsupportedFallback,
+            decideAssistantRole(AssistantSnapshot.Known(available = false, held = false)),
+        )
+        assertEquals(
+            AssistantRoleDecision.UnsupportedFallback,
+            decideAssistantRole(AssistantSnapshot.Unsupported),
+        )
+        assertEquals(
+            AssistantRoleDecision.UnsupportedFallback,
+            decideAssistantRole(AssistantSnapshot.ReadError),
+        )
+    }
+
+    // ---- Stage 2 B：驗證代幣消耗（consumePendingVerify）＋雙時序收斂 ----
+
+    @Test
+    fun givenKnown_whenConsumePendingVerify_thenConsumes() {
+        assertEquals(
+            false,
+            consumePendingVerify(
+                true,
+                AssistantSnapshot.Known(available = true, held = false),
+            ),
+        )
+        assertEquals(
+            false,
+            consumePendingVerify(
+                true,
+                AssistantSnapshot.Known(available = false, held = true),
+            ),
+        )
+    }
+
+    @Test
+    fun givenUnknown_whenConsumePendingVerify_thenRetains() {
+        // 未知態不消耗（保留到下一次 Known 讀取；調和本就忽略寬限，無掩蓋風險）。
+        assertEquals(true, consumePendingVerify(true, AssistantSnapshot.ReadError))
+        assertEquals(true, consumePendingVerify(true, AssistantSnapshot.Unsupported))
+    }
+
+    @Test
+    fun givenNoPending_whenConsumePendingVerify_thenStaysFalse() {
+        assertEquals(
+            false,
+            consumePendingVerify(
+                false,
+                AssistantSnapshot.Known(available = true, held = false),
+            ),
+        )
+        assertEquals(false, consumePendingVerify(false, AssistantSnapshot.ReadError))
+        assertEquals(false, consumePendingVerify(false, AssistantSnapshot.Unsupported))
+    }
+
+    /**
+     * 雙時序收斂模擬（純函數層；UI 真機時序見缺口註記）。
+     *
+     * 以 UI 相同協議（回調設 pending=true＋重讀→以 true 判定→SideEffect 消耗）
+     * 走兩種順序，皆收斂到「寬限恰一幀，次幀 REVOKED」。
+     * 真正的 Lifecycle＋重組交錯（Robolectric compose）因 RoleManager 系統服務
+     * 難控，未在此覆蓋——缺口見本檔尾 KDoc／PR 說明。
+     */
+    @Test
+    fun givenCallbackAfterResume_whenTokenProtocol_thenGraceOneFrame() {
+        // 順序 A（callback-after-resume）：resume 先重讀（無旗），回調後設旗重讀。
+        var pending = false
+        var stored: String? = null
+        // resume tick：Known !held，無旗 → passthrough null。
+        var snapshot: AssistantSnapshot =
+            AssistantSnapshot.Known(available = true, held = false)
+        assertNull(effectiveAssistantReason(stored, snapshot, false, pending))
+        pending = consumePendingVerify(pending, snapshot)
+        assertEquals(false, pending)
+        // 回調 RESULT_OK：stored=GRANTED＋pending=true，下次重讀幀寬限。
+        stored = AssistantReasonCode.GRANTED
+        pending = true
+        snapshot = AssistantSnapshot.Known(available = true, held = false)
+        assertEquals(
+            AssistantReasonCode.GRANTED,
+            effectiveAssistantReason(stored, snapshot, false, pending),
+        )
+        pending = consumePendingVerify(pending, snapshot)
+        assertEquals(false, pending)
+        // 次幀（如下次 resume 重讀）：無旗 → REVOKED，不再常駐 GRANTED。
+        snapshot = AssistantSnapshot.Known(available = true, held = false)
+        assertEquals(
+            AssistantReasonCode.REVOKED,
+            effectiveAssistantReason(stored, snapshot, false, pending),
+        )
+    }
+
+    @Test
+    fun givenCallbackBeforeResume_whenTokenProtocol_thenConverges() {
+        // 順序 B（callback-before-resume）：回調先設旗，ON_RESUME 緊接再重讀。
+        var stored: String? = AssistantReasonCode.GRANTED
+        var pending = true
+        // 首幀（回調 tick 重讀）：寬限 GRANTED。
+        var snapshot: AssistantSnapshot =
+            AssistantSnapshot.Known(available = true, held = false)
+        assertEquals(
+            AssistantReasonCode.GRANTED,
+            effectiveAssistantReason(stored, snapshot, false, pending),
+        )
+        // 交錯 B1：SideEffect 已消耗 → 次幀（resume tick）正常判 REVOKED。
+        pending = consumePendingVerify(pending, snapshot)
+        snapshot = AssistantSnapshot.Known(available = true, held = false)
+        assertEquals(
+            AssistantReasonCode.REVOKED,
+            effectiveAssistantReason(stored, snapshot, false, pending),
+        )
+        // 交錯 B2：resume 搶在首幀 effect 前（旗仍 true）→ 次幀再寬限一幀，
+        // 隨後消耗收斂（至多兩幀，不常駐）。
+        pending = true
+        snapshot = AssistantSnapshot.Known(available = true, held = false)
+        assertEquals(
+            AssistantReasonCode.GRANTED,
+            effectiveAssistantReason(stored, snapshot, false, pending),
+        )
+        pending = consumePendingVerify(pending, snapshot)
+        assertEquals(false, pending)
+        snapshot = AssistantSnapshot.Known(available = true, held = false)
+        assertEquals(
+            AssistantReasonCode.REVOKED,
+            effectiveAssistantReason(stored, snapshot, false, pending),
+        )
+    }
 }

@@ -20,7 +20,13 @@ import kotlinx.coroutines.withContext
  * Room-backed [SessionStore] (M4, spec §8).
  *
  * Write-path guarantees (spec §8.4):
- * - every event text passes [Redactor.redact] before insert;
+ * - every event text passes [Redactor.redact] before insert, with exactly one
+ *   narrow identity-preservation exception: system terminal markers
+ *   (`turn <runId> interrupted/cancelled`, and the prefix of `turn <runId> failed`)
+ *   preserve their exact marker prefix when and only when [isTrustedRunId] validates
+ *   the run ID as a trusted UUID shape (protecting against false-positive card redaction
+ *   on Luhn-valid generated IDs); any untrusted run ID or failure message suffix is
+ *   strictly redacted;
  * - image bytes never reach the DB (only [TranscriptEvent.imagesOmitted]);
  * - `seq` is assigned as (max+1) inside the same transaction as the insert,
  *   with a [Mutex] as the second line of defence for same-session concurrency.
@@ -1166,6 +1172,15 @@ internal fun terminalTail(runId: String, text: String): String? {
     }
 }
 
+/**
+ * Prepares event text for storage under write-path redaction guarantees (spec §8.4):
+ * every event text passes [Redactor.redact] before insert, with exactly one narrow
+ * identity-preservation exception: system terminal markers (`turn <runId> interrupted/cancelled`,
+ * and the prefix of `turn <runId> failed`) preserve their exact marker prefix when and only when
+ * [isTrustedRunId] validates the run ID as a trusted UUID shape (protecting against false-positive
+ * card redaction on Luhn-valid generated IDs); any untrusted run ID or failure message suffix is
+ * strictly redacted.
+ */
 internal fun prepareEventText(kind: String, runId: String, text: String): String {
     if (kind == "system" && isTrustedRunId(runId)) {
         val tail = terminalTail(runId, text)

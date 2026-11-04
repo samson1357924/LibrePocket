@@ -400,7 +400,9 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
 
         val text = content ?: partText
         if (text != null) {
-            // Valid text content takes priority: stray/empty refusal must NOT poison sawRefusal
+            // Per OpenAI Structured Outputs §2.4 refusal specification: valid text content takes
+            // strict priority over refusal (including part-array refusal). When text is present,
+            // stray or mixed refusal parts must NOT poison sawRefusal or supersede content.
             return text
         }
         val effectiveRefusal = refusal ?: partRefusal

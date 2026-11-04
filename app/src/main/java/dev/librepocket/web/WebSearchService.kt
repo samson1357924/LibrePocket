@@ -3,6 +3,8 @@ package dev.librepocket.web
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -16,6 +18,16 @@ import kotlinx.coroutines.withContext
  *   follower `await()`；follower 取消不影響 leader，只中斷自己的等待）。
  * - 取消語義（#138 Scope：取消不 fallback、不寫 cache）：外部取消原樣透傳，
  *   不寫快取；`Failed`／`Unavailable` 同樣不寫快取（熔斷與缺設定不得焊住）。
+ * - follower 重試（leader 取消不污染 follower）：follower `await()` 收到
+ *   [CancellationException] 時先 `ensureActive()`——若 follower 自己被取消則原樣拋出；
+ *   否則視為 leader 死亡，迴圈重選（成為新 leader 重打 upstream）。in-flight 移除
+ *   仍在 `NonCancellable` finally 內，殘留已取消的 deferred 不會焊住後續同 key。
+ * - leader 已拿到值才觀察到取消（delegate 回 `Ok` 後 `ensureActive()` 失敗）：
+ *   不寫快取、leader 仍拋 [CancellationException]，但已在等待的 follower 仍以該
+ *   `Ok`（非 cached）完成，不陪葬重打。
+ * - 非取消異常（delegate 拋 `Exception`，如吞掉取消的壞 delegate 或程式錯誤）映射為
+ *   `Failed(TRANSPORT)` 值回傳（fail-closed，允許非 pinned fallback），不 raw throw；
+ *   `Error` 仍 `completeExceptionally` 後原樣拋出。
  * - 空 query 直接委派（`Unavailable(EMPTY_QUERY)`），不進 cache／in-flight 表。
  */
 class WebSearchService(
@@ -31,41 +43,68 @@ class WebSearchService(
         if (query.isBlank()) return delegate.search(query, count)
         val n = WebSearchBudgets.countOf(count)
         val key = cache.key(delegate.id, query, n)
-        cache.get(delegate.id, query, n)?.let { return it.copy(cached = true) }
+        while (true) {
+            cache.get(delegate.id, query, n)?.let { return it.copy(cached = true) }
 
-        val mine: CompletableDeferred<WebSearchOutcome>
-        val leader: Boolean
-        mutex.withLock {
-            val existing = inFlight[key]
-            if (existing != null) {
-                mine = existing
-                leader = false
-            } else {
-                mine = CompletableDeferred()
-                inFlight[key] = mine
-                leader = true
+            val mine: CompletableDeferred<WebSearchOutcome>
+            val leader: Boolean
+            mutex.withLock {
+                val existing = inFlight[key]
+                if (existing != null) {
+                    mine = existing
+                    leader = false
+                } else {
+                    mine = CompletableDeferred()
+                    inFlight[key] = mine
+                    leader = true
+                }
             }
-        }
-        if (!leader) return mine.await()
+            if (!leader) {
+                try {
+                    return mine.await()
+                } catch (_: CancellationException) {
+                    // Follower 自己被取消 → ensureActive 拋出，原樣透傳；
+                    // 否則是 leader 死亡 → 迴圈重選（成為新 leader）。
+                    currentCoroutineContext().ensureActive()
+                    continue
+                }
+            }
 
-        try {
-            val outcome = delegate.search(query, n)
-            if (outcome is WebSearchOutcome.Ok) {
-                cache.put(delegate.id, query, n, outcome)
-            }
-            mine.complete(outcome)
-            return outcome
-        } catch (e: CancellationException) {
-            mine.completeExceptionally(e)
-            throw e
-        } catch (e: Throwable) {
-            mine.completeExceptionally(e)
-            throw e
-        } finally {
-            // 取消狀態下仍須清 inFlight，否則殘留已取消的 deferred 會焊住後續同 key。
-            withContext(NonCancellable) {
-                mutex.withLock {
-                    if (inFlight[key] === mine) inFlight.remove(key)
+            var okForFollowers: WebSearchOutcome.Ok? = null
+            try {
+                val outcome = delegate.search(query, n)
+                if (outcome is WebSearchOutcome.Ok) okForFollowers = outcome
+                // 吞掉取消的壞 delegate：已取消仍回值時不得寫 cache。
+                currentCoroutineContext().ensureActive()
+                if (outcome is WebSearchOutcome.Ok) {
+                    cache.put(delegate.id, query, n, outcome)
+                }
+                mine.complete(outcome)
+                return outcome
+            } catch (e: CancellationException) {
+                // Leader 已拿到 Ok 才觀察到取消：follower 仍值得該值（不寫 cache），
+                // leader 自己拋 CE；否則 follower 會重試，不污染。
+                val ok = okForFollowers
+                if (ok != null) {
+                    mine.complete(ok)
+                } else {
+                    mine.completeExceptionally(e)
+                }
+                throw e
+            } catch (_: Exception) {
+                currentCoroutineContext().ensureActive()
+                val failed = WebSearchOutcome.Failed(WebFailureReason.TRANSPORT)
+                mine.complete(failed)
+                return failed
+            } catch (e: Throwable) {
+                mine.completeExceptionally(e)
+                throw e
+            } finally {
+                // 取消狀態下仍須清 inFlight，否則殘留已取消的 deferred 會焊住後續同 key。
+                withContext(NonCancellable) {
+                    mutex.withLock {
+                        if (inFlight[key] === mine) inFlight.remove(key)
+                    }
                 }
             }
         }

@@ -5,6 +5,8 @@ import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withTimeout
 
 /**
@@ -60,12 +62,18 @@ internal suspend fun fetchWithTimeout(
     } catch (e: CancellationException) {
         throw e
     } catch (_: SocketTimeoutException) {
+        currentCoroutineContext().ensureActive()
         return FetchOut.Fail(WebFailureReason.TIMEOUT)
     } catch (_: InterruptedIOException) {
+        currentCoroutineContext().ensureActive()
         return FetchOut.Fail(WebFailureReason.TIMEOUT)
     } catch (_: IOException) {
+        currentCoroutineContext().ensureActive()
         return FetchOut.Fail(WebFailureReason.TRANSPORT)
     } catch (_: Exception) {
+        // Fail-closed：fetcher 拋出的未知異常（程式錯誤）仍映射 TRANSPORT，保持
+        // provider contract no-throw；Service 另有中央映射，見 WebSearchService。
+        currentCoroutineContext().ensureActive()
         return FetchOut.Fail(WebFailureReason.TRANSPORT)
     }
     return FetchOut.Resp(response)

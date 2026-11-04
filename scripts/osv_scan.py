@@ -12,9 +12,11 @@ Scope (Current):
     entries without a version (e.g. ``compose-ui`` via ``compose-bom``) are
     skipped with a warning, because the catalog does not record their
     resolved version. Transitive and build-plugin (AGP/Kotlin) versions are
-    NOT covered here; they are covered by Gradle dependency verification
-    (``gradle/verification-metadata.xml``) and GitHub dependency-review /
-    Dependabot alerts (see issue #132).
+    NOT covered here (direct-catalog-only). Artifact integrity for those
+    versions is covered by Gradle dependency verification
+    (``gradle/verification-metadata.xml``); vulnerability visibility for them
+    comes from GitHub dependency-review (PR diffs only) / Dependabot alerts
+    (see issue #132).
   * npm (``github_bot``) and pip (``scripts/requirements-docs.txt``) are NOT
     scanned here; they are covered by Dependabot updates.
 

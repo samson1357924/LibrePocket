@@ -417,8 +417,6 @@ fun SettingsScreen(
                             // enabled（僅 held 才 disabled），文案改為「前往語音輸入設定」；
                             // 點擊仍走 onRequestAssistantRole → request() UnsupportedFallback
                             // 分支（設 UNSUPPORTED＋openFallback），與下方 OutlinedButton 同效。
-                            // 行為變更：舊測 unsupported_showsUnsupportedState 斷言此態 disabled
-                            // 將破，留 Stage 4 統一修測，本 stage 不改測試檔。
                             Button(
                                 onClick = onRequestAssistantRole,
                                 enabled = !assistant.roleHeld,

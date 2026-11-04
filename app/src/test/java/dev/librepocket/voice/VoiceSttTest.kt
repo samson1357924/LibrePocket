@@ -89,16 +89,17 @@ class VoiceSttTest {
     }
 
     @Test fun manifestQueriesAction_isRecognizeSpeech() {
-        // B1：queries 必須是 intent action（RECOGNIZE_SPEECH），不可用
-        // RecognitionService（服務類名，PackageManager 解析不到）。
+        // B1：<queries> 必須是 intent action（RECOGNIZE_SPEECH）；服務宣告的
+        // intent-filter 允許 RecognitionService action，<queries> 內不可用服務類名。
         val manifest = findSource(
             "src/main/AndroidManifest.xml",
             "app/src/main/AndroidManifest.xml",
         ).readText()
+        val queries = manifest.substringAfter("<queries>").substringBefore("</queries>")
         assertTrue(
-            manifest.contains("<action android:name=\"android.speech.action.RECOGNIZE_SPEECH\" />"),
+            queries.contains("<action android:name=\"android.speech.action.RECOGNIZE_SPEECH\" />"),
         )
-        assertFalse(manifest.contains("android.speech.RecognitionService"))
+        assertFalse(queries.contains("android.speech.RecognitionService"))
         assertEquals("android.speech.action.RECOGNIZE_SPEECH", VoiceStt.ACTION)
     }
 

@@ -14,7 +14,11 @@ Scope (Current):
     shorthand string ``alias = "group:name:version"``. BOM-managed
     entries without a version (e.g. ``compose-ui`` via ``compose-bom``) are
     skipped with a warning, because the catalog does not record their
-    resolved version. A versioned entry with malformed coordinates or
+    resolved version. The text header and the JSON ``summary`` both report
+    the skipped (BOM-managed, version unknown) count. The 7 versionless
+    ``compose-*`` aliases are pinned as the ``EXPECTED_UNVERSIONED_KEYS``
+    allowlist; any other unversioned library fails closed. A versioned entry
+    with malformed coordinates or
     version (bad ``module`` shape, bad shorthand shape, dangling
     ``version.ref``, non-string/non-ref ``version``) fails closed
     (``RuntimeError``, exit 2). Transitive and build-plugin (AGP/Kotlin) versions are
@@ -42,6 +46,8 @@ Network note: the default OSV endpoint is public and unauthenticated
 (``https://api.osv.dev/v1/querybatch``). Tests must use ``--osv-url`` with a
 local fake HTTP server and synthetic catalogs; never point tests at the
 production OSV endpoint.
+
+Requires Python >= 3.11 (``tomllib`` stdlib).
 """
 
 from __future__ import annotations

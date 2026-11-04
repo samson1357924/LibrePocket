@@ -44,6 +44,10 @@ import java.io.File
  *   [dev.librepocket.files.FileScope.decide] 回 needsBridge 且橋接已授權
  *   （[bridgeGranted]，對應 `privilege_bridge` 開關）。
  *
+ * R2-A 可驗證化（owner P1-1）：`su -c` 拉起的子孫經同一
+ * [ElevatedProcessKiller.killTree] 清理（宣告類查表，JVM 真子進程已驗，
+ * 見 `ElevatedProcessKillerTest`）；裝置側 SELinux/Root 語義差異 E2E 為 B3。
+ *
  * 注入說明（雙注入保留，不合併，避免 API 破壞）：[suBinary] 為直接覆寫的
  * 候選 su 路徑（測試／呼叫方可釘死，仍須過可信判定），[suExists] 為解析時
  * 的存在性檢查（預設走檔案系統，單測可注入假映射）；前者管「用哪條」，

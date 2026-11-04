@@ -139,8 +139,61 @@ class ShizukuStatusTest {
     }
 
     @Test fun attachWithoutBinderEnvironmentDoesNotThrow() {
-        // JVM 單測無 Shizuku 服務：註冊異常由 attach 內部收斂，不得外抛。
-        ShizukuBinderEvents().attach()
+        // JVM 單測無 Shizuku 服務：Shizuku 類初始化即失敗，註冊異常由
+        // attach/detach 內部 runCatching 收斂，不得外抛。
+        val events = ShizukuBinderEvents()
+        events.attach()
+        events.detach()
+    }
+
+    @Test fun detachResetsGuardAndClearsCallbacks() {
+        // JVM 單測無 binder：Shizuku 類初始化即失敗，attach 註冊失敗由內部收斂；
+        // 舊實作先置守衛會導致失敗後卡死 true，新實作保持 false（允許重試）。
+        val events = ShizukuBinderEvents()
+        var received = 0
+        var dead = 0
+        events.onReceived { received++ }
+        events.onDead { dead++ }
+        events.attach()
+        assertFalse(events.isAttached())
+        events.attach() // 重試不被冪等守衛吞掉（仍失敗但不抛）
+        assertFalse(events.isAttached())
+        // 失敗只影響上游註冊，不清本地表：本地回呼仍有效。
+        events.emitReceived()
+        events.emitDead()
+        assertEquals(1, received)
+        assertEquals(1, dead)
+        // detach 清本地表＋復位守衛，空 detach 冪等安全。
+        events.detach()
+        assertFalse(events.isAttached())
+        events.emitReceived()
+        events.emitDead()
+        assertEquals(1, received)
+        assertEquals(1, dead)
+        events.detach()
+        assertFalse(events.isAttached())
+    }
+
+    @Test fun attachDetachAttachDoesNotAccumulateCallbacks() {
+        // attach→detach→attach：detach 清本地表，重建後重新訂閱只分發一次，
+        // 無殘留重複。上游靜態表無法在 JVM 斷言（Shizuku 類初始化即失敗）；
+        // 上游不累積由 detach 內 remove*（同一引用反註冊）保證，見 KDoc。
+        val events = ShizukuBinderEvents()
+        var calls = 0
+        events.onReceived { calls++ }
+        events.attach()
+        assertFalse(events.isAttached()) // JVM 下註冊失敗，守衛保持 false
+        events.detach()
+        assertFalse(events.isAttached())
+        events.emitReceived()
+        assertEquals(0, calls) // detach 已清空本地表
+        events.attach() // 重建：守衛未卡死，重試不抛
+        events.onReceived { calls++ }
+        events.emitReceived()
+        assertEquals(1, calls) // 只觸發一次
+        events.detach()
+        events.emitReceived()
+        assertEquals(1, calls)
     }
 
     @Test fun evaluateExtremeVersions() {

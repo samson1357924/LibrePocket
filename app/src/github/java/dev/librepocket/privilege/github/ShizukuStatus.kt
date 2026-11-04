@@ -140,14 +140,29 @@ object ShizukuStatusGate {
  * 真實 `addBinderReceivedListener` / `addBinderDeadListener` 只在 [attach]
  * 內註冊（產品路徑，需 binder 環境）；狀態分發走純 JVM 回呼表，
  * 單測以 [emitReceived]/[emitDead] 驅動，零真機、零 su、零真連線。
+ *
+ * 重試語義：[attach] 僅在兩段上游註冊都成功後才將守衛置 true；
+ * 任一段失敗即回滾已註冊項並保持 false，呼叫方可重試。JVM 單測下
+ * Shizuku 類初始化即失敗（android.os.Binder 未 mock），attach 恆走
+ * 失敗路徑、守衛恆 false——此恰可斷言失敗不卡死守衛；真機缺服務時
+ * 同理，重試不被冪等守衛吞掉。
+ * 上游為靜態 Shizuku 類無法注入失敗，單測只斷言本地語義
+ * （守衛＋回呼表）。
  */
 class ShizukuBinderEvents {
     private val receivedCallbacks = mutableListOf<() -> Unit>()
     private val deadCallbacks = mutableListOf<() -> Unit>()
     private val lock = Any()
 
-    /** 是否已向 Shizuku 註冊過 listener（冪等守衛，僅 [attach]/[detach] 內讀寫）。 */
+    /** 是否已向 Shizuku 註冊過 listener（冪等守衛，僅 [attach]/[detach]/[clear] 內讀寫）。 */
     private var attached = false
+
+    /**
+     * 暫存的上游 listener 引用：attach 建新並以同一物件註冊，
+     * detach 以同一引用反註冊；讀寫皆在 [lock] 下，失敗/解除即置 null。
+     */
+    private var receivedListener: Shizuku.OnBinderReceivedListener? = null
+    private var deadListener: Shizuku.OnBinderDeadListener? = null
 
     fun onReceived(callback: () -> Unit) {
         synchronized(lock) { receivedCallbacks += callback }
@@ -156,6 +171,9 @@ class ShizukuBinderEvents {
     fun onDead(callback: () -> Unit) {
         synchronized(lock) { deadCallbacks += callback }
     }
+
+    /** 是否已成功註冊上游 listener（守衛讀取；供單測斷言重試/重建語義）。 */
+    fun isAttached(): Boolean = synchronized(lock) { attached }
 
     /** 僅測試/真實 listener 轉發用：觸發 received 快照（異常隔離，逐個收斂）。 */
     fun emitReceived() {
@@ -172,35 +190,73 @@ class ShizukuBinderEvents {
     /**
      * 產品接線：向 Shizuku 註冊 binder received/dead listener，事件轉發進回呼表。
      * 註冊本身異常 runCatching 收斂（未安裝/服務異常時不崩，狀態門仍 fail-closed）。
-     * 冪等：重複呼叫只註冊一次（[attached] 守衛）。
+     * 冪等：成功後重複呼叫只註冊一次（[attached] 守衛）；失敗不置守衛，允許重試：
+     * 首段失敗直接丟棄暫存引用，次段失敗先反註冊首段已註冊項再丟棄，
+     * 避免半註冊殘留與重試累積。
      */
     fun attach() {
         synchronized(lock) {
             if (attached) return
+            // 同一物件註冊/反註冊：暫存引用，重試復用殘留（失敗路徑已清，此處多為新建）。
+            val stagedReceived: Shizuku.OnBinderReceivedListener =
+                receivedListener ?: Shizuku.OnBinderReceivedListener { emitReceived() }
+                    .also { receivedListener = it }
+            val stagedDead: Shizuku.OnBinderDeadListener =
+                deadListener ?: Shizuku.OnBinderDeadListener { emitDead() }
+                    .also { deadListener = it }
+            if (runCatching { Shizuku.addBinderReceivedListener(stagedReceived) }.isFailure) {
+                if (receivedListener === stagedReceived) receivedListener = null
+                if (deadListener === stagedDead) deadListener = null
+                return
+            }
+            if (runCatching { Shizuku.addBinderDeadListener(stagedDead) }.isFailure) {
+                runCatching { Shizuku.removeBinderReceivedListener(stagedReceived) }
+                if (receivedListener === stagedReceived) receivedListener = null
+                if (deadListener === stagedDead) deadListener = null
+                return
+            }
             attached = true
-        }
-        runCatching {
-            Shizuku.addBinderReceivedListener { emitReceived() }
-        }
-        runCatching {
-            Shizuku.addBinderDeadListener { emitDead() }
         }
     }
 
     /**
-     * 解除接線：清 [attached] 守衛並清空回呼表（synchronized）。
-     * Shizuku 未提供移除 listener API，此處僅清本地分發表；
-     * 已註冊的轉發閉包留空轉（emit 快照為空，無副作用）。
+     * 解除接線：反註冊上游 listener 並清空本地回呼表、丟棄暫存引用、重置守衛。
+     *
+     * 上游 13.1.5 已提供 `removeBinderReceivedListener` /
+     * `removeBinderDeadListener`（簽名已對本地 gradle cache 的
+     * api-13.1.5.aar 以 javap 驗證；舊版上游缺此方法時
+     * NoSuchMethodError 由 runCatching 收斂為空轉，屬版本差異）。
+     * 空 detach（未 attach 即調）為無操作，不外抛。
      */
     fun detach() {
+        val stagedReceived: Shizuku.OnBinderReceivedListener?
+        val stagedDead: Shizuku.OnBinderDeadListener?
+        synchronized(lock) {
+            stagedReceived = receivedListener
+            stagedDead = deadListener
+        }
         clear()
+        if (stagedReceived != null) {
+            runCatching { Shizuku.removeBinderReceivedListener(stagedReceived) }
+        }
+        if (stagedDead != null) {
+            runCatching { Shizuku.removeBinderDeadListener(stagedDead) }
+        }
     }
 
-    /** 清空回呼表並重置 [attached] 守衛（synchronized；測試/生命週期重建用）。 */
+    /**
+     * 清空本地回呼表並重置 [attached] 守衛與暫存 listener 引用
+     * （synchronized；測試/生命週期重建用）。
+     *
+     * 注意：此函數不觸碰上游註冊（純 JVM，JVM 單測安全）；
+     * 產品路徑請用 [detach] 以同時反註冊上游，避免上游殘留累積。
+     */
     fun clear() {
         synchronized(lock) {
             receivedCallbacks.clear()
             deadCallbacks.clear()
+            receivedListener = null
+            deadListener = null
             attached = false
         }
     }

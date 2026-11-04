@@ -8,10 +8,16 @@ dependencies and never contacts production endpoints besides the OSV API
 (or an explicit ``--osv-url`` override, used by tests with a local fake server).
 
 Scope (Current):
-  * Direct catalog libraries with an explicit version only. BOM-managed
+  * Direct catalog libraries with an explicit version only. Supported
+    notations: ``group`` + ``name`` (+ ``version`` / ``version.ref``),
+    ``module = "group:name"`` (+ ``version`` / ``version.ref``), and the
+    shorthand string ``alias = "group:name:version"``. BOM-managed
     entries without a version (e.g. ``compose-ui`` via ``compose-bom``) are
     skipped with a warning, because the catalog does not record their
-    resolved version. Transitive and build-plugin (AGP/Kotlin) versions are
+    resolved version. A versioned entry with malformed coordinates or
+    version (bad ``module`` shape, bad shorthand shape, dangling
+    ``version.ref``, non-string/non-ref ``version``) fails closed
+    (``RuntimeError``, exit 2). Transitive and build-plugin (AGP/Kotlin) versions are
     NOT covered here (direct-catalog-only). Artifact integrity for those
     versions is covered by Gradle dependency verification
     (``gradle/verification-metadata.xml``); vulnerability visibility for them
@@ -92,13 +98,68 @@ def _osv_url_allowed(url: str) -> bool:
     return False
 
 
+def _split_module(key: str, raw: object) -> tuple[str, str]:
+    """Split ``module = "group:name"``; raise on any malformed shape."""
+    if not isinstance(raw, str):
+        raise RuntimeError(
+            f"invalid module for library '{key}': expected 'group:name' string, "
+            f"got {type(raw).__name__}"
+        )
+    parts = raw.strip().split(":")
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        raise RuntimeError(
+            f"invalid module {raw!r} for library '{key}': expected 'group:name' "
+            f"(exactly one ':', both sides non-empty)"
+        )
+    return parts[0].strip(), parts[1].strip()
+
+
+def _split_shorthand(key: str, raw: str) -> tuple[str, str, str]:
+    """Split shorthand ``alias = "group:name:version"``; raise if malformed."""
+    parts = raw.strip().split(":")
+    if len(parts) != 3 or any(not p.strip() for p in parts):
+        raise RuntimeError(
+            f"invalid shorthand {raw!r} for library '{key}': expected "
+            f"'group:name:version' (exactly two ':', all three parts non-empty)"
+        )
+    return parts[0].strip(), parts[1].strip(), parts[2].strip()
+
+
+def _resolve_version(key: str, label: str, raw: object, versions: dict) -> str:
+    """Resolve a ``version`` value to a pinned string; raise if malformed."""
+    if isinstance(raw, str):
+        if not raw.strip():
+            raise RuntimeError(f"empty version for {label} (library '{key}')")
+        return raw.strip()
+    if isinstance(raw, dict):
+        ref = raw.get("ref")
+        if isinstance(ref, str):
+            resolved = versions.get(ref)
+            if isinstance(resolved, str) and resolved.strip():
+                return resolved.strip()
+            raise RuntimeError(
+                f"unresolvable version.ref '{ref}' for {label} (library '{key}')"
+            )
+        raise RuntimeError(
+            f"unsupported version shape for {label} (library '{key}'): "
+            f"expected version string or {{ ref = ... }}, got {raw!r}"
+        )
+    raise RuntimeError(
+        f"unsupported version shape for {label} (library '{key}'): "
+        f"expected version string or {{ ref = ... }}, got {raw!r}"
+    )
+
+
 def parse_catalog(catalog: Path) -> tuple[list[dict[str, str]], list[str], int]:
     """Return (packages, warnings, skipped_count).
 
-    Each package is group/name/version/key (key = catalog alias). Every
-    warning corresponds to one skipped library entry (BOM-managed without a
-    catalog version, missing group/name, unresolvable version.ref, ...), so
-    skipped_count == len(warnings).
+    Each package is group/name/version/key (key = catalog alias). Skipped
+    entries are BOM-managed libraries with no version information at all
+    (no ``version`` key and no version in a shorthand string): each one
+    produces exactly one warning, so skipped_count == len(warnings).
+    Anything with version intent but a malformed shape (bad ``module``,
+    bad shorthand, dangling ``version.ref``, non-string/non-ref ``version``,
+    versioned entry without coordinates) raises ``RuntimeError`` (exit 2).
     """
     if tomllib is None:
         raise RuntimeError("tomllib is unavailable (requires Python >= 3.11)")
@@ -122,36 +183,46 @@ def parse_catalog(catalog: Path) -> tuple[list[dict[str, str]], list[str], int]:
     warnings: list[str] = []
     for key in sorted(libraries):
         entry = libraries[key]
+        if isinstance(entry, str):
+            # Shorthand string: alias = "group:name:version".
+            group, name, version = _split_shorthand(key, entry)
+            packages.append({"group": group, "name": name, "version": version, "key": key})
+            continue
         if not isinstance(entry, dict):
-            warnings.append(f"skip {key}: library entry is not a mapping")
-            continue
-        group = entry.get("group")
-        name = entry.get("name")
-        if not isinstance(group, str) or not group or not isinstance(name, str) or not name:
-            warnings.append(f"skip {key}: missing group/name")
-            continue
-        version: str | None = None
-        if "version" in entry:
-            raw = entry["version"]
-            if isinstance(raw, str):
-                version = raw
-            elif isinstance(raw, dict) and isinstance(raw.get("ref"), str):
-                ref = raw["ref"]
-                resolved = versions.get(ref)
-                if isinstance(resolved, str) and resolved:
-                    version = resolved
-                else:
-                    warnings.append(f"skip {group}:{name}: unresolvable version.ref '{ref}'")
-                    continue
+            raise RuntimeError(
+                f"invalid library entry for '{key}': expected mapping or "
+                f"'group:name:version' string, got {type(entry).__name__}"
+            )
+        group: str | None = None
+        name: str | None = None
+        if "module" in entry:
+            if "group" in entry or "name" in entry:
+                raise RuntimeError(
+                    f"ambiguous coordinates for library '{key}': use either "
+                    f"'module' or 'group'/'name', not both"
+                )
+            group, name = _split_module(key, entry["module"])
+        elif (
+            isinstance(entry.get("group"), str)
+            and entry["group"]
+            and isinstance(entry.get("name"), str)
+            and entry["name"]
+        ):
+            group, name = entry["group"], entry["name"]
+        if "version" not in entry:
+            # No version information at all: BOM-managed, skip with warning.
+            if key and group is not None:
+                warnings.append(f"skip {key}: {group}:{name}: no version (BOM-managed?)")
             else:
-                warnings.append(f"skip {group}:{name}: unsupported version shape")
-                continue
-        else:
-            warnings.append(f"skip {group}:{name}: no version (BOM-managed?)")
+                label = f"{group}:{name}" if group is not None else key or "unknown"
+                warnings.append(f"skip {label}: no version (BOM-managed?)")
             continue
-        if not version:
-            warnings.append(f"skip {group}:{name}: empty version")
-            continue
+        if group is None:
+            raise RuntimeError(
+                f"missing group/name for library '{key}': versioned entry has "
+                f"no coordinates (expected group+name or module)"
+            )
+        version = _resolve_version(key, f"{group}:{name}", entry["version"], versions)
         packages.append({"group": group, "name": name, "version": version, "key": key})
     # Deduplicate identical coordinates (catalog may alias same GAV).
     seen: set[tuple[str, str, str]] = set()

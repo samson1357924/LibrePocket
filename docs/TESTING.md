@@ -866,8 +866,10 @@ git diff --stat
 # --output writes a JSON report file, --format controls stdout; --timeout
 # 1..300 (default 30s), --batch-size 1..500 (default 50), --retries 0..5
 # (default 2, total attempts = 1 + retries); header/JSON summary include the
-# skipped (BOM-managed, version unknown) count; exit 0 = clean, 1 = vuln
-# found (monitor signal), 2 = fail-closed error):
+# skipped (BOM-managed, version unknown) count; catalog parsing accepts
+# group+name, module = "group:name", and "group:name:version" shorthand,
+# failing closed (exit 2) on malformed versioned entries; exit 0 = clean,
+# 1 = vuln found (monitor signal), 2 = fail-closed error):
 python3 -P scripts/osv_scan.py --format json --output /tmp/osv-report.json
 
 # Docs dependency and configuration checks (static, no Gradle)

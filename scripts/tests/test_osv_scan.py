@@ -255,6 +255,86 @@ class OsvScanTest(unittest.TestCase):
         # BOM-managed compose entries must be skipped with a warning.
         self.assertIn("BOM-managed", proc.stderr)
 
+    def test_module_notation_queried_and_affected(self):
+        FakeOsvHandler.mode = "vuln"
+        toml = (
+            "[versions]\n"
+            'modver = "9.9.9"\n'
+            "\n[libraries]\n"
+            'mod-foo = { module = "com.example:foo", version.ref = "modver" }\n'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            catalog = self.write_catalog(Path(td), content=toml)
+            proc = self.run_scan("--catalog", str(catalog), "--osv-url", self.url)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("AFFECTED com.example:foo:9.9.9", proc.stdout)
+            names = [q["package"]["name"] for q in FakeOsvHandler.last_queries]
+            self.assertEqual(names, ["com.example:foo"])
+            self.assertIn("1 package(s) scanned", proc.stdout)
+
+    def test_shorthand_string_scanned(self):
+        FakeOsvHandler.mode = "clean"
+        toml = (
+            "[libraries]\n"
+            'short-foo = "com.example:foo:1.0.0"\n'
+            'plain-bar = { group = "com.example", name = "bar", version = "2.0.0" }\n'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            catalog = self.write_catalog(Path(td), content=toml)
+            proc = self.run_scan("--catalog", str(catalog), "--osv-url", self.url)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("2 package(s) scanned", proc.stdout)
+            names = [q["package"]["name"] for q in FakeOsvHandler.last_queries]
+            self.assertEqual(sorted(names), ["com.example:bar", "com.example:foo"])
+
+    def test_malformed_versioned_entries_fail_closed(self):
+        # Mixed catalog: one good versioned entry plus one malformed entry.
+        # A single bad entry alone has no distinguishing power (old skip-code
+        # yields pkgs=0 -> exit 2 via "no versioned packages", same as the
+        # new fail-closed exit 2). With a good entry present, old code exits
+        # 0/1 and prints "package(s) scanned" while new code exits 2 without
+        # the header, so each subtest is a true fail-before-fix check.
+        good = 'good = { group = "com.example", name = "foo", version = "1.0.0" }\n'
+        cases = [
+            ("module without colon",
+             '[libraries]\n' + good +
+             'bad = { module = "nocolon", version = "1.0" }\n',
+             "module"),
+            ("module with empty segment",
+             '[libraries]\n' + good +
+             'bad = { module = "g:", version = "1.0" }\n',
+             "module"),
+            ("dangling version.ref",
+             '[versions]\na = "1.0"\n[libraries]\n' + good +
+             'bad = { group = "g", name = "n", version.ref = "missing" }\n',
+             "version.ref"),
+            ("integer version",
+             '[libraries]\n' + good +
+             'bad = { group = "g", name = "n", version = 42 }\n',
+             "version"),
+            ("bad shorthand segment count",
+             '[libraries]\n' + good +
+             'bad = "g:n"\n',
+             "shorthand"),
+            ("non-mapping non-string entry",
+             '[libraries]\n' + good +
+             'bad = 42\n',
+             "library entry"),
+            ("whitespace-only version via ref",
+             '[versions]\nblank = "   "\n[libraries]\n' + good +
+             'bad = { group = "g", name = "n", version.ref = "blank" }\n',
+             "version.ref"),
+        ]
+        for name, toml, keyword in cases:
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    catalog = self.write_catalog(Path(td), content=toml)
+                    proc = self.run_scan("--catalog", str(catalog), "--osv-url", self.url)
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    self.assertIn("ERROR", proc.stderr)
+                    self.assertIn(keyword, proc.stderr)
+                    self.assertNotIn("package(s) scanned", proc.stdout)
+
     def test_json_report_writes_purls(self):
         FakeOsvHandler.mode = "vuln"
         with tempfile.TemporaryDirectory() as td:

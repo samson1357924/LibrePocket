@@ -29,6 +29,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import scripts.verify_verification_metadata as V
+from scripts import osv_scan
 from scripts.verify_verification_metadata import (
     NS,
     ROOT,
@@ -61,37 +62,27 @@ class VerificationMetadataTest(unittest.TestCase):
         # pinned version in the catalog (e.g. compose-ui via compose-bom) and
         # are skipped here; they are covered by osv_scan's WARN skip plus
         # transitive components, so they are recorded in `skipped`
-        # (group/name only) rather than silently dropped.
+        # (one warning per skipped entry) rather than silently dropped.
+        # GAV pins come from scripts/osv_scan.parse_catalog (single parser,
+        # no duplicated TOML logic here): a malformed versioned entry fails
+        # the test via RuntimeError, exactly as the monitor fails closed.
         try:
-            import tomllib
+            import tomllib  # noqa: F401
         except ImportError:
             self.skipTest("tomllib unavailable")
-        catalog = tomllib.loads((ROOT / "gradle/libs.versions.toml").read_text(encoding="utf-8"))
-        versions = catalog.get("versions", {})
+        packages, warnings, _skipped = osv_scan.parse_catalog(
+            ROOT / "gradle/libs.versions.toml"
+        )
         root = load_metadata()
         have = {
             (c.get("group"), c.get("name"), c.get("version"))
             for c in root.find("v:components", NS).findall("v:component", NS)
         }
         missing: list[str] = []
-        skipped: list[str] = []
-        for key, entry in sorted(catalog.get("libraries", {}).items()):
-            if not isinstance(entry, dict):
-                continue
-            group, name = entry.get("group"), entry.get("name")
-            raw = entry.get("version")
-            version = None
-            if isinstance(raw, str):
-                version = raw
-            elif isinstance(raw, dict) and isinstance(raw.get("ref"), str):
-                version = versions.get(raw["ref"])
-            if not group or not name or not version:
-                # BOM-managed (no pinned version): osv_scan skips these with a
-                # WARN; verification still covers them transitively.
-                skipped.append(f"{key} -> {group}:{name} (no pinned version, BOM-managed)")
-                continue
-            if (group, name, version) not in have:
-                missing.append(f"{group}:{name}:{version}")
+        for pkg in packages:
+            if (pkg["group"], pkg["name"], pkg["version"]) not in have:
+                missing.append(f"{pkg['group']}:{pkg['name']}:{pkg['version']}")
+        skipped: list[str] = list(warnings)
         self.assertEqual(missing, [], f"catalog direct deps missing from verification: {missing}")
         # The BOM-managed skip set is part of the gate contract: if it ever
         # becomes empty (all libs versioned) or grows unexpectedly, this

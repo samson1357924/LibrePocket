@@ -438,9 +438,13 @@ fun SettingsScreen(
                             // fail-closed 仍成立——不發要求）。
                             // held 才 disabled；未知態不暗示可跳 fallback，
                             // OutlinedButton 仍可達。
+                            // re-review #4 finding #2 [P3/UX]：驗證中（state.verifying，
+                            // 含 VERIFYING 顯示幀及未知/held 重疊幀）主按鈕 disabled，
+                            // 防重複點擊重開授權頁；request() 入口另有
+                            // canStartRequest 防禦性 no-op（第二層）。
                             Button(
                                 onClick = onRequestAssistantRole,
-                                enabled = !assistant.roleHeld,
+                                enabled = !assistant.roleHeld && !assistant.verifying,
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
                                 Text(

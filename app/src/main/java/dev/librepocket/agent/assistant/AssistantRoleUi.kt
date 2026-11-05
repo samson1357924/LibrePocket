@@ -60,7 +60,7 @@ import kotlinx.coroutines.delay
  *   （everHeld→REVOKED，其餘→UNCONFIRMED）再置 `pendingVerify=false`；
  *   超時不再回中性 idle；ReadError／Unsupported 次數未滿保留 pending 並照常
  *   重試，耗盡同樣終止為 UNCONFIRMED，pending 永不殘留）。新一輪 request
- *   發起清旗＋`attempt=0`（舊驗證不帶入新流程）；ReadError 下 request 觸發一次
+ *   發起清旗＋`attempt=0`（舊驗證不帶入新流程；驗證中 request 一律 [canStartRequest] 防禦性 no-op，不清旗不開頁——re-review #4 finding #2 [P3/UX]，UI 另以 `state.verifying` disabled 主按鈕）；ReadError 下 request 觸發一次
  *   重讀（`refreshTick++`，不設碼不開 fallback——「重新檢查」入口）；
  *   `pendingVerify`／`verifyAttempt` 僅記憶體態（remember，不跨 process death——
  *   丟失可接受，重進後按正常規則判定）。
@@ -279,6 +279,12 @@ fun rememberAssistantRole(): AssistantRoleUi {
         // 顯式本地 val：閉包捕獲當次 remember 計算的快照值（見上 KDoc）。
         val snap = snapshot
         {
+            // re-review #4 finding #2 [P3/UX]：驗證中 request 防禦性 no-op
+            // （UI 已以 state.verifying disabled 主按鈕，此為第二層：即使競態
+            // 穿透亦不再清驗證重開授權頁，避免重複流程）。
+            if (!canStartRequest(pendingVerify)) {
+                Log.w(TAG, "request skipped: verification in progress (fail-closed)")
+            } else {
             // 新一輪要求開始即結束上一輪驗證（否則舊 pendingVerify 常駐掩蓋撤銷）＋attempt=0。
             pendingVerify = false
             verifyAttempt = 0
@@ -326,6 +332,7 @@ fun rememberAssistantRole(): AssistantRoleUi {
                     }
                 }
             }
+            }
         }
     }
     val state = remember(snapshot, storedReason, everHeld, pendingVerify, fallbackFailed) {
@@ -337,6 +344,7 @@ fun rememberAssistantRole(): AssistantRoleUi {
             reasonCode = effectiveAssistantReason(storedReason, snapshot, everHeld, pendingVerify),
             fallbackFailed = fallbackFailed,
             readError = snapshot is AssistantSnapshot.ReadError,
+            verifying = pendingVerify,
         )
     }
     return AssistantRoleUi(

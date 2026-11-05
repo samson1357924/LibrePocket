@@ -202,11 +202,11 @@ class AssistantRoleTest {
             assistantReasonText(AssistantReasonCode.REVOKED),
         )
         assertEquals(
-            "此裝置不支援系統助理角色：已改用語音輸入設定。",
+            "不支援系統助理角色，請改用語音輸入設定。",
             assistantReasonText(AssistantReasonCode.UNSUPPORTED),
         )
         assertEquals(
-            "無法開啟系統授權頁：已改用語音輸入設定。",
+            "無法開啟系統授權頁，請改用語音輸入設定。",
             assistantReasonText(AssistantReasonCode.REQUEST_FAILED),
         )
         assertEquals(
@@ -1215,5 +1215,39 @@ class AssistantRoleTest {
             AssistantReasonCode.UNCONFIRMED,
             effectiveAssistantReason(stored, snapshot, false, pending),
         )
+    }
+
+    // ---- re-review #4 finding #2 [P3/UX]：驗證中 request 防線（純函數） ----
+
+    @Test
+    fun givenPendingVerify_whenCanStartRequest_thenReturnsFalse() {
+        // 驗證重試跑時 request() 入口純 no-op（UI 另以 state.verifying disabled
+        // 主按鈕，此為防禦性第二層，即使競態穿透亦不重開授權頁）。
+        assertEquals(false, canStartRequest(true))
+    }
+
+    @Test
+    fun givenNotPendingVerify_whenCanStartRequest_thenReturnsTrue() {
+        assertEquals(true, canStartRequest(false))
+    }
+
+    @Test
+    fun givenUnsupportedOrRequestFailedText_whenRead_thenDoesNotClaimFallbackOpened() {
+        // re-review #4 finding #3 [P3/UX]：原因行不預設 fallback 已開啟
+        // （祈使非完成式）；fallback 真失敗才由 fallbackFailed 紅字精確表達。
+        // 此處鎖定「已改用」完成式不再出現（與紅字「無法開啟語音輸入設定」矛盾）。
+        listOf(
+            assistantReasonText(AssistantReasonCode.UNSUPPORTED),
+            assistantReasonText(AssistantReasonCode.REQUEST_FAILED),
+        ).forEach { text ->
+            assertTrue(
+                "原因行不可預設 fallback 已開啟：$text",
+                !text.contains("已改用"),
+            )
+            assertTrue(
+                "原因行須給改用語音輸入設定動作：$text",
+                text.contains("請改用語音輸入設定"),
+            )
+        }
     }
 }

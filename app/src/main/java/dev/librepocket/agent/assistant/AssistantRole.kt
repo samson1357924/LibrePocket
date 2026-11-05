@@ -93,6 +93,15 @@ data class AssistantSettingsState(
      * 與真不支援（false／「此裝置不支援…」）區分，預設 false 保舊構造相容。
      */
     val readError: Boolean = false,
+    /**
+     * 驗證中（re-review #4 finding #2 [P3/UX]）。
+     * true 時 SettingsScreen 主按鈕 disabled（`enabled = !roleHeld && !verifying`），
+     * 防止驗證重試跑時再次點擊造成重複授權頁流程；request() 入口另以
+     * [canStartRequest] 防禦性 no-op（即使 UI 競態穿透亦不再開新流程）。
+     * 由 rememberAssistantRole 的 `pendingVerify` 傳入（見 AssistantRoleUi）；
+     * 預設 false 保舊構造相容。
+     */
+    val verifying: Boolean = false,
 )
 
 sealed interface AssistantRoleDecision {
@@ -422,11 +431,28 @@ fun verificationTimeoutReason(
     }
 }
 
+/**
+ * 驗證中是否允許發起新要求（re-review #4 finding #2 [P3/UX] 純函數防線）。
+ *
+ * `request()` 入口守衛（見 AssistantRoleUi）：`pendingVerify == true`（驗證重試
+ * 跑時）一律回 false，呼叫方純 no-op＋Log，不清驗證、不開授權頁；
+ * UI 另以 [AssistantSettingsState.verifying] disabled 主按鈕，此為防禦性第二層
+ * （即使 UI 競態穿透亦不再開重複流程）。
+ */
+fun canStartRequest(pendingVerify: Boolean): Boolean = !pendingVerify
+
 /** 原因碼 → 顯示文案（UI 只顯示文案不做流程分支，色彩可按失敗/中性區分（見 SettingsScreen）；未知碼原樣回報，不偽造語義）。
  *
  * 硬編碼說明（PocketGuard 建議）：本 PR 不做全量 strings.xml 遷移（SettingsScreen
  * 全檔既有硬編碼＋strings.xml 僅 app_name，專案級重構不宜在本 PR）。
  * TODO(i18n-followup): 集中遷移＋純函數改 mapper 注入（原因碼→文案改由呼叫方注入 mapper，本檔保持純邏輯可測）。
+ *
+ * 原因行不預設 fallback 已開啟（re-review #4 finding #3 [P3/UX]）：
+ * UNSUPPORTED／REQUEST_FAILED 只給祈使動作（「請改用語音輸入設定」），不用完成式
+ * （舊「已改用…」在無唯一系統候選／startActivity 失敗、fallback 根本沒打開時
+ * 與紅字「無法開啟語音輸入設定」矛盾）；fallback 真失敗才由
+ * `fallbackFailed` 紅字精確表達。UNSUPPORTED 原因行另避與頭部不支援句逐字重複
+ * （頭部「此裝置不支援…，可改用…」；原因行「不支援…，請改用…」）。
  */
 fun assistantReasonText(code: String): String =
     when (code) {
@@ -437,9 +463,9 @@ fun assistantReasonText(code: String): String =
         AssistantReasonCode.REVOKED ->
             "預設助理角色已被撤銷：可重新要求，或改用語音輸入設定。"
         AssistantReasonCode.UNSUPPORTED ->
-            "此裝置不支援系統助理角色：已改用語音輸入設定。"
+            "不支援系統助理角色，請改用語音輸入設定。"
         AssistantReasonCode.REQUEST_FAILED ->
-            "無法開啟系統授權頁：已改用語音輸入設定。"
+            "無法開啟系統授權頁，請改用語音輸入設定。"
         AssistantReasonCode.VERIFYING ->
             "要求已送出，正在向系統確認角色狀態…"
         AssistantReasonCode.UNCONFIRMED ->

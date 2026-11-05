@@ -474,4 +474,80 @@ class AssistantCardTest {
         composeRule.onNodeWithText(assistantReasonText(AssistantReasonCode.GRANTED))
             .assertDoesNotExist()
     }
+
+    /**
+     * re-review #4 finding #2 [P3/UX]：VERIFYING 顯示期間主按鈕 disabled。
+     * state.verifying=true（rememberAssistantRole 由 pendingVerify 傳入）即禁用，
+     * 防重複點擊重開授權頁；request() 入口另有 canStartRequest 防禦性 no-op。
+     */
+    @Test
+    fun verifying_disablesMainButton() {
+        setSettings(
+            AssistantSettingsState(
+                roleHeld = false,
+                roleAvailable = true,
+                reasonCode = AssistantReasonCode.VERIFYING,
+                verifying = true,
+            ),
+        )
+        composeRule.onNodeWithTag("assistantReason")
+            .performScrollTo().assertIsDisplayed()
+            .assertTextEquals(assistantReasonText(AssistantReasonCode.VERIFYING))
+        composeRule.onNodeWithText("設為預設助理").performScrollTo().assertIsNotEnabled()
+    }
+
+    /** re-review #4 finding #2：非驗證中主按鈕保持 enabled（舊構造預設 verifying=false 相容）。 */
+    @Test
+    fun notVerifying_keepsMainButtonEnabled() {
+        setSettings(
+            AssistantSettingsState(roleHeld = false, roleAvailable = true),
+        )
+        composeRule.onNodeWithText("設為預設助理").performScrollTo().assertIsEnabled()
+    }
+
+    /**
+     * re-review #4 finding #3 [P3/UX]：UNSUPPORTED 原因行＋fallback 失敗紅字並存渲染。
+     * 原因行祈使（「請改用語音輸入設定」）不預設 fallback 已開啟，與紅字
+     * 「無法開啟語音輸入設定」語義不矛盾（舊「已改用…」完成式與紅字矛盾）。
+     */
+    @Test
+    fun unsupportedWithFallbackFailed_showsBothRowsWithoutContradiction() {
+        setSettings(
+            AssistantSettingsState(
+                roleHeld = false,
+                roleAvailable = false,
+                reasonCode = AssistantReasonCode.UNSUPPORTED,
+                fallbackFailed = true,
+            ),
+        )
+        composeRule.onNodeWithTag("assistantReason")
+            .performScrollTo().assertIsDisplayed()
+            .assertTextEquals("不支援系統助理角色，請改用語音輸入設定。")
+        composeRule.onNodeWithTag("assistantFallbackFailed")
+            .performScrollTo().assertIsDisplayed()
+            .assertTextEquals("無法開啟語音輸入設定")
+    }
+
+    /**
+     * re-review #4 finding #3 [P3/UX]：REQUEST_FAILED 原因行＋fallback 失敗紅字並存渲染。
+     * 同上：原因行「無法開啟系統授權頁，請改用語音輸入設定。」＋紅字並存，
+     * 無「已改用」完成式矛盾。
+     */
+    @Test
+    fun requestFailedWithFallbackFailed_showsBothRowsWithoutContradiction() {
+        setSettings(
+            AssistantSettingsState(
+                roleHeld = false,
+                roleAvailable = true,
+                reasonCode = AssistantReasonCode.REQUEST_FAILED,
+                fallbackFailed = true,
+            ),
+        )
+        composeRule.onNodeWithTag("assistantReason")
+            .performScrollTo().assertIsDisplayed()
+            .assertTextEquals("無法開啟系統授權頁，請改用語音輸入設定。")
+        composeRule.onNodeWithTag("assistantFallbackFailed")
+            .performScrollTo().assertIsDisplayed()
+            .assertTextEquals("無法開啟語音輸入設定")
+    }
 }

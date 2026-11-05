@@ -90,13 +90,13 @@ ALLOWED_WORKFLOW_FILES = frozenset(
 EXPECTED_WORKFLOW_SHA256 = {
     "codeql.yml": "c22dfb2bc946d510c809dbac5ac25b13ac44b896779d736600989be067d5fdb7",
     "nightly-instrumented.yml": (
-        "706297db88b46bd359c52a070207f9eb26532261f393d574e4ba0b3519254137"
+        "be179f748ec9eb8196f7ef6fe169e316b56f565d8d2d617947fd29640b11abdb"
     ),
     "pocketguard.yml": (
         "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564"
     ),
     "pr-check.yml": (
-        "037d5784e7ecafe1eb181cf54c91c175e9b205e9df50da523896be734fcefc5d"
+        "e865c3363b58df73c50d84496ddb9367cbb76c902bbe3fb210935ec92d6126ea"
     ),
     "release.yml": (
         "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f"

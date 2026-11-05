@@ -256,7 +256,7 @@ jobs:
         # 的 job 打成 failure 誤判為紅燈。上傳報告是取證輔助，不應成為新的 flake 來源。
         # 真正的 gate 是 pr-gate job（評估 unit-tests 的執行結果，不依賴 artifact）。
         continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           # run_attempt 後綴：同一 run re-run 時不會撞到 v4 的 artifact 重名錯誤。
           name: unit-test-reports-${{ matrix.flavor }}-attempt-${{ github.run_attempt }}
@@ -307,7 +307,7 @@ jobs:
 
       - name: Upload Lint Reports
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lint-reports
           path: app/build/reports/lint-results-*
@@ -503,7 +503,7 @@ jobs:
 
       - name: Upload Debug & Release APKs
         if: success()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: assembled-apks
           path: app/build/outputs/apk/**/*.apk

@@ -135,18 +135,48 @@ def _properties_verification_mode(lines: list[str]) -> str | None:
     # a physical line ending in an odd number of backslashes continues (the
     # final backslash plus the line break are dropped and leading whitespace
     # of the next line is stripped, per spec); an even count is literal
-    # backslashes and does not continue. Comment/blank detection runs on the
-    # merged logical lines. Duplicate keys are last-wins (Properties.load
-    # overwrites), and key escapes are unescaped before comparing, so
+    # backslashes and does not continue. Comment/blank detection runs on each
+    # physical line BEFORE continuation merging: a '#'/'!' comment or blank
+    # line never opens or extends a continuation, even with a trailing
+    # backslash. Only a physical line already inside a continuation is
+    # literal content (so '#' there belongs to the value). Duplicate keys
+    # are last-wins (Properties.load overwrites), and key escapes are unescaped before comparing, so
     # obfuscated/continued/duplicated keys cannot slip past.
     key_wanted = "org.gradle.dependency.verification"
     logical: list[str] = []
     buf: str | None = None
+    continuing = False
     for raw in lines:
-        buf = raw if buf is None else buf + raw.lstrip(" \t\f")
+        if continuing:
+            # Mid-continuation: this physical line is literal value content.
+            # Leading whitespace is stripped per spec, but '#', '!', and
+            # blank lines are NOT comments/blanks here -- they belong to the
+            # value (verified against Properties.load: 'val\\' + '#x' loads
+            # value 'val#x'). An empty appended segment ends the logical
+            # line (Java terminates continuation on blank lines too).
+            seg = raw.lstrip(" \t\f")
+            buf = (buf if buf is not None else "") + seg
+            trailing = len(seg) - len(seg.rstrip("\\"))
+            if trailing % 2 == 1:
+                buf = buf[:-1]  # drop continuation marker, stay continuing
+                continue
+            logical.append(buf)
+            buf = None
+            continuing = False
+            continue
+        # Fresh logical line: blank lines and '#'/'!' comments are skipped
+        # BEFORE continuation handling, so a comment line never opens or
+        # extends a continuation -- even with a trailing backslash. Java
+        # discards comment lines wholesale ('# c \\' + 'k=off' loads k=off
+        # as an independent property); merging first would swallow the key
+        # line into the comment and hide a real 'off' (bypass).
+        if not raw.lstrip(" \t\f") or raw.lstrip(" \t\f")[0] in ("#", "!"):
+            continue
+        buf = raw
         trailing = len(buf) - len(buf.rstrip("\\"))
         if trailing % 2 == 1:
             buf = buf[:-1]  # drop continuation marker, merge next line
+            continuing = True
             continue
         logical.append(buf)
         buf = None

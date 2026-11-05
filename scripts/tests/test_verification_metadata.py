@@ -317,6 +317,74 @@ class VerificationMetadataTest(unittest.TestCase):
                     else:
                         validate_gradle_files(tmp)  # must not raise
 
+    def test_gradle_properties_comment_continuation_rejected(self):
+        # Java semantic (verified against Properties.load): a '#'/'!'
+        # comment line never opens a continuation, even with a trailing
+        # backslash -- the next physical line is an independent property.
+        # Merging first and then discarding comments would swallow the key
+        # line into the comment and hide a real off/lenient (bypass).
+        cases = {
+            "hash comment with backslash then off":
+                "# harmless comment \\\norg.gradle.dependency.verification=off\n",
+            "bang comment with backslash then lenient":
+                "! note \\\norg.gradle.dependency.verification:lenient\n",
+        }
+        for name, content in cases.items():
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    (tmp / "gradle.properties").write_text(content, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        validate_gradle_files(tmp)
+
+    def test_gradle_properties_comment_does_not_suppress_next_line(self):
+        # A plain comment (no trailing backslash) followed by strict passes.
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            (tmp / "gradle.properties").write_text(
+                "# just a comment\norg.gradle.dependency.verification=strict\n",
+                encoding="utf-8",
+            )
+            validate_gradle_files(tmp)  # must not raise
+        # Mixed: strict, then a comment line ending in backslash (discarded,
+        # opens nothing), then off as an independent logical line --
+        # last-wins yields off, so this must be rejected. This locks that a
+        # comment continuation pollutes nothing yet suppresses nothing.
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            (tmp / "gradle.properties").write_text(
+                "org.gradle.dependency.verification=strict\n"
+                "# c \\\n"
+                "org.gradle.dependency.verification=off\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                validate_gradle_files(tmp)
+
+    def test_gradle_properties_continuation_hash_is_content(self):
+        # Mid-continuation '#' is literal value content, not a comment
+        # (verified against Properties.load: value is 'val#not-a-comment').
+        content = "org.gradle.dependency.verification = val\\\n#not-a-comment\n"
+        self.assertEqual(
+            V._properties_verification_mode(content.splitlines()),
+            "val#not-a-comment",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            (tmp / "gradle.properties").write_text(content, encoding="utf-8")
+            validate_gradle_files(tmp)  # must not raise (not off/lenient)
+        # Boundary (verified against Properties.load): a blank physical
+        # line terminates a continuation -- 'a\\' + '' yields value 'a' and
+        # the next line is a separate property.
+        blank_content = "org.gradle.dependency.verification = a\\\n\nb=c\n"
+        self.assertEqual(
+            V._properties_verification_mode(blank_content.splitlines()), "a"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            (tmp / "gradle.properties").write_text(blank_content, encoding="utf-8")
+            validate_gradle_files(tmp)  # must not raise
+
     def test_groovy_build_gradle_scanned(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)

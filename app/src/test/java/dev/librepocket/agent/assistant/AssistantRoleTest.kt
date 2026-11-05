@@ -82,6 +82,7 @@ class AssistantRoleTest {
             AssistantReasonCode.UNSUPPORTED,
             AssistantReasonCode.REQUEST_FAILED,
             AssistantReasonCode.VERIFYING,
+            AssistantReasonCode.UNCONFIRMED,
         ).forEach { code ->
             assertTrue("$code 文案不可為空", assistantReasonText(code).isNotBlank())
         }
@@ -211,6 +212,10 @@ class AssistantRoleTest {
         assertEquals(
             "要求已送出，正在向系統確認角色狀態…",
             assistantReasonText(AssistantReasonCode.VERIFYING),
+        )
+        assertEquals(
+            "授權要求已送出，但未能確認角色狀態，可重新檢查。",
+            assistantReasonText(AssistantReasonCode.UNCONFIRMED),
         )
     }
 
@@ -877,16 +882,33 @@ class AssistantRoleTest {
     }
 
     @Test
-    fun givenUnknown_whenConsumePendingVerify_thenRetains() {
-        // 未知態保留到下一次 Known 讀取（次數無關；調和在未知態本就 passthrough，
-        // 無掩蓋風險；排程照常重試，系統服務恢復後仍可確認）。
-        listOf(0, VERIFY_MAX_ATTEMPTS - 1, VERIFY_MAX_ATTEMPTS).forEach { attempt ->
+    fun givenUnknown_whenConsumePendingVerify_thenRetainsUntilMaxThenEnds() {
+        // 未知態次數未滿保留到下一次 Known 讀取（調和在未知態本就 passthrough，
+        // 無掩蓋風險；排程照常重試，系統服務恢復後仍可確認）；
+        // re-review #4 finding #1 [P2/Merge blocker]：attempt>=MAX 強制終止，
+        // 無論快照類型（舊行為無限保留 true，排程 guard 已 false 不再排程，
+        // pending 永不清——終端殘留驗證中）。
+        listOf(0, VERIFY_MAX_ATTEMPTS - 1).forEach { attempt ->
             assertEquals(
+                "未知態次數未滿須保留 (attempt=$attempt)",
                 true,
                 consumePendingVerify(true, AssistantSnapshot.ReadError, attempt),
             )
             assertEquals(
+                "未知態次數未滿須保留 (attempt=$attempt)",
                 true,
+                consumePendingVerify(true, AssistantSnapshot.Unsupported, attempt),
+            )
+        }
+        listOf(VERIFY_MAX_ATTEMPTS, VERIFY_MAX_ATTEMPTS + 5).forEach { attempt ->
+            assertEquals(
+                "未知態耗盡須終止 (attempt=$attempt)",
+                false,
+                consumePendingVerify(true, AssistantSnapshot.ReadError, attempt),
+            )
+            assertEquals(
+                "未知態耗盡須終止 (attempt=$attempt)",
+                false,
                 consumePendingVerify(true, AssistantSnapshot.Unsupported, attempt),
             )
         }
@@ -912,13 +934,14 @@ class AssistantRoleTest {
      *
      * 以 UI 相同協議（回調設 pending=true＋attempt=0＋tick 重讀→VERIFYING→
      * 排程重讀 attempt++→SideEffect 判定結束）走兩種順序：
-     * A 收斂到「超時→中性 idle（!everHeld 不斷言撤銷）」，
+     * A 收斂到「超時→UNCONFIRMED（re-review #4 finding #1：從未確認持有不再回
+     * 中性 idle，原因行提示可重新檢查）」，
      * B 收斂到「held 確認→清除結束」。
      * 真正的 Lifecycle＋重組交錯（Robolectric compose）因 RoleManager 系統服務
      * 難控，未在此覆蓋——缺口見本檔尾 KDoc／PR 說明。
      */
     @Test
-    fun givenCallbackAfterResume_whenVerifyProtocol_thenTimeoutConvergesToIdle() {
+    fun givenCallbackAfterResume_whenVerifyProtocol_thenTimeoutConvergesToUnconfirmed() {
         // 順序 A（callback-after-resume）：resume 先重讀（非驗證中），回調後進入驗證。
         var pending = false
         var attempt = 0
@@ -951,12 +974,18 @@ class AssistantRoleTest {
             )
             pending = consumePendingVerify(pending, snapshot, attempt)
         }
-        // attempt==MAX：最後一次 SideEffect 超時收斂 → pending=false。
+        // attempt==MAX：最後一次 SideEffect 超時終止 → pending=false，同時按
+        // verificationTimeoutReason 重寫 stored（!everHeld→UNCONFIRMED）。
         assertEquals(false, pending)
-        // 次幀按正常規則走：從未確認持有 → 中性 idle（null），不用早期 false
-        // 快照斷言撤銷（本 finding 核心誠實性）。
+        stored = verificationTimeoutReason(snapshot, everHeld = false)
+        assertEquals(AssistantReasonCode.UNCONFIRMED, stored)
+        // 次幀按正常規則走：UNCONFIRMED passthrough（原因行提示可重新檢查，
+        // 不再回中性 idle——re-review #4 finding #1 誠實性修正）。
         snapshot = AssistantSnapshot.Known(available = true, held = false)
-        assertNull(effectiveAssistantReason(stored, snapshot, false, pending))
+        assertEquals(
+            AssistantReasonCode.UNCONFIRMED,
+            effectiveAssistantReason(stored, snapshot, false, pending),
+        )
     }
 
     @Test
@@ -987,7 +1016,9 @@ class AssistantRoleTest {
     @Test
     fun givenEverHeld_whenVerifyTimeout_thenReportsRevoked() {
         // 驗證中即使 everHeld＋Known(!held) 亦不判 REVOKED（一律 VERIFYING）；
-        // 超時收斂（pending=false）後按正常規則：everHeld → REVOKED
+        // 超時終止（re-review #4 finding #1）：SideEffect 先按
+        // verificationTimeoutReason 重寫 stored（everHeld→REVOKED），
+        // 再置 pending=false；次幀按正常規則走同樣 REVOKED
         // （曾確認持有、現已非持有＝genuine 撤銷證據）。
         val stored: String? = null
         var pending = true
@@ -999,17 +1030,21 @@ class AssistantRoleTest {
         )
         pending = consumePendingVerify(pending, snapshot, VERIFY_MAX_ATTEMPTS)
         assertEquals(false, pending)
+        val terminated = verificationTimeoutReason(snapshot, everHeld = true)
+        assertEquals(AssistantReasonCode.REVOKED, terminated)
         assertEquals(
             AssistantReasonCode.REVOKED,
-            effectiveAssistantReason(stored, snapshot, true, pending),
+            effectiveAssistantReason(terminated, snapshot, true, pending),
         )
     }
 
     @Test
-    fun givenNeverHeld_whenVerifyTimeout_thenConvergesToNeutral() {
-        // 誠實核心（re-review #3 finding #1 [P2]）：RESULT_OK 後從未觀察 held、
-        // 重試耗盡仍 !held → 中性 null（idle「尚未設為…」），不用早期 false
-        // 快照斷言撤銷；與 everHeld 路徑（上測 REVOKED）對照鎖定。
+    fun givenNeverHeld_whenVerifyTimeout_thenConvergesToUnconfirmed() {
+        // 誠實核心（re-review #4 finding #1 [P2/Merge blocker]，取代旧中性 idle）：
+        // RESULT_OK 後從未觀察 held、重試耗盡仍 !held → 終止寫入 UNCONFIRMED
+        // （要求已送出但未確認，不斷言撤銷、亦不回中性 idle 假裝成功），
+        // 次幀 UNCONFIRMED passthrough（原因行提示可重新檢查）；
+        // 與 everHeld 路徑（上測 REVOKED）對照鎖定。
         val stored: String? = null
         var pending = true
         var attempt = 0
@@ -1024,6 +1059,161 @@ class AssistantRoleTest {
             pending = consumePendingVerify(pending, snapshot, attempt)
         }
         assertEquals(false, pending)
+        val terminated = verificationTimeoutReason(snapshot, everHeld = false)
+        assertEquals(AssistantReasonCode.UNCONFIRMED, terminated)
+        assertEquals(
+            AssistantReasonCode.UNCONFIRMED,
+            effectiveAssistantReason(terminated, snapshot, false, pending),
+        )
+    }
+
+    // ---- re-review #4 finding #1 [P2/Merge blocker]：終止矩陣＋UNCONFIRMED 調和 ----
+
+    @Test
+    fun givenTimeoutReason_whenAllSnapshots_thenTerminationMatrix() {
+        // 終止矩陣（MAX＋快照／everHeld → 終止寫入碼；由 UI SideEffect 執行，
+        // 此處鎖定純函數映射）：
+        // - MAX＋Known !held＋everHeld → REVOKED；
+        // - MAX＋Known !held＋!everHeld → UNCONFIRMED；
+        // - MAX＋ReadError → UNCONFIRMED；
+        // - MAX＋Unsupported → UNCONFIRMED；
+        // - MAX＋held → null（held 優先已清，生產不會走到終止）。
+        assertEquals(
+            AssistantReasonCode.REVOKED,
+            verificationTimeoutReason(
+                AssistantSnapshot.Known(available = true, held = false),
+                everHeld = true,
+            ),
+        )
+        assertEquals(
+            AssistantReasonCode.REVOKED,
+            verificationTimeoutReason(
+                AssistantSnapshot.Known(available = false, held = false),
+                everHeld = true,
+            ),
+        )
+        assertEquals(
+            AssistantReasonCode.UNCONFIRMED,
+            verificationTimeoutReason(
+                AssistantSnapshot.Known(available = true, held = false),
+                everHeld = false,
+            ),
+        )
+        assertEquals(
+            AssistantReasonCode.UNCONFIRMED,
+            verificationTimeoutReason(
+                AssistantSnapshot.Known(available = false, held = false),
+                everHeld = false,
+            ),
+        )
+        listOf(false, true).forEach { everHeld ->
+            assertEquals(
+                "ReadError 超時須 UNCONFIRMED（everHeld=$everHeld）",
+                AssistantReasonCode.UNCONFIRMED,
+                verificationTimeoutReason(AssistantSnapshot.ReadError, everHeld),
+            )
+            assertEquals(
+                "Unsupported 超時須 UNCONFIRMED（everHeld=$everHeld）",
+                AssistantReasonCode.UNCONFIRMED,
+                verificationTimeoutReason(AssistantSnapshot.Unsupported, everHeld),
+            )
+        }
+        listOf(false, true).forEach { everHeld ->
+            assertNull(
+                "held 不走到終止（everHeld=$everHeld）",
+                verificationTimeoutReason(
+                    AssistantSnapshot.Known(available = true, held = true),
+                    everHeld,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun givenUnconfirmedStored_whenReconciled_thenPassesThroughExceptHeld() {
+        // UNCONFIRMED 調和一律 passthrough（else stored）：
+        // Known 非持有非驗證中／未知態皆保留；Known held 仍優先清除為 null。
+        val knownNotHeld = AssistantSnapshot.Known(available = true, held = false)
+        listOf(false, true).forEach { everHeld ->
+            listOf(false, true).forEach { pendingVerify ->
+                // 非驗證中必 passthrough；驗證中＋UNCONFIRMED stored 非 null／
+                // GRANTED 故同樣 passthrough（VERIFYING 合成僅 stored null／GRANTED）。
+                assertEquals(
+                    "UNCONFIRMED 須 passthrough（Known !held, " +
+                        "everHeld=$everHeld, pendingVerify=$pendingVerify）",
+                    AssistantReasonCode.UNCONFIRMED,
+                    effectiveAssistantReason(
+                        AssistantReasonCode.UNCONFIRMED,
+                        knownNotHeld,
+                        everHeld,
+                        pendingVerify,
+                    ),
+                )
+            }
+        }
+        listOf(AssistantSnapshot.ReadError, AssistantSnapshot.Unsupported).forEach { snapshot ->
+            listOf(false, true).forEach { everHeld ->
+                listOf(false, true).forEach { pendingVerify ->
+                    assertEquals(
+                        "UNCONFIRMED 須 passthrough（$snapshot, " +
+                            "everHeld=$everHeld, pendingVerify=$pendingVerify）",
+                        AssistantReasonCode.UNCONFIRMED,
+                        effectiveAssistantReason(
+                            AssistantReasonCode.UNCONFIRMED,
+                            snapshot,
+                            everHeld,
+                            pendingVerify,
+                        ),
+                    )
+                }
+            }
+        }
+        // held 優先：UNCONFIRMED＋held → null（頭部已表達持有，不重複原因行）。
+        listOf(false, true).forEach { everHeld ->
+            listOf(false, true).forEach { pendingVerify ->
+                assertNull(
+                    "UNCONFIRMED＋held 必須清除（everHeld=$everHeld, " +
+                        "pendingVerify=$pendingVerify）",
+                    effectiveAssistantReason(
+                        AssistantReasonCode.UNCONFIRMED,
+                        AssistantSnapshot.Known(available = true, held = true),
+                        everHeld,
+                        pendingVerify,
+                    ),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun givenReadErrorRetries_whenExhausted_thenTerminatesToUnconfirmed() {
+        // 重試循環觸發終止的模擬（b 問題：3 次皆 ReadError → 不再永久保留 pending）：
+        // RESULT_OK 後連續 ReadError，次數未滿保留（排程繼續），耗盡強制終止
+        // （pending=false）＋終止寫入 UNCONFIRMED，次幀 passthrough。
+        var stored: String? = null
+        var pending = true
+        var attempt = 0
+        val snapshot: AssistantSnapshot = AssistantSnapshot.ReadError
+        // 首幀：未知態＋pending 不合成 VERIFYING（passthrough null）。
         assertNull(effectiveAssistantReason(stored, snapshot, false, pending))
+        pending = consumePendingVerify(pending, snapshot, attempt)
+        assertEquals(true, pending)
+        repeat(VERIFY_MAX_ATTEMPTS - 1) {
+            attempt++
+            assertNull(effectiveAssistantReason(stored, snapshot, false, pending))
+            pending = consumePendingVerify(pending, snapshot, attempt)
+            assertEquals(true, pending)
+        }
+        // 最後一次排程重讀耗盡：強制終止。
+        attempt++
+        assertEquals(VERIFY_MAX_ATTEMPTS, attempt)
+        pending = consumePendingVerify(pending, snapshot, attempt)
+        assertEquals(false, pending)
+        stored = verificationTimeoutReason(snapshot, everHeld = false)
+        assertEquals(AssistantReasonCode.UNCONFIRMED, stored)
+        assertEquals(
+            AssistantReasonCode.UNCONFIRMED,
+            effectiveAssistantReason(stored, snapshot, false, pending),
+        )
     }
 }

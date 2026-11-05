@@ -234,6 +234,56 @@ class AssistantCardTest {
             .assertTextEquals("要求已送出，正在向系統確認角色狀態…")
     }
 
+    /**
+     * re-review #4 finding #1 [P2/Merge blocker]：UNCONFIRMED 原因行渲染
+     * （[assistantReasonText] 同源比對）。生產管線經終止收斂寫入：
+     * RESULT_OK 後重試耗盡仍未確認持有（!everHeld）或連續讀取失敗，
+     * 原因行提示「可重新檢查」，主按鈕重試可達（ReadError 下「重新檢查」）。
+     */
+    @Test
+    fun reasonUnconfirmed_showsExactText() {
+        setSettings(
+            AssistantSettingsState(
+                roleHeld = false,
+                roleAvailable = true,
+                reasonCode = AssistantReasonCode.UNCONFIRMED,
+            ),
+        )
+        composeRule.onNodeWithTag("assistantReason")
+            .performScrollTo().assertIsDisplayed()
+            .assertTextEquals(assistantReasonText(AssistantReasonCode.UNCONFIRMED))
+    }
+
+    /** UNCONFIRMED＋ReadError：未知頭部＋未確認原因行並存，主按鈕「重新檢查」可達。 */
+    @Test
+    fun unconfirmedWithReadError_showsBothAndRecheckReachable() {
+        var requests = 0
+        val reason = effectiveAssistantReason(
+            AssistantReasonCode.UNCONFIRMED,
+            AssistantSnapshot.ReadError,
+            everHeld = false,
+            pendingVerify = false,
+        )
+        assertEquals(AssistantReasonCode.UNCONFIRMED, reason)
+        setSettings(
+            AssistantSettingsState(
+                roleHeld = false,
+                roleAvailable = false,
+                reasonCode = reason,
+                readError = true,
+            ),
+            onRequest = { requests++ },
+        )
+        composeRule.onNodeWithText("無法確認助理狀態，請稍後重試。")
+            .performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("assistantReason")
+            .performScrollTo().assertIsDisplayed()
+            .assertTextEquals(assistantReasonText(AssistantReasonCode.UNCONFIRMED))
+        composeRule.onNodeWithText("重新檢查").performScrollTo().assertIsEnabled()
+        composeRule.onNodeWithText("重新檢查").performScrollTo().performClick()
+        assertEquals(1, requests)
+    }
+
     /** C7：reason==null 時原因行與 DENIED 文案皆不存在。 */
     @Test
     fun nullReason_hidesDeniedTextAndReasonTag() {
@@ -323,19 +373,25 @@ class AssistantCardTest {
 
     // ---- Stage 2 finding C：ReadError 頭部／主按鈕 fail-closed ----
 
-    /** ReadError 顯示「無法確認…」未知文案（與「不支援」區分），主按鈕 disabled。 */
+    /** ReadError 顯示「無法確認…」未知文案（與「不支援」區分），主按鈕為「重新檢查」可點。 */
     @Test
-    fun readError_showsUnknownHeaderAndDisablesRequest() {
+    fun readError_showsUnknownHeaderAndEnablesRecheck() {
+        var requests = 0
         setSettings(
             AssistantSettingsState(
                 roleHeld = false,
                 roleAvailable = false,
                 readError = true,
             ),
+            onRequest = { requests++ },
         )
         composeRule.onNodeWithText("無法確認助理狀態，請稍後重試。")
             .performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithText("設為預設助理").performScrollTo().assertIsNotEnabled()
+        // re-review #4 finding #1 [P2/Merge blocker]：ReadError 主按鈕不再 disabled，
+        // 文案「重新檢查」（與 Unsupported「前往語音輸入設定」區分），點擊觸發重讀。
+        composeRule.onNodeWithText("重新檢查").performScrollTo().assertIsEnabled()
+        composeRule.onNodeWithText("重新檢查").performScrollTo().performClick()
+        assertEquals(1, requests)
     }
 
     /** ReadError 原因行 passthrough：stored 碼照常顯示（此處以 DENIED 為例）。 */

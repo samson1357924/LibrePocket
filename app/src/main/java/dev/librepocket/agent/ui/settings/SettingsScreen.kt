@@ -387,10 +387,10 @@ fun SettingsScreen(
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
                                 when {
-                                    // Stage 2 finding C：讀取失敗與真不支援區分。
+                                    // Stage 2 finding C + re-review #4 #1：讀取失敗與真不支援區分。
                                     // ReadError 不宣稱任何狀態（roleHeld／roleAvailable 皆 false，
-                                    // 見 AssistantSettingsState.readError），頭部誠實顯示未知，
-                                    // 主按鈕 disabled（fail-closed），原因行照常 passthrough。
+                                    // 見 AssistantSettingsState.readError），頭部誠實顯示未知；
+                                    // 主按鈕改為「重新檢查」可重讀快照（fail-closed：不發要求，見 request）。
                                     assistant.readError -> "無法確認助理狀態，請稍後重試。"
                                     assistant.roleHeld -> "已設為預設助理：長按首頁鍵或系統手勢可叫出 LibrePocket。"
                                     !assistant.roleAvailable -> "此裝置不支援系統助理角色，可改用語音輸入設定。"
@@ -404,13 +404,16 @@ fun SettingsScreen(
                                 Text(
                                     assistantReasonText(code),
                                     style = MaterialTheme.typography.bodySmall,
-                                    // A 原因碼色彩：被拒／撤銷／請求失敗走 error；
+                                    // A 原因碼色彩：被拒／撤銷／請求失敗／未確認走 error
+                                    // （UNCONFIRMED 需使用者處理：重新檢查，
+                                    // re-review #4 finding #1 [P2/Merge blocker]）；
                                     // 不支援中性（頭部已是不支援文案，原因段不追加紅字）；
                                     // GRANTED 正常不顯示（held=>null 已清除），若顯示亦中性。
                                     color = when (code) {
                                         AssistantReasonCode.DENIED,
                                         AssistantReasonCode.REVOKED,
-                                        AssistantReasonCode.REQUEST_FAILED ->
+                                        AssistantReasonCode.REQUEST_FAILED,
+                                        AssistantReasonCode.UNCONFIRMED ->
                                             MaterialTheme.colorScheme.error
                                         // VERIFYING 明確中性：驗證中不宣稱成功／失敗
                                         // （re-review #3 finding #1；else 同中性，
@@ -427,17 +430,22 @@ fun SettingsScreen(
                             // enabled（僅 held 才 disabled），文案改為「前往語音輸入設定」；
                             // 點擊仍走 onRequestAssistantRole → request() UnsupportedFallback
                             // 分支（設 UNSUPPORTED＋openFallback），與下方 OutlinedButton 同效。
-                            // Stage 2 finding C：ReadError 時主按鈕 disabled（fail-closed，
-                            // request() 內亦防禦性 no-op）；文案維持「設為預設助理」
-                            //（未知態不暗示可跳 fallback，OutlinedButton 仍可達）。
+                            // Stage 2 finding C＋re-review #4 finding #1 [P2/Merge blocker]：
+                            // ReadError 時主按鈕保持 enabled，文案「重新檢查」（與
+                            // Unsupported 的「前往語音輸入設定」區分）：點擊走
+                            // onRequestAssistantRole → request() ReadError 分支
+                            // （不設碼、不開 fallback，只 refreshTick++ 觸發重讀，
+                            // fail-closed 仍成立——不發要求）。
+                            // held 才 disabled；未知態不暗示可跳 fallback，
+                            // OutlinedButton 仍可達。
                             Button(
                                 onClick = onRequestAssistantRole,
-                                enabled = !assistant.roleHeld && !assistant.readError,
+                                enabled = !assistant.roleHeld,
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
                                 Text(
                                     when {
-                                        assistant.readError -> "設為預設助理"
+                                        assistant.readError -> "重新檢查"
                                         assistant.roleHeld -> "設為預設助理"
                                         !assistant.roleAvailable -> "前往語音輸入設定"
                                         else -> "設為預設助理"

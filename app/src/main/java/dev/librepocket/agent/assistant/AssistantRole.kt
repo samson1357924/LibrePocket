@@ -23,6 +23,11 @@ import android.provider.Settings
  *   撤銷只在「曾確認持有」＋當前 Known(!held)＋非驗證中判定；驗證中一律
  *   不判撤銷、不宣稱授予（re-review #3 finding #1 [P2]：驗證代幣被消耗≠
  *   觀察到新系統真相；RESULT_OK 後未觀察 held 即判 REVOKED 是不誠實斷言）。
+ * - re-review #4 finding #1 [P2/Merge blocker]：驗證超時終止語義
+ *   （[AssistantReasonCode.UNCONFIRMED]＋[verificationTimeoutReason]）：
+ *   `attempt >= MAX` 強制結束驗證（覆蓋所有快照類型，pending 永不殘留），
+ *   終止先重寫 `stored`（everHeld→REVOKED，其餘→UNCONFIRMED）再清 pending；
+ *   超時不再回中性 idle（舊行為無錯誤／重試提示）。
  */
 data class AssistantRoleSnapshot(
     val roleAvailable: Boolean,
@@ -83,7 +88,8 @@ data class AssistantSettingsState(
      * 快照讀取失敗（[AssistantSnapshot.ReadError]，Stage 2 finding C）。
      * true 時 `roleHeld`／`roleAvailable` 皆為 false（不宣稱任何狀態）；
      * SettingsScreen 頭部顯示「無法確認助理狀態，請稍後重試」、
-     * 主按鈕 disabled（fail-closed），原因行照常 passthrough。
+     * 主按鈕改為「重新檢查」可重讀快照（fail-closed：不發要求，見 request），
+     * 原因行照常 passthrough。
      * 與真不支援（false／「此裝置不支援…」）區分，預設 false 保舊構造相容。
      */
     val readError: Boolean = false,
@@ -116,7 +122,7 @@ fun decideAssistantRole(snapshot: AssistantRoleSnapshot): AssistantRoleDecision 
  *   兩者決策同值但 UI 文案必須區分：Unsupported 頭部「此裝置不支援…」、
  *   ReadError 頭部「無法確認助理狀態，請稍後重試」（見 [AssistantSettingsState.readError]
  *   與 SettingsScreen），且 request() 入口對 ReadError 不設 UNSUPPORTED 碼、
- *   不開 fallback（純 no-op，按钮本就 disabled，防禦性 fail-closed）。
+ *   不開 fallback，僅觸發快照重讀（主按鈕「重新檢查」，防禦性 fail-closed）。
  */
 fun decideAssistantRole(snapshot: AssistantSnapshot): AssistantRoleDecision =
     when (snapshot) {
@@ -138,6 +144,27 @@ object AssistantReasonCode {
     const val REVOKED = "ASSISTANT_REVOKED"
     const val UNSUPPORTED = "ASSISTANT_UNSUPPORTED"
     const val REQUEST_FAILED = "ASSISTANT_REQUEST_FAILED"
+
+    /**
+     * 未確認（re-review #4 finding #1 [P2/Merge blocker] 終止語義）。
+     *
+     * `RESULT_OK` 後重試上限（[VERIFY_MAX_ATTEMPTS]）仍未觀察到持有、
+     * 且無曾持有痕跡（`everHeld == false`）時，驗證結束寫入此碼（見
+     * [verificationTimeoutReason]＋AssistantRoleUi `SideEffect` 終止收斂）：
+     * 誠實表達「要求已送出、但系統真相未知」，取代舊「超時回中性 idle」
+     * （舊行為把超時當成功、只顯示「尚未設為…」，無錯誤／重試提示）。
+     * Unknown 快照超時（ReadError／Unsupported 皆連續失敗）同寫此碼——
+     * 頭部已區分「無法確認／不支援」，原因行補「可重新檢查」動作語義。
+     * 只用一個碼（不另設 READ_UNAVAILABLE）：ReadError 頭部本就說明讀取失敗，
+     * 原因行只需補動作語義；Unsupported 超時生產不可達（見
+     * [verificationTimeoutReason] KDoc），同碼無歧義。
+     * 調和一律 passthrough（`else stored`，Known 非持有非驗證中／未知態皆然；
+     * Known held 仍優先清除為 null）。UI 色彩走 error（需使用者處理：重新檢查，
+     * 見 SettingsScreen；[VERIFYING] 才是中性）。
+     * 永由終止收斂寫入 `stored`（sticky，可跨重組；`rememberSaveable`），
+     * 非合成碼（與 [VERIFYING] 永不寫 `stored` 對照）。
+     */
+    const val UNCONFIRMED = "ASSISTANT_UNCONFIRMED"
 
     /**
      * 驗證中（re-review #3 finding #1 [P2]）。
@@ -186,7 +213,8 @@ object AssistantReasonCode {
  *     GRANTED 歷史成功≠當前持有；舊 stored／AlreadyHeld 路徑殘留皆遮罩）。
  *   - Unknown＋VERIFYING → 原樣 passthrough，但生產不可達的防禦性
  *     fallthrough（`else stored` 分支，非合成）：`stored` 永不為 VERIFYING
- *     （AssistantRoleUi 只寫 null／DENIED／GRANTED／UNSUPPORTED／REQUEST_FAILED；
+ *     （AssistantRoleUi 只寫 null／DENIED／GRANTED／UNSUPPORTED／REQUEST_FAILED／
+ *     REVOKED（驗證超時 genuine 撤銷）／UNCONFIRMED（驗證超時未確認）；
  *     `effective` 合成的 VERIFYING 只進 `state.reasonCode` 不回流 `stored`；
  *     `rememberSaveable` 亦然）。未知態不憑空造 VERIFYING，`stored` 非
  *     VERIFYING 時不產生它。
@@ -196,9 +224,16 @@ object AssistantReasonCode {
  *   `everHeld`／`pendingVerify` 在未知態一律忽略（不判撤銷、不合成原因碼；
  *   `pending` 雖經 [consumePendingVerify] 保留供重試排程繼續，但未知幀不合成
  *   VERIFYING 顯示）。
- * - 超時收斂（重試耗盡，`pendingVerify` 被置 false 後按正常規則走）：
- *   `stored=null`＋`!everHeld`＋Known(!held) → null（中性 idle「尚未設為…」，
- *   誠實：系統從未確認持有，不斷言撤銷）；`stored=null`＋`everHeld` → REVOKED。
+ * - 超時收斂（re-review #4 finding #1 [P2/Merge blocker]：重試耗盡由 UI 端
+ *   `SideEffect` 終止收斂先重寫 `stored`，再按正常規則走；見
+ *   [verificationTimeoutReason]）：
+ *   Known(!held)＋`everHeld` → 終止寫入 REVOKED（多次新鮮確認非持有＋曾確認
+ *   持有＝genuine 撤銷）；Known(!held)＋`!everHeld` → 終止寫入
+ *   [AssistantReasonCode.UNCONFIRMED]（要求已送出但從未觀察持有：不斷言撤銷、
+ *   亦不回中性 idle，原因行提示「可重新檢查」）；Unknown（ReadError／
+ *   Unsupported）→ 終止寫入 UNCONFIRMED（頭部已區分未知／不支援）。
+ *   UNCONFIRMED 調和一律 passthrough（`else stored`，Known 非持有非驗證中／
+ *   未知態皆然；Known held 仍優先清除為 null）。
  *
  * `everHeld` 由 SharedPreferences（`"assistant_role"`／`"ever_held"`）持久化，
  * process death 後仍能判定外部撤銷；`pendingVerify` 實為 UI 層驗證中旗標
@@ -274,11 +309,14 @@ fun effectiveAssistantReason(
     effectiveAssistantReason(stored, snapshot, everHeld = false, pendingVerify = false)
 
 /**
- * 單次驗證重讀上限（re-review #3 finding #1 [P2]）。
+ * 單次驗證重讀上限（re-review #3 finding #1 [P2]；re-review #4 finding #1
+ * [P2/Merge blocker] 終止語義：`attempt >= MAX` 強制結束驗證，無論快照類型）。
  *
  * `RESULT_OK` 回調 tick 觸發的即時重讀不計數；之後每次排程重讀計 1 次
- * （見 AssistantRoleUi `LaunchedEffect`）。耗盡仍 Known(!held) 即超時收斂
- * （`pendingVerify=false`，按正常規則走：`everHeld?REVOKED:中性 idle`）。
+ * （見 AssistantRoleUi `LaunchedEffect`）。耗盡時 UI 端終止收斂先按
+ * [verificationTimeoutReason] 重寫 `stored`（REVOKED／UNCONFIRMED），再置
+ * `pendingVerify=false` 按正常規則走——pending 永不殘留（含 ReadError／
+ * Unsupported 連續失敗，不再無限保留）。
  */
 const val VERIFY_MAX_ATTEMPTS = 3
 
@@ -292,16 +330,22 @@ const val VERIFY_RETRY_DELAY_MS = 1200L
 
 /**
  * 驗證結束判定（Stage 2 finding B [P2]，純函數；UI 在 `SideEffect` 內呼叫，
- * 重試排程見 AssistantRoleUi `LaunchedEffect(pendingVerify, verifyAttempt)`）。
+ * 重試排程見 AssistantRoleUi `LaunchedEffect(pendingVerify, verifyAttempt)`；
+ * re-review #4 finding #1 [P2/Merge blocker]：`attempt >= MAX` 強制終止，
+ * 無論快照類型，pending 永不殘留）。
  *
  * 語義（`pendingVerify == true`＝驗證中）：
+ * - `verifyAttempt >= [VERIFY_MAX_ATTEMPTS]` → 回 false（強制終止：重試已耗盡，
+ *   UI 端同時按 [verificationTimeoutReason] 重寫 `stored` 終止收斂；覆盖所有
+ *   快照類型——Known(!held)／ReadError／Unsupported 皆結束，不再為未知態
+ *   無限保留 pending。`held` 確認同樣回 false，見下）。
  * - 本幀快照是 [AssistantSnapshot.Known] 且 `held` → 回 false（確認持有，
- *   驗證結束；調和同步清原因為 null）。
- * - Known 且 `!held` → 僅當 `verifyAttempt >= [VERIFY_MAX_ATTEMPTS]` 回 false
- *   （超時收斂：不再自稱驗證中，按正常規則走）；次數未滿回 true（保留，
- *   等待排程的下一次重讀——驗證中調和回 VERIFYING，不判撤銷）。
- * - ReadError／Unsupported → 回 true（保留到下一次 Known 讀取；調和在未知態
- *   本就 passthrough，無掩蓋風險；排程照常重試，系統服務恢復後仍可確認）。
+ *   驗證結束；調和同步清原因為 null；`attempt` 無關）。
+ * - Known 且 `!held`、次數未滿 → 回 true（保留，等待排程的下一次重讀——
+ *   驗證中調和回 VERIFYING，不判撤銷）。
+ * - ReadError／Unsupported、次數未滿 → 回 true（保留到下一次 Known 讀取；
+ *   調和在未知態本就 passthrough，無掩蓋風險；排程照常重試，系統服務恢復後
+ *   仍可確認；次數耗盡則由首條強制終止，不再保留）。
  * - `pendingVerify == false` → 回 false（非驗證中無事可做）。
  *
  * 時序收斂（關鍵：結束點是「可觀測的快照讀取＋重試計數」，與回調／resume
@@ -328,9 +372,54 @@ fun consumePendingVerify(
     verifyAttempt: Int,
 ): Boolean {
     if (!pendingVerify) return false
+    // re-review #4 finding #1 [P2/Merge blocker]：重試耗盡強制終止，無論快照
+    // 類型（舊行為對 ReadError／Unsupported 無限保留 true，LaunchedEffect guard
+    // `attempt < MAX` 已 false 不再排程，pending 永不清——終端殘留驗證中）。
+    if (verifyAttempt >= VERIFY_MAX_ATTEMPTS) return false
     val known = snapshot as? AssistantSnapshot.Known ?: return true
     if (known.held) return false
-    return verifyAttempt < VERIFY_MAX_ATTEMPTS
+    return true
+}
+
+/**
+ * 驗證超時終止原因（re-review #4 finding #1 [P2/Merge blocker]，純函數；
+ * UI 在 `SideEffect` 內 `attempt >= [VERIFY_MAX_ATTEMPTS]` 且快照非 held 時
+ * 以此重寫 `stored`，再置 `pendingVerify=false`；見 AssistantRoleUi）。
+ *
+ * - [AssistantSnapshot.Known] 且 `held` → null（held 優先已清原因，生產不會
+ *   走到終止；防禦性回 null，不憑空造碼）。
+ * - Known 且 `!held`＋`everHeld == true` → [AssistantReasonCode.REVOKED]
+ *   （多次新鮮確認非持有＋曾確認持有＝genuine 撤銷；直接寫 REVOKED，不借
+ *   GRANTED→REVOKED 通道——後者需先寫 GRANTED 再被調和覆寫，多一次間接，
+ *   直接寫最誠實）。
+ * - Known 且 `!held`＋`!everHeld` → [AssistantReasonCode.UNCONFIRMED]
+ *   （要求已送出但從未觀察持有：不斷言撤銷、亦不回中性 idle，原因行提示
+ *   「可重新檢查」＋重試入口）。
+ * - ReadError／Unsupported → [AssistantReasonCode.UNCONFIRMED]（讀取失敗／
+ *   服務缺失皆屬「未確認」；頭部已區分「無法確認…」／「不支援…」，原因行補
+ *   動作語義。只用一個 UNCONFIRMED 碼，不另設 READ_UNAVAILABLE，見
+ *   [AssistantReasonCode.UNCONFIRMED] KDoc）。
+ *
+ * 快照類型釐清：[AssistantSnapshot.Unsupported] 僅指 `RoleManager == null`
+ * （OEM 無此服務），與 `available == false`（有服務但角色不可用，
+ * 仍是 [AssistantSnapshot.Known]`(false, false)`）嚴格區分。`RESULT_OK` 回調
+ * 意味請求 Intent 發出成功（必有 RoleManager），故超時幀出現 Unsupported
+ * 生產不可達（僅系統服務抖動抽風）；仍須覆蓋終止（pending 永不殘留），
+ * 不為其保留無限重試。Unknown 快照＋pending 未滿次數時仍保留重試（讀取可能
+ * 恢復，由 [consumePendingVerify] 執行；此函數只在耗盡時被呼叫）。
+ */
+fun verificationTimeoutReason(
+    snapshot: AssistantSnapshot,
+    everHeld: Boolean,
+): String? {
+    val known = snapshot as? AssistantSnapshot.Known
+        ?: return AssistantReasonCode.UNCONFIRMED
+    if (known.held) return null
+    return if (everHeld) {
+        AssistantReasonCode.REVOKED
+    } else {
+        AssistantReasonCode.UNCONFIRMED
+    }
 }
 
 /** 原因碼 → 顯示文案（UI 只顯示文案不做流程分支，色彩可按失敗/中性區分（見 SettingsScreen）；未知碼原樣回報，不偽造語義）。
@@ -353,6 +442,8 @@ fun assistantReasonText(code: String): String =
             "無法開啟系統授權頁：已改用語音輸入設定。"
         AssistantReasonCode.VERIFYING ->
             "要求已送出，正在向系統確認角色狀態…"
+        AssistantReasonCode.UNCONFIRMED ->
+            "授權要求已送出，但未能確認角色狀態，可重新檢查。"
         else -> "未知狀態（$code）。"
     }
 

@@ -53,12 +53,15 @@ import kotlinx.coroutines.delay
  *   回調設 `pendingVerify=true`＋`stored=null`＋`attempt=0`＋`refreshTick++`
  *   （首幀即 VERIFYING）；`LaunchedEffect(pendingVerify, verifyAttempt)` 排程
  *   後續重讀（`delay([VERIFY_RETRY_DELAY_MS])` 後 `attempt++`＋`refreshTick++`，
- *   上限 [VERIFY_MAX_ATTEMPTS] 次）；每幀提交後
- *   `SideEffect { pendingVerify = consumePendingVerify(pendingVerify, snapshot,
- *   verifyAttempt) }` 判定結束（Known held 確認持有即結束；Known(!held) 且次數
- *   耗盡即超時收斂 `pendingVerify=false`，按正常規則走：`everHeld?REVOKED:
- *   中性 idle`——從未確認持有不斷言撤銷；ReadError／Unsupported 保留 pending
- *   並照常重試）。新一輪 request 發起清旗＋`attempt=0`（舊驗證不帶入新流程）；
+ *   上限 [VERIFY_MAX_ATTEMPTS] 次）；每幀提交後 `SideEffect` 判定結束
+ *   （Known held 確認持有即結束；次數耗盡即超時終止收斂——re-review #4
+ *   finding #1 [P2/Merge blocker]：`attempt >= MAX` 強制終止覆蓋所有快照類型，
+ *   終止先按 `verificationTimeoutReason(snapshot, everHeld)` 重寫 `stored`
+ *   （everHeld→REVOKED，其餘→UNCONFIRMED）再置 `pendingVerify=false`；
+ *   超時不再回中性 idle；ReadError／Unsupported 次數未滿保留 pending 並照常
+ *   重試，耗盡同樣終止為 UNCONFIRMED，pending 永不殘留）。新一輪 request
+ *   發起清旗＋`attempt=0`（舊驗證不帶入新流程）；ReadError 下 request 觸發一次
+ *   重讀（`refreshTick++`，不設碼不開 fallback——「重新檢查」入口）；
  *   `pendingVerify`／`verifyAttempt` 僅記憶體態（remember，不跨 process death——
  *   丟失可接受，重進後按正常規則判定）。
  *   回調先於 ON_RESUME／後於 ON_RESUME 兩種順序皆收斂（至多上限次排程重讀
@@ -66,8 +69,9 @@ import kotlinx.coroutines.delay
  *   內故不重啟 delay，無無限循環）。
  * - RoleManager 缺失（OEM 不支援）→ [AssistantSnapshot.Unsupported]＋對應原因碼＋
  *   fallback，fail-closed；讀取異常 → [AssistantSnapshot.ReadError]（與真不支援
- *   區分：頭部「無法確認助理狀態，請稍後重試」＋主按鈕 disabled＋原因行 passthrough，
- *   不判撤銷；Stage 2 finding C）。
+ *   區分：頭部「無法確認助理狀態，請稍後重試」＋主按鈕 enabled「重新檢查」
+ *   （re-review #4 finding #1：給稍後重試實際入口，request 觸發重讀）＋
+ *   原因行 passthrough，不判撤銷；Stage 2 finding C）。
  */
 data class AssistantRoleUi(
     val state: AssistantSettingsState,
@@ -156,19 +160,37 @@ fun rememberAssistantRole(): AssistantRoleUi {
     // 避免把讀取失敗誤記為持有痕跡）；process death 後仍可判撤銷。
     // composition body 禁止直接寫 state＋SP（重組循環風險），改用 SideEffect。
     // 驗證結束判定同在此：以 consumePendingVerify(pendingVerify, snapshot,
-    // verifyAttempt) 決策（held 確認／超時收斂置 false，未知態／次數未滿保留），
+    // verifyAttempt) 決策（held 確認／次數耗盡強制終止置 false——re-review #4
+    // finding #1：attempt>=MAX 覆蓋所有快照類型，pending 永不殘留；未知態次數
+    // 未滿保留），終止收斂同時按 verificationTimeoutReason(snapshot, everHeld)
+    // 重寫 storedReason（everHeld→REVOKED，其餘→UNCONFIRMED；held 確認不寫，
+    // 保持 null），再清 pending（見下）。
     // 次數遞增由排程端 LaunchedEffect 執行（見下），此處不計數。
     SideEffect {
         if (snapshot is AssistantSnapshot.Known && snapshot.held && !everHeld) {
             everHeld = true
             prefs.edit().putBoolean("ever_held", true).apply()
         }
-        pendingVerify = consumePendingVerify(pendingVerify, snapshot, verifyAttempt)
+        if (pendingVerify) {
+            // re-review #4 finding #1 [P2/Merge blocker] 終止收斂：重試耗盡且
+            // 當前非 held 即驗證超時，先按快照／everHeld 重寫 stored（終端狀態），
+            // 再由 consumePendingVerify 置 pending=false（強制終止覆蓋所有快照
+            // 類型；held 確認不寫 stored，保持 null）。
+            val heldNow = (snapshot as? AssistantSnapshot.Known)?.held == true
+            if (!heldNow && verifyAttempt >= VERIFY_MAX_ATTEMPTS) {
+                storedReason = verificationTimeoutReason(snapshot, everHeld)
+            }
+            pendingVerify = consumePendingVerify(pendingVerify, snapshot, verifyAttempt)
+        } else {
+            pendingVerify = consumePendingVerify(pendingVerify, snapshot, verifyAttempt)
+        }
     }
-    // 驗證重試排程（re-review #3 finding #1：驗證必須觸發新的讀取）。
+    // 驗證重試排程（re-review #3 finding #1：驗證必須觸發新的讀取；
+    // re-review #4 finding #1：attempt>=MAX 終止覆蓋所有快照類型，pending 永不殘留）。
     // key 含 verifyAttempt：每次排程重讀提交後 SideEffect 若保留 pending
-    // （Known(!held) 且次數未滿），attempt 已＋1 使 key 變化→重排下一次；
-    // 達上限（SideEffect 置 pending=false）或 held 確認（同置 false）即停。
+    // （次數未滿），attempt 已＋1 使 key 變化→重排下一次；
+    // 達上限（SideEffect 終止收斂：重寫 stored＋置 pending=false）或 held 確認
+    // （同置 false）即停。
     // tick++ 不在 key 內：ON_RESUME／回調的即時重讀不重啟 delay、不多計次數，
     // 只提供額外新鮮快照；guard（pending＋attempt 上限）保證終止，無無限循環。
     LaunchedEffect(pendingVerify, verifyAttempt) {
@@ -229,8 +251,9 @@ fun rememberAssistantRole(): AssistantRoleUi {
             // （re-review #3 finding #1 [P2]）：不寫 GRANTED（否則下次重讀
             // Known(!held) 會用早期 false 快照斷言撤銷），stored 清 null＋
             // pendingVerify=true 進入驗證中（調和回 VERIFYING）＋attempt=0，
-            // refreshTick++ 立即重讀第一幀；後續重讀由重試排程驅動，超時收斂
-            // （!everHeld→中性 idle，everHeld→REVOKED）。此處不清，ON_RESUME 亦不清。
+            // refreshTick++ 立即重讀第一幀；後續重讀由重試排程驅動，超時終止收斂
+            // （re-review #4 finding #1：everHeld→REVOKED，其餘→UNCONFIRMED，
+            // 見 SideEffect＋verificationTimeoutReason）。此處不清，ON_RESUME 亦不清。
             storedReason = null
             pendingVerify = true
             verifyAttempt = 0
@@ -260,10 +283,14 @@ fun rememberAssistantRole(): AssistantRoleUi {
             pendingVerify = false
             verifyAttempt = 0
             // Stage 2 finding C：ReadError fail-closed——不發要求、不設
-            // UNSUPPORTED 碼（誠實：未知≠不支援）、不開 fallback，純 no-op
-            //（主按鈕本就 disabled，此為防禦性分支）。
+            // UNSUPPORTED 碼（誠實：未知≠不支援）、不開 fallback；但觸發一次
+            // 重讀（refreshTick++，re-review #4 finding #1 [P2/Merge blocker]：
+            // ReadError 超時／平時皆需實際重試入口，主按鈕改為 enabled
+            // 「重新檢查」，見 SettingsScreen；不設碼、不開 fallback、不動
+            // pendingVerify／verifyAttempt——request 入口已清旗＋attempt=0）。
             if (snap is AssistantSnapshot.ReadError) {
-                Log.w(TAG, "request skipped: snapshot read error (fail-closed)")
+                Log.w(TAG, "request skipped: snapshot read error (fail-closed); trigger re-read")
+                refreshTick++
             } else {
                 when (decideAssistantRole(snap)) {
                     AssistantRoleDecision.AlreadyHeld -> {

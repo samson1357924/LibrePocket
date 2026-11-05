@@ -3,6 +3,7 @@ package dev.librepocket.privilege.github
 import java.lang.reflect.InvocationTargetException
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Assume.assumeTrue
@@ -94,6 +95,13 @@ class ElevatedProcessKillerTest {
         }
         ElevatedProcessKiller.killTree(stub) // 不抛即收斂；抛即此行紅。
         assertTrue("fallback must still destroy parent", stub.destroyed)
+    }
+
+    @Test fun destroyForciblyReturnsThis() {
+        // AB1 順手補（核實缺失後新增）：fake 契約——destroyForcibly 回同一實例
+        //（drain／kill 流程依賴此語義；ShizukuRemoteProcess 包裝直通同理）。
+        val stub = AospFallbackStub()
+        assertSame(stub, stub.destroyForcibly())
     }
 
     /**

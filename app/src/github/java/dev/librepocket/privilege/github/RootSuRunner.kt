@@ -118,6 +118,13 @@ import java.io.File
  * drain 層飽和仍嘗試監督清理（永不跳過 killer）；本旗標經
  * [ElevatedBinaryResult.Ok.cleanupIncomplete]／[ElevatedBinaryResult.TimedOut.cleanupIncomplete]
  * 穿透（僅監測，不改 verdict）。
+ *
+ * AB1 呼叫級准入（owner 新 P1-A＋P1-B）：飽和／熔斷門之後、配額之前
+ * [ElevatedCleanupTracker.tryEnterCall]（CAS，上限
+ * [ElevatedCleanupTracker.MAX_CONCURRENT_CALLS]＝4，特權通道宜序列，B3 可調）；
+ * 滿即拒 `Denied(QUOTA_EXCEEDED, "elevated concurrency full...")` 且零 spawn、
+ * 不耗配額；成功後整個剩餘 runBinary 包 `try { ... } finally { leaveCall() }`
+ * （配額拒、spawn 抛、drain 全路徑釋放）。
  */
 class RootSuRunner(
     private val privateRoot: String? = null,
@@ -231,86 +238,96 @@ class RootSuRunner(
         if (ElevatedCleanupTracker.isBreakerOpen()) {
             return ElevatedRunnerCommon.cleanupBreakerOpen()
         }
-        if (!quota.tryAcquire()) {
-            return ElevatedRunnerCommon.quotaExceeded()
+        // AB1 P1-B 呼叫級准入（飽和／熔斷門之後、配額之前）：CAS 佔一席，滿即
+        // fail-closed 拒絕（QUOTA_EXCEEDED，零 spawn、不耗配額）；成功後剩餘 runBinary
+        // 全包 try/finally 釋放（配額拒、spawn 抛、drain 全路徑）。
+        if (!ElevatedCleanupTracker.tryEnterCall()) {
+            return ElevatedRunnerCommon.concurrencyFull()
         }
-        // su -c 傳送層：內層 argv 已校驗，此處 joinToString 拼成單一
-        // `-c` 字串（裝置側 `su` 必經一次字串解析，非 argv 直達；
-        // 參數衛生已先拒絕串接/重定向字元，此處再經 quoteArg 包覆縱深防禦）。
-        // P0 cwd 釘死：外層 ProcessBuilder 目錄釘到 privateRoot（見 pinnedSpawn），
-        // 內層再 `cd <root> && exec ...` 雙保險，避免裝置側 su 重置 cwd 後
-        // 相對路徑解析到不可控目錄。
-        val inner = request.argv.joinToString(" ") { quoteArg(it) }
-        val root = privateRoot
-        val shellScript = if (root != null) {
-            "cd ${quoteArg(root)} && exec $inner"
-        } else {
-            inner
-        }
-        val wrapped = listOf(su, "-c", shellScript)
-        val process: Process = try {
-            (spawn ?: ::pinnedSpawn)(wrapped)
-        } catch (e: Exception) {
-            val redacted = Redactor.redactError(e.message ?: e.javaClass.simpleName)
-            return ElevatedBinaryResult.Failed("su spawn failed: $redacted")
-        }
-        // R1-A 雙軌＋U2-B stderr 獨立小 cap：截圖 stdout 即 8M 軌，stderr 維持
-        // 通用軌（硬讀取 512K／截斷 64K；截圖錯誤訊息短，降 OOM 峰值）；
-        // 其餘通用命令走舊 64K/512K。
-        val isScreenshot = request.argv == listOf("screencap", "-p") ||
-            request.argv == listOf("cat", "/dev/graphics/fb0")
-        val hardCapBytes = if (isScreenshot) {
-            ElevatedProcessIo.BINARY_SCREENSHOT_HARD_CAP_BYTES
-        } else {
-            ShellPolicy.HARD_READ_CAP_BYTES
-        }
-        // U2-B：截圖 stderr 獨立小 cap（通用軌 512K）；通用命令傳 null 即同 stdout cap。
-        val hardCapErrBytes: Int? = if (isScreenshot) ShellPolicy.HARD_READ_CAP_BYTES else null
-        val maxBytes = if (isScreenshot) {
-            ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES
-        } else {
-            ShellPolicy.MAX_OUTPUT_BYTES
-        }
-        // U2-B：stderr 截斷一律通用軌 64K（截圖亦同）。
-        val errMaxBytes = ShellPolicy.MAX_OUTPUT_BYTES
-        val raw = ElevatedProcessIo.drain(process, timeoutMs, killer, isCancelled, hardCapBytes, hardCapErrBytes)
-        val out = ShellPolicy.truncate(raw.stdout, maxBytes)
-        val err = ShellPolicy.truncate(raw.stderr, errMaxBytes)
-        val truncated = out.truncated || err.truncated || raw.truncated
-        if (raw.timedOut) {
-            return ElevatedBinaryResult.TimedOut(
-                partialStdout = out.bytes,
-                partialStderr = err.bytes,
-                timeoutMs = timeoutMs,
+        try {
+            if (!quota.tryAcquire()) {
+                return ElevatedRunnerCommon.quotaExceeded()
+            }
+            // su -c 傳送層：內層 argv 已校驗，此處 joinToString 拼成單一
+            // `-c` 字串（裝置側 `su` 必經一次字串解析，非 argv 直達；
+            // 參數衛生已先拒絕串接/重定向字元，此處再經 quoteArg 包覆縱深防禦）。
+            // P0 cwd 釘死：外層 ProcessBuilder 目錄釘到 privateRoot（見 pinnedSpawn），
+            // 內層再 `cd <root> && exec ...` 雙保險，避免裝置側 su 重置 cwd 後
+            // 相對路徑解析到不可控目錄。
+            val inner = request.argv.joinToString(" ") { quoteArg(it) }
+            val root = privateRoot
+            val shellScript = if (root != null) {
+                "cd ${quoteArg(root)} && exec $inner"
+            } else {
+                inner
+            }
+            val wrapped = listOf(su, "-c", shellScript)
+            val process: Process = try {
+                (spawn ?: ::pinnedSpawn)(wrapped)
+            } catch (e: Exception) {
+                val redacted = Redactor.redactError(e.message ?: e.javaClass.simpleName)
+                return ElevatedBinaryResult.Failed("su spawn failed: $redacted")
+            }
+            // R1-A 雙軌＋U2-B stderr 獨立小 cap：截圖 stdout 即 8M 軌，stderr 維持
+            // 通用軌（硬讀取 512K／截斷 64K；截圖錯誤訊息短，降 OOM 峰值）；
+            // 其餘通用命令走舊 64K/512K。
+            val isScreenshot = request.argv == listOf("screencap", "-p") ||
+                request.argv == listOf("cat", "/dev/graphics/fb0")
+            val hardCapBytes = if (isScreenshot) {
+                ElevatedProcessIo.BINARY_SCREENSHOT_HARD_CAP_BYTES
+            } else {
+                ShellPolicy.HARD_READ_CAP_BYTES
+            }
+            // U2-B：截圖 stderr 獨立小 cap（通用軌 512K）；通用命令傳 null 即同 stdout cap。
+            val hardCapErrBytes: Int? = if (isScreenshot) ShellPolicy.HARD_READ_CAP_BYTES else null
+            val maxBytes = if (isScreenshot) {
+                ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES
+            } else {
+                ShellPolicy.MAX_OUTPUT_BYTES
+            }
+            // U2-B：stderr 截斷一律通用軌 64K（截圖亦同）。
+            val errMaxBytes = ShellPolicy.MAX_OUTPUT_BYTES
+            val raw = ElevatedProcessIo.drain(process, timeoutMs, killer, isCancelled, hardCapBytes, hardCapErrBytes)
+            val out = ShellPolicy.truncate(raw.stdout, maxBytes)
+            val err = ShellPolicy.truncate(raw.stderr, errMaxBytes)
+            val truncated = out.truncated || err.truncated || raw.truncated
+            if (raw.timedOut) {
+                return ElevatedBinaryResult.TimedOut(
+                    partialStdout = out.bytes,
+                    partialStderr = err.bytes,
+                    timeoutMs = timeoutMs,
+                    truncated = truncated,
+                    cleanupIncomplete = raw.cleanupIncomplete,
+                )
+            }
+            // V2 gobbler 讀取失敗（owner 新 P1-2 correctness）：只有真 EOF（`read`
+            // 回 -1）才算完整流；finished（非超時/取消，killer 未關流）下的讀取異常
+            // 必為真實 I/O 錯誤（部分 PNG 當完整幀即虛構，故回 Failed，不回 Ok）。
+            // 超時/取消路徑已先回 TimedOut，不受影響（預期 close 收斂保留）。
+            if (raw.readFailed) {
+                return ElevatedBinaryResult.Failed("elevated IO read failed (incomplete stream)")
+            }
+            if (raw.exitCode != 0) {
+                val redacted = Redactor.redactError(String(err.bytes, Charsets.UTF_8))
+                return if (isSuDenied(err.bytes, raw.exitCode)) {
+                    ElevatedBinaryResult.Denied(
+                        ShellDeny.NOT_WHITELISTED,
+                        "su denied exit=${raw.exitCode} (NO_PRIVILEGE; fallback to unprivileged path): $redacted",
+                    )
+                } else {
+                    ElevatedBinaryResult.Failed("su failed exit=${raw.exitCode}: $redacted")
+                }
+            }
+            return ElevatedBinaryResult.Ok(
+                stdout = out.bytes,
+                stderr = err.bytes,
+                exitCode = raw.exitCode,
                 truncated = truncated,
                 cleanupIncomplete = raw.cleanupIncomplete,
             )
+        } finally {
+            ElevatedCleanupTracker.leaveCall()
         }
-        // V2 gobbler 讀取失敗（owner 新 P1-2 correctness）：只有真 EOF（`read`
-        // 回 -1）才算完整流；finished（非超時/取消，killer 未關流）下的讀取異常
-        // 必為真實 I/O 錯誤（部分 PNG 當完整幀即虛構，故回 Failed，不回 Ok）。
-        // 超時/取消路徑已先回 TimedOut，不受影響（預期 close 收斂保留）。
-        if (raw.readFailed) {
-            return ElevatedBinaryResult.Failed("elevated IO read failed (incomplete stream)")
-        }
-        if (raw.exitCode != 0) {
-            val redacted = Redactor.redactError(String(err.bytes, Charsets.UTF_8))
-            return if (isSuDenied(err.bytes, raw.exitCode)) {
-                ElevatedBinaryResult.Denied(
-                    ShellDeny.NOT_WHITELISTED,
-                    "su denied exit=${raw.exitCode} (NO_PRIVILEGE; fallback to unprivileged path): $redacted",
-                )
-            } else {
-                ElevatedBinaryResult.Failed("su failed exit=${raw.exitCode}: $redacted")
-            }
-        }
-        return ElevatedBinaryResult.Ok(
-            stdout = out.bytes,
-            stderr = err.bytes,
-            exitCode = raw.exitCode,
-            truncated = truncated,
-            cleanupIncomplete = raw.cleanupIncomplete,
-        )
     }
 
     /**

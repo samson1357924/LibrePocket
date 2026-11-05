@@ -11,4 +11,8 @@
         <ignore path="src/foss/AndroidManifest.xml" />
         <ignore path="src/github/AndroidManifest.xml" />
     </issue>
+    <!-- TODO(localization): Demoted to warning during Alpha phase due to ongoing translation work.
+         Must be restored to default error severity prior to General Availability (GA) milestone to prevent
+         shipping incomplete localization. -->
+    <issue id="MissingTranslation" severity="warning" />
 </lint>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- GitHub flavor label (co-installable alongside Play via .github suffix). -->
+    <string name="app_name">LibrePocket GitHub</string>
+    <string name="accessibility_description">LibrePocket 小幫手：螢幕逐步協助（預設關閉；付款／刪除／發送步驟一律先詢問）。</string>
+</resources>

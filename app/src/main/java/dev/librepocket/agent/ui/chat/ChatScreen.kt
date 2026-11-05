@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.speech.RecognizerIntent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.VisibleForTesting
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,10 +32,10 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
@@ -59,12 +60,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import dev.librepocket.agent.R
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.tool.DenyReason
@@ -437,12 +440,14 @@ fun ChatScreen(
                 }
                 if (streaming) {
                     item {
+                        val streamingStatus = stringResource(R.string.chat_streaming_status)
+                        val streamingLabel = stringResource(R.string.chat_streaming_label)
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .semantics {
                                     liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite
-                                    contentDescription = "正在串流回覆"
+                                    contentDescription = streamingStatus
                                 },
                             horizontalArrangement = Arrangement.Start,
                         ) {
@@ -457,10 +462,14 @@ fun ChatScreen(
                                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 ) {
                                     CircularProgressIndicator(
-                                        modifier = Modifier.padding(2.dp),
+                                        modifier = Modifier
+                                            .padding(2.dp)
+                                            .semantics {
+                                                contentDescription = streamingStatus
+                                            },
                                         strokeWidth = 2.dp,
                                     )
-                                    Text("串流中…")
+                                    Text(streamingLabel)
                                 }
                             }
                         }
@@ -902,8 +911,9 @@ internal fun KeyReadConfirmDialog(
     )
 }
 
+@VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
 @Composable
-private fun MessageBubble(
+internal fun MessageBubble(
     msg: UiMessage,
     onSpeak: (messageId: String, text: String) -> Unit = { _, _ -> },
     // M2：voice_output 開關（false 即隱藏朗讀鈕，與 ToolRegistry 投影同源）。
@@ -932,23 +942,44 @@ private fun MessageBubble(
         ) {
             Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                 val displayText = displayAssistantText(msg.role, msg.text)
-                Text(
-                    text = if (msg.isPartial) displayText + " ▍" else displayText,
-                    style = MaterialTheme.typography.bodyLarge,
-                )
+                if (isUser) {
+                    Text(
+                        text = if (msg.isPartial) displayText + " ▍" else displayText,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        // Streaming cursor "▍" is visual only: announce the plain text
+                        // so TalkBack skips the cursor glyph.
+                        modifier = Modifier.semantics { contentDescription = displayText },
+                    )
+                } else {
+                    ChatMarkdownView(
+                        text = displayText,
+                        isStreaming = msg.isPartial,
+                        textColor = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
                 // S2 系統 TTS：助理氣泡加朗讀鈕（系統語音引擎處理，
                 // 離線能力與資料傳輸取決於已安裝的引擎，非「本地保證」；
                 // 零新權限；開關關閉時隱藏）。朗讀為逐則手勢，
                 // 引擎揭露見按鈕無障礙文案（VoiceTts.SPEAK_BUTTON_DESCRIPTION）。
-                if (!isUser && displayText.isNotBlank() && !msg.isPartial && showSpeak) {
-                    IconButton(
-                        onClick = { onSpeak(msg.id, displayText) },
-                        modifier = Modifier.size(32.dp),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.VolumeUp,
-                            contentDescription = VoiceTts.SPEAK_BUTTON_DESCRIPTION,
-                        )
+                if (!isUser && !msg.isPartial && showSpeak) {
+                    // TTS pipeline (P2-3): strip thinking (fail-closed) then verbalize
+                    // (drop fence delimiters/tool-marker lines, unwrap inline code).
+                    // P2-2 documented divergence: English prose resembling a malformed
+                    // opener (e.g. `I <think that 5 > 3 is true>`) is absorbed to EOF
+                    // here while display renders it verbatim — fail-closed prefers
+                    // hiding a possible thought over speaking it.
+                    val speakableText = remember(displayText) { ChatMarkdownParser.speakableText(displayText) }
+                    if (speakableText.isNotBlank()) {
+                        IconButton(
+                            onClick = { onSpeak(msg.id, speakableText) },
+                            modifier = Modifier.size(32.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.VolumeUp,
+                                contentDescription = VoiceTts.SPEAK_BUTTON_DESCRIPTION,
+                            )
+                        }
                     }
                 }
             }

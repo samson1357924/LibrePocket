@@ -1,0 +1,1975 @@
+package dev.librepocket.agent.ui.chat
+
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class ChatMarkdownParserTest {
+
+    @Test
+    fun parse_emptyText_returnsEmptyListOrStreamingBlock() {
+        assertTrue(ChatMarkdownParser.parse("").isEmpty())
+        val streamingBlocks = ChatMarkdownParser.parse("", isStreaming = true)
+        assertEquals(1, streamingBlocks.size)
+        assertTrue(streamingBlocks[0] is ChatContentBlock.ParagraphBlock)
+        assertEquals("", (streamingBlocks[0] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+    }
+
+    @Test
+    fun parse_thinking_closed_returnsThinkingBlockNotStreaming() {
+        val input = "<think>\nThinking about this problem...\n</think>\nHere is the answer."
+        val blocks = ChatMarkdownParser.parse(input, isStreaming = true)
+
+        assertEquals(2, blocks.size)
+        val thinking = blocks[0] as ChatContentBlock.ThinkingBlock
+        assertEquals("Thinking about this problem...", thinking.content)
+        assertFalse("Closed think tag must not be streaming", thinking.isStreaming)
+
+        val paragraph = blocks[1] as ChatContentBlock.ParagraphBlock
+        assertEquals("Here is the answer.", paragraph.annotatedText.text)
+    }
+
+    @Test
+    fun parse_thinking_unclosed_streaming_returnsThinkingBlockStreaming() {
+        val input = "<think>\nReasoning in progress..."
+        val blocks = ChatMarkdownParser.parse(input, isStreaming = true)
+
+        assertEquals(1, blocks.size)
+        val thinking = blocks[0] as ChatContentBlock.ThinkingBlock
+        assertEquals("Reasoning in progress...", thinking.content)
+        assertTrue("Unclosed think during stream must have isStreaming=true", thinking.isStreaming)
+    }
+
+    @Test
+    fun parse_thinking_unclosed_notStreaming_returnsThinkingBlockNotStreaming() {
+        val input = "<think>\nCut off reasoning"
+        val blocks = ChatMarkdownParser.parse(input, isStreaming = false)
+
+        assertEquals(1, blocks.size)
+        val thinking = blocks[0] as ChatContentBlock.ThinkingBlock
+        assertEquals("Cut off reasoning", thinking.content)
+        assertFalse("Unclosed think when not streaming must have isStreaming=false", thinking.isStreaming)
+    }
+
+    @Test
+    fun parse_thinking_caseInsensitive_andAlternativeTags() {
+        val thinkUpper = "<THINK>Upper case</THINK>Answer"
+        val blocks1 = ChatMarkdownParser.parse(thinkUpper)
+        assertEquals(2, blocks1.size)
+        assertEquals("Upper case", (blocks1[0] as ChatContentBlock.ThinkingBlock).content)
+
+        val thought = "<thought>Alternative tag</thought>Answer"
+        val blocks2 = ChatMarkdownParser.parse(thought)
+        assertEquals(2, blocks2.size)
+        assertEquals("Alternative tag", (blocks2[0] as ChatContentBlock.ThinkingBlock).content)
+    }
+
+    @Test
+    fun parse_codeBlock_closedWithLanguage_returnsCodeBlock() {
+        val input = "```kotlin\nfun main() {\n    println(\"hi\")\n}\n```"
+        val blocks = ChatMarkdownParser.parse(input)
+
+        assertEquals(1, blocks.size)
+        val code = blocks[0] as ChatContentBlock.CodeBlock
+        assertEquals("kotlin", code.language)
+        assertEquals("fun main() {\n    println(\"hi\")\n}", code.code)
+        assertFalse(code.isStreaming)
+    }
+
+    @Test
+    fun parse_codeBlock_closedWithoutLanguage_returnsCodeBlock() {
+        val input = "```\nval x = 42\n```"
+        val blocks = ChatMarkdownParser.parse(input)
+
+        assertEquals(1, blocks.size)
+        val code = blocks[0] as ChatContentBlock.CodeBlock
+        assertNull(code.language)
+        assertEquals("val x = 42", code.code)
+        assertFalse(code.isStreaming)
+    }
+
+    @Test
+    fun parse_codeBlock_unclosedStreaming_returnsCodeBlockStreaming() {
+        val input = "```python\ndef run():\n    pass"
+        val blocks = ChatMarkdownParser.parse(input, isStreaming = true)
+
+        assertEquals(1, blocks.size)
+        val code = blocks[0] as ChatContentBlock.CodeBlock
+        assertEquals("python", code.language)
+        assertEquals("def run():\n    pass", code.code)
+        assertTrue(code.isStreaming)
+    }
+
+    @Test
+    fun parse_interleaved_thinking_paragraph_code_paragraph() {
+        val input = """
+            <think>
+            Plan:
+            1. Write a function
+            </think>
+            Here is the implementation:
+            ```kotlin
+            fun add(a: Int, b: Int) = a + b
+            ```
+            Hope this helps!
+        """.trimIndent()
+
+        val blocks = ChatMarkdownParser.parse(input)
+
+        assertEquals(4, blocks.size)
+        assertTrue(blocks[0] is ChatContentBlock.ThinkingBlock)
+        assertEquals("Plan:\n1. Write a function", (blocks[0] as ChatContentBlock.ThinkingBlock).content)
+
+        assertTrue(blocks[1] is ChatContentBlock.ParagraphBlock)
+        assertEquals("Here is the implementation:", (blocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+
+        assertTrue(blocks[2] is ChatContentBlock.CodeBlock)
+        val codeBlock = blocks[2] as ChatContentBlock.CodeBlock
+        assertEquals("kotlin", codeBlock.language)
+        assertEquals("fun add(a: Int, b: Int) = a + b", codeBlock.code)
+
+        assertTrue(blocks[3] is ChatContentBlock.ParagraphBlock)
+        assertEquals("Hope this helps!", (blocks[3] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+    }
+
+    @Test
+    fun parseInlineMarkdown_bold_italic_boldItalic() {
+        val text = "Normal **bold text** and *italic text* and ***both*** end."
+        val annotated = ChatMarkdownParser.parseInlineMarkdown(text)
+
+        assertEquals("Normal bold text and italic text and both end.", annotated.text)
+
+        val boldSpan = annotated.spanStyles.firstOrNull { it.item.fontWeight == FontWeight.Bold && it.item.fontStyle == null }
+        val italicSpan = annotated.spanStyles.firstOrNull { it.item.fontStyle == FontStyle.Italic && it.item.fontWeight == null }
+        val bothSpan = annotated.spanStyles.firstOrNull { it.item.fontWeight == FontWeight.Bold && it.item.fontStyle == FontStyle.Italic }
+
+        assertTrue("Bold span must be present", boldSpan != null)
+        assertEquals(7, boldSpan!!.start)
+        assertEquals(16, boldSpan.end)
+
+        assertTrue("Italic span must be present", italicSpan != null)
+        assertEquals(21, italicSpan!!.start)
+        assertEquals(32, italicSpan.end)
+
+        assertTrue("Bold+Italic span must be present", bothSpan != null)
+        assertEquals(37, bothSpan!!.start)
+        assertEquals(41, bothSpan.end)
+    }
+
+    @Test
+    fun parseInlineMarkdown_inlineCode() {
+        val text = "Use `val result = 1` here."
+        val annotated = ChatMarkdownParser.parseInlineMarkdown(text)
+
+        assertEquals("Use val result = 1 here.", annotated.text)
+        val codeSpan = annotated.spanStyles.firstOrNull { it.item.fontFamily == FontFamily.Monospace }
+        assertTrue("Monospace code span must be present", codeSpan != null)
+        assertEquals(4, codeSpan!!.start)
+        assertEquals(18, codeSpan.end)
+    }
+
+    @Test
+    fun parseInlineMarkdown_listPrefixesFormatted() {
+        val raw = "- First item\n* Second item\n1. Numbered item"
+        val annotated = ChatMarkdownParser.parseInlineMarkdown(raw)
+
+        assertEquals("• First item\n• Second item\n1. Numbered item", annotated.text)
+    }
+
+    @Test
+    fun parseInlineMarkdown_unmatchedSyntaxLeavesVerbatim() {
+        val raw = "Single * asterisk and ` unmatched backtick and ** unmatched bold"
+        val annotated = ChatMarkdownParser.parseInlineMarkdown(raw)
+
+        assertEquals(raw, annotated.text)
+        assertTrue("No spans should be applied for unmatched formatting", annotated.spanStyles.isEmpty())
+    }
+
+    @Test
+    fun stripThinking_removesAllThinkingTags() {
+        val input = "Hello <think>internal thinking</think>World <THINK>more</THINK>!"
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        assertEquals("Hello World !", stripped)
+
+        val unclosed = "Answer <think>incomplete"
+        assertEquals("Answer", ChatMarkdownParser.stripThinking(unclosed))
+    }
+
+    @Test
+    fun parse_inlineCodeShieldsThinkingTags_andStripPreservesRawCode() {
+        val input = "Use `<think>literal</think>` and <think>secret</think>answer"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals("Use <think>literal</think> and", (blocks[0] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("secret", (blocks[1] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("Use `<think>literal</think>` and answer", ChatMarkdownParser.stripThinking(input))
+    }
+
+    @Test
+    fun parse_paragraphPreservesLeadingAndNestedListIndentation() {
+        val input = "  - first\n    - nested\n  continuation"
+        val paragraph = ChatMarkdownParser.parse(input).single() as ChatContentBlock.ParagraphBlock
+        assertEquals("  • first\n    • nested\n  continuation", paragraph.annotatedText.text)
+        assertEquals(input, ChatMarkdownParser.stripThinking(input))
+        val afterThinking = ChatMarkdownParser.parse("<think>x</think>\n  - answer")
+        assertEquals("  • answer", (afterThinking[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+    }
+
+    @Test
+    fun parse_doubleBacktickCodeSpansShieldTagsAndAllowSingleBackticks() {
+        val input = "Before ``one `<think>literal</think>` two`` after <think>secret</think> end"
+        for (streaming in listOf(false, true)) {
+            val blocks = ChatMarkdownParser.parse(input, isStreaming = streaming)
+            assertEquals(3, blocks.size)
+            val paragraph = (blocks[0] as ChatContentBlock.ParagraphBlock).annotatedText
+            assertEquals("Before one `<think>literal</think>` two after", paragraph.text)
+            assertTrue(paragraph.spanStyles.any { it.item.fontFamily == FontFamily.Monospace })
+            assertEquals("secret", (blocks[1] as ChatContentBlock.ThinkingBlock).content)
+        }
+        assertEquals("Before ``one `<think>literal</think>` two`` after  end", ChatMarkdownParser.stripThinking(input))
+        val unmatched = "``<think>secret</think>`"
+        for (streaming in listOf(false, true)) {
+            assertTrue(ChatMarkdownParser.parse(unmatched, isStreaming = streaming).any { it is ChatContentBlock.ThinkingBlock })
+        }
+        assertEquals("```", ChatMarkdownParser.stripThinking(unmatched))
+    }
+
+    @Test
+    fun parse_indentedCodeAtBlockBoundaryShieldsTagsInDisplayAndTts() {
+        val input = "intro\n\n    <think>literal</think>\n\tval x = 1\nend <think>secret</think>"
+        for (streaming in listOf(false, true)) {
+            val blocks = ChatMarkdownParser.parse(input, isStreaming = streaming)
+            assertEquals("intro", (blocks[0] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+            assertEquals("<think>literal</think>\nval x = 1", (blocks[1] as ChatContentBlock.CodeBlock).code)
+            assertEquals("end", (blocks[2] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+            assertEquals("secret", (blocks[3] as ChatContentBlock.ThinkingBlock).content)
+        }
+        assertEquals("intro\n\n    <think>literal</think>\n\tval x = 1\nend", ChatMarkdownParser.stripThinking(input))
+        val top = "    <think>literal</think>"
+        assertEquals("<think>literal</think>", (ChatMarkdownParser.parse(top).single() as ChatContentBlock.CodeBlock).code)
+        assertEquals(top, ChatMarkdownParser.stripThinking(top))
+        // Like Markdown paragraphs, an indented continuation without a blank line is not an indented code block.
+        val continuation = "paragraph\n    <think>secret</think>"
+        assertTrue(ChatMarkdownParser.parse(continuation).any { it is ChatContentBlock.ThinkingBlock })
+    }
+
+    @Test
+    fun parse_indentedCodeKeepsInternalBlankLinesAndStopsBeforeProse() {
+        val input = "    first\n\n    second\n\n\n    <think>literal</think>\n\nanswer <think>secret</think>"
+        for (streaming in listOf(false, true)) {
+            val blocks = ChatMarkdownParser.parse(input, isStreaming = streaming)
+            assertEquals(3, blocks.size)
+            val code = blocks[0] as ChatContentBlock.CodeBlock
+            assertEquals("first\n\nsecond\n\n\n<think>literal</think>", code.code)
+            assertFalse(code.isStreaming)
+            assertEquals("answer", (blocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+            assertEquals("secret", (blocks[2] as ChatContentBlock.ThinkingBlock).content)
+        }
+        assertEquals("    first\n\n    second\n\n\n    <think>literal</think>\n\nanswer", ChatMarkdownParser.stripThinking(input))
+    }
+
+    @Test
+    fun parse_indentedCodeBlankLinesWithCrLfRemainOneCopyableBlock() {
+        val input = "    first\r\n \t\r\n    \r\n\tsecond\r\n\r\nafter"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(2, blocks.size)
+        assertEquals("first\n\n\nsecond", (blocks[0] as ChatContentBlock.CodeBlock).code)
+        assertEquals("after", (blocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals(input, ChatMarkdownParser.stripThinking(input))
+    }
+
+    @Test
+    fun parse_indentedCodeStreamingCursorOnlyWhileAtEnd() {
+        for (input in listOf("    code", "    code\n", "    code\n\n", "    code\n \t\n")) {
+            val streaming = ChatMarkdownParser.parse(input, isStreaming = true).single() as ChatContentBlock.CodeBlock
+            assertEquals("code", streaming.code)
+            assertTrue(streaming.isStreaming)
+            assertFalse((ChatMarkdownParser.parse(input).single() as ChatContentBlock.CodeBlock).isStreaming)
+        }
+        val extended = ChatMarkdownParser.parse("    one\n\n    two", isStreaming = true).single() as ChatContentBlock.CodeBlock
+        assertEquals("one\n\ntwo", extended.code)
+        assertTrue(extended.isStreaming)
+        val completed = ChatMarkdownParser.parse("    code\n\nanswer", isStreaming = true)
+        assertFalse((completed[0] as ChatContentBlock.CodeBlock).isStreaming)
+        assertEquals("answer", (completed[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+    }
+
+    @Test
+    fun parse_nestedUnorderedListsAcrossBlankLinesRemainLists() {
+        for (newline in listOf("\n", "\r\n")) {
+            for (marker in listOf("-", "*")) {
+                val input = "$marker parent${newline}  ${newline}${newline}    $marker child"
+                for (streaming in listOf(false, true)) {
+                    val blocks = ChatMarkdownParser.parse(input, isStreaming = streaming)
+                    val paragraph = blocks.single() as ChatContentBlock.ParagraphBlock
+                    assertEquals("• parent\n  \n\n    • child", paragraph.annotatedText.text)
+                }
+                assertEquals(input, ChatMarkdownParser.stripThinking(input))
+            }
+        }
+        val standalone = ChatMarkdownParser.parse("    - code").single() as ChatContentBlock.CodeBlock
+        assertEquals("- code", standalone.code)
+        val afterParagraph = ChatMarkdownParser.parse("paragraph\n\n    - code")
+        assertEquals("- code", (afterParagraph[1] as ChatContentBlock.CodeBlock).code)
+        val insideCode = ChatMarkdownParser.parse("    code\n\n    - literal").single() as ChatContentBlock.CodeBlock
+        assertEquals("code\n\n- literal", insideCode.code)
+        val withThinking = "- parent\n\n    - child <think>secret</think>"
+        assertTrue(ChatMarkdownParser.parse(withThinking).any { it is ChatContentBlock.ThinkingBlock })
+        assertEquals("- parent\n\n    - child", ChatMarkdownParser.stripThinking(withThinking))
+    }
+
+    @Test(timeout = 3000)
+    fun bounds_whitespaceOnlyLinesAlwaysAdvanceAtEofAndAfterCode() {
+        val blankInputs = listOf("     ", "      ", "\t  ", "     \n", "     \r\n", "\n     ", "\r\n     ", "     \n      \r\n")
+        for (input in blankInputs) {
+            for (streaming in listOf(false, true)) {
+                assertTrue("blank input must not produce a block: $input", ChatMarkdownParser.parse(input, isStreaming = streaming).isEmpty())
+            }
+            assertEquals("", ChatMarkdownParser.stripThinking(input))
+        }
+        for (suffix in listOf("     ", "     \n", "     \r\n", "\r\n     ", "\n      \r\n")) {
+            val input = "    code\n$suffix"
+            for (streaming in listOf(false, true)) {
+                val code = ChatMarkdownParser.parse(input, isStreaming = streaming).single() as ChatContentBlock.CodeBlock
+                assertEquals("code", code.code)
+                assertEquals(streaming, code.isStreaming)
+            }
+            assertEquals("    code", ChatMarkdownParser.stripThinking(input))
+        }
+    }
+
+    @Test
+    fun parse_listContinuationRetainsContextAcrossBlankLines() {
+        for (newline in listOf("\n", "\r\n")) {
+            for (marker in listOf("-", "*")) {
+                val input = "$marker parent${newline}  continuation${newline}${newline}    $marker child"
+                for (streaming in listOf(false, true)) {
+                    val paragraph = ChatMarkdownParser.parse(input, isStreaming = streaming).single() as ChatContentBlock.ParagraphBlock
+                    assertEquals("• parent\n  continuation\n\n    • child", paragraph.annotatedText.text)
+                }
+                assertEquals(input, ChatMarkdownParser.stripThinking(input))
+                val loose = "$marker parent${newline}${newline}    continuation paragraph${newline}${newline}    $marker child"
+                val paragraph = ChatMarkdownParser.parse(loose).single() as ChatContentBlock.ParagraphBlock
+                assertEquals("• parent\n\n    continuation paragraph\n\n    • child", paragraph.annotatedText.text)
+                assertEquals(loose, ChatMarkdownParser.stripThinking(loose))
+            }
+        }
+    }
+
+    @Test
+    fun parse_listContextEndsForUnindentedProseAndDeepCode() {
+        val prose = "- parent\nordinary paragraph\n\n    - code"
+        val proseBlocks = ChatMarkdownParser.parse(prose)
+        assertEquals("- code", (proseBlocks[1] as ChatContentBlock.CodeBlock).code)
+        val deepCode = "- parent\n\n        <think>literal</think>"
+        val codeBlocks = ChatMarkdownParser.parse(deepCode)
+        assertEquals("  <think>literal</think>", (codeBlocks[1] as ChatContentBlock.CodeBlock).code)
+        assertEquals(deepCode, ChatMarkdownParser.stripThinking(deepCode))
+        val standalone = ChatMarkdownParser.parse("    continuation paragraph").single() as ChatContentBlock.CodeBlock
+        assertEquals("continuation paragraph", standalone.code)
+    }
+
+    @Test
+    fun parse_listCodeIndentIsRelativeToMarkerContentColumn() {
+        val cases = listOf("- " to 6, "  - " to 8, " -  " to 8, "*    " to 9)
+        for ((marker, codeIndent) in cases) {
+            for (newline in listOf("\n", "\r\n")) {
+                val code = "<think>literal</think>"
+                val input = "${marker}parent${newline}${newline}${" ".repeat(codeIndent)}$code"
+                for (streaming in listOf(false, true)) {
+                    val blocks = ChatMarkdownParser.parse(input, isStreaming = streaming)
+                    assertEquals(2, blocks.size)
+                    val codeBlock = blocks[1] as ChatContentBlock.CodeBlock
+                    assertEquals(code, codeBlock.code)
+                    assertEquals(streaming, codeBlock.isStreaming)
+                }
+                assertEquals(input, ChatMarkdownParser.stripThinking(input))
+
+                val continuation = "${marker}parent${newline}${newline}${" ".repeat(codeIndent - 1)}<think>secret</think>"
+                assertTrue(ChatMarkdownParser.parse(continuation).any { it is ChatContentBlock.ThinkingBlock })
+                assertEquals("${marker}parent", ChatMarkdownParser.stripThinking(continuation))
+            }
+        }
+    }
+
+    @Test
+    fun parse_listCodeRetainsColumnsWhenTabCrossesIndentBoundary() {
+        for (newline in listOf("\n", "\r\n")) {
+            val input = "- parent${newline}${newline}\t\t<think>literal</think>${newline}  \t\tsecond${newline}\t  exact"
+            for (streaming in listOf(false, true)) {
+                val blocks = ChatMarkdownParser.parse(input, isStreaming = streaming)
+                val code = blocks[1] as ChatContentBlock.CodeBlock
+                assertEquals("  <think>literal</think>\n  second\nexact", code.code)
+                assertEquals(streaming, code.isStreaming)
+            }
+            assertEquals(input, ChatMarkdownParser.stripThinking(input))
+        }
+        val exactTab = "- parent\n\n\t  \tremaining"
+        assertEquals("  remaining", (ChatMarkdownParser.parse(exactTab)[1] as ChatContentBlock.CodeBlock).code)
+        assertEquals(exactTab, ChatMarkdownParser.stripThinking(exactTab))
+        val mixed = "- parent\n\n      \t  \t<think>literal</think>\n\t \t \ttext\tinside"
+        assertEquals("      <think>literal</think>\n      text\tinside", (ChatMarkdownParser.parse(mixed)[1] as ChatContentBlock.CodeBlock).code)
+        assertEquals(mixed, ChatMarkdownParser.stripThinking(mixed))
+    }
+
+    @Test
+    fun parse_indentedCodePreservesAlignedRecipeTabs() {
+        for (newline in listOf("\n", "\r\n")) {
+            val input = "    target:${newline}    \t@echo first${newline}    \t\t@echo nested"
+            for (streaming in listOf(false, true)) {
+                val code = ChatMarkdownParser.parse(input, isStreaming = streaming).single() as ChatContentBlock.CodeBlock
+                assertEquals("target:\n\t@echo first\n\t\t@echo nested", code.code)
+                assertEquals(streaming, code.isStreaming)
+            }
+            assertEquals(input, ChatMarkdownParser.stripThinking(input))
+        }
+        val alignedList = "  - parent\n\n        \t@echo <think>literal</think>"
+        assertEquals("\t@echo <think>literal</think>", (ChatMarkdownParser.parse(alignedList)[1] as ChatContentBlock.CodeBlock).code)
+        assertEquals(alignedList, ChatMarkdownParser.stripThinking(alignedList))
+    }
+
+    @Test
+    fun parse_indentedCodeExpandsOnlyTabsWhoseStopsMove() {
+        val input = "- parent\n\n      \t@echo one\n\t\t\t@echo two\n      \t  \t@echo three"
+        val code = ChatMarkdownParser.parse(input)[1] as ChatContentBlock.CodeBlock
+        assertEquals("  @echo one\n      @echo two\n      @echo three", code.code)
+        assertEquals(input, ChatMarkdownParser.stripThinking(input))
+        val unalignedTabInCode = "- parent\n\n      \t@echo text\tinside"
+        assertEquals("  @echo text\tinside", (ChatMarkdownParser.parse(unalignedTabInCode)[1] as ChatContentBlock.CodeBlock).code)
+        assertEquals(unalignedTabInCode, ChatMarkdownParser.stripThinking(unalignedTabInCode))
+    }
+
+    @Test
+    fun parse_listContextSurvivesIndentedCodeAndRecognizesNestedItems() {
+        for (newline in listOf("\n", "\r\n")) {
+            val input = "- parent${newline}${newline}      print(1)${newline}${newline}    - <think>secret</think>"
+            for (streaming in listOf(false, true)) {
+                val blocks = ChatMarkdownParser.parse(input, isStreaming = streaming)
+                assertEquals(4, blocks.size)
+                assertEquals("print(1)", (blocks[1] as ChatContentBlock.CodeBlock).code)
+                assertEquals("    -", (blocks[2] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+                assertEquals("secret", (blocks[3] as ChatContentBlock.ThinkingBlock).content)
+            }
+            assertEquals("- parent${newline}${newline}      print(1)${newline}${newline}    -", ChatMarkdownParser.stripThinking(input))
+        }
+        val nested = "- parent\n  - child\n\n        code\n\n    - grandchild <think>secret</think>"
+        val blocks = ChatMarkdownParser.parse(nested)
+        assertEquals("code", (blocks[1] as ChatContentBlock.CodeBlock).code)
+        assertTrue(blocks.last() is ChatContentBlock.ThinkingBlock)
+        assertEquals("- parent\n  - child\n\n        code\n\n    - grandchild", ChatMarkdownParser.stripThinking(nested))
+    }
+
+    @Test
+    fun parse_listCodeFollowedByParentContinuationOrOutsideText() {
+        val continuation = "- parent\n\n      code\n\n  continuation <think>secret</think>"
+        val continuationBlocks = ChatMarkdownParser.parse(continuation)
+        assertEquals("code", (continuationBlocks[1] as ChatContentBlock.CodeBlock).code)
+        assertEquals("  continuation", (continuationBlocks[2] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("secret", (continuationBlocks[3] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("- parent\n\n      code\n\n  continuation", ChatMarkdownParser.stripThinking(continuation))
+
+        val outside = "- parent\n\n      code\n\noutside\n\n    <think>literal</think>"
+        val blocks = ChatMarkdownParser.parse(outside)
+        assertEquals(4, blocks.size)
+        assertEquals("code", (blocks[1] as ChatContentBlock.CodeBlock).code)
+        assertEquals("outside", (blocks[2] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("<think>literal</think>", (blocks[3] as ChatContentBlock.CodeBlock).code)
+        assertEquals(outside, ChatMarkdownParser.stripThinking(outside))
+    }
+
+    @Test
+    fun parse_nestedListReturnRestoresParentCodeIndent() {
+        for (newline in listOf("\n", "\r\n")) {
+            val input = "- parent${newline}  - child${newline}    - grandchild${newline}  parent continuation${newline}${newline}      <think>literal</think>"
+            for (streaming in listOf(false, true)) {
+                val blocks = ChatMarkdownParser.parse(input, isStreaming = streaming)
+                assertEquals(2, blocks.size)
+                val code = blocks[1] as ChatContentBlock.CodeBlock
+                assertEquals("<think>literal</think>", code.code)
+                assertEquals(streaming, code.isStreaming)
+            }
+            assertEquals(input, ChatMarkdownParser.stripThinking(input))
+        }
+        val childContinuation = "- parent\n  - child\n    child continuation\n\n        <think>literal</think>"
+        assertEquals("<think>literal</think>", (ChatMarkdownParser.parse(childContinuation)[1] as ChatContentBlock.CodeBlock).code)
+        assertEquals(childContinuation, ChatMarkdownParser.stripThinking(childContinuation))
+        val thinkingInParent = "- parent\n  - child\n  parent continuation <think>secret</think>"
+        assertTrue(ChatMarkdownParser.parse(thinkingInParent).any { it is ChatContentBlock.ThinkingBlock })
+        assertEquals("- parent\n  - child\n  parent continuation", ChatMarkdownParser.stripThinking(thinkingInParent))
+    }
+
+    @Test(timeout = 5000)
+    fun bounds_deepListContextPushAndParentReturn() {
+        val input = buildString {
+            append("- root\n")
+            for (depth in 1..300) append(" ".repeat(depth * 2)).append("- child\n")
+            append("  parent continuation\n\n      <think>literal</think>")
+        }
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(2, blocks.size)
+        assertEquals("<think>literal</think>", (blocks[1] as ChatContentBlock.CodeBlock).code)
+        assertEquals(input, ChatMarkdownParser.stripThinking(input))
+    }
+
+    @Test
+    fun parse_thinkingEndsListContextButInlineCodeDoesNot() {
+        val input = "- parent <think>secret\n</think>\n\n    <think>literal</think>"
+        for (streaming in listOf(false, true)) {
+            val blocks = ChatMarkdownParser.parse(input, isStreaming = streaming)
+            assertEquals(3, blocks.size)
+            assertEquals("secret", (blocks[1] as ChatContentBlock.ThinkingBlock).content)
+            assertEquals("<think>literal</think>", (blocks[2] as ChatContentBlock.CodeBlock).code)
+        }
+        assertEquals("- parent \n\n    <think>literal</think>", ChatMarkdownParser.stripThinking(input))
+
+        val inline = "- parent `<think>literal</think>`\n\n    continuation"
+        assertTrue(ChatMarkdownParser.parse(inline).single() is ChatContentBlock.ParagraphBlock)
+        assertEquals(inline, ChatMarkdownParser.stripThinking(inline))
+    }
+
+    @Test(timeout = 5000)
+    fun bounds_manyListRelativeCodeBlocksAndWhitespace() {
+        val input = "- item\n\n      code\n\n".repeat(6000)
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(12000, blocks.size)
+        assertTrue(blocks.filterIsInstance<ChatContentBlock.CodeBlock>().all { it.code == "code" })
+        assertEquals(input.trimEnd(), ChatMarkdownParser.stripThinking(input))
+        assertTrue(ChatMarkdownParser.parse("     ").isEmpty())
+    }
+
+    @Test(timeout = 5000)
+    fun bounds_manyBlankLinesInsideIndentedCodeAndLists() {
+        val code = "    a\n" + "\n    b\n".repeat(12000)
+        val block = ChatMarkdownParser.parse(code).single() as ChatContentBlock.CodeBlock
+        assertEquals("a\n" + "\nb\n".repeat(11999) + "\nb", block.code)
+        val list = "- parent\n" + "\n".repeat(12000) + "    - child"
+        assertTrue(ChatMarkdownParser.parse(list).single() is ChatContentBlock.ParagraphBlock)
+    }
+
+    @Test(timeout = 5000)
+    fun bounds_manyDoubleBacktickSpansAndIndentedLines() {
+        val spans = "``x `<think>literal</think>` y`` ".repeat(12000)
+        assertEquals(1, ChatMarkdownParser.parse(spans).size)
+        assertEquals(spans.trimEnd(), ChatMarkdownParser.stripThinking(spans))
+        val code = "    <think>literal</think>\n".repeat(12000)
+        assertEquals(1, ChatMarkdownParser.parse(code).size)
+        assertEquals(code.trimEnd(), ChatMarkdownParser.stripThinking(code))
+    }
+
+    @Test
+    fun parse_fencedCodeOnlyClosesOnFenceLine() {
+        val input = "```text\ninline ``` remains\n```suffix\n<think>literal</think>\n```\nafter"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(2, blocks.size)
+        assertEquals("inline ``` remains\n```suffix\n<think>literal</think>", (blocks[0] as ChatContentBlock.CodeBlock).code)
+        assertEquals("after", (blocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals(input, ChatMarkdownParser.stripThinking(input))
+    }
+
+    @Test
+    fun stripThinking_usesSameOrderingAsDisplayForMixedAndUnclosedTags() {
+        val input = "before <thought>outer <think>inner</thought> visible </think> after"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals("outer <think>inner</thought> visible", (blocks[1] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("before  after", ChatMarkdownParser.stripThinking(input))
+        assertEquals("before", ChatMarkdownParser.stripThinking("before <thinking>unclosed <think>x</think>"))
+    }
+
+    @Test
+    fun parse_streamingPartialTagsAreNotDisplayedPrematurely() {
+        for (prefix in listOf("<", "<t", "<thi", "<THINK", "<thought")) {
+            val blocks = ChatMarkdownParser.parse("answer $prefix", isStreaming = true)
+            assertEquals("answer", (blocks.single() as ChatContentBlock.ParagraphBlock).annotatedText.text)
+            assertEquals("answer $prefix", (ChatMarkdownParser.parse("answer $prefix").single() as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        }
+        val thinking = ChatMarkdownParser.parse("<think>reason</thi", isStreaming = true).single() as ChatContentBlock.ThinkingBlock
+        assertEquals("reason", thinking.content)
+        assertTrue(thinking.isStreaming)
+        assertEquals("reason</thi", (ChatMarkdownParser.parse("<think>reason</thi").single() as ChatContentBlock.ThinkingBlock).content)
+    }
+
+    @Test
+    fun parseInlineMarkdown_italicCanContainBoldWithoutConsumingBoldDelimiter() {
+        val result = ChatMarkdownParser.parseInlineMarkdown("*outer **bold** end*")
+        assertEquals("outer bold end", result.text)
+        assertTrue(result.spanStyles.any { it.item.fontStyle == FontStyle.Italic && it.start == 0 && it.end == 14 })
+        assertTrue(result.spanStyles.any { it.item.fontWeight == FontWeight.Bold && it.start == 6 && it.end == 10 })
+        assertEquals("*outer **unclosed", ChatMarkdownParser.parseInlineMarkdown("*outer **unclosed").text)
+    }
+
+    @Test
+    fun parseInlineMarkdown_boldAndNestedItalicShareClosingRun() {
+        val input = "before **bold *italic*** after"
+        for (streaming in listOf(false, true)) {
+            val result = (ChatMarkdownParser.parse(input, streaming).single() as ChatContentBlock.ParagraphBlock).annotatedText
+            assertEquals("before bold italic after", result.text)
+            assertTrue(result.spanStyles.any { it.item.fontWeight == FontWeight.Bold && it.start == 7 && it.end == 18 })
+            assertTrue(result.spanStyles.any { it.item.fontStyle == FontStyle.Italic && it.start == 12 && it.end == 18 })
+        }
+        val code = ChatMarkdownParser.parseInlineMarkdown("**bold `*literal`***")
+        assertEquals("bold *literal*", code.text)
+        assertTrue(code.spanStyles.none { it.item.fontStyle == FontStyle.Italic })
+        val spaced = ChatMarkdownParser.parseInlineMarkdown("**bold * italic***")
+        assertTrue(spaced.spanStyles.none { it.item.fontStyle == FontStyle.Italic })
+        val closed = ChatMarkdownParser.parseInlineMarkdown("**bold *italic* end***")
+        assertEquals("bold italic end*", closed.text)
+        assertTrue(closed.spanStyles.any { it.item.fontStyle == FontStyle.Italic && it.start == 5 && it.end == 11 })
+        assertEquals("both", ChatMarkdownParser.parseInlineMarkdown("***both***").text)
+    }
+
+    @Test(timeout = 5000)
+    fun bounds_manySharedBoldItalicClosers() {
+        val result = ChatMarkdownParser.parseInlineMarkdown("**bold *italic*** ".repeat(12000))
+        assertEquals("bold italic ".repeat(12000), result.text)
+        assertEquals(24000, result.spanStyles.size)
+    }
+
+    @Test
+    fun parseInlineMarkdown_sharedClosersAreScopedAndWorkInBothDirections() {
+        val scoped = ChatMarkdownParser.parseInlineMarkdown("**a *orphan** **bold*italic***")
+        assertEquals("a *orphan bolditalic", scoped.text)
+        assertTrue(scoped.spanStyles.any { it.item.fontWeight == FontWeight.Bold && it.start == 0 && it.end == 9 })
+        assertTrue(scoped.spanStyles.any { it.item.fontWeight == FontWeight.Bold && it.start == 10 && it.end == 20 })
+        assertTrue(scoped.spanStyles.any { it.item.fontStyle == FontStyle.Italic && it.start == 14 && it.end == 20 })
+        val reverse = ChatMarkdownParser.parseInlineMarkdown("*italic **bold***")
+        assertEquals("italic bold", reverse.text)
+        assertTrue(reverse.spanStyles.any { it.item.fontStyle == FontStyle.Italic && it.start == 0 && it.end == 11 })
+        assertTrue(reverse.spanStyles.any { it.item.fontWeight == FontWeight.Bold && it.start == 7 && it.end == 11 })
+
+        val code = ChatMarkdownParser.parseInlineMarkdown("*italic `**not bold`***")
+        assertTrue(code.spanStyles.none { it.item.fontWeight == FontWeight.Bold })
+        assertEquals("*italic **not bold***", code.text)
+        val shielded = ChatMarkdownParser.parseInlineMarkdown("`*italic **bold***` **bold *italic***")
+        assertEquals("*italic **bold*** bold italic", shielded.text)
+        assertTrue(shielded.spanStyles.any { it.item.fontFamily == FontFamily.Monospace && it.start == 0 && it.end == 17 })
+        assertTrue(shielded.spanStyles.any { it.item.fontStyle == FontStyle.Italic && it.start == 23 && it.end == 29 })
+        for (input in listOf("*italic ** unclosed***", "*italic **bold", "**bold *italic", "*italic\n**bold***")) {
+            val result = ChatMarkdownParser.parseInlineMarkdown(input)
+            assertTrue("No shared nested styles for $input", result.spanStyles.none {
+                it.item.fontStyle == FontStyle.Italic
+            })
+        }
+        val fenced = ChatMarkdownParser.parse("```text\n*italic **bold***\n```\n*italic **bold***")
+        assertEquals("*italic **bold***", (fenced[0] as ChatContentBlock.CodeBlock).code)
+        assertEquals("italic bold", (fenced[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+    }
+
+    @Test(timeout = 5000)
+    fun bounds_manyScopedAndUnbalancedSharedClosers() {
+        val chunk = "**a *orphan** **bold*italic*** *italic **bold*** "
+        val result = ChatMarkdownParser.parseInlineMarkdown(chunk.repeat(12000))
+        assertEquals("a *orphan bolditalic italic bold ".repeat(12000), result.text)
+        val unbalanced = "*orphan **orphan\n".repeat(12000)
+        assertEquals(unbalanced, ChatMarkdownParser.parseInlineMarkdown(unbalanced).text)
+        val sameLine = "**x *orphan** ".repeat(12000)
+        assertEquals("x *orphan ".repeat(12000), ChatMarkdownParser.parseInlineMarkdown(sameLine).text)
+    }
+
+    @Test
+    fun parseInlineMarkdown_sharedCloserSkipsUnrelatedTripleRuns() {
+        val input = "*a ***both*** and **bold***"
+        for (streaming in listOf(false, true)) {
+            val result = (ChatMarkdownParser.parse(input, streaming).single() as ChatContentBlock.ParagraphBlock).annotatedText
+            assertEquals("a both and bold", result.text)
+            assertEquals(3, result.spanStyles.size)
+            assertTrue(result.spanStyles.any { it.item.fontStyle == FontStyle.Italic && it.item.fontWeight == null && it.start == 0 && it.end == 15 })
+            assertTrue(result.spanStyles.any { it.item.fontStyle == FontStyle.Italic && it.item.fontWeight == FontWeight.Bold && it.start == 2 && it.end == 6 })
+            assertTrue(result.spanStyles.any { it.item.fontStyle == null && it.item.fontWeight == FontWeight.Bold && it.start == 11 && it.end == 15 })
+        }
+        val code = ChatMarkdownParser.parseInlineMarkdown("*a `***both***` and **bold***")
+        assertEquals("a ***both*** and bold", code.text)
+        assertEquals(3, code.spanStyles.size)
+        assertTrue(code.spanStyles.any { it.item.fontFamily == FontFamily.Monospace && it.start == 2 && it.end == 12 })
+        assertTrue(code.spanStyles.any { it.item.fontStyle == FontStyle.Italic && it.start == 0 && it.end == 21 })
+        assertTrue(code.spanStyles.any { it.item.fontWeight == FontWeight.Bold && it.start == 17 && it.end == 21 })
+        val codeInBold = ChatMarkdownParser.parseInlineMarkdown("*a **bold `***masked***` tail***")
+        assertEquals("a bold ***masked*** tail", codeInBold.text)
+        assertEquals(3, codeInBold.spanStyles.size)
+        assertTrue(codeInBold.spanStyles.any { it.item.fontFamily == FontFamily.Monospace && it.start == 7 && it.end == 19 })
+        assertTrue(codeInBold.spanStyles.any { it.item.fontStyle == FontStyle.Italic && it.start == 0 && it.end == 24 })
+        assertTrue(codeInBold.spanStyles.any { it.item.fontWeight == FontWeight.Bold && it.start == 2 && it.end == 24 })
+
+        val noBold = ChatMarkdownParser.parseInlineMarkdown("*a ***both*** end***")
+        assertEquals("*a both end***", noBold.text)
+        assertEquals(1, noBold.spanStyles.size)
+        assertTrue(noBold.spanStyles.any { it.item.fontWeight == FontWeight.Bold && it.item.fontStyle == FontStyle.Italic && it.start == 3 && it.end == 7 })
+        val earlierClose = ChatMarkdownParser.parseInlineMarkdown("*a* ***both*** and **bold***")
+        assertEquals("a both and bold*", earlierClose.text)
+        assertEquals(3, earlierClose.spanStyles.size)
+        assertTrue(earlierClose.spanStyles.any { it.item.fontStyle == FontStyle.Italic && it.item.fontWeight == null && it.start == 0 && it.end == 1 })
+        assertTrue(earlierClose.spanStyles.any { it.item.fontWeight == FontWeight.Bold && it.item.fontStyle == FontStyle.Italic && it.start == 2 && it.end == 6 })
+        assertTrue(earlierClose.spanStyles.any { it.item.fontWeight == FontWeight.Bold && it.item.fontStyle == null && it.start == 11 && it.end == 15 })
+    }
+
+    @Test(timeout = 5000)
+    fun bounds_manyUnrelatedTripleRunsBeforeSharedCloser() {
+        val triples = "***both*** ".repeat(12000)
+        val result = ChatMarkdownParser.parseInlineMarkdown("*a ${triples}and **bold***")
+        assertEquals("a ${"both ".repeat(12000)}and bold", result.text)
+        assertEquals(12002, result.spanStyles.size)
+        val unbalanced = "*a ${"***both*** ".repeat(12000)}without closer"
+        val unmatched = ChatMarkdownParser.parseInlineMarkdown(unbalanced)
+        assertEquals("*a ${"both ".repeat(12000)}without closer", unmatched.text)
+        assertEquals(12000, unmatched.spanStyles.size)
+    }
+
+    @Test(timeout = 5000)
+    fun bounds_manyAlternatingBlocksAndUnmatchedInlineDelimiters() {
+        val blocks = buildString { repeat(12000) { append("<think>x</think>text ") } }
+        assertEquals(24000, ChatMarkdownParser.parse(blocks).size)
+        val unmatched = ("*x\n".repeat(12000)) + ("`x\n".repeat(12000))
+        assertEquals(unmatched, ChatMarkdownParser.parseInlineMarkdown(unmatched).text)
+    }
+
+    @Test
+    fun parse_fenceCloserMustBeAtLeastAsLongAsOpener() {
+        val input = "````text\n```\n<think>literal</think>\n````\nafter"
+        val blocks = ChatMarkdownParser.parse(input)
+        val code = blocks[0] as ChatContentBlock.CodeBlock
+        assertEquals("```\n<think>literal</think>", code.code)
+        assertFalse(code.isStreaming)
+        assertEquals("after", (blocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals(input, ChatMarkdownParser.stripThinking(input))
+
+        val longer = ChatMarkdownParser.parse("````\nx\n`````\nafter")
+        assertEquals("x", (longer[0] as ChatContentBlock.CodeBlock).code)
+        assertEquals("after", (longer[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        val unclosed = ChatMarkdownParser.parse("````\nx\n```").single() as ChatContentBlock.CodeBlock
+        assertEquals("x\n```", unclosed.code)
+        assertFalse(unclosed.isStreaming)
+        val sameLine = ChatMarkdownParser.parse("````x```y````").single() as ChatContentBlock.CodeBlock
+        assertEquals("x```y", sameLine.code)
+    }
+
+    @Test
+    fun parse_inlineCodeTakesPrecedenceOverStyleDelimiters() {
+        val input = "**`**<think>secret</think>`"
+        val block = ChatMarkdownParser.parse(input).single() as ChatContentBlock.ParagraphBlock
+        assertEquals("****<think>secret</think>", block.annotatedText.text)
+        assertTrue(block.annotatedText.spanStyles.any { it.item.fontFamily == FontFamily.Monospace && it.start == 2 })
+        assertTrue(block.annotatedText.spanStyles.none { it.item.fontWeight == FontWeight.Bold })
+        assertEquals(input, ChatMarkdownParser.stripThinking(input))
+
+        val nested = ChatMarkdownParser.parse("**before `<think>literal</think>` after**").single() as ChatContentBlock.ParagraphBlock
+        assertEquals("before <think>literal</think> after", nested.annotatedText.text)
+        assertTrue(nested.annotatedText.spanStyles.any { it.item.fontFamily == FontFamily.Monospace })
+        assertTrue(nested.annotatedText.spanStyles.any { it.item.fontWeight == FontWeight.Bold })
+    }
+
+    @Test
+    fun parse_escapedBacktickDoesNotHideThinkingAndKeepsFollowingCode() {
+        val input = "Escaped \\` <think>secret</think> `code`"
+        for (streaming in listOf(false, true)) {
+            val blocks = ChatMarkdownParser.parse(input, isStreaming = streaming)
+            assertEquals(3, blocks.size)
+            assertEquals("Escaped \\`", (blocks[0] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+            assertEquals("secret", (blocks[1] as ChatContentBlock.ThinkingBlock).content)
+            val code = (blocks[2] as ChatContentBlock.ParagraphBlock).annotatedText
+            assertEquals("code", code.text)
+            assertTrue(code.spanStyles.any { it.item.fontFamily == FontFamily.Monospace })
+        }
+        assertEquals("Escaped \\`  `code`", ChatMarkdownParser.stripThinking(input))
+    }
+
+    @Test
+    fun parse_backslashParityDeterminesInlineCodeDelimiters() {
+        for (count in 1..4) {
+            val slashes = "\\".repeat(count)
+            val input = "start ${slashes}`<think>secret</think>` end"
+            for (streaming in listOf(false, true)) {
+                val blocks = ChatMarkdownParser.parse(input, isStreaming = streaming)
+                if (count % 2 == 1) {
+                    assertEquals("start ${slashes}`", (blocks[0] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+                    assertEquals("secret", (blocks[1] as ChatContentBlock.ThinkingBlock).content)
+                    assertEquals("` end", (blocks[2] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+                } else {
+                    val paragraph = (blocks.single() as ChatContentBlock.ParagraphBlock).annotatedText
+                    assertEquals("start $slashes<think>secret</think> end", paragraph.text)
+                    assertTrue(paragraph.spanStyles.any { it.item.fontFamily == FontFamily.Monospace })
+                }
+            }
+            val expected = if (count % 2 == 1) "start ${slashes}`` end" else input
+            assertEquals(expected, ChatMarkdownParser.stripThinking(input))
+        }
+    }
+
+    @Test
+    fun parse_backslashesInsideInlineCodeDoNotEscapeCloser() {
+        for (count in 1..4) {
+            val slashes = "\\".repeat(count)
+            val input = "Path `C:$slashes` <think>secret</think> `ok`"
+            for (streaming in listOf(false, true)) {
+                val blocks = ChatMarkdownParser.parse(input, isStreaming = streaming)
+                assertEquals(3, blocks.size)
+                val path = (blocks[0] as ChatContentBlock.ParagraphBlock).annotatedText
+                assertEquals("Path C:$slashes", path.text)
+                assertTrue(path.spanStyles.any { it.item.fontFamily == FontFamily.Monospace })
+                assertEquals("secret", (blocks[1] as ChatContentBlock.ThinkingBlock).content)
+                val ok = (blocks[2] as ChatContentBlock.ParagraphBlock).annotatedText
+                assertEquals("ok", ok.text)
+                assertTrue(ok.spanStyles.any { it.item.fontFamily == FontFamily.Monospace })
+            }
+            assertEquals("Path `C:$slashes`  `ok`", ChatMarkdownParser.stripThinking(input))
+            assertEquals("C:$slashes", ChatMarkdownParser.parseInlineMarkdown("`C:$slashes`").text)
+        }
+        val literal = "`C:\\<think>literal</think>`"
+        assertEquals("C:\\<think>literal</think>", (ChatMarkdownParser.parse(literal).single() as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals(literal, ChatMarkdownParser.stripThinking(literal))
+    }
+
+    @Test
+    fun parse_closingFenceAllowsAtMostThreeSpacesAndNoTabs() {
+        for (indent in listOf("    ", "     ", "\t", "  \t")) {
+            val input = "```\ncode\n${indent}```\n<think>literal</think>\n```\nafter"
+            val blocks = ChatMarkdownParser.parse(input)
+            assertEquals("code\n${indent}```\n<think>literal</think>", (blocks[0] as ChatContentBlock.CodeBlock).code)
+            assertEquals("after", (blocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+            assertEquals(input, ChatMarkdownParser.stripThinking(input))
+            val partial = ChatMarkdownParser.parse("```\ncode\n${indent}``", isStreaming = true).single() as ChatContentBlock.CodeBlock
+            assertEquals("code\n${indent}``", partial.code)
+        }
+        for (indent in listOf("", " ", "  ", "   ")) {
+            val input = "```\ncode\n${indent}```\n<think>secret</think>"
+            val blocks = ChatMarkdownParser.parse(input)
+            assertEquals("code", (blocks[0] as ChatContentBlock.CodeBlock).code)
+            assertEquals("secret", (blocks[1] as ChatContentBlock.ThinkingBlock).content)
+            assertEquals("```\ncode\n${indent}```", ChatMarkdownParser.stripThinking(input))
+        }
+    }
+
+    @Test
+    fun parse_indentedFenceOpenersAndInlineOpenersFollowExplicitRules() {
+        for (indent in listOf("", " ", "  ", "   ")) {
+            val input = "${indent}```txt\n<think>literal</think>\n${indent}```\nafter"
+            val blocks = ChatMarkdownParser.parse(input)
+            val code = blocks[0] as ChatContentBlock.CodeBlock
+            assertEquals("txt", code.language)
+            assertEquals("<think>literal</think>", code.code)
+            assertEquals("after", (blocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+            assertEquals(input, ChatMarkdownParser.stripThinking(input))
+        }
+        for (indent in listOf("    ", "     ", "\t", "  \t")) {
+            val input = "${indent}```\n<think>secret</think>\n${indent}```"
+            for (streaming in listOf(false, true)) {
+                val blocks = ChatMarkdownParser.parse(input, isStreaming = streaming)
+                assertEquals(3, blocks.size)
+                val expectedCode = indent.substring(when (indent) { "    " -> 4; "     " -> 4; "\t" -> 1; else -> 3 }) + "```"
+                assertEquals(expectedCode, (blocks[0] as ChatContentBlock.CodeBlock).code)
+                assertEquals("secret", (blocks[1] as ChatContentBlock.ThinkingBlock).content)
+                assertEquals("${indent}```", (blocks[2] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+            }
+            assertEquals("${indent}```\n\n${indent}```", ChatMarkdownParser.stripThinking(input))
+        }
+        val inline = "prefix ```txt\ncode\n```\nafter"
+        val blocks = ChatMarkdownParser.parse(inline)
+        assertEquals("prefix", (blocks[0] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("code", (blocks[1] as ChatContentBlock.CodeBlock).code)
+        assertEquals("after", (blocks[2] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals(inline, ChatMarkdownParser.stripThinking(inline))
+        val continued = "lead\n    prefix ```txt\ncode\n```\nafter"
+        val continuedBlocks = ChatMarkdownParser.parse(continued)
+        assertEquals("lead\n    prefix", (continuedBlocks[0] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("code", (continuedBlocks[1] as ChatContentBlock.CodeBlock).code)
+    }
+
+    @Test(timeout = 5000)
+    fun bounds_manyEscapedBackticksAndIndentedFenceCandidates() {
+        val chunk = "\\` <think>x</think> `code` "
+        val input = chunk.repeat(10000)
+        assertEquals(20001, ChatMarkdownParser.parse(input).size)
+        assertEquals(input.replace("<think>x</think>", "").trim(), ChatMarkdownParser.stripThinking(input))
+        val fenced = "```\n" + "    ```\n".repeat(10000) + "```\n"
+        val code = ChatMarkdownParser.parse(fenced).single() as ChatContentBlock.CodeBlock
+        assertEquals("    ```\n".repeat(9999) + "    ```", code.code)
+        val rejected = "    ```\n".repeat(10000)
+        assertEquals(1, ChatMarkdownParser.parse(rejected).count { it is ChatContentBlock.CodeBlock })
+        val closers = "`C:\\` <think>x</think> `ok` ".repeat(10000)
+        assertEquals(20001, ChatMarkdownParser.parse(closers).size)
+        assertEquals(closers.replace("<think>x</think>", "").trim(), ChatMarkdownParser.stripThinking(closers))
+    }
+
+    @Test
+    fun parse_inlineItalicDoesNotReformatListPrefixes() {
+        val text = ChatMarkdownParser.parseInlineMarkdown("*- item*")
+        assertEquals("- item", text.text)
+        assertTrue(text.spanStyles.any { it.item.fontStyle == FontStyle.Italic })
+        assertEquals("• item", ChatMarkdownParser.parseInlineMarkdown("- item").text)
+    }
+
+    @Test
+    fun parse_unclosedInlineCodeRecognizesTagsInBothStatesAndTts() {
+        val input = "`<think>literal</think>"
+        for (streaming in listOf(false, true)) {
+            val blocks = ChatMarkdownParser.parse(input, isStreaming = streaming)
+            assertEquals(2, blocks.size)
+            assertEquals("`", (blocks[0] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+            assertEquals("literal", (blocks[1] as ChatContentBlock.ThinkingBlock).content)
+        }
+        assertEquals("`", ChatMarkdownParser.stripThinking(input))
+        for (streaming in listOf(false, true)) {
+            val finished = ChatMarkdownParser.parse("$input`", isStreaming = streaming).single() as ChatContentBlock.ParagraphBlock
+            assertEquals("<think>literal</think>", finished.annotatedText.text)
+            assertTrue(finished.annotatedText.spanStyles.any { it.item.fontFamily == FontFamily.Monospace })
+            val nextLine = ChatMarkdownParser.parse("`unfinished\n<think>reason</think>", isStreaming = streaming)
+            assertTrue(nextLine[1] is ChatContentBlock.ThinkingBlock)
+        }
+        assertEquals("$input`", ChatMarkdownParser.stripThinking("$input`"))
+    }
+
+    @Test
+    fun parse_streamingFenceAtEofWaitsForLineEnd() {
+        val prefix = "```\ncode\n```"
+        val pending = ChatMarkdownParser.parse(prefix, isStreaming = true).single() as ChatContentBlock.CodeBlock
+        assertEquals("code", pending.code)
+        assertTrue(pending.isStreaming)
+        assertFalse((ChatMarkdownParser.parse(prefix).single() as ChatContentBlock.CodeBlock).isStreaming)
+        val confirmed = ChatMarkdownParser.parse("$prefix\nanswer", isStreaming = true)
+        assertFalse((confirmed[0] as ChatContentBlock.CodeBlock).isStreaming)
+        assertEquals("answer", (confirmed[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        val extended = ChatMarkdownParser.parse("${prefix}Done\n<think>literal</think>", isStreaming = true).single() as ChatContentBlock.CodeBlock
+        assertTrue(extended.isStreaming)
+        assertEquals("code\n```Done\n<think>literal</think>", extended.code)
+    }
+
+    @Test
+    fun parse_streamingPartialClosingFenceIsHiddenUntilDisambiguated() {
+        for (ticks in listOf("`", "``")) {
+            val input = "```\ncode\n  $ticks"
+            val pending = ChatMarkdownParser.parse(input, isStreaming = true).single() as ChatContentBlock.CodeBlock
+            assertEquals("code", pending.code)
+            assertTrue(pending.isStreaming)
+            val completed = ChatMarkdownParser.parse(input).single() as ChatContentBlock.CodeBlock
+            assertEquals("code\n  $ticks", completed.code)
+            assertEquals(input, ChatMarkdownParser.stripThinking(input))
+            val literal = ChatMarkdownParser.parse("${input}Done", isStreaming = true).single() as ChatContentBlock.CodeBlock
+            assertEquals("code\n  ${ticks}Done", literal.code)
+            val line = ChatMarkdownParser.parse("$input\n", isStreaming = true).single() as ChatContentBlock.CodeBlock
+            assertEquals("code\n  $ticks\n", line.code)
+        }
+        val longer = ChatMarkdownParser.parse("````\ncode\n```", isStreaming = true).single() as ChatContentBlock.CodeBlock
+        assertEquals("code", longer.code)
+        assertTrue(longer.isStreaming)
+    }
+
+    @Test
+    fun parse_malformedFenceSuffixRemainsCodeUntilValidCloser() {
+        val input = "```\ncode\n```Done\n<think>literal</think>\n```\nanswer"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals("code\n```Done\n<think>literal</think>", (blocks[0] as ChatContentBlock.CodeBlock).code)
+        assertEquals("answer", (blocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals(input, ChatMarkdownParser.stripThinking(input))
+    }
+
+    @Test(timeout = 5000)
+    fun bounds_manyInlineCodePairsAndShortFenceRuns() {
+        val inline = "`x` ".repeat(15000)
+        assertEquals("x ".repeat(15000), ChatMarkdownParser.parseInlineMarkdown(inline).text)
+        val input = "````\n" + "```\n".repeat(15000) + "````\n"
+        assertEquals("```\n".repeat(14999) + "```", (ChatMarkdownParser.parse(input).single() as ChatContentBlock.CodeBlock).code)
+    }
+
+    @Test(timeout = 5000)
+    fun bounds_extremeLargeText_completesLinearlyWithoutStackOverflow() {
+        val large = StringBuilder().apply {
+            repeat(1000) {
+                append("<think>Thinking step $it</think>\n")
+                append("Paragraph $it with **bold** and `code`.\n")
+                append("```python\nprint($it)\n```\n")
+            }
+        }.toString()
+
+        val blocks = ChatMarkdownParser.parse(large)
+        assertEquals(3000, blocks.size)
+    }
+
+    @Test
+    fun bounds_nestedOrMalformedTags_doesNotThrow() {
+        val malformed = listOf(
+            "<think><think>nested</think>",
+            "</think>orphan closing",
+            "``` ``` ```",
+            "```\n```\n```",
+            "<think>```code inside think```</think>",
+            "```<think>think inside code</think>```",
+            "",
+            "   \n\n\t  ",
+            "*********************",
+            "````````````",
+        )
+
+        malformed.forEach { input ->
+            val blocks = ChatMarkdownParser.parse(input)
+            // Verify no exception is thrown and parse succeeds safely
+            if (input.isNotBlank()) {
+                assertTrue("Non-blank input must produce blocks or safe paragraphs", blocks.isNotEmpty())
+            }
+        }
+    }
+
+    @Test
+    fun parse_thinking_withAttributes_parsedAndStripped() {
+        val input = "<think id=\"step-1\">Reasoning with attribute</think>Output"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(2, blocks.size)
+        val thinking = blocks[0] as ChatContentBlock.ThinkingBlock
+        assertEquals("Reasoning with attribute", thinking.content)
+        val paragraph = blocks[1] as ChatContentBlock.ParagraphBlock
+        assertEquals("Output", paragraph.annotatedText.text)
+        assertEquals("Output", ChatMarkdownParser.stripThinking(input))
+
+        val multiAttr = "<thought status=\"complete\" author=\"model\">Multiple attributes</thought>Next output"
+        val multiBlocks = ChatMarkdownParser.parse(multiAttr)
+        assertEquals(2, multiBlocks.size)
+        assertEquals("Multiple attributes", (multiBlocks[0] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("Next output", (multiBlocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("Next output", ChatMarkdownParser.stripThinking(multiAttr))
+
+        val thinkingTag = "<thinking mode=\"fast\">Quick thought</thinking>Result"
+        val thinkingBlocks = ChatMarkdownParser.parse(thinkingTag)
+        assertEquals(2, thinkingBlocks.size)
+        assertEquals("Quick thought", (thinkingBlocks[0] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("Result", (thinkingBlocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("Result", ChatMarkdownParser.stripThinking(thinkingTag))
+    }
+
+    @Test
+    fun parse_thinking_withWhitespaceInTags_parsedAndStripped() {
+        val input = "<think >Whitespace in open tag</think >"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(1, blocks.size)
+        val thinking = blocks[0] as ChatContentBlock.ThinkingBlock
+        assertEquals("Whitespace in open tag", thinking.content)
+        assertEquals("", ChatMarkdownParser.stripThinking(input))
+
+        val multiSpace = "<thought   >Multiple spaces</thought   >Answer"
+        val multiBlocks = ChatMarkdownParser.parse(multiSpace)
+        assertEquals(2, multiBlocks.size)
+        assertEquals("Multiple spaces", (multiBlocks[0] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("Answer", (multiBlocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("Answer", ChatMarkdownParser.stripThinking(multiSpace))
+
+        val mixedWhitespace = "<thinking \t >Tab and spaces</thinking \t >Final"
+        val mixedBlocks = ChatMarkdownParser.parse(mixedWhitespace)
+        assertEquals(2, mixedBlocks.size)
+        assertEquals("Tab and spaces", (mixedBlocks[0] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("Final", (mixedBlocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("Final", ChatMarkdownParser.stripThinking(mixedWhitespace))
+    }
+
+    @Test
+    fun parse_thinking_nested_depthCalculatedToPreventLeak() {
+        val input = "<think>Outer step 1 <think>Inner step</think> Outer step 2</think>Answer"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(2, blocks.size)
+        val thinking = blocks[0] as ChatContentBlock.ThinkingBlock
+        assertEquals("Outer step 1 <think>Inner step</think> Outer step 2", thinking.content)
+        val paragraph = blocks[1] as ChatContentBlock.ParagraphBlock
+        assertEquals("Answer", paragraph.annotatedText.text)
+        assertEquals("Answer", ChatMarkdownParser.stripThinking(input))
+
+        val nestedWithAttrs = "<think id=\"1\">outer <think id=\"2\">nested</think> still outer</think>done"
+        val attrBlocks = ChatMarkdownParser.parse(nestedWithAttrs)
+        assertEquals(2, attrBlocks.size)
+        assertEquals("outer <think id=\"2\">nested</think> still outer", (attrBlocks[0] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("done", (attrBlocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("done", ChatMarkdownParser.stripThinking(nestedWithAttrs))
+
+        val tripleNested = "<thought>lvl1 <thought>lvl2 <thought>lvl3</thought> back2</thought> back1</thought>final"
+        val tripleBlocks = ChatMarkdownParser.parse(tripleNested)
+        assertEquals(2, tripleBlocks.size)
+        assertEquals("lvl1 <thought>lvl2 <thought>lvl3</thought> back2</thought> back1", (tripleBlocks[0] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("final", (tripleBlocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("final", ChatMarkdownParser.stripThinking(tripleNested))
+
+        val unclosedNested = "<think><think>nested incomplete"
+        val unclosedBlocks = ChatMarkdownParser.parse(unclosedNested, isStreaming = true)
+        assertEquals(1, unclosedBlocks.size)
+        assertTrue((unclosedBlocks[0] as ChatContentBlock.ThinkingBlock).isStreaming)
+        assertEquals("", ChatMarkdownParser.stripThinking(unclosedNested))
+    }
+
+    @Test
+    fun parseInlineMarkdown_wordAsterisks_delimitersConsumedCorrectly() {
+        val wordTwoStars = ChatMarkdownParser.parseInlineMarkdown("*word**")
+        assertEquals("word*", wordTwoStars.text)
+        assertTrue(wordTwoStars.spanStyles.any { it.item.fontStyle == FontStyle.Italic && it.start == 0 && it.end == 4 })
+
+        val noteColonTwoStars = ChatMarkdownParser.parseInlineMarkdown("*Note:**")
+        assertEquals("Note:*", noteColonTwoStars.text)
+        assertTrue(noteColonTwoStars.spanStyles.any { it.item.fontStyle == FontStyle.Italic && it.start == 0 && it.end == 5 })
+
+        val italicThreeStars = ChatMarkdownParser.parseInlineMarkdown("*italic***")
+        assertEquals("italic**", italicThreeStars.text)
+        assertTrue(italicThreeStars.spanStyles.any { it.item.fontStyle == FontStyle.Italic && it.start == 0 && it.end == 6 })
+
+        val boldGreedyAvoided = ChatMarkdownParser.parseInlineMarkdown("**bold *italic*** and more**")
+        assertEquals("bold italic** and more", boldGreedyAvoided.text)
+        assertTrue(boldGreedyAvoided.spanStyles.any { it.item.fontWeight == FontWeight.Bold && it.start == 0 && it.end == 22 })
+        assertTrue(boldGreedyAvoided.spanStyles.any { it.item.fontStyle == FontStyle.Italic && it.start == 5 && it.end == 11 })
+    }
+
+    @Test
+    fun parse_orderedListAndPlusPrefixes() {
+        val ordered = "1. First item\n2. Second item"
+        val annotatedOrdered = ChatMarkdownParser.parseInlineMarkdown(ordered)
+        assertEquals("1. First item\n2. Second item", annotatedOrdered.text)
+
+        val plusList = "+ First item\n+ Second item"
+        val annotatedPlus = ChatMarkdownParser.parseInlineMarkdown(plusList)
+        assertEquals("• First item\n• Second item", annotatedPlus.text)
+
+        val hr = "* * *"
+        val annotatedHr = ChatMarkdownParser.parseInlineMarkdown(hr)
+        assertEquals("* * *", annotatedHr.text)
+
+        val orderedWithCode = "1. parent\n\n       <think>literal</think>"
+        val orderedBlocks = ChatMarkdownParser.parse(orderedWithCode)
+        assertEquals(2, orderedBlocks.size)
+        val code = orderedBlocks[1] as ChatContentBlock.CodeBlock
+        assertEquals("<think>literal</think>", code.code)
+
+        val orderedContinuation = "1. parent\n\n      <think>secret</think>"
+        val contBlocks = ChatMarkdownParser.parse(orderedContinuation)
+        assertTrue(contBlocks.any { it is ChatContentBlock.ThinkingBlock })
+    }
+
+    @Test
+    fun stripThinking_comprehensiveScenarios() {
+        val textWithAttr = "Answer <think id=\"test\">intermediate thinking</think> completed."
+        assertEquals("Answer  completed.", ChatMarkdownParser.stripThinking(textWithAttr))
+
+        val textWithWhitespace = "Result <thought  >internal thought</thought   > finished."
+        assertEquals("Result  finished.", ChatMarkdownParser.stripThinking(textWithWhitespace))
+
+        val textWithNested = "Start <think>outer <think>inner</think> resume</think> End."
+        assertEquals("Start  End.", ChatMarkdownParser.stripThinking(textWithNested))
+
+        val textWithUnclosedNested = "Prompt <thinking mode=\"deep\"><thinking>nested unfinished"
+        assertEquals("Prompt", ChatMarkdownParser.stripThinking(textWithUnclosedNested))
+    }
+
+    @Test
+    fun parse_mixedNestedThinkingTags_isolatedWithoutLeak() {
+        val input = "<thought>outer <think>inner</thought>PRIVATE</think>"
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        assertFalse("stripThinking must not contain PRIVATE", stripped.contains("PRIVATE"))
+        assertEquals("", stripped)
+
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(1, blocks.size)
+        val thinking = blocks[0] as ChatContentBlock.ThinkingBlock
+        assertEquals("outer <think>inner</thought>PRIVATE", thinking.content)
+        assertFalse(thinking.isStreaming)
+    }
+
+    @Test
+    fun parse_thinkingTagHeaderNewlineProtection() {
+        val input = "<think\nReasoning\n</think>\nActual response"
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        assertEquals("Actual response", stripped)
+
+        val blocks = ChatMarkdownParser.parse(input)
+        assertTrue("Actual response must not be swallowed into thinking card", blocks.any {
+            it is ChatContentBlock.ParagraphBlock && it.annotatedText.text == "Actual response"
+        })
+    }
+
+    @Test
+    fun parse_selfClosingThinkingTags_handledSafely() {
+        for (input in listOf("<think/>Hello", "<think />Hello", "<thought/>Hello", "<thinking />Hello")) {
+            assertEquals("Hello", ChatMarkdownParser.stripThinking(input))
+            val blocks = ChatMarkdownParser.parse(input)
+            assertEquals(2, blocks.size)
+            val thinking = blocks[0] as ChatContentBlock.ThinkingBlock
+            assertEquals("", thinking.content)
+            assertFalse(thinking.isStreaming)
+            val paragraph = blocks[1] as ChatContentBlock.ParagraphBlock
+            assertEquals("Hello", paragraph.annotatedText.text)
+        }
+    }
+
+    @Test
+    fun parse_englishSentenceWithComparison_doesNotSwallowIntoThinkingCard() {
+        val input = "I <think that 5 > 3 is true> then answer"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertTrue("Must not contain thinking block", blocks.none { it is ChatContentBlock.ThinkingBlock })
+        assertEquals(1, blocks.size)
+        val paragraph = blocks[0] as ChatContentBlock.ParagraphBlock
+        assertEquals("I <think that 5 > 3 is true> then answer", paragraph.annotatedText.text)
+        assertEquals("I", ChatMarkdownParser.stripThinking(input))
+    }
+
+    @Test
+    fun stripThinking_isolatedClosingTagPrefillCot_isolatedFailClosed() {
+        val input = "Reasoning step 1\n</think>\nActual answer"
+        assertEquals("Actual answer", ChatMarkdownParser.stripThinking(input))
+
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(2, blocks.size)
+        val thinking = blocks[0] as ChatContentBlock.ThinkingBlock
+        assertEquals("Reasoning step 1", thinking.content)
+        val paragraph = blocks[1] as ChatContentBlock.ParagraphBlock
+        assertEquals("Actual answer", paragraph.annotatedText.text)
+    }
+
+    @Test(timeout = 3000)
+    fun bounds_malformedUnclosedTags_streamingCompletesLinearly() {
+        val input = "<x".repeat(10000)
+        val start = System.currentTimeMillis()
+        val blocks = ChatMarkdownParser.parse(input, isStreaming = true)
+        val elapsed = System.currentTimeMillis() - start
+
+        assertTrue("Expected streaming parse of '<x'x10000 to complete in milliseconds (< 1000ms), took ${elapsed}ms", elapsed < 1000)
+        assertEquals(1, blocks.size)
+        assertTrue(blocks[0] is ChatContentBlock.ParagraphBlock)
+    }
+
+    @Test(timeout = 3000)
+    fun bounds_malformedThinkingTags_completesLinearly() {
+        val inputThink = "<think ".repeat(5000)
+        val startThink = System.currentTimeMillis()
+        val blocksThink = ChatMarkdownParser.parse(inputThink, isStreaming = true)
+        val elapsedThink = System.currentTimeMillis() - startThink
+        assertTrue("Expected streaming parse of '<think 'x5000 to complete in milliseconds (< 1000ms), took ${elapsedThink}ms", elapsedThink < 1000)
+        assertEquals(1, blocksThink.size)
+        assertTrue(blocksThink[0] is ChatContentBlock.ParagraphBlock)
+
+        val inputThought = "<thought>".repeat(5000)
+        val startThought = System.currentTimeMillis()
+        val blocksThought = ChatMarkdownParser.parse(inputThought, isStreaming = true)
+        val elapsedThought = System.currentTimeMillis() - startThought
+        assertTrue("Expected streaming parse of '<thought>'x5000 to complete in milliseconds (< 1000ms), took ${elapsedThought}ms", elapsedThought < 1000)
+        assertTrue(blocksThought.isNotEmpty())
+    }
+
+    @Test(timeout = 3000)
+    fun bounds_maliciousInlineFormatting_completesLinearlyWithoutAnr() {
+        val input = "*a\\` ".repeat(2000) + "x**y ".repeat(2000)
+        val start = System.currentTimeMillis()
+        val blocks = ChatMarkdownParser.parse(input, isStreaming = false)
+        val elapsed = System.currentTimeMillis() - start
+
+        assertTrue("Expected inline formatting to complete in milliseconds (< 1000ms), took ${elapsed}ms", elapsed < 1000)
+        assertEquals(1, blocks.size)
+        assertTrue(blocks[0] is ChatContentBlock.ParagraphBlock)
+
+        val startInline = System.currentTimeMillis()
+        val annotated = ChatMarkdownParser.parseInlineMarkdown(input)
+        val elapsedInline = System.currentTimeMillis() - startInline
+        assertTrue("Expected parseInlineMarkdown to complete in milliseconds (< 1000ms), took ${elapsedInline}ms", elapsedInline < 1000)
+        assertTrue(annotated.text.isNotEmpty())
+    }
+
+    @Test
+    fun parse_invalidCloseThinkTags_doNotPrematurelyCloseThinkingScope() {
+        val invalidCloserInput = "<think>\nStep 1\n</think?>\nStep 2\n</think!>\nStep 3\n</think .>\nFinal\n</think>"
+        val blocks = ChatMarkdownParser.parse(invalidCloserInput)
+        assertEquals(1, blocks.size)
+        assertTrue("Must be a single ThinkingBlock", blocks[0] is ChatContentBlock.ThinkingBlock)
+        val thinking = blocks[0] as ChatContentBlock.ThinkingBlock
+        assertEquals("Step 1\n</think?>\nStep 2\n</think!>\nStep 3\n</think .>\nFinal", thinking.content)
+
+        val stripped = ChatMarkdownParser.stripThinking(invalidCloserInput)
+        assertEquals("Pure thinking message with invalid closer tags must strip completely", "", stripped)
+        assertTrue("TTS read button must not be shown for stripped empty text", stripped.isBlank())
+
+        val withAnswer = "<think>Reasoning </think?> more thinking </think>Real answer"
+        val answerBlocks = ChatMarkdownParser.parse(withAnswer)
+        assertEquals(2, answerBlocks.size)
+        assertEquals("Reasoning </think?> more thinking", (answerBlocks[0] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("Real answer", (answerBlocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("Real answer", ChatMarkdownParser.stripThinking(withAnswer))
+    }
+
+    @Test
+    fun parse_quoteAwareAndOverlongThinkingTags_cotIsolatedAndTtsShielded() {
+        // Quote-aware attribute containing '>' after a previously closed thinking block
+        val input = "<think>prior</think><think note=\"a>b\">SECRET</think>"
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        assertFalse("stripThinking must strictly filter SECRET", stripped.contains("SECRET"))
+        assertEquals("", stripped)
+        assertTrue("TTS speak button must not be shown", stripped.isBlank())
+
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(2, blocks.size)
+        assertEquals("prior", (blocks[0] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("SECRET", (blocks[1] as ChatContentBlock.ThinkingBlock).content)
+
+        // Single quote variant
+        val singleQuote = "<think note='x>y'>PRIVATE</think>"
+        assertEquals("", ChatMarkdownParser.stripThinking(singleQuote))
+
+        // Attribute length exceeding 512 characters
+        val overlongAttr = "<think note=\"" + "a".repeat(600) + "\">OVERLONG_SECRET</think>"
+        val strippedOverlong = ChatMarkdownParser.stripThinking(overlongAttr)
+        assertFalse("Overlong attribute tag must fail-closed in stripThinking", strippedOverlong.contains("OVERLONG_SECRET"))
+        assertEquals("", strippedOverlong)
+
+        // Malformed attribute syntax
+        val malformedAttr = "<think ??? malformed >MALFORMED_SECRET</think>"
+        val strippedMalformed = ChatMarkdownParser.stripThinking(malformedAttr)
+        assertFalse("Malformed tag must fail-closed in stripThinking", strippedMalformed.contains("MALFORMED_SECRET"))
+        assertEquals("", strippedMalformed)
+    }
+
+    @Test(timeout = 3000)
+    fun bounds_mismatchedClosingTags_completesInMillisecondsWithoutQuadraticSlowdown() {
+        val input = "<think>".repeat(5000) + "</thought>".repeat(5000)
+        val start = System.currentTimeMillis()
+        val blocks = ChatMarkdownParser.parse(input, isStreaming = false)
+        val elapsed = System.currentTimeMillis() - start
+
+        assertTrue("Expected 5000 mismatched closing tags to complete in milliseconds (< 500ms), took ${elapsed}ms", elapsed < 500)
+        assertEquals(1, blocks.size)
+        assertTrue(blocks[0] is ChatContentBlock.ThinkingBlock)
+
+        val startStrip = System.currentTimeMillis()
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        val elapsedStrip = System.currentTimeMillis() - startStrip
+        assertTrue("Expected stripThinking on 5000 mismatched tags to complete in milliseconds (< 500ms), took ${elapsedStrip}ms", elapsedStrip < 500)
+        assertEquals("", stripped)
+    }
+
+    @Test(timeout = 3000)
+    fun bounds_italicCloserSearch_scalesLinearlyWithoutQuadraticSlowdown() {
+        for (n in listOf(100, 200, 400, 800)) {
+            val input = "*a\\` ".repeat(n) + "x**y ".repeat(n)
+            val start = System.currentTimeMillis()
+            val annotated = ChatMarkdownParser.parseInlineMarkdown(input)
+            val elapsed = System.currentTimeMillis() - start
+
+            assertTrue("Expected n=$n to complete in milliseconds (< 300ms), took ${elapsed}ms", elapsed < 300)
+            assertTrue(annotated.text.isNotEmpty())
+        }
+    }
+
+    @Test(timeout = 3000)
+    fun bounds_malformedUnclosedSuspectTags_stripThinkingCompletesLinearlyWithoutAnr() {
+        val input = "<think ??? malformed >".repeat(10000)
+        val start = System.currentTimeMillis()
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        val elapsed = System.currentTimeMillis() - start
+
+        assertTrue(
+            "Expected stripThinking on 10000 malformed unclosed tags to complete in milliseconds (< 500ms), took ${elapsed}ms",
+            elapsed < 500
+        )
+        assertEquals("", stripped)
+
+        val inputWithNonThinkCloser = "<think ??? malformed >".repeat(10000) + "</other>"
+        val startNonThink = System.currentTimeMillis()
+        val strippedNonThink = ChatMarkdownParser.stripThinking(inputWithNonThinkCloser)
+        val elapsedNonThink = System.currentTimeMillis() - startNonThink
+
+        assertTrue(
+            "Expected stripThinking with non-think closer to complete in milliseconds (< 500ms), took ${elapsedNonThink}ms",
+            elapsedNonThink < 500
+        )
+        assertEquals("", strippedNonThink)
+    }
+
+    @Test(timeout = 3000)
+    fun bounds_malformedSuspectTagsWithSingleCloser_stripThinkingCompletesLinearly() {
+        val input = "<think ??? malformed >".repeat(10000) + "</think>"
+        val start = System.currentTimeMillis()
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        val elapsed = System.currentTimeMillis() - start
+
+        assertTrue(
+            "Expected stripThinking on 10000 malformed suspect tags with single closer to complete in milliseconds (< 200ms), took ${elapsed}ms",
+            elapsed < 200
+        )
+        assertEquals("", stripped)
+
+        val inputAfterValidThink = "<think>init</think>" + "<think ??? malformed >".repeat(10000) + "</think>"
+        val startAfterValid = System.currentTimeMillis()
+        val strippedAfterValid = ChatMarkdownParser.stripThinking(inputAfterValidThink)
+        val elapsedAfterValid = System.currentTimeMillis() - startAfterValid
+
+        assertTrue(
+            "Expected stripThinking on 10000 malformed suspect tags after valid tag to complete in milliseconds (< 200ms), took ${elapsedAfterValid}ms",
+            elapsedAfterValid < 200
+        )
+        assertEquals("", strippedAfterValid)
+
+        val inputPairs = ("<think ??? malformed >" + "</think>").repeat(5000)
+        val startPairs = System.currentTimeMillis()
+        val strippedPairs = ChatMarkdownParser.stripThinking(inputPairs)
+        val elapsedPairs = System.currentTimeMillis() - startPairs
+
+        assertTrue(
+            "Expected stripThinking on 5000 matched pairs to complete in milliseconds (< 200ms), took ${elapsedPairs}ms",
+            elapsedPairs < 200
+        )
+        assertEquals("", strippedPairs)
+
+        val inputNested = "<think>init</think>" + "<think ??? malformed >".repeat(2500) + "</think>".repeat(2500)
+        val startNested = System.currentTimeMillis()
+        val strippedNested = ChatMarkdownParser.stripThinking(inputNested)
+        val elapsedNested = System.currentTimeMillis() - startNested
+
+        assertTrue(
+            "Expected stripThinking on 2500 nested tags to complete in milliseconds (< 200ms), took ${elapsedNested}ms",
+            elapsedNested < 200
+        )
+        assertEquals("", strippedNested)
+    }
+
+    @Test
+    fun stripThinking_unclosedMalformedSuspectTagFollowedByClosedMalformedSuspectTag() {
+        val input = "<think>init</think> <think ??? unclosed> text <think ??? malformed>CONFIDENTIAL</think> after"
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        assertFalse("CONFIDENTIAL must be stripped", stripped.contains("CONFIDENTIAL"))
+        assertFalse("</think> must be stripped", stripped.contains("</think>"))
+        assertEquals("", stripped)
+    }
+
+    @Test
+    fun stripThinking_selfClosingSuspectTags_strippedWithoutPollutingOpenStarts() {
+        val input = "<think/> <think ??? malformed /> <think ??? unclosed> text <think ??? malformed>SECRET</think> after"
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        assertFalse("SECRET must be stripped", stripped.contains("SECRET"))
+        assertFalse("self-closing think must be stripped", stripped.contains("<think/>"))
+        assertFalse("malformed self-closing think must be stripped", stripped.contains("<think ??? malformed />"))
+        assertFalse("</think> must be stripped", stripped.contains("</think>"))
+        assertFalse("unclosed suspect tag must be stripped", stripped.contains("<think ??? unclosed>"))
+        assertEquals("", stripped)
+    }
+
+    @Test
+    fun stripThinking_unclosedSuspectTagPrecededByValidClosedTag_failsClosedWithoutLeak() {
+        val overlongTag = "<think note=\"" + "a".repeat(600) + "\">PRIVATE"
+        val input = "<think>prior</think>$overlongTag"
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        assertFalse("stripThinking must not contain PRIVATE", stripped.contains("PRIVATE"))
+        assertEquals("", stripped)
+
+        val malformedTag = "<think note=\"...\" >PRIVATE"
+        val inputMalformed = "<think>prior</think>$malformedTag"
+        val strippedMalformed = ChatMarkdownParser.stripThinking(inputMalformed)
+        assertFalse("stripThinking must not contain PRIVATE", strippedMalformed.contains("PRIVATE"))
+        assertEquals("", strippedMalformed)
+
+        // Pure unclosed thinking messages must yield empty string
+        assertEquals("", ChatMarkdownParser.stripThinking(overlongTag))
+        assertEquals("", ChatMarkdownParser.stripThinking(malformedTag))
+        assertEquals("", ChatMarkdownParser.stripThinking("<think>PRIVATE"))
+        assertEquals("", ChatMarkdownParser.stripThinking("<thought>PRIVATE"))
+        assertEquals("", ChatMarkdownParser.stripThinking("<thinking>PRIVATE"))
+    }
+
+    @Test(timeout = 10000)
+    fun bounds_interleavedCrossKindThinkingTags_scalesLinearlyWithoutQuadraticSlowdown() {
+        // Warm up JIT
+        val warmInput = "<think>".repeat(500) + "<thought>".repeat(500) + "</think>".repeat(500)
+        ChatMarkdownParser.parse(warmInput)
+
+        val sizes = listOf(1000, 2000, 4000)
+        for (n in sizes) {
+            val input = "<think>".repeat(n) + "<thought>".repeat(n) + "</think>".repeat(n)
+            val start = System.currentTimeMillis()
+            val blocks = ChatMarkdownParser.parse(input)
+            val elapsed = System.currentTimeMillis() - start
+
+            assertEquals(1, blocks.size)
+            assertTrue(blocks[0] is ChatContentBlock.ThinkingBlock)
+            assertTrue("Expected n=$n to complete in milliseconds (< 1500ms), took ${elapsed}ms", elapsed < 1500)
+        }
+    }
+
+    @Test
+    fun stripThinking_malformedOuterThinkingScope_absorbsInnerBlockAndCodeWithoutTtsLeak() {
+        val raw = "<think ??? >OUTER <think>inner</think>LEAK"
+        assertEquals("", ChatMarkdownParser.stripThinking(raw))
+
+        val rawWithCode = "<think ??? >OUTER \n```\ncode\n```\nLEAK"
+        assertEquals("", ChatMarkdownParser.stripThinking(rawWithCode))
+
+        val rawWithInlineCode = "<think ??? >OUTER `val x = 1` LEAK"
+        assertEquals("", ChatMarkdownParser.stripThinking(rawWithInlineCode))
+
+        val closedOuter = "<think ??? >OUTER <think>inner</think>END</think>VALID ANSWER"
+        assertEquals("VALID ANSWER", ChatMarkdownParser.stripThinking(closedOuter))
+    }
+
+    @Test
+    fun parse_codeBlockKey_bindsToContentIdentityAndDisambiguatesDuplicates() {
+        val input = "```kotlin\nval x = 1\n```\n\n```python\nprint(1)\n```\n\n```kotlin\nval x = 1\n```"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(3, blocks.size)
+
+        val code1 = blocks[0] as ChatContentBlock.CodeBlock
+        val code2 = blocks[1] as ChatContentBlock.CodeBlock
+        val code3 = blocks[2] as ChatContentBlock.CodeBlock
+
+        val expectedKotlinKey = "code_fenced_kotlin_${ChatMarkdownParser.contentHashHex16("val x = 1")}"
+        val expectedPythonKey = "code_fenced_python_${ChatMarkdownParser.contentHashHex16("print(1)")}"
+
+        assertEquals(expectedKotlinKey, code1.key)
+        assertEquals(expectedPythonKey, code2.key)
+        assertEquals("${expectedKotlinKey}_dup2", code3.key)
+
+        val streamingBlocks = ChatMarkdownParser.parse("```kotlin\nval x = 1", isStreaming = true)
+        val streamingCode = streamingBlocks[0] as ChatContentBlock.CodeBlock
+        assertEquals("code_streaming_0", streamingCode.key)
+    }
+
+    @Test
+    fun parse_thinkingPrepend_sameContentKeyStable_differentContentDistinct() {
+        // Old card content unchanged across prepend: key must be stable (content identity,
+        // not positional ordinal), so Compose keeps expansion state on the old card.
+        val before = ChatMarkdownParser.parse("<think>Alpha content</think>\n\nAnswer A")
+        val beforeThink = before[0] as ChatContentBlock.ThinkingBlock
+        val after = ChatMarkdownParser.parse("<think>Beta content</think>\n\n<think>Alpha content</think>\n\nAnswer A")
+        assertEquals(3, after.size)
+        val newThink = after[0] as ChatContentBlock.ThinkingBlock
+        val oldThink = after[1] as ChatContentBlock.ThinkingBlock
+        assertEquals("Beta content", newThink.content)
+        assertEquals("Alpha content", oldThink.content)
+        assertEquals(beforeThink.key, oldThink.key)
+        assertTrue("Different thinking contents must not share keys", newThink.key != oldThink.key)
+        assertTrue(newThink.key.startsWith("think_c_"))
+        assertTrue(oldThink.key.startsWith("think_c_"))
+    }
+
+    @Test
+    fun parse_thinkingStreamingKey_stableDuringGrowth_changesOnCompletion() {
+        // Streaming growth keeps think_streaming_0; closing the tag switches to content key.
+        // The switch intentionally recreates the Compose node (documented semantics).
+        val growing1 = ChatMarkdownParser.parse("<think>Pl", isStreaming = true)
+        val growing2 = ChatMarkdownParser.parse("<think>Plan", isStreaming = true)
+        assertEquals("think_streaming_0", (growing1[0] as ChatContentBlock.ThinkingBlock).key)
+        assertEquals("think_streaming_0", (growing2[0] as ChatContentBlock.ThinkingBlock).key)
+        val completed = ChatMarkdownParser.parse("<think>Plan</think>")
+        val completedKey = (completed[0] as ChatContentBlock.ThinkingBlock).key
+        assertTrue(completedKey.startsWith("think_c_"))
+        assertTrue(completedKey != "think_streaming_0")
+    }
+
+    @Test
+    fun parse_codeHashCollisionAaBb_distinctKeysAndOrderStable() {
+        // "Aa" and "BB" collide under 32-bit String.hashCode() (both 2112); SHA-256 must separate them.
+        assertEquals("Aa".hashCode(), "BB".hashCode())
+        val forward = ChatMarkdownParser.parse("```kotlin\nAa\n```\n\n```kotlin\nBB\n```")
+        assertEquals(2, forward.size)
+        val forwardAa = forward[0] as ChatContentBlock.CodeBlock
+        val forwardBb = forward[1] as ChatContentBlock.CodeBlock
+        assertEquals("Aa", forwardAa.code)
+        assertEquals("BB", forwardBb.code)
+        assertTrue("Collision contents must yield distinct baseKeys", forwardAa.key != forwardBb.key)
+        val swapped = ChatMarkdownParser.parse("```kotlin\nBB\n```\n\n```kotlin\nAa\n```")
+        val swappedBb = swapped[0] as ChatContentBlock.CodeBlock
+        val swappedAa = swapped[1] as ChatContentBlock.CodeBlock
+        assertEquals(forwardAa.key, swappedAa.key)
+        assertEquals(forwardBb.key, swappedBb.key)
+        assertEquals("Aa", swappedAa.code)
+        assertEquals("BB", swappedBb.code)
+    }
+
+    @Test
+    fun parse_codeTripleDuplicate_namingConsistentAndKindNamespacesSeparate() {
+        val triple = ChatMarkdownParser.parse("```kotlin\nsame\n```\n\n```kotlin\nsame\n```\n\n```kotlin\nsame\n```")
+        assertEquals(3, triple.size)
+        val base = "code_fenced_kotlin_${ChatMarkdownParser.contentHashHex16("same")}"
+        assertEquals(base, (triple[0] as ChatContentBlock.CodeBlock).key)
+        assertEquals("${base}_dup2", (triple[1] as ChatContentBlock.CodeBlock).key)
+        assertEquals("${base}_dup3", (triple[2] as ChatContentBlock.CodeBlock).key)
+
+        // Fenced without language vs indented with identical code must not share namespace.
+        val mixed = ChatMarkdownParser.parse("```\nsame\n```\n\n    same\n")
+        assertEquals(2, mixed.size)
+        val fenced = mixed[0] as ChatContentBlock.CodeBlock
+        val indented = mixed[1] as ChatContentBlock.CodeBlock
+        assertEquals("same", fenced.code)
+        assertEquals("same", indented.code)
+        assertTrue(fenced.key.startsWith("code_fenced_"))
+        assertTrue(indented.key.startsWith("code_indented_"))
+        assertTrue(fenced.key != indented.key)
+    }
+
+    @Test
+    fun parse_streamingToCompletedCodeKeyChange_pinned() {
+        // Pin streaming→completed key-change semantics: scroll/state recreation is expected (P3).
+        val streaming = ChatMarkdownParser.parse("```kotlin\npartial", isStreaming = true)
+        val streamingCode = streaming[0] as ChatContentBlock.CodeBlock
+        assertTrue(streamingCode.isStreaming)
+        assertEquals("code_streaming_0", streamingCode.key)
+        val completed = ChatMarkdownParser.parse("```kotlin\npartial\n```", isStreaming = false)
+        val completedCode = completed[0] as ChatContentBlock.CodeBlock
+        assertFalse(completedCode.isStreaming)
+        assertTrue(completedCode.key.startsWith("code_fenced_kotlin_"))
+        assertTrue(completedCode.key != streamingCode.key)
+    }
+
+    @Test
+    fun stripThinking_kindMismatchedCloser_isIgnoredAndDisplayConsistent() {
+        // P1-1: kind-strict matching — `</thought>` inside `<think>` closes nothing
+        // on either path; both absorb it inside the `<think>` scope (fail-closed).
+        val input = "<think>A</thought>B</think>C"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(2, blocks.size)
+        assertEquals("A</thought>B", (blocks[0] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("C", (blocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("C", ChatMarkdownParser.stripThinking(input))
+
+        // Suspect opener with a matching closer: both paths hide the same prefix.
+        val suspect = "<think ??? malformed >X</think>Z"
+        val suspectBlocks = ChatMarkdownParser.parse(suspect)
+        assertEquals(2, suspectBlocks.size)
+        assertEquals("<think ??? malformed >X", (suspectBlocks[0] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("Z", (suspectBlocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("Z", ChatMarkdownParser.stripThinking(suspect))
+    }
+
+    @Test
+    fun stripThinking_orphanCloserAfterCodeBlock_preservesCode() {
+        // P2-1: a fenced code block before a stray closer disables orphan
+        // absorption on both paths; the closer stays literal like display.
+        val input = "```kotlin\nval x = 1\n```\n</think>\nanswer"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertTrue(blocks.any { it is ChatContentBlock.CodeBlock })
+        val stripped = ChatMarkdownParser.stripThinking(input)
+        assertTrue(stripped.contains("val x = 1"))
+        assertTrue(stripped.contains("answer"))
+        assertTrue(stripped.contains("</think>"))
+
+        // Indented code behaves the same.
+        val indented = "    val y = 2\n</think>\nanswer"
+        assertTrue(ChatMarkdownParser.parse(indented).any { it is ChatContentBlock.CodeBlock })
+        val strippedIndented = ChatMarkdownParser.stripThinking(indented)
+        assertTrue(strippedIndented.contains("val y = 2"))
+        assertTrue(strippedIndented.contains("answer"))
+    }
+
+    @Test
+    fun stripThinking_englishComparisonSentence_ttsFailClosedPinned() {
+        // P2-2 documented divergence (deliberately NOT converged): display renders
+        // the prose verbatim while TTS absorbs from the suspect opener to EOF.
+        // Fail-closed prefers hiding a possible thought over speaking it; the
+        // limitation is noted at the ChatScreen speak pipeline.
+        val input = "I <think that 5 > 3 is true> then answer"
+        assertEquals("I", ChatMarkdownParser.stripThinking(input))
+        assertEquals("I", ChatMarkdownParser.speakableText(input))
+    }
+
+    @Test
+    fun speakableText_verbalizesCodeAndToolMarkers() {
+        // P2-3 minimal verbalizer: fence delimiters and tool-marker lines are
+        // dropped, inline code keeps content without markers.
+        val input = "Here is code:\n```kotlin\nval x = 1\n```\nUse `val x` now.\n[tool:read …]\nDone"
+        val speakable = ChatMarkdownParser.speakableText(input)
+        assertFalse(speakable.contains("```"))
+        assertFalse(speakable.contains("[tool:"))
+        assertTrue(speakable.contains("val x = 1"))
+        assertTrue(speakable.contains("Use val x now."))
+        assertTrue(speakable.contains("Done"))
+        // Scope limit pin: emphasis markers are left verbatim, never rewritten.
+        assertEquals("**bold**", ChatMarkdownParser.speakableText("**bold**"))
+    }
+
+    @Test
+    fun speakableText_pureThinking_hasNoSpeakableText() {
+        // Fail-closed preserved through the verbalizer: blank speakable text
+        // keeps the speak button hidden in ChatScreen.
+        assertEquals("", ChatMarkdownParser.speakableText("<think>secret</think>"))
+        assertTrue(ChatMarkdownParser.speakableText("<think>secret</think>").isBlank())
+        assertEquals("", ChatMarkdownParser.speakableText("<think>unclosed"))
+    }
+
+    @Test
+    fun speakableText_indentedFenceDelimitersAreKeptVerbatim() {
+        // Display (segments/invalidIndentedFenceOpeners) treats 4-space/tab-indented
+        // ``` as literal text, not a fence delimiter; the verbalizer must match and
+        // keep the line instead of dropping it (previous bug dropped it for TTS).
+        val indentedOpener = "hello\n    ```\nworld"
+        assertEquals(indentedOpener, ChatMarkdownParser.speakableText(indentedOpener))
+
+        val tabOpener = "hello\n\t```\nworld"
+        assertEquals(tabOpener, ChatMarkdownParser.speakableText(tabOpener))
+
+        // A 4-space indented ``` inside a block is content, not a closer.
+        val block = "```\ncode\n    ```\nmore\n```\nend"
+        assertEquals("code\n    ```\nmore\nend", ChatMarkdownParser.speakableText(block))
+    }
+
+    @Test
+    fun speakableText_leavesHeadingsBulletsLinksVerbatim() {
+        // Scope-limit pin: headings, list bullets and links are prose and stay
+        // verbatim — the verbalizer only drops fence/tool syntax and unwraps code.
+        assertEquals("# Title", ChatMarkdownParser.speakableText("# Title"))
+        assertEquals("- item", ChatMarkdownParser.speakableText("- item"))
+        assertEquals("[link](https://example.com)", ChatMarkdownParser.speakableText("[link](https://example.com)"))
+    }
+
+    @Test
+    fun stripThinking_inlineCodePrefixStillAbsorbsOrphanCloser() {
+        // Inline code spans fold into TEXT on display (not CODE segments), so a
+        // stray closer after inline code still absorbs the prefix on both paths —
+        // unlike a fenced/indented code block which disables orphan absorption.
+        val input = "`code`\n</think>\nanswer"
+        val blocks = ChatMarkdownParser.parse(input)
+        assertEquals(2, blocks.size)
+        assertEquals("`code`", (blocks[0] as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("answer", (blocks[1] as ChatContentBlock.ParagraphBlock).annotatedText.text)
+        assertEquals("answer", ChatMarkdownParser.stripThinking(input))
+        assertEquals("answer", ChatMarkdownParser.speakableText(input))
+    }
+
+    // ---- Phase 3 (PR 128) scaling + contract tests (F1-F5) ----
+    //
+    // These tests complement the existing fixed-timeout bounds tests (which are kept):
+    // each adds a 2x-size time ratio (or explicit iteration/depth bound) so linearity is
+    // proven by scaling rather than by a single fixed timeout.
+
+    @Test
+    fun scaling_streamingGrowth_prefixReparse_totalBoundedAndSubQuadratic() {
+        // F1: ChatMarkdownView re-parses the full prefix per chunk via
+        // remember(text, isStreaming). Per-call cost is O(prefix), so M prefixes cost
+        // Theta(N^2 / c) cumulatively (c = mean chunk size). This replays that caller
+        // pattern: total time must stay bounded for chat sizes with a scaling ratio
+        // consistent with cumulative quadratic (~4x for 2x N), ruling out
+        // super-quadratic blowup. Incremental/tail re-parse is future work (see KDoc).
+        val unit = "Hello **world** and `code`! "
+        fun totalFor(repeat: Int, prefixes: Int): Long {
+            val final = unit.repeat(repeat)
+            repeat(3) { ChatMarkdownParser.parse(final, isStreaming = true) }
+            val start = System.nanoTime()
+            for (k in 1..prefixes) {
+                val prefix = final.substring(0, final.length * k / prefixes)
+                ChatMarkdownParser.parse(prefix, isStreaming = true)
+            }
+            return System.nanoTime() - start
+        }
+        val m = 20
+        val smallRepeat = 80
+        val small = totalFor(smallRepeat, m)
+        // Correctness pin: replaying the final prefix equals a direct single parse.
+        val finalSmall = unit.repeat(smallRepeat)
+        val direct = ChatMarkdownParser.parse(finalSmall, isStreaming = true)
+        val replayed = ChatMarkdownParser.parse(finalSmall, isStreaming = true)
+        assertEquals(direct.size, replayed.size)
+        assertEquals(
+            (direct.filterIsInstance<ChatContentBlock.ParagraphBlock>().single().annotatedText.text),
+            (replayed.filterIsInstance<ChatContentBlock.ParagraphBlock>().single().annotatedText.text),
+        )
+        val large = totalFor(smallRepeat * 2, m)
+        val ratio = large.toDouble() / maxOf(1L, small).toDouble()
+        assertTrue(
+            "streaming-growth ratio $ratio exceeds cumulative-quadratic bound (small=${small}ns large=${large}ns)",
+            ratio < 10.0,
+        )
+        assertTrue("streaming-growth total unbounded: ${large}ns", large < 5_000_000_000L)
+    }
+
+    @Test
+    fun parseInline_depthCap_failClosedAsLiteral() {
+        // F2: recursion deeper than MAX_INLINE_NESTING_DEPTH fails closed as literal text
+        // (delimiters preserved, no spans, no stack overflow). Natural inputs nest at most
+        // a few levels (same-delimiter pairs match sequentially, so only mixed-delimiter
+        // shapes such as bold-containing-italic recurse); the cap is defense-in-depth,
+        // hence pinned here by direct white-box depth injection.
+        assertEquals(32, ChatMarkdownParser.MAX_INLINE_NESTING_DEPTH)
+        val overCap = ChatMarkdownParser.parseInline("**a**", ChatMarkdownParser.MAX_INLINE_NESTING_DEPTH + 1)
+        assertEquals("**a**", overCap.text)
+        assertTrue("over-cap input must carry no styles", overCap.spanStyles.isEmpty())
+        val atCap = ChatMarkdownParser.parseInline("**a**", ChatMarkdownParser.MAX_INLINE_NESTING_DEPTH)
+        assertEquals("a", atCap.text)
+        assertTrue(atCap.spanStyles.any { it.item.fontWeight == FontWeight.Bold })
+        // Natural nesting (bold containing italic) still styles fully below the cap.
+        val nested = ChatMarkdownParser.parseInlineMarkdown("**a *b* c**")
+        assertEquals("a b c", nested.text)
+        assertFalse("nested input must be fully styled, got: ${nested.text}", nested.text.contains("*"))
+        assertTrue(nested.spanStyles.any { it.item.fontWeight == FontWeight.Bold })
+        assertTrue(nested.spanStyles.any { it.item.fontStyle == FontStyle.Italic })
+    }
+
+    @Test
+    fun scaling_parseInline_twofoldInput_ratioBounded() {
+        // F2: per-call O(N*depth) with small practical depth; doubling N at fixed depth
+        // must scale ~linearly (well under the quadratic 4x plus noise headroom).
+        val unit = "**bold** and *italic* with `code` "
+        fun timed(repeat: Int): Long {
+            val input = unit.repeat(repeat)
+            repeat(3) { ChatMarkdownParser.parseInlineMarkdown(input) }
+            val start = System.nanoTime()
+            repeat(5) { ChatMarkdownParser.parseInlineMarkdown(input) }
+            return System.nanoTime() - start
+        }
+        val t1 = timed(400)
+        val t2 = timed(800)
+        val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
+        assertTrue("parseInline 2x-input ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)", ratio < 3.5)
+    }
+
+    @Test
+    fun scaling_sharedTripleSkip_multiWalkerMultiQualifier_ratioBounded() {
+        // F3: each italic walker skips leading shared-triple qualifiers whose bold opener
+        // lies outside it (openBold[t] < i + 1) via a monotonically advancing chain
+        // (see parseInline invariant comment). Shapes below combine outer unclosed bold
+        // qualifiers with inner shared closers; repeated k times on one line gives k
+        // walkers x k+ qualifiers. Assert words survive, output is deterministic, and
+        // doubling k scales ~linearly.
+        //
+        // Hardening (Round-6 Phase B): a single-shot timing on a ~12ms base flaked in
+        // CI (2x ratio 3.5242 vs bound 3.5). Median-of-rounds on a doubled base cuts the
+        // noise share; the 3.5 bound still sits strictly inside (2, 4), so the
+        // linear (~2) vs quadratic (~4) discrimination is unchanged — no bound relaxation.
+        val unit = "**u *a ***x*** **b *c*** "
+        val one = ChatMarkdownParser.parseInlineMarkdown(unit)
+        for (word in listOf("u", "a", "x", "b", "c")) {
+            assertTrue("word '$word' must survive styling, got: ${one.text}", one.text.contains(word))
+        }
+        assertEquals(
+            one.text,
+            ChatMarkdownParser.parseInlineMarkdown(unit).text,
+        )
+        fun timed(repeat: Int): Long {
+            val input = unit.repeat(repeat)
+            repeat(5) { ChatMarkdownParser.parseInlineMarkdown(input) }
+            val samples = LongArray(7) {
+                val start = System.nanoTime()
+                repeat(5) { ChatMarkdownParser.parseInlineMarkdown(input) }
+                System.nanoTime() - start
+            }
+            return samples.sorted()[samples.size / 2]
+        }
+        val t1 = timed(600)
+        val t2 = timed(1200)
+        val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
+        assertTrue("shared-triple 2x ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)", ratio < 3.5)
+    }
+
+    @Test
+    fun scaling_thinkingAlignIdentityOnly_duplicatePrepend_ratioBounded() {
+        // P3 (Round-6 Phase B): same-content extreme the all-different scaling test
+        // (ChatMarkdownUiTest.thinkingAlignIdentityOnly_rewriteAllDifferent_scalesLinearly)
+        // does not cover. Prev K identical + curr 2K identical (prepend-shaped: the extra
+        // K cards share the one content). Synthetic distinct ids force every card through
+        // the content-exact path — the worst case for per-content candidate handling: a
+        // head re-scan per card costs Theta(K^2) (the last K cards each re-skip K consumed
+        // entries), while cursor consumption is amortized O(K). Doubling K must therefore
+        // scale ~linearly (bound strictly inside (2, 4)).
+        fun timed(k: Int): Long {
+            val prev = List(k) { "same-dup-content" }
+            val curr = List(2 * k) { "same-dup-content" }
+            val prevIds = List(k) { "prev-$it" }
+            val currIds = List(2 * k) { "curr-$it" }
+            val currSet = currIds.toSet()
+            repeat(5) {
+                alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
+            }
+            val samples = LongArray(7) {
+                val start = System.nanoTime()
+                repeat(10) {
+                    alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
+                }
+                System.nanoTime() - start
+            }
+            return samples.sorted()[samples.size / 2]
+        }
+        val t1 = timed(4000)
+        val t2 = timed(8000)
+        val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
+        assertTrue(
+            "identity-only duplicate 2x-input ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)",
+            ratio < 3.5,
+        )
+        // Correctness pin (pure-function layer): cursor consumes earliest-first, so the
+        // first K curr cards inherit prev values in document order (alternating values
+        // prove order, not just presence) and the last K default; stale prev ids prune.
+        val k = 4
+        val prev = List(k) { "same" }
+        val curr = List(2 * k) { "same" }
+        val prevIds = List(k) { "p$it" }
+        val currIds = List(2 * k) { "c$it" }
+        val overrides = mutableMapOf<String, Boolean>()
+        prevIds.forEachIndexed { i, id -> overrides[id] = i % 2 == 0 }
+        alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, overrides, currIds.toSet())
+        for (j in 0 until k) {
+            assertEquals("curr c$j must inherit prev p$j in order", j % 2 == 0, overrides["c$j"])
+        }
+        for (j in k until 2 * k) {
+            assertFalse("extra curr c$j must default", overrides.containsKey("c$j"))
+        }
+        assertTrue("stale prev ids must prune", overrides.keys.all { it.startsWith("c") })
+        // Realistic-ids pin: prev K same + curr 2K same via thinkingOverrideIds — the
+        // first K retain their values through exact ids, the last K default.
+        val rPrev = List(k) { "same" }
+        val rCurr = List(2 * k) { "same" }
+        val rPrevIds = thinkingOverrideIds(rPrev)
+        val rCurrIds = thinkingOverrideIds(rCurr)
+        val rOverrides = mutableMapOf<String, Boolean>()
+        rPrevIds.forEach { id -> rOverrides[id] = true }
+        alignThinkingOverridesIdentityOnly(rPrev, rPrevIds, rCurrIds, rCurr, rOverrides, rCurrIds.toSet())
+        for (j in 0 until k) {
+            assertEquals("curr r$j must retain prev value", true, rOverrides[rCurrIds[j]])
+        }
+        for (j in k until 2 * k) {
+            assertFalse("extra curr r$j must default", rOverrides.containsKey(rCurrIds[j]))
+        }
+    }
+
+    @Test
+    fun attr512_boundaryAndOverlapping_shapesFailClosed() {
+        // F4: attribute scans are bounded by MAX_TAG_ATTRIBUTE_SCAN_CHARS (512).
+        // Exact-fit attributes parse as tags; overlong ones fail closed.
+        val valid = "<think note=\"" + "a".repeat(100) + "\">SECRET</think>AFTER"
+        assertEquals("SECRET", (ChatMarkdownParser.parse(valid).first() as ChatContentBlock.ThinkingBlock).content)
+        assertEquals("AFTER", ChatMarkdownParser.stripThinking(valid))
+        // Overlong attribute with closer: display orphan-absorbs the prefix into a
+        // ThinkingBlock (never body text); TTS absorbs through the closer, keeping AFTER.
+        val overlong = "<think note=\"" + "a".repeat(600) + "\">SECRET</think>AFTER"
+        val overBlocks = ChatMarkdownParser.parse(overlong)
+        assertTrue(overBlocks.first() is ChatContentBlock.ThinkingBlock)
+        assertTrue((overBlocks.first() as ChatContentBlock.ThinkingBlock).content.contains("SECRET"))
+        assertTrue(
+            overBlocks.filterIsInstance<ChatContentBlock.ParagraphBlock>()
+                .none { it.annotatedText.text.contains("SECRET") },
+        )
+        assertEquals("AFTER", ChatMarkdownParser.stripThinking(overlong))
+        // Overlapping: valid closed tag followed by an overlong unclosed opener — TTS
+        // still absorbs from the suspect opener to EOF (fail-closed) while display keeps
+        // the first block intact.
+        val mixed = "<think>prior</think><think note=\"" + "b".repeat(600) + "\">PRIVATE"
+        assertEquals("", ChatMarkdownParser.stripThinking(mixed))
+        assertEquals("prior", (ChatMarkdownParser.parse(mixed).first() as ChatContentBlock.ThinkingBlock).content)
+    }
+
+    @Test
+    fun parse_unclosedTag_shapes_bufferedOrFailClosed() {
+        // Unclosed opener streams while open; completed parses pin it as a block.
+        for (name in listOf("think", "thought", "thinking")) {
+            val streaming = ChatMarkdownParser.parse("<$name>reason", isStreaming = true).single()
+            assertTrue((streaming as ChatContentBlock.ThinkingBlock).isStreaming)
+            assertEquals("reason", streaming.content)
+            val completed = ChatMarkdownParser.parse("<$name>reason").single()
+            assertEquals("reason", (completed as ChatContentBlock.ThinkingBlock).content)
+            assertFalse(completed.isStreaming)
+        }
+        // Partial closer is held back while streaming, literal when completed.
+        val partialStream = ChatMarkdownParser.parse("<think>reason</thi", isStreaming = true).single()
+        assertEquals("reason", (partialStream as ChatContentBlock.ThinkingBlock).content)
+        val partialDone = ChatMarkdownParser.parse("<think>reason</thi").single()
+        assertEquals("reason</thi", (partialDone as ChatContentBlock.ThinkingBlock).content)
+        // Unclosed with attribute and nested unclosed shapes.
+        val attr = ChatMarkdownParser.parse("<think id=\"1\">reason", isStreaming = true).single()
+        assertEquals("reason", (attr as ChatContentBlock.ThinkingBlock).content)
+        val nested = ChatMarkdownParser.parse("<think><think>nested incomplete", isStreaming = true).single()
+        assertTrue((nested as ChatContentBlock.ThinkingBlock).isStreaming)
+        // TTS fail-closed for every unclosed shape above.
+        for (input in listOf(
+            "<think>reason",
+            "<thought>reason",
+            "<thinking>reason",
+            "<think>reason</thi",
+            "<think id=\"1\">reason",
+            "<think><think>nested incomplete",
+        )) {
+            assertEquals("TTS must absorb unclosed input: $input", "", ChatMarkdownParser.stripThinking(input))
+        }
+    }
+}

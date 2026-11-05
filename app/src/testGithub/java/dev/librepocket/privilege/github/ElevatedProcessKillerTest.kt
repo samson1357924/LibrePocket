@@ -1,8 +1,10 @@
 package dev.librepocket.privilege.github
 
+import java.lang.reflect.InvocationTargetException
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 
@@ -66,6 +68,62 @@ class ElevatedProcessKillerTest {
             doomed.forEach { pid ->
                 runCatching { ProcessHandle.of(pid).ifPresent { it.destroyForcibly() } }
             }
+        }
+    }
+
+    @Test fun killTreeDegradesToSingleKillWhenToHandleUnsupported() {
+        // PocketGuard SUGGESTION：舊 Android 缺 toHandle/descendants 時退化單殺。
+        // JVM 上真進程（ProcessImpl）必有 toHandle，無法自然觸發；以 stub 模擬
+        // AOSP 行為：自訂 Process 子類不提供 handle（見 AospFallbackStub），
+        // 反射 invoke 即抛（包裝為 InvocationTargetException，cause 為 UOE
+        // "…toHandle() not supported"），killTree 不抛、父進程被 destroy、
+        // 無異常外逃。主碼 catch (Exception) 收斂（見 killDescendantsReflective）。
+        val stub = AospFallbackStub()
+        // 前提取 stub 反射語義確為包裝抛（文件化此路徑前提；JDK 基類預設
+        // 抛 UOE、AOSP 樁同為 UOE，訊息皆含 "toHandle() not supported"）。
+        try {
+            Process::class.java.getMethod("toHandle").invoke(stub)
+            fail("stub toHandle must throw via reflection")
+        } catch (e: InvocationTargetException) {
+            val cause = e.cause
+            assertTrue(
+                "cause must be UOE stub, got $cause",
+                cause is UnsupportedOperationException &&
+                    (cause.message ?: "").contains("toHandle() not supported"),
+            )
+        }
+        ElevatedProcessKiller.killTree(stub) // 不抛即收斂；抛即此行紅。
+        assertTrue("fallback must still destroy parent", stub.destroyed)
+    }
+
+    /**
+     * 模擬 AOSP/舊 Android 缺 handle 語義（Host JDK 真進程無法自然觸發）。
+     *
+     * 刻意不覆寫 `toHandle`：JDK 基類預設即抛 UOE（訊息
+     * `"class X.toHandle() not supported"`，含 `"toHandle() not supported"`；
+     * AOSP 樁同為 UOE `"toHandle() not supported"`)，主碼經宣告類查表反射
+     * invoke 即得 `InvocationTargetException`→收斂為關流＋單殺，與舊 Android
+     * 缺 API／樁抛走同一 catch 路徑。顯式 `override fun toHandle()` 不可行：
+     * AGP api-versions 編譯期隱藏該方法（Kotlin 報 "overrides nothing"，
+     * javac 連 `ProcessHandle` 符號都不可見），故以純子類行等價路徑。
+     */
+    private class AospFallbackStub : Process() {
+        var destroyed = false
+        var forciblyDestroyed = false
+        override fun getOutputStream(): java.io.OutputStream = java.io.ByteArrayOutputStream()
+        override fun getInputStream(): java.io.InputStream =
+            java.io.ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream(): java.io.InputStream =
+            java.io.ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int = 0
+        override fun exitValue(): Int = 0
+        override fun destroy() {
+            destroyed = true
+        }
+        override fun destroyForcibly(): Process {
+            forciblyDestroyed = true
+            destroyed = true
+            return this
         }
     }
 

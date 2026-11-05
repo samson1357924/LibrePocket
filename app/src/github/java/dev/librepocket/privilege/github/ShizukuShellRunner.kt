@@ -69,10 +69,12 @@ import rikka.shizuku.Shizuku
  * `activationCheck` 預設消費（default-deny，未就緒一律零 spawn）；
  * B3 接線時傳明示 allow＋每次重驗。
  *
- * R1-A 雙軌容量（Issue #136 R1-A，owner P1-2）：
+ * R1-A 雙軌容量（Issue #136 R1-A，owner P1-2；U2-B 細化 stderr，owner P2）：
  * 截圖二進位（`screencap -p` / `cat /dev/graphics/fb0`，argv 精確匹配）走
- * 8M 軌（[ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES] 截斷＋
- * [ElevatedProcessIo.BINARY_SCREENSHOT_HARD_CAP_BYTES] 硬讀取，OOM 上界每流 8M）；
+ * stdout 8M 軌（[ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES] 截斷＋
+ * [ElevatedProcessIo.BINARY_SCREENSHOT_HARD_CAP_BYTES] 硬讀取，OOM 上界 stdout 8M），
+ * stderr 維持通用軌（[ShellPolicy.MAX_OUTPUT_BYTES] 64K 截斷＋
+ * [ShellPolicy.HARD_READ_CAP_BYTES] 512K 硬讀取；截圖錯誤訊息短，降 OOM 峰值）；
  * 其餘通用命令走舊 64K/512K 軌（[ShellPolicy.MAX_OUTPUT_BYTES]／
  * [ShellPolicy.HARD_READ_CAP_BYTES]）。[BinaryElevatedRunner] 介面簽名不變。
  *
@@ -180,7 +182,9 @@ class ShizukuShellRunner(
             val redacted = Redactor.redactError(e.message ?: e.javaClass.simpleName)
             return ElevatedBinaryResult.Failed("shizuku spawn failed: $redacted")
         }
-        // R1-A 雙軌：截圖 argv 精確匹配即 8M 軌，其餘走舊 64K/512K。
+        // R1-A 雙軌＋U2-B stderr 獨立小 cap：截圖 stdout 即 8M 軌，stderr 維持
+        // 通用軌（硬讀取 512K／截斷 64K；截圖錯誤訊息短，降 OOM 峰值）；
+        // 其餘通用命令走舊 64K/512K。
         val isScreenshot = request.argv == listOf("screencap", "-p") ||
             request.argv == listOf("cat", "/dev/graphics/fb0")
         val hardCapBytes = if (isScreenshot) {
@@ -188,14 +192,18 @@ class ShizukuShellRunner(
         } else {
             ShellPolicy.HARD_READ_CAP_BYTES
         }
+        // U2-B：截圖 stderr 獨立小 cap（通用軌 512K）；通用命令傳 null 即同 stdout cap。
+        val hardCapErrBytes: Int? = if (isScreenshot) ShellPolicy.HARD_READ_CAP_BYTES else null
         val maxBytes = if (isScreenshot) {
             ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES
         } else {
             ShellPolicy.MAX_OUTPUT_BYTES
         }
-        val raw = ElevatedProcessIo.drain(process, timeoutMs, killer, isCancelled, hardCapBytes)
+        // U2-B：stderr 截斷一律通用軌 64K（截圖亦同）。
+        val errMaxBytes = ShellPolicy.MAX_OUTPUT_BYTES
+        val raw = ElevatedProcessIo.drain(process, timeoutMs, killer, isCancelled, hardCapBytes, hardCapErrBytes)
         val out = ShellPolicy.truncate(raw.stdout, maxBytes)
-        val err = ShellPolicy.truncate(raw.stderr, maxBytes)
+        val err = ShellPolicy.truncate(raw.stderr, errMaxBytes)
         val truncated = out.truncated || err.truncated || raw.truncated
         if (raw.timedOut) {
             return ElevatedBinaryResult.TimedOut(

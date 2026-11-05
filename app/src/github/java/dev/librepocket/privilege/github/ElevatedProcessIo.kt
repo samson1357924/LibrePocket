@@ -34,14 +34,17 @@ import java.util.concurrent.TimeUnit
  * P2-B 抽檔（行為零變更）：原內嵌於 `ShizukuShellRunner.kt`，搬至本檔；
  * [ShizukuShellRunner]/[RootSuRunner] 同包直接引用，免 import。
  *
- * R1-A 雙軌容量（Issue #136 R1-A，owner P1-2）：
+ * R1-A 雙軌容量（Issue #136 R1-A，owner P1-2；U2-B 細化 stderr，owner P2）：
  * - 通用命令：截斷標記沿用 [ShellPolicy.MAX_OUTPUT_BYTES]（64K），硬讀取上限
  *   沿用 [ShellPolicy.HARD_READ_CAP_BYTES]（512K），OOM 有界（每流 512K）；
- * - 截圖二進位（`screencap -p` / `cat /dev/graphics/fb0`）：截斷上限
+ * - 截圖二進位（`screencap -p` / `cat /dev/graphics/fb0`）：stdout 截斷上限
  *   [BINARY_SCREENSHOT_MAX_BYTES]（8M），硬讀取上限
- *   [BINARY_SCREENSHOT_HARD_CAP_BYTES]（8M），OOM 有界（每流 8M）；
+ *   [BINARY_SCREENSHOT_HARD_CAP_BYTES]（8M），OOM 上界（stdout 8M）；
+ *   stderr 維持通用軌（硬讀取 512K／截斷 64K）——截圖錯誤訊息短，
+ *   不需 8M，降 OOM 峰值（雙流並發 8M＋512K，而非 8M＋8M）；
  * - 雙軌由各 Runner 以 argv 精確匹配判定（見兩 Runner 的 `isScreenshot`），
- *   本檔只提供可選參數 `hardCapBytes`（預設 512K，截圖傳 8M）與截斷常數，
+ *   本檔只提供可選參數 `hardCapBytes`（預設 512K，截圖 stdout 傳 8M）與
+ *   `hardCapErrBytes`（預設 null＝同 stdout cap；截圖傳 512K）及截斷常數，
  *   不做 argv 判定；[Drained] 結構不變（仍為 stdout/stderr/exitCode/
  *   timedOut/truncated，`truncated` 另含硬上限溢出標記，見 [CappedPipe]）。
  *
@@ -56,6 +59,14 @@ import java.util.concurrent.TimeUnit
  * - 高熵 PNG 超限同理：>8M 即 truncated→null，不分內容熵；
  * - 裝置容量驗收歸 B3 E2E（見 [PrivilegeActivation]：`ELEVATED_RUNNERS_READY`
  *   翻 true 前需裝置驗收；JVM 單測僅以假位元組斷言容量邊界，不代表真機幀大小）。
+ *
+ * U2-B stderr 獨立小 cap（owner P2，僅 KDoc＋可選參數，通用軌行為零變更）：
+ * - 截圖軌 stdout 8M＋stderr 通用軌（硬讀取 512K／截斷 64K）：截圖錯誤訊息短
+ *   （exit 非零文案／warn 行），stderr 不需 8M；雙流並發 OOM 峰值由
+ *   16M 降至 8.5M；
+ * - 通用軌不變（雙流 512K／截斷 64K，`hardCapErrBytes` 傳 null 即同 stdout cap）；
+ * - 判定：任一流溢出即 [Drained.truncated]（stdout 超 8M 丟棄與 stderr 超 512K
+ *   丟棄皆經溢出位帶出，不靜默短讀；見容量測試截圖＋1MB stderr 用例）。
  */
 internal object ElevatedProcessIo {
     /** R1-A 截圖二進位容量：`screencap -p` / `cat /dev/graphics/fb0` 的截斷上限（8M）。 */
@@ -88,6 +99,7 @@ internal object ElevatedProcessIo {
         process: Process,
         timeoutMs: Long,
         hardCapBytes: Int = ShellPolicy.HARD_READ_CAP_BYTES,
+        hardCapErrBytes: Int? = null,
     ): Drained =
         drain(
             process,
@@ -95,11 +107,15 @@ internal object ElevatedProcessIo {
             { ElevatedProcessKiller.killTree(it) },
             { Thread.currentThread().isInterrupted },
             hardCapBytes,
+            hardCapErrBytes,
         )
 
     /**
-     * R1-A 雙軌：`hardCapBytes` 預設 [ShellPolicy.HARD_READ_CAP_BYTES]（512K，通用命令）；
-     * 截圖二進位傳 [BINARY_SCREENSHOT_HARD_CAP_BYTES]（8M）。[Drained] 結構不變，
+     * R1-A 雙軌＋U2-B stderr 獨立小 cap：`hardCapBytes` 預設
+     * [ShellPolicy.HARD_READ_CAP_BYTES]（512K，通用命令）；截圖二進位 stdout 傳
+     * [BINARY_SCREENSHOT_HARD_CAP_BYTES]（8M）。`hardCapErrBytes` 預設 null＝
+     * 同 stdout cap（通用軌行為不變）；截圖傳 [ShellPolicy.HARD_READ_CAP_BYTES]
+     * （512K，截圖錯誤訊息短，降 OOM 峰值）。[Drained] 結構不變，
      * `truncated` 含 join 未完成或硬上限溢出（任一流丟棄即 true，絕不靜默短讀不標）。
      *
      * R3-A 取消限制（owner P2-5）：[isCancelled] 預設只看 Thread 中斷，
@@ -112,6 +128,7 @@ internal object ElevatedProcessIo {
         killer: (Process) -> Unit,
         isCancelled: () -> Boolean,
         hardCapBytes: Int = ShellPolicy.HARD_READ_CAP_BYTES,
+        hardCapErrBytes: Int? = null,
     ): Drained {
         // P1-B：spawn 成功後立即關子進程 stdin（子進程 stdin EOF）：等 stdin EOF 的
         // 子進程（如 cat）不再假性 TimedOut。killer 內已關流，此處縱深再關一次。
@@ -119,7 +136,8 @@ internal object ElevatedProcessIo {
         // API，不得復用本函數（復用會與起手關流競態，並改變 EOF 語義）。
         runCatching { process.outputStream.close() }
         val out = CappedPipe(hardCapBytes)
-        val err = CappedPipe(hardCapBytes)
+        // U2-B：stderr 獨立小 cap（null＝同 stdout cap；截圖傳 512K）。
+        val err = CappedPipe(hardCapErrBytes ?: hardCapBytes)
         val tOut = Thread({ copyCapped(process.inputStream, out) }, "elevated-stdout").also {
             it.isDaemon = true
             it.start()
@@ -260,8 +278,9 @@ internal object ElevatedProcessIo {
                     // P1-B review：超標後仍繼續讀丟棄，絕不關流（省 CPU 的優化撤回，
                     // 正確性優先）。提前關讀端會致寫端 EPIPE/SIGPIPE，使本可
                     // exit 0 + truncated 的成功改寫為 141 轉 Failed。
-                    // OOM 防護由 write() 內 hardCapBytes 丟棄超額承擔，語義不變
-                    //（通用 512K／截圖 8M，見 drain 的 hardCapBytes）。
+                    // OOM 防護由 write() 內 hardCap 丟棄超額承擔，語義不變
+                    //（通用雙流 512K／截圖 stdout 8M＋stderr 512K，見 drain 的
+                    // hardCapBytes／hardCapErrBytes）。
                     // （此分支無動作，僅留檢查點明語義；讀丟棄經由下輪 read 繼續。）
                 }
             }

@@ -140,10 +140,28 @@ class ShizukuStatusTest {
 
     @Test fun attachWithoutBinderEnvironmentDoesNotThrow() {
         // JVM 單測無 Shizuku 服務：Shizuku 類初始化即失敗，註冊異常由
-        // attach/detach 內部 runCatching 收斂，不得外抛。
+        // attach/detach 內部 runCatching 收斂，不得外抛；守衛恆 false（失敗不卡死）。
         val events = ShizukuBinderEvents()
         events.attach()
+        assertFalse(events.isAttached())
         events.detach()
+        assertFalse(events.isAttached())
+    }
+
+    @Test fun attachOnJvmNeverRegistersRealListener() {
+        // JVM 上 Shizuku 類初始化失敗（android.os.Binder 未 mock）：attach 經
+        // runCatching 收斂，守衛恆 false（失敗不卡死，允許重試）；detach 冪等不抛。
+        // 與 attachWithoutBinderEnvironmentDoesNotThrow 互補：此處斷言重試語義＋
+        // 冪等 detach；本地回呼表語義見 detachResetsGuardAndClearsCallbacks。
+        val events = ShizukuBinderEvents()
+        events.attach()
+        assertFalse("JVM attach must not set guard", events.isAttached())
+        events.attach() // 重試不被冪等守衛吞掉（仍失敗但不抛）。
+        assertFalse("retry must not stick guard", events.isAttached())
+        events.detach() // 空/失敗 detach 冪等安全，不抛。
+        assertFalse(events.isAttached())
+        events.detach()
+        assertFalse(events.isAttached())
     }
 
     @Test fun detachResetsGuardAndClearsCallbacks() {

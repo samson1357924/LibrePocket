@@ -109,6 +109,36 @@ class ElevatedRunnerScreenshotCapacityTest {
         }
     }
 
+    @Test fun screenshotLargeStderrTruncatedToNull() {
+        // U2-B stderr 獨立小 cap（owner P2）：截圖 stdout 小（70KB，stdout 軌
+        // 通過），stderr 1MB（>通用硬讀 512K）→ err 溢出即 raw.truncated →
+        // Ok.truncated → capture null。舊碼 stderr 同 stdout 8M cap 時 1MB
+        // 不截斷；本測試鎖定 stderr 獨立 cap 生效。
+        // 記憶體：1MB 單陣列，兩 runner 共用（不重配）。
+        val png = ByteArray(70 * 1024) { (it and 0xFF).toByte() }
+        val bigErr = ByteArray(1 * 1024 * 1024) { 0x45.toByte() }
+        val runners: List<Pair<String, BinaryElevatedRunner>> = listOf(
+            "shizuku" to shizukuRunner { _ -> FakeProcess(png, bigErr, 0) },
+            "root" to rootRunner { _ -> FakeProcess(png, bigErr, 0) },
+        )
+        for ((name, runner) in runners) {
+            val b = runner.runBinary(ElevatedRequest(listOf("screencap", "-p"), "U2B-T"), 5_000L)
+            assertTrue("$name 1MB stderr -> $b", b is ElevatedBinaryResult.Ok)
+            b as ElevatedBinaryResult.Ok
+            assertTrue("$name stderr must truncate", b.truncated)
+            // stdout 本身完整（70KB <8M），stderr 被切到通用軌 64K。
+            assertTrue("$name stdout intact", b.stdout.contentEquals(png))
+            assertEquals("$name stderr capped at 64K", ShellPolicy.MAX_OUTPUT_BYTES, b.stderr.size)
+            // capture：Ok.truncated 即 null（呼叫方降級手動截圖），審計仍記 OK。
+            val audit = PrivilegeAuditLog()
+            assertNull(
+                "$name capture must be null",
+                RootFramebufferCapture.screencapViaBinary(runner, audit, "U2B-T", 5_000L)(),
+            )
+            assertEquals(mapOf("OK" to 1), audit.countByVerdict())
+        }
+    }
+
     @Test fun generic70KBStillTruncated() {
         // 通用命令 70KB 仍走 64K 軌：Ok.truncated==true（舊測試已覆蓋，此處鎖定不回歸）。
         val big = ByteArray(70 * 1024) { (it and 0xFF).toByte() }

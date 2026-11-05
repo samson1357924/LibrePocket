@@ -53,8 +53,12 @@ enum class FrameSource {
  * - 未壓縮 RGBA 1080x2400x4 ≈10.37MB：明確不支援（>8M 即 truncated→null，
  *   呼叫方降級手動截圖；截斷即 null，不摘要部分幀，見 `auditAndExtract`）；
  * - 高熵 PNG 超限同理：>8M 即 truncated→null，不分內容熵；
- * - 容量常數見 [ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES]（8M 截斷＋硬讀取）；
+ * - 容量常數見 [ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES]（stdout 8M 截斷＋硬讀取）；
  *   裝置容量驗收歸 B3 E2E（見 [PrivilegeActivation]）。
+ *
+ * U2-B stderr 獨立小 cap（owner P2）：截圖 stderr 維持通用軌（硬讀取 512K／
+ * 截斷 64K；截圖錯誤訊息短，降 OOM 峰值）——stderr 超限同樣經 truncated→null
+ * （即使 stdout 完整；見 `auditAndExtract`：Ok.truncated 即 null，不分哪路截斷）。
  *
  * 讀取函數可注入，JVM 單測直接斷言優先序與摘要語義。
  */

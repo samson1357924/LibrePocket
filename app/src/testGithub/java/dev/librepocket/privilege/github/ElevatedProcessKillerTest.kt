@@ -102,7 +102,7 @@ class ElevatedProcessKillerTest {
      * 刻意不覆寫 `toHandle`：JDK 基類預設即抛 UOE（訊息
      * `"class X.toHandle() not supported"`，含 `"toHandle() not supported"`；
      * AOSP 樁同為 UOE `"toHandle() not supported"`)，主碼經宣告類查表反射
-     * invoke 即得 `InvocationTargetException`→收斂為關流＋單殺，與舊 Android
+     * invoke 即得 `InvocationTargetException`→收斂為單殺（串流由 drain 關），與舊 Android
      * 缺 API／樁抛走同一 catch 路徑。顯式 `override fun toHandle()` 不可行：
      * AGP api-versions 編譯期隱藏該方法（Kotlin 報 "overrides nothing"，
      * javac 連 `ProcessHandle` 符號都不可見），故以純子類行等價路徑。

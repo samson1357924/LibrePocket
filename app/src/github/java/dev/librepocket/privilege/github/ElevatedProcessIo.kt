@@ -48,7 +48,7 @@ import java.util.concurrent.TimeUnit
  *   本檔只提供可選參數 `hardCapBytes`（預設 512K，截圖 stdout 傳 8M）與
  *   `hardCapErrBytes`（預設 null＝同 stdout cap；截圖傳 512K）及截斷常數，
  *   不做 argv 判定；[Drained] 結構不變（仍為 stdout/stderr/exitCode/
- *   timedOut/truncated，`truncated` 另含硬上限溢出標記，見 [CappedPipe]）。
+ *   timedOut/truncated，`truncated` 另含硬上限溢出標記，見 [ElevatedCappedPipe]）。
  *
  * R3-B（PocketGuard SUGGESTION，ExecutorService）：維持現狀 —— 固定 2 daemon
  * threads＋有界 join 已防洩漏/hang，ExecutorService 為未來選項（B3）。
@@ -64,14 +64,14 @@ import java.util.concurrent.TimeUnit
  *
  * U2-B stderr 獨立小 cap（owner P2，僅 KDoc＋可選參數，通用軌行為零變更）：
  * - 截圖軌 stdout 8M＋stderr 通用軌（硬讀取 512K／截斷 64K）：截圖錯誤訊息短
- *   （exit 非零文案／warn 行），stderr 不需 8M；雙流 CappedPipe 同時保留量由
+ *   （exit 非零文案／warn 行），stderr 不需 8M；雙流 ElevatedCappedPipe 同時保留量由
  *   16M 降至 8.5M（僅 pipe 內保留，不等於程序峰值）；
  * - 通用軌不變（雙流 512K／截斷 64K，`hardCapErrBytes` 傳 null 即同 stdout cap）；
  * - 判定：任一流溢出即 [Drained.truncated]（stdout 超 8M 丟棄與 stderr 超 512K
  *   丟棄皆經溢出位帶出，不靜默短讀；見容量測試截圖＋1MB stderr 用例）。
  *
  * V2 OOM 峰值誠實說明（owner P2 memory）：cap 相加（截圖 8M＋512K ≈8.5M）
- * 僅是 [CappedPipe] 同時保留量，不是程序峰值。實際峰值另含 `bytes()` 的
+ * 僅是 [ElevatedCappedPipe] 同時保留量，不是程序峰值。實際峰值另含 `bytes()` 的
  * `toByteArray` 拷貝＋[ElevatedBinaryResult.Ok] 防禦複製（構造 `copyOf`＋取值
  * `copyOf`）＋capture 側 `copyOf`，約為 pipe 保留量的數倍。低 RAM 裝置實際
  * 峰值由 B3 heap profile 驗收，本檔不承諾 8.5MiB 程序峰值。
@@ -82,8 +82,8 @@ import java.util.concurrent.TimeUnit
  * kill 路徑重調 `process.inputStream/errorStream.close()` 同樣觸阻塞 getter。
  * 現：
  * - deadline 移到 drain 入口第一行（outputStream 關閉之前），全部開銷計入同一 budget；
- * - outputStream 起手關保留同步 runCatching（移到 deadline 之後；su 路徑本地瞬時、
- *   Shizuku 單次 Binder，stall 即 binder 死亡由狀態門 fail-closed）；
+ * - outputStream 起手關改 Y1 有界化（見下；X1 的同步 runCatching 已取代：同步關在
+ *   getter/close stall 時仍卡死呼叫執行緒，binder 死亡門只保 fail-closed 不保有界）；
  * - getter 移回 gobbler 內、整段 try/catch（throw 即 markFailed，W1 語義保留，
  *   無未捕捉例外；block 則 caller 不受影響照常進 deadline/poll/kill）；
  * - kill 路徑改關已取流（不再重調 getter，根除 kill 路徑阻塞），kill 前先
@@ -100,6 +100,22 @@ import java.util.concurrent.TimeUnit
  * exitValueOr-1, timedOut=false, readFailed=true)`；呼叫方既有 `readFailed`
  * 分支即回同一固定字串 Failed（不帶 remote 原文、不帶輸出）。gobbler 只在雙流
  * 取成功後啟動，daemon thread 內不再求值 getter，無未捕捉例外。
+ *
+ * Y1 三入口＋CappedPipe 備註（owner 新 P1 兩入口＋P2；PocketGuard CappedPipe 可測性）：
+ * - killer 去串流關閉：[ElevatedProcessKiller.killTree] 刪除
+ *   `inputStream/errorStream/outputStream.close()` 三行（getter 先求值即阻塞），
+ *   只留子孫列舉＋destroy/destroyForcibly（全 runCatching）。串流關閉是 drain 職責
+ *   （kill 路徑關已取引用，不重調 getter），呼叫點僅 drain 預設值＋單測；
+ * - stdin 關有界化：起手 `outputStream.close()` 改 daemon thread
+ *  （`elevated-stdin-close`）執行＋主執行緒 join（上界 `min(剩餘 budget,
+ *   STDIN_CLOSE_MAX_MS=2s)`，計入同一 deadline）；超界即放行繼續（best-effort，
+ *   後續 killer destroy 兜底）。舊同步關在 getter/close stall 時無界卡死；
+ * - finished 路徑 join 超時 interrupt：兩處 SUCCESS_JOIN（10s）join 後仍存活即
+ *   interrupt＋短 grace（SUCCESS_JOIN_GRACE_MS=1s）重 join 回收線程；首段超界即記
+ *   不完整（grace 不清除標記）。只影響卡死執行緒（10s 內完成即無 interrupt）；
+ * - [ElevatedCappedPipe]：原內嵌 `private CappedPipe` 更名提升為同檔 internal，
+ *   行為零變更（drain 改用），僅為隔離可測（見 `ElevatedCappedPipeTest`：溢出→
+ *   didOverflow、截斷語義、failed 單調、bytes 拷貝）。
  */
 internal object ElevatedProcessIo {
     /** R1-A 截圖二進位容量：`screencap -p` / `cat /dev/graphics/fb0` 的截斷上限（8M）。 */
@@ -112,7 +128,11 @@ internal object ElevatedProcessIo {
     private const val POLL_SLICE_MS = 50L
     private const val GOBBLER_JOIN_MS = 5_000L
     private const val SUCCESS_JOIN_MS = 10_000L
+    /** Y1 成功路徑卡死 grace：首段 [SUCCESS_JOIN_MS] 超界仍存活即 interrupt＋本值重 join 回收線程（不清除不完整標記，見 drain）。 */
+    private const val SUCCESS_JOIN_GRACE_MS = 1_000L
     private const val KILL_WAIT_SEC = 5L
+    /** Y1 stdin 有界關閉上界：`outputStream` getter/close 在 daemon thread 執行，主執行緒至多等本值（另受剩餘 budget 截頂），超界即放行。 */
+    private const val STDIN_CLOSE_MAX_MS = 2_000L
     private const val COPY_BUF_SIZE = 8192
 
     data class Drained(
@@ -122,14 +142,14 @@ internal object ElevatedProcessIo {
         val timedOut: Boolean,
         /**
          * gobbler 有界 join 未完成（部分讀）：呼叫方須併入 truncated，絕不靜默短讀不標。
-         * R1-A：另含硬上限溢出（任一流丟棄即 true，見 [CappedPipe.didOverflow]），
+         * R1-A：另含硬上限溢出（任一流丟棄即 true，見 [ElevatedCappedPipe.didOverflow]），
          * 截圖 8M==8M 時靠此位區分恰上限通過與超限丟棄。
          */
         val truncated: Boolean = false,
         /**
          * V2 gobbler 讀取失敗旗標（owner 新 P1-2 correctness）：任一流
-         * `stream.read` 抛異常即 true（見 [CappedPipe.failed]，[copyCapped]
-         * catch 內無條件 [CappedPipe.markFailed]）。只有真 EOF（`read` 回 -1）
+         * `stream.read` 抛異常即 true（見 [ElevatedCappedPipe.failed]，[copyCapped]
+         * catch 內無條件 [ElevatedCappedPipe.markFailed]）。只有真 EOF（`read` 回 -1）
          * 才算完整流；finished（非超時/取消，killer 未關流）下的讀取異常必為
          * 真實 I/O 錯誤，呼叫方須回 Failed（見兩 Runner `raw.readFailed` 分支，
          * 位於 `timedOut` 之後、`exitCode != 0` 之前；超時/取消路徑已先回
@@ -178,15 +198,32 @@ internal object ElevatedProcessIo {
         val deadlineNanos = System.nanoTime() +
             TimeUnit.MILLISECONDS.toNanos(timeoutMs.coerceAtLeast(0L))
         // P1-B：spawn 成功後立即關子進程 stdin（子進程 stdin EOF）：等 stdin EOF 的
-        // 子進程（如 cat）不再假性 TimedOut。killer 內已關流，此處縱深再關一次。
+        // 子進程（如 cat）不再假性 TimedOut。killer 內不關流，此處是唯一關 stdin 處
+        //（drain kill 路徑另關已取的 stdout/stderr，不碰 stdin）。
         // 約束：本 drain 為無 stdin 模式（起手即關），未來需寫 stdin 必須另開
         // API，不得復用本函數（復用會與起手關流競態，並改變 EOF 語義）。
-        // X1 註：su 路徑本地瞬時、Shizuku 單次 Binder，stall 即 binder 死亡由狀態門
-        // fail-closed，故此處保留同步 runCatching（移到 deadline 之後）。
-        runCatching { process.outputStream.close() }
-        val out = CappedPipe(hardCapBytes)
+        // Y1 stdin 有界化（owner 新 P1 兩入口）：`outputStream` getter/close 可阻塞
+        //（Shizuku 單次 Binder 亦可 stall；binder 死亡由狀態門 fail-closed，但
+        // stall 本身無界）。改 daemon thread 執行＋主執行緒 join（上界
+        // `min(剩餘 budget, STDIN_CLOSE_MAX_MS)`，計入同一 deadline）；超界即放行
+        // 繼續（best-effort，後續 killer destroy 兜底），drain 總耗時仍有上界。
+        val stdinCloser = Thread({
+            runCatching { process.outputStream.close() }
+        }, "elevated-stdin-close").also {
+            it.isDaemon = true
+            it.start()
+        }
+        try {
+            val stdinRemainMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime())
+                .coerceAtLeast(0L)
+            val stdinBudgetMs = minOf(stdinRemainMs, STDIN_CLOSE_MAX_MS)
+            if (stdinBudgetMs > 0L) stdinCloser.join(stdinBudgetMs)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        val out = ElevatedCappedPipe(hardCapBytes)
         // U2-B：stderr 獨立小 cap（null＝同 stdout cap；截圖傳 512K）。
-        val err = CappedPipe(hardCapErrBytes ?: hardCapBytes)
+        val err = ElevatedCappedPipe(hardCapErrBytes ?: hardCapBytes)
         // X1 getter 回 gobbler 內、整段 try/catch：throw 即 markFailed（W1 語義保留，
         // runner 側同一 "elevated IO read failed" 固定文案，不帶 remote 原文或輸出；
         // 無未捕捉例外）；block 則 caller 不受影響照常進 deadline/poll/kill。
@@ -286,20 +323,40 @@ internal object ElevatedProcessIo {
             // 超界即停並標 truncated（絕不靜默短讀不標）；drain 總耗時有上界
             //（timeoutMs + 常數），不無限卡。
             // 無界 join 在遠端流永不 EOF 時可卡死超 timeoutMs，故不用。
+            // Y1（owner 新 P1 兩入口）：首段超界仍存活即 best-effort interrupt＋
+            // 短 grace（SUCCESS_JOIN_GRACE_MS）重 join 回收線程。首段超界即記
+            // 不完整（grace 只為回收，不清除標記：超 10s 的讀數不視為完整）。
+            // 正常慢讀 10s 內完成即無 interrupt，不受影響；只有卡死執行緒才走到此分支。
             try {
                 tOut.join(SUCCESS_JOIN_MS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
-            } finally {
-                if (tOut.isAlive) joinIncomplete = true
             }
+            val outStuck = tOut.isAlive
+            if (outStuck) {
+                runCatching { tOut.interrupt() }
+                try {
+                    tOut.join(SUCCESS_JOIN_GRACE_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+            if (outStuck) joinIncomplete = true
             try {
                 tErr.join(SUCCESS_JOIN_MS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
-            } finally {
-                if (tErr.isAlive) joinIncomplete = true
             }
+            val errStuck = tErr.isAlive
+            if (errStuck) {
+                runCatching { tErr.interrupt() }
+                try {
+                    tErr.join(SUCCESS_JOIN_GRACE_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+            if (errStuck) joinIncomplete = true
         }
         return Drained(
             stdout = out.bytes(),
@@ -317,7 +374,14 @@ internal object ElevatedProcessIo {
         )
     }
 
-    private class CappedPipe(private val hardCapBytes: Int) {
+    /**
+     * 有界截斷管（Y1 由內嵌 `CappedPipe` 更名提升，行為零變更，僅為隔離可測）：
+     * 硬上限 `hardCapBytes` 內保留前綴，超額丟棄並經 [didOverflow] 單調標溢出
+     * （drain 併入 `Drained.truncated`，絕不靜默短讀不標）；讀取異常經 [markFailed]
+     * 單調標 [failed]（drain 併入 `Drained.readFailed`）。`internal` 僅為同模組
+     * 隔離單測（見 `ElevatedCappedPipeTest`），產品語義不變。
+     */
+    internal class ElevatedCappedPipe(private val hardCapBytes: Int) {
         private val sink = ByteArrayOutputStream()
         @Volatile private var overflowed = false
         /** V2 gobbler 讀取失敗旗標（owner 新 P1-2）：`copyCapped` 內 `read` 抛即標 true，單調不清除。 */
@@ -355,7 +419,7 @@ internal object ElevatedProcessIo {
         fun bytes(): ByteArray = synchronized(sink) { sink.toByteArray() }
     }
 
-    private fun copyCapped(stream: java.io.InputStream, pipe: CappedPipe) {
+    private fun copyCapped(stream: java.io.InputStream, pipe: ElevatedCappedPipe) {
         val buf = ByteArray(COPY_BUF_SIZE)
         try {
             while (true) {

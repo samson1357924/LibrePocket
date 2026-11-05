@@ -19,8 +19,8 @@ import java.io.File
  *（[bridgeGranted] 快照，未授權即拒，對一切命令生效，見 U1 段）→ 可信 su 解析
  * （[suBinary] 非空直接用（仍須 [SuBinaryResolver.isTrusted]）；為空才走
  * [SuBinaryResolver.resolve] 以 [suExists] 做存在性檢查）→ 配額 →
- * `su -c` argv 直達 → 超時殺（盡力整組；Android 多數退化為關流+單殺，
- * 見 [ElevatedProcessKiller]） → 輸出截斷。
+ * `su -c` argv 直達 → 超時殺（盡力整組；Android 多數退化為單殺，
+ * 串流由 drain 經已取引用關，見 [ElevatedProcessKiller]） → 輸出截斷。
  * 策略拒絕/配額拒絕/su 不可用一律不建子進程；缺 su 不耗配額。
  * su 不可用（二進位缺席/拒絕提權）回
  * typed Denied/Failed 並附降級話術，呼叫方回落免 Root 路徑。
@@ -30,7 +30,7 @@ import java.io.File
  *   一般非零回 `Failed`，皆不回 `Ok`（舊實現誤回 Ok 已修正）；
  *   訊息內 stderr 經 `Redactor.redactError` 收斂（保留 redacted，不洩密）；
  * - 超時/cancel 走 [ElevatedProcessKiller.killTree]（盡力整組殺，舊實現只殺 `su`
- *   本體；Android 多數退化為關流+單殺，見 [ElevatedProcessKiller]）＋ [isCancelled] 輪詢鉤，解除 blocking I/O；
+ *   本體；Android 多數退化為單殺，串流由 drain 關，見 [ElevatedProcessKiller]）＋ [isCancelled] 輪詢鉤，解除 blocking I/O；
  * - su 本體經 [SuBinaryResolver] 解析可信絕對路徑（舊碼 bare `"su"` 走 PATH，
  *   可劫持），缺席即 Failed 且零 spawn；
  * - 二進位通道：[runBinary] 以 [ByteArray] 直達，[run] 僅為文字相容殼。

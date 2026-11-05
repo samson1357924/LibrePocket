@@ -8,8 +8,11 @@ import java.lang.reflect.InaccessibleObjectException
  *
  * 背景：舊 [ElevatedProcessIo.drain] 只殺 `su` 本體（`destroyForcibly`），
  * 其子孫（`su -c` 拉起的真正命令）殘留為 root 孤兒（Issue #136 §5）。
- * 本物件盡力整組 best-effort（JVM/新 Android 才真整組）：先殺子孫再殺本體，並關流以
- * 解除 gobbler 的 blocking I/O。
+ * 本物件盡力整組 best-effort（JVM/新 Android 才真整組）：先殺子孫再殺本體。
+ * 串流關閉不屬本物件職責：gobbler 的 blocking I/O 由 [ElevatedProcessIo.drain]
+ * 經已取引用關閉（kill 路徑不再重調 `process.inputStream/errorStream` getter，
+ * 根除 kill 路徑 getter 阻塞；見 drain）；本物件只管 destroy/destroyForcibly，
+ * 全 runCatching（Y1，owner 新 P1 兩入口）。
  *
  * S2-A 版本矩陣（owner P1-2 lifecycle＋P2-3 cancel，不改行為）：
  * - JVM Host JDK（單測）：JDK 9+ `ProcessHandle` 完整 → 真整組（先殺子孫再殺本體；
@@ -17,7 +20,8 @@ import java.lang.reflect.InaccessibleObjectException
  * - 新 Android（具 `descendants` API）：反射取到 handle＋`descendants` → 同上真整組；
  * - 舊 Android（缺 API 或 AOSP 樁抛錯）：`NoSuchMethodException`／
  *   `UnsupportedOperationException` 或 `ProcessHandle` 類缺席（`NoClassDefFoundError`）
- *   即收斂，實際退化為「關流 + 殺本體 best-effort（單殺 `destroyForcibly`）」，非真整組；
+ *   即收斂，實際退化為單殺本體 best-effort（僅 `destroy/destroyForcibly`；
+ *   串流由 drain 經已取引用關閉，killer 不觸 getter），非真整組；
  * - AOSP libcore `Process.toHandle` 預設實作抛 `UnsupportedOperationException`
  *   （源碼見 https://cs.android.com/android/platform/superproject/main/+/main:libcore/ojluni/src/main/java/java/lang/Process.java
  *   ；android.jar 內即 `".toHandle() not supported"` 樁，非公開 API，見 `api-versions.xml`）；
@@ -31,11 +35,11 @@ import java.lang.reflect.InaccessibleObjectException
  * （[PrivilegeActivation.ELEVATED_RUNNERS_READY] 仍 `false`，B1 未完，產品不得接線 runner；
  * 子孫清理裝置 E2E 歸 B3）。
  *
- * 誠實化（P1-B，行為不變）：
+ * 誠實化（P1-B，行為不變；Y1 去串流關閉，契約見下）：
  * - Android 上 `Process.toHandle`/`descendants` 若不可用（舊版本缺席，或
  *   SDK 樁直接抛 `UnsupportedOperationException`——android.jar 內即
  *   `".toHandle() not supported"` 樁，非公開 API，見 `api-versions.xml`），
- *   反射即收斂，實際退化為「關流 + 殺本體 best-effort」，非真整組；
+ *   反射即收斂，實際退化為單殺本體 best-effort，非真整組（串流由 drain 關）；
  * - [ShizukuRemoteProcess] 未覆寫 `toHandle`，遠端樹同為單殺（僅本體）；
  *   真整組僅在 JVM 單測 / 具 descendants API 的新 Android 才成立。
  *
@@ -52,6 +56,11 @@ import java.lang.reflect.InaccessibleObjectException
  *
  * - 子孫列舉經反射（`Process.toHandle/descendants`，JDK 9+；API 缺席時
  *   runCatching 收斂為僅殺本體，不崩）；
+ * - Y1 契約（owner 新 P1 兩入口）：本物件只管 destroy（子孫＋本體，全
+ *   runCatching），絕不觸 `process.inputStream/errorStream/outputStream`
+ *   getter（含關閉）。getter 可阻塞（Shizuku 同步 Binder IPC），kill 路徑重調
+ *   即呼叫執行緒卡死；串流關閉是 [ElevatedProcessIo.drain] 的職責（經已取引用，
+ *   見其 kill 路徑），呼叫點僅 drain 預設值＋單測；
  * - 任何步驟異常一律收斂（fail-closed 方向是「已盡力殺」，呼叫方仍回
  *   TimedOut，不把清理異常升級為崩潰）；
  * - 單測以 `killer: (Process) -> Unit` 注入假實現斷言「超時/cancel 必經清理」，
@@ -60,10 +69,8 @@ import java.lang.reflect.InaccessibleObjectException
 object ElevatedProcessKiller {
     fun killTree(process: Process) {
         runCatching { killDescendantsReflective(process) }
-        // 關流先行：gobbler 若卡在 read，關流即抛而退出（見 drain 超時路徑的 join 有界）。
-        runCatching { process.inputStream.close() }
-        runCatching { process.errorStream.close() }
-        runCatching { process.outputStream.close() }
+        // Y1：只管 destroy，不關流（串流由 drain 經已取引用關；此處重調 getter
+        // 可阻塞呼叫執行緒，見上 KDoc 契約）。
         runCatching { process.destroy() }
         runCatching { process.destroyForcibly() }
     }
@@ -77,9 +84,9 @@ object ElevatedProcessKiller {
         val handle = try {
             Process::class.java.getMethod("toHandle").invoke(process) ?: return
         } catch (_: NoSuchMethodException) {
-            return // 舊 Android 無此 API：退化關流＋單殺（fail-closed）。
+            return // 舊 Android 無此 API：退化單殺（fail-closed；串流由 drain 關）。
         } catch (_: InaccessibleObjectException) {
-            return // JDK 強封裝拒絕：退化關流＋單殺（fail-closed）。
+            return // JDK 強封裝拒絕：退化單殺（fail-closed；串流由 drain 關）。
         } catch (_: Exception) {
             return
         }
@@ -116,7 +123,8 @@ object ElevatedProcessKiller {
         } catch (_: Exception) {
             // Stream.forEach 本體異常（列舉中途 IO/併發失敗）：單個 handle 已在內層
             // runCatching 逐個收斂，此處僅吞 forEach 本體異常，fail-closed 為
-            // 「已盡力殺」，呼叫方仍回 TimedOut，不升級為崩潰；finally 仍關流。
+            // 「已盡力殺」，呼叫方仍回 TimedOut，不升級為崩潰；finally 仍關
+            // descendants 列舉流（`java.util.stream.Stream` 自身，非進程串流）。
         } finally {
             runCatching { descendants.close() }
         }

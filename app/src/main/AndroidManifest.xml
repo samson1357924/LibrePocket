@@ -54,9 +54,11 @@
         <intent>
             <action android:name="android.settings.SOUND_SETTINGS" />
         </intent>
-        <!-- C1b fallback resolve-first 契約：openFallback 先 resolve 再 startActivity，
+        <!-- C1b fallback queryIntentActivities-first 契約：openFallback 先
+             queryIntentActivities 全枚舉再 setComponent explicit 啟動，
              VOICE_INPUT_SETTINGS 須列 queries（startActivity 本身不需 queries，
-             resolve 可見性需要）。 -->
+             queryIntentActivities 可見性需要——非 resolveActivity：多候選無預設時
+             resolveActivity 回傳系統 Resolver 本身，FLAG_SYSTEM 檢查會誤判）。 -->
         <intent>
             <action android:name="android.settings.VOICE_INPUT_SETTINGS" />
         </intent>

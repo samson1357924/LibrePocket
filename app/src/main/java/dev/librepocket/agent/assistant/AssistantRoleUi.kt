@@ -243,7 +243,18 @@ fun rememberAssistantRole(): AssistantRoleUi {
         // 驗證中／DENIED 皆重讀快照：VERIFYING／held／REVOKED 調和經 effectiveAssistantReason 生效。
         refreshTick++
     }
+    /**
+     * 閉包快照語義（PocketGuard S2）：`snap` 是本次 `remember(snapshot, ...)`
+     * 計算當下捕獲的快照值——顯式本地 val，閉包內快照只讀 `snap`。
+     * （另讀寫的 pendingVerify／verifyAttempt／storedReason 等 MutableState
+     * 不受此約束，見各分支。）`AssistantSnapshot` 為不可變 sealed（`Known` data class／
+     * `Unsupported`、`ReadError` data object，無可變欄位），故無需
+     * `.copy()`；若未來出現可變欄位須改為快照拷貝。`remember` key 含
+     * `snapshot`，快照變化必重算 `request`，不會有時序 stale。
+     */
     val request: () -> Unit = remember(snapshot, roleManager, launcher, openFallback) {
+        // 顯式本地 val：閉包捕獲當次 remember 計算的快照值（見上 KDoc）。
+        val snap = snapshot
         {
             // 新一輪要求開始即結束上一輪驗證（否則舊 pendingVerify 常駐掩蓋撤銷）＋attempt=0。
             pendingVerify = false
@@ -251,10 +262,10 @@ fun rememberAssistantRole(): AssistantRoleUi {
             // Stage 2 finding C：ReadError fail-closed——不發要求、不設
             // UNSUPPORTED 碼（誠實：未知≠不支援）、不開 fallback，純 no-op
             //（主按鈕本就 disabled，此為防禦性分支）。
-            if (snapshot is AssistantSnapshot.ReadError) {
+            if (snap is AssistantSnapshot.ReadError) {
                 Log.w(TAG, "request skipped: snapshot read error (fail-closed)")
             } else {
-                when (decideAssistantRole(snapshot)) {
+                when (decideAssistantRole(snap)) {
                     AssistantRoleDecision.AlreadyHeld -> {
                         // 已確認 held 前提下寫 GRANTED（隨即被 held 規則清除為 null）：
                         // 此為新流程下 GRANTED sticky 唯一合法來源，具確認語義

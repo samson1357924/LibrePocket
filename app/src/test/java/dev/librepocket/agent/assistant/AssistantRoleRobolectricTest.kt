@@ -151,4 +151,61 @@ class AssistantRoleRobolectricTest {
             )
         }
     }
+
+    /**
+     * S1 queries 可見性契約：主 manifest `<queries>` 必須宣告
+     * `VOICE_INPUT_SETTINGS`，否則 `openFallback` 的
+     * `queryIntentActivities` 在 targetSdk 36 下被 package-visibility 過濾，
+     * 候選為空而永遠 fallbackFailed（見 AssistantRoleUi）。
+     *
+     * 測試策略註記：Robolectric 不強制 package-visibility 過濾
+     * （`queryIntentActivities` 在單測環境不經 queries 白名單裁剪），故此測
+     * 直接斷言原始碼 manifest 的 `<queries>` 區段內容（同 VoiceSttTest
+     * `manifestQueriesAction_isRecognizeSpeech` 模式），以檔案內容＋程式碼
+     * 審查為準，而非執行期可見性行為。
+     */
+    @Test
+    fun manifestQueries_declaresVoiceInputSettings() {
+        val manifest = findSourceManifest(
+            "src/main/AndroidManifest.xml",
+            "app/src/main/AndroidManifest.xml",
+        )
+        val queries = manifest.substringAfter("<queries>").substringBefore("</queries>")
+        assertTrue(
+            "主 manifest <queries> 必須宣告 VOICE_INPUT_SETTINGS" +
+                "（供 queryIntentActivities 可見性，非 resolveActivity）",
+            queries.contains("<action android:name=\"android.settings.VOICE_INPUT_SETTINGS\" />"),
+        )
+    }
+
+    /**
+     * 生產探測契約：`openFallback` 必須走 `queryIntentActivities` 全枚舉＋
+     * `setComponent` explicit（見 AssistantRoleUi）：`resolveActivity` 在
+     * 多候選無預設時回傳系統 Resolver 本身，`FLAG_SYSTEM` 檢查會誤判放行
+     * 第三方（同 VoiceSttTest `sttProbe_usesMatchDefaultOnly` 模式，以原始碼
+     * 內容＋審查為準）。
+     */
+    @Test
+    fun fallbackProbe_usesQueryIntentActivities() {
+        val ui = findSourceManifest(
+            "src/main/java/dev/librepocket/agent/assistant/AssistantRoleUi.kt",
+            "app/src/main/java/dev/librepocket/agent/assistant/AssistantRoleUi.kt",
+        )
+        assertTrue(
+            "openFallback 必須以 queryIntentActivities 全枚舉候選",
+            ui.contains("queryIntentActivities"),
+        )
+    }
+
+    /** 單測工作目錄（模組 dir）出發，向上走最多 5 層找原始碼/清單檔（同 VoiceSttTest 模式）。 */
+    private fun findSourceManifest(vararg relPaths: String): String {
+        val bases = generateSequence(java.io.File(System.getProperty("user.dir") ?: ".")) { it.parentFile }.take(6).toList()
+        for (base in bases) {
+            for (rel in relPaths) {
+                val f = java.io.File(base, rel)
+                if (f.isFile) return f.readText()
+            }
+        }
+        error("not found: ${relPaths.toList()} under ${System.getProperty("user.dir")}")
+    }
 }

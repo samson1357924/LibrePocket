@@ -21,6 +21,10 @@ private const val TAG = "LibreVoiceSession"
  * `ACTION_ASSIST`（沿用既有 ASSIST 入口），再 `hide()`。C1 不做 session 內
  * UI／STT（C2 範疇）；喚起失敗亦 `hide()`，fail-closed，不殘留空白 session。
  *
+ * `startedOk` 僅供日誌／除錯語義：`hide()` 與成功與否無關，兩路皆執行
+ * （成功亦 hide——UI 由 MainActivity 承載；失敗亦 hide——fail-closed，
+ * 不殘留空白 session）。
+ *
  * 手勢主張降級：`ACTION_ASSIST` 是既有隱式入口，第三方應用亦可偽造發起——此類
  * 不可信喚起僅開啟 App（EntryGate：ASSIST 無文字即只開 App、不自動發送），不授予
  * 額外能力。是否為可信系統手勢喚起，留待 follow-up 以 `voiceInteractionRoot`
@@ -38,15 +42,19 @@ class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSession(c
 
     override fun onShow(args: Bundle?, showFlags: Int) {
         super.onShow(args, showFlags)
+        var startedOk = false
         try {
             val assist = assistantVoiceIntent(context).setClass(
                 context,
                 MainActivity::class.java,
             )
             startVoiceActivity(assist)
+            startedOk = true
         } catch (e: Exception) {
-            Log.w(TAG, "startVoiceActivity failed", e)
+            startedOk = false
+            Log.w(TAG, "startVoiceActivity failed; hiding session (startedOk=$startedOk)", e)
         } finally {
+            // hide 與成功與否無關（見上 KDoc）：startedOk 僅供日誌／除錯語義。
             hide()
         }
     }

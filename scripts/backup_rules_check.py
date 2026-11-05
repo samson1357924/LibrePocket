@@ -77,9 +77,10 @@ canonical resource members (``res/xml/backup_rules.xml``,
 artifact's actual compiled path by NAME (release obfuscation renames the
 entry), dumps it via ``aapt dump xmltree``, rebuilds the tree and calls
 ``validate_tree`` with ``exact_excludes=True`` - the compiled exclude set
-must equal ``REQUIRED_EXCLUDES`` plus the allowlisted device-bound extras
-(``ALLOWED_EXTRA_EXCLUDES``; missing required entries AND unexpected entries
-beyond that union are failures, order-free). Source-level presence-only
+must equal ``REQUIRED_EXCLUDES`` plus the required device-bound excludes
+``REQUIRED_DEVICE_BOUND_EXCLUDES`` (single-sourced as the allowlist
+``ALLOWED_EXTRA_EXCLUDES``; missing entries from EITHER set AND unexpected
+entries beyond that union are failures, order-free). Source-level presence-only
 validation cannot see such a rewrite.
 
 It is invoked by the shell gate and is directly unit-tested against negative
@@ -108,16 +109,28 @@ REQUIRED_EXCLUDES: tuple[tuple[str, str], ...] = (
     ("file", "librepocket_keysets"),
 )
 
-# Allowlisted device-bound extras (NOT key material, NOT part of
-# BackupPolicy.KEY_FILES_EXCLUDED): per-device system state that must not
-# migrate to a restored device. `exact_excludes` mode tolerates exactly this
-# union — any other extra is still an unexpected-entry failure.
+# Required device-bound excludes (re-review #3 finding #3 [P3]): per-device
+# system state that must not migrate to a restored device, enforced with the
+# same missing-entry severity as REQUIRED_EXCLUDES (see
+# _missing_exclude_errors). Each entry is (domain, path).
 #   - ("sharedpref", "assistant_role.xml"): `everHeld` for the system
 #     ROLE_ASSISTANT grant (finding D [P3]); restoring it onto an
 #     unauthorized device would misreport REVOKED.
-ALLOWED_EXTRA_EXCLUDES: tuple[tuple[str, str], ...] = (
+# Deliberately NOT part of BackupPolicy.KEY_FILES_EXCLUDED (key/vault-only);
+# the drift guard in scripts/tests/test_apk_policy_check.py pins that 5-item
+# Kotlin list separately.
+REQUIRED_DEVICE_BOUND_EXCLUDES: tuple[tuple[str, str], ...] = (
     ("sharedpref", "assistant_role.xml"),
 )
+
+# Allowlisted device-bound extras (NOT key material, NOT part of
+# BackupPolicy.KEY_FILES_EXCLUDED): per-device system state that must not
+# migrate to a restored device. Single-sourced as REQUIRED_DEVICE_BOUND_EXCLUDES
+# so the exact-set subtraction in _unexpected_exclude_errors never
+# double-reports an entry that _missing_exclude_errors already demands:
+# a missing device-bound entry fails ONLY as "missing exclude", never also as
+# "unexpected exclude".
+ALLOWED_EXTRA_EXCLUDES: tuple[tuple[str, str], ...] = REQUIRED_DEVICE_BOUND_EXCLUDES
 
 # File↔root binding (Android's own expectation; a swapped file is silently
 # ignored by the runtime parser - see module docstring).
@@ -237,9 +250,21 @@ def _validate_rule_children(
 def _missing_exclude_errors(
     path: str, branch_label: str, present: set[tuple[str, str]]
 ) -> list[str]:
+    """Report excludes missing from the REQUIRED + DEVICE-BOUND set.
+
+    Both ``REQUIRED_EXCLUDES`` (BackupPolicy.KEY_FILES_EXCLUDED, key/vault)
+    and ``REQUIRED_DEVICE_BOUND_EXCLUDES`` (per-device system state, finding
+    #3 [P3]) must be present in every checked scope: a resources-overlay /
+    merger rewrite that drops ``assistant_role.xml`` fails here as a missing
+    entry (fail-closed), even though ``exact_excludes`` would otherwise
+    tolerate it as allowlisted. Missing from EITHER set is a FAIL.
+    """
     return [
         f"{path}: {_where(branch_label)}missing exclude domain={domain} path={rule_path}"
-        for domain, rule_path in REQUIRED_EXCLUDES
+        for domain, rule_path in (
+            *REQUIRED_EXCLUDES,
+            *REQUIRED_DEVICE_BOUND_EXCLUDES,
+        )
         if (domain, rule_path) not in present
     ]
 
@@ -250,8 +275,9 @@ def _unexpected_exclude_errors(
     """Report excludes BEYOND the required set (exact-set mode only).
 
     Artifact-level authority only: the compiled rule bytes must carry
-    ``REQUIRED_EXCLUDES`` (BackupPolicy.KEY_FILES_EXCLUDED) plus at most the
-    allowlisted ``ALLOWED_EXTRA_EXCLUDES`` (device-bound state, not key
+    ``REQUIRED_EXCLUDES`` (BackupPolicy.KEY_FILES_EXCLUDED) PLUS the required
+    device-bound excludes ``REQUIRED_DEVICE_BOUND_EXCLUDES`` (single-sourced
+    as the allowlist ``ALLOWED_EXTRA_EXCLUDES``; device-bound state, not key
     material), so any resources-overlay / merger rewrite of the compiled
     XML - even one that only ADDS other entries - fails as the set
     difference it is (order-free). Source-level third parties may
@@ -265,11 +291,13 @@ def _unexpected_exclude_errors(
         if ALLOWED_EXTRA_EXCLUDES
         else ""
     )
+    total = len(REQUIRED_EXCLUDES) + len(REQUIRED_DEVICE_BOUND_EXCLUDES)
     return [
         f"{path}: {_where(branch_label)}unexpected exclude domain={domain} "
         f"path={rule_path} - the compiled backup rules must carry the "
-        "KEY_FILES_EXCLUDED set "
-        f"({len(REQUIRED_EXCLUDES)} entries){allowed}, nothing else"
+        "KEY_FILES_EXCLUDED + device-bound set "
+        f"({total} entries: {len(REQUIRED_EXCLUDES)} key + "
+        f"{len(REQUIRED_DEVICE_BOUND_EXCLUDES)} device-bound){allowed}, nothing else"
         for domain, rule_path in extra
     ]
 
@@ -323,8 +351,10 @@ def validate_tree(
     ``aapt dump xmltree`` output of the COMPILED resource: both surfaces run
     the exact same rules so a compiled-XML rewrite cannot diverge from source.
     ``exact_excludes=True`` (artifact level only) additionally refuses
-    excludes beyond ``REQUIRED_EXCLUDES`` + ``ALLOWED_EXTRA_EXCLUDES``
-    - see ``_unexpected_exclude_errors``.
+    excludes beyond ``REQUIRED_EXCLUDES`` + ``REQUIRED_DEVICE_BOUND_EXCLUDES``
+    (single-sourced as ``ALLOWED_EXTRA_EXCLUDES``)
+    - see ``_unexpected_exclude_errors`` - while a missing entry from EITHER
+    set still fails via ``_missing_exclude_errors``.
     """
     if root.tag != expected_root:
         return [f"{path}: expected root <{expected_root}>, found <{root.tag}>"]

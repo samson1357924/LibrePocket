@@ -57,6 +57,17 @@ open class FakeSessionStore : SessionStore {
     val events = ArrayList<TranscriptEvent>()
     var now = 1_700_000_000_000L
 
+    /**
+     * TEST-ONLY writer-drain hook (zero behavior change when null): invoked
+     * synchronously at the end of [appendEvent] after `events.add`, on the
+     * writer's own thread — so a hook that reads [events] observes a
+     * consistent state with no cross-thread CME/visibility race. Per-instance
+     * state (never shared across tests). `@Volatile` so a test-thread write
+     * is visible to the writer thread.
+     */
+    @Volatile
+    var onAppended: (() -> Unit)? = null
+
     override suspend fun createSession(title: String, model: String): String {
         require(model.isNotBlank()) { "model must not be blank" }
         val id = UUID.randomUUID().toString()
@@ -99,6 +110,7 @@ open class FakeSessionStore : SessionStore {
         val max = events.filter { it.sessionId == event.sessionId }.maxOfOrNull { it.seq } ?: 0L
         check(max < Long.MAX_VALUE) { "seq exhausted" }
         events.add(event.copy(seq = max + 1, text = text, failureReason = reason))
+        onAppended?.invoke()
         return events.size.toLong()
     }
 
@@ -115,7 +127,8 @@ open class FakeSessionStore : SessionStore {
      * pass fixtures with `failureReason == null` and text that needs no
      * redaction; anything else must go through [appendEvent]. Must not be used
      * with fault-injecting subclasses (`appendEvents` does not route here;
-     * only [appendEvent] is virtual).
+     * only [appendEvent] is virtual). Does NOT invoke `onAppended`
+     * (budget-fixture fast path; use [appendEvent] when a drain hook is needed).
      */
     suspend fun appendPreRedactedForBudgetTest(event: TranscriptEvent): Long {
         require(event.kind in VALID_KINDS) { "unknown event kind: ${event.kind}" }

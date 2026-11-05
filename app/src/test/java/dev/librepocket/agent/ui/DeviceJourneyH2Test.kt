@@ -1,0 +1,371 @@
+package dev.librepocket.agent.ui
+
+import androidx.compose.foundation.layout.Column
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.junit4.StateRestorationTester
+import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performTextInput
+import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import dev.librepocket.agent.ui.chat.ChatSessionFactory
+import dev.librepocket.agent.ui.chat.ChatTestMainDispatcher
+import dev.librepocket.agent.ui.chat.ChatTestViewModelStore
+import dev.librepocket.agent.ui.chat.ChatViewModel
+import dev.librepocket.agent.ui.chat.SessionStoreSource
+import dev.librepocket.agent.ui.chat.VaultSource
+import dev.librepocket.agent.ui.chat.allowKeyReadPolicy
+import dev.librepocket.agent.ui.chat.cancelAndJoinChatTestScopes
+import dev.librepocket.agent.ui.setup.CountingVault
+import dev.librepocket.agent.ui.setup.EndpointConfig
+import dev.librepocket.agent.ui.setup.EndpointStore
+import dev.librepocket.agent.ui.setup.SetupValidation
+import dev.librepocket.agent.ui.setup.SetupViewModel
+import dev.librepocket.agent.ui.setup.VerdictPolicy
+import dev.librepocket.chat.ChatStatus
+import dev.librepocket.keystore.EncryptedPrefsVault
+import dev.librepocket.keystore.InMemoryPrefs
+import dev.librepocket.policy.Verdict
+import dev.librepocket.provider.ChatRequest
+import dev.librepocket.provider.LlmProvider
+import dev.librepocket.provider.ProviderProtocol
+import dev.librepocket.provider.StreamEvent
+import dev.librepocket.session.FakeSessionStore
+import java.io.File
+import java.nio.file.Files
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+
+private class H2FakeProvider(
+    val handler: (ChatRequest) -> Flow<StreamEvent> = { emptyFlow() },
+) : LlmProvider {
+    override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
+    override fun stream(request: ChatRequest): Flow<StreamEvent> = flow { emitAll(handler(request)) }
+    override suspend fun listModels(): List<String> = emptyList()
+}
+
+/**
+ * Batch H2（Issue #18 殘留）：零裝置 journey＋process-recreation（Robolectric/fake）。
+ *
+ * - ordering-deterministic, timing still wall-clock：本檔自身等待以
+ *   `first {} + withTimeout`／`waitUntil` 條件等待取代固定 delay；但共用
+ *   helper（awaitTrue 內 Thread.sleep(10)、DataStore IO、MockWebServer、FakeSessionStore plain-list poll）
+ *   仍是 wall-clock，並非全程 sleep-free。
+ * - NOT covered：prod ChatScreen 草稿（此處僅 local rememberSaveable stub）、
+ *   Room 持久化（僅 FakeSessionStore map）、ASK 同意路徑（僅 ALLOW）、
+ *   真旋轉（僅 fontScale 變體）。
+ * - 測試のみ：不改 production 行為；以 negative control 綁定 red-green（見各測試 KDoc 的 RED 敘述）。
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [33])
+class DeviceJourneyH2Test {
+
+    @get:Rule
+    val composeRule = createComposeRule()
+
+    private val tmpDirs = ArrayList<File>()
+    private val scopes = ArrayList<CoroutineScope>()
+    private val chatMain = ChatTestMainDispatcher()
+    private val chatStores = ChatTestViewModelStore()
+
+    @Before
+    fun setUp() {
+        chatMain.install()
+    }
+
+    @After
+    fun tearDown() {
+        try {
+            chatMain.clearViewModels(chatStores)
+        } finally {
+            try {
+                cancelAndJoinChatTestScopes(scopes)
+            } finally {
+                try {
+                    tmpDirs.forEach { it.deleteRecursively() }
+                } finally {
+                    chatMain.resetAndClose()
+                }
+            }
+        }
+    }
+
+    private fun newStore(): EndpointStore {
+        val dir = Files.createTempDirectory("h2-journey").toFile()
+        tmpDirs.add(dir)
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        scopes.add(scope)
+        return EndpointStore(
+            PreferenceDataStoreFactory.create(
+                scope = scope,
+                produceFile = { File(dir, "h2.preferences_pb") },
+            ),
+        )
+    }
+
+    private fun openAiConfig(model: String = "gpt-4o-mini") = EndpointConfig(
+        providerId = "preset:openai",
+        presetId = "openai",
+        label = "OpenAI",
+        baseUrl = "https://api.openai.com/v1",
+        protocol = ProviderProtocol.CHAT_COMPLETIONS,
+        model = model,
+        apiKeyRef = "provider_key/preset:openai",
+    )
+
+    private fun onMain(block: () -> Unit) {
+        runBlocking { chatMain.run(block) }
+    }
+
+    /**
+     * 正向 journey：first-run setup save → chat send → model-only 編輯沿用 → logout 清除。
+     *
+     * RED（若 production 退化即紅）：save 未落盤則快照為空；send 未回 `ok` 則訊息數不足；
+     * model-only 空白 key 若被誤拒則 saved=false；logout 未清則快照仍在。皆為條件等待，
+     * 無固定 sleep；任一環退化即超時紅，非計數膨脹。
+     * Resume 以第二 VM openSession(sid) 重開並回放驗證 user／assistant 文本
+     * （同一 FakeSessionStore 事件回放；跨重啟持久化仍未覆蓋）。
+     */
+    @Test
+    fun journey_firstRunSetupSendEditLogout() = runBlocking {
+        val store = newStore()
+        val vault = CountingVault(EncryptedPrefsVault(InMemoryPrefs()))
+        val setupVm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = { _, _ -> H2FakeProvider() },
+        )
+        // first-run：空白表單填 key＋save。
+        onMain {
+            setupVm.onApiKeyChange("fake-h2-journey-key-12345678")
+            setupVm.save()
+        }
+        withTimeout(10_000) { setupVm.form.first { !it.saving && (it.saved || it.errorCode != null) } }
+        assertNull("setup save must succeed, got ${setupVm.form.value.errorCode}", setupVm.form.value.errorCode)
+        assertTrue(setupVm.form.value.saved)
+        val saved = withTimeout(10_000) { store.snapshotStrict() }
+        assertEquals("preset:openai", saved?.providerId)
+        assertEquals("gpt-4o-mini", saved?.model)
+
+        // chat send（Fake provider 回 ok）：sleep-free 以 first 等待訊息落定。
+        val fake = H2FakeProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "ok"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val transcripts = FakeSessionStore()
+        // Writer-drain hook (installed BEFORE send so every append fires on
+        // the writer thread; the events read inside is same-thread → no
+        // CME/visibility race, unlike the old cross-thread poll below).
+        val drained = CompletableDeferred<Unit>()
+        transcripts.onAppended = {
+            if (transcripts.events.count { it.kind == "user" || it.kind == "assistant" } >= 2 &&
+                !drained.isCompleted
+            ) {
+                drained.complete(Unit)
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = allowKeyReadPolicy(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val chatVm = chatStores.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        onMain { chatVm.onInputChange("hi h2") }
+        onMain { chatVm.send() }
+        withTimeout(10_000) {
+            chatVm.sessionState.first { it.status == ChatStatus.IDLE && it.messages.size == 2 }
+        }
+        assertEquals("ok", chatVm.sessionState.value.messages.first { it.role == "assistant" }.text)
+        assertEquals("hi h2", chatVm.sessionState.value.messages.first { it.role == "user" }.text)
+
+        // resume：同 store 第二 VM 重開舊會話並回放歷史（FakeSessionStore 事件回放）。
+        // 回放內容經 _history 併入 messages（sessionState.messages 僅含 live
+        // 訊息，重開後為空，故以 messages.size == 2 為條件）。
+        val sid = checkNotNull(chatVm.currentSessionId.value) { "first send must create session" }
+        assertTrue(transcripts.metas.containsKey(sid))
+        // Writer-drain via the onAppended hook (installed pre-send above):
+        // the hook fires on the writer thread, so the count read is
+        // same-thread. Bounded 10s; drains in ms in practice.
+        withTimeout(10_000) { drained.await() }
+        val vm2 = chatStores.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        onMain { vm2.openSession(sid) }
+        withTimeout(10_000) { vm2.messages.first { it.size == 2 } }
+        assertEquals(sid, vm2.currentSessionId.value)
+        assertEquals("hi h2", vm2.messages.value.first { it.role == "user" }.text)
+        assertEquals("ok", vm2.messages.value.first { it.role == "assistant" }.text)
+
+        // endpoint model-only 編輯沿用（空白 key 免重貼）。
+        val editVm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = { _, _ -> H2FakeProvider() },
+        )
+        val putsBefore = vault.putKeys
+        val getsBefore = vault.getKeys
+        val deletesBefore = vault.deleteKeys
+        onMain {
+            editVm.prefillForEdit(openAiConfig())
+            editVm.onModelChange("gpt-4o")
+            editVm.save()
+        }
+        withTimeout(10_000) { editVm.form.first { !it.saving && (it.saved || it.errorCode != null) } }
+        assertNull(editVm.form.value.errorCode)
+        assertTrue(editVm.form.value.saved)
+        assertEquals(putsBefore, vault.putKeys)
+        // Model-only 編輯沿用既有 key：save 本身零 vault get/delete I/O。
+        // 上方 chat send 已做一次 attach-time getKey，故以編輯前計數為基準（非 0）。
+        assertEquals(getsBefore, vault.getKeys)
+        assertEquals(deletesBefore, vault.deleteKeys)
+        assertEquals("gpt-4o", withTimeout(10_000) { store.snapshotStrict() }?.model)
+
+        // logout 清除：store＋vault 鍵皆空。
+        val liveAlias = checkNotNull(withTimeout(10_000) { store.snapshotStrict() }?.apiKeyRef) {
+            "model-only edit must persist endpoint"
+        }.removePrefix("provider_key/")
+        check(liveAlias.isNotBlank()) { "live alias must not be blank" }
+        val done = CompletableDeferred<Boolean>()
+        onMain { editVm.logout { done.complete(it) } }
+        assertTrue("logout must succeed", withTimeout(10_000) { done.await() })
+        assertNull("logout must clear endpoint snapshot", withTimeout(10_000) { store.snapshotStrict() })
+        assertFalse("logout must clear live vault key $liveAlias", vault.hasKey(liveAlias))
+        assertNull("logout must clear live vault key bytes $liveAlias", vault.getKey(liveAlias))
+    }
+
+    private fun customConfig(url: String, model: String = "local"): EndpointConfig {
+        val id = SetupValidation.deriveEndpointId("custom", url)
+        return EndpointConfig(
+            providerId = id,
+            presetId = "custom",
+            label = "自訂",
+            baseUrl = url,
+            protocol = ProviderProtocol.CHAT_COMPLETIONS,
+            model = model,
+            apiKeyRef = SetupValidation.deriveApiKeyRef(id),
+        )
+    }
+
+    /**
+     * Negative control：跨 origin 空白 key 不沿用（fail-closed 須重貼）。
+     *
+     * RED：若身份比對誤用 origin/寬鬆相等，此測試轉紅（空白 key 被沿用即 saved=true）。
+     * 與正向 model-only 沿用測試成對：同字串沿用放行、跨 origin 拒絕，證明 gate 非恆真。
+     */
+    @Test
+    fun journey_crossOriginBlankKeyRequiresRepaste_negativeControl() = runBlocking {
+        val urlA = "http://127.0.0.1:11442/v1"
+        val urlB = "http://127.0.0.1:11443/v1"
+        val store = newStore()
+        val vault = CountingVault(EncryptedPrefsVault(InMemoryPrefs()))
+        val idA = SetupValidation.deriveEndpointId("custom", urlA)
+        vault.putKey(idA, "fake-h2-cross-key-12345678".toCharArray())
+        store.save(customConfig(urlA))
+        val putsBefore = vault.putKeys
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = { _, _ -> H2FakeProvider() },
+        )
+        onMain {
+            vm.prefillForEdit(customConfig(urlA))
+            vm.onBaseUrlChange(urlB)
+            vm.save()
+        }
+        withTimeout(10_000) { vm.form.first { !it.saving && (it.saved || it.errorCode != null) } }
+        assertEquals("SETUP_KEY_TOO_SHORT", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        // 跨 origin 空白 key 須重貼：save 失敗，零 vault 接觸（與
+        // SetupEditBoundaryAndBarrierTest.customCrossOriginBlankRequiresRepasteWithZeroVaultIo 對稱）。
+        assertEquals(putsBefore, vault.putKeys)
+        assertEquals(0, vault.deleteKeys)
+        assertEquals(0, vault.getKeys)
+        assertEquals(0, vault.hasKeys)
+    }
+
+    /**
+     * Compose saveable framework canary (local stub, NOT prod ChatScreen coverage).
+     *
+     * Process-recreation：聊天草稿（rememberSaveable）經 emulateSavedInstanceStateRestore 存活。
+     *
+     * RED：若草稿用純 remember（非 saveable），restore 後為空即紅；此處以 saveable 綠，
+     * 證明接線非恆過（把 rememberSaveable 換成 remember 即紅，negative control）。
+     * 僅釘住 Robolectric StateRestorationTester＋rememberSaveable 在 local stub 上的接線，
+     * 非 prod ChatScreen 輸入框。
+     */
+    @Test
+    fun compose_saveableFrameworkCanary_draftSurvivesRestore() {
+        val restoration = StateRestorationTester(composeRule)
+        restoration.setContent {
+            Column {
+                var draft by rememberSaveable { mutableStateOf("") }
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it },
+                    label = { Text("輸入草稿") },
+                )
+            }
+        }
+        composeRule.onNodeWithText("輸入草稿").performTextInput("hello restore")
+        composeRule.onNodeWithText("hello restore").assertIsDisplayed()
+        restoration.emulateSavedInstanceStateRestore()
+        composeRule.onNodeWithText("hello restore").assertIsDisplayed()
+    }
+
+    /**
+     * Compose saveable framework canary (local stub, NOT prod ChatScreen coverage).
+     *
+     * 大字體變體：fontScale=1.3 下草稿仍存活且可見（fontScale recreation only，非真旋轉）。
+     * 同上，僅 local stub 的 rememberSaveable 接線，非 prod ChatScreen 輸入框。
+     */
+    @Test
+    @Config(sdk = [33], fontScale = 1.3f)
+    fun compose_saveableFrameworkCanary_draftSurvivesRestoreAtLargeFont() {
+        val restoration = StateRestorationTester(composeRule)
+        restoration.setContent {
+            Column {
+                var draft by rememberSaveable { mutableStateOf("") }
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it },
+                    label = { Text("大字體草稿") },
+                )
+            }
+        }
+        composeRule.onNodeWithText("大字體草稿").performTextInput("大字你好")
+        composeRule.onNodeWithText("大字你好").assertIsDisplayed()
+        restoration.emulateSavedInstanceStateRestore()
+        composeRule.onNodeWithText("大字你好").assertIsDisplayed()
+    }
+}

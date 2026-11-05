@@ -1231,6 +1231,109 @@ class AssistantRoleTest {
         assertEquals(true, canStartRequest(false))
     }
 
+    // ---- re-review #5 finding #1 [P2/Merge blocker]：held 觀察幀清除序列 ----
+
+    @Test
+    fun givenDeniedThenHeldObserved_whenExternallyRevoked_thenReportsRevoked() {
+        // 序列鎖定（純函數層模擬 UI SideEffect 三步）：
+        // DENIED（!held passthrough）→ held 觀察（everHeld＋清除→null）
+        // → 外部撤銷（!held＋everHeld＋null→REVOKED，而非殘留 DENIED）。
+        var stored: String? = AssistantReasonCode.DENIED
+        var everHeld = false
+        val notHeld = AssistantSnapshot.Known(available = true, held = false)
+        // 第 1 幀：無 held 觀察史時 passthrough（舊孤立真值表語義仍對）。
+        assertEquals(
+            AssistantReasonCode.DENIED,
+            effectiveAssistantReason(stored, notHeld, everHeld, false),
+        )
+        // 第 2 幀：觀察到 held（可信確認）→ sticky＋經純函數清除舊事件碼。
+        val held = AssistantSnapshot.Known(available = true, held = true)
+        if (held.held) everHeld = true
+        stored = reconcileStoredOnHeldObserved(stored, heldConfirmed = true)
+        assertNull("held 觀察幀必須清除陳舊 DENIED", stored)
+        assertNull(effectiveAssistantReason(stored, held, everHeld, false))
+        // 第 3 幀：外部撤銷 → REVOKED（不清則殘留 DENIED，此測鎖定修復）。
+        assertEquals(
+            AssistantReasonCode.REVOKED,
+            effectiveAssistantReason(stored, notHeld, everHeld, false),
+        )
+    }
+
+    @Test
+    fun givenUnconfirmedThenHeldObserved_whenExternallyRevoked_thenReportsRevoked() {
+        // UNCONFIRMED 同理：超時未確認碼亦是舊事件，held 觀察後過期。
+        var stored: String? = AssistantReasonCode.UNCONFIRMED
+        var everHeld = false
+        val notHeld = AssistantSnapshot.Known(available = true, held = false)
+        assertEquals(
+            AssistantReasonCode.UNCONFIRMED,
+            effectiveAssistantReason(stored, notHeld, everHeld, false),
+        )
+        val held = AssistantSnapshot.Known(available = true, held = true)
+        if (held.held) everHeld = true
+        stored = reconcileStoredOnHeldObserved(stored, heldConfirmed = true)
+        assertNull("held 觀察幀必須清除陳舊 UNCONFIRMED", stored)
+        assertNull(effectiveAssistantReason(stored, held, everHeld, false))
+        assertEquals(
+            AssistantReasonCode.REVOKED,
+            effectiveAssistantReason(stored, notHeld, everHeld, false),
+        )
+    }
+
+    @Test
+    fun givenRequestFailedThenHeldObserved_whenExternallyRevoked_thenReportsRevoked() {
+        // REQUEST_FAILED 同理（至少一例）。
+        var stored: String? = AssistantReasonCode.REQUEST_FAILED
+        var everHeld = false
+        val notHeld = AssistantSnapshot.Known(available = true, held = false)
+        assertEquals(
+            AssistantReasonCode.REQUEST_FAILED,
+            effectiveAssistantReason(stored, notHeld, everHeld, false),
+        )
+        val held = AssistantSnapshot.Known(available = true, held = true)
+        if (held.held) everHeld = true
+        stored = reconcileStoredOnHeldObserved(stored, heldConfirmed = true)
+        assertNull("held 觀察幀必須清除陳舊 REQUEST_FAILED", stored)
+        assertNull(effectiveAssistantReason(stored, held, everHeld, false))
+        assertEquals(
+            AssistantReasonCode.REVOKED,
+            effectiveAssistantReason(stored, notHeld, everHeld, false),
+        )
+    }
+
+    @Test
+    fun givenHeldObservedWithPendingVerify_whenCleared_thenPendingEndsWithoutConflict() {
+        // 同幀無矛盾：held 幀清除 stored 同時 consumePendingVerify(pending, held)
+        // 恆回 false（次數無關），VERIFYING 不殘留、pending 不殘留。
+        var stored: String? = AssistantReasonCode.DENIED
+        val everHeld = true // 先前已 sticky（二次 held 觀察亦須清除）。
+        val held = AssistantSnapshot.Known(available = true, held = true)
+        stored = reconcileStoredOnHeldObserved(stored, heldConfirmed = true)
+        assertNull(stored)
+        assertEquals(false, consumePendingVerify(true, held, 0))
+        assertEquals(false, consumePendingVerify(true, held, VERIFY_MAX_ATTEMPTS))
+        assertNull(effectiveAssistantReason(stored, held, everHeld, true))
+    }
+
+    @Test
+    fun givenFreshDeniedWithEverHeld_whenNotHeld_thenDeniedPreserved() {
+        // 「不清」路徑：清除僅發生在 held 觀察幀；新 DENIED 寫入幀 snapshot 非
+        // held，故保留——新鮮 DENIED 優先於更舊 everHeld（證明不誤殺新鮮碼）。
+        assertEquals(
+            AssistantReasonCode.DENIED,
+            reconcileStoredOnHeldObserved(AssistantReasonCode.DENIED, heldConfirmed = false),
+        )
+        assertEquals(
+            AssistantReasonCode.DENIED,
+            effectiveAssistantReason(
+                AssistantReasonCode.DENIED,
+                AssistantSnapshot.Known(available = true, held = false),
+                everHeld = true,
+                pendingVerify = false,
+            ),
+        )
+    }
+
     @Test
     fun givenUnsupportedOrRequestFailedText_whenRead_thenDoesNotClaimFallbackOpened() {
         // re-review #4 finding #3 [P3/UX]：原因行不預設 fallback 已開啟

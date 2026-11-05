@@ -166,10 +166,29 @@ fun rememberAssistantRole(): AssistantRoleUi {
     // 重寫 storedReason（everHeld→REVOKED，其餘→UNCONFIRMED；held 確認不寫，
     // 保持 null），再清 pending（見下）。
     // 次數遞增由排程端 LaunchedEffect 執行（見下），此處不計數。
+    // re-review #5 finding #1 [P2/Merge blocker]：held 觀察幀同步清除過期
+    // storedReason（見 reconcileStoredOnHeldObserved；KDoc 序列語義），消除
+    // DENIED→held→撤銷鏈路的陳舊碼殘留（REQUEST_FAILED／UNSUPPORTED／
+    // UNCONFIRMED／GRANTED 殘留同理）。
     SideEffect {
-        if (snapshot is AssistantSnapshot.Known && snapshot.held && !everHeld) {
-            everHeld = true
-            prefs.edit().putBoolean("ever_held", true).apply()
+        // held 是可信確認（新鮮快照真相）：本幀 Known(held=true) 即置 everHeld
+        // sticky＋清除舊事件碼（DENIED／REQUEST_FAILED／UNSUPPORTED／
+        // UNCONFIRMED／GRANTED 殘留一律過期，經 reconcileStoredOnHeldObserved
+        // 回 null）。「新鮮 DENIED 優先於更舊 everHeld」規則不變：新 DENIED 只
+        // 可能在 !held 下寫入（request 回調非 OK 分支／分支決策，寫入幀 snapshot
+        // 非 held），故不會被此清除誤殺；清除僅發生在觀察到 held 的幀。
+        // 邊界 AlreadyHeld：request() 在 held 前提寫 GRANTED（見下 request 分支），
+        // state 當幀即經 held 規則算 null；此處下幀再清仍 null，一致。
+        // VERIFYING／pending 不動：consumePendingVerify(pending, Known held) 恆回
+        // false（次數無關），清除 stored 與消耗 pending 同幀無矛盾（見下）。
+        // 與終止重寫互斥：終止重寫（verificationTimeoutReason）僅 !held 分支
+        // （heldNow==false＋attempt>=MAX），本清除僅 held 分支，同一幀永不雙寫。
+        if (snapshot is AssistantSnapshot.Known && snapshot.held) {
+            if (!everHeld) {
+                everHeld = true
+                prefs.edit().putBoolean("ever_held", true).apply()
+            }
+            storedReason = reconcileStoredOnHeldObserved(storedReason, heldConfirmed = true)
         }
         if (pendingVerify) {
             // re-review #4 finding #1 [P2/Merge blocker] 終止收斂：重試耗盡且

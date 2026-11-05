@@ -432,8 +432,33 @@ fun verificationTimeoutReason(
 }
 
 /**
- * 驗證中是否允許發起新要求（re-review #4 finding #2 [P3/UX] 純函數防線）。
+ * held 觀察幀的 stored 清除（re-review #5 finding #1 [P2/Merge blocker]，純函數；
+ * UI 在 `SideEffect` 內觀察到 Known(held=true) 的幀呼叫，序列轉移可測）。
  *
+ * 序列語義（三步）：
+ * 1. 某幀 `stored=DENIED`（或 REQUEST_FAILED／UNSUPPORTED／UNCONFIRMED／GRANTED
+ *    殘留）＋ Known(!held)（`effective` 走 passthrough 顯示舊事件碼，此為舊孤立
+ *    真值表語義，無 held 觀察史時仍對）；
+ * 2. 後續某幀觀察到 Known(held=true)（held 是可信確認＝新鮮快照真相）→
+ *    `everHeld=true` sticky 同時本函數回 null（舊事件碼一律過期）；
+ * 3. 再後續外部撤銷（Known(!held)＋everHeld＋stored=null）→ `effective` 判
+ *    REVOKED（而非殘留 DENIED 等過期碼）。
+ * 若第 2 步不清 stored，第 3 步會因 `stored != null` 走 passthrough 分支，
+ * 顯示過期 DENIED 而非 REVOKED（REQUEST_FAILED／UNSUPPORTED／UNCONFIRMED 同理）。
+ *
+ * 「新鮮 DENIED 優先於更舊 everHeld」規則不變：新 DENIED 只可能在 !held 下寫入
+ * （request 回調非 OK 分支／分支決策寫入），寫入幀 snapshot 非 held，故不會被
+ * 此清除誤殺；清除僅發生在觀察到 held 的幀（`heldConfirmed == true` 才回 null，
+ * 否則原樣回 `stored`，即「不清」路徑）。
+ *
+ * 與驗證終止重寫互斥：終止重寫（[verificationTimeoutReason]）僅 !held 分支執行，
+ * 本清除僅 held 分支執行，同一幀永不雙寫（見 AssistantRoleUi `SideEffect`）。
+ */
+fun reconcileStoredOnHeldObserved(stored: String?, heldConfirmed: Boolean): String? =
+    if (heldConfirmed) null else stored
+
+/**
+ * 驗證中是否允許發起新要求（re-review #4 finding #2 [P3/UX] 純函數防線）。
  * `request()` 入口守衛（見 AssistantRoleUi）：`pendingVerify == true`（驗證重試
  * 跑時）一律回 false，呼叫方純 no-op＋Log，不清驗證、不開授權頁；
  * UI 另以 [AssistantSettingsState.verifying] disabled 主按鈕，此為防禦性第二層

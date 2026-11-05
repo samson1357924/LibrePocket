@@ -10,8 +10,8 @@ Validates the strict checksum-only gate without running Gradle:
     (checksum-only; signatures/keyrings are a separate future slice);
   * no global bypass: no <verify-metadata>false</verify-metadata>, no
     <trusted-artifacts> allowlist, no ignored-keys, no key-servers disabled;
-  * every <component> carries at least one <sha256> with a 64-hex value and
-    no weak-only (md5/sha1) entries;
+  * every <component> carries exactly one childless <sha256> with a 64-hex
+    value and no weak-only (md5/sha1) entries (no <also-trust> alternates);
   * no per-configuration bypass in Gradle files
     (disableDependencyVerification must not appear).
 
@@ -156,6 +156,17 @@ class VerificationMetadataTest(unittest.TestCase):
             _comp, art = _first_comp_artifact(t)
             art.find("v:sha256", NS).set("value", "abc123")
 
+        def sha256_with_also_trust_child(t):
+            _comp, art = _first_comp_artifact(t)
+            sha = art.find("v:sha256", NS)
+            ET.SubElement(sha, f"{{{VNS}}}also-trust",
+                          attrib={"value": "f" * 64})
+
+        def sha256_duplicated(t):
+            _comp, art = _first_comp_artifact(t)
+            sha = art.find("v:sha256", NS)
+            art.append(copy.deepcopy(sha))
+
         def sha256_nonhex(t):
             _comp, art = _first_comp_artifact(t)
             art.find("v:sha256", NS).set("value", "z" * 64)
@@ -194,6 +205,8 @@ class VerificationMetadataTest(unittest.TestCase):
             "weak sha1-only": sha1_only,
             "sha256 coexisting with weak md5": sha256_plus_weak_md5,
             "sha256 short value": sha256_short,
+            "sha256 with also-trust child": sha256_with_also_trust_child,
+            "sha256 duplicated": sha256_duplicated,
             "sha256 non-hex value": sha256_nonhex,
             "component missing version": component_missing_version,
             "component missing group": component_missing_group,

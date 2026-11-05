@@ -65,9 +65,18 @@ def validate_tree(root: ET.Element) -> None:
             aname = artifact.get("name")
             if not aname:
                 raise ValueError(f"artifact missing name in {group}:{name}:{version}")
-            sha = artifact.find("v:sha256", NS)
-            if sha is None:
-                raise ValueError(f"artifact {aname} missing <sha256> (weak-only or unsigned)")
+            shas = artifact.findall("v:sha256", NS)
+            if len(shas) != 1:
+                raise ValueError(
+                    f"artifact {aname} must have exactly one <sha256> "
+                    f"(got {len(shas)}; missing is weak-only or unsigned)"
+                )
+            sha = shas[0]
+            if len(list(sha)) != 0:
+                raise ValueError(
+                    f"artifact {aname} <sha256> must not have child elements "
+                    f"(e.g. <also-trust>)"
+                )
             value = (sha.get("value") or "").strip()
             if len(value) != 64 or any(c not in HEX64 for c in value):
                 raise ValueError(f"artifact {aname} has invalid sha256: {value!r}")

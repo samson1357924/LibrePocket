@@ -95,6 +95,10 @@ object OpenAiTtsModels {
      * Canonical speech endpoint path. Single source of truth for the
      * `POST /v1/audio/speech` path; [OpenAiTtsClient.resolveEndpoint] must build
      * endpoint URLs from this constant instead of duplicating path literals.
+     *
+     * Realtime 遷移入口註記：遷移至 Realtime API（見 [MIGRATION_TARGET]）時，此 path allowlist
+     * 必須重構（新路徑/傳輸不同，不可僅改字串；須同步重構 [OpenAiTtsClient.resolveEndpoint] 與
+     * `validateEndpointUrl` 的精確路徑比對）。
      */
     const val SPEECH_ENDPOINT_PATH = "/v1/audio/speech"
     /**

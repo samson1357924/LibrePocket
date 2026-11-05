@@ -2,6 +2,7 @@ package dev.librepocket.voice
 
 import android.media.MediaDataSource
 import android.media.MediaPlayer
+import androidx.annotation.VisibleForTesting
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.agent.ui.setup.SetupValidation
@@ -131,6 +132,10 @@ class ByteArrayMediaDataSource(
  * play 發起的 setDataSource/prepareAsync/setListener 在呼叫方線程鎖外執行（不持 monitor、不進池），
  * 確保 [stop] 與新播放能隨時即時中斷。
  * 不再宣稱同步有界靜音：stop() 返回僅保證邏輯取消完成，不保證返回當下已無聲。
+ *
+ * 拆分路線圖（scaffold 期不拆：風險>收益）：未來接線 PR 擬拆為 ResourceGate（原子預佔/retained 總帳）/
+ * MuteReleasePipeline（mute/release 背景鏈+有界丟棄）/PlaybackCoordinator（世代 claim+柵欄+prepare 超時），
+ * 本類屆時僅保留接線。
  */
 class AndroidAudioPlayer(
     private val mediaPlayerFactory: () -> MediaPlayer = { MediaPlayer() },
@@ -211,7 +216,10 @@ class AndroidAudioPlayer(
      * 允許測試將 A 暫停於「admission 成功後、factory snapshot 前」，再由主線程呼叫 [stop]
      * 製造決定性交錯；放行後 A 以登記時世代比對，必因 session 遞增而失格。生產為 null。
      * 僅測試使用，呼叫端必須自帶超時，不得在持有 [lock] 時阻塞。
+     *
+     * 測試縫不變量：生產永不設置（恆為 null）；僅決定性並發測試在鎖外短暫注入且自帶超時。
      */
+    @VisibleForTesting
     @Volatile
     internal var preFactorySnapshotBarrierForTest: (() -> Unit)? = null
     /**
@@ -219,7 +227,10 @@ class AndroidAudioPlayer(
      * 允許測試將回呼線程暫停於「最後一次 epoch check 之前」，再由主線程呼叫 [stop] 製造決定性交錯；
      * 實作在柵欄返回後仍會做最終雙重柵欄複檢，故遲到 onPrepared 永不 start。生產為 null。
      * 僅測試使用，呼叫端必須自帶超時，不得在持有 [lock] 時阻塞。
+     *
+     * 測試縫不變量：生產永不設置（恆為 null）；僅決定性並發測試注入且自帶超時。
      */
+    @VisibleForTesting
     @Volatile
     internal var preStartBarrierForTest: ((Long) -> Unit)? = null
     // 已成功 onPrepared 並進入 PLAYING 的世代集合（以 lock 保護）。
@@ -317,7 +328,12 @@ class AndroidAudioPlayer(
      * 長生命週期 idle stop() 不再無界增長）；測試需先置 true 啟用。啟用時亦有界
      * ([MAX_EVENT_LOG] ring，滿時丟棄最舊保留最新），避免測試大量操作撐爆記憶體。 */
     internal val testEventLog = java.util.concurrent.ConcurrentLinkedQueue<String>()
-    /** 測試專用開關：預設 false（生產零記錄）；決定性並發測試置 true 後才記錄事件序。 */
+    /**
+     * 測試專用開關：預設 false（生產零記錄）；決定性並發測試置 true 後才記錄事件序。
+     *
+     * 測試縫不變量：生產永不設置（恆為 false，零 append）；僅決定性並發測試短暫置 true。
+     */
+    @VisibleForTesting
     @Volatile
     internal var eventLogEnabledForTest: Boolean = false
     private fun logEvent(event: String) {
@@ -1576,13 +1592,21 @@ class OpenAiSpeechEngine(
      * 測試專用柵欄：首輪 shutdown 持 [shutdownLock] 期間依序回調 "after-cas" / "after-fencing" /
      * "before-release"，允許決定性並發測試將首輪暫停於 CAS 與 stop 之間，再由第二線程調 shutdown
      * 驗證其阻塞等待而非提前關池。生產為 null；測試必須自帶超時，不得無限阻塞。
+     *
+     * 測試縫不變量：生產永不設置（恆為 null）；僅決定性並發測試注入且自帶超時。
      */
+    @VisibleForTesting
     @Volatile
     internal var shutdownPauseForTest: ((String) -> Unit)? = null
 
-    /** 測試專用柵欄：在世代躍遷臨界區外、遞增 epoch 後回調，允許測試暫停舊請求以驗證 winner 語義。生產為 null。
-   * 僅測試使用，呼叫端必須自帶超時（例如 `CountDownLatch.await(5, SECONDS)`），且絕不在持有
-   * [generationLock] 時阻塞，以免卡住 [stop]。實作上柵欄已移出鎖外，stop 可隨時中斷。 */
+    /**
+     * 測試專用柵欄：在世代躍遷臨界區外、遞增 epoch 後回調，允許測試暫停舊請求以驗證 winner 語義。生產為 null。
+     * 僅測試使用，呼叫端必須自帶超時（例如 `CountDownLatch.await(5, SECONDS)`），且絕不在持有
+     * [generationLock] 時阻塞，以免卡住 [stop]。實作上柵欄已移出鎖外，stop 可隨時中斷。
+     *
+     * 測試縫不變量：生產永不設置（恆為 null）；僅 winner 語義測試注入且自帶超時。
+     */
+    @VisibleForTesting
     @Volatile
     internal var epochClaimBarrierForTest: ((Long) -> Unit)? = null
 
@@ -1919,6 +1943,191 @@ class OpenAiSpeechEngine(
     ): Check = Companion.check(voiceOutputOn, openAiTtsOn, hasKey, flavor)
 
     /**
+     * pre-check 階段 sealed 結果（Stage-B 第五輪：深嵌套拆分）。
+     *
+     * - [Passed] 攜帶後續 claim→synthesize→play 所需最小狀態（已脫敏文字 + 金鑰解析結果）；
+     * - [Denied]／[Cancelled] 直接對應原內聯分支的 `SynthOutcome`，語義零變更。
+     *
+     * 行為契約：[runPreChecks] 完整保留原 8 檢查中的前 2 項（入口 `isShutdown/callerJob` +
+     * 解析後 `isShutdown/stopEpoch/callerJob`），主體保留後 5 項（claim 內/claim 後/winner 內外/
+     * 合成前/播放前後 `isShutdown/epoch/callerJob`）＋最外層 closed fail-fast，共 8 柵欄語義不變。
+     */
+    private sealed interface PreCheckResult {
+        data class Passed(
+            val redacted: String,
+            val resolvedKey: ResolvedKey?,
+            val effectiveVault: KeyVault?,
+            val effectiveSupplier: (suspend () -> CharArray?)?,
+        ) : PreCheckResult
+        data class Denied(val outcome: SynthOutcome.Denied) : PreCheckResult
+        data class Cancelled(val outcome: SynthOutcome.Failed) : PreCheckResult
+    }
+
+    /**
+     * pre-check 子步驟 sealed 結果：脫敏文字驗證。
+     * [Passed] 攜帶已脫敏非空白文字；[Denied] 攜帶 `EMPTY_TEXT` 拒絕（訊息與原內聯分支逐字一致）。
+     */
+    private sealed interface RedactResult {
+        data class Passed(val redacted: String) : RedactResult
+        data class Denied(val outcome: SynthOutcome.Denied) : RedactResult
+    }
+
+    /**
+     * 1. 輕量開關門禁（純函數，原內聯步驟 1 逐字搬移）。
+     * 檢查不通過絕不遞增 speechEpoch 或中斷正在播放的工作；回傳 null 表通過。
+     */
+    private fun checkSwitchGate(
+        voiceOutputOn: Boolean,
+        openAiTtsOn: Boolean,
+        flavor: Flavor,
+    ): SynthOutcome.Denied? {
+        val switchDeny = OpenAiSpeechGate.denyReason(flavor, voiceOutputOn, openAiTtsOn, hasKey = true)
+        if (switchDeny != null) {
+            val d = denied(switchDeny, DETAIL_SWITCH_OFF, "到設定同時開啟「語音輸出」與「OpenAI 語音」後重試")
+            return SynthOutcome.Denied(d.reason, d.detail, d.message)
+        }
+        return null
+    }
+
+    /**
+     * 2. 脫敏文字與空白檢查（純函數，原內聯步驟 2 逐字搬移）。
+     */
+    private fun redactInputOrDenied(text: String): RedactResult {
+        val redacted = VoiceTools.redactForCloud(text)
+        if (redacted.isBlank()) {
+            return RedactResult.Denied(
+                SynthOutcome.Denied(
+                    reason = DenyReason.USER_DISABLED,
+                    detail = DETAIL_EMPTY_TEXT,
+                    message = S1bFallback.message(
+                        what = "OpenAI 語音（$DETAIL_EMPTY_TEXT）",
+                        reason = DenyReason.USER_DISABLED,
+                        detail = DETAIL_EMPTY_TEXT,
+                        alternative = "read the text on screen manually",
+                        needFromUser = "提供要朗讀的文字",
+                    ),
+                ),
+            )
+        }
+        return RedactResult.Passed(redacted)
+    }
+
+    /**
+     * 3. 金鑰解析（suspend，原內聯步驟 3 前半逐字搬移）。
+     * 僅包裝 [resolveEffectiveKey]；fail-closed 語義（DataStore 讀取失敗/pendingDelete/config 缺失
+     * 回傳 null，嚴禁向下降級）保留在被包裝函數內，此處不新增分支。
+     */
+    private suspend fun resolveKeyForPreCheck(
+        effectiveVault: KeyVault?,
+        effectiveEndpointStore: EndpointStore?,
+        effectiveSupplier: (suspend () -> CharArray?)?,
+        effectiveOriginUrl: String?,
+    ): ResolvedKey? = resolveEffectiveKey(
+        vault = effectiveVault,
+        endpointStore = effectiveEndpointStore,
+        supplier = effectiveSupplier,
+        supplierOriginUrl = effectiveOriginUrl,
+        hasClientSupplier = client.hasApiKeySupplier,
+    )
+
+    /**
+     * 4. 金鑰—端點綁定 + 二次門禁（純函數，原內聯步驟 3 後半逐字搬移）。
+     * 嚴防憑證送往非授權端點或未隔離 loopback；回傳 null 表通過。
+     */
+    private fun validateBindingOrDenied(
+        resolvedKey: ResolvedKey?,
+        voiceOutputOn: Boolean,
+        openAiTtsOn: Boolean,
+        flavor: Flavor,
+        allowTestLoopback: Boolean,
+    ): SynthOutcome.Denied? {
+        if (resolvedKey != null && !isKeyTargetBindingAllowed(resolvedKey, client.baseUrl, allowTestLoopback)) {
+            val d = denied(DenyReason.NO_PRIVILEGE, DETAIL_NO_KEY, "先在設定寫入 OpenAI 金鑰後重試")
+            return SynthOutcome.Denied(d.reason, d.detail, d.message)
+        }
+        val hasKey = resolvedKey != null && isKeyTargetBindingAllowed(resolvedKey, client.baseUrl, allowTestLoopback)
+        when (val c = check(voiceOutputOn = voiceOutputOn, openAiTtsOn = openAiTtsOn, hasKey = hasKey, flavor = flavor)) {
+            is Check.Denied -> return SynthOutcome.Denied(c.reason, c.detail, c.message)
+            is Check.Allowed -> Unit
+        }
+        return null
+    }
+
+    private fun cancelledOutcome(): SynthOutcome.Failed = SynthOutcome.Failed(
+        detail = DETAIL_CANCELLED,
+        message = "語音合成已被中斷",
+    )
+
+    /**
+     * pre-check 編排（suspend，原內聯步驟 1–3 + 前後 2 柵欄逐字搬移，零行為變更）。
+     *
+     * 保留語義（與原內聯順序一致）：
+     * - C2 入口柵欄：`isShutdown || callerJob inactive` → [PreCheckResult.Cancelled]；
+     * - switch gate → [PreCheckResult.Denied]（SWITCH_OFF）；
+     * - redaction → [PreCheckResult.Denied]（EMPTY_TEXT）；
+     * - key resolution（suspend）+ binding validation → [PreCheckResult.Denied]（NO_KEY）；
+     * - C3 解析後柵欄：`isShutdown || stopEpoch != preCheck || callerJob inactive` → Cancelled。
+     *
+     * suspension 點與原碼一致：僅 [resolveKeyForPreCheck]（即原 `resolveEffectiveKey` 內 vault/endpoint
+     * 讀取）可暫停；C2 在任何暫停前執行，C3 在解析完成後執行，期間 stop/shutdown 交錯語義不變。
+     */
+    private suspend fun runPreChecks(
+        text: String,
+        vault: KeyVault?,
+        endpointStore: EndpointStore?,
+        apiKeyOverride: (suspend () -> CharArray?)?,
+        apiKeyOverrideOriginUrl: String?,
+        voiceOutputOn: Boolean,
+        openAiTtsOn: Boolean,
+        flavor: Flavor,
+        allowTestLoopback: Boolean,
+        preCheckStopEpoch: Long,
+        callerJob: Job?,
+    ): PreCheckResult {
+        if (isShutdown.get() || callerJob?.isActive == false) {
+            return PreCheckResult.Cancelled(cancelledOutcome())
+        }
+        checkSwitchGate(voiceOutputOn, openAiTtsOn, flavor)?.let {
+            return PreCheckResult.Denied(it)
+        }
+        val redacted = when (val r = redactInputOrDenied(text)) {
+            is RedactResult.Denied -> return PreCheckResult.Denied(r.outcome)
+            is RedactResult.Passed -> r.redacted
+        }
+        val effectiveVault = vault ?: this@OpenAiSpeechEngine.vault
+        val effectiveEndpointStore = endpointStore ?: this@OpenAiSpeechEngine.endpointStore
+        val (effectiveSupplier, effectiveOriginUrl) = if (apiKeyOverride != null) {
+            apiKeyOverride to apiKeyOverrideOriginUrl
+        } else {
+            this@OpenAiSpeechEngine.apiKeySupplier to this@OpenAiSpeechEngine.apiKeySupplierOriginUrl
+        }
+        val resolvedKey = resolveKeyForPreCheck(
+            effectiveVault = effectiveVault,
+            effectiveEndpointStore = effectiveEndpointStore,
+            effectiveSupplier = effectiveSupplier,
+            effectiveOriginUrl = effectiveOriginUrl,
+        )
+        validateBindingOrDenied(
+            resolvedKey = resolvedKey,
+            voiceOutputOn = voiceOutputOn,
+            openAiTtsOn = openAiTtsOn,
+            flavor = flavor,
+            allowTestLoopback = allowTestLoopback,
+        )?.let {
+            return PreCheckResult.Denied(it)
+        }
+        if (isShutdown.get() || stopEpoch.get() != preCheckStopEpoch || callerJob?.isActive == false) {
+            return PreCheckResult.Cancelled(cancelledOutcome())
+        }
+        return PreCheckResult.Passed(
+            redacted = redacted,
+            resolvedKey = resolvedKey,
+            effectiveVault = effectiveVault,
+            effectiveSupplier = effectiveSupplier,
+        )
+    }
+
+    /**
      * 雲端語音合成並於受限記憶體緩衝中播放音訊（app 層不寫入檔案系統（零 File 引用），上限 25MB；框架層(MediaPlayer/OEM)是否落盤依實作而定）。
      *
      * 取消契約（統一）：
@@ -1930,6 +2139,10 @@ class OpenAiSpeechEngine(
      *
      * 重試契約：engine 永不隱性重試（單次呼叫恰一發，[retryable] 僅為分類標籤不觸發重送）；
      * 未來 UI 若重試需指數退避＋尊重 Retry-After＋上限＋同 epoch/手勢（同一次使用者手勢／同一世代內才可重試，失敗不自動重試）。
+     *
+     * 結構（Stage-B 第五輪）：pre-check 階段（switch gate→redaction→key resolution→binding validation，
+     * 含前後 2 柵欄）已抽成 [runPreChecks]（sealed [PreCheckResult]）；主體僅留 claim→synthesize→play→cleanup。
+     * 8 項 `isShutdown/epoch/callerJob` 檢查語義逐字保留（2 在 pre-check、5 在主體 claim/合成/播放路徑＋最外層 1），行為零變更。
      *
      * @param text 要合成的文字（送雲前先經 [VoiceTools.redactForCloud] best-effort 已知樣式遮罩，非匿名化；朗讀文本將送 OpenAI 依其條款處理）。
      * @param vault 提供 OpenAI API 金鑰的 [KeyVault]（未傳則使用建構子注入者）。
@@ -1975,72 +2188,30 @@ class OpenAiSpeechEngine(
             return withContext(Dispatchers.IO) {
         val preCheckStopEpoch = stopEpoch.get()
         val callerJob = coroutineContext[Job]
-        if (isShutdown.get() || callerJob?.isActive == false) {
-            return@withContext SynthOutcome.Failed(
-                detail = DETAIL_CANCELLED,
-                message = "語音合成已被中斷",
-            )
-        }
-
-        // 1. 輕量開關門禁檢查（檢查不通過絕不遞增 speechEpoch 或中斷正在播放的工作）
-        val switchDeny = OpenAiSpeechGate.denyReason(flavor, voiceOutputOn, openAiTtsOn, hasKey = true)
-        if (switchDeny != null) {
-            val d = denied(switchDeny, DETAIL_SWITCH_OFF, "到設定同時開啟「語音輸出」與「OpenAI 語音」後重試")
-            return@withContext SynthOutcome.Denied(d.reason, d.detail, d.message)
-        }
-
-        // 2. 脫敏文字與空白檢查
-        val redacted = VoiceTools.redactForCloud(text)
-        if (redacted.isBlank()) {
-            return@withContext SynthOutcome.Denied(
-                reason = DenyReason.USER_DISABLED,
-                detail = DETAIL_EMPTY_TEXT,
-                message = S1bFallback.message(
-                    what = "OpenAI 語音（$DETAIL_EMPTY_TEXT）",
-                    reason = DenyReason.USER_DISABLED,
-                    detail = DETAIL_EMPTY_TEXT,
-                    alternative = "read the text on screen manually",
-                    needFromUser = "提供要朗讀的文字",
-                ),
-            )
-        }
-
-        // 3. 基本金鑰存在性與端點綁定檢查
-        val effectiveVault = vault ?: this@OpenAiSpeechEngine.vault
-        val effectiveEndpointStore = endpointStore ?: this@OpenAiSpeechEngine.endpointStore
-        val (effectiveSupplier, effectiveOriginUrl) = if (apiKeyOverride != null) {
-            apiKeyOverride to apiKeyOverrideOriginUrl
-        } else {
-            this@OpenAiSpeechEngine.apiKeySupplier to this@OpenAiSpeechEngine.apiKeySupplierOriginUrl
-        }
-
-        val resolvedKey = resolveEffectiveKey(
-            vault = effectiveVault,
-            endpointStore = effectiveEndpointStore,
-            supplier = effectiveSupplier,
-            supplierOriginUrl = effectiveOriginUrl,
-            hasClientSupplier = client.hasApiKeySupplier,
+        // Stage-B 第五輪：pre-check 階段（switch gate→redaction→key resolution→binding validation，
+        // 含前後 2 柵欄）已抽成 [runPreChecks]（sealed 結果），此處僅分派；語義與原內聯逐字一致。
+        val preCheck = runPreChecks(
+            text = text,
+            vault = vault,
+            endpointStore = endpointStore,
+            apiKeyOverride = apiKeyOverride,
+            apiKeyOverrideOriginUrl = apiKeyOverrideOriginUrl,
+            voiceOutputOn = voiceOutputOn,
+            openAiTtsOn = openAiTtsOn,
+            flavor = flavor,
+            allowTestLoopback = allowTestLoopback,
+            preCheckStopEpoch = preCheckStopEpoch,
+            callerJob = callerJob,
         )
-
-        // 驗證金鑰與目標端點的綁定安全契約：嚴防 OpenAI 官方或自訂憑證送往非授權端點或未隔離之本機 loopback
-        if (resolvedKey != null && !isKeyTargetBindingAllowed(resolvedKey, client.baseUrl, allowTestLoopback)) {
-            val d = denied(DenyReason.NO_PRIVILEGE, DETAIL_NO_KEY, "先在設定寫入 OpenAI 金鑰後重試")
-            return@withContext SynthOutcome.Denied(d.reason, d.detail, d.message)
+        val passedPreCheck = when (preCheck) {
+            is PreCheckResult.Denied -> return@withContext preCheck.outcome
+            is PreCheckResult.Cancelled -> return@withContext preCheck.outcome
+            is PreCheckResult.Passed -> preCheck
         }
-
-        val hasKey = resolvedKey != null && isKeyTargetBindingAllowed(resolvedKey, client.baseUrl, allowTestLoopback)
-        when (val c = check(voiceOutputOn = voiceOutputOn, openAiTtsOn = openAiTtsOn, hasKey = hasKey, flavor = flavor)) {
-            is Check.Denied -> return@withContext SynthOutcome.Denied(c.reason, c.detail, c.message)
-            is Check.Allowed -> Unit
-        }
-
-        // 檢查期間若發生 stop/shutdown 或呼叫端協程已被取消，直接返回取消，不進入合成流程
-        if (isShutdown.get() || stopEpoch.get() != preCheckStopEpoch || callerJob?.isActive == false) {
-            return@withContext SynthOutcome.Failed(
-                detail = DETAIL_CANCELLED,
-                message = "語音合成已被中斷",
-            )
-        }
+        val redacted = passedPreCheck.redacted
+        val resolvedKey = passedPreCheck.resolvedKey
+        val effectiveVault = passedPreCheck.effectiveVault
+        val effectiveSupplier = passedPreCheck.effectiveSupplier
 
         // 前置檢查確認通過後，才在同一受控躍遷臨界區內決定 winner：遞增世代、快照舊工作並註冊新工作。
         // 僅 winner 能取消舊世代；舊請求快照不含新工作，故絕不取消新請求。

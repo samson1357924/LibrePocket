@@ -160,6 +160,10 @@ class OpenAiTtsClient(
          * Canonical speech endpoint path — single-sourced from [OpenAiTtsModels.SPEECH_ENDPOINT_PATH].
          * [resolveEndpoint] builds URLs from this constant; [validateEndpointUrl] admits only this
          * exact resolved path.
+         *
+         * Realtime 遷移入口註記：遷移至 Realtime API（見 [MIGRATION_TARGET]）時，此 path allowlist
+         * 必須重構（新路徑/傳輸不同，不可僅改字串；須同步重構 [resolveEndpoint] 與 [validateEndpointUrl]
+         * 的精確路徑比對）。
          */
         const val SPEECH_ENDPOINT_PATH = OpenAiTtsModels.SPEECH_ENDPOINT_PATH
         /**
@@ -272,6 +276,13 @@ class OpenAiTtsClient(
             }
         }
 
+        /**
+         * 嚴格驗證目標語音端點 URL（精確路徑 allowlist + 主機 allowlist）。
+         *
+         * Realtime 遷移入口註記：遷移至 Realtime API（見 [MIGRATION_TARGET]）時，此 path allowlist
+         * 必須重構（新路徑/傳輸不同；須與 [SPEECH_ENDPOINT_PATH]/[resolveEndpoint] 同步修改，
+         * 不可僅放寬此處比對）。
+         */
         internal fun validateEndpointUrl(endpointUrl: String, allowTestLoopback: Boolean = false) {
             val parsed = endpointUrl.toHttpUrlOrNull()
                 ?: throw OpenAiTtsException(

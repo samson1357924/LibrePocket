@@ -57,10 +57,27 @@ import dev.librepocket.agent.R
 import kotlinx.coroutines.delay
 
 /**
+ * Maximum number of hoisted thinking expanded-override entries persisted by
+ * [ThinkingExpandedOverridesSaver]. One rendered message holds only a handful of
+ * thinking cards; the cap is purely a Binder-abuse guard. Writes that would exceed
+ * the cap are rejected (see [putThinkingOverrideBounded]); the saver additionally
+ * truncates to the first entries in iteration order for defense in depth.
+ */
+internal const val ThinkingExpandedOverridesMaxEntries = 128
+
+/**
  * Saveable holder for hoisted thinking expanded overrides, keyed by deterministic
  * occurrence-aware override id (see [thinkingOverrideId]): `"<contentHashHex16
  * (trimmedContent)>.<rank>"`, where `rank` is the 0-based occurrence index of the same
  * trimmed content within one parse.
+ *
+ * Only this map is persisted across recreation. It is small by construction: keys are
+ * fixed-size `"<16 hex>.<rank>"` ids and values are single booleans, and the entry
+ * count is capped at [ThinkingExpandedOverridesMaxEntries] (see
+ * [putThinkingOverrideBounded]). Raw message text and previous-parse thinking contents
+ * are deliberately NOT saved — they live only in plain in-memory `remember` state (see
+ * [ChatMarkdownView]) so per-message Binder payload stays flat regardless of message
+ * size.
  *
  * The saver persists the map as a `List<Pair<String, Boolean>>` (both components are
  * Bundle-saveable primitives) and restores it into a [SnapshotStateMap]. Content-hash
@@ -71,45 +88,34 @@ import kotlinx.coroutines.delay
  */
 internal val ThinkingExpandedOverridesSaver:
     Saver<SnapshotStateMap<String, Boolean>, List<Pair<String, Boolean>>> = Saver(
-    save = { state -> ArrayList(state.toList()) },
+    save = { state ->
+        ArrayList(state.toList().take(ThinkingExpandedOverridesMaxEntries))
+    },
     restore = { saved ->
         mutableStateMapOf<String, Boolean>().apply { putAll(saved.toMap()) }
     },
 )
 
 /**
- * Total UTF-8 byte cap for the saveable previous raw message text
- * (see [ThinkingPrevRawSaver]). Keeps rotation persistence bounded at chat sizes.
- */
-internal const val ThinkingPrevRawSaveBytesMax = 64 * 1024
-
-/**
- * Saveable holder for the previous raw message text, used as the append-only anchor
- * (see [ChatMarkdownView]).
+ * Bounded write into the hoisted thinking-expanded-override map.
  *
- * Over-limit behaviour: when the UTF-8 bytes exceed [ThinkingPrevRawSaveBytesMax],
- * `null` is persisted instead (saving `null` means "no value saved" and the restore
- * init runs as `null`). `null` is treated as *unknown* by the alignment logic: the
- * append-only fast path is disabled and alignment falls back to identity-only
- * matching against known previous contents (exact/content-exact carry plus prune);
- * while previous contents are still unknown both branches are skipped and only
- * exact-id reads apply until the next parse is observed. Within a live session the
- * uncapped plain `remember` value (see `prevRawLive` in [ChatMarkdownView]) still
- * drives the anchor, so growth migration keeps working at chat sizes; only the
- * rotation-restored path pauses migration under the giant-text extreme. Documented
- * limitation, fail-closed (defaults, no misapplied overrides).
+ * Updating an existing id always succeeds. Inserting a new id while the map already
+ * holds [ThinkingExpandedOverridesMaxEntries] entries is rejected (returns `false`,
+ * map unchanged) so the saveable payload can never grow without bound. Rejection is
+ * fail-closed: the card falls back to `block.isStreaming`, the same default as a
+ * card with no stored override.
  */
-internal val ThinkingPrevRawSaver: Saver<MutableState<String?>, String> = Saver(
-    save = { state ->
-        val value = state.value
-        when {
-            value == null -> null
-            value.toByteArray(Charsets.UTF_8).size > ThinkingPrevRawSaveBytesMax -> null
-            else -> value
-        }
-    },
-    restore = { saved -> mutableStateOf(saved) },
-)
+internal fun putThinkingOverrideBounded(
+    overrides: SnapshotStateMap<String, Boolean>,
+    id: String,
+    value: Boolean,
+): Boolean {
+    if (!overrides.containsKey(id) && overrides.size >= ThinkingExpandedOverridesMaxEntries) {
+        return false
+    }
+    overrides[id] = value
+    return true
+}
 
 /**
  * Position-zip alignment for the append-only fast path (`currText.startsWith(prevRaw)`).
@@ -236,42 +242,6 @@ internal fun alignThinkingOverridesIdentityOnly(
         overrides.remove(stale)
     }
 }
-
-/**
- * Total UTF-8 byte cap for the saveable previous-parse thinking contents
- * (see [ThinkingPrevContentsSaver]). Keeps rotation persistence bounded at chat sizes.
- */
-internal const val ThinkingPrevContentsSaveBytesMax = 32 * 1024
-
-/**
- * Saveable holder for the previous parse's thinking contents (trimmed, document order),
- * used for cross-parse override alignment (see [ChatMarkdownView]).
- *
- * Over-limit behaviour: when the summed UTF-8 bytes exceed
- * [ThinkingPrevContentsSaveBytesMax], an empty list is persisted instead. An empty (or
- * never-observed / `null`) previous list is treated as *unknown* by the alignment logic:
- * exact-id reads still apply, but no prefix migration and no stale-entry pruning happen
- * until the next parse is observed (pruning is then deferred by one composition).
- * This is safe because a legitimately empty previous list (no thinking cards) implies no
- * live entries to prune — the map was already emptied when the cards disappeared.
- */
-internal val ThinkingPrevContentsSaver: Saver<MutableState<List<String>?>, List<String>> =
-    Saver(
-        save = { state ->
-            val source = state.value ?: emptyList()
-            var totalBytes = 0
-            var fits = true
-            for (entry in source) {
-                totalBytes += entry.toByteArray(Charsets.UTF_8).size
-                if (totalBytes > ThinkingPrevContentsSaveBytesMax) {
-                    fits = false
-                    break
-                }
-            }
-            if (fits) ArrayList(source) else emptyList()
-        },
-        restore = { saved -> mutableStateOf(saved) },
-    )
 
 /**
  * Deterministic override id for one thinking card: `"<hex16(trimmedContent)>.<rank>"`.
@@ -590,17 +560,21 @@ internal fun CodeBlockView(
  *     prepended different card never steals the old card's override; same-content
  *     prepend stays positional (document-order consumption picks the earliest entry),
  *     consistent with the parser's `_o2` occurrence disambiguation.
- * - Previous-state tracking is dual-track: `prevRawLive` (plain `remember`, uncapped,
- *   drives the live-session anchor) plus `prevRawSaveable` (`rememberSaveable` via
- *   [ThinkingPrevRawSaver], capped at [ThinkingPrevRawSaveBytesMax] UTF-8 bytes;
- *   over-limit persists as `null` = unknown). The effective anchor is
- *   `prevRawLive ?: prevRawSaveable` (saveable only matters on the first composition
- *   after rotation). `prevContents` stays `rememberSaveable` via
- *   [ThinkingPrevContentsSaver] (`null`/empty = unknown). When the previous state is
- *   unknown, migration and pruning are skipped (deferred to the next observed parse);
- *   exact-id reads still apply. Rotation giant-text extreme (raw over cap) therefore
- *   pauses growth migration fail-closed (defaults, no misapplied overrides) until new
- *   parses are observed.
+ * - Previous-state tracking is in-memory only: `prevRaw` (plain `remember`,
+ *   uncapped, the last full [text] observed in this composition lifetime) and
+ *   `prevThinkingContents` (plain `remember`, previous parse's trimmed thinking
+ *   contents in document order). Neither is saved across recreation, so per-message
+ *   saved-state payload is essentially the overrides map — flat regardless of message
+ *   size (plus one nullable Boolean per directly-rendered fallback card), and messages
+ *   without thinking blocks write only an empty map. After
+ *   recreation (rotation / process death) both revert to `null` = unknown: the
+ *   append-only fast path is disabled for the first composition, migration and
+ *   pruning are skipped (deferred to the next observed parse), and only exact-id
+ *   reads apply. Because override ids are deterministic pure functions of content
+ *   (see [thinkingOverrideId]), a manually expanded card keeps its entry across
+ *   recreation and re-attaches on the first post-restore composition; only growth
+ *   migration pauses for a single frame. Fail-closed throughout (defaults, no
+ *   misapplied overrides).
  * - An existing explicit entry on the target always wins (never overwritten); the
  *   matched source is still dropped when it differs (move), so one stored value is
  *   never observed by two cards. Previous ids that have no counterpart are cleaned by
@@ -625,19 +599,15 @@ internal fun ChatMarkdownView(
         mutableStateMapOf<String, Boolean>()
     }
     // Previous parse's thinking contents (trimmed, document order) for cross-parse
-    // alignment. Saveable: rotation-safe (bounded by ThinkingPrevContentsSaveBytesMax);
-    // null/empty = unknown (not yet observed or over cap).
-    var prevThinkingContents by rememberSaveable(saver = ThinkingPrevContentsSaver) {
-        mutableStateOf<List<String>?>(null)
-    }
-    // Previous raw text anchor for append-only detection. Dual-track: plain remember
-    // (uncapped, drives the live-session anchor) plus saveable (capped at
-    // ThinkingPrevRawSaveBytesMax, over-limit persists as null = unknown). Effective
-    // anchor is live ?: saveable (saveable only matters right after rotation).
-    var prevRawSaveable by rememberSaveable(saver = ThinkingPrevRawSaver) {
-        mutableStateOf<String?>(null)
-    }
-    var prevRawLive by remember { mutableStateOf<String?>(null) }
+    // alignment. In-memory only (plain remember, uncapped): null/empty = unknown
+    // (not yet observed in this composition lifetime, e.g. right after recreation).
+    var prevThinkingContents by remember { mutableStateOf<List<String>?>(null) }
+    // Previous raw text anchor for append-only detection. In-memory only (plain
+    // remember, uncapped): null = unknown. Deliberately not saveable — persisting
+    // the full raw per message scales Binder payload with message size (~1 MiB
+    // risk at ~20 long messages), while this anchor only optimizes live streaming
+    // growth migration within one composition lifetime.
+    var prevRaw by remember { mutableStateOf<String?>(null) }
 
     val currentThinkingContents = remember(blocks) {
         blocks.filterIsInstance<ChatContentBlock.ThinkingBlock>().map { it.content.trim() }
@@ -656,8 +626,8 @@ internal fun ChatMarkdownView(
     val prevOverrideIds = remember(prevKnownContents) {
         prevKnownContents?.let { thinkingOverrideIds(it) }
     }
-    val effectivePrevRaw: String? = prevRawLive ?: prevRawSaveable
-    val appendOnly = effectivePrevRaw != null && text.startsWith(effectivePrevRaw)
+    val prevRawSnapshot: String? = prevRaw
+    val appendOnly = prevRawSnapshot != null && text.startsWith(prevRawSnapshot)
 
     // Synchronously align before reads so this composition already observes the
     // retained/migrated values. Idempotent: a mutating pass schedules one follow-up
@@ -686,11 +656,8 @@ internal fun ChatMarkdownView(
     if (prevThinkingContents != currentThinkingContents) {
         prevThinkingContents = currentThinkingContents
     }
-    if (prevRawLive != text) {
-        prevRawLive = text
-    }
-    if (prevRawSaveable != text) {
-        prevRawSaveable = text
+    if (prevRaw != text) {
+        prevRaw = text
     }
 
     if (blocks.isEmpty() && isStreaming) {
@@ -725,7 +692,9 @@ internal fun ChatMarkdownView(
                             onUserExpandedChange = { next ->
                                 // Async write: exact occurrence-aware id for the clicked
                                 // card. Reads above already observe the retained value.
-                                thinkingOverrides[overrideId] = next
+                                // Bounded (see putThinkingOverrideBounded): rejection is
+                                // fail-closed (card falls back to block.isStreaming).
+                                putThinkingOverrideBounded(thinkingOverrides, overrideId, next)
                             },
                         )
                     }

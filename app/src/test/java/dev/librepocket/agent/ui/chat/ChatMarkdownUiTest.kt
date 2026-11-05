@@ -8,7 +8,9 @@ import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.SaverScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -26,6 +28,7 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertWidthIsAtLeast
+import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.compose.ui.test.onAllNodesWithText
@@ -41,6 +44,7 @@ import dev.librepocket.voice.VoiceTts
 import java.util.Locale
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -1916,6 +1920,110 @@ class ChatMarkdownUiTest {
         composeRule.onNodeWithText("Plan \u258D").assertDoesNotExist()
         composeRule.onAllNodesWithContentDescription(expandDesc).assertCountEquals(2)
         composeRule.onAllNodesWithContentDescription(collapseDesc).assertCountEquals(0)
+    }
+
+    @Test
+    fun chatMarkdownView_manualExpand_survivesRecreationWithoutRaw() {
+        // Phase A: raw text and previous thinking contents live only in plain remember,
+        // so recreation drops the anchors but must keep the user's manual expand choice
+        // via the saveable overrides map (deterministic ids re-attach by exact-id read).
+        val text = "<think>Reasoning that the user manually expanded</think>\n\nFinal answer."
+        val restoration = StateRestorationTester(composeRule)
+        restoration.setContent {
+            MaterialTheme {
+                ChatMarkdownView(text = text, isStreaming = false)
+            }
+        }
+
+        val thinkingTitle = context.getString(R.string.chat_thinking_title)
+        val collapseDesc = context.getString(R.string.chat_thinking_collapse)
+        val expandDesc = context.getString(R.string.chat_thinking_expand)
+
+        // Completed thinking block collapses by default.
+        composeRule.onNodeWithContentDescription(expandDesc).assertIsDisplayed()
+        composeRule.onNodeWithText(thinkingTitle).performClick()
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("Reasoning that the user manually expanded").assertIsDisplayed()
+
+        restoration.emulateSavedInstanceStateRestore()
+
+        composeRule.onNodeWithContentDescription(collapseDesc).assertIsDisplayed()
+        composeRule.onNodeWithText("Reasoning that the user manually expanded").assertIsDisplayed()
+        composeRule.onNodeWithText("Final answer.").assertIsDisplayed()
+    }
+
+    @Test
+    fun chatMarkdownView_longMessageWithoutThinking_restoresWithoutRawSaveable() {
+        // Phase A structural pin: a 64 KiB+ message with no thinking blocks must survive
+        // recreation even though no raw-related saveable exists (raw lives only in plain
+        // remember; the only saveable is the empty overrides map).
+        val body = "Lorem ipsum dolor sit amet. ".repeat(2400)
+        assertTrue(body.toByteArray(Charsets.UTF_8).size > 64 * 1024)
+        val restoration = StateRestorationTester(composeRule)
+        restoration.setContent {
+            MaterialTheme {
+                ChatMarkdownView(text = body, isStreaming = false)
+            }
+        }
+
+        composeRule.onNodeWithText("Lorem ipsum", substring = true).assertIsDisplayed()
+
+        restoration.emulateSavedInstanceStateRestore()
+
+        composeRule.onNodeWithText("Lorem ipsum", substring = true).assertIsDisplayed()
+    }
+
+    @Test
+    fun thinkingExpandedOverridesSaver_roundTripAndSizeBound() {
+        // The only saveable in ChatMarkdownView: 64 full entries must restore exactly
+        // and stay far below 50 KiB serialized (fixed-size "<16 hex>.<rank>" keys).
+        val original = mutableStateMapOf<String, Boolean>()
+        repeat(64) { i ->
+            original[thinkingOverrideId("reasoning content $i", 0)] = i % 2 == 0
+        }
+        val saverScope = object : SaverScope {
+            override fun canBeSaved(value: Any): Boolean = true
+        }
+        val saved = with(ThinkingExpandedOverridesSaver) { saverScope.save(original) }
+        assertNotNull(saved)
+        val payload = saved!!
+        val bytes = payload.sumOf { (key, _) -> key.toByteArray(Charsets.UTF_8).size + 1 }
+        assertTrue("overrides payload $bytes bytes exceeds bound", bytes < 50 * 1024)
+        val restored = with(ThinkingExpandedOverridesSaver) { restore(payload) }
+        assertNotNull(restored)
+        assertEquals(original.toMap(), restored!!.toMap())
+    }
+
+    @Test
+    fun thinkingExpandedOverridesSaver_truncatesBeyondCap() {
+        val original = mutableStateMapOf<String, Boolean>()
+        repeat(ThinkingExpandedOverridesMaxEntries + 50) { i ->
+            original["abcdef0123456789.$i"] = true
+        }
+        val saverScope = object : SaverScope {
+            override fun canBeSaved(value: Any): Boolean = true
+        }
+        val saved = with(ThinkingExpandedOverridesSaver) { saverScope.save(original) }
+        assertNotNull(saved)
+        assertTrue(
+            "saved ${saved!!.size} entries exceeds cap $ThinkingExpandedOverridesMaxEntries",
+            saved.size <= ThinkingExpandedOverridesMaxEntries,
+        )
+    }
+
+    @Test
+    fun putThinkingOverrideBounded_rejectsNewBeyondCap() {
+        val map = mutableStateMapOf<String, Boolean>()
+        repeat(ThinkingExpandedOverridesMaxEntries) { i ->
+            map["abcdef0123456789.$i"] = true
+        }
+        // New id at cap: rejected, map unchanged (fail-closed to block.isStreaming).
+        assertFalse(putThinkingOverrideBounded(map, "abcdef0123456789.new", true))
+        assertFalse(map.containsKey("abcdef0123456789.new"))
+        assertEquals(ThinkingExpandedOverridesMaxEntries, map.size)
+        // Updating an existing id always succeeds, even at cap.
+        assertTrue(putThinkingOverrideBounded(map, "abcdef0123456789.0", false))
+        assertEquals(false, map["abcdef0123456789.0"])
     }
 
     @Test

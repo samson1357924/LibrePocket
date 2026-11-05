@@ -228,6 +228,13 @@ class ShizukuShellRunner(
                 truncated = truncated,
             )
         }
+        // V2 gobbler 讀取失敗（owner 新 P1-2 correctness）：只有真 EOF（`read`
+        // 回 -1）才算完整流；finished（非超時/取消，killer 未關流）下的讀取異常
+        // 必為真實 I/O 錯誤（部分 PNG 當完整幀即虛構，故回 Failed，不回 Ok）。
+        // 超時/取消路徑已先回 TimedOut，不受影響（預期 close 收斂保留）。
+        if (raw.readFailed) {
+            return ElevatedBinaryResult.Failed("elevated IO read failed (incomplete stream)")
+        }
         if (raw.exitCode != 0) {
             val redacted = Redactor.redactError(String(err.bytes, Charsets.UTF_8))
             return ElevatedBinaryResult.Failed("shizuku command failed exit=${raw.exitCode}: $redacted")

@@ -62,11 +62,17 @@ import java.util.concurrent.TimeUnit
  *
  * U2-B stderr 獨立小 cap（owner P2，僅 KDoc＋可選參數，通用軌行為零變更）：
  * - 截圖軌 stdout 8M＋stderr 通用軌（硬讀取 512K／截斷 64K）：截圖錯誤訊息短
- *   （exit 非零文案／warn 行），stderr 不需 8M；雙流並發 OOM 峰值由
- *   16M 降至 8.5M；
+ *   （exit 非零文案／warn 行），stderr 不需 8M；雙流 CappedPipe 同時保留量由
+ *   16M 降至 8.5M（僅 pipe 內保留，不等於程序峰值）；
  * - 通用軌不變（雙流 512K／截斷 64K，`hardCapErrBytes` 傳 null 即同 stdout cap）；
  * - 判定：任一流溢出即 [Drained.truncated]（stdout 超 8M 丟棄與 stderr 超 512K
  *   丟棄皆經溢出位帶出，不靜默短讀；見容量測試截圖＋1MB stderr 用例）。
+ *
+ * V2 OOM 峰值誠實說明（owner P2 memory）：cap 相加（截圖 8M＋512K ≈8.5M）
+ * 僅是 [CappedPipe] 同時保留量，不是程序峰值。實際峰值另含 `bytes()` 的
+ * `toByteArray` 拷貝＋[ElevatedBinaryResult.Ok] 防禦複製（構造 `copyOf`＋取值
+ * `copyOf`）＋capture 側 `copyOf`，約為 pipe 保留量的數倍。低 RAM 裝置實際
+ * 峰值由 B3 heap profile 驗收，本檔不承諾 8.5MiB 程序峰值。
  */
 internal object ElevatedProcessIo {
     /** R1-A 截圖二進位容量：`screencap -p` / `cat /dev/graphics/fb0` 的截斷上限（8M）。 */
@@ -93,6 +99,16 @@ internal object ElevatedProcessIo {
          * 截圖 8M==8M 時靠此位區分恰上限通過與超限丟棄。
          */
         val truncated: Boolean = false,
+        /**
+         * V2 gobbler 讀取失敗旗標（owner 新 P1-2 correctness）：任一流
+         * `stream.read` 抛異常即 true（見 [CappedPipe.failed]，[copyCapped]
+         * catch 內無條件 [CappedPipe.markFailed]）。只有真 EOF（`read` 回 -1）
+         * 才算完整流；finished（非超時/取消，killer 未關流）下的讀取異常必為
+         * 真實 I/O 錯誤，呼叫方須回 Failed（見兩 Runner `raw.readFailed` 分支，
+         * 位於 `timedOut` 之後、`exitCode != 0` 之前；超時/取消路徑已先回
+         * TimedOut，不受影響，預期 close 收斂保留）。
+         */
+        val readFailed: Boolean = false,
     )
 
     fun drain(
@@ -233,12 +249,22 @@ internal object ElevatedProcessIo {
             // 截圖 8M==8M 時需此位區分「恰 8M 通過」與「>8M 丟棄」（後者 truncate(8M,8M)
             // 無法檢出，故必須由溢出位帶出，否則 >8M 會誤判為完整幀）。
             truncated = joinIncomplete || out.didOverflow() || err.didOverflow(),
+            // V2：任一流 gobbler 讀取異常即 true（無條件記錄；超時/取消路徑
+            // 已先回 TimedOut，runner 側按 finished 區分語義，見 Drained.readFailed）。
+            readFailed = out.failed || err.failed,
         )
     }
 
     private class CappedPipe(private val hardCapBytes: Int) {
         private val sink = ByteArrayOutputStream()
         @Volatile private var overflowed = false
+        /** V2 gobbler 讀取失敗旗標（owner 新 P1-2）：`copyCapped` 內 `read` 抛即標 true，單調不清除。 */
+        @Volatile var failed: Boolean = false
+            private set
+        /** 無條件記錄讀取異常（超時/取消殺後關流的預期 close 亦標 true，由呼叫方按 finished 區分語義）。 */
+        fun markFailed() {
+            failed = true
+        }
         fun write(buf: ByteArray, n: Int) {
             // S3 競爭收斂（PocketGuard SUGGESTION，語義不變）：鎖外先讀 size
             // 快照做快速判斷（room<=0 即標溢出直接返回；n>room 預標溢出），
@@ -285,7 +311,10 @@ internal object ElevatedProcessIo {
                 }
             }
         } catch (_: Exception) {
-            // 被殺時流中斷屬正常，直接收尾。
+            // V2：無條件記錄讀取失敗（finished 下必為真實 I/O 錯誤，經
+            // Drained.readFailed 帶出；被殺時流中斷亦標 true，但超時/取消路徑
+            // 已先回 TimedOut，不受影響，預期 close 收斂保留）。
+            pipe.markFailed()
         } finally {
             runCatching { stream.close() }
         }

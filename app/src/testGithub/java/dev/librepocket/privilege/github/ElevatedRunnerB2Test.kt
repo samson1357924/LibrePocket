@@ -1,10 +1,15 @@
 package dev.librepocket.privilege.github
 
 import dev.librepocket.shell.ElevatedRequest
+import dev.librepocket.shell.PrivilegeAuditLog
 import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellQuota
 import dev.librepocket.shell.ShellResult
 import dev.librepocket.tool.Flavor
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -945,5 +950,138 @@ class ElevatedRunnerB2Test {
                 grantCheck = GrantFixtures.allowAlways,
             )
         }
+    }
+
+    // ---- V2 gobbler 讀取失敗旗標（owner 新 P1-2 correctness）：部分流不當完整幀 ----
+
+    /**
+     * 先給 N bytes 後抛 IOException 的假流：模擬 gobbler 中途 EIO。
+     * `read(b, off, len)` 前綴耗盡後即抛，`read()` 同語義。
+     */
+    private class FailingReadStream(private val prefix: ByteArray) : InputStream() {
+        private var pos = 0
+        override fun read(): Int {
+            if (pos < prefix.size) return prefix[pos++].toInt() and 0xFF
+            throw IOException("simulated EIO")
+        }
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (pos < prefix.size) {
+                val n = minOf(len, prefix.size - pos)
+                System.arraycopy(prefix, pos, b, off, n)
+                pos += n
+                return n
+            }
+            throw IOException("simulated EIO")
+        }
+    }
+
+    /** 自訂流假進程：waitFor 即 true、exit 0（finished 路徑），流由呼叫方注入。 */
+    private class FailingStreamProcess(
+        private val stdoutStream: InputStream,
+        private val stderrStream: InputStream,
+        private val code: Int = 0,
+    ) : Process() {
+        override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+        override fun getInputStream(): InputStream = stdoutStream
+        override fun getErrorStream(): InputStream = stderrStream
+        override fun waitFor(): Int = code
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = true
+        override fun exitValue(): Int = code
+        override fun destroy() = Unit
+        override fun destroyForcibly(): Process = this
+    }
+
+    @Test fun rootStdoutReadFailureMapsToFailedAndCaptureNull() {
+        // screencap -p stdout 中途 EIO：waitFor true＋exit 0，但流不完整 → Failed＋capture null。
+        val partial = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+        val runner = RootSuRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
+            spawn = {
+                FailingStreamProcess(
+                    FailingReadStream(partial),
+                    java.io.ByteArrayInputStream(ByteArray(0)),
+                    0,
+                )
+            },
+            suBinary = "/system/bin/su",
+            grantCheck = GrantFixtures.allowAlways,
+        )
+        val b = runner.runBinary(ElevatedRequest(listOf("screencap", "-p"), "V2-T"), 5_000L)
+        assertTrue("$b", b is ElevatedBinaryResult.Failed)
+        val audit = PrivilegeAuditLog()
+        assertNull(RootFramebufferCapture.screencapViaBinary(runner, audit, "V2-T", 5_000L)())
+    }
+
+    @Test fun rootStderrReadFailureMapsToFailedAndCaptureNull() {
+        // screencap -p stdout 完整但 stderr 中途 EIO：err readFailed 亦 Failed＋capture null。
+        val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x01, 0x02)
+        val runner = RootSuRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
+            spawn = {
+                FailingStreamProcess(
+                    java.io.ByteArrayInputStream(png),
+                    FailingReadStream("warn".toByteArray()),
+                    0,
+                )
+            },
+            suBinary = "/system/bin/su",
+            grantCheck = GrantFixtures.allowAlways,
+        )
+        val b = runner.runBinary(ElevatedRequest(listOf("screencap", "-p"), "V2-T"), 5_000L)
+        assertTrue("$b", b is ElevatedBinaryResult.Failed)
+        val audit = PrivilegeAuditLog()
+        assertNull(RootFramebufferCapture.screencapViaBinary(runner, audit, "V2-T", 5_000L)())
+    }
+
+    @Test fun shizukuStdoutReadFailureMapsToFailedAndCaptureNull() {
+        // shizuku 側：stdout 中途 EIO → Failed＋capture null。
+        val partial = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+        val runner = ShizukuShellRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
+            pingBinder = { true },
+            spawn = {
+                FailingStreamProcess(
+                    FailingReadStream(partial),
+                    java.io.ByteArrayInputStream(ByteArray(0)),
+                    0,
+                )
+            },
+            status = { ShizukuStatus.Available(15) },
+            grantCheck = GrantFixtures.allowAlways,
+        )
+        val b = runner.runBinary(ElevatedRequest(listOf("screencap", "-p"), "V2-T"), 5_000L)
+        assertTrue("$b", b is ElevatedBinaryResult.Failed)
+        val audit = PrivilegeAuditLog()
+        assertNull(RootFramebufferCapture.screencapViaBinary(runner, audit, "V2-T", 5_000L)())
+    }
+
+    @Test fun shizukuStderrReadFailureMapsToFailedAndCaptureNull() {
+        // shizuku 側：stdout 完整但 stderr 中途 EIO → Failed＋capture null。
+        val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x01, 0x02)
+        val runner = ShizukuShellRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
+            pingBinder = { true },
+            spawn = {
+                FailingStreamProcess(
+                    java.io.ByteArrayInputStream(png),
+                    FailingReadStream("warn".toByteArray()),
+                    0,
+                )
+            },
+            status = { ShizukuStatus.Available(15) },
+            grantCheck = GrantFixtures.allowAlways,
+        )
+        val b = runner.runBinary(ElevatedRequest(listOf("screencap", "-p"), "V2-T"), 5_000L)
+        assertTrue("$b", b is ElevatedBinaryResult.Failed)
+        val audit = PrivilegeAuditLog()
+        assertNull(RootFramebufferCapture.screencapViaBinary(runner, audit, "V2-T", 5_000L)())
     }
 }

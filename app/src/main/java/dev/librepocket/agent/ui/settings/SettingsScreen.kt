@@ -131,7 +131,9 @@ fun SettingsScreen(
     onOpenSystemA11y: () -> Unit = {},
     /**
      * #3 語音開關（DataStore 持久化，單一真相源見 `VoiceSwitchStore`）：
-     * 預設皆開；關閉即隱藏聊天頁對應入口（mic 鈕／朗讀鈕，與投影層同 key）。
+     * 三鍵預設：`voice_input` 開、`voice_output` 開、`openai_tts` 關（SCAFFOLD，
+     * 目前尚未接線，切換僅持久化開關值、無任何作用）；
+     * 關閉即隱藏聊天頁對應入口（mic 鈕／朗讀鈕，與投影層同 key）。
      * 形狀仿無障礙自動化開關（checked + onCheckedChange 回調）。
      * R4-2 三態：[voiceSwitchesEnabled] 為 `loaded && !loadFailed`（loading／
      * 失敗態禁用開關，避免在未知真相源上寫入）；[voiceLoadFailed] 時另顯示
@@ -139,10 +141,12 @@ fun SettingsScreen(
      */
     voiceInputEnabled: Boolean = VoiceTools.SWITCH_INPUT_DEFAULT,
     voiceOutputEnabled: Boolean = VoiceTools.SWITCH_OUTPUT_DEFAULT,
+    openAiTtsEnabled: Boolean = VoiceTools.SWITCH_OPENAI_DEFAULT,
     voiceSwitchesEnabled: Boolean = true,
     voiceLoadFailed: Boolean = false,
     onVoiceInputSwitch: (Boolean) -> Unit = {},
     onVoiceOutputSwitch: (Boolean) -> Unit = {},
+    onOpenAiTtsSwitch: (Boolean) -> Unit = {},
     /**
      * 登出失敗碼（僅 `LOGOUT_*` 顯示；呼叫方由 form.errorCode 過濾傳入）。
      * 非 null 即顯示失敗卡；失敗不自動關 dialog（見 [showConfirmLogout]）。
@@ -265,7 +269,7 @@ fun SettingsScreen(
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
                             "語音輸入走系統辨識、語音輸出走系統朗讀，不新增任何權限；" +
-                                "麥克風音檔只駐留記憶體、不落地存檔；辨識正文寫入紀錄前會先遮罩敏感內容；" +
+                                "麥克風音檔只駐留記憶體，app 層不寫入檔案系統（零 File 引用）；辨識正文寫入紀錄前會先經 best-effort 已知樣式遮罩（非匿名化）處理；" +
                                 "系統朗讀由" + VoiceTts.ENGINE_DISCLOSURE + "，離線能力因引擎而異。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -273,7 +277,18 @@ fun SettingsScreen(
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
                             "雲端語音（Azure）僅直接下載版可用，需同時開啟「語音輸出」與「Azure 語音」" +
-                                "（後者預設關閉）；送雲前會再次遮罩敏感內容。",
+                                "（後者預設關閉）；送雲前經 best-effort 已知樣式遮罩，非匿名化；送雲文本將依雲端條款處理。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            "雲端語音（OpenAI）支援所有版本，需同時開啟「語音輸出」與「OpenAI 語音」" +
+                                "（後者預設關閉，目前尚未接線，切換無作用）；" +
+                                "未來需經端點設定（KeyVault providerId \"openai_tts\"）設定 OpenAI API 金鑰（目前無設定入口）；" +
+                                VoiceTools.OPENAI_VOICE_DISCLOSURE + "；" +
+                                "送雲前經 best-effort 已知樣式遮罩，非匿名化；朗讀文本將送 OpenAI 依其條款處理；使用 OpenAI 語音會依其定價產生費用" +
+                                "（SCAFFOLD：管線接線尚在收斂，未接線前一律使用系統語音）。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -324,6 +339,21 @@ fun SettingsScreen(
                                 checked = voiceOutputEnabled,
                                 onCheckedChange = onVoiceOutputSwitch,
                                 enabled = voiceSwitchesEnabled,
+                            )
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                "OpenAI 語音（尚未接線，目前無作用）",
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Switch(
+                                checked = openAiTtsEnabled,
+                                onCheckedChange = onOpenAiTtsSwitch,
+                                enabled = voiceSwitchesEnabled && voiceOutputEnabled,
                             )
                         }
                     }

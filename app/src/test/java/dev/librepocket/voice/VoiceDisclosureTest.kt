@@ -1,6 +1,7 @@
 package dev.librepocket.voice
 
 import dev.librepocket.tool.DenyReason
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -70,6 +71,40 @@ class VoiceDisclosureTest {
         assertTrue(VoiceTts.SPEAK_BUTTON_DESCRIPTION.contains(VoiceTts.ENGINE_DISCLOSURE))
         assertFalse(VoiceTts.SPEAK_BUTTON_DESCRIPTION.contains("本地"))
         assertFalse(VoiceTts.ENGINE_DISCLOSURE.contains("本地"))
+    }
+
+    @Test fun openAiVoiceDisclosure_containsAiAndBoundedBufferCopy() {
+        assertTrue(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("本功能語音為 AI 生成，非真人聲音（AI-generated voice, not a human voice）"))
+        assertTrue(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("app 層不寫入檔案系統（零 File 引用）"))
+        assertTrue(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("框架層(MediaPlayer/OEM)是否落盤依實作而定"))
+        assertTrue(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("上限 25MB"))
+        assertFalse(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("不寫入儲存空間"))
+        assertFalse(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("絕不寫入"))
+        assertFalse(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("永不落地"))
+        assertFalse(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("零磁碟"))
+        assertFalse(VoiceTools.OPENAI_VOICE_DISCLOSURE.contains("零檔案系統"))
+        assertEquals(
+            "本功能語音為 AI 生成，非真人聲音（AI-generated voice, not a human voice）",
+            VoiceTools.OPENAI_VOICE_AI_DISCLOSURE,
+        )
+        assertEquals(
+            "音檔採受限記憶體緩衝播放，上限 25MB；app 層不寫入檔案系統（零 File 引用）；框架層(MediaPlayer/OEM)是否落盤依實作而定",
+            VoiceTools.OPENAI_VOICE_BUFFER_DISCLOSURE,
+        )
+    }
+
+    @Test fun openAiTts_legacyBridgeAndTransitionConstants() {
+        assertEquals("2027-01-06", OpenAiTtsModels.SUNSET_DATE)
+        assertEquals("gpt-realtime-2.1-mini", OpenAiTtsModels.MIGRATION_TARGET)
+        assertTrue(OpenAiTtsModels.IS_LEGACY_BRIDGE)
+
+        assertEquals(OpenAiTtsModels.SUNSET_DATE, OpenAiTtsClient.SUNSET_DATE)
+        assertEquals(OpenAiTtsModels.MIGRATION_TARGET, OpenAiTtsClient.MIGRATION_TARGET)
+        assertTrue(OpenAiTtsClient.IS_LEGACY_BRIDGE)
+
+        assertEquals(OpenAiTtsModels.SUNSET_DATE, OpenAiSpeechEngine.SUNSET_DATE)
+        assertEquals(OpenAiTtsModels.MIGRATION_TARGET, OpenAiSpeechEngine.MIGRATION_TARGET)
+        assertTrue(OpenAiSpeechEngine.IS_LEGACY_BRIDGE)
     }
 
     // ---- 首次揭露確認（#2 行為，不釘原始碼字串） ----
@@ -174,6 +209,39 @@ class VoiceDisclosureTest {
         ).readText()
         assertTrue(settings.contains("VoiceTts.ENGINE_DISCLOSURE"))
         assertFalse(settings.contains("本地引擎"))
+    }
+
+    @Test fun settings_openAiVoiceCardDisclosesAiAndBoundedBufferCopy() {
+        val settings = findSource(
+            "src/main/java/dev/librepocket/agent/ui/settings/SettingsScreen.kt",
+            "app/src/main/java/dev/librepocket/agent/ui/settings/SettingsScreen.kt",
+        ).readText()
+        assertTrue(settings.contains("VoiceTools.OPENAI_VOICE_DISCLOSURE"))
+        assertTrue(settings.contains("best-effort 已知樣式遮罩，非匿名化"))
+        assertTrue(settings.contains("朗讀文本將送 OpenAI 依其條款處理"))
+        assertFalse(settings.contains("音檔採純記憶體串流播放不落地"))
+        assertFalse(settings.contains("送雲前會再次遮罩敏感內容"))
+        assertFalse(settings.contains("不寫入儲存空間"))
+        assertFalse(settings.contains("不落地存檔"))
+        assertFalse(settings.contains("絕不寫入"))
+        assertFalse(settings.contains("永不落地"))
+        assertFalse(settings.contains("零磁碟"))
+    }
+
+    @Test fun settings_openAiVoiceCardHonestAboutUnwiredDefaultOffAndKeyAndCost() {
+        // 脆弱性：見本節說明。Stage-3 誠實性釘：未接線開關必須明示預設關閉／無作用、
+        // 金鑰可達路徑（KeyVault providerId）、費用揭露與 SCAFFOLD 標記皆不可靜默消失。
+        val settings = findSource(
+            "src/main/java/dev/librepocket/agent/ui/settings/SettingsScreen.kt",
+            "app/src/main/java/dev/librepocket/agent/ui/settings/SettingsScreen.kt",
+        ).readText()
+        assertTrue(settings.contains("預設關閉"))
+        assertTrue(settings.contains("API 金鑰"))
+        assertTrue(settings.contains("SCAFFOLD"))
+        assertTrue(settings.contains("尚未接線，目前無作用"))
+        assertTrue(settings.contains("依其定價產生費用"))
+        assertTrue(settings.contains("未接線前一律使用系統語音"))
+        assertFalse("must not claim fallback-before-wired as downgrade", settings.contains("未接妥前降級走系統語音"))
     }
 
     @Test fun manifestDeclaresTtsServiceVisibility() {

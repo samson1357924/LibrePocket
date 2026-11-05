@@ -57,8 +57,10 @@ manifest binding only pins the FILENAMES ``@xml/backup_rules`` /
 or merger rewrite put INTO the compiled XML while leaving those filenames
 alone. So both compiled resources are dumped with ``aapt dump xmltree``,
 rebuilt into trees, and re-validated by the source gate's own engine
-(``backup_rules_check.validate_tree``) demanding the EXACT
-``REQUIRED_EXCLUDES`` set (BackupPolicy.KEY_FILES_EXCLUDED, order-free): a
+(``backup_rules_check.validate_tree``) demanding ``REQUIRED_EXCLUDES``
+(BackupPolicy.KEY_FILES_EXCLUDED) plus the required device-bound entries
+(``REQUIRED_DEVICE_BOUND_EXCLUDES``, single-sourced as the allowlist
+``ALLOWED_EXTRA_EXCLUDES``, order-free): a
 dump failure, a missing entry, or a set difference fails closed. The member
 path dumped is resolved by RESOURCE NAME through the sibling aapt2
 (``_compiled_member_resolver``): an AGP release build obfuscates the
@@ -1303,7 +1305,7 @@ def _assert_merged_backup_rules_bytes(
     apk: Path,
     resolve_member: Callable[[str], str] | None = None,
 ) -> None:
-    """Assert the COMPILED backup rules still exclude exactly the key files.
+    """Assert the COMPILED backup rules still exclude the key files (+ allowlist).
 
     The manifest binding pins only the filenames ``@xml/backup_rules`` /
     ``@xml/data_extraction_rules`` - it cannot see what a resources overlay or
@@ -1313,7 +1315,8 @@ def _assert_merged_backup_rules_bytes(
     empty / truncated dumps fail closed), and validated by the source gate's
     own engine (``backup_rules_check.validate_tree``) with
     ``exact_excludes=True``: the exclude set must equal
-    ``BackupPolicy.KEY_FILES_EXCLUDED`` EXACTLY (missing AND unexpected
+    ``BackupPolicy.KEY_FILES_EXCLUDED`` plus the required device-bound
+    entries (missing required entries AND other unexpected
     entries are set differences, order-free). Source-level rules validation
     cannot reach this rewrite; this is the artifact-level authority on the
     rules bytes.

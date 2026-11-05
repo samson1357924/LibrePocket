@@ -54,6 +54,14 @@
         <intent>
             <action android:name="android.settings.SOUND_SETTINGS" />
         </intent>
+        <!-- C1b fallback queryIntentActivities-first 契約：openFallback 先
+             queryIntentActivities 全枚舉再 setComponent explicit 啟動，
+             VOICE_INPUT_SETTINGS 須列 queries（startActivity 本身不需 queries，
+             queryIntentActivities 可見性需要——非 resolveActivity：多候選無預設時
+             resolveActivity 回傳系統 Resolver 本身，FLAG_SYSTEM 檢查會誤判）。 -->
+        <intent>
+            <action android:name="android.settings.VOICE_INPUT_SETTINGS" />
+        </intent>
     </queries>
 
     <application
@@ -87,5 +95,47 @@
                 <data android:mimeType="text/plain" />
             </intent-filter>
         </activity>
+        <!-- C1 系統預設助理（Issue #137 C1a，三 flavor 共用，無新增權限；
+             play 不加 a11y service overlay：本 PR 完全不碰 a11y）。
+             VoiceInteractionService：BIND_VOICE_INTERACTION 門檻＋
+             VoiceInteractionService action＋android.voice_interaction meta-data。
+             人類 review #4：三服務一律 android:process=":voice"，與主 App process
+             分離；好處是隔離（voice crash/OOM 不拖垮主 process、系統可獨立回收），
+             非省總記憶體（多一份 ART + Application 實例，總 PSS 增加）。
+             註：LibrePocketApp.onCreate 在 :voice 仍執行，但 SkillInstaller
+             清理僅 main process 執行（見 LibrePocketApp 進程閘門；:voice 跳過
+             並記 log，避免與主行程安裝窗口併發）。三 flavor 共用 main
+             manifest，本 PR 無需 flavor overlay。
+             C1 三服務同 :voice（stub 無狀態）；C2 接 UI/STT 前將 SessionService（+Recognition）另開 :voice_session 並測量 PSS/啟動時延。TODO(C2-voice-process)。 -->
+        <service
+            android:name=".assistant.LibreVoiceInteractionService"
+            android:exported="true"
+            android:process=":voice"
+            android:permission="android.permission.BIND_VOICE_INTERACTION">
+            <intent-filter>
+                <action android:name="android.service.voice.VoiceInteractionService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.voice_interaction"
+                android:resource="@xml/voice_interaction" />
+        </service>
+        <service
+            android:name=".assistant.LibreVoiceInteractionSessionService"
+            android:exported="true"
+            android:process=":voice"
+            android:permission="android.permission.BIND_VOICE_INTERACTION">
+            <intent-filter>
+                <action android:name="android.service.voice.VoiceInteractionSessionService" />
+            </intent-filter>
+        </service>
+        <service
+            android:name=".assistant.LibreRecognitionService"
+            android:exported="true"
+            android:process=":voice"
+            android:permission="android.permission.BIND_RECOGNITION_SERVICE">
+            <intent-filter>
+                <action android:name="android.speech.RecognitionService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

@@ -22,6 +22,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -30,6 +31,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -40,6 +42,9 @@ import dev.librepocket.agent.ui.chat.ExportUiState
 import dev.librepocket.agent.ui.chat.ImportUiState
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.setupErrorText
+import dev.librepocket.agent.assistant.AssistantReasonCode
+import dev.librepocket.agent.assistant.AssistantSettingsState
+import dev.librepocket.agent.assistant.assistantReasonText
 import dev.librepocket.automation.AutomationSettingsState
 import dev.librepocket.voice.VoiceTools
 import dev.librepocket.voice.VoiceTts
@@ -147,6 +152,21 @@ fun SettingsScreen(
     onVoiceInputSwitch: (Boolean) -> Unit = {},
     onVoiceOutputSwitch: (Boolean) -> Unit = {},
     onOpenAiTtsSwitch: (Boolean) -> Unit = {},
+    /**
+     * C1 系統預設助理（Issue #137 C1b，三 flavor 共用 main 接線）：
+     * null（未接線）時整卡隱藏（仿 automation 模式）；非 null 顯示狀態＋
+     * 「設為預設助理」一鍵（RoleManager 流程）＋「語音輸入設定」fallback。
+     * C1 不新增麥克風／浮窗／截圖權限。
+     */
+    assistant: AssistantSettingsState? = null,
+    onRequestAssistantRole: () -> Unit = {},
+    /**
+     * 獨立重讀入口（re-review #5 finding #2 [P3/UX] 方案 A）：
+     * ReadError 與 Known(!held)＋UNCONFIRMED 的主按鈕「重新檢查」皆走此回調
+     * （生產接 `assistantRole.recheck`，只重讀不清碼不開頁）；預設 {} 保舊構造相容。
+     */
+    onRecheckAssistantRole: () -> Unit = {},
+    onOpenVoiceInputSettings: () -> Unit = {},
     /**
      * 登出失敗碼（僅 `LOGOUT_*` 顯示；呼叫方由 form.errorCode 過濾傳入）。
      * 非 null 即顯示失敗卡；失敗不自動關 dialog（見 [showConfirmLogout]）。
@@ -359,6 +379,146 @@ fun SettingsScreen(
                     }
                 }
                 Spacer(modifier = Modifier.height(8.dp))
+                // C1 系統預設助理（Issue #137 C1b）：僅 main 接線傳入非 null 才顯示
+                // （三 flavor 共用；play 不加 a11y overlay，本卡與 a11y 無關）。
+                // 被拒／撤銷／OEM 不支援／請求失敗皆顯示原因並提供 fallback 入口。
+                if (assistant != null) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                        ),
+                    ) {
+                        Column(modifier = Modifier.padding(14.dp)) {
+                            Text("預設助理（系統助手）", style = MaterialTheme.typography.titleMedium)
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                when {
+                                    // Stage 2 finding C + re-review #4 #1：讀取失敗與真不支援區分。
+                                    // ReadError 不宣稱任何狀態（roleHeld／roleAvailable 皆 false，
+                                    // 見 AssistantSettingsState.readError），頭部誠實顯示未知；
+                                    // 主按鈕改為「重新檢查」可重讀快照（fail-closed：不發要求，見 request）。
+                                    assistant.readError -> "無法確認助理狀態，請稍後重試。"
+                                    assistant.roleHeld -> "已設為預設助理：長按首頁鍵或系統手勢可叫出 LibrePocket。"
+                                    !assistant.roleAvailable -> "此裝置不支援系統助理角色，可改用語音輸入設定。"
+                                    else -> "尚未設為預設助理；授予後長按首頁鍵或系統手勢可叫出 LibrePocket。"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            assistant.reasonCode?.let { code ->
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    assistantReasonText(code),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    // A 原因碼色彩：被拒／撤銷／請求失敗／未確認走 error
+                                    // （UNCONFIRMED 需使用者處理：重新檢查，
+                                    // re-review #4 finding #1 [P2/Merge blocker]）；
+                                    // 不支援中性（頭部已是不支援文案，原因段不追加紅字）；
+                                    // GRANTED 正常不顯示（held=>null 已清除），若顯示亦中性。
+                                    color = when (code) {
+                                        AssistantReasonCode.DENIED,
+                                        AssistantReasonCode.REVOKED,
+                                        AssistantReasonCode.REQUEST_FAILED,
+                                        AssistantReasonCode.UNCONFIRMED ->
+                                            MaterialTheme.colorScheme.error
+                                        // VERIFYING 明確中性：驗證中不宣稱成功／失敗
+                                        // （re-review #3 finding #1；else 同中性，
+                                        // 列出以鎖定語義）。
+                                        AssistantReasonCode.VERIFYING ->
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                    modifier = Modifier.testTag("assistantReason"),
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            // Stage 2 review #3：不支援分支可達——!available 時主按鈕保持
+                            // enabled（僅 held 才 disabled），文案改為「前往語音輸入設定」；
+                            // 點擊仍走 onRequestAssistantRole → request() UnsupportedFallback
+                            // 分支（設 UNSUPPORTED＋openFallback），與下方 OutlinedButton 同效。
+                            // Stage 2 finding C＋re-review #4 finding #1 [P2/Merge blocker]：
+                            // ReadError 時主按鈕保持 enabled，文案「重新檢查」：點擊走
+                            // onRecheckAssistantRole → recheck()（只 refreshTick++ 觸發重讀，
+                            // fail-closed 仍成立——不發要求；request() ReadError 分支
+                            // 直接委託 recheck()，同通道）。
+                            // re-review #5 finding #2 [P3/UX] 方案 A：Known(!held)＋available＋
+                            // UNCONFIRMED（RESULT_OK 後重試耗盡，文案承諾「可重新檢查」）主按鈕
+                            // 亦為「重新檢查」走 onRecheckAssistantRole（只重讀不清碼不開頁；
+                            // 若重讀 held→Stage 1 清除＋everHeld 生效自動修復，仍 !held→
+                            // UNCONFIRMED 保留），另在下方加小字「重新要求授權」走
+                            // onRequestAssistantRole（明確重授權入口）。Unknown（ReadError／
+                            // Unsupported 超時）UNCONFIRMED 走 readError／不支援分支，不另設碼。
+                            // held 才 disabled；未知態不暗示可跳 fallback，
+                            // OutlinedButton 仍可達。
+                            // re-review #4 finding #2 [P3/UX]：驗證中（state.verifying，
+                            // 含 VERIFYING 顯示幀及未知/held 重疊幀）主按鈕 disabled
+                            // （含重新檢查，與 #2 防重入一致）；request() 入口另有
+                            // canStartRequest 防禦性 no-op（第二層；recheck 不開授權頁，
+                            // pending 守衛不擋 recheck，見 AssistantRoleUi.recheck KDoc）。
+                            val unconfirmedRecheck = !assistant.readError &&
+                                !assistant.roleHeld &&
+                                assistant.roleAvailable &&
+                                assistant.reasonCode == AssistantReasonCode.UNCONFIRMED
+                            val isRecheck = assistant.readError || unconfirmedRecheck
+                            Button(
+                                onClick = if (isRecheck) onRecheckAssistantRole else onRequestAssistantRole,
+                                enabled = !assistant.roleHeld && !assistant.verifying,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text(
+                                    when {
+                                        isRecheck -> "重新檢查"
+                                        assistant.roleHeld -> "設為預設助理"
+                                        !assistant.roleAvailable -> "前往語音輸入設定"
+                                        else -> "設為預設助理"
+                                    },
+                                )
+                            }
+                            // re-review #5 finding #2 方案 A 明確重授權入口：僅 UNCONFIRMED＋
+                            // Known !held＋available 時顯示（ReadError 的重讀入口已是主按鈕，
+                            // 不支援分支主按鈕已是 fallback，同效不另加）。verifying 期間
+                            // disabled（與主按鈕一致，防重入）。
+                            if (unconfirmedRecheck) {
+                                TextButton(
+                                    onClick = onRequestAssistantRole,
+                                    enabled = !assistant.verifying,
+                                    modifier = Modifier.fillMaxWidth().testTag("assistantRerequest"),
+                                ) {
+                                    Text("重新要求授權")
+                                }
+                            }
+                            // B held 指引：取消須走系統設定（RoleManager 無應用側取消入口）。
+                            if (assistant.roleHeld) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    "如需取消，請至系統設定 → 預設應用程式",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.testTag("assistantCancelHint"),
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedButton(
+                                onClick = onOpenVoiceInputSettings,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("語音輸入設定")
+                            }
+                            // C fallback 失敗回饋：設定頁打不開時紅字提示（不跳轉）。
+                            if (assistant.fallbackFailed) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    "無法開啟語音輸入設定",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.testTag("assistantFallbackFailed"),
+                                )
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
                 // S3 提權橋揭露 + 一鍵收回（矩陣 §3：每次跨權限邊界呼叫攜原因碼寫審計，
                 // 審計只記雜湊計數；此處一鍵清表並關閉提權橋開關）。
                 Card(

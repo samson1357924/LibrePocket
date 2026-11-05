@@ -516,7 +516,8 @@ class ApkPolicyHarness(unittest.TestCase):
             "        empty) : ;;\n"
             "        missing-one)\n"
             "          # The file/librepocket_keysets exclude drops out of EVERY\n"
-            "          # section: the exact-set rule must reject the compiled\n"
+            "          # section (assistant_role retained to isolate the single miss):\n"
+            "          # the exact-set rule must reject the compiled\n"
             "          # bytes in both members (dump succeeds, content differs).\n"
             "          if [ \"${MEMBER}\" = \"res/xml/backup_rules.xml\" ]; then\n"
             "            printf '%s\\n' \\\n"
@@ -532,7 +533,10 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    A: path=\"librepocket_vault-wal\" (Raw: \"librepocket_vault-wal\")' \\\n"
             "              '  E: exclude (line=5)' \\\n"
             "              '    A: domain=\"database\" (Raw: \"database\")' \\\n"
-            "              '    A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")'\n"
+            "              '    A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '    A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")'\n"
             "          else\n"
             "            printf '%s\\n' \\\n"
             "              'E: data-extraction-rules (line=1)' \\\n"
@@ -549,6 +553,9 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude (line=6)' \\\n"
             "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
             "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
             "              '  E: device-transfer (line=7)' \\\n"
             "              '    E: exclude (line=8)' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
@@ -561,11 +568,14 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '      A: path=\"librepocket_vault-wal\" (Raw: \"librepocket_vault-wal\")' \\\n"
             "              '    E: exclude (line=11)' \\\n"
             "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
-            "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")'\n"
+            "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")'\n"
             "          fi ;;\n"
             "        extra-one)\n"
-            "          # The mirror image of missing-one: every REQUIRED exclude\n"
-            "          # stays and ONE entry beyond the pinned five adds itself\n"
+            "          # The mirror image of missing-one: every REQUIRED + DEVICE-BOUND\n"
+            "          # exclude stays and ONE entry beyond the pinned six adds itself\n"
             "          # to EVERY section: the exact-set rule must reject the\n"
             "          # compiled bytes in both members (dump succeeds, content\n"
             "          # differs).\n"
@@ -584,6 +594,9 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '  E: exclude (line=5)' \\\n"
             "              '    A: domain=\"database\" (Raw: \"database\")' \\\n"
             "              '    A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '    A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
             "              '  E: exclude (line=6)' \\\n"
             "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '    A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -606,6 +619,9 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude (line=6)' \\\n"
             "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
             "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
             "              '    E: exclude (line=7)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -625,6 +641,9 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude (line=13)' \\\n"
             "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
             "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
             "              '    E: exclude (line=14)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -652,6 +671,9 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude (line=6)' \\\n"
             "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
             "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
             "              '    E: exclude (line=7)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -668,6 +690,9 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude (line=12)' \\\n"
             "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
             "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
             "              '    E: exclude (line=13)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -690,11 +715,14 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '  E: exclude (line=5)' \\\n"
             "              '    A: domain=\"database\" (Raw: \"database\")' \\\n"
             "              '    A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '    A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
             "              '  E: exclude (line=6)' \\\n"
             "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '    A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")'\n"
             "          fi ;;\n"
-            "        *)  # ok (default): exactly the REQUIRED_EXCLUDES set under\n"
+            "        *)  # *)  # ok (default): exactly the REQUIRED + DEVICE-BOUND set under\n"
             "            # both roots, so the default artifacts stay positive\n"
             "            # controls for the compiled-bytes authority\n"
             "          if [ \"${MEMBER}\" = \"res/xml/backup_rules.xml\" ]; then\n"
@@ -712,6 +740,9 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '  E: exclude (line=5)' \\\n"
             "              '    A: domain=\"database\" (Raw: \"database\")' \\\n"
             "              '    A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '    A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
             "              '  E: exclude (line=6)' \\\n"
             "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '    A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")'\n"
@@ -731,6 +762,9 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude (line=6)' \\\n"
             "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
             "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
             "              '    E: exclude (line=7)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -747,6 +781,9 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude (line=12)' \\\n"
             "              '      A: domain=\"database\" (Raw: \"database\")' \\\n"
             "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
+            "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
             "              '    E: exclude (line=13)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")'\n"
@@ -1820,8 +1857,9 @@ class ApkPolicyHarness(unittest.TestCase):
     def test_compiled_backup_rules_missing_exclude_rejected(self) -> None:
         # A resources-overlay/merger rewrite can change the COMPILED rule
         # content while every source file and the manifest binding stay
-        # faithful. The artifact bytes must still carry the EXACT five
-        # excludes: dropping one entry fails the run even though the dump
+        # faithful. The artifact bytes must still carry the EXACT six
+        # excludes (5 key + 1 device-bound): dropping one entry fails the
+        # run even though the dump
         # succeeded and the binding survived.
         apk = complete_apk(
             self.tmp / "rules-missing-one.apk",
@@ -1837,8 +1875,9 @@ class ApkPolicyHarness(unittest.TestCase):
     def test_compiled_backup_rules_unexpected_exclude_rejected(self) -> None:
         # The mirror image of the missing-one control: a resources-overlay /
         # merger rewrite can also ADD an exclude to the COMPILED rule
-        # content. The artifact bytes must still carry EXACTLY the five
-        # excludes: adding one entry (domain="path", path="extra.xml") fails
+        # content. The artifact bytes must still carry EXACTLY the six
+        # excludes (5 key + 1 device-bound): adding one entry
+        # (domain="path", path="extra.xml") fails
         # the run even though every required entry survives and the dump
         # succeeded.
         apk = complete_apk(
@@ -1853,7 +1892,8 @@ class ApkPolicyHarness(unittest.TestCase):
         self.assertIn("compiled res/xml/", result.stdout)
 
     def test_compiled_backup_rules_valid_bytes_accepted(self) -> None:
-        # Positive control: the exactly-pinned five-exclude set (any order)
+        # Positive control: the exactly-pinned six-exclude set (5 key +
+        # 1 device-bound, any order)
         # passes both members, keeping the default artifact runs positive.
         apk = complete_apk(
             self.tmp / "rules-ok.apk",
@@ -1909,8 +1949,9 @@ class ApkPolicyHarness(unittest.TestCase):
         ):
             self.assertEqual(engine_call.args[1], member)
             self.assertEqual(engine_call.args[2], expected_root)
-            # Exact-set mode is ON at artifact level: extras beyond the five
-            # required excludes are refused, not tolerated.
+            # Exact-set mode is ON at artifact level: extras beyond the six
+            # required excludes (5 key + 1 device-bound) are refused,
+            # not tolerated.
             self.assertIs(engine_call.kwargs.get("exact_excludes"), True)
 
     # -- compiled-member path resolution (release resource-name obfuscation) --
@@ -3931,6 +3972,14 @@ class BackupRulesValidator(unittest.TestCase):
         '        <exclude domain="database" path="librepocket_vault-wal" />\n'
         '        <exclude domain="database" path="librepocket_vault-shm" />\n'
         '        <exclude domain="file" path="librepocket_keysets" />\n'
+        '        <exclude domain="sharedpref" path="assistant_role.xml" />\n'
+        # Device-bound (finding #3 [P3]): always required alongside the five
+        # key entries, in EVERY checked scope (both extraction branches).
+    )
+
+    # REQUIRED (5 key) + DEVICE-BOUND (1) total expected in every scope.
+    _TOTAL_EXCLUDES = len(backup_rules_check.REQUIRED_EXCLUDES) + len(
+        backup_rules_check.REQUIRED_DEVICE_BOUND_EXCLUDES
     )
 
     def setUp(self) -> None:
@@ -4273,7 +4322,7 @@ class BackupRulesValidator(unittest.TestCase):
         )
         errors = self._check(path)
         self.assertTrue(any("<device-transfer>" in e for e in errors), errors)
-        self.assertEqual(len(errors), len(backup_rules_check.REQUIRED_EXCLUDES), errors)
+        self.assertEqual(len(errors), self._TOTAL_EXCLUDES, errors)
         self.assertTrue(all("<device-transfer>" in e for e in errors), errors)
 
     def test_commented_out_excludes_do_not_count(self) -> None:
@@ -4284,6 +4333,7 @@ class BackupRulesValidator(unittest.TestCase):
             '    <exclude domain="database" path="librepocket_vault-wal" />\n'
             '    <exclude domain="database" path="librepocket_vault-shm" />\n'
             '    <exclude domain="file" path="librepocket_keysets" />\n'
+            '    <exclude domain="sharedpref" path="assistant_role.xml" />\n'
             "    -->\n"
         )
         path = self._write(
@@ -4291,8 +4341,8 @@ class BackupRulesValidator(unittest.TestCase):
         )
         errors = self._check(path)
         self.assertEqual(
-            len(errors), 2 * len(backup_rules_check.REQUIRED_EXCLUDES), errors
-        )  # 5 per branch; comments ignored
+            len(errors), 2 * self._TOTAL_EXCLUDES, errors
+        )  # 6 per branch; comments ignored
         self.assertTrue(
             all("<cloud-backup>" in e or "<device-transfer>" in e for e in errors),
             errors,
@@ -4336,7 +4386,7 @@ class BackupRulesValidator(unittest.TestCase):
         )
         path = self._write("backup_rules.xml", self._full_backup(excludes))
         errors = self._check(path)
-        self.assertEqual(len(errors), len(backup_rules_check.REQUIRED_EXCLUDES), errors)
+        self.assertEqual(len(errors), self._TOTAL_EXCLUDES, errors)
 
     def test_nested_exclude_does_not_count(self) -> None:
         # Android allows <exclude> only as a direct child of the branch; a
@@ -4355,9 +4405,9 @@ class BackupRulesValidator(unittest.TestCase):
         errors = self._check(path)
         self.assertEqual(
             len(errors),
-            len(backup_rules_check.REQUIRED_EXCLUDES) + 1,
+            self._TOTAL_EXCLUDES + 1,
             errors,
-        )  # 5 missing per branch + 1 unknown-element (<rule>)
+        )  # 6 missing per branch + 1 unknown-element (<rule>)
         self.assertTrue(all("<device-transfer>" in e for e in errors), errors)
         self.assertTrue(
             any("unknown element <rule>" in e for e in errors), errors
@@ -4405,7 +4455,7 @@ class BackupRulesValidator(unittest.TestCase):
     def test_exclude_moved_into_duplicate_section_fails_gate(self) -> None:
         # Splitting the required excludes across duplicate cloud-backup
         # sections must not satisfy the gate: every occurrence must carry the
-        # full five-exclude set.
+        # full six-exclude set (5 key + 1 device-bound).
         split = (
             "    <cloud-backup>\n"
             '        <exclude domain="sharedpref" path="librepocket_keys.xml" />\n'
@@ -4424,8 +4474,9 @@ class BackupRulesValidator(unittest.TestCase):
         )
         path = self._write("data_extraction_rules.xml", body)
         errors = self._check(path)
-        # First occurrence misses 4, second misses 1 (sharedpref covered there,
-        # first misses it) — every occurrence must be complete.
+        # First occurrence misses 5 (4 key + device-bound), second misses 2
+        # (keys + device-bound; sharedpref key covered there, first misses
+        # it) — every occurrence must be complete.
         self.assertTrue(
             any("missing exclude domain=database path=librepocket_vault" in e for e in errors),
             errors,
@@ -4556,7 +4607,8 @@ class BackupRulesValidator(unittest.TestCase):
 
     def test_exact_excludes_mode_flags_set_differences(self) -> None:
         # Artifact-level authority: `exact_excludes=True` (the compiled-bytes
-        # scan) demands the exact REQUIRED_EXCLUDES set - a missing entry
+        # scan) demands the exact REQUIRED + DEVICE-BOUND set (5 key +
+        # 1 device-bound, single-sourced as the allowlist) - a missing entry
         # fails as usual AND an unexpected extra is a set difference too,
         # order-free. Source-level default stays presence-only (over-shielding
         # tolerated at source: the exact-set pin is deliberately compiled-byte
@@ -4603,6 +4655,119 @@ class BackupRulesValidator(unittest.TestCase):
                 reordered, "x", "full-backup-content", exact_excludes=True
             ),
             [],
+        )
+
+    def test_exact_excludes_allows_required_device_bound_entry(self) -> None:
+        # Finding #3 [P3] positive control: the allowlisted device-bound entry
+        # (assistant_role.xml) is REQUIRED, not merely tolerated - the exact
+        # six-entry set (5 key + 1 device-bound) passes with zero errors and
+        # is reported as NEITHER missing NOR unexpected (no double-report).
+        tree = ET.fromstring(self._full_backup(self._ALL_EXCLUDES))
+        self.assertEqual(
+            backup_rules_check.validate_tree(
+                tree, "x", "full-backup-content", exact_excludes=True
+            ),
+            [],
+        )
+        # Same shape in both data-extraction branches.
+        branch_tree = ET.fromstring(
+            self._data_extraction(self._ALL_EXCLUDES, self._ALL_EXCLUDES)
+        )
+        self.assertEqual(
+            backup_rules_check.validate_tree(
+                branch_tree,
+                "x",
+                backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION,
+                exact_excludes=True,
+            ),
+            [],
+        )
+
+    def test_exact_excludes_still_rejects_unexpected_alongside_device_bound(
+        self,
+    ) -> None:
+        # Finding #3 [P3]: keeping the required device-bound entry must not
+        # mask an overlay-injected extra - REQUIRED + DEVICE-BOUND present
+        # plus one evil entry still FAILS as an unexpected set difference
+        # (and reports no missing entry).
+        tree = ET.fromstring(
+            self._full_backup(
+                self._ALL_EXCLUDES
+                + '        <exclude domain="file" path="evil.xml" />\n'
+            )
+        )
+        errors = backup_rules_check.validate_tree(
+            tree, "x", "full-backup-content", exact_excludes=True
+        )
+        self.assertTrue(
+            any("unexpected exclude domain=file path=evil.xml" in e for e in errors),
+            errors,
+        )
+        self.assertFalse(
+            any("missing exclude" in e for e in errors), errors
+        )
+
+    def test_exact_excludes_rejects_missing_device_bound_entry(self) -> None:
+        # Finding #3 [P3] repro: an overlay/merger rewrite that removes ONLY
+        # assistant_role.xml (all five key entries intact) must FAIL - the
+        # device-bound entry is required, not merely allowlisted. Before the
+        # fix, `exact_excludes=True` passed this shape (present - REQUIRED -
+        # ALLOWED == empty) while the restored device would misreport REVOKED.
+        key_only = self._ALL_EXCLUDES.replace(
+            '        <exclude domain="sharedpref" path="assistant_role.xml" />\n',
+            "",
+        )
+        tree = ET.fromstring(self._full_backup(key_only))
+        errors = backup_rules_check.validate_tree(
+            tree, "x", "full-backup-content", exact_excludes=True
+        )
+        self.assertTrue(
+            any(
+                "missing exclude domain=sharedpref path=assistant_role.xml" in e
+                for e in errors
+            ),
+            errors,
+        )
+        # No double-report: the missing device-bound entry must not ALSO
+        # surface as unexpected.
+        self.assertFalse(
+            any("unexpected exclude" in e for e in errors), errors
+        )
+        # Same repro inside a data-extraction branch.
+        branch_tree = ET.fromstring(
+            self._data_extraction(self._ALL_EXCLUDES, key_only)
+        )
+        branch_errors = backup_rules_check.validate_tree(
+            branch_tree,
+            "x",
+            backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION,
+            exact_excludes=True,
+        )
+        self.assertTrue(
+            any(
+                "<device-transfer> missing exclude domain=sharedpref "
+                "path=assistant_role.xml" in e
+                for e in branch_errors
+            ),
+            branch_errors,
+        )
+
+    def test_source_level_requires_device_bound_entry(self) -> None:
+        # Finding #3 [P3] at the source face: presence-only validation also
+        # demands assistant_role.xml (source files missing it fail closed,
+        # not just the compiled bytes).
+        key_only = self._ALL_EXCLUDES.replace(
+            '        <exclude domain="sharedpref" path="assistant_role.xml" />\n',
+            "",
+        )
+        path = self._write("backup_rules.xml", self._full_backup(key_only))
+        errors = self._check(path)
+        self.assertTrue(
+            any(
+                "missing exclude domain=sharedpref path=assistant_role.xml" in e
+                for e in errors
+            ),
+            errors,
         )
 
     def test_validate_tree_matches_validate_on_representative_shapes(self) -> None:
@@ -6940,6 +7105,7 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             "    <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
             "    <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
             "    <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+            "    <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
             "</full-backup-content>\n",
             encoding="utf-8",
         )
@@ -6952,6 +7118,7 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             "        <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
             "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
             "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+            "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
             "    </cloud-backup>\n"
             "    <device-transfer>\n"
             "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
@@ -6959,6 +7126,7 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             "        <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
             "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
             "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+            "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
             "    </device-transfer>\n"
             "</data-extraction-rules>\n",
             encoding="utf-8",
@@ -7054,6 +7222,7 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+                "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
                 "    </cloud-backup>\n"
                 "    <device-transfer>\n"
                 "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
@@ -7061,6 +7230,7 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+                "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
                 "    </device-transfer>\n"
                 "</data-extraction-rules>\n",
                 encoding="utf-8",
@@ -7085,6 +7255,7 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "    <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
                 "    <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "    <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+                "    <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
                 "</full-backup-content>\n",
                 encoding="utf-8",
             )
@@ -7099,6 +7270,7 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+                "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
                 "    </cloud-backup>\n"
                 "    <device-transfer>\n"
                 "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
@@ -7106,6 +7278,7 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+                "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
                 "    </device-transfer>\n"
                 "</data-extraction-rules>\n",
                 encoding="utf-8",
@@ -7136,6 +7309,7 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+                "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
                 "    </cloud-backup>\n"
                 "    <device-transfer>\n"
                 "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
@@ -7143,6 +7317,7 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-wal\" />\n"
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
+                "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
                 "    </device-transfer>\n"
                 "</data-extraction-rules>\n",
                 encoding="utf-8",
@@ -7811,6 +7986,7 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 '        <exclude domain="database" path="librepocket_vault-wal" />\n'
                 '        <exclude domain="database" path="librepocket_vault-shm" />\n'
                 '        <exclude domain="file" path="librepocket_keysets" />\n'
+                '        <exclude domain="sharedpref" path="assistant_role.xml" />\n'
                 "    </cloud-backup>\n"
                 "    <device-transfer>\n"
                 '        <exclude domain="sharedpref" path="librepocket_keys.xml" />\n'
@@ -7818,6 +7994,7 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 '        <exclude domain="database" path="librepocket_vault-wal" />\n'
                 '        <exclude domain="database" path="librepocket_vault-shm" />\n'
                 '        <exclude domain="file" path="librepocket_keysets" />\n'
+                '        <exclude domain="sharedpref" path="assistant_role.xml" />\n'
                 "    </device-transfer>\n"
                 "</data-extraction-rules>\n",
                 encoding="utf-8",

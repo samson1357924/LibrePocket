@@ -305,7 +305,7 @@ EOF
 for f in "$ROOT/app/src/main/res/xml/backup_rules.xml" "$ROOT/app/src/main/res/xml/data_extraction_rules.xml"; do
     [ -f "$f" ] || fail "missing $f"
 done
-# BackupPolicy.KEY_FILES_EXCLUDED 5 項逐項斷言：以結構化 XML 驗證區分
+# BackupPolicy.KEY_FILES_EXCLUDED 5 key 項＋device-bound assistant_role 逐項斷言：以結構化 XML 驗證區分
 # cloud-backup / device-transfer 並忽略註解（grep 全文比對會誤判 PASS，見
 # scripts/backup_rules_check.py 說明）。
 # 檔名↔root 綁定 fail-closed：backup_rules.xml 必須是 <full-backup-content>、

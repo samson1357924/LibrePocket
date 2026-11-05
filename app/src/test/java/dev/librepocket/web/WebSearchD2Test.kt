@@ -8,6 +8,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -458,5 +459,63 @@ class WebSearchD2Test {
         val svc = WebSearchService(unavailable)
         repeat(2) { assertTrue(svc.search("kotlin", 5) is WebSearchOutcome.Unavailable) }
         assertEquals(2, calls)
+    }
+
+    @Test fun lateCacheHitAfterMissDoesNotStartSecondUpstream() = runBlocking {
+        // Interleaving under test (check-then-elect race):
+        // 1. jobA misses the (shared) cache, then parks at svcA.mutex BEFORE electing
+        //    in-flight leader/follower (mutex held externally via reflection).
+        // 2. svcB (own mutex, same shared WebSearchCache + same cacheNamespace) runs to
+        //    completion on the test thread and populates the cache.
+        // 3. svcA mutex released -> jobA resumes. Without an under-lock re-check it would
+        //    elect itself leader and fire a 2nd upstream; with the fix it sees the late
+        //    hit under lock and returns Ok(cached=true) with zero delegateA calls.
+        // Deterministic (no timing): the held mutex forces the park; the delay below only
+        // lets the UNDISPATCHED body run to its first suspension point.
+        val cache = WebSearchCache()
+        val callsA = AtomicInteger(0)
+        val callsB = AtomicInteger(0)
+        fun countingDelegate(calls: AtomicInteger, id: String) = object : WebSearchProvider {
+            override val id: String = id
+            override val cacheNamespace: String = "shared-ns"
+            override val capabilities: Set<WebCapability> = emptySet()
+            override suspend fun probe(): WebProbe = WebProbe.Ready
+            override suspend fun search(query: String, count: Int): WebSearchOutcome {
+                calls.incrementAndGet()
+                return WebSearchOutcome.Ok(
+                    results = listOf(WebSearchResult("T", "https://example.com/", "s")),
+                )
+            }
+        }
+        val svcA = WebSearchService(countingDelegate(callsA, "a"), cache)
+        val svcB = WebSearchService(countingDelegate(callsB, "b"), cache)
+
+        // Reflection clearly marked: hold svcA's private mutex so jobA parks pre-election.
+        val mutexField = WebSearchService::class.java.getDeclaredField("mutex")
+        mutexField.setAccessible(true)
+        val mutexA = mutexField.get(svcA) as Mutex
+        mutexA.lock()
+        var jobA: kotlinx.coroutines.Deferred<WebSearchOutcome>? = null
+        try {
+            jobA = async(start = CoroutineStart.UNDISPATCHED) { svcA.search("q", 5) }
+            delay(50) // let UNDISPATCHED body run to mutex.withLock suspension
+            assertFalse(jobA.isCompleted) // parked, not complete
+            assertEquals(0, callsA.get())
+
+            val outB = svcB.search("q", 5) as WebSearchOutcome.Ok
+            assertFalse(outB.cached)
+            assertEquals(1, callsB.get())
+
+            mutexA.unlock()
+            val outA = withTimeout(5_000) { jobA.await() } as WebSearchOutcome.Ok
+            assertTrue(outA.cached)
+            assertEquals(0, callsA.get()) // no second upstream
+            assertEquals(1, callsA.get() + callsB.get())
+        } finally {
+            if (mutexA.isLocked) {
+                try { mutexA.unlock() } catch (_: IllegalStateException) { /* already released */ }
+            }
+            jobA?.cancel()
+        }
     }
 }

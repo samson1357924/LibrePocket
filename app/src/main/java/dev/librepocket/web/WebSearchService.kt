@@ -71,22 +71,28 @@ class WebSearchService(
         while (true) {
             cache.getByKey(key)?.let { return it.copy(cached = true) }
 
-            val mine: CompletableDeferred<WebSearchOutcome>
-            val leader: Boolean
+            var lateHit: WebSearchOutcome.Ok? = null
+            var mine: CompletableDeferred<WebSearchOutcome>? = null
+            var leader = false
             mutex.withLock {
-                val existing = inFlight[key]
-                if (existing != null) {
-                    mine = existing
-                    leader = false
-                } else {
-                    mine = CompletableDeferred()
-                    inFlight[key] = mine
-                    leader = true
+                lateHit = cache.getByKey(key) // re-check under lock closes check-then-elect race
+                if (lateHit == null) {
+                    val existing = inFlight[key]
+                    if (existing != null) {
+                        mine = existing
+                    } else {
+                        val fresh = CompletableDeferred<WebSearchOutcome>()
+                        mine = fresh
+                        inFlight[key] = fresh
+                        leader = true
+                    }
                 }
             }
+            lateHit?.let { return it.copy(cached = true) }
+            val m = mine ?: continue // unreachable (lateHit==null implies elected/joined) but safe
             if (!leader) {
                 try {
-                    return mine.await()
+                    return m.await()
                 } catch (_: CancellationException) {
                     // Follower 自己被取消 → ensureActive 拋出，原樣透傳；
                     // 否則是 leader 死亡 → 迴圈重選（成為新 leader）。
@@ -104,32 +110,32 @@ class WebSearchService(
                 if (outcome is WebSearchOutcome.Ok) {
                     cache.putByKey(key, outcome)
                 }
-                mine.complete(outcome)
+                m.complete(outcome)
                 return outcome
             } catch (e: CancellationException) {
                 // Leader 已拿到 Ok 才觀察到取消：follower 仍值得該值（不寫 cache），
                 // leader 自己拋 CE；否則 follower 會重試，不污染。
                 val ok = okForFollowers
                 if (ok != null) {
-                    mine.complete(ok)
+                    m.complete(ok)
                 } else {
-                    mine.completeExceptionally(e)
+                    m.completeExceptionally(e)
                 }
                 throw e
             } catch (_: Exception) {
                 try { currentCoroutineContext().ensureActive() }
-                catch (ce: CancellationException) { mine.completeExceptionally(ce); throw ce }
+                catch (ce: CancellationException) { m.completeExceptionally(ce); throw ce }
                 val failed = WebSearchOutcome.Failed(WebFailureReason.TRANSPORT)
-                mine.complete(failed)
+                m.complete(failed)
                 return failed
             } catch (e: Throwable) {
-                mine.completeExceptionally(e)
+                m.completeExceptionally(e)
                 throw e
             } finally {
                 // 取消狀態下仍須清 inFlight，否則殘留已取消的 deferred 會焊住後續同 key。
                 withContext(NonCancellable) {
                     mutex.withLock {
-                        if (inFlight[key] === mine) inFlight.remove(key)
+                        if (inFlight[key] === m) inFlight.remove(key)
                     }
                 }
             }

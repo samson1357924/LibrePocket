@@ -11,6 +11,7 @@ Run with: python3 -m unittest scripts/tests/test_workflow_policy.py
 
 from __future__ import annotations
 
+import fnmatch
 import io
 import re
 import shutil
@@ -1779,6 +1780,68 @@ jobs:
         )
         self._assert_rejected("policy filter is missing: .github/workflows/**")
 
+    def test_policy_filter_requires_gradle_path(self) -> None:
+        # Two-line context: 'gradle/**' also appears in the code filter
+        # (followed by 'gradlew'), so anchor on the policy-only
+        # 'gradle.properties' successor (the comment block above it is
+        # skipped by matching the entry pair directly).
+        self._write(
+            "pr-check.yml",
+            PR_CHECK.replace(
+                "              - 'gradle/**'\n"
+                "              - 'gradle.properties'\n",
+                "              - 'gradle.properties'\n",
+                1,
+            ),
+        )
+        self._assert_rejected("policy filter is missing: gradle/**")
+
+    def test_policy_filter_requires_gradle_properties_path(self) -> None:
+        # Two-line context: 'gradle.properties' also appears in the code
+        # filter (after 'build.gradle.kts'), so anchor on the policy-only
+        # 'gradle/**' predecessor.
+        self._write(
+            "pr-check.yml",
+            PR_CHECK.replace(
+                "              - 'gradle/**'\n"
+                "              - 'gradle.properties'\n",
+                "              - 'gradle/**'\n",
+                1,
+            ),
+        )
+        self._assert_rejected("policy filter is missing: gradle.properties")
+
+    def test_policy_filter_covers_gradle_build_files(self) -> None:
+        """P1-1: metadata/catalog/properties-only diffs must run the harness.
+
+        `gradle/**` covers files under gradle/ (verification-metadata.xml,
+        libs.versions.toml, future new files) but not the root-level
+        gradle.properties (no slash), which needs its own filter entry.
+        """
+        patterns = check_workflow_policy.EXPECTED_POLICY_FILTER_PATHS
+        for path in (
+            "gradle/verification-metadata.xml",
+            "gradle/libs.versions.toml",
+            "gradle.properties",
+            "gradle/wrapper/gradle-wrapper.properties",
+            "gradle/new-file.toml",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(
+                    any(
+                        fnmatch.fnmatchcase(path, pattern)
+                        for pattern in patterns
+                    ),
+                    f"gradle-only diff {path} must set policy=true",
+                )
+        self.assertFalse(
+            any(
+                fnmatch.fnmatchcase("docs/TESTING.md", pattern)
+                for pattern in patterns
+            ),
+            "docs-only diff must leave policy=false",
+        )
+
     def test_policy_filter_rejects_extra_path(self) -> None:
         self._write(
             "pr-check.yml",
@@ -1895,6 +1958,30 @@ jobs:
         end = workflow.index("  build-and-policy-gate:\n")
         block = workflow[start:end]
         mutated = block.replace(" scripts/tests/test_verify_jdk_floor.py", "", 1)
+        self.assertNotEqual(block, mutated)
+        self._write(
+            "pr-check.yml", workflow[:start] + mutated + workflow[end:]
+        )
+        self._assert_rejected("policy-harness core command must appear exactly once")
+
+    def test_policy_harness_command_includes_verification_metadata_test(self) -> None:
+        workflow = PR_CHECK
+        start = workflow.index("  policy-harness:\n")
+        end = workflow.index("  build-and-policy-gate:\n")
+        block = workflow[start:end]
+        mutated = block.replace(" scripts/tests/test_verification_metadata.py", "", 1)
+        self.assertNotEqual(block, mutated)
+        self._write(
+            "pr-check.yml", workflow[:start] + mutated + workflow[end:]
+        )
+        self._assert_rejected("policy-harness core command must appear exactly once")
+
+    def test_policy_harness_command_includes_osv_scan_test(self) -> None:
+        workflow = PR_CHECK
+        start = workflow.index("  policy-harness:\n")
+        end = workflow.index("  build-and-policy-gate:\n")
+        block = workflow[start:end]
+        mutated = block.replace(" scripts/tests/test_osv_scan.py", "", 1)
         self.assertNotEqual(block, mutated)
         self._write(
             "pr-check.yml", workflow[:start] + mutated + workflow[end:]

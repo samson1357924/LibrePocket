@@ -108,6 +108,13 @@ import java.io.File
  * bridge／spawn 之前（flavor 為構造屬性，fail-closed 早拒）。
  * [ShellPolicy.validateElevated] 只把 flavor 傳給路徑 scope（FileScope），無路徑
  * 命令（`id`／`getprop`）在 PLAY／FOSS 亦 Allowed，故不能只靠 validate，須此全域門兜底。
+ *
+ * AA1 資源門（owner 新 P1＋P2）：[ElevatedCleanupTracker.isSaturated] 即拒
+ * `Denied(QUOTA_EXCEEDED, "elevated cleanup backlog full...")` 且零 spawn
+ * （與 quota 同級，位於配額門前，飽和拒絕不耗配額；飽和＝有不可回收清理，
+ * B3 需介入）。drain 層飽和仍嘗試監督清理（永不跳過 killer）；本旗標經
+ * [ElevatedBinaryResult.Ok.cleanupIncomplete]／[ElevatedBinaryResult.TimedOut.cleanupIncomplete]
+ * 穿透（僅監測，不改 verdict）。
  */
 class RootSuRunner(
     private val privateRoot: String? = null,
@@ -211,6 +218,12 @@ class RootSuRunner(
         if (!SuBinaryResolver.isTrusted(su)) {
             return ElevatedBinaryResult.Failed("su untrusted path (fail-closed, no spawn)")
         }
+        // AA1 resource gate (same level as quota): saturated cleanup backlog
+        // means unreclaimable cleanups are outstanding; fail-closed, no spawn,
+        // no quota consumed (B3 must intervene, see ElevatedCleanupTracker).
+        if (ElevatedCleanupTracker.isSaturated()) {
+            return ElevatedRunnerCommon.cleanupBacklogFull()
+        }
         if (!quota.tryAcquire()) {
             return ElevatedRunnerCommon.quotaExceeded()
         }
@@ -263,6 +276,7 @@ class RootSuRunner(
                 partialStderr = err.bytes,
                 timeoutMs = timeoutMs,
                 truncated = truncated,
+                cleanupIncomplete = raw.cleanupIncomplete,
             )
         }
         // V2 gobbler 讀取失敗（owner 新 P1-2 correctness）：只有真 EOF（`read`
@@ -288,6 +302,7 @@ class RootSuRunner(
             stderr = err.bytes,
             exitCode = raw.exitCode,
             truncated = truncated,
+            cleanupIncomplete = raw.cleanupIncomplete,
         )
     }
 

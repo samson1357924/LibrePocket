@@ -22,6 +22,11 @@ import dev.librepocket.shell.ShellResult
  * [ByteArray] 做 `copyOf()` 存入私有 backing，取值經 `get() = copyOf()`。
  * 呼叫方不得保留傳入引用（內部已拷貝），取用方拿到的每次皆為新拷貝，
  * 可自由竄改不影響內部。單測以 `contentEquals` 斷言，故構造拷貝安全。
+ *
+ * AA1 清理旗標穿透（owner 新 P1＋P2；僅監測，不改 verdict）：[Ok.cleanupIncomplete]／
+ * [TimedOut.cleanupIncomplete] 由 drain 經 [ElevatedProcessIo.Drained.cleanupIncomplete]
+ * 穿透（預設 false，舊 4 參構造仍可編譯；copy/getter/equals/hashCode/componentN
+ * 一併更新，手寫風格與 P2-A 一致）。auditAndExtract 不變（truncated 語義不混入）。
  */
 sealed interface ElevatedBinaryResult {
     class Ok(
@@ -29,6 +34,7 @@ sealed interface ElevatedBinaryResult {
         stderr: ByteArray,
         val exitCode: Int,
         val truncated: Boolean,
+        val cleanupIncomplete: Boolean = false,
     ) : ElevatedBinaryResult {
         private val _stdout: ByteArray = stdout.copyOf()
         private val _stderr: ByteArray = stderr.copyOf()
@@ -41,12 +47,14 @@ sealed interface ElevatedBinaryResult {
             stderr: ByteArray = this.stderr,
             exitCode: Int = this.exitCode,
             truncated: Boolean = this.truncated,
-        ): Ok = Ok(stdout, stderr, exitCode, truncated)
+            cleanupIncomplete: Boolean = this.cleanupIncomplete,
+        ): Ok = Ok(stdout, stderr, exitCode, truncated, cleanupIncomplete)
 
         operator fun component1(): ByteArray = stdout
         operator fun component2(): ByteArray = stderr
         operator fun component3(): Int = exitCode
         operator fun component4(): Boolean = truncated
+        operator fun component5(): Boolean = cleanupIncomplete
 
         override fun equals(other: Any?): Boolean {
             if (this === other) return true
@@ -54,7 +62,8 @@ sealed interface ElevatedBinaryResult {
             return _stdout.contentEquals(other._stdout) &&
                 _stderr.contentEquals(other._stderr) &&
                 exitCode == other.exitCode &&
-                truncated == other.truncated
+                truncated == other.truncated &&
+                cleanupIncomplete == other.cleanupIncomplete
         }
 
         override fun hashCode(): Int {
@@ -62,11 +71,13 @@ sealed interface ElevatedBinaryResult {
             r = 31 * r + _stderr.contentHashCode()
             r = 31 * r + exitCode
             r = 31 * r + truncated.hashCode()
+            r = 31 * r + cleanupIncomplete.hashCode()
             return r
         }
 
         override fun toString(): String =
-            "Ok(stdout=$_stdout, stderr=$_stderr, exitCode=$exitCode, truncated=$truncated)"
+            "Ok(stdout=$_stdout, stderr=$_stderr, exitCode=$exitCode, truncated=$truncated, " +
+                "cleanupIncomplete=$cleanupIncomplete)"
     }
 
     data class Denied(
@@ -79,6 +90,7 @@ sealed interface ElevatedBinaryResult {
         partialStderr: ByteArray,
         val timeoutMs: Long,
         val truncated: Boolean,
+        val cleanupIncomplete: Boolean = false,
     ) : ElevatedBinaryResult {
         private val _partialStdout: ByteArray = partialStdout.copyOf()
         private val _partialStderr: ByteArray = partialStderr.copyOf()
@@ -91,12 +103,14 @@ sealed interface ElevatedBinaryResult {
             partialStderr: ByteArray = this.partialStderr,
             timeoutMs: Long = this.timeoutMs,
             truncated: Boolean = this.truncated,
-        ): TimedOut = TimedOut(partialStdout, partialStderr, timeoutMs, truncated)
+            cleanupIncomplete: Boolean = this.cleanupIncomplete,
+        ): TimedOut = TimedOut(partialStdout, partialStderr, timeoutMs, truncated, cleanupIncomplete)
 
         operator fun component1(): ByteArray = partialStdout
         operator fun component2(): ByteArray = partialStderr
         operator fun component3(): Long = timeoutMs
         operator fun component4(): Boolean = truncated
+        operator fun component5(): Boolean = cleanupIncomplete
 
         override fun equals(other: Any?): Boolean {
             if (this === other) return true
@@ -104,7 +118,8 @@ sealed interface ElevatedBinaryResult {
             return _partialStdout.contentEquals(other._partialStdout) &&
                 _partialStderr.contentEquals(other._partialStderr) &&
                 timeoutMs == other.timeoutMs &&
-                truncated == other.truncated
+                truncated == other.truncated &&
+                cleanupIncomplete == other.cleanupIncomplete
         }
 
         override fun hashCode(): Int {
@@ -112,12 +127,13 @@ sealed interface ElevatedBinaryResult {
             r = 31 * r + _partialStderr.contentHashCode()
             r = 31 * r + timeoutMs.hashCode()
             r = 31 * r + truncated.hashCode()
+            r = 31 * r + cleanupIncomplete.hashCode()
             return r
         }
 
         override fun toString(): String =
             "TimedOut(partialStdout=$_partialStdout, partialStderr=$_partialStderr, " +
-                "timeoutMs=$timeoutMs, truncated=$truncated)"
+                "timeoutMs=$timeoutMs, truncated=$truncated, cleanupIncomplete=$cleanupIncomplete)"
     }
 
     data class Failed(val message: String) : ElevatedBinaryResult
@@ -164,6 +180,9 @@ fun ElevatedBinaryResult.verdict(): String = when (this) {
  * 再 `toByteArray(UTF_8)`（見 [RootFramebufferCapture] B2 修正）。
  * 本函數不加 `Deprecated`：文字相容殼仍為 [ElevatedShellRunner.run]
  * 的實現手段，保留合法呼叫。
+ *
+ * AA1 誠實聲明：legacy String 路徑不攜清理旗標（[ShellResult] 無此欄位，
+ * 此處不映射 cleanupIncomplete；二進位 [ElevatedBinaryResult] 為準）。
  */
 fun ElevatedBinaryResult.toShellResult(): ShellResult = when (this) {
     is ElevatedBinaryResult.Ok ->

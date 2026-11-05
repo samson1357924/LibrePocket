@@ -11,6 +11,11 @@ package dev.librepocket.privilege.github
  * U1（owner 新 P1-1＋P1-2）：本旗已被兩 runner（[RootSuRunner]／[ShizukuShellRunner]）
  * 經 `activationCheck` 預設消費（default-deny：`false` 即零 spawn 拒絕）；
  * B3 產品接線時傳明示 allow（`{ ELEVATED_RUNNERS_READY }` 仍須每次重驗，不得快取）。
+ *
+ * AA1（owner 新 P1＋P2）：[ElevatedCleanupTracker.isSaturated]（未完成清理達上限，
+ * 有不可回收 Binder stall 殘留）即 B3 blocker 條件——兩 runner 入口資源門已
+ * fail-closed 拒絕新 spawn，B3 須先解清理缺口（裝置驗收＋殘留回收）再放行，
+ * 不得僅調大上限繞行。
  */
 object PrivilegeActivation {
     const val ELEVATED_RUNNERS_READY = false

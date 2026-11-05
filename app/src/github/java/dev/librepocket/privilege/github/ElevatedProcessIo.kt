@@ -4,6 +4,7 @@ import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellPolicy
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.TimeUnit
 
@@ -117,7 +118,47 @@ import java.util.concurrent.TimeUnit
  * - [ElevatedCappedPipe]：原內嵌 `private CappedPipe` 更名提升為同檔 internal，
  *   行為零變更（drain 改用），僅為隔離可測（見 `ElevatedCappedPipeTest`：溢出→
  *   didOverflow、截斷語義、failed 單調、bytes 拷貝）。
+ *
+ * AA1 跨呼叫清理監督（owner 新 P1＋P2；PocketGuard 無動作項）：
+ * 單次 drain 有界已由 Z1 完成，但每次 timeout 建新 daemon worker、不可中斷 stall
+ * 永久殘留且無總量上限（quota 只限速率）。現 [ElevatedCleanupTracker] 跨呼叫計數
+ * 未完成清理（雙 runner 共用；正常完成即釋放），飽和即兩 runner 入口拒絕新 spawn
+ * （fail-closed），drain 層仍嘗試監督清理（永不跳過 killer）；旗標經二進位結果
+ * cleanupIncomplete 穿透至 runner 層（legacy String 路徑不攜，二進位為準）。
  */
+internal object ElevatedCleanupTracker {
+    /**
+     * 跨呼叫未完成清理計數上限（AA1，owner 新 P1＋P2）。
+     *
+     * 每殘留清理 worker 持有 Process＋已取流＋Binder 參照（Shizuku 遠端 stall 時含
+     * Binder 代理），無界殘留即無界 fd／執行緒／binder 參照洩漏。4 為有界併發經驗值
+     * （單次 drain 至多 1 worker，允許數次偶發 stall 疊加而不立即拒絕；持續 stall
+     * 即飽和 fail-closed，B3 可調本常數）。
+     *
+     * 飽和（[isSaturated]）即 B3 blocker 條件（見 [PrivilegeActivation]：清理缺口未解
+     * 前產品不得放行，runner 入口資源門拒絕新 spawn）。
+     */
+    const val MAX_OUTSTANDING_CLEANUPS = 4
+
+    private val outstandingCount = AtomicInteger(0)
+
+    /** 目前未完成清理數（跨呼叫全域，雙 runner 共用；僅計未完成，正常完成即釋放）。 */
+    fun outstanding(): Int = outstandingCount.get()
+
+    /** 是否飽和（未完成數達上限；飽和即有不可回收清理，runner 入口拒絕新 spawn）。 */
+    fun isSaturated(): Boolean = outstanding() >= MAX_OUTSTANDING_CLEANUPS
+
+    /** 佔一槽（僅 [ElevatedProcessIo.drain] 經 `runCleanupBounded` 調用）。 */
+    internal fun acquireSlot() {
+        outstandingCount.incrementAndGet()
+    }
+
+    /** 釋一槽（僅 [ElevatedProcessIo.drain] 經 `runCleanupBounded` worker finally 調用）。 */
+    internal fun releaseSlot() {
+        outstandingCount.updateAndGet { if (it > 0) it - 1 else 0 }
+    }
+}
+
 internal object ElevatedProcessIo {
     /** R1-A 截圖二進位容量：`screencap -p` / `cat /dev/graphics/fb0` 的截斷上限（8M）。 */
     const val BINARY_SCREENSHOT_MAX_BYTES: Int = 8 * 1024 * 1024
@@ -432,17 +473,33 @@ internal object ElevatedProcessIo {
      * [Drained.cleanupIncomplete] 帶出，不靜默）。每 drain 至多 1 worker，
      * daemon 故不擋 JVM 退出；不可中斷 Binder stall 殘留 daemon 至多存活至 block
      * 自然返回（如 8s 睡眠模型），呼叫方有界返回不受影響。
+     *
+     * AA1 跨呼叫計數（owner 新 P1）：worker 啟動即 [ElevatedCleanupTracker.acquireSlot]、
+     * finally [ElevatedCleanupTracker.releaseSlot]（正常完成即釋放；永久卡住期間
+     * 即殘留計數）。drain 層飽和亦不跳過 killer（入口拒絕由 runner 資源門承擔）。
      */
     private fun runCleanupBounded(timeoutMs: Long, block: () -> Unit): Boolean {
+        // AA1: worker 啟動即佔一槽（呼叫執行緒計數，避免啟動競態漏計），finally 釋放
+        // （正常完成即--；永久卡住即殘留計數，見 ElevatedCleanupTracker）。
+        // 飽和時 drain 層仍嘗試監督清理（永不跳過 killer，只記錄）：入口拒絕由兩
+        // runner 資源門承擔，此處不拒絕，只計數。
+        ElevatedCleanupTracker.acquireSlot()
         val t = Thread({
             try {
                 block()
             } catch (_: Exception) {
                 // block 內已逐段 runCatching，此處僅兜底線程體異常，不外抛。
+            } finally {
+                ElevatedCleanupTracker.releaseSlot()
             }
         }, "elevated-cleanup").also {
             it.isDaemon = true
-            it.start()
+            try {
+                it.start()
+            } catch (e: Exception) {
+                ElevatedCleanupTracker.releaseSlot()
+                throw e
+            }
         }
         try {
             t.join(timeoutMs.coerceAtLeast(0L))
@@ -541,6 +598,10 @@ internal object ElevatedProcessIo {
  *   [RootSuRunner] 各寫一次（改一漏一風險），收斂至此；
  * - verdict 映射單一來源：缺原因碼一律 `BAD_ARGUMENT`，配額耗盡一律
  *   `QUOTA_EXCEEDED`（與 [dev.librepocket.shell.ShellDeny] 對齊，不另發明碼）。
+ *
+ * AA1 資源門（owner 新 P1）：清理 backlog 飽和拒絕收斂至此（[cleanupBacklogFull]，
+ * 與 quota 同級，同為 `QUOTA_EXCEEDED` 且零 spawn；飽和＝有不可回收清理，
+ * B3 需介入，見 [ElevatedCleanupTracker]）。
  */
 internal object ElevatedRunnerCommon {
     /** 原因碼缺失拒絕訊息（矩陣 §3 審計要求原因碼非空）。 */
@@ -556,4 +617,12 @@ internal object ElevatedRunnerCommon {
     /** 配額耗盡時的 typed 拒絕：`QUOTA_EXCEEDED`，不建子進程。 */
     fun quotaExceeded(): ElevatedBinaryResult.Denied =
         ElevatedBinaryResult.Denied(ShellDeny.QUOTA_EXCEEDED, QUOTA_EXCEEDED_MESSAGE)
+
+    /** 清理 backlog 飽和拒絕訊息（AA1 資源門，與 quota 同級）。 */
+    const val CLEANUP_BACKLOG_FULL_MESSAGE =
+        "elevated cleanup backlog full (fail-closed, no spawn)"
+
+    /** 清理 backlog 飽和時的 typed 拒絕：`QUOTA_EXCEEDED`，不建子進程。 */
+    fun cleanupBacklogFull(): ElevatedBinaryResult.Denied =
+        ElevatedBinaryResult.Denied(ShellDeny.QUOTA_EXCEEDED, CLEANUP_BACKLOG_FULL_MESSAGE)
 }

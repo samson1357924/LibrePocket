@@ -20,6 +20,7 @@ import dev.librepocket.agent.assistant.AssistantSettingsState
 import dev.librepocket.agent.assistant.AssistantSnapshot
 import dev.librepocket.agent.assistant.assistantReasonText
 import dev.librepocket.agent.assistant.effectiveAssistantReason
+import dev.librepocket.agent.assistant.reconcileFallbackFailedOnHeldObserved
 import dev.librepocket.provider.ProviderProtocol
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -637,5 +638,29 @@ class AssistantCardTest {
         composeRule.onNodeWithText("設為預設助理").performScrollTo().performClick()
         assertEquals(1, requests)
         assertEquals(0, rechecks)
+    }
+
+    /**
+     * re-review #6 finding #3 [P3/UX]：held 清理後期望終態渲染——held＋
+     * `fallbackFailed=false` 時無紅字，只留 held 頭部（鎖定清理後的期望終態）。
+     *
+     * 接線缺口誠實註記：Card 層 `state` 靜態灌入，測不出 `SideEffect` held 清除
+     * 接線（`state` 可任意構造，`held=true＋fallbackFailed=true` 亦可渲染紅字——
+     * 那是 SettingsScreen 照 `state` 顯示，非管線保證）；接線由純函數
+     * [reconcileFallbackFailedOnHeldObserved]＋AssistantRoleTest 組合序列鎖定，
+     * 真機 Lifecycle＋重組交錯未在此覆蓋（與既有缺口註記一致）。
+     */
+    @Test
+    fun heldWithFallbackCleared_hidesErrorRow() {
+        setSettings(
+            AssistantSettingsState(
+                roleHeld = true,
+                roleAvailable = true,
+                fallbackFailed = false,
+            ),
+        )
+        composeRule.onNodeWithText("已設為預設助理：長按首頁鍵或系統手勢可叫出 LibrePocket。")
+            .performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("assistantFallbackFailed").assertDoesNotExist()
     }
 }

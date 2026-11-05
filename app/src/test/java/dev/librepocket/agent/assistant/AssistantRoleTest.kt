@@ -1353,4 +1353,65 @@ class AssistantRoleTest {
             )
         }
     }
+
+    // ---- re-review #6 finding #3 [P3/UX]：held 觀察幀清除 fallbackFailed ----
+
+    @Test
+    fun givenHeldObserved_whenFallbackFailed_thenClearsToFalse() {
+        // held 可信確認：舊 fallback 失敗紅字過期（主入口已生效），一律清 false。
+        assertEquals(
+            false,
+            reconcileFallbackFailedOnHeldObserved(true, heldConfirmed = true),
+        )
+        assertEquals(
+            false,
+            reconcileFallbackFailedOnHeldObserved(false, heldConfirmed = true),
+        )
+    }
+
+    @Test
+    fun givenNotHeldObserved_whenFallbackFailed_thenPreserves() {
+        // 「不清」路徑：清除僅發生在 held 觀察幀；!held 幀原樣保留
+        // （與 reconcileStoredOnHeldObserved 對稱）。
+        assertEquals(
+            true,
+            reconcileFallbackFailedOnHeldObserved(true, heldConfirmed = false),
+        )
+        assertEquals(
+            false,
+            reconcileFallbackFailedOnHeldObserved(false, heldConfirmed = false),
+        )
+    }
+
+    @Test
+    fun givenDeniedAndFallbackFailedThenHeldObserved_whenCleared_thenNoContradiction() {
+        // 組合序列（純函數層模擬 UI SideEffect held 分支雙清除）：
+        // DENIED＋fallbackFailed=true（!held passthrough＋保留）→ held 觀察
+        // （stored→null＋fallback→false）→ 調和 null＋無紅字，頭部 held 與紅字
+        // 不再並存；後續外部撤銷仍判 REVOKED（stored 清除語義不變）。
+        var stored: String? = AssistantReasonCode.DENIED
+        var fallbackFailed = true
+        var everHeld = false
+        val notHeld = AssistantSnapshot.Known(available = true, held = false)
+        assertEquals(
+            AssistantReasonCode.DENIED,
+            effectiveAssistantReason(stored, notHeld, everHeld, false),
+        )
+        assertEquals(
+            true,
+            reconcileFallbackFailedOnHeldObserved(fallbackFailed, heldConfirmed = false),
+        )
+        val held = AssistantSnapshot.Known(available = true, held = true)
+        if (held.held) everHeld = true
+        stored = reconcileStoredOnHeldObserved(stored, heldConfirmed = true)
+        fallbackFailed =
+            reconcileFallbackFailedOnHeldObserved(fallbackFailed, heldConfirmed = true)
+        assertNull("held 觀察幀必須清除陳舊 DENIED", stored)
+        assertEquals("held 觀察幀必須清除過期 fallbackFailed", false, fallbackFailed)
+        assertNull(effectiveAssistantReason(stored, held, everHeld, false))
+        assertEquals(
+            AssistantReasonCode.REVOKED,
+            effectiveAssistantReason(stored, notHeld, everHeld, false),
+        )
+    }
 }

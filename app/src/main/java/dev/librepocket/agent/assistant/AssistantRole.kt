@@ -458,6 +458,32 @@ fun reconcileStoredOnHeldObserved(stored: String?, heldConfirmed: Boolean): Stri
     if (heldConfirmed) null else stored
 
 /**
+ * held 觀察幀的 fallback 失敗旗清除（re-review #6 finding #3 [P3/UX]，純函數；
+ * UI 在 `SideEffect` 內觀察到 Known(held=true) 的幀呼叫，與 stored 清除同幀）。
+ *
+ * 語義：held 已確認可用＝主入口生效，舊「無法開啟語音輸入設定」紅字過期
+ * （使用者曾點「語音輸入設定」但 fallback 失敗 → `fallbackFailed=true` sticky，
+ * 之後從外部系統設定手動授予 → 回 App 觀察到 Known held；若不清，頭部
+ * 「已設為預設助理」與過期紅字同時出現）。與 [reconcileStoredOnHeldObserved]
+ * 同因——可信新鮮確認（新鮮快照真相），故同幀清除。
+ *
+ * 互斥：`fallbackFailed=true` 只由 openFallback 失敗路徑寫入（無唯一系統候選／
+ * `startActivity` 異常），成功置 false；決策驅動的 openFallback
+ * （UnsupportedFallback／REQUEST_FAILED 分支）只在非 held 快照下發生
+ * （[decideAssistantRole] 該兩分支要求 `!held`），寫入幀非 held 幀；本清除僅
+ * held 幀，幀不同故與決策路徑無同幀雙寫競爭（AlreadyHeld／RESULT_OK／
+ * RequestRole 新一輪的 false 寫入同為 false，同值無衝突；held 態手動點
+ * fallback 失敗置 true 後，下一 held `SideEffect` 即清為 false，正為預期過期語義）。
+ *
+ * `heldConfirmed == false` 原樣回 `fallbackFailed`（即「不清」路徑，與
+ * [reconcileStoredOnHeldObserved] 對稱）。
+ */
+fun reconcileFallbackFailedOnHeldObserved(
+    fallbackFailed: Boolean,
+    heldConfirmed: Boolean,
+): Boolean = if (heldConfirmed) false else fallbackFailed
+
+/**
  * 驗證中是否允許發起新要求（re-review #4 finding #2 [P3/UX] 純函數防線）。
  * `request()` 入口守衛（見 AssistantRoleUi）：`pendingVerify == true`（驗證重試
  * 跑時）一律回 false，呼叫方純 no-op＋Log，不清驗證、不開授權頁；

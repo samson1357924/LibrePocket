@@ -206,25 +206,40 @@ fun rememberAssistantRole(): AssistantRoleUi {
     // storedReason（見 reconcileStoredOnHeldObserved；KDoc 序列語義），消除
     // DENIED→held→撤銷鏈路的陳舊碼殘留（REQUEST_FAILED／UNSUPPORTED／
     // UNCONFIRMED／GRANTED 殘留同理）。
+    // re-review #6 finding #3 [P3/UX]：同幀同步清除過期 fallbackFailed
+    // （見 reconcileFallbackFailedOnHeldObserved）：held 已確認可用＝主入口生效，
+    // 舊「無法開啟語音輸入設定」紅字過期；與 stored 清理同因——可信新鮮確認。
     SideEffect {
         // held 是可信確認（新鮮快照真相）：本幀 Known(held=true) 即置 everHeld
         // sticky＋清除舊事件碼（DENIED／REQUEST_FAILED／UNSUPPORTED／
         // UNCONFIRMED／GRANTED 殘留一律過期，經 reconcileStoredOnHeldObserved
-        // 回 null）。「新鮮 DENIED 優先於更舊 everHeld」規則不變：新 DENIED 只
-        // 可能在 !held 下寫入（request 回調非 OK 分支／分支決策，寫入幀 snapshot
-        // 非 held），故不會被此清除誤殺；清除僅發生在觀察到 held 的幀。
+        // 回 null）＋清除舊 fallback 失敗旗（經
+        // reconcileFallbackFailedOnHeldObserved 回 false）。「新鮮 DENIED 優先於
+        // 更舊 everHeld」規則不變：新 DENIED 只可能在 !held 下寫入（request 回調
+        // 非 OK 分支／分支決策，寫入幀 snapshot 非 held），故不會被此清除誤殺；
+        // 清除僅發生在觀察到 held 的幀。
         // 邊界 AlreadyHeld：request() 在 held 前提寫 GRANTED（見下 request 分支），
         // state 當幀即經 held 規則算 null；此處下幀再清仍 null，一致。
         // VERIFYING／pending 不動：consumePendingVerify(pending, Known held) 恆回
         // false（次數無關），清除 stored 與消耗 pending 同幀無矛盾（見下）。
         // 與終止重寫互斥：終止重寫（verificationTimeoutReason）僅 !held 分支
         // （heldNow==false＋attempt>=MAX），本清除僅 held 分支，同一幀永不雙寫。
+        // fallbackFailed 互斥：=true 只由 openFallback 失敗路徑寫入（無唯一系統
+        // 候選／startActivity 異常），成功置 false；決策驅動的 openFallback
+        // （UnsupportedFallback／REQUEST_FAILED 分支）只在非 held 快照下發生
+        // （decideAssistantRole 該兩分支要求 !held），寫入幀非 held 幀；本清除僅
+        // Known held 幀，幀不同故與決策路徑無同幀雙寫競爭（AlreadyHeld／RESULT_OK／
+        // RequestRole 新一輪的 false 寫入同為 false，同值無衝突；held 態手動點
+        // fallback 失敗置 true 後，下一 held SideEffect 即清為 false，正為預期
+        // 過期語義）。
         if (snapshot is AssistantSnapshot.Known && snapshot.held) {
             if (!everHeld) {
                 everHeld = true
                 prefs.edit().putBoolean("ever_held", true).apply()
             }
             storedReason = reconcileStoredOnHeldObserved(storedReason, heldConfirmed = true)
+            fallbackFailed =
+                reconcileFallbackFailedOnHeldObserved(fallbackFailed, heldConfirmed = true)
         }
         if (pendingVerify) {
             // re-review #4 finding #1 [P2/Merge blocker] 終止收斂：重試耗盡且

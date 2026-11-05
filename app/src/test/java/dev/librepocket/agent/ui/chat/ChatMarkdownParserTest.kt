@@ -1813,6 +1813,11 @@ class ChatMarkdownParserTest {
         // qualifiers with inner shared closers; repeated k times on one line gives k
         // walkers x k+ qualifiers. Assert words survive, output is deterministic, and
         // doubling k scales ~linearly.
+        //
+        // Hardening (Round-6 Phase B): a single-shot timing on a ~12ms base flaked in
+        // CI (2x ratio 3.5242 vs bound 3.5). Median-of-rounds on a doubled base cuts the
+        // noise share; the 3.5 bound still sits strictly inside (2, 4), so the
+        // linear (~2) vs quadratic (~4) discrimination is unchanged — no bound relaxation.
         val unit = "**u *a ***x*** **b *c*** "
         val one = ChatMarkdownParser.parseInlineMarkdown(unit)
         for (word in listOf("u", "a", "x", "b", "c")) {
@@ -1824,15 +1829,88 @@ class ChatMarkdownParserTest {
         )
         fun timed(repeat: Int): Long {
             val input = unit.repeat(repeat)
-            repeat(3) { ChatMarkdownParser.parseInlineMarkdown(input) }
-            val start = System.nanoTime()
             repeat(5) { ChatMarkdownParser.parseInlineMarkdown(input) }
-            return System.nanoTime() - start
+            val samples = LongArray(7) {
+                val start = System.nanoTime()
+                repeat(5) { ChatMarkdownParser.parseInlineMarkdown(input) }
+                System.nanoTime() - start
+            }
+            return samples.sorted()[samples.size / 2]
         }
-        val t1 = timed(300)
-        val t2 = timed(600)
+        val t1 = timed(600)
+        val t2 = timed(1200)
         val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
         assertTrue("shared-triple 2x ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)", ratio < 3.5)
+    }
+
+    @Test
+    fun scaling_thinkingAlignIdentityOnly_duplicatePrepend_ratioBounded() {
+        // P3 (Round-6 Phase B): same-content extreme the all-different scaling test
+        // (ChatMarkdownUiTest.thinkingAlignIdentityOnly_rewriteAllDifferent_scalesLinearly)
+        // does not cover. Prev K identical + curr 2K identical (prepend-shaped: the extra
+        // K cards share the one content). Synthetic distinct ids force every card through
+        // the content-exact path — the worst case for per-content candidate handling: a
+        // head re-scan per card costs Theta(K^2) (the last K cards each re-skip K consumed
+        // entries), while cursor consumption is amortized O(K). Doubling K must therefore
+        // scale ~linearly (bound strictly inside (2, 4)).
+        fun timed(k: Int): Long {
+            val prev = List(k) { "same-dup-content" }
+            val curr = List(2 * k) { "same-dup-content" }
+            val prevIds = List(k) { "prev-$it" }
+            val currIds = List(2 * k) { "curr-$it" }
+            val currSet = currIds.toSet()
+            repeat(5) {
+                alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
+            }
+            val samples = LongArray(7) {
+                val start = System.nanoTime()
+                repeat(10) {
+                    alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
+                }
+                System.nanoTime() - start
+            }
+            return samples.sorted()[samples.size / 2]
+        }
+        val t1 = timed(4000)
+        val t2 = timed(8000)
+        val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
+        assertTrue(
+            "identity-only duplicate 2x-input ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)",
+            ratio < 3.5,
+        )
+        // Correctness pin (pure-function layer): cursor consumes earliest-first, so the
+        // first K curr cards inherit prev values in document order (alternating values
+        // prove order, not just presence) and the last K default; stale prev ids prune.
+        val k = 4
+        val prev = List(k) { "same" }
+        val curr = List(2 * k) { "same" }
+        val prevIds = List(k) { "p$it" }
+        val currIds = List(2 * k) { "c$it" }
+        val overrides = mutableMapOf<String, Boolean>()
+        prevIds.forEachIndexed { i, id -> overrides[id] = i % 2 == 0 }
+        alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, overrides, currIds.toSet())
+        for (j in 0 until k) {
+            assertEquals("curr c$j must inherit prev p$j in order", j % 2 == 0, overrides["c$j"])
+        }
+        for (j in k until 2 * k) {
+            assertFalse("extra curr c$j must default", overrides.containsKey("c$j"))
+        }
+        assertTrue("stale prev ids must prune", overrides.keys.all { it.startsWith("c") })
+        // Realistic-ids pin: prev K same + curr 2K same via thinkingOverrideIds — the
+        // first K retain their values through exact ids, the last K default.
+        val rPrev = List(k) { "same" }
+        val rCurr = List(2 * k) { "same" }
+        val rPrevIds = thinkingOverrideIds(rPrev)
+        val rCurrIds = thinkingOverrideIds(rCurr)
+        val rOverrides = mutableMapOf<String, Boolean>()
+        rPrevIds.forEach { id -> rOverrides[id] = true }
+        alignThinkingOverridesIdentityOnly(rPrev, rPrevIds, rCurrIds, rCurr, rOverrides, rCurrIds.toSet())
+        for (j in 0 until k) {
+            assertEquals("curr r$j must retain prev value", true, rOverrides[rCurrIds[j]])
+        }
+        for (j in k until 2 * k) {
+            assertFalse("extra curr r$j must default", rOverrides.containsKey(rCurrIds[j]))
+        }
     }
 
     @Test

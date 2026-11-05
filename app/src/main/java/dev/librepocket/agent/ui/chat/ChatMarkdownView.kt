@@ -179,11 +179,10 @@ internal fun alignThinkingOverridesAppendOnly(
  * Identity-only alignment for edits / prepends / reorders / unknown previous raw.
  *
  * Per current card in document order: exact id (unconsumed, retain) then
- * content-exact via `prevContentToIndices` O(1) lookup (first unconsumed equal
- * content, inherit with move semantics, consumption bookkeeping retained), else
- * default. Never does prefix migration. Stale ids are pruned. Example:
- * `["Plan"]` to `["Planning", "Plan"]` yields `j=0` default, `j=1` content-exact
- * retain.
+ * content-exact via `prevContentToIndices` queue (head unconsumed equal content,
+ * inherit with move semantics, cursor consumption), else default. Never does
+ * prefix migration. Stale ids are pruned. Example: `["Plan"]` to
+ * `["Planning", "Plan"]` yields `j=0` default, `j=1` content-exact retain.
  */
 internal fun alignThinkingOverridesIdentityOnly(
     prevContents: List<String>,
@@ -199,11 +198,16 @@ internal fun alignThinkingOverridesIdentityOnly(
             prevIdToIndex[id] = index
         }
     }
-    // O(K) index: content -> document-ordered indices, so content-exact is O(1)
-    // lookup plus O(occurrences) scan of that content's list only.
-    val prevContentToIndices = HashMap<String, MutableList<Int>>(prevContents.size)
+    // O(K) index: content -> document-ordered queue of previous indices. Each
+    // previous index is enqueued once and dequeued at most once across the whole
+    // pass (content-exact takes the head after skipping exact-id-consumed heads),
+    // so total content-exact work is amortized O(K) even when every card shares
+    // one content. Re-scanning a per-content list from the head per card would
+    // cost Theta(K^2) in that duplicate extreme (prev K same + curr 2K same: the
+    // last K cards each re-skip K consumed entries).
+    val prevContentToIndices = HashMap<String, ArrayDeque<Int>>(prevContents.size)
     for ((index, content) in prevContents.withIndex()) {
-        prevContentToIndices.getOrPut(content) { mutableListOf() }.add(index)
+        prevContentToIndices.getOrPut(content) { ArrayDeque() }.addLast(index)
     }
     val consumed = BooleanArray(prevContents.size)
     for (j in currContents.indices) {
@@ -217,11 +221,14 @@ internal fun alignThinkingOverridesIdentityOnly(
         var sourceIndex: Int? = null
         val candidates = prevContentToIndices[currContent]
         if (candidates != null) {
-            for (candidate in candidates) {
-                if (!consumed[candidate]) {
-                    sourceIndex = candidate
-                    break
-                }
+            // Skip heads already consumed via the exact-id path above (each index
+            // leaves the queue at most once: amortized O(1) per card, preserving
+            // the earliest-unconsumed order of the previous scan).
+            while (candidates.isNotEmpty() && consumed[candidates.first()]) {
+                candidates.removeFirst()
+            }
+            if (candidates.isNotEmpty()) {
+                sourceIndex = candidates.removeFirst()
             }
         }
         if (sourceIndex != null) {
@@ -552,13 +559,16 @@ internal fun CodeBlockView(
  *     source, `j=1` has no counterpart so defaults to `block.isStreaming`).
  *   - Non-append-only mode (edits / prepends / reorders / unknown previous raw):
  *     identity-only alignment (see [alignThinkingOverridesIdentityOnly]). Per current
- *     card in document order: exact id (unconsumed, retain) then content-exact via an
- *     O(1) `prevContentToIndices` lookup (first unconsumed equal content, inherit with
- *     move semantics; consumption bookkeeping retained), else default. Never does
- *     prefix migration. Stale ids prune. Example: `["Plan"]` to
+ *     card in document order: exact id (unconsumed, retain) then content-exact via a
+ *     per-content candidate queue consumed with a cursor (head unconsumed equal
+ *     content, inherit with move semantics), else default. The whole matching pass
+ *     is amortized O(K): each previous index leaves its queue at most once, so even
+ *     the same-content extreme (prev K identical + curr 2K identical, where the last
+ *     K cards would otherwise each re-skip K consumed entries = Theta(K^2)) stays
+ *     linear. Never does prefix migration. Stale ids prune. Example: `["Plan"]` to
  *     `["Planning", "Plan"]` yields `j=0` default and `j=1` content-exact retain, so a
  *     prepended different card never steals the old card's override; same-content
- *     prepend stays positional (document-order consumption picks the earliest entry),
+ *     prepend stays positional (document-order cursor consumes the earliest entry),
  *     consistent with the parser's `_o2` occurrence disambiguation.
  * - Previous-state tracking is in-memory only: `prevRaw` (plain `remember`,
  *   uncapped, the last full [text] observed in this composition lifetime) and

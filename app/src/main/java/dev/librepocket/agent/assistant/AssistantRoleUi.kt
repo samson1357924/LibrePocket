@@ -29,6 +29,19 @@ import kotlinx.coroutines.delay
 /**
  * C1b RoleManager 生產接線（Issue #137：Settings 一鍵 `ROLE_ASSISTANT`）。
  *
+ * 設計決策（re-review #5 finding #2 [P3/UX]，選方案 A）：
+ * UNCONFIRMED 獨立「重新檢查」動作＋保留明確重授權入口。理由：Known(!held)＋
+ * UNCONFIRMED（RESULT_OK 後重試耗盡）文案承諾「可重新檢查」，若主按鈕仍是
+ * 「設為預設助理」→ request() → createRequestRoleIntent 重開授權頁，而非單純
+ * 重讀 isRoleHeld，則系統其實已授予時用戶被迫再走不必要授權流程；ReadError
+ * 已有「重新檢查」（同 recheck 通道），Known(!held)＋UNCONFIRMED 沒有是斷裂。
+ * 故 UNCONFIRMED 且 Known !held 且 available 時主按鈕「重新檢查」調 [recheck]
+ * （只 `refreshTick++`，不設碼不開頁；若重讀 held→Stage 1 清除＋everHeld 生效
+ * 自動修復，若仍 !held→UNCONFIRMED 保留），另在原因行下方加小字按鈕
+ * 「重新要求授權」調 request()。方案 B（主按鈕保持重授權、只改文案
+ * 「可重新要求授權」）僅在 A 不可行時 fallback；review 明確建議獨立動作，
+ * 故選 A。
+ *
  * - 流程：[decideAssistantRole]（Held→顯示狀態；Request→
  *   `createRequestRoleIntent(ROLE_ASSISTANT)`＋`StartActivityForResult`；
  *   Unsupported／ReadError→直接 fallback／no-op，fail-closed）＋失敗 fallback
@@ -70,13 +83,36 @@ import kotlinx.coroutines.delay
  * - RoleManager 缺失（OEM 不支援）→ [AssistantSnapshot.Unsupported]＋對應原因碼＋
  *   fallback，fail-closed；讀取異常 → [AssistantSnapshot.ReadError]（與真不支援
  *   區分：頭部「無法確認助理狀態，請稍後重試」＋主按鈕 enabled「重新檢查」
- *   （re-review #4 finding #1：給稍後重試實際入口，request 觸發重讀）＋
+ *   （re-review #4 finding #1：給稍後重試實際入口，request 觸發重讀；re-review #5
+ *   finding #2 後統一走 [AssistantRoleUi.recheck] 同通道，見下）＋
  *   原因行 passthrough，不判撤銷；Stage 2 finding C）。
+ * - recheck 獨立通道（re-review #5 finding #2 [P3/UX] 方案 A）：ReadError 與
+ *   Known(!held)＋UNCONFIRMED 的主按鈕「重新檢查」皆調 [AssistantRoleUi.recheck]
+ *   （只 `refreshTick++`，不清碼不開頁；UNCONFIRMED 保留直到重讀確認，held 即
+ *   Stage 1 清除路徑自動修復）；request() 的 ReadError 分支直接委託 recheck()
+ *   （同義重構，行為不變，仍 fail-closed 不發要求）。
  */
 data class AssistantRoleUi(
     val state: AssistantSettingsState,
     val request: () -> Unit,
     val openFallback: () -> Unit,
+    /**
+     * 獨立重讀入口（re-review #5 finding #2 [P3/UX] 方案 A）。
+     *
+     * 只 `refreshTick++` 觸發快照重讀，不清 `stored` 原因碼、不開授權頁／fallback、
+     * 不碰 `pendingVerify`／`verifyAttempt`；UNCONFIRMED 保留直到重讀確認
+     * （held→Stage 1 清除＋everHeld 生效自動修復，仍 !held→UNCONFIRMED 保留）。
+     * 與 request() 的 ReadError 分支同義（後者直接委託此函數），兩路「重新檢查」
+     * 行為統一。
+     *
+     * 與 request() 守衛的區分：request() 在驗證中（pendingVerify）由
+     * [canStartRequest] 防禦性 no-op（不開重複授權頁）；recheck 不開授權頁、無重複
+     * 流程風險，故 pending 守衛不擋 recheck（驗證中重讀無害，且 attempt 只由
+     * `LaunchedEffect` 遞增、tick 不重置 attempt，故不干擾重試排程）。但 UI 層
+     * verifying 期間按鈕 disabled（含重新檢查，與 #2 防重入一致），此為顯示層阻擋
+     * 而非通道守衛。
+     */
+    val recheck: () -> Unit,
 )
 
 private const val TAG = "AssistantRoleUi"
@@ -286,6 +322,15 @@ fun rememberAssistantRole(): AssistantRoleUi {
         refreshTick++
     }
     /**
+     * 獨立重讀通道（re-review #5 finding #2 [P3/UX] 方案 A，見 [AssistantRoleUi.recheck]）。
+     * 只 tick 不碰 pending／attempt，`remember` 無 key（捕獲的是 State 引用非值）。
+     */
+    val recheck: () -> Unit = remember {
+        {
+            refreshTick++
+        }
+    }
+    /**
      * 閉包快照語義（PocketGuard S2）：`snap` 是本次 `remember(snapshot, ...)`
      * 計算當下捕獲的快照值——顯式本地 val，閉包內快照只讀 `snap`。
      * （另讀寫的 pendingVerify／verifyAttempt／storedReason 等 MutableState
@@ -294,7 +339,7 @@ fun rememberAssistantRole(): AssistantRoleUi {
      * `.copy()`；若未來出現可變欄位須改為快照拷貝。`remember` key 含
      * `snapshot`，快照變化必重算 `request`，不會有時序 stale。
      */
-    val request: () -> Unit = remember(snapshot, roleManager, launcher, openFallback) {
+    val request: () -> Unit = remember(snapshot, roleManager, launcher, openFallback, recheck) {
         // 顯式本地 val：閉包捕獲當次 remember 計算的快照值（見上 KDoc）。
         val snap = snapshot
         {
@@ -309,13 +354,16 @@ fun rememberAssistantRole(): AssistantRoleUi {
             verifyAttempt = 0
             // Stage 2 finding C：ReadError fail-closed——不發要求、不設
             // UNSUPPORTED 碼（誠實：未知≠不支援）、不開 fallback；但觸發一次
-            // 重讀（refreshTick++，re-review #4 finding #1 [P2/Merge blocker]：
+            // 重讀（re-review #4 finding #1 [P2/Merge blocker]：
             // ReadError 超時／平時皆需實際重試入口，主按鈕改為 enabled
             // 「重新檢查」，見 SettingsScreen；不設碼、不開 fallback、不動
             // pendingVerify／verifyAttempt——request 入口已清旗＋attempt=0）。
+            // re-review #5 finding #2 方案 A 同義重構：直接委託 recheck()
+            // （只 tick，不設碼不開頁；與 UNCONFIRMED「重新檢查」同通道，
+            // 行為統一，仍 fail-closed 不發要求）。
             if (snap is AssistantSnapshot.ReadError) {
                 Log.w(TAG, "request skipped: snapshot read error (fail-closed); trigger re-read")
-                refreshTick++
+                recheck()
             } else {
                 when (decideAssistantRole(snap)) {
                     AssistantRoleDecision.AlreadyHeld -> {
@@ -370,5 +418,6 @@ fun rememberAssistantRole(): AssistantRoleUi {
         state = state,
         request = request,
         openFallback = openFallback,
+        recheck = recheck,
     )
 }

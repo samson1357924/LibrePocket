@@ -22,6 +22,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -159,6 +160,12 @@ fun SettingsScreen(
      */
     assistant: AssistantSettingsState? = null,
     onRequestAssistantRole: () -> Unit = {},
+    /**
+     * 獨立重讀入口（re-review #5 finding #2 [P3/UX] 方案 A）：
+     * ReadError 與 Known(!held)＋UNCONFIRMED 的主按鈕「重新檢查」皆走此回調
+     * （生產接 `assistantRole.recheck`，只重讀不清碼不開頁）；預設 {} 保舊構造相容。
+     */
+    onRecheckAssistantRole: () -> Unit = {},
     onOpenVoiceInputSettings: () -> Unit = {},
     /**
      * 登出失敗碼（僅 `LOGOUT_*` 顯示；呼叫方由 form.errorCode 過濾傳入）。
@@ -431,30 +438,55 @@ fun SettingsScreen(
                             // 點擊仍走 onRequestAssistantRole → request() UnsupportedFallback
                             // 分支（設 UNSUPPORTED＋openFallback），與下方 OutlinedButton 同效。
                             // Stage 2 finding C＋re-review #4 finding #1 [P2/Merge blocker]：
-                            // ReadError 時主按鈕保持 enabled，文案「重新檢查」（與
-                            // Unsupported 的「前往語音輸入設定」區分）：點擊走
-                            // onRequestAssistantRole → request() ReadError 分支
-                            // （不設碼、不開 fallback，只 refreshTick++ 觸發重讀，
-                            // fail-closed 仍成立——不發要求）。
+                            // ReadError 時主按鈕保持 enabled，文案「重新檢查」：點擊走
+                            // onRecheckAssistantRole → recheck()（只 refreshTick++ 觸發重讀，
+                            // fail-closed 仍成立——不發要求；request() ReadError 分支
+                            // 直接委託 recheck()，同通道）。
+                            // re-review #5 finding #2 [P3/UX] 方案 A：Known(!held)＋available＋
+                            // UNCONFIRMED（RESULT_OK 後重試耗盡，文案承諾「可重新檢查」）主按鈕
+                            // 亦為「重新檢查」走 onRecheckAssistantRole（只重讀不清碼不開頁；
+                            // 若重讀 held→Stage 1 清除＋everHeld 生效自動修復，仍 !held→
+                            // UNCONFIRMED 保留），另在下方加小字「重新要求授權」走
+                            // onRequestAssistantRole（明確重授權入口）。Unknown（ReadError／
+                            // Unsupported 超時）UNCONFIRMED 走 readError／不支援分支，不另設碼。
                             // held 才 disabled；未知態不暗示可跳 fallback，
                             // OutlinedButton 仍可達。
                             // re-review #4 finding #2 [P3/UX]：驗證中（state.verifying，
-                            // 含 VERIFYING 顯示幀及未知/held 重疊幀）主按鈕 disabled，
-                            // 防重複點擊重開授權頁；request() 入口另有
-                            // canStartRequest 防禦性 no-op（第二層）。
+                            // 含 VERIFYING 顯示幀及未知/held 重疊幀）主按鈕 disabled
+                            // （含重新檢查，與 #2 防重入一致）；request() 入口另有
+                            // canStartRequest 防禦性 no-op（第二層；recheck 不開授權頁，
+                            // pending 守衛不擋 recheck，見 AssistantRoleUi.recheck KDoc）。
+                            val unconfirmedRecheck = !assistant.readError &&
+                                !assistant.roleHeld &&
+                                assistant.roleAvailable &&
+                                assistant.reasonCode == AssistantReasonCode.UNCONFIRMED
+                            val isRecheck = assistant.readError || unconfirmedRecheck
                             Button(
-                                onClick = onRequestAssistantRole,
+                                onClick = if (isRecheck) onRecheckAssistantRole else onRequestAssistantRole,
                                 enabled = !assistant.roleHeld && !assistant.verifying,
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
                                 Text(
                                     when {
-                                        assistant.readError -> "重新檢查"
+                                        isRecheck -> "重新檢查"
                                         assistant.roleHeld -> "設為預設助理"
                                         !assistant.roleAvailable -> "前往語音輸入設定"
                                         else -> "設為預設助理"
                                     },
                                 )
+                            }
+                            // re-review #5 finding #2 方案 A 明確重授權入口：僅 UNCONFIRMED＋
+                            // Known !held＋available 時顯示（ReadError 的重讀入口已是主按鈕，
+                            // 不支援分支主按鈕已是 fallback，同效不另加）。verifying 期間
+                            // disabled（與主按鈕一致，防重入）。
+                            if (unconfirmedRecheck) {
+                                TextButton(
+                                    onClick = onRequestAssistantRole,
+                                    enabled = !assistant.verifying,
+                                    modifier = Modifier.fillMaxWidth().testTag("assistantRerequest"),
+                                ) {
+                                    Text("重新要求授權")
+                                }
                             }
                             // B held 指引：取消須走系統設定（RoleManager 無應用側取消入口）。
                             if (assistant.roleHeld) {

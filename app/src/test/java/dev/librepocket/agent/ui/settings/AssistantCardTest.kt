@@ -70,6 +70,7 @@ class AssistantCardTest {
         assistant: AssistantSettingsState?,
         onRequest: () -> Unit = {},
         onFallback: () -> Unit = {},
+        onRecheck: () -> Unit = {},
     ) {
         composeRule.setContent {
             SettingsScreen(
@@ -77,6 +78,7 @@ class AssistantCardTest {
                 gate = readyGate(),
                 assistant = assistant,
                 onRequestAssistantRole = onRequest,
+                onRecheckAssistantRole = onRecheck,
                 onOpenVoiceInputSettings = onFallback,
             )
         }
@@ -257,6 +259,7 @@ class AssistantCardTest {
     /** UNCONFIRMED＋ReadError：未知頭部＋未確認原因行並存，主按鈕「重新檢查」可達。 */
     @Test
     fun unconfirmedWithReadError_showsBothAndRecheckReachable() {
+        var rechecks = 0
         var requests = 0
         val reason = effectiveAssistantReason(
             AssistantReasonCode.UNCONFIRMED,
@@ -273,6 +276,7 @@ class AssistantCardTest {
                 readError = true,
             ),
             onRequest = { requests++ },
+            onRecheck = { rechecks++ },
         )
         composeRule.onNodeWithText("無法確認助理狀態，請稍後重試。")
             .performScrollTo().assertIsDisplayed()
@@ -281,7 +285,10 @@ class AssistantCardTest {
             .assertTextEquals(assistantReasonText(AssistantReasonCode.UNCONFIRMED))
         composeRule.onNodeWithText("重新檢查").performScrollTo().assertIsEnabled()
         composeRule.onNodeWithText("重新檢查").performScrollTo().performClick()
-        assertEquals(1, requests)
+        // re-review #5 finding #2 方案 A 行為變更：ReadError「重新檢查」統一走
+        // onRecheck（recheck 通道，只重讀不開頁），不再走 onRequest。
+        assertEquals(1, rechecks)
+        assertEquals(0, requests)
     }
 
     /** C7：reason==null 時原因行與 DENIED 文案皆不存在。 */
@@ -376,6 +383,7 @@ class AssistantCardTest {
     /** ReadError 顯示「無法確認…」未知文案（與「不支援」區分），主按鈕為「重新檢查」可點。 */
     @Test
     fun readError_showsUnknownHeaderAndEnablesRecheck() {
+        var rechecks = 0
         var requests = 0
         setSettings(
             AssistantSettingsState(
@@ -384,14 +392,18 @@ class AssistantCardTest {
                 readError = true,
             ),
             onRequest = { requests++ },
+            onRecheck = { rechecks++ },
         )
         composeRule.onNodeWithText("無法確認助理狀態，請稍後重試。")
             .performScrollTo().assertIsDisplayed()
         // re-review #4 finding #1 [P2/Merge blocker]：ReadError 主按鈕不再 disabled，
         // 文案「重新檢查」（與 Unsupported「前往語音輸入設定」區分），點擊觸發重讀。
+        // re-review #5 finding #2 方案 A 行為變更：統一走 onRecheck（recheck 通道），
+        // 不再走 onRequest（request() ReadError 分支直接委託 recheck()，同義）。
         composeRule.onNodeWithText("重新檢查").performScrollTo().assertIsEnabled()
         composeRule.onNodeWithText("重新檢查").performScrollTo().performClick()
-        assertEquals(1, requests)
+        assertEquals(1, rechecks)
+        assertEquals(0, requests)
     }
 
     /** ReadError 原因行 passthrough：stored 碼照常顯示（此處以 DENIED 為例）。 */
@@ -549,5 +561,81 @@ class AssistantCardTest {
         composeRule.onNodeWithTag("assistantFallbackFailed")
             .performScrollTo().assertIsDisplayed()
             .assertTextEquals("無法開啟語音輸入設定")
+    }
+
+    // ---- re-review #5 finding #2 [P3/UX] 方案 A：UNCONFIRMED 獨立重查 ----
+
+    /**
+     * UNCONFIRMED＋Known !held＋available：主按鈕「重新檢查」enabled＋點擊走
+     * onRecheck（只重讀不開授權頁）；原因行下方小字「重新要求授權」走 onRequest。
+     * 生產管線同源計算 reason（Known(!held)＋stored UNCONFIRMED passthrough）。
+     */
+    @Test
+    fun unconfirmedKnown_showsRecheckMainAndRerequestSecondary() {
+        var rechecks = 0
+        var requests = 0
+        val reason = effectiveAssistantReason(
+            AssistantReasonCode.UNCONFIRMED,
+            AssistantSnapshot.Known(available = true, held = false),
+            everHeld = false,
+            pendingVerify = false,
+        )
+        assertEquals(AssistantReasonCode.UNCONFIRMED, reason)
+        setSettings(
+            AssistantSettingsState(
+                roleHeld = false,
+                roleAvailable = true,
+                reasonCode = reason,
+            ),
+            onRequest = { requests++ },
+            onRecheck = { rechecks++ },
+        )
+        composeRule.onNodeWithTag("assistantReason")
+            .performScrollTo().assertIsDisplayed()
+            .assertTextEquals(assistantReasonText(AssistantReasonCode.UNCONFIRMED))
+        composeRule.onNodeWithText("重新檢查").performScrollTo().assertIsEnabled()
+        composeRule.onNodeWithText("重新檢查").performScrollTo().performClick()
+        assertEquals(1, rechecks)
+        assertEquals(0, requests)
+        composeRule.onNodeWithTag("assistantRerequest").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("重新要求授權").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("重新要求授權").performScrollTo().performClick()
+        assertEquals(1, requests)
+        assertEquals(1, rechecks)
+    }
+
+    /** UNCONFIRMED＋Known !held＋available：verifying 期間主副按鈕皆 disabled（含重新檢查）。 */
+    @Test
+    fun unconfirmedKnownVerifying_disablesBothActions() {
+        setSettings(
+            AssistantSettingsState(
+                roleHeld = false,
+                roleAvailable = true,
+                reasonCode = AssistantReasonCode.UNCONFIRMED,
+                verifying = true,
+            ),
+        )
+        composeRule.onNodeWithText("重新檢查").performScrollTo().assertIsNotEnabled()
+        composeRule.onNodeWithTag("assistantRerequest").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("重新要求授權").performScrollTo().assertIsDisplayed()
+        // TextButton disabled 斷言：沿用主按鈕語義（verifying 阻擋，與 #2 防重入一致）。
+        composeRule.onNodeWithText("重新要求授權").assertIsNotEnabled()
+    }
+
+    /** 非 UNCONFIRMED 的 Known 可要求態：無次按鈕，主按鈕仍是「設為預設助理」走 onRequest。 */
+    @Test
+    fun knownIdle_hasNoRerequestSecondary() {
+        var rechecks = 0
+        var requests = 0
+        setSettings(
+            AssistantSettingsState(roleHeld = false, roleAvailable = true),
+            onRequest = { requests++ },
+            onRecheck = { rechecks++ },
+        )
+        composeRule.onNodeWithText("設為預設助理").performScrollTo().assertIsEnabled()
+        composeRule.onNodeWithTag("assistantRerequest").assertDoesNotExist()
+        composeRule.onNodeWithText("設為預設助理").performScrollTo().performClick()
+        assertEquals(1, requests)
+        assertEquals(0, rechecks)
     }
 }

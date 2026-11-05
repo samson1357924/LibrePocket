@@ -413,6 +413,7 @@ fun MainScreen(
                 onDismissImportState = { sessionListViewModel.resetImportState() },
                 assistant = assistantRole.state,
                 onRequestAssistantRole = assistantRole.request,
+                onRecheckAssistantRole = assistantRole.recheck,
                 onOpenVoiceInputSettings = assistantRole.openFallback,
             )
         },

@@ -35,7 +35,8 @@ Exit codes:
   * 1: scan completed, at least one vulnerability found (monitor signal,
     not an upgrade trigger).
   * 2: fail-closed error (unreadable catalog, invalid TOML, network failure,
-    non-200 response, invalid JSON, missing ``--osv-url`` scheme, etc.).
+    non-200 response, invalid JSON, missing ``--osv-url`` scheme, pagination
+    ``next_page_token`` present, etc.).
 
 Usage:
   python3 -P scripts/osv_scan.py [--catalog PATH] [--osv-url URL]

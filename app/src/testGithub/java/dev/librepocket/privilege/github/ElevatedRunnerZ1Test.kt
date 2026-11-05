@@ -9,11 +9,13 @@ import java.io.OutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 /**
@@ -40,6 +42,21 @@ import org.junit.Test
 class ElevatedRunnerZ1Test {
 
     private val privateRoot = "/data/data/files"
+
+    /**
+     * 終審殘留隔離：本檔多個用例觸發不清創（blocked destroy／close，drain
+     * kill 路徑 `noteUnclean` 累計 consecutive）。用例間以 [Before]/[After]
+     * 歸零 consecutive（各用例只做單次 drain 斷言，不依賴跨用例累計；
+     * 跨呼叫累計語義由 `ElevatedRunnerAA1Test` 覆蓋），防同 JVM 內污染後測。
+     * （outstanding 由各用例 finally 釋放 latch＋await 收斂，此處只歸零計數器。）
+     */
+    @Before fun setUpBreakerIsolation() {
+        ElevatedCleanupTracker.noteClean()
+    }
+
+    @After fun tearDownBreakerIsolation() {
+        ElevatedCleanupTracker.noteClean()
+    }
 
     /** (a) 專用：destroy 吞 interrupt 續等 latch（釋放前永不返回）。 */
     private class BlockedDestroyProcess(

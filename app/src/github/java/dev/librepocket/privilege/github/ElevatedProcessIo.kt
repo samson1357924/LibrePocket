@@ -140,13 +140,48 @@ internal object ElevatedCleanupTracker {
      */
     const val MAX_OUTSTANDING_CLEANUPS = 4
 
+    /**
+     * 連續不清創熔斷上限（終審殘留，fail-closed，不懲罰良性慢命令）。
+     *
+     * 只計「清理未完成」的連續次數（killer worker 超界未完成，即
+     * [ElevatedProcessIo.drain] kill 路徑 `runCleanupBounded` 回 false）；
+     * 清理完成（含成功路徑 finished、超時但清理完成 `cleanupOk==true`）即
+     * [noteClean] 歸零；良性慢命令（清理完成，即使 TimedOut）不累計。
+     * 可恢復序列 `0→1→0→1` 永不觸發（每次清理完成即歸零）；連續
+     * `MAX_CONSECUTIVE_UNCLEAN` 次未完成即 [isBreakerOpen] 熔斷，
+     * runner 入口拒絕新 spawn（與 [isSaturated] 同級，皆零 spawn、不耗配額）。
+     */
+    const val MAX_CONSECUTIVE_UNCLEAN = 4
+
     private val outstandingCount = AtomicInteger(0)
+
+    /** 連續未完成清理計數（僅 killer worker 超界未完成累計，清理完成即歸零）。 */
+    private val consecutiveUnclean = AtomicInteger(0)
 
     /** 目前未完成清理數（跨呼叫全域，雙 runner 共用；僅計未完成，正常完成即釋放）。 */
     fun outstanding(): Int = outstandingCount.get()
 
     /** 是否飽和（未完成數達上限；飽和即有不可回收清理，runner 入口拒絕新 spawn）。 */
     fun isSaturated(): Boolean = outstanding() >= MAX_OUTSTANDING_CLEANUPS
+
+    /** 是否熔斷（連續未完成數達上限；熔斷即持續不清創，runner 入口拒絕新 spawn）。
+     *
+     * 鎖存語義：熔斷後所有新 spawn 被入口門拒絕，故不會再有 drain 執行、
+     * 計數器不會自然歸零；B3 在驗證修復後須顯式呼叫 [noteClean] 重置
+     * （internal，同模組可見），不得僅調大上限繞行。*/
+    fun isBreakerOpen(): Boolean = consecutiveUnclean.get() >= MAX_CONSECUTIVE_UNCLEAN
+
+    /** 清理完成（成功路徑 finished、超時但清理完成）：連續計數歸零。 */
+    fun noteClean() {
+        consecutiveUnclean.set(0)
+    }
+
+    /** 清理未完成（killer worker 超界未完成）：連續計數遞增，飽和值封頂防溢出。 */
+    fun noteUnclean() {
+        consecutiveUnclean.updateAndGet {
+            if (it >= MAX_CONSECUTIVE_UNCLEAN) MAX_CONSECUTIVE_UNCLEAN else it + 1
+        }
+    }
 
     /** 佔一槽（僅 [ElevatedProcessIo.drain] 經 `runCleanupBounded` 調用）。 */
     internal fun acquireSlot() {
@@ -372,6 +407,9 @@ internal object ElevatedProcessIo {
                 runCatching { errAcquired.get()?.close() }
             }
             if (!cleanupOk) cleanupIncomplete = true
+            // 終審殘留：kill 監督後接線連續計數（ok 即歸零，否則遞增；良性慢命令
+            // 清理完成即歸零，不累計）。
+            if (cleanupOk) ElevatedCleanupTracker.noteClean() else ElevatedCleanupTracker.noteUnclean()
             // 殺後等待：中斷必須 restore（不吞 InterruptedException）；
             // 非中斷異常收斂（清理路徑不升級為崩潰，仍回 TimedOut）。
             try {
@@ -398,6 +436,9 @@ internal object ElevatedProcessIo {
                 if (tErr.isAlive) joinIncomplete = true
             }
         } else {
+            // 終審殘留：成功路徑（finished、無需清理）即歸零；早拒路徑（門拒／
+            // 配額拒，spawn 前）無 drain 執行，不碰計數器。
+            ElevatedCleanupTracker.noteClean()
             // 成功路徑亦有界等待（P1-B review）：上界 SUCCESS_JOIN_MS（10s），
             // 超界即停並標 truncated（絕不靜默短讀不標）；drain 總耗時有上界
             //（timeoutMs + 常數），不無限卡。
@@ -599,9 +640,10 @@ internal object ElevatedProcessIo {
  * - verdict 映射單一來源：缺原因碼一律 `BAD_ARGUMENT`，配額耗盡一律
  *   `QUOTA_EXCEEDED`（與 [dev.librepocket.shell.ShellDeny] 對齊，不另發明碼）。
  *
- * AA1 資源門（owner 新 P1）：清理 backlog 飽和拒絕收斂至此（[cleanupBacklogFull]，
- * 與 quota 同級，同為 `QUOTA_EXCEEDED` 且零 spawn；飽和＝有不可回收清理，
- * B3 需介入，見 [ElevatedCleanupTracker]）。
+ * AA1 資源門（owner 新 P1）：清理 backlog 飽和（[cleanupBacklogFull]）與連續不清創
+ * 熔斷（[cleanupBreakerOpen]，訊息區分兩因）拒絕收斂至此，與 quota 同級，同為
+ * `QUOTA_EXCEEDED` 且零 spawn；飽和＝有不可回收清理，B3 需介入，見
+ * [ElevatedCleanupTracker]）。
  */
 internal object ElevatedRunnerCommon {
     /** 原因碼缺失拒絕訊息（矩陣 §3 審計要求原因碼非空）。 */
@@ -625,4 +667,12 @@ internal object ElevatedRunnerCommon {
     /** 清理 backlog 飽和時的 typed 拒絕：`QUOTA_EXCEEDED`，不建子進程。 */
     fun cleanupBacklogFull(): ElevatedBinaryResult.Denied =
         ElevatedBinaryResult.Denied(ShellDeny.QUOTA_EXCEEDED, CLEANUP_BACKLOG_FULL_MESSAGE)
+
+    /** 連續不清創熔斷拒絕訊息（終審殘留，與飽和同級，零 spawn、不耗配額）。 */
+    const val CLEANUP_BREAKER_OPEN_MESSAGE =
+        "elevated cleanup breaker open (consecutive unclean, fail-closed, no spawn)"
+
+    /** 連續不清創熔斷時的 typed 拒絕：`QUOTA_EXCEEDED`，不建子進程。 */
+    fun cleanupBreakerOpen(): ElevatedBinaryResult.Denied =
+        ElevatedBinaryResult.Denied(ShellDeny.QUOTA_EXCEEDED, CLEANUP_BREAKER_OPEN_MESSAGE)
 }

@@ -93,7 +93,10 @@ import rikka.shizuku.Shizuku
  * AA1 資源門（owner 新 P1＋P2）：[ElevatedCleanupTracker.isSaturated] 即拒
  * `Denied(QUOTA_EXCEEDED, "elevated cleanup backlog full...")` 且零 spawn
  * （與 quota 同級，位於配額門前，飽和拒絕不耗配額；飽和＝有不可回收清理，
- * B3 需介入）。drain 層飽和仍嘗試監督清理（永不跳過 killer）；本旗標經
+ * B3 需介入）。終審殘留第二條件：[ElevatedCleanupTracker.isBreakerOpen]
+ * （連續不清創達上限）即拒 `Denied(QUOTA_EXCEEDED,
+ * "elevated cleanup breaker open...")` 且零 spawn、不耗配額（訊息區分兩因）。
+ * drain 層飽和仍嘗試監督清理（永不跳過 killer）；本旗標經
  * [ElevatedBinaryResult.Ok.cleanupIncomplete]／[ElevatedBinaryResult.TimedOut.cleanupIncomplete]
  * 穿透（僅監測，不改 verdict）。
  */
@@ -198,8 +201,12 @@ class ShizukuShellRunner(
         // AA1 resource gate (same level as quota): saturated cleanup backlog
         // means unreclaimable cleanups are outstanding; fail-closed, no spawn,
         // no quota consumed (B3 must intervene, see ElevatedCleanupTracker).
+        // 終審殘留第二條件：連續不清創熔斷亦拒（訊息區分兩因，皆零 spawn、不耗配額）。
         if (ElevatedCleanupTracker.isSaturated()) {
             return ElevatedRunnerCommon.cleanupBacklogFull()
+        }
+        if (ElevatedCleanupTracker.isBreakerOpen()) {
+            return ElevatedRunnerCommon.cleanupBreakerOpen()
         }
         if (!quota.tryAcquire()) {
             return ElevatedRunnerCommon.quotaExceeded()

@@ -138,6 +138,7 @@ class ElevatedRunnerAA1Test {
     }
 
     @Test fun saturationGateBlocksBothRunnersAndRecovers() {
+        ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         val latch = CountDownLatch(1)
         val rootSpawns = AtomicInteger(0)
@@ -157,6 +158,8 @@ class ElevatedRunnerAA1Test {
                 assertEquals(i + 1, ElevatedCleanupTracker.outstanding())
             }
             assertTrue(ElevatedCleanupTracker.isSaturated())
+            // 終審殘留相容：4 次連續不清創亦觸熔斷（與飽和同時成立，第 5 次兩因皆拒）。
+            assertTrue(ElevatedCleanupTracker.isBreakerOpen())
             assertEquals(4, rootSpawns.get())
             // 第 5 次 Root spawn 即拒：零 spawn（計數不變）。
             val denied = root.runBinary(ElevatedRequest(listOf("id"), "AA1-SAT"), 300L)
@@ -183,7 +186,14 @@ class ElevatedRunnerAA1Test {
             awaitNoElevatedThreads()
         }
         // 恢復：釋放後 outstanding 歸 0 即 spawn 重新放行（雙側各一次正常成功）。
+        // 終審殘留：late 完成只釋放 outstanding，不歸零 consecutive；此處以 noteClean
+        // 模擬 B3 介入後重置（否則熔斷閂鎖，fail-closed 本應持續拒絕）。
         pollOutstandingTo(0)
+        assertTrue(
+            "late completion must not reset breaker",
+            ElevatedCleanupTracker.isBreakerOpen(),
+        )
+        ElevatedCleanupTracker.noteClean()
         assertFalse(ElevatedCleanupTracker.isSaturated())
         val okRoot = makeRoot { FakeProcess("ok".toByteArray()) }
             .runBinary(ElevatedRequest(listOf("id"), "AA1-REC"), 2_000L)
@@ -200,6 +210,7 @@ class ElevatedRunnerAA1Test {
     private fun doFlagPassthrough(
         makeRunner: ((List<String>) -> Process) -> BinaryElevatedRunner,
     ) {
+        ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         // blocked destroy → TimedOut(cleanupIncomplete=true)。
         val latchKill = CountDownLatch(1)
@@ -247,5 +258,159 @@ class ElevatedRunnerAA1Test {
 
     @Test fun shizukuFlagPassthrough() {
         doFlagPassthrough(::makeShizuku)
+    }
+
+    /**
+     * 終審殘留 (a)：可恢復序列永不熔斷。
+     * 4 次「超時但清理完成」（killer 立即成功，hang 可回收）timeout →
+     * 第 5 次仍放行（outstanding 歸零且 consecutive 歸零；良性慢命令不累計）。
+     */
+    @Test fun recoverableTimeoutNeverTripsBreaker() {
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        try {
+            val spawns = AtomicInteger(0)
+            val runner = makeRoot {
+                spawns.incrementAndGet()
+                FakeProcess(hang = true)
+            }
+            repeat(4) { i ->
+                val b = runner.runBinary(ElevatedRequest(listOf("id"), "AA1-REC"), 300L)
+                assertTrue("call ${i + 1}: $b", b is ElevatedBinaryResult.TimedOut)
+                assertFalse(
+                    "call ${i + 1}: clean killer must not flag",
+                    (b as ElevatedBinaryResult.TimedOut).cleanupIncomplete,
+                )
+                pollOutstandingTo(0)
+                assertFalse(ElevatedCleanupTracker.isSaturated())
+                assertFalse(
+                    "call ${i + 1}: clean cleanup must reset consecutive",
+                    ElevatedCleanupTracker.isBreakerOpen(),
+                )
+            }
+            assertEquals(4, spawns.get())
+            // 第 5 次仍放行（成功）。
+            val ok = makeRoot { FakeProcess("ok".toByteArray()) }
+                .runBinary(ElevatedRequest(listOf("id"), "AA1-REC"), 2_000L)
+            assertTrue("$ok", ok is ElevatedBinaryResult.Ok)
+            pollOutstandingTo(0)
+            assertFalse(ElevatedCleanupTracker.isBreakerOpen())
+        } finally {
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            awaitNoElevatedThreads()
+        }
+    }
+
+    /**
+     * 終審殘留 (b) 孤立變體：連續不清創熔斷獨立生效。
+     * 4 次 uninterruptible stall 後先釋放 latch＋輪詢 outstanding==0
+     * （late 完成釋放 slot 但 consecutive 留 4），再發第 5 次 → 若仍 Denied
+     * 則為 breaker 生效（outstanding 已 0，非飽和擋；訊息區分兩因）。
+     */
+    @Test fun breakerOpenBlocksWhenOutstandingZero() {
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val latch = CountDownLatch(1)
+        val spawns = AtomicInteger(0)
+        val runner = makeRoot {
+            spawns.incrementAndGet()
+            StallDestroyProcess(latch)
+        }
+        try {
+            repeat(4) { i ->
+                val b = runner.runBinary(ElevatedRequest(listOf("id"), "AA1-BRK"), 300L)
+                assertTrue("call ${i + 1}: $b", b is ElevatedBinaryResult.TimedOut)
+                assertTrue(
+                    "call ${i + 1}: blocked destroy must flag",
+                    (b as ElevatedBinaryResult.TimedOut).cleanupIncomplete,
+                )
+                assertEquals(i + 1, ElevatedCleanupTracker.outstanding())
+            }
+            assertTrue(ElevatedCleanupTracker.isSaturated())
+            assertTrue(ElevatedCleanupTracker.isBreakerOpen())
+            assertEquals(4, spawns.get())
+            // 釋放全部：worker 完成釋放 slot，outstanding 回 0 而 consecutive 留 4。
+            latch.countDown()
+            pollOutstandingTo(0)
+            assertFalse(ElevatedCleanupTracker.isSaturated())
+            assertTrue(
+                "late completion releases slot but must not reset consecutive",
+                ElevatedCleanupTracker.isBreakerOpen(),
+            )
+            // 第 5 次被 breaker 擋（非飽和擋），零 spawn、不耗配額。
+            val denied = runner.runBinary(ElevatedRequest(listOf("id"), "AA1-BRK"), 300L)
+            assertTrue("$denied", denied is ElevatedBinaryResult.Denied)
+            denied as ElevatedBinaryResult.Denied
+            assertEquals(ShellDeny.QUOTA_EXCEEDED, denied.reason)
+            assertTrue("msg=${denied.message}", denied.message.contains("breaker open"))
+            assertEquals(4, spawns.get())
+        } finally {
+            latch.countDown()
+            pollOutstandingTo(0)
+            ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
+        }
+        // 重置後放行（防污染）。
+        pollOutstandingTo(0)
+        assertFalse(ElevatedCleanupTracker.isBreakerOpen())
+        val ok = makeRoot { FakeProcess("ok".toByteArray()) }
+            .runBinary(ElevatedRequest(listOf("id"), "AA1-BRK-REC"), 2_000L)
+        assertTrue("$ok", ok is ElevatedBinaryResult.Ok)
+        pollOutstandingTo(0)
+        awaitNoElevatedThreads()
+    }
+
+    /**
+     * 終審殘留 (c)：成功路徑歸零。
+     * unclean×2 後一次成功 → 計數器歸零 → 後續 2 次 unclean 不觸熔斷
+     * （若未歸零則累計 4 次即開；outstanding 每次即時釋放，孤立 consecutive）。
+     */
+    @Test fun successResetsConsecutiveCounter() {
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        try {
+            fun doOneStall(tag: String) {
+                val latch = CountDownLatch(1)
+                val runner = makeRoot { StallDestroyProcess(latch) }
+                try {
+                    val b = runner.runBinary(ElevatedRequest(listOf("id"), tag), 300L)
+                    assertTrue("$tag: $b", b is ElevatedBinaryResult.TimedOut)
+                    assertTrue(
+                        "$tag: blocked destroy must flag",
+                        (b as ElevatedBinaryResult.TimedOut).cleanupIncomplete,
+                    )
+                } finally {
+                    latch.countDown()
+                    pollOutstandingTo(0)
+                }
+            }
+            doOneStall("AA1-RST1")
+            doOneStall("AA1-RST2")
+            assertFalse(ElevatedCleanupTracker.isSaturated())
+            assertFalse(ElevatedCleanupTracker.isBreakerOpen())
+            // 一次成功即歸零。
+            val ok = makeRoot { FakeProcess("ok".toByteArray()) }
+                .runBinary(ElevatedRequest(listOf("id"), "AA1-RST-OK"), 2_000L)
+            assertTrue("$ok", ok is ElevatedBinaryResult.Ok)
+            assertFalse(ElevatedCleanupTracker.isBreakerOpen())
+            // 若成功未歸零，此處累計即 4→熔斷；歸零則為 2→放行。
+            doOneStall("AA1-RST3")
+            doOneStall("AA1-RST4")
+            assertFalse(ElevatedCleanupTracker.isSaturated())
+            assertFalse(
+                "success must have reset consecutive (else 2+2=4 would trip)",
+                ElevatedCleanupTracker.isBreakerOpen(),
+            )
+            val ok2 = makeRoot { FakeProcess("ok".toByteArray()) }
+                .runBinary(ElevatedRequest(listOf("id"), "AA1-RST-OK2"), 2_000L)
+            assertTrue("$ok2", ok2 is ElevatedBinaryResult.Ok)
+        } finally {
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            awaitNoElevatedThreads()
+        }
+        pollOutstandingTo(0)
+        assertFalse(ElevatedCleanupTracker.isBreakerOpen())
     }
 }

@@ -5,6 +5,7 @@ import dev.librepocket.shell.PrivilegeAuditLog
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 /**
@@ -38,6 +39,11 @@ class ScreenshotCapacityTest {
         suBinary = "/system/bin/su",
         grantCheck = GrantFixtures.allowAlways,
     )
+
+    /** 終審殘留隔離：防同 JVM 內先行不清創用例遺留熔斷（本用例只斷成功截斷）。 */
+    @Before fun setUpBreakerIsolation() {
+        ElevatedCleanupTracker.noteClean()
+    }
 
     @Test fun rgba1080x2400Over8MTruncatedToNull() {
         // 未壓縮 RGBA 1080*2400*4 = 10_368_000（≈10.37MB），以 10.5MiB 假位元組

@@ -3,6 +3,7 @@ package dev.librepocket.privilege.github
 import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellPolicy
 import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.util.concurrent.TimeUnit
 
 /**
@@ -73,6 +74,18 @@ import java.util.concurrent.TimeUnit
  * `toByteArray` 拷貝＋[ElevatedBinaryResult.Ok] 防禦複製（構造 `copyOf`＋取值
  * `copyOf`）＋capture 側 `copyOf`，約為 pipe 保留量的數倍。低 RAM 裝置實際
  * 峰值由 B3 heap profile 驗收，本檔不承諾 8.5MiB 程序峰值。
+ *
+ * W1 getter 先行（owner 新 P1 fail-closed & crash）：`process.inputStream`／
+ * `errorStream` getter 本身可抛（`ShizukuRemoteProcess` 的 IllegalStateException／
+ * UOE／InvocationTargetException，見該類委派收斂）。舊碼把 getter 求值寫在
+ * gobbler `Thread({ copyCapped(process.inputStream, out) })` 的 lambda 內——
+ * 求值發生在 daemon thread 上、`copyCapped` 的 try/catch 之外，抛即逃出執行緒：
+ * 不執行 `markFailed`（`readFailed=false` 誤判）＋觸 app 未捕捉 handler。
+ * 現啟動 gobbler 前先在呼叫執行緒安全取雙流：任一 getter 抛即清理
+ * （`runCatching killer`＋關已取得流）後回 `Drained(empty, empty,
+ * exitValueOr-1, timedOut=false, readFailed=true)`；呼叫方既有 `readFailed`
+ * 分支即回同一固定字串 Failed（不帶 remote 原文、不帶輸出）。gobbler 只在雙流
+ * 取成功後啟動，daemon thread 內不再求值 getter，無未捕捉例外。
  */
 internal object ElevatedProcessIo {
     /** R1-A 截圖二進位容量：`screencap -p` / `cat /dev/graphics/fb0` 的截斷上限（8M）。 */
@@ -154,11 +167,45 @@ internal object ElevatedProcessIo {
         val out = CappedPipe(hardCapBytes)
         // U2-B：stderr 獨立小 cap（null＝同 stdout cap；截圖傳 512K）。
         val err = CappedPipe(hardCapErrBytes ?: hardCapBytes)
-        val tOut = Thread({ copyCapped(process.inputStream, out) }, "elevated-stdout").also {
+        // W1 getter 先行（owner 新 P1 fail-closed & crash）：雙流 getter 在呼叫
+        // 執行緒求值，gobbler 只在雙流取成功後啟動。getter 抛（ShizukuRemoteProcess
+        // 的 ISE/UOE/ITE）即清理後回 readFailed，不再讓抛逃出 daemon thread
+        //（舊碼 `Thread({ copyCapped(process.inputStream, out) })` 把 getter 求值
+        // 留在 thread 內、`copyCapped` try/catch 之外：不 markFailed＋觸未捕捉 handler）。
+        // 錯誤訊息固定（runner 側同一 "elevated IO read failed" 文案），不帶
+        // remote 原文或輸出；exitValue 取不到即 -1（進程可能仍存活）。
+        val stdoutStream: InputStream
+        try {
+            stdoutStream = process.inputStream
+        } catch (_: Exception) {
+            runCatching { killer(process) }
+            return Drained(
+                stdout = ByteArray(0),
+                stderr = ByteArray(0),
+                exitCode = runCatching { process.exitValue() }.getOrDefault(-1),
+                timedOut = false,
+                readFailed = true,
+            )
+        }
+        val stderrStream: InputStream
+        try {
+            stderrStream = process.errorStream
+        } catch (_: Exception) {
+            runCatching { stdoutStream.close() }
+            runCatching { killer(process) }
+            return Drained(
+                stdout = ByteArray(0),
+                stderr = ByteArray(0),
+                exitCode = runCatching { process.exitValue() }.getOrDefault(-1),
+                timedOut = false,
+                readFailed = true,
+            )
+        }
+        val tOut = Thread({ copyCapped(stdoutStream, out) }, "elevated-stdout").also {
             it.isDaemon = true
             it.start()
         }
-        val tErr = Thread({ copyCapped(process.errorStream, err) }, "elevated-stderr").also {
+        val tErr = Thread({ copyCapped(stderrStream, err) }, "elevated-stderr").also {
             it.isDaemon = true
             it.start()
         }

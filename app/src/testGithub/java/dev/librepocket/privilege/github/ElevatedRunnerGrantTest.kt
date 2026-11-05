@@ -3,6 +3,7 @@ package dev.librepocket.privilege.github
 import dev.librepocket.shell.ElevatedRequest
 import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellResult
+import dev.librepocket.tool.Flavor
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -23,6 +24,8 @@ import org.junit.Test
  * - 全 fake（假進程＋假狀態＋假 su＋記憶體 grant store 同步語義），零真機/真 su/真 binder；
  * - S1 fail-closed：兩 runner `grantCheck` 無預設值（mandatory），本檔全部明示供給；
  *   非 grant 主題測試的 allow 接線見 `GrantFixtures.allowAlways`。
+ * - V1 全域 flavor 門（owner 新 P1-1）：PLAY/FOSS × `id`/`getprop` × 兩 runner 共 8 組，
+ *   grant/bridge/activation 全 allow 下仍 `Denied(NOT_WHITELISTED, "github-only")` 且零 spawn。
  */
 class ElevatedRunnerGrantTest {
 
@@ -403,6 +406,55 @@ class ElevatedRunnerGrantTest {
             assertTrue("$gate -> $rb", rb is ElevatedBinaryResult.Denied)
             assertEquals(ShellDeny.NOT_WHITELISTED, (rb as ElevatedBinaryResult.Denied).reason)
             assertEquals(0, rootSpawns)
+        }
+    }
+
+    @Test fun unsupportedFlavorDeniesWithoutSpawn() {
+        // V1 全域 flavor 門（owner 新 P1-1，github-only）：PLAY/FOSS × id/getprop ×
+        // Root/Shizuku 共 8 組，一律 Denied(NOT_WHITELISTED, "github-only") 且零 spawn。
+        // grant/bridge/activation 全 allow＋status Available＋可信 su，孤立 flavor 變因
+        //（validate 只把 flavor 傳給路徑 scope，無路徑命令不靠 validate 擋，須此門兜底）。
+        for (flavor in listOf(Flavor.PLAY, Flavor.FOSS)) {
+            for (argv in listOf(listOf("id"), listOf("getprop"))) {
+                var shizukuSpawns = 0
+                val shizuku = ShizukuShellRunner(
+                    privateRoot = privateRoot,
+                    bridgeGranted = GrantFixtures.bridgeOn,
+                    activationCheck = GrantFixtures.activationOn,
+                    flavor = flavor,
+                    pingBinder = { true },
+                    spawn = {
+                        shizukuSpawns++
+                        FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+                    },
+                    status = { ShizukuStatus.Available(15) },
+                    grantCheck = GrantFixtures.allowAlways,
+                )
+                val sb = shizuku.runBinary(ElevatedRequest(argv, "V1-T"), 2_000L)
+                assertTrue("$flavor $argv -> $sb", sb is ElevatedBinaryResult.Denied)
+                assertEquals(ShellDeny.NOT_WHITELISTED, (sb as ElevatedBinaryResult.Denied).reason)
+                assertTrue("$flavor $argv -> ${sb.message}", sb.message.contains("github-only"))
+                assertEquals(0, shizukuSpawns)
+
+                var rootSpawns = 0
+                val root = RootSuRunner(
+                    privateRoot = privateRoot,
+                    bridgeGranted = GrantFixtures.bridgeOn,
+                    activationCheck = GrantFixtures.activationOn,
+                    flavor = flavor,
+                    spawn = {
+                        rootSpawns++
+                        FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+                    },
+                    suBinary = "/system/bin/su",
+                    grantCheck = GrantFixtures.allowAlways,
+                )
+                val rb = root.runBinary(ElevatedRequest(argv, "V1-T"), 2_000L)
+                assertTrue("$flavor $argv -> $rb", rb is ElevatedBinaryResult.Denied)
+                assertEquals(ShellDeny.NOT_WHITELISTED, (rb as ElevatedBinaryResult.Denied).reason)
+                assertTrue("$flavor $argv -> ${rb.message}", rb.message.contains("github-only"))
+                assertEquals(0, rootSpawns)
+            }
         }
     }
 }

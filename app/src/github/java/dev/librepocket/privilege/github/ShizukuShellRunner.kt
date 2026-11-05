@@ -82,6 +82,13 @@ import rikka.shizuku.Shizuku
  * （`Thread.currentThread().isInterrupted`），coroutine `Job` 取消不保證中斷
  * blocking `waitFor`；coroutine 呼叫方應顯式傳
  * `isCancelled = { !job.isActive }`（或 `!coroutineContext.isActive`）。
+ *
+ * V1 全域 flavor 門（owner 新 P1-1）：本 runner 僅 github 風味可用（github-only
+ * 設計）。[runBinary] 首位即判 `flavor != GITHUB → Denied(NOT_WHITELISTED,
+ * "unsupported flavor (github-only)")` 且零 spawn，位於 grantCheck／activation／
+ * bridge／status 門／spawn 之前（flavor 為構造屬性，fail-closed 早拒）。
+ * [ShellPolicy.validateElevated] 只把 flavor 傳給路徑 scope（FileScope），無路徑
+ * 命令（`id`／`getprop`）在 PLAY／FOSS 亦 Allowed，故不能只靠 validate，須此全域門兜底。
  */
 class ShizukuShellRunner(
     private val privateRoot: String? = null,
@@ -102,6 +109,14 @@ class ShizukuShellRunner(
         runBinary(request, timeoutMs).toShellResult()
 
     override fun runBinary(request: ElevatedRequest, timeoutMs: Long): ElevatedBinaryResult {
+        // V1 全域 flavor 門（owner 新 P1-1，github-only）：首位即拒，
+        // grantCheck／activation／bridge／status 門／spawn 之前（flavor 為構造屬性，fail-closed 早拒）。
+        if (flavor != Flavor.GITHUB) {
+            return ElevatedBinaryResult.Denied(
+                ShellDeny.NOT_WHITELISTED,
+                "unsupported flavor (github-only)",
+            )
+        }
         // P1-B 門順序＋R1-B grant＋U1 執行門：
         // validate → reasonCode → grantCheck → activation → bridge → status 門 → quota → spawn。
         // validate 先於 binder IPC（status 內 ping 最多 3 次 binder），黑名單 argv

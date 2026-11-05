@@ -40,7 +40,7 @@ compose-ui = { group = "androidx.compose.ui", name = "ui" }
 
 
 class FakeOsvHandler(BaseHTTPRequestHandler):
-    mode = "clean"  # clean | vuln | error500 | badjson | mismatch | garbage | nonlist_vulns | flaky | token_only | token_with_vulns | empty_token | int_token
+    mode = "clean"  # clean | vuln | error500 | badjson | mismatch | garbage | nonlist_vulns | flaky | token_only | token_with_vulns | empty_token | int_token | zero_token | list_token
     last_queries: list = []
     flaky_count = 0
 
@@ -132,6 +132,30 @@ class FakeOsvHandler(BaseHTTPRequestHandler):
             for i, _query in enumerate(queries):
                 if i == 0:
                     results.append({"next_page_token": 123})
+                else:
+                    results.append({})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"results": results}).encode())
+            return
+        if FakeOsvHandler.mode == "zero_token":
+            results = []
+            for i, _query in enumerate(queries):
+                if i == 0:
+                    results.append({"next_page_token": 0})
+                else:
+                    results.append({})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"results": results}).encode())
+            return
+        if FakeOsvHandler.mode == "list_token":
+            results = []
+            for i, _query in enumerate(queries):
+                if i == 0:
+                    results.append({"next_page_token": []})
                 else:
                     results.append({})
             self.send_response(200)
@@ -515,6 +539,28 @@ class OsvScanTest(unittest.TestCase):
 
     def test_nonstring_page_token_fails_closed(self):
         FakeOsvHandler.mode = "int_token"
+        with tempfile.TemporaryDirectory() as td:
+            catalog = self.write_catalog(Path(td))
+            proc = self.run_scan("--catalog", str(catalog), "--osv-url", self.url)
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn("ERROR", proc.stderr)
+            self.assertIn("next_page_token", proc.stderr)
+            self.assertNotIn("package(s) scanned", proc.stdout)
+
+    def test_zero_page_token_fails_closed(self):
+        # Falsy non-string (0) must not be mistaken for "no page".
+        FakeOsvHandler.mode = "zero_token"
+        with tempfile.TemporaryDirectory() as td:
+            catalog = self.write_catalog(Path(td))
+            proc = self.run_scan("--catalog", str(catalog), "--osv-url", self.url)
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn("ERROR", proc.stderr)
+            self.assertIn("next_page_token", proc.stderr)
+            self.assertNotIn("package(s) scanned", proc.stdout)
+
+    def test_list_page_token_fails_closed(self):
+        # Falsy non-string ([]) must not be mistaken for "no page".
+        FakeOsvHandler.mode = "list_token"
         with tempfile.TemporaryDirectory() as td:
             catalog = self.write_catalog(Path(td))
             proc = self.run_scan("--catalog", str(catalog), "--osv-url", self.url)

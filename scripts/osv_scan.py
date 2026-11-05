@@ -366,17 +366,26 @@ def query_osv(
         for pkg, result in zip(batch, results):
             if not isinstance(result, dict):
                 raise RuntimeError(f"OSV malformed per-package result for {pkg['group']}:{pkg['name']}")
-            # Fail closed on OSV querybatch pagination: a non-empty
+            # Fail closed on OSV querybatch pagination: a non-empty-string
             # per-result ``next_page_token`` means the page is incomplete
             # (full page-following is future work), so the scan cannot
-            # report exit 0/1 on a partial result set. Empty string /
-            # None / missing means no further page. Any other truthy
-            # shape (e.g. a non-string token) is treated as paginated.
+            # report exit 0/1 on a partial result set. Missing / None /
+            # empty string means no further page. Any non-string token
+            # (whatever its truthiness, e.g. 0, False, [], {}) is a
+            # malformed response and also fails closed.
             token = result.get("next_page_token")
-            if token:
+            if token is None:
+                pass
+            elif isinstance(token, str):
+                if token != "":
+                    raise RuntimeError(
+                        f"OSV paginated response for {pkg['group']}:{pkg['name']} "
+                        f"(next_page_token present, scan incomplete)"
+                    )
+            else:
                 raise RuntimeError(
-                    f"OSV paginated response for {pkg['group']}:{pkg['name']} "
-                    f"(next_page_token present, scan incomplete)"
+                    f"OSV malformed paginated response for {pkg['group']}:{pkg['name']} "
+                    f"(next_page_token unexpected type {type(token).__name__}, scan incomplete)"
                 )
             vulns = result.get("vulns", [])
             if vulns is None:

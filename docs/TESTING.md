@@ -874,8 +874,8 @@ git diff --stat
 # compose-ui-test-manifest) are pinned as the EXPECTED_UNVERSIONED_KEYS
 # allowlist (any other unversioned library fails closed) and adding a new BOM-managed dependency
 # requires updating that set after conscious review; exit 0 = clean,
-# 1 = vuln found (monitor signal), 2 = fail-closed error (a non-empty
-# per-result `next_page_token` — OSV querybatch pagination — also fails
+# 1 = vuln found (monitor signal), 2 = fail-closed error (a non-string or
+# non-empty-string per-result `next_page_token` — OSV querybatch pagination — also fails
 # closed with exit 2; full page-following is future work):
 python3 -P scripts/osv_scan.py --format json --output /tmp/osv-report.json
 

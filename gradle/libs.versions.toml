@@ -27,7 +27,7 @@ junit4 = "4.13.2"
 robolectric = "4.17"
 testCore = "1.7.0"
 # SSE replay transport (JVM unit tests + instrumented no-external-network tests)
-mockwebserver = "5.5.0"
+mockwebserver = "5.5.1"
 # Instrumented UI assertions (androidTest only)
 testExtJunit = "1.2.1"
 espressoCore = "3.6.1"

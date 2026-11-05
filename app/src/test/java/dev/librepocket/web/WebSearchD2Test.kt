@@ -243,6 +243,14 @@ class WebSearchD2Test {
         assertFalse(failed.fallbackAllowed)
     }
 
+    @Test fun ddgsBlankBody403IsAuth() = runBlocking {
+        val http = FakeHttp { WebHttpResponse(403, "   ") }
+        val out = DdgsSearchProvider(http).search("q", 5)
+        val failed = out as WebSearchOutcome.Failed
+        assertEquals(WebFailureReason.AUTH, failed.reason)
+        assertFalse(failed.fallbackAllowed)
+    }
+
     // ---- cache：第二次零 upstream、cached=true ----
 
     @Test fun cacheSecondCallHitsZeroUpstream() = runBlocking {

@@ -873,4 +873,30 @@ class WebSearchPhase5Test {
         )
         assertEquals("A", hex.single().title)
     }
+
+    @Test fun delegateErrorDoesNotLeakInFlight() = runBlocking {
+        // Error (not Exception) must not be mapped to Failed: it fails the
+        // call via completeExceptionally + rethrow, and finally still clears
+        // inFlight so the next same-key call retries upstream (no weld/hang).
+        val calls = AtomicInteger(0)
+        val delegate = object : WebSearchProvider {
+            override val id: String = "x"
+            override val capabilities: Set<WebCapability> = emptySet()
+            override suspend fun probe(): WebProbe = WebProbe.Ready
+            override suspend fun search(query: String, count: Int): WebSearchOutcome {
+                if (calls.incrementAndGet() == 1) throw AssertionError("boom")
+                return WebSearchOutcome.Ok(listOf(okResult()), false)
+            }
+        }
+        val svc = WebSearchService(delegate)
+        try {
+            withTimeout(5_000) { svc.search("kotlin", 5) }
+            fail("expected AssertionError")
+        } catch (e: AssertionError) {
+            assertEquals("boom", e.message)
+        }
+        val second = withTimeout(5_000) { svc.search("kotlin", 5) }
+        assertTrue(second is WebSearchOutcome.Ok)
+        assertEquals(2, calls.get())
+    }
 }

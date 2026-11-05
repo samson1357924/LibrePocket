@@ -58,12 +58,13 @@ class DdgsSearchProvider(
             is FetchOut.Fail -> return WebSearchOutcome.Failed(fetched.reason)
             is FetchOut.Resp -> fetched.response
         }
-        if (response.code == 403 && isBotWall(response.body)) return WebSearchOutcome.Failed(WebFailureReason.SUPPLIER_ERROR)
+        val botWall by lazy { isBotWall(response.body) }
+        if (response.code == 403 && botWall) return WebSearchOutcome.Failed(WebFailureReason.SUPPLIER_ERROR)
         failureForStatus(response.code)?.let { return WebSearchOutcome.Failed(it) }
         if (response.body.isBlank() || response.body.length > maxBodyChars.coerceAtLeast(1)) {
             return WebSearchOutcome.Failed(WebFailureReason.BAD_RESPONSE)
         }
-        if (isBotWall(response.body)) return WebSearchOutcome.Failed(WebFailureReason.SUPPLIER_ERROR)
+        if (botWall) return WebSearchOutcome.Failed(WebFailureReason.SUPPLIER_ERROR)
         val hits = parseDdgsHtml(response.body)
         val clipped = hits.size > n
         val capped = capResultsForModel(hits.take(n))

@@ -4,6 +4,7 @@ import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellPolicy
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.TimeUnit
 
 /**
@@ -75,7 +76,20 @@ import java.util.concurrent.TimeUnit
  * `copyOf`）＋capture 側 `copyOf`，約為 pipe 保留量的數倍。低 RAM 裝置實際
  * 峰值由 B3 heap profile 驗收，本檔不承諾 8.5MiB 程序峰值。
  *
- * W1 getter 先行（owner 新 P1 fail-closed & crash）：`process.inputStream`／
+ * X1 有界 acquisition（owner 新 P1 lifecycle，W1 引入的 timeout 繞過）：
+ * W1 在呼叫執行緒先取雙流（L177-203）→ Shizuku getter 為同步 Binder IPC，
+ * stall 即呼叫執行緒卡死：deadline（L215）與首次 isCancelled（L218）永不進入；
+ * kill 路徑重調 `process.inputStream/errorStream.close()` 同樣觸阻塞 getter。
+ * 現：
+ * - deadline 移到 drain 入口第一行（outputStream 關閉之前），全部開銷計入同一 budget；
+ * - outputStream 起手關保留同步 runCatching（移到 deadline 之後；su 路徑本地瞬時、
+ *   Shizuku 單次 Binder，stall 即 binder 死亡由狀態門 fail-closed）；
+ * - getter 移回 gobbler 內、整段 try/catch（throw 即 markFailed，W1 語義保留，
+ *   無未捕捉例外；block 則 caller 不受影響照常進 deadline/poll/kill）；
+ * - kill 路徑改關已取流（不再重調 getter，根除 kill 路徑阻塞），kill 前先
+ *   `tOut.interrupt()`／`tErr.interrupt()`（best-effort 助可中斷 stalls 脫離，無害）。
+ *
+ * W1 getter 先行（owner 新 P1 fail-closed & crash，X1 已取代為 gobbler 內取值）：`process.inputStream`／
  * `errorStream` getter 本身可抛（`ShizukuRemoteProcess` 的 IllegalStateException／
  * UOE／InvocationTargetException，見該類委派收斂）。舊碼把 getter 求值寫在
  * gobbler `Thread({ copyCapped(process.inputStream, out) })` 的 lambda 內——
@@ -159,61 +173,57 @@ internal object ElevatedProcessIo {
         hardCapBytes: Int = ShellPolicy.HARD_READ_CAP_BYTES,
         hardCapErrBytes: Int? = null,
     ): Drained {
+        // X1 有界 acquisition：deadline 移到 drain 入口第一行（outputStream 關閉
+        // 之前），全部開銷計入同一 budget（單調時鐘，不受 wall-clock 回撥影響）。
+        val deadlineNanos = System.nanoTime() +
+            TimeUnit.MILLISECONDS.toNanos(timeoutMs.coerceAtLeast(0L))
         // P1-B：spawn 成功後立即關子進程 stdin（子進程 stdin EOF）：等 stdin EOF 的
         // 子進程（如 cat）不再假性 TimedOut。killer 內已關流，此處縱深再關一次。
         // 約束：本 drain 為無 stdin 模式（起手即關），未來需寫 stdin 必須另開
         // API，不得復用本函數（復用會與起手關流競態，並改變 EOF 語義）。
+        // X1 註：su 路徑本地瞬時、Shizuku 單次 Binder，stall 即 binder 死亡由狀態門
+        // fail-closed，故此處保留同步 runCatching（移到 deadline 之後）。
         runCatching { process.outputStream.close() }
         val out = CappedPipe(hardCapBytes)
         // U2-B：stderr 獨立小 cap（null＝同 stdout cap；截圖傳 512K）。
         val err = CappedPipe(hardCapErrBytes ?: hardCapBytes)
-        // W1 getter 先行（owner 新 P1 fail-closed & crash）：雙流 getter 在呼叫
-        // 執行緒求值，gobbler 只在雙流取成功後啟動。getter 抛（ShizukuRemoteProcess
-        // 的 ISE/UOE/ITE）即清理後回 readFailed，不再讓抛逃出 daemon thread
-        //（舊碼 `Thread({ copyCapped(process.inputStream, out) })` 把 getter 求值
-        // 留在 thread 內、`copyCapped` try/catch 之外：不 markFailed＋觸未捕捉 handler）。
-        // 錯誤訊息固定（runner 側同一 "elevated IO read failed" 文案），不帶
-        // remote 原文或輸出；exitValue 取不到即 -1（進程可能仍存活）。
-        val stdoutStream: InputStream
-        try {
-            stdoutStream = process.inputStream
-        } catch (_: Exception) {
-            runCatching { killer(process) }
-            return Drained(
-                stdout = ByteArray(0),
-                stderr = ByteArray(0),
-                exitCode = runCatching { process.exitValue() }.getOrDefault(-1),
-                timedOut = false,
-                readFailed = true,
-            )
-        }
-        val stderrStream: InputStream
-        try {
-            stderrStream = process.errorStream
-        } catch (_: Exception) {
-            runCatching { stdoutStream.close() }
-            runCatching { killer(process) }
-            return Drained(
-                stdout = ByteArray(0),
-                stderr = ByteArray(0),
-                exitCode = runCatching { process.exitValue() }.getOrDefault(-1),
-                timedOut = false,
-                readFailed = true,
-            )
-        }
-        val tOut = Thread({ copyCapped(stdoutStream, out) }, "elevated-stdout").also {
+        // X1 getter 回 gobbler 內、整段 try/catch：throw 即 markFailed（W1 語義保留，
+        // runner 側同一 "elevated IO read failed" 固定文案，不帶 remote 原文或輸出；
+        // 無未捕捉例外）；block 則 caller 不受影響照常進 deadline/poll/kill。
+        // @Volatile 語義由 AtomicReference 承載（函數內局部 var 不可 @Volatile，
+        // 此處以原子引用持有已取流，供 kill 路徑關流）。
+        val inAcquired = AtomicReference<InputStream?>(null)
+        val errAcquired = AtomicReference<InputStream?>(null)
+        val tOut = Thread({
+            try {
+                val s = process.inputStream
+                inAcquired.set(s)
+                copyCapped(s, out)
+            } catch (_: Exception) {
+                out.markFailed()
+            } finally {
+                inAcquired.set(null)
+            }
+        }, "elevated-stdout").also {
             it.isDaemon = true
             it.start()
         }
-        val tErr = Thread({ copyCapped(stderrStream, err) }, "elevated-stderr").also {
+        val tErr = Thread({
+            try {
+                val s = process.errorStream
+                errAcquired.set(s)
+                copyCapped(s, err)
+            } catch (_: Exception) {
+                err.markFailed()
+            } finally {
+                errAcquired.set(null)
+            }
+        }, "elevated-stderr").also {
             it.isDaemon = true
             it.start()
         }
         var finished = false
         try {
-            // 單調時鐘：nanoTime 不受 wall-clock 回撥/校時影響，避免超時拉長或提前。
-            val deadlineNanos = System.nanoTime() +
-                TimeUnit.MILLISECONDS.toNanos(timeoutMs.coerceAtLeast(0L))
             while (true) {
                 if (runCatching { isCancelled() }.getOrDefault(false)) break
                 val remaining = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime())
@@ -237,10 +247,15 @@ internal object ElevatedProcessIo {
         // 經 Drained.truncated 帶出（絕不靜默短讀不標）。
         var joinIncomplete = false
         if (!finished) {
+            // X1：kill 前先 best-effort 中斷兩 gobbler（助可中斷 stalls 脫離，無害；
+            // 若 getter 正阻塞於可中斷等待即抛，經 gobbler 整段 catch 收斂為 markFailed）。
+            runCatching { tOut.interrupt() }
+            runCatching { tErr.interrupt() }
             runCatching { killer(process) }
-            // 關流以解除 gobbler 阻塞（killer 內已關，此處縱深再關一次）。
-            runCatching { process.inputStream.close() }
-            runCatching { process.errorStream.close() }
+            // X1：只關已取流，不再重調 `process.inputStream/errorStream` getter
+            //（根除 kill 路徑 getter 阻塞；未取到即 null，無動作）。
+            runCatching { inAcquired.get()?.close() }
+            runCatching { errAcquired.get()?.close() }
             // 殺後等待：中斷必須 restore（不吞 InterruptedException）；
             // 非中斷異常收斂（清理路徑不升級為崩潰，仍回 TimedOut）。
             try {

@@ -252,6 +252,35 @@ class VerificationMetadataTest(unittest.TestCase):
                     (tmp / "gradle.properties").write_text(content, encoding="utf-8")
                     validate_gradle_files(tmp)  # must not raise
 
+    def test_gradle_properties_formfeed_separator_rejected(self):
+        # Java physical line endings are CR/LF/CRLF only: a literal form-feed
+        # byte (0x0C) is an in-line key/value separator per the properties
+        # spec, NOT a line break. Python str.splitlines() would cut there and
+        # hide a real off/lenient from the validator, so the validator splits
+        # on "\n" only. write_bytes renders the true on-disk byte faithfully
+        # (write_text would carry the same byte, but bytes leave no doubt).
+        cases = {
+            "formfeed off": b"org.gradle.dependency.verification\x0c=off\n",
+            "formfeed lenient": b"org.gradle.dependency.verification\x0c:lenient\n",
+        }
+        for name, content in cases.items():
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    (tmp / "gradle.properties").write_bytes(content)
+                    with self.assertRaises(ValueError):
+                        validate_gradle_files(tmp)
+
+    def test_gradle_properties_formfeed_strict_passes(self):
+        # \x0c doubles as ordinary whitespace separator around '=' and inside
+        # the value: Java reads value "strict" here, so the gate must pass.
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            (tmp / "gradle.properties").write_bytes(
+                b"org.gradle.dependency.verification\x0c=\x0cstrict\n"
+            )
+            validate_gradle_files(tmp)  # must not raise
+
     def test_gradle_properties_duplicate_key_last_wins(self):
         cases = [
             ("strict then off rejected",

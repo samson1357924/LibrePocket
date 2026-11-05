@@ -268,7 +268,13 @@ def validate_gradle_files(root: Path = ROOT) -> None:
         if "disableDependencyVerification" in text:
             raise ValueError(f"{label} disables dependency verification (bypass forbidden)")
         if path.name == "gradle.properties":
-            mode = _properties_verification_mode(text.splitlines())
+            # Split on "\n" only: Path.read_text() already universal-newline
+            # converts CRLF/CR to "\n", matching Java's physical line endings
+            # (CR/LF/CRLF only). str.splitlines() would also split on \x0b
+            # \x0c \x85 \u2028 etc., which Java treats as in-line chars --
+            # an attacker could hide "key\x0c=off" from the validator while
+            # Java still reads it (\x0c is a key/value separator).
+            mode = _properties_verification_mode(text.split("\n"))
             if mode in ("off", "lenient"):
                 raise ValueError(
                     f"{label} weakens verification mode (strict required, got {mode!r})"

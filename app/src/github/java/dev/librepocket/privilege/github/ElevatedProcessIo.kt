@@ -172,12 +172,12 @@ internal object ElevatedCleanupTracker {
     fun isBreakerOpen(): Boolean = consecutiveUnclean.get() >= MAX_CONSECUTIVE_UNCLEAN
 
     /** 清理完成（成功路徑 finished、超時但清理完成）：連續計數歸零。 */
-    fun noteClean() {
+    internal fun noteClean() {
         consecutiveUnclean.set(0)
     }
 
     /** 清理未完成（killer worker 超界未完成）：連續計數遞增，飽和值封頂防溢出。 */
-    fun noteUnclean() {
+    internal fun noteUnclean() {
         consecutiveUnclean.updateAndGet {
             if (it >= MAX_CONSECUTIVE_UNCLEAN) MAX_CONSECUTIVE_UNCLEAN else it + 1
         }

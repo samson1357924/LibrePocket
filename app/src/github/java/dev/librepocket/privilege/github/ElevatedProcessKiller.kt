@@ -65,6 +65,13 @@ import java.lang.reflect.InaccessibleObjectException
  *   TimedOut，不把清理異常升級為崩潰）；
  * - 單測以 `killer: (Process) -> Unit` 注入假實現斷言「超時/cancel 必經清理」，
  *   不依賴真實子孫（真樹驗證另見 `ElevatedProcessKillerTest`）。
+ *
+ * Z1 監督清理（owner 新 P1，僅 KDoc，行為不變）：本物件自身仍同步阻塞
+ * （`destroy/destroyForcibly` 在 Shizuku 遠端可為同步 Binder IPC，stall 即呼叫
+ * 執行緒卡死）。有界性由 [ElevatedProcessIo.drain] 經
+ * `runCleanupBounded(min(max(remaining,500),3000))` 承擔（daemon worker＋
+ * interrupt＋500ms grace；永不跳過 killer 嘗試），未完成經
+ * [ElevatedProcessIo.Drained.cleanupIncomplete] 帶出（runner verdict 映射不變）。
  */
 object ElevatedProcessKiller {
     fun killTree(process: Process) {

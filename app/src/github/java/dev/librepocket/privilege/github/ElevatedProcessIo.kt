@@ -89,17 +89,18 @@ import java.util.concurrent.TimeUnit
  * - kill 路徑改關已取流（不再重調 getter，根除 kill 路徑阻塞），kill 前先
  *   `tOut.interrupt()`／`tErr.interrupt()`（best-effort 助可中斷 stalls 脫離，無害）。
  *
- * W1 getter 先行（owner 新 P1 fail-closed & crash，X1 已取代為 gobbler 內取值）：`process.inputStream`／
- * `errorStream` getter 本身可抛（`ShizukuRemoteProcess` 的 IllegalStateException／
- * UOE／InvocationTargetException，見該類委派收斂）。舊碼把 getter 求值寫在
- * gobbler `Thread({ copyCapped(process.inputStream, out) })` 的 lambda 內——
- * 求值發生在 daemon thread 上、`copyCapped` 的 try/catch 之外，抛即逃出執行緒：
- * 不執行 `markFailed`（`readFailed=false` 誤判）＋觸 app 未捕捉 handler。
- * 現啟動 gobbler 前先在呼叫執行緒安全取雙流：任一 getter 抛即清理
- * （`runCatching killer`＋關已取得流）後回 `Drained(empty, empty,
- * exitValueOr-1, timedOut=false, readFailed=true)`；呼叫方既有 `readFailed`
- * 分支即回同一固定字串 Failed（不帶 remote 原文、不帶輸出）。gobbler 只在雙流
- * 取成功後啟動，daemon thread 內不再求值 getter，無未捕捉例外。
+ * Z1 監督清理現狀（owner 新 P1＋P2＋P3；W1 caller 取流舊描述已刪除）：
+ * - getter 在 gobbler 內取值、整段 try/catch（throw 即 markFailed，W1 語義保留，
+ *   無未捕捉例外；block 則 caller 不受影響照常進 deadline/poll/kill）；
+ * - kill 路徑清理監督化：`killer`＋已取流 close 包入單一 daemon worker
+ *   [runCleanupBounded]（上界 `min(max(remaining,CLEANUP_MIN_MS),CLEANUP_JOIN_MS)`，
+ *   超界 interrupt＋[CLEANUP_GRACE_MS] grace 重 join；永不跳過 killer 嘗試），
+ *   未完成即 [Drained.cleanupIncomplete]=true（不可中斷 Binder stall 殘留 daemon
+ *   由文件揭露＋旗標帶出，不靜默）；
+ * - stdin-closer 生命週期收斂：drain 結尾（兩路徑 gobbler join 後）仍存活即
+ *   interrupt＋grace 重 join，仍存活即 cleanupIncomplete=true；kill 路徑順序為
+ *   interrupt stdinCloser → 監督清理 → joins；
+ * - runner verdict 映射不變：timedOut 仍 TimedOut，旗標僅供 B3 監測可觀測。
  *
  * Y1 三入口＋CappedPipe 備註（owner 新 P1 兩入口＋P2；PocketGuard CappedPipe 可測性）：
  * - killer 去串流關閉：[ElevatedProcessKiller.killTree] 刪除
@@ -133,6 +134,21 @@ internal object ElevatedProcessIo {
     private const val KILL_WAIT_SEC = 5L
     /** Y1 stdin 有界關閉上界：`outputStream` getter/close 在 daemon thread 執行，主執行緒至多等本值（另受剩餘 budget 截頂），超界即放行。 */
     private const val STDIN_CLOSE_MAX_MS = 2_000L
+    /**
+     * Z1 清理監督上界（owner 新 P1）：kill 路徑 `killer`＋已取流 close 包入單一
+     * daemon worker（見 [runCleanupBounded]），主執行緒 join 上界本值；
+     * 實際 budget 為 `min(max(remaining, CLEANUP_MIN_MS), CLEANUP_JOIN_MS)`
+     * （remaining 為 kill 進入時剩餘 deadline；永不跳過 killer 嘗試，最少仍給
+     * [CLEANUP_MIN_MS]）。每 drain 至多 1 清理 worker（daemon），drain 總耗時
+     * 上界為 timeoutMs＋3s＋既有 joins（kill 等待＋gobbler joins＋stdin 尾收）；
+     * 不可中斷 Binder stall 殘留 daemon 由文件揭露＋[Drained.cleanupIncomplete]
+     * 旗標帶出，不靜默。
+     */
+    private const val CLEANUP_JOIN_MS = 3_000L
+    /** Z1 清理監督下界：remaining 再小仍給本值，保證 killer 至少被嘗試一次。 */
+    private const val CLEANUP_MIN_MS = 500L
+    /** Z1 清理／stdin 尾收 grace：首段 join 超界仍存活即 interrupt＋本值重 join 回收線程。 */
+    private const val CLEANUP_GRACE_MS = 500L
     private const val COPY_BUF_SIZE = 8192
 
     data class Drained(
@@ -156,6 +172,15 @@ internal object ElevatedProcessIo {
          * TimedOut，不受影響，預期 close 收斂保留）。
          */
         val readFailed: Boolean = false,
+        /**
+         * Z1 清理不完整旗標（owner 新 P1 可觀測，僅監測用，不改 verdict）：
+         * kill 監督 worker 未完成（[runCleanupBounded] 超界仍存活，killer／已取流
+         * close 含不可中斷 Binder stall）或 stdin-closer 尾收殘留（drain 結尾兩路徑
+         * gobbler join 後仍存活，interrupt＋[CLEANUP_GRACE_MS] 仍存活）即 true。
+         * runner verdict 映射不變：timedOut 仍 TimedOut（僅經既有 truncated／
+         * readFailed 分支），本旗標不進 verdict，僅供 B3 監測清理缺口。
+         */
+        val cleanupIncomplete: Boolean = false,
     )
 
     fun drain(
@@ -283,16 +308,29 @@ internal object ElevatedProcessIo {
         // gobbler 有界 join 未完成標記：任一 join 超界/中斷後執行緒仍存活即部分讀，
         // 經 Drained.truncated 帶出（絕不靜默短讀不標）。
         var joinIncomplete = false
+        // Z1 清理不完整旗標：kill 監督未完成或 stdin-closer 尾收殘留即 true
+        //（runner verdict 映射不變，僅供 B3 監測）。
+        var cleanupIncomplete = false
         if (!finished) {
             // X1：kill 前先 best-effort 中斷兩 gobbler（助可中斷 stalls 脫離，無害；
             // 若 getter 正阻塞於可中斷等待即抛，經 gobbler 整段 catch 收斂為 markFailed）。
             runCatching { tOut.interrupt() }
             runCatching { tErr.interrupt() }
-            runCatching { killer(process) }
-            // X1：只關已取流，不再重調 `process.inputStream/errorStream` getter
-            //（根除 kill 路徑 getter 阻塞；未取到即 null，無動作）。
-            runCatching { inAcquired.get()?.close() }
-            runCatching { errAcquired.get()?.close() }
+            // Z1 順序：interrupt stdinCloser → 監督清理 → joins。stdin 先中斷
+            // 助可中斷 stalls 脫離；尾收（見下方共通段）再確認殘留並記旗標。
+            runCatching { stdinCloser.interrupt() }
+            // Z1 kill 路徑清理監督化：killer＋已取流 close 包入單一 daemon worker，
+            // 有界 join；超界 interrupt＋grace。永不跳過 killer 嘗試（下界保底）。
+            // X1 語義保留：只關已取流，不再重調 getter（根除 kill 路徑 getter 阻塞）。
+            val cleanupRemainMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime())
+                .coerceAtLeast(0L)
+            val cleanupBudgetMs = minOf(maxOf(cleanupRemainMs, CLEANUP_MIN_MS), CLEANUP_JOIN_MS)
+            val cleanupOk = runCleanupBounded(cleanupBudgetMs) {
+                runCatching { killer(process) }
+                runCatching { inAcquired.get()?.close() }
+                runCatching { errAcquired.get()?.close() }
+            }
+            if (!cleanupOk) cleanupIncomplete = true
             // 殺後等待：中斷必須 restore（不吞 InterruptedException）；
             // 非中斷異常收斂（清理路徑不升級為崩潰，仍回 TimedOut）。
             try {
@@ -358,6 +396,18 @@ internal object ElevatedProcessIo {
             }
             if (errStuck) joinIncomplete = true
         }
+        // Z1 stdin-closer 生命週期收斂（兩路徑共通尾收）：gobbler joins 後仍存活即
+        // interrupt＋grace 重 join，仍存活即 cleanupIncomplete=true（daemon 殘留
+        // 8s 類不可中斷 stall 由旗標帶出，不靜默；正常完成即無 interrupt 影響）。
+        if (stdinCloser.isAlive) {
+            runCatching { stdinCloser.interrupt() }
+            try {
+                stdinCloser.join(CLEANUP_GRACE_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            if (stdinCloser.isAlive) cleanupIncomplete = true
+        }
         return Drained(
             stdout = out.bytes(),
             stderr = err.bytes(),
@@ -371,7 +421,43 @@ internal object ElevatedProcessIo {
             // V2：任一流 gobbler 讀取異常即 true（無條件記錄；超時/取消路徑
             // 已先回 TimedOut，runner 側按 finished 區分語義，見 Drained.readFailed）。
             readFailed = out.failed || err.failed,
+            cleanupIncomplete = cleanupIncomplete,
         )
+    }
+
+    /**
+     * Z1 清理監督 worker（owner 新 P1）：daemon thread 執行 [block]（killer＋已取流
+     * close），主執行緒 join 上界 [timeoutMs]；超界即 interrupt＋[CLEANUP_GRACE_MS]
+     * grace 重 join，回是否完成（grace 後仍存活即 false，殘留 daemon 由
+     * [Drained.cleanupIncomplete] 帶出，不靜默）。每 drain 至多 1 worker，
+     * daemon 故不擋 JVM 退出；不可中斷 Binder stall 殘留 daemon 至多存活至 block
+     * 自然返回（如 8s 睡眠模型），呼叫方有界返回不受影響。
+     */
+    private fun runCleanupBounded(timeoutMs: Long, block: () -> Unit): Boolean {
+        val t = Thread({
+            try {
+                block()
+            } catch (_: Exception) {
+                // block 內已逐段 runCatching，此處僅兜底線程體異常，不外抛。
+            }
+        }, "elevated-cleanup").also {
+            it.isDaemon = true
+            it.start()
+        }
+        try {
+            t.join(timeoutMs.coerceAtLeast(0L))
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        if (t.isAlive) {
+            runCatching { t.interrupt() }
+            try {
+                t.join(CLEANUP_GRACE_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+        return !t.isAlive
     }
 
     /**

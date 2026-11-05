@@ -27,6 +27,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -3855,6 +3856,120 @@ class OpenAiSpeechEngineTest {
             assertEquals(0L, player.retainedBytesForTest())
         } finally {
             factoryUnblock.countDown()
+            try {
+                player.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    // ---- Stage-A 第五輪 P2 REQUIRED：admission→factory 快照窗口，stop 使 pending 失格 ----
+    @Test
+    fun androidAudioPlayer_admissionSnapshotWindow_stopInvalidatesPendingBeforeFactorySnapshot() = runBlocking {
+        // A 通過 retained admission + 初步檢查後，暫停於 factory snapshot 讀取之前；
+        // B stop（尚無 active 可 detach）僅遞增世代即返回；A 放行後必須以登記時世代
+        // 比對發現失格，拋 CancellationException 且零 setDataSource/prepareAsync/start。
+        val admissionEntered = CountDownLatch(1)
+        val releaseAdmission = CountDownLatch(1)
+        val firstGate = AtomicBoolean(true)
+        class CountingMp : TestMediaPlayer() {
+            @Volatile var setDataSourceCalled = false
+            override fun setDataSource(dataSource: android.media.MediaDataSource) {
+                setDataSourceCalled = true
+                super.setDataSource(dataSource)
+            }
+        }
+        val created = java.util.Collections.synchronizedList(mutableListOf<CountingMp>())
+        val player = AndroidAudioPlayer(
+            mediaPlayerFactory = {
+                val mp = CountingMp()
+                created.add(mp)
+                mp
+            },
+            prepareTimeoutMs = 5000L,
+        )
+        // 僅首個 play（A）暫停於登記後、factory 前；C（正向對照）不暫停。
+        player.preFactorySnapshotBarrierForTest = {
+            if (firstGate.compareAndSet(true, false)) {
+                admissionEntered.countDown()
+                releaseAdmission.await(5, TimeUnit.SECONDS)
+            }
+        }
+        try {
+            var playExA: Throwable? = null
+            val jobA = launch(Dispatchers.IO) {
+                try {
+                    player.play(byteArrayOf(0x01, 0x02))
+                } catch (e: Throwable) {
+                    playExA = e
+                }
+            }
+            assertTrue("A must pause after admission+registration, before factory snapshot", admissionEntered.await(5, TimeUnit.SECONDS))
+            // B stop：尚無 active 可 detach，僅世代遞增 + 清 pending 即有界返回。
+            val t0 = System.nanoTime()
+            player.stop()
+            val stopElapsedMs = (System.nanoTime() - t0) / 1_000_000
+            assertTrue("stop must return bounded (<1000ms) while A blocked pre-snapshot, elapsed=${stopElapsedMs}ms", stopElapsedMs < 1000)
+            // 放行 A：必須以登記時世代比對發現失格，連 factory 都可不呼叫，絕不做任何 native。
+            releaseAdmission.countDown()
+            withTimeout(5000L) {
+                jobA.join()
+            }
+            val exA = playExA
+            assertNotNull("A must be cancelled after interleaved stop (pre-snapshot window)", exA)
+            assertTrue("pre-snapshot stop must cancel with CancellationException, was: $exA", exA is CancellationException)
+            // A 的 factory 產物（若有）必須零 native；本實作在柵欄後 fail-fast，連 factory 都不呼叫。
+            val snapshotAfterA: List<CountingMp> = try {
+                ArrayList(created)
+            } catch (_: Throwable) {
+                emptyList()
+            }
+            for (mp in snapshotAfterA) {
+                assertFalse("setDataSource must never be called for pre-snapshot-cancelled A", mp.setDataSourceCalled)
+                assertFalse("prepareAsync must never be called for pre-snapshot-cancelled A", mp.prepareAsyncCalled)
+                assertFalse("start must never be called for pre-snapshot-cancelled A", mp.startCalled)
+            }
+            awaitCondition(timeoutMs = 5000L) { player.retainedSessionsForTest() == 0 }
+            assertEquals(0L, player.retainedBytesForTest())
+            // 正向對照：B stop 後新發起的 C.play 仍可正常播放（新登記綁定新世代，不受舊失效影響）。
+            player.preFactorySnapshotBarrierForTest = null
+            val beforeC = try {
+                created.size
+            } catch (_: Throwable) {
+                snapshotAfterA.size
+            }
+            var playExC: Throwable? = null
+            val jobC = async(Dispatchers.IO) {
+                try {
+                    player.play(byteArrayOf(0x03, 0x04))
+                } catch (e: Throwable) {
+                    playExC = e
+                }
+            }
+            awaitCondition(timeoutMs = 5000L) {
+                try {
+                    created.size > beforeC && created[beforeC].preparedListener != null
+                } catch (_: Throwable) {
+                    false
+                }
+            }
+            val cMp: CountingMp = created[beforeC]
+            cMp.preparedListener!!.onPrepared(cMp)
+            awaitCondition(timeoutMs = 5000L) { cMp.startCalled }
+            assertTrue("C (post-stop new play) must start normally", cMp.startCalled)
+            cMp.completionListener!!.onCompletion(cMp)
+            withTimeout(5000L) {
+                jobC.await()
+            }
+            assertNull("C must complete without exception, was: $playExC", playExC)
+            awaitCondition(timeoutMs = 5000L) { player.retainedSessionsForTest() == 0 }
+            assertEquals(0L, player.retainedBytesForTest())
+        } finally {
+            releaseAdmission.countDown()
+            try {
+                player.preFactorySnapshotBarrierForTest = null
+            } catch (_: Throwable) {
+            }
             try {
                 player.release()
             } catch (_: Throwable) {

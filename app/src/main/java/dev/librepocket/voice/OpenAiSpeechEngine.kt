@@ -195,6 +195,26 @@ class AndroidAudioPlayer(
     private var activeReservedBytes: Long = 0L
     private val lock = Any()
     /**
+     * Stage-A 第五輪 P2 REQUIRED：admission→factory 快照窗口 pending 登記（以 [lock] 保護）。
+     * [play] 在任何可暫停/阻塞的 pre-claim 工作（測試柵欄、factory、dataSource 配置）之前，
+     * 先在 [lock] 內原子登記本次 request：分配單調 [pendingNextId]、快照當代
+     * （sessionEpoch/activeEpoch）並將 continuation 存入 [pendingPlays]。
+     * [stop]/[release] 在同一 [lock] 臨界區內清空 [pendingPlays] 並在鎖外逐一 cancel，
+     * 故已進入但尚未 factory 快照的 pending 必失格；claim 比對必須使用登記時世代
+     * （[registerSession]/[registerActive] + 仍在集合內），絕不重讀新世代，
+     * 避免 stop 後重取新世代把舊呼叫當新 request（admission→snapshot 窗口）。
+     */
+    private var pendingNextId: Long = 0L
+    private val pendingPlays = mutableMapOf<Long, CancellableContinuation<Unit>?>()
+    /**
+     * 測試專用柵欄：在 pending 登記完成後、factory 快照/建立前回調（鎖外執行）。
+     * 允許測試將 A 暫停於「admission 成功後、factory snapshot 前」，再由主線程呼叫 [stop]
+     * 製造決定性交錯；放行後 A 以登記時世代比對，必因 session 遞增而失格。生產為 null。
+     * 僅測試使用，呼叫端必須自帶超時，不得在持有 [lock] 時阻塞。
+     */
+    @Volatile
+    internal var preFactorySnapshotBarrierForTest: (() -> Unit)? = null
+    /**
      * 測試專用柵欄：在 onPrepared 第一重柵欄通過並標記已準備後、最終 start 前柵欄前回調。
      * 允許測試將回呼線程暫停於「最後一次 epoch check 之前」，再由主線程呼叫 [stop] 製造決定性交錯；
      * 實作在柵欄返回後仍會做最終雙重柵欄複檢，故遲到 onPrepared 永不 start。生產為 null。
@@ -446,15 +466,22 @@ class AndroidAudioPlayer(
             }
             // 單一 owner：標記 closed 使併發 play fail-fast。
             isReleased.set(true)
-            // 自身 fence：detach 當前 active（含 PREPARING）+ 世代遞增使 in-flight 柵欄失效。
+            // 自身 fence：detach 當前 active（含 PREPARING）+ 世代遞增使 in-flight 柵欄失效
+            // + 清空 pending 登記使尚未 factory snapshot 者失格（與 stop 同語義）。
             // 順序 releaseLock -> lock，與其他路徑（僅持 lock）無反向依賴。
-            val detached = synchronized(lock) {
-                val d = detachAnyLocked()
+            val detached: DetachedSession
+            val pendings: List<CancellableContinuation<Unit>?>
+            synchronized(lock) {
+                detached = detachAnyLocked()
                 sessionEpoch += 1
                 activeEpoch = sessionEpoch
-                d
+                pendings = pendingPlays.values.toList()
+                pendingPlays.clear()
             }
             logEvent("release-fence")
+            for (pending in pendings) {
+                tryCancel(pending, "AndroidAudioPlayer released before claim (pending invalidated)")
+            }
             // 取消 + 清 timer（仍在 releaseLock 內，但已釋放 lock；cont.cancel 觸發的
             // invokeOnCancellation 僅需 lock，此時 lock 空閒，不死鎖）。
             tryCancel(detached.continuation, "AndroidAudioPlayer released (epoch ${detached.epoch})")
@@ -1018,20 +1045,58 @@ class AndroidAudioPlayer(
             }
             return@suspendCancellableCoroutine
         }
+        // Stage-A 第五輪 P2 REQUIRED：pending 原子登記（lock 內分配 id + 綁定世代 + 存 continuation）。
+        // 必須在任何可暫停/阻塞的 pre-claim 工作（測試柵欄、factory、dataSource）之前完成，
+        // 與 [stop]/[release] 的清空失效共用同一 [lock] 原子狀態轉換；claim 比對使用此處
+        // 登記時世代，絕不重讀，避免 admission→snapshot 窗口把舊呼叫當新 request。
         // 入口原子預佔已涵蓋 factory 等待期間的併發，不再設二次 gate（避免對自身重複拒絕）。
-        // BLOCK 修復：工廠前於 lock 內快照世代（sessionEpoch + activeEpoch）。
-        // factory 可能阻塞任意久；期間 stop()/新 play claim/release 皆遞增 sessionEpoch，
-        // 故返回後必須比對快照，失格即釋放 factory 產物並取消，不進任何 native。
+        val myPendingId: Long
         val factorySnapshotSession: Long
         val factorySnapshotActive: Long
         synchronized(lock) {
+            pendingNextId += 1
+            myPendingId = pendingNextId
             factorySnapshotSession = sessionEpoch
             factorySnapshotActive = activeEpoch
+            pendingPlays[myPendingId] = continuation
         }
+        // 注意：此處刻意不調用 continuation.invokeOnCancellation（CancellableContinuation
+        // 僅允許單一 handler，active detach 的 handler 在 claim 成功後註冊）。
+        // 外部取消（job.cancel）導致的 pending 洩漏由 factory 返回/柵欄後的顯式
+        // `pendingPlays.remove` 統一清理（factory 必然返回或拋出，無懸掛）；stop/release
+        // 的清空 + cancel 已涵蓋 in-flight 失效，無需提前 handler。
+        // 決定性測試縫（Stage-A 第五輪 P2）：登記完成後、factory 前暫停（鎖外，不阻塞 stop）。
+        try {
+            preFactorySnapshotBarrierForTest?.invoke()
+        } catch (_: Throwable) {
+        }
+        // 柵欄期間 stop/release 可能已交錯：以登記時世代比對（不重讀），失格即直接回滾，
+        // 連 factory 都不呼叫，零 setDataSource/prepareAsync/start。
+        val barrierStale = !continuation.isActive || isReleased.get() ||
+            synchronized(lock) {
+                !pendingPlays.containsKey(myPendingId) ||
+                    sessionEpoch != factorySnapshotSession || activeEpoch != factorySnapshotActive
+            }
+        if (barrierStale) {
+            synchronized(lock) { pendingPlays.remove(myPendingId) }
+            tryCancel(continuation, "Audio play superseded before factory snapshot (register $factorySnapshotSession/$factorySnapshotActive stale)")
+            try {
+                retainedSessions.decrementAndGet()
+            } catch (_: Throwable) {
+            }
+            try {
+                retainedBytes.addAndGet(-reservedSize)
+            } catch (_: Throwable) {
+            }
+            return@suspendCancellableCoroutine
+        }
+        // BLOCK 修復（沿用登記時快照，不重讀）：factory 可能阻塞任意久；期間 stop()/新 play
+        // claim/release 皆遞增 sessionEpoch，故返回後必須比對登記快照，失格即釋放並取消。
 
         val player = try {
             mediaPlayerFactory()
         } catch (e: Throwable) {
+            synchronized(lock) { pendingPlays.remove(myPendingId) }
             try {
                 retainedSessions.decrementAndGet()
             } catch (_: Throwable) {
@@ -1047,6 +1112,7 @@ class AndroidAudioPlayer(
         // factory 返回後必須再查 closed，released 明確 fail-fast，不做後續 native。
         // （release 擋法保留；stop 語義對等由下方快照柵欄覆蓋。）
         if (isReleased.get() || !continuation.isActive) {
+            synchronized(lock) { pendingPlays.remove(myPendingId) }
             tryCancel(continuation, "Audio play cancelled: player released during factory (epoch pending)")
             releaseAsync(DetachedSession(player, null, null, -1L, reservedSize))
             return@suspendCancellableCoroutine
@@ -1054,12 +1120,16 @@ class AndroidAudioPlayer(
         // P2-2 TOCTOU + BLOCK：factory 阻塞期間 stop/新 play 可能已交錯。
         // 僅查 isReleased/continuation.isActive 不足：stop() 在空 detach 時僅遞增世代，
         // continuation 仍 active、isReleased 仍 false，舊 claim 會直接覆寫世代導致 stop 丟失。
-        // 故此處比對工廠前快照，失格（期間有 stop/新 play claim/release）即釋放 player 並取消，
+        // 故此處比對登記時快照（含 pending 仍在集合內），失格即釋放 player 並取消，
         // 不建 dataSource、不做後續 native。
-        val factoryStale = !continuation.isActive ||
-            synchronized(lock) { sessionEpoch != factorySnapshotSession || activeEpoch != factorySnapshotActive }
+        val factoryStale = !continuation.isActive || isReleased.get() ||
+            synchronized(lock) {
+                !pendingPlays.containsKey(myPendingId) ||
+                    sessionEpoch != factorySnapshotSession || activeEpoch != factorySnapshotActive
+            }
         if (factoryStale) {
-            // 工廠前快照失格：期間有 stop/新 play/release。從未 claim，不進 native，直接取消。
+            // 登記快照失格：期間有 stop/新 play/release（或 pending 已被 stop 清除）。從未 claim，不進 native，直接取消。
+            synchronized(lock) { pendingPlays.remove(myPendingId) }
             tryCancel(continuation, "Audio play superseded during factory (snapshot $factorySnapshotSession/$factorySnapshotActive stale)")
             releaseAsync(DetachedSession(player, null, null, -1L, reservedSize))
             return@suspendCancellableCoroutine
@@ -1072,21 +1142,27 @@ class AndroidAudioPlayer(
             // 詳見 ByteArrayMediaDataSource KDoc 與 copyFalse 釘選測試。
             ByteArrayMediaDataSource(audioBytes, copy = false)
         } catch (e: Throwable) {
+            synchronized(lock) { pendingPlays.remove(myPendingId) }
             // resume 先行，釋放投背景，避免阻塞呼叫線程（預佔隨 DetachedSession 轉交回滾）。
             tryResumeException(continuation, e)
             releaseAsync(DetachedSession(player, null, null, -1L, reservedSize))
             return@suspendCancellableCoroutine
         }
         if (isReleased.get() || !continuation.isActive) {
+            synchronized(lock) { pendingPlays.remove(myPendingId) }
             tryCancel(continuation, "Audio play cancelled: player released before claim (epoch pending)")
             releaseAsync(DetachedSession(player, dataSource, null, -1L, reservedSize))
             return@suspendCancellableCoroutine
         }
-        // dataSource 配置期間亦可能交錯 stop/release/新 play，再查快照+closed。
+        // dataSource 配置期間亦可能交錯 stop/release/新 play，再查登記快照+closed+pending。
         // stop() 語義對等：未 claim 的 in-flight 亦須能被取消（比照 resolved 失格路徑）。
-        val preClaimStale = !continuation.isActive ||
-            synchronized(lock) { sessionEpoch != factorySnapshotSession || activeEpoch != factorySnapshotActive }
+        val preClaimStale = !continuation.isActive || isReleased.get() ||
+            synchronized(lock) {
+                !pendingPlays.containsKey(myPendingId) ||
+                    sessionEpoch != factorySnapshotSession || activeEpoch != factorySnapshotActive
+            }
         if (preClaimStale) {
+            synchronized(lock) { pendingPlays.remove(myPendingId) }
             tryCancel(continuation, "Audio play superseded before claim (snapshot $factorySnapshotSession/$factorySnapshotActive stale)")
             releaseAsync(DetachedSession(player, dataSource, null, -1L, reservedSize))
             return@suspendCancellableCoroutine
@@ -1095,16 +1171,20 @@ class AndroidAudioPlayer(
         val myEpoch: Long?
         val oldDetached: DetachedSession?
         synchronized(lock) {
-            // BLOCK claim 柵欄：比對工廠前快照，期間有 stop/新 play/release 即失格，
-            // 失格即回滾（釋放 factory 產物 + 取消，不進 native）。直接覆寫世代會丟失 stop。
+            // BLOCK claim 柵欄：比對登記時快照（含 pending 登記世代，不重讀），期間有 stop/新 play/release
+            // 即失格，失格即回滾（釋放 factory 產物 + 取消，不進 native）。直接覆寫世代會丟失 stop。
             if (!continuation.isActive || isReleased.get() ||
+                !pendingPlays.containsKey(myPendingId) ||
                 sessionEpoch != factorySnapshotSession || activeEpoch != factorySnapshotActive
             ) {
+                // 失格：清理本次 pending 登記，避免集合洩漏。
+                pendingPlays.remove(myPendingId)
                 myEpoch = null
                 oldDetached = null
             } else {
                 sessionEpoch += 1
                 myEpoch = sessionEpoch
+                pendingPlays.remove(myPendingId)
                 oldDetached = DetachedSession(activePlayer, activeDataSource, activeContinuation, activeEpoch, activeReservedBytes)
                 activePlayer = player
                 activeDataSource = dataSource
@@ -1405,14 +1485,22 @@ class AndroidAudioPlayer(
     }
 
     override fun stop() {
-        val detached = synchronized(lock) {
-            val d = detachAnyLocked()
-            // 遞增世代使進行中 play 的柵欄失效，遲到回呼永不 start
+        val detached: DetachedSession
+        val pendings: List<CancellableContinuation<Unit>?>
+        synchronized(lock) {
+            detached = detachAnyLocked()
+            // 遞增世代使進行中 play 的柵欄失效，遲到回呼永不 start；同時清空 pending 登記，
+            // 使已進入但尚未 factory snapshot 的舊呼叫失格（claim 比對登記世代，不重讀）。
             sessionEpoch += 1
             activeEpoch = sessionEpoch
-            d
+            // 快照並清空 pending（鎖內原子），鎖外逐一取消，保持呼叫線程有界返回。
+            pendings = pendingPlays.values.toList()
+            pendingPlays.clear()
         }
         logEvent("stop-fence")
+        for (pending in pendings) {
+            tryCancel(pending, "AndroidAudioPlayer stopped before claim (pending invalidated)")
+        }
         tryCancel(detached.continuation, "AndroidAudioPlayer stopped (epoch ${detached.epoch})")
         cancelTimeoutAndClearPrepared(detached.epoch)
         // Stage-A 第三輪：僅做邏輯取消 + enqueue 背景靜音/釋放，呼叫線程永不執行 native。

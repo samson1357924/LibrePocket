@@ -1,5 +1,7 @@
 package dev.librepocket.provider
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkEgressPolicy
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -552,8 +554,13 @@ class AnthropicProviderTest {
                     .setBody(sseBody),
             )
             val textKey = "test-api-key-text".toCharArray()
+            // S2：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in。
             val textProvider = AnthropicProvider(
-                testConfig(server.url("/").toString().trimEnd('/')),
+                testConfig(server.url("/").toString().trimEnd('/')).copy(
+                    networkOptIn = EndpointNetworkOptIn(
+                        NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+                    ),
+                ),
                 { textKey },
             )
             val textRequest = ChatRequest(
@@ -585,8 +592,13 @@ class AnthropicProviderTest {
                     .setBody(sseBody),
             )
             val nullKey = "test-api-key-null".toCharArray()
+            // S2：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in。
             val nullProvider = AnthropicProvider(
-                testConfig(server.url("/").toString().trimEnd('/')),
+                testConfig(server.url("/").toString().trimEnd('/')).copy(
+                    networkOptIn = EndpointNetworkOptIn(
+                        NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+                    ),
+                ),
                 { nullKey },
             )
             val nullRequest = ChatRequest(

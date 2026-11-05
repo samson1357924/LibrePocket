@@ -111,6 +111,10 @@ class ResponsesProvider(
     private val httpClient: OkHttpClient by lazy { providerTransportClient(client ?: defaultOkHttpClient(config.http)) }
 
     override fun stream(request: ChatRequest): Flow<StreamEvent> = streamingFlow {
+        // S2 接線：先閘後釘——政策拒絕不觸碰 key／body／連線。
+        val fullUrl = endpoint(config.baseUrl)
+        val (pinnedClient, pinnedResolver) =
+            pinnedTransportFor(httpClient, fullUrl, config.networkOptIn, config.networkResolver)
         val key = apiKey() ?: throw ProviderFailure(false, "HTTP 401 missing_api_key")
         try {
             val body = buildBody(request)
@@ -132,7 +136,7 @@ class ResponsesProvider(
             // VirtualMachineError); an interrupted pump rethrows after
             // restoring the thread's interrupt flag.
             try {
-                pumpSse(httpClient, postJson(endpoint(config.baseUrl), headers, body), config.http) { frame ->
+                pumpSse(pinnedClient, postJson(fullUrl, headers, body), config.http, config.networkOptIn, pinnedResolver) { frame ->
                     emitAll(mapper.mapPayload(frame.data))
                     if (mapper.terminalReached) SsePumpDecision.STOP else SsePumpDecision.CONTINUE
                 }
@@ -152,15 +156,18 @@ class ResponsesProvider(
     }
 
     override suspend fun listModels(): List<String> {
+        // S2 接線：先閘後釘——拒絕不觸碰 key／連線。
+        val url = joinEndpoint(config.baseUrl, "/models")
+        val (pinnedClient, pinnedResolver) =
+            pinnedTransportFor(httpClient, url, config.networkOptIn, config.networkResolver)
         val key = apiKey() ?: throw ProviderFailure(false, "HTTP 401 missing_api_key")
         try {
-            val url = joinEndpoint(config.baseUrl, "/models")
             val req = okhttp3.Request.Builder()
                 .url(url)
                 .header("Authorization", "Bearer ${String(key)}")
                 .get()
                 .build()
-            return executeProviderRequest(httpClient, req, config.http) { resp, cancelCall ->
+            return executeProviderRequest(pinnedClient, req, config.http, config.networkOptIn, pinnedResolver) { resp, cancelCall ->
                 if (!resp.isSuccessful) {
                     val errorPrefix = readProviderErrorPrefix(resp.body, cancelCall).orEmpty()
                     val kind = ProviderErrorClassifier.classify(resp.code, null, errorPrefix)

@@ -1,5 +1,7 @@
 package dev.librepocket.provider
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkEgressPolicy
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
@@ -205,6 +207,9 @@ class ToolAggBudgetTest {
                 baseUrl = server.url("/").toString().trimEnd('/'),
                 protocol = ProviderProtocol.CHAT_COMPLETIONS,
                 apiKeyRef = "fake",
+                networkOptIn = EndpointNetworkOptIn(
+                    NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+                ),
                 http = ProviderHttpConfig(readTimeoutMs = TimeUnit.MINUTES.toMillis(5)),
             )
             val provider = ChatCompletionsProvider(config, { "fake-key".toCharArray() }, OkHttpClient())
@@ -2061,6 +2066,9 @@ class ToolAggBudgetTest {
                 baseUrl = server.url("/").toString().trimEnd('/'),
                 protocol = ProviderProtocol.RESPONSES,
                 apiKeyRef = "fake",
+                networkOptIn = EndpointNetworkOptIn(
+                    NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+                ),
                 http = ProviderHttpConfig(readTimeoutMs = TimeUnit.MINUTES.toMillis(5)),
             )
             val provider = ResponsesProvider(config, { "fake-key".toCharArray() }, OkHttpClient())
@@ -2100,6 +2108,9 @@ class ToolAggBudgetTest {
                 baseUrl = server.url("/").toString().trimEnd('/'),
                 protocol = ProviderProtocol.ANTHROPIC,
                 apiKeyRef = "fake",
+                networkOptIn = EndpointNetworkOptIn(
+                    NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+                ),
                 http = ProviderHttpConfig(readTimeoutMs = TimeUnit.MINUTES.toMillis(5)),
             )
             val provider = AnthropicProvider(config, { "fake-key".toCharArray() }, OkHttpClient())

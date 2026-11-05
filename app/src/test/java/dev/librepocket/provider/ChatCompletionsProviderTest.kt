@@ -1,5 +1,7 @@
 package dev.librepocket.provider
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkEgressPolicy
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -584,8 +586,13 @@ class ChatCompletionsProviderTest {
                     .setHeader("Content-Type", "text/event-stream")
                     .setBody(body),
             )
+            // S2：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in。
             val provider = ChatCompletionsProvider(
-                testConfig(server.url("/").toString().trimEnd('/')),
+                testConfig(server.url("/").toString().trimEnd('/')).copy(
+                    networkOptIn = EndpointNetworkOptIn(
+                        NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+                    ),
+                ),
                 { "test_api_key".toCharArray() },
             )
             val events = withTimeout(10_000) {
@@ -623,8 +630,13 @@ class ChatCompletionsProviderTest {
                     .setHeader("Content-Type", "text/event-stream")
                     .setBody(body),
             )
+            // S2：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in。
             val provider = ChatCompletionsProvider(
-                testConfig(server.url("/").toString().trimEnd('/')),
+                testConfig(server.url("/").toString().trimEnd('/')).copy(
+                    networkOptIn = EndpointNetworkOptIn(
+                        NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+                    ),
+                ),
                 { "test_api_key".toCharArray() },
             )
             val rf = ResponseFormat.JsonSchema(
@@ -717,8 +729,13 @@ class ChatCompletionsProviderTest {
                     .setHeader("Content-Type", "text/event-stream")
                     .setBody(body),
             )
+            // S2：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in。
             val provider = ChatCompletionsProvider(
-                testConfig(server.url("/").toString().trimEnd('/')),
+                testConfig(server.url("/").toString().trimEnd('/')).copy(
+                    networkOptIn = EndpointNetworkOptIn(
+                        NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+                    ),
+                ),
                 { "test_api_key".toCharArray() },
             )
             val events = withTimeout(10_000) {
@@ -800,8 +817,13 @@ class ChatCompletionsProviderTest {
                     .setHeader("Content-Type", "text/event-stream")
                     .setBody(body),
             )
+            // S2：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in。
             val provider = ChatCompletionsProvider(
-                testConfig(server.url("/").toString().trimEnd('/')),
+                testConfig(server.url("/").toString().trimEnd('/')).copy(
+                    networkOptIn = EndpointNetworkOptIn(
+                        NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+                    ),
+                ),
                 { "test_api_key".toCharArray() },
             )
             val events = withTimeout(10_000) {
@@ -838,8 +860,13 @@ class ChatCompletionsProviderTest {
                     .setHeader("Content-Type", "text/event-stream")
                     .setBody(body),
             )
+            // S2：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in。
             val provider = ChatCompletionsProvider(
-                testConfig(server.url("/").toString().trimEnd('/')),
+                testConfig(server.url("/").toString().trimEnd('/')).copy(
+                    networkOptIn = EndpointNetworkOptIn(
+                        NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+                    ),
+                ),
                 { "test_api_key".toCharArray() },
             )
             val events = withTimeout(10_000) {
@@ -932,8 +959,13 @@ class ChatCompletionsProviderTest {
                     .setHeader("Content-Type", "text/event-stream")
                     .setBody(body),
             )
+            // S2：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in。
             val provider = ChatCompletionsProvider(
-                testConfig(server.url("/").toString().trimEnd('/')),
+                testConfig(server.url("/").toString().trimEnd('/')).copy(
+                    networkOptIn = EndpointNetworkOptIn(
+                        NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+                    ),
+                ),
                 { "test_api_key".toCharArray() },
             )
             val events = withTimeout(10_000) {

@@ -158,6 +158,23 @@ class SetupConnectionTest {
     }
 
     @Test
+    fun policyBlockedMapsToPolicyBlocked() {
+        val fake = FakeListProvider(
+            failure = ProviderFailure(
+                false,
+                "NETWORK_POLICY_BLOCKED:CLEARTEXT_NOT_PERMITTED",
+                code = ProviderFailureCode.NETWORK_POLICY_BLOCKED,
+            ),
+        )
+        val (vm, _) = newVm(fake)
+        vm.onApiKeyChange("unit-test-key-123")
+        vm.testConnection()
+        awaitIdle(vm)
+        assertEquals("TEST_POLICY_BLOCKED", vm.form.value.errorCode)
+        assertNull(vm.form.value.testModels)
+    }
+
+    @Test
     fun tooLargeMessageWithoutCodeStillFails() {
         val fake = FakeListProvider(
             failure = ProviderFailure(false, "TOO_LARGE provider model-list response"),

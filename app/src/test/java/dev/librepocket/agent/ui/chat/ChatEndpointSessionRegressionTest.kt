@@ -6,6 +6,8 @@ import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.agent.ui.setup.SetupValidation
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
+import dev.librepocket.policy.NetworkEgressPolicy
+import dev.librepocket.policy.NetworkOptInStore
 import dev.librepocket.provider.ProviderProtocol
 import java.io.File
 import java.nio.file.Files
@@ -79,6 +81,24 @@ class ChatEndpointSessionRegressionTest {
     private fun newServer(): MockWebServer = MockWebServer().also {
         it.start()
         servers.add(it)
+    }
+
+    // S2：MockWebServer 走 http://localhost（迴環明文），須經 NetworkOptInStore
+    // 明示確認才放行；每次 save 後以當前 revision 重綁（變更即失效）。
+    // 本檔為 JVM 測試接線，模擬 foss／github pilot 的升級路徑，故顯式
+    // allowTierUpgrade = true；play production 只允許預設建構（deny-all）。
+    private suspend fun confirmCleartext(
+        optIns: NetworkOptInStore,
+        store: EndpointStore,
+    ) {
+        val cfg = store.snapshotStrict() ?: return
+        val rev = store.currentRevision() ?: cfg.configRevision
+        optIns.confirm(
+            cfg.providerId,
+            cfg.baseUrl,
+            NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+            rev,
+        )
     }
 
     private fun baseUrlOf(server: MockWebServer): String = server.url("/v1").toString().trimEnd('/')
@@ -157,9 +177,12 @@ class ChatEndpointSessionRegressionTest {
         store.save(endpoint(endpointA, aliasA))
 
         val policy = allowKeyReadPolicy()
+        val optIns = NetworkOptInStore(allowTierUpgrade = true)
+        confirmCleartext(optIns, store)
         val sessions = ChatSessionFactory(
             policy = policy,
             vaultSource = VaultSource { vault },
+            networkOptInStore = optIns,
         )
         val viewModel = own(ChatViewModel(store, sessions, policy))
         try {
@@ -183,6 +206,7 @@ class ChatEndpointSessionRegressionTest {
             // Metadata save advances configRevision. The retained ViewModel
             // observes the shared DataStore and rebuilds to B before send.
             store.save(endpoint(endpointB, aliasB))
+            confirmCleartext(optIns, store)
             awaitNoAttachedSession(viewModel)
             chatMain.run { viewModel.sendDirect("now on B") }
             val third = endpointB.takeRequest(10, TimeUnit.SECONDS)
@@ -197,6 +221,7 @@ class ChatEndpointSessionRegressionTest {
             endpointA.enqueue(response())
             vault.putKey(nsA, "test-key-A-123".toCharArray())
             store.save(endpoint(endpointA, aliasA))
+            confirmCleartext(optIns, store)
             awaitNoAttachedSession(viewModel)
             chatMain.run { viewModel.sendDirect("back on A") }
             val fourth = endpointA.takeRequest(10, TimeUnit.SECONDS)
@@ -250,9 +275,12 @@ class ChatEndpointSessionRegressionTest {
         store.save(cfgA1)
 
         val policy = allowKeyReadPolicy()
+        val optIns = NetworkOptInStore(allowTierUpgrade = true)
+        confirmCleartext(optIns, store)
         val sessions = ChatSessionFactory(
             policy = policy,
             vaultSource = VaultSource { vault },
+            networkOptInStore = optIns,
         )
         val viewModel = own(ChatViewModel(store, sessions, policy))
         try {
@@ -271,6 +299,7 @@ class ChatEndpointSessionRegressionTest {
             // session must rebuild and B must receive only KB.
             serverB.enqueue(response())
             store.save(cfgB)
+            confirmCleartext(optIns, store)
             awaitNoAttachedSession(viewModel)
             chatMain.run { viewModel.sendDirect("now on B") }
             val second = serverB.takeRequest(10, TimeUnit.SECONDS)
@@ -286,6 +315,7 @@ class ChatEndpointSessionRegressionTest {
             serverA.enqueue(response())
             val revBeforeRotation = store.currentRevision()
             store.save(cfgA2)
+            confirmCleartext(optIns, store)
             awaitNoAttachedSession(viewModel)
             chatMain.run { viewModel.sendDirect("back on A rotated") }
             val third = serverA.takeRequest(10, TimeUnit.SECONDS)

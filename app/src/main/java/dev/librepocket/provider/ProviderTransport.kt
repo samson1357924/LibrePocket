@@ -1,7 +1,15 @@
 package dev.librepocket.provider
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.HostResolver
+import dev.librepocket.policy.NetworkDenyCode
+import dev.librepocket.policy.NetworkEvaluation
+import dev.librepocket.policy.NetworkPolicy
+import dev.librepocket.policy.PinnedNetworkDns
+import dev.librepocket.policy.SystemHostResolver
 import dev.librepocket.redact.Redactor
 import java.io.IOException
+import java.net.Proxy
 import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.concurrent.TimeUnit
@@ -22,6 +30,8 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.ConnectionPool
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -43,6 +53,12 @@ internal enum class ProviderFailureCode {
      * poison-adjacent pending tool fragments.
      */
     DEADLINE_EXCEEDED,
+    /**
+     * S2 (Issue #135 A2): 網路政策阻擋（cleartext／私有／metadata／redirect）。
+     * 一律 fatal 不重試；訊息首段即 `NETWORK_POLICY_BLOCKED:<DenyCode>`，
+     * `Failed.code` 取此名，`Failed.message` 另帶 `HTTP <code>`（3xx 相容舊斷言）。
+     */
+    NETWORK_POLICY_BLOCKED,
     /**
      * Unknown runtime failure from the provider stream (e.g. an unexpected
      * `RuntimeException` that is neither a typed `ProviderFailure`, validation
@@ -149,6 +165,129 @@ fun defaultOkHttpClient(http: ProviderHttpConfig): OkHttpClient = OkHttpClient.B
 internal fun providerTransportClient(client: OkHttpClient): OkHttpClient = client.newBuilder()
     .denyUnbudgetedResends()
     .build()
+
+/**
+ * S2 (Issue #135 A2): 建連前政策閘。
+ *
+ * 呼叫方（各 provider 的 `stream`／`listModels`）必須在讀 key、組 body 之前
+ * 先調此閘：拒絕即 typed fatal [ProviderFailure]
+ *（`NETWORK_POLICY_BLOCKED:<DenyCode>`，retryable=false），不傳送 credential／body、
+ * 不建連（key 快照由 factory／session 層持有，僅放行後載入使用；此閘保證拒絕路徑
+ * 零送出）。Transport 的 `executeProviderRequest`／`pumpSse` 另在 `call.execute()`
+ * 前重驗一次（縱深，防直接調用繞過）。
+ */
+internal fun requireNetworkPolicyAllowed(
+    rawUrl: String,
+    optIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+    resolver: HostResolver = SystemHostResolver,
+): NetworkEvaluation {
+    val eval = NetworkPolicy.evaluateUrl(rawUrl, optIn, resolver)
+    if (!eval.allowed) throw networkPolicyFailure(eval)
+    return eval
+}
+
+/** 拒絕決策 → typed fatal（訊息經 redact，不含 key／body／明文位址）。 */
+internal fun networkPolicyFailure(eval: NetworkEvaluation): ProviderFailure {
+    val code = eval.denyCode ?: NetworkDenyCode.INVALID_HOST
+    return ProviderFailure(
+        retryable = false,
+        message = redactedError("NETWORK_POLICY_BLOCKED:${code.name}"),
+        code = ProviderFailureCode.NETWORK_POLICY_BLOCKED,
+    )
+}
+
+/** 3xx 專用 typed fatal（訊息另帶 `HTTP <code>` 以相容既有 redirect 斷言）。 */
+internal fun redirectBlockedFailure(httpCode: Int): ProviderFailure = ProviderFailure(
+    retryable = false,
+    message = redactedError("NETWORK_POLICY_BLOCKED:${NetworkDenyCode.REDIRECT_BLOCKED.name} HTTP $httpCode"),
+    code = ProviderFailureCode.NETWORK_POLICY_BLOCKED,
+)
+
+/**
+ * DNS pin-miss 辨識（大小寫無關，走 cause 鏈）：[PinnedNetworkDns] 訊息為靜態
+ * `DNS_PIN_MISS`（不帶 host），OkHttp 可能包裝，故走鏈比對。
+ */
+private fun isDnsPinMiss(e: IOException): Boolean {
+    val seen = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
+    var cur: Throwable? = e
+    while (cur != null && seen.add(cur)) {
+        if (cur.message?.contains("DNS_PIN_MISS", ignoreCase = true) == true) return true
+        cur = cur.cause
+    }
+    return false
+}
+
+/**
+ * S2 redirect 結構檢查 hook（0-follow 執行面，純字串／結構、零 DNS）。
+ *
+ * Provider 永不跟隨（MCP 待 A4）：301/302/303/307/308 (304/305/306 明確排除)一律
+ * [redirectBlockedFailure] 終端，絕不重送 credential／body。若 `Location` 存在，
+ * 僅做結構檢查供 audit（`toHttpUrlOrNull` 解析＋scheme／userinfo 判定），
+ * 絕不調用 [NetworkPolicy.evaluateUrl]、不觸碰 [HostResolver]——攻擊者可控
+ * Location 不得觸發 DNS 解析。回傳值僅供除錯：結構非法回 denied 評估，
+ * 結構合法回 null（audit 通過但呼叫方照擋）。
+ *
+ * @param resolver 已忽略，僅為相容保留（零 DNS，絕不調用）。
+ */
+@Suppress("UNUSED_PARAMETER")
+internal fun evaluateRedirectTargetHook(
+    location: String?,
+    optIn: EndpointNetworkOptIn,
+    resolver: HostResolver,
+): NetworkEvaluation? {
+    if (location.isNullOrBlank()) return null
+    val schemePrefix = REDIRECT_SCHEME_PREFIX.find(location)?.groupValues?.get(1)
+        ?.lowercase(java.util.Locale.ROOT)
+    if (schemePrefix != null && schemePrefix != "http" && schemePrefix != "https") {
+        return NetworkEvaluation.denied(NetworkDenyCode.UNSUPPORTED_SCHEME, null)
+    }
+    val url = location.toHttpUrlOrNull()
+        ?: return NetworkEvaluation.denied(NetworkDenyCode.INVALID_HOST, null)
+    // Userinfo 永遠阻擋：解析後欄位＋原始 authority 雙重檢查（與 NetworkPolicy 同姿態）。
+    val authority = location.substringAfter("://", "").substringBefore('/').substringBefore('?').substringBefore('#')
+    if (url.username.isNotEmpty() || !url.password.isNullOrEmpty() || '@' in authority) {
+        return NetworkEvaluation.denied(NetworkDenyCode.USERINFO_BLOCKED, null)
+    }
+    return null
+}
+
+/** Location scheme 識別（與 NetworkPolicy.SCHEME_PREFIX 同形，僅供結構檢查，零 DNS）。 */
+private val REDIRECT_SCHEME_PREFIX = Regex("""^\s*([A-Za-z][A-Za-z0-9+.-]*):""")
+
+/**
+ * Provider 入口共用：先閘後釘（讀 key 之前）。
+ *
+ * 回傳 `(pinnedClient, pinnedResolver)`：呼叫方用 pinnedClient 建連，
+ * 並把 pinnedResolver 傳回 `executeProviderRequest`／`pumpSse` 做縱深重驗
+ *（重驗走釘住值，不做二次解析，無 TOCTOU）。
+ * 拒絕即拋 typed fatal，不傳送 credential／body（key 快照由 factory／session 層
+ * 持有，僅放行後載入使用；此處保證拒絕路徑零送出）。
+ * pinnedClient 強制直連（`Proxy.NO_PROXY`）：OkHttp `newBuilder()`
+ * 繼承 baseClient 的 proxy 設定，必須顯式覆寫，否則呼叫方注入的 proxy 會把
+ * 建連外包給代理另行解析，繞過 DNS pin（pin 只管直連路徑）。
+ * 連線池獨立且無閒置（per-request `ConnectionPool(0, 1, NANOSECONDS)`）：
+ * 舊 keep-alive 不得繞過 pin，且每請求建池不累積 idle socket（per-request
+ * pin 隔離＋不累積 5 分鐘 idle FD 成本，人審 #4）。
+ * 預設 [defaultOkHttpClient] 維持系統預設（走系統 proxy），僅 pinned 強制直連；
+ * proxy 環境下 pin 要求直連，企業 proxy 使用者走 A4 另議。
+ */
+internal fun pinnedTransportFor(
+    baseClient: OkHttpClient,
+    fullUrl: String,
+    optIn: EndpointNetworkOptIn,
+    resolver: HostResolver,
+): Pair<OkHttpClient, PinnedNetworkDns> {
+    val eval = requireNetworkPolicyAllowed(fullUrl, optIn, resolver)
+    val host = fullUrl.toHttpUrlOrNull()?.host
+        ?: throw networkPolicyFailure(NetworkEvaluation.denied(NetworkDenyCode.INVALID_HOST, null))
+    val pinned = PinnedNetworkDns.forHost(host, eval.resolvedAddresses, resolver)
+    val pinnedClient = providerTransportClient(baseClient).newBuilder()
+        .dns(pinned)
+        .proxy(Proxy.NO_PROXY)
+        .connectionPool(ConnectionPool(0, 1, TimeUnit.NANOSECONDS))
+        .build()
+    return pinnedClient to pinned
+}
 
 /** A redirect is a terminal response: never replay credentials or request bodies. */
 internal enum class SsePumpDecision { CONTINUE, STOP }
@@ -314,8 +453,13 @@ internal suspend fun <T> executeProviderRequest(
     client: OkHttpClient,
     request: Request,
     httpConfig: ProviderHttpConfig = ProviderHttpConfig(),
+    optIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+    resolver: HostResolver = SystemHostResolver,
     consume: (response: Response, cancelCall: () -> Unit) -> T,
 ): T = withContext(Dispatchers.IO) {
+    // S2 接線（縱深）：建連前重驗政策。Provider 入口已在讀 key 前驗過一次，
+    // 此處防直接調用繞過；拒絕即 typed fatal，不建連。
+    requireNetworkPolicyAllowed(request.url.toString(), optIn, resolver)
     val call = client.newCall(request)
     val job = currentCoroutineContext()[Job]
     val cancellation = job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
@@ -332,6 +476,17 @@ internal suspend fun <T> executeProviderRequest(
     try {
         currentCoroutineContext().ensureActive()
         val response = call.execute()
+        // S2 redirect 執行面：0-follow，301/302/303/307/308 (304/305/306 明確排除)即 REDIRECT_BLOCKED 終端
+        //（不重送 credential／body；Location 僅結構檢查供 audit，零 DNS，照擋）。
+        if (NetworkPolicy.isRedirectStatus(response.code)) {
+            evaluateRedirectTargetHook(response.header("Location"), optIn, resolver)
+            try {
+                response.close()
+            } catch (_: NullPointerException) {
+                // Defensive: OkHttp Response.close() crashes if body is null.
+            }
+            throw redirectBlockedFailure(response.code)
+        }
         val result = try {
             consume(response) { call.cancel() }
         } finally {
@@ -384,8 +539,12 @@ internal suspend fun pumpSse(
     client: OkHttpClient,
     request: Request,
     httpConfig: ProviderHttpConfig = ProviderHttpConfig(),
+    optIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+    resolver: HostResolver = SystemHostResolver,
     onFrame: suspend (SseFrameParser.Frame) -> SsePumpDecision,
 ) = coroutineScope {
+    // S2 接線（縱深）：建連前重驗政策，防直接調用繞過入口閘。
+    requireNetworkPolicyAllowed(request.url.toString(), optIn, resolver)
     val call = client.newCall(request)
     val job = currentCoroutineContext()[Job]
     val cancellation = job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
@@ -413,12 +572,26 @@ internal suspend fun pumpSse(
                     code = ProviderFailureCode.DEADLINE_EXCEEDED,
                 )
             }
+            if (isDnsPinMiss(e)) throw networkPolicyFailure(
+                NetworkEvaluation.denied(NetworkDenyCode.INVALID_HOST, null),
+            )
             val kind = ProviderErrorClassifier.classify(null, e, null)
             throw ProviderFailure(kind == FailureKind.RETRYABLE, redactedError("SSE_TRANSPORT", e.message), e)
         }
         var protocolTerminalReached = false
         try {
             try {
+                // S2 redirect 執行面：0-follow，301/302/303/307/308 (304/305/306 明確排除)即 REDIRECT_BLOCKED 終端。
+                if (NetworkPolicy.isRedirectStatus(response.code)) {
+                    // Location 僅結構檢查供 audit，零 DNS，照擋。
+                    evaluateRedirectTargetHook(response.header("Location"), optIn, resolver)
+                    try {
+                        response.close()
+                    } catch (_: NullPointerException) {
+                        // Defensive: OkHttp Response.close() crashes if body is null.
+                    }
+                    throw redirectBlockedFailure(response.code)
+                }
                 if (!response.isSuccessful) {
                     val snippet = try {
                         readProviderErrorPrefix(response.body) { call.cancel() }
@@ -475,6 +648,9 @@ internal suspend fun pumpSse(
                                 code = ProviderFailureCode.DEADLINE_EXCEEDED,
                             )
                         }
+                        if (isDnsPinMiss(e)) throw networkPolicyFailure(
+                            NetworkEvaluation.denied(NetworkDenyCode.INVALID_HOST, null),
+                        )
                         val kind = ProviderErrorClassifier.classify(null, e, null)
                         throw ProviderFailure(kind == FailureKind.RETRYABLE, redactedError("SSE_TRANSPORT", e.message), e)
                     }
@@ -635,11 +811,16 @@ internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit)
                     // never retries, even when the classifier sees a plain
                     // IOException shape.
                     val aggCode = inferAggFailureCodeName(e)
+                    // DNS pin-miss fail-closed：typed NETWORK_POLICY_BLOCKED，
+                    // 永不重試（classifier 經 `dns_pin_miss` 已判 FATAL，此處
+                    // 保底鎖死 retryable=false 並補 typed code）。
+                    val pinMiss = aggCode == null && isDnsPinMiss(e)
                     emit(
                         StreamEvent.Failed(
                             redactedError("PROVIDER_TRANSPORT", e.message),
-                            retryable = kind == FailureKind.RETRYABLE && aggCode == null,
-                            code = aggCode,
+                            retryable = kind == FailureKind.RETRYABLE && aggCode == null && !pinMiss,
+                            code = aggCode
+                                ?: if (pinMiss) ProviderFailureCode.NETWORK_POLICY_BLOCKED.name else null,
                         ),
                     )
                 }

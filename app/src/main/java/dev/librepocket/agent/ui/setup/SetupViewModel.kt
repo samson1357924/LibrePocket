@@ -4199,6 +4199,11 @@ class SetupViewModel(
         // In-memory transport mapping only (never persisted): the endpoint id
         // is the per-endpoint entity (Stage1), the fixed ref is a placeholder
         // — the key itself travels via the KeyProvider closure.
+        // Phase C rollout 決議：probe 經 toProviderConfig() 無 store 預設
+        // deny-all（HTTPS_ONLY）；localhost／明文內網即擲 NETWORK_POLICY_BLOCKED，
+        // 由 classifyTestError 映射為 TEST_POLICY_BLOCKED（見 SetupErrorText），
+        // 非籠統 TEST_FAILED。opt-in confirm UI 接線前需經測試注入 store
+        // (allowTierUpgrade=true) 才放行；此處 production 接線仍為 null。
         val providerId = SetupValidation.deriveEndpointId(form.presetId, effectiveBaseUrl)
         return endpointConfigOf(form, effectiveBaseUrl, providerId, SetupValidation.deriveApiKeyRef(providerId))
             .toProviderConfig()
@@ -4206,6 +4211,10 @@ class SetupViewModel(
 
     private fun classifyTestError(e: ProviderFailure): String {
         if (e.code == ProviderFailureCode.TOO_LARGE) return "TEST_TOO_LARGE"
+        // Phase C 人審 #3：NETWORK_POLICY_BLOCKED 可辨識（policy fatal 優先，
+        // 置於 UNAUTHORIZED 之前）：自 139 起既有 debug localhost /
+        // http://10.0.2.2 等預設拒絕（HTTPS_ONLY），即此閘，見 SetupErrorText。
+        if (e.code == ProviderFailureCode.NETWORK_POLICY_BLOCKED) return "TEST_POLICY_BLOCKED"
         val msg = e.message.orEmpty()
         val lower = msg.lowercase()
         if (!e.retryable &&

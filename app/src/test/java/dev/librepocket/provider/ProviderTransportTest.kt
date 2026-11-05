@@ -1,7 +1,14 @@
 package dev.librepocket.provider
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.HostResolver
+import dev.librepocket.policy.NetworkEgressPolicy
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Proxy
+import java.net.UnknownHostException
 import java.util.concurrent.Callable
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -81,6 +88,11 @@ class ProviderTransportTest {
         protocol = protocol,
         apiKeyRef = "fake-key-ref",
         http = http,
+        // S2：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in；
+        // production 預設仍 deny-all（HTTPS_ONLY）。
+        networkOptIn = EndpointNetworkOptIn(
+            NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+        ),
     )
 
     private fun anthropic(
@@ -263,6 +275,164 @@ class ProviderTransportTest {
                 origin.shutdown()
                 target.shutdown()
             }
+        }
+    }
+
+    @Test
+    fun privateIpRedirectTargetFailsClosedWithoutFollowing() = runBlocking {
+        // Phase4：Location 指私有字面 https://10.1.2.3/ —— transport 0-follow，
+        // 照擋 REDIRECT_BLOCKED，不觸 DNS、不建第二連線、不把 credential 送往 target。
+        val origin = MockWebServer()
+        val target = MockWebServer()
+        origin.start()
+        target.start()
+        try {
+            target.enqueue(MockResponse().setResponseCode(200).setBody("accepted"))
+            origin.enqueue(
+                MockResponse()
+                    .setResponseCode(307)
+                    .addHeader("Location", "https://10.1.2.3/collect"),
+            )
+            val keyCalls = AtomicInteger(0)
+            val base = origin.url("/").toString().trimEnd('/')
+            val cfg = config(ProviderProtocol.CHAT_COMPLETIONS, base)
+            val provider = ChatCompletionsProvider(cfg, { keyCalls.incrementAndGet(); fakeKey.toCharArray() }, null)
+            val events = withTimeout(3_000) { provider.stream(request()).toList() }
+            val failed = events.filterIsInstance<StreamEvent.Failed>().single()
+            assertFalse("private redirect is terminal/fatal", failed.retryable)
+            assertEquals(ProviderFailureCode.NETWORK_POLICY_BLOCKED.name, failed.code)
+            assertTrue("redirect carries REDIRECT_BLOCKED, got: ${failed.message}", failed.message.contains("REDIRECT_BLOCKED"))
+            assertTrue("redirect carries HTTP code, got: ${failed.message}", failed.message.contains("HTTP 307"))
+            assertFalse("redirect failure leaks no target address, got: ${failed.message}", failed.message.contains("10.1.2.3"))
+            // Origin 仍收到已認證首跳（key 只為 origin 讀一次）；target 零請求。
+            assertEquals("key read once for origin only", 1, keyCalls.get())
+            assertEquals(1, origin.requestCount)
+            val received = withContext(Dispatchers.IO) { origin.takeRequest(2, TimeUnit.SECONDS) }
+            assertNotNull("origin request recorded", received)
+            assertEquals("POST", received!!.method)
+            assertEquals(fakeKey, received.getHeader("Authorization")?.removePrefix("Bearer "))
+            assertEquals("redirect target must receive no request", 0, target.requestCount)
+            assertNull("no second request follows the redirect", origin.takeRequest(100, TimeUnit.MILLISECONDS))
+        } finally {
+            origin.shutdown()
+            target.shutdown()
+        }
+    }
+
+    @Test
+    fun privateIpRedirectTargetFailsClosedForListModels() = runBlocking {
+        // Phase4：listModels 同走 0-follow——307 到私有字面即 typed fatal，不建 target 連線。
+        val origin = MockWebServer()
+        val target = MockWebServer()
+        origin.start()
+        target.start()
+        try {
+            target.enqueue(MockResponse().setResponseCode(200).setBody("accepted"))
+            origin.enqueue(
+                MockResponse()
+                    .setResponseCode(307)
+                    .addHeader("Location", "https://10.1.2.3/models"),
+            )
+            val keyCalls = AtomicInteger(0)
+            val base = origin.url("/").toString().trimEnd('/')
+            val cfg = config(ProviderProtocol.CHAT_COMPLETIONS, base)
+            val provider = ChatCompletionsProvider(cfg, { keyCalls.incrementAndGet(); fakeKey.toCharArray() }, null)
+            try {
+                withTimeout(3_000) { provider.listModels() }
+                fail("private redirect must fail closed")
+            } catch (expected: ProviderFailure) {
+                assertFalse(expected.retryable)
+                assertEquals(ProviderFailureCode.NETWORK_POLICY_BLOCKED, expected.code)
+                assertTrue(expected.message.orEmpty().contains("REDIRECT_BLOCKED"))
+                assertFalse(expected.message.orEmpty().contains("10.1.2.3"))
+            }
+            assertEquals(1, origin.requestCount)
+            assertEquals("redirect target must receive no request", 0, target.requestCount)
+        } finally {
+            origin.shutdown()
+            target.shutdown()
+        }
+    }
+
+    @Test
+    fun pinnedClientIgnoresInjectedProxy() = runBlocking {
+        // Phase A：呼叫方注入帶 proxy 的 baseClient，pinned 必須顯式 NO_PROXY 覆寫
+        //（OkHttp newBuilder 繼承 proxy，不覆寫則建連外包給代理另行解析繞過 pin）。
+        val target = MockWebServer()
+        val proxy = MockWebServer()
+        target.start()
+        proxy.start()
+        try {
+            target.enqueue(
+                MockResponse().setResponseCode(200).setBody("{\"data\":[{\"id\":\"m1\"}]}"),
+            )
+            // 若旁路失效（請求走 proxy），此毒丸讓失敗顯性化而非掛起。
+            proxy.enqueue(
+                MockResponse().setResponseCode(500).setBody("proxied-must-not-happen"),
+            )
+            val baseClient = OkHttpClient.Builder()
+                .proxy(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", proxy.port)))
+                .build()
+            val targetBase = target.url("/").toString().trimEnd('/')
+            val fullUrl = joinEndpoint(targetBase, "/models")
+            val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
+            val loopback: HostResolver = HostResolver { listOf(InetAddress.getByName("127.0.0.1")) }
+            // 直連 pin 斷言：覆寫繼承來的 proxy。
+            val (pinnedClient, _) = pinnedTransportFor(baseClient, fullUrl, optIn, loopback)
+            assertEquals(Proxy.NO_PROXY, pinnedClient.proxy)
+            val cfg = config(ProviderProtocol.CHAT_COMPLETIONS, targetBase).copy(networkResolver = loopback)
+            val provider = ChatCompletionsProvider(
+                cfg,
+                { fakeKey.toCharArray() },
+                baseClient,
+            )
+            val models = withTimeout(5_000) { provider.listModels() }
+            assertEquals(listOf("m1"), models)
+            assertEquals("target receives the direct request", 1, target.requestCount)
+            assertEquals("proxy receives no request", 0, proxy.requestCount)
+            val stray = withContext(Dispatchers.IO) { proxy.takeRequest(500, TimeUnit.MILLISECONDS) }
+            assertNull("no request leaks to the injected proxy", stray)
+        } finally {
+            target.shutdown()
+            proxy.shutdown()
+        }
+    }
+
+    @Test
+    fun httpMixedDnsNeverConnectsNorReadsKey() = runBlocking {
+        // Phase A P1 BLOCK：http 混答（PUBLIC+LOOPBACK）即使 cleartext opt-in
+        // 也整組拒；transport 閘在讀 key 前，keyCalls 必須 0，零連線。
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(MockResponse().setResponseCode(200).setBody("{\"data\":[]}"))
+            val mixed: HostResolver = HostResolver { host ->
+                if (host == "mixed.example") {
+                    listOf(InetAddress.getByName("203.0.113.5"), InetAddress.getByName("127.0.0.1"))
+                } else {
+                    throw UnknownHostException(host)
+                }
+            }
+            val keyCalls = AtomicInteger(0)
+            val base = "http://mixed.example:${server.port}/v1"
+            val cfg = config(ProviderProtocol.CHAT_COMPLETIONS, base).copy(networkResolver = mixed)
+            val provider = ChatCompletionsProvider(cfg, { keyCalls.incrementAndGet(); fakeKey.toCharArray() }, null)
+            try {
+                withTimeout(5_000) { provider.listModels() }
+                fail("mixed-DNS http must fail closed")
+            } catch (expected: ProviderFailure) {
+                assertFalse(expected.retryable)
+                assertEquals(ProviderFailureCode.NETWORK_POLICY_BLOCKED, expected.code)
+                assertTrue(
+                    "deny carries CLEARTEXT_NOT_PERMITTED, got: ${expected.message}",
+                    expected.message.orEmpty().contains("CLEARTEXT_NOT_PERMITTED"),
+                )
+            }
+            assertEquals("denied listModels must not fetch key", 0, keyCalls.get())
+            assertEquals("denied http mixed-DNS must send nothing", 0, server.requestCount)
+            assertNull(withContext(Dispatchers.IO) { server.takeRequest(100, TimeUnit.MILLISECONDS) })
+        } finally {
+            server.shutdown()
         }
     }
 

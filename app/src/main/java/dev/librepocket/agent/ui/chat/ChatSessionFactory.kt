@@ -15,6 +15,8 @@ import dev.librepocket.chat.TurnController
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.KeyVault
 import dev.librepocket.policy.DataStorePolicyStore
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkOptInStore
 import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.preset.ProviderCatalog
@@ -24,8 +26,10 @@ import dev.librepocket.provider.KeyProvider
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderConfig
 import dev.librepocket.redact.Redactor
+import dev.librepocket.router.SafeToolSlice
 import dev.librepocket.session.LibrePocketDb
 import dev.librepocket.session.RoomSessionStore
+import dev.librepocket.session.SessionMeta
 import dev.librepocket.session.SessionStore
 import dev.librepocket.session.SessionTranscriptSink
 import dev.librepocket.session.TranscriptEvent
@@ -597,7 +601,20 @@ class ChatSessionFactory(
      * loop with fake clock/backend so a REAL factory-built session completes
      * the fake-tool round-trip.
      */
-    internal val toolSlice: dev.librepocket.router.SafeToolSlice? = null,
+    internal val toolSlice: SafeToolSlice? = null,
+    /**
+     * S2 (Issue #135 A2): per-endpoint 網路 opt-in 解析。Null（預設）即
+     * deny-all（HTTPS_ONLY）；測試／後續 UI 接線注入 `NetworkOptInStore`
+     *（已 `confirm` 的迴環／LAN endpoint 才放行，變更即失效需重綁）。
+     * Play production 只允許預設建構（`allowTierUpgrade = false`）或 null；
+     * 升級-capable 的 store 屬 foss／github pilot 接線（見 `NetworkOptInStore`）。
+     *
+     * BREAKING（Phase C rollout 決議，#139 起）：既有 debug localhost／
+     * http://10.0.2.2 等自 139 起預設拒絕（HTTPS_ONLY，即使 debug NSC 允許；
+     * 屬刻意先全禁）；opt-in confirm UI 接線前，需經測試注入 store
+     * (allowTierUpgrade=true) 才放行；無遷移（舊本機端點需重新確認）。
+     */
+    private val networkOptInStore: NetworkOptInStore? = null,
 ) : ChatSessionProvider {
     // S1: no defaults on overrides (Kotlin forbids defaults on overriding
     // functions): the fail-closed default allowAsk=false lives on the
@@ -613,7 +630,7 @@ class ChatSessionFactory(
         // Stage1 compat (see requireCurrentEndpointId): legacy rows never
         // reach the vault read below.
         requireCurrentEndpointId(endpoint)
-        val config = endpoint.toProviderConfig()
+        val config = endpoint.toProviderConfig(optInFor(endpoint))
         require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
         val model = modelFor(endpoint)
         var credential: SessionCredential? = null
@@ -674,6 +691,7 @@ class ChatSessionFactory(
                 null
             }
             val createdSession = buildSession(
+                endpoint,
                 config,
                 model,
                 transcript,
@@ -799,7 +817,7 @@ class ChatSessionFactory(
         // Stage1 compat (see requireCurrentEndpointId): legacy rows never
         // reach the vault read below.
         requireCurrentEndpointId(endpoint)
-        val config = endpoint.toProviderConfig()
+        val config = endpoint.toProviderConfig(optInFor(endpoint))
         require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
         requireCurrentBinding(keyIsCurrent)
         val store = requireNotNull(sessionStores?.store()) { "UNKNOWN_SESSION" }
@@ -867,6 +885,7 @@ class ChatSessionFactory(
             requireCurrentBinding(keyIsCurrent)
             val sessionStart = meta.createdAt.toInstantOrNull()
             val openedSession = buildSession(
+                endpoint,
                 config,
                 model,
                 SessionTranscriptSink(store, sessionId),
@@ -924,7 +943,7 @@ class ChatSessionFactory(
         endpoint: EndpointConfig,
         config: ProviderConfig,
         oldSessionId: String,
-        oldMeta: dev.librepocket.session.SessionMeta,
+        oldMeta: SessionMeta,
         keyIsCurrent: suspend () -> Boolean,
         allowAsk: Boolean,
     ): CreatedSession {
@@ -988,6 +1007,7 @@ class ChatSessionFactory(
             val sessionStart = forkMeta?.createdAt?.toInstantOrNull()
             requireCurrentBinding(keyIsCurrent)
             val openedSession = buildSession(
+                endpoint,
                 config,
                 model,
                 SessionTranscriptSink(store, newSessionId),
@@ -1067,9 +1087,11 @@ class ChatSessionFactory(
         null
     }
 
+    // 同包頂層同名函式的委派：成員遮蔽頂層，全限定為 load-bearing（import 無法消歧），故保留。
     internal fun cappedHistoryText(text: String): String = dev.librepocket.agent.ui.chat.cappedHistoryText(text)
 
     internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): LoadedModelHistory =
+        // 同上：成員遮蔽同包頂層，全限定保留。
         dev.librepocket.agent.ui.chat.loadModelHistory(store, sessionId)
 
     /** Effective model id for an endpoint (user text, preset default, or "default"). */
@@ -1104,6 +1126,28 @@ class ChatSessionFactory(
     private fun requireCurrentEndpointId(endpoint: EndpointConfig) {
         if (SetupValidation.isLegacyEndpoint(endpoint)) throw CaptureDeniedException("ENDPOINT_ID_LEGACY")
     }
+
+    //region S2 per-endpoint opt-in（store 接線時 live，否則快照）
+    /**
+     * S2 opt-in 解析：經 [networkOptInStore] 查已確認 tier，綁定
+     * (`providerId`＋`baseUrl`＋`configRevision`) 全等才放行升級，否則
+     * deny-all。Null store（預設／production 未接 UI 前）即 HTTPS_ONLY。
+     * 生命週期：僅記憶體持有，重啟即失；持久化待 EndpointStore metadata
+     * 接線（確認本身仍經 confirm 明示 mint）。
+     *
+     * Phase B live 語義：此函數仍取當下快照做初始 [ProviderConfig.networkOptIn]
+     *（create／open 建 session 的 transport 起點），但 store 接線時
+     * [buildSession] 會再包一層 [OptInResolvingProvider]，使活躍 session 的
+     * 每個 `stream`／`listModels` 入口重解 `optInFor`——`invalidate()` 或
+     * `confirm(HTTPS_ONLY)` 後同一 session 物件再送即用 fresh HTTPS_ONLY 被
+     * transport 閘擋下（typed NETWORK_POLICY_BLOCKED＋0 request）。Null store
+     * 時無 live 層，仍為建時快照語義。直接持 [ProviderConfig] 快照的調用方
+     *（Setup probe 無 store）同樣仍為快照語義。
+     */
+    private fun optInFor(endpoint: EndpointConfig): EndpointNetworkOptIn =
+        networkOptInStore?.optInFor(endpoint.providerId, endpoint.baseUrl, endpoint.configRevision)
+            ?: EndpointNetworkOptIn()
+    //endregion
 
     private suspend fun requireCurrentBinding(keyIsCurrent: suspend () -> Boolean) {
         if (!keyIsCurrent()) throw CancellationException("ENDPOINT_BINDING_STALE")
@@ -1170,7 +1214,14 @@ class ChatSessionFactory(
         return SessionCredential(endpoint.apiKeyRef, key)
     }
 
+    /**
+     * Phase B live 接線：[endpoint]＋建時 [config] 快照共同決定 transport 起點；
+     * [networkOptInStore] 非 null 時包 [OptInResolvingProvider] 使活躍 session
+     * 每 turn 重解 opt-in（revoke／降級後同一物件再送即被擋）；null 時維持建時
+     * 快照（deny-all 預設）。private 可加參，不影響 public API。
+     */
     private fun buildSession(
+        endpoint: EndpointConfig,
         config: ProviderConfig,
         model: String,
         transcript: TranscriptSink,
@@ -1186,7 +1237,10 @@ class ChatSessionFactory(
         val keys = KeyProvider { ref ->
             if (keyIsCurrent()) credential.copyFor(ref) else null
         }
-        val provider = buildProvider(config, keys)
+        val optInStore = networkOptInStore
+        val provider =
+            if (optInStore != null) OptInResolvingProvider(endpoint, optInStore, config, keys, buildProvider)
+            else buildProvider(config, keys)
         val session = ChatSessionImpl(
             provider,
             policy,

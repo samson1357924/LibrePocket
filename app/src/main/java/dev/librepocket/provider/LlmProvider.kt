@@ -1,6 +1,8 @@
 package dev.librepocket.provider
 
+import java.util.Locale
 import kotlinx.coroutines.flow.Flow
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /**
  * Provider client facade (SPEC §1.2).
@@ -65,34 +67,50 @@ class DefaultProviderFactory(
  * `https://` required; `http://` only for loopback / RFC1918 development
  * hosts, otherwise [IllegalArgumentException].
  *
+ * http 例外僅字面 loopback／RFC1918（`localhost`、`127.0.0.1`、`::1`、
+ * 字面 `10/8`、`172.16/12`、`192.168/16` 精確比對）；域名一律 https
+ * （如 `10.evil.com` 不放行，不做 DNS，只做字面比對）。
+ * IPv6 字面 loopback 已覆蓋 `::1`，其餘一律不放行。
+ * 與 NetworkPolicy 位元組分類一致方向，transport 仍是最終閘。
+ *
  * Runtime note: release builds deny ALL cleartext via
  * `res/xml/network_security_config.xml`, so even a validated http:// URL only
  * connects in debug builds (whose overlay permits loopback +
  * emulator-host cleartext) — LAN http:// stays refused at runtime by design.
+ *
+ * 解析經 `HttpUrl.toHttpUrlOrNull`（PocketGuard WARN：`java.net.URL` 已棄用語義）。
  */
 fun validateBaseUrl(baseUrl: String) {
-    val url = try {
-        java.net.URL(baseUrl)
-    } catch (e: java.net.MalformedURLException) {
-        throw IllegalArgumentException("PROVIDER_BAD_URL", e)
+    val url = baseUrl.toHttpUrlOrNull() ?: run {
+        // HttpUrl 只解析 http(s)：其餘 scheme 先顯式識別，保留 MUST_BE_HTTPS 細分。
+        val schemePrefix = Regex("""^\s*([A-Za-z][A-Za-z0-9+.-]*):""").find(baseUrl)
+            ?.groupValues?.get(1)?.lowercase(Locale.ROOT)
+        if (schemePrefix != null && schemePrefix != "http" && schemePrefix != "https") {
+            throw IllegalArgumentException("PROVIDER_URL_MUST_BE_HTTPS")
+        }
+        throw IllegalArgumentException("PROVIDER_BAD_URL")
     }
-    val scheme = url.protocol.lowercase()
+    val scheme = url.scheme.lowercase(Locale.ROOT)
     if (scheme == "https") return
     if (scheme == "http") {
-        // URL.getHost() returns bracketed IPv6 ("[::1]"): strip brackets.
-        val host = url.host.lowercase().trim('[', ']')
-        val local = host == "localhost" ||
-            host == "127.0.0.1" ||
-            host == "::1" ||
-            host.startsWith("10.") ||
-            host.startsWith("192.168.") ||
-            host.startsWith("172.") && isPrivate172(host)
-        if (local) return
+        // HttpUrl.host 已去括號且小寫（IPv6 無方括號）；保留 trim 防禦無害。
+        val host = url.host.lowercase(Locale.ROOT).trim('[', ']')
+        if (host == "localhost" || host == "127.0.0.1" || host == "::1") return
+        // 僅 IPv4 字面精確比對（RFC1918）；域名一律不算 local
+        //（如 10.evil.com 不再放行）。不用 DNS，只做字面比對。
+        if (isPrivateIpv4Literal(host)) return
     }
     throw IllegalArgumentException("PROVIDER_URL_MUST_BE_HTTPS")
 }
 
-private fun isPrivate172(host: String): Boolean {
-    val second = host.removePrefix("172.").substringBefore('.').toIntOrNull() ?: return false
-    return second in 16..31
+private val IPV4_LITERAL = Regex("""^\d+\.\d+\.\d+\.\d+$""")
+
+private fun isPrivateIpv4Literal(host: String): Boolean {
+    if (!IPV4_LITERAL.matches(host)) return false
+    val parts = host.split('.').map { it.toIntOrNull() ?: return false }
+    if (parts.size != 4 || parts.any { it !in 0..255 }) return false
+    if (parts[0] == 10) return true // 10/8
+    if (parts[0] == 192 && parts[1] == 168) return true // 192.168/16
+    if (parts[0] == 172 && parts[1] in 16..31) return true // 172.16/12
+    return false
 }

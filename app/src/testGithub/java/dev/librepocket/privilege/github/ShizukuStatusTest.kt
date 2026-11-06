@@ -72,7 +72,7 @@ class ShizukuStatusTest {
     }
 
     @Test fun gateDeniesTypedWithoutSpawn() {
-        // Phase3 P2：`runIfAvailable` 已刪（防 B3 經緩存 Available 直調 spawn）；
+        // Phase3 P2：`runIfAvailable` 已刪（防 #136-B3 經緩存 Available 直調 spawn）；
         // 門語義只經 denyFor 斷言，零 spawn 由 runner 側內門保證
         //（見 `ElevatedRunnerB2Test.shizukuGateBlocksSpawnWhenNotAvailable`）。
         val cases = listOf(

@@ -22,11 +22,11 @@ import org.junit.Test
  * - P1-A：4 次 success-exit＋不可中斷 stdin 阻塞（getter／close 吞 interrupt，
  *   latch 保持）→ 每次 `Ok(cleanupIncomplete=true)`；outstanding 逐次 1→4；
  *   第 5 次 Denied（backlog 或 breaker，斷零 spawn）；finally 釋放＋輪詢歸零＋
- *   手動 noteClean（模擬 B3 remediation）→ 恢復放行。Root（getter 阻塞）＋
+ *   手動 noteClean（模擬#136-B3介入）→ 恢復放行。Root（getter 阻塞）＋
  *   Shizuku（close 阻塞）混合疊加，證跨 runner 共用同一全域計數；
  * - P1-B：8 執行緒 barrier，fake spawn 內 `entered` 計數後 latch 等待；
- *   斷言 spawn==4（恰好，另 4 被併發門拒，reason 含 "concurrency full"）；
- *   釋放後 4 個走 timeout＋不可中斷 destroy → outstanding 達上限；後續 denied。
+ *   斷言 spawn==1（恰好，另 7 被預留門拒，reason 含 "backlog full"）；
+ *   釋放後 1 個走 timeout＋不可中斷 destroy → outstanding=1；後續 denied（backlog）。
  *   finally 全釋放＋輪詢歸零。
  */
 class ElevatedRunnerAB1Test {
@@ -164,7 +164,7 @@ class ElevatedRunnerAB1Test {
     }
 
     @Test fun lingeringSuccessCountsAndSharesAcrossRunners() {
-        ElevatedCleanupTracker.noteClean()
+        ElevatedCleanupTracker.noteClean() // 測試隔離重置，非#136-B3修復。
         pollOutstandingTo(0)
         assertEquals(0, ElevatedCleanupTracker.activeCalls())
         // P1-2 預留（PR140 Phase1，特權宜序列）：逐次累積 4 已不可達（第 2 次即拒）。
@@ -229,7 +229,7 @@ class ElevatedRunnerAB1Test {
             "late completion must not reset breaker",
             ElevatedCleanupTracker.isBreakerOpen(),
         )
-        // 模擬 B3 remediation 後重置 → 恢復放行（雙側各一次正常成功，flag false）。
+        // 模擬#136-B3介入後重置 → 恢復放行（雙側各一次正常成功，flag false）。
         ElevatedCleanupTracker.noteClean()
         assertFalse(ElevatedCleanupTracker.isBreakerOpen())
         val okR = makeRoot { FakeProcess("ok".toByteArray()) }
@@ -246,16 +246,18 @@ class ElevatedRunnerAB1Test {
     }
 
     @Test fun concurrencyGateAdmitsExactlyOneSerial() {
-        ElevatedCleanupTracker.noteClean()
+        ElevatedCleanupTracker.noteClean() // 測試隔離重置，非#136-B3修復（首尾皆然；尾部見 finally）。
         pollOutstandingTo(0)
         assertEquals(0, ElevatedCleanupTracker.activeCalls())
         val spawnGate = CountDownLatch(1)
         val destroyLatch = CountDownLatch(1)
         val entered = AtomicInteger(0)
         val spawns = AtomicInteger(0)
+        val spawnEntered = CountDownLatch(1)
         val runner = makeRoot {
             spawns.incrementAndGet()
             entered.incrementAndGet()
+            spawnEntered.countDown()
             try {
                 spawnGate.await()
             } catch (_: InterruptedException) {
@@ -266,6 +268,10 @@ class ElevatedRunnerAB1Test {
         val n = 8
         val results = arrayOfNulls<ElevatedBinaryResult>(n)
         val start = CountDownLatch(1)
+        // barrier 化：8 線程同起（start 同時釋放，消除啟動交錯抖動）；attempted 記嘗試發起
+        // （start 釋放後即計數，finally 外——holder 阻塞於 spawnGate 不經完成路徑，
+        // 全滿等待會與 spawnGate 死鎖，故主線程只 await 嘗試發起，不 await 完成）。
+        val attempted = CountDownLatch(n)
         val threads = (0 until n).map { i ->
             Thread {
                 try {
@@ -273,6 +279,7 @@ class ElevatedRunnerAB1Test {
                 } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt()
                 }
+                attempted.countDown()
                 results[i] = runner.runBinary(ElevatedRequest(listOf("id"), "AB1-B"), 300L)
             }.also { it.isDaemon = true; it.start() }
         }
@@ -280,19 +287,35 @@ class ElevatedRunnerAB1Test {
             start.countDown()
             // P1-2 預留（PR140 Phase1，特權宜序列）：乾淨態僅允單一進行中呼叫
             //（0+1*4<=4 通過，0+2*4<=4 拒絕）；另 7 應被預留門（backlog）拒絕，不進 spawn。
-            val deadline = System.currentTimeMillis() + 10_000L
-            while (entered.get() < 1) {
-                if (System.currentTimeMillis() >= deadline) {
-                    throw AssertionError("entered=${entered.get()} spawns=${spawns.get()}")
+            assertTrue(
+                "8 threads must all start attempting within 10s (barrier, no sleep)",
+                attempted.await(10L, TimeUnit.SECONDS),
+            )
+            assertTrue(
+                "single admission must enter spawn within 10s (no poll-sleep)",
+                spawnEntered.await(10L, TimeUnit.SECONDS),
+            )
+            // 另 7 次被預留門拒：輪詢其結果皆回（10s 上界），替代 sleep(500ms) 猜收斂；
+            // holder 阻塞於 spawnGate，其結果仍 null，故以 n-1 為滿。
+            val denyDeadline = System.currentTimeMillis() + 10_000L
+            while (results.count { it != null } < n - 1) {
+                if (System.currentTimeMillis() >= denyDeadline) {
+                    throw AssertionError(
+                        "only ${results.count { it != null }}/7 rejections returned",
+                    )
                 }
                 Thread.sleep(20L)
             }
-            Thread.sleep(500L)
             assertEquals(1, spawns.get())
+            assertEquals(1, entered.get())
             // 釋放 spawn 門 → 1 個走 timeout＋不可中斷 destroy → outstanding=1。
             spawnGate.countDown()
             threads.forEach { it.join(30_000L) }
-            assertTrue("all calls must return bounded", threads.none { it.isAlive })
+            assertTrue(
+                "all calls must return within 30s join bound " +
+                    "(CI margin; holder drain ≈ timeout+cleanup ≈ 6s, bound only guards hang)",
+                threads.none { it.isAlive },
+            )
             val timedOut = results.filterIsInstance<ElevatedBinaryResult.TimedOut>()
             assertEquals(1, timedOut.size)
             assertTrue(timedOut.all { it.cleanupIncomplete })

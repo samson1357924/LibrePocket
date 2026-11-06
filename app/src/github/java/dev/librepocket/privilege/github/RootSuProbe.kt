@@ -3,7 +3,7 @@ package dev.librepocket.privilege.github
 import java.io.File
 
 /**
- * Root su 探測（B1，BACKLOG D09，Issue #136 B1，僅 github 風味）。
+ * Root su 探測（#136-B1，BACKLOG D09，Issue #136-B1，僅 github 風味）。
  *
  * 補齊 Magisk／KernelSU／APatch 路徑（Issue #136 §Scope-1）：
  * 既有 [dev.librepocket.shell.PrivilegeProbe.defaultSuProbe] 只認四條

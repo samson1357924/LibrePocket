@@ -1,5 +1,6 @@
 package dev.librepocket.privilege.github
 
+import androidx.annotation.VisibleForTesting
 import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellPolicy
 import java.io.ByteArrayOutputStream
@@ -52,7 +53,7 @@ import java.util.concurrent.TimeUnit
  *   timedOut/truncated，`truncated` 另含硬上限溢出標記，見 [ElevatedCappedPipe]）。
  *
  * R3-B（PocketGuard SUGGESTION，ExecutorService）：維持現狀 —— 固定 2 daemon
- * threads＋有界 join 已防洩漏/hang，ExecutorService 為未來選項（B3）。
+ * threads＋有界 join 已防洩漏/hang，ExecutorService 為未來選項（#136-B3）。
  *
  * S2-B 容量矩陣（owner P2-4，僅 KDoc 文件化，行為零變更）：
  * - 典型 PNG 截圖 1-3MB：完整通過（<8M，Ok 非 truncated，capture 可摘要）；
@@ -60,7 +61,7 @@ import java.util.concurrent.TimeUnit
  * - 未壓縮 RGBA 1080x2400x4 ≈10.37MB：明確不支援（>8M 即 truncated→null，
  *   呼叫方降級手動截圖；截斷幀摘要會虛構完整截圖，故不摘要部分幀）；
  * - 高熵 PNG 超限同理：>8M 即 truncated→null，不分內容熵；
- * - 裝置容量驗收歸 B3 E2E（見 [PrivilegeActivation]：`ELEVATED_RUNNERS_READY`
+ * - 裝置容量驗收歸 #136-B3 E2E（見 [PrivilegeActivation]：`ELEVATED_RUNNERS_READY`
  *   翻 true 前需裝置驗收；JVM 單測僅以假位元組斷言容量邊界，不代表真機幀大小）。
  *
  * U2-B stderr 獨立小 cap（owner P2，僅 KDoc＋可選參數，通用軌行為零變更）：
@@ -75,7 +76,7 @@ import java.util.concurrent.TimeUnit
  * 僅是 [ElevatedCappedPipe] 同時保留量，不是程序峰值。實際峰值另含 `bytes()` 的
  * `toByteArray` 拷貝＋[ElevatedBinaryResult.Ok] 防禦複製（構造 `copyOf`＋取值
  * `copyOf`）＋capture 側 `copyOf`，約為 pipe 保留量的數倍。低 RAM 裝置實際
- * 峰值由 B3 heap profile 驗收，本檔不承諾 8.5MiB 程序峰值。
+ * 峰值由 #136-B3 heap profile 驗收，本檔不承諾 8.5MiB 程序峰值。
  *
  * X1 有界 acquisition（owner 新 P1 lifecycle，W1 引入的 timeout 繞過）：
  * W1 在呼叫執行緒先取雙流（L177-203）→ Shizuku getter 為同步 Binder IPC，
@@ -101,7 +102,7 @@ import java.util.concurrent.TimeUnit
  * - stdin-closer 生命週期收斂：drain 結尾（兩路徑 gobbler join 後）仍存活即
  *   interrupt＋grace 重 join，仍存活即 cleanupIncomplete=true；kill 路徑順序為
  *   interrupt stdinCloser → 監督清理 → joins；
- * - runner verdict 映射不變：timedOut 仍 TimedOut，旗標僅供 B3 監測可觀測。
+ * - runner verdict 映射不變：timedOut 仍 TimedOut，旗標僅供 #136-B3 監測可觀測。
  *
  * Y1 三入口＋CappedPipe 備註（owner 新 P1 兩入口＋P2；PocketGuard CappedPipe 可測性）：
  * - killer 去串流關閉：[ElevatedProcessKiller.killTree] 刪除
@@ -133,7 +134,7 @@ import java.util.concurrent.TimeUnit
  *   （飽和／熔斷／併發預留三條件，不做三段 CAS）；
  *   兩 runner 在飽和／熔斷門之後、配額之前准入，拒絕即
  *   `Denied(QUOTA_EXCEEDED, "elevated concurrency full...")` 且零 spawn、不耗配額；
- *   特權通道宜序列，B3 可調本常數）；
+ *   特權通道宜序列，#136-B3 可調本常數）；
  * - 殘留 gobbler／stdin-closer 計數（啟動不預佔；join 超界仍存活即 interrupt＋grace，
  *   仍存活即 [ElevatedCleanupTracker.markLingering]：每執行緒三態
  *   [AtomicInteger]（0=init／1=held／2=done）＋僅未計數時佔槽，
@@ -152,9 +153,9 @@ internal object ElevatedCleanupTracker {
      * 每殘留清理 worker 持有 Process＋已取流＋Binder 參照（Shizuku 遠端 stall 時含
      * Binder 代理），無界殘留即無界 fd／執行緒／binder 參照洩漏。4 為有界併發經驗值
      * （單次 drain 至多 1 worker，允許數次偶發 stall 疊加而不立即拒絕；持續 stall
-     * 即飽和 fail-closed，B3 可調本常數）。
+     * 即飽和 fail-closed，#136-B3 可調本常數）。
      *
-     * 飽和（[isSaturated]）即 B3 blocker 條件（見 [PrivilegeActivation]：清理缺口未解
+     * 飽和（[isSaturated]）即 #136-B3 blocker 條件（見 [PrivilegeActivation]：清理缺口未解
      * 前產品不得放行，runner 入口資源門拒絕新 spawn）。
      *
      * P1-2 雙預算分離（PR140 Phase1）：本上限同時承擔併發預留檢查
@@ -162,7 +163,7 @@ internal object ElevatedCleanupTracker {
      * `outstanding + (active+1) * SLOTS_PER_CALL <= MAX_OUTSTANDING_CLEANUPS`。
      * 以 MAX=4、SLOTS=4 計，乾淨態（outstanding==0）僅允單一進行中呼叫
      *（0+1*4<=4 通過，0+2*4<=4 拒絕）：實效接近串行。特權通道宜序列
-     *（單次 drain 至多 1 清理 worker＋雙 gobbler＋stdin-closer），B3 可調本常數
+     *（單次 drain 至多 1 清理 worker＋雙 gobbler＋stdin-closer），#136-B3 可調本常數
      *（放寬即允更高併發，但最壞超額同步放大，見 [tryEnterReserved] KDoc）。
      */
     const val MAX_OUTSTANDING_CLEANUPS = 4
@@ -188,7 +189,7 @@ internal object ElevatedCleanupTracker {
      *
      * [MAX_OUTSTANDING_CLEANUPS] 只計殘留清理（事後止血）；併發呼叫本身亦須有界：
      * 特權通道宜序列（單次 drain 至多 1 清理 worker＋雙 gobbler＋stdin-closer），
-     * 無界併發即無界執行緒／fd／Binder 參照。4 為有界併發經驗值（B3 可調本常數），
+     * 無界併發即無界執行緒／fd／Binder 參照。4 為有界併發經驗值（#136-B3 可調本常數），
      * 飽和即兩 runner 入口拒絕新 spawn（fail-closed，見 [tryEnterReserved]）。
      *
      * 呼叫級准入（P1-2 原子化）：runner 在飽和／熔斷門之後、配額之前調用單一
@@ -302,7 +303,7 @@ internal object ElevatedCleanupTracker {
     /** 是否熔斷（連續未完成數達上限；熔斷即持續不清創，runner 入口拒絕新 spawn）。
      *
      * 鎖存語義：熔斷後所有新 spawn 被入口門拒絕，故不會再有 drain 執行、
-     * 計數器不會自然歸零；B3 在驗證修復後須顯式呼叫 [noteClean] 重置
+     * 計數器不會自然歸零；#136-B3 在驗證修復後須顯式呼叫 [noteClean] 重置
      * （internal，同模組可見），不得僅調大上限繞行。*/
     fun isBreakerOpen(): Boolean = synchronized(lock) { consecutiveUnclean.get() >= MAX_CONSECUTIVE_UNCLEAN }
 
@@ -310,7 +311,11 @@ internal object ElevatedCleanupTracker {
      * 清理完成：僅全域無殘留（`outstanding==0`）才歸零（P0-1）。
      * 殘留期間（outstanding>0）的乾淨 drain 保持計數（不歸零亦不遞增），
      * 避免乾淨呼叫沖掉熔斷。
+     *
+     * 測試意圖：單測 setUp／tearDown／首尾呼叫皆屬測試隔離重置，非 #136-B3 修復驗證；
+     * 產品 #136-B3 介入重置亦經此（見 [PrivilegeActivation]），單測僅借其歸零語義做隔離。
      */
+    @VisibleForTesting
     internal fun noteClean() {
         synchronized(lock) {
             if (outstandingCount.get() == 0) consecutiveUnclean.set(0)
@@ -340,7 +345,7 @@ internal object ElevatedCleanupTracker {
      * 5. 否則 `active++` 並回 [Admission.OK]。
      *
      * 特權宜序列：MAX=4、SLOTS=4 時乾淨態僅允單一進行中呼叫
-     *（0+1*4<=4 通過，0+2*4<=4 拒絕），實效接近串行；B3 可調 MAX／SLOTS
+     *（0+1*4<=4 通過，0+2*4<=4 拒絕），實效接近串行；#136-B3 可調 MAX／SLOTS
      * 放寬併發，但最壞超額同步放大（理論最壞 `outstanding + active*SLOTS`
      * 可達 `MAX + MAX_CONCURRENT*SLOTS`，現參數下單槽實測峰值有界，見
      * 迴歸測試 mixed-backlog）。呼叫方成功（OK）後須 `try/finally{leaveCall()}`
@@ -501,7 +506,7 @@ internal object ElevatedProcessIo {
          * close 含不可中斷 Binder stall）或 stdin-closer 尾收殘留（drain 結尾兩路徑
          * gobbler join 後仍存活，interrupt＋[CLEANUP_GRACE_MS] 仍存活）即 true。
          * runner verdict 映射不變：timedOut 仍 TimedOut（僅經既有 truncated／
-         * readFailed 分支），本旗標不進 verdict，僅供 B3 監測清理缺口。
+         * readFailed 分支），本旗標不進 verdict，僅供 #136-B3 監測清理缺口。
          *
          * AB1 P1-A：殘留 gobbler（兩路徑 join 超界仍存活，見 [markLingering]）
          * 亦置本旗標 true（成功路徑 finished＋殘留 gobbler 即 Ok cleanupIncomplete=true，
@@ -692,7 +697,7 @@ internal object ElevatedProcessIo {
         // 經 Drained.truncated 帶出（絕不靜默短讀不標）。
         var joinIncomplete = false
         // Z1 清理不完整旗標：kill 監督未完成或 stdin-closer 尾收殘留即 true
-        //（runner verdict 映射不變，僅供 B3 監測）。
+        //（runner verdict 映射不變，僅供 #136-B3 監測）。
         // P1-3：kill 終審推遲到尾收後（gobbler／stdin linger 亦計入，避免少計）。
         var cleanupIncomplete = false
         if (!finished) {
@@ -1008,7 +1013,7 @@ internal object ElevatedProcessIo {
  *
  * AA1 資源門（owner 新 P1）：清理 backlog 飽和（[cleanupBacklogFull]）與連續不清創
  * 熔斷（[cleanupBreakerOpen]，訊息區分兩因）拒絕收斂至此，與 quota 同級，同為
- * `QUOTA_EXCEEDED` 且零 spawn；飽和＝有不可回收清理，B3 需介入，見
+ * `QUOTA_EXCEEDED` 且零 spawn；飽和＝有不可回收清理，#136-B3 需介入，見
  * [ElevatedCleanupTracker]）。
  *
  * AB1 呼叫級准入（owner 新 P1-A＋P1-B）：併發上限（[concurrencyFull]，訊息含

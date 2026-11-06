@@ -10,7 +10,7 @@ import org.junit.Assume.assumeTrue
 import org.junit.Test
 
 /**
- * R2-A killTree 真子進程驗證（owner P1-1；JVM 已驗，裝置 E2E 為 B3）。
+ * R2-A killTree 真子進程驗證（owner P1-1；JVM 已驗，裝置 E2E 為 #136-B3）。
  *
  * 以真 `sh -c "sleep 30 & wait"` 拉起父子兩層 → [ElevatedProcessKiller.killTree]
  * → 斷言父已死＋子孫無存活。舊實現（實作類查表）在 OpenJDK 21+ 抛

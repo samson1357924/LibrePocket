@@ -23,7 +23,8 @@ import org.junit.Test
  *   被同一全域計數擋下，證跨 runner 共用）；finally 釋放全部 latch＋輪詢 outstanding
  *   回 0（防污染）。每次 stall 耗時約 cleanup budget 下界（500ms join＋500ms grace
  *   ＋300ms poll），4 次約數秒；
- * - 恢復：釋放後 outstanding 歸 0 即 spawn 重新放行；
+ * - 恢復：釋放後 outstanding 歸 0 但 breaker 仍開（late 完成只釋放 slot，不歸零
+ *   consecutive，fail-closed 閂鎖），需 noteClean（模擬#136-B3介入）才放行；
  * - 旗標：blocked destroy → `TimedOut(cleanupIncomplete=true)`；success＋blocked
  *   stdin → `Ok(cleanupIncomplete=true)`；正常 → false。Root＋Shizuku 雙側。
  */
@@ -138,7 +139,7 @@ class ElevatedRunnerAA1Test {
     }
 
     @Test fun saturationGateBlocksBothRunnersAndRecovers() {
-        ElevatedCleanupTracker.noteClean()
+        ElevatedCleanupTracker.noteClean() // 測試隔離重置，非#136-B3修復。
         pollOutstandingTo(0)
         // P1-2 預留（PR140 Phase1，特權宜序列）：乾淨態僅允單一進行中呼叫。
         // 先 1 stall（0+4<=4 放行，outstanding 0→1），再預填 3 達飽和（1+3=4）；
@@ -194,7 +195,8 @@ class ElevatedRunnerAA1Test {
         }
         // 恢復：釋放後 outstanding 歸 0 即 spawn 重新放行（雙側各一次正常成功）。
         // 終審殘留：late 完成只釋放 outstanding，不歸零 consecutive；此處以 noteClean
-        // 模擬 B3 介入後重置（否則熔斷閂鎖，fail-closed 本應持續拒絕）。
+        // 模擬#136-B3介入後重置（否則熔斷閂鎖，fail-closed 本應持續拒絕）。
+        // 首尾 noteClean 呼叫屬測試隔離重置，非#136-B3修復（見本檔各用例首尾）。
         pollOutstandingTo(0)
         assertTrue(
             "late completion must not reset breaker",
@@ -217,7 +219,7 @@ class ElevatedRunnerAA1Test {
     private fun doFlagPassthrough(
         makeRunner: ((List<String>) -> Process) -> BinaryElevatedRunner,
     ) {
-        ElevatedCleanupTracker.noteClean()
+        ElevatedCleanupTracker.noteClean() // 測試隔離重置，非#136-B3修復。
         pollOutstandingTo(0)
         // blocked destroy → TimedOut(cleanupIncomplete=true)。
         val latchKill = CountDownLatch(1)
@@ -273,7 +275,7 @@ class ElevatedRunnerAA1Test {
      * 第 5 次仍放行（outstanding 歸零且 consecutive 歸零；良性慢命令不累計）。
      */
     @Test fun recoverableTimeoutNeverTripsBreaker() {
-        ElevatedCleanupTracker.noteClean()
+        ElevatedCleanupTracker.noteClean() // 測試隔離重置，非#136-B3修復。
         pollOutstandingTo(0)
         try {
             val spawns = AtomicInteger(0)
@@ -316,7 +318,7 @@ class ElevatedRunnerAA1Test {
      * 則為 breaker 生效（outstanding 已 0，非飽和擋；訊息區分兩因）。
      */
     @Test fun breakerOpenBlocksWhenOutstandingZero() {
-        ElevatedCleanupTracker.noteClean()
+        ElevatedCleanupTracker.noteClean() // 測試隔離重置，非#136-B3修復。
         pollOutstandingTo(0)
         // P1-2 預留（PR140 Phase1）：逐次累積不可達，改逐次釋放累計 consecutive
         //（每次 outstanding 0→1→0，consecutive 逐次+1；4 次後 breaker 開而飽和關）。
@@ -379,7 +381,7 @@ class ElevatedRunnerAA1Test {
      * （若未歸零則累計 4 次即開；outstanding 每次即時釋放，孤立 consecutive）。
      */
     @Test fun successResetsConsecutiveCounter() {
-        ElevatedCleanupTracker.noteClean()
+        ElevatedCleanupTracker.noteClean() // 測試隔離重置，非#136-B3修復。
         pollOutstandingTo(0)
         try {
             fun doOneStall(tag: String) {

@@ -29,7 +29,7 @@ internal val SHIZUKU_GRANT_AT_MS = longPreferencesKey("shizuku_grant_at_ms_v1")
 internal val SHIZUKU_GRANT_SERVICE_VERSION = intPreferencesKey("shizuku_grant_service_version_v1")
 
 /**
- * Shizuku 授權持久化（B1，BACKLOG D09，Issue #136 B1，僅 github 風味）。
+ * Shizuku 授權持久化（#136-B1，BACKLOG D09，Issue #136-B1，僅 github 風味）。
  *
  * - 授權結果綁定 endpoint 身分（providerId）＋設定版本（configRevision，
  *   見 [dev.librepocket.agent.ui.setup.EndpointStore]）：endpoint 切換或
@@ -52,9 +52,9 @@ internal val SHIZUKU_GRANT_SERVICE_VERSION = intPreferencesKey("shizuku_grant_se
  * S1 fail-closed（owner P1-1 security）：兩 runner 預設不再放行；
  * [dev.librepocket.privilege.github.RootSuRunner]／[dev.librepocket.privilege.github.ShizukuShellRunner]
  * 的 `grantCheck` 無預設值（mandatory dependency），缺接線編譯失敗；
- * B3 產品供給責任：`{ store.check(freshProviderId, freshRevision) }`（每次新鮮求值）。
+ * #136-B3 產品供給責任：`{ store.check(freshProviderId, freshRevision) }`（每次新鮮求值）。
  * [dev.librepocket.shell.PrivilegeBridgeState.revoke] 與本 Store 的統一路徑為
- * B3 職責（本檔不跨域調 bridge 狀態，避免 main/github 源集耦合）。
+ * #136-B3 職責（本檔不跨域調 bridge 狀態，避免 main/github 源集耦合）。
  */
 data class ShizukuGrant(
     val providerId: String,
@@ -174,9 +174,9 @@ class ShizukuGrantStore(
 
     /** 當前設定下的有效性：load＋policy 一次判定，讀不到即 Invalid。
      *
-     * B3 blocking 包裝契約（Phase3 P2，防懸空／撕裂讀；兩 runner 的 `grantCheck`
+     * #136-B3 blocking 包裝契約（Phase3 P2，防懸空／撕裂讀；兩 runner 的 `grantCheck`
      * KDoc 引用此處為準，runner 側只消費 supplier、不自建快取）：
-     * - runner 非 suspend，故 B3 須以 blocking 包裝供給 `grantCheck`
+     * - runner 非 suspend，故 #136-B3 須以 blocking 包裝供給 `grantCheck`
      *  （例 `runBlocking(ioDispatcher) { store.check(providerId, revision) }`
      *   或等價橋接）；包裝必須在 IO dispatcher 執行，不得在呼叫執行緒直讀；
      * - 每次呼叫必須新鮮供給：grant 側以 [load] 單發射讀 DataStore
@@ -197,10 +197,10 @@ class ShizukuGrantStore(
      * 僅留存稽核，不參與有效性判定（見 `ShizukuGrantTest` 的
      * serviceVersionChangeKeepsValid／grantedAtMsDoesNotAffectCheck 與
      * `ElevatedRunnerPhase3Test` 的 P3-1 pin）；無 TTL（永不過期）。
-     * B3 在另行綁定 serviceVersion／TTL 前不得假設本層會過期舊授權——
-     * 過期語義歸 B3（需改 policy＋同步更新 pin 測試，此處僅文件化，見 TODO）。
+     * #136-B3 在另行綁定 serviceVersion／TTL 前不得假設本層會過期舊授權——
+     * 過期語義歸 #136-B3（需改 policy＋同步更新 pin 測試，此處僅文件化，見 TODO）。
      *
-     * TODO(B3): 若需綁定 serviceVersion（如 Shizuku 升級即重授權）或 TTL
+     * TODO(#136-B3): 若需綁定 serviceVersion（如 Shizuku 升級即重授權）或 TTL
      * （授權時效），在此 policy 新增判定分支＋原因碼，並更新兩 runner 的
      * grant 門測試；現階段刻意不做（P3-1 文件化不改行為）。
      */

@@ -6,12 +6,12 @@ import dev.librepocket.shell.ShellResult
 import rikka.shizuku.Shizuku
 
 /**
- * Shizuku 型別化狀態機（B1，BACKLOG D09，Issue #136 B1，僅 github 風味）。
+ * Shizuku 型別化狀態機（#136-B1，BACKLOG D09，Issue #136-B1，僅 github 風味）。
  *
  * 取代裸 boolean 探測：binder 可用性、授權狀態、版本相容各自收斂為
  * [ShizukuStatus]，非 [ShizukuStatus.Available] 一律經
  * [ShizukuStatusGate] 回 typed [ShellResult.Denied] 且不建任何子進程
- * （「拒絕即 typed 不執行」；runner 真正接線是 B2/B3，本階段只提供門）。
+ * （「拒絕即 typed 不執行」；runner 真正接線是 B2/#136-B3，本階段只提供門）。
  *
  * - 設計沿用 [ShizukuProbe] 的 fail-closed 慣例：任何探測異常收斂為
  *   不可用，呼叫方回落免 Root 路徑，不打擾使用者；
@@ -39,12 +39,12 @@ sealed interface ShizukuStatus {
 
     companion object {
         /**
-         * 最低服務版本（B1 決議）。
+         * 最低服務版本（#136-B1 決議）。
          *
          * 版本來源為 `Shizuku.getVersion()`（見 [ShizukuStatusProbe.status]
          * 的 `serviceVersion` 預設參數）；邊界取 pre-V11：pre-V11 缺乏現行
          * 授權/binder 語義（對應 `Shizuku.isPreV11()` 劃分），禁止執行提權。
-         * `newProcess` 等遠端執行 API 屬 B2 接線範圍，本常數只守 B1 狀態門，
+         * `newProcess` 等遠端執行 API 屬 B2 接線範圍，本常數只守 #136-B1 狀態門，
          * 不代表 B2 已驗證。
          */
         const val MIN_SERVICE_VERSION: Int = 11
@@ -86,9 +86,9 @@ val ShizukuStatus.canExecute: Boolean
     get() = this is ShizukuStatus.Available
 
 /**
- * Shizuku 執行門（B1）：typed 拒絕，不建子進程。
+ * Shizuku 執行門（#136-B1）：typed 拒絕，不建子進程。
  *
- * B3 dispatcher 在每次 call 前以此門守衛：非 Available 即回
+ * #136-B3 dispatcher 在每次 call 前以此門守衛：非 Available 即回
  * [ShellResult.Denied]（reason 為各狀態的原因碼），spawn 永不被呼叫。
  */
 object ShizukuStatusGate {
@@ -106,13 +106,13 @@ object ShizukuStatusGate {
      *
      * P3-2 现状 pin（行为不变）：verdict 粒度坍缩为单码 NOT_WHITELISTED 系刻意
      * （[ShellDeny] 无 binder/授权/版本细分）；细因仅进 `message` 作审计文本，
-     * 不得作程序分支（见上）。TODO(B3): 若需结构化原因码（如新增
+     * 不得作程序分支（见上）。TODO(#136-B3): 若需结构化原因码（如新增
      * `DeniedWithCode(reason, code)` 或审计侧 reasonCode 字段），须同步
      * [dev.librepocket.shell.ShellResult] 与审计映射并更新门测试；
      * 现阶段刻意不做（P3-2 文件化不改行为）。
      *
      * 相容壳移除说明（Phase3 P2）：旧 `@Deprecated runIfAvailable` 已删除。
-     * 其 `Available → 直调 spawn` 语义允许 B3 经缓存的 Available 绕过 runner
+     * 其 `Available → 直调 spawn` 语义允许 #136-B3 经缓存的 Available 绕过 runner
      * 内门直达 spawn；删除后放行路径唯一：`denyFor(...) == null` 再由呼叫方
      * （runner 内门，非缓存状态）执行。测试替代：门语义由
      * `ShizukuStatusTest` 的 denyFor 断言覆盖，零 spawn 由 runner 侧
@@ -137,7 +137,7 @@ object ShizukuStatusGate {
 }
 
 /**
- * Shizuku binder 生命週期事件（B1）。
+ * Shizuku binder 生命週期事件（#136-B1）。
  *
  * 真實 `addBinderReceivedListener` / `addBinderDeadListener` 只在 [attach]
  * 內註冊（產品路徑，需 binder 環境）；狀態分發走純 JVM 回呼表，
@@ -155,10 +155,10 @@ object ShizukuStatusGate {
  * - JVM 單測走註冊失敗路徑（Shizuku 類初始化失敗，`isAttached` 恆 false）：
  *   僅斷言本地語義（守衛＋回呼表＋失敗不卡死＋detach 清表），不代表真機 binder 語義；
  * - 真實 binder attach→detach→attach 不重複（上游不累積、重建後單分發）
- *   需裝置 E2E 驗收（歸 B3，見 [PrivilegeActivation]；JVM 下上游靜態表無法斷言，
+ *   需裝置 E2E 驗收（歸 #136-B3，見 [PrivilegeActivation]；JVM 下上游靜態表無法斷言，
  *   僅由 [detach] 內同一引用 remove* 保證）。
  *
- * B3 接線立約（Phase3 P2，僅 KDoc，行為不變）：
+ * #136-B3 接線立約（Phase3 P2，僅 KDoc，行為不變）：
  * - `onDead` 產品接線：binder 死亡即視為授權失效——回呼內執行 grant 撤銷
  *   （`ShizukuGrantStore.clear()`）並記審計；撤銷後已建 runner 次 call 即經
  *   grant 門／spawn 前重求值拒絕且零 spawn（見兩 runner grant 測試的全鏈路）。
@@ -187,7 +187,7 @@ class ShizukuBinderEvents {
     }
 
     /**
-     * binder 死亡回呼註冊（B3 接線：回呼內执行 grant 撤銷＋審計，見本類 KDoc 立約；
+     * binder 死亡回呼註冊（#136-B3 接線：回呼內执行 grant 撤銷＋審計，見本類 KDoc 立約；
      * 回呼內禁止快取 [ShizukuStatus]，狀態只在每次 call 新鮮求值）。
      */
     fun onDead(callback: () -> Unit) {
@@ -292,7 +292,7 @@ class ShizukuBinderEvents {
 }
 
 /**
- * B1 狀態探測組合（[ShizukuProbe] 的 typed 延伸；原 boolean API 不動）。
+ * #136-B1 狀態探測組合（[ShizukuProbe] 的 typed 延伸；原 boolean API 不動）。
  *
  * 求值順序刻意與 [ShizukuStatus.evaluate] 對齊：ping 失敗即短路，
  * 不再觸碰 `checkSelfPermission` / `getVersion`（binder 已死時後兩者

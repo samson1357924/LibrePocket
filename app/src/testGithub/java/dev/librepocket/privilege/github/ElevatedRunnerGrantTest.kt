@@ -4,7 +4,16 @@ import dev.librepocket.shell.ElevatedRequest
 import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellResult
 import dev.librepocket.tool.Flavor
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.io.OutputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -455,6 +464,95 @@ class ElevatedRunnerGrantTest {
                 assertTrue("$flavor $argv -> ${rb.message}", rb.message.contains("github-only"))
                 assertEquals(0, rootSpawns)
             }
+        }
+    }
+
+    // ---- 快照語義：drain 進行中撤銷 grant，當次按進入時快照完成，次 call 才拒 ----
+
+    /** latch 門控 waitFor：釋放前不回（hang）；exit 0、stdout "ok"（健康完成態）。 */
+    private class LatchWaitProcess(private val latch: CountDownLatch) : Process() {
+        override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+        override fun getInputStream(): InputStream = ByteArrayInputStream("ok".toByteArray())
+        override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int = 0
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
+            latch.await(10L, TimeUnit.SECONDS)
+            return true
+        }
+        override fun exitValue(): Int = 0
+        override fun destroy() = Unit
+        override fun destroyForcibly(): Process = this
+    }
+
+    private fun doGrantRevokedMidDrain(
+        build: (
+            spawn: (List<String>) -> Process,
+            grantCheck: () -> GrantCheck,
+        ) -> BinaryElevatedRunner,
+    ) {
+        // spawn 前兩次重估（入口＋准入後）皆 Valid；drain 阻塞期間翻 Invalid；
+        // spawn 後 drain 不再重估 → 當次 Ok（快照完成），次 call 才 Denied 且零新增 spawn。
+        val latch = CountDownLatch(1)
+        val calls = AtomicInteger(0)
+        // benign race 文件化：bg 執行緒經 grantCheck 讀、主線程寫；單寫者布林可見性即可，
+        // 無複合原子需求，故 @Volatile 足夠（函數內局部 var 不可 @Volatile，以 holder 承載）。
+        class GrantFlag(@Volatile var valid: Boolean)
+        val grantValid = GrantFlag(true)
+        val runner = build(
+            { calls.incrementAndGet(); LatchWaitProcess(latch) },
+            { if (grantValid.valid) GrantCheck.Valid else GrantCheck.Invalid(ShizukuGrantPolicy.REASON_NEVER_GRANTED) },
+        )
+        val resultRef = AtomicReference<ElevatedBinaryResult?>()
+        val bg = Thread {
+            resultRef.set(runner.runBinary(request(), 10_000L))
+        }.also { it.isDaemon = true; it.start() }
+        // 等 spawn 發生（drain 進行中）再撤銷：latch 驅動，無 sleep 猜測。
+        val deadline = System.currentTimeMillis() + 10_000L
+        while (calls.get() < 1) {
+            if (System.currentTimeMillis() >= deadline) {
+                latch.countDown()
+                throw AssertionError("spawn never happened (calls=${calls.get()})")
+            }
+            Thread.sleep(20L)
+        }
+        grantValid.valid = false
+        latch.countDown()
+        bg.join(15_000L)
+        assertFalse("mid-drain revoke must not hang the in-flight call", bg.isAlive)
+        val first = resultRef.get()
+        assertTrue("$first", first is ElevatedBinaryResult.Ok)
+        assertEquals(1, calls.get())
+        // 次 call：grant 已 Invalid，入口即拒，零新增 spawn。
+        val second = runner.runBinary(request(), 2_000L)
+        assertTrue("$second", second is ElevatedBinaryResult.Denied)
+        assertEquals(ShellDeny.NOT_WHITELISTED, (second as ElevatedBinaryResult.Denied).reason)
+        assertEquals(1, calls.get())
+    }
+
+    @Test fun rootGrantRevokedMidDrainSnapshotCompletesThenNextDenied() {
+        doGrantRevokedMidDrain { spawn, grantCheck ->
+            RootSuRunner(
+                privateRoot = privateRoot,
+                bridgeGranted = GrantFixtures.bridgeOn,
+                activationCheck = GrantFixtures.activationOn,
+                spawn = spawn,
+                suBinary = "/system/bin/su",
+                grantCheck = grantCheck,
+            )
+        }
+    }
+
+    @Test fun shizukuGrantRevokedMidDrainSnapshotCompletesThenNextDenied() {
+        doGrantRevokedMidDrain { spawn, grantCheck ->
+            ShizukuShellRunner(
+                privateRoot = privateRoot,
+                bridgeGranted = GrantFixtures.bridgeOn,
+                activationCheck = GrantFixtures.activationOn,
+                pingBinder = { true },
+                spawn = spawn,
+                status = { ShizukuStatus.Available(15) },
+                grantCheck = grantCheck,
+            )
         }
     }
 }

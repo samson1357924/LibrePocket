@@ -4,6 +4,7 @@ import dev.librepocket.shell.ElevatedRequest
 import dev.librepocket.shell.PrivilegeAuditLog
 import dev.librepocket.shell.ShellPolicy
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -82,6 +83,50 @@ class ElevatedRunnerScreenshotCapacityTest {
         }
     }
 
+    @Test fun screenshot8MExactPassesBothRunners() {
+        // 恰 8M==硬讀上限：pipe 未溢出（閾值==硬讀靠溢出位區分恰過／超限），
+        // truncate(8M, 8M) 不截斷 → Ok(truncated=false)＋capture 非 null（完整幀可摘要）。
+        // 單一 8M 陣列兩 runner 共用（不重配，復大陣列模式）。
+        val exact = ByteArray(8 * 1024 * 1024) { (it and 0xFF).toByte() }
+        val runners: List<Pair<String, BinaryElevatedRunner>> = listOf(
+            "shizuku" to shizukuRunner { _ -> FakeProcess(exact, ByteArray(0), 0) },
+            "root" to rootRunner { _ -> FakeProcess(exact, ByteArray(0), 0) },
+        )
+        for ((name, runner) in runners) {
+            val b = runner.runBinary(ElevatedRequest(listOf("screencap", "-p"), "R1A-T"), 5_000L)
+            assertTrue("$name 8M exact -> $b", b is ElevatedBinaryResult.Ok)
+            b as ElevatedBinaryResult.Ok
+            assertFalse("$name must not truncate", b.truncated)
+            assertTrue("$name content", b.stdout.contentEquals(exact))
+            val audit = PrivilegeAuditLog()
+            val bytes = RootFramebufferCapture.screencapViaBinary(runner, audit, "R1A-T", 5_000L)()
+            assertTrue("$name capture must be non-null", bytes != null && bytes.contentEquals(exact))
+            assertEquals(mapOf("OK" to 1), audit.countByVerdict())
+        }
+    }
+
+    @Test fun screenshot8MPlusOneTruncatesToNull() {
+        // 8M+1：pipe 溢出一位（超硬讀即丟棄，溢出位→truncated）→ Ok(truncated=true)＋
+        // capture null（呼叫方降級手動截圖；截斷部分幀不摘要）。單一 8M+1 陣列兩 runner 共用。
+        val over = ByteArray(8 * 1024 * 1024 + 1) { (it and 0xFF).toByte() }
+        val runners: List<Pair<String, BinaryElevatedRunner>> = listOf(
+            "shizuku" to shizukuRunner { _ -> FakeProcess(over, ByteArray(0), 0) },
+            "root" to rootRunner { _ -> FakeProcess(over, ByteArray(0), 0) },
+        )
+        for ((name, runner) in runners) {
+            val b = runner.runBinary(ElevatedRequest(listOf("screencap", "-p"), "R1A-T"), 5_000L)
+            assertTrue("$name 8M+1 -> $b", b is ElevatedBinaryResult.Ok)
+            b as ElevatedBinaryResult.Ok
+            assertTrue("$name must truncate", b.truncated)
+            val audit = PrivilegeAuditLog()
+            assertNull(
+                "$name capture must be null",
+                RootFramebufferCapture.screencapViaBinary(runner, audit, "R1A-T", 5_000L)(),
+            )
+            assertEquals(mapOf("OK" to 1), audit.countByVerdict())
+        }
+    }
+
     @Test fun screenshotOver8MLargeTruncatedToNull() {
         // >8M 唯一大配置：9M 假位元組僅一次，兩 runner 共用同一陣列（不重配）。
         val big = ByteArray(9 * 1024 * 1024)
@@ -137,6 +182,88 @@ class ElevatedRunnerScreenshotCapacityTest {
             )
             assertEquals(mapOf("OK" to 1), audit.countByVerdict())
         }
+    }
+
+    @Test fun generic65KBTruncatesByMarkWithoutPipeOverflow() {
+        // 65KB：超通用 64K mark（truncated 置位）但未超 512K 硬讀（pipe 溢出不置位：
+        // clean overflow 無殘留即 flag false；stdout 被切到 64K）。雙 runner。
+        val over64k = ByteArray(65 * 1024) { (it and 0xFF).toByte() }
+        val runners: List<Pair<String, BinaryElevatedRunner>> = listOf(
+            "shizuku" to shizukuRunner { _ -> FakeProcess(over64k, ByteArray(0), 0) },
+            "root" to rootRunner { _ -> FakeProcess(over64k, ByteArray(0), 0) },
+        )
+        for ((name, runner) in runners) {
+            val b = runner.runBinary(ElevatedRequest(listOf("id"), "R1A-T"), 2_000L)
+            assertTrue("$name generic 65KB -> $b", b is ElevatedBinaryResult.Ok)
+            b as ElevatedBinaryResult.Ok
+            assertTrue("$name must truncate (64K mark)", b.truncated)
+            assertEquals(ShellPolicy.MAX_OUTPUT_BYTES, b.stdout.size)
+            assertFalse("$name clean mark must not flag", b.cleanupIncomplete)
+        }
+        // drain 層正交：65KB 未觸 pipe 溢出（Drained.truncated=false；64K mark 由
+        // runner 側 ShellPolicy.truncate 置位，見上 runner 斷言）。
+        val d = ElevatedProcessIo.drain(
+            FakeProcess(over64k, ByteArray(0), 0),
+            2_000L,
+        )
+        assertFalse(d.timedOut)
+        assertFalse("65KB must not trip pipe overflow", d.truncated)
+        assertFalse(d.readFailed)
+    }
+
+    @Test fun generic512KExactTruncatesByMarkWithoutPipeOverflow() {
+        // 恰 512K==硬讀：pipe 溢出不置位（恰上限通過），但 64K mark 必截斷 →
+        // Ok(truncated=true)，stdout 64K。雙 runner 共用單一 512K 陣列。
+        val exact = ByteArray(512 * 1024) { (it and 0xFF).toByte() }
+        val runners: List<Pair<String, BinaryElevatedRunner>> = listOf(
+            "shizuku" to shizukuRunner { _ -> FakeProcess(exact, ByteArray(0), 0) },
+            "root" to rootRunner { _ -> FakeProcess(exact, ByteArray(0), 0) },
+        )
+        for ((name, runner) in runners) {
+            val b = runner.runBinary(ElevatedRequest(listOf("id"), "R1A-T"), 2_000L)
+            assertTrue("$name generic 512K exact -> $b", b is ElevatedBinaryResult.Ok)
+            b as ElevatedBinaryResult.Ok
+            assertTrue("$name must truncate (64K mark)", b.truncated)
+            assertEquals(ShellPolicy.MAX_OUTPUT_BYTES, b.stdout.size)
+        }
+        val d = ElevatedProcessIo.drain(
+            FakeProcess(exact, ByteArray(0), 0),
+            2_000L,
+        )
+        assertFalse(d.timedOut)
+        assertFalse("512K exact must not trip pipe overflow", d.truncated)
+    }
+
+    @Test fun drainOutErrOverflowOrthogonal() {
+        // drain 直測 out/err 溢出正交（Drained.truncated = 任一流溢出 OR）：
+        // - out 600KB（超 512K）＋err 空 → truncated（out 溢出）；
+        // - out 空＋err 600KB → truncated（err 溢出，與 out 無關）；
+        // - 截圖軌 out 70KB＋err 1MB（err 超 512K 小 cap）→ truncated（err 溢出正交）；
+        // - 截圖軌 out 70KB＋err 空 → 非 truncated（任一流皆未溢出）。
+        // （64K mark 截斷由 runner 側置位，不在本層；本層只斷 pipe 溢出位。）
+        val out600k = ByteArray(600 * 1024) { (it and 0xFF).toByte() }
+        val err600k = ByteArray(600 * 1024) { 0x45.toByte() }
+        val outOverflow = ElevatedProcessIo.drain(FakeProcess(out600k, ByteArray(0), 0), 2_000L)
+        assertTrue(outOverflow.truncated)
+        val errOverflow = ElevatedProcessIo.drain(FakeProcess(ByteArray(0), err600k, 0), 2_000L)
+        assertTrue(errOverflow.truncated)
+        val png70k = ByteArray(70 * 1024) { (it and 0xFF).toByte() }
+        val err1m = ByteArray(1 * 1024 * 1024) { 0x45.toByte() }
+        val shotErrOverflow = ElevatedProcessIo.drain(
+            FakeProcess(png70k, err1m, 0),
+            2_000L,
+            ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES,
+            ShellPolicy.HARD_READ_CAP_BYTES,
+        )
+        assertTrue(shotErrOverflow.truncated)
+        val shotClean = ElevatedProcessIo.drain(
+            FakeProcess(png70k, ByteArray(0), 0),
+            2_000L,
+            ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES,
+            ShellPolicy.HARD_READ_CAP_BYTES,
+        )
+        assertFalse(shotClean.truncated)
+        assertFalse(shotClean.readFailed)
     }
 
     @Test fun generic70KBStillTruncated() {

@@ -45,7 +45,7 @@ enum class FrameSource {
  * 直接走位元組直達（無 `as?`，本體即委派 [screencapViaBinary]/[fb0ViaBinary]）；
  * 舊 `ElevatedShellRunner` 通用版標 Deprecated（行為不變，僅相容文字 runner，
  * 會損毀 PNG）。審計（R3-B）：grep 產品源集（`app/src/main`＋`app/src/github`）
- * 零呼叫，僅測試引用；產品 B3 接線應使用 Binary 多載。
+ * 零呼叫，僅測試引用；產品 #136-B3 接線應使用 Binary 多載。
  *
  * S2-B 容量矩陣（owner P2-4，僅 KDoc 文件化，行為零變更）：
  * - 典型 PNG 截圖 1-3MB：完整通過（<8M，Ok 非 truncated，capture 可摘要）；
@@ -54,7 +54,9 @@ enum class FrameSource {
  *   呼叫方降級手動截圖；截斷即 null，不摘要部分幀，見 `auditAndExtract`）；
  * - 高熵 PNG 超限同理：>8M 即 truncated→null，不分內容熵；
  * - 容量常數見 [ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES]（stdout 8M 截斷＋硬讀取）；
- *   裝置容量驗收歸 B3 E2E（見 [PrivilegeActivation]）。
+ *   pipe 保留 8M＋512K≈8.5M，非進程峰值；閾值恰等於硬讀上限（8M==8M）靠溢出位區分
+ *   恰上限通過與超限丟棄（見容量測試 8M exact／8M+1）；
+ *   裝置容量驗收歸 #136-B3 E2E（見 [PrivilegeActivation]）。
  *
  * U2-B stderr 獨立小 cap（owner P2）：截圖 stderr 維持通用軌（硬讀取 512K／
  * 截斷 64K；截圖錯誤訊息短，降 OOM 峰值）——stderr 超限同樣經 truncated→null
@@ -132,7 +134,7 @@ class RootFramebufferCapture(
          *
          * P2-A 分發說明：此處 `as? BinaryElevatedRunner` 為相容分發——
          * 僅實作 [ElevatedShellRunner] 的裝飾器（例如測試替身、舊攔截器）
-         * 即走 String 回落（lossy，僅相容文字 runner）；B3 起新 Runner
+         * 即走 String 回落（lossy，僅相容文字 runner）；#136-B3 起新 Runner
          * 應一律實作 [BinaryElevatedRunner]（多載優先：直接呼叫
          * [screencapViaBinary]/[fb0ViaBinary] 或 Binary 多載
          * [screencapViaElevated]/[fb0ViaElevated] 即走位元組直達，不經此分發）。
@@ -141,7 +143,7 @@ class RootFramebufferCapture(
          *
          * R3-B：本通用版已 Deprecated（訊息「二進位優先：傳 BinaryElevatedRunner
          * 走直達；文字 runner 僅相容，會損毀 PNG」），行為不變；新碼一律使用
-         * Binary 多載。審計（R3-B）：產品源集零呼叫，僅測試引用。B3 前相容保留，不刪除；B3 前重審移除。
+         * Binary 多載。審計（R3-B）：產品源集零呼叫，僅測試引用。#136-B3 前相容保留，不刪除；#136-B3 前重審移除。
          */
         @Deprecated("二進位優先：傳 BinaryElevatedRunner 走直達；文字 runner 僅相容，會損毀 PNG")
         fun screencapViaElevated(
@@ -172,7 +174,7 @@ class RootFramebufferCapture(
          *
          * R3-B：本通用版已 Deprecated（訊息同 [screencapViaElevated]），行為不變；
          * 新碼一律使用 Binary 多載 [fb0ViaElevated]。審計（R3-B）：產品源集零呼叫，
-         * 僅測試引用。B3 前相容保留，不刪除；B3 前重審移除。
+         * 僅測試引用。#136-B3 前相容保留，不刪除；#136-B3 前重審移除。
          */
         @Deprecated("二進位優先：傳 BinaryElevatedRunner 走直達；文字 runner 僅相容，會損毀 PNG")
         fun fb0ViaElevated(
@@ -196,7 +198,7 @@ class RootFramebufferCapture(
         /**
          * R3-B 二進位-only 多載版 screencap：首參為 [BinaryElevatedRunner] 即
          * 直接走位元組直達（本體即委派 [screencapViaBinary]，無 `as?` 分發）。
-         * 產品 B3 接線應使用本多載；文字 runner 僅走上方 Deprecated 通用版
+         * 產品 #136-B3 接線應使用本多載；文字 runner 僅走上方 Deprecated 通用版
          * （相容，會損毀 PNG）。
          */
         fun screencapViaElevated(

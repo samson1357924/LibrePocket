@@ -32,8 +32,8 @@ import java.lang.reflect.InaccessibleObjectException
  * `descendants` 的新平台才真整組，舊平台一律 fallback 單殺 `destroyForcibly`
  * （即上表；版本漂移一律收斂，不崩）。best-effort 單殺，裝置缺口未解；
  * B2 runner 清理驗收未過；activation blocker 見 [PrivilegeActivation]
- * （[PrivilegeActivation.ELEVATED_RUNNERS_READY] 仍 `false`，B1 未完，產品不得接線 runner；
- * 子孫清理裝置 E2E 歸 B3）。
+ * （[PrivilegeActivation.ELEVATED_RUNNERS_READY] 仍 `false`，#136-B1 未完，產品不得接線 runner；
+ * 子孫清理裝置 E2E 歸 #136-B3）。
  *
  * 誠實化（P1-B，行為不變；Y1 去串流關閉，契約見下）：
  * - Android 上 `Process.toHandle`/`descendants` 若不可用（舊版本缺席，或
@@ -52,7 +52,7 @@ import java.lang.reflect.InaccessibleObjectException
  * process 實例）＋ `ProcessHandle` 宣告類查
  * `descendants/destroy/destroyForcibly`；`InaccessibleObjectException`
  * 明確收斂（另見內聯註）。JVM 真子進程單測已驗（父死＋子孫無存活，見
- * `ElevatedProcessKillerTest`）；裝置 SELinux/Root 語義差異 E2E 為 B3。
+ * `ElevatedProcessKillerTest`）；裝置 SELinux/Root 語義差異 E2E 為 #136-B3。
  *
  * - 子孫列舉經反射（`Process.toHandle/descendants`，JDK 9+；API 缺席時
  *   runCatching 收斂為僅殺本體，不崩）；

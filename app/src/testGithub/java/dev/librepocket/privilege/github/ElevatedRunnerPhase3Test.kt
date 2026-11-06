@@ -29,7 +29,7 @@ import org.junit.Test
  *   存在性不注，見 rootExplicitSuBinaryUntrustedFailsClosedWithoutSpawn）；
  * - 撕裂讀契約：混代（新 provider＋舊 revision 或反之）一律 Invalid；
  * - Redactor 路徑覆蓋邊界 pin（保守保留 redact，僅鎖定邊界）；
- * - P3-1 pin：serviceVersion／TTL 不參與有效性（現行為 Valid，B3 另綁）。
+ * - P3-1 pin：serviceVersion／TTL 不參與有效性（現行為 Valid，#136-B3 另綁）。
  *
  * 全 fake（假進程＋假 su 映射＋假狀態＋計數 spawn），零真機、零真 su、零真 binder。
  * 背景執行緒只為驅動「慢門阻塞中翻轉」；latch 上界 10s，超界即失敗，不懸掛。
@@ -394,7 +394,7 @@ class ElevatedRunnerPhase3Test {
     // ---- 撕裂讀契約：混代一律 Invalid ----
 
     @Test fun grantMixedGenerationTornReadFailsClosed() {
-        // B3 須以 snapshotWithRevisionStrict 同 emission 供給 provider＋revision
+        // #136-B3 須以 snapshotWithRevisionStrict 同 emission 供給 provider＋revision
         //（見 ShizukuGrantStore.check KDoc）；混代組合經 policy 仍為 Invalid，
         // runner 早拒／重求值任一混代即拒，禁止放行重試。
         val grant = ShizukuGrantPolicy.grant("provider-a", 1L, 15)
@@ -436,7 +436,7 @@ class ElevatedRunnerPhase3Test {
 
     @Test fun grantServiceVersionAndTtlNotEnforced_pinsCurrentBehavior() {
         // P3-1 現狀 pin（行為不變）：serviceVersion 變更不影響有效性；
-        // 無 TTL（grantedAtMs 任意值皆 Valid）。B3 另行綁定 serviceVersion／TTL
+        // 無 TTL（grantedAtMs 任意值皆 Valid）。#136-B3 另行綁定 serviceVersion／TTL
         // 前不得假設本層會過期舊授權；未來加綁定時須同步更新本測試。
         val old = ShizukuGrantPolicy.grant("p", 1L, 11, atMs = 0L)
         assertTrue("${ShizukuGrantPolicy.check(old, "p", 1L)}", ShizukuGrantPolicy.check(old, "p", 1L) is GrantCheck.Valid)

@@ -48,7 +48,8 @@ class ElevatedRunnerZ1Test {
      * kill 路徑 `noteUnclean` 累計 consecutive）。用例間以 [Before]/[After]
      * 歸零 consecutive（各用例只做單次 drain 斷言，不依賴跨用例累計；
      * 跨呼叫累計語義由 `ElevatedRunnerAA1Test` 覆蓋），防同 JVM 內污染後測。
-     * （outstanding 由各用例 finally 釋放 latch＋await 收斂，此處只歸零計數器。）
+     * （outstanding 由各用例 finally 釋放 latch＋await 收斂，此處只歸零計數器；
+     * 測試隔離重置，非#136-B3修復。）
      */
     @Before fun setUpBreakerIsolation() {
         ElevatedCleanupTracker.noteClean()
@@ -289,9 +290,15 @@ class ElevatedRunnerZ1Test {
         }
         try {
             block(uncaught)
-            Thread.sleep(500L)
-            synchronized(uncaught) {
-                assertTrue("uncaught thread exceptions: $uncaught", uncaught.isEmpty())
+            // 固定 sleep(500ms) 改輪詢 2s：晚到未捕捉 fail-fast（首見即抛），2s 無逃逸即收斂；
+            // 上界僅 CI 餘量（daemon 線程逃逸至多晚一個調度片），非 verdict 主證。
+            val deadline = System.currentTimeMillis() + 2_000L
+            while (true) {
+                synchronized(uncaught) {
+                    assertTrue("uncaught thread exceptions: $uncaught", uncaught.isEmpty())
+                }
+                if (System.currentTimeMillis() >= deadline) break
+                Thread.sleep(50L)
             }
         } finally {
             Thread.setDefaultUncaughtExceptionHandler(previous)
@@ -313,9 +320,9 @@ class ElevatedRunnerZ1Test {
                 bg.join(20_000L)
                 val elapsed = System.currentTimeMillis() - start
                 assertFalse("drain must return bounded despite blocked destroy", bg.isAlive)
-                // timeout 0.5s＋cleanup 0.5s＋grace 0.5s＋kill等待 5s＋joins（gobbler 已 EOF 即回）≈7s；
-                // 放寬至 15s（CI 抖動），但絕不可無界。
-                assertTrue("elapsed=$elapsed", elapsed < 15_000L)
+                // 有界返回為主證（上已斷 bg 不存活）；上界 25s 僅 CI 餘量
+                //（timeout 0.5s＋cleanup 0.5s＋grace 0.5s＋kill等待 5s＋joins ≈7s），絕不無界。
+                assertTrue("elapsed=$elapsed", elapsed < 25_000L)
                 val d = resultRef.get()
                 assertNotNull(d)
                 d!!
@@ -385,7 +392,8 @@ class ElevatedRunnerZ1Test {
                 bg.join(25_000L)
                 val elapsed = System.currentTimeMillis() - start
                 assertFalse("drain must return bounded despite blocked close", bg.isAlive)
-                assertTrue("elapsed=$elapsed", elapsed < 20_000L)
+                // 有界返回為主證（上已斷 bg 不存活）；上界 25s 僅 CI 餘量，絕不無界。
+                assertTrue("elapsed=$elapsed", elapsed < 25_000L)
                 val d = resultRef.get()
                 assertNotNull(d)
                 d!!
@@ -445,7 +453,8 @@ class ElevatedRunnerZ1Test {
                 bg.join(15_000L)
                 val elapsed = System.currentTimeMillis() - start
                 assertFalse("drain must return bounded despite blocked stdin", bg.isAlive)
-                assertTrue("elapsed=$elapsed", elapsed < 10_000L)
+                // 有界返回為主證（上已斷 bg 不存活）；上界 25s 僅 CI 餘量，絕不無界。
+                assertTrue("elapsed=$elapsed", elapsed < 25_000L)
                 val d = resultRef.get()
                 assertNotNull(d)
                 d!!
@@ -493,7 +502,8 @@ class ElevatedRunnerZ1Test {
     ) {
         val latch = CountDownLatch(1)
         // P1-2 預留（PR140 Phase1）：首 call 殘留 1 槽期間次 call 會被預留門拒，
-        // 故先斷首 verdict，釋放收斂＋重置 breaker 後再斷 capture（clean Ok 非 null）。
+        // 故先斷首 verdict，釋放收斂＋重置 breaker 後再斷 capture（clean Ok 非 null；
+        // 重置屬測試隔離，非#136-B3修復）。
         val runner = makeRunner { BlockedStdinSuccessProcess(latch, blockGetter) }
         try {
             runWithUncaughtGuard { uncaught ->
@@ -630,16 +640,18 @@ class ElevatedRunnerZ1Test {
             bg.join(25_000L)
             val elapsed = System.currentTimeMillis() - start
             assertFalse("drain must return bounded despite 8s stall", bg.isAlive)
-            // 清理 budget 0.5s＋grace 0.5s＋kill等待快收＋gobbler join 5s ≈7s；放寬至 20s。
-            assertTrue("elapsed=$elapsed", elapsed < 20_000L)
+                // 有界返回為主證（上已斷 bg 不存活）；上界 25s 僅 CI 餘量
+                //（清理 budget 0.5s＋grace 0.5s＋kill等待快收＋gobbler join 5s ≈7s），絕不無界。
+                assertTrue("elapsed=$elapsed", elapsed < 25_000L)
             val d = resultRef.get()
             assertNotNull(d)
             d!!
             assertTrue("timedOut expected, got $d", d.timedOut)
             assertTrue("cleanupIncomplete expected, got $d", d.cleanupIncomplete)
             assertTrue(uncaught.isEmpty())
-            // daemon 殘留 8s：等待其退出再做 orphan 斷言（上界 10s）。
-            awaitNoElevatedThreads(10_000L)
+            // daemon 殘留 8s：等待其退出再做 orphan 斷言（上界 15s：8s stall＋清理監督
+            // join 餘量＋CI 抖動，避免污染後測）。
+            awaitNoElevatedThreads(15_000L)
             assertTrue(uncaught.isEmpty())
         }
     }

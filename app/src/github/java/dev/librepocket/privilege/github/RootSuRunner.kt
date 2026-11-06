@@ -58,7 +58,7 @@ import java.io.File
  *
  * R2-A 可驗證化（owner P1-1）：`su -c` 拉起的子孫經同一
  * [ElevatedProcessKiller.killTree] 清理（宣告類查表，JVM 真子進程已驗，
- * 見 `ElevatedProcessKillerTest`）；裝置側 SELinux/Root 語義差異 E2E 為 B3。
+ * 見 `ElevatedProcessKillerTest`）；裝置側 SELinux/Root 語義差異 E2E 為 #136-B3。
  *
  * 注入說明（雙注入保留，不合併，避免 API 破壞）：[suBinary] 為直接覆寫的
  * 候選 su 路徑（測試／呼叫方可釘死，仍須過可信判定），[suExists] 為解析時
@@ -69,15 +69,17 @@ import java.io.File
  * 每次 [runBinary] 呼叫新鮮求值 [grantCheck]（構造時只存 supplier，不快取結果；
  * 同一實例跨 call 翻轉即拒，見 runner grant 測試的 flipsAcrossCalls）。
  * [grantCheck] 為必填參數（mandatory dependency，無預設值；缺接線編譯失敗，
- * 一律零 spawn）：呼叫方必須每次供給新鮮 [GrantCheck]，產品 B3 供給
+ * 一律零 spawn）：呼叫方必須每次供給新鮮 [GrantCheck]，產品 #136-B3 供給
  * `{ store.check(freshProviderId, freshRevision) }`
- *（blocking 包裝由 B3 決定，runner 非 suspend 故不能直調 suspend DataStore；
+ *（blocking 包裝由 #136-B3 決定，runner 非 suspend 故不能直調 suspend DataStore；
  * blocking 包裝契約——IO dispatcher 單發射讀 grant DataStore＋
  * `snapshotWithRevisionStrict` 同 emission 取 endpoint 身分／revision＋永不快取＋
  * 撕裂讀禁用——見 [ShizukuGrantStore.check] KDoc，本 runner 側只消費 supplier，
  * 不自建快取）；
  * [GrantCheck.Invalid] 一律 `Denied(NOT_WHITELISTED, reason)` 且零 spawn，
  * [grantCheck] 抛異常同樣 fail-closed `Denied(NOT_WHITELISTED)` 且零 spawn。
+ * 快照語義：spawn 成功後 drain 不再重估 grant；mid-drain 撤銷不影響當次
+ * （當次按進入時快照完成，次 call 才拒，見 grant 測試 mid-drain 翻轉用例）。
  *
  * Phase3 spawn 前重求值（TOCTOU 收斂，行為見 `ElevatedRunnerPhase3Test`）：
  * 准入（[ElevatedCleanupTracker.tryEnterReserved]）已占席後、配額
@@ -99,7 +101,7 @@ import java.io.File
  * 翻轉造成政策與門禁不一致；同一實例跨 call 翻轉即拒，
  * 見 runner grant 測試的 bridge 翻轉用例）。
  * - [activationCheck] 預設讀 [PrivilegeActivation.ELEVATED_RUNNERS_READY]
- *   （現 `false` 即 default-deny；B3 產品傳明示 allow＋每次重驗，不得快取）；
+ *   （現 `false` 即 default-deny；#136-B3 產品傳明示 allow＋每次重驗，不得快取）；
  *   未就緒即 `Denied(NOT_WHITELISTED, "activation not ready")` 且零 spawn，
  *   抛異常同樣 fail-closed `Denied(NOT_WHITELISTED)` 且零 spawn；
  * - [bridgeGranted] 預設 `{ false }`（default-deny）；`false` 即
@@ -113,7 +115,7 @@ import java.io.File
  *
  * 產品接線門：[PrivilegeActivation.ELEVATED_RUNNERS_READY] 已被兩 runner 經
  * `activationCheck` 預設消費（default-deny，未就緒一律零 spawn）；
- * B3 接線時傳明示 allow＋每次重驗。
+ * #136-B3 接線時傳明示 allow＋每次重驗。
  *
  * R1-A 雙軌容量（Issue #136 R1-A，owner P1-2；U2-B 細化 stderr，owner P2）：
  * 截圖二進位（`screencap -p` / `cat /dev/graphics/fb0`，argv 精確匹配）走
@@ -121,6 +123,9 @@ import java.io.File
  * [ElevatedProcessIo.BINARY_SCREENSHOT_HARD_CAP_BYTES] 硬讀取，OOM 上界 stdout 8M），
  * stderr 維持通用軌（[ShellPolicy.MAX_OUTPUT_BYTES] 64K 截斷＋
  * [ShellPolicy.HARD_READ_CAP_BYTES] 512K 硬讀取；截圖錯誤訊息短，降 OOM 峰值）；
+ * pipe 保留 8M＋512K≈8.5M，非進程峰值（另含拷貝＋防禦複製，見 [ElevatedProcessIo]
+ * V2 OOM 峰值說明）；閾值恰等於硬讀上限（8M==8M）靠溢出位區分恰上限通過與超限丟棄
+ * （溢出即 truncated；恰 8M 通過不截斷，見容量測試 8M exact／8M+1）；
  * 其餘通用命令走舊 64K/512K 軌（[ShellPolicy.MAX_OUTPUT_BYTES]／
  * [ShellPolicy.HARD_READ_CAP_BYTES]）。[BinaryElevatedRunner] 介面簽名不變。
  *
@@ -139,7 +144,7 @@ import java.io.File
  * AA1 資源門（owner 新 P1＋P2）：[ElevatedCleanupTracker.isSaturated] 即拒
  * `Denied(QUOTA_EXCEEDED, "elevated cleanup backlog full...")` 且零 spawn
  * （與 quota 同級，位於配額門前，飽和拒絕不耗配額；飽和＝有不可回收清理，
- * B3 需介入）。終審殘留第二條件：[ElevatedCleanupTracker.isBreakerOpen]
+ * #136-B3 需介入）。終審殘留第二條件：[ElevatedCleanupTracker.isBreakerOpen]
  * （連續不清創達上限）即拒 `Denied(QUOTA_EXCEEDED,
  * "elevated cleanup breaker open...")` 且零 spawn、不耗配額（訊息區分兩因）。
  * drain 層飽和仍嘗試監督清理（永不跳過 killer）；本旗標經
@@ -148,7 +153,7 @@ import java.io.File
  *
  * AB1 呼叫級准入（owner 新 P1-A＋P1-B）：飽和／熔斷門之後、配額之前
  * 單一原子 [ElevatedCleanupTracker.tryEnterReserved]（同一鎖內檢查＋佔席，
- * 上限 [ElevatedCleanupTracker.MAX_CONCURRENT_CALLS]＝4，特權通道宜序列，B3 可調）；
+ * 上限 [ElevatedCleanupTracker.MAX_CONCURRENT_CALLS]＝4，特權通道宜序列，#136-B3 可調）；
  * 滿即拒 `Denied(QUOTA_EXCEEDED, "elevated concurrency full...")` 且零 spawn、
  * 不耗配額；成功後整個剩餘 runBinary 包 `try { ... } finally { leaveCall() }`
  * （配額拒、spawn 抛、drain 全路徑釋放）。
@@ -263,7 +268,7 @@ class RootSuRunner(
         // 單一 [ElevatedCleanupTracker.tryEnterReserved] 原子決定（飽和／熔斷／
         // 併發預留同一鎖內檢查＋佔席，消除三段檢查 TOCTOU；3 backlog＋4 併發最壞
         // 19 槽（每 call 4 槽上界）經預留 `outstanding+(active+1)*4<=MAX` 截斷，
-        // 實效接近串行，特權宜序列，B3 可調 MAX／SLOTS）。
+        // 實效接近串行，特權宜序列，#136-B3 可調 MAX／SLOTS）。
         // 拒絕原因僅供訊息區分（backlog vs breaker vs concurrency），准入決定原子。
         when (ElevatedCleanupTracker.tryEnterReserved()) {
             ElevatedCleanupTracker.Admission.OK -> Unit
@@ -442,7 +447,7 @@ class RootSuRunner(
      * 不靜默續行：靜默回落到預設 cwd 會讓相對路徑解析到不可控目錄。
      *
      * 真機路徑（僅真機／裝置驗收調用，JVM 單測一律注入假 `spawn`，
-     * 不得直調本函數；需真子進程驗收歸 B3 E2E）。
+     * 不得直調本函數；需真子進程驗收歸 #136-B3 E2E）。
      */
     private fun pinnedSpawn(argv: List<String>): Process {
         val pb = ProcessBuilder(argv)

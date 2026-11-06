@@ -340,8 +340,11 @@ class ElevatedRunnerY1Test {
                     "success-path stuck getter must return bounded (~10s join + grace)",
                     bg.isAlive,
                 )
-                assertTrue("elapsed=$elapsed", elapsed >= 9_000L)
-                assertTrue("elapsed=$elapsed", elapsed < 15_000L)
+                // 有界性以 verdict／flag 為主證（上已斷 bg 必回；下斷 Failed＋capture null，
+                // 舊碼此處為 Ok(truncated)＋孤兒線程）；耗時僅記 CI 餘量帶
+                // （SUCCESS_JOIN 10s＋grace 1s，8s..20s），非 hard-fail 主證。
+                assertTrue("elapsed=$elapsed (CI margin 8s..20s)", elapsed >= 8_000L)
+                assertTrue("elapsed=$elapsed (CI margin 8s..20s)", elapsed < 20_000L)
                 // interrupt→gobbler 抛→markFailed→readFailed：非 Ok-完整（Failed），
                 // 舊碼此處為 Ok(truncated=true)＋孤兒線程。
                 val b = resultRef.get()

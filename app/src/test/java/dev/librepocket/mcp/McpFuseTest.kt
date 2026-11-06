@@ -1,6 +1,8 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkEgressPolicy
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
@@ -42,12 +44,22 @@ class McpFuseTest {
         id: String = "s1",
         keyId: String = "mcp:s1",
     ): McpServer = McpServer(
-        config = McpServerConfig(id = id, baseUrl = web.url("/").toString(), keyId = keyId),
+        // A3：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in；
+        // production 預設仍 deny-all（HTTPS_ONLY）。
+        config = McpServerConfig(
+            id = id,
+            baseUrl = web.url("/").toString(),
+            keyId = keyId,
+            networkOptIn = loopbackOptIn,
+        ),
         keyVault = FakeVault(),
         transport = McpTransport(),
         breaker = breaker,
         clockMs = clock::get,
     )
+
+    // A3 loopback 明文 opt-in（見上）。
+    private val loopbackOptIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
 
     private fun okCall(): MockResponse {
         val body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"isError\":false}}"
@@ -108,7 +120,12 @@ class McpFuseTest {
                 override suspend fun hasKey(providerId: String): Boolean = error("no hasKey")
             }
             val s = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), keyId = "mcp:s1"),
+                config = McpServerConfig(
+                    id = "s1",
+                    baseUrl = web.url("/").toString(),
+                    keyId = "mcp:s1",
+                    networkOptIn = loopbackOptIn,
+                ),
                 keyVault = vaultMustNotBeRead,
                 transport = McpTransport(),
                 breaker = breaker,
@@ -402,7 +419,7 @@ class McpFuseTest {
             web.enqueue(MockResponse().setResponseCode(200).setBody(goodListBody()))
             val clock = Clock(0L)
             val s = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/custom/path").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/custom/path").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(clockMs = clock::get),
@@ -524,7 +541,7 @@ class McpFuseTest {
             // bare-origin 無尾斜線（如 http://host:port）同樣打到 /mcp。
             val bareNoSlash = web.url("/").toString().trimEnd('/')
             val s = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = bareNoSlash),
+                config = McpServerConfig(id = "s1", baseUrl = bareNoSlash, networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(clockMs = clock::get),
@@ -548,7 +565,7 @@ class McpFuseTest {
             val clock = Clock(0L)
             // 自訂 path 尾斜線原樣保留：server 若區分 /api/mcp/ 與 /api/mcp，不得正規化掉。
             val s = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/api/mcp/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/api/mcp/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(clockMs = clock::get),

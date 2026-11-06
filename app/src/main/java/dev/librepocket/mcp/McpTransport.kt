@@ -1,5 +1,11 @@
 package dev.librepocket.mcp
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.HostResolver
+import dev.librepocket.policy.NetworkDenyCode
+import dev.librepocket.policy.NetworkEvaluation
+import dev.librepocket.policy.NetworkPolicy
+import dev.librepocket.policy.SystemHostResolver
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
@@ -41,7 +47,8 @@ import okio.BufferedSink
  * - [bearer] 只放 `Authorization` 標頭，永不拼進 body，不寫 log；
  * - 呼叫方（[McpServer]）負責從 KeyVault 取 key、用後即擦，本層不留存；
  * - 僅放行 `https` 與回環 `http`（見 [McpWire.requireSecureEndpoint]，
- *   直調亦擋；其餘明文拋 `McpProtocol`）；
+ *   直調亦擋；其餘明文拋 `McpProtocol`；回環／私有 `http` 另需政策閘
+ *   [requireMcpNetworkPolicyAllowed] 的 opt-in 放行，預設 deny-all）；
  * - 不自動跟隨 redirect：3xx 為終端回應（[McpServer] 映射 PROTOCOL + 計熔斷），
  *   `tools/call` body／Bearer 只會送到預驗過的初始端點；
  *   注入的 client 經 [transportClient] 強制套用 redirect／連線失敗重試／503 重送／
@@ -144,6 +151,8 @@ class McpTransport(
         bearer: String,
         bodyJson: String,
         timeoutMs: Long,
+        optIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+        resolver: HostResolver = SystemHostResolver,
     ): Pair<Int, String?>? {
         // 縱深：直調 transport 亦 fail-closed（McpServer 已預驗，此處僅防直調）。
         try {
@@ -158,6 +167,12 @@ class McpTransport(
         }
         // bare-origin 相容：無 path 時 endpoint() 自動補 /mcp（舊配置相容，建議記 warning 提醒手動補完整 path）。
         val url = McpWire.endpoint(baseUrl)
+        // A3 (Issue #135 A3)：建連前政策閘——讀 key／建連之前已由 McpServer
+        // 預驗，此處防直調繞過。拒絕即 typed fatal [McpNetworkPolicyBlocked]
+        //（deny code 可辨、不重試），不傳送 credential／body、不建連。
+        // metadata／link-local／multicast／unspecified／CGNAT 永遠阻擋
+        //（opt-in 也打不開，見 [NetworkPolicy.mergeClass] 最嚴勝出）。
+        requireMcpNetworkPolicyAllowed(url, optIn, resolver)
         // 可觀測性：自動補 /mcp 時記 warning（runCatching 使 JVM 單測無 mocked Log 仍綠）。
         if (McpWire.isBareOrigin(baseUrl)) {
             runCatching {
@@ -244,6 +259,43 @@ class McpTransport(
         }
     }
 }
+
+/**
+ * A3 (Issue #135 A3)：MCP 建連前政策閘（對齊 provider
+ * `requireNetworkPolicyAllowed`）。
+ *
+ * 呼叫方（[McpServer.listTools]／[McpServer.callTool]）必須在讀 key、組 body
+ * 之後、發送之前先調此閘（McpServer 另在 vault read 之前預驗一次）；
+ * 直調 [McpTransport.postJson] 亦經此閘。拒絕即 typed fatal
+ * [McpNetworkPolicyBlocked]（deny code 可辨、不重試——MCP 單次預算本就無重試），
+ * 不傳送 credential／body、不建連。
+ *
+ * Redirect 執行面：本層 0-follow（見 `transportClient`），3xx 由 [McpServer]
+ * 映射 PROTOCOL + 計熔斷（即 REDIRECT_BLOCKED 語義：跳轉目標永不被跟隨、
+ * credential／body 永不重送，`Location` 亦不觸發 DNS 解析）。
+ */
+internal fun requireMcpNetworkPolicyAllowed(
+    rawUrl: String,
+    optIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+    resolver: HostResolver = SystemHostResolver,
+): NetworkEvaluation {
+    val eval = NetworkPolicy.evaluateUrl(rawUrl, optIn, resolver)
+    if (!eval.allowed) throw McpNetworkPolicyBlocked(eval.denyCode ?: NetworkDenyCode.INVALID_HOST)
+    return eval
+}
+
+/**
+ * 政策阻擋 typed fatal（A3）：與 [McpWire.McpProtocol] 平級的獨立例外
+ * （同為 [IllegalArgumentException] 子類、型別不相交）。[McpServer] 以專屬
+ * catch 先攔（配置錯誤姿態：PROTOCOL、不計熔斷、不碰 vault），再由
+ * `catch (McpProtocol) → PROTOCOL + 計熔斷` 兜底——順序不得顛倒，
+ * 否則阻擋會落到熔斷計數分支。
+ *
+ * 訊息僅帶 deny code（`mcp: network policy blocked:<CODE>`），不含 URL、
+ * 位址、credential——[NetworkEvaluation.resolvedAddresses] 永不進錯誤面。
+ */
+internal class McpNetworkPolicyBlocked(val denyCode: NetworkDenyCode) :
+    IllegalArgumentException("mcp: network policy blocked:${denyCode.name}")
 
 /**
  * 本層唯一的 JSON media type（top-level：[OneShotJsonBody] 共用）。

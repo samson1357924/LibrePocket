@@ -1,6 +1,8 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkEgressPolicy
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.mockwebserver.MockResponse
@@ -38,11 +40,20 @@ class McpHttpBudgetMatrixTest {
     }
 
     private fun server(web: MockWebServer, breaker: McpCircuitBreaker) = McpServer(
-        config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+        // A3：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in；
+        // production 預設仍 deny-all（HTTPS_ONLY）。
+        config = McpServerConfig(
+            id = "s1",
+            baseUrl = web.url("/").toString(),
+            networkOptIn = loopbackOptIn,
+        ),
         keyVault = FakeVault(),
         transport = McpTransport(),
         breaker = breaker,
     )
+
+    // A3 loopback 明文 opt-in（見上）。
+    private val loopbackOptIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
 
     private fun redirect(code: Int, location: String) = MockResponse()
         .setResponseCode(code)

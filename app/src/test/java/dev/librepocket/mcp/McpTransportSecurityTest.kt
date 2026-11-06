@@ -1,6 +1,8 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkEgressPolicy
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
@@ -42,11 +44,19 @@ class McpTransportSecurityTest {
     }
 
     private fun server(web: MockWebServer, breaker: McpCircuitBreaker) = McpServer(
-        config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+        config = McpServerConfig(
+            id = "s1",
+            baseUrl = web.url("/").toString(),
+            networkOptIn = loopbackOptIn,
+        ),
         keyVault = FakeVault(),
         transport = McpTransport(),
         breaker = breaker,
     )
+
+    // A3：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in；
+    // production 預設仍 deny-all（HTTPS_ONLY）。
+    private val loopbackOptIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
 
     private fun redirect(code: Int, location: String) = MockResponse()
         .setResponseCode(code)
@@ -209,7 +219,11 @@ class McpTransportSecurityTest {
                 .build()
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = origin.url("/").toString()),
+                config = McpServerConfig(
+                    id = "s1",
+                    baseUrl = origin.url("/").toString(),
+                    networkOptIn = loopbackOptIn,
+                ),
                 keyVault = FakeVault(),
                 transport = McpTransport(permissive),
                 breaker = breaker,

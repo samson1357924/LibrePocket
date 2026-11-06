@@ -1,76 +1,346 @@
 package dev.librepocket.tool
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.HostResolver
+import dev.librepocket.policy.NetworkDenyCode
+import dev.librepocket.policy.NetworkEgressPolicy
+import dev.librepocket.policy.NetworkPolicy
+import java.net.InetAddress
+import java.net.UnknownHostException
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import okhttp3.Call
+import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okio.Buffer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * S1-B `web.fetch` / `web.search` 測試：https-only 策略、maxBytes 截斷、
- * 15s 超時可配、轉碼降級、開關預設（webfetch 開 / websearch 關）。
- * 全程 MockWebServer（本地迴環 http 允許），不連外網。
+ * S1-B `web.fetch` / `web.search` 測試＋Issue #135 A4 接線測試。
+ *
+ * A4 後 URL 檢查走 [NetworkPolicy.evaluateUrl]（per-endpoint opt-in，預設
+ * deny-all）：迴環 http 須 `ALLOW_CLEARTEXT_PRIVATE` 才放行；redirect 逐跳重驗，
+ * 跳轉失敗一律 typed `REDIRECT_BLOCKED`；建連走 per-fetch DNS pin＋直連。
+ * 全程 MockWebServer（本地迴環，配 opt-in）／fake [HostResolver]，
+ * 禁真網路、禁真 DNS。
  */
 class WebFetchTest {
 
-    // ---- URL 策略（純函數，不觸碰網路） ----
+    private val cleartextPrivate = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
+
+    /**
+     * Fake DNS：精確表查詢；字面 IP 走 [NetworkPolicy.parseLiteralIp]
+     *（純解析，不觸網）；`localhost` 固定回 `127.0.0.1`；其餘一律拋
+     * [UnknownHostException]（如 NXDOMAIN，fail-closed）。
+     */
+    private fun fakeDns(vararg entries: Pair<String, List<String>>): HostResolver {
+        val table = entries.toMap()
+        return HostResolver { host ->
+            table[host]?.map { InetAddress.getByName(it) }
+                ?: NetworkPolicy.parseLiteralIp(host)?.let { listOf(it) }
+                ?: if (host == "localhost") listOf(InetAddress.getByName("127.0.0.1"))
+                else throw UnknownHostException(host)
+        }
+    }
+
+    private fun loopbackDns(): HostResolver = fakeDns("localhost" to listOf("127.0.0.1"))
+
+    private fun assertBlocked(code: String, check: WebFetch.UrlCheck) {
+        assertTrue("expected Blocked, got: $check", check is WebFetch.UrlCheck.Blocked)
+        val blocked = check as WebFetch.UrlCheck.Blocked
+        assertEquals(DenyReason.NO_PRIVILEGE, blocked.reason)
+        assertEquals(code, blocked.detail)
+    }
+
+    private fun assertUnavailable(code: String, outcome: WebFetch.FetchOutcome) {
+        assertTrue("expected Unavailable, got: $outcome", outcome is WebFetch.FetchOutcome.Unavailable)
+        val u = outcome as WebFetch.FetchOutcome.Unavailable
+        assertEquals(DenyReason.NO_PRIVILEGE, u.reason)
+        assertEquals(code, u.detail)
+        assertTrue(u.message.contains("做不到") && u.message.contains("NO_PRIVILEGE"))
+    }
+
+    // ---- URL 策略（走 NetworkPolicy；一律注 fake Dns） ----
 
     @Test fun httpsIsAllowed() {
-        val check = WebFetch.checkUrl("https://example.com/a?q=1")
-        assertTrue(check is WebFetch.UrlCheck.Allowed)
+        // 正向：公網 https fixture 在預設 opt-in 下 PASS。
+        val dns = fakeDns("example.com" to listOf("203.0.113.7"))
+        val check = WebFetch.checkUrl("https://example.com/a?q=1", resolver = dns)
+        assertTrue("expected Allowed, got: $check", check is WebFetch.UrlCheck.Allowed)
     }
 
     @Test fun nonLocalHttpIsBlockedBeforeAnyNetwork() {
+        val dns = fakeDns("example.com" to listOf("203.0.113.7"))
         for (url in listOf("http://example.com/", "http://203.0.113.7:8080/x", "http://[2001:db8::1]/")) {
-            val check = WebFetch.checkUrl(url)
-            assertTrue(url, check is WebFetch.UrlCheck.Blocked)
-            val blocked = check as WebFetch.UrlCheck.Blocked
-            assertEquals(DenyReason.NO_PRIVILEGE, blocked.reason)
-            assertEquals("CLEARTEXT_NON_LOCAL", blocked.detail)
+            val check = WebFetch.checkUrl(url, resolver = dns)
+            assertBlocked(NetworkDenyCode.CLEARTEXT_NOT_PERMITTED.name, check)
         }
     }
+
+    @Test fun tenEvilComHttpIsRejectedByBytesNotPrefix() {
+        // `10.evil.com` 是 DNS 名（解析後公網），絕不能被當成 10/8 放行 http。
+        val dns = fakeDns("10.evil.com" to listOf("203.0.113.7"))
+        assertBlocked(
+            NetworkDenyCode.CLEARTEXT_NOT_PERMITTED.name,
+            WebFetch.checkUrl("http://10.evil.com/", resolver = dns),
+        )
+        // 同一 host 走 https 放行，證明它沒被當成私有。
+        val https = WebFetch.checkUrl("https://10.evil.com/v1", resolver = dns)
+        assertTrue("expected Allowed, got: $https", https is WebFetch.UrlCheck.Allowed)
+        // fetch 層同樣 fail-closed（不起 server：政策短路，零建連）。
+        assertUnavailable(
+            NetworkDenyCode.CLEARTEXT_NOT_PERMITTED.name,
+            WebFetch.fetch("http://10.evil.com/", resolver = dns),
+        )
+    }
+
+    @Test fun loopbackHttpNeedsCleartextOptIn() {
+        // 正向：迴環 http 在 opt-in 下 PASS；預設 deny-all 先拒。
+        val dns = loopbackDns()
+        for (url in listOf(
+            "http://localhost:8080/x",
+            "http://127.0.0.1:9/",
+            "http://127.0.0.2/",
+            "http://[::1]:8080/",
+        )) {
+            assertBlocked(
+                NetworkDenyCode.CLEARTEXT_NOT_PERMITTED.name,
+                WebFetch.checkUrl(url, resolver = dns),
+            )
+            val allowed = WebFetch.checkUrl(url, optIn = cleartextPrivate, resolver = dns)
+            assertTrue("$url expected Allowed, got: $allowed", allowed is WebFetch.UrlCheck.Allowed)
+        }
+    }
+
+    @Test fun loopbackHttpFetchSucceedsWithOptIn() {
+        // 正向：迴環 http＋opt-in 真實抓取（MockWebServer＋fake DNS＋pin＋直連）。
+        val server = MockWebServer()
+        try {
+            server.enqueue(MockResponse().setResponseCode(200).setBody("hello-loopback"))
+            val url = server.url("/").toString()
+            val outcome = WebFetch.fetch(url, optIn = cleartextPrivate, resolver = loopbackDns())
+            assertTrue("expected Ok, got: $outcome", outcome is WebFetch.FetchOutcome.Ok)
+            assertEquals("hello-loopback", (outcome as WebFetch.FetchOutcome.Ok).text)
+            assertEquals(1, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test fun alwaysBlockedClassesStayBlockedWithOptIn() {
+        // metadata／link-local／multicast／unspecified／CGNAT：最強 opt-in 也打不開。
+        val dns = loopbackDns()
+        assertBlocked(
+            NetworkDenyCode.METADATA_ADDRESS_BLOCKED.name,
+            WebFetch.checkUrl(
+                "http://169.254.169.254/latest/meta-data/",
+                optIn = cleartextPrivate,
+                resolver = dns,
+            ),
+        )
+        // metadata 走 https＋較弱 opt-in 同樣永遠阻擋。
+        assertBlocked(
+            NetworkDenyCode.METADATA_ADDRESS_BLOCKED.name,
+            WebFetch.checkUrl(
+                "https://169.254.169.254/",
+                optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS),
+                resolver = dns,
+            ),
+        )
+        for (url in listOf(
+            "http://169.254.10.20/", // link-local（非 metadata 段）
+            "http://224.0.0.1/", // multicast
+            "http://0.0.0.0/", // unspecified／保留段
+            "http://100.64.0.1/", // CGNAT（不可信，opt-in 打不開）
+        )) {
+            assertBlocked(
+                NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED.name,
+                WebFetch.checkUrl(url, optIn = cleartextPrivate, resolver = dns),
+            )
+        }
+        // fetch 層同樣 fail-closed（字面 IP 不查 DNS，不起 server，零建連）。
+        assertUnavailable(
+            NetworkDenyCode.METADATA_ADDRESS_BLOCKED.name,
+            WebFetch.fetch(
+                "http://169.254.169.254/latest/meta-data/",
+                optIn = cleartextPrivate,
+                resolver = dns,
+            ),
+        )
+    }
+
+    @Test fun unsupportedSchemeAndBadUrlAreBlocked() {
+        val dns = loopbackDns()
+        val ftp = WebFetch.checkUrl("ftp://example.com/f", resolver = dns)
+        assertBlocked(NetworkDenyCode.UNSUPPORTED_SCHEME.name, ftp)
+        val bad = WebFetch.checkUrl("not a url", resolver = dns)
+        assertBlocked(NetworkDenyCode.INVALID_HOST.name, bad)
+    }
+
+    // ---- 逐跳判定（純函數，不建連） ----
+
+    @Test fun redirectDowngradeIsAlwaysBlocked() {
+        // https → http 降級永遠拒：即使目標（迴環＋opt-in）本身可放行，照擋，
+        // 且先於 DNS 判定（攻擊者可控 Location 不觸發解析）。
+        val dns = fakeDns("api.example.com" to listOf("203.0.113.10"))
+        val eval = WebFetch.evaluateRedirectTarget(
+            "https://api.example.com/a",
+            "http://127.0.0.1:9/b",
+            cleartextPrivate,
+            dns,
+        )
+        assertFalse("expected deny: $eval", eval.allowed)
+        assertEquals(NetworkDenyCode.REDIRECT_BLOCKED, eval.denyCode)
+    }
+
+    @Test fun redirectToLoopbackUnderDefaultOptInIsBlocked() {
+        // https 起跳 → https 迴環：預設 opt-in 下私有不放行，正規化為 REDIRECT_BLOCKED。
+        val dns = fakeDns("api.example.com" to listOf("203.0.113.10"))
+        val eval = WebFetch.evaluateRedirectTarget(
+            "https://api.example.com/a",
+            "https://127.0.0.1:9/b",
+            EndpointNetworkOptIn(),
+            dns,
+        )
+        assertFalse("expected deny: $eval", eval.allowed)
+        assertEquals(NetworkDenyCode.REDIRECT_BLOCKED, eval.denyCode)
+    }
+
+    @Test fun redirectToMetadataIsBlockedEvenWithOptIn() {
+        val dns = loopbackDns()
+        val eval = WebFetch.evaluateRedirectTarget(
+            "http://localhost:1/a",
+            "http://169.254.169.254/x",
+            cleartextPrivate,
+            dns,
+        )
+        assertFalse("expected deny: $eval", eval.allowed)
+        assertEquals(NetworkDenyCode.REDIRECT_BLOCKED, eval.denyCode)
+    }
+
+    @Test fun redirectToPublicHttpIsBlockedEvenWithOptIn() {
+        // 公網 http 永不開放：opt-in 也打不開，正規化為 REDIRECT_BLOCKED。
+        val dns = fakeDns("10.evil.com" to listOf("203.0.113.7"))
+        val eval = WebFetch.evaluateRedirectTarget(
+            "http://localhost:1/a",
+            "http://10.evil.com/",
+            cleartextPrivate,
+            dns,
+        )
+        assertFalse("expected deny: $eval", eval.allowed)
+        assertEquals(NetworkDenyCode.REDIRECT_BLOCKED, eval.denyCode)
+    }
+
+    @Test fun redirectSameHostLoopbackWithOptInIsFollowable() {
+        val dns = loopbackDns()
+        val eval = WebFetch.evaluateRedirectTarget(
+            "http://localhost:1/a",
+            "http://localhost:1/b",
+            cleartextPrivate,
+            dns,
+        )
+        assertTrue("expected allow: $eval", eval.allowed)
+    }
+
+    // ---- 傳輸行為（MockWebServer = 本地 http，配 opt-in＋fake DNS） ----
 
     @Test fun blockedFetchReturnsUnavailableWithoutSending() {
         val server = MockWebServer()
         try {
             val port = server.url("/").port
-            // 指向本地埠但用非本地主機名：策略短路，server 應收到 0 個請求。
-            val outcome = WebFetch.fetch("http://example.com:$port/")
-            assertTrue(outcome is WebFetch.FetchOutcome.Unavailable)
-            val u = outcome as WebFetch.FetchOutcome.Unavailable
-            assertEquals(DenyReason.NO_PRIVILEGE, u.reason)
-            assertEquals("CLEARTEXT_NON_LOCAL", u.detail)
-            assertTrue(u.message.contains("做不到") && u.message.contains("NO_PRIVILEGE"))
+            // 指向本地埠但用公網主機名：政策短路，server 應收到 0 個請求。
+            val dns = fakeDns("example.com" to listOf("203.0.113.7"))
+            val outcome = WebFetch.fetch("http://example.com:$port/", resolver = dns)
+            assertUnavailable(NetworkDenyCode.CLEARTEXT_NOT_PERMITTED.name, outcome)
             assertEquals(0, server.requestCount)
         } finally {
             server.shutdown()
         }
     }
 
-    @Test fun redirectDowngradeToNonLocalHttpIsBlockedWithoutFollowing() {
-        val target = MockWebServer()
+    @Test fun redirectToDeniedTargetIsBlockedWithoutFollowing() {
         val redirector = MockWebServer()
         try {
-            target.enqueue(MockResponse().setResponseCode(200).setBody("must-not-fetch"))
-            // 302 到非本地明文：取 target 本地 URL 並把 host 換成 example.com（同埠）。
-            // 逐跳 checkUrl 應擋下，絕不向目標發請求（target 零請求）。
-            val evil = target.url("/secret").toString()
-                .replace("localhost", "example.com")
-                .replace("127.0.0.1", "example.com")
-            redirector.enqueue(MockResponse().setResponseCode(302).setHeader("Location", evil))
-            val outcome = WebFetch.fetch(redirector.url("/start").toString())
-            assertTrue(outcome is WebFetch.FetchOutcome.Unavailable)
-            val u = outcome as WebFetch.FetchOutcome.Unavailable
-            assertEquals(DenyReason.NO_PRIVILEGE, u.reason)
-            assertEquals("CLEARTEXT_NON_LOCAL", u.detail)
+            val dns = loopbackDns()
+            // 302 到 metadata（opt-in 也打不開）：逐跳判定擋下，絕不建第二連線。
+            redirector.enqueue(MockResponse().setResponseCode(302).setHeader("Location", "http://169.254.169.254/x"))
+            val outcome = WebFetch.fetch(
+                redirector.url("/start").toString(),
+                optIn = cleartextPrivate,
+                resolver = dns,
+            )
+            assertUnavailable(NetworkDenyCode.REDIRECT_BLOCKED.name, outcome)
             assertEquals(1, redirector.requestCount)
-            assertEquals(0, target.requestCount)
         } finally {
             redirector.shutdown()
-            target.shutdown()
+        }
+    }
+
+    @Test fun redirectDeniedTargetMakesNoSecondConnection() {
+        // N1 誠實註記：本 repo 無 TLS test infra，不硬造 `https→http` 真 E2E。
+        // 降級判定（`https→http` 永遠拒、先於 DNS）由純函數測試
+        // `redirectDowngradeIsAlwaysBlocked` 釘住（零建連）；此 E2E 以
+        // `http→metadata（被拒目標）` 類比，釘住同一執行面不變式：被拒跳轉
+        // 絕不建第二連線（witness 全程閒置 requestCount==0，origin 恰一發）。
+        val origin = MockWebServer()
+        val witness = MockWebServer()
+        try {
+            // witness 保持監聽但從不被指向：任何第二連線洩漏都會落到它身上。
+            witness.url("/idle")
+            origin.enqueue(MockResponse().setResponseCode(302).setHeader("Location", "http://169.254.169.254/x"))
+            val outcome = WebFetch.fetch(
+                origin.url("/start").toString(),
+                optIn = cleartextPrivate,
+                resolver = loopbackDns(),
+            )
+            assertUnavailable(NetworkDenyCode.REDIRECT_BLOCKED.name, outcome)
+            assertEquals(1, origin.requestCount)
+            assertEquals("denied redirect must not open a second connection", 0, witness.requestCount)
+        } finally {
+            origin.shutdown()
+            witness.shutdown()
+        }
+    }
+
+    @Test fun redirectWithoutLocationIsBlocked() {
+        // 缺 Location：跳轉失敗一律 typed REDIRECT_BLOCKED，不建第二連線。
+        val server = MockWebServer()
+        try {
+            server.enqueue(MockResponse().setResponseCode(302))
+            val outcome = WebFetch.fetch(
+                server.url("/start").toString(),
+                optIn = cleartextPrivate,
+                resolver = loopbackDns(),
+            )
+            assertUnavailable(NetworkDenyCode.REDIRECT_BLOCKED.name, outcome)
+            assertEquals(1, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test fun redirectWithBadLocationIsBlocked() {
+        // 壞 Location（非 http(s) scheme）：解析成功但政策拒收，正規化為
+        // REDIRECT_BLOCKED，不建第二連線。
+        val server = MockWebServer()
+        try {
+            server.enqueue(MockResponse().setResponseCode(302).setHeader("Location", "ftp://example.com/x"))
+            val outcome = WebFetch.fetch(
+                server.url("/start").toString(),
+                optIn = cleartextPrivate,
+                resolver = loopbackDns(),
+            )
+            assertUnavailable(NetworkDenyCode.REDIRECT_BLOCKED.name, outcome)
+            assertEquals(1, server.requestCount)
+        } finally {
+            server.shutdown()
         }
     }
 
@@ -79,7 +349,11 @@ class WebFetchTest {
         try {
             server.enqueue(MockResponse().setResponseCode(302).setHeader("Location", "/final"))
             server.enqueue(MockResponse().setResponseCode(200).setBody("arrived"))
-            val outcome = WebFetch.fetch(server.url("/start").toString())
+            val outcome = WebFetch.fetch(
+                server.url("/start").toString(),
+                optIn = cleartextPrivate,
+                resolver = loopbackDns(),
+            )
             assertTrue(outcome is WebFetch.FetchOutcome.Ok)
             assertEquals("arrived", (outcome as WebFetch.FetchOutcome.Ok).text)
             assertEquals(2, server.requestCount)
@@ -88,30 +362,30 @@ class WebFetchTest {
         }
     }
 
-    @Test fun loopbackHttpIsAllowed() {
-        assertTrue(WebFetch.checkUrl("http://localhost:8080/x") is WebFetch.UrlCheck.Allowed)
-        assertTrue(WebFetch.checkUrl("http://127.0.0.1:9/") is WebFetch.UrlCheck.Allowed)
-        assertTrue(WebFetch.checkUrl("http://127.0.0.2/") is WebFetch.UrlCheck.Allowed)
-        assertTrue(WebFetch.checkUrl("http://[::1]:8080/") is WebFetch.UrlCheck.Allowed)
+    @Test fun tooManyRedirectsIsRedirectBlocked() {
+        val server = MockWebServer()
+        try {
+            repeat(WebFetch.MAX_REDIRECTS + 1) {
+                server.enqueue(MockResponse().setResponseCode(302).setHeader("Location", "/loop"))
+            }
+            val outcome = WebFetch.fetch(
+                server.url("/start").toString(),
+                optIn = cleartextPrivate,
+                resolver = loopbackDns(),
+            )
+            assertUnavailable(NetworkDenyCode.REDIRECT_BLOCKED.name, outcome)
+            assertEquals(WebFetch.MAX_REDIRECTS + 1, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
     }
-
-    @Test fun unsupportedSchemeAndBadUrlAreBlocked() {
-        val ftp = WebFetch.checkUrl("ftp://example.com/f")
-        assertTrue(ftp is WebFetch.UrlCheck.Blocked)
-        assertEquals("UNSUPPORTED_SCHEME", (ftp as WebFetch.UrlCheck.Blocked).detail)
-        val bad = WebFetch.checkUrl("not a url")
-        assertTrue(bad is WebFetch.UrlCheck.Blocked)
-        assertEquals("BAD_URL", (bad as WebFetch.UrlCheck.Blocked).detail)
-    }
-
-    // ---- 傳輸行為（MockWebServer = 本地 http，允許） ----
 
     @Test fun fetchOkAndMaxBytesTruncates() {
         val server = MockWebServer()
         try {
             server.enqueue(MockResponse().setResponseCode(200).setBody("0123456789".repeat(100)))
             val url = server.url("/big").toString()
-            val outcome = WebFetch.fetch(url, maxBytes = 100)
+            val outcome = WebFetch.fetch(url, maxBytes = 100, optIn = cleartextPrivate, resolver = loopbackDns())
             assertTrue(outcome is WebFetch.FetchOutcome.Ok)
             val ok = outcome as WebFetch.FetchOutcome.Ok
             assertTrue(ok.truncated)
@@ -122,12 +396,39 @@ class WebFetchTest {
         }
     }
 
+    @Test fun oversizedBodyIsTruncatedAtAbsoluteCap() {
+        // 大 body fail-closed：超過 1 MiB 硬頂只保留硬頂並標記，不無界緩衝。
+        val server = MockWebServer()
+        try {
+            val big = "0123456789".repeat((WebFetch.ABSOLUTE_MAX_BYTES / 10) + 200)
+            server.enqueue(MockResponse().setResponseCode(200).setBody(big))
+            val url = server.url("/big").toString()
+            val outcome = WebFetch.fetch(
+                url,
+                maxBytes = Int.MAX_VALUE,
+                optIn = cleartextPrivate,
+                resolver = loopbackDns(),
+            )
+            assertTrue("expected Ok, got: $outcome", outcome is WebFetch.FetchOutcome.Ok)
+            val ok = outcome as WebFetch.FetchOutcome.Ok
+            assertTrue(ok.truncated)
+            assertEquals(WebFetch.ABSOLUTE_MAX_BYTES, ok.bytesKept)
+        } finally {
+            server.shutdown()
+        }
+    }
+
     @Test fun maxBytesIsClampedToAbsoluteMax() {
         val server = MockWebServer()
         try {
             server.enqueue(MockResponse().setResponseCode(200).setBody("hi"))
             val url = server.url("/").toString()
-            val outcome = WebFetch.fetch(url, maxBytes = Int.MAX_VALUE)
+            val outcome = WebFetch.fetch(
+                url,
+                maxBytes = Int.MAX_VALUE,
+                optIn = cleartextPrivate,
+                resolver = loopbackDns(),
+            )
             assertTrue(outcome is WebFetch.FetchOutcome.Ok)
             assertFalse((outcome as WebFetch.FetchOutcome.Ok).truncated)
         } finally {
@@ -139,7 +440,11 @@ class WebFetchTest {
         val server = MockWebServer()
         try {
             server.enqueue(MockResponse().setResponseCode(503).setBody("down"))
-            val outcome = WebFetch.fetch(server.url("/").toString())
+            val outcome = WebFetch.fetch(
+                server.url("/").toString(),
+                optIn = cleartextPrivate,
+                resolver = loopbackDns(),
+            )
             assertTrue(outcome is WebFetch.FetchOutcome.Failed)
             val failed = outcome as WebFetch.FetchOutcome.Failed
             assertEquals("HTTP_503", failed.detail)
@@ -155,10 +460,69 @@ class WebFetchTest {
             server.enqueue(
                 MockResponse().setResponseCode(200).setBody("late").setBodyDelay(3, TimeUnit.SECONDS),
             )
-            val outcome = WebFetch.fetch(server.url("/slow").toString(), timeoutMs = 500L)
+            val outcome = WebFetch.fetch(
+                server.url("/slow").toString(),
+                timeoutMs = 500L,
+                optIn = cleartextPrivate,
+                resolver = loopbackDns(),
+            )
             assertTrue(outcome is WebFetch.FetchOutcome.Failed)
             assertEquals("TIMEOUT", (outcome as WebFetch.FetchOutcome.Failed).detail)
         } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test fun cancelledFetchFailsWithoutPartialOk() {
+        // 取消語義：測試執行緒 cancel 在途 Call → Failed（絕不回傳部分 Ok；
+        // WebFetch 無 cache／無第二傳輸可寫——`tapping` 本就無 cache 屬空斷言，
+        // 真正保證是下方「Failed 型別＋單次請求」：部分位元組不得包裝成 Ok）。
+        val server = MockWebServer()
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            server.enqueue(
+                MockResponse().setResponseCode(200).setBody("late-body").setBodyDelay(5, TimeUnit.SECONDS),
+            )
+            val captured = AtomicReference<Call>()
+            val tapping = OkHttpClient.Builder()
+                .addNetworkInterceptor { chain ->
+                    captured.set(chain.call())
+                    chain.proceed(chain.request())
+                }
+                .build()
+            val url = server.url("/slow").toString()
+            val future = executor.submit(Callable {
+                WebFetch.fetch(
+                    url,
+                    client = tapping,
+                    timeoutMs = 60_000L,
+                    optIn = cleartextPrivate,
+                    resolver = loopbackDns(),
+                )
+            })
+            // 等請求抵達 server（已在途），再取消在途 Call。
+            assertNotNull(server.takeRequest(5, TimeUnit.SECONDS))
+            var inFlight: Call? = null
+            val deadline = System.currentTimeMillis() + 5_000L
+            while (inFlight == null && System.currentTimeMillis() < deadline) {
+                inFlight = captured.get()
+                if (inFlight == null) Thread.sleep(10)
+            }
+            assertNotNull("expected to capture the in-flight call", inFlight)
+            inFlight!!.cancel()
+            val outcome = future.get(10, TimeUnit.SECONDS)
+            assertTrue("expected Failed after cancel, got: $outcome", outcome is WebFetch.FetchOutcome.Failed)
+            // 有意義斷言（取代空斷言 `tapping.cache == null`）：取消後不得有部分 Ok，
+            // 且只發過一次請求（無重送／無第二傳輸）；detail 僅能是傳輸類失敗。
+            val failed = outcome as WebFetch.FetchOutcome.Failed
+            assertTrue(
+                "cancel detail must be TIMEOUT/TRANSPORT, got: ${failed.detail}",
+                failed.detail == "TIMEOUT" || failed.detail == "TRANSPORT",
+            )
+            assertTrue(failed.message.contains("做不到"))
+            assertEquals("cancel must not retry", 1, server.requestCount)
+        } finally {
+            executor.shutdownNow()
             server.shutdown()
         }
     }
@@ -172,7 +536,11 @@ class WebFetchTest {
                     .setHeader("Content-Type", "text/plain")
                     .setBody(raw),
             )
-            val outcome = WebFetch.fetch(server.url("/bin").toString())
+            val outcome = WebFetch.fetch(
+                server.url("/bin").toString(),
+                optIn = cleartextPrivate,
+                resolver = loopbackDns(),
+            )
             assertTrue(outcome is WebFetch.FetchOutcome.Ok)
             val text = (outcome as WebFetch.FetchOutcome.Ok).text
             assertTrue(text.contains("�"))

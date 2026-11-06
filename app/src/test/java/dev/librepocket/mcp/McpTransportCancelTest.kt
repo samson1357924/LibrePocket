@@ -1,6 +1,8 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkEgressPolicy
 import java.io.IOException
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
@@ -93,6 +95,10 @@ class McpTransportCancelTest {
         override suspend fun hasKey(providerId: String): Boolean = true
     }
 
+    // A3：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in；
+    // production 預設仍 deny-all（HTTPS_ONLY）。
+    private val loopbackOptIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
+
     /** 取消中的子協程結果收集器：吞掉取消只為斷言（測試 harness 用途，production 不吞）。 */
     private suspend fun CoroutineScope.runCancellablePost(
         web: MockWebServer,
@@ -103,7 +109,7 @@ class McpTransportCancelTest {
     ): AtomicReference<Result<Pair<Int, String?>?>> {
         val outcome = AtomicReference<Result<Pair<Int, String?>?>>()
         val active = launch(Dispatchers.IO) {
-            outcome.set(runCatching { shared.postJson(web.url("/").toString(), "sekret", "{}", timeoutMs) })
+            outcome.set(runCatching { shared.postJson(web.url("/").toString(), "sekret", "{}", timeoutMs, loopbackOptIn) })
         }
         try {
             awaitInFlight()
@@ -246,7 +252,7 @@ class McpTransportCancelTest {
                 web.enqueue(MockResponse().setResponseCode(200).setBody(body).setSocketPolicy(SocketPolicy.KEEP_OPEN))
             }
             val first = withTimeoutOrNull(5_000) {
-                shared.postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                shared.postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS, loopbackOptIn)
             }
             assertNotNull("terminal 回應必須在 socket 未關下即時回傳（不等 EOF）", first)
             assertEquals(200, first!!.first)
@@ -255,7 +261,7 @@ class McpTransportCancelTest {
             // 健康 keep-alive 重用：第二步重用同一條 pooled connection（成功 + 同一身份）。
             val acquiredBefore = signals.acquired.size
             val second = withTimeoutOrNull(5_000) {
-                shared.postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                shared.postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS, loopbackOptIn)
             }
             assertNotNull("同一傳輸第二步必須即時成功", second)
             assertEquals(200, second!!.first)
@@ -298,7 +304,7 @@ class McpTransportCancelTest {
                 val cancelledConn = signals.acquired.last()
                 // 同一 transport 下一步成功：必須建新連線（被取消 socket 已關閉驅逐，不得重用）。
                 val retry = withTimeoutOrNull(5_000) {
-                    shared.postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                    shared.postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS, loopbackOptIn)
                 }
                 assertNotNull("第 ${round + 1} 輪取消後同一傳輸必須可發下一步", retry)
                 assertEquals(200, retry!!.first)
@@ -330,7 +336,7 @@ class McpTransportCancelTest {
             web.enqueue(MockResponse().setResponseCode(200).setChunkedBody("y".repeat(300 * 1024), 8192))
             val outcome = withTimeoutOrNull(10_000) {
                 runCatching {
-                    transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                    transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS, loopbackOptIn)
                 }
             }
             assertNotNull("超大 body 必須在 10s 內拋出（不等 EOF 排空）", outcome)
@@ -359,7 +365,7 @@ class McpTransportCancelTest {
             )
             val outcome = withTimeoutOrNull(10_000) {
                 runCatching {
-                    transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                    transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS, loopbackOptIn)
                 }
             }
             assertNotNull("Content-Length 超量必須立即拋出", outcome)
@@ -385,7 +391,7 @@ class McpTransportCancelTest {
             web.enqueue(MockResponse().setResponseCode(200).setChunkedBody("y".repeat(200 * 1024), 8192))
             val outcome = withTimeoutOrNull(15_000) {
                 runCatching {
-                    transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                    transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS, loopbackOptIn)
                 }
             }
             assertNotNull("字元超量必須拋出", outcome)
@@ -410,7 +416,7 @@ class McpTransportCancelTest {
             assertTrue("fixture 必須小於字元上限", body.length < McpTransport.RESPONSE_MAX_CHARS)
             web.enqueue(MockResponse().setResponseCode(200).setBody(body))
             val got = withTimeoutOrNull(5_000) {
-                transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS, loopbackOptIn)
             }
             assertNotNull("合法 CJK JSON 必須完整回傳", got)
             assertEquals(200, got!!.first)
@@ -433,7 +439,7 @@ class McpTransportCancelTest {
             val body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"$emoji\"}],\"isError\":false}}"
             web.enqueue(MockResponse().setResponseCode(200).setBody(body))
             val got = withTimeoutOrNull(5_000) {
-                transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS, loopbackOptIn)
             }
             assertNotNull("合法 emoji JSON 必須完整回傳", got)
             assertEquals(body, got!!.second)
@@ -473,7 +479,7 @@ class McpTransportCancelTest {
             web.enqueue(MockResponse().setResponseCode(200).setChunkedBody(payload, 8192))
             val outcome = withTimeoutOrNull(5_000) {
                 runCatching {
-                    transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                    transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS, loopbackOptIn)
                 }
             }
             assertNotNull("邊界切開必須拋出（不等 EOF）", outcome)
@@ -543,7 +549,7 @@ class McpTransportCancelTest {
             val start = System.nanoTime()
             val outcome = withTimeoutOrNull(15_000) {
                 runCatching {
-                    McpTransport().postJson("http://127.0.0.1:$port/", "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                    McpTransport().postJson("http://127.0.0.1:$port/", "sekret", "{}", McpTimeouts.DEFAULT_MS, loopbackOptIn)
                 }
             }
             val elapsedMs = (System.nanoTime() - start) / 1_000_000L
@@ -567,7 +573,7 @@ class McpTransportCancelTest {
             web.enqueue(MockResponse().setResponseCode(200).setChunkedBody("z".repeat(300 * 1024), 8192))
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -594,7 +600,7 @@ class McpTransportCancelTest {
             web.enqueue(MockResponse().setResponseCode(200).setBody(body))
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -621,7 +627,7 @@ class McpTransportCancelTest {
             web.enqueue(MockResponse().setResponseCode(200).setBody("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":"))
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -647,13 +653,13 @@ class McpTransportCancelTest {
             web.enqueue(MockResponse().setResponseCode(401).setChunkedBody("x".repeat(300 * 1024), 8192))
             web.enqueue(MockResponse().setResponseCode(500).setChunkedBody("y".repeat(300 * 1024), 8192))
             val first = withTimeoutOrNull(5_000) {
-                McpTransport().postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                McpTransport().postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS, loopbackOptIn)
             }
             assertNotNull("超大 401 必須即時回傳（不等 EOF 排空、不等 deadline）", first)
             assertEquals(401, first!!.first)
             assertNull("error body 必須跳過不讀（null text）", first.second)
             val second = withTimeoutOrNull(5_000) {
-                McpTransport().postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                McpTransport().postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS, loopbackOptIn)
             }
             assertNotNull("超大 500 必須即時回傳", second)
             assertEquals(500, second!!.first)
@@ -676,7 +682,7 @@ class McpTransportCancelTest {
             web.enqueue(MockResponse().setResponseCode(401).setBody(body))
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -701,7 +707,7 @@ class McpTransportCancelTest {
             web.enqueue(MockResponse().setResponseCode(403).setChunkedBody("x".repeat(300 * 1024), 8192))
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -726,7 +732,7 @@ class McpTransportCancelTest {
             web.enqueue(MockResponse().setResponseCode(500).setChunkedBody("y".repeat(300 * 1024), 8192))
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -753,7 +759,7 @@ class McpTransportCancelTest {
             web.enqueue(MockResponse().setResponseCode(500).setChunkedBody("b".repeat(300 * 1024), 8192))
             val breaker1 = McpCircuitBreaker()
             val server1 = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker1,
@@ -766,7 +772,7 @@ class McpTransportCancelTest {
             assertFalse(breaker1.isOpen())
             val breaker2 = McpCircuitBreaker()
             val server2 = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker2,
@@ -802,6 +808,7 @@ class McpTransportCancelTest {
                     "sekret",
                     "{}",
                     McpTimeouts.MIN_MS,
+                    loopbackOptIn,
                 )
             }
             val elapsedMs = (System.nanoTime() - start) / 1_000_000L
@@ -822,7 +829,7 @@ class McpTransportCancelTest {
             repeat(2) { web.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE)) }
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -869,6 +876,7 @@ class McpTransportCancelTest {
                         "sekret",
                         "{}",
                         McpTimeouts.DEFAULT_MS,
+                        loopbackOptIn,
                     )
                 }
             }
@@ -893,7 +901,7 @@ class McpTransportCancelTest {
             repeat(2) { web.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE)) }
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -935,7 +943,7 @@ class McpTransportCancelTest {
             web.enqueue(MockResponse().setResponseCode(200).setBody("{\"jsonrpc\":\"2.0\"}").setBodyDelay(20, TimeUnit.SECONDS))
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,

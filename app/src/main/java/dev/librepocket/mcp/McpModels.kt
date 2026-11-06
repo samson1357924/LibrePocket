@@ -1,5 +1,8 @@
 package dev.librepocket.mcp
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.HostResolver
+import dev.librepocket.policy.SystemHostResolver
 import dev.librepocket.tool.SideEffect
 
 /**
@@ -52,6 +55,27 @@ data class McpServerConfig(
     val enabledTools: Map<String, Boolean> = emptyMap(),
     /** 單次呼叫超時，鉗制在 [McpTimeouts.MIN_MS]..[McpTimeouts.MAX_MS]。 */
     val timeoutMs: Long = McpTimeouts.DEFAULT_MS,
+    /**
+     * A3 (Issue #135 A3)：per-server 網路 opt-in（預設 deny-all
+     * [dev.librepocket.policy.NetworkEgressPolicy.HTTPS_ONLY]）。
+     * 回環／私有明文須經 `NetworkOptInStore.confirm` 明示確認升級到
+     * `ALLOW_CLEARTEXT_PRIVATE`（foss／github LAN pilot；play 維持 deny-all，
+     * 見 [dev.librepocket.policy.NetworkOptInStore.checkPlayTierAllows]），
+     * 無全域一鍵開放。公網 `http` 永不開放（見 [dev.librepocket.policy.NetworkPolicy]）。
+     */
+    val networkOptIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+    /**
+     * A3：首跳解析 seam。production 預設 [SystemHostResolver]；測試注入 fake。
+     * Transport 在建連前先 `evaluateUrl(endpoint, networkOptIn, networkResolver)`，
+     * 拒絕即 typed fatal（[McpNetworkPolicyBlocked]），不送 credential／body。
+     */
+    val networkResolver: HostResolver = SystemHostResolver,
+    /**
+     * A3：opt-in 綁定世代。`NetworkOptInStore` 以 (`mcp:<id>`＋正規化 baseUrl＋
+     * scheme／port＋tier＋本 revision) 綁定確認；任一變動使舊確認自動失效
+     * （fail-closed，需重新明示確認；見 [dev.librepocket.policy.NetworkOptInStore]）。
+     */
+    val configRevision: Long = 0L,
 ) {
     fun effectiveTimeoutMs(): Long = McpTimeouts.clamp(timeoutMs)
 

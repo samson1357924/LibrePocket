@@ -46,7 +46,14 @@ class ElevatedRunnerScreenshotCapacityTest {
 
     @Test fun screenshot70KBPassesBothRunners() {
         // 70KB > 通用 64K：通用軌必截斷，截圖軌必須通過（Ok 非 truncated）。
+        // B4：screencap 側須過 PNG 輕量門，故首 8B 置 signature、尾 12B 置 IEND。
         val png = ByteArray(70 * 1024) { (it and 0xFF).toByte() }
+        RootFramebufferCapture.PNG_SIGNATURE.copyInto(png, 0)
+        byteArrayOf(
+            0x00, 0x00, 0x00, 0x00,
+            0x49, 0x45, 0x4E, 0x44,
+            0xAE.toByte(), 0x42, 0x60, 0x82.toByte(),
+        ).copyInto(png, png.size - 12)
         val runners: List<Pair<String, BinaryElevatedRunner>> = listOf(
             "shizuku" to shizukuRunner { _ -> FakeProcess(png, ByteArray(0), 0) },
             "root" to rootRunner { _ -> FakeProcess(png, ByteArray(0), 0) },
@@ -87,7 +94,14 @@ class ElevatedRunnerScreenshotCapacityTest {
         // 恰 8M==硬讀上限：pipe 未溢出（閾值==硬讀靠溢出位區分恰過／超限），
         // truncate(8M, 8M) 不截斷 → Ok(truncated=false)＋capture 非 null（完整幀可摘要）。
         // 單一 8M 陣列兩 runner 共用（不重配，復大陣列模式）。
+        // B4：screencap 側須過 PNG 輕量門，故首 8B 置 signature、尾 12B 置 IEND。
         val exact = ByteArray(8 * 1024 * 1024) { (it and 0xFF).toByte() }
+        RootFramebufferCapture.PNG_SIGNATURE.copyInto(exact, 0)
+        byteArrayOf(
+            0x00, 0x00, 0x00, 0x00,
+            0x49, 0x45, 0x4E, 0x44,
+            0xAE.toByte(), 0x42, 0x60, 0x82.toByte(),
+        ).copyInto(exact, exact.size - 12)
         val runners: List<Pair<String, BinaryElevatedRunner>> = listOf(
             "shizuku" to shizukuRunner { _ -> FakeProcess(exact, ByteArray(0), 0) },
             "root" to rootRunner { _ -> FakeProcess(exact, ByteArray(0), 0) },
@@ -160,7 +174,15 @@ class ElevatedRunnerScreenshotCapacityTest {
         // Ok.truncated → capture null。舊碼 stderr 同 stdout 8M cap 時 1MB
         // 不截斷；本測試鎖定 stderr 獨立 cap 生效。
         // 記憶體：1MB 單陣列，兩 runner 共用（不重配）。
+        // B4：stdout 70KB 須過 PNG 輕量門（本用例 trunc 於 stderr，PNG 門不影響
+        // verdict，但置合法 PNG 保語義一致）。
         val png = ByteArray(70 * 1024) { (it and 0xFF).toByte() }
+        RootFramebufferCapture.PNG_SIGNATURE.copyInto(png, 0)
+        byteArrayOf(
+            0x00, 0x00, 0x00, 0x00,
+            0x49, 0x45, 0x4E, 0x44,
+            0xAE.toByte(), 0x42, 0x60, 0x82.toByte(),
+        ).copyInto(png, png.size - 12)
         val bigErr = ByteArray(1 * 1024 * 1024) { 0x45.toByte() }
         val runners: List<Pair<String, BinaryElevatedRunner>> = listOf(
             "shizuku" to shizukuRunner { _ -> FakeProcess(png, bigErr, 0) },

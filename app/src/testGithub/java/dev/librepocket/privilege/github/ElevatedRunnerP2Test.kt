@@ -150,16 +150,17 @@ class ElevatedRunnerP2Test {
     }
 
     @Test fun deniedCarriesCleanupIncompleteWhenSuDeniedPlusLingering() {
+        // B4（owner P2-7）：su 前綴可仿造，不再斷言 Denied，一律 Failed；
+        // 清理旗標穿透語義不變（Failed 仍攜 flag）。
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         val latch = CountDownLatch(1)
         val runner = makeRoot { BlockedStdinDeniedProcess(latch) }
         try {
             val b = runner.runBinary(ElevatedRequest(listOf("id"), "P2-T"), 5_000L)
-            assertTrue("$b", b is ElevatedBinaryResult.Denied)
-            b as ElevatedBinaryResult.Denied
-            assertEquals(ShellDeny.NOT_WHITELISTED, b.reason)
-            assertTrue("Denied must carry flag", b.cleanupIncomplete)
+            assertTrue("$b", b is ElevatedBinaryResult.Failed)
+            b as ElevatedBinaryResult.Failed
+            assertTrue("Failed must carry flag", b.cleanupIncomplete)
         } finally {
             latch.countDown()
             pollOutstandingTo(0)

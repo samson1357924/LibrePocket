@@ -894,6 +894,12 @@ object ShellPolicy {
      *    （含 NotDirectory／瞬時 I/O 錯），關閉 EACCES 混同為缺席的繞行；ABSENT 等同舊 false 語義繼續，PRESENT 繼續；
      *    超深仍拒）。提權注記：app UID 不可判定者雙通道皆拒，需提權側預檢者走
      *    Refs #10 follow-up（刻意不在本 PR 碰 github source set）。
+     *    B4 跨域提醒（owner P2-9）：app UID 對 Root/fb0 等跨域目標的 lstat
+     *    可能因 EACCES 而 UNKNOWN，本門 fail-closed 拒（雙通道皆拒，不降級，
+     *    不改 UNKNOWN fail-closed）。真機跨域成功路徑（root/Shizuku 提權後
+     *    讀取）需 #136-B3 E2E 驗收；特權側預檢如需放行須另設可信有界門
+     *    （特權行程內 lstat＋結果有界回傳），不得把 UNKNOWN 一律放行
+     *    （TODO #136-B3）。
      * 2. 存在即 `toRealPath()` 全解析固定，再驗 real 身分獨立條件＋同語義重裁
      *    [FileScope.decide]（[isElevated] 為 true 時沿提權語義
      *    `allowed==true` 即放行，否則要求 `allowed && !needsBridge`）；

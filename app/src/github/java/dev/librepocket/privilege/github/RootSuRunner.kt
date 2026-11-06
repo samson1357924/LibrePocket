@@ -29,8 +29,11 @@ import java.util.concurrent.TimeUnit
  * typed Denied/Failed 並附降級話術，呼叫方回落免 Root 路徑。
  *
  * B2 修正（Issue #136 B2）：
- * - su exit 語義：拒絕（[isSuDenied]）回 `Denied(NOT_WHITELISTED)`，
- *   一般非零回 `Failed`，皆不回 `Ok`（舊實現誤回 Ok 已修正）；
+ * - su exit 語義：B4 前拒絕（[isSuDenied]）回 `Denied(NOT_WHITELISTED)`；
+ *   B4 起（owner P2-7）`^su:` 前綴可被內層仿造，無獨立可信來源，不再斷言
+ *   Denied，一律回 `Failed`（不確定失敗，含可能的真拒絕；見 [isSuDenied]
+ *   B4 段與 B4 負向單測）；一般非零回 `Failed`，皆不回 `Ok`
+ *   （舊實現誤回 Ok 已修正）；
  *   訊息內 stderr 經 `Redactor.redactError` 收斂（保留 redacted，不洩密）；
  * - 超時/cancel 走 [ElevatedProcessKiller.killTree]（盡力整組殺，舊實現只殺 `su`
  *   本體；Android 多數退化為單殺，串流由 drain 關，見 [ElevatedProcessKiller]）＋ [isCancelled] 輪詢鉤，解除 blocking I/O；
@@ -39,8 +42,8 @@ import java.util.concurrent.TimeUnit
  * - 二進位通道：[runBinary] 以 [ByteArray] 直達，[run] 僅為文字相容殼。
  *
  * B2 失敗訊息收斂 pin（Phase3 P3 低風險，行為不變）：
- * 非零 exit 回 `Failed("su failed exit=...: $redacted")`／拒絕回
- * `Denied(NOT_WHITELISTED, "su denied ...: $redacted")`，`$redacted` 經
+ * 非零 exit 回 `Failed("su failed exit=...: $redacted")`／前綴命中回
+ * `Failed("su failed (possible denial, unverified source) exit=...: $redacted")`，`$redacted` 經
  * `Redactor.redactError` 收斂。路徑覆蓋邊界（見 `Redactor.ANDROID_PATH`）：
  * 覆蓋 `/data/data|user|app|media|misc`、`/storage/emulated`、`/sdcard`；
  * 不覆蓋 `/system|/vendor|/data/adb`——su 可信路徑常量屬公開 allowlist
@@ -559,10 +562,12 @@ class RootSuRunner(
             }
             if (raw.exitCode != 0) {
                 val redacted = Redactor.redactError(String(err.bytes, Charsets.UTF_8))
+                // B4 P2-7：`^su:` 前綴可被內層仿造（合併 stderr／共享 exit code 下
+                // 不可區分真拒絕與內層失敗），無獨立可信來源時不判 Denied，一律
+                // Failed（不確定失敗；內層仿 su 行負向見 B4 單測）。
                 return if (isSuDenied(err.bytes, raw.exitCode)) {
-                    ElevatedBinaryResult.Denied(
-                        ShellDeny.NOT_WHITELISTED,
-                        "su denied exit=${raw.exitCode} (NO_PRIVILEGE; fallback to unprivileged path): $redacted",
+                    ElevatedBinaryResult.Failed(
+                        "su failed (possible denial, unverified source) exit=${raw.exitCode}: $redacted",
                         cleanupIncomplete = raw.cleanupIncomplete,
                     )
                 } else {

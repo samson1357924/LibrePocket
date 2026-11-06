@@ -15,14 +15,25 @@ import org.junit.Test
  */
 class RootCaptureTest {
 
+    private fun validPng(fill: ByteArray = "png-bytes".toByteArray()): ByteArray {
+        val sig = RootFramebufferCapture.PNG_SIGNATURE
+        val iend = byteArrayOf(
+            0x00, 0x00, 0x00, 0x00,
+            0x49, 0x45, 0x4E, 0x44,
+            0xAE.toByte(), 0x42, 0x60, 0x82.toByte(),
+        )
+        return sig + fill + iend
+    }
+
     @Test fun screencapPreferredOverFb0() {
+        val png = validPng()
         val capture = RootFramebufferCapture(
-            readScreencap = { "png-bytes".toByteArray() },
+            readScreencap = { png },
             readFb0 = { "fb-bytes".toByteArray() },
         )
         val digest = capture.capture()!!
         assertEquals(FrameSource.SCREENCAP, digest.source)
-        assertEquals("png-bytes".toByteArray().size, digest.byteSize)
+        assertEquals(png.size, digest.byteSize)
         assertEquals(64, digest.digest.length)
     }
 
@@ -44,10 +55,13 @@ class RootCaptureTest {
     }
 
     @Test fun sameBytesSameDigestWithoutPixelFields() {
-        val a = RootFramebufferCapture({ "same".toByteArray() }, { null }).capture()!!
-        val b = RootFramebufferCapture({ "same".toByteArray() }, { null }).capture()!!
+        // B4：capture() screencap 側須過 PNG 輕量門，故用合法 PNG（同位元組同摘要）。
+        val same = validPng("same".toByteArray())
+        val diff = validPng("different".toByteArray())
+        val a = RootFramebufferCapture({ same }, { null }).capture()!!
+        val b = RootFramebufferCapture({ same }, { null }).capture()!!
         assertEquals(a.digest, b.digest)
-        val c = RootFramebufferCapture({ "different".toByteArray() }, { null }).capture()!!
+        val c = RootFramebufferCapture({ diff }, { null }).capture()!!
         assertTrue(a.digest != c.digest)
         // 僅摘要進轉錄：FrameDigest 無像素欄位（編譯期保證；此處再斷言一次）。
         val fieldNames = FrameDigest::class.java.declaredFields.map { it.name }.toSet()
@@ -98,7 +112,8 @@ class RootCaptureTest {
     @Test fun binaryOverloadBypassesStringFallback() {
         // R3-B：Binary 多載直接走位元組直達（無 as?）；run() 蓄意回損毀文字，
         // 若誤走 String 路徑即回 "lossy-garbage" 而非 PNG，位元組比對即抓包。
-        val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0xFF.toByte(), 0x00, 0x01)
+        // B4：screencap 側須過 PNG 輕量門，故用合法 PNG。
+        val png = validPng(byteArrayOf(0xFF.toByte(), 0x00, 0x01))
         val audit = PrivilegeAuditLog()
         val runner: BinaryElevatedRunner = object : BinaryElevatedRunner {
             override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult =

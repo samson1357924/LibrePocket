@@ -527,8 +527,18 @@ class ElevatedRunnerZ1Test {
         ElevatedCleanupTracker.noteClean()
         runWithUncaughtGuard { uncaught ->
             val audit = PrivilegeAuditLog()
+            // B4：capture screencap 側須過 PNG 輕量門，故 capture 用乾淨合法 PNG
+            // spawn（latch 已釋放，stdin 不再阻塞），斷非 null。
+            val png = RootFramebufferCapture.PNG_SIGNATURE +
+                "z1-ok".toByteArray() +
+                byteArrayOf(
+                    0x00, 0x00, 0x00, 0x00,
+                    0x49, 0x45, 0x4E, 0x44,
+                    0xAE.toByte(), 0x42, 0x60, 0x82.toByte(),
+                )
+            val cleanRunner = makeRunner { FakeProcess(png, ByteArray(0), 0) }
             // capture 用乾淨 spawn（latch 已釋放，stdin 不再阻塞），斷非 null。
-            val cap = RootFramebufferCapture.screencapViaBinary(runner, audit, "Z1-C", 5_000L)()
+            val cap = RootFramebufferCapture.screencapViaBinary(cleanRunner, audit, "Z1-C", 5_000L)()
             assertNotNull("capture must be non-null for complete Ok", cap)
             assertTrue(uncaught.isEmpty())
         }

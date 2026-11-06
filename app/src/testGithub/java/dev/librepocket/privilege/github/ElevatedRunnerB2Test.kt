@@ -32,6 +32,9 @@ class ElevatedRunnerB2Test {
     // ---- 1. su exit 語義：拒絕/exit≠0 不回 Ok；stderr redacted ----
 
     @Test fun suDeniedStderrMapsToTypedDenied() {
+        // B4（owner P2-7）：`^su:` 前綴可被內層仿造，無獨立可信來源，不再斷言
+        // Denied，一律 Failed（不確定失敗）；本用例即內層仿 su 行亦同形，
+        // 不得回 Denied（見 suInnerSpoofPrefixIsFailedNotDenied）。
         var spawns = 0
         val runner = RootSuRunner(
             privateRoot = privateRoot,
@@ -49,12 +52,12 @@ class ElevatedRunnerB2Test {
             grantCheck = GrantFixtures.allowAlways,
         )
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
-        assertTrue("$r", r is ShellResult.Denied)
-        assertEquals(ShellDeny.NOT_WHITELISTED, (r as ShellResult.Denied).reason)
+        assertTrue("$r", r is ShellResult.Failed)
         assertEquals(1, spawns)
         // stderr 保留但已 redacted：私網 IP 不得原文出現。
-        assertTrue(r.message.contains("10.1.2.3").not())
-        assertTrue(r.message.contains("REDACTED") || r.message.contains("denied", ignoreCase = true))
+        val msg = (r as ShellResult.Failed).message
+        assertTrue(msg.contains("10.1.2.3").not())
+        assertTrue(msg.contains("REDACTED") || msg.contains("denied", ignoreCase = true))
     }
 
     @Test fun suGenericNonZeroMapsToFailedNotOk() {
@@ -285,7 +288,14 @@ class ElevatedRunnerB2Test {
     }
 
     @Test fun framebufferPrefersBinaryChannel() {
-        val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0xFF.toByte(), 0x00)
+        // B4：screencap 側須過 PNG 輕量門，故用合法 PNG（sig＋fill＋IEND）。
+        val png = RootFramebufferCapture.PNG_SIGNATURE +
+            byteArrayOf(0xFF.toByte(), 0x00) +
+            byteArrayOf(
+                0x00, 0x00, 0x00, 0x00,
+                0x49, 0x45, 0x4E, 0x44,
+                0xAE.toByte(), 0x42, 0x60, 0x82.toByte(),
+            )
         val runner = ShizukuShellRunner(
             privateRoot = privateRoot,
             bridgeGranted = GrantFixtures.bridgeOn,

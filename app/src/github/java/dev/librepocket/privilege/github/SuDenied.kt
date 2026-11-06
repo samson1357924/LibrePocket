@@ -8,8 +8,8 @@ import java.util.Locale
  * - exit==0 永不視為拒絕（成功）；
  * - 非零且 stderr 存在 `^su:` 前綴行（行首可有空白，大小寫無關）同時命中
  *   拒絕子串（`denied`／`rejected`／`eacces`／`eperm`，大小寫無關）即拒絕
- *   （使用者在 Magisk/KernelSU 彈窗按拒，或 `su` 本體不可用），呼叫方回 typed
- *   `Denied(NOT_WHITELISTED)`；
+ *   （使用者在 Magisk/KernelSU 彈窗按拒，或 `su` 本體不可用），呼叫方回
+ *   `Failed`（B4 起不再斷言 Denied，見 [RootSuRunner]）；
  * - 非零但無此類行即一般失敗，呼叫方回 `Failed`（皆不回 Ok）。
  *   內層命令自身 EACCES/EPERM（例如 `cat` 不可讀檔，無 `su:` 前綴）一律 Failed，
  *   不誤判為 Denied（見負向單測）。
@@ -26,7 +26,13 @@ import java.util.Locale
  * P2 精確化（啟發式收斂完成）：`su -c` 把 su 層與內層命令的多路輸出共用
  * 同一個 exit code／stderr，舊實現對合併後全文做關鍵字匹配，內層 EACCES
  * 即誤判為 Denied。現只認 `^su:` 前綴行內命中，內層輸出即使含關鍵字
- * 也不算拒絕；呼叫方仍應把 Denied 理解為「su 層拒絕」（前綴行保證來源）。
+ * 也不算拒絕。
+ *
+ * B4 降級（owner P2-7）：`^su:` 前綴僅為啟發式，不保證來源 —— 內層程式亦可
+ * 印出同形 `su: ... denied` 行並以非零 exit 退出（見 B4 負向單測），與真正的
+ * su 層拒絕在合併 stderr／共享 exit code 下不可區分。無獨立可信來源時不得
+ * 斷言 Denied；呼叫方一律收斂為 Failed（不確定失敗），不得以 KDoc 宣稱
+ * 前綴保證來源。
  */
 private val SU_DENIED_SIGNALS: List<String> = listOf(
     // P2 精確化：僅保留 4 個拒絕子串家族（denied/rejected/eacces/eperm），

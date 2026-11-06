@@ -47,6 +47,19 @@ enum class FrameSource {
  * 會損毀 PNG）。審計（R3-B）：grep 產品源集（`app/src/main`＋`app/src/github`）
  * 零呼叫，僅測試引用；產品 #136-B3 接線應使用 Binary 多載。
  *
+ * B4 PNG 輕量門（owner P2-6，前者落地：signature＋IEND）：
+ * - `screencap -p` 產物必須為 PNG：[isPlausiblePng] 驗 8 位元組 signature
+ *  （`89 50 4E 47 0D 0A 1A 0A`）＋尾 12 位元組 IEND chunk
+ *  （`00 00 00 00 49 45 4E 44 AE 42 60 82`）＋最小長度；不做全 chunk walk／
+ *   不解碼（輕量，JVM 零依賴）；
+ * - `capture()` 側：screencap 位元組未過門即視為缺失，回落 fb0（fb0 為原始
+ *   framebuffer，不做 PNG 門）；兩路皆無／皆無效即 null（降級手動截圖）；
+ * - `screencapViaBinary`／`screencapViaElevated`（String 回落同）側：Ok 非截斷
+ *   但 PNG 無效即 null，審計記 `FRAME_REJECTED`（非 `OK`，機器可區分）；
+ *   truncated 即 null 仍記既有 `OK`（B1-B3 語義 pin 保留，不改，見
+ *   `RootCaptureTest.truncatedOkYieldsNullWithoutSummarizingPartialFrame`）；
+ * - fb0 通道（原始位元組）不做 PNG 門，語義不變。
+ *
  * S2-B 容量矩陣（owner P2-4，僅 KDoc 文件化，行為零變更）：
  * - 典型 PNG 截圖 1-3MB：完整通過（<8M，Ok 非 truncated，capture 可摘要）；
  * - 600KB fb0：完整通過；
@@ -70,11 +83,13 @@ class RootFramebufferCapture(
 ) {
     /**
      * screencap 優先、fb0 兜底；只回摘要（像素不保留）。
+     * B4：screencap 位元組須過 [isPlausiblePng]（輕量 PNG 門），未過即視為
+     * 缺失回落 fb0（fb0 原始位元組不做 PNG 門）；兩路皆無／皆無效為 null。
      * @return 幀摘要，兩路皆無時為 null（呼叫方降級手動截圖）。
      */
     fun capture(atMs: Long = System.currentTimeMillis()): FrameDigest? {
         val screen = runCatching { readScreencap() }.getOrNull()
-        if (screen != null && screen.isNotEmpty()) {
+        if (screen != null && screen.isNotEmpty() && isPlausiblePng(screen)) {
             return digestOf(screen, FrameSource.SCREENCAP, atMs)
         }
         val fb = runCatching { readFb0() }.getOrNull()
@@ -94,6 +109,30 @@ class RootFramebufferCapture(
 
     companion object {
         /**
+         * B4 PNG 輕量門（owner P2-6）：只驗 signature＋尾 IEND＋最小長度，
+         * 不做全 chunk walk／不解碼。fb0 原始位元組不經此門。
+         */
+        internal val PNG_SIGNATURE: ByteArray =
+            byteArrayOf(
+                0x89.toByte(), 0x50, 0x4E, 0x47,
+                0x0D, 0x0A, 0x1A, 0x0A,
+            )
+        private val PNG_IEND: ByteArray =
+            byteArrayOf(
+                0x00, 0x00, 0x00, 0x00,
+                0x49, 0x45, 0x4E, 0x44,
+                0xAE.toByte(), 0x42, 0x60, 0x82.toByte(),
+            )
+
+        internal fun isPlausiblePng(bytes: ByteArray): Boolean {
+            if (bytes.size < PNG_SIGNATURE.size + PNG_IEND.size) return false
+            if (!bytes.copyOf(PNG_SIGNATURE.size).contentEquals(PNG_SIGNATURE)) return false
+            val tail = bytes.copyOfRange(bytes.size - PNG_IEND.size, bytes.size)
+            if (!tail.contentEquals(PNG_IEND)) return false
+            return true
+        }
+
+        /**
          * 二進位審計＋位元組抽取共用（P2-A）：兩路 `*ViaBinary` 皆經此記帳，
          * 避免雙寫 verdict 映射。行為錨定：`audit.record(argv/reason/verdict)`
          * 只記碼不記明文；僅 [ElevatedBinaryResult.Ok] 且 `truncated==false`
@@ -102,7 +141,7 @@ class RootFramebufferCapture(
          * 其餘（Denied/TimedOut/Failed，以及 Ok 但 truncated==true 的部分幀）
          * 一律回 null（呼叫方降級手動截圖）。截斷即 null，不摘要部分幀：
          * 截斷 PNG 仍被當成功幀摘要會虛構完整截圖，故視為不可用；
-         * 審計仍記 verdict（Ok 截斷仍記 OK，只是不回位元組）。
+         * 審計仍記 verdict（Ok 截斷仍記 OK，只是不回位元組；B1-B3 pin 保留）。
          */
         private fun auditAndExtract(
             request: ElevatedRequest,
@@ -120,6 +159,27 @@ class RootFramebufferCapture(
                 is ElevatedBinaryResult.TimedOut,
                 -> return null
             }
+        }
+
+        /**
+         * B4 screencap 專用抽取：先過 PNG 輕量門，未過即 `FRAME_REJECTED`＋null
+         *（機器可區分 malformed 與 truncated；truncated 仍走 [auditAndExtract]
+         * 記既有 `OK`，語義不改）。fb0 不經此函數（原始位元組無 PNG 門）。
+         */
+        private fun auditAndExtractScreenshot(
+            request: ElevatedRequest,
+            result: ElevatedBinaryResult,
+            audit: PrivilegeAuditLog,
+        ): ByteArray? {
+            if (result is ElevatedBinaryResult.Ok &&
+                !result.truncated &&
+                result.stdout.isNotEmpty() &&
+                !isPlausiblePng(result.stdout)
+            ) {
+                audit.record(request.argv, request.reasonCode, "FRAME_REJECTED")
+                return null
+            }
+            return auditAndExtract(request, result, audit)
         }
 
         /**
@@ -157,10 +217,26 @@ class RootFramebufferCapture(
             return {
                 val request = ElevatedRequest(listOf("screencap", "-p"), reasonCode)
                 val result = runner.run(request, timeoutMs)
-                audit.recordResult(request, result)
                 val ok = result as? ShellResult.Ok
-                if (ok == null || ok.truncated) null
-                else ok.stdout.toByteArray(Charsets.UTF_8).takeIf { it.isNotEmpty() }
+                if (ok == null || ok.truncated) {
+                    audit.recordResult(request, result)
+                    null
+                } else {
+                    // B4：String 回落同過 PNG 輕量門；lossy 損毀位元組未過門即
+                    // FRAME_REJECTED＋null（不摘要損毀幀）；空位元組維持既有
+                    // OK＋null（B1-B3 pin，不改）。
+                    val bytes = ok.stdout.toByteArray(Charsets.UTF_8).takeIf { it.isNotEmpty() }
+                    if (bytes == null) {
+                        audit.recordResult(request, result)
+                        null
+                    } else if (!isPlausiblePng(bytes)) {
+                        audit.record(request.argv, request.reasonCode, "FRAME_REJECTED")
+                        null
+                    } else {
+                        audit.recordResult(request, result)
+                        bytes
+                    }
+                }
             }
         }
 
@@ -222,6 +298,7 @@ class RootFramebufferCapture(
         /**
          * B2 位元組直達版 screencap：經 [BinaryElevatedRunner.runBinary]，
          * PNG 位元組不經 String，審計僅記 verdict（不記明文）。
+         * B4：經 [auditAndExtractScreenshot]（PNG 輕量門＋FRAME_REJECTED）。
          */
         fun screencapViaBinary(
             runner: BinaryElevatedRunner,
@@ -231,7 +308,7 @@ class RootFramebufferCapture(
         ): () -> ByteArray? = {
             val request = ElevatedRequest(listOf("screencap", "-p"), reasonCode)
             val result = runner.runBinary(request, timeoutMs)
-            auditAndExtract(request, result, audit)
+            auditAndExtractScreenshot(request, result, audit)
         }
 
         /**

@@ -514,6 +514,13 @@ class ShizukuShellRunner(
      *
      * 真機路徑（僅真機／裝置驗收調用，JVM 單測一律注入假 `spawn`，
      * 不得直調本函數；需真 Binder 驗收歸 #136-B3 E2E）。
+     *
+     * B4 反射相容（owner P2-8）：真機經 [defaultSpawnWithDir] 反射調用
+     * Shizuku 13.x 私有 `newProcess`（`getDeclaredMethod＋isAccessible`），
+     * 上游弃用提醒，真機未驗。裝置矩陣驗收歸 #136-B3 E2E：授權／拒絕／
+     * service 重啟／死亡／版本升級；長期路線評估 UserService（TODO #136-B3）。
+     * JVM 側缺方法／版本漂移 fail-closed（反射抛即 spawn 側收斂為 Failed，
+     * 零殘留，見 B4 pin），不抛。
      */
     private fun pinnedSpawn(argv: List<String>): Process = defaultSpawnWithDir(argv, privateRoot)
 
@@ -521,6 +528,14 @@ class ShizukuShellRunner(
         /**
          * R3-B：grep 確認測試零引用，收斂為 private（僅 [pinnedSpawn]
          * 內部使用）；#136-B3 前重審（刪除或保留內部實現）。
+         *
+         * B4 反射相容注記（owner P2-8）：`Shizuku.newProcess` 為 13.x 私有
+         * API（`getDeclaredMethod("newProcess", String[], String[], String)`＋
+         * `isAccessible=true`），方法缺席／簽名漂移／版本升級即抛
+         * （`NoSuchMethodException` 等），由呼叫方 spawn catch 收斂為
+         * `Failed("shizuku spawn failed: ...")` 且零殘留（fail-closed，不抛；
+         * 見 B4 pin）。真機相容未驗，裝置矩陣（授權／拒絕／service 重啟／
+         * 死亡／版本升級）＋UserService 長期路線歸 #136-B3 E2E。
          */
         private fun defaultSpawnWithDir(argv: List<String>, dir: String?): Process {
             val method = Shizuku::class.java.getDeclaredMethod(

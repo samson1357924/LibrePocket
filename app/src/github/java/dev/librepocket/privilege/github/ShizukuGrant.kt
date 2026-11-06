@@ -172,7 +172,38 @@ class ShizukuGrantStore(
         }
     }
 
-    /** 當前設定下的有效性：load＋policy 一次判定，讀不到即 Invalid。 */
+    /** 當前設定下的有效性：load＋policy 一次判定，讀不到即 Invalid。
+     *
+     * B3 blocking 包裝契約（Phase3 P2，防懸空／撕裂讀；兩 runner 的 `grantCheck`
+     * KDoc 引用此處為準，runner 側只消費 supplier、不自建快取）：
+     * - runner 非 suspend，故 B3 須以 blocking 包裝供給 `grantCheck`
+     *  （例 `runBlocking(ioDispatcher) { store.check(providerId, revision) }`
+     *   或等價橋接）；包裝必須在 IO dispatcher 執行，不得在呼叫執行緒直讀；
+     * - 每次呼叫必須新鮮供給：grant 側以 [load] 單發射讀 DataStore
+     *  （單 `data.first()` emission 解析 providerId＋revision＋atMs＋
+     *   serviceVersion 四鍵，同一快照內判定，禁止分鍵多次 collect）；
+     * - 當前 endpoint 身分＋revision 必須取自
+     *   `EndpointStore.snapshotWithRevisionStrict()` 同一 emission
+     *  （單發射 providerId＋revision，禁止「先讀 provider 再讀 revision」
+     *   的兩讀序列——併發 endpoint 切換可落在兩讀之間造成撕裂：舊 provider＋
+     *   新 revision 混代）；
+     * - 永不快取結果：每次 `grantCheck()` 呼叫重走上述新鮮讀；快取即把撤銷窗口
+     *   延長到快取 TTL，runner 的跨 call 翻轉即拒與 spawn 前重求值將失效；
+     * - 撕裂讀禁用＋混代 fail-closed：撕裂的混代組合經 [ShizukuGrantPolicy.check]
+     *   仍為 Invalid（provider 不等或 revision 不等即拒，見撕裂契約測試），
+     *   禁止在混代時放行或重試放行。
+     *
+     * P3-1 現狀 pin（行為不變）：[ShizukuGrant.serviceVersion] 與 `grantedAtMs`
+     * 僅留存稽核，不參與有效性判定（見 `ShizukuGrantTest` 的
+     * serviceVersionChangeKeepsValid／grantedAtMsDoesNotAffectCheck 與
+     * `ElevatedRunnerPhase3Test` 的 P3-1 pin）；無 TTL（永不過期）。
+     * B3 在另行綁定 serviceVersion／TTL 前不得假設本層會過期舊授權——
+     * 過期語義歸 B3（需改 policy＋同步更新 pin 測試，此處僅文件化，見 TODO）。
+     *
+     * TODO(B3): 若需綁定 serviceVersion（如 Shizuku 升級即重授權）或 TTL
+     * （授權時效），在此 policy 新增判定分支＋原因碼，並更新兩 runner 的
+     * grant 門測試；現階段刻意不做（P3-1 文件化不改行為）。
+     */
     suspend fun check(
         currentProviderId: String?,
         currentRevision: Long?,

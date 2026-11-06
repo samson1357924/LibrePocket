@@ -25,6 +25,15 @@ import rikka.shizuku.Shizuku
  * Denied（B2：舊碼回 Failed，現對齊 B1 門語義），spawn 異常回
  * [ShellResult.Failed]，呼叫方回落免 Root 路徑。
  *
+ * B2 失敗訊息收斂 pin（Phase3 P3 低風險，行為不變）：
+ * 非零 exit 回 `Failed("shizuku command failed exit=...: $redacted")`，
+ * `$redacted` 經 `Redactor.redactError` 收斂。路徑覆蓋邊界
+ * （見 `Redactor.ANDROID_PATH`）：覆蓋 `/data/data|user|app|media|misc`、
+ * `/storage/emulated`、`/sdcard`；不覆蓋 `/system|/vendor|/data/adb`——
+ * su／Shizuku 可信路徑常量屬公開 allowlist，非秘密，原文保留可接受。
+ * 保守做法：保留 redact 不改審計格式（B2 紅線），僅以本 KDoc＋
+ * `ElevatedRunnerPhase3Test.redactorPathBoundaryPinsBehavior` 負向測試鎖定邊界。
+ *
  * - 遠端進程經 Shizuku 13.x `newProcess(argv, env, dir)`（private，
  *   反射呼叫；回傳物經 [ShizukuRemoteProcess.wrap] 包裝，永不直 cast
  *   `Process`，binder 死亡/版本差異經 runCatching 收斂為 [ShellResult.Failed]）；
@@ -42,9 +51,22 @@ import rikka.shizuku.Shizuku
  * [grantCheck] 為必填參數（mandatory dependency，無預設值；缺接線編譯失敗，
  * 一律零 spawn）：呼叫方必須每次供給新鮮 [GrantCheck]，產品 B3 供給
  * `{ store.check(freshProviderId, freshRevision) }`
- *（blocking 包裝由 B3 決定，runner 非 suspend 故不能直調 suspend DataStore）；
+ *（blocking 包裝由 B3 決定，runner 非 suspend 故不能直調 suspend DataStore；
+ * blocking 包裝契約——IO dispatcher 單發射讀 grant DataStore＋
+ * `snapshotWithRevisionStrict` 同 emission 取 endpoint 身分／revision＋永不快取＋
+ * 撕裂讀禁用——見 [ShizukuGrantStore.check] KDoc，本 runner 側只消費 supplier，
+ * 不自建快取）；
  * [GrantCheck.Invalid] 一律 `Denied(NOT_WHITELISTED, reason)` 且零 spawn，
  * [grantCheck] 抛異常同樣 fail-closed `Denied(NOT_WHITELISTED)` 且零 spawn。
+ *
+ * Phase3 spawn 前重求值（TOCTOU 收斂，行為見 `ElevatedRunnerPhase3Test`）：
+ * 准入（[ElevatedCleanupTracker.tryEnterReserved]）已占席後、配額
+ * （[ShellQuota.tryAcquire]）之前、spawn 前一刻重求 `grantCheck`＋
+ * `activationCheck`＋`bridgeGranted` 新鮮快照＋重估 `status()`
+ *（首次 `status()` 在准入前、重估在准入後、配額在重估後——慢 IPC 阻塞不占配額，
+ * 早段阻塞尚未占席，重驗阻塞已占席但配額尚未 acquire），
+ * 任一翻轉即按早拒同錯誤碼 Denied 且零 spawn；
+ * 拒絕經 `finally { leaveCall() }` 釋席，且配額尚未 acquire 故不耗配額。
  *
  * U1 執行門（owner 新 P1-1＋P1-2）：
  * 每次 [runBinary] 呼叫新鮮求值 [bridgeGranted] 與 [activationCheck]
@@ -228,6 +250,57 @@ class ShizukuShellRunner(
             }
         }
         try {
+            // Phase3 spawn 前重求值（TOCTOU 收斂）：准入已占席（active+1）但配額尚未消耗；
+            // 此處重求 grant＋activation＋bridge 新鮮快照＋重估 status()（首次 status
+            // 在准入前、重估在准入後、配額在重估後——慢 IPC 阻塞不占配額），任一翻轉
+            // 即按早拒同碼 Denied 且零 spawn；拒絕經 finally leaveCall 釋席，不耗配額
+            //（quota 尚未 acquire）。
+            val reGrant = try {
+                grantCheck()
+            } catch (_: Exception) {
+                return ElevatedBinaryResult.Denied(
+                    ShellDeny.NOT_WHITELISTED,
+                    "grant check failed (fail-closed, no spawn)",
+                )
+            }
+            when (reGrant) {
+                is GrantCheck.Valid -> Unit
+                is GrantCheck.Invalid -> return ElevatedBinaryResult.Denied(ShellDeny.NOT_WHITELISTED, reGrant.reason)
+            }
+            val reActivated = try {
+                activationCheck()
+            } catch (_: Exception) {
+                return ElevatedBinaryResult.Denied(
+                    ShellDeny.NOT_WHITELISTED,
+                    "activation check failed (fail-closed, no spawn)",
+                )
+            }
+            if (!reActivated) {
+                return ElevatedBinaryResult.Denied(
+                    ShellDeny.NOT_WHITELISTED,
+                    "activation not ready (fail-closed, no spawn)",
+                )
+            }
+            val reBridge = try {
+                bridgeGranted()
+            } catch (_: Exception) {
+                return ElevatedBinaryResult.Denied(
+                    ShellDeny.NOT_WHITELISTED,
+                    "privilege bridge check failed (fail-closed, no spawn)",
+                )
+            }
+            if (!reBridge) {
+                return ElevatedBinaryResult.Denied(
+                    ShellDeny.NOT_WHITELISTED,
+                    "privilege bridge off (fail-closed, no spawn)",
+                )
+            }
+            // status 重估（同早段門語義：抛異常折 BinderUnreachable，denyFor 映射；
+            // 早段已求值一次，此處為 spawn 前最終快照，binder 翻轉即零 spawn 拒絕）。
+            val reStatus = runCatching { status() }
+                .getOrDefault(ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN))
+            ShizukuStatusGate.denyFor(reStatus)
+                ?.let { return ElevatedBinaryResult.Denied(it.reason, it.message) }
             if (!quota.tryAcquire()) {
                 return ElevatedRunnerCommon.quotaExceeded()
             }

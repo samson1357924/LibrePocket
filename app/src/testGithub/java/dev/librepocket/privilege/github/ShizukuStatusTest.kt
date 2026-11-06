@@ -1,8 +1,6 @@
 package dev.librepocket.privilege.github
 
-import dev.librepocket.shell.ElevatedRequest
 import dev.librepocket.shell.ShellDeny
-import dev.librepocket.shell.ShellResult
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -73,8 +71,10 @@ class ShizukuStatusTest {
         assertTrue("$down", down is ShizukuStatus.BinderUnreachable)
     }
 
-    @Suppress("DEPRECATION")
     @Test fun gateDeniesTypedWithoutSpawn() {
+        // Phase3 P2：`runIfAvailable` 已刪（防 B3 經緩存 Available 直調 spawn）；
+        // 門語義只經 denyFor 斷言，零 spawn 由 runner 側內門保證
+        //（見 `ElevatedRunnerB2Test.shizukuGateBlocksSpawnWhenNotAvailable`）。
         val cases = listOf(
             ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN),
             ShizukuStatus.PermissionDenied(15),
@@ -82,18 +82,9 @@ class ShizukuStatusTest {
             ShizukuStatus.VersionUnsupported(10),
         )
         for (status in cases) {
-            var spawns = 0
-            val result = ShizukuStatusGate.runIfAvailable(
-                status,
-                ElevatedRequest(listOf("id"), "B1-T"),
-                1_000L,
-            ) { _, _ ->
-                spawns++
-                ShellResult.Ok("x", "", 0, false)
-            }
-            assertTrue("$status -> $result", result is ShellResult.Denied)
-            assertEquals(ShellDeny.NOT_WHITELISTED, (result as ShellResult.Denied).reason)
-            assertEquals(0, spawns)
+            val denied = ShizukuStatusGate.denyFor(status)
+            assertTrue("$status -> $denied", denied != null)
+            assertEquals(ShellDeny.NOT_WHITELISTED, denied!!.reason)
         }
         assertNull(ShizukuStatusGate.denyFor(ShizukuStatus.Available(15)))
     }
@@ -109,19 +100,10 @@ class ShizukuStatusTest {
         assertTrue(old.message.contains(ShizukuStatus.REASON_VERSION_UNSUPPORTED))
     }
 
-    @Suppress("DEPRECATION")
-    @Test fun availableDelegatesToSpawn() {
-        var spawns = 0
-        val result = ShizukuStatusGate.runIfAvailable(
-            ShizukuStatus.Available(15),
-            ElevatedRequest(listOf("id"), "B1-T"),
-            1_000L,
-        ) { _, _ ->
-            spawns++
-            ShellResult.Ok("ok", "", 0, false)
-        }
-        assertTrue("$result", result is ShellResult.Ok)
-        assertEquals(1, spawns)
+    @Test fun availablePassesGate() {
+        // Phase3 P2：放行僅回 null，執行由呼叫方（runner 內門）負責，不經門直調 spawn；
+        // runner 側放行＋spawn 見 `ElevatedRunnerB2Test.shizukuGateAvailableAllowsSpawn`。
+        assertNull(ShizukuStatusGate.denyFor(ShizukuStatus.Available(15)))
     }
 
     @Test fun binderEventsDispatchWithFaultIsolation() {

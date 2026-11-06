@@ -33,9 +33,13 @@ internal object SuBinaryResolver {
      *
      * 輸入先做字串正規化（合併重複 `/`、剔除 `.` 段）再比對；
      * TOCTOU／symlink 揭露：此處只做字串層正規化，不解 symlink、不做
-     * 存在時點綁定，解析到 spawn 之間的替換（TOCTOU）與表內路徑被鏈到
-     * 不可信目標（symlink）仍不在本層收斂，依賴裝置側 root 方案自身的
-     * 路徑完整性。
+     * 存在時點綁定；Runner 在 spawn 前重做 `exists`＋本判定（resolve 後路徑，
+     * 見 [RootSuRunner] spawn 前重求值），缩小解析→執行窗口，但重驗→exec 之間
+     * 的替換（TOCTOU）與表內路徑被鏈到不可信目標（symlink）仍不在本層收斂，
+     * 依賴裝置側 root 方案自身的路徑完整性。
+     * 注記：真 O_NOFOLLOW 需 NIO `Os.open(..., O_NOFOLLOW)` 句柄綁定
+     * （存在性重驗後持句柄 exec，關閉替換窗口），屬 B3 E2E 範疇；
+     * 本層以重驗收斂窗口並以本 KDoc 揭露殘餘，不作字串外承諾。
      */
     fun isTrusted(path: String): Boolean = normalizeSuPath(path) in RootSuProbe.SU_BINARIES
 

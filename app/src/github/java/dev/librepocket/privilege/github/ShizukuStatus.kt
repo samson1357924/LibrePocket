@@ -1,7 +1,6 @@
 package dev.librepocket.privilege.github
 
 import android.content.pm.PackageManager
-import dev.librepocket.shell.ElevatedRequest
 import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellResult
 import rikka.shizuku.Shizuku
@@ -95,7 +94,8 @@ val ShizukuStatus.canExecute: Boolean
 object ShizukuStatusGate {
     /**
      * 非 Available 回 typed [ShellResult.Denied]；Available 回 null
-     * （放行，由呼叫方執行）。
+     * （放行，由呼叫方经自有内门执行——两 runner 在 runBinary 内自带
+     * grant/activation/bridge/status 门，不经此处 spawn）。
      *
      * 語義（P2-B 釐清）：四種非 Available 狀態一律回
      * [ShellDeny.NOT_WHITELISTED]（[ShellDeny] 無更精確的
@@ -103,6 +103,20 @@ object ShizukuStatusGate {
      *（各狀態的 `REASON_*` 碼＋上下文），呼叫方不得對 `message`
      * 做程式分支（審計若按 reason 分類會失真：verdict 層只見
      * NOT_WHITELISTED）。
+     *
+     * P3-2 现状 pin（行为不变）：verdict 粒度坍缩为单码 NOT_WHITELISTED 系刻意
+     * （[ShellDeny] 无 binder/授权/版本细分）；细因仅进 `message` 作审计文本，
+     * 不得作程序分支（见上）。TODO(B3): 若需结构化原因码（如新增
+     * `DeniedWithCode(reason, code)` 或审计侧 reasonCode 字段），须同步
+     * [dev.librepocket.shell.ShellResult] 与审计映射并更新门测试；
+     * 现阶段刻意不做（P3-2 文件化不改行为）。
+     *
+     * 相容壳移除说明（Phase3 P2）：旧 `@Deprecated runIfAvailable` 已删除。
+     * 其 `Available → 直调 spawn` 语义允许 B3 经缓存的 Available 绕过 runner
+     * 内门直达 spawn；删除后放行路径唯一：`denyFor(...) == null` 再由呼叫方
+     * （runner 内门，非缓存状态）执行。测试替代：门语义由
+     * `ShizukuStatusTest` 的 denyFor 断言覆盖，零 spawn 由 runner 侧
+     * `ElevatedRunnerB2Test.shizukuGateBlocksSpawnWhenNotAvailable` 覆盖。
      */
     fun denyFor(status: ShizukuStatus): ShellResult.Denied? = when (status) {
         is ShizukuStatus.Available -> null
@@ -120,19 +134,6 @@ object ShizukuStatusGate {
             "${status.reason} (shizuku binder unreachable; fallback to unprivileged path)",
         )
     }
-
-    /**
-     * 門控執行：拒絕即回 Denied 且不碰 [spawn]；放行才委派 [spawn]。
-     * 純函數可測（spawn 為假 lambda；B2/B3 前真實 runner 不經此函數）。
-     * 測試專用相容殼，B3 前相容保留，不刪除；B3 前重審移除。
-     */
-    @Deprecated("測試專用，產品走 denyFor；B3 dispatcher 前守衛用 denyFor")
-    fun runIfAvailable(
-        status: ShizukuStatus,
-        request: ElevatedRequest,
-        timeoutMs: Long,
-        spawn: (ElevatedRequest, Long) -> ShellResult,
-    ): ShellResult = denyFor(status) ?: spawn(request, timeoutMs)
 }
 
 /**
@@ -156,6 +157,15 @@ object ShizukuStatusGate {
  * - 真實 binder attach→detach→attach 不重複（上游不累積、重建後單分發）
  *   需裝置 E2E 驗收（歸 B3，見 [PrivilegeActivation]；JVM 下上游靜態表無法斷言，
  *   僅由 [detach] 內同一引用 remove* 保證）。
+ *
+ * B3 接線立約（Phase3 P2，僅 KDoc，行為不變）：
+ * - `onDead` 產品接線：binder 死亡即視為授權失效——回呼內執行 grant 撤銷
+ *   （`ShizukuGrantStore.clear()`）並記審計；撤銷後已建 runner 次 call 即經
+ *   grant 門／spawn 前重求值拒絕且零 spawn（見兩 runner grant 測試的全鏈路）。
+ * - 禁止快取 [ShizukuStatus]：狀態只在每次 call 經 [ShizukuStatusProbe.status]
+ *   新鮮求值（含 runner spawn 前重估）；任何「存 Available 複用」皆會繞過
+ *   runner 內門直達 spawn（`runIfAvailable` 已刪即為封堵此路徑）。
+ *   回呼內只做撤銷＋審計，不得存狀態供後續放行。
  */
 class ShizukuBinderEvents {
     private val receivedCallbacks = mutableListOf<() -> Unit>()
@@ -176,6 +186,10 @@ class ShizukuBinderEvents {
         synchronized(lock) { receivedCallbacks += callback }
     }
 
+    /**
+     * binder 死亡回呼註冊（B3 接線：回呼內执行 grant 撤銷＋審計，見本類 KDoc 立約；
+     * 回呼內禁止快取 [ShizukuStatus]，狀態只在每次 call 新鮮求值）。
+     */
     fun onDead(callback: () -> Unit) {
         synchronized(lock) { deadCallbacks += callback }
     }
@@ -230,6 +244,11 @@ class ShizukuBinderEvents {
     /**
      * 解除接線：反註冊上游 listener 並清空本地回呼表、丟棄暫存引用、重置守衛。
      *
+     * 產品唯一出口：任何 attach 成功路徑必須以 [detach] 收尾，不得只調 [clear]——
+     * [clear] 不觸碰上游註冊，只清本地會造成上游靜態表殘留累積（listener 洩漏，
+     * 每次 attach→clear 循環在 Shizuku 上游靜態表多留兩個引用；JVM 單測無上游
+     * 故不斷言，見本類 KDoc S2-B）。
+     *
      * 上游 13.1.5 已提供 `removeBinderReceivedListener` /
      * `removeBinderDeadListener`（簽名已對本地 gradle cache 的
      * api-13.1.5.aar 以 javap 驗證；舊版上游缺此方法時
@@ -258,8 +277,10 @@ class ShizukuBinderEvents {
      *
      * 注意：此函數不觸碰上游註冊（純 JVM，JVM 單測安全）；
      * 產品路徑請用 [detach] 以同時反註冊上游，避免上游殘留累積。
+     * 可見性收斂（Phase3 P2）：internal——產品只暴露 [detach]，
+     * 外部誤調本函數會造成上游 listener 洩漏（同上）。
      */
-    fun clear() {
+    internal fun clear() {
         synchronized(lock) {
             receivedCallbacks.clear()
             deadCallbacks.clear()

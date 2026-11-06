@@ -13,14 +13,13 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * W1 getter-throw 回歸（owner 新 P1 fail-closed & crash）：
+ * X1 getter-throw 回歸（owner 新 P1 lifecycle，W1 語義保留）：
  * `process.inputStream`／`errorStream` getter 本身可抛（`ShizukuRemoteProcess`
- * 的 ISE/UOE/ITE）。舊碼把 getter 求值留在 gobbler daemon thread 內、
- * `copyCapped` try/catch 之外：抛即逃出執行緒，不 `markFailed`
- * （`readFailed=false` 誤判 Ok）＋觸 app 未捕捉 handler。
- * 現 [ElevatedProcessIo.drain] 在呼叫執行緒先行安全取雙流，任一 getter 抛即
- * 清理後回 `readFailed=true`；兩 runner 既有分支即回同一固定字串 Failed
- * （不帶 remote 原文、不帶輸出），gobbler 只在雙流取成功後啟動。
+ * 的 ISE/UOE/ITE）或可阻塞（同步 Binder IPC，見 BlockedGetterTest）。
+ * X1 將 getter 移回 gobbler 內整段 try/catch：throw 即 markFailed（W1 語義保留：
+ * 任一流 throw 即 readFailed=true，兩 runner 回同一固定字串 Failed，不帶
+ * remote 原文；無未捕捉例外），block 則 caller 不受影響照常進 deadline/poll/kill
+ * （有界，不卡死呼叫執行緒；kill 只關已取流，不重調 getter）。
  *
  * 全 fake（局部自訂 getter-throw 假進程，共用 fixture 不支援 getter throw
  * 故不動它），零真機、零 su、零 binder。4 測：兩 runner ×（stdout throw／

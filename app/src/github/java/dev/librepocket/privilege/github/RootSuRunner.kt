@@ -141,6 +141,10 @@ class RootSuRunner(
     private val grantCheck: () -> GrantCheck,
 ) : BinaryElevatedRunner {
 
+    /**
+     * 文字相容殼：經 [toShellResult] 丟棄 cleanupIncomplete（[ShellResult] 無此欄位）；
+     * 監測須用 runBinary（二進位 [ElevatedBinaryResult] 為準）。
+     */
     override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult =
         runBinary(request, timeoutMs).toShellResult()
 
@@ -273,8 +277,7 @@ class RootSuRunner(
             // R1-A 雙軌＋U2-B stderr 獨立小 cap：截圖 stdout 即 8M 軌，stderr 維持
             // 通用軌（硬讀取 512K／截斷 64K；截圖錯誤訊息短，降 OOM 峰值）；
             // 其餘通用命令走舊 64K/512K。
-            val isScreenshot = request.argv == listOf("screencap", "-p") ||
-                request.argv == listOf("cat", "/dev/graphics/fb0")
+            val isScreenshot = ElevatedRunnerCommon.isScreenshotArgv(request.argv)
             val hardCapBytes = if (isScreenshot) {
                 ElevatedProcessIo.BINARY_SCREENSHOT_HARD_CAP_BYTES
             } else {
@@ -307,7 +310,10 @@ class RootSuRunner(
             // 必為真實 I/O 錯誤（部分 PNG 當完整幀即虛構，故回 Failed，不回 Ok）。
             // 超時/取消路徑已先回 TimedOut，不受影響（預期 close 收斂保留）。
             if (raw.readFailed) {
-                return ElevatedBinaryResult.Failed("elevated IO read failed (incomplete stream)")
+                return ElevatedBinaryResult.Failed(
+                    "elevated IO read failed (incomplete stream)",
+                    cleanupIncomplete = raw.cleanupIncomplete,
+                )
             }
             if (raw.exitCode != 0) {
                 val redacted = Redactor.redactError(String(err.bytes, Charsets.UTF_8))
@@ -315,9 +321,13 @@ class RootSuRunner(
                     ElevatedBinaryResult.Denied(
                         ShellDeny.NOT_WHITELISTED,
                         "su denied exit=${raw.exitCode} (NO_PRIVILEGE; fallback to unprivileged path): $redacted",
+                        cleanupIncomplete = raw.cleanupIncomplete,
                     )
                 } else {
-                    ElevatedBinaryResult.Failed("su failed exit=${raw.exitCode}: $redacted")
+                    ElevatedBinaryResult.Failed(
+                        "su failed exit=${raw.exitCode}: $redacted",
+                        cleanupIncomplete = raw.cleanupIncomplete,
+                    )
                 }
             }
             return ElevatedBinaryResult.Ok(
@@ -339,6 +349,9 @@ class RootSuRunner(
      *
      * 非目錄即抛（由 [runBinary] 的 spawn catch 轉 Failed），
      * 不靜默續行：靜默回落到預設 cwd 會讓相對路徑解析到不可控目錄。
+     *
+     * 真機路徑（僅真機／裝置驗收調用，JVM 單測一律注入假 `spawn`，
+     * 不得直調本函數；需真子進程驗收歸 B3 E2E）。
      */
     private fun pinnedSpawn(argv: List<String>): Process {
         val pb = ProcessBuilder(argv)
@@ -378,10 +391,9 @@ class RootSuRunner(
          * （傳送層縱深防禦；引號/括號等若出現在此即表示上游衛生有漏，
          * 包覆後仍可安全經一次 `su -c` 字串解析）。
          *
-         * P2-A 可見性：[ElevatedRunnerTest]/[ElevatedRunnerB2Test] 直接調用，
-         * 故保持 public（同包測試亦可 internal，但跨包相容起見保留 public）。
+         * P2 可見性：同包測試直接調用，故為 internal（不跨包暴露）。
          */
-        fun quoteArg(arg: String): String {
+        internal fun quoteArg(arg: String): String {
             if (arg.isNotEmpty() && arg.all { it in SAFE_ARG_CHARS }) {
                 return arg
             }

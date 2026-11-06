@@ -430,6 +430,16 @@ internal object ElevatedProcessIo {
     /** R1-A 截圖二進位硬讀取上限（8M，每流 OOM 上界；溢出經 [Drained.truncated] 帶出）。 */
     const val BINARY_SCREENSHOT_HARD_CAP_BYTES: Int = 8 * 1024 * 1024
 
+    /**
+     * 吞例外計數（P2 可觀測，僅診斷，不改 verdict）：`isCancelled`／`killer` 鉤抛
+     * 即吞（fail-closed：前者折為未取消，後者已盡力殺），此處計數供單測斷言
+     * 「恒抛鉤計數翻轉且 verdict 不變」。刻意靜默理由：鉤為外部注入（coroutine
+     * Job／Binder killer），抛異常不得升級為崩潰或誤殺，收斂為 fail-closed
+     * 即正確；計數僅供監測，不進 verdict。
+     */
+    internal val swallowedIsCancelledThrows = AtomicInteger(0)
+    internal val swallowedKillerThrows = AtomicInteger(0)
+
     /** P1-B magic number 抽常數（行為不變）：輪詢切片 / gobbler 有界 join / 成功路徑放寬 join / 殺後等待 / 複製緩衝。 */
     private const val POLL_SLICE_MS = 50L
     private const val GOBBLER_JOIN_MS = 5_000L
@@ -465,6 +475,14 @@ internal object ElevatedProcessIo {
          * gobbler 有界 join 未完成（部分讀）：呼叫方須併入 truncated，絕不靜默短讀不標。
          * R1-A：另含硬上限溢出（任一流丟棄即 true，見 [ElevatedCappedPipe.didOverflow]），
          * 截圖 8M==8M 時靠此位區分恰上限通過與超限丟棄。
+         *
+         * P2 語義文件化（joinIncomplete vs overflow，不拆欄位，OR 收斂）：
+         * - joinIncomplete：gobbler 有界 join 超界仍存活（遠端流未 EOF／不可中斷 stall），
+         *   部分讀，經此位標截斷；
+         * - overflow：任一流硬上限丟棄（通用 512K／截圖 stdout 8M＋stderr 512K 超額丟棄），
+         *   部分保留，經此位標截斷；
+         * 兩者皆為「部分位元組」，呼叫方一律併入 truncated（成功路徑仍回 Ok(truncated=true)，
+         * 不降為 Failed；capture 側 Ok.truncated 即 null，不摘要部分幀）。
          */
         val truncated: Boolean = false,
         /**
@@ -514,13 +532,15 @@ internal object ElevatedProcessIo {
      * R1-A 雙軌＋U2-B stderr 獨立小 cap：`hardCapBytes` 預設
      * [ShellPolicy.HARD_READ_CAP_BYTES]（512K，通用命令）；截圖二進位 stdout 傳
      * [BINARY_SCREENSHOT_HARD_CAP_BYTES]（8M）。`hardCapErrBytes` 預設 null＝
-     * 同 stdout cap（通用軌行為不變）；截圖傳 [ShellPolicy.HARD_READ_CAP_BYTES]
-     * （512K，截圖錯誤訊息短，降 OOM 峰值）。[Drained] 結構不變，
+     * 同 stdout cap（通用軌行為不變，預設顯式即 [ShellPolicy.HARD_READ_CAP_BYTES]
+     * 512K；截圖傳 [ShellPolicy.HARD_READ_CAP_BYTES]
+     * 512K，截圖錯誤訊息短，降 OOM 峰值）。[Drained] 結構不變，
      * `truncated` 含 join 未完成或硬上限溢出（任一流丟棄即 true，絕不靜默短讀不標）。
      *
      * R3-A 取消限制（owner P2-5）：[isCancelled] 預設只看 Thread 中斷，
      * coroutine 呼叫方應傳 `isCancelled = { !job.isActive }`
-     * （或 `!coroutineContext.isActive`）；鉤抛異常折為未取消（fail-closed）。
+     * （或 `!coroutineContext.isActive`）；鉤抛異常折為未取消（fail-closed，
+     * 刻意靜默：外部鉤异常不得誤殺，計數見 [swallowedIsCancelledThrows]）。
      */
     fun drain(
         process: Process,
@@ -530,10 +550,18 @@ internal object ElevatedProcessIo {
         hardCapBytes: Int = ShellPolicy.HARD_READ_CAP_BYTES,
         hardCapErrBytes: Int? = null,
     ): Drained {
+        // P2 caller 中斷級聯（僅監測，不改 verdict）：入口 `Thread.interrupted()`
+        // 清除並記錄呼叫方預置中斷（清除後 isCancelled 預設鉤不再誤讀 caller 旗標，
+        // 健康進程仍走 finished；尾收前 joins 不再因預置中斷即抛），出口恢復一次
+        // （不吞 caller 中斷）。join 前不再暫清：入口已清，全程無 caller 旗標干擾。
+        val callerInterrupted = Thread.interrupted()
         // X1 有界 acquisition：deadline 移到 drain 入口第一行（outputStream 關閉
         // 之前），全部開銷計入同一 budget（單調時鐘，不受 wall-clock 回撥影響）。
-        val deadlineNanos = System.nanoTime() +
-            TimeUnit.MILLISECONDS.toNanos(timeoutMs.coerceAtLeast(0L))
+        // P2 上溢夾頂：timeoutMs 先 coerceAtMost(Long.MAX/1e6)，避免
+        // MILLISECONDS.toNanos(Long.MAX) 上溢回負（deadline 回過去即假性即時超時，
+        // Long.MAX 應為近無限而非即時超時；夾頂後 Long.MAX 即約 292M 年，不懸掛）。
+        val safeTimeoutMs = timeoutMs.coerceAtLeast(0L).coerceAtMost(Long.MAX_VALUE / 1_000_000L)
+        val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(safeTimeoutMs)
         // P1-B：spawn 成功後立即關子進程 stdin（子進程 stdin EOF）：等 stdin EOF 的
         // 子進程（如 cat）不再假性 TimedOut。killer 內不關流，此處是唯一關 stdin 處
         //（drain kill 路徑另關已取的 stdout/stderr，不碰 stdin）。
@@ -634,7 +662,15 @@ internal object ElevatedProcessIo {
         var finished = false
         try {
             while (true) {
-                if (runCatching { isCancelled() }.getOrDefault(false)) break
+                // P2 吞例外計數：isCancelled 抛即折為未取消（fail-closed，不誤殺；
+                // 刻意靜默理由同上，計數見 swallowedIsCancelledThrows）。
+                val cancelled = try {
+                    isCancelled()
+                } catch (_: Exception) {
+                    swallowedIsCancelledThrows.incrementAndGet()
+                    false
+                }
+                if (cancelled) break
                 val remaining = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime())
                 if (remaining <= 0) break
                 val slice = minOf(remaining, POLL_SLICE_MS)
@@ -674,7 +710,14 @@ internal object ElevatedProcessIo {
                 .coerceAtLeast(0L)
             val cleanupBudgetMs = minOf(maxOf(cleanupRemainMs, CLEANUP_MIN_MS), CLEANUP_JOIN_MS)
             val cleanupOk = runCleanupBounded(cleanupBudgetMs) {
-                runCatching { killer(process) }
+                // P2 吞例外計數：killer 抛即吞（best-effort，已盡力殺；刻意靜默，
+                // 不升級為崩潰，計數見 swallowedKillerThrows；流 close 另逐段吞，
+                // 預期 close 收斂，不計數）。
+                try {
+                    killer(process)
+                } catch (_: Exception) {
+                    swallowedKillerThrows.incrementAndGet()
+                }
                 runCatching { inAcquired.get()?.close() }
                 runCatching { errAcquired.get()?.close() }
             }
@@ -803,9 +846,15 @@ internal object ElevatedProcessIo {
         } else if (ElevatedCleanupTracker.outstanding() == 0) {
             ElevatedCleanupTracker.noteClean()
         }
+        // P2 caller 中斷恢復：入口預置中斷出口恢復一次（不吞 caller 中斷）。
+        if (callerInterrupted) Thread.currentThread().interrupt()
         return Drained(
             stdout = out.bytes(),
             stderr = err.bytes(),
+            // P2 exit -1 難分註記：finished 下 exitValue() 抛（遠端漂移）即 -1，
+            // 與 kill 路徑（!finished）-1 同值但以 timedOut 區分（false vs true），
+            // 不可僅看 exitCode；runner 側 finished -1 即 Failed（非零分支），
+            // kill -1 即 TimedOut，verdict 不混。
             exitCode = if (finished) runCatching { process.exitValue() }.getOrDefault(-1) else -1,
             timedOut = !finished,
             // R1-A：join 未完成或任一流硬上限溢出（>hardCapBytes 丟棄）即 truncated；
@@ -970,6 +1019,10 @@ internal object ElevatedProcessIo {
 internal object ElevatedRunnerCommon {
     /** 原因碼缺失拒絕訊息（矩陣 §3 審計要求原因碼非空）。 */
     const val REASON_CODE_REQUIRED_MESSAGE = "reasonCode required (matrix §3 audit)"
+
+    /** 截圖 argv 精確匹配（R1-A 雙軌＋U2-B stderr 小 cap 共用判定，兩 runner 共用）。 */
+    internal fun isScreenshotArgv(argv: List<String>): Boolean =
+        argv == listOf("screencap", "-p") || argv == listOf("cat", "/dev/graphics/fb0")
 
     /** 配額耗盡拒絕訊息。 */
     const val QUOTA_EXCEEDED_MESSAGE = "elevated shell quota exceeded"

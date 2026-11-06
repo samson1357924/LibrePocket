@@ -122,6 +122,10 @@ class ShizukuShellRunner(
     private val grantCheck: () -> GrantCheck,
 ) : BinaryElevatedRunner {
 
+    /**
+     * 文字相容殼：經 [toShellResult] 丟棄 cleanupIncomplete（[ShellResult] 無此欄位）；
+     * 監測須用 runBinary（二進位 [ElevatedBinaryResult] 為準）。
+     */
     override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult =
         runBinary(request, timeoutMs).toShellResult()
 
@@ -236,8 +240,7 @@ class ShizukuShellRunner(
             // R1-A 雙軌＋U2-B stderr 獨立小 cap：截圖 stdout 即 8M 軌，stderr 維持
             // 通用軌（硬讀取 512K／截斷 64K；截圖錯誤訊息短，降 OOM 峰值）；
             // 其餘通用命令走舊 64K/512K。
-            val isScreenshot = request.argv == listOf("screencap", "-p") ||
-                request.argv == listOf("cat", "/dev/graphics/fb0")
+            val isScreenshot = ElevatedRunnerCommon.isScreenshotArgv(request.argv)
             val hardCapBytes = if (isScreenshot) {
                 ElevatedProcessIo.BINARY_SCREENSHOT_HARD_CAP_BYTES
             } else {
@@ -270,11 +273,17 @@ class ShizukuShellRunner(
             // 必為真實 I/O 錯誤（部分 PNG 當完整幀即虛構，故回 Failed，不回 Ok）。
             // 超時/取消路徑已先回 TimedOut，不受影響（預期 close 收斂保留）。
             if (raw.readFailed) {
-                return ElevatedBinaryResult.Failed("elevated IO read failed (incomplete stream)")
+                return ElevatedBinaryResult.Failed(
+                    "elevated IO read failed (incomplete stream)",
+                    cleanupIncomplete = raw.cleanupIncomplete,
+                )
             }
             if (raw.exitCode != 0) {
                 val redacted = Redactor.redactError(String(err.bytes, Charsets.UTF_8))
-                return ElevatedBinaryResult.Failed("shizuku command failed exit=${raw.exitCode}: $redacted")
+                return ElevatedBinaryResult.Failed(
+                    "shizuku command failed exit=${raw.exitCode}: $redacted",
+                    cleanupIncomplete = raw.cleanupIncomplete,
+                )
             }
             return ElevatedBinaryResult.Ok(
                 stdout = out.bytes,
@@ -292,6 +301,9 @@ class ShizukuShellRunner(
      * P0 cwd 釘死：遠端建子進程時把 `dir` 釘到 privateRoot（原 `null` 會落在
      * system_server 預設 cwd，不可控）。privateRoot 為 null 時維持 null，
      * 但政策層已 fail-closed，殘餘僅非路徑子命令。
+     *
+     * 真機路徑（僅真機／裝置驗收調用，JVM 單測一律注入假 `spawn`，
+     * 不得直調本函數；需真 Binder 驗收歸 B3 E2E）。
      */
     private fun pinnedSpawn(argv: List<String>): Process = defaultSpawnWithDir(argv, privateRoot)
 

@@ -108,9 +108,16 @@ class RootFramebufferCapture(
             audit: PrivilegeAuditLog,
         ): ByteArray? {
             audit.record(request.argv, request.reasonCode, result.verdict())
-            val ok = result as? ElevatedBinaryResult.Ok ?: return null
-            if (ok.truncated) return null
-            return ok.stdout.copyOf().takeIf { it.isNotEmpty() }
+            when (result) {
+                is ElevatedBinaryResult.Ok -> {
+                    if (result.truncated) return null
+                    return result.stdout.copyOf().takeIf { it.isNotEmpty() }
+                }
+                is ElevatedBinaryResult.Denied,
+                is ElevatedBinaryResult.Failed,
+                is ElevatedBinaryResult.TimedOut,
+                -> return null
+            }
         }
 
         /**

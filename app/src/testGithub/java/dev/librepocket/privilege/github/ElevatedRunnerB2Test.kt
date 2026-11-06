@@ -79,13 +79,19 @@ class ElevatedRunnerB2Test {
     }
 
     @Test fun suDeniedKnownSignalsStillDenied() {
-        // su 側拒絕本來就帶明確關鍵字，維持 Denied。
+        // P2 精確化：只認 `^su:` 前綴行內命中 denied/rejected/eacces/eperm。
         assertTrue(isSuDenied("su: permission denied".toByteArray(), 1))
-        assertTrue(isSuDenied("Permission denied".toByteArray(), 1))
         assertTrue(isSuDenied("su: request rejected".toByteArray(), 1))
+        assertTrue(isSuDenied("su: EACCES (permission denied)".toByteArray(), 1))
+        assertTrue(isSuDenied("  su: permission denied".toByteArray(), 1))
         // exit==0 永不視為拒絕；空白 stderr 亦不視為拒絕。
         assertFalse(isSuDenied("su: permission denied".toByteArray(), 0))
         assertFalse(isSuDenied(ByteArray(0), 1))
+        // P2 負向：無前綴即使含關鍵字亦不算拒絕（內層輸出）。
+        assertFalse(isSuDenied("Permission denied".toByteArray(), 1))
+        assertFalse(isSuDenied("OPERATION NOT PERMITTED".toByteArray(), 1))
+        assertFalse(isSuDenied("REQUEST REJECTED".toByteArray(), 1))
+        assertFalse(isSuDenied("cat: /x: EACCES".toByteArray(), 1))
     }
 
     @Test fun suBinaryMapsToFailedRedacted() {
@@ -137,6 +143,8 @@ class ElevatedRunnerB2Test {
     // ---- 2. process-group kill best-effort＋cancel 鉤 ----
 
     @Test fun timeoutKillsWholeGroupViaKiller() {
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
         var kills = 0
         var lastVictim: Process? = null
         val runner = RootSuRunner(
@@ -156,6 +164,10 @@ class ElevatedRunnerB2Test {
         assertTrue("$r", r is ShellResult.TimedOut)
         assertEquals(1, kills)
         assertTrue((lastVictim as? FakeProcess)?.destroyed == true)
+        // P2-1 可恢復 timeout 不斷 breaker：clean killer 即 outstanding 歸零且不熔斷。
+        pollOutstandingTo(0)
+        assertFalse(ElevatedCleanupTracker.isSaturated())
+        assertFalse(ElevatedCleanupTracker.isBreakerOpen())
     }
 
     @Test fun cancelHookKillsAndUnblocks() {
@@ -440,16 +452,30 @@ class ElevatedRunnerB2Test {
     }
 
     @Test fun suDeniedCaseInsensitive() {
-        // 全大寫拒絕訊號仍命中（Locale.ROOT 折疊，不隨裝置語系漂移）。
-        assertTrue(isSuDenied("PERMISSION DENIED".toByteArray(), 1))
+        // 全大寫拒絕訊號仍命中（Locale.ROOT 折疊，不隨裝置語系漂移；須帶 ^su: 前綴）。
+        assertTrue(isSuDenied("SU: PERMISSION DENIED".toByteArray(), 1))
         assertTrue(isSuDenied("Su: Permission Denied".toByteArray(), 1))
-        assertTrue(isSuDenied("OPERATION NOT PERMITTED".toByteArray(), 1))
-        assertTrue(isSuDenied("REQUEST REJECTED".toByteArray(), 1))
+        assertTrue(isSuDenied("su: REQUEST REJECTED".toByteArray(), 1))
+        assertTrue(isSuDenied("su: Eacces".toByteArray(), 1))
     }
 
     // ---- P3-A 補強：超時/cancel/注入異常/門禁邊界（只斷 verdict＋計數＋位元組，不斷耗時） ----
 
+    private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.outstanding() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "outstanding=${ElevatedCleanupTracker.outstanding()} expected=$expected",
+                )
+            }
+            Thread.sleep(50L)
+        }
+    }
+
     @Test fun shizukuTimeoutKillsAndReturnsBinaryTimedOut() {
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
         val partial = "part-bytes".toByteArray()
         var kills = 0
         val runner = ShizukuShellRunner(
@@ -471,6 +497,10 @@ class ElevatedRunnerB2Test {
         b as ElevatedBinaryResult.TimedOut
         assertEquals(150L, b.timeoutMs)
         assertTrue(b.partialStdout.contentEquals(partial))
+        // P2-1 可恢復 timeout 不斷 breaker。
+        pollOutstandingTo(0)
+        assertFalse(ElevatedCleanupTracker.isSaturated())
+        assertFalse(ElevatedCleanupTracker.isBreakerOpen())
     }
 
     @Test fun shizukuCancelKillsAndUnblocks() {
@@ -788,6 +818,8 @@ class ElevatedRunnerB2Test {
     }
 
     @Test fun zeroTimeoutReturnsTimedOut() {
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
         var shizukuKills = 0
         val shizuku = ShizukuShellRunner(
             privateRoot = privateRoot,
@@ -806,6 +838,10 @@ class ElevatedRunnerB2Test {
         assertTrue("$sb", sb is ElevatedBinaryResult.TimedOut)
         assertEquals(1, shizukuKills)
         assertEquals(0L, (sb as ElevatedBinaryResult.TimedOut).timeoutMs)
+        // P2-1 可恢復 timeout 不斷 breaker。
+        pollOutstandingTo(0)
+        assertFalse(ElevatedCleanupTracker.isSaturated())
+        assertFalse(ElevatedCleanupTracker.isBreakerOpen())
 
         var rootKills = 0
         val root = RootSuRunner(

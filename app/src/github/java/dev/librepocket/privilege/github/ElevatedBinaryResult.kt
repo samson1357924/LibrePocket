@@ -24,9 +24,13 @@ import dev.librepocket.shell.ShellResult
  * 可自由竄改不影響內部。單測以 `contentEquals` 斷言，故構造拷貝安全。
  *
  * AA1 清理旗標穿透（owner 新 P1＋P2；僅監測，不改 verdict）：[Ok.cleanupIncomplete]／
- * [TimedOut.cleanupIncomplete] 由 drain 經 [ElevatedProcessIo.Drained.cleanupIncomplete]
- * 穿透（預設 false，舊 4 參構造仍可編譯；copy/getter/equals/hashCode/componentN
+ * [TimedOut.cleanupIncomplete]／[Denied.cleanupIncomplete]／[Failed.cleanupIncomplete]
+ * 由 drain 經 [ElevatedProcessIo.Drained.cleanupIncomplete]
+ * 穿透（預設 false，舊 4 參／2 參構造仍可編譯；copy/getter/equals/hashCode/componentN
  * 一併更新，手寫風格與 P2-A 一致）。auditAndExtract 不變（truncated 語義不混入）。
+ * P2 防禦拷貝說明：[Ok]/[TimedOut] 構造拷貝＋取值拷貝各一次；[copy] 預設參數
+ * 直接取內部 backing 引用（不經 getter），僅構造時拷貝一次，避免雙重拷貝
+ * （getter 仍每次拷貝，呼叫方拿到的皆為新拷貝，可自由竄改）。
  */
 sealed interface ElevatedBinaryResult {
     class Ok(
@@ -43,8 +47,8 @@ sealed interface ElevatedBinaryResult {
         val stderr: ByteArray get() = _stderr.copyOf()
 
         fun copy(
-            stdout: ByteArray = this.stdout,
-            stderr: ByteArray = this.stderr,
+            stdout: ByteArray = this._stdout,
+            stderr: ByteArray = this._stderr,
             exitCode: Int = this.exitCode,
             truncated: Boolean = this.truncated,
             cleanupIncomplete: Boolean = this.cleanupIncomplete,
@@ -76,13 +80,14 @@ sealed interface ElevatedBinaryResult {
         }
 
         override fun toString(): String =
-            "Ok(stdout=$_stdout, stderr=$_stderr, exitCode=$exitCode, truncated=$truncated, " +
+            "Ok(stdout.size=${_stdout.size}, stderr.size=${_stderr.size}, exitCode=$exitCode, truncated=$truncated, " +
                 "cleanupIncomplete=$cleanupIncomplete)"
     }
 
     data class Denied(
         val reason: ShellDeny,
         val message: String,
+        val cleanupIncomplete: Boolean = false,
     ) : ElevatedBinaryResult
 
     class TimedOut(
@@ -99,8 +104,8 @@ sealed interface ElevatedBinaryResult {
         val partialStderr: ByteArray get() = _partialStderr.copyOf()
 
         fun copy(
-            partialStdout: ByteArray = this.partialStdout,
-            partialStderr: ByteArray = this.partialStderr,
+            partialStdout: ByteArray = this._partialStdout,
+            partialStderr: ByteArray = this._partialStderr,
             timeoutMs: Long = this.timeoutMs,
             truncated: Boolean = this.truncated,
             cleanupIncomplete: Boolean = this.cleanupIncomplete,
@@ -132,11 +137,11 @@ sealed interface ElevatedBinaryResult {
         }
 
         override fun toString(): String =
-            "TimedOut(partialStdout=$_partialStdout, partialStderr=$_partialStderr, " +
+            "TimedOut(partialStdout.size=${_partialStdout.size}, partialStderr.size=${_partialStderr.size}, " +
                 "timeoutMs=$timeoutMs, truncated=$truncated, cleanupIncomplete=$cleanupIncomplete)"
     }
 
-    data class Failed(val message: String) : ElevatedBinaryResult
+    data class Failed(val message: String, val cleanupIncomplete: Boolean = false) : ElevatedBinaryResult
 }
 
 /**
@@ -149,6 +154,10 @@ sealed interface ElevatedBinaryResult {
  *
  * P2-A 可見性：保持 public（public Runner 的 supertype，
  * 收斂為 internal 會暴露內部超型別，故不收斂）。
+ *
+ * 清理旗標監測契約：[run] 為文字相容殼，經 [toShellResult] 丟棄
+ * cleanupIncomplete（[ShellResult] 無此欄位）；監測須用 runBinary
+ * （二進位 [ElevatedBinaryResult] 為準，攜 Ok/TimedOut/Denied/Failed 全分支旗標）。
  */
 interface BinaryElevatedRunner : ElevatedShellRunner {
     fun runBinary(request: ElevatedRequest, timeoutMs: Long): ElevatedBinaryResult
@@ -182,7 +191,8 @@ fun ElevatedBinaryResult.verdict(): String = when (this) {
  * 的實現手段，保留合法呼叫。
  *
  * AA1 誠實聲明：legacy String 路徑不攜清理旗標（[ShellResult] 無此欄位，
- * 此處不映射 cleanupIncomplete；二進位 [ElevatedBinaryResult] 為準）。
+ * 此處不映射 cleanupIncomplete；二進位 [ElevatedBinaryResult] 為準，
+ * 監測須用 runBinary）。
  */
 fun ElevatedBinaryResult.toShellResult(): ShellResult = when (this) {
     is ElevatedBinaryResult.Ok ->

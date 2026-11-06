@@ -84,16 +84,19 @@ internal class ShizukuRemoteProcess(private val remote: Any) : Process() {
             ?: throw IllegalStateException("shizuku remote exitValue type drift (fail-closed)")
 
     override fun destroy() {
-        // best-effort：異常由外層 killer runCatching 收斂。
+        // P2 對稱語義（best-effort 吞＋suppressed 註記）：Shizuku 遠端 destroy
+        // 可為同步 Binder IPC（stall/死亡即抛），呼叫方（drain kill 監督 worker／
+        // ElevatedProcessKiller）一律 best-effort，已逐段 runCatching；此處再兜底
+        // 吞（雙層 best-effort，永不外抛，不靜默：上層監督旗標＋計數仍帶出缺口）。
         runCatching { call("destroy") }
     }
 
     override fun destroyForcibly(): Process {
-        // P1-B：至少一次成功才算成功；皆失敗即抛（由 killer 外層 runCatching
-        // 收斂，但不再靜默謊稱已殺）。
-        val first = runCatching { call("destroyForcibly") }
-        if (first.isSuccess) return this
-        call("destroy")
+        // P2 對稱語義（同 destroy）：至少一次成功才算成功已收斂為「全 best-effort
+        // 吞」——destroyForcibly 缺席/抛即回落 destroy，仍抛即吞（永不外抛，
+        // 由上層 killer/drain 監督收斂；舊碼第二段直調可抛，現收斂）。
+        runCatching { call("destroyForcibly") }
+        runCatching { call("destroy") }
         return this
     }
 

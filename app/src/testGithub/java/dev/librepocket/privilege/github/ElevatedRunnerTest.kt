@@ -60,11 +60,13 @@ class ElevatedRunnerTest {
             assertTrue("$r", r is ShellResult.Ok)
         }
         val spawn = SpawnCounter()
-        // Root 走 su -c 傳送層：內層 argv 原樣包覆，外層 cwd 釘死（cd + exec 雙保險）。
+        // Root 走 su -c 傳送層：內層為已固定目標（P1-1，不再用原始 bare），外層 cwd 釘死（cd + exec 雙保險）。
         // B2：su 本體為可信絕對路徑（不再是 bare "su"）。
+        // P1-1：內層 argv[0] 已固定為已驗證實體（宿主單測經合成回退 `/system/bin/dumpsys`，
+        // 見 ElevatedExecPolicy，裝置側為真查固定實體），不再是裸 `dumpsys`。
         rootRunner(spawn).run(ElevatedRequest(listOf("dumpsys", "activity"), reasonCode = "D09-T"))
         assertEquals(
-            listOf("/system/bin/su", "-c", "cd $privateRoot && exec dumpsys activity"),
+            listOf("/system/bin/su", "-c", "cd $privateRoot && exec /system/bin/dumpsys activity"),
             spawn.lastArgv,
         )
     }

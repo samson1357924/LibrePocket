@@ -3,12 +3,14 @@ package dev.librepocket.privilege.github
 import dev.librepocket.redact.Redactor
 import dev.librepocket.shell.ElevatedRequest
 import dev.librepocket.shell.ShellDeny
+import dev.librepocket.shell.ShellExecutables
 import dev.librepocket.shell.ShellPolicy
 import dev.librepocket.shell.ShellQuota
 import dev.librepocket.shell.ShellResult
 import dev.librepocket.shell.Validation
 import dev.librepocket.tool.Flavor
 import java.io.File
+import java.nio.file.Path
 
 /**
  * Root 提權執行器（S3，BACKLOG D09，矩陣 §3，僅 github 風味，極客可選）。
@@ -171,6 +173,10 @@ class RootSuRunner(
     private val killer: (Process) -> Unit = { ElevatedProcessKiller.killTree(it) },
     private val isCancelled: () -> Boolean = { Thread.currentThread().isInterrupted },
     private val grantCheck: () -> GrantCheck,
+    private val execSearchDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
+    private val execAllowedRoots: List<String>? = null,
+    private val execIsWritable: (Path) -> Boolean = ShellExecutables::defaultIsWritable,
+    private val execResolver: ((String) -> ShellExecutables.ResolvedExec?)? = null,
 ) : BinaryElevatedRunner {
 
     /**
@@ -181,6 +187,12 @@ class RootSuRunner(
         runBinary(request, timeoutMs).toShellResult()
 
     override fun runBinary(request: ElevatedRequest, timeoutMs: Long): ElevatedBinaryResult {
+        // P1-2 不變快照（入口即凍結）：後續 validation／容量特判／spawn 一律用
+        // 同一份已核驗快照，不再觸碰原始 request.argv（MutableList 在 grant／
+        // bridge／status supplier 內竄改亦不影響本份，見 ElevatedExecPolicy）。
+        val snapshot = ElevatedExecPolicy.snapshot(request)
+        val argvSnapshot: List<String> = snapshot.argv
+        val reasonSnapshot: String = snapshot.reasonCode
         // V1 全域 flavor 門（owner 新 P1-1，github-only）：首位即拒，
         // grantCheck／activation／bridge／spawn 之前（flavor 為構造屬性，fail-closed 早拒）。
         if (flavor != Flavor.GITHUB) {
@@ -201,18 +213,40 @@ class RootSuRunner(
         }
         when (
             val v = ShellPolicy.validateElevated(
-                request.argv,
+                argvSnapshot,
                 privateRoot,
                 safRoots,
                 flavor,
                 bridge,
+                false,
+                execSearchDirs,
             )
         ) {
             is Validation.Denied -> return ElevatedBinaryResult.Denied(v.reason, v.message)
             is Validation.Allowed -> Unit
         }
-        if (request.reasonCode.isBlank()) {
+        if (reasonSnapshot.isBlank()) {
             return ElevatedRunnerCommon.missingReasonCode()
+        }
+        // P1-1 可信身分（提權與直接同等）：bare 經受控搜尋固定為已驗證實體，
+        // 絕對 argv[0] 經同一實體驗證（containment＋writability＋entry 閘）；
+        // 失敗即 Denied 且零 spawn、不耗配額、不占席（准入之前）。
+        // spawn 一律用已固定目標，不再用原始 argv[0]（見 toSpawnArgv）。
+        val resolvedExec = when (
+            val outcome = ElevatedExecPolicy.resolveForSnapshot(
+                argvSnapshot[0],
+                execSearchDirs,
+                execAllowedRoots,
+                execIsWritable,
+                execResolver,
+            )
+        ) {
+            is ShellExecutables.ResolveOutcome.Ok -> outcome.exec
+            is ShellExecutables.ResolveOutcome.Denied ->
+                return ElevatedBinaryResult.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "untrusted executable: ${argvSnapshot[0].trim()} (reason=${outcome.reason})",
+                )
         }
         // R1-B：grant 新鮮求值
         //（validate→reasonCode→grantCheck→activation→bridge→su 門→quota→spawn）。
@@ -347,16 +381,42 @@ class RootSuRunner(
             if (!SuBinaryResolver.isTrusted(su)) {
                 return ElevatedBinaryResult.Failed("su untrusted path (fail-closed, no spawn)")
             }
+            // P1-1 spawn 前重驗 executable（縮小驗過→spawn 窗口，與直接通道同策）：
+            // 同一解析再跑一次並比全字段，不一致／失敗即拒且零 spawn（配額尚未扣除）。
+            val reResolved = when (
+                val outcome = ElevatedExecPolicy.resolveForSnapshot(
+                    argvSnapshot[0],
+                    execSearchDirs,
+                    execAllowedRoots,
+                    execIsWritable,
+                    execResolver,
+                )
+            ) {
+                is ShellExecutables.ResolveOutcome.Ok -> outcome.exec
+                is ShellExecutables.ResolveOutcome.Denied ->
+                    return ElevatedBinaryResult.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "untrusted executable: ${argvSnapshot[0].trim()} (reason=${outcome.reason})",
+                    )
+            }
+            if (reResolved != resolvedExec) {
+                return ElevatedBinaryResult.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "untrusted executable: ${argvSnapshot[0].trim()} (reason=REVERIFY_MISMATCH)",
+                )
+            }
             if (!quota.tryAcquire()) {
                 return ElevatedRunnerCommon.quotaExceeded()
             }
-            // su -c 傳送層：內層 argv 已校驗，此處 joinToString 拼成單一
-            // `-c` 字串（裝置側 `su` 必經一次字串解析，非 argv 直達；
+            // su -c 傳送層：內層為已固定目標（[ElevatedExecPolicy.toSpawnArgv]，
+            // 不再用原始 argv[0]），此處 joinToString 拼成單一 `-c` 字串
+            //（裝置側 `su` 必經一次字串解析，非 argv 直達；
             // 參數衛生已先拒絕串接/重定向字元，此處再經 quoteArg 包覆縱深防禦）。
             // P0 cwd 釘死：外層 ProcessBuilder 目錄釘到 privateRoot（見 pinnedSpawn），
             // 內層再 `cd <root> && exec ...` 雙保險，避免裝置側 su 重置 cwd 後
             // 相對路徑解析到不可控目錄。
-            val inner = request.argv.joinToString(" ") { quoteArg(it) }
+            val spawnInner = ElevatedExecPolicy.toSpawnArgv(snapshot, resolvedExec)
+            val inner = spawnInner.joinToString(" ") { quoteArg(it) }
             val root = privateRoot
             val shellScript = if (root != null) {
                 "cd ${quoteArg(root)} && exec $inner"
@@ -372,8 +432,9 @@ class RootSuRunner(
             }
             // R1-A 雙軌＋U2-B stderr 獨立小 cap：截圖 stdout 即 8M 軌，stderr 維持
             // 通用軌（硬讀取 512K／截斷 64K；截圖錯誤訊息短，降 OOM 峰值）；
-            // 其餘通用命令走舊 64K/512K。
-            val isScreenshot = ElevatedRunnerCommon.isScreenshotArgv(request.argv)
+            // 其餘通用命令走舊 64K/512K。容量特判用同一快照（邏輯 argv），
+            // 不用已固定實體路徑（`[real, ...]` 不再精確等於 `["screencap","-p"]`）。
+            val isScreenshot = ElevatedRunnerCommon.isScreenshotArgv(argvSnapshot)
             val hardCapBytes = if (isScreenshot) {
                 ElevatedProcessIo.BINARY_SCREENSHOT_HARD_CAP_BYTES
             } else {

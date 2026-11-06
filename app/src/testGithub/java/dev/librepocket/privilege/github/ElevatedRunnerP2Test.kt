@@ -213,24 +213,47 @@ class ElevatedRunnerP2Test {
     // ---- 6. 吞例外訊號：恒抛鉤計數翻轉且 verdict 不變 ----
 
     @Test fun alwaysThrowIsCancelledCountsOnceAndVerdictUnchanged() {
+        // B2 P1-4：runner 層抛鉤 fail-closed（未建即視為已取消，零 spawn 回 TimedOut；
+        // drain 層內抛仍折為未取消，見 `drainThrowingIsCancelledFoldsToNotCancelled`）。
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         val before = ElevatedProcessIo.swallowedIsCancelledThrows.get()
+        var spawns = 0
         val runner = RootSuRunner(
             privateRoot = privateRoot,
             bridgeGranted = GrantFixtures.bridgeOn,
             activationCheck = GrantFixtures.activationOn,
-            spawn = { FakeProcess("ok".toByteArray(), ByteArray(0), 0) },
+            spawn = {
+                spawns++
+                FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+            },
             suBinary = "/system/bin/su",
             isCancelled = { throw IllegalStateException("cancel boom") },
             grantCheck = GrantFixtures.allowAlways,
         )
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "P2-T"), 2_000L)
-        assertTrue("$b", b is ElevatedBinaryResult.Ok)
+        assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
+        assertEquals(0, spawns)
         val after = ElevatedProcessIo.swallowedIsCancelledThrows.get()
         assertTrue("counter must flip at least once: $before->$after", after > before)
         pollOutstandingTo(0)
         assertFalse(ElevatedCleanupTracker.isSaturated())
+        assertFalse(ElevatedCleanupTracker.isBreakerOpen())
+    }
+
+    @Test fun drainThrowingIsCancelledFoldsToNotCancelled() {
+        // drain 層語義不變：已建進程的輪詢中抛折為未取消（不誤殺），健康即 finished。
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val d = ElevatedProcessIo.drain(
+            FakeProcess("ok".toByteArray(), ByteArray(0), 0),
+            2_000L,
+            { ElevatedProcessKiller.killTree(it) },
+            { throw IllegalStateException("cancel boom") },
+        )
+        assertFalse(d.timedOut)
+        assertEquals(0, d.exitCode)
+        pollOutstandingTo(0)
         assertFalse(ElevatedCleanupTracker.isBreakerOpen())
     }
 
@@ -429,9 +452,13 @@ class ElevatedRunnerP2Test {
         }
     }
 
-    // ---- 9. caller 中斷級聯 ----
+    // ---- 9. caller 中斷級聯（drain 層語義，非 runner 應 spawn） ----
+    //
+    // B2 P1-4 分工 pin：本用例僅斷 drain 層不吞中斷（入口清除＋健康收尾＋出口恢復），
+    // 不代表 runner 層已取消應建子進程——runner 層已取消一律零 spawn 回 TimedOut
+    // （見新 B2 P1-4 取消測試 `...PreSpawnCancel...`），兩層語義分開，不衝突。
 
-    @Test fun presetCallerInterruptStillDrainsClean() {
+    @Test fun drainPresetCallerInterruptClearedAndRestored_healthDrainsClean_doesNotImplyRunnerShouldSpawn() {
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         Thread.currentThread().interrupt()

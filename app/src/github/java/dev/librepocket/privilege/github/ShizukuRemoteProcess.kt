@@ -88,6 +88,8 @@ internal class ShizukuRemoteProcess(private val remote: Any) : Process() {
         // 可為同步 Binder IPC（stall/死亡即抛），呼叫方（drain kill 監督 worker／
         // ElevatedProcessKiller）一律 best-effort，已逐段 runCatching；此處再兜底
         // 吞（雙層 best-effort，永不外抛，不靜默：上層監督旗標＋計數仍帶出缺口）。
+        // B2 P1-3：吞≠已停，真死由 drain post-kill 驗證（waitFor／liveness，
+        // binder 不可達視 unknown）確認，失敗即 cleanupIncomplete=true。
         runCatching { call("destroy") }
     }
 
@@ -95,6 +97,7 @@ internal class ShizukuRemoteProcess(private val remote: Any) : Process() {
         // P2 對稱語義（同 destroy）：至少一次成功才算成功已收斂為「全 best-effort
         // 吞」——destroyForcibly 缺席/抛即回落 destroy，仍抛即吞（永不外抛，
         // 由上層 killer/drain 監督收斂；舊碼第二段直調可抛，現收斂）。
+        // B2 P1-3：同上，吞≠已停，由 drain 驗證（見上）。
         runCatching { call("destroyForcibly") }
         runCatching { call("destroy") }
         return this

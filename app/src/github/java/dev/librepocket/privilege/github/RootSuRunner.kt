@@ -159,6 +159,14 @@ import java.nio.file.Path
  * 滿即拒 `Denied(QUOTA_EXCEEDED, "elevated concurrency full...")` 且零 spawn、
  * 不耗配額；成功後整個剩餘 runBinary 包 `try { ... } finally { leaveCall() }`
  * （配額拒、spawn 抛、drain 全路徑釋放）。
+ *
+ * B2 P1-4 spawn 前取消（owner 新 P1-4）：入口＋最後授權重驗後（配額前）＋
+ * 配額→spawn 窗口三點經 [ElevatedRunnerCommon.isPreSpawnCancelled] 檢查
+ * （Thread 中斷不清旗標或鉤真；鉤抛即已取消，未建 fail-closed），任一命中即
+ * 零 spawn 回 `TimedOut`（空 partial，`cleanupIncomplete=false`，無進程故無殘留；
+ * interrupt 原樣保留，不清除，不把已取消翻成未取消）。drain 層入口清中斷＋
+ * 健康收尾語義不變（drain 不吞中斷，出口恢復），runner 層已取消一律不建
+ * （見 `ElevatedRunnerP2Test` 改名＋新 B2 取消測試的分工）。
  */
 class RootSuRunner(
     private val privateRoot: String? = null,
@@ -200,6 +208,12 @@ class RootSuRunner(
                 ShellDeny.NOT_WHITELISTED,
                 "unsupported flavor (github-only)",
             )
+        }
+        // P1-4 spawn 前取消入口檢查（B2）：已取消（Thread 中斷不清旗標或
+        // isCancelled 真；鉤抛即已取消，未建 fail-closed）即零 spawn 回 TimedOut，
+        // 不進後續門／准入／配額／spawn；interrupt 原樣保留，不清除。
+        if (ElevatedRunnerCommon.isPreSpawnCancelled(isCancelled)) {
+            return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
         }
         // U1：bridge 當次 call 新鮮求值快照一次，供 validate 與橋門共用
         //（同 call 內一致；抛異常即 fail-closed 零 spawn）。
@@ -405,8 +419,19 @@ class RootSuRunner(
                     "untrusted executable: ${argvSnapshot[0].trim()} (reason=REVERIFY_MISMATCH)",
                 )
             }
+            // P1-4 spawn 前最終取消檢查（B2）：重驗後、配額前再驗一次，中途取消
+            // 亦零新 spawn（不耗配額；已占席由 finally 釋放；interrupt 不清除）。
+            if (ElevatedRunnerCommon.isPreSpawnCancelled(isCancelled)) {
+                return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
+            }
             if (!quota.tryAcquire()) {
                 return ElevatedRunnerCommon.quotaExceeded()
+            }
+            // P1-4 spawn 競態收斂：配額→spawn 窗口再驗一次（配額已耗仍零 spawn，
+            // 覆蓋 quota.acquire 後取消的窄競態；drain 層 isCancelled 輪詢只覆
+            // 已建進程，此處覆未建）。
+            if (ElevatedRunnerCommon.isPreSpawnCancelled(isCancelled)) {
+                return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
             }
             // su -c 傳送層：內層為已固定目標（[ElevatedExecPolicy.toSpawnArgv]，
             // 不再用原始 argv[0]），此處 joinToString 拼成單一 `-c` 字串

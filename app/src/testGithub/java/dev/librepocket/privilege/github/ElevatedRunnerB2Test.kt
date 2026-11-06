@@ -171,12 +171,18 @@ class ElevatedRunnerB2Test {
     }
 
     @Test fun cancelHookKillsAndUnblocks() {
+        // B2 P1-4：常量已取消在入口即零 spawn（不建進程故不調 killer），仍回 TimedOut
+        // 且有界（不等滿 10s）；mid-drain 取消殺路徑見 `cancelMidDrainKillsAndUnblocks`。
         var kills = 0
+        var spawns = 0
         val runner = RootSuRunner(
             privateRoot = privateRoot,
             bridgeGranted = GrantFixtures.bridgeOn,
             activationCheck = GrantFixtures.activationOn,
-            spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
+            spawn = {
+                spawns++
+                FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true)
+            },
             suBinary = "/system/bin/su",
             killer = {
                 kills++
@@ -189,8 +195,37 @@ class ElevatedRunnerB2Test {
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 10_000L)
         val elapsed = System.currentTimeMillis() - start
         assertTrue("$r", r is ShellResult.TimedOut)
+        assertEquals(0, spawns)
+        assertEquals(0, kills)
+        // 已取消即拒，不等滿 10s（留 4s 餘量給 CI 抖動）。
+        assertTrue("elapsed=$elapsed", elapsed < 4_000L)
+    }
+
+    @Test fun cancelMidDrainKillsAndUnblocks() {
+        // B2 P1-4：spawn 時未取消、drain 輪詢中取消 → 建後殺（kills==1）回 TimedOut。
+        // 閾值 >4：runner 三點預檢（入口＋配額前＋配額後）各耗一次鉤調用，drain 輪詢
+        // 才命中，避免預檢提前翻轉致零 spawn（見 P1-4 KDoc）。
+        var kills = 0
+        var polls = 0
+        val runner = RootSuRunner(
+            privateRoot = privateRoot,
+            bridgeGranted = GrantFixtures.bridgeOn,
+            activationCheck = GrantFixtures.activationOn,
+            spawn = { FakeProcess("x".toByteArray(), ByteArray(0), 0, hang = true) },
+            suBinary = "/system/bin/su",
+            killer = {
+                kills++
+                it.destroy()
+            },
+            isCancelled = { ++polls > 4 },
+            grantCheck = GrantFixtures.allowAlways,
+        )
+        val start = System.currentTimeMillis()
+        val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 10_000L)
+        val elapsed = System.currentTimeMillis() - start
+        assertTrue("$r", r is ShellResult.TimedOut)
         assertEquals(1, kills)
-        // cancel 即殺，不等滿 10s（留 4s 餘量給 CI 抖動）。
+        assertTrue("polls=$polls", polls > 4)
         assertTrue("elapsed=$elapsed", elapsed < 4_000L)
     }
 
@@ -504,6 +539,8 @@ class ElevatedRunnerB2Test {
     }
 
     @Test fun shizukuCancelKillsAndUnblocks() {
+        // B2 P1-4：閾值 >4（runner 三點預檢各耗一次，drain 輪詢才命中；>2 會在
+        // 配額後預檢即翻轉致零 spawn，見 Root 側同形註解）。
         var kills = 0
         var polls = 0
         val runner = ShizukuShellRunner(
@@ -517,40 +554,52 @@ class ElevatedRunnerB2Test {
                 kills++
                 it.destroy()
             },
-            isCancelled = { ++polls > 2 },
+            isCancelled = { ++polls > 4 },
             grantCheck = GrantFixtures.allowAlways,
         )
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 10_000L)
         assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
         assertEquals(1, kills)
-        assertTrue("polls=$polls", polls > 2)
+        assertTrue("polls=$polls", polls > 4)
     }
 
     @Test fun isCancelledThrowFoldsToNotCancelled() {
+        // B2 P1-4：runner 層抛鉤 fail-closed（未建即視為已取消，零 spawn 回 TimedOut；
+        // drain 層內抛仍折為未取消，見 P2 `drainThrowingIsCancelledFoldsToNotCancelled`）。
+        var shizukuSpawns = 0
         val shizuku = ShizukuShellRunner(
             privateRoot = privateRoot,
             bridgeGranted = GrantFixtures.bridgeOn,
             activationCheck = GrantFixtures.activationOn,
             pingBinder = { true },
-            spawn = { FakeProcess("ok".toByteArray(), ByteArray(0), 0) },
+            spawn = {
+                shizukuSpawns++
+                FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+            },
             status = { ShizukuStatus.Available(15) },
             isCancelled = { throw IllegalStateException("cancel boom") },
             grantCheck = GrantFixtures.allowAlways,
         )
         val b = shizuku.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
-        assertTrue("$b", b is ElevatedBinaryResult.Ok)
+        assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
+        assertEquals(0, shizukuSpawns)
 
+        var rootSpawns = 0
         val root = RootSuRunner(
             privateRoot = privateRoot,
             bridgeGranted = GrantFixtures.bridgeOn,
             activationCheck = GrantFixtures.activationOn,
-            spawn = { FakeProcess("ok".toByteArray(), ByteArray(0), 0) },
+            spawn = {
+                rootSpawns++
+                FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+            },
             suBinary = "/system/bin/su",
             isCancelled = { throw IllegalStateException("cancel boom") },
             grantCheck = GrantFixtures.allowAlways,
         )
         val r = root.run(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
-        assertTrue("$r", r is ShellResult.Ok)
+        assertTrue("$r", r is ShellResult.TimedOut)
+        assertEquals(0, rootSpawns)
     }
 
     @Test fun killerThrowStillReturnsTimedOut() {
@@ -866,9 +915,10 @@ class ElevatedRunnerB2Test {
     @Test fun coroutineJobCancelDrivesCleanup() {
         // R3-A：預設 isCancelled 只看 Thread 中斷，coroutine 呼叫方須顯式傳
         // `isCancelled = { !job.isActive }`；此處以前 N 次 false 後讀 job 狀態
-        // 的鉤模擬「輪詢中被取消」：hang FakeProcess 保證非超時路徑（10s 上界），
-        // 第 3 次輪詢時 job.cancel()，之後鉤讀到 !isActive 即盡力殺整組 best-effort 回 TimedOut。
-        // 零真機/零真掛起：hang FakeProcess 的 waitFor 切片可被 killer 立即解除。
+        // 的鉤模擬「輪詢中被取消」：hang FakeProcess 保證非超時路徑（10s 上界）。
+        // B2 P1-4：閾值 6（runner 三點預檢各耗一次：入口1＋配額前2＋配額後3，
+        // drain 輪詢 4/5 後第 6 次才 cancel，保證 spawn 已發生；==3 會在配額後
+        // 預檢即翻轉致零 spawn）。零真機/零真掛起：hang 的 waitFor 切片可被 killer 立即解除。
         val job = Job()
         var polls = 0
         var kills = 0
@@ -884,7 +934,7 @@ class ElevatedRunnerB2Test {
             },
             isCancelled = {
                 ++polls
-                if (polls == 3) job.cancel()
+                if (polls == 6) job.cancel()
                 !job.isActive
             },
             grantCheck = GrantFixtures.allowAlways,
@@ -892,7 +942,7 @@ class ElevatedRunnerB2Test {
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "R3A-T"), 10_000L)
         assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
         assertEquals(1, kills)
-        assertTrue("polls=$polls", polls >= 3)
+        assertTrue("polls=$polls", polls >= 6)
         assertTrue(job.isCancelled)
 
         // 同一 Job 語義走 Shizuku 側亦回 TimedOut（兩 runner 同源 drain）。
@@ -912,7 +962,7 @@ class ElevatedRunnerB2Test {
             },
             isCancelled = {
                 ++shizukuPolls
-                if (shizukuPolls == 3) shizukuJob.cancel()
+                if (shizukuPolls == 6) shizukuJob.cancel()
                 !shizukuJob.isActive
             },
             grantCheck = GrantFixtures.allowAlways,
@@ -920,7 +970,7 @@ class ElevatedRunnerB2Test {
         val sb = shizuku.runBinary(ElevatedRequest(listOf("id"), "R3A-T"), 10_000L)
         assertTrue("$sb", sb is ElevatedBinaryResult.TimedOut)
         assertEquals(1, shizukuKills)
-        assertTrue("shizukuPolls=$shizukuPolls", shizukuPolls >= 3)
+        assertTrue("shizukuPolls=$shizukuPolls", shizukuPolls >= 6)
         assertTrue(shizukuJob.isCancelled)
     }
 

@@ -729,15 +729,14 @@ internal object ElevatedProcessIo {
             if (!cleanupOk) cleanupIncomplete = true
             // P1-3：終審推遲到尾收後（此處不再 noteClean/noteUnclean，避免
             // 後續 gobbler／stdin linger 少計；統一終審見尾收段）。
-            // 殺後等待：中斷必須 restore（不吞 InterruptedException）；
-            // 非中斷異常收斂（清理路徑不升級為崩潰，仍回 TimedOut）。
-            try {
-                process.waitFor(KILL_WAIT_SEC, TimeUnit.SECONDS)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-            } catch (_: Exception) {
-                // 清理異常收斂，見上。
-            }
+            // P1-3 post-kill 驗證（B2，killer true ≠ 進程真死）：killer 全
+            // runCatching＋遠端 destroy 吞失敗，cleanupOk 只代表本機 thread
+            // 離開，不代表父進程已停。此處以 waitFor／liveness 驗證父進程，
+            // 失敗或不可驗證（binder 不可達視 unknown）即 cleanupIncomplete=true
+            //（經尾收終審進 noteUnclean／breaker，不宣稱 cleaned）。子孫全滅
+            // 仍為真機 blocker（JVM 真樹已驗，裝置 SELinux／Root 語義差異 E2E
+            // 歸 #136-B3，見 ElevatedProcessKiller）。
+            if (!verifyParentStopped(process)) cleanupIncomplete = true
             // 超時/cancel 路徑保留有界 join：gobbler 仍可能卡住，避免無限等。
             // join 中斷必須 restore 中斷旗標（不吞 InterruptedException）。
             // AB1 P1-A：join 超界仍存活即殘留 gobbler（入口已中斷兩 gobbler，
@@ -930,6 +929,50 @@ internal object ElevatedProcessIo {
     }
 
     /**
+     * P1-3 post-kill 父進程停止驗證（B2，僅 kill 路徑調用）：
+     * killer 不抛≠已停（destroy／destroyForcibly 全 runCatching，遠端 destroy
+     * 吞失敗），cleanupOk 只代表監督 worker 離開。此函數以 `waitFor` 回傳為
+     * 主證據、liveness（`isAlive`）為輔助，僅可驗證已停才回 true：
+     * - `waitFor(KILL_WAIT_SEC)` 回 true：已停；再讀 `isAlive`，僅其明確回 true
+     *   才翻為未停（矛盾競態），`isAlive` 抛即忽略（主證據已足）；
+     * - `waitFor` 回 false：5s  grace 仍存活，未停；
+     * - `waitFor` 抛（遠端 binder 死亡等）或中斷：主證據缺失，退讀 `isAlive`；
+     *   明確 false 才算已停，true／抛／中斷一律 unknown→false（binder 不可達
+     *   視 unknown，fail-closed 為 incomplete，不宣稱 cleaned）。
+     * 中斷一律 restore，不吞 caller 中斷；子孫全滅不在此驗（JVM 真樹已驗，
+     * 裝置語義差異 E2E 歸 #136-B3，見 [ElevatedProcessKiller]）。
+     */
+    private fun verifyParentStopped(process: Process): Boolean {
+        val exited: Boolean? = try {
+            process.waitFor(KILL_WAIT_SEC, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            null
+        } catch (_: Exception) {
+            null
+        }
+        if (exited == null) {
+            return try {
+                !process.isAlive
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            } catch (_: Exception) {
+                false
+            }
+        }
+        if (!exited) return false
+        return try {
+            !process.isAlive
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            true
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    /**
      * 有界截斷管（Y1 由內嵌 `CappedPipe` 更名提升，行為零變更，僅為隔離可測）：
      * 硬上限 `hardCapBytes` 內保留前綴，超額丟棄並經 [didOverflow] 單調標溢出
      * （drain 併入 `Drained.truncated`，絕不靜默短讀不標）；讀取異常經 [markFailed]
@@ -1063,4 +1106,38 @@ internal object ElevatedRunnerCommon {
     /** 併發上限時的 typed 拒絕：`QUOTA_EXCEEDED`，不建子進程。 */
     fun concurrencyFull(): ElevatedBinaryResult.Denied =
         ElevatedBinaryResult.Denied(ShellDeny.QUOTA_EXCEEDED, CONCURRENCY_FULL_MESSAGE)
+
+    /**
+     * P1-4 spawn 前取消檢查（B2，兩 runner 共用）：
+     * 任何 spawn 前調用（入口＋最後授權重驗後，確保中途取消亦零新 spawn）。
+     * - `Thread.currentThread().isInterrupted`（不清旗標，保留原始 interrupt）
+     *   或 `isCancelled()` 任一為 true 即已取消；
+     * - `isCancelled()` 抛即視為已取消（對尚未 spawn fail-closed：drain 內抛折
+     *   為未取消是為不誤殺已建進程，未建時 fail-closed 方向是拒新 spawn；
+     *   計數沿用 [ElevatedProcessIo.swallowedIsCancelledThrows]，不改 verdict
+     *   映射外的可觀測）；
+     * - 永不清 interrupt（不用 `Thread.interrupted()`），不把已取消翻成未取消；
+     *   中斷下清理 join 有界由 drain 既有上界承擔。
+     * 已取消時呼叫方回 `TimedOut`（空 partial，`cleanupIncomplete=false`，
+     * 無進程故無殘留），零 spawn、不耗配額（配額前檢查）／已占席由 finally 釋放。
+     */
+    internal fun isPreSpawnCancelled(isCancelled: () -> Boolean): Boolean {
+        if (Thread.currentThread().isInterrupted) return true
+        return try {
+            isCancelled()
+        } catch (_: Exception) {
+            runCatching { ElevatedProcessIo.swallowedIsCancelledThrows.incrementAndGet() }
+            true
+        }
+    }
+
+    /** P1-4 已取消的 spawn 前 verdict：零 spawn 的 TimedOut（無 partial，無殘留）。 */
+    internal fun preSpawnCancelled(timeoutMs: Long): ElevatedBinaryResult.TimedOut =
+        ElevatedBinaryResult.TimedOut(
+            ByteArray(0),
+            ByteArray(0),
+            timeoutMs,
+            false,
+            false,
+        )
 }

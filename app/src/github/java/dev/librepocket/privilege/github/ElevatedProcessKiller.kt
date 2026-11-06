@@ -72,6 +72,14 @@ import java.lang.reflect.InaccessibleObjectException
  * `runCleanupBounded(min(max(remaining,500),3000))` 承擔（daemon worker＋
  * interrupt＋500ms grace；永不跳過 killer 嘗試），未完成經
  * [ElevatedProcessIo.Drained.cleanupIncomplete] 帶出（runner verdict 映射不變）。
+ *
+ * B2 P1-3 誠實化（owner 新 P1-3，行為見 drain）：本物件全 runCatching（destroy／
+ * destroyForcibly 抛即吞，遠端 destroy 失敗亦吞），`killTree` 正常返回≠進程真死
+ * （no-op／抛吞／streams EOF 皆可返回）。真死由 [ElevatedProcessIo.drain] 經
+ * post-kill 驗證（`waitFor` 回傳／liveness，binder 不可達視 unknown）確認，
+ * 失敗或不可驗證即 `cleanupIncomplete=true` 並進資源／breaker 終審，不因 killer
+ * 未抛而宣稱 cleaned。子孫全滅仍為真機 blocker（JVM 真樹已驗，裝置 SELinux／
+ * Root 語義差異 E2E 歸 #136-B3，見上）。
  */
 object ElevatedProcessKiller {
     fun killTree(process: Process) {

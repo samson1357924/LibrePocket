@@ -247,10 +247,11 @@ class ElevatedRunnerBlockedGetterTest {
             assertEquals(1, kills.get())
             assertTrue(job.isCancelled)
             assertTrue(uncaught.isEmpty())
-            // capture 側：同一已取消 Job 即進 cancel→TimedOut→null（gobbler 仍先阻塞後被中斷）。
+            // capture 側：同一已取消 Job 即進 spawn 前取消→TimedOut→null（B2 P1-4：
+            // 已取消零新 spawn，故 kills 仍 1，不再 2；drain 層未建，無 gobbler 阻塞）。
             val audit = PrivilegeAuditLog()
             assertNull(RootFramebufferCapture.screencapViaBinary(runner, audit, "X1-T", 10_000L)())
-            assertEquals(2, kills.get())
+            assertEquals(1, kills.get())
             assertTrue(uncaught.isEmpty())
             latch.countDown()
             awaitNoElevatedThreads()

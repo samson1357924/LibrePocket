@@ -19,7 +19,7 @@ import org.junit.Before
 import org.junit.Test
 
 /**
- * Z1 監督清理回歸（owner 新 P1＋P2＋P3）：
+ * Z1 監督清理回歸（owner 新 P1＋P2＋P3；串行契約下預填代理多 stall 疊加，真實多 drain 疊加由 P1Fix 混合測試覆蓋）：
  * kill 路徑 `killer`＋已取流 close 監督化（daemon worker＋`min(max(remaining,500),3000)`
  * 上界＋interrupt＋500ms grace，永不跳過 killer），[ElevatedProcessIo.Drained.cleanupIncomplete]
  * 帶出未完成；stdin-closer 尾收同理。runner verdict 映射不變（timedOut 仍 TimedOut）。
@@ -492,7 +492,8 @@ class ElevatedRunnerZ1Test {
         makeRunner: (spawn: (List<String>) -> Process) -> BinaryElevatedRunner,
     ) {
         val latch = CountDownLatch(1)
-        // latch 不釋放直到斷言完（stdin 阻塞期間斷 verdict＋capture）。
+        // P1-2 預留（PR140 Phase1）：首 call 殘留 1 槽期間次 call 會被預留門拒，
+        // 故先斷首 verdict，釋放收斂＋重置 breaker 後再斷 capture（clean Ok 非 null）。
         val runner = makeRunner { BlockedStdinSuccessProcess(latch, blockGetter) }
         try {
             runWithUncaughtGuard { uncaught ->
@@ -507,16 +508,22 @@ class ElevatedRunnerZ1Test {
                 b as ElevatedBinaryResult.Ok
                 assertEquals("ok", String(b.stdout, Charsets.UTF_8))
                 assertTrue(uncaught.isEmpty())
-                // capture 非 null（stdout 完整故；Ok 非 truncated 即回位元組）。
-                val audit = PrivilegeAuditLog()
-                val cap = RootFramebufferCapture.screencapViaBinary(runner, audit, "Z1-C", 5_000L)()
-                assertNotNull("capture must be non-null for complete Ok", cap)
-                assertTrue(uncaught.isEmpty())
             }
         } finally {
             latch.countDown()
             awaitNoElevatedThreads(10_000L)
         }
+        // 收斂後重置（首 call linger 已計 unclean×1），再斷 capture 非 null。
+        ElevatedCleanupTracker.noteClean()
+        runWithUncaughtGuard { uncaught ->
+            val audit = PrivilegeAuditLog()
+            // capture 用乾淨 spawn（latch 已釋放，stdin 不再阻塞），斷非 null。
+            val cap = RootFramebufferCapture.screencapViaBinary(runner, audit, "Z1-C", 5_000L)()
+            assertNotNull("capture must be non-null for complete Ok", cap)
+            assertTrue(uncaught.isEmpty())
+        }
+        awaitNoElevatedThreads(10_000L)
+        ElevatedCleanupTracker.noteClean()
     }
 
     @Test fun rootSuccessBlockedStdinGetterIsOkAndCapture() {

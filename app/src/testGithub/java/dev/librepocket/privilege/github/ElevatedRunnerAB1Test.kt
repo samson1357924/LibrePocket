@@ -15,7 +15,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * AB1 回歸（owner 新 P1-A＋P1-B）：
+ * AB1 回歸（owner 新 P1-A＋P1-B；串行契約下預填代理多 stall 疊加，真實多 drain 疊加由 P1Fix 混合測試覆蓋）：
  * 呼叫級併發准入＋殘留 gobbler／stdin 計數＋linger 成功走 noteUnclean。
  * 全 fake（latch 阻塞假進程），零真機、零 su、零 binder。
  *
@@ -167,36 +167,37 @@ class ElevatedRunnerAB1Test {
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         assertEquals(0, ElevatedCleanupTracker.activeCalls())
+        // P1-2 預留（PR140 Phase1，特權宜序列）：逐次累積 4 已不可達（第 2 次即拒）。
+        // 本測以 1 Root linger（0→1）證計數＋跨 runner 共享（次 call Shizuku 即被
+        // 預留門拒，零 spawn），再預填 3 達飽和（1+3=4），另補計數使熔斷亦成立。
         val latch = CountDownLatch(1)
         val rootSpawns = AtomicInteger(0)
         val shizukuSpawns = AtomicInteger(0)
-        // Root 側 getter 阻塞、Shizuku 側 close 阻塞：兩種 stdin 殘留形態皆計數，
-        // 且疊加於同一全域（證跨 runner 共用）。
+        // Root 側 getter 阻塞、Shizuku 側 close 阻塞：兩種 stdin 殘留形態。
         val root = makeRoot { rootSpawns.incrementAndGet(); GetterLingerSuccessProcess(latch) }
         val shizuku = makeShizuku { shizukuSpawns.incrementAndGet(); CloseLingerSuccessProcess(latch) }
         try {
-            // 4 次 success＋殘留 stdin：每次 Ok(flag true)，outstanding 逐次 1→4。
-            repeat(2) { i ->
-                val b = root.runBinary(ElevatedRequest(listOf("id"), "AB1-A"), 5_000L)
-                assertTrue("$b", b is ElevatedBinaryResult.Ok)
-                b as ElevatedBinaryResult.Ok
-                assertEquals("ok", String(b.stdout, Charsets.UTF_8))
-                assertTrue("blocked stdin getter must surface flag", b.cleanupIncomplete)
-                assertEquals(i + 1, ElevatedCleanupTracker.outstanding())
-            }
-            repeat(2) { i ->
-                val b = shizuku.runBinary(ElevatedRequest(listOf("id"), "AB1-A"), 5_000L)
-                assertTrue("$b", b is ElevatedBinaryResult.Ok)
-                b as ElevatedBinaryResult.Ok
-                assertEquals("ok", String(b.stdout, Charsets.UTF_8))
-                assertTrue("blocked stdin close must surface flag", b.cleanupIncomplete)
-                assertEquals(3 + i, ElevatedCleanupTracker.outstanding())
-            }
+            // 1 次 Root success＋殘留 stdin：Ok(flag true)，outstanding 0→1。
+            val b1 = root.runBinary(ElevatedRequest(listOf("id"), "AB1-A"), 5_000L)
+            assertTrue("$b1", b1 is ElevatedBinaryResult.Ok)
+            b1 as ElevatedBinaryResult.Ok
+            assertEquals("ok", String(b1.stdout, Charsets.UTF_8))
+            assertTrue("blocked stdin getter must surface flag", b1.cleanupIncomplete)
+            assertEquals(1, ElevatedCleanupTracker.outstanding())
+            // Shizuku 次 call 即被預留門拒（1+4>4），零 spawn，證跨 runner 共用同一全域。
+            val blocked = shizuku.runBinary(ElevatedRequest(listOf("id"), "AB1-A"), 5_000L)
+            assertTrue("$blocked", blocked is ElevatedBinaryResult.Denied)
+            assertEquals(0, shizukuSpawns.get())
+            // 預填 3 達飽和（1+3=4）。
+            repeat(3) { ElevatedCleanupTracker.acquireSlot() }
+            assertEquals(4, ElevatedCleanupTracker.outstanding())
             assertTrue(ElevatedCleanupTracker.isSaturated())
-            // linger 成功走 noteUnclean：4 次連續即熔斷（與飽和同時成立）。
+            // linger 成功走 noteUnclean：此處僅 1 次 drain（consecutive=1，未熔斷）；
+            // 補 3 次計數使熔斷亦成立（與飽和同時成立）。
+            repeat(3) { ElevatedCleanupTracker.noteUnclean() }
             assertTrue(ElevatedCleanupTracker.isBreakerOpen())
-            assertEquals(2, rootSpawns.get())
-            assertEquals(2, shizukuSpawns.get())
+            assertEquals(1, rootSpawns.get())
+            assertEquals(0, shizukuSpawns.get())
             // 第 5 次：兩 runner 皆拒（backlog 或 breaker，訊息區分），零新增 spawn。
             val deniedR = root.runBinary(ElevatedRequest(listOf("id"), "AB1-A"), 5_000L)
             assertTrue("$deniedR", deniedR is ElevatedBinaryResult.Denied)
@@ -214,11 +215,13 @@ class ElevatedRunnerAB1Test {
                 "msg=${deniedS.message}",
                 deniedS.message.contains("backlog full") || deniedS.message.contains("breaker open"),
             )
-            assertEquals(2, rootSpawns.get())
-            assertEquals(2, shizukuSpawns.get())
+            assertEquals(1, rootSpawns.get())
+            assertEquals(0, shizukuSpawns.get())
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
         } finally {
             latch.countDown()
+            // 釋放預填 3 槽（latch 釋放還 1 linger 槽，併發收斂）。
+            repeat(3) { ElevatedCleanupTracker.releaseSlot() }
             pollOutstandingTo(0)
         }
         // late 完成只釋放 slot，不歸零 consecutive（fail-closed 閂鎖，AA1 同語義）。
@@ -242,7 +245,7 @@ class ElevatedRunnerAB1Test {
         awaitNoElevatedThreads()
     }
 
-    @Test fun concurrencyGateAdmitsExactlyFour() {
+    @Test fun concurrencyGateAdmitsExactlyOneSerial() {
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         assertEquals(0, ElevatedCleanupTracker.activeCalls())
@@ -275,42 +278,43 @@ class ElevatedRunnerAB1Test {
         }
         try {
             start.countDown()
-            // 等 4 個進入 spawn（有界輪詢）；另 4 應被併發門拒絕，不進 spawn。
+            // P1-2 預留（PR140 Phase1，特權宜序列）：乾淨態僅允單一進行中呼叫
+            //（0+1*4<=4 通過，0+2*4<=4 拒絕）；另 7 應被預留門（backlog）拒絕，不進 spawn。
             val deadline = System.currentTimeMillis() + 10_000L
-            while (entered.get() < 4) {
+            while (entered.get() < 1) {
                 if (System.currentTimeMillis() >= deadline) {
                     throw AssertionError("entered=${entered.get()} spawns=${spawns.get()}")
                 }
                 Thread.sleep(20L)
             }
             Thread.sleep(500L)
-            assertEquals(4, spawns.get())
-            // 釋放 spawn 門 → 4 個走 timeout＋不可中斷 destroy → outstanding 達上限。
+            assertEquals(1, spawns.get())
+            // 釋放 spawn 門 → 1 個走 timeout＋不可中斷 destroy → outstanding=1。
             spawnGate.countDown()
             threads.forEach { it.join(30_000L) }
             assertTrue("all calls must return bounded", threads.none { it.isAlive })
             val timedOut = results.filterIsInstance<ElevatedBinaryResult.TimedOut>()
-            assertEquals(4, timedOut.size)
+            assertEquals(1, timedOut.size)
             assertTrue(timedOut.all { it.cleanupIncomplete })
             val denied = results.filterIsInstance<ElevatedBinaryResult.Denied>()
-            assertEquals(4, denied.size)
+            assertEquals(7, denied.size)
             assertTrue(denied.all { it.reason == ShellDeny.QUOTA_EXCEEDED })
             assertTrue(
                 "denied msgs=${denied.map { it.message }}",
-                denied.all { it.message.contains("concurrency full") },
+                denied.all { it.message.contains("backlog full") },
             )
-            pollOutstandingTo(4)
-            assertTrue(ElevatedCleanupTracker.isSaturated())
-            // 後續呼叫被拒（飽和或熔斷），零新增 spawn。
+            pollOutstandingTo(1)
+            assertFalse(ElevatedCleanupTracker.isSaturated())
+            // 後續呼叫仍被預留門拒（outstanding=1，1+4>4），零新增 spawn。
             val extra = runner.runBinary(ElevatedRequest(listOf("id"), "AB1-B"), 300L)
             assertTrue("$extra", extra is ElevatedBinaryResult.Denied)
             extra as ElevatedBinaryResult.Denied
             assertEquals(ShellDeny.QUOTA_EXCEEDED, extra.reason)
             assertTrue(
                 "msg=${extra.message}",
-                extra.message.contains("backlog full") || extra.message.contains("breaker open"),
+                extra.message.contains("backlog full"),
             )
-            assertEquals(4, spawns.get())
+            assertEquals(1, spawns.get())
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
         } finally {
             spawnGate.countDown()

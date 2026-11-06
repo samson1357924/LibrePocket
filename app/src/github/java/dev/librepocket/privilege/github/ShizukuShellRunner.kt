@@ -101,8 +101,8 @@ import rikka.shizuku.Shizuku
  * 穿透（僅監測，不改 verdict）。
  *
  * AB1 呼叫級准入（owner 新 P1-A＋P1-B）：飽和／熔斷門之後、配額之前
- * [ElevatedCleanupTracker.tryEnterCall]（CAS，上限
- * [ElevatedCleanupTracker.MAX_CONCURRENT_CALLS]＝4，特權通道宜序列，B3 可調）；
+ * 單一原子 [ElevatedCleanupTracker.tryEnterReserved]（同一鎖內檢查＋佔席，
+ * 上限 [ElevatedCleanupTracker.MAX_CONCURRENT_CALLS]＝4，特權通道宜序列，B3 可調）；
  * 滿即拒 `Denied(QUOTA_EXCEEDED, "elevated concurrency full...")` 且零 spawn、
  * 不耗配額；成功後整個剩餘 runBinary 包 `try { ... } finally { leaveCall() }`
  * （配額拒、spawn 抛、drain 全路徑釋放）。
@@ -205,21 +205,23 @@ class ShizukuShellRunner(
         }
         ShizukuStatusGate.denyFor(runCatching { status() }.getOrDefault(ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN)))
             ?.let { return ElevatedBinaryResult.Denied(it.reason, it.message) }
-        // AA1 resource gate (same level as quota): saturated cleanup backlog
-        // means unreclaimable cleanups are outstanding; fail-closed, no spawn,
-        // no quota consumed (B3 must intervene, see ElevatedCleanupTracker).
-        // 終審殘留第二條件：連續不清創熔斷亦拒（訊息區分兩因，皆零 spawn、不耗配額）。
-        if (ElevatedCleanupTracker.isSaturated()) {
-            return ElevatedRunnerCommon.cleanupBacklogFull()
-        }
-        if (ElevatedCleanupTracker.isBreakerOpen()) {
-            return ElevatedRunnerCommon.cleanupBreakerOpen()
-        }
-        // AB1 P1-B 呼叫級准入（飽和／熔斷門之後、配額之前）：CAS 佔一席，滿即
-        // fail-closed 拒絕（QUOTA_EXCEEDED，零 spawn、不耗配額）；成功後剩餘 runBinary
-        // 全包 try/finally 釋放（配額拒、spawn 抛、drain 全路徑）。
-        if (!ElevatedCleanupTracker.tryEnterCall()) {
-            return ElevatedRunnerCommon.concurrencyFull()
+        // AA1 resource gate＋AB1 呼叫級准入（P1-2 原子化，PR140 Phase1）：
+        // 單一 [ElevatedCleanupTracker.tryEnterReserved] 原子決定（飽和／熔斷／
+        // 併發預留同一鎖內檢查＋佔席，消除三段檢查 TOCTOU；3 backlog＋4 併發最壞
+        // 19 槽（每 call 4 槽上界）經預留 `outstanding+(active+1)*4<=MAX` 截斷，
+        // 實效接近串行，特權宜序列，B3 可調 MAX／SLOTS）。
+        // 拒絕原因僅供訊息區分（backlog vs breaker vs concurrency），准入決定原子。
+        when (ElevatedCleanupTracker.tryEnterReserved()) {
+            ElevatedCleanupTracker.Admission.OK -> Unit
+            ElevatedCleanupTracker.Admission.BACKLOG_FULL -> {
+                return ElevatedRunnerCommon.cleanupBacklogFull()
+            }
+            ElevatedCleanupTracker.Admission.BREAKER_OPEN -> {
+                return ElevatedRunnerCommon.cleanupBreakerOpen()
+            }
+            ElevatedCleanupTracker.Admission.CONCURRENCY_FULL -> {
+                return ElevatedRunnerCommon.concurrencyFull()
+            }
         }
         try {
             if (!quota.tryAcquire()) {

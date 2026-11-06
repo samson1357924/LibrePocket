@@ -4,7 +4,6 @@ import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellPolicy
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.TimeUnit
@@ -130,17 +129,20 @@ import java.util.concurrent.TimeUnit
  * AB1 呼叫級准入＋殘留計數補齊（owner 新 P1-A＋P1-B；PocketGuard 多為過時項，
  * 核實後只補真正缺的）：
  * - 併發上限 4（[ElevatedCleanupTracker.MAX_CONCURRENT_CALLS]，
- *   CAS [ElevatedCleanupTracker.tryEnterCall]／[ElevatedCleanupTracker.leaveCall]；
+ *   單一原子 [ElevatedCleanupTracker.tryEnterReserved] 同一鎖內檢查＋佔席
+ *   （飽和／熔斷／併發預留三條件，不做三段 CAS）；
  *   兩 runner 在飽和／熔斷門之後、配額之前准入，拒絕即
  *   `Denied(QUOTA_EXCEEDED, "elevated concurrency full...")` 且零 spawn、不耗配額；
  *   特權通道宜序列，B3 可調本常數）；
  * - 殘留 gobbler／stdin-closer 計數（啟動不預佔；join 超界仍存活即 interrupt＋grace，
- *   仍存活即 [ElevatedCleanupTracker.markLingering]：每執行緒 [AtomicBoolean]
- *   旗標＋僅未計數時佔槽，執行緒本體 finally 釋放；清理 worker 維持啟動佔／
+ *   仍存活即 [ElevatedCleanupTracker.markLingering]：每執行緒三態
+ *   [AtomicInteger]（0=init／1=held／2=done）＋僅未計數時佔槽，
+ *   執行緒本體 finally 釋放；清理 worker 維持啟動佔／
  *   finally 釋，不變）；
- * - linger 成功走 [ElevatedCleanupTracker.noteUnclean]（finished 路徑
- *   `if (cleanupIncomplete) noteUnclean() else noteClean()`；cleanupIncomplete
- *   含殘留 gobbler／stdin；正常完成仍 noteClean，不誤判良性；讀失敗不計入
+ * - linger 成功走 [ElevatedCleanupTracker.noteUnclean]（finished／kill 統一終審
+ *   `if (cleanupIncomplete) noteUnclean() else if (outstanding()==0) noteClean()`；
+ *   cleanupIncomplete 含殘留 gobbler／stdin；正常完成且全域無殘留仍 noteClean，
+ *   不誤判良性；讀失敗不計入
  *   連續計數 —— 無資源殘留，verdict 已 Failed，避免數據錯誤誤觸熔斷）。
  */
 internal object ElevatedCleanupTracker {
@@ -154,6 +156,14 @@ internal object ElevatedCleanupTracker {
      *
      * 飽和（[isSaturated]）即 B3 blocker 條件（見 [PrivilegeActivation]：清理缺口未解
      * 前產品不得放行，runner 入口資源門拒絕新 spawn）。
+     *
+     * P1-2 雙預算分離（PR140 Phase1）：本上限同時承擔併發預留檢查
+     *（見 [SLOTS_PER_CALL]／[tryEnterReserved]）：准入要求
+     * `outstanding + (active+1) * SLOTS_PER_CALL <= MAX_OUTSTANDING_CLEANUPS`。
+     * 以 MAX=4、SLOTS=4 計，乾淨態（outstanding==0）僅允單一進行中呼叫
+     *（0+1*4<=4 通過，0+2*4<=4 拒絕）：實效接近串行。特權通道宜序列
+     *（單次 drain 至多 1 清理 worker＋雙 gobbler＋stdin-closer），B3 可調本常數
+     *（放寬即允更高併發，但最壞超額同步放大，見 [tryEnterReserved] KDoc）。
      */
     const val MAX_OUTSTANDING_CLEANUPS = 4
 
@@ -161,12 +171,13 @@ internal object ElevatedCleanupTracker {
      * 連續不清創熔斷上限（終審殘留，fail-closed，不懲罰良性慢命令）。
      *
      * 只計「清理未完成」的連續次數（killer worker 超界未完成，即
-     * [ElevatedProcessIo.drain] kill 路徑 `runCleanupBounded` 回 false；
-     * AB1 起 finished 路徑殘留 gobbler／stdin（[markLingering] 持槽）亦記
-     * 未完成，見 drain finished 路徑 `if (cleanupIncomplete) noteUnclean()`）；
-     * 清理完成（含成功路徑正常完成、超時但清理完成 `cleanupOk==true`）即
-     * [noteClean] 歸零；良性慢命令（清理完成，即使 TimedOut）不累計。
-     * 可恢復序列 `0→1→0→1` 永不觸發（每次清理完成即歸零）；連續
+     * [ElevatedProcessIo.drain] kill 路徑 `runCleanupBounded` 回 false；或殘留
+     * gobbler／stdin（[markLingering] 持槽），見 drain finished／kill 統一終審
+     * `if (cleanupIncomplete) noteUnclean()`）；
+     * 清理完成且全域無殘留（`outstanding()==0 && !cleanupIncomplete`）即
+     * [noteClean] 歸零；殘留期間的乾淨 drain（outstanding>0）保持計數
+     *（不歸零亦不遞增），避免乾淨呼叫沖掉熔斷（P0-1，owner 新 P1）。
+     * 可恢復序列 `0→1→0→1` 永不觸發（每次乾淨完成且無殘留即歸零）；連續
      * `MAX_CONSECUTIVE_UNCLEAN` 次未完成即 [isBreakerOpen] 熔斷，
      * runner 入口拒絕新 spawn（與 [isSaturated] 同級，皆零 spawn、不耗配額）。
      */
@@ -178,96 +189,236 @@ internal object ElevatedCleanupTracker {
      * [MAX_OUTSTANDING_CLEANUPS] 只計殘留清理（事後止血）；併發呼叫本身亦須有界：
      * 特權通道宜序列（單次 drain 至多 1 清理 worker＋雙 gobbler＋stdin-closer），
      * 無界併發即無界執行緒／fd／Binder 參照。4 為有界併發經驗值（B3 可調本常數），
-     * 飽和即兩 runner 入口拒絕新 spawn（fail-closed，見 [tryEnterCall]）。
+     * 飽和即兩 runner 入口拒絕新 spawn（fail-closed，見 [tryEnterReserved]）。
      *
-     * 呼叫級准入（CAS，不耗配額）：runner 在飽和／熔斷門之後、配額之前 [tryEnterCall]
-     * （成功當且僅當舊值 < [MAX_CONCURRENT_CALLS]）；成功後整個剩餘 runBinary 包
+     * 呼叫級准入（P1-2 原子化）：runner 在飽和／熔斷門之後、配額之前調用單一
+     * [tryEnterReserved]（成功當且僅當預留檢查通過）；成功後整個剩餘 runBinary 包
      * `try { ... } finally { leaveCall() }`（配額拒、spawn 抛、drain 全路徑釋放）。
      * 併發拒絕與 quota 同級（`QUOTA_EXCEEDED`，零 spawn、不耗配額）。
      */
     const val MAX_CONCURRENT_CALLS = 4
 
+    /**
+     * 單呼叫槽位上界（P1-2，PR140 Phase1）。
+     *
+     * 單次 drain 最壞持有：1 清理 worker（kill 路徑 [runCleanupBounded]）＋
+     * 2 gobbler（stdout／stderr 殘留 [markLingering]）＋1 stdin-closer 殘留
+     * ＝4 槽。准入預留以此上界估算（見 [tryEnterReserved]），寧可保守拒絕
+     * 也不超額。
+     */
+    const val SLOTS_PER_CALL = 4
+
+    /**
+     * 統一准入 verdict（P1-2）：准入決定必須原子，拒絕原因僅供訊息區分，
+     * 不另做二次檢查。
+     */
+    enum class Admission {
+        OK,
+        BACKLOG_FULL,
+        BREAKER_OPEN,
+        CONCURRENCY_FULL,
+    }
+
+    private val lock = Any()
+
     private val outstandingCount = AtomicInteger(0)
 
-    /** 連續未完成清理計數（killer worker 超界未完成或 finished 殘留累計，清理完成即歸零）。 */
+    /** 連續未完成清理計數（killer worker 超界未完成或 finished 殘留累計；清理完成且全域無殘留才歸零，見 [noteClean]）。 */
     private val consecutiveUnclean = AtomicInteger(0)
 
     /** 進行中呼叫數（AB1 呼叫級准入，跨呼叫全域，雙 runner 共用；進入即佔，finally 釋放）。 */
     private val activeCalls = AtomicInteger(0)
 
-    /** 目前未完成清理數（跨呼叫全域，雙 runner 共用；僅計未完成，正常完成即釋放）。 */
-    fun outstanding(): Int = outstandingCount.get()
-
-    /** 目前進行中呼叫數（AB1 呼叫級准入；跨呼叫全域，雙 runner 共用）。 */
-    fun activeCalls(): Int = activeCalls.get()
+    /**
+     * floor 命中計數（診斷用，產品保持 floor 不變負但上報；正常路徑永不觸發，
+     * 觸發即呼叫方 bug——未佔而釋）。
+     */
+    private val releaseFloorHits = AtomicInteger(0)
+    private val leaveFloorHits = AtomicInteger(0)
 
     /**
-     * 呼叫級准入（AB1 P1-B）：CAS 佔一席，成功當且僅當舊值 < [MAX_CONCURRENT_CALLS]。
-     *
-     * 門位置：兩 runner 在飽和／熔斷門之後、配額之前調用；false 即 fail-closed
-     * 拒絕（`QUOTA_EXCEEDED`，零 spawn、不耗配額）。成功後呼叫方須以
-     * `try { ... } finally { leaveCall() }` 包住剩餘 runBinary（配額拒、spawn 抛、
-     * drain 全路徑釋放），否則計數洩漏即永久拒絕。
+     * 同步峰值（P1Fix 混合測試用，替代 sleep 採樣）：[acquireSlot] 同一 [lock] 內
+     * 同步更新，呼叫方以 [peakOutstanding] 斷言峰值有界，無採樣遺漏。
      */
-    fun tryEnterCall(): Boolean {
-        val prev = activeCalls.getAndUpdate { if (it >= MAX_CONCURRENT_CALLS) it else it + 1 }
-        return prev < MAX_CONCURRENT_CALLS
+    private val peakOutstanding = AtomicInteger(0)
+
+    /** 目前未完成清理數（跨呼叫全域，雙 runner 共用；僅計未完成，正常完成即釋放）。 */
+    fun outstanding(): Int = synchronized(lock) { outstandingCount.get() }
+
+    /** 目前進行中呼叫數（AB1 呼叫級准入；跨呼叫全域，雙 runner 共用）。 */
+    fun activeCalls(): Int = synchronized(lock) { activeCalls.get() }
+
+    /** 連續未完成計數快照（僅測試／診斷用；正式 verdict 以 [isBreakerOpen] 為準）。 */
+    internal fun consecutiveCount(): Int = synchronized(lock) { consecutiveUnclean.get() }
+
+    /** floor 命中快照（僅診斷用；正常路徑永為 0，測用不断言）。 */
+    internal fun releaseFloorHits(): Int = releaseFloorHits.get()
+    internal fun leaveFloorHits(): Int = leaveFloorHits.get()
+
+    /** 同步峰值快照（僅測試／診斷用；[acquireSlot] 同鎖內同步更新，替代 sleep 採樣）。 */
+    internal fun peakOutstanding(): Int = synchronized(lock) { peakOutstanding.get() }
+
+    /** 重置同步峰值為當前值（測試隔離用）。 */
+    internal fun resetPeak() {
+        synchronized(lock) { peakOutstanding.set(outstandingCount.get()) }
     }
 
-    /** 呼叫結束釋一席（floor 0；僅成功 [tryEnterCall] 後的 `finally` 調用）。 */
+    /**
+     * 呼叫級准入（AB1 P1-B，僅測用）：佔一席，成功當且僅當舊值 < [MAX_CONCURRENT_CALLS]。
+     *
+     * 僅測用，產品走單一原子 [tryEnterReserved]（飽和／熔斷／併發預留同一鎖內
+     * 檢查＋佔席，消除三段檢查 TOCTOU）。本函數保留供既有單測直接斷言併發語義，
+     * 不供 runner 入口使用（兩 runner 入口一律 [tryEnterReserved]）。
+     *
+     * 門位置（測用直調時）：false 即 fail-closed 拒絕（`QUOTA_EXCEEDED`，
+     * 零 spawn、不耗配額）。成功後呼叫方須以
+     * `try { ... } finally { leaveCall() }` 包住剩餘路徑，否則計數洩漏即永久拒絕。
+     */
+    internal fun tryEnterCall(): Boolean = synchronized(lock) {
+        if (activeCalls.get() >= MAX_CONCURRENT_CALLS) return false
+        activeCalls.incrementAndGet()
+        true
+    }
+
+    /**
+     * 呼叫結束釋一席（floor 0；僅成功 [tryEnterReserved] 後的 `finally` 調用）。
+     *
+     * floor 觸發即 bug（未進入而釋放）：產品保持 floor 不變負，但經
+     * [leaveFloorHits] 計數上報（測用不断言，僅供診斷；正常路徑永不觸發）。
+     */
     fun leaveCall() {
-        activeCalls.updateAndGet { if (it > 0) it - 1 else 0 }
+        synchronized(lock) {
+            if (activeCalls.get() > 0) {
+                activeCalls.decrementAndGet()
+            } else {
+                leaveFloorHits.incrementAndGet()
+            }
+        }
     }
 
     /** 是否飽和（未完成數達上限；飽和即有不可回收清理，runner 入口拒絕新 spawn）。 */
-    fun isSaturated(): Boolean = outstanding() >= MAX_OUTSTANDING_CLEANUPS
+    fun isSaturated(): Boolean = synchronized(lock) { outstandingCount.get() >= MAX_OUTSTANDING_CLEANUPS }
 
     /** 是否熔斷（連續未完成數達上限；熔斷即持續不清創，runner 入口拒絕新 spawn）。
      *
      * 鎖存語義：熔斷後所有新 spawn 被入口門拒絕，故不會再有 drain 執行、
      * 計數器不會自然歸零；B3 在驗證修復後須顯式呼叫 [noteClean] 重置
      * （internal，同模組可見），不得僅調大上限繞行。*/
-    fun isBreakerOpen(): Boolean = consecutiveUnclean.get() >= MAX_CONSECUTIVE_UNCLEAN
+    fun isBreakerOpen(): Boolean = synchronized(lock) { consecutiveUnclean.get() >= MAX_CONSECUTIVE_UNCLEAN }
 
-    /** 清理完成（成功路徑 finished、超時但清理完成）：連續計數歸零。 */
+    /**
+     * 清理完成：僅全域無殘留（`outstanding==0`）才歸零（P0-1）。
+     * 殘留期間（outstanding>0）的乾淨 drain 保持計數（不歸零亦不遞增），
+     * 避免乾淨呼叫沖掉熔斷。
+     */
     internal fun noteClean() {
-        consecutiveUnclean.set(0)
-    }
-
-    /** 清理未完成（killer worker 超界未完成）：連續計數遞增，飽和值封頂防溢出。 */
-    internal fun noteUnclean() {
-        consecutiveUnclean.updateAndGet {
-            if (it >= MAX_CONSECUTIVE_UNCLEAN) MAX_CONSECUTIVE_UNCLEAN else it + 1
+        synchronized(lock) {
+            if (outstandingCount.get() == 0) consecutiveUnclean.set(0)
         }
     }
 
-    /** 佔一槽（[ElevatedProcessIo.drain] 經 `runCleanupBounded` 或 [markLingering] 調用）。 */
-    internal fun acquireSlot() {
-        outstandingCount.incrementAndGet()
-    }
-
-    /** 釋一槽（`runCleanupBounded` worker finally 或殘留執行緒本體 finally 調用）。 */
-    internal fun releaseSlot() {
-        outstandingCount.updateAndGet { if (it > 0) it - 1 else 0 }
+    /** 清理未完成（killer worker 超界未完成或殘留 gobbler／stdin）：連續計數遞增，飽和值封頂防溢出。 */
+    internal fun noteUnclean() {
+        synchronized(lock) {
+            if (consecutiveUnclean.get() >= MAX_CONSECUTIVE_UNCLEAN) {
+                consecutiveUnclean.set(MAX_CONSECUTIVE_UNCLEAN)
+            } else {
+                consecutiveUnclean.incrementAndGet()
+            }
+        }
     }
 
     /**
-     * 殘留執行緒記一槽（AB1 P1-A）：drain 內 gobbler／stdin-closer 啟動不預佔；
-     * join 超界仍存活（interrupt＋grace 後）即調用，僅未計數時 [acquireSlot]。
+     * 統一原子准入（P1-2，PR140 Phase1）：同一 [lock] 內檢查三條件並佔席。
      *
-     * 競態收斂：調用前先查 `thread.isAlive`（已退出即不計）；CAS 成功佔槽後若執行緒
-     * 已自然退出（CAS 與執行緒本體 finally 的 `getAndSet(false)` 交錯），以
-     * `compareAndSet(true, false)` 收回並釋放 —— 與 finally 的釋放互斥其一，
-     * 恰好一次，不漏計不重釋。執行緒本體 finally 為
-     * `if (counted.getAndSet(false)) releaseSlot()`（自然退出時競態下平衡）。
+     * 檢查順序（拒絕原因優先級，僅供訊息區分，准入決定單一原子點）：
+     * 1. `outstanding >= MAX` → [Admission.BACKLOG_FULL]；
+     * 2. `consecutive >= MAX_CONSECUTIVE_UNCLEAN` → [Admission.BREAKER_OPEN]；
+     * 3. `active >= MAX_CONCURRENT_CALLS` → [Admission.CONCURRENCY_FULL]；
+     * 4. `outstanding + (active+1) * SLOTS_PER_CALL > MAX` → [Admission.BACKLOG_FULL]
+     *   （預留超額，視為 backlog 壓力）；
+     * 5. 否則 `active++` 並回 [Admission.OK]。
+     *
+     * 特權宜序列：MAX=4、SLOTS=4 時乾淨態僅允單一進行中呼叫
+     *（0+1*4<=4 通過，0+2*4<=4 拒絕），實效接近串行；B3 可調 MAX／SLOTS
+     * 放寬併發，但最壞超額同步放大（理論最壞 `outstanding + active*SLOTS`
+     * 可達 `MAX + MAX_CONCURRENT*SLOTS`，現參數下單槽實測峰值有界，見
+     * 迴歸測試 mixed-backlog）。呼叫方成功（OK）後須 `try/finally{leaveCall()}`
+     * 包住剩餘 runBinary；拒絕路徑零 spawn、不耗配額、不佔席。
+     *
+     * [Admission.CONCURRENCY_FULL] 保留但現參數下實效不可達（預留檢查先拒：
+     * 乾淨態第二呼叫即 `0+2*4>4` 走 BACKLOG_FULL，不會走到 `active>=4`），
+     * 為未來放寬 MAX／SLOTS 後的併發上限保留；reservation 矩陣直測見
+     * `ElevatedCleanupTrackerTest`（不經 runner，直接斷言預留表）。
      */
-    internal fun markLingering(thread: Thread, counted: AtomicBoolean) {
-        if (!thread.isAlive) return
-        if (counted.compareAndSet(false, true)) {
-            acquireSlot()
-            if (!thread.isAlive && counted.compareAndSet(true, false)) {
-                releaseSlot()
+    fun tryEnterReserved(): Admission = synchronized(lock) {
+        if (outstandingCount.get() >= MAX_OUTSTANDING_CLEANUPS) return Admission.BACKLOG_FULL
+        if (consecutiveUnclean.get() >= MAX_CONSECUTIVE_UNCLEAN) return Admission.BREAKER_OPEN
+        if (activeCalls.get() >= MAX_CONCURRENT_CALLS) return Admission.CONCURRENCY_FULL
+        if (outstandingCount.get() + (activeCalls.get() + 1) * SLOTS_PER_CALL > MAX_OUTSTANDING_CLEANUPS) {
+            return Admission.BACKLOG_FULL
+        }
+        activeCalls.incrementAndGet()
+        Admission.OK
+    }
+
+    /** 佔一槽（[ElevatedProcessIo.drain] 經 `runCleanupBounded` 或 [markLingering] 調用；同鎖內同步更新峰值）。 */
+    internal fun acquireSlot() {
+        synchronized(lock) {
+            outstandingCount.incrementAndGet()
+            val cur = outstandingCount.get()
+            if (cur > peakOutstanding.get()) peakOutstanding.set(cur)
+        }
+    }
+
+    /**
+     * 釋一槽（`runCleanupBounded` worker finally 或殘留執行緒本體 finally 調用）。
+     *
+     * floor 觸發即 bug（未佔而釋）：產品保持 floor 不變負，但經
+     * [releaseFloorHits] 計數上報（測用不断言，僅供診斷；正常三態機制下永不觸發）。
+     */
+    internal fun releaseSlot() {
+        synchronized(lock) {
+            if (outstandingCount.get() > 0) {
+                outstandingCount.decrementAndGet()
+            } else {
+                releaseFloorHits.incrementAndGet()
             }
+        }
+    }
+
+    /**
+     * 殘留執行緒記一槽（AB1 P1-A＋P0-1 三態修正）：drain 內 gobbler／stdin-closer
+     * 啟動不預佔；join 超界 grace 後仍存活（重讀 `isAlive` 確認）即調用。
+     *
+     * 三態線性化點：以 `state` 本體為鎖（`synchronized(state)`），同一執行緒的
+     * mark 與本體 finally 互斥，恰好一次，不漏計不重釋，不依賴 `isAlive` 第二讀：
+     * - 狀態：0=init（未記）、1=held（已佔槽）、2=done（終態，不再轉換）；
+     * - mark：僅 `state==0 && thread.state!=TERMINATED` 才 `state=1+acquire`；
+     *   `state!=0` 直接返回（已記或已終）；已終止（TERMINATED）即 `state=2` 返回，
+     *   不佔槽；無第二 `isAlive` 收斂分支（舊碼同鎖內第二讀無用——`isAlive`
+     *   不受本鎖保護，worker 可在取鎖前釋放後、返回前窗口內退出，造成 ghost；
+     *   新碼以狀態機消除該窗口）；
+     * - finally：`synchronized(state){ if (state==1){state=2;release} else if (state==0) state=2 }`
+     *   （自然退出時競態下平衡；1→釋放，0→直接終態，2→無動作）。
+     *
+     * 舊 CAS＋雙讀 ghost 根因：`compareAndSet(false,true)` 成功後、`acquireSlot()`
+     * 之前，worker finally 的 `getAndSet(false)->releaseSlot()` 可插隊；
+     * `releaseSlot` 在 outstanding==0 時 floor-to-zero 丟失一次遞減，隨後
+     * `acquireSlot` 即永久 +1；同鎖內第二 `isAlive` 讀亦無法收斂（μs 窗口內
+     * caller 可 set+acquire 成 ghost）。現以三態＋同一鎖包住 acquire／標記／釋放，
+     * 刪除 `isAlive` 依賴（僅保留 mark 入口一次 `state==TERMINATED` 判定，
+     * 為線性化點內的單次狀態讀，非快照＋重讀）。
+     */
+    internal fun markLingering(thread: Thread, state: AtomicInteger) {
+        synchronized(state) {
+            if (state.get() != 0) return
+            if (thread.state == Thread.State.TERMINATED) {
+                state.set(2)
+                return
+            }
+            state.set(1)
+            acquireSlot()
         }
     }
 }
@@ -393,15 +544,22 @@ internal object ElevatedProcessIo {
         // stall 本身無界）。改 daemon thread 執行＋主執行緒 join（上界
         // `min(剩餘 budget, STDIN_CLOSE_MAX_MS)`，計入同一 deadline）；超界即放行
         // 繼續（best-effort，後續 killer destroy 兜底），drain 總耗時仍有上界。
-        // AB1 P1-A：stdin-closer 啟動不預佔；尾收 grace 後仍存活才 [markLingering]
-        // （每執行緒 [AtomicBoolean] 旗標＋僅未計數時佔槽；本體 finally 釋放，
-        // 自然退出時競態下平衡，見 [ElevatedCleanupTracker.markLingering]）。
-        val stdinCounted = AtomicBoolean(false)
+        // AB1 P1-A＋P0-1 三態：stdin-closer 啟動不預佔；尾收 grace 後仍存活才 [markLingering]
+        // （每執行緒三態 [AtomicInteger] 0=init／1=held／2=done＋僅未計數時佔槽；
+        // 本體 finally 釋放，見 [ElevatedCleanupTracker.markLingering]）。
+        val stdinCounted = AtomicInteger(0)
         val stdinCloser = Thread({
             try {
                 runCatching { process.outputStream.close() }
             } finally {
-                if (stdinCounted.getAndSet(false)) ElevatedCleanupTracker.releaseSlot()
+                synchronized(stdinCounted) {
+                    if (stdinCounted.get() == 1) {
+                        stdinCounted.set(2)
+                        ElevatedCleanupTracker.releaseSlot()
+                    } else if (stdinCounted.get() == 0) {
+                        stdinCounted.set(2)
+                    }
+                }
             }
         }, "elevated-stdin-close").also {
             it.isDaemon = true
@@ -423,10 +581,10 @@ internal object ElevatedProcessIo {
         // 無未捕捉例外）；block 則 caller 不受影響照常進 deadline/poll/kill。
         // @Volatile 語義由 AtomicReference 承載（函數內局部 var 不可 @Volatile，
         // 此處以原子引用持有已取流，供 kill 路徑關流）。
-        // AB1 P1-A：gobbler 啟動不預佔；join 超界仍存活（interrupt＋grace 後）才
-        // [markLingering]（旗標＋僅未計數時佔槽；本體 finally 釋放，見上）。
-        val outCounted = AtomicBoolean(false)
-        val errCounted = AtomicBoolean(false)
+        // AB1 P1-A＋P0-1 三態：gobbler 啟動不預佔；join 超界 grace 後仍存活才
+        // [markLingering]（三態＋僅未計數時佔槽；本體 finally 釋放，見上）。
+        val outCounted = AtomicInteger(0)
+        val errCounted = AtomicInteger(0)
         val inAcquired = AtomicReference<InputStream?>(null)
         val errAcquired = AtomicReference<InputStream?>(null)
         val tOut = Thread({
@@ -438,7 +596,14 @@ internal object ElevatedProcessIo {
                 out.markFailed()
             } finally {
                 inAcquired.set(null)
-                if (outCounted.getAndSet(false)) ElevatedCleanupTracker.releaseSlot()
+                synchronized(outCounted) {
+                    if (outCounted.get() == 1) {
+                        outCounted.set(2)
+                        ElevatedCleanupTracker.releaseSlot()
+                    } else if (outCounted.get() == 0) {
+                        outCounted.set(2)
+                    }
+                }
             }
         }, "elevated-stdout").also {
             it.isDaemon = true
@@ -453,7 +618,14 @@ internal object ElevatedProcessIo {
                 err.markFailed()
             } finally {
                 errAcquired.set(null)
-                if (errCounted.getAndSet(false)) ElevatedCleanupTracker.releaseSlot()
+                synchronized(errCounted) {
+                    if (errCounted.get() == 1) {
+                        errCounted.set(2)
+                        ElevatedCleanupTracker.releaseSlot()
+                    } else if (errCounted.get() == 0) {
+                        errCounted.set(2)
+                    }
+                }
             }
         }, "elevated-stderr").also {
             it.isDaemon = true
@@ -485,6 +657,7 @@ internal object ElevatedProcessIo {
         var joinIncomplete = false
         // Z1 清理不完整旗標：kill 監督未完成或 stdin-closer 尾收殘留即 true
         //（runner verdict 映射不變，僅供 B3 監測）。
+        // P1-3：kill 終審推遲到尾收後（gobbler／stdin linger 亦計入，避免少計）。
         var cleanupIncomplete = false
         if (!finished) {
             // X1：kill 前先 best-effort 中斷兩 gobbler（助可中斷 stalls 脫離，無害；
@@ -506,9 +679,8 @@ internal object ElevatedProcessIo {
                 runCatching { errAcquired.get()?.close() }
             }
             if (!cleanupOk) cleanupIncomplete = true
-            // 終審殘留：kill 監督後接線連續計數（ok 即歸零，否則遞增；良性慢命令
-            // 清理完成即歸零，不累計）。
-            if (cleanupOk) ElevatedCleanupTracker.noteClean() else ElevatedCleanupTracker.noteUnclean()
+            // P1-3：終審推遲到尾收後（此處不再 noteClean/noteUnclean，避免
+            // 後續 gobbler／stdin linger 少計；統一終審見尾收段）。
             // 殺後等待：中斷必須 restore（不吞 InterruptedException）；
             // 非中斷異常收斂（清理路徑不升級為崩潰，仍回 TimedOut）。
             try {
@@ -547,8 +719,8 @@ internal object ElevatedProcessIo {
             }
         } else {
             // AB1 P1-A：本分支不再起手 noteClean；改由尾收後統一判定
-            // `if (cleanupIncomplete) noteUnclean() else noteClean()`
-            //（cleanupIncomplete 含殘留 gobbler／stdin；正常完成仍
+            // `if (cleanupIncomplete) noteUnclean() else if (outstanding()==0) noteClean()`
+            //（cleanupIncomplete 含殘留 gobbler／stdin；正常完成且全域無殘留仍
             // noteClean，不誤判良性；讀失敗不計，見尾收終審）。早拒路徑（門拒／
             // 配額拒，spawn 前）無 drain 執行，不碰計數器。
             // 成功路徑亦有界等待（P1-B review）：上界 SUCCESS_JOIN_MS（10s），
@@ -559,13 +731,14 @@ internal object ElevatedProcessIo {
             // 短 grace（SUCCESS_JOIN_GRACE_MS）重 join 回收線程。首段超界即記
             // 不完整（grace 只為回收，不清除標記：超 10s 的讀數不視為完整）。
             // 正常慢讀 10s 內完成即無 interrupt，不受影響；只有卡死執行緒才走到此分支。
+            // P0-2：grace 後必須重讀 `isAlive` 再判定（舊碼以 grace 前快照置旗，
+            // 而三態 mark 對已退出執行緒不佔槽，造成無槽 noteUnclean）。
             try {
                 tOut.join(SUCCESS_JOIN_MS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
-            val outStuck = tOut.isAlive
-            if (outStuck) {
+            if (tOut.isAlive) {
                 runCatching { tOut.interrupt() }
                 try {
                     tOut.join(SUCCESS_JOIN_GRACE_MS)
@@ -573,7 +746,7 @@ internal object ElevatedProcessIo {
                     Thread.currentThread().interrupt()
                 }
             }
-            if (outStuck) {
+            if (tOut.isAlive) {
                 joinIncomplete = true
                 cleanupIncomplete = true
                 ElevatedCleanupTracker.markLingering(tOut, outCounted)
@@ -583,8 +756,7 @@ internal object ElevatedProcessIo {
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
-            val errStuck = tErr.isAlive
-            if (errStuck) {
+            if (tErr.isAlive) {
                 runCatching { tErr.interrupt() }
                 try {
                     tErr.join(SUCCESS_JOIN_GRACE_MS)
@@ -592,7 +764,7 @@ internal object ElevatedProcessIo {
                     Thread.currentThread().interrupt()
                 }
             }
-            if (errStuck) {
+            if (tErr.isAlive) {
                 joinIncomplete = true
                 cleanupIncomplete = true
                 ElevatedCleanupTracker.markLingering(tErr, errCounted)
@@ -615,18 +787,21 @@ internal object ElevatedProcessIo {
                 ElevatedCleanupTracker.markLingering(stdinCloser, stdinCounted)
             }
         }
-        // AB1 finished 路徑終審：殘留 gobbler／stdin（cleanupIncomplete）即
-        // noteUnclean 累計；正常完成（無殘留）仍 noteClean，不誤判良性。
+        // P1-3＋P0-1 統一終審（兩路徑共通，kill 終審推遲到此，避免少計）：
+        // - cleanupIncomplete（含 kill 監督未完成、殘留 gobbler／stdin）即
+        //   noteUnclean 累計（kill 路徑 cleanupOk==false 已併入本旗標；kill 後
+        //   gobbler linger 亦併入，不再少計；finished 殘留同理）；
+        // - 無殘留（cleanupIncomplete==false）僅全域無殘留（outstanding==0）才
+        //   noteClean；殘留期間（outstanding>0）的乾淨 drain 保持計數
+        //  （不歸零亦不遞增），避免乾淨呼叫沖掉熔斷（P0-1）。
         // 讀失敗（out／err.failed）不計入連續計數：finished 下讀異常必為真實 I／O
         // 錯誤但不持有任何資源（執行緒已退出、流已關），verdict 已回 Failed；
         // 連續計數只計資源清理未完成（殘留執行緒／worker 持槽），避免數據錯誤
-        // 誤觸熔斷。kill 路徑已在上以 cleanupOk 終審，此處只處理 finished。
-        if (finished) {
-            if (cleanupIncomplete) {
-                ElevatedCleanupTracker.noteUnclean()
-            } else {
-                ElevatedCleanupTracker.noteClean()
-            }
+        // 誤觸熔斷。
+        if (cleanupIncomplete) {
+            ElevatedCleanupTracker.noteUnclean()
+        } else if (ElevatedCleanupTracker.outstanding() == 0) {
+            ElevatedCleanupTracker.noteClean()
         }
         return Drained(
             stdout = out.bytes(),

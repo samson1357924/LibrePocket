@@ -10,6 +10,7 @@ import dev.librepocket.shell.ShellResult
 import dev.librepocket.shell.Validation
 import dev.librepocket.tool.Flavor
 import java.nio.file.Path
+import java.util.concurrent.TimeUnit
 import rikka.shizuku.Shizuku
 
 /**
@@ -191,19 +192,40 @@ class ShizukuShellRunner(
         if (ElevatedRunnerCommon.isPreSpawnCancelled(isCancelled)) {
             return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
         }
-        // P1-B 門順序＋R1-B grant＋U1 執行門：
+        // B3 單一 deadline（owner P1-5）：整個特權請求同一 budget（單調時鐘），
+        // 後續阻塞外部回呼（授權讀取／status ping／newProcess／wait）＋drain 皆以
+        // 剩餘為上界，超界即 TimedOut（零 spawn／零殘留語義同既有取消，不耗 quota）。
+        val safeTimeoutMs = timeoutMs.coerceAtLeast(0L).coerceAtMost(Long.MAX_VALUE / 1_000_000L)
+        val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(safeTimeoutMs)
+        // B3 cheap 准入前置（owner P1-5）：可能阻塞的外部回呼前先占全域席
+        //（[tryEnterReserved] 原子；拒絕不耗 quota；阻塞體皆有界監督，stall 即殘留
+        // 追蹤，呼叫方有界返回）。validate（純）亦入席內（需 bridge 快照，bridge
+        // 本身阻塞，故席位須在 bridge 之前；黑名單等純拒絕亦短暫占席後經 finally 釋放）。
+        when (ElevatedCleanupTracker.tryEnterReserved()) {
+            ElevatedCleanupTracker.Admission.OK -> Unit
+            ElevatedCleanupTracker.Admission.BACKLOG_FULL -> {
+                return ElevatedRunnerCommon.cleanupBacklogFull()
+            }
+            ElevatedCleanupTracker.Admission.BREAKER_OPEN -> {
+                return ElevatedRunnerCommon.cleanupBreakerOpen()
+            }
+            ElevatedCleanupTracker.Admission.CONCURRENCY_FULL -> {
+                return ElevatedRunnerCommon.concurrencyFull()
+            }
+        }
+        try {
+        // P1-B 門順序＋R1-B grant＋U1 執行門（B3 有界）：
         // validate → reasonCode → grantCheck → activation → bridge → status 門 → quota → spawn。
-        // validate 先於 binder IPC（status 內 ping 最多 3 次 binder），黑名單 argv
-        // 零 IPC 即拒；quota 置於門後（與 RootSuRunner 側一致），門拒絕不耗配額。
         // U1：bridge 當次 call 新鮮求值快照一次，供 validate 與橋門共用
-        //（同 call 內一致；抛異常即 fail-closed 零 spawn）。
-        val bridge = try {
-            bridgeGranted()
-        } catch (_: Exception) {
-            return ElevatedBinaryResult.Denied(
+        //（同 call 內一致；B3 有界：超界／取消即 TimedOut 零 spawn，不耗 quota）。
+        val bridgeRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) { bridgeGranted() }
+        val bridge = when (bridgeRes) {
+            is ElevatedCallSupervisor.Res.Ok -> bridgeRes.v
+            is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                 ShellDeny.NOT_WHITELISTED,
                 "privilege bridge check failed (fail-closed, no spawn)",
             )
+            is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
         }
         when (
             val v = ShellPolicy.validateElevated(
@@ -222,50 +244,61 @@ class ShizukuShellRunner(
         if (reasonSnapshot.isBlank()) {
             return ElevatedRunnerCommon.missingReasonCode()
         }
-        // P1-1 可信身分（提權與直接同等）：bare 經受控搜尋固定為已驗證實體，
-        // 絕對 argv[0] 經同一實體驗證；失敗即 Denied 且零 spawn、不耗配額、
-        // 不占席、不打 binder IPC（status 門之前）。
-        val resolvedExec = when (
-            val outcome = ElevatedExecPolicy.resolveForSnapshot(
+        // P1-1 可信身分（B3 有界）：bare 經受控搜尋固定為已驗證實體，
+        // 絕對 argv[0] 經同一實體驗證；失敗即 Denied 且零 spawn、不耗配額；
+        // 席位已在上占，經 finally 釋放。`execResolver` 注入可阻塞，故亦跑監督。
+        val resolvedRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) {
+            ElevatedExecPolicy.resolveForSnapshot(
                 argvSnapshot[0],
                 execSearchDirs,
                 execAllowedRoots,
                 execIsWritable,
                 execResolver,
             )
-        ) {
-            is ShellExecutables.ResolveOutcome.Ok -> outcome.exec
-            is ShellExecutables.ResolveOutcome.Denied ->
-                return ElevatedBinaryResult.Denied(
-                    ShellDeny.BLACKLISTED,
-                    "untrusted executable: ${argvSnapshot[0].trim()} (reason=${outcome.reason})",
-                )
         }
-        // R1-B：grant 新鮮求值
-        //（validate→reasonCode→grantCheck→activation→bridge→status 門→quota→spawn）。
+        val resolvedExec = when (resolvedRes) {
+            is ElevatedCallSupervisor.Res.Ok -> when (
+                val outcome = resolvedRes.v
+            ) {
+                is ShellExecutables.ResolveOutcome.Ok -> outcome.exec
+                is ShellExecutables.ResolveOutcome.Denied ->
+                    return ElevatedBinaryResult.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "untrusted executable: ${argvSnapshot[0].trim()} (reason=${outcome.reason})",
+                    )
+            }
+            is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
+                ShellDeny.BLACKLISTED,
+                "untrusted executable: ${argvSnapshot[0].trim()} (reason=NOT_FOUND)",
+            )
+            is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
+        }
+        // R1-B：grant 新鮮求值（B3 有界：超界／取消即 TimedOut 零 spawn，不耗 quota）。
         // Invalid 即 Denied(NOT_WHITELISTED, reason) 且零 spawn；抛異常同樣
         // fail-closed Denied 且零 spawn（不耗 quota，不打 binder IPC，不 spawn）。
-        val grant = try {
-            grantCheck()
-        } catch (_: Exception) {
-            return ElevatedBinaryResult.Denied(
+        val grantRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) { grantCheck() }
+        val grant = when (grantRes) {
+            is ElevatedCallSupervisor.Res.Ok -> grantRes.v
+            is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                 ShellDeny.NOT_WHITELISTED,
                 "grant check failed (fail-closed, no spawn)",
             )
+            is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
         }
         when (grant) {
             is GrantCheck.Valid -> Unit
             is GrantCheck.Invalid -> return ElevatedBinaryResult.Denied(ShellDeny.NOT_WHITELISTED, grant.reason)
         }
         // U1 執行門：activation 未就緒即 Denied 且零 spawn；抛異常同樣
-        // fail-closed Denied 且零 spawn（不打 binder IPC，不耗 quota，不 spawn）。
-        val activated = try {
-            activationCheck()
-        } catch (_: Exception) {
-            return ElevatedBinaryResult.Denied(
+        // fail-closed Denied 且零 spawn（B3 有界同上）。
+        val activatedRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) { activationCheck() }
+        val activated = when (activatedRes) {
+            is ElevatedCallSupervisor.Res.Ok -> activatedRes.v
+            is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                 ShellDeny.NOT_WHITELISTED,
                 "activation check failed (fail-closed, no spawn)",
             )
+            is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
         }
         if (!activated) {
             return ElevatedBinaryResult.Denied(
@@ -281,51 +314,44 @@ class ShizukuShellRunner(
                 "privilege bridge off (fail-closed, no spawn)",
             )
         }
-        ShizukuStatusGate.denyFor(runCatching { status() }.getOrDefault(ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN)))
-            ?.let { return ElevatedBinaryResult.Denied(it.reason, it.message) }
-        // AA1 resource gate＋AB1 呼叫級准入（P1-2 原子化，PR140 Phase1）：
-        // 單一 [ElevatedCleanupTracker.tryEnterReserved] 原子決定（飽和／熔斷／
-        // 併發預留同一鎖內檢查＋佔席，消除三段檢查 TOCTOU；3 backlog＋4 併發最壞
-        // 19 槽（每 call 4 槽上界）經預留 `outstanding+(active+1)*4<=MAX` 截斷，
-        // 實效接近串行，特權宜序列，#136-B3 可調 MAX／SLOTS）。
-        // 拒絕原因僅供訊息區分（backlog vs breaker vs concurrency），准入決定原子。
-        when (ElevatedCleanupTracker.tryEnterReserved()) {
-            ElevatedCleanupTracker.Admission.OK -> Unit
-            ElevatedCleanupTracker.Admission.BACKLOG_FULL -> {
-                return ElevatedRunnerCommon.cleanupBacklogFull()
-            }
-            ElevatedCleanupTracker.Admission.BREAKER_OPEN -> {
-                return ElevatedRunnerCommon.cleanupBreakerOpen()
-            }
-            ElevatedCleanupTracker.Admission.CONCURRENCY_FULL -> {
-                return ElevatedRunnerCommon.concurrencyFull()
-            }
+        // B3 有界 status（owner P1-5）：`status()` 內 ping／version／permission
+        // 皆為同步 Binder IPC，可無限等；跑監督 worker，超界／取消即 TimedOut
+        // 零 spawn（抛異常仍折 BinderUnreachable Denied，見下；快路徑不額外調鉤）。
+        val statusRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) { status() }
+        val curStatus = when (statusRes) {
+            is ElevatedCallSupervisor.Res.Ok -> statusRes.v
+            is ElevatedCallSupervisor.Res.Err -> ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN)
+            is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
         }
-        try {
-            // Phase3 spawn 前重求值（TOCTOU 收斂）：准入已占席（active+1）但配額尚未消耗；
-            // 此處重求 grant＋activation＋bridge 新鮮快照＋重估 status()（首次 status
-            // 在准入前、重估在准入後、配額在重估後——慢 IPC 阻塞不占配額），任一翻轉
-            // 即按早拒同碼 Denied 且零 spawn；拒絕經 finally leaveCall 釋席，不耗配額
-            //（quota 尚未 acquire）。
-            val reGrant = try {
-                grantCheck()
-            } catch (_: Exception) {
-                return ElevatedBinaryResult.Denied(
+        ShizukuStatusGate.denyFor(curStatus)
+            ?.let { return ElevatedBinaryResult.Denied(it.reason, it.message) }
+        // B3 註記：第二准入已前移至入口（單一 `tryEnterReserved`，見上）；
+        // 此處不再二次准入，仍在同一 `try { ... } finally { leaveCall() }` 內。
+        // （B1/B2 語義不變：快照／身分／三點取消／verify 皆保留）。
+            // Phase3 spawn 前重求值（TOCTOU 收斂，B3 有界）：准入已占席但配額尚未消耗；
+            // 此處重求 grant＋activation＋bridge 新鮮快照＋重估 status()，任一翻轉
+            // 即按早拒同碼 Denied 且零 spawn；拒絕經 finally leaveCall 釋席，不耗配額。
+            val reGrantRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) { grantCheck() }
+            val reGrant = when (reGrantRes) {
+                is ElevatedCallSupervisor.Res.Ok -> reGrantRes.v
+                is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                     ShellDeny.NOT_WHITELISTED,
                     "grant check failed (fail-closed, no spawn)",
                 )
+                is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
             }
             when (reGrant) {
                 is GrantCheck.Valid -> Unit
                 is GrantCheck.Invalid -> return ElevatedBinaryResult.Denied(ShellDeny.NOT_WHITELISTED, reGrant.reason)
             }
-            val reActivated = try {
-                activationCheck()
-            } catch (_: Exception) {
-                return ElevatedBinaryResult.Denied(
+            val reActivatedRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) { activationCheck() }
+            val reActivated = when (reActivatedRes) {
+                is ElevatedCallSupervisor.Res.Ok -> reActivatedRes.v
+                is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                     ShellDeny.NOT_WHITELISTED,
                     "activation check failed (fail-closed, no spawn)",
                 )
+                is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
             }
             if (!reActivated) {
                 return ElevatedBinaryResult.Denied(
@@ -333,13 +359,14 @@ class ShizukuShellRunner(
                     "activation not ready (fail-closed, no spawn)",
                 )
             }
-            val reBridge = try {
-                bridgeGranted()
-            } catch (_: Exception) {
-                return ElevatedBinaryResult.Denied(
+            val reBridgeRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) { bridgeGranted() }
+            val reBridge = when (reBridgeRes) {
+                is ElevatedCallSupervisor.Res.Ok -> reBridgeRes.v
+                is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                     ShellDeny.NOT_WHITELISTED,
                     "privilege bridge check failed (fail-closed, no spawn)",
                 )
+                is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
             }
             if (!reBridge) {
                 return ElevatedBinaryResult.Denied(
@@ -347,28 +374,41 @@ class ShizukuShellRunner(
                     "privilege bridge off (fail-closed, no spawn)",
                 )
             }
-            // status 重估（同早段門語義：抛異常折 BinderUnreachable，denyFor 映射；
-            // 早段已求值一次，此處為 spawn 前最終快照，binder 翻轉即零 spawn 拒絕）。
-            val reStatus = runCatching { status() }
-                .getOrDefault(ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN))
+            // status 重估（B3 有界，同早段門語義：抛異常折 BinderUnreachable，denyFor 映射；
+            // 超界／取消即 TimedOut 零 spawn）。
+            val reStatusRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) { status() }
+            val reStatus = when (reStatusRes) {
+                is ElevatedCallSupervisor.Res.Ok -> reStatusRes.v
+                is ElevatedCallSupervisor.Res.Err -> ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN)
+                is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
+            }
             ShizukuStatusGate.denyFor(reStatus)
                 ?.let { return ElevatedBinaryResult.Denied(it.reason, it.message) }
-            // P1-1 spawn 前重驗 executable（縮小驗過→spawn 窗口，與直接通道同策）：
+            // P1-1 spawn 前重驗 executable（B3 有界）：縮小驗過→spawn 窗口。
             // 同一解析再跑一次並比全字段，不一致／失敗即拒且零 spawn（配額尚未扣除）。
-            val reResolved = when (
-                val outcome = ElevatedExecPolicy.resolveForSnapshot(
+            val reResolvedRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) {
+                ElevatedExecPolicy.resolveForSnapshot(
                     argvSnapshot[0],
                     execSearchDirs,
                     execAllowedRoots,
                     execIsWritable,
                     execResolver,
                 )
-            ) {
-                is ShellExecutables.ResolveOutcome.Ok -> outcome.exec
+            }
+            val reOutcome = when (reResolvedRes) {
+                is ElevatedCallSupervisor.Res.Ok -> reResolvedRes.v
+                is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "untrusted executable: ${argvSnapshot[0].trim()} (reason=NOT_FOUND)",
+                )
+                is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
+            }
+            val reResolved = when (reOutcome) {
+                is ShellExecutables.ResolveOutcome.Ok -> reOutcome.exec
                 is ShellExecutables.ResolveOutcome.Denied ->
                     return ElevatedBinaryResult.Denied(
                         ShellDeny.BLACKLISTED,
-                        "untrusted executable: ${argvSnapshot[0].trim()} (reason=${outcome.reason})",
+                        "untrusted executable: ${argvSnapshot[0].trim()} (reason=${reOutcome.reason})",
                     )
             }
             if (reResolved != resolvedExec) {
@@ -377,28 +417,32 @@ class ShizukuShellRunner(
                     "untrusted executable: ${argvSnapshot[0].trim()} (reason=REVERIFY_MISMATCH)",
                 )
             }
-            // P1-4 spawn 前最終取消檢查（B2）：重驗後、配額前再驗一次，中途取消
-            // 亦零新 spawn（不耗配額；已占席由 finally 釋放；interrupt 不清除）。
+            // P1-4 spawn 前最終取消檢查：重驗後、配額前再驗一次，
+            // 中途取消／超界亦零新 spawn（不耗配額；已占席由 finally 釋放）。
             if (ElevatedRunnerCommon.isPreSpawnCancelled(isCancelled)) {
                 return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
             }
             if (!quota.tryAcquire()) {
                 return ElevatedRunnerCommon.quotaExceeded()
             }
-            // P1-4 spawn 競態收斂：配額→spawn 窗口再驗一次（配額已耗仍零 spawn，
-            // 覆蓋 quota.acquire 後取消的窄競態；drain 層 isCancelled 輪詢只覆
-            // 已建進程，此處覆未建）。
+            // P1-4 spawn 競態收斂：配額→spawn 窗口再驗一次（配額已耗仍零 spawn）。
             if (ElevatedRunnerCommon.isPreSpawnCancelled(isCancelled)) {
                 return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
             }
-            // 遠端建子進程：argv 已固定為已驗證實體（[ElevatedExecPolicy.toSpawnArgv]，
-            // 不再用原始 argv[0]），dir 釘到 privateRoot（見 pinnedSpawn）。
+            // 遠端建子進程（B3 有界，owner P1-5）：`newProcess` 同步 Binder 可無限等；
+            // 跑監督 worker，超界／取消即 TimedOut 零 spawn（配額已耗仍零 spawn）。
             val spawnArgv = ElevatedExecPolicy.toSpawnArgv(snapshot, resolvedExec)
-            val process: Process = try {
+            val spawnRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) {
                 (spawn ?: ::pinnedSpawn)(spawnArgv)
-            } catch (e: Exception) {
-                val redacted = Redactor.redactError(e.message ?: e.javaClass.simpleName)
-                return ElevatedBinaryResult.Failed("shizuku spawn failed: $redacted")
+            }
+            val process: Process = when (spawnRes) {
+                is ElevatedCallSupervisor.Res.Ok -> spawnRes.v
+                is ElevatedCallSupervisor.Res.Err -> {
+                    val e = spawnRes.t
+                    val redacted = Redactor.redactError(e.message ?: e.javaClass.simpleName)
+                    return ElevatedBinaryResult.Failed("shizuku spawn failed: $redacted")
+                }
+                is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnCancelled(timeoutMs)
             }
             // R1-A 雙軌＋U2-B stderr 獨立小 cap：截圖 stdout 即 8M 軌，stderr 維持
             // 通用軌（硬讀取 512K／截斷 64K；截圖錯誤訊息短，降 OOM 峰值）；
@@ -419,7 +463,9 @@ class ShizukuShellRunner(
             }
             // U2-B：stderr 截斷一律通用軌 64K（截圖亦同）。
             val errMaxBytes = ShellPolicy.MAX_OUTPUT_BYTES
-            val raw = ElevatedProcessIo.drain(process, timeoutMs, killer, isCancelled, hardCapBytes, hardCapErrBytes)
+            // B3 單一 deadline：drain 只用剩餘（`deadline - now`），不重取滿 `timeoutMs`。
+            val drainBudgetMs = ElevatedCallSupervisor.remainingMs(deadlineNanos)
+            val raw = ElevatedProcessIo.drain(process, drainBudgetMs, killer, isCancelled, hardCapBytes, hardCapErrBytes)
             val out = ShellPolicy.truncate(raw.stdout, maxBytes)
             val err = ShellPolicy.truncate(raw.stderr, errMaxBytes)
             val truncated = out.truncated || err.truncated || raw.truncated

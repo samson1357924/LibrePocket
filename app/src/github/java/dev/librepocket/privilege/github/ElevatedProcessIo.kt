@@ -428,6 +428,326 @@ internal object ElevatedCleanupTracker {
     }
 }
 
+/**
+ * B3 有界外部呼叫監督（owner P1-5，PR140 Phase B3）：
+ * - 特權請求單一 deadline：入口 `deadlineNanos = now + timeoutMs`（單調時鐘），
+ *   所有阻塞外部回呼（授權讀取／status ping／su 探測／newProcess／waitFor）
+ *   皆以剩餘 budget 為上界，超界即 `TimedOut`（零 spawn／零殘留語義同既有取消）；
+ * - 有限併發＋無界 stall 追蹤：呼叫執行緒先占 [ElevatedCleanupTracker] 席（兩 runner
+ *   入口即 [tryEnterReserved]，拒絕不耗 quota），阻塞體跑 daemon worker，主執行緒
+ *   `join(POLL)` 輪詢 cancel／deadline；超界即 `interrupt`＋grace，仍存活即
+ *   [ElevatedCleanupTracker.markLingering]（啟動不預佔，僅殘留佔槽，本體 finally
+ *   釋放；連續不清創經既有 [noteUnclean]／breaker 收斂，見各呼叫點）；
+ * - Binder interrupt 不可靠：不依賴中斷必達，stall 即殘留 daemon＋計數＋旗標，
+ *   呼叫方有界返回（見 [awaitPreSpawn]／[awaitWaitSlice]／[verifyParentStoppedBounded]）。
+ *
+ * 常數不動 READY／MAX（新增本物件常數，不改 [ElevatedCleanupTracker] 上限）。
+ */
+internal object ElevatedCallSupervisor {
+    /** 監督輪詢切片（呼叫執行緒 join 粒度，兼 cancel／deadline 響應）。 */
+    const val POLL_MS = 20L
+
+    /** 超界後 grace：`interrupt` 後再等本值，仍存活即殘留（mark＋計數）。 */
+    const val GRACE_MS = 500L
+
+    /** post-kill 驗證 join 上界（`KILL_WAIT_SEC` 5s＋grace，見 [verifyParentStoppedBounded]）。 */
+    const val VERIFY_JOIN_MS = 5_500L
+
+    /** `exitValue` 有界讀取上界（finished 後 Binder 亦可 stall，超界即 -1＋殘留記數）。 */
+    const val EXIT_JOIN_MS = 2_000L
+
+    sealed interface Res<out T> {
+        data class Ok<T>(val v: T) : Res<T>
+        data class Err(val t: Throwable) : Res<Nothing>
+        data object Expired : Res<Nothing>
+    }
+
+    private data class Val<T>(val v: T)
+    private data class Thr(val t: Throwable)
+
+    fun remainingMs(deadlineNanos: Long): Long =
+        TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()).coerceAtLeast(0L)
+
+    fun isExpired(deadlineNanos: Long): Boolean =
+        (deadlineNanos - System.nanoTime()) <= 0L
+
+    /**
+     * spawn 前阻塞體有界（grant／activation／bridge／status／suExists／spawn 共用）：
+     * - 快路徑（worker 首個 [POLL_MS] 內完成）不額外調 `isCancelled`（既有 B2 三點
+     *   計數不變，見 `cancelMidDrainKillsAndUnblocks` 類斷言）；
+     * - 慢路徑每 [POLL_MS] 查 `interrupt`／`isCancelled()`（抛即已取消，
+     *   fail-closed，計數沿用 `swallowedIsCancelledThrows`）／deadline，命中即
+     *   `interrupt`＋grace，仍存活即 lingering（`markLingering`＋`noteUnclean`，
+     *   無 drain 終審故此處直接計入 breaker）。
+     */
+    fun <T> awaitPreSpawn(
+        deadlineNanos: Long,
+        isCancelled: () -> Boolean,
+        block: () -> T,
+    ): Res<T> = awaitInternal(
+        deadlineNanos = deadlineNanos,
+        cancelCheck = {
+            if (Thread.currentThread().isInterrupted) {
+                true
+            } else {
+                val c = try {
+                    isCancelled()
+                } catch (_: Exception) {
+                    runCatching { ElevatedProcessIo.swallowedIsCancelledThrows.incrementAndGet() }
+                    true
+                }
+                c || isExpired(deadlineNanos)
+            }
+        },
+        block = block,
+        threadName = "elevated-supervisor",
+        markUncleanOnLinger = true,
+    )
+
+    /**
+     * drain 輪詢 `waitFor(slice)` 單片有界（B3，Binder 同步 stall 即此卡住）：
+     * - `isCancelled` 抛折為未取消（drain 語義，不誤殺，計數同上）；
+     * - 超界（cancel／deadline／worker stall）即 `Expired`，呼叫方走 kill 路徑；
+     *   lingering 只記槽（`markLingering`），`noteUnclean` 由 drain 終審經
+     *   `cleanupIncomplete` 統一計入（避免一次 drain 雙計）。
+     */
+    fun awaitWaitSlice(
+        process: Process,
+        sliceMs: Long,
+        deadlineNanos: Long,
+        isCancelled: () -> Boolean,
+    ): Res<Boolean> = awaitInternal(
+        deadlineNanos = deadlineNanos,
+        cancelCheck = {
+            val c = try {
+                isCancelled()
+            } catch (_: Exception) {
+                runCatching { ElevatedProcessIo.swallowedIsCancelledThrows.incrementAndGet() }
+                false
+            }
+            c || Thread.currentThread().isInterrupted || isExpired(deadlineNanos)
+        },
+        block = { process.waitFor(sliceMs, TimeUnit.MILLISECONDS) },
+        threadName = "elevated-wait",
+        markUncleanOnLinger = false,
+    )
+
+    /** 通用有界（verify／exitValue 用，不查 cancel，只看 deadline＋interrupt）。 */
+    fun <T> awaitTimeout(
+        timeoutMs: Long,
+        threadName: String,
+        block: () -> T,
+    ): Res<T> {
+        val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(
+            timeoutMs.coerceAtLeast(0L).coerceAtMost(Long.MAX_VALUE / 1_000_000L),
+        )
+        return awaitInternal(
+            deadlineNanos = deadlineNanos,
+            cancelCheck = { Thread.currentThread().isInterrupted || isExpired(deadlineNanos) },
+            block = block,
+            threadName = threadName,
+            markUncleanOnLinger = false,
+        )
+    }
+
+    private fun <T> awaitInternal(
+        deadlineNanos: Long,
+        cancelCheck: () -> Boolean,
+        block: () -> T,
+        threadName: String,
+        markUncleanOnLinger: Boolean,
+    ): Res<T> {
+        val holder = AtomicReference<Any?>()
+        val state = AtomicInteger(0)
+        val worker = Thread({
+            try {
+                val v = block()
+                holder.set(Val(v))
+            } catch (t: Throwable) {
+                holder.set(Thr(t))
+            } finally {
+                synchronized(state) {
+                    if (state.get() == 1) {
+                        state.set(2)
+                        ElevatedCleanupTracker.releaseSlot()
+                    } else if (state.get() == 0) {
+                        state.set(2)
+                    }
+                }
+            }
+        }, threadName)
+        worker.isDaemon = true
+        try {
+            worker.start()
+        } catch (_: Exception) {
+            return Res.Expired
+        }
+        try {
+            while (true) {
+                try {
+                    worker.join(POLL_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    runCatching { worker.interrupt() }
+                    try {
+                        worker.join(GRACE_MS)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                    }
+                    if (worker.isAlive) {
+                        ElevatedCleanupTracker.markLingering(worker, state)
+                        if (markUncleanOnLinger) ElevatedCleanupTracker.noteUnclean()
+                    }
+                    return Res.Expired
+                }
+                if (!worker.isAlive) {
+                    val h = holder.get()
+                    return when (h) {
+                        is Val<*> -> {
+                            @Suppress("UNCHECKED_CAST")
+                            Res.Ok((h as Val<T>).v)
+                        }
+                        is Thr -> Res.Err(h.t)
+                        else -> Res.Err(IllegalStateException("supervisor worker died without result"))
+                    }
+                }
+                val shouldExpire = try {
+                    cancelCheck()
+                } catch (_: Exception) {
+                    true
+                }
+                if (shouldExpire) {
+                    runCatching { worker.interrupt() }
+                    try {
+                        worker.join(GRACE_MS)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                    }
+                    if (worker.isAlive) {
+                        ElevatedCleanupTracker.markLingering(worker, state)
+                        if (markUncleanOnLinger) ElevatedCleanupTracker.noteUnclean()
+                    }
+                    return Res.Expired
+                }
+            }
+        } catch (_: Exception) {
+            runCatching { worker.interrupt() }
+            try {
+                worker.join(GRACE_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            if (worker.isAlive) {
+                ElevatedCleanupTracker.markLingering(worker, state)
+                if (markUncleanOnLinger) ElevatedCleanupTracker.noteUnclean()
+            }
+            return Res.Expired
+        }
+    }
+
+    /**
+     * B3 有界父進程停止驗證（取代直調 `waitFor(5s)`＋`isAlive`；Binder stall
+     * 即舊碼無界卡住）：全部 Binder 呼叫跑 `elevated-verify` worker，主執行緒
+     * join [VERIFY_JOIN_MS]；超界即 interrupt＋grace，仍存活即 lingering（記槽，
+     * `noteUnclean` 由 drain 終審經 `cleanupIncomplete` 統一計入，此處不直接計）
+     * 並回 false（unknown→incomplete，不宣稱 cleaned）。語義同舊直調（true／
+     * false／unknown→false 三分支，見舊 KDoc），只加有界。
+     */
+    fun verifyParentStoppedBounded(process: Process): Boolean {
+        val holder = AtomicReference<Any?>()
+        val state = AtomicInteger(0)
+        val worker = Thread({
+            try {
+                val exited: Boolean? = try {
+                    process.waitFor(5L, TimeUnit.SECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    null
+                } catch (_: Exception) {
+                    null
+                }
+                val res: Boolean = if (exited == null) {
+                    try {
+                        !process.isAlive
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        false
+                    } catch (_: Exception) {
+                        false
+                    }
+                } else if (!exited) {
+                    false
+                } else {
+                    try {
+                        !process.isAlive
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        true
+                    } catch (_: Exception) {
+                        true
+                    }
+                }
+                holder.set(Val(res))
+            } catch (t: Throwable) {
+                holder.set(Thr(t))
+            } finally {
+                synchronized(state) {
+                    if (state.get() == 1) {
+                        state.set(2)
+                        ElevatedCleanupTracker.releaseSlot()
+                    } else if (state.get() == 0) {
+                        state.set(2)
+                    }
+                }
+            }
+        }, "elevated-verify")
+        worker.isDaemon = true
+        try {
+            worker.start()
+        } catch (_: Exception) {
+            return false
+        }
+        try {
+            worker.join(VERIFY_JOIN_MS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            runCatching { worker.interrupt() }
+            try {
+                worker.join(GRACE_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            if (worker.isAlive) ElevatedCleanupTracker.markLingering(worker, state)
+            return false
+        }
+        if (worker.isAlive) {
+            runCatching { worker.interrupt() }
+            try {
+                worker.join(GRACE_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            if (worker.isAlive) ElevatedCleanupTracker.markLingering(worker, state)
+            return false
+        }
+        val h = holder.get()
+        return when (h) {
+            is Val<*> -> {
+                @Suppress("UNCHECKED_CAST")
+                (h as Val<Boolean>).v
+            }
+            else -> false
+        }
+    }
+
+    /** B3 有界 `exitValue`（finished 後 Binder 亦可 stall）：超界即 Expired＋殘留記槽。 */
+    fun exitValueBounded(process: Process): Res<Int> {
+        // B3 debug: preset-interrupt cleared path must not expire for immediate exitValue.
+        // 若此處頻繁 Expired 且 `isInterrupted=false`，即 worker 啟動／調度異常，需查線程池。
+        return awaitTimeout(EXIT_JOIN_MS, "elevated-supervisor") { process.exitValue() }
+    }
+}
+
 internal object ElevatedProcessIo {
     /** R1-A 截圖二進位容量：`screencap -p` / `cat /dev/graphics/fb0` 的截斷上限（8M）。 */
     const val BINARY_SCREENSHOT_MAX_BYTES: Int = 8 * 1024 * 1024
@@ -665,6 +985,15 @@ internal object ElevatedProcessIo {
             it.start()
         }
         var finished = false
+        // B3 有界 wait（owner P1-5）：直調 `process.waitFor(slice)` 在 Shizuku 同步
+        // Binder stall 下無界卡住（slice／deadline／cancel 皆不生效）。現每片跑
+        // `elevated-wait` worker（見 [ElevatedCallSupervisor.awaitWaitSlice]），主執行緒
+        // 輪詢 cancel／deadline；超界即 kill 路徑（`finished=false`），殘留 worker
+        // 由監督記槽（`markLingering`），`cleanupIncomplete` 由下方 kill 終審帶出。
+        // 快路徑（`waitFor` 首片內即回）不額外調鉤（B2 計數語義不變）。
+        // B3 wait 殘留旗標：`awaitWaitSlice` lingering 只記槽不直接 `noteUnclean`
+        //（drain 終審統一計入，此處經本旗標傳遞，避免一次 drain 雙計）。
+        var waitLingering = false
         try {
             while (true) {
                 // P2 吞例外計數：isCancelled 抛即折為未取消（fail-closed，不誤殺；
@@ -679,15 +1008,36 @@ internal object ElevatedProcessIo {
                 val remaining = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime())
                 if (remaining <= 0) break
                 val slice = minOf(remaining, POLL_SLICE_MS)
-                val done = try {
-                    process.waitFor(slice, TimeUnit.MILLISECONDS)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    break
-                }
-                if (done) {
-                    finished = true
-                    break
+                when (val w = ElevatedCallSupervisor.awaitWaitSlice(process, slice, deadlineNanos, isCancelled)) {
+                    is ElevatedCallSupervisor.Res.Ok -> if (w.v) {
+                        finished = true
+                        break
+                    }
+                    is ElevatedCallSupervisor.Res.Err -> break
+                    is ElevatedCallSupervisor.Res.Expired -> {
+                        // 區分 stall 殘留（worker 仍存活→記槽）與單純超時／取消：
+                        // `awaitWaitSlice` 內 lingering 已記槽（outstanding++），此處
+                        // 只需把「有殘留」帶入終審（`cleanupIncomplete=true`）。
+                        // 判定：若 `outstanding` 在本次 wait 後增長即有殘留？更直接：
+                        // 以 `isExpired` 前 worker 是否仍存活無法在此得知，故以保守
+                        // 方式：Expired 且既非 cancel 亦非 deadline（即 slice 內 stall）
+                        // 視為潛在殘留——但 cancel／deadline 下的 worker 亦可能殘留。
+                        // 為不漏計，Expired 一律先記潛在殘留，終審由
+                        // `cleanupIncomplete` 統一進 `noteUnclean`（良性超時無殘留時
+                        // `outstanding==0` 仍走 `noteClean`，見尾收終審；此處只置旗，
+                        // 不直接計數，避免雙計）。
+                        //
+                        // 簡化：Expired 不在此直接置旗，殘留已由監督記槽
+                        //（`outstanding>0`）；終審 `outstanding==0` 才 `noteClean`，
+                        // 故 stall 殘留不會被誤判為乾淨。但 `cleanupIncomplete` 仍需
+                        // 置 true 以穿透至 runner 監測（stall 即清理缺口，不靜默）。
+                        // 以 `outstanding` 是否非零判定是否置旗：超時但 worker 已收
+                        // （無殘留）即不置旗，stall 殘留即置旗。
+                        if (ElevatedCleanupTracker.outstanding() > 0) {
+                            waitLingering = true
+                        }
+                        break
+                    }
                 }
             }
         } catch (_: Exception) {
@@ -700,6 +1050,8 @@ internal object ElevatedProcessIo {
         //（runner verdict 映射不變，僅供 #136-B3 監測）。
         // P1-3：kill 終審推遲到尾收後（gobbler／stdin linger 亦計入，避免少計）。
         var cleanupIncomplete = false
+        // B3：wait 殘留（`elevated-wait` worker stall）即清理缺口，不靜默。
+        if (waitLingering) cleanupIncomplete = true
         if (!finished) {
             // X1：kill 前先 best-effort 中斷兩 gobbler（助可中斷 stalls 脫離，無害；
             // 若 getter 正阻塞於可中斷等待即抛，經 gobbler 整段 catch 收斂為 markFailed）。
@@ -736,7 +1088,7 @@ internal object ElevatedProcessIo {
             //（經尾收終審進 noteUnclean／breaker，不宣稱 cleaned）。子孫全滅
             // 仍為真機 blocker（JVM 真樹已驗，裝置 SELinux／Root 語義差異 E2E
             // 歸 #136-B3，見 ElevatedProcessKiller）。
-            if (!verifyParentStopped(process)) cleanupIncomplete = true
+            if (!ElevatedCallSupervisor.verifyParentStoppedBounded(process)) cleanupIncomplete = true
             // 超時/cancel 路徑保留有界 join：gobbler 仍可能卡住，避免無限等。
             // join 中斷必須 restore 中斷旗標（不吞 InterruptedException）。
             // AB1 P1-A：join 超界仍存活即殘留 gobbler（入口已中斷兩 gobbler，
@@ -845,6 +1197,20 @@ internal object ElevatedProcessIo {
         // 錯誤但不持有任何資源（執行緒已退出、流已關），verdict 已回 Failed；
         // 連續計數只計資源清理未完成（殘留執行緒／worker 持槽），避免數據錯誤
         // 誤觸熔斷。
+        // B3 有界 exitValue 先行（P2 中斷恢復之前）：`exitValueBounded` 以
+        // `isInterrupted` 判超界，須在 caller 預置中斷恢復前求值，否則恢復後的
+        // 置旗會使健康進程誤判為 stall（P2 `drainPresetCallerInterrupt...` 回歸）。
+        // Expired（stall 殘留）即置 `cleanupIncomplete`，由下方終審統一進 breaker。
+        val exitCode: Int = if (finished) {
+            when (val ev = ElevatedCallSupervisor.exitValueBounded(process)) {
+                is ElevatedCallSupervisor.Res.Ok -> ev.v
+                is ElevatedCallSupervisor.Res.Err -> -1
+                is ElevatedCallSupervisor.Res.Expired -> {
+                    cleanupIncomplete = true
+                    -1
+                }
+            }
+        } else -1
         if (cleanupIncomplete) {
             ElevatedCleanupTracker.noteUnclean()
         } else if (ElevatedCleanupTracker.outstanding() == 0) {
@@ -859,7 +1225,7 @@ internal object ElevatedProcessIo {
             // 與 kill 路徑（!finished）-1 同值但以 timedOut 區分（false vs true），
             // 不可僅看 exitCode；runner 側 finished -1 即 Failed（非零分支），
             // kill -1 即 TimedOut，verdict 不混。
-            exitCode = if (finished) runCatching { process.exitValue() }.getOrDefault(-1) else -1,
+            exitCode = exitCode,
             timedOut = !finished,
             // R1-A：join 未完成或任一流硬上限溢出（>hardCapBytes 丟棄）即 truncated；
             // 通用 512K 溢出本就經 64K truncate 標記，此處 OR 不改其 verdict；

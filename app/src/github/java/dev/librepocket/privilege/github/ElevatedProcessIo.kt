@@ -752,8 +752,9 @@ internal object ElevatedCallSupervisor {
     }
 
     /**
-     * P1-2 spawn 專用有界監督（PR140 Phase 2）：`block` 建特權進程（`ProcessBuilder.start()`／
-     * Shizuku `newProcess`，Binder 一旦送達即不可撤回），故逾期交付不能只丟棄引用，必須
+     * P1-2 spawn 專用有界監督（PR140 Phase 2；R2-PhaseB 全域管理）：
+     * `block` 建特權進程（`ProcessBuilder.start()`／Shizuku `newProcess`，
+     * Binder 一旦送達即不可撤回），故逾期交付不能只丟棄引用，必須
      * late compensation（見 [lateCompensateSpawn]）。
      *
      * owner 認領機制：
@@ -763,20 +764,34 @@ internal object ElevatedCallSupervisor {
      * - 認領競態（worker 發布與 caller 過期交錯）以 holder CAS 恰好一次交付清理方：
      *   worker 發布後若見 expired 即 `compareAndSet(發布值, null)`，成功則 worker 內聯補償，
      *   失敗（caller 已取走）則放手；caller 過期路徑同樣 CAS 取 holder 內逾期 Process，
-     *   成功則起 `elevated-late-spawn` daemon 補償（caller 不為補償多擋 budget，
-     *   有界性只由 [GRACE_MS] 承擔），失敗（worker 已認領或尚未發布——後者由 worker
-     *   發布後重讀兜底）則放手。三方交錯下恰好一方動手，不雙殺（killer 本就冪等，
-     *   destroy 重入無害）不漏殺（任一發布必有一方在置旗後 CAS）；
+     *   成功則起 `elevated-late-spawn` daemon 補償（caller 不為補償多擋 budget），
+     *   失敗（worker 已認領或尚未發布——後者由 worker發布後重讀兜底）則放手。
+     *   三方交錯下恰好一方動手，不雙殺（killer 本就冪等，destroy 重入無害）
+     *   不漏殺（任一發布必有一方在置旗後 CAS）；
      * - 返回後再確認 deadline：worker 已死但交付發生在 budget 之後（邊緣回傳），
      *   即 CAS 取回＋daemon 補償＋`Expired(hasLinger=true)`，不把逾期建成當成功；
      * - `hasLinger=true` 條件：grace 後 worker 仍存活（late Process 仍可能送達，
      *   由 worker 發布後重讀兜底清理）或本次確有逾期 Process（已取走補償中，
-     *   結果未知故保守置旗）。spawn 呼叫方必須穿透至 `TimedOut.cleanupIncomplete`。
+     *   保守置旗）或 worker 內聯補償已驗證為 incomplete（[lateIncomplete]）。
+     *   spawn 呼叫方必須穿透至 `TimedOut.cleanupIncomplete`。
+     *
+     * R2-PhaseB 全域管理（P1-2 late 缺口，slot 常數 7／MAX 7 語義保持）：
+     * - late 補償執行前先 [ElevatedCleanupTracker.acquireSlot]（worker 內聯與 caller
+     *   daemon 同一全域管理，佔槽即自然受 7 管；持槽全程，stall 即 outstanding 擋
+     *   新 spawn，不再有 untracked 永久卡住）；
+     * - 飽和（acquire false）即不起無界 daemon，經 [lateIncomplete]＋breaker 終審
+     *   （fail-closed：owner 仍為 late Process 唯一追蹤者，記為殘留而非丟棄）；
+     * - `t.start()` 抛即釋槽＋計數（同步有界收斂，不靜默丟 owner；資源壓力最高時
+     *   不放大，不重試起線程）；
+     * - 單 call breaker 恰好一次（[uncleanCounted] guard：lingering 與 late 雙因不雙計，
+     *   首因勝出；verified clean 不計，outstanding 釋放後 admission 自然恢復）。
+     *   每 call 至多新增槽位：spawn worker lingering 1＋late daemon 1＋verify 1＝3≤7，
+     *   不需調常數（若調必須重推導＋更新 barrier 測試）。
      *
      * 入口 preflight 同 [awaitInternal]（已逾期即不啟 worker，`Expired(false)`，
      * 零 spawn）；`killer` 為 runner 注入（單測計數／destroy 可觀測，預設即
      * [ElevatedProcessKiller.killTree]）；残留記槽／breaker 計入同 [awaitPreSpawn]
-     * （`markUncleanOnLinger=true` 語義：grace 後仍存活即記＋計）。
+     * （grace 後仍存活即記＋計，現經 guard 恰好一次）。
      */
     fun awaitSpawn(
         deadlineNanos: Long,
@@ -789,6 +804,50 @@ internal object ElevatedCallSupervisor {
         val expired = AtomicBoolean(false)
         val holder = AtomicReference<Any?>()
         val state = AtomicInteger(0)
+        // R2-PhaseB（P1-2 late 缺口）：worker 內聯補償結果回傳旗標。
+        // worker 認領並補償後若未驗證（no-op kill／waitFor=false／verify=false／
+        // 無槽／daemon 起失敗），置 true，caller expireWorker 即使見 holder==null
+        // ＋lingering==false 亦回 Expired(true)（cleanupIncomplete=true），不誤報 cleaned。
+        // 驗證通過才保持 false（caller 方可回 false，見 lateCompensateSpawn）。
+        val lateIncomplete = AtomicBoolean(false)
+        // R2-PhaseB：單 call breaker 恰好一次（lingering＋late 雙因不雙計）。
+        // caller lingering 計數與 worker／daemon incomplete 計數經本旗互斥，首因勝出；
+        // 仍 fail-closed（任一殘留必計 1），不漏不重，連續 4 次熔斷語義不變。
+        val uncleanCounted = AtomicBoolean(false)
+        fun countUncleanOnce() {
+            if (uncleanCounted.compareAndSet(false, true)) ElevatedCleanupTracker.noteUnclean()
+        }
+        // R2-PhaseB：caller 側 daemon 起動（含飽和／起失敗收斂）。
+        // - acquired 才起 daemon（daemon 持槽全程，stall 即 outstanding 擋 admission，
+        //   受 MAX 7 管，不再有無界 untracked daemon）；
+        // - 飽和（acquire false）即不起 daemon，經 countUncleanOnce 記殘留
+        //   （fail-closed：owner 仍為唯一追蹤者，記為殘留而非丟棄，breaker 終審擋新 spawn）；
+        // - t.start() 抛即釋槽＋計數（同步有界收斂，不靜默丟 owner；不再重試起線程，
+        //   資源壓力最高時不放大）；
+        // - daemon 終審：incomplete 才計數（guard 保 lingering 不雙計），verified
+        //   clean 不計（outstanding 釋放後 admission 自然恢復，見 lateCompensateSpawn）。
+        fun startLateDaemon(v: Process) {
+            val acquired = ElevatedCleanupTracker.acquireSlot()
+            if (!acquired) {
+                countUncleanOnce()
+                return
+            }
+            val t = Thread({
+                try {
+                    val clean = lateCompensateSpawn(v, killer)
+                    if (!clean) countUncleanOnce()
+                } finally {
+                    ElevatedCleanupTracker.releaseSlot()
+                }
+            }, "elevated-late-spawn")
+            t.isDaemon = true
+            try {
+                t.start()
+            } catch (_: Exception) {
+                ElevatedCleanupTracker.releaseSlot()
+                countUncleanOnce()
+            }
+        }
         val worker = Thread({
             try {
                 val p = block()
@@ -797,7 +856,23 @@ internal object ElevatedCallSupervisor {
                 // 發布後重讀：caller 已過期即嘗試認領回來自行補償。
                 if (expired.get()) {
                     if (holder.compareAndSet(published, null)) {
-                        lateCompensateSpawn(p, killer)
+                        // R2-PhaseB：worker 內聯補償亦先佔槽（與 caller daemon 同一全域管理）。
+                        // 飽和即不補償、置旗＋計數（fail-closed，不靜默丟 owner）。
+                        val acquired = ElevatedCleanupTracker.acquireSlot()
+                        if (!acquired) {
+                            lateIncomplete.set(true)
+                            countUncleanOnce()
+                        } else {
+                            try {
+                                val clean = lateCompensateSpawn(p, killer)
+                                if (!clean) {
+                                    lateIncomplete.set(true)
+                                    countUncleanOnce()
+                                }
+                            } finally {
+                                ElevatedCleanupTracker.releaseSlot()
+                            }
+                        }
                     }
                 }
             } catch (t: Throwable) {
@@ -833,25 +908,23 @@ internal object ElevatedCallSupervisor {
             val lingering = worker.isAlive
             if (lingering) {
                 ElevatedCleanupTracker.markLingering(worker, state)
-                ElevatedCleanupTracker.noteUnclean()
+                countUncleanOnce()
             }
             var lateProcess = false
             val h = holder.get()
             if (h is Val<*>) {
                 @Suppress("UNCHECKED_CAST")
                 val v = (h as Val<Process>).v
-                // CAS 認領：成功才起 daemon 補償（caller 不多擋 budget）；
-                // 失敗即 worker 已認領（內聯補償中），放手。
+                // CAS 認領：成功才起 daemon 補償（caller 不多擋 budget，受槽管控）；
+                // 失敗即 worker 已認領（內聯補償中），放手（worker 側已置旗＋計數）。
                 if (holder.compareAndSet(h, null)) {
                     lateProcess = true
-                    val t = Thread({ lateCompensateSpawn(v, killer) }, "elevated-late-spawn")
-                    t.isDaemon = true
-                    runCatching { t.start() }
+                    startLateDaemon(v)
                 } else {
                     lateProcess = true
                 }
             }
-            return Res.Expired(hasLinger = lingering || lateProcess)
+            return Res.Expired(hasLinger = lingering || lateProcess || lateIncomplete.get())
         }
         try {
             while (true) {
@@ -867,14 +940,14 @@ internal object ElevatedCallSupervisor {
                         is Val<*> -> {
                             // P1-3 返回後再確認 deadline：邊緣回傳（交付在 budget
                             // 之後）不當成功，CAS 取回＋daemon 補償＋Expired(true)。
+                            // R2-PhaseB：同一受槽 daemon（見 startLateDaemon），不再裸起
+                            // untracked daemon；CAS 失敗即 worker 已認領，放手。
                             if (isExpired(deadlineNanos)) {
                                 expired.set(true)
                                 @Suppress("UNCHECKED_CAST")
                                 val v = (h as Val<Process>).v
                                 if (holder.compareAndSet(h, null)) {
-                                    val t = Thread({ lateCompensateSpawn(v, killer) }, "elevated-late-spawn")
-                                    t.isDaemon = true
-                                    runCatching { t.start() }
+                                    startLateDaemon(v)
                                 }
                                 return Res.Expired(hasLinger = true)
                             }
@@ -913,30 +986,62 @@ internal object ElevatedCallSupervisor {
     }
 
     /**
-     * P1-2 late 補償（PR140 Phase 2）：逾期交付的 Process 在此收斂，不再經 holder／drain。
+     * P1-2 late 補償（PR140 Phase 2；R2-PhaseB 受監督重寫）：逾期交付的 Process
+     * 在此收斂，不再經 holder／drain。
      *
-     * 順序：runner 注入 `killer`（盡力整組，抛即吞＋計數，不升級崩潰）→
-     * `waitFor([LATE_REAP_WAIT_SEC])` 有界 reap（僵屍不留；Binder stall 即本執行緒
-     * 多活至多 1s——本體為已過期 worker／`elevated-late-spawn` daemon，caller 早已
-     * 有界返回，不擋 budget）→ 三流 best-effort 關（此 Process 永不進 drain，
-     * drain 的「關已取流」無人執行，此處即唯一關流處；getter 重調可 stall，
-     * 逐段 runCatching，stall 只拖本 daemon）。
-     * 結果未知故呼叫方一律 `cleanupIncomplete=true`（不因補償成功而清旗）。
+     * R2-PhaseB 誠實邊界（P1-2 late 缺口）：
+     * - 受監督 bounded cleanup：呼叫方（worker 內聯或 `elevated-late-spawn` daemon）
+     *   進入前已持一槽（見 [awaitSpawn]／[ElevatedCleanupTracker.acquireSlot]），
+     *   本體 stall（killer／reap／verify／關流吞 interrupt）即持槽殘留，
+     *   `outstanding` 擋新 spawn（受 MAX 7 管），不再有 untracked 永久卡住；
+     * - 完成／未知／失敗判定：`killer` 抛即 incomplete（計數＋續驗，不升級崩潰）；
+     *   `waitFor([LATE_REAP_WAIT_SEC])` 回 false／抛／中斷一律 incomplete
+     *   （false 不可算成功→unknown/incomplete）；父進程必須經
+     *   [verifyParentStoppedBounded] 驗證已死才可清 incomplete（true 才可回 true）。
+     *   子孫整組仍為 E2E（見 [ElevatedProcessKiller]，裝置 SELinux 差異歸 #136-B3），
+     *   但 parent／reap 必須驗；
+     * - 快速路徑（destroy no-op＋waitFor=false 立即返回）必經本驗證：verify 回 false
+     *   即回 false（呼叫方置 `cleanupIncomplete=true`＋breaker 計數，不恢復 admission）；
+     *   只有 killer＋reap＋verify 全過才回 true（verified clean 方可不清旗）；
+     * - 三流 best-effort 關：此 Process 永不進 drain，此處即唯一關流處；getter 重調
+     *   可 stall，stall 即持槽殘留（由槽追蹤，不靜默），抛即吞（不翻 verdict，
+     *   parent 驗證已定 verdict）；
+     * - 本函數不碰槽／breaker（槽由呼叫方持有全程，breaker 由呼叫方終審經返回值計入），
+     *   不抛（全段 catch，daemon 不死於異常）。
+     *
+     * 上界：killer（注入側有界，stall 即持槽）＋reap 1s＋verify 5.5s＋grace 0.5s＋
+     * 關流（stall 即持槽）。呼叫方（awaitSpawn caller）早已返回，不擋 budget。
+     * owner 語義：late Process 的唯一追蹤者即本補償持有者（worker 內聯或 daemon 持槽）；
+     * 飽和無槽時不起 daemon，呼叫方記殘留（breaker）而非丟棄（見 startLateDaemon）。
      */
-    private fun lateCompensateSpawn(p: Process, killer: (Process) -> Unit) {
+    private fun lateCompensateSpawn(p: Process, killer: (Process) -> Unit): Boolean {
+        var ok = true
         try {
             killer(p)
         } catch (_: Exception) {
             runCatching { ElevatedProcessIo.swallowedKillerThrows.incrementAndGet() }
+            ok = false
         }
+        // 有界 reap：false／抛／中斷一律 incomplete（不可算成功）。
         try {
-            p.waitFor(LATE_REAP_WAIT_SEC, TimeUnit.SECONDS)
+            val reaped = p.waitFor(LATE_REAP_WAIT_SEC, TimeUnit.SECONDS)
+            if (!reaped) ok = false
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            ok = false
         } catch (_: Exception) {
-            // 有界 reap 失敗即放手（daemon 不抛，旗標已由呼叫方保守置 true）。
+            ok = false
+        }
+        // 父進程必須驗證已死才可清 incomplete（unknown→false，不宣稱 cleaned）。
+        try {
+            if (!verifyParentStoppedBounded(p)) ok = false
+        } catch (_: Exception) {
+            ok = false
         }
         runCatching { p.inputStream.close() }
         runCatching { p.errorStream.close() }
         runCatching { p.outputStream.close() }
+        return ok
     }
 
     /**

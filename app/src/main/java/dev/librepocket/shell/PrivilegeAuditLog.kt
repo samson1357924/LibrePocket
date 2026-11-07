@@ -14,6 +14,22 @@ import java.security.MessageDigest
  *   呼叫方同時把 `privilege_bridge` 開關與橋接授權一起關掉）。
  *
  * 零 Android 依賴，JVM 單測可直接斷言。
+ *
+ * Phase 5 B6 審計欄位（僅 KDoc＋TODO，不加欄位）：
+ * 排障需要明文枚舉欄位（`truncated`／`cleanupIncomplete`／`exitCode`／
+ * `elapsedMs`／`capTrack`，`reason` 仍只存 hash）或 `ElevatedDebugEvents`
+ * 環形緩衝（仅内存、不落盤、不進轉錄），但 [PrivilegeAuditRecord] 為 data class——
+ * 加欄位即改 `equals/hashCode/componentN/copy/toString`，既有
+ * `snapshot().single()`＋欄位斷言、`toString()` 禁明文斷言皆須重審，
+ * 且轉錄側 `countByVerdict` 形狀亦受影響。本階段不加欄位，留 #136-B3。
+ * TODO(#136-B3): 審計可辨識性 —— `record` 加可選 `details`（默認 null，
+ * 明文枚舉＋耗時＋cap 軌，reason 仍只存 hash）或開 `ElevatedDebugEvents`
+ * 環形緩衝；加欄位時須同步更新 data-class 相等斷言與禁明文測試。
+ *
+ * Phase 5 B5 verdict 坍縮（詳見二進位側 `verdict()` KDoc「verdict 坍縮表」）：
+ * `QUOTA_EXCEEDED` 四因同碼、`TimedOut` 含取消與超時、`Res.Err` 在 su 路徑
+ * 與政策門路徑不對稱（`Failed` vs `Denied`）。本表只記四碼 verdict，
+ * 坍縮原因須看拒絕訊息／`cleanupIncomplete` 上下文，不得僅看本表 verdict。
  */
 data class PrivilegeAuditRecord(
     val seqId: String,
@@ -117,6 +133,8 @@ class PrivilegeAuditLog {
             is ShellResult.TimedOut -> "TIMEOUT"
             is ShellResult.Failed -> "FAILED"
         }
+        // Phase 5 B2：本映射與二進位側 `verdict()` 手動同步（皆四碼，不合併實作；
+        // 新增分支兩處須同步，一致性由 `ElevatedVerdictMappingTest` 鎖定）。
 
         fun sha256Hex(input: String): String =
             sha256HexBytes(input.toByteArray(Charsets.UTF_8))

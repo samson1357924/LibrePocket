@@ -68,7 +68,7 @@ enum class FrameSource {
  *   呼叫方降級手動截圖；截斷即 null，不摘要部分幀，見 `auditAndExtract`）；
  * - 高熵 PNG 超限同理：>8M 即 truncated→null，不分內容熵；
  * - 容量常數見 [ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES]（stdout 8M 截斷＋硬讀取）；
- *   pipe 保留 8M＋512K≈8.5M，非進程峰值；閾值恰等於硬讀上限（8M==8M）靠溢出位區分
+ *   pipe 保留 8M＋512K≈8.5M，非程序峰值；閾值恰等於硬讀上限（8M==8M）靠溢出位區分
  *   恰上限通過與超限丟棄（見容量測試 8M exact／8M+1）；
  *   裝置容量驗收歸 #136-B3 E2E（見 [PrivilegeActivation]）。
  *
@@ -86,6 +86,18 @@ class RootFramebufferCapture(
      * screencap 優先、fb0 兜底；只回摘要（像素不保留）。
      * B4：screencap 位元組須過 [isPlausiblePng]（輕量 PNG 門），未過即視為
      * 缺失回落 fb0（fb0 原始位元組不做 PNG 門）；兩路皆無／皆無效為 null。
+     *
+     * Phase 5 A2/A3 截斷前置契約（僅 KDoc，行為不變）：
+     * 傳入本函數的位元組須為非截斷完整幀。截斷幀（`Ok.truncated==true`、
+     * 硬上限溢出、gobbler 部分讀）呼叫方須先回 null（見 `auditAndExtract`：
+     * truncated-Ok 即 null，不摘要部分幀；截斷 PNG 當成功幀摘要會虛構完整截圖），
+     * 不得把部分位元組傳入摘要。本函數不做截斷判定（`readScreencap`／`readFb0`
+     * 回 `ByteArray?` 即視為完整幀；空即缺失）。
+     * 強型別 `FrameBytes`（完整幀／截斷幀以型別區分）留 #136-B3：
+     * 改型別牽連 `screencapViaBinary`／`fb0ViaBinary`／`auditAndExtract` 全鏈，
+     * 破編譯面大，本階段僅以本契約＋既有 `truncated→null` 測試鎖定。
+     * TODO(#136-B3): 評估 `FrameBytes` 型別（截斷幀不可構造摘要，編譯期保證）。
+     *
      * @return 幀摘要，兩路皆無時為 null（呼叫方降級手動截圖）。
      */
     fun capture(atMs: Long = System.currentTimeMillis()): FrameDigest? {

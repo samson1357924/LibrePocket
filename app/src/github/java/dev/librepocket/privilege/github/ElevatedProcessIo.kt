@@ -45,7 +45,8 @@ import java.util.concurrent.TimeUnit
  *   沿用 [ShellPolicy.HARD_READ_CAP_BYTES]（512K），OOM 有界（每流 512K）；
  * - 截圖二進位（`screencap -p` / `cat /dev/graphics/fb0`）：stdout 截斷上限
  *   [BINARY_SCREENSHOT_MAX_BYTES]（8M），硬讀取上限
- *   [BINARY_SCREENSHOT_HARD_CAP_BYTES]（8M），OOM 上界（stdout 8M）；
+ *   [BINARY_SCREENSHOT_HARD_CAP_BYTES]（8M），pipe 內保留上界 stdout 8M
+ *   （非程序峰值，見 V2 誠實說明）；
  *   stderr 維持通用軌（硬讀取 512K／截斷 64K）——截圖錯誤訊息短，
  *   不需 8M，降 OOM 峰值（雙流並發 8M＋512K，而非 8M＋8M）；
  * - 雙軌由各 Runner 以 argv 精確匹配判定（見兩 Runner 的 `isScreenshot`），
@@ -356,7 +357,27 @@ internal object ElevatedCleanupTracker {
     }
 
     /**
+     * 純判定（B3 Phase 5 拆分，行為不變）：僅計算准入 verdict，不佔席、無副作用。
+     *
+     * 須在 [lock] 內調用（調用方 [tryEnterReserved] 同一鎖內先判後佔，仍單一原子點，
+     * 不做三段 CAS）。判定順序同 [tryEnterReserved]（backlog／breaker／併發／預留）。
+     */
+    private fun classifyAdmissionLocked(): Admission {
+        if (outstandingCount.get() >= MAX_OUTSTANDING_CLEANUPS) return Admission.BACKLOG_FULL
+        if (consecutiveUnclean.get() >= MAX_CONSECUTIVE_UNCLEAN) return Admission.BREAKER_OPEN
+        if (activeCalls.get() >= MAX_CONCURRENT_CALLS) return Admission.CONCURRENCY_FULL
+        if (outstandingCount.get() + (activeCalls.get() + 1) * SLOTS_PER_CALL > MAX_OUTSTANDING_CLEANUPS) {
+            return Admission.BACKLOG_FULL
+        }
+        return Admission.OK
+    }
+
+    /**
      * 統一原子准入（P1-2，PR140 Phase1）：同一 [lock] 內檢查三條件並佔席。
+     *
+     * Phase 5 B3 拆分（行為不變）：純判定抽為 [classifyAdmissionLocked]
+     * （backlog／breaker／reservation 無副作用），本函數僅在 `OK` 時單一原子佔席
+     * （`active++`）。判定＋佔席仍在同一 `synchronized(lock)` 內，不引入 TOCTOU。
      *
      * 檢查順序（拒絕原因優先級，僅供訊息區分，准入決定單一原子點）：
      * 1. `outstanding >= MAX` → [Admission.BACKLOG_FULL]；
@@ -377,16 +398,12 @@ internal object ElevatedCleanupTracker {
      *
      * [Admission.CONCURRENCY_FULL] 保留但現參數下實效不可達（預留檢查先拒：
      * 乾淨態第二呼叫即 `0+2*7>7` 走 BACKLOG_FULL，不會走到 `active>=4`），
-     * 為未來放寬 MAX／SLOTS 後的併發上限保留；reservation 矩陣直測見
+     * 為未來放寬 MAX／SLOTS 後的併發上限保留，不刪分支；reservation 矩陣直測見
      * `ElevatedCleanupTrackerTest`（不經 runner，直接斷言預留表）。
      */
     fun tryEnterReserved(): Admission = synchronized(lock) {
-        if (outstandingCount.get() >= MAX_OUTSTANDING_CLEANUPS) return Admission.BACKLOG_FULL
-        if (consecutiveUnclean.get() >= MAX_CONSECUTIVE_UNCLEAN) return Admission.BREAKER_OPEN
-        if (activeCalls.get() >= MAX_CONCURRENT_CALLS) return Admission.CONCURRENCY_FULL
-        if (outstandingCount.get() + (activeCalls.get() + 1) * SLOTS_PER_CALL > MAX_OUTSTANDING_CLEANUPS) {
-            return Admission.BACKLOG_FULL
-        }
+        val decision = classifyAdmissionLocked()
+        if (decision != Admission.OK) return decision
         activeCalls.incrementAndGet()
         Admission.OK
     }
@@ -518,7 +535,7 @@ internal object ElevatedCallSupervisor {
     /** 超界後 grace：`interrupt` 後再等本值，仍存活即殘留（mark＋計數）。 */
     const val GRACE_MS = 500L
 
-    /** post-kill 驗證 join 上界（`KILL_WAIT_SEC` 5s＋grace，見 [verifyParentStoppedBounded]）。 */
+    /** post-kill 驗證 join 上界（5s＋grace，見 [verifyParentStoppedBounded]；另見 `VERIFY_JOIN_MS`）。 */
     const val VERIFY_JOIN_MS = 5_500L
 
     /** `exitValue` 有界讀取上界（finished 後 Binder 亦可 stall，超界即 -1＋殘留記數）。 */
@@ -1035,7 +1052,7 @@ internal object ElevatedProcessIo {
     /** R1-A 截圖二進位容量：`screencap -p` / `cat /dev/graphics/fb0` 的截斷上限（8M）。 */
     const val BINARY_SCREENSHOT_MAX_BYTES: Int = 8 * 1024 * 1024
 
-    /** R1-A 截圖二進位硬讀取上限（8M，每流 OOM 上界；溢出經 [Drained.truncated] 帶出）。 */
+    /** R1-A 截圖二進位硬讀取上限（8M，pipe 內保留上界，非程序峰值；溢出經 [Drained.truncated] 帶出）。 */
     const val BINARY_SCREENSHOT_HARD_CAP_BYTES: Int = 8 * 1024 * 1024
 
     /**
@@ -1061,7 +1078,6 @@ internal object ElevatedProcessIo {
      * `ElevatedRunnerPhase3HardeningTest`）。
      */
     private const val FINISHED_TAIL_BUDGET_MS = 2_000L
-    private const val KILL_WAIT_SEC = 5L
     /** Y1 stdin 有界關閉上界：`outputStream` getter/close 在 daemon thread 執行，主執行緒至多等本值（另受剩餘 budget 截頂），超界即放行。 */
     private const val STDIN_CLOSE_MAX_MS = 2_000L
     /**
@@ -1681,49 +1697,9 @@ internal object ElevatedProcessIo {
         return acquired && !t.isAlive
     }
 
-    /**
-     * P1-3 post-kill 父進程停止驗證（B2，僅 kill 路徑調用）：
-     * killer 不抛≠已停（destroy／destroyForcibly 全 runCatching，遠端 destroy
-     * 吞失敗），cleanupOk 只代表監督 worker 離開。此函數以 `waitFor` 回傳為
-     * 主證據、liveness（`isAlive`）為輔助，僅可驗證已停才回 true：
-     * - `waitFor(KILL_WAIT_SEC)` 回 true：已停；再讀 `isAlive`，僅其明確回 true
-     *   才翻為未停（矛盾競態），`isAlive` 抛即忽略（主證據已足）；
-     * - `waitFor` 回 false：5s  grace 仍存活，未停；
-     * - `waitFor` 抛（遠端 binder 死亡等）或中斷：主證據缺失，退讀 `isAlive`；
-     *   明確 false 才算已停，true／抛／中斷一律 unknown→false（binder 不可達
-     *   視 unknown，fail-closed 為 incomplete，不宣稱 cleaned）。
-     * 中斷一律 restore，不吞 caller 中斷；子孫全滅不在此驗（JVM 真樹已驗，
-     * 裝置語義差異 E2E 歸 #136-B3，見 [ElevatedProcessKiller]）。
-     */
-    private fun verifyParentStopped(process: Process): Boolean {
-        val exited: Boolean? = try {
-            process.waitFor(KILL_WAIT_SEC, TimeUnit.SECONDS)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-            null
-        } catch (_: Exception) {
-            null
-        }
-        if (exited == null) {
-            return try {
-                !process.isAlive
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                false
-            } catch (_: Exception) {
-                false
-            }
-        }
-        if (!exited) return false
-        return try {
-            !process.isAlive
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-            true
-        } catch (_: Exception) {
-            true
-        }
-    }
+    // Phase 5 B3 死碼刪除：舊直調 `verifyParentStopped`（`waitFor(5s)` 無界版）
+    // 已無呼叫者（grep 零程式呼叫，僅註解提及，現一律走有界 `verifyParentStoppedBounded`），刪除。
+    // 語義見 `verifyParentStoppedBounded` KDoc（true／false／unknown→false 三分支保留）。
 
     /**
      * 有界截斷管（Y1 由內嵌 `CappedPipe` 更名提升，行為零變更，僅為隔離可測）：
@@ -1816,6 +1792,26 @@ internal object ElevatedProcessIo {
  * "concurrency full" 以區分飽和／熔斷兩因）拒絕收斂至此，與 quota 同級，同為
  * `QUOTA_EXCEEDED` 且零 spawn、不耗配額（准入在飽和／熔斷門之後、配額之前；
  * 成功准入後剩餘 runBinary 包 `try/finally` 釋放，見兩 runner）。
+ *
+ * Phase 5 B4 可調參數索引（僅 KDoc，不搬移常數；#136-B3 調參入口）：
+ * - 准入／熔斷：`ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS`（7）／
+ *   `MAX_CONSECUTIVE_UNCLEAN`（4）／`MAX_CONCURRENT_CALLS`（4）／
+ *   `SLOTS_PER_CALL`（7，單呼叫槽位上界推導見其 KDoc）；
+ * - 監督節拍：`ElevatedCallSupervisor.POLL_MS`（20ms）／`GRACE_MS`（500ms）／
+ *   `VERIFY_JOIN_MS`（5.5s）／`EXIT_JOIN_MS`（2s）／`LATE_REAP_WAIT_SEC`（1s）；
+ * - 容量雙軌：`ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES`（8M 截斷）／
+ *   `BINARY_SCREENSHOT_HARD_CAP_BYTES`（8M 硬讀，pipe 內保留上界）／
+ *   `ShellPolicy.MAX_OUTPUT_BYTES`（64K）／`ShellPolicy.HARD_READ_CAP_BYTES`（512K）；
+ * - drain 有界：`POLL_SLICE_MS`／`GOBBLER_JOIN_MS`／`FINISHED_TAIL_BUDGET_MS`（2s）／
+ *   `CLEANUP_JOIN_MS`（3s）／`CLEANUP_MIN_MS`（500ms）／`CLEANUP_GRACE_MS`（500ms）／
+ *   `STDIN_CLOSE_MAX_MS`（2s）（皆本檔 `ElevatedProcessIo` 私有常數，行為不變）。
+ * 只調數值、不搬位置；放寬任一上限即放寬峰值保證，須同步重審 `peakOutstanding`
+ * 上界與 six-point-barrier 迴歸。
+ *
+ * Phase 5 B1 大檔註記：本檔（`ElevatedProcessIo.kt`，含 `ElevatedCleanupTracker`／
+ * `ElevatedCallSupervisor`／`ElevatedProcessIo`／`ElevatedRunnerCommon`）不拆分
+ * （拆分重構風險＞收益，移動任一對象即大 diff＋KDoc 鏈斷裂）。
+ * TODO(#136-B3): 大檔拆分重審（按對象分檔，保留 KDoc 鏈與常數位置）。
  */
 internal object ElevatedRunnerCommon {
     /** 原因碼缺失拒絕訊息（矩陣 §3 審計要求原因碼非空）。 */

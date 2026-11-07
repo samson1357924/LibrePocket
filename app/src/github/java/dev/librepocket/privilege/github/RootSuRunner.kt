@@ -127,10 +127,10 @@ import java.util.concurrent.TimeUnit
  * R1-A 雙軌容量（Issue #136 R1-A，owner P1-2；U2-B 細化 stderr，owner P2）：
  * 截圖二進位（`screencap -p` / `cat /dev/graphics/fb0`，argv 精確匹配）走
  * stdout 8M 軌（[ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES] 截斷＋
- * [ElevatedProcessIo.BINARY_SCREENSHOT_HARD_CAP_BYTES] 硬讀取，OOM 上界 stdout 8M），
+ * [ElevatedProcessIo.BINARY_SCREENSHOT_HARD_CAP_BYTES] 硬讀取，pipe 內保留上界 stdout 8M（非程序峰值）），
  * stderr 維持通用軌（[ShellPolicy.MAX_OUTPUT_BYTES] 64K 截斷＋
  * [ShellPolicy.HARD_READ_CAP_BYTES] 512K 硬讀取；截圖錯誤訊息短，降 OOM 峰值）；
- * pipe 保留 8M＋512K≈8.5M，非進程峰值（另含拷貝＋防禦複製，見 [ElevatedProcessIo]
+ * pipe 保留 8M＋512K≈8.5M，非程序峰值（另含拷貝＋防禦複製，見 [ElevatedProcessIo]
  * V2 OOM 峰值說明）；閾值恰等於硬讀上限（8M==8M）靠溢出位區分恰上限通過與超限丟棄
  * （溢出即 truncated；恰 8M 通過不截斷，見容量測試 8M exact／8M+1）；
  * 其餘通用命令走舊 64K/512K 軌（[ShellPolicy.MAX_OUTPUT_BYTES]／
@@ -270,6 +270,8 @@ class RootSuRunner(
                 return ElevatedRunnerCommon.cleanupBreakerOpen()
             }
             ElevatedCleanupTracker.Admission.CONCURRENCY_FULL -> {
+                // Phase 5 B3：分支保留不刪。現參數下實效不可達（預留檢查先拒，
+                // 見 tryEnterReserved KDoc），為未來放寬 MAX／SLOTS 後保留。
                 return ElevatedRunnerCommon.concurrencyFull()
             }
         }

@@ -16,6 +16,13 @@ package dev.librepocket.privilege.github
  * 經 `activationCheck` 預設消費（default-deny：`false` 即零 spawn 拒絕）；
  * #136-B3 產品接線時傳明示 allow（`{ ELEVATED_RUNNERS_READY }` 仍須每次重驗，不得快取）。
  *
+ * Phase 5 A4 產品接線契約（僅 KDoc＋負向測試釘死，行為不變）：
+ * 產品必須傳 `{ ELEVATED_RUNNERS_READY }` 讀值（每次重讀本旗），禁止傳 `{ true }`
+ * 常數（傳常數即繞過本旗：翻旗無法關閉 runner，`ELEVATED_RUNNERS_READY=false`
+ * 的 default-deny 即失效）。`{ true }` 僅測試 fixture（`GrantFixtures.activationOn`）
+ * 可用；產品出現 `{ true }` 即審查紅線。負向釘死見 `ElevatedActivationContractTest`
+ * （默認門拒絕 vs `{ true }` 繞過告警）。
+ *
  * AA1（owner 新 P1＋P2）：[ElevatedCleanupTracker.isSaturated]（未完成清理達上限，
  * 有不可回收 Binder stall 殘留）即 #136-B3 blocker 條件——兩 runner 入口資源門已
  * fail-closed 拒絕新 spawn，#136-B3 須先解清理缺口（裝置驗收＋殘留回收）再放行，

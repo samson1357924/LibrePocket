@@ -24,8 +24,13 @@ import java.nio.file.Path
  *   Root `su -c` 傳送層同形，見 [toSpawnArgv]）。
  * - 本檔案零 Android 依賴，JVM 單測可直接斷言；產品 runner 經
  *   [RootSuRunner]/[ShizukuShellRunner] 強制調用（預設即真查 FS，不可繞過）。
+ *
+ * Phase 5 B1 可見性（僅 github 風味內部）：本對象收斂為 `internal`
+ * （同模組 runner＋單測仍可見；`app/src/main` 僅 KDoc 提及，無代碼引用，
+ * 故不破跨模組編譯）。`ElevatedProcessIo.kt` 大檔不拆（風險高，見
+ * `ElevatedRunnerCommon` KDoc TODO，留 #136-B3）。
  */
-object ElevatedExecPolicy {
+internal object ElevatedExecPolicy {
 
     /**
      * 已核驗快照（P1-2，真正不變）：
@@ -80,6 +85,13 @@ object ElevatedExecPolicy {
      * 既有單測無此形，不影響）；`SEARCH_DIR_UNTRUSTED`／`REAL_WRITABLE`／
      * `ENTRY_WRITABLE`／`UNTRUSTED_PATH` 等安全閘永不回退。
      * 生產裝置（`/system/bin` 存在）無回退分支，一律嚴格實體驗證。
+     *
+     * Phase 5 B7 三表同步警告（不改型別，僅 KDoc）：
+     * 可信目錄三表（`ShellPolicy.validateElevated.trustedBinDirs` 詞法門／
+     * 本函數 `searchDirs` 受控搜尋／runner `execSearchDirs` 構造參數）呼叫方須同步
+     * 傳同一表。混表即語義分叉（validate 放行但 resolve 拒、或反之），fail-closed
+     * 方向不一致。型別收斂（統一 `ExecTrust` 值對象）破簽名風險高，本階段不做。
+     * TODO(#136-B3): 評估三表合一（單一可信表值對象＋單一傳參點）。
      */
     fun resolveForSnapshot(
         snapshotArgv0: String,

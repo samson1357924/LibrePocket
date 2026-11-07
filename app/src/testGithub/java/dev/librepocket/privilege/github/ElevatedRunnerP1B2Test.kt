@@ -22,7 +22,7 @@ import org.junit.Test
  *
  * P1-3：killer 真≠進程真死（destroy／destroyForcibly 全 runCatching，遠端 destroy
  * 吞失敗；cleanup worker 離開只代表本機 thread 結束）。drain kill 路徑經
- * `verifyParentStopped`（`waitFor` 回傳／liveness，binder 不可達視 unknown）驗證
+ * `verifyParentStoppedBounded`（`waitFor` 回傳／liveness，binder 不可達視 unknown）驗證
  * 父進程，失敗或不可驗證即 `cleanupIncomplete=true` 並進資源／breaker 終審，
  * 不因 killer 未抛而宣稱 cleaned。子孫全滅仍為真機 blocker（JVM 真樹已驗，
  * 裝置 SELinux／Root 語義差異 E2E 歸 #136-B3）。

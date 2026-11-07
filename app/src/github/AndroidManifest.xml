@@ -12,7 +12,8 @@
           #136-B1 Shizuku binder 通道（Shizuku 13.x 標準接線，僅 github 風味）。
           authorities 固定為 "<package>.shizuku"（ShizukuProvider 以
           getPackageName() + ".shizuku" 自尋 binder）；exported=true 是
-          Shizuku 13.x 官方合約（Manager 回傳 binder 必需）。play/foss 源集
+          Shizuku 13.x 官方合約（Manager 回傳 binder 必需，上游 provider 合約要求
+          exported 必為 true；鑑權在 Manager 側）。play/foss 源集
           無此宣告，對應 artifact gate 維持 fail-closed。
           刻意不加 signature permission（鑑權在 Manager 側），未來勿加固，
           以免後人誤加固斷連。

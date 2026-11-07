@@ -171,6 +171,29 @@ interface BinaryElevatedRunner : ElevatedShellRunner {
  * （本函數吃 [ElevatedBinaryResult]，對方吃 [ShellResult]）。
  * 新增分支時兩處須同步；此處刻意不經 [toShellResult] 轉一道
  * （lossy 解碼只為 verdict 不值得），故以獨立 `when` 保持映射。
+ * 雙映射一致性由 `ElevatedVerdictMappingTest` 鎖定（遍歷全變體斷言
+ * `verdict() == verdictName(toShellResult())`），不合併實作。
+ *
+ * Phase 5 verdict 坍縮表（B5，僅 KDoc，#136-B3 排障用；不新增 verdict 常數，
+ * `OK_TRUNCATED` 不引入，維持 Phase 4 決定 —— truncated-Ok 仍記 `OK`，
+ * 只是不回位元組、不摘要部分幀，見 `RootFramebufferCapture`）：
+ * - `QUOTA_EXCEEDED` 四因同碼（僅訊息區分，皆零 spawn、不耗配額）：
+ *   配額耗盡（`ElevatedRunnerCommon.quotaExceeded`）／清理 backlog 飽和
+ *   （`cleanupBacklogFull`）／連續不清創熔斷（`cleanupBreakerOpen`）／
+ *   併發上限（`concurrencyFull`）。審計 `DENY` 下四因不可區分，
+ *   排障須看拒絕訊息（`quota exceeded`／`backlog full`／`breaker open`／
+ *   `concurrency full`），不得僅看 verdict；
+ * - 取消／超時同 `TimedOut`：spawn 前取消（`isPreSpawnCancelled`）、deadline
+ *   耗盡（`preSpawnExpired`）、drain 超時／取消（kill 路徑）一律
+ *   `TimedOut`（空 partial、`cleanupIncomplete=false` 若未建進程；
+ *   spawn 逾期／kill 殘留則 `cleanupIncomplete=true`）。取消與超時在
+ *   verdict 層不可區分，排障須看 `cleanupIncomplete`＋上下文；
+ * - `Res.Err` 不對稱（刻意）：su 探測抛（`suExists`／`suBinary` 阻塞體 Err）
+ *   → `Failed("su unavailable...")`（可用性語義，回落免 Root 路徑）；
+ *   grant／activation／bridge／status 阻塞體 Err → `Denied(NOT_WHITELISTED)`
+ *  （政策門 fail-closed）。Shizuku `status()` Err 另折
+ *   `BinderUnreachable` 再經 `ShizukuStatusGate.denyFor` 映射為 `Denied`
+ *  （不斷言 `Failed`）。不對稱即契約，#136-B3 不得「統一」為同碼。
  */
 fun ElevatedBinaryResult.verdict(): String = when (this) {
     is ElevatedBinaryResult.Ok -> "OK"

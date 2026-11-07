@@ -4,8 +4,10 @@ import dev.librepocket.shell.ElevatedRequest
 import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellQuota
 import dev.librepocket.shell.ShellResult
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 /**
@@ -19,6 +21,55 @@ import org.junit.Test
 class ElevatedRunnerTest {
 
     private val privateRoot = "/data/data/dev.librepocket.agent/files"
+
+    /**
+     * 終審殘留隔離（Phase 1 P1-1 模式，Round-2 Phase A 補）：每用例首尾歸零
+     * consecutive＋輪詢收斂 outstanding/active，避免同 JVM 內熔斷污染後測。
+     *
+     * Hermetic fixture：暫存 `dumpsys`＋`getprop`＋`id`＋`systemOwned`
+     * （`nonWhitelisted…` 的 dumpsys 與 `outputTruncation…` 的 getprop 在
+     * CI 宿主走預設表即 `SEARCH_DIR_UNTRUSTED`；生產門零變更）。
+     */
+    private var hermeticExec: HermeticExecFixture? = null
+
+    @Before fun setUpBreakerIsolation() {
+        hermeticExec = HermeticExecFixture("runner-hermetic", "dumpsys", "getprop", "id")
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+    }
+
+    @After fun tearDownBreakerIsolation() {
+        hermeticExec?.close()
+        hermeticExec = null
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+    }
+
+    private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.outstanding() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "outstanding=${ElevatedCleanupTracker.outstanding()} expected=$expected",
+                )
+            }
+            Thread.sleep(50L)
+        }
+    }
+
+    private fun pollActiveTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.activeCalls() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "active=${ElevatedCleanupTracker.activeCalls()} expected=$expected",
+                )
+            }
+            Thread.sleep(20L)
+        }
+    }
 
     private fun shizukuRunner(
         spawn: SpawnCounter,
@@ -36,6 +87,9 @@ class ElevatedRunnerTest {
         // VersionUnsupported；單測只斷 runner 語義，不斷探測）。
         status = { ShizukuStatus.Available(15) },
         grantCheck = GrantFixtures.allowAlways,
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     private fun rootRunner(
@@ -52,6 +106,9 @@ class ElevatedRunnerTest {
         // B2：su 經可信絕對路徑（單測注入假路徑，不碰真實 FS/su）。
         suBinary = "/system/bin/su",
         grantCheck = GrantFixtures.allowAlways,
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     @Test fun nonWhitelistedBinaryPassesOnlyViaElevated() {
@@ -62,11 +119,13 @@ class ElevatedRunnerTest {
         val spawn = SpawnCounter()
         // Root 走 su -c 傳送層：內層為已固定目標（P1-1，不再用原始 bare），外層 cwd 釘死（cd + exec 雙保險）。
         // B2：su 本體為可信絕對路徑（不再是 bare "su"）。
-        // P1-1：內層 argv[0] 已固定為已驗證實體（宿主單測經合成回退 `/system/bin/dumpsys`，
-        // 見 ElevatedExecPolicy，裝置側為真查固定實體），不再是裸 `dumpsys`。
+        // P1-1＋Round-2 Phase A：內層 argv[0] 固定為 hermetic fixture 實體
+        // （舊預期 `/system/bin/dumpsys` 來自宿主合成回退，宿主相關已棄用；
+        // 裝置側為真查固定實體；產品文案零變更，只修測試預期為動態 fixture 路徑）。
         rootRunner(spawn).run(ElevatedRequest(listOf("dumpsys", "activity"), reasonCode = "D09-T"))
+        val realDumpsys = java.io.File(hermeticExec!!.dir, "dumpsys").canonicalPath
         assertEquals(
-            listOf("/system/bin/su", "-c", "cd $privateRoot && exec /system/bin/dumpsys activity"),
+            listOf("/system/bin/su", "-c", "cd $privateRoot && exec $realDumpsys activity"),
             spawn.lastArgv,
         )
     }

@@ -50,14 +50,24 @@ class ElevatedRunnerZ1Test {
      * 跨呼叫累計語義由 `ElevatedRunnerAA1Test` 覆蓋），防同 JVM 內污染後測。
      * （outstanding 由各用例 finally 釋放 latch＋await 收斂，此處只歸零計數器；
      * 測試隔離重置，非#136-B3修復。）
+     *
+     * Round-2 Phase A hermetic fixture：暫存 `id`＋`screencap`＋`systemOwned`。
+     * `doRunnerSuccessBlockedStdin` 的 capture 段（`screencap -p`）在 CI 宿主
+     * 走預設表即 `SEARCH_DIR_UNTRUSTED`→capture null（期非 null）；首段 `id`
+     * 一併注入，同值同語義；生產門零變更。
      */
+    private var hermeticExec: HermeticExecFixture? = null
+
     @Before fun setUpBreakerIsolation() {
+        hermeticExec = HermeticExecFixture("z1-hermetic", "id", "screencap")
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
     }
 
     @After fun tearDownBreakerIsolation() {
+        hermeticExec?.close()
+        hermeticExec = null
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
@@ -282,6 +292,9 @@ class ElevatedRunnerZ1Test {
         spawn = spawn,
         suBinary = "/system/bin/su",
         grantCheck = GrantFixtures.allowAlways,
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     private fun makeShizuku(spawn: (List<String>) -> Process): BinaryElevatedRunner =
@@ -293,6 +306,9 @@ class ElevatedRunnerZ1Test {
             spawn = spawn,
             status = { ShizukuStatus.Available(15) },
             grantCheck = GrantFixtures.allowAlways,
+            execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
         )
 
     private fun awaitNoElevatedThreads(boundMs: Long = 5_000L) {

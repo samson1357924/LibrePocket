@@ -2,11 +2,13 @@ package dev.librepocket.privilege.github
 
 import dev.librepocket.shell.ElevatedRequest
 import dev.librepocket.shell.PrivilegeAuditLog
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
+import org.junit.Before
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -21,6 +23,55 @@ import java.util.concurrent.TimeUnit
  * 全 fake 遠端物件，零真機、零 binder、零 su。
  */
 class ShizukuRemoteProcessTest {
+
+    /**
+     * 終審殘留隔離（Phase 1 P1-1 模式，Round-2 Phase A 補）：每用例首尾歸零
+     * consecutive＋輪詢收斂 outstanding/active，避免同 JVM 內熔斷污染後測。
+     *
+     * Hermetic fixture：暫存 `screencap`＋`systemOwned`（3 項 runner 層失敗皆
+     * `SEARCH_DIR_UNTRUSTED` 在先、到不了遠端流 EIO／getter-throw 分支；
+     * 生產門零變更）。
+     */
+    private var hermeticExec: HermeticExecFixture? = null
+
+    @Before fun setUpBreakerIsolation() {
+        hermeticExec = HermeticExecFixture("remote-hermetic", "screencap")
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+    }
+
+    @After fun tearDownBreakerIsolation() {
+        hermeticExec?.close()
+        hermeticExec = null
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+    }
+
+    private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.outstanding() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "outstanding=${ElevatedCleanupTracker.outstanding()} expected=$expected",
+                )
+            }
+            Thread.sleep(50L)
+        }
+    }
+
+    private fun pollActiveTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.activeCalls() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "active=${ElevatedCleanupTracker.activeCalls()} expected=$expected",
+                )
+            }
+            Thread.sleep(20L)
+        }
+    }
 
     private class PassThrough : Process() {
         override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
@@ -226,6 +277,9 @@ class ShizukuRemoteProcessTest {
         spawn = { ShizukuRemoteProcess.wrap(FailingRemote(outPrefix, errPrefix, outEio, errEio, throwGetter)) },
         status = { ShizukuStatus.Available(15) },
         grantCheck = GrantFixtures.allowAlways,
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     @Test fun wrappedStdoutMidEioMapsToFailedAndCaptureNull() {

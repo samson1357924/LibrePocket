@@ -39,14 +39,24 @@ class ElevatedRunnerB4Test {
      * 終審殘留隔離（Phase 1 P1-1）：每用例首尾歸零 consecutive＋輪詢收斂
      * outstanding/active，避免同 JVM 內熔斷污染後測。
      * （測試隔離重置，非#136-B3修復；不升級 noteClean 可見性。）
+     *
+     * Round-2 Phase A hermetic fixture：暫存 `screencap`＋`id`＋`systemOwned`，
+     * `rootRunner`／`shizukuRunner` 一律顯式注入（`malformedOk` 的 screencap
+     * 在 CI 宿主走預設表即 `SEARCH_DIR_UNTRUSTED`→`DENY`，掩蓋意圖的
+     * `FRAME_REJECTED`；生產門零變更）。
      */
+    private var hermeticExec: HermeticExecFixture? = null
+
     @Before fun setUpBreakerIsolation() {
+        hermeticExec = HermeticExecFixture("b4-hermetic", "screencap", "id")
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
     }
 
     @After fun tearDownBreakerIsolation() {
+        hermeticExec?.close()
+        hermeticExec = null
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
@@ -108,6 +118,9 @@ class ElevatedRunnerB4Test {
         spawn = spawn,
         suBinary = "/system/bin/su",
         grantCheck = GrantFixtures.allowAlways,
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     private fun shizukuRunner(spawn: (List<String>) -> Process) = ShizukuShellRunner(
@@ -118,6 +131,9 @@ class ElevatedRunnerB4Test {
         spawn = spawn,
         status = { ShizukuStatus.Available(15) },
         grantCheck = GrantFixtures.allowAlways,
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     // ---- P2-6 PNG 輕量門 ----

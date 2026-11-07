@@ -35,14 +35,25 @@ class ElevatedRunnerB2Test {
      * 終審殘留隔離（Phase 1 P1-1）：每用例首尾歸零 consecutive＋輪詢收斂
      * outstanding/active，避免同 JVM 內熔斷污染後測。
      * （測試隔離重置，非#136-B3修復；不升級 noteClean 可見性。）
+     *
+     * Round-2 Phase A hermetic fixture：暫存 `screencap`＋`systemOwned`
+     * （全不可寫，模擬裝置系統目錄），screencap 用例一律顯式注入
+     * `execSearchDirs`／`execAllowedRoots`／`execIsWritable`，不碰宿主系統目錄、
+     * 不讀宿主 `PATH`／cwd、不依賴合成回退（CI 宿主 `/usr/local/bin` 可寫即
+     * `SEARCH_DIR_UNTRUSTED`，本地與 CI 分叉即本 fixture 消除；生產門零變更）。
      */
+    private var hermeticExec: HermeticExecFixture? = null
+
     @Before fun setUpBreakerIsolation() {
+        hermeticExec = HermeticExecFixture("b2-hermetic", "screencap")
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
     }
 
     @After fun tearDownBreakerIsolation() {
+        hermeticExec?.close()
+        hermeticExec = null
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
@@ -279,6 +290,7 @@ class ElevatedRunnerB2Test {
         // 非 capture 語義（capture 另有 PNG 輕量門＋truncated→null，不在此斷）。
         // PNG 頭＋0xFF/0x00：經 String 往返必損毀。
         val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0xFF.toByte(), 0x00, 0x01)
+        val exec = hermeticExec!!
         val shizuku = ShizukuShellRunner(
             privateRoot = privateRoot,
             bridgeGranted = GrantFixtures.bridgeOn,
@@ -287,6 +299,9 @@ class ElevatedRunnerB2Test {
             spawn = { FakeProcess(png, ByteArray(0), 0) },
             status = { ShizukuStatus.Available(15) },
             grantCheck = GrantFixtures.allowAlways,
+            execSearchDirs = exec.searchDirs,
+            execAllowedRoots = exec.allowedRoots,
+            execIsWritable = exec.systemOwned,
         )
         val b = shizuku.runBinary(ElevatedRequest(listOf("screencap", "-p"), "B2-T"), 2_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Ok)
@@ -302,6 +317,9 @@ class ElevatedRunnerB2Test {
             spawn = { FakeProcess(png, ByteArray(0), 0) },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
+            execSearchDirs = exec.searchDirs,
+            execAllowedRoots = exec.allowedRoots,
+            execIsWritable = exec.systemOwned,
         )
         val rb = root.runBinary(ElevatedRequest(listOf("screencap", "-p"), "B2-T"), 2_000L)
         assertTrue("$rb", rb is ElevatedBinaryResult.Ok)
@@ -335,6 +353,9 @@ class ElevatedRunnerB2Test {
             spawn = { FakeProcess(png, ByteArray(0), 0) },
             status = { ShizukuStatus.Available(15) },
             grantCheck = GrantFixtures.allowAlways,
+            execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
         )
         val audit = dev.librepocket.shell.PrivilegeAuditLog()
         val read = RootFramebufferCapture.screencapViaElevated(runner, audit, "B2-T", 2_000L)
@@ -1140,7 +1161,9 @@ class ElevatedRunnerB2Test {
 
     @Test fun rootStdoutReadFailureMapsToFailedAndCaptureNull() {
         // screencap -p stdout 中途 EIO：waitFor true＋exit 0，但流不完整 → Failed＋capture null。
+        // Hermetic：screencap 解析走暫存可信 fixture（見類首注記），直達 IO 分支。
         val partial = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+        val exec = hermeticExec!!
         val runner = RootSuRunner(
             privateRoot = privateRoot,
             bridgeGranted = GrantFixtures.bridgeOn,
@@ -1154,6 +1177,9 @@ class ElevatedRunnerB2Test {
             },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
+            execSearchDirs = exec.searchDirs,
+            execAllowedRoots = exec.allowedRoots,
+            execIsWritable = exec.systemOwned,
         )
         val b = runner.runBinary(ElevatedRequest(listOf("screencap", "-p"), "V2-T"), 5_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Failed)
@@ -1163,7 +1189,9 @@ class ElevatedRunnerB2Test {
 
     @Test fun rootStderrReadFailureMapsToFailedAndCaptureNull() {
         // screencap -p stdout 完整但 stderr 中途 EIO：err readFailed 亦 Failed＋capture null。
+        // Hermetic：見 rootStdoutReadFailureMapsToFailedAndCaptureNull 注記。
         val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x01, 0x02)
+        val exec = hermeticExec!!
         val runner = RootSuRunner(
             privateRoot = privateRoot,
             bridgeGranted = GrantFixtures.bridgeOn,
@@ -1177,6 +1205,9 @@ class ElevatedRunnerB2Test {
             },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
+            execSearchDirs = exec.searchDirs,
+            execAllowedRoots = exec.allowedRoots,
+            execIsWritable = exec.systemOwned,
         )
         val b = runner.runBinary(ElevatedRequest(listOf("screencap", "-p"), "V2-T"), 5_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Failed)
@@ -1186,7 +1217,9 @@ class ElevatedRunnerB2Test {
 
     @Test fun shizukuStdoutReadFailureMapsToFailedAndCaptureNull() {
         // shizuku 側：stdout 中途 EIO → Failed＋capture null。
+        // Hermetic：見 rootStdoutReadFailureMapsToFailedAndCaptureNull 注記。
         val partial = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+        val exec = hermeticExec!!
         val runner = ShizukuShellRunner(
             privateRoot = privateRoot,
             bridgeGranted = GrantFixtures.bridgeOn,
@@ -1201,6 +1234,9 @@ class ElevatedRunnerB2Test {
             },
             status = { ShizukuStatus.Available(15) },
             grantCheck = GrantFixtures.allowAlways,
+            execSearchDirs = exec.searchDirs,
+            execAllowedRoots = exec.allowedRoots,
+            execIsWritable = exec.systemOwned,
         )
         val b = runner.runBinary(ElevatedRequest(listOf("screencap", "-p"), "V2-T"), 5_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Failed)
@@ -1210,7 +1246,9 @@ class ElevatedRunnerB2Test {
 
     @Test fun shizukuStderrReadFailureMapsToFailedAndCaptureNull() {
         // shizuku 側：stdout 完整但 stderr 中途 EIO → Failed＋capture null。
+        // Hermetic：見 rootStdoutReadFailureMapsToFailedAndCaptureNull 注記。
         val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x01, 0x02)
+        val exec = hermeticExec!!
         val runner = ShizukuShellRunner(
             privateRoot = privateRoot,
             bridgeGranted = GrantFixtures.bridgeOn,
@@ -1225,6 +1263,9 @@ class ElevatedRunnerB2Test {
             },
             status = { ShizukuStatus.Available(15) },
             grantCheck = GrantFixtures.allowAlways,
+            execSearchDirs = exec.searchDirs,
+            execAllowedRoots = exec.allowedRoots,
+            execIsWritable = exec.systemOwned,
         )
         val b = runner.runBinary(ElevatedRequest(listOf("screencap", "-p"), "V2-T"), 5_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Failed)

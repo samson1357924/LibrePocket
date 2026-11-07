@@ -3,10 +3,12 @@ package dev.librepocket.privilege.github
 import dev.librepocket.shell.ElevatedRequest
 import dev.librepocket.shell.PrivilegeAuditLog
 import dev.librepocket.shell.ShellPolicy
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 /**
@@ -20,6 +22,54 @@ class ElevatedRunnerScreenshotCapacityTest {
 
     private val privateRoot = "/data/data/dev.librepocket.agent/files"
 
+    /**
+     * 終審殘留隔離（Phase 1 P1-1 模式，Round-2 Phase A 補）：每用例首尾歸零
+     * consecutive＋輪詢收斂 outstanding/active，避免同 JVM 內熔斷污染後測。
+     *
+     * Hermetic fixture：暫存 `screencap`＋`cat`＋`id`＋`systemOwned`
+     * （5 項 screencap 失敗皆 `SEARCH_DIR_UNTRUSTED` 在先；生產門零變更）。
+     */
+    private var hermeticExec: HermeticExecFixture? = null
+
+    @Before fun setUpBreakerIsolation() {
+        hermeticExec = HermeticExecFixture("cap-hermetic", "screencap", "cat", "id")
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+    }
+
+    @After fun tearDownBreakerIsolation() {
+        hermeticExec?.close()
+        hermeticExec = null
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+    }
+
+    private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.outstanding() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "outstanding=${ElevatedCleanupTracker.outstanding()} expected=$expected",
+                )
+            }
+            Thread.sleep(50L)
+        }
+    }
+
+    private fun pollActiveTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.activeCalls() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "active=${ElevatedCleanupTracker.activeCalls()} expected=$expected",
+                )
+            }
+            Thread.sleep(20L)
+        }
+    }
+
     private fun shizukuRunner(spawn: (List<String>) -> Process) = ShizukuShellRunner(
         privateRoot = privateRoot,
         bridgeGranted = GrantFixtures.bridgeOn,
@@ -28,6 +78,9 @@ class ElevatedRunnerScreenshotCapacityTest {
         spawn = spawn,
         status = { ShizukuStatus.Available(15) },
         grantCheck = GrantFixtures.allowAlways,
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     private fun rootRunner(spawn: (List<String>) -> Process) = RootSuRunner(
@@ -37,6 +90,9 @@ class ElevatedRunnerScreenshotCapacityTest {
         spawn = spawn,
         suBinary = "/system/bin/su",
         grantCheck = GrantFixtures.allowAlways,
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     @Test fun screenshotCapacityConstantsAre8M() {

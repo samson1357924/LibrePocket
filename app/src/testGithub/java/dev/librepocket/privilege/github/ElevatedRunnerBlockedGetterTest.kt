@@ -53,14 +53,24 @@ class ElevatedRunnerBlockedGetterTest {
      * 終審殘留隔離（Phase 1 P1-1）：每用例首尾歸零 consecutive＋輪詢收斂
      * outstanding/active，避免同 JVM 內熔斷污染後測。
      * （測試隔離重置，非#136-B3修復；不升級 noteClean 可見性。）
+     *
+     * Round-2 Phase A hermetic fixture：暫存 `id`＋`screencap`＋`systemOwned`。
+     * timeout 輪的第二次 `runBinary`（`screencapViaBinary`，`screencap -p`）在
+     * CI 宿主走預設表即 `SEARCH_DIR_UNTRUSTED` 零 spawn（kills 停 1，期 2），
+     * 本地經合成回退 spawn（kills 到 2）——方向性分叉即本 fixture 消除。
      */
+    private var hermeticExec: HermeticExecFixture? = null
+
     @Before fun setUpBreakerIsolation() {
+        hermeticExec = HermeticExecFixture("blockedgetter-hermetic", "id", "screencap")
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
     }
 
     @After fun tearDownBreakerIsolation() {
+        hermeticExec?.close()
+        hermeticExec = null
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
@@ -162,6 +172,9 @@ class ElevatedRunnerBlockedGetterTest {
         killer = killer,
         isCancelled = isCancelled,
         grantCheck = GrantFixtures.allowAlways,
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     private fun rootRunner(
@@ -177,6 +190,9 @@ class ElevatedRunnerBlockedGetterTest {
         killer = killer,
         isCancelled = isCancelled,
         grantCheck = GrantFixtures.allowAlways,
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     private fun awaitNoElevatedThreads(boundMs: Long = 5_000L) {
@@ -217,6 +233,12 @@ class ElevatedRunnerBlockedGetterTest {
             killer: (Process) -> Unit,
         ) -> BinaryElevatedRunner,
     ) {
+        // kill 計數確定性（Round-2 Phase A）：drain 超時路徑 killer 恰調用一次
+        // （`runCleanupBounded` 內單次 `killer(process)`，與 destroy 生效快慢無關；
+        // `destroy` 只影響 `verifyParentStoppedBounded` 旗標，不重調 killer）。
+        // 故 kills 語義＝「spawn 且超時 drain 的次數」：首輪 [`id`] 必 1（下即斷言，
+        // 兼作第二輪的 barrier），次輪 `screencapViaBinary` 的 spawn 與否由測試
+        // 控制——hermetic fixture 保證解析成功必 spawn，計數恆 2，消滅方向性 flaky。
         val latch = CountDownLatch(1)
         val kills = AtomicInteger(0)
         val spawn: (List<String>) -> Process = {

@@ -2,8 +2,11 @@ package dev.librepocket.privilege.github
 
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
+import java.nio.file.Files
+import java.nio.file.Path
 import java.util.concurrent.TimeUnit
 
 /**
@@ -88,5 +91,36 @@ internal class SpawnCounter(
         calls++
         lastArgv = argv
         return FakeProcess(stdout)
+    }
+}
+
+/**
+ * Hermetic 可信 executable fixture（Round-2 Phase A，P1-1 CI 30 綠）：
+ * 暫存目錄＋假 executable＋`systemOwned`（全不可寫，模擬裝置系統目錄），
+ * 供 runner `execSearchDirs`／`execAllowedRoots`／`execIsWritable` 顯式注入。
+ * 不碰宿主系統目錄、不讀宿主 `PATH`／cwd、不依賴 `File("/system/bin")` 合成回退；
+ * 顯式搜尋表永不回退，`resolveForSnapshot` fail-closed 語義一字不動（生產門零變更）。
+ *
+ * 用法：`@Before` 建（具名所需 binary），`@After` 關；runner 構造時傳
+ * `execSearchDirs = fixture.searchDirs`、
+ * `execAllowedRoots = fixture.allowedRoots`、
+ * `execIsWritable = fixture.systemOwned`。
+ * 呼叫方不得把本 fixture 目錄再混入其他搜尋表（混表即語義分叉，見
+ * `ElevatedExecPolicy` Phase 5 B7 注記）。
+ */
+internal class HermeticExecFixture(prefix: String, vararg names: String) {
+    val dir: File = Files.createTempDirectory(prefix).toFile()
+    val systemOwned: (Path) -> Boolean = { _ -> false }
+    init {
+        for (n in names) {
+            val f = File(dir, n)
+            f.writeText("#!/bin/sh\necho hi\n")
+            check(f.setExecutable(true)) { "setExecutable failed for $f" }
+        }
+    }
+    val searchDirs: List<String> get() = listOf(dir.absolutePath)
+    val allowedRoots: List<String> get() = listOf(dir.canonicalPath)
+    fun close() {
+        dir.deleteRecursively()
     }
 }

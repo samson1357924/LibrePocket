@@ -12,9 +12,11 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 /**
@@ -39,6 +41,46 @@ import org.junit.Test
 class ElevatedRunnerGrantTest {
 
     private val privateRoot = "/data/data/dev.librepocket.agent/files"
+
+    /**
+     * 終審殘留隔離（Phase 1 P1-1 模式，Round-2 Phase A 補）：每用例首尾歸零
+     * consecutive＋輪詢收斂 outstanding/active，避免同 JVM 內熔斷污染後測。
+     */
+    @Before fun setUpBreakerIsolation() {
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+    }
+
+    @After fun tearDownBreakerIsolation() {
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+    }
+
+    private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.outstanding() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "outstanding=${ElevatedCleanupTracker.outstanding()} expected=$expected",
+                )
+            }
+            Thread.sleep(50L)
+        }
+    }
+
+    private fun pollActiveTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.activeCalls() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "active=${ElevatedCleanupTracker.activeCalls()} expected=$expected",
+                )
+            }
+            Thread.sleep(20L)
+        }
+    }
 
     private fun shizukuRunner(spawn: SpawnCounter, grantCheck: () -> GrantCheck) = ShizukuShellRunner(
         privateRoot = privateRoot,
@@ -249,43 +291,57 @@ class ElevatedRunnerGrantTest {
         // U1：bridge off 對一切命令生效，含無路徑的 id/getprop
         //（validate 只把 bridge 傳給路徑 scope，無路徑即 Allowed，故 runner 顯式橋門再擋）。
         // Root & Shizuku × 2 無路徑命令，一律 Denied(NOT_WHITELISTED) 且零 spawn。
-        for (argv in listOf(listOf("id"), listOf("getprop"))) {
-            var shizukuSpawns = 0
-            val shizuku = ShizukuShellRunner(
-                privateRoot = privateRoot,
-                bridgeGranted = GrantFixtures.bridgeOff,
-                activationCheck = GrantFixtures.activationOn,
-                pingBinder = { true },
-                spawn = {
-                    shizukuSpawns++
-                    FakeProcess("ok".toByteArray(), ByteArray(0), 0)
-                },
-                status = { ShizukuStatus.Available(15) },
-                grantCheck = GrantFixtures.allowAlways,
-            )
-            val sb = shizuku.runBinary(ElevatedRequest(argv, "U1-T"), 2_000L)
-            assertTrue("$argv -> $sb", sb is ElevatedBinaryResult.Denied)
-            assertEquals(ShellDeny.NOT_WHITELISTED, (sb as ElevatedBinaryResult.Denied).reason)
-            assertTrue("$argv -> ${sb.message}", sb.message.contains("privilege bridge off"))
-            assertEquals(0, shizukuSpawns)
+        // Hermetic（Round-2 Phase A）：`getprop` 在 CI 宿主走預設表即
+        // `SEARCH_DIR_UNTRUSTED`（BLACKLISTED 在橋門前先拒），暫存可信 fixture
+        // 使解析必過、 verdict 回到意圖的橋門 NOT_WHITELISTED；生產門零變更。
+        val exec = HermeticExecFixture("grant-bridgeoff-hermetic", "id", "getprop")
+        try {
+            for (argv in listOf(listOf("id"), listOf("getprop"))) {
+                var shizukuSpawns = 0
+                val shizuku = ShizukuShellRunner(
+                    privateRoot = privateRoot,
+                    bridgeGranted = GrantFixtures.bridgeOff,
+                    activationCheck = GrantFixtures.activationOn,
+                    pingBinder = { true },
+                    spawn = {
+                        shizukuSpawns++
+                        FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+                    },
+                    status = { ShizukuStatus.Available(15) },
+                    grantCheck = GrantFixtures.allowAlways,
+                    execSearchDirs = exec.searchDirs,
+                    execAllowedRoots = exec.allowedRoots,
+                    execIsWritable = exec.systemOwned,
+                )
+                val sb = shizuku.runBinary(ElevatedRequest(argv, "U1-T"), 2_000L)
+                assertTrue("$argv -> $sb", sb is ElevatedBinaryResult.Denied)
+                assertEquals(ShellDeny.NOT_WHITELISTED, (sb as ElevatedBinaryResult.Denied).reason)
+                assertTrue("$argv -> ${sb.message}", sb.message.contains("privilege bridge off"))
+                assertEquals(0, shizukuSpawns)
 
-            var rootSpawns = 0
-            val root = RootSuRunner(
-                privateRoot = privateRoot,
-                bridgeGranted = GrantFixtures.bridgeOff,
-                activationCheck = GrantFixtures.activationOn,
-                spawn = {
-                    rootSpawns++
-                    FakeProcess("ok".toByteArray(), ByteArray(0), 0)
-                },
-                suBinary = "/system/bin/su",
-                grantCheck = GrantFixtures.allowAlways,
-            )
-            val rb = root.runBinary(ElevatedRequest(argv, "U1-T"), 2_000L)
-            assertTrue("$argv -> $rb", rb is ElevatedBinaryResult.Denied)
-            assertEquals(ShellDeny.NOT_WHITELISTED, (rb as ElevatedBinaryResult.Denied).reason)
-            assertTrue("$argv -> ${rb.message}", rb.message.contains("privilege bridge off"))
-            assertEquals(0, rootSpawns)
+                var rootSpawns = 0
+                val root = RootSuRunner(
+                    privateRoot = privateRoot,
+                    bridgeGranted = GrantFixtures.bridgeOff,
+                    activationCheck = GrantFixtures.activationOn,
+                    spawn = {
+                        rootSpawns++
+                        FakeProcess("ok".toByteArray(), ByteArray(0), 0)
+                    },
+                    suBinary = "/system/bin/su",
+                    grantCheck = GrantFixtures.allowAlways,
+                    execSearchDirs = exec.searchDirs,
+                    execAllowedRoots = exec.allowedRoots,
+                    execIsWritable = exec.systemOwned,
+                )
+                val rb = root.runBinary(ElevatedRequest(argv, "U1-T"), 2_000L)
+                assertTrue("$argv -> $rb", rb is ElevatedBinaryResult.Denied)
+                assertEquals(ShellDeny.NOT_WHITELISTED, (rb as ElevatedBinaryResult.Denied).reason)
+                assertTrue("$argv -> ${rb.message}", rb.message.contains("privilege bridge off"))
+                assertEquals(0, rootSpawns)
+            }
+        } finally {
+            exec.close()
         }
     }
 

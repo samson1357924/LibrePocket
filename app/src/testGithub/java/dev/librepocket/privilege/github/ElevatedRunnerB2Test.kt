@@ -931,7 +931,11 @@ class ElevatedRunnerB2Test {
         )
         val sb = shizuku.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 0L)
         assertTrue("$sb", sb is ElevatedBinaryResult.TimedOut)
-        assertEquals(1, shizukuKills)
+        // P1-3（PR140 Phase 2）：timeoutMs=0 即 budget 全無，入口 preflight 零 spawn
+        //（舊碼快路徑仍建進程再由 drain 殺，kills==1；現 worker 從未啟動，kills==0、
+        // 無 late 缺口故 cleanupIncomplete=false）。斷 0 privileged process。
+        assertEquals(0, shizukuKills)
+        assertFalse((sb as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
         assertEquals(0L, (sb as ElevatedBinaryResult.TimedOut).timeoutMs)
         // P2-1 可恢復 timeout 不斷 breaker。
         pollOutstandingTo(0)
@@ -953,7 +957,9 @@ class ElevatedRunnerB2Test {
         )
         val rb = root.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 0L)
         assertTrue("$rb", rb is ElevatedBinaryResult.TimedOut)
-        assertEquals(1, rootKills)
+        // P1-3（同 shizuku 側）：零 spawn，kills==0，旗標 false。
+        assertEquals(0, rootKills)
+        assertFalse((rb as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
     }
 
     // ---- R3-A Job 取消（owner P2-5）：真 kotlinx.coroutines Job 驅動清理 ----

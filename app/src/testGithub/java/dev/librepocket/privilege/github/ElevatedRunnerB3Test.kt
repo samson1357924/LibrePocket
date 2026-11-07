@@ -26,6 +26,11 @@ import org.junit.Test
  *
  * 全 fake，零真機、零 su、零 binder。阻塞體一律吞 interrupt 續等（模擬不可靠
  * Binder 中斷；可中斷 stalls 由既有 hang 語義覆，此處專測不可中斷殘留追蹤）。
+ *
+ * P1-2 誠實化（PR140 Phase 2）：blocked-spawn 超時即 `cleanupIncomplete=true`
+ *（worker 殘留＝late Process 缺口，Binder 已送達不可撤回，worker 內有界補償）；
+ * late 交付的確定性補償斷言（destroyed＋無 orphan＋tracker 收斂）見
+ * `ElevatedRunnerPhase2LateSpawnTest`。
  */
 class ElevatedRunnerB3Test {
 
@@ -367,9 +372,16 @@ class ElevatedRunnerB3Test {
             val r = runner.runBinary(ElevatedRequest(listOf("id"), "B3-T"), 300L)
             val elapsed = System.currentTimeMillis() - start
             assertTrue("$r", r is ElevatedBinaryResult.TimedOut)
-            // spawn 未返回即無進程可殺（kills 0），零 spawn 語義為「未建成」。
+            // P1-2 誠實化（PR140 Phase 2）：`kills==0` 僅表示回傳前無進程可殺，
+            // 不再聲稱「未建成」——逾時後 worker 仍可能交付 late Process（Binder
+            // 已送達不可撤回），由 worker 內有界補償；本次即
+            // `cleanupIncomplete=true`（見 Phase2 late-spawn 迴歸）。
             assertEquals(1, spawns.get())
             assertEquals(0, kills)
+            assertTrue(
+                "spawn supervisor linger must flag incomplete, got $r",
+                (r as ElevatedBinaryResult.TimedOut).cleanupIncomplete,
+            )
             assertTrue("elapsed=$elapsed", elapsed < 12_000L)
             assertEquals(1, ElevatedCleanupTracker.outstanding())
         } finally {
@@ -396,6 +408,11 @@ class ElevatedRunnerB3Test {
             val r = runner.runBinary(ElevatedRequest(listOf("id"), "B3-T"), 300L)
             assertTrue("$r", r is ElevatedBinaryResult.TimedOut)
             assertEquals(1, spawns.get())
+            // P1-2 誠實化（同 root 側）：spawn worker 殘留即 late 缺口，旗標 true。
+            assertTrue(
+                "spawn supervisor linger must flag incomplete, got $r",
+                (r as ElevatedBinaryResult.TimedOut).cleanupIncomplete,
+            )
             assertEquals(1, ElevatedCleanupTracker.outstanding())
         } finally {
             latch.countDown()

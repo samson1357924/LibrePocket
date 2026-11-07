@@ -5,6 +5,7 @@ import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellPolicy
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.TimeUnit
@@ -441,6 +442,31 @@ internal object ElevatedCleanupTracker {
  * - Binder interrupt 不可靠：不依賴中斷必達，stall 即殘留 daemon＋計數＋旗標，
  *   呼叫方有界返回（見 [awaitPreSpawn]／[awaitWaitSlice]／[verifyParentStoppedBounded]）。
  *
+ * P1-2 late-spawn ownership＋P1-3 deadline preflight（PR140 Phase 2）：
+ * - 單一 deadline 誠實描述：Binder 已送達不可撤回。spawn 阻塞體一旦向系統提交
+ *   建進程（`ProcessBuilder.start()`／Shizuku `newProcess` Binder 已送達對端），
+ *   呼叫方超時即無法撤回，只能 late compensation（有界 kill／reap，見 [awaitSpawn]）。
+ *   故 spawn 超時一律 `cleanupIncomplete=true`（保守：返回當下不知 late Process
+ *   是否／何時送達、補償是否成功，不宣稱 cleaned）。
+ * - owner 認領機制（見 [awaitSpawn]）：`expired` 單一原子旗標決定 late Process
+ *   所有權。未逾期交付才經 holder handoff caller；逾期後 worker 取得的 Process
+ *   在 worker 內立即有界補償（[lateCompensateSpawn]：killer＋`waitFor(1s)`＋
+ *   三流 best-effort 關，不再經 holder）；認領競態（worker 發布與 caller 過期間
+ *   的 µs 交錯）以 holder CAS 恰好一次交付清理方（worker 內聯或 caller 側
+ *   `elevated-late-spawn` daemon），不雙殺不漏殺；
+ * - preflight 三層（皆零新 spawn）：[awaitInternal]／[awaitSpawn] 入口
+ *   `isExpired` 即不啟 worker 直回 `Expired(hasLinger=false)`；[awaitSpawn]
+ *   worker 返回後再確認 deadline（逾期交付即補償＋`Expired(true)`）；quota 後、
+ *   真正提交 spawn 前 runner 顯式 `isExpired`（見兩 runner；配額已耗仍零 spawn，
+ *   無 refund API，fail-closed 窄競態）；runner 入口 `safeTimeoutMs<=0` 直回
+ *   `preSpawnExpired(false)`（不佔席不耗 quota）；[drain] 入口 remaining<=0
+ *   即監督殺＋有界驗證後回 `Drained(timedOut=true)`，不起 gobbler／stdin-closer；
+ * - [Res.Expired.hasLinger] 僅表示「supervisor worker 仍存活（grace 後）或
+ *   曾交付 late 值」：spawn 路徑穿透至 `TimedOut.cleanupIncomplete`（有 late
+ *   Process 缺口）；非 spawn 路徑（grant／status／suExists 等）無 Process 資源，
+ *   殘留執行緒已經 outstanding／breaker 追蹤，verdict 旗標保持 false（既有契約，
+ *   見 B3 grant 測試），由呼叫方傳 `hasLinger=false` 映射（見 [ElevatedRunnerCommon]）。
+ *
  * 常數不動 READY／MAX（新增本物件常數，不改 [ElevatedCleanupTracker] 上限）。
  */
 internal object ElevatedCallSupervisor {
@@ -456,10 +482,20 @@ internal object ElevatedCallSupervisor {
     /** `exitValue` 有界讀取上界（finished 後 Binder 亦可 stall，超界即 -1＋殘留記數）。 */
     const val EXIT_JOIN_MS = 2_000L
 
+    /** P1-2 late 補償 reap 上界（[lateCompensateSpawn] 內 `waitFor` 有界等待，呼叫方已返回，不擋 budget）。 */
+    const val LATE_REAP_WAIT_SEC = 1L
+
     sealed interface Res<out T> {
         data class Ok<T>(val v: T) : Res<T>
         data class Err(val t: Throwable) : Res<Nothing>
-        data object Expired : Res<Nothing>
+        /**
+         * P1-2 殘留提示（PR140 Phase 2）：`hasLinger=true` 表示 supervisor worker
+         * 在 grace 後仍存活（late 值仍可能送達）或曾交付逾期值。
+         * spawn 路徑必須穿透至 `TimedOut.cleanupIncomplete`（late Process 缺口，
+         * 見 [awaitSpawn]）；非 spawn 路徑無 Process 資源，殘留已由 outstanding／
+         * breaker 追蹤，呼叫方映射 `preSpawnExpired(false)` 保持既有契約。
+         */
+        data class Expired(val hasLinger: Boolean = false) : Res<Nothing>
     }
 
     private data class Val<T>(val v: T)
@@ -472,13 +508,19 @@ internal object ElevatedCallSupervisor {
         (deadlineNanos - System.nanoTime()) <= 0L
 
     /**
-     * spawn 前阻塞體有界（grant／activation／bridge／status／suExists／spawn 共用）：
+     * spawn 前阻塞體有界（grant／activation／bridge／status／suExists 共用；
+     * spawn 本體改走 [awaitSpawn]，不經此）：
+     * - P1-3 入口 preflight：`isExpired(deadline)` 即不啟 worker，直回
+     *   `Expired(hasLinger=false)`（零殘留；剩餘<=0 與已逾期同義，[isExpired]
+     *   覆蓋）；
      * - 快路徑（worker 首個 [POLL_MS] 內完成）不額外調 `isCancelled`（既有 B2 三點
      *   計數不變，見 `cancelMidDrainKillsAndUnblocks` 類斷言）；
      * - 慢路徑每 [POLL_MS] 查 `interrupt`／`isCancelled()`（抛即已取消，
      *   fail-closed，計數沿用 `swallowedIsCancelledThrows`）／deadline，命中即
      *   `interrupt`＋grace，仍存活即 lingering（`markLingering`＋`noteUnclean`，
-     *   無 drain 終審故此處直接計入 breaker）。
+     *   無 drain 終審故此處直接計入 breaker）；`Expired.hasLinger` 即 worker
+     *   grace 後仍存活，非 spawn 呼叫方一律映射 `preSpawnExpired(false)`
+     *   （無 Process 資源，殘留已追蹤，見本物件 P1-2 段）。
      */
     fun <T> awaitPreSpawn(
         deadlineNanos: Long,
@@ -557,6 +599,8 @@ internal object ElevatedCallSupervisor {
         threadName: String,
         markUncleanOnLinger: Boolean,
     ): Res<T> {
+        // P1-3 入口 preflight：budget 已盡即不啟 worker（零執行緒、零殘留）。
+        if (isExpired(deadlineNanos)) return Res.Expired(hasLinger = false)
         val holder = AtomicReference<Any?>()
         val state = AtomicInteger(0)
         val worker = Thread({
@@ -580,7 +624,7 @@ internal object ElevatedCallSupervisor {
         try {
             worker.start()
         } catch (_: Exception) {
-            return Res.Expired
+            return Res.Expired(hasLinger = false)
         }
         try {
             while (true) {
@@ -594,11 +638,12 @@ internal object ElevatedCallSupervisor {
                     } catch (_: InterruptedException) {
                         Thread.currentThread().interrupt()
                     }
-                    if (worker.isAlive) {
+                    val lingering = worker.isAlive
+                    if (lingering) {
                         ElevatedCleanupTracker.markLingering(worker, state)
                         if (markUncleanOnLinger) ElevatedCleanupTracker.noteUnclean()
                     }
-                    return Res.Expired
+                    return Res.Expired(hasLinger = lingering)
                 }
                 if (!worker.isAlive) {
                     val h = holder.get()
@@ -623,11 +668,12 @@ internal object ElevatedCallSupervisor {
                     } catch (_: InterruptedException) {
                         Thread.currentThread().interrupt()
                     }
-                    if (worker.isAlive) {
+                    val lingering = worker.isAlive
+                    if (lingering) {
                         ElevatedCleanupTracker.markLingering(worker, state)
                         if (markUncleanOnLinger) ElevatedCleanupTracker.noteUnclean()
                     }
-                    return Res.Expired
+                    return Res.Expired(hasLinger = lingering)
                 }
             }
         } catch (_: Exception) {
@@ -637,12 +683,201 @@ internal object ElevatedCallSupervisor {
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
-            if (worker.isAlive) {
+            val lingering = worker.isAlive
+            if (lingering) {
                 ElevatedCleanupTracker.markLingering(worker, state)
                 if (markUncleanOnLinger) ElevatedCleanupTracker.noteUnclean()
             }
-            return Res.Expired
+            return Res.Expired(hasLinger = lingering)
         }
+    }
+
+    /**
+     * P1-2 spawn 專用有界監督（PR140 Phase 2）：`block` 建特權進程（`ProcessBuilder.start()`／
+     * Shizuku `newProcess`，Binder 一旦送達即不可撤回），故逾期交付不能只丟棄引用，必須
+     * late compensation（見 [lateCompensateSpawn]）。
+     *
+     * owner 認領機制：
+     * - `expired` 單一原子旗標為線性化點。caller 決定過期即先置 true，再 interrupt＋grace；
+     *   worker 發布值後必重讀本旗：false 才經 holder handoff，true 即自行 [lateCompensateSpawn]
+     *   後（CAS 認領成功才動手）丟棄，不再經 holder；
+     * - 認領競態（worker 發布與 caller 過期交錯）以 holder CAS 恰好一次交付清理方：
+     *   worker 發布後若見 expired 即 `compareAndSet(發布值, null)`，成功則 worker 內聯補償，
+     *   失敗（caller 已取走）則放手；caller 過期路徑同樣 CAS 取 holder 內逾期 Process，
+     *   成功則起 `elevated-late-spawn` daemon 補償（caller 不為補償多擋 budget，
+     *   有界性只由 [GRACE_MS] 承擔），失敗（worker 已認領或尚未發布——後者由 worker
+     *   發布後重讀兜底）則放手。三方交錯下恰好一方動手，不雙殺（killer 本就冪等，
+     *   destroy 重入無害）不漏殺（任一發布必有一方在置旗後 CAS）；
+     * - 返回後再確認 deadline：worker 已死但交付發生在 budget 之後（邊緣回傳），
+     *   即 CAS 取回＋daemon 補償＋`Expired(hasLinger=true)`，不把逾期建成當成功；
+     * - `hasLinger=true` 條件：grace 後 worker 仍存活（late Process 仍可能送達，
+     *   由 worker 發布後重讀兜底清理）或本次確有逾期 Process（已取走補償中，
+     *   結果未知故保守置旗）。spawn 呼叫方必須穿透至 `TimedOut.cleanupIncomplete`。
+     *
+     * 入口 preflight 同 [awaitInternal]（已逾期即不啟 worker，`Expired(false)`，
+     * 零 spawn）；`killer` 為 runner 注入（單測計數／destroy 可觀測，預設即
+     * [ElevatedProcessKiller.killTree]）；残留記槽／breaker 計入同 [awaitPreSpawn]
+     * （`markUncleanOnLinger=true` 語義：grace 後仍存活即記＋計）。
+     */
+    fun awaitSpawn(
+        deadlineNanos: Long,
+        isCancelled: () -> Boolean,
+        killer: (Process) -> Unit,
+        block: () -> Process,
+    ): Res<Process> {
+        // P1-3 入口 preflight：budget 已盡即不提交 spawn（零特權進程）。
+        if (isExpired(deadlineNanos)) return Res.Expired(hasLinger = false)
+        val expired = AtomicBoolean(false)
+        val holder = AtomicReference<Any?>()
+        val state = AtomicInteger(0)
+        val worker = Thread({
+            try {
+                val p = block()
+                val published: Any = Val(p)
+                holder.set(published)
+                // 發布後重讀：caller 已過期即嘗試認領回來自行補償。
+                if (expired.get()) {
+                    if (holder.compareAndSet(published, null)) {
+                        lateCompensateSpawn(p, killer)
+                    }
+                }
+            } catch (t: Throwable) {
+                // 例外不攜 OS 資源：未過期才發布供 caller 診斷，逾期即丟棄。
+                if (!expired.get()) holder.set(Thr(t))
+            } finally {
+                synchronized(state) {
+                    if (state.get() == 1) {
+                        state.set(2)
+                        ElevatedCleanupTracker.releaseSlot()
+                    } else if (state.get() == 0) {
+                        state.set(2)
+                    }
+                }
+            }
+        }, "elevated-supervisor")
+        worker.isDaemon = true
+        try {
+            worker.start()
+        } catch (_: Exception) {
+            return Res.Expired(hasLinger = false)
+        }
+        // 過期善後（caller 側）：置旗→interrupt→grace→記槽→CAS 認領逾期交付。
+        // 三條過期路徑（caller 中斷／cancel-deadline／外層異常）共用，恰好一次。
+        fun expireWorker(): Res<Process> {
+            expired.set(true)
+            runCatching { worker.interrupt() }
+            try {
+                worker.join(GRACE_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            val lingering = worker.isAlive
+            if (lingering) {
+                ElevatedCleanupTracker.markLingering(worker, state)
+                ElevatedCleanupTracker.noteUnclean()
+            }
+            var lateProcess = false
+            val h = holder.get()
+            if (h is Val<*>) {
+                @Suppress("UNCHECKED_CAST")
+                val v = (h as Val<Process>).v
+                // CAS 認領：成功才起 daemon 補償（caller 不多擋 budget）；
+                // 失敗即 worker 已認領（內聯補償中），放手。
+                if (holder.compareAndSet(h, null)) {
+                    lateProcess = true
+                    val t = Thread({ lateCompensateSpawn(v, killer) }, "elevated-late-spawn")
+                    t.isDaemon = true
+                    runCatching { t.start() }
+                } else {
+                    lateProcess = true
+                }
+            }
+            return Res.Expired(hasLinger = lingering || lateProcess)
+        }
+        try {
+            while (true) {
+                try {
+                    worker.join(POLL_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return expireWorker()
+                }
+                if (!worker.isAlive) {
+                    val h = holder.get()
+                    when (h) {
+                        is Val<*> -> {
+                            // P1-3 返回後再確認 deadline：邊緣回傳（交付在 budget
+                            // 之後）不當成功，CAS 取回＋daemon 補償＋Expired(true)。
+                            if (isExpired(deadlineNanos)) {
+                                expired.set(true)
+                                @Suppress("UNCHECKED_CAST")
+                                val v = (h as Val<Process>).v
+                                if (holder.compareAndSet(h, null)) {
+                                    val t = Thread({ lateCompensateSpawn(v, killer) }, "elevated-late-spawn")
+                                    t.isDaemon = true
+                                    runCatching { t.start() }
+                                }
+                                return Res.Expired(hasLinger = true)
+                            }
+                            @Suppress("UNCHECKED_CAST")
+                            return Res.Ok((h as Val<Process>).v)
+                        }
+                        is Thr -> return Res.Err(h.t)
+                        else -> {
+                            // worker 已死無交付：仍確認 deadline（reset 競態下
+                            // 的逾期完成不當成功，直回 Expired(false)，無資源）。
+                            if (isExpired(deadlineNanos)) return Res.Expired(hasLinger = false)
+                            return Res.Err(IllegalStateException("supervisor worker died without result"))
+                        }
+                    }
+                }
+                val shouldExpire = try {
+                    if (Thread.currentThread().isInterrupted) {
+                        true
+                    } else {
+                        val c = try {
+                            isCancelled()
+                        } catch (_: Exception) {
+                            runCatching { ElevatedProcessIo.swallowedIsCancelledThrows.incrementAndGet() }
+                            true
+                        }
+                        c || isExpired(deadlineNanos)
+                    }
+                } catch (_: Exception) {
+                    true
+                }
+                if (shouldExpire) return expireWorker()
+            }
+        } catch (_: Exception) {
+            return expireWorker()
+        }
+    }
+
+    /**
+     * P1-2 late 補償（PR140 Phase 2）：逾期交付的 Process 在此收斂，不再經 holder／drain。
+     *
+     * 順序：runner 注入 `killer`（盡力整組，抛即吞＋計數，不升級崩潰）→
+     * `waitFor([LATE_REAP_WAIT_SEC])` 有界 reap（僵屍不留；Binder stall 即本執行緒
+     * 多活至多 1s——本體為已過期 worker／`elevated-late-spawn` daemon，caller 早已
+     * 有界返回，不擋 budget）→ 三流 best-effort 關（此 Process 永不進 drain，
+     * drain 的「關已取流」無人執行，此處即唯一關流處；getter 重調可 stall，
+     * 逐段 runCatching，stall 只拖本 daemon）。
+     * 結果未知故呼叫方一律 `cleanupIncomplete=true`（不因補償成功而清旗）。
+     */
+    private fun lateCompensateSpawn(p: Process, killer: (Process) -> Unit) {
+        try {
+            killer(p)
+        } catch (_: Exception) {
+            runCatching { ElevatedProcessIo.swallowedKillerThrows.incrementAndGet() }
+        }
+        try {
+            p.waitFor(LATE_REAP_WAIT_SEC, TimeUnit.SECONDS)
+        } catch (_: Exception) {
+            // 有界 reap 失敗即放手（daemon 不抛，旗標已由呼叫方保守置 true）。
+        }
+        runCatching { p.inputStream.close() }
+        runCatching { p.errorStream.close() }
+        runCatching { p.outputStream.close() }
     }
 
     /**
@@ -887,6 +1122,39 @@ internal object ElevatedProcessIo {
         // Long.MAX 應為近無限而非即時超時；夾頂後 Long.MAX 即約 292M 年，不懸掛）。
         val safeTimeoutMs = timeoutMs.coerceAtLeast(0L).coerceAtMost(Long.MAX_VALUE / 1_000_000L)
         val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(safeTimeoutMs)
+        // P1-3 drain 入口 preflight（PR140 Phase 2，最小改動）：budget 已盡即不起
+        // gobbler／stdin-closer（零新執行緒），直接監督殺＋有界驗證後回
+        // `Drained(timedOut=true)`。殺驗語義同 kill 路徑（killer 永不跳過，下界
+        // [CLEANUP_MIN_MS]；驗證走有界 [verifyParentStoppedBounded]），終審計入
+        // breaker 同正常路徑；caller 預置中斷照常出口恢復。流未起即無已取引用可關
+        // （killer 契約本就不碰流；此 Process 的流隨 kill＋物件回收收斂）。
+        if ((deadlineNanos - System.nanoTime()) <= 0L) {
+            var preIncomplete = false
+            val preOk = runCleanupBounded(CLEANUP_MIN_MS) {
+                try {
+                    killer(process)
+                } catch (_: Exception) {
+                    swallowedKillerThrows.incrementAndGet()
+                }
+            }
+            if (!preOk) preIncomplete = true
+            if (!ElevatedCallSupervisor.verifyParentStoppedBounded(process)) preIncomplete = true
+            if (preIncomplete) {
+                ElevatedCleanupTracker.noteUnclean()
+            } else if (ElevatedCleanupTracker.outstanding() == 0) {
+                ElevatedCleanupTracker.noteClean()
+            }
+            if (callerInterrupted) Thread.currentThread().interrupt()
+            return Drained(
+                stdout = ByteArray(0),
+                stderr = ByteArray(0),
+                exitCode = -1,
+                timedOut = true,
+                truncated = false,
+                readFailed = false,
+                cleanupIncomplete = preIncomplete,
+            )
+        }
         // P1-B：spawn 成功後立即關子進程 stdin（子進程 stdin EOF）：等 stdin EOF 的
         // 子進程（如 cat）不再假性 TimedOut。killer 內不關流，此處是唯一關 stdin 處
         //（drain kill 路徑另關已取的 stdout/stderr，不碰 stdin）。
@@ -1474,7 +1742,7 @@ internal object ElevatedRunnerCommon {
         ElevatedBinaryResult.Denied(ShellDeny.QUOTA_EXCEEDED, CONCURRENCY_FULL_MESSAGE)
 
     /**
-     * P1-4 spawn 前取消檢查（B2，兩 runner 共用）：
+     * P1-4 spawn 前取消檢查（B2，兩 runner 共用；P1-2/P1-3 語義保留，不看 deadline）：
      * 任何 spawn 前調用（入口＋最後授權重驗後，確保中途取消亦零新 spawn）。
      * - `Thread.currentThread().isInterrupted`（不清旗標，保留原始 interrupt）
      *   或 `isCancelled()` 任一為 true 即已取消；
@@ -1486,6 +1754,12 @@ internal object ElevatedRunnerCommon {
      *   中斷下清理 join 有界由 drain 既有上界承擔。
      * 已取消時呼叫方回 `TimedOut`（空 partial，`cleanupIncomplete=false`，
      * 無進程故無殘留），零 spawn、不耗配額（配額前檢查）／已占席由 finally 釋放。
+     *
+     * P1-3 deadline 語義分離（PR140 Phase 2）：本檢查刻意不看 deadline（中斷／
+     * 取消語義純粹，B2 計數不變）；budget 耗盡由各層顯式 `isExpired(deadline)`
+     * 承擔——supervisor 入口 preflight（[ElevatedCallSupervisor]）、quota 後
+     * 提交前檢查、runner 入口 `safeTimeoutMs<=0` 早拒（見兩 runner），逾期映射
+     * 一律經 [preSpawnExpired]（`hasLinger` 決定旗標）。
      */
     internal fun isPreSpawnCancelled(isCancelled: () -> Boolean): Boolean {
         if (Thread.currentThread().isInterrupted) return true
@@ -1497,13 +1771,22 @@ internal object ElevatedRunnerCommon {
         }
     }
 
-    /** P1-4 已取消的 spawn 前 verdict：零 spawn 的 TimedOut（無 partial，無殘留）。 */
-    internal fun preSpawnCancelled(timeoutMs: Long): ElevatedBinaryResult.TimedOut =
+    /**
+     * P1-2/P1-3 逾期 spawn 前 verdict（PR140 Phase 2，兩 runner 共用）：
+     * 零 handoff 的 `TimedOut`（空 partial）。
+     * - `hasLinger=false`：worker 從未啟動（入口 preflight／quota 後顯式檢查）或
+     *   逾期值非 Process——無 late 進程缺口，`cleanupIncomplete=false`（舊
+     *   `preSpawnCancelled` 語義，非 spawn 逾期與取消共用）；
+     * - `hasLinger=true`：supervisor worker grace 後仍存活或確有逾期交付——
+     *   late Process 缺口（Binder 已送達不可撤回，補償結果未知），
+     *   `cleanupIncomplete=true`（僅 spawn 逾期置 true，見 [ElevatedCallSupervisor]）。
+     */
+    internal fun preSpawnExpired(timeoutMs: Long, hasLinger: Boolean): ElevatedBinaryResult.TimedOut =
         ElevatedBinaryResult.TimedOut(
             ByteArray(0),
             ByteArray(0),
             timeoutMs,
             false,
-            false,
+            hasLinger,
         )
 }

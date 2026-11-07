@@ -22,11 +22,13 @@ class ElevatedActivationContractTest {
     private val privateRoot = "/data/data/dev.librepocket.agent/files"
 
     @Before fun setUp() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollActiveTo(0)
     }
 
     @After fun tearDown() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollActiveTo(0)
     }

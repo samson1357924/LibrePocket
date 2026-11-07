@@ -37,6 +37,7 @@ class ElevatedRunnerPhaseBLateCompensationTest {
     private val privateRoot = "/data/data/files"
 
     @Before fun setUpIsolation() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
@@ -48,6 +49,7 @@ class ElevatedRunnerPhaseBLateCompensationTest {
         repeat(8) { ElevatedCleanupTracker.leaveCall() }
         pollOutstandingTo(0)
         pollActiveTo(0)
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
     }
 

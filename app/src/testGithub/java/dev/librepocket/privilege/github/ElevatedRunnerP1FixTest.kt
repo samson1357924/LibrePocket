@@ -34,12 +34,14 @@ class ElevatedRunnerP1FixTest {
      * （測試隔離重置，非#136-B3修復；不升級 noteClean 可見性。）
      */
     @Before fun setUpBreakerIsolation() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
     }
 
     @After fun tearDownBreakerIsolation() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)

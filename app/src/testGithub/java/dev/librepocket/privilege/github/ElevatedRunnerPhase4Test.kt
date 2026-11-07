@@ -37,12 +37,14 @@ class ElevatedRunnerPhase4Test {
     private val systemOwned: (java.nio.file.Path) -> Boolean = { _ -> false }
 
     @Before fun setUpBreakerIsolation() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
     }
 
     @After fun tearDownBreakerIsolation() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)

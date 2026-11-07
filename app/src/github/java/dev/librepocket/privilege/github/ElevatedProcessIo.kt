@@ -235,12 +235,17 @@ internal object ElevatedCleanupTracker {
     /**
      * 統一准入 verdict（P1-2）：准入決定必須原子，拒絕原因僅供訊息區分，
      * 不另做二次檢查。
+     *
+     * Round-3 Phase E（P1-1）：新增 [QUARANTINE]——未驗證停止的特權 process
+     * 持久 quarantine 非空即拒（獨立維度，見 [quarantineUnverified]；
+     * slot 常數 7 語義保持，quarantine 不佔槽、不計 consecutive）。
      */
     enum class Admission {
         OK,
         BACKLOG_FULL,
         BREAKER_OPEN,
         CONCURRENCY_FULL,
+        QUARANTINE,
     }
 
     private val lock = Any()
@@ -252,6 +257,28 @@ internal object ElevatedCleanupTracker {
 
     /** 進行中呼叫數（AB1 呼叫級准入，跨呼叫全域，雙 runner 共用；進入即佔，finally 釋放）。 */
     private val activeCalls = AtomicInteger(0)
+
+    /**
+     * Round-3 Phase E 未驗證死亡 process 持久 quarantine（P1-1，fail-closed latch，
+     * 與 slot／consecutive 計數分離）：
+     * - 登記對象：post-kill／late-compensation 驗證失敗（verify=false／no-op kill／
+     *   reap=false）仍未證死亡的 `Process` handle（本地 OS 進程與 Shizuku 遠端進程
+     *   同經 `Process` 介面登記，雙軌同一機制）。worker 執行緒完成 ≠ process 已驗證
+     *   死亡（killer best-effort 抛吞／no-op 皆可正常返回）：只有
+     *   [ElevatedCallSupervisor.verifyParentStoppedBounded] 回 true 才算 verified；
+     *   其餘一律登記，不宣稱 cleaned；
+     * - 登記是冪等閂（同一 handle 以 `===` 去重，不計數、不佔槽）：飽和無槽／起線程
+     *   失敗的 owner 亦轉入此登記（而非丟棄），同樣擋後續 spawn；
+     * - 解除只兩途：[sweepQuarantine] 有界重驗見確死（`waitFor(0)` 回 true），或
+     *   [clearUnverified] 顯式 recovery（僅 B3 已驗證 recovery 或測試隔離可調）。
+     *   [noteClean]／成功 drain 永不清除（見其 KDoc 分離聲明）；
+     * - 有界性：quarantine 非空即擋新 spawn，故登記數上界為准入前已在飛的併發呼叫數
+     *   （`<=MAX_CONCURRENT_CALLS` 量級，不無界增長）；重驗見 [sweepQuarantine]
+     *   （快照＋單次非阻塞狀態查詢，不起線程、不設定時器）。
+     *
+     * 鎖：一切經 [lock]（與槽／計數器同一鎖，准入判定單一原子點）。
+     */
+    private val quarantine = ArrayList<Process>()
 
     /**
      * floor 命中計數（診斷用，產品保持 floor 不變負但上報；正常路徑永不觸發，
@@ -335,6 +362,11 @@ internal object ElevatedCleanupTracker {
      * 殘留期間（outstanding>0）的乾淨 drain 保持計數（不歸零亦不遞增），
      * 避免乾淨呼叫沖掉熔斷。
      *
+     * Round-3 Phase E 分離聲明：本函數只碰 [consecutiveUnclean]，永不清除
+     * quarantine（見 [quarantine]）：後續正常成功 drain 在 `outstanding==0`
+     * 時重置連續計數，仍擋不住未驗證 process——quarantine 非空即
+     * [Admission.QUARANTINE] 拒絕，與 breaker 計數獨立。
+     *
      * 測試意圖：單測 setUp／tearDown／首尾呼叫皆屬測試隔離重置，非 #136-B3 修復驗證；
      * 產品 #136-B3 介入重置亦經此（見 [PrivilegeActivation]），單測僅借其歸零語義做隔離。
      */
@@ -357,18 +389,107 @@ internal object ElevatedCleanupTracker {
     }
 
     /**
+     * Round-3 Phase E：未驗證停止的 process 登記入 quarantine（P1-1）。
+     *
+     * 調用點（缺一即漏回收，見各處 KDoc）：
+     * - [ElevatedCallSupervisor.lateCompensateSpawn] 未驗證（回 false）；
+     * - `awaitSpawn` 內 worker 內聯補償飽和無槽、`startLateDaemon` 飽和無槽／
+     *   `Thread.start()` 抛（owner 轉入登記，而非丟棄）；
+     * - [ElevatedProcessIo.drain] 正常／preflight kill 後
+     *   `verifyParentStoppedBounded` 失敗。
+     *
+     * 冪等（同一 handle 以 `===` 去重，不雙計）；只持引用，不佔槽、不計
+     * consecutive（與 breaker 計數分離，見 [noteClean] 分離聲明）。
+     * worker 完成 ≠ verified dead：呼叫方 breaker 計數保持（`countUncleanOnce`），
+     * verdict `cleanupIncomplete=true` 保持（由各路徑既有旗標帶出），quarantine
+     * 以 [Admission.QUARANTINE] 把 fail-closed 擴展到後續一切新 spawn。
+     */
+    internal fun quarantineUnverified(p: Process) {
+        synchronized(lock) {
+            if (quarantine.none { it === p }) quarantine.add(p)
+        }
+    }
+
+    /** quarantine 是否非空（快照，僅測試／診斷用；正式准入 verdict 以 [tryEnterReserved] 為準）。 */
+    internal fun isQuarantined(): Boolean = synchronized(lock) { quarantine.isNotEmpty() }
+
+    /** quarantine 登記數快照（僅測試／診斷用）。 */
+    internal fun quarantinedCount(): Int = synchronized(lock) { quarantine.size }
+
+    /**
+     * Round-3 Phase E 有界重試回收（P1-1；重試管道，不無界）：
+     * 對快照內每個登記做一次非阻塞存活查詢（`waitFor(0)`：本地真進程即時回；
+     * 假件按其語義回；Shizuku 遠端為一次 Binder 狀態查詢），確死（回 true）
+     * 即解除登記，仍存活／查詢抛／中斷即保留（fail-closed：中斷恢復旗標）。
+     *
+     * 有界性：快照＋逐個單次查詢，不起線程、不設定時器、不用 `ProcessHandle.onExit`
+     * 回調（假件無 `pid`／`toHandle` 真語義，見 [ElevatedProcessKiller] S2-A；
+     * 回調的執行緒／生命週期在 Binder 死亡語義下不可控）。quarantine 非空即擋新
+     * spawn，登記數天然上界（見 [quarantine]），故本函數耗時上界為
+     * `登記數 × 單次狀態查詢`。
+     *
+     * 調用：兩 runner 每次准入前先調本函數再調 [tryEnterReserved]（sweep-then-admit；
+     * 本函數鎖外探測、不持 [lock] 做外部呼叫，准入判定仍單一原子點）。
+     * 生產 Binder stall 注記：遠端查詢 stall 只延遲本次拒絕（條目保留，下次仍拒），
+     * 永不放行 spawn（fail-closed 方向不變）。
+     *
+     * @return 本次解除的登記數（測試斷言回收用）。
+     */
+    internal fun sweepQuarantine(): Int {
+        val snapshot: List<Process> = synchronized(lock) { quarantine.toList() }
+        if (snapshot.isEmpty()) return 0
+        var cleared = 0
+        for (p in snapshot) {
+            val exited = try {
+                p.waitFor(0L, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            } catch (_: Exception) {
+                false
+            }
+            if (exited) {
+                synchronized(lock) {
+                    val idx = quarantine.indexOfFirst { it === p }
+                    if (idx >= 0) {
+                        quarantine.removeAt(idx)
+                        cleared++
+                    }
+                }
+            }
+        }
+        return cleared
+    }
+
+    /**
+     * Round-3 Phase E 顯式解除 quarantine（P1-1）：
+     * 僅 B3 明確驗證的 recovery（帶外驗證已死後）或測試隔離可調。
+     * 成功 drain／[noteClean]／[sweepQuarantine] 未見確死一律不得調用
+     * （quarantine 與 breaker 計數分離，見 [noteClean] 分離聲明）。
+     */
+    @VisibleForTesting
+    internal fun clearUnverified() {
+        synchronized(lock) { quarantine.clear() }
+    }
+
+    /**
      * 純判定（B3 Phase 5 拆分，行為不變）：僅計算准入 verdict，不佔席、無副作用。
      *
      * 須在 [lock] 內調用（調用方 [tryEnterReserved] 同一鎖內先判後佔，仍單一原子點，
-     * 不做三段 CAS）。判定順序同 [tryEnterReserved]（backlog／breaker／併發／預留）。
+     * 不做三段 CAS）。判定順序同 [tryEnterReserved]（backlog／breaker／併發／預留／quarantine）。
      */
     private fun classifyAdmissionLocked(): Admission {
+        // Round-3 Phase E（P1-1）：quarantine 末門（既有門相對順序不動，Phase F 範圍；
+        // quarantine 只補 P1-1 缺口——outstanding==0、consecutive==1、預留通過時，
+        // 前四門皆不觸發，此門獨立兜底；多門同成立時既有 reason 優先，quarantine
+        // 仍經 isQuarantined／quarantinedCount 可觀測，backlog 清後即 surface）。
         if (outstandingCount.get() >= MAX_OUTSTANDING_CLEANUPS) return Admission.BACKLOG_FULL
         if (consecutiveUnclean.get() >= MAX_CONSECUTIVE_UNCLEAN) return Admission.BREAKER_OPEN
         if (activeCalls.get() >= MAX_CONCURRENT_CALLS) return Admission.CONCURRENCY_FULL
         if (outstandingCount.get() + (activeCalls.get() + 1) * SLOTS_PER_CALL > MAX_OUTSTANDING_CLEANUPS) {
             return Admission.BACKLOG_FULL
         }
+        if (quarantine.isNotEmpty()) return Admission.QUARANTINE
         return Admission.OK
     }
 
@@ -379,13 +500,16 @@ internal object ElevatedCleanupTracker {
      * （backlog／breaker／reservation 無副作用），本函數僅在 `OK` 時單一原子佔席
      * （`active++`）。判定＋佔席仍在同一 `synchronized(lock)` 內，不引入 TOCTOU。
      *
-     * 檢查順序（拒絕原因優先級，僅供訊息區分，准入決定單一原子點）：
+     * 檢查順序（拒絕原因優先級，僅供訊息區分，准入決定單一原子點；
+     * Round-3 Phase E（P1-1）：既有 1-4 相對順序不動，quarantine 只為末門）：
      * 1. `outstanding >= MAX` → [Admission.BACKLOG_FULL]；
      * 2. `consecutive >= MAX_CONSECUTIVE_UNCLEAN` → [Admission.BREAKER_OPEN]；
      * 3. `active >= MAX_CONCURRENT_CALLS` → [Admission.CONCURRENCY_FULL]；
      * 4. `outstanding + (active+1) * SLOTS_PER_CALL > MAX` → [Admission.BACKLOG_FULL]
      *   （預留超額，視為 backlog 壓力）；
-     * 5. 否則 `active++` 並回 [Admission.OK]。
+     * 5. `quarantine 非空` → [Admission.QUARANTINE]（Round-3 Phase E 末門，
+     *   見 [quarantine]；不與 backlog／breaker 混碼）；
+     * 6. 否則 `active++` 並回 [Admission.OK]。
      *
      * 特權宜序列：MAX=7、SLOTS=7 時乾淨態僅允單一進行中呼叫
      *（0+1*7<=7 通過，0+2*7>7 拒絕），實效串行；且任一殘留（`outstanding>=1`）
@@ -854,9 +978,14 @@ internal object ElevatedCallSupervisor {
         //   資源壓力最高時不放大）；
         // - daemon 終審：incomplete 才計數（guard 保 lingering 不雙計），verified
         //   clean 不計（outstanding 釋放後 admission 自然恢復，見 lateCompensateSpawn）。
+        // - Round-3 Phase E（P1-1）：飽和無槽／起線程失敗的 owner 一律轉入
+        //   quarantine 登記（[ElevatedCleanupTracker.quarantineUnverified]，而非丟棄），
+        //   outstanding 歸零後仍以 QUARANTINE 擋後續 spawn（同條漏回收路徑消除，
+        //   不只寫 breaker 計數）。
         fun startLateDaemon(v: Process) {
             val acquired = ElevatedCleanupTracker.acquireSlot()
             if (!acquired) {
+                ElevatedCleanupTracker.quarantineUnverified(v)
                 countUncleanOnce()
                 return
             }
@@ -873,6 +1002,7 @@ internal object ElevatedCallSupervisor {
                 t.start()
             } catch (_: Exception) {
                 ElevatedCleanupTracker.releaseSlot()
+                ElevatedCleanupTracker.quarantineUnverified(v)
                 countUncleanOnce()
             }
         }
@@ -886,8 +1016,10 @@ internal object ElevatedCallSupervisor {
                     if (holder.compareAndSet(published, null)) {
                         // R2-PhaseB：worker 內聯補償亦先佔槽（與 caller daemon 同一全域管理）。
                         // 飽和即不補償、置旗＋計數（fail-closed，不靜默丟 owner）。
+                        // Round-3 Phase E（P1-1）：飽和 owner 同轉入 quarantine 登記。
                         val acquired = ElevatedCleanupTracker.acquireSlot()
                         if (!acquired) {
+                            ElevatedCleanupTracker.quarantineUnverified(p)
                             lateIncomplete.set(true)
                             countUncleanOnce()
                         } else {
@@ -1036,11 +1168,15 @@ internal object ElevatedCallSupervisor {
      *   parent 驗證已定 verdict）；
      * - 本函數不碰槽／breaker（槽由呼叫方持有全程，breaker 由呼叫方終審經返回值計入），
      *   不抛（全段 catch，daemon 不死於異常）。
+     * - Round-3 Phase E（P1-1）：未驗證（回 false）即登記 quarantine
+     *   （[ElevatedCleanupTracker.quarantineUnverified]，冪等閂）：worker 完成
+     *   ≠ verified dead，登記是本函數的直接職責（非計數，故不經呼叫方 guard），
+     *   breaker 計數仍由呼叫方經返回值終審（不雙計語義不變）。
      *
      * 上界：killer（注入側有界，stall 即持槽）＋reap 1s＋verify 5.5s＋grace 0.5s＋
      * 關流（stall 即持槽）。呼叫方（awaitSpawn caller）早已返回，不擋 budget。
      * owner 語義：late Process 的唯一追蹤者即本補償持有者（worker 內聯或 daemon 持槽）；
-     * 飽和無槽時不起 daemon，呼叫方記殘留（breaker）而非丟棄（見 startLateDaemon）。
+     * 飽和無槽時不起 daemon，呼叫方記殘留＋quarantine 登記（見 startLateDaemon）。
      */
     private fun lateCompensateSpawn(p: Process, killer: (Process) -> Unit): Boolean {
         var ok = true
@@ -1069,6 +1205,9 @@ internal object ElevatedCallSupervisor {
         runCatching { p.inputStream.close() }
         runCatching { p.errorStream.close() }
         runCatching { p.outputStream.close() }
+        // Round-3 Phase E（P1-1）：未驗證即登記 quarantine（worker 完成≠verified dead；
+        // 呼叫方 breaker 計數經返回值另行終審，此處只登記，不雙計）。
+        if (!ok) ElevatedCleanupTracker.quarantineUnverified(p)
         return ok
     }
 
@@ -1368,7 +1507,14 @@ internal object ElevatedProcessIo {
                 }
             }
             if (!preOk) preIncomplete = true
-            if (!ElevatedCallSupervisor.verifyParentStoppedBounded(process)) preIncomplete = true
+            if (!ElevatedCallSupervisor.verifyParentStoppedBounded(process)) {
+                preIncomplete = true
+                // Round-3 Phase E（P1-1）：preflight 監督殺後仍未驗證即登記 quarantine
+                // （worker 完成≠verified dead；僅 verify 失敗才登記，worker stall 但已驗證
+                // 死亡不登記——process 已死，無未驗證 handle；後續 spawn 以 QUARANTINE 拒，
+                // 不靠 breaker 計數）。
+                ElevatedCleanupTracker.quarantineUnverified(process)
+            }
             if (preIncomplete) {
                 ElevatedCleanupTracker.noteUnclean()
             } else if (ElevatedCleanupTracker.outstanding() == 0) {
@@ -1583,7 +1729,14 @@ internal object ElevatedProcessIo {
             //（經尾收終審進 noteUnclean／breaker，不宣稱 cleaned）。子孫全滅
             // 仍為真機 blocker（JVM 真樹已驗，裝置 SELinux／Root 語義差異 E2E
             // 歸 #136-B3，見 ElevatedProcessKiller）。
-            if (!ElevatedCallSupervisor.verifyParentStoppedBounded(process)) cleanupIncomplete = true
+            // Round-3 Phase E（P1-1）：驗證失敗即登記 quarantine（worker 完成≠
+            // verified dead；僅 verify 失敗才登記，cleanupOk==false 但已驗證死亡
+            // 不登記）。verdict cleanupIncomplete 保持 true（經尾收終審），
+            // quarantine 以 QUARANTINE 把 fail-closed 擴展到後續 spawn。
+            if (!ElevatedCallSupervisor.verifyParentStoppedBounded(process)) {
+                cleanupIncomplete = true
+                ElevatedCleanupTracker.quarantineUnverified(process)
+            }
             // 超時/cancel 路徑保留有界 join：gobbler 仍可能卡住，避免無限等。
             // join 中斷必須 restore 中斷旗標（不吞 InterruptedException）。
             // AB1 P1-A：join 超界仍存活即殘留 gobbler（入口已中斷兩 gobbler，
@@ -1952,6 +2105,9 @@ internal object ElevatedProcessIo {
  * `QUOTA_EXCEEDED` 且零 spawn；飽和＝有不可回收清理，#136-B3 需介入，見
  * [ElevatedCleanupTracker]）。
  *
+ * Round-3 Phase E（P1-1）：未驗證 quarantine 持有（[quarantineHeld]）拒絕亦收斂至此，
+ * 與 quota 同級（零 spawn、不耗配額），但原因碼獨立（`QUARANTINE`，不與上兩因混碼）。
+ *
  * AB1 呼叫級准入（owner 新 P1-A＋P1-B）：併發上限（[concurrencyFull]，訊息含
  * "concurrency full" 以區分飽和／熔斷兩因）拒絕收斂至此，與 quota 同級，同為
  * `QUOTA_EXCEEDED` 且零 spawn、不耗配額（准入在飽和／熔斷門之後、配額之前；
@@ -1961,6 +2117,9 @@ internal object ElevatedProcessIo {
  * - 准入／熔斷：`ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS`（7）／
  *   `MAX_CONSECUTIVE_UNCLEAN`（4）／`MAX_CONCURRENT_CALLS`（4）／
  *   `SLOTS_PER_CALL`（7，單呼叫槽位上界推導見其 KDoc）；
+ * - 未驗證 quarantine（Round-3 Phase E，無上限常數可調：登記數天然上界見
+ *   `ElevatedCleanupTracker.quarantine` KDoc；解除只經 `sweepQuarantine`
+ *   有界重驗或 `clearUnverified` 顯式 recovery，不得調參繞行）；
  * - 監督節拍：`ElevatedCallSupervisor.POLL_MS`（20ms）／`GRACE_MS`（500ms）／
  *   `VERIFY_JOIN_MS`（5.5s）／`EXIT_JOIN_MS`（2s）／`LATE_REAP_WAIT_SEC`（1s）；
  * - 容量雙軌：`ElevatedProcessIo.BINARY_SCREENSHOT_MAX_BYTES`（8M 截斷）／
@@ -2011,6 +2170,23 @@ internal object ElevatedRunnerCommon {
     /** 連續不清創熔斷時的 typed 拒絕：`QUOTA_EXCEEDED`，不建子進程。 */
     fun cleanupBreakerOpen(): ElevatedBinaryResult.Denied =
         ElevatedBinaryResult.Denied(ShellDeny.QUOTA_EXCEEDED, CLEANUP_BREAKER_OPEN_MESSAGE)
+
+    /**
+     * Round-3 Phase E 未驗證 quarantine 持有拒絕訊息（P1-1，與 quota 同級，
+     * 零 spawn、不耗配額；原因碼獨立，不與 backlog／breaker 混碼）。
+     */
+    const val QUARANTINE_HELD_MESSAGE =
+        "elevated unverified process quarantine held (fail-closed, no spawn)"
+
+    /**
+     * Round-3 Phase E 未驗證 quarantine 持有時的 typed 拒絕（P1-1）：
+     * `QUARANTINE` 獨立原因碼（不與 backlog／breaker 的 `QUOTA_EXCEEDED` 混碼），
+     * 不建子進程。`cleanupIncomplete=true`（quarantine 明確接管前 cleanup 仍未完成，
+     * fail-closed 信號經 verdict 持久帶出；`toShellResult` 照既有契約丟棄本旗標，
+     * 監測須用 runBinary）。
+     */
+    fun quarantineHeld(): ElevatedBinaryResult.Denied =
+        ElevatedBinaryResult.Denied(ShellDeny.QUARANTINE, QUARANTINE_HELD_MESSAGE, true)
 
     /** 呼叫級併發上限拒絕訊息（AB1 P1-B 准入門，與 quota 同級，零 spawn、不耗配額）。 */
     const val CONCURRENCY_FULL_MESSAGE =

@@ -129,6 +129,11 @@ import rikka.shizuku.Shizuku
  * drain 層飽和仍嘗試監督清理（永不跳過 killer）；本旗標經
  * [ElevatedBinaryResult.Ok.cleanupIncomplete]／[ElevatedBinaryResult.TimedOut.cleanupIncomplete]
  * 穿透（僅監測，不改 verdict）。
+  *
+  * Round-3 Phase E（P1-1）：未驗證 quarantine 非空即拒
+  * `Denied(QUARANTINE, "elevated unverified process quarantine held...")` 且零 spawn、
+  * 不耗配額（准入前先 [ElevatedCleanupTracker.sweepQuarantine] 有界重驗，
+  * 已驗證死亡即解除；原因碼獨立，不與 backlog／breaker 混碼）。
  *
  * AB1 呼叫級准入（owner 新 P1-A＋P1-B）：飽和／熔斷門之後、配額之前
  * 單一原子 [ElevatedCleanupTracker.tryEnterReserved]（同一鎖內檢查＋佔席，
@@ -249,6 +254,10 @@ class ShizukuShellRunner(
         //（[tryEnterReserved] 原子；拒絕不耗 quota；阻塞體皆有界監督，stall 即殘留
         // 追蹤，呼叫方有界返回）。validate（純）亦入席內（需 bridge 快照，bridge
         // 本身阻塞，故席位須在 bridge 之前；黑名單等純拒絕亦短暫占席後經 finally 釋放）。
+        // Round-3 Phase E（P1-1）：准入先有界重掃 quarantine（[sweepQuarantine]：
+        // 已驗證死亡即解除，無需 B3 手動介入；仍存活即保持，後續准入以 QUARANTINE
+        // 拒）。sweep 在准入鎖外探測、有界（無新線程），准入判定仍單一原子點。
+        ElevatedCleanupTracker.sweepQuarantine()
         when (ElevatedCleanupTracker.tryEnterReserved()) {
             ElevatedCleanupTracker.Admission.OK -> Unit
             ElevatedCleanupTracker.Admission.BACKLOG_FULL -> {
@@ -256,6 +265,9 @@ class ShizukuShellRunner(
             }
             ElevatedCleanupTracker.Admission.BREAKER_OPEN -> {
                 return ElevatedRunnerCommon.cleanupBreakerOpen()
+            }
+            ElevatedCleanupTracker.Admission.QUARANTINE -> {
+                return ElevatedRunnerCommon.quarantineHeld()
             }
             ElevatedCleanupTracker.Admission.CONCURRENCY_FULL -> {
                 // Phase 5 B3：分支保留不刪。現參數下實效不可達（預留檢查先拒，

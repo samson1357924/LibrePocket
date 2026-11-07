@@ -183,6 +183,11 @@ interface BinaryElevatedRunner : ElevatedShellRunner {
  *   併發上限（`concurrencyFull`）。審計 `DENY` 下四因不可區分，
  *   排障須看拒絕訊息（`quota exceeded`／`backlog full`／`breaker open`／
  *   `concurrency full`），不得僅看 verdict；
+ * - 未驗證 quarantine（Round-3 Phase E，P1-1）：獨立原因碼 `QUARANTINE`
+ *   （`ElevatedRunnerCommon.quarantineHeld`，訊息含 `quarantine held`），
+ *   不與上四因混碼；同為零 spawn、不耗配額，審計同記 `DENY`，
+ *   另攜 `cleanupIncomplete=true`（quarantine 接管前 cleanup 仍未完成，
+ *   fail-closed 信號經 verdict 持久帶出；`toShellResult` 照既有契約丟棄旗標）；
  * - 取消／超時同 `TimedOut`：spawn 前取消（`isPreSpawnCancelled`）、deadline
  *   耗盡（`preSpawnExpired`）、drain 超時／取消（kill 路徑）一律
  *   `TimedOut`（空 partial、`cleanupIncomplete=false` 若未建進程；

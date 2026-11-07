@@ -41,12 +41,14 @@ class ElevatedRunnerPhase2LateSpawnTest {
      * outstanding/active，避免同 JVM 內熔斷污染後測。
      */
     @Before fun setUpBreakerIsolation() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
     }
 
     @After fun tearDownBreakerIsolation() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)

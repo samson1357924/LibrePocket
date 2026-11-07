@@ -162,6 +162,7 @@ class ElevatedRunnerB3Test {
     // ---- Root blocked grant × timeout/cancel ----
 
     @Test fun rootBlockedGrantTimeout() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
@@ -191,6 +192,7 @@ class ElevatedRunnerB3Test {
         } finally {
             latch.countDown()
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }
@@ -198,6 +200,7 @@ class ElevatedRunnerB3Test {
     }
 
     @Test fun rootBlockedGrantCancel() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         val latch = CountDownLatch(1)
@@ -232,6 +235,7 @@ class ElevatedRunnerB3Test {
             cancelled.set(true)
             latch.countDown()
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }
@@ -240,6 +244,7 @@ class ElevatedRunnerB3Test {
     // ---- Shizuku blocked status × timeout/cancel ----
 
     @Test fun shizukuBlockedStatusTimeout() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
@@ -267,12 +272,14 @@ class ElevatedRunnerB3Test {
         } finally {
             latch.countDown()
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }
     }
 
     @Test fun shizukuBlockedStatusCancel() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         val latch = CountDownLatch(1)
@@ -305,6 +312,7 @@ class ElevatedRunnerB3Test {
             cancelled.set(true)
             latch.countDown()
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }
@@ -313,6 +321,7 @@ class ElevatedRunnerB3Test {
     // ---- Root blocked suExists × timeout/cancel ----
 
     @Test fun rootBlockedSuExistsTimeout() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         val latch = CountDownLatch(1)
@@ -343,6 +352,7 @@ class ElevatedRunnerB3Test {
         } finally {
             latch.countDown()
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }
@@ -351,6 +361,7 @@ class ElevatedRunnerB3Test {
     // ---- Blocked spawn × timeout/cancel (Root/Shizuku) ----
 
     @Test fun rootBlockedSpawnTimeout() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         val latch = CountDownLatch(1)
@@ -387,12 +398,14 @@ class ElevatedRunnerB3Test {
         } finally {
             latch.countDown()
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }
     }
 
     @Test fun shizukuBlockedSpawnTimeout() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         val latch = CountDownLatch(1)
@@ -417,12 +430,14 @@ class ElevatedRunnerB3Test {
         } finally {
             latch.countDown()
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }
     }
 
     @Test fun rootBlockedSpawnCancel() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         val latch = CountDownLatch(1)
@@ -451,12 +466,14 @@ class ElevatedRunnerB3Test {
             cancelled.set(true)
             latch.countDown()
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }
     }
 
     @Test fun shizukuBlockedSpawnCancel() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         val latch = CountDownLatch(1)
@@ -485,6 +502,7 @@ class ElevatedRunnerB3Test {
             cancelled.set(true)
             latch.countDown()
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }
@@ -493,6 +511,7 @@ class ElevatedRunnerB3Test {
     // ---- Blocked wait (remote waitFor stall) × timeout/cancel ----
 
     @Test fun rootBlockedWaitTimeout() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         val latch = CountDownLatch(1)
@@ -517,12 +536,14 @@ class ElevatedRunnerB3Test {
         } finally {
             latch.countDown()
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }
     }
 
     @Test fun shizukuBlockedWaitTimeout() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         val latch = CountDownLatch(1)
@@ -542,6 +563,7 @@ class ElevatedRunnerB3Test {
         } finally {
             latch.countDown()
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }
@@ -572,6 +594,7 @@ class ElevatedRunnerB3Test {
     }
 
     @Test fun rootBlockedWaitCancel() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         val latch = CountDownLatch(1)
@@ -598,12 +621,14 @@ class ElevatedRunnerB3Test {
         } finally {
             latch.countDown()
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }
     }
 
     @Test fun shizukuBlockedWaitCancel() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         val latch = CountDownLatch(1)
@@ -630,6 +655,7 @@ class ElevatedRunnerB3Test {
         } finally {
             latch.countDown()
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }
@@ -638,6 +664,7 @@ class ElevatedRunnerB3Test {
     // ---- No unlimited blocked callers (8 concurrent, 1 slot) ----
 
     @Test fun rootBlockedStatusNoUnlimitedCallers() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
@@ -689,6 +716,7 @@ class ElevatedRunnerB3Test {
         } finally {
             latch.countDown()
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             pollActiveTo(0)
             awaitNoElevatedThreads()
@@ -696,6 +724,7 @@ class ElevatedRunnerB3Test {
     }
 
     @Test fun shizukuBlockedStatusNoUnlimitedCallers() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
@@ -740,6 +769,7 @@ class ElevatedRunnerB3Test {
         } finally {
             latch.countDown()
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             pollActiveTo(0)
             awaitNoElevatedThreads()

@@ -40,6 +40,7 @@ class ElevatedRunnerPhaseCTest {
     private val privateRoot = "/data/data/files"
 
     @Before fun setUpIsolation() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
@@ -48,6 +49,7 @@ class ElevatedRunnerPhaseCTest {
     @After fun tearDownIsolation() {
         pollOutstandingTo(0)
         pollActiveTo(0)
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
     }
 

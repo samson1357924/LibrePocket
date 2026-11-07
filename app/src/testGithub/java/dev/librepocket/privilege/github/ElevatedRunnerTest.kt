@@ -34,6 +34,7 @@ class ElevatedRunnerTest {
 
     @Before fun setUpBreakerIsolation() {
         hermeticExec = HermeticExecFixture("runner-hermetic", "dumpsys", "getprop", "id")
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
@@ -42,6 +43,7 @@ class ElevatedRunnerTest {
     @After fun tearDownBreakerIsolation() {
         hermeticExec?.close()
         hermeticExec = null
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)

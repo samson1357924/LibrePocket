@@ -36,6 +36,7 @@ class ShizukuRemoteProcessTest {
 
     @Before fun setUpBreakerIsolation() {
         hermeticExec = HermeticExecFixture("remote-hermetic", "screencap")
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
@@ -44,6 +45,7 @@ class ShizukuRemoteProcessTest {
     @After fun tearDownBreakerIsolation() {
         hermeticExec?.close()
         hermeticExec = null
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)

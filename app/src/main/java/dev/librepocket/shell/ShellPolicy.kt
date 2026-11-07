@@ -1086,13 +1086,20 @@ object ShellPolicy {
     }
 }
 
-/** 拒絕原因碼（對應 D05「白名單/黑名單/配額」三類門禁 + 參數衛生）。 */
+/** 拒絕原因碼（對應 D05「白名單/黑名單/配額」三類門禁 + 參數衛生 + 未驗證 quarantine 閂）。 */
 enum class ShellDeny {
     EMPTY_COMMAND,
     NOT_WHITELISTED,
     BLACKLISTED,
     BAD_ARGUMENT,
     QUOTA_EXCEEDED,
+    /**
+     * Round-3 Phase E（P1-1，未驗證死亡 process 持久 quarantine）：
+     * quarantine 非空期間一切新 privileged spawn 一律 fail-closed 拒絕。
+     * 獨立原因碼，不與 [QUOTA_EXCEEDED] 的 backlog／breaker／併發三因混碼
+     * （verdict 仍 `DENY`，見提權 verdict 坍縮表；僅 github 風味提權通道使用）。
+     */
+    QUARANTINE,
 }
 
 /** [ShellPolicy.validate] 的回執：放行攜正規化後的二進位名，拒絕攜原因。 */

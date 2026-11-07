@@ -164,6 +164,7 @@ class ElevatedRunnerAB1Test {
     }
 
     @Test fun lingeringSuccessCountsAndSharesAcrossRunners() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean() // 測試隔離重置，非#136-B3修復。
         pollOutstandingTo(0)
         assertEquals(0, ElevatedCleanupTracker.activeCalls())
@@ -246,6 +247,7 @@ class ElevatedRunnerAB1Test {
     }
 
     @Test fun concurrencyGateAdmitsExactlyOneSerial() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean() // 測試隔離重置，非#136-B3修復（首尾皆然；尾部見 finally）。
         pollOutstandingTo(0)
         assertEquals(0, ElevatedCleanupTracker.activeCalls())
@@ -344,6 +346,7 @@ class ElevatedRunnerAB1Test {
             destroyLatch.countDown()
             threads.forEach { it.join(30_000L) }
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }

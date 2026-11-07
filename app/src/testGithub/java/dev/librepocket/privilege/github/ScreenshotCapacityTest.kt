@@ -43,12 +43,14 @@ class ScreenshotCapacityTest {
 
     /** 終審殘留隔離：防同 JVM 內先行不清創用例遺留熔斷（本用例只斷成功截斷）。 */
     @Before fun setUpBreakerIsolation() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
     }
 
     @After fun tearDownBreakerIsolation() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)

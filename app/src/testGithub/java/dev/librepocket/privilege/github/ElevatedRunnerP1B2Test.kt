@@ -41,10 +41,12 @@ class ElevatedRunnerP1B2Test {
     private val privateRoot = "/data/data/files"
 
     @Before fun setUpIsolation() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
     }
 
     @After fun tearDownIsolation() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
     }
 
@@ -302,6 +304,10 @@ class ElevatedRunnerP1B2Test {
         assertTrue((rb as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
         pollOutstandingTo(0)
 
+        // Round-3 Phase E（P1-1）：首 call 未驗證 handle 進 quarantine；Shizuku 側
+        // 仍須驗「binder 死亡亦 incomplete」，故先顯式 recovery（不清 breaker 計數），
+        // 見 consecutiveUncleanOpensBreaker 同例。
+        ElevatedCleanupTracker.clearUnverified()
         val shizuku = makeShizuku(
             spawn = { ShizukuRemoteProcess.wrap(BinderDiedRemote()) },
         )
@@ -346,6 +352,11 @@ class ElevatedRunnerP1B2Test {
             assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
             assertTrue((b as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
             pollOutstandingTo(0)
+            // Round-3 Phase E（P1-1）：每次未驗證 handle 進 quarantine（次 call 即
+            // QUARANTINE 拒）。本用例只驗 consecutive 累計→熔斷語義，故每輪顯式
+            // recovery quarantine（不清 consecutive、不调 breaker 計數），保持
+            // 「連續 4 次不清創即熔斷」原意；quarantine 擋次 call 語義見 PhaseE 測試。
+            ElevatedCleanupTracker.clearUnverified()
         }
         assertTrue(ElevatedCleanupTracker.isBreakerOpen())
     }

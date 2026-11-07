@@ -139,6 +139,7 @@ class ElevatedRunnerAA1Test {
     }
 
     @Test fun saturationGateBlocksBothRunnersAndRecovers() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean() // 測試隔離重置，非#136-B3修復。
         pollOutstandingTo(0)
         // P1-2 預留（PR140 Phase1，特權宜序列）：乾淨態僅允單一進行中呼叫。
@@ -219,6 +220,7 @@ class ElevatedRunnerAA1Test {
     private fun doFlagPassthrough(
         makeRunner: ((List<String>) -> Process) -> BinaryElevatedRunner,
     ) {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean() // 測試隔離重置，非#136-B3修復。
         pollOutstandingTo(0)
         // blocked destroy → TimedOut(cleanupIncomplete=true)。
@@ -275,6 +277,7 @@ class ElevatedRunnerAA1Test {
      * 第 5 次仍放行（outstanding 歸零且 consecutive 歸零；良性慢命令不累計）。
      */
     @Test fun recoverableTimeoutNeverTripsBreaker() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean() // 測試隔離重置，非#136-B3修復。
         pollOutstandingTo(0)
         try {
@@ -305,6 +308,7 @@ class ElevatedRunnerAA1Test {
             pollOutstandingTo(0)
             assertFalse(ElevatedCleanupTracker.isBreakerOpen())
         } finally {
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             pollOutstandingTo(0)
             awaitNoElevatedThreads()
@@ -318,6 +322,7 @@ class ElevatedRunnerAA1Test {
      * 則為 breaker 生效（outstanding 已 0，非飽和擋；訊息區分兩因）。
      */
     @Test fun breakerOpenBlocksWhenOutstandingZero() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean() // 測試隔離重置，非#136-B3修復。
         pollOutstandingTo(0)
         // P1-2 預留（PR140 Phase1）：逐次累積不可達，改逐次釋放累計 consecutive
@@ -362,6 +367,7 @@ class ElevatedRunnerAA1Test {
             assertEquals(4, spawns.get())
         } finally {
             pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }
@@ -381,6 +387,7 @@ class ElevatedRunnerAA1Test {
      * （若未歸零則累計 4 次即開；outstanding 每次即時釋放，孤立 consecutive）。
      */
     @Test fun successResetsConsecutiveCounter() {
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean() // 測試隔離重置，非#136-B3修復。
         pollOutstandingTo(0)
         try {
@@ -420,6 +427,7 @@ class ElevatedRunnerAA1Test {
                 .runBinary(ElevatedRequest(listOf("id"), "AA1-RST-OK2"), 2_000L)
             assertTrue("$ok2", ok2 is ElevatedBinaryResult.Ok)
         } finally {
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             pollOutstandingTo(0)
             awaitNoElevatedThreads()

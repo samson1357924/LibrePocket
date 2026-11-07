@@ -3,6 +3,8 @@ package dev.librepocket.privilege.github
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.After
+import org.junit.Before
 import org.junit.Test
 
 /**
@@ -18,6 +20,16 @@ import org.junit.Test
  *   success 阻塞 stdin、8s 永久 stall）。
  */
 class ElevatedCleanupTrackerTest {
+
+    // Round-3 Phase E（P1-1）：quarantine 為跨用例全域閂，首尾清空（計數器隔離
+    // 仍由各用例首尾 noteClean＋歸零輪詢承擔，此處只補新閂）。
+    @Before fun setUpQuarantineIsolation() {
+        ElevatedCleanupTracker.clearUnverified()
+    }
+
+    @After fun tearDownQuarantineIsolation() {
+        ElevatedCleanupTracker.clearUnverified()
+    }
 
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {
         val deadline = System.currentTimeMillis() + boundMs

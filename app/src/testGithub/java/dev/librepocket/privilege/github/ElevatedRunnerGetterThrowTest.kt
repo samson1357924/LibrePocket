@@ -43,6 +43,7 @@ class ElevatedRunnerGetterThrowTest {
 
     @Before fun setUpBreakerIsolation() {
         hermeticExec = HermeticExecFixture("getterthrow-hermetic", "screencap")
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
@@ -51,6 +52,7 @@ class ElevatedRunnerGetterThrowTest {
     @After fun tearDownBreakerIsolation() {
         hermeticExec?.close()
         hermeticExec = null
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)

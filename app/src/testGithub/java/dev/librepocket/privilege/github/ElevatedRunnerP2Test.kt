@@ -40,6 +40,7 @@ class ElevatedRunnerP2Test {
 
     @Before fun setUpBreakerIsolation() {
         hermeticExec = HermeticExecFixture("p2-hermetic", "screencap", "id", "cat")
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
@@ -48,6 +49,7 @@ class ElevatedRunnerP2Test {
     @After fun tearDownBreakerIsolation() {
         hermeticExec?.close()
         hermeticExec = null
+        ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
@@ -329,7 +331,18 @@ class ElevatedRunnerP2Test {
         assertEquals(1, kills)
         val after = ElevatedProcessIo.swallowedKillerThrows.get()
         assertTrue("killer counter must flip: $before->$after", after > before)
-        // 原 runner 不受影響（隔離）。
+        // Round-3 Phase E（P1-1）：恒抛 killer 從未殺死進程（post-kill 驗證仍存活）→
+        // quarantine 持有，次 call fail-closed 拒絕（舊「計數隔離即放行」語義已修正：
+        // worker 完成≠verified dead，見 PhaseE quarantine 測試）。
+        assertTrue(ElevatedCleanupTracker.isQuarantined())
+        val blocked = okRunner.runBinary(ElevatedRequest(listOf("id"), "P2-T"), 2_000L)
+        assertTrue("$blocked", blocked is ElevatedBinaryResult.Denied)
+        blocked as ElevatedBinaryResult.Denied
+        assertEquals(ShellDeny.QUARANTINE, blocked.reason)
+        assertTrue("msg=${blocked.message}", blocked.message.contains("quarantine"))
+        // B3 recovery 語義：顯式解除後放行（原隔離斷言保留於此）。
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
         assertTrue(okRunner.runBinary(ElevatedRequest(listOf("id"), "P2-T"), 2_000L) is ElevatedBinaryResult.Ok)
         pollOutstandingTo(0)
         // 恒抛 killer 的監督 worker 仍正常完成（吞後釋放），不殘留。

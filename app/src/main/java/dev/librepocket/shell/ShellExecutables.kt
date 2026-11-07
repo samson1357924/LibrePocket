@@ -52,11 +52,15 @@ import java.nio.file.Paths
  *   不得放寬。宿主 fixture 在 `/tmp` 下時祖先可寫，單測須注入 `systemOwned`
  *   模擬裝置不可寫（與 entry/real 閘同式），真查即 fail-closed 拒。
  * - multicall（toybox / toolbox / busybox，見 [MULTICALL_BINARIES]）：實體
- *   basename 落此顯式表時，spawn 形狀為 `[realPath, applet, ...args]`——
+ *   basename 落此顯式表「且」邏輯 basename（`argv[0]` 的 basename）與實體
+ *   basename 不同時，spawn 形狀為 `[realPath, applet, ...args]`——
  *   applet 取自 `argv[0]` 的 basename（[ShellPolicy.basename]），其值已由
  *   [ShellPolicy.validate] 白名單放行（`Allowed.binary`），本函數只負責
- *   「是否為 multicall」的訊號，不擴大白名單。非表內（即使 link 名與實體名
- *   不同，如版本化 link）一律維持 `[realPath, ...args]`，不插入。
+ *   「是否為 multicall」的訊號，不擴大白名單。邏輯名本來就是 multicall
+ *   主程式自身時（`logicalBase == realBase`，如 `["toybox", "id"]`）不插入，
+ *   spawn 為 `[realPath, ...args]`（`args` 首位即 applet，不重插）。
+ *   非表內（即使 link 名與實體名不同，如版本化 link）一律維持
+ *   `[realPath, ...args]`，不插入。
  *   判定只認實體 basename 的精確集合成員，不用「名不同即插」的籠統規則。
  *   toolbox 在部分舊版本／廠商改版上的 applet 傳參語義（`[real, applet, ...]`
  *   是否被接受）未經實機驗證，此處為保留說明，待 Android 實機覆蓋。
@@ -142,9 +146,11 @@ object ShellExecutables {
 
     /**
      * 已解析 executable：[path] 為驗證後實體絕對路徑（spawn 的 `argv[0]`）；
-     * [applet] 僅 multicall（實體 basename ∈ [MULTICALL_BINARIES]）非 null，
+     * [applet] 僅 multicall 別名形（實體 basename ∈ [MULTICALL_BINARIES]「且」
+     * 邏輯 basename ≠ 實體 basename，即經 symlink／別名呼叫）非 null，
      * 取自原始 `argv[0]` 的 basename（見 [resolve]），呼叫方 spawn 時置於
-     * `argv[1]` 還原被 link 吞掉的子命令名；非 multicall 為 null，spawn 不插入。
+     * `argv[1]` 還原被 link 吞掉的子命令名；multicall 主程式自身
+     * （`logicalBase == realBase`）與非 multicall 為 null，spawn 不插入。
      */
     data class ResolvedExec(val path: String, val applet: String?)
 
@@ -536,11 +542,12 @@ object ShellExecutables {
      *   現場快照。bare 與絕對 `argv[0]` 同表（S2「放行即能解析」不變）。
      * - writability 判定：[isWritable]（預設 [defaultIsWritable]；單測可注入
      *   以模擬系統自帶不可寫，宿主暫存檔屬主可寫故直接用預設值會全拒）。
-     * - multicall：實體 basename ∈ [MULTICALL_BINARIES] 時回 [ResolvedExec]
+     * - multicall：實體 basename ∈ [MULTICALL_BINARIES]「且」邏輯 basename ≠
+     *   實體 basename 時回 [ResolvedExec]
      *   攜 `applet = argv[0]` 的 basename（呼叫方須先經 [ShellPolicy.validate]
      *   白名單放行，本函數不管白名單；multicall 不豁免 containment/writability/
      *   entry 閘，逃逸或 entry 可寫照拒；entry 全乾淨時合法形放行不受影響）；
-     *   其餘回 `applet = null`。
+     *   主程式自身（`logicalBase == realBase`）與其餘回 `applet = null`。
      * - 本函數不管白名單（由 [ShellPolicy.validate] 先判）；回 null 呼叫方必須
      *   拒絕且不建子進程。需定位時用 [resolveDetailed] 取 [ResolveDeny]。
      */
@@ -624,15 +631,20 @@ object ShellExecutables {
 
     /**
      * 實體路徑 → [ResolvedExec]：僅實體 basename 精確命中 [MULTICALL_BINARIES]
-     * 才攜 applet（取自原始 `argv[0]` 的 basename；呼叫方保證該值已過白名單），
+     * 「且」邏輯 basename（原始 `argv[0]` 的 basename）與實體 basename 不同
+     * 才攜 applet（呼叫方保證該值已過白名單）；邏輯名本來就是 multicall
+     * 主程式自身（`logicalBase == realBase`，如 `["toybox", "id"]`）回
+     * `applet = null`（`args` 首位即 applet，不重插；否則形成
+     * `[real, "toybox", "id"]` 錯誤形）。
      * 其餘（版本化 link、改名二進位、同名實體）一律 `applet = null`。
      * multicall 且 basename 為空的畸形輸入 fail-closed 回 null。
      */
     private fun toResolved(argv0: String, realPath: String): ResolvedExec? {
         val realBase = realPath.substringAfterLast('/')
         if (realBase !in MULTICALL_BINARIES) return ResolvedExec(realPath, null)
-        val applet = ShellPolicy.basename(argv0)
-        if (applet.isEmpty()) return null
-        return ResolvedExec(realPath, applet)
+        val logicalBase = ShellPolicy.basename(argv0)
+        if (logicalBase.isEmpty()) return null
+        if (logicalBase == realBase) return ResolvedExec(realPath, null)
+        return ResolvedExec(realPath, logicalBase)
     }
 }

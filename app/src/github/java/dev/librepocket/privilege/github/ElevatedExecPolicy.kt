@@ -17,11 +17,16 @@ import java.nio.file.Path
  *   entry 閘，與 [ShellExecutables.resolveDetailed] 同參）；含分隔符的絕對
  *   `argv[0]` 先過詞法門（[ShellPolicy.validateElevated] 已擋非可信父目錄），
  *   再經同一實體驗證；spawn 一律用已固定目標，不再用原始 `argv[0]`。
- * - multicall（toybox／toolbox／busybox）：實體 basename 落表時 spawn 形狀為
- *   `[real, applet, ...args]`，其中 `applet` 取快照 `argv[0]` 的 basename
- *   （已過 [ShellPolicy.validateElevated] 黑名單／衛生門，本函數只負責是否為
- *   multicall 的訊號，不擴大白名單；與 [ShellExecutables] 直接通道同形，
- *   Root `su -c` 傳送層同形，見 [toSpawnArgv]）。
+ * - multicall（toybox／toolbox／busybox，P2-7 parity）：實體 basename 落表
+ *   「且」邏輯 basename（快照 `argv[0]` 的 basename）與實體 basename 不同
+ *   （經 symlink／別名呼叫）時 spawn 形狀為 `[real, applet, ...args]`，其中
+ *   `applet` 取快照 `argv[0]` 的 basename（已過 [ShellPolicy.validateElevated]
+ *   黑名單／衛生門＋applet 黑名單，本函數只負責是否為 multicall 的訊號，
+ *   不擴大白名單；與 [ShellExecutables] 直接通道同形，Root `su -c` 傳送層同形，
+ *   見 [toSpawnArgv]）。邏輯名本來就是 multicall 主程式自身時
+ *   （`logicalBase == realBase`，如 `["toybox", "id"]`）不插入，spawn 為
+ *   `[real, ...snapshot.drop(1)]`（`drop(1)` 首位即 applet，不重插；否則形成
+ *   `[real, "toybox", "id"]` 錯誤形）。
  * - 本檔案零 Android 依賴，JVM 單測可直接斷言；產品 runner 經
  *   [RootSuRunner]/[ShizukuShellRunner] 強制調用（預設即真查 FS，不可繞過）。
  *
@@ -111,6 +116,9 @@ internal object ElevatedExecPolicy {
             )
             // F1：注入回傳再驗證（與內建路徑同閘）。entryRoot 取回傳路徑的
             // lexical parent；spawn 用驗證後實體（防映射回傳 link／可寫目標）。
+            // P2-7 parity：applet 不採信映射自帶字串（值與 null 性皆以快照
+            // basename × 實體 basename 重算：multicall 別名形才攜 applet，
+            // 主程式自身一律 null，防 `[real, "toybox", ...]` 重插）。
             val rawPath = exec.path.trim()
             if (rawPath.isEmpty() || rawPath.contains('\u0000')) {
                 return ShellExecutables.ResolveOutcome.Denied(
@@ -143,7 +151,20 @@ internal object ElevatedExecPolicy {
                     failure ?: ShellExecutables.ResolveDeny.NOT_FOUND,
                 )
             }
-            return ShellExecutables.ResolveOutcome.Ok(exec.copy(path = real))
+            // P2-7：以快照 basename × 驗證後實體重算 applet（見上註解）。
+            val logicalBase = ShellPolicy.basename(snapshotArgv0.trim())
+            val realBase = real.substringAfterLast('/')
+            val fixedApplet =
+                if (realBase in ShellExecutables.MULTICALL_BINARIES &&
+                    logicalBase.isNotEmpty() && logicalBase != realBase
+                ) {
+                    logicalBase
+                } else {
+                    null
+                }
+            return ShellExecutables.ResolveOutcome.Ok(
+                ShellExecutables.ResolvedExec(real, fixedApplet),
+            )
         }
         val outcome = try {
             ShellExecutables.resolveDetailed(
@@ -175,23 +196,38 @@ internal object ElevatedExecPolicy {
     /**
      * 快照＋已固定目標 → spawn argv（不再含原始 `argv[0]`）：
      * - 非 multicall（`resolved.applet == null`）：`[real, ...snapshot.drop(1)]`；
-     * - multicall（實體 basename ∈ [ShellExecutables.MULTICALL_BINARIES]）：
+     * - multicall 別名形（實體 basename ∈ [ShellExecutables.MULTICALL_BINARIES]
+     *   「且」快照 basename ≠ 實體 basename，即經 symlink／別名呼叫）：
      *   `[real, applet, ...snapshot.drop(1)]`，其中 `applet` 取快照 `argv[0]` 的
-     *   basename（[ShellPolicy.basename]，已過黑名單／衛生門），不採信映射自帶
-     *   字串（自訂映射不得注入未過審的 applet 名，與直接通道 [RestrictedShell]
-     *   同策）。
+     *   basename（[ShellPolicy.basename]，已過黑名單／衛生門＋applet 黑名單），
+     *   不採信映射自帶字串（自訂映射不得注入未過審的 applet 名，與直接通道
+     *   [RestrictedShell] 同策）；
+     * - multicall 主程式自身（快照 basename == 實體 basename，如
+     *   `["toybox", "id"]`）：不插入，為 `[real, ...snapshot.drop(1)]`
+     *  （`drop(1)` 首位即 applet；陳舊 `ResolvedExec` 攜非 null applet 亦不重插，
+     *   縱深防禦）。
      * 操作數（`drop(1)`）取自同一快照，原樣透傳，不重寫、不放寬。
+     *
+     * TODO(#136-B3): B3 子命令 allowlist（`cmd`／`package` 等未知二進位的子命令
+     * 審查）在此擴充 applet／子命令位置審查；本函數只做黑名單 parity，不放寬。
      */
     fun toSpawnArgv(
         snapshot: ElevatedCommandSnapshot,
         resolved: ShellExecutables.ResolvedExec,
     ): List<String> {
         val applet = resolved.applet
-        return if (applet != null) {
-            val validatedApplet = ShellPolicy.basename(snapshot.argv[0])
-            listOf(resolved.path, validatedApplet) + snapshot.argv.drop(1)
-        } else {
-            listOf(resolved.path) + snapshot.argv.drop(1)
+        if (applet == null) {
+            return listOf(resolved.path) + snapshot.argv.drop(1)
         }
+        // P2-7 parity 縱深：即使陳舊映射攜非 null applet，主程式自身一律不插。
+        val realBase = resolved.path.substringAfterLast('/')
+        val logicalBase = ShellPolicy.basename(snapshot.argv[0])
+        if (realBase !in ShellExecutables.MULTICALL_BINARIES || logicalBase == realBase) {
+            return listOf(resolved.path) + snapshot.argv.drop(1)
+        }
+        if (logicalBase.isEmpty()) {
+            return listOf(resolved.path) + snapshot.argv.drop(1)
+        }
+        return listOf(resolved.path, logicalBase) + snapshot.argv.drop(1)
     }
 }

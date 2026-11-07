@@ -156,11 +156,14 @@ class ShellQuota(
  * 縮小驗過→spawn 窗口；見 [executeResolved] 殘餘揭露）→
  * 建子進程（argv[0] 已改寫為固定絕對路徑 + [ShellExecutables.CLEAN_ENV]
  * 乾淨 env + cwd 釘死到 [privateRoot]）→ 超時殺 → 輸出截斷。
- * spawn 固定形態：非 multicall 為 `[real, ...args]`；實體 basename 落
- * [ShellExecutables.MULTICALL_BINARIES]（toybox / toolbox / busybox）時為
- * `[real, applet, ...args]`，其中 `applet` 取白名單放行值（`Allowed.binary`，
- * 即 `argv[0]` 的 basename），還原被 link 吞掉的子命令名
- * （Android toybox 下 `ls -l` 不得丟成 `toybox -l`）。
+ * spawn 固定形態（P2-7 parity）：非 multicall 別名形為 `[real, ...args]`；
+ * 實體 basename 落 [ShellExecutables.MULTICALL_BINARIES]（toybox / toolbox /
+ * busybox）「且」白名單放行值（`Allowed.binary`，即 `argv[0]` 的 basename）
+ * 與實體 basename 不同（經 symlink／別名呼叫）時為 `[real, applet, ...args]`，
+ * 其中 `applet` 取白名單放行值，還原被 link 吞掉的子命令名
+ * （Android toybox 下 `ls -l` 不得丟成 `toybox -l`）；主程式自身
+ * （`binary == realBase`，如 `["toybox", "id"]`）不插入（`args` 首位即 applet，
+ * 否則形成 `[real, "toybox", "id"]` 錯誤形；陳舊映射攜非 null 亦不重插）。
  * 策略拒絕、映射拒絕與配額拒絕一律不建子進程；提權執行不在此類（見 [ElevatedShellRunner]）。
  * 操作數 schema（`--opt=value`、短旗標合併、取值旗標值槽、grep pattern 槽）
  * 沿 [ShellPolicy] 既有嚴格語義，本類不放寬、不重寫。
@@ -327,11 +330,16 @@ class RestrictedShell(
         // spawn 固定形態：argv[0] 已改寫為驗證後實體路徑（可執行目標不再由
         // OS 經 `PATH`/cwd 解析）+ 乾淨 env（固定 `PATH`、無危險變數，
         // 不繼承宿主）。操作數（drop(1)）原樣傳遞，不重寫、不放寬。
-        // multicall（resolved.applet 非 null，即實體為 toybox/toolbox/busybox）
-        // 時在 argv[1] 補回白名單放行值 `binary`（即 argv[0] 的 basename），
-        // 還原被 link 吞掉的子命令名；此處用 validate 回傳值而非映射自帶字串，
-        // 自訂映射不得注入未過白名單的 applet 名。非 multicall 不插入。
-        val spawnArgv = if (resolved.applet != null) {
+        // multicall 別名形（resolved.applet 非 null「且」binary ≠ 實體 basename，
+        // 即經 symlink／別名呼叫）時在 argv[1] 補回白名單放行值 `binary`
+        // （即 argv[0] 的 basename），還原被 link 吞掉的子命令名；此處用
+        // validate 回傳值而非映射自帶字串，自訂映射不得注入未過白名單的
+        // applet 名。主程式自身（binary == 實體 basename）與非 multicall
+        // 不插入（P2-7 parity 縱深：陳舊映射攜非 null 亦不重插）。
+        val realBase = resolved.path.substringAfterLast('/')
+        val spawnArgv = if (resolved.applet != null &&
+            realBase in ShellExecutables.MULTICALL_BINARIES && binary != realBase
+        ) {
             listOf(resolved.path, binary) + argv.drop(1)
         } else {
             listOf(resolved.path) + argv.drop(1)

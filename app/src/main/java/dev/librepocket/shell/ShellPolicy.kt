@@ -117,6 +117,35 @@ object ShellPolicy {
         argv0.substringAfterLast('/').substringAfterLast('\\')
 
     /**
+     * P2-7 multicall applet 黑名單（直接／提權 parity，僅黑名單不放寬）。
+     *
+     * dispatcher（toybox／toolbox／busybox）經主程式自身呼叫時 `argv[1]` 為
+     * applet 名（如 `["toybox", "sh"]`），其語義等同 `argv[0]` 為該二進位，
+     * 故同樣受 [DENIED_BINARIES] 約束，否則 `sh`／`rm`／`su` 可繞過 `argv[0]`
+     * 黑名單。命中即 `BLACKLISTED`（直接通道 `["toybox", "sh"]` 即使無此門亦
+     * 會以 `NOT_WHITELISTED` 拒，但此處顯式 `BLACKLISTED` 以與提權一致，且防
+     * 未來白名單放寬 `toybox` 時回退；提權通道無白名單，此門為唯一 applet 閘）。
+     * 只查 `DENIED_BINARIES`（全文片段／特殊字元已由全 argv 掃描覆蓋，不在此重檢）。
+     * `argv.size < 2`（如 `["toybox"]` 無 applet）回 null（交後續門處理；空
+     * applet 形僅印 help，無提權／破壞語義）。
+     *
+     * TODO(#136-B3): B3 子命令 allowlist（`cmd`／`package`／`uninstall` 類未知
+     * 二進位的子命令審查）在此擴充 applet／子命令位置審查；本 PR 只做黑名單
+     * parity，不做 allowlist、不放寬。
+     */
+    private fun multicallAppletDenial(argv: List<String>): Validation.Denied? {
+        if (argv.size < 2) return null
+        val base = basename(argv[0].trim())
+        if (base !in ShellExecutables.MULTICALL_BINARIES) return null
+        val applet = basename(argv[1].trim())
+        if (applet.isEmpty()) return null
+        if (applet in DENIED_BINARIES) {
+            return Validation.Denied(ShellDeny.BLACKLISTED, "applet denied: $applet")
+        }
+        return null
+    }
+
+    /**
      * 會把 positional 參數當檔案路徑的二進位（P0 binary-aware，PR#1 re-review）。
      * 這些二進位的非旗標 bare word 即相對路徑，必須 fail-closed（要求絕對路徑）。
      */
@@ -210,7 +239,9 @@ object ShellPolicy {
     }
 
     /**
-     * 校驗：依次判空 → 黑名單（二進位/全文片段/特殊字元）→ 白名單
+     * 校驗：依次判空 → 黑名單（二進位/全文片段/特殊字元）→ multicall applet
+     * 黑名單（P2-7：`argv[0]` 為 toybox／toolbox／busybox 主程式自身時 `argv[1]`
+     * 同樣受黑名單約束，見 [multicallAppletDenial]）→ 白名單
      * → argv[0] 可信路徑門（同名不同路徑封堵，詞法；僅直接通道，
      *   guest 跳過——guest argv[0] 是容器命名空間路徑）→ find 高危謂詞
      * → 檔案域（絕對路徑經 [FileScope.decide] 詞法門 + [checkPhysicalOperandGate]
@@ -284,6 +315,9 @@ object ShellPolicy {
                 return Validation.Denied(ShellDeny.BAD_ARGUMENT, "NUL byte denied")
             }
         }
+        // P2-7 multicall applet 黑名單（直接通道 parity：BLACKLISTED 優先於
+        // NOT_WHITELISTED，見 [multicallAppletDenial]）。
+        multicallAppletDenial(argv)?.let { return it }
         if (base !in allowedBinaries) {
             return Validation.Denied(ShellDeny.NOT_WHITELISTED, "not whitelisted: $base")
         }
@@ -360,7 +394,8 @@ object ShellPolicy {
      * 提權通道校驗（S3，BACKLOG D09，矩陣 §3）。
      *
      * 與 [validate] 的差異只有兩處，其餘（空命令 → 黑名單二進位/全文片段 →
-     * 參數衛生 → argv[0] 可信路徑詞法門 → find 高危謂詞 → 檔案域）完全同序：
+     * 參數衛生 → multicall applet 黑名單（P2-7，直接／提權同序同策）→
+     * argv[0] 可信路徑詞法門 → find 高危謂詞 → 檔案域）完全同序：
      * - 跳過白名單門禁：白名單外的二進位僅允許走提權通道（Shizuku/Root），
      *   直接 exec 仍拒（[validate] 維持原判）；
      * - 檔案域改走提權語義：私有域 / 已授權 SAF 直行（呼叫方應優先走
@@ -418,6 +453,9 @@ object ShellPolicy {
                 return Validation.Denied(ShellDeny.BAD_ARGUMENT, "NUL byte denied")
             }
         }
+        // P2-7 multicall applet 黑名單（提權通道：無白名單，此門為唯一 applet 閘；
+        // 與直接通道同序同策，見 [multicallAppletDenial]）。
+        multicallAppletDenial(argv)?.let { return it }
         // argv[0] 可信路徑門（P1-1，提權與直接同等詞法門，host-only）：
         // 含 `/`/`\` 的寫法父目錄必須在可信系統目錄內，否則同名不同路徑的假
         // 二進位（`/data/local/tmp/cat`）可憑 basename 通過白名單（提權無白名單

@@ -9,9 +9,11 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 /**
@@ -25,6 +27,23 @@ class ElevatedRunnerP2Test {
 
     private val privateRoot = "/data/data/files"
 
+    /**
+     * 終審殘留隔離（Phase 1 P1-1）：每用例首尾歸零 consecutive＋輪詢收斂
+     * outstanding/active，避免同 JVM 內熔斷污染後測。
+     * （測試隔離重置，非#136-B3修復；不升級 noteClean 可見性。）
+     */
+    @Before fun setUpBreakerIsolation() {
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+    }
+
+    @After fun tearDownBreakerIsolation() {
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+    }
+
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {
         val deadline = System.currentTimeMillis() + boundMs
         while (ElevatedCleanupTracker.outstanding() != expected) {
@@ -34,6 +53,18 @@ class ElevatedRunnerP2Test {
                 )
             }
             Thread.sleep(50L)
+        }
+    }
+
+    private fun pollActiveTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.activeCalls() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "active=${ElevatedCleanupTracker.activeCalls()} expected=$expected",
+                )
+            }
+            Thread.sleep(20L)
         }
     }
 

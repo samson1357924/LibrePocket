@@ -14,10 +14,12 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.Job
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 /**
@@ -28,6 +30,23 @@ import org.junit.Test
 class ElevatedRunnerB2Test {
 
     private val privateRoot = "/data/data/dev.librepocket.agent/files"
+
+    /**
+     * 終審殘留隔離（Phase 1 P1-1）：每用例首尾歸零 consecutive＋輪詢收斂
+     * outstanding/active，避免同 JVM 內熔斷污染後測。
+     * （測試隔離重置，非#136-B3修復；不升級 noteClean 可見性。）
+     */
+    @Before fun setUpBreakerIsolation() {
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+    }
+
+    @After fun tearDownBreakerIsolation() {
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+    }
 
     // ---- 1. su exit 語義：拒絕/exit≠0 不回 Ok；stderr redacted ----
 
@@ -256,6 +275,8 @@ class ElevatedRunnerB2Test {
     }
 
     @Test fun binaryChannelPreservesNonUtf8() {
+        // Phase 1 註記：9B 非 UTF-8 用例斷 runner 位元組直達（runBinary 原樣回傳），
+        // 非 capture 語義（capture 另有 PNG 輕量門＋truncated→null，不在此斷）。
         // PNG 頭＋0xFF/0x00：經 String 往返必損毀。
         val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0xFF.toByte(), 0x00, 0x01)
         val shizuku = ShizukuShellRunner(
@@ -289,6 +310,7 @@ class ElevatedRunnerB2Test {
 
     @Test fun framebufferPrefersBinaryChannel() {
         // B4：screencap 側須過 PNG 輕量門，故用合法 PNG（sig＋fill＋IEND）。
+        // 輕量門代理（sig＋IEND），非解碼保證：僅證門通過＋位元組直達，不證圖片可解碼。
         val png = RootFramebufferCapture.PNG_SIGNATURE +
             byteArrayOf(0xFF.toByte(), 0x00) +
             byteArrayOf(
@@ -515,6 +537,18 @@ class ElevatedRunnerB2Test {
                 )
             }
             Thread.sleep(50L)
+        }
+    }
+
+    private fun pollActiveTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.activeCalls() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "active=${ElevatedCleanupTracker.activeCalls()} expected=$expected",
+                )
+            }
+            Thread.sleep(20L)
         }
     }
 
@@ -817,6 +851,8 @@ class ElevatedRunnerB2Test {
         )
         val sr = shizuku.run(ElevatedRequest(argv, "P3-T"), 2_000L)
         assertTrue("$sr", sr is ShellResult.Denied)
+        // Phase 1 註記：/sdcard 路徑先命中 validate 跨域拒（BLACKLISTED），未走到橋門；
+        // 橋門文案 "privilege bridge off" 由 GrantTest 無路徑命令（id/getprop）鎖定，此處只斷 Denied＋零 spawn。
         assertEquals(0, shizukuSpawns)
 
         var rootSpawns = 0

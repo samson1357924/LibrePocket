@@ -53,10 +53,38 @@ class ElevatedRunnerZ1Test {
      */
     @Before fun setUpBreakerIsolation() {
         ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
     }
 
     @After fun tearDownBreakerIsolation() {
         ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+    }
+
+    private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.outstanding() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "outstanding=${ElevatedCleanupTracker.outstanding()} expected=$expected",
+                )
+            }
+            Thread.sleep(50L)
+        }
+    }
+
+    private fun pollActiveTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.activeCalls() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "active=${ElevatedCleanupTracker.activeCalls()} expected=$expected",
+                )
+            }
+            Thread.sleep(20L)
+        }
     }
 
     /** (a) 專用：destroy 吞 interrupt 續等 latch（釋放前永不返回）。 */
@@ -529,6 +557,7 @@ class ElevatedRunnerZ1Test {
             val audit = PrivilegeAuditLog()
             // B4：capture screencap 側須過 PNG 輕量門，故 capture 用乾淨合法 PNG
             // spawn（latch 已釋放，stdin 不再阻塞），斷非 null。
+            // 輕量門代理（sig＋IEND），非解碼保證：僅證門通過，不證圖片可解碼。
             val png = RootFramebufferCapture.PNG_SIGNATURE +
                 "z1-ok".toByteArray() +
                 byteArrayOf(

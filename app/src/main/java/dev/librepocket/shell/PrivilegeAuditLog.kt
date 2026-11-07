@@ -27,7 +27,9 @@ import java.security.MessageDigest
  * 環形緩衝；加欄位時須同步更新 data-class 相等斷言與禁明文測試。
  *
  * Phase 5 B5 verdict 坍縮（詳見二進位側 `verdict()` KDoc「verdict 坍縮表」）：
- * `QUOTA_EXCEEDED` 四因同碼、`TimedOut` 含取消與超時、`Res.Err` 在 su 路徑
+ * `QUOTA_EXCEEDED` 四因同碼、`TimedOut` 含取消與超時、tail 取消／超時
+ * （R2-PhaseC P2-2：finished 但 `tailIncomplete` 即 `TimedOut`，不再回 Ok）→
+ * `TIMEOUT`、`Res.Err` 在 su 路徑
  * 與政策門路徑不對稱（`Failed` vs `Denied`）。本表只記四碼 verdict，
  * 坍縮原因須看拒絕訊息／`cleanupIncomplete` 上下文，不得僅看本表 verdict。
  *

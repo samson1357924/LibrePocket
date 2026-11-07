@@ -188,6 +188,12 @@ interface BinaryElevatedRunner : ElevatedShellRunner {
  *   `TimedOut`（空 partial、`cleanupIncomplete=false` 若未建進程；
  *   spawn 逾期／kill 殘留則 `cleanupIncomplete=true`）。取消與超時在
  *   verdict 層不可區分，排障須看 `cleanupIncomplete`＋上下文；
+ * - tail 取消／超時（R2-PhaseC P2-2）：finished（命令已 exit 0）但 tail 未排空
+ *   （取消／deadline／tail budget 致 gobbler 中斷＋殘留，`Drained.tailIncomplete`）
+ *   → `TimedOut`（攜 partial＋truncated＋cleanupIncomplete），不再回 Ok；
+ *   上層僅看 Ok 即完成、`auditAndExtract` truncated-Ok→null 皆不再誤判，審計記
+ *   `TIMEOUT`（非 `OK`）。`readFailed`／非零 exit 的 tail 中斷仍走既有 `Failed`
+ *   （皆非 Ok，安全；只有 would-be Ok 才升級，不新增 verdict 常數）；
  * - `Res.Err` 不對稱（刻意）：su 探測抛（`suExists`／`suBinary` 阻塞體 Err）
  *   → `Failed("su unavailable...")`（可用性語義，回落免 Root 路徑）；
  *   grant／activation／bridge／status 阻塞體 Err → `Denied(NOT_WHITELISTED)`

@@ -56,6 +56,21 @@ class ElevatedVerdictMappingTest {
         )
     }
 
+    @Test fun tailCancelTimedOutMapsToTimeout() {
+        // R2-PhaseC P2-2：tail 取消／超時升級的 TimedOut（攜 partial＋truncated＋
+        // cleanupIncomplete，不再是 Ok）雙映射同為 TIMEOUT（審計非 OK）。
+        assertConsistent(
+            ElevatedBinaryResult.TimedOut(
+                "partial".toByteArray(),
+                ByteArray(0),
+                10_000L,
+                true,
+                true,
+            ),
+            "TIMEOUT",
+        )
+    }
+
     @Test fun failedMapsToFailed() {
         assertConsistent(
             ElevatedBinaryResult.Failed("boom"),

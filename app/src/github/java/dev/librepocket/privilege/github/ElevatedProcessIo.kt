@@ -606,6 +606,34 @@ internal object ElevatedCallSupervisor {
     )
 
     /**
+     * R2-PhaseC P2-1 caller-safe 取消位有界求值（spawn 前三門專用）：
+     * - 呼叫執行緒永不直接求值 hook：[cancelCheck] 只看自身中斷＋deadline，
+     *   hook 本體跑 worker。blocking supplier（latch／Binder stall 充當 cancel）
+     *   只卡 worker，呼叫方經 deadline＋grace 有界回 `Expired`，不斷 timeout 上界；
+     * - 快路徑（首 [POLL_MS] 內回）不額外動作，B2 計數語義不變；
+     * - hook 抛 → `Err`（呼叫方 fail-closed 視為已取消＋計數，不誤放行）；
+     * - lingering（grace 後仍存活）記槽＋`noteUnclean`（同 [awaitPreSpawn]，
+     *   無 drain 終審故此處直接計入 breaker）；`Expired.hasLinger` 在 pre-spawn
+     *   非 spawn 語境下呼叫方一律映射 `preSpawnExpired(false)`（無 Process 資源，
+     *   殘留已由 outstanding／breaker 追蹤，見 [ElevatedRunnerCommon]）。
+     *
+     * 與 [awaitPreSpawn] 的差異：後者的 `cancelCheck` 在呼叫執行緒每片調 hook，
+     * hook 阻塞即呼叫執行緒跟著卡（慢阻塞體＋壞 hook 下無界）。三門檢查必須經
+     * 本函數（或等效「hook 只跑 worker」包裝），不得直調 hook，亦不得經
+     * [awaitPreSpawn] 包 `isCancelled()`（同樣在呼叫側求值 hook）。
+     */
+    fun awaitCancelBit(
+        deadlineNanos: Long,
+        isCancelled: () -> Boolean,
+    ): Res<Boolean> = awaitInternal(
+        deadlineNanos = deadlineNanos,
+        cancelCheck = { Thread.currentThread().isInterrupted || isExpired(deadlineNanos) },
+        block = { isCancelled() },
+        threadName = "elevated-supervisor",
+        markUncleanOnLinger = true,
+    )
+
+    /**
      * drain 輪詢 `waitFor(slice)` 單片有界（B3，Binder 同步 stall 即此卡住）：
      * - `isCancelled` 抛折為未取消（drain 語義，不誤殺，計數同上）；
      * - 超界（cancel／deadline／worker stall）即 `Expired`，呼叫方走 kill 路徑；
@@ -1253,6 +1281,21 @@ internal object ElevatedProcessIo {
          * verdict 已回 Failed，避免數據錯誤誤觸熔斷。
          */
         val cleanupIncomplete: Boolean = false,
+        /**
+         * R2-PhaseC P2-2 tail 未完成旗標（命令 exit vs 整個 request finished 分開）：
+         * `finished`（`waitFor` 回 true，命令已 exit）只代表子進程退出，不代表
+         * 整個 request 完成（雙流排空＋exitValue 讀回）。finished 路徑 tail（雙
+         * gobbler joins 共享 tail budget）在取消（`isCancelled`／呼叫執行緒中斷）／
+         * 超時（主 deadline／tail budget 耗盡）下中止（gobbler 中斷＋殘留，
+         * `joinIncomplete` 同置）即 true；kill 路徑（`!finished`）永 false
+         * （`timedOut` 已覆蓋）；stdin-closer 殘留不置本旗標（流已排空，輸出完整，
+         * 見 AB1 linger-success 仍 Ok）。
+         * runner 映射：would-be Ok（exit 0 且無 [readFailed]）→ `TimedOut`
+         * （攜 partial＋truncated＋cleanupIncomplete），不再回 Ok；`readFailed`／
+         * 非零 exit 的 tail 中斷仍走既有 `Failed`（皆非 Ok，安全；Y1 readFailed
+         * pin 保留，只有 would-be Ok 才升級，不新增 verdict 常數）。
+         */
+        val tailIncomplete: Boolean = false,
     )
 
     fun drain(
@@ -1283,6 +1326,11 @@ internal object ElevatedProcessIo {
      * coroutine 呼叫方應傳 `isCancelled = { !job.isActive }`
      * （或 `!coroutineContext.isActive`）；鉤抛異常折為未取消（fail-closed，
      * 刻意靜默：外部鉤异常不得誤殺，計數見 [swallowedIsCancelledThrows]）。
+     *
+     * R2-PhaseC P2-2 finished 語義（命令 exit vs 整個 request finished 分開）：
+     * `finished`（`waitFor` 回 true）只代表命令已 exit；tail（雙流排空）因取消／
+     * 超時中止即 [Drained.tailIncomplete]=true（`timedOut` 仍為 `!finished` 不動，
+     * 命令 exit 語義不動），runner 側 would-be Ok 升級 TimedOut（見兩 runner）。
      */
     fun drain(
         process: Process,
@@ -1488,6 +1536,11 @@ internal object ElevatedProcessIo {
         // gobbler 有界 join 未完成標記：任一 join 超界/中斷後執行緒仍存活即部分讀，
         // 經 Drained.truncated 帶出（絕不靜默短讀不標）。
         var joinIncomplete = false
+        // R2-PhaseC P2-2：finished 路徑 tail 中止（取消／超時致 gobbler 中斷＋殘留）
+        // 即 true（與 joinIncomplete 同置三處，見下；kill 路徑永 false）。
+        // 命令 exit（finished）vs 整個 request finished 分開：本旗標真即 request 未完，
+        // runner 側 would-be Ok 升級 TimedOut（見兩 runner P2-2 分支）。
+        var tailIncomplete = false
         // Z1 清理不完整旗標：kill 監督未完成或 stdin-closer 尾收殘留即 true
         //（runner verdict 映射不變，僅供 #136-B3 監測）。
         // P1-3：kill 終審推遲到尾收後（gobbler／stdin linger 亦計入，避免少計）。
@@ -1589,11 +1642,12 @@ internal object ElevatedProcessIo {
             var tailAborted = false
             fun joinFinishedTail(t: Thread, counted: AtomicInteger) {
                 if (tailAborted) {
-                    // 前一流已因取消／逾期 abort：本流不再等，直接中斷＋雙旗＋記槽。
+                    // 前一流已因取消／逾期 abort：本流不再等，直接中斷＋三旗＋記槽。
                     if (t.isAlive) {
                         runCatching { t.interrupt() }
                         joinIncomplete = true
                         cleanupIncomplete = true
+                        tailIncomplete = true
                         ElevatedCleanupTracker.markLingering(t, counted)
                     }
                     return
@@ -1614,6 +1668,7 @@ internal object ElevatedProcessIo {
                         runCatching { t.interrupt() }
                         joinIncomplete = true
                         cleanupIncomplete = true
+                        tailIncomplete = true
                         ElevatedCleanupTracker.markLingering(t, counted)
                         tailAborted = true
                         return
@@ -1644,6 +1699,7 @@ internal object ElevatedProcessIo {
                     if (t.isAlive) {
                         joinIncomplete = true
                         cleanupIncomplete = true
+                        tailIncomplete = true
                         ElevatedCleanupTracker.markLingering(t, counted)
                     }
                 }
@@ -1729,6 +1785,9 @@ internal object ElevatedProcessIo {
             // 已先回 TimedOut，runner 側按 finished 區分語義，見 Drained.readFailed）。
             readFailed = out.failed || err.failed,
             cleanupIncomplete = cleanupIncomplete,
+            // R2-PhaseC P2-2：finished tail 中止原樣帶出（runner 側 would-be Ok
+            // 升級 TimedOut；`timedOut` 本體仍為 `!finished`，命令 exit 語義不動）。
+            tailIncomplete = tailIncomplete,
         )
     }
 
@@ -1980,6 +2039,16 @@ internal object ElevatedRunnerCommon {
      * 承擔——supervisor 入口 preflight（[ElevatedCallSupervisor]）、quota 後
      * 提交前檢查、runner 入口 `safeTimeoutMs<=0` 早拒（見兩 runner），逾期映射
      * 一律經 [preSpawnExpired]（`hasLinger` 決定旗標）。
+     *
+     * R2-PhaseC P2-1 取消 hook 不可阻塞契約（產品＋測試一律遵守）：
+     * hook 必須是本地原子快照（`Thread.isInterrupted`／`Job.isActive` 一類，
+     * µs 回、永不阻塞；抛仍 fail-closed 計數並視為已取消）。禁止在 hook 內做
+     * blocking store 查詢（DataStore／Binder／latch 等充當 cancel）：產品須在
+     * IO dispatcher 側快照後傳值、本 runner 側只消費無阻塞 supplier；違約 supplier
+     * 由 [checkPreSpawnCancel] 有界兜底（Expired→preSpawnExpired，不斷 timeout
+     * 上界）。drain／supervisor 慢路徑輪詢仍假定 hook 非阻塞（違約下呼叫側跟著
+     * 卡，見 [ElevatedCallSupervisor.awaitCancelBit] 差異說明）；三門檢查一律經
+     * [checkPreSpawnCancel]，不得直調本函數（入口在 deadline 前，直調即無界）。
      */
     internal fun isPreSpawnCancelled(isCancelled: () -> Boolean): Boolean {
         if (Thread.currentThread().isInterrupted) return true
@@ -1988,6 +2057,34 @@ internal object ElevatedRunnerCommon {
         } catch (_: Exception) {
             runCatching { ElevatedProcessIo.swallowedIsCancelledThrows.incrementAndGet() }
             true
+        }
+    }
+
+    /**
+     * R2-PhaseC P2-1 spawn 前取消有界門（兩 runner 入口＋配額前／後三點共用）：
+     * 經 [ElevatedCallSupervisor.awaitCancelBit] 求值（hook 只跑 worker，呼叫側
+     * 只看自身中斷＋deadline），blocked hook 不能無限卡 caller。
+     * - 中斷（不清旗標）／`Ok(true)`／`Err`（hook 抛，fail-closed＋計數）→
+     *   `TimedOut`（空 partial，`cleanupIncomplete=false`；無進程故無殘留，非
+     *   spawn 語境殘留 worker 已由 outstanding／breaker 追蹤，`hasLinger` 不穿透）；
+     * - `Expired`（hook 阻塞至 deadline／grace，或 budget 耗盡）→ 同上 `TimedOut`
+     *   （有界返回，不斷 timeout 上界）；
+     * - `Ok(false)` → null（未取消，呼叫方繼續）。
+     * 呼叫形：`checkPreSpawnCancel(timeoutMs, deadlineNanos, isCancelled)?.let { return it }`。
+     */
+    internal fun checkPreSpawnCancel(
+        timeoutMs: Long,
+        deadlineNanos: Long,
+        isCancelled: () -> Boolean,
+    ): ElevatedBinaryResult.TimedOut? {
+        if (Thread.currentThread().isInterrupted) return preSpawnExpired(timeoutMs, false)
+        return when (val r = ElevatedCallSupervisor.awaitCancelBit(deadlineNanos, isCancelled)) {
+            is ElevatedCallSupervisor.Res.Ok -> if (r.v) preSpawnExpired(timeoutMs, false) else null
+            is ElevatedCallSupervisor.Res.Err -> {
+                runCatching { ElevatedProcessIo.swallowedIsCancelledThrows.incrementAndGet() }
+                preSpawnExpired(timeoutMs, false)
+            }
+            is ElevatedCallSupervisor.Res.Expired -> preSpawnExpired(timeoutMs, false)
         }
     }
 

@@ -397,12 +397,16 @@ class ElevatedRunnerPhase3HardeningTest {
             val start = System.currentTimeMillis()
             val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-TAIL"), 300L)
             val elapsed = System.currentTimeMillis() - start
-            // 已 exit：finished 路徑（非 TimedOut），舊碼雙 10s joins 可釘 20s＋，
+            // 已 exit：舊碼走 finished 路徑回 Ok（雙 10s joins 可釘 20s＋），
             // 現 tail 共享 2s（此處剩餘 ≈300ms 即收）。
+            // R2-PhaseC P2-2：finished 但 tail 超時（剩餘 budget 耗盡，流仍不 EOF，
+            // `Drained.tailIncomplete`）→ TimedOut（攜 partial＋truncated＋
+            // cleanupIncomplete），不再回 Ok（舊鎖 Ok 斷言在此修正；exit=0 但流卡住
+            // 不得宣告工具完成，審計記 TIMEOUT）。
             assertTrue("elapsed=$elapsed must be far below legacy 20s tail", elapsed < 8_000L)
-            assertTrue("$b", b is ElevatedBinaryResult.Ok)
-            b as ElevatedBinaryResult.Ok
-            assertEquals(0, b.exitCode)
+            assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
+            b as ElevatedBinaryResult.TimedOut
+            assertEquals("TIMEOUT", b.verdict())
             assertTrue("stuck streams must truncate", b.truncated)
             assertTrue("stuck streams must flag incomplete", b.cleanupIncomplete)
             // 雙流同持 2 槽。
@@ -464,10 +468,13 @@ class ElevatedRunnerPhase3HardeningTest {
             assertFalse("tail must abort on cancel", bg.isAlive)
             assertTrue("elapsed=$elapsed", elapsed < 8_000L)
             val b = resultRef.get()
-            // finished 已成立（取消落於 tail）：仍走 finished 路徑，中斷＋雙旗＋break。
-            assertTrue("$b", b is ElevatedBinaryResult.Ok)
-            b as ElevatedBinaryResult.Ok
-            assertEquals(0, b.exitCode)
+            // R2-PhaseC P2-2：取消落於 tail（finished 已成立）：tail 中止＋三旗
+            // （truncated＋cleanupIncomplete＋tailIncomplete）→ TimedOut（攜 partial），
+            // 不再回 Ok（舊鎖 Ok 斷言在此修正；exit=0 但流卡住不得宣告工具完成）。
+            assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
+            b as ElevatedBinaryResult.TimedOut
+            assertEquals("TIMEOUT", b.verdict())
+            assertTrue("cancelled tail must truncate", b.truncated)
             assertTrue("cancelled tail must flag incomplete", b.cleanupIncomplete)
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
         } finally {

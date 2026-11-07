@@ -166,8 +166,10 @@ import java.util.concurrent.TimeUnit
  * （配額拒、spawn 抛、drain 全路徑釋放）。
  *
  * B2 P1-4 spawn 前取消（owner 新 P1-4）：入口＋最後授權重驗後（配額前）＋
- * 配額→spawn 窗口三點經 [ElevatedRunnerCommon.isPreSpawnCancelled] 檢查
- * （Thread 中斷不清旗標或鉤真；鉤抛即已取消，未建 fail-closed），任一命中即
+ * 配額→spawn 窗口三點經 [ElevatedRunnerCommon.checkPreSpawnCancel] 有界檢查
+ * （R2-PhaseC P2-1：hook 只跑監督 worker，呼叫側只看中斷＋deadline；
+ * 直調語義見 [ElevatedRunnerCommon.isPreSpawnCancelled]——Thread 中斷不清旗標或
+ * 鉤真；鉤抛即已取消，未建 fail-closed），任一命中即
  * 零 spawn 回 `TimedOut`（空 partial，`cleanupIncomplete=false`，無進程故無殘留；
  * interrupt 原樣保留，不清除，不把已取消翻成未取消）。drain 層入口清中斷＋
  * 健康收尾語義不變（drain 不吞中斷，出口恢復），runner 層已取消一律不建
@@ -180,6 +182,21 @@ import java.util.concurrent.TimeUnit
  * 零 spawn：入口 `safeTimeoutMs<=0` 直回（不佔席不耗 quota）；quota 後提交前
  * 顯式 `isExpired`（配額已耗仍零 spawn）；supervisor 入口＋返回後雙確認。
  * [ElevatedRunnerCommon.isPreSpawnCancelled] 語義保留（不看 deadline）。
+ *
+ * R2-PhaseC P2-1 取消 hook 有界化（review P2-1）：首個 `isPreSpawnCancelled`
+ * 在 deadline 前直調 hook——blocking supplier（latch／Binder 充當 cancel）可卡
+ * caller 使 timeout 永不返回（甚至 `activeCalls==0` 尚未准入）。現 deadline 先算，
+ * 三門一律經 [ElevatedRunnerCommon.checkPreSpawnCancel]（hook 只跑 worker，
+ * Expired→preSpawnExpired 有界回）；hook 不可阻塞契約見該函數 KDoc
+ * （產品只用 `Job.isActive` 一類本地原子快取）。
+ *
+ * R2-PhaseC P2-2 tail verdict（review P2-2）：drain tail（finished 但流未排空）
+ * 期間取消／超時致 gobbler 中斷＋殘留（[ElevatedProcessIo.Drained.tailIncomplete]），
+ * finished 一經 true 不變回 false——舊 runner 只依 `raw.timedOut` 分支，exit=0 但
+ * 流卡住即回 `Ok(truncated=true, cleanupIncomplete=true)`，上層僅看 Ok 即宣告完成。
+ * 現 would-be Ok（exit 0 且無 readFailed）升級 `TimedOut`（攜 partial＋truncated＋
+ * cleanupIncomplete），不再回 Ok；`readFailed`／非零 exit 仍既有 `Failed`
+ * （皆非 Ok，安全）。審計記 TIMEOUT（見 verdict 坍縮表）。
  */
 class RootSuRunner(
     private val privateRoot: String? = null,
@@ -237,15 +254,10 @@ class RootSuRunner(
                 "unsupported flavor (github-only)",
             )
         }
-        // P1-4 spawn 前取消入口檢查（B2）：已取消（Thread 中斷不清旗標或
-        // isCancelled 真；鉤抛即已取消，未建 fail-closed）即零 spawn 回 TimedOut，
-        // 不進後續門／准入／配額／spawn；interrupt 原樣保留，不清除。
-        if (ElevatedRunnerCommon.isPreSpawnCancelled(isCancelled)) {
-            return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, false)
-        }
         // B3 單一 deadline（owner P1-5）：整個特權請求同一 budget（單調時鐘），
-        // 後續阻塞外部回呼（授權讀取／su 探測／spawn）＋drain 皆以剩餘為上界，
-        // 超界即 TimedOut（零 spawn／零殘留語義同既有取消，不耗 quota）。
+        // 後續阻塞外部回呼（授權讀取／su 探測／spawn）＋有界取消門＋drain 皆以
+        // 剩餘為上界，超界即 TimedOut（零 spawn／零殘留語義同既有取消，不耗 quota）。
+        // R2-PhaseC P2-1：deadline 先算（純算術，非阻塞），取消門才有界可依。
         val safeTimeoutMs = timeoutMs.coerceAtLeast(0L).coerceAtMost(Long.MAX_VALUE / 1_000_000L)
         val deadlineNanos = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(safeTimeoutMs)
         // P1-3 入口 preflight（PR140 Phase 2）：`safeTimeoutMs<=0` 即 budget 全無，
@@ -254,6 +266,13 @@ class RootSuRunner(
         if (safeTimeoutMs <= 0L) {
             return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, false)
         }
+        // P1-4 spawn 前取消入口檢查（B2＋R2-PhaseC P2-1 有界化）：已取消
+        // （Thread 中斷不清旗標或鉤真；鉤抛即已取消，未建 fail-closed）即零 spawn
+        // 回 TimedOut，不進後續門／准入／配額／spawn；interrupt 原樣保留，不清除。
+        // 有界：hook 只跑監督 worker（見 [ElevatedRunnerCommon.checkPreSpawnCancel]，
+        // 呼叫側只看中斷＋deadline），blocked hook（latch／Binder stall 充當 cancel）
+        // 經 Expired 有界回 preSpawnExpired，不斷 timeout 上界、不佔席。
+        ElevatedRunnerCommon.checkPreSpawnCancel(timeoutMs, deadlineNanos, isCancelled)?.let { return it }
         // B3 cheap 准入前置（owner P1-5）：可能阻塞的外部回呼前先占全域席
         //（[tryEnterReserved] 原子：飽和／熔斷／併發預留同一鎖內檢查＋佔席），
         // 拒絕不耗 quota、不占席外資源；阻塞體皆有界監督（見下），stall 即殘留
@@ -522,20 +541,17 @@ class RootSuRunner(
                     "untrusted executable: ${argvSnapshot[0].trim()} (reason=REVERIFY_MISMATCH)",
                 )
             }
-            // P1-4 spawn 前最終取消檢查（B2＋B3）：重驗後、配額前再驗一次，
-            // 中途取消／超界亦零新 spawn（不耗配額；已占席由 finally 釋放；interrupt 不清除）。
-            if (ElevatedRunnerCommon.isPreSpawnCancelled(isCancelled)) {
-                return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, false)
-            }
+            // P1-4 spawn 前最終取消檢查（B2＋B3＋R2-PhaseC P2-1 有界化）：重驗後、
+            // 配額前再驗一次，中途取消／超界／hook 阻塞亦零新 spawn（不耗配額；
+            // 已占席由 finally 釋放；interrupt 不清除；blocked hook 有界回，不多擋席位）。
+            ElevatedRunnerCommon.checkPreSpawnCancel(timeoutMs, deadlineNanos, isCancelled)?.let { return it }
             if (!quota.tryAcquire()) {
                 return ElevatedRunnerCommon.quotaExceeded()
             }
             // P1-4 spawn 競態收斂：配額→spawn 窗口再驗一次（配額已耗仍零 spawn，
             // 覆蓋 quota.acquire 後取消的窄競態；drain 層 isCancelled 輪詢只覆
-            // 已建進程，此處覆未建）。
-            if (ElevatedRunnerCommon.isPreSpawnCancelled(isCancelled)) {
-                return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, false)
-            }
+            // 已建進程，此處覆未建；R2-PhaseC P2-1 有界化同上）。
+            ElevatedRunnerCommon.checkPreSpawnCancel(timeoutMs, deadlineNanos, isCancelled)?.let { return it }
             // P1-3 quota 後顯式 deadline 檢查（PR140 Phase 2）：重驗→配額間 budget
             // 耗盡即零 spawn（配額已耗無 refund，fail-closed 窄競態，不建特權進程；
             // worker 從未啟動故 `hasLinger=false`）。[isPreSpawnCancelled] 語義保留
@@ -610,6 +626,22 @@ class RootSuRunner(
             val err = ShellPolicy.truncate(raw.stderr, errMaxBytes)
             val truncated = out.truncated || err.truncated || raw.truncated
             if (raw.timedOut) {
+                return ElevatedBinaryResult.TimedOut(
+                    partialStdout = out.bytes,
+                    partialStderr = err.bytes,
+                    timeoutMs = timeoutMs,
+                    truncated = truncated,
+                    cleanupIncomplete = raw.cleanupIncomplete,
+                )
+            }
+            // R2-PhaseC P2-2 tail 取消／超時升級：finished（命令已 exit 0）但 tail
+            // 未排空（取消／deadline／tail budget 致 gobbler 中斷＋殘留，
+            // `Drained.tailIncomplete`）→ TimedOut（攜 partial＋truncated＋
+            // cleanupIncomplete），不再回 Ok（exit=0 但流卡住不得宣告工具完成；
+            // 上層僅看 Ok 即完成、`auditAndExtract` truncated-Ok→null 皆不再誤判，
+            // 審計記 TIMEOUT）。`readFailed`／非零 exit 的 tail 中斷仍走既有
+            // Failed（皆非 Ok，安全；只有 would-be Ok 才升級，不新增 verdict 常數）。
+            if (raw.tailIncomplete && !raw.readFailed && raw.exitCode == 0) {
                 return ElevatedBinaryResult.TimedOut(
                     partialStdout = out.bytes,
                     partialStderr = err.bytes,

@@ -28,6 +28,24 @@ data class ElevatedRequest(
 )
 
 /**
+ * Phase 4（P2-1，PR #140）：入口防禦性凍結。
+ *
+ * 呼叫方可能傳入 `MutableList` 並保留引用，在 runner 執行期間
+ * （grant／status supplier 內）竄改內容；runner 內雖已用
+ * 快照，但審計若讀原始 `request.argv` 即讀到竄改後值。
+ * 本函數在入口即拷貝＋不可變包裝，後續 gate／執行／審計一律用
+ * 同一份凍結物件。拷貝本身可能因併發竄改抛
+ * [java.util.ConcurrentModificationException]（見 F9），故包
+ * runCatching，失敗回 null，呼叫方 fail-closed 拒絕且零 spawn。
+ */
+internal fun ElevatedRequest.frozenOrNull(): ElevatedRequest? = runCatching {
+    ElevatedRequest(
+        java.util.Collections.unmodifiableList(ArrayList(argv)),
+        reasonCode,
+    )
+}.getOrNull()
+
+/**
  * 提權執行器介面（僅介面）。D05 階段不提供真實現；
  * D09 在 foss/github 源集落地前，呼叫方應使用 [DenyingElevatedRunner]。
  */

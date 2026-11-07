@@ -6,6 +6,7 @@ import dev.librepocket.shell.PrivilegeAuditLog
 import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellExecTool
 import dev.librepocket.shell.ShellPolicy
+import dev.librepocket.shell.frozenOrNull
 import dev.librepocket.shell.ShellResult
 import dev.librepocket.tool.Projection
 import dev.librepocket.tool.ToolDef
@@ -24,10 +25,15 @@ object ElevatedDispatch {
     /**
      * 門禁先行、審計必行的提權執行。
      *
+     * Phase 4（P2-1，PR #140）：入口先凍結 [request]（見
+     * [dev.librepocket.shell.frozenOrNull]），同一凍結物件用於門禁
+     * reasonCode、執行與審計；凍結失敗即 `Denied(BLACKLISTED)` 且零
+     * spawn（審計以空 argv 記一筆 DENY）。
+     *
      * @param tool 必須是 `shell.elevated` 的 [ToolDef]（斷言防誤用）。
      * @param confirmed 當輪二次確認。
      * @param projection 投影（`privilege_bridge` 未開即 UNAVAILABLE，先擋）。
-     * @param request 提權請求（含 reasonCode，門禁與審計共用同一份）。
+     * @param request 提權請求（含 reasonCode，門禁與審計共用同一份凍結）。
      */
     fun execute(
         tool: ToolDef,
@@ -41,20 +47,28 @@ object ElevatedDispatch {
         require(tool.name == PrivilegeGate.ELEVATED_TOOL) {
             "ElevatedDispatch only serves ${PrivilegeGate.ELEVATED_TOOL}, not ${tool.name}"
         }
+        val frozen = request.frozenOrNull() ?: run {
+            val snapshotDenied = ShellResult.Denied(
+                ShellDeny.BLACKLISTED,
+                "elevated snapshot failed (fail-closed, no spawn)",
+            )
+            audit.record(emptyList(), request.reasonCode, PrivilegeAuditLog.verdictName(snapshotDenied))
+            return snapshotDenied
+        }
         val gate = PrivilegeGate.check(
             tool,
             confirmed,
             projection,
-            mapOf("reasonCode" to request.reasonCode),
+            mapOf("reasonCode" to frozen.reasonCode),
         )
         if (gate !is GateResult.Allowed) {
             val denied = ShellResult.Denied(
                 ShellDeny.NOT_WHITELISTED,
                 "privilege gate blocked: $gate",
             )
-            audit.recordResult(request, denied)
+            audit.recordResult(frozen, denied)
             return denied
         }
-        return ShellExecTool.executeElevated(request, runner, audit, timeoutMs)
+        return ShellExecTool.executeElevated(frozen, runner, audit, timeoutMs)
     }
 }

@@ -290,4 +290,52 @@ class ShellElevatedTest {
         assertEquals(0, audit.size())
         assertTrue(audit.countByVerdict().isEmpty())
     }
+
+    @Test fun audit_executeElevatedUsesFrozenSnapshotDespiteMidRunMutation() {
+        // Phase 4 P2-1：MutableList 在 run 期間被竄改，執行所見與審計雜湊
+        // 仍須是入口快照（["id"]），且與送 spawn 邏輯 argv 一致。
+        val audit = PrivilegeAuditLog()
+        val mutable = mutableListOf("id")
+        var seenByRunner: List<String>? = null
+        val tampering = object : ElevatedShellRunner {
+            override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult {
+                seenByRunner = request.argv.toList()
+                mutable.add("sh")
+                mutable[0] = "sh"
+                return ShellResult.Ok("ok", "", 0, false)
+            }
+        }
+        val result = ShellExecTool.executeElevated(ElevatedRequest(mutable, "D09-T"), tampering, audit)
+        assertTrue("$result", result is ShellResult.Ok)
+        assertEquals(listOf("id"), seenByRunner)
+        assertEquals(1, audit.size())
+        val row = audit.snapshot().single()
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), row.argvHash)
+        assertEquals(PrivilegeAuditLog.sha256Hex("D09-T"), row.reasonHash)
+        assertEquals(mapOf("OK" to 1), audit.countByVerdict())
+    }
+
+    @Test fun audit_executeElevatedSnapshotFailureDeniedWithoutSpawn() {
+        // Phase 4 F9：凍結拷貝抛（併發竄改）即 Denied 且零 spawn，仍寫一筆 DENY。
+        val audit = PrivilegeAuditLog()
+        var spawns = 0
+        val runner = object : ElevatedShellRunner {
+            override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult {
+                spawns++
+                return ShellResult.Ok("ok", "", 0, false)
+            }
+        }
+        val throwingArgv = object : AbstractList<String>() {
+            override val size: Int get() = 1
+            override fun get(index: Int): String = "id"
+            override fun iterator(): Iterator<String> =
+                throw java.util.ConcurrentModificationException("injected")
+        }
+        val result = ShellExecTool.executeElevated(ElevatedRequest(throwingArgv, "D09-T"), runner, audit)
+        assertTrue("$result", result is ShellResult.Denied)
+        assertEquals(ShellDeny.BLACKLISTED, (result as ShellResult.Denied).reason)
+        assertEquals(0, spawns)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+    }
 }

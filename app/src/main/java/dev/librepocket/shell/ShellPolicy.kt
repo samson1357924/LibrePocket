@@ -360,13 +360,18 @@ object ShellPolicy {
      * 提權通道校驗（S3，BACKLOG D09，矩陣 §3）。
      *
      * 與 [validate] 的差異只有兩處，其餘（空命令 → 黑名單二進位/全文片段 →
-     * 參數衛生 → find 高危謂詞 → 檔案域）完全同序：
+     * 參數衛生 → argv[0] 可信路徑詞法門 → find 高危謂詞 → 檔案域）完全同序：
      * - 跳過白名單門禁：白名單外的二進位僅允許走提權通道（Shizuku/Root），
      *   直接 exec 仍拒（[validate] 維持原判）；
      * - 檔案域改走提權語義：私有域 / 已授權 SAF 直行（呼叫方應優先走
      *   SAF/私有域，見提權橋「SAF 優先」話術）；跨域且
      *   [FileScope.decide] 回 needsBridge（橋接已授權）才放行，其餘跨域仍拒。
      * 黑名單（`rm -rf /` 類）一律拒，不因提權放行。
+     * - argv[0] 可信路徑詞法門（P1-1，與直接通道同等，host-only）：
+     *   含 `/`/`\` 的寫法父目錄必須在 [trustedBinDirs] 內（預設
+     *   [ShellExecutables.TRUSTED_BIN_DIRS]），否則 `/data/local/tmp/cat` 類
+     *   憑 basename 通過；bare 由提權專用 resolve 經受控搜尋固定為已驗證實體
+     *   （見 github 源集提權 wrapper，spawn 用固定目標，不再用原始 argv[0]）。
      *
      * 預設 [flavor] 為 PLAY（fail-closed：未指明風味時跨域一律拒；
      * 自裝風味呼叫方必須顯式傳 FOSS/GITHUB + bridgeGranted）。
@@ -381,6 +386,7 @@ object ShellPolicy {
         flavor: Flavor = Flavor.PLAY,
         bridgeGranted: Boolean = false,
         isGuest: Boolean = false,
+        trustedBinDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
         preRealPathHook: (() -> Unit)? = null,
     ): Validation {
         if (argv.isEmpty() || argv.all { it.isBlank() }) {
@@ -410,6 +416,21 @@ object ShellPolicy {
             }
             if (arg.contains('\u0000')) {
                 return Validation.Denied(ShellDeny.BAD_ARGUMENT, "NUL byte denied")
+            }
+        }
+        // argv[0] 可信路徑門（P1-1，提權與直接同等詞法門，host-only）：
+        // 含 `/`/`\` 的寫法父目錄必須在可信系統目錄內，否則同名不同路徑的假
+        // 二進位（`/data/local/tmp/cat`）可憑 basename 通過白名單（提權無白名單
+        // 更需此門）；bare 由提權專用 resolve 經受控搜尋固定（見 github 源集
+        // [ElevatedExecPolicy]），此處只做詞法門，不做實體 IO。
+        // Guest 通道（isGuest=true）跳過此門（與直接通道同策，容器命名空間路徑）。
+        val rawElevatedArgv0 = argv[0].trim()
+        if (!isGuest && (rawElevatedArgv0.contains('/') || rawElevatedArgv0.contains('\\'))) {
+            if (!ShellExecutables.isTrustedAbsoluteArgv0(rawElevatedArgv0, trustedBinDirs)) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "untrusted executable path: $rawElevatedArgv0",
+                )
             }
         }
         // find 沙箱逃逸封堵：提權通道同樣拒絕（與 validate 同策）。
@@ -455,7 +476,8 @@ object ShellPolicy {
         flavor: Flavor = Flavor.PLAY,
         bridgeGranted: Boolean = false,
         isGuest: Boolean = false,
-    ): Validation = validateElevatedInternal(argv, privateRoot, safRoots, flavor, bridgeGranted, isGuest, null)
+        trustedBinDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
+    ): Validation = validateElevatedInternal(argv, privateRoot, safRoots, flavor, bridgeGranted, isGuest, trustedBinDirs, null)
 
     /**
      * 宿主外掛點前綴（guest 容器內路徑豁免的例外，縱深保留拒絕）：
@@ -872,6 +894,12 @@ object ShellPolicy {
      *    （含 NotDirectory／瞬時 I/O 錯），關閉 EACCES 混同為缺席的繞行；ABSENT 等同舊 false 語義繼續，PRESENT 繼續；
      *    超深仍拒）。提權注記：app UID 不可判定者雙通道皆拒，需提權側預檢者走
      *    Refs #10 follow-up（刻意不在本 PR 碰 github source set）。
+     *    B4 跨域提醒（owner P2-9）：app UID 對 Root/fb0 等跨域目標的 lstat
+     *    可能因 EACCES 而 UNKNOWN，本門 fail-closed 拒（雙通道皆拒，不降級，
+     *    不改 UNKNOWN fail-closed）。真機跨域成功路徑（root/Shizuku 提權後
+     *    讀取）需 #136-B3 E2E 驗收；特權側預檢如需放行須另設可信有界門
+     *    （特權行程內 lstat＋結果有界回傳），不得把 UNKNOWN 一律放行
+     *    （TODO #136-B3）。
      * 2. 存在即 `toRealPath()` 全解析固定，再驗 real 身分獨立條件＋同語義重裁
      *    [FileScope.decide]（[isElevated] 為 true 時沿提權語義
      *    `allowed==true` 即放行，否則要求 `allowed && !needsBridge`）；

@@ -142,7 +142,7 @@ class ElevatedRunnerAA1Test {
         ElevatedCleanupTracker.noteClean() // 測試隔離重置，非#136-B3修復。
         pollOutstandingTo(0)
         // P1-2 預留（PR140 Phase1，特權宜序列）：乾淨態僅允單一進行中呼叫。
-        // 先 1 stall（0+4<=4 放行，outstanding 0→1），再預填 3 達飽和（1+3=4）；
+        // 先 1 stall（0+7<=7 放行，outstanding 0→1），再預填 6 達飽和（1+6=7）；
         // 另補 3 次 noteUnclean 使熔斷亦成立（drain 已計 1，補 3 即連續 4）。
         val latch = CountDownLatch(1)
         val rootSpawns = AtomicInteger(0)
@@ -159,8 +159,8 @@ class ElevatedRunnerAA1Test {
                 (b as ElevatedBinaryResult.TimedOut).cleanupIncomplete,
             )
             assertEquals(1, ElevatedCleanupTracker.outstanding())
-            repeat(3) { ElevatedCleanupTracker.acquireSlot() }
-            assertEquals(4, ElevatedCleanupTracker.outstanding())
+            repeat(6) { ElevatedCleanupTracker.acquireSlot() }
+            assertEquals(7, ElevatedCleanupTracker.outstanding())
             // 補足熔斷計數（drain 已計 1，再補 3 即連續 4；與飽和同時成立）。
             repeat(3) { ElevatedCleanupTracker.noteUnclean() }
             assertTrue(ElevatedCleanupTracker.isSaturated())
@@ -188,8 +188,8 @@ class ElevatedRunnerAA1Test {
             assertEquals(0, shizukuSpawns.get())
         } finally {
             latch.countDown()
-            // 釋放預填 3 槽（與 stall 槽併發釋放，poll 等兩者收斂）。
-            repeat(3) { ElevatedCleanupTracker.releaseSlot() }
+            // 釋放預填 6 槽（與 stall 槽併發釋放，poll 等兩者收斂）。
+            repeat(6) { ElevatedCleanupTracker.releaseSlot() }
             pollOutstandingTo(0)
             awaitNoElevatedThreads()
         }

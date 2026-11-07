@@ -31,8 +31,11 @@ class ElevatedCleanupTrackerTest {
         }
     }
 
-    @Test fun constantsAreFour() {
-        assertEquals(4, ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS)
+    @Test fun capacityConstantsMatchSlotDerivation() {
+        // P1-4 重推導：單呼叫最壞 7 槽（drain 4＋監督 3，見 SLOTS_PER_CALL KDoc），
+        // 總量上限同取 7（任一殘留即擋新呼叫，fail-closed 最保守）。
+        assertEquals(7, ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS)
+        assertEquals(7, ElevatedCleanupTracker.SLOTS_PER_CALL)
         assertEquals(4, ElevatedCleanupTracker.MAX_CONSECUTIVE_UNCLEAN)
         assertEquals(4, ElevatedCleanupTracker.MAX_CONCURRENT_CALLS)
     }
@@ -63,17 +66,17 @@ class ElevatedCleanupTrackerTest {
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         try {
-            repeat(4) { ElevatedCleanupTracker.acquireSlot() }
-            assertEquals(4, ElevatedCleanupTracker.outstanding())
+            repeat(7) { ElevatedCleanupTracker.acquireSlot() }
+            assertEquals(7, ElevatedCleanupTracker.outstanding())
             assertTrue(ElevatedCleanupTracker.isSaturated())
-            repeat(4) { ElevatedCleanupTracker.releaseSlot() }
+            repeat(7) { ElevatedCleanupTracker.releaseSlot() }
             pollOutstandingTo(0)
             assertFalse(ElevatedCleanupTracker.isSaturated())
             // floor：未佔而釋放不變負。
             ElevatedCleanupTracker.releaseSlot()
             assertEquals(0, ElevatedCleanupTracker.outstanding())
         } finally {
-            repeat(4) { ElevatedCleanupTracker.releaseSlot() }
+            repeat(7) { ElevatedCleanupTracker.releaseSlot() }
             ElevatedCleanupTracker.noteClean()
             pollOutstandingTo(0)
         }
@@ -81,10 +84,10 @@ class ElevatedCleanupTrackerTest {
 
     /**
      * reservation 矩陣直測（不經 runner）：驗證 [ElevatedCleanupTracker.tryEnterReserved]
-     * 原子預留表。現參數 MAX=4、SLOTS=4 下實效串行（0+1*4<=4 過，0+2*4>4 拒），
-     * [ElevatedCleanupTracker.Admission.CONCURRENCY_FULL] 保留但實效不可達
-     * （第二呼叫即走 BACKLOG_FULL），為未來放寬保留；直測以 tryEnterCall 預填
-     * active=4 證該分支仍可達。
+     * 原子預留表。現參數 MAX=7、SLOTS=7 下實效串行＋任一殘留即拒（0+1*7<=7 過，
+     * 0+2*7>7 拒，1+7>7 拒），[ElevatedCleanupTracker.Admission.CONCURRENCY_FULL]
+     * 保留但實效不可達（第二呼叫即走 BACKLOG_FULL），為未來放寬保留；直測以
+     * tryEnterCall 預填 active=4 證該分支仍可達。
      */
     @Test fun reservationMatrixDirect() {
         ElevatedCleanupTracker.noteClean()
@@ -93,13 +96,13 @@ class ElevatedCleanupTrackerTest {
         repeat(8) { ElevatedCleanupTracker.leaveCall() }
         assertEquals(0, ElevatedCleanupTracker.activeCalls())
         try {
-            // 乾淨態首呼叫放行（0+1*4<=4）。
+            // 乾淨態首呼叫放行（0+1*7<=7）。
             assertEquals(
                 ElevatedCleanupTracker.Admission.OK,
                 ElevatedCleanupTracker.tryEnterReserved(),
             )
             assertEquals(1, ElevatedCleanupTracker.activeCalls())
-            // 乾淨態次呼叫即預留拒（0+2*4>4 → BACKLOG_FULL，非 CONCURRENCY_FULL）。
+            // 乾淨態次呼叫即預留拒（0+2*7>7 → BACKLOG_FULL，非 CONCURRENCY_FULL）。
             assertEquals(
                 ElevatedCleanupTracker.Admission.BACKLOG_FULL,
                 ElevatedCleanupTracker.tryEnterReserved(),
@@ -107,6 +110,14 @@ class ElevatedCleanupTrackerTest {
             assertEquals(1, ElevatedCleanupTracker.activeCalls())
             ElevatedCleanupTracker.leaveCall()
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
+            // 殘留 1 即拒後續（1+7>7 → BACKLOG_FULL，fail-closed 最保守）。
+            ElevatedCleanupTracker.acquireSlot()
+            assertEquals(
+                ElevatedCleanupTracker.Admission.BACKLOG_FULL,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+            ElevatedCleanupTracker.releaseSlot()
+            pollOutstandingTo(0)
             // CONCURRENCY_FULL 死分支仍可達：以僅測用 tryEnterCall 預填 active=4。
             repeat(4) { assertTrue(ElevatedCleanupTracker.tryEnterCall()) }
             assertEquals(4, ElevatedCleanupTracker.activeCalls())
@@ -116,13 +127,13 @@ class ElevatedCleanupTrackerTest {
             )
             repeat(4) { ElevatedCleanupTracker.leaveCall() }
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
-            // backlog 優先：outstanding=4 即 BACKLOG_FULL。
-            repeat(4) { ElevatedCleanupTracker.acquireSlot() }
+            // backlog 優先：outstanding=7 即 BACKLOG_FULL。
+            repeat(7) { ElevatedCleanupTracker.acquireSlot() }
             assertEquals(
                 ElevatedCleanupTracker.Admission.BACKLOG_FULL,
                 ElevatedCleanupTracker.tryEnterReserved(),
             )
-            repeat(4) { ElevatedCleanupTracker.releaseSlot() }
+            repeat(7) { ElevatedCleanupTracker.releaseSlot() }
             pollOutstandingTo(0)
             // breaker 優先於預留：consecutive=4 即 BREAKER_OPEN。
             repeat(4) { ElevatedCleanupTracker.noteUnclean() }

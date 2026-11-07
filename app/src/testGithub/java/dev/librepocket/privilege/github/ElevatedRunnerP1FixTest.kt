@@ -392,7 +392,7 @@ class ElevatedRunnerP1FixTest {
             start.countDown()
             threads.forEach { it.join(30_000L) }
             assertTrue(threads.none { it.isAlive })
-            // 新碼：3 預填＋預留 4/呼叫 → 3+4>4，全拒，零 spawn，峰值仍 3。
+            // 新碼：3 預填＋預留 7/呼叫 → 3+7>7，全拒，零 spawn，峰值仍 3。
             // 舊碼：isSaturated(3<4) 放行 4 併發，各 1 槽 → 峰值 7，4 拒為 concurrency。
             assertEquals("spawns=${spawns.get()}", 0, spawns.get())
             assertEquals(3, ElevatedCleanupTracker.outstanding())
@@ -680,7 +680,7 @@ class ElevatedRunnerP1FixTest {
                 .runBinary(ElevatedRequest(listOf("id"), "LEAK"), 1_000L)
             assertTrue("$spawnThrow", spawnThrow is ElevatedBinaryResult.Failed)
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
-            // backlog 拒（預填滿）。
+            // backlog 拒（預填 4：4+7>7 預留拒，零 spawn）。
             repeat(4) { ElevatedCleanupTracker.acquireSlot() }
             try {
                 val denied = makeRoot { FakeProcess("ok".toByteArray()) }

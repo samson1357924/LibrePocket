@@ -169,7 +169,7 @@ class ElevatedRunnerAB1Test {
         assertEquals(0, ElevatedCleanupTracker.activeCalls())
         // P1-2 預留（PR140 Phase1，特權宜序列）：逐次累積 4 已不可達（第 2 次即拒）。
         // 本測以 1 Root linger（0→1）證計數＋跨 runner 共享（次 call Shizuku 即被
-        // 預留門拒，零 spawn），再預填 3 達飽和（1+3=4），另補計數使熔斷亦成立。
+        // 預留門拒，零 spawn），再預填 6 達飽和（1+6=7），另補計數使熔斷亦成立。
         val latch = CountDownLatch(1)
         val rootSpawns = AtomicInteger(0)
         val shizukuSpawns = AtomicInteger(0)
@@ -184,13 +184,13 @@ class ElevatedRunnerAB1Test {
             assertEquals("ok", String(b1.stdout, Charsets.UTF_8))
             assertTrue("blocked stdin getter must surface flag", b1.cleanupIncomplete)
             assertEquals(1, ElevatedCleanupTracker.outstanding())
-            // Shizuku 次 call 即被預留門拒（1+4>4），零 spawn，證跨 runner 共用同一全域。
+            // Shizuku 次 call 即被預留門拒（1+7>7），零 spawn，證跨 runner 共用同一全域。
             val blocked = shizuku.runBinary(ElevatedRequest(listOf("id"), "AB1-A"), 5_000L)
             assertTrue("$blocked", blocked is ElevatedBinaryResult.Denied)
             assertEquals(0, shizukuSpawns.get())
-            // 預填 3 達飽和（1+3=4）。
-            repeat(3) { ElevatedCleanupTracker.acquireSlot() }
-            assertEquals(4, ElevatedCleanupTracker.outstanding())
+            // 預填 6 達飽和（1+6=7）。
+            repeat(6) { ElevatedCleanupTracker.acquireSlot() }
+            assertEquals(7, ElevatedCleanupTracker.outstanding())
             assertTrue(ElevatedCleanupTracker.isSaturated())
             // linger 成功走 noteUnclean：此處僅 1 次 drain（consecutive=1，未熔斷）；
             // 補 3 次計數使熔斷亦成立（與飽和同時成立）。
@@ -220,8 +220,8 @@ class ElevatedRunnerAB1Test {
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
         } finally {
             latch.countDown()
-            // 釋放預填 3 槽（latch 釋放還 1 linger 槽，併發收斂）。
-            repeat(3) { ElevatedCleanupTracker.releaseSlot() }
+            // 釋放預填 6 槽（latch 釋放還 1 linger 槽，併發收斂）。
+            repeat(6) { ElevatedCleanupTracker.releaseSlot() }
             pollOutstandingTo(0)
         }
         // late 完成只釋放 slot，不歸零 consecutive（fail-closed 閂鎖，AA1 同語義）。
@@ -286,7 +286,7 @@ class ElevatedRunnerAB1Test {
         try {
             start.countDown()
             // P1-2 預留（PR140 Phase1，特權宜序列）：乾淨態僅允單一進行中呼叫
-            //（0+1*4<=4 通過，0+2*4<=4 拒絕）；另 7 應被預留門（backlog）拒絕，不進 spawn。
+            //（0+1*7<=7 通過，0+2*7>7 拒絕）；另 7 應被預留門（backlog）拒絕，不進 spawn。
             assertTrue(
                 "8 threads must all start attempting within 10s (barrier, no sleep)",
                 attempted.await(10L, TimeUnit.SECONDS),
@@ -328,7 +328,7 @@ class ElevatedRunnerAB1Test {
             )
             pollOutstandingTo(1)
             assertFalse(ElevatedCleanupTracker.isSaturated())
-            // 後續呼叫仍被預留門拒（outstanding=1，1+4>4），零新增 spawn。
+            // 後續呼叫仍被預留門拒（outstanding=1，1+7>7），零新增 spawn。
             val extra = runner.runBinary(ElevatedRequest(listOf("id"), "AB1-B"), 300L)
             assertTrue("$extra", extra is ElevatedBinaryResult.Denied)
             extra as ElevatedBinaryResult.Denied

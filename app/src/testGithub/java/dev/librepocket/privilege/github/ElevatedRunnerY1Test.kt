@@ -34,9 +34,10 @@ import org.junit.Test
  *   Root＋Shizuku ×（getter 阻塞／close 阻塞）＝4 測；
  * - (c) success-exit（waitFor 即 true／exit 0）＋blocked stdout getter 永不釋放：
  *   舊碼成功路徑 join(10s) 超界即回（孤兒線程殘留；`readFailed=false` 誤判
- *   Ok-truncated）；新碼 interrupt＋1s grace 收線程，經 markFailed 轉 Failed，
- *   有界返回（約 10s＋grace，不超過 ~15s）＋非 Ok-完整（Failed）＋capture null，
- *   Root＋Shizuku＝2 測。
+ *   Ok-truncated）；Y1 起 interrupt＋1s grace 收線程，經 markFailed 轉 Failed，
+ *   有界返回（約 10s＋grace，不超過 ~15s）；P1-4 起 finished tail 雙流共享 2s
+ *   （`FINISHED_TAIL_BUDGET_MS`，剩餘 30s 下取 2s），有界返回約 2s（1s..8s CI
+ *   餘量）＋非 Ok-完整（Failed）＋capture null，Root＋Shizuku＝2 測。
  *
  * Fake 的 `destroy()` 釋放 latch 以便線程退出（(c) 除外：(c) 靠 interrupt 退出，
  * 不釋放亦可；測試 finally 仍釋放防掛死污染後測）。
@@ -337,14 +338,14 @@ class ElevatedRunnerY1Test {
                 bg.join(25_000L)
                 val elapsed = System.currentTimeMillis() - start
                 assertFalse(
-                    "success-path stuck getter must return bounded (~10s join + grace)",
+                    "success-path stuck getter must return bounded (~2s shared tail)",
                     bg.isAlive,
                 )
                 // 有界性以 verdict／flag 為主證（上已斷 bg 必回；下斷 Failed＋capture null，
                 // 舊碼此處為 Ok(truncated)＋孤兒線程）；耗時僅記 CI 餘量帶
-                // （SUCCESS_JOIN 10s＋grace 1s，8s..20s），非 hard-fail 主證。
-                assertTrue("elapsed=$elapsed (CI margin 8s..20s)", elapsed >= 8_000L)
-                assertTrue("elapsed=$elapsed (CI margin 8s..20s)", elapsed < 20_000L)
+                // （P1-4 finished tail 共享 2s，1s..8s），非 hard-fail 主證。
+                assertTrue("elapsed=$elapsed (CI margin 1s..8s)", elapsed >= 1_000L)
+                assertTrue("elapsed=$elapsed (CI margin 1s..8s)", elapsed < 8_000L)
                 // interrupt→gobbler 抛→markFailed→readFailed：非 Ok-完整（Failed），
                 // 舊碼此處為 Ok(truncated=true)＋孤兒線程。
                 val b = resultRef.get()

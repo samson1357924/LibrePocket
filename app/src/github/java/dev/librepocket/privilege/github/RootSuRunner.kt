@@ -197,6 +197,16 @@ class RootSuRunner(
     private val execAllowedRoots: List<String>? = null,
     private val execIsWritable: (Path) -> Boolean = ShellExecutables::defaultIsWritable,
     private val execResolver: ((String) -> ShellExecutables.ResolvedExec?)? = null,
+    /**
+     * P1-4 validate 有界化測試接縫（僅單測注入阻塞 validate 模擬 FUSE stall，
+     * 見 `ElevatedRunnerPhase3HardeningTest`；生產一律預設 null，即
+     * [ShellPolicy.validateElevated] 本體，同參數同語義）。
+     *
+     * 有界包裝（[ElevatedCallSupervisor.awaitPreSpawn]）不經本接縫區分：注入與
+     * 本體一律跑同一監督＋同一逾期映射（`Expired.hasLinger` 穿透至
+     * `TimedOut.cleanupIncomplete`）。
+     */
+    private val validateFn: ((argv: List<String>, bridge: Boolean) -> Validation)? = null,
 ) : BinaryElevatedRunner {
 
     /**
@@ -269,18 +279,38 @@ class RootSuRunner(
             )
             is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, false)
         }
-        when (
-            val v = ShellPolicy.validateElevated(
-                argvSnapshot,
-                privateRoot,
-                safRoots,
-                flavor,
-                bridge,
-                false,
-                execSearchDirs,
+        // P1-4 validate FS 有界化：[ShellPolicy.validateElevated] 含實體解析門
+        // （逐段 lstat＋toRealPath，FUSE stall 可無界卡呼叫執行緒）。純詞法部分快
+        // （µs 級）但與 FS 門同函數，整體跑等效有界監督（快路徑首 POLL 內完成，
+        // 不額外調鉤，B2 計數語義不變）。Expired 即
+        // `preSpawnExpired(hasLinger)`：stall 殘留 worker 可能持 FS 參照，保守
+        // 穿透 hasLinger（grant／status 等非 spawn 逾期仍按既有契約 false）。
+        // [validateFn] 非空即調注入（僅單測 FUSE-stall 模擬），否則走產品本體。
+        val validateRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) {
+            validateFn?.invoke(argvSnapshot, bridge)
+                ?: ShellPolicy.validateElevated(
+                    argvSnapshot,
+                    privateRoot,
+                    safRoots,
+                    flavor,
+                    bridge,
+                    false,
+                    execSearchDirs,
+                )
+        }
+        val validated = when (validateRes) {
+            is ElevatedCallSupervisor.Res.Ok -> validateRes.v
+            is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
+                ShellDeny.NOT_WHITELISTED,
+                "validation check failed (fail-closed, no spawn)",
             )
-        ) {
-            is Validation.Denied -> return ElevatedBinaryResult.Denied(v.reason, v.message)
+            is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(
+                timeoutMs,
+                validateRes.hasLinger,
+            )
+        }
+        when (validated) {
+            is Validation.Denied -> return ElevatedBinaryResult.Denied(validated.reason, validated.message)
             is Validation.Allowed -> Unit
         }
         if (reasonSnapshot.isBlank()) {

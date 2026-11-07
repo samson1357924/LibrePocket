@@ -93,7 +93,7 @@ class ElevatedDispatchTest {
         assertEquals(listOf("id"), seenByRunner)
         assertEquals(1, audit.size())
         val row = audit.snapshot().single()
-        assertEquals(PrivilegeAuditLog.sha256Hex("id"), row.argvHash)
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), row.argvHash)
         assertEquals(PrivilegeAuditLog.sha256Hex("D09-T"), row.reasonHash)
         assertEquals(mapOf("OK" to 1), audit.countByVerdict())
     }

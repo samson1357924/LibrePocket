@@ -44,11 +44,24 @@ class ElevatedRunnerScreenshotCapacityTest {
         assertEquals(8 * 1024 * 1024, ElevatedProcessIo.BINARY_SCREENSHOT_HARD_CAP_BYTES)
     }
 
+    /** Phase 4 P2-4: patterned screenshot arrays patch a minimal IHDR header
+      * (len=13 + "IHDR" + w/h=1) at offset 8 so they pass the strengthened gate;
+      * remaining pattern bytes are untouched. CRC is not verified by the gate. */
+    private fun patchScreenshotIhdr(target: ByteArray) {
+        byteArrayOf(
+            0x00, 0x00, 0x00, 0x0D,
+            0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x01,
+        ).copyInto(target, 8)
+    }
+
     @Test fun screenshot70KBPassesBothRunners() {
         // 70KB > 通用 64K：通用軌必截斷，截圖軌必須通過（Ok 非 truncated）。
         // B4：screencap 側須過 PNG 輕量門，故首 8B 置 signature、尾 12B 置 IEND。
         val png = ByteArray(70 * 1024) { (it and 0xFF).toByte() }
         RootFramebufferCapture.PNG_SIGNATURE.copyInto(png, 0)
+        patchScreenshotIhdr(png)
         byteArrayOf(
             0x00, 0x00, 0x00, 0x00,
             0x49, 0x45, 0x4E, 0x44,
@@ -97,6 +110,7 @@ class ElevatedRunnerScreenshotCapacityTest {
         // B4：screencap 側須過 PNG 輕量門，故首 8B 置 signature、尾 12B 置 IEND。
         val exact = ByteArray(8 * 1024 * 1024) { (it and 0xFF).toByte() }
         RootFramebufferCapture.PNG_SIGNATURE.copyInto(exact, 0)
+        patchScreenshotIhdr(exact)
         byteArrayOf(
             0x00, 0x00, 0x00, 0x00,
             0x49, 0x45, 0x4E, 0x44,
@@ -178,6 +192,7 @@ class ElevatedRunnerScreenshotCapacityTest {
         // verdict，但置合法 PNG 保語義一致）。
         val png = ByteArray(70 * 1024) { (it and 0xFF).toByte() }
         RootFramebufferCapture.PNG_SIGNATURE.copyInto(png, 0)
+        patchScreenshotIhdr(png)
         byteArrayOf(
             0x00, 0x00, 0x00, 0x00,
             0x49, 0x45, 0x4E, 0x44,

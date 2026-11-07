@@ -68,6 +68,24 @@ class PrivilegeAuditLog {
         atMs = atMs,
     )
 
+    /**
+     * 快照版記帳（Phase 4，P2-1，PR #140）：呼叫方傳入入口已凍結的
+     * argv／reason（見 [ShellExecTool.executeElevated]），本函數不再觸碰
+     * 原始 `request`，故 runner 執行期間的竄改不污染審計雜湊。
+     * 與 [recordResult] 同為雜湊計數、不記明文；舊過載保留相容。
+     */
+    fun recordSnapshot(
+        argvSnapshot: List<String>,
+        reasonSnapshot: String,
+        result: ShellResult,
+        atMs: Long = System.currentTimeMillis(),
+    ): PrivilegeAuditRecord = record(
+        argv = argvSnapshot,
+        reasonCode = reasonSnapshot,
+        verdict = verdictName(result),
+        atMs = atMs,
+    )
+
     fun snapshot(): List<PrivilegeAuditRecord> = synchronized(lock) { records.toList() }
 
     fun size(): Int = synchronized(lock) { records.size }

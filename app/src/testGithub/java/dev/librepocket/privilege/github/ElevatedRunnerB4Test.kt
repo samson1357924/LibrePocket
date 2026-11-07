@@ -23,7 +23,7 @@ import org.junit.Test
 
 /**
  * PR140 Phase B4（最後功能階段）pins（owner P2-6/7/8/9＋WARNs）：
- * - P2-6 PNG 輕量門（signature＋IEND）＋malformed→FRAME_REJECTED＋truncated 仍 OK；
+ * - P2-6 PNG 輕量門（signature＋IHDR＋IEND；Phase 4 P2-4 收緊）＋malformed→FRAME_REJECTED＋truncated 仍 OK；
  * - P2-7 內層仿 su 行負向（Failed 非 Denied）；
  * - P2-8 反射缺方法 fail-closed；
  * - P2-9 跨域 fb0 政策 pin（UNKNOWN 仍 fail-closed）；
@@ -77,19 +77,28 @@ class ElevatedRunnerB4Test {
     }
 
     /**
-     * 合法 PNG fixture：sig＋fill＋IEND。
-     * 輕量門代理（sig＋IEND），非解碼保證：僅證 isPlausiblePng 門通過，
+     * 合法 PNG fixture：sig＋IHDR＋fill＋IEND。
+     * 輕量門代理（sig＋IHDR＋IEND），非解碼保證：僅證 isPlausiblePng 門通過，
      * 不證圖片可解碼（真解碼歸 Phase 2-5，不在此斷）。
      */
 
     private fun validPng(fill: ByteArray = "b4".toByteArray()): ByteArray {
         val sig = RootFramebufferCapture.PNG_SIGNATURE
+        // IHDR 塊（25B）：len(13)＋"IHDR"＋w(1)＋h(1)＋5B 留白＋crc（門不驗 CRC）。
+        val ihdr = byteArrayOf(
+            0x00, 0x00, 0x00, 0x0D,
+            0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x01,
+            0x08, 0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        )
         val iend = byteArrayOf(
             0x00, 0x00, 0x00, 0x00,
             0x49, 0x45, 0x4E, 0x44,
             0xAE.toByte(), 0x42, 0x60, 0x82.toByte(),
         )
-        return sig + fill + iend
+        return sig + ihdr + fill + iend
     }
 
     private fun rootRunner(spawn: (List<String>) -> Process) = RootSuRunner(

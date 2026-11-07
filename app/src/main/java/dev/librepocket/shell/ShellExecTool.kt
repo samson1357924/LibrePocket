@@ -58,6 +58,13 @@ object ShellExecTool {
      * 注意：無 audit 的過載已刪除 —— 任何提權執行都必須留痕，
      * 呼叫方一律傳 [PrivilegeAuditLog]（見 [dev.librepocket.router.ElevatedDispatch]，
      * 先四參門禁再執行，全路徑審計）。
+     *
+     * Phase 4（P2-1，PR #140）：入口先 [frozenOrNull] 凍結 argv＋reason，
+     * 同一凍結物件用於 gate（上游 [dev.librepocket.router.ElevatedDispatch]
+     * 已凍結，此處再凍一次冪等）、[runner.run][ElevatedShellRunner.run]、
+     * 審計 [PrivilegeAuditLog.recordSnapshot]；凍結失敗（併發竄改致拷貝抛，
+     * 見 F9）即 `Denied(BLACKLISTED)` 且零 spawn，審計以空 argv＋原始
+     * reasonCode 記一筆 DENY（argv 讀取本身不可信，故不雜湊原文）。
      */
     fun executeElevated(
         request: ElevatedRequest,
@@ -65,8 +72,13 @@ object ShellExecTool {
         audit: PrivilegeAuditLog,
         timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS,
     ): ShellResult {
-        val result = runner.run(request, timeoutMs)
-        audit.recordResult(request, result)
+        val frozen = request.frozenOrNull() ?: run {
+            val denied = ShellResult.Denied(ShellDeny.BLACKLISTED, "elevated snapshot failed (fail-closed, no spawn)")
+            audit.record(emptyList(), request.reasonCode, PrivilegeAuditLog.verdictName(denied))
+            return denied
+        }
+        val result = runner.run(frozen, timeoutMs)
+        audit.recordSnapshot(frozen.argv, frozen.reasonCode, result)
         return result
     }
 }

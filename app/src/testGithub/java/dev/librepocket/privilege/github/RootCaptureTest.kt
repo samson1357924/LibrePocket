@@ -59,19 +59,28 @@ class RootCaptureTest {
     }
 
     /**
-     * 合法 PNG fixture：sig＋fill＋IEND。
-     * 輕量門代理（sig＋IEND），非解碼保證：僅證 isPlausiblePng 門通過，
+     * 合法 PNG fixture：sig＋IHDR＋fill＋IEND。
+     * 輕量門代理（sig＋IHDR＋IEND），非解碼保證：僅證 isPlausiblePng 門通過，
      * 不證圖片可解碼（真解碼歸 Phase 2-5，不在此斷）。
      */
 
     private fun validPng(fill: ByteArray = "png-bytes".toByteArray()): ByteArray {
         val sig = RootFramebufferCapture.PNG_SIGNATURE
+        // IHDR 塊（25B）：len(13)＋"IHDR"＋w(1)＋h(1)＋5B 留白＋crc（門不驗 CRC）。
+        val ihdr = byteArrayOf(
+            0x00, 0x00, 0x00, 0x0D,
+            0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x01,
+            0x08, 0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        )
         val iend = byteArrayOf(
             0x00, 0x00, 0x00, 0x00,
             0x49, 0x45, 0x4E, 0x44,
             0xAE.toByte(), 0x42, 0x60, 0x82.toByte(),
         )
-        return sig + fill + iend
+        return sig + ihdr + fill + iend
     }
 
     @Test fun screencapPreferredOverFb0() {

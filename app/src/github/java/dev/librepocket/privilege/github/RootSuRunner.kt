@@ -32,7 +32,8 @@ import java.util.concurrent.TimeUnit
  * - su exit 語義：B4 前拒絕（[isSuDenied]）回 `Denied(NOT_WHITELISTED)`；
  *   B4 起（owner P2-7）`^su:` 前綴可被內層仿造，無獨立可信來源，不再斷言
  *   Denied，一律回 `Failed`（不確定失敗，含可能的真拒絕；見 [isSuDenied]
- *   B4 段與 B4 負向單測）；一般非零回 `Failed`，皆不回 `Ok`
+  *   B4 段與 B4 負向單測）；Phase 4（F8）不再基於 stderr 做二分級，
+  *   一律單一 `Failed("su failed exit=...")`；一般非零回 `Failed`，皆不回 `Ok`
  *   （舊實現誤回 Ok 已修正）；
  *   訊息內 stderr 經 `Redactor.redactError` 收斂（保留 redacted，不洩密）；
  * - 超時/cancel 走 [ElevatedProcessKiller.killTree]（盡力整組殺，舊實現只殺 `su`
@@ -41,9 +42,9 @@ import java.util.concurrent.TimeUnit
  *   可劫持），缺席即 Failed 且零 spawn；
  * - 二進位通道：[runBinary] 以 [ByteArray] 直達，[run] 僅為文字相容殼。
  *
- * B2 失敗訊息收斂 pin（Phase3 P3 低風險，行為不變）：
- * 非零 exit 回 `Failed("su failed exit=...: $redacted")`／前綴命中回
- * `Failed("su failed (possible denial, unverified source) exit=...: $redacted")`，`$redacted` 經
+  * B2 失敗訊息收斂 pin（Phase3 P3 低風險，行為不變；Phase 4 F8 後單一形）：
+  * 非零 exit 一律回 `Failed("su failed exit=...: $redacted")`（不再分 `possible denial`
+  * 變體，見下 F8 段），`$redacted` 經
  * `Redactor.redactError` 收斂。路徑覆蓋邊界（見 `Redactor.ANDROID_PATH`）：
  * 覆蓋 `/data/data|user|app|media|misc`、`/storage/emulated`、`/sdcard`；
  * 不覆蓋 `/system|/vendor|/data/adb`——su 可信路徑常量屬公開 allowlist
@@ -220,7 +221,12 @@ class RootSuRunner(
         // P1-2 不變快照（入口即凍結）：後續 validation／容量特判／spawn 一律用
         // 同一份已核驗快照，不再觸碰原始 request.argv（MutableList 在 grant／
         // bridge／status supplier 內竄改亦不影響本份，見 ElevatedExecPolicy）。
-        val snapshot = ElevatedExecPolicy.snapshot(request)
+        // Phase 4（F9）：凍結失敗（併發竄改致拷貝抛）即 Denied 且零 spawn，
+        // 不外抛（Denied＋審計契約：上游 ShellExecTool 仍寫一筆 DENY）。
+        val snapshot = ElevatedExecPolicy.snapshot(request) ?: return ElevatedBinaryResult.Denied(
+            ShellDeny.BLACKLISTED,
+            "elevated snapshot failed (fail-closed, no spawn)",
+        )
         val argvSnapshot: List<String> = snapshot.argv
         val reasonSnapshot: String = snapshot.reasonCode
         // V1 全域 flavor 門（owner 新 P1-1，github-only）：首位即拒，
@@ -622,20 +628,15 @@ class RootSuRunner(
             }
             if (raw.exitCode != 0) {
                 val redacted = Redactor.redactError(String(err.bytes, Charsets.UTF_8))
-                // B4 P2-7：`^su:` 前綴可被內層仿造（合併 stderr／共享 exit code 下
-                // 不可區分真拒絕與內層失敗），無獨立可信來源時不判 Denied，一律
-                // Failed（不確定失敗；內層仿 su 行負向見 B4 單測）。
-                return if (isSuDenied(err.bytes, raw.exitCode)) {
-                    ElevatedBinaryResult.Failed(
-                        "su failed (possible denial, unverified source) exit=${raw.exitCode}: $redacted",
-                        cleanupIncomplete = raw.cleanupIncomplete,
-                    )
-                } else {
-                    ElevatedBinaryResult.Failed(
-                        "su failed exit=${raw.exitCode}: $redacted",
-                        cleanupIncomplete = raw.cleanupIncomplete,
-                    )
-                }
+                // Phase 4（F8，PR #140）：`^su:` 前綴可被內層仿造（合併 stderr／
+                // 共享 exit code 下不可區分真拒絕與內層失敗），不再基於 stderr
+                // 做啟發式分級（舊 `possible denial` 變體已刪除），一律單一
+                // Failed（不確定失敗；[isSuDenied] 保留供單測啟發式本身，
+                // runner 不再以此分支）。
+                return ElevatedBinaryResult.Failed(
+                    "su failed exit=${raw.exitCode}: $redacted",
+                    cleanupIncomplete = raw.cleanupIncomplete,
+                )
             }
             return ElevatedBinaryResult.Ok(
                 stdout = out.bytes,
@@ -654,6 +655,11 @@ class RootSuRunner(
      * privateRoot 為 null（未配置作用域）時維持預設 cwd，但政策層已對
      * 任何 path-like bare（含 `.`）fail-closed，殘餘僅非路徑子命令。
      *
+     * Phase 4（F2 跟進，PR #140）：env 清空後只放 [ShellExecutables.CLEAN_ENV]
+     * （固定 `PATH`＋`LANG`，不繼承 App 進程環境，與直接通道
+     * [dev.librepocket.shell.RestrictedShell]＋Shizuku 側 [buildCleanEnv]
+     * 同策；舊碼沿用 `ProcessBuilder` 預設繼承，已修正）。
+     *
      * 非目錄即抛（由 [runBinary] 的 spawn catch 轉 Failed），
      * 不靜默續行：靜默回落到預設 cwd 會讓相對路徑解析到不可控目錄。
      *
@@ -662,6 +668,8 @@ class RootSuRunner(
      */
     private fun pinnedSpawn(argv: List<String>): Process {
         val pb = ProcessBuilder(argv)
+        pb.environment().clear()
+        pb.environment().putAll(ShellExecutables.CLEAN_ENV)
         val root = privateRoot
         if (root != null) {
             val dir = java.io.File(root)

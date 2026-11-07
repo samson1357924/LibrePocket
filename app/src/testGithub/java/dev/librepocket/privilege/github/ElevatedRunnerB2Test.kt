@@ -309,9 +309,18 @@ class ElevatedRunnerB2Test {
     }
 
     @Test fun framebufferPrefersBinaryChannel() {
-        // B4：screencap 側須過 PNG 輕量門，故用合法 PNG（sig＋fill＋IEND）。
-        // 輕量門代理（sig＋IEND），非解碼保證：僅證門通過＋位元組直達，不證圖片可解碼。
+        // B4＋Phase 4 P2-4：screencap 側須過 PNG 輕量門，故用合法 PNG
+        // （sig＋IHDR＋fill＋IEND）。
+        // 輕量門代理（sig＋IHDR＋IEND），非解碼保證：僅證門通過＋位元組直達，不證圖片可解碼。
         val png = RootFramebufferCapture.PNG_SIGNATURE +
+            byteArrayOf(
+                0x00, 0x00, 0x00, 0x0D,
+                0x49, 0x48, 0x44, 0x52,
+                0x00, 0x00, 0x00, 0x01,
+                0x00, 0x00, 0x00, 0x01,
+                0x08, 0x02, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+            ) +
             byteArrayOf(0xFF.toByte(), 0x00) +
             byteArrayOf(
                 0x00, 0x00, 0x00, 0x00,

@@ -40,18 +40,29 @@ object ElevatedExecPolicy {
         val reasonCode: String,
     )
 
-    /** 入口快照：argv 防禦性拷貝＋不可變包裝，reasonCode 直接存（String 不可變）。 */
-    fun snapshot(request: ElevatedRequest): ElevatedCommandSnapshot {
+    /** 入口快照：argv 防禦性拷貝＋不可變包裝，reasonCode 直接存（String 不可變）。
+     *
+     * Phase 4（F9，PR #140）：拷貝可能因呼叫方併發竄改原始 `MutableList`
+     * 而抛 [java.util.ConcurrentModificationException]，故包 runCatching，
+     * 失敗回 null；兩 runner 入口 `?: Denied(BLACKLISTED, "snapshot failed")`
+     * 且零 spawn（Denied＋審計契約不被外抛繞過）。
+     */
+    fun snapshot(request: ElevatedRequest): ElevatedCommandSnapshot? = runCatching {
         val argvCopy: List<String> =
             java.util.Collections.unmodifiableList(ArrayList(request.argv))
-        return ElevatedCommandSnapshot(argvCopy, request.reasonCode)
-    }
+        ElevatedCommandSnapshot(argvCopy, request.reasonCode)
+    }.getOrNull()
 
     /**
      * 可信 executable 解析（提權專用，spawn 前唯一入口）：
-     * - `customResolver` 非 null 時走注入映射（單測 stub 用，生產一律 null）；
-     *   自訂映射回 multicall 時其 `applet` 會被快照 basename 覆寫後才 spawn
-     *   （見 [toSpawnArgv]，不採信映射自帶字串），回 null 即呼叫方拒絕且零 spawn；
+     * - `customResolver` 非 null 時走注入映射（僅單測 stub 用，生產一律 null）；
+     *   Phase 4（F1，PR #140）：注入回傳不再全信 —— 回傳路徑必經同一實體驗證
+     *   （containment＋app-writability＋entry 閘，見
+     *   [ShellExecutables.verifiedTargetDetailed]，entryRoot 取回傳路徑的
+     *   lexical parent；允許集／writability 判定沿用本函數同參），未通過即
+     *   `Denied` 且零 spawn；spawn 用驗證後實體路徑（[toSpawnArgv] 另以快照
+     *   basename 覆寫 multicall `applet`，不採信映射自帶字串，語義不變）；
+     *   映射回 null／抛異常即呼叫方拒絕且零 spawn（語義不變）；
      * - null（預設）時走真查 [ShellExecutables.resolveDetailed]（受控搜尋＋
      *   containment＋writability＋entry 閘，不查 `PATH`、不看 cwd）。
      * 回傳 `Ok(exec)` 即已固定目標（spawn 用 `exec.path`，不再用原始 `argv[0]`）；
@@ -86,7 +97,41 @@ object ElevatedExecPolicy {
             } ?: return ShellExecutables.ResolveOutcome.Denied(
                 ShellExecutables.ResolveDeny.NOT_FOUND,
             )
-            return ShellExecutables.ResolveOutcome.Ok(exec)
+            // F1：注入回傳再驗證（與內建路徑同閘）。entryRoot 取回傳路徑的
+            // lexical parent；spawn 用驗證後實體（防映射回傳 link／可寫目標）。
+            val rawPath = exec.path.trim()
+            if (rawPath.isEmpty() || rawPath.contains('\u0000')) {
+                return ShellExecutables.ResolveOutcome.Denied(
+                    ShellExecutables.ResolveDeny.INVALID_INPUT,
+                )
+            }
+            val normPath = try {
+                dev.librepocket.files.FileScope.normalize(rawPath)
+            } catch (_: Exception) {
+                return ShellExecutables.ResolveOutcome.Denied(
+                    ShellExecutables.ResolveDeny.INVALID_INPUT,
+                )
+            }
+            val slash = normPath.lastIndexOf('/')
+            if (slash <= 0) {
+                // 相對形／無 parent 可驗 entry chain —— fail-closed，不採信。
+                return ShellExecutables.ResolveOutcome.Denied(
+                    ShellExecutables.ResolveDeny.UNTRUSTED_PATH,
+                )
+            }
+            val entryRoot = normPath.substring(0, slash).ifEmpty { "/" }
+            val roots = allowedRoots ?: ShellExecutables.snapshotRealRoots(searchDirs)
+            val (real, failure) = try {
+                ShellExecutables.verifiedTargetDetailed(normPath, roots, isWritable, entryRoot)
+            } catch (_: Exception) {
+                null to ShellExecutables.ResolveDeny.NOT_FOUND
+            }
+            if (real == null) {
+                return ShellExecutables.ResolveOutcome.Denied(
+                    failure ?: ShellExecutables.ResolveDeny.NOT_FOUND,
+                )
+            }
+            return ShellExecutables.ResolveOutcome.Ok(exec.copy(path = real))
         }
         val outcome = try {
             ShellExecutables.resolveDetailed(

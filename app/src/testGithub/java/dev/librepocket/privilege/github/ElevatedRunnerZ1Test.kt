@@ -555,10 +555,18 @@ class ElevatedRunnerZ1Test {
         ElevatedCleanupTracker.noteClean()
         runWithUncaughtGuard { uncaught ->
             val audit = PrivilegeAuditLog()
-            // B4：capture screencap 側須過 PNG 輕量門，故 capture 用乾淨合法 PNG
+            // B4＋Phase 4 P2-4：capture screencap 側須過 PNG 輕量門，故 capture 用乾淨合法 PNG
             // spawn（latch 已釋放，stdin 不再阻塞），斷非 null。
-            // 輕量門代理（sig＋IEND），非解碼保證：僅證門通過，不證圖片可解碼。
+            // 輕量門代理（sig＋IHDR＋IEND），非解碼保證：僅證門通過，不證圖片可解碼。
             val png = RootFramebufferCapture.PNG_SIGNATURE +
+                byteArrayOf(
+                    0x00, 0x00, 0x00, 0x0D,
+                    0x49, 0x48, 0x44, 0x52,
+                    0x00, 0x00, 0x00, 0x01,
+                    0x00, 0x00, 0x00, 0x01,
+                    0x08, 0x02, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00,
+                ) +
                 "z1-ok".toByteArray() +
                 byteArrayOf(
                     0x00, 0x00, 0x00, 0x00,

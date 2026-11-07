@@ -47,11 +47,12 @@ enum class FrameSource {
  * 會損毀 PNG）。審計（R3-B）：grep 產品源集（`app/src/main`＋`app/src/github`）
  * 零呼叫，僅測試引用；產品 #136-B3 接線應使用 Binary 多載。
  *
- * B4 PNG 輕量門（owner P2-6，前者落地：signature＋IEND）：
+ * B4 PNG 輕量門（owner P2-6，前者落地；Phase 4 P2-4 收緊，後者為準）：
  * - `screencap -p` 產物必須為 PNG：[isPlausiblePng] 驗 8 位元組 signature
- *  （`89 50 4E 47 0D 0A 1A 0A`）＋尾 12 位元組 IEND chunk
- *  （`00 00 00 00 49 45 4E 44 AE 42 60 82`）＋最小長度；不做全 chunk walk／
- *   不解碼（輕量，JVM 零依賴）；
+ *  （`89 50 4E 47 0D 0A 1A 0A`）＋第一塊 IHDR（length==13、`"IHDR"`，
+ *  width／height 皆 >0）＋尾 12 位元組 IEND chunk
+ *  （`00 00 00 00 49 45 4E 44 AE 42 60 82`）＋最小長度 45；不做全 chunk walk／
+ *   不驗 CRC／IDAT，不解碼（輕量，JVM 零依賴；非解碼保證，僅擋截斷／拼接）；
  * - `capture()` 側：screencap 位元組未過門即視為缺失，回落 fb0（fb0 為原始
  *   framebuffer，不做 PNG 門）；兩路皆無／皆無效即 null（降級手動截圖）；
  * - `screencapViaBinary`／`screencapViaElevated`（String 回落同）側：Ok 非截斷
@@ -109,8 +110,23 @@ class RootFramebufferCapture(
 
     companion object {
         /**
-         * B4 PNG 輕量門（owner P2-6）：只驗 signature＋尾 IEND＋最小長度，
-         * 不做全 chunk walk／不解碼。fb0 原始位元組不經此門。
+         * B4 PNG 輕量門（owner P2-6；Phase 4 P2-4 收緊，PR #140）：
+         * 只驗 signature＋第一塊 IHDR＋尾 IEND＋最小長度，不做全 chunk
+         * walk／不解碼、不驗 CRC／IDAT（輕量，JVM 零依賴；**非解碼保證**，
+         * 僅擋截斷／拼接／非 PNG 誤摘要）。fb0 原始位元組不經此門。
+         *
+         * - 最小長度 45：sig(8)＋IHDR 塊(25：len4＋"IHDR"＋data13＋crc4)＋
+         *   IEND(12)；舊 20-byte 拼接（sig＋IEND 直貼）在本門即拒；
+         * - 第一塊必須是 IHDR：length==13、`"IHDR"`、width／height 皆 >0
+         *   （big-endian uint32；零寬高即拒）；
+         * - 尾 12 位元組須為 IEND chunk。
+         *
+         * truncated-Ok 審計語義（B1-B3 pin 保留，Phase 4 不改）：
+         * `auditAndExtractScreenshot` 對 truncated Ok 仍記 `OK`（只是不回
+         * 位元組、不摘要部分幀）；`OK` 含 truncated-Ok，轉錄側不得把 `OK`
+         * 直接解讀為「完整幀已摘要」。若 Phase 5 要新增 `OK_TRUNCATED`
+         * verdict，須同步雙映射（[PrivilegeAuditLog.verdictName]＋
+         * [verdict]）並加測試鎖定，見 Phase 5 事項。
          */
         internal val PNG_SIGNATURE: ByteArray =
             byteArrayOf(
@@ -124,13 +140,38 @@ class RootFramebufferCapture(
                 0xAE.toByte(), 0x42, 0x60, 0x82.toByte(),
             )
 
+        /** IHDR 塊固定長度（不含 len＋type 頭的 data 段 13 位元組）。 */
+        private const val PNG_IHDR_DATA_LEN = 13
+
+        /** 最小 PNG 長度：sig(8)＋IHDR 塊(4＋4＋13＋4)＋IEND(12)＝45。 */
+        internal const val PNG_MIN_BYTES: Int = 8 + (4 + 4 + PNG_IHDR_DATA_LEN + 4) + 12
+
         internal fun isPlausiblePng(bytes: ByteArray): Boolean {
-            if (bytes.size < PNG_SIGNATURE.size + PNG_IEND.size) return false
+            if (bytes.size < PNG_MIN_BYTES) return false
             if (!bytes.copyOf(PNG_SIGNATURE.size).contentEquals(PNG_SIGNATURE)) return false
+            // 第一塊須為 IHDR：length==13（4 位元組 big-endian）＋"IHDR"。
+            if (bytes[8] != 0x00.toByte() || bytes[9] != 0x00.toByte() ||
+                bytes[10] != 0x00.toByte() || bytes[11] != 0x0D.toByte()
+            ) {
+                return false
+            }
+            if (bytes[12] != 0x49.toByte() || bytes[13] != 0x48.toByte() ||
+                bytes[14] != 0x44.toByte() || bytes[15] != 0x52.toByte()
+            ) {
+                return false
+            }
+            // IHDR data：width／height（各 4 位元組 big-endian uint32）皆須 >0。
+            if (u32Be(bytes, 16) == 0L || u32Be(bytes, 20) == 0L) return false
             val tail = bytes.copyOfRange(bytes.size - PNG_IEND.size, bytes.size)
             if (!tail.contentEquals(PNG_IEND)) return false
             return true
         }
+
+        private fun u32Be(bytes: ByteArray, offset: Int): Long =
+            ((bytes[offset].toLong() and 0xFF) shl 24) or
+                ((bytes[offset + 1].toLong() and 0xFF) shl 16) or
+                ((bytes[offset + 2].toLong() and 0xFF) shl 8) or
+                (bytes[offset + 3].toLong() and 0xFF)
 
         /**
          * 二進位審計＋位元組抽取共用（P2-A）：兩路 `*ViaBinary` 皆經此記帳，

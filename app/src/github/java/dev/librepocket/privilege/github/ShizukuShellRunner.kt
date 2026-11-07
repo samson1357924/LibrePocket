@@ -193,7 +193,12 @@ class ShizukuShellRunner(
         // P1-2 不變快照（入口即凍結）：後續 validation／容量特判／spawn 一律用
         // 同一份已核驗快照，不再觸碰原始 request.argv（MutableList 在 grant／
         // bridge／status supplier 內竄改亦不影響本份，見 ElevatedExecPolicy）。
-        val snapshot = ElevatedExecPolicy.snapshot(request)
+        // Phase 4（F9）：凍結失敗（併發竄改致拷貝抛）即 Denied 且零 spawn，
+        // 不外抛（Denied＋審計契約：上游 ShellExecTool 仍寫一筆 DENY）。
+        val snapshot = ElevatedExecPolicy.snapshot(request) ?: return ElevatedBinaryResult.Denied(
+            ShellDeny.BLACKLISTED,
+            "elevated snapshot failed (fail-closed, no spawn)",
+        )
         val argvSnapshot: List<String> = snapshot.argv
         val reasonSnapshot: String = snapshot.reasonCode
         // V1 全域 flavor 門（owner 新 P1-1，github-only）：首位即拒，
@@ -586,6 +591,17 @@ class ShizukuShellRunner(
 
     companion object {
         /**
+         * Phase 4（F2，PR #140）：`newProcess` 專用乾淨 env（`KEY=VALUE` 陣列形）。
+         * 固定 [ShellExecutables.CLEAN_ENV]（`PATH`＋`LANG`），不繼承
+         * system_server 環境（`LD_PRELOAD`／`LD_LIBRARY_PATH`／代理變數等
+         * 經此消除，與直接通道 [dev.librepocket.shell.RestrictedShell]
+         * 同策）。純函數，永不回 null；反射缺方法等失敗由呼叫方 spawn
+         * catch 收斂為 Failed（fail-closed），不存在傳 null 繼承的路徑。
+         */
+        internal fun buildCleanEnv(): Array<String> =
+            ShellExecutables.CLEAN_ENV.map { (k, v) -> "$k=$v" }.toTypedArray()
+
+        /**
          * R3-B：grep 確認測試零引用，收斂為 private（僅 [pinnedSpawn]
          * 內部使用）；#136-B3 前重審（刪除或保留內部實現）。
          *
@@ -596,6 +612,9 @@ class ShizukuShellRunner(
          * `Failed("shizuku spawn failed: ...")` 且零殘留（fail-closed，不抛；
          * 見 B4 pin）。真機相容未驗，裝置矩陣（授權／拒絕／service 重啟／
          * 死亡／版本升級）＋UserService 長期路線歸 #136-B3 E2E。
+         *
+         * Phase 4（F2）：env 傳 [buildCleanEnv]，永不傳 null（舊碼傳 null
+         * 即繼承 system_server 環境，已修正）。
          */
         private fun defaultSpawnWithDir(argv: List<String>, dir: String?): Process {
             val method = Shizuku::class.java.getDeclaredMethod(
@@ -605,7 +624,7 @@ class ShizukuShellRunner(
                 String::class.java,
             )
             method.isAccessible = true
-            val raw = method.invoke(null, argv.toTypedArray(), null, dir)
+            val raw = method.invoke(null, argv.toTypedArray(), buildCleanEnv(), dir)
             return ShizukuRemoteProcess.wrap(raw)
         }
     }

@@ -39,6 +39,7 @@ internal object SuBinaryResolver {
      * 依賴裝置側 root 方案自身的路徑完整性。
      * 注記：真 O_NOFOLLOW 需 NIO `Os.open(..., O_NOFOLLOW)` 句柄綁定
      * （存在性重驗後持句柄 exec，關閉替換窗口），屬 #136-B3 E2E 範疇；
+     * TODO(#136-B3): spawn 前持 O_NOFOLLOW 句柄綁定完整修（存在性重驗後持句柄 exec，關閉替換窗口），不要大重構 fd 綁定；本階段僅以重驗收斂窗口並以本 KDoc 揭露殘餘。
      * 本層以重驗收斂窗口並以本 KDoc 揭露殘餘，不作字串外承諾。
      */
     fun isTrusted(path: String): Boolean = normalizeSuPath(path) in RootSuProbe.SU_BINARIES

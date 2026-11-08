@@ -523,13 +523,17 @@ class ElevatedRunnerP2Test {
         pollOutstandingTo(0)
         Thread.currentThread().interrupt()
         try {
+            val proc = FakeProcess("ok".toByteArray(), ByteArray(0), 0)
             val d = ElevatedProcessIo.drain(
-                FakeProcess("ok".toByteArray(), ByteArray(0), 0),
+                proc,
                 2_000L,
             )
-            // 預置中斷已在入口清除：健康進程仍 finished（非超時），無殘留。
-            assertFalse(d.timedOut)
-            assertEquals(0, d.exitCode)
+            // R3-PhaseG P2-3：預置中斷在入口轉為一次性取消決策——進 drain 即走
+            // 受監督 kill 路徑（`timedOut=true`），不再當健康進程跑 finished。
+            // kill 受監督（destroy 可觀測、verify 通過即無殘留旗標）。
+            assertTrue("pre-interrupt drain must take supervised kill path, got $d", d.timedOut)
+            assertEquals(-1, d.exitCode)
+            assertTrue("kill must be attempted on pre-interrupt entry", proc.destroyed)
             pollOutstandingTo(0)
             assertFalse(ElevatedCleanupTracker.isSaturated())
             assertFalse(ElevatedCleanupTracker.isBreakerOpen())

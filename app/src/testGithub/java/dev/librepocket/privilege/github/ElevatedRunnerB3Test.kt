@@ -184,7 +184,9 @@ class ElevatedRunnerB3Test {
             val elapsed = System.currentTimeMillis() - start
             assertTrue("$r", r is ElevatedBinaryResult.TimedOut)
             assertEquals(0, spawns.get())
-            assertFalse((r as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
+            // R3-PhaseG P2-4 決策 a：grant block worker 殘留（outstanding==1）
+            // 即置旗，不再為 false（舊「非 spawn 逾期一律 false」契約已改）。
+            assertTrue("blocked grant expiry must flag linger, got $r", (r as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
             // 不可中斷 stall 即殘留追蹤（outstanding 1），呼叫方有界返回（<5s）。
             assertTrue("elapsed=$elapsed", elapsed < 12_000L)
             assertEquals(1, ElevatedCleanupTracker.outstanding())
@@ -266,6 +268,9 @@ class ElevatedRunnerB3Test {
             val elapsed = System.currentTimeMillis() - start
             assertTrue("$r", r is ElevatedBinaryResult.TimedOut)
             assertEquals(0, spawns.get())
+            // R3-PhaseG P2-4 決策 a：status block worker 殘留（outstanding==1）
+            // 即置旗（與 grant 側一致）。
+            assertTrue("blocked status expiry must flag linger, got $r", (r as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
             assertTrue("elapsed=$elapsed", elapsed < 12_000L)
             assertEquals(1, ElevatedCleanupTracker.outstanding())
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
@@ -347,6 +352,9 @@ class ElevatedRunnerB3Test {
             val elapsed = System.currentTimeMillis() - start
             assertTrue("$r", r is ElevatedBinaryResult.TimedOut)
             assertEquals(0, spawns.get())
+            // R3-PhaseG P2-4 決策 a：suExists block worker 殘留（outstanding==1）
+            // 即置旗（status 等價門，雙 runner 一致）。
+            assertTrue("blocked suExists expiry must flag linger, got $r", (r as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
             assertTrue("elapsed=$elapsed", elapsed < 12_000L)
             assertEquals(1, ElevatedCleanupTracker.outstanding())
         } finally {

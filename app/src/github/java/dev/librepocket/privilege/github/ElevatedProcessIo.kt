@@ -688,8 +688,12 @@ internal object ElevatedCallSupervisor {
          * P1-2 殘留提示（PR140 Phase 2）：`hasLinger=true` 表示 supervisor worker
          * 在 grace 後仍存活（late 值仍可能送達）或曾交付逾期值。
          * spawn 路徑必須穿透至 `TimedOut.cleanupIncomplete`（late Process 缺口，
-         * 見 [awaitSpawn]）；非 spawn 路徑無 Process 資源，殘留已由 outstanding／
-         * breaker 追蹤，呼叫方映射 `preSpawnExpired(false)` 保持既有契約。
+         * 見 [awaitSpawn]）；非 spawn 路徑見 R3-PhaseG P2-4 旗標契約
+         * （[ElevatedRunnerCommon.preSpawnLinger]）：`cleanupIncomplete` 涵蓋
+         * background worker，`hasLinger || outstanding>0` 即置旗，不再一律 false。
+         *
+         * R3-PhaseG P2-2：任何 `Ok` 返回前皆經 deadline＋中斷 postcheck
+         * （worker 在 deadline 後交付但 caller 延遲醒來不得回 Ok，見 [awaitInternal]）。
          */
         data class Expired(val hasLinger: Boolean = false) : Res<Nothing>
     }
@@ -697,11 +701,22 @@ internal object ElevatedCallSupervisor {
     private data class Val<T>(val v: T)
     private data class Thr(val t: Throwable)
 
-    fun remainingMs(deadlineNanos: Long): Long =
-        TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()).coerceAtLeast(0L)
+    /**
+     * R3-PhaseG P2-2 可注入時鐘接縫：`nowNanos` 預設單調時鐘（`System.nanoTime`），
+     * 單測傳假時鐘＋latch 排序做「worker 在 deadline 邊緣交付但 caller 延遲醒來」
+     * 的確定性迴歸（不靠 sleep 猜調度窗口）。產品呼叫沿用預設，不傳參。
+     */
+    fun remainingMs(
+        deadlineNanos: Long,
+        nowNanos: () -> Long = { System.nanoTime() },
+    ): Long =
+        TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L)
 
-    fun isExpired(deadlineNanos: Long): Boolean =
-        (deadlineNanos - System.nanoTime()) <= 0L
+    fun isExpired(
+        deadlineNanos: Long,
+        nowNanos: () -> Long = { System.nanoTime() },
+    ): Boolean =
+        (deadlineNanos - nowNanos()) <= 0L
 
     /**
      * spawn 前阻塞體有界（grant／activation／bridge／status／suExists 共用；
@@ -719,8 +734,12 @@ internal object ElevatedCallSupervisor {
      *   `interrupt`＋grace，仍存活即 lingering（`markLingering`＋`noteUnclean`，
      *   無 drain 終審故此處直接計入 breaker；watcher 殘留同計，單 call 恰好一次）；
      *   `Expired.hasLinger` 即 block worker grace 後仍存活（watcher 殘留不穿透，
-     *   非 spawn 呼叫方一律映射 `preSpawnExpired(false)`，無 Process 資源，
-     *   殘留已追蹤，見本物件 P1-2 段）；
+     *   非 spawn 呼叫方經 [ElevatedRunnerCommon.preSpawnLinger] 映射旗標，
+     *   見 R3-PhaseG P2-4 契約）；
+     * - R3-PhaseG P2-2 快路徑 postcheck：watcher 從未啟動的 `Ok` 返回前重驗
+     *   deadline＋呼叫執行緒中斷（worker 在 deadline 後交付但 caller 延遲醒來
+     *   不得回 Ok，逾期即 `Expired` 丟棄交付值，非 spawn 無 owner 缺口）；
+     *   慢路徑 handoff 的取消證據檢查即 postcheck（見 [awaitInternal]）。
      * - R3-PhaseF review G1 決策 (a) 慢成功照常成功＋caller-claim 合成：watcher
      *   啟動後已交付 Val 仍須消費——曾見明確 false（[CancelWatch.observedFalse]）＋
      *   無取消證據（bit 真／中斷／deadline 皆無）即 Ok handoff，不因超首 POLL 而
@@ -733,15 +752,17 @@ internal object ElevatedCallSupervisor {
     fun <T> awaitPreSpawn(
         deadlineNanos: Long,
         isCancelled: () -> Boolean,
+        nowNanos: () -> Long = { System.nanoTime() },
         block: () -> T,
     ): Res<T> = awaitInternal(
         deadlineNanos = deadlineNanos,
-        cancelCheck = { Thread.currentThread().isInterrupted || isExpired(deadlineNanos) },
+        cancelCheck = { Thread.currentThread().isInterrupted || isExpired(deadlineNanos, nowNanos) },
         block = block,
         threadName = "elevated-supervisor",
         markUncleanOnLinger = true,
         hook = isCancelled,
         hookThrowMeansCancelled = true,
+        nowNanos = nowNanos,
     )
 
     /**
@@ -752,9 +773,9 @@ internal object ElevatedCallSupervisor {
      * - 快路徑（首 [POLL_MS] 內回）不額外動作，B2 計數語義不變；
      * - hook 抛 → `Err`（呼叫方 fail-closed 視為已取消＋計數，不誤放行）；
      * - lingering（grace 後仍存活）記槽＋`noteUnclean`（同 [awaitPreSpawn]，
-     *   無 drain 終審故此處直接計入 breaker）；`Expired.hasLinger` 在 pre-spawn
-     *   非 spawn 語境下呼叫方一律映射 `preSpawnExpired(false)`（無 Process 資源，
-     *   殘留已由 outstanding／breaker 追蹤，見 [ElevatedRunnerCommon]）。
+     *   無 drain 終審故此處直接計入 breaker）；`Expired.hasLinger` 經
+     *   [ElevatedRunnerCommon.preSpawnLinger] 映射旗標（R3-PhaseG P2-4），
+     *   見 [ElevatedRunnerCommon]）。
      *
      * 與 [awaitPreSpawn] 的分工：後者為阻塞體監督（慢路徑 hook 另跑
      * [CancelWatch] watcher 連續觀察，見其 KDoc）；本函數為 hook 本體單次求值
@@ -764,12 +785,14 @@ internal object ElevatedCallSupervisor {
     fun awaitCancelBit(
         deadlineNanos: Long,
         isCancelled: () -> Boolean,
+        nowNanos: () -> Long = { System.nanoTime() },
     ): Res<Boolean> = awaitInternal(
         deadlineNanos = deadlineNanos,
-        cancelCheck = { Thread.currentThread().isInterrupted || isExpired(deadlineNanos) },
+        cancelCheck = { Thread.currentThread().isInterrupted || isExpired(deadlineNanos, nowNanos) },
         block = { isCancelled() },
         threadName = "elevated-supervisor",
         markUncleanOnLinger = true,
+        nowNanos = nowNanos,
     )
 
     /**
@@ -803,6 +826,7 @@ internal object ElevatedCallSupervisor {
         private val deadlineNanos: Long,
         private val hook: () -> Boolean,
         private val throwMeansCancelled: Boolean,
+        private val nowNanos: () -> Long = { System.nanoTime() },
     ) {
         private val bit = AtomicBoolean(false)
         private val done = AtomicBoolean(false)
@@ -816,7 +840,7 @@ internal object ElevatedCallSupervisor {
         private val seenFalse = AtomicBoolean(false)
         private val worker = Thread({
             try {
-                while (!done.get() && !isExpired(deadlineNanos)) {
+                while (!done.get() && !isExpired(deadlineNanos, nowNanos)) {
                     val cancel: Boolean? = try {
                         hook()
                     } catch (_: Exception) {
@@ -897,8 +921,9 @@ internal object ElevatedCallSupervisor {
         deadlineNanos: Long,
         hook: () -> Boolean,
         throwMeansCancelled: Boolean,
+        nowNanos: () -> Long = { System.nanoTime() },
     ): CancelWatch {
-        val watch = CancelWatch(deadlineNanos, hook, throwMeansCancelled)
+        val watch = CancelWatch(deadlineNanos, hook, throwMeansCancelled, nowNanos)
         watch.start()
         return watch
     }
@@ -913,40 +938,57 @@ internal object ElevatedCallSupervisor {
      *   lingering 只記槽（`markLingering`），`noteUnclean` 由 drain 終審經
      *   `cleanupIncomplete` 統一計入（避免一次 drain 雙計；watcher 殘留經
      *   `hasLinger` 同通道帶出，見 drain）。
+     * - R3-PhaseG P2-2：`Ok(true)` 不代表整個 request 未逾期——drain 呼叫方須在
+     *   置 `finished` 前重驗 deadline＋取消（見 drain 等待循環 postcheck），
+     *   整體逾期完成走 kill 路徑（`timedOut=true`），與 tail 中止
+     *   （`tailIncomplete`，`timedOut` 仍 false）區分，不新增 verdict 常數。
      */
     fun awaitWaitSlice(
         process: Process,
         sliceMs: Long,
         deadlineNanos: Long,
         isCancelled: () -> Boolean,
+        nowNanos: () -> Long = { System.nanoTime() },
     ): Res<Boolean> = awaitInternal(
         deadlineNanos = deadlineNanos,
-        cancelCheck = { Thread.currentThread().isInterrupted || isExpired(deadlineNanos) },
+        cancelCheck = { Thread.currentThread().isInterrupted || isExpired(deadlineNanos, nowNanos) },
         block = { process.waitFor(sliceMs, TimeUnit.MILLISECONDS) },
         threadName = "elevated-wait",
         markUncleanOnLinger = false,
         hook = isCancelled,
         hookThrowMeansCancelled = false,
+        nowNanos = nowNanos,
     )
 
     /** 通用有界（verify／exitValue 用，不查 cancel，只看 deadline＋interrupt）。 */
     fun <T> awaitTimeout(
         timeoutMs: Long,
         threadName: String,
+        nowNanos: () -> Long = { System.nanoTime() },
         block: () -> T,
     ): Res<T> {
-        val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(
+        val deadlineNanos = nowNanos() + TimeUnit.MILLISECONDS.toNanos(
             timeoutMs.coerceAtLeast(0L).coerceAtMost(Long.MAX_VALUE / 1_000_000L),
         )
         return awaitInternal(
             deadlineNanos = deadlineNanos,
-            cancelCheck = { Thread.currentThread().isInterrupted || isExpired(deadlineNanos) },
+            cancelCheck = { Thread.currentThread().isInterrupted || isExpired(deadlineNanos, nowNanos) },
             block = block,
             threadName = threadName,
             markUncleanOnLinger = false,
+            nowNanos = nowNanos,
         )
     }
 
+    /**
+     * R3-PhaseG P2-2：`Ok` 返回前一律 postcheck（快慢路徑皆然）。
+     * 快路徑（`watch` 從未啟動）舊碼見 worker 已死即回 `Ok`：caller 被調度延遲、
+     * worker 在 deadline 後交付但 caller 復甦前結束即把逾期完成映為成功。
+     * 現快路徑 `Val` 返回前重驗 deadline＋呼叫執行緒中斷，逾期／中斷即 `Expired`
+     * （worker 已死故 `hasLinger=false`；非 spawn 無 owner 缺口，交付值丟棄）。
+     * hook 本體仍不求值（B2 快路徑零 hook 求值計數語義不變）；慢路徑 handoff 的
+     * 取消證據檢查（`cancelNow`：中斷／bit／deadline）即等效 postcheck。
+     */
     private fun <T> awaitInternal(
         deadlineNanos: Long,
         cancelCheck: () -> Boolean,
@@ -955,9 +997,10 @@ internal object ElevatedCallSupervisor {
         markUncleanOnLinger: Boolean,
         hook: (() -> Boolean)? = null,
         hookThrowMeansCancelled: Boolean = true,
+        nowNanos: () -> Long = { System.nanoTime() },
     ): Res<T> {
         // P1-3 入口 preflight：budget 已盡即不啟 worker（零執行緒、零殘留）。
-        if (isExpired(deadlineNanos)) return Res.Expired(hasLinger = false)
+        if (isExpired(deadlineNanos, nowNanos)) return Res.Expired(hasLinger = false)
         val holder = AtomicReference<Any?>()
         val state = AtomicInteger(0)
         val worker = Thread({
@@ -991,7 +1034,7 @@ internal object ElevatedCallSupervisor {
             if (Thread.currentThread().isInterrupted) return true
             val w = watch
             if (w != null && w.bit()) return true
-            return isExpired(deadlineNanos)
+            return isExpired(deadlineNanos, nowNanos)
         }
         // 無 hook 呼叫方（awaitTimeout／verify 系）：沿既有用中斷＋deadline 判定。
         fun legacyCancel(): Boolean =
@@ -1060,6 +1103,15 @@ internal object ElevatedCallSupervisor {
                             // 不樂觀消費（PhaseB caller-claim 確定性）。
                             val watchLingering = closeWatch()
                             if (watchLingering && markUncleanOnLinger) ElevatedCleanupTracker.noteUnclean()
+                            // R3-PhaseG P2-2：關 watcher 期間的邊緣回傳兜底（見
+                            // awaitSpawn 同位檢查）：此處已無取消證據，但關 watcher
+                            // 的 grace 可把 caller 推過 deadline，仍不當成功。
+                            val edgeOverdue = try {
+                                isExpired(deadlineNanos, nowNanos)
+                            } catch (_: Exception) {
+                                true
+                            } || Thread.currentThread().isInterrupted
+                            if (edgeOverdue) return Res.Expired(hasLinger = false)
                             @Suppress("UNCHECKED_CAST")
                             return Res.Ok((h as Val<T>).v)
                         }
@@ -1067,6 +1119,17 @@ internal object ElevatedCallSupervisor {
                     } else {
                         val watchLingering = closeWatch()
                         if (watchLingering && markUncleanOnLinger) ElevatedCleanupTracker.noteUnclean()
+                        // R3-PhaseG P2-2 快路徑 postcheck（見本函數 KDoc）：worker
+                        // 已死＋watcher 從未啟動時，仍須重驗 deadline＋中斷。
+                        // Thr／無交付（Err 語義）不轉 Expired，只有成功交付才驗。
+                        if (h is Val<*>) {
+                            val overdue = try {
+                                isExpired(deadlineNanos, nowNanos)
+                            } catch (_: Exception) {
+                                true
+                            } || Thread.currentThread().isInterrupted
+                            if (overdue) return Res.Expired(hasLinger = false)
+                        }
                         return when (h) {
                             is Val<*> -> {
                                 @Suppress("UNCHECKED_CAST")
@@ -1078,7 +1141,7 @@ internal object ElevatedCallSupervisor {
                     }
                 }
                 if (hook != null && watch == null) {
-                    watch = startCancelWatch(deadlineNanos, hook, hookThrowMeansCancelled)
+                    watch = startCancelWatch(deadlineNanos, hook, hookThrowMeansCancelled, nowNanos)
                 }
                 val shouldExpire = try {
                     if (hook != null) cancelNow() else legacyCancel()
@@ -1189,10 +1252,11 @@ internal object ElevatedCallSupervisor {
         deadlineNanos: Long,
         isCancelled: () -> Boolean,
         killer: (Process) -> Unit,
+        nowNanos: () -> Long = { System.nanoTime() },
         block: () -> Process,
     ): Res<Process> {
         // P1-3 入口 preflight：budget 已盡即不提交 spawn（零特權進程）。
-        if (isExpired(deadlineNanos)) return Res.Expired(hasLinger = false)
+        if (isExpired(deadlineNanos, nowNanos)) return Res.Expired(hasLinger = false)
         val expired = AtomicBoolean(false)
         val holder = AtomicReference<Any?>()
         val state = AtomicInteger(0)
@@ -1351,7 +1415,7 @@ internal object ElevatedCallSupervisor {
                     if (h is Val<*> && watch != null) {
                         val w0 = watch
                         val expiredNow = Thread.currentThread().isInterrupted ||
-                            w0.bit() || isExpired(deadlineNanos)
+                            w0.bit() || isExpired(deadlineNanos, nowNanos)
                         if (expiredNow) {
                             return expireWorker()
                         } else if (w0.observedFalse()) {
@@ -1361,7 +1425,7 @@ internal object ElevatedCallSupervisor {
                             if (watch?.close() == true) countUncleanOnce()
                             // P1-3 返回後再確認 deadline（上一行已確認未逾期，此處為
                             // 關 watcher 期間的邊緣回傳兜底，仍不當成功即補償）。
-                            if (isExpired(deadlineNanos)) {
+                            if (isExpired(deadlineNanos, nowNanos)) {
                                 expired.set(true)
                                 @Suppress("UNCHECKED_CAST")
                                 val v = (h as Val<Process>).v
@@ -1382,7 +1446,7 @@ internal object ElevatedCallSupervisor {
                                 // 之後）不當成功，CAS 取回＋daemon 補償＋Expired(true)。
                                 // R2-PhaseB：同一受槽 daemon（見 startLateDaemon），不再裸起
                                 // untracked daemon；CAS 失敗即 worker 已認領，放手。
-                                if (isExpired(deadlineNanos)) {
+                                if (isExpired(deadlineNanos, nowNanos)) {
                                     expired.set(true)
                                     @Suppress("UNCHECKED_CAST")
                                     val v = (h as Val<Process>).v
@@ -1398,18 +1462,18 @@ internal object ElevatedCallSupervisor {
                             else -> {
                                 // worker 已死無交付：仍確認 deadline（reset 競態下
                                 // 的逾期完成不當成功，直回 Expired(false)，無資源）。
-                                if (isExpired(deadlineNanos)) return Res.Expired(hasLinger = false)
+                                if (isExpired(deadlineNanos, nowNanos)) return Res.Expired(hasLinger = false)
                                 return Res.Err(IllegalStateException("supervisor worker died without result"))
                             }
                         }
                     }
                 }
-                val w = watch ?: startCancelWatch(deadlineNanos, isCancelled, true).also { watch = it }
+                val w = watch ?: startCancelWatch(deadlineNanos, isCancelled, true, nowNanos).also { watch = it }
                 val shouldExpire = try {
                     if (Thread.currentThread().isInterrupted) {
                         true
                     } else {
-                        w.bit() || isExpired(deadlineNanos)
+                        w.bit() || isExpired(deadlineNanos, nowNanos)
                     }
                 } catch (_: Exception) {
                     true
@@ -1600,10 +1664,13 @@ internal object ElevatedCallSupervisor {
     }
 
     /** B3 有界 `exitValue`（finished 後 Binder 亦可 stall）：超界即 Expired＋殘留記槽。 */
-    fun exitValueBounded(process: Process): Res<Int> {
+    fun exitValueBounded(
+        process: Process,
+        nowNanos: () -> Long = { System.nanoTime() },
+    ): Res<Int> {
         // B3 debug: preset-interrupt cleared path must not expire for immediate exitValue.
         // 若此處頻繁 Expired 且 `isInterrupted=false`，即 worker 啟動／調度異常，需查線程池。
-        return awaitTimeout(EXIT_JOIN_MS, "elevated-supervisor") { process.exitValue() }
+        return awaitTimeout(EXIT_JOIN_MS, "elevated-supervisor", nowNanos) { process.exitValue() }
     }
 }
 
@@ -1729,6 +1796,7 @@ internal object ElevatedProcessIo {
         timeoutMs: Long,
         hardCapBytes: Int = ShellPolicy.HARD_READ_CAP_BYTES,
         hardCapErrBytes: Int? = null,
+        nowNanos: () -> Long = { System.nanoTime() },
     ): Drained =
         drain(
             process,
@@ -1737,6 +1805,7 @@ internal object ElevatedProcessIo {
             { Thread.currentThread().isInterrupted },
             hardCapBytes,
             hardCapErrBytes,
+            nowNanos,
         )
 
     /**
@@ -1764,6 +1833,19 @@ internal object ElevatedProcessIo {
      * tail 一律只讀緩存 bit，caller 永不直調 hook（blocked hook 只卡 watcher，
      * caller 經 deadline 有界進 kill／tail 中止）。drain 返回前 watcher 收斂：
      * 殘留即記槽＋`cleanupIncomplete=true`（由終審統一進 breaker）。
+     *
+     * R3-PhaseG P2-2 整體逾期完成（命令 exit vs 整個 request 逾期分開）：
+     * [awaitWaitSlice] 回 `Ok(true)` 只代表該片內命令已 exit，不代表整個 request
+     * 未逾期——置 `finished` 前重驗 deadline＋取消＋[cancelledAtEntry]（見等待循環
+     * postcheck）：整體逾期完成走 kill 路徑（`timedOut=true`），與 tail 中止
+     * （`tailIncomplete=true` 但 `timedOut` 仍 false，命令 exit 語義不動）區分，
+     * 不新增 verdict 常數（runner 兩路徑皆映 `TimedOut`，審計皆 `TIMEOUT`）。
+     *
+     * R3-PhaseG P2-3 入口取消一次性決策（[cancelledAtEntry]）：入口
+     * `Thread.interrupted()` 快照在清旗的同時轉為一次性取消決策——預置中斷的
+     * caller 進 drain 即走受監督 kill 路徑（killer＋有界驗證＋終審計入 breaker，
+     * 進程已啟動不當健康進程跑），不再因清旗後預設鉤讀到 false 而健康跑到
+     * timeout。清旗＋出口恢復保證不變（不吞 caller 中斷）。
      */
     fun drain(
         process: Process,
@@ -1772,26 +1854,32 @@ internal object ElevatedProcessIo {
         isCancelled: () -> Boolean,
         hardCapBytes: Int = ShellPolicy.HARD_READ_CAP_BYTES,
         hardCapErrBytes: Int? = null,
+        nowNanos: () -> Long = { System.nanoTime() },
     ): Drained {
-        // P2 caller 中斷級聯（僅監測，不改 verdict）：入口 `Thread.interrupted()`
-        // 清除並記錄呼叫方預置中斷（清除後 isCancelled 預設鉤不再誤讀 caller 旗標，
-        // 健康進程仍走 finished；尾收前 joins 不再因預置中斷即抛），出口恢復一次
-        // （不吞 caller 中斷）。join 前不再暫清：入口已清，全程無 caller 旗標干擾。
+        // P2 caller 中斷級聯＋R3-PhaseG P2-3 一次性決策：入口 `Thread.interrupted()`
+        // 清除並記錄呼叫方預置中斷。清除保證尾收前 joins 不再因預置中斷即抛；
+        // 同步記錄的 [cancelledAtEntry] 保證已取消不因清旗而遺失——預置中斷的
+        // caller 進 drain 即 cancel，走下方受監督 kill 路徑（kill＋驗證＋終審），
+        // 不當健康進程跑。出口恢復一次（不吞 caller 中斷）。
         val callerInterrupted = Thread.interrupted()
+        // R3-PhaseG P2-3：入口取消快照（一次性，不重讀）。只取無阻塞的中斷位，
+        // 永不在此直調 `isCancelled`（blocked hook 只卡 watcher，見 PhaseF）；
+        // job 式取消由 drain 級 watcher 在首片內觀測到位，同样有界收斂。
+        val cancelledAtEntry = callerInterrupted
         // X1 有界 acquisition：deadline 移到 drain 入口第一行（outputStream 關閉
         // 之前），全部開銷計入同一 budget（單調時鐘，不受 wall-clock 回撥影響）。
         // P2 上溢夾頂：timeoutMs 先 coerceAtMost(Long.MAX/1e6)，避免
         // MILLISECONDS.toNanos(Long.MAX) 上溢回負（deadline 回過去即假性即時超時，
         // Long.MAX 應為近無限而非即時超時；夾頂後 Long.MAX 即約 292M 年，不懸掛）。
         val safeTimeoutMs = timeoutMs.coerceAtLeast(0L).coerceAtMost(Long.MAX_VALUE / 1_000_000L)
-        val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(safeTimeoutMs)
+        val deadlineNanos = nowNanos() + TimeUnit.MILLISECONDS.toNanos(safeTimeoutMs)
         // P1-3 drain 入口 preflight（PR140 Phase 2，最小改動）：budget 已盡即不起
         // gobbler／stdin-closer（零新執行緒），直接監督殺＋有界驗證後回
         // `Drained(timedOut=true)`。殺驗語義同 kill 路徑（killer 永不跳過，下界
         // [CLEANUP_MIN_MS]；驗證走有界 [verifyParentStoppedBounded]），終審計入
         // breaker 同正常路徑；caller 預置中斷照常出口恢復。流未起即無已取引用可關
         // （killer 契約本就不碰流；此 Process 的流隨 kill＋物件回收收斂）。
-        if ((deadlineNanos - System.nanoTime()) <= 0L) {
+        if ((deadlineNanos - nowNanos()) <= 0L) {
             var preIncomplete = false
             val preOk = runCleanupBounded(CLEANUP_MIN_MS) {
                 try {
@@ -1857,7 +1945,7 @@ internal object ElevatedProcessIo {
             it.start()
         }
         try {
-            val stdinRemainMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime())
+            val stdinRemainMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos())
                 .coerceAtLeast(0L)
             val stdinBudgetMs = minOf(stdinRemainMs, STDIN_CLOSE_MAX_MS)
             if (stdinBudgetMs > 0L) stdinCloser.join(stdinBudgetMs)
@@ -1937,19 +2025,32 @@ internal object ElevatedProcessIo {
         // deadline，永不直調 hook（blocked hook 只卡 watcher，caller 經 deadline
         // 有界進 kill／tail 中止）。gobbler 起後、wait 輪詢前啟動（首求值時機≈舊
         // 主循環首輪 hook 位，B2 計數語義不變）。
-        val cancelWatch = ElevatedCallSupervisor.startCancelWatch(deadlineNanos, isCancelled, false)
+        val cancelWatch = ElevatedCallSupervisor.startCancelWatch(deadlineNanos, isCancelled, false, nowNanos)
         // 受信取消讀閉包：傳入 [awaitWaitSlice]（其慢路徑 watcher 再包一層求此位，
         // 永不觸不可信代碼，見其 KDoc 契約）與 tail 循環。
         val cancelBit: () -> Boolean = { cancelWatch.bit() }
         try {
             while (true) {
-                // R3-PhaseF：只讀緩存 bit（hook 在 watcher worker 求值，此處永不直調）。
-                if (cancelBit()) break
-                val remaining = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime())
+                // R3-PhaseF＋PhaseG P2-3：只讀緩存 bit（hook 在 watcher worker 求值，
+                // 此處永不直調）＋入口一次性 [cancelledAtEntry]。預置中斷的 caller
+                // 在此即 break 走 kill 路徑，不當健康進程跑。
+                if (cancelledAtEntry || cancelBit()) break
+                val remaining = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos())
                 if (remaining <= 0) break
                 val slice = minOf(remaining, POLL_SLICE_MS)
-                when (val w = ElevatedCallSupervisor.awaitWaitSlice(process, slice, deadlineNanos, cancelBit)) {
+                when (val w = ElevatedCallSupervisor.awaitWaitSlice(process, slice, deadlineNanos, cancelBit, nowNanos)) {
                     is ElevatedCallSupervisor.Res.Ok -> if (w.v) {
+                        // R3-PhaseG P2-2 postcheck：該片 `waitFor==true` 只代表命令
+                        // 已 exit，不代表整個 request 未逾期。整體逾期完成
+                        // （deadline 已過／caller 已取消／入口已取消）不得置
+                        // finished——break 走 kill 路徑（`timedOut=true`），與 tail
+                        // 中止（`tailIncomplete`，`timedOut` 仍 false）區分。
+                        // 逾期完成不攜 linger（slice worker 已死），只 break。
+                        val overdueOrCancelled = cancelledAtEntry ||
+                            Thread.currentThread().isInterrupted ||
+                            cancelBit() ||
+                            ElevatedCallSupervisor.isExpired(deadlineNanos, nowNanos)
+                        if (overdueOrCancelled) break
                         finished = true
                         break
                     }
@@ -2000,7 +2101,7 @@ internal object ElevatedProcessIo {
             // Z1 kill 路徑清理監督化：killer＋已取流 close 包入單一 daemon worker，
             // 有界 join；超界 interrupt＋grace。永不跳過 killer 嘗試（下界保底）。
             // X1 語義保留：只關已取流，不再重調 getter（根除 kill 路徑 getter 阻塞）。
-            val cleanupRemainMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime())
+            val cleanupRemainMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos())
                 .coerceAtLeast(0L)
             val cleanupBudgetMs = minOf(maxOf(cleanupRemainMs, CLEANUP_MIN_MS), CLEANUP_JOIN_MS)
             val cleanupOk = runCleanupBounded(cleanupBudgetMs) {
@@ -2080,13 +2181,13 @@ internal object ElevatedProcessIo {
             // interrupt，不受影響；只有卡死執行緒才走到記槽分支。
             // 無界 join 在遠端流永不 EOF 時可卡死超 timeoutMs，故不用。
             val tailBudgetMs = minOf(
-                TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()).coerceAtLeast(0L),
+                TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L),
                 FINISHED_TAIL_BUDGET_MS,
             )
-            val tailDeadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(tailBudgetMs)
+            val tailDeadlineNanos = nowNanos() + TimeUnit.MILLISECONDS.toNanos(tailBudgetMs)
             fun tailRemainMs(): Long = minOf(
-                TimeUnit.NANOSECONDS.toMillis(tailDeadlineNanos - System.nanoTime()).coerceAtLeast(0L),
-                TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()).coerceAtLeast(0L),
+                TimeUnit.NANOSECONDS.toMillis(tailDeadlineNanos - nowNanos()).coerceAtLeast(0L),
+                TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L),
             )
             var tailAborted = false
             fun joinFinishedTail(t: Thread, counted: AtomicInteger) {
@@ -2102,10 +2203,11 @@ internal object ElevatedProcessIo {
                     return
                 }
                 while (t.isAlive) {
-                    // R3-PhaseF：只讀緩存 bit（hook 在 watcher worker 求值，此處永不
-                    // 直調；拋折為未取消的語義由 watcher 側同策略承擔，不誤殺）。
-                    if (cancelBit() || Thread.currentThread().isInterrupted ||
-                        (deadlineNanos - System.nanoTime()) <= 0L
+                    // R3-PhaseF＋PhaseG P2-3：只讀緩存 bit（hook 在 watcher worker
+                    // 求值，此處永不直調；拋折為未取消的語義由 watcher 側同策略
+                    // 承擔，不誤殺）＋入口一次性 [cancelledAtEntry]。
+                    if (cancelledAtEntry || cancelBit() || Thread.currentThread().isInterrupted ||
+                        (deadlineNanos - nowNanos()) <= 0L
                     ) {
                         // 取消／呼叫執行緒中斷／deadline 耗盡：不再等流。
                         runCatching { t.interrupt() }
@@ -2182,8 +2284,10 @@ internal object ElevatedProcessIo {
         // 連續計數只計資源清理未完成（殘留執行緒／worker 持槽），避免數據錯誤
         // 誤觸熔斷。
         // B3 有界 exitValue 先行（P2 中斷恢復之前）：`exitValueBounded` 以
-        // `isInterrupted` 判超界，須在 caller 預置中斷恢復前求值，否則恢復後的
-        // 置旗會使健康進程誤判為 stall（P2 `drainPresetCallerInterrupt...` 回歸）。
+        // `isInterrupted` 判超界，須在 caller 預置中斷恢復前求值。
+        // R3-PhaseG P2-3 注記：預置中斷的 drain 已由 [cancelledAtEntry] 進 kill
+        // 路徑（`finished=false`），不到此 finished 分支；此處只處理 tail 期間
+        // 新到的中斷（join 內抛後 restore 的旗標），語義不變。
         // P1-4 tail 中斷快照清除：finished joins 在 `InterruptedException` 後一律
         // restore 旗標（見上兩分支 catch），若呼叫執行緒在 tail 期間被中斷（或預置
         // 中斷在某 join 內再次抛），此處旗標已置；不清即 `exitValueBounded` 的
@@ -2196,7 +2300,7 @@ internal object ElevatedProcessIo {
         // Expired（stall 殘留）即置 `cleanupIncomplete`，由下方終審統一進 breaker。
         val joinInterrupted = Thread.interrupted()
         val exitCode: Int = if (finished) {
-            when (val ev = ElevatedCallSupervisor.exitValueBounded(process)) {
+            when (val ev = ElevatedCallSupervisor.exitValueBounded(process, nowNanos)) {
                 is ElevatedCallSupervisor.Res.Ok -> ev.v
                 is ElevatedCallSupervisor.Res.Err -> -1
                 is ElevatedCallSupervisor.Res.Expired -> {
@@ -2494,13 +2598,14 @@ internal object ElevatedRunnerCommon {
      * 經 [ElevatedCallSupervisor.awaitCancelBit] 求值（hook 只跑 worker，呼叫側
      * 只看自身中斷＋deadline），blocked hook 不能無限卡 caller。
      * - 中斷（不清旗標）／`Ok(true)`／`Err`（hook 抛，fail-closed＋計數）→
-     *   `TimedOut`（空 partial，`cleanupIncomplete=false`；無進程故無殘留，非
-     *   spawn 語境殘留 worker 已由 outstanding／breaker 追蹤，`hasLinger` 不穿透）；
-     * - `Expired`（hook 阻塞至 deadline／grace，或 budget 耗盡）→ 同上 `TimedOut`
-     *   （有界返回，不斷 timeout 上界）；
+     *   `TimedOut`（空 partial，`cleanupIncomplete=false`；門 worker 已正常回收，
+     *   無新增殘留）；
+     * - `Expired`（hook 阻塞至 deadline／grace，或 budget 耗盡）→ `TimedOut`
+     *   （有界返回，不斷 timeout 上界），旗標經 [preSpawnLinger] 判定
+     *   （R3-PhaseG P2-4：block worker 殘留或已占 outstanding 即 true）；
      * - `Ok(false)` → null（未取消，呼叫方繼續）。
-     * 呼叫形：`checkPreSpawnCancel(timeoutMs, deadlineNanos, isCancelled)?.let { return it }`。
-     * R3-PhaseF P1-2 pre-admission 不變量：三門皆在全域席位內執行（入口門亦在
+     * 呼叫形：`checkPreSpawnCancel(timeoutMs, deadlineNanos, isCancelled)?.let { return it }`.
+     * R3-PhaseF P2-1 pre-admission 不變量：三門皆在全域席位內執行（入口門亦在
      * 准入之後，見兩 runner 准入順序——callback 未取 global lease 絕不 start
      * worker；拒絕路徑不耗 quota，佔席經 finally 釋放）。飽和／熔斷／quarantine
      * 拒絕優先於取消判定（席位未取得即無門可進，見准入 verdict 順序）。
@@ -2525,19 +2630,41 @@ internal object ElevatedRunnerCommon {
                 runCatching { ElevatedProcessIo.swallowedIsCancelledThrows.incrementAndGet() }
                 preSpawnExpired(timeoutMs, false)
             }
-            is ElevatedCallSupervisor.Res.Expired -> preSpawnExpired(timeoutMs, false)
+            is ElevatedCallSupervisor.Res.Expired -> preSpawnExpired(timeoutMs, preSpawnLinger(r.hasLinger))
         }
     }
 
     /**
+     * R3-PhaseG P2-4 非 spawn linger 旗標契約（決策 a：`cleanupIncomplete` 涵蓋
+     * background worker，不另設欄位、不改名）：
+     * - `cleanupIncomplete` 語義＝「本 request 已知有未完成清理（OS process 或
+     *   background worker 持槽殘留），需進 breaker 終審」；`false` 僅在
+     *   `!expiredHasLinger && outstanding()==0` 時成立——`result=false` 與同
+     *   request `outstanding==1` 並存即為契約違反（舊 blocked entry 缺口）；
+     * - `expiredHasLinger` 即本次監督 `Expired.hasLinger`（block worker grace 後
+     *   仍存活）；`outstanding()>0` 覆蓋 watcher-only 殘留（block 已死但 watcher
+     *   持槽）。准入序列化保證被准入 request 見到的 `outstanding>0` 必為自身
+     *   殘留（他 call 殘留會先被准入門拒，見 [ElevatedCleanupTracker]），故無
+     *   跨 request 誤傷；測試隔離另封跨測污染（見各測試 Before/After）。
+     * - 適用範圍：一切「曾啟監督 worker 的逾期」映射（cancel 門／grant／bridge／
+     *   status／suExists／validate 等 `Expired` 分支）；worker 從未啟動的純
+     *   preflight（入口 `safeTimeoutMs<=0`、quota 後顯式 `isExpired`）保持
+     *   `preSpawnExpired(false)`（零新增殘留，舊語義不動）。
+     */
+    internal fun preSpawnLinger(expiredHasLinger: Boolean): Boolean =
+        expiredHasLinger || ElevatedCleanupTracker.outstanding() > 0
+
+    /**
      * P1-2/P1-3 逾期 spawn 前 verdict（PR140 Phase 2，兩 runner 共用）：
      * 零 handoff 的 `TimedOut`（空 partial）。
-     * - `hasLinger=false`：worker 從未啟動（入口 preflight／quota 後顯式檢查）或
-     *   逾期值非 Process——無 late 進程缺口，`cleanupIncomplete=false`（舊
-     *   `preSpawnCancelled` 語義，非 spawn 逾期與取消共用）；
-     * - `hasLinger=true`：supervisor worker grace 後仍存活或確有逾期交付——
-     *   late Process 缺口（Binder 已送達不可撤回，補償結果未知），
-     *   `cleanupIncomplete=true`（僅 spawn 逾期置 true，見 [ElevatedCallSupervisor]）。
+     * - `hasLinger=false`：worker 從未啟動（入口 preflight／quota 後顯式檢查，
+     *   見 [preSpawnLinger] 適用範圍）或門 worker 已正常回收且全域無殘留——
+     *   `cleanupIncomplete=false`（舊 `preSpawnCancelled` 語義）；
+     * - `hasLinger=true`：supervisor worker grace 後仍存活、確有逾期交付、或
+     *   已占 outstanding（R3-PhaseG P2-4 決策 a：`cleanupIncomplete` 涵蓋
+     *   background worker，經 [preSpawnLinger] 判定，不再「僅 spawn 逾期置 true」）——
+     *   late Process 缺口或 background worker 殘留（Binder 已送達不可撤回／
+     *   殘留 daemon 持槽，補償或回收結果未知），`cleanupIncomplete=true`。
      */
     internal fun preSpawnExpired(timeoutMs: Long, hasLinger: Boolean): ElevatedBinaryResult.TimedOut =
         ElevatedBinaryResult.TimedOut(

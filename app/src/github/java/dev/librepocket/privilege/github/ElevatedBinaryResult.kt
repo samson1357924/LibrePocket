@@ -190,9 +190,18 @@ interface BinaryElevatedRunner : ElevatedShellRunner {
  *   fail-closed 信號經 verdict 持久帶出；`toShellResult` 照既有契約丟棄旗標）；
  * - 取消／超時同 `TimedOut`：spawn 前取消（`checkPreSpawnCancel`）、deadline
  *   耗盡（`preSpawnExpired`）、drain 超時／取消（kill 路徑）一律
- *   `TimedOut`（空 partial、`cleanupIncomplete=false` 若未建進程；
- *   spawn 逾期／kill 殘留則 `cleanupIncomplete=true`）。取消與超時在
- *   verdict 層不可區分，排障須看 `cleanupIncomplete`＋上下文；
+ *   `TimedOut`（空 partial；`cleanupIncomplete` 見下 P2-4 契約——未建進程且
+ *   全域無殘留即 false，spawn 逾期／kill 殘留／background worker 殘留即 true）。
+ *   取消與超時在 verdict 層不可區分，排障須看 `cleanupIncomplete`＋上下文；
+ * - R3-PhaseG P2-4 旗標契約（決策 a，不新增 verdict 常數／不改名）：
+ *   `cleanupIncomplete` 涵蓋 background worker（OS process＋監督／gobbler／
+ *   watcher 殘留）：一切曾啟監督 worker 的逾期映射經
+ *   `ElevatedRunnerCommon.preSpawnLinger` 判定（`hasLinger || outstanding>0`
+ *   即 true）；`result=false` 與同 request `outstanding==1` 並存即為契約違反
+ *   （舊 blocked entry 缺口，現已封）。worker 從未啟動的純 preflight
+ *   （入口零 budget、quota 後顯式過期）保持 false（零新增殘留）；spawn 逾期
+ *   沿既有 `hasLinger` 穿透（late Process 缺口）。取消門的 `Ok(true)`／`Err`
+ *   （hook 抛）仍 false（門 worker 已正常回收）。
  * - tail 取消／超時（R2-PhaseC P2-2）：finished（命令已 exit 0）但 tail 未排空
  *   （取消／deadline／tail budget 致 gobbler 中斷＋殘留，`Drained.tailIncomplete`）
  *   → `TimedOut`（攜 partial＋truncated＋cleanupIncomplete），不再回 Ok；

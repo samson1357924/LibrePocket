@@ -27,7 +27,8 @@ import org.junit.Test
  *   [ElevatedCallSupervisor.CancelWatch] worker（caller 只看中斷＋deadline＋
  *   緩存 bit）：gate 慢路徑（bridge 阻塞＋hook 第二次求值起永久阻塞）經 deadline
  *   有界回 TimedOut（零 spawn；block worker＋watcher 各記一槽，breaker 恰好一次；
- *   非 spawn 語境 `cleanupIncomplete` 保持 false）；drain 直測（finished 但流卡住
+ *   非 spawn 語境旗標經 R3-PhaseG P2-4 決策 a 置 true（background worker 殘留
+ *   即 `cleanupIncomplete=true`）；drain 直測（finished 但流卡住
  *   ＋hook 第二次求值起阻塞）經 tail budget 有界中止（`tailIncomplete` 真，
  *   gobbler 雙槽＋watcher 一槽，終審恰好一次）。
  * - R3-PhaseF review G1 決策 (a) 慢成功照常成功（T1／T2）：watcher 啟動後已交付
@@ -306,8 +307,9 @@ class ElevatedRunnerPhaseFCancelBoundTest {
             val b = resultRef.get()
             assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
             b as ElevatedBinaryResult.TimedOut
-            // 非 spawn 語境：無 late 進程缺口，旗標誠實為 false（既有契約）。
-            assertFalse("non-spawn gate expiry must not flag, got $b", b.cleanupIncomplete)
+            // R3-PhaseG P2-4 決策 a：background worker 殘留即置旗（`hasLinger ||
+            // outstanding>0`，此處 outstanding==2），不再為 false。
+            assertTrue("blocked gate expiry must flag linger, got $b", b.cleanupIncomplete)
             assertEquals("blocked gate must not spawn", 0, spawns.get())
             // hook 恰求值兩次（入口 false＋watcher 第二次阻塞）：交錯確定，不多不少。
             assertEquals("hook evals=${calls.get()}", 2, calls.get())
@@ -838,7 +840,9 @@ class ElevatedRunnerPhaseFCancelBoundTest {
             val b = resultRef.get()
             assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
             b as ElevatedBinaryResult.TimedOut
-            assertFalse("non-spawn gate expiry must not flag, got $b", b.cleanupIncomplete)
+            // R3-PhaseG P2-4 決策 a：bridge block worker 殘留（outstanding==1）
+            // 即置旗，不再為 false。
+            assertTrue("cancelled gate expiry must flag linger, got $b", b.cleanupIncomplete)
             assertEquals("cancelled gate must not spawn", 0, spawns.get())
             assertTrue(
                 "throwing hook must be counted",

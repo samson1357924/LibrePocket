@@ -30,6 +30,13 @@ object ElevatedDispatch {
      * reasonCode、執行與審計；凍結失敗即 `Denied(BLACKLISTED)` 且零
      * spawn（審計以空 argv 記一筆 DENY）。
      *
+     * Round-3 Phase H（P2-5）：runner throw 審計由下游客
+     * [ShellExecTool.executeElevated] 保證（非致命 throw 映 `Failed`＋一筆
+     * FAILED 審計，致命重抛前亦已盡力審計），本函數不再另包 try/catch——
+     * 重複捕捉即重複審計（`audit.size()==2` 違反單筆契約），故此處刻意只做
+     * 單一委派；「所有執行必有一筆審計」由工具層單點保證（直調工具層與經
+     * dispatch 同契約，見工具層 KDoc）。
+     *
      * @param tool 必須是 `shell.elevated` 的 [ToolDef]（斷言防誤用）。
      * @param confirmed 當輪二次確認。
      * @param projection 投影（`privilege_bridge` 未開即 UNAVAILABLE，先擋）。

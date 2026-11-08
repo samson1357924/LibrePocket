@@ -214,6 +214,14 @@ import java.util.concurrent.TimeUnit
  * 現 would-be Ok（exit 0 且無 readFailed）升級 `TimedOut`（攜 partial＋truncated＋
  * cleanupIncomplete），不再回 Ok；`readFailed`／非零 exit 仍既有 `Failed`
  * （皆非 Ok，安全）。審計記 TIMEOUT（見 verdict 坍縮表）。
+ *
+ * R3-PhaseH P2-6 入口順序（PR140 Round-3）：flavor→deadline→preflight→席位→
+ * （席內）取消門→（席內同 deadline 監督）argv 快照→bridge→validate→…。
+ * 舊碼快照在 deadline／席位之前，直拷貝非受信任 List 即資源門外無界
+ * （阻塞 iterator 卡呼叫執行緒、極大 argv OOM）；現快照在席位內經
+ * [ElevatedCallSupervisor.awaitPreSpawn]（超界即 `TimedOut` 零 spawn，殘留進
+ * slot／breaker 終審），上限見 [ShellPolicy.copyArgvBounded]。flavor／deadline／
+ * preflight／席位本身語義不動（E/F/G 已定，只調順序：三者皆不觸碰 argv）。
  */
 class RootSuRunner(
     private val privateRoot: String? = null,
@@ -252,19 +260,10 @@ class RootSuRunner(
         runBinary(request, timeoutMs).toShellResult()
 
     override fun runBinary(request: ElevatedRequest, timeoutMs: Long): ElevatedBinaryResult {
-        // P1-2 不變快照（入口即凍結）：後續 validation／容量特判／spawn 一律用
-        // 同一份已核驗快照，不再觸碰原始 request.argv（MutableList 在 grant／
-        // bridge／status supplier 內竄改亦不影響本份，見 ElevatedExecPolicy）。
-        // Phase 4（F9）：凍結失敗（併發竄改致拷貝抛）即 Denied 且零 spawn，
-        // 不外抛（Denied＋審計契約：上游 ShellExecTool 仍寫一筆 DENY）。
-        val snapshot = ElevatedExecPolicy.snapshot(request) ?: return ElevatedBinaryResult.Denied(
-            ShellDeny.BLACKLISTED,
-            "elevated snapshot failed (fail-closed, no spawn)",
-        )
-        val argvSnapshot: List<String> = snapshot.argv
-        val reasonSnapshot: String = snapshot.reasonCode
         // V1 全域 flavor 門（owner 新 P1-1，github-only）：首位即拒，
         // grantCheck／activation／bridge／spawn 之前（flavor 為構造屬性，fail-closed 早拒）。
+        // Round-3 Phase H（P2-6）：本門與 deadline／准入皆不觸碰 argv，故一律置於
+        // 快照之前——argv 入站上限與凍結只在此後執行（快照在席位內、同 deadline 監督）。
         if (flavor != Flavor.GITHUB) {
             return ElevatedBinaryResult.Denied(
                 ShellDeny.NOT_WHITELISTED,
@@ -275,6 +274,8 @@ class RootSuRunner(
         // 後續阻塞外部回呼（授權讀取／su 探測／spawn）＋有界取消門＋drain 皆以
         // 剩餘為上界，超界即 TimedOut（零 spawn／零殘留語義同既有取消，不耗 quota）。
         // R2-PhaseC P2-1：deadline 先算（純算術，非阻塞），取消門才有界可依。
+        // Round-3 Phase H（P2-6）：deadline 計算本身不觸碰 argv（純算術），故置於
+        // 快照之前——快照拷貝（含阻塞 iterator）納入同一 deadline 監督（見下）。
         val safeTimeoutMs = timeoutMs.coerceAtLeast(0L).coerceAtMost(Long.MAX_VALUE / 1_000_000L)
         val deadlineNanos = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(safeTimeoutMs)
         // P1-3 入口 preflight（PR140 Phase 2）：`safeTimeoutMs<=0` 即 budget 全無，
@@ -328,6 +329,38 @@ class RootSuRunner(
         // 經 Expired 有界回 preSpawnExpired，不斷 timeout 上界；席內執行（已占席，
         // 拒絕經 finally 釋席，不耗配額）。
         ElevatedRunnerCommon.checkPreSpawnCancel(timeoutMs, deadlineNanos, isCancelled)?.let { return it }
+        // Round-3 Phase H（P2-6）：argv 快照在席位內、同 deadline 監督。
+        // 舊碼快照在 deadline／席位之前（`ArrayList(request.argv)` 直拷貝）：自訂
+        // AbstractList 的阻塞 iterator／極大 argv OOM 皆在資源門外無界。
+        // 現快照經 [ElevatedCallSupervisor.awaitPreSpawn]（快路徑 µs 級，不額外調鉤，
+        // B2 計數語義不變；慢／阻塞路徑超界即 `Expired`→`TimedOut` 零 spawn，殘留進
+        // slot／breaker 終審）：
+        // - P1-2 不變語義保留：後續 validation／容量特判／spawn 一律用同一份已核驗
+        //   快照，不再觸碰原始 request.argv（MutableList 在 grant／bridge supplier 內
+        //   竄改亦不影響本份，見 [ElevatedExecPolicy]）；
+        // - Phase 4（F9）保留：拷貝抛（併發竄改）即 `Denied(BLACKLISTED)` 零 spawn；
+        // - P2-6 入站上限（見 [ShellPolicy.copyArgvBounded]：argc≤64／單項≤4K 字元／
+        //   總量≤64K＋孤立代理拒絕）超限同映 `Denied(BLACKLISTED)` 零 spawn；
+        // - 已取消（首門）先於快照：已取消即 TimedOut，不為無效呼叫起快照 worker。
+        val snapshotRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) {
+            ElevatedExecPolicy.snapshot(request)
+        }
+        val snapshot = when (snapshotRes) {
+            is ElevatedCallSupervisor.Res.Ok -> snapshotRes.v ?: return ElevatedBinaryResult.Denied(
+                ShellDeny.BLACKLISTED,
+                "elevated snapshot failed (fail-closed, no spawn)",
+            )
+            is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
+                ShellDeny.BLACKLISTED,
+                "elevated snapshot failed (fail-closed, no spawn)",
+            )
+            is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(
+                timeoutMs,
+                ElevatedRunnerCommon.preSpawnLinger(snapshotRes.hasLinger),
+            )
+        }
+        val argvSnapshot: List<String> = snapshot.argv
+        val reasonSnapshot: String = snapshot.reasonCode
         // U1：bridge 當次 call 新鮮求值快照一次，供 validate 與橋門共用
         //（同 call 內一致；B3 有界：超界／取消即 TimedOut 零 spawn，不耗 quota）。
         val bridgeRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) { bridgeGranted() }

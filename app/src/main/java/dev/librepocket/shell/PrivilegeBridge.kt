@@ -1,6 +1,7 @@
 package dev.librepocket.shell
 
 import java.io.File
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * 提權子進程預留介面（BACKLOG D05/D09，矩陣 §3）。
@@ -28,6 +29,25 @@ data class ElevatedRequest(
 )
 
 /**
+ * 快照專用有界門上限（Round-3 Phase H，P2-6）：
+ * - [SNAPSHOT_MAX_WAIT_MS]：入口凍結等待上界（固定 1s，與執行 `timeoutMs` 無關——
+ *   凍結是廉價結構准入（正常 argv 為 µs 級），不是執行 budget；阻塞 iterator 在此
+ *   界內 fail-closed，不把呼叫執行緒無限卡住）；
+ * - [SNAPSHOT_GRACE_MS]：超界後 `interrupt` 再等的 grace（worker 仍存活即殘留，
+ *   見下）。
+ *
+ * 殘餘誠實聲明：超界殘留的 worker 為 daemon（不擋 JVM 退出），但若其阻塞於不可中斷
+ * 操作即永久持一份 argv 引用（單次呼叫至多一殘留；供給阻塞 list 的本來就是呼叫方
+ * 自身，屬自限 DoS，不放大為跨呼叫無界 worker——每次凍結恰一 worker，絕無一呼叫
+ * 多 worker）。github 側 runner 內快照另經 `awaitPreSpawn` 同 deadline 監督
+ * （殘留進 slot／breaker 終審，見 runner KDoc），本門只覆 main 側入口。
+ */
+internal const val SNAPSHOT_MAX_WAIT_MS: Long = 1_000L
+
+/** 快照門超界 grace（見上）。 */
+internal const val SNAPSHOT_GRACE_MS: Long = 200L
+
+/**
  * Phase 4（P2-1，PR #140）：入口防禦性凍結。
  *
  * 呼叫方可能傳入 `MutableList` 並保留引用，在 runner 執行期間
@@ -37,13 +57,54 @@ data class ElevatedRequest(
  * 同一份凍結物件。拷貝本身可能因併發竄改抛
  * [java.util.ConcurrentModificationException]（見 F9），故包
  * runCatching，失敗回 null，呼叫方 fail-closed 拒絕且零 spawn。
+ *
+ * Round-3 Phase H（P2-6）：拷貝體換為 [ShellPolicy.copyArgvBounded]
+ *（argc≤64／單項≤4K 字元／總量≤64K UTF-8 位元組＋孤立代理拒絕，超限回 null，
+ * 呼叫方同映 `Denied(BLACKLISTED)` 零 spawn），且整體跑快照專用有界門——自訂
+ * `AbstractList` 的 `iterator()`／`size()` 可永久阻塞呼叫執行緒（舊 `runCatching`
+ * 不足：抛可收斂，阻塞不可），現拷貝跑 daemon worker、呼叫側 `join` 上界
+ * （[SNAPSHOT_MAX_WAIT_MS]＋[SNAPSHOT_GRACE_MS]），阻塞即 fail-closed 回 null
+ * （零 spawn、不建無界背景 worker：每凍結恰一 worker；中斷後仍存活即 daemon 殘留，
+ * 見上殘餘聲明）。起線程失敗同樣回 null（資源枯竭 fail-closed）。
  */
-internal fun ElevatedRequest.frozenOrNull(): ElevatedRequest? = runCatching {
-    ElevatedRequest(
-        java.util.Collections.unmodifiableList(ArrayList(argv)),
-        reasonCode,
-    )
-}.getOrNull()
+internal fun ElevatedRequest.frozenOrNull(): ElevatedRequest? {
+    val holder = AtomicReference<Any?>()
+    val worker = Thread({
+        try {
+            holder.set(ShellPolicy.copyArgvBounded(argv))
+        } catch (t: Throwable) {
+            // copyArgvBounded 內已全收斂（理論不可達）；兜底不外抛。
+            holder.set(t)
+        }
+    }, "elevated-snapshot")
+    worker.isDaemon = true
+    try {
+        worker.start()
+    } catch (_: Throwable) {
+        return null
+    }
+    try {
+        worker.join(SNAPSHOT_MAX_WAIT_MS)
+    } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        runCatching { worker.interrupt() }
+        return null
+    }
+    if (worker.isAlive) {
+        runCatching { worker.interrupt() }
+        runCatching { worker.join(SNAPSHOT_GRACE_MS) }
+        return null
+    }
+    val h = holder.get()
+    if (h is List<*>) {
+        @Suppress("UNCHECKED_CAST")
+        return ElevatedRequest(
+            java.util.Collections.unmodifiableList(h as List<String>),
+            reasonCode,
+        )
+    }
+    return null
+}
 
 /**
  * 提權執行器介面（僅介面）。D05 階段不提供真實現；

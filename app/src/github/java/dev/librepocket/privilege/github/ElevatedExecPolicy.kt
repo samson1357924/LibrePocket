@@ -56,12 +56,24 @@ internal object ElevatedExecPolicy {
      * 而抛 [java.util.ConcurrentModificationException]，故包 runCatching，
      * 失敗回 null；兩 runner 入口 `?: Denied(BLACKLISTED, "snapshot failed")`
      * 且零 spawn（Denied＋審計契約不被外抛繞過）。
+     *
+     * Round-3 Phase H（P2-6＋P3a）：拷貝體換為
+     * [dev.librepocket.shell.ShellPolicy.copyArgvBounded]（argc≤64／單項≤4K
+     * 字元／總量≤64K UTF-8 位元組＋孤立代理拒絕，超限／拷貝抛一律回 null，
+     * 呼叫方同映 `Denied(BLACKLISTED)` 零 spawn）。阻塞 iterator 不在此收斂——
+     * 本函數仍為呼叫執行緒同步拷貝，阻塞交由 runner 側 `awaitPreSpawn` 同
+     * deadline 監督（超界即 `Expired`→`TimedOut`，零 spawn；殘留進 slot／breaker
+     * 終審，見兩 runner 入口順序）。
      */
-    fun snapshot(request: ElevatedRequest): ElevatedCommandSnapshot? = runCatching {
-        val argvCopy: List<String> =
-            java.util.Collections.unmodifiableList(ArrayList(request.argv))
-        ElevatedCommandSnapshot(argvCopy, request.reasonCode)
-    }.getOrNull()
+    fun snapshot(request: ElevatedRequest): ElevatedCommandSnapshot? = try {
+        val argvCopy = ShellPolicy.copyArgvBounded(request.argv) ?: return null
+        ElevatedCommandSnapshot(
+            java.util.Collections.unmodifiableList(argvCopy),
+            request.reasonCode,
+        )
+    } catch (_: Throwable) {
+        null
+    }
 
     /**
      * 可信 executable 解析（提權專用，spawn 前唯一入口）：

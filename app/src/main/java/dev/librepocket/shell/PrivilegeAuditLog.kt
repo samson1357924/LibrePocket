@@ -165,6 +165,17 @@ class PrivilegeAuditLog {
          * 邊界：空 argv 編為單一 `0` 計數；空字串項編為 `len=0` 零載荷；
          * 內含 `\u0000`／`\u0001` 皆為 UTF-8 載荷位元組，不具分隔意義，編碼層不抛；
          * 上游對 `\u0000` 的拒絕由 `ShellPolicy` 負責，本層只保證雜湊可辨。
+         *
+         * Round-3 Phase H（P3 註記，選項 a）：上式「相異向量必得相異位元組串」
+         * 只對良構字串成立——未配對 UTF-16 代理（lone surrogate）經
+         * `toByteArray(UTF_8)` 替換為單位元組 `[63]`（即 `?`；已在 JDK 25
+         * 實證：`"\uD800".getBytes(UTF_8)==byteArrayOf(63)`，與 `"?"` 同串），
+         * 故 `listOf("\uD800")` 與 `listOf("?")` 編碼同串、同雜湊，強單射對
+         * 一切 JVM String 不成立。
+         * 入站層已 fail-closed 拒孤立代理（見 [ShellPolicy.copyArgvBounded]，
+         * 產品路徑不可達替換分支），本函數為純編碼保持原樣（不抛、不改簽名，
+         * 審計欄位不變約束）；直接呼叫本函數傳孤立代理即得替換後雜湊
+         * （行為保留，不承諾單射）。
          */
         fun encodeArgv(argv: List<String>): ByteArray {
             // 先逐項轉 UTF-8（避免重複編碼），總長 = 4 + Σ(4 + len_i)。

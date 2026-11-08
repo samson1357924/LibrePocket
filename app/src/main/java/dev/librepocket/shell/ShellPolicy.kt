@@ -112,6 +112,119 @@ object ShellPolicy {
     const val DEFAULT_MAX_CALLS: Int = 30
     const val DEFAULT_WINDOW_MS: Long = 60_000L
 
+    /**
+     * Round-3 Phase H（P2-6）：提權 argv 入站上限（入站 schema，提權／直接共用）。
+     *
+     * 上限表（超限一律 fail-closed `Denied(BLACKLISTED)` 且零 spawn，見
+     * [copyArgvBounded]；凍結／快照層執行，validate 之前）：
+     * - `MAX_ELEVATED_ARGC = 64`：單次提權 argv 項數上限。提權命令皆為短 argv
+     *  （`id`／`getprop`／`screencap -p` 量級），64 已留足餘量；同時封頂
+     *   `validate` 內 `joinToString` 與 spawn argv 掃描成本（最壞 64×4K＝256K
+     *   字元，有界）。
+     * - `MAX_ELEVATED_ARG_CHARS = 4K`：單項 UTF-16 長度上限。4K 字元至多
+     *   12K UTF-8 位元組，逐項物化（`toByteArray`）恆安全，不會因單個巨參數 OOM。
+     * - `MAX_ELEVATED_ARGV_BYTES = 64K`：全向量 UTF-8 總量上限，與
+     *   [MAX_OUTPUT_BYTES] 64K 通道上限對齊（同一容量體系：提權通道任何方向的
+     *   單次物化皆以 64K 為界，512K 硬讀另為輸出側專用，見
+     *   [HARD_READ_CAP_BYTES]）。
+     *
+     * 前提：[validate]／[validateElevated] 假設輸入已為有界快照（呼叫方須先經
+     * [copyArgvBounded] 或等效凍結；直接傳非受信任 List 即把阻塞／OOM 風險帶入
+     * 純函數，產品路徑一律傳快照，見 [dev.librepocket.shell.frozenOrNull] 與
+     * github 源集 `ElevatedExecPolicy.snapshot`）。
+     */
+    const val MAX_ELEVATED_ARGC: Int = 64
+
+    /** 單項提權參數 UTF-16 長度上限（見上限表）。 */
+    const val MAX_ELEVATED_ARG_CHARS: Int = 4 * 1024
+
+    /** 提權 argv 全向量 UTF-8 總量上限（見上限表，與 64K 通道上限對齊）。 */
+    const val MAX_ELEVATED_ARGV_BYTES: Int = 64 * 1024
+
+    /**
+     * 有界 argv 拷貝（Round-3 Phase H，P2-6 入站 schema 唯一實現）：
+     * 呼叫執行緒內同步拷貝（不另起 worker；阻塞交由呼叫方監督——main 側
+     * [dev.librepocket.shell.frozenOrNull] 的快照專用有界門、github 側 runner 內
+     * `awaitPreSpawn` 監督，本函數只保證「有限輸入→有限時間／記憶體」）。
+     *
+     * fail-closed 回 null（呼叫方一律映 `Denied(BLACKLISTED)` 且零 spawn）：
+     * - 拷貝抛（併發竄改 CME／自訂 List 抛）；
+     * - `size` 與實際產出不一致（謊報 size 或併發增減，防 `ArrayList` 預分配繞行）；
+     * - 超上限（argc／單項字元／總 UTF-8 位元組，見上限表）；
+     * - 含孤立代理（lone surrogate，P3 選項 a：`encode` 前拒，見
+     *   [PrivilegeAuditLog.encodeArgv] 誠實注記；雜湊單射只對良構字串成立，
+     *   入站即拒故產品路徑不可達替換分支）；
+     * - 含 null 元素（`List<String>` 契約破壞，原始型別擦除混入 null）。
+     *
+     * 記憶體上界：單項先驗字元數（≤4K 才物化位元組，≤12K），總量累積超 64K 即停，
+     * 故峰值暫存 ≤64K＋12K，有界。
+     */
+    fun copyArgvBounded(src: List<String>): List<String>? {
+        val n: Int = try {
+            src.size
+        } catch (_: Throwable) {
+            return null
+        }
+        if (n < 0 || n > MAX_ELEVATED_ARGC) return null
+        val out = ArrayList<String>(n)
+        val it: Iterator<String> = try {
+            src.iterator()
+        } catch (_: Throwable) {
+            return null
+        }
+        var totalBytes = 0
+        var count = 0
+        try {
+            while (it.hasNext()) {
+                // size 謊報偏小（實際產出更多）即拒，不信任預分配。
+                if (count >= MAX_ELEVATED_ARGC) return null
+                val s: String = try {
+                    it.next()
+                } catch (_: Throwable) {
+                    return null
+                } ?: return null
+                if (s.length > MAX_ELEVATED_ARG_CHARS) return null
+                // P3(a)：孤立代理入站即拒（fail-closed），不進雜湊替換分支。
+                if (hasLoneSurrogate(s)) return null
+                val bytes: ByteArray = try {
+                    s.toByteArray(Charsets.UTF_8)
+                } catch (_: Throwable) {
+                    return null
+                }
+                totalBytes += bytes.size
+                if (totalBytes > MAX_ELEVATED_ARGV_BYTES) return null
+                out.add(s)
+                count++
+            }
+        } catch (_: Throwable) {
+            return null
+        }
+        // size 謊報偏大或併發縮減（產出與 size 不一致）即拒。
+        if (count != n) return null
+        return out
+    }
+
+    /**
+     * 孤立代理檢查（P3 選項 a，僅入站門用）：
+     * 高代理後無低代理、低代理前無高代理即孤立；配對代理（正常增補字元）放行。
+     * 純掃描，不抛。
+     */
+    internal fun hasLoneSurrogate(s: String): Boolean {
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            if (c.isHighSurrogate()) {
+                if (i + 1 >= s.length || !s[i + 1].isLowSurrogate()) return true
+                i += 2
+            } else if (c.isLowSurrogate()) {
+                return true
+            } else {
+                i++
+            }
+        }
+        return false
+    }
+
     /** 取 argv[0] 的 basename（相容 `/bin/ls` 這類絕對路徑寫法）。 */
     fun basename(argv0: String): String =
         argv0.substringAfterLast('/').substringAfterLast('\\')

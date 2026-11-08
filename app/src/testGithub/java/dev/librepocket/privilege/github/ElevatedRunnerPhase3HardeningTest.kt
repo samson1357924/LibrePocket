@@ -182,6 +182,13 @@ class ElevatedRunnerPhase3HardeningTest {
         }
         override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
             if (destroyed) return true
+            // R3-PhaseF fake 誠實性：`timeout<=0` 為非阻塞 poll（JDK 語義：零等待即回
+            // 當前態），不得阻塞——[ElevatedCleanupTracker.sweepQuarantine] 以
+            // `waitFor(0)` 有界重驗 quarantine（worker 完成≠verified dead，見 Phase E）；
+            // 無條件阻塞即第二次呼叫在 sweep 內死鎖（caller 非 bg、無 join 上界）。
+            // 六個 stuck 點（waitFor 正片／destroy／雙流／stdin）皆用正超時／無參變體，
+            // 不受本短路影響，barrier 語義不變。
+            if (timeout <= 0L) return destroyed
             stuck()
             return destroyed
         }
@@ -219,6 +226,12 @@ class ElevatedRunnerPhase3HardeningTest {
         }
         fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
             if (destroyed) return true
+            // R3-PhaseF fake 誠實性：`timeout<=0` 為非阻塞 poll（JDK 語義：零等待即回
+            // 當前態），不得阻塞——[ElevatedCleanupTracker.sweepQuarantine] 以
+            // `waitFor(0)` 有界重驗 quarantine；無條件阻塞即第二次呼叫在 sweep 內死鎖。
+            // 六個 stuck 點（waitFor 正片／destroy／雙流／stdin）皆用正超時／無參變體，
+            // 不受本短路影響，barrier 語義不變。
+            if (timeout <= 0L) return destroyed
             stuck()
             return destroyed
         }

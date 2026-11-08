@@ -22,10 +22,10 @@ import org.junit.Test
  * Round-2 Phase C 迴歸（review P2-1＋P2-2，PR #140）：
  * - P2-1 取消 hook 有界化：blocked cancel supplier（latch 永不放，吞 interrupt 續等，
  *   模擬以 blocking store 查詢充當 cancel）不能無限卡 caller。入口 preflight
- *   （deadline 前、尚未准入、`activeCalls==0`）＋配額前／後三門一律經
+ *   （deadline 前）＋配額前／後三門一律經
  *   [ElevatedRunnerCommon.checkPreSpawnCancel]（hook 只跑監督 worker，呼叫側只看
  *   中斷＋deadline），Expired→preSpawnExpired 有界回（timeoutMs＋grace 量級），
- *   零 spawn、不佔席（配額前／後門已占席由 finally 有界釋放）。兩 runner 雙軌。
+ *   零 spawn（入口門已在准入之內，Expired 經 finally 釋席；配額前／後門同理）。
  * - P2-2 tail verdict：drain 層 finished-tail 中止直接斷言（`timedOut` 仍為
  *   `!finished` 不動＋`tailIncomplete` 真＋exit 0，命令 exit vs request finished
  *   分開）；runner→tool→audit 鏈（`executeElevated`＋`TIMEOUT` 審計）兩 runner 雙軌
@@ -173,7 +173,8 @@ class ElevatedRunnerPhaseCTest {
             b as ElevatedBinaryResult.TimedOut
             assertEquals("TIMEOUT", b.verdict())
             assertEquals("blocked entry must not spawn", 0, spawns.get())
-            // 不佔席：入口門在准入之前，Expired 直接回，席位從未佔用。
+            // 席內門：入口門已在准入之後（R3-PhaseF P1-2），Expired 經 finally 釋席，
+            // 故此處仍 active==0；席位從未外洩。
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
             // 殘留追蹤：吞 interrupt 的 hook worker 持 1 槽＋breaker 計 1（不熔斷）。
             assertEquals(1, ElevatedCleanupTracker.outstanding())

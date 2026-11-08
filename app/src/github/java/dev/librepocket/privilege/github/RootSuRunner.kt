@@ -173,8 +173,7 @@ import java.util.concurrent.TimeUnit
  * B2 P1-4 spawn 前取消（owner 新 P1-4）：入口＋最後授權重驗後（配額前）＋
  * 配額→spawn 窗口三點經 [ElevatedRunnerCommon.checkPreSpawnCancel] 有界檢查
  * （R2-PhaseC P2-1：hook 只跑監督 worker，呼叫側只看中斷＋deadline；
- * 直調語義見 [ElevatedRunnerCommon.isPreSpawnCancelled]——Thread 中斷不清旗標或
- * 鉤真；鉤抛即已取消，未建 fail-closed），任一命中即
+ * 中斷不清旗標或鉤真即已取消；鉤抛即已取消，未建 fail-closed），任一命中即
  * 零 spawn 回 `TimedOut`（空 partial，`cleanupIncomplete=false`，無進程故無殘留；
  * interrupt 原樣保留，不清除，不把已取消翻成未取消）。drain 層入口清中斷＋
  * 健康收尾語義不變（drain 不吞中斷，出口恢復），runner 層已取消一律不建
@@ -186,14 +185,24 @@ import java.util.concurrent.TimeUnit
  * 有界補償，逾期交付即 `TimedOut(cleanupIncomplete=true)`）。preflight 三層皆
  * 零 spawn：入口 `safeTimeoutMs<=0` 直回（不佔席不耗 quota）；quota 後提交前
  * 顯式 `isExpired`（配額已耗仍零 spawn）；supervisor 入口＋返回後雙確認。
- * [ElevatedRunnerCommon.isPreSpawnCancelled] 語義保留（不看 deadline）。
+ * 取消語義（中斷不清旗標、不看 deadline）見 [ElevatedRunnerCommon.checkPreSpawnCancel]。
  *
- * R2-PhaseC P2-1 取消 hook 有界化（review P2-1）：首個 `isPreSpawnCancelled`
- * 在 deadline 前直調 hook——blocking supplier（latch／Binder 充當 cancel）可卡
+ * R2-PhaseC P2-1 取消 hook 有界化（review P2-1）：舊直調 hook 在 deadline 前
+ * 可卡 caller（blocking supplier（latch／Binder 充當 cancel）可卡
  * caller 使 timeout 永不返回（甚至 `activeCalls==0` 尚未准入）。現 deadline 先算，
  * 三門一律經 [ElevatedRunnerCommon.checkPreSpawnCancel]（hook 只跑 worker，
  * Expired→preSpawnExpired 有界回）；hook 不可阻塞契約見該函數 KDoc
  * （產品只用 `Job.isActive` 一類本地原子快取）。
+ *
+ * R3-PhaseF P1-2 pre-admission 有界取消：cheap [ElevatedCleanupTracker.tryEnterReserved]
+ * 移到任何 worker 啟動之前（含首個 cancel 門），callback 未取 global lease
+ * 絕不 `Thread.start()`（併發 caller 在准入處即序列化，飽和下零線程拒絕；
+ * 拒絕不耗 quota；verdict 優先級准入拒絕先於取消判定，見 runBinary 准入段）。
+ * R3-PhaseF P2-1 慢輪詢 hook 統一：一切 supervisory polling（gates 慢路徑／
+ * spawn／drain）皆經 [ElevatedCallSupervisor.CancelWatch]（hook 只跑 watcher
+ * worker，caller 只看中斷＋deadline＋緩存 bit，bit 單調閂）；blocked hook 只卡
+ * worker，caller 經 deadline 有界返回（首 false、後 blocked 交錯全請求有界，
+ * 見 `ElevatedRunnerPhaseFCancelBoundTest`）。
  *
  * R2-PhaseC P2-2 tail verdict（review P2-2）：drain tail（finished 但流未排空）
  * 期間取消／超時致 gobbler 中斷＋殘留（[ElevatedProcessIo.Drained.tailIncomplete]），
@@ -271,13 +280,14 @@ class RootSuRunner(
         if (safeTimeoutMs <= 0L) {
             return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, false)
         }
-        // P1-4 spawn 前取消入口檢查（B2＋R2-PhaseC P2-1 有界化）：已取消
-        // （Thread 中斷不清旗標或鉤真；鉤抛即已取消，未建 fail-closed）即零 spawn
-        // 回 TimedOut，不進後續門／准入／配額／spawn；interrupt 原樣保留，不清除。
-        // 有界：hook 只跑監督 worker（見 [ElevatedRunnerCommon.checkPreSpawnCancel]，
-        // 呼叫側只看中斷＋deadline），blocked hook（latch／Binder stall 充當 cancel）
-        // 經 Expired 有界回 preSpawnExpired，不斷 timeout 上界、不佔席。
-        ElevatedRunnerCommon.checkPreSpawnCancel(timeoutMs, deadlineNanos, isCancelled)?.let { return it }
+        // R3-PhaseF P1-2 pre-admission 有界（准入先於一切 worker 啟動）：
+        // cheap [tryEnterReserved] 移到任何 worker 啟動之前（含首個 cancel 門）——
+        // callback 未取 global lease 絕不 `Thread.start()`：併發 caller 在准入處
+        // 即序列化（乾淨態僅單一進行中呼叫，見 [ElevatedCleanupTracker]），飽和／
+        // 熔斷／quarantine 下零線程拒絕（不耗 quota、不佔席外資源）。
+        // verdict 優先級：准入拒絕（Denied）先於取消判定（TimedOut）——席位未取得
+        // 即無門可進；sweep（[sweepQuarantine]，鎖外非阻塞狀態查詢，不起線程）
+        // 仍在准入鎖外先行，有界、無新線程，准入判定仍單一原子點。
         // B3 cheap 准入前置（owner P1-5）：可能阻塞的外部回呼前先占全域席
         //（[tryEnterReserved] 原子：飽和／熔斷／併發預留同一鎖內檢查＋佔席），
         // 拒絕不耗 quota、不占席外資源；阻塞體皆有界監督（見下），stall 即殘留
@@ -307,6 +317,14 @@ class RootSuRunner(
             }
         }
         try {
+        // P1-4 spawn 前取消入口檢查（B2＋R2-PhaseC P2-1 有界化＋R3-PhaseF P1-2 席內化）：
+        // 已取消（Thread 中斷不清旗標或鉤真；鉤抛即已取消，未建 fail-closed）即零 spawn
+        // 回 TimedOut；interrupt 原樣保留，不清除。
+        // 有界：hook 只跑監督 worker（見 [ElevatedRunnerCommon.checkPreSpawnCancel]，
+        // 呼叫側只看中斷＋deadline），blocked hook（latch／Binder stall 充當 cancel）
+        // 經 Expired 有界回 preSpawnExpired，不斷 timeout 上界；席內執行（已占席，
+        // 拒絕經 finally 釋席，不耗配額）。
+        ElevatedRunnerCommon.checkPreSpawnCancel(timeoutMs, deadlineNanos, isCancelled)?.let { return it }
         // U1：bridge 當次 call 新鮮求值快照一次，供 validate 與橋門共用
         //（同 call 內一致；B3 有界：超界／取消即 TimedOut 零 spawn，不耗 quota）。
         val bridgeRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) { bridgeGranted() }
@@ -566,7 +584,7 @@ class RootSuRunner(
             ElevatedRunnerCommon.checkPreSpawnCancel(timeoutMs, deadlineNanos, isCancelled)?.let { return it }
             // P1-3 quota 後顯式 deadline 檢查（PR140 Phase 2）：重驗→配額間 budget
             // 耗盡即零 spawn（配額已耗無 refund，fail-closed 窄競態，不建特權進程；
-            // worker 從未啟動故 `hasLinger=false`）。[isPreSpawnCancelled] 語義保留
+            // worker 從未啟動故 `hasLinger=false`）。取消語義（中斷不清旗標、不看 deadline）見 checkPreSpawnCancel
             // （不看 deadline），此處為真正的提交前最後一門。
             if (ElevatedCallSupervisor.isExpired(deadlineNanos)) {
                 return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, false)

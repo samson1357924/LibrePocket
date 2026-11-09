@@ -245,6 +245,12 @@ internal object ElevatedCleanupTracker {
      * 與 7 體系正交（stall 殘留仍報 QUARANTINE，不翻轉 BACKLOG），
      * 故本常數推導與 barrier 測試皆不需改。
      *
+     * Round-4 Phase L（P1-2）lingering 即停推導（常數不動，仍為 7）：
+     * slow gate 見自身 watcher lingering 即該 gate 失敗（[ElevatedCallSupervisor]
+     * fail-closed，不 handoff 下一 gate／spawn，見 awaitInternal）：單 call 至多
+     * 1 lingering watcher（首個慢 gate 即停），其餘 slot 佔用不變，故峰值封包仍為
+     * 7，無需重推導（barrier `peakOutstanding<=7==MAX` 不動）。
+     *
      * 准入預留以此上界估算（見 [tryEnterReserved]），寧可保守拒絕也不超額。
      * 不變量（串行契約 `active<=1` 下）：准入要求 `outstanding+7<=7` 即
      * `outstanding==0`，故峰值 `peakOutstanding <= outstanding_admit+7 <= 7 == MAX`
@@ -901,6 +907,11 @@ internal object ElevatedCallSupervisor {
      *   則繼續等 hook 明確／中斷／deadline，不樂觀消費（PhaseB caller-claim 確定性：
      *   發佈於 caller 阻塞期間的 Val 須由 expireWorker CAS 認領補償）。
      *   快路徑（watcher 從未啟動）沿舊語義立即消費。
+     * - Round-4 Phase L fail-closed 收斂（P1-2／P2-3，見 [awaitInternal]）：
+     *   G1(a) handoff 前須經 close 後重驗——watcher lingering（grace 後仍存活）
+     *   即該 gate 失敗（`Expired`，不 handoff 下一 gate／spawn；單 call 至多
+     *   1 linger）；sticky bit 在 close grace 期間 latch true 即按取消收斂
+     *   （不交付 Ok）。安靜 hook（恒 false）下 watcher 乾淨退出即仍 Ok。
      */
     fun <T> awaitPreSpawn(
         deadlineNanos: Long,
@@ -1048,6 +1059,17 @@ internal object ElevatedCallSupervisor {
         /**
          * 停止觀察（冪等）：done→interrupt→[GRACE_MS] join。
          * @return watcher 是否殘留（grace 後仍存活，已記槽；計數由呼叫方終審）。
+         *
+         * Round-4 Phase L close 語義（P1-2／P2-3）：
+         * - lingering 即殘留（grace 後仍存活）：呼叫方不得 handoff 交付值——slow
+         *   gate 見自身 watcher lingering 即該 gate 失敗（`Expired` fail-closed，
+         *   即使 block 值已交付），不進下一 gate／spawn（單 call 至多 1 linger）；
+         *   spawn 側改走 expireWorker CAS＋late cleanup（見 [awaitSpawn]）；
+         * - sticky 契約：[bit] 單調閂（false→true 不回退）；close 的 grace 可把
+         *   watcher 的第二次求值推成 true（bit 在 close 期間 latch）。呼叫方須在
+         *   close 後重驗 [bit]==true（及 deadline／中斷），命中即按取消收斂
+         *   （`Expired`／expireWorker），不得以後驗前的快照交付 Ok
+         *  （違 CancelWatch KDoc：bit 真即已取消）。
          */
         fun close(): Boolean {
             done.set(true)
@@ -1256,15 +1278,25 @@ internal object ElevatedCallSupervisor {
                             // 不樂觀消費（PhaseB caller-claim 確定性）。
                             val watchLingering = closeWatch()
                             if (watchLingering && markUncleanOnLinger) ElevatedCleanupTracker.noteUnclean()
+                            // Round-4 Phase L P1-2：linger 即該 gate 失敗（即使 block
+                            // 值已交付）：watcher 殘留即不 handoff，fail-closed 回
+                            // Expired（單 call 至多 1 linger，後續 gate 不再執行；
+                            // runner 經 preSpawnLinger(outstanding>0) 置
+                            // cleanupIncomplete=true）。
+                            // Round-4 Phase L P2-3：close 後重驗 sticky bit——bit
+                            // 單調閂，watcher 第二次求值可在 close grace 期間變
+                            // true（close 前快照 false 不代表 close 後仍 false）。
+                            // 命中即按取消收斂，不交付 Ok（違 CancelWatch KDoc）。
                             // R3-PhaseG P2-2：關 watcher 期間的邊緣回傳兜底（見
                             // awaitSpawn 同位檢查）：此處已無取消證據，但關 watcher
                             // 的 grace 可把 caller 推過 deadline，仍不當成功。
+                            val stickyCancelled = w.bit()
                             val edgeOverdue = try {
                                 isExpired(deadlineNanos, nowNanos)
                             } catch (_: Exception) {
                                 true
-                            } || Thread.currentThread().isInterrupted
-                            if (edgeOverdue) return Res.Expired(hasLinger = false)
+                            } || Thread.currentThread().isInterrupted || stickyCancelled
+                            if (watchLingering || edgeOverdue) return Res.Expired(hasLinger = false)
                             @Suppress("UNCHECKED_CAST")
                             return Res.Ok((h as Val<T>).v)
                         }
@@ -1400,6 +1432,10 @@ internal object ElevatedCallSupervisor {
      * 消費（PhaseB caller-claim 確定性）。
      * 快路徑（watcher 從未啟動）沿舊語義立即消費。
      * watcher 殘留經 `countUncleanOnce` guard 同通道恰好一次。
+     * Round-4 Phase L（P1-2／P2-3）：handoff 前 close 後重驗——watcher lingering
+     * 或 sticky bit（close grace 期間 latch true）或 deadline／中斷任一命中即改走
+     * expireWorker CAS＋late cleanup，不直接 handoff（安靜 hook 下 watcher 乾淨
+     * 退出即仍 Ok，T2 不變）。
      */
     fun awaitSpawn(
         deadlineNanos: Long,
@@ -1575,17 +1611,25 @@ internal object ElevatedCallSupervisor {
                             // G1(a)＋caller-claim 合成：曾見明確 false＋無取消證據即
                             // Ok handoff；unknown 則落到下方慢檢查繼續等 hook 明確／
                             // 中斷／deadline，不樂觀消費（PhaseB caller-claim 確定性）。
-                            if (watch?.close() == true) countUncleanOnce()
-                            // P1-3 返回後再確認 deadline（上一行已確認未逾期，此處為
-                            // 關 watcher 期間的邊緣回傳兜底，仍不當成功即補償）。
-                            if (isExpired(deadlineNanos, nowNanos)) {
-                                expired.set(true)
-                                @Suppress("UNCHECKED_CAST")
-                                val v = (h as Val<Process>).v
-                                if (holder.compareAndSet(h, null)) {
-                                    startLateDaemon(v)
-                                }
-                                return Res.Expired(hasLinger = true)
+                            // Round-4 Phase L P1-2／P2-3：close 後重驗 lingering＋
+                            // sticky bit＋deadline＋中斷——任一命中即改走 expireWorker
+                            // CAS＋late cleanup，不直接 handoff：
+                            // - lingering（watcher grace 後仍存活）：殘留 watcher 持槽，
+                            //   直接 Ok 即把未知取消態當成功交付（P1-2 同一 seat 可順序
+                            //   累積 watchers）；expireWorker 經 holder CAS 認領逾期
+                            //   Process 起 daemon 補償，不漏殺；
+                            // - sticky（bit 在 close grace 期間 latch true）：違
+                            //   CancelWatch KDoc 的取消證據，須按取消收斂；
+                            // - deadline／中斷：關 watcher 的 grace 可把 caller 推過
+                            //   budget（P1-3 邊緣回傳兜底）。
+                            // 安靜 hook（恒 false）下 watcher 乾淨退出、三者皆無即仍
+                            // Ok handoff（T2 慢 spawn 成功不變）。
+                            val watchLingering = (watch?.close() == true)
+                            if (watchLingering) countUncleanOnce()
+                            val stickyNow = w0.bit() || Thread.currentThread().isInterrupted ||
+                                isExpired(deadlineNanos, nowNanos)
+                            if (watchLingering || stickyNow) {
+                                return expireWorker()
                             }
                             @Suppress("UNCHECKED_CAST")
                             return Res.Ok((h as Val<Process>).v)

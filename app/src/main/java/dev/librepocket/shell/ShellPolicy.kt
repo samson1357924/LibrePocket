@@ -259,6 +259,53 @@ object ShellPolicy {
     }
 
     /**
+     * Round-4 Phase J（P1-1）：multicall 有效命令規範化（直接／提權同規則）。
+     *
+     * dispatcher（toybox／toolbox／busybox）經主程式自身呼叫時 `argv = [dispatcher,
+     * applet, ...args]` 的實際執行語義等同 `[applet, ...args]`（resolved spawn 實為
+     * `[realToybox, applet, ...args]`，見 [ShellExecutables]／提權 `toSpawnArgv`），
+     * 故驗證必須以有效形 `[applet, ...args]` 套用完整拒絕規則，而非僅查第一層
+     * applet 黑名單（見 [multicallAppletDenial] 的 Phase I 缺口）：
+     * - 有效基 `applet = basename(argv[1].trim())`，有效操作數 `args = argv.drop(2)`；
+     * - `argv.size < 2`（如 `["toybox"]`）或 `applet` 為空回 null（交呼叫方走常规
+     *   dispatcher 本體門；空形僅印 help，無提權／破壞語義）；
+     * - 旗標形 `argv[1]`（如 `"-h"`）亦視為 applet 候選（fail-closed：不在白名單即
+     *   `NOT_WHITELISTED` 拒，不當 help 放行）；
+     * - 含 `/`／`\` 的 applet 寫法經 [basename] 取尾段（如 `"a/sh"` → `"sh"`，
+     *   仍 `BLACKLISTED`），與 dispatcher 黑名單同口徑；
+     * - 呼叫方須以有效形完整套用：applet 黑名單（`BLACKLISTED`）→ 未知 applet
+     *   明示拒（`NOT_WHITELISTED`，TODO #136-B3，不 blanket allow）→ dispatcher
+     *   `argv[0]` 可信路徑詞法門 → find 高危謂詞（僅 `applet == "find"` 時掃
+     *   `args`）→ 檔案域（[checkPathArgs] 以 `base = applet, args = args`，
+     *   含 FILE_OPERAND／relative／realpath scope／implicit cwd／取值旗標值槽／
+     *   有限 argv 同門；`--bind` 縱深同門）。
+     * 未知 applet 維持拒絕（fail-closed）：有效基不在白名單即 `NOT_WHITELISTED`
+     * （直接通道用 `allowedBinaries` 參數，提權用 [ALLOWED_BINARIES]；B3
+     * `cmd`／`am` 等子命令 allowlist 在此擴充，本 PR 只做現有拒絕規則 parity＋TODO，
+     * 不放寬）。
+     */
+    private data class MulticallEffective(val applet: String, val args: List<String>)
+
+    private fun multicallEffective(argv: List<String>, base: String): MulticallEffective? {
+        if (base !in ShellExecutables.MULTICALL_BINARIES) return null
+        if (argv.size < 2) return null
+        val raw: String = try {
+            argv[1].trim()
+        } catch (_: Exception) {
+            return null
+        }
+        if (raw.isEmpty()) return null
+        val applet = basename(raw)
+        if (applet.isEmpty()) return null
+        val args: List<String> = try {
+            argv.drop(2)
+        } catch (_: Exception) {
+            return null
+        }
+        return MulticallEffective(applet, args)
+    }
+
+    /**
      * 會把 positional 參數當檔案路徑的二進位（P0 binary-aware，PR#1 re-review）。
      * 這些二進位的非旗標 bare word 即相對路徑，必須 fail-closed（要求絕對路徑）。
      */
@@ -352,9 +399,10 @@ object ShellPolicy {
     }
 
     /**
-     * 校驗：依次判空 → 黑名單（二進位/全文片段/特殊字元）→ multicall applet
-     * 黑名單（P2-7：`argv[0]` 為 toybox／toolbox／busybox 主程式自身時 `argv[1]`
-     * 同樣受黑名單約束，見 [multicallAppletDenial]）→ 白名單
+     * 校驗：依次判空 → 黑名單（二進位/全文片段/特殊字元）→ multicall 有效形
+     * （Round-4 Phase J P1-1：`argv[0]` 為 toybox／toolbox／busybox 主程式自身時
+     * 按有效形 `[applet, ...args]` 套用完整拒絕門，見 [multicallEffective]；
+     * P2-7 黑名單見 [multicallAppletDenial]，主程式形已由有效門先行覆蓋）→ 白名單
      * → argv[0] 可信路徑門（同名不同路徑封堵，詞法；僅直接通道，
      *   guest 跳過——guest argv[0] 是容器命名空間路徑）→ find 高危謂詞
      * → 檔案域（絕對路徑經 [FileScope.decide] 詞法門 + [checkPhysicalOperandGate]
@@ -428,8 +476,64 @@ object ShellPolicy {
                 return Validation.Denied(ShellDeny.BAD_ARGUMENT, "NUL byte denied")
             }
         }
+        // Round-4 Phase J（P1-1）：multicall 主程式形有效命令完整 parity。
+        // `[toybox, applet, ...args]` 按有效形 `[applet, ...args]` 套用全部拒絕門
+        // （見 [multicallEffective]）：applet 黑名單 → 未知 applet 明示拒（B3 TODO，
+        // 不 blanket allow）→ dispatcher 可信路徑門 → find 謂詞（有效基）→ 檔案域
+        // （有效基／有效操作數，含 FILE_OPERAND／relative／realpath／implicit cwd／
+        // 取值旗標值槽）。有效門全過後仍回 NOT_WHITELISTED（dispatcher 本體不在白名單，
+        // 維持 Phase I 直接拒；提權同形放行，差異僅白名單門，見 validateElevatedInternal）。
+        val eff = multicallEffective(argv, base)
+        if (eff != null) {
+            if (eff.applet in DENIED_BINARIES) {
+                return Validation.Denied(ShellDeny.BLACKLISTED, "applet denied: ${eff.applet}")
+            }
+            if (eff.applet !in allowedBinaries) {
+                return Validation.Denied(
+                    ShellDeny.NOT_WHITELISTED,
+                    "applet not allowed (needs B3 allowlist, fail-closed): ${eff.applet}",
+                )
+            }
+            val rawEffArgv0 = argv[0].trim()
+            if (!isGuest && (rawEffArgv0.contains('/') || rawEffArgv0.contains('\\'))) {
+                if (!ShellExecutables.isTrustedAbsoluteArgv0(rawEffArgv0, trustedBinDirs)) {
+                    return Validation.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "untrusted executable path: $rawEffArgv0",
+                    )
+                }
+            }
+            if (eff.applet == "find") {
+                for (arg in eff.args) {
+                    if (arg in FIND_DENIED_PREDICATES) {
+                        return Validation.Denied(
+                            ShellDeny.BLACKLISTED,
+                            "find predicate denied: $arg",
+                        )
+                    }
+                }
+            }
+            val effDenial = checkPathArgs(
+                base = eff.applet,
+                args = eff.args,
+                privateRoot = privateRoot,
+                safRoots = safRoots,
+                flavor = flavor,
+                bridgeGranted = bridgeGranted,
+                isElevated = false,
+                allowedBinaries = allowedBinaries,
+                isGuest = isGuest,
+                preRealPathHook = preRealPathHook,
+            )
+            if (effDenial != null) return effDenial
+            return Validation.Denied(
+                ShellDeny.NOT_WHITELISTED,
+                "dispatcher not whitelisted (multicall main, effective ${eff.applet} passed gates): $base",
+            )
+        }
         // P2-7 multicall applet 黑名單（直接通道 parity：BLACKLISTED 優先於
-        // NOT_WHITELISTED，見 [multicallAppletDenial]）。
+        // NOT_WHITELISTED，見 [multicallAppletDenial]；主程式形已由上有效門處理，
+        // 此處僅覆非有效形〈非 dispatcher／無 applet〉，恆回 null）。
         multicallAppletDenial(argv)?.let { return it }
         if (base !in allowedBinaries) {
             return Validation.Denied(ShellDeny.NOT_WHITELISTED, "not whitelisted: $base")
@@ -507,7 +611,8 @@ object ShellPolicy {
      * 提權通道校驗（S3，BACKLOG D09，矩陣 §3）。
      *
      * 與 [validate] 的差異只有兩處，其餘（空命令 → 黑名單二進位/全文片段 →
-     * 參數衛生 → multicall applet 黑名單（P2-7，直接／提權同序同策）→
+     * 參數衛生 → multicall 有效形（Round-4 Phase J P1-1，直接／提權同序同策，
+     * 見 [multicallEffective]；P2-7 黑名單為其子集）→
      * argv[0] 可信路徑詞法門 → find 高危謂詞 → 檔案域）完全同序：
      * - 跳過白名單門禁：白名單外的二進位僅允許走提權通道（Shizuku/Root），
      *   直接 exec 仍拒（[validate] 維持原判）；
@@ -566,8 +671,60 @@ object ShellPolicy {
                 return Validation.Denied(ShellDeny.BAD_ARGUMENT, "NUL byte denied")
             }
         }
+        // Round-4 Phase J（P1-1）：multicall 主程式形有效命令完整 parity（與直接同序同策）。
+        // `[toybox, applet, ...args]` 按有效形 `[applet, ...args]` 套用全部拒絕門：
+        // applet 黑名單 → 未知 applet 明示拒（B3 TODO，不 blanket allow；提權無白名單，
+        // 此門為未知 applet 唯一閘，直接通道對應門見 validateInternal 有效分支）→
+        // dispatcher 可信路徑門 → find 謂詞（有效基）→ 檔案域（有效基／有效操作數，
+        // 提權語義）。有效門全過即 Allowed(有效基)（與 `[applet, ...]` 等效）。
+        val effElevated = multicallEffective(argv, base)
+        if (effElevated != null) {
+            if (effElevated.applet in DENIED_BINARIES) {
+                return Validation.Denied(ShellDeny.BLACKLISTED, "applet denied: ${effElevated.applet}")
+            }
+            if (effElevated.applet !in ALLOWED_BINARIES) {
+                return Validation.Denied(
+                    ShellDeny.NOT_WHITELISTED,
+                    "applet not allowed (needs B3 allowlist, fail-closed): ${effElevated.applet}",
+                )
+            }
+            val rawEffElevatedArgv0 = argv[0].trim()
+            if (!isGuest && (rawEffElevatedArgv0.contains('/') || rawEffElevatedArgv0.contains('\\'))) {
+                if (!ShellExecutables.isTrustedAbsoluteArgv0(rawEffElevatedArgv0, trustedBinDirs)) {
+                    return Validation.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "untrusted executable path: $rawEffElevatedArgv0",
+                    )
+                }
+            }
+            if (effElevated.applet == "find") {
+                for (arg in effElevated.args) {
+                    if (arg in FIND_DENIED_PREDICATES) {
+                        return Validation.Denied(
+                            ShellDeny.BLACKLISTED,
+                            "find predicate denied: $arg",
+                        )
+                    }
+                }
+            }
+            val effElevatedDenial = checkPathArgs(
+                base = effElevated.applet,
+                args = effElevated.args,
+                privateRoot = privateRoot,
+                safRoots = safRoots,
+                flavor = flavor,
+                bridgeGranted = bridgeGranted,
+                isElevated = true,
+                allowedBinaries = ALLOWED_BINARIES,
+                isGuest = isGuest,
+                preRealPathHook = preRealPathHook,
+            )
+            if (effElevatedDenial != null) return effElevatedDenial
+            return Validation.Allowed(effElevated.applet)
+        }
         // P2-7 multicall applet 黑名單（提權通道：無白名單，此門為唯一 applet 閘；
-        // 與直接通道同序同策，見 [multicallAppletDenial]）。
+        // 與直接通道同序同策，見 [multicallAppletDenial]；主程式形已由上有效門處理，
+        // 此處僅覆非有效形，恆回 null）。
         multicallAppletDenial(argv)?.let { return it }
         // argv[0] 可信路徑門（P1-1，提權與直接同等詞法門，host-only）：
         // 含 `/`/`\` 的寫法父目錄必須在可信系統目錄內，否則同名不同路徑的假

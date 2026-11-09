@@ -3,6 +3,7 @@ package dev.librepocket.shell
 import dev.librepocket.tool.Flavor
 import java.io.ByteArrayOutputStream
 import java.util.ArrayDeque
+import java.util.Collections
 import java.util.concurrent.TimeUnit
 
 /**
@@ -146,16 +147,117 @@ class ShellQuota(
 }
 
 /**
+ * 直接通道有界監督（Round-4 Phase K P2-4，main 源集本地實現）：
+ * 沿用 supervisor 模式（worker＋deadline＋bounded join），不依賴 github 源集
+ * [dev.librepocket.privilege.github.ElevatedCallSupervisor]（main 源集不可見；
+ * 語義同源：單一 request deadline、caller 只看中斷＋deadline、超界即
+ * `interrupt`＋grace、仍存活即殘留 daemon）。
+ * - 覆蓋：freeze（[ShellPolicy.copyArgvBounded]，惡意 `List` 可阻塞呼叫執行緒）→
+ *   gate（[ShellPolicy.validate] 實體門 `lstat`/`toRealPath`＋resolve／自訂 resolver
+ *   回呼，FUSE／壞 FS／自訂 resolver 可卡住）→ reverify（同 resolve 體）；
+ *   spawn 本體（[ProcessRunner.run]）不經此（其 `timeoutMs` 即 process 超時，
+ *   見 [RestrictedShell.execute] 預算語義，傳剩餘 budget）。
+ * - 殘餘：超界殘留 worker 為 daemon（不擋 JVM 退出），單次 execute 至多三 worker
+ *   （freeze／gate／reverify 各一），阻塞於不可中斷操作即各持一份快照引用而殘留；
+ *   供給阻塞 list／resolver 的本來就是呼叫方自身，屬自限 DoS，不放大為跨呼叫無界。
+ */
+internal object DirectSupervisor {
+    /** 監督輪詢切片（呼叫執行緒 join 粒度，兼中斷／deadline 響應）。 */
+    const val POLL_MS = 20L
+
+    /** 超界後 grace：`interrupt` 後再等本值，仍存活即殘留。 */
+    const val GRACE_MS = 200L
+
+    sealed interface Res<out T> {
+        data class Ok<T>(val v: T) : Res<T>
+        data class Err(val t: Throwable) : Res<Nothing>
+        /** 超界：[hasLinger] 即 worker 在 grace 後仍存活（殘留 daemon）。 */
+        data class Expired(val hasLinger: Boolean = false) : Res<Nothing>
+    }
+
+    private class Val<T>(val v: T)
+    private class Thr(val t: Throwable)
+
+    /** 單一 request deadline（單調時鐘；`timeoutMs<=0` 即已逾期；溢出飽和）。 */
+    fun deadlineNanos(timeoutMs: Long, nowNanos: Long = System.nanoTime()): Long {
+        val safe = timeoutMs.coerceAtLeast(0L)
+        val delta = try {
+            Math.multiplyExact(safe, 1_000_000L)
+        } catch (_: ArithmeticException) {
+            Long.MAX_VALUE / 2
+        }
+        return try {
+            Math.addExact(nowNanos, delta)
+        } catch (_: ArithmeticException) {
+            Long.MAX_VALUE
+        }
+    }
+
+    fun isExpired(deadlineNanos: Long, nowNanos: Long = System.nanoTime()): Boolean =
+        (deadlineNanos - nowNanos) <= 0L
+
+    fun remainingMs(deadlineNanos: Long, nowNanos: Long = System.nanoTime()): Long =
+        ((deadlineNanos - nowNanos) / 1_000_000L).coerceAtLeast(0L)
+
+    /** 阻塞體有界：入口已逾期即不啟 worker，直回 `Expired(false)`（零殘留）。 */
+    fun <T> supervise(deadlineNanos: Long, threadName: String, block: () -> T): Res<T> {
+        if (isExpired(deadlineNanos)) return Res.Expired(false)
+        val holder = arrayOfNulls<Any>(1)
+        val worker = Thread({
+            try {
+                holder[0] = Val(block())
+            } catch (t: Throwable) {
+                holder[0] = Thr(t)
+            }
+        }, threadName)
+        worker.isDaemon = true
+        try {
+            worker.start()
+        } catch (_: Throwable) {
+            return Res.Expired(false)
+        }
+        try {
+            while (true) {
+                worker.join(POLL_MS)
+                if (!worker.isAlive) break
+                if (Thread.currentThread().isInterrupted || isExpired(deadlineNanos)) {
+                    runCatching { worker.interrupt() }
+                    runCatching { worker.join(GRACE_MS) }
+                    return Res.Expired(worker.isAlive)
+                }
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            runCatching { worker.interrupt() }
+            runCatching { worker.join(GRACE_MS) }
+            return Res.Expired(worker.isAlive)
+        }
+        return when (val h = holder[0]) {
+            is Val<*> -> {
+                @Suppress("UNCHECKED_CAST")
+                Res.Ok((h as Val<T>).v)
+            }
+            is Thr -> Res.Err(h.t)
+            else -> Res.Err(IllegalStateException("supervisor no result"))
+        }
+    }
+}
+
+/**
  * 受限 shell 入口（BACKLOG D05，矩陣「終端命令」行 play 可用部分）。
  *
- * 執行順序：[ShellPolicy.validate]（含 argv[0] 詞法可信門 + 操作數實體門）→
- * 可信 executable 映射（[ShellExecutables.resolve]：logical command →
+ * 執行順序（Round-4 Phase K）：freeze-once（[ShellPolicy.copyArgvBounded] 有界
+ * 不可變快照，同一 snapshot 驅動後續全鏈，見 [execute]）→
+ * [ShellPolicy.validate]（含 argv[0] 詞法可信門 + 操作數實體門）＋
+ * 可信 executable 映射（[ShellExecutables.resolveDetailed]：logical command →
  * [ShellExecutables.ResolvedExec]，拒 `PATH` 劫持；含 real containment +
- * app-writability 閘，逃逸/可寫即拒且零 spawn、不佔配額）→
+ * app-writability 閘，逃逸/可寫即拒且零 spawn、不佔配額；兩段同一監督 worker
+ * 同一 deadline，阻塞即 `TimedOut` 零 spawn，見 [DirectSupervisor]）→
  * 配額 → spawn 前重驗 executable（B1：同一解析再跑一次並比對實體路徑，
- * 縮小驗過→spawn 窗口；見 [executeResolved] 殘餘揭露）→
- * 建子進程（argv[0] 已改寫為固定絕對路徑 + [ShellExecutables.CLEAN_ENV]
- * 乾淨 env + cwd 釘死到 [privateRoot]）→ 超時殺 → 輸出截斷。
+ * 縮小驗過→spawn 窗口；監督 worker，見 [executeFrozen] 殘餘揭露）→
+ * 建子進程（frozen[0] 已改寫為固定絕對路徑 + [ShellExecutables.CLEAN_ENV]
+ * 乾淨 env + cwd 釘死到 [privateRoot]，操作數取 frozen `drop(1)`）→ 超時殺 →
+ * 輸出截斷。`timeoutMs` 為整體 request budget（見 [execute]），剩餘才交 runner。
  * spawn 固定形態（P2-7 parity）：非 multicall 別名形為 `[real, ...args]`；
  * 實體 basename 落 [ShellExecutables.MULTICALL_BINARIES]（toybox / toolbox /
  * busybox）「且」白名單放行值（`Allowed.binary`，即 `argv[0]` 的 basename）
@@ -203,7 +305,7 @@ class RestrictedShell(
     /**
      * 可信 executable 解析（預設 null → 內建 [ShellExecutables.resolveDetailed] 真查 FS；
      * 單測可注入假映射，但生產必須用預設 null）。
-     * 輸入為原始 `argv[0]`（保留絕對/相對形態供驗證），輸出為
+     * 輸入為 frozen `argv[0]`（保留絕對/相對形態供驗證；P1-4 起不再讀原始 argv），輸出為
      * [ShellExecutables.ResolvedExec]（驗證後實體路徑 + multicall applet
      * 訊號）或 null（不可信/不存在即 null，呼叫方轉拒絕且零 spawn）。
      * 自訂映射回 multicall 時，其 `applet` 會被白名單放行值（`Allowed.binary`）
@@ -213,39 +315,124 @@ class RestrictedShell(
      */
     private val execResolver: ((String) -> ShellExecutables.ResolvedExec?)? = null,
 ) {
+    /**
+     * 直接通道執行（Round-4 Phase K P1-4＋P2-4）。
+     *
+     * P1-4 freeze-once：入口只凍結一次有界 immutable argv（[ShellPolicy.copyArgvBounded]
+     * 上限 argc≤64／單項≤4K／總≤64K＋lone surrogate 拒；超限／含 null／拷貝抛即
+     * `Denied(BLACKLISTED)` 零 spawn），同一 frozen snapshot 驅動 validation、binary、
+     * resolve／reverify、quota、最終 spawn；凍結後任何一步不再讀原始 `argv`
+     * （含 `argv[0].trim()` 訊息、`drop(1)` 操作數、resolver 輸入——一律用 frozen）。
+     *
+     * P2-4 有界監督：freeze／gate（validate 實體門＋resolve／自訂 resolver）／reverify
+     * 三段各跑 [DirectSupervisor] worker＋deadline＋bounded join；阻塞
+     * `toRealPath`／resolver 即 typed `TimedOut`（空 partial）零 spawn，
+     * 無無界活 thread（殘留見 [DirectSupervisor]）。
+     *
+     * `timeoutMs` 語義（全鏈一致，整體 request budget）：自本函數入口起的單調時鐘總預算，
+     * 覆 freeze＋validate＋resolve＋quota＋reverify＋process-run；剩餘 budget 才交
+     * [ProcessRunner.run]（`remainingMs`，耗盡即 spawn 前 `TimedOut` 零 spawn）。
+     * 呼叫方（[ShellExecTool.execute]）直傳即同語義。`timeoutMs<=0` 即已逾期，
+     * 直接 `TimedOut` 零 spawn（不耗配額）。`TimedOut.timeoutMs` 回顯原始請求值
+     * （可觀測），runner 側實際等待為剩餘值。
+     */
     fun execute(argv: List<String>, timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS): ShellResult {
-        val binary = when (
-            val v = ShellPolicy.validate(argv, privateRoot, safRoots, flavor, bridgeGranted, trustedBinDirs = execSearchDirs)
+        val entryNanos = System.nanoTime()
+        val deadlineNanos = DirectSupervisor.deadlineNanos(timeoutMs, entryNanos)
+        if (DirectSupervisor.isExpired(deadlineNanos)) {
+            return ShellResult.TimedOut("", "", timeoutMs, false)
+        }
+        // P1-4：只凍結一次。後續一律用 frozen，不再讀 argv。
+        val frozenRaw: List<String> = when (
+            val r = DirectSupervisor.supervise(deadlineNanos, "direct-freeze") {
+                ShellPolicy.copyArgvBounded(argv)
+            }
         ) {
-            is Validation.Denied -> return ShellResult.Denied(v.reason, v.message)
+            is DirectSupervisor.Res.Ok ->
+                r.v ?: return ShellResult.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "invalid argv (fail-closed, no spawn)",
+                )
+            is DirectSupervisor.Res.Err -> return ShellResult.Denied(
+                ShellDeny.BLACKLISTED,
+                "invalid argv (fail-closed, no spawn)",
+            )
+            is DirectSupervisor.Res.Expired -> return ShellResult.TimedOut("", "", timeoutMs, false)
+        }
+        val frozen: List<String> = Collections.unmodifiableList(frozenRaw)
+        // P2-4：gate（validate＋resolve）同一 worker 同一 deadline 監督。
+        // 可信 executable 映射失敗即拒，不建子進程、不佔配額（「拒絕零 spawn」不變量）。
+        val custom = execResolver
+        val gate: DirectGate = when (
+            val r = DirectSupervisor.supervise(deadlineNanos, "direct-gate") {
+                gateOnFrozen(frozen, custom)
+            }
+        ) {
+            is DirectSupervisor.Res.Ok -> r.v
+            is DirectSupervisor.Res.Err -> return ShellResult.Denied(
+                ShellDeny.BLACKLISTED,
+                "validation failed (fail-closed, no spawn)",
+            )
+            is DirectSupervisor.Res.Expired -> return ShellResult.TimedOut("", "", timeoutMs, false)
+        }
+        val binary: String
+        val resolved: ShellExecutables.ResolvedExec
+        when (gate) {
+            is DirectGate.Denied -> return ShellResult.Denied(gate.reason, gate.message)
+            is DirectGate.Ready -> {
+                binary = gate.binary
+                resolved = gate.resolved
+            }
+        }
+        return executeFrozen(frozen, binary, resolved, timeoutMs, deadlineNanos)
+    }
+
+    /** gate worker 本體：只讀 frozen（純函數＋FS／resolver 阻塞體，監督內執行）。 */
+    private fun gateOnFrozen(
+        frozen: List<String>,
+        custom: ((String) -> ShellExecutables.ResolvedExec?)?,
+    ): DirectGate {
+        val v = try {
+            ShellPolicy.validate(
+                frozen,
+                privateRoot,
+                safRoots,
+                flavor,
+                bridgeGranted,
+                trustedBinDirs = execSearchDirs,
+            )
+        } catch (_: Exception) {
+            return DirectGate.Denied(
+                ShellDeny.BLACKLISTED,
+                "validation failed (fail-closed, no spawn)",
+            )
+        }
+        val binary = when (v) {
+            is Validation.Denied -> return DirectGate.Denied(v.reason, v.message)
             is Validation.Allowed -> v.binary
         }
-        // 可信 executable 映射（建程序前）：logical command → 已驗證實體。
-        // 失敗（同名不同路徑假二進位、`PATH` 劫持、檔案缺失/不可執行、
-        // symlink 逃逸集外、可寫目標）即拒，
-        // 不建子進程、不佔配額（沿用「拒絕零 spawn」不變量）。
-        val custom = execResolver
+        val first = try {
+            frozen[0].trim()
+        } catch (_: Exception) {
+            return DirectGate.Denied(
+                ShellDeny.BLACKLISTED,
+                "validation failed (fail-closed, no spawn)",
+            )
+        }
         if (custom != null) {
-            val resolved = try {
-                custom(argv[0].trim())
+            val r = try {
+                custom(first)
             } catch (_: Exception) {
                 null
-            } ?: return ShellResult.Denied(
+            } ?: return DirectGate.Denied(
                 ShellDeny.BLACKLISTED,
-                "untrusted executable: ${argv[0].trim()}",
+                "untrusted executable: $first",
             )
-            val reverify: () -> ShellExecutables.ResolvedExec? = {
-                try {
-                    custom(argv[0].trim())
-                } catch (_: Exception) {
-                    null
-                }
-            }
-            return executeResolved(argv, binary, resolved, timeoutMs, reverify)
+            return DirectGate.Ready(binary, r)
         }
         val outcome = try {
             ShellExecutables.resolveDetailed(
-                argv[0].trim(),
+                first,
                 execSearchDirs,
                 execAllowedRoots,
                 execIsWritable,
@@ -253,35 +440,25 @@ class RestrictedShell(
         } catch (_: Exception) {
             null
         }
-        val resolved = (outcome as? ShellExecutables.ResolveOutcome.Ok)?.exec
+        val r = (outcome as? ShellExecutables.ResolveOutcome.Ok)?.exec
             ?: run {
                 val reason = (outcome as? ShellExecutables.ResolveOutcome.Denied)?.reason
-                return ShellResult.Denied(
+                return DirectGate.Denied(
                     ShellDeny.BLACKLISTED,
-                    if (reason != null) "untrusted executable: ${argv[0].trim()} (reason=$reason)"
-                    else "untrusted executable: ${argv[0].trim()}",
+                    if (reason != null) "untrusted executable: $first (reason=$reason)"
+                    else "untrusted executable: $first",
                 )
             }
-        val reverify: () -> ShellExecutables.ResolvedExec? = {
-            try {
-                (ShellExecutables.resolveDetailed(
-                    argv[0].trim(),
-                    execSearchDirs,
-                    execAllowedRoots,
-                    execIsWritable,
-                ) as? ShellExecutables.ResolveOutcome.Ok)?.exec
-            } catch (_: Exception) {
-                null
-            }
-        }
-        return executeResolved(argv, binary, resolved, timeoutMs, reverify)
+        return DirectGate.Ready(binary, r)
+    }
+
+    private sealed interface DirectGate {
+        data class Ready(val binary: String, val resolved: ShellExecutables.ResolvedExec) : DirectGate
+        data class Denied(val reason: ShellDeny, val message: String) : DirectGate
     }
 
     /**
-     * spawn 前重驗（B1）：配額通過後、建子進程前把同一解析再跑一次並比對
-     * 實體路徑（自訂映射即重調映射，預設即重跑 `resolveDetailed` 同參），
-     * 不一致／失敗即拒且零 spawn。目的只為縮小「驗過→spawn」窗口
-     * （[ShellExecutables] 檔頭殘餘：resolve 與 `ProcessBuilder.start()` 非原子）。
+     * spawn 前重驗（B1）＋spawn：只讀 frozen snapshot（P1-4），重驗跑監督 worker（P2-4）。
      *
      * 誠實揭露（殘餘 TOCTOU）：重驗與 `runner.run(spawnArgv)` 仍非原子；
      * Java 無 `O_NOFOLLOW`／`openat` 可持鎖，驗→spawn 間的二進位替換／link
@@ -289,20 +466,25 @@ class RestrictedShell(
      * 可持的容器鎖（不像 scoped-file 可持 fd 語義）；提權／guest 通道另見
      * 各自入口（`ProotExec` 持同容器鎖，仍只覆 spawn 臨界、不覆政策驗證）。
      * 重驗只覆 argv[0]
-     * 實體（executable），操作數（drop(1)）無二次驗、原樣傳遞；驗→spawn 間操作數
-     * 被換即穿，屬上游 ShellPolicy 門的 TOCTOU 殘餘類，僅有界。
-     * 重驗失敗不洩路徑（通用訊息，僅攜原始 `argv[0]`）；配額已在重驗前扣除
-     * （攻擊性重驗失敗亦計次，兼作速率限制）。
+     * 實體（executable），操作數（frozen `drop(1)`）無二次驗、原樣傳遞；驗→spawn
+     * 間操作數被換即穿，屬上游 ShellPolicy 門的 TOCTOU 殘餘類，僅有界——但
+     * P1-4 已把「呼叫方經原始 mutable list 竄改操作數」的確定性繞道封死：
+     * spawn 操作數取自凍結時 snapshot，驗證後竄改不影響本次 spawn。
+     * 重驗失敗不洩路徑（通用訊息，僅攜 frozen `argv[0]`）；配額已在重驗前扣除
+     * （攻擊性重驗失敗亦計次，兼作速率限制；監督超界同理，已扣除不退）。
      */
-    private fun executeResolved(
-        argv: List<String>,
+    private fun executeFrozen(
+        frozen: List<String>,
         binary: String,
         resolved: ShellExecutables.ResolvedExec,
         timeoutMs: Long,
-        reverify: () -> ShellExecutables.ResolvedExec?,
+        deadlineNanos: Long,
     ): ShellResult {
         if (!quota.tryAcquire()) {
             return ShellResult.Denied(ShellDeny.QUOTA_EXCEEDED, "shell quota exceeded")
+        }
+        if (DirectSupervisor.isExpired(deadlineNanos)) {
+            return ShellResult.TimedOut("", "", timeoutMs, false)
         }
         // Direct 通道 cwd 縱深釘死：預設 runner 且 privateRoot 已知時，用釘死 cwd
         // 的 runner 執行（與 Root/Shizuku 雙層釘死對齊；政策層已 fail-closed，
@@ -316,23 +498,57 @@ class RestrictedShell(
             }
         // spawn 前重驗：同一解析再跑一次，全字段不一致即拒（零 spawn；
         // ResolvedExec 為 data class，全相等比分段比對多覆未來新增欄位）。
-        val fresh = try {
-            reverify()
+        // P2-4：重驗跑監督 worker（自訂 resolver／FS 可阻塞），超界即 TimedOut。
+        val safeFirst = try {
+            frozen[0].trim()
         } catch (_: Exception) {
-            null
+            return ShellResult.Denied(
+                ShellDeny.BLACKLISTED,
+                "untrusted executable (fail-closed, no spawn)",
+            )
+        }
+        val custom = execResolver
+        val fresh: ShellExecutables.ResolvedExec? = when (
+            val r = DirectSupervisor.supervise(deadlineNanos, "direct-reverify") {
+                if (custom != null) {
+                    try {
+                        custom(safeFirst)
+                    } catch (_: Exception) {
+                        null
+                    }
+                } else {
+                    try {
+                        (ShellExecutables.resolveDetailed(
+                            safeFirst,
+                            execSearchDirs,
+                            execAllowedRoots,
+                            execIsWritable,
+                        ) as? ShellExecutables.ResolveOutcome.Ok)?.exec
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+            }
+        ) {
+            is DirectSupervisor.Res.Ok -> r.v
+            is DirectSupervisor.Res.Err -> null
+            is DirectSupervisor.Res.Expired -> return ShellResult.TimedOut("", "", timeoutMs, false)
         }
         if (fresh != resolved) {
             return ShellResult.Denied(
                 ShellDeny.BLACKLISTED,
-                "untrusted executable: ${argv[0].trim()}",
+                "untrusted executable: $safeFirst",
             )
         }
-        // spawn 固定形態：argv[0] 已改寫為驗證後實體路徑（可執行目標不再由
+        if (DirectSupervisor.isExpired(deadlineNanos)) {
+            return ShellResult.TimedOut("", "", timeoutMs, false)
+        }
+        // spawn 固定形態：frozen[0] 已改寫為驗證後實體路徑（可執行目標不再由
         // OS 經 `PATH`/cwd 解析）+ 乾淨 env（固定 `PATH`、無危險變數，
-        // 不繼承宿主）。操作數（drop(1)）原樣傳遞，不重寫、不放寬。
+        // 不繼承宿主）。操作數（frozen `drop(1)`）原樣傳遞，不重寫、不放寬。
         // multicall 別名形（resolved.applet 非 null「且」binary ≠ 實體 basename，
         // 即經 symlink／別名呼叫）時在 argv[1] 補回白名單放行值 `binary`
-        // （即 argv[0] 的 basename），還原被 link 吞掉的子命令名；此處用
+        // （即 frozen[0] 的 basename），還原被 link 吞掉的子命令名；此處用
         // validate 回傳值而非映射自帶字串，自訂映射不得注入未過白名單的
         // applet 名。主程式自身（binary == 實體 basename）與非 multicall
         // 不插入（P2-7 parity 縱深：陳舊映射攜非 null 亦不重插）。
@@ -340,12 +556,16 @@ class RestrictedShell(
         val spawnArgv = if (resolved.applet != null &&
             realBase in ShellExecutables.MULTICALL_BINARIES && binary != realBase
         ) {
-            listOf(resolved.path, binary) + argv.drop(1)
+            listOf(resolved.path, binary) + frozen.drop(1)
         } else {
-            listOf(resolved.path) + argv.drop(1)
+            listOf(resolved.path) + frozen.drop(1)
+        }
+        val remainingMs = DirectSupervisor.remainingMs(deadlineNanos)
+        if (remainingMs <= 0L) {
+            return ShellResult.TimedOut("", "", timeoutMs, false)
         }
         val raw: RawOutput = try {
-            effectiveRunner.run(spawnArgv, timeoutMs, ShellExecutables.CLEAN_ENV)
+            effectiveRunner.run(spawnArgv, remainingMs, ShellExecutables.CLEAN_ENV)
         } catch (_: Exception) {
             // 診斷如需保留只可進 log；目前直接丟棄，回執固定字串不內插異常訊息（防路徑外洩）。
             return ShellResult.Failed("spawn failed")

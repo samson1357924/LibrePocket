@@ -40,6 +40,7 @@ object ShellExecTool {
     /**
      * 受限執行：argv 直達 [RestrictedShell]，不經 shell 解析。
      * 開關關閉時直接回 [ShellResult.Denied] 且不建子進程。
+     * `timeoutMs` 語義沿 [RestrictedShell.execute]（整體 request budget，直傳）。
      */
     fun execute(
         argv: List<String>,

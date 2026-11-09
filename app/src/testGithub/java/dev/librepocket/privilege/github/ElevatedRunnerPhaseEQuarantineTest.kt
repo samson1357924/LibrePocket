@@ -106,6 +106,7 @@ class ElevatedRunnerPhaseEQuarantineTest {
             "elevated-late-spawn",
             "elevated-wait",
             "elevated-verify",
+            "elevated-quarantine-verify",
         )
         val deadline = System.currentTimeMillis() + boundMs
         while (true) {
@@ -164,6 +165,46 @@ class ElevatedRunnerPhaseEQuarantineTest {
             if (!death.get()) throw IllegalThreadStateException("process has not exited")
             return 0
         }
+        override fun destroy() = Unit
+        override fun destroyForcibly(): Process = this
+    }
+
+    /**
+     * Round-4 Phase M stall 回歸模型（P1-3）：跨 Binder `waitFor(0)` 無時限保證——
+     * 永不返回且忽略中斷（`latch` 放行前一直等，`InterruptedException` 吞掉續等，
+     * 含 `timeout==0`）。舊碼在呼叫側直調 `waitFor(0)` 即無界卡死（try/catch
+     * 攔不住 blocking IPC）；新碼 IPC 只跑 `elevated-quarantine-verify` 內層
+     * worker，呼叫側只 join（[ElevatedCleanupTracker.SWEEP_VERIFY_MS]＋
+     * [ElevatedCleanupTracker.SWEEP_GRACE_MS] 有界，逾期記 sweepPending 保持
+     * quarantine）。`latch` 僅供 teardown 放行收斂（測中永不放行）。
+     */
+    private class StallQuarantineProcess(private val latch: CountDownLatch) : Process() {
+        override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+        override fun getInputStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int {
+            while (true) {
+                try {
+                    latch.await()
+                    break
+                } catch (_: InterruptedException) {
+                    // 吞 interrupt 續等。
+                }
+            }
+            return 0
+        }
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
+            while (true) {
+                try {
+                    latch.await()
+                    break
+                } catch (_: InterruptedException) {
+                    // 吞 interrupt 續等（不可靠中斷，呼叫方有界返回，內層殘留追蹤）。
+                }
+            }
+            return false
+        }
+        override fun exitValue(): Int = throw IllegalThreadStateException("process has not exited")
         override fun destroy() = Unit
         override fun destroyForcibly(): Process = this
     }
@@ -567,7 +608,6 @@ class ElevatedRunnerPhaseEQuarantineTest {
     }
 
     // ---- 6. tracker 語義單測（冪等／分離／准入末門／sweep／clear） ----
-
     @Test fun quarantineTrackerSemantics() {
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
@@ -623,5 +663,138 @@ class ElevatedRunnerPhaseEQuarantineTest {
         }
         assertEquals(0, ElevatedCleanupTracker.activeCalls())
         assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
+    }
+
+    // ---- 7. Round-4 Phase M stall 有界化（P1-3，Root＋Shizuku 雙軌） ----
+    //
+    // quarantined 遠端 `waitFor(0)` 永不返回且忽略中斷（跨 Binder 無時限保證模型）＋
+    // 並行多 caller：各呼叫必須有界 `Denied(QUARANTINE)`（贏者約
+    // `SWEEP_VERIFY_MS＋SWEEP_GRACE_MS` 有界，後到 singleflight 零等待即拒）、
+    // 零新 spawn（quarantine 擋在 spawn 之前）、無 untracked checker thread
+    // （同時至多一 `elevated-quarantine-verify` 活躍內層＋一已登記殘留，
+    // `outstanding==0` 不動、`sweepPending==1` 可斷；舊碼呼叫側直調即多 Binder
+    // 並行卡死，連應立刻回的 Denied 都拿不到）。
+    // 排序一律 latch／barrier，不靠 sleep 時序；`latch` 僅 teardown 放行收斂。
+
+    private fun pollPendingTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.sweepPendingCount() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "sweepPending=${ElevatedCleanupTracker.sweepPendingCount()} expected=$expected",
+                )
+            }
+            Thread.sleep(20L)
+        }
+    }
+
+    private fun aliveQuarantineVerifyCount(): Int =
+        Thread.getAllStackTraces().keys.count { it.name == "elevated-quarantine-verify" && it.isAlive }
+
+    private fun doStallParallelBoundedDenied(makeRunner: (
+        spawn: (List<String>) -> Process,
+        killer: (Process) -> Unit,
+    ) -> BinaryElevatedRunner) {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+        pollPendingTo(0)
+        val latch = CountDownLatch(1)
+        val stall = StallQuarantineProcess(latch)
+        ElevatedCleanupTracker.quarantineUnverified(stall)
+        assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+        assertEquals(0, ElevatedCleanupTracker.sweepPendingCount())
+        val spawns = AtomicInteger(0)
+        val runner = makeRunner(
+            {
+                spawns.incrementAndGet()
+                FakeProcess("ok".toByteArray())
+            },
+            {
+                // killer 不應被調（quarantine 擋在 spawn 之前，零 spawn 即零 kill）。
+            },
+        )
+        val callers = 4
+        val startGate = CountDownLatch(1)
+        val results = arrayOfNulls<ElevatedBinaryResult>(callers)
+        val elapsedMs = LongArray(callers)
+        val threads = (0 until callers).map { i ->
+            Thread({
+                try {
+                    startGate.await()
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+                val t0 = System.currentTimeMillis()
+                val r = runner.runBinary(ElevatedRequest(listOf("id"), "PE-STALL"), 5_000L)
+                elapsedMs[i] = System.currentTimeMillis() - t0
+                results[i] = r
+            }).also { it.isDaemon = true }
+        }
+        try {
+            threads.forEach { it.start() }
+            startGate.countDown()
+            threads.forEach { it.join(20_000L) }
+            threads.forEachIndexed { i, t ->
+                assertFalse("caller $i must return bounded (stall must not pin caller)", t.isAlive)
+            }
+            results.forEachIndexed { i, r ->
+                assertTrue("caller $i must deny, got $r", r is ElevatedBinaryResult.Denied)
+                r as ElevatedBinaryResult.Denied
+                assertEquals("caller $i must be QUARANTINE, got $r", ShellDeny.QUARANTINE, r.reason)
+                assertTrue("caller $i msg=${r.message}", r.message.contains("quarantine"))
+                assertTrue("caller $i must keep incomplete signal, got $r", r.cleanupIncomplete)
+                assertTrue(
+                    "caller $i must be bounded (elapsed=${elapsedMs[i]}ms)",
+                    elapsedMs[i] < 8_000L,
+                )
+            }
+            assertEquals("quarantined stall must allow zero new spawn", 0, spawns.get())
+            assertTrue(ElevatedCleanupTracker.isQuarantined())
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            // sweep 獨立 permit：不碰槽／計數器（仍報 QUARANTINE，不翻轉 BACKLOG）。
+            assertEquals(0, ElevatedCleanupTracker.outstanding())
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+            // singleflight＋pending：至多一活躍內層＋一已登記殘留，無 per-caller 爆炸。
+            pollPendingTo(1)
+            val alive = aliveQuarantineVerifyCount()
+            assertTrue(
+                "at most one tracked quarantine-verify may linger, got $alive",
+                alive <= 1,
+            )
+            // 後續 sweep 跳過 pending（零新線程、零等待即 0，不再累積殘留）。
+            val aliveBefore = aliveQuarantineVerifyCount()
+            val t0 = System.currentTimeMillis()
+            assertEquals(0, ElevatedCleanupTracker.sweepQuarantine())
+            val sweepElapsed = System.currentTimeMillis() - t0
+            assertTrue("skip-pending sweep must be fast, elapsed=$sweepElapsed", sweepElapsed < 2_000L)
+            assertEquals(1, ElevatedCleanupTracker.sweepPendingCount())
+            assertTrue(
+                "skip-pending sweep must not spawn new checker (before=$aliveBefore)",
+                aliveQuarantineVerifyCount() <= aliveBefore,
+            )
+            assertEquals(0, spawns.get())
+        } finally {
+            // 放行 stall 內層收斂（worker 回 false，finally 移除 pending），再隔離。
+            latch.countDown()
+            pollPendingTo(0)
+            threads.forEach { it.join(5_000L) }
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            awaitNoElevatedThreads()
+        }
+        assertEquals(0, spawns.get())
+        assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
+    }
+
+    @Test fun rootStallQuarantineParallelBoundedDenied() {
+        doStallParallelBoundedDenied { s, k -> rootRunner(spawn = s, killer = k) }
+    }
+
+    @Test fun shizukuStallQuarantineParallelBoundedDenied() {
+        doStallParallelBoundedDenied { s, k -> shizukuRunner(spawn = s, killer = k) }
     }
 }

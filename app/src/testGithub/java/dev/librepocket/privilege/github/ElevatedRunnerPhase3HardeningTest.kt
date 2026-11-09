@@ -182,10 +182,12 @@ class ElevatedRunnerPhase3HardeningTest {
         }
         override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
             if (destroyed) return true
-            // R3-PhaseF fake 誠實性：`timeout<=0` 為非阻塞 poll（JDK 語義：零等待即回
-            // 當前態），不得阻塞——[ElevatedCleanupTracker.sweepQuarantine] 以
-            // `waitFor(0)` 有界重驗 quarantine（worker 完成≠verified dead，見 Phase E）；
-            // 無條件阻塞即第二次呼叫在 sweep 內死鎖（caller 非 bg、無 join 上界）。
+            // R3-PhaseF fake 誠實性＋R4-PhaseM 注記：`timeout<=0` 為非阻塞 poll
+            //（JDK 語義：零等待即回當前態），不得阻塞——[ElevatedCleanupTracker.sweepQuarantine]
+            // 以內層 worker 跑 `waitFor(0)` 受監督重驗（worker 完成≠verified dead，
+            // 見 Phase E；呼叫側只 join，見 Phase M）；本短路保留快路徑即時回收，
+            // 無條件阻塞亦不再死鎖（sweep 有 `SWEEP_VERIFY_MS＋SWEEP_GRACE_MS` 上界，
+            // 逾期記 pending 保持 quarantine），但短路仍 substantiates barrier 語義。
             // 六個 stuck 點（waitFor 正片／destroy／雙流／stdin）皆用正超時／無參變體，
             // 不受本短路影響，barrier 語義不變。
             if (timeout <= 0L) return destroyed
@@ -226,11 +228,10 @@ class ElevatedRunnerPhase3HardeningTest {
         }
         fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
             if (destroyed) return true
-            // R3-PhaseF fake 誠實性：`timeout<=0` 為非阻塞 poll（JDK 語義：零等待即回
-            // 當前態），不得阻塞——[ElevatedCleanupTracker.sweepQuarantine] 以
-            // `waitFor(0)` 有界重驗 quarantine；無條件阻塞即第二次呼叫在 sweep 內死鎖。
-            // 六個 stuck 點（waitFor 正片／destroy／雙流／stdin）皆用正超時／無參變體，
-            // 不受本短路影響，barrier 語義不變。
+            // R3-PhaseF fake 誠實性＋R4-PhaseM 注記：`timeout<=0` 為非阻塞 poll
+            //（JDK 語義），不得阻塞——[ElevatedCleanupTracker.sweepQuarantine] 以內層
+            // worker 受監督重驗；本短路保留快路徑，無條件阻塞亦不再死鎖（sweep 有界
+            // 逾期即 pending 保持），barrier 語義不變（六 stuck 點皆正超時／無參變體）。
             if (timeout <= 0L) return destroyed
             stuck()
             return destroyed

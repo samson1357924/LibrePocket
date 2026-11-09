@@ -133,7 +133,9 @@ import rikka.shizuku.Shizuku
   * Round-3 Phase E（P1-1）：未驗證 quarantine 非空即拒
   * `Denied(QUARANTINE, "elevated unverified process quarantine held...")` 且零 spawn、
   * 不耗配額（准入前先 [ElevatedCleanupTracker.sweepQuarantine] 有界重驗，
-  * 已驗證死亡即解除；原因碼獨立，不與 backlog／breaker 混碼）。
+  * 已驗證死亡即解除；原因碼獨立，不與 backlog／breaker 混碼；
+  * Round-4 Phase M：呼叫側零 IPC＋singleflight＋受監督 verifier，
+  * 絕不用 `waitFor(0)` 作跨 Binder 時限保證）。
  *
  * AB1 呼叫級准入（owner 新 P1-A＋P1-B）：飽和／熔斷門之後、配額之前
  * 單一原子 [ElevatedCleanupTracker.tryEnterReserved]（同一鎖內檢查＋佔席，
@@ -262,15 +264,18 @@ class ShizukuShellRunner(
         // 即序列化（乾淨態僅單一進行中呼叫，見 [ElevatedCleanupTracker]），飽和／
         // 熔斷／quarantine 下零線程拒絕（不耗 quota、不佔席外資源）。
         // verdict 優先級：准入拒絕（Denied）先於取消判定（TimedOut）——席位未取得
-        // 即無門可進；sweep（[sweepQuarantine]，鎖外非阻塞狀態查詢，不起線程）
-        // 仍在准入鎖外先行，有界、無新線程，准入判定仍單一原子點。
+        // 即無門可進；sweep（[sweepQuarantine]，Round-4 Phase M singleflight＋
+        // 受監督有界重驗：呼叫側零 IPC、贏者內層 worker＋deadline＋grace、
+        // 逾期放棄保持 quarantine）仍在准入鎖外先行，有界，准入判定仍單一原子點。
         // B3 cheap 准入前置（owner P1-5）：可能阻塞的外部回呼前先占全域席
         //（[tryEnterReserved] 原子；拒絕不耗 quota；阻塞體皆有界監督，stall 即殘留
         // 追蹤，呼叫方有界返回）。validate（純）亦入席內（需 bridge 快照，bridge
         // 本身阻塞，故席位須在 bridge 之前；黑名單等純拒絕亦短暫占席後經 finally 釋放）。
         // Round-3 Phase E（P1-1）：准入先有界重掃 quarantine（[sweepQuarantine]：
-        // 已驗證死亡即解除，無需 B3 手動介入；仍存活即保持，後續准入以 QUARANTINE
-        // 拒）。sweep 在准入鎖外探測、有界（無新線程），准入判定仍單一原子點。
+        // 已驗證死亡即解除，無需 B3 手動介入；仍存活／逾期／中斷即保持，後續准入
+        // 以 QUARANTINE 拒）。sweep 在准入鎖外受監督探測、有界（Round-4 Phase M：
+        // 呼叫側零 IPC＋singleflight，絕不用 `waitFor(0)` 作跨 Binder 時限保證），
+        // 准入判定仍單一原子點。
         ElevatedCleanupTracker.sweepQuarantine()
         when (ElevatedCleanupTracker.tryEnterReserved()) {
             ElevatedCleanupTracker.Admission.OK -> Unit

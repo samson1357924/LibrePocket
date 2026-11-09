@@ -81,6 +81,16 @@ object ShellExecTool {
      * 不吞 VM 失敗；[InterruptedException] 恢復中斷位後同樣映 `Failed`
      * （runner 契約以 [ShellResult] 返值，不抛中斷；coroutine 取消請用
      * `isCancelled` 鉤，見 runner R3-A 段）。
+     *
+     * Round-4 Phase N（P2-1 SLA 統一＋P2-2 reason 上限）：
+     * - reasonCode 先行（P2-2）：超限（[PrivilegeAuditLog.MAX_REASON_CODE_BYTES]
+     *   UTF-8 位元組）即 `Denied(BLACKLISTED)` 且零 spawn、零 snapshot worker；
+     *   審計以空 argv＋空 reason 記一筆 DENY（不哈希無界輸入，見
+     *   [PrivilegeAuditLog.record] fail-closed 門）。
+     * - 單次凍結（P2-1）：本函數快照一次，得 frozen 即委派
+     *   [executeElevatedFrozen]；上游 [dev.librepocket.router.ElevatedDispatch]
+     *   已凍結時直調 frozen 版，不再二次凍結（舊雙重凍結最坏 2×(1s+grace)，
+     *   現每 caller 至多一 snapshot worker，且池化有界見 [frozenOrNull]）。
      */
     fun executeElevated(
         request: ElevatedRequest,
@@ -88,9 +98,46 @@ object ShellExecTool {
         audit: PrivilegeAuditLog,
         timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS,
     ): ShellResult {
+        if (PrivilegeAuditLog.isReasonCodeTooLong(request.reasonCode)) {
+            val denied = ShellResult.Denied(
+                ShellDeny.BLACKLISTED,
+                "reasonCode too long (fail-closed, no spawn)",
+            )
+            audit.record(emptyList(), "", PrivilegeAuditLog.verdictName(denied))
+            return denied
+        }
         val frozen = request.frozenOrNull() ?: run {
             val denied = ShellResult.Denied(ShellDeny.BLACKLISTED, "elevated snapshot failed (fail-closed, no spawn)")
+            // reason 已先行验长度（见上），此处哈希有界；argv 读取本身不可信，
+            // 故以空 argv 记 DENY（不哈希原文）。
             audit.record(emptyList(), request.reasonCode, PrivilegeAuditLog.verdictName(denied))
+            return denied
+        }
+        return executeElevatedFrozen(frozen, runner, audit, timeoutMs)
+    }
+
+    /**
+     * 已凍結版提權執行（Round-4 Phase N，P2-1 SLA 統一唯一入口）：
+     * [frozen] 須為入口快照（[frozenOrNull] 產物：有界拷貝＋不可變包裝），
+     * 本函數不再觸碰原始 `request`、不再二次凍結；門禁／執行／審計一律用同一份。
+     *
+     * SLA：`timeoutMs` 原值透傳 [runner]（准入後執行預算，不扣快照耗時；
+     * 快照為准入成本，有界 1s＋grace，見 [frozenOrNull]；呼叫方總耗時上界 ≈
+     * 快照門＋`timeoutMs`）。直调本函数传超限 frozen 同样防御性复检
+     * （String 只读，零 worker）fail-closed。
+     */
+    fun executeElevatedFrozen(
+        frozen: ElevatedRequest,
+        runner: ElevatedShellRunner,
+        audit: PrivilegeAuditLog,
+        timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS,
+    ): ShellResult {
+        if (PrivilegeAuditLog.isReasonCodeTooLong(frozen.reasonCode)) {
+            val denied = ShellResult.Denied(
+                ShellDeny.BLACKLISTED,
+                "reasonCode too long (fail-closed, no spawn)",
+            )
+            audit.record(emptyList(), "", PrivilegeAuditLog.verdictName(denied))
             return denied
         }
         val result = try {

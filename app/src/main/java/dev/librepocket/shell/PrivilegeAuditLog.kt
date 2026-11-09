@@ -74,6 +74,13 @@ class PrivilegeAuditLog {
         atMs: Long = System.currentTimeMillis(),
     ): PrivilegeAuditRecord {
         require(verdict.isNotBlank()) { "verdict must not be blank" }
+        // Round-4 Phase N（P2-2）：reasonCode 超限 fail-closed，不哈希无界输入。
+        // 入口（Dispatch／Tool）已先行检查并映 `Denied`（见各调用方 KDoc），本处为纵深：
+        // 直调 record 传超限 reason 即抛（无行写入），不做截断哈希（截断即把相异长码
+        // 坍缩为同哈希，审计不可辨；且 `toByteArray` 物化本身即无界成本）。
+        require(!isReasonCodeTooLong(reasonCode)) {
+            "reasonCode too long (max $MAX_REASON_CODE_BYTES UTF-8 bytes, fail-closed)"
+        }
         // 純計算（SHA-256）放鎖外，避免持鎖做雜湊；結果綁定本次呼叫的 argv／reason。
         val argvH = argvHash(argv)
         val reasonH = sha256Hex(reasonCode)
@@ -148,6 +155,57 @@ class PrivilegeAuditLog {
          * seqId 單調遞增，轉錄側以序號空洞察覺丟棄）。
          */
         const val MAX_RECORDS: Int = 1_000
+
+        /**
+         * Round-4 Phase N（P2-2）：reasonCode 入站上限（短码语义）。
+         *
+         * - 取值 512 UTF-8 位元組：原因码为人工短码（`D09-bridge`／矩阵 §3 量级，
+         *   通常 <64B），512 已留 ~8× 余量；与 argv 通道 64K 上限同属“有限输入→
+         *   有限哈希成本”体系（512B 哈希为常数成本，不可成为放大的 DoS 面）。
+         * - 计数口径为 UTF-8 位元组（非 `String.length`）：多字节码点（CJK 3B／
+         *   emoji 4B）按实际哈希物化成本计，`length` 口径可被非 ASCII 绕行。
+         * - 失败语义 fail-closed（见 [record] 与各入口）：超限即 `Denied`，
+         *   不截断（截断即哈希坍缩，不可辨）、不流式哈希（短码无流式必要）。
+         */
+        const val MAX_REASON_CODE_BYTES: Int = 512
+
+        /**
+         * reasonCode 的 UTF-8 有界长度（P2-2 门用，不物化字节数组）：
+         * 逐字符累加（ASCII 1／<0x800 2／非代理 3／代理对 4／孤立代理按替换
+         * `?` 计 1，与 `toByteArray(UTF_8)` 一致），超 [MAX_REASON_CODE_BYTES]
+         * 即 early-exit（长输入不断言全扫，无 2× 物化）。
+         * 返回值在超限时只保证 `> MAX`（饱和，不承诺精确长度）。
+         */
+        fun reasonUtf8Length(reason: String): Int {
+            var total = 0
+            var i = 0
+            val n = reason.length
+            while (i < n) {
+                val c = reason[i]
+                val w = when {
+                    c < '\u0080' -> 1
+                    c < '\u0800' -> 2
+                    c.isHighSurrogate() -> {
+                        if (i + 1 < n && reason[i + 1].isLowSurrogate()) {
+                            i++
+                            4
+                        } else {
+                            1
+                        }
+                    }
+                    c.isLowSurrogate() -> 1
+                    else -> 3
+                }
+                total += w
+                if (total > MAX_REASON_CODE_BYTES) return total
+                i++
+            }
+            return total
+        }
+
+        /** reasonCode 是否超限（gate／audit／hash 前的统一门，见 P2-2）。 */
+        fun isReasonCodeTooLong(reason: String): Boolean =
+            reasonUtf8Length(reason) > MAX_REASON_CODE_BYTES
 
         /**
          * argv 向量的單射編碼（Phase D P2-3，PR #140 Round-2）：

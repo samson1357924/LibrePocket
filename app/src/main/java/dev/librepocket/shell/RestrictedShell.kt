@@ -4,6 +4,7 @@ import dev.librepocket.tool.Flavor
 import java.io.ByteArrayOutputStream
 import java.util.ArrayDeque
 import java.util.Collections
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 
 /**
@@ -346,19 +347,85 @@ class ShellQuota(
 }
 
 /**
- * 直接通道有界監督（Round-4 Phase K P2-4，main 源集本地實現）：
+ * 直接通道跨呼叫准入（Round-5 Phase P P1-2，main 源集本地實現）：
+ *
+ * 推導（固定小池之原子 reservation，二選一之抉擇）：
+ * - 不用「每呼叫各起一 thread」（Phase K 舊碼）：24／100 caller 各創一永久活
+ *   daemon，`outstanding==0` 仍 thread 數隨呼叫數成長——呼叫數即殘留上界，
+ *   不可接受（review 已驗證：並行 24/100 caller 留 24/100 活 daemon）。
+ * - 不用「固定 ThreadPoolExecutor＋SynchronousQueue 零排隊」（提權快照池式）：
+ *   池化雖同樣有界（全域恆 ≤N worker），但核心 threads 常駐 idle（`core==max`
+ *   永不超時），idle 亦佔 `direct-*` 名，測試「釋 latch 後歸零」需等 keepAlive
+ *   超時、非確定性；且池 thread 重用把「殘留引用」與「idle 線程」混為一談，
+ *   不如 reservation 誠實（alive 即持 permit，idle 即零 thread）。
+ * - 原子 reservation＋殘留持 permit 至 thread 實際退出：[permits] 同時是併發
+ *   上限與 alive 上限（每活 worker 恰持一 permit，worker `finally` 才釋放；
+ *   caller 永不持 permit，entry 不預佔）。飽和即 [tryEnter] 失敗→呼叫方零
+ *   thread 即時 `Expired(hasLinger=true)`（fail-closed，不排隊：排隊即把 caller
+ *   卡成隱性等待，與 deadline 門重複且掩蓋飽和）。
+ *
+ * 常數 `MAX_WORKERS = 3` 推導（與提權 7 體系協調的獨立小池）：
+ * - 下界：正常 direct 預檢皆 µs～ms 級（拷貝＋詞法＋`lstat`），quota 30/min
+ *   ≈0.5/s，Little 定律併發 ≈0.005，2 槽已不序列化正常；但 gate 含 FS／自訂
+ *   resolver（FUSE 慢路徑 ms 級），取 3 留一槽餘量，避免正常抖動下偶發飽和
+ *   誤拒（提權快照池取 2 因純拷貝無 FS，本池多一槽正為 FS 差異）。
+ * - 上界：每殘留持一 argv 快照（≤64K＋12K，見 [ShellPolicy.copyArgvBounded]）
+ *   ＋一 thread，3 份 ≈228K＋3 thread，有界小常數；全域 shell 子系統峰值
+ *   ＝提權快照 2＋提權清理 7＋直接 3＝12 daemon，不擋 JVM 退出。
+ * - 與提權正交：提權 `tryEnterReserved`／quarantine／slot（E/F/G/H/M/L/Q 已定）
+ *   本池永不觸碰；直接飽和只擋直接，不影響提權（反之亦然）。
+ *
+ * 排序（quota 留位說明）：本准入在任何 worker 之前（freeze／gate 的
+ * [DirectSupervisor.supervise] 內首步即 [tryEnter]，失敗即零 thread 回
+ * `Expired`，故永久 stall 下後續請求立即 fail-closed，且發生在 quota 之前，
+ * 飽和拒絕不耗 quota）；quota 本身留位 gate 之後（[RestrictedShell.executeFrozen]
+ * 首步，見其 KDoc）：`deniedCallsDoNotConsumeQuota` 釘住「策略拒絕不耗配額」，
+ * 提權雙 runner 亦 quota 置門後（門拒絕不耗配額），前移 quota 會使任意無效
+ * argv 耗配額（無效探測即 DoS 配額），故配額仍為速率門、准入為負載門，
+ * 分工見 [RestrictedShell.execute]。
+ */
+internal object DirectAdmission {
+    /** 跨呼叫 alive worker 上界（見上推導；殘留引用全域上界同值）。 */
+    const val MAX_WORKERS: Int = 3
+
+    private val permits = Semaphore(MAX_WORKERS)
+
+    /** 非阻塞准入：成功即持一 permit（由 worker `finally` 釋放，caller 不持）。 */
+    fun tryEnter(): Boolean = permits.tryAcquire()
+
+    /** worker 退出釋放（僅 worker `finally` 調用；起線程失敗由 caller 補釋）。 */
+    fun release() {
+        permits.release()
+    }
+
+    /** 剩餘 permits（僅單測斷言有界用；近似值）。 */
+    internal fun availablePermits(): Int = permits.availablePermits()
+}
+
+/**
+ * 直接通道有界監督（Round-4 Phase K P2-4＋Round-5 Phase P P1-2/P2-3，main 源集本地實現）：
  * 沿用 supervisor 模式（worker＋deadline＋bounded join），不依賴 github 源集
  * [dev.librepocket.privilege.github.ElevatedCallSupervisor]（main 源集不可見；
  * 語義同源：單一 request deadline、caller 只看中斷＋deadline、超界即
  * `interrupt`＋grace、仍存活即殘留 daemon）。
  * - 覆蓋：freeze（[ShellPolicy.copyArgvBounded]，惡意 `List` 可阻塞呼叫執行緒）→
  *   gate（[ShellPolicy.validate] 實體門 `lstat`/`toRealPath`＋resolve／自訂 resolver
- *   回呼，FUSE／壞 FS／自訂 resolver 可卡住）→ reverify（同 resolve 體）；
- *   spawn 本體（[ProcessRunner.run]）不經此（其 `timeoutMs` 即 process 超時，
- *   見 [RestrictedShell.execute] 預算語義，傳剩餘 budget）。
- * - 殘餘：超界殘留 worker 為 daemon（不擋 JVM 退出），單次 execute 至多三 worker
- *   （freeze／gate／reverify 各一），阻塞於不可中斷操作即各持一份快照引用而殘留；
- *   供給阻塞 list／resolver 的本來就是呼叫方自身，屬自限 DoS，不放大為跨呼叫無界。
+ *   回呼，FUSE／壞 FS／自訂 resolver 可卡住）→ reverify（同 resolve 體）→
+ *   process（[ProcessRunner.run] 全包：spawn＋wait＋kill＋gobbler joins 同一
+ *   deadline 監督下，見 Round-5 Phase P P2-3）。
+ * - Round-5 Phase P P1-2 跨呼叫有界：每 [supervise] 首步非阻塞取
+ *   [DirectAdmission] permit（飽和即零 thread 直回 `Expired(true)`，fail-closed），
+ *   worker `finally` 才釋放（殘留持 permit 至 thread 實際退出）；全域 alive
+ *   `direct-*` 恆 ≤[DirectAdmission.MAX_WORKERS]，idle 零 thread（非池化常駐）。
+ * - Round-5 Phase P P2-3 整體上限：process 段同 deadline 監督（caller wall
+ *   ≤`timeoutMs`＋[GRACE_MS]＋[POLL_MS]＋調度，見 [RestrictedShell.execute]）；
+ *   runner 內超額（`waitFor` 準時後的 kill-grace＋雙 gobbler join(5s)／吞中斷
+ *   假 runner 永不返回／`pb.start()` 阻塞）只滯 worker（daemon 殘留，有界），
+ *   不滯 caller；真 runner 清理（kill＋reap＋關流，Phase O owner 語義）仍在
+ *   worker 內執行，caller `TimedOut` 後台收斂（見 Phase P 測試 kill＋reap 斷言）。
+ * - 殘餘：超界殘留 worker 為 daemon（不擋 JVM 退出），阻塞於不可中斷操作即
+ *   持 permit＋快照引用而殘留（全域 ≤3）；供給阻塞 list／resolver／runner 的
+ *   本來就是呼叫方自身（假 runner 阻塞亦然），屬自限 DoS，不放大為跨呼叫無界。
  */
 internal object DirectSupervisor {
     /** 監督輪詢切片（呼叫執行緒 join 粒度，兼中斷／deadline 響應）。 */
@@ -398,21 +465,31 @@ internal object DirectSupervisor {
     fun remainingMs(deadlineNanos: Long, nowNanos: Long = System.nanoTime()): Long =
         ((deadlineNanos - nowNanos) / 1_000_000L).coerceAtLeast(0L)
 
-    /** 阻塞體有界：入口已逾期即不啟 worker，直回 `Expired(false)`（零殘留）。 */
+    /** 阻塞體有界：入口已逾期即不啟 worker，直回 `Expired(false)`（零殘留）。
+     * Round-5 Phase P P1-2：次步非阻塞取 [DirectAdmission] permit（飽和即零
+     * thread 直回 `Expired(true)`，fail-closed；permit 由 worker `finally` 釋放，
+     * 殘留持至 thread 實際退出）。 */
     fun <T> supervise(deadlineNanos: Long, threadName: String, block: () -> T): Res<T> {
         if (isExpired(deadlineNanos)) return Res.Expired(false)
+        if (!DirectAdmission.tryEnter()) return Res.Expired(true)
         val holder = arrayOfNulls<Any>(1)
         val worker = Thread({
             try {
-                holder[0] = Val(block())
-            } catch (t: Throwable) {
-                holder[0] = Thr(t)
+                try {
+                    holder[0] = Val(block())
+                } catch (t: Throwable) {
+                    holder[0] = Thr(t)
+                }
+            } finally {
+                DirectAdmission.release()
             }
         }, threadName)
         worker.isDaemon = true
         try {
             worker.start()
         } catch (_: Throwable) {
+            // 起線程失敗：worker finally 永不執行，由 caller 補釋（fail-closed）。
+            DirectAdmission.release()
             return Res.Expired(false)
         }
         try {
@@ -515,7 +592,7 @@ class RestrictedShell(
     private val execResolver: ((String) -> ShellExecutables.ResolvedExec?)? = null,
 ) {
     /**
-     * 直接通道執行（Round-4 Phase K P1-4＋P2-4）。
+     * 直接通道執行（Round-4 Phase K P1-4＋P2-4，Round-5 Phase P P1-2/P2-3）。
      *
      * P1-4 freeze-once：入口只凍結一次有界 immutable argv（[ShellPolicy.copyArgvBounded]
      * 上限 argc≤64／單項≤4K／總≤64K＋lone surrogate 拒；超限／含 null／拷貝抛即
@@ -525,15 +602,29 @@ class RestrictedShell(
      *
      * P2-4 有界監督：freeze／gate（validate 實體門＋resolve／自訂 resolver）／reverify
      * 三段各跑 [DirectSupervisor] worker＋deadline＋bounded join；阻塞
-     * `toRealPath`／resolver 即 typed `TimedOut`（空 partial）零 spawn，
-     * 無無界活 thread（殘留見 [DirectSupervisor]）。
+     * `toRealPath`／resolver 即 typed `TimedOut`（空 partial）零 spawn。
+     * Round-5 Phase P P1-2 跨呼叫准入：每段首步非阻塞取 [DirectAdmission]
+     * permit（飽和即零 thread 即時 `TimedOut`，fail-closed；freeze／gate 在 quota
+     * 之前故飽和不耗 quota；permits 由 worker `finally` 釋放，殘留持至 thread
+     * 實際退出，全域 alive `direct-*` 恆 ≤[DirectAdmission.MAX_WORKERS]，idle
+     * 零 thread，見 [DirectAdmission] 推導；quota 留位 gate 之後以保
+     * `deniedCallsDoNotConsumeQuota`＋提權 parity，准入為負載門、配額為速率門）。
      *
-     * `timeoutMs` 語義（全鏈一致，整體 request budget）：自本函數入口起的單調時鐘總預算，
+     * Round-5 Phase P P2-3 受監督 process 段：`runner.run` 全包（spawn＋wait＋
+     * kill＋gobbler joins）跑同一 deadline 監督 worker（`direct-process`，見
+     * [executeFrozen]）：注入 runner 永不返回／`pb.start()` 阻塞／慢 gobbler
+     * EOF 只滯 worker（daemon 殘留，有界），caller wall 恆有界（見下）。
+     *
+     * `timeoutMs` 語義（全鏈一致，整體 request budget，有測試背書見
+     * `ShellDirectPhasePTest`）：自本函數入口起的單調時鐘總預算，
      * 覆 freeze＋validate＋resolve＋quota＋reverify＋process-run；剩餘 budget 才交
      * [ProcessRunner.run]（`remainingMs`，耗盡即 spawn 前 `TimedOut` 零 spawn）。
-     * 呼叫方（[ShellExecTool.execute]）直傳即同語義。`timeoutMs<=0` 即已逾期，
-     * 直接 `TimedOut` 零 spawn（不耗配額）。`TimedOut.timeoutMs` 回顯原始請求值
-     * （可觀測），runner 側實際等待為剩餘值。
+     * caller wall 上界＝`timeoutMs`＋[DirectSupervisor.GRACE_MS]＋
+     * [DirectSupervisor.POLL_MS]＋調度（process 段吞中斷阻塞亦然；真 runner 的
+     * kill-grace＋gobbler joins 超額只滯 worker，不滯 caller）。
+     * 呼叫方（[ShellExecTool.execute]）直傳即同語義（Tool API 不變）。
+     * `timeoutMs<=0` 即已逾期，直接 `TimedOut` 零 spawn（不耗配額）。
+     * `TimedOut.timeoutMs` 回顯原始請求值（可觀測），runner 側實際等待為剩餘值。
      */
     fun execute(argv: List<String>, timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS): ShellResult {
         val entryNanos = System.nanoTime()
@@ -657,7 +748,8 @@ class RestrictedShell(
     }
 
     /**
-     * spawn 前重驗（B1）＋spawn：只讀 frozen snapshot（P1-4），重驗跑監督 worker（P2-4）。
+     * spawn 前重驗（B1）＋spawn：只讀 frozen snapshot（P1-4），重驗跑監督 worker（P2-4），
+     * process 段跑同一 deadline 監督 worker（Round-5 Phase P P2-3）。
      *
      * 誠實揭露（殘餘 TOCTOU）：重驗與 `runner.run(spawnArgv)` 仍非原子；
      * Java 無 `O_NOFOLLOW`／`openat` 可持鎖，驗→spawn 間的二進位替換／link
@@ -670,7 +762,25 @@ class RestrictedShell(
      * P1-4 已把「呼叫方經原始 mutable list 竄改操作數」的確定性繞道封死：
      * spawn 操作數取自凍結時 snapshot，驗證後竄改不影響本次 spawn。
      * 重驗失敗不洩路徑（通用訊息，僅攜 frozen `argv[0]`）；配額已在重驗前扣除
-     * （攻擊性重驗失敗亦計次，兼作速率限制；監督超界同理，已扣除不退）。
+     * （攻擊性重驗失敗亦計次，兼作速率限制；監督超界同理，已扣除不退；
+     * reverify／process 段飽和（[DirectAdmission] 滿）同理已扣除不退——freeze／
+     * gate 飽和在 quota 之前故不耗，見 [execute]）。
+     *
+     * Round-5 Phase P P2-3 process 監督（不碰 [DefaultProcessRunner]/gobbler 內部
+     * 語義，Phase O 已定，只包監督）：`effectiveRunner.run(spawnArgv,
+     * remainingMsSnapshot, CLEAN_ENV)` 跑 `direct-process` 監督 worker，同一
+     * `deadlineNanos` 為上界（caller wall ≤`timeoutMs`＋grace＋poll，見 [execute]）：
+     * - 注入 runner 永不返回／`pb.start()`／`outputStream.close()` 阻塞／慢
+     *   gobbler EOF（雙 join(5s)）只滯 worker（`Expired` 即 `TimedOut` 空 partial，
+     *   worker 殘留 daemon 有界 ≤[DirectAdmission.MAX_WORKERS]，permit 至退出才釋）；
+     * - 真 runner 清理仍在 worker 內（Phase O owner try/finally：關流＋監督
+     *   kill+reap，中斷快照恢復），caller `TimedOut` 後台收斂（kill＋reap 斷言見
+     *   Phase P 測試；direct 無 `cleanupIncomplete` 欄，`TimedOut` 即含「已殺」語義，
+     *   殘留只可能是 worker 滯留而非未嘗試清理）；
+     * - worker 抛 [InterruptedException]（runner 中斷已做 owner 清理）映
+     *   `Failed("interrupted (process cleaned up)")`＋恢復 caller 中斷（P1-1 語義
+     *   不變，只是發生地從 caller 線程移到 worker）；其餘抛映 `Failed("spawn
+     *   failed")`（固定字串不內插異常訊息，防路徑外洩）。
      */
     private fun executeFrozen(
         frozen: List<String>,
@@ -763,16 +873,32 @@ class RestrictedShell(
         if (remainingMs <= 0L) {
             return ShellResult.TimedOut("", "", timeoutMs, false)
         }
-        val raw: RawOutput = try {
-            effectiveRunner.run(spawnArgv, remainingMs, ShellExecutables.CLEAN_ENV)
-        } catch (ie: InterruptedException) {
-            // P1-1：runner 中斷已做 owner 清理（kill+reap＋關流，見 DefaultProcessRunner），
-            // 不偽造 Ok/TimedOut；direct 無 cleanupIncomplete 欄，以 Failed＋KDoc 說明。
-            Thread.currentThread().interrupt()
-            return ShellResult.Failed("interrupted (process cleaned up)")
-        } catch (_: Exception) {
-            // 診斷如需保留只可進 log；目前直接丟棄，回執固定字串不內插異常訊息（防路徑外洩）。
-            return ShellResult.Failed("spawn failed")
+        // Round-5 Phase P P2-3：process 全包監督（spawn＋wait＋kill＋gobbler joins
+        // 同一 deadline；runner 側實際等待為快照值，caller wall 另由監督封頂）。
+        // 不碰 DefaultProcessRunner／Gobbler 內部語義（Phase O 已定），只包監督：
+        // 阻塞 runner／慢 tail 只滯 worker（daemon 殘留，有界），不滯 caller。
+        val remainingSnapshot = remainingMs
+        val raw: RawOutput = when (
+            val r = DirectSupervisor.supervise(deadlineNanos, "direct-process") {
+                effectiveRunner.run(spawnArgv, remainingSnapshot, ShellExecutables.CLEAN_ENV)
+            }
+        ) {
+            is DirectSupervisor.Res.Ok -> r.v
+            is DirectSupervisor.Res.Err -> {
+                val t = r.t
+                if (t is InterruptedException) {
+                    // P1-1：runner 中斷已做 owner 清理（kill+reap＋關流，見 DefaultProcessRunner），
+                    // 不偽造 Ok/TimedOut；direct 無 cleanupIncomplete 欄，以 Failed＋KDoc 說明。
+                    Thread.currentThread().interrupt()
+                    return ShellResult.Failed("interrupted (process cleaned up)")
+                }
+                // 診斷如需保留只可進 log；目前直接丟棄，回執固定字串不內插異常訊息（防路徑外洩）。
+                return ShellResult.Failed("spawn failed")
+            }
+            is DirectSupervisor.Res.Expired ->
+                // process 超界：空 partial（worker 滯留持有 partial，caller 不取；
+                // 真 runner 清理在 worker 內後台收斂，見本函數 KDoc）。
+                return ShellResult.TimedOut("", "", timeoutMs, false)
         }
         val out = ShellPolicy.truncate(raw.stdout)
         val err = ShellPolicy.truncate(raw.stderr)

@@ -20,12 +20,28 @@ interface ProcessRunner {
     fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>? = null): RawOutput
 }
 
-/** 子進程原始回執：輸出為位元組（截斷前），[timedOut] 表示超時已被殺。 */
+/** 子進程原始回執：輸出為位元組（截斷前），[timedOut] 表示超時已被殺。
+ *
+ * Phase O 完整性旗標（direct 通道誠實性，不新增 [ShellResult] verdict 常數）：
+ * - [readFailed]：任一流 gobbler `read` 抛異常（真實 I/O 錯誤；只有真 EOF 才算完整）。
+ *   `executeFrozen` 側 finished 下必映 `Failed`（部分輸出不當完整幀），超時路徑已先回
+ *   `TimedOut` 不受影響（預期 close 收斂保留）。
+ * - [outputIncomplete]：gobbler 有界 join（[DefaultProcessRunner.GOBBLER_JOIN_MS]）超界仍
+ *   存活（父已 exit 但子孫繼承 pipe 致 EOF 延遲等），部分讀。would-be Ok（非超時且無
+ *   [readFailed]）一律升級 `TimedOut`（攜 partial），不再回完整 Ok；`readFailed` 優先
+ *   （兩旗同真即 `Failed`，數據錯誤優先於排空超時）。
+ * - [overflowed]：任一流達 [ShellPolicy.HARD_READ_CAP_BYTES] 硬上限丟棄（drain-and-discard
+ *   續讀至 EOF，不提前關流；見 P2-1）。下游仍經 [ShellPolicy.truncate]（64K）併入
+ *   `truncated`（512K＞64K 故溢出必已截斷，此位僅為誠實冗餘）。
+ */
 data class RawOutput(
     val stdout: ByteArray,
     val stderr: ByteArray,
     val exitCode: Int,
     val timedOut: Boolean,
+    val readFailed: Boolean = false,
+    val outputIncomplete: Boolean = false,
+    val overflowed: Boolean = false,
 )
 
 /** 真實子進程實現：argv 直達 exec（無 shell），超時 [destroyForcibly]。
@@ -35,8 +51,52 @@ data class RawOutput(
  * [run] 的 [env] 一律先 `clear()` 再全量替換，不繼承宿主 env；
  * null 即回落 [ShellExecutables.CLEAN_ENV]（固定 `PATH`、無危險變數），
  * guest 通道仍須顯式傳 [dev.librepocket.linux.LinuxEnv.GUEST_ENV]。
+ *
+ * Round-5 Phase O 生命週期（P1-1 owner try/finally＋P2-1 drain-and-discard＋P2-2 完整性）：
+ * - owner 語義：[pb.start] 成功後立即進 try/finally。正常／Timeout／中斷／stdin 關閉抛／
+ *   gobbler 啟動抛／`waitFor` 抛／`exitValue` 抛，全路徑關流（stdin＋雙讀端，best-effort
+ *   吞）＋監督 kill+reap（`destroy`→有界 grace→`destroyForcibly`→有界 reap，見
+ *   [DESTROY_GRACE_MS]/[REAP_JOIN_MS]），中斷旗標快照清除後恢復（不吞 caller 中斷）。
+ * - 中斷：`waitFor` 抛 [InterruptedException] 即 kill 後原樣重抛（不偽造 Ok/TimedOut；
+ *   上層 [RestrictedShell.executeFrozen] 映 `Failed("interrupted (process cleaned up)")`
+ *   並恢復中斷；direct [ShellResult] 無 `cleanupIncomplete` 欄，以 Failed＋本 KDoc 說明，
+ *   不新增 verdict 常數）。
+ * - reap 失敗（有界 kill 後仍存活，實務僅不可殺 D-state）：try 內主動抛
+ *   [IllegalStateException]（轉 `Failed("spawn failed")`），不回健康 Ok；finally 本身不抛
+ *   （不遮蔽原異常），殘留風險見 KDoc 殘餘。
+ * - P2-1：gobbler 到 cap 後 drain-and-discard 至 EOF（不提前 break/close，不給寫端
+ *   EPIPE/SIGPIPE；與提權 [dev.librepocket.privilege.github.ElevatedProcessIo.copyCapped]
+ *   同策），溢出經 [Gobbler.truncated] 單調標。
+ * - P2-2：gobbler [Gobbler.finished]/[Gobbler.failed]/[Gobbler.truncated] 單調旗＋
+ *   [Gobbler.read] join 超界 `joinIncomplete`；[RawOutput.readFailed]/[RawOutput.outputIncomplete]
+ *   帶出，would-be Ok 不偽造完整（見 [RawOutput] 與 `executeFrozen` 映射）。
+ *
+ * 殘餘：`destroyForcibly` 後仍不可殺（D-state／核心拒殺）即殘留活子進程（verdict 已為
+ * Failed，非健康 Ok；本機無提權通道式 quarantine 閂，後續 spawn 不自動封鎖）。
  */
 class DefaultProcessRunner(val dirRoot: String? = null) : ProcessRunner {
+    companion object {
+        /** gobbler 有界 join（每流；超界即 [RawOutput.outputIncomplete]，不無限等 pipe）。 */
+        const val GOBBLER_JOIN_MS: Long = 5_000L
+
+        /** `destroy` 優雅 grace（仍存活即升級 `destroyForcibly`）。 */
+        const val DESTROY_GRACE_MS: Long = 200L
+
+        /** `destroyForcibly` 後有界 reap（殭屍收割；早死即早回，非固定等待）。 */
+        const val REAP_JOIN_MS: Long = 5_000L
+    }
+
+    /**
+     * Phase O 測試縫（internal，同模組單測可達；產品碼永不設置）：
+     * - [processObserver]：`pb.start()` 成功後同步回調（PID／[ProcessHandle] 可觀測；
+     *   回調抛即吞，不影響生命週期）。
+     * - [failStdinClose]：為 true 即不關 stdin、直接抛（模擬 stdin 關閉失敗路徑）。
+     * - [failGobblerStart]：為 true 即不啟 gobbler、直接抛（模擬 gobbler 啟動失敗路徑）。
+     */
+    internal var processObserver: ((Process) -> Unit)? = null
+    internal var failStdinClose: Boolean = false
+    internal var failGobblerStart: Boolean = false
+
     override fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>?): RawOutput {
         val pb = ProcessBuilder(argv)
             .redirectInput(ProcessBuilder.Redirect.PIPE)
@@ -53,21 +113,108 @@ class DefaultProcessRunner(val dirRoot: String? = null) : ProcessRunner {
             }
             pb.directory(dir)
         }
+        // start 抛（argv/cwd/env 無效）即無 process，無需清理，直接抛。
         val process = pb.start()
-        process.outputStream.close()
-        val outReader = streamGobbler(process.inputStream)
-        val errReader = streamGobbler(process.errorStream)
-        val finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
-        if (!finished) {
-            process.destroyForcibly()
-            process.waitFor(5, TimeUnit.SECONDS)
+        // 測試縫回調抛即吞，不影響生命週期（生產永為 null）。
+        processObserver?.let { cb ->
+            runCatching { cb(process) }
         }
-        return RawOutput(
-            stdout = outReader.read(),
-            stderr = errReader.read(),
-            exitCode = if (finished) process.exitValue() else -1,
-            timedOut = !finished,
-        )
+        var finished = false
+        try {
+            if (failStdinClose) {
+                throw java.io.IOException("injected stdin-close failure (Phase O test seam)")
+            }
+            process.outputStream.close()
+            if (failGobblerStart) {
+                throw IllegalStateException("injected gobbler-start failure (Phase O test seam)")
+            }
+            // 任一啟動抛即進 finally（已啟的 gobbler 經關流＋kill 收斂，daemon 不殘留 verdict）。
+            val outReader = streamGobbler(process.inputStream)
+            val errReader = streamGobbler(process.errorStream)
+            // Phase O：timeoutMs 負值經 coerceAtLeast(0L) 即時超時（waitFor(0) 未早死即 TimedOut；直調 runner 者同語義，不抛）。
+            try {
+                finished = process.waitFor(timeoutMs.coerceAtLeast(0L), TimeUnit.MILLISECONDS)
+            } catch (ie: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw ie
+            }
+            if (!finished) {
+                killAndReap(process)
+                if (isAlive(process)) {
+                    throw IllegalStateException("process still alive after bounded kill+reap")
+                }
+            }
+            val out = outReader.read()
+            val err = errReader.read()
+            val exit = if (finished) {
+                try {
+                    process.exitValue()
+                } catch (_: Exception) {
+                    throw IllegalStateException("exitValue unavailable after waitFor success")
+                }
+            } else {
+                -1
+            }
+            return RawOutput(
+                stdout = out.bytes,
+                stderr = err.bytes,
+                exitCode = exit,
+                timedOut = !finished,
+                readFailed = out.failed || err.failed,
+                outputIncomplete = out.joinIncomplete || err.joinIncomplete,
+                overflowed = out.truncated || err.truncated,
+            )
+        } finally {
+            // owner 清理：全關流＋監督 kill+reap（best-effort 吞；中斷快照清除後恢復，
+            // finally 內 waitFor 不因預置中斷即抛而跳過 destroyForcibly）。
+            val wasInterrupted = Thread.interrupted()
+            try {
+                runCatching { process.outputStream.close() }
+                // 關雙讀端以喚醒仍阻塞於 read 的 gobbler（正常 EOF 路徑已關，此處冪等）。
+                runCatching { process.inputStream.close() }
+                runCatching { process.errorStream.close() }
+                killAndReap(process)
+            } finally {
+                if (wasInterrupted) Thread.currentThread().interrupt()
+            }
+        }
+    }
+
+    private fun isAlive(process: Process): Boolean =
+        try {
+            process.isAlive
+        } catch (_: Exception) {
+            false
+        }
+
+    /**
+     * 監督 kill+reap（best-effort，不抛；中斷恢復旗標，呼叫方 finally 另做快照恢復）：
+     * 已死即返；先 `destroy`＋[DESTROY_GRACE_MS] grace，仍存活即 `destroyForcibly`＋
+     * [REAP_JOIN_MS] 有界 reap（早死早回）。
+     */
+    private fun killAndReap(process: Process) {
+        if (!isAlive(process)) return
+        try {
+            process.destroy()
+        } catch (_: Exception) {
+        }
+        try {
+            if (process.waitFor(DESTROY_GRACE_MS, TimeUnit.MILLISECONDS)) return
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } catch (_: Exception) {
+        }
+        if (!isAlive(process)) return
+        try {
+            process.destroyForcibly()
+        } catch (_: Exception) {
+        }
+        try {
+            process.waitFor(REAP_JOIN_MS, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } catch (_: Exception) {
+        }
     }
 
     private fun streamGobbler(stream: java.io.InputStream): Gobbler {
@@ -79,24 +226,60 @@ class DefaultProcessRunner(val dirRoot: String? = null) : ProcessRunner {
         return gobbler
     }
 
-    private class Gobbler(private val stream: java.io.InputStream) : Runnable {
+    /**
+     * Phase O gobbler（P2-1 drain-and-discard＋P2-2 單調旗）：
+     * - 到 [ShellPolicy.HARD_READ_CAP_BYTES] 後不 break／不關流，續讀丟棄至 EOF
+     *   （[truncated] 單調標溢出；提前關讀端會致寫端 EPIPE/SIGPIPE，把 exit 0 改寫為
+     *   141，見 P2-1）。
+     * - [finished] 僅真 EOF（`read` 回 -1）置位；`read` 抛即 [failed] 單調置位後 break
+     *   （killer 關流的預期中斷亦標 true，由呼叫方按 `finished`/超時區分語義）。
+     * - [read] 有界 join（[GOBBLER_JOIN_MS]；中斷恢復不吞），回 [GobblerRead] 快照：
+     *   join 超界仍存活即 [GobblerRead.joinIncomplete]=true（部分讀，呼叫方禁回完整 Ok）。
+     */
+    internal class Gobbler(private val stream: java.io.InputStream) : Runnable {
         @Volatile var thread: Thread? = null
         private val sink = ByteArrayOutputStream()
+
+        /** 單調：真 EOF，已全量排空。 */
+        @Volatile var finished: Boolean = false
+            private set
+
+        /** 單調：`read` 抛過（真實 I/O 錯誤或關流中斷）。 */
+        @Volatile var failed: Boolean = false
+            private set
+
+        /** 單調：硬上限丟棄過（drain-and-discard 續讀，絕不靜默短讀不標）。 */
+        @Volatile var truncated: Boolean = false
+            private set
 
         override fun run() {
             val buf = ByteArray(8192)
             try {
                 while (true) {
-                    val n = stream.read(buf)
-                    if (n < 0) break
+                    val n = try {
+                        stream.read(buf)
+                    } catch (_: Exception) {
+                        failed = true
+                        break
+                    }
+                    if (n < 0) {
+                        finished = true
+                        break
+                    }
+                    if (n == 0) continue
                     synchronized(sink) {
                         val room = ShellPolicy.HARD_READ_CAP_BYTES - sink.size()
-                        if (room <= 0) break
-                        sink.write(buf, 0, minOf(n, room))
+                        if (room <= 0) {
+                            // P2-1：已滿仍續讀丟棄，不 break／不關流。
+                            truncated = true
+                        } else if (n > room) {
+                            truncated = true
+                            sink.write(buf, 0, room)
+                        } else {
+                            sink.write(buf, 0, n)
+                        }
                     }
                 }
-            } catch (_: Exception) {
-                // 子進程被殺時流中斷屬正常，直接收尾。
             } finally {
                 try {
                     stream.close()
@@ -105,17 +288,33 @@ class DefaultProcessRunner(val dirRoot: String? = null) : ProcessRunner {
             }
         }
 
-        fun read(): ByteArray {
+        fun read(): GobblerRead {
             try {
-                thread?.join(5_000L)
+                thread?.join(GOBBLER_JOIN_MS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
+            val alive = thread?.isAlive == true
             synchronized(sink) {
-                return sink.toByteArray()
+                return GobblerRead(
+                    bytes = sink.toByteArray(),
+                    finished = finished,
+                    failed = failed,
+                    truncated = truncated,
+                    joinIncomplete = alive,
+                )
             }
         }
     }
+
+    /** gobbler 有界讀快照（見 [Gobbler.read]）。 */
+    internal data class GobblerRead(
+        val bytes: ByteArray,
+        val finished: Boolean,
+        val failed: Boolean,
+        val truncated: Boolean,
+        val joinIncomplete: Boolean,
+    )
 }
 
 /**
@@ -566,14 +765,35 @@ class RestrictedShell(
         }
         val raw: RawOutput = try {
             effectiveRunner.run(spawnArgv, remainingMs, ShellExecutables.CLEAN_ENV)
+        } catch (ie: InterruptedException) {
+            // P1-1：runner 中斷已做 owner 清理（kill+reap＋關流，見 DefaultProcessRunner），
+            // 不偽造 Ok/TimedOut；direct 無 cleanupIncomplete 欄，以 Failed＋KDoc 說明。
+            Thread.currentThread().interrupt()
+            return ShellResult.Failed("interrupted (process cleaned up)")
         } catch (_: Exception) {
             // 診斷如需保留只可進 log；目前直接丟棄，回執固定字串不內插異常訊息（防路徑外洩）。
             return ShellResult.Failed("spawn failed")
         }
         val out = ShellPolicy.truncate(raw.stdout)
         val err = ShellPolicy.truncate(raw.stderr)
-        val truncated = out.truncated || err.truncated
+        val truncated = out.truncated || err.truncated || raw.overflowed
         if (raw.timedOut) {
+            return ShellResult.TimedOut(
+                partialStdout = out.bytes.toUtf8Lossy(),
+                partialStderr = err.bytes.toUtf8Lossy(),
+                timeoutMs = timeoutMs,
+                truncated = truncated,
+            )
+        }
+        // P2-2：finished 下讀取異常必為真實 I/O 錯誤（只有真 EOF 才算完整流），
+        // 部分輸出不當完整 Ok，回 Failed（超時路徑已先回 TimedOut，不受影響）。
+        if (raw.readFailed) {
+            return ShellResult.Failed("direct IO read failed (incomplete stream)")
+        }
+        // P2-2：finished 但 tail 未排空（join 超界仍存活，如子孫繼承 pipe 致 EOF 延遲），
+        // would-be Ok 升級 TimedOut（攜 partial＋truncated），不再回完整 Ok；
+        // exitCode 不攜（request 未完成，非命令退出語義；避免以 exit 0 宣告工具完成）。
+        if (raw.outputIncomplete) {
             return ShellResult.TimedOut(
                 partialStdout = out.bytes.toUtf8Lossy(),
                 partialStderr = err.bytes.toUtf8Lossy(),

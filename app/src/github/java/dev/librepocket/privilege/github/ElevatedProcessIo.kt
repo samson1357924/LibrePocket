@@ -295,7 +295,7 @@ internal object ElevatedCleanupTracker {
      *   其餘一律登記，不宣稱 cleaned；
      * - 登記是冪等閂（同一 handle 以 `===` 去重，不計數、不佔槽）：飽和無槽／起線程
      *   失敗的 owner 亦轉入此登記（而非丟棄），同樣擋後續 spawn；
-     * - 解除只兩途：[sweepQuarantine] 有界重驗見確死，或
+     * - 解除只兩途：[sweepQuarantine]／[kickSweepAsync] 背景重驗見確死，或
      *   [clearUnverified] 顯式 recovery（僅 B3 已驗證 recovery 或測試隔離可調）。
      *   [noteClean]／成功 drain 永不清除（見其 KDoc 分離聲明）；
      * - 有界性：quarantine 非空即擋新 spawn，故登記數上界為准入前已在飛的併發呼叫數
@@ -313,9 +313,12 @@ internal object ElevatedCleanupTracker {
      * slot 常數 7 保持——推導見 [sweepQuarantine]）：
      * - `false→true` CAS 即取得本次 sweep 驗證權；已持有即後到 caller 零 IPC、
      *   零新線程直回（本地 latch 判定進 [Admission.QUARANTINE]，有界 Denied）；
-     * - verifier 即贏得 CAS 的呼叫執行緒本身（不另起 verifier 常駐線程）；
+     * - verifier 即贏得 CAS 者：同步版（[sweepQuarantine]）為呼叫執行緒本身
+     *   （不另起 verifier 常駐線程），背景版（[kickSweepAsync]，Round-5 Phase Q）
+     *   為即席 `elevated-quarantine-sweep` daemon（同樣非常駐，單次即退）；
      *   逐條目的 IPC 一律跑 `elevated-quarantine-verify` 內層 worker，
-     *   呼叫側只 join（見 [SWEEP_VERIFY_MS]／[SWEEP_GRACE_MS]）；
+     *   呼叫側只 join（見 [SWEEP_VERIFY_MS]／[SWEEP_GRACE_MS]，背景版呼叫側
+     *   連 join 都不做，見 [kickSweepAsync]）；
      * - 與 [MAX_OUTSTANDING_CLEANUPS]／[SLOTS_PER_CALL] 體系分離：
      *   sweep 永不調 [acquireSlot]／[markLingering]／[noteUnclean]，
      *   故 `outstanding`／`consecutive` 不變，准入 verdict 順序不動、
@@ -486,9 +489,10 @@ internal object ElevatedCleanupTracker {
 
     /**
      * Round-3 Phase E 有界重試回收（P1-1；重試管道，不無界）＋Round-4 Phase M
-     * 有界化（P1-3；呼叫側零 IPC＋singleflight＋受監督 verifier）：
+     * 有界化（P1-3；呼叫側零 IPC＋singleflight＋受監督 verifier）＋Round-5
+     * Phase Q（P2-4；runner 呼叫側永不等待 verifier，見 [kickSweepAsync]）：
      * - 准入只查本地 latch（[tryEnterReserved] 見 quarantine 非空即
-     *   [Admission.QUARANTINE]）：本函數是唯一的重驗管道，呼叫執行緒永不直調
+     *   [Admission.QUARANTINE]）：重驗管道唯一，呼叫執行緒永不直調
      *   `Process.waitFor／isAlive／exitValue`（Shizuku 遠端經反射→同步遠端 IPC，
      *   `waitFor(0)` 不保證 0ms 返回，Binder death／驅動卡死即呼叫側無界；
      *   try/catch 攔不住 blocking IPC，故絕不用 `waitFor(0)` 作為跨 Binder
@@ -496,9 +500,10 @@ internal object ElevatedCleanupTracker {
      * - singleflight：[sweepLease] CAS 取得驗證權，後到 caller 零 IPC、零新線程
      *   直回 0（隨後 [tryEnterReserved] 以 QUARANTINE 有界拒；多 caller 同遇
      *   遠端 stall 各自有界 Denied，零新 spawn）；
-     * - 受監督 verifier（贏得 CAS 的呼叫執行緒本身，不另起常駐線程）：
+     * - 受監督 verifier（贏得 CAS 者；同步版為呼叫執行緒本身，背景版
+     *   [kickSweepAsync] 為 `elevated-quarantine-sweep` daemon，均非常駐）：
      *   快照逐條經 [verifyQuarantinedOneBounded]（內層 `elevated-quarantine-verify`
-     *   daemon worker 跑 `waitFor(0)`＋呼叫側 join [SWEEP_VERIFY_MS]＋interrupt＋
+     *   daemon worker 跑 `waitFor(0)`＋join [SWEEP_VERIFY_MS]＋interrupt＋
      *   [SWEEP_GRACE_MS] grace；逾期／中斷／抛一律放棄本次回收、保持 quarantine，
      *   無法確認死亡就保持，永不放行 spawn）；
      * - stall 殘留：grace 後仍存活即記 [sweepPending]（identity，後續 sweep 跳過
@@ -512,11 +517,15 @@ internal object ElevatedCleanupTracker {
      *   （stall 殘留仍報 QUARANTINE，不翻轉為 BACKLOG_FULL；解除只經確死或
      *   [clearUnverified]，登記／解除語義不動，見 [quarantineUnverified]）。
      *
-     * 調用：兩 runner 每次准入前先調本函數再調 [tryEnterReserved]（sweep-then-admit；
-     * 本函數鎖外探測＋join、不持 [lock] 做外部呼叫，准入判定仍單一原子點）。
-     * 生產 Binder stall 注記：遠端查詢 stall 只延遲贏得 CAS 的本次调用
-     * （`SWEEP_VERIFY_MS＋SWEEP_GRACE_MS` 有界，條目保留＋[sweepPending] 登記，
-     * 下次仍拒），後到 caller 零等待即拒，永不放行 spawn（fail-closed 方向不變）。
+     * 調用：兩 runner 每次准入前調 [kickSweepAsync]（非同步觸發，不等待）再調
+     * [tryEnterReserved]（sweep-then-admit；kick 只取 [lock] 做本地快照、
+     * 不持鎖做外部呼叫，准入判定仍單一原子點）。本同步函數保留供確定性單測／
+     * 顯式 recovery 探測（tracker 語義直測，見 Phase E；語義與背景版共用
+     * [sweepEntries]，完全一致），runner 熱路徑不再調用（Round-5 Phase Q：
+     * sweep 移出整體 deadline，caller wall 零依賴遠端）。
+     * 生產 Binder stall 注記：遠端查詢 stall 只延遲背景 sweep（`SWEEP_VERIFY_MS＋
+     * SWEEP_GRACE_MS` 有界，條目保留＋[sweepPending] 登記，下次仍拒），呼叫側
+     * 一律零等待即拒（贏者亦不等待），永不放行 spawn（fail-closed 方向不變）。
      *
      * @return 本次解除的登記數（測試斷言回收用；stall／存活／逾期一律 0）。
      */
@@ -525,27 +534,85 @@ internal object ElevatedCleanupTracker {
         if (snapshot.isEmpty()) return 0
         if (!sweepLease.compareAndSet(false, true)) return 0
         try {
-            var cleared = 0
-            for (p in snapshot) {
-                synchronized(lock) {
-                    if (quarantine.none { it === p }) continue
-                    if (sweepPending.any { it === p }) continue
-                }
-                val exited = verifyQuarantinedOneBounded(p)
-                if (exited) {
-                    synchronized(lock) {
-                        val idx = quarantine.indexOfFirst { it === p }
-                        if (idx >= 0) {
-                            quarantine.removeAt(idx)
-                            cleared++
-                        }
-                    }
-                }
-            }
-            return cleared
+            return sweepEntries(snapshot)
         } finally {
             sweepLease.set(false)
         }
+    }
+
+    /**
+     * Round-5 Phase Q（P2-4）非同步重掃觸發：runner 准入前唯一 sweep 調用點。
+     * 本地快照判斷（同步、零 IPC：只取 [lock] 讀 [quarantine]／[sweepPending]，
+     * 絕不觸碰 `Process` handle）＋背景 singleflight verifier（沿用 Phase M
+     * [verifyQuarantinedOneBounded]：逐條內層 `elevated-quarantine-verify`
+     * daemon worker 跑 `waitFor(0)`＋背景 join [SWEEP_VERIFY_MS]＋interrupt＋
+     * [SWEEP_GRACE_MS] grace，不新增線程模型——背景 owner 亦為即席 daemon，
+     * 單次即退；逾期／中斷／抛一律放棄本次回收、保持 quarantine）。
+     * 呼叫側永不等待 verifier：quarantine 空／全 pending（無條目可驗）／lease
+     * 被佔／起線程失敗一律即時回 false，隨後 [tryEnterReserved] 以
+     * [Admission.QUARANTINE] 有界拒（caller wall 只含本地快照＋准入，
+     * timeoutMs=10/100＋stall handle 亦毫秒級 Denied，見 Phase Q 迴歸）。
+     * 登記／解除語義不動（只改調度）：解除仍只經確死（背景見確死即清）或
+     * [clearUnverified]，見 [quarantineUnverified]；slot 常數 7 推導不動
+     * （背景 sweep 同樣永不碰槽／計數器）。
+     *
+     * @return 是否成功發起一次背景重掃（false 即本次無動作：空／全 pending／
+     *   已有在飛 sweep／起線程失敗；皆 fail-closed，quarantine 保持）。
+     */
+    internal fun kickSweepAsync(): Boolean {
+        val snapshot: List<Process> = synchronized(lock) {
+            if (quarantine.isEmpty()) return false
+            quarantine.filter { q -> sweepPending.none { it === q } }
+        }
+        if (snapshot.isEmpty()) return false
+        if (!sweepLease.compareAndSet(false, true)) return false
+        val worker = Thread({
+            try {
+                sweepEntries(snapshot)
+            } catch (_: Throwable) {
+                // 背景重掃永不抛向呼叫方（lease 照常釋放，quarantine 保持）。
+            } finally {
+                sweepLease.set(false)
+            }
+        }, "elevated-quarantine-sweep")
+        worker.isDaemon = true
+        try {
+            worker.start()
+        } catch (_: Throwable) {
+            sweepLease.set(false)
+            return false
+        }
+        return true
+    }
+
+    /**
+     * sweep 條目迴圈（[sweepQuarantine] 同步版與 [kickSweepAsync] 背景版共用，
+     * 登記／解除語義唯一實作）：
+     * 逐條經 [verifyQuarantinedOneBounded] 重驗，見確死即同 [lock] 內 identity
+     * 移除＋計數；存活／逾期／中斷一律保持。呼叫方須已持有 [sweepLease]
+     * （singleflight），本函數不另搶 lease。
+     *
+     * @return 本次解除的登記數（stall／存活／逾期一律 0）。
+     */
+    private fun sweepEntries(snapshot: List<Process>): Int {
+        var cleared = 0
+        for (p in snapshot) {
+            synchronized(lock) {
+                if (quarantine.none { it === p }) continue
+                if (sweepPending.any { it === p }) continue
+            }
+            val exited = verifyQuarantinedOneBounded(p)
+            if (exited) {
+                synchronized(lock) {
+                    val idx = quarantine.indexOfFirst { it === p }
+                    if (idx >= 0) {
+                        quarantine.removeAt(idx)
+                        cleared++
+                    }
+                }
+            }
+        }
+        return cleared
     }
 
     /**

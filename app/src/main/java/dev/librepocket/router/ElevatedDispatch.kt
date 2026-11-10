@@ -48,7 +48,8 @@ object ElevatedDispatch {
      *   即 `Denied(BLACKLISTED)` 且零 spawn（gate 前先行，見
      *   [PrivilegeGate.isElevatedRequest] 同門）。
      * - 單次凍結（SLA 統一）：門禁通過後快照一次，得 frozen 即以
-     *   [ShellExecTool.executeElevatedFrozen] 傳遞同一份，工具層不再二次凍結
+     *   [ShellExecTool.executeElevatedFrozen]（同模組 internal，傳 gate 後同一
+     *   frozen）傳遞同一份，工具層不再二次凍結
      *   （舊雙重凍結最壞 2×(1s+grace)；現每 caller 至多一 snapshot worker，
      *   且池化有界見 [dev.librepocket.shell.frozenOrNull]）。
      * - SLA：`timeoutMs` 原值透傳 runner（准入後執行預算，不扣快照耗時；

@@ -124,7 +124,16 @@ class ElevatedRunnerAA1Test {
     }
 
     private fun awaitNoElevatedThreads(boundMs: Long = 10_000L) {
-        val names = setOf("elevated-stdout", "elevated-stderr", "elevated-stdin-close", "elevated-cleanup")
+        val names = setOf(
+            "elevated-stdout",
+            "elevated-stderr",
+            "elevated-stdin-close",
+            "elevated-cleanup",
+            // Round-5 Phase Q：背景 sweep owner＋內層 verify worker（皆即席 daemon；
+            // teardown 等其收斂，避免在飛 sweep 持 lease 滲入下一個用例的 kick 時序）。
+            "elevated-quarantine-sweep",
+            "elevated-quarantine-verify",
+        )
         val deadline = System.currentTimeMillis() + boundMs
         while (true) {
             val alive = Thread.getAllStackTraces().keys.filter {
@@ -135,6 +144,32 @@ class ElevatedRunnerAA1Test {
                 throw AssertionError("orphan elevated threads: $alive")
             }
             Thread.sleep(50L)
+        }
+    }
+
+    /**
+     * Round-5 Phase Q 背景重掃收斂呼叫（P2-4）：前柄確死解除為背景 singleflight，
+     * 本次 call 只做本地快照＋kick、不等待 verifier，故首輪可能先拒 QUARANTINE
+     * （准入快照先於背景清除；零 spawn、不碰槽／計數器、不擾 breaker）。
+     * 有界重試直到准入放行（確死柄背景即時清除；stall 柄逾期保持、走 Phase E
+     * 專測，不經此徑）。逾期未收斂即抛（背景管線本身故障，不靜默放過）。
+     */
+    private fun runUntilAdmitted(
+        tag: String,
+        runner: BinaryElevatedRunner,
+        timeoutMs: Long,
+    ): ElevatedBinaryResult {
+        val deadline = System.currentTimeMillis() + 15_000L
+        while (true) {
+            val r = runner.runBinary(ElevatedRequest(listOf("id"), tag), timeoutMs)
+            if (r is ElevatedBinaryResult.Denied && r.reason == ShellDeny.QUARANTINE) {
+                if (System.currentTimeMillis() >= deadline) {
+                    throw AssertionError("$tag: background sweep never cleared dead handles, last=$r")
+                }
+                Thread.sleep(50L)
+                continue
+            }
+            return r
         }
     }
 
@@ -205,12 +240,20 @@ class ElevatedRunnerAA1Test {
         )
         ElevatedCleanupTracker.noteClean()
         assertFalse(ElevatedCleanupTracker.isSaturated())
-        val okRoot = makeRoot { FakeProcess("ok".toByteArray()) }
-            .runBinary(ElevatedRequest(listOf("id"), "AA1-REC"), 2_000L)
+        // Round-5 Phase Q：stall 柄（latch 釋放後確死）由背景重掃解除——有界收斂後
+        // 再斷言放行（Denied 輪次皆 QUARANTINE，零 spawn）。
+        val okRoot = runUntilAdmitted(
+            "AA1-REC",
+            makeRoot { FakeProcess("ok".toByteArray()) },
+            2_000L,
+        )
         assertTrue("$okRoot", okRoot is ElevatedBinaryResult.Ok)
         assertFalse((okRoot as ElevatedBinaryResult.Ok).cleanupIncomplete)
-        val okShizuku = makeShizuku { FakeProcess("ok".toByteArray()) }
-            .runBinary(ElevatedRequest(listOf("id"), "AA1-REC"), 2_000L)
+        val okShizuku = runUntilAdmitted(
+            "AA1-REC",
+            makeShizuku { FakeProcess("ok".toByteArray()) },
+            2_000L,
+        )
         assertTrue("$okShizuku", okShizuku is ElevatedBinaryResult.Ok)
         assertFalse((okShizuku as ElevatedBinaryResult.Ok).cleanupIncomplete)
         pollOutstandingTo(0)
@@ -238,10 +281,12 @@ class ElevatedRunnerAA1Test {
             pollOutstandingTo(0)
         }
         // success＋blocked stdin → Ok(cleanupIncomplete=true)，stdout 完整。
+        // Round-5 Phase Q：前柄（blocked destroy，latch 釋放後確死）由背景重掃
+        // 解除——有界收斂後再斷言 Ok 本體（Denied 輪次皆 QUARANTINE，零 spawn）。
         val latchStdin = CountDownLatch(1)
         val runnerStdin = makeRunner { BlockedStdinSuccessProcess(latchStdin) }
         try {
-            val b = runnerStdin.runBinary(ElevatedRequest(listOf("id"), "AA1-FLAG"), 5_000L)
+            val b = runUntilAdmitted("AA1-FLAG", runnerStdin, 5_000L)
             assertTrue("$b", b is ElevatedBinaryResult.Ok)
             b as ElevatedBinaryResult.Ok
             assertEquals("ok", String(b.stdout, Charsets.UTF_8))
@@ -336,7 +381,9 @@ class ElevatedRunnerAA1Test {
                     StallDestroyProcess(latch)
                 }
                 try {
-                    val b = runner.runBinary(ElevatedRequest(listOf("id"), "AA1-BRK"), 300L)
+                    // Round-5 Phase Q：前輪確死柄由背景重掃解除——有界收斂後再斷言
+                    // TimedOut 本體（Denied 輪次皆 QUARANTINE，零 spawn、不計 consecutive）。
+                    val b = runUntilAdmitted("AA1-BRK", runner, 300L)
                     assertTrue("call ${i + 1}: $b", b is ElevatedBinaryResult.TimedOut)
                     assertTrue(
                         "call ${i + 1}: blocked destroy must flag",
@@ -395,7 +442,9 @@ class ElevatedRunnerAA1Test {
                 val latch = CountDownLatch(1)
                 val runner = makeRoot { StallDestroyProcess(latch) }
                 try {
-                    val b = runner.runBinary(ElevatedRequest(listOf("id"), tag), 300L)
+                    // Round-5 Phase Q：前柄確死由背景重掃解除，有界收斂後再斷言
+                    // TimedOut 本體（見 runUntilAdmitted）。
+                    val b = runUntilAdmitted(tag, runner, 300L)
                     assertTrue("$tag: $b", b is ElevatedBinaryResult.TimedOut)
                     assertTrue(
                         "$tag: blocked destroy must flag",
@@ -411,8 +460,12 @@ class ElevatedRunnerAA1Test {
             assertFalse(ElevatedCleanupTracker.isSaturated())
             assertFalse(ElevatedCleanupTracker.isBreakerOpen())
             // 一次成功即歸零。
-            val ok = makeRoot { FakeProcess("ok".toByteArray()) }
-                .runBinary(ElevatedRequest(listOf("id"), "AA1-RST-OK"), 2_000L)
+            // Round-5 Phase Q：RST2 柄確死由背景重掃解除，有界收斂後再斷言 Ok。
+            val ok = runUntilAdmitted(
+                "AA1-RST-OK",
+                makeRoot { FakeProcess("ok".toByteArray()) },
+                2_000L,
+            )
             assertTrue("$ok", ok is ElevatedBinaryResult.Ok)
             assertFalse(ElevatedCleanupTracker.isBreakerOpen())
             // 若成功未歸零，此處累計即 4→熔斷；歸零則為 2→放行。
@@ -423,8 +476,12 @@ class ElevatedRunnerAA1Test {
                 "success must have reset consecutive (else 2+2=4 would trip)",
                 ElevatedCleanupTracker.isBreakerOpen(),
             )
-            val ok2 = makeRoot { FakeProcess("ok".toByteArray()) }
-                .runBinary(ElevatedRequest(listOf("id"), "AA1-RST-OK2"), 2_000L)
+            // Round-5 Phase Q：RST3／RST4 柄確死由背景重掃解除，有界收斂後再斷言 Ok。
+            val ok2 = runUntilAdmitted(
+                "AA1-RST-OK2",
+                makeRoot { FakeProcess("ok".toByteArray()) },
+                2_000L,
+            )
             assertTrue("$ok2", ok2 is ElevatedBinaryResult.Ok)
         } finally {
             ElevatedCleanupTracker.clearUnverified()

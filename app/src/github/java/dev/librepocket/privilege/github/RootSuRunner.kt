@@ -160,9 +160,9 @@ import java.util.concurrent.TimeUnit
   *
   * Round-3 Phase E（P1-1）：未驗證 quarantine 非空即拒
   * `Denied(QUARANTINE, "elevated unverified process quarantine held...")` 且零 spawn、
-  * 不耗配額（准入前先 [ElevatedCleanupTracker.sweepQuarantine] 有界重驗，
-  * 已驗證死亡即解除；原因碼獨立，不與 backlog／breaker 混碼；
-  * Round-4 Phase M：呼叫側零 IPC＋singleflight＋受監督 verifier，
+  * 不耗配額（准入前先 [ElevatedCleanupTracker.kickSweepAsync] 觸發背景重掃，
+  * 已驗證死亡即由背景解除；原因碼獨立，不與 backlog／breaker 混碼；
+  * Round-4 Phase M＋Round-5 Phase Q：呼叫側零 IPC 永不等待＋背景 singleflight＋受監督 verifier，
   * 絕不用 `waitFor(0)` 作跨 Binder 時限保證）。
  *
  * AB1 呼叫級准入（owner 新 P1-A＋P1-B）：飽和／熔斷門之後、配額之前
@@ -292,9 +292,10 @@ class RootSuRunner(
         // 即序列化（乾淨態僅單一進行中呼叫，見 [ElevatedCleanupTracker]），飽和／
         // 熔斷／quarantine 下零線程拒絕（不耗 quota、不佔席外資源）。
         // verdict 優先級：准入拒絕（Denied）先於取消判定（TimedOut）——席位未取得
-        // 即無門可進；sweep（[sweepQuarantine]，Round-4 Phase M singleflight＋
-        // 受監督有界重驗：呼叫側零 IPC、贏者內層 worker＋deadline＋grace、
-        // 逾期放棄保持 quarantine）仍在准入鎖外先行，有界，准入判定仍單一原子點。
+        // 即無門可進；sweep（[kickSweepAsync]，Round-5 Phase Q 非同步 singleflight：
+        // 呼叫側只做本地快照判斷、零 IPC 永不等待 verifier，隔離非空即觸發背景重掃
+        // 後直進准入；背景沿用 Phase M 受監督 verifier（內層 worker＋verify＋grace、
+        // 逾期放棄保持 quarantine），caller wall 零依賴遠端，准入判定仍單一原子點）。
         // B3 cheap 准入前置（owner P1-5）：可能阻塞的外部回呼前先占全域席
         //（[tryEnterReserved] 原子：飽和／熔斷／併發預留同一鎖內檢查＋佔席），
         // 拒絕不耗 quota、不占席外資源；阻塞體皆有界監督（見下），stall 即殘留
@@ -302,12 +303,13 @@ class RootSuRunner(
         // 位置取舍：validate（純）亦入席內（需 bridge 快照，bridge 本身阻塞，
         // 故席位須在 bridge 之前；黑名單等純拒絕亦短暫占席後經 finally 釋放，
         // 終態 `activeCalls==0` 不變，見 `zeroSpawnRejectionsLeaveNoActiveCall`）。
-        // Round-3 Phase E（P1-1）：准入先有界重掃 quarantine（[sweepQuarantine]：
-        // 已驗證死亡即解除，無需 B3 手動介入；仍存活／逾期／中斷即保持，後續准入
-        // 以 QUARANTINE 拒）。sweep 在准入鎖外受監督探測、有界（Round-4 Phase M：
-        // 呼叫側零 IPC＋singleflight，絕不用 `waitFor(0)` 作跨 Binder 時限保證），
-        // 准入判定仍單一原子點。
-        ElevatedCleanupTracker.sweepQuarantine()
+        // Round-3 Phase E（P1-1）：准入前先觸發 quarantine 背景重掃（[kickSweepAsync]：
+        // 已驗證死亡即由背景解除，無需 B3 手動介入；仍存活／逾期／中斷即保持，後續准入
+        // 以 QUARANTINE 拒）。重掃為背景 singleflight 受監督探測（Round-4 Phase M
+        // verifier：呼叫側零 IPC 永不等待，絕不用 `waitFor(0)` 作跨 Binder 時限保證），
+        // 准入判定仍單一原子點（Round-5 Phase Q：sweep 移出整體 deadline，caller wall
+        // 只含本地快照＋准入，不含遠端驗證）。
+        ElevatedCleanupTracker.kickSweepAsync()
         when (ElevatedCleanupTracker.tryEnterReserved()) {
             ElevatedCleanupTracker.Admission.OK -> Unit
             ElevatedCleanupTracker.Admission.BACKLOG_FULL -> {

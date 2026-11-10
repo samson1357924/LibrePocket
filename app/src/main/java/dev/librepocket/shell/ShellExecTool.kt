@@ -125,8 +125,18 @@ object ShellExecTool {
      * 快照為准入成本，有界 1s＋grace，見 [frozenOrNull]；呼叫方總耗時上界 ≈
      * 快照門＋`timeoutMs`）。直调本函数传超限 frozen 同样防御性复检
      * （String 只读，零 worker）fail-closed。
+     *
+     * Round-5 Phase Q（P2-5 frozen API 契約）：本函數收斂為 internal——
+     * [frozen] 只接受 gate 已產生的凍結物件（[frozenOrNull] 產物，執行期不可變，
+     * 見 Phase Q 迴歸）；同模組新 caller 禁止直傳未凍結 `ElevatedRequest`
+     * （尤其 `MutableList` 背板：runner／審計讀到活引用即舊 snapshot TOCTOU
+     * 重現）。公開入口一律走 [executeElevated]（入口凍結＋單次凍結 SLA）；
+     * 同模組唯一產品調用為 [dev.librepocket.router.ElevatedDispatch]
+     * （傳 gate 後同一 frozen），跨模組產品調用不存在。
+     * 本函數刻意不做二次凍結：傳未凍結物件的行為未定義（TOCTOU），由可見性
+     * （internal）＋本契約防範，不另加執行期重驗。
      */
-    fun executeElevatedFrozen(
+    internal fun executeElevatedFrozen(
         frozen: ElevatedRequest,
         runner: ElevatedShellRunner,
         audit: PrivilegeAuditLog,

@@ -107,6 +107,8 @@ class ElevatedRunnerPhaseEQuarantineTest {
             "elevated-wait",
             "elevated-verify",
             "elevated-quarantine-verify",
+            // Round-5 Phase Q：背景 sweep owner（即席 daemon，單次即退）。
+            "elevated-quarantine-sweep",
         )
         val deadline = System.currentTimeMillis() + boundMs
         while (true) {
@@ -173,10 +175,11 @@ class ElevatedRunnerPhaseEQuarantineTest {
      * Round-4 Phase M stall 回歸模型（P1-3）：跨 Binder `waitFor(0)` 無時限保證——
      * 永不返回且忽略中斷（`latch` 放行前一直等，`InterruptedException` 吞掉續等，
      * 含 `timeout==0`）。舊碼在呼叫側直調 `waitFor(0)` 即無界卡死（try/catch
-     * 攔不住 blocking IPC）；新碼 IPC 只跑 `elevated-quarantine-verify` 內層
-     * worker，呼叫側只 join（[ElevatedCleanupTracker.SWEEP_VERIFY_MS]＋
-     * [ElevatedCleanupTracker.SWEEP_GRACE_MS] 有界，逾期記 sweepPending 保持
-     * quarantine）。`latch` 僅供 teardown 放行收斂（測中永不放行）。
+     * 攔不住 blocking IPC）；新碼 IPC 只跑背景 `elevated-quarantine-sweep`
+     * owner＋內層 `elevated-quarantine-verify` worker（Round-5 Phase Q：
+     * 呼叫側只做本地快照、零 IPC 永不等待，見 [ElevatedCleanupTracker.kickSweepAsync]），
+     * 呼叫側有界拒（逾期記 sweepPending 保持 quarantine）。
+     * `latch` 僅供 teardown 放行收斂（測中永不放行）。
      */
     private class StallQuarantineProcess(private val latch: CountDownLatch) : Process() {
         override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
@@ -514,11 +517,29 @@ class ElevatedRunnerPhaseEQuarantineTest {
             // 確定性死亡翻轉（不靠 sleep 時序）。
             death.set(true)
             assertTrue(live.waitFor(0L, TimeUnit.MILLISECONDS))
-            // 下一次 call：sweep 見確死即解除，spawn 放行且 drain 成功。
-            val ok = runner.runBinary(ElevatedRequest(listOf("id"), "PE-REVIVE"), 10_000L)
-            assertTrue("$ok", ok is ElevatedBinaryResult.Ok)
-            ok as ElevatedBinaryResult.Ok
-            assertFalse("recovered call must be verified clean", ok.cleanupIncomplete)
+            // Round-5 Phase Q：解除為背景重掃（見 kickSweepAsync）——死亡翻轉後
+            // 首次 call 觸發 kick 但仍可能因競態先拒（准入快照先於背景清除），
+            // 故有界重試直到 Ok（每次 Denied 皆 QUARANTINE 且觸發一次 kick，
+            // singleflight 下不疊加 verifier；確死條目背景即時清除，無 stall
+            // 等待，兩輪內必收斂）。
+            val okDeadline = System.currentTimeMillis() + 15_000L
+            var ok: ElevatedBinaryResult.Ok? = null
+            while (System.currentTimeMillis() < okDeadline) {
+                when (val r = runner.runBinary(ElevatedRequest(listOf("id"), "PE-REVIVE"), 10_000L)) {
+                    is ElevatedBinaryResult.Ok -> {
+                        ok = r
+                        break
+                    }
+                    is ElevatedBinaryResult.Denied -> {
+                        assertEquals(ShellDeny.QUARANTINE, r.reason)
+                        assertTrue(r.cleanupIncomplete)
+                    }
+                    else -> throw AssertionError("unexpected verdict during revive: $r")
+                }
+                Thread.sleep(50L)
+            }
+            val recovered = ok ?: throw AssertionError("background sweep never cleared verified death")
+            assertFalse("recovered call must be verified clean", recovered.cleanupIncomplete)
             assertEquals(2, spawns.get())
             assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
             assertFalse(ElevatedCleanupTracker.isQuarantined())
@@ -665,15 +686,17 @@ class ElevatedRunnerPhaseEQuarantineTest {
         assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
     }
 
-    // ---- 7. Round-4 Phase M stall 有界化（P1-3，Root＋Shizuku 雙軌） ----
+    // ---- 7. Round-4 Phase M stall 有界化（P1-3，Root＋Shizuku 雙軌）
+    //      ＋Round-5 Phase Q 非同步化（P2-4） ----
     //
     // quarantined 遠端 `waitFor(0)` 永不返回且忽略中斷（跨 Binder 無時限保證模型）＋
-    // 並行多 caller：各呼叫必須有界 `Denied(QUARANTINE)`（贏者約
-    // `SWEEP_VERIFY_MS＋SWEEP_GRACE_MS` 有界，後到 singleflight 零等待即拒）、
+    // 並行多 caller：各呼叫必須有界 `Denied(QUARANTINE)`（Round-5 Phase Q 起含贏者
+    // 在內一律零等待即拒——重掃跑背景 `elevated-quarantine-sweep`，呼叫側只做本地
+    // 快照，見 [ElevatedCleanupTracker.kickSweepAsync]）、
     // 零新 spawn（quarantine 擋在 spawn 之前）、無 untracked checker thread
-    // （同時至多一 `elevated-quarantine-verify` 活躍內層＋一已登記殘留，
-    // `outstanding==0` 不動、`sweepPending==1` 可斷；舊碼呼叫側直調即多 Binder
-    // 並行卡死，連應立刻回的 Denied 都拿不到）。
+    // （同時至多一背景 sweep owner＋一 `elevated-quarantine-verify` 活躍內層＋
+    // 一已登記殘留，`outstanding==0` 不動、`sweepPending==1` 可斷；舊碼呼叫側直調
+    // 即多 Binder 並行卡死，連應立刻回的 Denied 都拿不到）。
     // 排序一律 latch／barrier，不靠 sleep 時序；`latch` 僅 teardown 放行收斂。
 
     private fun pollPendingTo(expected: Int, boundMs: Long = 10_000L) {
@@ -746,8 +769,8 @@ class ElevatedRunnerPhaseEQuarantineTest {
                 assertTrue("caller $i msg=${r.message}", r.message.contains("quarantine"))
                 assertTrue("caller $i must keep incomplete signal, got $r", r.cleanupIncomplete)
                 assertTrue(
-                    "caller $i must be bounded (elapsed=${elapsedMs[i]}ms)",
-                    elapsedMs[i] < 8_000L,
+                    "caller $i must be bounded without waiting verifier (elapsed=${elapsedMs[i]}ms)",
+                    elapsedMs[i] < 2_000L,
                 )
             }
             assertEquals("quarantined stall must allow zero new spawn", 0, spawns.get())
@@ -756,8 +779,13 @@ class ElevatedRunnerPhaseEQuarantineTest {
             // sweep 獨立 permit：不碰槽／計數器（仍報 QUARANTINE，不翻轉 BACKLOG）。
             assertEquals(0, ElevatedCleanupTracker.outstanding())
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
-            // singleflight＋pending：至多一活躍內層＋一已登記殘留，無 per-caller 爆炸。
-            pollPendingTo(1)
+            // singleflight＋pending：至多一背景 sweep owner＋一活躍內層＋一已登記殘留，
+            // 無 per-caller 爆炸（重試 kick 直到背景登記 pending：前測殘留 sweep
+            // 若仍持 lease，本次 kick 即讓路，重試即收斂，不疊加 verifier）。
+            pollTrue("background sweep must track stall") {
+                ElevatedCleanupTracker.kickSweepAsync()
+                ElevatedCleanupTracker.sweepPendingCount() == 1
+            }
             val alive = aliveQuarantineVerifyCount()
             assertTrue(
                 "at most one tracked quarantine-verify may linger, got $alive",
@@ -796,5 +824,73 @@ class ElevatedRunnerPhaseEQuarantineTest {
 
     @Test fun shizukuStallQuarantineParallelBoundedDenied() {
         doStallParallelBoundedDenied { s, k -> shizukuRunner(spawn = s, killer = k) }
+    }
+
+    // ---- 8. Round-5 Phase Q caller wall 內化（P2-4，Root＋Shizuku 雙軌） ----
+    //
+    // stalled quarantine handle 存在時，新 runBinary(timeoutMs=10／100) 必須在
+    // deadline 內拿到 `Denied(QUARANTINE)`（舊碼 sweep 在整體 deadline 之外同步
+    // 等 `SWEEP_VERIFY_MS＋SWEEP_GRACE_MS` 近 1s 才拒；新碼呼叫側只做本地快照＋
+    // 背景 kick，wall 零依賴遠端）。wall 上界取 500ms：正常毫秒級返回，舊 1s
+    // 行為必超界，CI 慢機亦有餘量。
+
+    private fun doStalledQuarantineSmallTimeoutWallBounded(makeRunner: (
+        spawn: (List<String>) -> Process,
+        killer: (Process) -> Unit,
+    ) -> BinaryElevatedRunner) {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+        pollPendingTo(0)
+        val latch = CountDownLatch(1)
+        val stall = StallQuarantineProcess(latch)
+        ElevatedCleanupTracker.quarantineUnverified(stall)
+        assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+        val spawns = AtomicInteger(0)
+        val runner = makeRunner(
+            {
+                spawns.incrementAndGet()
+                FakeProcess("ok".toByteArray())
+            },
+            {
+                // killer 不應被調（quarantine 擋在 spawn 之前，零 spawn 即零 kill）。
+            },
+        )
+        try {
+            for (timeoutMs in listOf(10L, 100L)) {
+                val before = spawns.get()
+                val t0 = System.nanoTime()
+                val r = runner.runBinary(ElevatedRequest(listOf("id"), "PE-WALL"), timeoutMs)
+                val elapsedMs = (System.nanoTime() - t0) / 1_000_000L
+                assertQuarantineDenied(r, before, spawns)
+                assertTrue(
+                    "timeoutMs=$timeoutMs stalled quarantine must deny within " +
+                        "deadline-internal budget, elapsed=${elapsedMs}ms",
+                    elapsedMs < 500L,
+                )
+            }
+            assertEquals("quarantined stall must allow zero new spawn", 0, spawns.get())
+            assertTrue(ElevatedCleanupTracker.isQuarantined())
+        } finally {
+            // 放行 stall 內層收斂（背景 sweep worker 回 false，finally 移除 pending），再隔離。
+            latch.countDown()
+            pollPendingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            awaitNoElevatedThreads()
+        }
+        assertEquals(0, spawns.get())
+        assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
+    }
+
+    @Test fun rootStalledQuarantineSmallTimeoutWallBounded() {
+        doStalledQuarantineSmallTimeoutWallBounded { s, k -> rootRunner(spawn = s, killer = k) }
+    }
+
+    @Test fun shizukuStalledQuarantineSmallTimeoutWallBounded() {
+        doStalledQuarantineSmallTimeoutWallBounded { s, k -> shizukuRunner(spawn = s, killer = k) }
     }
 }

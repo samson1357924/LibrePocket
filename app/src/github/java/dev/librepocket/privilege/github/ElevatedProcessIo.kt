@@ -5,6 +5,7 @@ import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellPolicy
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import java.util.IdentityHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -208,6 +209,18 @@ internal object ElevatedCleanupTracker {
     const val MAX_CONCURRENT_CALLS = 4
 
     /**
+     * Round-4 Phase R（P2-1）sweep verifier 全域上界（獨立於 quarantine 代際）：
+     * 存活 `elevated-quarantine-verify` worker 總數恆 `<=MAX_SWEEP_VERIFIERS`。
+     * [verifyQuarantinedOneBounded] 起線程前同 [lock] 內預佔 [sweepPending]
+     * （`size>=MAX_SWEEP_VERIFIERS` 即跳過該條目、fail-closed 保持 quarantine；
+     * 同 handle 已在集即跳過），worker 退出時 finally 移除（含起線程失敗回滾）。
+     * 舊 `pending<=quarantine.size` 推導已刪除：跨代 [clearUnverified] 後舊殘留仍
+     * 存活，新代疊加即無界（P2-1）；現與代際無關，飽和期間新代驗證被跳過即保持
+     * QUARANTINE，直到 stall worker 退出釋放佔位（安全方向，不翻轉放行）。
+     */
+    const val MAX_SWEEP_VERIFIERS = MAX_CONCURRENT_CALLS
+
+    /**
      * 單呼叫槽位上界（P1-2，PR140 Phase1；P1-4 重推導：4→7）。
      *
      * 舊值 4 沿用舊假設（1 清理 worker＋2 gobbler＋1 stdin-closer），漏計 B3 後
@@ -238,12 +251,15 @@ internal object ElevatedCleanupTracker {
      *   finished 路徑至多 5（3＋exit 1＋watcher 1）。
      *   故峰值封包仍為 7，常數與 barrier 測試皆不需改（見 PhaseF cancel bound 測試）。
      *
-     * Round-4 Phase M（P1-3）sweep 獨立 permit 推導（常數不動，仍為 7）：
+     * Round-4 Phase M（P1-3）sweep 獨立 permit 推導（常數不動，仍為 7）＋
+     * Round-4 Phase R（P2-1）全域 verifier 上界：
      * sweep verifier 採獨立 singleflight permit（[sweepLease]＋[sweepPending]，
-     * 見 [sweepQuarantine]），永不佔槽／不計 consecutive／不動峰值：
-     * 在飛 sweep 內層 `<=quarantine.size<=MAX_CONCURRENT_CALLS` 量級，
-     * 與 7 體系正交（stall 殘留仍報 QUARANTINE，不翻轉 BACKLOG），
-     * 故本常數推導與 barrier 測試皆不需改。
+     * 見 [sweepQuarantine]），永不佔槽／不計 consecutive／不動峰值；
+     * 在飛 verifier 總數恆 `<=MAX_SWEEP_VERIFIERS (=MAX_CONCURRENT_CALLS)`（見
+     * [MAX_SWEEP_VERIFIERS]：[verifyQuarantinedOneBounded] 起線程前同鎖預佔、
+     * 飽和即跳過 fail-closed，與 quarantine 代際無關），與 7 體系正交
+     * （stall 殘留仍報 QUARANTINE，不翻轉 BACKLOG），故本常數推導與 barrier
+     * 測試皆不需改。
      *
      * Round-4 Phase L（P1-2）lingering 即停推導（常數不動，仍為 7）：
      * slow gate 見自身 watcher lingering 即該 gate 失敗（[ElevatedCallSupervisor]
@@ -327,14 +343,30 @@ internal object ElevatedCleanupTracker {
     private val sweepLease = AtomicBoolean(false)
 
     /**
-     * Round-4 Phase M 在飛 sweep 內層檢查集合（identity `===`，同 [lock] 保護）：
-     * grace 後仍存活的 stall 內層 worker 在此登記，後續 sweep 跳過同 handle
-     * （不再為同一 handle 起新 worker，避免每次准入累積一殘留致無界）。
-     * 每 handle 至多一在飛檢查，故在飛內層總數 `<=quarantine.size<=MAX_CONCURRENT_CALLS`
-     * 量級；worker 退出時 finally 移除（見 [sweepQuarantine]），`latch` 放行後
-     * 自然收斂，不需顯式清除（[clearUnverified] 只清 quarantine，不清本集合）。
+     * Round-4 Phase M 在飛 sweep 內層檢查集合（identity `===`，同 [lock] 保護）＋
+     * Round-4 Phase R（P2-1）全域 verifier 存活集：
+     * - [verifyQuarantinedOneBounded] 起 `elevated-quarantine-verify` 前同鎖預佔
+     *   （`size>=MAX_SWEEP_VERIFIERS` 即跳過該條目、fail-closed 保持 quarantine；
+     *   同 handle 已在集即跳過），worker 退出時 finally 移除（含起線程失敗回滾）；
+     *   故存活 verifier 總數恆 `<=MAX_SWEEP_VERIFIERS`，與 quarantine 代際無關；
+     * - grace 後仍存活的 stall worker 保留佔位（後續 sweep 跳過同 handle，不再起新
+     *   worker）；`latch` 放行後 worker 退出即 finally 移除，自然收斂；
+     * - [clearUnverified] 只清 quarantine，不清本集合（live worker 存活屬設計：
+     *   資源釋放隨 worker 退出自然發生，非同步於 clear；新代驗證在飽和期間被跳過
+     *   即保持 QUARANTINE，直到 stall worker 退出釋放佔位，安全方向不翻轉放行）。
      */
     private val sweepPending = ArrayList<Process>()
+
+    /**
+     * Round-4 Phase R（P2-1＋P3）sweep 節流狀態（同 [lock] 保護）：
+     * - [lastSweepStartNanos]：上次成功發起背景 sweep 的單調時鐘（[kickSweepAsync]
+     *   lease 贏得後同鎖記錄；[SWEEP_COOLDOWN_MS] 內重複 kick 即零線程直回 false）；
+     * - `lastAttemptNanos`：每 handle 上次驗證嘗試時刻（identity key；[sweepEntries]
+     *   記錄，[SWEEP_PER_HANDLE_COOLDOWN_MS] 內跳過同 handle，避免對同一 stall
+     *   handle 高頻起線程；成功解除或 [clearUnverified] 即移除對應條目防洩漏）。
+     */
+    private var lastSweepStartNanos: Long = 0L
+    private val lastAttemptNanos = IdentityHashMap<Process, Long>()
 
     /**
      * floor 命中計數（診斷用，產品保持 floor 不變負但上報；正常路徑永不觸發，
@@ -481,10 +513,24 @@ internal object ElevatedCleanupTracker {
     /** Round-4 Phase M sweep 內層 grace（產品常數；interrupt 後再等本值，仍存活即殘留記 [sweepPending]）。 */
     internal const val SWEEP_GRACE_MS = 500L
 
+    /**
+     * Round-4 Phase R（P3）背景 sweep 全域冷卻（產品常數；[kickSweepAsync] 上次成功
+     * 發起後本值內重複 kick 即零線程直回 false，將創建速率封頂為 `<=1 sweep/cooldown`
+     * 而與拒絕 QPS 無關；fail-closed 保持 quarantine）。
+     * 單測經 `nowNanos` 假時鐘注入繞行（沿用 [ElevatedCallSupervisor] 模式）。
+     */
+    internal const val SWEEP_COOLDOWN_MS = 1000L
+
+    /**
+     * Round-4 Phase R（P3）單 handle 重試冷卻（產品常數；[sweepEntries] 跳過本值內
+     * 已嘗試的 handle，避免對同一 stall handle 高頻起線程；fail-closed 保持）。
+     */
+    internal const val SWEEP_PER_HANDLE_COOLDOWN_MS = 5000L
+
     /** sweep 是否有在飛驗證（快照，僅測試／診斷用）。 */
     internal fun isSweepInFlight(): Boolean = sweepLease.get()
 
-    /** sweep 在飛內層檢查數快照（僅測試／診斷用；stall 殘留即 1，收斂後歸零）。 */
+    /** sweep 在飛內層檢查數快照（僅測試／診斷用；含預佔在飛＋stall 殘留，恆 `<=MAX_SWEEP_VERIFIERS`，收斂後歸零）。 */
     internal fun sweepPendingCount(): Int = synchronized(lock) { sweepPending.size }
 
     /**
@@ -506,11 +552,14 @@ internal object ElevatedCleanupTracker {
      *   daemon worker 跑 `waitFor(0)`＋join [SWEEP_VERIFY_MS]＋interrupt＋
      *   [SWEEP_GRACE_MS] grace；逾期／中斷／抛一律放棄本次回收、保持 quarantine，
      *   無法確認死亡就保持，永不放行 spawn）；
-     * - stall 殘留：grace 後仍存活即記 [sweepPending]（identity，後續 sweep 跳過
-     *   同 handle，不再起新 worker），worker 退出時 finally 移除；
-     *   在飛內層總數 `<=quarantine.size`（見 [sweepPending]），無 untracked
-     *   checker thread（同時至多一 sweep 活躍內層＋若干已登記殘留，皆可經
-     *   alive thread＋[sweepPendingCount] 斷言）；
+     * - stall 殘留＋全域上界（Phase R P2-1）：grace 後仍存活即保留 [sweepPending]
+     *   佔位（identity，後續 sweep 跳過同 handle，不再起新 worker），worker 退出時
+     *   finally 移除；起線程前同鎖預佔、飽和（`size>=MAX_SWEEP_VERIFIERS`）即跳過
+     *   該條目 fail-closed，故存活 verifier 總數恆 `<=MAX_SWEEP_VERIFIERS`，無
+     *   untracked checker thread（皆可經 alive thread＋[sweepPendingCount] 斷言）；
+     * - per-handle 重試節流：[sweepEntries] 跳過 [SWEEP_PER_HANDLE_COOLDOWN_MS]
+     *   內已嘗試的 handle（`lastAttemptNanos`），避免對同一 stall handle 高頻起
+     *   線程；飽和／節流一律保持 quarantine（fail-closed，零放行）；
      * - slot 常數 7 推導（獨立 permit，二選一之其一）：本函數永不碰槽／計數器
      *   （不調 `acquireSlot／markLingering／noteUnclean`），故 `outstanding`／
      *   `consecutive`／`peakOutstanding` 不動，准入 verdict 順序不動
@@ -528,20 +577,25 @@ internal object ElevatedCleanupTracker {
      * 一律零等待即拒（贏者亦不等待），永不放行 spawn（fail-closed 方向不變）。
      *
      * @return 本次解除的登記數（測試斷言回收用；stall／存活／逾期一律 0）。
+     * @param nowNanos 可注入單調時鐘（預設 `System.nanoTime`；單測傳假時鐘做確定性
+     *   節流迴歸，不靠 sleep 時序；產品呼叫沿用預設，不傳參）。
      */
-    internal fun sweepQuarantine(): Int {
+    internal fun sweepQuarantine(
+        nowNanos: () -> Long = { System.nanoTime() },
+    ): Int {
         val snapshot: List<Process> = synchronized(lock) { quarantine.toList() }
         if (snapshot.isEmpty()) return 0
         if (!sweepLease.compareAndSet(false, true)) return 0
         try {
-            return sweepEntries(snapshot)
+            return sweepEntries(snapshot, nowNanos)
         } finally {
             sweepLease.set(false)
         }
     }
 
     /**
-     * Round-5 Phase Q（P2-4）非同步重掃觸發：runner 准入前唯一 sweep 調用點。
+     * Round-5 Phase Q（P2-4）非同步重掃觸發：runner 准入前唯一 sweep 調用點＋
+     * Round-4 Phase R（P3）全域冷卻。
      * 本地快照判斷（同步、零 IPC：只取 [lock] 讀 [quarantine]／[sweepPending]，
      * 絕不觸碰 `Process` handle）＋背景 singleflight verifier（沿用 Phase M
      * [verifyQuarantinedOneBounded]：逐條內層 `elevated-quarantine-verify`
@@ -549,26 +603,52 @@ internal object ElevatedCleanupTracker {
      * [SWEEP_GRACE_MS] grace，不新增線程模型——背景 owner 亦為即席 daemon，
      * 單次即退；逾期／中斷／抛一律放棄本次回收、保持 quarantine）。
      * 呼叫側永不等待 verifier：quarantine 空／全 pending（無條目可驗）／lease
-     * 被佔／起線程失敗一律即時回 false，隨後 [tryEnterReserved] 以
+     * 被佔／冷卻中／起線程失敗一律即時回 false，隨後 [tryEnterReserved] 以
      * [Admission.QUARANTINE] 有界拒（caller wall 只含本地快照＋准入，
      * timeoutMs=10/100＋stall handle 亦毫秒級 Denied，見 Phase Q 迴歸）。
+     * 冷卻（P3）：上次成功發起後 [SWEEP_COOLDOWN_MS] 內重複 kick 即零線程直回
+     * false（不取 lease、不起 worker），創建速率封頂 `<=1 sweep/cooldown` 而與
+     * 拒絕 QPS 無關；fail-closed 保持 quarantine。時鐘經 `nowNanos` 注入
+     * （沿用 [ElevatedCallSupervisor] 模式；預設單調時鐘，單測傳假時鐘）。
      * 登記／解除語義不動（只改調度）：解除仍只經確死（背景見確死即清）或
      * [clearUnverified]，見 [quarantineUnverified]；slot 常數 7 推導不動
      * （背景 sweep 同樣永不碰槽／計數器）。
      *
      * @return 是否成功發起一次背景重掃（false 即本次無動作：空／全 pending／
-     *   已有在飛 sweep／起線程失敗；皆 fail-closed，quarantine 保持）。
+     *   已有在飛 sweep／冷卻中／起線程失敗；皆 fail-closed，quarantine 保持）。
      */
-    internal fun kickSweepAsync(): Boolean {
+    internal fun kickSweepAsync(
+        nowNanos: () -> Long = { System.nanoTime() },
+    ): Boolean {
+        val now: Long = try {
+            nowNanos()
+        } catch (_: Exception) {
+            System.nanoTime()
+        }
         val snapshot: List<Process> = synchronized(lock) {
             if (quarantine.isEmpty()) return false
-            quarantine.filter { q -> sweepPending.none { it === q } }
+            val filtered = quarantine.filter { q -> sweepPending.none { it === q } }
+            if (filtered.isEmpty()) return false
+            if (lastSweepStartNanos != 0L &&
+                now - lastSweepStartNanos < TimeUnit.MILLISECONDS.toNanos(SWEEP_COOLDOWN_MS)
+            ) {
+                return false
+            }
+            filtered
         }
         if (snapshot.isEmpty()) return false
         if (!sweepLease.compareAndSet(false, true)) return false
+        synchronized(lock) {
+            val start: Long = try {
+                nowNanos()
+            } catch (_: Exception) {
+                System.nanoTime()
+            }
+            lastSweepStartNanos = start
+        }
         val worker = Thread({
             try {
-                sweepEntries(snapshot)
+                sweepEntries(snapshot, nowNanos)
             } catch (_: Throwable) {
                 // 背景重掃永不抛向呼叫方（lease 照常釋放，quarantine 保持）。
             } finally {
@@ -589,24 +669,46 @@ internal object ElevatedCleanupTracker {
      * sweep 條目迴圈（[sweepQuarantine] 同步版與 [kickSweepAsync] 背景版共用，
      * 登記／解除語義唯一實作）：
      * 逐條經 [verifyQuarantinedOneBounded] 重驗，見確死即同 [lock] 內 identity
-     * 移除＋計數；存活／逾期／中斷一律保持。呼叫方須已持有 [sweepLease]
+     * 移除＋計數（含 `lastAttemptNanos` 條目移除防洩漏）；存活／逾期／中斷／
+     * 飽和跳過／節流跳過一律保持。呼叫方須已持有 [sweepLease]
      * （singleflight），本函數不另搶 lease。
+     * per-handle 節流（Phase R P3）：同 [lock] 內查 `lastAttemptNanos`，
+     * [SWEEP_PER_HANDLE_COOLDOWN_MS] 內已嘗試即跳過該條目（不另起 worker）；
+     * 嘗試即記錄時刻（含飽和跳過亦記錄，壓住飽和期熱重試）。
      *
-     * @return 本次解除的登記數（stall／存活／逾期一律 0）。
+     * @return 本次解除的登記數（stall／存活／逾期／飽和／節流一律 0）。
      */
-    private fun sweepEntries(snapshot: List<Process>): Int {
+    private fun sweepEntries(
+        snapshot: List<Process>,
+        nowNanos: () -> Long = { System.nanoTime() },
+    ): Int {
         var cleared = 0
         for (p in snapshot) {
-            synchronized(lock) {
-                if (quarantine.none { it === p }) continue
-                if (sweepPending.any { it === p }) continue
+            val now: Long = try {
+                nowNanos()
+            } catch (_: Exception) {
+                System.nanoTime()
             }
+            var shouldAttempt = false
+            synchronized(lock) {
+                if (quarantine.any { it === p } && sweepPending.none { it === p }) {
+                    val last = lastAttemptNanos[p]
+                    if (last == null ||
+                        now - last >= TimeUnit.MILLISECONDS.toNanos(SWEEP_PER_HANDLE_COOLDOWN_MS)
+                    ) {
+                        lastAttemptNanos[p] = now
+                        shouldAttempt = true
+                    }
+                }
+            }
+            if (!shouldAttempt) continue
             val exited = verifyQuarantinedOneBounded(p)
             if (exited) {
                 synchronized(lock) {
                     val idx = quarantine.indexOfFirst { it === p }
                     if (idx >= 0) {
                         quarantine.removeAt(idx)
+                        lastAttemptNanos.remove(p)
                         cleared++
                     }
                 }
@@ -616,15 +718,25 @@ internal object ElevatedCleanupTracker {
     }
 
     /**
-     * Round-4 Phase M 單條受監督存活查詢（P1-3；[sweepQuarantine] 內層專用）：
+     * Round-4 Phase M 單條受監督存活查詢（P1-3；[sweepQuarantine] 內層專用）＋
+     * Round-4 Phase R 全域上界（P2-1）：
      * IPC 只跑內層 daemon worker（`elevated-quarantine-verify`），呼叫側只 join。
+     * - 起線程前同 [lock] 內預佔 [sweepPending]：同 handle 已在集即跳過回 false；
+     *   `size>=MAX_SWEEP_VERIFIERS` 即飽和跳過回 false（保持 quarantine，
+     *   fail-closed；與 quarantine 代際無關，舊跨代無界即此門堵住）；
+     *   預佔後 worker 退出時 finally 移除（含起線程失敗回滾），故存活總數恆
+     *   `<=MAX_SWEEP_VERIFIERS`；
      * - `waitFor(0)` 回 true 即確死（true）；回 false／抛／中斷／逾期／起線程失敗
      *   一律 false（保持 quarantine；中斷恢復旗標）；
-     * - grace 後仍存活即記 [sweepPending]（冪等 identity 登記；worker 退出時
-     *   finally 移除，見本體 finally），呼叫側有界回 false；
-     * - add 後重驗 `isAlive`（worker 在登記窗口內退出即立即移除，不留 stale）。
+     * - stall（grace 後仍存活）即保留預佔位，呼叫側有界回 false（不再另行 add；
+     *   worker 在 grace 窗口內退出即 finally 已移除，不留 stale）。
      */
     private fun verifyQuarantinedOneBounded(p: Process): Boolean {
+        synchronized(lock) {
+            if (sweepPending.any { it === p }) return false
+            if (sweepPending.size >= MAX_SWEEP_VERIFIERS) return false
+            sweepPending.add(p)
+        }
         val holder = AtomicReference<Boolean?>()
         val worker = Thread({
             try {
@@ -650,6 +762,10 @@ internal object ElevatedCleanupTracker {
         try {
             worker.start()
         } catch (_: Exception) {
+            synchronized(lock) {
+                val idx = sweepPending.indexOfFirst { it === p }
+                if (idx >= 0) sweepPending.removeAt(idx)
+            }
             return false
         }
         try {
@@ -663,17 +779,6 @@ internal object ElevatedCleanupTracker {
                 } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt()
                 }
-                if (worker.isAlive) {
-                    synchronized(lock) {
-                        if (sweepPending.none { it === p }) sweepPending.add(p)
-                    }
-                    if (!worker.isAlive) {
-                        synchronized(lock) {
-                            val idx = sweepPending.indexOfFirst { it === p }
-                            if (idx >= 0) sweepPending.removeAt(idx)
-                        }
-                    }
-                }
             }
             return false
         }
@@ -684,31 +789,32 @@ internal object ElevatedCleanupTracker {
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
-            if (worker.isAlive) {
-                synchronized(lock) {
-                    if (sweepPending.none { it === p }) sweepPending.add(p)
-                }
-                if (!worker.isAlive) {
-                    synchronized(lock) {
-                        val idx = sweepPending.indexOfFirst { it === p }
-                        if (idx >= 0) sweepPending.removeAt(idx)
-                    }
-                }
-                return false
-            }
+            return false
         }
         return holder.get() == true
     }
 
     /**
-     * Round-3 Phase E 顯式解除 quarantine（P1-1）：
-     * 僅 B3 明確驗證的 recovery（帶外驗證已死後）或測試隔離可調。
+     * Round-3 Phase E 顯式解除 quarantine（P1-1）＋Round-4 Phase R（P2-1）語義澄清：
+     * 僅 B3 明確驗證的 recovery（帶外驗證已死後）或測試隔離可調；B3 自動 recovery
+     * 尚未接線（生產無調用方，見呼叫點檢索：僅測試調用），故生產 quarantine 一旦
+     * 進入即持久直到確死 sweep 解除。
      * 成功 drain／[noteClean]／[sweepQuarantine] 未見確死一律不得調用
      * （quarantine 與 breaker 計數分離，見 [noteClean] 分離聲明）。
+     * 注意 `clear != 資源釋放`：本函數只清 quarantine，不清 [sweepPending] 存活
+     * worker（live worker 存活屬設計，隨退出自然釋放；飽和期間新代驗證被跳過即
+     * 保持 QUARANTINE，直到舊 worker 退出，安全方向）。
+     * 同步清理 `lastAttemptNanos` 對應條目防洩漏（[sweepPending] 存活佔位保留）；
+     * 重置 [SWEEP_COOLDOWN_MS] 冷卻（代際邊界／測試隔離語義：新代允許即時探測，
+     * 仍受 [MAX_SWEEP_VERIFIERS] 全域上界約束，故不引入無界）。
      */
     @VisibleForTesting
     internal fun clearUnverified() {
-        synchronized(lock) { quarantine.clear() }
+        synchronized(lock) {
+            quarantine.clear()
+            lastAttemptNanos.clear()
+            lastSweepStartNanos = 0L
+        }
     }
 
     /**

@@ -181,7 +181,19 @@ class ShellDirectPhaseLingerTest {
             holders.forEach { it.start() }
             // 3 workers 皆阻塞於 gate resolver（各持一 permit）。
             awaitDirectThreads(DirectAdmission.MAX_WORKERS)
-            Thread.sleep(200)
+            // 佔用數 rendezvous（取代固定 sleep）：三 permit 全被持有才算齊。
+            // DirectAdmission 無 current()（僅 GobblerAdmission 有），
+            // 以 availablePermits()==0 判定全佔滿；freeze 工為純 CPU（µs 級），
+            // 穩定性再確認一次以排除 freeze→gate 交接瞬間的採樣。
+            val occDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            while (DirectAdmission.availablePermits() > 0 && System.nanoTime() < occDeadline) Thread.sleep(20)
+            assertEquals(0, DirectAdmission.availablePermits())
+            Thread.sleep(50)
+            assertEquals(
+                "holders must all be gate-blocked, permits=${DirectAdmission.availablePermits()}",
+                0,
+                DirectAdmission.availablePermits(),
+            )
             assertEquals("no spawn while holders blocked, calls=${calls.get()}", 0, calls.get())
             // 第 4 呼叫：freeze 段准入飽和，零 thread 即時 TimedOut(true)。
             val saturated = shell.execute(listOf("echo", "victim"), timeoutMs = 15_000L)
@@ -311,5 +323,61 @@ class ShellDirectPhaseLingerTest {
         val (_, _, _, _, linger) = legacy
         assertFalse(linger)
         assertTrue(legacy.copy(cleanupIncomplete = true).cleanupIncomplete)
+    }
+
+    // ---- P1：gate 阻塞超期 → TimedOut，零 spawn（生產 pre-spawn 線直連） ----
+
+    @Test fun gateBlockedPastDeadlineTimesOutWithoutSpawn() {
+        // 生產接線 pin：gate resolver 在監督 worker 內阻塞過 deadline，
+        // caller 按 deadline 回 TimedOut（worker grace 後仍存活即 linger）；
+        // worker 逾期放行完成後生產亦不再建子進程（該呼叫的 executeFrozen
+        // 永不執行；若有 worker 逾期進入直接 process 段，spawn 前預檢即抛
+        // DirectSupervisor.PreSpawnTimeoutException，零 spawn 映 TimedOut）。
+        // 本測試不複刻任何到期判定（resolver 只阻塞，判定全在生產）：
+        // 刪除 gate 逾期的 Expired→TimedOut 映射或清出管線重入，
+        // 逾期放行的 worker 結果將被接受或補 spawn，本 pin 即紅。
+        // （直接 process 段的 spawn 前預檢由 P1 T2 覆蓋：該 µs 窗口無法經
+        // 公開 API 決定性觸發，此處不斷言其紅綠。）
+        val blockLatch = CountDownLatch(1)
+        val calls = AtomicInteger(0)
+        val runner = object : ProcessRunner {
+            override fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>?): RawOutput {
+                calls.incrementAndGet()
+                return RawOutput("ok".toByteArray(), ByteArray(0), 0, false)
+            }
+        }
+        val shell = RestrictedShell(
+            runner = runner,
+            privateRoot = null,
+            execResolver = {
+                awaitUninterruptibly(blockLatch)
+                ShellExecutables.ResolvedExec("/trusted/$it", null)
+            },
+        )
+        val releaser = Thread({
+            Thread.sleep(600)
+            blockLatch.countDown()
+        }, "linger-prespawn-releaser").apply { isDaemon = true }
+        try {
+            releaser.start()
+            val start = System.nanoTime()
+            val r = shell.execute(listOf("echo", "hi"), timeoutMs = 200L)
+            val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start)
+            assertTrue("blocked gate must supervise to TimedOut, got $r", r is ShellResult.TimedOut)
+            assertTrue(
+                "stuck gate worker must flag linger, got $r",
+                (r as ShellResult.TimedOut).cleanupIncomplete,
+            )
+            assertTrue("wall bounded, elapsed=$elapsedMs", elapsedMs < 200L + 5_000L)
+            assertEquals("blocked gate must not spawn", 0, calls.get())
+            // 逾期 worker 放行完成後仍不補 spawn（生產丟棄過期 holder，不回填管線）。
+            releaser.join(5_000L)
+            awaitNoDirectThreads()
+            assertEquals("late gate completion must not spawn either", 0, calls.get())
+        } finally {
+            blockLatch.countDown()
+            runCatching { releaser.join(5_000L) }
+            awaitNoDirectThreads()
+        }
     }
 }

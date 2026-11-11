@@ -197,10 +197,17 @@ class ShellDirectPhaseGobblerTest {
     @Test fun saturationExecuteMapsToFailed() {
         assumeTrue("/bin/true missing, skipping", File("/bin/true").canExecute())
         assertEquals(0, GobblerAdmission.current())
+        // Stage 5 P3-4：真系統二進位以 real 父目錄為允許集、裝置不可寫模擬
+        // （root 下預設 Files.isWritable 恆真會誤判 REAL_WRITABLE 而拒；
+        // 飽和應映 Failed 而非 Denied，同 ShellDirectPhaseLingerTest 真 sleep 形）。
+        val realTrue = File("/bin/true").canonicalPath
+        val trueRoot = File(realTrue).parentFile.canonicalPath
         val shell = RestrictedShell(
             runner = DefaultProcessRunner(),
             privateRoot = null,
-            execResolver = { ShellExecutables.ResolvedExec("/bin/true", null) },
+            execAllowedRoots = listOf(trueRoot),
+            execIsWritable = { _ -> false },
+            execResolver = { ShellExecutables.ResolvedExec(realTrue, null) },
         )
         repeat(GobblerAdmission.MAX_GOBBLERS) {
             assertTrue("admission must have room before saturation test", GobblerAdmission.tryEnter())

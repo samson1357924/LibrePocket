@@ -28,25 +28,92 @@ class ShellStage5Test {
             File("app/src/main/java"),
             File("src/main/java"),
             File("../app/src/main/java"),
-            File("/mnt/240G_SSD/opencode_tmp/worktrees/fix-github-root-probe-runner/app/src/main/java"),
         )
         val root = candidates.firstOrNull { it.isDirectory } ?: return
         val hits = mutableListOf<String>()
         root.walkTopDown().filter { it.isFile && it.name.endsWith(".kt") }.forEach { f ->
-            // 僅掃產品源集（main），跳過定義檔本身；註解/KDoc 命中不計（僅計實際調用 `.executeElevated(`）。
+            // 僅掃產品源集（main），跳過定義檔本身；註解/KDoc 命中不計，
+            // 字串字面量內命中亦不計（僅計程式碼區實際調用 `.executeElevated(`）。
             if (f.name == "ShellExecTool.kt") return@forEach
-            val text = f.readText()
-            // 去註解簡化：逐行剔除 `//` 尾註與 `*` KDoc 行，仍含調用即記。
-            val codeLines = text.lines().filter { line ->
-                val t = line.trim()
-                !(t.startsWith("//") || t.startsWith("*") || t.startsWith("/*"))
-            }
-            val code = codeLines.joinToString("\n")
-            if (code.contains(".executeElevated(")) {
+            if (codeContainsExecuteElevated(f.readText())) {
                 hits.add(f.relativeTo(root).path)
             }
         }
         assertTrue("main 源集直調 executeElevated（繞 PrivilegeGate）：$hits", hits.isEmpty())
+    }
+
+    /**
+     * 程式碼區調用探測（token 級，非正則 grep）：逐行掃描並追蹤區塊註解／
+     * 行註解／字串（`"`、三引號、`'…'`）狀態，僅程式碼區的
+     * `.executeElevated(` 才算命中，避免註解與字串字面量誤報。
+     */
+    private fun codeContainsExecuteElevated(text: String): Boolean {
+        var inBlock = false
+        var inTriple = false
+        for (rawLine in text.lines()) {
+            var i = 0
+            var inStr = false
+            val code = StringBuilder()
+            while (i < rawLine.length) {
+                if (inTriple) {
+                    val end = rawLine.indexOf("\"\"\"", i)
+                    if (end < 0) break
+                    i = end + 3
+                    inTriple = false
+                    continue
+                }
+                if (inBlock) {
+                    val end = rawLine.indexOf("*/", i)
+                    if (end < 0) break
+                    i = end + 2
+                    inBlock = false
+                    continue
+                }
+                val c = rawLine[i]
+                if (inStr) {
+                    if (c == '\\') {
+                        i += 2
+                        continue
+                    }
+                    if (c == '"') inStr = false
+                    i++
+                    continue
+                }
+                if (c == '"') {
+                    if (rawLine.startsWith("\"\"\"", i)) {
+                        inTriple = true
+                        i += 3
+                    } else {
+                        inStr = true
+                        i++
+                    }
+                    continue
+                }
+                if (c == '\'') {
+                    // 字元字面量（如 `'/'`）：跳過至配對 `'`，避免其內 `/` 干擾註解判定。
+                    i = if (i + 2 < rawLine.length && rawLine[i + 1] == '\\') {
+                        if (i + 3 < rawLine.length) i + 4 else rawLine.length
+                    } else {
+                        val end = rawLine.indexOf('\'', i + 1)
+                        if (end < 0) rawLine.length else end + 1
+                    }
+                    continue
+                }
+                if (c == '/' && i + 1 < rawLine.length) {
+                    val n = rawLine[i + 1]
+                    if (n == '/') break
+                    if (n == '*') {
+                        inBlock = true
+                        i += 2
+                        continue
+                    }
+                }
+                code.append(c)
+                i++
+            }
+            if (code.contains(".executeElevated(")) return true
+        }
+        return false
     }
 
     // ---- P3-2：reason 孤立代理 ----
@@ -114,8 +181,10 @@ class ShellStage5Test {
 
     private class CapRunner : ProcessRunner {
         var calls = 0
+        var lastArgv: List<String>? = null
         override fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>?): RawOutput {
             calls++
+            lastArgv = argv.toList()
             return RawOutput("ok".toByteArray(), ByteArray(0), 0, false)
         }
     }
@@ -173,6 +242,58 @@ class ShellStage5Test {
         } finally {
             dir.deleteRecursively()
             outside.deleteRecursively()
+        }
+    }
+
+    // ---- 跨段 pin：自訂映射＋trimmed argv[0] 端到端 ----
+
+    @Test fun customResolverSpacedArgvZeroSpawnsTrimmedAppletParity() {
+        // gate 以 frozen[0].trim() 調自訂映射、自訂映射 applet 由白名單放行值重算：
+        // "  ls  " 與 "ls" 端到端必須同一 spawn 形（[toybox 實體, "ls"]），
+        // 零 spawn（拒）／滿 spawn（放行）行為一致。
+        val dir = Files.createTempDirectory("s5-direct-trim").toFile().canonicalFile
+        try {
+            val toy = File(dir, "toybox").apply {
+                writeText("#!/bin/sh\necho hi\n")
+                assertTrue(setExecutable(true))
+            }
+            val toyReal = toy.canonicalPath
+            val seenPlain = mutableListOf<String>()
+            val seenSpaced = mutableListOf<String>()
+            val plainRunner = CapRunner()
+            val spacedRunner = CapRunner()
+            fun shellFor(runner: CapRunner, seen: MutableList<String>) = RestrictedShell(
+                runner = runner,
+                privateRoot = dir.absolutePath,
+                execSearchDirs = listOf(dir.absolutePath),
+                execAllowedRoots = listOf(dir.canonicalPath),
+                execIsWritable = { _ -> false },
+                // 惡意映射攜污染 applet：生產以白名單放行值重算，不採信此字串。
+                execResolver = { name ->
+                    seen += name
+                    ShellExecutables.ResolvedExec(toyReal, "  ls  ")
+                },
+            )
+            val rPlain = shellFor(plainRunner, seenPlain).execute(listOf("ls"), timeoutMs = 5_000L)
+            assertTrue("$rPlain", rPlain is ShellResult.Ok)
+            val rSpaced = shellFor(spacedRunner, seenSpaced).execute(listOf("  ls  "), timeoutMs = 5_000L)
+            assertTrue("$rSpaced", rSpaced is ShellResult.Ok)
+            // trim 發生於調 resolver 之前：gate＋reverify 所見全為 "ls"。
+            assertTrue("resolver must be consulted", seenPlain.isNotEmpty())
+            assertEquals("resolver path must match", seenPlain.size, seenSpaced.size)
+            assertTrue("resolver must only see trimmed name, got $seenSpaced", seenSpaced.all { it == "ls" })
+            // spawn 形 parity：污染 applet 被放行值覆寫，首元為驗證後實體。
+            assertEquals(1, plainRunner.calls)
+            assertEquals(1, spacedRunner.calls)
+            assertEquals(listOf(toyReal, "ls"), plainRunner.lastArgv)
+            assertEquals(plainRunner.lastArgv, spacedRunner.lastArgv)
+            assertEquals("ls", spacedRunner.lastArgv!![1])
+            assertTrue(
+                "no untrimmed argv[0] may reach spawn",
+                spacedRunner.lastArgv!!.none { it.contains("  ") },
+            )
+        } finally {
+            dir.deleteRecursively()
         }
     }
 }

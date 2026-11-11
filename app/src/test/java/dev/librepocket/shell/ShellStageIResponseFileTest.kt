@@ -24,7 +24,8 @@ import org.junit.Test
  * 即使 MANIFEST 域內亦 `Denied(BLACKLISTED)`（vet 獨立性）。
  * 未來受控 helper（讀＋vet＋freeze＋替換 operands）屬 out-of-scope。
  *
- * 覆蓋（MANIFEST 域內、內容列域外，trailing-legal throughout）：
+ * 覆蓋（MANIFEST 域內、內容列域外；trailing-legal，唯 du 除外——
+ * GNU 禁 --files0-from 與路徑操作數並存，故 du 無 trailing）：
  * - du／wc／find ×｛分離形、`=v`、縮寫分離、`=v` 縮寫｝直接＋提權 Denied；
  * - multicall toybox 有效形同門；
  * - 直接跑道層零 spawn；
@@ -326,13 +327,16 @@ class ShellStageIResponseFileTest {
         val f = responseFixture("stageI-du-real")
         try {
             // 唯讀觀察：MANIFEST 域內、內容列域外；`du` 直讀即印域外（exit 0）。
+            // 注意 GNU du 禁止 --files0-from 與路徑操作數並存（exit 1），故無
+            // trailing 操作數（SYNOPSIS 第 2 式；uutils 較寬鬆，本地會過但 CI 不過）。
             val raw = DefaultProcessRunner(dirRoot = f.scope.absolutePath)
-                .run(listOf(duBin!!, "--files0-from=" + f.manifestAbs, f.scope.absolutePath), 10_000L, null)
+                .run(listOf(duBin!!, "--files0-from=" + f.manifestAbs), 10_000L, null)
             val out = String(raw.stdout, Charsets.UTF_8)
             assertEquals("OS must read outside via manifest (exit 0), got: $out", 0, raw.exitCode)
             assertTrue("OS must list outside path, got: $out", out.contains("hidden.txt"))
-            // 政策拒絕（直接＋提權）且零 spawn（trailing-legal 形式）。
-            val argv = listOf("du", "--files0-from=" + f.manifestAbs, f.scope.absolutePath)
+            // 政策拒絕（直接＋提權）且零 spawn（無 trailing 操作數：GNU 不允許
+            // 其與 --files0-from 並存；拒絕僅來自 response-file 門）。
+            val argv = listOf("du", "--files0-from=" + f.manifestAbs)
             assertBlockedResponseFile(ShellPolicy.validate(argv, f.scope.absolutePath), argv)
             assertBlockedResponseFile(
                 ShellPolicy.validateElevated(

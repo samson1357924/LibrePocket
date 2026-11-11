@@ -786,6 +786,12 @@ class ElevatedRunnerPhaseEQuarantineTest {
                 ElevatedCleanupTracker.kickSweepAsync()
                 ElevatedCleanupTracker.sweepPendingCount() == 1
             }
+            // 可見性屏障：pending==1 可能搶在 worker.start() 之前可見，
+            // 先等 verifier 線程現身再採 baseline，否則 aliveBefore 在 0 撕裂、
+            // owner 隨後啟動 W1 即誤判「新生 checker」。
+            pollTrue("quarantine verifier must be visible", boundMs = 10_000L) {
+                aliveQuarantineVerifyCount() >= 1
+            }
             val alive = aliveQuarantineVerifyCount()
             assertTrue(
                 "at most one tracked quarantine-verify may linger, got $alive",

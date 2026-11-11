@@ -419,7 +419,7 @@ object ShellPolicy {
      *   非 `-args` 前綴，fail-closed）；單橫組合含 `L` 即拒。`-D`／
      *   `--dereference-args` 僅跟隨命令列參數：操作數 symlink 已由
      *   [checkPhysicalOperandGate] 拒（`LINK` 即拒），跟隨命令列即無新增逃逸；
-     *   域內真目錄＋`-D` 不跟隨 interior，故维持放行（見下抉擇表）。
+     *   域內真目錄＋`-D` 不跟隨 interior，故維持放行（見下抉擇表）。
      * - ls：`-L`／`--dereference*`（含 `=value` 附著形）；單橫組合含 `L` 即拒。
      *   `-R` 單獨維持放行（僅列名，不讀目標內容；`-R`＋`-L` 同現時 `L` 門已拒）。
      *

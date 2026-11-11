@@ -1134,6 +1134,14 @@ object ShellPolicy {
      *   與 `--file` 同門）；
      * - 短 `-f`：分離形（槽）＋附著形 `-fX`／`-f=X`（附著分支，grep-only，
      *   單橫 `=` rest 是相對檔名故一律拒，見 [checkPathArgs] 附著分支）。
+      * du 打開檔案的選項清單（audit 完備性，與上同門）：
+      * - `--files0-from`／`--exclude-from`（含 Stage G 唯一前綴縮寫，見
+      *   [canonicalFileKey]）：分離形經槽、附著形 `=v` 經本鍵；
+      * - 短 `-X`（`--exclude-from` 短形）：分離形經槽、簇附著形 `-Xrest`／
+      *   `-aXrest`（簇內 `X` 後 REST 恒為檔名，`X` 為 du 唯一短檔旗，前導布林
+      *   隱式消費無需查表；空 REST 如 `-aX` 臂檔槽）經 [checkPathArgs] 簇門
+      *   （`-` 非 stdin，uutils 實測按字面開檔，fail-closed 拒；`/abs` rest
+      *   走 FileScope＋實體門）。
      * 刻意未列（非檔案開啟，無需檔名審查）：
      * - `-e`／`--regexp`：pattern 字串（值槽／NON_PATH，不觸檔案）；
      * - `--include`／`--exclude`／`--exclude-dir`：glob（NON_PATH）；
@@ -1548,6 +1556,64 @@ object ShellPolicy {
                 }
                 if (clusterDone) continue
             }
+            // Stage A＋C du `-X` 簇附著值：`-X` 取必填參數，故簇內 `X` 後 REST
+            // 恒為檔名（getopt：前導布林如 `-a` 僅消費自身，`X` 取其後全部 REST；
+            // `X` 為 du 唯一短檔旗，簇內無需布林表，前導字元隱式消費）。
+            // - REST 空（如 `-X`／`-aX`）→ 臂檔槽取次 argv（同分離形）；
+            // - REST 以 `/` 起 → dotdot＋FileScope／實體門（use==validated，域內放行）；
+            // - 其餘（`-`／`-secret`／bare／`=/abs` 含 `=`）→ 相對 fail-closed
+            //  （uutils 實測 `-` 按字面開檔非 stdin，故 `-X-`／`-aX-` 亦拒；
+            //   `=` 起 REST 按短選項語義為相對檔名，不抽後綴，見 [absoluteCandidates]）。
+            // 選項位限定（`--` 後的 `-aXx` 是檔名，已由短橫門覆蓋）；guest 容器內
+            // 豁免（與 `-fX` 門同策）。
+            if (base == "du" && !endOfOptions && !inFileSlot &&
+                arg.startsWith("-") && !arg.startsWith("--") && arg != "-" &&
+                !(isGuest && privateRoot != null)
+            ) {
+                val xPos = arg.indexOf('X', 1)
+                if (xPos >= 1) {
+                    val rest = arg.substring(xPos + 1)
+                    if (rest.isEmpty()) {
+                        pendingFileValue = true
+                        prevArg = arg
+                        continue
+                    }
+                    if (rest.startsWith("/")) {
+                        if (hasDotDotSegment(rest)) {
+                            return Validation.Denied(
+                                ShellDeny.BLACKLISTED,
+                                "dotdot segment denied (reason=DOTDOT): $arg",
+                            )
+                        }
+                        val vet = if (isElevated) {
+                            checkFileScopeElevated(
+                                rest,
+                                privateRoot,
+                                safRoots,
+                                flavor,
+                                bridgeGranted,
+                                preRealPathHook,
+                            )
+                        } else {
+                            checkFileScope(
+                                rest,
+                                privateRoot,
+                                safRoots,
+                                flavor,
+                                bridgeGranted,
+                                preRealPathHook,
+                            )
+                        }
+                        if (vet != null) return vet
+                        prevArg = arg
+                        continue
+                    }
+                    return Validation.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "relative path denied (fail-closed, use absolute path): $arg",
+                    )
+                }
+            }
             if (isRelativePathArg(arg)) {
                 return Validation.Denied(
                     ShellDeny.BLACKLISTED,
@@ -1654,16 +1720,19 @@ object ShellPolicy {
             if (bareDenial != null) return bareDenial
             // Stage A＋C＋G 設槽：grep `-f`／`--file`／`--exclude-from`（Stage G：
             // 含 `--exclude-f…` 唯一前綴縮寫，見 [canonicalFileKey]）與 du
-            // `--files0-from`／`--exclude-from`（含唯一前綴縮寫）使下一位為
+            // `--files0-from`／`--exclude-from`（含唯一前綴縮寫）及短旗 `-X`
+            // （分離形 `-X`；簇空 REST `-aX` 另由簇門臂槽，見上；附著形
+            // `-Xrest`／`-aXrest` 另由簇門審）使下一位為
             // REQUIRED-FILENAME 槽（選項位）。`--` 後的操作數位不設槽；
-            // 他 binary 的 `-f`（如 `ls -f` 排序旗）不設槽。du `-X` 短旗
-            // （分離形／附著形）未覆，殘餘（超出 Stage G 有界切片）。
+            // 他 binary 的 `-f`（如 `ls -f` 排序旗）不設槽。
             if (base == "grep" && !endOfOptions && !arg.contains('=') &&
                 (arg == "-f" || canonicalFileKey("grep", arg) != null)
             ) {
                 pendingFileValue = true
             }
-            if (base == "du" && !endOfOptions && !arg.contains('=') && canonicalFileKey("du", arg) != null) {
+            if (base == "du" && !endOfOptions && !arg.contains('=') &&
+                (canonicalFileKey("du", arg) != null || arg == "-X")
+            ) {
                 pendingFileValue = true
             }
             prevArg = arg

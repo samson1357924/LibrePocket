@@ -155,13 +155,56 @@ class ShellStage5Test {
     // ---- Stage B (P2 length-first)：巨型 ASCII reason 粗門有界 ----
 
     @Test fun hugeAsciiReasonCoarseGateBoundedZeroSpawnNoHash() {
-        // 8M ASCII：舊碼先全掃 hasLoneSurrogate（~18-32ms）再 early-exit；
+        // 8M ASCII 自校準比值 pin（取代單發 <15ms 絕對 SLA，避免 GC/調度誤紅）：
         // 粗門 `length > 512` 應 O(1) 即拒，不跑任何 Unicode 掃描。
+        // - 修前舊碼先全掃 hasLoneSurrogate 再算 reasonUtf8Length（2 次 O(n)
+        //   全掃）才 early-exit：gate ≈ 2× 單次參考掃描 → gateMedian*5 < scanMedian
+        //   不成立（比值≈0.5，遠低於 5× 門檻），修前必紅；
+        // - 修後粗門 O(1)：gateMedian（µs 級）<< scanMedian（ms 級），
+        //   比值 >>5，在任何硬體皆大幅通過。
+        // 交錯採樣 N=7（gate/參考掃描逐輪交替，GC/降頻同等影響兩側），取中位數
+        // 抗單輪毛刺；另以 <1000ms 絕對上界僅防 hang（永不緊到誤紅）。
+        // 運行時間：8M×7 參考觸碰 ≈56M char（<1s）＋ 7 次 O(1) gate。
         val huge = "x".repeat(8_000_000)
-        val gateStart = System.nanoTime()
-        assertTrue(PrivilegeAuditLog.isReasonCodeTooLong(huge))
-        val gateMs = (System.nanoTime() - gateStart) / 1_000_000L
-        assertTrue("coarse length-first gate must skip full Unicode scan, elapsed=${gateMs}ms", gateMs < 15L)
+        val rounds = 7
+        val gateNs = LongArray(rounds)
+        val scanNs = LongArray(rounds)
+        var gateHits = 0
+        var scanSink = 0L
+        repeat(rounds) { r ->
+            val g0 = System.nanoTime()
+            val gated = PrivilegeAuditLog.isReasonCodeTooLong(huge)
+            val g1 = System.nanoTime()
+            assertTrue("coarse gate must deny huge reason (round $r)", gated)
+            gateNs[r] = g1 - g0
+            if (gated) gateHits++
+            // 參考全掃（摹舊演算法 O(n) 形態）：逐字觸碰並累加 checksum，
+            // 使 JIT 無法消除迴圈；單次掃描即足（舊門 2 次掃描≈2× 本參考）。
+            val s0 = System.nanoTime()
+            var acc = 0
+            for (i in huge.indices) {
+                acc += huge[i].code
+            }
+            val s1 = System.nanoTime()
+            scanNs[r] = s1 - s0
+            scanSink += acc
+        }
+        assertEquals("coarse gate must deny on every round", rounds, gateHits)
+        assertTrue("reference scan must observe input, sink=$scanSink", scanSink != 0L)
+        gateNs.sort()
+        scanNs.sort()
+        val gateMedianNs = gateNs[rounds / 2]
+        val scanMedianNs = scanNs[rounds / 2]
+        val gateMaxMs = (gateNs.max() / 1_000_000.0)
+        assertTrue(
+            "coarse gate must stay bounded (hang pin), max=${gateMaxMs}ms",
+            gateMaxMs < 1000.0,
+        )
+        assertTrue(
+            "O(1) coarse gate must beat O(n) full scan by >=5x: " +
+                "gateMedianNs=$gateMedianNs scanMedianNs=$scanMedianNs",
+            gateMedianNs * 5 < scanMedianNs,
+        )
         // 端到端：Tool 入口同樣先行門禁，零 spawn、零 snapshot worker，
         // 審計記空串標記（不哈希 8M 無界輸入）。
         var spawns = 0

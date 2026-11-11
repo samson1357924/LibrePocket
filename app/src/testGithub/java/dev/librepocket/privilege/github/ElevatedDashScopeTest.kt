@@ -88,17 +88,23 @@ class ElevatedDashScopeTest {
         grantCheck = GrantFixtures.allowAlways,
     )
 
-    private val vectors: List<List<String>> = listOf(
-        listOf("cat", "--", "-secret"),
-        listOf("grep", "-f", "-patterns", "allowed.txt"),
-        listOf("grep", "--", "pattern", "-secret"),
-        listOf("toybox", "cat", "--", "-secret"),
-    )
+    private fun dashVectors(scope: File): List<Pair<List<String>, String>> {
+        // P3 hygiene: trailing incidental must be in-scope ABSOLUTE legal, so a
+        // front-slot miss cannot be masked by a trailing deny (false green).
+        // Only vectors whose subject IS trailing keep a dash trailing.
+        val allowedAbs = File(scope, "allowed.txt").apply { writeText("hello\n") }.absolutePath
+        return listOf(
+            listOf("cat", "--", "-secret") to "-secret",
+            listOf("grep", "-f", "-patterns", allowedAbs) to "-patterns",
+            listOf("grep", "--", "pattern", "-secret") to "-secret",
+            listOf("toybox", "cat", "--", "-secret") to "-secret",
+        )
+    }
 
     @Test fun rootRunner_zeroSpawnOnDashBypass() {
         val (scope, outside) = dashScope()
         try {
-            for (argv in vectors) {
+            for ((argv, firstDanger) in dashVectors(scope)) {
                 val spawn = SpawnCounter()
                 val runner = makeRoot(scope, spawn)
                 val result = runner.runBinary(ElevatedRequest(argv, "DASH-TEST"), 5_000L)
@@ -108,6 +114,10 @@ class ElevatedDashScopeTest {
                 assertTrue(
                     "message must stay in relative-path family, got ${denied.message}",
                     denied.message.contains("relative path denied"),
+                )
+                assertTrue(
+                    "rejection must come from first dangerous slot $firstDanger, got ${denied.message}",
+                    denied.message.contains(firstDanger),
                 )
                 assertEquals("spawn must be zero for $argv", 0, spawn.calls)
             }
@@ -120,7 +130,7 @@ class ElevatedDashScopeTest {
     @Test fun shizukuRunner_zeroSpawnOnDashBypass() {
         val (scope, outside) = dashScope()
         try {
-            for (argv in vectors) {
+            for ((argv, firstDanger) in dashVectors(scope)) {
                 val spawn = SpawnCounter()
                 val runner = makeShizuku(scope, spawn)
                 val result = runner.runBinary(ElevatedRequest(argv, "DASH-TEST"), 5_000L)
@@ -131,6 +141,10 @@ class ElevatedDashScopeTest {
                     "message must stay in relative-path family, got ${denied.message}",
                     denied.message.contains("relative path denied"),
                 )
+                assertTrue(
+                    "rejection must come from first dangerous slot $firstDanger, got ${denied.message}",
+                    denied.message.contains(firstDanger),
+                )
                 assertEquals("spawn must be zero for $argv", 0, spawn.calls)
             }
         } finally {
@@ -139,19 +153,19 @@ class ElevatedDashScopeTest {
         }
     }
 
-    private val eqVectors: List<List<String>> = listOf(
-        listOf("cat", "--", "--color=auto"),
-        listOf("grep", "-f", "--color=auto"),
-        listOf("grep", "--", "pattern", "--color=auto"),
-        listOf("cat", "--", "--file="),
-        listOf("cat", "--", "--file=-"),
-        listOf("cat", "--", "--file=/scope/work/known.txt"),
+    private val eqVectors: List<Pair<List<String>, String>> = listOf(
+        listOf("cat", "--", "--color=auto") to "--color=auto",
+        listOf("grep", "-f", "--color=auto") to "--color=auto",
+        listOf("grep", "--", "pattern", "--color=auto") to "--color=auto",
+        listOf("cat", "--", "--file=") to "--file=",
+        listOf("cat", "--", "--file=-") to "--file=-",
+        listOf("cat", "--", "--file=/scope/work/known.txt") to "--file=",
     )
 
     @Test fun rootRunner_zeroSpawnOnEqOperand() {
         val (scope, outside) = dashScope()
         try {
-            for (argv in eqVectors) {
+            for ((argv, danger) in eqVectors) {
                 val spawn = SpawnCounter()
                 val runner = makeRoot(scope, spawn)
                 val result = runner.runBinary(ElevatedRequest(argv, "DASH-EQ-TEST"), 5_000L)
@@ -161,6 +175,10 @@ class ElevatedDashScopeTest {
                 assertTrue(
                     "message must stay in relative-path family, got ${denied.message}",
                     denied.message.contains("relative path denied"),
+                )
+                assertTrue(
+                    "rejection must come from dangerous slot $danger, got ${denied.message}",
+                    denied.message.contains(danger),
                 )
                 assertEquals("spawn must be zero for $argv", 0, spawn.calls)
             }
@@ -173,7 +191,7 @@ class ElevatedDashScopeTest {
     @Test fun shizukuRunner_zeroSpawnOnEqOperand() {
         val (scope, outside) = dashScope()
         try {
-            for (argv in eqVectors) {
+            for ((argv, danger) in eqVectors) {
                 val spawn = SpawnCounter()
                 val runner = makeShizuku(scope, spawn)
                 val result = runner.runBinary(ElevatedRequest(argv, "DASH-EQ-TEST"), 5_000L)
@@ -183,6 +201,10 @@ class ElevatedDashScopeTest {
                 assertTrue(
                     "message must stay in relative-path family, got ${denied.message}",
                     denied.message.contains("relative path denied"),
+                )
+                assertTrue(
+                    "rejection must come from dangerous slot $danger, got ${denied.message}",
+                    denied.message.contains(danger),
                 )
                 assertEquals("spawn must be zero for $argv", 0, spawn.calls)
             }
@@ -198,23 +220,23 @@ class ElevatedDashScopeTest {
      * `toybox grep -f=…` 經 Root／Shizuku 必須 `Denied(BLACKLISTED)` 且零 spawn。
      * 尾參合法絕對（load-bearing：拒絕只能來自危險槽）。
      */
-    private fun stageCVectors(scope: File): List<List<String>> {
+    private fun stageCVectors(scope: File): List<Pair<List<String>, String>> {
         val patterns = File(scope, "patterns").apply { writeText("zzz-no-match\n") }.absolutePath
         val input = File(scope, "input").apply { writeText("hello world\n") }.absolutePath
         return listOf(
-            listOf("grep", "-f=$patterns", input),
-            listOf("grep", "-f=-secret", input),
-            listOf("grep", "hello", "--exclude-from", "-secret", input),
-            listOf("grep", "--exclude-from=-secret", input),
-            listOf("grep", "--exclude-from=bare/relative", input),
-            listOf("toybox", "grep", "-f=$patterns", input),
+            listOf("grep", "-f=$patterns", input) to "-f=",
+            listOf("grep", "-f=-secret", input) to "-f=-secret",
+            listOf("grep", "hello", "--exclude-from", "-secret", input) to "-secret",
+            listOf("grep", "--exclude-from=-secret", input) to "--exclude-from=-secret",
+            listOf("grep", "--exclude-from=bare/relative", input) to "--exclude-from=",
+            listOf("toybox", "grep", "-f=$patterns", input) to "-f=",
         )
     }
 
     @Test fun rootRunner_zeroSpawnOnStageC() {
         val (scope, outside) = dashScope()
         try {
-            for (argv in stageCVectors(scope)) {
+            for ((argv, firstDanger) in stageCVectors(scope)) {
                 val spawn = SpawnCounter()
                 val runner = makeRoot(scope, spawn)
                 val result = runner.runBinary(ElevatedRequest(argv, "STAGEC-TEST"), 5_000L)
@@ -224,6 +246,10 @@ class ElevatedDashScopeTest {
                 assertTrue(
                     "message must stay in relative-path family, got ${denied.message}",
                     denied.message.contains("relative path denied"),
+                )
+                assertTrue(
+                    "rejection must come from first dangerous slot $firstDanger, got ${denied.message}",
+                    denied.message.contains(firstDanger),
                 )
                 assertEquals("spawn must be zero for $argv", 0, spawn.calls)
             }
@@ -236,7 +262,7 @@ class ElevatedDashScopeTest {
     @Test fun shizukuRunner_zeroSpawnOnStageC() {
         val (scope, outside) = dashScope()
         try {
-            for (argv in stageCVectors(scope)) {
+            for ((argv, firstDanger) in stageCVectors(scope)) {
                 val spawn = SpawnCounter()
                 val runner = makeShizuku(scope, spawn)
                 val result = runner.runBinary(ElevatedRequest(argv, "STAGEC-TEST"), 5_000L)
@@ -246,6 +272,10 @@ class ElevatedDashScopeTest {
                 assertTrue(
                     "message must stay in relative-path family, got ${denied.message}",
                     denied.message.contains("relative path denied"),
+                )
+                assertTrue(
+                    "rejection must come from first dangerous slot $firstDanger, got ${denied.message}",
+                    denied.message.contains(firstDanger),
                 )
                 assertEquals("spawn must be zero for $argv", 0, spawn.calls)
             }
@@ -277,19 +307,19 @@ class ElevatedDashScopeTest {
         return Triple(scope, outside, subtree.absolutePath)
     }
 
-    private fun traversalVectors(subtreeAbs: String): List<List<String>> = listOf(
-        listOf("grep", "-R", "TOKEN", subtreeAbs),
-        listOf("grep", "--dereference-recursive", "TOKEN", subtreeAbs),
-        listOf("find", "-L", subtreeAbs, "-name", "hidden.txt"),
-        listOf("find", subtreeAbs, "-follow", "-name", "hidden.txt"),
-        listOf("du", "-L", "-a", subtreeAbs),
-        listOf("ls", "-L", subtreeAbs),
+    private fun traversalVectors(subtreeAbs: String): List<Pair<List<String>, String>> = listOf(
+        listOf("grep", "-R", "TOKEN", subtreeAbs) to "-R",
+        listOf("grep", "--dereference-recursive", "TOKEN", subtreeAbs) to "--dereference-recursive",
+        listOf("find", "-L", subtreeAbs, "-name", "hidden.txt") to "-L",
+        listOf("find", subtreeAbs, "-follow", "-name", "hidden.txt") to "-follow",
+        listOf("du", "-L", "-a", subtreeAbs) to "-L",
+        listOf("ls", "-L", subtreeAbs) to "-L",
     )
 
     @Test fun rootRunner_zeroSpawnOnTraversal() {
         val (scope, outside, subtreeAbs) = traversalScope()
         try {
-            for (argv in traversalVectors(subtreeAbs)) {
+            for ((argv, firstDanger) in traversalVectors(subtreeAbs)) {
                 val spawn = SpawnCounter()
                 val runner = makeRoot(scope, spawn)
                 val result = runner.runBinary(ElevatedRequest(argv, "TRAV-TEST"), 5_000L)
@@ -299,6 +329,10 @@ class ElevatedDashScopeTest {
                 assertTrue(
                     "message must stay in traversal family, got ${denied.message}",
                     denied.message.contains("traversal flag denied"),
+                )
+                assertTrue(
+                    "rejection must come from first dangerous slot $firstDanger, got ${denied.message}",
+                    denied.message.contains(firstDanger),
                 )
                 assertEquals("spawn must be zero for $argv", 0, spawn.calls)
             }
@@ -311,7 +345,7 @@ class ElevatedDashScopeTest {
     @Test fun shizukuRunner_zeroSpawnOnTraversal() {
         val (scope, outside, subtreeAbs) = traversalScope()
         try {
-            for (argv in traversalVectors(subtreeAbs)) {
+            for ((argv, firstDanger) in traversalVectors(subtreeAbs)) {
                 val spawn = SpawnCounter()
                 val runner = makeShizuku(scope, spawn)
                 val result = runner.runBinary(ElevatedRequest(argv, "TRAV-TEST"), 5_000L)
@@ -321,6 +355,10 @@ class ElevatedDashScopeTest {
                 assertTrue(
                     "message must stay in traversal family, got ${denied.message}",
                     denied.message.contains("traversal flag denied"),
+                )
+                assertTrue(
+                    "rejection must come from first dangerous slot $firstDanger, got ${denied.message}",
+                    denied.message.contains(firstDanger),
                 )
                 assertEquals("spawn must be zero for $argv", 0, spawn.calls)
             }

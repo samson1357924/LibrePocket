@@ -6,6 +6,9 @@ import java.util.ArrayDeque
 import java.util.Collections
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * 子進程跑道抽象：預設走真實 [ProcessBuilder]，單測可注入假實現，
@@ -71,6 +74,11 @@ data class RawOutput(
  * - P2-2：gobbler [Gobbler.finished]/[Gobbler.failed]/[Gobbler.truncated] 單調旗＋
  *   [Gobbler.read] join 超界 `joinIncomplete`；[RawOutput.readFailed]/[RawOutput.outputIncomplete]
  *   帶出，would-be Ok 不偽造完整（見 [RawOutput] 與 `executeFrozen` 映射）。
+ * - Stage 3（P2-2 cap）：雙 gobbler 啟動前 [GobblerAdmission] reserve-before-start
+ *   （飽和即零 thread、[RawOutput.readFailed]=true，`executeFrozen` 映 `Failed`，
+ *   永不偽造 Ok）；permit 持至 thread 實際退出才釋放（[Gobbler.run] finally，
+ *   殘留讀者續持、可觀測峰值見 [GobblerAdmission.peak]）；雙流 join 共享單一
+ *   [GOBBLER_JOIN_MS] budget（非 2× 順序），縮短最壞 permit 持有。
  *
  * 殘餘：`destroyForcibly` 後仍不可殺（D-state／核心拒殺）即殘留活子進程（verdict 已為
  * Failed，非健康 Ok；本機無提權通道式 quarantine 閂，後續 spawn 不自動封鎖）。
@@ -85,6 +93,9 @@ class DefaultProcessRunner(val dirRoot: String? = null) : ProcessRunner {
 
         /** `destroyForcibly` 後有界 reap（殭屍收割；早死即早回，非固定等待）。 */
         const val REAP_JOIN_MS: Long = 5_000L
+
+        /** gobbler 線程唯一序號（`shell-gobbler-<seq>` 命名，診斷可區分 2N 殘留歸屬）。 */
+        private val gobblerSeq = AtomicLong(0L)
     }
 
     /**
@@ -130,8 +141,21 @@ class DefaultProcessRunner(val dirRoot: String? = null) : ProcessRunner {
                 throw IllegalStateException("injected gobbler-start failure (Phase O test seam)")
             }
             // 任一啟動抛即進 finally（已啟的 gobbler 經關流＋kill 收斂，daemon 不殘留 verdict）。
-            val outReader = streamGobbler(process.inputStream)
-            val errReader = streamGobbler(process.errorStream)
+            // Stage 3（P2-2 cap）：准入 reserve-before-start，fail-closed——飽和
+            // （殘留讀者佔滿 [GobblerAdmission]，典型為 fork-but-no-exec 子孫握 pipe
+            // 寫端致 EOF 延遲）即零 thread，直接回 [RawOutput.readFailed]=true
+            // （上層映 `Failed`，永不偽造 Ok）。已啟的對端 gobbler（如有）經 finally
+            // 關流＋kill 收斂（殘留與否皆有界，permit 持至其 thread 實際退出）。
+            val outReader = try {
+                streamGobbler(process.inputStream)
+            } catch (_: GobblerSaturatedException) {
+                return RawOutput(ByteArray(0), ByteArray(0), -1, false, readFailed = true)
+            }
+            val errReader = try {
+                streamGobbler(process.errorStream)
+            } catch (_: GobblerSaturatedException) {
+                return RawOutput(ByteArray(0), ByteArray(0), -1, false, readFailed = true)
+            }
             // Phase O：timeoutMs 負值經 coerceAtLeast(0L) 即時超時（waitFor(0) 未早死即 TimedOut；直調 runner 者同語義，不抛）。
             try {
                 finished = process.waitFor(timeoutMs.coerceAtLeast(0L), TimeUnit.MILLISECONDS)
@@ -145,8 +169,12 @@ class DefaultProcessRunner(val dirRoot: String? = null) : ProcessRunner {
                     throw IllegalStateException("process still alive after bounded kill+reap")
                 }
             }
-            val out = outReader.read()
-            val err = errReader.read()
+            // Stage 3 共享 tail budget：舊 2× [GOBBLER_JOIN_MS] 順序 join 最壞持有
+            // permit 10s；現雙流共享單一 budget（次流取剩餘，可為 0 即即時快照），
+            // 最壞持有 ≈5s＋調度，縮短殘留窗口（仍有界，超界即 joinIncomplete 誠實帶出）。
+            val joinDeadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(GOBBLER_JOIN_MS)
+            val out = outReader.read(remainingJoinMs(joinDeadlineNanos))
+            val err = errReader.read(remainingJoinMs(joinDeadlineNanos))
             val exit = if (finished) {
                 try {
                     process.exitValue()
@@ -168,10 +196,15 @@ class DefaultProcessRunner(val dirRoot: String? = null) : ProcessRunner {
         } finally {
             // owner 清理：全關流＋監督 kill+reap（best-effort 吞；中斷快照清除後恢復，
             // finally 內 waitFor 不因預置中斷即抛而跳過 destroyForcibly）。
+            // 誠實注記：關讀端並不喚醒 Linux 上已阻塞於 FileInputStream.read() 的
+            // gobbler（fd 在核心內保持開啟直至讀者返回，close 只對已 EOF／空閒者
+            // 有效）；阻塞讀者只隨真 EOF 收斂（全部寫端關閉），子孫握寫端即殘留，
+            // 由 [GobblerAdmission] 封頂（見該對象 KDoc 洩漏源推導）。
             val wasInterrupted = Thread.interrupted()
             try {
                 runCatching { process.outputStream.close() }
-                // 關雙讀端以喚醒仍阻塞於 read 的 gobbler（正常 EOF 路徑已關，此處冪等）。
+                // 關雙讀端（best-effort：僅已 EOF／空閒 gobbler 有效；in-flight pipe
+                // read 喚不醒，見上注記；正常 EOF 路徑已關，此處冪等）。
                 runCatching { process.inputStream.close() }
                 runCatching { process.errorStream.close() }
                 killAndReap(process)
@@ -189,9 +222,21 @@ class DefaultProcessRunner(val dirRoot: String? = null) : ProcessRunner {
         }
 
     /**
+     * 共享 gobbler tail budget 剩餘（[Gobbler.read] 用；耗盡即 0，不負值）。
+     */
+    private fun remainingJoinMs(deadlineNanos: Long): Long =
+        ((deadlineNanos - System.nanoTime()) / 1_000_000L).coerceAtLeast(0L)
+
+    /**
      * 監督 kill+reap（best-effort，不抛；中斷恢復旗標，呼叫方 finally 另做快照恢復）：
      * 已死即返；先 `destroy`＋[DESTROY_GRACE_MS] grace，仍存活即 `destroyForcibly`＋
      * [REAP_JOIN_MS] 有界 reap（早死早回）。
+     *
+     * Parent-only（direct 通道無 killTree——有意為之，非遺漏）：只信號直接子進程
+     * handle；`fork`-but-no-`exec` 子孫繼承的 pipe 寫端不受影響而存活（direct  spawn
+     * 為裸 argv、無 setsid 包裝，process-group kill 可能誤傷同組無關進程，故不用）。
+     * 存活子孫握寫端即 EOF 延遲 → gobbler 殘留（關讀端喚不醒，已在 finally 注記），
+     * 洩漏源由 [GobblerAdmission] 封頂，verdict 誠實性由 `outputIncomplete` 承載。
      */
     private fun killAndReap(process: Process) {
         if (!isAlive(process)) return
@@ -218,28 +263,57 @@ class DefaultProcessRunner(val dirRoot: String? = null) : ProcessRunner {
         }
     }
 
+    /**
+     * Stage 3 准入 gobbler（reserve-before-start，fail-closed；提權 verifier-cap 同式，
+     * 見 [GobblerAdmission]）：先 [GobblerAdmission.tryEnter]，飽和即抛
+     * [GobblerSaturatedException]（零 thread 啟動；`run` 側映 [RawOutput.readFailed]，
+     * 永不偽造 Ok）。permit 持至 thread 實際退出（[Gobbler.run] finally 釋放，
+     * [DirectAdmission.release] 同式）；起線程抛則 worker finally 永不執行，由此處
+     * [Gobbler.dropAdmissionForStartFailure] 補釋（CAS 保 exactly-once）。
+     * 線程唯一命名 `shell-gobbler-<seq>`（診斷可數、可歸因）。
+     */
     private fun streamGobbler(stream: java.io.InputStream): Gobbler {
+        if (!GobblerAdmission.tryEnter()) throw GobblerSaturatedException()
         val gobbler = Gobbler(stream)
-        val thread = Thread(gobbler, "shell-gobbler")
+        val thread = Thread(gobbler, "shell-gobbler-${gobblerSeq.incrementAndGet()}")
         thread.isDaemon = true
-        thread.start()
+        gobbler.claimAdmission()
+        try {
+            thread.start()
+        } catch (t: Throwable) {
+            // 起線程失敗：worker finally 永不執行，由 caller 補釋（fail-closed）。
+            gobbler.dropAdmissionForStartFailure()
+            throw t
+        }
         gobbler.thread = thread
         return gobbler
     }
 
     /**
-     * Phase O gobbler（P2-1 drain-and-discard＋P2-2 單調旗）：
+     * Phase O gobbler（P2-1 drain-and-discard＋P2-2 單調旗；Stage 3 准入持有）：
      * - 到 [ShellPolicy.HARD_READ_CAP_BYTES] 後不 break／不關流，續讀丟棄至 EOF
      *   （[truncated] 單調標溢出；提前關讀端會致寫端 EPIPE/SIGPIPE，把 exit 0 改寫為
      *   141，見 P2-1）。
      * - [finished] 僅真 EOF（`read` 回 -1）置位；`read` 抛即 [failed] 單調置位後 break
      *   （killer 關流的預期中斷亦標 true，由呼叫方按 `finished`/超時區分語義）。
-     * - [read] 有界 join（[GOBBLER_JOIN_MS]；中斷恢復不吞），回 [GobblerRead] 快照：
+     * - [read] 有界 join（預設 [GOBBLER_JOIN_MS]；中斷恢復不吞，回 [GobblerRead] 快照）：
      *   join 超界仍存活即 [GobblerRead.joinIncomplete]=true（部分讀，呼叫方禁回完整 Ok）。
+     *   中斷語義（誠實注記）：`join` 被中斷即提前抛、中斷旗恢復後直接按當刻存活快照
+     *   返回（不重等剩餘 budget；任一返回路徑耗時恆 ≤ 傳入 budget＋調度，有界）。
+     * - 洩漏語義（誠實注記）：父 exit0 但子孫握 pipe 寫端時，owner 關讀端喚不醒已
+     *   阻塞於 `FileInputStream.read()` 的本 thread（Linux 語義，見 `run` finally）；
+     *   本 thread 滯留至真 EOF（子孫死／寫端關）或 JVM 退出（daemon），期間續持
+     *   [GobblerAdmission] permit（本 `run` finally 釋放，exactly-once），殘留總量由
+     *   [GobblerAdmission.MAX_GOBBLERS] 封頂。
+     * - 直接 `g.run()` 單測（未經 [streamGobbler]、未 [claimAdmission]）不持有
+     *   permit，finally 不釋放（[releaseAdmissionOnce] CAS 保衛，不污染全域計數）。
      */
     internal class Gobbler(private val stream: java.io.InputStream) : Runnable {
         @Volatile var thread: Thread? = null
         private val sink = ByteArrayOutputStream()
+
+        /** 准入持有（僅 [streamGobbler] 准入成功後置位；finally／start-failure 二路徑 CAS exactly-once 釋放）。 */
+        private val admissionHeld = AtomicBoolean(false)
 
         /** 單調：真 EOF，已全量排空。 */
         @Volatile var finished: Boolean = false
@@ -252,6 +326,23 @@ class DefaultProcessRunner(val dirRoot: String? = null) : ProcessRunner {
         /** 單調：硬上限丟棄過（drain-and-discard 續讀，絕不靜默短讀不標）。 */
         @Volatile var truncated: Boolean = false
             private set
+
+        /** owner 准入成功後調用（permit 與本 gobbler 生命週期綁定，持至 thread 實際退出）。 */
+        internal fun claimAdmission() {
+            admissionHeld.set(true)
+        }
+
+        /**
+         * 起線程失敗回滾（owner 路徑；worker finally 永不執行）。
+         * 與 finally 內 [releaseAdmissionOnce] 同一 CAS，exactly-once。
+         */
+        internal fun dropAdmissionForStartFailure() {
+            releaseAdmissionOnce()
+        }
+
+        private fun releaseAdmissionOnce() {
+            if (admissionHeld.compareAndSet(true, false)) GobblerAdmission.release()
+        }
 
         override fun run() {
             val buf = ByteArray(8192)
@@ -286,14 +377,30 @@ class DefaultProcessRunner(val dirRoot: String? = null) : ProcessRunner {
                     stream.close()
                 } catch (_: Exception) {
                 }
+                // Stage 3：permit 持至 thread 實際退出（殘留讀者續持，cap 封頂；見類 KDoc）。
+                releaseAdmissionOnce()
             }
         }
 
-        fun read(): GobblerRead {
-            try {
-                thread?.join(GOBBLER_JOIN_MS)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
+        /**
+         * 有界讀快照（預設完整 [GOBBLER_JOIN_MS] budget；`run` 側以共享剩餘傳入）。
+         * 見 [read].
+         */
+        fun read(): GobblerRead = read(GOBBLER_JOIN_MS)
+
+        /**
+         * 有界讀快照（[timeoutMs] 上界；≤0 即不等待、直接快照當刻存活）。
+         * 注意：`Thread.join(0)` 語義為無限等待，故耗盡 budget 時必須跳過 join
+         * （不可透傳 0）。中斷即恢復旗標並按當刻存活返回（不重等，恆有界）；
+         * 見類 KDoc 中斷語義。
+         */
+        fun read(timeoutMs: Long): GobblerRead {
+            if (timeoutMs > 0L) {
+                try {
+                    thread?.join(timeoutMs)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
             }
             val alive = thread?.isAlive == true
             synchronized(sink) {
@@ -345,6 +452,88 @@ class ShellQuota(
         marks.clear()
     }
 }
+
+/**
+ * Gobbler 准入（Round-5 Stage 3 P2-2，main 源集本地實現；[DirectAdmission] 姊妹對象）：
+ *
+ * 推導（固定小池之原子 reservation，提權 verifier-cap 同式）：
+ * - 問題：每 `run` 起 2 條無名 `shell-gobbler` daemon、無准入無計數；父 exit0 但
+ *   `fork`-but-no-`exec` 子孫握 pipe 寫端時，owner 關讀端喚不醒已阻塞於
+ *   `FileInputStream.read()` 的讀者（Linux 語義）→ 讀者滯留至子孫死；N 次請求即
+ *   2N daemon（各持 ≤512K sink＋棧），無峰值可觀測（Phase P 只採 `direct-*`）。
+ * - 不用「關流＋kill 即收斂」假設：已實證關讀端不中斷 in-flight pipe read
+ *   （見 `DefaultProcessRunner.run` finally 注記），收斂唯一依賴真 EOF，故必須
+ *   以數量上界兜底，而非以清理語義兜底。
+ * - 不用「池化复用」：gobbler 生命週期與單次 `run` 的雙流綁定（drain-and-discard
+ *   狀態機不可跨 run 复用），池化省不掉 thread 數、徒增狀態污染面；reservation
+ *   誠實（alive 即持 permit，idle 即零 thread），與 [DirectAdmission] 同哲學。
+ * - 原子 reservation＋殘留持 permit 至 thread 實際退出：[permits] 同時是併發上限
+ *   與 alive 上限（每活 gobbler 恰持一 permit，[Gobbler.run] `finally` 才釋放；
+ *   caller 永不持 permit，entry 不預佔）；飽和即 [tryEnter] 失敗→`run` 側零
+ *   thread、[RawOutput.readFailed]=true（fail-closed，不排隊：排隊即把 `run` 卡成
+ *   隱性等待，與 gobbler join budget 疊加掩蓋飽和）。
+ *
+ * 常數 `MAX_GOBBLERS = 8` 推導：
+ * - 下界：direct 側 [DirectAdmission.MAX_WORKERS]=3 允 3 併發 worker，每 worker 至多
+ *   1 在飛 `run`（process 段監督內），每 `run` 2 gobbler → 穩態上限 6；取 8 留 2 槽
+ *   餘量，容 teardown 交疊（舊 run 殘留未釋、新 run 已啟）下偶發飽和誤拒。
+ * - 上界：每殘留持一 sink（≤512K，見 [ShellPolicy.HARD_READ_CAP_BYTES]）＋一 thread，
+ *   8 份 ≈4M＋8 棧，有界小常數；fail-closed 方向（飽和拒讀不偽造 Ok），可用性損失
+ *   只發生在殘留壓力下（洩漏源本身，非誤傷）。
+ * - 與直接／提權正交：本池只計 gobbler thread（`shell-gobbler-*`），永不碰
+ *   [DirectAdmission]／提權槽；gobbler 飽和只擋 pipe 排空（映 `Failed`），不影響
+ *   監督 worker 准入（反之亦然）。
+ *
+ * 計數器（單測／診斷用，[DirectAdmission.availablePermits] 同式）：
+ * - [current]：當前持 permit 數（== 活 gobbler 數，含殘留）；
+ * - [peak]：歷峰（[resetPeak] 可回錨至當前值做測試隔離）；
+ * - [availablePermits]：剩餘 permits（近似值）。
+ */
+internal object GobblerAdmission {
+    /** 併發／殘留 gobbler 上界（見上推導；存活 `shell-gobbler-*` 總數恆 ≤ 本值）。 */
+    const val MAX_GOBBLERS: Int = 8
+
+    private val permits = Semaphore(MAX_GOBBLERS)
+    private val inFlight = AtomicInteger(0)
+    private val peakInFlight = AtomicInteger(0)
+
+    /** 非阻塞准入：成功即持一 permit（由 [Gobbler.run] `finally` 釋放，caller 不持）。 */
+    fun tryEnter(): Boolean {
+        if (!permits.tryAcquire()) return false
+        val c = inFlight.incrementAndGet()
+        peakInFlight.updateAndGet { prev -> maxOf(prev, c) }
+        return true
+    }
+
+    /** 退出釋放（僅 [Gobbler] finally／起線程失敗回滾調用；CAS 保 exactly-once）。 */
+    fun release() {
+        inFlight.decrementAndGet()
+        permits.release()
+    }
+
+    /** 剩餘 permits（僅單測斷言有界用；近似值）。 */
+    internal fun availablePermits(): Int = permits.availablePermits()
+
+    /** 當前持 permit 數（== 活 gobbler 數，含殘留）。 */
+    internal fun current(): Int = inFlight.get()
+
+    /** 歷峰（單測斷言峰值有界用；[resetPeak] 回錨做隔離）。 */
+    internal fun peak(): Int = peakInFlight.get()
+
+    /** 峰值回錨至當前值（測試隔離用）。 */
+    internal fun resetPeak() {
+        peakInFlight.set(inFlight.get())
+    }
+}
+
+/**
+ * Gobbler 准入飽和（Stage 3 P2-2）：`DefaultProcessRunner.streamGobbler`
+ * reserve-before-start 失敗即抛（零 thread 啟動）；`run` 側捕獲後回
+ * [RawOutput.readFailed]=true（`executeFrozen` 映 `Failed("direct IO read failed…")`，
+ * 與既有 P2-2 映射一致，永不回完整 Ok）。
+ */
+internal class GobblerSaturatedException :
+    IllegalStateException("shell gobbler admission saturated (fail-closed, no thread started)")
 
 /**
  * 直接通道跨呼叫准入（Round-5 Phase P P1-2，main 源集本地實現）：

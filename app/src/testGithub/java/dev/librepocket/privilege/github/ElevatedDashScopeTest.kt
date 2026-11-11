@@ -254,4 +254,79 @@ class ElevatedDashScopeTest {
             outside.deleteRecursively()
         }
     }
+
+    /**
+     * Stage D（P1-2 recursive symlink-follow）提權跑道層迴歸：
+     * `grep -R`／`grep --dereference-recursive`／`find -L`／`find -follow`／
+     * `du -L`／`ls -L` 經 Root／Shizuku 必須 `Denied(BLACKLISTED)` 且零 spawn
+     *（validate 先於 grant／activation／橋門／su 解析／spawn，見兩 runner
+     * `runBinary` 順序；訊息走 traversal 家族，與主源集
+     * `ShellTraversalTest.directRunner_zeroSpawnOnTraversal` 同門）。
+     *
+     * fixture 與主源集同形：scope/subtree 內 `escape -> outside` dir symlink。
+     */
+    private fun traversalScope(): Triple<File, File, String> {
+        val osName: String = System.getProperty("os.name") ?: ""
+        assumeTrue(!osName.startsWith("Windows"))
+        val scope = tempDir("trav-elev-scope")
+        val outside = tempDir("trav-elev-outside")
+        File(outside, "hidden.txt").writeText("OUTSIDE_MARK_xyz\n")
+        val subtree = File(scope, "subtree").apply { mkdirs() }
+        File(subtree, "inside.txt").writeText("INSIDE_MARK_abc\n")
+        Files.createSymbolicLink(File(subtree, "escape").toPath(), outside.toPath())
+        return Triple(scope, outside, subtree.absolutePath)
+    }
+
+    private fun traversalVectors(subtreeAbs: String): List<List<String>> = listOf(
+        listOf("grep", "-R", "TOKEN", subtreeAbs),
+        listOf("grep", "--dereference-recursive", "TOKEN", subtreeAbs),
+        listOf("find", "-L", subtreeAbs, "-name", "hidden.txt"),
+        listOf("find", subtreeAbs, "-follow", "-name", "hidden.txt"),
+        listOf("du", "-L", "-a", subtreeAbs),
+        listOf("ls", "-L", subtreeAbs),
+    )
+
+    @Test fun rootRunner_zeroSpawnOnTraversal() {
+        val (scope, outside, subtreeAbs) = traversalScope()
+        try {
+            for (argv in traversalVectors(subtreeAbs)) {
+                val spawn = SpawnCounter()
+                val runner = makeRoot(scope, spawn)
+                val result = runner.runBinary(ElevatedRequest(argv, "TRAV-TEST"), 5_000L)
+                assertTrue("expected Denied for $argv, got $result", result is ElevatedBinaryResult.Denied)
+                val denied = result as ElevatedBinaryResult.Denied
+                assertEquals(ShellDeny.BLACKLISTED, denied.reason)
+                assertTrue(
+                    "message must stay in traversal family, got ${denied.message}",
+                    denied.message.contains("traversal flag denied"),
+                )
+                assertEquals("spawn must be zero for $argv", 0, spawn.calls)
+            }
+        } finally {
+            scope.deleteRecursively()
+            outside.deleteRecursively()
+        }
+    }
+
+    @Test fun shizukuRunner_zeroSpawnOnTraversal() {
+        val (scope, outside, subtreeAbs) = traversalScope()
+        try {
+            for (argv in traversalVectors(subtreeAbs)) {
+                val spawn = SpawnCounter()
+                val runner = makeShizuku(scope, spawn)
+                val result = runner.runBinary(ElevatedRequest(argv, "TRAV-TEST"), 5_000L)
+                assertTrue("expected Denied for $argv, got $result", result is ElevatedBinaryResult.Denied)
+                val denied = result as ElevatedBinaryResult.Denied
+                assertEquals(ShellDeny.BLACKLISTED, denied.reason)
+                assertTrue(
+                    "message must stay in traversal family, got ${denied.message}",
+                    denied.message.contains("traversal flag denied"),
+                )
+                assertEquals("spawn must be zero for $argv", 0, spawn.calls)
+            }
+        } finally {
+            scope.deleteRecursively()
+            outside.deleteRecursively()
+        }
+    }
 }

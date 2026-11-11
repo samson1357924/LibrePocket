@@ -385,6 +385,91 @@ object ShellPolicy {
         arg == "-r" || arg == "-R" || arg == "--recursive" ||
             (arg.startsWith("-") && !arg.startsWith("--") && 'r' in arg.drop(1) && !arg.contains('='))
 
+    /**
+     * Stage D（P1-2 recursive symlink-follow）：guest 容器內豁免判定。
+     *
+     * `isGuest && privateRoot != null` 時 traversal 仍在容器命名空間內
+     * （`proot -r rootfs` 無 bind 約束，宿主樹外絕對另由 [isContainerInternalPath]
+     * 短路；宿主 symlink 語義不適用容器命名空間，邊界由 `proot -r`＋執行入口
+     * host 樹封堵＋同容器鎖覆蓋）。與既有 dash／bare 放行同設計
+     * （見 [checkPathArgs] Guest 通道抉擇）；guest＋null 仍 fail-closed。
+     */
+    private fun isGuestTraversalExempt(isGuest: Boolean, privateRoot: String?): Boolean =
+        isGuest && privateRoot != null
+
+    /**
+     * Stage D（P1-2）：symlink-follow 旗標形態判定（純形態，不判位置）。
+     *
+     * 位置由呼叫方 [checkPathArgs] 判定（grep 僅選項位、find/du/ls 全位置
+     * fail-closed，見該函數）；guest 豁免亦由呼叫方先判，此處只判形態。
+     * 大小寫敏感（`R`/`L` 大寫才跟隨，`-r`/`-l` 不跟隨）：
+     * - grep：`-R`（含 `-rR`/`-iR` 類單橫組合，`R` 即跟隨）與
+     *   `--dereference-recursive`（含 `=value` 附著形）；小寫 `-r`／`--recursive`
+     *   不跟隨，維持放行。`-eX` 附著（`X` 為 pattern，`ROOT` 含 `R` 不得誤殺）與
+     *   `-fX` 附著（Stage A/C 已由相對路徑門拒，見 [checkPathArgs] 附著分支，
+     *   此處跳過以保留相對訊息）一律跳過；`--regexp=`／`--file=` 等長 `=` 值
+     *   非單橫故天然跳過。`-reROOT` 類中段 `-e` 附著（非 `-e` 起頭）刻意不展
+     *   開，fail-closed 誤殺（罕見寫法，安全優先）。
+     * - find：`-L` 與 `-follow`（BusyBox  legacy；另覆 `--follow`／`=value`
+     *   附著形，fail-closed）；單橫組合含大寫 `L`（如 `-HL`）即拒。合法謂詞
+     *   `-lname`／`-ilname`／`-links`／`-perm` 皆小寫 `l`，不受影響（大小寫敏感）。
+     *   `-H`（僅跟隨命令列參數，操作數已由實體門拒 symlink）與 `-P`（預設不跟隨）
+     *   維持放行。
+     * - du：`-L`／`--dereference`（含 `=value` 附著形與 `--dereference*`
+     *   非 `-args` 前綴，fail-closed）；單橫組合含 `L` 即拒。`-D`／
+     *   `--dereference-args` 僅跟隨命令列參數：操作數 symlink 已由
+     *   [checkPhysicalOperandGate] 拒（`LINK` 即拒），跟隨命令列即無新增逃逸；
+     *   域內真目錄＋`-D` 不跟隨 interior，故维持放行（見下抉擇表）。
+     * - ls：`-L`／`--dereference*`（含 `=value` 附著形）；單橫組合含 `L` 即拒。
+     *   `-R` 單獨維持放行（僅列名，不讀目標內容；`-R`＋`-L` 同現時 `L` 門已拒）。
+     *
+     * 決策表（host 通道；guest＋scope 一律豁免，見上）：
+     * | binary | flag | verdict | rationale |
+     * | grep `-R`／`--dereference-recursive`／含 `R` 單橫 | DENY | 跟隨 interior symlink 讀域外 |
+     * | grep `-r`／`--recursive` | ALLOW | 不跟隨 |
+     * | find `-L`／`-follow`／含 `L` 單橫 | DENY | 跟隨 interior（含 `-follow`） |
+     * | find `-H`／`-P` | ALLOW | `-H` 僅命令列（操作數門已拒 symlink），`-P` 不跟隨 |
+     * | du `-L`／`--dereference`／含 `L` 單橫 | DENY | 跟隨 interior |
+     * | du `-D`／`--dereference-args` | ALLOW | 僅命令列（操作數門已拒 symlink），不跟隨 interior |
+     * | ls `-L`／`--dereference*`／含 `L` 單橫 | DENY | 跟隨（`ls -L` 讀目標 stat／內容） |
+     * | ls `-R` 單獨 | ALLOW | 僅列名，不讀目標內容 |
+     *
+     * 長期受控 traversal（工作區無 symlink 不變量／遞迴白名單）超出本次有界切片，
+     * 見 [checkPhysicalOperandGate] 遞迴後代揭露 follow-up。
+     */
+    private fun isFollowFlag(base: String, arg: String): Boolean {
+        when (base) {
+            "grep" -> {
+                if (arg == "--dereference-recursive") return true
+                if (arg.startsWith("--dereference-recursive=")) return true
+                if (arg.startsWith("-") && !arg.startsWith("--") && arg != "-" && 'R' in arg) {
+                    if (arg.startsWith("-e") && arg.length > 2) return false
+                    if (arg.startsWith("-f") && arg.length > 2) return false
+                    return true
+                }
+                return false
+            }
+            "find" -> {
+                if (arg == "-L" || arg == "-follow") return true
+                if (arg == "--follow") return true
+                if (arg.startsWith("-follow=") || arg.startsWith("--follow=")) return true
+                if (arg.startsWith("-") && !arg.startsWith("--") && arg != "-" && 'L' in arg) return true
+                return false
+            }
+            "du" -> {
+                if (arg.startsWith("--dereference") && !arg.startsWith("--dereference-args")) return true
+                if (arg.startsWith("-") && !arg.startsWith("--") && arg != "-" && 'L' in arg) return true
+                return false
+            }
+            "ls" -> {
+                if (arg.startsWith("--dereference")) return true
+                if (arg.startsWith("-") && !arg.startsWith("--") && arg != "-" && 'L' in arg) return true
+                return false
+            }
+            else -> return false
+        }
+    }
+
     /** 純值形態保留（文件用）：數字/布林/stdin/格式/glob 僅在值槽
      *（VALUE_TAKING_FLAGS 下一位 / grep pattern 槽 / NON_PATH_OPT_KEYS）
      * 才豁免；FILE_OPERAND 普通 positional 不得以形態豁免（見上）。 */
@@ -1038,6 +1123,23 @@ object ShellPolicy {
                     "bind forbidden inside guest argv",
                 )
             }
+            // Stage D（P1-2）：find/du/ls symlink-follow 全位置 fail-closed。
+            // find `-L`/`-follow`（全局，可出現在路徑前後）、du `-L`/
+            // `--dereference`、ls `-L`/`--dereference` 在 spawn 後跟隨 interior
+            // symlink 讀域外，而操作數門只驗 CLI 操作數本鏈（見
+            // [checkPhysicalOperandGate] 遞迴後代揭露），故必須拒旗標本身。
+            // 全位置（選項位／值槽／`--` 後皆拒，fail-closed，僅 guest 容器內
+            // 豁免，見 [isGuestTraversalExempt]）；`--` 後短橫在宿主本就由短橫門
+            // 拒，訊息以 traversal 為準不影響 verdict 家族（同 BLACKLISTED）。
+            if (!isGuestTraversalExempt(isGuest, privateRoot) &&
+                (base == "find" || base == "du" || base == "ls") &&
+                isFollowFlag(base, arg)
+            ) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "traversal flag denied (fail-closed, symlink-follow): $arg",
+                )
+            }
             for (candidate in absoluteCandidates(arg)) {
                 // F1：原始操作數含 `..` 段即 fail-closed 拒絕（不先做詞法 normalize
                 // 折疊；拒絕訊息帶原因碼 DOTDOT）。spawn 用原始操作數，故驗側嚴於
@@ -1119,6 +1221,26 @@ object ShellPolicy {
                 grepPatternSeen = true
                 prevArg = arg
                 continue
+            }
+            // Stage D（P1-2）：grep symlink-follow 僅選項位 fail-closed。
+            // `-R`（含 `-rR`/`-iR` 類單橫組合）與 `--dereference-recursive`
+            // 跟隨 interior dir symlink 讀域外（PoC：scope/subtree 內 `escape`
+            // → outside，`grep -R TOKEN /scope/subtree` 印 outside/hidden.txt）。
+            // 僅選項位（`!endOfOptions && !inFileSlot && prevArg !in
+            // VALUE_TAKING_FLAGS`，`--` 後短橫／`-f` 槽／`-e` 值另由短橫／附著門
+            // 拒，訊息保留相對家族；`grep -- -r` 首位仍是 pattern，已由上槽消費；
+            // `-e -R` 的 `-R` 是 pattern 值（`prevArg == "-e"`），跳過）；
+            // 小寫 `-r`／`--recursive` 不跟隨，維持放行；`-eX` 附著 pattern
+            //（含 `R` 如 `ROOT`）與 `-fX` 附著（另由附著門拒）由 [isFollowFlag]
+            // 內跳過。guest 容器內豁免（見 [isGuestTraversalExempt]）。
+            if (base == "grep" && !isGuestTraversalExempt(isGuest, privateRoot) &&
+                !endOfOptions && !inFileSlot && prevArg !in VALUE_TAKING_FLAGS &&
+                isFollowFlag(base, arg)
+            ) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "traversal flag denied (fail-closed, symlink-follow): $arg",
+                )
             }
             // Stage A 短橫操作數封堵：`--` 後／REQUIRED-FILENAME 槽內的短橫形態
             // （`-` 哨兵除外，見 isDashOperand）即相對檔名，不再放行。
@@ -1433,7 +1555,7 @@ object ShellPolicy {
      *
      * hardlink 揭露：本門不解 hardlink；同 FS 域內 hardlink 指到域外（硬連結
      * 指向域外 inode）在承諾外，不在消除保證內。
-     * 遞迴後代揭露（Refs #9；殘餘列 out-of-scope，不擋跟隨旗標的理由見下）：
+     * 遞迴後代揭露（Refs #9；Stage D 已收斂跟隨旗標，殘餘見下）：
      * 本門只驗操作數本鏈，不驗遞迴走訪的後代（find/du/ls -R、grep -r 在 spawn 後
      * 走訪後代，後代內 interior symlink + 跟隨旗標〈find -L、grep -R（含
      * --dereference-recursive）等，ls/stat/du -L（含 --dereference）等〉可讀域外；
@@ -1442,9 +1564,14 @@ object ShellPolicy {
      * interior link 需併發植入或帶外植入；直接通道 `ln` 不在允許命令內
      * （ALLOWED_BINARIES 無 ln），直接通道模型無法直接建鏈，但 guest 通道
      * python3/tar/unzip 可在容器內建鏈（見 ProotExec KDoc 容器內殘餘）。
-     * 不擋 -L/-R 的理由：擋 grep -R 將誤殺合法遞迴、有可用性成本，已超本次
-     * 有界切片；未來以工作區無 symlink 不變量或遞迴白名單收斂（Refs #9
-     * follow-up）。提權（Root/Shizuku，見 app/src/github）走同一門
+     * Stage D 收斂（P1-2）：跟隨旗標本身已由 [checkPathArgs] fail-closed 拒絕
+     * （grep `-R`／`--dereference-recursive`／含 `R` 單橫、find `-L`／`-follow`／
+     * 含 `L` 單橫、du `-L`／`--dereference`／含 `L` 單橫、ls `-L`／
+     * `--dereference*`／含 `L` 單橫；小寫 `-r`／`--recursive`、find `-H`／`-P`、
+     * du `-D`／`--dereference-args`、ls `-R` 單獨維持放行，見 [isFollowFlag]
+     * 決策表；multicall 有效基同門；guest＋scope 容器內豁免）。長期受控
+     * traversal（工作區無 symlink 不變量／遞迴白名單）仍為 follow-up（Refs #9）。
+     * 提權（Root/Shizuku，見 app/src/github）走同一門
      * （isElevated=true），同殘餘適用，其 Failed 去路徑化等收斂見 Refs #10
      * follow-up（刻意不在本 PR 碰 github source set）。
      * F-NORMWALK：步驟 1 walk 的對象為 [FileScope.normalize] 後鏈，原始 `..`

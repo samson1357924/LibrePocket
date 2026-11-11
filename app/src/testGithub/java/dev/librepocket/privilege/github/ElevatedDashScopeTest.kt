@@ -286,6 +286,77 @@ class ElevatedDashScopeTest {
     }
 
     /**
+     * Stage F（P1-1 getopt 短選項簇）提權跑道層迴歸：
+     * `grep -if=/abs`／`-Eif=/abs`／`-if=-secret`／`-Eif=bare`／
+     * `toybox grep -if=…` 經 Root／Shizuku 必須 `Denied(BLACKLISTED)` 且零 spawn。
+     * 尾參合法絕對（load-bearing：拒絕只能來自危險簇）。
+     */
+    private fun stageFVectors(scope: File): List<Pair<List<String>, String>> {
+        val patterns = File(scope, "patterns").apply { writeText("zzz-no-match\n") }.absolutePath
+        val input = File(scope, "input").apply { writeText("hello world\n") }.absolutePath
+        return listOf(
+            listOf("grep", "-if=$patterns", input) to "-if=",
+            listOf("grep", "-Eif=$patterns", input) to "-Eif=",
+            listOf("grep", "-if=-secret", input) to "-if=-secret",
+            listOf("grep", "-Eif=bare", input) to "-Eif=",
+            listOf("toybox", "grep", "-if=$patterns", input) to "-if=",
+            listOf("toybox", "grep", "-Eif=bare", input) to "-Eif=",
+        )
+    }
+
+    @Test fun rootRunner_zeroSpawnOnStageF() {
+        val (scope, outside) = dashScope()
+        try {
+            for ((argv, firstDanger) in stageFVectors(scope)) {
+                val spawn = SpawnCounter()
+                val runner = makeRoot(scope, spawn)
+                val result = runner.runBinary(ElevatedRequest(argv, "STAGEF-TEST"), 5_000L)
+                assertTrue("expected Denied for $argv, got $result", result is ElevatedBinaryResult.Denied)
+                val denied = result as ElevatedBinaryResult.Denied
+                assertEquals(ShellDeny.BLACKLISTED, denied.reason)
+                assertTrue(
+                    "message must stay in relative-path family, got ${denied.message}",
+                    denied.message.contains("relative path denied"),
+                )
+                assertTrue(
+                    "rejection must come from first dangerous slot $firstDanger, got ${denied.message}",
+                    denied.message.contains(firstDanger),
+                )
+                assertEquals("spawn must be zero for $argv", 0, spawn.calls)
+            }
+        } finally {
+            scope.deleteRecursively()
+            outside.deleteRecursively()
+        }
+    }
+
+    @Test fun shizukuRunner_zeroSpawnOnStageF() {
+        val (scope, outside) = dashScope()
+        try {
+            for ((argv, firstDanger) in stageFVectors(scope)) {
+                val spawn = SpawnCounter()
+                val runner = makeShizuku(scope, spawn)
+                val result = runner.runBinary(ElevatedRequest(argv, "STAGEF-TEST"), 5_000L)
+                assertTrue("expected Denied for $argv, got $result", result is ElevatedBinaryResult.Denied)
+                val denied = result as ElevatedBinaryResult.Denied
+                assertEquals(ShellDeny.BLACKLISTED, denied.reason)
+                assertTrue(
+                    "message must stay in relative-path family, got ${denied.message}",
+                    denied.message.contains("relative path denied"),
+                )
+                assertTrue(
+                    "rejection must come from first dangerous slot $firstDanger, got ${denied.message}",
+                    denied.message.contains(firstDanger),
+                )
+                assertEquals("spawn must be zero for $argv", 0, spawn.calls)
+            }
+        } finally {
+            scope.deleteRecursively()
+            outside.deleteRecursively()
+        }
+    }
+
+    /**
      * Stage D（P1-2 recursive symlink-follow）提權跑道層迴歸：
      * `grep -R`／`grep --dereference-recursive`／`find -L`／`find -follow`／
      * `du -L`／`ls -L` 經 Root／Shizuku 必須 `Denied(BLACKLISTED)` 且零 spawn

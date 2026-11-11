@@ -132,6 +132,82 @@ class ShellTraversalTest {
         }
     }
 
+    @Test fun grepValueFlagBoolean_noBypass_directAndElevated() {
+        // Stage F：`-n`／`-c` 在 grep 是布林（--line-number／--count），不是取值旗標；
+        // `grep -n -R …` 的 `-R` 不得被 `prevArg` 值豁免吞掉，必須仍觸 traversal 門。
+        // （`-d` 在 grep 仍是取值 --directories，維持豁免，不在此列。）
+        val f = traversalFixture("trav-grep-nc")
+        try {
+            val vectors = listOf(
+                listOf("grep", "-n", "-R", "TOKEN", f.subtreeAbs),
+                listOf("grep", "-c", "-R", "TOKEN", f.subtreeAbs),
+                listOf("toybox", "grep", "-n", "-R", "TOKEN", f.subtreeAbs),
+            )
+            for (argv in vectors) {
+                assertBlocked(ShellPolicy.validate(argv, f.scope.absolutePath), argv)
+                assertBlocked(
+                    ShellPolicy.validateElevated(
+                        argv,
+                        f.scope.absolutePath,
+                        flavor = Flavor.GITHUB,
+                        bridgeGranted = true,
+                    ),
+                    argv,
+                )
+            }
+            // 跑道層零 spawn（直接通道）。
+            for (argv in vectors) {
+                val runner = ArgvCaptureRunner()
+                val shell = RestrictedShell(
+                    runner = runner,
+                    privateRoot = f.scope.absolutePath,
+                    execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
+                )
+                val result = shell.execute(argv)
+                assertTrue("expected Denied for $argv, got $result", result is ShellResult.Denied)
+                assertEquals(ShellDeny.BLACKLISTED, (result as ShellResult.Denied).reason)
+                assertTrue(
+                    "message must stay in traversal family for $argv",
+                    (result as ShellResult.Denied).message.contains("traversal flag denied"),
+                )
+                assertEquals("spawn must be zero for $argv", 0, runner.calls)
+            }
+        } finally {
+            f.scope.deleteRecursively()
+            f.outside.deleteRecursively()
+        }
+    }
+
+    @Test fun valueFlagPositives_preserved() {
+        // 無迴歸 pin：grep `-n` 布林＋pattern 槽、`head -n 20`、`stat -c %s` 維持放行。
+        val f = traversalFixture("trav-valpos")
+        try {
+            val vectors = listOf(
+                listOf("grep", "-n", "hello", f.insideAbs),
+                listOf("head", "-n", "20", f.insideAbs),
+                listOf("stat", "-c", "%s", f.insideAbs),
+            )
+            for (argv in vectors) {
+                assertTrue(
+                    "positive must stay allowed, got ${ShellPolicy.validate(argv, f.scope.absolutePath)} for $argv",
+                    ShellPolicy.validate(argv, f.scope.absolutePath) is Validation.Allowed,
+                )
+                assertTrue(
+                    "elevated positive must stay allowed for $argv",
+                    ShellPolicy.validateElevated(
+                        argv,
+                        f.scope.absolutePath,
+                        flavor = Flavor.GITHUB,
+                        bridgeGranted = true,
+                    ) is Validation.Allowed,
+                )
+            }
+        } finally {
+            f.scope.deleteRecursively()
+            f.outside.deleteRecursively()
+        }
+    }
+
     @Test fun findFollowDenied_directAndElevated() {
         val f = traversalFixture("trav-find")
         try {

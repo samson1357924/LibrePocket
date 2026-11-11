@@ -357,6 +357,22 @@ object ShellPolicy {
     )
 
     /**
+     * base 感知取值旗標判定（Stage F：`grep -n`／`grep -c` 布林 bypass 封堵）：
+     * `-n`／`-c` 在 head/tail（計數）／stat（格式）是取值旗標，但 GNU grep
+     * 語義是布林（`--line-number`／`--count`），其下一位不是值而仍是旗標位。
+     * 若沿用 [VALUE_TAKING_FLAGS] 原集合，`grep -n -R` 的 `-R` 會被
+     * `prevArg` 豁免吞掉，跳過簇 `R` 門與 follow 門（Allowed 即真跟隨讀域外）。
+     * `-d` 在 grep 仍是取值（`--directories=read|skip|recurse`），維持豁免；
+     * `-e`／`--regexp` 同為 pattern 值，維持豁免；其餘旗標無 grep 碰撞。
+     */
+    private fun isValueTakingFlag(base: String, flag: String?): Boolean {
+        if (flag == null || flag !in VALUE_TAKING_FLAGS) return false
+        // grep booleans, not value-takers (GNU grep --line-number/--count)
+        if (base == "grep" && (flag == "-n" || flag == "-c")) return false
+        return true
+    }
+
+    /**
      * 非路徑 `--opt` 鍵（值為列舉/格式/glob/數字，非檔案路徑）：
      * `--color/--sort/--format` 等放行，`--db/--file/--output` 等仍按路徑擋。
      */
@@ -1006,6 +1022,71 @@ object ShellPolicy {
     )
 
     /**
+     * Stage F（P1-1 getopt 短選項簇）：grep 短選項語法表（GNU／BusyBox 交集，fail-closed）。
+     *
+     * GNU `grep --help` 短選項（3.12 實測＋BusyBox `grep --help` 子集）：
+     * - 值附著（遇即消費 REST，停止掃描）：
+     *   `e` pattern（REST 即 pattern，永不按檔審，`-eROOT`／`-iefoo` 放行 pin），
+     *   `f` file（REST 即檔名，空 REST 臂槽取次 argv，`/…` 起 REST 走 FileScope＋實體門，
+     *   其餘 `=…`／`-…`／bare 一律 `Denied(BLACKLISTED)`），
+     *   `m/A/B/C` 數字（`-A5`／`-m5` 附著數值，空 REST 次 argv 為數值，皆跳過非檔），
+     *   `D/d` 列舉（`-Dskip`／`-dskip`，`devices: read|skip`／`directories: read|recurse|skip`）。
+     * - 布林（逐字消費，繼續掃描）：`i,E,F,G,P,v,w,x,y,z,s,V,b,n,H,h,o,q,a,I,T,U,u,Z,l,L,c,r`
+     *   ＋數字 `0-9`（`-NUM` context，如 `-5`／`-i5`；`-5foo` 即 `-5`＋`-f oo`，由 `f` 門拒），
+     *   其中 `R` 為跟隨（traversal，簇內作布林繼續掃描但首遇即 `traversal flag denied`，
+     *   交後續 follow 門同 verdict；`L` 在 grep 僅 `files-without-match`，非跟隨，維持放行）。
+     * - 未知字元（含 `=`／`/` 作選項字元時，如 `-i=foo` 的 `=`）：fail-closed `Denied`
+     *  （防未來 file-taker 誤分類；無效旗標本就 exit 2，拒不破壞合法用）。
+     *
+     * 決策表（選項位單橫簇，操作數位 `--` 後／`-f` 槽另由 deny-all 門覆蓋）：
+     * | 簇例 | 判定 | 理由 |
+     * | `-if=/abs`（`f` REST `=/abs`） | DENY relative | `=` 起 REST 相對，經 `=` symlink 穿出（PoC） |
+     * | `-Eif=/abs` | DENY relative | 同上 |
+     * | `-if=-secret`（REST `=-secret`） | DENY relative | 短橫相對檔名 |
+     * | `-Eif=bare`（REST `=bare`） | DENY relative | 同上 |
+     * | `-if/abs`（REST `/abs`） | FileScope vet | `use==validated` 絕對，域內放行／域外拒 |
+     * | `-if`（`f` 空 REST） | 臂檔槽 | 次 argv 為檔（同 `-f`），短橫檔仍拒 |
+     * | `-iefoo`／`-eROOT`（`e` REST） | ALLOW | pattern，永不檔拒（FP pin） |
+     * | `-A5`／`-Dskip`（數值／列舉 REST） | ALLOW | 非檔跳過 |
+     * | `-iQ` 未知 | DENY fail-closed | 防未來 file-taker |
+     * | `-iR` 含 `R` | DENY traversal | 跟隨 interior symlink 讀域外（follow 門同 verdict） |
+     */
+    private val GREP_SHORT_BOOL: Set<Char> = setOf(
+        'i', 'E', 'F', 'G', 'P', 'v', 'w', 'x', 'y', 'z', 's', 'V', 'b', 'n',
+        'H', 'h', 'o', 'q', 'a', 'I', 'T', 'U', 'u', 'Z', 'l', 'L', 'c', 'r', 'R',
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    )
+
+    /** Stage F：附著數值／列舉（REST 跳過非檔，空 REST 次 argv 為值）。 */
+    private val GREP_SHORT_VALUE_NONFILE: Set<Char> = setOf('m', 'A', 'B', 'C', 'D', 'd')
+
+    /**
+     * Stage F 預掃助件：單橫簇是否含 `e`／`f` 顯式 pattern 源（選項位語義）。
+     *
+     * 呼叫方須已排除 `--`／`-`／長選項，僅傳單橫簇；按 [GREP_SHORT_BOOL]／
+     * [GREP_SHORT_VALUE_NONFILE] 逐字掃描：布林繼續，`e`／`f` 即回 true，
+     * `m/A/B/C/D/d` 消費 REST 即回 false（後續 `e/f` 在數值內非旗標，如 `-Aef`），
+     * 未知（含 `=`／`/`）即回 false（主門另由簇門 fail-closed 拒，hasExplicit 無關）。
+     * 純布林無 `e/f` 回 false。
+     */
+    private fun clusterHasExplicitPattern(arg: String): Boolean {
+        if (!arg.startsWith("-") || arg.startsWith("--") || arg == "-") return false
+        val s = arg.substring(1)
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            if (c in GREP_SHORT_BOOL) {
+                i++
+                continue
+            }
+            if (c == 'e' || c == 'f') return true
+            if (c in GREP_SHORT_VALUE_NONFILE) return false
+            return false
+        }
+        return false
+    }
+
+    /**
      * argv 參數是否為相對路徑（P0 fail-closed）。
      * - 絕對路徑（`/...`、長選項 `--opt=/...`，見 [absoluteCandidates]
      *   Stage C：單橫 `-k=/...` 永不視為絕對）由 [absoluteCandidates] 處理，
@@ -1090,16 +1171,37 @@ object ShellPolicy {
     ): Validation.Denied? {
         // grep 顯式 pattern 旗標預掃：-e/--regexp/-f 存在時無 positional pattern 槽。
         // Stage C：`--exclude-from` 刻意不計入（它不提供搜尋 pattern，只提供排除表）。
+        // Stage F：簇 `e/f`（如 `-iefoo`／`-if`）同理提供 pattern 源，須位置感知預掃
+        // （`--` 後操作數 `-secret` 非旗標，不得計入，否則 `grep -- pattern -secret`
+        // 的 `pattern` 誤判為檔；`-f` 槽內同理跳過）。
         var grepPatternSeen = (base != "grep")
         if (base == "grep") {
             var hasExplicit = false
+            var preEnd = false
+            var prePendingFile = false
             for (a in args) {
+                if (prePendingFile) {
+                    prePendingFile = false
+                    continue
+                }
+                if (!preEnd && a == "--") {
+                    preEnd = true
+                    continue
+                }
+                if (preEnd) continue
                 if (a == "-e" || a == "--regexp" || a.startsWith("--regexp=") ||
                     a == "-f" || a == "--file" || a.startsWith("--file=") ||
                     (a.startsWith("-e") && a.length > 2 && !a.contains('/'))
                 ) {
                     hasExplicit = true
                     break
+                }
+                if (a.startsWith("-") && !a.startsWith("--") && a != "-" && clusterHasExplicitPattern(a)) {
+                    hasExplicit = true
+                    break
+                }
+                if (a == "-f" || a == "--file" || a == "--exclude-from") {
+                    prePendingFile = true
                 }
             }
             if (hasExplicit) grepPatternSeen = true
@@ -1111,6 +1213,12 @@ object ShellPolicy {
         // `ls -f` 是排序旗標）。`--exclude-from` 不計入 pattern 預掃
         // （見 FILE_VALUE_OPT_KEYS：它不提供搜尋 pattern）。
         var pendingFileValue = false
+        // Stage F：簇空 REST 值槽（`e` pattern／`m/A/B/C/D/d` 數值列舉，次 argv 為值）。
+        // `f` 空 REST 沿用 [pendingFileValue]；此旗標僅非檔值用，消費時整 token 跳過
+        // （含絕對候選 vet 跳過：值非檔，spawn 不開檔；`grep -A -R` 的 `-R` 為值非旗標，
+        // 不觸 traversal）。
+        var pendingClusterValue = false
+        var pendingClusterValueIsPattern = false
         // grep 遞迴旗標是否出現在真正的選項位（-- 之後 / 取值旗標值 / pattern 槽不算，
         // 如 `grep -- -r` 的 -r 是 pattern 而非遞迴）。
         var sawGrepRecursiveFlag = false
@@ -1122,6 +1230,18 @@ object ShellPolicy {
                     ShellDeny.BLACKLISTED,
                     "bind forbidden inside guest argv",
                 )
+            }
+            // Stage F：簇空 REST 值槽消費（`e` pattern／`m/A/B/C/D/d` 數值列舉）。
+            // 次 argv 為值非檔，整 token 跳過（含絕對 vet 跳過：值非檔不開檔；
+            // `grep -A -R` 的 `-R` 為值非旗標，不觸 traversal；`e` 值提供 pattern）。
+            if (pendingClusterValue) {
+                pendingClusterValue = false
+                if (pendingClusterValueIsPattern) {
+                    grepPatternSeen = true
+                }
+                pendingClusterValueIsPattern = false
+                prevArg = arg
+                continue
             }
             // Stage D（P1-2）：find/du/ls symlink-follow 全位置 fail-closed。
             // find `-L`/`-follow`（全局，可出現在路徑前後）、du `-L`/
@@ -1196,6 +1316,108 @@ object ShellPolicy {
                 prevArg = arg
                 continue
             }
+            // Stage F（P1-1 getopt 短選項簇）：選項位單橫簇逐字掃描（見 [GREP_SHORT_BOOL]）。
+            // 位置限定選項位（`--` 後／`-f` 槽／取值旗標值／簇值槽另由 deny-all／值門覆蓋）；
+            // `-e` REST 永為 pattern（`-eROOT`／`-iefoo` 放行 pin），`-f` REST 按附著檔規則，
+            // `m/A/B/C/D/d` REST 為數值列舉跳過，`R` 作布林首遇即 traversal 拒（`L` 非跟隨），
+            // 未知 fail-closed 拒。`=/abs` REST（含 `=`）恆相對拒；`/abs` REST 走 FileScope＋
+            // 實體門（use==validated）；空 REST 臂槽（`f`→檔槽，`e/m/A/B/C/D/d`→值槽）。
+            if (base == "grep" && !endOfOptions && !inFileSlot &&
+                !isValueTakingFlag(base, prevArg) && !pendingClusterValue &&
+                arg.startsWith("-") && !arg.startsWith("--") && arg != "-"
+            ) {
+                val body = arg.substring(1)
+                var bi = 0
+                var clusterDone = false
+                while (bi < body.length && !clusterDone) {
+                    val c = body[bi]
+                    if (c in GREP_SHORT_BOOL) {
+                        if (c == 'R' && !isGuestTraversalExempt(isGuest, privateRoot)) {
+                            return Validation.Denied(
+                                ShellDeny.BLACKLISTED,
+                                "traversal flag denied (fail-closed, symlink-follow): $arg",
+                            )
+                        }
+                        bi++
+                        continue
+                    }
+                    if (c == 'e') {
+                        val rest = body.substring(bi + 1)
+                        grepPatternSeen = true
+                        if (rest.isEmpty()) {
+                            pendingClusterValue = true
+                            pendingClusterValueIsPattern = true
+                        }
+                        prevArg = arg
+                        clusterDone = true
+                        break
+                    }
+                    if (c == 'f') {
+                        val rest = body.substring(bi + 1)
+                        grepPatternSeen = true
+                        if (rest.isEmpty()) {
+                            pendingFileValue = true
+                            prevArg = arg
+                            clusterDone = true
+                            break
+                        }
+                        if (rest == "-") {
+                            prevArg = arg
+                            clusterDone = true
+                            break
+                        }
+                        if (rest.startsWith("/")) {
+                            if (hasDotDotSegment(rest)) {
+                                return Validation.Denied(
+                                    ShellDeny.BLACKLISTED,
+                                    "dotdot segment denied (reason=DOTDOT): $arg",
+                                )
+                            }
+                            if (!(isGuest && privateRoot != null && isContainerInternalPath(rest, privateRoot))) {
+                                val vet = if (isElevated) {
+                                    checkFileScopeElevated(rest, privateRoot, safRoots, flavor, bridgeGranted, preRealPathHook)
+                                } else {
+                                    checkFileScope(rest, privateRoot, safRoots, flavor, bridgeGranted, preRealPathHook)
+                                }
+                                if (vet != null) return vet
+                            }
+                            prevArg = arg
+                            clusterDone = true
+                            break
+                        }
+                        if (isGuest && privateRoot != null) {
+                            prevArg = arg
+                            clusterDone = true
+                            break
+                        }
+                        return Validation.Denied(
+                            ShellDeny.BLACKLISTED,
+                            "relative path denied (fail-closed, use absolute path): $arg",
+                        )
+                    }
+                    if (c in GREP_SHORT_VALUE_NONFILE) {
+                        val rest = body.substring(bi + 1)
+                        if (rest.isEmpty()) {
+                            pendingClusterValue = true
+                            pendingClusterValueIsPattern = false
+                        }
+                        prevArg = arg
+                        clusterDone = true
+                        break
+                    }
+                    if (isGuest && privateRoot != null) {
+                        // guest 容器內未知短旗：容器命名空間無宿主 file-taker 語義，
+                        // 維持放行（與 bare／短橫同策；null 作用域仍下式拒）。
+                        // 為與宿主 fail-closed 區分，此處直接落穿常規門（`--` 後另拒）。
+                        break
+                    }
+                    return Validation.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "relative path denied (fail-closed, use absolute path): $arg",
+                    )
+                }
+                if (clusterDone) continue
+            }
             if (isRelativePathArg(arg)) {
                 return Validation.Denied(
                     ShellDeny.BLACKLISTED,
@@ -1204,13 +1426,13 @@ object ShellPolicy {
             }
             val isPositional = endOfOptions || !arg.startsWith("-") || arg == "-"
             // grep 遞迴旗標只認選項位的（見 sawGrepRecursiveFlag 註解）。
-            if (base == "grep" && !endOfOptions && prevArg !in VALUE_TAKING_FLAGS &&
+            if (base == "grep" && !endOfOptions && !isValueTakingFlag(base, prevArg) &&
                 isGrepRecursiveFlag(arg)
             ) {
                 sawGrepRecursiveFlag = true
             }
             // 取值旗標的下一位是值而非路徑（如 -n 20、-c %s、-name *.db、-e pattern）。
-            if (isPositional && prevArg != null && prevArg in VALUE_TAKING_FLAGS) {
+            if (isPositional && prevArg != null && isValueTakingFlag(base, prevArg)) {
                 prevArg = arg
                 // -f/--file 除外已不在 VALUE_TAKING_FLAGS，其值仍按路徑審查；
                 // 此處僅豁免已列旗標的值。
@@ -1226,15 +1448,15 @@ object ShellPolicy {
             // `-R`（含 `-rR`/`-iR` 類單橫組合）與 `--dereference-recursive`
             // 跟隨 interior dir symlink 讀域外（PoC：scope/subtree 內 `escape`
             // → outside，`grep -R TOKEN /scope/subtree` 印 outside/hidden.txt）。
-            // 僅選項位（`!endOfOptions && !inFileSlot && prevArg !in
-            // VALUE_TAKING_FLAGS`，`--` 後短橫／`-f` 槽／`-e` 值另由短橫／附著門
+            // 僅選項位（`!endOfOptions && !inFileSlot && !isValueTakingFlag(base,
+            // prevArg)`（base-aware：grep `-n`/`-c` 是布林非取值），`--` 後短橫／`-f` 槽／`-e` 值另由短橫／附著門
             // 拒，訊息保留相對家族；`grep -- -r` 首位仍是 pattern，已由上槽消費；
             // `-e -R` 的 `-R` 是 pattern 值（`prevArg == "-e"`），跳過）；
             // 小寫 `-r`／`--recursive` 不跟隨，維持放行；`-eX` 附著 pattern
             //（含 `R` 如 `ROOT`）與 `-fX` 附著（另由附著門拒）由 [isFollowFlag]
             // 內跳過。guest 容器內豁免（見 [isGuestTraversalExempt]）。
             if (base == "grep" && !isGuestTraversalExempt(isGuest, privateRoot) &&
-                !endOfOptions && !inFileSlot && prevArg !in VALUE_TAKING_FLAGS &&
+                !endOfOptions && !inFileSlot && !isValueTakingFlag(base, prevArg) &&
                 isFollowFlag(base, arg)
             ) {
                 return Validation.Denied(

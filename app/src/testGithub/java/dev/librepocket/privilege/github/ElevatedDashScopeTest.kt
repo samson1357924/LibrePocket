@@ -191,4 +191,67 @@ class ElevatedDashScopeTest {
             outside.deleteRecursively()
         }
     }
+
+    /**
+     * Stage C（P1-1 attached file-options）提權跑道層迴歸：
+     * `grep -f=/abs`／`--exclude-from -secret`／`--exclude-from=v`／
+     * `toybox grep -f=…` 經 Root／Shizuku 必須 `Denied(BLACKLISTED)` 且零 spawn。
+     * 尾參合法絕對（load-bearing：拒絕只能來自危險槽）。
+     */
+    private fun stageCVectors(scope: File): List<List<String>> {
+        val patterns = File(scope, "patterns").apply { writeText("zzz-no-match\n") }.absolutePath
+        val input = File(scope, "input").apply { writeText("hello world\n") }.absolutePath
+        return listOf(
+            listOf("grep", "-f=$patterns", input),
+            listOf("grep", "-f=-secret", input),
+            listOf("grep", "hello", "--exclude-from", "-secret", input),
+            listOf("grep", "--exclude-from=-secret", input),
+            listOf("grep", "--exclude-from=bare/relative", input),
+            listOf("toybox", "grep", "-f=$patterns", input),
+        )
+    }
+
+    @Test fun rootRunner_zeroSpawnOnStageC() {
+        val (scope, outside) = dashScope()
+        try {
+            for (argv in stageCVectors(scope)) {
+                val spawn = SpawnCounter()
+                val runner = makeRoot(scope, spawn)
+                val result = runner.runBinary(ElevatedRequest(argv, "STAGEC-TEST"), 5_000L)
+                assertTrue("expected Denied for $argv, got $result", result is ElevatedBinaryResult.Denied)
+                val denied = result as ElevatedBinaryResult.Denied
+                assertEquals(ShellDeny.BLACKLISTED, denied.reason)
+                assertTrue(
+                    "message must stay in relative-path family, got ${denied.message}",
+                    denied.message.contains("relative path denied"),
+                )
+                assertEquals("spawn must be zero for $argv", 0, spawn.calls)
+            }
+        } finally {
+            scope.deleteRecursively()
+            outside.deleteRecursively()
+        }
+    }
+
+    @Test fun shizukuRunner_zeroSpawnOnStageC() {
+        val (scope, outside) = dashScope()
+        try {
+            for (argv in stageCVectors(scope)) {
+                val spawn = SpawnCounter()
+                val runner = makeShizuku(scope, spawn)
+                val result = runner.runBinary(ElevatedRequest(argv, "STAGEC-TEST"), 5_000L)
+                assertTrue("expected Denied for $argv, got $result", result is ElevatedBinaryResult.Denied)
+                val denied = result as ElevatedBinaryResult.Denied
+                assertEquals(ShellDeny.BLACKLISTED, denied.reason)
+                assertTrue(
+                    "message must stay in relative-path family, got ${denied.message}",
+                    denied.message.contains("relative path denied"),
+                )
+                assertEquals("spawn must be zero for $argv", 0, spawn.calls)
+            }
+        } finally {
+            scope.deleteRecursively()
+            outside.deleteRecursively()
+        }
+    }
 }

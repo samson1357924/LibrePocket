@@ -840,9 +840,21 @@ object ShellPolicy {
         return true
     }
 
-    /** 取參數中的絕對路徑候選：`/...` 或 `--opt=/...`（`=` 後綴）。 */
+    /**
+     * 取參數中的絕對路徑候選（Stage C，P1-1 attached file-options）。
+     *
+     * - 裸 `/…`：程式收到的操作數即該字串，驗用一致，可抽候選。
+     * - 長選項 `--opt=/…`：GNU 長選項 `=` 語義把 `=` 後字面傳給程式
+     *   （use==validated），故以後綴 `/…` 走 FileScope＋實體門是 sound 的；
+     *   未知長鍵 `--unknown=/abs` 同理保留信任（長 `=` 無短橫歧義）。
+     * - 單橫 `-k…=/…`（含 `-f=/abs`、`-file=/abs` 類）：getopt 短選項語義把
+     *   `=` 起的整個 rest（`=/abs`）當相對檔名，OS 在 cwd 下打開
+     *   `<cwd>/=/abs`（PoC：scope 預植 `=` symlink → outside 即穿出），
+     *   與後綴 `/abs` 驗用分叉，故永不抽候選（fail-closed，改由附著分支拒）。
+     */
     private fun absoluteCandidates(arg: String): List<String> {
         if (arg.startsWith("/")) return listOf(arg)
+        if (!arg.startsWith("--")) return emptyList()
         val eq = arg.indexOf('=')
         if (eq >= 0 && eq + 1 < arg.length && arg[eq + 1] == '/') {
             return listOf(arg.substring(eq + 1))
@@ -882,19 +894,36 @@ object ShellPolicy {
         arg.startsWith("-") && arg != "-" && arg.indexOf('=') < 0
 
     /**
-     * Stage A（P1 dash bypass）：取值即檔名的長選項鍵（`--file=` 單 token 形態用）。
+     * Stage C（P1-1 attached file-options）：取值即檔名的長選項鍵
+     * （`--key=value` 單 token 形態用）。
      * 其 `=value` 恆為檔名（flag 位與 `--` 後操作數位皆然），短橫／相對值
      * fail-closed（見 [checkBareFileOperand]）；絕對值已先由 [absoluteCandidates]
-     * 走 FileScope＋實體門，與今日一致。刻意只列 `--file`（grep 唯一文件鍵；
-     * `--color` 等非路徑鍵維持豁免，見 [NON_PATH_OPT_KEYS]）。
+     * 走 FileScope＋實體門（僅長選項 `--` 前綴才抽候選，見該函數）。
+     *
+     * grep 打開檔案的選項清單（audit 完備性）：
+     * - `--file`：pattern file（`--file F` 分離形經 REQUIRED-FILENAME 槽，
+     *   `--file=F` 附著形經本鍵）；
+     * - `--exclude-from`：exclude-patterns file（GNU grep；分離形
+     *   `--exclude-from F` 經槽、附著形 `--exclude-from=F` 經本鍵，
+     *   與 `--file` 同門）；
+     * - 短 `-f`：分離形（槽）＋附著形 `-fX`／`-f=X`（附著分支，grep-only，
+     *   單橫 `=` rest 是相對檔名故一律拒，見 [checkPathArgs] 附著分支）。
+     * 刻意未列（非檔案開啟，無需檔名審查）：
+     * - `-e`／`--regexp`：pattern 字串（值槽／NON_PATH，不觸檔案）；
+     * - `--include`／`--exclude`／`--exclude-dir`：glob（NON_PATH）；
+     * - `-d`／`--max-depth`／`--max-count` 等：列舉／數字（VALUE_TAKING_FLAGS／NON_PATH）。
+     * `--exclude-from` 刻意不計入 grep pattern 預掃（[checkPathArgs] 首的
+     * `hasExplicit`）：它不提供搜尋 pattern，首個 positional 仍是 pattern 槽。
      */
     private val FILE_VALUE_OPT_KEYS: Set<String> = setOf(
         "--file",
+        "--exclude-from",
     )
 
     /**
      * argv 參數是否為相對路徑（P0 fail-closed）。
-     * - 絕對路徑（`/...`、`--opt=/...`）由 [absoluteCandidates] 處理，
+     * - 絕對路徑（`/...`、長選項 `--opt=/...`，見 [absoluteCandidates]
+     *   Stage C：單橫 `-k=/...` 永不視為絕對）由 [absoluteCandidates] 處理，
      *   此處回 false（其中 key 含 `/` 的畸形參數仍擋）；
      * - `-flag` 純旗標：不含 `/` 即放行，含 `/`（如 `-foo/bar`）一律擋
      *   （合法 flag 不含斜線）；
@@ -924,10 +953,12 @@ object ShellPolicy {
      * 即相對檔名，fail-closed）→ binary-aware bare 封堵。
      * 直接/提權共用，避免雙寫漂移。
      *
-     * Stage A 選項解析器狀態（P1 scope bypass，`cat -- -secret`／`grep -f -patterns`
+     * Stage A＋C 選項解析器狀態（P1 scope bypass，`cat -- -secret`／`grep -f -patterns`
      * 類）：顯式追蹤 `endOfOptions`（`--` 終止符）＋ REQUIRED-FILENAME 槽
-     * （grep `-f`／`--file` 精確 token 的下一位；`ls -f` 是排序旗標故槽只限 grep；
-     * `--` 後的 `-f` 是操作數而非旗標，不設槽；`-f` 附著值 `-fX` 恒為檔名 X，
+     * （grep `-f`／`--file`／`--exclude-from` 精確 token 的下一位；
+     * `ls -f` 是排序旗標故槽只限 grep；
+     * `--` 後的 `-f` 是操作數而非旗標，不設槽；`-f` 附著值 `-fX`／`-f=X`
+     * 恒為檔名 X（Stage C：`-f=` 的值是 `=/…` 相對檔名），
      * 另由附著分支 fail-closed）。槽內／`--` 後的短橫形態（[isDashOperand]，
      * `-` 哨兵除外）即相對檔名操作數，一律 `Denied(BLACKLISTED)`（與相對路徑
      * 拒絕同 verdict 家族），不再經由短橫放行洞穿 FileScope 實體門。
@@ -973,6 +1004,7 @@ object ShellPolicy {
         preRealPathHook: (() -> Unit)? = null,
     ): Validation.Denied? {
         // grep 顯式 pattern 旗標預掃：-e/--regexp/-f 存在時無 positional pattern 槽。
+        // Stage C：`--exclude-from` 刻意不計入（它不提供搜尋 pattern，只提供排除表）。
         var grepPatternSeen = (base != "grep")
         if (base == "grep") {
             var hasExplicit = false
@@ -989,8 +1021,10 @@ object ShellPolicy {
         }
         var endOfOptions = false
         var prevArg: String? = null
-        // Stage A：grep `-f`／`--file` 精確 token 的下一位是 REQUIRED-FILENAME 槽
-        // （檔名操作數，短橫形亦拒，見下；只限 grep，`ls -f` 是排序旗標）。
+        // Stage A＋C：grep `-f`／`--file`／`--exclude-from` 精確 token 的下一位是
+        // REQUIRED-FILENAME 槽（檔名操作數，短橫形亦拒，見下；只限 grep，
+        // `ls -f` 是排序旗標）。`--exclude-from` 不計入 pattern 預掃
+        // （見 FILE_VALUE_OPT_KEYS：它不提供搜尋 pattern）。
         var pendingFileValue = false
         // grep 遞迴旗標是否出現在真正的選項位（-- 之後 / 取值旗標值 / pattern 槽不算，
         // 如 `grep -- -r` 的 -r 是 pattern 而非遞迴）。
@@ -1102,13 +1136,15 @@ object ShellPolicy {
                     "relative path denied (fail-closed, use absolute path): $arg",
                 )
             }
-            // Stage A grep `-f` 附著值：`-f` 取必填參數，故 `-fX`（無 `=`、無 `/`）
+            // Stage A＋C grep `-f` 附著值：`-f` 取必填參數，故 `-fX`
             // 的附著尾 X 恒為檔名；相對即 fail-closed（宿主通道）。
+            // Stage C：`-f=/x` 的值是 `=/x` 整 rest（短選項附著語義，相對檔名），
+            // 故 `=` 形亦拒（不豁免；單橫 `=` 永不走 absoluteCandidates，見該函數）。
             // 選項位限定（`--` 後的 `-fX` 是檔名，已由上式覆蓋）；`-F` 大寫另旗，
-            // 不在此列；含 `/` 者已由 isRelativePathArg 擋。
+            // 不在此列；含 `/` 者（`-f/a` 類）已由 isRelativePathArg 擋。
             if (base == "grep" && !endOfOptions && !inFileSlot &&
                 arg.startsWith("-f") && arg.length > 2 && !arg.startsWith("--") &&
-                arg.indexOf('=') < 0 && !(isGuest && privateRoot != null)
+                !(isGuest && privateRoot != null)
             ) {
                 return Validation.Denied(
                     ShellDeny.BLACKLISTED,
@@ -1121,7 +1157,8 @@ object ShellPolicy {
             // absoluteCandidates 验后缀 `/abs` 而 spawn 打开不同路径＝验证／使用
             // 不一致）。操作数位一律 Denied(BLACKLISTED)，仅 guest 容器内与
             // NO_FILE 二进制豁免（不打开宿主文件）；`--file=` 落穿豁免已删除。
-            // 旗标位的 `--file=/abs` 仍经 absoluteCandidates＋checkBareFileOperand。
+            // 旗标位的 `--file=/abs`／`--exclude-from=/abs`
+            // 仍经 absoluteCandidates＋checkBareFileOperand。
             if ((endOfOptions || inFileSlot) && arg.startsWith("-") && arg.indexOf('=') >= 0 &&
                 !(isGuest && privateRoot != null) && base !in NO_FILE_BINARIES
             ) {
@@ -1140,10 +1177,12 @@ object ShellPolicy {
                 isGuest = isGuest,
             )
             if (bareDenial != null) return bareDenial
-            // Stage A 設槽：grep `-f`／`--file` 精確 token（選項位）使下一位為
-            // REQUIRED-FILENAME 槽。`--` 後的操作數位不設槽；他 binary 的 `-f`
-            // （如 `ls -f` 排序旗）不設槽。
-            if (base == "grep" && !endOfOptions && (arg == "-f" || arg == "--file")) {
+            // Stage A＋C 設槽：grep `-f`／`--file`／`--exclude-from` 精確 token
+            // （選項位）使下一位為 REQUIRED-FILENAME 槽。`--` 後的操作數位不設槽；
+            // 他 binary 的 `-f`（如 `ls -f` 排序旗）不設槽。
+            if (base == "grep" && !endOfOptions &&
+                (arg == "-f" || arg == "--file" || arg == "--exclude-from")
+            ) {
                 pendingFileValue = true
             }
             prevArg = arg
@@ -1186,7 +1225,7 @@ object ShellPolicy {
      *   `stat %s` 亦視為相對路徑）；
      * - `--opt=bare`：鍵在 [NON_PATH_OPT_KEYS]（color/sort/format 等）放行；
      *   否則 FILE_OPERAND 即使值像數字/格式/glob 仍拒（`--db=123` 視為潛在路徑）；
-     * - Stage A `--file=bare`：鍵在 [FILE_VALUE_OPT_KEYS] 即檔名，短橫形／相對值
+     * - Stage A＋C `--file=bare`／`--exclude-from=bare`：鍵在 [FILE_VALUE_OPT_KEYS] 即檔名，短橫形／相對值
      *   全 binary fail-closed（未知提權＋scope 亦拒，cwd 釘死不豁免檔名鍵；
      *   `-` stdin 哨兵／空值／絕對值維持放行，絕對值已先走實體門）；
      *   [NO_FILE_BINARIES] 無檔案語義，維持放行；
@@ -1218,7 +1257,8 @@ object ShellPolicy {
             val key = arg.substring(0, eq)
             val v = arg.substring(eq + 1)
             if (v.isEmpty() || v.startsWith("/")) return null
-            // Stage A：`--file=` 值恒為檔名（旗標位與 `--` 後操作數位皆然）：
+            // Stage A＋C：`--file=`／`--exclude-from=` 值恒為檔名
+            // （旗標位與 `--` 後操作數位皆然）：
             // 短橫形（`-patterns`）／相對值 fail-closed；`-` 是 stdin 哨兵，
             // 維持放行（既有關閉：修前 `--file=-` 誤拒，stdin 無檔案觸及），
             // 絕對值已先由 absoluteCandidates 走 FileScope＋實體門（上式）。

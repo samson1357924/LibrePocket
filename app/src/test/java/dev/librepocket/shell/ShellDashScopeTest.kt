@@ -564,4 +564,237 @@ class ShellDashScopeTest {
             outside.deleteRecursively()
         }
     }
+
+    // ---- Stage C（P1-1 attached file-options）：單橫 `=` 附著＋`--exclude-from` ----
+
+    /**
+     * Stage C fixture：scope 內 benign patterns/input（絕對尾參合法，
+     * load-bearing：拒絕只能來自危險槽，不能來自尾參），outside 內
+     * shadow `<outside><scope>/patterns` 含可觀測行，scope 內 `=` symlink →
+     * outside。未修補政策驗後綴 benign 而 OS 打開 shadow（use≠validated），
+     * 見 [stageC_shortEq_realSemanticsMismatchAndPolicyDenies]。
+     */
+    private data class StageCFixture(
+        val scope: File,
+        val outside: File,
+        val patternsAbs: String,
+        val inputAbs: String,
+    )
+
+    private fun stageCFixture(prefix: String): StageCFixture {
+        assumeNonWindows()
+        val scope = tempDir("$prefix-scope").canonicalFile
+        val outside = tempDir("$prefix-outside").canonicalFile
+        File(scope, "patterns").writeText("zzz-no-match\n")
+        File(scope, "input").writeText("hello world\n")
+        val shadowDir = File(outside.absolutePath + scope.absolutePath).apply { mkdirs() }
+        File(shadowDir, "patterns").writeText("hello\n")
+        Files.createSymbolicLink(File(scope, "=").toPath(), outside.toPath())
+        return StageCFixture(
+            scope,
+            outside,
+            File(scope, "patterns").absolutePath,
+            File(scope, "input").absolutePath,
+        )
+    }
+
+    @Test fun stageC_shortEqAttached_deniedDirectAndElevated() {
+        // 單橫 `-f=/abs`：短選項附著取整 rest `=/abs` 當相對檔名，
+        // 後綴再乾淨（域內 benign）也不得信任。
+        val f = stageCFixture("stageC-eq")
+        try {
+            val vectors = listOf(
+                listOf("grep", "-f=" + f.patternsAbs, f.inputAbs),
+                listOf("grep", "-f=-secret", f.inputAbs),
+                listOf("grep", "-f=bare/relative", f.inputAbs),
+                listOf("toybox", "grep", "-f=" + f.patternsAbs, f.inputAbs),
+            )
+            for (argv in vectors) {
+                assertBlocked(ShellPolicy.validate(argv, f.scope.absolutePath), argv)
+                assertBlocked(
+                    ShellPolicy.validateElevated(
+                        argv,
+                        f.scope.absolutePath,
+                        flavor = Flavor.GITHUB,
+                        bridgeGranted = true,
+                    ),
+                    argv,
+                )
+            }
+        } finally {
+            f.scope.deleteRecursively()
+            f.outside.deleteRecursively()
+        }
+    }
+
+    @Test fun stageC_excludeFrom_deniedDirectAndElevated() {
+        // `--exclude-from` 是 grep 文件鍵（GNU 支援分離形＋附著形）：
+        // 分離形下一位短橫即檔名，附著形值恆為檔名。
+        val f = stageCFixture("stageC-excl")
+        try {
+            val vectors = listOf(
+                listOf("grep", "hello", "--exclude-from", "-secret", f.inputAbs),
+                listOf("grep", "--exclude-from", "-secret", f.inputAbs),
+                listOf("grep", "--exclude-from=-secret", f.inputAbs),
+                listOf("grep", "--exclude-from=bare/relative", f.inputAbs),
+                listOf("toybox", "grep", "hello", "--exclude-from", "-secret", f.inputAbs),
+            )
+            for (argv in vectors) {
+                assertBlocked(ShellPolicy.validate(argv, f.scope.absolutePath), argv)
+                assertBlocked(
+                    ShellPolicy.validateElevated(
+                        argv,
+                        f.scope.absolutePath,
+                        flavor = Flavor.GITHUB,
+                        bridgeGranted = true,
+                    ),
+                    argv,
+                )
+            }
+        } finally {
+            f.scope.deleteRecursively()
+            f.outside.deleteRecursively()
+        }
+    }
+
+    @Test fun stageC_allowForms_preservedDirectAndElevated() {
+        // 放行 pin：分離 `-f /abs`（flag 位真同一檔案）＋附著長
+        // `--file=/abs`／`--exclude-from=/abs`（use==validated）维持放行；
+        // `=` symlink 不污染放行形（實體門走候選鏈，不經 `=`）。
+        val f = stageCFixture("stageC-allow")
+        try {
+            val vectors = listOf(
+                listOf("grep", "-f", f.patternsAbs, f.inputAbs),
+                listOf("grep", "--file=" + f.patternsAbs, f.inputAbs),
+                listOf("grep", "hello", "--exclude-from", f.patternsAbs, f.inputAbs),
+                listOf("grep", "hello", "--exclude-from=" + f.patternsAbs, f.inputAbs),
+            )
+            for (argv in vectors) {
+                assertTrue(
+                    "positive must stay allowed, got ${ShellPolicy.validate(argv, f.scope.absolutePath)}",
+                    ShellPolicy.validate(argv, f.scope.absolutePath) is Validation.Allowed,
+                )
+                assertTrue(
+                    "elevated positive must stay allowed, got ${
+                        ShellPolicy.validateElevated(
+                            argv,
+                            f.scope.absolutePath,
+                            flavor = Flavor.GITHUB,
+                            bridgeGranted = true,
+                        )
+                    }",
+                    ShellPolicy.validateElevated(
+                        argv,
+                        f.scope.absolutePath,
+                        flavor = Flavor.GITHUB,
+                        bridgeGranted = true,
+                    ) is Validation.Allowed,
+                )
+            }
+        } finally {
+            f.scope.deleteRecursively()
+            f.outside.deleteRecursively()
+        }
+    }
+
+    @Test fun stageC_directRunner_zeroSpawn() {
+        val f = stageCFixture("stageC-runner")
+        try {
+            val vectors = listOf(
+                listOf("grep", "-f=" + f.patternsAbs, f.inputAbs),
+                listOf("grep", "-f=-secret", f.inputAbs),
+                listOf("grep", "hello", "--exclude-from", "-secret", f.inputAbs),
+                listOf("grep", "--exclude-from=-secret", f.inputAbs),
+                listOf("grep", "--exclude-from=bare/relative", f.inputAbs),
+                listOf("toybox", "grep", "-f=" + f.patternsAbs, f.inputAbs),
+            )
+            for (argv in vectors) {
+                val runner = ArgvCaptureRunner()
+                val shell = RestrictedShell(
+                    runner = runner,
+                    privateRoot = f.scope.absolutePath,
+                    execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
+                )
+                val result = shell.execute(argv)
+                assertTrue("expected Denied for $argv, got $result", result is ShellResult.Denied)
+                assertEquals(ShellDeny.BLACKLISTED, (result as ShellResult.Denied).reason)
+                assertEquals("spawn must be zero for $argv", 0, runner.calls)
+            }
+        } finally {
+            f.scope.deleteRecursively()
+            f.outside.deleteRecursively()
+        }
+    }
+
+    @Test fun stageC_shortEq_realSemanticsMismatchAndPolicyDenies() {
+        // 驗用分叉實證（load-bearing 核心）：同一 argv 繞過政策直 spawn
+        // （cwd=scope）讀到 shadow（`=` symlink 跟隨），而政策必須拒絕。
+        // 另附放行形真跑讀到域內（real-file positive）。
+        assumeNonWindows()
+        val grepBin = listOf("/bin/grep", "/usr/bin/grep").firstOrNull { File(it).canExecute() }
+        assumeTrue(grepBin != null)
+        val f = stageCFixture("stageC-real")
+        try {
+            val argv = listOf("grep", "-f=" + f.patternsAbs, f.inputAbs)
+            // 1. OS 語義（無政策，直 spawn）：`-f=` 的 optarg 是相對 `=/…`，
+            //    經 `=` 指向 shadow（含 `hello`），故命中 input 的 `hello world`
+            //    （benign 後綴是 `zzz-no-match`，命中即證打開的是 shadow）。
+            val raw = DefaultProcessRunner(dirRoot = f.scope.absolutePath)
+                .run(listOf(grepBin!!, "-f=" + f.patternsAbs, f.inputAbs), 10_000L, null)
+            val out = String(raw.stdout, Charsets.UTF_8)
+            assertEquals("OS must open shadow via `=` symlink (exit 0), got: $out", 0, raw.exitCode)
+            assertTrue("OS opened shadow, not benign suffix, got: $out", out.contains("hello world"))
+            // 2. 政策拒絕（直接＋提權）且零 spawn（實際打開目標永不到達 OS，
+            //    上式 shadow 命中反證修前信任後綴即穿出）。
+            assertBlocked(ShellPolicy.validate(argv, f.scope.absolutePath), argv)
+            assertBlocked(
+                ShellPolicy.validateElevated(
+                    argv,
+                    f.scope.absolutePath,
+                    flavor = Flavor.GITHUB,
+                    bridgeGranted = true,
+                ),
+                argv,
+            )
+            var delegateCalls = 0
+            val counting: ProcessRunner = object : ProcessRunner {
+                override fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>?): RawOutput {
+                    delegateCalls++
+                    return RawOutput("ok".toByteArray(), ByteArray(0), 0, false)
+                }
+            }
+            val shell = RestrictedShell(
+                runner = counting,
+                privateRoot = f.scope.absolutePath,
+                execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
+            )
+            val result = shell.execute(argv)
+            assertTrue("expected Denied for $argv, got $result", result is ShellResult.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (result as ShellResult.Denied).reason)
+            assertEquals("spawn must be zero for $argv", 0, delegateCalls)
+            // 3. 放行形真跑（real-file positive）：`--file=/abs` 經政策放行，
+            //    真 spawn 讀到域內 input（benign patterns 無命中，exit 1，無輸出）。
+            val okArgv = listOf("grep", "--file=" + f.patternsAbs, f.inputAbs)
+            assertTrue(
+                ShellPolicy.validate(okArgv, f.scope.absolutePath) is Validation.Allowed,
+            )
+            val grepDir = File(grepBin).parentFile.canonicalPath
+            val realShell = RestrictedShell(
+                runner = DefaultProcessRunner(dirRoot = f.scope.absolutePath),
+                privateRoot = f.scope.absolutePath,
+                execSearchDirs = listOf(grepDir),
+                execAllowedRoots = listOf(grepDir),
+                execIsWritable = { false },
+            )
+            val ok = realShell.execute(okArgv)
+            assertTrue("expected Ok, got $ok", ok is ShellResult.Ok)
+            // benign patterns 無命中 → exit 1、空輸出：證真 spawn 讀的是域內
+            // benign（若誤讀 shadow 即命中 `hello world`、exit 0）。
+            assertEquals(1, (ok as ShellResult.Ok).exitCode)
+            assertEquals("", ok.stdout)
+        } finally {
+            f.scope.deleteRecursively()
+            f.outside.deleteRecursively()
+        }
+    }
 }

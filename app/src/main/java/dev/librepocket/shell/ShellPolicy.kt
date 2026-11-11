@@ -874,7 +874,8 @@ object ShellPolicy {
     /**
      * Stage A（P1 dash bypass）：短橫形態操作數判定（`--` 後／`-f` 值槽用）。
      * 以 `-` 開頭、不是 `-` stdin 哨兵、不含 `=` 即短橫形態（如 `-secret`、`--` 自身）。
-     * 含 `=` 的形態（`--opt=v`）另由 [checkBareFileOperand] 的鍵值分支處理，
+     * 含 `=` 的形態（`--opt=v`）另由操作數 `=` 門（[checkPathArgs] deny-all，
+     * `--` 後／`-f` 槽內）／旗標位 [checkBareFileOperand] 鍵值分支處理，
      * 不在此判定（`--color=always` 等合法 `--opt=value` 不受影響）。
      */
     private fun isDashOperand(arg: String): Boolean =
@@ -945,8 +946,10 @@ object ShellPolicy {
      * `grep -- pattern -secret` 中 pattern 取首位、`-secret` 仍拒）、
      * NO_FILE_BINARIES（`echo -- -secret` 只是字串，無檔案語義）、`-` 哨兵、
      * `--opt=value` 非路徑鍵（`--color=always` 旗標位維持放行；但 `--` 後／
-     * `-f` 槽內的 `--file=` 值仍按檔名審查）。`=` 空值（`--opt=`）維持既有
-     * 放行（用法錯誤，無檔案觸及），尾 `=` 殘餘見測試檔注記。
+     * `-f` 槽內的 `--file=` 值仍按檔名審查）。旗標位的 `=` 空值（`--opt=`）
+     * 維持既有放行（用法錯誤，無檔案觸及），尾 `=` 殘餘見測試檔注記；
+     * `--` 後／`-f` 槽內的 `--opt=`（含 `--file=`）一律 `Denied(BLACKLISTED)`，
+     * 見操作數門。
      *
      * 純值豁免僅限值槽（VALUE_TAKING_FLAGS 下一位 / grep pattern 槽 /
      * NON_PATH_OPT_KEYS 的 --opt 值），FILE_OPERAND 的普通 positional 一律
@@ -1112,22 +1115,20 @@ object ShellPolicy {
                     "relative path denied (fail-closed, use absolute path): $arg",
                 )
             }
-            // Stage A `=` operand fail-closed: `--` 后／REQUIRED-FILENAME 槽内的 `--opt=v`
-            // 无旗标语义，即文件名；NON_PATH 豁免仅限旗标位。
+            // Stage A `=` operand deny-all: `--` 后／REQUIRED-FILENAME 槽内的 `--opt=v`
+            // 无旗标语义，即文件名（`cat -- --file=-` 打开字面文件 `--file=-` 而非
+            // stdin，`cat -- --file=/abs` 打开 `<cwd>/--file=/abs` 而非 `/abs`；
+            // absoluteCandidates 验后缀 `/abs` 而 spawn 打开不同路径＝验证／使用
+            // 不一致）。操作数位一律 Denied(BLACKLISTED)，仅 guest 容器内与
+            // NO_FILE 二进制豁免（不打开宿主文件）；`--file=` 落穿豁免已删除。
+            // 旗标位的 `--file=/abs` 仍经 absoluteCandidates＋checkBareFileOperand。
             if ((endOfOptions || inFileSlot) && arg.startsWith("-") && arg.indexOf('=') >= 0 &&
                 !(isGuest && privateRoot != null) && base !in NO_FILE_BINARIES
             ) {
-                val eq = arg.indexOf('=')
-                val key = arg.substring(0, eq)
-                val v = arg.substring(eq + 1)
-                val fileKeyAllowed = key in FILE_VALUE_OPT_KEYS && (v == "-" || v.startsWith("/"))
-                if (!fileKeyAllowed) {
-                    return Validation.Denied(
-                        ShellDeny.BLACKLISTED,
-                        "relative path denied (fail-closed, use absolute path): $arg",
-                    )
-                }
-                // `--file=-|/abs` 落穿至 bareDenial（绝对值已过实体门）；空值在操作数位亦拒。
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "relative path denied (fail-closed, use absolute path): $arg",
+                )
             }
             // LOW accepted residual: 旗标位未知 binary 的 `--opt=-dash` 值仍靠 cwd 钉死放行；cwd 可含预植 symlink，宿主语义见上 Guest 抉择。
             val bareDenial = checkBareFileOperand(

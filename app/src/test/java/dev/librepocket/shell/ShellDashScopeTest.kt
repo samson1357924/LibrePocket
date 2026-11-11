@@ -22,7 +22,9 @@ import org.junit.Test
  *
  * 豁免 pin（防誤殺，見各用例）：
  * - `grep -- -r` 的首位短橫仍是 pattern（pattern 槽先於短橫封堵消費）；
- * - `-` stdin 哨兵（含 `grep -f -`、`--file=-`）維持放行；
+ * - `-` stdin 哨兵（含 `grep -f -`、旗標位的 `--file=-`）維持放行；
+ *   但 `--` 後／`-f` 槽操作數位的 `--file=-|/abs` 一律拒（deny-all，
+ *   無旗標語義，即字面檔名，見 `eqOperandExemptions_guestAndNoFileAllowed`）；
  * - [ShellPolicy.NO_FILE_BINARIES]（`echo -- -secret` 只是字串）維持放行；
  * - guest 容器內（`isGuest && privateRoot != null`）維持放行（cwd 已釘
  *   `-w /`＋`-r rootfs`，容器命名空間相對路徑；與既有 bare 放行同設計，
@@ -31,9 +33,13 @@ import org.junit.Test
  * - `ls -f`（排序旗標）不設 REQUIRED-FILENAME 槽，只限 grep。
  *
  * 殘餘揭露（刻意不封，超出本次 Stage A 範圍）：
- * - `-f` 槽／`--` 後的 `--opt=bare`（如 `grep -f --color=auto`，檔名恰為
- *   `--color=auto`）維持 NON_PATH 豁免放行；
- * - 尾 `=` 空值（`--opt=`）維持既有用法定罪（用法錯誤，無檔案觸及）。
+ * - 旗標位的 `--opt=-dash` 值（如未知 binary 的 `--db=-secret`）仍靠 cwd
+ *   釘死放行（已知 FILE_OPERAND／`--file` 鍵已拒；見 [ShellPolicy] LOW 註記）；
+ * - 旗標位的尾 `=` 空值（`--opt=`）維持既有用法定罪（用法錯誤，無檔案觸及）；
+ *   `--` 後／`-f` 槽內的操作數 `--opt=`（含 `--file=`）一律 BLACKLISTED 拒。
+ * （`=` 操作數位的 `--opt=v`（含 `--file=-|/abs`，deny-all）如
+ * `grep -f --color=auto`／`cat -- --file=/abs` 已由操作數門拒絕，
+ * 見 `eqOperandAfterDashDash_deniedDirectAndElevated`。）
  */
 class ShellDashScopeTest {
 
@@ -260,6 +266,16 @@ class ShellDashScopeTest {
                     scope.absolutePath,
                 ) is Validation.Allowed,
             )
+            // 旗標位 `--file=<域內絕對>` 正向 pin（與操作數位 deny-all 對照，
+            // 鎖定旗標/操作數區分，防未來過緊）。
+            val known = File(scope, "work/known.txt").absolutePath
+            val other = File(scope, "work/other.txt").apply { writeText("hello\n") }.absolutePath
+            assertTrue(
+                ShellPolicy.validate(
+                    listOf("grep", "--file=$known", other),
+                    scope.absolutePath,
+                ) is Validation.Allowed,
+            )
         } finally {
             scope.deleteRecursively()
             outside.deleteRecursively()
@@ -466,20 +482,53 @@ class ShellDashScopeTest {
                     scope.absolutePath,
                 ) is Validation.Allowed,
             )
-            // `--file=-|/abs` 操作數位落穿至 vetted 路徑：stdin 哨兵與域內絕對值放行。
-            assertTrue(
+            // `--file=-|/abs` 操作数位亦拒（deny-all）：`--` 后无旗标语义，
+            // 即字面文件名（`cat -- --file=-` 打开 `--file=-` 而非 stdin，
+            // `cat -- --file=/abs` 打开 `<cwd>/--file=/abs` 而非 `/abs`）。
+            assertBlocked(
                 ShellPolicy.validate(
                     listOf("cat", "--", "--file=-"),
                     scope.absolutePath,
-                ) is Validation.Allowed,
+                ),
+                listOf("cat", "--", "--file=-"),
+            )
+            assertBlocked(
+                ShellPolicy.validateElevated(
+                    listOf("cat", "--", "--file=-"),
+                    scope.absolutePath,
+                    flavor = Flavor.GITHUB,
+                    bridgeGranted = true,
+                ),
+                listOf("cat", "--", "--file=-"),
             )
             val known = File(scope, "work/known.txt").absolutePath
-            assertTrue(
-                ShellPolicy.validate(
-                    listOf("cat", "--", "--file=$known"),
-                    scope.absolutePath,
-                ) is Validation.Allowed,
+            val fileAbsArgv = listOf("cat", "--", "--file=$known")
+            assertBlocked(
+                ShellPolicy.validate(fileAbsArgv, scope.absolutePath),
+                fileAbsArgv,
             )
+            assertBlocked(
+                ShellPolicy.validateElevated(
+                    fileAbsArgv,
+                    scope.absolutePath,
+                    flavor = Flavor.GITHUB,
+                    bridgeGranted = true,
+                ),
+                fileAbsArgv,
+            )
+            // 零 spawn：操作数位 `--opt=v` 永不到达 OS。
+            for (argv in listOf(listOf("cat", "--", "--file=-"), fileAbsArgv)) {
+                val runner = ArgvCaptureRunner()
+                val shell = RestrictedShell(
+                    runner = runner,
+                    privateRoot = scope.absolutePath,
+                    execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
+                )
+                val result = shell.execute(argv)
+                assertTrue("expected Denied for $argv, got $result", result is ShellResult.Denied)
+                assertEquals(ShellDeny.BLACKLISTED, (result as ShellResult.Denied).reason)
+                assertEquals("spawn must be zero for $argv", 0, runner.calls)
+            }
         } finally {
             scope.deleteRecursively()
             outside.deleteRecursively()
@@ -489,11 +538,14 @@ class ShellDashScopeTest {
     @Test fun directRunner_zeroSpawnOnEqOperand() {
         val (scope, outside) = dashFixture("dash-eq-runner")
         try {
+            val known = File(scope, "work/known.txt").absolutePath
             val vectors = listOf(
                 listOf("cat", "--", "--color=auto"),
                 listOf("grep", "-f", "--color=auto"),
                 listOf("grep", "--", "pattern", "--color=auto"),
                 listOf("cat", "--", "--file="),
+                listOf("cat", "--", "--file=-"),
+                listOf("cat", "--", "--file=$known"),
             )
             for (argv in vectors) {
                 val runner = ArgvCaptureRunner()

@@ -436,7 +436,8 @@ object ShellPolicy {
      *   `-H`（僅跟隨命令列參數，操作數已由實體門拒 symlink）與 `-P`（預設不跟隨）
      *   維持放行。
      * - du：`-L`／`--dereference` 家族（Stage G 縮寫，`--dereference-args`
-     *   消歧前綴除外，見 [isDuFollowAbbrev]，含 `=value` 附著形，fail-closed）；單橫組合含 `L` 即拒。`-D`／
+     *   消歧前綴除外，見 [isDuFollowAbbrev]，含 `=value` 附著形，fail-closed）；
+     *   單橫組合含 `L` 即拒。`-D`／
      *   `--dereference-args` 僅跟隨命令列參數：操作數 symlink 已由
      *   [checkPhysicalOperandGate] 拒（`LINK` 即拒），跟隨命令列即無新增逃逸；
      *   域內真目錄＋`-D` 不跟隨 interior，故維持放行（見下抉擇表）。
@@ -1134,8 +1135,8 @@ object ShellPolicy {
      *   與 `--file` 同門）；
      * - 短 `-f`：分離形（槽）＋附著形 `-fX`／`-f=X`（附著分支，grep-only，
      *   單橫 `=` rest 是相對檔名故一律拒，見 [checkPathArgs] 附著分支）。
-      * du 打開檔案的選項清單（audit 完備性，與上同門）：
-      * - `--files0-from`／`--exclude-from`（含 Stage G 唯一前綴縮寫，見
+     * du 打開檔案的選項清單（audit 完備性，與上同門）：
+     * - `--files0-from`／`--exclude-from`（含 Stage G 唯一前綴縮寫，見
       *   [canonicalFileKey]）：分離形經槽、附著形 `=v` 經本鍵；
       * - 短 `-X`（`--exclude-from` 短形）：分離形經槽、簇附著形 `-Xrest`／
       *   `-aXrest`（簇內 `X` 後 REST 恒為檔名，`X` 為 du 唯一短檔旗，前導布林

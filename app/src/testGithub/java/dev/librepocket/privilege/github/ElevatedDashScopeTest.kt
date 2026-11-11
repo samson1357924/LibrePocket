@@ -144,6 +144,8 @@ class ElevatedDashScopeTest {
         listOf("grep", "-f", "--color=auto"),
         listOf("grep", "--", "pattern", "--color=auto"),
         listOf("cat", "--", "--file="),
+        listOf("cat", "--", "--file=-"),
+        listOf("cat", "--", "--file=/scope/work/known.txt"),
     )
 
     @Test fun rootRunner_zeroSpawnOnEqOperand() {

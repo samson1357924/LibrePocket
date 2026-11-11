@@ -334,7 +334,6 @@ object ShellPolicy {
         "pwd",
         "uname",
         "id",
-        "date",
         "whoami",
         "printenv",
         "sleep",
@@ -623,6 +622,221 @@ object ShellPolicy {
         if (v.startsWith("%")) return true
         if (v.contains('*') || v.contains('?') || v.contains('[')) return true
         return false
+    }
+
+    /**
+     * Stage H（P1-1 clock-set＋P1-2 file-read）：date 長鍵規範（canonicalize-then-judge）。
+     *
+     * 背景（Help 證據，不執行 `date -s`；GNU/uutils `date --help` 實測）：
+     * - `-s/--set STRING` SET the system clock（Root 提權下真設時鐘）；
+     * - Toybox HELP_date：`-s DATE Set the system clock`＋裸 positional `SET`
+     *  （`date 010101002030` 形）同樣設時鐘；
+     * - `-r/--reference FILE` 顯示 FILE mtime（open 檔案），`-f/--file DATEFILE`
+     *   逐行讀 DATEFILE（open 檔案）。GNU 實測 `-r` 讀域外 mtime、`--file` 讀域外。
+     * 故 `date` 不得在 [NO_FILE_BINARIES]（已移除），必須走只讀 allowlist＋檔名 vet。
+     *
+     * 規範（`key` 為 `=` 前鍵，見 [longKeyBeforeEq]）：
+     * - SET：任何 `--s` 起頭唯一映射 `--set`（僅 `--set` 以 `--s` 起頭，無歧義）。
+     *   `--s`／`--se`／`--set`／`--set=VAL`／`--set` 無效延伸 fail-closed 一律拒。
+     * - FILE：`--ref` 起頭（`len>=5`，`--reference` 唯一前綴；`--re`／`--r` 歧義於
+     *   `--resolution`／`--rfc` 留安全側，不映射）＋`--reference` 無效延伸；
+     *   `--f` 起頭（僅 `--file` 以 `--f` 起頭，無歧義，含 `--f`／`--fi`／`--file`）
+     *   一律檔名 vet。分離形臂槽，`=v` 附著形嚴審。
+     * - STRING：`--da`／`--dat`／`--date`（`--d` 歧義於 `--debug` 不映射，
+     *   `--de` 留給 `--debug` 精確）。
+     * 他鍵（`--universal/--utc/--rfc-email/--rfc-3339/--iso-8601/--resolution/
+     * --debug/--help/--version`）僅精確放行，縮寫 fail-closed（GNU 接受但我方拒，
+     * 無害，要求全拼；見 [checkDateArgs]）。
+     */
+    private fun isDateSetKey(key: String): Boolean = key.startsWith("--s")
+
+    private fun isDateRefFileKey(key: String): Boolean {
+        if (key == "--reference" || key.startsWith("--reference")) return true
+        if (key.length >= "--ref".length && "--reference".startsWith(key)) return true
+        return false
+    }
+
+    private fun isDateFileKey(key: String): Boolean = key.startsWith("--f")
+
+    private fun isDateStringKey(key: String): Boolean {
+        if (key == "--date" || key.startsWith("--date")) return true
+        if (key == "--da" || key == "--dat") return true
+        return false
+    }
+
+    /**
+     * Stage H date 只讀 allowlist（直接／提權／multicall 有效形同門，見 [checkPathArgs]）。
+     *
+     * 允許（read-only，無副作用）：
+     * - 無參 `date`、`-u/--universal/--utc`、`-R/--rfc-email`、`-I/--iso-8601`
+     *  （可選 FMT 僅附著 `=v`，分離不消費）、`--rfc-3339`（必填 FMT，分離／附著）、
+     *   `--resolution/--debug`、`-h/--help`、`-V/--version`；
+     * - `-d/--date`（STRING 值槽，分離／`--date=*` 附著；STRING 非檔，不 vet，
+     *   含 `/abs` 亦放行）；
+     * - `+FORMAT`（`+` 起頭顯示格式，含 `/` 亦放行，非開檔）；
+     * - `-r/--reference/-f/--file`（FILE 值槽，分離／附著 `=v`）：值須絕對＋
+     *   [FileScope]＋[checkPhysicalOperandGate] 同門 vet（guest 容器內短路同門）；
+     * - `--` 終止符（後僅 `+FORMAT` 放行）。
+     *
+     * 拒絕（fail-closed，`Denied(BLACKLISTED)` 且零 spawn）：
+     * - `-s/--set*`（任何 `--s*`）＋裸 positional SET（非 `+` 起頭、非旗標的任何
+     *   bare，含 `010101002030`／絕對／相對；`+FORMAT` 唯一例外）；
+     * - FILE 值為 `-`/短橫／相對／bare／空（`-` 無 stdin 語義，uutils 按字面開檔，
+     *   fail-closed 拒；guest＋scope 容器內（無 `/`）豁免，與既有 bare 同策）；
+     * - 單橫簇／附著（`-us/-uR/-sDATE/-dSTRING/-rFILE/-fFILE` 等）：僅精確
+     *   `-u/-R/-I/-d/-r/-f/-h/-V` 放行，其餘一律拒（罕見寫法 fail-closed，要求分離形）；
+     * - 未知長鍵／`--bool=v`／非法 FMT 枚舉值一律拒。
+     *
+     * 單橫 `s` 說明：`date` 無簇語法表，`-s` 取必填參，故任何含 `s` 的單橫簇
+     * （`-us/-ss`）皆涉 SET，一律拒；`-d/-r/-f` 附著值（`-dSTRING` 等）同樣拒，
+     * 要求分離形（`--date=*` 附著僅長鍵 STRING 例外）。
+     */
+    private fun checkDateArgs(
+        args: List<String>,
+        privateRoot: String?,
+        safRoots: List<String>,
+        flavor: Flavor,
+        bridgeGranted: Boolean,
+        isElevated: Boolean,
+        isGuest: Boolean = false,
+        preRealPathHook: (() -> Unit)? = null,
+    ): Validation.Denied? {
+        fun denySet(arg: String): Validation.Denied =
+            Validation.Denied(ShellDeny.BLACKLISTED, "date set denied (fail-closed, read-only): $arg")
+
+        fun denyFlag(arg: String): Validation.Denied =
+            Validation.Denied(ShellDeny.BLACKLISTED, "date flag denied (fail-closed, read-only): $arg")
+
+        fun denyFile(arg: String): Validation.Denied =
+            Validation.Denied(
+                ShellDeny.BLACKLISTED,
+                "date file denied (relative path denied, fail-closed, use absolute path): $arg",
+            )
+
+        fun denyEnum(arg: String): Validation.Denied =
+            Validation.Denied(ShellDeny.BLACKLISTED, "date enum denied (fail-closed, read-only): $arg")
+
+        fun vetFileValue(raw: String, label: String): Validation.Denied? {
+            if (raw.isEmpty() || raw == "-") return denyFile(label)
+            if (!raw.startsWith("/")) {
+                if (isGuest && privateRoot != null && !raw.contains('/')) return null
+                return denyFile(label)
+            }
+            if (hasDotDotSegment(raw)) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "dotdot segment denied (reason=DOTDOT): $raw",
+                )
+            }
+            if (isGuest && privateRoot != null && isContainerInternalPath(raw, privateRoot)) return null
+            return if (isElevated) {
+                checkFileScopeElevated(raw, privateRoot, safRoots, flavor, bridgeGranted, preRealPathHook)
+            } else {
+                checkFileScope(raw, privateRoot, safRoots, flavor, bridgeGranted, preRealPathHook)
+            }
+        }
+
+        var endOfOptions = false
+        var pendingFile = false
+        var pendingString = false
+        var pendingRfc = false
+        for (arg in args) {
+            if (arg == "--bind" || arg.startsWith("--bind=")) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "bind forbidden inside guest argv",
+                )
+            }
+            if (pendingFile) {
+                pendingFile = false
+                val vet = vetFileValue(arg, arg)
+                if (vet != null) return vet
+                continue
+            }
+            if (pendingString) {
+                pendingString = false
+                continue
+            }
+            if (pendingRfc) {
+                pendingRfc = false
+                if (arg == "date" || arg == "seconds" || arg == "ns") continue
+                return denyEnum(arg)
+            }
+            if (endOfOptions) {
+                if (arg.startsWith("+")) continue
+                return denySet(arg)
+            }
+            if (arg == "--") {
+                endOfOptions = true
+                continue
+            }
+            if (arg.startsWith("-") && !arg.startsWith("--")) {
+                if (arg == "-") return denySet(arg)
+                when (arg) {
+                    "-u", "-R", "-I", "-h", "-V" -> continue
+                    "-d" -> {
+                        pendingString = true
+                        continue
+                    }
+                    "-r", "-f" -> {
+                        pendingFile = true
+                        continue
+                    }
+                    else -> {
+                        if ('s' in arg) return denySet(arg)
+                        return denyFlag(arg)
+                    }
+                }
+            }
+            if (arg.startsWith("--")) {
+                val eq = arg.indexOf('=')
+                val key = if (eq >= 0) arg.substring(0, eq) else arg
+                val value: String? = if (eq >= 0) arg.substring(eq + 1) else null
+                if (isDateSetKey(key)) return denySet(arg)
+                if (isDateRefFileKey(key) || isDateFileKey(key)) {
+                    if (value != null) {
+                        val vet = vetFileValue(value, arg)
+                        if (vet != null) return vet
+                        continue
+                    }
+                    pendingFile = true
+                    continue
+                }
+                if (isDateStringKey(key)) {
+                    if (value != null) continue
+                    pendingString = true
+                    continue
+                }
+                if (key == "--rfc-3339") {
+                    if (value != null) {
+                        if (value == "date" || value == "seconds" || value == "ns") continue
+                        return denyEnum(arg)
+                    }
+                    pendingRfc = true
+                    continue
+                }
+                if (key == "--iso-8601") {
+                    if (value != null) {
+                        if (value == "date" || value == "hours" || value == "minutes" ||
+                            value == "seconds" || value == "ns"
+                        ) continue
+                        return denyEnum(arg)
+                    }
+                    continue
+                }
+                if (key == "--universal" || key == "--utc" || key == "--rfc-email" ||
+                    key == "--resolution" || key == "--debug" || key == "--help" ||
+                    key == "--version"
+                ) {
+                    if (value != null) return denyFlag(arg)
+                    continue
+                }
+                return denyFlag(arg)
+            }
+            if (arg.startsWith("+")) continue
+            return denySet(arg)
+        }
+        return null
     }
 
     /**
@@ -1307,6 +1521,21 @@ object ShellPolicy {
         isGuest: Boolean = false,
         preRealPathHook: (() -> Unit)? = null,
     ): Validation.Denied? {
+        // Stage H：date 只讀 allowlist（直接／提權／multicall 有效形同門）。
+        // `date` 開檔（-r/--reference/-f/--file）故不在 NO_FILE，裸 positional
+        // 僅 `+FORMAT` 放行，其餘（SET）一律拒；-s/--set* 一律拒。先於通用門。
+        if (base == "date") {
+            return checkDateArgs(
+                args = args,
+                privateRoot = privateRoot,
+                safRoots = safRoots,
+                flavor = flavor,
+                bridgeGranted = bridgeGranted,
+                isElevated = isElevated,
+                isGuest = isGuest,
+                preRealPathHook = preRealPathHook,
+            )
+        }
         // grep 顯式 pattern 旗標預掃：-e/--regexp/-f 存在時無 positional pattern 槽。
         // Stage C：`--exclude-from` 刻意不計入（它不提供搜尋 pattern，只提供排除表）。
         // Stage F：簇 `e/f`（如 `-iefoo`／`-if`）同理提供 pattern 源，須位置感知預掃

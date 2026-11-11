@@ -441,6 +441,14 @@ internal object DirectSupervisor {
         data class Expired(val hasLinger: Boolean = false) : Res<Nothing>
     }
 
+    /**
+     * P1-1 內部超時標記（spawn 前預檢用）：worker 內 [isExpired]/中斷即抛，
+     * 上層映 `Expired`→`TimedOut`（未 spawn，無需清理）。模組內可見
+     * （internal，不進 public API；單測可用同一型別斷言映射）；[Thr]
+     * 包裝後由呼叫方按型別映射（見 `executeFrozen`）。
+     */
+    internal class PreSpawnTimeoutException : RuntimeException("direct pre-spawn deadline exceeded")
+
     private class Val<T>(val v: T)
     private class Thr(val t: Throwable)
 
@@ -468,9 +476,19 @@ internal object DirectSupervisor {
     /** 阻塞體有界：入口已逾期即不啟 worker，直回 `Expired(false)`（零殘留）。
      * Round-5 Phase P P1-2：次步非阻塞取 [DirectAdmission] permit（飽和即零
      * thread 直回 `Expired(true)`，fail-closed；permit 由 worker `finally` 釋放，
-     * 殘留持至 thread 實際退出）。 */
-    fun <T> supervise(deadlineNanos: Long, threadName: String, block: () -> T): Res<T> {
-        if (isExpired(deadlineNanos)) return Res.Expired(false)
+     * 殘留持至 thread 實際退出）。P1-1 fail-closed 收尾：join 迴圈以
+     * `!worker.isAlive` 跳出後、讀 [holder] 之前必經 postcheck（呼叫方中斷旗標
+     * 或 [isExpired] 即回 `Expired`，覆寫 `Val`——deadline+5ms 完工不誤判 Ok）。
+     * 時鐘可注入（[nowNanos]，預設 [System.nanoTime]；單測傳 fake clock，
+     * 產品行為不變）。
+     */
+    fun <T> supervise(
+        deadlineNanos: Long,
+        threadName: String,
+        block: () -> T,
+        nowNanos: () -> Long = System::nanoTime,
+    ): Res<T> {
+        if (isExpired(deadlineNanos, nowNanos())) return Res.Expired(false)
         if (!DirectAdmission.tryEnter()) return Res.Expired(true)
         val holder = arrayOfNulls<Any>(1)
         val worker = Thread({
@@ -496,7 +514,7 @@ internal object DirectSupervisor {
             while (true) {
                 worker.join(POLL_MS)
                 if (!worker.isAlive) break
-                if (Thread.currentThread().isInterrupted || isExpired(deadlineNanos)) {
+                if (Thread.currentThread().isInterrupted || isExpired(deadlineNanos, nowNanos())) {
                     runCatching { worker.interrupt() }
                     runCatching { worker.join(GRACE_MS) }
                     return Res.Expired(worker.isAlive)
@@ -506,6 +524,11 @@ internal object DirectSupervisor {
             Thread.currentThread().interrupt()
             runCatching { worker.interrupt() }
             runCatching { worker.join(GRACE_MS) }
+            return Res.Expired(worker.isAlive)
+        }
+        // P1-1 fail-closed postcheck：worker 死於 deadline 之後（join 在最終切片
+        // 才觀測到死亡，迴圈內未來得及看門）亦回 Expired，覆寫 holder 的 Val/Thr。
+        if (Thread.currentThread().isInterrupted || isExpired(deadlineNanos, nowNanos())) {
             return Res.Expired(worker.isAlive)
         }
         return when (val h = holder[0]) {
@@ -634,9 +657,9 @@ class RestrictedShell(
         }
         // P1-4：只凍結一次。後續一律用 frozen，不再讀 argv。
         val frozenRaw: List<String> = when (
-            val r = DirectSupervisor.supervise(deadlineNanos, "direct-freeze") {
+            val r = DirectSupervisor.supervise(deadlineNanos, "direct-freeze", block = {
                 ShellPolicy.copyArgvBounded(argv)
-            }
+            })
         ) {
             is DirectSupervisor.Res.Ok ->
                 r.v ?: return ShellResult.Denied(
@@ -654,9 +677,9 @@ class RestrictedShell(
         // 可信 executable 映射失敗即拒，不建子進程、不佔配額（「拒絕零 spawn」不變量）。
         val custom = execResolver
         val gate: DirectGate = when (
-            val r = DirectSupervisor.supervise(deadlineNanos, "direct-gate") {
+            val r = DirectSupervisor.supervise(deadlineNanos, "direct-gate", block = {
                 gateOnFrozen(frozen, custom)
-            }
+            })
         ) {
             is DirectSupervisor.Res.Ok -> r.v
             is DirectSupervisor.Res.Err -> return ShellResult.Denied(
@@ -781,6 +804,9 @@ class RestrictedShell(
      *   `Failed("interrupted (process cleaned up)")`＋恢復 caller 中斷（P1-1 語義
      *   不變，只是發生地從 caller 線程移到 worker）；其餘抛映 `Failed("spawn
      *   failed")`（固定字串不內插異常訊息，防路徑外洩）。
+     * - P1-1 雙門（fail-closed，不誤判 Ok）：成功路徑亦有 postcheck——worker 死於
+     *   deadline 之後即 `Expired`→`TimedOut`（覆寫 `Val`）；spawn 前 worker 內預檢
+     *   （[DirectSupervisor.PreSpawnTimeoutException]→`TimedOut`，零 spawn）。
      */
     private fun executeFrozen(
         frozen: List<String>,
@@ -818,7 +844,7 @@ class RestrictedShell(
         }
         val custom = execResolver
         val fresh: ShellExecutables.ResolvedExec? = when (
-            val r = DirectSupervisor.supervise(deadlineNanos, "direct-reverify") {
+            val r = DirectSupervisor.supervise(deadlineNanos, "direct-reverify", block = {
                 if (custom != null) {
                     try {
                         custom(safeFirst)
@@ -837,7 +863,7 @@ class RestrictedShell(
                         null
                     }
                 }
-            }
+            })
         ) {
             is DirectSupervisor.Res.Ok -> r.v
             is DirectSupervisor.Res.Err -> null
@@ -879,13 +905,24 @@ class RestrictedShell(
         // 阻塞 runner／慢 tail 只滯 worker（daemon 殘留，有界），不滯 caller。
         val remainingSnapshot = remainingMs
         val raw: RawOutput = when (
-            val r = DirectSupervisor.supervise(deadlineNanos, "direct-process") {
+            val r = DirectSupervisor.supervise(deadlineNanos, "direct-process", block = {
+                // P1-1 spawn 前預檢：supervise 入口→worker 實際執行間有線程啟動＋
+                // 調度間隙，deadline 可在此間逾期；spawn 前再看門一次，逾期／中斷
+                // 即抛 [DirectSupervisor.PreSpawnTimeoutException]（零 spawn，
+                // 上層映 TimedOut，不走 Failed 清理語義）。
+                if (DirectSupervisor.isExpired(deadlineNanos) || Thread.currentThread().isInterrupted) {
+                    throw DirectSupervisor.PreSpawnTimeoutException()
+                }
                 effectiveRunner.run(spawnArgv, remainingSnapshot, ShellExecutables.CLEAN_ENV)
-            }
+            })
         ) {
             is DirectSupervisor.Res.Ok -> r.v
             is DirectSupervisor.Res.Err -> {
                 val t = r.t
+                if (t is DirectSupervisor.PreSpawnTimeoutException) {
+                    // 預檢期滿：spawn 未發生，無需清理，直回 TimedOut。
+                    return ShellResult.TimedOut("", "", timeoutMs, false)
+                }
                 if (t is InterruptedException) {
                     // P1-1：runner 中斷已做 owner 清理（kill+reap＋關流，見 DefaultProcessRunner），
                     // 不偽造 Ok/TimedOut；direct 無 cleanupIncomplete 欄，以 Failed＋KDoc 說明。

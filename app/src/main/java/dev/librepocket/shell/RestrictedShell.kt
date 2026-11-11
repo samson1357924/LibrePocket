@@ -24,7 +24,9 @@ interface ProcessRunner {
     fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>? = null): RawOutput
 }
 
-/** 子進程原始回執：輸出為位元組（截斷前），[timedOut] 表示超時已被殺。
+/** 子進程原始回執：輸出為位元組（截斷前），[timedOut] 表示超時已被殺
+ * （runner 內已 kill+reap；跨 worker 監督語義見 [ShellResult.TimedOut] KDoc——
+ * runner 層 true，supervisor 層 UNKNOWN）。
  *
  * Phase O 完整性旗標（direct 通道誠實性，不新增 [ShellResult] verdict 常數）：
  * - [readFailed]：任一流 gobbler `read` 抛異常（真實 I/O 錯誤；只有真 EOF 才算完整）。
@@ -63,8 +65,8 @@ data class RawOutput(
  *   [DESTROY_GRACE_MS]/[REAP_JOIN_MS]），中斷旗標快照清除後恢復（不吞 caller 中斷）。
  * - 中斷：`waitFor` 抛 [InterruptedException] 即 kill 後原樣重抛（不偽造 Ok/TimedOut；
  *   上層 [RestrictedShell.executeFrozen] 映 `Failed("interrupted (process cleaned up)")`
- *   並恢復中斷；direct [ShellResult] 無 `cleanupIncomplete` 欄，以 Failed＋本 KDoc 說明，
- *   不新增 verdict 常數）。
+ *   並恢復中斷；中斷路徑 verdict 為 Failed（非 TimedOut），故不攜 `cleanupIncomplete`
+ *   旗標——該旗僅屬 [ShellResult.TimedOut]，不新增 verdict 常數）。
  * - reap 失敗（有界 kill 後仍存活，實務僅不可殺 D-state）：try 內主動抛
  *   [IllegalStateException]（轉 `Failed("spawn failed")`），不回健康 Ok；finally 本身不抛
  *   （不遮蔽原異常），殘留風險見 KDoc 殘餘。
@@ -859,7 +861,16 @@ class RestrictedShell(
                 ShellDeny.BLACKLISTED,
                 "invalid argv (fail-closed, no spawn)",
             )
-            is DirectSupervisor.Res.Expired -> return ShellResult.TimedOut("", "", timeoutMs, false)
+            // P2-3 Stage 4：Expired 攜 linger——飽和零 thread（true，全域 backlog
+            // 存在）／worker grace 後仍存活（true，殘留 daemon）／entry 期滿零 worker
+            // （false，無殘留）。舊 `TimedOut(..., false)` 坍縮三態，此處穿透區分。
+            is DirectSupervisor.Res.Expired -> return ShellResult.TimedOut(
+                "",
+                "",
+                timeoutMs,
+                false,
+                cleanupIncomplete = r.hasLinger,
+            )
         }
         val frozen: List<String> = Collections.unmodifiableList(frozenRaw)
         // P2-4：gate（validate＋resolve）同一 worker 同一 deadline 監督。
@@ -875,7 +886,15 @@ class RestrictedShell(
                 ShellDeny.BLACKLISTED,
                 "validation failed (fail-closed, no spawn)",
             )
-            is DirectSupervisor.Res.Expired -> return ShellResult.TimedOut("", "", timeoutMs, false)
+            // P2-3 Stage 4：同上，gate 段 Expired 攜 linger（飽和 true／殘留 true／
+            // 期滿 false），不再坍縮為無旗標 TimedOut。
+            is DirectSupervisor.Res.Expired -> return ShellResult.TimedOut(
+                "",
+                "",
+                timeoutMs,
+                false,
+                cleanupIncomplete = r.hasLinger,
+            )
         }
         val binary: String
         val resolved: ShellExecutables.ResolvedExec
@@ -987,8 +1006,11 @@ class RestrictedShell(
      *   worker 殘留 daemon 有界 ≤[DirectAdmission.MAX_WORKERS]，permit 至退出才釋）；
      * - 真 runner 清理仍在 worker 內（Phase O owner try/finally：關流＋監督
      *   kill+reap，中斷快照恢復），caller `TimedOut` 後台收斂（kill＋reap 斷言見
-     *   Phase P 測試；direct 無 `cleanupIncomplete` 欄，`TimedOut` 即含「已殺」語義，
-     *   殘留只可能是 worker 滯留而非未嘗試清理）；
+     *   Phase P 測試；P2-3 Stage 4 起 `TimedOut.cleanupIncomplete` 誠實揭露殘留：
+     *   process 段 `Expired(hasLinger)` 穿透（worker grace 後仍存活即 true，kill
+     *   可能在 worker 內尚未執行或尚未收斂；飽和零 thread 即 true，全域 backlog
+     *   存在），絕非「已殺」保證——`TimedOut`＝deadline exceeded＋partial，
+     *   清理狀態 UNKNOWN，殘留只可能是 worker 滯留而非未嘗試清理一說已修正）；
      * - worker 抛 [InterruptedException]（runner 中斷已做 owner 清理）映
      *   `Failed("interrupted (process cleaned up)")`＋恢復 caller 中斷（P1-1 語義
      *   不變，只是發生地從 caller 線程移到 worker）；其餘抛映 `Failed("spawn
@@ -1056,7 +1078,15 @@ class RestrictedShell(
         ) {
             is DirectSupervisor.Res.Ok -> r.v
             is DirectSupervisor.Res.Err -> null
-            is DirectSupervisor.Res.Expired -> return ShellResult.TimedOut("", "", timeoutMs, false)
+            // P2-3 Stage 4：reverify 段 Expired 攜 linger（飽和 true／殘留 true／
+            // 期滿 false），與 freeze／gate 同策。
+            is DirectSupervisor.Res.Expired -> return ShellResult.TimedOut(
+                "",
+                "",
+                timeoutMs,
+                false,
+                cleanupIncomplete = r.hasLinger,
+            )
         }
         if (fresh != resolved) {
             return ShellResult.Denied(
@@ -1114,7 +1144,8 @@ class RestrictedShell(
                 }
                 if (t is InterruptedException) {
                     // P1-1：runner 中斷已做 owner 清理（kill+reap＋關流，見 DefaultProcessRunner），
-                    // 不偽造 Ok/TimedOut；direct 無 cleanupIncomplete 欄，以 Failed＋KDoc 說明。
+                    // 不偽造 Ok/TimedOut；中斷路徑 verdict 為 Failed（`cleanupIncomplete`
+                    // 僅屬 TimedOut，此處不攜，見 ShellResult.TimedOut KDoc）。
                     Thread.currentThread().interrupt()
                     return ShellResult.Failed("interrupted (process cleaned up)")
                 }
@@ -1122,9 +1153,17 @@ class RestrictedShell(
                 return ShellResult.Failed("spawn failed")
             }
             is DirectSupervisor.Res.Expired ->
-                // process 超界：空 partial（worker 滯留持有 partial，caller 不取；
-                // 真 runner 清理在 worker 內後台收斂，見本函數 KDoc）。
-                return ShellResult.TimedOut("", "", timeoutMs, false)
+                // P2-3 Stage 4：process 超界空 partial（worker 滯留持有 partial，
+                // caller 不取；真 runner 清理在 worker 內後台收斂，見本函數 KDoc），
+                // linger 穿透——worker grace 後仍存活（true，殘留 daemon，可能仍持
+                // 活子進程／gobbler）／飽和零 thread（true，全域 backlog 存在）。
+                return ShellResult.TimedOut(
+                    "",
+                    "",
+                    timeoutMs,
+                    false,
+                    cleanupIncomplete = r.hasLinger,
+                )
         }
         val out = ShellPolicy.truncate(raw.stdout)
         val err = ShellPolicy.truncate(raw.stderr)
@@ -1143,14 +1182,17 @@ class RestrictedShell(
             return ShellResult.Failed("direct IO read failed (incomplete stream)")
         }
         // P2-2：finished 但 tail 未排空（join 超界仍存活，如子孫繼承 pipe 致 EOF 延遲），
-        // would-be Ok 升級 TimedOut（攜 partial＋truncated），不再回完整 Ok；
+        // would-be Ok 升級 TimedOut（攜 partial＋truncated，不再回完整 Ok）；
         // exitCode 不攜（request 未完成，非命令退出語義；避免以 exit 0 宣告工具完成）。
+        // P2-3 Stage 4：此升級攜 `cleanupIncomplete=true`（殘留 gobbler 仍持 pipe
+        // 讀端／permit，收斂唯一依賴真 EOF；鏡像提權 `tailIncomplete→TimedOut+旗標`）。
         if (raw.outputIncomplete) {
             return ShellResult.TimedOut(
                 partialStdout = out.bytes.toUtf8Lossy(),
                 partialStderr = err.bytes.toUtf8Lossy(),
                 timeoutMs = timeoutMs,
                 truncated = truncated,
+                cleanupIncomplete = true,
             )
         }
         return ShellResult.Ok(

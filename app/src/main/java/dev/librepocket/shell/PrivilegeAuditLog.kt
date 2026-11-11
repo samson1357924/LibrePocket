@@ -259,6 +259,11 @@ class PrivilegeAuditLog {
         fun verdictName(result: ShellResult): String = when (result) {
             is ShellResult.Ok -> "OK"
             is ShellResult.Denied -> "DENY"
+            // P2-3 Stage 4：TimedOut 恆映 TIMEOUT（verdict 不變）；`cleanupIncomplete`
+            // 殘留細節不進審計表（本表只記四碼雜湊計數，見類 KDoc B6／#136-B3）。
+            // 本模組零 Android 依賴、無日誌門面，故不在此 warn-log；排障須看回執旗標。
+            // TODO(#136-B3): 審計可辨識性 —— `record` 加可選 `details`（linger 枚舉＋
+            // 耗時＋cap 軌）或開 `ElevatedDebugEvents` 環形緩衝。
             is ShellResult.TimedOut -> "TIMEOUT"
             is ShellResult.Failed -> "FAILED"
         }

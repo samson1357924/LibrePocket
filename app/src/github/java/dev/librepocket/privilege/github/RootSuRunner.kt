@@ -255,8 +255,8 @@ class RootSuRunner(
 ) : BinaryElevatedRunner {
 
     /**
-     * 文字相容殼：經 [toShellResult] 丟棄 cleanupIncomplete（[ShellResult] 無此欄位）；
-     * 監測須用 runBinary（二進位 [ElevatedBinaryResult] 為準）。
+     * 文字相容殼：經 [toShellResult] 保留 TimedOut.cleanupIncomplete（Stage 4 起穿透）；
+     * Denied／Failed 無對應欄仍丟棄。監測須用 runBinary（二進位 [ElevatedBinaryResult] 為準）。
      */
     override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult =
         runBinary(request, timeoutMs).toShellResult()

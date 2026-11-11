@@ -155,8 +155,9 @@ sealed interface ElevatedBinaryResult {
  * P2-A 可見性：保持 public（public Runner 的 supertype，
  * 收斂為 internal 會暴露內部超型別，故不收斂）。
  *
- * 清理旗標監測契約：[run] 為文字相容殼，經 [toShellResult] 丟棄
- * cleanupIncomplete（[ShellResult] 無此欄位）；監測須用 runBinary
+ * 清理旗標監測契約：[run] 為文字相容殼，經 [toShellResult] 保留
+ * [ElevatedBinaryResult.TimedOut.cleanupIncomplete]（P2-3 Stage 4 起穿透；
+ * [ShellResult.TimedOut] 同名欄，預設 false）；監測仍建議用 runBinary
  * （二進位 [ElevatedBinaryResult] 為準，攜 Ok/TimedOut/Denied/Failed 全分支旗標）。
  */
 interface BinaryElevatedRunner : ElevatedShellRunner {
@@ -187,7 +188,8 @@ interface BinaryElevatedRunner : ElevatedShellRunner {
  *   （`ElevatedRunnerCommon.quarantineHeld`，訊息含 `quarantine held`），
  *   不與上四因混碼；同為零 spawn、不耗配額，審計同記 `DENY`，
  *   另攜 `cleanupIncomplete=true`（quarantine 接管前 cleanup 仍未完成，
- *   fail-closed 信號經 verdict 持久帶出；`toShellResult` 照既有契約丟棄旗標）；
+ *   fail-closed 信號經 verdict 持久帶出；binary 層攜旗，`toShellResult` 僅
+ *   `TimedOut` 穿透、`Denied` 無對應欄仍丟棄）；
  * - 取消／超時同 `TimedOut`：spawn 前取消（`checkPreSpawnCancel`）、deadline
  *   耗盡（`preSpawnExpired`）、drain 超時／取消（kill 路徑）一律
  *   `TimedOut`（空 partial；`cleanupIncomplete` 見下 P2-4 契約——未建進程且
@@ -233,9 +235,10 @@ fun ElevatedBinaryResult.verdict(): String = when (this) {
  * 本函數不加 `Deprecated`：文字相容殼仍為 [ElevatedShellRunner.run]
  * 的實現手段，保留合法呼叫。
  *
- * AA1 誠實聲明：legacy String 路徑不攜清理旗標（[ShellResult] 無此欄位，
- * 此處不映射 cleanupIncomplete；二進位 [ElevatedBinaryResult] 為準，
- * 監測須用 runBinary）。
+ * AA1 誠實聲明（P2-3 Stage 4 起穿透，不再丟棄）：文字相容轉換保留
+ * [ElevatedBinaryResult.TimedOut.cleanupIncomplete]（[ShellResult.TimedOut] 同名欄，
+ * 預設 false；舊 4 參構造仍可編譯）。監測仍建議用 runBinary（二進位為準），
+ * 但文字路徑亦不再丟旗標。
  */
 fun ElevatedBinaryResult.toShellResult(): ShellResult = when (this) {
     is ElevatedBinaryResult.Ok ->
@@ -252,6 +255,7 @@ fun ElevatedBinaryResult.toShellResult(): ShellResult = when (this) {
             partialStderr = String(partialStderr, Charsets.UTF_8),
             timeoutMs = timeoutMs,
             truncated = truncated,
+            cleanupIncomplete = cleanupIncomplete,
         )
     is ElevatedBinaryResult.Failed -> ShellResult.Failed(message)
 }

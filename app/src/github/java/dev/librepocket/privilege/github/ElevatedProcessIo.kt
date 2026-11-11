@@ -2949,8 +2949,8 @@ internal object ElevatedRunnerCommon {
      * Round-3 Phase E 未驗證 quarantine 持有時的 typed 拒絕（P1-1）：
      * `QUARANTINE` 獨立原因碼（不與 backlog／breaker 的 `QUOTA_EXCEEDED` 混碼），
      * 不建子進程。`cleanupIncomplete=true`（quarantine 明確接管前 cleanup 仍未完成，
-     * fail-closed 信號經 verdict 持久帶出；`toShellResult` 照既有契約丟棄本旗標，
-     * 監測須用 runBinary）。
+     * fail-closed 信號經 verdict 持久帶出；`toShellResult` 保留 TimedOut.cleanupIncomplete
+     * （Stage 4 起穿透），Denied 無對應欄仍丟棄，監測須用 runBinary）。
      */
     fun quarantineHeld(): ElevatedBinaryResult.Denied =
         ElevatedBinaryResult.Denied(ShellDeny.QUARANTINE, QUARANTINE_HELD_MESSAGE, true)

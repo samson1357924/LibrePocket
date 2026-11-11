@@ -106,6 +106,17 @@ class ShellStageGAbbrevTest {
         )
     }
 
+    private fun assertBlockedResponseFile(v: Validation, argv: List<String>) {
+        // Stage I：`--files0-from` 家族一律 response-file 拒（域內亦拒），
+        // 不再走相對路徑家族。
+        assertTrue("expected Denied for $argv, got $v", v is Validation.Denied)
+        assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+        assertTrue(
+            "message must stay in response-file family, got ${v.message}",
+            v.message.contains("response file denied"),
+        )
+    }
+
     private fun firstExecutable(vararg paths: String): String? =
         paths.firstOrNull { File(it).canExecute() }
 
@@ -355,21 +366,39 @@ class ShellStageGAbbrevTest {
         // du `--files0-from`（NUL 名單檔）＋`--exclude-from` 分離形短橫即檔名；
         // uutils 實測接受唯一前綴（`--f/--fi/--files/--exclude-` 皆開檔）。
         // du `-X` 短旗（分離形經槽、附著形 `-Xrest` 經附著門）見 duShortX 系列測試。
+        // Stage I 注記：`--files0-from` 家族現由 response-file 門一律拒
+        // （域內亦拒，見 [ShellPolicy.isResponseFileKey]），訊息家族為
+        // `response file denied`，不再是 `relative path denied`；
+        // `--exclude-from` 家族維持相對路徑家族（patterns 檔 vet）。
         val f = fileKeyFixture("stageG-dufile")
         try {
-            val vectors = listOf(
+            val responseVectors = listOf(
                 listOf("du", "--files0-from", "-secret", f.scope.absolutePath),
                 listOf("du", "--files0-from=-secret", f.scope.absolutePath),
                 listOf("du", "--files0-from=bare/relative", f.scope.absolutePath),
                 listOf("du", "--files0-f", "-secret", f.scope.absolutePath),
                 listOf("du", "--files0-f=-secret", f.scope.absolutePath),
                 listOf("du", "--f", "-secret", f.scope.absolutePath),
+                listOf("toybox", "du", "--files0-from", "-secret", f.scope.absolutePath),
+            )
+            val relativeVectors = listOf(
                 listOf("du", "--exclude-from", "-secret", f.scope.absolutePath),
                 listOf("du", "--exclude-from=-secret", f.scope.absolutePath),
                 listOf("du", "--exclude-", "-secret", f.scope.absolutePath),
-                listOf("toybox", "du", "--files0-from", "-secret", f.scope.absolutePath),
             )
-            for (argv in vectors) {
+            for (argv in responseVectors) {
+                assertBlockedResponseFile(ShellPolicy.validate(argv, f.scope.absolutePath), argv)
+                assertBlockedResponseFile(
+                    ShellPolicy.validateElevated(
+                        argv,
+                        f.scope.absolutePath,
+                        flavor = Flavor.GITHUB,
+                        bridgeGranted = true,
+                    ),
+                    argv,
+                )
+            }
+            for (argv in relativeVectors) {
                 assertBlockedRelative(ShellPolicy.validate(argv, f.scope.absolutePath), argv)
                 assertBlockedRelative(
                     ShellPolicy.validateElevated(
@@ -389,13 +418,19 @@ class ShellStageGAbbrevTest {
 
     @Test fun fileKeyAbbrevAllowForms_preservedDirectAndElevated() {
         // 放行 pin：縮寫 `=域內絕對`（use==validated）维持放行。
+        // Stage I 注記：`du --files0-from=/abs`（精確＋縮寫）本曾在此放行
+        // （Stage G vet-allow），現一律 Denied——MANIFEST 域內亦拒：
+        // `du` 在 spawn 後讀 MANIFEST 內容所列 NUL 路徑（域外）即穿出 FileScope
+        // （review v5 P1-3；GNU 實測真讀，見 ShellStageIResponseFileTest）。
+        // 未來受控 helper（讀＋vet＋freeze＋替換 operands）屬 out-of-scope。
+        // 故本測試僅保留 `--exclude-from` 家族（patterns 檔，非 file-list
+        // indirection）與 grep `--exclude-f` 放行；`--files0-from` 家族見下
+        // `fileKeyAbbrevFiles0From_nowDeniedStageI`（Denied＋零 spawn）。
         val f = fileKeyFixture("stageG-fallow")
         try {
             val vectors = listOf(
                 listOf("grep", "hello", "--exclude-f=" + f.patternsAbs, f.inputAbs),
                 listOf("grep", "hello", "--exclude-fr=" + f.patternsAbs, f.inputAbs),
-                listOf("du", "--files0-from=" + f.patternsAbs, f.scope.absolutePath),
-                listOf("du", "--files0-f=" + f.patternsAbs, f.scope.absolutePath),
                 listOf("du", "--exclude-from=" + f.patternsAbs, f.scope.absolutePath),
                 // 附著 `=v` 不設次位槽：其後的 `-e` 仍是顯式 pattern（非檔名），
                 // 整串合法即放行（slot 誤設會把 `-e` 當檔拒掉）。
@@ -422,6 +457,49 @@ class ShellStageGAbbrevTest {
                         bridgeGranted = true,
                     ) is Validation.Allowed,
                 )
+            }
+        } finally {
+            f.scope.deleteRecursively()
+            f.outside.deleteRecursively()
+        }
+    }
+
+    @Test fun fileKeyAbbrevFiles0From_nowDeniedStageI() {
+        // Stage I 翻轉（review v5 P1-3）：`du --files0-from=/abs`（精確＋縮寫）
+        // 即使 MANIFEST 域內亦 Denied＋零 spawn（舊 Stage G vet-allow 已翻轉）。
+        // 原因：MANIFEST 內容所列 NUL 路徑在 spawn 後由 `du` 直讀，不經 FileScope；
+        // 政策只 vet 本體即穿出（無需 symlink／race／`-L`）。
+        val f = fileKeyFixture("stageG-fallow-flip")
+        try {
+            val vectors = listOf(
+                listOf("du", "--files0-from=" + f.patternsAbs, f.scope.absolutePath),
+                listOf("du", "--files0-f=" + f.patternsAbs, f.scope.absolutePath),
+            )
+            for (argv in vectors) {
+                val v = ShellPolicy.validate(argv, f.scope.absolutePath)
+                assertTrue("expected Denied for $argv, got $v", v is Validation.Denied)
+                assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+                assertTrue(
+                    "message must stay in response-file family, got ${v.message}",
+                    v.message.contains("response file denied"),
+                )
+                val ve = ShellPolicy.validateElevated(
+                    argv,
+                    f.scope.absolutePath,
+                    flavor = Flavor.GITHUB,
+                    bridgeGranted = true,
+                )
+                assertTrue("expected elevated Denied for $argv, got $ve", ve is Validation.Denied)
+                assertEquals(ShellDeny.BLACKLISTED, (ve as Validation.Denied).reason)
+                val runner = ArgvCaptureRunner()
+                val shell = RestrictedShell(
+                    runner = runner,
+                    privateRoot = f.scope.absolutePath,
+                    execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
+                )
+                val result = shell.execute(argv)
+                assertTrue("expected Denied, got $result", result is ShellResult.Denied)
+                assertEquals(0, runner.calls)
             }
         } finally {
             f.scope.deleteRecursively()

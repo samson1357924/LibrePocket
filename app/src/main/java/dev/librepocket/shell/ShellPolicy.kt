@@ -569,6 +569,65 @@ object ShellPolicy {
     }
 
     /**
+     * Stage I (P1-3 response-file indirection) deny-all (direct/elevated/guest/multicall同門):
+     *
+     * `du --files0-from=F` / `wc --files0-from=F`（double-dash，exact＋GNU
+     * `getopt_long` 唯一前綴縮寫＋`=v` 附著＋分離形）與 `find -files0-from F`
+     * （single-dash，分離形為唯一真讀形；`=v` 附著／縮寫／double-dash 在 GNU
+     * 皆 exit 1 `未知謂語`，fail-closed 一併拒）皆為 response-file indirection：
+     * 政策若只 vet MANIFEST 本體（`/scope/patterns` 域內即放行），`du/wc/find`
+     * 在 spawn 後讀 MANIFEST 內容所列 NUL 路徑（`/outside/...`）即穿出
+     * [FileScope]（無需 symlink／race／`-L`；GNU 實測三者皆真讀域外，見
+     * `ShellStageIResponseFileTest` REAL 證據；Toybox per-ROM 未驗，
+     * 拒絕對其 fail-closed 無害——無效旗標本就 exit 2）。
+     *
+     * 故一律 `Denied(BLACKLISTED)`（含域內 MANIFEST，vet 獨立性）：
+     * - 見即拒（key token 本體，不看次 argv 值槽）：分離形與 `=v` 附著同門；
+     * - `endOfOptions`／REQUIRED-FILENAME 槽／取值旗標值槽內亦拒（fail-closed，
+     *  罕見寫法誤殺可接受；`--` 後同名檔名一併拒）；
+     * - guest＋scope 亦拒（容器內 MANIFEST 內容仍可列容器內外路徑，不豁免）；
+     * - multicall 有效形同門（[checkPathArgs] 以有效基調用，本門已在該函數內，
+     *  無需另設 applet 門）。
+     *
+     * 未來受控 helper（讀＋vet＋freeze＋替換 operands）屬 out-of-scope，
+     * 見 [checkPathArgs] 內調用點注記；本門僅 deny-all。
+     *
+     * 判定（`arg` 為原始 token，大小寫敏感）：
+     * - du/wc：`=` 前鍵（見 [longKeyBeforeEq]）為 `--files0-from` 精確、
+     *   其唯一前綴（`len>=3`，du 僅此一 `--f*`，wc 僅此一 `--f*`，
+     *   `--f/--fi/--files0-f…` 皆 GNU 實測真讀）或其無效延伸
+     *   （`--files0-from*`，GNU 報錯，拒無害）即拒；
+     * - find：`=` 前鍵為 `-files0-from` 精確、`-files0-from*` 延伸
+     *   （含 `=v`，GNU 報錯，拒無害）、`-files0-from` 的單橫前綴
+     *   （`len>=4`，GNU 報錯，拒無害）或 double-dash 對應形
+     *   （防禦性，GNU 報錯，拒無害）即拒。
+     * 他 binary 回 false；`--files-from`（非 NUL）GNU 三者皆無此鍵，
+     * 不在判定內（誤拼即各 binary 自報錯，拒絕面不擴）。
+     */
+    private fun isResponseFileKey(base: String, arg: String): Boolean {
+        if (base == "du" || base == "wc") {
+            if (!arg.startsWith("--")) return false
+            val key = longKeyBeforeEq(arg)
+            if (key == "--files0-from") return true
+            if (key.length >= 3 && "--files0-from".startsWith(key)) return true
+            if (key.startsWith("--files0-from")) return true
+            return false
+        }
+        if (base == "find") {
+            val eq = arg.indexOf('=')
+            val key = if (eq >= 0) arg.substring(0, eq) else arg
+            if (key == "-files0-from" || key == "--files0-from") return true
+            if (key.startsWith("-files0-from") || key.startsWith("--files0-from")) return true
+            if (key.length >= 4 && key.startsWith("-") && !key.startsWith("--") &&
+                "-files0-from".startsWith(key)
+            ) return true
+            if (key.length >= 3 && key.startsWith("--") && "--files0-from".startsWith(key)) return true
+            return false
+        }
+        return false
+    }
+
+    /**
      * Stage G：開檔長鍵規範化（`key` 為 `=` 前鍵，base 感知，canonicalize-then-judge）。
      *
      * GNU/uutils 唯一前綴縮寫同樣打開檔案（實測：grep `--exclude-f/--exclude-fr`
@@ -583,8 +642,12 @@ object ShellPolicy {
      * - du：`--exclude-from` 同上（du 無 `--exclude-dir`，故 `--exclude-` 亦唯一，
      *   一併映射）＋`--files0-from` 精確＋唯一前綴（du 仅此一 `--f*` 長鍵，
      *   `--f…--files0-f…` 皆映射，uutils 實測確認）＋無效延伸（fail-closed）；
+     *   Stage I 注記：本映射對 `--files0-from` 家族僅具文件／保底意義，
+     *   實際先由 [isResponseFileKey] deny-all（域內 MANIFEST 亦拒），
+     *   不再走 vet-allow；
      * - 他 binary：回 null（呼叫方另以 [FILE_VALUE_OPT_KEYS] 精確集保底，
-     *   未知提權＋scope 的 `--file=` 仍全拒）。
+     *   未知提權＋scope 的 `--file=` 仍全拒；
+     *   Stage I：`wc --files0-from` 家族不經本映射，逕由 [isResponseFileKey] 拒）。
      * 非 `--` 起頭或過短（`--` 本身）回 null。
      */
     private fun canonicalFileKey(base: String, key: String): String? {
@@ -1370,6 +1433,8 @@ object ShellPolicy {
         // Stage G：du `--files0-from`（NUL 名單檔，`--files0-from F` 分離形經槽、
         // `--files0-from=F` 經本鍵；縮寫經 [canonicalFileKey] base 感知映射，
         // 此處精確集保底未知 binary 的 `=v` 嚴審）。
+        // Stage I 注記：本集對 `--files0-from` 僅具保底文件意義，實際先由
+        // [isResponseFileKey] deny-all（du/wc/find，域內亦拒），不再走 vet-allow。
         "--files0-from",
     )
 
@@ -1596,6 +1661,18 @@ object ShellPolicy {
                 return Validation.Denied(
                     ShellDeny.BLACKLISTED,
                     "bind forbidden inside guest argv",
+                )
+            }
+            // Stage I（P1-3 response-file indirection）deny-all：見 [isResponseFileKey]。
+            // MANIFEST 本體即使域內亦拒（vet 獨立性）：`du/wc/find` 在 spawn 後讀
+            // MANIFEST 內容所列 NUL 路徑即穿出 FileScope；未來受控 helper
+            //（讀＋vet＋freeze＋替換 operands）屬 out-of-scope，本門僅 deny-all。
+            // 全位置（選項位／值槽／`--` 後／槽內皆拒，guest 亦不豁免，multicall
+            // 有效形經本函數同門）；`absoluteCandidates` 之前先判，不做實體 IO。
+            if (isResponseFileKey(base, arg)) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "response file denied (fail-closed, indirection): $arg",
                 )
             }
             // Stage F：簇空 REST 值槽消費（`e` pattern／`m/A/B/C/D/d` 數值列舉）。

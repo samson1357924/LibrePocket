@@ -146,6 +146,54 @@ class ElevatedRunnerTest {
         }
     }
 
+    @Test fun stageIResponseFileDeniedWithoutSpawnOnBothRunners() {
+        // Stage I (P1-3 response-file indirection) runner-level pin: validateElevated
+        // 先行門即拒，雙 runner 皆零 spawn。fake scope ("/scope/...")：runner 取
+        // explicit scope 參數，政策門在實體 IO 前即以 key token 拒，故無需真實
+        // MANIFEST 檔；訊息須留 response-file 家族。
+        val vectors = listOf(
+            listOf("du", "--files0-from", "/scope/list", "/scope"),
+            listOf("du", "--files0-from=/scope/list", "/scope"),
+            listOf("du", "--files0-f", "/scope/list", "/scope"),
+            listOf("du", "--f", "/scope/list", "/scope"),
+            listOf("du", "--files0-f=/scope/list", "/scope"),
+            listOf("du", "--f=/scope/list", "/scope"),
+            listOf("wc", "--files0-from", "/scope/list", "-c"),
+            listOf("wc", "--files0-from=/scope/list", "-c"),
+            listOf("wc", "--files0-f", "/scope/list", "-c"),
+            listOf("wc", "--f", "/scope/list", "-c"),
+            listOf("wc", "--files0-f=/scope/list", "-c"),
+            listOf("wc", "--f=/scope/list", "-c"),
+            listOf("find", "-files0-from", "/scope/list", "-print"),
+            listOf("find", "-files0-from=/scope/list", "-print"),
+            listOf("find", "-files0-f", "/scope/list", "-print"),
+            listOf("find", "--files0-from", "/scope/list", "-print"),
+            listOf("toybox", "du", "--files0-from", "/scope/list", "/scope"),
+            listOf("toybox", "du", "--files0-from=/scope/list", "/scope"),
+            listOf("toybox", "du", "--f", "/scope/list", "/scope"),
+            listOf("toybox", "wc", "--files0-from", "/scope/list", "-c"),
+            listOf("toybox", "wc", "--files0-from=/scope/list", "-c"),
+            listOf("toybox", "wc", "--f=/scope/list", "-c"),
+            listOf("toybox", "find", "-files0-from", "/scope/list", "-print"),
+            listOf("toybox", "find", "-files0-from=/scope/list", "-print"),
+        )
+        for (argv in vectors) {
+            for (factory in listOf<(SpawnCounter) -> Any>({ s -> shizukuRunner(s) }, { s -> rootRunner(s) })) {
+                val spawn = SpawnCounter()
+                @Suppress("UNCHECKED_CAST")
+                val runner = factory(spawn) as dev.librepocket.shell.ElevatedShellRunner
+                val r = runner.run(ElevatedRequest(argv, reasonCode = "D09-T"))
+                assertTrue("$argv -> $r", r is ShellResult.Denied)
+                assertEquals(ShellDeny.BLACKLISTED, (r as ShellResult.Denied).reason)
+                assertTrue(
+                    "message must stay in response-file family, got ${r.message}",
+                    r.message.contains("response file denied"),
+                )
+                assertEquals("spawn must be zero for $argv", 0, spawn.calls)
+            }
+        }
+    }
+
     @Test fun reasonCodeRequiredAndQuotaApplies() {
         val spawn = SpawnCounter()
         val quota = ShellQuota(maxCalls = 1, windowMs = 60_000L)

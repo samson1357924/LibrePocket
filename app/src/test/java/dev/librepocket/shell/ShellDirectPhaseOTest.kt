@@ -237,10 +237,15 @@ class ShellDirectPhaseOTest {
         val scope = tempDir("phaseO-exec-big")
         try {
             val big = File(scope, "big.bin").apply { writeBytes(ByteArray(700 * 1024) { 0x43 }) }
+            // Stage 5 P3-4：真系統二進位須配允許集＋不可寫模擬（同 sleep 用例）。
+            val realCat = File("/bin/cat").canonicalPath
+            val catRoot = File(realCat).parentFile.canonicalPath
             val shell = RestrictedShell(
                 runner = DefaultProcessRunner(),
                 privateRoot = scope.absolutePath,
-                execResolver = { ShellExecutables.ResolvedExec("/bin/cat", null) },
+                execAllowedRoots = listOf(catRoot),
+                execIsWritable = { _ -> false },
+                execResolver = { ShellExecutables.ResolvedExec(realCat, null) },
             )
             val r = shell.execute(listOf("cat", big.absolutePath), timeoutMs = 30_000L)
             assertTrue("$r", r is ShellResult.Ok)

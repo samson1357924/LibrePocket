@@ -233,7 +233,9 @@ internal object ElevatedExecPolicy {
         }
         // P2-7 parity 縱深：即使陳舊映射攜非 null applet，主程式自身一律不插。
         val realBase = resolved.path.substringAfterLast('/')
-        val logicalBase = ShellPolicy.basename(snapshot.argv[0])
+        // P3-1 trimmed logicalBase：驗證側已 trim，spawn 側同口徑，否則
+        // `["  ls  "]` 驗為 `ls` 卻 spawn `[real,"  ls  "]`（applet 帶空格）。
+        val logicalBase = ShellPolicy.basename(snapshot.argv[0].trim())
         if (realBase !in ShellExecutables.MULTICALL_BINARIES || logicalBase == realBase) {
             return listOf(resolved.path) + snapshot.argv.drop(1)
         }

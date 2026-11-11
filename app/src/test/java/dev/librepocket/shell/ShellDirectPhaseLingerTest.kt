@@ -116,10 +116,16 @@ class ShellDirectPhaseLingerTest {
         var child: Process? = null
         val runner = DefaultProcessRunner()
         runner.processObserver = { child = it }
+        // Stage 5 P3-4：自訂映射須過再驗證；真系統二進位以 real 父目錄為允許集、
+        // 裝置不可寫模擬（宿主 /tmp 可寫不影響系統路徑判定），否則 fail-closed 拒。
+        val realSleep = File("/bin/sleep").canonicalPath
+        val sleepRoot = File(realSleep).parentFile.canonicalPath
         val shell = RestrictedShell(
             runner = runner,
             privateRoot = null,
-            execResolver = { ShellExecutables.ResolvedExec("/bin/sleep", null) },
+            execAllowedRoots = listOf(sleepRoot),
+            execIsWritable = { _ -> false },
+            execResolver = { ShellExecutables.ResolvedExec(realSleep, null) },
         )
         try {
             val r = shell.execute(listOf("sleep", "30"), timeoutMs = 300L)

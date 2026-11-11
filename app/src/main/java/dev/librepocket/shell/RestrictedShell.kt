@@ -1,5 +1,6 @@
 package dev.librepocket.shell
 
+import dev.librepocket.files.FileScope
 import dev.librepocket.tool.Flavor
 import java.io.ByteArrayOutputStream
 import java.util.ArrayDeque
@@ -802,6 +803,17 @@ class RestrictedShell(
      * 覆寫後才 spawn，不採信映射自帶字串。
      * null（預設）路徑的拒絕訊息攜帶 [ShellExecutables.ResolveDeny] reason code
      * （不含任意 filesystem path）；自訂映射路徑維持通用訊息。
+     *
+     * Stage 5 P3-4 自訂映射再驗證（fail-closed，提權 F1 parity）：
+     * 自訂映射回傳不再全信——回傳路徑必經同一實體驗證（containment＋
+     * app-writability＋entry 閘，見 [ShellExecutables.verifiedTargetDetailed]，
+     * entryRoot 取回傳路徑的 lexical parent；允許集／writability 判定沿用本類
+     * 同參），未通過即 `Denied` 且零 spawn；spawn 用驗證後實體路徑，applet
+     * 以白名單放行值（`Allowed.binary`）重算，不採信映射自帶字串。
+     * 測試相容：回傳路徑確定缺席（`NOT_FOUND`，如 hermetic 假 `/trusted/...`）
+     * 仍放行原路徑（spawn 側假 runner 不落地，見 `ShellWhitelistTest` 註解；
+     * 真缺席 spawn 即 `Failed`，不執行未驗證內容）；其餘失敗（`OUTSIDE_ROOTS`／
+     * `REAL_WRITABLE`／`ENTRY_WRITABLE` 等）一律拒。生產一律 null（無此分支）。
      */
     private val execResolver: ((String) -> ShellExecutables.ResolvedExec?)? = null,
 ) {
@@ -941,7 +953,7 @@ class RestrictedShell(
             )
         }
         if (custom != null) {
-            val r = try {
+            val rawExec = try {
                 custom(first)
             } catch (_: Exception) {
                 null
@@ -949,7 +961,11 @@ class RestrictedShell(
                 ShellDeny.BLACKLISTED,
                 "untrusted executable: $first",
             )
-            return DirectGate.Ready(binary, r)
+            val verified = verifyCustomExec(rawExec, binary) ?: return DirectGate.Denied(
+                ShellDeny.BLACKLISTED,
+                "untrusted executable: $first",
+            )
+            return DirectGate.Ready(binary, verified)
         }
         val outcome = try {
             ShellExecutables.resolveDetailed(
@@ -971,6 +987,65 @@ class RestrictedShell(
                 )
             }
         return DirectGate.Ready(binary, r)
+    }
+
+    /**
+     * Stage 5 P3-4 自訂映射再驗證（提權 F1 同閘，見本類 `execResolver` KDoc）：
+     * - 輸入 `raw` 為自訂映射回傳（僅測試桩用，生產 null 不經此函數）；
+     *   `binary` 為白名單放行值（`Allowed.binary`，已 trim 的 basename）。
+     * - 路徑非法（空／NUL／含 `\`／相對／無 parent）即 null（fail-closed）；
+     * - 經 [ShellExecutables.verifiedTargetDetailed] 同閘驗證（containment＋
+     *   real writability＋entry，允許集／判定沿用本類同參）：
+     *   成功即回驗證後實體＋重算 applet（`realBase ∈ MULTICALL ＆ binary !=
+     *   realBase` 才攜 `binary`，主程式自身一律 null，不採信映射自帶字串）；
+     *   `NOT_FOUND`（hermetic 假路徑，如 `/trusted/...`）放行原路徑＋重算
+     *   applet（假 runner 不落地，真缺席 spawn 即 `Failed`）；其餘失敗一律 null。
+     * - 純函數＋FS 阻塞體，呼叫方須在監督 worker 內執行（見 gate／reverify）。
+     */
+    private fun verifyCustomExec(
+        raw: ShellExecutables.ResolvedExec?,
+        binary: String,
+    ): ShellExecutables.ResolvedExec? {
+        if (raw == null) return null
+        val rawPath = try {
+            raw.path.trim()
+        } catch (_: Exception) {
+            return null
+        }
+        if (rawPath.isEmpty() || rawPath.contains('\u0000') || rawPath.contains('\\')) return null
+        val normPath = try {
+            FileScope.normalize(rawPath)
+        } catch (_: Exception) {
+            return null
+        }
+        if (!normPath.startsWith("/")) return null
+        val slash = normPath.lastIndexOf('/')
+        if (slash <= 0) return null
+        val entryRoot = normPath.substring(0, slash).ifEmpty { "/" }
+        val roots = execAllowedRoots ?: ShellExecutables.snapshotRealRoots(execSearchDirs)
+        val (real, failure) = try {
+            ShellExecutables.verifiedTargetDetailed(normPath, roots, execIsWritable, entryRoot)
+        } catch (_: Exception) {
+            null to ShellExecutables.ResolveDeny.NOT_FOUND
+        }
+        // applet 一律重算（不採信映射自帶字串；multicall 別名形才攜 binary）。
+        fun fixedApplet(realPath: String): String? {
+            val realBase = realPath.substringAfterLast('/')
+            return if (realBase in ShellExecutables.MULTICALL_BINARIES &&
+                binary.isNotEmpty() && binary != realBase
+            ) {
+                binary
+            } else {
+                null
+            }
+        }
+        if (real != null) return ShellExecutables.ResolvedExec(real, fixedApplet(real))
+        // hermetic 假路徑相容：確定缺席放行原路徑（spawn 假 runner 不落地）；
+        // 其餘（OUTSIDE_ROOTS／REAL_WRITABLE／ENTRY_WRITABLE 等）一律拒。
+        if (failure == ShellExecutables.ResolveDeny.NOT_FOUND) {
+            return ShellExecutables.ResolvedExec(normPath, fixedApplet(normPath))
+        }
+        return null
     }
 
     private sealed interface DirectGate {
@@ -1057,11 +1132,13 @@ class RestrictedShell(
         val fresh: ShellExecutables.ResolvedExec? = when (
             val r = DirectSupervisor.supervise(deadlineNanos, "direct-reverify", block = {
                 if (custom != null) {
-                    try {
+                    // P3-4：自訂映射重驗同 gate（再驗證＋applet 重算，不採信原串）。
+                    val rawExec = try {
                         custom(safeFirst)
                     } catch (_: Exception) {
                         null
                     }
+                    verifyCustomExec(rawExec, binary)
                 } else {
                     try {
                         (ShellExecutables.resolveDetailed(

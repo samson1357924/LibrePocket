@@ -175,6 +175,11 @@ class PrivilegeAuditLog {
          * `?` 计 1，与 `toByteArray(UTF_8)` 一致），超 [MAX_REASON_CODE_BYTES]
          * 即 early-exit（长输入不断言全扫，无 2× 物化）。
          * 返回值在超限时只保证 `> MAX`（饱和，不承诺精确长度）。
+         *
+         * P3-2 孤立代理注记：本计数把 lone surrogate 按 `?` 计 1（与 JDK
+         * `toByteArray` 替换语义一致），故 `"\uD800"` 与 `"?"` 同计 1。
+         * 单靠计数不可辨——入站门 [isReasonCodeTooLong] 另行拒孤立代理
+         * （fail-closed），不进哈希（见该函数）。
          */
         fun reasonUtf8Length(reason: String): Int {
             var total = 0
@@ -203,9 +208,40 @@ class PrivilegeAuditLog {
             return total
         }
 
-        /** reasonCode 是否超限（gate／audit／hash 前的统一门，见 P2-2）。 */
-        fun isReasonCodeTooLong(reason: String): Boolean =
-            reasonUtf8Length(reason) > MAX_REASON_CODE_BYTES
+        /** reasonCode 是否超限（gate／audit／hash 前的统一门，见 P2-2）。
+         *
+         * P3-2 孤立代理 fail-closed（Phase H argv 门 parity）：未配对代理
+         * 经 `toByteArray(UTF_8)` 替换为 `[63]`（即 `?`），与 `"?"` 同串、
+         * 同哈希（单射只对良构字串成立，见 [encodeArgv] 注记）。入站即拒
+         * （回 true），不进哈希替换分支；直调 [sha256Hex] 仍得替换后哈希
+         * （行为保留，不承诺单射）。
+         */
+        fun isReasonCodeTooLong(reason: String): Boolean {
+            if (hasLoneSurrogate(reason)) return true
+            return reasonUtf8Length(reason) > MAX_REASON_CODE_BYTES
+        }
+
+        /**
+         * 孤立代理检查（P3-2，reason 入站门用；与 [ShellPolicy.hasLoneSurrogate]
+         * 同式，刻意重复以保本模块零 ShellPolicy 依赖——审计门不随政策
+         * 层改动而漂移；两处须同步，见 `ShellStage5Test` 双门一致断言）。
+         * 高代理后无低代理、低代理前无高代理即孤立；配对代理放行。纯扫描，不抛。
+         */
+        internal fun hasLoneSurrogate(s: String): Boolean {
+            var i = 0
+            while (i < s.length) {
+                val c = s[i]
+                if (c.isHighSurrogate()) {
+                    if (i + 1 >= s.length || !s[i + 1].isLowSurrogate()) return true
+                    i += 2
+                } else if (c.isLowSurrogate()) {
+                    return true
+                } else {
+                    i++
+                }
+            }
+            return false
+        }
 
         /**
          * argv 向量的單射編碼（Phase D P2-3，PR #140 Round-2）：

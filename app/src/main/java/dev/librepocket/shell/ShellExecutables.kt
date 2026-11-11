@@ -642,7 +642,8 @@ object ShellExecutables {
     private fun toResolved(argv0: String, realPath: String): ResolvedExec? {
         val realBase = realPath.substringAfterLast('/')
         if (realBase !in MULTICALL_BINARIES) return ResolvedExec(realPath, null)
-        val logicalBase = ShellPolicy.basename(argv0)
+        // P3-1 parity：呼叫方已傳 trim 後 raw，此處再 trim 以保直調不分叉。
+        val logicalBase = ShellPolicy.basename(argv0.trim())
         if (logicalBase.isEmpty()) return null
         if (logicalBase == realBase) return ResolvedExec(realPath, null)
         return ResolvedExec(realPath, logicalBase)

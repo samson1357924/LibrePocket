@@ -91,8 +91,14 @@ object ShellExecTool {
      *   [executeElevatedFrozen]；上游 [dev.librepocket.router.ElevatedDispatch]
      *   已凍結時直調 frozen 版，不再二次凍結（舊雙重凍結最坏 2×(1s+grace)，
      *   現每 caller 至多一 snapshot worker，且池化有界見 [frozenOrNull]）。
+     * Round-5 Phase Q（P2-5 frozen API 契約）＋ Stage 5 P2-2（產品唯一入口收斂）：
+     * 本函數已收斂為 internal——[dev.librepocket.router.ElevatedDispatch] 為唯一
+     * 產品調用方（傳 gate 後同一 frozen 經 [executeElevatedFrozen]；本函數僅供
+     * Dispatch 外的防線縱深與單測直調，產品代碼禁止直調本函數繞過
+     * [dev.librepocket.router.PrivilegeGate] 確認／投影／reason 門。誤調即編譯期
+     * 攔截（internal 可見性），見 `ShellGateSoleEntryTest`）。
      */
-    fun executeElevated(
+    internal fun executeElevated(
         request: ElevatedRequest,
         runner: ElevatedShellRunner,
         audit: PrivilegeAuditLog,

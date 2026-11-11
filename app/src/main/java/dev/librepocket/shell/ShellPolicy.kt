@@ -447,6 +447,16 @@ object ShellPolicy {
         trustedBinDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
         preRealPathHook: (() -> Unit)? = null,
     ): Validation {
+        // P3-3 bound-first（fail-closed，零 join 物化）：argc 超限即拒，
+        // 不做 `joinToString` 全文扫描（64K×4K 直接调 validate 即 OOM 于拒前）。
+        val argcDirect: Int = try {
+            argv.size
+        } catch (_: Exception) {
+            return Validation.Denied(ShellDeny.BLACKLISTED, "argc bound")
+        }
+        if (argcDirect > MAX_ELEVATED_ARGC) {
+            return Validation.Denied(ShellDeny.BLACKLISTED, "argc bound")
+        }
         if (argv.isEmpty() || argv.all { it.isBlank() }) {
             return Validation.Denied(ShellDeny.EMPTY_COMMAND, "empty command")
         }
@@ -642,6 +652,16 @@ object ShellPolicy {
         trustedBinDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
         preRealPathHook: (() -> Unit)? = null,
     ): Validation {
+        // P3-3 bound-first（fail-closed，零 join 物化）：与 validateInternal 同门，
+        // argc 超限即拒，不做 `joinToString` 全文扫描。
+        val argcElevated: Int = try {
+            argv.size
+        } catch (_: Exception) {
+            return Validation.Denied(ShellDeny.BLACKLISTED, "argc bound")
+        }
+        if (argcElevated > MAX_ELEVATED_ARGC) {
+            return Validation.Denied(ShellDeny.BLACKLISTED, "argc bound")
+        }
         if (argv.isEmpty() || argv.all { it.isBlank() }) {
             return Validation.Denied(ShellDeny.EMPTY_COMMAND, "empty command")
         }

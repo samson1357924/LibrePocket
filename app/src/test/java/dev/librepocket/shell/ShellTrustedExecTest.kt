@@ -142,6 +142,11 @@ class ShellTrustedExecTest {
             val shell = RestrictedShell(
                 runner = runner,
                 privateRoot = scope.absolutePath,
+                // Stage 5 P3-4：自訂映射再驗證須與映射同表（否則 fail-closed 拒）；
+                // 本用例映射即 `resolve(trusted, systemOwned)`，故 shell 側同表。
+                execSearchDirs = listOf(trusted.absolutePath),
+                execAllowedRoots = listOf(trusted.canonicalPath),
+                execIsWritable = systemOwned,
                 execResolver = { ShellExecutables.resolve(it, listOf(trusted.absolutePath), isWritable = systemOwned) },
             )
             val r = shell.execute(listOf("ls", "-l"))

@@ -220,10 +220,15 @@ class ShellDirectPhasePTest {
         var child: Process? = null
         val runner = DefaultProcessRunner()
         runner.processObserver = { child = it }
+        // Stage 5 P3-4：同 Linger T1b，真系統二進位須配允許集＋不可寫模擬。
+        val realSleep = File("/bin/sleep").canonicalPath
+        val sleepRoot = File(realSleep).parentFile.canonicalPath
         val shell = RestrictedShell(
             runner = runner,
             privateRoot = null,
-            execResolver = { ShellExecutables.ResolvedExec("/bin/sleep", null) },
+            execAllowedRoots = listOf(sleepRoot),
+            execIsWritable = { _ -> false },
+            execResolver = { ShellExecutables.ResolvedExec(realSleep, null) },
         )
         try {
             val start = System.nanoTime()

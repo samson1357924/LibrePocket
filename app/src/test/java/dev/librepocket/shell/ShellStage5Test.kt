@@ -152,6 +152,41 @@ class ShellStage5Test {
         assertFalse(row.reasonHash == PrivilegeAuditLog.sha256Hex("?"))
     }
 
+    // ---- Stage B (P2 length-first)：巨型 ASCII reason 粗門有界 ----
+
+    @Test fun hugeAsciiReasonCoarseGateBoundedZeroSpawnNoHash() {
+        // 8M ASCII：舊碼先全掃 hasLoneSurrogate（~18-32ms）再 early-exit；
+        // 粗門 `length > 512` 應 O(1) 即拒，不跑任何 Unicode 掃描。
+        val huge = "x".repeat(8_000_000)
+        val gateStart = System.nanoTime()
+        assertTrue(PrivilegeAuditLog.isReasonCodeTooLong(huge))
+        val gateMs = (System.nanoTime() - gateStart) / 1_000_000L
+        assertTrue("coarse length-first gate must skip full Unicode scan, elapsed=${gateMs}ms", gateMs < 15L)
+        // 端到端：Tool 入口同樣先行門禁，零 spawn、零 snapshot worker，
+        // 審計記空串標記（不哈希 8M 無界輸入）。
+        var spawns = 0
+        val runner = object : ElevatedShellRunner {
+            override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult {
+                spawns++
+                return ShellResult.Ok("ok", "", 0, false)
+            }
+        }
+        val audit = PrivilegeAuditLog()
+        val r = ShellExecTool.executeElevated(
+            ElevatedRequest(listOf("id"), huge),
+            runner,
+            audit,
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertEquals(ShellDeny.BLACKLISTED, (r as ShellResult.Denied).reason)
+        assertEquals("huge reason must not spawn", 0, spawns)
+        assertEquals(1, audit.size())
+        val row = audit.snapshot().single()
+        assertEquals("DENY", row.verdict)
+        assertEquals(PrivilegeAuditLog.argvHash(emptyList()), row.argvHash)
+        assertEquals(PrivilegeAuditLog.sha256Hex(""), row.reasonHash)
+    }
+
     // ---- P3-3：validate bound-first ----
 
     @Test fun oversizedArgcDeniedWithoutJoin() {

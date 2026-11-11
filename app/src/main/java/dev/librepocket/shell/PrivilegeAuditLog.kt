@@ -217,6 +217,14 @@ class PrivilegeAuditLog {
          * （行为保留，不承诺单射）。
          */
         fun isReasonCodeTooLong(reason: String): Boolean {
+            // Stage B (P2 length-first): coarse UTF-16 unit bound BEFORE any
+            // Unicode scan. UTF-8 byte count >= UTF-16 unit count ALWAYS
+            // (ASCII 1B, <0x800 2B, BMP 3B, surrogate pair 2 units -> 4B,
+            // lone surrogate -> 1B replacement `?`), so length > MAX implies
+            // bytes > MAX (sound, no false-positive deny). Gates the
+            // unbounded hasLoneSurrogate full-scan below: post-gate inputs
+            // are <=512 units (bounded).
+            if (reason.length > MAX_REASON_CODE_BYTES) return true
             if (hasLoneSurrogate(reason)) return true
             return reasonUtf8Length(reason) > MAX_REASON_CODE_BYTES
         }

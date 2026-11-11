@@ -73,9 +73,30 @@ object ShellPolicy {
      *
      * - `-exec` / `-execdir` / `-ok` / `-okdir` 藉 find 執行任意二進位
      *  （`find / -exec rm {} +` 類），白名單形同虛設。
-     * - `-delete` 直接刪除任意路徑；`-fls` / `-fprint` / `-fprintf`
-     *   任意寫檔。同族一併封堵。
+     * - `-delete` 直接刪除任意路徑；`-fls` / `-fprint` / `-fprint0` /
+     *   `-fprintf` 任意寫檔。同族一併封堵。
      * - 精確匹配即可（find 謂詞大小寫敏感）；argv[0] 不計入。
+     * - 唯 `-fprint0` 族用前綴匹配（見 [isFindDeniedPredicate]）：
+     *   PoC `find /scope -maxdepth 0 -fprint0 /scope/sentinel.txt`
+     *   以 NUL 結尾路徑覆寫 sentinel（location-valid ≠ read-only-safe；
+     *   GNU 實測，Toybox 語義未驗——拒絕對其 fail-closed 無害）；
+     *   `-fprint0junk` 類附著形非合法 find 謂詞，拒無害。
+     *
+     * Stage J（P1-4）allowlist 評估（結論：本切片維持 deny-list，不做
+     * read-only allowlist；決策＋殘餘見下）：
+     * - allowlist 需窮舉 GNU／toybox／busybox 三實現謂詞（數十個，
+     *   含 `-print`／`-print0`／`-printf`（僅 stdout）／`-ls`／`-name`／
+     *   `-newer`／`-samefile` 等），跨實現差異大：漏一寫／執行謂詞即逃逸，
+     *   多一嚴格項即破合法用；本切片 denies 已覆已知寫／執行全族，
+     *   allowlist 屬高風險擴 scope，不做。
+     * - file-taker 殘餘（`-newer`／`-samefile` 等讀參考檔 mtime／身分，
+     *   1-bit oracle）：其參考檔操作數若為絕對路徑，已由
+     *   [absoluteCandidates]＋[FileScope]＋[checkPhysicalOperandGate]
+     *   同門 vet（域外即拒；域內 oracle 僅域內可見）；bare／相對一律拒。
+     *   故 vet 獨立性成立，無需 allowlist 另封。
+     * - 殘餘揭露：未來未知寫／執行謂詞（新 find 實現新增謂詞）不在本
+     *   deny-list 內，仍為開放殘餘（Refs #9 follow-up，allowlist 或謂詞
+     *   語義表屬後續工作）。
      */
     private val FIND_DENIED_PREDICATES: Set<String> = setOf(
         "-exec",
@@ -85,8 +106,22 @@ object ShellPolicy {
         "-delete",
         "-fls",
         "-fprint",
+        "-fprint0",
         "-fprintf",
     )
+
+    /**
+     * Stage J（P1-4）：find 高危謂詞判定（直接／提權／multicall 有效形同門）。
+     *
+     * 精確集（[FIND_DENIED_PREDICATES]）＋ `-fprint0` 族前綴
+     * （`arg.startsWith("-fprint0")`，覆精確＋附著／無效延伸，fail-closed
+     * 無害；find 謂詞無縮寫語義，前綴僅為 fail-closed）。他謂詞維持精確。
+     */
+    private fun isFindDeniedPredicate(arg: String): Boolean {
+        if (arg in FIND_DENIED_PREDICATES) return true
+        if (arg.startsWith("-fprint0")) return true
+        return false
+    }
 
     /** 連接後全文掃描的黑名單片段（大小寫敏感即可，攻擊字面本就固定）。 */
     private val DENIED_TEXT_SNIPPETS: List<String> = listOf(
@@ -1019,7 +1054,7 @@ object ShellPolicy {
             }
             if (eff.applet == "find") {
                 for (arg in eff.args) {
-                    if (arg in FIND_DENIED_PREDICATES) {
+                    if (isFindDeniedPredicate(arg)) {
                         return Validation.Denied(
                             ShellDeny.BLACKLISTED,
                             "find predicate denied: $arg",
@@ -1073,7 +1108,7 @@ object ShellPolicy {
         // find 沙箱逃逸封堵：高危謂詞命中任一即拒絕（不建子進程）。
         if (base == "find") {
             for (arg in argv.drop(1)) {
-                if (arg in FIND_DENIED_PREDICATES) {
+                if (isFindDeniedPredicate(arg)) {
                     return Validation.Denied(
                         ShellDeny.BLACKLISTED,
                         "find predicate denied: $arg",
@@ -1223,7 +1258,7 @@ object ShellPolicy {
             }
             if (effElevated.applet == "find") {
                 for (arg in effElevated.args) {
-                    if (arg in FIND_DENIED_PREDICATES) {
+                    if (isFindDeniedPredicate(arg)) {
                         return Validation.Denied(
                             ShellDeny.BLACKLISTED,
                             "find predicate denied: $arg",
@@ -1268,7 +1303,7 @@ object ShellPolicy {
         // find 沙箱逃逸封堵：提權通道同樣拒絕（與 validate 同策）。
         if (base == "find") {
             for (arg in argv.drop(1)) {
-                if (arg in FIND_DENIED_PREDICATES) {
+                if (isFindDeniedPredicate(arg)) {
                     return Validation.Denied(
                         ShellDeny.BLACKLISTED,
                         "find predicate denied: $arg",
@@ -1504,6 +1539,35 @@ object ShellPolicy {
     }
 
     /**
+     * Stage J（P2 pathless df）：`-a`／`--all` 判定（`arg` 為原始 token，
+     * 大小寫敏感；呼叫方只在選項位調用，`--` 後操作數位不適用）。
+     *
+     * GNU `df --help` 實測：`-a, --all` 包含虛擬／重複／不可存取檔案系統；
+     * `--all` 為唯一 `--a*` 長鍵（`--a`／`--al` 唯一前綴同義，實測同族），
+     * 故 `--a*` 前綴一律拒（fail-closed；未來新增 `--a*` 鍵誤殺可接受）。
+     * - 長鍵：精確 `--all`＋唯一前綴（`len>2` 且為 `--all` 前綴，
+     *   `--` 終止符除外）＋無效延伸（`--all*`，GNU 報錯，拒無害）；
+     *   `=v` 附著經 [longKeyBeforeEq] 取鍵同門（`--all` 不取值，附著本就報錯）。
+     * - 單橫：精確 `-a`＋簇含 `a`（如 `-ah`；`a` 僅 `-a` 一鍵用，
+     *   誤殺無害，fail-closed），`=` 前核（`-a=x` 形同拒）。
+     */
+    private fun isDfAllFlag(arg: String): Boolean {
+        if (arg == "-a" || arg == "--all") return true
+        if (arg.startsWith("--")) {
+            val key = longKeyBeforeEq(arg)
+            if (key.length <= 2) return false
+            if (key == "--all" || key.startsWith("--all")) return true
+            if ("--all".startsWith(key)) return true
+            return false
+        }
+        if (arg.startsWith("-") && arg != "-") {
+            val core = arg.substring(1).substringBefore('=')
+            if ('a' in core) return true
+        }
+        return false
+    }
+
+    /**
      * argv 參數是否為相對路徑（P0 fail-closed）。
      * - 絕對路徑（`/...`、長選項 `--opt=/...`，見 [absoluteCandidates]
      *   Stage C：單橫 `-k=/...` 永不視為絕對）由 [absoluteCandidates] 處理，
@@ -1600,6 +1664,45 @@ object ShellPolicy {
                 isGuest = isGuest,
                 preRealPathHook = preRealPathHook,
             )
+        }
+        // Stage J（P2 pathless df＋`-a/--all`）：`df` 無操作數／`-a` 列全部
+        // 掛載（不跟隨 pinned cwd，FileScope 契約＝域內元數據可見即洩露），故：
+        // - `-a`／`--all`（含唯一前綴縮寫／`=v` 附著／無效延伸／單橫簇含 `a`，
+        //   見 [isDfAllFlag]）一律 `Denied(BLACKLISTED)`，即使帶絕對路徑亦然
+        //   （fail-closed：帶路徑輸出仍含 dummy 檔案系統，全域可見；決策：完全禁
+        //   `-a/--all`，不採「帶路徑放行」；僅選項位判定，`--` 後同名操作數位
+        //   走相對路徑門）。
+        // - 無裸絕對路徑操作數（`/...` 起頭 positional；`df` 操作數僅此一形，
+        //   `--opt=/abs`（如 `--output=/abs`）值為列舉非路徑，不計入）即
+        //   `Denied(BLACKLISTED)`（新訊息族 `df requires scoped path`），
+        //   privateRoot 有無皆然（null 側舊 `implicit cwd` 門同 verdict，
+        //   此門先行，訊息以 df 族為準）。
+        // 有路徑形（如 `df /scope`、`df -h /scope`）落穿後續通用門 vet
+        // （absoluteCandidates＋FileScope＋實體門）；既有測試僅覆 null 側
+        // pathless（見 ShellWhitelistTest.implicitCwd…，verdict 不變），無
+        // scoped-allow 翻轉。
+        if (base == "df") {
+            var dfEnd = false
+            for (arg in args) {
+                if (!dfEnd && arg == "--") {
+                    dfEnd = true
+                    continue
+                }
+                if (dfEnd) continue
+                if (isDfAllFlag(arg)) {
+                    return Validation.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "df all denied (fail-closed, global mounts): $arg",
+                    )
+                }
+            }
+            val hasScopedPath = args.any { it.startsWith("/") }
+            if (!hasScopedPath) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "df requires scoped path (fail-closed, global mounts): $base",
+                )
+            }
         }
         // grep 顯式 pattern 旗標預掃：-e/--regexp/-f 存在時無 positional pattern 槽。
         // Stage C：`--exclude-from` 刻意不計入（它不提供搜尋 pattern，只提供排除表）。

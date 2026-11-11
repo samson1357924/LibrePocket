@@ -380,6 +380,9 @@ object ShellPolicy {
         "--color", "--sort", "--format", "--printf", "--block-size",
         "--time-style", "--lines", "--bytes", "--max-count", "--max-depth",
         "--regexp", "--include", "--exclude", "--exclude-dir",
+        // Stage G：grep 列舉值（非檔名）：`--directories=read|recurse|skip`
+        // （recurse ≈ -r，不跟隨 symlink，安全放行）、`--devices=read|skip`。
+        "--directories", "--devices",
     )
 
     /**
@@ -420,7 +423,8 @@ object ShellPolicy {
      * fail-closed，見該函數）；guest 豁免亦由呼叫方先判，此處只判形態。
      * 大小寫敏感（`R`/`L` 大寫才跟隨，`-r`/`-l` 不跟隨）：
      * - grep：`-R`（含 `-rR`/`-iR` 類單橫組合，`R` 即跟隨）與
-     *   `--dereference-recursive`（含 `=value` 附著形）；小寫 `-r`／`--recursive`
+     *   `--dereference-recursive` 家族（Stage G 唯一前綴縮寫，見
+     *   [isGrepFollowAbbrev]，含 `=value` 附著形）；小寫 `-r`／`--recursive`
      *   不跟隨，維持放行。`-eX` 附著（`X` 為 pattern，`ROOT` 含 `R` 不得誤殺）與
      *   `-fX` 附著（Stage A/C 已由相對路徑門拒，見 [checkPathArgs] 附著分支，
      *   此處跳過以保留相對訊息）一律跳過；`--regexp=`／`--file=` 等長 `=` 值
@@ -431,33 +435,43 @@ object ShellPolicy {
      *   `-lname`／`-ilname`／`-links`／`-perm` 皆小寫 `l`，不受影響（大小寫敏感）。
      *   `-H`（僅跟隨命令列參數，操作數已由實體門拒 symlink）與 `-P`（預設不跟隨）
      *   維持放行。
-     * - du：`-L`／`--dereference`（含 `=value` 附著形與 `--dereference*`
-     *   非 `-args` 前綴，fail-closed）；單橫組合含 `L` 即拒。`-D`／
+     * - du：`-L`／`--dereference` 家族（Stage G 縮寫，`--dereference-args`
+     *   消歧前綴除外，見 [isDuFollowAbbrev]，含 `=value` 附著形，fail-closed）；單橫組合含 `L` 即拒。`-D`／
      *   `--dereference-args` 僅跟隨命令列參數：操作數 symlink 已由
      *   [checkPhysicalOperandGate] 拒（`LINK` 即拒），跟隨命令列即無新增逃逸；
      *   域內真目錄＋`-D` 不跟隨 interior，故維持放行（見下抉擇表）。
-     * - ls：`-L`／`--dereference*`（含 `=value` 附著形）；單橫組合含 `L` 即拒。
+     * - ls：`-L`／`--dereference*` 家族（Stage G 縮寫，見 [isLsFollowAbbrev]，
+     *   含 `=value` 附著形）；單橫組合含 `L` 即拒。
      *   `-R` 單獨維持放行（僅列名，不讀目標內容；`-R`＋`-L` 同現時 `L` 門已拒）。
      *
      * 決策表（host 通道；guest＋scope 一律豁免，見上）：
      * | binary | flag | verdict | rationale |
-     * | grep `-R`／`--dereference-recursive`／含 `R` 單橫 | DENY | 跟隨 interior symlink 讀域外 |
-     * | grep `-r`／`--recursive` | ALLOW | 不跟隨 |
+     * | grep `-R`／`--dereference-recursive` 家族縮寫／含 `R` 單橫 | DENY | 跟隨 interior symlink 讀域外 |
+     * | grep `-r`／`--recursive`／`--directories=*`／`--devices=*` | ALLOW | 不跟隨（列舉值） |
      * | find `-L`／`-follow`／含 `L` 單橫 | DENY | 跟隨 interior（含 `-follow`） |
      * | find `-H`／`-P` | ALLOW | `-H` 僅命令列（操作數門已拒 symlink），`-P` 不跟隨 |
-     * | du `-L`／`--dereference`／含 `L` 單橫 | DENY | 跟隨 interior |
-     * | du `-D`／`--dereference-args` | ALLOW | 僅命令列（操作數門已拒 symlink），不跟隨 interior |
-     * | ls `-L`／`--dereference*`／含 `L` 單橫 | DENY | 跟隨（`ls -L` 讀目標 stat／內容） |
+     * | du `-L`／`--dereference` 家族縮寫／含 `L` 單橫 | DENY | 跟隨 interior |
+     * | du `-D`／`--dereference-args` 消歧前綴 | ALLOW | 僅命令列（操作數門已拒 symlink），不跟隨 interior |
+     * | ls `-L`／`--dereference*` 家族縮寫／含 `L` 單橫 | DENY | 跟隨（`ls -L` 讀目標 stat／內容） |
      * | ls `-R` 單獨 | ALLOW | 僅列名，不讀目標內容 |
      *
      * 長期受控 traversal（工作區無 symlink 不變量／遞迴白名單）超出本次有界切片，
      * 見 [checkPhysicalOperandGate] 遞迴後代揭露 follow-up。
+     *
+     * Stage G（P1-2 GNU long-option 唯一前綴縮寫，canonicalize-then-judge）：
+     * GNU `getopt_long` 接受唯一前綴縮寫（如 grep `--deref` → 實測跟隨
+     * `--dereference-recursive`，PoC 讀到域外），故只比對全鍵即漏判。
+     * 縮寫判定見 [isGrepFollowAbbrev]／[isDuFollowAbbrev]／[isLsFollowAbbrev]，
+     * 輸入皆為 `=` 前鍵（見 [longKeyBeforeEq]，`=value` 附著形同門）。
+     * BusyBox 1.37 不接受任何長縮寫（`--deref` 即 exit 2 `unrecognized option`，
+     * 實測），Toybox 未驗——縮寫拒絕對二者 fail-closed 無害（無效旗標本就
+     * exit 2，拒不破壞合法用）；TRUSTED_BIN_DIRS 含 `/bin,/usr/bin`（宿主 GNU
+     * 可能），故宿主／提權側必須關閉。
      */
     private fun isFollowFlag(base: String, arg: String): Boolean {
         when (base) {
             "grep" -> {
-                if (arg == "--dereference-recursive") return true
-                if (arg.startsWith("--dereference-recursive=")) return true
+                if (isGrepFollowAbbrev(longKeyBeforeEq(arg))) return true
                 if (arg.startsWith("-") && !arg.startsWith("--") && arg != "-" && 'R' in arg) {
                     if (arg.startsWith("-e") && arg.length > 2) return false
                     if (arg.startsWith("-f") && arg.length > 2) return false
@@ -473,17 +487,128 @@ object ShellPolicy {
                 return false
             }
             "du" -> {
-                if (arg.startsWith("--dereference") && !arg.startsWith("--dereference-args")) return true
+                if (isDuFollowAbbrev(longKeyBeforeEq(arg))) return true
                 if (arg.startsWith("-") && !arg.startsWith("--") && arg != "-" && 'L' in arg) return true
                 return false
             }
             "ls" -> {
-                if (arg.startsWith("--dereference")) return true
+                if (isLsFollowAbbrev(longKeyBeforeEq(arg))) return true
                 if (arg.startsWith("-") && !arg.startsWith("--") && arg != "-" && 'L' in arg) return true
                 return false
             }
             else -> return false
         }
+    }
+
+    /**
+     * Stage G：長選項 `=` 前鍵（`--opt=v` 取 `=` 前，bare 照原樣）。
+     * 非 `--` 起頭照原樣返回（呼叫方只傳長鍵判縮寫，短橫另由簇門處理）。
+     */
+    private fun longKeyBeforeEq(arg: String): String {
+        if (!arg.startsWith("--")) return arg
+        val eq = arg.indexOf('=')
+        return if (eq >= 0) arg.substring(0, eq) else arg
+    }
+
+    /**
+     * Stage G：grep follow 縮寫判定（`s` 為 `=` 前鍵，見 [longKeyBeforeEq]）。
+     *
+     * GNU grep 3.12 長選項實測：`--devices`、`--directories`、
+     * `--dereference-recursive`（`--dereference…--der` 皆唯一跟隨；
+     * `--de` 與 `--devices` 歧義報錯、`--d` 三方歧義報錯，拒絕無害）：
+     * - `s` 以 `--dereference` 起頭即拒（全鍵、`=value` 經 `s` 覆蓋、
+     *   `--dereference-r…` 全縮寫、`--dereferencex` 無效延伸，後者 GNU 報錯，
+     *   拒無害）；
+     * - 否則 `s` 為 `--dereference-recursive` 的前綴（`len>=4`，避開 `-`／`--`／
+     *   `--d` 三方歧義）且非 `--directories` 的前綴即拒（`--der…--dereferenc`；
+     *   `--di…` 屬 `--directories` 不拒，`--dev…` 非前綴不拒、由 GNU 報錯）。
+     * grep 無 `--dereference-args` 變體，無例外。
+     */
+    private fun isGrepFollowAbbrev(s: String): Boolean {
+        if (s.startsWith("--dereference")) return true
+        if (s.length >= 4 && "--dereference-recursive".startsWith(s) &&
+            !"--directories".startsWith(s)
+        ) return true
+        return false
+    }
+
+    /**
+     * Stage G：du follow 縮寫判定（`s` 為 `=` 前鍵）。
+     *
+     * du 長選項（GNU/uutils 皆含）：`--dereference`（`-L`）與
+     * `--dereference-args`（`-D`，僅命令列，操作數 symlink 已由實體門拒，
+     * 故放行）：
+     * - `--dereference-args` 精確＋消歧前綴（`s` 為其前綴且
+     *   `len>len(--dereference)`，如 `--dereference-`、`--dereference-a…`）
+     *   放行；
+     * - 其餘以 `--dereference` 起頭（全鍵、`=value`、無效延伸）或為
+     *   `--dereference` 的短前綴（`len>=3`，如 `--d…--dereferenc`；短形在 GNU
+     *   屬雙鍵歧義報錯，uutils 直接拒參，拒絕皆無害）即拒。
+     */
+    private fun isDuFollowAbbrev(s: String): Boolean {
+        if (s == "--dereference-args") return false
+        if (s.length > "--dereference".length && "--dereference-args".startsWith(s)) return false
+        if (s.startsWith("--dereference")) return true
+        if (s.length >= 3 && "--dereference".startsWith(s)) return true
+        return false
+    }
+
+    /**
+     * Stage G：ls follow 縮寫判定（`s` 為 `=` 前鍵）。
+     *
+     * ls `--dereference*` 全跟隨（`--dereference`、
+     * `--dereference-command-line*`），無 `-args` 例外：以 `--dereference`
+     * 起頭或為其短前綴（`len>=3`，避開 `-`／`--`）即拒；短形在 GNU 屬多鍵歧義
+     * 報錯、uutils 直接拒參，拒絕皆無害。`--directory`／`--dired*` 非其前綴，
+     * 不受影響。
+     */
+    private fun isLsFollowAbbrev(s: String): Boolean {
+        if (s.startsWith("--dereference")) return true
+        if (s.length >= 3 && "--dereference".startsWith(s)) return true
+        return false
+    }
+
+    /**
+     * Stage G：開檔長鍵規範化（`key` 為 `=` 前鍵，base 感知，canonicalize-then-judge）。
+     *
+     * GNU/uutils 唯一前綴縮寫同樣打開檔案（實測：grep `--exclude-f/--exclude-fr`
+     * 分離形＋附著形皆開檔；uutils du `--exclude-`、`--files/--f/--fi` 皆開檔），
+     * 故分離形槽＋`=v` 嚴審皆須以規範鍵判定：
+     * - grep：`--file` 僅精確（`--fil/--fi` 歧義於 `--files-with-matches*`，
+     *   GNU 報錯，安全，無需映射）；`--exclude-from` 映射精確＋唯一前綴
+     *   （`--exclude-from` 的前綴、嚴長於共享莖 `--exclude-`、且非
+     *   `--exclude-dir` 的前綴，如 `--exclude-f…`；`--exclude-` 歧義於
+     *   `--exclude-dir` 不映射，由 GNU 報錯）＋無效延伸 `--exclude-from*`
+     *  （fail-closed，GNU 報錯，拒無害）；
+     * - du：`--exclude-from` 同上（du 無 `--exclude-dir`，故 `--exclude-` 亦唯一，
+     *   一併映射）＋`--files0-from` 精確＋唯一前綴（du 仅此一 `--f*` 長鍵，
+     *   `--f…--files0-f…` 皆映射，uutils 實測確認）＋無效延伸（fail-closed）；
+     * - 他 binary：回 null（呼叫方另以 [FILE_VALUE_OPT_KEYS] 精確集保底，
+     *   未知提權＋scope 的 `--file=` 仍全拒）。
+     * 非 `--` 起頭或過短（`--` 本身）回 null。
+     */
+    private fun canonicalFileKey(base: String, key: String): String? {
+        if (!key.startsWith("--") || key.length < 3) return null
+        if (base == "grep") {
+            if (key == "--file") return "--file"
+            if (key == "--exclude-from") return "--exclude-from"
+            if (key.length > "--exclude-".length && "--exclude-from".startsWith(key) &&
+                !"--exclude-dir".startsWith(key)
+            ) return "--exclude-from"
+            if (key.startsWith("--exclude-from")) return "--exclude-from"
+            return null
+        }
+        if (base == "du") {
+            if (key == "--files0-from" || key == "--exclude-from") return key
+            if ("--files0-from".startsWith(key)) return "--files0-from"
+            if (key.startsWith("--files0-from")) return "--files0-from"
+            if (key.length > "--exclude".length && "--exclude-from".startsWith(key)) {
+                return "--exclude-from"
+            }
+            if (key.startsWith("--exclude-from")) return "--exclude-from"
+            return null
+        }
+        return null
     }
 
     /** 純值形態保留（文件用）：數字/布林/stdin/格式/glob 僅在值槽
@@ -1019,6 +1144,10 @@ object ShellPolicy {
     private val FILE_VALUE_OPT_KEYS: Set<String> = setOf(
         "--file",
         "--exclude-from",
+        // Stage G：du `--files0-from`（NUL 名單檔，`--files0-from F` 分離形經槽、
+        // `--files0-from=F` 經本鍵；縮寫經 [canonicalFileKey] base 感知映射，
+        // 此處精確集保底未知 binary 的 `=v` 嚴審）。
+        "--files0-from",
     )
 
     /**
@@ -1200,7 +1329,7 @@ object ShellPolicy {
                     hasExplicit = true
                     break
                 }
-                if (a == "-f" || a == "--file" || a == "--exclude-from") {
+                if (a == "-f" || (!a.contains('=') && canonicalFileKey("grep", a) != null)) {
                     prePendingFile = true
                 }
             }
@@ -1243,9 +1372,10 @@ object ShellPolicy {
                 prevArg = arg
                 continue
             }
-            // Stage D（P1-2）：find/du/ls symlink-follow 全位置 fail-closed。
+            // Stage D（P1-2）＋G（縮寫）：find/du/ls symlink-follow 全位置 fail-closed。
             // find `-L`/`-follow`（全局，可出現在路徑前後）、du `-L`/
-            // `--dereference`、ls `-L`/`--dereference` 在 spawn 後跟隨 interior
+            // `--dereference` 家族（Stage G 縮寫，`--dereference-args` 消歧除外）、
+            // ls `-L`/`--dereference` 家族（Stage G 縮寫）在 spawn 後跟隨 interior
             // symlink 讀域外，而操作數門只驗 CLI 操作數本鏈（見
             // [checkPhysicalOperandGate] 遞迴後代揭露），故必須拒旗標本身。
             // 全位置（選項位／值槽／`--` 後皆拒，fail-closed，僅 guest 容器內
@@ -1444,9 +1574,10 @@ object ShellPolicy {
                 prevArg = arg
                 continue
             }
-            // Stage D（P1-2）：grep symlink-follow 僅選項位 fail-closed。
+            // Stage D（P1-2）＋G（縮寫）：grep symlink-follow 僅選項位 fail-closed。
             // `-R`（含 `-rR`/`-iR` 類單橫組合）與 `--dereference-recursive`
-            // 跟隨 interior dir symlink 讀域外（PoC：scope/subtree 內 `escape`
+            // 家族（Stage G：含 `--deref`／`--dereference-r…` 等 GNU 唯一前綴縮寫，
+            // 見 [isGrepFollowAbbrev]）跟隨 interior dir symlink 讀域外（PoC：scope/subtree 內 `escape`
             // → outside，`grep -R TOKEN /scope/subtree` 印 outside/hidden.txt）。
             // 僅選項位（`!endOfOptions && !inFileSlot && !isValueTakingFlag(base,
             // prevArg)`（base-aware：grep `-n`/`-c` 是布林非取值），`--` 後短橫／`-f` 槽／`-e` 值另由短橫／附著門
@@ -1521,12 +1652,18 @@ object ShellPolicy {
                 isGuest = isGuest,
             )
             if (bareDenial != null) return bareDenial
-            // Stage A＋C 設槽：grep `-f`／`--file`／`--exclude-from` 精確 token
-            // （選項位）使下一位為 REQUIRED-FILENAME 槽。`--` 後的操作數位不設槽；
-            // 他 binary 的 `-f`（如 `ls -f` 排序旗）不設槽。
-            if (base == "grep" && !endOfOptions &&
-                (arg == "-f" || arg == "--file" || arg == "--exclude-from")
+            // Stage A＋C＋G 設槽：grep `-f`／`--file`／`--exclude-from`（Stage G：
+            // 含 `--exclude-f…` 唯一前綴縮寫，見 [canonicalFileKey]）與 du
+            // `--files0-from`／`--exclude-from`（含唯一前綴縮寫）使下一位為
+            // REQUIRED-FILENAME 槽（選項位）。`--` 後的操作數位不設槽；
+            // 他 binary 的 `-f`（如 `ls -f` 排序旗）不設槽。du `-X` 短旗
+            // （分離形／附著形）未覆，殘餘（超出 Stage G 有界切片）。
+            if (base == "grep" && !endOfOptions && !arg.contains('=') &&
+                (arg == "-f" || canonicalFileKey("grep", arg) != null)
             ) {
+                pendingFileValue = true
+            }
+            if (base == "du" && !endOfOptions && !arg.contains('=') && canonicalFileKey("du", arg) != null) {
                 pendingFileValue = true
             }
             prevArg = arg
@@ -1569,7 +1706,8 @@ object ShellPolicy {
      *   `stat %s` 亦視為相對路徑）；
      * - `--opt=bare`：鍵在 [NON_PATH_OPT_KEYS]（color/sort/format 等）放行；
      *   否則 FILE_OPERAND 即使值像數字/格式/glob 仍拒（`--db=123` 視為潛在路徑）；
-     * - Stage A＋C `--file=bare`／`--exclude-from=bare`：鍵在 [FILE_VALUE_OPT_KEYS] 即檔名，短橫形／相對值
+     * - Stage A＋C＋G `--file=bare`／`--exclude-from=bare`／`--files0-from=bare`：
+     *   鍵在 [FILE_VALUE_OPT_KEYS] 或經 [canonicalFileKey] 規範為開檔鍵即檔名，短橫形／相對值
      *   全 binary fail-closed（未知提權＋scope 亦拒，cwd 釘死不豁免檔名鍵；
      *   `-` stdin 哨兵／空值／絕對值維持放行，絕對值已先走實體門）；
      *   [NO_FILE_BINARIES] 無檔案語義，維持放行；
@@ -1608,7 +1746,7 @@ object ShellPolicy {
             // 絕對值已先由 absoluteCandidates 走 FileScope＋實體門（上式）。
             // NO_FILE 二進位無檔案語義，維持放行；guest 容器內（無 `/`）已由
             // 上方早返放行，此處只剩 guest＋null（fail-closed）與宿主通道。
-            if (key in FILE_VALUE_OPT_KEYS) {
+            if (key in FILE_VALUE_OPT_KEYS || canonicalFileKey(base, key) != null) {
                 if (v == "-") return null
                 if (base in NO_FILE_BINARIES) return null
                 return Validation.Denied(
@@ -1786,11 +1924,12 @@ object ShellPolicy {
      * interior link 需併發植入或帶外植入；直接通道 `ln` 不在允許命令內
      * （ALLOWED_BINARIES 無 ln），直接通道模型無法直接建鏈，但 guest 通道
      * python3/tar/unzip 可在容器內建鏈（見 ProotExec KDoc 容器內殘餘）。
-     * Stage D 收斂（P1-2）：跟隨旗標本身已由 [checkPathArgs] fail-closed 拒絕
-     * （grep `-R`／`--dereference-recursive`／含 `R` 單橫、find `-L`／`-follow`／
-     * 含 `L` 單橫、du `-L`／`--dereference`／含 `L` 單橫、ls `-L`／
-     * `--dereference*`／含 `L` 單橫；小寫 `-r`／`--recursive`、find `-H`／`-P`、
-     * du `-D`／`--dereference-args`、ls `-R` 單獨維持放行，見 [isFollowFlag]
+     * Stage D＋G 收斂（P1-2）：跟隨旗標本身已由 [checkPathArgs] fail-closed 拒絕
+     * （grep `-R`／`--dereference-recursive` 家族縮寫／含 `R` 單橫、find `-L`／
+     * `-follow`／含 `L` 單橫、du `-L`／`--dereference` 家族縮寫／含 `L` 單橫、
+     * ls `-L`／`--dereference*` 家族縮寫／含 `L` 單橫；小寫 `-r`／`--recursive`、
+     * find `-H`／`-P`、du `-D`／`--dereference-args` 消歧前綴、ls `-R` 單獨、
+     * grep `--directories=*`／`--devices=*` 維持放行，見 [isFollowFlag]
      * 決策表；multicall 有效基同門；guest＋scope 容器內豁免）。長期受控
      * traversal（工作區無 symlink 不變量／遞迴白名單）仍為 follow-up（Refs #9）。
      * 提權（Root/Shizuku，見 app/src/github）走同一門

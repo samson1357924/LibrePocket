@@ -36,6 +36,9 @@ CODEQL = (WORKFLOWS_DIR / "codeql.yml").read_text(encoding="utf-8")
 SECURITY_AUDIT = (
     WORKFLOWS_DIR / "security-audit.yml"
 ).read_text(encoding="utf-8")
+OSV_SCAN = (
+    WORKFLOWS_DIR / "osv-scan.yml"
+).read_text(encoding="utf-8")
 POCKETGUARD = (
     WORKFLOWS_DIR / "pocketguard.yml"
 ).read_text(encoding="utf-8")
@@ -45,6 +48,7 @@ WORKFLOW_TEXTS = {
     "release.yml": RELEASE,
     "codeql.yml": CODEQL,
     "security-audit.yml": SECURITY_AUDIT,
+    "osv-scan.yml": OSV_SCAN,
     "pocketguard.yml": POCKETGUARD,
 }
 CHECKOUT_STEP = (
@@ -1987,6 +1991,179 @@ jobs:
             "pr-check.yml", workflow[:start] + mutated + workflow[end:]
         )
         self._assert_rejected("policy-harness core command must appear exactly once")
+
+    def test_policy_harness_command_includes_verify_metadata_gate(self) -> None:
+        workflow = PR_CHECK
+        start = workflow.index("  policy-harness:\n")
+        end = workflow.index("  build-and-policy-gate:\n")
+        block = workflow[start:end]
+        mutated = block.replace(
+            "        run: python3 -P scripts/verify_verification_metadata.py\n",
+            "",
+            1,
+        )
+        self.assertNotEqual(block, mutated)
+        self._write(
+            "pr-check.yml", workflow[:start] + mutated + workflow[end:]
+        )
+        self._assert_rejected("policy-harness core command must appear exactly once")
+
+    def test_policy_harness_verify_metadata_gate_replaced_with_true(self) -> None:
+        workflow = PR_CHECK
+        start = workflow.index("  policy-harness:\n")
+        end = workflow.index("  build-and-policy-gate:\n")
+        block = workflow[start:end]
+        mutated = block.replace(
+            "        run: python3 -P scripts/verify_verification_metadata.py\n",
+            "        run: 'true'\n",
+            1,
+        )
+        self.assertNotEqual(block, mutated)
+        self._write(
+            "pr-check.yml", workflow[:start] + mutated + workflow[end:]
+        )
+        self._assert_rejected("policy-harness core command must appear exactly once")
+
+    def test_policy_harness_verify_metadata_gate_step_if_is_rejected(self) -> None:
+        workflow = PR_CHECK
+        start = workflow.index("  policy-harness:\n")
+        end = workflow.index("  build-and-policy-gate:\n")
+        block = workflow[start:end]
+        mutated = block.replace(
+            "      - name: Verify dependency metadata gate (strict checksums)\n",
+            "      - name: Verify dependency metadata gate (strict checksums)\n"
+            "        if: false\n",
+            1,
+        )
+        self.assertNotEqual(block, mutated)
+        self._write(
+            "pr-check.yml", workflow[:start] + mutated + workflow[end:]
+        )
+        self._assert_rejected("policy-harness core step keys must be exactly")
+
+    # --- osv-scan.yml monitor shape ------------------------------------
+
+    def test_osv_scan_trigger_is_pinned(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "    - cron: '0 6 * * 1'\n",
+                "    - cron: '0 7 * * 1'\n",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan.yml 'on' must be exactly")
+
+    def test_osv_scan_pr_trigger_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "  workflow_dispatch:\n",
+                "  workflow_dispatch:\n  pull_request:\n",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan.yml 'on' must be exactly")
+
+    def test_osv_scan_scan_command_is_pinned(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "        run: python3 -P scripts/osv_scan.py --format json "
+                "--output osv-report.json\n",
+                "        run: 'true'\n",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan scan command must be exactly")
+
+    def test_osv_scan_scan_step_conditions_are_rejected(self) -> None:
+        for line, expected in (
+            ("        if: false\n", "osv-scan scan step must not contain if"),
+            (
+                "        continue-on-error: true\n",
+                "osv-scan scan step must not contain continue-on-error",
+            ),
+        ):
+            with self.subTest(line=line.strip()):
+                self._reset_workflows()
+                self._write(
+                    "osv-scan.yml",
+                    OSV_SCAN.replace(
+                        "      - name: Run OSV monitor scan (read-only, no upgrades)\n",
+                        "      - name: Run OSV monitor scan (read-only, no upgrades)\n"
+                        + line,
+                        1,
+                    ),
+                )
+                self._assert_rejected(expected)
+
+    def test_osv_scan_upload_must_keep_always_and_pinned_action(self) -> None:
+        for old, new, expected in (
+            (
+                "        if: always()\n",
+                "",
+                "osv-scan upload step keys must be exactly",
+            ),
+            (
+                "        if: always()\n",
+                "        if: false\n",
+                "osv-scan upload step if must be exactly",
+            ),
+            (
+                "          if-no-files-found: warn\n",
+                "          if-no-files-found: ignore\n",
+                "osv-scan upload with must be exactly",
+            ),
+        ):
+            with self.subTest(old=old.strip()):
+                self._reset_workflows()
+                mutated = OSV_SCAN.replace(old, new, 1)
+                self.assertNotEqual(OSV_SCAN, mutated)
+                self._write("osv-scan.yml", mutated)
+                self._assert_rejected(expected)
+
+    def test_osv_scan_unpinned_checkout_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(f"@{PINNED_SHA}", "@v4", 1),
+        )
+        self._assert_rejected("unpinned or unsupported uses ref")
+
+    def test_osv_scan_write_permission_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "permissions:\n  contents: read\n",
+                "permissions:\n  contents: read\n  issues: write\n",
+                1,
+            ),
+        )
+        self._assert_rejected("permissions must not grant issues: write")
+
+    def test_osv_scan_issue_filing_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "      - name: Upload OSV report\n",
+                "      - name: File issues\n"
+                "        run: gh issue create --title osv --body report\n"
+                "      - name: Upload OSV report\n",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan must not file issues")
+
+    def test_osv_scan_extra_job_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "  osv-scan:\n",
+                "  osv-scan:\n    continue-on-error: true\n",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan must not contain job-level continue-on-error")
 
     def test_policy_harness_pyyaml_install_is_pinned(self) -> None:
         workflow = PR_CHECK

@@ -397,6 +397,9 @@ jobs:
         with:
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
+      - name: Verify Jackson flavor isolation guard (#132)
+        run: ./gradlew :app:verifyJacksonFlavorIsolation --stacktrace
+
       # P2: the release variants merge buildType (app/src/release) and
       # <flavor><BuildType> source sets that Debug APKs never contain, so
       # PR CI assembles all six variants. The release APKs are UNSIGNED

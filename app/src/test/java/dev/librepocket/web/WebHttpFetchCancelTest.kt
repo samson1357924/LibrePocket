@@ -127,6 +127,18 @@ class WebHttpFetchCancelTest {
             "SocketTimeoutException" to { SocketTimeoutException("read timed out") },
             "InterruptedIOException" to { InterruptedIOException("interrupted") },
             "IOException" to { IOException("down") },
+            "TimeoutCancellationException" to {
+                // Public ctors are internal in this coroutines version:
+                // mint a real TCE via an already-expired timeout.
+                runBlocking {
+                    try {
+                        withTimeout(1) { delay(60_000) }
+                        error("unreachable")
+                    } catch (e: TimeoutCancellationException) {
+                        e
+                    }
+                }
+            },
             "genericException" to { IllegalStateException("broken fetcher") },
         )
         for ((name, makeError) in makers) {

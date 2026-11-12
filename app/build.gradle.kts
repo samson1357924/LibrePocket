@@ -301,3 +301,7 @@ tasks.register("verifyJacksonFlavorIsolation") {
         )
     }
 }
+
+tasks.named("check") {
+    dependsOn(tasks.named("verifyJacksonFlavorIsolation"))
+}

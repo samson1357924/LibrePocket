@@ -47,6 +47,11 @@ jobs:
               - 'settings.gradle.kts'
               - 'build.gradle.kts'
               - 'gradle.properties'
+              - '**/gradle.properties'
+              - '*.gradle'
+              - '**/*.gradle'
+              - '*.gradle.kts'
+              - '**/*.gradle.kts'
               - '.github/workflows/pr-check.yml'
             policy:
               # The harness runs in parallel; each Gradle job also checks its
@@ -58,11 +63,16 @@ jobs:
               # gradle.properties (no slash), which needs its own entry.
               - 'gradle/**'
               - 'gradle.properties'
+              - '**/gradle.properties'
               - 'gradlew'
               - 'gradlew.bat'
               - 'app/build.gradle.kts'
               - 'build.gradle.kts'
               - 'settings.gradle.kts'
+              - '*.gradle'
+              - '**/*.gradle'
+              - '*.gradle.kts'
+              - '**/*.gradle.kts'
               - 'scripts/play_policy_check.sh'
               - 'scripts/apk_policy_inspect.py'
               - 'scripts/backup_rules_check.py'

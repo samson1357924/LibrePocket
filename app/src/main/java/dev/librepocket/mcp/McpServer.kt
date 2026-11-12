@@ -1,6 +1,10 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkDenyCode
+import dev.librepocket.policy.NetworkEvaluation
+import dev.librepocket.policy.NetworkOptInStore
 import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
 import kotlinx.coroutines.CancellationException
@@ -36,10 +40,16 @@ import kotlinx.coroutines.CancellationException
  * - 超時：單次 15–30s（[McpTimeouts.clamp]），超時映射 TIMEOUT，不重試；OkHttp
  *   callTimeout／HTTP-2／Okio 寫入等以 [InterruptedIOException] 呈現的超時亦同
  *   （RT-06：catch 於一般 Exception 之前，與 [SocketTimeoutException] 同待遇）；
- * - 傳輸安全：僅放行 `https`，以及回環 `http`（測試／本機；見 [McpWire.requireSecureEndpoint]），
- *   其餘明文一律 PROTOCOL、不碰 vault、不發送、不計熔斷；
- *   傳輸層不自動跟隨 redirect（3xx 終端 → PROTOCOL + 計熔斷，
- *   參數不會重放到未驗證 origin；注入 client 的 redirect／連線重試／503 重送／
+ * - 傳輸安全：僅放行 `https`，以及 opt-in 後的回環 `http`（本機 pilot；
+ *   LAN 明文 pilot 僅 WebFetch——MCP 形狀閘（[McpWire.requireSecureEndpoint]）
+ *   不放行非回環明文，LAN `http` 到不了政策閘；
+ *   政策見 [requireMcpNetworkPolicyAllowed]——預設 deny-all，回環明文須經
+ *   `NetworkOptInStore.confirm` 明示確認，見 [McpServerConfig.networkOptIn]），
+ *   其餘明文與政策阻擋一律 PROTOCOL、不碰 vault、不發送、不計熔斷；
+ *   傳輸層不自動跟隨 redirect（3xx 終端 → PROTOCOL + 計熔斷＋稽核
+ *   `denyCode=REDIRECT_BLOCKED`，即 REDIRECT_BLOCKED 語義：`304`／`305`／
+ *   `306` 無 Location 跳轉語義亦同終端，範圍見下順序段；參數不會重放到未驗證
+ *   origin；注入 client 的 redirect／連線重試／503 重送／
  *   authenticator／cookie／cache 政策同樣強制、POST body 為 one-shot，
  *   application interceptor 屬受信任呼叫方元件，見 [McpTransport] KDoc）；
  * - 隱私：Bearer 只放標頭；`CharArray` 用後即擦（`String`／OkHttp 拷貝為已知殘留，
@@ -66,8 +76,10 @@ import kotlinx.coroutines.CancellationException
  *    零 vault / 零 HTTP / 零熔斷；malformed args 必須先於 baseUrl 判定，
  *    否則壞參數會被錯標成 UNAUTHORIZED）；
  * 4. baseUrl 形狀 → UNAUTHORIZED（零 vault / 零 HTTP / 零熔斷）；
- * 5. vault 讀 key（缺 key → UNAUTHORIZED，零熔斷）；
- * 6. HTTP（401/403 → UNAUTHORIZED+計熔斷；逾時 → TIMEOUT+計熔斷；其他失敗 →
+ * 5. A3 政策預驗 → PROTOCOL（零 vault / 零 HTTP / 零熔斷；opt-in 缺失／
+ *    位址不可路由屬配置問題，姿態同 4）；
+ * 6. vault 讀 key（缺 key → UNAUTHORIZED，零熔斷）；
+ * 7. HTTP（401/403 → UNAUTHORIZED+計熔斷；逾時 → TIMEOUT+計熔斷；其他失敗 →
  *    TRANSPORT+計熔斷；body 形狀錯 → PROTOCOL+計熔斷）。
  */
 class McpServer(
@@ -78,6 +90,14 @@ class McpServer(
     // C-08：預設時鐘改單調源（nanoTime 基準，單位維持 ms）。注入式簽名不變——
     // 既有測試全用假時鐘；回撥序列由 elapsedMs 的鉗制兜底（防禦深度）。
     private val clockMs: () -> Long = ::monotonicClockMs,
+    /**
+     * A3：MCP 專用 opt-in store（`mcp:` 命名空間，見 [mcpEndpointId]）。
+     * 非 null 時每次呼叫重解 `store.optInFor(...)`（活躍 session 生即生效；
+     * baseUrl／scheme／port／tier／[McpServerConfig.configRevision] 任一變動
+     * 使舊確認自動失效，需重新明示確認）。null 時用 [McpServerConfig.networkOptIn]
+     * 快照（預設 deny-all；測試直用）。
+     */
+    private val networkOptInStore: NetworkOptInStore? = null,
 ) {
     fun config(): McpServerConfig = config
     fun breaker(): McpCircuitBreaker = breaker
@@ -89,6 +109,15 @@ class McpServer(
      * 預設時鐘本身即單調（[monotonicClockMs]），鉗制是對注入時鐘的防禦深度。
      */
     private fun elapsedMs(start: Long): Long = (clockMs() - start).coerceAtLeast(0L)
+
+    /**
+     * A3 生效 opt-in：store 非 null 即每呼叫重解（活躍 session 生即生效；
+     * 降級／invalidate 後同一物件再送即被政策閘擋下），null 即用 config 快照。
+     */
+    private fun effectiveOptIn(): EndpointNetworkOptIn {
+        val store = networkOptInStore ?: return config.networkOptIn
+        return store.optInFor(mcpEndpointId(config.id), config.baseUrl, config.configRevision)
+    }
 
     suspend fun listTools(timeoutMs: Long = config.effectiveTimeoutMs()): McpListResult {
         val start = clockMs()
@@ -112,11 +141,24 @@ class McpServer(
         if (!McpWire.isValidBaseUrl(config.baseUrl)) {
             return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
+        val endpoint: String
         try {
-            McpWire.requireSecureEndpoint(config.baseUrl)
+            endpoint = McpWire.requireSecureEndpoint(config.baseUrl)
         } catch (_: IllegalArgumentException) {
             // 明文非回環／畸形地址：fail-closed，不碰 vault、不發送、不計熔斷。
             return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, elapsedMs(start))
+        }
+        // A3 政策預驗（讀 vault／發送之前）：拒絕即 PROTOCOL，不碰 vault、
+        // 不發送、不計熔斷（確認缺失／位址不可路由屬配置問題，姿態同上分支）。
+        // 阻擋碼記入稽核（`denyCode` 鍵，靜態碼名；位址／URL 永不進稽核面）。
+        val optIn = effectiveOptIn()
+        // 單次解析接線：預驗的放行決策經 preverifiedEval 傳入 transport
+        //（傳輸層只做一致性檢查，零二次 DNS，關 skew 窗；見 takePreverifiedEval）。
+        val preEval: NetworkEvaluation
+        try {
+            preEval = requireMcpNetworkPolicyAllowed(endpoint, optIn, config.networkResolver)
+        } catch (e: McpNetworkPolicyBlocked) {
+            return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, elapsedMs(start), e.denyCode.name)
         }
         val key = try {
             keyVault.getKey(config.keyId)
@@ -147,7 +189,15 @@ class McpServer(
             return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
         try {
-            val raw = transport.postJson(config.baseUrl, bearer, McpWire.listBody(), timeoutMs)
+            val raw = transport.postJson(
+                config.baseUrl,
+                bearer,
+                McpWire.listBody(),
+                timeoutMs,
+                optIn,
+                config.networkResolver,
+                preverifiedEval = preEval,
+            )
             // bearer 僅棧上短生命週期，不存欄位、不寫 log。
             if (raw == null) {
                 breaker.onFailure()
@@ -161,10 +211,22 @@ class McpServer(
             }
             if (code in 300..399) {
                 // 傳輸層不跟隨 redirect（見 McpTransport.transportClient）：3xx 是終端回應。
+                // 範圍刻意取 `300..399`（寬於 `NetworkPolicy.isRedirectStatus`
+                // 的 `300..303／307／308`）：`304`（Not Modified）／`305`（Use Proxy）／
+                // `306` 無 Location 跳轉語義（isRedirectStatus 明確排除），但在本 0-follow
+                // 單 POST 子集中同樣是未預期的終端回應——一律 PROTOCOL + 計熔斷
+                // fail-closed，不區分「真跳轉」與「快取／代理殘留」。
                 // 伺服器/代理配置與本子集不合 → PROTOCOL + 計熔斷；body 不讀、
                 // 參數不重放（第二次端點從未收到請求，見 McpTransportSecurityTest）。
+                // 執行層拒絕記靜態碼（稽核 `denyCode=REDIRECT_BLOCKED`，不含位址／URL）。
                 breaker.onFailure()
-                return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, elapsedMs(start))
+                return McpListResult(
+                    config.id,
+                    emptyList(),
+                    McpStatus.PROTOCOL,
+                    elapsedMs(start),
+                    NetworkDenyCode.REDIRECT_BLOCKED.name,
+                )
             }
             if (code == 400 || code == 404 || code == 405) {
                 // 端點/請求形狀配置錯（非暫態）：PROTOCOL + 計熔斷（同 3xx 待遇）；
@@ -202,6 +264,11 @@ class McpServer(
             // 成功 body 超量（位元組/字元上限）：顯式 PROTOCOL + 計熔斷，不當 OK。
             breaker.onFailure()
             return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, elapsedMs(start))
+        } catch (e: McpNetworkPolicyBlocked) {
+            // 縱深：傳輸層直調閘（正常路徑預驗已擋，此處僅防決策 skew）——
+            // 配置姿態：PROTOCOL、不計熔斷（語義同預驗分支）；阻擋碼記入稽核
+            //（靜態碼名，不含位址／URL）。
+            return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, elapsedMs(start), e.denyCode.name)
         } catch (_: McpWire.McpProtocol) {
             // 傳輸層非 JSON 早擋（如 event-stream）：PROTOCOL + 計熔斷（同超量路徑）。
             breaker.onFailure()
@@ -236,7 +303,9 @@ class McpServer(
      *
      * baseUrl 形狀（[McpWire.isValidBaseUrl]）在 body 校驗**之後**、vault 之前驗證：
      * 壞參數仍優先報 PROTOCOL（不得被改標成 UNAUTHORIZED），壞地址則零 vault／
-     * 零 HTTP／零熔斷。停用／熔斷開路仍先短路（DISABLED／CIRCUIT_OPEN 不驗參數）。
+     * 零 HTTP／零熔斷；A3 政策預驗（[requireMcpNetworkPolicyAllowed]）緊隨傳輸形狀
+     * 預驗之後、同樣在 vault 之前（opt-in 缺失／位址不可路由 → PROTOCOL，
+     * 零 vault／零 HTTP／零熔斷）。停用／熔斷開路仍先短路（DISABLED／CIRCUIT_OPEN 不驗參數）。
      *
      * toolName 形狀（C-02）：只收遠端 **bare** 名——已限定名（保留前綴 `mcp.` 開頭，
      * 含 [McpScope.switchKey] 授權鍵形狀 `mcp.<len>|<id>|<tool>` 與展示形狀
@@ -290,11 +359,23 @@ class McpServer(
         if (!McpWire.isValidBaseUrl(config.baseUrl)) {
             return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
+        val endpoint: String
         try {
-            McpWire.requireSecureEndpoint(config.baseUrl)
+            endpoint = McpWire.requireSecureEndpoint(config.baseUrl)
         } catch (_: IllegalArgumentException) {
             // 明文非回環／畸形地址：fail-closed，不碰 vault、不發送、不計熔斷。
             return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, elapsedMs(start))
+        }
+        // A3 政策預驗（讀 vault／發送之前；body 形狀已先驗，壞參數仍優先報 PROTOCOL）：
+        // 拒絕即 PROTOCOL，不碰 vault、不發送、不計熔斷。
+        // 阻擋碼記入稽核（`denyCode` 鍵，靜態碼名；位址／URL 永不進稽核面）。
+        val optIn = effectiveOptIn()
+        // 單次解析接線（同 listTools）：預驗決策傳入 transport，零二次 DNS。
+        val preEval: NetworkEvaluation
+        try {
+            preEval = requireMcpNetworkPolicyAllowed(endpoint, optIn, config.networkResolver)
+        } catch (e: McpNetworkPolicyBlocked) {
+            return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, elapsedMs(start), denyCode = e.denyCode.name)
         }
         val key = try {
             keyVault.getKey(config.keyId)
@@ -324,7 +405,15 @@ class McpServer(
             return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
         try {
-            val raw = transport.postJson(config.baseUrl, bearer, body, timeoutMs)
+            val raw = transport.postJson(
+                config.baseUrl,
+                bearer,
+                body,
+                timeoutMs,
+                optIn,
+                config.networkResolver,
+                preverifiedEval = preEval,
+            )
             if (raw == null) {
                 breaker.onFailure()
                 return McpCallResult(config.id, toolName, McpStatus.TIMEOUT, elapsedMs(start))
@@ -336,8 +425,17 @@ class McpServer(
             }
             if (code in 300..399) {
                 // 同 listTools：不跟隨 redirect，3xx 終端 → PROTOCOL + 計熔斷。
+                // 範圍刻意取 `300..399`（寬於 `NetworkPolicy.isRedirectStatus`）：
+                // `304`／`305`／`306` 無跳轉語義但同屬未預期終端，一律 fail-closed。
+                // 執行層拒絕記靜態碼（稽核 `denyCode=REDIRECT_BLOCKED`）。
                 breaker.onFailure()
-                return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, elapsedMs(start))
+                return McpCallResult(
+                    config.id,
+                    toolName,
+                    McpStatus.PROTOCOL,
+                    elapsedMs(start),
+                    denyCode = NetworkDenyCode.REDIRECT_BLOCKED.name,
+                )
             }
             if (code == 400 || code == 404 || code == 405) {
                 // 同 listTools：端點/請求形狀配置錯（非暫態）→ PROTOCOL + 計熔斷
@@ -394,6 +492,11 @@ class McpServer(
             // 成功 body 超量（位元組/字元上限）：顯式 PROTOCOL + 計熔斷，不當 OK。
             breaker.onFailure()
             return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, elapsedMs(start))
+        } catch (e: McpNetworkPolicyBlocked) {
+            // 縱深：傳輸層直調閘（正常路徑預驗已擋，此處僅防決策 skew）——
+            // 配置姿態：PROTOCOL、不計熔斷（語義同預驗分支）；阻擋碼記入稽核
+            //（靜態碼名，不含位址／URL）。
+            return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, elapsedMs(start), denyCode = e.denyCode.name)
         } catch (_: McpWire.McpProtocol) {
             // 傳輸層非 JSON 早擋（如 event-stream）：PROTOCOL + 計熔斷（同超量路徑）。
             breaker.onFailure()
@@ -412,6 +515,17 @@ class McpServer(
         }
     }
 }
+
+/**
+ * A3：MCP 伺服器的 opt-in endpoint 身份（`NetworkOptInStore` 綁定鍵）。
+ *
+ * `mcp:` 命名空間與 chat 的 `preset:`／`custom:` 嚴格區分（見
+ * [NetworkOptInStore.boundOf]）：MCP 確認以獨立 store 實例持有，
+ * 不與 chat 共用確認；key 槽位（`McpServerConfig.keyId` 預設 `mcp:<id>`）
+ * 本就獨立於 chat key。baseUrl／scheme／port／tier／configRevision
+ * 任一變動即新身份，舊確認自動失效（fail-closed）。
+ */
+internal fun mcpEndpointId(serverId: String): String = "mcp:$serverId"
 
 /**
  * Bearer token 可列印 ASCII 預檢（fail-closed）：值須非空、長度不超過 [BEARER_MAX_CHARS]，

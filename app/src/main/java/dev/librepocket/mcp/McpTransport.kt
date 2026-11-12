@@ -1,6 +1,14 @@
 package dev.librepocket.mcp
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.HostResolver
+import dev.librepocket.policy.NetworkDenyCode
+import dev.librepocket.policy.NetworkEvaluation
+import dev.librepocket.policy.NetworkPolicy
+import dev.librepocket.policy.PinnedNetworkDns
+import dev.librepocket.policy.SystemHostResolver
 import java.io.IOException
+import java.net.Proxy
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
@@ -13,7 +21,9 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Authenticator
+import okhttp3.ConnectionPool
 import okhttp3.CookieJar
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
@@ -41,7 +51,8 @@ import okio.BufferedSink
  * - [bearer] 只放 `Authorization` 標頭，永不拼進 body，不寫 log；
  * - 呼叫方（[McpServer]）負責從 KeyVault 取 key、用後即擦，本層不留存；
  * - 僅放行 `https` 與回環 `http`（見 [McpWire.requireSecureEndpoint]，
- *   直調亦擋；其餘明文拋 `McpProtocol`）；
+ *   直調亦擋；其餘明文拋 `McpProtocol`；回環 `http` 另需政策閘
+ *   [requireMcpNetworkPolicyAllowed] 的 opt-in 放行，預設 deny-all）；
  * - 不自動跟隨 redirect：3xx 為終端回應（[McpServer] 映射 PROTOCOL + 計熔斷），
  *   `tools/call` body／Bearer 只會送到預驗過的初始端點；
  *   注入的 client 經 [transportClient] 強制套用 redirect／連線失敗重試／503 重送／
@@ -144,6 +155,17 @@ class McpTransport(
         bearer: String,
         bodyJson: String,
         timeoutMs: Long,
+        optIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+        resolver: HostResolver = SystemHostResolver,
+        /**
+         * 單次解析接線（single-flight）：[McpServer] 預驗的同一 [NetworkEvaluation]
+         * 可經此傳入，傳輸層只做一致性檢查（正規化 URL 相符即沿用，不再查 DNS，
+         * 省一次解析並關 skew 窗）＋pin 建連。缺席／不一致（直接呼叫、傳入其它
+         * URL 的舊決策）一律回落完整 [requireMcpNetworkPolicyAllowed]，
+         * fail-closed。呼叫方須保證傳入的是同 url＋同 optIn＋同 resolver 的
+         * 放行決策（[McpServer] 保證；直調傳 null 即走完整閘）。
+         */
+        preverifiedEval: NetworkEvaluation? = null,
     ): Pair<Int, String?>? {
         // 縱深：直調 transport 亦 fail-closed（McpServer 已預驗，此處僅防直調）。
         try {
@@ -158,6 +180,34 @@ class McpTransport(
         }
         // bare-origin 相容：無 path 時 endpoint() 自動補 /mcp（舊配置相容，建議記 warning 提醒手動補完整 path）。
         val url = McpWire.endpoint(baseUrl)
+        // A3 (Issue #135 A3)：建連前政策閘——讀 key／建連之前已由 McpServer
+        // 預驗，此處防直調繞過（直調無預驗決策可傳，[preverifiedEval] 為 null）。
+        // MCP 正常路徑走單次解析接線：[McpServer] 把預驗的放行決策經
+        // [preverifiedEval] 傳入，此處只做一致性檢查（見 [takePreverifiedEval]，
+        // 零 DNS）＋pin 建連；直調回落完整閘。拒絕即 typed fatal
+        // [McpNetworkPolicyBlocked]（deny code 可辨、不重試），不傳送
+        // credential／body、不建連。
+        // metadata／link-local／multicast／unspecified／CGNAT 永遠阻擋
+        //（opt-in 也打不開，見 [NetworkPolicy.mergeClass] 最嚴勝出）。
+        // 放行答案立即以 [PinnedNetworkDns] 釘住，建連走釘住值（evaluate 與
+        // connect 之間無二次解析，消除 TOCTOU rebind；呼叫方注入的 proxy 一律
+        // 以 `NO_PROXY` 覆寫，否則建連外包給代理另行解析、繞過 pin）。
+        // Per-request 獨立無閒置連線池（`ConnectionPool(0, 1, NANOSECONDS)`，
+        // 對齊 provider `pinnedTransportFor`）：舊 keep-alive 不得繞過 pin。
+        // [preverifiedEval] 沿用時此處不再查 DNS（單次解析），一致性檢查見
+        // [takePreverifiedEval]；放行答案立即以 [PinnedNetworkDns] 釘住。
+        val eval = takePreverifiedEval(url, preverifiedEval, optIn, resolver)
+        if (eval.resolvedAddresses.isEmpty()) {
+            throw McpNetworkPolicyBlocked(NetworkDenyCode.INVALID_HOST)
+        }
+        val host = url.toHttpUrlOrNull()?.host
+            ?: throw McpWire.McpProtocol("mcp: bad endpoint")
+        val pinned = PinnedNetworkDns.forHost(host, eval.resolvedAddresses, resolver)
+        val pinnedHttp = http.newBuilder()
+            .dns(pinned)
+            .proxy(Proxy.NO_PROXY)
+            .connectionPool(ConnectionPool(0, 1, TimeUnit.NANOSECONDS))
+            .build()
         // 可觀測性：自動補 /mcp 時記 warning（runCatching 使 JVM 單測無 mocked Log 仍綠）。
         if (McpWire.isBareOrigin(baseUrl)) {
             runCatching {
@@ -179,7 +229,7 @@ class McpTransport(
         // 以 TimeoutCancellationException/CancellationException 原樣傳播，不吞為 null。
         return withTimeoutOrNull(deadlineMs) {
             withContext(Dispatchers.IO) {
-                val call = http.newCall(request)
+                val call = pinnedHttp.newCall(request)
                 val job = currentCoroutineContext()[Job]
                 val cancellation =
                     job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
@@ -244,6 +294,73 @@ class McpTransport(
         }
     }
 }
+
+/**
+ * A3 (Issue #135 A3)：MCP 建連前政策閘（對齊 provider
+ * `requireNetworkPolicyAllowed`）。
+ *
+ * 呼叫方（[McpServer.listTools]／[McpServer.callTool]）必須在讀 key、組 body
+ * 之後、發送之前先調此閘（McpServer 另在 vault read 之前預驗一次）；
+ * 直調 [McpTransport.postJson] 亦經此閘。拒絕即 typed fatal
+ * [McpNetworkPolicyBlocked]（deny code 可辨、不重試——MCP 單次預算本就無重試），
+ * 不傳送 credential／body、不建連。
+ *
+ * Redirect 執行面：本層 0-follow（見 `transportClient`），3xx 由 [McpServer]
+ * 映射 PROTOCOL + 計熔斷（即 REDIRECT_BLOCKED 語義：跳轉目標永不被跟隨、
+ * credential／body 永不重送，`Location` 亦不觸發 DNS 解析）。
+ */
+internal fun requireMcpNetworkPolicyAllowed(
+    rawUrl: String,
+    optIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+    resolver: HostResolver = SystemHostResolver,
+): NetworkEvaluation {
+    val eval = NetworkPolicy.evaluateUrl(rawUrl, optIn, resolver)
+    if (!eval.allowed) throw McpNetworkPolicyBlocked(eval.denyCode ?: NetworkDenyCode.INVALID_HOST)
+    return eval
+}
+
+/**
+ * 單次解析接線（single-flight）：[McpServer] 預驗的放行決策沿用檢查。
+ *
+ * - [preverified] 非 null、放行、帶非空解析答案、且 `normalizedUrl` 與本步
+ *   傳輸 URL（`endpoint(baseUrl)` 正規化後）完全相符 → 直接沿用，零 DNS
+ *   （evaluate 與 connect 之間無二次解析，關 TOCTOU rebind skew 窗）；
+ * - 其餘（null＝直調、或不一致＝傳入其它 URL 的舊決策）→ 回落完整
+ *   [requireMcpNetworkPolicyAllowed]（fail-closed，直調路徑語義不變）。
+ *
+ * 一致性只比 `normalizedUrl`（已含 scheme／host／port／path 正規化），
+ * 不比 optIn／resolver——呼叫方（[McpServer]）須傳同 url＋同 optIn＋同
+ * resolver 的決策；直調傳 null 即走完整閘。沿用決策的 pin 建連仍由呼叫方
+ * （[McpTransport.postJson]）以 [PinnedNetworkDns] 執行。
+ */
+internal fun takePreverifiedEval(
+    url: String,
+    preverified: NetworkEvaluation?,
+    optIn: EndpointNetworkOptIn,
+    resolver: HostResolver,
+): NetworkEvaluation {
+    if (preverified != null &&
+        preverified.allowed &&
+        preverified.resolvedAddresses.isNotEmpty() &&
+        preverified.normalizedUrl == url
+    ) {
+        return preverified
+    }
+    return requireMcpNetworkPolicyAllowed(url, optIn, resolver)
+}
+
+/**
+ * 政策阻擋 typed fatal（A3）：與 [McpWire.McpProtocol] 平級的獨立例外
+ * （同為 [IllegalArgumentException] 子類、型別不相交）。[McpServer] 以專屬
+ * catch 先攔（配置錯誤姿態：PROTOCOL、不計熔斷、不碰 vault），再由
+ * `catch (McpProtocol) → PROTOCOL + 計熔斷` 兜底——順序不得顛倒，
+ * 否則阻擋會落到熔斷計數分支。
+ *
+ * 訊息僅帶 deny code（`mcp: network policy blocked:<CODE>`），不含 URL、
+ * 位址、credential——[NetworkEvaluation.resolvedAddresses] 永不進錯誤面。
+ */
+internal class McpNetworkPolicyBlocked(val denyCode: NetworkDenyCode) :
+    IllegalArgumentException("mcp: network policy blocked:${denyCode.name}")
 
 /**
  * 本層唯一的 JSON media type（top-level：[OneShotJsonBody] 共用）。

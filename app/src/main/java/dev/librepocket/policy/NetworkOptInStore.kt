@@ -13,6 +13,9 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  * 綁定（變更即失效，沿用 S4-C 顯式重綁姿態，不與 chat key 共用 namespace）：
  * - `endpointId`：`preset:<presetId>`（內建）或 `custom:<sha256-32hex>`（自訂，
  *   與 `SetupValidation.deriveEndpointId` 同形；此處只驗形狀，不重算）；
+ *   A3 另接受 `mcp:<serverId>`（MCP 伺服器專用命名空間，與 chat key 槽位
+ *   `preset:`／`custom:` 嚴格區分；MCP 側以獨立 store 實例持有確認，
+ *   不與 chat 共用確認）；
  * - `baseUrl` HttpUrl 正規化後字串（scheme／host 小寫、預設埠歸一、去
  *   fragment；尾點保留（視為不同身份，fail-closed，需重確認）；寫入與查詢兩側
  *   同經 boundOf 歸一；任何重寫即新身份）；
@@ -169,7 +172,9 @@ class NetworkOptInStore(
       configRevision: Long,
     ): ConfirmedOptIn {
       require(endpointId.isNotBlank()) { "NETWORK_OPTIN_ENDPOINT_BLANK" }
-      require(endpointId.startsWith("preset:") || endpointId.startsWith("custom:")) {
+      // `mcp:` 為 MCP 伺服器專用命名空間（A3；見類 KDoc）：MCP 確認以獨立
+      // store 實例持有，不與 chat 的 `preset:`／`custom:` 確認混用。
+      require(endpointId.startsWith("preset:") || endpointId.startsWith("custom:") || endpointId.startsWith("mcp:")) {
         "NETWORK_OPTIN_ENDPOINT_MALFORMED"
       }
       val trimmed = baseUrl.trim()

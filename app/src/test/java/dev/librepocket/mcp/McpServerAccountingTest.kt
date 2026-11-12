@@ -1,6 +1,8 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkEgressPolicy
 import java.io.InterruptedIOException
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
@@ -63,11 +65,20 @@ class McpServerAccountingTest {
         breaker: McpCircuitBreaker = McpCircuitBreaker(),
         vault: KeyVault = FakeVault(),
     ): McpServer = McpServer(
-        config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+        // A3：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in；
+        // production 預設仍 deny-all（HTTPS_ONLY）。
+        config = McpServerConfig(
+            id = "s1",
+            baseUrl = web.url("/").toString(),
+            networkOptIn = loopbackOptIn,
+        ),
         keyVault = vault,
         transport = transport,
         breaker = breaker,
     )
+
+    // A3 loopback 明文 opt-in（見上）。
+    private val loopbackOptIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
 
     // ---- socket 讀超時 → TIMEOUT（非 TRANSPORT） ----
 

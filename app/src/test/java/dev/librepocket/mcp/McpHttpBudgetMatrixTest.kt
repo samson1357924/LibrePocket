@@ -1,6 +1,9 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkDenyCode
+import dev.librepocket.policy.NetworkEgressPolicy
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.mockwebserver.MockResponse
@@ -38,11 +41,20 @@ class McpHttpBudgetMatrixTest {
     }
 
     private fun server(web: MockWebServer, breaker: McpCircuitBreaker) = McpServer(
-        config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+        // A3：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in；
+        // production 預設仍 deny-all（HTTPS_ONLY）。
+        config = McpServerConfig(
+            id = "s1",
+            baseUrl = web.url("/").toString(),
+            networkOptIn = loopbackOptIn,
+        ),
         keyVault = FakeVault(),
         transport = McpTransport(),
         breaker = breaker,
     )
+
+    // A3 loopback 明文 opt-in（見上）。
+    private val loopbackOptIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
 
     private fun redirect(code: Int, location: String) = MockResponse()
         .setResponseCode(code)
@@ -68,6 +80,7 @@ class McpHttpBudgetMatrixTest {
             val got = deadline { s.callTool("t", "{}") }
             assertNotNull("301 必須在 5s 內原樣回到呼叫方（不跟隨、不重送）", got)
             assertEquals("301 必須映射 PROTOCOL（非 TRANSPORT/OK）", McpStatus.PROTOCOL, got!!.status)
+            assertEquals("301 終端記 REDIRECT_BLOCKED", NetworkDenyCode.REDIRECT_BLOCKED.name, got.auditMap()["denyCode"])
             assertEquals("301 恰一發（body 不重放）", 1, web.requestCount)
             assertEquals("3xx 計熔斷一次（現行不變分類）", 1, breaker.failureCount())
         } finally {
@@ -85,6 +98,7 @@ class McpHttpBudgetMatrixTest {
             val got = deadline { s.listTools() }
             assertNotNull("303 必須在 5s 內原樣回到呼叫方", got)
             assertEquals("303 必須映射 PROTOCOL", McpStatus.PROTOCOL, got!!.status)
+            assertEquals("303 終端記 REDIRECT_BLOCKED", NetworkDenyCode.REDIRECT_BLOCKED.name, got.auditMap()["denyCode"])
             assertEquals("303 恰一發（303→GET 也不得被改寫送出）", 1, web.requestCount)
             assertEquals("3xx 計熔斷一次", 1, breaker.failureCount())
         } finally {

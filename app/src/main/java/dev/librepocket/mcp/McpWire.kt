@@ -1123,6 +1123,11 @@ internal object McpWire {
      * 注意 `mcp: missing result`／`mcp: bad result`／`mcp: bad result.tools`／
      * `mcp: tool without name` 四類結果形狀錯刻意拋一般 [IllegalArgumentException]
      * （與本類在 [McpServer] 同映射，行為無差異；型別區分由 McpWireD1Test 釘住）。
+     *
+     * 本類為 final（不得繼承）：A3 政策阻擋 [McpNetworkPolicyBlocked] 為與本類
+     * 平級的獨立例外（同為 [IllegalArgumentException] 子類、同訊息前綴，
+     * 但型別不相交），由 [McpServer] 專屬 catch 先攔（配置姿態 PROTOCOL、
+     * 不計熔斷），再由本類兜底；新增錯誤型別先經契約評審。
      */
     class McpProtocol(message: String) : IllegalArgumentException(message)
 

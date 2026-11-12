@@ -1,33 +1,56 @@
 package dev.librepocket.tool
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.HostResolver
+import dev.librepocket.policy.NetworkDenyCode
+import dev.librepocket.policy.NetworkEvaluation
+import dev.librepocket.policy.NetworkPolicy
+import dev.librepocket.policy.PinnedNetworkDns
+import dev.librepocket.policy.SystemHostResolver
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InterruptedIOException
+import java.net.Proxy
 import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.nio.charset.Charset
 import java.nio.charset.CodingErrorAction
 import java.util.concurrent.TimeUnit
+import okhttp3.ConnectionPool
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
 /**
- * S1-B `web.fetch` (READ)：抓取單一 URL 的文字內容。
+ * S1-B `web.fetch` (READ)＋Issue #135 A4 出站政策接線：抓取單一 URL 的文字內容。
  *
- * 規則（S1-B 範圍）：
- * - https-only：明文 `http` 僅允許本地迴環（`localhost` / `127.0.0.0/8` / `::1`），
- *   非本地一律執行期 `Unavailable`（投影層級等價於 UNAVAILABLE），不發任何請求；
- *   自動重定向一律關閉，手動跟隨（上限 [MAX_REDIRECTS] 跳）且每跳重做策略檢查，
- *   `https → http` 降級一律 `Unavailable/CLEARTEXT_NON_LOCAL`；
+ * 規則（S1-B 基礎＋A4 接線）：
+ * - URL 檢查一律走 [NetworkPolicy.evaluateUrl]（per-endpoint [EndpointNetworkOptIn]，
+ *   預設 `HTTPS_ONLY` 即 deny-all）：公網 https-only；迴環／私有（含 `localhost`）
+ *   須 opt-in（`ALLOW_PRIVATE_DNS` 走 https、`ALLOW_CLEARTEXT_PRIVATE` 另開
+ *   迴環／RFC1918／ULA 明文，公網 http 永不開放）；metadata／link-local／
+ *   multicast／unspecified／CGNAT 等 opt-in 也永遠阻擋；判定一律以解析後位元組
+ *   [NetworkPolicy.classifyAddress] 為準，不做字串前綴比對；
+ * - 自動重定向一律關閉，手動跟隨（上限 [MAX_REDIRECTS] 跳），每跳以原始 resolver
+ *   重走政策（新決策）＋`https → http` 降級永遠拒；任何跳轉失敗（含超跳數、
+ *   壞 Location、跳往被政策拒絕的目標）一律 typed `REDIRECT_BLOCKED`
+ *   （[FetchOutcome.Unavailable]），絕不向 redirect target 發請求；
+ * - DNS pinning：首跳放行答案經 [PinnedNetworkDns] 釘住，逐跳通過政策才補釘，
+ *   建連一律走釘住值（evaluate 與 connect 之間無二次解析）；client 強制直連
+ *   （`Proxy.NO_PROXY`），代理不得外包解析繞過 pin；
  * - `maxBytes` 上限（預設 256 KiB，絕對上限 1 MiB），超限截斷並標記；
  * - 超時 15s：connect / read / write / 全程 call 皆 15s（[TIMEOUT_MS]）；
  * - 轉碼降級：按 `Content-Type` charset 解碼，未知或損壞編碼降級為 UTF-8
  *   replacement 解碼，永不因轉碼拋異常；
+ * - 取消：同步阻塞 API，無第二傳輸、無 cache；無 coroutine 取消路徑——
+ *   中斷唯一靠外層超時 bound（全程 call [TIMEOUT_MS]，`InterruptedIOException`
+ *   → `TIMEOUT`），絕不 fallback、不回傳部分 Ok；
  * - 複用 OkHttp：共用單例 [sharedClient]（連線池/調度器共用），僅在呼叫方
- *   要求不同超時時才 `newBuilder` 衍生（仍共用底層連線池）。
+ *   要求不同超時時才 `newBuilder` 衍生（仍共用底層連線池）；每跳建連另疊
+ *   pinning DNS＋直連（`newBuilder` 衍生，不污染單例）。
  *
- * 純 JVM（無 Android API），可在單元測試直接執行。
+ * 純 JVM（無 Android API），可在單元測試直接執行（測試一律注入 fake
+ * [HostResolver]／MockWebServer，禁真網路／真 DNS）。
  */
 object WebFetch {
 
@@ -44,7 +67,7 @@ object WebFetch {
     /** 位元組上限硬頂 1 MiB（呼叫方要求再大也鉗制於此）。 */
     const val ABSOLUTE_MAX_BYTES = 1_048_576
 
-    /** 手動跟隨重定向的上限跳數（超過即 `Failed/TOO_MANY_REDIRECTS`）。 */
+    /** 手動跟隨重定向的上限跳數（超過即 `Unavailable/REDIRECT_BLOCKED`）。 */
     const val MAX_REDIRECTS = 5
 
     const val FALLBACK_HINT = "open the URL manually in a browser"
@@ -66,35 +89,24 @@ object WebFetch {
         data class Failed(val detail: String, val message: String) : FetchOutcome
     }
 
-    /** 是否本地迴環主機（`http` 例外的唯一判據）。 */
-    fun isLocalHost(host: String): Boolean {
-        val h = host.lowercase().trimEnd('.')
-        if (h == "localhost") return true
-        if (h == "::1" || h == "0:0:0:0:0:0:0:1") return true
-        val parts = h.split(".")
-        if (parts.size == 4 && parts[0] == "127") {
-            return parts.all { it.toIntOrNull() in 0..255 }
-        }
-        return false
-    }
-
-    private val schemePrefix = Regex("^\\s*([A-Za-z][A-Za-z0-9+.-]*):")
-
-    /** 純策略檢查：不觸碰網路，可在請求發出前短路拒絕。 */
-    fun checkUrl(rawUrl: String): UrlCheck {
-        // OkHttp HttpUrl 僅解析 http(s)：先顯式識別其餘 scheme，保留細分碼。
-        val prefix = schemePrefix.find(rawUrl)?.groupValues?.get(1)?.lowercase()
-        if (prefix != null && prefix != "http" && prefix != "https") {
-            return UrlCheck.Blocked(DenyReason.NO_PRIVILEGE, "UNSUPPORTED_SCHEME")
-        }
-        val url = rawUrl.toHttpUrlOrNull()
-            ?: return UrlCheck.Blocked(DenyReason.NO_PRIVILEGE, "BAD_URL")
-        return when (url.scheme) {
-            "https" -> UrlCheck.Allowed(url.toString())
-            "http" ->
-                if (isLocalHost(url.host)) UrlCheck.Allowed(url.toString())
-                else UrlCheck.Blocked(DenyReason.NO_PRIVILEGE, "CLEARTEXT_NON_LOCAL")
-            else -> UrlCheck.Blocked(DenyReason.NO_PRIVILEGE, "UNSUPPORTED_SCHEME")
+    /**
+     * 純策略檢查：改走 [NetworkPolicy.evaluateUrl]（A4），建連前短路拒絕。
+     *
+     * 預設 [EndpointNetworkOptIn]（`HTTPS_ONLY`）即 deny-all：迴環／私有
+     * 無論明文與否一律先拒，須呼叫方按 per-endpoint 授權傳入 opt-in。
+     * 阻擋時 `detail` 即 [NetworkDenyCode] 名（typed）；舊字串碼已對應：
+     * `BAD_URL`→`INVALID_HOST`、`CLEARTEXT_NON_LOCAL`→`CLEARTEXT_NOT_PERMITTED`。
+     */
+    fun checkUrl(
+        rawUrl: String,
+        optIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+        resolver: HostResolver = SystemHostResolver,
+    ): UrlCheck {
+        val eval = NetworkPolicy.evaluateUrl(rawUrl, optIn, resolver)
+        return if (eval.allowed) {
+            UrlCheck.Allowed(eval.normalizedUrl ?: rawUrl)
+        } else {
+            UrlCheck.Blocked(DenyReason.NO_PRIVILEGE, eval.denyCode?.name ?: NetworkDenyCode.INVALID_HOST.name)
         }
     }
 
@@ -116,7 +128,13 @@ object WebFetch {
                 .also { shared = it }
         }
 
-    private val redirectCodes = setOf(301, 302, 303, 307, 308)
+    /**
+     * 跳轉碼判定單一真相：[NetworkPolicy.isRedirectStatus]
+     * （`300..303`／`307`／`308`；`304`（Not Modified）／`305`（Use Proxy）／
+     * `306` 無 `Location` 跳轉語義，明確排除——落到下方 `!isSuccessful` 分支
+     * 以 `HTTP_304` 等 `Failed` 終端，fail-closed，絕不跟隨）。
+     */
+    private fun isRedirect(code: Int): Boolean = NetworkPolicy.isRedirectStatus(code)
 
     private fun unavailable(detail: String): FetchOutcome.Unavailable =
         FetchOutcome.Unavailable(
@@ -135,30 +153,87 @@ object WebFetch {
     fun resolveRedirect(currentUrl: String, location: String): String? =
         currentUrl.toHttpUrlOrNull()?.resolve(location)?.toString()
 
+    /** 跳轉失敗一律 typed `REDIRECT_BLOCKED`（[FetchOutcome.Unavailable]，不建第二連線）。 */
+    private fun redirectBlocked(): FetchOutcome.Unavailable =
+        unavailable(NetworkDenyCode.REDIRECT_BLOCKED.name)
+
+    /**
+     * A4 逐跳 redirect 目標判定（純函數，可單測；零建連）。
+     *
+     * - 解析失敗／非 http(s) → 拒；
+     * - `https → http` 降級永遠拒（先於 DNS：攻擊者可控 Location 不觸發解析）；
+     * - 其餘走 [NetworkPolicy.evaluateUrl] 重驗（新決策），拒絕一律正規化為
+     *   [NetworkDenyCode.REDIRECT_BLOCKED]（跳往迴環／私有／metadata 等皆同），
+     *   放行回該跳評估（含釘住用答案與正規化 URL）。
+     */
+    internal fun evaluateRedirectTarget(
+        currentUrl: String,
+        resolvedUrl: String,
+        optIn: EndpointNetworkOptIn,
+        resolver: HostResolver,
+    ): NetworkEvaluation {
+        val fromHttps = currentUrl.toHttpUrlOrNull()?.scheme == "https"
+        val toScheme = resolvedUrl.toHttpUrlOrNull()?.scheme
+        if (toScheme == null || (fromHttps && toScheme == "http")) {
+            return NetworkEvaluation.denied(NetworkDenyCode.REDIRECT_BLOCKED, null)
+        }
+        val eval = NetworkPolicy.evaluateUrl(resolvedUrl, optIn, resolver)
+        if (eval.allowed) return eval
+        return NetworkEvaluation.denied(
+            NetworkDenyCode.REDIRECT_BLOCKED,
+            eval.addressClass,
+            eval.resolvedAddresses,
+        )
+    }
+
     /**
      * 同步抓取（呼叫方負責切到 IO 執行緒）。
-     * 非本地明文 http 在觸碰 [client] 之前即短路為 [FetchOutcome.Unavailable]；
+     * 首跳先走 [NetworkPolicy.evaluateUrl]（per-endpoint [optIn]，預設 deny-all），
+     * 拒絕即 [FetchOutcome.Unavailable]（typed deny code），不觸碰 [client]；
      * 自動重定向一律關閉（[sharedClient] 及本函式內衍生 client 皆
      * `followRedirects(false)`），最多 [MAX_REDIRECTS] 跳手動跟隨，每跳重做
-     * [checkUrl]，`https → http` 降級一律 [FetchOutcome.Unavailable]
-     *（`CLEARTEXT_NON_LOCAL`，含本地迴環在內 fail-closed），絕不發出明文請求。
+     * [evaluateRedirectTarget]（`https → http` 降級永不跟隨，含本地迴環在內
+     * fail-closed，絕不發出該跳請求；任何跳轉失敗一律 `REDIRECT_BLOCKED`）。
+     * 每跳建連走 per-fetch [PinnedNetworkDns] 釘住答案並強制直連。
      */
     fun fetch(
         rawUrl: String,
         maxBytes: Int = DEFAULT_MAX_BYTES,
         client: OkHttpClient = sharedClient(),
         timeoutMs: Long = TIMEOUT_MS,
+        optIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+        resolver: HostResolver = SystemHostResolver,
     ): FetchOutcome {
         val cap = maxBytes.coerceIn(1, ABSOLUTE_MAX_BYTES)
-        val first = when (val check = checkUrl(rawUrl)) {
-            is UrlCheck.Allowed -> check.url
-            is UrlCheck.Blocked -> return unavailable(check.detail)
+        val firstEval = NetworkPolicy.evaluateUrl(rawUrl, optIn, resolver)
+        if (!firstEval.allowed || firstEval.resolvedAddresses.isEmpty()) {
+            return unavailable(firstEval.denyCode?.name ?: NetworkDenyCode.INVALID_HOST.name)
         }
+        val first = firstEval.normalizedUrl ?: rawUrl
+        val firstHost = first.toHttpUrlOrNull()?.host
+            ?: return unavailable(NetworkDenyCode.INVALID_HOST.name)
+        // Per-fetch DNS pin（A4）：首跳放行答案先釘住；逐跳以原始 [resolver]
+        // 重驗（新決策）後才補釘，建連一律走釘住值，evaluate 與 connect 之間
+        // 無二次解析（無 TOCTOU rebind）。`strict = true`：未釘住 host 絕不建連。
+        val pinned = PinnedNetworkDns(delegate = resolver, strict = true)
+        pinned.pin(firstHost, firstEval.resolvedAddresses)
         // 呼叫方傳入的 client 可能仍開啟自動重定向：一律強制關閉，改由下方手動跟隨。
         val baseClient =
             if (timeoutMs == TIMEOUT_MS) client
             else client.newBuilder().callTimeout(timeoutMs, TimeUnit.MILLISECONDS).build()
+        // 強制直連（`Proxy.NO_PROXY`，與 provider `pinnedTransportFor` 同姿態）：
+        // `newBuilder` 繼承呼叫方 client 的 proxy 設定，必須顯式覆寫，否則建連外包
+        // 給代理另行解析，繞過 DNS pin（pin 只管直連路徑）。
+        // 跨 fetch 連線池重用已關閉：per-fetch `callClient` 疊加無閒置池
+        //（`ConnectionPool(0, 1, NANOSECONDS)`，對齊 provider `pinnedTransportFor`
+        // 與 `McpTransport.postJson`）：舊 keep-alive socket 不得跨 fetch 重用、
+        // 繞過當次 pin；同 fetch 內多跳共用同一 pin 生命週期。
+        // `newBuilder` 仍共用底層調度器等其餘資源（S1-B「複用 OkHttp」相容），
+        // 僅連線池 per-fetch 隔離。
         val callClient = baseClient.newBuilder()
+            .dns(pinned)
+            .proxy(Proxy.NO_PROXY)
+            .connectionPool(ConnectionPool(0, 1, TimeUnit.NANOSECONDS))
             .followRedirects(false)
             .followSslRedirects(false)
             .build()
@@ -170,20 +245,21 @@ object WebFetch {
                 .build()
             val next: String = try {
                 callClient.newCall(request).execute().use { response ->
-                    if (response.code in redirectCodes) {
-                        if (hops >= MAX_REDIRECTS) return transportFailed("TOO_MANY_REDIRECTS")
+                    if (isRedirect(response.code)) {
+                        if (hops >= MAX_REDIRECTS) return redirectBlocked()
                         val location = response.header("Location")
-                            ?: return transportFailed("BAD_REDIRECT")
+                            ?: return redirectBlocked()
                         val resolved = resolveRedirect(current, location)
-                            ?: return transportFailed("BAD_REDIRECT")
-                        // https → http 降級一律拒絕（fail-closed，含本地迴環），絕不發出明文請求。
-                        val fromHttps = current.toHttpUrlOrNull()?.scheme == "https"
-                        val toHttp = resolved.toHttpUrlOrNull()?.scheme == "http"
-                        if (fromHttps && toHttp) return unavailable("CLEARTEXT_NON_LOCAL")
-                        when (val check = checkUrl(resolved)) {
-                            is UrlCheck.Blocked -> return unavailable(check.detail)
-                            is UrlCheck.Allowed -> check.url
-                        }
+                            ?: return redirectBlocked()
+                        // A4 逐跳重驗（含 `https → http` 降級永遠拒）：任何拒絕一律
+                        // typed `REDIRECT_BLOCKED`，絕不向 redirect target 發請求；
+                        // 通過才補釘並跟隨（建連只走釘住答案）。
+                        val hopEval = evaluateRedirectTarget(current, resolved, optIn, resolver)
+                        if (!hopEval.allowed || hopEval.resolvedAddresses.isEmpty()) return redirectBlocked()
+                        val hopUrl = hopEval.normalizedUrl ?: resolved
+                        val hopHost = hopUrl.toHttpUrlOrNull()?.host ?: return redirectBlocked()
+                        pinned.pin(hopHost, hopEval.resolvedAddresses)
+                        hopUrl
                     } else {
                         if (!response.isSuccessful) {
                             val detail = "HTTP_${response.code}"

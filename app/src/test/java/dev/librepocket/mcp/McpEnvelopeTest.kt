@@ -1,6 +1,8 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkEgressPolicy
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
@@ -27,6 +29,10 @@ class McpEnvelopeTest {
     private suspend fun <T> deadline(block: suspend CoroutineScope.() -> T): T =
         withTimeoutOrNull(5_000, block)
             ?: error("5 秒內未回傳——server 未返回（佇列阻塞或 timeout 到期）")
+
+    // A3：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in；
+    // production 預設仍 deny-all（HTTPS_ONLY）。
+    private val loopbackOptIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
 
     private class FakeVault : KeyVault {
         var reads = 0
@@ -976,7 +982,7 @@ class McpEnvelopeTest {
             val breaker = McpCircuitBreaker()
             val vault = FakeVault()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = vault,
                 transport = McpTransport(),
                 breaker = breaker,
@@ -1022,7 +1028,7 @@ class McpEnvelopeTest {
             )
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -1067,7 +1073,7 @@ class McpEnvelopeTest {
             }
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -1106,7 +1112,7 @@ class McpEnvelopeTest {
             web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -1148,7 +1154,7 @@ class McpEnvelopeTest {
             )
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -1178,7 +1184,7 @@ class McpEnvelopeTest {
             )
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,

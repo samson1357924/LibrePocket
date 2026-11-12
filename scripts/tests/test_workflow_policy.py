@@ -2175,7 +2175,7 @@ jobs:
                 )
                 self._assert_rejected("osv-scan must not file issues")
 
-    def test_osv_scan_extra_job_is_rejected(self) -> None:
+    def test_osv_scan_job_continue_on_error_is_rejected(self) -> None:
         self._write(
             "osv-scan.yml",
             OSV_SCAN.replace(
@@ -2185,6 +2185,75 @@ jobs:
             ),
         )
         self._assert_rejected("osv-scan must not contain job-level continue-on-error")
+
+    def test_osv_scan_extra_job_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "jobs:\n",
+                "jobs:\n  extra:\n    runs-on: ubuntu-latest\n    steps: []\n",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan jobs must be exactly ['osv-scan']")
+
+    def test_osv_scan_missing_concurrency_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "concurrency:\n"
+                "  group: ${{ github.workflow }}-${{ github.ref }}\n"
+                "  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}\n\n",
+                "",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan concurrency is missing")
+
+    def test_osv_scan_invalid_concurrency_cancel_in_progress_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}",
+                "cancel-in-progress: false",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan concurrency.cancel-in-progress must be exactly")
+
+    def test_osv_scan_missing_shadow_preflight_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "      - name: Reject Python import shadowing\n"
+                "        run: |\n"
+                "          chmod +x scripts/check_python_shadowing.sh\n"
+                "          scripts/check_python_shadowing.sh\n\n",
+                "",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan must have exactly four steps")
+
+    def test_osv_scan_upload_retention_days_is_pinned(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace("retention-days: 14", "retention-days: 30", 1),
+        )
+        self._assert_rejected("osv-scan upload with must be exactly")
+
+    def test_osv_scan_extra_step_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "      - name: Upload OSV report\n",
+                "      - name: Extra step\n"
+                "        run: echo extra\n"
+                "      - name: Upload OSV report\n",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan must have exactly four steps")
 
     def test_policy_harness_pyyaml_install_is_pinned(self) -> None:
         workflow = PR_CHECK

@@ -136,7 +136,8 @@ fun MainScreen(
 
     // S3 提權橋產品態（BACKLOG D09）：審計表 + privilege_bridge 開關 +
     // 橋接授權三位一體；一鍵收回原子清表、關開關、撤授權（見 PrivilegeBridgeState）。
-    val privilegeState = remember { PrivilegeBridgeState() }
+    // #136-B1 行程單例：跨 composition／Activity 唯一持有者，審計計數不因重組丟失。
+    val privilegeState = remember { PrivilegeBridgeState.process() }
     var privilegeAuditCount by remember { mutableIntStateOf(privilegeState.auditCount()) }
 
     // C1 系統預設助理（Issue #137 C1b，三 flavor 共用 main 接線）：

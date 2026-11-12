@@ -107,13 +107,10 @@ class ShellP1RegressionTest {
     @Test fun grepPatternValueR_notTraversal() {
         val scope = java.io.File.createTempFile("scp","").apply { delete(); mkdirs() }
         try {
-            val known = java.io.File(scope, "known").apply { mkdirs() }
+            val known = java.io.File(scope, "known.txt").apply { writeText("needle") }
             val v = ShellPolicy.validate(listOf("grep", "-e", "-R", known.absolutePath), privateRoot = scope.absolutePath)
-            // -R consumed as pattern value; known path vetted -> may be Allowed or denied on other grounds, but NOT traversal-blacklisted due to -R-as-pattern
-            if (v is Validation.Denied) {
-                val msg = v.message
-                assertTrue("should not be traversal denial, got $v", !msg.contains("traversal"))
-            }
+            // -R consumed as pattern value; known path vetted -> Allowed (no denial).
+            assertTrue("expected Allowed, got $v", v is Validation.Allowed)
         } finally { scope.deleteRecursively() }
     }
 
@@ -157,6 +154,50 @@ class ShellP1RegressionTest {
         val scope = java.io.File.createTempFile("scp","").apply { delete(); mkdirs() }
         try {
             val v = ShellPolicy.validate(listOf("df", "--exclude-typ", scope.absolutePath), privateRoot = scope.absolutePath)
+            assertTrue("expected denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+        } finally { scope.deleteRecursively() }
+    }
+
+    // Elevated channel parity for new vectors
+    @Test fun elevated_grepRegexp_dashLeadingPattern() {
+        val scope = java.io.File.createTempFile("scp","").apply { delete(); mkdirs() }
+        val outside = java.io.File.createTempFile("out","").apply { delete(); mkdirs() }
+        try {
+            val link = java.io.File(scope, "leak").apply { delete() }
+            java.nio.file.Files.createSymbolicLink(link.toPath(), outside.toPath())
+            val v = ShellPolicy.validateElevated(listOf("grep", "--regexp", "-e", link.absolutePath), privateRoot = scope.absolutePath)
+            assertTrue("expected denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+        } finally { scope.deleteRecursively(); outside.deleteRecursively() }
+    }
+
+    @Test fun elevated_dfShortCluster_typeValue() {
+        val scope = java.io.File.createTempFile("scp","").apply { delete(); mkdirs() }
+        try {
+            val v = ShellPolicy.validateElevated(listOf("df", "-hx", scope.absolutePath), privateRoot = scope.absolutePath)
+            assertTrue("expected denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+        } finally { scope.deleteRecursively() }
+    }
+
+    // Multicall effective form (toybox) for new vectors
+    @Test fun multicall_grepRegexp_dashLeadingPattern() {
+        val scope = java.io.File.createTempFile("scp","").apply { delete(); mkdirs() }
+        val outside = java.io.File.createTempFile("out","").apply { delete(); mkdirs() }
+        try {
+            val link = java.io.File(scope, "leak").apply { delete() }
+            java.nio.file.Files.createSymbolicLink(link.toPath(), outside.toPath())
+            val v = ShellPolicy.validate(listOf("toybox", "grep", "--regexp", "-e", link.absolutePath), privateRoot = scope.absolutePath)
+            assertTrue("expected denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+        } finally { scope.deleteRecursively(); outside.deleteRecursively() }
+    }
+
+    @Test fun multicall_dfShortCluster_typeValue() {
+        val scope = java.io.File.createTempFile("scp","").apply { delete(); mkdirs() }
+        try {
+            val v = ShellPolicy.validate(listOf("toybox", "df", "-hx", scope.absolutePath), privateRoot = scope.absolutePath)
             assertTrue("expected denied, got $v", v is Validation.Denied)
             assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
         } finally { scope.deleteRecursively() }

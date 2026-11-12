@@ -1284,7 +1284,7 @@ jobs:
     def test_nightly_api_matrix_is_pinned(self) -> None:
         self._write(
             "nightly-instrumented.yml",
-            NIGHTLY.replace("api-level: [33, 34]", "api-level: [33]", 1),
+            NIGHTLY.replace("api-level: [33, 34, 36]", "api-level: [33]", 1),
         )
         self._assert_rejected("matrix api-level must be exactly")
 

@@ -71,15 +71,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        api-level: [33, 34]
+        # API 36 == targetSdk (app/build.gradle.kts): target-level behavior
+        # (permission model, background restrictions, edge-to-edge) must be
+        # sampled on every flavor — Play/Github-only code paths (GMS/ML Kit,
+        # Azure Speech, Shizuku) are the ones most likely to diverge on the
+        # target level, so a Foss-only API 36 lane would leave them uncovered.
+        # Cost: nightly-only lanes (PR runs need the run-instrumented label),
+        # 9 jobs in parallel; wall time stays the slowest shard.
+        api-level: [33, 34, 36]
         flavor: [Play, Foss, Github]
         target: [google_apis]
         arch: [x86_64]
-        include:
-          - api-level: 36
-            flavor: Foss
-            target: google_apis
-            arch: x86_64
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

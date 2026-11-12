@@ -90,7 +90,7 @@ ALLOWED_WORKFLOW_FILES = frozenset(
 EXPECTED_WORKFLOW_SHA256 = {
     "codeql.yml": "b58e40a235a3ea0580d12e902f61ab04e0331cdbaeffdc1e72332055d722c638",
     "nightly-instrumented.yml": (
-        "7f6fef3510422f07b7c04010c4de32b4e3705b45eb4003571f93cbec4d9301b1"
+        "a271008743bc51293847d687261f3a30f3fff15af485dd9c764a35be7c5d9b67"
     ),
     "pocketguard.yml": (
         "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564"
@@ -429,20 +429,12 @@ EXPECTED_INSTRUMENTED_KEYS = frozenset(
     {"if", "name", "runs-on", "timeout-minutes", "strategy", "steps"}
 )
 EXPECTED_STRATEGY_KEYS = frozenset({"fail-fast", "matrix"})
-EXPECTED_MATRIX_KEYS = frozenset({"api-level", "flavor", "target", "arch", "include"})
+EXPECTED_MATRIX_KEYS = frozenset({"api-level", "flavor", "target", "arch"})
 EXPECTED_MATRIX_VALUES = {
-    "api-level": [33, 34],
+    "api-level": [33, 34, 36],
     "flavor": ["Play", "Foss", "Github"],
     "target": ["google_apis"],
     "arch": ["x86_64"],
-    "include": [
-        {
-            "api-level": 36,
-            "flavor": "Foss",
-            "target": "google_apis",
-            "arch": "x86_64",
-        }
-    ],
 }
 EXPECTED_RELEASE_ON = {
     "push": {"tags": ["v[0-9]*.[0-9]*.[0-9]*"]},

@@ -150,12 +150,12 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * [TurnController.droppedHistoryChars] (char sum, same window, `String.length`
  * units) plus the continuation's own trim publication, never silent.
  *
- * Hydration char budget (H1 observability, #16 residual): the window itself
- * is still count- or char-capped ([MaxMessages]/[MaxChars]) with no separate
- * token/context measurement — the factory hydration path already applies its
- * own interim per-row 20k char truncation upstream, and this window only
- * bounds the outgoing request *copy*. The char counterpart closes the
- * reconciliation gap: for every plain [buildRequest] shipment the combined
+ * Hydration char budget (H1 observability, #16-B1 bounded default): the
+ * window itself is count- or char-capped ([MaxMessages]/[MaxChars]/[Bounded])
+ * with no separate token/context measurement — the factory hydration path
+ * already applies its own interim per-row 20k char truncation upstream, and
+ * this window only bounds the outgoing request *copy*. The char counterpart
+ * closes the reconciliation gap: for every plain [buildRequest] shipment the combined
  * (capped prefix + live) text chars equal `droppedHistoryChars +
  * lastRequestTrimmedChars + lastRequestChars` up to the ephemeral
  * time-block delta (the time block is suffixed after the window trim, so it
@@ -173,11 +173,47 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * accounted delta). Chars reconcile with the one documented time-block
  * delta.
  *
- * The default is [Unbounded] (window everything, truncate nothing): no
- * on-device token/context measurement exists in this branch to justify a
- * tighter default (TODO #16: measure real session sizes before fixing a
- * number). [MaxMessages]/[MaxChars] exist so callers and tests can lock the
- * truncation behavior today.
+ * The default is [Bounded] ([HistoryWindowCap.DEFAULT]: at most 200 messages
+ * and 60_000 chars, oldest-first, whole-message, pair-atomic — see below).
+ * Synthetic JVM measurement basis (fake provider/policy, no network/device):
+ * 20 x ~500-char rows ship ~10k chars while 100 x ~500-char rows ship ~50k
+ * chars under explicit [Unbounded] (linear, unbounded — both fit the 100k
+ * send-time cap so no send-time trim masks the window); the 150 x ~500-char
+ * (75k) fixture exceeds the 60k char leg but still fits the 100k send-time
+ * cap, so the bounded default must drop from the head with send-time trim
+ * staying at 0 (pinned by `TurnControllerDefaultCapTest`). 60_000 chars is
+ * 0.6 x [TurnController.MAX_REQUEST_CHARS] (leaves ~40k headroom for the
+ * ephemeral time block plus the structured tool round without tripping the
+ * send-time trim, and fits at least three full 20k interim rows); 200
+ * messages is ~100 turns (SnapshotBudget's ordinary 50-100 turns never trip;
+ * tiny-message floods are still count-bounded). Ordinary sessions never trip
+ * either leg; long dialogues window oldest-first and stay observable.
+ * [Unbounded] is retained as an explicit opt-in for tests/scaffolds that
+ * need the full history. Hydration-tail unification (the 2000-row DB tail
+ * still loads before this window) and any token/context measurement stay
+ * Target for B2.
+ *
+ * Pair atomicity (B1): truncation never splits a legal tool-call/result
+ * pairing. When a naive head cut (count/char/dual) falls inside a valid,
+ * complete tool-call/output batch (assistant `toolCalls` with non-blank,
+ * batch-unique ids/names immediately followed by matching `tool` rows,
+ * including single-pending backfill matching
+ * `ProviderJson.validateToolPairing(..., allowChatBackfill = true)`), it
+ * snaps FORWARD to the end of that batch so the cut never orphans a leading
+ * `tool` result (within cap, counted in
+ * [TurnController.droppedHistoryCount]/[TurnController.droppedHistoryChars])
+ * — including snapping to `history.size` (yielding empty) if a valid batch
+ * runs to the end of history and would otherwise be split. Discarded
+ * unwindowed prefixes are NOT validated: an invalid message or malformed
+ * batch wholly within the discarded prefix never disables pair-atomic
+ * snapping for valid tool batches later in the history. The
+ * single-newest-whole-message rule is preserved for plain histories (a lone
+ * newest user/assistant row is never a tool batch, so it survives even over a
+ * char budget). When an invalid or unpaired part survives into the retained
+ * slice (such as an orphan `tool` row, a dangling batch, or an ambiguous
+ * blank `toolCallId` within or straddling the retained window), the window
+ * never repairs or drops it: it keeps the naive cut and fails closed
+ * downstream in `ProviderJson.validateToolPairing`.
  */
 sealed interface HistoryWindowCap {
   data object Unbounded : HistoryWindowCap
@@ -191,31 +227,162 @@ sealed interface HistoryWindowCap {
       require(maxChars > 0) { "maxChars must be positive" }
     }
   }
+  /**
+   * B1 (#16) dual-track bound: the request copy must satisfy BOTH legs
+   * (newest kept). The naive head cut is `max(count-leg cut, char-leg cut)`
+   * and then snaps forward to the next tool-pair boundary (see above).
+   */
+  data class Bounded(val maxMessages: Int, val maxChars: Int) : HistoryWindowCap {
+    init {
+      require(maxMessages > 0) { "maxMessages must be positive" }
+      require(maxChars > 0) { "maxChars must be positive" }
+    }
+  }
+
+  companion object {
+    /** B1 default: at most ~100 turns even when every row is tiny. */
+    const val DEFAULT_MAX_MESSAGES = 200
+
+    /** B1 default: 0.6 x `MAX_REQUEST_CHARS`; see the measurement note above. */
+    const val DEFAULT_MAX_CHARS = 60_000
+
+    /** B1 default window: [Bounded] with the legs above. */
+    val DEFAULT: HistoryWindowCap = Bounded(DEFAULT_MAX_MESSAGES, DEFAULT_MAX_CHARS)
+  }
 }
 
 /**
  * Oldest-first eviction (evicts oldest first, retains newest; eviction order,
  * not iteration order), whole-message truncation for the resumed prefix and
- * the outgoing request copy. Whole messages only (tool-pair integrity is
- * structural, see above). A single newest message that already exceeds a
- * char budget is still kept whole — truncation drops messages, never splits
- * one — so at least the newest message always survives.
+ * the outgoing request copy. Whole messages only, and pair-atomic (tool-pair
+ * integrity is structural for plain marker histories AND enforced by the
+ * boundary snap for structured `toolCalls`/`tool` histories — see
+ * [HistoryWindowCap]): when a naive count/char head cut would split a valid,
+ * complete tool-call/output batch, it snaps forward to the end of that batch
+ * so the split pair is dropped whole (staying within cap) instead of shipping
+ * half — including snapping to `history.size` (yielding empty) rather than a
+ * lone orphan `tool`. Discarded unwindowed prefixes are NOT validated, so an
+ * invalid message in a discarded prefix never disables pair-atomic snapping
+ * for valid tool batches later in the history. A single newest plain message
+ * that already exceeds a char budget is still kept whole — truncation drops
+ * messages, never splits one — so at least the newest message always survives.
+ * When an invalid or unpaired part survives into the retained slice (e.g., an
+ * orphan `tool` row, a dangling batch, or an ambiguous blank `toolCallId`
+ * within the retained window), it is never repaired or dropped here: the
+ * window keeps the naive cut and fails closed downstream in
+ * `ProviderJson.validateToolPairing`.
  */
-internal fun applyHistoryCap(history: List<ChatMessage>, cap: HistoryWindowCap): List<ChatMessage> =
-  when (cap) {
+internal fun applyHistoryCap(history: List<ChatMessage>, cap: HistoryWindowCap): List<ChatMessage> {
+  if (history.isEmpty()) return history
+  return when (cap) {
     is HistoryWindowCap.Unbounded -> history
-    is HistoryWindowCap.MaxMessages -> history.takeLast(cap.maxMessages)
+    is HistoryWindowCap.MaxMessages -> {
+      val naiveStart = (history.size - cap.maxMessages).coerceAtLeast(0)
+      history.drop(snapHistoryToPairBoundary(history, naiveStart))
+    }
     is HistoryWindowCap.MaxChars -> {
-      var kept = 0
-      var chars = 0
-      for (m in history.asReversed()) {
-        if (kept > 0 && chars + m.text.length > cap.maxChars) break
-        chars += m.text.length
-        kept++
-      }
-      history.takeLast(kept)
+      history.drop(snapHistoryToPairBoundary(history, charWindowStart(history, cap.maxChars)))
+    }
+    is HistoryWindowCap.Bounded -> {
+      val countStart = (history.size - cap.maxMessages).coerceAtLeast(0)
+      val charStart = charWindowStart(history, cap.maxChars)
+      history.drop(snapHistoryToPairBoundary(history, maxOf(countStart, charStart)))
     }
   }
+}
+
+/** Char-leg head cut as a start index: newest-first accumulation, newest always kept. */
+private fun charWindowStart(history: List<ChatMessage>, maxChars: Int): Int {
+  var kept = 0
+  var chars = 0
+  for (m in history.asReversed()) {
+    if (kept > 0 && chars + m.text.length > maxChars) break
+    chars += m.text.length
+    kept++
+  }
+  return (history.size - kept).coerceAtLeast(0)
+}
+
+/**
+ * Turn-boundary snap for [applyHistoryCap] (and send-time prefix trimming;
+ * B1 pair atomicity).
+ *
+ * Scans `0 until naiveStart` for any assistant message with `toolCalls` whose
+ * valid, complete tool-call/output batch (per [completeToolBatchEnd])
+ * straddles [naiveStart] (`batchEnd > naiveStart`), snapping forward to
+ * `batchEnd` so a legal batch is never split.
+ *
+ * Discarded unwindowed prefixes are NOT validated: an invalid message,
+ * orphan `tool` row, or malformed batch wholly before [naiveStart] is simply
+ * skipped and never disables pair-atomic snapping for valid tool batches
+ * later in [history]. Conversely, when an invalid or unpaired part survives
+ * into or straddles the retained slice (e.g., an orphan `tool` row, a
+ * dangling batch, or an ambiguous blank `toolCallId` within or straddling
+ * the retained window), [completeToolBatchEnd] returns `-1` for malformed/incomplete
+ * batches and [snapHistoryToPairBoundary] returns [naiveStart] unchanged — the
+ * window never repairs invalid history and fails closed downstream in
+ * `ProviderJson.validateToolPairing`.
+ */
+private fun snapHistoryToPairBoundary(history: List<ChatMessage>, naiveStart: Int): Int {
+  if (naiveStart <= 0) return 0
+  if (naiveStart >= history.size) return history.size
+  var i = 0
+  while (i < naiveStart) {
+    val m = history[i]
+    if (m.role == "assistant" && m.toolCalls.isNotEmpty()) {
+      val batchEnd = completeToolBatchEnd(history, i)
+      if (batchEnd > naiveStart) {
+        return batchEnd
+      }
+      if (batchEnd > i + 1) {
+        i = batchEnd
+        continue
+      }
+    }
+    i++
+  }
+  return naiveStart
+}
+
+/**
+ * If [history] at [start] opens a valid, complete tool-call/output batch
+ * (assistant `toolCalls` with non-blank, batch-unique ids/names immediately
+ * followed by matching `tool` rows, including single-pending backfill
+ * matching `ProviderJson.validateToolPairing(..., allowChatBackfill = true)`),
+ * returns the exclusive end index of that batch (`> start + 1`).
+ * Returns `-1` when the batch is malformed, ambiguous, interrupted by a
+ * non-tool message, or dangling at the end of [history].
+ *
+ * Only inspects the candidate batch starting at [start] without validating
+ * discarded prefixes; any invalid or unpaired part remaining in a retained
+ * slice is never repaired here and fails closed downstream in
+ * `ProviderJson.validateToolPairing`.
+ */
+private fun completeToolBatchEnd(history: List<ChatMessage>, start: Int): Int {
+  val open = history[start]
+  if (open.role != "assistant" || open.toolCalls.isEmpty()) return -1
+  val pending = LinkedHashSet<String>(open.toolCalls.size)
+  for (tc in open.toolCalls) {
+    if (tc.id.isBlank() || tc.name.isBlank()) return -1
+    if (!pending.add(tc.id)) return -1
+  }
+  var j = start + 1
+  while (pending.isNotEmpty() && j < history.size) {
+    val next = history[j]
+    if (next.role != "tool" || next.toolCalls.isNotEmpty()) return -1
+    val stored = next.toolCallId
+    val id = if (!stored.isNullOrBlank()) {
+      stored
+    } else if (pending.size == 1) {
+      pending.single()
+    } else {
+      return -1
+    }
+    if (!pending.remove(id)) return -1
+    j++
+  }
+  return if (pending.isEmpty()) j else -1
+}
 
 /** A direct admission cannot overtake queued work that still needs explicit recovery. */
 class RecoveryRequiredException : IllegalStateException("queued turn recovery required before admission")
@@ -413,19 +580,21 @@ internal enum class DurableAdmission {
  * flush commits).
  *
  * Context window: the outgoing request carries [historyCap] (default
- * Unbounded — zero behavior change); truncation is oldest-first,
- * whole-message, and counted on [droppedHistoryCount]. The resumed prefix
- * below is part of that windowed history.
+ * [HistoryWindowCap.DEFAULT] — bounded, pair-atomic); truncation is
+ * oldest-first, whole-message, tool-pair-atomic, and counted on
+ * [droppedHistoryCount]/[droppedHistoryChars]. The resumed prefix below is
+ * part of that windowed history. [HistoryWindowCap.Unbounded] remains as an
+ * explicit opt-in for tests/scaffolds only.
  *
  * Resumed history (Phase 3): [initialHistory] carries the pre-truncation
  * user/assistant prefix restored from the transcript store (partial rows are
  * excluded by the caller — they replay in the UI flagged, but never read as
  * completed model context, mirroring the live `!isPartial` filter below).
  * [historyCap] bounds that prefix oldest-first at whole-message boundaries
- * ([HistoryWindowCap]); the default hydrates everything while the measured
- * token budget is still a TODO. Every outgoing [ChatRequest] is
- * history-prefix + live messages, so the first request after resume already
- * sees the prior conversation.
+ * ([HistoryWindowCap]); hydration-tail unification (DB tail paging) stays
+ * Target for B2. Every outgoing [ChatRequest] is history-prefix + live
+ * messages, so the first request after resume already sees the prior
+ * conversation.
  *
  * Ephemeral runtime time context (Phase 2): every outgoing [ChatRequest]
  * carries a [buildRuntimeTimeContext] block appended to a **copy** of the last
@@ -469,7 +638,7 @@ class TurnController(
   private val sessionStart: Instant? = null,
   private val systemZone: () -> ZoneId = ZoneId::systemDefault,
   initialHistory: List<ChatMessage> = emptyList(),
-  private val historyCap: HistoryWindowCap = HistoryWindowCap.Unbounded,
+  private val historyCap: HistoryWindowCap = HistoryWindowCap.DEFAULT,
   transcriptDispatcher: CoroutineDispatcher? = null,
   private val acceptTimeoutMs: Long = ACCEPT_DURABLE_TIMEOUT_MS,
   transcriptCapacity: Int = OrderedTranscriptSink.DEFAULT_CAPACITY,
@@ -854,9 +1023,10 @@ class TurnController(
 
   /**
    * Messages dropped from the last outgoing request by [historyCap], seeded
-   * with the resumed-prefix drops at load time (0 when
-   * [HistoryWindowCap.Unbounded]). The observable counterpart to context
-   * truncation: the request copy never silently loses history. Updated on
+   * with the resumed-prefix drops at load time (0 when nothing is dropped,
+   * e.g. explicit [HistoryWindowCap.Unbounded]). The observable counterpart
+   * to context truncation: the request copy never silently loses history.
+   * Updated on
    * every [buildRequest] to that request's combined-window drop
    * (`combined - base`, capped prefix + live); the seed is then replaced, so
    * a resumed session at cap reports a growing send-time count while the
@@ -867,12 +1037,12 @@ class TurnController(
     private set
 
   /**
-   * H1 (#16 residual): char counterpart of [droppedHistoryCount] — the
+   * H1 (#16-B1): char counterpart of [droppedHistoryCount] — the
    * `String.length` (UTF-16 code units, same unit as [MAX_REQUEST_CHARS] and
    * the factory `MODEL_HISTORY_MAX_CHARS_PER_MESSAGE` interim bound) sum
    * dropped by [historyCap] from the combined (capped prefix + live) window.
-   * Seeded with the resumed-prefix drop at load time (0 when
-   * [HistoryWindowCap.Unbounded]), replaced on every [buildRequest] with that
+   * Seeded with the resumed-prefix drop at load time (0 when nothing is
+   * dropped, e.g. explicit [HistoryWindowCap.Unbounded]), replaced on every [buildRequest] with that
    * request's combined-window drop (time-block excluded: the ephemeral block
    * is suffixed after the window trim, so it never inflates this cell — see
    * the [HistoryWindowCap] reconciliation note). The UI list and transcript
@@ -1001,7 +1171,7 @@ class TurnController(
   val lastRequestTrimmedCount: Int get() = _lastRequestTrimmedCount.get()
 
   /**
-   * H1 (#16 residual): char counterpart of [lastRequestTrimmedCount] — the
+   * H1 (#16-B1): char counterpart of [lastRequestTrimmedCount] — the
    * `String.length` sum trimmed from the head of the request to fit within
    * [MAX_REQUEST_CHARS]. The ephemeral time block is already suffixed when
    * the [buildRequest] trim runs, but its `maxDropLimit` stops the head trim
@@ -1032,7 +1202,7 @@ class TurnController(
     }
 
   /**
-   * H1 (#16 residual): `String.length` sum of the last outgoing request's
+   * H1 (#16-B1): `String.length` sum of the last outgoing request's
    * message texts after every trim (window + [MAX_REQUEST_CHARS] + the
    * continuation's own prefix trim when present), time-block included. Together
    * with [droppedHistoryChars] and [lastRequestTrimmedChars] this closes the
@@ -5824,7 +5994,7 @@ class TurnController(
    *
    * When the structured round pushes the request past [MAX_REQUEST_CHARS],
    * history-prefix trimming (oldest-first, whole messages, tool pairing kept
-   * atomic, the structured payload counted) is additionally published on
+   * atomic by snapping forward via [snapHistoryToPairBoundary], the structured payload counted) is additionally published on
    * [lastRequestTrimmedCount]/[requestTrimmedCount] (counts) and
    * [lastRequestTrimmedChars]/[lastRequestChars] (chars)
    * as the total head trim of the outgoing request (added on top of the
@@ -5849,7 +6019,8 @@ class TurnController(
     val base = buildRequest(images, allowTools = false)
     val contMessages = loop.continuationMessages(calls, results)
     // Keep tool-call/tool-result pairing atomic: trim only the history prefix
-    // when the structured round pushes the request over MAX_REQUEST_CHARS.
+    // when the structured round pushes the request over MAX_REQUEST_CHARS,
+    // snapping forward via snapHistoryToPairBoundary.
     // Payload accounting is the conservative full-request estimate
     // (`requestWireEstimate`: per-message terms for the base AND the
     // structured round, plus the request envelope once) and includes the
@@ -5864,6 +6035,15 @@ class TurnController(
     while (drop < baseMessages.size - 1 && totalChars > MAX_REQUEST_CHARS) {
       totalChars -= baseMessages[drop].wirePayloadChars()
       drop++
+    }
+    if (drop > 0) {
+      val snapped = snapHistoryToPairBoundary(baseMessages, drop)
+      if (snapped <= baseMessages.size - 1) {
+        drop = snapped
+      }
+    }
+    if (drop > 0) {
+      totalChars = requestWireEstimate(baseMessages.drop(drop) + contMessages, base.model)
     }
     if (totalChars > MAX_REQUEST_CHARS) {
       // Untrimmable: the newest base row + the structured round exceed the
@@ -5943,11 +6123,13 @@ class TurnController(
    * whole-message boundaries before
    * images/time-block attach. UI state and transcript keep everything; only
    * the outgoing request is windowed. The drop count is published on
-   * [droppedHistoryCount] (0 when Unbounded) with its char counterpart on
+   * [droppedHistoryCount] (0 when nothing is dropped) with its char counterpart on
    * [droppedHistoryChars], never silent. The send-time [MAX_REQUEST_CHARS]
    * trim is published on [lastRequestTrimmedCount]/[lastRequestTrimmedChars]
    * with the final size on [lastRequestChars] (see [HistoryWindowCap] for the
-   * reconciliation formula).
+   * reconciliation formula). The send-time [MAX_REQUEST_CHARS] trim is also
+   * pair-atomic, snapping forward via [snapHistoryToPairBoundary] so tool
+   * call/result pairs are never fractured.
    *
    * Ephemeral time context: a [buildRuntimeTimeContext] block is appended to a
    * copy of the last user message only. No user message means no injection
@@ -6000,6 +6182,12 @@ class TurnController(
     while (dropCount < maxDropLimit && totalChars > MAX_REQUEST_CHARS) {
       totalChars -= base[dropCount].text.length
       dropCount++
+    }
+    if (dropCount > 0) {
+      val snapped = snapHistoryToPairBoundary(base, dropCount)
+      if (snapped <= maxDropLimit) {
+        dropCount = snapped
+      }
     }
     _lastRequestTrimmedCount.set(dropCount)
     _requestTrimmedCount.value = dropCount

@@ -48,7 +48,7 @@ class ChatSessionImpl(
   sessionStart: java.time.Instant? = null,
   systemZone: () -> java.time.ZoneId = java.time.ZoneId::systemDefault,
   initialHistory: List<ChatMessage> = emptyList(),
-  historyCap: HistoryWindowCap = HistoryWindowCap.Unbounded,
+  historyCap: HistoryWindowCap = HistoryWindowCap.DEFAULT,
   toolSlice: dev.librepocket.router.SafeToolSlice? = null,
 ) : ChatSession {
   private val controller = TurnController(

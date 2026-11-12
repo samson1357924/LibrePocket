@@ -70,6 +70,16 @@ private const val HISTORY_PAGE = 200
  * and one store batch; an over-budget prefix is abandoned whole (zero rows +
  * incomplete marker, never a truncated half prefix — see
  * [snapshotSwitchHistory]).
+ *
+ * Known inconsistency (B1, declared — unification is Target B2): [openImpl]
+ * retains the declared B1 inconsistency (`MaxMessages(HISTORY_LOAD_CAP)`
+ * for the 2000-row DB tail load) until B2 hydration-tail unification lands,
+ * while [openForked] now uses `HistoryWindowCap.DEFAULT` (since it starts a
+ * fresh empty session) matching [buildSession]'s default — and
+ * [dev.librepocket.chat.TurnController]'s — bounded `HistoryWindowCap.DEFAULT`
+ * (200 msgs / 60k chars). Thus only [openImpl] retains this divergence, so a
+ * resumed long dialogue windows harder on create-path semantics than on the
+ * open path until B2.
  */
 internal object SnapshotBudget {
     internal const val HISTORY_LOAD_CAP = 2000
@@ -868,6 +878,10 @@ class ChatSessionFactory(
         // observes the same truncation (defense in depth: the prefix already
         // saturates the cap, so each new live turn evicts the oldest prefix
         // row to hold the combined request total at cap).
+        // B1 known divergence (see [SnapshotBudget]): only openImpl retains
+        // the declared B1 inconsistency (MaxMessages(HISTORY_LOAD_CAP) for
+        // the 2000-row DB tail) until B2 hydration-tail unification; openForked
+        // now uses HistoryWindowCap.DEFAULT (starts fresh empty session).
         val loaded = loadModelHistory(store, sessionId)
         requireCurrentBinding(keyIsCurrent)
         val model = modelFor(endpoint)
@@ -1018,7 +1032,7 @@ class ChatSessionFactory(
                 systemZone,
                 sessionStart,
                 emptyList(),
-                HistoryWindowCap.MaxMessages(SnapshotBudget.HISTORY_LOAD_CAP),
+                HistoryWindowCap.DEFAULT,
             )
             session = openedSession
             requireCurrentBinding(keyIsCurrent)
@@ -1232,7 +1246,7 @@ class ChatSessionFactory(
         systemZone: () -> ZoneId = this.systemZone,
         sessionStart: Instant? = null,
         history: List<ChatMessage> = emptyList(),
-        historyCap: HistoryWindowCap = HistoryWindowCap.Unbounded,
+        historyCap: HistoryWindowCap = HistoryWindowCap.DEFAULT,
     ): ChatSession {
         val keys = KeyProvider { ref ->
             if (keyIsCurrent()) credential.copyFor(ref) else null

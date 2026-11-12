@@ -5,6 +5,7 @@ import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.chat.ChatSessionImpl
 import dev.librepocket.chat.ChatStatus
+import dev.librepocket.chat.HistoryWindowCap
 import dev.librepocket.chat.TurnController
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
@@ -354,6 +355,9 @@ class ChatRequestTrimVisibilityTest {
             sessionStart = null,
             systemZone = zoneSupplier,
             initialHistory = history,
+            // B1: this test pins the send-time trim layer (trimmedCount==1),
+            // not the window layer — opt out of the bounded DEFAULT window.
+            historyCap = HistoryWindowCap.Unbounded,
         )
         try {
             assertEquals(0, session.requestTrimmedCount.value)

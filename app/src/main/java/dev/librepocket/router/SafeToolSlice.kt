@@ -122,7 +122,7 @@ import kotlin.coroutines.coroutineContext
  */
 class SafeToolSlice(
     private val ctxSupplier: () -> ProjectionContext = { ProjectionContext() },
-    internal val policy: PolicyStore,
+    private val policy: PolicyStore,
     private val backend: LspTools.Backend = LspTools.StubBackend,
     private val clock: Clock = Clock.systemDefaultZone(),
     val maxCallsPerTurn: Int = 1,
@@ -130,6 +130,9 @@ class SafeToolSlice(
     init {
         require(maxCallsPerTurn in 1..8) { "maxCallsPerTurn must be 1..8, was $maxCallsPerTurn" }
     }
+
+    internal fun usesPolicy(other: PolicyStore): Boolean = policy === other
+
     companion object {
         /** The single slice tool (registry `executionReady=true`; loop is opt-in/test-attached). */
         const val TOOL_NAME: String = "lsp.symbols"

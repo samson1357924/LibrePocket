@@ -113,6 +113,34 @@ class ElevatedWiringTest {
         assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
     }
 
+    @Test fun unconfirmedCheapDenyDoesNotTouchArgv() = runBlocking {
+        var touched = false
+        val argv = object : AbstractList<String>() {
+            override val size: Int get() { touched = true; return 1 }
+            override fun get(index: Int): String { touched = true; return "id" }
+            override fun iterator(): MutableIterator<String> {
+                touched = true
+                return mutableListOf("id").iterator()
+            }
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = argv,
+            reasonCode = "B3-T",
+            confirmed = false,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertEquals(0, runner.calls)
+        assertEquals(false, touched)
+    }
+
     @Test fun blankReasonCodeNeverAllows() = runBlocking {
         val runner = SpawnCounter()
         val audit = PrivilegeAuditLog()
@@ -214,6 +242,29 @@ class ElevatedWiringTest {
         assertTrue("$r", r is ShellResult.Denied)
         assertTrue("$r", (r as ShellResult.Denied).message.contains("bridge off"))
         assertEquals(0, runner.calls)
+    }
+
+    @Test fun blockingGrantCheckFailsClosedNoSpawn() = runBlocking {
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = {
+                Thread.sleep(5_000L)
+                validGrant()
+            },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("grant check failed"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
     }
 
     @Test fun grantInvalidZeroSpawn() = runBlocking {
@@ -449,6 +500,27 @@ class ElevatedWiringTest {
             assertEquals(1, store.clearCalls)
             assertEquals(false, state.bridgeSwitchOn)
             assertEquals(false, state.bridgeGranted)
+        }
+    }
+
+    @Test fun persistentRevokeStoreClearCancellationMemoryFirstNoScope() = runBlocking {
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.audit.record(listOf("id"), "B3-x", "DENY")
+        var scopeCalls = 0
+        val store = object : dev.librepocket.shell.PrivilegeRevokeStore {
+            override suspend fun clear() { throw CancellationException("store cancelled") }
+        }
+        try {
+            state.revoke(store) { scopeCalls++ }
+            assertTrue("must throw", false)
+        } catch (_: CancellationException) {
+            assertEquals(0, scopeCalls)
+            assertEquals(false, state.bridgeSwitchOn)
+            assertEquals(false, state.bridgeGranted)
+            assertEquals(0, state.auditCount())
         }
     }
 

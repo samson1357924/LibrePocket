@@ -92,6 +92,89 @@ class MainActivityEntryLifecycleTest {
         }
     }
 
+    @Test
+    fun assistVoiceFlag_setFromLaunchIntentAndConsumable() {
+        val controller = launch(assistVoiceIntent())
+        try {
+            val activity = controller.get()
+            assertEquals(true, activity.pendingVoice)
+            activity.fakeConsumeVoice()
+            assertEquals(false, activity.pendingVoice)
+        } finally {
+            destroy(controller)
+        }
+    }
+
+    @Test
+    fun assistVoiceFlag_absentForPlainAssistAndShare() {
+        val plainAssist = launch(Intent(Intent.ACTION_ASSIST))
+        try {
+            assertEquals(false, plainAssist.get().pendingVoice)
+        } finally {
+            destroy(plainAssist)
+        }
+        val share = launch(shareIntent("hello"))
+        try {
+            assertEquals(false, share.get().pendingVoice)
+        } finally {
+            destroy(share)
+        }
+    }
+
+    @Test
+    fun pendingVoiceSurvivesRecreationAndConsumedStaysConsumed() {
+        val first = launch(assistVoiceIntent())
+        val savedState = Bundle()
+        try {
+            assertEquals(true, first.get().pendingVoice)
+            first.saveInstanceState(savedState)
+        } finally {
+            destroy(first)
+        }
+
+        val recreated = recreate(assistVoiceIntent(), savedState)
+        try {
+            // 待消費在旋轉後保留（對應 pending share 語義）。
+            assertEquals(true, recreated.get().pendingVoice)
+            recreated.get().fakeConsumeVoice()
+            assertEquals(false, recreated.get().pendingVoice)
+        } finally {
+            destroy(recreated)
+        }
+    }
+
+    @Test
+    fun consumedVoiceIsNotRedeliveredAfterRecreation() {
+        val first = launch(assistVoiceIntent())
+        val savedState = Bundle()
+        try {
+            first.get().fakeConsumeVoice()
+            first.saveInstanceState(savedState)
+        } finally {
+            destroy(first)
+        }
+
+        // 已消費＋舊 launch Intent 同時出現時，已消費快照優先，不復活。
+        val recreated = recreate(assistVoiceIntent(), savedState)
+        try {
+            assertEquals(false, recreated.get().pendingVoice)
+        } finally {
+            destroy(recreated)
+        }
+    }
+
+    @Test
+    fun nonVoiceNewIntentDoesNotClearPendingVoice() {
+        val controller = launch(assistVoiceIntent())
+        try {
+            val activity = controller.get()
+            activity.deliverNewIntent(Intent(Intent.ACTION_VIEW))
+            assertEquals(true, activity.pendingVoice)
+        } finally {
+            destroy(controller)
+        }
+    }
+
     private fun launch(intent: Intent): ActivityController<FakeDispatchMainActivity> =
         Robolectric.buildActivity(FakeDispatchMainActivity::class.java, intent).setup()
 
@@ -111,24 +194,36 @@ class MainActivityEntryLifecycleTest {
     private fun shareIntent(text: String) = Intent(Intent.ACTION_SEND)
         .setType("text/plain")
         .putExtra(Intent.EXTRA_TEXT, text)
+
+    private fun assistVoiceIntent() = Intent(Intent.ACTION_ASSIST)
+        .putExtra(dev.librepocket.agent.assistant.AssistantVoice.EXTRA_VOICE_INPUT, true)
 }
 
 /** Captures MainActivity's existing acknowledgement callback without product composition. */
 class FakeDispatchMainActivity : MainActivity() {
     private lateinit var sharedText: () -> String?
     private lateinit var onSharedConsumed: () -> Unit
+    private lateinit var voiceInputRequested: () -> Boolean
+    private lateinit var onVoiceInputConsumed: () -> Unit
     val deliveries = mutableListOf<String>()
 
     override fun installMainScreenContent(
         sharedText: () -> String?,
         onSharedConsumed: () -> Unit,
+        voiceInputRequested: () -> Boolean,
+        onVoiceInputConsumed: () -> Unit,
     ) {
         this.sharedText = sharedText
         this.onSharedConsumed = onSharedConsumed
+        this.voiceInputRequested = voiceInputRequested
+        this.onVoiceInputConsumed = onVoiceInputConsumed
     }
 
     val pendingText: String?
         get() = sharedText()
+
+    val pendingVoice: Boolean
+        get() = voiceInputRequested()
 
     fun deliverNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -138,5 +233,9 @@ class FakeDispatchMainActivity : MainActivity() {
         val text = pendingText ?: return
         deliveries += text
         onSharedConsumed()
+    }
+
+    fun fakeConsumeVoice() {
+        onVoiceInputConsumed()
     }
 }

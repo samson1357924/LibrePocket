@@ -126,6 +126,13 @@ fun ChatScreen(
     // 失敗仍執行本次朗讀並顯示 TTS_ACK_PERSIST_WARNING（保持未確認，下次重問）。
     ttsAcknowledged: Boolean = false,
     onTtsAcknowledged: suspend () -> Boolean = { true },
+    // C2 session 語音喚起（Issue #137）：MainActivity 經 MainScreen 傳入的
+    // 一次態 voice 請求；true 即自動走下方既有 launchSystemStt()
+    //（RecognizerIntent 委派，零新權限），先消費再啟動（防重組重放）。
+    // 結果沿既有路徑只 prefill 不自動送出；開關關閉／無服務時沿用
+    // launchSystemStt 內既有降級話術。預設 false 保舊構造／預覽相容。
+    voiceInputRequested: Boolean = false,
+    onVoiceInputConsumed: () -> Unit = {},
 ) {
     val session by viewModel.sessionState.collectAsStateWithLifecycle()
     val messages by viewModel.messages.collectAsStateWithLifecycle()
@@ -334,6 +341,15 @@ fun ChatScreen(
             sttLauncher.launch(intent)
         } catch (_: Exception) {
             voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE))
+        }
+    }
+    // C2 自動喚起：session ASSIST＋flag → 此 true 幀消費一次並走既有委派。
+    // 先消費再啟動：啟動後重組不再重放；降級（開關關／無服務）由
+    // launchSystemStt 內既有話術承擔，此處不另分支。
+    LaunchedEffect(voiceInputRequested) {
+        if (voiceInputRequested) {
+            onVoiceInputConsumed()
+            launchSystemStt()
         }
     }
 

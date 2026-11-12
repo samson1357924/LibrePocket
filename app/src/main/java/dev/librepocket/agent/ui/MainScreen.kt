@@ -60,6 +60,11 @@ private const val TAG = "MainScreen"
 fun MainScreen(
     sharedText: String? = null,
     onSharedConsumed: () -> Unit = {},
+    // C2 session 語音喚起（Issue #137）：MainActivity 的一次態 voice 請求；
+    // 轉交 ChatScreen 自動走既有 RecognizerIntent 委派（零新權限），
+    // 結果只 prefill 不自動送出。預設 false 保舊構造相容。
+    assistVoiceRequested: Boolean = false,
+    onAssistVoiceConsumed: () -> Unit = {},
 ) {
     val navController = rememberNavController()
     val scope = rememberCoroutineScope()
@@ -232,6 +237,8 @@ fun MainScreen(
                 viewModel = chatViewModel,
                 onOpenSettings = { goSetupForEdit() },
                 onTurnFinished = { sessionListViewModel.refresh() },
+                voiceInputRequested = assistVoiceRequested,
+                onVoiceInputConsumed = onAssistVoiceConsumed,
                 userSwitches = voiceUiSwitches,
                 voiceSwitchLoadFailed = voiceEffectiveSnapshot.loadFailed,
                 ttsAcknowledged = ttsAcknowledged,

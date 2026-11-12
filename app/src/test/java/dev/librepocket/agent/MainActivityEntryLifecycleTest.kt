@@ -175,6 +175,29 @@ class MainActivityEntryLifecycleTest {
         }
     }
 
+    @Test
+    fun savedInstanceStateWithoutAssistVoiceKeyFallsBackToLaunchIntent() {
+        val savedState = Bundle()
+        val recreated = recreate(assistVoiceIntent(), savedState)
+        try {
+            assertEquals(true, recreated.get().pendingVoice)
+        } finally {
+            destroy(recreated)
+        }
+    }
+
+    @Test
+    fun assistVoiceLaunchedFromHistoryDoesNotSetPendingVoice() {
+        val historyIntent = assistVoiceIntent()
+            .addFlags(Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY)
+        val controller = launch(historyIntent)
+        try {
+            assertEquals(false, controller.get().pendingVoice)
+        } finally {
+            destroy(controller)
+        }
+    }
+
     private fun launch(intent: Intent): ActivityController<FakeDispatchMainActivity> =
         Robolectric.buildActivity(FakeDispatchMainActivity::class.java, intent).setup()
 

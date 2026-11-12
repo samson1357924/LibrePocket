@@ -36,4 +36,21 @@ class AssistantVoiceTest {
         assertNull(AssistantVoice.resolveVoicePrefill(emptyList()))
         assertNull(AssistantVoice.resolveVoicePrefill(listOf("", "   ")))
     }
+
+    @Test fun whitespaceOnlyResult_returnsNull() {
+        assertNull(AssistantVoice.resolveVoicePrefill(listOf("   ")))
+        assertNull(AssistantVoice.resolveVoicePrefill(listOf("\t\n  ")))
+    }
+
+    @Test fun leadingAndTrailingWhitespace_isTrimmed() {
+        assertEquals("你好世界", AssistantVoice.resolveVoicePrefill(listOf("  你好世界 \n\t")))
+        assertEquals("hello", AssistantVoice.resolveVoicePrefill(listOf("   ", "  hello  ")))
+    }
+
+    @Test fun longResult_isTruncatedToMaxTextLength() {
+        val longText = "a".repeat(4500)
+        val result = AssistantVoice.resolveVoicePrefill(listOf(longText))
+        assertEquals("a".repeat(4000), result)
+        assertEquals(4000, result?.length)
+    }
 }

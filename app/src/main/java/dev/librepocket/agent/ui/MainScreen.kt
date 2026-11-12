@@ -2,6 +2,8 @@ package dev.librepocket.agent.ui
 
 import android.util.Log
 import kotlinx.coroutines.CancellationException
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -16,6 +18,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import dev.librepocket.agent.R
 import dev.librepocket.agent.ui.chat.ChatScreen
@@ -79,6 +82,10 @@ fun MainScreen(
     // 守衛／spinner／drawer 接線只在 StartupGateHost 實現（單一來源，接線測直
     // 接測該 host）；此處只收集狀態並傳入，不重算、不重抄。
     val startupReconcilePending by setupViewModel.startupReconcilePending.collectAsStateWithLifecycle()
+    val navLoading = startupEffectiveLoading(gate is EndpointGate.Loading, startupReconcilePending)
+    val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+    val backStack by navController.currentBackStackEntryAsState()
+    val currentRoute = backStack?.destination?.route
     // 登出失敗 Settings UI 可見（Re-review #7 Finding 2 階段2）：false 分支不導航
     // 不清空，只靠 form.errorCode（LOGOUT_*）驅動 Settings 失敗卡；簽名不改。
     val setupForm by setupViewModel.form.collectAsStateWithLifecycle()
@@ -179,6 +186,34 @@ fun MainScreen(
         }
     }
 
+    // C2 session 語音喚起路由與邊界守衛：
+    // - 啟動落定前（navLoading）不啟動也不消費，等待 gate 與 reconcile 落定；
+    // - 落定後若無可用端點（!hasEndpoint），消費清除 stale flag，避免日後設定
+    //   完成回到 CHAT 時意外補彈 STT；
+    // - 有端點且已落定時，關閉唯讀檢視（viewedSessionId），若當前不在 CHAT
+    //   路由則先導回 CHAT，待 currentRoute == Routes.CHAT 後關閉抽屜並交由 ChatScreen 消費。
+    LaunchedEffect(assistVoiceRequested, hasEndpoint, navLoading, currentRoute) {
+        if (!assistVoiceRequested) return@LaunchedEffect
+        if (navLoading) return@LaunchedEffect
+        if (!hasEndpoint) {
+            onAssistVoiceConsumed()
+            return@LaunchedEffect
+        }
+        if (viewedSessionId != null) {
+            viewedSessionId = null
+        }
+        if (currentRoute != null && currentRoute != Routes.CHAT) {
+            navController.navigate(Routes.CHAT) {
+                popUpTo(Routes.CHAT) { inclusive = false }
+                launchSingleTop = true
+            }
+            return@LaunchedEffect
+        }
+        if (!drawerState.isClosed || drawerState.targetValue != DrawerValue.Closed) {
+            drawerState.close()
+        }
+    }
+
     // Edit-entry helper: prefill the form with the live endpoint (key stays
     // blank) so "edit" never shows another preset's defaults.
     fun goSetupForEdit() {
@@ -231,14 +266,22 @@ fun MainScreen(
         pendingTeardown = pendingTeardown,
         // Stage F：stale 抑制標籤同源傳入（四參派生；pure 只隱藏，真清卡靠 retry 終端）。
         logoutErrorSourceJournal = setupForm.logoutErrorSourceJournal,
+        drawerState = drawerState,
         chatContent = { padding ->
             ChatScreen(
                 padding = padding,
                 viewModel = chatViewModel,
                 onOpenSettings = { goSetupForEdit() },
                 onTurnFinished = { sessionListViewModel.refresh() },
-                voiceInputRequested = assistVoiceRequested,
+                voiceInputRequested = assistVoiceRequested &&
+                    currentRoute == Routes.CHAT &&
+                    hasEndpoint &&
+                    !navLoading &&
+                    viewedSessionId == null &&
+                    drawerState.isClosed &&
+                    drawerState.targetValue == DrawerValue.Closed,
                 onVoiceInputConsumed = onAssistVoiceConsumed,
+                voiceSwitchesLoaded = voiceEffectiveSnapshot.loaded || voiceEffectiveSnapshot.loadFailed,
                 userSwitches = voiceUiSwitches,
                 voiceSwitchLoadFailed = voiceEffectiveSnapshot.loadFailed,
                 ttsAcknowledged = ttsAcknowledged,

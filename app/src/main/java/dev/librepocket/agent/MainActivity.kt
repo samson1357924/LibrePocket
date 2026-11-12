@@ -21,10 +21,11 @@ import dev.librepocket.entry.EntryNormalize
 open class MainActivity : ComponentActivity() {
     private val entryState = mutableStateOf(EntryConsumptionState())
     private var entryConsumptionState by entryState
-    // C2 一次態 voice 請求（Issue #137）：session ASSIST＋EXTRA_VOICE_INPUT
-    // 喚起後置 true，UI 消費（自動開系統辨識）即清回 false。旋轉經
-    // onSaveInstanceState 保留待消費；偽造 ASSIST＋flag 最多打開辨識框，
-    // 結果只 prefill 不自動送出，無能力增益。
+    // C2 一次態 voice 請求（Issue #137）：僅接受經 AssistantVoice.isVoiceInputRequested
+    // 驗證（ACTION_ASSIST＋非歷史重放＋EXTRA_VOICE_INPUT=true）的喚起。
+    // UI 消費（自動開系統辨識）即清回 false；旋轉時若 savedInstanceState 顯式含
+    // KEY_ASSIST_VOICE 則優先還原（已消費不復活、待消費保留），否則再檢 intent。
+    // 偽造 ASSIST＋flag 最多打開辨識框，結果只 prefill 不自動送出，無能力增益。
     private val assistVoiceState = mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -35,7 +36,7 @@ open class MainActivity : ComponentActivity() {
             launchText = extractSharedTurnText(intent),
         )
         assistVoiceState.value =
-            if (savedInstanceState != null) {
+            if (savedInstanceState?.containsKey(KEY_ASSIST_VOICE) == true) {
                 savedInstanceState.getBoolean(KEY_ASSIST_VOICE, false)
             } else {
                 AssistantVoice.isVoiceInputRequested(intent)

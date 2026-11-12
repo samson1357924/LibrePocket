@@ -128,12 +128,16 @@ fun ChatScreen(
     ttsAcknowledged: Boolean = false,
     onTtsAcknowledged: suspend () -> Boolean = { true },
     // C2 session 語音喚起（Issue #137）：MainActivity 經 MainScreen 傳入的
-    // 一次態 voice 請求；true 即自動走下方既有 launchSystemStt()
-    //（RecognizerIntent 委派，零新權限），先消費再啟動（防重組重放）。
-    // 結果沿既有路徑只 prefill 不自動送出；開關關閉／無服務時沿用
-    // launchSystemStt 內既有降級話術。預設 false 保舊構造／預覽相容。
+    // 一次態 voice 請求（MainScreen 已守衛 hasEndpoint && !navLoading &&
+    // currentRoute == Routes.CHAT）；true 且開關快照已落定（voiceSwitchesLoaded）
+    // 即自動走下方既有 launchSystemStt()（RecognizerIntent 委派，零新權限），
+    // 先消費再啟動（防重組重放）。
+    // 結果經 AssistantVoice.resolveVoicePrefill 截斷至上限並只 prefill 不自動送出；
+    // 開關關閉／讀取失敗（loadFailed→userSwitches 全關）／無服務時由 launchSystemStt
+    // 內既有降級話術承擔（USER_DISABLED / NO_PRIVILEGE）。預設 false／true 保舊構造／預覽相容。
     voiceInputRequested: Boolean = false,
     onVoiceInputConsumed: () -> Unit = {},
+    voiceSwitchesLoaded: Boolean = true,
 ) {
     val session by viewModel.sessionState.collectAsStateWithLifecycle()
     val messages by viewModel.messages.collectAsStateWithLifecycle()
@@ -302,10 +306,13 @@ fun ChatScreen(
     val sttLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
-        check(!AssistantVoice.AUTO_SEND_AFTER_VOICE) { "voice auto-send is locked off (#137 C2)" }
+        if (AssistantVoice.AUTO_SEND_AFTER_VOICE) {
+            // locked off by policy
+            return@rememberLauncherForActivityResult
+        }
         if (result.resultCode == Activity.RESULT_OK) {
             val candidates = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
-            val text = VoiceStt.pickResult(candidates)
+            val text = AssistantVoice.resolveVoicePrefill(candidates)
             if (text != null) {
                 voiceErrors.onSttSuccess()
                 viewModel.prefill(text)
@@ -345,11 +352,13 @@ fun ChatScreen(
             voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE))
         }
     }
-    // C2 自動喚起：session ASSIST＋flag → 此 true 幀消費一次並走既有委派。
-    // 先消費再啟動：啟動後重組不再重放；降級（開關關／無服務）由
-    // launchSystemStt 內既有話術承擔，此處不另分支。
-    LaunchedEffect(voiceInputRequested) {
-        if (voiceInputRequested) {
+    // C2 自動喚起：session ASSIST＋flag → 須待 VoiceSwitchStore 快照落定
+    // （voiceSwitchesLoaded == true，含 loaded 與 loadFailed，避免冷啟動
+    // LOADING 窗口誤以全關 map 提前消費／降級）；落定後消費一次並走既有委派。
+    // 先消費再啟動：啟動後重組不再重放；開關關閉或 loadFailed 時，
+    // launchSystemStt() 內 cleanly 降級為 USER_DISABLED。
+    LaunchedEffect(voiceInputRequested, voiceSwitchesLoaded) {
+        if (voiceInputRequested && voiceSwitchesLoaded) {
             onVoiceInputConsumed()
             launchSystemStt()
         }

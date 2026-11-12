@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DrawerState
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -65,7 +66,8 @@ import kotlinx.coroutines.launch
  *
  * 非 gate 邏輯不在此：entry 分發、replay 觸發、語音／提權／會話狀態仍歸
  * `MainScreen`（呼叫方經 [chatContent]／[settingsContent]／[setupContent] 與
- * 回調傳入）。
+ * 回調傳入；[drawerState] 可由 `MainScreen` 傳入以便跨系統喚起如 assist voice
+ * 時收起開啟中的抽屜）。
  *
  * Stage D2（R12 Finding 2 (b)）：派生恢復態內聚單一來源——有效碼
  * `effectiveLogoutRecovery(logoutGuardError, logoutErrorSourceJournal, pendingTeardown, logoutInFlight).effectiveCode`
@@ -118,8 +120,8 @@ internal fun StartupGateHost(
      * `retryPendingDelete` 終端。舊三參呼叫（tag null）行為不變。
      */
     logoutErrorSourceJournal: String? = null,
+    drawerState: DrawerState = rememberDrawerState(initialValue = DrawerValue.Closed),
 ) {
-    val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val backStack by navController.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route

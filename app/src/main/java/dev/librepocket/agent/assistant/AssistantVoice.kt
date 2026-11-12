@@ -1,6 +1,7 @@
 package dev.librepocket.agent.assistant
 
 import android.content.Intent
+import dev.librepocket.entry.EntryNormalize
 import dev.librepocket.voice.VoiceStt
 
 /**
@@ -19,9 +20,15 @@ import dev.librepocket.voice.VoiceStt
  * 喚起鏈：`LibreVoiceInteractionSession.onShow` 在 ASSIST intent 掛
  * [EXTRA_VOICE_INPUT] → `MainActivity` 轉一次態 →
  * `MainScreen` → `ChatScreen` 自動走既有 `launchSystemStt()`。
- * 該 flag 只是 UI 提示（開系統辨識框），不是 entry 正文：
- * 不進 `EntryNormalize`，偽造的 ASSIST＋flag 最多打開辨識框，
- * 結果仍只 prefill、不自動送出（見 [AUTO_SEND_AFTER_VOICE]），無能力增益。
+ *
+ * 信任邊界與不變量：
+ * - [isVoiceInputRequested] 只接受 `Intent.ACTION_ASSIST` 且非系統歷史重放
+ *   （`FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY` 必須為 0）的 intent，阻斷外部非 ASSIST
+ *   或從最近任務重放時重複喚起 STT；
+ * - 該 flag 只是 UI 提示（開系統辨識框），不是 entry 正文：
+ *   不進 `EntryNormalize`，偽造的 ASSIST＋flag 最多打開辨識框，
+ *   結果經 [resolveVoicePrefill] 截斷至 [EntryNormalize.MAX_TEXT_LENGTH]（4000 字）後
+ *   只 prefill、不自動送出（見 [AUTO_SEND_AFTER_VOICE]），無能力增益。
  */
 object AssistantVoice {
     /** ASSIST intent 附帶 voice 請求的 extra key（字面值穩定，Robolectric 鎖定）。 */
@@ -37,14 +44,28 @@ object AssistantVoice {
     fun withVoiceInput(intent: Intent): Intent =
         intent.putExtra(EXTRA_VOICE_INPUT, true)
 
-    /** 解析喚起 intent 是否帶 voice 請求（null／無 extra／非 true 一律 false）。 */
-    fun isVoiceInputRequested(intent: Intent?): Boolean =
-        intent?.getBooleanExtra(EXTRA_VOICE_INPUT, false) == true
+    /**
+     * 解析喚起 intent 是否帶合法 voice 請求。
+     *
+     * 信任邊界：必須為 [Intent.ACTION_ASSIST]、不得帶
+     * [Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY]（防最近任務重放誤觸發），
+     * 且 [EXTRA_VOICE_INPUT] 顯式為 `true`；null 或不符合者一律 `false`。
+     */
+    fun isVoiceInputRequested(intent: Intent?): Boolean {
+        if (intent == null) return false
+        if (intent.action != Intent.ACTION_ASSIST) return false
+        if ((intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) return false
+        return intent.getBooleanExtra(EXTRA_VOICE_INPUT, false)
+    }
 
     /**
-     * C2 回填語義（純函數，JVM 可測）：辨識候選取首條非空正文；
+     * C2 回填語義（純函數，JVM 可測）：辨識候選取首條非空正文並截斷至
+     * [EntryNormalize.MAX_TEXT_LENGTH]（4000 字）；
      * 無結果回 null（呼叫方留手動輸入，不報錯不自動送出）。
      */
     fun resolveVoicePrefill(results: List<String>?): String? =
         VoiceStt.pickResult(results)
+            ?.trim()
+            ?.take(EntryNormalize.MAX_TEXT_LENGTH)
+            ?.takeIf { it.isNotEmpty() }
 }

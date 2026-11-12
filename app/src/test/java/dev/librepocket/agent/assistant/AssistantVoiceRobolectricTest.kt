@@ -101,6 +101,32 @@ class AssistantVoiceRobolectricTest {
         )
     }
 
+    @Test
+    fun isVoiceInputRequested_rejectsNonAssistActionsEvenWithFlag() {
+        for (action in listOf(Intent.ACTION_SEND, Intent.ACTION_MAIN, Intent.ACTION_VIEW)) {
+            val intent = Intent(action).putExtra(AssistantVoice.EXTRA_VOICE_INPUT, true)
+            assertFalse(
+                "non-ASSIST action $action must be rejected",
+                AssistantVoice.isVoiceInputRequested(intent),
+            )
+        }
+    }
+
+    @Test
+    fun isVoiceInputRequested_rejectsAssistLaunchedFromHistory() {
+        val intent = Intent(Intent.ACTION_ASSIST)
+            .addFlags(Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY)
+            .putExtra(AssistantVoice.EXTRA_VOICE_INPUT, true)
+        assertFalse(AssistantVoice.isVoiceInputRequested(intent))
+    }
+
+    @Test
+    fun isVoiceInputRequested_acceptsFreshAssistWithFlag() {
+        val intent = Intent(Intent.ACTION_ASSIST)
+            .putExtra(AssistantVoice.EXTRA_VOICE_INPUT, true)
+        assertTrue(AssistantVoice.isVoiceInputRequested(intent))
+    }
+
     /** 單測工作目錄（模組 dir）出發，向上走最多 5 層找原始碼/清單檔（同既有模式）。 */
     private fun findSourceManifest(vararg relPaths: String): String {
         val bases = generateSequence(java.io.File(System.getProperty("user.dir") ?: ".")) { it.parentFile }.take(6).toList()

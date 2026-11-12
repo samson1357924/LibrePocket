@@ -330,8 +330,8 @@ Robolectric SDK pin (Current): JVM unit tests run with `sdk=33` pinned in
 `app/src/test/resources/robolectric.properties`, while `targetSdk` is 36
 (see [Build Environment](ENV.md)). A green run on API 33 does **not** imply
 API 34–36 behavior is verified; version-sensitive Android API behavior needs
-separate higher-API device evidence. An API 36 Foss emulator lane is configured
-outside the PR gate; its execution evidence is tracked below. The pin
+separate higher-API device evidence. API 36 emulator lanes across Play, Foss, and
+Github are configured outside the PR gate; their execution evidence is tracked below. The pin
 itself and any `@Config` SDK matrix expansion are out of scope for the
 current deflake work — do not change them here.
 
@@ -1032,7 +1032,7 @@ Every lane runs the same app-module connected instrumentation task,
 `connected<Flavor>DebugAndroidTest`, with no reduced test selection configured. On 2026-10-29,
 [dispatch 40831562611](https://github.com/samson1357924/LibrePocket/actions/runs/40831562611)
 completed successfully at SHA `f3c363384710e3e62ab3d3dbc3cd17e322fa59d8`;
-all seven instrumented jobs and the nightly stress job succeeded. The
+all seven instrumented jobs (the 7-lane matrix configured at that SHA) and the nightly stress job succeeded. The
 [Foss API 36 job](https://github.com/samson1357924/LibrePocket/actions/runs/40831562611/job/123306736606)
 succeeded; its downloaded [HTML report artifact](https://github.com/samson1357924/LibrePocket/actions/runs/40831562611/artifacts/12879331442)
 reported 14 tests, 0 failures and 0 skipped: 4 vault, 9 permission-policy,

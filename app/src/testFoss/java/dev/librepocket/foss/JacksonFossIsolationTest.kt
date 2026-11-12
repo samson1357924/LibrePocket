@@ -68,6 +68,9 @@ class JacksonFossIsolationTest {
         roots.forEach { entry ->
             try {
                 when {
+                    !entry.exists() -> {
+                        unreadable += entry.path + " (missing classpath root)"
+                    }
                     entry.isDirectory -> {
                         val root = File(entry, jacksonPathPrefix)
                         if (root.exists()) {
@@ -75,7 +78,8 @@ class JacksonFossIsolationTest {
                                 .filter { it.isFile && it.path.replace(File.separatorChar, '/').contains(jacksonPathPrefix) }
                                 .take(10)
                                 .forEach { file ->
-                                    hits += "${entry.path}!${entry.toPath().relativize(file.toPath()).toString().replace(File.separatorChar, '/')}"
+                                    val rel = entry.toPath().relativize(file.toPath()).toString().replace(File.separatorChar, '/')
+                                    hits += entry.path + "!" + rel
                                 }
                         }
                     }
@@ -84,12 +88,17 @@ class JacksonFossIsolationTest {
                             jar.entries().asSequence()
                                 .filter { !it.isDirectory && it.name.startsWith(jacksonPathPrefix) }
                                 .take(10)
-                                .forEach { jarEntry -> hits += "${entry.path}!${jarEntry.name}" }
+                                .forEach { jarEntry -> hits += entry.path + "!" + jarEntry.name }
                         }
+                    }
+                    else -> {
+                        unreadable += entry.path + " (unsupported classpath root type)"
                     }
                 }
             } catch (e: Exception) {
-                unreadable += "${entry.path} (${e.javaClass.simpleName}: ${e.message})"
+                val errorType = e.javaClass.simpleName
+                val errorMessage = e.message ?: "no message"
+                unreadable += entry.path + " (" + errorType + ": " + errorMessage + ")"
             }
         }
         return JacksonScanResult(roots = roots.map { it.path }.toSet(), hits = hits.toList(), unreadable = unreadable)

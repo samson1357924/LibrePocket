@@ -281,12 +281,11 @@ fun MainScreen(
                     // #136-B3 持久版收回（依賴 #166）：`store` 為橋授權持久真相源
                     //（現以記憶體 Store 佔位，rebase 後換 B1 的 DataStore 版），
                     // `withdrawScope` 傳跨域撤銷（產品為 github 側 Shizuku 授權
-                    // Store 的 `clear()`，本 main 源集不直接引用 github 類）；
-                    // 持久層抛錯仍先落記憶體收回（見 revoke fail-closed），此處
-                    // 不殘留可用旗標（呼叫方不得吞錯放行由 State 保證）；
-                    // 失敗表面化：Toast＋Log（不靜默視為成功）。
-                    // TODO(#166)：rebase 後以 B1 DataStore 版為準，持久失敗改走
-                    // Snackbar＋重試入口（現以 Toast 佔位，行為：記憶體已先收回）。
+                    // Store 的 `clear()`，本 main 源集不直接引用 github 類）。
+                    // memory-first/fail-closed：State.revoke 先同步清記憶體（當下零新准入），
+                    // 再嘗試持久/跨域；持久失敗不回滾記憶體，但須表面化並可重試。
+                    // TODO(#166)：rebase 後以 B1 DataStore 版為準並注入真實 withdrawScope；
+                    // 持久失敗改走 Snackbar＋重試入口（現以 Toast 佔位）。未接線前不可視為持久撤權完成。
                     scope.launch {
                         try {
                             privilegeState.revoke(privilegeRevokeStore) {
@@ -296,10 +295,10 @@ fun MainScreen(
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Exception) {
-                            Log.w(TAG, "privilege revoke persist failed", e)
+                            Log.w(TAG, "privilege revoke persist/cross-domain failed (memory revoked)", e)
                             android.widget.Toast.makeText(
                                 app,
-                                "提權收回持久化失敗，請重試",
+                                "提權已於本機收回，但持久化或跨域清除失敗，請重試",
                                 android.widget.Toast.LENGTH_LONG,
                             ).show()
                         } finally {

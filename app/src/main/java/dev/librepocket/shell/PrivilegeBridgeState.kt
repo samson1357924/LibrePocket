@@ -46,28 +46,29 @@ class PrivilegeBridgeState(
 
     /**
      * 一鍵收回（持久版，#136-B3 接線形狀，依賴 #166）：
-     * 先清持久授權 [store]（＋可選跨域 [withdrawScope]，如 github 側 Shizuku
-     * 授權 Store 的 `clear()`，由產品接線傳入，本檔不跨源集引用）→ 清審計表 →
-     * 關開關 → 撤橋接授權。
+     * **memory-first / fail-closed**：先同步清審計表、關 `privilege_bridge` 開關、
+     * 撤橋接授權（當下即零新准入），再嘗試清持久授權 [store] 與可選跨域
+     * [withdrawScope]（如 github 側 Shizuku 授權 Store 的 `clear()`）。
      *
-     * 持久層／跨域 scope 抛錯時仍先落記憶體收回再重抛（fail-closed）；
-     * [kotlinx.coroutines.CancellationException] 原樣傳播（先收回再抛）。
+     * 持久層／跨域 scope 失敗或取消時，記憶體已先收回且不回滾（fail-closed，
+     * 收回永不因持久失敗而殘留可用旗標）；例外／[kotlinx.coroutines.CancellationException]
+     * 原樣重拋，由呼叫方表面化「本機已收回但持久/跨域可能未完成」並提供重試。
+     * 依賴 #166：產品須注入真實持久 Store 與跨域 withdraw；未接線時不可視為持久撤權完成。
      */
     suspend fun revoke(
         store: PrivilegeRevokeStore,
         withdrawScope: (suspend () -> Unit)? = null,
     ): Int {
+        val cleared = revoke() // 先落記憶體收回（同步、即時生效）
         try {
             store.clear()
             withdrawScope?.invoke()
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            revoke()
             throw cancelled
         } catch (failure: Exception) {
-            revoke()
             throw failure
         }
-        return revoke()
+        return cleared
     }
 }
 

@@ -368,6 +368,7 @@ class ElevatedWiringTest {
             bridgeSwitchOn = true,
             bridgeGranted = true,
         )
+        state.audit.record(listOf("id"), "B3-x", "DENY")
         val failing = object : dev.librepocket.shell.PrivilegeRevokeStore {
             override suspend fun clear() {
                 throw IllegalStateException("store boom")
@@ -377,7 +378,40 @@ class ElevatedWiringTest {
             state.revoke(failing)
             assertTrue("must throw", false)
         } catch (_: IllegalStateException) {
-            // 仍先落記憶體收回（fail-closed，不殘留可用旗標）。
+            // memory-first：已先落記憶體收回（fail-closed，不殘留可用旗標/審計）。
+            assertEquals(false, state.bridgeSwitchOn)
+            assertEquals(false, state.bridgeGranted)
+            assertEquals(0, state.auditCount())
+        }
+    }
+
+    @Test fun persistentRevokeFailClosedOnWithdrawScopeThrow() = runBlocking {
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        val store = InMemoryPrivilegeRevokeStore()
+        try {
+            state.revoke(store) { throw IllegalStateException("scope boom") }
+            assertTrue("must throw", false)
+        } catch (_: IllegalStateException) {
+            assertEquals(1, store.clearCalls)
+            assertEquals(false, state.bridgeSwitchOn)
+            assertEquals(false, state.bridgeGranted)
+        }
+    }
+
+    @Test fun persistentRevokeCancellationMemoryFirstThenRethrow() = runBlocking {
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        val store = InMemoryPrivilegeRevokeStore()
+        try {
+            state.revoke(store) { throw CancellationException("cancelled") }
+            assertTrue("must throw", false)
+        } catch (_: CancellationException) {
+            assertEquals(1, store.clearCalls)
             assertEquals(false, state.bridgeSwitchOn)
             assertEquals(false, state.bridgeGranted)
         }

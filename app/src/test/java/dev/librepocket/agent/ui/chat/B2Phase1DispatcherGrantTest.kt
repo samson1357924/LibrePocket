@@ -43,6 +43,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -362,7 +363,7 @@ class B2Phase1DispatcherGrantTest {
         base.setRule(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 20))
         // Flip between offer and execution without a suspend call inside the
         // non-suspend provider handler: fresh evaluate must see the DENY.
-        val flipped = java.util.concurrent.atomic.AtomicBoolean(false)
+        val flipped = AtomicBoolean(false)
         val policy = object : dev.librepocket.policy.PolicyStore by base {
             override suspend fun evaluateFresh(
                 action: String,
@@ -381,7 +382,7 @@ class B2Phase1DispatcherGrantTest {
         val backend = CountingBackend()
         val requests = AtomicInteger(0)
         val seen = mutableListOf<ChatRequest>()
-        val f = factory(app, store, base, provider, slice(policy, backend))
+        val f = factory(app, store, policy, provider, slice(policy, backend))
 
         provider.handler = { request ->
             seen.add(request)

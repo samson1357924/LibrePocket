@@ -74,6 +74,11 @@ private class DefCapAllowPolicy : PolicyStore {
  * - [sendTimeTrimPreservesToolPairAtomicityUnderUnbounded] and
  *   [sendTimeTrimRetainsIntactPairWhenHeadPlainMessageDrops] pin the second trim layer
  *   (send-time MAX_REQUEST_CHARS) pair-atomicity under Unbounded historyCap.
+ * - [orphanPrefixOutsideWindowIsDroppedWhileValidTailSucceeds] pins that an orphan
+ *   prefix outside the window is dropped without error while valid tail succeeds,
+ *   and fails closed with TOOL_OUTPUT_ORPHAN_ID if kept in-window.
+ * - [exactMessageCapBoundaries] and [exactCharCapBoundaries] pin exact message and
+ *   char count boundaries for history windowing.
  */
 class TurnControllerDefaultCapTest {
 
@@ -673,5 +678,70 @@ class TurnControllerDefaultCapTest {
     } finally {
       c.close()
     }
+  }
+
+  @Test(timeout = 30_000) fun orphanPrefixOutsideWindowIsDroppedWhileValidTailSucceeds() {
+    val orphanTool = ChatMessage(role = "tool", text = "out-orphan", toolCallId = "orphan-call")
+    val userTail = ChatMessage(role = "user", text = "valid tail")
+    val history = listOf(orphanTool, userTail)
+
+    // When cap = MaxMessages(1), orphan prefix outside the window is dropped.
+    val kept1 = applyHistoryCap(history, HistoryWindowCap.MaxMessages(1))
+    assertEquals(listOf(userTail), kept1)
+    // Downstream validateToolPairing([userTail], true) succeeds without error.
+    validateToolPairing(kept1, true)
+
+    // When cap = MaxMessages(2), applyHistoryCap keeps [orphanTool, userTail].
+    val kept2 = applyHistoryCap(history, HistoryWindowCap.MaxMessages(2))
+    assertEquals(listOf(orphanTool, userTail), kept2)
+    // Downstream validateToolPairing fails closed with TOOL_OUTPUT_ORPHAN_ID.
+    try {
+      validateToolPairing(kept2, true)
+      org.junit.Assert.fail("expected orphan tool rejection when kept in window")
+    } catch (e: ProviderFailure) {
+      assertTrue(
+        "downstream must fail closed with TOOL_OUTPUT_ORPHAN_ID, got ${e.message}",
+        (e.message ?: "").contains("TOOL_OUTPUT_ORPHAN_ID"),
+      )
+    }
+  }
+
+  @Test(timeout = 30_000) fun exactMessageCapBoundaries() {
+    fun msg(text: String) = ChatMessage(role = "user", text = text)
+    val cap5 = HistoryWindowCap.MaxMessages(5)
+
+    // 5 plain messages with MaxMessages(5) keeps all 5.
+    val msgs5 = (1..5).map { msg("m$it") }
+    assertEquals(msgs5, applyHistoryCap(msgs5, cap5))
+
+    // 6 plain messages with MaxMessages(5) drops exactly oldest 1, keeps newest 5.
+    val msgs6 = (1..6).map { msg("m$it") }
+    assertEquals(msgs6.drop(1), applyHistoryCap(msgs6, cap5))
+
+    // 4 plain messages with MaxMessages(5) keeps all 4.
+    val msgs4 = (1..4).map { msg("m$it") }
+    assertEquals(msgs4, applyHistoryCap(msgs4, cap5))
+  }
+
+  @Test(timeout = 30_000) fun exactCharCapBoundaries() {
+    fun msg(text: String) = ChatMessage(role = "user", text = text)
+    val cap40 = HistoryWindowCap.MaxChars(40)
+
+    val m1 = msg("a".repeat(20))
+    val m2 = msg("b".repeat(20))
+    val m3 = msg("c".repeat(20))
+
+    // 2 messages of 20 chars each (total 40 chars) with MaxChars(40) keeps both.
+    val two = listOf(m1, m2)
+    assertEquals(two, applyHistoryCap(two, cap40))
+
+    // Add 3rd message of 20 chars (total 60 chars) with MaxChars(40) keeps newest 2 (40 chars) and drops oldest 1.
+    val three = listOf(m1, m2, m3)
+    assertEquals(listOf(m2, m3), applyHistoryCap(three, cap40))
+
+    // Message of 41 chars with MaxChars(40) keeps the message whole (single newest rule).
+    val m41 = msg("x".repeat(41))
+    assertEquals(listOf(m41), applyHistoryCap(listOf(m41), cap40))
+    assertEquals(listOf(m41), applyHistoryCap(listOf(m1, m41), cap40))
   }
 }

@@ -385,8 +385,10 @@ object ShellPolicy {
         "-c", "--format", "--printf",
         "-e", "--regexp",
         "-d", "--max-depth", "--date",
+        "-A", "--after-context", "-B", "--before-context", "-C", "--context",
+        "-m", "--max-count", "-D",
         "-t", "--type", "-x", "--exclude-type",
-        "-B", "--block-size", "--output",
+        "--block-size", "--output",
         "-name", "-iname", "-wholename", "-iwholename",
         "-type", "-maxdepth", "-mindepth", "-mmin", "-mtime",
         "-size", "-perm", "-user", "-group",
@@ -418,7 +420,9 @@ object ShellPolicy {
         val allowed: Set<String> = when (base) {
             "head", "tail" -> setOf("-n", "--lines", "-c", "--bytes")
             "stat" -> setOf("-c", "--format", "--printf")
-            "grep" -> setOf("-e", "--regexp", "-d", "--directories", "--devices")
+            "grep" -> setOf("-e", "--regexp", "-d", "--directories", "--devices",
+                "-A", "--after-context", "-B", "--before-context", "-C", "--context",
+                "-m", "--max-count", "-D")
             "find" -> setOf("-name", "-iname", "-wholename", "-iwholename", "-type",
                 "-maxdepth", "-mindepth", "-mmin", "-mtime", "-size", "-perm", "-user", "-group")
             "du" -> setOf("-d", "--max-depth", "-B", "--block-size")
@@ -437,10 +441,10 @@ object ShellPolicy {
         "--color", "--sort", "--format", "--printf", "--block-size",
         "--time-style", "--lines", "--bytes", "--max-count", "--max-depth",
         "--type", "--exclude-type", "--output",
-        "--regexp", "--directories", "--devices", "--include", "--exclude", "--exclude-dir",
+        "--regexp", "--directories", "--devices", "--after-context", "--before-context",
+        "--context", "--include", "--exclude", "--exclude-dir",
         // Stage G：grep 列舉值（非檔名）：`--directories=read|recurse|skip`
         // （recurse ≈ -r，不跟隨 symlink，安全放行）、`--devices=read|skip`。
-        "--directories", "--devices",
     )
 
     /**
@@ -460,7 +464,11 @@ object ShellPolicy {
     /** grep 遞迴旗標：有此旗標且無檔案參數時語義為遞迴 `.`。 */
     private fun isGrepRecursiveFlag(arg: String): Boolean =
         arg == "-r" || arg == "-R" || arg == "--recursive" ||
-            (arg.startsWith("-") && !arg.startsWith("--") && 'r' in arg.drop(1) && !arg.contains('='))
+            arg == "--dereference-recursive" ||
+            (arg.startsWith("--") && !arg.contains('=') && arg.length >= 5 &&
+                ("--recursive".startsWith(arg) || "--dereference-recursive".startsWith(arg))) ||
+            (arg.startsWith("-") && !arg.startsWith("--") && !arg.contains('=') &&
+                ('r' in arg.drop(1) || 'R' in arg.drop(1)))
 
     /**
      * Stage D（P1-2 recursive symlink-follow）：guest 容器內豁免判定。
@@ -1817,6 +1825,10 @@ object ShellPolicy {
         // 如 `grep -- -r` 的 -r 是 pattern 而非遞迴）。
         var sawGrepRecursiveFlag = false
         for (arg in args) {
+            // Stage A：REQUIRED-FILENAME 槽狀態在迭代開始即 snapshot，避免早期 continue
+            //（pendingClusterValue 消費／guest 容器路徑）漏 reset pendingFileValue。
+            val inFileSlot = pendingFileValue
+            pendingFileValue = false
             // bind 封堵縱深（與 LinuxEnv.bindVeto 雙層）：guest 包裝層 argv 內
             // 出現 --bind 即否決，不因 guest 放行（黑名單不因通道放行）。
             if (arg == "--bind" || arg.startsWith("--bind=")) {
@@ -1891,7 +1903,7 @@ object ShellPolicy {
                 // 不適用。容器內 symlink／TOCTOU 殘餘見 `ProotExec` KDoc。
                 if (isGuest && privateRoot != null && isContainerInternalPath(candidate, privateRoot)) {
                     prevArg = arg
-                    prevWasValue = false
+                    prevWasValue = inFileSlot
                     continue
                 }
                 val denial = if (isElevated) {
@@ -1903,8 +1915,6 @@ object ShellPolicy {
             }
             // Stage A：REQUIRED-FILENAME 槽先消費（`grep -f --` 的 `--` 是檔名，
             // 不是終止符；`-` 是 stdin 哨兵，維持放行）。
-            val inFileSlot = pendingFileValue
-            pendingFileValue = false
             if (inFileSlot) {
                 if (arg == "-") {
                     prevArg = arg
@@ -2218,7 +2228,9 @@ object ShellPolicy {
                 pendingFileValue = true
             }
             prevArg = arg
-            prevWasValue = false
+            // file slot 消費的檔名 token 視為已消費資料值（token-role），避免下一轮
+            // 以其字面值重新參與旗標分類；一般 operand 維持 false。
+            prevWasValue = inFileSlot
         }
         // Implicit-cwd fail-closed（PR#1 re-review head 4e3a6c6 blocker 1）：
         // ls/du/df/find/pwd 無明確絕對路徑時語義即隱式操作 cwd（ls/du 列 `.`、

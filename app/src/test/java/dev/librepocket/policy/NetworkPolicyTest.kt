@@ -513,18 +513,51 @@ class NetworkPolicyTest {
   }
 
   @Test fun httpUnderNonCleartextOptInDoesNotResolveDns() {
-    // WARN-05：預設非明文 opt-in 下，http 請求在 DNS 前即短路拒絕（零 DNS 洩漏）。
+    // WARN-05：預設及 ALLOW_PRIVATE_DNS（皆不開明文）下，http 請求在 DNS 前即短路拒絕（零 DNS 洩漏）。
     assertDenied(
       NetworkDenyCode.CLEARTEXT_NOT_PERMITTED,
       NetworkPolicy.evaluateUrl("http://example.com/", optIn = EndpointNetworkOptIn(), resolver = neverResolve),
     )
+    assertDenied(
+      NetworkDenyCode.CLEARTEXT_NOT_PERMITTED,
+      NetworkPolicy.evaluateUrl(
+        "http://example.com/",
+        optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS),
+        resolver = neverResolve,
+      ),
+    )
   }
 
   @Test fun invalidIpv4LiteralDoesNotTouchDns() {
-    // IPv4 形狀但數值超範圍字面：resolveHost 直接拒絕，不當 DNS 查詢洩漏。
+    // IPv4 形狀但數值超範圍／前導零字面：resolveHost 直接拒絕（含 http），不當 DNS 查詢洩漏。
+    for (bad in listOf("https://999.1.1.1/", "http://999.1.1.1/", "https://0177.0.0.1/", "http://0177.0.0.1/")) {
+      assertDenied(
+        NetworkDenyCode.INVALID_HOST,
+        NetworkPolicy.evaluateUrl(bad, resolver = neverResolve),
+      )
+    }
+  }
+
+  @Test fun backslashAndMalformedSchemeDelimitersBlockedWithoutDns() {
+    // 反斜線 host 混淆與單/三斜線 scheme 分隔符繞過一律在 DNS 前 fail-closed。
     assertDenied(
-      NetworkDenyCode.INVALID_HOST,
-      NetworkPolicy.evaluateUrl("https://999.1.1.1/", resolver = neverResolve),
+      NetworkDenyCode.USERINFO_BLOCKED,
+      NetworkPolicy.evaluateUrl("https://evil.example\\@trusted.example/", resolver = neverResolve),
     )
+    assertDenied(
+      NetworkDenyCode.USERINFO_BLOCKED,
+      NetworkPolicy.evaluateUrl("http://evil.example\\trusted.example/", resolver = neverResolve),
+    )
+    for (malformed in listOf(
+      "https:/evil.example\\@trusted.example/",
+      "https:///evil.example\\@trusted.example/",
+      "https:/@trusted.example/",
+      "https:/evil.example\\@trusted.example?x=://good.com",
+    )) {
+      assertDenied(
+        NetworkDenyCode.INVALID_HOST,
+        NetworkPolicy.evaluateUrl(malformed, resolver = neverResolve),
+      )
+    }
   }
 }

@@ -11,9 +11,12 @@ import dev.librepocket.policy.NetworkOptInStore
 import dev.librepocket.policy.PinnedNetworkDns
 import java.net.InetAddress
 import java.net.UnknownHostException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
@@ -294,6 +297,7 @@ class McpNetworkPolicyTest {
             val got = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }
             assertNotNull("5s 內未回傳", got)
             assertEquals("307 是終端回應（不跟隨）", McpStatus.PROTOCOL, got!!.status)
+            assertEquals(NetworkDenyCode.REDIRECT_BLOCKED.name, got.auditMap()["denyCode"])
             assertEquals("跳轉目標不得收到任何請求", 0, target.requestCount)
             assertEquals("origin 恰一發（不跟隨、不重送）", 1, origin.requestCount)
             assertEquals(1, breaker.failureCount())
@@ -660,13 +664,17 @@ class McpNetworkPolicyTest {
 
     @Test fun takePreverifiedEvalForgedPrivateAddressUnderStrictOptInFallsBack() {
         // 偽造 preverifiedEval 宣稱私有 IP 放行，但當前 optIn 為預設 HTTPS_ONLY：
-        // 重跑 pinned resolver 失敗後回落 realResolver，且 realResolver 答案同為私有時被拒。
+        // 重跑 pinned resolver 失敗後必須回落 realResolver。
         val forged = NetworkEvaluation.allowed(
             AddressClass.PRIVATE,
             listOf(addr("10.0.0.1")),
             "https://internal.example.com/mcp",
         )
-        val realResolver = fakeDns("internal.example.com" to listOf("10.0.0.1"))
+        val realCalls = AtomicInteger(0)
+        val realResolver = HostResolver {
+            realCalls.incrementAndGet()
+            listOf(addr("10.0.0.1"))
+        }
         try {
             takePreverifiedEval(
                 url = "https://internal.example.com/mcp",
@@ -677,59 +685,150 @@ class McpNetworkPolicyTest {
             fail("預設 opt-in 必須阻擋私有 IP，不得盲信 preverified")
         } catch (e: McpNetworkPolicyBlocked) {
             assertEquals(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, e.denyCode)
+            assertEquals("pinned 重驗失敗後必須真正回落 realResolver", 1, realCalls.get())
+        }
+        // 對照：若 realResolver 實際回傳公網 IP，回落 realResolver 應改用真解析結果放行。
+        val publicRealResolver = fakeDns("internal.example.com" to listOf("203.0.113.5"))
+        val recovered = takePreverifiedEval(
+            url = "https://internal.example.com/mcp",
+            preverified = forged,
+            optIn = EndpointNetworkOptIn(NetworkEgressPolicy.HTTPS_ONLY),
+            resolver = publicRealResolver,
+        )
+        assertTrue(recovered.allowed)
+        assertEquals(listOf(addr("203.0.113.5")), recovered.resolvedAddresses)
+    }
+
+    @Test fun postJsonDirectCallRejectsForgedPreverifiedEvalWithBlockedAddress() = runBlocking {
+        // 直調 postJson 帶偽造 preverifiedEval（宣稱 127.0.0.1 放行）但 optIn 為預設 HTTPS_ONLY：
+        // 必須拒絕且不發送 HTTP。
+        val web = MockWebServer()
+        web.start()
+        try {
+            val url = web.url("/mcp").toString()
+            val forged = NetworkEvaluation.allowed(
+                AddressClass.LOOPBACK,
+                listOf(addr("127.0.0.1")),
+                url,
+            )
+            try {
+                McpTransport().postJson(
+                    baseUrl = url,
+                    bearer = "sekret",
+                    bodyJson = "{}",
+                    timeoutMs = McpTimeouts.DEFAULT_MS,
+                    optIn = EndpointNetworkOptIn(NetworkEgressPolicy.HTTPS_ONLY),
+                    resolver = noDns,
+                    preverifiedEval = forged,
+                )
+                fail("預設 HTTPS_ONLY 下直調 postJson 不得信任偽造的 LOOPBACK preverifiedEval")
+            } catch (e: McpNetworkPolicyBlocked) {
+                assertEquals(NetworkDenyCode.CLEARTEXT_NOT_PERMITTED, e.denyCode)
+            }
+            assertEquals("偽造 eval 被擋下時不得發送任何請求", 0, web.requestCount)
+        } finally {
+            web.shutdown()
         }
     }
 
     @Test fun preflightTimeoutReturnsTimeoutStatusWithoutBreaker() = runBlocking {
-        // WARN-04：DNS preflight 超時立即回 TIMEOUT，零 vault、零熔斷。
+        // WARN-04：DNS preflight 超時立即回 TIMEOUT，零 vault、零熔斷，且確實中斷卡住的解析執行緒。
         val vault = CountingVault()
         val breaker = McpCircuitBreaker()
+        val interrupted = AtomicInteger(0)
         val hangingResolver = HostResolver {
-            Thread.sleep(5_000)
+            try {
+                Thread.sleep(5_000)
+            } catch (e: InterruptedException) {
+                interrupted.incrementAndGet()
+                throw e
+            }
             listOf(addr("203.0.113.1"))
         }
-        val server = McpServer(
-            config = McpServerConfig(
-                id = "s-slow",
-                baseUrl = "https://slow.example.com/mcp",
-                networkResolver = hangingResolver,
-            ),
-            keyVault = vault,
-            transport = McpTransport(),
-            breaker = breaker,
-        )
-        // 傳入短超時 100ms：preflight 立即超時，不卡住線程、零 vault、零熔斷。
-        val got = server.listTools(timeoutMs = 100L)
-        assertEquals(McpStatus.TIMEOUT, got.status)
-        assertEquals(0, vault.reads.get())
-        assertEquals("preflight timeout 不得計入熔斷失敗", 0, breaker.failureCount())
+        val testExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "test-preflight-timeout").apply { isDaemon = true }
+        }
+        try {
+            val server = McpServer(
+                config = McpServerConfig(
+                    id = "s-slow",
+                    baseUrl = "https://slow.example.com/mcp",
+                    networkResolver = hangingResolver,
+                ),
+                keyVault = vault,
+                transport = McpTransport(),
+                breaker = breaker,
+                preflightExecutor = testExecutor,
+            )
+            // 傳入短超時 100ms：preflight 立即超時，不卡住線程、零 vault、零熔斷。
+            val start = System.currentTimeMillis()
+            val got = server.listTools(timeoutMs = 100L)
+            val elapsed = System.currentTimeMillis() - start
+            assertEquals(McpStatus.TIMEOUT, got.status)
+            assertTrue("preflight timeout 應在 2s 內返回，實際 ${elapsed}ms", elapsed < 2_000L)
+            assertEquals(null, got.auditMap()["denyCode"])
+            assertFalse("稽核不得含 host", got.auditMap().toString().contains("slow.example.com"))
+            assertEquals(0, vault.reads.get())
+            assertEquals("preflight timeout 不得計入熔斷失敗", 0, breaker.failureCount())
 
-        val callGot = server.callTool("toolA", "{}", timeoutMs = 100L)
-        assertEquals(McpStatus.TIMEOUT, callGot.status)
-        assertEquals(0, vault.reads.get())
-        assertEquals("preflight timeout 不得計入熔斷失敗", 0, breaker.failureCount())
+            val callGot = server.callTool("toolA", "{}", timeoutMs = 100L)
+            assertEquals(McpStatus.TIMEOUT, callGot.status)
+            assertEquals(null, callGot.auditMap()["denyCode"])
+            assertFalse("稽核不得含 host", callGot.auditMap().toString().contains("slow.example.com"))
+            assertEquals(0, vault.reads.get())
+            assertEquals("preflight timeout 不得計入熔斷失敗", 0, breaker.failureCount())
+            // 等待極短暫讓 worker catch 到 InterruptedException
+            val deadline = System.currentTimeMillis() + 1_000L
+            while (interrupted.get() < 2 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10)
+            }
+            assertEquals("兩次超時皆須實際中斷解析執行緒", 2, interrupted.get())
+        } finally {
+            testExecutor.shutdownNow()
+        }
     }
 
     @Test fun preflightCancelledByCallingCoroutineCancelsPromptly() = runBlocking {
         // 協程取消時，runInterruptible 應立即中斷 worker thread，不得等待 10s DNS。
+        val entered = CountDownLatch(1)
+        val interrupted = AtomicBoolean(false)
         val hangingResolver = HostResolver {
-            Thread.sleep(10_000)
+            entered.countDown()
+            try {
+                Thread.sleep(10_000)
+            } catch (e: InterruptedException) {
+                interrupted.set(true)
+                throw e
+            }
             listOf(addr("203.0.113.1"))
         }
-        val server = McpServer(
-            config = McpServerConfig(
-                id = "s-slow-cancel",
-                baseUrl = "https://slow.example.com/mcp",
-                networkResolver = hangingResolver,
-            ),
-            keyVault = CountingVault(),
-        )
-        val job = launch { server.listTools(timeoutMs = 10_000L) }
-        delay(50)
-        val start = System.currentTimeMillis()
-        job.cancelAndJoin()
-        val elapsed = System.currentTimeMillis() - start
-        assertTrue("協程取消應立即中斷返回，不得等待 10s DNS，實際: ${elapsed}ms", elapsed < 2_000L)
+        val testExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "test-preflight-cancel").apply { isDaemon = true }
+        }
+        try {
+            val server = McpServer(
+                config = McpServerConfig(
+                    id = "s-slow-cancel",
+                    baseUrl = "https://slow.example.com/mcp",
+                    networkResolver = hangingResolver,
+                ),
+                keyVault = CountingVault(),
+                preflightExecutor = testExecutor,
+            )
+            val job = launch(Dispatchers.Default) { server.listTools(timeoutMs = 10_000L) }
+            assertTrue("必須先確定進入 resolver 再取消，避免競態假陽性", entered.await(5, TimeUnit.SECONDS))
+            val start = System.currentTimeMillis()
+            job.cancelAndJoin()
+            val elapsed = System.currentTimeMillis() - start
+            assertTrue("協程取消應立即中斷返回，不得等待 10s DNS，實際: ${elapsed}ms", elapsed < 2_000L)
+            val deadline = System.currentTimeMillis() + 1_000L
+            while (!interrupted.get() && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10)
+            }
+            assertTrue("協程取消必須實際中斷 hangingResolver 執行緒", interrupted.get())
+        } finally {
+            testExecutor.shutdownNow()
+        }
     }
 
     @Test fun takePreverifiedEvalWithUrlMismatchFallsBackToRealResolver() {

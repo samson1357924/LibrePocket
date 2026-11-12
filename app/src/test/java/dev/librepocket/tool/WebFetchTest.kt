@@ -11,6 +11,8 @@ import java.net.UnknownHostException
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import okhttp3.Call
 import okhttp3.OkHttpClient
@@ -513,6 +515,121 @@ class WebFetchTest {
                 resolver = loopbackDns(),
             )
             assertTrue(outcome is WebFetch.FetchOutcome.Failed)
+            assertEquals("TIMEOUT", (outcome as WebFetch.FetchOutcome.Failed).detail)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test fun customClientWithZeroTimeoutAtDefaultTimeoutMsIsOverridden() {
+        // 傳入 timeoutMs == TIMEOUT_MS（15s）與 callTimeout=0/connectTimeout=0 的 client：
+        // 仍必須重建並覆寫四個超時，不得因與 TIMEOUT_MS 相等而沿用無界 client。
+        val server = MockWebServer()
+        try {
+            val observedConnectMs = AtomicInteger(-1)
+            val observedReadMs = AtomicInteger(-1)
+            val unboundedClient = OkHttpClient.Builder()
+                .connectTimeout(0, TimeUnit.MILLISECONDS)
+                .readTimeout(0, TimeUnit.MILLISECONDS)
+                .writeTimeout(0, TimeUnit.MILLISECONDS)
+                .callTimeout(0, TimeUnit.MILLISECONDS)
+                .addNetworkInterceptor { chain ->
+                    observedConnectMs.set(chain.connectTimeoutMillis())
+                    observedReadMs.set(chain.readTimeoutMillis())
+                    chain.proceed(chain.request())
+                }
+                .build()
+            server.enqueue(MockResponse().setResponseCode(200).setBody("ok"))
+            val outcome = WebFetch.fetch(
+                server.url("/ok").toString(),
+                client = unboundedClient,
+                timeoutMs = WebFetch.TIMEOUT_MS,
+                optIn = cleartextPrivate,
+                resolver = loopbackDns(),
+            )
+            assertTrue(outcome is WebFetch.FetchOutcome.Ok)
+            assertTrue(
+                "connectTimeout 必須被覆寫為 > 0 且 <= TIMEOUT_MS，實際 ${observedConnectMs.get()}",
+                observedConnectMs.get() in 1..WebFetch.TIMEOUT_MS.toInt(),
+            )
+            assertTrue(
+                "readTimeout 必須被覆寫為 > 0 且 <= TIMEOUT_MS，實際 ${observedReadMs.get()}",
+                observedReadMs.get() in 1..WebFetch.TIMEOUT_MS.toInt(),
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test fun negativeTimeoutClampsToOneMillisecondAndTimesOut() {
+        val server = MockWebServer()
+        try {
+            server.enqueue(
+                MockResponse().setResponseCode(200).setBody("late").setBodyDelay(3, TimeUnit.SECONDS),
+            )
+            val outcome = WebFetch.fetch(
+                server.url("/slow").toString(),
+                timeoutMs = -5L,
+                optIn = cleartextPrivate,
+                resolver = loopbackDns(),
+            )
+            assertTrue(outcome is WebFetch.FetchOutcome.Failed)
+            assertEquals("TIMEOUT", (outcome as WebFetch.FetchOutcome.Failed).detail)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test fun slowDnsPreflightHitsTimeoutPromptly() {
+        // WARN-04：WebFetch DNS preflight 納入全程端到端 deadline，阻塞 resolver 必須即時超時中斷。
+        val interrupted = AtomicBoolean(false)
+        val hangingDns = HostResolver {
+            try {
+                Thread.sleep(5_000)
+            } catch (e: InterruptedException) {
+                interrupted.set(true)
+                throw e
+            }
+            listOf(InetAddress.getByName("127.0.0.1"))
+        }
+        val start = System.currentTimeMillis()
+        val outcome = WebFetch.fetch(
+            "https://slow-dns.example.com/",
+            timeoutMs = 200L,
+            resolver = hangingDns,
+        )
+        val elapsed = System.currentTimeMillis() - start
+        assertTrue(outcome is WebFetch.FetchOutcome.Failed)
+        assertEquals("TIMEOUT", (outcome as WebFetch.FetchOutcome.Failed).detail)
+        assertTrue("DNS preflight timeout 應在 2s 內返回，實際 ${elapsed}ms", elapsed < 2_000L)
+        val deadline = System.currentTimeMillis() + 1_000L
+        while (!interrupted.get() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10)
+        }
+        assertTrue("超時必須中斷阻塞的 DNS 解析執行緒", interrupted.get())
+    }
+
+    @Test fun aggregateTimeoutAcrossRedirects() {
+        // 多跳 redirect 必須共用單一全程 deadline，不得每跳重置超時預算。
+        val server = MockWebServer()
+        try {
+            server.enqueue(
+                MockResponse().setResponseCode(302)
+                    .addHeader("Location", "/hop2")
+                    .setHeadersDelay(350, TimeUnit.MILLISECONDS),
+            )
+            server.enqueue(
+                MockResponse().setResponseCode(200)
+                    .setBody("too-late")
+                    .setBodyDelay(350, TimeUnit.MILLISECONDS),
+            )
+            val outcome = WebFetch.fetch(
+                server.url("/hop1").toString(),
+                timeoutMs = 500L,
+                optIn = cleartextPrivate,
+                resolver = loopbackDns(),
+            )
+            assertTrue("expected Failed, got: $outcome", outcome is WebFetch.FetchOutcome.Failed)
             assertEquals("TIMEOUT", (outcome as WebFetch.FetchOutcome.Failed).detail)
         } finally {
             server.shutdown()

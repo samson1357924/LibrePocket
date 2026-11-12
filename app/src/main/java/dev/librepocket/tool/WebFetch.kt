@@ -15,7 +15,14 @@ import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.nio.charset.Charset
 import java.nio.charset.CodingErrorAction
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CancellationException
 import okhttp3.ConnectionPool
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
@@ -160,6 +167,32 @@ object WebFetch {
     private fun redirectBlocked(): FetchOutcome.Unavailable =
         unavailable(NetworkDenyCode.REDIRECT_BLOCKED.name)
 
+    private val preflightThreadCount = AtomicInteger(1)
+
+    /** WARN-04：WebFetch DNS preflight 專用有界執行器（避免阻塞調用方執行緒）。 */
+    private val preflightExecutor: ExecutorService =
+        Executors.newFixedThreadPool(4) { r ->
+            Thread(r, "webfetch-preflight-${preflightThreadCount.getAndIncrement()}").apply { isDaemon = true }
+        }
+
+    private fun evaluateWithBudget(budgetMs: Long, block: () -> NetworkEvaluation): NetworkEvaluation? {
+        val future = preflightExecutor.submit(Callable { block() })
+        return try {
+            future.get(budgetMs.coerceAtLeast(1L), TimeUnit.MILLISECONDS)
+        } catch (_: TimeoutException) {
+            future.cancel(true)
+            null
+        } catch (_: InterruptedException) {
+            future.cancel(true)
+            Thread.currentThread().interrupt()
+            null
+        } catch (e: ExecutionException) {
+            val cause = e.cause
+            if (cause is CancellationException) return null
+            throw (cause ?: e)
+        }
+    }
+
     /**
      * A4 逐跳 redirect 目標判定（純函數，可單測；零建連）。
      *
@@ -208,7 +241,14 @@ object WebFetch {
         resolver: HostResolver = SystemHostResolver,
     ): FetchOutcome {
         val cap = maxBytes.coerceIn(1, ABSOLUTE_MAX_BYTES)
-        val firstEval = NetworkPolicy.evaluateUrl(rawUrl, optIn, resolver)
+        // 超時鉗制：0／負值不得關閉 OkHttp 超時（OkHttp 以 0 表「不超時」），
+        // 一律鉗到 1ms–MAX_TIMEOUT_MS；並納入全程端到端 deadline（含首跳及
+        // 逐跳 DNS preflight 與 HTTP）。
+        val safeTimeout = timeoutMs.coerceIn(1L, MAX_TIMEOUT_MS)
+        val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(safeTimeout)
+        val firstEval = evaluateWithBudget(safeTimeout) {
+            NetworkPolicy.evaluateUrl(rawUrl, optIn, resolver)
+        } ?: return transportFailed("TIMEOUT")
         if (!firstEval.allowed || firstEval.resolvedAddresses.isEmpty()) {
             return unavailable(firstEval.denyCode?.name ?: NetworkDenyCode.INVALID_HOST.name)
         }
@@ -220,38 +260,16 @@ object WebFetch {
         // 無二次解析（無 TOCTOU rebind）。`strict = true`：未釘住 host 絕不建連。
         val pinned = PinnedNetworkDns(delegate = resolver, strict = true)
         pinned.pin(firstHost, firstEval.resolvedAddresses)
-        // 呼叫方傳入的 client 可能仍開啟自動重定向：一律強制關閉，改由下方手動跟隨。
-        // 超時鉗制：0／負值不得關閉 OkHttp 超時（OkHttp 以 0 表「不超時」），
-        // 一律鉗到 1ms–MAX_TIMEOUT_MS；connect/read/write 與 call 一律同 budget，
-        // 避免「只調 callTimeout」導致 connect/read 仍卡在 shared client 的 15s
-        // 或小 budget 無法收緊 connect/read。
-        val safeTimeout = timeoutMs.coerceIn(1L, MAX_TIMEOUT_MS)
-        // 一律以 safeTimeout 重建 connect/read/write/call，避免呼叫方傳入
-        // callTimeout=0（OkHttp「不超時」）或超大值時沿用原 client 的無界超時。
-        // 僅在預算等於預設且原 client 四個 timeout 皆已等於預設時才複用原 client。
-        val baseClient =
-            if (safeTimeout == TIMEOUT_MS &&
-                client.connectTimeoutMillis.toLong() == TIMEOUT_MS &&
-                client.readTimeoutMillis.toLong() == TIMEOUT_MS &&
-                client.writeTimeoutMillis.toLong() == TIMEOUT_MS &&
-                client.callTimeoutMillis.toLong() == TIMEOUT_MS
-            ) client
-            else client.newBuilder()
-                .connectTimeout(safeTimeout, TimeUnit.MILLISECONDS)
-                .readTimeout(safeTimeout, TimeUnit.MILLISECONDS)
-                .writeTimeout(safeTimeout, TimeUnit.MILLISECONDS)
-                .callTimeout(safeTimeout, TimeUnit.MILLISECONDS)
-                .build()
+        // 呼叫方傳入的 client 可能仍開啟自動重定向或無界超時：一律強制關閉重定向並直連，
+        // 每跳建連再覆寫剩餘端到端 budget 到 connect/read/write/call。
         // 強制直連（`Proxy.NO_PROXY`，與 provider `pinnedTransportFor` 同姿態）：
         // `newBuilder` 繼承呼叫方 client 的 proxy 設定，必須顯式覆寫，否則建連外包
         // 給代理另行解析，繞過 DNS pin（pin 只管直連路徑）。
-        // 跨 fetch 連線池重用已關閉：per-fetch `callClient` 疊加無閒置池
+        // 跨 fetch 連線池重用已關閉：per-fetch `callClientBase` 疊加無閒置池
         //（`ConnectionPool(0, 1, NANOSECONDS)`，對齊 provider `pinnedTransportFor`
         // 與 `McpTransport.postJson`）：舊 keep-alive socket 不得跨 fetch 重用、
         // 繞過當次 pin；同 fetch 內多跳共用同一 pin 生命週期。
-        // `newBuilder` 仍共用底層調度器等其餘資源（S1-B「複用 OkHttp」相容），
-        // 僅連線池 per-fetch 隔離。
-        val callClient = baseClient.newBuilder()
+        val callClientBase = client.newBuilder()
             .dns(pinned)
             .proxy(Proxy.NO_PROXY)
             .connectionPool(ConnectionPool(0, 1, TimeUnit.NANOSECONDS))
@@ -261,11 +279,19 @@ object WebFetch {
         var current = first
         var hops = 0
         while (true) {
+            val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
+            if (remainingMs <= 0L) return transportFailed("TIMEOUT")
+            val hopClient = callClientBase.newBuilder()
+                .connectTimeout(remainingMs, TimeUnit.MILLISECONDS)
+                .readTimeout(remainingMs, TimeUnit.MILLISECONDS)
+                .writeTimeout(remainingMs, TimeUnit.MILLISECONDS)
+                .callTimeout(remainingMs, TimeUnit.MILLISECONDS)
+                .build()
             val request = Request.Builder().url(current).get()
                 .header("Accept", "text/*, application/*+json, application/json;q=0.9, */*;q=0.1")
                 .build()
             val next: String = try {
-                callClient.newCall(request).execute().use { response ->
+                hopClient.newCall(request).execute().use { response ->
                     if (isRedirect(response.code)) {
                         if (hops >= MAX_REDIRECTS) return redirectBlocked()
                         val location = response.header("Location")
@@ -275,7 +301,11 @@ object WebFetch {
                         // A4 逐跳重驗（含 `https → http` 降級永遠拒）：任何拒絕一律
                         // typed `REDIRECT_BLOCKED`，絕不向 redirect target 發請求；
                         // 通過才補釘並跟隨（建連只走釘住答案）。
-                        val hopEval = evaluateRedirectTarget(current, resolved, optIn, resolver)
+                        val hopEvalRemaining = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
+                        if (hopEvalRemaining <= 0L) return transportFailed("TIMEOUT")
+                        val hopEval = evaluateWithBudget(hopEvalRemaining) {
+                            evaluateRedirectTarget(current, resolved, optIn, resolver)
+                        } ?: return transportFailed("TIMEOUT")
                         if (!hopEval.allowed || hopEval.resolvedAddresses.isEmpty()) return redirectBlocked()
                         val hopUrl = hopEval.normalizedUrl ?: resolved
                         val hopHost = hopUrl.toHttpUrlOrNull()?.host ?: return redirectBlocked()

@@ -53,11 +53,28 @@ object NetworkPolicy {
     }
     val url = rawUrl.toHttpUrlOrNull()
       ?: return NetworkEvaluation.denied(NetworkDenyCode.INVALID_HOST, null)
+    // 原始 authority 檢查（對齊 McpWire.requireSecureEndpoint 姿態）：
+    // 第一個 `:` 之後必須緊接 `//`，嚴防單斜線／三斜線／反斜線 scheme 分隔符繞過。
+    val trimmed = rawUrl.trim()
+    val schemeEnd = trimmed.indexOf(':')
+    if (schemeEnd <= 0 || !trimmed.startsWith("//", schemeEnd + 1)) {
+      return NetworkEvaluation.denied(NetworkDenyCode.INVALID_HOST, null)
+    }
+    val authStart = schemeEnd + 3
+    var authEnd = trimmed.length
+    for (i in authStart until trimmed.length) {
+      val c = trimmed[i]
+      if (c == '/' || c == '?' || c == '#') {
+        authEnd = i
+        break
+      }
+    }
+    val authority = trimmed.substring(authStart, authEnd)
+    if (authority.isEmpty()) {
+      return NetworkEvaluation.denied(NetworkDenyCode.INVALID_HOST, null)
+    }
     // Userinfo 永遠阻擋：解析後欄位＋原始 authority 雙重檢查（含空 userinfo
-    // 的 `http://@host/`，與 McpWire F-01 姿態對稱；先剝 fragment `#` 免誤殺）。
-    val authority = rawUrl.substringAfter("://", "").substringBefore('/').substringBefore('?').substringBefore('#')
-    // 反斜線同 userinfo 皆屬 host 混淆（OkHttp 把 `\\` 當 authority/path 分隔，
-    // 顯示主機與實際連線主機可被分離）：fail-closed，與 McpWire 姿態對稱。
+    // 的 `http://@host/`，與 McpWire F-01 姿態對稱；反斜線同屬 host 混淆）。
     if (url.username.isNotEmpty() || !url.password.isNullOrEmpty() || '@' in authority || '\\' in authority) {
       return NetworkEvaluation.denied(NetworkDenyCode.USERINFO_BLOCKED, null)
     }
@@ -75,8 +92,8 @@ object NetworkPolicy {
         hostForShortCircuit.none { it.isWhitespace() || it < ' ' } &&
         // 無效 IPv4 字面（前導零等）一律不短路：resolveHost 會走 DNS 路徑
         //（可能 INVALID_HOST），保留既有 deny code 語義。
-        !hostForShortCircuit.matches(Regex("""^\d+(\.\d+){3}$""")) &&
-        (NetworkPolicy.parseLiteralIp(hostForShortCircuit) != null ||
+        !IPV4_SHAPED.matches(hostForShortCircuit) &&
+        (parseLiteralIp(hostForShortCircuit) != null ||
           (':' !in hostForShortCircuit && isValidDnsName(hostForShortCircuit)))
     if (url.scheme == "http" && !optIn.allowsCleartext && hostStructurallyValid) {
       return NetworkEvaluation.denied(NetworkDenyCode.CLEARTEXT_NOT_PERMITTED, null)
@@ -122,7 +139,7 @@ object NetworkPolicy {
     parseLiteralIp(h)?.let { return listOf(it) }
     // IPv4 形狀但字面非法（前導零／超範圍等）：resolveHost 視為不可解析，
     // 不得走 DNS 路徑（避免無效 host 觸發 resolver 洩漏）。
-    if (h.matches(Regex("""^\d+(\.\d+){3}$""")) && parseLiteralIp(h) == null) return null
+    if (IPV4_SHAPED.matches(h) && parseLiteralIp(h) == null) return null
     if (':' in h) return null // 含冒號卻不是合法字面 IPv6。
     if (!isValidDnsName(h)) return null
     return try {
@@ -215,6 +232,8 @@ object NetworkPolicy {
   )
 
   private val IPV4_LITERAL = Regex("""^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$""")
+
+  private val IPV4_SHAPED = Regex("""^\d+(\.\d+){3}$""")
 
   private val IPV6_LITERAL_CHARS = Regex("""^[0-9a-fA-F:.]+$""")
 

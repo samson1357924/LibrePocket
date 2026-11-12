@@ -10,10 +10,16 @@
   explicitly and keysets live under the files/librepocket_keysets/ directory.
 
   Device-bound state (NOT part of BackupPolicy.KEY_FILES_EXCLUDED, which is
-  key/vault-only): sharedpref/assistant_role.xml holds `everHeld` for the
-  system ROLE_ASSISTANT grant. Role-hold is a per-device system state — a
-  restored device may not hold the role, and migrating the flag would
-  misreport REVOKED on the new device. It must not travel with backup.
+  key/vault-only):
+  - sharedpref/assistant_role.xml holds `everHeld` for the system
+    ROLE_ASSISTANT grant. Role-hold is a per-device system state — a restored
+    device may not hold the role, and migrating the flag would misreport
+    REVOKED on the new device.
+  - files/datastore/librepocket_privilege_bridge.preferences_pb and
+    files/datastore/librepocket_shizuku_grant.preferences_pb hold device-bound
+    privilege bridge and Shizuku authorization grants; a restored device must
+    re-authorize locally instead of inheriting prior grants across backup or
+    D2D transfer.
 -->
 <data-extraction-rules>
     <cloud-backup>
@@ -24,6 +30,9 @@
         <exclude domain="file" path="librepocket_keysets" />
         <!-- Device-bound: ROLE_ASSISTANT hold flag must not migrate to a new device. -->
         <exclude domain="sharedpref" path="assistant_role.xml" />
+        <!-- Device-bound: privilege bridge & Shizuku grant DataStores must not migrate across devices (not in BackupPolicy.KEY_FILES_EXCLUDED). -->
+        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb" />
+        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="librepocket_keys.xml" />
@@ -33,5 +42,8 @@
         <exclude domain="file" path="librepocket_keysets" />
         <!-- Device-bound: ROLE_ASSISTANT hold flag must not migrate to a new device. -->
         <exclude domain="sharedpref" path="assistant_role.xml" />
+        <!-- Device-bound: privilege bridge & Shizuku grant DataStores must not migrate across devices (not in BackupPolicy.KEY_FILES_EXCLUDED). -->
+        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb" />
+        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb" />
     </device-transfer>
 </data-extraction-rules>

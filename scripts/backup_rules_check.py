@@ -109,18 +109,26 @@ REQUIRED_EXCLUDES: tuple[tuple[str, str], ...] = (
     ("file", "librepocket_keysets"),
 )
 
-# Required device-bound excludes (re-review #3 finding #3 [P3]): per-device
-# system state that must not migrate to a restored device, enforced with the
-# same missing-entry severity as REQUIRED_EXCLUDES (see
-# _missing_exclude_errors). Each entry is (domain, path).
+# Required device-bound excludes (re-review #3 finding #3 [P3] + #136-B1
+# grant lifecycle): per-device system/authorization state that must not migrate
+# to a restored device, enforced with the same missing-entry severity as
+# REQUIRED_EXCLUDES (see _missing_exclude_errors). Each entry is (domain, path).
 #   - ("sharedpref", "assistant_role.xml"): `everHeld` for the system
 #     ROLE_ASSISTANT grant (finding D [P3]); restoring it onto an
 #     unauthorized device would misreport REVOKED.
+#   - ("file", "datastore/librepocket_privilege_bridge.preferences_pb"):
+#     device-bound privilege bridge grant DataStore (#136-B1); must not migrate
+#     across backup or device transfer.
+#   - ("file", "datastore/librepocket_shizuku_grant.preferences_pb"):
+#     device-bound Shizuku authorization grant DataStore (#136-B1); must not
+#     migrate across backup or device transfer.
 # Deliberately NOT part of BackupPolicy.KEY_FILES_EXCLUDED (key/vault-only);
 # the drift guard in scripts/tests/test_apk_policy_check.py pins that 5-item
 # Kotlin list separately.
 REQUIRED_DEVICE_BOUND_EXCLUDES: tuple[tuple[str, str], ...] = (
     ("sharedpref", "assistant_role.xml"),
+    ("file", "datastore/librepocket_privilege_bridge.preferences_pb"),
+    ("file", "datastore/librepocket_shizuku_grant.preferences_pb"),
 )
 
 # Allowlisted device-bound extras (NOT key material, NOT part of
@@ -253,11 +261,13 @@ def _missing_exclude_errors(
     """Report excludes missing from the REQUIRED + DEVICE-BOUND set.
 
     Both ``REQUIRED_EXCLUDES`` (BackupPolicy.KEY_FILES_EXCLUDED, key/vault)
-    and ``REQUIRED_DEVICE_BOUND_EXCLUDES`` (per-device system state, finding
-    #3 [P3]) must be present in every checked scope: a resources-overlay /
-    merger rewrite that drops ``assistant_role.xml`` fails here as a missing
-    entry (fail-closed), even though ``exact_excludes`` would otherwise
-    tolerate it as allowlisted. Missing from EITHER set is a FAIL.
+    and ``REQUIRED_DEVICE_BOUND_EXCLUDES`` (per-device system/authorization
+    state, finding #3 [P3] + #136-B1 grant lifecycle) must be present in every
+    checked scope: a resources-overlay / merger rewrite that drops a required
+    device-bound exclude such as ``assistant_role.xml`` or the privilege grant
+    DataStores fails here as a missing entry (fail-closed), even though
+    ``exact_excludes`` would otherwise tolerate it as allowlisted. Missing from
+    EITHER set is a FAIL.
     """
     return [
         f"{path}: {_where(branch_label)}missing exclude domain={domain} path={rule_path}"

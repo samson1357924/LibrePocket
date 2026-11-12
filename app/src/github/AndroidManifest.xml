@@ -9,21 +9,24 @@
 
     <application>
         <!--
-          #136-B1 Shizuku binder 通道（Shizuku 13.x 標準接線，僅 github 風味）。
-          authorities 固定為 "<package>.shizuku"（ShizukuProvider 以
-          getPackageName() + ".shizuku" 自尋 binder）；exported=true 是
-          Shizuku 13.x 官方合約（Manager 回傳 binder 必需，上游 provider 合約要求
-          exported 必為 true；鑑權在 Manager 側）。play/foss 源集
-          無此宣告，對應 artifact gate 維持 fail-closed。
-          刻意不加 signature permission（鑑權在 Manager 側），未來勿加固，
-          以免後人誤加固斷連。
+          #136-B1 Shizuku binder 通道（Shizuku 13.x 官方合約，僅 github 風味；
+          見 RikkaApps/Shizuku-API `ShizukuProvider.java` 與 README）。
+          authorities 固定為 "${applicationId}.shizuku"（ShizukuProvider 以
+          getPackageName() + ".shizuku" 自尋 binder）；exported="true" 與
+          multiprocess="false" 為上游 ShizukuProvider.attachInfo() 硬性契約。
+          必須宣告 android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"：
+          防止一般第三方 App 存取 sendBinder / getBinder，同時讓
+          shizuku_server（com.android.shell / root）與本 App 自身 UID 仍可存取；
+          切勿改為自訂 app signature permission（會導致 shizuku_server 無法回傳 binder 而斷連）。
+          play/foss 源集無此宣告，對應 artifact gate 維持 fail-closed。
         -->
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
             android:authorities="${applicationId}.shizuku"
             android:enabled="true"
             android:exported="true"
-            android:multiprocess="false" />
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
         <service
             android:name=".github.GithubAccessibilityService"
             android:exported="false"

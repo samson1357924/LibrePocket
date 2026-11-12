@@ -116,4 +116,49 @@ class ShellP1RegressionTest {
             }
         } finally { scope.deleteRecursively() }
     }
+
+    // Long flag --regexp dash-leading pattern value consumption (P1)
+    @Test fun grepRegexpLongFlag_dashLeadingPattern() {
+        val scope = java.io.File.createTempFile("scp","").apply { delete(); mkdirs() }
+        val outside = java.io.File.createTempFile("out","").apply { delete(); mkdirs() }
+        try {
+            val link = java.io.File(scope, "leak").apply { delete() }
+            java.nio.file.Files.createSymbolicLink(link.toPath(), outside.toPath())
+            val v = ShellPolicy.validate(listOf("grep", "--regexp", "-e", link.absolutePath), privateRoot = scope.absolutePath)
+            assertTrue("expected denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+        } finally { scope.deleteRecursively(); outside.deleteRecursively() }
+    }
+
+    @Test fun grepRegexpLongFlag_dashLeadingTraversal() {
+        val scope = java.io.File.createTempFile("scp","").apply { delete(); mkdirs() }
+        try {
+            val sub = java.io.File(scope, "subtree").apply { mkdirs() }
+            val v = ShellPolicy.validate(listOf("grep", "--regexp", "-e", "-R", scope.absolutePath + "/subtree"), privateRoot = scope.absolutePath)
+            assertTrue("expected denied (traversal), got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+            val msg = (v as Validation.Denied).message
+            assertTrue("should be traversal denial, got $v", msg.contains("traversal"))
+        } finally { scope.deleteRecursively() }
+    }
+
+    // df short cluster (P2)
+    @Test fun dfShortCluster_typeValue() {
+        val scope = java.io.File.createTempFile("scp","").apply { delete(); mkdirs() }
+        try {
+            val v = ShellPolicy.validate(listOf("df", "-hx", scope.absolutePath), privateRoot = scope.absolutePath)
+            assertTrue("expected denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+        } finally { scope.deleteRecursively() }
+    }
+
+    // df long prefix (P2)
+    @Test fun dfLongPrefix_excludeType() {
+        val scope = java.io.File.createTempFile("scp","").apply { delete(); mkdirs() }
+        try {
+            val v = ShellPolicy.validate(listOf("df", "--exclude-typ", scope.absolutePath), privateRoot = scope.absolutePath)
+            assertTrue("expected denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+        } finally { scope.deleteRecursively() }
+    }
 }

@@ -2634,6 +2634,15 @@ class ChatViewModelFactory(
     buildProvider: ((ProviderConfig, KeyProvider) -> LlmProvider)? = null,
     vaultSource: VaultSource? = null,
     sessionStores: SessionStoreSource? = null,
+    /**
+     * B2-phase1 (#19) injection seam: production default stays null
+     * (records-only invariant pinned by ProductionChatCompositionTest).
+     * Tests attach an explicit [SafeToolSlice] to prove the real-factory
+     * round-trip (visibleTools → ChatRequest.tools → execute → continuation)
+     * without flipping any registry `executionReady` or capability matrix.
+     * B3 decides the default-attached production slice (real switches/backend).
+     */
+    toolSlice: SafeToolSlice? = null,
 ) : ViewModelProvider.Factory {
     private val effectivePolicy: PolicyStore = policy ?: DataStorePolicyStore(app)
 
@@ -2654,7 +2663,7 @@ class ChatViewModelFactory(
         vaultSource = effectiveVaultSource,
         buildProvider = buildProvider ?: { cfg, keys -> DefaultProviderFactory(keys).create(cfg) },
         sessionStores = effectiveSessionStores,
-        toolSlice = null, // Records-only invariant pinned in production composition
+        toolSlice = toolSlice, // Records-only invariant pinned in production composition (default null)
     )
 
     @Suppress("UNCHECKED_CAST")

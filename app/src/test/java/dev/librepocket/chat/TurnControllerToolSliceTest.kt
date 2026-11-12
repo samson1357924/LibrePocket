@@ -222,6 +222,7 @@ class TurnControllerToolSliceTest {
         policy: PolicyStore,
         sink: TranscriptSink,
         toolSlice: SafeToolSlice?,
+        historyCap: HistoryWindowCap = HistoryWindowCap.DEFAULT,
     ): TurnController {
         var n = 0
         return TurnController(
@@ -232,6 +233,7 @@ class TurnControllerToolSliceTest {
             dispatcher = Dispatchers.Default,
             sleeper = {},
             newId = { "slice-${n++}" },
+            historyCap = historyCap,
             toolSlice = toolSlice,
         )
     }
@@ -1129,7 +1131,10 @@ class TurnControllerToolSliceTest {
         val sink = SliceSink()
         val backend = CountingBackend()
         val pol = slicePolicy()
-        val c = controller(provider, pol, sink, loop(pol, backend))
+        // B1: pins the continuation wire-estimate trim layer with a 98.5k
+        // base that the bounded window default would already window away —
+        // explicit Unbounded opt-in (was the implicit default pre-B1).
+        val c = controller(provider, pol, sink, loop(pol, backend), HistoryWindowCap.Unbounded)
         val nearCapHistory = "a".repeat(98_500)
         val echoArgs = """{"query":"${"x".repeat(4_000)}"}"""
         var responses = 0

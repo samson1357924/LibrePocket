@@ -117,8 +117,10 @@ private class AggRecordingSink : TranscriptSink {
  *   attempt), with the same no-retry / no-poison-record behavior;
  * - UI-update cost counters observe every delta (batching downgraded to
  *   counters + KDoc TODO until on-device measurements justify a threshold);
- * - [HistoryWindowCap] windows only the outgoing request copy (Unbounded by
- *   default), oldest-first at whole-message boundaries, with an observable
+ * - [HistoryWindowCap] windows only the outgoing request copy (bounded
+ *   [HistoryWindowCap.DEFAULT] by default; this file explicitly opts into
+ *   [HistoryWindowCap.Unbounded] to pin the legacy whole-history behavior),
+ *   oldest-first at whole-message boundaries, with an observable
  *   drop count.
  */
 class TurnControllerAggBudgetTest {

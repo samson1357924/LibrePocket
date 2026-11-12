@@ -15,6 +15,7 @@ import dev.librepocket.tool.CapabilityLevel
 import dev.librepocket.tool.Flavor
 import dev.librepocket.tool.ProjectionContext
 import dev.librepocket.tool.ToolRegistry
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -29,6 +30,16 @@ import org.junit.Test
  * - 持久收回形狀：`revoke(store, withdrawScope)`（依賴 #166，B1 持久版為準）。
  */
 class ElevatedWiringTest {
+
+    private companion object {
+        const val TEST_PROVIDER_ID = "preset:openai"
+        const val TEST_REVISION = 3L
+    }
+
+    private fun validGrant(
+        providerId: String = TEST_PROVIDER_ID,
+        revision: Long = TEST_REVISION,
+    ) = ElevatedWiring.ElevatedGrant.Valid(providerId, revision)
 
     private fun allowPolicy(): InMemoryPolicyStore = InMemoryPolicyStore(
         initialRules = listOf(
@@ -60,7 +71,7 @@ class ElevatedWiringTest {
         runner: ElevatedShellRunner = SpawnCounter(),
         audit: PrivilegeAuditLog = PrivilegeAuditLog(),
         ctx: ProjectionContext = elevatedCtx(),
-        grant: ElevatedWiring.ElevatedGrant = ElevatedWiring.ElevatedGrant.Valid,
+        grant: ElevatedWiring.ElevatedGrant = validGrant(),
         bridge: Boolean = true,
     ) = object {
         val policyStore: PolicyStore = policy
@@ -137,7 +148,7 @@ class ElevatedWiringTest {
             policyStore = askPolicy,
             runner = runner,
             audit = audit,
-            grantCheck = { ElevatedWiring.ElevatedGrant.Valid },
+            grantCheck = { validGrant() },
             bridgeGranted = { true },
         )
         assertTrue("$r", r is ShellResult.Denied)
@@ -178,7 +189,7 @@ class ElevatedWiringTest {
             policyStore = allowPolicy(),
             runner = runner,
             audit = audit,
-            grantCheck = { ElevatedWiring.ElevatedGrant.Valid },
+            grantCheck = { validGrant() },
             bridgeGranted = { true },
         )
         assertTrue("$r", r is ShellResult.Denied)
@@ -197,7 +208,7 @@ class ElevatedWiringTest {
             policyStore = allowPolicy(),
             runner = runner,
             audit = audit,
-            grantCheck = { ElevatedWiring.ElevatedGrant.Valid },
+            grantCheck = { validGrant() },
             bridgeGranted = { false },
         )
         assertTrue("$r", r is ShellResult.Denied)
@@ -245,7 +256,7 @@ class ElevatedWiringTest {
             policyStore = allowPolicy(),
             runner = runner,
             audit = audit,
-            grantCheck = { ElevatedWiring.ElevatedGrant.Valid },
+            grantCheck = { validGrant() },
             bridgeGranted = { true },
         )
         assertTrue("$r", r is ShellResult.Denied)
@@ -275,7 +286,7 @@ class ElevatedWiringTest {
             policyStore = allowPolicy(),
             runner = runner,
             audit = audit,
-            grantCheck = { ElevatedWiring.ElevatedGrant.Valid },
+            grantCheck = { validGrant() },
             bridgeGranted = flippingBridge,
         )
         // 前驗 bridge=true（首調），重驗 bridge=false（次調）→ 拒。
@@ -297,7 +308,7 @@ class ElevatedWiringTest {
             policyStore = allowPolicy(),
             runner = runner,
             audit = audit,
-            grantCheck = { ElevatedWiring.ElevatedGrant.Valid },
+            grantCheck = { validGrant() },
             bridgeGranted = { true },
         )
         assertTrue("$r", r is ShellResult.Ok)
@@ -326,7 +337,7 @@ class ElevatedWiringTest {
             policyStore = allowPolicy(),
             runner = DenyingElevatedRunner(),
             audit = audit,
-            grantCheck = { ElevatedWiring.ElevatedGrant.Valid },
+            grantCheck = { validGrant() },
             bridgeGranted = { true },
         )
         assertTrue("$r", r is ShellResult.Denied)
@@ -370,5 +381,142 @@ class ElevatedWiringTest {
             assertEquals(false, state.bridgeSwitchOn)
             assertEquals(false, state.bridgeGranted)
         }
+    }
+
+    @Test fun cancellationPropagatesWithoutDenyAudit() = runBlocking {
+        // 取消必須重拋 CE，不得轉 Denied＋DENY 審計（各 supplier／policy 全覆）。
+        val cancellingPolicy = object : PolicyStore by allowPolicy() {
+            override suspend fun evaluateFresh(action: String, resource: String) =
+                throw CancellationException("policy cancelled")
+        }
+        for (name in listOf("ctxSupplier", "bridgeGranted", "grantCheck", "evaluateFresh")) {
+            val audit = PrivilegeAuditLog()
+            val runner = SpawnCounter()
+            try {
+                when (name) {
+                    "ctxSupplier" -> ElevatedWiring.execute(
+                        argv = listOf("id"),
+                        reasonCode = "B3-T",
+                        confirmed = true,
+                        ctxSupplier = { throw CancellationException("ctx cancelled") },
+                        policyStore = allowPolicy(),
+                        runner = runner,
+                        audit = audit,
+                        grantCheck = { validGrant() },
+                        bridgeGranted = { true },
+                    )
+                    "bridgeGranted" -> ElevatedWiring.execute(
+                        argv = listOf("id"),
+                        reasonCode = "B3-T",
+                        confirmed = true,
+                        ctxSupplier = { elevatedCtx() },
+                        policyStore = allowPolicy(),
+                        runner = runner,
+                        audit = audit,
+                        grantCheck = { validGrant() },
+                        bridgeGranted = { throw CancellationException("bridge cancelled") },
+                    )
+                    "grantCheck" -> ElevatedWiring.execute(
+                        argv = listOf("id"),
+                        reasonCode = "B3-T",
+                        confirmed = true,
+                        ctxSupplier = { elevatedCtx() },
+                        policyStore = allowPolicy(),
+                        runner = runner,
+                        audit = audit,
+                        grantCheck = { throw CancellationException("grant cancelled") },
+                        bridgeGranted = { true },
+                    )
+                    else -> ElevatedWiring.execute(
+                        argv = listOf("id"),
+                        reasonCode = "B3-T",
+                        confirmed = true,
+                        ctxSupplier = { elevatedCtx() },
+                        policyStore = cancellingPolicy,
+                        runner = runner,
+                        audit = audit,
+                        grantCheck = { validGrant() },
+                        bridgeGranted = { true },
+                    )
+                }
+                assertTrue("$name must throw CE", false)
+            } catch (_: CancellationException) {
+                // 預期：重拋，不轉 Denied。
+            }
+            assertEquals("$name must not record DENY", 0, audit.size())
+            assertEquals("$name must not spawn", 0, runner.calls)
+        }
+    }
+
+    @Test fun grantIdentityRotationVoidsOnReverify() = runBlocking {
+        // endpoint／revision 輪轉即作廢：前驗 Valid(A,1)、重驗 Valid(B,1) 即拒，零 spawn。
+        var calls = 0
+        val rotatingGrant: () -> ElevatedWiring.ElevatedGrant = {
+            calls++
+            if (calls == 1) validGrant("preset:openai", 3L) else validGrant("preset:other", 3L)
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = rotatingGrant,
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("grant identity changed"))
+        assertEquals(0, runner.calls)
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+    }
+
+    @Test fun grantRevisionRotationVoidsOnReverify() = runBlocking {
+        // revision 推進即作廢：前驗 (A,3)、重驗 (A,4) 即拒，零 spawn。
+        var calls = 0
+        val rotatingGrant: () -> ElevatedWiring.ElevatedGrant = {
+            calls++
+            if (calls == 1) validGrant(TEST_PROVIDER_ID, 3L) else validGrant(TEST_PROVIDER_ID, 4L)
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = rotatingGrant,
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("grant identity changed"))
+        assertEquals(0, runner.calls)
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+    }
+
+    @Test fun blankGrantProviderFailsClosed() = runBlocking {
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant("", TEST_REVISION) },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("malformed"))
+        assertEquals(0, runner.calls)
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
     }
 }

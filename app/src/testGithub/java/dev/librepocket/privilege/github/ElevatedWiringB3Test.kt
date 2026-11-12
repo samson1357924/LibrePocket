@@ -99,14 +99,26 @@ class ElevatedWiringB3Test {
         userSwitches = mapOf("privilege_bridge" to true),
     )
 
-    private fun grantValid(): () -> ElevatedWiring.ElevatedGrant =
-        { ElevatedWiring.ElevatedGrant.Valid }
+    private companion object {
+        const val TEST_PROVIDER_ID = "preset:openai"
+        const val TEST_REVISION = 3L
+    }
+
+    private fun grantValid(
+        providerId: String = TEST_PROVIDER_ID,
+        revision: Long = TEST_REVISION,
+    ): () -> ElevatedWiring.ElevatedGrant =
+        { ElevatedWiring.ElevatedGrant.Valid(providerId, revision) }
 
     private fun grantInvalid(reason: String): () -> ElevatedWiring.ElevatedGrant =
         { ElevatedWiring.ElevatedGrant.Invalid(reason) }
 
-    private fun mapGrant(check: GrantCheck): ElevatedWiring.ElevatedGrant = when (check) {
-        is GrantCheck.Valid -> ElevatedWiring.ElevatedGrant.Valid
+    private fun mapGrant(
+        check: GrantCheck,
+        providerId: String = TEST_PROVIDER_ID,
+        revision: Long = TEST_REVISION,
+    ): ElevatedWiring.ElevatedGrant = when (check) {
+        is GrantCheck.Valid -> ElevatedWiring.ElevatedGrant.Valid(providerId, revision)
         is GrantCheck.Invalid -> ElevatedWiring.ElevatedGrant.Invalid(check.reason)
     }
 
@@ -538,9 +550,11 @@ class ElevatedWiringB3Test {
     }
 
     @Test fun wiringGrantMapsGithubCheck() {
-        // 最小抽象對映：github GrantCheck ↔ 接線 ElevatedGrant（rebase 後以 B1 為準）。
+        // 最小抽象對映：github GrantCheck ↔ 接線 ElevatedGrant（rebase 後以 B1
+        // `PrivilegeGrantCheck.check()` 為準；Valid 攜帶 endpoint 身份＋revision，
+        // endpoint／revision 輪轉即作廢，見主側接線測試）。
         assertEquals(
-            ElevatedWiring.ElevatedGrant.Valid,
+            ElevatedWiring.ElevatedGrant.Valid(TEST_PROVIDER_ID, TEST_REVISION),
             mapGrant(GrantCheck.Valid),
         )
         val invalid = mapGrant(GrantCheck.Invalid(ShizukuGrantPolicy.REASON_NEVER_GRANTED))

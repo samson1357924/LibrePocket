@@ -269,7 +269,7 @@ class RootFramebufferCapture(
             // Stage 5 P2-1 fail-closed（zero spawn，zero unbounded hash）：
             // capture  helper 直调 runner.runBinary 前须先过 reason 长度门，
             // 否则 audit.record 在已 spawn 后抛 IllegalArgumentException（截图已执行、
-            // 零审计行）。超限即空 argv＋空 reason 记一笔 DENY（不哈希无界输入，
+            // 零审计行）。超限即空 argv＋空 reason 记一笔 DENY（不哈希無界输入，
             // 见 PrivilegeAuditLog 门），直接回 null 读数（呼叫方降级手动截图）。
             if (PrivilegeAuditLog.isReasonCodeTooLong(reasonCode)) {
                 audit.record(
@@ -380,7 +380,7 @@ class RootFramebufferCapture(
          * Stage 5 P2-1 fail-closed（zero spawn，zero unbounded hash）：
          * 入口先验 reason 长度（[PrivilegeAuditLog.isReasonCodeTooLong]，含孤立
          * 代理拒），超限即空 argv＋空 reason 记一笔 DENY 后回 null 读数，
-         * 不建 ElevatedRequest、不调 runBinary（zero spawn）、不哈希无界输入。
+         * 不建 ElevatedRequest、不调 runBinary（zero spawn）、不哈希無界输入。
          */
         fun screencapViaBinary(
             runner: BinaryElevatedRunner,

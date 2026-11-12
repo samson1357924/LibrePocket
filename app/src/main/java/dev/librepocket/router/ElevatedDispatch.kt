@@ -73,7 +73,7 @@ object ElevatedDispatch {
             "ElevatedDispatch only serves ${PrivilegeGate.ELEVATED_TOOL}, not ${tool.name}"
         }
         // P2-2 先行：reason 只读（String 不可变，零 worker），超限即拒，
-        // 不碰 argv、不哈希无界输入。
+        // 不碰 argv、不哈希無界输入。
         if (PrivilegeAuditLog.isReasonCodeTooLong(request.reasonCode)) {
             val tooLong = ShellResult.Denied(
                 ShellDeny.BLACKLISTED,

@@ -21,6 +21,11 @@ package dev.librepocket.shell
  * - `MainScreen.onRevokePrivilege` 經此持久版收回（`scope` 傳跨域 clear），
  *   B1 未合併前以記憶體 Store 佔位、PR 描述註明依賴 #166（rebase 後以 B1
  *   持久版為準）。
+ *
+ * Rebase 註記（#166，寫進 PR 描述用）：rebase 時 B1 Store 實現
+ * [PrivilegeRevokeStore] 介面，並刪除本檔的重複 overload／佔位
+ * （無參 `revoke()` 僅供舊呼叫相容，屆時改走持久版；`InMemoryPrivilegeRevokeStore`
+ * 僅 JVM 接線佔位，屆時刪、用 B1 持久版替換）。
  */
 class PrivilegeBridgeState(
     val audit: PrivilegeAuditLog = PrivilegeAuditLog(),

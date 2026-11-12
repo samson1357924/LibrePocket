@@ -104,7 +104,7 @@ EXPECTED_WORKFLOW_SHA256 = {
     ),
     "pr-check.yml": (
     "pr-check.yml": (
-        "a133c5199b0f1c400a9716b8236accd06939bd91df1c2a565b85b81960016fd6"
+        "736fe1542df26a14750175191e48e339588c075cc9d2a57df7859bad4743793b"
     ),
     ),
     "release.yml": (
@@ -229,6 +229,9 @@ EXPECTED_POLICY_FILTER_PATHS = frozenset(
         "gradle.properties",
         "gradlew",
         "gradlew.bat",
+        "app/build.gradle.kts",
+        "build.gradle.kts",
+        "settings.gradle.kts",
         "scripts/play_policy_check.sh",
         "scripts/apk_policy_inspect.py",
         "scripts/backup_rules_check.py",

@@ -229,7 +229,7 @@ class ShellElevatedPhaseNTest {
             assertEquals(0, spawns.get())
             assertEquals(1, audit.size())
             assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
-            // 审计未哈希无界输入：记空串标记（与直接哈希巨串不等）。
+            // 审计未哈希無界输入：记空串标记（与直接哈希巨串不等）。
             val row = audit.snapshot().single()
             assertEquals(PrivilegeAuditLog.sha256Hex(""), row.reasonHash)
             assertFalse(row.reasonHash == PrivilegeAuditLog.sha256Hex(huge))

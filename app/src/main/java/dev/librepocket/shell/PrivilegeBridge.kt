@@ -48,7 +48,7 @@ data class ElevatedRequest(
  * daemon，不擋 JVM 退出）。阻塞於不可中斷操作（吞中斷的自訂 iterator）即永久
  * 持一份 argv 引用，但全域至多 [ElevatedSnapshotPool.POOL_SIZE] 份（池满后新
  * caller 即时 fail-closed，不再起 worker）；供给阻塞 list 的本来就是呼叫方
- * 自身，属自限 DoS，不放大为跨呼叫无界（旧“每冻结恰一 worker”已消除）。
+ * 自身，属自限 DoS，不放大为跨呼叫無界（旧“每冻结恰一 worker”已消除）。
  * github 侧 runner 内快照另经 `awaitPreSpawn` 同 deadline 监督
  * （残留进 slot／breaker 终审，见 runner KDoc），本门只覆 main 侧入口。
  */

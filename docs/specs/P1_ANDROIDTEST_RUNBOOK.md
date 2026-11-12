@@ -17,7 +17,7 @@
 
 The dialog and policy-to-provider gate in `PlayPermissionPolicyInstrumentedTest` are test fixtures, not production UI or a production consent gate. The test does not exercise setup/dispatch ASK consent behavior (issue #13); this change does not fix or claim that behavior. Source presence is not evidence that a test passed on a physical device or emulator.
 
-For relevant code/policy changes, the regular pull-request workflow gates unit/Robolectric, lint, debug assembly, and artifact policy checks; docs-only changes can skip those jobs under its path filter. That workflow does not run this AndroidTest set. The separate nightly/instrumented workflow is configured to run API 33 and API 34 across Play, Foss, and Github variants. Pull-request runs remain gated by the `run-instrumented` label and are triggered when the label is applied, a commit is synchronized, or a PR is opened/reopened. This is configured coverage only, not evidence of a passing device run.
+For relevant code/policy changes, the regular pull-request workflow gates unit/Robolectric, lint, debug assembly, and artifact policy checks; docs-only changes can skip those jobs under its path filter. That workflow does not run this AndroidTest set. The separate nightly/instrumented workflow is configured to run API 33, 34, and 36 across Play, Foss, and Github variants. Pull-request runs remain gated by the `run-instrumented` label and are triggered when the label is applied, a commit is synchronized, or a PR is opened/reopened. This is configured coverage only, not evidence of a passing device run.
 
 ## Example execution
 
@@ -29,8 +29,8 @@ export ANDROID_HOME="$HOME/Android/Sdk"
 ./gradlew :app:connectedPlayDebugAndroidTest --max-workers=1 --no-daemon
 ```
 
-This command runs only the Play variant on the attached device. The nightly workflow configuration expands the test task across all three flavors and API 33/34; only attached CI results tied to a source SHA establish which combinations actually ran and passed.
+This command runs only the Play variant on the attached device. The nightly workflow configuration expands the test task across all three flavors and API 33, 34, and 36; only attached CI results tied to a source SHA establish which combinations actually ran and passed.
 
 ## Evidence required for a device claim
 
-Record the tested SHA, exact Gradle task, device/emulator model, Android API, JDK, result and report location. State which variants were not run. The historical API 33/34/36/37 matrix language elsewhere in the P1 design spec is a target proposal, not current CI configuration or proof of execution. See [Testing](../TESTING.md).
+Record the tested SHA, exact Gradle task, device/emulator model, Android API, JDK, result and report location. State which variants were not run. While API 33, 34, and 36 are wired across all three flavors in `.github/workflows/nightly-instrumented.yml`, API 35 and API 37 remain unconfigured/proposed, and workflow configuration is not proof of execution; historical API 37 matrix language elsewhere in the P1 design spec is a target proposal only. See [Testing](../TESTING.md).

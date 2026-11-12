@@ -130,8 +130,11 @@ object NetworkPolicy {
       if (addrs.isEmpty()) null else addrs
     } catch (e: Exception) {
       // resolver 任何例外（含 RuntimeException／IO）一律 fail-closed；
-      // 唯協程取消必須透傳，不可吞沒（否則結構化併發失效）。
+      // 唯協程取消與中斷必須透傳，不可吞沒（否則結構化併發與 timeout 失效）。
       if (e is CancellationException) throw e
+      if (e is InterruptedException || e.cause is InterruptedException || Thread.currentThread().isInterrupted) {
+        throw CancellationException("resolver interrupted", e)
+      }
       null
     }
   }

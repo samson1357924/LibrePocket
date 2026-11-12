@@ -475,6 +475,50 @@ class WebFetchTest {
         }
     }
 
+    @Test fun timeoutZeroClampsToOneMillisecondAndTimesOut() {
+        // timeoutMs = 0 不得關閉 OkHttp 超時（OkHttp 0 表「不超時」），鉗制至 1ms 即時超時。
+        val server = MockWebServer()
+        try {
+            server.enqueue(
+                MockResponse().setResponseCode(200).setBody("late").setBodyDelay(3, TimeUnit.SECONDS),
+            )
+            val outcome = WebFetch.fetch(
+                server.url("/slow").toString(),
+                timeoutMs = 0L,
+                optIn = cleartextPrivate,
+                resolver = loopbackDns(),
+            )
+            assertTrue(outcome is WebFetch.FetchOutcome.Failed)
+            assertEquals("TIMEOUT", (outcome as WebFetch.FetchOutcome.Failed).detail)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test fun customClientWithZeroTimeoutIsOverriddenBySafeTimeout() {
+        // 呼叫端傳入 callTimeout=0 的 client，safeTimeout 仍強制覆寫，不得沿用無界超時。
+        val server = MockWebServer()
+        try {
+            val unboundedClient = OkHttpClient.Builder()
+                .callTimeout(0, TimeUnit.MILLISECONDS)
+                .build()
+            server.enqueue(
+                MockResponse().setResponseCode(200).setBody("late").setBodyDelay(3, TimeUnit.SECONDS),
+            )
+            val outcome = WebFetch.fetch(
+                server.url("/slow").toString(),
+                client = unboundedClient,
+                timeoutMs = 500L,
+                optIn = cleartextPrivate,
+                resolver = loopbackDns(),
+            )
+            assertTrue(outcome is WebFetch.FetchOutcome.Failed)
+            assertEquals("TIMEOUT", (outcome as WebFetch.FetchOutcome.Failed).detail)
+        } finally {
+            server.shutdown()
+        }
+    }
+
     @Test fun cancelledFetchFailsWithoutPartialOk() {
         // 取消語義：測試執行緒 cancel 在途 Call → Failed（絕不回傳部分 Ok；
         // WebFetch 無 cache／無第二傳輸可寫——`tapping` 本就無 cache 屬空斷言，

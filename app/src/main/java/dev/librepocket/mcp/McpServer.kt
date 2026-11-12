@@ -7,7 +7,13 @@ import dev.librepocket.policy.NetworkEvaluation
 import dev.librepocket.policy.NetworkOptInStore
 import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * D03 單伺服器客戶端（多伺服器 = 每個配置一個 [McpServer] 實例）。
@@ -98,7 +104,52 @@ class McpServer(
      * 快照（預設 deny-all；測試直用）。
      */
     private val networkOptInStore: NetworkOptInStore? = null,
+    /**
+     * WARN-04：DNS preflight 專用有界執行器（避免阻塞共用 Dispatchers.IO）。
+     * 預設為固定大小執行器；測試可注入自訂執行器以驗證 timeout 行為。
+     */
+    private val preflightExecutor: ExecutorService = defaultPreflightExecutor,
 ) {
+    companion object {
+        private val preflightThreadCount = AtomicInteger(1)
+        /** WARN-04：MCP DNS preflight 專用有界執行器（避免阻塞共用 IO dispatcher）。 */
+        internal val defaultPreflightExecutor: ExecutorService =
+            Executors.newFixedThreadPool(4) { r ->
+                Thread(r, "mcp-preflight-${preflightThreadCount.getAndIncrement()}").apply { isDaemon = true }
+            }
+    }
+
+    private val preflightDispatcher = preflightExecutor.asCoroutineDispatcher()
+
+    private sealed interface PreflightResult {
+        data class Allowed(val eval: NetworkEvaluation) : PreflightResult
+        data object TimedOut : PreflightResult
+        data class Blocked(val denyCode: NetworkDenyCode) : PreflightResult
+    }
+
+    /**
+     * WARN-04：DNS preflight 納入有界 deadline——在專用執行器上以
+     * withTimeoutOrNull + runInterruptible 執行，懸掛解析會被中斷，
+     * 且協程暫停而非阻塞調用方執行緒（防 ANR 與 Dispatchers.IO 耗盡）。
+     */
+    private suspend fun preflightPolicy(
+        endpoint: String,
+        optIn: EndpointNetworkOptIn,
+        timeoutMs: Long,
+    ): PreflightResult {
+        val preflightBudget = timeoutMs.coerceIn(1L, McpTimeouts.MAX_MS)
+        return try {
+            val eval = withTimeoutOrNull(preflightBudget) {
+                runInterruptible(preflightDispatcher) {
+                    requireMcpNetworkPolicyAllowed(endpoint, optIn, config.networkResolver)
+                }
+            }
+            if (eval == null) PreflightResult.TimedOut
+            else PreflightResult.Allowed(eval)
+        } catch (e: McpNetworkPolicyBlocked) {
+            PreflightResult.Blocked(e.denyCode)
+        }
+    }
     fun config(): McpServerConfig = config
     fun breaker(): McpCircuitBreaker = breaker
 
@@ -154,11 +205,15 @@ class McpServer(
         val optIn = effectiveOptIn()
         // 單次解析接線：預驗的放行決策經 preverifiedEval 傳入 transport
         //（傳輸層只做一致性檢查，零二次 DNS，關 skew 窗；見 takePreverifiedEval）。
-        val preEval: NetworkEvaluation
-        try {
-            preEval = requireMcpNetworkPolicyAllowed(endpoint, optIn, config.networkResolver)
-        } catch (e: McpNetworkPolicyBlocked) {
-            return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, elapsedMs(start), e.denyCode.name)
+        // WARN-04：DNS preflight 納入有界 deadline（專用執行器 + runInterruptible）。
+        val preEval = when (val res = preflightPolicy(endpoint, optIn, timeoutMs)) {
+            is PreflightResult.TimedOut -> {
+                return McpListResult(config.id, emptyList(), McpStatus.TIMEOUT, elapsedMs(start))
+            }
+            is PreflightResult.Blocked -> {
+                return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, elapsedMs(start), res.denyCode.name)
+            }
+            is PreflightResult.Allowed -> res.eval
         }
         val key = try {
             keyVault.getKey(config.keyId)
@@ -371,11 +426,15 @@ class McpServer(
         // 阻擋碼記入稽核（`denyCode` 鍵，靜態碼名；位址／URL 永不進稽核面）。
         val optIn = effectiveOptIn()
         // 單次解析接線（同 listTools）：預驗決策傳入 transport，零二次 DNS。
-        val preEval: NetworkEvaluation
-        try {
-            preEval = requireMcpNetworkPolicyAllowed(endpoint, optIn, config.networkResolver)
-        } catch (e: McpNetworkPolicyBlocked) {
-            return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, elapsedMs(start), denyCode = e.denyCode.name)
+        // WARN-04：DNS preflight 納入有界 deadline（專用執行器 + runInterruptible）。
+        val preEval = when (val res = preflightPolicy(endpoint, optIn, timeoutMs)) {
+            is PreflightResult.TimedOut -> {
+                return McpCallResult(config.id, toolName, McpStatus.TIMEOUT, elapsedMs(start))
+            }
+            is PreflightResult.Blocked -> {
+                return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, elapsedMs(start), denyCode = res.denyCode.name)
+            }
+            is PreflightResult.Allowed -> res.eval
         }
         val key = try {
             keyVault.getKey(config.keyId)

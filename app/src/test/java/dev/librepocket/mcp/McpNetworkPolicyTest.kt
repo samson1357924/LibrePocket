@@ -1,15 +1,20 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import dev.librepocket.policy.AddressClass
 import dev.librepocket.policy.EndpointNetworkOptIn
 import dev.librepocket.policy.HostResolver
 import dev.librepocket.policy.NetworkDenyCode
 import dev.librepocket.policy.NetworkEgressPolicy
+import dev.librepocket.policy.NetworkEvaluation
 import dev.librepocket.policy.NetworkOptInStore
 import dev.librepocket.policy.PinnedNetworkDns
 import java.net.InetAddress
 import java.net.UnknownHostException
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.mockwebserver.MockResponse
@@ -609,5 +614,140 @@ class McpNetworkPolicyTest {
         assertNotNull(shapeGot)
         assertEquals(McpStatus.PROTOCOL, shapeGot!!.status)
         assertEquals(null, shapeGot.auditMap()["denyCode"])
+    }
+
+    // ---- WARN-03 / BLOCK-02 / WARN-04 強化測試 ----
+
+    @Test fun takePreverifiedEvalCanonicalUrlMatchesMixedCaseAndDefaultPort() {
+        val canonical = "https://example.com/mcp"
+        val preverified = NetworkEvaluation.allowed(
+            AddressClass.PUBLIC,
+            listOf(addr("203.0.113.10")),
+            canonical,
+        )
+        // url 大寫 host + 顯式 443 預設埠：正規化後與 preverified.normalizedUrl 一致，
+        // realResolver 不應被呼叫（單次解析保證）。
+        val realResolver = HostResolver { throw AssertionError("real resolver must not be called") }
+        val eval = takePreverifiedEval(
+            url = "https://EXAMPLE.COM:443/mcp",
+            preverified = preverified,
+            optIn = EndpointNetworkOptIn(),
+            resolver = realResolver,
+        )
+        assertTrue(eval.allowed)
+        assertEquals(listOf(addr("203.0.113.10")), eval.resolvedAddresses)
+    }
+
+    @Test fun takePreverifiedEvalLiteralIpMismatchFallsBackToRealResolver() {
+        // url 為字面 IP，但 preverifiedEval 釘住不同 IP（偽造 retarget 企圖）：
+        // 必須識別 mismatch 並回落 realResolver。
+        val forged = NetworkEvaluation.allowed(
+            AddressClass.LOOPBACK,
+            listOf(addr("127.0.0.2")),
+            "http://127.0.0.1:8080/mcp",
+        )
+        val loopbackOptIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
+        val realResolver = fakeDns("127.0.0.1" to listOf("127.0.0.1"))
+        val eval = takePreverifiedEval(
+            url = "http://127.0.0.1:8080/mcp",
+            preverified = forged,
+            optIn = loopbackOptIn,
+            resolver = realResolver,
+        )
+        assertTrue(eval.allowed)
+        assertEquals("必須回落真解析的字面 IP，不得沿用偽造的 127.0.0.2", listOf(addr("127.0.0.1")), eval.resolvedAddresses)
+    }
+
+    @Test fun takePreverifiedEvalForgedPrivateAddressUnderStrictOptInFallsBack() {
+        // 偽造 preverifiedEval 宣稱私有 IP 放行，但當前 optIn 為預設 HTTPS_ONLY：
+        // 重跑 pinned resolver 失敗後回落 realResolver，且 realResolver 答案同為私有時被拒。
+        val forged = NetworkEvaluation.allowed(
+            AddressClass.PRIVATE,
+            listOf(addr("10.0.0.1")),
+            "https://internal.example.com/mcp",
+        )
+        val realResolver = fakeDns("internal.example.com" to listOf("10.0.0.1"))
+        try {
+            takePreverifiedEval(
+                url = "https://internal.example.com/mcp",
+                preverified = forged,
+                optIn = EndpointNetworkOptIn(NetworkEgressPolicy.HTTPS_ONLY),
+                resolver = realResolver,
+            )
+            fail("預設 opt-in 必須阻擋私有 IP，不得盲信 preverified")
+        } catch (e: McpNetworkPolicyBlocked) {
+            assertEquals(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, e.denyCode)
+        }
+    }
+
+    @Test fun preflightTimeoutReturnsTimeoutStatusWithoutBreaker() = runBlocking {
+        // WARN-04：DNS preflight 超時立即回 TIMEOUT，零 vault、零熔斷。
+        val vault = CountingVault()
+        val breaker = McpCircuitBreaker()
+        val hangingResolver = HostResolver {
+            Thread.sleep(5_000)
+            listOf(addr("203.0.113.1"))
+        }
+        val server = McpServer(
+            config = McpServerConfig(
+                id = "s-slow",
+                baseUrl = "https://slow.example.com/mcp",
+                networkResolver = hangingResolver,
+            ),
+            keyVault = vault,
+            transport = McpTransport(),
+            breaker = breaker,
+        )
+        // 傳入短超時 100ms：preflight 立即超時，不卡住線程、零 vault、零熔斷。
+        val got = server.listTools(timeoutMs = 100L)
+        assertEquals(McpStatus.TIMEOUT, got.status)
+        assertEquals(0, vault.reads.get())
+        assertEquals("preflight timeout 不得計入熔斷失敗", 0, breaker.failureCount())
+
+        val callGot = server.callTool("toolA", "{}", timeoutMs = 100L)
+        assertEquals(McpStatus.TIMEOUT, callGot.status)
+        assertEquals(0, vault.reads.get())
+        assertEquals("preflight timeout 不得計入熔斷失敗", 0, breaker.failureCount())
+    }
+
+    @Test fun preflightCancelledByCallingCoroutineCancelsPromptly() = runBlocking {
+        // 協程取消時，runInterruptible 應立即中斷 worker thread，不得等待 10s DNS。
+        val hangingResolver = HostResolver {
+            Thread.sleep(10_000)
+            listOf(addr("203.0.113.1"))
+        }
+        val server = McpServer(
+            config = McpServerConfig(
+                id = "s-slow-cancel",
+                baseUrl = "https://slow.example.com/mcp",
+                networkResolver = hangingResolver,
+            ),
+            keyVault = CountingVault(),
+        )
+        val job = launch { server.listTools(timeoutMs = 10_000L) }
+        delay(50)
+        val start = System.currentTimeMillis()
+        job.cancelAndJoin()
+        val elapsed = System.currentTimeMillis() - start
+        assertTrue("協程取消應立即中斷返回，不得等待 10s DNS，實際: ${elapsed}ms", elapsed < 2_000L)
+    }
+
+    @Test fun takePreverifiedEvalWithUrlMismatchFallsBackToRealResolver() {
+        val canonical = "https://example.com/mcp"
+        val preverified = NetworkEvaluation.allowed(
+            AddressClass.PUBLIC,
+            listOf(addr("203.0.113.10")),
+            canonical,
+        )
+        // 傳入不同路徑的 URL，takePreverifiedEval 必須拒絕沿用並回落 realResolver。
+        val realResolver = fakeDns("example.com" to listOf("203.0.113.99"))
+        val eval = takePreverifiedEval(
+            url = "https://example.com/other-endpoint",
+            preverified = preverified,
+            optIn = EndpointNetworkOptIn(),
+            resolver = realResolver,
+        )
+        assertTrue(eval.allowed)
+        assertEquals("URL 不符必須回落真解析答案", listOf(addr("203.0.113.99")), eval.resolvedAddresses)
     }
 }

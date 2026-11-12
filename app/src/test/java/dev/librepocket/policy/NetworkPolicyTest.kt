@@ -511,4 +511,20 @@ class NetworkPolicyTest {
   @Test fun ftpSchemeUnsupported() {
     assertDenied(NetworkDenyCode.UNSUPPORTED_SCHEME, NetworkPolicy.evaluateUrl("ftp://example.com/file", resolver = neverResolve))
   }
+
+  @Test fun httpUnderNonCleartextOptInDoesNotResolveDns() {
+    // WARN-05：預設非明文 opt-in 下，http 請求在 DNS 前即短路拒絕（零 DNS 洩漏）。
+    assertDenied(
+      NetworkDenyCode.CLEARTEXT_NOT_PERMITTED,
+      NetworkPolicy.evaluateUrl("http://example.com/", optIn = EndpointNetworkOptIn(), resolver = neverResolve),
+    )
+  }
+
+  @Test fun invalidIpv4LiteralDoesNotTouchDns() {
+    // IPv4 形狀但數值超範圍字面：resolveHost 直接拒絕，不當 DNS 查詢洩漏。
+    assertDenied(
+      NetworkDenyCode.INVALID_HOST,
+      NetworkPolicy.evaluateUrl("https://999.1.1.1/", resolver = neverResolve),
+    )
+  }
 }

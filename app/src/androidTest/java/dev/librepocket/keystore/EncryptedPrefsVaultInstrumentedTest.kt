@@ -19,7 +19,7 @@ import org.junit.runner.RunWith
  * EncryptedSharedPreferences); the Robolectric counterpart
  * (`EncryptedPrefsVaultTest`) only covers key-format / validation logic.
  *
- * Requires a device or emulator (API 33/37 matrix); see
+ * Requires a device or emulator (API 33, 34, and 36 configured; API 37 proposed); see
  * `docs/specs/P1_ANDROIDTEST_RUNBOOK.md`. Never touches the network.
  */
 @RunWith(AndroidJUnit4::class)

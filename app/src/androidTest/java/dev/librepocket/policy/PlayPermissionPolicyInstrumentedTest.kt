@@ -32,8 +32,8 @@ import org.junit.runner.RunWith
  * DENY and ASK return before transport. Setup/dispatch ASK behavior (issue #13)
  * remains outside this scope and is not claimed as fixed here.
  *
- * The nightly workflow is configured for API 33/34 across Play, Foss, and
- * Github. That configuration is not evidence of a device run; see
+ * The nightly workflow is configured for API 33, 34, and 36 across Play, Foss,
+ * and Github. That configuration is not evidence of a device run; see
  * `docs/specs/P1_ANDROIDTEST_RUNBOOK.md`.
  */
 @RunWith(AndroidJUnit4::class)
@@ -82,7 +82,7 @@ class PlayPermissionPolicyInstrumentedTest {
                     // (AlertController ButtonHandler); the dismissed state is
                     // therefore asserted in the NEXT onActivity block, assumed
                     // to run after the queued dismiss (same-Looper FIFO).
-                    // Assumption only — device-run pending on API 33/34.
+                    // Assumption only — device-run verification pending across configured API 33, 34, and 36 lanes.
                     created.getButton(AlertDialog.BUTTON_NEGATIVE).performClick()
                 }
                 scenario.onActivity {

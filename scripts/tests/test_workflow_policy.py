@@ -1312,7 +1312,7 @@ jobs:
     def test_nightly_api_matrix_is_pinned(self) -> None:
         self._write(
             "nightly-instrumented.yml",
-            NIGHTLY.replace("api-level: [33, 34]", "api-level: [33]", 1),
+            NIGHTLY.replace("api-level: [33, 34, 36]", "api-level: [33]", 1),
         )
         self._assert_rejected("matrix api-level must be exactly")
 
@@ -2956,6 +2956,18 @@ runs:
                 "        arch: [x86_64]\n",
                 "        arch: [x86_64]\n"
                 "        exclude:\n          - flavor: Play\n",
+                1,
+            ),
+        )
+        self._assert_rejected("instrumented-test matrix keys must be exactly")
+
+    def test_nightly_matrix_include_is_rejected(self) -> None:
+        self._write(
+            "nightly-instrumented.yml",
+            NIGHTLY.replace(
+                "        arch: [x86_64]\n",
+                "        arch: [x86_64]\n"
+                "        include:\n          - flavor: Play\n",
                 1,
             ),
         )

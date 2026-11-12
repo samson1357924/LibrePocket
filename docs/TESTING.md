@@ -233,7 +233,7 @@ closed with `file:line` diagnostics on these pinned invariants:
   `nightly-unit-stress`/`instrumented-test` jobs; it pins the stress
   if/timeout constraints, job keys, env `NIGHTLY_STRESS=1` and exact full-stress Gradle command
   with no `continue-on-error`, plus the instrumented label gate, exact job
-  keys, `fail-fast: false`, matrix `api-level` `[33, 34]`, flavors
+  keys, `fail-fast: false`, matrix `api-level` `[33, 34, 36]`, flavors
   `[Play, Foss, Github]`, target/arch and the exact emulator
   connectedAndroidTest command;
 - `security-audit.yml` pins `on:` exactly (push/pull_request on `main`, the
@@ -347,8 +347,8 @@ Robolectric SDK pin (Current): JVM unit tests run with `sdk=33` pinned in
 `app/src/test/resources/robolectric.properties`, while `targetSdk` is 36
 (see [Build Environment](ENV.md)). A green run on API 33 does **not** imply
 API 34–36 behavior is verified; version-sensitive Android API behavior needs
-separate higher-API device evidence. An API 36 Foss emulator lane is configured
-outside the PR gate; its execution evidence is tracked below. The pin
+separate higher-API device evidence. API 36 emulator lanes across Play, Foss, and
+Github are configured outside the PR gate; their execution evidence is tracked below. The pin
 itself and any `@Config` SDK matrix expansion are out of scope for the
 current deflake work — do not change them here.
 
@@ -1042,16 +1042,19 @@ does not enter `pr-gate` merge evaluation). The `nightly-unit-stress` job
 `NIGHTLY_STRESS=1`) runs on schedule / `workflow_dispatch` only
 (`if: github.event_name != 'pull_request'`), never on PR; JUnit XML retained
 14 days, non-gating (not in `pr-check.yml` `pr-gate`). The configured emulator
-matrix runs API levels 33 and 34 across the Play/Foss/Github flavors, plus a
-targetSdk-level API 36 Foss lane (`include:` with `api-level: 36`,
-`flavor: Foss`, `target: google_apis`, `arch: x86_64`). A single Foss lane
-limits emulator cost while sampling target-level behavior; it does not verify
-the other flavors on API 36. It runs the same app-module connected instrumentation
-task, `connectedFossDebugAndroidTest`, as the API 33 and 34 Foss lanes, with no
-reduced test selection configured. On 2026-10-29,
+matrix runs API levels 33, 34 and 36 across the Play/Foss/Github flavors
+(9 lanes; `api-level: [33, 34, 36]`, `target: google_apis`, `arch: x86_64`).
+API 36 equals `targetSdk`, so target-level behavior (permission model,
+background restrictions, edge-to-edge) is sampled on every flavor rather than
+Foss-only: the Play/Github-only code paths (GMS/ML Kit, Azure Speech, Shizuku)
+are the ones most likely to diverge at the target level. Cost stays bounded
+because these lanes run on the nightly schedule / `workflow_dispatch` (PR runs
+still need the `run-instrumented` label) with `fail-fast: false` in parallel.
+Every lane runs the same app-module connected instrumentation task,
+`connected<Flavor>DebugAndroidTest`, with no reduced test selection configured. On 2026-10-29,
 [dispatch 40831562611](https://github.com/samson1357924/LibrePocket/actions/runs/40831562611)
 completed successfully at SHA `f3c363384710e3e62ab3d3dbc3cd17e322fa59d8`;
-all seven instrumented jobs and the nightly stress job succeeded. The
+all seven instrumented jobs (the 7-lane matrix configured at that SHA) and the nightly stress job succeeded. The
 [Foss API 36 job](https://github.com/samson1357924/LibrePocket/actions/runs/40831562611/job/123306736606)
 succeeded; its downloaded [HTML report artifact](https://github.com/samson1357924/LibrePocket/actions/runs/40831562611/artifacts/12879331442)
 reported 14 tests, 0 failures and 0 skipped: 4 vault, 9 permission-policy,
@@ -1060,7 +1063,7 @@ is evidence for that run and SHA, not for subsequent changes or other devices.
 
 While `minSdk` is 33, `targetSdk` is 36, and `compileSdk` is 37 (`app/build.gradle.kts`),
 several open device testing gaps remain:
-- Matrix coverage gaps: API 35 and API 37 emulator lanes are not configured in this workflow; API 36 is Foss-only.
+- Matrix coverage gaps: API 35 and API 37 emulator lanes are not configured in this workflow; API 36 now rides all three flavors.
 - Journey and lifecycle gaps: Absence of Compose UI end-to-end journey tests and activity process-recreation / configuration-change restoration device tests in `app/src/androidTest` (current instrumented tests cover only Room concurrency, `EncryptedPrefsVault`, and Play permission policy test fixtures).
 
 The JVM/Robolectric `app/src/test/java/dev/librepocket/session/SessionListTest.kt`
@@ -1070,6 +1073,22 @@ that assertion, not evidence of scheduler-dependent ordering. Other sleeps
 must be evaluated in context; this is not an androidTest sleep finding.
 Additional matrix lanes are Proposed until wired; any configured lane still
 needs run-specific evidence before its execution is claimed.
+
+Device smoke minimal set (Proposed scope, not a gate): when a device pass is
+claimed for a SHA, the minimum is the two API boundaries crossed with the
+three flavors' key differences, using the same `connected<Flavor>DebugAndroidTest`
+selection as the matrix (no reduced selection):
+- API 33 (`minSdk` floor) plus API 36 (`targetSdk` behavior) — API 34 stays
+  compat sampling between the boundaries, not a third required point;
+- Play lane is evidence for the store-safe face (permission blacklist /
+  service scan fixtures), Foss lane for the OSS-only face (proprietary stacks
+  absent), Github lane for the full-capability face (proprietary stacks present
+  and gated) — a lane only covers the paths its tests execute; untested paths
+  (journey/lifecycle, see gaps above) remain unproven on every API.
+Until this set is wired as a required check with per-SHA retained reports, any
+device pass claim must still name its exact API/flavor/device coverage and
+report artifact (see the 2026-10-29 run above); a missing lane is missing
+evidence, never a pass.
 
 Instrumented tests are a separate device-dependent tier. The existing [P1 androidTest runbook](specs/P1_ANDROIDTEST_RUNBOOK.md) lists test classes and sample commands, but its device matrix and prior status notes are not current CI evidence. Before treating a device matrix as a merge/release gate, maintainers must name the required API/flavor/device coverage, run it, and retain results tied to the tested SHA. Do not report a device pass when no device was used.
 

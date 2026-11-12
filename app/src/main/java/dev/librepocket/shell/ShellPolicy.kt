@@ -384,7 +384,9 @@ object ShellPolicy {
         "-n", "--lines", "--bytes",
         "-c", "--format", "--printf",
         "-e", "--regexp",
-        "-d", "--max-depth",
+        "-d", "--max-depth", "--date",
+        "-t", "--type", "-x", "--exclude-type",
+        "-B", "--block-size", "--output",
         "-name", "-iname", "-wholename", "-iwholename",
         "-type", "-maxdepth", "-mindepth", "-mmin", "-mtime",
         "-size", "-perm", "-user", "-group",
@@ -399,11 +401,32 @@ object ShellPolicy {
      * `-d` 在 grep 仍是取值（`--directories=read|skip|recurse`），維持豁免；
      * `-e`／`--regexp` 同為 pattern 值，維持豁免；其餘旗標無 grep 碰撞。
      */
-    private fun isValueTakingFlag(base: String, flag: String?): Boolean {
+    /**
+     * base-aware 取值旗標判定（Stage P1-1 修正）：VALUE_TAKING_FLAGS 是跨 binary 的
+     * 候選集合，但 `-c`/`-n`/`--bytes`/`--lines` 在 wc/du/ls/sort 等 binary 上
+     * 是布林旗標（選擇計數／排序），並非取值；只在 head/tail/stat/cut/date/df 等
+     * 真正取值的 binary 上視為取值。grep 的 `-n`/`-c` 已在原邏輯排除。
+     * `prevWasValue` 由呼叫端控制：若上一 token 是「已被消費的資料值」（即使字串等於
+     * 某旗標），本函數仍回 false，避免已消費 token 重新參與旗標分類（P1-2）。
+     */
+    private fun isValueTakingFlag(base: String, flag: String?, prevWasValue: Boolean = false): Boolean {
+        if (prevWasValue) return false
         if (flag == null || flag !in VALUE_TAKING_FLAGS) return false
-        // grep booleans, not value-takers (GNU grep --line-number/--count)
-        if (base == "grep" && (flag == "-n" || flag == "-c")) return false
-        return true
+        // Per-binary typed classification (P1-1): default false for unknown binaries
+        // so boolean/unknown flags do not consume the following token (which would
+        // skip checkBareFileOperand and allow bare filenames to bypass denial).
+        val allowed: Set<String> = when (base) {
+            "head", "tail" -> setOf("-n", "--lines", "-c", "--bytes")
+            "stat" -> setOf("-c", "--format", "--printf")
+            "grep" -> setOf("-e", "--regexp", "-d", "--directories", "--devices")
+            "find" -> setOf("-name", "-iname", "-wholename", "-iwholename", "-type",
+                "-maxdepth", "-mindepth", "-mmin", "-mtime", "-size", "-perm", "-user", "-group")
+            "du" -> setOf("-d", "--max-depth", "-B", "--block-size")
+            "df" -> setOf("-t", "--type", "-x", "--exclude-type", "-B", "--block-size", "--output")
+            "date" -> setOf("-d", "--date")
+            else -> emptySet()
+        }
+        return flag in allowed
     }
 
     /**
@@ -413,7 +436,8 @@ object ShellPolicy {
     private val NON_PATH_OPT_KEYS: Set<String> = setOf(
         "--color", "--sort", "--format", "--printf", "--block-size",
         "--time-style", "--lines", "--bytes", "--max-count", "--max-depth",
-        "--regexp", "--include", "--exclude", "--exclude-dir",
+        "--type", "--exclude-type", "--output",
+        "--regexp", "--directories", "--devices", "--include", "--exclude", "--exclude-dir",
         // Stage G：grep 列舉值（非檔名）：`--directories=read|recurse|skip`
         // （recurse ≈ -r，不跟隨 symlink，安全放行）、`--devices=read|skip`。
         "--directories", "--devices",
@@ -1568,6 +1592,37 @@ object ShellPolicy {
     }
 
     /**
+     * P2 修正：df 的 scoped path 判定必須排除 `-t/--type`、`-x/--exclude-type`、
+     * `-B/--block-size` 等旗標的值，避免 `df -x /scope` 把 TYPE 值誤當 FILE operand。
+     * 只有真正的 positional（含 `--` 後）絕對路徑才算 scoped path。
+     */
+    private fun dfHasScopedPath(args: List<String>): Boolean {
+        val valueFlags = setOf("-t", "--type", "-x", "--exclude-type", "-B", "--block-size", "--output")
+        var end = false
+        var skipNext = false
+        for (arg in args) {
+            if (skipNext) { skipNext = false; continue }
+            if (!end && arg == "--") { end = true; continue }
+            if (end) {
+                if (arg.startsWith("/")) return true
+                continue
+            }
+            if (arg.startsWith("--")) {
+                val key = arg.substringBefore("=")
+                if (key in valueFlags && !arg.contains("=")) skipNext = true
+                continue
+            }
+            if (arg.startsWith("-") && arg != "-") {
+                if (arg == "-t" || arg == "-x" || arg == "-B") skipNext = true
+                // attached form -tTYPE / -xTYPE：值已附著，不需 skip
+                continue
+            }
+            if (arg.startsWith("/")) return true
+        }
+        return false
+    }
+
+    /**
      * argv 參數是否為相對路徑（P0 fail-closed）。
      * - 絕對路徑（`/...`、長選項 `--opt=/...`，見 [absoluteCandidates]
      *   Stage C：單橫 `-k=/...` 永不視為絕對）由 [absoluteCandidates] 處理，
@@ -1696,7 +1751,7 @@ object ShellPolicy {
                     )
                 }
             }
-            val hasScopedPath = args.any { it.startsWith("/") }
+            val hasScopedPath = dfHasScopedPath(args)
             if (!hasScopedPath) {
                 return Validation.Denied(
                     ShellDeny.BLACKLISTED,
@@ -1743,6 +1798,10 @@ object ShellPolicy {
         }
         var endOfOptions = false
         var prevArg: String? = null
+        // P1-2 token-role：上一 token 是否「已被消費為資料值」（pattern／取值／檔名槽）。
+        // 若是，下一輪即使其字串等於某旗標，也不得再參與旗標分類，避免已消費 token
+        // 重新解鎖 fail-closed 禁止項。
+        var prevWasValue: Boolean = false
         // Stage A＋C：grep `-f`／`--file`／`--exclude-from` 精確 token 的下一位是
         // REQUIRED-FILENAME 槽（檔名操作數，短橫形亦拒，見下；只限 grep，
         // `ls -f` 是排序旗標）。`--exclude-from` 不計入 pattern 預掃
@@ -1788,6 +1847,7 @@ object ShellPolicy {
                 }
                 pendingClusterValueIsPattern = false
                 prevArg = arg
+                prevWasValue = true
                 continue
             }
             // Stage D（P1-2）＋G（縮寫）：find/du/ls symlink-follow 全位置 fail-closed。
@@ -1830,6 +1890,8 @@ object ShellPolicy {
                 // + spawn 持同容器鎖（見 `ProotExec.execute`），宿主 symlink 語義
                 // 不適用。容器內 symlink／TOCTOU 殘餘見 `ProotExec` KDoc。
                 if (isGuest && privateRoot != null && isContainerInternalPath(candidate, privateRoot)) {
+                    prevArg = arg
+                    prevWasValue = false
                     continue
                 }
                 val denial = if (isElevated) {
@@ -1846,11 +1908,13 @@ object ShellPolicy {
             if (inFileSlot) {
                 if (arg == "-") {
                     prevArg = arg
+                    prevWasValue = true
                     continue
                 }
                 if (arg == "--") {
                     if (isGuest && privateRoot != null) {
                         prevArg = arg
+                        prevWasValue = true
                         continue
                     }
                     return Validation.Denied(
@@ -1862,6 +1926,7 @@ object ShellPolicy {
             if (!endOfOptions && arg == "--") {
                 endOfOptions = true
                 prevArg = arg
+                prevWasValue = false
                 continue
             }
             // Stage F（P1-1 getopt 短選項簇）：選項位單橫簇逐字掃描（見 [GREP_SHORT_BOOL]）。
@@ -1871,7 +1936,7 @@ object ShellPolicy {
             // 未知 fail-closed 拒。`=/abs` REST（含 `=`）恆相對拒；`/abs` REST 走 FileScope＋
             // 實體門（use==validated）；空 REST 臂槽（`f`→檔槽，`e/m/A/B/C/D/d`→值槽）。
             if (base == "grep" && !endOfOptions && !inFileSlot &&
-                !isValueTakingFlag(base, prevArg) && !pendingClusterValue &&
+                !isValueTakingFlag(base, prevArg, prevWasValue) && !pendingClusterValue &&
                 arg.startsWith("-") && !arg.startsWith("--") && arg != "-"
             ) {
                 val body = arg.substring(1)
@@ -1964,7 +2029,10 @@ object ShellPolicy {
                         "relative path denied (fail-closed, use absolute path): $arg",
                     )
                 }
-                if (clusterDone) continue
+                if (clusterDone) {
+                    prevWasValue = false
+                    continue
+                }
             }
             // Stage A＋C du `-X` 簇附著值：`-X` 取必填參數，故簇內 `X` 後 REST
             // 恒為檔名（getopt：前導布林如 `-a` 僅消費自身，`X` 取其後全部 REST；
@@ -1986,6 +2054,7 @@ object ShellPolicy {
                     if (rest.isEmpty()) {
                         pendingFileValue = true
                         prevArg = arg
+                        prevWasValue = false
                         continue
                     }
                     if (rest.startsWith("/")) {
@@ -2016,6 +2085,7 @@ object ShellPolicy {
                         }
                         if (vet != null) return vet
                         prevArg = arg
+                        prevWasValue = false
                         continue
                     }
                     return Validation.Denied(
@@ -2032,14 +2102,15 @@ object ShellPolicy {
             }
             val isPositional = endOfOptions || !arg.startsWith("-") || arg == "-"
             // grep 遞迴旗標只認選項位的（見 sawGrepRecursiveFlag 註解）。
-            if (base == "grep" && !endOfOptions && !isValueTakingFlag(base, prevArg) &&
+            if (base == "grep" && !endOfOptions && !isValueTakingFlag(base, prevArg, prevWasValue) &&
                 isGrepRecursiveFlag(arg)
             ) {
                 sawGrepRecursiveFlag = true
             }
             // 取值旗標的下一位是值而非路徑（如 -n 20、-c %s、-name *.db、-e pattern）。
-            if (isPositional && prevArg != null && isValueTakingFlag(base, prevArg)) {
+            if (isPositional && prevArg != null && isValueTakingFlag(base, prevArg, prevWasValue)) {
                 prevArg = arg
+                prevWasValue = true
                 // -f/--file 除外已不在 VALUE_TAKING_FLAGS，其值仍按路徑審查；
                 // 此處僅豁免已列旗標的值。
                 continue
@@ -2048,6 +2119,7 @@ object ShellPolicy {
             if (base == "grep" && !grepPatternSeen && isPositional && !arg.startsWith("/")) {
                 grepPatternSeen = true
                 prevArg = arg
+                prevWasValue = true
                 continue
             }
             // Stage D（P1-2）＋G（縮寫）：grep symlink-follow 僅選項位 fail-closed。
@@ -2063,7 +2135,7 @@ object ShellPolicy {
             //（含 `R` 如 `ROOT`）與 `-fX` 附著（另由附著門拒）由 [isFollowFlag]
             // 內跳過。guest 容器內豁免（見 [isGuestTraversalExempt]）。
             if (base == "grep" && !isGuestTraversalExempt(isGuest, privateRoot) &&
-                !endOfOptions && !inFileSlot && !isValueTakingFlag(base, prevArg) &&
+                !endOfOptions && !inFileSlot && !isValueTakingFlag(base, prevArg, prevWasValue) &&
                 isFollowFlag(base, arg)
             ) {
                 return Validation.Denied(
@@ -2146,6 +2218,7 @@ object ShellPolicy {
                 pendingFileValue = true
             }
             prevArg = arg
+            prevWasValue = false
         }
         // Implicit-cwd fail-closed（PR#1 re-review head 4e3a6c6 blocker 1）：
         // ls/du/df/find/pwd 無明確絕對路徑時語義即隱式操作 cwd（ls/du 列 `.`、

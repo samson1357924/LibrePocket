@@ -95,15 +95,16 @@ class ShellStageIResponseFileTest {
         }
     }
 
-    private fun duVectors(manifest: String, scopeAbs: String): List<List<String>> = listOf(
-        // 分離形＋`=v`（GNU 真讀）。
-        listOf("du", "--files0-from", manifest, scopeAbs),
-        listOf("du", "--files0-from=$manifest", scopeAbs),
+    private fun duVectors(manifest: String): List<List<String>> = listOf(
+        // 分離形＋`=v`（GNU 真讀）：GNU du 不接受 `--files0-from` 與普通 operand 併用，
+        // 故 trailing scopeAbs 移除，僅保留 response-file indirection 本身。
+        listOf("du", "--files0-from", manifest),
+        listOf("du", "--files0-from=$manifest"),
         // 唯一前綴縮寫（GNU 真讀：`--f` 亦唯一映射 `--files0-from`，實測）。
-        listOf("du", "--files0-f", manifest, scopeAbs),
-        listOf("du", "--f", manifest, scopeAbs),
-        listOf("du", "--files0-f=$manifest", scopeAbs),
-        listOf("du", "--f=$manifest", scopeAbs),
+        listOf("du", "--files0-f", manifest),
+        listOf("du", "--f", manifest),
+        listOf("du", "--files0-f=$manifest"),
+        listOf("du", "--f=$manifest"),
     )
 
     private fun wcVectors(manifest: String): List<List<String>> = listOf(
@@ -132,7 +133,7 @@ class ShellStageIResponseFileTest {
     @Test fun duDenied_directAndElevated() {
         val f = responseFixture("stageI-du")
         try {
-            for (argv in duVectors(f.manifestAbs, f.scope.absolutePath)) {
+            for (argv in duVectors(f.manifestAbs)) {
                 assertBlockedResponseFile(ShellPolicy.validate(argv, f.scope.absolutePath), argv)
                 assertBlockedResponseFile(
                     ShellPolicy.validateElevated(
@@ -294,7 +295,7 @@ class ShellStageIResponseFileTest {
         val f = responseFixture("stageI-runner")
         try {
             val vectors = mutableListOf<List<String>>()
-            vectors.addAll(duVectors(f.manifestAbs, f.scope.absolutePath))
+            vectors.addAll(duVectors(f.manifestAbs))
             vectors.addAll(wcVectors(f.manifestAbs))
             vectors.addAll(findVectors(f.manifestAbs))
             vectors.add(listOf("toybox", "du", "--files0-from", f.manifestAbs, f.scope.absolutePath))

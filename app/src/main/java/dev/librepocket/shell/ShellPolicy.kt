@@ -1605,7 +1605,9 @@ object ShellPolicy {
      * 只有真正的 positional（含 `--` 後）絕對路徑才算 scoped path。
      */
     private fun dfHasScopedPath(args: List<String>): Boolean {
-        val valueFlags = setOf("-t", "--type", "-x", "--exclude-type", "-B", "--block-size", "--output")
+        // GNU value-taking flags for df (mandatory value). Long forms are matched by
+        // unique prefix (GNU allows unambiguous abbreviation).
+        val longValueFlags = listOf("--type", "--exclude-type", "--block-size")
         var end = false
         var skipNext = false
         for (arg in args) {
@@ -1616,13 +1618,27 @@ object ShellPolicy {
                 continue
             }
             if (arg.startsWith("--")) {
+                val attached = arg.contains("=")
                 val key = arg.substringBefore("=")
-                if (key in valueFlags && !arg.contains("=")) skipNext = true
+                // exact or unambiguous prefix of a mandatory-value long flag
+                val isValueLong = longValueFlags.any { it == key || (key.length >= 4 && it.startsWith(key)) }
+                if (isValueLong && !attached) skipNext = true
+                // --output: skip only when attached (--output=...); separated form
+                // keeps the following token as a potential scoped path (per owner).
+                if (key == "--output" && attached) {
+                    // attached value, nothing to skip
+                }
                 continue
             }
             if (arg.startsWith("-") && arg != "-") {
-                if (arg == "-t" || arg == "-x" || arg == "-B") skipNext = true
-                // attached form -tTYPE / -xTYPE：值已附著，不需 skip
+                val core = arg.substring(1).substringBefore("=")
+                val attached = arg.contains("=")
+                // short cluster: skip next only if the LAST flag char is t/x/B and
+                // there is no attached value.
+                if (!attached && core.isNotEmpty()) {
+                    val last = core.last()
+                    if (last == 't' || last == 'x' || last == 'B') skipNext = true
+                }
                 continue
             }
             if (arg.startsWith("/")) return true
@@ -2118,7 +2134,13 @@ object ShellPolicy {
                 sawGrepRecursiveFlag = true
             }
             // 取值旗標的下一位是值而非路徑（如 -n 20、-c %s、-name *.db、-e pattern）。
-            if (isPositional && prevArg != null && isValueTakingFlag(base, prevArg, prevWasValue)) {
+            // P1 修正： consumption 不應要求 isPositional，否則 `grep --regexp -e`／
+            // `grep --regexp -R` 中 dash-leading 的 pattern value 不被消費，導致後續
+            // `-R` 被誤判為 `-e` 的值而繞過 symlink-follow 門。`--` 結束符仍由
+            // 下式處理，不在此消費。
+            if (prevArg != null && !endOfOptions && arg != "--" && !inFileSlot &&
+                isValueTakingFlag(base, prevArg, prevWasValue)
+            ) {
                 prevArg = arg
                 prevWasValue = true
                 // -f/--file 除外已不在 VALUE_TAKING_FLAGS，其值仍按路徑審查；

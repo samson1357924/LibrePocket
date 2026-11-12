@@ -1,5 +1,6 @@
 package dev.librepocket.shell
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -9,6 +10,7 @@ class ShellP1RegressionTest {
         try {
             val v = ShellPolicy.validate(listOf("wc", "-c", "leak"), privateRoot = scope.absolutePath)
             assertTrue("expected denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
         } finally { scope.deleteRecursively() }
     }
 
@@ -19,6 +21,7 @@ class ShellP1RegressionTest {
             val sub = java.io.File(scope, "subtree").apply { mkdirs() }
             val v = ShellPolicy.validate(listOf("grep", "-e", "-e", "-R", scope.absolutePath + "/subtree"), privateRoot = scope.absolutePath)
             assertTrue("expected denied (traversal), got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
         } finally {
             scope.deleteRecursively(); outside.deleteRecursively()
         }
@@ -29,6 +32,7 @@ class ShellP1RegressionTest {
         try {
             val v = ShellPolicy.validate(listOf("df", "-x", scope.absolutePath), privateRoot = scope.absolutePath)
             assertTrue("expected denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
         } finally { scope.deleteRecursively() }
     }
 
@@ -39,6 +43,7 @@ class ShellP1RegressionTest {
             val v = ShellPolicy.validate(listOf("wc", "-c", outside.absolutePath), privateRoot = scope.absolutePath)
             // outside path: vetted against scope => denied
             assertTrue("expected denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
         } finally { scope.deleteRecursively(); outside.deleteRecursively() }
     }
 
@@ -48,6 +53,7 @@ class ShellP1RegressionTest {
         try {
             val v = ShellPolicy.validateElevated(listOf("wc", "-c", "leak"), privateRoot = scope.absolutePath)
             assertTrue("expected denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
         } finally { scope.deleteRecursively() }
     }
 
@@ -56,6 +62,7 @@ class ShellP1RegressionTest {
         try {
             val v = ShellPolicy.validateElevated(listOf("grep", "-e", "-e", "-R", scope.absolutePath + "/subtree"), privateRoot = scope.absolutePath)
             assertTrue("expected denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
         } finally { scope.deleteRecursively() }
     }
 
@@ -64,6 +71,7 @@ class ShellP1RegressionTest {
         try {
             val v = ShellPolicy.validateElevated(listOf("df", "-x", scope.absolutePath), privateRoot = scope.absolutePath)
             assertTrue("expected denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
         } finally { scope.deleteRecursively() }
     }
 
@@ -73,6 +81,7 @@ class ShellP1RegressionTest {
         try {
             val v = ShellPolicy.validate(listOf("toybox", "wc", "-c", "leak"), privateRoot = scope.absolutePath)
             assertTrue("expected denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
         } finally { scope.deleteRecursively() }
     }
 
@@ -81,6 +90,7 @@ class ShellP1RegressionTest {
         try {
             val v = ShellPolicy.validate(listOf("toybox", "grep", "-e", "-e", "-R", scope.absolutePath + "/subtree"), privateRoot = scope.absolutePath)
             assertTrue("expected denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
         } finally { scope.deleteRecursively() }
     }
 
@@ -89,6 +99,7 @@ class ShellP1RegressionTest {
         try {
             val v = ShellPolicy.validate(listOf("toybox", "df", "-x", scope.absolutePath), privateRoot = scope.absolutePath)
             assertTrue("expected denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
         } finally { scope.deleteRecursively() }
     }
 

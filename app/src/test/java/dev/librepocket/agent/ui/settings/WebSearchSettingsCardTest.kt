@@ -82,11 +82,14 @@ class WebSearchSettingsCardTest {
         }
         onWebTag("webSearchCard").assertIsDisplayed()
         onWebTag("webMasterSwitch").assertIsDisplayed()
-        // SearXNG 空 URL → 缺 URL；DDGS keyless 預設 Ready → 可用。
+        // SearXNG 空 URL → 缺 URL；DDGS keyless 預設 Ready → 設定格式有效（未連網）。
         onWebTag("webSearxngStatus").assertIsDisplayed()
         composeRule.onNodeWithText("狀態：缺 URL", substring = true).performScrollTo().assertIsDisplayed()
         onWebTag("webDdgsStatus").assertIsDisplayed()
-        composeRule.onNodeWithText("狀態：可用", substring = true).performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText(
+            "狀態：${WebSearchSettings.statusText(WebSearchSettings.ProviderStatus.AVAILABLE)}",
+            substring = true,
+        ).performScrollTo().assertIsDisplayed()
         // DDGS 非官方警語必顯示（D3 必須）。
         onWebTag("webDdgsWarning").assertIsDisplayed()
         assertTrue(WebSearchSettings.DDGS_UNOFFICIAL_WARNING.contains("非官方"))
@@ -133,7 +136,7 @@ class WebSearchSettingsCardTest {
             SettingsScreen(
                 padding = PaddingValues(0.dp),
                 gate = readyGate(),
-                web = webState(probeMessage = "SearXNG：缺 URL；DDGS：可用"),
+                web = webState(probeMessage = "SearXNG：缺 URL；DDGS：設定格式有效（未連網）"),
                 onWebProbe = { probed++ },
             )
         }
@@ -192,6 +195,28 @@ class WebSearchSettingsCardTest {
             )
         }
         composeRule.onNodeWithText("狀態：缺 key", substring = true).performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    fun invalidUrlAndNotReadyStatusDisplayed() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                web = webState().copy(
+                    searxngProbe = WebProbe.NotReady(WebUnavailableReason.INVALID_URL),
+                    ddgsProbe = WebProbe.NotReady(WebUnavailableReason.NO_PROVIDER),
+                ),
+            )
+        }
+        composeRule.onNodeWithText(
+            "狀態：${WebSearchSettings.statusText(WebSearchSettings.ProviderStatus.INVALID_URL)}",
+            substring = true,
+        ).performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText(
+            "狀態：${WebSearchSettings.statusText(WebSearchSettings.ProviderStatus.NOT_READY)}",
+            substring = true,
+        ).performScrollTo().assertIsDisplayed()
     }
 
     @Test

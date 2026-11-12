@@ -34,29 +34,50 @@ object WebSearchSettings {
 
     const val CONSENT_TITLE = "啟用網路搜尋？"
     const val CONSENT_TEXT =
-        "啟用後，搜尋查詢會經網路送往你設定的搜尋後端（預設自架 SearXNG；" +
-            "DDGS 為 opt-in 非官方端點，見下方警語）。查詢內容將依後端條款處理；" +
-            "本機快取僅保留 15 分鐘（見 WebSearchCache），取消不寫快取。"
+        "啟用後，搜尋查詢內容（未經全域脫敏）將經網路送往你設定的搜尋後端" +
+            "（預設自架 SearXNG；若另開啟 DDGS opt-in，當 SearXNG 未設定、格式無效或暫時失敗時" +
+            "將自動改送 DuckDuckGo 非官方端點，見下方警語），並依該後端條款處理。" +
+            "本機快取保留 15 分鐘，取消不寫快取。" +
+            "偏好設定（含 SearXNG 網址與同意狀態，不含 API 金鑰）會依系統與應用備份設定納入 Android 備份範圍。" +
+            "目前版本（D3）尚未提供實際聊天工具連線搜尋（僅儲存設定與同意狀態）。"
+
+    /** SearXNG URL 形狀驗證單一真相源（純本地格式檢查，不打網路）。 */
+    fun probeSearxngUrl(baseUrl: String): WebProbe = SearxngSearchProvider.probeUrl(baseUrl)
+
+    private fun requireValidProviderId(providerId: String): String {
+        val pid = providerId.trim()
+        require(
+            pid.isNotEmpty() &&
+                pid == providerId &&
+                '@' !in pid &&
+                '/' !in pid &&
+                !pid.any { it.isWhitespace() } &&
+                !containsControlFormatOrSurrogateChar(pid),
+        ) { "INVALID_WEB_PROVIDER_ID" }
+        return pid
+    }
 
     /** KeyVault 命名空間：`web.<providerId>`（與聊天 key 永不共用）。 */
-    fun namespaceFor(providerId: String): String = "web.$providerId"
+    fun namespaceFor(providerId: String): String = "web.${requireValidProviderId(providerId)}"
 
     /**
      * keyId 綁定 providerId＋origin（endpoint 切換不可沿用）。
      *
-     * 正規化僅做 `trim`＋小寫＋去尾 `/`（與 provider cacheNamespace 的
-     * scheme＋host 正規化同方向、更寬鬆；D5 keyed 實作可收緊，此處只保證
-     * 同 provider＋同 origin 同 key、異 origin 異 key）。
+     * 嚴格驗證 providerId 與 http/https origin，scheme＋host 小寫、保留明確 port 與
+     * `rawPath` 大小寫、去尾 `/`；非法輸入 fail-fast 拋 [IllegalArgumentException]。
      */
     fun keyIdFor(providerId: String, origin: String): String {
-        val o = origin.trim().lowercase().trimEnd('/')
-        return "${namespaceFor(providerId)}@$o"
+        val pid = requireValidProviderId(providerId)
+        val normalized = normalizeHttpOrigin(origin)
+            ?: throw IllegalArgumentException("INVALID_WEB_ORIGIN")
+        return "${namespaceFor(pid)}@$normalized"
     }
 
     /** 設定頁 provider 狀態（由 `probe()` 映射，見 [statusFor]）。 */
     enum class ProviderStatus {
         AVAILABLE,
         MISSING_URL,
+        INVALID_URL,
         MISSING_KEY,
         NOT_READY,
     }
@@ -65,14 +86,16 @@ object WebSearchSettings {
         is WebProbe.Ready -> ProviderStatus.AVAILABLE
         is WebProbe.NotReady -> when (probe.reason) {
             WebUnavailableReason.MISSING_URL -> ProviderStatus.MISSING_URL
+            WebUnavailableReason.INVALID_URL -> ProviderStatus.INVALID_URL
             WebUnavailableReason.MISSING_KEY -> ProviderStatus.MISSING_KEY
             else -> ProviderStatus.NOT_READY
         }
     }
 
     fun statusText(status: ProviderStatus): String = when (status) {
-        ProviderStatus.AVAILABLE -> "可用"
+        ProviderStatus.AVAILABLE -> "設定格式有效（未連網）"
         ProviderStatus.MISSING_URL -> "缺 URL"
+        ProviderStatus.INVALID_URL -> "URL 格式無效"
         ProviderStatus.MISSING_KEY -> "缺 key"
         ProviderStatus.NOT_READY -> "未就緒"
     }

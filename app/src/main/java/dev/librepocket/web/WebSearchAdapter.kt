@@ -1,18 +1,20 @@
 package dev.librepocket.web
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 /**
  * D3 本地搜尋 adapter（#138 D3；純 JVM，不接線）。
  *
- * - SearXNG 預設 fallback、DDGS opt-in：未 pin＋無 hosted 時，候選為
- *   registry 註冊順序（預期 SearXNG→DDGS）中「就緒＋（DDGS 需 opt-in）」者；
- *   首個 `Failed(fallbackAllowed)` 才換下一個（經
- *   [WebSearchSelector.mayFallback]）；`Unavailable` 一律不換、
- *   pinned 一律不換、AUTH／PROTOCOL 一律不換。
+ * - SearXNG 預設 fallback、DDGS opt-in：未 pin＋無 hosted 時，候選依「非 DDGS 優先、
+ *   DDGS 在後」順序，按需（lazy）以 `isReady` 探測；首個就緒者執行，只有
+ *   `Failed(fallbackAllowed)` 才依序探測下一個（經 [WebSearchSelector.mayFallback]）；
+ *   `Unavailable` 一律不換、pinned 一律不換、AUTH／PROTOCOL 一律不換。
  * - DDGS 未 opt-in 時直接排除（含 pinned `ddgs` → `PINNED_UNAVAILABLE`，
  *   fail-closed，不靜默換 SearXNG）。
- * - master 關閉 → `Unavailable(PROVIDER_DISABLED)`，零 upstream。
+ * - master 關閉或尚未確認同意（[Config.consentConfirmed]）→ `Unavailable(PROVIDER_DISABLED)`，
+ *   零探測、零 upstream。
  * - 取消語義：[CancellationException] 原樣透傳，不 fallback、不寫 cache
  *  （寫 cache 由 [WebSearchService] 保證，adapter 側保證不捕捉 CE、不換下一個）。
  * - 本層不做 cache：cache＋single-flight 由呼叫方傳入的
@@ -31,10 +33,11 @@ object WebSearchAdapter {
         val pinnedId: String? = null,
         val ddgsOptIn: Boolean = false,
         val hostedAvailable: Boolean = false,
+        val consentConfirmed: Boolean = false,
     )
 
     /**
-     * 候選過濾（SearXNG 預設、DDGS 需 opt-in）。
+     * 候選過濾與排序（非 DDGS／SearXNG 優先，DDGS 僅在 opt-in 後排於尾端）。
      *
      * DDGS 識別以 id 字面量（[DdgsSearchProvider.ID]）判定，不依賴 capabilities
      *（兩者皆 keyless，capabilities 無法區分；id 為 registry 唯一鍵，穩定）。
@@ -43,8 +46,9 @@ object WebSearchAdapter {
         providers: List<WebSearchProvider>,
         ddgsOptIn: Boolean,
     ): List<WebSearchProvider> {
-        if (ddgsOptIn) return providers.toList()
-        return providers.filter { it.id != DdgsSearchProvider.ID }
+        val primary = providers.filter { it.id != DdgsSearchProvider.ID }
+        if (!ddgsOptIn) return primary
+        return primary + providers.filter { it.id == DdgsSearchProvider.ID }
     }
 
     suspend fun search(
@@ -52,52 +56,103 @@ object WebSearchAdapter {
         count: Int,
         registry: WebSearchRegistry,
         config: Config = Config(),
-        isReady: (WebSearchProvider) -> Boolean = { true },
+        isReady: (suspend (WebSearchProvider) -> Boolean)? = null,
     ): WebSearchOutcome {
-        if (!config.masterEnabled) {
+        if (!config.masterEnabled || !config.consentConfirmed) {
             return WebSearchOutcome.Unavailable(WebUnavailableReason.PROVIDER_DISABLED)
         }
         if (query.isBlank()) return WebSearchOutcome.Unavailable(WebUnavailableReason.EMPTY_QUERY)
 
+        val n = WebSearchBudgets.countOf(count)
         // Pinned DDGS 但未 opt-in → fail-closed（不靜默換 SearXNG）。
         val pin = config.pinnedId?.trim()?.takeIf { it.isNotEmpty() }
         if (pin == DdgsSearchProvider.ID && !config.ddgsOptIn) {
             return WebSearchOutcome.Unavailable(WebUnavailableReason.PINNED_UNAVAILABLE)
         }
 
-        val filtered = WebSearchRegistry(candidatesOf(registry.providers(), config.ddgsOptIn))
-        val route = WebSearchSelector.select(pin, config.hostedAvailable, filtered, isReady)
+        val ordered = candidatesOf(registry.providers(), config.ddgsOptIn)
+        val filtered = WebSearchRegistry(ordered)
+        val readyCheck: suspend (WebSearchProvider) -> Boolean =
+            isReady ?: { it.probe() is WebProbe.Ready }
+
+        suspend fun safeReady(p: WebSearchProvider): Boolean {
+            return try {
+                val ready = readyCheck(p)
+                currentCoroutineContext().ensureActive()
+                ready
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                currentCoroutineContext().ensureActive()
+                false
+            } catch (e: Throwable) {
+                throw e
+            }
+        }
+
+        var startIndex = -1
+        val route: WebRoute = when {
+            pin != null -> {
+                val p = filtered.get(pin)
+                if (p == null) {
+                    WebSearchSelector.select(pin, config.hostedAvailable, filtered) { false }
+                } else {
+                    val pReady = safeReady(p)
+                    startIndex = ordered.indexOfFirst { it.id == pin }
+                    WebSearchSelector.select(pin, config.hostedAvailable, filtered) { it.id == pin && pReady }
+                }
+            }
+            config.hostedAvailable -> {
+                WebSearchSelector.select(null, true, filtered) { false }
+            }
+            else -> {
+                var firstReady: WebSearchProvider? = null
+                for (i in ordered.indices) {
+                    val candidate = ordered[i]
+                    if (safeReady(candidate)) {
+                        firstReady = candidate
+                        startIndex = i
+                        break
+                    }
+                }
+                val firstId = firstReady?.id
+                WebSearchSelector.select(null, false, filtered) { it.id == firstId }
+            }
+        }
+
         when (route) {
             is WebRoute.Hosted ->
                 return WebSearchOutcome.Unavailable(WebUnavailableReason.HOSTED_NOT_SUPPORTED)
             is WebRoute.Unavailable ->
                 return WebSearchOutcome.Unavailable(route.reason)
-            is WebRoute.Local -> {
-                // 首選 provider（pinned 或首個就緒）。
-            }
+            is WebRoute.Local -> Unit
         }
-        val firstId = (route as WebRoute.Local).providerId
-        val ordered = filtered.providers()
-        val startIndex = ordered.indexOfFirst { it.id == firstId }.coerceAtLeast(0)
-        // Fallback 順序：首選＋其後就緒者（註冊順序；pinned 時 select 已保證
-        // 單一路徑，mayFallback 恆 false，故迴圈只跑首選一次）。
-        val queue = listOf(ordered[startIndex]) +
-            ordered.drop(startIndex + 1).filter(isReady)
+
+        val indicesToTry: Iterable<Int> = if (pin != null) {
+            listOf(startIndex)
+        } else {
+            startIndex until ordered.size
+        }
 
         var last: WebSearchOutcome? = null
-        for (p in queue) {
+        for (i in indicesToTry) {
+            val p = ordered[i]
+            if (i != startIndex && !safeReady(p)) continue
             val out = try {
-                p.search(query, count)
+                val r = p.search(query, n)
+                currentCoroutineContext().ensureActive()
+                r
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
+                currentCoroutineContext().ensureActive()
                 WebSearchOutcome.Failed(WebFailureReason.TRANSPORT)
             } catch (e: Throwable) {
                 throw e
             }
             when (out) {
                 is WebSearchOutcome.Ok -> return out
-                is WebSearchOutcome.Unavailable -> return out
+                is WebSearchOutcome.Unavailable -> return last ?: out
                 is WebSearchOutcome.Failed -> {
                     last = out
                     if (!WebSearchSelector.mayFallback(pin, out)) return out

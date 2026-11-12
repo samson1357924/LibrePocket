@@ -2,6 +2,7 @@ package dev.librepocket.tool
 
 import dev.librepocket.web.WebSearchAdapter
 import dev.librepocket.web.WebSearchOutcome
+import dev.librepocket.web.WebSearchProvider
 import dev.librepocket.web.WebSearchRegistry
 import dev.librepocket.web.WebUnavailableReason
 
@@ -49,7 +50,11 @@ object WebSearchLocal {
     }
 
     sealed interface SearchOutcome {
-        data class Ok(val results: List<Result>) : SearchOutcome
+        data class Ok(
+            val results: List<Result>,
+            val truncated: Boolean = false,
+            val cached: Boolean = false,
+        ) : SearchOutcome
         data class Unavailable(val reason: DenyReason, val detail: String, val message: String) : SearchOutcome
         data class Failed(val detail: String, val message: String) : SearchOutcome
     }
@@ -101,7 +106,8 @@ object WebSearchLocal {
     /**
      * D3 suspend 版：經 [WebSearchAdapter] 走新 provider 層。
      *
-     * - `masterEnabled=false`（預設）→ `Unavailable(PROVIDER_DISABLED→USER_DISABLED)`，零 upstream；
+     * - `masterEnabled=false`（預設）或 `consentConfirmed=false`（預設 fail-closed）
+     *   → `Unavailable(PROVIDER_DISABLED→USER_DISABLED)`，零探測、零 upstream；
      * - 空 query → `Unavailable(EMPTY_QUERY)`；
      * - SearXNG 預設首選、DDGS 需 [ddgsOptIn]（未 opt-in 直接排除，
      *   pinned `ddgs` 亦 fail-closed 為 `PINNED_UNAVAILABLE`，不靜默換）；
@@ -112,7 +118,8 @@ object WebSearchLocal {
      *  （本地不與 hosted 並用，由上層走 hosted）。
      *
      * 純映射：`Ok` 取 title／url／snippet（`published`／`siteName` 為 model 可見
-     * 預算內資訊，本地 `Result` 僅保留三欄）；`Unavailable` 按原因映射
+     * 預算內資訊，本地 `Result` 僅保留三欄）並透傳 [SearchOutcome.Ok.truncated] 與
+     * [SearchOutcome.Ok.cached]；`Unavailable` 按原因映射
      * `DenyReason`（`PROVIDER_DISABLED→USER_DISABLED`，其餘 `NO_PRIVILEGE`）；
      * `Failed` 保留 `reason.detail`。
      */
@@ -124,29 +131,52 @@ object WebSearchLocal {
         pinnedId: String? = null,
         ddgsOptIn: Boolean = false,
         hostedAvailable: Boolean = false,
-        isReady: (dev.librepocket.web.WebSearchProvider) -> Boolean = { true },
+        consentConfirmed: Boolean = false,
+        isReady: (suspend (WebSearchProvider) -> Boolean)? = null,
     ): SearchOutcome {
+        val n = countOf(count)
         val outcome = WebSearchAdapter.search(
             query = query,
-            count = count,
+            count = n,
             registry = registry,
             config = WebSearchAdapter.Config(
                 masterEnabled = masterEnabled,
                 pinnedId = pinnedId,
                 ddgsOptIn = ddgsOptIn,
                 hostedAvailable = hostedAvailable,
+                consentConfirmed = consentConfirmed,
             ),
             isReady = isReady,
         )
         return when (outcome) {
             is WebSearchOutcome.Ok -> SearchOutcome.Ok(
-                outcome.results.map { Result(it.title, it.url, it.snippet) },
+                results = outcome.results.map { Result(it.title, it.url, it.snippet) },
+                truncated = outcome.truncated,
+                cached = outcome.cached,
             )
             is WebSearchOutcome.Unavailable -> {
                 val reason = if (outcome.reason == WebUnavailableReason.PROVIDER_DISABLED) {
                     DenyReason.USER_DISABLED
                 } else {
                     DenyReason.NO_PRIVILEGE
+                }
+                val needFromUser = when (outcome.reason) {
+                    WebUnavailableReason.PROVIDER_DISABLED ->
+                        "先在設定→網路搜尋開啟開關並完成同意（目前版本尚未接線至對話工具執行）"
+                    WebUnavailableReason.EMPTY_QUERY ->
+                        "提供要搜尋的關鍵字"
+                    WebUnavailableReason.HOSTED_NOT_SUPPORTED ->
+                        "目前端點支援服務端搜尋，應改走 hosted 路徑"
+                    WebUnavailableReason.PINNED_UNAVAILABLE ->
+                        "檢查所指定的搜尋供應商設定是否就緒（或取消固定改用預設）"
+                    WebUnavailableReason.MISSING_URL ->
+                        "先在設定填入有效的 SearXNG baseUrl"
+                    WebUnavailableReason.INVALID_URL ->
+                        "修正設定中的 SearXNG URL 格式（需 http/https 且不可含帳密、query 或 fragment）"
+                    WebUnavailableReason.MISSING_KEY ->
+                        "先在設定配置該搜尋供應商所需的 API 金鑰"
+                    WebUnavailableReason.NO_PROVIDER ->
+                        "手動在瀏覽器搜尋，或先配置並啟用可用的搜尋供應商"
                 }
                 SearchOutcome.Unavailable(
                     reason = reason,
@@ -156,11 +186,7 @@ object WebSearchLocal {
                         reason = reason,
                         detail = outcome.detail,
                         alternative = FALLBACK_HINT,
-                        needFromUser = if (outcome.reason == WebUnavailableReason.PROVIDER_DISABLED) {
-                            "先在設定→工具→網路搜尋開啟開關並完成同意"
-                        } else {
-                            "手動在瀏覽器搜尋，或先配置搜尋供應商再開啟 websearch 開關"
-                        },
+                        needFromUser = needFromUser,
                     ),
                 )
             }

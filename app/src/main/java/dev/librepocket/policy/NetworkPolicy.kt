@@ -56,8 +56,30 @@ object NetworkPolicy {
     // Userinfo 永遠阻擋：解析後欄位＋原始 authority 雙重檢查（含空 userinfo
     // 的 `http://@host/`，與 McpWire F-01 姿態對稱；先剝 fragment `#` 免誤殺）。
     val authority = rawUrl.substringAfter("://", "").substringBefore('/').substringBefore('?').substringBefore('#')
-    if (url.username.isNotEmpty() || !url.password.isNullOrEmpty() || '@' in authority) {
+    // 反斜線同 userinfo 皆屬 host 混淆（OkHttp 把 `\\` 當 authority/path 分隔，
+    // 顯示主機與實際連線主機可被分離）：fail-closed，與 McpWire 姿態對稱。
+    if (url.username.isNotEmpty() || !url.password.isNullOrEmpty() || '@' in authority || '\\' in authority) {
       return NetworkEvaluation.denied(NetworkDenyCode.USERINFO_BLOCKED, null)
+    }
+    // 明文且 opt-in 完全不允許時，不必 DNS：任何 http 在此 tier 一律拒
+    //（避免「必定拒絕的 public HTTP 仍查 DNS」的隱私／延遲回歸）。
+    // 但 host 結構不合法（onion／非法字面／非法 DNS 名）時仍走 resolveHost，
+    // 以保留 INVALID_HOST 語義與 neverResolve 測試不變式（結構合法才短路）。
+    val hostForShortCircuit = url.host.trim().trimEnd('.').lowercase(Locale.ROOT)
+    // 結構合法性（無 DNS）：與 resolveHost 的 DNS 前檢查同源。
+    val hostStructurallyValid =
+      hostForShortCircuit.isNotEmpty() && hostForShortCircuit.length <= 253 &&
+        hostForShortCircuit != "onion" && !hostForShortCircuit.endsWith(".onion") &&
+        '@' !in hostForShortCircuit && '/' !in hostForShortCircuit &&
+        '\\' !in hostForShortCircuit &&
+        hostForShortCircuit.none { it.isWhitespace() || it < ' ' } &&
+        // 無效 IPv4 字面（前導零等）一律不短路：resolveHost 會走 DNS 路徑
+        //（可能 INVALID_HOST），保留既有 deny code 語義。
+        !hostForShortCircuit.matches(Regex("""^\d+(\.\d+){3}$""")) &&
+        (NetworkPolicy.parseLiteralIp(hostForShortCircuit) != null ||
+          (':' !in hostForShortCircuit && isValidDnsName(hostForShortCircuit)))
+    if (url.scheme == "http" && !optIn.allowsCleartext && hostStructurallyValid) {
+      return NetworkEvaluation.denied(NetworkDenyCode.CLEARTEXT_NOT_PERMITTED, null)
     }
     val resolved = resolveHost(url.host, resolver)
       ?: return NetworkEvaluation.denied(NetworkDenyCode.INVALID_HOST, null)

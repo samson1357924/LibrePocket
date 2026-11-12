@@ -61,6 +61,9 @@ object WebFetch {
     /** 全程超時預算（S1-B：15s）。 */
     const val TIMEOUT_MS = 15_000L
 
+    /** 超時上限（防資源耗盡；直調 API 才可能超出預設）。 */
+    const val MAX_TIMEOUT_MS = 60_000L
+
     /** 預設位元組上限 256 KiB。 */
     const val DEFAULT_MAX_BYTES = 262_144
 
@@ -218,9 +221,19 @@ object WebFetch {
         val pinned = PinnedNetworkDns(delegate = resolver, strict = true)
         pinned.pin(firstHost, firstEval.resolvedAddresses)
         // 呼叫方傳入的 client 可能仍開啟自動重定向：一律強制關閉，改由下方手動跟隨。
+        // 超時鉗制：0／負值不得關閉 OkHttp 超時（OkHttp 以 0 表「不超時」），
+        // 一律鉗到 1ms–MAX_TIMEOUT_MS；connect/read/write 與 call 一律同 budget，
+        // 避免「只調 callTimeout」導致 connect/read 仍卡在 shared client 的 15s
+        // 或小 budget 無法收緊 connect/read。
+        val safeTimeout = timeoutMs.coerceIn(1L, MAX_TIMEOUT_MS)
         val baseClient =
-            if (timeoutMs == TIMEOUT_MS) client
-            else client.newBuilder().callTimeout(timeoutMs, TimeUnit.MILLISECONDS).build()
+            if (safeTimeout == TIMEOUT_MS) client
+            else client.newBuilder()
+                .connectTimeout(safeTimeout, TimeUnit.MILLISECONDS)
+                .readTimeout(safeTimeout, TimeUnit.MILLISECONDS)
+                .writeTimeout(safeTimeout, TimeUnit.MILLISECONDS)
+                .callTimeout(safeTimeout, TimeUnit.MILLISECONDS)
+                .build()
         // 強制直連（`Proxy.NO_PROXY`，與 provider `pinnedTransportFor` 同姿態）：
         // `newBuilder` 繼承呼叫方 client 的 proxy 設定，必須顯式覆寫，否則建連外包
         // 給代理另行解析，繞過 DNS pin（pin 只管直連路徑）。

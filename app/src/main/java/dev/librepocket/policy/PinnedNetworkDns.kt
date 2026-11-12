@@ -28,7 +28,7 @@ import okhttp3.Dns
  * 代理鏈政策由 A4 處理（此處行為不變，僅聲明假設）。
  */
 class PinnedNetworkDns(
-  pinned: Map<String, List<InetAddress>> = emptyMap(),
+  initialPinned: Map<String, List<InetAddress>> = emptyMap(),
   private val delegate: HostResolver = SystemHostResolver,
   private val strict: Boolean = true,
 ) : Dns, HostResolver {
@@ -36,7 +36,7 @@ class PinnedNetworkDns(
   private val pinned = ConcurrentHashMap<String, List<InetAddress>>()
 
   init {
-    for ((host, addrs) in pinned) {
+    for ((host, addrs) in initialPinned) {
       this.pinned[normalize(host)] = addrs.toList()
     }
   }

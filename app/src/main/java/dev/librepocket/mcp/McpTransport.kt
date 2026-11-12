@@ -339,12 +339,31 @@ internal fun takePreverifiedEval(
     optIn: EndpointNetworkOptIn,
     resolver: HostResolver,
 ): NetworkEvaluation {
+    // 正規化後的傳輸 URL（與 preverified.normalizedUrl 同形；McpWire.endpoint
+    // 回傳的原始字串可能含大寫 host／顯式預設埠，直接比對會誤判不一致而回落
+    // 第二次 DNS，破壞單次解析保證）。
+    val canonicalUrl = url.toHttpUrlOrNull()?.toString() ?: url
+    val httpUrl = url.toHttpUrlOrNull()
+    // host 為字面 IP 時，釘住答案必須與該 IP 一致（否則為偽造 retarget）。
+    val hostLiteral = httpUrl?.host?.let { NetworkPolicy.parseLiteralIp(it) }
+    val literalMismatch = hostLiteral != null &&
+        preverified?.resolvedAddresses != listOf(hostLiteral)
     if (preverified != null &&
         preverified.allowed &&
         preverified.resolvedAddresses.isNotEmpty() &&
-        preverified.normalizedUrl == url
+        preverified.normalizedUrl == canonicalUrl &&
+        !literalMismatch
     ) {
-        return preverified
+        // 不盲信呼叫端的放行決策：以釘住答案為 resolver 重跑政策，驗證地址集合在
+        // *當前* optIn 下仍合法（防偽造 preverifiedEval 繞過 gate；opt-in 降級
+        // 亦在此被拒）。重跑失敗（偽造／降級）回落完整 gate（真 resolver），
+        // fail-closed，絕不沿用不可信的地址集合。
+        val pinnedResolver = HostResolver { preverified.resolvedAddresses }
+        return try {
+            requireMcpNetworkPolicyAllowed(url, optIn, pinnedResolver)
+        } catch (e: McpNetworkPolicyBlocked) {
+            requireMcpNetworkPolicyAllowed(url, optIn, resolver)
+        }
     }
     return requireMcpNetworkPolicyAllowed(url, optIn, resolver)
 }

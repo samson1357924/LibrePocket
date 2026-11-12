@@ -1,5 +1,6 @@
 package dev.librepocket.agent.assistant
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -17,10 +18,11 @@ import org.robolectric.annotation.Config
  *
  * - Intent 契約：session 喚起在既有 ASSIST（限包→真 explicit）上掛
  *   voice flag；解析預設 false，null 安全。
- * - Manifest 零新增權限：主 manifest `uses-permission` 集合鎖死
- *   （INTERNET／ACCESS_NETWORK_STATE／POST_NOTIFICATIONS／
- *   FOREGROUND_SERVICE／SET_ALARM），C2 不加 RECORD_AUDIO
- *  （RecognizerIntent 委派由系統辨識 Activity 錄音）。
+ * - Manifest 零新增權限：合併後 manifest `requestedPermissions`
+ *   鎖死安全集合（INTERNET／ACCESS_NETWORK_STATE／POST_NOTIFICATIONS／
+ *   FOREGROUND_SERVICE／SET_ALARM + flavor 既有宣告），C2 不加 RECORD_AUDIO
+ *   （主 manifest 並以 `tools:node="remove"` 防範 transitive AAR 帶入，
+ *   RecognizerIntent 委派由系統辨識 Activity 錄音）。
  * - MainActivity ASSIST 接收無損：flag 不影響既有 ASSIST 解析。
  */
 @RunWith(RobolectricTestRunner::class)
@@ -61,43 +63,53 @@ class AssistantVoiceRobolectricTest {
 
     @Test
     fun manifest_declaresNoRecordAudio() {
-        val manifest = findSourceManifest(
-            "src/main/AndroidManifest.xml",
-            "app/src/main/AndroidManifest.xml",
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val packageInfo = context.packageManager.getPackageInfo(
+            context.packageName,
+            PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS.toLong()),
         )
+        val requestedPermissions = packageInfo.requestedPermissions?.toSet().orEmpty()
         assertFalse(
-            "C2 不新增錄音權限（RecognizerIntent 委派，見 AssistantVoice）",
-            manifest.contains("RECORD_AUDIO"),
+            "C2 不新增錄音權限（RecognizerIntent 委派，見 AssistantVoice；合併後 manifest 不得含 RECORD_AUDIO）",
+            Manifest.permission.RECORD_AUDIO in requestedPermissions,
         )
-        val permissions = Regex(
-            """<uses-permission android:name="([^"]+)"\s*/>""",
-        ).findAll(manifest).map { it.groupValues[1] }.toSet()
+        val expectedSafePermissions = setOf(
+            Manifest.permission.INTERNET,
+            Manifest.permission.ACCESS_NETWORK_STATE,
+            Manifest.permission.POST_NOTIFICATIONS,
+            Manifest.permission.FOREGROUND_SERVICE,
+            "com.android.alarm.permission.SET_ALARM",
+        )
+        assertTrue(
+            "預期安全權限缺失：${expectedSafePermissions - requestedPermissions}",
+            requestedPermissions.containsAll(expectedSafePermissions),
+        )
+        val allowedFlavorExtras = buildSet {
+            add("${context.packageName}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION")
+            if (context.packageName.endsWith(".github")) {
+                add("moe.shizuku.manager.permission.API_V23")
+            }
+        }
         assertEquals(
-            setOf(
-                "android.permission.INTERNET",
-                "android.permission.ACCESS_NETWORK_STATE",
-                "android.permission.POST_NOTIFICATIONS",
-                "android.permission.FOREGROUND_SERVICE",
-                "com.android.alarm.permission.SET_ALARM",
-            ),
-            permissions,
+            expectedSafePermissions + allowedFlavorExtras,
+            requestedPermissions,
         )
     }
 
     @Test
     fun mainActivity_stillResolvesAssistWithFlag() {
         // flag 是 extra，不影響 intent-filter 解析：ASSIST 仍命中 MainActivity。
-        val pm = ApplicationProvider.getApplicationContext<Context>().packageManager
         val context = ApplicationProvider.getApplicationContext<Context>()
+        val pm = context.packageManager
         val probe = AssistantVoice.withVoiceInput(Intent(Intent.ACTION_ASSIST))
             .setPackage(context.packageName)
         val found = pm.queryIntentActivities(
             probe,
             PackageManager.MATCH_DEFAULT_ONLY,
         )
-        assertTrue(
-            "ASSIST＋voice flag 仍應解析到 MainActivity",
-            found.any { it.activityInfo.name.endsWith(".MainActivity") },
+        assertEquals(
+            dev.librepocket.agent.MainActivity::class.java.name,
+            found.single().activityInfo.name,
         )
     }
 
@@ -125,17 +137,5 @@ class AssistantVoiceRobolectricTest {
         val intent = Intent(Intent.ACTION_ASSIST)
             .putExtra(AssistantVoice.EXTRA_VOICE_INPUT, true)
         assertTrue(AssistantVoice.isVoiceInputRequested(intent))
-    }
-
-    /** 單測工作目錄（模組 dir）出發，向上走最多 5 層找原始碼/清單檔（同既有模式）。 */
-    private fun findSourceManifest(vararg relPaths: String): String {
-        val bases = generateSequence(java.io.File(System.getProperty("user.dir") ?: ".")) { it.parentFile }.take(6).toList()
-        for (base in bases) {
-            for (rel in relPaths) {
-                val f = java.io.File(base, rel)
-                if (f.isFile) return f.readText()
-            }
-        }
-        error("not found: ${relPaths.toList()} under ${System.getProperty("user.dir")}")
     }
 }

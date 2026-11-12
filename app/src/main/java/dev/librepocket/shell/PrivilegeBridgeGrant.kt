@@ -105,6 +105,8 @@ object PrivilegeGrantPolicy {
      * fail-closed 為無效，禁止沿用舊授權）。
      * @param currentRevision 當前設定版本（null＝讀不到版本，同樣 fail-closed）。
      * @param nowMs 以此時刻判定到期（到期瞬間 `nowMs >= expiresAtMs` 即失效）。
+     * Wall-clock 殘留：回撥系統時鐘可延長 TTL（威脅模型接受：攻擊者＝機主，
+     * 無遠端向量；如需嚴格單調請改用 elapsedRealtime，見 B3）。
      */
     fun check(
         grant: PrivilegeGrant?,

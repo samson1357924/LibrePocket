@@ -1,6 +1,7 @@
 package dev.librepocket.privilege.github
 
 import android.content.pm.PackageManager
+import androidx.annotation.VisibleForTesting
 import rikka.shizuku.Shizuku
 
 /**
@@ -66,8 +67,9 @@ class ShizukuPermissionRequests {
      */
     fun isAttached(): Boolean = synchronized(lock) { attached }
 
-    /** 僅測試/真實 listener 轉發用：按碼分發結果快照（異常隔離，逐個收斂）。 */
-    fun emitResult(requestCode: Int, grantResult: Int) {
+    /** 僅真實 listener 轉發用（internal：行程外不可偽造結果）：按碼分發結果快照（異常隔離，逐個收斂）。 */
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    internal fun emitResult(requestCode: Int, grantResult: Int) {
         val snapshot = synchronized(lock) { callbacks[requestCode]?.toList() } ?: return
         val granted = grantResult == PackageManager.PERMISSION_GRANTED
         snapshot.forEach { runCatching { it(granted) } }

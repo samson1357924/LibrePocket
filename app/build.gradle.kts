@@ -134,12 +134,6 @@ val jacksonGithubForcedVersion = libs.versions.jacksonBom.get()
 // Match by group prefix so future com.fasterxml.jackson.* modules pulled in
 // transitively (e.g. dataformat) are covered as well.
 val jacksonGithubForcedGroupPrefix = "com.fasterxml.jackson."
-val jacksonGithubForcedModules = setOf(
-    "com.fasterxml.jackson.core:jackson-core",
-    "com.fasterxml.jackson.core:jackson-databind",
-    "com.fasterxml.jackson.core:jackson-annotations",
-    "com.fasterxml.jackson.datatype:jackson-datatype-jsr310",
-)
 
 // NOTE: variant configurations use a lowercase "github" prefix
 // (githubDebugRuntimeClasspath), while test configurations use "Github"
@@ -147,12 +141,9 @@ val jacksonGithubForcedModules = setOf(
 // both are covered, and foss/play (no "github" substring) stay untouched.
 configurations.matching { it.name.contains("github", ignoreCase = true) }.all {
     resolutionStrategy.eachDependency {
-        val coordinates = "${requested.group}:${requested.name}"
-        if (requested.group?.startsWith(jacksonGithubForcedGroupPrefix) == true ||
-            coordinates in jacksonGithubForcedModules
-        ) {
+        if (requested.group?.startsWith(jacksonGithubForcedGroupPrefix) == true) {
             useVersion(jacksonGithubForcedVersion)
-            because("#132: force Azure Speech transitive Jackson to patched 2.18 line (CVE-2026-110879)")
+            because("#132: force Azure Speech transitive Jackson to ${jacksonGithubForcedVersion} (CVE-2026-110879)")
         }
     }
 }

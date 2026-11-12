@@ -39,7 +39,8 @@
 #         backticks; subpackages dev.librepocket.mcp.* are in-package; more
 #         than one declaration fails closed — the ONLY allowed
 #         dev.librepocket.* references are the import allowlist
-#         (keystore.KeyVault + the 7 tool contract types), the package decl,
+#         (keystore.KeyVault + the 7 tool contract types + the 8 network-policy
+#         contract types), the package decl,
 #         self-mentions, and KDoc links in comments (blanked before scanning,
 #         so a bracketed/generic FQN in real code or a string is still found) —
 #         any other import (incl. star imports) or fully-qualified outbound use
@@ -3266,8 +3267,11 @@ fi
 # around dots collapsed) so the legal spellings `"dev . librepocket . X"`,
 # `"dev.`librepocket`.X"` and `"dev/*x*/.librepocket.X"` cannot hide it. The
 # only allowed outward
-# types are KeyVault + the 7 tool contract types (and static members/nested
-# types of those types); a subpackage may import a parent-package mcp type;
+# types are KeyVault + the 7 tool contract types + the 8 network-policy contract
+# types (EndpointNetworkOptIn, HostResolver, NetworkDenyCode, NetworkEvaluation,
+# NetworkOptInStore, NetworkPolicy, PinnedNetworkDns, SystemHostResolver)
+# (and static members/nested types of those types); a subpackage may import a
+# parent-package mcp type;
 # star imports to dev.librepocket.* fail; the identifier-aware self-mention
 # strip (full JVM identifier-part predicate) keeps `dev.librepocket.mcpfoo`,
 # `…mcp$Compat`, `…mcpé`, `…mcp\u0301`, `…mcp\u200d` and `…mcp€X` outbound.

@@ -77,6 +77,13 @@ private class DefCapAllowPolicy : PolicyStore {
  * - [orphanPrefixOutsideWindowIsDroppedWhileValidTailSucceeds] pins that an orphan
  *   prefix outside the window is dropped without error while valid tail succeeds,
  *   and fails closed with TOOL_OUTPUT_ORPHAN_ID if kept in-window.
+ * - [invalidDiscardedPrefixDoesNotBreakLaterPairSnapping],
+ *   [invalidDiscardedPrefixUnderBoundedCapAndSendTimeTrim], and
+ *   [malformedBatchAndToolRowWithToolCallsFailClosed] pin Phase A local batch
+ *   boundary snapping: invalid or malformed prefixes wholly before the cut do not
+ *   disable pair-atomic snapping for later valid batches (under count, bounded char,
+ *   and send-time `MAX_REQUEST_CHARS` trims), while `role == "tool"` rows carrying
+ *   `toolCalls` or malformed retained batches fail closed downstream.
  * - [exactMessageCapBoundaries] and [exactCharCapBoundaries] pin exact message and
  *   char count boundaries for history windowing.
  */
@@ -743,5 +750,157 @@ class TurnControllerDefaultCapTest {
     val m41 = msg("x".repeat(41))
     assertEquals(listOf(m41), applyHistoryCap(listOf(m41), cap40))
     assertEquals(listOf(m41), applyHistoryCap(listOf(m1, m41), cap40))
+  }
+
+  @Test(timeout = 30_000) fun invalidDiscardedPrefixDoesNotBreakLaterPairSnapping() {
+    val orphan = ChatMessage(role = "tool", text = "orphan", toolCallId = "unknown")
+    val call = ChatMessage(
+      role = "assistant",
+      text = "call",
+      toolCalls = listOf(ToolCall(id = "a", name = "fn", argumentsJson = "{}")),
+    )
+    val answer = ChatMessage(role = "tool", text = "answer", toolCallId = "a")
+    val tail = ChatMessage(role = "user", text = "tail")
+    val history = listOf(orphan, call, answer, tail)
+
+    val kept4 = applyHistoryCap(history, HistoryWindowCap.MaxMessages(4))
+    assertEquals(history, kept4)
+    try {
+      validateToolPairing(kept4, true)
+      org.junit.Assert.fail("expected orphan tool rejection for MaxMessages(4)")
+    } catch (e: ProviderFailure) {
+      assertTrue(
+        "downstream must fail closed with TOOL_OUTPUT_ORPHAN_ID, got ${e.message}",
+        (e.message ?: "").contains("TOOL_OUTPUT_ORPHAN_ID"),
+      )
+    }
+
+    val kept3 = applyHistoryCap(history, HistoryWindowCap.MaxMessages(3))
+    assertEquals(listOf(call, answer, tail), kept3)
+    assertEquals(listOf(null, "a", null), validateToolPairing(kept3, true))
+
+    val kept2 = applyHistoryCap(history, HistoryWindowCap.MaxMessages(2))
+    assertEquals(listOf(tail), kept2)
+    assertEquals(listOf(null), validateToolPairing(kept2, true))
+
+    val kept1 = applyHistoryCap(history, HistoryWindowCap.MaxMessages(1))
+    assertEquals(listOf(tail), kept1)
+    assertEquals(listOf(null), validateToolPairing(kept1, true))
+  }
+
+  @Test(timeout = 30_000) fun invalidDiscardedPrefixUnderBoundedCapAndSendTimeTrim() {
+    // Part 1: Bounded char-leg and count-leg cuts after an orphan prefix.
+    val orphan = ChatMessage(role = "tool", text = "orphan-" + "x".repeat(13), toolCallId = "unknown")
+    val call = ChatMessage(
+      role = "assistant",
+      text = "call-" + "y".repeat(25),
+      toolCalls = listOf(ToolCall(id = "a", name = "fn", argumentsJson = "{}")),
+    )
+    val answer = ChatMessage(role = "tool", text = "ans-" + "z".repeat(6), toolCallId = "a")
+    val tail = ChatMessage(role = "user", text = "tail-" + "w".repeat(5))
+    val boundedHistory = listOf(orphan, call, answer, tail)
+    assertEquals(listOf(20, 30, 10, 10), boundedHistory.map { it.text.length })
+
+    val keptCharBounded = applyHistoryCap(
+      boundedHistory,
+      HistoryWindowCap.Bounded(maxMessages = 10, maxChars = 25),
+    )
+    assertEquals(listOf(tail), keptCharBounded)
+    assertEquals(listOf(null), validateToolPairing(keptCharBounded, true))
+
+    val keptCountBounded = applyHistoryCap(
+      boundedHistory,
+      HistoryWindowCap.Bounded(maxMessages = 2, maxChars = 100),
+    )
+    assertEquals(listOf(tail), keptCountBounded)
+    assertEquals(listOf(null), validateToolPairing(keptCountBounded, true))
+
+    // Part 2: Send-time MAX_REQUEST_CHARS trim under HistoryWindowCap.Unbounded after orphan prefix.
+    val bigOrphan = ChatMessage(
+      role = "tool",
+      text = "orphan:" + "o".repeat(29_993),
+      toolCallId = "unknown",
+    )
+    val bigCallA = ChatMessage(
+      role = "assistant",
+      text = "call:" + "c".repeat(29_995),
+      toolCalls = listOf(ToolCall(id = "a", name = "fn", argumentsJson = "{}")),
+    )
+    val bigToolA = ChatMessage(
+      role = "tool",
+      text = "tool:" + "t".repeat(24_995),
+      toolCallId = "a",
+    )
+    assertEquals(30_000, bigOrphan.text.length)
+    assertEquals(30_000, bigCallA.text.length)
+    assertEquals(25_000, bigToolA.text.length)
+
+    val liveTail = "tail:" + "z".repeat(50_000)
+    val provider = DefCapFakeProvider(doneOnce())
+    val c = controller(provider, listOf(bigOrphan, bigCallA, bigToolA), HistoryWindowCap.Unbounded)
+    try {
+      runBlocking { c.send(liveTail) }
+      val req = provider.seenRequests.single()
+      assertEquals(3, c.lastRequestTrimmedCount)
+      assertEquals(0, c.droppedHistoryCount)
+      assertEquals(1, req.messages.size)
+      assertEquals("user", req.messages.single().role)
+      assertTrue(req.messages.single().text.startsWith("tail:"))
+      assertEquals(listOf(null), validateToolPairing(req.messages, true))
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test(timeout = 30_000) fun malformedBatchAndToolRowWithToolCallsFailClosed() {
+    // Part 1: role == "tool" row carrying non-empty toolCalls causes completeToolBatchEnd to
+    // return -1; MaxMessages(2) keeps [tool, tail] and downstream fails closed.
+    val callA1 = ChatMessage(
+      role = "assistant",
+      text = "call-a",
+      toolCalls = listOf(ToolCall(id = "a", name = "fn", argumentsJson = "{}")),
+    )
+    val toolWithCalls = ChatMessage(
+      role = "tool",
+      text = "out",
+      toolCallId = "a",
+      toolCalls = listOf(ToolCall(id = "b", name = "fn", argumentsJson = "{}")),
+    )
+    val tail1 = ChatMessage(role = "user", text = "tail")
+    val kept1 = applyHistoryCap(
+      listOf(callA1, toolWithCalls, tail1),
+      HistoryWindowCap.MaxMessages(2),
+    )
+    assertEquals(listOf(toolWithCalls, tail1), kept1)
+    try {
+      validateToolPairing(kept1, true)
+      org.junit.Assert.fail("expected TOOL_CALLS_ROLE_MUST_BE_ASSISTANT rejection")
+    } catch (e: ProviderFailure) {
+      assertTrue(
+        "downstream must fail closed with TOOL_CALLS_ROLE_MUST_BE_ASSISTANT, got ${e.message}",
+        (e.message ?: "").contains("TOOL_CALLS_ROLE_MUST_BE_ASSISTANT"),
+      )
+    }
+
+    // Part 2: malformed batch before a valid pair is skipped so later pair snapping still works.
+    val danglingCall = ChatMessage(
+      role = "assistant",
+      text = "dangling",
+      toolCalls = listOf(ToolCall(id = "d", name = "fn", argumentsJson = "{}")),
+    )
+    val orphan = ChatMessage(role = "tool", text = "orphan", toolCallId = "x")
+    val callA2 = ChatMessage(
+      role = "assistant",
+      text = "call-a",
+      toolCalls = listOf(ToolCall(id = "a", name = "fn", argumentsJson = "{}")),
+    )
+    val answerA = ChatMessage(role = "tool", text = "answer-a", toolCallId = "a")
+    val tail2 = ChatMessage(role = "user", text = "tail")
+    val kept2 = applyHistoryCap(
+      listOf(danglingCall, orphan, callA2, answerA, tail2),
+      HistoryWindowCap.MaxMessages(2),
+    )
+    assertEquals(listOf(tail2), kept2)
+    assertEquals(listOf(null), validateToolPairing(kept2, true))
   }
 }

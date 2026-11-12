@@ -10,6 +10,7 @@ import dev.librepocket.keystore.InMemoryPrefs
 import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.policy.PolicyRule
 import dev.librepocket.policy.Verdict
+import dev.librepocket.provider.ChatMessage
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol as ProviderProto
@@ -33,6 +34,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.After
@@ -155,6 +157,24 @@ class B2Phase1DispatcherGrantTest {
         }
     }
 
+    private fun assertToolDeniedReceipt(
+        message: ChatMessage,
+        expectedCallId: String,
+        expectedCode: String,
+        expectedDetail: String? = null,
+    ): JsonObject {
+        assertEquals("tool", message.role)
+        assertEquals(expectedCallId, message.toolCallId)
+        val body = Json.parseToJsonElement(message.text).jsonObject
+        assertEquals("true", body.getValue("denied").jsonPrimitive.content)
+        assertEquals(expectedCallId, body.getValue("callId").jsonPrimitive.content)
+        assertEquals(expectedCode, body.getValue("code").jsonPrimitive.content)
+        if (expectedDetail != null) {
+            assertEquals(expectedDetail, body.getValue("detail").jsonPrimitive.content)
+        }
+        return body
+    }
+
     @Test fun realFactoryRoundTripCompletesFakeToolLoop() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<Application>()
         val store = openDb(app)
@@ -248,6 +268,7 @@ class B2Phase1DispatcherGrantTest {
             val body = Json.parseToJsonElement(result.text).jsonObject
             assertEquals("false", body.getValue("denied").jsonPrimitive.content)
             assertEquals("call-b2-pair", body.getValue("callId").jsonPrimitive.content)
+            assertEquals("lsp.symbols", body.getValue("tool").jsonPrimitive.content)
         } finally {
             closeQuietly(created.session)
         }
@@ -321,9 +342,13 @@ class B2Phase1DispatcherGrantTest {
             assertTrue(created.session.flushDurable(8_000))
             assertEquals(0, backend.invocations.get())
             assertEquals(2, seen.size)
-            val toolTexts = seen[1].messages.filter { it.role == "tool" }.map { it.text }
-            assertEquals(1, toolTexts.size)
-            assertTrue(toolTexts.single().contains(SafeToolSlice.DenyCodes.SCHEMA_INVALID))
+            val toolMessages = seen[1].messages.filter { it.role == "tool" }
+            assertEquals(1, toolMessages.size)
+            assertToolDeniedReceipt(
+                message = toolMessages.single(),
+                expectedCallId = "call-bad",
+                expectedCode = SafeToolSlice.DenyCodes.SCHEMA_INVALID,
+            )
             val events = store.loadEvents(created.sessionId!!, 0, 2000)
             assertFalse("schema denial must not execute backend", events.any { it.text.contains("Foo:example") })
         } finally {
@@ -331,7 +356,7 @@ class B2Phase1DispatcherGrantTest {
         }
     }
 
-    @Test fun scopeMismatchDeniesWithZeroBackendEffects() = runBlocking {
+    @Test fun scopeMismatchDeniesWithZeroBackendEffects(): Unit = runBlocking {
         val app = ApplicationProvider.getApplicationContext<Application>()
         val store = openDb(app)
         val provider = ScriptedProvider()
@@ -370,9 +395,13 @@ class B2Phase1DispatcherGrantTest {
             assertEquals(2, seen.size)
             assertEquals("request must offer tool while switch is ON", 1, seen[0].tools.size)
             assertEquals("lsp.symbols", seen[0].tools.single().name)
-            val toolTexts = seen[1].messages.filter { it.role == "tool" }.map { it.text }
-            assertEquals(1, toolTexts.size)
-            assertTrue(toolTexts.single().contains(SafeToolSlice.DenyCodes.SCOPE_DENIED))
+            val toolMessages = seen[1].messages.filter { it.role == "tool" }
+            assertEquals(1, toolMessages.size)
+            assertToolDeniedReceipt(
+                message = toolMessages.single(),
+                expectedCallId = "call-scope",
+                expectedCode = SafeToolSlice.DenyCodes.SCOPE_DENIED,
+            )
         } finally {
             closeQuietly(created.session)
         }
@@ -453,7 +482,7 @@ class B2Phase1DispatcherGrantTest {
         assertTrue(exSessions.message!!.contains("toolSlice.policy must be identical to ChatSessionFactory's policy"))
     }
 
-    @Test fun latestPolicyDenyAfterOfferDeniesWithZeroBackendEffects() = runBlocking {
+    @Test fun latestPolicyDenyAfterOfferDeniesWithZeroBackendEffects(): Unit = runBlocking {
         val app = ApplicationProvider.getApplicationContext<Application>()
         val store = openDb(app)
         val provider = ScriptedProvider()
@@ -505,9 +534,13 @@ class B2Phase1DispatcherGrantTest {
             assertTrue(created.session.flushDurable(8_000))
             assertEquals(0, backend.invocations.get())
             assertEquals(2, seen.size)
-            val toolTexts = seen[1].messages.filter { it.role == "tool" }.map { it.text }
-            assertEquals(1, toolTexts.size)
-            assertTrue(toolTexts.single().contains(SafeToolSlice.DenyCodes.POLICY_DENIED))
+            val toolMessages = seen[1].messages.filter { it.role == "tool" }
+            assertEquals(1, toolMessages.size)
+            assertToolDeniedReceipt(
+                message = toolMessages.single(),
+                expectedCallId = "call-flip",
+                expectedCode = SafeToolSlice.DenyCodes.POLICY_DENIED,
+            )
         } finally {
             closeQuietly(created.session)
         }
@@ -661,12 +694,13 @@ class B2Phase1DispatcherGrantTest {
             val toolMessages = seen[1].messages.filter { it.role == "tool" }
             assertEquals(1, toolMessages.size)
             val toolMsg = toolMessages.single()
-            assertEquals("call-fail", toolMsg.toolCallId)
             assertTrue(seen[1].tools.isEmpty())
-            val body = Json.parseToJsonElement(toolMsg.text).jsonObject
-            assertEquals("true", body.getValue("denied").jsonPrimitive.content)
-            assertEquals(SafeToolSlice.DenyCodes.EXEC_ERROR, body.getValue("code").jsonPrimitive.content)
-            assertEquals("backend failed", body.getValue("detail").jsonPrimitive.content)
+            assertToolDeniedReceipt(
+                message = toolMsg,
+                expectedCallId = "call-fail",
+                expectedCode = SafeToolSlice.DenyCodes.EXEC_ERROR,
+                expectedDetail = "backend failed",
+            )
             assertFalse("raw exception message must not leak to wire", toolMsg.text.contains("LSP process terminated unexpectedly"))
             val sid = checkNotNull(created.sessionId)
             val events = store.loadEvents(sid, 0, 2000)
@@ -714,10 +748,16 @@ class B2Phase1DispatcherGrantTest {
             assertTrue(seen[1].tools.isEmpty())
             val toolMessages = seen[1].messages.filter { it.role == "tool" }
             assertEquals(2, toolMessages.size)
-            assertEquals("call-1", toolMessages[0].toolCallId)
-            assertEquals("call-2", toolMessages[1].toolCallId)
-            assertTrue("first call must be denied with BUDGET_EXCEEDED: ${toolMessages[0].text}", toolMessages[0].text.contains(SafeToolSlice.DenyCodes.BUDGET_EXCEEDED))
-            assertTrue("second call must be denied with BUDGET_EXCEEDED: ${toolMessages[1].text}", toolMessages[1].text.contains(SafeToolSlice.DenyCodes.BUDGET_EXCEEDED))
+            assertToolDeniedReceipt(
+                message = toolMessages[0],
+                expectedCallId = "call-1",
+                expectedCode = SafeToolSlice.DenyCodes.BUDGET_EXCEEDED,
+            )
+            assertToolDeniedReceipt(
+                message = toolMessages[1],
+                expectedCallId = "call-2",
+                expectedCode = SafeToolSlice.DenyCodes.BUDGET_EXCEEDED,
+            )
             val sid = checkNotNull(created.sessionId)
             val events = store.loadEvents(sid, 0, 2000)
             assertEquals(2, events.sumOf { it.text.split("[tool-result:lsp.symbols").size - 1 })
@@ -746,7 +786,7 @@ class B2Phase1DispatcherGrantTest {
         val requests = AtomicInteger(0)
         val seen = CopyOnWriteArrayList<ChatRequest>()
         val toolSlice = slice(policy, backend)
-        toolSlice.backendTimeoutMillisForTest = 50L
+        toolSlice.backendTimeoutMillisForTest = 250L
         val f = factory(app, store, policy, provider, toolSlice)
 
         provider.handler = { request ->
@@ -772,10 +812,12 @@ class B2Phase1DispatcherGrantTest {
             assertTrue(seen[1].tools.isEmpty())
             val toolMessages = seen[1].messages.filter { it.role == "tool" }
             assertEquals(1, toolMessages.size)
-            val toolMsg = toolMessages.single()
-            assertEquals("call-slow", toolMsg.toolCallId)
-            assertTrue("message must contain EXEC_DENIED: ${toolMsg.text}", toolMsg.text.contains(SafeToolSlice.DenyCodes.EXEC_DENIED))
-            assertTrue("message must contain 'backend timed out': ${toolMsg.text}", toolMsg.text.contains("backend timed out"))
+            assertToolDeniedReceipt(
+                message = toolMessages.single(),
+                expectedCallId = "call-slow",
+                expectedCode = SafeToolSlice.DenyCodes.EXEC_DENIED,
+                expectedDetail = "backend timed out",
+            )
             val sid = checkNotNull(created.sessionId)
             val events = store.loadEvents(sid, 0, 2000)
             assertTrue("missing tool result marker: $events", events.any { it.text.contains("[tool-result:lsp.symbols") })

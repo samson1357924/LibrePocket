@@ -96,7 +96,7 @@ EXPECTED_WORKFLOW_SHA256 = {
         "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564"
     ),
     "pr-check.yml": (
-        "397af6a0ad4e2aece48d64db411ff808b4a0ff865dfa1914ca513b2836c64534"
+        "ac3219626c0a419bc7bf72373c7b5496fb8a1b34456830c6654c5561825e2455"
     ),
     "release.yml": (
         "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f"

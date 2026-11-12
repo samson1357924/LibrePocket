@@ -124,6 +124,30 @@ android {
     }
 }
 
+// Issue #132 phase 1: Azure Speech's azure-core declares Jackson 2.18.7.
+// The github-only platform BOM upgrades the selected version, but resolution
+// still records the vulnerable 2.18.7 metadata. Substitute the version
+// up-front, scoped to Github configurations only — foss/play classpaths must
+// stay Jackson-free (JacksonFossIsolationTest / JacksonPlayIsolationTest guard
+// this). platform(libs.jackson.bom) in dependencies{} stays as version source.
+val jacksonGithubForcedVersion = libs.versions.jacksonBom.get()
+// Match by group prefix so future com.fasterxml.jackson.* modules pulled in
+// transitively (e.g. dataformat) are covered as well.
+val jacksonGithubForcedGroupPrefix = "com.fasterxml.jackson."
+
+// NOTE: variant configurations use a lowercase "github" prefix
+// (githubDebugRuntimeClasspath), while test configurations use "Github"
+// (testGithubDebugUnitTestRuntimeClasspath) — match case-insensitively so
+// both are covered, and foss/play (no "github" substring) stay untouched.
+configurations.matching { it.name.contains("github", ignoreCase = true) }.all {
+    resolutionStrategy.eachDependency {
+        if (requested.group?.startsWith(jacksonGithubForcedGroupPrefix) == true) {
+            useVersion(jacksonGithubForcedVersion)
+            because("#132: force Azure Speech transitive Jackson to ${jacksonGithubForcedVersion} (CVE-2026-110879)")
+        }
+    }
+}
+
 dependencies {
     // Compose UI: MainScreen + Theme + NavHost (Gemini/ChatGPT-style chat).
     implementation(platform(libs.compose.bom))
@@ -196,4 +220,125 @@ dependencies {
     // references (store compliance; play AAPT gate asserts this).
     "githubImplementation"(libs.shizuku.api)
     "githubImplementation"(libs.shizuku.provider)
+}
+
+// Issue #132: verification guard for Jackson flavor scoping/resolution.
+// Ensures github configurations resolve only the forced Jackson version and
+// foss/play configurations resolve no com.fasterxml.jackson artifacts.
+tasks.register("verifyJacksonFlavorIsolation") {
+    group = "verification"
+    description = "Verifies Jackson is forced to " + jacksonGithubForcedVersion + " on github configs and absent from foss/play configs"
+    // Resolves live project configurations; not intended for configuration cache.
+    notCompatibleWithConfigurationCache("Resolves project configurations at execution time for dependency verification")
+
+    doLast {
+        val forcedVersion = jacksonGithubForcedVersion
+        val jacksonGroupPrefix = jacksonGithubForcedGroupPrefix
+        val problems = mutableListOf<String>()
+        val inspected = mutableListOf<String>()
+        val githubConfigsResolvedCleanly = mutableListOf<String>()
+        val githubConfigsWithJackson = mutableListOf<String>()
+
+        configurations
+            .filter { it.isCanBeResolved }
+            .sortedBy { it.name }
+            .forEach { cfg ->
+                val name = cfg.name
+                val isGithub = name.contains("github", ignoreCase = true)
+                val isFossOrPlay = name.contains("foss", ignoreCase = true) || name.contains("play", ignoreCase = true)
+                if (!isGithub && !isFossOrPlay) return@forEach
+
+                val jacksonComponents = try {
+                    val resolutionResult = cfg.incoming.resolutionResult
+                    val unresolved = resolutionResult.allDependencies
+                        .filterIsInstance<org.gradle.api.artifacts.result.UnresolvedDependencyResult>()
+                    if (unresolved.isNotEmpty()) {
+                        val unresolvedDetails = unresolved.map { dep ->
+                            val requested = dep.requested.displayName
+                            val reason = dep.failure.message ?: dep.failure.javaClass.simpleName
+                            requested + " (" + reason + ")"
+                        }.sorted().joinToString()
+                        problems += "Configuration '" + name + "' has unresolved dependencies: " + unresolvedDetails
+                        null
+                    } else {
+                        resolutionResult.allComponents
+                            .mapNotNull { component ->
+                                val id = component.moduleVersion ?: return@mapNotNull null
+                                val group = id.group
+                                val moduleName = id.name
+                                val version = id.version
+                                if (group.startsWith(jacksonGroupPrefix)) {
+                                    group + ":" + moduleName + ":" + version
+                                } else {
+                                    null
+                                }
+                            }
+                            .toSortedSet()
+                    }
+                } catch (e: Exception) {
+                    val errorType = e.javaClass.simpleName
+                    val errorMessage = e.message ?: "no message"
+                    problems += "Configuration '" + name + "' could not be resolved for Jackson verification: " + errorType + ": " + errorMessage
+                    null
+                }
+
+                if (jacksonComponents == null) {
+                    inspected += name
+                    return@forEach
+                }
+
+                inspected += name
+                if (isGithub) {
+                    githubConfigsResolvedCleanly += name
+                }
+
+                if (isFossOrPlay) {
+                    if (jacksonComponents.isNotEmpty()) {
+                        val resolved = jacksonComponents.joinToString()
+                        problems += "Configuration '" + name + "' (foss/play) must not resolve Jackson artifacts but resolved: " + resolved
+                    }
+                } else {
+                    if (jacksonComponents.isNotEmpty()) {
+                        githubConfigsWithJackson += name
+                        val forcedSuffix = ":" + forcedVersion
+                        val bad = jacksonComponents.filterNot { it.endsWith(forcedSuffix) }
+                        if (bad.isNotEmpty()) {
+                            val resolvedBad = bad.joinToString()
+                            problems += "Configuration '" + name + "' (github) resolved non-forced Jackson artifacts: " + resolvedBad + " (expected all " + forcedSuffix + ")"
+                        }
+                    }
+                }
+            }
+
+        if (inspected.none { it.contains("github", ignoreCase = true) }) {
+            problems += "No resolvable github configurations were inspected; cannot verify Jackson forcing"
+        }
+        if (inspected.none { it.contains("foss", ignoreCase = true) || it.contains("play", ignoreCase = true) }) {
+            problems += "No resolvable foss/play configurations were inspected; cannot verify Jackson absence"
+        }
+        val inspectedGithubConfigs = inspected.any { it.contains("github", ignoreCase = true) }
+        if (inspectedGithubConfigs && githubConfigsResolvedCleanly.isEmpty()) {
+            problems += "No github configuration resolved successfully for Jackson verification"
+        } else if (githubConfigsResolvedCleanly.isNotEmpty() && githubConfigsWithJackson.isEmpty()) {
+            problems += "No successfully resolved github configuration contained com.fasterxml.jackson.* artifacts; expected Azure Speech github graph to include Jackson"
+        }
+
+        if (problems.isNotEmpty()) {
+            val inspectedCount = inspected.size.toString()
+            val details = problems.joinToString("\n - ")
+            throw GradleException(
+                "Jackson flavor isolation verification failed (inspected=" + inspectedCount + "):\n - " + details
+            )
+        }
+
+        val inspectedCount = inspected.size.toString()
+        val githubCount = githubConfigsWithJackson.size.toString()
+        logger.lifecycle(
+            "verifyJacksonFlavorIsolation: OK (forced=" + forcedVersion + ", inspected=" + inspectedCount + ", githubWithJackson=" + githubCount + ")"
+        )
+    }
+}
+
+tasks.named("check") {
+    dependsOn(tasks.named("verifyJacksonFlavorIsolation"))
 }

@@ -71,6 +71,9 @@ private class DefCapAllowPolicy : PolicyStore {
  *   out-of-order result resolution, sequential round boundaries, degenerate snap-past-end,
  *   no orphan special-case in the window (retain + downstream `validateToolPairing` fail-closed),
  *   and naive-cut fallback for globally unpaired histories.
+ * - [sendTimeTrimPreservesToolPairAtomicityUnderUnbounded] and
+ *   [sendTimeTrimRetainsIntactPairWhenHeadPlainMessageDrops] pin the second trim layer
+ *   (send-time MAX_REQUEST_CHARS) pair-atomicity under Unbounded historyCap.
  */
 class TurnControllerDefaultCapTest {
 
@@ -620,5 +623,55 @@ class TurnControllerDefaultCapTest {
       listOf(null, "call-a", "call-b", null),
       validateToolPairing(history, true),
     )
+  }
+
+  @Test(timeout = 30_000) fun sendTimeTrimPreservesToolPairAtomicityUnderUnbounded() {
+    val call = ChatMessage(
+      role = "assistant",
+      text = "call:" + "x".repeat(30_000),
+      toolCalls = listOf(ToolCall("c1", "tool", "{}")),
+    )
+    val result = ChatMessage(role = "tool", text = "out:" + "y".repeat(25_000), toolCallId = "c1")
+    val tail = "tail:" + "z".repeat(50_000)
+    val provider = DefCapFakeProvider(doneOnce())
+    val c = controller(provider, listOf(call, result), HistoryWindowCap.Unbounded)
+    try {
+      runBlocking { c.send(tail) }
+      assertEquals(2, c.lastRequestTrimmedCount)
+      val req = provider.seenRequests.single()
+      assertTrue("shipped messages must contain no orphan tool messages", req.messages.none { it.role == "tool" })
+      assertEquals(1, req.messages.size)
+      assertEquals("user", req.messages.single().role)
+      assertTrue(req.messages.single().text.startsWith("tail:"))
+      validateToolPairing(req.messages, true)
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test(timeout = 30_000) fun sendTimeTrimRetainsIntactPairWhenHeadPlainMessageDrops() {
+    val u0 = ChatMessage(role = "user", text = "u0:" + "a".repeat(30_000))
+    val call = ChatMessage(
+      role = "assistant",
+      text = "call:" + "x".repeat(20_000),
+      toolCalls = listOf(ToolCall("c1", "tool", "{}")),
+    )
+    val result = ChatMessage(role = "tool", text = "out:" + "y".repeat(20_000), toolCallId = "c1")
+    val tail = "tail:" + "z".repeat(40_000)
+    val provider = DefCapFakeProvider(doneOnce())
+    val c = controller(provider, listOf(u0, call, result), HistoryWindowCap.Unbounded)
+    try {
+      runBlocking { c.send(tail) }
+      assertEquals(1, c.lastRequestTrimmedCount)
+      val req = provider.seenRequests.single()
+      assertEquals(3, req.messages.size)
+      assertEquals(listOf("assistant", "tool", "user"), req.messages.map { it.role })
+      assertEquals(call.text, req.messages[0].text)
+      assertEquals(result.text, req.messages[1].text)
+      assertTrue(req.messages[2].text.startsWith("tail:"))
+      validateToolPairing(req.messages, true)
+    } finally {
+      c.close()
+    }
   }
 }

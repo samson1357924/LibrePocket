@@ -1,5 +1,6 @@
 package dev.librepocket.router
 
+import androidx.annotation.VisibleForTesting
 import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.ChatMessage
@@ -121,7 +122,7 @@ import kotlin.coroutines.coroutineContext
  */
 class SafeToolSlice(
     private val ctxSupplier: () -> ProjectionContext = { ProjectionContext() },
-    private val policy: PolicyStore,
+    internal val policy: PolicyStore,
     private val backend: LspTools.Backend = LspTools.StubBackend,
     private val clock: Clock = Clock.systemDefaultZone(),
     val maxCallsPerTurn: Int = 1,
@@ -475,6 +476,7 @@ class SafeToolSlice(
      * volatile so a mid-turn install from the test thread is visible to the
      * turn dispatcher thread.
      */
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
     @Volatile
     internal var beforeExecuteForTest: (suspend () -> Unit)? = null
 
@@ -489,6 +491,7 @@ class SafeToolSlice(
      * Volatile for the same cross-thread install reason as
      * [beforeExecuteForTest].
      */
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
     @Volatile
     internal var backendTimeoutMillisForTest: Long? = null
 

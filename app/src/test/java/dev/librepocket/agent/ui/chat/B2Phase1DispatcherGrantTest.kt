@@ -36,6 +36,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -125,8 +126,14 @@ class B2Phase1DispatcherGrantTest {
         policy: dev.librepocket.policy.PolicyStore,
         backend: LspTools.Backend,
         switches: Map<String, Boolean> = mapOf("lsp" to true),
+    ) = slice(policy, backend) { switches }
+
+    private fun slice(
+        policy: dev.librepocket.policy.PolicyStore,
+        backend: LspTools.Backend,
+        switchesSupplier: () -> Map<String, Boolean>,
     ) = SafeToolSlice(
-        ctxSupplier = { ProjectionContext(userSwitches = switches) },
+        ctxSupplier = { ProjectionContext(userSwitches = switchesSupplier()) },
         policy = policy,
         backend = backend,
     )
@@ -322,13 +329,18 @@ class B2Phase1DispatcherGrantTest {
         val backend = CountingBackend()
         val requests = AtomicInteger(0)
         val seen = mutableListOf<ChatRequest>()
-        // Switch off: request offers nothing, execution re-checks latest scope.
-        val f = factory(app, store, policy, provider, slice(policy, backend, mapOf("lsp" to false)))
+        val switchOn = AtomicBoolean(true)
+        // Switch ON at offer time: request offers tool. Switch flips to OFF between offer
+        // and execution: fresh projection re-check must deny with SCOPE_DENIED.
+        val f = factory(app, store, policy, provider, slice(policy, backend) { mapOf("lsp" to switchOn.get()) })
 
         provider.handler = { request ->
             seen.add(request)
             if (requests.incrementAndGet() == 1) {
-                assertTrue("switch-off request must be pure chat", request.tools.isEmpty())
+                assertEquals("request must offer tool while switch is ON", 1, request.tools.size)
+                assertEquals("lsp.symbols", request.tools.single().name)
+                // Switch flips to OFF between offer and execution: fresh projection must deny.
+                switchOn.set(false)
                 flow {
                     emit(StreamEvent.ToolDone(0, "call-scope", "lsp.symbols", """{"query":"Foo"}"""))
                     emit(StreamEvent.Done("tool_calls"))
@@ -353,6 +365,72 @@ class B2Phase1DispatcherGrantTest {
         } finally {
             closeQuietly(created.session)
         }
+    }
+
+    @Test fun unsolicitedToolCallWhenSwitchFlipsOffToOnStaysRecordsOnly() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val store = openDb(app)
+        val provider = ScriptedProvider()
+        val policy = allowKeyReadPolicy()
+        policy.setRule(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 20))
+        val backend = CountingBackend()
+        val requests = AtomicInteger(0)
+        val seen = mutableListOf<ChatRequest>()
+        val switchOn = AtomicBoolean(false)
+        // Switch is OFF at offer time: request offers nothing. Switch flips ON mid-turn, but
+        // unsolicited tool call must stay records-only and never execute or continue the turn.
+        val f = factory(app, store, policy, provider, slice(policy, backend) { mapOf("lsp" to switchOn.get()) })
+
+        provider.handler = { request ->
+            seen.add(request)
+            requests.incrementAndGet()
+            assertTrue("switch-off request must offer no tools", request.tools.isEmpty())
+            // Switch flips ON mid-turn after request was sent:
+            switchOn.set(true)
+            flow {
+                emit(StreamEvent.ToolDone(0, "call-unsolicited", "lsp.symbols", """{"query":"Foo"}"""))
+                emit(StreamEvent.TextDelta(0, 0, "未提供工具"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+
+        val created = f.sessions.create(endpoint(), "B2 未主動提供工具", allowAsk = false, keyIsCurrent = { true })
+        try {
+            created.session.send("查 Foo")
+            assertTrue(created.session.flushDurable(8_000))
+            assertEquals(0, backend.invocations.get())
+            // Must stay records-only: never continues the turn
+            assertEquals(1, seen.size)
+            val events = store.loadEvents(created.sessionId!!, 0, 2000)
+            assertTrue(events.any { it.text.contains("[tool:lsp.symbols") })
+            assertFalse(events.any { it.text.contains("[tool-result:") })
+        } finally {
+            closeQuietly(created.session)
+        }
+    }
+
+    @Test fun mismatchedPolicyThrowsIllegalArgumentException() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val store = openDb(app)
+        val provider = ScriptedProvider()
+        val factoryPolicy = allowKeyReadPolicy()
+        val slicePolicy = allowKeyReadPolicy()
+        val backend = CountingBackend()
+        val slice = slice(slicePolicy, backend)
+
+        val ex = assertThrows(IllegalArgumentException::class.java) {
+            factory(app, store, factoryPolicy, provider, slice)
+        }
+        assertTrue(ex.message!!.contains("prevent policy split-brain"))
+
+        val exSessions = assertThrows(IllegalArgumentException::class.java) {
+            ChatSessionFactory(
+                policy = factoryPolicy,
+                vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+                toolSlice = slice,
+            )
+        }
+        assertTrue(exSessions.message!!.contains("toolSlice.policy must be identical to ChatSessionFactory's policy"))
     }
 
     @Test fun latestPolicyDenyAfterOfferDeniesWithZeroBackendEffects() = runBlocking {

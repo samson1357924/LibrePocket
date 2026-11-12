@@ -353,6 +353,13 @@ jobs:
       - name: Run APK policy and release-identity harnesses
         run: PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 python3 -P -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py scripts/tests/test_gradle_wrapper_checksum.py scripts/tests/test_verify_jdk_floor.py scripts/tests/test_workflow_policy.py scripts/tests/test_verification_metadata.py scripts/tests/test_osv_scan.py
 
+      # Verification gate (issue #20): run the production validator itself,
+      # not just its static tests — Gradle enforces verification-metadata by
+      # default on every build, and this step makes a silenced
+      # <verify-metadata> (or any checksum-shape drift) an explicit red gate.
+      - name: Verify dependency metadata gate (strict checksums)
+        run: python3 -P scripts/verify_verification_metadata.py
+
       # PR #87 P2-4: script-only diffs (code == false) skip the unit-tests job
       # that hosts the write-budget gate, so the repo-wide scan runs here too —
       # the harness tests alone only cover the scripts' own logic, never the

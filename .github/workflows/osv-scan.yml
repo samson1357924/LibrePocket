@@ -1,0 +1,48 @@
+name: OSV Monitor Scan
+
+# Monitor-only (issue #20): weekly OSV querybatch scan over the direct
+# catalog dependencies parsed by scripts/osv_scan.py. This workflow never
+# blocks PRs (schedule + dispatch only), never opens issues automatically,
+# and never upgrades dependencies — the script exits 0 (clean), 1 (vulns
+# found, monitor signal) or 2 (fail-closed error). Any non-zero exit fails
+# this run red so the signal and the network-failure record stay visible;
+# the JSON report is uploaded whenever it was written (vulns included).
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  osv-scan:
+    name: OSV Monitor Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Reject Python import shadowing
+        run: |
+          chmod +x scripts/check_python_shadowing.sh
+          scripts/check_python_shadowing.sh
+
+      - name: Run OSV monitor scan (read-only, no upgrades)
+        run: python3 -P scripts/osv_scan.py --format json --output osv-report.json
+
+      - name: Upload OSV report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: osv-scan-report
+          path: osv-report.json
+          retention-days: 14
+          if-no-files-found: warn

@@ -264,7 +264,7 @@ def validate_gradle_files(root: Path = ROOT) -> None:
         except ValueError:
             return True
         return not any(
-            part in ("build", "node_modules", ".git", ".gradle") or part.startswith(".")
+            part in ("build", "node_modules") or part.startswith(".")
             for part in rel.parts[:-1]
         )
 

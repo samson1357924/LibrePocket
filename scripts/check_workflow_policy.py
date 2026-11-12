@@ -103,7 +103,7 @@ EXPECTED_WORKFLOW_SHA256 = {
         "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564"
     ),
     "pr-check.yml": (
-        "736fe1542df26a14750175191e48e339588c075cc9d2a57df7859bad4743793b"
+        "b3a34f2e6af595e5d9b9dcfefa2a6f8b4792b488a9263ae35c66298935683bc2"
     ),
     "release.yml": (
         "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f"
@@ -217,6 +217,11 @@ EXPECTED_CODE_FILTER_PATHS = frozenset(
         "settings.gradle.kts",
         "build.gradle.kts",
         "gradle.properties",
+        "**/gradle.properties",
+        "*.gradle",
+        "**/*.gradle",
+        "*.gradle.kts",
+        "**/*.gradle.kts",
         ".github/workflows/pr-check.yml",
     }
 )
@@ -225,11 +230,16 @@ EXPECTED_POLICY_FILTER_PATHS = frozenset(
         "gradle/wrapper/**",
         "gradle/**",
         "gradle.properties",
+        "**/gradle.properties",
         "gradlew",
         "gradlew.bat",
         "app/build.gradle.kts",
         "build.gradle.kts",
         "settings.gradle.kts",
+        "*.gradle",
+        "**/*.gradle",
+        "*.gradle.kts",
+        "**/*.gradle.kts",
         "scripts/play_policy_check.sh",
         "scripts/apk_policy_inspect.py",
         "scripts/backup_rules_check.py",

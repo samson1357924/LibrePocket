@@ -14,10 +14,14 @@ only; it has no `workflow_dispatch` trigger. Within a triggered run, a
 `changes` job classifies changed paths
 with `dorny/paths-filter` into `code` (`app/src/**`,
 `app/build.gradle.kts`, `app/lint.xml`, `gradle/**`,
-`settings.gradle.kts`, `build.gradle.kts`, `gradle.properties`, `gradlew`, `gradlew.bat`,
+`settings.gradle.kts`, `build.gradle.kts`, `gradle.properties`,
+`**/gradle.properties`, `*.gradle`, `**/*.gradle`, `*.gradle.kts`,
+`**/*.gradle.kts`, `gradlew`, `gradlew.bat`,
 `.github/workflows/pr-check.yml`) and `policy`
-(`gradle/wrapper/**`, `gradle/**`, `gradle.properties`, `gradlew`, `gradlew.bat`,
+(`gradle/wrapper/**`, `gradle/**`, `gradle.properties`,
+`**/gradle.properties`, `gradlew`, `gradlew.bat`,
 `app/build.gradle.kts`, `build.gradle.kts`, `settings.gradle.kts`,
+`*.gradle`, `**/*.gradle`, `*.gradle.kts`, `**/*.gradle.kts`,
 `scripts/play_policy_check.sh`, `scripts/apk_policy_inspect.py`,
 `scripts/backup_rules_check.py`,
 `scripts/nsc_check.py`,

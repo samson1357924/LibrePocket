@@ -68,6 +68,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.librepocket.agent.R
+import dev.librepocket.agent.assistant.AssistantVoice
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.tool.DenyReason
@@ -301,6 +302,7 @@ fun ChatScreen(
     val sttLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
+        check(!AssistantVoice.AUTO_SEND_AFTER_VOICE) { "voice auto-send is locked off (#137 C2)" }
         if (result.resultCode == Activity.RESULT_OK) {
             val candidates = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
             val text = VoiceStt.pickResult(candidates)

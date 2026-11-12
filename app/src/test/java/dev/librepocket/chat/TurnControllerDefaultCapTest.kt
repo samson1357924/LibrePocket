@@ -63,10 +63,14 @@ private class DefCapAllowPolicy : PolicyStore {
  *   send-time trim, and char reconciliation.
  * - [boundedTakesMaxLegThenSnapsForwardOverPair],
  *   [multiCallBatchSnapsForwardWhole], [orphanNewestToolRowRetainedForDownstreamReject],
- *   and [globallyUnpairedHistoryFallsBackToNaiveCut] pin the snap semantics:
- *   dual-leg max, whole-batch snap, no orphan special-case in the window
- *   (retain + downstream `validateToolPairing` fail-closed), and naive-cut
- *   fallback for globally unpaired histories.
+ *   [globallyUnpairedHistoryFallsBackToNaiveCut], [singlePendingBackfillSnapsPairAtomically],
+ *   [degenerateSnapPastEndYieldsEmptyList],
+ *   [multiTurnSequentialToolRoundsSnapCleanlyToIntermediateBoundary], and
+ *   [outOfOrderBatchToolResultsResolveToCleanTurnBoundary] pin the snap semantics:
+ *   dual-leg max, whole-batch snap, single-pending backfill matching ProviderJson,
+ *   out-of-order result resolution, sequential round boundaries, degenerate snap-past-end,
+ *   no orphan special-case in the window (retain + downstream `validateToolPairing` fail-closed),
+ *   and naive-cut fallback for globally unpaired histories.
  */
 class TurnControllerDefaultCapTest {
 
@@ -472,12 +476,16 @@ class TurnControllerDefaultCapTest {
         (e.message ?: "").contains("TOOL_CALLS_UNRESOLVED"),
       )
     }
-    // Case 2: blank toolCallId. The history is globally unpaired, so the
+    // Case 2: blank toolCallId with multiple pending calls. Since pending.size == 2,
+    // backfill is ambiguous and fails, so the history is globally unpaired and the
     // naive MaxMessages(2) cut [tool(blank), tail] is preserved as-is.
     val blankCall = ChatMessage(
       role = "assistant",
       text = "calling",
-      toolCalls = listOf(ToolCall(id = "call-e", name = "lsp.symbols", argumentsJson = """{"query":"E"}""")),
+      toolCalls = listOf(
+        ToolCall(id = "c1", name = "lsp.symbols", argumentsJson = """{"query":"E1"}"""),
+        ToolCall(id = "c2", name = "lsp.symbols", argumentsJson = """{"query":"E2"}"""),
+      ),
     )
     val blankTool = ChatMessage(role = "tool", text = "out", toolCallId = "   ")
     val blankTail = ChatMessage(role = "user", text = "tail")
@@ -492,6 +500,93 @@ class TurnControllerDefaultCapTest {
     } catch (_: ProviderFailure) {
       // expected: the naive cut is still unpaired, downstream fails closed.
     }
+  }
+
+  @Test(timeout = 30_000) fun singlePendingBackfillSnapsPairAtomically() {
+    // Single-pending backfill matching ProviderJson.validateToolPairing(..., allowChatBackfill = true):
+    // A tool row with null id matches the single pending tool call, so the pair is
+    // recognized as valid. Naive cut inside the pair (MaxMessages(2)) snaps forward
+    // past the pair to [tail], while MaxMessages(3) keeps all 3 whole and downstream
+    // validateToolPairing(history, true) succeeds.
+    val call = ChatMessage(
+      role = "assistant",
+      text = "calling",
+      toolCalls = listOf(ToolCall(id = "c1", name = "lsp.symbols", argumentsJson = """{"query":"A"}""")),
+    )
+    val result = ChatMessage(role = "tool", text = "out", toolCallId = null)
+    val tail = ChatMessage(role = "user", text = "tail")
+    val history = listOf(call, result, tail)
+
+    val kept2 = applyHistoryCap(history, HistoryWindowCap.MaxMessages(2))
+    assertEquals(listOf("tail"), kept2.map { it.text })
+
+    val kept3 = applyHistoryCap(history, HistoryWindowCap.MaxMessages(3))
+    assertEquals(listOf("calling", "out", "tail"), kept3.map { it.text })
+    assertEquals(listOf(null, "c1", null), validateToolPairing(history, true))
+  }
+
+  @Test(timeout = 30_000) fun degenerateSnapPastEndYieldsEmptyList() {
+    // Degenerate snap-past-end: history ends with a pair [call, tool].
+    // MaxMessages(1) naively cuts to [tool], which would be an orphan.
+    // Boundary snap snaps forward past the end (cut = 2), yielding emptyList().
+    val call = ChatMessage(
+      role = "assistant",
+      text = "calling",
+      toolCalls = listOf(ToolCall(id = "c1", name = "lsp.symbols", argumentsJson = """{"query":"A"}""")),
+    )
+    val res = ChatMessage(role = "tool", text = "out", toolCallId = "c1")
+    val history = listOf(call, res)
+
+    val kept = applyHistoryCap(history, HistoryWindowCap.MaxMessages(1))
+    assertEquals(emptyList<ChatMessage>(), kept)
+  }
+
+  @Test(timeout = 30_000) fun multiTurnSequentialToolRoundsSnapCleanlyToIntermediateBoundary() {
+    val u0 = ChatMessage(role = "user", text = "u0")
+    val call1 = ChatMessage(
+      role = "assistant",
+      text = "call1",
+      toolCalls = listOf(ToolCall(id = "c1", name = "fn", argumentsJson = "{}")),
+    )
+    val res1 = ChatMessage(role = "tool", text = "res1", toolCallId = "c1")
+    val u1 = ChatMessage(role = "user", text = "u1")
+    val call2 = ChatMessage(
+      role = "assistant",
+      text = "call2",
+      toolCalls = listOf(ToolCall(id = "c2", name = "fn", argumentsJson = "{}")),
+    )
+    val res2 = ChatMessage(role = "tool", text = "res2", toolCallId = "c2")
+    val tail = ChatMessage(role = "user", text = "tail")
+    val history = listOf(u0, call1, res1, u1, call2, res2, tail)
+
+    val kept = applyHistoryCap(history, HistoryWindowCap.MaxMessages(5))
+    assertEquals(listOf("u1", "call2", "res2", "tail"), kept.map { it.text })
+    assertEquals(listOf(null, null, "c2", null), validateToolPairing(kept, true))
+  }
+
+  @Test(timeout = 30_000) fun outOfOrderBatchToolResultsResolveToCleanTurnBoundary() {
+    val batch = ChatMessage(
+      role = "assistant",
+      text = "calling-both",
+      toolCalls = listOf(
+        ToolCall(id = "c1", name = "lsp.symbols", argumentsJson = """{"query":"A"}"""),
+        ToolCall(id = "c2", name = "lsp.symbols", argumentsJson = """{"query":"B"}"""),
+      ),
+    )
+    val res2 = ChatMessage(role = "tool", text = "out-2", toolCallId = "c2")
+    val res1 = ChatMessage(role = "tool", text = "out-1", toolCallId = "c1")
+    val tail = ChatMessage(role = "user", text = "tail")
+    val history = listOf(batch, res2, res1, tail)
+
+    // Naive cut between res2 and res1 (MaxMessages(2) -> naiveStart = 2, landing on res1)
+    // snaps forward past the whole batch to [tail].
+    val kept = applyHistoryCap(history, HistoryWindowCap.MaxMessages(2))
+    assertEquals(listOf("tail"), kept.map { it.text })
+
+    // When all 4 are within cap, out-of-order results drain pending cleanly and validate downstream.
+    val keptAll = applyHistoryCap(history, HistoryWindowCap.MaxMessages(4))
+    assertEquals(listOf("calling-both", "out-2", "out-1", "tail"), keptAll.map { it.text })
+    assertEquals(listOf(null, "c2", "c1", null), validateToolPairing(keptAll, true))
   }
 
   @Test(timeout = 30_000) fun multiCallBatchSnapsForwardWhole() {

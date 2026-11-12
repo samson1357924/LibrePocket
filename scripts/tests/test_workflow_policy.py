@@ -11,7 +11,6 @@ Run with: python3 -m unittest scripts/tests/test_workflow_policy.py
 
 from __future__ import annotations
 
-import fnmatch
 import io
 import re
 import shutil
@@ -73,6 +72,31 @@ def remove_job(text: str, name: str) -> str:
             end = index
             break
     return "".join(lines[:start] + lines[end:])
+
+
+def _path_match(path: str, pattern: str) -> bool:
+    """Path-aware glob matching where * does not cross / and **/ matches any depth."""
+    parts: list[str] = ["^"]
+    index = 0
+    length = len(pattern)
+    while index < length:
+        if pattern[index : index + 3] == "**/":
+            parts.append("(?:[^/]+/)*")
+            index += 3
+        elif pattern[index : index + 2] == "**":
+            parts.append(".*")
+            index += 2
+        elif pattern[index] == "*":
+            parts.append("[^/]*")
+            index += 1
+        elif pattern[index] == "?":
+            parts.append("[^/]")
+            index += 1
+        else:
+            parts.append(re.escape(pattern[index]))
+            index += 1
+    parts.append(r"\Z")
+    return re.match("".join(parts), path) is not None
 
 
 class WorkflowPolicyHarness(unittest.TestCase):
@@ -1784,66 +1808,116 @@ jobs:
         )
         self._assert_rejected("policy filter is missing: .github/workflows/**")
 
+    def _remove_filter_pattern(self, filter_name: str, pattern: str) -> str:
+        markers = {
+            "code": ("            code:\n", "            policy:\n"),
+            "policy": ("            policy:\n", "            bot:\n"),
+        }
+        start_marker, end_marker = markers[filter_name]
+        start = PR_CHECK.index(start_marker)
+        end = PR_CHECK.index(end_marker)
+        block = PR_CHECK[start:end]
+        mutated = block.replace(f"              - '{pattern}'\n", "", 1)
+        self.assertNotEqual(block, mutated)
+        return PR_CHECK[:start] + mutated + PR_CHECK[end:]
+
     def test_policy_filter_requires_gradle_path(self) -> None:
-        # Two-line context: 'gradle/**' also appears in the code filter
-        # (followed by 'gradlew'), so anchor on the policy-only
-        # 'gradle.properties' successor (the comment block above it is
-        # skipped by matching the entry pair directly).
-        self._write(
-            "pr-check.yml",
-            PR_CHECK.replace(
-                "              - 'gradle/**'\n"
-                "              - 'gradle.properties'\n",
-                "              - 'gradle.properties'\n",
-                1,
-            ),
-        )
+        self._write("pr-check.yml", self._remove_filter_pattern("policy", "gradle/**"))
         self._assert_rejected("policy filter is missing: gradle/**")
 
     def test_policy_filter_requires_gradle_properties_path(self) -> None:
-        # Two-line context: 'gradle.properties' also appears in the code
-        # filter (after 'build.gradle.kts'), so anchor on the policy-only
-        # 'gradle/**' predecessor.
         self._write(
             "pr-check.yml",
-            PR_CHECK.replace(
-                "              - 'gradle/**'\n"
-                "              - 'gradle.properties'\n",
-                "              - 'gradle/**'\n",
-                1,
-            ),
+            self._remove_filter_pattern("policy", "gradle.properties"),
         )
         self._assert_rejected("policy filter is missing: gradle.properties")
 
+    def test_policy_filter_requires_nested_gradle_properties(self) -> None:
+        self._write(
+            "pr-check.yml",
+            self._remove_filter_pattern("policy", "**/gradle.properties"),
+        )
+        self._assert_rejected("policy filter is missing: **/gradle.properties")
+
+    def test_policy_filter_requires_wildcard_gradle_scripts(self) -> None:
+        for pattern in ("*.gradle", "**/*.gradle", "*.gradle.kts", "**/*.gradle.kts"):
+            with self.subTest(pattern=pattern):
+                self._reset_workflows()
+                self._write(
+                    "pr-check.yml",
+                    self._remove_filter_pattern("policy", pattern),
+                )
+                self._assert_rejected(f"policy filter is missing: {pattern}")
+
+    def test_code_filter_requires_wildcard_gradle_scripts(self) -> None:
+        for pattern in (
+            "*.gradle",
+            "**/*.gradle",
+            "*.gradle.kts",
+            "**/*.gradle.kts",
+            "**/gradle.properties",
+        ):
+            with self.subTest(pattern=pattern):
+                self._reset_workflows()
+                self._write(
+                    "pr-check.yml",
+                    self._remove_filter_pattern("code", pattern),
+                )
+                self._assert_rejected(f"code filter is missing: {pattern}")
+
+    GRADLE_BUILD_FILTER_PATHS = (
+        "gradle/verification-metadata.xml",
+        "gradle/libs.versions.toml",
+        "gradle.properties",
+        "gradle/wrapper/gradle-wrapper.properties",
+        "gradle/new-file.toml",
+        "app/build.gradle.kts",
+        "build.gradle.kts",
+        "settings.gradle.kts",
+        "app/gradle.properties",
+        "subproject/gradle.properties",
+        "sub/nested/gradle.properties",
+        "app/scripts/config.gradle.kts",
+        "sub/module/build.gradle",
+        "custom.gradle",
+        "custom.gradle.kts",
+        "gradlew",
+        "gradlew.bat",
+    )
+
     def test_policy_filter_covers_gradle_build_files(self) -> None:
-        """P1-1: metadata/catalog/properties-only diffs must run the harness.
+        """P1-1: metadata/catalog/properties/build-script diffs must run the harness.
 
         `gradle/**` covers files under gradle/ (verification-metadata.xml,
-        libs.versions.toml, future new files) but not the root-level
-        gradle.properties (no slash), which needs its own filter entry.
+        libs.versions.toml, future new files), while root and nested
+        gradle.properties and *.gradle/*.gradle.kts files need explicit entries.
         """
+        self.assertTrue(_path_match("custom.gradle", "*.gradle"))
+        self.assertFalse(_path_match("sub/module/build.gradle", "*.gradle"))
+        self.assertTrue(_path_match("sub/module/build.gradle", "**/*.gradle"))
         patterns = check_workflow_policy.EXPECTED_POLICY_FILTER_PATHS
-        for path in (
-            "gradle/verification-metadata.xml",
-            "gradle/libs.versions.toml",
-            "gradle.properties",
-            "gradle/wrapper/gradle-wrapper.properties",
-            "gradle/new-file.toml",
-        ):
+        for path in self.GRADLE_BUILD_FILTER_PATHS:
             with self.subTest(path=path):
                 self.assertTrue(
-                    any(
-                        fnmatch.fnmatchcase(path, pattern)
-                        for pattern in patterns
-                    ),
+                    any(_path_match(path, pattern) for pattern in patterns),
                     f"gradle-only diff {path} must set policy=true",
                 )
         self.assertFalse(
-            any(
-                fnmatch.fnmatchcase("docs/TESTING.md", pattern)
-                for pattern in patterns
-            ),
+            any(_path_match("docs/TESTING.md", pattern) for pattern in patterns),
             "docs-only diff must leave policy=false",
+        )
+
+    def test_code_filter_covers_gradle_build_files(self) -> None:
+        patterns = check_workflow_policy.EXPECTED_CODE_FILTER_PATHS
+        for path in self.GRADLE_BUILD_FILTER_PATHS:
+            with self.subTest(path=path):
+                self.assertTrue(
+                    any(_path_match(path, pattern) for pattern in patterns),
+                    f"gradle-only diff {path} must set code=true",
+                )
+        self.assertFalse(
+            any(_path_match("docs/TESTING.md", pattern) for pattern in patterns),
+            "docs-only diff must leave code=false",
         )
 
     def test_policy_filter_rejects_extra_path(self) -> None:

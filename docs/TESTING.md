@@ -179,7 +179,7 @@ boolean `on:` key collision. YAML merge keys (`<<`) are forbidden at
 construction time by `DuplicateKeySafeLoader`. Flow style, quoted keys,
 next-line scalars and anchors/aliases are resolved by the parser rather than by
 text matching. Comprehensive test coverage for the workflow policy checker is
-maintained in `scripts/tests/test_workflow_policy.py` (222 tests). It fails
+maintained in `scripts/tests/test_workflow_policy.py` (226 tests). It fails
 closed with `file:line` diagnostics on these pinned invariants:
 
 - only the reviewed workflow filenames (`codeql.yml`,
@@ -291,7 +291,7 @@ closed with `file:line` diagnostics on these pinned invariants:
   `working-directory`; `unit-tests` must keep `fail-fast: false` and
   `matrix.flavor` exactly `[play, foss, github]`, and `policy-harness` must
   keep the pinned PyYAML install, the import-shadow preflight, the unittest
-  command containing `scripts/tests/test_workflow_policy.py` (222 tests) and
+  command containing `scripts/tests/test_workflow_policy.py` (226 tests) and
   the production `verify_verification_metadata.py` gate step (no
   `--dependency-verification` flag on builds — the checked-in
   `verify-metadata=true` already enforces verification on every Gradle build).

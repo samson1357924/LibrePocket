@@ -196,17 +196,21 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * Pair atomicity (B1): truncation never splits a legal tool-call/result
  * pairing. The naive head cut (count/char/dual) snaps FORWARD to the next
  * turn boundary (`pending == 0` in a single chronological scan mirroring the
- * canonical `ProviderJson.validateToolPairing`): plain user/assistant
- * histories have a boundary at every index (no-op); a cut that would orphan
- * a leading `tool` result of an otherwise legal history drops the whole
- * orphan pair forward (within cap, counted in
- * [TurnController.droppedHistoryCount]/[TurnController.droppedHistoryChars]),
+ * canonical `ProviderJson.validateToolPairing` with single-pending backfill
+ * matching `validateToolPairing(..., allowChatBackfill = true)`): plain
+ * user/assistant histories have a boundary at every index (fast path skips the
+ * scan entirely); a cut that would orphan a leading `tool` result of an
+ * otherwise legal history drops the whole orphan pair forward (within cap,
+ * counted in [TurnController.droppedHistoryCount]/[TurnController.droppedHistoryChars]),
  * never ships the split — including the degenerate snap-past-end, which
- * yields empty rather than a lone orphan `tool`. The
- * single-newest-whole-message rule is preserved for plain histories (a lone
- * newest user/assistant row is always boundary-valid, so it survives even
- * over a char budget). A history that is already globally unpaired
- * (including a lone orphan `tool` row) is NOT repaired or dropped by the
+ * yields empty rather than a lone orphan `tool`. Truncation discards
+ * unwindowed prefixes without validating them; any invalid or unpaired tool calls
+ * within the retained slice are not repaired and fail closed downstream
+ * (`ProviderJson.validateToolPairing`). The single-newest-whole-message rule is
+ * preserved for plain histories (a lone newest user/assistant row is always
+ * boundary-valid, so it survives even over a char budget). A history that is
+ * already globally unpaired (such as an ambiguous blank `toolCallId` with multiple
+ * pending calls or a lone orphan `tool` row) is NOT repaired or dropped by the
  * window: it falls back to the naive cut as-is, and the downstream provider
  * validator (`ProviderJson.validateToolPairing`) still fails closed on the
  * shipped shape.
@@ -256,8 +260,10 @@ sealed interface HistoryWindowCap {
  * [HistoryWindowCap]): a naive count/char head cut snaps forward to the next
  * `pending == 0` turn boundary, so a split pair is dropped whole (forward,
  * staying within cap) instead of shipping half — including the degenerate
- * snap-past-end, which yields empty rather than a lone orphan `tool`. A
- * single newest plain message
+ * snap-past-end, which yields empty rather than a lone orphan `tool`.
+ * Truncation discards unwindowed prefixes without validating them; any
+ * invalid or unpaired tool calls within the retained slice are not repaired
+ * and fail closed downstream. A single newest plain message
  * that already exceeds a char budget is still kept whole — truncation drops
  * messages, never splits one — so at least the newest message always survives
  * (a globally unpaired history, including a lone orphan `tool` row, is NOT
@@ -298,19 +304,26 @@ private fun charWindowStart(history: List<ChatMessage>, maxChars: Int): Int {
 /**
  * Turn-boundary snap for [applyHistoryCap] (B1 pair atomicity).
  *
- * Returns the first `pending == 0` cut at or after [naiveStart] in a single
+ * Fast path: if [history] contains no tool calls or tool rows, returns
+ * [naiveStart] immediately without scanning.
+ *
+ * Otherwise returns the first `pending == 0` cut at or after [naiveStart] in a single
  * chronological scan (assistant `toolCalls` open a batch, matching `tool`
- * ids drain it, any other message with non-empty `pending` closes a turn
- * with output missing). Plain user/assistant histories yield a boundary at
- * every index (snap is a no-op). Returns [naiveStart] unchanged when the
- * history is already globally unpaired (including a dangling trailing batch
- * or a blank `toolCallId`, where the window stays strict and the downstream
- * provider validator fails closed on the shipped shape) so the window never
- * silently repairs an invalid history.
+ * ids drain it, supporting single-pending backfill matching
+ * `ProviderJson.validateToolPairing(..., allowChatBackfill = true)`, and any
+ * other message with non-empty `pending` closes a turn with output missing).
+ * Truncation discards unwindowed prefixes without validating them; any invalid
+ * or unpaired tool calls within the retained slice are not repaired and fail
+ * closed downstream. Returns [naiveStart] unchanged when the history is
+ * already globally unpaired (including a dangling trailing batch, an ambiguous
+ * blank `toolCallId` with multiple pending calls, or an orphan tool row, where
+ * the window stays strict and the downstream provider validator fails closed
+ * on the shipped shape) so the window never silently repairs an invalid history.
  */
 private fun snapHistoryToPairBoundary(history: List<ChatMessage>, naiveStart: Int): Int {
   if (naiveStart <= 0) return 0
   if (naiveStart >= history.size) return history.size
+  if (history.none { it.toolCalls.isNotEmpty() || it.role == "tool" }) return naiveStart
   val boundaries = pairCutBoundaries(history) ?: return naiveStart
   for (cut in boundaries) {
     if (cut >= naiveStart) return cut
@@ -325,12 +338,15 @@ private fun snapHistoryToPairBoundary(history: List<ChatMessage>, naiveStart: In
  *
  * Mirror-canonical with the downstream gate: the scan below duplicates the
  * pairing rule of `ProviderJson.validateToolPairing` (assistant `toolCalls`
- * open a batch, matching `tool` ids drain it, any other message with
+ * open a batch, matching `tool` ids drain it, single-pending backfill
+ * matches `validateToolPairing(..., allowChatBackfill = true)` when a `tool`
+ * row has a blank id and exactly one pending call, and any other message with
  * non-empty `pending` is a turn with output missing). Argument shapes and
  * tool images are NOT checked here — the downstream gate rejects those;
- * the window only decides where to cut. On any divergence the
- * window stays strict (returns null → naive cut, never a repair) so the
- * downstream validator still fails closed on the shipped shape.
+ * the window only decides where turn boundaries occur so unwindowed prefixes
+ * are discarded without validation. Any invalid or unpaired tool calls within
+ * the retained slice are not repaired here (returns null → naive cut, never a
+ * repair) and fail closed downstream in `validateToolPairing`.
  */
 private fun pairCutBoundaries(history: List<ChatMessage>): List<Int>? {
   val cuts = ArrayList<Int>(history.size + 1)
@@ -348,8 +364,14 @@ private fun pairCutBoundaries(history: List<ChatMessage>): List<Int>? {
       }
       for (tc in m.toolCalls) pending.add(tc.id)
     } else if (m.role == "tool") {
-      val id = m.toolCallId
-      if (id.isNullOrBlank()) return null
+      val stored = m.toolCallId
+      val id = if (!stored.isNullOrBlank()) {
+        stored
+      } else if (pending.size == 1) {
+        pending.single()
+      } else {
+        return null
+      }
       if (id in consumed) return null
       if (id !in pending) return null
       pending.remove(id)

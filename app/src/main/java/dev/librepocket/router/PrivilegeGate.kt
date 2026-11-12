@@ -1,5 +1,6 @@
 package dev.librepocket.router
 
+import dev.librepocket.shell.PrivilegeAuditLog
 import dev.librepocket.tool.CapabilityLevel
 import dev.librepocket.tool.DenyReason
 import dev.librepocket.tool.Projection
@@ -103,9 +104,18 @@ object PrivilegeGate {
     /**
      * 提權請求是否攜帶有效原因碼（矩陣 §3 審計要求：每次跨權限邊界呼叫
      * 必須攜帶原因碼）。空白/缺席一律視為無效。
+     *
+     * Round-4 Phase N（P2-2）：超限（[PrivilegeAuditLog.MAX_REASON_CODE_BYTES]
+     * UTF-8 位元組）同樣無效（fail-closed：呼叫方映 `Denied`，不哈希無界輸入；
+     * 本門僅判有效／無效，超限的顯式 `Denied(BLACKLISTED)` 訊息由
+     * [ElevatedDispatch]/[dev.librepocket.shell.ShellExecTool] 入口先行分支負責）。
      */
-    fun isElevatedRequest(args: Map<String, String>): Boolean =
-        !args["reasonCode"].isNullOrBlank()
+    fun isElevatedRequest(args: Map<String, String>): Boolean {
+        val reason = args["reasonCode"]
+        if (reason.isNullOrBlank()) return false
+        if (PrivilegeAuditLog.isReasonCodeTooLong(reason)) return false
+        return true
+    }
 
     /**
      * `fullText=true` (or `1`) requests the privileged body path. The key

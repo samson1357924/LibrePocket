@@ -73,9 +73,30 @@ object ShellPolicy {
      *
      * - `-exec` / `-execdir` / `-ok` / `-okdir` 藉 find 執行任意二進位
      *  （`find / -exec rm {} +` 類），白名單形同虛設。
-     * - `-delete` 直接刪除任意路徑；`-fls` / `-fprint` / `-fprintf`
-     *   任意寫檔。同族一併封堵。
+     * - `-delete` 直接刪除任意路徑；`-fls` / `-fprint` / `-fprint0` /
+     *   `-fprintf` 任意寫檔。同族一併封堵。
      * - 精確匹配即可（find 謂詞大小寫敏感）；argv[0] 不計入。
+     * - 唯 `-fprint0` 族用前綴匹配（見 [isFindDeniedPredicate]）：
+     *   PoC `find /scope -maxdepth 0 -fprint0 /scope/sentinel.txt`
+     *   以 NUL 結尾路徑覆寫 sentinel（location-valid ≠ read-only-safe；
+     *   GNU 實測，Toybox 語義未驗——拒絕對其 fail-closed 無害）；
+     *   `-fprint0junk` 類附著形非合法 find 謂詞，拒無害。
+     *
+     * Stage J（P1-4）allowlist 評估（結論：本切片維持 deny-list，不做
+     * read-only allowlist；決策＋殘餘見下）：
+     * - allowlist 需窮舉 GNU／toybox／busybox 三實現謂詞（數十個，
+     *   含 `-print`／`-print0`／`-printf`（僅 stdout）／`-ls`／`-name`／
+     *   `-newer`／`-samefile` 等），跨實現差異大：漏一寫／執行謂詞即逃逸，
+     *   多一嚴格項即破合法用；本切片 denies 已覆已知寫／執行全族，
+     *   allowlist 屬高風險擴 scope，不做。
+     * - file-taker 殘餘（`-newer`／`-samefile` 等讀參考檔 mtime／身分，
+     *   1-bit oracle）：其參考檔操作數若為絕對路徑，已由
+     *   [absoluteCandidates]＋[FileScope]＋[checkPhysicalOperandGate]
+     *   同門 vet（域外即拒；域內 oracle 僅域內可見）；bare／相對一律拒。
+     *   故 vet 獨立性成立，無需 allowlist 另封。
+     * - 殘餘揭露：未來未知寫／執行謂詞（新 find 實現新增謂詞）不在本
+     *   deny-list 內，仍為開放殘餘（Refs #9 follow-up，allowlist 或謂詞
+     *   語義表屬後續工作）。
      */
     private val FIND_DENIED_PREDICATES: Set<String> = setOf(
         "-exec",
@@ -85,8 +106,22 @@ object ShellPolicy {
         "-delete",
         "-fls",
         "-fprint",
+        "-fprint0",
         "-fprintf",
     )
+
+    /**
+     * Stage J（P1-4）：find 高危謂詞判定（直接／提權／multicall 有效形同門）。
+     *
+     * 精確集（[FIND_DENIED_PREDICATES]）＋ `-fprint0` 族前綴
+     * （`arg.startsWith("-fprint0")`，覆精確＋附著／無效延伸，fail-closed
+     * 無害；find 謂詞無縮寫語義，前綴僅為 fail-closed）。他謂詞維持精確。
+     */
+    private fun isFindDeniedPredicate(arg: String): Boolean {
+        if (arg in FIND_DENIED_PREDICATES) return true
+        if (arg.startsWith("-fprint0")) return true
+        return false
+    }
 
     /** 連接後全文掃描的黑名單片段（大小寫敏感即可，攻擊字面本就固定）。 */
     private val DENIED_TEXT_SNIPPETS: List<String> = listOf(
@@ -112,9 +147,198 @@ object ShellPolicy {
     const val DEFAULT_MAX_CALLS: Int = 30
     const val DEFAULT_WINDOW_MS: Long = 60_000L
 
+    /**
+     * Round-3 Phase H（P2-6）：提權 argv 入站上限（入站 schema，提權／直接共用）。
+     *
+     * 上限表（超限一律 fail-closed `Denied(BLACKLISTED)` 且零 spawn，見
+     * [copyArgvBounded]；凍結／快照層執行，validate 之前）：
+     * - `MAX_ELEVATED_ARGC = 64`：單次提權 argv 項數上限。提權命令皆為短 argv
+     *  （`id`／`getprop`／`screencap -p` 量級），64 已留足餘量；同時封頂
+     *   `validate` 內 `joinToString` 與 spawn argv 掃描成本（最壞 64×4K＝256K
+     *   字元，有界）。
+     * - `MAX_ELEVATED_ARG_CHARS = 4K`：單項 UTF-16 長度上限。4K 字元至多
+     *   12K UTF-8 位元組，逐項物化（`toByteArray`）恆安全，不會因單個巨參數 OOM。
+     * - `MAX_ELEVATED_ARGV_BYTES = 64K`：全向量 UTF-8 總量上限，與
+     *   [MAX_OUTPUT_BYTES] 64K 通道上限對齊（同一容量體系：提權通道任何方向的
+     *   單次物化皆以 64K 為界，512K 硬讀另為輸出側專用，見
+     *   [HARD_READ_CAP_BYTES]）。
+     *
+     * 前提：[validate]／[validateElevated] 假設輸入已為有界快照（呼叫方須先經
+     * [copyArgvBounded] 或等效凍結；直接傳非受信任 List 即把阻塞／OOM 風險帶入
+     * 純函數，產品路徑一律傳快照，見 [dev.librepocket.shell.frozenOrNull] 與
+     * github 源集 `ElevatedExecPolicy.snapshot`）。
+     */
+    const val MAX_ELEVATED_ARGC: Int = 64
+
+    /** 單項提權參數 UTF-16 長度上限（見上限表）。 */
+    const val MAX_ELEVATED_ARG_CHARS: Int = 4 * 1024
+
+    /** 提權 argv 全向量 UTF-8 總量上限（見上限表，與 64K 通道上限對齊）。 */
+    const val MAX_ELEVATED_ARGV_BYTES: Int = 64 * 1024
+
+    /**
+     * 有界 argv 拷貝（Round-3 Phase H，P2-6 入站 schema 唯一實現）：
+     * 呼叫執行緒內同步拷貝（不另起 worker；阻塞交由呼叫方監督——main 側
+     * [dev.librepocket.shell.frozenOrNull] 的快照專用有界門、github 側 runner 內
+     * `awaitPreSpawn` 監督，本函數只保證「有限輸入→有限時間／記憶體」）。
+     *
+     * fail-closed 回 null（呼叫方一律映 `Denied(BLACKLISTED)` 且零 spawn）：
+     * - 拷貝抛（併發竄改 CME／自訂 List 抛）；
+     * - `size` 與實際產出不一致（謊報 size 或併發增減，防 `ArrayList` 預分配繞行）；
+     * - 超上限（argc／單項字元／總 UTF-8 位元組，見上限表）；
+     * - 含孤立代理（lone surrogate，P3 選項 a：`encode` 前拒，見
+     *   [PrivilegeAuditLog.encodeArgv] 誠實注記；雜湊單射只對良構字串成立，
+     *   入站即拒故產品路徑不可達替換分支）；
+     * - 含 null 元素（`List<String>` 契約破壞，原始型別擦除混入 null）。
+     *
+     * 記憶體上界：單項先驗字元數（≤4K 才物化位元組，≤12K），總量累積超 64K 即停，
+     * 故峰值暫存 ≤64K＋12K，有界。
+     */
+    fun copyArgvBounded(src: List<String>): List<String>? {
+        val n: Int = try {
+            src.size
+        } catch (_: Throwable) {
+            return null
+        }
+        if (n < 0 || n > MAX_ELEVATED_ARGC) return null
+        val out = ArrayList<String>(n)
+        val it: Iterator<String> = try {
+            src.iterator()
+        } catch (_: Throwable) {
+            return null
+        }
+        var totalBytes = 0
+        var count = 0
+        try {
+            while (it.hasNext()) {
+                // size 謊報偏小（實際產出更多）即拒，不信任預分配。
+                if (count >= MAX_ELEVATED_ARGC) return null
+                val s: String = try {
+                    it.next()
+                } catch (_: Throwable) {
+                    return null
+                } ?: return null
+                if (s.length > MAX_ELEVATED_ARG_CHARS) return null
+                // P3(a)：孤立代理入站即拒（fail-closed），不進雜湊替換分支。
+                if (hasLoneSurrogate(s)) return null
+                val bytes: ByteArray = try {
+                    s.toByteArray(Charsets.UTF_8)
+                } catch (_: Throwable) {
+                    return null
+                }
+                totalBytes += bytes.size
+                if (totalBytes > MAX_ELEVATED_ARGV_BYTES) return null
+                out.add(s)
+                count++
+            }
+        } catch (_: Throwable) {
+            return null
+        }
+        // size 謊報偏大或併發縮減（產出與 size 不一致）即拒。
+        if (count != n) return null
+        return out
+    }
+
+    /**
+     * 孤立代理檢查（P3 選項 a，僅入站門用）：
+     * 高代理後無低代理、低代理前無高代理即孤立；配對代理（正常增補字元）放行。
+     * 純掃描，不抛。
+     */
+    internal fun hasLoneSurrogate(s: String): Boolean {
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            if (c.isHighSurrogate()) {
+                if (i + 1 >= s.length || !s[i + 1].isLowSurrogate()) return true
+                i += 2
+            } else if (c.isLowSurrogate()) {
+                return true
+            } else {
+                i++
+            }
+        }
+        return false
+    }
+
     /** 取 argv[0] 的 basename（相容 `/bin/ls` 這類絕對路徑寫法）。 */
     fun basename(argv0: String): String =
         argv0.substringAfterLast('/').substringAfterLast('\\')
+
+    /**
+     * P2-7 multicall applet 黑名單（直接／提權 parity，僅黑名單不放寬）。
+     *
+     * dispatcher（toybox／toolbox／busybox）經主程式自身呼叫時 `argv[1]` 為
+     * applet 名（如 `["toybox", "sh"]`），其語義等同 `argv[0]` 為該二進位，
+     * 故同樣受 [DENIED_BINARIES] 約束，否則 `sh`／`rm`／`su` 可繞過 `argv[0]`
+     * 黑名單。命中即 `BLACKLISTED`（直接通道 `["toybox", "sh"]` 即使無此門亦
+     * 會以 `NOT_WHITELISTED` 拒，但此處顯式 `BLACKLISTED` 以與提權一致，且防
+     * 未來白名單放寬 `toybox` 時回退；提權通道無白名單，此門為唯一 applet 閘）。
+     * 只查 `DENIED_BINARIES`（全文片段／特殊字元已由全 argv 掃描覆蓋，不在此重檢）。
+     * `argv.size < 2`（如 `["toybox"]` 無 applet）回 null（交後續門處理；空
+     * applet 形僅印 help，無提權／破壞語義）。
+     *
+     * TODO(#136-B3): B3 子命令 allowlist（`cmd`／`package`／`uninstall` 類未知
+     * 二進位的子命令審查）在此擴充 applet／子命令位置審查；本 PR 只做黑名單
+     * parity，不做 allowlist、不放寬。
+     */
+    private fun multicallAppletDenial(argv: List<String>): Validation.Denied? {
+        if (argv.size < 2) return null
+        val base = basename(argv[0].trim())
+        if (base !in ShellExecutables.MULTICALL_BINARIES) return null
+        val applet = basename(argv[1].trim())
+        if (applet.isEmpty()) return null
+        if (applet in DENIED_BINARIES) {
+            return Validation.Denied(ShellDeny.BLACKLISTED, "applet denied: $applet")
+        }
+        return null
+    }
+
+    /**
+     * Round-4 Phase J（P1-1）：multicall 有效命令規範化（直接／提權同規則）。
+     *
+     * dispatcher（toybox／toolbox／busybox）經主程式自身呼叫時 `argv = [dispatcher,
+     * applet, ...args]` 的實際執行語義等同 `[applet, ...args]`（resolved spawn 實為
+     * `[realToybox, applet, ...args]`，見 [ShellExecutables]／提權 `toSpawnArgv`），
+     * 故驗證必須以有效形 `[applet, ...args]` 套用完整拒絕規則，而非僅查第一層
+     * applet 黑名單（見 [multicallAppletDenial] 的 Phase I 缺口）：
+     * - 有效基 `applet = basename(argv[1].trim())`，有效操作數 `args = argv.drop(2)`；
+     * - `argv.size < 2`（如 `["toybox"]`）或 `applet` 為空回 null（交呼叫方走常规
+     *   dispatcher 本體門；空形僅印 help，無提權／破壞語義）；
+     * - 旗標形 `argv[1]`（如 `"-h"`）亦視為 applet 候選（fail-closed：不在白名單即
+     *   `NOT_WHITELISTED` 拒，不當 help 放行）；
+     * - 含 `/`／`\` 的 applet 寫法經 [basename] 取尾段（如 `"a/sh"` → `"sh"`，
+     *   仍 `BLACKLISTED`），與 dispatcher 黑名單同口徑；
+     * - 呼叫方須以有效形完整套用：applet 黑名單（`BLACKLISTED`）→ 未知 applet
+     *   明示拒（`NOT_WHITELISTED`，TODO #136-B3，不 blanket allow）→ dispatcher
+     *   `argv[0]` 可信路徑詞法門 → find 高危謂詞（僅 `applet == "find"` 時掃
+     *   `args`）→ 檔案域（[checkPathArgs] 以 `base = applet, args = args`，
+     *   含 FILE_OPERAND／relative／realpath scope／implicit cwd／取值旗標值槽／
+     *   有限 argv 同門；`--bind` 縱深同門）。
+     * 未知 applet 維持拒絕（fail-closed）：有效基不在白名單即 `NOT_WHITELISTED`
+     * （直接通道用 `allowedBinaries` 參數，提權用 [ALLOWED_BINARIES]；B3
+     * `cmd`／`am` 等子命令 allowlist 在此擴充，本 PR 只做現有拒絕規則 parity＋TODO，
+     * 不放寬）。
+     */
+    private data class MulticallEffective(val applet: String, val args: List<String>)
+
+    private fun multicallEffective(argv: List<String>, base: String): MulticallEffective? {
+        if (base !in ShellExecutables.MULTICALL_BINARIES) return null
+        if (argv.size < 2) return null
+        val raw: String = try {
+            argv[1].trim()
+        } catch (_: Exception) {
+            return null
+        }
+        if (raw.isEmpty()) return null
+        val applet = basename(raw)
+        if (applet.isEmpty()) return null
+        val args: List<String> = try {
+            argv.drop(2)
+        } catch (_: Exception) {
+            return null
+        }
+        return MulticallEffective(applet, args)
+    }
 
     /**
      * 會把 positional 參數當檔案路徑的二進位（P0 binary-aware，PR#1 re-review）。
@@ -145,7 +369,6 @@ object ShellPolicy {
         "pwd",
         "uname",
         "id",
-        "date",
         "whoami",
         "printenv",
         "sleep",
@@ -161,11 +384,54 @@ object ShellPolicy {
         "-n", "--lines", "--bytes",
         "-c", "--format", "--printf",
         "-e", "--regexp",
-        "-d", "--max-depth",
+        "-d", "--max-depth", "--date",
+        "-A", "--after-context", "-B", "--before-context", "-C", "--context",
+        "-m", "--max-count", "-D",
+        "-t", "--type", "-x", "--exclude-type",
+        "--block-size", "--output",
         "-name", "-iname", "-wholename", "-iwholename",
         "-type", "-maxdepth", "-mindepth", "-mmin", "-mtime",
         "-size", "-perm", "-user", "-group",
     )
+
+    /**
+     * base 感知取值旗標判定（Stage F：`grep -n`／`grep -c` 布林 bypass 封堵）：
+     * `-n`／`-c` 在 head/tail（計數）／stat（格式）是取值旗標，但 GNU grep
+     * 語義是布林（`--line-number`／`--count`），其下一位不是值而仍是旗標位。
+     * 若沿用 [VALUE_TAKING_FLAGS] 原集合，`grep -n -R` 的 `-R` 會被
+     * `prevArg` 豁免吞掉，跳過簇 `R` 門與 follow 門（Allowed 即真跟隨讀域外）。
+     * `-d` 在 grep 仍是取值（`--directories=read|skip|recurse`），維持豁免；
+     * `-e`／`--regexp` 同為 pattern 值，維持豁免；其餘旗標無 grep 碰撞。
+     */
+    /**
+     * base-aware 取值旗標判定（Stage P1-1 修正）：VALUE_TAKING_FLAGS 是跨 binary 的
+     * 候選集合，但 `-c`/`-n`/`--bytes`/`--lines` 在 wc/du/ls/sort 等 binary 上
+     * 是布林旗標（選擇計數／排序），並非取值；只在 head/tail/stat/cut/date/df 等
+     * 真正取值的 binary 上視為取值。grep 的 `-n`/`-c` 已在原邏輯排除。
+     * `prevWasValue` 由呼叫端控制：若上一 token 是「已被消費的資料值」（即使字串等於
+     * 某旗標），本函數仍回 false，避免已消費 token 重新參與旗標分類（P1-2）。
+     */
+    private fun isValueTakingFlag(base: String, flag: String?, prevWasValue: Boolean = false): Boolean {
+        if (prevWasValue) return false
+        if (flag == null || flag !in VALUE_TAKING_FLAGS) return false
+        // Per-binary typed classification (P1-1): default false for unknown binaries
+        // so boolean/unknown flags do not consume the following token (which would
+        // skip checkBareFileOperand and allow bare filenames to bypass denial).
+        val allowed: Set<String> = when (base) {
+            "head", "tail" -> setOf("-n", "--lines", "-c", "--bytes")
+            "stat" -> setOf("-c", "--format", "--printf")
+            "grep" -> setOf("-e", "--regexp", "-d", "--directories", "--devices",
+                "-A", "--after-context", "-B", "--before-context", "-C", "--context",
+                "-m", "--max-count", "-D")
+            "find" -> setOf("-name", "-iname", "-wholename", "-iwholename", "-type",
+                "-maxdepth", "-mindepth", "-mmin", "-mtime", "-size", "-perm", "-user", "-group")
+            "du" -> setOf("-d", "--max-depth", "-B", "--block-size")
+            "df" -> setOf("-t", "--type", "-x", "--exclude-type", "-B", "--block-size", "--output")
+            "date" -> setOf("-d", "--date")
+            else -> emptySet()
+        }
+        return flag in allowed
+    }
 
     /**
      * 非路徑 `--opt` 鍵（值為列舉/格式/glob/數字，非檔案路徑）：
@@ -174,7 +440,11 @@ object ShellPolicy {
     private val NON_PATH_OPT_KEYS: Set<String> = setOf(
         "--color", "--sort", "--format", "--printf", "--block-size",
         "--time-style", "--lines", "--bytes", "--max-count", "--max-depth",
-        "--regexp", "--include", "--exclude", "--exclude-dir",
+        "--type", "--exclude-type", "--output",
+        "--regexp", "--directories", "--devices", "--after-context", "--before-context",
+        "--context", "--include", "--exclude", "--exclude-dir",
+        // Stage G：grep 列舉值（非檔名）：`--directories=read|recurse|skip`
+        // （recurse ≈ -r，不跟隨 symlink，安全放行）、`--devices=read|skip`。
     )
 
     /**
@@ -194,7 +464,282 @@ object ShellPolicy {
     /** grep 遞迴旗標：有此旗標且無檔案參數時語義為遞迴 `.`。 */
     private fun isGrepRecursiveFlag(arg: String): Boolean =
         arg == "-r" || arg == "-R" || arg == "--recursive" ||
-            (arg.startsWith("-") && !arg.startsWith("--") && 'r' in arg.drop(1) && !arg.contains('='))
+            arg == "--dereference-recursive" ||
+            (arg.startsWith("--") && !arg.contains('=') && arg.length >= 5 &&
+                ("--recursive".startsWith(arg) || "--dereference-recursive".startsWith(arg))) ||
+            (arg.startsWith("-") && !arg.startsWith("--") && !arg.contains('=') &&
+                ('r' in arg.drop(1) || 'R' in arg.drop(1)))
+
+    /**
+     * Stage D（P1-2 recursive symlink-follow）：guest 容器內豁免判定。
+     *
+     * `isGuest && privateRoot != null` 時 traversal 仍在容器命名空間內
+     * （`proot -r rootfs` 無 bind 約束，宿主樹外絕對另由 [isContainerInternalPath]
+     * 短路；宿主 symlink 語義不適用容器命名空間，邊界由 `proot -r`＋執行入口
+     * host 樹封堵＋同容器鎖覆蓋）。與既有 dash／bare 放行同設計
+     * （見 [checkPathArgs] Guest 通道抉擇）；guest＋null 仍 fail-closed。
+     */
+    private fun isGuestTraversalExempt(isGuest: Boolean, privateRoot: String?): Boolean =
+        isGuest && privateRoot != null
+
+    /**
+     * Stage D（P1-2）：symlink-follow 旗標形態判定（純形態，不判位置）。
+     *
+     * 位置由呼叫方 [checkPathArgs] 判定（grep 僅選項位、find/du/ls 全位置
+     * fail-closed，見該函數）；guest 豁免亦由呼叫方先判，此處只判形態。
+     * 大小寫敏感（`R`/`L` 大寫才跟隨，`-r`/`-l` 不跟隨）：
+     * - grep：`-R`（含 `-rR`/`-iR` 類單橫組合，`R` 即跟隨）與
+     *   `--dereference-recursive` 家族（Stage G 唯一前綴縮寫，見
+     *   [isGrepFollowAbbrev]，含 `=value` 附著形）；小寫 `-r`／`--recursive`
+     *   不跟隨，維持放行。`-eX` 附著（`X` 為 pattern，`ROOT` 含 `R` 不得誤殺）與
+     *   `-fX` 附著（Stage A/C 已由相對路徑門拒，見 [checkPathArgs] 附著分支，
+     *   此處跳過以保留相對訊息）一律跳過；`--regexp=`／`--file=` 等長 `=` 值
+     *   非單橫故天然跳過。`-reROOT` 類中段 `-e` 附著（非 `-e` 起頭）刻意不展
+     *   開，fail-closed 誤殺（罕見寫法，安全優先）。
+     * - find：`-L` 與 `-follow`（BusyBox  legacy；另覆 `--follow`／`=value`
+     *   附著形，fail-closed）；單橫組合含大寫 `L`（如 `-HL`）即拒。合法謂詞
+     *   `-lname`／`-ilname`／`-links`／`-perm` 皆小寫 `l`，不受影響（大小寫敏感）。
+     *   `-H`（僅跟隨命令列參數，操作數已由實體門拒 symlink）與 `-P`（預設不跟隨）
+     *   維持放行。
+     * - du：`-L`／`--dereference` 家族（Stage G 縮寫，`--dereference-args`
+     *   消歧前綴除外，見 [isDuFollowAbbrev]，含 `=value` 附著形，fail-closed）；
+     *   單橫組合含 `L` 即拒。`-D`／
+     *   `--dereference-args` 僅跟隨命令列參數：操作數 symlink 已由
+     *   [checkPhysicalOperandGate] 拒（`LINK` 即拒），跟隨命令列即無新增逃逸；
+     *   域內真目錄＋`-D` 不跟隨 interior，故維持放行（見下抉擇表）。
+     * - ls：`-L`／`--dereference*` 家族（Stage G 縮寫，見 [isLsFollowAbbrev]，
+     *   含 `=value` 附著形）；單橫組合含 `L` 即拒。
+     *   `-R` 單獨維持放行（僅列名，不讀目標內容；`-R`＋`-L` 同現時 `L` 門已拒）。
+     *
+     * 決策表（host 通道；guest＋scope 一律豁免，見上）：
+     * | binary | flag | verdict | rationale |
+     * | grep `-R`／`--dereference-recursive` 家族縮寫／含 `R` 單橫 | DENY | 跟隨 interior symlink 讀域外 |
+     * | grep `-r`／`--recursive`／`--directories=*`／`--devices=*` | ALLOW | 不跟隨（列舉值） |
+     * | find `-L`／`-follow`／含 `L` 單橫 | DENY | 跟隨 interior（含 `-follow`） |
+     * | find `-H`／`-P` | ALLOW | `-H` 僅命令列（操作數門已拒 symlink），`-P` 不跟隨 |
+     * | du `-L`／`--dereference` 家族縮寫／含 `L` 單橫 | DENY | 跟隨 interior |
+     * | du `-D`／`--dereference-args` 消歧前綴 | ALLOW | 僅命令列（操作數門已拒 symlink），不跟隨 interior |
+     * | ls `-L`／`--dereference*` 家族縮寫／含 `L` 單橫 | DENY | 跟隨（`ls -L` 讀目標 stat／內容） |
+     * | ls `-R` 單獨 | ALLOW | 僅列名，不讀目標內容 |
+     *
+     * 長期受控 traversal（工作區無 symlink 不變量／遞迴白名單）超出本次有界切片，
+     * 見 [checkPhysicalOperandGate] 遞迴後代揭露 follow-up。
+     *
+     * Stage G（P1-2 GNU long-option 唯一前綴縮寫，canonicalize-then-judge）：
+     * GNU `getopt_long` 接受唯一前綴縮寫（如 grep `--deref` → 實測跟隨
+     * `--dereference-recursive`，PoC 讀到域外），故只比對全鍵即漏判。
+     * 縮寫判定見 [isGrepFollowAbbrev]／[isDuFollowAbbrev]／[isLsFollowAbbrev]，
+     * 輸入皆為 `=` 前鍵（見 [longKeyBeforeEq]，`=value` 附著形同門）。
+     * BusyBox 1.37 不接受任何長縮寫（`--deref` 即 exit 2 `unrecognized option`，
+     * 實測），Toybox 未驗——縮寫拒絕對二者 fail-closed 無害（無效旗標本就
+     * exit 2，拒不破壞合法用）；TRUSTED_BIN_DIRS 含 `/bin,/usr/bin`（宿主 GNU
+     * 可能），故宿主／提權側必須關閉。
+     */
+    private fun isFollowFlag(base: String, arg: String): Boolean {
+        when (base) {
+            "grep" -> {
+                if (isGrepFollowAbbrev(longKeyBeforeEq(arg))) return true
+                if (arg.startsWith("-") && !arg.startsWith("--") && arg != "-" && 'R' in arg) {
+                    if (arg.startsWith("-e") && arg.length > 2) return false
+                    if (arg.startsWith("-f") && arg.length > 2) return false
+                    return true
+                }
+                return false
+            }
+            "find" -> {
+                if (arg == "-L" || arg == "-follow") return true
+                if (arg == "--follow") return true
+                if (arg.startsWith("-follow=") || arg.startsWith("--follow=")) return true
+                if (arg.startsWith("-") && !arg.startsWith("--") && arg != "-" && 'L' in arg) return true
+                return false
+            }
+            "du" -> {
+                if (isDuFollowAbbrev(longKeyBeforeEq(arg))) return true
+                if (arg.startsWith("-") && !arg.startsWith("--") && arg != "-" && 'L' in arg) return true
+                return false
+            }
+            "ls" -> {
+                if (isLsFollowAbbrev(longKeyBeforeEq(arg))) return true
+                if (arg.startsWith("-") && !arg.startsWith("--") && arg != "-" && 'L' in arg) return true
+                return false
+            }
+            else -> return false
+        }
+    }
+
+    /**
+     * Stage G：長選項 `=` 前鍵（`--opt=v` 取 `=` 前，bare 照原樣）。
+     * 非 `--` 起頭照原樣返回（呼叫方只傳長鍵判縮寫，短橫另由簇門處理）。
+     */
+    private fun longKeyBeforeEq(arg: String): String {
+        if (!arg.startsWith("--")) return arg
+        val eq = arg.indexOf('=')
+        return if (eq >= 0) arg.substring(0, eq) else arg
+    }
+
+    /**
+     * Stage G：grep follow 縮寫判定（`s` 為 `=` 前鍵，見 [longKeyBeforeEq]）。
+     *
+     * GNU grep 3.12 長選項實測：`--devices`、`--directories`、
+     * `--dereference-recursive`（`--dereference…--der` 皆唯一跟隨；
+     * `--de` 與 `--devices` 歧義報錯、`--d` 三方歧義報錯，拒絕無害）：
+     * - `s` 以 `--dereference` 起頭即拒（全鍵、`=value` 經 `s` 覆蓋、
+     *   `--dereference-r…` 全縮寫、`--dereferencex` 無效延伸，後者 GNU 報錯，
+     *   拒無害）；
+     * - 否則 `s` 為 `--dereference-recursive` 的前綴（`len>=4`，避開 `-`／`--`／
+     *   `--d` 三方歧義）且非 `--directories` 的前綴即拒（`--der…--dereferenc`；
+     *   `--di…` 屬 `--directories` 不拒，`--dev…` 非前綴不拒、由 GNU 報錯）。
+     * grep 無 `--dereference-args` 變體，無例外。
+     */
+    private fun isGrepFollowAbbrev(s: String): Boolean {
+        if (s.startsWith("--dereference")) return true
+        if (s.length >= 4 && "--dereference-recursive".startsWith(s) &&
+            !"--directories".startsWith(s)
+        ) return true
+        return false
+    }
+
+    /**
+     * Stage G：du follow 縮寫判定（`s` 為 `=` 前鍵）。
+     *
+     * du 長選項（GNU/uutils 皆含）：`--dereference`（`-L`）與
+     * `--dereference-args`（`-D`，僅命令列，操作數 symlink 已由實體門拒，
+     * 故放行）：
+     * - `--dereference-args` 精確＋消歧前綴（`s` 為其前綴且
+     *   `len>len(--dereference)`，如 `--dereference-`、`--dereference-a…`）
+     *   放行；
+     * - 其餘以 `--dereference` 起頭（全鍵、`=value`、無效延伸）或為
+     *   `--dereference` 的短前綴（`len>=3`，如 `--d…--dereferenc`；短形在 GNU
+     *   屬雙鍵歧義報錯，uutils 直接拒參，拒絕皆無害）即拒。
+     */
+    private fun isDuFollowAbbrev(s: String): Boolean {
+        if (s == "--dereference-args") return false
+        if (s.length > "--dereference".length && "--dereference-args".startsWith(s)) return false
+        if (s.startsWith("--dereference")) return true
+        if (s.length >= 3 && "--dereference".startsWith(s)) return true
+        return false
+    }
+
+    /**
+     * Stage G：ls follow 縮寫判定（`s` 為 `=` 前鍵）。
+     *
+     * ls `--dereference*` 全跟隨（`--dereference`、
+     * `--dereference-command-line*`），無 `-args` 例外：以 `--dereference`
+     * 起頭或為其短前綴（`len>=3`，避開 `-`／`--`）即拒；短形在 GNU 屬多鍵歧義
+     * 報錯、uutils 直接拒參，拒絕皆無害。`--directory`／`--dired*` 非其前綴，
+     * 不受影響。
+     */
+    private fun isLsFollowAbbrev(s: String): Boolean {
+        if (s.startsWith("--dereference")) return true
+        if (s.length >= 3 && "--dereference".startsWith(s)) return true
+        return false
+    }
+
+    /**
+     * Stage I (P1-3 response-file indirection) deny-all (direct/elevated/guest/multicall同門):
+     *
+     * `du --files0-from=F` / `wc --files0-from=F`（double-dash，exact＋GNU
+     * `getopt_long` 唯一前綴縮寫＋`=v` 附著＋分離形）與 `find -files0-from F`
+     * （single-dash，分離形為唯一真讀形；`=v` 附著／縮寫／double-dash 在 GNU
+     * 皆 exit 1 `未知謂語`，fail-closed 一併拒）皆為 response-file indirection：
+     * 政策若只 vet MANIFEST 本體（`/scope/patterns` 域內即放行），`du/wc/find`
+     * 在 spawn 後讀 MANIFEST 內容所列 NUL 路徑（`/outside/...`）即穿出
+     * [FileScope]（無需 symlink／race／`-L`；GNU 實測三者皆真讀域外，見
+     * `ShellStageIResponseFileTest` REAL 證據；Toybox per-ROM 未驗，
+     * 拒絕對其 fail-closed 無害——無效旗標本就 exit 2）。
+     *
+     * 故一律 `Denied(BLACKLISTED)`（含域內 MANIFEST，vet 獨立性）：
+     * - 見即拒（key token 本體，不看次 argv 值槽）：分離形與 `=v` 附著同門；
+     * - `endOfOptions`／REQUIRED-FILENAME 槽／取值旗標值槽內亦拒（fail-closed，
+     *  罕見寫法誤殺可接受；`--` 後同名檔名一併拒）；
+     * - guest＋scope 亦拒（容器內 MANIFEST 內容仍可列容器內外路徑，不豁免）；
+     * - multicall 有效形同門（[checkPathArgs] 以有效基調用，本門已在該函數內，
+     *  無需另設 applet 門）。
+     *
+     * 未來受控 helper（讀＋vet＋freeze＋替換 operands）屬 out-of-scope，
+     * 見 [checkPathArgs] 內調用點注記；本門僅 deny-all。
+     *
+     * 判定（`arg` 為原始 token，大小寫敏感）：
+     * - du/wc：`=` 前鍵（見 [longKeyBeforeEq]）為 `--files0-from` 精確、
+     *   其唯一前綴（`len>=3`，du 僅此一 `--f*`，wc 僅此一 `--f*`，
+     *   `--f/--fi/--files0-f…` 皆 GNU 實測真讀）或其無效延伸
+     *   （`--files0-from*`，GNU 報錯，拒無害）即拒；
+     * - find：`=` 前鍵為 `-files0-from` 精確、`-files0-from*` 延伸
+     *   （含 `=v`，GNU 報錯，拒無害）、`-files0-from` 的單橫前綴
+     *   （`len>=4`，GNU 報錯，拒無害）或 double-dash 對應形
+     *   （防禦性，GNU 報錯，拒無害）即拒。
+     * 他 binary 回 false；`--files-from`（非 NUL）GNU 三者皆無此鍵，
+     * 不在判定內（誤拼即各 binary 自報錯，拒絕面不擴）。
+     */
+    private fun isResponseFileKey(base: String, arg: String): Boolean {
+        if (base == "du" || base == "wc") {
+            if (!arg.startsWith("--")) return false
+            val key = longKeyBeforeEq(arg)
+            if (key == "--files0-from") return true
+            if (key.length >= 3 && "--files0-from".startsWith(key)) return true
+            if (key.startsWith("--files0-from")) return true
+            return false
+        }
+        if (base == "find") {
+            val eq = arg.indexOf('=')
+            val key = if (eq >= 0) arg.substring(0, eq) else arg
+            if (key == "-files0-from" || key == "--files0-from") return true
+            if (key.startsWith("-files0-from") || key.startsWith("--files0-from")) return true
+            if (key.length >= 4 && key.startsWith("-") && !key.startsWith("--") &&
+                "-files0-from".startsWith(key)
+            ) return true
+            if (key.length >= 3 && key.startsWith("--") && "--files0-from".startsWith(key)) return true
+            return false
+        }
+        return false
+    }
+
+    /**
+     * Stage G：開檔長鍵規範化（`key` 為 `=` 前鍵，base 感知，canonicalize-then-judge）。
+     *
+     * GNU/uutils 唯一前綴縮寫同樣打開檔案（實測：grep `--exclude-f/--exclude-fr`
+     * 分離形＋附著形皆開檔；uutils du `--exclude-`、`--files/--f/--fi` 皆開檔），
+     * 故分離形槽＋`=v` 嚴審皆須以規範鍵判定：
+     * - grep：`--file` 僅精確（`--fil/--fi` 歧義於 `--files-with-matches*`，
+     *   GNU 報錯，安全，無需映射）；`--exclude-from` 映射精確＋唯一前綴
+     *   （`--exclude-from` 的前綴、嚴長於共享莖 `--exclude-`、且非
+     *   `--exclude-dir` 的前綴，如 `--exclude-f…`；`--exclude-` 歧義於
+     *   `--exclude-dir` 不映射，由 GNU 報錯）＋無效延伸 `--exclude-from*`
+     *  （fail-closed，GNU 報錯，拒無害）；
+     * - du：`--exclude-from` 同上（du 無 `--exclude-dir`，故 `--exclude-` 亦唯一，
+     *   一併映射）＋`--files0-from` 精確＋唯一前綴（du 仅此一 `--f*` 長鍵，
+     *   `--f…--files0-f…` 皆映射，uutils 實測確認）＋無效延伸（fail-closed）；
+     *   Stage I 注記：本映射對 `--files0-from` 家族僅具文件／保底意義，
+     *   實際先由 [isResponseFileKey] deny-all（域內 MANIFEST 亦拒），
+     *   不再走 vet-allow；
+     * - 他 binary：回 null（呼叫方另以 [FILE_VALUE_OPT_KEYS] 精確集保底，
+     *   未知提權＋scope 的 `--file=` 仍全拒；
+     *   Stage I：`wc --files0-from` 家族不經本映射，逕由 [isResponseFileKey] 拒）。
+     * 非 `--` 起頭或過短（`--` 本身）回 null。
+     */
+    private fun canonicalFileKey(base: String, key: String): String? {
+        if (!key.startsWith("--") || key.length < 3) return null
+        if (base == "grep") {
+            if (key == "--file") return "--file"
+            if (key == "--exclude-from") return "--exclude-from"
+            if (key.length > "--exclude-".length && "--exclude-from".startsWith(key) &&
+                !"--exclude-dir".startsWith(key)
+            ) return "--exclude-from"
+            if (key.startsWith("--exclude-from")) return "--exclude-from"
+            return null
+        }
+        if (base == "du") {
+            if (key == "--files0-from" || key == "--exclude-from") return key
+            if ("--files0-from".startsWith(key)) return "--files0-from"
+            if (key.startsWith("--files0-from")) return "--files0-from"
+            if (key.length > "--exclude".length && "--exclude-from".startsWith(key)) {
+                return "--exclude-from"
+            }
+            if (key.startsWith("--exclude-from")) return "--exclude-from"
+            return null
+        }
+        return null
+    }
 
     /** 純值形態保留（文件用）：數字/布林/stdin/格式/glob 僅在值槽
      *（VALUE_TAKING_FLAGS 下一位 / grep pattern 槽 / NON_PATH_OPT_KEYS）
@@ -210,7 +755,225 @@ object ShellPolicy {
     }
 
     /**
-     * 校驗：依次判空 → 黑名單（二進位/全文片段/特殊字元）→ 白名單
+     * Stage H（P1-1 clock-set＋P1-2 file-read）：date 長鍵規範（canonicalize-then-judge）。
+     *
+     * 背景（Help 證據，不執行 `date -s`；GNU/uutils `date --help` 實測）：
+     * - `-s/--set STRING` SET the system clock（Root 提權下真設時鐘）；
+     * - Toybox HELP_date：`-s DATE Set the system clock`＋裸 positional `SET`
+     *  （`date 010101002030` 形）同樣設時鐘；
+     * - `-r/--reference FILE` 顯示 FILE mtime（open 檔案），`-f/--file DATEFILE`
+     *   逐行讀 DATEFILE（open 檔案）。GNU 實測 `-r` 讀域外 mtime、`--file` 讀域外。
+     * 故 `date` 不得在 [NO_FILE_BINARIES]（已移除），必須走只讀 allowlist＋檔名 vet。
+     *
+     * 規範（`key` 為 `=` 前鍵，見 [longKeyBeforeEq]）：
+     * - SET：任何 `--s` 起頭唯一映射 `--set`（僅 `--set` 以 `--s` 起頭，無歧義）。
+     *   `--s`／`--se`／`--set`／`--set=VAL`／`--set` 無效延伸 fail-closed 一律拒。
+     * - FILE：`--ref` 起頭（`len>=5`，`--reference` 唯一前綴；`--re`／`--r` 歧義於
+     *   `--resolution`／`--rfc` 留安全側，不映射）＋`--reference` 無效延伸；
+     *   `--f` 起頭（僅 `--file` 以 `--f` 起頭，無歧義，含 `--f`／`--fi`／`--file`）
+     *   一律檔名 vet。分離形臂槽，`=v` 附著形嚴審。
+     * - STRING：`--da`／`--dat`／`--date`（`--d` 歧義於 `--debug` 不映射，
+     *   `--de` 留給 `--debug` 精確）。
+     * 他鍵（`--universal/--utc/--rfc-email/--rfc-3339/--iso-8601/--resolution/
+     * --debug/--help/--version`）僅精確放行，縮寫 fail-closed（GNU 接受但我方拒，
+     * 無害，要求全拼；見 [checkDateArgs]）。
+     */
+    private fun isDateSetKey(key: String): Boolean = key.startsWith("--s")
+
+    private fun isDateRefFileKey(key: String): Boolean {
+        if (key == "--reference" || key.startsWith("--reference")) return true
+        if (key.length >= "--ref".length && "--reference".startsWith(key)) return true
+        return false
+    }
+
+    private fun isDateFileKey(key: String): Boolean = key.startsWith("--f")
+
+    private fun isDateStringKey(key: String): Boolean {
+        if (key == "--date" || key.startsWith("--date")) return true
+        if (key == "--da" || key == "--dat") return true
+        return false
+    }
+
+    /**
+     * Stage H date 只讀 allowlist（直接／提權／multicall 有效形同門，見 [checkPathArgs]）。
+     *
+     * 允許（read-only，無副作用）：
+     * - 無參 `date`、`-u/--universal/--utc`、`-R/--rfc-email`、`-I/--iso-8601`
+     *  （可選 FMT 僅附著 `=v`，分離不消費）、`--rfc-3339`（必填 FMT，分離／附著）、
+     *   `--resolution/--debug`、`-h/--help`、`-V/--version`；
+     * - `-d/--date`（STRING 值槽，分離／`--date=*` 附著；STRING 非檔，不 vet，
+     *   含 `/abs` 亦放行）；
+     * - `+FORMAT`（`+` 起頭顯示格式，含 `/` 亦放行，非開檔）；
+     * - `-r/--reference/-f/--file`（FILE 值槽，分離／附著 `=v`）：值須絕對＋
+     *   [FileScope]＋[checkPhysicalOperandGate] 同門 vet（guest 容器內短路同門）；
+     * - `--` 終止符（後僅 `+FORMAT` 放行）。
+     *
+     * 拒絕（fail-closed，`Denied(BLACKLISTED)` 且零 spawn）：
+     * - `-s/--set*`（任何 `--s*`）＋裸 positional SET（非 `+` 起頭、非旗標的任何
+     *   bare，含 `010101002030`／絕對／相對；`+FORMAT` 唯一例外）；
+     * - FILE 值為 `-`/短橫／相對／bare／空（`-` 無 stdin 語義，uutils 按字面開檔，
+     *   fail-closed 拒；guest＋scope 容器內（無 `/`）豁免，與既有 bare 同策）；
+     * - 單橫簇／附著（`-us/-uR/-sDATE/-dSTRING/-rFILE/-fFILE` 等）：僅精確
+     *   `-u/-R/-I/-d/-r/-f/-h/-V` 放行，其餘一律拒（罕見寫法 fail-closed，要求分離形）；
+     * - 未知長鍵／`--bool=v`／非法 FMT 枚舉值一律拒。
+     *
+     * 單橫 `s` 說明：`date` 無簇語法表，`-s` 取必填參，故任何含 `s` 的單橫簇
+     * （`-us/-ss`）皆涉 SET，一律拒；`-d/-r/-f` 附著值（`-dSTRING` 等）同樣拒，
+     * 要求分離形（`--date=*` 附著僅長鍵 STRING 例外）。
+     */
+    private fun checkDateArgs(
+        args: List<String>,
+        privateRoot: String?,
+        safRoots: List<String>,
+        flavor: Flavor,
+        bridgeGranted: Boolean,
+        isElevated: Boolean,
+        isGuest: Boolean = false,
+        preRealPathHook: (() -> Unit)? = null,
+    ): Validation.Denied? {
+        fun denySet(arg: String): Validation.Denied =
+            Validation.Denied(ShellDeny.BLACKLISTED, "date set denied (fail-closed, read-only): $arg")
+
+        fun denyFlag(arg: String): Validation.Denied =
+            Validation.Denied(ShellDeny.BLACKLISTED, "date flag denied (fail-closed, read-only): $arg")
+
+        fun denyFile(arg: String): Validation.Denied =
+            Validation.Denied(
+                ShellDeny.BLACKLISTED,
+                "date file denied (relative path denied, fail-closed, use absolute path): $arg",
+            )
+
+        fun denyEnum(arg: String): Validation.Denied =
+            Validation.Denied(ShellDeny.BLACKLISTED, "date enum denied (fail-closed, read-only): $arg")
+
+        fun vetFileValue(raw: String, label: String): Validation.Denied? {
+            if (raw.isEmpty() || raw == "-") return denyFile(label)
+            if (!raw.startsWith("/")) {
+                if (isGuest && privateRoot != null && !raw.contains('/')) return null
+                return denyFile(label)
+            }
+            if (hasDotDotSegment(raw)) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "dotdot segment denied (reason=DOTDOT): $raw",
+                )
+            }
+            if (isGuest && privateRoot != null && isContainerInternalPath(raw, privateRoot)) return null
+            return if (isElevated) {
+                checkFileScopeElevated(raw, privateRoot, safRoots, flavor, bridgeGranted, preRealPathHook)
+            } else {
+                checkFileScope(raw, privateRoot, safRoots, flavor, bridgeGranted, preRealPathHook)
+            }
+        }
+
+        var endOfOptions = false
+        var pendingFile = false
+        var pendingString = false
+        var pendingRfc = false
+        for (arg in args) {
+            if (arg == "--bind" || arg.startsWith("--bind=")) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "bind forbidden inside guest argv",
+                )
+            }
+            if (pendingFile) {
+                pendingFile = false
+                val vet = vetFileValue(arg, arg)
+                if (vet != null) return vet
+                continue
+            }
+            if (pendingString) {
+                pendingString = false
+                continue
+            }
+            if (pendingRfc) {
+                pendingRfc = false
+                if (arg == "date" || arg == "seconds" || arg == "ns") continue
+                return denyEnum(arg)
+            }
+            if (endOfOptions) {
+                if (arg.startsWith("+")) continue
+                return denySet(arg)
+            }
+            if (arg == "--") {
+                endOfOptions = true
+                continue
+            }
+            if (arg.startsWith("-") && !arg.startsWith("--")) {
+                if (arg == "-") return denySet(arg)
+                when (arg) {
+                    "-u", "-R", "-I", "-h", "-V" -> continue
+                    "-d" -> {
+                        pendingString = true
+                        continue
+                    }
+                    "-r", "-f" -> {
+                        pendingFile = true
+                        continue
+                    }
+                    else -> {
+                        if ('s' in arg) return denySet(arg)
+                        return denyFlag(arg)
+                    }
+                }
+            }
+            if (arg.startsWith("--")) {
+                val eq = arg.indexOf('=')
+                val key = if (eq >= 0) arg.substring(0, eq) else arg
+                val value: String? = if (eq >= 0) arg.substring(eq + 1) else null
+                if (isDateSetKey(key)) return denySet(arg)
+                if (isDateRefFileKey(key) || isDateFileKey(key)) {
+                    if (value != null) {
+                        val vet = vetFileValue(value, arg)
+                        if (vet != null) return vet
+                        continue
+                    }
+                    pendingFile = true
+                    continue
+                }
+                if (isDateStringKey(key)) {
+                    if (value != null) continue
+                    pendingString = true
+                    continue
+                }
+                if (key == "--rfc-3339") {
+                    if (value != null) {
+                        if (value == "date" || value == "seconds" || value == "ns") continue
+                        return denyEnum(arg)
+                    }
+                    pendingRfc = true
+                    continue
+                }
+                if (key == "--iso-8601") {
+                    if (value != null) {
+                        if (value == "date" || value == "hours" || value == "minutes" ||
+                            value == "seconds" || value == "ns"
+                        ) continue
+                        return denyEnum(arg)
+                    }
+                    continue
+                }
+                if (key == "--universal" || key == "--utc" || key == "--rfc-email" ||
+                    key == "--resolution" || key == "--debug" || key == "--help" ||
+                    key == "--version"
+                ) {
+                    if (value != null) return denyFlag(arg)
+                    continue
+                }
+                return denyFlag(arg)
+            }
+            if (arg.startsWith("+")) continue
+            return denySet(arg)
+        }
+        return null
+    }
+
+    /**
+     * 校驗：依次判空 → 黑名單（二進位/全文片段/特殊字元）→ multicall 有效形
+     * （Round-4 Phase J P1-1：`argv[0]` 為 toybox／toolbox／busybox 主程式自身時
+     * 按有效形 `[applet, ...args]` 套用完整拒絕門，見 [multicallEffective]；
+     * P2-7 黑名單見 [multicallAppletDenial]，主程式形已由有效門先行覆蓋）→ 白名單
      * → argv[0] 可信路徑門（同名不同路徑封堵，詞法；僅直接通道，
      *   guest 跳過——guest argv[0] 是容器命名空間路徑）→ find 高危謂詞
      * → 檔案域（絕對路徑經 [FileScope.decide] 詞法門 + [checkPhysicalOperandGate]
@@ -255,6 +1018,16 @@ object ShellPolicy {
         trustedBinDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
         preRealPathHook: (() -> Unit)? = null,
     ): Validation {
+        // P3-3 bound-first（fail-closed，零 join 物化）：argc 超限即拒，
+        // 不做 `joinToString` 全文扫描（64K×4K 直接调 validate 即 OOM 于拒前）。
+        val argcDirect: Int = try {
+            argv.size
+        } catch (_: Exception) {
+            return Validation.Denied(ShellDeny.BLACKLISTED, "argc bound")
+        }
+        if (argcDirect > MAX_ELEVATED_ARGC) {
+            return Validation.Denied(ShellDeny.BLACKLISTED, "argc bound")
+        }
         if (argv.isEmpty() || argv.all { it.isBlank() }) {
             return Validation.Denied(ShellDeny.EMPTY_COMMAND, "empty command")
         }
@@ -284,6 +1057,65 @@ object ShellPolicy {
                 return Validation.Denied(ShellDeny.BAD_ARGUMENT, "NUL byte denied")
             }
         }
+        // Round-4 Phase J（P1-1）：multicall 主程式形有效命令完整 parity。
+        // `[toybox, applet, ...args]` 按有效形 `[applet, ...args]` 套用全部拒絕門
+        // （見 [multicallEffective]）：applet 黑名單 → 未知 applet 明示拒（B3 TODO，
+        // 不 blanket allow）→ dispatcher 可信路徑門 → find 謂詞（有效基）→ 檔案域
+        // （有效基／有效操作數，含 FILE_OPERAND／relative／realpath／implicit cwd／
+        // 取值旗標值槽）。有效門全過後仍回 NOT_WHITELISTED（dispatcher 本體不在白名單，
+        // 維持 Phase I 直接拒；提權同形放行，差異僅白名單門，見 validateElevatedInternal）。
+        val eff = multicallEffective(argv, base)
+        if (eff != null) {
+            if (eff.applet in DENIED_BINARIES) {
+                return Validation.Denied(ShellDeny.BLACKLISTED, "applet denied: ${eff.applet}")
+            }
+            if (eff.applet !in allowedBinaries) {
+                return Validation.Denied(
+                    ShellDeny.NOT_WHITELISTED,
+                    "applet not allowed (needs B3 allowlist, fail-closed): ${eff.applet}",
+                )
+            }
+            val rawEffArgv0 = argv[0].trim()
+            if (!isGuest && (rawEffArgv0.contains('/') || rawEffArgv0.contains('\\'))) {
+                if (!ShellExecutables.isTrustedAbsoluteArgv0(rawEffArgv0, trustedBinDirs)) {
+                    return Validation.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "untrusted executable path: $rawEffArgv0",
+                    )
+                }
+            }
+            if (eff.applet == "find") {
+                for (arg in eff.args) {
+                    if (isFindDeniedPredicate(arg)) {
+                        return Validation.Denied(
+                            ShellDeny.BLACKLISTED,
+                            "find predicate denied: $arg",
+                        )
+                    }
+                }
+            }
+            val effDenial = checkPathArgs(
+                base = eff.applet,
+                args = eff.args,
+                privateRoot = privateRoot,
+                safRoots = safRoots,
+                flavor = flavor,
+                bridgeGranted = bridgeGranted,
+                isElevated = false,
+                allowedBinaries = allowedBinaries,
+                isGuest = isGuest,
+                preRealPathHook = preRealPathHook,
+            )
+            if (effDenial != null) return effDenial
+            return Validation.Denied(
+                ShellDeny.NOT_WHITELISTED,
+                "dispatcher not whitelisted (multicall main, effective ${eff.applet} passed gates): $base",
+            )
+        }
+        // P2-7 multicall applet 黑名單（直接通道 parity：BLACKLISTED 優先於
+        // NOT_WHITELISTED，見 [multicallAppletDenial]；主程式形已由上有效門處理，
+        // 此處僅覆非有效形〈非 dispatcher／無 applet〉，恆回 null）。
+        multicallAppletDenial(argv)?.let { return it }
         if (base !in allowedBinaries) {
             return Validation.Denied(ShellDeny.NOT_WHITELISTED, "not whitelisted: $base")
         }
@@ -308,7 +1140,7 @@ object ShellPolicy {
         // find 沙箱逃逸封堵：高危謂詞命中任一即拒絕（不建子進程）。
         if (base == "find") {
             for (arg in argv.drop(1)) {
-                if (arg in FIND_DENIED_PREDICATES) {
+                if (isFindDeniedPredicate(arg)) {
                     return Validation.Denied(
                         ShellDeny.BLACKLISTED,
                         "find predicate denied: $arg",
@@ -360,13 +1192,20 @@ object ShellPolicy {
      * 提權通道校驗（S3，BACKLOG D09，矩陣 §3）。
      *
      * 與 [validate] 的差異只有兩處，其餘（空命令 → 黑名單二進位/全文片段 →
-     * 參數衛生 → find 高危謂詞 → 檔案域）完全同序：
+     * 參數衛生 → multicall 有效形（Round-4 Phase J P1-1，直接／提權同序同策，
+     * 見 [multicallEffective]；P2-7 黑名單為其子集）→
+     * argv[0] 可信路徑詞法門 → find 高危謂詞 → 檔案域）完全同序：
      * - 跳過白名單門禁：白名單外的二進位僅允許走提權通道（Shizuku/Root），
      *   直接 exec 仍拒（[validate] 維持原判）；
      * - 檔案域改走提權語義：私有域 / 已授權 SAF 直行（呼叫方應優先走
      *   SAF/私有域，見提權橋「SAF 優先」話術）；跨域且
      *   [FileScope.decide] 回 needsBridge（橋接已授權）才放行，其餘跨域仍拒。
      * 黑名單（`rm -rf /` 類）一律拒，不因提權放行。
+     * - argv[0] 可信路徑詞法門（P1-1，與直接通道同等，host-only）：
+     *   含 `/`/`\` 的寫法父目錄必須在 [trustedBinDirs] 內（預設
+     *   [ShellExecutables.TRUSTED_BIN_DIRS]），否則 `/data/local/tmp/cat` 類
+     *   憑 basename 通過；bare 由提權專用 resolve 經受控搜尋固定為已驗證實體
+     *   （見 github 源集提權 wrapper，spawn 用固定目標，不再用原始 argv[0]）。
      *
      * 預設 [flavor] 為 PLAY（fail-closed：未指明風味時跨域一律拒；
      * 自裝風味呼叫方必須顯式傳 FOSS/GITHUB + bridgeGranted）。
@@ -381,8 +1220,20 @@ object ShellPolicy {
         flavor: Flavor = Flavor.PLAY,
         bridgeGranted: Boolean = false,
         isGuest: Boolean = false,
+        trustedBinDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
         preRealPathHook: (() -> Unit)? = null,
+        allowedBinaries: Set<String> = ALLOWED_BINARIES,
     ): Validation {
+        // P3-3 bound-first（fail-closed，零 join 物化）：与 validateInternal 同门，
+        // argc 超限即拒，不做 `joinToString` 全文扫描。
+        val argcElevated: Int = try {
+            argv.size
+        } catch (_: Exception) {
+            return Validation.Denied(ShellDeny.BLACKLISTED, "argc bound")
+        }
+        if (argcElevated > MAX_ELEVATED_ARGC) {
+            return Validation.Denied(ShellDeny.BLACKLISTED, "argc bound")
+        }
         if (argv.isEmpty() || argv.all { it.isBlank() }) {
             return Validation.Denied(ShellDeny.EMPTY_COMMAND, "empty command")
         }
@@ -412,10 +1263,83 @@ object ShellPolicy {
                 return Validation.Denied(ShellDeny.BAD_ARGUMENT, "NUL byte denied")
             }
         }
+        // Round-4 Phase J（P1-1）：multicall 主程式形有效命令完整 parity（與直接同序同策）。
+        // `[toybox, applet, ...args]` 按有效形 `[applet, ...args]` 套用全部拒絕門：
+        // applet 黑名單 → 未知 applet 明示拒（B3 TODO，不 blanket allow；提權無白名單，
+        // 此門為未知 applet 唯一閘，直接通道對應門見 validateInternal 有效分支）→
+        // dispatcher 可信路徑門 → find 謂詞（有效基）→ 檔案域（有效基／有效操作數，
+        // 提權語義）。有效門全過即 Allowed(有效基)（與 `[applet, ...]` 等效）。
+        val effElevated = multicallEffective(argv, base)
+        if (effElevated != null) {
+            if (effElevated.applet in DENIED_BINARIES) {
+                return Validation.Denied(ShellDeny.BLACKLISTED, "applet denied: ${effElevated.applet}")
+            }
+            // Elevated 通道無白名單門（提權 binary 由 resolver 固定），但 multicall
+            // effective applet 仍以 ALLOWED_BINARIES 為 fail-closed 閘；S4 擴充 binary
+            // 若需放行，另開 B3 allowlist 工作，不在本 PR 範圍。
+            if (effElevated.applet !in ALLOWED_BINARIES) {
+                return Validation.Denied(
+                    ShellDeny.NOT_WHITELISTED,
+                    "applet not allowed (needs B3 allowlist, fail-closed): ${effElevated.applet}",
+                )
+            }
+            val rawEffElevatedArgv0 = argv[0].trim()
+            if (!isGuest && (rawEffElevatedArgv0.contains('/') || rawEffElevatedArgv0.contains('\\'))) {
+                if (!ShellExecutables.isTrustedAbsoluteArgv0(rawEffElevatedArgv0, trustedBinDirs)) {
+                    return Validation.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "untrusted executable path: $rawEffElevatedArgv0",
+                    )
+                }
+            }
+            if (effElevated.applet == "find") {
+                for (arg in effElevated.args) {
+                    if (isFindDeniedPredicate(arg)) {
+                        return Validation.Denied(
+                            ShellDeny.BLACKLISTED,
+                            "find predicate denied: $arg",
+                        )
+                    }
+                }
+            }
+            val effElevatedDenial = checkPathArgs(
+                base = effElevated.applet,
+                args = effElevated.args,
+                privateRoot = privateRoot,
+                safRoots = safRoots,
+                flavor = flavor,
+                bridgeGranted = bridgeGranted,
+                isElevated = true,
+                allowedBinaries = allowedBinaries,
+                isGuest = isGuest,
+                preRealPathHook = preRealPathHook,
+            )
+            if (effElevatedDenial != null) return effElevatedDenial
+            return Validation.Allowed(effElevated.applet)
+        }
+        // P2-7 multicall applet 黑名單（提權通道：無白名單，此門為唯一 applet 閘；
+        // 與直接通道同序同策，見 [multicallAppletDenial]；主程式形已由上有效門處理，
+        // 此處僅覆非有效形，恆回 null）。
+        multicallAppletDenial(argv)?.let { return it }
+        // argv[0] 可信路徑門（P1-1，提權與直接同等詞法門，host-only）：
+        // 含 `/`/`\` 的寫法父目錄必須在可信系統目錄內，否則同名不同路徑的假
+        // 二進位（`/data/local/tmp/cat`）可憑 basename 通過白名單（提權無白名單
+        // 更需此門）；bare 由提權專用 resolve 經受控搜尋固定（見 github 源集
+        // [ElevatedExecPolicy]），此處只做詞法門，不做實體 IO。
+        // Guest 通道（isGuest=true）跳過此門（與直接通道同策，容器命名空間路徑）。
+        val rawElevatedArgv0 = argv[0].trim()
+        if (!isGuest && (rawElevatedArgv0.contains('/') || rawElevatedArgv0.contains('\\'))) {
+            if (!ShellExecutables.isTrustedAbsoluteArgv0(rawElevatedArgv0, trustedBinDirs)) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "untrusted executable path: $rawElevatedArgv0",
+                )
+            }
+        }
         // find 沙箱逃逸封堵：提權通道同樣拒絕（與 validate 同策）。
         if (base == "find") {
             for (arg in argv.drop(1)) {
-                if (arg in FIND_DENIED_PREDICATES) {
+                if (isFindDeniedPredicate(arg)) {
                     return Validation.Denied(
                         ShellDeny.BLACKLISTED,
                         "find predicate denied: $arg",
@@ -436,7 +1360,7 @@ object ShellPolicy {
             flavor = flavor,
             bridgeGranted = bridgeGranted,
             isElevated = true,
-            allowedBinaries = ALLOWED_BINARIES,
+            allowedBinaries = allowedBinaries,
             isGuest = isGuest,
             preRealPathHook = preRealPathHook,
         )
@@ -455,7 +1379,9 @@ object ShellPolicy {
         flavor: Flavor = Flavor.PLAY,
         bridgeGranted: Boolean = false,
         isGuest: Boolean = false,
-    ): Validation = validateElevatedInternal(argv, privateRoot, safRoots, flavor, bridgeGranted, isGuest, null)
+        trustedBinDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
+        allowedBinaries: Set<String> = ALLOWED_BINARIES,
+    ): Validation = validateElevatedInternal(argv, privateRoot, safRoots, flavor, bridgeGranted, isGuest, trustedBinDirs, null, allowedBinaries)
 
     /**
      * 宿主外掛點前綴（guest 容器內路徑豁免的例外，縱深保留拒絕）：
@@ -490,9 +1416,21 @@ object ShellPolicy {
         return true
     }
 
-    /** 取參數中的絕對路徑候選：`/...` 或 `--opt=/...`（`=` 後綴）。 */
+    /**
+     * 取參數中的絕對路徑候選（Stage C，P1-1 attached file-options）。
+     *
+     * - 裸 `/…`：程式收到的操作數即該字串，驗用一致，可抽候選。
+     * - 長選項 `--opt=/…`：GNU 長選項 `=` 語義把 `=` 後字面傳給程式
+     *   （use==validated），故以後綴 `/…` 走 FileScope＋實體門是 sound 的；
+     *   未知長鍵 `--unknown=/abs` 同理保留信任（長 `=` 無短橫歧義）。
+     * - 單橫 `-k…=/…`（含 `-f=/abs`、`-file=/abs` 類）：getopt 短選項語義把
+     *   `=` 起的整個 rest（`=/abs`）當相對檔名，OS 在 cwd 下打開
+     *   `<cwd>/=/abs`（PoC：scope 預植 `=` symlink → outside 即穿出），
+     *   與後綴 `/abs` 驗用分叉，故永不抽候選（fail-closed，改由附著分支拒）。
+     */
     private fun absoluteCandidates(arg: String): List<String> {
         if (arg.startsWith("/")) return listOf(arg)
+        if (!arg.startsWith("--")) return emptyList()
         val eq = arg.indexOf('=')
         if (eq >= 0 && eq + 1 < arg.length && arg[eq + 1] == '/') {
             return listOf(arg.substring(eq + 1))
@@ -522,8 +1460,214 @@ object ShellPolicy {
     }
 
     /**
+     * Stage A（P1 dash bypass）：短橫形態操作數判定（`--` 後／`-f` 值槽用）。
+     * 以 `-` 開頭、不是 `-` stdin 哨兵、不含 `=` 即短橫形態（如 `-secret`、`--` 自身）。
+     * 含 `=` 的形態（`--opt=v`）另由操作數 `=` 門（[checkPathArgs] deny-all，
+     * `--` 後／`-f` 槽內）／旗標位 [checkBareFileOperand] 鍵值分支處理，
+     * 不在此判定（`--color=always` 等合法 `--opt=value` 不受影響）。
+     */
+    private fun isDashOperand(arg: String): Boolean =
+        arg.startsWith("-") && arg != "-" && arg.indexOf('=') < 0
+
+    /**
+     * Stage C（P1-1 attached file-options）：取值即檔名的長選項鍵
+     * （`--key=value` 單 token 形態用）。
+     * 其 `=value` 恆為檔名（flag 位與 `--` 後操作數位皆然），短橫／相對值
+     * fail-closed（見 [checkBareFileOperand]）；絕對值已先由 [absoluteCandidates]
+     * 走 FileScope＋實體門（僅長選項 `--` 前綴才抽候選，見該函數）。
+     *
+     * grep 打開檔案的選項清單（audit 完備性）：
+     * - `--file`：pattern file（`--file F` 分離形經 REQUIRED-FILENAME 槽，
+     *   `--file=F` 附著形經本鍵）；
+     * - `--exclude-from`：exclude-patterns file（GNU grep；分離形
+     *   `--exclude-from F` 經槽、附著形 `--exclude-from=F` 經本鍵，
+     *   與 `--file` 同門）；
+     * - 短 `-f`：分離形（槽）＋附著形 `-fX`／`-f=X`（附著分支，grep-only，
+     *   單橫 `=` rest 是相對檔名故一律拒，見 [checkPathArgs] 附著分支）。
+     * du 打開檔案的選項清單（audit 完備性，與上同門）：
+     * - `--files0-from`／`--exclude-from`（含 Stage G 唯一前綴縮寫，見
+      *   [canonicalFileKey]）：分離形經槽、附著形 `=v` 經本鍵；
+      * - 短 `-X`（`--exclude-from` 短形）：分離形經槽、簇附著形 `-Xrest`／
+      *   `-aXrest`（簇內 `X` 後 REST 恒為檔名，`X` 為 du 唯一短檔旗，前導布林
+      *   隱式消費無需查表；空 REST 如 `-aX` 臂檔槽）經 [checkPathArgs] 簇門
+      *   （`-` 非 stdin，uutils 實測按字面開檔，fail-closed 拒；`/abs` rest
+      *   走 FileScope＋實體門）。
+     * 刻意未列（非檔案開啟，無需檔名審查）：
+     * - `-e`／`--regexp`：pattern 字串（值槽／NON_PATH，不觸檔案）；
+     * - `--include`／`--exclude`／`--exclude-dir`：glob（NON_PATH）；
+     * - `-d`／`--max-depth`／`--max-count` 等：列舉／數字（VALUE_TAKING_FLAGS／NON_PATH）。
+     * `--exclude-from` 刻意不計入 grep pattern 預掃（[checkPathArgs] 首的
+     * `hasExplicit`）：它不提供搜尋 pattern，首個 positional 仍是 pattern 槽。
+     */
+    private val FILE_VALUE_OPT_KEYS: Set<String> = setOf(
+        "--file",
+        "--exclude-from",
+        // Stage G：du `--files0-from`（NUL 名單檔，`--files0-from F` 分離形經槽、
+        // `--files0-from=F` 經本鍵；縮寫經 [canonicalFileKey] base 感知映射，
+        // 此處精確集保底未知 binary 的 `=v` 嚴審）。
+        // Stage I 注記：本集對 `--files0-from` 僅具保底文件意義，實際先由
+        // [isResponseFileKey] deny-all（du/wc/find，域內亦拒），不再走 vet-allow。
+        "--files0-from",
+    )
+
+    /**
+     * Stage F（P1-1 getopt 短選項簇）：grep 短選項語法表（GNU／BusyBox 交集，fail-closed）。
+     *
+     * GNU `grep --help` 短選項（3.12 實測＋BusyBox `grep --help` 子集）：
+     * - 值附著（遇即消費 REST，停止掃描）：
+     *   `e` pattern（REST 即 pattern，永不按檔審，`-eROOT`／`-iefoo` 放行 pin），
+     *   `f` file（REST 即檔名，空 REST 臂槽取次 argv，`/…` 起 REST 走 FileScope＋實體門，
+     *   其餘 `=…`／`-…`／bare 一律 `Denied(BLACKLISTED)`），
+     *   `m/A/B/C` 數字（`-A5`／`-m5` 附著數值，空 REST 次 argv 為數值，皆跳過非檔），
+     *   `D/d` 列舉（`-Dskip`／`-dskip`，`devices: read|skip`／`directories: read|recurse|skip`）。
+     * - 布林（逐字消費，繼續掃描）：`i,E,F,G,P,v,w,x,y,z,s,V,b,n,H,h,o,q,a,I,T,U,u,Z,l,L,c,r`
+     *   ＋數字 `0-9`（`-NUM` context，如 `-5`／`-i5`；`-5foo` 即 `-5`＋`-f oo`，由 `f` 門拒），
+     *   其中 `R` 為跟隨（traversal，簇內作布林繼續掃描但首遇即 `traversal flag denied`，
+     *   交後續 follow 門同 verdict；`L` 在 grep 僅 `files-without-match`，非跟隨，維持放行）。
+     * - 未知字元（含 `=`／`/` 作選項字元時，如 `-i=foo` 的 `=`）：fail-closed `Denied`
+     *  （防未來 file-taker 誤分類；無效旗標本就 exit 2，拒不破壞合法用）。
+     *
+     * 決策表（選項位單橫簇，操作數位 `--` 後／`-f` 槽另由 deny-all 門覆蓋）：
+     * | 簇例 | 判定 | 理由 |
+     * | `-if=/abs`（`f` REST `=/abs`） | DENY relative | `=` 起 REST 相對，經 `=` symlink 穿出（PoC） |
+     * | `-Eif=/abs` | DENY relative | 同上 |
+     * | `-if=-secret`（REST `=-secret`） | DENY relative | 短橫相對檔名 |
+     * | `-Eif=bare`（REST `=bare`） | DENY relative | 同上 |
+     * | `-if/abs`（REST `/abs`） | FileScope vet | `use==validated` 絕對，域內放行／域外拒 |
+     * | `-if`（`f` 空 REST） | 臂檔槽 | 次 argv 為檔（同 `-f`），短橫檔仍拒 |
+     * | `-iefoo`／`-eROOT`（`e` REST） | ALLOW | pattern，永不檔拒（FP pin） |
+     * | `-A5`／`-Dskip`（數值／列舉 REST） | ALLOW | 非檔跳過 |
+     * | `-iQ` 未知 | DENY fail-closed | 防未來 file-taker |
+     * | `-iR` 含 `R` | DENY traversal | 跟隨 interior symlink 讀域外（follow 門同 verdict） |
+     */
+    private val GREP_SHORT_BOOL: Set<Char> = setOf(
+        'i', 'E', 'F', 'G', 'P', 'v', 'w', 'x', 'y', 'z', 's', 'V', 'b', 'n',
+        'H', 'h', 'o', 'q', 'a', 'I', 'T', 'U', 'u', 'Z', 'l', 'L', 'c', 'r', 'R',
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    )
+
+    /** Stage F：附著數值／列舉（REST 跳過非檔，空 REST 次 argv 為值）。 */
+    private val GREP_SHORT_VALUE_NONFILE: Set<Char> = setOf('m', 'A', 'B', 'C', 'D', 'd')
+
+    /**
+     * Stage F 預掃助件：單橫簇是否含 `e`／`f` 顯式 pattern 源（選項位語義）。
+     *
+     * 呼叫方須已排除 `--`／`-`／長選項，僅傳單橫簇；按 [GREP_SHORT_BOOL]／
+     * [GREP_SHORT_VALUE_NONFILE] 逐字掃描：布林繼續，`e`／`f` 即回 true，
+     * `m/A/B/C/D/d` 消費 REST 即回 false（後續 `e/f` 在數值內非旗標，如 `-Aef`），
+     * 未知（含 `=`／`/`）即回 false（主門另由簇門 fail-closed 拒，hasExplicit 無關）。
+     * 純布林無 `e/f` 回 false。
+     */
+    private fun clusterHasExplicitPattern(arg: String): Boolean {
+        if (!arg.startsWith("-") || arg.startsWith("--") || arg == "-") return false
+        val s = arg.substring(1)
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            if (c in GREP_SHORT_BOOL) {
+                i++
+                continue
+            }
+            if (c == 'e' || c == 'f') return true
+            if (c in GREP_SHORT_VALUE_NONFILE) return false
+            return false
+        }
+        return false
+    }
+
+    /**
+     * Stage J（P2 pathless df）：`-a`／`--all` 判定（`arg` 為原始 token，
+     * 大小寫敏感；呼叫方只在選項位調用，`--` 後操作數位不適用）。
+     *
+     * GNU `df --help` 實測：`-a, --all` 包含虛擬／重複／不可存取檔案系統；
+     * `--all` 為唯一 `--a*` 長鍵（`--a`／`--al` 唯一前綴同義，實測同族），
+     * 故 `--a*` 前綴一律拒（fail-closed；未來新增 `--a*` 鍵誤殺可接受）。
+     * - 長鍵：精確 `--all`＋唯一前綴（`len>2` 且為 `--all` 前綴，
+     *   `--` 終止符除外）＋無效延伸（`--all*`，GNU 報錯，拒無害）；
+     *   `=v` 附著經 [longKeyBeforeEq] 取鍵同門（`--all` 不取值，附著本就報錯）。
+     * - 單橫：精確 `-a`＋簇含 `a`（如 `-ah`；`a` 僅 `-a` 一鍵用，
+     *   誤殺無害，fail-closed），`=` 前核（`-a=x` 形同拒）。
+     */
+    private fun isDfAllFlag(arg: String): Boolean {
+        if (arg == "-a" || arg == "--all") return true
+        if (arg.startsWith("--")) {
+            val key = longKeyBeforeEq(arg)
+            if (key.length <= 2) return false
+            if (key == "--all" || key.startsWith("--all")) return true
+            if ("--all".startsWith(key)) return true
+            return false
+        }
+        if (arg.startsWith("-") && arg != "-") {
+            val core = arg.substring(1).substringBefore('=')
+            // GNU getopt：叢集左到右解析，第一個取值旗標（t/x/B）會吞掉其後全部
+            // 作為值，故 `a` 只有在所有取值旗標之前出現才算 all-flag
+            // （如 `-ta` 中的 `a` 是 -t 的值，不是 --all）。
+            val valueChars = setOf('t', 'x', 'B')
+            val firstValueIdx = core.indexOfFirst { it in valueChars }
+            val allFlagRange = if (firstValueIdx < 0) core else core.substring(0, firstValueIdx)
+            if ('a' in allFlagRange) return true
+        }
+        return false
+    }
+
+    /**
+     * P2 修正：df 的 scoped path 判定必須排除 `-t/--type`、`-x/--exclude-type`、
+     * `-B/--block-size` 等旗標的值，避免 `df -x /scope` 把 TYPE 值誤當 FILE operand。
+     * 只有真正的 positional（含 `--` 後）絕對路徑才算 scoped path。
+     */
+    private fun dfHasScopedPath(args: List<String>): Boolean {
+        // GNU value-taking flags for df (mandatory value). Long forms are matched by
+        // unique prefix (GNU allows unambiguous abbreviation).
+        val longValueFlags = listOf("--type", "--exclude-type", "--block-size")
+        var end = false
+        var skipNext = false
+        for (arg in args) {
+            if (skipNext) { skipNext = false; continue }
+            if (!end && arg == "--") { end = true; continue }
+            if (end) {
+                if (arg.startsWith("/")) return true
+                continue
+            }
+            if (arg.startsWith("--")) {
+                val attached = arg.contains("=")
+                val key = arg.substringBefore("=")
+                // exact or unambiguous prefix of a mandatory-value long flag
+                val isValueLong = longValueFlags.any { it == key || (key.length >= 4 && it.startsWith(key)) }
+                if (isValueLong && !attached) skipNext = true
+                // --output: skip only when attached (--output=...); separated form
+                // keeps the following token as a potential scoped path (per owner).
+                if (key == "--output" && attached) {
+                    // attached value, nothing to skip
+                }
+                continue
+            }
+            if (arg.startsWith("-") && arg != "-") {
+                val core = arg.substring(1).substringBefore("=")
+                val attached = arg.contains("=")
+                // GNU getopt: a cluster is parsed left-to-right; the first flag that
+                // takes a required argument consumes the REST of the cluster as its
+                // value. So we only need to skip the NEXT token when the first
+                // value-taking flag (t/x/B) is also the LAST char of the cluster
+                // (i.e. no attached value and no later flag). Combined forms such as
+                // -tx mean -t x (attached) and do not consume a following token.
+                if (!attached && core.isNotEmpty()) {
+                    val valueChars = setOf('t', 'x', 'B')
+                    val firstValueIdx = core.indexOfFirst { it in valueChars }
+                    if (firstValueIdx >= 0 && firstValueIdx == core.length - 1) {
+                        skipNext = true
+                    }
+                }
+                continue
+            }
+            if (arg.startsWith("/")) return true
+        }
+        return false
+    }
+
+    /**
      * argv 參數是否為相對路徑（P0 fail-closed）。
-     * - 絕對路徑（`/...`、`--opt=/...`）由 [absoluteCandidates] 處理，
+     * - 絕對路徑（`/...`、長選項 `--opt=/...`，見 [absoluteCandidates]
+     *   Stage C：單橫 `-k=/...` 永不視為絕對）由 [absoluteCandidates] 處理，
      *   此處回 false（其中 key 含 `/` 的畸形參數仍擋）；
      * - `-flag` 純旗標：不含 `/` 即放行，含 `/`（如 `-foo/bar`）一律擋
      *   （合法 flag 不含斜線）；
@@ -546,10 +1690,41 @@ object ShellPolicy {
     }
 
     /**
-     * 共用路徑審查（P0 re-review fix→review 循環後 + PR#1 P0 value-shaped 封堵）：
+     * 共用路徑審查（P0 re-review fix→review 循環後 + PR#1 P0 value-shaped 封堵 +
+     * Stage A P1 dash bypass 封堵）：
      * 絕對路徑先過 FileScope → 相對含 `/` 擋 → grep `--` 終止符與 pattern 槽 →
-     * 取值旗標值豁免 → binary-aware bare 封堵。
+     * 取值旗標值豁免 → Stage A 短橫操作數封堵（`--` 後／`-f` 值槽的 `-secret`
+     * 即相對檔名，fail-closed）→ binary-aware bare 封堵。
      * 直接/提權共用，避免雙寫漂移。
+     *
+     * Stage A＋C 選項解析器狀態（P1 scope bypass，`cat -- -secret`／`grep -f -patterns`
+     * 類）：顯式追蹤 `endOfOptions`（`--` 終止符）＋ REQUIRED-FILENAME 槽
+     * （grep `-f`／`--file`／`--exclude-from` 精確 token 的下一位；
+     * `ls -f` 是排序旗標故槽只限 grep；
+     * `--` 後的 `-f` 是操作數而非旗標，不設槽；`-f` 附著值 `-fX`／`-f=X`
+     * 恒為檔名 X（Stage C：`-f=` 的值是 `=/…` 相對檔名），
+     * 另由附著分支 fail-closed）。槽內／`--` 後的短橫形態（[isDashOperand]，
+     * `-` 哨兵除外）即相對檔名操作數，一律 `Denied(BLACKLISTED)`（與相對路徑
+     * 拒絕同 verdict 家族），不再經由短橫放行洞穿 FileScope 實體門。
+     *
+     * Guest 通道抉擇（設計對齊既有 [checkBareFileOperand] L1084 容器內 bare 放行）：
+     * `isGuest && privateRoot != null` 時短橫操作數視為容器內相對路徑，放行
+     * （cwd 已釘 `-w /`＋`-r rootfs`，宿主樹外絕對路徑另由
+     * [isContainerInternalPath] 短路；宿主 symlink 語義不適用容器命名空間，
+     * 邊界由 `proot -r` 無 bind＋執行入口 host 樹封堵＋同容器鎖覆蓋）。
+     * 宿主通道（直接＋提權 Root/Shizuku，cwd 釘死到 privateRoot 但其內容可含
+     * 攻擊者預植的 `-secret -> /outside` symlink，OS 打開即穿出）一律
+     * fail-closed；guest＋null 作用域同樣 fail-closed（與 bare 同策）。
+     *
+     * 豁免維持：VALUE_TAKING_FLAGS 值、grep pattern 槽（首個 positional，含
+     * `--` 後短橫形如 `grep -- -r`，故 pattern 槽先於短橫封堵消費；
+     * `grep -- pattern -secret` 中 pattern 取首位、`-secret` 仍拒）、
+     * NO_FILE_BINARIES（`echo -- -secret` 只是字串，無檔案語義）、`-` 哨兵、
+     * `--opt=value` 非路徑鍵（`--color=always` 旗標位維持放行；但 `--` 後／
+     * `-f` 槽內的 `--file=` 值仍按檔名審查）。旗標位的 `=` 空值（`--opt=`）
+     * 維持既有放行（用法錯誤，無檔案觸及），尾 `=` 殘餘見測試檔注記；
+     * `--` 後／`-f` 槽內的 `--opt=`（含 `--file=`）一律 `Denied(BLACKLISTED)`，
+     * 見操作數門。
      *
      * 純值豁免僅限值槽（VALUE_TAKING_FLAGS 下一位 / grep pattern 槽 /
      * NON_PATH_OPT_KEYS 的 --opt 值），FILE_OPERAND 的普通 positional 一律
@@ -572,11 +1747,102 @@ object ShellPolicy {
         isGuest: Boolean = false,
         preRealPathHook: (() -> Unit)? = null,
     ): Validation.Denied? {
+        // Stage H：date 只讀 allowlist（直接／提權／multicall 有效形同門）。
+        // `date` 開檔（-r/--reference/-f/--file）故不在 NO_FILE，裸 positional
+        // 僅 `+FORMAT` 放行，其餘（SET）一律拒；-s/--set* 一律拒。先於通用門。
+        if (base == "date") {
+            return checkDateArgs(
+                args = args,
+                privateRoot = privateRoot,
+                safRoots = safRoots,
+                flavor = flavor,
+                bridgeGranted = bridgeGranted,
+                isElevated = isElevated,
+                isGuest = isGuest,
+                preRealPathHook = preRealPathHook,
+            )
+        }
+        // Stage J（P2 pathless df＋`-a/--all`）：`df` 無操作數／`-a` 列全部
+        // 掛載（不跟隨 pinned cwd，FileScope 契約＝域內元數據可見即洩露），故：
+        // - `-a`／`--all`（含唯一前綴縮寫／`=v` 附著／無效延伸／單橫簇含 `a`，
+        //   見 [isDfAllFlag]）一律 `Denied(BLACKLISTED)`，即使帶絕對路徑亦然
+        //   （fail-closed：帶路徑輸出仍含 dummy 檔案系統，全域可見；決策：完全禁
+        //   `-a/--all`，不採「帶路徑放行」；僅選項位判定，`--` 後同名操作數位
+        //   走相對路徑門）。
+        // - 無裸絕對路徑操作數（`/...` 起頭 positional；`df` 操作數僅此一形，
+        //   `--opt=/abs`（如 `--output=/abs`）值為列舉非路徑，不計入）即
+        //   `Denied(BLACKLISTED)`（新訊息族 `df requires scoped path`），
+        //   privateRoot 有無皆然（null 側舊 `implicit cwd` 門同 verdict，
+        //   此門先行，訊息以 df 族為準）。
+        // 有路徑形（如 `df /scope`、`df -h /scope`）落穿後續通用門 vet
+        // （absoluteCandidates＋FileScope＋實體門）；既有測試僅覆 null 側
+        // pathless（見 ShellWhitelistTest.implicitCwd…，verdict 不變），無
+        // scoped-allow 翻轉。
+        if (base == "df") {
+            var dfEnd = false
+            var dfSkipNext = false
+            for (arg in args) {
+                if (dfSkipNext) { dfSkipNext = false; continue }
+                if (!dfEnd && arg == "--") {
+                    dfEnd = true
+                    continue
+                }
+                if (dfEnd) continue
+                if (isDfAllFlag(arg)) {
+                    return Validation.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "df all denied (fail-closed, global mounts): $arg",
+                    )
+                }
+                // skip the value of t/x/B mandatory flags (GNU getopt consumption)
+                // so a consumed `a` is not mistaken for --all.
+                if (arg.startsWith("--")) {
+                    val key = arg.substringBefore("=")
+                    if (!arg.contains("=") && (key == "--type" || key == "--exclude-type" ||
+                            key == "--block-size" || (key.length >= 4 &&
+                            ("--type".startsWith(key) || "--exclude-type".startsWith(key) ||
+                                "--block-size".startsWith(key))))) {
+                        dfSkipNext = true
+                    }
+                } else if (arg.startsWith("-") && arg != "-") {
+                    val core = arg.substring(1).substringBefore("=")
+                    if (!arg.contains("=") && core.isNotEmpty()) {
+                        val valueChars = setOf('t', 'x', 'B')
+                        val firstValueIdx = core.indexOfFirst { it in valueChars }
+                        if (firstValueIdx >= 0 && firstValueIdx == core.length - 1) {
+                            dfSkipNext = true
+                        }
+                    }
+                }
+            }
+            val hasScopedPath = dfHasScopedPath(args)
+            if (!hasScopedPath) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "df requires scoped path (fail-closed, global mounts): $base",
+                )
+            }
+        }
         // grep 顯式 pattern 旗標預掃：-e/--regexp/-f 存在時無 positional pattern 槽。
+        // Stage C：`--exclude-from` 刻意不計入（它不提供搜尋 pattern，只提供排除表）。
+        // Stage F：簇 `e/f`（如 `-iefoo`／`-if`）同理提供 pattern 源，須位置感知預掃
+        // （`--` 後操作數 `-secret` 非旗標，不得計入，否則 `grep -- pattern -secret`
+        // 的 `pattern` 誤判為檔；`-f` 槽內同理跳過）。
         var grepPatternSeen = (base != "grep")
         if (base == "grep") {
             var hasExplicit = false
+            var preEnd = false
+            var prePendingFile = false
             for (a in args) {
+                if (prePendingFile) {
+                    prePendingFile = false
+                    continue
+                }
+                if (!preEnd && a == "--") {
+                    preEnd = true
+                    continue
+                }
+                if (preEnd) continue
                 if (a == "-e" || a == "--regexp" || a.startsWith("--regexp=") ||
                     a == "-f" || a == "--file" || a.startsWith("--file=") ||
                     (a.startsWith("-e") && a.length > 2 && !a.contains('/'))
@@ -584,21 +1850,90 @@ object ShellPolicy {
                     hasExplicit = true
                     break
                 }
+                if (a.startsWith("-") && !a.startsWith("--") && a != "-" && clusterHasExplicitPattern(a)) {
+                    hasExplicit = true
+                    break
+                }
+                if (a == "-f" || (!a.contains('=') && canonicalFileKey("grep", a) != null)) {
+                    prePendingFile = true
+                }
             }
             if (hasExplicit) grepPatternSeen = true
         }
         var endOfOptions = false
         var prevArg: String? = null
+        // P1-2 token-role：上一 token 是否「已被消費為資料值」（pattern／取值／檔名槽）。
+        // 若是，下一輪即使其字串等於某旗標，也不得再參與旗標分類，避免已消費 token
+        // 重新解鎖 fail-closed 禁止項。
+        var prevWasValue: Boolean = false
+        // Stage A＋C：grep `-f`／`--file`／`--exclude-from` 精確 token 的下一位是
+        // REQUIRED-FILENAME 槽（檔名操作數，短橫形亦拒，見下；只限 grep，
+        // `ls -f` 是排序旗標）。`--exclude-from` 不計入 pattern 預掃
+        // （見 FILE_VALUE_OPT_KEYS：它不提供搜尋 pattern）。
+        var pendingFileValue = false
+        // Stage F：簇空 REST 值槽（`e` pattern／`m/A/B/C/D/d` 數值列舉，次 argv 為值）。
+        // `f` 空 REST 沿用 [pendingFileValue]；此旗標僅非檔值用，消費時整 token 跳過
+        // （含絕對候選 vet 跳過：值非檔，spawn 不開檔；`grep -A -R` 的 `-R` 為值非旗標，
+        // 不觸 traversal）。
+        var pendingClusterValue = false
+        var pendingClusterValueIsPattern = false
         // grep 遞迴旗標是否出現在真正的選項位（-- 之後 / 取值旗標值 / pattern 槽不算，
         // 如 `grep -- -r` 的 -r 是 pattern 而非遞迴）。
         var sawGrepRecursiveFlag = false
         for (arg in args) {
+            // Stage A：REQUIRED-FILENAME 槽狀態在迭代開始即 snapshot，避免早期 continue
+            //（pendingClusterValue 消費／guest 容器路徑）漏 reset pendingFileValue。
+            val inFileSlot = pendingFileValue
+            pendingFileValue = false
             // bind 封堵縱深（與 LinuxEnv.bindVeto 雙層）：guest 包裝層 argv 內
             // 出現 --bind 即否決，不因 guest 放行（黑名單不因通道放行）。
             if (arg == "--bind" || arg.startsWith("--bind=")) {
                 return Validation.Denied(
                     ShellDeny.BLACKLISTED,
                     "bind forbidden inside guest argv",
+                )
+            }
+            // Stage I（P1-3 response-file indirection）deny-all：見 [isResponseFileKey]。
+            // MANIFEST 本體即使域內亦拒（vet 獨立性）：`du/wc/find` 在 spawn 後讀
+            // MANIFEST 內容所列 NUL 路徑即穿出 FileScope；未來受控 helper
+            //（讀＋vet＋freeze＋替換 operands）屬 out-of-scope，本門僅 deny-all。
+            // 全位置（選項位／值槽／`--` 後／槽內皆拒，guest 亦不豁免，multicall
+            // 有效形經本函數同門）；`absoluteCandidates` 之前先判，不做實體 IO。
+            if (isResponseFileKey(base, arg)) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "response file denied (fail-closed, indirection): $arg",
+                )
+            }
+            // Stage F：簇空 REST 值槽消費（`e` pattern／`m/A/B/C/D/d` 數值列舉）。
+            // 次 argv 為值非檔，整 token 跳過（含絕對 vet 跳過：值非檔不開檔；
+            // `grep -A -R` 的 `-R` 為值非旗標，不觸 traversal；`e` 值提供 pattern）。
+            if (pendingClusterValue) {
+                pendingClusterValue = false
+                if (pendingClusterValueIsPattern) {
+                    grepPatternSeen = true
+                }
+                pendingClusterValueIsPattern = false
+                prevArg = arg
+                prevWasValue = true
+                continue
+            }
+            // Stage D（P1-2）＋G（縮寫）：find/du/ls symlink-follow 全位置 fail-closed。
+            // find `-L`/`-follow`（全局，可出現在路徑前後）、du `-L`/
+            // `--dereference` 家族（Stage G 縮寫，`--dereference-args` 消歧除外）、
+            // ls `-L`/`--dereference` 家族（Stage G 縮寫）在 spawn 後跟隨 interior
+            // symlink 讀域外，而操作數門只驗 CLI 操作數本鏈（見
+            // [checkPhysicalOperandGate] 遞迴後代揭露），故必須拒旗標本身。
+            // 全位置（選項位／值槽／`--` 後皆拒，fail-closed，僅 guest 容器內
+            // 豁免，見 [isGuestTraversalExempt]）；`--` 後短橫在宿主本就由短橫門
+            // 拒，訊息以 traversal 為準不影響 verdict 家族（同 BLACKLISTED）。
+            if (!isGuestTraversalExempt(isGuest, privateRoot) &&
+                (base == "find" || base == "du" || base == "ls") &&
+                isFollowFlag(base, arg)
+            ) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "traversal flag denied (fail-closed, symlink-follow): $arg",
                 )
             }
             for (candidate in absoluteCandidates(arg)) {
@@ -623,6 +1958,8 @@ object ShellPolicy {
                 // + spawn 持同容器鎖（見 `ProotExec.execute`），宿主 symlink 語義
                 // 不適用。容器內 symlink／TOCTOU 殘餘見 `ProotExec` KDoc。
                 if (isGuest && privateRoot != null && isContainerInternalPath(candidate, privateRoot)) {
+                    prevArg = arg
+                    prevWasValue = inFileSlot
                     continue
                 }
                 val denial = if (isElevated) {
@@ -632,10 +1969,196 @@ object ShellPolicy {
                 }
                 if (denial != null) return denial
             }
+            // Stage A：REQUIRED-FILENAME 槽先消費（`grep -f --` 的 `--` 是檔名，
+            // 不是終止符；`-` 是 stdin 哨兵，維持放行）。
+            if (inFileSlot) {
+                if (arg == "-") {
+                    prevArg = arg
+                    prevWasValue = true
+                    continue
+                }
+                if (arg == "--") {
+                    if (isGuest && privateRoot != null) {
+                        prevArg = arg
+                        prevWasValue = true
+                        continue
+                    }
+                    return Validation.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "relative path denied (fail-closed, use absolute path): $arg",
+                    )
+                }
+            }
             if (!endOfOptions && arg == "--") {
                 endOfOptions = true
                 prevArg = arg
+                prevWasValue = false
                 continue
+            }
+            // Stage F（P1-1 getopt 短選項簇）：選項位單橫簇逐字掃描（見 [GREP_SHORT_BOOL]）。
+            // 位置限定選項位（`--` 後／`-f` 槽／取值旗標值／簇值槽另由 deny-all／值門覆蓋）；
+            // `-e` REST 永為 pattern（`-eROOT`／`-iefoo` 放行 pin），`-f` REST 按附著檔規則，
+            // `m/A/B/C/D/d` REST 為數值列舉跳過，`R` 作布林首遇即 traversal 拒（`L` 非跟隨），
+            // 未知 fail-closed 拒。`=/abs` REST（含 `=`）恆相對拒；`/abs` REST 走 FileScope＋
+            // 實體門（use==validated）；空 REST 臂槽（`f`→檔槽，`e/m/A/B/C/D/d`→值槽）。
+            if (base == "grep" && !endOfOptions && !inFileSlot &&
+                !isValueTakingFlag(base, prevArg, prevWasValue) && !pendingClusterValue &&
+                arg.startsWith("-") && !arg.startsWith("--") && arg != "-"
+            ) {
+                val body = arg.substring(1)
+                var bi = 0
+                var clusterDone = false
+                while (bi < body.length && !clusterDone) {
+                    val c = body[bi]
+                    if (c in GREP_SHORT_BOOL) {
+                        if (c == 'R' && !isGuestTraversalExempt(isGuest, privateRoot)) {
+                            return Validation.Denied(
+                                ShellDeny.BLACKLISTED,
+                                "traversal flag denied (fail-closed, symlink-follow): $arg",
+                            )
+                        }
+                        bi++
+                        continue
+                    }
+                    if (c == 'e') {
+                        val rest = body.substring(bi + 1)
+                        grepPatternSeen = true
+                        if (rest.isEmpty()) {
+                            pendingClusterValue = true
+                            pendingClusterValueIsPattern = true
+                        }
+                        prevArg = arg
+                        clusterDone = true
+                        break
+                    }
+                    if (c == 'f') {
+                        val rest = body.substring(bi + 1)
+                        grepPatternSeen = true
+                        if (rest.isEmpty()) {
+                            pendingFileValue = true
+                            prevArg = arg
+                            clusterDone = true
+                            break
+                        }
+                        if (rest == "-") {
+                            prevArg = arg
+                            clusterDone = true
+                            break
+                        }
+                        if (rest.startsWith("/")) {
+                            if (hasDotDotSegment(rest)) {
+                                return Validation.Denied(
+                                    ShellDeny.BLACKLISTED,
+                                    "dotdot segment denied (reason=DOTDOT): $arg",
+                                )
+                            }
+                            if (!(isGuest && privateRoot != null && isContainerInternalPath(rest, privateRoot))) {
+                                val vet = if (isElevated) {
+                                    checkFileScopeElevated(rest, privateRoot, safRoots, flavor, bridgeGranted, preRealPathHook)
+                                } else {
+                                    checkFileScope(rest, privateRoot, safRoots, flavor, bridgeGranted, preRealPathHook)
+                                }
+                                if (vet != null) return vet
+                            }
+                            prevArg = arg
+                            clusterDone = true
+                            break
+                        }
+                        if (isGuest && privateRoot != null) {
+                            prevArg = arg
+                            clusterDone = true
+                            break
+                        }
+                        return Validation.Denied(
+                            ShellDeny.BLACKLISTED,
+                            "relative path denied (fail-closed, use absolute path): $arg",
+                        )
+                    }
+                    if (c in GREP_SHORT_VALUE_NONFILE) {
+                        val rest = body.substring(bi + 1)
+                        if (rest.isEmpty()) {
+                            pendingClusterValue = true
+                            pendingClusterValueIsPattern = false
+                        }
+                        prevArg = arg
+                        clusterDone = true
+                        break
+                    }
+                    if (isGuest && privateRoot != null) {
+                        // guest 容器內未知短旗：容器命名空間無宿主 file-taker 語義，
+                        // 維持放行（與 bare／短橫同策；null 作用域仍下式拒）。
+                        // 為與宿主 fail-closed 區分，此處直接落穿常規門（`--` 後另拒）。
+                        break
+                    }
+                    return Validation.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "relative path denied (fail-closed, use absolute path): $arg",
+                    )
+                }
+                if (clusterDone) {
+                    prevWasValue = false
+                    continue
+                }
+            }
+            // Stage A＋C du `-X` 簇附著值：`-X` 取必填參數，故簇內 `X` 後 REST
+            // 恒為檔名（getopt：前導布林如 `-a` 僅消費自身，`X` 取其後全部 REST；
+            // `X` 為 du 唯一短檔旗，簇內無需布林表，前導字元隱式消費）。
+            // - REST 空（如 `-X`／`-aX`）→ 臂檔槽取次 argv（同分離形）；
+            // - REST 以 `/` 起 → dotdot＋FileScope／實體門（use==validated，域內放行）；
+            // - 其餘（`-`／`-secret`／bare／`=/abs` 含 `=`）→ 相對 fail-closed
+            //  （uutils 實測 `-` 按字面開檔非 stdin，故 `-X-`／`-aX-` 亦拒；
+            //   `=` 起 REST 按短選項語義為相對檔名，不抽後綴，見 [absoluteCandidates]）。
+            // 選項位限定（`--` 後的 `-aXx` 是檔名，已由短橫門覆蓋）；guest 容器內
+            // 豁免（與 `-fX` 門同策）。
+            if (base == "du" && !endOfOptions && !inFileSlot &&
+                arg.startsWith("-") && !arg.startsWith("--") && arg != "-" &&
+                !(isGuest && privateRoot != null)
+            ) {
+                val xPos = arg.indexOf('X', 1)
+                if (xPos >= 1) {
+                    val rest = arg.substring(xPos + 1)
+                    if (rest.isEmpty()) {
+                        pendingFileValue = true
+                        prevArg = arg
+                        prevWasValue = false
+                        continue
+                    }
+                    if (rest.startsWith("/")) {
+                        if (hasDotDotSegment(rest)) {
+                            return Validation.Denied(
+                                ShellDeny.BLACKLISTED,
+                                "dotdot segment denied (reason=DOTDOT): $arg",
+                            )
+                        }
+                        val vet = if (isElevated) {
+                            checkFileScopeElevated(
+                                rest,
+                                privateRoot,
+                                safRoots,
+                                flavor,
+                                bridgeGranted,
+                                preRealPathHook,
+                            )
+                        } else {
+                            checkFileScope(
+                                rest,
+                                privateRoot,
+                                safRoots,
+                                flavor,
+                                bridgeGranted,
+                                preRealPathHook,
+                            )
+                        }
+                        if (vet != null) return vet
+                        prevArg = arg
+                        prevWasValue = false
+                        continue
+                    }
+                    return Validation.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "relative path denied (fail-closed, use absolute path): $arg",
+                    )
+                }
             }
             if (isRelativePathArg(arg)) {
                 return Validation.Denied(
@@ -645,14 +2168,21 @@ object ShellPolicy {
             }
             val isPositional = endOfOptions || !arg.startsWith("-") || arg == "-"
             // grep 遞迴旗標只認選項位的（見 sawGrepRecursiveFlag 註解）。
-            if (base == "grep" && !endOfOptions && prevArg !in VALUE_TAKING_FLAGS &&
+            if (base == "grep" && !endOfOptions && !isValueTakingFlag(base, prevArg, prevWasValue) &&
                 isGrepRecursiveFlag(arg)
             ) {
                 sawGrepRecursiveFlag = true
             }
             // 取值旗標的下一位是值而非路徑（如 -n 20、-c %s、-name *.db、-e pattern）。
-            if (isPositional && prevArg != null && prevArg in VALUE_TAKING_FLAGS) {
+            // P1 修正： consumption 不應要求 isPositional，否則 `grep --regexp -e`／
+            // `grep --regexp -R` 中 dash-leading 的 pattern value 不被消費，導致後續
+            // `-R` 被誤判為 `-e` 的值而繞過 symlink-follow 門。`--` 結束符仍由
+            // 下式處理，不在此消費。
+            if (prevArg != null && !endOfOptions && arg != "--" && !inFileSlot &&
+                isValueTakingFlag(base, prevArg, prevWasValue)
+            ) {
                 prevArg = arg
+                prevWasValue = true
                 // -f/--file 除外已不在 VALUE_TAKING_FLAGS，其值仍按路徑審查；
                 // 此處僅豁免已列旗標的值。
                 continue
@@ -661,8 +2191,78 @@ object ShellPolicy {
             if (base == "grep" && !grepPatternSeen && isPositional && !arg.startsWith("/")) {
                 grepPatternSeen = true
                 prevArg = arg
+                prevWasValue = true
                 continue
             }
+            // Stage D（P1-2）＋G（縮寫）：grep symlink-follow 僅選項位 fail-closed。
+            // `-R`（含 `-rR`/`-iR` 類單橫組合）與 `--dereference-recursive`
+            // 家族（Stage G：含 `--deref`／`--dereference-r…` 等 GNU 唯一前綴縮寫，
+            // 見 [isGrepFollowAbbrev]）跟隨 interior dir symlink 讀域外（PoC：scope/subtree 內 `escape`
+            // → outside，`grep -R TOKEN /scope/subtree` 印 outside/hidden.txt）。
+            // 僅選項位（`!endOfOptions && !inFileSlot && !isValueTakingFlag(base,
+            // prevArg)`（base-aware：grep `-n`/`-c` 是布林非取值），`--` 後短橫／`-f` 槽／`-e` 值另由短橫／附著門
+            // 拒，訊息保留相對家族；`grep -- -r` 首位仍是 pattern，已由上槽消費；
+            // `-e -R` 的 `-R` 是 pattern 值（`prevArg == "-e"`），跳過）；
+            // 小寫 `-r`／`--recursive` 不跟隨，維持放行；`-eX` 附著 pattern
+            //（含 `R` 如 `ROOT`）與 `-fX` 附著（另由附著門拒）由 [isFollowFlag]
+            // 內跳過。guest 容器內豁免（見 [isGuestTraversalExempt]）。
+            if (base == "grep" && !isGuestTraversalExempt(isGuest, privateRoot) &&
+                !endOfOptions && !inFileSlot && !isValueTakingFlag(base, prevArg, prevWasValue) &&
+                isFollowFlag(base, arg)
+            ) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "traversal flag denied (fail-closed, symlink-follow): $arg",
+                )
+            }
+            // Stage A 短橫操作數封堵：`--` 後／REQUIRED-FILENAME 槽內的短橫形態
+            // （`-` 哨兵除外，見 isDashOperand）即相對檔名，不再放行。
+            // 排序在 pattern 槽／取值豁免之後：`grep -- -r` 的 -r 仍是 pattern
+            // （既有豁免），`grep -- pattern -secret` 的 -secret 仍拒。
+            // 豁免僅兩處：guest 容器內（`isGuest && privateRoot != null`，見上抉擇）
+            // 與 NO_FILE 二進位（`echo -- -secret` 只是字串）；未知提權 binary＋scope
+            // 的非短橫 bare 仍靠 cwd 釘死放行（子命令／包名兼顧），但短橫形在檔位
+            // 即檔名（旗標應在 `--` 之前），一律 fail-closed。
+            if ((endOfOptions || inFileSlot) && isDashOperand(arg) &&
+                !(isGuest && privateRoot != null) && base !in NO_FILE_BINARIES
+            ) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "relative path denied (fail-closed, use absolute path): $arg",
+                )
+            }
+            // Stage A＋C grep `-f` 附著值：`-f` 取必填參數，故 `-fX`
+            // 的附著尾 X 恒為檔名；相對即 fail-closed（宿主通道）。
+            // Stage C：`-f=/x` 的值是 `=/x` 整 rest（短選項附著語義，相對檔名），
+            // 故 `=` 形亦拒（不豁免；單橫 `=` 永不走 absoluteCandidates，見該函數）。
+            // 選項位限定（`--` 後的 `-fX` 是檔名，已由上式覆蓋）；`-F` 大寫另旗，
+            // 不在此列；含 `/` 者（`-f/a` 類）已由 isRelativePathArg 擋。
+            if (base == "grep" && !endOfOptions && !inFileSlot &&
+                arg.startsWith("-f") && arg.length > 2 && !arg.startsWith("--") &&
+                !(isGuest && privateRoot != null)
+            ) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "relative path denied (fail-closed, use absolute path): $arg",
+                )
+            }
+            // Stage A `=` operand deny-all: `--` 后／REQUIRED-FILENAME 槽内的 `--opt=v`
+            // 无旗标语义，即文件名（`cat -- --file=-` 打开字面文件 `--file=-` 而非
+            // stdin，`cat -- --file=/abs` 打开 `<cwd>/--file=/abs` 而非 `/abs`；
+            // absoluteCandidates 验后缀 `/abs` 而 spawn 打开不同路径＝验证／使用
+            // 不一致）。操作数位一律 Denied(BLACKLISTED)，仅 guest 容器内与
+            // NO_FILE 二进制豁免（不打开宿主文件）；`--file=` 落穿豁免已删除。
+            // 旗标位的 `--file=/abs`／`--exclude-from=/abs`
+            // 仍经 absoluteCandidates＋checkBareFileOperand。
+            if ((endOfOptions || inFileSlot) && arg.startsWith("-") && arg.indexOf('=') >= 0 &&
+                !(isGuest && privateRoot != null) && base !in NO_FILE_BINARIES
+            ) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "relative path denied (fail-closed, use absolute path): $arg",
+                )
+            }
+            // LOW accepted residual: 旗标位未知 binary 的 `--opt=-dash` 值仍靠 cwd 钉死放行；cwd 可含预植 symlink，宿主语义见上 Guest 抉择。
             val bareDenial = checkBareFileOperand(
                 base = base,
                 arg = arg,
@@ -672,7 +2272,27 @@ object ShellPolicy {
                 isGuest = isGuest,
             )
             if (bareDenial != null) return bareDenial
+            // Stage A＋C＋G 設槽：grep `-f`／`--file`／`--exclude-from`（Stage G：
+            // 含 `--exclude-f…` 唯一前綴縮寫，見 [canonicalFileKey]）與 du
+            // `--files0-from`／`--exclude-from`（含唯一前綴縮寫）及短旗 `-X`
+            // （分離形 `-X`；簇空 REST `-aX` 另由簇門臂槽，見上；附著形
+            // `-Xrest`／`-aXrest` 另由簇門審）使下一位為
+            // REQUIRED-FILENAME 槽（選項位）。`--` 後的操作數位不設槽；
+            // 他 binary 的 `-f`（如 `ls -f` 排序旗）不設槽。
+            if (base == "grep" && !endOfOptions && !arg.contains('=') &&
+                (arg == "-f" || canonicalFileKey("grep", arg) != null)
+            ) {
+                pendingFileValue = true
+            }
+            if (base == "du" && !endOfOptions && !arg.contains('=') &&
+                (canonicalFileKey("du", arg) != null || arg == "-X")
+            ) {
+                pendingFileValue = true
+            }
             prevArg = arg
+            // file slot 消費的檔名 token 視為已消費資料值（token-role），避免下一轮
+            // 以其字面值重新參與旗標分類；一般 operand 維持 false。
+            prevWasValue = inFileSlot
         }
         // Implicit-cwd fail-closed（PR#1 re-review head 4e3a6c6 blocker 1）：
         // ls/du/df/find/pwd 無明確絕對路徑時語義即隱式操作 cwd（ls/du 列 `.`、
@@ -712,6 +2332,11 @@ object ShellPolicy {
      *   `stat %s` 亦視為相對路徑）；
      * - `--opt=bare`：鍵在 [NON_PATH_OPT_KEYS]（color/sort/format 等）放行；
      *   否則 FILE_OPERAND 即使值像數字/格式/glob 仍拒（`--db=123` 視為潛在路徑）；
+     * - Stage A＋C＋G `--file=bare`／`--exclude-from=bare`／`--files0-from=bare`：
+     *   鍵在 [FILE_VALUE_OPT_KEYS] 或經 [canonicalFileKey] 規範為開檔鍵即檔名，短橫形／相對值
+     *   全 binary fail-closed（未知提權＋scope 亦拒，cwd 釘死不豁免檔名鍵；
+     *   `-` stdin 哨兵／空值／絕對值維持放行，絕對值已先走實體門）；
+     *   [NO_FILE_BINARIES] 無檔案語義，維持放行；
      * - [NO_FILE_BINARIES]：bare 永遠放行；
      * - Guest 模式（proot 容器內）：無 `/` bare 一律放行（子命令如 `version` /
      *   `update` / `sign` 與容器內相對路徑如 `x.apk`；cwd 已釘 `-w /` + `-r`，
@@ -740,6 +2365,21 @@ object ShellPolicy {
             val key = arg.substring(0, eq)
             val v = arg.substring(eq + 1)
             if (v.isEmpty() || v.startsWith("/")) return null
+            // Stage A＋C：`--file=`／`--exclude-from=` 值恒為檔名
+            // （旗標位與 `--` 後操作數位皆然）：
+            // 短橫形（`-patterns`）／相對值 fail-closed；`-` 是 stdin 哨兵，
+            // 維持放行（既有關閉：修前 `--file=-` 誤拒，stdin 無檔案觸及），
+            // 絕對值已先由 absoluteCandidates 走 FileScope＋實體門（上式）。
+            // NO_FILE 二進位無檔案語義，維持放行；guest 容器內（無 `/`）已由
+            // 上方早返放行，此處只剩 guest＋null（fail-closed）與宿主通道。
+            if (key in FILE_VALUE_OPT_KEYS || canonicalFileKey(base, key) != null) {
+                if (v == "-") return null
+                if (base in NO_FILE_BINARIES) return null
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "relative path denied (fail-closed, use absolute path): $arg",
+                )
+            }
             if (key in NON_PATH_OPT_KEYS) return null
             if (base in NO_FILE_BINARIES) return null
             val isFileOperand = base in FILE_OPERAND_BINARIES ||
@@ -872,6 +2512,12 @@ object ShellPolicy {
      *    （含 NotDirectory／瞬時 I/O 錯），關閉 EACCES 混同為缺席的繞行；ABSENT 等同舊 false 語義繼續，PRESENT 繼續；
      *    超深仍拒）。提權注記：app UID 不可判定者雙通道皆拒，需提權側預檢者走
      *    Refs #10 follow-up（刻意不在本 PR 碰 github source set）。
+     *    B4 跨域提醒（owner P2-9）：app UID 對 Root/fb0 等跨域目標的 lstat
+     *    可能因 EACCES 而 UNKNOWN，本門 fail-closed 拒（雙通道皆拒，不降級，
+     *    不改 UNKNOWN fail-closed）。真機跨域成功路徑（root/Shizuku 提權後
+     *    讀取）需 #136-B3 E2E 驗收；特權側預檢如需放行須另設可信有界門
+     *    （特權行程內 lstat＋結果有界回傳），不得把 UNKNOWN 一律放行
+     *    （TODO #136-B3）。
      * 2. 存在即 `toRealPath()` 全解析固定，再驗 real 身分獨立條件＋同語義重裁
      *    [FileScope.decide]（[isElevated] 為 true 時沿提權語義
      *    `allowed==true` 即放行，否則要求 `allowed && !needsBridge`）；
@@ -895,7 +2541,7 @@ object ShellPolicy {
      *
      * hardlink 揭露：本門不解 hardlink；同 FS 域內 hardlink 指到域外（硬連結
      * 指向域外 inode）在承諾外，不在消除保證內。
-     * 遞迴後代揭露（Refs #9；殘餘列 out-of-scope，不擋跟隨旗標的理由見下）：
+     * 遞迴後代揭露（Refs #9；Stage D 已收斂跟隨旗標，殘餘見下）：
      * 本門只驗操作數本鏈，不驗遞迴走訪的後代（find/du/ls -R、grep -r 在 spawn 後
      * 走訪後代，後代內 interior symlink + 跟隨旗標〈find -L、grep -R（含
      * --dereference-recursive）等，ls/stat/du -L（含 --dereference）等〉可讀域外；
@@ -904,9 +2550,15 @@ object ShellPolicy {
      * interior link 需併發植入或帶外植入；直接通道 `ln` 不在允許命令內
      * （ALLOWED_BINARIES 無 ln），直接通道模型無法直接建鏈，但 guest 通道
      * python3/tar/unzip 可在容器內建鏈（見 ProotExec KDoc 容器內殘餘）。
-     * 不擋 -L/-R 的理由：擋 grep -R 將誤殺合法遞迴、有可用性成本，已超本次
-     * 有界切片；未來以工作區無 symlink 不變量或遞迴白名單收斂（Refs #9
-     * follow-up）。提權（Root/Shizuku，見 app/src/github）走同一門
+     * Stage D＋G 收斂（P1-2）：跟隨旗標本身已由 [checkPathArgs] fail-closed 拒絕
+     * （grep `-R`／`--dereference-recursive` 家族縮寫／含 `R` 單橫、find `-L`／
+     * `-follow`／含 `L` 單橫、du `-L`／`--dereference` 家族縮寫／含 `L` 單橫、
+     * ls `-L`／`--dereference*` 家族縮寫／含 `L` 單橫；小寫 `-r`／`--recursive`、
+     * find `-H`／`-P`、du `-D`／`--dereference-args` 消歧前綴、ls `-R` 單獨、
+     * grep `--directories=*`／`--devices=*` 維持放行，見 [isFollowFlag]
+     * 決策表；multicall 有效基同門；guest＋scope 容器內豁免）。長期受控
+     * traversal（工作區無 symlink 不變量／遞迴白名單）仍為 follow-up（Refs #9）。
+     * 提權（Root/Shizuku，見 app/src/github）走同一門
      * （isElevated=true），同殘餘適用，其 Failed 去路徑化等收斂見 Refs #10
      * follow-up（刻意不在本 PR 碰 github source set）。
      * F-NORMWALK：步驟 1 walk 的對象為 [FileScope.normalize] 後鏈，原始 `..`
@@ -1058,13 +2710,20 @@ object ShellPolicy {
     }
 }
 
-/** 拒絕原因碼（對應 D05「白名單/黑名單/配額」三類門禁 + 參數衛生）。 */
+/** 拒絕原因碼（對應 D05「白名單/黑名單/配額」三類門禁 + 參數衛生 + 未驗證 quarantine 閂）。 */
 enum class ShellDeny {
     EMPTY_COMMAND,
     NOT_WHITELISTED,
     BLACKLISTED,
     BAD_ARGUMENT,
     QUOTA_EXCEEDED,
+    /**
+     * Round-3 Phase E（P1-1，未驗證死亡 process 持久 quarantine）：
+     * quarantine 非空期間一切新 privileged spawn 一律 fail-closed 拒絕。
+     * 獨立原因碼，不與 [QUOTA_EXCEEDED] 的 backlog／breaker／併發三因混碼
+     * （verdict 仍 `DENY`，見提權 verdict 坍縮表；僅 github 風味提權通道使用）。
+     */
+    QUARANTINE,
 }
 
 /** [ShellPolicy.validate] 的回執：放行攜正規化後的二進位名，拒絕攜原因。 */

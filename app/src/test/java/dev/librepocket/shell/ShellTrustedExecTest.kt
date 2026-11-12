@@ -33,8 +33,10 @@ import org.junit.Test
  *   usr 合併形放行不受影響；拒絕細項經 ResolveDeny 可觀測（不含 path）；
  * - 操作數 schema（`--opt=value`、短旗標合併、值槽、pattern 槽）維持既有嚴格語義；
  * - null 作用域的隱式 cwd bare fail-closed，且放行者 spawn 仍是固定路徑 + 乾淨 env；
- * - multicall（toybox/toolbox/busybox）：實體 basename 落顯式表時 spawn 還原
- *   applet（`[real, applet, ...]`），bare/絕對 `argv[0]` 全鏈覆蓋 + 真跑 e2e；
+ * - multicall（toybox/toolbox/busybox）：實體 basename 落顯式表「且」邏輯名
+ *   ≠ 實體名（經 symlink／別名呼叫）時 spawn 還原 applet（`[real, applet, ...]`），
+ *   bare/絕對 `argv[0]` 全鏈覆蓋 + 真跑 e2e；主程式自身（`logicalBase == realBase`）
+ *   不重插（P2-7 parity，見 `ShellMulticallParityTest`）；
  *   舊形狀（無 applet）負向對照證非 vacuous；非表內（正規檔/同名 link/
  *   版本化名）維持無插入；
  * - `env == null` 不再繼承宿主（真實 runner 回落 [ShellExecutables.CLEAN_ENV]）。
@@ -140,6 +142,11 @@ class ShellTrustedExecTest {
             val shell = RestrictedShell(
                 runner = runner,
                 privateRoot = scope.absolutePath,
+                // Stage 5 P3-4：自訂映射再驗證須與映射同表（否則 fail-closed 拒）；
+                // 本用例映射即 `resolve(trusted, systemOwned)`，故 shell 側同表。
+                execSearchDirs = listOf(trusted.absolutePath),
+                execAllowedRoots = listOf(trusted.canonicalPath),
+                execIsWritable = systemOwned,
                 execResolver = { ShellExecutables.resolve(it, listOf(trusted.absolutePath), isWritable = systemOwned) },
             )
             val r = shell.execute(listOf("ls", "-l"))
@@ -610,12 +617,20 @@ class ShellTrustedExecTest {
                 setOf("toybox", "toolbox", "busybox"),
                 ShellExecutables.MULTICALL_BINARIES,
             )
+            // P2-7 parity：邏輯名本來就是 multicall 主程式自身時不插入
+            // （`logicalBase == realBase` → `applet == null`；`args` 首位即 applet）。
             for (name in listOf("toybox", "toolbox", "busybox")) {
                 val f = File(dir, name)
                 f.writeText("#!/bin/sh\necho marker\n")
                 assertTrue("setExecutable failed for $f", f.setExecutable(true))
                 val hit = ShellExecutables.resolve(name, listOf(dir.absolutePath), isWritable = systemOwned)!!
-                assertEquals("$name", name, hit.applet)
+                assertNull("$name main-self must not insert applet", hit.applet)
+                val hitAbs = ShellExecutables.resolve(
+                    "${dir.absolutePath}/$name",
+                    listOf(dir.absolutePath),
+                    isWritable = systemOwned,
+                )!!
+                assertNull("$name absolute main-self must not insert applet", hitAbs.applet)
             }
             // 版本化／改名／普通二進位不在表：一律無插入（拒「名不同即插」）。
             for (name in listOf("toybox-arm", "coreutils", "myecho")) {

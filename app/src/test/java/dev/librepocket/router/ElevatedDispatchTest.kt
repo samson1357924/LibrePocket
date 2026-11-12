@@ -2,6 +2,7 @@ package dev.librepocket.router
 
 import dev.librepocket.shell.DenyingElevatedRunner
 import dev.librepocket.shell.ElevatedRequest
+import dev.librepocket.shell.ElevatedShellRunner
 import dev.librepocket.shell.PrivilegeAuditLog
 import dev.librepocket.shell.ShellResult
 import dev.librepocket.tool.CapabilityLevel
@@ -64,5 +65,60 @@ class ElevatedDispatchTest {
         assertTrue("$r", r is ShellResult.Denied)
         assertEquals(1, audit.size())
         assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+    }
+
+    @Test fun allowedRunAuditsFrozenSnapshotDespiteMidRunMutation() {
+        // Phase 4 P2-1：dispatch 入口凍結，run 期間竄改原始 MutableList
+        // 不影響執行所見與審計雜湊（皆為入口快照 ["id"]）。
+        val audit = PrivilegeAuditLog()
+        val mutable = mutableListOf("id")
+        var seenByRunner: List<String>? = null
+        val tampering = object : ElevatedShellRunner {
+            override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult {
+                seenByRunner = request.argv.toList()
+                mutable.add("sh")
+                mutable[0] = "sh"
+                return ShellResult.Ok("ok", "", 0, false)
+            }
+        }
+        val r = ElevatedDispatch.execute(
+            tool = tool,
+            confirmed = true,
+            projection = native,
+            request = ElevatedRequest(mutable, reasonCode = "D09-T"),
+            runner = tampering,
+            audit = audit,
+        )
+        assertTrue("$r", r is ShellResult.Ok)
+        assertEquals(listOf("id"), seenByRunner)
+        assertEquals(1, audit.size())
+        val row = audit.snapshot().single()
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), row.argvHash)
+        assertEquals(PrivilegeAuditLog.sha256Hex("D09-T"), row.reasonHash)
+        assertEquals(mapOf("OK" to 1), audit.countByVerdict())
+    }
+
+    @Test fun tailTimeoutAuditsTimeoutNotOk() {
+        // R2-PhaseC P2-2：tail 取消／超時升級的 TimedOut（攜 partial＋truncated，
+        // runner 側不再回 Ok）經 dispatch 同樣回 TimedOut＋審計 TIMEOUT（非 OK）。
+        // 二進位→文字轉換一致性由 `ElevatedVerdictMappingTest` 鎖定，此處鎖
+        // dispatch＋audit 映射（verdict 坍縮表 tail-cancel→TIMEOUT 一條）。
+        val audit = PrivilegeAuditLog()
+        val tailTimedOut = object : ElevatedShellRunner {
+            override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult =
+                ShellResult.TimedOut("partial", "", timeoutMs, true)
+        }
+        val r = ElevatedDispatch.execute(
+            tool = tool,
+            confirmed = true,
+            projection = native,
+            request = ElevatedRequest(listOf("id"), reasonCode = "D09-T"),
+            runner = tailTimedOut,
+            audit = audit,
+        )
+        assertTrue("$r", r is ShellResult.TimedOut)
+        assertEquals("TIMEOUT", PrivilegeAuditLog.verdictName(r))
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("TIMEOUT" to 1), audit.countByVerdict())
     }
 }

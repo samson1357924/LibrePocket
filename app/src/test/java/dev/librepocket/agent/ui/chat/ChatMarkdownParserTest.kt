@@ -1818,6 +1818,11 @@ class ChatMarkdownParserTest {
         // CI (2x ratio 3.5242 vs bound 3.5). Median-of-rounds on a doubled base cuts the
         // noise share; the 3.5 bound still sits strictly inside (2, 4), so the
         // linear (~2) vs quadratic (~4) discrimination is unchanged — no bound relaxation.
+        //
+        // Hardening 2 (PR #140 CI): median-of-7 still flaked on a loaded foss runner
+        // (2x ratio 3.6039 vs bound 3.5, t1=6.7ms). Interleaved sampling cancels
+        // machine drift between the t1 and t2 phases (each round measures both back
+        // to back, ratio uses per-side medians); base doubled again. Bound unchanged.
         val unit = "**u *a ***x*** **b *c*** "
         val one = ChatMarkdownParser.parseInlineMarkdown(unit)
         for (word in listOf("u", "a", "x", "b", "c")) {
@@ -1827,18 +1832,24 @@ class ChatMarkdownParserTest {
             one.text,
             ChatMarkdownParser.parseInlineMarkdown(unit).text,
         )
-        fun timed(repeat: Int): Long {
-            val input = unit.repeat(repeat)
+        fun timedOnce(input: String): Long {
             repeat(5) { ChatMarkdownParser.parseInlineMarkdown(input) }
-            val samples = LongArray(7) {
-                val start = System.nanoTime()
-                repeat(5) { ChatMarkdownParser.parseInlineMarkdown(input) }
-                System.nanoTime() - start
-            }
-            return samples.sorted()[samples.size / 2]
+            val start = System.nanoTime()
+            repeat(5) { ChatMarkdownParser.parseInlineMarkdown(input) }
+            return System.nanoTime() - start
         }
-        val t1 = timed(600)
-        val t2 = timed(1200)
+        val input1 = unit.repeat(1200)
+        val input2 = unit.repeat(2400)
+        // Interleaved rounds: each round measures both back to back so machine
+        // drift hits both sides equally; ratio uses per-side medians.
+        val samples1 = LongArray(7)
+        val samples2 = LongArray(7)
+        repeat(7) { i ->
+            samples1[i] = timedOnce(input1)
+            samples2[i] = timedOnce(input2)
+        }
+        val t1 = samples1.sorted()[samples1.size / 2]
+        val t2 = samples2.sorted()[samples2.size / 2]
         val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
         assertTrue("shared-triple 2x ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)", ratio < 3.5)
     }

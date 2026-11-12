@@ -8,7 +8,7 @@ Gradle bypass). The regression tests in
 scripts/tests/test_verification_metadata.py only import this module; the
 validator logic lives here.
 
-Usage: python3 -P scripts/verify_verification_metadata.py
+Usage: python3 -P scripts/verify_verification_metadata.py [--help | -h]
 Exit status: 0 = gate passes, 2 = gate rejected (ValueError).
 """
 
@@ -30,13 +30,20 @@ def _text(element) -> str:
 def validate_tree(root: ET.Element) -> None:
     if root.tag != "{https://schema.gradle.org/dependency-verification}verification-metadata":
         raise ValueError(f"unexpected root tag: {root.tag}")
-    config = root.find("v:configuration", NS)
-    if config is None:
-        raise ValueError("missing <configuration>")
-    verify_metadata = _text(config.find("v:verify-metadata", NS))
+    configs = root.findall("v:configuration", NS)
+    if len(configs) != 1:
+        raise ValueError(f"expected exactly one <configuration> element, found {len(configs)}")
+    config = configs[0]
+    v_metas = config.findall("v:verify-metadata", NS)
+    if len(v_metas) != 1:
+        raise ValueError(f"expected exactly one <verify-metadata> element, found {len(v_metas)}")
+    verify_metadata = _text(v_metas[0])
     if verify_metadata != "true":
         raise ValueError(f"<verify-metadata> must be 'true', got {verify_metadata!r}")
-    verify_signatures = _text(config.find("v:verify-signatures", NS))
+    v_sigs = config.findall("v:verify-signatures", NS)
+    if len(v_sigs) != 1:
+        raise ValueError(f"expected exactly one <verify-signatures> element, found {len(v_sigs)}")
+    verify_signatures = _text(v_sigs[0])
     if verify_signatures != "false":
         raise ValueError(
             f"<verify-signatures> must be 'false' for the checksum-only slice, got {verify_signatures!r}"
@@ -48,9 +55,10 @@ def validate_tree(root: ET.Element) -> None:
     key_servers = config.find("v:key-servers", NS)
     if key_servers is not None and key_servers.get("enabled") == "false":
         raise ValueError("<key-servers enabled='false'/> weakens future signature bootstrapping")
-    components = root.find("v:components", NS)
-    if components is None:
-        raise ValueError("missing <components>")
+    comps = root.findall("v:components", NS)
+    if len(comps) != 1:
+        raise ValueError(f"expected exactly one <components> element, found {len(comps)}")
+    components = comps[0]
     entries = components.findall("v:component", NS)
     if not entries:
         raise ValueError("no <component> entries (empty verification is a bypass)")
@@ -248,13 +256,17 @@ def _properties_verification_mode(lines: list[str]) -> str | None:
 
 def validate_gradle_files(root: Path = ROOT) -> None:
     # Scan Gradle scripts under root; skip generated output dirs (build/)
-    # and hidden dirs so future build outputs can never false-positive.
+    # and hidden dirs (.git, .gradle) or node_modules so future build outputs
+    # and vendored trees can never false-positive.
     def _scannable(path: Path) -> bool:
         try:
             rel = path.relative_to(root)
         except ValueError:
             return True
-        return not any(part == "build" or part.startswith(".") for part in rel.parts[:-1])
+        return not any(
+            part in ("build", "node_modules", ".git", ".gradle") or part.startswith(".")
+            for part in rel.parts[:-1]
+        )
 
     targets = sorted(
         p
@@ -262,9 +274,11 @@ def validate_gradle_files(root: Path = ROOT) -> None:
         for p in root.rglob(pattern)
         if _scannable(p)
     )
-    props = root / "gradle.properties"
-    if props.is_file():
-        targets.append(props)
+    props_targets = sorted(
+        p for p in root.rglob("gradle.properties") if _scannable(p)
+    )
+    targets.extend(props_targets)
+    targets = list(dict.fromkeys(targets))
     for path in targets:
         if not path.is_file():
             continue
@@ -299,7 +313,20 @@ def load_metadata() -> ET.Element:
         raise ValueError(f"invalid XML in {METADATA}: {exc}") from exc
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else list(argv)
+    for arg in args:
+        if arg not in ("-h", "--help"):
+            print(
+                f"Usage: python3 -P scripts/verify_verification_metadata.py [--help | -h]\n"
+                f"ERROR: unrecognized argument: {arg}",
+                file=sys.stderr,
+            )
+            return 2
+    if any(arg in ("-h", "--help") for arg in args):
+        print(__doc__.strip())
+        return 0
+
     try:
         root = load_metadata()
         validate_tree(root)

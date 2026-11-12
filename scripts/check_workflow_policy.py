@@ -120,7 +120,9 @@ REMOTE_USES_RE = re.compile(
     r"@[0-9a-f]{40}$"
 )
 GH_RELEASE_RE = re.compile(r"(?i)\bgh\s+[\"']?release[\"']?\b")
-GH_ISSUE_RE = re.compile(r"(?i)\bgh\s+issue\b")
+GH_ISSUE_RE = re.compile(
+    r"(?i)\bgh\s+(?:[\"']?issues?[\"']?|[\"']?api[\"']?\b(?:[^\n]|\\\n)*\bissues?\b)"
+)
 GH_API_RE = re.compile(r"(?i)\bgh\s+api\b")
 GH_API_HOST_RE = re.compile(r"(?i)\bapi\.github\.com\b")
 RELEASES_PATH_RE = re.compile(r"(?i)(?:^|[/\s\"'`])releases(?:/assets)?(?:[/\s\"'`]|$)")

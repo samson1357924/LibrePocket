@@ -22,7 +22,11 @@ the proof is a clean-cache Gradle build with strict verification (see docs).
 shape-only: version drift is caught by Gradle builds, not by this test.
 """
 
+import contextlib
 import copy
+import io
+import subprocess
+import sys
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -188,6 +192,14 @@ class VerificationMetadataTest(unittest.TestCase):
             config = t.find("v:configuration", NS)
             t.remove(config)
 
+        def duplicate_configuration(t):
+            config = t.find("v:configuration", NS)
+            t.append(copy.deepcopy(config))
+
+        def duplicate_components(t):
+            comps = t.find("v:components", NS)
+            t.append(copy.deepcopy(comps))
+
         def enable_signatures(t):
             # checksum-only lock: the validator currently requires
             # <verify-signatures>false</verify-signatures>; flipping it to
@@ -213,6 +225,8 @@ class VerificationMetadataTest(unittest.TestCase):
             "component missing name": component_missing_name,
             "artifact missing name": artifact_missing_name,
             "missing configuration": drop_configuration,
+            "duplicate configuration": duplicate_configuration,
+            "duplicate components": duplicate_components,
             "verify-signatures=true rejected (checksum-only lock)": enable_signatures,
         }
         for name, mutate in cases.items():
@@ -460,6 +474,118 @@ class VerificationMetadataTest(unittest.TestCase):
                 validate_gradle_files(tmp)
             props.write_text("# clean\n", encoding="utf-8")
             validate_gradle_files(tmp)  # must not raise
+
+    def test_duplicate_configuration_rejected(self):
+        root = load_metadata()
+        config = root.find("v:configuration", NS)
+        root.append(copy.deepcopy(config))
+        with self.assertRaisesRegex(
+            ValueError, r"expected exactly one <configuration> element, found 2"
+        ):
+            validate_tree(root)
+
+    def test_duplicate_verify_metadata_rejected(self):
+        root = load_metadata()
+        config = root.find("v:configuration", NS)
+        v_meta = config.find("v:verify-metadata", NS)
+        config.append(copy.deepcopy(v_meta))
+        with self.assertRaisesRegex(
+            ValueError, r"expected exactly one <verify-metadata> element, found 2"
+        ):
+            validate_tree(root)
+
+    def test_duplicate_verify_signatures_rejected(self):
+        root = load_metadata()
+        config = root.find("v:configuration", NS)
+        v_sig = config.find("v:verify-signatures", NS)
+        config.append(copy.deepcopy(v_sig))
+        with self.assertRaisesRegex(
+            ValueError, r"expected exactly one <verify-signatures> element, found 2"
+        ):
+            validate_tree(root)
+
+    def test_duplicate_components_rejected(self):
+        root = load_metadata()
+        comps = root.find("v:components", NS)
+        root.append(copy.deepcopy(comps))
+        with self.assertRaisesRegex(
+            ValueError, r"expected exactly one <components> element, found 2"
+        ):
+            validate_tree(root)
+
+    def test_subproject_gradle_properties_disabled_verification_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            sub = tmp / "subproject"
+            sub.mkdir()
+            props = sub / "gradle.properties"
+            props.write_text(
+                "org.gradle.dependency.verification=off\n", encoding="utf-8"
+            )
+            with self.assertRaises(ValueError):
+                validate_gradle_files(tmp)
+
+            props.write_text(
+                "org.gradle.dependency.verification=lenient\n", encoding="utf-8"
+            )
+            with self.assertRaises(ValueError):
+                validate_gradle_files(tmp)
+
+            props.write_text(
+                "org.gradle.dependency.verification=strict\n", encoding="utf-8"
+            )
+            validate_gradle_files(tmp)  # must not raise
+
+            # Excluded directories (.git, .gradle, build, node_modules) are ignored
+            for ignored in (".git", ".gradle", "build", "node_modules"):
+                ignored_dir = tmp / ignored
+                ignored_dir.mkdir(parents=True, exist_ok=True)
+                (ignored_dir / "gradle.properties").write_text(
+                    "org.gradle.dependency.verification=off\n", encoding="utf-8"
+                )
+            validate_gradle_files(tmp)  # must not raise
+
+    def test_cli_invocation_help_and_unknown_flags(self):
+        script = ROOT / "scripts/verify_verification_metadata.py"
+
+        # --help exits 0
+        res_help = subprocess.run(
+            [sys.executable, "-P", str(script), "--help"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_help.returncode, 0)
+        self.assertIn("Usage:", res_help.stdout)
+
+        # -h exits 0
+        res_h = subprocess.run(
+            [sys.executable, "-P", str(script), "-h"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_h.returncode, 0)
+        self.assertIn("Usage:", res_h.stdout)
+
+        # --unknown-flag exits 2
+        res_unknown = subprocess.run(
+            [sys.executable, "-P", str(script), "--unknown-flag"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_unknown.returncode, 2)
+        self.assertIn("unrecognized argument: --unknown-flag", res_unknown.stderr)
+
+        # Direct function invocation
+        buf_out = io.StringIO()
+        buf_err = io.StringIO()
+        with contextlib.redirect_stdout(buf_out):
+            self.assertEqual(V.main(["--help"]), 0)
+            self.assertEqual(V.main(["-h"]), 0)
+        self.assertIn("Checksum-only strict gate", buf_out.getvalue())
+        with contextlib.redirect_stderr(buf_err):
+            self.assertEqual(V.main(["--unknown-flag"]), 2)
+            self.assertEqual(V.main(["--unknown-flag", "--help"]), 2)
+        self.assertIn("unrecognized argument: --unknown-flag", buf_err.getvalue())
 
 
 if __name__ == "__main__":

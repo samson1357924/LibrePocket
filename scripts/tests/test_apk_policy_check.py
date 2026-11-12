@@ -516,7 +516,7 @@ class ApkPolicyHarness(unittest.TestCase):
             "        empty) : ;;\n"
             "        missing-one)\n"
             "          # The file/librepocket_keysets exclude drops out of EVERY\n"
-            "          # section (assistant_role retained to isolate the single miss):\n"
+            "          # section (device-bound excludes retained to isolate the single miss):\n"
             "          # the exact-set rule must reject the compiled\n"
             "          # bytes in both members (dump succeeds, content differs).\n"
             "          if [ \"${MEMBER}\" = \"res/xml/backup_rules.xml\" ]; then\n"
@@ -536,7 +536,13 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
             "              '  E: exclude' \\\n"
             "              '    A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
-            "              '    A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")'\n"
+            "              '    A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")'\n"
             "          else\n"
             "            printf '%s\\n' \\\n"
             "              'E: data-extraction-rules (line=1)' \\\n"
@@ -556,6 +562,12 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
             "              '  E: device-transfer (line=7)' \\\n"
             "              '    E: exclude (line=8)' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
@@ -571,11 +583,17 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
-            "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")'\n"
+            "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")'\n"
             "          fi ;;\n"
             "        extra-one)\n"
             "          # The mirror image of missing-one: every REQUIRED + DEVICE-BOUND\n"
-            "          # exclude stays and ONE entry beyond the pinned six adds itself\n"
+            "          # exclude stays and ONE entry beyond the pinned eight adds itself\n"
             "          # to EVERY section: the exact-set rule must reject the\n"
             "          # compiled bytes in both members (dump succeeds, content\n"
             "          # differs).\n"
@@ -597,6 +615,12 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '  E: exclude' \\\n"
             "              '    A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '    A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
             "              '  E: exclude (line=6)' \\\n"
             "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '    A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -622,6 +646,12 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
             "              '    E: exclude (line=7)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -644,6 +674,12 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
             "              '    E: exclude (line=14)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -674,6 +710,12 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
             "              '    E: exclude (line=7)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -693,6 +735,12 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
             "              '    E: exclude (line=13)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -718,11 +766,17 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '  E: exclude' \\\n"
             "              '    A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '    A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
             "              '  E: exclude (line=6)' \\\n"
             "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '    A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")'\n"
             "          fi ;;\n"
-            "        *)  # *)  # ok (default): exactly the REQUIRED + DEVICE-BOUND set under\n"
+            "        *)  # ok (default): exactly the REQUIRED + DEVICE-BOUND set under\n"
             "            # both roots, so the default artifacts stay positive\n"
             "            # controls for the compiled-bytes authority\n"
             "          if [ \"${MEMBER}\" = \"res/xml/backup_rules.xml\" ]; then\n"
@@ -743,6 +797,12 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '  E: exclude' \\\n"
             "              '    A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '    A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
             "              '  E: exclude (line=6)' \\\n"
             "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '    A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")'\n"
@@ -765,6 +825,12 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
             "              '    E: exclude (line=7)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -784,6 +850,12 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
             "              '    E: exclude (line=13)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")'\n"
@@ -955,6 +1027,100 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '    E: service (line=4)' \\\n"
             "            '      A: android:name=\"decoy.Service\" (Raw: \"decoy.Service\")' \\\n"
             "            '      A: android:debuggable(0x0101000f)=(type 0x12)0xffffffff' ;;\n"
+            "        shizuku-ok)\n"
+            "          # Realistic github manifest excerpt: benign integer attrs\n"
+            "          # (type 0x10), InitializationProvider, Shizuku meta-data,\n"
+            "          # and ShizukuProvider guarded by INTERACT_ACROSS_USERS_FULL.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: meta-data (line=2)' \\\n"
+            "            '      A: android:name(0x01010003)=\"moe.shizuku.client.V3_SUPPORT\" (Raw: \"moe.shizuku.client.V3_SUPPORT\")' \\\n"
+            "            '      A: android:value(0x01010024)=(type 0x12)0xffffffff' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\"androidx.startup.InitializationProvider\" (Raw: \"androidx.startup.InitializationProvider\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.androidx-startup\" (Raw: \"dev.librepocket.agent.github.androidx-startup\")' \\\n"
+            "            '      A: android:initOrder(0x010103a7)=(type 0x10)0x64' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-weak-perm)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERNET\" (Raw: \"android.permission.INTERNET\")' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-grant-uri)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:grantUriPermissions(0x0101001b)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-grant-uri-ref)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:grantUriPermissions(0x0101001b)=@0x7f030001' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-grant-uri-attr)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:grantUriPermissions(0x0101001b)=?0x01010000' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-grant-uri-upper)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:grantUriPermissions(0x0101001b)=\"TRUE\" (Raw: \"TRUE\")' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        duplicate-application)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '  E: application' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-ns-alias-weak)\n"
+            "          printf '%s\\n' 'N: p=http://schemas.android.com/apk/res/android' \\\n"
+            "            '  E: manifest' '    E: application' \\\n"
+            "            '      A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '      A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '      A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '      E: provider (line=4)' \\\n"
+            "            '        A: p:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '        A: p:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '        A: p:writePermission(0x01010008)=\"android.permission.INTERNET\" (Raw: \"android.permission.INTERNET\")' \\\n"
+            "            '        A: p:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
             "        *)  # bindings (the default, realistic merged manifest)\n"
             "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
             "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
@@ -1857,8 +2023,8 @@ class ApkPolicyHarness(unittest.TestCase):
     def test_compiled_backup_rules_missing_exclude_rejected(self) -> None:
         # A resources-overlay/merger rewrite can change the COMPILED rule
         # content while every source file and the manifest binding stay
-        # faithful. The artifact bytes must still carry the EXACT six
-        # excludes (5 key + 1 device-bound): dropping one entry fails the
+        # faithful. The artifact bytes must still carry the EXACT eight
+        # excludes (5 key + 3 device-bound): dropping one entry fails the
         # run even though the dump
         # succeeded and the binding survived.
         apk = complete_apk(
@@ -1875,8 +2041,8 @@ class ApkPolicyHarness(unittest.TestCase):
     def test_compiled_backup_rules_unexpected_exclude_rejected(self) -> None:
         # The mirror image of the missing-one control: a resources-overlay /
         # merger rewrite can also ADD an exclude to the COMPILED rule
-        # content. The artifact bytes must still carry EXACTLY the six
-        # excludes (5 key + 1 device-bound): adding one entry
+        # content. The artifact bytes must still carry EXACTLY the eight
+        # excludes (5 key + 3 device-bound): adding one entry
         # (domain="path", path="extra.xml") fails
         # the run even though every required entry survives and the dump
         # succeeded.
@@ -1892,8 +2058,8 @@ class ApkPolicyHarness(unittest.TestCase):
         self.assertIn("compiled res/xml/", result.stdout)
 
     def test_compiled_backup_rules_valid_bytes_accepted(self) -> None:
-        # Positive control: the exactly-pinned six-exclude set (5 key +
-        # 1 device-bound, any order)
+        # Positive control: the exactly-pinned eight-exclude set (5 key +
+        # 3 device-bound, any order)
         # passes both members, keeping the default artifact runs positive.
         apk = complete_apk(
             self.tmp / "rules-ok.apk",
@@ -1949,8 +2115,8 @@ class ApkPolicyHarness(unittest.TestCase):
         ):
             self.assertEqual(engine_call.args[1], member)
             self.assertEqual(engine_call.args[2], expected_root)
-            # Exact-set mode is ON at artifact level: extras beyond the six
-            # required excludes (5 key + 1 device-bound) are refused,
+            # Exact-set mode is ON at artifact level: extras beyond the eight
+            # required excludes (5 key + 3 device-bound) are refused,
             # not tolerated.
             self.assertIs(engine_call.kwargs.get("exact_excludes"), True)
 
@@ -2543,6 +2709,400 @@ class ApkPolicyHarness(unittest.TestCase):
             "uses-permission: android.permission.BIND_ACCESSIBILITY_SERVICE\n",
             'E: service\n'
             '  A: android:name="android.accessibilityservice.AccessibilityService"\n',
+        )
+
+    def test_play_mode_rejects_shizuku_manifest_and_provider_references(self) -> None:
+        apk = complete_apk(
+            self.tmp / "play-shizuku.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, xmltree_mode="shizuku-ok")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Shizuku", result.stdout)
+
+        for label, permissions, xmltree in (
+            (
+                "rikka-xmltree",
+                "",
+                '  E: application\n'
+                '    E: provider\n'
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n',
+            ),
+            (
+                "moe-permissions",
+                "uses-permission: name='moe.shizuku.manager.permission.API_V23'\n",
+                "  E: application\n",
+            ),
+            (
+                "moe-metadata",
+                "",
+                '  E: application\n'
+                '    E: meta-data\n'
+                '      A: android:name="moe.shizuku.client.V3_SUPPORT"\n',
+            ),
+            (
+                "shizuku-authority-only",
+                "",
+                '  E: application\n'
+                '    E: provider\n'
+                '      A: android:name="com.example.RenamedProvider"\n'
+                '      A: android:authorities="dev.librepocket.agent.shizuku"\n',
+            ),
+        ):
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, "Shizuku"):
+                    policy_inspect._check_play(permissions, xmltree, (), [])
+
+    def test_github_mode_enforces_shizuku_provider_permission_and_uri_grants(self) -> None:
+        apk = complete_apk(
+            self.tmp / "github-shizuku.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        ok = self._run_scanner_cli(apk, "github", xmltree_mode="shizuku-ok")
+        self.assertEqual(ok.returncode, 0, ok.stderr + ok.stdout)
+        self.assertIn("policy: github OK", ok.stdout)
+
+        weak = self._run_scanner_cli(apk, "github", xmltree_mode="shizuku-weak-perm")
+        self.assertNotEqual(weak.returncode, 0, weak.stderr + weak.stdout)
+        self.assertIn("INTERACT_ACROSS_USERS_FULL", weak.stderr)
+
+        uri_grant = self._run_scanner_cli(apk, "github", xmltree_mode="shizuku-grant-uri")
+        self.assertNotEqual(uri_grant.returncode, 0, uri_grant.stderr + uri_grant.stdout)
+        self.assertIn("grantUriPermissions", uri_grant.stderr)
+
+        # Positive controls: explicit read+write permissions and nested child meta-data
+        # under <provider> (child attributes at +4 must not shadow provider attrs at +2).
+        policy_inspect._check_github_shizuku_provider(
+            "  E: application\n"
+            "    E: provider\n"
+            '      A: android:name(0x01010003)="rikka.shizuku.ShizukuProvider" (Raw: "rikka.shizuku.ShizukuProvider")\n'
+            '      A: android:permission(0x01010006)="android.permission.INTERACT_ACROSS_USERS_FULL" (Raw: "android.permission.INTERACT_ACROSS_USERS_FULL")\n'
+            '      A: android:grantUriPermissions(0x0101001b)=(type 0x12)0x0\n'
+            "      E: meta-data\n"
+            '        A: android:name="child.Meta"\n'
+        )
+        policy_inspect._check_github_shizuku_provider(
+            "  E: application\n"
+            "    E: provider\n"
+            '      A: http://schemas.android.com/apk/res/android:name="rikka.shizuku.ShizukuProvider"\n'
+            '      A: http://schemas.android.com/apk/res/android:readPermission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+            '      A: http://schemas.android.com/apk/res/android:writePermission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+        )
+
+        # Negative controls: missing permission, weakened read/write override,
+        # grantUriPermissions=true, <path-permission>, <grant-uri-permission>.
+        for label, bad_tree, msg in (
+            (
+                "missing-permission",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:authorities="dev.librepocket.agent.github.shizuku"\n',
+                "INTERACT_ACROSS_USERS_FULL",
+            ),
+            (
+                "weak-write-override",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '      A: android:writePermission="android.permission.INTERNET"\n',
+                "INTERACT_ACROSS_USERS_FULL",
+            ),
+            (
+                "weak-read-override",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '      A: android:readPermission=""\n',
+                "INTERACT_ACROSS_USERS_FULL",
+            ),
+            (
+                "path-permission-child",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                "      E: path-permission\n"
+                '        A: android:path="/"\n',
+                "path-permission",
+            ),
+            (
+                "grant-uri-permission-child",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                "      E: grant-uri-permission\n"
+                '        A: android:path="/"\n',
+                "grant-uri-permission",
+            ),
+            (
+                "authority-only-shizuku",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="com.example.AliasProvider"\n'
+                '      A: android:authorities="a;dev.librepocket.agent.github.shizuku"\n',
+                "INTERACT_ACROSS_USERS_FULL",
+            ),
+        ):
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, msg):
+                    policy_inspect._check_github_shizuku_provider(bad_tree)
+
+    def test_github_mode_rejects_non_false_grant_uri_permissions_encodings(self) -> None:
+        apk = complete_apk(
+            self.tmp / "github-grant-uri-encodings.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for xmltree_mode in (
+            "shizuku-grant-uri-ref",
+            "shizuku-grant-uri-attr",
+            "shizuku-grant-uri-upper",
+        ):
+            with self.subTest(xmltree_mode=xmltree_mode):
+                result = self._run_scanner_cli(apk, "github", xmltree_mode=xmltree_mode)
+                self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertIn("grantUriPermissions", result.stderr)
+
+        # Direct positive control for explicit string "false" and typed false.
+        for false_encoding in ('"false" (Raw: "false")', "(type 0x12)0x0"):
+            policy_inspect._check_github_shizuku_provider(
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                f"      A: android:grantUriPermissions={false_encoding}\n"
+            )
+
+        for label, bad_encoding in (
+            ("resource-ref", "@0x7f030001"),
+            ("theme-attr-ref", "?0x01010000"),
+            ("uppercase-true", '"TRUE" (Raw: "TRUE")'),
+            ("empty-string", '""'),
+        ):
+            with self.subTest(encoding=label):
+                with self.assertRaisesRegex(
+                    policy_inspect.PolicyError, "grantUriPermissions"
+                ):
+                    policy_inspect._check_github_shizuku_provider(
+                        "  E: application\n"
+                        "    E: provider\n"
+                        '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                        '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                        f"      A: android:grantUriPermissions={bad_encoding}\n"
+                    )
+
+    def test_duplicate_application_block_and_decoy_tags_fail_closed(self) -> None:
+        apk = complete_apk(
+            self.tmp / "duplicate-application.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for mode in ("github", "play", "foss"):
+            with self.subTest(mode=mode):
+                result = self._run_scanner_cli(
+                    apk, mode, xmltree_mode="duplicate-application"
+                )
+                self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertIn("multiple <application>", result.stderr)
+
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, r"multiple <application>"
+        ):
+            policy_inspect._application_manifest_block(
+                "E: manifest\n"
+                "  E: application\n"
+                "    A: android:fullBackupContent(0x010104eb)=@0x7f010000\n"
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+            )
+
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, r"multiple <application>"
+        ):
+            policy_inspect._check_github_shizuku_provider(
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="androidx.startup.InitializationProvider"\n'
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+            )
+
+        # Tag boundary: E: application-decoy and E: provider-decoy must never match.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, r"lacks an <application> element"
+        ):
+            policy_inspect._application_manifest_block(
+                "E: manifest\n"
+                "  E: application-decoy\n"
+                "    A: android:fullBackupContent(0x010104eb)=@0x7f010000\n"
+            )
+        policy_inspect._check_github_shizuku_provider(
+            "E: manifest\n"
+            "  E: application\n"
+            "    E: provider-decoy\n"
+            '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+        )
+
+    def test_shizuku_provider_namespace_aliases_and_boundaries(self) -> None:
+        apk = complete_apk(
+            self.tmp / "github-ns-alias.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        cli_weak = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-ns-alias-weak"
+        )
+        self.assertNotEqual(cli_weak.returncode, 0, cli_weak.stderr + cli_weak.stdout)
+        self.assertIn("INTERACT_ACROSS_USERS_FULL", cli_weak.stderr)
+
+        # Bound alias `N: p=http://schemas.android.com/apk/res/android` with valid attrs passes.
+        policy_inspect._check_github_shizuku_provider(
+            "N: p=http://schemas.android.com/apk/res/android\n"
+            "  E: manifest\n"
+            "    E: application\n"
+            "      E: provider\n"
+            '        A: p:name="rikka.shizuku.ShizukuProvider"\n'
+            '        A: p:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+            '        A: p:authorities="dev.librepocket.agent.github.shizuku"\n'
+        )
+
+        # Bound alias catching weak writePermission and grantUriPermissions=true.
+        for label, bad_tree, msg in (
+            (
+                "ns-alias-weak-write",
+                "N: p=http://schemas.android.com/apk/res/android\n"
+                "  E: manifest\n"
+                "    E: application\n"
+                "      E: provider\n"
+                '        A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '        A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '        A: p:writePermission="android.permission.INTERNET"\n',
+                "INTERACT_ACROSS_USERS_FULL",
+            ),
+            (
+                "ns-alias-grant-uri",
+                "E: manifest\n"
+                "  E: application\n"
+                "    N: p=http://schemas.android.com/apk/res/android\n"
+                "      E: provider\n"
+                '        A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '        A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                "        A: p:grantUriPermissions=(type 0x12)0xffffffff\n",
+                "grantUriPermissions",
+            ),
+            (
+                "ns-alias-grant-uri-literal-true",
+                "N: p=http://schemas.android.com/apk/res/android\n"
+                "E: manifest\n"
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                "      A: p:grantUriPermissions=true\n",
+                "unrecognized attribute value encoding",
+            ),
+            (
+                "unbound-unexpected-prefix-write-perm",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '      A: p:writePermission="android.permission.INTERNET"\n',
+                "unexpected or unbound namespace prefix",
+            ),
+            (
+                "unbound-unexpected-prefix-grant-uri",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                "      A: custom:grantUriPermissions=(type 0x12)0xffffffff\n",
+                "unexpected or unbound namespace prefix",
+            ),
+            (
+                "attr-after-child-element",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                "      E: meta-data\n"
+                '        A: android:name="child.Meta"\n'
+                "      A: android:grantUriPermissions=(type 0x12)0xffffffff\n",
+                "attribute line after child element",
+            ),
+        ):
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, msg):
+                    policy_inspect._check_github_shizuku_provider(bad_tree)
+
+    def test_foss_and_play_shizuku_parity_and_moe_shizuku_dex(self) -> None:
+        # Both play and foss modes must reject Shizuku manifest/provider references
+        # and both rikka.shizuku and moe.shizuku DEX type references.
+        apk_clean_dex = complete_apk(
+            self.tmp / "shizuku-manifest.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for mode in ("play", "foss"):
+            with self.subTest(mode=mode, vector="manifest"):
+                result = self._run_scanner_cli(
+                    apk_clean_dex, mode, xmltree_mode="shizuku-ok"
+                )
+                self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        for label, permissions, xmltree in (
+            (
+                "rikka-xmltree",
+                "",
+                '  E: application\n'
+                '    E: provider\n'
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n',
+            ),
+            (
+                "moe-permissions",
+                "uses-permission: name='moe.shizuku.manager.permission.API_V23'\n",
+                "  E: application\n",
+            ),
+            (
+                "shizuku-authority-only",
+                "",
+                '  E: application\n'
+                '    E: provider\n'
+                '      A: android:name="com.example.RenamedProvider"\n'
+                '      A: android:authorities="dev.librepocket.agent.foss.shizuku"\n',
+            ),
+        ):
+            with self.subTest(mode="foss", case=label):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, r"(?i)shizuku"):
+                    policy_inspect._check_foss(permissions, xmltree, [])
+
+        for idx, descriptor in enumerate((
+            "Lrikka/shizuku/Shizuku;",
+            "Lmoe/shizuku/api/BinderContainer;",
+            "[Lmoe/shizuku/api/BinderContainer;",
+        )):
+            dex_ref_only = minimal_dex(type_descriptors=(descriptor,))
+            apk_ref = complete_apk(
+                self.tmp / f"shizuku-ref-{idx}.apk", dex_ref_only
+            )
+            for mode in ("play", "foss"):
+                with self.subTest(descriptor=descriptor, mode=mode):
+                    result = self._run_scanner_cli(apk_ref, mode)
+                    self.assertNotEqual(
+                        result.returncode, 0, result.stderr + result.stdout
+                    )
+
+        # Also test defined_classes for Lmoe/shizuku/ in play mode.
+        dex_defined = minimal_dex(
+            class_definitions=(("Lmoe/shizuku/api/BinderContainer;", None),)
+        )
+        defined_result = self._run_scanner_cli(
+            complete_apk(self.tmp / "play-moe-defined.apk", dex_defined), "play"
+        )
+        self.assertNotEqual(
+            defined_result.returncode, 0, defined_result.stderr + defined_result.stdout
         )
 
     # -- merged-manifest networkSecurityConfig binding (artifact authority) --
@@ -3975,11 +4535,14 @@ class BackupRulesValidator(unittest.TestCase):
         '        <exclude domain="database" path="librepocket_vault-shm" />\n'
         '        <exclude domain="file" path="librepocket_keysets" />\n'
         '        <exclude domain="sharedpref" path="assistant_role.xml" />\n'
-        # Device-bound (finding #3 [P3]): always required alongside the five
-        # key entries, in EVERY checked scope (both extraction branches).
+        '        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb" />\n'
+        '        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb" />\n'
+        # Device-bound (finding #3 [P3] + #136-B1 grant lifecycle): always
+        # required alongside the five key entries, in EVERY checked scope
+        # (both extraction branches).
     )
 
-    # REQUIRED (5 key) + DEVICE-BOUND (1) total expected in every scope.
+    # REQUIRED (5 key) + DEVICE-BOUND (3) total expected in every scope.
     _TOTAL_EXCLUDES = len(backup_rules_check.REQUIRED_EXCLUDES) + len(
         backup_rules_check.REQUIRED_DEVICE_BOUND_EXCLUDES
     )
@@ -4336,6 +4899,8 @@ class BackupRulesValidator(unittest.TestCase):
             '    <exclude domain="database" path="librepocket_vault-shm" />\n'
             '    <exclude domain="file" path="librepocket_keysets" />\n'
             '    <exclude domain="sharedpref" path="assistant_role.xml" />\n'
+            '    <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb" />\n'
+            '    <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb" />\n'
             "    -->\n"
         )
         path = self._write(
@@ -4344,7 +4909,7 @@ class BackupRulesValidator(unittest.TestCase):
         errors = self._check(path)
         self.assertEqual(
             len(errors), 2 * self._TOTAL_EXCLUDES, errors
-        )  # 6 per branch; comments ignored
+        )  # 8 per branch; comments ignored
         self.assertTrue(
             all("<cloud-backup>" in e or "<device-transfer>" in e for e in errors),
             errors,
@@ -4409,7 +4974,7 @@ class BackupRulesValidator(unittest.TestCase):
             len(errors),
             self._TOTAL_EXCLUDES + 1,
             errors,
-        )  # 6 missing per branch + 1 unknown-element (<rule>)
+        )  # 8 missing per branch + 1 unknown-element (<rule>)
         self.assertTrue(all("<device-transfer>" in e for e in errors), errors)
         self.assertTrue(
             any("unknown element <rule>" in e for e in errors), errors
@@ -4457,7 +5022,7 @@ class BackupRulesValidator(unittest.TestCase):
     def test_exclude_moved_into_duplicate_section_fails_gate(self) -> None:
         # Splitting the required excludes across duplicate cloud-backup
         # sections must not satisfy the gate: every occurrence must carry the
-        # full six-exclude set (5 key + 1 device-bound).
+        # full eight-exclude set (5 key + 3 device-bound).
         split = (
             "    <cloud-backup>\n"
             '        <exclude domain="sharedpref" path="librepocket_keys.xml" />\n'
@@ -4476,8 +5041,8 @@ class BackupRulesValidator(unittest.TestCase):
         )
         path = self._write("data_extraction_rules.xml", body)
         errors = self._check(path)
-        # First occurrence misses 5 (4 key + device-bound), second misses 2
-        # (keys + device-bound; sharedpref key covered there, first misses
+        # First occurrence misses 7 (4 key + 3 device-bound), second misses 4
+        # (keys + 3 device-bound; sharedpref key covered there, first misses
         # it) — every occurrence must be complete.
         self.assertTrue(
             any("missing exclude domain=database path=librepocket_vault" in e for e in errors),
@@ -4610,7 +5175,7 @@ class BackupRulesValidator(unittest.TestCase):
     def test_exact_excludes_mode_flags_set_differences(self) -> None:
         # Artifact-level authority: `exact_excludes=True` (the compiled-bytes
         # scan) demands the exact REQUIRED + DEVICE-BOUND set (5 key +
-        # 1 device-bound, single-sourced as the allowlist) - a missing entry
+        # 3 device-bound, single-sourced as the allowlist) - a missing entry
         # fails as usual AND an unexpected extra is a set difference too,
         # order-free. Source-level default stays presence-only (over-shielding
         # tolerated at source: the exact-set pin is deliberately compiled-byte
@@ -4660,9 +5225,9 @@ class BackupRulesValidator(unittest.TestCase):
         )
 
     def test_exact_excludes_allows_required_device_bound_entry(self) -> None:
-        # Finding #3 [P3] positive control: the allowlisted device-bound entry
-        # (assistant_role.xml) is REQUIRED, not merely tolerated - the exact
-        # six-entry set (5 key + 1 device-bound) passes with zero errors and
+        # Finding #3 [P3] + #136-B1 positive control: all allowlisted
+        # device-bound entries are REQUIRED, not merely tolerated - the exact
+        # eight-entry set (5 key + 3 device-bound) passes with zero errors and
         # is reported as NEITHER missing NOR unexpected (no double-report).
         tree = ET.fromstring(self._full_backup(self._ALL_EXCLUDES))
         self.assertEqual(
@@ -4771,6 +5336,130 @@ class BackupRulesValidator(unittest.TestCase):
             ),
             errors,
         )
+
+    def test_exact_excludes_rejects_missing_privilege_bridge_grant(self) -> None:
+        # #136-B1 grant lifecycle: missing privilege bridge DataStore exclude
+        # must fail exact_excludes=True in full-backup-content and both
+        # data-extraction-rules branches without double-reporting unexpected.
+        grant_path = "datastore/librepocket_privilege_bridge.preferences_pb"
+        without_grant = self._ALL_EXCLUDES.replace(
+            f'        <exclude domain="file" path="{grant_path}" />\n',
+            "",
+        )
+        self.assertNotEqual(without_grant, self._ALL_EXCLUDES)
+        tree = ET.fromstring(self._full_backup(without_grant))
+        errors = backup_rules_check.validate_tree(
+            tree, "x", backup_rules_check.EXPECTED_ROOT_BACKUP_RULES, exact_excludes=True
+        )
+        self.assertTrue(
+            any(f"missing exclude domain=file path={grant_path}" in e for e in errors),
+            errors,
+        )
+        self.assertFalse(any("unexpected exclude" in e for e in errors), errors)
+
+        for branch, cloud, device in (
+            ("<cloud-backup>", without_grant, self._ALL_EXCLUDES),
+            ("<device-transfer>", self._ALL_EXCLUDES, without_grant),
+        ):
+            with self.subTest(branch=branch):
+                branch_tree = ET.fromstring(self._data_extraction(cloud, device))
+                branch_errors = backup_rules_check.validate_tree(
+                    branch_tree,
+                    "x",
+                    backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION,
+                    exact_excludes=True,
+                )
+                self.assertTrue(
+                    any(
+                        f"{branch} missing exclude domain=file path={grant_path}" in e
+                        for e in branch_errors
+                    ),
+                    branch_errors,
+                )
+                self.assertFalse(
+                    any("unexpected exclude" in e for e in branch_errors), branch_errors
+                )
+
+    def test_exact_excludes_rejects_missing_shizuku_grant(self) -> None:
+        # #136-B1 grant lifecycle: missing Shizuku grant DataStore exclude
+        # must fail exact_excludes=True in full-backup-content and both
+        # data-extraction-rules branches without double-reporting unexpected.
+        grant_path = "datastore/librepocket_shizuku_grant.preferences_pb"
+        without_grant = self._ALL_EXCLUDES.replace(
+            f'        <exclude domain="file" path="{grant_path}" />\n',
+            "",
+        )
+        self.assertNotEqual(without_grant, self._ALL_EXCLUDES)
+        tree = ET.fromstring(self._full_backup(without_grant))
+        errors = backup_rules_check.validate_tree(
+            tree, "x", backup_rules_check.EXPECTED_ROOT_BACKUP_RULES, exact_excludes=True
+        )
+        self.assertTrue(
+            any(f"missing exclude domain=file path={grant_path}" in e for e in errors),
+            errors,
+        )
+        self.assertFalse(any("unexpected exclude" in e for e in errors), errors)
+
+        for branch, cloud, device in (
+            ("<cloud-backup>", without_grant, self._ALL_EXCLUDES),
+            ("<device-transfer>", self._ALL_EXCLUDES, without_grant),
+        ):
+            with self.subTest(branch=branch):
+                branch_tree = ET.fromstring(self._data_extraction(cloud, device))
+                branch_errors = backup_rules_check.validate_tree(
+                    branch_tree,
+                    "x",
+                    backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION,
+                    exact_excludes=True,
+                )
+                self.assertTrue(
+                    any(
+                        f"{branch} missing exclude domain=file path={grant_path}" in e
+                        for e in branch_errors
+                    ),
+                    branch_errors,
+                )
+                self.assertFalse(
+                    any("unexpected exclude" in e for e in branch_errors), branch_errors
+                )
+
+    def test_source_level_requires_privilege_grant_excludes(self) -> None:
+        # #136-B1 grant lifecycle at the source face: missing either
+        # privilege grant DataStore fails backup_rules_check.validate() across
+        # backup_rules.xml and both branches of data_extraction_rules.xml.
+        for grant_path in (
+            "datastore/librepocket_privilege_bridge.preferences_pb",
+            "datastore/librepocket_shizuku_grant.preferences_pb",
+        ):
+            without_grant = self._ALL_EXCLUDES.replace(
+                f'        <exclude domain="file" path="{grant_path}" />\n',
+                "",
+            )
+            self.assertNotEqual(without_grant, self._ALL_EXCLUDES)
+            with self.subTest(file="backup_rules.xml", missing=grant_path):
+                p = self._write("backup_rules.xml", self._full_backup(without_grant))
+                errors = self._check(p)
+                self.assertTrue(
+                    any(f"missing exclude domain=file path={grant_path}" in e for e in errors),
+                    errors,
+                )
+            for branch, cloud, device in (
+                ("<cloud-backup>", without_grant, self._ALL_EXCLUDES),
+                ("<device-transfer>", self._ALL_EXCLUDES, without_grant),
+            ):
+                with self.subTest(file="data_extraction_rules.xml", branch=branch, missing=grant_path):
+                    p = self._write(
+                        "data_extraction_rules.xml",
+                        self._data_extraction(cloud, device),
+                    )
+                    errors = self._check(p)
+                    self.assertTrue(
+                        any(
+                            f"{branch} missing exclude domain=file path={grant_path}" in e
+                            for e in errors
+                        ),
+                        errors,
+                    )
 
     def test_validate_tree_matches_validate_on_representative_shapes(self) -> None:
         # The artifact scanner runs validate_tree directly; the file loader
@@ -7108,6 +7797,8 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             "    <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
             "    <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
             "    <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+            "    <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+            "    <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
             "</full-backup-content>\n",
             encoding="utf-8",
         )
@@ -7121,6 +7812,8 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
             "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
             "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+            "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+            "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
             "    </cloud-backup>\n"
             "    <device-transfer>\n"
             "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
@@ -7129,6 +7822,8 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
             "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
             "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+            "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+            "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
             "    </device-transfer>\n"
             "</data-extraction-rules>\n",
             encoding="utf-8",
@@ -7225,6 +7920,8 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
                 "    </cloud-backup>\n"
                 "    <device-transfer>\n"
                 "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
@@ -7233,6 +7930,8 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
                 "    </device-transfer>\n"
                 "</data-extraction-rules>\n",
                 encoding="utf-8",
@@ -7258,6 +7957,8 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "    <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "    <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "    <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+                "    <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "    <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
                 "</full-backup-content>\n",
                 encoding="utf-8",
             )
@@ -7273,6 +7974,8 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
                 "    </cloud-backup>\n"
                 "    <device-transfer>\n"
                 "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
@@ -7281,6 +7984,8 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
                 "    </device-transfer>\n"
                 "</data-extraction-rules>\n",
                 encoding="utf-8",
@@ -7312,6 +8017,8 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
                 "    </cloud-backup>\n"
                 "    <device-transfer>\n"
                 "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
@@ -7320,6 +8027,8 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
                 "    </device-transfer>\n"
                 "</data-extraction-rules>\n",
                 encoding="utf-8",
@@ -7989,6 +8698,8 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 '        <exclude domain="database" path="librepocket_vault-shm" />\n'
                 '        <exclude domain="file" path="librepocket_keysets" />\n'
                 '        <exclude domain="sharedpref" path="assistant_role.xml" />\n'
+                '        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb" />\n'
+                '        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb" />\n'
                 "    </cloud-backup>\n"
                 "    <device-transfer>\n"
                 '        <exclude domain="sharedpref" path="librepocket_keys.xml" />\n'
@@ -7997,6 +8708,8 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 '        <exclude domain="database" path="librepocket_vault-shm" />\n'
                 '        <exclude domain="file" path="librepocket_keysets" />\n'
                 '        <exclude domain="sharedpref" path="assistant_role.xml" />\n'
+                '        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb" />\n'
+                '        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb" />\n'
                 "    </device-transfer>\n"
                 "</data-extraction-rules>\n",
                 encoding="utf-8",
@@ -8005,6 +8718,71 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             self.assertNotIn("expected root", proc.stderr, proc.stderr)
             self.assertNotIn("deep-scan", proc.stderr, proc.stderr)
             self._assert_source_stage_clean_then_tool_stage_failure(proc)
+
+    def test_missing_privilege_grant_exclude_fails_at_source_stage(self) -> None:
+        # #136-B1 grant lifecycle: dropping either privilege grant DataStore
+        # exclude from backup_rules.xml or data_extraction_rules.xml (<device-transfer>)
+        # fails the real shell gate before the tool/artifact stage.
+        for grant_path in (
+            "datastore/librepocket_privilege_bridge.preferences_pb",
+            "datastore/librepocket_shizuku_grant.preferences_pb",
+        ):
+            with self.subTest(file="backup_rules.xml", missing=grant_path):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = self._minimal_tree(tmp)
+                    rules_file = (
+                        root / "app" / "src" / "main" / "res" / "xml" / "backup_rules.xml"
+                    )
+                    original = rules_file.read_text(encoding="utf-8")
+                    updated = original.replace(
+                        f'    <exclude domain="file" path="{grant_path}" />\n',
+                        "",
+                    )
+                    self.assertNotEqual(updated, original)
+                    rules_file.write_text(updated, encoding="utf-8")
+                    proc = self._run_gate(root)
+                    self.assertEqual(proc.returncode, 1, proc.stderr)
+                    self.assertIn(
+                        f"missing exclude domain=file path={grant_path}",
+                        proc.stderr,
+                    )
+                    self.assertNotIn("required Android build-tools", proc.stderr)
+
+            with self.subTest(
+                file="data_extraction_rules.xml",
+                branch="device-transfer",
+                missing=grant_path,
+            ):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = self._minimal_tree(tmp)
+                    extraction_file = (
+                        root
+                        / "app"
+                        / "src"
+                        / "main"
+                        / "res"
+                        / "xml"
+                        / "data_extraction_rules.xml"
+                    )
+                    original = extraction_file.read_text(encoding="utf-8")
+                    marker = "    <device-transfer>\n"
+                    head, sep, tail = original.partition(marker)
+                    self.assertEqual(sep, marker)
+                    updated_tail = tail.replace(
+                        f'        <exclude domain="file" path="{grant_path}" />\n',
+                        "",
+                    )
+                    self.assertNotEqual(updated_tail, tail)
+                    updated = head + sep + updated_tail
+                    self.assertNotEqual(updated, original)
+                    extraction_file.write_text(updated, encoding="utf-8")
+                    proc = self._run_gate(root)
+                    self.assertEqual(proc.returncode, 1, proc.stderr)
+                    self.assertIn(
+                        f"<device-transfer> missing exclude domain=file path={grant_path}",
+                        proc.stderr,
+                    )
+                    self.assertNotIn("required Android build-tools", proc.stderr)
 
     def test_nsc_alias_without_config_segment_is_deep_scanned(self) -> None:
         # The NSC deep scan was widened from the exact

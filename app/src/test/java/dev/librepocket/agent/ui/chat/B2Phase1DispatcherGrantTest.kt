@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.test.core.app.ApplicationProvider
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.chat.ChatSession
+import dev.librepocket.chat.ChatStatus
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
 import dev.librepocket.policy.InMemoryPolicyStore
@@ -23,6 +24,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.emptyFlow
@@ -604,6 +606,241 @@ class B2Phase1DispatcherGrantTest {
                     event.text.contains("user@example.com"),
                 )
             }
+        } finally {
+            closeQuietly(created.session)
+        }
+    }
+
+    @Test fun backendExceptionYieldsExecErrorDenialWithoutCrashingSession() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val store = openDb(app)
+        val provider = ScriptedProvider()
+        val policy = allowKeyReadPolicy()
+        policy.setRule(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 20))
+        val backendInvocations = AtomicInteger(0)
+        val backend = object : LspTools.Backend {
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+                backendInvocations.incrementAndGet()
+                throw RuntimeException("LSP process terminated unexpectedly")
+            }
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val requests = AtomicInteger(0)
+        val seen = CopyOnWriteArrayList<ChatRequest>()
+        val f = factory(app, store, policy, provider, slice(policy, backend))
+
+        provider.handler = { request ->
+            seen.add(request)
+            when (requests.incrementAndGet()) {
+                1 -> flow {
+                    emit(StreamEvent.ToolDone(0, "call-fail", "lsp.symbols", """{"query":"Foo"}"""))
+                    emit(StreamEvent.Done("tool_calls"))
+                }
+                else -> flow {
+                    emit(StreamEvent.TextDelta(0, 0, "執行工具失敗後的正常回答"))
+                    emit(StreamEvent.Done("stop"))
+                }
+            }
+        }
+
+        val created = f.sessions.create(endpoint(), "B2 後端異常", allowAsk = false, keyIsCurrent = { true })
+        try {
+            created.session.send("查 Foo")
+            assertTrue(created.session.flushDurable(8_000))
+            assertEquals(1, backendInvocations.get())
+            assertEquals(2, seen.size)
+            val toolMessages = seen[1].messages.filter { it.role == "tool" }
+            assertEquals(1, toolMessages.size)
+            val toolMsg = toolMessages.single()
+            assertEquals("call-fail", toolMsg.toolCallId)
+            assertTrue(seen[1].tools.isEmpty())
+            val body = Json.parseToJsonElement(toolMsg.text).jsonObject
+            assertEquals("true", body.getValue("denied").jsonPrimitive.content)
+            assertEquals(SafeToolSlice.DenyCodes.EXEC_ERROR, body.getValue("code").jsonPrimitive.content)
+            assertEquals("backend failed", body.getValue("detail").jsonPrimitive.content)
+            assertFalse("raw exception message must not leak to wire", toolMsg.text.contains("LSP process terminated unexpectedly"))
+            val sid = checkNotNull(created.sessionId)
+            val events = store.loadEvents(sid, 0, 2000)
+            assertFalse("raw exception message must not leak to audit", events.any { it.text.contains("LSP process terminated unexpectedly") })
+            assertTrue("missing final answer: $events", events.any { it.text.contains("執行工具失敗後的正常回答") })
+            assertTrue("missing tool result marker: $events", events.any { it.text.contains("[tool-result:lsp.symbols") })
+            assertEquals(ChatStatus.IDLE, created.session.uiState.value.status)
+        } finally {
+            closeQuietly(created.session)
+        }
+    }
+
+    @Test fun multiToolCallExceedingTurnBudgetDeniesWholeRound() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val store = openDb(app)
+        val provider = ScriptedProvider()
+        val policy = allowKeyReadPolicy()
+        policy.setRule(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 20))
+        val backend = CountingBackend()
+        val requests = AtomicInteger(0)
+        val seen = CopyOnWriteArrayList<ChatRequest>()
+        val f = factory(app, store, policy, provider, slice(policy, backend))
+
+        provider.handler = { request ->
+            seen.add(request)
+            when (requests.incrementAndGet()) {
+                1 -> flow {
+                    emit(StreamEvent.ToolDone(0, "call-1", "lsp.symbols", """{"query":"Foo"}"""))
+                    emit(StreamEvent.ToolDone(1, "call-2", "lsp.symbols", """{"query":"Bar"}"""))
+                    emit(StreamEvent.Done("tool_calls"))
+                }
+                else -> flow {
+                    emit(StreamEvent.TextDelta(0, 0, "超額呼叫已拒絕，提供最終回答"))
+                    emit(StreamEvent.Done("stop"))
+                }
+            }
+        }
+
+        val created = f.sessions.create(endpoint(), "B2 超額工具呼叫", allowAsk = false, keyIsCurrent = { true })
+        try {
+            created.session.send("一次查兩個符號")
+            assertTrue(created.session.flushDurable(8_000))
+            assertEquals(0, backend.invocations.get())
+            assertEquals(2, seen.size)
+            assertTrue(seen[1].tools.isEmpty())
+            val toolMessages = seen[1].messages.filter { it.role == "tool" }
+            assertEquals(2, toolMessages.size)
+            assertEquals("call-1", toolMessages[0].toolCallId)
+            assertEquals("call-2", toolMessages[1].toolCallId)
+            assertTrue("first call must be denied with BUDGET_EXCEEDED: ${toolMessages[0].text}", toolMessages[0].text.contains(SafeToolSlice.DenyCodes.BUDGET_EXCEEDED))
+            assertTrue("second call must be denied with BUDGET_EXCEEDED: ${toolMessages[1].text}", toolMessages[1].text.contains(SafeToolSlice.DenyCodes.BUDGET_EXCEEDED))
+            val sid = checkNotNull(created.sessionId)
+            val events = store.loadEvents(sid, 0, 2000)
+            assertEquals(2, events.sumOf { it.text.split("[tool-result:lsp.symbols").size - 1 })
+            assertFalse(events.any { it.text.contains(":example") })
+            assertTrue("missing final answer: $events", events.any { it.text.contains("超額呼叫已拒絕，提供最終回答") })
+            assertEquals(ChatStatus.IDLE, created.session.uiState.value.status)
+        } finally {
+            closeQuietly(created.session)
+        }
+    }
+
+    @Test fun backendTimeoutYieldsExecDeniedWithZeroCrash() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val store = openDb(app)
+        val provider = ScriptedProvider()
+        val policy = allowKeyReadPolicy()
+        policy.setRule(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 20))
+        val backendInvocations = AtomicInteger(0)
+        val backend = object : LspTools.Backend {
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+                backendInvocations.incrementAndGet()
+                awaitCancellation()
+            }
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val requests = AtomicInteger(0)
+        val seen = CopyOnWriteArrayList<ChatRequest>()
+        val toolSlice = slice(policy, backend)
+        toolSlice.backendTimeoutMillisForTest = 50L
+        val f = factory(app, store, policy, provider, toolSlice)
+
+        provider.handler = { request ->
+            seen.add(request)
+            when (requests.incrementAndGet()) {
+                1 -> flow {
+                    emit(StreamEvent.ToolDone(0, "call-slow", "lsp.symbols", """{"query":"Foo"}"""))
+                    emit(StreamEvent.Done("tool_calls"))
+                }
+                else -> flow {
+                    emit(StreamEvent.TextDelta(0, 0, "後端超時後的回答"))
+                    emit(StreamEvent.Done("stop"))
+                }
+            }
+        }
+
+        val created = f.sessions.create(endpoint(), "B2 後端超時", allowAsk = false, keyIsCurrent = { true })
+        try {
+            created.session.send("查慢速符號")
+            assertTrue(created.session.flushDurable(8_000))
+            assertEquals(1, backendInvocations.get())
+            assertEquals(2, seen.size)
+            assertTrue(seen[1].tools.isEmpty())
+            val toolMessages = seen[1].messages.filter { it.role == "tool" }
+            assertEquals(1, toolMessages.size)
+            val toolMsg = toolMessages.single()
+            assertEquals("call-slow", toolMsg.toolCallId)
+            assertTrue("message must contain EXEC_DENIED: ${toolMsg.text}", toolMsg.text.contains(SafeToolSlice.DenyCodes.EXEC_DENIED))
+            assertTrue("message must contain 'backend timed out': ${toolMsg.text}", toolMsg.text.contains("backend timed out"))
+            val sid = checkNotNull(created.sessionId)
+            val events = store.loadEvents(sid, 0, 2000)
+            assertTrue("missing tool result marker: $events", events.any { it.text.contains("[tool-result:lsp.symbols") })
+            assertFalse("timed-out backend must not produce symbol output: $events", events.any { it.text.contains("Foo:example") })
+            assertTrue("missing final answer: $events", events.any { it.text.contains("後端超時後的回答") })
+            assertEquals(ChatStatus.IDLE, created.session.uiState.value.status)
+        } finally {
+            try {
+                toolSlice.backendTimeoutMillisForTest = null
+            } finally {
+                closeQuietly(created.session)
+            }
+        }
+    }
+
+    @Test fun multiTurnSessionResetsTurnSliceBudgetCleanly() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val store = openDb(app)
+        val provider = ScriptedProvider()
+        val policy = allowKeyReadPolicy()
+        policy.setRule(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 20))
+        val backend = CountingBackend()
+        val requests = AtomicInteger(0)
+        val seen = CopyOnWriteArrayList<ChatRequest>()
+        val f = factory(app, store, policy, provider, slice(policy, backend))
+
+        provider.handler = { request ->
+            seen.add(request)
+            when (requests.incrementAndGet()) {
+                1 -> flow {
+                    emit(StreamEvent.ToolDone(0, "call-turn-1", "lsp.symbols", """{"query":"Foo"}"""))
+                    emit(StreamEvent.Done("tool_calls"))
+                }
+                2 -> flow {
+                    emit(StreamEvent.TextDelta(0, 0, "第一輪最終回答"))
+                    emit(StreamEvent.Done("stop"))
+                }
+                3 -> flow {
+                    emit(StreamEvent.ToolDone(0, "call-turn-2", "lsp.symbols", """{"query":"Bar"}"""))
+                    emit(StreamEvent.Done("tool_calls"))
+                }
+                4 -> flow {
+                    emit(StreamEvent.TextDelta(0, 0, "第二輪最終回答"))
+                    emit(StreamEvent.Done("stop"))
+                }
+                else -> error("unexpected request #${requests.get()}")
+            }
+        }
+
+        val created = f.sessions.create(endpoint(), "B2 多輪工具重設預算", allowAsk = false, keyIsCurrent = { true })
+        try {
+            // Turn 1
+            created.session.send("回合 1")
+            assertTrue(created.session.flushDurable(8_000))
+            assertEquals(1, backend.invocations.get())
+            assertEquals(2, seen.size)
+            assertEquals(listOf("lsp.symbols"), seen[0].tools.map { it.name })
+            assertTrue("turn 1 continuation must not offer tools", seen[1].tools.isEmpty())
+            assertEquals(ChatStatus.IDLE, created.session.uiState.value.status)
+
+            // Turn 2
+            created.session.send("回合 2")
+            assertTrue(created.session.flushDurable(8_000))
+            assertEquals(2, backend.invocations.get())
+            assertEquals(4, seen.size)
+            assertEquals("turn 2 initial request must offer tools again", listOf("lsp.symbols"), seen[2].tools.map { it.name })
+            assertTrue("turn 2 continuation must not offer tools", seen[3].tools.isEmpty())
+            assertEquals(ChatStatus.IDLE, created.session.uiState.value.status)
+
+            val sid = checkNotNull(created.sessionId)
+            val events = store.loadEvents(sid, 0, 2000)
+            assertEquals(2, events.count { it.text.contains("[tool-result:lsp.symbols") })
+            assertTrue("missing turn 1 answer: $events", events.any { it.text.contains("第一輪最終回答") })
+            assertTrue("missing turn 2 answer: $events", events.any { it.text.contains("第二輪最終回答") })
         } finally {
             closeQuietly(created.session)
         }

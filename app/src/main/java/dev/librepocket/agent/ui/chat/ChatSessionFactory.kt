@@ -72,12 +72,14 @@ private const val HISTORY_PAGE = 200
  * [snapshotSwitchHistory]).
  *
  * Known inconsistency (B1, declared — unification is Target B2): [openImpl]
- * and [openForked] still pass `HistoryWindowCap.MaxMessages(HISTORY_LOAD_CAP)`
- * (effectively unbounded for the ≤2000-row tail load) while
- * [buildSession]'s default — and [dev.librepocket.chat.TurnController]'s —
- * is the bounded `HistoryWindowCap.DEFAULT` (200 msgs / 60k chars), so a
+ * retains the declared B1 inconsistency (`MaxMessages(HISTORY_LOAD_CAP)`
+ * for the 2000-row DB tail load) until B2 hydration-tail unification lands,
+ * while [openForked] now uses `HistoryWindowCap.DEFAULT` (since it starts a
+ * fresh empty session) matching [buildSession]'s default — and
+ * [dev.librepocket.chat.TurnController]'s — bounded `HistoryWindowCap.DEFAULT`
+ * (200 msgs / 60k chars). Thus only [openImpl] retains this divergence, so a
  * resumed long dialogue windows harder on create-path semantics than on the
- * open path until the hydration-tail unification lands.
+ * open path until B2.
  */
 internal object SnapshotBudget {
     internal const val HISTORY_LOAD_CAP = 2000
@@ -876,8 +878,10 @@ class ChatSessionFactory(
         // observes the same truncation (defense in depth: the prefix already
         // saturates the cap, so each new live turn evicts the oldest prefix
         // row to hold the combined request total at cap).
-        // B1 known divergence (see [SnapshotBudget]): open/openForked pin
-        // MaxMessages(2000) while create-path uses HistoryWindowCap.DEFAULT.
+        // B1 known divergence (see [SnapshotBudget]): only openImpl retains
+        // the declared B1 inconsistency (MaxMessages(HISTORY_LOAD_CAP) for
+        // the 2000-row DB tail) until B2 hydration-tail unification; openForked
+        // now uses HistoryWindowCap.DEFAULT (starts fresh empty session).
         val loaded = loadModelHistory(store, sessionId)
         requireCurrentBinding(keyIsCurrent)
         val model = modelFor(endpoint)
@@ -1028,7 +1032,7 @@ class ChatSessionFactory(
                 systemZone,
                 sessionStart,
                 emptyList(),
-                HistoryWindowCap.MaxMessages(SnapshotBudget.HISTORY_LOAD_CAP),
+                HistoryWindowCap.DEFAULT,
             )
             session = openedSession
             requireCurrentBinding(keyIsCurrent)

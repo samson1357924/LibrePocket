@@ -25,7 +25,7 @@ WORKFLOWS = {
 # This is a change-detection convention, not a shell/action call-graph analysis.
 WORKFLOW_SNAPSHOTS = {
     "codeql.yml": "b58e40a235a3ea0580d12e902f61ab04e0331cdbaeffdc1e72332055d722c638",
-    "nightly-instrumented.yml": "7f6fef3510422f07b7c04010c4de32b4e3705b45eb4003571f93cbec4d9301b1",
+    "nightly-instrumented.yml": "a271008743bc51293847d687261f3a30f3fff15af485dd9c764a35be7c5d9b67",
     "pocketguard.yml": "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564",
     "pr-check.yml": "ac3219626c0a419bc7bf72373c7b5496fb8a1b34456830c6654c5561825e2455",
     "release.yml": "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f",

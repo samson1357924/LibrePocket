@@ -2620,6 +2620,18 @@ runs:
         )
         self._assert_rejected("instrumented-test matrix keys must be exactly")
 
+    def test_nightly_matrix_include_is_rejected(self) -> None:
+        self._write(
+            "nightly-instrumented.yml",
+            NIGHTLY.replace(
+                "        arch: [x86_64]\n",
+                "        arch: [x86_64]\n"
+                "        include:\n          - flavor: Play\n",
+                1,
+            ),
+        )
+        self._assert_rejected("instrumented-test matrix keys must be exactly")
+
     def test_nightly_instrumented_fail_fast_true_is_rejected(self) -> None:
         self._write(
             "nightly-instrumented.yml",

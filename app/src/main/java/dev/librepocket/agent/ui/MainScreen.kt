@@ -2,6 +2,7 @@ package dev.librepocket.agent.ui
 
 import android.util.Log
 import kotlinx.coroutines.CancellationException
+import androidx.compose.material3.DrawerState
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
@@ -18,6 +19,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavHostController
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import dev.librepocket.agent.R
@@ -186,33 +188,18 @@ fun MainScreen(
         }
     }
 
-    // C2 session 語音喚起路由與邊界守衛：
-    // - 啟動落定前（navLoading）不啟動也不消費，等待 gate 與 reconcile 落定；
-    // - 落定後若無可用端點（!hasEndpoint），消費清除 stale flag，避免日後設定
-    //   完成回到 CHAT 時意外補彈 STT；
-    // - 有端點且已落定時，關閉唯讀檢視（viewedSessionId），若當前不在 CHAT
-    //   路由則先導回 CHAT，待 currentRoute == Routes.CHAT 後關閉抽屜並交由 ChatScreen 消費。
-    LaunchedEffect(assistVoiceRequested, hasEndpoint, navLoading, currentRoute) {
-        if (!assistVoiceRequested) return@LaunchedEffect
-        if (navLoading) return@LaunchedEffect
-        if (!hasEndpoint) {
-            onAssistVoiceConsumed()
-            return@LaunchedEffect
-        }
-        if (viewedSessionId != null) {
-            viewedSessionId = null
-        }
-        if (currentRoute != null && currentRoute != Routes.CHAT) {
-            navController.navigate(Routes.CHAT) {
-                popUpTo(Routes.CHAT) { inclusive = false }
-                launchSingleTop = true
-            }
-            return@LaunchedEffect
-        }
-        if (!drawerState.isClosed || drawerState.targetValue != DrawerValue.Closed) {
-            drawerState.close()
-        }
-    }
+    // C2 session 語音喚起路由與邊界守衛（單一來源見 AssistVoiceCoordinator / shouldDeliverVoiceToChat）。
+    AssistVoiceCoordinator(
+        assistVoiceRequested = assistVoiceRequested,
+        hasEndpoint = hasEndpoint,
+        navLoading = navLoading,
+        currentRoute = currentRoute,
+        navController = navController,
+        drawerState = drawerState,
+        viewedSessionId = viewedSessionId,
+        onClearViewedSession = { viewedSessionId = null },
+        onAssistVoiceConsumed = onAssistVoiceConsumed,
+    )
 
     // Edit-entry helper: prefill the form with the live endpoint (key stays
     // blank) so "edit" never shows another preset's defaults.
@@ -273,13 +260,14 @@ fun MainScreen(
                 viewModel = chatViewModel,
                 onOpenSettings = { goSetupForEdit() },
                 onTurnFinished = { sessionListViewModel.refresh() },
-                voiceInputRequested = assistVoiceRequested &&
-                    currentRoute == Routes.CHAT &&
-                    hasEndpoint &&
-                    !navLoading &&
-                    viewedSessionId == null &&
-                    drawerState.isClosed &&
-                    drawerState.targetValue == DrawerValue.Closed,
+                voiceInputRequested = shouldDeliverVoiceToChat(
+                    assistVoiceRequested = assistVoiceRequested,
+                    currentRoute = currentRoute,
+                    hasEndpoint = hasEndpoint,
+                    navLoading = navLoading,
+                    viewedSessionId = viewedSessionId,
+                    drawerState = drawerState,
+                ),
                 onVoiceInputConsumed = onAssistVoiceConsumed,
                 voiceSwitchesLoaded = voiceEffectiveSnapshot.loaded || voiceEffectiveSnapshot.loadFailed,
                 userSwitches = voiceUiSwitches,
@@ -483,5 +471,73 @@ fun MainScreen(
     )
     viewedSessionId?.let { id ->
         TranscriptViewer(id, sessionListViewModel::readTranscriptPage) { viewedSessionId = null }
+    }
+}
+
+/**
+ * C2 session 語音喚起投遞門禁（與 [AssistVoiceCoordinator] 同源）：
+ * 僅在已導至 `Routes.CHAT`、有端點、啟動已落定、無唯讀覆蓋且抽屜已完全關閉時才向
+ * [ChatScreen] 遞送一次態 `voiceInputRequested`。
+ */
+internal fun shouldDeliverVoiceToChat(
+    assistVoiceRequested: Boolean,
+    currentRoute: String?,
+    hasEndpoint: Boolean,
+    navLoading: Boolean,
+    viewedSessionId: String?,
+    drawerState: DrawerState,
+): Boolean =
+    assistVoiceRequested &&
+        currentRoute == Routes.CHAT &&
+        hasEndpoint &&
+        !navLoading &&
+        viewedSessionId == null &&
+        drawerState.isClosed &&
+        drawerState.targetValue == DrawerValue.Closed
+
+/**
+ * C2 session 語音喚起路由與邊界守衛（MainScreen 與接線測試共用單一來源）：
+ * - 啟動落定前（`navLoading`）不啟動也不消費，等待 gate 與 reconcile 落定；
+ * - 落定後若無可用端點（`!hasEndpoint`），消費清除 stale flag，避免日後設定
+ *   完成回到 CHAT 時意外補彈 STT；
+ * - 有端點且已落定時，關閉唯讀檢視（`viewedSessionId`），若當前不在 CHAT
+ *   路由則先導回 CHAT，待 `currentRoute == Routes.CHAT` 後關閉抽屜並交由 ChatScreen 消費。
+ */
+@Composable
+internal fun AssistVoiceCoordinator(
+    assistVoiceRequested: Boolean,
+    hasEndpoint: Boolean,
+    navLoading: Boolean,
+    currentRoute: String?,
+    navController: NavHostController,
+    drawerState: DrawerState,
+    viewedSessionId: String?,
+    onClearViewedSession: () -> Unit,
+    onAssistVoiceConsumed: () -> Unit,
+) {
+    // 刻意不把 viewedSessionId 放進 LaunchedEffect key：若納入 key，下方
+    // onClearViewedSession() 將 viewedSessionId 設為 null 會立即重啟效應並取消
+    // 正在執行的 drawerState.close()；同時 shouldDeliverVoiceToChat 已要求
+    // viewedSessionId == null 才允許投遞，不會在唯讀覆蓋關閉前誤送。
+    LaunchedEffect(assistVoiceRequested, hasEndpoint, navLoading, currentRoute) {
+        if (!assistVoiceRequested) return@LaunchedEffect
+        if (navLoading) return@LaunchedEffect
+        if (!hasEndpoint) {
+            onAssistVoiceConsumed()
+            return@LaunchedEffect
+        }
+        if (viewedSessionId != null) {
+            onClearViewedSession()
+        }
+        if (currentRoute != null && currentRoute != Routes.CHAT) {
+            navController.navigate(Routes.CHAT) {
+                popUpTo(Routes.CHAT) { inclusive = false }
+                launchSingleTop = true
+            }
+            return@LaunchedEffect
+        }
+        if (!drawerState.isClosed || drawerState.targetValue != DrawerValue.Closed) {
+            drawerState.close()
+        }
     }
 }

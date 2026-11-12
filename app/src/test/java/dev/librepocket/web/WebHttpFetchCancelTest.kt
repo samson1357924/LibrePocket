@@ -13,6 +13,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -23,9 +24,9 @@ import org.junit.Test
  * Provider／Service 層已有外層取消不回退證據（`WebSearchPhase5Test`
  * `outerTimeoutIsCancelNotFallback` 走 `SearxngSearchProvider` 整條路、
  * `WebSearchD2Test.cancellationDoesNotWriteCache` 證不寫快取），但映射層
- * `fetchWithTimeout` 內四個 `ensureActive()` 守衛——`SocketTimeoutException`／
- * `InterruptedIOException`／`IOException`／未知 `Exception` 在遇到取消時
- * 不得映射為 `TIMEOUT`／`TRANSPORT` 值（否則上層 `mayFallback` 會把一次
+ * `fetchWithTimeout` 內五處 `ensureActive()` 守衛——`TimeoutCancellationException`／
+ * `SocketTimeoutException`／`InterruptedIOException`／`IOException`／未知 `Exception`
+ * 在遇到取消時不得映射為 `TIMEOUT`／`TRANSPORT` 值（否則上層 `mayFallback` 會把一次
  * 外部取消誤判為可重試的傳輸失敗）——此前沒有任何測試同時「拋 IO 錯」又
  * 「帶取消」進入 catch，刪掉守衛全部測試照綠。此檔補的正是這塊缺口：
  * 取消永遠贏過錯誤映射，原樣透傳 [CancellationException]，絕不回
@@ -38,10 +39,12 @@ import org.junit.Test
  * 壞 fetcher」證明的映射層保證，無法轉移到真實 IO 上。Adapter 本人須另補
  * MockWebServer＋慢響應＋cancel 的 `Call.cancel()` 證據測試（本 D2 假尚未存在）。
  *
- * 變異驗證（2026-11-13）：拔掉 `fetchWithTimeout` 五處 `ensureActive()` 守衛後，
- * 僅 `transportErrorRacingWithCancelLosesToCancellation` 轉紅（回 Fail 值而非拋
- * CE），其餘三測仍綠（純 CE／TCE 經 `withTimeout` 機制透傳）。故競速測試是本檔
- * 真正的守衛殺手，其餘兩傳播測試釘住單元層級契約。
+ * 變異驗證（2026-11-13）：拔掉 `fetchWithTimeout` 五處 `ensureActive()` 守衛時，
+ * 守衛 1（`TimeoutCancellationException`）由 `outerTimeoutSurfacesAsTimeoutCancellationNotFailTimeout`
+ * 擊殺（`withTimeout(150)` 內捕獲 `returned` 並於 `catch` 斷言 `assertNull`，若映射回
+ * `Fail(TIMEOUT)` 即轉紅）；守衛 2–5（`SocketTimeoutException`／`InterruptedIOException`／
+ * `IOException`／未知 `Exception`）由 `transportErrorRacingWithCancelLosesToCancellation`
+ * 擊殺（回 `Fail` 值而非拋 `CE`）。其餘傳播／自家超時測試釘住單元層級契約。
  */
 class WebHttpFetchCancelTest {
 
@@ -69,7 +72,7 @@ class WebHttpFetchCancelTest {
         }
         val (job, outcome) = launchFetch(this, httpGet)
         withTimeout(5_000) { entered.await() }
-        job.cancelAndJoin()
+        withTimeout(5_000) { job.cancelAndJoin() }
         val result = outcome.get()
         assertNotNull("子協程應已產出結果", result)
         val failure = result!!.exceptionOrNull()
@@ -80,16 +83,24 @@ class WebHttpFetchCancelTest {
     }
 
     @Test fun outerTimeoutSurfacesAsTimeoutCancellationNotFailTimeout() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
         val httpGet = WebHttpGet { _, _ ->
+            entered.complete(Unit)
             delay(30_000) // cooperative suspend：外層 withTimeout 可中斷
             WebHttpResponse(200, "{}")
         }
-        try {
-            withTimeout(75) {
-                fetchWithTimeout(httpGet, url, emptyMap(), timeoutMs = 10_000)
+        var returned: FetchOut? = null
+        val job = async {
+            withTimeout(150) {
+                returned = fetchWithTimeout(httpGet, url, emptyMap(), timeoutMs = 10_000)
             }
+        }
+        withTimeout(5_000) { entered.await() }
+        try {
+            job.await()
             fail("外層 withTimeout 必須拋 CE，不得回 Fail(TIMEOUT)")
         } catch (e: CancellationException) {
+            assertNull("fetchWithTimeout 絕不得回傳 Fail 值，必須以異常透傳取消", returned)
             // 外層取消以 TCE 送達：自家 timeout 未到（10s），必須透傳而非映射。
             assertTrue("外層 deadline 必須透傳 TimeoutCancellationException，實際=$e", e is TimeoutCancellationException)
         }
@@ -120,25 +131,13 @@ class WebHttpFetchCancelTest {
      * IO 錯誤與取消競速時取消獲勝：壞 fetcher 先吞掉取消（模擬不可取消的
      * blocking IO 中斷後才回報傳輸錯誤），再拋各類傳輸異常；映射層 catch 內的
      * `ensureActive()` 必須把 CE 丟出來，不得回傳可 fallback 的 Fail 值。
-     * 拿掉任一 `ensureActive()` 此測即紅（回 Fail 而非拋 CE）。
+     * 拿掉守衛 2–5 任一 `ensureActive()` 此測即紅（回 Fail 而非拋 CE）。
      */
     @Test fun transportErrorRacingWithCancelLosesToCancellation() = runBlocking {
         val makers: List<Pair<String, () -> Exception>> = listOf(
             "SocketTimeoutException" to { SocketTimeoutException("read timed out") },
             "InterruptedIOException" to { InterruptedIOException("interrupted") },
             "IOException" to { IOException("down") },
-            "TimeoutCancellationException" to {
-                // Public ctors are internal in this coroutines version:
-                // mint a real TCE via an already-expired timeout.
-                runBlocking {
-                    try {
-                        withTimeout(1) { delay(60_000) }
-                        error("unreachable")
-                    } catch (e: TimeoutCancellationException) {
-                        e
-                    }
-                }
-            },
             "genericException" to { IllegalStateException("broken fetcher") },
         )
         for ((name, makeError) in makers) {

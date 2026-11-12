@@ -349,6 +349,8 @@ class ElevatedWiringTest {
         assertTrue("$r", (r as ShellResult.Denied).message.contains("changed after confirm"))
         assertEquals(0, runner.calls)
         assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+        val row = audit.snapshot().single()
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), row.argvHash)
     }
 
     @Test fun contextFlipOnReverifyVoids() = runBlocking {

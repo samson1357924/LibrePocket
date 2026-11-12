@@ -629,7 +629,7 @@ class ChatSessionFactory(
 ) : ChatSessionProvider {
     init {
         if (toolSlice != null) {
-            require(toolSlice.policy === policy) {
+            require(toolSlice.usesPolicy(policy)) {
                 "toolSlice.policy must be identical to ChatSessionFactory's policy to prevent policy split-brain"
             }
         }
@@ -2635,32 +2635,30 @@ private fun markerNamePrefix(text: String, start: Int, limit: Int): String {
     return text.substring(start, end)
 }
 
-/** Production wiring for [ChatViewModel] (shares the process-singleton endpoint store). */
-class ChatViewModelFactory(
+class ChatViewModelFactory private constructor(
     app: Application,
-    private val store: EndpointStore = EndpointStore(app),
-    policy: PolicyStore? = null,
-    buildProvider: ((ProviderConfig, KeyProvider) -> LlmProvider)? = null,
-    vaultSource: VaultSource? = null,
-    sessionStores: SessionStoreSource? = null,
-    /**
-     * B2-phase1 (#19) injection seam: production default stays null
-     * (records-only invariant pinned by ProductionChatCompositionTest).
-     * Tests attach an explicit [SafeToolSlice] to prove the real-factory
-     * round-trip (visibleTools → ChatRequest.tools → execute → continuation)
-     * without flipping any registry `executionReady` or capability matrix.
-     * B3 decides the default-attached production slice (real switches/backend).
-     *
-     * Invariant: when non-null, [toolSlice.policy] must match [effectivePolicy]
-     * (reference-identical `===`) to prevent policy split-brain.
-     */
-    @VisibleForTesting(otherwise = VisibleForTesting.NONE) toolSlice: SafeToolSlice? = null,
+    private val store: EndpointStore,
+    policy: PolicyStore?,
+    buildProvider: ((ProviderConfig, KeyProvider) -> LlmProvider)?,
+    vaultSource: VaultSource?,
+    sessionStores: SessionStoreSource?,
+    toolSlice: SafeToolSlice?,
 ) : ViewModelProvider.Factory {
+    /** Production wiring for [ChatViewModel] (records-only pinned; shares the process-singleton endpoint store). */
+    constructor(
+        app: Application,
+        store: EndpointStore = EndpointStore(app),
+        policy: PolicyStore? = null,
+        buildProvider: ((ProviderConfig, KeyProvider) -> LlmProvider)? = null,
+        vaultSource: VaultSource? = null,
+        sessionStores: SessionStoreSource? = null,
+    ) : this(app, store, policy, buildProvider, vaultSource, sessionStores, toolSlice = null)
+
     private val effectivePolicy: PolicyStore = policy ?: DataStorePolicyStore(app)
 
     init {
         if (toolSlice != null) {
-            require(toolSlice.policy === effectivePolicy) {
+            require(toolSlice.usesPolicy(effectivePolicy)) {
                 "toolSlice.policy must be identical to ChatViewModelFactory's effectivePolicy to prevent policy split-brain"
             }
         }
@@ -2689,5 +2687,37 @@ class ChatViewModelFactory(
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         return ChatViewModel(store, sessions, effectivePolicy) as T
+    }
+
+    companion object {
+        /**
+         * B2-phase1 (#19) test factory seam: allows attaching an explicit [SafeToolSlice]
+         * to prove the real-factory round-trip (visibleTools -> ChatRequest.tools -> execute -> continuation)
+         * without exposing the slice parameter on the production constructor.
+         *
+         * Production composition strictly leaves [toolSlice] null (records-only invariant
+         * pinned by [ProductionChatCompositionTest]).
+         *
+         * Invariant: when non-null, [toolSlice] must match [effectivePolicy]
+         * (reference-identical `===` via [SafeToolSlice.usesPolicy]) to prevent policy split-brain.
+         */
+        @VisibleForTesting(otherwise = VisibleForTesting.NONE)
+        internal fun forTesting(
+            app: Application,
+            store: EndpointStore = EndpointStore(app),
+            policy: PolicyStore? = null,
+            buildProvider: ((ProviderConfig, KeyProvider) -> LlmProvider)? = null,
+            vaultSource: VaultSource? = null,
+            sessionStores: SessionStoreSource? = null,
+            toolSlice: SafeToolSlice? = null,
+        ): ChatViewModelFactory = ChatViewModelFactory(
+            app = app,
+            store = store,
+            policy = policy,
+            buildProvider = buildProvider,
+            vaultSource = vaultSource,
+            sessionStores = sessionStores,
+            toolSlice = toolSlice,
+        )
     }
 }

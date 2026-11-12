@@ -5570,7 +5570,7 @@ class TurnController(
     event: StreamEvent.ToolDone,
     attemptRunId: String,
     onWiredToolDone: ((dev.librepocket.provider.ToolCall) -> Unit)?,
-    offeredToolNames: Set<String> = emptySet(),
+    offeredToolNames: Set<String>,
   ) {
     // Terminal-only guard (Stage E): a direct ToolDone that never
     // went through delta budgeting must still fit ALL budgets

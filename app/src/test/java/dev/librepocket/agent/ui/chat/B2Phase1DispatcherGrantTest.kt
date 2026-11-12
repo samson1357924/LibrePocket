@@ -113,7 +113,7 @@ class B2Phase1DispatcherGrantTest {
         policy: dev.librepocket.policy.PolicyStore,
         provider: ScriptedProvider,
         slice: SafeToolSlice?,
-    ) = ChatViewModelFactory(
+    ) = ChatViewModelFactory.forTesting(
         app = app,
         policy = policy,
         vaultSource = VaultSource {
@@ -430,7 +430,16 @@ class B2Phase1DispatcherGrantTest {
         val slice = slice(slicePolicy, backend)
 
         val ex = assertThrows(IllegalArgumentException::class.java) {
-            factory(app, store, factoryPolicy, provider, slice)
+            ChatViewModelFactory.forTesting(
+                app = app,
+                policy = factoryPolicy,
+                vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+                sessionStores = object : SessionStoreSource {
+                    override suspend fun store() = store
+                },
+                buildProvider = { _, _ -> provider },
+                toolSlice = slice,
+            )
         }
         assertTrue(ex.message!!.contains("prevent policy split-brain"))
 

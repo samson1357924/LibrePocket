@@ -247,9 +247,18 @@ class TurnControllerHistoryTest {
         assertEquals(listOf("qq", toolBlock), fitting.map { it.text })
     }
 
-    @Test fun unboundedDefaultHydratesEverything() {
+    @Test fun smallHistorySurvivesDefaultCapWhole() {
+        // B1 rename (was `unboundedDefaultHydratesEverything`, written against
+        // the pre-B1 implicit Unbounded default): the intent — a tiny history
+        // hydrates whole with zero drops — now pins DEFAULT semantics with an
+        // explicit cap (never rely on the implicit default — the only
+        // exceptions are TurnControllerDefaultCapTest's emptyHistory and
+        // singleHugeMessage tests, which deliberately pin the default
+        // itself). The explicit
+        // Unbounded identity is pinned separately by
+        // TurnControllerDefaultCapTest.unboundedRequestSizeGrowsWithHistory.
         val history = historyOf("user" to "q1", "assistant" to "a1", "user" to "q2")
-        assertEquals(history, applyHistoryCap(history, HistoryWindowCap.Unbounded))
+        assertEquals(history, applyHistoryCap(history, HistoryWindowCap.DEFAULT))
         var n = 0
         val c = TurnController(
             provider = HistoryFakeProvider(doneOnce()),
@@ -258,9 +267,11 @@ class TurnControllerHistoryTest {
             sleeper = {},
             newId = { "unb-${n++}" },
             initialHistory = history,
+            historyCap = HistoryWindowCap.DEFAULT,
         )
         try {
             assertEquals(0, c.droppedHistoryCount)
+            assertEquals(0L, c.droppedHistoryChars)
         } finally {
             c.close()
         }
@@ -313,6 +324,10 @@ class TurnControllerHistoryTest {
             sleeper = {},
             newId = { "agg-${n++}" },
             initialHistory = historyList,
+            // B1: pins the send-time MAX_REQUEST_CHARS trim layer, not the
+            // window default — explicit Unbounded opt-in (was the implicit
+            // default before the B1 bounded default).
+            historyCap = HistoryWindowCap.Unbounded,
         )
         try {
             val latestUserText = "latest user: " + "y".repeat(17985)

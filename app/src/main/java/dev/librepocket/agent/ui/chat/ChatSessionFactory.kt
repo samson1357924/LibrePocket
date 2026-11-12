@@ -70,6 +70,14 @@ private const val HISTORY_PAGE = 200
  * and one store batch; an over-budget prefix is abandoned whole (zero rows +
  * incomplete marker, never a truncated half prefix — see
  * [snapshotSwitchHistory]).
+ *
+ * Known inconsistency (B1, declared — unification is Target B2): [openImpl]
+ * and [openForked] still pass `HistoryWindowCap.MaxMessages(HISTORY_LOAD_CAP)`
+ * (effectively unbounded for the ≤2000-row tail load) while
+ * [buildSession]'s default — and [dev.librepocket.chat.TurnController]'s —
+ * is the bounded `HistoryWindowCap.DEFAULT` (200 msgs / 60k chars), so a
+ * resumed long dialogue windows harder on create-path semantics than on the
+ * open path until the hydration-tail unification lands.
  */
 internal object SnapshotBudget {
     internal const val HISTORY_LOAD_CAP = 2000
@@ -868,6 +876,8 @@ class ChatSessionFactory(
         // observes the same truncation (defense in depth: the prefix already
         // saturates the cap, so each new live turn evicts the oldest prefix
         // row to hold the combined request total at cap).
+        // B1 known divergence (see [SnapshotBudget]): open/openForked pin
+        // MaxMessages(2000) while create-path uses HistoryWindowCap.DEFAULT.
         val loaded = loadModelHistory(store, sessionId)
         requireCurrentBinding(keyIsCurrent)
         val model = modelFor(endpoint)
@@ -1232,7 +1242,7 @@ class ChatSessionFactory(
         systemZone: () -> ZoneId = this.systemZone,
         sessionStart: Instant? = null,
         history: List<ChatMessage> = emptyList(),
-        historyCap: HistoryWindowCap = HistoryWindowCap.Unbounded,
+        historyCap: HistoryWindowCap = HistoryWindowCap.DEFAULT,
     ): ChatSession {
         val keys = KeyProvider { ref ->
             if (keyIsCurrent()) credential.copyFor(ref) else null

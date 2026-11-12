@@ -120,6 +120,9 @@ object NetworkPolicy {
     if (h == "onion" || h.endsWith(".onion")) return null
     if ('@' in h || '/' in h || '\\' in h || h.any { it.isWhitespace() || it < ' ' }) return null
     parseLiteralIp(h)?.let { return listOf(it) }
+    // IPv4 形狀但字面非法（前導零／超範圍等）：resolveHost 視為不可解析，
+    // 不得走 DNS 路徑（避免無效 host 觸發 resolver 洩漏）。
+    if (h.matches(Regex("""^\d+(\.\d+){3}$""")) && parseLiteralIp(h) == null) return null
     if (':' in h) return null // 含冒號卻不是合法字面 IPv6。
     if (!isValidDnsName(h)) return null
     return try {

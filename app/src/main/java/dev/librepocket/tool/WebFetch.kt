@@ -226,8 +226,16 @@ object WebFetch {
         // 避免「只調 callTimeout」導致 connect/read 仍卡在 shared client 的 15s
         // 或小 budget 無法收緊 connect/read。
         val safeTimeout = timeoutMs.coerceIn(1L, MAX_TIMEOUT_MS)
+        // 一律以 safeTimeout 重建 connect/read/write/call，避免呼叫方傳入
+        // callTimeout=0（OkHttp「不超時」）或超大值時沿用原 client 的無界超時。
+        // 僅在預算等於預設且原 client 四個 timeout 皆已等於預設時才複用原 client。
         val baseClient =
-            if (safeTimeout == TIMEOUT_MS) client
+            if (safeTimeout == TIMEOUT_MS &&
+                client.connectTimeoutMillis.toLong() == TIMEOUT_MS &&
+                client.readTimeoutMillis.toLong() == TIMEOUT_MS &&
+                client.writeTimeoutMillis.toLong() == TIMEOUT_MS &&
+                client.callTimeoutMillis.toLong() == TIMEOUT_MS
+            ) client
             else client.newBuilder()
                 .connectTimeout(safeTimeout, TimeUnit.MILLISECONDS)
                 .readTimeout(safeTimeout, TimeUnit.MILLISECONDS)

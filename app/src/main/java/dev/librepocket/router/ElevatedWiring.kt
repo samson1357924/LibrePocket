@@ -14,7 +14,10 @@ import dev.librepocket.tool.Flavor
 import dev.librepocket.tool.ProjectionContext
 import dev.librepocket.tool.ToolRegistry
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.coroutineContext
 
 /**
@@ -105,28 +108,52 @@ object ElevatedWiring {
         val grantConfigRevision: Long,
     )
 
+    /** Bounded best-effort timeout for sync supplier checks (F4). */
+    private const val SUPPLIER_TIMEOUT_MS: Long = 1_000L
+
+    /** Off-caller-thread bounded supplier eval; timeout/failure => null (fail-closed), CE rethrown. */
+    private suspend fun <T> evalBounded(block: () -> T): T? {
+        return try {
+            withContext(Dispatchers.IO) {
+                withTimeoutOrNull(SUPPLIER_TIMEOUT_MS) { block() }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /** Bounded projection context fetch (F4). */
+    private suspend fun fetchCtx(
+        ctxSupplier: () -> ProjectionContext,
+    ): ProjectionContext? = evalBounded(ctxSupplier)
+
+    /** Safe bounded recheck of untrusted argv against snapshot (F3). */
+    private fun argvMatchesSnapshot(current: List<String>, snapshotArgv: List<String>): Boolean {
+        val recheck = try {
+            ElevatedRequest(current, "").frozenOrNull()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            null
+        } ?: return false
+        return recheck.argv == snapshotArgv
+    }
+
     /**
-     * 接線執行（suspend 只因 [PolicyStore.evaluateFresh] 為 suspend；其餘皆同步門）。
+     * 接線執行（suspend；門禁／supplier 具取消協作與有界 best-effort，runner 於 IO dispatch）。
      *
-     * 全路徑留痕：門禁未過亦寫一筆 DENY 審計（經 [ElevatedDispatch] 或本層直記，
-     * 與 dispatch 同契約）；任何拒絕一律零 spawn（由呼叫方的 spawn 計數斷言）。
+     * F6 cheap-gate-first：argv 相關有界凍結僅在 cheap gate 通過且需建不可變快照時執行一次；
+     * 早期 deny 路徑不觸碰不可信 argv 迭代（審計以空 argv＋有界 reason 記錄）。
+     * F3：重驗參數竄改以有界重凍結比對，不直接對不可信 list 呼叫未受控 equals/iterator。
+     * F4：ctx/bridge/grant supplier 於 caller 外執行並具 best-effort 有界逾時（fail-closed）；CE 一律重拋。
+     * F7：重驗通過後以單一 frozen snapshot 委派 executeWithFrozen（避免二次凍結）。
+     * F8：快照已存在且未觸不可信 argv 的 deny，審計記錄 snapshot argv＋有界 reason 以保留關聯。
+     * F5：最終阻塞 runner 執行於 Dispatchers.IO（取消可協作觀察；真中斷依 runner 實作）。
      *
-     * 取消語義：[CancellationException] 一律重拋（不轉 `Denied`、不寫 DENY 審計）；
-     * 各 supplier／projection／`evaluateFresh` 的 `catch` 皆先重拋 CE，
-     * 僅非取消異常才 fail-closed 拒（見取消傳播測試）。
-     *
-     * @param argv 提權 argv 向量（呼叫方可能傳 `MutableList`；本函數入口即快照，
-     * 確認後重驗一致性，竄改即作廢）。
-     * @param reasonCode 跨權限邊界原因碼（空白即拒，ASK 不默許）。
-     * @param confirmed 當輪二次確認（false 即拒，ASK 不默認為 ALLOW；重驗通過後
-     * 原值透傳 [ElevatedDispatch]，不再硬編 `true`）。
-     * @param ctxSupplier 每次新鮮供給投影上下文（flavor＋開關；確認前後各求值一次）。
-     * @param grantCheck 每次新鮮求值 scope grant（產品傳
-     * `{ store.check(freshProviderId, freshRevision) }` 的 blocking 包裝，並嵌入
-     * 同一 emission 的身份為 [ElevatedGrant.Valid]；抛異常即 fail-closed 拒，
-     * [CancellationException] 重拋）。
-     * @param bridgeGranted 每次新鮮求值橋開關（產品傳 `{ state.bridgeGranted }`
-     * 經 `refresh` 同步後的值；抛異常即 fail-closed 拒，[CancellationException] 重拋）。
+     * 全路徑留痕：門禁未過亦寫一筆 DENY 審計；任何拒絕一律零 spawn。
+     * 取消語義：[CancellationException] 一律重拋（不轉 `Denied`、不寫 DENY 審計）。
      */
     suspend fun execute(
         argv: List<String>,
@@ -141,6 +168,7 @@ object ElevatedWiring {
         timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS,
     ): ShellResult {
         coroutineContext.ensureActive()
+        // --- Cheap gates first (F6): no argv iteration/snapshot before these pass ---
         val tool = ToolRegistry.find(TOOL_NAME)
             ?: run {
                 audit.record(emptyList(), "", PrivilegeAuditLog.verdictName(
@@ -148,28 +176,49 @@ object ElevatedWiring {
                 ))
                 return ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "unknown tool $TOOL_NAME")
             }
-        // 入口快照（有界凍結：argv 拷貝經快照專用有界門，阻塞／超限／竄改抛
-        // 即 fail-closed 拒；與 Dispatch 同門，不另起無界拷貝）。
-        val frozenEntry = ElevatedRequest(argv, reasonCode).frozenOrNull()
-            ?: run {
-                val denied = ShellResult.Denied(ShellDeny.BLACKLISTED, "elevated snapshot failed (fail-closed, no spawn)")
-                audit.record(
-                    emptyList(),
-                    if (PrivilegeAuditLog.isReasonCodeTooLong(reasonCode)) "" else reasonCode,
-                    PrivilegeAuditLog.verdictName(denied),
-                )
+        val reasonTooLong = PrivilegeAuditLog.isReasonCodeTooLong(reasonCode)
+        val reasonBlank = !reasonTooLong && reasonCode.isBlank()
+        if (reasonTooLong) {
+            val denied = ShellResult.Denied(
+                ShellDeny.BLACKLISTED,
+                "reasonCode too long (fail-closed, no spawn)",
+            )
+            // too-long reason -> empty reason in audit (no unbounded hash)
+            audit.record(emptyList(), "", PrivilegeAuditLog.verdictName(denied))
+            return denied
+        }
+        if (reasonBlank) {
+            val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "privilege gate blocked: reasonCode blank")
+            audit.record(emptyList(), "", PrivilegeAuditLog.verdictName(denied))
+            return denied
+        }
+        // confirmed=false: deny early without argv snapshot (F6), but classify using real bounded
+        // projection (projection-unavailable takes precedence over NeedConfirm in PrivilegeGate).
+        if (!confirmed) {
+            val ctx0 = fetchCtx(ctxSupplier) ?: run {
+                val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "projection unavailable (fail-closed, no spawn)")
+                audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
                 return denied
             }
-        val argvCopy: List<String> = frozenEntry.argv
-        val reasonCopy: String = frozenEntry.reasonCode
-        // 每次 call 重新投影（前驗）：supplier 抛即 fail-closed 拒（CE 重拋）。
-        val ctx1: ProjectionContext = try {
-            ctxSupplier()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
+            val projection0 = try {
+                tool.project(ctx0)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "projection unavailable (fail-closed, no spawn)")
+                audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
+                return denied
+            }
+            val gate = PrivilegeGate.check(tool, false, projection0, mapOf("reasonCode" to reasonCode))
+            val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "privilege gate blocked: $gate")
+            audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
+            return denied
+        }
+
+        // Precheck projection/context (F4 bounded) without argv snapshot
+        val ctx1: ProjectionContext = fetchCtx(ctxSupplier) ?: run {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "projection unavailable (fail-closed, no spawn)")
-            audit.record(emptyList(), safeReason(reasonCopy), PrivilegeAuditLog.verdictName(denied))
+            audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
         val projection1 = try {
@@ -178,13 +227,12 @@ object ElevatedWiring {
             throw e
         } catch (_: Exception) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "projection unavailable (fail-closed, no spawn)")
-            audit.record(emptyList(), safeReason(reasonCopy), PrivilegeAuditLog.verdictName(denied))
+            audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
         if (projection1.level == CapabilityLevel.UNAVAILABLE) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "privilege projection blocked: ${projection1.reason}")
-            // 全路徑留痕：以空 argv＋有界 reason 記 DENY（不哈希不可信 argv）。
-            audit.record(emptyList(), safeReason(reasonCopy), PrivilegeAuditLog.verdictName(denied))
+            audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
         // fresh policy（前驗）：僅 ALLOW 放行；ASK／DENY／異常一律拒（ASK 不變 ALLOW；CE 重拋）。
@@ -200,53 +248,55 @@ object ElevatedWiring {
                 ShellDeny.NOT_WHITELISTED,
                 "policy denied (verdict=${verdict1?.name ?: "ERROR"}, fail-closed, no spawn)",
             )
-            audit.record(emptyList(), safeReason(reasonCopy), PrivilegeAuditLog.verdictName(denied))
+            audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
-        // ASK 確認（前驗）：四參 gate；NeedConfirm／Denied 一律拒（不默認 ALLOW）。
-        // 注意：gate 用凍結後 reason（String 不可變，與入口同值；超限門由 Dispatch 再驗）。
-        val gate1 = PrivilegeGate.check(tool, confirmed, projection1, mapOf("reasonCode" to reasonCopy))
+        // ASK 確認（前驗）：四參 gate；NeedConfirm／Denied 一律拒（confirmed 已 cheap-gated，但保留完整 gate）。
+        val gate1 = PrivilegeGate.check(tool, confirmed, projection1, mapOf("reasonCode" to reasonCode))
         if (gate1 !is GateResult.Allowed) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "privilege gate blocked: $gate1")
-            audit.record(emptyList(), safeReason(reasonCopy), PrivilegeAuditLog.verdictName(denied))
+            audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
-        // bridge＋grant 前驗（每次新鮮求值；抛異常即 fail-closed 拒，CE 重拋）。
-        val bridge1 = try {
-            bridgeGranted()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
+        // bridge＋grant 前驗（每次新鮮求值；有界 best-effort；抛/逾時即 fail-closed 拒，CE 重拋）。
+        val bridge1 = evalBounded(bridgeGranted)
+        if (bridge1 == null) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "privilege bridge check failed (fail-closed, no spawn)")
-            audit.record(emptyList(), safeReason(reasonCopy), PrivilegeAuditLog.verdictName(denied))
+            audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
         if (!bridge1) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "privilege bridge off (fail-closed, no spawn)")
-            audit.record(emptyList(), safeReason(reasonCopy), PrivilegeAuditLog.verdictName(denied))
+            audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
-        val grant1 = try {
-            grantCheck()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
+        val grant1 = evalBounded(grantCheck)
+        if (grant1 == null) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "grant check failed (fail-closed, no spawn)")
-            audit.record(emptyList(), safeReason(reasonCopy), PrivilegeAuditLog.verdictName(denied))
+            audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
         if (grant1 is ElevatedGrant.Invalid) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, grant1.reason)
-            audit.record(emptyList(), safeReason(reasonCopy), PrivilegeAuditLog.verdictName(denied))
+            audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
         if (grant1 is ElevatedGrant.Valid && grant1.providerId.isBlank()) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "grant identity malformed (fail-closed, no spawn)")
-            audit.record(emptyList(), safeReason(reasonCopy), PrivilegeAuditLog.verdictName(denied))
+            audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
         val validGrant1 = grant1 as ElevatedGrant.Valid
-        // 不可變快照（確認後 spawn 前重驗的基準；argv／reason 皆取凍結份；grant 身份同快）。
+
+        // Prechecks passed: perform single bounded freeze to build immutable snapshot (F6,F7).
+        val frozenEntry = ElevatedRequest(argv, reasonCode).frozenOrNull()
+            ?: run {
+                val denied = ShellResult.Denied(ShellDeny.BLACKLISTED, "elevated snapshot failed (fail-closed, no spawn)")
+                audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
+                return denied
+            }
+        val argvCopy: List<String> = frozenEntry.argv
+        val reasonCopy: String = frozenEntry.reasonCode
         val snapshot = ElevatedSnapshot(
             toolName = tool.name,
             argv = argvCopy,
@@ -260,25 +310,28 @@ object ElevatedWiring {
         )
         coroutineContext.ensureActive()
         // 確認後 spawn 前重驗：重新投影＋fresh policy＋重求 bridge／grant＋
-        // 快照一致性（argv／reason／flavor／開關任一變更即作廢，零 spawn）。
-        val ctx2: ProjectionContext = try {
-            ctxSupplier()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
+        // 快照一致性；snapshot 已存在且不觸不可信 argv 的 deny 用 snapshot argv＋有界 reason 記錄（F8）。
+        val ctx2: ProjectionContext = fetchCtx(ctxSupplier) ?: run {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "reverify projection unavailable (fail-closed, no spawn)")
-            audit.record(emptyList(), safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
+            audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
-        // 確認後參數變更作廢：呼叫方在確認後竄改原始 `argv`（同引用）即與快照不等。
-        if (argv != snapshot.argv) {
+        // F3: bounded/safe recheck of untrusted argv (no uncontrolled equals/iterator on adversarial list)
+        val argvOk = try {
+            argvMatchesSnapshot(argv, snapshot.argv)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            false
+        }
+        if (!argvOk) {
             val denied = ShellResult.Denied(ShellDeny.BLACKLISTED, "elevated args changed after confirm (fail-closed, no spawn)")
-            audit.record(emptyList(), safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
+            audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
         if (ctx2.flavor != snapshot.flavor || ctx2.userSwitches != snapshot.userSwitches) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "elevated context changed after confirm (fail-closed, no spawn)")
-            audit.record(emptyList(), safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
+            audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
         val projection2 = try {
@@ -287,12 +340,12 @@ object ElevatedWiring {
             throw e
         } catch (_: Exception) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "reverify projection unavailable (fail-closed, no spawn)")
-            audit.record(emptyList(), safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
+            audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
         if (projection2.level == CapabilityLevel.UNAVAILABLE) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "privilege projection blocked on reverify: ${projection2.reason}")
-            audit.record(emptyList(), safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
+            audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
         val verdict2 = try {
@@ -307,40 +360,34 @@ object ElevatedWiring {
                 ShellDeny.NOT_WHITELISTED,
                 "policy denied on reverify (verdict=${verdict2?.name ?: "ERROR"}, fail-closed, no spawn)",
             )
-            audit.record(emptyList(), safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
+            audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
-        val bridge2 = try {
-            bridgeGranted()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
+        val bridge2 = evalBounded(bridgeGranted)
+        if (bridge2 == null) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "privilege bridge recheck failed (fail-closed, no spawn)")
-            audit.record(emptyList(), safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
+            audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
         if (!bridge2) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "privilege bridge off on reverify (fail-closed, no spawn)")
-            audit.record(emptyList(), safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
+            audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
-        val grant2 = try {
-            grantCheck()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
+        val grant2 = evalBounded(grantCheck)
+        if (grant2 == null) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "grant recheck failed (fail-closed, no spawn)")
-            audit.record(emptyList(), safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
+            audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
         if (grant2 is ElevatedGrant.Invalid) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, grant2.reason)
-            audit.record(emptyList(), safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
+            audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
         if (grant2 is ElevatedGrant.Valid && grant2.providerId.isBlank()) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "grant identity malformed on reverify (fail-closed, no spawn)")
-            audit.record(emptyList(), safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
+            audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
         val validGrant2 = grant2 as ElevatedGrant.Valid
@@ -351,21 +398,20 @@ object ElevatedWiring {
                 ShellDeny.NOT_WHITELISTED,
                 "elevated grant identity changed after confirm (fail-closed, no spawn)",
             )
-            audit.record(emptyList(), safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
+            audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
-        // 重驗通過：以快照（不可變）委派唯一產品入口；確認後不再觸碰原始 argv。
-        // `confirmed` 原值透傳（前驗 gate 已要求 true 才可達此處；Dispatch 再驗）。
+        // 重驗通過：以已凍結快照委派（F7 單次凍結，無二次 frozenOrNull）；runner 於 IO 執行（F5）。
         coroutineContext.ensureActive()
-        return ElevatedDispatch.execute(
-            tool = tool,
-            confirmed = confirmed,
-            projection = projection2,
-            request = ElevatedRequest(snapshot.argv, snapshot.reasonCode),
-            runner = runner,
-            audit = audit,
-            timeoutMs = timeoutMs,
-        )
+        return withContext(Dispatchers.IO) {
+            ElevatedDispatch.executeWithFrozen(
+                tool = tool,
+                frozen = ElevatedRequest(snapshot.argv, snapshot.reasonCode),
+                runner = runner,
+                audit = audit,
+                timeoutMs = timeoutMs,
+            )
+        }
     }
 
     /** 有界 reason（超限即空串標記，不哈希無界輸入；與 Dispatch 同門）。 */

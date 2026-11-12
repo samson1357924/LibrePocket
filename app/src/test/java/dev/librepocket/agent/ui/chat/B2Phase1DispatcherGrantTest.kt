@@ -42,18 +42,22 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * B2-phase1 (#19) acceptance via the REAL [ChatViewModelFactory] composition
- * (not a direct tool-function call): UI send → request tools → model ToolDone
- * → schema → latest projection + fresh `tool.exec` policy → StubBackend
- * executor → typed result → provider continuation → final UI/transcript.
+ * B2-phase1 (#19) acceptance via factory-session integration testing
+ * ([ChatViewModelFactory] composition through [ChatSessionFactory] and
+ * [ChatSessionImpl] down to Room transcript and provider continuation,
+ * not a direct tool-function call): session send → request tools → model
+ * ToolDone → schema → latest projection + fresh `tool.exec` policy →
+ * CountingBackend executor → typed result → provider continuation →
+ * persisted transcript / session events.
  *
- * Scope: single read-only tool (`lsp.symbols`, StubBackend echo). No
+ * Scope: single read-only tool (`lsp.symbols`, CountingBackend echo). No
  * FastRouter wiring (B3), no `executionReady` flips, no capability-matrix
  * change. Production default stays records-only (`toolSlice = null` unless a
  * test injects one through the factory seam).
@@ -69,7 +73,7 @@ class B2Phase1DispatcherGrantTest {
     }
 
     private class ScriptedProvider(
-        var handler: (ChatRequest) -> Flow<StreamEvent> = { emptyFlow() },
+        @Volatile var handler: (ChatRequest) -> Flow<StreamEvent> = { emptyFlow() },
     ) : LlmProvider {
         override val protocol: ProviderProto = ProviderProto.CHAT_COMPLETIONS
         override fun stream(request: ChatRequest): Flow<StreamEvent> = flow { emitAll(handler(request)) }
@@ -139,11 +143,13 @@ class B2Phase1DispatcherGrantTest {
     )
 
     private suspend fun closeQuietly(session: ChatSession) {
-        try {
-            withContext(NonCancellable) {
-                try { session.close() } finally { session.flush(8_000) }
+        withContext(NonCancellable) {
+            try {
+                session.close()
+            } finally {
+                val flushed = session.flush(5_000)
+                check(flushed) { "session flush timed out during teardown" }
             }
-        } catch (_: Exception) {
         }
     }
 
@@ -155,19 +161,19 @@ class B2Phase1DispatcherGrantTest {
         policy.setRule(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 20))
         val backend = CountingBackend()
         val requests = AtomicInteger(0)
+        val seen = CopyOnWriteArrayList<ChatRequest>()
         val f = factory(app, store, policy, provider, slice(policy, backend))
 
         provider.handler = { request ->
+            seen.add(request)
             when (requests.incrementAndGet()) {
                 1 -> {
-                    assertEquals(listOf("lsp.symbols"), request.tools.map { it.name })
                     flow {
                         emit(StreamEvent.ToolDone(0, "call-b2-1", "lsp.symbols", """{"query":"Foo"}"""))
                         emit(StreamEvent.Done("tool_calls"))
                     }
                 }
                 else -> {
-                    assertTrue("continuation must not offer another tool round", request.tools.isEmpty())
                     flow {
                         emit(StreamEvent.TextDelta(0, 0, "Foo 在 Example.kt 第一行"))
                         emit(StreamEvent.Done("stop"))
@@ -182,6 +188,9 @@ class B2Phase1DispatcherGrantTest {
             assertTrue(created.session.flushDurable(8_000))
             assertEquals(1, backend.invocations.get())
             assertEquals(2, requests.get())
+            assertEquals(2, seen.size)
+            assertEquals(listOf("lsp.symbols"), seen[0].tools.map { it.name })
+            assertTrue("continuation must not offer another tool round", seen[1].tools.isEmpty())
             val sid = created.sessionId!!
             val events = store.loadEvents(sid, 0, 2000)
             assertTrue("missing tool marker: $events", events.any { it.text.contains("[tool:lsp.symbols") })
@@ -200,7 +209,7 @@ class B2Phase1DispatcherGrantTest {
         policy.setRule(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 20))
         val backend = CountingBackend()
         val requests = AtomicInteger(0)
-        val seen = mutableListOf<ChatRequest>()
+        val seen = CopyOnWriteArrayList<ChatRequest>()
         val f = factory(app, store, policy, provider, slice(policy, backend))
 
         provider.handler = { request ->
@@ -286,7 +295,7 @@ class B2Phase1DispatcherGrantTest {
         policy.setRule(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 20))
         val backend = CountingBackend()
         val requests = AtomicInteger(0)
-        val seen = mutableListOf<ChatRequest>()
+        val seen = CopyOnWriteArrayList<ChatRequest>()
         val f = factory(app, store, policy, provider, slice(policy, backend))
 
         provider.handler = { request ->
@@ -328,7 +337,7 @@ class B2Phase1DispatcherGrantTest {
         policy.setRule(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 20))
         val backend = CountingBackend()
         val requests = AtomicInteger(0)
-        val seen = mutableListOf<ChatRequest>()
+        val seen = CopyOnWriteArrayList<ChatRequest>()
         val switchOn = AtomicBoolean(true)
         // Switch ON at offer time: request offers tool. Switch flips to OFF between offer
         // and execution: fresh projection re-check must deny with SCOPE_DENIED.
@@ -337,8 +346,6 @@ class B2Phase1DispatcherGrantTest {
         provider.handler = { request ->
             seen.add(request)
             if (requests.incrementAndGet() == 1) {
-                assertEquals("request must offer tool while switch is ON", 1, request.tools.size)
-                assertEquals("lsp.symbols", request.tools.single().name)
                 // Switch flips to OFF between offer and execution: fresh projection must deny.
                 switchOn.set(false)
                 flow {
@@ -359,6 +366,8 @@ class B2Phase1DispatcherGrantTest {
             assertTrue(created.session.flushDurable(8_000))
             assertEquals(0, backend.invocations.get())
             assertEquals(2, seen.size)
+            assertEquals("request must offer tool while switch is ON", 1, seen[0].tools.size)
+            assertEquals("lsp.symbols", seen[0].tools.single().name)
             val toolTexts = seen[1].messages.filter { it.role == "tool" }.map { it.text }
             assertEquals(1, toolTexts.size)
             assertTrue(toolTexts.single().contains(SafeToolSlice.DenyCodes.SCOPE_DENIED))
@@ -375,7 +384,7 @@ class B2Phase1DispatcherGrantTest {
         policy.setRule(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 20))
         val backend = CountingBackend()
         val requests = AtomicInteger(0)
-        val seen = mutableListOf<ChatRequest>()
+        val seen = CopyOnWriteArrayList<ChatRequest>()
         val switchOn = AtomicBoolean(false)
         // Switch is OFF at offer time: request offers nothing. Switch flips ON mid-turn, but
         // unsolicited tool call must stay records-only and never execute or continue the turn.
@@ -384,7 +393,6 @@ class B2Phase1DispatcherGrantTest {
         provider.handler = { request ->
             seen.add(request)
             requests.incrementAndGet()
-            assertTrue("switch-off request must offer no tools", request.tools.isEmpty())
             // Switch flips ON mid-turn after request was sent:
             switchOn.set(true)
             flow {
@@ -401,6 +409,7 @@ class B2Phase1DispatcherGrantTest {
             assertEquals(0, backend.invocations.get())
             // Must stay records-only: never continues the turn
             assertEquals(1, seen.size)
+            assertTrue("switch-off request must offer no tools", seen[0].tools.isEmpty())
             val events = store.loadEvents(created.sessionId!!, 0, 2000)
             assertTrue(events.any { it.text.contains("[tool:lsp.symbols") })
             assertFalse(events.any { it.text.contains("[tool-result:") })
@@ -459,7 +468,7 @@ class B2Phase1DispatcherGrantTest {
         }
         val backend = CountingBackend()
         val requests = AtomicInteger(0)
-        val seen = mutableListOf<ChatRequest>()
+        val seen = CopyOnWriteArrayList<ChatRequest>()
         val f = factory(app, store, policy, provider, slice(policy, backend))
 
         provider.handler = { request ->
@@ -533,6 +542,8 @@ class B2Phase1DispatcherGrantTest {
             val events = store.loadEvents(created.sessionId!!, 0, 2000)
             assertFalse("cancel must leave no tool result", events.any { it.text.contains("[tool-result:") })
         } finally {
+            gate.complete(Unit)
+            toolSlice.beforeExecuteForTest = null
             closeQuietly(created.session)
         }
     }
@@ -545,7 +556,7 @@ class B2Phase1DispatcherGrantTest {
         policy.setRule(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 20))
         val backend = CountingBackend()
         val requests = AtomicInteger(0)
-        val seen = mutableListOf<ChatRequest>()
+        val seen = CopyOnWriteArrayList<ChatRequest>()
         val f = factory(app, store, policy, provider, slice(policy, backend))
         val secretQuery = "contact user@example.com about Foo"
 
@@ -579,10 +590,14 @@ class B2Phase1DispatcherGrantTest {
             assertEquals(2, seen.size)
             val wireToolTexts = seen[1].messages.filter { it.role == "tool" }.map { it.text } +
                 seen[1].messages.flatMap { it.toolCalls }.map { it.argumentsJson }
+            assertTrue("wireToolTexts must not be empty", wireToolTexts.isNotEmpty())
+            assertTrue("wireToolTexts must contain redaction receipt", wireToolTexts.any { it.contains("⟦REDACTED:EMAIL⟧") })
             for (text in wireToolTexts) {
                 assertFalse("wire must not carry plaintext email: $text", text.contains("user@example.com"))
             }
             val events = store.loadEvents(created.sessionId!!, 0, 2000)
+            assertTrue("audit events must contain tool notice with redaction receipt", events.any { it.kind == "tool" && it.text.contains("⟦REDACTED:EMAIL⟧") })
+            assertTrue("audit events must contain tool result with redaction receipt", events.any { it.text.contains("[tool-result:lsp.symbols") && it.text.contains("⟦REDACTED:EMAIL⟧") })
             for (event in events) {
                 assertFalse(
                     "audit must not store plaintext email: ${event.text}",

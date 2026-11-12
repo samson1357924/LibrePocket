@@ -220,12 +220,35 @@ class ShizukuBinderEvents {
         synchronized(lock) {
             if (attached) return
             // 同一物件註冊/反註冊：暫存引用，重試復用殘留（失敗路徑已清，此處多為新建）。
+            // P3：listener 以「身分」判斷是否過期（identity check）。
+            // detach() 會在鎖內把 receivedListener/deadListener 置 null，
+            // 因此過期 listener 的回呼只需比對 `receivedListener !== this` 即可 no-op，
+            // 避免 epoch 遞增次數與 listener 建立次數不一致造成的永久失效。
             val stagedReceived: Shizuku.OnBinderReceivedListener =
-                receivedListener ?: Shizuku.OnBinderReceivedListener { emitReceived() }
-                    .also { receivedListener = it }
+                receivedListener ?: run {
+                    lateinit var listener: Shizuku.OnBinderReceivedListener
+                    listener = Shizuku.OnBinderReceivedListener {
+                        // 原子：身分檢查 + snapshot 同鎖，避免 detach 在中間清空後仍執行舊 callbacks。
+                        val snapshot = synchronized(lock) {
+                            if (receivedListener !== listener) return@synchronized null
+                            receivedCallbacks.toList()
+                        }
+                        snapshot?.forEach { runCatching { it() } }
+                    }
+                    listener.also { receivedListener = it }
+                }
             val stagedDead: Shizuku.OnBinderDeadListener =
-                deadListener ?: Shizuku.OnBinderDeadListener { emitDead() }
-                    .also { deadListener = it }
+                deadListener ?: run {
+                    lateinit var listener: Shizuku.OnBinderDeadListener
+                    listener = Shizuku.OnBinderDeadListener {
+                        val snapshot = synchronized(lock) {
+                            if (deadListener !== listener) return@synchronized null
+                            deadCallbacks.toList()
+                        }
+                        snapshot?.forEach { runCatching { it() } }
+                    }
+                    listener.also { deadListener = it }
+                }
             if (runCatching { Shizuku.addBinderReceivedListener(stagedReceived) }.isFailure) {
                 if (receivedListener === stagedReceived) receivedListener = null
                 if (deadListener === stagedDead) deadListener = null

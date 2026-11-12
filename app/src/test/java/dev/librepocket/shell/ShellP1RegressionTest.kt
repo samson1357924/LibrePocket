@@ -121,9 +121,12 @@ class ShellP1RegressionTest {
         try {
             val link = java.io.File(scope, "leak").apply { delete() }
             java.nio.file.Files.createSymbolicLink(link.toPath(), outside.toPath())
-            val v = ShellPolicy.validate(listOf("grep", "--regexp", "-e", link.absolutePath), privateRoot = scope.absolutePath)
+            // use relative "leak" so the value-consumption bypass is actually exercised
+            // (absolute path would be caught by the front-end realpath gate regardless)
+            val v = ShellPolicy.validate(listOf("grep", "--regexp", "-e", "leak"), privateRoot = scope.absolutePath)
             assertTrue("expected denied, got $v", v is Validation.Denied)
             assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+            assertTrue("expected relative-path denial, got $v", (v as Validation.Denied).message.contains("relative path denied"))
         } finally { scope.deleteRecursively(); outside.deleteRecursively() }
     }
 
@@ -146,6 +149,7 @@ class ShellP1RegressionTest {
             val v = ShellPolicy.validate(listOf("df", "-hx", scope.absolutePath), privateRoot = scope.absolutePath)
             assertTrue("expected denied, got $v", v is Validation.Denied)
             assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+            assertTrue("expected df scoped path denial, got $v", (v as Validation.Denied).message.contains("df requires scoped path"))
         } finally { scope.deleteRecursively() }
     }
 
@@ -156,6 +160,7 @@ class ShellP1RegressionTest {
             val v = ShellPolicy.validate(listOf("df", "--exclude-typ", scope.absolutePath), privateRoot = scope.absolutePath)
             assertTrue("expected denied, got $v", v is Validation.Denied)
             assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+            assertTrue("expected df scoped path denial, got $v", (v as Validation.Denied).message.contains("df requires scoped path"))
         } finally { scope.deleteRecursively() }
     }
 
@@ -166,9 +171,10 @@ class ShellP1RegressionTest {
         try {
             val link = java.io.File(scope, "leak").apply { delete() }
             java.nio.file.Files.createSymbolicLink(link.toPath(), outside.toPath())
-            val v = ShellPolicy.validateElevated(listOf("grep", "--regexp", "-e", link.absolutePath), privateRoot = scope.absolutePath)
+            val v = ShellPolicy.validateElevated(listOf("grep", "--regexp", "-e", "leak"), privateRoot = scope.absolutePath)
             assertTrue("expected denied, got $v", v is Validation.Denied)
             assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+            assertTrue("expected relative-path denial, got $v", (v as Validation.Denied).message.contains("relative path denied"))
         } finally { scope.deleteRecursively(); outside.deleteRecursively() }
     }
 
@@ -178,6 +184,7 @@ class ShellP1RegressionTest {
             val v = ShellPolicy.validateElevated(listOf("df", "-hx", scope.absolutePath), privateRoot = scope.absolutePath)
             assertTrue("expected denied, got $v", v is Validation.Denied)
             assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+            assertTrue("expected df scoped path denial, got $v", (v as Validation.Denied).message.contains("df requires scoped path"))
         } finally { scope.deleteRecursively() }
     }
 
@@ -188,9 +195,10 @@ class ShellP1RegressionTest {
         try {
             val link = java.io.File(scope, "leak").apply { delete() }
             java.nio.file.Files.createSymbolicLink(link.toPath(), outside.toPath())
-            val v = ShellPolicy.validate(listOf("toybox", "grep", "--regexp", "-e", link.absolutePath), privateRoot = scope.absolutePath)
+            val v = ShellPolicy.validate(listOf("toybox", "grep", "--regexp", "-e", "leak"), privateRoot = scope.absolutePath)
             assertTrue("expected denied, got $v", v is Validation.Denied)
             assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+            assertTrue("expected relative-path denial, got $v", (v as Validation.Denied).message.contains("relative path denied"))
         } finally { scope.deleteRecursively(); outside.deleteRecursively() }
     }
 
@@ -200,6 +208,7 @@ class ShellP1RegressionTest {
             val v = ShellPolicy.validate(listOf("toybox", "df", "-hx", scope.absolutePath), privateRoot = scope.absolutePath)
             assertTrue("expected denied, got $v", v is Validation.Denied)
             assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+            assertTrue("expected df scoped path denial, got $v", (v as Validation.Denied).message.contains("df requires scoped path"))
         } finally { scope.deleteRecursively() }
     }
 }

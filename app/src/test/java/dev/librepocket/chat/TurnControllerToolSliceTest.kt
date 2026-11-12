@@ -465,15 +465,23 @@ class TurnControllerToolSliceTest {
     }
 
     @Test fun switchOffDeniesAtExecutionWithZeroSideEffects() = runBlocking {
-        // Request-time offer is empty (pure chat) AND execution re-checks the
-        // latest scope: both layers deny, backend untouched.
+        // Tool offered at request time, then switch flips to OFF before execution:
+        // fresh projection re-check at execution denies with SCOPE_DENIED, backend untouched.
         val provider = SliceProvider()
         val sink = SliceSink()
         val backend = CountingBackend()
         val pol = slicePolicy()
-        val c = controller(provider, pol, sink, loop(pol, backend, switches = mapOf("lsp" to false)))
+        val switchOn = java.util.concurrent.atomic.AtomicBoolean(true)
+        val slice = SafeToolSlice(
+            ctxSupplier = { ProjectionContext(userSwitches = mapOf("lsp" to switchOn.get())) },
+            policy = pol,
+            backend = backend,
+            clock = fixedClock,
+        )
+        val c = controller(provider, pol, sink, slice)
         provider.handler = { request ->
             if (request.messages.none { it.role == "tool" }) {
+                switchOn.set(false)
                 flow {
                     emit(
                         StreamEvent.ToolDone(
@@ -494,11 +502,42 @@ class TurnControllerToolSliceTest {
         }
         c.send("幫我查 Foo")
 
-        assertTrue(provider.seenRequests[0].tools.isEmpty())
+        assertEquals(1, provider.seenRequests[0].tools.size)
         assertEquals(0, backend.invocations.get())
         assertEquals(2, provider.seenRequests.size)
         val paired = provider.seenRequests[1].toolResultTexts().single()
         assertTrue(paired.contains(SafeToolSlice.DenyCodes.SCOPE_DENIED))
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    }
+
+    @Test fun unsolicitedToolCallWhenSwitchOffStaysRecordsOnly() = runBlocking {
+        // Request-time offer is empty (switch OFF): unsolicited tool call must stay
+        // records-only and never execute or continue the turn.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend, switches = mapOf("lsp" to false)))
+        provider.handler = {
+            flow {
+                emit(
+                    StreamEvent.ToolDone(
+                        toolIndex = 0,
+                        id = "call-unsolicited",
+                        name = "lsp.symbols",
+                        argumentsJson = """{"query":"Foo"}""",
+                    ),
+                )
+                emit(StreamEvent.TextDelta(0, 0, "no tool offered"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        c.send("幫我查 Foo")
+
+        assertTrue(provider.seenRequests[0].tools.isEmpty())
+        assertEquals(0, backend.invocations.get())
+        // Stays records-only: no continuation request
+        assertEquals(1, provider.seenRequests.size)
         assertEquals(ChatStatus.IDLE, c.uiState.value.status)
     }
 

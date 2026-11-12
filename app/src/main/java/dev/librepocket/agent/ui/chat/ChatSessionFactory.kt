@@ -1,6 +1,7 @@
 package dev.librepocket.agent.ui.chat
 
 import android.app.Application
+import androidx.annotation.VisibleForTesting
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import dev.librepocket.agent.ui.setup.EndpointConfig
@@ -626,6 +627,14 @@ class ChatSessionFactory(
      */
     private val networkOptInStore: NetworkOptInStore? = null,
 ) : ChatSessionProvider {
+    init {
+        if (toolSlice != null) {
+            require(toolSlice.policy === policy) {
+                "toolSlice.policy must be identical to ChatSessionFactory's policy to prevent policy split-brain"
+            }
+        }
+    }
+
     // S1: no defaults on overrides (Kotlin forbids defaults on overriding
     // functions): the fail-closed default allowAsk=false lives on the
     // interface only. Concrete-type callers must pass an explicit
@@ -2641,10 +2650,21 @@ class ChatViewModelFactory(
      * round-trip (visibleTools → ChatRequest.tools → execute → continuation)
      * without flipping any registry `executionReady` or capability matrix.
      * B3 decides the default-attached production slice (real switches/backend).
+     *
+     * Invariant: when non-null, [toolSlice.policy] must match [effectivePolicy]
+     * (reference-identical `===`) to prevent policy split-brain.
      */
-    toolSlice: SafeToolSlice? = null,
+    @VisibleForTesting(otherwise = VisibleForTesting.NONE) toolSlice: SafeToolSlice? = null,
 ) : ViewModelProvider.Factory {
     private val effectivePolicy: PolicyStore = policy ?: DataStorePolicyStore(app)
+
+    init {
+        if (toolSlice != null) {
+            require(toolSlice.policy === effectivePolicy) {
+                "toolSlice.policy must be identical to ChatViewModelFactory's effectivePolicy to prevent policy split-brain"
+            }
+        }
+    }
 
     @Volatile
     private var vault: KeyVault? = null

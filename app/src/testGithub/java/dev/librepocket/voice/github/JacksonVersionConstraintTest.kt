@@ -69,6 +69,10 @@ class JacksonVersionConstraintTest {
             "Expected Jackson PackageVersion classes on github classpath, found none (roots=${scan.roots.size})",
             scan.locationsByClass.isNotEmpty(),
         )
+        assertTrue(
+            "Expected at least 3 Jackson PackageVersion classes on github classpath (core/databind/jsr310), found " + scan.locationsByClass.size + ": " + scan.locationsByClass.keys.sorted().joinToString(),
+            scan.locationsByClass.size >= 3,
+        )
 
         scan.locationsByClass.keys.sorted().forEach { className ->
             val clazz = Class.forName(className, false, Thread.currentThread().contextClassLoader ?: ClassLoader.getSystemClassLoader())
@@ -110,6 +114,9 @@ class JacksonVersionConstraintTest {
         roots.forEach { entry ->
             try {
                 when {
+                    !entry.exists() -> {
+                        unreadable += entry.path + " (missing classpath root)"
+                    }
                     entry.isDirectory -> {
                         val root = File(entry, jacksonPathPrefix)
                         if (root.exists()) {
@@ -118,7 +125,7 @@ class JacksonVersionConstraintTest {
                                 .forEach { file ->
                                     val rel = entry.toPath().relativize(file.toPath()).toString().replace(File.separatorChar, '/')
                                     val className = rel.removeSuffix(".class").replace('/', '.')
-                                    locationsByClass.getOrPut(className) { linkedSetOf() } += "${entry.path}!$rel"
+                                    locationsByClass.getOrPut(className) { linkedSetOf() } += entry.path + "!" + rel
                                 }
                         }
                     }
@@ -128,13 +135,18 @@ class JacksonVersionConstraintTest {
                                 .filter { !it.isDirectory && it.name.startsWith(jacksonPathPrefix) && it.name.endsWith("PackageVersion.class") }
                                 .forEach { jarEntry ->
                                     val className = jarEntry.name.removeSuffix(".class").replace('/', '.')
-                                    locationsByClass.getOrPut(className) { linkedSetOf() } += "${entry.path}!${jarEntry.name}"
+                                    locationsByClass.getOrPut(className) { linkedSetOf() } += entry.path + "!" + jarEntry.name
                                 }
                         }
                     }
+                    else -> {
+                        unreadable += entry.path + " (unsupported classpath root type)"
+                    }
                 }
             } catch (e: Exception) {
-                unreadable += "${entry.path} (${e.javaClass.simpleName}: ${e.message})"
+                val errorType = e.javaClass.simpleName
+                val errorMessage = e.message ?: "no message"
+                unreadable += entry.path + " (" + errorType + ": " + errorMessage + ")"
             }
         }
 

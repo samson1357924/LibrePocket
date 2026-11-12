@@ -261,8 +261,10 @@ class ShizukuBinderEvents {
         synchronized(lock) {
             stagedReceived = receivedListener
             stagedDead = deadListener
+            // 原子 snapshot + clear（P2 修正）：避免 detach 與 clear 之間的 race
+            // 窗口。
+            clearLocked()
         }
-        clear()
         if (stagedReceived != null) {
             runCatching { Shizuku.removeBinderReceivedListener(stagedReceived) }
         }
@@ -281,13 +283,15 @@ class ShizukuBinderEvents {
      * 外部誤調本函數會造成上游 listener 洩漏（同上）。
      */
     internal fun clear() {
-        synchronized(lock) {
-            receivedCallbacks.clear()
-            deadCallbacks.clear()
-            receivedListener = null
-            deadListener = null
-            attached = false
-        }
+        synchronized(lock) { clearLocked() }
+    }
+
+    private fun clearLocked() {
+        receivedCallbacks.clear()
+        deadCallbacks.clear()
+        receivedListener = null
+        deadListener = null
+        attached = false
     }
 }
 

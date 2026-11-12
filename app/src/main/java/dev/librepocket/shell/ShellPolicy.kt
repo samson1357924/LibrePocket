@@ -1222,6 +1222,7 @@ object ShellPolicy {
         isGuest: Boolean = false,
         trustedBinDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
         preRealPathHook: (() -> Unit)? = null,
+        allowedBinaries: Set<String> = ALLOWED_BINARIES,
     ): Validation {
         // P3-3 bound-first（fail-closed，零 join 物化）：与 validateInternal 同门，
         // argc 超限即拒，不做 `joinToString` 全文扫描。
@@ -1273,6 +1274,9 @@ object ShellPolicy {
             if (effElevated.applet in DENIED_BINARIES) {
                 return Validation.Denied(ShellDeny.BLACKLISTED, "applet denied: ${effElevated.applet}")
             }
+            // Elevated 通道無白名單門（提權 binary 由 resolver 固定），但 multicall
+            // effective applet 仍以 ALLOWED_BINARIES 為 fail-closed 閘；S4 擴充 binary
+            // 若需放行，另開 B3 allowlist 工作，不在本 PR 範圍。
             if (effElevated.applet !in ALLOWED_BINARIES) {
                 return Validation.Denied(
                     ShellDeny.NOT_WHITELISTED,
@@ -1306,7 +1310,7 @@ object ShellPolicy {
                 flavor = flavor,
                 bridgeGranted = bridgeGranted,
                 isElevated = true,
-                allowedBinaries = ALLOWED_BINARIES,
+                allowedBinaries = allowedBinaries,
                 isGuest = isGuest,
                 preRealPathHook = preRealPathHook,
             )
@@ -1356,7 +1360,7 @@ object ShellPolicy {
             flavor = flavor,
             bridgeGranted = bridgeGranted,
             isElevated = true,
-            allowedBinaries = ALLOWED_BINARIES,
+            allowedBinaries = allowedBinaries,
             isGuest = isGuest,
             preRealPathHook = preRealPathHook,
         )
@@ -1376,7 +1380,8 @@ object ShellPolicy {
         bridgeGranted: Boolean = false,
         isGuest: Boolean = false,
         trustedBinDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
-    ): Validation = validateElevatedInternal(argv, privateRoot, safRoots, flavor, bridgeGranted, isGuest, trustedBinDirs, null)
+        allowedBinaries: Set<String> = ALLOWED_BINARIES,
+    ): Validation = validateElevatedInternal(argv, privateRoot, safRoots, flavor, bridgeGranted, isGuest, trustedBinDirs, null, allowedBinaries)
 
     /**
      * 宿主外掛點前綴（guest 容器內路徑豁免的例外，縱深保留拒絕）：
@@ -1594,7 +1599,13 @@ object ShellPolicy {
         }
         if (arg.startsWith("-") && arg != "-") {
             val core = arg.substring(1).substringBefore('=')
-            if ('a' in core) return true
+            // GNU getopt：叢集左到右解析，第一個取值旗標（t/x/B）會吞掉其後全部
+            // 作為值，故 `a` 只有在所有取值旗標之前出現才算 all-flag
+            // （如 `-ta` 中的 `a` 是 -t 的值，不是 --all）。
+            val valueChars = setOf('t', 'x', 'B')
+            val firstValueIdx = core.indexOfFirst { it in valueChars }
+            val allFlagRange = if (firstValueIdx < 0) core else core.substring(0, firstValueIdx)
+            if ('a' in allFlagRange) return true
         }
         return false
     }
@@ -1633,11 +1644,18 @@ object ShellPolicy {
             if (arg.startsWith("-") && arg != "-") {
                 val core = arg.substring(1).substringBefore("=")
                 val attached = arg.contains("=")
-                // short cluster: skip next only if the LAST flag char is t/x/B and
-                // there is no attached value.
+                // GNU getopt: a cluster is parsed left-to-right; the first flag that
+                // takes a required argument consumes the REST of the cluster as its
+                // value. So we only need to skip the NEXT token when the first
+                // value-taking flag (t/x/B) is also the LAST char of the cluster
+                // (i.e. no attached value and no later flag). Combined forms such as
+                // -tx mean -t x (attached) and do not consume a following token.
                 if (!attached && core.isNotEmpty()) {
-                    val last = core.last()
-                    if (last == 't' || last == 'x' || last == 'B') skipNext = true
+                    val valueChars = setOf('t', 'x', 'B')
+                    val firstValueIdx = core.indexOfFirst { it in valueChars }
+                    if (firstValueIdx >= 0 && firstValueIdx == core.length - 1) {
+                        skipNext = true
+                    }
                 }
                 continue
             }
@@ -1762,7 +1780,9 @@ object ShellPolicy {
         // scoped-allow 翻轉。
         if (base == "df") {
             var dfEnd = false
+            var dfSkipNext = false
             for (arg in args) {
+                if (dfSkipNext) { dfSkipNext = false; continue }
                 if (!dfEnd && arg == "--") {
                     dfEnd = true
                     continue
@@ -1773,6 +1793,26 @@ object ShellPolicy {
                         ShellDeny.BLACKLISTED,
                         "df all denied (fail-closed, global mounts): $arg",
                     )
+                }
+                // skip the value of t/x/B mandatory flags (GNU getopt consumption)
+                // so a consumed `a` is not mistaken for --all.
+                if (arg.startsWith("--")) {
+                    val key = arg.substringBefore("=")
+                    if (!arg.contains("=") && (key == "--type" || key == "--exclude-type" ||
+                            key == "--block-size" || (key.length >= 4 &&
+                            ("--type".startsWith(key) || "--exclude-type".startsWith(key) ||
+                                "--block-size".startsWith(key))))) {
+                        dfSkipNext = true
+                    }
+                } else if (arg.startsWith("-") && arg != "-") {
+                    val core = arg.substring(1).substringBefore("=")
+                    if (!arg.contains("=") && core.isNotEmpty()) {
+                        val valueChars = setOf('t', 'x', 'B')
+                        val firstValueIdx = core.indexOfFirst { it in valueChars }
+                        if (firstValueIdx >= 0 && firstValueIdx == core.length - 1) {
+                            dfSkipNext = true
+                        }
+                    }
                 }
             }
             val hasScopedPath = dfHasScopedPath(args)

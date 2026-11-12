@@ -40,6 +40,16 @@ import dev.librepocket.shell.PrivilegeBridgeState
 import dev.librepocket.voice.VoiceSwitchStore
 import dev.librepocket.voice.VoiceSwitchSnapshot
 import dev.librepocket.voice.VoiceTools
+import dev.librepocket.agent.ui.settings.WebSearchSettingsState
+import dev.librepocket.web.DdgsSearchProvider
+import dev.librepocket.web.SearxngSearchProvider
+import dev.librepocket.web.WebHttpGet
+import dev.librepocket.web.WebHttpResponse
+import dev.librepocket.web.WebProbe
+import dev.librepocket.web.WebSearchSettings
+import dev.librepocket.web.WebSearchSnapshot
+import dev.librepocket.web.WebSwitchStore
+import dev.librepocket.web.WebUnavailableReason
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -133,6 +143,27 @@ fun MainScreen(
         voiceStore.observeTtsAcknowledged().stateIn(scope, SharingStarted.WhileSubscribed(5000), false)
     }
     val ttsAcknowledged by ackFlow.collectAsStateWithLifecycle()
+
+    // D3 網路搜尋開關真相源（WebSwitchStore，DataStore 持久化）：
+    // master 預設關、DDGS opt-in 預設關、consent 只問一次、SearXNG URL 預設空。
+    // UI 門禁 fail-closed：`!loaded || loadFailed` 時開關禁用，不在未知真相源上寫入；
+    // `executionReady=false` 不可執行（SCAFFOLD，見 ToolRegistry），本接線僅供
+    // 設定頁顯示＋probe，不接 production 搜尋執行。
+    val webStore = remember(app) { WebSwitchStore(app) }
+    val webFlow = remember(webStore, scope) {
+        webStore.observeState().stateIn(scope, SharingStarted.WhileSubscribed(5000), WebSearchSnapshot.LOADING)
+    }
+    val webSnapshot by webFlow.collectAsStateWithLifecycle()
+    var webProbeMessage by rememberSaveable { mutableStateOf<String?>(null) }
+    var showWebConsent by rememberSaveable { mutableStateOf(false) }
+    // D3 production transport 尚未落地：probe 僅做設定檢查（不打網路），
+    // 故以永不觸發網路的 no-op HttpGet 建 provider（search 永不執行，
+    // `executionReady=false`；若誤調即拋，fail-closed）。
+    val webNoopHttp = remember {
+        WebHttpGet { _, _ ->
+            throw UnsupportedOperationException("D3 no production transport")
+        }
+    }
 
     // S3 提權橋產品態（BACKLOG D09）：審計表 + privilege_bridge 開關 +
     // 橋接授權三位一體；一鍵收回原子清表、關開關、撤授權（見 PrivilegeBridgeState）。
@@ -415,6 +446,99 @@ fun MainScreen(
                 onRequestAssistantRole = assistantRole.request,
                 onRecheckAssistantRole = assistantRole.recheck,
                 onOpenVoiceInputSettings = assistantRole.openFallback,
+                // D3 網路搜尋（Settings→Tools→Web）：master 預設關、DDGS opt-in 預設關、
+                // SearXNG URL 預設空（→缺 URL）；provider 狀態由 probe 形狀同步推導
+                //（與 Searxng／Ddgs provider.probe 同邏輯，不打網路）；probe 按鈕
+                // 另以 no-op transport 調真實 probe（僅設定檢查）；首次開啟走 consent。
+                web = WebSearchSettingsState(
+                    masterEnabled = webSnapshot.masterEnabled,
+                    ddgsOptIn = webSnapshot.ddgsOptIn,
+                    searxngUrl = webSnapshot.searxngBaseUrl,
+                    searxngProbe = if (webSnapshot.searxngBaseUrl.isBlank()) {
+                        WebProbe.NotReady(WebUnavailableReason.MISSING_URL)
+                    } else {
+                        WebProbe.Ready
+                    },
+                    ddgsProbe = WebProbe.Ready,
+                    probeMessage = webProbeMessage,
+                    showConsent = showWebConsent,
+                    switchesEnabled = webSnapshot.loaded && !webSnapshot.loadFailed,
+                ),
+                onWebMasterSwitch = { enabled ->
+                    if (enabled && !webSnapshot.consentAck) {
+                        showWebConsent = true
+                    } else {
+                        scope.launch {
+                            try {
+                                webStore.setMasterEnabled(enabled)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                Log.w(TAG, "web master switch persist failed", e)
+                            }
+                        }
+                    }
+                },
+                onWebDdgsSwitch = { enabled ->
+                    scope.launch {
+                        try {
+                            webStore.setDdgsOptIn(enabled)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "web ddgs switch persist failed", e)
+                        }
+                    }
+                },
+                onWebSearxngUrlChange = { url ->
+                    scope.launch {
+                        try {
+                            webStore.setSearxngBaseUrl(url)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "web searxng url persist failed", e)
+                        }
+                    }
+                },
+                onWebProbe = {
+                    scope.launch {
+                        val searxng = SearxngSearchProvider(webSnapshot.searxngBaseUrl, webNoopHttp)
+                        val ddgs = DdgsSearchProvider(webNoopHttp)
+                        val s = try {
+                            searxng.probe()
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            WebProbe.NotReady(WebUnavailableReason.MISSING_URL)
+                        }
+                        val d = try {
+                            ddgs.probe()
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            WebProbe.NotReady(WebUnavailableReason.MISSING_URL)
+                        }
+                        val ss = WebSearchSettings.statusText(WebSearchSettings.statusFor(s))
+                        val ds = WebSearchSettings.statusText(WebSearchSettings.statusFor(d))
+                        webProbeMessage = "SearXNG：$ss；DDGS：$ds"
+                    }
+                },
+                onWebConsentConfirm = {
+                    scope.launch {
+                        try {
+                            webStore.acknowledgeConsent()
+                            webStore.setMasterEnabled(true)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "web consent persist failed", e)
+                        } finally {
+                            showWebConsent = false
+                        }
+                    }
+                },
+                onWebConsentDismiss = { showWebConsent = false },
             )
         },
         setupContent = { padding, isFirstRun ->

@@ -265,6 +265,41 @@ class ElevatedWiringTest {
         assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
     }
 
+    @Test fun adversarialEqualsMutationDetectedBySafeRecheck() = runBlocking {
+        // F3: untrusted argv must not be compared via uncontrolled equals/iterator; bounded re-freeze detects mutation.
+        class EvilArgv(private val backing: MutableList<String>) : AbstractList<String>() {
+            override val size: Int get() = backing.size
+            override fun get(index: Int): String = backing[index]
+            override fun iterator(): MutableIterator<String> = backing.iterator()
+            override fun equals(other: Any?): Boolean = true // adversarial
+        }
+        val backing = mutableListOf("id")
+        val argv = EvilArgv(backing)
+        var calls = 0
+        val ctxSupplier: () -> ProjectionContext = {
+            calls++
+            if (calls == 2) backing.add("evil")
+            elevatedCtx()
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = argv,
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = ctxSupplier,
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("changed after confirm"))
+        assertEquals(0, runner.calls)
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+    }
+
     @Test fun contextFlipOnReverifyVoids() = runBlocking {
         // 確認後開關翻轉（前驗 true、重驗 false）：重驗即拒，零 spawn。
         var reverify = false

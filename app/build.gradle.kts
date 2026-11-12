@@ -221,3 +221,83 @@ dependencies {
     "githubImplementation"(libs.shizuku.api)
     "githubImplementation"(libs.shizuku.provider)
 }
+
+// Issue #132: verification guard for Jackson flavor scoping/resolution.
+// Ensures github configurations resolve only the forced Jackson version and
+// foss/play configurations resolve no com.fasterxml.jackson artifacts.
+tasks.register("verifyJacksonFlavorIsolation") {
+    group = "verification"
+    description = "Verifies Jackson is forced to ${jacksonGithubForcedVersion} on github configs and absent from foss/play configs"
+    // Resolves live project configurations; not intended for configuration cache.
+    notCompatibleWithConfigurationCache("Resolves project configurations at execution time for dependency verification")
+
+    doLast {
+        val forcedVersion = jacksonGithubForcedVersion
+        val jacksonGroupPrefix = jacksonGithubForcedGroupPrefix
+        val problems = mutableListOf<String>()
+        val inspected = mutableListOf<String>()
+        val githubConfigsWithJackson = mutableListOf<String>()
+
+        configurations
+            .filter { it.isCanBeResolved }
+            .sortedBy { it.name }
+            .forEach { cfg ->
+                val name = cfg.name
+                val isGithub = name.contains("github", ignoreCase = true)
+                val isFossOrPlay = name.contains("foss", ignoreCase = true) || name.contains("play", ignoreCase = true)
+                if (!isGithub && !isFossOrPlay) return@forEach
+
+                val jacksonComponents = try {
+                    cfg.incoming.resolutionResult.allComponents
+                        .mapNotNull { component ->
+                            val id = component.moduleVersion ?: return@mapNotNull null
+                            if (id.group.startsWith(jacksonGroupPrefix)) {
+                                "${id.group}:${id.name}:${id.version}"
+                            } else {
+                                null
+                            }
+                        }
+                        .toSortedSet()
+                } catch (e: Exception) {
+                    problems += "Configuration '$name' could not be resolved for Jackson verification: ${e.javaClass.simpleName}: ${e.message}"
+                    return@forEach
+                }
+
+                inspected += name
+
+                if (isFossOrPlay) {
+                    if (jacksonComponents.isNotEmpty()) {
+                        problems += "Configuration '$name' (foss/play) must not resolve Jackson artifacts but resolved: ${jacksonComponents.joinToString()}"
+                    }
+                } else {
+                    if (jacksonComponents.isNotEmpty()) {
+                        githubConfigsWithJackson += name
+                        val bad = jacksonComponents.filterNot { it.endsWith(":$forcedVersion") }
+                        if (bad.isNotEmpty()) {
+                            problems += "Configuration '$name' (github) resolved non-forced Jackson artifacts: ${bad.joinToString()} (expected all :$forcedVersion)"
+                        }
+                    }
+                }
+            }
+
+        if (inspected.none { it.contains("github", ignoreCase = true) }) {
+            problems += "No resolvable github configurations were inspected; cannot verify Jackson forcing"
+        }
+        if (inspected.none { it.contains("foss", ignoreCase = true) || it.contains("play", ignoreCase = true) }) {
+            problems += "No resolvable foss/play configurations were inspected; cannot verify Jackson absence"
+        }
+        if (githubConfigsWithJackson.isEmpty()) {
+            problems += "No inspected github configuration resolved any com.fasterxml.jackson.* artifacts; expected Azure Speech github graph to include Jackson"
+        }
+
+        if (problems.isNotEmpty()) {
+            throw GradleException(
+                "Jackson flavor isolation verification failed (inspected=${inspected.size}):\n - " + problems.joinToString("\n - ")
+            )
+        }
+
+        logger.lifecycle(
+            "verifyJacksonFlavorIsolation: OK (forced=$forcedVersion, inspected=${inspected.size}, githubWithJackson=${githubConfigsWithJackson.size})"
+        )
+    }
+}

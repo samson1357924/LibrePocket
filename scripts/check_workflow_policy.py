@@ -16,9 +16,9 @@ Checks:
     ref (tags, branches, short SHAs and docker refs are rejected); referenced
     composite actions are parsed recursively with the same rules and the
     non-release publisher checks;
-  * only the reviewed workflow filename allowlist may exist (all six are
-    required, and codeql/security-audit/pocketguard keep their exact job sets
-    and pinned scanner actions), and no top-level ``defaults``/``env`` or any
+  * only the reviewed workflow filename allowlist may exist (all seven are
+    required, and codeql/security-audit/osv-scan/pocketguard keep their exact
+    job sets and pinned scanner/monitor actions), and no top-level ``defaults``/``env`` or any
     ``defaults`` block is allowed;
   * every ``permissions`` mapping rejects ``write-all`` and ``contents: write``;
   * non-release workflows/actions may not become publishers (``push.tags``,
@@ -33,12 +33,15 @@ Checks:
   * ``nightly-instrumented.yml`` pins its trigger map, schedule, concurrency,
     exact job/matrix shapes, job-level failure semantics, stress env/command
     and instrumented command;
+  * ``osv-scan.yml`` pins its weekly schedule trigger, the exact monitor-only
+    job shape (``contents: read`` only, no issue filing, no upgrades), the
+    exact scan command and the always-uploaded report artifact;
   * ``pr-check.yml`` pins its trigger, the ``changes`` outputs/filter/dorny
     step shape, the unconditional ``workflow-guard`` job, the exact
     ``pr-gate`` env and hash-pinned gate script, and the core run commands and
     job-level if/env of the required PR jobs.
 
-The six reviewed workflow files are also pinned to the SHA-256 of their raw
+The seven reviewed workflow files are also pinned to the SHA-256 of their raw
 checked-in bytes. This is a review regression guard for extra-step/no-op edits
 that the semantic checks do not model, not a tamper-proof seal: a PR that edits
 this checker and a workflow together can update the pin. Updating
@@ -77,6 +80,7 @@ ALLOWED_WORKFLOW_FILES = frozenset(
     {
         "codeql.yml",
         "nightly-instrumented.yml",
+        "osv-scan.yml",
         "pocketguard.yml",
         "pr-check.yml",
         "release.yml",
@@ -92,11 +96,14 @@ EXPECTED_WORKFLOW_SHA256 = {
     "nightly-instrumented.yml": (
         "7f6fef3510422f07b7c04010c4de32b4e3705b45eb4003571f93cbec4d9301b1"
     ),
+    "osv-scan.yml": (
+        "3f7102cb9d26b8d4cc1c9a2b6da2bbf4c4b6753148f2968137e67eeff0bacdc1"
+    ),
     "pocketguard.yml": (
         "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564"
     ),
     "pr-check.yml": (
-        "ac3219626c0a419bc7bf72373c7b5496fb8a1b34456830c6654c5561825e2455"
+        "b3a34f2e6af595e5d9b9dcfefa2a6f8b4792b488a9263ae35c66298935683bc2"
     ),
     "release.yml": (
         "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f"
@@ -111,6 +118,9 @@ REMOTE_USES_RE = re.compile(
     r"@[0-9a-f]{40}$"
 )
 GH_RELEASE_RE = re.compile(r"(?i)\bgh\s+[\"']?release[\"']?\b")
+GH_ISSUE_RE = re.compile(
+    r"(?i)\bgh\s+(?:[\"']?issues?[\"']?|[\"']?api[\"']?\b(?:[^\n]|\\\n)*\bissues?\b)"
+)
 GH_API_RE = re.compile(r"(?i)\bgh\s+api\b")
 GH_API_HOST_RE = re.compile(r"(?i)\bapi\.github\.com\b")
 RELEASES_PATH_RE = re.compile(r"(?i)(?:^|[/\s\"'`])releases(?:/assets)?(?:[/\s\"'`]|$)")
@@ -207,6 +217,11 @@ EXPECTED_CODE_FILTER_PATHS = frozenset(
         "settings.gradle.kts",
         "build.gradle.kts",
         "gradle.properties",
+        "**/gradle.properties",
+        "*.gradle",
+        "**/*.gradle",
+        "*.gradle.kts",
+        "**/*.gradle.kts",
         ".github/workflows/pr-check.yml",
     }
 )
@@ -215,8 +230,16 @@ EXPECTED_POLICY_FILTER_PATHS = frozenset(
         "gradle/wrapper/**",
         "gradle/**",
         "gradle.properties",
+        "**/gradle.properties",
         "gradlew",
         "gradlew.bat",
+        "app/build.gradle.kts",
+        "build.gradle.kts",
+        "settings.gradle.kts",
+        "*.gradle",
+        "**/*.gradle",
+        "*.gradle.kts",
+        "**/*.gradle.kts",
         "scripts/play_policy_check.sh",
         "scripts/apk_policy_inspect.py",
         "scripts/backup_rules_check.py",
@@ -309,6 +332,7 @@ LINT_RUN = "./gradlew :app:lintPlayDebug :app:lintFossDebug :app:lintGithubDebug
 POLICY_BUDGETS_RUN = (
     "PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_test_budgets.py"
 )
+VERIFY_METADATA_RUN = "python3 -P scripts/verify_verification_metadata.py"
 ASSEMBLE_RUN = (
     "./gradlew :app:assemblePlayDebug :app:assembleFossDebug "
     ":app:assembleGithubDebug :app:assemblePlayRelease "
@@ -404,6 +428,7 @@ EXPECTED_PR_JOB_CORE_STEPS = {
     "lint": ((LINT_RUN, None),),
     "policy-harness": (
         (EXPECTED_POLICY_HARNESS_RUN, None),
+        (VERIFY_METADATA_RUN, None),
         (POLICY_BUDGETS_RUN, None),
     ),
     "build-and-policy-gate": (
@@ -474,6 +499,26 @@ EXPECTED_GITLEAKS_STEP_ENV = {
     "GITLEAKS_CONFIG": ".gitleaks.toml",
 }
 EXPECTED_DEPENDENCY_REVIEW_IF = "github.event_name == 'pull_request'"
+EXPECTED_OSV_ON = {
+    "schedule": [{"cron": "0 6 * * 1"}],
+    "workflow_dispatch": None,
+}
+EXPECTED_OSV_GROUP = (
+    "${{ github.workflow }}-${{ github.ref }}"
+)
+EXPECTED_OSV_CANCEL = "${{ github.ref != 'refs/heads/main' }}"
+EXPECTED_OSV_SCAN_RUN = (
+    "python3 -P scripts/osv_scan.py --format json --output osv-report.json"
+)
+UPLOAD_ARTIFACT_USES = (
+    "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
+)
+EXPECTED_OSV_UPLOAD_WITH = {
+    "name": "osv-scan-report",
+    "path": "osv-report.json",
+    "retention-days": 14,
+    "if-no-files-found": "warn",
+}
 EXPECTED_CODEQL_JOBS = frozenset({"codeql"})
 EXPECTED_CODEQL_PATHS_IGNORE = (
     "docs/**",
@@ -2569,6 +2614,235 @@ def check_security_audit(path: str, data: dict[Any, Any]) -> list[Finding]:
     return findings
 
 
+def check_osv_scan(path: str, data: dict[Any, Any]) -> list[Finding]:
+    findings: list[Finding] = []
+    if data.get("on") != EXPECTED_OSV_ON:
+        findings.append(
+            Finding(
+                path,
+                1,
+                "osv-scan.yml 'on' must be exactly the Monday 06:00 schedule "
+                "and workflow_dispatch (a monitor, never a PR/push gate)",
+            )
+        )
+    # Monitor-only abuse runs before the shape gates below so an added
+    # issue-filing step is named even when the step count is also wrong.
+    for scalar in walk_strings(data):
+        if GH_ISSUE_RE.search(scalar):
+            findings.append(
+                Finding(
+                    path,
+                    1,
+                    "osv-scan must not file issues (monitor-only: scan plus "
+                    "artifact, no automatic issue creation)",
+                )
+            )
+            break
+    concurrency = data.get("concurrency")
+    if not isinstance(concurrency, dict):
+        findings.append(Finding(path, 1, "osv-scan concurrency is missing"))
+    else:
+        findings.extend(
+            exact_keys(
+                path,
+                "osv-scan concurrency",
+                concurrency,
+                frozenset({"group", "cancel-in-progress"}),
+            )
+        )
+        if concurrency.get("group") != EXPECTED_OSV_GROUP:
+            findings.append(
+                Finding(
+                    path,
+                    1,
+                    f"osv-scan concurrency.group must be exactly "
+                    f"{EXPECTED_OSV_GROUP!r}",
+                )
+            )
+        if concurrency.get("cancel-in-progress") != EXPECTED_OSV_CANCEL:
+            findings.append(
+                Finding(
+                    path,
+                    1,
+                    "osv-scan concurrency.cancel-in-progress must be exactly "
+                    f"{EXPECTED_OSV_CANCEL!r}",
+                )
+            )
+    jobs = data.get("jobs")
+    if not isinstance(jobs, dict):
+        return findings + [Finding(path, 1, "osv-scan.yml must define jobs")]
+    job_names = {str(name) for name in jobs}
+    if job_names != {"osv-scan"}:
+        findings.append(
+            Finding(
+                path,
+                1,
+                "osv-scan jobs must be exactly ['osv-scan'] "
+                f"(found {sorted(job_names)})",
+            )
+        )
+    job = jobs.get("osv-scan")
+    if not isinstance(job, dict):
+        return findings + [
+            Finding(path, 1, "osv-scan.yml is missing the osv-scan job")
+        ]
+    findings.extend(
+        exact_keys(
+            path,
+            "osv-scan job",
+            job,
+            frozenset(
+                {"name", "runs-on", "timeout-minutes", "permissions", "steps"}
+            ),
+        )
+    )
+    if job.get("name") != "OSV Monitor Scan":
+        findings.append(
+            Finding(path, 1, "osv-scan.name must be 'OSV Monitor Scan'")
+        )
+    if job.get("runs-on") != "ubuntu-latest":
+        findings.append(
+            Finding(path, 1, "osv-scan.runs-on must be ubuntu-latest")
+        )
+    if job.get("timeout-minutes") != 15:
+        findings.append(
+            Finding(path, 1, "osv-scan.timeout-minutes must be 15")
+        )
+    if job.get("permissions") != {"contents": "read"}:
+        findings.append(
+            Finding(
+                path,
+                1,
+                "osv-scan.permissions must be exactly contents: read "
+                "(monitor-only: no write scope)",
+            )
+        )
+    for forbidden in ("if", "continue-on-error", "defaults"):
+        if forbidden in job:
+            findings.append(
+                Finding(
+                    path,
+                    1,
+                    f"osv-scan must not contain job-level {forbidden}",
+                )
+            )
+    steps = job.get("steps")
+    if not isinstance(steps, list) or len(steps) != 4:
+        return findings + [
+            Finding(
+                path,
+                1,
+                "osv-scan must have exactly four steps (pinned checkout, "
+                "Python shadow preflight, scan and report upload)",
+            )
+        ]
+    checkout, preflight, scan, upload = steps
+    if not isinstance(checkout, dict):
+        findings.append(Finding(path, 1, "osv-scan checkout step must be a mapping"))
+    else:
+        findings.extend(
+            exact_keys(
+                path, "osv-scan checkout step", checkout, frozenset({"name", "uses"})
+            )
+        )
+        if checkout.get("uses") != EXPECTED_CHECKOUT:
+            findings.append(
+                Finding(
+                    path,
+                    1,
+                    "osv-scan checkout must use the pinned "
+                    f"{EXPECTED_CHECKOUT}",
+                )
+            )
+        for forbidden in ("if", "continue-on-error", "shell", "working-directory", "env"):
+            if forbidden in checkout:
+                findings.append(
+                    Finding(
+                        path,
+                        1,
+                        f"osv-scan checkout step must not contain {forbidden}",
+                    )
+                )
+    if not isinstance(preflight, dict):
+        findings.append(
+            Finding(path, 1, "osv-scan shadow preflight step must be a mapping")
+        )
+    else:
+        findings.extend(_check_shadow_preflight(path, "osv-scan", [preflight]))
+    if not isinstance(scan, dict):
+        findings.append(Finding(path, 1, "osv-scan scan step must be a mapping"))
+    else:
+        findings.extend(
+            exact_keys(path, "osv-scan scan step", scan, frozenset({"name", "run"}))
+        )
+        if scan.get("run") != EXPECTED_OSV_SCAN_RUN:
+            findings.append(
+                Finding(
+                    path,
+                    1,
+                    "osv-scan scan command must be exactly "
+                    f"{EXPECTED_OSV_SCAN_RUN!r}",
+                )
+            )
+        for forbidden in ("if", "continue-on-error", "shell", "working-directory", "env"):
+            if forbidden in scan:
+                findings.append(
+                    Finding(
+                        path,
+                        1,
+                        f"osv-scan scan step must not contain {forbidden}",
+                    )
+                )
+    if not isinstance(upload, dict):
+        findings.append(Finding(path, 1, "osv-scan upload step must be a mapping"))
+    else:
+        findings.extend(
+            exact_keys(
+                path,
+                "osv-scan upload step",
+                upload,
+                frozenset({"name", "if", "uses", "with"}),
+            )
+        )
+        if upload.get("if") != "always()":
+            findings.append(
+                Finding(
+                    path,
+                    1,
+                    "osv-scan upload step if must be exactly 'always()' "
+                    "(report evidence even on a red scan)",
+                )
+            )
+        if upload.get("uses") != UPLOAD_ARTIFACT_USES:
+            findings.append(
+                Finding(
+                    path,
+                    1,
+                    "osv-scan upload must use the pinned "
+                    f"{UPLOAD_ARTIFACT_USES}",
+                )
+            )
+        if upload.get("with") != EXPECTED_OSV_UPLOAD_WITH:
+            findings.append(
+                Finding(
+                    path,
+                    1,
+                    "osv-scan upload with must be exactly "
+                    f"{EXPECTED_OSV_UPLOAD_WITH!r}",
+                )
+            )
+        for forbidden in ("continue-on-error", "shell", "working-directory", "env"):
+            if forbidden in upload:
+                findings.append(
+                    Finding(
+                        path,
+                        1,
+                        f"osv-scan upload step must not contain {forbidden}",
+                    )
+                )
+    return findings
+
+
 def check_codeql(path: str, data: dict[Any, Any]) -> list[Finding]:
     findings: list[Finding] = []
     on_value = data.get("on")
@@ -2833,6 +3107,8 @@ def check_workflow(
         findings.extend(check_pr_check(relative, data))
     if workflow.name == "security-audit.yml":
         findings.extend(check_security_audit(relative, data))
+    if workflow.name == "osv-scan.yml":
+        findings.extend(check_osv_scan(relative, data))
     if workflow.name == "codeql.yml":
         findings.extend(check_codeql(relative, data))
     if workflow.name == "pocketguard.yml":

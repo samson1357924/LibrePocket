@@ -11,7 +11,6 @@ Run with: python3 -m unittest scripts/tests/test_workflow_policy.py
 
 from __future__ import annotations
 
-import fnmatch
 import io
 import re
 import shutil
@@ -36,6 +35,9 @@ CODEQL = (WORKFLOWS_DIR / "codeql.yml").read_text(encoding="utf-8")
 SECURITY_AUDIT = (
     WORKFLOWS_DIR / "security-audit.yml"
 ).read_text(encoding="utf-8")
+OSV_SCAN = (
+    WORKFLOWS_DIR / "osv-scan.yml"
+).read_text(encoding="utf-8")
 POCKETGUARD = (
     WORKFLOWS_DIR / "pocketguard.yml"
 ).read_text(encoding="utf-8")
@@ -45,6 +47,7 @@ WORKFLOW_TEXTS = {
     "release.yml": RELEASE,
     "codeql.yml": CODEQL,
     "security-audit.yml": SECURITY_AUDIT,
+    "osv-scan.yml": OSV_SCAN,
     "pocketguard.yml": POCKETGUARD,
 }
 CHECKOUT_STEP = (
@@ -69,6 +72,31 @@ def remove_job(text: str, name: str) -> str:
             end = index
             break
     return "".join(lines[:start] + lines[end:])
+
+
+def _path_match(path: str, pattern: str) -> bool:
+    """Path-aware glob matching where * does not cross / and **/ matches any depth."""
+    parts: list[str] = ["^"]
+    index = 0
+    length = len(pattern)
+    while index < length:
+        if pattern[index : index + 3] == "**/":
+            parts.append("(?:[^/]+/)*")
+            index += 3
+        elif pattern[index : index + 2] == "**":
+            parts.append(".*")
+            index += 2
+        elif pattern[index] == "*":
+            parts.append("[^/]*")
+            index += 1
+        elif pattern[index] == "?":
+            parts.append("[^/]")
+            index += 1
+        else:
+            parts.append(re.escape(pattern[index]))
+            index += 1
+    parts.append(r"\Z")
+    return re.match("".join(parts), path) is not None
 
 
 class WorkflowPolicyHarness(unittest.TestCase):
@@ -1780,66 +1808,116 @@ jobs:
         )
         self._assert_rejected("policy filter is missing: .github/workflows/**")
 
+    def _remove_filter_pattern(self, filter_name: str, pattern: str) -> str:
+        markers = {
+            "code": ("            code:\n", "            policy:\n"),
+            "policy": ("            policy:\n", "            bot:\n"),
+        }
+        start_marker, end_marker = markers[filter_name]
+        start = PR_CHECK.index(start_marker)
+        end = PR_CHECK.index(end_marker)
+        block = PR_CHECK[start:end]
+        mutated = block.replace(f"              - '{pattern}'\n", "", 1)
+        self.assertNotEqual(block, mutated)
+        return PR_CHECK[:start] + mutated + PR_CHECK[end:]
+
     def test_policy_filter_requires_gradle_path(self) -> None:
-        # Two-line context: 'gradle/**' also appears in the code filter
-        # (followed by 'gradlew'), so anchor on the policy-only
-        # 'gradle.properties' successor (the comment block above it is
-        # skipped by matching the entry pair directly).
-        self._write(
-            "pr-check.yml",
-            PR_CHECK.replace(
-                "              - 'gradle/**'\n"
-                "              - 'gradle.properties'\n",
-                "              - 'gradle.properties'\n",
-                1,
-            ),
-        )
+        self._write("pr-check.yml", self._remove_filter_pattern("policy", "gradle/**"))
         self._assert_rejected("policy filter is missing: gradle/**")
 
     def test_policy_filter_requires_gradle_properties_path(self) -> None:
-        # Two-line context: 'gradle.properties' also appears in the code
-        # filter (after 'build.gradle.kts'), so anchor on the policy-only
-        # 'gradle/**' predecessor.
         self._write(
             "pr-check.yml",
-            PR_CHECK.replace(
-                "              - 'gradle/**'\n"
-                "              - 'gradle.properties'\n",
-                "              - 'gradle/**'\n",
-                1,
-            ),
+            self._remove_filter_pattern("policy", "gradle.properties"),
         )
         self._assert_rejected("policy filter is missing: gradle.properties")
 
+    def test_policy_filter_requires_nested_gradle_properties(self) -> None:
+        self._write(
+            "pr-check.yml",
+            self._remove_filter_pattern("policy", "**/gradle.properties"),
+        )
+        self._assert_rejected("policy filter is missing: **/gradle.properties")
+
+    def test_policy_filter_requires_wildcard_gradle_scripts(self) -> None:
+        for pattern in ("*.gradle", "**/*.gradle", "*.gradle.kts", "**/*.gradle.kts"):
+            with self.subTest(pattern=pattern):
+                self._reset_workflows()
+                self._write(
+                    "pr-check.yml",
+                    self._remove_filter_pattern("policy", pattern),
+                )
+                self._assert_rejected(f"policy filter is missing: {pattern}")
+
+    def test_code_filter_requires_wildcard_gradle_scripts(self) -> None:
+        for pattern in (
+            "*.gradle",
+            "**/*.gradle",
+            "*.gradle.kts",
+            "**/*.gradle.kts",
+            "**/gradle.properties",
+        ):
+            with self.subTest(pattern=pattern):
+                self._reset_workflows()
+                self._write(
+                    "pr-check.yml",
+                    self._remove_filter_pattern("code", pattern),
+                )
+                self._assert_rejected(f"code filter is missing: {pattern}")
+
+    GRADLE_BUILD_FILTER_PATHS = (
+        "gradle/verification-metadata.xml",
+        "gradle/libs.versions.toml",
+        "gradle.properties",
+        "gradle/wrapper/gradle-wrapper.properties",
+        "gradle/new-file.toml",
+        "app/build.gradle.kts",
+        "build.gradle.kts",
+        "settings.gradle.kts",
+        "app/gradle.properties",
+        "subproject/gradle.properties",
+        "sub/nested/gradle.properties",
+        "app/scripts/config.gradle.kts",
+        "sub/module/build.gradle",
+        "custom.gradle",
+        "custom.gradle.kts",
+        "gradlew",
+        "gradlew.bat",
+    )
+
     def test_policy_filter_covers_gradle_build_files(self) -> None:
-        """P1-1: metadata/catalog/properties-only diffs must run the harness.
+        """P1-1: metadata/catalog/properties/build-script diffs must run the harness.
 
         `gradle/**` covers files under gradle/ (verification-metadata.xml,
-        libs.versions.toml, future new files) but not the root-level
-        gradle.properties (no slash), which needs its own filter entry.
+        libs.versions.toml, future new files), while root and nested
+        gradle.properties and *.gradle/*.gradle.kts files need explicit entries.
         """
+        self.assertTrue(_path_match("custom.gradle", "*.gradle"))
+        self.assertFalse(_path_match("sub/module/build.gradle", "*.gradle"))
+        self.assertTrue(_path_match("sub/module/build.gradle", "**/*.gradle"))
         patterns = check_workflow_policy.EXPECTED_POLICY_FILTER_PATHS
-        for path in (
-            "gradle/verification-metadata.xml",
-            "gradle/libs.versions.toml",
-            "gradle.properties",
-            "gradle/wrapper/gradle-wrapper.properties",
-            "gradle/new-file.toml",
-        ):
+        for path in self.GRADLE_BUILD_FILTER_PATHS:
             with self.subTest(path=path):
                 self.assertTrue(
-                    any(
-                        fnmatch.fnmatchcase(path, pattern)
-                        for pattern in patterns
-                    ),
+                    any(_path_match(path, pattern) for pattern in patterns),
                     f"gradle-only diff {path} must set policy=true",
                 )
         self.assertFalse(
-            any(
-                fnmatch.fnmatchcase("docs/TESTING.md", pattern)
-                for pattern in patterns
-            ),
+            any(_path_match("docs/TESTING.md", pattern) for pattern in patterns),
             "docs-only diff must leave policy=false",
+        )
+
+    def test_code_filter_covers_gradle_build_files(self) -> None:
+        patterns = check_workflow_policy.EXPECTED_CODE_FILTER_PATHS
+        for path in self.GRADLE_BUILD_FILTER_PATHS:
+            with self.subTest(path=path):
+                self.assertTrue(
+                    any(_path_match(path, pattern) for pattern in patterns),
+                    f"gradle-only diff {path} must set code=true",
+                )
+        self.assertFalse(
+            any(_path_match("docs/TESTING.md", pattern) for pattern in patterns),
+            "docs-only diff must leave code=false",
         )
 
     def test_policy_filter_rejects_extra_path(self) -> None:
@@ -1987,6 +2065,269 @@ jobs:
             "pr-check.yml", workflow[:start] + mutated + workflow[end:]
         )
         self._assert_rejected("policy-harness core command must appear exactly once")
+
+    def test_policy_harness_command_includes_verify_metadata_gate(self) -> None:
+        workflow = PR_CHECK
+        start = workflow.index("  policy-harness:\n")
+        end = workflow.index("  build-and-policy-gate:\n")
+        block = workflow[start:end]
+        mutated = block.replace(
+            "        run: python3 -P scripts/verify_verification_metadata.py\n",
+            "",
+            1,
+        )
+        self.assertNotEqual(block, mutated)
+        self._write(
+            "pr-check.yml", workflow[:start] + mutated + workflow[end:]
+        )
+        self._assert_rejected("policy-harness core command must appear exactly once")
+
+    def test_policy_harness_verify_metadata_gate_replaced_with_true(self) -> None:
+        workflow = PR_CHECK
+        start = workflow.index("  policy-harness:\n")
+        end = workflow.index("  build-and-policy-gate:\n")
+        block = workflow[start:end]
+        mutated = block.replace(
+            "        run: python3 -P scripts/verify_verification_metadata.py\n",
+            "        run: 'true'\n",
+            1,
+        )
+        self.assertNotEqual(block, mutated)
+        self._write(
+            "pr-check.yml", workflow[:start] + mutated + workflow[end:]
+        )
+        self._assert_rejected("policy-harness core command must appear exactly once")
+
+    def test_policy_harness_verify_metadata_gate_step_if_is_rejected(self) -> None:
+        workflow = PR_CHECK
+        start = workflow.index("  policy-harness:\n")
+        end = workflow.index("  build-and-policy-gate:\n")
+        block = workflow[start:end]
+        mutated = block.replace(
+            "      - name: Verify dependency metadata gate (strict checksums)\n",
+            "      - name: Verify dependency metadata gate (strict checksums)\n"
+            "        if: false\n",
+            1,
+        )
+        self.assertNotEqual(block, mutated)
+        self._write(
+            "pr-check.yml", workflow[:start] + mutated + workflow[end:]
+        )
+        self._assert_rejected("policy-harness core step keys must be exactly")
+
+    # --- osv-scan.yml monitor shape ------------------------------------
+
+    def test_osv_scan_trigger_is_pinned(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "    - cron: '0 6 * * 1'\n",
+                "    - cron: '0 7 * * 1'\n",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan.yml 'on' must be exactly")
+
+    def test_osv_scan_pr_trigger_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "  workflow_dispatch:\n",
+                "  workflow_dispatch:\n  pull_request:\n",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan.yml 'on' must be exactly")
+
+    def test_osv_scan_scan_command_is_pinned(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "        run: python3 -P scripts/osv_scan.py --format json "
+                "--output osv-report.json\n",
+                "        run: 'true'\n",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan scan command must be exactly")
+
+    def test_osv_scan_scan_step_conditions_are_rejected(self) -> None:
+        for line, expected in (
+            ("        if: false\n", "osv-scan scan step must not contain if"),
+            (
+                "        continue-on-error: true\n",
+                "osv-scan scan step must not contain continue-on-error",
+            ),
+        ):
+            with self.subTest(line=line.strip()):
+                self._reset_workflows()
+                self._write(
+                    "osv-scan.yml",
+                    OSV_SCAN.replace(
+                        "      - name: Run OSV monitor scan (read-only, no upgrades)\n",
+                        "      - name: Run OSV monitor scan (read-only, no upgrades)\n"
+                        + line,
+                        1,
+                    ),
+                )
+                self._assert_rejected(expected)
+
+    def test_osv_scan_upload_must_keep_always_and_pinned_action(self) -> None:
+        for old, new, expected in (
+            (
+                "        if: always()\n",
+                "",
+                "osv-scan upload step keys must be exactly",
+            ),
+            (
+                "        if: always()\n",
+                "        if: false\n",
+                "osv-scan upload step if must be exactly",
+            ),
+            (
+                "          if-no-files-found: warn\n",
+                "          if-no-files-found: ignore\n",
+                "osv-scan upload with must be exactly",
+            ),
+        ):
+            with self.subTest(old=old.strip()):
+                self._reset_workflows()
+                mutated = OSV_SCAN.replace(old, new, 1)
+                self.assertNotEqual(OSV_SCAN, mutated)
+                self._write("osv-scan.yml", mutated)
+                self._assert_rejected(expected)
+
+    def test_osv_scan_unpinned_checkout_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(f"@{PINNED_SHA}", "@v4", 1),
+        )
+        self._assert_rejected("unpinned or unsupported uses ref")
+
+    def test_osv_scan_write_permission_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "permissions:\n  contents: read\n",
+                "permissions:\n  contents: read\n  issues: write\n",
+                1,
+            ),
+        )
+        self._assert_rejected("permissions must not grant issues: write")
+
+    def test_osv_scan_issue_filing_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "      - name: Upload OSV report\n",
+                "      - name: File issues\n"
+                "        run: gh issue create --title osv --body report\n"
+                "      - name: Upload OSV report\n",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan must not file issues")
+
+    def test_osv_scan_issue_filing_quotes_and_api_rejected(self) -> None:
+        commands = [
+            'gh "issue" create --title osv --body report',
+            "gh 'issues' create --title osv --body report",
+            "gh api repos/:owner/:repo/issues",
+            "gh api /repos/foo/bar/issues -f title=osv",
+        ]
+        for cmd in commands:
+            with self.subTest(cmd=cmd):
+                self._write(
+                    "osv-scan.yml",
+                    OSV_SCAN.replace(
+                        "      - name: Upload OSV report\n",
+                        f"      - name: File issues\n"
+                        f"        run: {cmd}\n"
+                        f"      - name: Upload OSV report\n",
+                        1,
+                    ),
+                )
+                self._assert_rejected("osv-scan must not file issues")
+
+    def test_osv_scan_job_continue_on_error_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "  osv-scan:\n",
+                "  osv-scan:\n    continue-on-error: true\n",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan must not contain job-level continue-on-error")
+
+    def test_osv_scan_extra_job_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "jobs:\n",
+                "jobs:\n  extra:\n    runs-on: ubuntu-latest\n    steps: []\n",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan jobs must be exactly ['osv-scan']")
+
+    def test_osv_scan_missing_concurrency_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "concurrency:\n"
+                "  group: ${{ github.workflow }}-${{ github.ref }}\n"
+                "  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}\n\n",
+                "",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan concurrency is missing")
+
+    def test_osv_scan_invalid_concurrency_cancel_in_progress_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}",
+                "cancel-in-progress: false",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan concurrency.cancel-in-progress must be exactly")
+
+    def test_osv_scan_missing_shadow_preflight_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "      - name: Reject Python import shadowing\n"
+                "        run: |\n"
+                "          chmod +x scripts/check_python_shadowing.sh\n"
+                "          scripts/check_python_shadowing.sh\n\n",
+                "",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan must have exactly four steps")
+
+    def test_osv_scan_upload_retention_days_is_pinned(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace("retention-days: 14", "retention-days: 30", 1),
+        )
+        self._assert_rejected("osv-scan upload with must be exactly")
+
+    def test_osv_scan_extra_step_is_rejected(self) -> None:
+        self._write(
+            "osv-scan.yml",
+            OSV_SCAN.replace(
+                "      - name: Upload OSV report\n",
+                "      - name: Extra step\n"
+                "        run: echo extra\n"
+                "      - name: Upload OSV report\n",
+                1,
+            ),
+        )
+        self._assert_rejected("osv-scan must have exactly four steps")
 
     def test_policy_harness_pyyaml_install_is_pinned(self) -> None:
         workflow = PR_CHECK

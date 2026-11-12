@@ -9,6 +9,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import dev.librepocket.agent.assistant.AssistantVoice
 import dev.librepocket.agent.ui.MainScreen
 import dev.librepocket.agent.ui.theme.LibrePocketTheme
 import dev.librepocket.entry.EntryGate
@@ -20,6 +21,11 @@ import dev.librepocket.entry.EntryNormalize
 open class MainActivity : ComponentActivity() {
     private val entryState = mutableStateOf(EntryConsumptionState())
     private var entryConsumptionState by entryState
+    // C2 一次態 voice 請求（Issue #137）：session ASSIST＋EXTRA_VOICE_INPUT
+    // 喚起後置 true，UI 消費（自動開系統辨識）即清回 false。旋轉經
+    // onSaveInstanceState 保留待消費；偽造 ASSIST＋flag 最多打開辨識框，
+    // 結果只 prefill 不自動送出，無能力增益。
+    private val assistVoiceState = mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
@@ -28,10 +34,18 @@ open class MainActivity : ComponentActivity() {
             savedInstanceState = savedInstanceState,
             launchText = extractSharedTurnText(intent),
         )
+        assistVoiceState.value =
+            if (savedInstanceState != null) {
+                savedInstanceState.getBoolean(KEY_ASSIST_VOICE, false)
+            } else {
+                AssistantVoice.isVoiceInputRequested(intent)
+            }
         enableEdgeToEdge()
         installMainScreenContent(
             sharedText = { entryConsumptionState.pendingText },
             onSharedConsumed = { entryConsumptionState = entryConsumptionState.consume() },
+            voiceInputRequested = { assistVoiceState.value },
+            onVoiceInputConsumed = { assistVoiceState.value = false },
         )
     }
 
@@ -39,10 +53,17 @@ open class MainActivity : ComponentActivity() {
     protected open fun installMainScreenContent(
         sharedText: () -> String?,
         onSharedConsumed: () -> Unit,
+        voiceInputRequested: () -> Boolean = { false },
+        onVoiceInputConsumed: () -> Unit = {},
     ) {
         setContent {
             LibrePocketTheme {
-                MainScreen(sharedText = sharedText(), onSharedConsumed = onSharedConsumed)
+                MainScreen(
+                    sharedText = sharedText(),
+                    onSharedConsumed = onSharedConsumed,
+                    assistVoiceRequested = voiceInputRequested(),
+                    onAssistVoiceConsumed = onVoiceInputConsumed,
+                )
             }
         }
     }
@@ -50,11 +71,16 @@ open class MainActivity : ComponentActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         entryConsumptionState.saveTo(outState)
+        outState.putBoolean(KEY_ASSIST_VOICE, assistVoiceState.value)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        // 非 voice intent 不清待消費（沿用 entry「無效 intent 不丟 pending」語義）。
+        if (AssistantVoice.isVoiceInputRequested(intent)) {
+            assistVoiceState.value = true
+        }
         extractSharedTurnText(intent)?.let { text ->
             entryConsumptionState = entryConsumptionState.accept(text)
         }
@@ -98,5 +124,9 @@ open class MainActivity : ComponentActivity() {
             )
             else -> null
         }
+    }
+
+    companion object {
+        private const val KEY_ASSIST_VOICE = "dev.librepocket.agent.assist_voice"
     }
 }

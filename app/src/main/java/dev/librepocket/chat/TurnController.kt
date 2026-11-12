@@ -5995,7 +5995,7 @@ class TurnController(
    *
    * When the structured round pushes the request past [MAX_REQUEST_CHARS],
    * history-prefix trimming (oldest-first, whole messages, tool pairing kept
-   * atomic, the structured payload counted) is additionally published on
+   * atomic by snapping forward via [snapHistoryToPairBoundary], the structured payload counted) is additionally published on
    * [lastRequestTrimmedCount]/[requestTrimmedCount] (counts) and
    * [lastRequestTrimmedChars]/[lastRequestChars] (chars)
    * as the total head trim of the outgoing request (added on top of the
@@ -6020,7 +6020,8 @@ class TurnController(
     val base = buildRequest(images, allowTools = false)
     val contMessages = loop.continuationMessages(calls, results)
     // Keep tool-call/tool-result pairing atomic: trim only the history prefix
-    // when the structured round pushes the request over MAX_REQUEST_CHARS.
+    // when the structured round pushes the request over MAX_REQUEST_CHARS,
+    // snapping forward via snapHistoryToPairBoundary.
     // Payload accounting is the conservative full-request estimate
     // (`requestWireEstimate`: per-message terms for the base AND the
     // structured round, plus the request envelope once) and includes the
@@ -6035,6 +6036,15 @@ class TurnController(
     while (drop < baseMessages.size - 1 && totalChars > MAX_REQUEST_CHARS) {
       totalChars -= baseMessages[drop].wirePayloadChars()
       drop++
+    }
+    if (drop > 0) {
+      val snapped = snapHistoryToPairBoundary(baseMessages, drop)
+      if (snapped <= baseMessages.size - 1) {
+        drop = snapped
+      }
+    }
+    if (drop > 0) {
+      totalChars = requestWireEstimate(baseMessages.drop(drop) + contMessages, base.model)
     }
     if (totalChars > MAX_REQUEST_CHARS) {
       // Untrimmable: the newest base row + the structured round exceed the
@@ -6118,7 +6128,9 @@ class TurnController(
    * [droppedHistoryChars], never silent. The send-time [MAX_REQUEST_CHARS]
    * trim is published on [lastRequestTrimmedCount]/[lastRequestTrimmedChars]
    * with the final size on [lastRequestChars] (see [HistoryWindowCap] for the
-   * reconciliation formula).
+   * reconciliation formula). The send-time [MAX_REQUEST_CHARS] trim is also
+   * pair-atomic, snapping forward via [snapHistoryToPairBoundary] so tool
+   * call/result pairs are never fractured.
    *
    * Ephemeral time context: a [buildRuntimeTimeContext] block is appended to a
    * copy of the last user message only. No user message means no injection
@@ -6171,6 +6183,12 @@ class TurnController(
     while (dropCount < maxDropLimit && totalChars > MAX_REQUEST_CHARS) {
       totalChars -= base[dropCount].text.length
       dropCount++
+    }
+    if (dropCount > 0) {
+      val snapped = snapHistoryToPairBoundary(base, dropCount)
+      if (snapped <= maxDropLimit) {
+        dropCount = snapped
+      }
     }
     _lastRequestTrimmedCount.set(dropCount)
     _requestTrimmedCount.value = dropCount

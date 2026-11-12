@@ -2154,6 +2154,27 @@ jobs:
         )
         self._assert_rejected("osv-scan must not file issues")
 
+    def test_osv_scan_issue_filing_quotes_and_api_rejected(self) -> None:
+        commands = [
+            'gh "issue" create --title osv --body report',
+            "gh 'issues' create --title osv --body report",
+            "gh api repos/:owner/:repo/issues",
+            "gh api /repos/foo/bar/issues -f title=osv",
+        ]
+        for cmd in commands:
+            with self.subTest(cmd=cmd):
+                self._write(
+                    "osv-scan.yml",
+                    OSV_SCAN.replace(
+                        "      - name: Upload OSV report\n",
+                        f"      - name: File issues\n"
+                        f"        run: {cmd}\n"
+                        f"      - name: Upload OSV report\n",
+                        1,
+                    ),
+                )
+                self._assert_rejected("osv-scan must not file issues")
+
     def test_osv_scan_extra_job_is_rejected(self) -> None:
         self._write(
             "osv-scan.yml",

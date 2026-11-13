@@ -38,9 +38,14 @@ object WebSearchDispatch {
      * `ServerToolTranscript.webSearchMarker(state)` 同形，避免 web 模組硬依賴
      * provider 模組；兩者一致性由 `hostedMarkerMirrorsServerTools` 測試釘住。
      * `state` 為呼叫方傳入的狀態字（如 `completed`），不攜帶使用者原文。
+     * 構造保證：含 `]`／換行的狀態字直接拒絕，呼叫方只能傳 allowlist 狀態。
      */
-    fun hostedMarker(state: String): String =
-        "\n[SERVER_TOOL:${WebSearchSelector.HOSTED_TOOL_NAME} $state]\n"
+    fun hostedMarker(state: String): String {
+        require(state.none { it == ']' || it == '\n' || it == '\r' }) {
+            "hosted marker state must be allowlisted"
+        }
+        return "\n[SERVER_TOOL:${WebSearchSelector.HOSTED_TOOL_NAME} $state]\n"
+    }
 
     /**
      * 單一路徑執行。

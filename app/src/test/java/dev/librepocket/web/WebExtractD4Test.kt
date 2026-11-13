@@ -267,6 +267,31 @@ class WebExtractD4Test {
         assertTrue(out.envelope.trimEnd().endsWith(WebContentEnvelope.END))
     }
 
+    @Test fun extractCfObfuscatedMarkersDoNotLeakToAnyField() = runBlocking {
+        val dns = publicDns("example.com")
+        // Cf 混淆第二通道：marker 內插 U+200B，單輪 strip->sanitize 會漏網。
+        val cf = String(Character.toChars(0x200B))
+        fun obf(m: String): String = m.replace("EXTERNAL", "EXTERNAL" + cf)
+        val obfBegin = obf(WebContentEnvelope.BEGIN)
+        val obfEnd = obf(WebContentEnvelope.END)
+        assertTrue("fixture 前提：混淆 marker 含 Cf", obfBegin.contains(cf))
+        assertFalse("fixture 前提：混淆後不應直接命中", obfBegin == WebContentEnvelope.BEGIN)
+        val doc = "<html><head><title>pre " + obfBegin + "T" + obfEnd + " post</title>" +
+            "<meta property=" + '"' + "article:published_time" + '"' + " content=" + '"' + "pre " + obfBegin + "2024-01-02" + obfEnd + " post" + '"' + ">" +
+            "</head><body><p>pre " + obfBegin + "body" + obfEnd + " post</p></body></html>"
+        val http = FakeExtract { okResp(doc) }
+        val svc = WebExtractService(http)
+        val out = svc.extract("https://example.com/cf", resolver = dns) as WebExtractOutcome.Ok
+        val fields = listOf(out.content.title, out.content.snippet, out.content.published ?: "")
+        for (f in fields) {
+            assertFalse("title/snippet/published 不得含 BEGIN: $f", f.contains(WebContentEnvelope.BEGIN))
+            assertFalse("title/snippet/published 不得含 END: $f", f.contains(WebContentEnvelope.END))
+        }
+        // envelope 仍單層（外層一組，內容零組）。
+        assertEquals(1, out.envelope.split(WebContentEnvelope.BEGIN).size - 1)
+        assertEquals(1, out.envelope.split(WebContentEnvelope.END).size - 1)
+    }
+
     @Test fun extractSanitizesBidiAndCf() = runBlocking {
         val dns = publicDns("example.com")
         // bidi 控制＋零寬＋BOM＋soft hyphen 全屬 Cf，必須剝除；換行保留。

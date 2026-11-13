@@ -907,6 +907,35 @@ class WebFetchTest {
         assertEquals(EndpointNetworkOptIn(), afterAnotherCross)
     }
 
+    @Test fun nonRedirect3xxStatusesAreTerminalFailures() {
+        // 304/305/306 are not redirect-follow targets in this client; they must fail closed
+        // as terminal HTTP errors without issuing a follow-up request.
+        val server = MockWebServer()
+        try {
+            val dns = loopbackDns()
+            for ((code, location) in listOf(
+                304 to null,
+                305 to "http://127.0.0.1:${server.port}/proxy",
+                306 to "http://127.0.0.1:${server.port}/unused",
+            )) {
+                val resp = MockResponse().setResponseCode(code)
+                if (location != null) resp.setHeader("Location", location)
+                server.enqueue(resp)
+                val outcome = WebFetch.fetch(
+                    server.url("/start").toString(),
+                    optIn = cleartextPrivate,
+                    resolver = dns,
+                )
+                val failed = outcome as? WebFetch.FetchOutcome.Failed
+                assertNotNull("expected Failed for HTTP $code, got: $outcome", failed)
+                assertEquals("HTTP_$code", failed!!.detail)
+            }
+            assertEquals(3, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
     @Test fun preflightOverloadFailsDeterministicallyWithoutUnboundedQueue() {
         val saturated = ThreadPoolExecutor(
             1, 1, 0L, TimeUnit.MILLISECONDS,

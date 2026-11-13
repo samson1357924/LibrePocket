@@ -149,6 +149,42 @@ class McpHttpBudgetMatrixTest {
         }
     }
 
+    @Test fun redirect305And306AreTerminalProtocolWithSingleRequest() = runBlocking {
+        // 305/306 無 Location 跳轉語義但仍屬 3xx 終端回應：不得跟隨、不得當成功，
+        // callTool 與 listTools 皆須 fail-closed 並計熔斷。
+        for (code in listOf(305, 306)) {
+            val webCall = MockWebServer()
+            webCall.start()
+            try {
+                webCall.enqueue(redirect(code, webCall.url("/moved").toString()))
+                val breakerCall = McpCircuitBreaker()
+                val callGot = deadline { server(webCall, breakerCall).callTool("t", "{}") }
+                assertNotNull("$code callTool 必須在 5s 內原樣回到呼叫方", callGot)
+                assertEquals(McpStatus.PROTOCOL, callGot!!.status)
+                assertEquals(NetworkDenyCode.REDIRECT_BLOCKED.name, callGot.auditMap()["denyCode"])
+                assertEquals(1, webCall.requestCount)
+                assertEquals(1, breakerCall.failureCount())
+            } finally {
+                webCall.shutdown()
+            }
+
+            val webList = MockWebServer()
+            webList.start()
+            try {
+                webList.enqueue(redirect(code, webList.url("/moved").toString()))
+                val breakerList = McpCircuitBreaker()
+                val listGot = deadline { server(webList, breakerList).listTools() }
+                assertNotNull("$code listTools 必須在 5s 內原樣回到呼叫方", listGot)
+                assertEquals(McpStatus.PROTOCOL, listGot!!.status)
+                assertEquals(NetworkDenyCode.REDIRECT_BLOCKED.name, listGot.auditMap()["denyCode"])
+                assertEquals(1, webList.requestCount)
+                assertEquals(1, breakerList.failureCount())
+            } finally {
+                webList.shutdown()
+            }
+        }
+    }
+
     // ---- 408/429 暫態：不隱性重送 ----
 
     @Test fun http408OnCallToolDoesNotResend() = runBlocking {

@@ -124,7 +124,7 @@ object WebFetch {
     @Volatile
     private var shared: OkHttpClient? = null
 
-    /** 共用 OkHttp 單例（S1-B「複用 OkHttp」：連線池共用；自動重定向一律關閉，由 [fetch] 手動跟隨並逐跳重做 [checkUrl]）。 */
+    /** 共用 OkHttp 單例（S1-B「複用 OkHttp」：連線池共用；自動重定向一律關閉，由 [fetch] 手動跟隨並逐跳重驗政策/opt-in）。 */
     fun sharedClient(): OkHttpClient =
         shared ?: synchronized(this) {
             shared ?: OkHttpClient.Builder()

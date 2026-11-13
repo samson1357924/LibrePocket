@@ -220,8 +220,11 @@ class NetworkOptInStore(
       require(authority.none { it.isWhitespace() || it < ' ' || it.isISOControl() }) {
         "NETWORK_OPTIN_URL_MALFORMED"
       }
-      require('@' !in authority && '\\' !in authority) {
+      require('@' !in authority) {
         "NETWORK_OPTIN_USERINFO_BLOCKED"
+      }
+      require('\\' !in authority) {
+        "NETWORK_OPTIN_AUTHORITY_INVALID"
       }
       if ('[' in authority || ']' in authority) {
         val closeIdx = authority.indexOf(']')

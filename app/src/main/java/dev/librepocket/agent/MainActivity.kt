@@ -92,10 +92,12 @@ open class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        // 非可信 voice intent 不清待消費（沿用 entry「無效 intent 不丟 pending」語義）。
-        if (isTrustedVoiceRequest(intent)) {
-            assistVoiceState.value = true
-        }
+        // Voice auto-launch is only armed on initial trusted creation/handoff
+        // (onCreate launch intent) or trusted saved-state restore. Subsequent
+        // onNewIntent deliveries do not carry verified per-intent voice provenance,
+        // so they must never re-arm pending assist voice (including trusted-root
+        // reuse or external/unverified-shaped intents). Non-voice intents must
+        // still not clear pending voice.
         extractSharedTurnText(intent)?.let { text ->
             entryConsumptionState = entryConsumptionState.accept(text)
         }

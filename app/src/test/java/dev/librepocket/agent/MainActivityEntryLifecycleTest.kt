@@ -232,7 +232,7 @@ class MainActivityEntryLifecycleTest {
     }
 
     @Test
-    fun onNewIntent_assistVoiceAfterConsumed_rearmsPendingVoice() {
+    fun onNewIntent_assistVoiceAfterConsumed_doesNotRearmPendingVoice() {
         val controller = launch(assistVoiceIntent(), trustedVoiceSession = true)
         try {
             val activity = controller.get()
@@ -240,10 +240,51 @@ class MainActivityEntryLifecycleTest {
             activity.fakeConsumeVoice()
             assertEquals(false, activity.pendingVoice)
 
+            // Voice auto-launch is not re-armed from onNewIntent deliveries.
             activity.deliverNewIntent(assistVoiceIntent())
-            assertEquals(true, activity.pendingVoice)
+            assertEquals(false, activity.pendingVoice)
         } finally {
             destroy(controller)
+        }
+    }
+
+    @Test
+    fun onNewIntent_externalShapedAssistVoiceToTrustedRoot_doesNotArmPendingVoice() {
+        // Policy-level regression: even when the existing activity is a trusted
+        // voice-root session, subsequent onNewIntent deliveries do not re-arm
+        // assist voice because per-intent provenance is not verified here.
+        val controller = launch(Intent(Intent.ACTION_MAIN), trustedVoiceSession = true)
+        try {
+            val activity = controller.get()
+            assertEquals(false, activity.pendingVoice)
+            activity.deliverNewIntent(assistVoiceIntent())
+            assertEquals(false, activity.pendingVoice)
+        } finally {
+            destroy(controller)
+        }
+    }
+
+    @Test
+    fun restoreWithoutAssistVoiceKey_historyFlaggedLaunchIntent_doesNotSetPendingVoice() {
+        val savedState = Bundle()
+        val historyIntent = assistVoiceIntent()
+            .addFlags(Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY)
+        val recreated = recreate(historyIntent, savedState)
+        try {
+            assertEquals(false, recreated.get().pendingVoice)
+        } finally {
+            destroy(recreated)
+        }
+    }
+
+    @Test
+    fun restoreWithoutAssistVoiceKey_freshTrustedLaunchIntent_setsPendingVoice() {
+        val savedState = Bundle()
+        val recreated = recreate(assistVoiceIntent(), savedState)
+        try {
+            assertEquals(true, recreated.get().pendingVoice)
+        } finally {
+            destroy(recreated)
         }
     }
 

@@ -10,7 +10,7 @@ import android.util.Log
 private const val TAG = "LibreRecognition"
 
 // C2 定案：session 內不做串流 STT（自家 process 辨識需要 RECORD_AUDIO，
-// 與零新增權限契約衝突）。本 stub 保持誠實無能力：不接系統 STT、不伪造結果。
+// 與零新增權限契約衝突）。本 stub 保持誠實無能力：不接系統 STT、不偽造結果。
 // 語音輸入走 AssistantVoice 委派 RecognizerIntent（錄音由系統／第三方辨識
 // Activity 承擔）。
 

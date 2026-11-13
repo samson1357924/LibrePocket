@@ -43,14 +43,22 @@ class ElevatedCleanupTrackerB2Test {
     }
 
     @After fun tearDownIsolation() {
+        val leakedOutstanding = ElevatedCleanupTracker.outstanding()
+        val leakedActive = ElevatedCleanupTracker.activeCalls()
         ElevatedCleanupTracker.clearUnverified()
-        repeat(8) { ElevatedCleanupTracker.releaseSlot() }
-        repeat(8) { ElevatedCleanupTracker.leaveCall() }
+        while (ElevatedCleanupTracker.outstanding() > 0) {
+            ElevatedCleanupTracker.releaseSlot()
+        }
+        while (ElevatedCleanupTracker.activeCalls() > 0) {
+            ElevatedCleanupTracker.leaveCall()
+        }
         pollOutstandingTo(0)
         pollActiveTo(0)
         pollPendingTo(0)
         ElevatedCleanupTracker.noteClean()
         awaitNoQuarantineThreads()
+        assertEquals("test leaked outstanding slots", 0, leakedOutstanding)
+        assertEquals("test leaked active calls", 0, leakedActive)
     }
 
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {
@@ -339,8 +347,12 @@ class ElevatedCleanupTrackerB2Test {
         // 子例間完全隔離：每段首尾重置 breaker＋槽＋quarantine＋active。
         fun resetAll() {
             ElevatedCleanupTracker.clearUnverified()
-            repeat(8) { ElevatedCleanupTracker.releaseSlot() }
-            repeat(8) { ElevatedCleanupTracker.leaveCall() }
+            while (ElevatedCleanupTracker.outstanding() > 0) {
+                ElevatedCleanupTracker.releaseSlot()
+            }
+            while (ElevatedCleanupTracker.activeCalls() > 0) {
+                ElevatedCleanupTracker.leaveCall()
+            }
             pollOutstandingTo(0)
             pollActiveTo(0)
             ElevatedCleanupTracker.noteClean()
@@ -526,10 +538,15 @@ class ElevatedCleanupTrackerB2Test {
     @Test fun kickSweepAsyncEmptyReturnsFalseWithoutThread() {
         assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
         assertEquals(0, ElevatedCleanupTracker.sweepPendingCount())
-        val t0 = System.nanoTime()
-        assertFalse(ElevatedCleanupTracker.kickSweepAsync())
-        val wallMs = (System.nanoTime() - t0) / 1_000_000L
-        assertTrue("empty kick must be local fast, wall=${wallMs}ms", wallMs < 500L)
+        var threadStarted = false
+        val kicked = ElevatedCleanupTracker.kickSweepAsyncWithThreadStarter(
+            startThread = {
+                threadStarted = true
+                it.start()
+            },
+        )
+        assertFalse("empty kick must return false", kicked)
+        assertFalse("empty kick must not start a sweep thread", threadStarted)
         assertEquals(0, ElevatedCleanupTracker.sweepPendingCount())
         assertFalse(ElevatedCleanupTracker.isSweepInFlight())
     }
@@ -572,15 +589,18 @@ class ElevatedCleanupTrackerB2Test {
         val fakeNow = AtomicLong(System.nanoTime())
         val nowNanos: () -> Long = { fakeNow.get() }
         try {
-            val stall = StallSwallowProcess(latch)
-            ElevatedCleanupTracker.quarantineUnverified(stall)
-            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            // Fill all MAX_SWEEP_VERIFIERS slots with StallSwallowProcess.
+            val stalls = (0 until ElevatedCleanupTracker.MAX_SWEEP_VERIFIERS).map {
+                StallSwallowProcess(latch)
+            }
+            for (s in stalls) ElevatedCleanupTracker.quarantineUnverified(s)
+            assertEquals(ElevatedCleanupTracker.MAX_SWEEP_VERIFIERS, ElevatedCleanupTracker.quarantinedCount())
             assertTrue(
                 "first kick must start (lease free + cooldown clear)",
                 ElevatedCleanupTracker.kickSweepAsync(nowNanos),
             )
-            pollTrue("stall must be tracked as pending", 15_000L) {
-                ElevatedCleanupTracker.sweepPendingCount() == 1
+            pollTrue("stalls must be tracked as pending", 15_000L) {
+                ElevatedCleanupTracker.sweepPendingCount() == ElevatedCleanupTracker.MAX_SWEEP_VERIFIERS
             }
             pollTrue("background sweep must finish", 15_000L) {
                 !ElevatedCleanupTracker.isSweepInFlight()
@@ -590,13 +610,14 @@ class ElevatedCleanupTrackerB2Test {
             assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
             assertFalse(ElevatedCleanupTracker.isQuarantined())
             assertEquals(
-                "live stall worker must be retained (safe direction)",
-                1,
+                "live stall workers must be retained (safe direction)",
+                ElevatedCleanupTracker.MAX_SWEEP_VERIFIERS,
                 ElevatedCleanupTracker.sweepPendingCount(),
             )
-            // 同一假時刻新 handle 即時可探（冷卻已重置；若未重置即 false）。
-            val fresh = FastAliveProcess()
-            ElevatedCleanupTracker.quarantineUnverified(fresh)
+            // Quarantine a dead process; verification skipped because sweepPending saturated.
+            val dead = FakeProcess("dead".toByteArray())
+            ElevatedCleanupTracker.quarantineUnverified(dead)
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
             assertTrue(
                 "after clear the same frozen clock must allow one sweep (cooldown reset)",
                 ElevatedCleanupTracker.kickSweepAsync(nowNanos),
@@ -604,7 +625,8 @@ class ElevatedCleanupTrackerB2Test {
             pollTrue("second sweep must finish", 15_000L) {
                 !ElevatedCleanupTracker.isSweepInFlight()
             }
-            // 新代驗證被飽和跳過即保持 QUARANTINE（pending 仍 1，不翻轉放行）。
+            // Dead process must NOT be cleared because sweepPending.size >= MAX skipped verification.
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
             assertTrue(ElevatedCleanupTracker.isQuarantined())
             assertEquals(
                 ElevatedCleanupTracker.Admission.QUARANTINE,
@@ -628,8 +650,12 @@ class ElevatedCleanupTrackerB2Test {
     @Test fun denialsNeverOccupyActiveSeat() {
         fun resetAll() {
             ElevatedCleanupTracker.clearUnverified()
-            repeat(8) { ElevatedCleanupTracker.releaseSlot() }
-            repeat(8) { ElevatedCleanupTracker.leaveCall() }
+            while (ElevatedCleanupTracker.outstanding() > 0) {
+                ElevatedCleanupTracker.releaseSlot()
+            }
+            while (ElevatedCleanupTracker.activeCalls() > 0) {
+                ElevatedCleanupTracker.leaveCall()
+            }
             pollOutstandingTo(0)
             pollActiveTo(0)
             ElevatedCleanupTracker.noteClean()
@@ -941,9 +967,13 @@ class ElevatedCleanupTrackerB2Test {
             val kicked = ElevatedCleanupTracker.kickSweepAsyncWithThreadStarter(
                 nowNanos = { t2 },
                 startThread = {
-                    startEntered.countDown()
-                    assertTrue(clearDone.await(10, TimeUnit.SECONDS))
-                    throw OutOfMemoryError("simulated OOM starting sweep thread")
+                    try {
+                        startEntered.countDown()
+                        assertTrue(clearDone.await(10, TimeUnit.SECONDS))
+                        throw OutOfMemoryError("simulated OOM starting sweep thread")
+                    } finally {
+                        startEntered.countDown()
+                    }
                 },
             )
             bg.join(10_000L)

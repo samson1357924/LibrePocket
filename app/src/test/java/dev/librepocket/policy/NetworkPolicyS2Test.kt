@@ -21,6 +21,7 @@ import dev.librepocket.provider.pinnedTransportFor
 import dev.librepocket.provider.redirectBlockedFailure
 import dev.librepocket.provider.requireNetworkPolicyAllowed
 import dev.librepocket.provider.streamingFlow
+import java.io.IOException
 import java.net.InetAddress
 import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
@@ -348,6 +349,8 @@ class NetworkPolicyS2Test {
     assertEquals("::1", PinnedNetworkDns.normalize("[::1]"))
     assertEquals("::1", PinnedNetworkDns.normalize("[::1]."))
     assertEquals("example.com", PinnedNetworkDns.normalize("Example.COM."))
+    assertEquals("", PinnedNetworkDns.normalize("[   ]"))
+    assertEquals("", PinnedNetworkDns.normalize("[ . ]"))
     // pin 與 lookup 同一鍵：括號形 pin 無括號形查。
     val pinned = PinnedNetworkDns.forHost("[::1]", listOf(addr("::1")))
     assertEquals(listOf(addr("::1")), pinned.lookup("::1"))
@@ -487,5 +490,478 @@ class NetworkPolicyS2Test {
     val redir = redirectBlockedFailure(307)
     assertTrue(redir.message.orEmpty().contains("REDIRECT_BLOCKED"))
     assertFalse(redir.message.orEmpty().contains("10.1.2.3"))
+  }
+
+  // —— Phase 1 硬化：NetworkOptInStore.boundOf / token 防碰撞 / 脫敏 ——
+
+  @Test fun boundOfRejectsAuthorityConfusionMalformedSchemeAndBlankIdSuffix() {
+    val store = NetworkOptInStore(allowTierUpgrade = true)
+    for (badUrl in listOf(
+      "http://@localhost/mcp",
+      "http://a\\@localhost/mcp",
+      "http://evil\\localhost/mcp",
+      "https:/127.0.0.1/mcp",
+      "https://ex\tample.com/mcp",
+      "https://ex ample.com/mcp",
+      "https://ex\u00a0ample.com/mcp",
+      "https://\u00a0example.com/mcp",
+      "ht\ttp://example.com/mcp",
+      "https://example.com:80\t80/mcp",
+      "https:///mcp",
+      "https://[1:2:3:4:5:6:7:8:9]/mcp",
+      "https://[1:2:3:4:5:6:7:1.2.3.4]/mcp",
+      "https://[::1/",
+      "https://::1]/",
+      "https://[]/",
+      "https://[::1]abc/",
+      "https://[::1][::2]/",
+      "https://[127.0.0.1]/",
+    )) {
+      try {
+        NetworkOptInStore.boundOf("mcp:srv", badUrl, NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE, 1L)
+        fail("boundOf must reject $badUrl")
+      } catch (_: IllegalArgumentException) {
+      }
+      try {
+        store.confirm("mcp:srv", badUrl, NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE, 1L)
+        fail("confirm must reject $badUrl")
+      } catch (_: IllegalArgumentException) {
+      }
+      assertEquals(
+        "malformed query must fail closed to HTTPS_ONLY: $badUrl",
+        NetworkEgressPolicy.HTTPS_ONLY,
+        store.confirmedPolicyFor("mcp:srv", badUrl, 1L),
+      )
+    }
+    try {
+      NetworkOptInStore.boundOf("mcp:srv", "   ", NetworkEgressPolicy.ALLOW_PRIVATE_DNS, 1L)
+      fail("spaces-only url must throw NETWORK_OPTIN_URL_BLANK")
+    } catch (e: IllegalArgumentException) {
+      assertEquals("NETWORK_OPTIN_URL_BLANK", e.message)
+    }
+    for (ctrlOnly in listOf("\u0000", "\t", "  \u0007  ")) {
+      try {
+        NetworkOptInStore.boundOf("mcp:srv", ctrlOnly, NetworkEgressPolicy.ALLOW_PRIVATE_DNS, 1L)
+        fail("control-char-only url must throw NETWORK_OPTIN_URL_MALFORMED: '$ctrlOnly'")
+      } catch (e: IllegalArgumentException) {
+        assertEquals("NETWORK_OPTIN_URL_MALFORMED", e.message)
+      }
+    }
+    for (badId in listOf("mcp:", "preset:", "custom:", "mcp:   ", "preset:\t")) {
+      try {
+        store.confirm(badId, "https://api.example.com/v1", NetworkEgressPolicy.ALLOW_PRIVATE_DNS, 1L)
+        fail("boundOf must reject blank suffix id: '$badId'")
+      } catch (_: IllegalArgumentException) {
+      }
+    }
+  }
+
+  @Test fun boundOfNormalizationAndTrailingDotMismatch() {
+    val store = NetworkOptInStore(allowTierUpgrade = true)
+    val endpointId = "preset:openai"
+    store.confirm(endpointId, "https://API.OPENAI.COM:443/v1#frag", NetworkEgressPolicy.ALLOW_PRIVATE_DNS, 1L)
+    assertEquals(
+      NetworkEgressPolicy.ALLOW_PRIVATE_DNS,
+      store.confirmedPolicyFor(endpointId, "https://api.openai.com/v1", 1L),
+    )
+    // 尾點視為不同身份（fail-closed）
+    assertEquals(
+      NetworkEgressPolicy.HTTPS_ONLY,
+      store.confirmedPolicyFor(endpointId, "https://api.openai.com./v1", 1L),
+    )
+
+    val clearId = "mcp:local"
+    store.confirm(clearId, "http://127.0.0.1:80/mcp#section", NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE, 2L)
+    assertEquals(
+      NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+      store.confirmedPolicyFor(clearId, "http://127.0.0.1/mcp", 2L),
+    )
+  }
+
+  @Test fun confirmationTokenLengthPrefixedResistsDelimiterCollision() {
+    val t1 = NetworkOptInStore.confirmationTokenFor(
+      "mcp:a",
+      "https://example.com/b|c",
+      NetworkEgressPolicy.ALLOW_PRIVATE_DNS,
+      1L,
+    )
+    val t2 = NetworkOptInStore.confirmationTokenFor(
+      "mcp:a|https://example.com/b",
+      "https://example.com/c",
+      NetworkEgressPolicy.ALLOW_PRIVATE_DNS,
+      1L,
+    )
+    assertNotEquals(t1, t2)
+
+    val t3 = NetworkOptInStore.confirmationTokenFor(
+      "mcp:srv",
+      "http://127.0.0.1/mcp?x=1|http|80",
+      NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+      1L,
+    )
+    val t4 = NetworkOptInStore.confirmationTokenFor(
+      "mcp:srv|http://127.0.0.1/mcp?x=1",
+      "http://127.0.0.1/mcp",
+      NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+      1L,
+    )
+    assertNotEquals(t3, t4)
+  }
+
+  @Test fun confirmedOptInToStringOmitsBaseUrl() {
+    val store = NetworkOptInStore(allowTierUpgrade = true)
+    val confirmed = store.confirm(
+      "mcp:srv",
+      "https://secret-host.example/path?token=supersecret",
+      NetworkEgressPolicy.ALLOW_PRIVATE_DNS,
+      3L,
+    )
+    val str = confirmed.toString()
+    assertFalse("ConfirmedOptIn.toString must redact baseUrl: $str", str.contains("secret-host.example") || str.contains("supersecret"))
+    assertTrue("ConfirmedOptIn.toString keeps non-sensitive fields: $str", str.contains("endpointId=mcp:srv") && str.contains("configRevision=3"))
+  }
+
+  // —— Phase 1 硬化：PinnedNetworkDns 單元行為 ——
+
+  @Test fun pinnedDnsStrictFalseCachesAndEmptyThrows() {
+    val calls = AtomicInteger(0)
+    val delegate = HostResolver { host ->
+      calls.incrementAndGet()
+      if (host == "empty.example") emptyList() else listOf(addr("203.0.113.50"))
+    }
+    val nonStrict = PinnedNetworkDns(delegate = delegate, strict = false)
+    assertEquals(listOf(addr("203.0.113.50")), nonStrict.lookup("a.example"))
+    assertEquals(listOf(addr("203.0.113.50")), nonStrict.lookup("a.example"))
+    assertEquals("second lookup must use cached pin", 1, calls.get())
+
+    // 跨寫法正規化快取命中：先查大寫加尾點，再查小寫無尾點必須命中同一 pin 不再碰 delegate。
+    calls.set(0)
+    assertEquals(listOf(addr("203.0.113.50")), nonStrict.lookup("EXAMPLE.COM."))
+    assertEquals(listOf(addr("203.0.113.50")), nonStrict.lookup("example.com"))
+    assertEquals("cross-variant lookup must hit cached normalized pin", 1, calls.get())
+
+    try {
+      nonStrict.lookup("empty.example")
+      fail("empty delegate must throw UnknownHostException")
+    } catch (_: UnknownHostException) {
+    }
+  }
+
+  @Test fun pinnedDnsRejectsEmptyEntriesAcrossInitPinAndForHost() {
+    try {
+      PinnedNetworkDns(initialPinned = mapOf("example.com" to emptyList()))
+      fail("init with empty address list must throw")
+    } catch (e: IllegalArgumentException) {
+      assertEquals("PINNED_DNS_EMPTY", e.message)
+    }
+
+    val dns = PinnedNetworkDns()
+    try {
+      dns.pin("example.com", emptyList())
+      fail("pin with empty address list must throw")
+    } catch (e: IllegalArgumentException) {
+      assertEquals("PINNED_DNS_EMPTY", e.message)
+    }
+
+    try {
+      PinnedNetworkDns.forHost("example.com", emptyList())
+      fail("forHost with empty address list must throw")
+    } catch (e: IllegalArgumentException) {
+      assertEquals("PINNED_DNS_EMPTY", e.message)
+    }
+  }
+
+  @Test fun pinnedDnsUnpinnedHasRebindOrderInsensitiveFailClosedAndDefensiveCopies() {
+    val delegateCalls = AtomicInteger(0)
+    var nextAnswers = listOf(addr("203.0.113.2"), addr("203.0.113.1"))
+    var mode = "normal"
+    val delegate = HostResolver { _ ->
+      delegateCalls.incrementAndGet()
+      when (mode) {
+        "throw_unknown" -> throw UnknownHostException("down")
+        "throw_runtime" -> throw IllegalStateException("boom")
+        "empty" -> emptyList()
+        "cancel" -> throw kotlinx.coroutines.CancellationException("cancelled")
+        "interrupt_cause" -> throw UnknownHostException("interrupted").apply { initCause(InterruptedException("stop")) }
+        else -> nextAnswers
+      }
+    }
+
+    val inputList = mutableListOf(addr("203.0.113.1"), addr("203.0.113.2"))
+    val pinned = PinnedNetworkDns.forHost("example.com", inputList, delegate)
+    // 防禦性拷貝：修改原傳入 list 不影響 pin。
+    inputList.clear()
+    assertEquals(listOf(addr("203.0.113.1"), addr("203.0.113.2")), pinned.pinnedFor("example.com"))
+
+    // 修改回傳 list 不影響內部 pin。
+    val out = pinned.lookup("example.com")
+    if (out is MutableList<InetAddress>) {
+      out.clear()
+    }
+    assertEquals(listOf(addr("203.0.113.1"), addr("203.0.113.2")), pinned.pinnedFor("example.com"))
+
+    // 未釘住 host
+    assertNull(pinned.pinnedFor("unpinned.example"))
+    assertNull(pinned.hasRebind("unpinned.example"))
+    assertEquals("unpinned hasRebind must not consult delegate", 0, delegateCalls.get())
+
+    // 順序無關（[2, 1] == [1, 2]）
+    assertEquals(false, pinned.hasRebind("example.com"))
+
+    // 子集合與超集合皆屬答案變更 → true
+    nextAnswers = listOf(addr("203.0.113.1"))
+    assertEquals(true, pinned.hasRebind("example.com"))
+    nextAnswers = listOf(addr("203.0.113.1"), addr("203.0.113.2"), addr("203.0.113.3"))
+    assertEquals(true, pinned.hasRebind("example.com"))
+
+    // 變更答案 → true
+    nextAnswers = listOf(addr("203.0.113.3"))
+    assertEquals(true, pinned.hasRebind("example.com"))
+
+    // fail-closed：exception / empty → true
+    mode = "throw_unknown"
+    assertEquals(true, pinned.hasRebind("example.com"))
+    mode = "throw_runtime"
+    assertEquals(true, pinned.hasRebind("example.com"))
+    mode = "empty"
+    assertEquals(true, pinned.hasRebind("example.com"))
+
+    // CancellationException / InterruptedException 透傳
+    mode = "cancel"
+    try {
+      pinned.hasRebind("example.com")
+      fail("CancellationException must propagate from hasRebind")
+    } catch (_: kotlinx.coroutines.CancellationException) {
+    }
+
+    mode = "interrupt_cause"
+    try {
+      pinned.hasRebind("example.com")
+      fail("InterruptedException cause must propagate as CancellationException")
+    } catch (_: kotlinx.coroutines.CancellationException) {
+    }
+  }
+
+  @Test fun boundOfRejectsControlCharsInPathQueryAndFragment() {
+    val store = NetworkOptInStore(allowTierUpgrade = true)
+    val cleanUrl = "https://api.example.com/v1"
+    store.confirm("mcp:srv", cleanUrl, NetworkEgressPolicy.ALLOW_PRIVATE_DNS, 1L)
+    val controlUrls = listOf(
+      "https://api.example.com/v1\tmore",
+      "https://api.example.com/v\t1",
+      "https://api.example.com/v1\t",
+      "https://api.example.com/v1\u0007",
+      "https://api.example.com/v1\nmore",
+      "https://api.example.com/v1\rmore",
+      "https://api.example.com/v1?q=a\tb",
+      "https://api.example.com/v1#frag\nmore",
+      "https://api.example.com/\u0000v1",
+      "https://api.example.com/\u007fv1",
+      "https://api.example.com/\u0085v1",
+      "\u0000https://example.com/",
+      "https://example.com/\u0007",
+      "\u0007ftp://example.com/",
+      "\u0000https://api.example.com/v1",
+      "https://api.example.com/v1\u0000",
+    )
+    for (badUrl in controlUrls) {
+      try {
+        NetworkOptInStore.boundOf("mcp:srv2", badUrl, NetworkEgressPolicy.ALLOW_PRIVATE_DNS, 1L)
+        fail("boundOf must reject control char URL: $badUrl")
+      } catch (e: IllegalArgumentException) {
+        assertEquals("NETWORK_OPTIN_URL_MALFORMED", e.message)
+      }
+      try {
+        store.confirm("mcp:srv2", badUrl, NetworkEgressPolicy.ALLOW_PRIVATE_DNS, 1L)
+        fail("confirm must reject control char URL: $badUrl")
+      } catch (e: IllegalArgumentException) {
+        assertEquals("NETWORK_OPTIN_URL_MALFORMED", e.message)
+      }
+      assertEquals(
+        "malformed control char query must fail closed to HTTPS_ONLY",
+        NetworkEgressPolicy.HTTPS_ONLY,
+        store.confirmedPolicyFor("mcp:srv", badUrl, 1L),
+      )
+    }
+    // 前後普通空白 ' ' 仍正常修剪匹配已確認 URL。
+    assertEquals(
+      NetworkEgressPolicy.ALLOW_PRIVATE_DNS,
+      store.confirmedPolicyFor("mcp:srv", "  https://api.example.com/v1  ", 1L),
+    )
+  }
+
+  @Test fun pinnedDnsRejectsBlankHostsAndDuplicateNormalizedKeys() {
+    val addrs = listOf(addr("203.0.113.10"))
+    for (blankHost in listOf("", "   ", ".", "[]", "[.]", "[   ]", "[ . ]")) {
+      try {
+        PinnedNetworkDns(initialPinned = mapOf(blankHost to addrs))
+        fail("init must reject blank normalized host: '$blankHost'")
+      } catch (e: IllegalArgumentException) {
+        assertEquals("PINNED_DNS_HOST_BLANK", e.message)
+      }
+      try {
+        PinnedNetworkDns.forHost(blankHost, addrs)
+        fail("forHost must reject blank normalized host: '$blankHost'")
+      } catch (e: IllegalArgumentException) {
+        assertEquals("PINNED_DNS_HOST_BLANK", e.message)
+      }
+      val dns = PinnedNetworkDns()
+      try {
+        dns.pin(blankHost, addrs)
+        fail("pin must reject blank normalized host: '$blankHost'")
+      } catch (e: IllegalArgumentException) {
+        assertEquals("PINNED_DNS_HOST_BLANK", e.message)
+      }
+    }
+
+    // 大小寫／括號／尾點碰撞正規化鍵在 initialPinned 必須拒收
+    try {
+      PinnedNetworkDns(
+        initialPinned = mapOf(
+          "EXAMPLE.COM" to listOf(addr("203.0.113.1")),
+          "example.com." to listOf(addr("203.0.113.2")),
+        ),
+      )
+      fail("init must reject colliding normalized keys")
+    } catch (e: IllegalArgumentException) {
+      assertEquals("PINNED_DNS_DUPLICATE_HOST", e.message)
+    }
+    try {
+      PinnedNetworkDns(
+        initialPinned = mapOf(
+          "[::1]" to listOf(addr("::1")),
+          "::1." to listOf(addr("::1")),
+        ),
+      )
+      fail("init must reject colliding IPv6 normalized keys")
+    } catch (e: IllegalArgumentException) {
+      assertEquals("PINNED_DNS_DUPLICATE_HOST", e.message)
+    }
+
+    // non-strict lookup 空正規化 host 直接拋 DNS_PIN_MISS 且不觸 delegate
+    val delegateCalls = AtomicInteger(0)
+    val nonStrict = PinnedNetworkDns(
+      delegate = HostResolver {
+        delegateCalls.incrementAndGet()
+        addrs
+      },
+      strict = false,
+    )
+    for (blankHost in listOf("", "   ", ".", "[]", "[.]", "[   ]", "[ . ]")) {
+      try {
+        nonStrict.lookup(blankHost)
+        fail("non-strict lookup must reject blank normalized host: '$blankHost'")
+      } catch (e: UnknownHostException) {
+        assertEquals("DNS_PIN_MISS", e.message)
+      }
+    }
+    assertEquals(0, delegateCalls.get())
+  }
+
+  @Test fun pinnedDnsPinNormalizesOverwritesCopiesAndBlankHasRebindSkipsDelegate() {
+    val delegateCalls = AtomicInteger(0)
+    val pinned = PinnedNetworkDns(
+      delegate = HostResolver {
+        delegateCalls.incrementAndGet()
+        listOf(addr("203.0.113.99"))
+      },
+    )
+    // 1) pin 正規化、防禦性拷貝與覆寫既有 pin
+    val callerList1 = mutableListOf(addr("203.0.113.10"))
+    pinned.pin("Example.COM.", callerList1)
+    callerList1.clear()
+    assertEquals(listOf(addr("203.0.113.10")), pinned.pinnedFor("example.com"))
+    assertEquals(listOf(addr("203.0.113.10")), pinned.lookup("EXAMPLE.COM"))
+
+    val callerList2 = mutableListOf(addr("203.0.113.20"), addr("203.0.113.21"))
+    pinned.pin("example.com", callerList2)
+    callerList2[0] = addr("203.0.113.250")
+    assertEquals(listOf(addr("203.0.113.20"), addr("203.0.113.21")), pinned.pinnedFor("Example.COM."))
+    assertEquals(listOf(addr("203.0.113.20"), addr("203.0.113.21")), pinned.lookup("example.com."))
+
+    // 2) blank / "[   ]" / "[.]" / "[ . ]" 的 hasRebind 回 null 且絕不觸碰 delegate
+    for (blankHost in listOf("", "   ", ".", "[]", "[.]", "[   ]", "[ . ]")) {
+      assertNull("hasRebind('$blankHost') must be null", pinned.hasRebind(blankHost))
+    }
+    assertEquals("blank hasRebind must not consult delegate", 0, delegateCalls.get())
+  }
+
+  @Test fun pinnedDnsNormalizesHostPassedToDelegateInNonStrictLookupAndHasRebind() {
+    val seenHosts = mutableListOf<String>()
+    val delegate = HostResolver { host ->
+      seenHosts += host
+      if (host == "::1") listOf(addr("::1")) else listOf(addr("203.0.113.44"))
+    }
+    val nonStrict = PinnedNetworkDns(delegate = delegate, strict = false)
+    assertEquals(listOf(addr("203.0.113.44")), nonStrict.lookup("EXAMPLE.COM."))
+    assertEquals(listOf(addr("::1")), nonStrict.lookup("[::1]."))
+    assertEquals(listOf("example.com", "::1"), seenHosts)
+
+    seenHosts.clear()
+    val strict = PinnedNetworkDns(
+      initialPinned = mapOf(
+        "example.com" to listOf(addr("203.0.113.44")),
+        "::1" to listOf(addr("::1")),
+      ),
+      delegate = delegate,
+      strict = true,
+    )
+    assertEquals(false, strict.hasRebind("EXAMPLE.COM."))
+    assertEquals(false, strict.hasRebind("[::1]."))
+    assertEquals(listOf("example.com", "::1"), seenHosts)
+  }
+
+  @Test fun pinnedDnsHasRebindMultiHopInterruptAndCyclicCause() {
+    val multiHopPinned = PinnedNetworkDns.forHost(
+      "example.com",
+      listOf(addr("203.0.113.10")),
+      delegate = HostResolver {
+        val root = InterruptedException("root")
+        val mid = IOException("mid").apply { initCause(root) }
+        throw UnknownHostException("outer").apply { initCause(mid) }
+      },
+    )
+    try {
+      multiHopPinned.hasRebind("example.com")
+      fail("multi-hop InterruptedException cause must propagate CancellationException")
+    } catch (_: kotlinx.coroutines.CancellationException) {
+    }
+
+    class CyclicException(msg: String) : RuntimeException(msg) {
+      var loopCause: Throwable? = null
+      override val cause: Throwable? get() = loopCause
+    }
+    val cyclicPinned = PinnedNetworkDns.forHost(
+      "example.com",
+      listOf(addr("203.0.113.10")),
+      delegate = HostResolver {
+        val e1 = CyclicException("c1")
+        val e2 = CyclicException("c2")
+        e1.loopCause = e2
+        e2.loopCause = e1
+        throw e1
+      },
+    )
+    assertEquals(true, cyclicPinned.hasRebind("example.com"))
+
+    // delegate 拋純 UnknownHostException（無 InterruptedException cause）但執行緒已帶中斷旗標：仍須透傳 CancellationException
+    val plainInterruptPinned = PinnedNetworkDns.forHost(
+      "example.com",
+      listOf(addr("203.0.113.10")),
+      delegate = HostResolver { host ->
+        Thread.currentThread().interrupt()
+        throw UnknownHostException(host)
+      },
+    )
+    try {
+      try {
+        plainInterruptPinned.hasRebind("example.com")
+        fail("plain UnknownHostException while interrupted must propagate CancellationException from hasRebind")
+      } catch (_: kotlinx.coroutines.CancellationException) {
+      }
+      assertTrue(Thread.interrupted())
+    } finally {
+      Thread.interrupted()
+    }
   }
 }

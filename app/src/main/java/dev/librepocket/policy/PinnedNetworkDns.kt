@@ -37,7 +37,11 @@ class PinnedNetworkDns(
 
   init {
     for ((host, addrs) in initialPinned) {
-      this.pinned[normalize(host)] = addrs.toList()
+      val key = normalize(host)
+      require(key.isNotBlank()) { "PINNED_DNS_HOST_BLANK" }
+      require(addrs.isNotEmpty()) { "PINNED_DNS_EMPTY" }
+      require(!this.pinned.containsKey(key)) { "PINNED_DNS_DUPLICATE_HOST" }
+      this.pinned[key] = addrs.toList()
     }
   }
 
@@ -45,10 +49,11 @@ class PinnedNetworkDns(
    *（不帶 hostname；host 只進 audit，不進錯誤字串／UI／transcript）。 */
   override fun lookup(hostname: String): List<InetAddress> {
     val key = normalize(hostname)
+    if (key.isBlank()) throw UnknownHostException("DNS_PIN_MISS")
     pinned[key]?.let { return it.toList() }
     if (strict) throw UnknownHostException("DNS_PIN_MISS")
-    val fresh = delegate.resolve(hostname)
-    if (fresh.isEmpty()) throw UnknownHostException(hostname)
+    val fresh = delegate.resolve(key)
+    if (fresh.isEmpty()) throw UnknownHostException(key)
     pinned[key] = fresh.toList()
     return fresh.toList()
   }
@@ -58,8 +63,10 @@ class PinnedNetworkDns(
 
   /** 釘住一組答案（覆寫舊值；呼叫方僅對已 `evaluateUrl` 放行的 host 使用）。 */
   fun pin(host: String, addresses: List<InetAddress>) {
+    val key = normalize(host)
+    require(key.isNotBlank()) { "PINNED_DNS_HOST_BLANK" }
     require(addresses.isNotEmpty()) { "PINNED_DNS_EMPTY" }
-    pinned[normalize(host)] = addresses.toList()
+    pinned[key] = addresses.toList()
   }
 
   /** 已釘住答案（防禦性拷貝），未釘住回 null。
@@ -74,13 +81,17 @@ class PinnedNetworkDns(
    */
   fun hasRebind(host: String): Boolean? {
     val key = normalize(host)
+    if (key.isBlank()) return null
     val old = pinned[key] ?: return null
     val fresh = try {
-      delegate.resolve(host)
+      delegate.resolve(key)
     } catch (e: Exception) {
       // 重查失敗 fail-closed：視為可疑，呼叫方重驗（回 true 比吞掉更安全）；
-      // 唯協程取消必須透傳，不可吞沒。
+      // 唯協程取消與中斷必須透傳，不可吞沒。
       if (e is CancellationException) throw e
+      if (NetworkPolicy.hasInterruptedCause(e) || Thread.currentThread().isInterrupted) {
+        throw CancellationException("rebind check interrupted", e)
+      }
       return true
     }
     if (fresh.isEmpty()) return true
@@ -97,11 +108,11 @@ class PinnedNetworkDns(
       var s = host.trim()
       while (true) {
         if (s.length >= 2 && s.startsWith('[') && s.endsWith(']')) {
-          s = s.substring(1, s.length - 1)
+          s = s.substring(1, s.length - 1).trim()
           continue
         }
         if (s.endsWith('.')) {
-          s = s.dropLast(1)
+          s = s.dropLast(1).trim()
           continue
         }
         break

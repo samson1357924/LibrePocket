@@ -1,6 +1,9 @@
 package dev.librepocket.shell
 
 import java.security.MessageDigest
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * 提權審計表（S3，BACKLOG D09，矩陣 §3/§4）。
@@ -56,6 +59,8 @@ class PrivilegeAuditLog {
     private val records = mutableListOf<PrivilegeAuditRecord>()
     private val lock = Any()
     private var seq: Long = 0L
+    private val _sizeFlow = MutableStateFlow(0)
+    val sizeFlow: StateFlow<Int> = _sizeFlow.asStateFlow()
 
     /**
      * 記一筆審計列（Phase D 單鎖不變量）：雜湊在鎖外先算好，
@@ -97,6 +102,7 @@ class PrivilegeAuditLog {
             // 有界審計表：超過上限丟棄最舊（seqId 單調遞增保證轉錄側可察覺空洞，
             // 見 MAX_RECORDS；與 seq 分配同鎖，故修剪恆刪最舊 seq）。
             while (records.size > MAX_RECORDS) records.removeAt(0)
+            _sizeFlow.value = records.size
             row
         }
     }
@@ -146,6 +152,7 @@ class PrivilegeAuditLog {
     fun revokeAll(): Int = synchronized(lock) {
         val n = records.size
         records.clear()
+        _sizeFlow.value = 0
         n
     }
 

@@ -15,6 +15,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -95,7 +96,7 @@ class PrivilegeBridgeRevokeRunnerTest {
 
     private fun rootRunner(state: PrivilegeBridgeState, spawn: SpawnCounter) = RootSuRunner(
         privateRoot = privateRoot,
-        bridgeGranted = { state.bridgeGranted },
+        bridgeGranted = { state.bridgeEffective },
         activationCheck = GrantFixtures.activationOn,
         spawn = spawn::spawn,
         suBinary = "/system/bin/su",
@@ -104,7 +105,7 @@ class PrivilegeBridgeRevokeRunnerTest {
 
     private fun shizukuRunner(state: PrivilegeBridgeState, spawn: SpawnCounter) = ShizukuShellRunner(
         privateRoot = privateRoot,
-        bridgeGranted = { state.bridgeGranted },
+        bridgeGranted = { state.bridgeEffective },
         activationCheck = GrantFixtures.activationOn,
         pingBinder = { true },
         spawn = spawn::spawn,
@@ -113,6 +114,7 @@ class PrivilegeBridgeRevokeRunnerTest {
     )
 
     private fun grantBoth(state: PrivilegeBridgeState) = runBlocking {
+        state.setBridgeSwitch(true)
         state.grant(bridgeStore, "provider-a", 1L)
         shizukuStore.save(ShizukuGrantPolicy.grant("provider-a", 1L, 15))
     }
@@ -214,7 +216,7 @@ class PrivilegeBridgeRevokeRunnerTest {
     }
 
     @Test fun bridgeExpiryRefreshDeniesWithoutSpawn() = runBlocking {
-        val state = PrivilegeBridgeState()
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
         // bridge 授權 1s 時效，Shizuku 授權不過期。
         state.grant(bridgeStore, "provider-a", 1L, ttlMs = 1_000L, atMs = 1_700_000_000_000L)
         shizukuStore.save(ShizukuGrantPolicy.grant("provider-a", 1L, 15))
@@ -236,5 +238,30 @@ class PrivilegeBridgeRevokeRunnerTest {
         assertTrue("$second", second is ElevatedBinaryResult.Denied)
         assertTrue("${(second as ElevatedBinaryResult.Denied).message}", second.message.contains("privilege bridge off"))
         assertEquals(1, spawn.calls)
+    }
+
+    @Test fun switchOffWithGrantActiveDeniesWithoutSpawn() = runBlocking {
+        val state = PrivilegeBridgeState(bridgeSwitchOn = false)
+        // Persist grants and update bridgeGranted to true
+        state.grant(bridgeStore, "provider-a", 1L)
+        shizukuStore.save(ShizukuGrantPolicy.grant("provider-a", 1L, 15))
+        assertTrue(state.bridgeGranted)
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse("bridgeEffective must be false when switch is off", state.bridgeEffective)
+
+        val spawn = SpawnCounter()
+        val root = rootRunner(state, spawn)
+        val rResult = root.runBinary(request(), 2_000L)
+        assertTrue("$rResult", rResult is ElevatedBinaryResult.Denied)
+        assertEquals(ShellDeny.NOT_WHITELISTED, (rResult as ElevatedBinaryResult.Denied).reason)
+        assertTrue("${rResult.message}", rResult.message.contains("privilege bridge off"))
+        assertEquals("zero spawn required when bridgeSwitchOn is false", 0, spawn.calls)
+
+        val shizuku = shizukuRunner(state, spawn)
+        val sResult = shizuku.runBinary(request(), 2_000L)
+        assertTrue("$sResult", sResult is ElevatedBinaryResult.Denied)
+        assertEquals(ShellDeny.NOT_WHITELISTED, (sResult as ElevatedBinaryResult.Denied).reason)
+        assertTrue("${sResult.message}", sResult.message.contains("privilege bridge off"))
+        assertEquals("zero spawn required when bridgeSwitchOn is false", 0, spawn.calls)
     }
 }

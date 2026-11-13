@@ -446,4 +446,124 @@ class ChatScreenVoiceLaunchTest {
         ).assertIsDisplayed()
         assertEquals(0, provider.streamCalls)
     }
+
+    @Test
+    fun sttResultOk_nullData_showsEmptyResultErrorWithoutPrefillOrSend() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.lastRequestCode, ActivityResult(Activity.RESULT_OK, null))
+        }
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithText(
+            VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_EMPTY_RESULT),
+        ).assertIsDisplayed()
+        assertEquals("", vm.input.value)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun sttResultOk_malformedResultsExtra_showsEmptyResultErrorWithoutCrash() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+
+        val malformedIntent = Intent().putExtra(RecognizerIntent.EXTRA_RESULTS, "bad")
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.lastRequestCode, ActivityResult(Activity.RESULT_OK, malformedIntent))
+        }
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithText(
+            VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_EMPTY_RESULT),
+        ).assertIsDisplayed()
+        assertEquals("", vm.input.value)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun sttResultNonOkNonCanceled_keepsManualInputWithoutErrorOrSend() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        vm.onInputChange("手動草稿")
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+
+        composeRule.runOnIdle {
+            registry.dispatchResult(
+                registry.lastRequestCode,
+                ActivityResult(Activity.RESULT_FIRST_USER, null),
+            )
+        }
+        composeRule.waitForIdle()
+
+        assertEquals("手動草稿", vm.input.value)
+        composeRule.onAllNodesWithText("做不到", substring = true).assertCountEquals(0)
+        assertEquals(0, provider.streamCalls)
+    }
 }

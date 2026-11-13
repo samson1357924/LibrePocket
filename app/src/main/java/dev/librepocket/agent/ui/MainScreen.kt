@@ -189,6 +189,7 @@ fun MainScreen(
     }
 
     // C2 session 語音喚起路由與邊界守衛（單一來源見 AssistVoiceCoordinator / shouldDeliverVoiceToChat）。
+    // drawerState 由 coordinator 負責在投遞前收斂至完全關閉；delivery gate 另行要求 target/current 皆為 Closed。
     AssistVoiceCoordinator(
         assistVoiceRequested = assistVoiceRequested,
         hasEndpoint = hasEndpoint,
@@ -260,6 +261,9 @@ fun MainScreen(
                 viewModel = chatViewModel,
                 onOpenSettings = { goSetupForEdit() },
                 onTurnFinished = { sessionListViewModel.refresh() },
+                // Safety net for coordinator key omissions/in-flight transitions: only deliver when CHAT,
+                // endpoint/nav are ready, no readonly transcript overlay (viewedSessionId excluded), and
+                // drawer is fully closed (current+target). Coordinator routes/clears; this gate blocks misdelivery.
                 voiceInputRequested = shouldDeliverVoiceToChat(
                     assistVoiceRequested = assistVoiceRequested,
                     currentRoute = currentRoute,

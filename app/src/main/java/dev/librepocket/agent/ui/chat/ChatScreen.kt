@@ -306,10 +306,10 @@ fun ChatScreen(
     val sttLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
-        if (AssistantVoice.AUTO_SEND_AFTER_VOICE) {
-            // locked off by policy
-            return@rememberLauncherForActivityResult
-        }
+        // TODO(#137): implement explicit auto-send handling before enabling; do not discard prefill results.
+        // Runtime contract today: voice results are prefill-only. Even if AUTO_SEND_AFTER_VOICE is
+        // flipped prematurely, never silently drop STT results—prefill/error handling below must still run.
+        val autoSendAfterVoice = AssistantVoice.AUTO_SEND_AFTER_VOICE
         if (result.resultCode == Activity.RESULT_OK) {
             val candidates = try {
                 result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
@@ -320,6 +320,9 @@ fun ChatScreen(
             if (text != null) {
                 voiceErrors.onSttSuccess()
                 viewModel.prefill(text)
+                if (autoSendAfterVoice) {
+                    // TODO(#137): wire explicit user-confirmed send here; intentionally no-op for now.
+                }
             } else {
                 voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_EMPTY_RESULT))
             }

@@ -62,6 +62,9 @@ object AssistantVoice {
      * C2 回填語義（純函數，JVM 可測）：辨識候選取首條非空正文並截斷至
      * [EntryNormalize.MAX_TEXT_LENGTH]（4000 字）；
      * 無結果回 null（呼叫方留手動輸入，不報錯不自動送出）。
+     *
+     * trim/empty 檢查為防禦性邊界：涵蓋 [VoiceStt.pickResult] 契約與未修剪／純空白候選，
+     * 長度上限則維持 prefill-only 邊界（不自動送出，亦不接受超長回填）。
      */
     fun resolveVoicePrefill(results: List<String>?): String? =
         VoiceStt.pickResult(results)

@@ -16,6 +16,7 @@ import dev.librepocket.tool.ToolRegistry
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.coroutineContext
@@ -115,7 +116,9 @@ object ElevatedWiring {
     private suspend fun <T> evalBounded(block: () -> T): T? {
         return try {
             withContext(Dispatchers.IO) {
-                withTimeoutOrNull(SUPPLIER_TIMEOUT_MS) { block() }
+                withTimeoutOrNull(SUPPLIER_TIMEOUT_MS) {
+                    runInterruptible { block() }
+                }
             }
         } catch (e: CancellationException) {
             throw e

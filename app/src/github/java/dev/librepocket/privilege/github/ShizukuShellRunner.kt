@@ -251,7 +251,7 @@ class ShizukuShellRunner(
         // Round-3 Phase H（P2-6）：deadline 計算本身不觸碰 argv（純算術），故置於
         // 快照之前——快照拷貝（含阻塞 iterator）納入同一 deadline 監督（見下）。
         val safeTimeoutMs = timeoutMs.coerceAtLeast(0L).coerceAtMost(Long.MAX_VALUE / 1_000_000L)
-        val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(safeTimeoutMs)
+        val deadlineNanos = ElevatedCallSupervisor.computeDeadlineNanos(timeoutMs)
         // P1-3 入口 preflight（PR140 Phase 2）：`safeTimeoutMs<=0` 即 budget 全無，
         // 不佔席不耗 quota，直回 `TimedOut(cleanupIncomplete=false)`（worker 從未啟動，
         // 無 late 缺口）。timeoutMs=0 仍可能 spawn 的舊缺口即在此封（見 Phase2 迴歸）。
@@ -329,6 +329,7 @@ class ShizukuShellRunner(
             is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                 ShellDeny.BLACKLISTED,
                 "elevated snapshot failed (fail-closed, no spawn)",
+                cleanupIncomplete = ElevatedRunnerCommon.preSpawnLinger(snapshotRes.hasLinger),
             )
             is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(
                 timeoutMs,
@@ -347,6 +348,7 @@ class ShizukuShellRunner(
             is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                 ShellDeny.NOT_WHITELISTED,
                 "privilege bridge check failed (fail-closed, no spawn)",
+                cleanupIncomplete = ElevatedRunnerCommon.preSpawnLinger(bridgeRes.hasLinger),
             )
             is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, ElevatedRunnerCommon.preSpawnLinger(bridgeRes.hasLinger))
         }
@@ -375,6 +377,7 @@ class ShizukuShellRunner(
             is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                 ShellDeny.NOT_WHITELISTED,
                 "validation check failed (fail-closed, no spawn)",
+                cleanupIncomplete = ElevatedRunnerCommon.preSpawnLinger(validateRes.hasLinger),
             )
             is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(
                 timeoutMs,
@@ -382,7 +385,10 @@ class ShizukuShellRunner(
             )
         }
         when (validated) {
-            is Validation.Denied -> return ElevatedBinaryResult.Denied(validated.reason, validated.message)
+            is Validation.Denied -> return ElevatedBinaryResult.Denied(
+                validated.reason,
+                Redactor.redactError(validated.message),
+            )
             is Validation.Allowed -> Unit
         }
         if (reasonSnapshot.isBlank()) {
@@ -408,12 +414,13 @@ class ShizukuShellRunner(
                 is ShellExecutables.ResolveOutcome.Denied ->
                     return ElevatedBinaryResult.Denied(
                         ShellDeny.BLACKLISTED,
-                        "untrusted executable: ${argvSnapshot[0].trim()} (reason=${outcome.reason})",
+                        "untrusted executable: ${Redactor.redactError(argvSnapshot[0].trim())} (reason=${outcome.reason})",
                     )
             }
             is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                 ShellDeny.BLACKLISTED,
-                "untrusted executable: ${argvSnapshot[0].trim()} (reason=NOT_FOUND)",
+                "untrusted executable: ${Redactor.redactError(argvSnapshot[0].trim())} (reason=NOT_FOUND)",
+                cleanupIncomplete = ElevatedRunnerCommon.preSpawnLinger(resolvedRes.hasLinger),
             )
             is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, ElevatedRunnerCommon.preSpawnLinger(resolvedRes.hasLinger))
         }
@@ -426,6 +433,7 @@ class ShizukuShellRunner(
             is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                 ShellDeny.NOT_WHITELISTED,
                 "grant check failed (fail-closed, no spawn)",
+                cleanupIncomplete = ElevatedRunnerCommon.preSpawnLinger(grantRes.hasLinger),
             )
             is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, ElevatedRunnerCommon.preSpawnLinger(grantRes.hasLinger))
         }
@@ -441,6 +449,7 @@ class ShizukuShellRunner(
             is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                 ShellDeny.NOT_WHITELISTED,
                 "activation check failed (fail-closed, no spawn)",
+                cleanupIncomplete = ElevatedRunnerCommon.preSpawnLinger(activatedRes.hasLinger),
             )
             is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, ElevatedRunnerCommon.preSpawnLinger(activatedRes.hasLinger))
         }
@@ -462,13 +471,18 @@ class ShizukuShellRunner(
         // 皆為同步 Binder IPC，可無限等；跑監督 worker，超界／取消即 TimedOut
         // 零 spawn（抛異常仍折 BinderUnreachable Denied，見下；快路徑不額外調鉤）。
         val statusRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) { status() }
+        val statusErrLinger = if (statusRes is ElevatedCallSupervisor.Res.Err) {
+            ElevatedRunnerCommon.preSpawnLinger(statusRes.hasLinger)
+        } else {
+            false
+        }
         val curStatus = when (statusRes) {
             is ElevatedCallSupervisor.Res.Ok -> statusRes.v
             is ElevatedCallSupervisor.Res.Err -> ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN)
             is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, ElevatedRunnerCommon.preSpawnLinger(statusRes.hasLinger))
         }
         ShizukuStatusGate.denyFor(curStatus)
-            ?.let { return ElevatedBinaryResult.Denied(it.reason, it.message) }
+            ?.let { return ElevatedBinaryResult.Denied(it.reason, it.message, cleanupIncomplete = statusErrLinger) }
         // B3 註記：第二准入已前移至入口（單一 `tryEnterReserved`，見上）；
         // 此處不再二次准入，仍在同一 `try { ... } finally { leaveCall() }` 內。
         // （B1/B2 語義不變：快照／身分／三點取消／verify 皆保留）。
@@ -481,6 +495,7 @@ class ShizukuShellRunner(
                 is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                     ShellDeny.NOT_WHITELISTED,
                     "grant check failed (fail-closed, no spawn)",
+                    cleanupIncomplete = ElevatedRunnerCommon.preSpawnLinger(reGrantRes.hasLinger),
                 )
                 is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, ElevatedRunnerCommon.preSpawnLinger(reGrantRes.hasLinger))
             }
@@ -494,6 +509,7 @@ class ShizukuShellRunner(
                 is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                     ShellDeny.NOT_WHITELISTED,
                     "activation check failed (fail-closed, no spawn)",
+                    cleanupIncomplete = ElevatedRunnerCommon.preSpawnLinger(reActivatedRes.hasLinger),
                 )
                 is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, ElevatedRunnerCommon.preSpawnLinger(reActivatedRes.hasLinger))
             }
@@ -509,6 +525,7 @@ class ShizukuShellRunner(
                 is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                     ShellDeny.NOT_WHITELISTED,
                     "privilege bridge check failed (fail-closed, no spawn)",
+                    cleanupIncomplete = ElevatedRunnerCommon.preSpawnLinger(reBridgeRes.hasLinger),
                 )
                 is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, ElevatedRunnerCommon.preSpawnLinger(reBridgeRes.hasLinger))
             }
@@ -521,13 +538,18 @@ class ShizukuShellRunner(
             // status 重估（B3 有界，同早段門語義：抛異常折 BinderUnreachable，denyFor 映射；
             // 超界／取消即 TimedOut 零 spawn）。
             val reStatusRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) { status() }
+            val reStatusErrLinger = if (reStatusRes is ElevatedCallSupervisor.Res.Err) {
+                ElevatedRunnerCommon.preSpawnLinger(reStatusRes.hasLinger)
+            } else {
+                false
+            }
             val reStatus = when (reStatusRes) {
                 is ElevatedCallSupervisor.Res.Ok -> reStatusRes.v
                 is ElevatedCallSupervisor.Res.Err -> ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN)
                 is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, ElevatedRunnerCommon.preSpawnLinger(reStatusRes.hasLinger))
             }
             ShizukuStatusGate.denyFor(reStatus)
-                ?.let { return ElevatedBinaryResult.Denied(it.reason, it.message) }
+                ?.let { return ElevatedBinaryResult.Denied(it.reason, it.message, cleanupIncomplete = reStatusErrLinger) }
             // P1-1 spawn 前重驗 executable（B3 有界）：縮小驗過→spawn 窗口。
             // 同一解析再跑一次並比全字段，不一致／失敗即拒且零 spawn（配額尚未扣除）。
             val reResolvedRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) {
@@ -543,7 +565,8 @@ class ShizukuShellRunner(
                 is ElevatedCallSupervisor.Res.Ok -> reResolvedRes.v
                 is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                     ShellDeny.BLACKLISTED,
-                    "untrusted executable: ${argvSnapshot[0].trim()} (reason=NOT_FOUND)",
+                    "untrusted executable: ${Redactor.redactError(argvSnapshot[0].trim())} (reason=NOT_FOUND)",
+                    cleanupIncomplete = ElevatedRunnerCommon.preSpawnLinger(reResolvedRes.hasLinger),
                 )
                 is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, ElevatedRunnerCommon.preSpawnLinger(reResolvedRes.hasLinger))
             }
@@ -552,13 +575,13 @@ class ShizukuShellRunner(
                 is ShellExecutables.ResolveOutcome.Denied ->
                     return ElevatedBinaryResult.Denied(
                         ShellDeny.BLACKLISTED,
-                        "untrusted executable: ${argvSnapshot[0].trim()} (reason=${reOutcome.reason})",
+                        "untrusted executable: ${Redactor.redactError(argvSnapshot[0].trim())} (reason=${reOutcome.reason})",
                     )
             }
             if (reResolved != resolvedExec) {
                 return ElevatedBinaryResult.Denied(
                     ShellDeny.BLACKLISTED,
-                    "untrusted executable: ${argvSnapshot[0].trim()} (reason=REVERIFY_MISMATCH)",
+                    "untrusted executable: ${Redactor.redactError(argvSnapshot[0].trim())} (reason=REVERIFY_MISMATCH)",
                 )
             }
             // P1-4 spawn 前最終取消檢查：重驗後、配額前再驗一次，
@@ -595,11 +618,14 @@ class ShizukuShellRunner(
                 is ElevatedCallSupervisor.Res.Err -> {
                     val e = spawnRes.t
                     val redacted = Redactor.redactError(e.message ?: e.javaClass.simpleName)
-                    return ElevatedBinaryResult.Failed("shizuku spawn failed: $redacted")
+                    return ElevatedBinaryResult.Failed(
+                        "shizuku spawn failed: $redacted",
+                        cleanupIncomplete = ElevatedRunnerCommon.preSpawnLinger(spawnRes.hasLinger),
+                    )
                 }
                 is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(
                     timeoutMs,
-                    spawnRes.hasLinger,
+                    ElevatedRunnerCommon.preSpawnLinger(spawnRes.hasLinger),
                 )
             }
             // R1-A 雙軌＋U2-B stderr 獨立小 cap：截圖 stdout 即 8M 軌，stderr 維持

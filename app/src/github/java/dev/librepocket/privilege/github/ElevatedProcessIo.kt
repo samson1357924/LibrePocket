@@ -365,7 +365,9 @@ internal object ElevatedCleanupTracker {
      *   記錄，[SWEEP_PER_HANDLE_COOLDOWN_MS] 內跳過同 handle，避免對同一 stall
      *   handle 高頻起線程；成功解除或 [clearUnverified] 即移除對應條目防洩漏）。
      */
+    private var hasLastSweepStart: Boolean = false
     private var lastSweepStartNanos: Long = 0L
+    private var sweepGeneration: Long = 0L
     private val lastAttemptNanos = IdentityHashMap<Process, Long>()
 
     /**
@@ -619,47 +621,61 @@ internal object ElevatedCleanupTracker {
      */
     internal fun kickSweepAsync(
         nowNanos: () -> Long = { System.nanoTime() },
+    ): Boolean = kickSweepAsyncWithThreadStarter(nowNanos = nowNanos)
+
+    internal fun kickSweepAsyncWithThreadStarter(
+        nowNanos: () -> Long = { System.nanoTime() },
+        startThread: (Thread) -> Unit = { it.start() },
     ): Boolean {
-        val now: Long = try {
-            nowNanos()
-        } catch (_: Exception) {
-            System.nanoTime()
-        }
-        val snapshot: List<Process> = synchronized(lock) {
+        val snapshot: List<Process>
+        val prevHasStart: Boolean
+        val prevStart: Long
+        val claimedGeneration: Long
+        synchronized(lock) {
             if (quarantine.isEmpty()) return false
             val filtered = quarantine.filter { q -> sweepPending.none { it === q } }
             if (filtered.isEmpty()) return false
-            if (lastSweepStartNanos != 0L &&
-                now - lastSweepStartNanos < TimeUnit.MILLISECONDS.toNanos(SWEEP_COOLDOWN_MS)
+            val now: Long = try {
+                nowNanos()
+            } catch (_: Throwable) {
+                System.nanoTime()
+            }
+            prevHasStart = hasLastSweepStart
+            prevStart = lastSweepStartNanos
+            if (prevHasStart &&
+                now - prevStart < TimeUnit.MILLISECONDS.toNanos(SWEEP_COOLDOWN_MS)
             ) {
                 return false
             }
-            filtered
+            if (!sweepLease.compareAndSet(false, true)) return false
+            claimedGeneration = sweepGeneration
+            hasLastSweepStart = true
+            lastSweepStartNanos = now
+            snapshot = filtered
         }
-        if (snapshot.isEmpty()) return false
-        if (!sweepLease.compareAndSet(false, true)) return false
-        synchronized(lock) {
-            val start: Long = try {
-                nowNanos()
-            } catch (_: Exception) {
-                System.nanoTime()
-            }
-            lastSweepStartNanos = start
-        }
-        val worker = Thread({
-            try {
-                sweepEntries(snapshot, nowNanos)
-            } catch (_: Throwable) {
-                // 背景重掃永不抛向呼叫方（lease 照常釋放，quarantine 保持）。
-            } finally {
-                sweepLease.set(false)
-            }
-        }, "elevated-quarantine-sweep")
-        worker.isDaemon = true
         try {
-            worker.start()
+            val worker = Thread({
+                try {
+                    sweepEntries(snapshot, nowNanos)
+                } catch (_: Throwable) {
+                    // 背景重掃永不抛向呼叫方（lease 照常釋放，quarantine 保持）。
+                } finally {
+                    sweepLease.set(false)
+                }
+            }, "elevated-quarantine-sweep")
+            worker.isDaemon = true
+            startThread(worker)
         } catch (_: Throwable) {
-            sweepLease.set(false)
+            synchronized(lock) {
+                try {
+                    if (sweepGeneration == claimedGeneration) {
+                        hasLastSweepStart = prevHasStart
+                        lastSweepStartNanos = prevStart
+                    }
+                } finally {
+                    sweepLease.set(false)
+                }
+            }
             return false
         }
         return true
@@ -686,7 +702,7 @@ internal object ElevatedCleanupTracker {
         for (p in snapshot) {
             val now: Long = try {
                 nowNanos()
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
                 System.nanoTime()
             }
             var shouldAttempt = false
@@ -738,30 +754,31 @@ internal object ElevatedCleanupTracker {
             sweepPending.add(p)
         }
         val holder = AtomicReference<Boolean?>()
-        val worker = Thread({
-            try {
-                val exited = try {
-                    p.waitFor(0L, TimeUnit.MILLISECONDS)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    false
-                } catch (_: Exception) {
-                    false
+        val worker = try {
+            Thread({
+                try {
+                    val exited = try {
+                        p.waitFor(0L, TimeUnit.MILLISECONDS)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        false
+                    } catch (_: Exception) {
+                        false
+                    }
+                    holder.set(exited)
+                } catch (_: Throwable) {
+                    holder.set(false)
+                } finally {
+                    synchronized(lock) {
+                        val idx = sweepPending.indexOfFirst { it === p }
+                        if (idx >= 0) sweepPending.removeAt(idx)
+                    }
                 }
-                holder.set(exited)
-            } catch (_: Throwable) {
-                holder.set(false)
-            } finally {
-                synchronized(lock) {
-                    val idx = sweepPending.indexOfFirst { it === p }
-                    if (idx >= 0) sweepPending.removeAt(idx)
-                }
+            }, "elevated-quarantine-verify").also {
+                it.isDaemon = true
+                it.start()
             }
-        }, "elevated-quarantine-verify")
-        worker.isDaemon = true
-        try {
-            worker.start()
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             synchronized(lock) {
                 val idx = sweepPending.indexOfFirst { it === p }
                 if (idx >= 0) sweepPending.removeAt(idx)
@@ -813,7 +830,9 @@ internal object ElevatedCleanupTracker {
         synchronized(lock) {
             quarantine.clear()
             lastAttemptNanos.clear()
+            hasLastSweepStart = false
             lastSweepStartNanos = 0L
+            sweepGeneration++
         }
     }
 
@@ -1015,7 +1034,7 @@ internal object ElevatedCallSupervisor {
 
     sealed interface Res<out T> {
         data class Ok<T>(val v: T) : Res<T>
-        data class Err(val t: Throwable) : Res<Nothing>
+        data class Err(val t: Throwable, val hasLinger: Boolean = false) : Res<Nothing>
         /**
          * P1-2 殘留提示（PR140 Phase 2）：`hasLinger=true` 表示 supervisor worker
          * 在 grace 後仍存活（late 值仍可能送達）或曾交付逾期值。
@@ -1038,17 +1057,33 @@ internal object ElevatedCallSupervisor {
      * 單測傳假時鐘＋latch 排序做「worker 在 deadline 邊緣交付但 caller 延遲醒來」
      * 的確定性迴歸（不靠 sleep 猜調度窗口）。產品呼叫沿用預設，不傳參。
      */
+    internal fun computeDeadlineNanos(
+        timeoutMs: Long,
+        nowNanos: () -> Long = { System.nanoTime() },
+    ): Long {
+        val now = nowNanos()
+        if (timeoutMs <= 0L) return now
+        val delta = try {
+            Math.multiplyExact(timeoutMs.coerceAtLeast(0L), 1_000_000L)
+        } catch (_: ArithmeticException) {
+            Long.MAX_VALUE / 2
+        }
+        return try {
+            Math.addExact(now, delta)
+        } catch (_: ArithmeticException) {
+            Long.MAX_VALUE
+        }
+    }
+
     fun remainingMs(
         deadlineNanos: Long,
         nowNanos: () -> Long = { System.nanoTime() },
-    ): Long =
-        TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L)
+    ): Long = TimeUnit.NANOSECONDS.toMillis((deadlineNanos - nowNanos()).coerceAtLeast(0L))
 
     fun isExpired(
         deadlineNanos: Long,
         nowNanos: () -> Long = { System.nanoTime() },
-    ): Boolean =
-        (deadlineNanos - nowNanos()) <= 0L
+    ): Boolean = (deadlineNanos - nowNanos()) <= 0L
 
     /**
      * spawn 前阻塞體有界（grant／activation／bridge／status／suExists 共用；
@@ -1065,9 +1100,9 @@ internal object ElevatedCallSupervisor {
      * - 慢路徑每 [POLL_MS] 查 `interrupt`／緩存 bit／deadline，命中即
      *   `interrupt`＋grace，仍存活即 lingering（`markLingering`＋`noteUnclean`，
      *   無 drain 終審故此處直接計入 breaker；watcher 殘留同計，單 call 恰好一次）；
-     *   `Expired.hasLinger` 即 block worker grace 後仍存活（watcher 殘留不穿透，
-     *   非 spawn 呼叫方經 [ElevatedRunnerCommon.preSpawnLinger] 映射旗標，
-     *   見 R3-PhaseG P2-4 契約）；
+     *   `Expired.hasLinger` 即 block worker 或 watcher grace 後仍存活
+     *   （`lingering || watchLingering`；非 spawn 呼叫方經
+     *   [ElevatedRunnerCommon.preSpawnLinger] 映射旗標，見 R3-PhaseG P2-4 契約）；
      * - R3-PhaseG P2-2 快路徑 postcheck：watcher 從未啟動的 `Ok` 返回前重驗
      *   deadline＋呼叫執行緒中斷（worker 在 deadline 後交付但 caller 延遲醒來
      *   不得回 Ok，逾期即 `Expired` 丟棄交付值，非 spawn 無 owner 缺口）；
@@ -1175,38 +1210,8 @@ internal object ElevatedCallSupervisor {
         // caller 阻塞期間時 worker 見 expired==false 留 Val，caller 仍須等取消明確後
         // 才經 expireWorker CAS 認領，不可提前 Ok）。
         private val seenFalse = AtomicBoolean(false)
-        private val worker = Thread({
-            try {
-                while (!done.get() && !isExpired(deadlineNanos, nowNanos)) {
-                    val cancel: Boolean? = try {
-                        hook()
-                    } catch (_: Exception) {
-                        runCatching { ElevatedProcessIo.swallowedIsCancelledThrows.incrementAndGet() }
-                        if (throwMeansCancelled) true else null
-                    }
-                    if (cancel == true) {
-                        bit.set(true)
-                        break
-                    }
-                    if (cancel == false) seenFalse.set(true)
-                    if (done.get()) break
-                    try {
-                        Thread.sleep(POLL_MS)
-                    } catch (_: InterruptedException) {
-                        break
-                    }
-                }
-            } finally {
-                synchronized(state) {
-                    if (state.get() == 1) {
-                        state.set(2)
-                        ElevatedCleanupTracker.releaseSlot()
-                    } else if (state.get() == 0) {
-                        state.set(2)
-                    }
-                }
-            }
-        }, "elevated-supervisor")
+        @Volatile
+        private var worker: Thread? = null
 
         /** 受信原子讀：caller 輪詢專用（永不拋，永不阻塞）。 */
         fun bit(): Boolean = bit.get()
@@ -1220,11 +1225,62 @@ internal object ElevatedCallSupervisor {
 
         /** 啟動 watcher（呼叫方須已持全域席位，慢輪詢 worker 皆受槽管控，見兩 runner 准入順序）。 */
         fun start() {
-            worker.isDaemon = true
             try {
-                worker.start()
-            } catch (_: Exception) {
+                val t = Thread({
+                    try {
+                        while (!done.get()) {
+                            val expiredNow = try {
+                                isExpired(deadlineNanos, nowNanos)
+                            } catch (_: Throwable) {
+                                bit.set(true)
+                                break
+                            }
+                            if (expiredNow) break
+                            val cancel: Boolean? = try {
+                                hook()
+                            } catch (t: Throwable) {
+                                runCatching { ElevatedProcessIo.swallowedIsCancelledThrows.incrementAndGet() }
+                                if (throwMeansCancelled) {
+                                    bit.set(true)
+                                    if (t is VirtualMachineError && t !is OutOfMemoryError) throw t
+                                    true
+                                } else {
+                                    if (t is VirtualMachineError && t !is OutOfMemoryError) throw t
+                                    null
+                                }
+                            }
+                            if (cancel == true) {
+                                bit.set(true)
+                                break
+                            }
+                            if (cancel == false) seenFalse.set(true)
+                            if (done.get()) break
+                            try {
+                                Thread.sleep(POLL_MS)
+                            } catch (_: InterruptedException) {
+                                break
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        if (throwMeansCancelled) bit.set(true)
+                        if (t is VirtualMachineError && t !is OutOfMemoryError) throw t
+                    } finally {
+                        synchronized(state) {
+                            if (state.get() == 1) {
+                                state.set(2)
+                                ElevatedCleanupTracker.releaseSlot()
+                            } else if (state.get() == 0) {
+                                state.set(2)
+                            }
+                        }
+                    }
+                }, "elevated-supervisor")
+                t.isDaemon = true
+                worker = t
+                t.start()
+            } catch (_: Throwable) {
                 // 起線程失敗即 fail-closed：再無求值能證明未取消，置位由呼叫方收斂。
+                worker = null
                 bit.set(true)
             }
         }
@@ -1246,14 +1302,15 @@ internal object ElevatedCallSupervisor {
          */
         fun close(): Boolean {
             done.set(true)
-            runCatching { worker.interrupt() }
+            val w = worker ?: return false
+            runCatching { w.interrupt() }
             try {
-                worker.join(GRACE_MS)
+                w.join(GRACE_MS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
-            return if (worker.isAlive) {
-                ElevatedCleanupTracker.markLingering(worker, state)
+            return if (w.isAlive) {
+                ElevatedCleanupTracker.markLingering(w, state)
                 true
             } else {
                 false
@@ -1315,9 +1372,11 @@ internal object ElevatedCallSupervisor {
         nowNanos: () -> Long = { System.nanoTime() },
         block: () -> T,
     ): Res<T> {
-        val deadlineNanos = nowNanos() + TimeUnit.MILLISECONDS.toNanos(
-            timeoutMs.coerceAtLeast(0L).coerceAtMost(Long.MAX_VALUE / 1_000_000L),
-        )
+        val deadlineNanos = try {
+            computeDeadlineNanos(timeoutMs, nowNanos)
+        } catch (_: Throwable) {
+            return Res.Expired(hasLinger = false)
+        }
         return awaitInternal(
             deadlineNanos = deadlineNanos,
             cancelCheck = { Thread.currentThread().isInterrupted || isExpired(deadlineNanos, nowNanos) },
@@ -1348,30 +1407,36 @@ internal object ElevatedCallSupervisor {
         nowNanos: () -> Long = { System.nanoTime() },
     ): Res<T> {
         // P1-3 入口 preflight：budget 已盡即不啟 worker（零執行緒、零殘留）。
-        if (isExpired(deadlineNanos, nowNanos)) return Res.Expired(hasLinger = false)
+        val preExpired = try {
+            isExpired(deadlineNanos, nowNanos)
+        } catch (_: Throwable) {
+            true
+        }
+        if (preExpired) return Res.Expired(hasLinger = false)
         val holder = AtomicReference<Any?>()
         val state = AtomicInteger(0)
-        val worker = Thread({
-            try {
-                val v = block()
-                holder.set(Val(v))
-            } catch (t: Throwable) {
-                holder.set(Thr(t))
-            } finally {
-                synchronized(state) {
-                    if (state.get() == 1) {
-                        state.set(2)
-                        ElevatedCleanupTracker.releaseSlot()
-                    } else if (state.get() == 0) {
-                        state.set(2)
+        val worker = try {
+            Thread({
+                try {
+                    val v = block()
+                    holder.set(Val(v))
+                } catch (t: Throwable) {
+                    holder.set(Thr(t))
+                } finally {
+                    synchronized(state) {
+                        if (state.get() == 1) {
+                            state.set(2)
+                            ElevatedCleanupTracker.releaseSlot()
+                        } else if (state.get() == 0) {
+                            state.set(2)
+                        }
                     }
                 }
+            }, threadName).also {
+                it.isDaemon = true
+                it.start()
             }
-        }, threadName)
-        worker.isDaemon = true
-        try {
-            worker.start()
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             return Res.Expired(hasLinger = false)
         }
         // R3-PhaseF P2-1：慢輪詢 hook 觀察者（惰性：首片後 block 仍存活才啟動；
@@ -1382,13 +1447,17 @@ internal object ElevatedCallSupervisor {
             if (Thread.currentThread().isInterrupted) return true
             val w = watch
             if (w != null && w.bit()) return true
-            return isExpired(deadlineNanos, nowNanos)
+            return try {
+                isExpired(deadlineNanos, nowNanos)
+            } catch (_: Throwable) {
+                true
+            }
         }
         // 無 hook 呼叫方（awaitTimeout／verify 系）：沿既有用中斷＋deadline 判定。
         fun legacyCancel(): Boolean =
             try {
                 cancelCheck()
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
                 true
             }
         // R3-PhaseF：殘留關閉（冪等，只記槽不計數；計數由各返回點
@@ -1412,7 +1481,7 @@ internal object ElevatedCallSupervisor {
                     if ((lingering || watchLingering) && markUncleanOnLinger) {
                         ElevatedCleanupTracker.noteUnclean()
                     }
-                    return Res.Expired(hasLinger = lingering)
+                    return Res.Expired(hasLinger = lingering || watchLingering)
                 }
                 if (!worker.isAlive) {
                     val h = holder.get()
@@ -1427,7 +1496,7 @@ internal object ElevatedCallSupervisor {
                         val w = watch
                         val cancelEvidence = try {
                             cancelNow()
-                        } catch (_: Exception) {
+                        } catch (_: Throwable) {
                             true
                         }
                         if (cancelEvidence) {
@@ -1443,7 +1512,7 @@ internal object ElevatedCallSupervisor {
                             if ((lingering || watchLingering) && markUncleanOnLinger) {
                                 ElevatedCleanupTracker.noteUnclean()
                             }
-                            return Res.Expired(hasLinger = lingering)
+                            return Res.Expired(hasLinger = lingering || watchLingering)
                         } else if (w.observedFalse()) {
                             // G1(a)＋caller-claim 合成：曾見明確 false＋無取消證據即
                             // Ok handoff；unknown（watcher 首求值即阻塞，從未見 false）
@@ -1466,10 +1535,10 @@ internal object ElevatedCallSupervisor {
                             val stickyCancelled = w.bit()
                             val edgeOverdue = try {
                                 isExpired(deadlineNanos, nowNanos)
-                            } catch (_: Exception) {
+                            } catch (_: Throwable) {
                                 true
                             } || Thread.currentThread().isInterrupted || stickyCancelled
-                            if (watchLingering || edgeOverdue) return Res.Expired(hasLinger = false)
+                            if (watchLingering || edgeOverdue) return Res.Expired(hasLinger = watchLingering)
                             @Suppress("UNCHECKED_CAST")
                             return Res.Ok((h as Val<T>).v)
                         }
@@ -1483,18 +1552,18 @@ internal object ElevatedCallSupervisor {
                         if (h is Val<*>) {
                             val overdue = try {
                                 isExpired(deadlineNanos, nowNanos)
-                            } catch (_: Exception) {
+                            } catch (_: Throwable) {
                                 true
                             } || Thread.currentThread().isInterrupted
-                            if (overdue) return Res.Expired(hasLinger = false)
+                            if (overdue) return Res.Expired(hasLinger = watchLingering)
                         }
                         return when (h) {
                             is Val<*> -> {
                                 @Suppress("UNCHECKED_CAST")
                                 Res.Ok((h as Val<T>).v)
                             }
-                            is Thr -> Res.Err(h.t)
-                            else -> Res.Err(IllegalStateException("supervisor worker died without result"))
+                            is Thr -> Res.Err(h.t, watchLingering)
+                            else -> Res.Err(IllegalStateException("supervisor worker died without result"), watchLingering)
                         }
                     }
                 }
@@ -1503,7 +1572,7 @@ internal object ElevatedCallSupervisor {
                 }
                 val shouldExpire = try {
                     if (hook != null) cancelNow() else legacyCancel()
-                } catch (_: Exception) {
+                } catch (_: Throwable) {
                     true
                 }
                 if (shouldExpire) {
@@ -1519,7 +1588,7 @@ internal object ElevatedCallSupervisor {
                     if ((lingering || watchLingering) && markUncleanOnLinger) {
                         ElevatedCleanupTracker.noteUnclean()
                     }
-                    return Res.Expired(hasLinger = lingering)
+                    return Res.Expired(hasLinger = lingering || watchLingering)
                 }
                 // Val pending 但 unknown（watcher 從未見 false、亦無取消證據）：
                 // worker 已死（join 瞬時返回），睡一片避免空轉，等 hook 明確／
@@ -1532,11 +1601,11 @@ internal object ElevatedCallSupervisor {
                         runCatching { worker.interrupt() }
                         val watchLingering = closeWatch()
                         if (watchLingering && markUncleanOnLinger) ElevatedCleanupTracker.noteUnclean()
-                        return Res.Expired(hasLinger = false)
+                        return Res.Expired(hasLinger = watchLingering)
                     }
                 }
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             runCatching { worker.interrupt() }
             try {
                 worker.join(GRACE_MS)
@@ -1549,7 +1618,7 @@ internal object ElevatedCallSupervisor {
             if ((lingering || watchLingering) && markUncleanOnLinger) {
                 ElevatedCleanupTracker.noteUnclean()
             }
-            return Res.Expired(hasLinger = lingering)
+            return Res.Expired(hasLinger = lingering || watchLingering)
         }
     }
 
@@ -1618,7 +1687,12 @@ internal object ElevatedCallSupervisor {
         block: () -> Process,
     ): Res<Process> {
         // P1-3 入口 preflight：budget 已盡即不提交 spawn（零特權進程）。
-        if (isExpired(deadlineNanos, nowNanos)) return Res.Expired(hasLinger = false)
+        val preExpired = try {
+            isExpired(deadlineNanos, nowNanos)
+        } catch (_: Throwable) {
+            true
+        }
+        if (preExpired) return Res.Expired(hasLinger = false)
         val expired = AtomicBoolean(false)
         val holder = AtomicReference<Any?>()
         val state = AtomicInteger(0)
@@ -1648,49 +1722,108 @@ internal object ElevatedCallSupervisor {
         //   quarantine 登記（[ElevatedCleanupTracker.quarantineUnverified]，而非丟棄），
         //   outstanding 歸零後仍以 QUARANTINE 擋後續 spawn（同條漏回收路徑消除，
         //   不只寫 breaker 計數）。
+        // Note: quarantine only blocks admission and verifies death; it does NOT kill.
+        // Best-effort termination is attempted via detached daemon thread (fire-and-forget).
         fun startLateDaemon(v: Process) {
             val acquired = ElevatedCleanupTracker.acquireSlot()
             if (!acquired) {
+                // Bounded caller-side path: killer is ElevatedProcessKiller.killTree which
+                // may perform unbounded synchronous Binder IPC (Shizuku Process). Calling it
+                // on the caller thread breaks the bounded execution guarantee. Instead,
+                // launch a detached daemon thread for best-effort termination (fire-and-forget,
+                // never joined), then register the handle in quarantine, mark incomplete/
+                // unclean, and return immediately. The detached thread attempts kill but does
+                // not block the caller.
+                try {
+                    Thread({
+                        runCatching { killer(v) }
+                        runCatching { v.destroyForcibly() }
+                        runCatching { v.inputStream.close() }
+                        runCatching { v.errorStream.close() }
+                        runCatching { v.outputStream.close() }
+                    }, "elevated-late-kill").apply { isDaemon = true; start() }
+                } catch (_: Throwable) {
+                    // Thread.start() failed (e.g. OOM); ensure fail-closed accounting
+                    // still runs even if thread creation failed.
+                }
                 ElevatedCleanupTracker.quarantineUnverified(v)
+                lateIncomplete.set(true)
                 countUncleanOnce()
                 return
             }
-            val t = Thread({
-                try {
-                    val clean = lateCompensateSpawn(v, killer)
-                    if (!clean) countUncleanOnce()
-                } finally {
-                    ElevatedCleanupTracker.releaseSlot()
-                }
-            }, "elevated-late-spawn")
-            t.isDaemon = true
             try {
+                val t = Thread({
+                    try {
+                        val clean = try {
+                            lateCompensateSpawn(v, killer)
+                        } catch (_: Throwable) {
+                            ElevatedCleanupTracker.quarantineUnverified(v)
+                            false
+                        }
+                        if (!clean) countUncleanOnce()
+                    } finally {
+                        ElevatedCleanupTracker.releaseSlot()
+                    }
+                }, "elevated-late-spawn")
+                t.isDaemon = true
                 t.start()
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
                 ElevatedCleanupTracker.releaseSlot()
+                // Detached best-effort kill (bounded caller path, fire-and-forget).
+                // Quarantine only blocks admission and verifies death; it does NOT kill.
+                // The detached daemon thread attempts termination without blocking caller.
+                try {
+                    Thread({
+                        runCatching { killer(v) }
+                        runCatching { v.destroyForcibly() }
+                        runCatching { v.inputStream.close() }
+                        runCatching { v.errorStream.close() }
+                        runCatching { v.outputStream.close() }
+                    }, "elevated-late-kill").apply { isDaemon = true; start() }
+                } catch (_: Throwable) {
+                    // Thread.start() failed (e.g. OOM); ensure fail-closed accounting
+                    // still runs even if thread creation failed.
+                }
                 ElevatedCleanupTracker.quarantineUnverified(v)
+                lateIncomplete.set(true)
                 countUncleanOnce()
             }
         }
-        val worker = Thread({
-            try {
-                val p = block()
-                val published: Any = Val(p)
-                holder.set(published)
-                // 發布後重讀：caller 已過期即嘗試認領回來自行補償。
-                if (expired.get()) {
-                    if (holder.compareAndSet(published, null)) {
-                        // R2-PhaseB：worker 內聯補償亦先佔槽（與 caller daemon 同一全域管理）。
-                        // 飽和即不補償、置旗＋計數（fail-closed，不靜默丟 owner）。
-                        // Round-3 Phase E（P1-1）：飽和 owner 同轉入 quarantine 登記。
-                        val acquired = ElevatedCleanupTracker.acquireSlot()
-                        if (!acquired) {
-                            ElevatedCleanupTracker.quarantineUnverified(p)
-                            lateIncomplete.set(true)
-                            countUncleanOnce()
-                        } else {
+        val worker = try {
+            Thread({
+                try {
+                    val p = block()
+                    val published: Any = Val(p)
+                    holder.set(published)
+                    // 發布後重讀：caller 已過期即嘗試認領回來自行補償。
+                    if (expired.get()) {
+                        fun compensateInline(v: Process) {
+                            val acquired = ElevatedCleanupTracker.acquireSlot()
+                            if (!acquired) {
+                                // Bounded worker-side path: detached best-effort kill.
+                                try {
+                                    Thread({
+                                        runCatching { killer(v) }
+                                        runCatching { v.destroyForcibly() }
+                                        runCatching { v.inputStream.close() }
+                                        runCatching { v.errorStream.close() }
+                                        runCatching { v.outputStream.close() }
+                                    }, "elevated-late-kill").apply { isDaemon = true; start() }
+                                } catch (_: Throwable) {
+                                    // Thread.start() failed; ensure fail-closed accounting.
+                                }
+                                ElevatedCleanupTracker.quarantineUnverified(v)
+                                lateIncomplete.set(true)
+                                countUncleanOnce()
+                                return
+                            }
                             try {
-                                val clean = lateCompensateSpawn(p, killer)
+                                val clean = try {
+                                    lateCompensateSpawn(v, killer)
+                                } catch (_: Throwable) {
+                                    ElevatedCleanupTracker.quarantineUnverified(v)
+                                    false
+                                }
                                 if (!clean) {
                                     lateIncomplete.set(true)
                                     countUncleanOnce()
@@ -1699,26 +1832,31 @@ internal object ElevatedCallSupervisor {
                                 ElevatedCleanupTracker.releaseSlot()
                             }
                         }
+                        if (holder.compareAndSet(published, null)) {
+                            // R2-PhaseB：worker 內聯補償亦先佔槽（與 caller daemon 同一全域管理）。
+                            // 飽和即不補償、置旗＋計數（fail-closed，不靜默丟 owner）。
+                            // Round-3 Phase E（P1-1）：飽和 owner 同轉入 quarantine 登記。
+                            compensateInline(p)
+                        }
+                    }
+                } catch (t: Throwable) {
+                    // 例外不攜 OS 資源：未過期才發布供 caller 診斷，逾期即丟棄。
+                    if (!expired.get()) holder.set(Thr(t))
+                } finally {
+                    synchronized(state) {
+                        if (state.get() == 1) {
+                            state.set(2)
+                            ElevatedCleanupTracker.releaseSlot()
+                        } else if (state.get() == 0) {
+                            state.set(2)
+                        }
                     }
                 }
-            } catch (t: Throwable) {
-                // 例外不攜 OS 資源：未過期才發布供 caller 診斷，逾期即丟棄。
-                if (!expired.get()) holder.set(Thr(t))
-            } finally {
-                synchronized(state) {
-                    if (state.get() == 1) {
-                        state.set(2)
-                        ElevatedCleanupTracker.releaseSlot()
-                    } else if (state.get() == 0) {
-                        state.set(2)
-                    }
-                }
+            }, "elevated-supervisor").also {
+                it.isDaemon = true
+                it.start()
             }
-        }, "elevated-supervisor")
-        worker.isDaemon = true
-        try {
-            worker.start()
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             return Res.Expired(hasLinger = false)
         }
         // R3-PhaseF P2-1：慢輪詢 hook 觀察者（惰性：首片後 block 仍存活才啟動；
@@ -1730,7 +1868,8 @@ internal object ElevatedCallSupervisor {
         // R3-PhaseF：入口先關 watcher（殘留經 [countUncleanOnce] guard 恰好一次）。
         fun expireWorker(): Res<Process> {
             expired.set(true)
-            if (watch?.close() == true) countUncleanOnce()
+            val watchLingering = (watch?.close() == true)
+            if (watchLingering) countUncleanOnce()
             runCatching { worker.interrupt() }
             try {
                 worker.join(GRACE_MS)
@@ -1756,7 +1895,7 @@ internal object ElevatedCallSupervisor {
                     lateProcess = true
                 }
             }
-            return Res.Expired(hasLinger = lingering || lateProcess || lateIncomplete.get())
+            return Res.Expired(hasLinger = lingering || watchLingering || lateProcess || lateIncomplete.get())
         }
         try {
             while (true) {
@@ -1776,8 +1915,12 @@ internal object ElevatedCallSupervisor {
                     // 立即消費。非 Val（Err／異常）無資源攜帶，立即消費＋關 watcher。
                     if (h is Val<*> && watch != null) {
                         val w0 = watch
-                        val expiredNow = Thread.currentThread().isInterrupted ||
-                            w0.bit() || isExpired(deadlineNanos, nowNanos)
+                        val expiredNow = try {
+                            Thread.currentThread().isInterrupted ||
+                                w0.bit() || isExpired(deadlineNanos, nowNanos)
+                        } catch (_: Throwable) {
+                            true
+                        }
                         if (expiredNow) {
                             return expireWorker()
                         } else if (w0.observedFalse()) {
@@ -1797,10 +1940,14 @@ internal object ElevatedCallSupervisor {
                             //   budget（P1-3 邊緣回傳兜底）。
                             // 安靜 hook（恒 false）下 watcher 乾淨退出、三者皆無即仍
                             // Ok handoff（T2 慢 spawn 成功不變）。
-                            val watchLingering = (watch?.close() == true)
+                            val watchLingering = w0.close()
                             if (watchLingering) countUncleanOnce()
-                            val stickyNow = w0.bit() || Thread.currentThread().isInterrupted ||
-                                isExpired(deadlineNanos, nowNanos)
+                            val stickyNow = try {
+                                w0.bit() || Thread.currentThread().isInterrupted ||
+                                    isExpired(deadlineNanos, nowNanos)
+                            } catch (_: Throwable) {
+                                true
+                            }
                             if (watchLingering || stickyNow) {
                                 return expireWorker()
                             }
@@ -1809,14 +1956,20 @@ internal object ElevatedCallSupervisor {
                         }
                         // else unknown：交付值 pending，落到下方慢檢查等待。
                     } else {
-                        if (watch?.close() == true) countUncleanOnce()
+                        val watchLingering = (watch?.close() == true)
+                        if (watchLingering) countUncleanOnce()
                         when (h) {
                             is Val<*> -> {
                                 // P1-3 返回後再確認 deadline：邊緣回傳（交付在 budget
                                 // 之後）不當成功，CAS 取回＋daemon 補償＋Expired(true)。
                                 // R2-PhaseB：同一受槽 daemon（見 startLateDaemon），不再裸起
                                 // untracked daemon；CAS 失敗即 worker 已認領，放手。
-                                if (isExpired(deadlineNanos, nowNanos)) {
+                                val lateExpired = try {
+                                    isExpired(deadlineNanos, nowNanos)
+                                } catch (_: Throwable) {
+                                    true
+                                }
+                                if (lateExpired) {
                                     expired.set(true)
                                     @Suppress("UNCHECKED_CAST")
                                     val v = (h as Val<Process>).v
@@ -1828,12 +1981,17 @@ internal object ElevatedCallSupervisor {
                                 @Suppress("UNCHECKED_CAST")
                                 return Res.Ok((h as Val<Process>).v)
                             }
-                            is Thr -> return Res.Err(h.t)
+                            is Thr -> return Res.Err(h.t, watchLingering)
                             else -> {
                                 // worker 已死無交付：仍確認 deadline（reset 競態下
-                                // 的逾期完成不當成功，直回 Expired(false)，無資源）。
-                                if (isExpired(deadlineNanos, nowNanos)) return Res.Expired(hasLinger = false)
-                                return Res.Err(IllegalStateException("supervisor worker died without result"))
+                                // 的逾期完成不當成功，直回 Expired(watchLingering)，無資源）。
+                                val deadNoResultExpired = try {
+                                    isExpired(deadlineNanos, nowNanos)
+                                } catch (_: Throwable) {
+                                    true
+                                }
+                                if (deadNoResultExpired) return Res.Expired(hasLinger = watchLingering)
+                                return Res.Err(IllegalStateException("supervisor worker died without result"), watchLingering)
                             }
                         }
                     }
@@ -1845,7 +2003,7 @@ internal object ElevatedCallSupervisor {
                     } else {
                         w.bit() || isExpired(deadlineNanos, nowNanos)
                     }
-                } catch (_: Exception) {
+                } catch (_: Throwable) {
                     true
                 }
                 if (shouldExpire) return expireWorker()
@@ -1861,7 +2019,7 @@ internal object ElevatedCallSupervisor {
                     }
                 }
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             return expireWorker()
         }
     }
@@ -1901,11 +2059,18 @@ internal object ElevatedCallSupervisor {
      */
     private fun lateCompensateSpawn(p: Process, killer: (Process) -> Unit): Boolean {
         var ok = true
+        var deferredVme: VirtualMachineError? = null
+        fun recordDeferredVme(t: Throwable) {
+            if (deferredVme == null && t is VirtualMachineError && t !is OutOfMemoryError) {
+                deferredVme = t
+            }
+        }
         try {
             killer(p)
-        } catch (_: Exception) {
+        } catch (t: Throwable) {
             runCatching { ElevatedProcessIo.swallowedKillerThrows.incrementAndGet() }
             ok = false
+            recordDeferredVme(t)
         }
         // 有界 reap：false／抛／中斷一律 incomplete（不可算成功）。
         try {
@@ -1914,21 +2079,36 @@ internal object ElevatedCallSupervisor {
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             ok = false
-        } catch (_: Exception) {
+        } catch (t: Throwable) {
             ok = false
+            recordDeferredVme(t)
         }
         // 父進程必須驗證已死才可清 incomplete（unknown→false，不宣稱 cleaned）。
         try {
             if (!verifyParentStoppedBounded(p)) ok = false
-        } catch (_: Exception) {
+        } catch (t: Throwable) {
             ok = false
+            recordDeferredVme(t)
         }
-        runCatching { p.inputStream.close() }
-        runCatching { p.errorStream.close() }
-        runCatching { p.outputStream.close() }
+        try {
+            p.inputStream.close()
+        } catch (t: Throwable) {
+            recordDeferredVme(t)
+        }
+        try {
+            p.errorStream.close()
+        } catch (t: Throwable) {
+            recordDeferredVme(t)
+        }
+        try {
+            p.outputStream.close()
+        } catch (t: Throwable) {
+            recordDeferredVme(t)
+        }
         // Round-3 Phase E（P1-1）：未驗證即登記 quarantine（worker 完成≠verified dead；
         // 呼叫方 breaker 計數經返回值另行終審，此處只登記，不雙計）。
         if (!ok) ElevatedCleanupTracker.quarantineUnverified(p)
+        deferredVme?.let { throw it }
         return ok
     }
 
@@ -1949,55 +2129,56 @@ internal object ElevatedCallSupervisor {
     fun verifyParentStoppedBounded(process: Process): Boolean {
         val holder = AtomicReference<Any?>()
         val state = AtomicInteger(0)
-        val worker = Thread({
-            try {
-                val exited: Boolean? = try {
-                    process.waitFor(5L, TimeUnit.SECONDS)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    null
-                } catch (_: Exception) {
-                    null
-                }
-                val res: Boolean = if (exited == null) {
-                    try {
-                        !process.isAlive
+        val worker = try {
+            Thread({
+                try {
+                    val exited: Boolean? = try {
+                        process.waitFor(5L, TimeUnit.SECONDS)
                     } catch (_: InterruptedException) {
                         Thread.currentThread().interrupt()
-                        false
+                        null
                     } catch (_: Exception) {
-                        false
+                        null
                     }
-                } else if (!exited) {
-                    false
-                } else {
-                    try {
-                        !process.isAlive
-                    } catch (_: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        true
-                    } catch (_: Exception) {
-                        true
+                    val res: Boolean = if (exited == null) {
+                        try {
+                            !process.isAlive
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            false
+                        } catch (_: Exception) {
+                            false
+                        }
+                    } else if (!exited) {
+                        false
+                    } else {
+                        try {
+                            !process.isAlive
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            true
+                        } catch (_: Exception) {
+                            true
+                        }
+                    }
+                    holder.set(Val(res))
+                } catch (t: Throwable) {
+                    holder.set(Thr(t))
+                } finally {
+                    synchronized(state) {
+                        if (state.get() == 1) {
+                            state.set(2)
+                            ElevatedCleanupTracker.releaseSlot()
+                        } else if (state.get() == 0) {
+                            state.set(2)
+                        }
                     }
                 }
-                holder.set(Val(res))
-            } catch (t: Throwable) {
-                holder.set(Thr(t))
-            } finally {
-                synchronized(state) {
-                    if (state.get() == 1) {
-                        state.set(2)
-                        ElevatedCleanupTracker.releaseSlot()
-                    } else if (state.get() == 0) {
-                        state.set(2)
-                    }
-                }
+            }, "elevated-verify").also {
+                it.isDaemon = true
+                it.start()
             }
-        }, "elevated-verify")
-        worker.isDaemon = true
-        try {
-            worker.start()
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             return false
         }
         try {
@@ -2045,6 +2226,11 @@ internal object ElevatedCallSupervisor {
 }
 
 internal object ElevatedProcessIo {
+    internal fun computeDeadlineNanos(
+        timeoutMs: Long,
+        nowNanos: () -> Long = { System.nanoTime() },
+    ): Long = ElevatedCallSupervisor.computeDeadlineNanos(timeoutMs, nowNanos)
+
     /** R1-A 截圖二進位容量：`screencap -p` / `cat /dev/graphics/fb0` 的截斷上限（8M）。 */
     const val BINARY_SCREENSHOT_MAX_BYTES: Int = 8 * 1024 * 1024
 
@@ -2225,6 +2411,26 @@ internal object ElevatedProcessIo {
         hardCapBytes: Int = ShellPolicy.HARD_READ_CAP_BYTES,
         hardCapErrBytes: Int? = null,
         nowNanos: () -> Long = { System.nanoTime() },
+    ): Drained =
+        drainWithThreadStarter(
+            process = process,
+            timeoutMs = timeoutMs,
+            killer = killer,
+            isCancelled = isCancelled,
+            hardCapBytes = hardCapBytes,
+            hardCapErrBytes = hardCapErrBytes,
+            nowNanos = nowNanos,
+        )
+
+    internal fun drainWithThreadStarter(
+        process: Process,
+        timeoutMs: Long,
+        killer: (Process) -> Unit,
+        isCancelled: () -> Boolean,
+        hardCapBytes: Int = ShellPolicy.HARD_READ_CAP_BYTES,
+        hardCapErrBytes: Int? = null,
+        nowNanos: () -> Long = { System.nanoTime() },
+        startThread: (Thread) -> Unit = { it.start() },
     ): Drained {
         // P2 caller 中斷級聯＋R3-PhaseG P2-3 一次性決策：入口 `Thread.interrupted()`
         // 清除並記錄呼叫方預置中斷。清除保證尾收前 joins 不再因預置中斷即抛；
@@ -2241,25 +2447,44 @@ internal object ElevatedProcessIo {
         // P2 上溢夾頂：timeoutMs 先 coerceAtMost(Long.MAX/1e6)，避免
         // MILLISECONDS.toNanos(Long.MAX) 上溢回負（deadline 回過去即假性即時超時，
         // Long.MAX 應為近無限而非即時超時；夾頂後 Long.MAX 即約 292M 年，不懸掛）。
-        val safeTimeoutMs = timeoutMs.coerceAtLeast(0L).coerceAtMost(Long.MAX_VALUE / 1_000_000L)
-        val deadlineNanos = nowNanos() + TimeUnit.MILLISECONDS.toNanos(safeTimeoutMs)
+        var entryClockFailed = false
+        val deadlineNanos = try {
+            ElevatedCallSupervisor.computeDeadlineNanos(timeoutMs, nowNanos)
+        } catch (_: Throwable) {
+            entryClockFailed = true
+            0L
+        }
         // P1-3 drain 入口 preflight（PR140 Phase 2，最小改動）：budget 已盡即不起
         // gobbler／stdin-closer（零新執行緒），直接監督殺＋有界驗證後回
         // `Drained(timedOut=true)`。殺驗語義同 kill 路徑（killer 永不跳過，下界
         // [CLEANUP_MIN_MS]；驗證走有界 [verifyParentStoppedBounded]），終審計入
         // breaker 同正常路徑；caller 預置中斷照常出口恢復。流未起即無已取引用可關
         // （killer 契約本就不碰流；此 Process 的流隨 kill＋物件回收收斂）。
-        if ((deadlineNanos - nowNanos()) <= 0L) {
+        val preflightExpired = entryClockFailed || try {
+            ElevatedCallSupervisor.isExpired(deadlineNanos, nowNanos)
+        } catch (_: Throwable) {
+            true
+        }
+        if (preflightExpired) {
             var preIncomplete = false
-            val preOk = runCleanupBounded(CLEANUP_MIN_MS) {
-                try {
-                    killer(process)
-                } catch (_: Exception) {
-                    swallowedKillerThrows.incrementAndGet()
+            val preOk = try {
+                runCleanupBounded(CLEANUP_MIN_MS) {
+                    try {
+                        killer(process)
+                    } catch (_: Throwable) {
+                        swallowedKillerThrows.incrementAndGet()
+                    }
                 }
+            } catch (_: Throwable) {
+                false
             }
             if (!preOk) preIncomplete = true
-            if (!ElevatedCallSupervisor.verifyParentStoppedBounded(process)) {
+            val preVerified = try {
+                ElevatedCallSupervisor.verifyParentStoppedBounded(process)
+            } catch (_: Throwable) {
+                false
+            }
+            if (!preVerified) {
                 preIncomplete = true
                 // Round-3 Phase E（P1-1）：preflight 監督殺後仍未驗證即登記 quarantine
                 // （worker 完成≠verified dead；僅 verify 失敗才登記，worker stall 但已驗證
@@ -2283,6 +2508,125 @@ internal object ElevatedProcessIo {
                 cleanupIncomplete = preIncomplete,
             )
         }
+        val out = ElevatedCappedPipe(hardCapBytes)
+        // U2-B：stderr 獨立小 cap（null＝同 stdout cap；截圖傳 512K）。
+        val err = ElevatedCappedPipe(hardCapErrBytes ?: hardCapBytes)
+        val aborted = AtomicBoolean(false)
+        val stdinCounted = AtomicInteger(0)
+        val outCounted = AtomicInteger(0)
+        val errCounted = AtomicInteger(0)
+        val inAcquired = AtomicReference<InputStream?>(null)
+        val errAcquired = AtomicReference<InputStream?>(null)
+        var stdinCloserRef: Thread? = null
+        var stdinStarted = false
+        var tOutRef: Thread? = null
+        var outStarted = false
+        var tErrRef: Thread? = null
+        var errStarted = false
+        fun cleanupOnThreadStartFailure(): Drained {
+            aborted.set(true)
+            out.markFailed()
+            err.markFailed()
+            val startedOut = tOutRef
+            val startedErr = tErrRef
+            val startedStdin = stdinCloserRef
+            if (startedOut != null && (outStarted || startedOut.isAlive)) {
+                runCatching { startedOut.interrupt() }
+            }
+            if (startedErr != null && (errStarted || startedErr.isAlive)) {
+                runCatching { startedErr.interrupt() }
+            }
+            if (startedStdin != null && (stdinStarted || startedStdin.isAlive)) {
+                runCatching { startedStdin.interrupt() }
+            }
+            var cleanupIncomplete = false
+            var joinIncomplete = false
+            val cleanupRemainMs = try {
+                TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L)
+            } catch (_: Throwable) {
+                0L
+            }
+            val cleanupBudgetMs = minOf(maxOf(cleanupRemainMs, CLEANUP_MIN_MS), CLEANUP_JOIN_MS)
+            val cleanupOk = try {
+                runCleanupBounded(cleanupBudgetMs) {
+                    try {
+                        killer(process)
+                    } catch (_: Throwable) {
+                        swallowedKillerThrows.incrementAndGet()
+                    }
+                    runCatching { inAcquired.get()?.close() }
+                    runCatching { errAcquired.get()?.close() }
+                }
+            } catch (_: Throwable) {
+                false
+            }
+            if (!cleanupOk) cleanupIncomplete = true
+            val verified = try {
+                ElevatedCallSupervisor.verifyParentStoppedBounded(process)
+            } catch (_: Throwable) {
+                false
+            }
+            if (!verified) {
+                cleanupIncomplete = true
+                ElevatedCleanupTracker.quarantineUnverified(process)
+            }
+            if (startedOut != null && (outStarted || startedOut.isAlive)) {
+                runCatching { startedOut.interrupt() }
+                try {
+                    startedOut.join(GOBBLER_JOIN_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                } finally {
+                    if (startedOut.isAlive) {
+                        joinIncomplete = true
+                        cleanupIncomplete = true
+                        ElevatedCleanupTracker.markLingering(startedOut, outCounted)
+                    }
+                }
+            }
+            if (startedErr != null && (errStarted || startedErr.isAlive)) {
+                runCatching { startedErr.interrupt() }
+                try {
+                    startedErr.join(GOBBLER_JOIN_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                } finally {
+                    if (startedErr.isAlive) {
+                        joinIncomplete = true
+                        cleanupIncomplete = true
+                        ElevatedCleanupTracker.markLingering(startedErr, errCounted)
+                    }
+                }
+            }
+            if (startedStdin != null && (stdinStarted || startedStdin.isAlive)) {
+                runCatching { startedStdin.interrupt() }
+                try {
+                    startedStdin.join(CLEANUP_GRACE_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                } finally {
+                    if (startedStdin.isAlive) {
+                        cleanupIncomplete = true
+                        ElevatedCleanupTracker.markLingering(startedStdin, stdinCounted)
+                    }
+                }
+            }
+            if (cleanupIncomplete) {
+                ElevatedCleanupTracker.noteUnclean()
+            } else if (ElevatedCleanupTracker.outstanding() == 0) {
+                ElevatedCleanupTracker.noteClean()
+            }
+            if (callerInterrupted) Thread.currentThread().interrupt()
+            return Drained(
+                stdout = runCatching { out.bytes() }.getOrElse { ByteArray(0) },
+                stderr = runCatching { err.bytes() }.getOrElse { ByteArray(0) },
+                exitCode = -1,
+                timedOut = false,
+                truncated = joinIncomplete || out.didOverflow() || err.didOverflow(),
+                readFailed = true,
+                cleanupIncomplete = cleanupIncomplete,
+            )
+        }
         // P1-B：spawn 成功後立即關子進程 stdin（子進程 stdin EOF）：等 stdin EOF 的
         // 子進程（如 cat）不再假性 TimedOut。killer 內不關流，此處是唯一關 stdin 處
         //（drain kill 路徑另關已取的 stdout/stderr，不碰 stdin）。
@@ -2296,35 +2640,40 @@ internal object ElevatedProcessIo {
         // AB1 P1-A＋P0-1 三態：stdin-closer 啟動不預佔；尾收 grace 後仍存活才 [markLingering]
         // （每執行緒三態 [AtomicInteger] 0=init／1=held／2=done＋僅未計數時佔槽；
         // 本體 finally 釋放，見 [ElevatedCleanupTracker.markLingering]）。
-        val stdinCounted = AtomicInteger(0)
-        val stdinCloser = Thread({
-            try {
-                runCatching { process.outputStream.close() }
-            } finally {
-                synchronized(stdinCounted) {
-                    if (stdinCounted.get() == 1) {
-                        stdinCounted.set(2)
-                        ElevatedCleanupTracker.releaseSlot()
-                    } else if (stdinCounted.get() == 0) {
-                        stdinCounted.set(2)
+        val stdinCloser = try {
+            Thread({
+                try {
+                    runCatching { process.outputStream.close() }
+                } finally {
+                    synchronized(stdinCounted) {
+                        if (stdinCounted.get() == 1) {
+                            stdinCounted.set(2)
+                            ElevatedCleanupTracker.releaseSlot()
+                        } else if (stdinCounted.get() == 0) {
+                            stdinCounted.set(2)
+                        }
                     }
                 }
+            }, "elevated-stdin-close").also {
+                it.isDaemon = true
+                stdinCloserRef = it
+                startThread(it)
+                stdinStarted = true
             }
-        }, "elevated-stdin-close").also {
-            it.isDaemon = true
-            it.start()
+        } catch (_: Throwable) {
+            return cleanupOnThreadStartFailure()
         }
         try {
-            val stdinRemainMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos())
-                .coerceAtLeast(0L)
+            val stdinRemainMs = try {
+                TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L)
+            } catch (_: Throwable) {
+                0L
+            }
             val stdinBudgetMs = minOf(stdinRemainMs, STDIN_CLOSE_MAX_MS)
             if (stdinBudgetMs > 0L) stdinCloser.join(stdinBudgetMs)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
-        val out = ElevatedCappedPipe(hardCapBytes)
-        // U2-B：stderr 獨立小 cap（null＝同 stdout cap；截圖傳 512K）。
-        val err = ElevatedCappedPipe(hardCapErrBytes ?: hardCapBytes)
         // X1 getter 回 gobbler 內、整段 try/catch：throw 即 markFailed（W1 語義保留，
         // runner 側同一 "elevated IO read failed" 固定文案，不帶 remote 原文或輸出；
         // 無未捕捉例外）；block 則 caller 不受影響照常進 deadline/poll/kill。
@@ -2332,53 +2681,73 @@ internal object ElevatedProcessIo {
         // 此處以原子引用持有已取流，供 kill 路徑關流）。
         // AB1 P1-A＋P0-1 三態：gobbler 啟動不預佔；join 超界 grace 後仍存活才
         // [markLingering]（三態＋僅未計數時佔槽；本體 finally 釋放，見上）。
-        val outCounted = AtomicInteger(0)
-        val errCounted = AtomicInteger(0)
-        val inAcquired = AtomicReference<InputStream?>(null)
-        val errAcquired = AtomicReference<InputStream?>(null)
-        val tOut = Thread({
-            try {
-                val s = process.inputStream
-                inAcquired.set(s)
-                copyCapped(s, out)
-            } catch (_: Exception) {
-                out.markFailed()
-            } finally {
-                inAcquired.set(null)
-                synchronized(outCounted) {
-                    if (outCounted.get() == 1) {
-                        outCounted.set(2)
-                        ElevatedCleanupTracker.releaseSlot()
-                    } else if (outCounted.get() == 0) {
-                        outCounted.set(2)
+        val tOut = try {
+            Thread({
+                try {
+                    val s = process.inputStream
+                    inAcquired.set(s)
+                    if (aborted.get() || Thread.currentThread().isInterrupted) {
+                        out.markFailed()
+                        runCatching { s.close() }
+                    } else {
+                        copyCapped(s, out)
+                    }
+                } catch (t: Throwable) {
+                    out.markFailed()
+                    if (t is VirtualMachineError && t !is OutOfMemoryError) throw t
+                } finally {
+                    inAcquired.set(null)
+                    synchronized(outCounted) {
+                        if (outCounted.get() == 1) {
+                            outCounted.set(2)
+                            ElevatedCleanupTracker.releaseSlot()
+                        } else if (outCounted.get() == 0) {
+                            outCounted.set(2)
+                        }
                     }
                 }
+            }, "elevated-stdout").also {
+                it.isDaemon = true
+                tOutRef = it
+                startThread(it)
+                outStarted = true
             }
-        }, "elevated-stdout").also {
-            it.isDaemon = true
-            it.start()
+        } catch (_: Throwable) {
+            return cleanupOnThreadStartFailure()
         }
-        val tErr = Thread({
-            try {
-                val s = process.errorStream
-                errAcquired.set(s)
-                copyCapped(s, err)
-            } catch (_: Exception) {
-                err.markFailed()
-            } finally {
-                errAcquired.set(null)
-                synchronized(errCounted) {
-                    if (errCounted.get() == 1) {
-                        errCounted.set(2)
-                        ElevatedCleanupTracker.releaseSlot()
-                    } else if (errCounted.get() == 0) {
-                        errCounted.set(2)
+        val tErr = try {
+            Thread({
+                try {
+                    val s = process.errorStream
+                    errAcquired.set(s)
+                    if (aborted.get() || Thread.currentThread().isInterrupted) {
+                        err.markFailed()
+                        runCatching { s.close() }
+                    } else {
+                        copyCapped(s, err)
+                    }
+                } catch (t: Throwable) {
+                    err.markFailed()
+                    if (t is VirtualMachineError && t !is OutOfMemoryError) throw t
+                } finally {
+                    errAcquired.set(null)
+                    synchronized(errCounted) {
+                        if (errCounted.get() == 1) {
+                            errCounted.set(2)
+                            ElevatedCleanupTracker.releaseSlot()
+                        } else if (errCounted.get() == 0) {
+                            errCounted.set(2)
+                        }
                     }
                 }
+            }, "elevated-stderr").also {
+                it.isDaemon = true
+                tErrRef = it
+                startThread(it)
+                errStarted = true
             }
-        }, "elevated-stderr").also {
-            it.isDaemon = true
-            it.start()
+        } catch (_: Throwable) {
+            return cleanupOnThreadStartFailure()
         }
         var finished = false
         // B3 有界 wait（owner P1-5）：直調 `process.waitFor(slice)` 在 Shizuku 同步
@@ -2405,7 +2774,11 @@ internal object ElevatedProcessIo {
                 // 此處永不直調）＋入口一次性 [cancelledAtEntry]。預置中斷的 caller
                 // 在此即 break 走 kill 路徑，不當健康進程跑。
                 if (cancelledAtEntry || cancelBit()) break
-                val remaining = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos())
+                val remaining = try {
+                    TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos())
+                } catch (_: Throwable) {
+                    -1L
+                }
                 if (remaining <= 0) break
                 val slice = minOf(remaining, POLL_SLICE_MS)
                 when (val w = ElevatedCallSupervisor.awaitWaitSlice(process, slice, deadlineNanos, cancelBit, nowNanos)) {
@@ -2419,12 +2792,21 @@ internal object ElevatedProcessIo {
                         val overdueOrCancelled = cancelledAtEntry ||
                             Thread.currentThread().isInterrupted ||
                             cancelBit() ||
-                            ElevatedCallSupervisor.isExpired(deadlineNanos, nowNanos)
+                            try {
+                                ElevatedCallSupervisor.isExpired(deadlineNanos, nowNanos)
+                            } catch (_: Throwable) {
+                                true
+                            }
                         if (overdueOrCancelled) break
                         finished = true
                         break
                     }
-                    is ElevatedCallSupervisor.Res.Err -> break
+                    is ElevatedCallSupervisor.Res.Err -> {
+                        if (w.hasLinger) {
+                            waitLingering = true
+                        }
+                        break
+                    }
                     is ElevatedCallSupervisor.Res.Expired -> {
                         // P1-4 per-worker 歸因：`hasLinger` 即本 slice worker 自身
                         // grace 後仍存活（[awaitInternal] 內 `worker.isAlive` 如實
@@ -2443,7 +2825,7 @@ internal object ElevatedProcessIo {
                     }
                 }
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             // 輪詢異常收斂為未完成，走下方清理（fail-closed：timedOut，不偽造成功）。
         }
         // gobbler 有界 join 未完成標記：任一 join 超界/中斷後執行緒仍存活即部分讀，
@@ -2461,6 +2843,7 @@ internal object ElevatedProcessIo {
         // B3：wait 殘留（`elevated-wait` worker stall）即清理缺口，不靜默。
         if (waitLingering) cleanupIncomplete = true
         if (!finished) {
+            aborted.set(true)
             // X1：kill 前先 best-effort 中斷兩 gobbler（助可中斷 stalls 脫離，無害；
             // 若 getter 正阻塞於可中斷等待即抛，經 gobbler 整段 catch 收斂為 markFailed）。
             runCatching { tOut.interrupt() }
@@ -2471,20 +2854,27 @@ internal object ElevatedProcessIo {
             // Z1 kill 路徑清理監督化：killer＋已取流 close 包入單一 daemon worker，
             // 有界 join；超界 interrupt＋grace。永不跳過 killer 嘗試（下界保底）。
             // X1 語義保留：只關已取流，不再重調 getter（根除 kill 路徑 getter 阻塞）。
-            val cleanupRemainMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos())
-                .coerceAtLeast(0L)
+            val cleanupRemainMs = try {
+                TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L)
+            } catch (_: Throwable) {
+                0L
+            }
             val cleanupBudgetMs = minOf(maxOf(cleanupRemainMs, CLEANUP_MIN_MS), CLEANUP_JOIN_MS)
-            val cleanupOk = runCleanupBounded(cleanupBudgetMs) {
-                // P2 吞例外計數：killer 抛即吞（best-effort，已盡力殺；刻意靜默，
-                // 不升級為崩潰，計數見 swallowedKillerThrows；流 close 另逐段吞，
-                // 預期 close 收斂，不計數）。
-                try {
-                    killer(process)
-                } catch (_: Exception) {
-                    swallowedKillerThrows.incrementAndGet()
+            val cleanupOk = try {
+                runCleanupBounded(cleanupBudgetMs) {
+                    // P2 吞例外計數：killer 抛即吞（best-effort，已盡力殺；刻意靜默，
+                    // 不升級為崩潰，計數見 swallowedKillerThrows；流 close 另逐段吞，
+                    // 預期 close 收斂，不計數）。
+                    try {
+                        killer(process)
+                    } catch (_: Throwable) {
+                        swallowedKillerThrows.incrementAndGet()
+                    }
+                    runCatching { inAcquired.get()?.close() }
+                    runCatching { errAcquired.get()?.close() }
                 }
-                runCatching { inAcquired.get()?.close() }
-                runCatching { errAcquired.get()?.close() }
+            } catch (_: Throwable) {
+                false
             }
             if (!cleanupOk) cleanupIncomplete = true
             // P1-3：終審推遲到尾收後（此處不再 noteClean/noteUnclean，避免
@@ -2500,7 +2890,12 @@ internal object ElevatedProcessIo {
             // verified dead；僅 verify 失敗才登記，cleanupOk==false 但已驗證死亡
             // 不登記）。verdict cleanupIncomplete 保持 true（經尾收終審），
             // quarantine 以 QUARANTINE 把 fail-closed 擴展到後續 spawn。
-            if (!ElevatedCallSupervisor.verifyParentStoppedBounded(process)) {
+            val verified = try {
+                ElevatedCallSupervisor.verifyParentStoppedBounded(process)
+            } catch (_: Throwable) {
+                false
+            }
+            if (!verified) {
                 cleanupIncomplete = true
                 ElevatedCleanupTracker.quarantineUnverified(process)
             }
@@ -2543,84 +2938,138 @@ internal object ElevatedProcessIo {
             // 300ms timeout＋已 exit 但流不 EOF 可釘 20s＋。現每片（POLL_SLICE_MS）
             // 後查 isCancelled／中斷／deadline，命中即 interrupt＋markLingering＋
             // 雙旗＋break（第二流亦跳過等待，直接中斷記槽）；自然耗盡（budget 用罄
-            // 仍存活）即 interrupt＋capped grace（grace 亦取自剩餘 tail，不另加
-            // budget）＋重判 `isAlive`（P0-2），仍存活即雙旗＋記槽。
+            // 仍存活）即 interrupt＋capped grace（grace 至少給 [CLEANUP_GRACE_MS]，封頂
+            // [SUCCESS_JOIN_GRACE_MS]，讓可中斷 gobbler 捕捉 `InterruptedException`
+            // 並完成 `markFailed()` 退出，避免 `tailRemainMs()==0` 時跳過 join 的 0ms 競態）
+            // ＋重判 `isAlive`（P0-2），仍存活即三旗＋記槽。
             // SUCCESS_JOIN_MS（10s）保留為單流絕對上界（tail 2s 下實效不觸達，
             // 只防 tail 預算未來放寬後的單流無界）；grace 亦 capped，不清除已記標記
             //（超 tail 的讀數不視為完整，Y1 語義保留）。正常慢讀 tail 內完成即無
             // interrupt，不受影響；只有卡死執行緒才走到記槽分支。
             // 無界 join 在遠端流永不 EOF 時可卡死超 timeoutMs，故不用。
-            val tailBudgetMs = minOf(
-                TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L),
-                FINISHED_TAIL_BUDGET_MS,
-            )
-            val tailDeadlineNanos = nowNanos() + TimeUnit.MILLISECONDS.toNanos(tailBudgetMs)
-            fun tailRemainMs(): Long = minOf(
-                TimeUnit.NANOSECONDS.toMillis(tailDeadlineNanos - nowNanos()).coerceAtLeast(0L),
-                TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L),
-            )
-            var tailAborted = false
-            fun joinFinishedTail(t: Thread, counted: AtomicInteger) {
-                if (tailAborted) {
-                    // 前一流已因取消／逾期 abort：本流不再等，直接中斷＋三旗＋記槽。
-                    if (t.isAlive) {
-                        runCatching { t.interrupt() }
-                        joinIncomplete = true
-                        cleanupIncomplete = true
-                        tailIncomplete = true
-                        ElevatedCleanupTracker.markLingering(t, counted)
-                    }
-                    return
+            try {
+                var tailClockFailed = false
+                val tailBudgetMs = try {
+                    minOf(
+                        TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L),
+                        FINISHED_TAIL_BUDGET_MS,
+                    )
+                } catch (_: Throwable) {
+                    tailClockFailed = true
+                    0L
                 }
-                while (t.isAlive) {
-                    // R3-PhaseF＋PhaseG P2-3：只讀緩存 bit（hook 在 watcher worker
-                    // 求值，此處永不直調；拋折為未取消的語義由 watcher 側同策略
-                    // 承擔，不誤殺）＋入口一次性 [cancelledAtEntry]。
-                    if (cancelledAtEntry || cancelBit() || Thread.currentThread().isInterrupted ||
-                        (deadlineNanos - nowNanos()) <= 0L
-                    ) {
-                        // 取消／呼叫執行緒中斷／deadline 耗盡：不再等流。
-                        runCatching { t.interrupt() }
-                        joinIncomplete = true
-                        cleanupIncomplete = true
-                        tailIncomplete = true
-                        ElevatedCleanupTracker.markLingering(t, counted)
-                        tailAborted = true
+                val tailBaseNanos = if (tailClockFailed) {
+                    0L
+                } else {
+                    try {
+                        nowNanos()
+                    } catch (_: Throwable) {
+                        tailClockFailed = true
+                        0L
+                    }
+                }
+                val tailDeadlineNanos = tailBaseNanos + TimeUnit.MILLISECONDS.toNanos(tailBudgetMs)
+                fun tailRemainMs(): Long = if (tailClockFailed) {
+                    0L
+                } else {
+                    try {
+                        minOf(
+                            TimeUnit.NANOSECONDS.toMillis(tailDeadlineNanos - nowNanos()).coerceAtLeast(0L),
+                            TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L),
+                        )
+                    } catch (_: Throwable) {
+                        tailClockFailed = true
+                        0L
+                    }
+                }
+                var tailAborted = false
+                fun joinFinishedTail(t: Thread, counted: AtomicInteger) {
+                    if (tailAborted) {
+                        // 前一流已因取消／逾期 abort：本流不再等，直接中斷＋三旗＋記槽。
+                        if (t.isAlive) {
+                            runCatching { t.interrupt() }
+                            joinIncomplete = true
+                            cleanupIncomplete = true
+                            tailIncomplete = true
+                            ElevatedCleanupTracker.markLingering(t, counted)
+                        }
                         return
                     }
-                    // P1-4 `join(0)` 防呆：`join(0)` 即無限等待。`tailRemainMs()` 取兩次
-                    // （檢查與等待量）之間可被調度切走使第二次回 0，故單次取值、
-                    // 非正即 break，傳入 join 的等待量恒正。
-                    val waitMs = minOf(tailRemainMs(), POLL_SLICE_MS)
-                    if (waitMs <= 0L) break
-                    try {
-                        t.join(waitMs)
-                    } catch (_: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                    }
-                }
-                if (t.isAlive && !tailAborted) {
-                    runCatching { t.interrupt() }
-                    val graceMs = minOf(tailRemainMs(), SUCCESS_JOIN_GRACE_MS)
-                    if (graceMs > 0L) {
+                    while (t.isAlive) {
+                        // R3-PhaseF＋PhaseG P2-3：只讀緩存 bit（hook 在 watcher worker
+                        // 求值，此處永不直調；拋折為未取消的語義由 watcher 側同策略
+                        // 承擔，不誤殺）＋入口一次性 [cancelledAtEntry]。
+                        val expiredNow = tailClockFailed || try {
+                            ElevatedCallSupervisor.isExpired(deadlineNanos, nowNanos)
+                        } catch (_: Throwable) {
+                            tailClockFailed = true
+                            true
+                        }
+                        if (cancelledAtEntry || cancelBit() || Thread.currentThread().isInterrupted || expiredNow) {
+                            // 取消／呼叫執行緒中斷／deadline 耗盡：不再等流。
+                            runCatching { t.interrupt() }
+                            joinIncomplete = true
+                            cleanupIncomplete = true
+                            tailIncomplete = true
+                            ElevatedCleanupTracker.markLingering(t, counted)
+                            tailAborted = true
+                            return
+                        }
+                        // P1-4 `join(0)` 防呆：`join(0)` 即無限等待。`tailRemainMs()` 取兩次
+                        // （檢查與等待量）之間可被調度切走使第二次回 0，故單次取值、
+                        // 非正即 break，傳入 join 的等待量恒正。
+                        val waitMs = minOf(tailRemainMs(), POLL_SLICE_MS)
+                        if (waitMs <= 0L) break
                         try {
-                            t.join(graceMs)
+                            t.join(waitMs)
                         } catch (_: InterruptedException) {
                             Thread.currentThread().interrupt()
                         }
                     }
-                    // P0-2：grace 後必須重讀 `isAlive` 再判定（舊碼以 grace 前快照置旗，
-                    // 而三態 mark 對已退出執行緒不佔槽，造成無槽 noteUnclean）。
+                    if (t.isAlive && !tailAborted) {
+                        // tail budget 耗盡（非取消／主 deadline 中止）：中斷後至少給
+                        // CLEANUP_GRACE_MS（封頂 SUCCESS_JOIN_GRACE_MS），讓可中斷 gobbler
+                        // 捕捉 InterruptedException 完成 markFailed() 並退出，避免 0ms 競態。
+                        runCatching { t.interrupt() }
+                        val graceMs = minOf(maxOf(tailRemainMs(), CLEANUP_GRACE_MS), SUCCESS_JOIN_GRACE_MS)
+                        if (graceMs > 0L) {
+                            try {
+                                t.join(graceMs)
+                            } catch (_: InterruptedException) {
+                                Thread.currentThread().interrupt()
+                            }
+                        }
+                        // P0-2：grace 後必須重讀 `isAlive` 再判定（舊碼以 grace 前快照置旗，
+                        // 而三態 mark 對已退出執行緒不佔槽，造成無槽 noteUnclean）。
+                        if (t.isAlive) {
+                            joinIncomplete = true
+                            cleanupIncomplete = true
+                            tailIncomplete = true
+                            ElevatedCleanupTracker.markLingering(t, counted)
+                        }
+                    }
+                }
+                joinFinishedTail(tOut, outCounted)
+                joinFinishedTail(tErr, errCounted)
+            } catch (_: Throwable) {
+                runCatching { tOut.interrupt() }
+                runCatching { tErr.interrupt() }
+                joinIncomplete = true
+                cleanupIncomplete = true
+                tailIncomplete = true
+                for ((t, counted) in listOf(tOut to outCounted, tErr to errCounted)) {
                     if (t.isAlive) {
-                        joinIncomplete = true
-                        cleanupIncomplete = true
-                        tailIncomplete = true
-                        ElevatedCleanupTracker.markLingering(t, counted)
+                        try {
+                            t.join(CLEANUP_GRACE_MS)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                        }
+                        if (t.isAlive) {
+                            ElevatedCleanupTracker.markLingering(t, counted)
+                        }
                     }
                 }
             }
-            joinFinishedTail(tOut, outCounted)
-            joinFinishedTail(tErr, errCounted)
         }
         // Z1 stdin-closer 生命週期收斂（兩路徑共通尾收）：gobbler joins 後仍存活即
         // interrupt＋grace 重 join，仍存活即 cleanupIncomplete=true（daemon 殘留
@@ -2641,7 +3090,12 @@ internal object ElevatedProcessIo {
         }
         // R3-PhaseF：watcher 收斂（殘留即記槽＋置旗，由下方終審統一進 breaker；
         // 正常完成即無 interrupt 影響，watcher 自行退出，零殘留）。
-        if (cancelWatch.close()) cleanupIncomplete = true
+        val watchLingering = try {
+            cancelWatch.close()
+        } catch (_: Throwable) {
+            true
+        }
+        if (watchLingering) cleanupIncomplete = true
         // P1-3＋P0-1 統一終審（兩路徑共通，kill 終審推遲到此，避免少計）：
         // - cleanupIncomplete（含 kill 監督未完成、殘留 gobbler／stdin）即
         //   noteUnclean 累計（kill 路徑 cleanupOk==false 已併入本旗標；kill 後
@@ -2670,13 +3124,18 @@ internal object ElevatedProcessIo {
         // Expired（stall 殘留）即置 `cleanupIncomplete`，由下方終審統一進 breaker。
         val joinInterrupted = Thread.interrupted()
         val exitCode: Int = if (finished) {
-            when (val ev = ElevatedCallSupervisor.exitValueBounded(process, nowNanos)) {
-                is ElevatedCallSupervisor.Res.Ok -> ev.v
-                is ElevatedCallSupervisor.Res.Err -> -1
-                is ElevatedCallSupervisor.Res.Expired -> {
-                    cleanupIncomplete = true
-                    -1
+            try {
+                when (val ev = ElevatedCallSupervisor.exitValueBounded(process, nowNanos)) {
+                    is ElevatedCallSupervisor.Res.Ok -> ev.v
+                    is ElevatedCallSupervisor.Res.Err -> -1
+                    is ElevatedCallSupervisor.Res.Expired -> {
+                        cleanupIncomplete = true
+                        -1
+                    }
                 }
+            } catch (_: Throwable) {
+                cleanupIncomplete = true
+                -1
             }
         } else -1
         if (joinInterrupted) Thread.currentThread().interrupt()
@@ -2687,9 +3146,21 @@ internal object ElevatedProcessIo {
         }
         // P2 caller 中斷恢復：入口預置中斷出口恢復一次（不吞 caller 中斷）。
         if (callerInterrupted) Thread.currentThread().interrupt()
+        val outBytes = try {
+            out.bytes()
+        } catch (_: Throwable) {
+            out.markFailed()
+            ByteArray(0)
+        }
+        val errBytes = try {
+            err.bytes()
+        } catch (_: Throwable) {
+            err.markFailed()
+            ByteArray(0)
+        }
         return Drained(
-            stdout = out.bytes(),
-            stderr = err.bytes(),
+            stdout = outBytes,
+            stderr = errBytes,
             // P2 exit -1 難分註記：finished 下 exitValue() 抛（遠端漂移）即 -1，
             // 與 kill 路徑（!finished）-1 同值但以 timedOut 區分（false vs true），
             // 不可僅看 exitCode；runner 側 finished -1 即 Failed（非零分支），
@@ -2746,22 +3217,22 @@ internal object ElevatedProcessIo {
         // runner 資源門承擔，此處不拒絕，只計數；無槽（acquireSlot 回 false）仍嘗試，
         // 但回 false 保守記不完整（見本函數 P1-4 段）。
         val acquired = ElevatedCleanupTracker.acquireSlot()
-        val t = Thread({
-            try {
-                block()
-            } catch (_: Exception) {
-                // block 內已逐段 runCatching，此處僅兜底線程體異常，不外抛。
-            } finally {
-                if (acquired) ElevatedCleanupTracker.releaseSlot()
-            }
-        }, "elevated-cleanup").also {
-            it.isDaemon = true
-            try {
+        val t = try {
+            Thread({
+                try {
+                    block()
+                } catch (_: Throwable) {
+                    // block 內已逐段 runCatching，此處僅兜底線程體異常，不外抛。
+                } finally {
+                    if (acquired) ElevatedCleanupTracker.releaseSlot()
+                }
+            }, "elevated-cleanup").also {
+                it.isDaemon = true
                 it.start()
-            } catch (_: Exception) {
-                if (acquired) ElevatedCleanupTracker.releaseSlot()
-                return false
             }
+        } catch (_: Throwable) {
+            if (acquired) ElevatedCleanupTracker.releaseSlot()
+            return false
         }
         try {
             t.join(timeoutMs.coerceAtLeast(0L))
@@ -2831,8 +3302,8 @@ internal object ElevatedProcessIo {
     }
 
     private fun copyCapped(stream: java.io.InputStream, pipe: ElevatedCappedPipe) {
-        val buf = ByteArray(COPY_BUF_SIZE)
         try {
+            val buf = ByteArray(COPY_BUF_SIZE)
             while (true) {
                 val n = stream.read(buf)
                 if (n < 0) break
@@ -2847,11 +3318,12 @@ internal object ElevatedProcessIo {
                     // （此分支無動作，僅留檢查點明語義；讀丟棄經由下輪 read 繼續。）
                 }
             }
-        } catch (_: Exception) {
+        } catch (t: Throwable) {
             // V2：無條件記錄讀取失敗（finished 下必為真實 I/O 錯誤，經
             // Drained.readFailed 帶出；被殺時流中斷亦標 true，但超時/取消路徑
             // 已先回 TimedOut，不受影響，預期 close 收斂保留）。
             pipe.markFailed()
+            if (t is VirtualMachineError && t !is OutOfMemoryError) throw t
         } finally {
             runCatching { stream.close() }
         }
@@ -2998,7 +3470,7 @@ internal object ElevatedRunnerCommon {
             is ElevatedCallSupervisor.Res.Ok -> if (r.v) preSpawnExpired(timeoutMs, false) else null
             is ElevatedCallSupervisor.Res.Err -> {
                 runCatching { ElevatedProcessIo.swallowedIsCancelledThrows.incrementAndGet() }
-                preSpawnExpired(timeoutMs, false)
+                preSpawnExpired(timeoutMs, preSpawnLinger(r.hasLinger))
             }
             is ElevatedCallSupervisor.Res.Expired -> preSpawnExpired(timeoutMs, preSpawnLinger(r.hasLinger))
         }

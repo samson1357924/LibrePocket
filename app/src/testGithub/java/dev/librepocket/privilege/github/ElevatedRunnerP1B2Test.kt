@@ -67,6 +67,7 @@ class ElevatedRunnerP1B2Test {
             "elevated-wait",
             "elevated-verify",
             "elevated-late-spawn",
+            "elevated-late-kill",
             "elevated-quarantine-sweep",
             "elevated-quarantine-verify",
         )
@@ -145,7 +146,8 @@ class ElevatedRunnerP1B2Test {
         override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
         override fun waitFor(): Int = 0
         override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = false
-        override fun exitValue(): Int = 0
+        override fun exitValue(): Int = throw IllegalThreadStateException("still alive")
+        override fun isAlive(): Boolean = true
         override fun destroy(): Unit = throw RuntimeException("destroy boom")
         override fun destroyForcibly(): Process = throw RuntimeException("forcibly boom")
     }
@@ -2246,6 +2248,42 @@ class ElevatedRunnerP1B2Test {
             "swallowedKillerThrows must increment on throwing killer",
             ElevatedProcessIo.swallowedKillerThrows.get() > before,
         )
+        pollOutstandingTo(0)
+        awaitNoElevatedThreads()
+        ElevatedCleanupTracker.noteClean()
+    }
+
+    @Test fun drainBlockingKillerReturnsBoundedAndSetsIncomplete() {
+        // Deterministic JVM regression: a killer that never returns must not make
+        // drain unbounded. runCleanupBounded must interrupt + grace + set incomplete.
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val killerLatch = CountDownLatch(1)
+        fun stuckAwait(latch: CountDownLatch) {
+            while (true) {
+                try {
+                    latch.await()
+                    break
+                } catch (_: InterruptedException) {
+                    // swallow interrupt, keep waiting
+                }
+            }
+        }
+        val p = FakeProcess("ok".toByteArray(), ByteArray(0), 0, hang = true)
+        val t0 = System.currentTimeMillis()
+        val d = ElevatedProcessIo.drain(
+            process = p,
+            timeoutMs = 100L,
+            killer = { stuckAwait(killerLatch) },
+            isCancelled = { false },
+        )
+        val wallMs = System.currentTimeMillis() - t0
+        // Must return within bounded time (CLEANUP_JOIN_MS + grace + margin).
+        assertTrue("drain must return bounded under blocking killer, wall=${wallMs}ms", wallMs < 15_000L)
+        assertTrue("drain must time out on hanging process", d.timedOut)
+        assertTrue("cleanupIncomplete must be true", d.cleanupIncomplete)
+        // Release the blocking killer so the detached worker can exit.
+        killerLatch.countDown()
         pollOutstandingTo(0)
         awaitNoElevatedThreads()
         ElevatedCleanupTracker.noteClean()

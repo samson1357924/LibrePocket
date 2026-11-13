@@ -14,12 +14,15 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import java.io.File
 import java.io.IOException
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 
 /**
  * B1 授權持久化測試（Issue #136 B1）：
@@ -299,5 +302,28 @@ class ShizukuGrantTest {
             it[SHIZUKU_GRANT_SERVICE_VERSION] = 15
         }
         assertNull(ShizukuGrantStore(blank).load())
+    }
+
+    @Test fun cancellationExceptionPropagatesWithoutBeingSwallowed() {
+        runBlocking {
+            val cancellingDataStore = object : DataStore<Preferences> {
+                override val data: Flow<Preferences> = flow {
+                    throw kotlinx.coroutines.CancellationException("test cancel")
+                }
+                override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                    throw kotlinx.coroutines.CancellationException("test cancel")
+                }
+            }
+            val store = ShizukuGrantStore(cancellingDataStore)
+            assertThrows(kotlinx.coroutines.CancellationException::class.java) {
+                runBlocking { store.load() }
+            }
+            assertThrows(kotlinx.coroutines.CancellationException::class.java) {
+                runBlocking { store.save(ShizukuGrantPolicy.grant("preset:openai", 1L, 15)) }
+            }
+            assertThrows(kotlinx.coroutines.CancellationException::class.java) {
+                runBlocking { store.clear() }
+            }
+        }
     }
 }

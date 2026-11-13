@@ -28,9 +28,19 @@ object WebContentEnvelope {
     }
 
     /**
+     * 定點清理：`sanitize(strip(sanitize(strip(x))))`。
+     *
+     * Cf 混淆第二通道：攻擊者可在 marker 內插入 Cf（如 `EXTERNAL\u200B_UNTRUSTED`），
+     * 單次 `strip→sanitize` 會先因混淆比對失敗、再經 `sanitize` 去 Cf 後露出完整
+     * marker 而漏網；雙輪（剝→清→剝→清）達定點，保證混淆 marker 亦剝除。
+     */
+    fun cleanField(text: String): String =
+        sanitize(stripForgedMarkers(sanitize(stripForgedMarkers(text))))
+
+    /**
      * 移除 Cf（FORMAT）碼點；永不拋異常。
      *
-     * 以碼點迭代，補充平面 tags 等亦按整點判定；孤立 surrogate（골
+     * 以碼點迭代，補充平面 tags 等亦按整點判定；孤立 surrogate（
      * `getType` 回 SURROGATE）保留，交由上層 replacement 解碼處理。
      */
     fun sanitize(text: String): String {
@@ -49,13 +59,13 @@ object WebContentEnvelope {
     }
 
     /**
-     * 先剝偽造 marker、再做 Cf 清理、最後包一層。
+     * 先剝偽造 marker、再做 Cf 清理、最後包一層（定點版，見 [cleanField]）。
      *
      * 輸出形狀：`BEGIN + "\n" + cleaned + "\n" + END`，恰含一組 marker；
      * 輸入 qualquer（含偽造 marker／bidi）皆 fail-closed 為單層乾淨 envelope。
      */
     fun wrap(raw: String): String {
-        val cleaned = sanitize(stripForgedMarkers(raw))
+        val cleaned = cleanField(raw)
         return "$BEGIN\n$cleaned\n$END"
     }
 

@@ -53,6 +53,21 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  * - 內容：`title/url/snippet/published/siteName` 正規化（見 [parseHtml]），
  *   全經 [WebContentEnvelope.sanitize] 清理；模型可見體為
  *   [WebContentEnvelope.wrap] 單層 envelope。
+ * - 偽造 marker 定點清理：`title/snippet/published` 皆經
+ *   [WebContentEnvelope.cleanField]（`sanitize(strip(sanitize(strip(x))))`
+ *   定點），擋 Cf 混淆第二通道（marker 內插 Cf 先躲過 `strip`、再經 `sanitize`
+ *   去 Cf 後露出完整 marker）。
+ *
+ * Blocking（production 接線前必解）：`resolver` 預設 [SystemHostResolver]
+ * 僅供純 JVM fixture 測試；production 接線前必須顯式注入 pinning resolver
+ *（[dev.librepocket.policy.PinnedNetworkDns]），禁止以預設建連；OkHttp adapter
+ * 須用 `resolvedAddresses` 釘住，rebind 視新決策重驗（S2 契約）。
+ * 本預設值刻意保留（避免測試 churn），不代表 production 可用預設直連。
+ *
+ * 收斂點（#158）：redirect／downgrade helper 待 #158 落地後抽共用；
+ * 目前 `tool/WebFetch.kt` 超限截斷（`truncated=true` 繼續）vs 本 PR 超限
+ * `Failed(TOO_LARGE)` fail-closed 屬刻意差異（extract 拒部分內容，避免模型
+ * 見到截斷 HTML 誤判），收斂時不得把 TOO_LARGE 改為截斷。
  *
  * 純 JVM fixture 可測：transport 經 [WebExtractHttpGet] 注入，DNS 經
  * [HostResolver] 注入，時鐘經 [WebExtractCache] 注入；零真網。
@@ -264,7 +279,7 @@ class WebExtractCache(
         map.clear()
     }
 
-    val size: Int get() = map.size
+    val size: Int get() = synchronized(map) { map.size }
 
     private fun sweepLocked(nowMs: Long) {
         val it = map.entries.iterator()
@@ -292,6 +307,14 @@ class WebExtractService(
     private val mutex = Mutex()
     private val inFlight: MutableMap<String, CompletableDeferred<WebExtractOutcome>> = mutableMapOf()
 
+    /**
+     * 單 URL 抽取（cache＋single-flight＋逐跳政策）。
+     *
+     * Blocking（production 接線前必解）：`resolver` 預設 [SystemHostResolver]
+     * 僅供純 JVM fixture 測試；production 接線前必須顯式注入 pinning resolver
+     *（[dev.librepocket.policy.PinnedNetworkDns]），禁止以預設建連；OkHttp adapter
+     * 須用 `resolvedAddresses` 釘住，rebind 視新決策重驗（S2 契約）。
+     */
     suspend fun extract(
         rawUrl: String,
         optIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
@@ -439,8 +462,8 @@ class WebExtractService(
                 val resolved = resolveRedirect(normalized, location)
                     ?: return WebExtractOutcome.Failed(WebExtract.DETAIL_BAD_REDIRECT)
                 // 預檢 downgrade（未發請求前擋；下一圈政策再驗一次，雙保險）。
-                val fromHttps = normalized.toHttpUrlOrNull()?.scheme == "https"
-                val toHttp = resolved.toHttpUrlOrNull()?.scheme == "http"
+                val fromHttps = normalized.toHttpUrlOrNull()?.scheme?.lowercase() == "https"
+                val toHttp = resolved.toHttpUrlOrNull()?.scheme?.lowercase() == "http"
                 if (fromHttps && toHttp) {
                     return WebExtractOutcome.Unavailable(
                         WebExtract.DETAIL_CLEARTEXT_DOWNGRADE,
@@ -493,18 +516,16 @@ class WebExtractService(
             val parsed = parseHtml(decoded, normalized)
                 ?: return WebExtractOutcome.Failed(WebExtract.DETAIL_BAD_RESPONSE)
 
-            // Model 可見截斷（先剝偽造 marker、sanitize 後、截斷後、envelope 最外）。
-            val strippedSnippet = WebContentEnvelope.stripForgedMarkers(parsed.snippet)
-            val cleanSnippet = WebContentEnvelope.sanitize(strippedSnippet)
-            val strippedTitle = WebContentEnvelope.stripForgedMarkers(parsed.title)
-            val cleanTitle = WebContentEnvelope.sanitize(strippedTitle)
+            // Model 可見截斷（定點清理後、截斷後、envelope 最外；見 cleanField）。
+            val cleanSnippet = WebContentEnvelope.cleanField(parsed.snippet)
+            val cleanTitle = WebContentEnvelope.cleanField(parsed.title)
             val capped = cleanSnippet.takeExtractPrefix(effModel)
             val truncated = capped.length < cleanSnippet.length
             val content = WebExtractContent(
                 title = cleanTitle,
                 url = parsed.url,
                 snippet = capped,
-                published = parsed.published?.let { WebContentEnvelope.sanitize(WebContentEnvelope.stripForgedMarkers(it)) },
+                published = parsed.published?.let { WebContentEnvelope.cleanField(it) },
                 siteName = parsed.siteName,
             )
             val envelope = WebContentEnvelope.wrap(capped)

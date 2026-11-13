@@ -393,6 +393,118 @@ class WebSearchSettingsCardTest {
         assertEquals(1, dismissed)
     }
 
+    @Test
+    fun probeButtonShowsHonestCopy() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                web = webState(),
+            )
+        }
+        composeRule.onNodeWithText("檢查設定（不連線）").performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    fun loadingStateDisplaysLoadingMessage() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                web = webState().copy(isLoading = true),
+            )
+        }
+        onWebTag("webLoading").assertIsDisplayed()
+        composeRule.onNodeWithText("網路搜尋設定讀取中…").performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    fun loadFailedDisplaysErrorMessageAndRetryButtonInvokesCallback() {
+        var retried = 0
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                web = webState().copy(loadFailed = true),
+                onWebRetryLoad = { retried++ },
+            )
+        }
+        onWebTag("webLoadFailed").assertIsDisplayed()
+        composeRule.onNodeWithText("網路搜尋設定讀取失敗，開關暫時停用。").performScrollTo().assertIsDisplayed()
+        onWebTag("webRetryLoadButton").assertIsDisplayed().performClick()
+        assertEquals(1, retried)
+    }
+
+    @Test
+    fun writeErrorDisplaysErrorBanner() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                web = webState().copy(writeError = "URL 含有不支援的控制字元"),
+            )
+        }
+        onWebTag("webWriteError").assertIsDisplayed()
+        composeRule.onNodeWithText("URL 含有不支援的控制字元").performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    fun invalidUrlDisplaysSupportingText() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                web = webState().copy(
+                    searxngProbe = WebProbe.NotReady(WebUnavailableReason.INVALID_URL),
+                ),
+            )
+        }
+        onWebTag("webSearxngUrl").assertIsDisplayed()
+        composeRule.onNodeWithTag("webSearxngSupportingText", useUnmergedTree = true).assertIsDisplayed()
+        composeRule.onNodeWithText("URL 格式無效，請以 http:// 或 https:// 開頭").assertIsDisplayed()
+    }
+
+    @Test
+    fun canResetTrueEnablesResetButtonAndInvokesCallback() {
+        var reset = 0
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                web = webState().copy(canReset = true, switchesEnabled = true),
+                onWebResetSettings = { reset++ },
+            )
+        }
+        onWebTag("webResetButton").assertIsDisplayed().assertIsEnabled().performClick()
+        assertEquals(1, reset)
+    }
+
+    @Test
+    fun canResetFalseDisablesResetButton() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                web = webState().copy(canReset = false, switchesEnabled = true),
+            )
+        }
+        onWebTag("webResetButton").assertIsDisplayed().assertIsNotEnabled()
+    }
+
+    @Test
+    fun consentAlertDialogContentIsScrollable() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                web = webState(showConsent = true),
+            )
+        }
+        composeRule.onNodeWithTag("webConsentTitle").assertIsDisplayed()
+        composeRule.onNodeWithTag("webConsentText").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("webConsentDdgsWarning").performScrollTo().assertIsDisplayed()
+    }
+
     private class UnknownTestViewModel : ViewModel()
 
     @Test

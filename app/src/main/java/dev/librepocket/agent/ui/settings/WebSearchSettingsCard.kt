@@ -6,6 +6,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -19,6 +22,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
 import dev.librepocket.web.WebProbe
@@ -68,6 +73,8 @@ fun WebSearchCard(
     onProbe: () -> Unit = {},
     onConsentConfirm: () -> Unit = {},
     onConsentDismiss: () -> Unit = {},
+    onRetryLoad: () -> Unit = {},
+    onResetSettings: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     Card(
@@ -87,9 +94,46 @@ fun WebSearchCard(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            if (state.loadFailed) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    "網路搜尋設定讀取失敗，開關暫時停用。",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.testTag("webLoadFailed"),
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                OutlinedButton(
+                    onClick = onRetryLoad,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("webRetryLoadButton"),
+                ) {
+                    Text("重試讀取")
+                }
+            } else if (state.isLoading) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    "網路搜尋設定讀取中…",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.testTag("webLoading"),
+                )
+            }
+            if (state.writeError != null) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    state.writeError,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.testTag("webWriteError"),
+                )
+            }
             Spacer(modifier = Modifier.height(8.dp))
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .semantics(mergeDescendants = true) {},
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
@@ -111,11 +155,26 @@ fun WebSearchCard(
                 style = MaterialTheme.typography.bodyMedium,
             )
             Spacer(modifier = Modifier.height(4.dp))
+            val isInvalidUrl = state.searxngProbe is WebProbe.NotReady &&
+                state.searxngProbe.reason == WebUnavailableReason.INVALID_URL
             OutlinedTextField(
                 value = state.searxngUrl,
                 onValueChange = onSearxngUrlChange,
                 enabled = state.urlEditable && state.switchesEnabled,
+                isError = isInvalidUrl,
                 label = { Text("SearXNG baseUrl（例 https://search.example）") },
+                placeholder = { Text("https://search.example") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, autoCorrectEnabled = false),
+                supportingText = if (isInvalidUrl) {
+                    {
+                        Text(
+                            "URL 格式無效，請以 http:// 或 https:// 開頭",
+                            modifier = Modifier.testTag("webSearxngSupportingText"),
+                        )
+                    }
+                } else {
+                    null
+                },
                 singleLine = true,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -131,7 +190,9 @@ fun WebSearchCard(
             Spacer(modifier = Modifier.height(8.dp))
             // DDGS（opt-in＋非官方警語，D3 必須顯示）。
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .semantics(mergeDescendants = true) {},
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
@@ -167,7 +228,7 @@ fun WebSearchCard(
                     .fillMaxWidth()
                     .testTag("webProbeButton"),
             ) {
-                Text("測試連線（probe）")
+                Text("檢查設定（不連線）")
             }
             state.probeMessage?.let { msg ->
                 Spacer(modifier = Modifier.height(4.dp))
@@ -177,6 +238,16 @@ fun WebSearchCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.testTag("webProbeMessage"),
                 )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = onResetSettings,
+                enabled = state.canReset && state.switchesEnabled,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("webResetButton"),
+            ) {
+                Text("重設所有設定")
             }
         }
     }
@@ -194,7 +265,9 @@ fun WebSearchCard(
                 )
             },
             text = {
-                Column {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                ) {
                     Text(
                         WebSearchSettings.CONSENT_TEXT,
                         modifier = Modifier.testTag("webConsentText"),

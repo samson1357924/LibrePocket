@@ -264,10 +264,19 @@ class McpServer internal constructor(
         }
         val vaultRemainingMs =
             (vaultRemainingNs / 1_000_000L) + if (vaultRemainingNs % 1_000_000L > 0L) 1L else 0L
-        val keyResult = try {
+        val keyOutcome = try {
             withTimeoutOrNull(vaultRemainingMs) {
                 withContext(Dispatchers.IO) {
-                    Result.success(keyVault.getKey(config.keyId))
+                    var key: CharArray? = null
+                    try {
+                        key = keyVault.getKey(config.keyId)
+                        Result.success(key?.let { String(it) })
+                    } finally {
+                        try {
+                            key?.fill('\u0000')
+                        } catch (_: Exception) {
+                        }
+                    }
                 }
             }
         } catch (e: CancellationException) {
@@ -277,25 +286,17 @@ class McpServer internal constructor(
             // 不計熔斷——本地 keystore 問題非傳輸失敗），絕不外拋崩潰呼叫方。
             return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
-        if (keyResult == null) {
+        if (keyOutcome == null) {
             // Step 6 vault 讀取逾時：尚未進入 Step 7 傳輸，0 HTTP、0 熔斷失敗。
             // 注意：withTimeoutOrNull 對不可中斷的同步 blocking backend 不具搶占性；
             // 讀取已移至 Dispatchers.IO 以避免阻塞呼叫方執行緒，但底層工作可能持續至完成。
+            // 即使 timeout 後 withContext 丟棄結果，原始 key 陣列的清零仍在 IO block 的 finally 中完成。
             return McpListResult(config.id, emptyList(), McpStatus.TIMEOUT, elapsedMs(start))
         }
-        val key = keyResult.getOrNull()
-        if (key == null) {
+        val bearer = keyOutcome.getOrNull()
+        if (bearer == null) {
             // 無 key 不計熔斷（配置問題，非傳輸失敗）。
             return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, elapsedMs(start))
-        }
-        val bearer: String
-        try {
-            bearer = String(key)
-        } finally {
-            try {
-                key.fill('\u0000')
-            } catch (_: Exception) {
-            }
         }
         // Bearer 預檢（fail-closed）：只放行可列印 ASCII（0x20–0x7E）。key 含控制字元／
         // 非 ASCII（含孤立 surrogate）即 UNAUTHORIZED、不發送、不計熔斷——這類值非合法
@@ -545,10 +546,19 @@ class McpServer internal constructor(
         }
         val vaultRemainingMs =
             (vaultRemainingNs / 1_000_000L) + if (vaultRemainingNs % 1_000_000L > 0L) 1L else 0L
-        val keyResult = try {
+        val keyOutcome = try {
             withTimeoutOrNull(vaultRemainingMs) {
                 withContext(Dispatchers.IO) {
-                    Result.success(keyVault.getKey(config.keyId))
+                    var key: CharArray? = null
+                    try {
+                        key = keyVault.getKey(config.keyId)
+                        Result.success(key?.let { String(it) })
+                    } finally {
+                        try {
+                            key?.fill('\u0000')
+                        } catch (_: Exception) {
+                        }
+                    }
                 }
             }
         } catch (e: CancellationException) {
@@ -558,25 +568,17 @@ class McpServer internal constructor(
             // 不計熔斷——本地 keystore 問題非傳輸失敗），絕不外拋崩潰呼叫方。
             return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
-        if (keyResult == null) {
+        if (keyOutcome == null) {
             // Step 6 vault 讀取逾時：尚未進入 Step 7 傳輸，0 HTTP、0 熔斷失敗。
             // 注意：withTimeoutOrNull 對不可中斷的同步 blocking backend 不具搶占性；
             // 讀取已移至 Dispatchers.IO 以避免阻塞呼叫方執行緒，但底層工作可能持續至完成。
+            // 即使 timeout 後 withContext 丟棄結果，原始 key 陣列的清零仍在 IO block 的 finally 中完成。
             return McpCallResult(config.id, toolName, McpStatus.TIMEOUT, elapsedMs(start))
         }
-        val key = keyResult.getOrNull()
-        if (key == null) {
+        val bearer = keyOutcome.getOrNull()
+        if (bearer == null) {
             // 無 key 不計熔斷（配置問題，非傳輸失敗）。
             return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, elapsedMs(start))
-        }
-        val bearer: String
-        try {
-            bearer = String(key)
-        } finally {
-            try {
-                key.fill('\u0000')
-            } catch (_: Exception) {
-            }
         }
         // Bearer 預檢（fail-closed，同 listTools）：只放行可列印 ASCII，非此即 UNAUTHORIZED、
         // 不發送、不計熔斷（防 header injection／keystore 損壞值流入標頭）。

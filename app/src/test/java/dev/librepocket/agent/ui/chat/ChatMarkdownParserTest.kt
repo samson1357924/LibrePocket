@@ -1864,7 +1864,11 @@ class ChatMarkdownParserTest {
         // head re-scan per card costs Theta(K^2) (the last K cards each re-skip K consumed
         // entries), while cursor consumption is amortized O(K). Doubling K must therefore
         // scale ~linearly (bound strictly inside (2, 4)).
-        fun timed(k: Int): Long {
+        // Timing is environment-sensitive (CI jitter/GC on short runs can inflate the
+        // ratio). Use interleaved rounds with per-side medians on a larger base so the
+        // noise share is small while keeping the 3.5 bound strictly inside (2, 4) to
+        // discriminate linear (~2) from quadratic (~4) behavior.
+        fun timedOnce(k: Int): Long {
             val prev = List(k) { "same-dup-content" }
             val curr = List(2 * k) { "same-dup-content" }
             val prevIds = List(k) { "prev-$it" }
@@ -1873,17 +1877,20 @@ class ChatMarkdownParserTest {
             repeat(5) {
                 alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
             }
-            val samples = LongArray(7) {
-                val start = System.nanoTime()
-                repeat(10) {
-                    alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
-                }
-                System.nanoTime() - start
+            val start = System.nanoTime()
+            repeat(10) {
+                alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
             }
-            return samples.sorted()[samples.size / 2]
+            return System.nanoTime() - start
         }
-        val t1 = timed(4000)
-        val t2 = timed(8000)
+        val samples1 = LongArray(7)
+        val samples2 = LongArray(7)
+        repeat(7) { i ->
+            samples1[i] = timedOnce(4000)
+            samples2[i] = timedOnce(8000)
+        }
+        val t1 = samples1.sorted()[samples1.size / 2]
+        val t2 = samples2.sorted()[samples2.size / 2]
         val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
         assertTrue(
             "identity-only duplicate 2x-input ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)",

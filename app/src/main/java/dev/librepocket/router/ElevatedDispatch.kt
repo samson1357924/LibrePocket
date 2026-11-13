@@ -73,7 +73,7 @@ object ElevatedDispatch {
             "ElevatedDispatch only serves ${PrivilegeGate.ELEVATED_TOOL}, not ${tool.name}"
         }
         // P2-2 先行：reason 只读（String 不可变，零 worker），超限即拒，
-        // 不碰 argv、不哈希无界输入。
+        // 不碰 argv、不哈希無界输入。
         if (PrivilegeAuditLog.isReasonCodeTooLong(request.reasonCode)) {
             val tooLong = ShellResult.Denied(
                 ShellDeny.BLACKLISTED,
@@ -106,6 +106,38 @@ object ElevatedDispatch {
             )
             audit.record(emptyList(), request.reasonCode, PrivilegeAuditLog.verdictName(snapshotDenied))
             return snapshotDenied
+        }
+        return ShellExecTool.executeElevatedFrozen(frozen, runner, audit, timeoutMs)
+    }
+
+    /**
+     * Single-freeze fast path for callers that have already performed required gates/reverify
+     * and hold a valid frozen [ElevatedRequest] snapshot (F7). Performs cheap final invariants
+     * and delegates to [ShellExecTool.executeElevatedFrozen] so runner execution/result auditing
+     * happens exactly once without re-freezing.
+     *
+     * PRECONDITION (defense-in-depth): caller MUST have completed tool/confirmation/projection/
+     * policy/bridge/grant checks and post-confirm reverify on the same immutable snapshot.
+     * Do not call with unverified or stale requests; misuse inside module can bypass gates.
+     */
+    internal fun executeWithFrozen(
+        tool: ToolDef,
+        frozen: ElevatedRequest,
+        runner: ElevatedShellRunner,
+        audit: PrivilegeAuditLog,
+        timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS,
+    ): ShellResult {
+        require(tool.name == PrivilegeGate.ELEVATED_TOOL) {
+            "ElevatedDispatch only serves ${PrivilegeGate.ELEVATED_TOOL}, not ${tool.name}"
+        }
+        // Cheap invariant: reason bound (String-only). Frozen request is from bounded snapshot path.
+        if (PrivilegeAuditLog.isReasonCodeTooLong(frozen.reasonCode)) {
+            val tooLong = ShellResult.Denied(
+                ShellDeny.BLACKLISTED,
+                "reasonCode too long (fail-closed, no spawn)",
+            )
+            audit.record(emptyList(), "", PrivilegeAuditLog.verdictName(tooLong))
+            return tooLong
         }
         return ShellExecTool.executeElevatedFrozen(frozen, runner, audit, timeoutMs)
     }

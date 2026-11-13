@@ -74,10 +74,10 @@ class PrivilegeAuditLog {
         atMs: Long = System.currentTimeMillis(),
     ): PrivilegeAuditRecord {
         require(verdict.isNotBlank()) { "verdict must not be blank" }
-        // Round-4 Phase N（P2-2）：reasonCode 超限 fail-closed，不哈希无界输入。
+        // Round-4 Phase N（P2-2）：reasonCode 超限 fail-closed，不哈希無界输入。
         // 入口（Dispatch／Tool）已先行检查并映 `Denied`（见各调用方 KDoc），本处为纵深：
         // 直调 record 传超限 reason 即抛（无行写入），不做截断哈希（截断即把相异长码
-        // 坍缩为同哈希，审计不可辨；且 `toByteArray` 物化本身即无界成本）。
+        // 坍缩为同哈希，审计不可辨；且 `toByteArray` 物化本身即無界成本）。
         require(!isReasonCodeTooLong(reasonCode)) {
             "reasonCode too long (max $MAX_REASON_CODE_BYTES UTF-8 bytes, fail-closed)"
         }

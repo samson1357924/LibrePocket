@@ -2032,23 +2032,34 @@ class ChatMarkdownUiTest {
         // once per recomposition (O(K)). Rewriting K cards to K fully different cards
         // must scale ~linearly (well under the quadratic 4x plus noise headroom),
         // unlike a per-card linear scan over all previous entries.
-        fun timed(k: Int): Long {
+        //
+        // Timing is environment-sensitive (CI jitter/GC on short runs can inflate the
+        // ratio). Use interleaved rounds with per-side medians on a larger base so the
+        // noise share is small while keeping the 3.5 bound strictly inside (2, 4) to
+        // discriminate linear (~2) from quadratic (~4) behavior.
+        fun timedOnce(k: Int): Long {
             val prev = List(k) { "prev-content-$it" }
             val curr = List(k) { "curr-content-$it" }
             val prevIds = thinkingOverrideIds(prev)
             val currIds = thinkingOverrideIds(curr)
             val currSet = currIds.toSet()
-            repeat(3) {
+            repeat(5) {
                 alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
             }
             val start = System.nanoTime()
-            repeat(5) {
+            repeat(10) {
                 alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
             }
             return System.nanoTime() - start
         }
-        val t1 = timed(400)
-        val t2 = timed(800)
+        val samples1 = LongArray(7)
+        val samples2 = LongArray(7)
+        repeat(7) { i ->
+            samples1[i] = timedOnce(2000)
+            samples2[i] = timedOnce(4000)
+        }
+        val t1 = samples1.sorted()[samples1.size / 2]
+        val t2 = samples2.sorted()[samples2.size / 2]
         val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
         assertTrue(
             "identity-only 2x-input ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)",

@@ -36,6 +36,7 @@ import dev.librepocket.agent.assistant.rememberAssistantRole
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.entry.EntryDispatch
 import dev.librepocket.entry.EntryRoute
+import dev.librepocket.shell.InMemoryPrivilegeRevokeStore
 import dev.librepocket.shell.PrivilegeBridgeState
 import dev.librepocket.voice.VoiceSwitchStore
 import dev.librepocket.voice.VoiceSwitchSnapshot
@@ -136,7 +137,13 @@ fun MainScreen(
 
     // S3 提權橋產品態（BACKLOG D09）：審計表 + privilege_bridge 開關 +
     // 橋接授權三位一體；一鍵收回原子清表、關開關、撤授權（見 PrivilegeBridgeState）。
+    // #136-B3 接線形狀（依賴 #166 先合併）：持久版收回經
+    // `revoke(store, withdrawScope)`（`scope` 傳跨域 clear，產品為 github 側
+    // `ShizukuGrantStore.clear`，rebase 後以 B1 的 DataStore 版為準）；
+    // B1 未合併前以記憶體 Store 佔位（行為：仍原子清表＋關開關＋撤旗標，
+    // fail-closed 不殘留），不得只清表而不關開關。
     val privilegeState = remember { PrivilegeBridgeState() }
+    val privilegeRevokeStore = remember { InMemoryPrivilegeRevokeStore() }
     var privilegeAuditCount by remember { mutableIntStateOf(privilegeState.auditCount()) }
 
     // C1 系統預設助理（Issue #137 C1b，三 flavor 共用 main 接線）：
@@ -271,8 +278,33 @@ fun MainScreen(
                     }
                 },
                 onRevokePrivilege = {
-                    privilegeState.revoke()
-                    privilegeAuditCount = privilegeState.auditCount()
+                    // #136-B3 持久版收回（依賴 #166）：`store` 為橋授權持久真相源
+                    //（現以記憶體 Store 佔位，rebase 後換 B1 的 DataStore 版），
+                    // `withdrawScope` 傳跨域撤銷（產品為 github 側 Shizuku 授權
+                    // Store 的 `clear()`，本 main 源集不直接引用 github 類）。
+                    // memory-first/fail-closed：State.revoke 先同步清記憶體（當下零新准入），
+                    // 再嘗試持久/跨域；持久失敗不回滾記憶體，但須表面化並可重試。
+                    // TODO(#166)：rebase 後以 B1 DataStore 版為準並注入真實 withdrawScope；
+                    // 持久失敗改走 Snackbar＋重試入口（現以 Toast 佔位）。未接線前不可視為持久撤權完成。
+                    scope.launch {
+                        try {
+                            privilegeState.revoke(privilegeRevokeStore) {
+                                // 跨域撤銷佔位：#166 rebase 後填
+                                // `shizukuStore.clear()`（github 源集）。
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "privilege revoke persist/cross-domain failed (memory revoked)", e)
+                            android.widget.Toast.makeText(
+                                app,
+                                "提權已於本機收回，但持久化或跨域清除失敗，請重試",
+                                android.widget.Toast.LENGTH_LONG,
+                            ).show()
+                        } finally {
+                            privilegeAuditCount = privilegeState.auditCount()
+                        }
+                    }
                 },
                 privilegeAuditCount = privilegeAuditCount,
                 voiceInputEnabled = VoiceTools.inputEnabled(voiceEffectiveSnapshot),

@@ -799,8 +799,37 @@ object ToolRegistry {
     )
     // S4-ANCHOR-END
 
-    // S1-B: ALL covers FAST + SLOW + S1B + S1A + VOICE + LINUX (S1-A appends S1A; S1-C extended FAST; S2 appends VOICE; S4 appends LINUX).
-    val ALL: List<ToolDef> = FAST_TOOLS + SLOW_TOOLS + S1B_TOOLS + S1A_TOOLS + VOICE_TOOLS + LINUX_TOOLS
+    // #138 D4 web.extract (registry shape only; not wired, not executable).
+    // Owned by D4 workstream; other workstreams append elsewhere.
+    // - Tool name `web.extract` (dot form, local extract; distinct from
+    //   server-side hosted passthrough `web_search`).
+    // - Switch `webextract` default false (fail-closed; D3 consent UX lands
+    //   separately in #165, not here).
+    // - executionReady MUST stay false (ToolDef default): projection-only,
+    //   never model-visible (see `visibleTools`); executable flip is out of
+    //   scope for D4 (no dispatcher/executor wiring in this PR).
+    val WEB_EXTRACT_TOOLS: List<ToolDef> = listOf(
+        ToolDef(
+            name = dev.librepocket.web.WebExtract.TOOL_NAME,
+            description = "Extract a single URL to title/url/snippet/published/siteName with an untrusted-content envelope; policy-gated per hop, byte-capped, 60min cache. SCAFFOLD: projection-only in this PR, no product Chat dispatcher wiring yet.",
+            jsonSchema = schema(
+                prop("url", "string", "https URL to extract (policy-gated per hop)"),
+                prop("maxBytes", "integer", "Response byte cap, clamped to 1 MiB"),
+                prop("maxModelChars", "integer", "Model-visible char cap, clamped to 50k"),
+                required = "\"url\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = dev.librepocket.web.WebExtract.SWITCH,
+                switchDefault = dev.librepocket.web.WebExtract.SWITCH_DEFAULT,
+                timeoutMs = dev.librepocket.web.WebExtract.TIMEOUT_MS,
+                fallbackHint = dev.librepocket.web.WebExtract.FALLBACK_HINT,
+            ),
+        ),
+    )
+
+    // S1-B: ALL covers FAST + SLOW + S1B + S1A + VOICE + LINUX + WEB_EXTRACT (D4 appends WEB_EXTRACT; S1-A appends S1A; S1-C extended FAST; S2 appends VOICE; S4 appends LINUX).
+    val ALL: List<ToolDef> = FAST_TOOLS + SLOW_TOOLS + S1B_TOOLS + S1A_TOOLS + VOICE_TOOLS + LINUX_TOOLS + WEB_EXTRACT_TOOLS
 
     fun find(name: String): ToolDef? = ALL.firstOrNull { it.name == name }
 

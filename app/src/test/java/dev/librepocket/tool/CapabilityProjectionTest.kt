@@ -241,8 +241,8 @@ class CapabilityProjectionTest {
         // P2 slice：開關全開下 model 名單恰為 [lsp.symbols]（與接了 loop 的
         // TurnController.buildRequest 一致；無 loop 時請求仍是純聊天）。
         assertEquals(setOf("lsp.symbols"), model)
-        // 42/1/41：總數隨 OpenAI TTS 新增至 42，恰一 ready，其餘全 false。
-        assertEquals(42, ToolRegistry.ALL.size)
+        // 43/1/42：總數隨 D4 web.extract 新增至 43，恰一 ready，其餘全 false。
+        assertEquals(43, ToolRegistry.ALL.size)
         assertEquals(1, ToolRegistry.ALL.count { it.executionReady })
         assertTrue(ToolRegistry.find("lsp.symbols")!!.executionReady)
     }

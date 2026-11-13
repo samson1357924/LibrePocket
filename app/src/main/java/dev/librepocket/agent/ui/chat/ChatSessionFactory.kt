@@ -883,8 +883,9 @@ class ChatSessionFactory(
         // B2 hydration-tail unification (done): the prefix travels
         // HistoryWindowCap.DEFAULT (200 msgs / 60k chars), same as create /
         // openForked / TurnController default, so a resumed long dialogue
-        // windows identically to a fresh one. The DB backward scan above
-        // stays bounded by HISTORY_LOAD_CAP (2000) as the I/O upper bound for
+        // windows identically to a fresh one. The backward scan inside
+        // loadModelHistory stays bounded by HISTORY_LOAD_CAP (2000) as the
+        // I/O upper bound for
         // reasoning-marker collection; extra rows are dropped by the window
         // downstream (TurnController.droppedHistoryCount/droppedHistoryChars),
         // never shipped.

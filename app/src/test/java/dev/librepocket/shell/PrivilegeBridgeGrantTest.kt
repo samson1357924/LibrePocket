@@ -19,6 +19,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
@@ -168,6 +169,10 @@ class PrivilegeBridgeGrantTest {
         val expired = PrivilegeGrantPolicy.check(grant, "preset:openai", 3L, nowMs = atMs + 1_000L)
         assertTrue("$expired", expired is PrivilegeGrantCheck.Invalid)
         assertEquals(PrivilegeGrantPolicy.REASON_EXPIRED, (expired as PrivilegeGrantCheck.Invalid).reason)
+        // 到期之後（nowMs > expiresAtMs）亦失效。
+        val afterExpiry = PrivilegeGrantPolicy.check(grant, "preset:openai", 3L, nowMs = atMs + 1_001L)
+        assertTrue("$afterExpiry", afterExpiry is PrivilegeGrantCheck.Invalid)
+        assertEquals(PrivilegeGrantPolicy.REASON_EXPIRED, (afterExpiry as PrivilegeGrantCheck.Invalid).reason)
     }
 
     @Test fun nullTtlNeverExpires() {
@@ -337,6 +342,38 @@ class PrivilegeBridgeGrantTest {
             it[PRIVILEGE_GRANT_AT_MS] = 0L
         }
         assertNull(PrivilegeBridgeStore(blank).load())
+
+        val missingAtMs = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "missing_at_ms_${System.nanoTime()}.preferences_pb")
+        }
+        missingAtMs.edit {
+            it[PRIVILEGE_GRANT_PROVIDER_ID] = "preset:openai"
+            it[PRIVILEGE_GRANT_CONFIG_REVISION] = 3L
+        }
+        assertNull(PrivilegeBridgeStore(missingAtMs).load())
+    }
+
+    @Test fun cancellationExceptionPropagatesWithoutBeingSwallowed() {
+        runBlocking {
+            val cancellingDataStore = object : DataStore<Preferences> {
+                override val data: Flow<Preferences> = flow {
+                    throw kotlinx.coroutines.CancellationException("test cancel")
+                }
+                override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                    throw kotlinx.coroutines.CancellationException("test cancel")
+                }
+            }
+            val store = PrivilegeBridgeStore(cancellingDataStore)
+            assertThrows(kotlinx.coroutines.CancellationException::class.java) {
+                runBlocking { store.load() }
+            }
+            assertThrows(kotlinx.coroutines.CancellationException::class.java) {
+                runBlocking { store.save(PrivilegeGrantPolicy.grant("preset:openai", 1L)) }
+            }
+            assertThrows(kotlinx.coroutines.CancellationException::class.java) {
+                runBlocking { store.clear() }
+            }
+        }
     }
 
     @Test fun loadFailureFoldsToNull() = runBlocking {

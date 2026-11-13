@@ -1,6 +1,8 @@
 package dev.librepocket.privilege.github
 
+import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.datastore.preferences.core.Preferences
 import dev.librepocket.shell.ElevatedRequest
 import dev.librepocket.shell.PrivilegeBridgeState
 import dev.librepocket.shell.PrivilegeBridgeStore
@@ -8,10 +10,13 @@ import dev.librepocket.shell.PrivilegeGrantCheck
 import dev.librepocket.shell.PrivilegeGrantPolicy
 import dev.librepocket.shell.ShellDeny
 import java.io.File
+import java.io.IOException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -263,5 +268,70 @@ class PrivilegeBridgeRevokeRunnerTest {
         assertEquals(ShellDeny.NOT_WHITELISTED, (sResult as ElevatedBinaryResult.Denied).reason)
         assertTrue("${sResult.message}", sResult.message.contains("privilege bridge off"))
         assertEquals("zero spawn required when bridgeSwitchOn is false", 0, spawn.calls)
+    }
+
+    @Test fun postFailedRevokeZeroSpawn() = runBlocking {
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+        grantBoth(state)
+        val spawn = SpawnCounter()
+        val root = rootRunner(state, spawn)
+        val shizuku = shizukuRunner(state, spawn)
+
+        val first = root.runBinary(request(), 2_000L)
+        assertTrue(first is ElevatedBinaryResult.Ok)
+        assertEquals(1, spawn.calls)
+
+        // Attempt revoke with a failing store: clear throws, but in-memory state is dropped
+        val failingStore = PrivilegeBridgeStore(object : DataStore<Preferences> {
+            override val data: Flow<Preferences> = flow { emit(androidx.datastore.preferences.core.emptyPreferences()) }
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                throw IOException("simulated disk error during clear")
+            }
+        })
+
+        try {
+            state.revoke(failingStore)
+            org.junit.Assert.fail("revoke must throw when store clear fails")
+        } catch (_: IOException) {
+            // expected
+        }
+
+        assertFalse("bridgeGranted must be false even after failed revoke", state.bridgeGranted)
+        assertFalse("bridgeSwitchOn must be false even after failed revoke", state.bridgeSwitchOn)
+        assertFalse(state.bridgeEffective)
+
+        val rResult = root.runBinary(request(), 2_000L)
+        assertTrue(rResult is ElevatedBinaryResult.Denied)
+        val rDenied = rResult as ElevatedBinaryResult.Denied
+        assertTrue(rDenied.message.contains("privilege bridge off"))
+        assertEquals("zero spawn after failed revoke", 1, spawn.calls)
+
+        val sResult = shizuku.runBinary(request(), 2_000L)
+        assertTrue(sResult is ElevatedBinaryResult.Denied)
+        val sDenied = sResult as ElevatedBinaryResult.Denied
+        assertTrue(sDenied.message.contains("privilege bridge off"))
+        assertEquals("zero spawn after failed revoke", 1, spawn.calls)
+    }
+
+    @Test fun shizukuExpiryRefreshDeniesWithoutSpawn() = runBlocking {
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+        state.grant(bridgeStore, "provider-a", 1L, ttlMs = 1_000L, atMs = 1_700_000_000_000L)
+        shizukuStore.save(ShizukuGrantPolicy.grant("provider-a", 1L, 15))
+        val spawn = SpawnCounter()
+        val runner = shizukuRunner(state, spawn)
+
+        val fresh = state.refresh(bridgeStore, "provider-a", 1L, nowMs = 1_700_000_000_000L)
+        assertTrue("$fresh", fresh is PrivilegeGrantCheck.Valid)
+        val first = runner.runBinary(request(), 2_000L)
+        assertTrue("$first", first is ElevatedBinaryResult.Ok)
+        assertEquals(1, spawn.calls)
+
+        val expired = state.refresh(bridgeStore, "provider-a", 1L, nowMs = 1_700_000_001_000L)
+        assertTrue("$expired", expired is PrivilegeGrantCheck.Invalid)
+        assertEquals(PrivilegeGrantPolicy.REASON_EXPIRED, (expired as PrivilegeGrantCheck.Invalid).reason)
+        val second = runner.runBinary(request(), 2_000L)
+        assertTrue("$second", second is ElevatedBinaryResult.Denied)
+        assertTrue("${(second as ElevatedBinaryResult.Denied).message}", second.message.contains("privilege bridge off"))
+        assertEquals(1, spawn.calls)
     }
 }

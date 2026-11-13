@@ -1,6 +1,7 @@
 package dev.librepocket.router
 
 import dev.librepocket.tool.CapabilityLevel
+import dev.librepocket.tool.LspTools
 import dev.librepocket.tool.ProjectionContext
 import dev.librepocket.tool.ToolRegistry
 import java.util.concurrent.atomic.AtomicLong
@@ -29,6 +30,18 @@ import java.util.concurrent.atomic.AtomicLong
  * FAST therefore means *routable AND executable*, never projection-only.
  * Confirmation is NOT checked here; [PrivilegeGate] owns the PRIVILEGED
  * execution gate.
+ *
+ * B3 (#19) expansion: `lsp.symbols` (the single `executionReady` tool,
+ * READ-only stub echo) gains a template so the fast lane is reachable
+ * end-to-end in JVM tests: a symbol-naming intent routes FAST, and
+ * [FastDispatcher] executes it against an injected [LspTools.Backend] fake.
+ * This router still only decides, never executes. Expansion rule
+ * (fail-safe ordering, pinned by `FastDispatchTest` + [templateToolNames]):
+ * a new tool must gain its RULES template AND its NEGATION verbs BEFORE its
+ * `executionReady` flips — a RULES gap is fail-safe (no template ⇒ DENIED
+ * no-match, never executes) but a NEGATION gap is not (a complete-args
+ * negated intent would sail through to FAST). `lsp.symbols` is the
+ * reference expansion (template + `別查`/`别查` + blank-query clarification).
  *
  * Pure logic, no Android dependencies.
  *
@@ -186,6 +199,11 @@ class FastRouter(
         private val VOLUME_HINTS = listOf(r("音量"), r("靜音"), r("静音"), r("大聲"), r("大声"), r("小聲"), r("小声"), r("調.*音"), r("调.*音"), r("volume"), r("mute"))
         private val NAVIGATE_HINTS = listOf(r("導航"), r("导航"), r("路線"), r("路线"), r("帶我去"), r("带我去"), r("怎麼去"), r("怎么去"), r("去.*(路|街|店|餐廳|餐厅|公司|家|站|場|场|店)"), r("\\bmap\\b"))
         private val OPEN_APP_HINTS = listOf(r("打開"), r("打开"), r("開啟"), r("开启"), r("啟動"), r("启动"), r("開.*app"), r("开.*app"))
+        // B3 (#19) reference expansion: the single `executionReady` tool
+        // (`lsp.symbols`, READ-only) becomes fast-lane routable. Hints stay
+        // narrow (symbol words only — a bare 「查」 without a symbol word is
+        // NOT a symbol query and stays no-match, fail-safe).
+        private val SYMBOL_HINTS = listOf(r("符號"), r("symbol"))
         private val SLOW_HINTS = listOf(
             r("自動點擊"), r("自动点击"), r("點擊螢幕"), r("点击屏幕"), r("幫我點"), r("帮我点"),
             r("自動填表"), r("自动填表"), r("代操"), r("自動操作"), r("自动操作"),
@@ -196,9 +214,15 @@ class FastRouter(
          * 「別/别+動詞」（繁簡對稱）與明確否定詞；命中且同時命中工具模板即轉澄清，
          * 絕不執行。
          *
-         * 維護註記：封閉動詞表——新工具上線為執行 ready 前必須先擴充此表，
-         * 否則該工具參數齊備時的否定句會一路走到 FAST 執行（非 fail-safe；
-         * 今日僅因各工具多為非 ready 才看似安全）。
+         * 擴表規則（B3 fail-safe ordering）：封閉動詞表——新工具上線為執行 ready
+         * 前必須先擴充此表（並在 RULES 增模板，見 [templateToolNames]），否則該
+         * 工具參數齊備時的否定句會一路走到 FAST 執行（非 fail-safe；今日僅因
+         * 各工具多為非 ready 才看似安全）。`lsp.symbols` 是參照擴充（`別查`／
+         * `别查`，與模板＋缺參門同 PR 落地，先於其既有 ready 旗標——該旗標早於
+         * 模板存在，但無模板時路由不可達，仍屬 fail-safe）。通用否定詞（不要／
+         * 不用／…）覆蓋所有模板工具，見 `FastDispatchTest`；裸「別+動詞」須逐
+         * 工具增補（繁簡對稱），殘餘缺口（未收錄動詞的「別…」句式）在 ready 翻
+         * 轉前必須補齊。
          * 已知侷限：複合句（「取消舊鬧鐘再設一個新的」同時命中模板與取消/停止詞）
          * 會被轉澄清，屬誤澄清（安全方向），由測試釘住。
          */
@@ -207,8 +231,10 @@ class FastRouter(
             r("取消"), r("停止"), r("禁止"), r("算了"),
             r("別打"), r("別設"), r("別開"), r("別截"), r("別播"),
             r("別調"), r("別導"), r("別發"), r("別傳"), r("別幫"), r("別給"),
+            r("別查"),
             r("别打"), r("别设"), r("别开"), r("别截"), r("别播"),
             r("别调"), r("别导"), r("别发"), r("别传"), r("别帮"), r("别给"),
+            r("别查"),
             r("\\bdon'?t\\b"), r("\\bdo not\\b"), r("\\bstop\\b"), r("\\bcancel\\b"),
         )
 
@@ -225,10 +251,13 @@ class FastRouter(
 
         // FastRouter template rules + arg builders, hoisted to the
         // companion with the hint regexes (Stage C completion): the
-        // 11-entry rule list and the builder closures stop allocating
+        // 12-entry rule list and the builder closures stop allocating
         // per FastRouter(); decide() is a hot path. The shared JSON/esc
         // helpers and the phone finder live here too so the RULES lambdas
         // never capture the instance.
+        //
+        // Expansion rule (B3): a new tool lands here AND in NEGATION_HINTS
+        // BEFORE its `executionReady` flips (see [templateToolNames]).
         private val RULES: List<Triple<String, List<Regex>, (String) -> String>> = listOf(
             Triple(
                 "screenshot.capture",
@@ -285,7 +314,26 @@ class FastRouter(
                 OPEN_APP_HINTS,
                 { t -> "{\"appName\": \"${esc(t)}\", \"packageName\": \"\"}" },
             ),
+            // B3 reference expansion (`lsp.symbols`, the single ready tool):
+            // symbol-naming intents route FAST only when projected AND ready;
+            // the query is the hint-stripped remainder (blank ⇒ clarification
+            // in [missingQuestionFor], never an empty-query execution).
+            Triple(
+                LspTools.SYMBOLS_NAME,
+                SYMBOL_HINTS,
+                { t -> symbolArgs(t) },
+            ),
         )
+
+        /**
+         * Fast-lane template coverage: every tool name with a RULES template.
+         * Expansion-rule oracle for `FastDispatchTest`: every
+         * `executionReady` registry tool must be covered here BEFORE its flag
+         * flips (a RULES gap is fail-safe, a NEGATION gap is not — see the
+         * class KDoc). Untemplated tools can never reach FAST by construction
+         * ([matchTemplate] returns null ⇒ DENIED no-match).
+         */
+        fun templateToolNames(): Set<String> = RULES.map { it.first }.toSet()
 
         private fun jsonText(text: String): String =
             "{\"text\": \"${esc(text)}\"}"
@@ -341,6 +389,29 @@ class FastRouter(
             return "{\"hour\": $hour, \"minute\": $minute, \"label\": \"${esc(text)}\"}"
         }
 
+        /**
+         * B3 symbol-query strip tokens: hint words removed from the intent to
+         * isolate the symbol name. Deliberately token-based (not char-based)
+         * so a symbol name merely CONTAINING a hint char (e.g. 「查理」) is not
+         * shredded char by char — though a name exactly equal to joined hint
+         * tokens still strips to blank and clarifies (fail-safe direction).
+         * Residual: CJK names embedding hint tokens over-strip; a READ-only
+         * echo mis-query is harmless, and future NER work owns precision.
+         */
+        private val SYMBOL_QUERY_STRIP =
+            Regex("幫我|這個|那個|一下|請|查|找|尋|搜|詢|符號|函式|函数|symbols?|lsp|[\\s，。、？?！!：:「」『』\"'（）()]", RegexOption.IGNORE_CASE)
+
+        private fun extractSymbolQuery(text: String): String =
+            SYMBOL_QUERY_STRIP.replace(text, "").trim()
+
+        private fun hasSymbolQuery(text: String): Boolean =
+            extractSymbolQuery(text).isNotEmpty()
+
+        private fun symbolArgs(text: String): String {
+            val q = extractSymbolQuery(text)
+            return "{\"query\": \"${esc(q)}\", \"limit\": ${LspTools.DEFAULT_LIMIT}}"
+        }
+
         private fun isNegated(text: String): Boolean = containsAny(text, NEGATION_HINTS)
 
         private fun hasExplicitAlarmTime(text: String): Boolean =
@@ -355,10 +426,11 @@ class FastRouter(
         }
 
         /**
-         * Stage1 缺參門（本輪封閉集，措辭收斂：只斷言此四項，不推及其他工具）：
+         * Stage1 缺參門（B3 擴至五項，措辭收斂：只斷言此五項，不推及其他工具）：
          * 缺 alarm 時間（不預設 7:00）、缺 phone 號碼（不送空字串）、
          * `sms.compose`（to 恆空，待收件者抽取落地前一律補參）、`calendar.create`
-         *（start/end 恆空，待日期解析落地前一律補參）。回傳問句即需澄清，null
+         *（start/end 恆空，待日期解析落地前一律補參）、`lsp.symbols`（剝離提示詞後
+         * query 為空，不送空白 query 執行）。回傳問句即需澄清，null
          * 即參數齊備（進接線門）。
          *
          * 範圍註記：`mail.compose`（to/subject 模板恆空）與 `open_app`
@@ -374,6 +446,8 @@ class FastRouter(
                 "請問簡訊要傳給誰？請補上收件號碼，例如「傳簡訊給 0912345678 說…」"
             "calendar.create" ->
                 "請問行程的時間是？請補上日期時間，例如「明天下午三點加個行程」需含時間"
+            LspTools.SYMBOLS_NAME ->
+                if (!hasSymbolQuery(text)) "請問要查哪個符號？例如「幫我查 Foo 這個符號」" else null
             else -> null
         }
 

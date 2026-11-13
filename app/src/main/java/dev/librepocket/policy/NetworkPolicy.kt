@@ -828,6 +828,13 @@ private fun isMetadataEndpoint(b: ByteArray): Boolean {
       0x02, 0x54,
     )
     if (b.size == want.size && want.indices.all { (b[it].toInt() and 0xff) == want[it] }) return true
+    // fd7a:115c:a1e0::53（Tailscale IPv6 Quad100 reserved service, #135 A5 前置：永遠封鎖/0-egress）。
+    val tailscaleQuad100 = intArrayOf(
+      0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x53,
+    )
+    if (tailscaleQuad100.indices.all { (b[it].toInt() and 0xff) == tailscaleQuad100[it] }) return true
   }
   return false
 }

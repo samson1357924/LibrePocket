@@ -457,12 +457,18 @@ class NetworkPolicyTest {
 
   @Test fun metadataExtendedAndUnspecifiedV6() {
     val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
-    // 169.254.169.123（GCE）與 fd00:ec2::254（AWS IPv6）皆 METADATA，opt-in 亦拒。
+    // 169.254.169.123（GCE）、fd00:ec2::254（AWS IPv6 metadata）與
+    // fd7a:115c:a1e0::53（Tailscale IPv6 Quad100 reserved service, #135 A5 前置）皆 METADATA，opt-in 亦拒。
     assertEquals(AddressClass.METADATA, NetworkPolicy.classifyAddress(addr("169.254.169.123")))
     assertDenied(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("http://169.254.169.123/", optIn, neverResolve))
     assertDenied(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("https://169.254.169.123/", optIn, neverResolve))
     assertEquals(AddressClass.METADATA, NetworkPolicy.classifyAddress(addr("fd00:ec2::254")))
     assertDenied(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("https://[fd00:ec2::254]/", optIn, neverResolve))
+    assertEquals(AddressClass.METADATA, NetworkPolicy.classifyAddress(addr("fd7a:115c:a1e0::53")))
+    assertDenied(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("https://[fd7a:115c:a1e0::53]/", optIn, neverResolve))
+    assertDenied(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("http://[fd7a:115c:a1e0::53]/", optIn, neverResolve))
+    assertDenied(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("https://[fd7a:115c:a1e0::53]/", EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS), neverResolve))
+    assertDenied(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("http://[fd7a:115c:a1e0::53]/", EndpointNetworkOptIn(), neverResolve))
     // :: 與 0.0.0.0 同屬 UNSPECIFIED，opt-in 亦拒。
     assertEquals(AddressClass.UNSPECIFIED, NetworkPolicy.classifyAddress(addr("::")))
     assertDenied(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("https://[::]/", optIn, neverResolve))

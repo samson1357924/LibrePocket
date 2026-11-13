@@ -1602,6 +1602,7 @@ class ElevatedRunnerP1B2Test {
                         ) {
                             Thread.sleep(10L)
                         }
+                        assertTrue("swallowedIsCancelledThrows did not increment before deadline", ElevatedProcessIo.swallowedIsCancelledThrows.get() > swallowedBefore)
                         blockRelease.countDown()
                         bg.join(10_000L)
                         assertFalse(bg.isAlive)
@@ -1651,6 +1652,7 @@ class ElevatedRunnerP1B2Test {
                         ) {
                             Thread.sleep(10L)
                         }
+                        assertTrue("swallowedIsCancelledThrows did not increment before deadline", ElevatedProcessIo.swallowedIsCancelledThrows.get() > swallowedBefore)
                         blockRelease.countDown()
                         bg.join(10_000L)
                         assertFalse(bg.isAlive)
@@ -1733,6 +1735,7 @@ class ElevatedRunnerP1B2Test {
                         ) {
                             Thread.sleep(10L)
                         }
+                        assertTrue("swallowedIsCancelledThrows did not increment before deadline", ElevatedProcessIo.swallowedIsCancelledThrows.get() > swallowedBefore)
                         spawnRelease.countDown()
                         bg.join(10_000L)
                         assertFalse(bg.isAlive)
@@ -1922,9 +1925,17 @@ class ElevatedRunnerP1B2Test {
                 assertTrue(cancelBlockEntered.await(10, TimeUnit.SECONDS))
                 spawnRelease.countDown()
                 assertTrue(spawnDone.await(10, TimeUnit.SECONDS))
-                // Wait briefly so worker publishes Val before caller expires.
-                Thread.sleep(30L)
                 cancelGate.countDown()
+                val workerDeadline = System.currentTimeMillis() + 5_000L
+                while (Thread.getAllStackTraces().keys.any { it.name == "elevated-supervisor" && it.isAlive } &&
+                    System.currentTimeMillis() < workerDeadline
+                ) {
+                    Thread.sleep(2L)
+                }
+                assertFalse(
+                    "supervisor worker must terminate after publishing before cancel",
+                    Thread.getAllStackTraces().keys.any { it.name == "elevated-supervisor" && it.isAlive },
+                )
                 bg.join(10_000L)
                 assertFalse(bg.isAlive)
                 val res = resRef.get()
@@ -2120,7 +2131,7 @@ class ElevatedRunnerP1B2Test {
                     // Delay longer than the 0ms gap between tOut.interrupt() and tOut.isAlive/out.failed
                     // when grace is missing, while staying well within CLEANUP_GRACE_MS (500ms).
                     try {
-                        Thread.sleep(40L)
+                        Thread.yield()
                     } catch (_: InterruptedException) {
                         // Interrupt flag was cleared by catching InterruptedException above.
                     }
@@ -2216,6 +2227,89 @@ class ElevatedRunnerP1B2Test {
             }
         } finally {
             exec.close()
+        }
+    }
+
+    @Test fun drainKillerThrowableRecoverySetsIncompleteAndCounts() {
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val before = ElevatedProcessIo.swallowedKillerThrows.get()
+        val p = FakeProcess("ok".toByteArray(), ByteArray(0), 0, hang = true)
+        val d = ElevatedProcessIo.drain(
+            process = p,
+            timeoutMs = 100L,
+            killer = { throw OutOfMemoryError("killer boom") },
+            isCancelled = { false },
+        )
+        assertTrue("drain must time out on hanging process", d.timedOut)
+        assertTrue(
+            "swallowedKillerThrows must increment on throwing killer",
+            ElevatedProcessIo.swallowedKillerThrows.get() > before,
+        )
+        pollOutstandingTo(0)
+        awaitNoElevatedThreads()
+        ElevatedCleanupTracker.noteClean()
+    }
+
+    @Test fun rootRawSuResLingerPathMarksTimedOut() {
+        fun awaitUninterruptibly(latch: CountDownLatch) {
+            while (true) {
+                try {
+                    latch.await()
+                    break
+                } catch (_: InterruptedException) {
+                    // swallow
+                }
+            }
+        }
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val suEntered = CountDownLatch(1)
+        val suRelease = CountDownLatch(1)
+        val watchEntered = CountDownLatch(1)
+        val watchRelease = CountDownLatch(1)
+        val suStarted = AtomicBoolean(false)
+        val resultRef = AtomicReference<ElevatedBinaryResult?>()
+        val bg = Thread {
+            val runner = RootSuRunner(
+                privateRoot = privateRoot,
+                bridgeGranted = GrantFixtures.bridgeOn,
+                activationCheck = GrantFixtures.activationOn,
+                spawn = { FakeProcess("ok".toByteArray()) },
+                suBinary = null,
+                suExists = { _ ->
+                    suStarted.set(true)
+                    suEntered.countDown()
+                    awaitUninterruptibly(suRelease)
+                    true
+                },
+                isCancelled = {
+                    if (suStarted.get()) {
+                        watchEntered.countDown()
+                        awaitUninterruptibly(watchRelease)
+                    }
+                    false
+                },
+                grantCheck = GrantFixtures.allowAlways,
+            )
+            resultRef.set(runner.runBinary(ElevatedRequest(listOf("id"), "P1-RAW-SU-LINGER"), 5_000L))
+        }.also { it.isDaemon = true; it.start() }
+        try {
+            assertTrue(suEntered.await(10, TimeUnit.SECONDS))
+            assertTrue(watchEntered.await(10, TimeUnit.SECONDS))
+            suRelease.countDown()
+            bg.join(10_000L)
+            assertFalse(bg.isAlive)
+            val res = resultRef.get()
+            assertTrue("expected TimedOut, got $res", res is ElevatedBinaryResult.TimedOut)
+            assertTrue("rawSuRes linger must set cleanupIncomplete", (res as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
+        } finally {
+            suRelease.countDown()
+            watchRelease.countDown()
+            bg.join(5_000L)
+            pollOutstandingTo(0)
+            awaitNoElevatedThreads()
+            ElevatedCleanupTracker.noteClean()
         }
     }
 }

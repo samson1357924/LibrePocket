@@ -128,6 +128,16 @@ internal fun hostOf(url: String): String? = try {
 
 internal const val MAX_WEB_BASE_URL_LENGTH = 2048
 
+internal fun isSafeUrlForStorage(url: String): Boolean {
+    if (url.isEmpty()) return true
+    if (url.length > MAX_WEB_BASE_URL_LENGTH) return false
+    if (containsControlFormatOrSurrogateChar(url)) return false
+    if (url.any { it == '@' || it == '?' || it == '#' || it == '\\' || it == '\u2028' || it == '\u2029' }) {
+        return false
+    }
+    return true
+}
+
 private val NUMERIC_IPV4_PART = Regex("""^(\d+|0[xX][0-9a-fA-F]+)$""")
 private val IPV6_LITERAL_CHARS = Regex("""^[0-9a-fA-F:.]+$""")
 private val DOT_SEGMENTS = setOf(".", "..")

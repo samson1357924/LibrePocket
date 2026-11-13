@@ -20,8 +20,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogProperties
 import dev.librepocket.web.WebProbe
 import dev.librepocket.web.WebSearchSettings
+import dev.librepocket.web.WebUnavailableReason
 
 /**
  * D3 網路搜尋設定狀態（Settings→Tools→Web；null 時整卡隱藏，仿 automation 模式）。
@@ -32,18 +34,29 @@ import dev.librepocket.web.WebSearchSettings
  *   （可用／缺 URL／缺 key，見 [WebSearchSettings.statusText]）；
  * - [probeMessage]：`probe()` 測試結果（null＝尚未測試）；
  * - [showConsent]：首次開啟 consent sheet 是否顯示；
- * - [switchesEnabled]：讀取中／讀取失敗時禁用開關（fail-closed，不在未知真相源上寫入）。
+ * - [switchesEnabled]：讀取中／讀取失敗時禁用開關（fail-closed，不在未知真相源上寫入）；
+ * - [urlEditable]：SearXNG URL 輸入框是否可編輯（讀取中／讀取失敗／同意提交中皆禁用）；
+ * - [isLoading]：是否處於冷啟動讀取或重試讀取中；
+ * - [loadFailed]：讀取失敗（需顯示重試讀取提示）；
+ * - [writeError]：最近一次儲存／同意／重設失敗或輸入含不支援字元之錯誤訊息（null＝無錯誤）；
+ * - [consentSubmitting]：首次同意提交中（禁用重複點擊與關閉）；
+ * - [canReset]：目前是否存在可重設的非預設設定或草稿。
  */
 data class WebSearchSettingsState(
     val masterEnabled: Boolean,
     val ddgsOptIn: Boolean,
     val searxngUrl: String = "",
-    val searxngProbe: WebProbe = WebProbe.NotReady(dev.librepocket.web.WebUnavailableReason.MISSING_URL),
+    val searxngProbe: WebProbe = WebProbe.NotReady(WebUnavailableReason.MISSING_URL),
     val ddgsProbe: WebProbe = WebProbe.Ready,
     val probeMessage: String? = null,
     val showConsent: Boolean = false,
     val switchesEnabled: Boolean = true,
     val urlEditable: Boolean = true,
+    val isLoading: Boolean = false,
+    val loadFailed: Boolean = false,
+    val writeError: String? = null,
+    val consentSubmitting: Boolean = false,
+    val canReset: Boolean = false,
 )
 
 @Composable
@@ -169,7 +182,11 @@ fun WebSearchCard(
     }
     if (state.showConsent) {
         AlertDialog(
-            onDismissRequest = onConsentDismiss,
+            onDismissRequest = { if (!state.consentSubmitting) onConsentDismiss() },
+            properties = DialogProperties(
+                dismissOnBackPress = !state.consentSubmitting,
+                dismissOnClickOutside = !state.consentSubmitting,
+            ),
             title = {
                 Text(
                     WebSearchSettings.CONSENT_TITLE,
@@ -194,6 +211,7 @@ fun WebSearchCard(
             confirmButton = {
                 TextButton(
                     onClick = onConsentConfirm,
+                    enabled = !state.consentSubmitting && state.switchesEnabled,
                     modifier = Modifier.testTag("webConsentConfirm"),
                 ) {
                     Text("同意並啟用")
@@ -202,6 +220,7 @@ fun WebSearchCard(
             dismissButton = {
                 TextButton(
                     onClick = onConsentDismiss,
+                    enabled = !state.consentSubmitting,
                     modifier = Modifier.testTag("webConsentDismiss"),
                 ) {
                     Text("取消")

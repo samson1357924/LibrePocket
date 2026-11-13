@@ -1,9 +1,16 @@
 package dev.librepocket.agent.ui.settings
 
+import android.app.Application
+import android.view.MotionEvent
+import androidx.activity.ComponentDialog
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -11,6 +18,10 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
+import androidx.test.core.app.ApplicationProvider
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.provider.ProviderProtocol
@@ -18,12 +29,15 @@ import dev.librepocket.web.WebProbe
 import dev.librepocket.web.WebSearchSettings
 import dev.librepocket.web.WebUnavailableReason
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowDialog
 
 /**
  * D3 Settings→Tools→Web Robolectric tests（#138 D3）。
@@ -81,7 +95,8 @@ class WebSearchSettingsCardTest {
             )
         }
         onWebTag("webSearchCard").assertIsDisplayed()
-        onWebTag("webMasterSwitch").assertIsDisplayed()
+        onWebTag("webMasterSwitch").assertIsDisplayed().assertIsOff()
+        onWebTag("webDdgsSwitch").assertIsDisplayed().assertIsOff()
         // SearXNG 空 URL → 缺 URL；DDGS keyless 預設 Ready → 設定格式有效（未連網）。
         onWebTag("webSearxngStatus").assertIsDisplayed()
         composeRule.onNodeWithText("狀態：缺 URL", substring = true).performScrollTo().assertIsDisplayed()
@@ -184,6 +199,48 @@ class WebSearchSettingsCardTest {
     }
 
     @Test
+    fun consentSubmittingDisablesConfirmAndDismiss() {
+        var confirmed = 0
+        var dismissed = 0
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                web = webState(showConsent = true).copy(consentSubmitting = true),
+                onWebConsentConfirm = { confirmed++ },
+                onWebConsentDismiss = { dismissed++ },
+            )
+        }
+        composeRule.onNodeWithTag("webConsentConfirm").assertIsNotEnabled()
+        composeRule.onNodeWithTag("webConsentDismiss").assertIsNotEnabled()
+        composeRule.onNodeWithTag("webConsentConfirm").performClick()
+        composeRule.onNodeWithTag("webConsentDismiss").performClick()
+        assertEquals(0, confirmed)
+        assertEquals(0, dismissed)
+    }
+
+    @Test
+    fun consentSheetWhenSwitchesDisabled_disablesConfirmButKeepsDismissEnabled() {
+        var confirmed = 0
+        var dismissed = 0
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                web = webState(showConsent = true).copy(switchesEnabled = false),
+                onWebConsentConfirm = { confirmed++ },
+                onWebConsentDismiss = { dismissed++ },
+            )
+        }
+        composeRule.onNodeWithTag("webConsentConfirm").assertIsNotEnabled()
+        composeRule.onNodeWithTag("webConsentDismiss").assertIsEnabled()
+        composeRule.onNodeWithTag("webConsentConfirm").performClick()
+        assertEquals(0, confirmed)
+        composeRule.onNodeWithTag("webConsentDismiss").performClick()
+        assertEquals(1, dismissed)
+    }
+
+    @Test
     fun missingKeyStatusDisplayed() {
         composeRule.setContent {
             SettingsScreen(
@@ -243,6 +300,115 @@ class WebSearchSettingsCardTest {
         }
         onWebTag("webMasterSwitch").assertIsNotEnabled()
         onWebTag("webDdgsSwitch").assertIsNotEnabled()
+        onWebTag("webSearxngUrl").assertIsNotEnabled()
         onWebTag("webProbeButton").assertIsNotEnabled()
+    }
+
+    @Test
+    fun urlEditableFalseDisablesUrlFieldOnly() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                web = webState().copy(switchesEnabled = true, urlEditable = false),
+            )
+        }
+        onWebTag("webSearxngUrl").assertIsNotEnabled()
+        onWebTag("webMasterSwitch").assertIsEnabled()
+        onWebTag("webDdgsSwitch").assertIsEnabled()
+        onWebTag("webProbeButton").assertIsEnabled()
+    }
+
+    @Test
+    fun consentSubmittingBlocksBackPressDismissAndKeepsDialogDisplayed() {
+        var submitting by mutableStateOf(true)
+        var dismissed = 0
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                web = webState(showConsent = true).copy(consentSubmitting = submitting),
+                onWebConsentDismiss = { dismissed++ },
+            )
+        }
+        composeRule.onNodeWithTag("webConsentTitle").assertIsDisplayed()
+        val dialog = ShadowDialog.getLatestDialog() as ComponentDialog
+        composeRule.runOnIdle {
+            dialog.onBackPressedDispatcher.onBackPressed()
+        }
+        composeRule.waitForIdle()
+        assertEquals(0, dismissed)
+        composeRule.onNodeWithTag("webConsentTitle").assertIsDisplayed()
+
+        // Positive control: once consentSubmitting becomes false, back press reaches onWebConsentDismiss.
+        submitting = false
+        composeRule.waitForIdle()
+        composeRule.runOnIdle {
+            dialog.onBackPressedDispatcher.onBackPressed()
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, dismissed)
+    }
+
+    @Test
+    fun consentSubmittingBlocksOutsideTouchDismissAndKeepsDialogDisplayed() {
+        var submitting by mutableStateOf(true)
+        var dismissed = 0
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                web = webState(showConsent = true).copy(consentSubmitting = submitting),
+                onWebConsentDismiss = { dismissed++ },
+            )
+        }
+        composeRule.onNodeWithTag("webConsentTitle").assertIsDisplayed()
+        val dialog = ShadowDialog.getLatestDialog() as ComponentDialog
+
+        fun dispatchOutsideTap(): Boolean {
+            val down = MotionEvent.obtain(0L, 0L, MotionEvent.ACTION_DOWN, -100f, -100f, 0)
+            val up = MotionEvent.obtain(0L, 10L, MotionEvent.ACTION_UP, -100f, -100f, 0)
+            return try {
+                val downHandled = dialog.onTouchEvent(down)
+                val upHandled = dialog.onTouchEvent(up)
+                downHandled || upHandled
+            } finally {
+                down.recycle()
+                up.recycle()
+            }
+        }
+
+        val handledWhileSubmitting = composeRule.runOnIdle { dispatchOutsideTap() }
+        composeRule.waitForIdle()
+        assertFalse(handledWhileSubmitting)
+        assertEquals(0, dismissed)
+        composeRule.onNodeWithTag("webConsentTitle").assertIsDisplayed()
+
+        // Positive control: once consentSubmitting becomes false, outside touch dismiss reaches onWebConsentDismiss.
+        submitting = false
+        composeRule.waitForIdle()
+        val handledAfterSubmit = composeRule.runOnIdle { dispatchOutsideTap() }
+        composeRule.waitForIdle()
+        assertTrue(handledAfterSubmit)
+        assertEquals(1, dismissed)
+    }
+
+    private class UnknownTestViewModel : ViewModel()
+
+    @Test
+    fun webSearchViewModelFactory_createsWebSearchViewModelAndRejectsUnknownClass() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val factory = WebSearchViewModelFactory(app)
+        assertThrows(IllegalArgumentException::class.java) {
+            factory.create(UnknownTestViewModel::class.java)
+        }
+
+        val vmStore = ViewModelStore()
+        try {
+            val vm = ViewModelProvider(vmStore, factory)[WebSearchViewModel::class.java]
+            assertEquals(WebSearchViewModel::class.java, vm::class.java)
+        } finally {
+            vmStore.clear()
+        }
     }
 }

@@ -346,8 +346,9 @@ class Stage3ResidualPinTest {
 
     /**
      * Tests P2-1: exact-cap history through the FULL factory.open (not just
-     * loadModelHistory): 1000 pairs = 2000 qualifying rows, dropped==0, and
-     * the first live send keeps the combined window honest.
+     * loadModelHistory): 1000 pairs = 2000 qualifying rows, dropped==0 at the
+     * DB tail, and the first live send windows the combined copy to DEFAULT
+     * (200, B2) — the full 2000-row prefix no longer reaches the request.
      */
     @Test fun exactCap2000ViaFactoryOpen_reportsZeroDropped() = runBlocking {
         val transcripts = FakeSessionStore()
@@ -367,7 +368,7 @@ class Stage3ResidualPinTest {
             assertEquals(0, opened.historyDroppedCount)
             opened.session.send("q-new")
             val req = provider.seenRequests.single()
-            assertTrue("full prefix must reach the request, got ${req.messages.size}", req.messages.size >= 2000)
+            assertEquals("B2: DEFAULT window bounds the request, got ${req.messages.size}", 200, req.messages.size)
         } finally {
             opened.session.close()
         }

@@ -189,9 +189,22 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * tiny-message floods are still count-bounded). Ordinary sessions never trip
  * either leg; long dialogues window oldest-first and stay observable.
  * [Unbounded] is retained as an explicit opt-in for tests/scaffolds that
- * need the full history. Hydration-tail unification (the 2000-row DB tail
- * still loads before this window) and any token/context measurement stay
- * Target for B2.
+ * need the full history. B2 hydration-tail unification (done): `open`
+ * travels this same [DEFAULT] (200/60k), so create/resume share one window;
+ * the 2000-row DB backward scan stays as the I/O upper bound for
+ * reasoning-marker collection (R23/R24/R25) and the extra rows are dropped
+ * by this window downstream, never shipped. Device-heap validation of that
+ * scan stays B3.
+ *
+ * Token layer (B2, honest char-based, no tokenizer dependency): all legs
+ * above are `String.length` (UTF-16 code units). Interim conversion assumes
+ * ~4 chars/token for running text (English ~3.5-4; CJK/dense symbols vary
+ * widely, so this is an order-of-magnitude budget aid, never a billing or
+ * model-context guarantee): 60k chars ≈ 15k tokens, 100k
+ * ([MAX_REQUEST_CHARS]) ≈ 25k tokens, one 20k interim row ≈ 5k tokens.
+ * Real token/heap measurement and budget tuning stay Target (B3 device
+ * validation); until then the char bound is the interim cap and every trim
+ * stays observable via the counters above.
  *
  * Pair atomicity (B1): truncation never splits a legal tool-call/result
  * pairing. When a naive head cut (count/char/dual) falls inside a valid,
@@ -214,6 +227,16 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * blank `toolCallId` within or straddling the retained window), the window
  * never repairs or drops it: it keeps the naive cut and fails closed
  * downstream in `ProviderJson.validateToolPairing`.
+ *
+ * Canonical note (B1 review, mirror-canonical drift): the pairing rule here
+ * mirrors the downstream gate `ProviderJson.validateToolPairing(...,
+ * allowChatBackfill = true)` (assistant `toolCalls` open, matching `tool`
+ * ids drain, single-pending blank-id backfill) via [snapHistoryToPairBoundary]
+ * + [completeToolBatchEnd], shared by the window, the send-time
+ * `MAX_REQUEST_CHARS` trim, and the continuation prefix trim. The gate is
+ * canonical; this window is a mirror only. On any drift the window stays
+ * strict (naive cut, never a repair) so the gate still fails closed on the
+ * shipped shape.
  */
 sealed interface HistoryWindowCap {
   data object Unbounded : HistoryWindowCap
@@ -591,8 +614,10 @@ internal enum class DurableAdmission {
  * excluded by the caller — they replay in the UI flagged, but never read as
  * completed model context, mirroring the live `!isPartial` filter below).
  * [historyCap] bounds that prefix oldest-first at whole-message boundaries
- * ([HistoryWindowCap]); hydration-tail unification (DB tail paging) stays
- * Target for B2. Every outgoing [ChatRequest] is history-prefix + live
+ * ([HistoryWindowCap]); B2 hydration-tail unification (done): `open` travels
+ * [HistoryWindowCap.DEFAULT], so create/resume share one window (the DB
+ * 2000-row scan stays as the I/O upper bound, windowed downstream). Every
+ * outgoing [ChatRequest] is history-prefix + live
  * messages, so the first request after resume already sees the prior
  * conversation.
  *

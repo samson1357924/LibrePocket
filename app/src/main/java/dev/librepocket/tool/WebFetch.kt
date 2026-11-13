@@ -253,6 +253,17 @@ object WebFetch {
      *   [NetworkDenyCode.REDIRECT_BLOCKED]（跳往迴環／私有／metadata 等皆同），
      *   放行回該跳評估（含釘住用答案與正規化 URL）。
      */
+    /**
+     * Redirect opt-in 狀態轉移：跨 origin 不可逆降級為 HTTPS_ONLY（deny-all），
+     * 同 origin 則維持目前有效 opt-in（不得恢復已降級權限）。
+     */
+    internal fun downgradedOptInForRedirect(
+        currentUrl: String,
+        resolvedUrl: String,
+        effectiveOptIn: EndpointNetworkOptIn,
+    ): EndpointNetworkOptIn =
+        if (sameOrigin(currentUrl, resolvedUrl)) effectiveOptIn else EndpointNetworkOptIn()
+
     internal fun evaluateRedirectTarget(
         currentUrl: String,
         resolvedUrl: String,
@@ -336,6 +347,7 @@ object WebFetch {
         }
         val callClientBase = builder.build()
         var current = first
+        var effectiveOptIn = optIn
         var hops = 0
         while (true) {
             val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
@@ -363,11 +375,11 @@ object WebFetch {
                         // 通過才補釘並跟隨（建連只走釘住答案）。
                         val hopEvalRemaining = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
                         if (hopEvalRemaining <= 0L) return transportFailed("TIMEOUT")
-                        // 跨 origin 跳轉時 opt-in 降級為 HTTPS_ONLY（deny-all）：
-                        // 原端點授權不得沿用到跨站目標，避免私有/明文權限外洩。
-                        val hopOptIn = if (sameOrigin(current, resolved)) optIn else EndpointNetworkOptIn()
+                        // 跨 origin 跳轉時 opt-in 不可逆降級為 HTTPS_ONLY（deny-all）：
+                        // 原端點授權不得沿用到跨站目標，且後續同 origin 跳轉亦不得恢復。
+                        effectiveOptIn = downgradedOptInForRedirect(current, resolved, effectiveOptIn)
                         val hopEval = evaluateWithBudget(hopEvalRemaining) {
-                            evaluateRedirectTarget(current, resolved, hopOptIn, resolver)
+                            evaluateRedirectTarget(current, resolved, effectiveOptIn, resolver)
                         } ?: return transportFailed("TIMEOUT")
                         if (!hopEval.allowed || hopEval.resolvedAddresses.isEmpty()) return redirectBlocked()
                         val hopUrl = hopEval.normalizedUrl ?: resolved

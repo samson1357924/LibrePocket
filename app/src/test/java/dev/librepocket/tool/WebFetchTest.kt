@@ -866,4 +866,42 @@ class WebFetchTest {
             server.shutdown()
         }
     }
+
+    @Test fun redirectCrossOriginDowngradeIsIrreversibleAcrossHops() {
+        // 多跳狀態轉移：A(原授權) --cross-origin--> B 後不可逆降級為 HTTPS_ONLY，
+        // B 的同站後續跳轉不得恢復原授權（即使 resolved 與 B 同 origin）。
+        val original = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val afterCross = WebFetch.downgradedOptInForRedirect(
+            "https://a.example/start",
+            "https://b.example/first",
+            original,
+        )
+        assertEquals(EndpointNetworkOptIn(), afterCross)
+
+        val afterSameOriginOnB = WebFetch.downgradedOptInForRedirect(
+            "https://b.example/first",
+            "https://b.example/private",
+            afterCross,
+        )
+        assertEquals(EndpointNetworkOptIn(), afterSameOriginOnB)
+
+        // 後續同站跳轉若目標需原始 private opt-in（DNS 指向私有位址），必須被阻擋。
+        val dns = fakeDns("b.example" to listOf("10.0.0.5"))
+        val eval = WebFetch.evaluateRedirectTarget(
+            "https://b.example/first",
+            "https://b.example/private",
+            afterSameOriginOnB,
+            dns,
+        )
+        assertFalse("expected deny after irreversible downgrade: $eval", eval.allowed)
+        assertEquals(NetworkDenyCode.REDIRECT_BLOCKED, eval.denyCode)
+
+        // 額外：再次跨站仍維持降級（不可回升）。
+        val afterAnotherCross = WebFetch.downgradedOptInForRedirect(
+            "https://b.example/private",
+            "https://a.example/back",
+            afterSameOriginOnB,
+        )
+        assertEquals(EndpointNetworkOptIn(), afterAnotherCross)
+    }
 }

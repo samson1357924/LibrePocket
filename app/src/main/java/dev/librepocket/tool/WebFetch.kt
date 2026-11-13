@@ -15,10 +15,8 @@ import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.nio.charset.Charset
 import java.nio.charset.CodingErrorAction
-import java.util.concurrent.Callable
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
@@ -214,33 +212,24 @@ object WebFetch {
         return false
     }
 
-    private val preflightThreadCount = AtomicInteger(1)
-
     @Volatile
-    internal var preflightExecutor: ExecutorService =
-        Executors.newFixedThreadPool(4) { r ->
-            Thread(r, "webfetch-preflight-${preflightThreadCount.getAndIncrement()}").apply { isDaemon = true }
-        }
+    internal var preflightExecutor: ExecutorService = NetworkPolicy.defaultPreflightExecutor
 
-    private fun evaluateWithBudget(budgetMs: Long, block: () -> NetworkEvaluation): NetworkEvaluation? {
-        val future = try {
-            preflightExecutor.submit(Callable { block() })
-        } catch (_: RejectedExecutionException) {
-            return null
-        }
+    private fun evaluateWithBudget(
+        budgetMs: Long,
+        block: () -> NetworkEvaluation,
+    ): NetworkPolicy.PreflightOutcome<NetworkEvaluation> {
+        val safeBudgetMs = budgetMs.coerceAtLeast(1L)
+        val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(safeBudgetMs)
         return try {
-            future.get(budgetMs.coerceAtLeast(1L), TimeUnit.MILLISECONDS)
-        } catch (_: TimeoutException) {
-            future.cancel(true)
-            null
-        } catch (_: InterruptedException) {
-            future.cancel(true)
+            NetworkPolicy.runPreflightBlocking(
+                deadlineNs = deadlineNs,
+                executor = preflightExecutor,
+                block = block,
+            )
+        } catch (_: kotlinx.coroutines.CancellationException) {
             Thread.currentThread().interrupt()
-            null
-        } catch (e: ExecutionException) {
-            val cause = e.cause
-            if (cause is CancellationException) return null
-            throw (cause ?: e)
+            NetworkPolicy.PreflightOutcome.TimedOut
         }
     }
 
@@ -308,9 +297,15 @@ object WebFetch {
         // 逐跳 DNS preflight 與 HTTP）。
         val safeTimeout = timeoutMs.coerceIn(1L, MAX_TIMEOUT_MS)
         val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(safeTimeout)
-        val firstEval = evaluateWithBudget(safeTimeout) {
-            NetworkPolicy.evaluateUrl(rawUrl, optIn, resolver)
-        } ?: return transportFailed("TIMEOUT")
+        val firstEval = when (
+            val pre = evaluateWithBudget(safeTimeout) {
+                NetworkPolicy.evaluateUrl(rawUrl, optIn, resolver)
+            }
+        ) {
+            is NetworkPolicy.PreflightOutcome.Completed -> pre.value
+            NetworkPolicy.PreflightOutcome.TimedOut -> return transportFailed("TIMEOUT")
+            NetworkPolicy.PreflightOutcome.OverloadRejected -> return transportFailed("TRANSPORT")
+        }
         if (!firstEval.allowed || firstEval.resolvedAddresses.isEmpty()) {
             return unavailable(firstEval.denyCode?.name ?: NetworkDenyCode.INVALID_HOST.name)
         }
@@ -378,9 +373,15 @@ object WebFetch {
                         // 跨 origin 跳轉時 opt-in 不可逆降級為 HTTPS_ONLY（deny-all）：
                         // 原端點授權不得沿用到跨站目標，且後續同 origin 跳轉亦不得恢復。
                         effectiveOptIn = downgradedOptInForRedirect(current, resolved, effectiveOptIn)
-                        val hopEval = evaluateWithBudget(hopEvalRemaining) {
-                            evaluateRedirectTarget(current, resolved, effectiveOptIn, resolver)
-                        } ?: return transportFailed("TIMEOUT")
+                        val hopEval = when (
+                            val pre = evaluateWithBudget(hopEvalRemaining) {
+                                evaluateRedirectTarget(current, resolved, effectiveOptIn, resolver)
+                            }
+                        ) {
+                            is NetworkPolicy.PreflightOutcome.Completed -> pre.value
+                            NetworkPolicy.PreflightOutcome.TimedOut -> return transportFailed("TIMEOUT")
+                            NetworkPolicy.PreflightOutcome.OverloadRejected -> return transportFailed("TRANSPORT")
+                        }
                         if (!hopEval.allowed || hopEval.resolvedAddresses.isEmpty()) return redirectBlocked()
                         val hopUrl = hopEval.normalizedUrl ?: resolved
                         val hopHost = hopUrl.toHttpUrlOrNull()?.host ?: return redirectBlocked()

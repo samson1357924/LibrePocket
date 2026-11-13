@@ -10,6 +10,8 @@ import java.net.InetAddress
 import java.net.UnknownHostException
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
+import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -903,5 +905,34 @@ class WebFetchTest {
             afterSameOriginOnB,
         )
         assertEquals(EndpointNetworkOptIn(), afterAnotherCross)
+    }
+
+    @Test fun preflightOverloadFailsDeterministicallyWithoutUnboundedQueue() {
+        val saturated = ThreadPoolExecutor(
+            1, 1, 0L, TimeUnit.MILLISECONDS,
+            SynchronousQueue(),
+            ThreadPoolExecutor.AbortPolicy(),
+        )
+        val blocker = java.util.concurrent.CountDownLatch(1)
+        saturated.execute {
+            try { blocker.await(5, TimeUnit.SECONDS) } catch (_: InterruptedException) {}
+        }
+        val old = WebFetch.preflightExecutor
+        WebFetch.preflightExecutor = saturated
+        try {
+            // DNS 需要解析才會進入 preflight executor；overload 應確定性失敗（不誤記為 TIMEOUT）。
+            val outcome = WebFetch.fetch(
+                "https://example.com/",
+                timeoutMs = 500,
+                resolver = fakeDns("example.com" to listOf("203.0.113.10")),
+            )
+            val failed = outcome as? WebFetch.FetchOutcome.Failed
+            assertNotNull("expected Failed, got: $outcome", failed)
+            assertEquals("TRANSPORT", failed!!.detail)
+        } finally {
+            blocker.countDown()
+            WebFetch.preflightExecutor = old
+            saturated.shutdownNow()
+        }
     }
 }

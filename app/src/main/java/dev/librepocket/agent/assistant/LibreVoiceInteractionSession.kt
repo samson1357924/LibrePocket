@@ -1,6 +1,7 @@
 package dev.librepocket.agent.assistant
 
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import android.service.voice.VoiceInteractionSession
 import android.util.Log
@@ -18,15 +19,20 @@ private const val TAG = "LibreVoiceSession"
 /**
  * C1/C2 語音助理 session（Issue #137）。
  *
- * `onShow` 後以 [assistantVoiceIntent(android.content.Context)] 為基礎，
- * 此處再 `setClass` 轉真 explicit，掛 MainActivity component（真 explicit）
- * 並經 `startVoiceActivity` 發出
- * `ACTION_ASSIST`（沿用既有 ASSIST 入口），再 `hide()`。C1/C2 皆不在 session 內做
- * UI／串流 STT（C2 改走 RecognizerIntent 委派）；喚起失敗亦 `hide()`，fail-closed，不殘留空白 session。
+ * Session 本體 UI-less（[onPrepareShow] 關閉預設 window，避免空白閃爍）；實際 UI
+ * 由 MainActivity 在獨立 voice task 中承載。
  *
- * `hide()` 與 `startVoiceActivity` 成功與否無關，兩路皆於 `finally` 執行
- * （成功亦 hide——UI 由 MainActivity 承載；失敗亦 hide——fail-closed，
- * 不殘留空白 session）。
+ * `onShow` 以 [assistantVoiceIntent(android.content.Context)] 為基礎轉真 explicit
+ * （掛 MainActivity component）並經 `startVoiceActivity` 發出
+ * `ACTION_ASSIST`（沿用既有 ASSIST 入口）。C1/C2 皆不在 session 內做
+ * UI／串流 STT（C2 改走 RecognizerIntent 委派）。
+ *
+ * 生命週期：`startVoiceActivity` 成功時 **不立即** `hide()`，避免 framework
+ * `hide()` 提前結束 voice task、殺掉委派中的 C2 MainActivity/STT 流程；
+ * session 需維持存活直到 voice task／activity 流程完成，由 [onTaskFinished]
+ * （或已隱藏狀態）收尾。`startVoiceActivity` 失敗時 fail-closed 立即
+ * `hide()`，不殘留空白 session。收尾路徑具 idempotent guard，避免重複
+ * `hide()`／重入迴圈。
  *
  * C2 UX 設計決策（專用 voice task）：`startVoiceActivity(assist)` 依系統語音助理
  * 契約建立獨立的 voice task（與主 App 現有對話草稿相互獨立，不覆寫主任務草稿）；
@@ -42,6 +48,8 @@ private const val TAG = "LibreVoiceSession"
  * 亦不自動觸發 STT），不授予額外能力。
  */
 open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSession(context) {
+    private var sessionHidden = false
+
     /**
      * Activity-only 流程（人類 review #5 session UI）：關預設 voice UI window，
      * 防空白閃爍；實際 UI 由 MainActivity 承載，session 本體不留可見 window。
@@ -53,6 +61,8 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
 
     override fun onShow(args: Bundle?, showFlags: Int) {
         super.onShow(args, showFlags)
+        // New show cycle may occur after a previous finish; allow one hide for this cycle.
+        sessionHidden = false
         try {
             // C2：掛 voice 請求 flag（見 AssistantVoice：只是 UI 提示，
             // MainActivity 收到後自動走既有 RecognizerIntent 委派；零新權限）。
@@ -63,9 +73,29 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
             startVoiceActivity(assist)
         } catch (e: Exception) {
             Log.w(TAG, "startVoiceActivity failed; hiding session", e)
-        } finally {
-            // hide() 與成功與否無關（見上 KDoc）：成功與失敗兩路皆執行。
-            hide()
+            // Fail-closed: do not leave an empty/inactive session around.
+            finishSession()
         }
+        // On success: keep session alive until the delegated voice task/activity flow completes.
+    }
+
+    override fun onTaskFinished(intent: Intent?, taskId: Int) {
+        super.onTaskFinished(intent, taskId)
+        finishSession()
+    }
+
+    override fun onHide() {
+        sessionHidden = true
+        super.onHide()
+    }
+
+    /**
+     * Ends this session once per lifecycle transition. Safe to call from failure and
+     * task-completion paths without repeated hide/re-entrancy loops.
+     */
+    protected open fun finishSession() {
+        if (sessionHidden) return
+        sessionHidden = true
+        hide()
     }
 }

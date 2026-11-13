@@ -52,7 +52,7 @@ class LibreVoiceInteractionSessionTest {
     }
 
     @Test
-    fun onShow_startsExplicitMainActivityWithAssistVoiceFlagAndHides() {
+    fun onShow_startsExplicitMainActivityWithAssistVoiceFlag_withoutImmediateHide() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val session = RecordingVoiceSession(context)
 
@@ -64,17 +64,31 @@ class LibreVoiceInteractionSessionTest {
         assertEquals(context.packageName, intent.`package`)
         assertEquals(MainActivity::class.java.name, intent.component?.className)
         assertTrue(AssistantVoice.isVoiceInputRequested(intent))
-        assertEquals(1, session.hideCalls)
+        // Successful start must keep the session alive for the delegated voice task/activity flow.
+        assertEquals(0, session.hideCalls)
     }
 
     @Test
-    fun onShow_whenStartVoiceActivityThrows_stillHidesFailClosed() {
+    fun onShow_whenStartVoiceActivityThrows_hidesFailClosed() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val session = RecordingVoiceSession(context, throwOnStart = true)
 
         session.onShow(null, 0)
 
         assertEquals(1, session.startedIntents.size)
+        assertEquals(1, session.hideCalls)
+    }
+
+    @Test
+    fun onTaskFinished_hidesSessionOnce() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val session = RecordingVoiceSession(context)
+
+        session.onShow(null, 0)
+        assertEquals(0, session.hideCalls)
+
+        session.onTaskFinished(null, 42)
+
         assertEquals(1, session.hideCalls)
     }
 }

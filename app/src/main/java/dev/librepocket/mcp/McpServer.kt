@@ -13,6 +13,8 @@ import java.util.IdentityHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
@@ -264,7 +266,9 @@ class McpServer internal constructor(
             (vaultRemainingNs / 1_000_000L) + if (vaultRemainingNs % 1_000_000L > 0L) 1L else 0L
         val keyResult = try {
             withTimeoutOrNull(vaultRemainingMs) {
-                Result.success(keyVault.getKey(config.keyId))
+                withContext(Dispatchers.IO) {
+                    Result.success(keyVault.getKey(config.keyId))
+                }
             }
         } catch (e: CancellationException) {
             throw e
@@ -274,7 +278,9 @@ class McpServer internal constructor(
             return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
         if (keyResult == null) {
-            // Step 6 vault 讀取超時：尚未進入 Step 7 傳輸，0 HTTP、0 熔斷失敗。
+            // Step 6 vault 讀取逾時：尚未進入 Step 7 傳輸，0 HTTP、0 熔斷失敗。
+            // 注意：withTimeoutOrNull 對不可中斷的同步 blocking backend 不具搶占性；
+            // 讀取已移至 Dispatchers.IO 以避免阻塞呼叫方執行緒，但底層工作可能持續至完成。
             return McpListResult(config.id, emptyList(), McpStatus.TIMEOUT, elapsedMs(start))
         }
         val key = keyResult.getOrNull()
@@ -541,7 +547,9 @@ class McpServer internal constructor(
             (vaultRemainingNs / 1_000_000L) + if (vaultRemainingNs % 1_000_000L > 0L) 1L else 0L
         val keyResult = try {
             withTimeoutOrNull(vaultRemainingMs) {
-                Result.success(keyVault.getKey(config.keyId))
+                withContext(Dispatchers.IO) {
+                    Result.success(keyVault.getKey(config.keyId))
+                }
             }
         } catch (e: CancellationException) {
             throw e
@@ -551,7 +559,9 @@ class McpServer internal constructor(
             return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, elapsedMs(start))
         }
         if (keyResult == null) {
-            // Step 6 vault 讀取超時：尚未進入 Step 7 傳輸，0 HTTP、0 熔斷失敗。
+            // Step 6 vault 讀取逾時：尚未進入 Step 7 傳輸，0 HTTP、0 熔斷失敗。
+            // 注意：withTimeoutOrNull 對不可中斷的同步 blocking backend 不具搶占性；
+            // 讀取已移至 Dispatchers.IO 以避免阻塞呼叫方執行緒，但底層工作可能持續至完成。
             return McpCallResult(config.id, toolName, McpStatus.TIMEOUT, elapsedMs(start))
         }
         val key = keyResult.getOrNull()

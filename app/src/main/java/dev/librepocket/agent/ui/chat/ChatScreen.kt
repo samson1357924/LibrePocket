@@ -311,7 +311,11 @@ fun ChatScreen(
             return@rememberLauncherForActivityResult
         }
         if (result.resultCode == Activity.RESULT_OK) {
-            val candidates = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+            val candidates = try {
+                result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+            } catch (_: Exception) {
+                null
+            }
             val text = AssistantVoice.resolveVoicePrefill(candidates)
             if (text != null) {
                 voiceErrors.onSttSuccess()

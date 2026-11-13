@@ -3,8 +3,12 @@ package dev.librepocket.privilege.github
 import android.content.pm.PackageManager
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import rikka.shizuku.Shizuku
 
 /**
  * B1 Shizuku 授權請求通道測試（Issue #136 B1）：
@@ -81,14 +85,125 @@ class ShizukuPermissionRequestTest {
         requests.onResult(1001) { fired++ }
         requests.attach()
         assertFalse(requests.isAttached())
-        // 失敗只影響上游註冊，不清本地表：本地回呼仍有效。
-        requests.emitResult(1001, PackageManager.PERMISSION_GRANTED)
-        assertEquals(1, fired)
         requests.detach()
         assertFalse(requests.isAttached())
         requests.emitResult(1001, PackageManager.PERMISSION_GRANTED)
-        assertEquals(1, fired)
+        assertEquals(0, fired)
+    }
+
+    @Test fun oneShotCallbackConsumption() {
+        val requests = ShizukuPermissionRequests()
+        var count = 0
+        requests.onResult(1001) { count++ }
+        requests.emitResult(1001, PackageManager.PERMISSION_GRANTED)
+        assertEquals(1, count)
+        // 第二次分發相同碼不得再次觸發
+        requests.emitResult(1001, PackageManager.PERMISSION_GRANTED)
+        assertEquals(1, count)
+    }
+
+    @Test fun epochInvalidationViaInvalidatePending() {
+        val requests = ShizukuPermissionRequests()
+        var fired = false
+        requests.onResult(1001) { fired = true }
+        val oldEpoch = requests.currentEpoch()
+        requests.invalidatePending()
+        // 舊 epoch 的分發不觸發回呼
+        requests.emitResult(1001, PackageManager.PERMISSION_GRANTED, epoch = oldEpoch)
+        assertFalse(fired)
+    }
+
+    @Test fun epochInvalidationViaDetach() {
+        val requests = ShizukuPermissionRequests()
+        var fired = false
+        requests.onResult(1001) { fired = true }
+        val oldEpoch = requests.currentEpoch()
+        requests.detach()
+        // 舊 epoch 的分發不觸發回呼
+        requests.emitResult(1001, PackageManager.PERMISSION_GRANTED, epoch = oldEpoch)
+        assertFalse(fired)
+    }
+
+    @Test fun invalidatePendingClearsCallbacksAndAllowsSubsequentRequests() {
+        val requests = ShizukuPermissionRequests()
+        var firstFired = false
+        var secondFired = false
+        requests.onResult(1001) { firstFired = true }
+        requests.invalidatePending()
+        requests.onResult(1002) { secondFired = true }
+        requests.emitResult(1001, PackageManager.PERMISSION_GRANTED)
+        requests.emitResult(1002, PackageManager.PERMISSION_GRANTED)
+        assertFalse(firstFired)
+        assertTrue(secondFired)
+    }
+
+    @Test fun injectableListenersAttachDispatchAndDetach() {
+        var registered: Shizuku.OnRequestPermissionResultListener? = null
+        var removed: Shizuku.OnRequestPermissionResultListener? = null
+        val requests = ShizukuPermissionRequests(
+            addListener = { registered = it },
+            removeListener = { removed = it },
+        )
+        requests.attach()
+        assertTrue(requests.isAttached())
+        assertNotNull(registered)
+
+        var grantedResult: Boolean? = null
+        requests.onResult(1001) { grantedResult = it }
+        registered?.onRequestPermissionResult(1001, PackageManager.PERMISSION_GRANTED)
+        assertEquals(true, grantedResult)
+
         requests.detach()
         assertFalse(requests.isAttached())
+        assertEquals(registered, removed)
+    }
+
+    @Test fun concurrentDetachDuringAttachRemovesStagedListener() {
+        var removedListener: Shizuku.OnRequestPermissionResultListener? = null
+        lateinit var requests: ShizukuPermissionRequests
+        requests = ShizukuPermissionRequests(
+            addListener = { requests.detach() },
+            removeListener = { removedListener = it },
+        )
+        requests.attach()
+        assertFalse(requests.isAttached())
+        assertNotNull(removedListener)
+    }
+
+    @Test fun requestWithCallbackSuccessRegistersAndDispatches() {
+        val requests = ShizukuPermissionRequests()
+        var granted: Boolean? = null
+        var requestedCode: Int? = null
+        val ok = requests.requestWithCallback(1001, { granted = it }) { code ->
+            requestedCode = code
+        }
+        assertTrue(ok)
+        assertEquals(1001, requestedCode)
+        requests.emitResult(1001, PackageManager.PERMISSION_GRANTED)
+        assertEquals(true, granted)
+    }
+
+    @Test fun requestWithCallbackRollsBackOnException() {
+        val requests = ShizukuPermissionRequests()
+        var callbackFired = false
+        val ok = requests.requestWithCallback(1001, { callbackFired = true }) {
+            throw SecurityException("binder dead")
+        }
+        assertFalse(ok)
+        requests.emitResult(1001, PackageManager.PERMISSION_GRANTED)
+        assertFalse(callbackFired)
+    }
+
+    @Test fun processSingletonStabilityAndReset() {
+        try {
+            val instance1 = ShizukuPermissionRequests.process()
+            val instance2 = ShizukuPermissionRequests.process()
+            assertSame(instance1, instance2)
+            ShizukuPermissionRequests.resetProcessForTest()
+            val instance3 = ShizukuPermissionRequests.process()
+            assertNotSame(instance1, instance3)
+        } finally {
+            ShizukuPermissionRequests.resetProcessForTest()
+        }
     }
 }

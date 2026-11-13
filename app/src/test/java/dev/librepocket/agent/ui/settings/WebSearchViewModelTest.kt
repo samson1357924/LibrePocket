@@ -60,10 +60,27 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class WebSearchViewModelTest {
 
+    private val managedStores = mutableListOf<ViewModelStore>()
+    private val managedSchedulers = mutableListOf<TestCoroutineScheduler>()
+
     @After
     fun tearDown() {
+        // Deterministic cleanup: clear all tracked VMs/scopes, drain tracked test schedulers,
+        // then reset Main to avoid coroutine/poller leaks polluting subsequent tests.
+        managedStores.forEach { it.clear() }
+        managedSchedulers.forEach { runCatching { it.advanceUntilIdle() } }
         DispatchersResetGuard.reset()
+        managedStores.clear()
+        managedSchedulers.clear()
     }
+
+    private fun trackStore(store: ViewModelStore): ViewModelStore = store.also { managedStores += it }
+
+    private fun TestScope.trackScheduler(): TestCoroutineScheduler =
+        testScheduler.also { if (it !in managedSchedulers) managedSchedulers += it }
+
+    private fun trackScheduler(scheduler: TestCoroutineScheduler): TestCoroutineScheduler =
+        scheduler.also { if (it !in managedSchedulers) managedSchedulers += it }
 
     private object DispatchersResetGuard {
         fun reset() {
@@ -184,8 +201,17 @@ class WebSearchViewModelTest {
     ): WebSearchViewModel {
         val dispatcher = StandardTestDispatcher(testScheduler)
         kotlinx.coroutines.Dispatchers.setMain(dispatcher)
-        val store = WebSwitchStore(fakeDs, dispatcher)
-        return WebSearchViewModel(store, dispatcher, probeProvider)
+        val ioDispatcher = dispatcher
+        val store = WebSwitchStore(fakeDs, ioDispatcher)
+        val vmStore = trackStore(ViewModelStore())
+        trackScheduler()
+        val factory = object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                return WebSearchViewModel(store, ioDispatcher, probeProvider) as T
+            }
+        }
+        return ViewModelProvider(vmStore, factory)[WebSearchViewModel::class.java]
     }
 
     private fun TestScope.collectUi(vm: WebSearchViewModel, seen: MutableList<WebSearchSettingsState>? = null) =
@@ -222,10 +248,16 @@ class WebSearchViewModelTest {
         val unconfined = UnconfinedTestDispatcher(testScheduler)
         val ioDispatcher = StandardTestDispatcher(testScheduler)
         kotlinx.coroutines.Dispatchers.setMain(unconfined)
+        trackScheduler()
         val fakeDs = FakePreferencesDataStore().apply {
             beforeWrite = { delay(50) }
         }
-        val vm = WebSearchViewModel(WebSwitchStore(fakeDs, ioDispatcher), ioDispatcher)
+        val vmStore = trackStore(ViewModelStore())
+        val vm = ViewModelProvider(vmStore, object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T =
+                WebSearchViewModel(WebSwitchStore(fakeDs, ioDispatcher), ioDispatcher) as T
+        })[WebSearchViewModel::class.java]
         val collector = backgroundScope.launch(unconfined) { vm.uiState.collect {} }
         vm.uiState.first { !it.isLoading }
 
@@ -867,6 +899,7 @@ class WebSearchViewModelTest {
     fun onCleared_viaViewModelStore_cancelsProbeClosesChannelAndLetsNonCancellableWriteComplete() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         kotlinx.coroutines.Dispatchers.setMain(dispatcher)
+        trackScheduler()
         val probeEntered = CompletableDeferred<Unit>()
         val probeGate = CompletableDeferred<Unit>()
         val probeCancelled = CompletableDeferred<Boolean>()
@@ -881,7 +914,7 @@ class WebSearchViewModelTest {
                 }
             }
         }
-        val vmStore = ViewModelStore()
+        val vmStore = trackStore(ViewModelStore())
         val factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -1551,7 +1584,7 @@ class WebSearchViewModelTest {
                     writeGate.await()
                 }
             }
-            val vmStore = ViewModelStore()
+            val vmStore = trackStore(ViewModelStore())
             val factory = object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
                 override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -1587,7 +1620,7 @@ class WebSearchViewModelTest {
         }
         val mainDispatcher = mainExecutor.asCoroutineDispatcher()
         Dispatchers.setMain(mainDispatcher)
-        val vmStore = ViewModelStore()
+        val vmStore = trackStore(ViewModelStore())
         var vm: WebSearchViewModel? = null
         var collector: Job? = null
         try {
@@ -1695,12 +1728,18 @@ class WebSearchViewModelTest {
         val mainDispatcher = UnconfinedTestDispatcher(testScheduler)
         val ioDispatcher = StandardTestDispatcher(testScheduler)
         Dispatchers.setMain(mainDispatcher)
+        trackScheduler()
         val fakeDs = FakePreferencesDataStore(
             prefs(master = true, ddgs = false, consent = true, url = "https://old.example"),
         ).apply {
             beforeWrite = { delay(20) }
         }
-        val vm = WebSearchViewModel(WebSwitchStore(fakeDs, ioDispatcher), ioDispatcher)
+        val vmStore = trackStore(ViewModelStore())
+        val vm = ViewModelProvider(vmStore, object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T =
+                WebSearchViewModel(WebSwitchStore(fakeDs, ioDispatcher), ioDispatcher) as T
+        })[WebSearchViewModel::class.java]
         val seen = mutableListOf<WebSearchSettingsState>()
         val collector = backgroundScope.launch(mainDispatcher) {
             vm.uiState.collect { seen.add(it) }
@@ -1729,6 +1768,7 @@ class WebSearchViewModelTest {
         val mainDispatcher = UnconfinedTestDispatcher(testScheduler)
         val ioDispatcher = StandardTestDispatcher(testScheduler)
         Dispatchers.setMain(mainDispatcher)
+        trackScheduler()
 
         for (initialUrl in listOf("", "https://old.example")) {
             val midFailure = CompletableDeferred<IOException>()
@@ -1737,7 +1777,12 @@ class WebSearchViewModelTest {
             ).apply {
                 midStreamFailure = midFailure
             }
-            val vm = WebSearchViewModel(WebSwitchStore(fakeDs, ioDispatcher), ioDispatcher)
+            val vmStore = trackStore(ViewModelStore())
+            val vm = ViewModelProvider(vmStore, object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T =
+                    WebSearchViewModel(WebSwitchStore(fakeDs, ioDispatcher), ioDispatcher) as T
+            })[WebSearchViewModel::class.java]
             val seen = mutableListOf<WebSearchSettingsState>()
             val collector = backgroundScope.launch(mainDispatcher) {
                 vm.uiState.collect { seen.add(it) }
@@ -1771,8 +1816,14 @@ class WebSearchViewModelTest {
     fun defaultProbeProvider_zeroNetworkAcrossBlankInvalidAndValid_andDirectRecoveryAfterProbeException() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         Dispatchers.setMain(dispatcher)
+        trackScheduler()
         val fakeDs = FakePreferencesDataStore(prefs(url = ""))
-        val defaultVm = WebSearchViewModel(WebSwitchStore(fakeDs, dispatcher), dispatcher)
+        val defaultStore = trackStore(ViewModelStore())
+        val defaultVm = ViewModelProvider(defaultStore, object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T =
+                WebSearchViewModel(WebSwitchStore(fakeDs, dispatcher), dispatcher) as T
+        })[WebSearchViewModel::class.java]
         val collector = collectUi(defaultVm)
         defaultVm.uiState.first { !it.isLoading }
 
@@ -1805,16 +1856,21 @@ class WebSearchViewModelTest {
         // Direct onProbe() recovery from exception without editing URL first.
         var shouldThrow = true
         val recoverDs = FakePreferencesDataStore(prefs(url = "https://search.example"))
-        val recoverVm = WebSearchViewModel(
-            store = WebSwitchStore(recoverDs, dispatcher),
-            ioDispatcher = dispatcher,
-            probeProvider = { url ->
-                if (shouldThrow) {
-                    throw IllegalStateException("transient probe failure")
-                }
-                WebSearchSettings.probeSearxngUrl(url) to WebProbe.Ready
-            },
-        )
+        val recoverStore = trackStore(ViewModelStore())
+        val recoverVm = ViewModelProvider(recoverStore, object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T =
+                WebSearchViewModel(
+                    store = WebSwitchStore(recoverDs, dispatcher),
+                    ioDispatcher = dispatcher,
+                    probeProvider = { url ->
+                        if (shouldThrow) {
+                            throw IllegalStateException("transient probe failure")
+                        }
+                        WebSearchSettings.probeSearxngUrl(url) to WebProbe.Ready
+                    },
+                ) as T
+        })[WebSearchViewModel::class.java]
         val recoverCollector = collectUi(recoverVm)
         recoverVm.uiState.first { !it.isLoading }
 
@@ -2233,7 +2289,7 @@ class WebSearchViewModelTest {
         // and onMasterSwitch(true) catches WEB_CONSENT_REQUIRED before Snap_Reset reaches snapshotDriver ->
         // when Snap_Reset arrives, showConsent == true.
         run {
-            val ioScheduler = TestCoroutineScheduler()
+            val ioScheduler = trackScheduler(TestCoroutineScheduler())
             val ioDispatcher = StandardTestDispatcher(ioScheduler)
             val mainDispatcher = StandardTestDispatcher(testScheduler)
             Dispatchers.setMain(mainDispatcher)
@@ -2250,7 +2306,7 @@ class WebSearchViewModelTest {
                     }
                 }
             }
-            val vmStore = ViewModelStore()
+            val vmStore = trackStore(ViewModelStore())
             val factory = object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
                 override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -2310,7 +2366,7 @@ class WebSearchViewModelTest {
         // (b) Snap_PreReset (consent = true) reaches snapshotDriver AFTER handleMasterSwitch catches WEB_CONSENT_REQUIRED,
         // then Snap_Reset (consent = false) arrives -> showConsent == true.
         run {
-            val ioScheduler = TestCoroutineScheduler()
+            val ioScheduler = trackScheduler(TestCoroutineScheduler())
             val ioDispatcher = StandardTestDispatcher(ioScheduler)
             val mainDispatcher = StandardTestDispatcher(testScheduler)
             Dispatchers.setMain(mainDispatcher)
@@ -2335,7 +2391,7 @@ class WebSearchViewModelTest {
                     }
                 }
             }
-            val vmStore = ViewModelStore()
+            val vmStore = trackStore(ViewModelStore())
             val factory = object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
                 override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -2399,7 +2455,7 @@ class WebSearchViewModelTest {
 
     @Test
     fun outOfBandConsentRevocationLag_onMasterSwitchTrue_reopensConsentWithoutWriteError() = runTest {
-        val ioScheduler = TestCoroutineScheduler()
+        val ioScheduler = trackScheduler(TestCoroutineScheduler())
         val ioDispatcher = StandardTestDispatcher(ioScheduler)
         val mainDispatcher = StandardTestDispatcher(testScheduler)
         Dispatchers.setMain(mainDispatcher)
@@ -2407,7 +2463,7 @@ class WebSearchViewModelTest {
         val fakeDs = FakePreferencesDataStore(
             prefs(master = false, ddgs = false, consent = true, url = "https://search.example"),
         )
-        val vmStore = ViewModelStore()
+        val vmStore = trackStore(ViewModelStore())
         val factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -2446,7 +2502,7 @@ class WebSearchViewModelTest {
         // (a) Armed pendingConsentReopen* + out-of-band false -> true conflation (snapshotDriver sees true -> true)
         // clears pendingConsentReopen* via live currentConsentAndMaster() check and never resurrects on later false.
         run {
-            val ioScheduler = TestCoroutineScheduler()
+            val ioScheduler = trackScheduler(TestCoroutineScheduler())
             val ioDispatcher = StandardTestDispatcher(ioScheduler)
             val mainDispatcher = StandardTestDispatcher(testScheduler)
             Dispatchers.setMain(mainDispatcher)
@@ -2454,7 +2510,7 @@ class WebSearchViewModelTest {
             val fakeDs = FakePreferencesDataStore(
                 prefs(master = false, ddgs = false, consent = true, url = "https://search.example"),
             )
-            val vmStore = ViewModelStore()
+            val vmStore = trackStore(ViewModelStore())
             val factory = object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
                 override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -2505,7 +2561,7 @@ class WebSearchViewModelTest {
         // (b) Armed pendingConsentReopen* + unsubscribe >5s + out-of-band consent=true while unsubscribed +
         // resubscribe clears pendingConsentReopen* and never resurrects on later consent=false.
         run {
-            val ioScheduler = TestCoroutineScheduler()
+            val ioScheduler = trackScheduler(TestCoroutineScheduler())
             val ioDispatcher = StandardTestDispatcher(ioScheduler)
             val mainDispatcher = StandardTestDispatcher(testScheduler)
             Dispatchers.setMain(mainDispatcher)
@@ -2523,7 +2579,7 @@ class WebSearchViewModelTest {
                     }
                 }
             }
-            val vmStore = ViewModelStore()
+            val vmStore = trackStore(ViewModelStore())
             val factory = object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
                 override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -2592,7 +2648,7 @@ class WebSearchViewModelTest {
 
     @Test
     fun masterSwitch_consentRequiredCatchToctouAckBeforeUpdateState_rechecksAndDoesNotArm() = runTest {
-        val ioScheduler = TestCoroutineScheduler()
+        val ioScheduler = trackScheduler(TestCoroutineScheduler())
         val ioDispatcher = StandardTestDispatcher(ioScheduler)
         val mainDispatcher = StandardTestDispatcher(testScheduler)
         Dispatchers.setMain(mainDispatcher)
@@ -2611,7 +2667,7 @@ class WebSearchViewModelTest {
                 testScheduler.runCurrent()
             }
         }
-        val vmStore = ViewModelStore()
+        val vmStore = trackStore(ViewModelStore())
         val factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T {

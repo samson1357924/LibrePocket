@@ -242,7 +242,7 @@ class WebSearchViewModelTest {
     }
 
     @Test
-    fun outOfOrderSlowWritesImmunity_sequentialOrderedWritesAndNoUiRegression() = runTest {
+    fun outOfOrderSlowWritesImmunity_coalescesQueuedUrlWritesAndNoUiRegression() = runTest {
         val firstWriteEntered = CompletableDeferred<Unit>()
         val firstWriteGate = CompletableDeferred<Unit>()
         val fakeDs = FakePreferencesDataStore().apply {
@@ -271,12 +271,31 @@ class WebSearchViewModelTest {
         firstWriteGate.complete(Unit)
         advanceUntilIdle()
 
+        // First write was already in-flight; queued intermediate URL writes are coalesced to latest.
         assertEquals(listOf("h", "https://search.example"), fakeDs.writtenUrls)
         assertEquals("https://search.example", fakeDs.currentUrl())
         assertEquals("https://search.example", vm.uiState.value.searxngUrl)
         val afterFinalTyped = seen.dropWhile { it.searxngUrl != "https://search.example" }
         assertTrue(afterFinalTyped.isNotEmpty())
         assertTrue(afterFinalTyped.all { it.searxngUrl == "https://search.example" })
+        collector.cancel()
+    }
+
+    @Test
+    fun onSearxngUrlChange_overMaxLength_notEnqueuedAndShowsWriteError() = runTest {
+        val fakeDs = FakePreferencesDataStore(prefs(url = "https://good.example"))
+        val vm = installStandardVm(fakeDs)
+        val collector = collectUi(vm)
+        vm.uiState.first { !it.isLoading }
+
+        val overMax = "https://example.com/" + "a".repeat(MAX_WEB_BASE_URL_LENGTH + 1 - "https://example.com/".length)
+        vm.onSearxngUrlChange(overMax)
+        runCurrent()
+        assertEquals(overMax, vm.uiState.value.searxngUrl)
+        assertEquals("SearXNG 網址過長，未儲存至本機設定。", vm.uiState.value.writeError)
+        advanceUntilIdle()
+        assertEquals(0, fakeDs.writeCount)
+        assertEquals("https://good.example", fakeDs.currentUrl())
         collector.cancel()
     }
 

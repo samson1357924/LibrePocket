@@ -94,6 +94,13 @@ fun WebSearchCard(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                "D3 網路搜尋目前為 scaffold，尚未接線至聊天工具執行（僅限設定／離線檢查）。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.testTag("webScaffoldNotice"),
+            )
             if (state.loadFailed) {
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(

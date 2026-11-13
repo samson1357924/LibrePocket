@@ -108,6 +108,9 @@ class WebSearchSettingsCardTest {
         // DDGS 非官方警語必顯示（D3 必須）。
         onWebTag("webDdgsWarning").assertIsDisplayed()
         assertTrue(WebSearchSettings.DDGS_UNOFFICIAL_WARNING.contains("非官方"))
+        // Persistent scaffold/non-wired disclosure (settings/offline check only).
+        onWebTag("webScaffoldNotice").assertIsDisplayed()
+        composeRule.onNodeWithText("尚未接線至聊天工具執行", substring = true).performScrollTo().assertIsDisplayed()
     }
 
     @Test

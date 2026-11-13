@@ -157,6 +157,7 @@ class WebSearchSettingsIntegrationTest {
         composeRule.onNodeWithTag("webSearxngStatus").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithText("狀態：缺 URL", substring = true).performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("webResetButton").performScrollTo().assertIsDisplayed().assertIsNotEnabled()
+        composeRule.onNodeWithTag("webScaffoldNotice").performScrollTo().assertIsDisplayed()
 
         val prefs = fakeDs.state.value
         assertFalse(prefs[booleanPreferencesKey(WebSearchLocal.SWITCH)] ?: false)

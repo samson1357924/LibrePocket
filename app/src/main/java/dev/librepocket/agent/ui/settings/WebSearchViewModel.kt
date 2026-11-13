@@ -6,6 +6,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import dev.librepocket.web.DdgsSearchProvider
+import dev.librepocket.web.MAX_WEB_BASE_URL_LENGTH
 import dev.librepocket.web.SearxngSearchProvider
 import dev.librepocket.web.WebHttpGet
 import dev.librepocket.web.WebProbe
@@ -297,8 +298,25 @@ class WebSearchViewModel(
 
     init {
         viewModelScope.launch(ioDispatcher) {
-            for (cmd in storeCommandChannel) {
-                handleCommand(cmd)
+            var pending: StoreCommand? = null
+            while (true) {
+                val cmd = pending ?: storeCommandChannel.receiveCatching().getOrNull() ?: break
+                pending = null
+                if (cmd is StoreCommand.UrlWrite) {
+                    var latestUrl = cmd
+                    while (true) {
+                        val next = storeCommandChannel.tryReceive().getOrNull() ?: break
+                        if (next is StoreCommand.UrlWrite) {
+                            latestUrl = next
+                        } else {
+                            pending = next
+                            break
+                        }
+                    }
+                    handleCommand(latestUrl)
+                } else {
+                    handleCommand(cmd)
+                }
             }
         }
     }
@@ -766,14 +784,25 @@ class WebSearchViewModel(
                 oldProbe = cancelProbeLocked()
                 val ver = cur.draftVersion + 1
                 val rGen = cur.resetGeneration
-                cur.copy(
-                    draftUrl = newUrl,
-                    urlDirty = true,
-                    pendingCleanVersion = -1L,
-                    draftVersion = ver,
-                    probeMessage = null,
-                    writeError = null,
-                ) to StoreCommand.UrlWrite(url = newUrl, draftVersion = ver, resetGeneration = rGen)
+                if (newUrl.length > MAX_WEB_BASE_URL_LENGTH) {
+                    cur.copy(
+                        draftUrl = newUrl,
+                        urlDirty = true,
+                        pendingCleanVersion = -1L,
+                        draftVersion = ver,
+                        probeMessage = null,
+                        writeError = "SearXNG 網址過長，未儲存至本機設定。",
+                    ) to null
+                } else {
+                    cur.copy(
+                        draftUrl = newUrl,
+                        urlDirty = true,
+                        pendingCleanVersion = -1L,
+                        draftVersion = ver,
+                        probeMessage = null,
+                        writeError = null,
+                    ) to StoreCommand.UrlWrite(url = newUrl, draftVersion = ver, resetGeneration = rGen)
+                }
             }
         }
         oldProbe?.cancel()

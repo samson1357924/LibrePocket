@@ -297,14 +297,18 @@ object WebFetch {
         // 逐跳 DNS preflight 與 HTTP）。
         val safeTimeout = timeoutMs.coerceIn(1L, MAX_TIMEOUT_MS)
         val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(safeTimeout)
-        val firstEval = when (
-            val pre = evaluateWithBudget(safeTimeout) {
-                NetworkPolicy.evaluateUrl(rawUrl, optIn, resolver)
+        val firstEval = if (!NetworkPolicy.requiresDnsLookup(rawUrl, optIn)) {
+            NetworkPolicy.evaluateUrl(rawUrl, optIn, resolver)
+        } else {
+            when (
+                val pre = evaluateWithBudget(safeTimeout) {
+                    NetworkPolicy.evaluateUrl(rawUrl, optIn, resolver)
+                }
+            ) {
+                is NetworkPolicy.PreflightOutcome.Completed -> pre.value
+                NetworkPolicy.PreflightOutcome.TimedOut -> return transportFailed("TIMEOUT")
+                NetworkPolicy.PreflightOutcome.OverloadRejected -> return transportFailed("TRANSPORT")
             }
-        ) {
-            is NetworkPolicy.PreflightOutcome.Completed -> pre.value
-            NetworkPolicy.PreflightOutcome.TimedOut -> return transportFailed("TIMEOUT")
-            NetworkPolicy.PreflightOutcome.OverloadRejected -> return transportFailed("TRANSPORT")
         }
         if (!firstEval.allowed || firstEval.resolvedAddresses.isEmpty()) {
             return unavailable(firstEval.denyCode?.name ?: NetworkDenyCode.INVALID_HOST.name)
@@ -373,14 +377,18 @@ object WebFetch {
                         // 跨 origin 跳轉時 opt-in 不可逆降級為 HTTPS_ONLY（deny-all）：
                         // 原端點授權不得沿用到跨站目標，且後續同 origin 跳轉亦不得恢復。
                         effectiveOptIn = downgradedOptInForRedirect(current, resolved, effectiveOptIn)
-                        val hopEval = when (
-                            val pre = evaluateWithBudget(hopEvalRemaining) {
-                                evaluateRedirectTarget(current, resolved, effectiveOptIn, resolver)
+                        val hopEval = if (!NetworkPolicy.requiresDnsLookup(resolved, effectiveOptIn)) {
+                            evaluateRedirectTarget(current, resolved, effectiveOptIn, resolver)
+                        } else {
+                            when (
+                                val pre = evaluateWithBudget(hopEvalRemaining) {
+                                    evaluateRedirectTarget(current, resolved, effectiveOptIn, resolver)
+                                }
+                            ) {
+                                is NetworkPolicy.PreflightOutcome.Completed -> pre.value
+                                NetworkPolicy.PreflightOutcome.TimedOut -> return transportFailed("TIMEOUT")
+                                NetworkPolicy.PreflightOutcome.OverloadRejected -> return transportFailed("TRANSPORT")
                             }
-                        ) {
-                            is NetworkPolicy.PreflightOutcome.Completed -> pre.value
-                            NetworkPolicy.PreflightOutcome.TimedOut -> return transportFailed("TIMEOUT")
-                            NetworkPolicy.PreflightOutcome.OverloadRejected -> return transportFailed("TRANSPORT")
                         }
                         if (!hopEval.allowed || hopEval.resolvedAddresses.isEmpty()) return redirectBlocked()
                         val hopUrl = hopEval.normalizedUrl ?: resolved

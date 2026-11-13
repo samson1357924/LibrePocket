@@ -964,4 +964,77 @@ class WebFetchTest {
             saturated.shutdownNow()
         }
     }
+
+    @Test fun preflightOverloadPreservesNonDnsCleartextDenyTaxonomy() {
+        assertFalse(
+            "http public host with default opt-in must be non-DNS preflight",
+            NetworkPolicy.requiresDnsLookup("http://example.com/", EndpointNetworkOptIn()),
+        )
+        val saturated = ThreadPoolExecutor(
+            1, 1, 0L, TimeUnit.MILLISECONDS,
+            SynchronousQueue(),
+            ThreadPoolExecutor.AbortPolicy(),
+        )
+        val blocker = java.util.concurrent.CountDownLatch(1)
+        saturated.execute {
+            try { blocker.await(5, TimeUnit.SECONDS) } catch (_: InterruptedException) {}
+        }
+        val old = WebFetch.preflightExecutor
+        WebFetch.preflightExecutor = saturated
+        try {
+            // http + public hostname 在預設 HTTPS_ONLY 下屬非 DNS scheme-gate 拒絕；
+            // executor 飽和時仍須保留 typed deny，不得誤成 TRANSPORT。
+            val neverResolve = HostResolver { throw AssertionError("must not resolve non-DNS deny: $it") }
+            val outcome = WebFetch.fetch(
+                "http://example.com/",
+                optIn = EndpointNetworkOptIn(),
+                resolver = neverResolve,
+            )
+            val unavailable = outcome as? WebFetch.FetchOutcome.Unavailable
+            assertNotNull("expected Unavailable, got: $outcome", unavailable)
+            assertEquals(NetworkDenyCode.CLEARTEXT_NOT_PERMITTED.name, unavailable!!.detail)
+        } finally {
+            blocker.countDown()
+            WebFetch.preflightExecutor = old
+            saturated.shutdownNow()
+        }
+    }
+
+    @Test fun preflightOverloadPreservesNonDnsLiteralIpDenyTaxonomy() {
+        val saturated = ThreadPoolExecutor(
+            1, 1, 0L, TimeUnit.MILLISECONDS,
+            SynchronousQueue(),
+            ThreadPoolExecutor.AbortPolicy(),
+        )
+        val blocker = java.util.concurrent.CountDownLatch(1)
+        saturated.execute {
+            try { blocker.await(5, TimeUnit.SECONDS) } catch (_: InterruptedException) {}
+        }
+        val old = WebFetch.preflightExecutor
+        WebFetch.preflightExecutor = saturated
+        try {
+            val neverResolve = HostResolver { throw AssertionError("must not resolve literal/non-DNS deny: $it") }
+            val privateOutcome = WebFetch.fetch(
+                "https://10.0.0.1/",
+                optIn = EndpointNetworkOptIn(),
+                resolver = neverResolve,
+            )
+            val privateIp = privateOutcome as? WebFetch.FetchOutcome.Unavailable
+            assertNotNull("expected Unavailable for private literal, got: $privateOutcome", privateIp)
+            assertEquals(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED.name, privateIp!!.detail)
+
+            val quad100Outcome = WebFetch.fetch(
+                "https://[fd7a:115c:a1e0::53]/",
+                optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE),
+                resolver = neverResolve,
+            )
+            val quad100 = quad100Outcome as? WebFetch.FetchOutcome.Unavailable
+            assertNotNull("expected Unavailable for Tailscale Quad100, got: $quad100Outcome", quad100)
+            assertEquals(NetworkDenyCode.METADATA_ADDRESS_BLOCKED.name, quad100!!.detail)
+        } finally {
+            blocker.countDown()
+            WebFetch.preflightExecutor = old
+            saturated.shutdownNow()
+        }
+    }
 }

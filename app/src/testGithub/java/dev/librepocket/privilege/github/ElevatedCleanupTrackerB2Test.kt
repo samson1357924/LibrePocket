@@ -725,4 +725,265 @@ class ElevatedCleanupTrackerB2Test {
             pollOutstandingTo(0)
         }
     }
+
+    // ---- 15. kickSweepAsync nowNanos == 0L 仍強制 SWEEP_COOLDOWN_MS（修復 0L sentinel 繞過） ----
+
+    @Test fun kickSweepAsyncAtZeroClockStillEnforcesCooldown() {
+        val fakeNow = AtomicLong(0L)
+        val nowNanos: () -> Long = { fakeNow.get() }
+        try {
+            ElevatedCleanupTracker.quarantineUnverified(FastAliveProcess())
+            assertTrue(
+                "initial kick at 0L must succeed",
+                ElevatedCleanupTracker.kickSweepAsync(nowNanos),
+            )
+            pollTrue("first sweep at 0L must finish", 15_000L) {
+                !ElevatedCleanupTracker.isSweepInFlight()
+            }
+            assertFalse(
+                "repeat kick at 0L within cooldown must be suppressed (0L sentinel bug)",
+                ElevatedCleanupTracker.kickSweepAsync(nowNanos),
+            )
+            fakeNow.set(
+                TimeUnit.MILLISECONDS.toNanos(ElevatedCleanupTracker.SWEEP_COOLDOWN_MS - 1L),
+            )
+            assertFalse(
+                "kick just before SWEEP_COOLDOWN_MS must still be suppressed",
+                ElevatedCleanupTracker.kickSweepAsync(nowNanos),
+            )
+            fakeNow.set(TimeUnit.MILLISECONDS.toNanos(ElevatedCleanupTracker.SWEEP_COOLDOWN_MS))
+            assertTrue(
+                "kick at SWEEP_COOLDOWN_MS after 0L must be allowed",
+                ElevatedCleanupTracker.kickSweepAsync(nowNanos),
+            )
+            pollTrue("second sweep must finish", 15_000L) {
+                !ElevatedCleanupTracker.isSweepInFlight()
+            }
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+        } finally {
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            awaitNoQuarantineThreads()
+        }
+    }
+
+    // ---- 16. throwing Error (Throwable) clock fallback in sweepQuarantine & kickSweepAsync ----
+
+    @Test fun throwingThrowableClockFallbackKeepsQuarantineFailClosed() {
+        val throwingClock: () -> Long = { throw AssertionError("clock throwable") }
+        try {
+            val syncProc = CountingAliveProcess()
+            ElevatedCleanupTracker.quarantineUnverified(syncProc)
+            assertEquals(0, ElevatedCleanupTracker.sweepQuarantine(throwingClock))
+            assertEquals("sync sweep must attempt waitFor(0) on fallback", 1, syncProc.waitCalls.get())
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+
+            ElevatedCleanupTracker.clearUnverified()
+            val asyncProc = CountingAliveProcess()
+            ElevatedCleanupTracker.quarantineUnverified(asyncProc)
+            assertTrue(
+                "kickSweepAsync must succeed on throwing clock fallback",
+                ElevatedCleanupTracker.kickSweepAsync(throwingClock),
+            )
+            pollTrue("background sweep must finish", 15_000L) {
+                !ElevatedCleanupTracker.isSweepInFlight()
+            }
+            assertEquals("async sweep must execute waitFor(0) on fallback", 1, asyncProc.waitCalls.get())
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+        } finally {
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            awaitNoQuarantineThreads()
+        }
+    }
+
+    // ---- 17. singleflight 併發爭奪不繞過冷卻，且不覆蓋 clearUnverified() 重置 ----
+
+    @Test fun kickSweepAsyncSingleflightContentionEnforcesCooldown() {
+        val fakeNow = AtomicLong(0L)
+        val nowNanos: () -> Long = { fakeNow.get() }
+        try {
+            ElevatedCleanupTracker.quarantineUnverified(FastAliveProcess())
+            val startGate = CountDownLatch(1)
+            val successes = AtomicInteger(0)
+            val workers = (0 until 8).map {
+                Thread {
+                    assertTrue(startGate.await(10, TimeUnit.SECONDS))
+                    if (ElevatedCleanupTracker.kickSweepAsync(nowNanos)) {
+                        successes.incrementAndGet()
+                    }
+                }.also { it.isDaemon = true; it.start() }
+            }
+            startGate.countDown()
+            workers.forEach { it.join(10_000L) }
+            assertEquals("concurrent wave at 0L must start at most once", 1, successes.get())
+            pollTrue("wave 1 sweep must finish", 15_000L) {
+                !ElevatedCleanupTracker.isSweepInFlight()
+            }
+            val wave2Gate = CountDownLatch(1)
+            val wave2Successes = AtomicInteger(0)
+            val wave2 = (0 until 8).map {
+                Thread {
+                    assertTrue(wave2Gate.await(10, TimeUnit.SECONDS))
+                    if (ElevatedCleanupTracker.kickSweepAsync(nowNanos)) {
+                        wave2Successes.incrementAndGet()
+                    }
+                }.also { it.isDaemon = true; it.start() }
+            }
+            wave2Gate.countDown()
+            wave2.forEach { it.join(10_000L) }
+            assertEquals("wave 2 within cooldown must start 0 sweeps", 0, wave2Successes.get())
+        } finally {
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            awaitNoQuarantineThreads()
+        }
+    }
+
+    @Test fun concurrentKickSweepAsyncAndClearUnverifiedDoNotClobberReset() {
+        val waitEntered = CountDownLatch(1)
+        val waitRelease = CountDownLatch(1)
+        val blockingProcess = object : Process() {
+            override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+            override fun getInputStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+            override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+            override fun waitFor(): Int = 0
+            override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
+                waitEntered.countDown()
+                waitRelease.await(10, TimeUnit.SECONDS)
+                return false
+            }
+            override fun exitValue(): Int = throw IllegalThreadStateException("not exited")
+            override fun destroy() = Unit
+            override fun destroyForcibly(): Process = this
+        }
+        val fakeNow = AtomicLong(123_456_789L)
+        val nowNanos: () -> Long = { fakeNow.get() }
+        try {
+            ElevatedCleanupTracker.quarantineUnverified(blockingProcess)
+            assertTrue(
+                "initial kick must acquire lease",
+                ElevatedCleanupTracker.kickSweepAsync(nowNanos),
+            )
+            assertTrue(
+                "verifier must enter waitFor(0)",
+                waitEntered.await(10, TimeUnit.SECONDS),
+            )
+            val contentionGate = CountDownLatch(1)
+            val contentionWins = AtomicInteger(0)
+            val contenders = (0 until 4).map {
+                Thread {
+                    assertTrue(contentionGate.await(10, TimeUnit.SECONDS))
+                    if (ElevatedCleanupTracker.kickSweepAsync(nowNanos)) {
+                        contentionWins.incrementAndGet()
+                    }
+                }.also { it.isDaemon = true; it.start() }
+            }
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.quarantineUnverified(FastAliveProcess())
+            contentionGate.countDown()
+            contenders.forEach { it.join(10_000L) }
+            assertEquals("in-flight contention must never steal lease", 0, contentionWins.get())
+
+            waitRelease.countDown()
+            pollTrue("in-flight sweep must release lease", 15_000L) {
+                !ElevatedCleanupTracker.isSweepInFlight()
+            }
+            assertTrue(
+                "frozen clock after clearUnverified must allow fresh sweep",
+                ElevatedCleanupTracker.kickSweepAsync(nowNanos),
+            )
+            pollTrue("post-clear sweep must finish", 15_000L) {
+                !ElevatedCleanupTracker.isSweepInFlight()
+            }
+            assertFalse(
+                "post-clear repeat kick within cooldown must be throttled",
+                ElevatedCleanupTracker.kickSweepAsync(nowNanos),
+            )
+        } finally {
+            waitRelease.countDown()
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            pollPendingTo(0)
+            awaitNoQuarantineThreads()
+        }
+    }
+
+    @Test fun kickSweepAsyncStartThreadOomAfterConcurrentClearPreservesResetAndReleasesLease() {
+        try {
+            // 1. Seed a previous sweep at t1 = 10s so prevHasStart=true, prevStart=10s.
+            val t1 = TimeUnit.SECONDS.toNanos(10L)
+            ElevatedCleanupTracker.quarantineUnverified(FastAliveProcess())
+            assertTrue(ElevatedCleanupTracker.kickSweepAsync { t1 })
+            pollTrue("seed sweep must finish", 15_000L) {
+                !ElevatedCleanupTracker.isSweepInFlight()
+            }
+
+            // 2. Start kick at t2 = 12s (past cooldown), run clearUnverified() concurrently
+            // while startThread is in progress, then throw OutOfMemoryError from startThread.
+            val t2 = TimeUnit.SECONDS.toNanos(12L)
+            val startEntered = CountDownLatch(1)
+            val clearDone = CountDownLatch(1)
+            val bg = Thread {
+                try {
+                    assertTrue(startEntered.await(10, TimeUnit.SECONDS))
+                    ElevatedCleanupTracker.clearUnverified()
+                } finally {
+                    clearDone.countDown()
+                }
+            }.also { it.isDaemon = true; it.start() }
+
+            ElevatedCleanupTracker.quarantineUnverified(FastAliveProcess())
+            val kicked = ElevatedCleanupTracker.kickSweepAsyncWithThreadStarter(
+                nowNanos = { t2 },
+                startThread = {
+                    startEntered.countDown()
+                    assertTrue(clearDone.await(10, TimeUnit.SECONDS))
+                    throw OutOfMemoryError("simulated OOM starting sweep thread")
+                },
+            )
+            bg.join(10_000L)
+            assertFalse(bg.isAlive)
+            assertFalse("failed startThread must return false", kicked)
+            assertFalse("sweepLease must be rolled back on startThread failure", ElevatedCleanupTracker.isSweepInFlight())
+
+            // 3. Probe at tProbe = 10.5s (within cooldown of t1 = 10s):
+            // Because clearUnverified() bumped sweepGeneration, the failed startThread must NOT restore t1.
+            val tProbe = TimeUnit.SECONDS.toNanos(10L) + TimeUnit.MILLISECONDS.toNanos(500L)
+            ElevatedCleanupTracker.quarantineUnverified(FastAliveProcess())
+            assertTrue(
+                "sweepGeneration must prevent restoring stale prevStart after concurrent clearUnverified",
+                ElevatedCleanupTracker.kickSweepAsync { tProbe },
+            )
+            pollTrue("post-OOM sweep must finish", 15_000L) {
+                !ElevatedCleanupTracker.isSweepInFlight()
+            }
+
+            // 4. Verify normal rollback (no concurrent clearUnverified): failing at t2 = 12s restores tProbe = 10.5s,
+            // so a retry at t2 = 12s (1.5s >= 1s after 10.5s) immediately succeeds rather than staying throttled at 12s.
+            val failedNormal = ElevatedCleanupTracker.kickSweepAsyncWithThreadStarter(
+                nowNanos = { t2 },
+                startThread = { throw OutOfMemoryError("simulated OOM without concurrent clear") },
+            )
+            assertFalse(failedNormal)
+            assertFalse(ElevatedCleanupTracker.isSweepInFlight())
+            assertTrue(
+                "failed startThread without concurrent clear must roll back lastSweepStartNanos",
+                ElevatedCleanupTracker.kickSweepAsync { t2 },
+            )
+            pollTrue("rollback retry sweep must finish", 15_000L) {
+                !ElevatedCleanupTracker.isSweepInFlight()
+            }
+        } finally {
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            pollPendingTo(0)
+            awaitNoQuarantineThreads()
+        }
+    }
 }

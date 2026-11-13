@@ -23,8 +23,10 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithText
 import androidx.core.app.ActivityOptionsCompat
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.lifecycle.ViewModelStore
@@ -174,6 +176,7 @@ class MainScreenAssistVoiceRoutingTest {
         val pending = MutableStateFlow(false)
         val assistVoiceRequested = MutableStateFlow(false)
         val voiceSwitchesLoaded = MutableStateFlow(false)
+        val voiceSwitchLoadFailed = MutableStateFlow(false)
         val userSwitches = MutableStateFlow(
             mapOf(
                 VoiceTools.SWITCH_INPUT to false,
@@ -225,6 +228,7 @@ class MainScreenAssistVoiceRoutingTest {
         val p by pending.collectAsState()
         val req by assistVoiceRequested.collectAsState()
         val loaded by voiceSwitchesLoaded.collectAsState()
+        val loadFailed by voiceSwitchLoadFailed.collectAsState()
         val switches by userSwitches.collectAsState()
         val viewed by viewedSessionId.collectAsState()
         val backStack by nav.currentBackStackEntryAsState()
@@ -276,6 +280,7 @@ class MainScreenAssistVoiceRoutingTest {
                             assistVoiceRequested.value = false
                         },
                         voiceSwitchesLoaded = loaded,
+                        voiceSwitchLoadFailed = loadFailed,
                         userSwitches = switches,
                     )
                 },
@@ -493,6 +498,179 @@ class MainScreenAssistVoiceRoutingTest {
         assertEquals(false, h.assistVoiceRequested.value)
         assertTrue(h.registry.launchedIntents.isEmpty())
         assertEquals(Routes.SETUP, h.nav.currentDestination?.route)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun delayedVoiceSwitchStore_whenDisabled_degradesToUserDisabledAndConsumesOnceWithoutReplay() {
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.Ready(sampleEndpoint())
+        h.pending.value = false
+        h.assistVoiceRequested.value = true
+        h.voiceSwitchesLoaded.value = false
+        h.userSwitches.value = mapOf(
+            VoiceTools.SWITCH_INPUT to false,
+            VoiceTools.SWITCH_OUTPUT to false,
+            VoiceTools.SWITCH_OPENAI to false,
+        )
+
+        render(h)
+
+        assertEquals(0, h.consumedCount)
+        assertTrue(h.assistVoiceRequested.value)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+
+        composeRule.runOnIdle {
+            h.voiceSwitchesLoaded.value = true
+            h.userSwitches.value = mapOf(
+                VoiceTools.SWITCH_INPUT to false,
+                VoiceTools.SWITCH_OUTPUT to true,
+                VoiceTools.SWITCH_OPENAI to false,
+            )
+        }
+        composeRule.waitForIdle()
+
+        assertEquals(1, h.consumedCount)
+        assertEquals(false, h.assistVoiceRequested.value)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+        composeRule.onNodeWithText(
+            VoiceStt.fallbackMessage(DenyReason.USER_DISABLED, VoiceStt.DETAIL_SWITCH_OFF),
+        ).assertIsDisplayed()
+
+        // Subsequent tick/recomposition does not launch STT or duplicate consumption.
+        composeRule.runOnIdle {
+            h.userSwitches.value = mapOf(
+                VoiceTools.SWITCH_INPUT to true,
+                VoiceTools.SWITCH_OUTPUT to true,
+                VoiceTools.SWITCH_OPENAI to false,
+            )
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, h.consumedCount)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun delayedVoiceSwitchStore_whenLoadFailed_degradesToUserDisabledAndConsumesOnceWithoutReplay() {
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.Ready(sampleEndpoint())
+        h.pending.value = false
+        h.assistVoiceRequested.value = true
+        h.voiceSwitchesLoaded.value = false
+        h.voiceSwitchLoadFailed.value = false
+        h.userSwitches.value = mapOf(
+            VoiceTools.SWITCH_INPUT to false,
+            VoiceTools.SWITCH_OUTPUT to false,
+            VoiceTools.SWITCH_OPENAI to false,
+        )
+
+        render(h)
+
+        assertEquals(0, h.consumedCount)
+        assertTrue(h.assistVoiceRequested.value)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+
+        composeRule.runOnIdle {
+            h.voiceSwitchesLoaded.value = true
+            h.voiceSwitchLoadFailed.value = true
+            // Fail-closed UI switches remain false on load failure.
+            h.userSwitches.value = mapOf(
+                VoiceTools.SWITCH_INPUT to false,
+                VoiceTools.SWITCH_OUTPUT to false,
+                VoiceTools.SWITCH_OPENAI to false,
+            )
+        }
+        composeRule.waitForIdle()
+
+        assertEquals(1, h.consumedCount)
+        assertEquals(false, h.assistVoiceRequested.value)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+        composeRule.onNodeWithText(
+            VoiceStt.fallbackMessage(DenyReason.USER_DISABLED, VoiceStt.DETAIL_SWITCH_OFF),
+        ).assertIsDisplayed()
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun settingsRoute_flaggedOnNewIntent_routesToChatAndSurvivesRecreationOnce() {
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.Ready(sampleEndpoint())
+        h.pending.value = false
+        h.assistVoiceRequested.value = false
+        h.voiceSwitchesLoaded.value = true
+        h.userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true)
+
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+
+        composeRule.runOnIdle {
+            h.nav.navigate(Routes.SETTINGS)
+        }
+        awaitRoute(h, Routes.SETTINGS)
+
+        // Deliver flagged onNewIntent while on Settings
+        composeRule.runOnIdle {
+            h.assistVoiceRequested.value = true
+        }
+        awaitRoute(h, Routes.CHAT)
+        composeRule.waitForIdle()
+
+        assertEquals(1, h.consumedCount)
+        assertEquals(false, h.assistVoiceRequested.value)
+        assertEquals(1, h.registry.launchedIntents.size)
+        assertEquals(RecognizerIntent.ACTION_RECOGNIZE_SPEECH, h.registry.launchedIntents.single().action)
+
+        // Simulated recreation with already-consumed state does not re-launch
+        composeRule.runOnIdle {
+            // assistVoiceRequested remains false
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, h.consumedCount)
+        assertEquals(1, h.registry.launchedIntents.size)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun setupRoute_flaggedOnNewIntent_clearsStaleFlagWithoutLeakingAcrossRecreation() {
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.NoEndpoint
+        h.pending.value = false
+        h.assistVoiceRequested.value = false
+        h.voiceSwitchesLoaded.value = true
+        h.userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true)
+
+        render(h)
+        awaitRoute(h, Routes.SETUP)
+
+        // Deliver flagged onNewIntent while on Setup
+        composeRule.runOnIdle {
+            h.assistVoiceRequested.value = true
+        }
+        composeRule.waitForIdle()
+
+        // Coordinator clears stale flag immediately
+        assertEquals(1, h.consumedCount)
+        assertEquals(false, h.assistVoiceRequested.value)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+
+        // Later when endpoint is saved/ready, no STT launch pops up
+        composeRule.runOnIdle {
+            h.gate.value = EndpointGate.Ready(sampleEndpoint())
+            h.nav.navigate(Routes.CHAT) {
+                popUpTo(Routes.SETUP) { inclusive = true }
+                launchSingleTop = true
+            }
+        }
+        awaitRoute(h, Routes.CHAT)
+        composeRule.waitForIdle()
+
+        assertEquals(1, h.consumedCount)
+        assertTrue(h.registry.launchedIntents.isEmpty())
         assertEquals(0, provider.streamCalls)
     }
 }

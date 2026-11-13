@@ -199,7 +199,8 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * Token layer (B2, honest char-based, no tokenizer dependency): all legs
  * above are `String.length` (UTF-16 code units). Interim conversion assumes
  * ~4 chars/token for running text (English ~3.5-4; CJK/dense symbols vary
- * widely, so this is an order-of-magnitude budget aid, never a billing or
+ * widely; counts are UTF-16 code units so emoji surrogate pairs inflate
+ * the count; this is an order-of-magnitude budget aid, never a billing or
  * model-context guarantee): 60k chars ≈ 15k tokens, 100k
  * ([MAX_REQUEST_CHARS]) ≈ 25k tokens, one 20k interim row ≈ 5k tokens.
  * Real token/heap measurement and budget tuning stay Target (B3 device
@@ -1056,7 +1057,8 @@ class TurnController(
    * (`combined - base`, capped prefix + live); the seed is then replaced, so
    * a resumed session at cap reports a growing send-time count while the
    * load-time total stays observable separately via the factory's
-   * historyDroppedCount. The UI list and transcript keep everything.
+   * historyDroppedCount (DB-tail drops only; the init-time window drop on a
+   * resumed session is overwritten by the first send-time count).
    */
   @Volatile var droppedHistoryCount: Int = (initialHistory.size - cappedHistory.size).coerceAtLeast(0)
     private set

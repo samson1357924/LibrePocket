@@ -272,6 +272,8 @@ class ChatRequestTrimVisibilityTest {
             "small request must fit uncropped, was ${req.messages.sumOf { it.text.length }}",
             req.messages.sumOf { it.text.length } <= TurnController.MAX_REQUEST_CHARS,
         )
+        // Window keeps newest 200 rows total (2000 tiny rows + live "hi" capped together).
+        assertEquals(200, req.messages.size)
         assertEquals(0, vm.requestTrimmedCount.value)
         assertEquals(2, vm.historyOmittedCount.value)
     }

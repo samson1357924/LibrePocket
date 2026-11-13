@@ -160,6 +160,10 @@ class BraveSearchProvider(
 ) : BaseKeyedSearchProvider(vault, keyId, timeoutMs, maxBodyChars, json) {
     override val id: String = ID
 
+    // Same posture as SearXNG/DDGS: namespace includes the fixed endpoint
+    // so a future custom-endpoint variant cannot share cached rows.
+    override val cacheNamespace: String get() = "$id@$ENDPOINT"
+
     companion object {
         const val ID = "brave"
         const val ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
@@ -193,6 +197,8 @@ class BraveSearchProvider(
 internal fun parseBraveResults(json: Json, body: String, limitHint: Int = 16): List<WebSearchResult>? {
     val root = try {
         json.parseToJsonElement(body) as? JsonObject ?: return null
+    } catch (e: CancellationException) {
+        throw e
     } catch (_: Exception) {
         return null
     }
@@ -209,6 +215,8 @@ internal fun parseBraveResults(json: Json, body: String, limitHint: Int = 16): L
                 published = primitiveOf(obj, "published_date", "published"),
             ) ?: continue
             out.add(hit)
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             continue
         }
@@ -231,6 +239,10 @@ class TavilySearchProvider(
     json: Json = KeyedSearchJson,
 ) : BaseKeyedSearchProvider(vault, keyId, timeoutMs, maxBodyChars, json) {
     override val id: String = ID
+
+    // Same posture as SearXNG/DDGS: namespace includes the fixed endpoint
+    // so a future custom-endpoint variant cannot share cached rows.
+    override val cacheNamespace: String get() = "$id@$ENDPOINT"
 
     companion object {
         const val ID = "tavily"
@@ -270,6 +282,8 @@ class TavilySearchProvider(
 internal fun parseTavilyResults(json: Json, body: String, limitHint: Int = 16): List<WebSearchResult>? {
     val root = try {
         json.parseToJsonElement(body) as? JsonObject ?: return null
+    } catch (e: CancellationException) {
+        throw e
     } catch (_: Exception) {
         return null
     }
@@ -286,6 +300,8 @@ internal fun parseTavilyResults(json: Json, body: String, limitHint: Int = 16): 
                 published = primitiveOf(obj, "published_date", "published"),
             ) ?: continue
             out.add(hit)
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             continue
         }
@@ -308,6 +324,10 @@ class ExaSearchProvider(
     json: Json = KeyedSearchJson,
 ) : BaseKeyedSearchProvider(vault, keyId, timeoutMs, maxBodyChars, json) {
     override val id: String = ID
+
+    // Same posture as SearXNG/DDGS: namespace includes the fixed endpoint
+    // so a future custom-endpoint variant cannot share cached rows.
+    override val cacheNamespace: String get() = "$id@$ENDPOINT"
 
     companion object {
         const val ID = "exa"
@@ -349,6 +369,8 @@ class ExaSearchProvider(
 internal fun parseExaResults(json: Json, body: String, limitHint: Int = 16): List<WebSearchResult>? {
     val root = try {
         json.parseToJsonElement(body) as? JsonObject ?: return null
+    } catch (e: CancellationException) {
+        throw e
     } catch (_: Exception) {
         return null
     }
@@ -365,6 +387,8 @@ internal fun parseExaResults(json: Json, body: String, limitHint: Int = 16): Lis
                 published = primitiveOf(obj, "publishedDate", "published_date", "published"),
             ) ?: continue
             out.add(hit)
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             continue
         }
@@ -388,6 +412,10 @@ class FirecrawlSearchProvider(
     json: Json = KeyedSearchJson,
 ) : BaseKeyedSearchProvider(vault, keyId, timeoutMs, maxBodyChars, json) {
     override val id: String = ID
+
+    // Same posture as SearXNG/DDGS: namespace includes the fixed endpoint
+    // so a future custom-endpoint variant cannot share cached rows.
+    override val cacheNamespace: String get() = "$id@$ENDPOINT"
 
     companion object {
         const val ID = "firecrawl"
@@ -421,6 +449,8 @@ class FirecrawlSearchProvider(
         }
         val root = try {
             json.parseToJsonElement(response.body) as? JsonObject
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             null
         } ?: return WebSearchOutcome.Failed(WebFailureReason.BAD_RESPONSE)
@@ -433,6 +463,8 @@ class FirecrawlSearchProvider(
     internal fun parseFirecrawlDataForTest(body: String): List<WebSearchResult>? {
         val root = try {
             json.parseToJsonElement(body) as? JsonObject ?: return null
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             return null
         }
@@ -454,6 +486,8 @@ internal fun parseFirecrawlData(root: JsonObject, limitHint: Int = 16): List<Web
                 published = primitiveOf(obj, "publishedDate", "published_date", "published"),
             ) ?: continue
             out.add(hit)
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             continue
         }

@@ -1,6 +1,13 @@
 package dev.librepocket.shell
 
+import androidx.annotation.VisibleForTesting
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * S3 提權橋產品態（BACKLOG D09，矩陣 §3）：審計表 + `privilege_bridge`
@@ -30,26 +37,62 @@ import kotlinx.coroutines.CancellationException
  * 單測用新實例（`PrivilegeBridgeState()`）互不污染，僅單例語義測試經
  * [resetProcessForTest] 前後隔離。
  */
-class PrivilegeBridgeState(
+class PrivilegeBridgeState @VisibleForTesting internal constructor(
     val audit: PrivilegeAuditLog = PrivilegeAuditLog(),
-    @Volatile var bridgeSwitchOn: Boolean = false,
-    @Volatile var bridgeGranted: Boolean = false,
+    bridgeSwitchOn: Boolean = false,
+    bridgeGranted: Boolean = false,
 ) {
+    @Volatile var bridgeSwitchOn: Boolean = bridgeSwitchOn
+        private set
+
+    @Volatile var bridgeGranted: Boolean = bridgeGranted
+        private set
+
+    fun setBridgeSwitch(enabled: Boolean) {
+        bridgeSwitchOn = enabled
+    }
+
+    val bridgeEffective: Boolean
+        get() = bridgeSwitchOn && bridgeGranted
+
+    val auditCountFlow: StateFlow<Int>
+        get() = audit.sizeFlow
+
+    private val opMutex = Mutex()
+    private val revokeEpoch = AtomicLong(0L)
+
     fun auditCount(): Int = audit.size()
 
     /**
-     * 一鍵收回：清表並回傳清除筆數，同時關閉開關與橋接授權。
+     * 一鍵收回（僅記憶體態）：清表並回傳清除筆數，同時關閉開關與橋接授權。
+     *
+     * 注意：本函數僅清除記憶體旗標與審計表，不清除磁碟 DataStore。
+     * 產品正常流程應呼叫持久版 [revoke(store, withdrawScope)]。
      */
+    @Deprecated(
+        message = "In-memory only. Use suspend revoke(store, withdrawScope) in production to ensure DataStore is cleared.",
+        replaceWith = ReplaceWith("revoke(store, withdrawScope)"),
+    )
     fun revoke(): Int {
-        val cleared = audit.revokeAll()
+        revokeEpoch.incrementAndGet()
         bridgeSwitchOn = false
         bridgeGranted = false
-        return cleared
+        return audit.revokeAll()
     }
+
+    /**
+     * 僅單測隔離用：記憶體收回（不碰磁碟）。
+     */
+    @VisibleForTesting
+    fun revokeInMemoryForTest(): Int = revoke()
 
     /**
      * 簽發橋授權：校驗＋落庫成功後才置 [bridgeGranted]（落庫抛錯即旗標不動，
      * fail-closed）；開關 [bridgeSwitchOn] 不在此動（UI 側意圖，見本類 KDoc）。
+     *
+     * Revoke-wins 併發保證：在排隊等待鎖前預先捕捉 revoke generation epoch，
+     * 若在排隊、落庫或校驗期間有撤銷發生，立即使授權失效、清除 Store 並抛出
+     * [IllegalStateException]。
      */
     suspend fun grant(
         store: PrivilegeBridgeStore,
@@ -58,10 +101,28 @@ class PrivilegeBridgeState(
         ttlMs: Long? = null,
         atMs: Long = System.currentTimeMillis(),
     ): PrivilegeGrant {
-        val grant = PrivilegeGrantPolicy.grant(providerId, configRevision, ttlMs, atMs)
-        store.save(grant)
-        bridgeGranted = true
-        return grant
+        val epochBefore = revokeEpoch.get()
+        return opMutex.withLock {
+            if (revokeEpoch.get() != epochBefore) {
+                bridgeGranted = false
+                throw IllegalStateException("PRIVILEGE_GRANT_REVOKED_CONCURRENTLY")
+            }
+            val grant = PrivilegeGrantPolicy.grant(providerId, configRevision, ttlMs, atMs)
+            store.save(grant)
+            if (revokeEpoch.get() != epochBefore) {
+                bridgeGranted = false
+                try { store.clear() } catch (_: Throwable) {}
+                throw IllegalStateException("PRIVILEGE_GRANT_REVOKED_CONCURRENTLY")
+            }
+            val postCheck = PrivilegeGrantPolicy.check(grant, providerId, configRevision, atMs)
+            if (revokeEpoch.get() != epochBefore) {
+                bridgeGranted = false
+                try { store.clear() } catch (_: Throwable) {}
+                throw IllegalStateException("PRIVILEGE_GRANT_REVOKED_CONCURRENTLY")
+            }
+            bridgeGranted = postCheck is PrivilegeGrantCheck.Valid
+            grant
+        }
     }
 
     /**
@@ -76,11 +137,22 @@ class PrivilegeBridgeState(
         store: PrivilegeBridgeStore,
         currentProviderId: String?,
         currentRevision: Long?,
-        nowMs: Long = System.currentTimeMillis(),
+        nowMs: Long? = null,
     ): PrivilegeGrantCheck {
-        val check = store.check(currentProviderId, currentRevision, nowMs)
-        bridgeGranted = check is PrivilegeGrantCheck.Valid
-        return check
+        val epochBefore = revokeEpoch.get()
+        return opMutex.withLock {
+            if (revokeEpoch.get() != epochBefore) {
+                bridgeGranted = false
+                return@withLock PrivilegeGrantCheck.Invalid(PrivilegeGrantPolicy.REASON_NEVER_GRANTED)
+            }
+            val check = store.check(currentProviderId, currentRevision, nowMs)
+            if (revokeEpoch.get() != epochBefore) {
+                bridgeGranted = false
+                return@withLock PrivilegeGrantCheck.Invalid(PrivilegeGrantPolicy.REASON_NEVER_GRANTED)
+            }
+            bridgeGranted = check is PrivilegeGrantCheck.Valid
+            check
+        }
     }
 
     /**
@@ -90,22 +162,48 @@ class PrivilegeBridgeState(
      *
      * 持久層／跨域 scope 抛錯時仍先落記憶體收回再重抛（fail-closed：
      * 收回永不因持久失敗而殘留可用旗標）；[CancellationException] 原樣傳播。
+     *
+     * 注意重入約束：本函數在持有內部 [opMutex] 鎖的臨界區內執行 [withdrawScope]，
+     * 該鎖為非重入鎖（non-reentrant）。傳入的 [withdrawScope] 僅應執行外部 Store 清除
+     *（例如 ShizukuGrantStore.clear()），嚴禁回調本物件的 [grant]、[refresh] 或 [revoke]，
+     * 否則將導致死鎖。
      */
     suspend fun revoke(
         store: PrivilegeBridgeStore,
         withdrawScope: (suspend () -> Unit)? = null,
     ): Int {
-        try {
-            store.clear()
-            withdrawScope?.invoke()
-        } catch (cancelled: CancellationException) {
-            revoke()
-            throw cancelled
-        } catch (failure: Exception) {
-            revoke()
-            throw failure
+        revokeEpoch.incrementAndGet()
+        bridgeSwitchOn = false
+        bridgeGranted = false
+        val cleared = audit.revokeAll()
+
+        withContext(NonCancellable) {
+            opMutex.withLock {
+                bridgeSwitchOn = false
+                bridgeGranted = false
+                var primaryFailure: Throwable? = null
+                try {
+                    store.clear()
+                } catch (t: Throwable) {
+                    primaryFailure = t
+                }
+                if (withdrawScope != null) {
+                    try {
+                        withdrawScope()
+                    } catch (t: Throwable) {
+                        if (primaryFailure != null) {
+                            primaryFailure.addSuppressed(t)
+                        } else {
+                            primaryFailure = t
+                        }
+                    }
+                }
+                bridgeSwitchOn = false
+                bridgeGranted = false
+                if (primaryFailure != null) throw primaryFailure
+            }
         }
-        return revoke()
+        return cleared
     }
 
     companion object {

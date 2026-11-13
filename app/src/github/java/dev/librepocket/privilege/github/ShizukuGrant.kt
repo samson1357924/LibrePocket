@@ -2,12 +2,16 @@ package dev.librepocket.privilege.github
 
 import android.content.Context
 import androidx.datastore.core.DataStore
+import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import dev.librepocket.shell.PendingRevokeMarker
+import java.io.File
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -21,7 +25,10 @@ import kotlinx.coroutines.withContext
  */
 private val Context.shizukuGrantDataStore: DataStore<Preferences> by preferencesDataStore(
     name = "librepocket_shizuku_grant",
+    corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
 )
+
+const val SHIZUKU_PENDING_REVOKE_FILE_NAME = "librepocket_shizuku_revoke.pending"
 
 internal val SHIZUKU_GRANT_PROVIDER_ID = stringPreferencesKey("shizuku_grant_provider_id_v1")
 internal val SHIZUKU_GRANT_CONFIG_REVISION = longPreferencesKey("shizuku_grant_config_revision_v1")
@@ -82,7 +89,9 @@ object ShizukuGrantPolicy {
         serviceVersion: Int,
         atMs: Long = System.currentTimeMillis(),
     ): ShizukuGrant {
-        require(providerId.isNotBlank()) { "PROVIDER_ID_BLANK" }
+        require(providerId.isNotBlank() && providerId.none { it.isISOControl() }) { "PROVIDER_ID_INVALID" }
+        require(configRevision > 0L) { "CONFIG_REVISION_INVALID" }
+        require(atMs >= 0L) { "AT_MS_NEGATIVE" }
         return ShizukuGrant(
             providerId = providerId,
             configRevision = configRevision,
@@ -103,7 +112,13 @@ object ShizukuGrantPolicy {
         currentRevision: Long?,
     ): GrantCheck {
         if (grant == null) return GrantCheck.Invalid(REASON_NEVER_GRANTED)
-        if (grant.providerId.isBlank()) return GrantCheck.Invalid(REASON_MALFORMED)
+        if (grant.providerId.isBlank() ||
+            grant.providerId.any { it.isISOControl() } ||
+            grant.configRevision <= 0L ||
+            grant.grantedAtMs < 0L
+        ) {
+            return GrantCheck.Invalid(REASON_MALFORMED)
+        }
         if (currentProviderId.isNullOrBlank() || currentRevision == null) {
             return GrantCheck.Invalid(REASON_CONFIG_UNREADABLE)
         }
@@ -127,11 +142,24 @@ object ShizukuGrantPolicy {
 class ShizukuGrantStore(
     private val dataStore: DataStore<Preferences>,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    val revokeMarker: PendingRevokeMarker = PendingRevokeMarker(null),
 ) {
-    constructor(context: Context) : this(context.applicationContext.shizukuGrantDataStore)
+    constructor(context: Context) : this(
+        dataStore = (context.applicationContext ?: context).shizukuGrantDataStore,
+        ioDispatcher = Dispatchers.IO,
+        revokeMarker = PendingRevokeMarker(
+            File(
+                (context.applicationContext ?: context).noBackupFilesDir
+                    ?: (context.applicationContext ?: context).filesDir,
+                SHIZUKU_PENDING_REVOKE_FILE_NAME,
+            ),
+        ),
+    )
 
     suspend fun save(grant: ShizukuGrant) {
-        require(grant.providerId.isNotBlank()) { "PROVIDER_ID_BLANK" }
+        require(grant.providerId.isNotBlank() && grant.providerId.none { it.isISOControl() }) { "PROVIDER_ID_INVALID" }
+        require(grant.configRevision > 0L) { "CONFIG_REVISION_INVALID" }
+        require(grant.grantedAtMs >= 0L) { "AT_MS_NEGATIVE" }
         withContext(ioDispatcher) {
             dataStore.edit { prefs ->
                 prefs[SHIZUKU_GRANT_PROVIDER_ID] = grant.providerId
@@ -139,10 +167,27 @@ class ShizukuGrantStore(
                 prefs[SHIZUKU_GRANT_AT_MS] = grant.grantedAtMs
                 prefs[SHIZUKU_GRANT_SERVICE_VERSION] = grant.serviceVersion
             }
+            revokeMarker.clearPending()
         }
     }
 
     suspend fun load(): ShizukuGrant? = withContext(ioDispatcher) {
+        if (revokeMarker.isPending()) {
+            try {
+                dataStore.edit { prefs ->
+                    prefs.remove(SHIZUKU_GRANT_PROVIDER_ID)
+                    prefs.remove(SHIZUKU_GRANT_CONFIG_REVISION)
+                    prefs.remove(SHIZUKU_GRANT_AT_MS)
+                    prefs.remove(SHIZUKU_GRANT_SERVICE_VERSION)
+                }
+                revokeMarker.clearPending()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // self-healing best effort
+            }
+            return@withContext null
+        }
         try {
             dataStore.data.map { prefs ->
                 val providerId = prefs[SHIZUKU_GRANT_PROVIDER_ID] ?: return@map null
@@ -163,12 +208,14 @@ class ShizukuGrantStore(
 
     suspend fun clear() {
         withContext(ioDispatcher) {
+            revokeMarker.markPending()
             dataStore.edit { prefs ->
                 prefs.remove(SHIZUKU_GRANT_PROVIDER_ID)
                 prefs.remove(SHIZUKU_GRANT_CONFIG_REVISION)
                 prefs.remove(SHIZUKU_GRANT_AT_MS)
                 prefs.remove(SHIZUKU_GRANT_SERVICE_VERSION)
             }
+            revokeMarker.clearPending()
         }
     }
 

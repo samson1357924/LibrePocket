@@ -1,7 +1,10 @@
 package dev.librepocket.privilege.github
 
+import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
+import dev.librepocket.shell.PendingRevokeMarker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -9,12 +12,14 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import java.io.File
+import java.io.IOException
 
 /**
  * B1 授權持久化測試（Issue #136 B1）：
@@ -49,12 +54,78 @@ class ShizukuGrantTest {
     }
 
     @Test fun malformedGrantIsInvalid() {
-        val check = ShizukuGrantPolicy.check(
+        val blankCheck = ShizukuGrantPolicy.check(
             ShizukuGrant("", 3L, 0L, 15),
             "preset:openai",
             3L,
         )
-        assertTrue("$check", check is GrantCheck.Invalid)
+        assertTrue("$blankCheck", blankCheck is GrantCheck.Invalid)
+        assertEquals(ShizukuGrantPolicy.REASON_MALFORMED, (blankCheck as GrantCheck.Invalid).reason)
+
+        val isoControlCheck = ShizukuGrantPolicy.check(
+            ShizukuGrant("provider\u0000", 3L, 0L, 15),
+            "provider\u0000",
+            3L,
+        )
+        assertTrue("$isoControlCheck", isoControlCheck is GrantCheck.Invalid)
+        assertEquals(ShizukuGrantPolicy.REASON_MALFORMED, (isoControlCheck as GrantCheck.Invalid).reason)
+
+        val zeroRevCheck = ShizukuGrantPolicy.check(
+            ShizukuGrant("preset:openai", 0L, 0L, 15),
+            "preset:openai",
+            0L,
+        )
+        assertTrue("$zeroRevCheck", zeroRevCheck is GrantCheck.Invalid)
+        assertEquals(ShizukuGrantPolicy.REASON_MALFORMED, (zeroRevCheck as GrantCheck.Invalid).reason)
+
+        val negativeRevCheck = ShizukuGrantPolicy.check(
+            ShizukuGrant("preset:openai", -1L, 0L, 15),
+            "preset:openai",
+            -1L,
+        )
+        assertTrue("$negativeRevCheck", negativeRevCheck is GrantCheck.Invalid)
+        assertEquals(ShizukuGrantPolicy.REASON_MALFORMED, (negativeRevCheck as GrantCheck.Invalid).reason)
+
+        val negAtCheck = ShizukuGrantPolicy.check(
+            ShizukuGrant("preset:openai", 3L, -1L, 15),
+            "preset:openai",
+            3L,
+        )
+        assertTrue("$negAtCheck", negAtCheck is GrantCheck.Invalid)
+        assertEquals(ShizukuGrantPolicy.REASON_MALFORMED, (negAtCheck as GrantCheck.Invalid).reason)
+    }
+
+    @Test fun grantValidationRejectsInvalidInputs() {
+        try {
+            ShizukuGrantPolicy.grant("  ", 3L, 15)
+            fail("blank providerId must throw")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("PROVIDER_ID_INVALID", e.message)
+        }
+        try {
+            ShizukuGrantPolicy.grant("provider\u001b", 3L, 15)
+            fail("control char in providerId must throw")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("PROVIDER_ID_INVALID", e.message)
+        }
+        try {
+            ShizukuGrantPolicy.grant("preset:openai", 0L, 15)
+            fail("revision 0 must throw")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("CONFIG_REVISION_INVALID", e.message)
+        }
+        try {
+            ShizukuGrantPolicy.grant("preset:openai", -1L, 15)
+            fail("negative revision must throw")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("CONFIG_REVISION_INVALID", e.message)
+        }
+        try {
+            ShizukuGrantPolicy.grant("preset:openai", 3L, 15, atMs = -1L)
+            fail("negative atMs must throw")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("AT_MS_NEGATIVE", e.message)
+        }
     }
 
     @Test fun unreadableConfigFailsClosed() {
@@ -125,8 +196,8 @@ class ShizukuGrantTest {
         try {
             ShizukuGrantPolicy.grant("  ", 3L, 15)
             fail("blank providerId must throw")
-        } catch (_: IllegalArgumentException) {
-            // 預期。
+        } catch (e: IllegalArgumentException) {
+            assertEquals("PROVIDER_ID_INVALID", e.message)
         }
         // store 層亦擋（繞過 policy 直構造仍不得寫入）。
         runBlocking {
@@ -134,10 +205,78 @@ class ShizukuGrantTest {
             try {
                 store.save(ShizukuGrant("", 3L, 0L, 15))
                 fail("blank providerId save must throw")
-            } catch (_: IllegalArgumentException) {
-                // 預期。
+            } catch (e: IllegalArgumentException) {
+                assertEquals("PROVIDER_ID_INVALID", e.message)
+            }
+            try {
+                store.save(ShizukuGrant("provider\u0000", 3L, 0L, 15))
+                fail("control char in providerId save must throw")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("PROVIDER_ID_INVALID", e.message)
+            }
+            try {
+                store.save(ShizukuGrant("provider", 0L, 0L, 15))
+                fail("zero revision save must throw")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("CONFIG_REVISION_INVALID", e.message)
+            }
+            try {
+                store.save(ShizukuGrant("provider", 3L, -1L, 15))
+                fail("negative atMs save must throw")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("AT_MS_NEGATIVE", e.message)
             }
         }
+    }
+
+    private class FailOnceClearDataStore(
+        private val delegate: DataStore<Preferences>,
+    ) : DataStore<Preferences> by delegate {
+        var failOnUpdate = false
+
+        override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+            if (failOnUpdate) {
+                failOnUpdate = false
+                throw IOException("simulated clear failure")
+            }
+            return delegate.updateData(transform)
+        }
+    }
+
+    @Test fun pendingRevokeMarkerPreventsResurrectionAndSelfHeals() = runBlocking {
+        val backing = PreferenceDataStoreFactory.create(scope = scope) { File(dir, "shizuku_marker.preferences_pb") }
+        val failOnceDs = FailOnceClearDataStore(backing)
+        val markerFile = File(dir, SHIZUKU_PENDING_REVOKE_FILE_NAME)
+        val marker = PendingRevokeMarker(markerFile)
+        val store = ShizukuGrantStore(failOnceDs, revokeMarker = marker)
+
+        val grant = ShizukuGrantPolicy.grant("preset:openai", 5L, 15)
+        store.save(grant)
+        assertEquals(grant, store.load())
+        assertFalse("Marker should not be pending after successful save", marker.isPending())
+
+        // Simulate clear failure
+        failOnceDs.failOnUpdate = true
+        try {
+            store.clear()
+            fail("store.clear should fail")
+        } catch (_: IOException) {
+            // Expected
+        }
+
+        // Marker remains pending on disk
+        assertTrue("Marker must remain pending after failed clear", marker.isPending())
+        assertTrue(markerFile.exists())
+
+        // Simulate app restart: new Store instance with normal DataStore and the same marker file
+        val restartedStore = ShizukuGrantStore(backing, revokeMarker = PendingRevokeMarker(markerFile))
+        // Load must detect pending marker, self-heal by clearing DataStore, and return null
+        assertNull("Pending marker must prevent resurrection on load", restartedStore.load())
+        assertFalse("Self-healing must have cleared the pending marker", markerFile.exists())
+        assertFalse(marker.isPending())
+
+        // Subsequent load returns null
+        assertNull(restartedStore.load())
     }
 
     @Test fun loadMissingKeysYieldsNull() = runBlocking {

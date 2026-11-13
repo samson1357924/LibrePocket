@@ -12,6 +12,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -64,13 +65,70 @@ class PrivilegeBridgeGrantTest {
     }
 
     @Test fun malformedGrantIsInvalid() {
-        val check = PrivilegeGrantPolicy.check(
-            PrivilegeGrant("", 3L, 0L, null),
+        // Blank providerId
+        val blankCheck = PrivilegeGrantPolicy.check(
+            PrivilegeGrant("", 3L, 1000L, null),
             "preset:openai",
             3L,
         )
-        assertTrue("$check", check is PrivilegeGrantCheck.Invalid)
-        assertEquals(PrivilegeGrantPolicy.REASON_MALFORMED, (check as PrivilegeGrantCheck.Invalid).reason)
+        assertTrue("$blankCheck", blankCheck is PrivilegeGrantCheck.Invalid)
+        assertEquals(PrivilegeGrantPolicy.REASON_MALFORMED, (blankCheck as PrivilegeGrantCheck.Invalid).reason)
+
+        // ISO control chars in providerId
+        val isoControlCheck = PrivilegeGrantPolicy.check(
+            PrivilegeGrant("preset:\u0000openai", 3L, 1000L, null),
+            "preset:\u0000openai",
+            3L,
+        )
+        assertTrue("$isoControlCheck", isoControlCheck is PrivilegeGrantCheck.Invalid)
+        assertEquals(PrivilegeGrantPolicy.REASON_MALFORMED, (isoControlCheck as PrivilegeGrantCheck.Invalid).reason)
+
+        // Non-positive config revision
+        val zeroRevCheck = PrivilegeGrantPolicy.check(
+            PrivilegeGrant("preset:openai", 0L, 1000L, null),
+            "preset:openai",
+            0L,
+        )
+        assertTrue("$zeroRevCheck", zeroRevCheck is PrivilegeGrantCheck.Invalid)
+        assertEquals(PrivilegeGrantPolicy.REASON_MALFORMED, (zeroRevCheck as PrivilegeGrantCheck.Invalid).reason)
+
+        val negativeRevCheck = PrivilegeGrantPolicy.check(
+            PrivilegeGrant("preset:openai", -1L, 1000L, null),
+            "preset:openai",
+            -1L,
+        )
+        assertTrue("$negativeRevCheck", negativeRevCheck is PrivilegeGrantCheck.Invalid)
+        assertEquals(PrivilegeGrantPolicy.REASON_MALFORMED, (negativeRevCheck as PrivilegeGrantCheck.Invalid).reason)
+
+        // Negative grantedAtMs
+        val negAtCheck = PrivilegeGrantPolicy.check(
+            PrivilegeGrant("preset:openai", 3L, -1L, null),
+            "preset:openai",
+            3L,
+        )
+        assertTrue("$negAtCheck", negAtCheck is PrivilegeGrantCheck.Invalid)
+        assertEquals(PrivilegeGrantPolicy.REASON_MALFORMED, (negAtCheck as PrivilegeGrantCheck.Invalid).reason)
+
+        // expiresAtMs < grantedAtMs
+        val invertedExpiryCheck = PrivilegeGrantPolicy.check(
+            PrivilegeGrant("preset:openai", 3L, 1000L, 999L),
+            "preset:openai",
+            3L,
+        )
+        assertTrue("$invertedExpiryCheck", invertedExpiryCheck is PrivilegeGrantCheck.Invalid)
+        assertEquals(PrivilegeGrantPolicy.REASON_MALFORMED, (invertedExpiryCheck as PrivilegeGrantCheck.Invalid).reason)
+    }
+
+    @Test fun clockRollbackInvalidatesGrant() {
+        val atMs = 1_700_000_000_000L
+        val grant = PrivilegeGrantPolicy.grant("preset:openai", 3L, ttlMs = 60_000L, atMs = atMs)
+        // System time rolled back before grantedAtMs
+        val rollback = PrivilegeGrantPolicy.check(grant, "preset:openai", 3L, nowMs = atMs - 1L)
+        assertTrue("$rollback", rollback is PrivilegeGrantCheck.Invalid)
+        assertEquals(
+            PrivilegeGrantPolicy.REASON_CLOCK_ROLLBACK,
+            (rollback as PrivilegeGrantCheck.Invalid).reason,
+        )
     }
 
     @Test fun unreadableConfigFailsClosed() {
@@ -135,17 +193,52 @@ class PrivilegeBridgeGrantTest {
         }
     }
 
-    @Test fun ttlOverflowSaturates() {
-        val grant = PrivilegeGrantPolicy.grant("preset:openai", 3L, ttlMs = 100L, atMs = Long.MAX_VALUE - 10L)
-        assertEquals(Long.MAX_VALUE, grant.expiresAtMs)
-        assertTrue(
-            PrivilegeGrantPolicy.check(grant, "preset:openai", 3L, nowMs = Long.MAX_VALUE - 1L)
-                is PrivilegeGrantCheck.Valid,
-        )
-        assertTrue(
-            PrivilegeGrantPolicy.check(grant, "preset:openai", 3L, nowMs = Long.MAX_VALUE)
-                is PrivilegeGrantCheck.Invalid,
-        )
+    @Test fun ttlOverflowThrows() {
+        try {
+            PrivilegeGrantPolicy.grant("preset:openai", 3L, ttlMs = 100L, atMs = Long.MAX_VALUE - 10L)
+            fail("ttl overflow must throw")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("TTL_OVERFLOW", e.message)
+        }
+    }
+
+    @Test fun grantValidationRejectsInvalidInputs() {
+        try {
+            PrivilegeGrantPolicy.grant("  ", 3L)
+            fail("blank providerId must throw")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("PROVIDER_ID_INVALID", e.message)
+        }
+        try {
+            PrivilegeGrantPolicy.grant("provider\u0007", 3L)
+            fail("control char in providerId must throw")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("PROVIDER_ID_INVALID", e.message)
+        }
+        try {
+            PrivilegeGrantPolicy.grant("preset:openai", 0L)
+            fail("revision 0 must throw")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("CONFIG_REVISION_INVALID", e.message)
+        }
+        try {
+            PrivilegeGrantPolicy.grant("preset:openai", -1L)
+            fail("negative revision must throw")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("CONFIG_REVISION_INVALID", e.message)
+        }
+        try {
+            PrivilegeGrantPolicy.grant("preset:openai", 3L, atMs = -1L)
+            fail("negative atMs must throw")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("AT_MS_NEGATIVE", e.message)
+        }
+        try {
+            PrivilegeGrantPolicy.grant("preset:openai", 3L, ttlMs = -1L)
+            fail("negative ttlMs must throw")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("TTL_NEGATIVE", e.message)
+        }
     }
 
     @Test fun saveBlankProviderThrows() {
@@ -160,8 +253,32 @@ class PrivilegeBridgeGrantTest {
             try {
                 store.save(PrivilegeGrant("", 3L, 0L, null))
                 fail("blank providerId save must throw")
-            } catch (_: IllegalArgumentException) {
-                // 預期。
+            } catch (e: IllegalArgumentException) {
+                assertEquals("PROVIDER_ID_INVALID", e.message)
+            }
+            try {
+                store.save(PrivilegeGrant("provider\u0000", 3L, 0L, null))
+                fail("control char in providerId save must throw")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("PROVIDER_ID_INVALID", e.message)
+            }
+            try {
+                store.save(PrivilegeGrant("provider", 0L, 0L, null))
+                fail("zero revision save must throw")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("CONFIG_REVISION_INVALID", e.message)
+            }
+            try {
+                store.save(PrivilegeGrant("provider", 3L, -1L, null))
+                fail("negative atMs save must throw")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("AT_MS_NEGATIVE", e.message)
+            }
+            try {
+                store.save(PrivilegeGrant("provider", 3L, 1000L, 999L))
+                fail("inverted expiry save must throw")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("EXPIRES_AT_INVALID", e.message)
             }
         }
     }
@@ -326,6 +443,97 @@ class PrivilegeBridgeGrantTest {
         assertEquals(0, state.auditCount())
         assertFalse(state.bridgeSwitchOn)
         assertFalse(state.bridgeGranted)
+    }
+
+    @Test fun stateRevokeStoreFailureStillRunsWithdrawScope() = runBlocking {
+        val store = PrivilegeBridgeStore(ThrowingDataStore())
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true, bridgeGranted = true)
+        state.audit.record(listOf("id"), "B1-x", "DENY")
+        var withdrawScopeRan = false
+        try {
+            state.revoke(store) { withdrawScopeRan = true }
+            fail("store failure must propagate")
+        } catch (_: IOException) {
+            // Expected
+        }
+        assertTrue("withdrawScope must run even if store.clear fails", withdrawScopeRan)
+        assertEquals(0, state.auditCount())
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+    }
+
+    @Test fun checkEvaluatesClockAfterLoadCompletes() = runBlocking {
+        var loadCompleted = false
+        val backing = PreferenceDataStoreFactory.create(scope = scope) { File(dir, "clock_test.preferences_pb") }
+        val delegating = object : DataStore<Preferences> by backing {
+            override val data: Flow<Preferences> = backing.data.map {
+                loadCompleted = true
+                it
+            }
+        }
+        var clockEvaluatedAfterLoad = false
+        val store = PrivilegeBridgeStore(
+            dataStore = delegating,
+            clock = {
+                clockEvaluatedAfterLoad = loadCompleted
+                1_700_000_000_000L
+            },
+        )
+        store.save(PrivilegeGrantPolicy.grant("preset:openai", 3L, ttlMs = 10_000L, atMs = 1_700_000_000_000L))
+        loadCompleted = false
+        val check = store.check("preset:openai", 3L)
+        assertTrue(check is PrivilegeGrantCheck.Valid)
+        assertTrue("clock must be queried AFTER load completes", clockEvaluatedAfterLoad)
+    }
+
+    private class FailOnceClearDataStore(
+        private val delegate: DataStore<Preferences>,
+    ) : DataStore<Preferences> by delegate {
+        var failOnUpdate = false
+
+        override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+            if (failOnUpdate) {
+                failOnUpdate = false
+                throw IOException("simulated clear failure")
+            }
+            return delegate.updateData(transform)
+        }
+    }
+
+    @Test fun pendingRevokeMarkerPreventsResurrectionAndSelfHeals() = runBlocking {
+        val backing = PreferenceDataStoreFactory.create(scope = scope) { File(dir, "pending_marker.preferences_pb") }
+        val failOnceDs = FailOnceClearDataStore(backing)
+        val markerFile = File(dir, PRIVILEGE_PENDING_REVOKE_FILE_NAME)
+        val marker = PendingRevokeMarker(markerFile)
+        val store = PrivilegeBridgeStore(failOnceDs, revokeMarker = marker)
+
+        val grant = PrivilegeGrantPolicy.grant("preset:openai", 5L)
+        store.save(grant)
+        assertEquals(grant, store.load())
+        assertFalse("Marker should not be pending after successful save", marker.isPending())
+
+        // Simulate clear failure
+        failOnceDs.failOnUpdate = true
+        try {
+            store.clear()
+            fail("store.clear should fail")
+        } catch (_: IOException) {
+            // Expected
+        }
+
+        // Marker remains pending on disk
+        assertTrue("Marker must remain pending after failed clear", marker.isPending())
+        assertTrue(markerFile.exists())
+
+        // Simulate app restart: create a new Store instance with normal DataStore and the same marker file
+        val restartedStore = PrivilegeBridgeStore(backing, revokeMarker = PendingRevokeMarker(markerFile))
+        // Load must detect pending marker, self-heal by clearing DataStore, and return null (no resurrection)
+        assertNull("Pending marker must prevent resurrection on load", restartedStore.load())
+        assertFalse("Self-healing must have cleared the pending marker", markerFile.exists())
+        assertFalse(marker.isPending())
+
+        // Subsequent load returns null
+        assertNull(restartedStore.load())
     }
 
     @Test fun processSingletonIsStableUntilReset() {

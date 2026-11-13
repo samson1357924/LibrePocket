@@ -41,9 +41,12 @@ private class TailFakeProvider(
  * Stage E history-tail regressions (all fake data).
  *
  * - Model history keeps the NEWEST rows (tail), oldest-first restored, with
- *   an exact dropped count ([CreatedSession.historyDroppedCount]).
+ *   an exact dropped count ([CreatedSession.historyDroppedCount] counts the
+ *   DB-tail drop beyond the 2000-row scan; the DEFAULT request window
+ *   (200 msgs / 60k chars) bounds the outgoing copy downstream —
+ *   B2 unification, see `ChatSessionFactoryHydrationB2Test`).
  * - The outgoing cap windows the combined (prefix + live) total, so the
- *   first send after a full tail evicts one more oldest row to hold 2000.
+ *   first send after a full tail evicts one more oldest row to hold 200.
  * - A giant single row is truncated with a visible marker (fail-closed, never
  *   a silent unbounded payload).
  */
@@ -111,18 +114,20 @@ class ChatSessionFactoryHistoryTailTest {
         }
         val opened = factoryWith(transcripts, provider).open(sampleEndpoint(), sid)
         try {
-            // 2002 qualifying rows, cap 2000: oldest pair (u0,a0) omitted at load.
+            // B2: DB tail still drops the oldest pair (u0,a0) at load
+            // (2002 rows, 2000-row scan cap), then the DEFAULT window
+            // (200 msgs) bounds the request copy downstream.
             assertEquals(2, opened.historyDroppedCount)
             opened.session.send("q-new")
             val req = provider.seenRequests.single()
-            // Total-window semantics: the outgoing cap bounds the combined
-            // (2000-row prefix + 1 live) copy at 2000, so the new turn evicts
-            // one more oldest prefix row (u1). Request holds [a1..a1000, q-new].
-            assertEquals(2000, req.messages.size)
-            assertEquals("a1", req.messages.first().text)
-            assertEquals("a1000", req.messages[2000 - 2].text)
+            // Combined (200 prefix + 1 live) windows to 200: the new turn
+            // evicts one more oldest prefix row. Request holds
+            // [a901..a1000, q-new] (newest 100 turns of the 2000-row tail).
+            assertEquals(200, req.messages.size)
+            assertEquals("a901", req.messages.first().text)
+            assertEquals("a1000", req.messages[200 - 2].text)
             assertTrue(req.messages.last().text.startsWith("q-new"))
-            assertTrue(req.messages.none { it.text == "u0" || it.text == "a0" || it.text == "u1" })
+            assertTrue(req.messages.none { it.text == "u0" || it.text == "a0" || it.text == "u901" })
         } finally {
             opened.session.close()
         }

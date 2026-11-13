@@ -315,7 +315,7 @@ class ElevatedCleanupTrackerB2Test {
             ElevatedCleanupTracker.noteClean()
             assertEquals(0, ElevatedCleanupTracker.consecutiveCount())
         } finally {
-            repeat(8) { ElevatedCleanupTracker.releaseSlot() }
+            while (ElevatedCleanupTracker.outstanding() > 0) { ElevatedCleanupTracker.releaseSlot() }
             pollOutstandingTo(0)
             ElevatedCleanupTracker.noteClean()
         }
@@ -424,8 +424,8 @@ class ElevatedCleanupTrackerB2Test {
             assertEquals(4, ElevatedCleanupTracker.activeCalls())
         } finally {
             ElevatedCleanupTracker.clearUnverified()
-            repeat(8) { ElevatedCleanupTracker.releaseSlot() }
-            repeat(8) { ElevatedCleanupTracker.leaveCall() }
+            while (ElevatedCleanupTracker.outstanding() > 0) { ElevatedCleanupTracker.releaseSlot() }
+            while (ElevatedCleanupTracker.activeCalls() > 0) { ElevatedCleanupTracker.leaveCall() }
             pollOutstandingTo(0)
             pollActiveTo(0)
             ElevatedCleanupTracker.noteClean()
@@ -699,8 +699,8 @@ class ElevatedCleanupTrackerB2Test {
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
         } finally {
             ElevatedCleanupTracker.clearUnverified()
-            repeat(8) { ElevatedCleanupTracker.releaseSlot() }
-            repeat(8) { ElevatedCleanupTracker.leaveCall() }
+            while (ElevatedCleanupTracker.outstanding() > 0) { ElevatedCleanupTracker.releaseSlot() }
+            while (ElevatedCleanupTracker.activeCalls() > 0) { ElevatedCleanupTracker.leaveCall() }
             pollOutstandingTo(0)
             pollActiveTo(0)
             ElevatedCleanupTracker.noteClean()
@@ -725,7 +725,7 @@ class ElevatedCleanupTrackerB2Test {
             assertEquals(2, ElevatedCleanupTracker.outstanding())
             assertEquals(2, ElevatedCleanupTracker.peakOutstanding())
         } finally {
-            repeat(8) { ElevatedCleanupTracker.releaseSlot() }
+            while (ElevatedCleanupTracker.outstanding() > 0) { ElevatedCleanupTracker.releaseSlot() }
             pollOutstandingTo(0)
             ElevatedCleanupTracker.noteClean()
         }

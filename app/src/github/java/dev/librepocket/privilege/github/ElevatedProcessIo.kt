@@ -1722,12 +1722,32 @@ internal object ElevatedCallSupervisor {
         //   quarantine 登記（[ElevatedCleanupTracker.quarantineUnverified]，而非丟棄），
         //   outstanding 歸零後仍以 QUARANTINE 擋後續 spawn（同條漏回收路徑消除，
         //   不只寫 breaker 計數）。
+        // Note: quarantine only blocks admission and verifies death; it does NOT kill.
+        // Best-effort termination is attempted via detached daemon thread (fire-and-forget).
         fun startLateDaemon(v: Process) {
             val acquired = ElevatedCleanupTracker.acquireSlot()
             if (!acquired) {
-                runCatching { killer(v) }
-                runCatching { v.destroyForcibly() }
+                // Bounded caller-side path: killer is ElevatedProcessKiller.killTree which
+                // may perform unbounded synchronous Binder IPC (Shizuku Process). Calling it
+                // on the caller thread breaks the bounded execution guarantee. Instead,
+                // launch a detached daemon thread for best-effort termination (fire-and-forget,
+                // never joined), then register the handle in quarantine, mark incomplete/
+                // unclean, and return immediately. The detached thread attempts kill but does
+                // not block the caller.
+                try {
+                    Thread({
+                        runCatching { killer(v) }
+                        runCatching { v.destroyForcibly() }
+                        runCatching { v.inputStream.close() }
+                        runCatching { v.errorStream.close() }
+                        runCatching { v.outputStream.close() }
+                    }, "elevated-late-kill").apply { isDaemon = true; start() }
+                } catch (_: Throwable) {
+                    // Thread.start() failed (e.g. OOM); ensure fail-closed accounting
+                    // still runs even if thread creation failed.
+                }
                 ElevatedCleanupTracker.quarantineUnverified(v)
+                lateIncomplete.set(true)
                 countUncleanOnce()
                 return
             }
@@ -1749,9 +1769,23 @@ internal object ElevatedCallSupervisor {
                 t.start()
             } catch (_: Throwable) {
                 ElevatedCleanupTracker.releaseSlot()
-                runCatching { killer(v) }
-                runCatching { v.destroyForcibly() }
+                // Detached best-effort kill (bounded caller path, fire-and-forget).
+                // Quarantine only blocks admission and verifies death; it does NOT kill.
+                // The detached daemon thread attempts termination without blocking caller.
+                try {
+                    Thread({
+                        runCatching { killer(v) }
+                        runCatching { v.destroyForcibly() }
+                        runCatching { v.inputStream.close() }
+                        runCatching { v.errorStream.close() }
+                        runCatching { v.outputStream.close() }
+                    }, "elevated-late-kill").apply { isDaemon = true; start() }
+                } catch (_: Throwable) {
+                    // Thread.start() failed (e.g. OOM); ensure fail-closed accounting
+                    // still runs even if thread creation failed.
+                }
                 ElevatedCleanupTracker.quarantineUnverified(v)
+                lateIncomplete.set(true)
                 countUncleanOnce()
             }
         }
@@ -1766,8 +1800,18 @@ internal object ElevatedCallSupervisor {
                         fun compensateInline(v: Process) {
                             val acquired = ElevatedCleanupTracker.acquireSlot()
                             if (!acquired) {
-                                runCatching { killer(v) }
-                                runCatching { v.destroyForcibly() }
+                                // Bounded worker-side path: detached best-effort kill.
+                                try {
+                                    Thread({
+                                        runCatching { killer(v) }
+                                        runCatching { v.destroyForcibly() }
+                                        runCatching { v.inputStream.close() }
+                                        runCatching { v.errorStream.close() }
+                                        runCatching { v.outputStream.close() }
+                                    }, "elevated-late-kill").apply { isDaemon = true; start() }
+                                } catch (_: Throwable) {
+                                    // Thread.start() failed; ensure fail-closed accounting.
+                                }
                                 ElevatedCleanupTracker.quarantineUnverified(v)
                                 lateIncomplete.set(true)
                                 countUncleanOnce()

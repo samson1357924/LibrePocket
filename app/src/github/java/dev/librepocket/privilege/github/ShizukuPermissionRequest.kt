@@ -2,6 +2,7 @@ package dev.librepocket.privilege.github
 
 import android.content.pm.PackageManager
 import androidx.annotation.VisibleForTesting
+import kotlinx.coroutines.CancellationException
 import rikka.shizuku.Shizuku
 
 /**
@@ -31,9 +32,32 @@ import rikka.shizuku.Shizuku
  * 本 app」的開關，不等於 OS sandbox——Root／特權語義見兩 runner KDoc，
  * 本類不作執行，不承諾隔離。
  */
-class ShizukuPermissionRequests {
+class ShizukuPermissionRequests(
+    private val addListener: (Shizuku.OnRequestPermissionResultListener) -> Unit = { Shizuku.addRequestPermissionResultListener(it) },
+    private val removeListener: (Shizuku.OnRequestPermissionResultListener) -> Unit = { Shizuku.removeRequestPermissionResultListener(it) },
+) {
+    companion object {
+        @Volatile
+        private var processInstance: ShizukuPermissionRequests? = null
+
+        fun process(): ShizukuPermissionRequests =
+            processInstance ?: synchronized(this) {
+                processInstance ?: ShizukuPermissionRequests().also { processInstance = it }
+            }
+
+        @VisibleForTesting
+        fun resetProcessForTest() {
+            synchronized(this) {
+                processInstance?.detach()
+                processInstance = null
+            }
+        }
+    }
+
     private val callbacks = mutableMapOf<Int, MutableList<(Boolean) -> Unit>>()
     private val lock = Any()
+
+    private var activeEpoch = 0L
 
     /** 是否已向上游註冊結果 listener（冪等守衛，僅 [attach]/[detach]/[clear] 內讀寫）。 */
     private var attached = false
@@ -62,53 +86,144 @@ class ShizukuPermissionRequests {
         requestPermission: (Int) -> Unit = { code -> Shizuku.requestPermission(code) },
     ): Boolean = runCatching { requestPermission(requestCode) }.isSuccess
 
+    private fun rollbackCallback(requestCode: Int, callback: (Boolean) -> Unit) {
+        synchronized(lock) {
+            val list = callbacks[requestCode]
+            list?.remove(callback)
+            if (list.isNullOrEmpty()) callbacks.remove(requestCode)
+        }
+    }
+
+    /**
+     * 原子登記回呼並送出授權請求。
+     * 若送出異常或失敗，自動回滾並移除已登記的回呼。
+     */
+    fun requestWithCallback(
+        requestCode: Int,
+        callback: (Boolean) -> Unit,
+        requestPermission: (Int) -> Unit = { code -> Shizuku.requestPermission(code) },
+    ): Boolean {
+        synchronized(lock) {
+            callbacks.getOrPut(requestCode) { mutableListOf() } += callback
+        }
+        val success = try {
+            requestPermission(requestCode)
+            true
+        } catch (e: CancellationException) {
+            rollbackCallback(requestCode, callback)
+            throw e
+        } catch (_: Throwable) {
+            rollbackCallback(requestCode, callback)
+            false
+        }
+        return success
+    }
+
+    /**
+     * 作廢所有進行中的請求：遞增 activeEpoch 並清空回呼表（synchronized）。
+     */
+    fun invalidatePending() {
+        synchronized(lock) {
+            activeEpoch++
+            callbacks.clear()
+        }
+    }
+
     /**
      * 是否已成功註冊上游 listener（守衛讀取；供單測斷言重試/重建語義）。
      */
     fun isAttached(): Boolean = synchronized(lock) { attached }
 
+    @VisibleForTesting
+    internal fun currentEpoch(): Long = synchronized(lock) { activeEpoch }
+
+    /**
+     * 單次消費回呼分發：按 requestCode 查找並移除回呼（one-shot），
+     * 比對 epoch 一致性；逐個調用並隔離異常。
+     */
+    private fun dispatchResult(requestCode: Int, grantResult: Int, epoch: Long) {
+        val snapshot: List<(Boolean) -> Unit>
+        synchronized(lock) {
+            if (epoch != activeEpoch) return
+            snapshot = callbacks.remove(requestCode)?.toList() ?: return
+        }
+        val granted = grantResult == PackageManager.PERMISSION_GRANTED
+        for (callback in snapshot) {
+            try {
+                callback(granted)
+            } catch (_: Throwable) {
+                // 回呼異常隔離（Binder/同步線程中不向外洩漏，避免影響其他回呼）
+            }
+        }
+    }
+
     /** 僅真實 listener 轉發用（internal：行程外不可偽造結果）：按碼分發結果快照（異常隔離，逐個收斂）。 */
     @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
-    internal fun emitResult(requestCode: Int, grantResult: Int) {
-        val snapshot = synchronized(lock) { callbacks[requestCode]?.toList() } ?: return
-        val granted = grantResult == PackageManager.PERMISSION_GRANTED
-        snapshot.forEach { runCatching { it(granted) } }
+    internal fun emitResult(
+        requestCode: Int,
+        grantResult: Int,
+        epoch: Long = synchronized(lock) { activeEpoch },
+    ) {
+        dispatchResult(requestCode, grantResult, epoch)
     }
 
     /**
      * 產品接線：向上游註冊授權結果 listener，事件轉發進回呼表。
      * 冪等：成功後重複呼叫只註冊一次（[attached] 守衛）；失敗不置守衛，允許重試。
+     *
+     * 鎖反轉防禦：呼叫 [addListener] 時不持有 [lock]，避免 AB-BA 死鎖；
+     * 若在無鎖註冊期間被 [detach]，則主動呼叫 [removeListener] 保持乾淨。
      */
     fun attach() {
+        val stagedEpoch: Long
+        val listener: Shizuku.OnRequestPermissionResultListener
         synchronized(lock) {
             if (attached) return
-            val staged: Shizuku.OnRequestPermissionResultListener =
-                resultListener ?: run {
-                    lateinit var listener: Shizuku.OnRequestPermissionResultListener
-                    listener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
-                        val snapshot = synchronized(lock) {
-                            if (resultListener !== listener) return@synchronized null
-                            callbacks[requestCode]?.toList()
-                        } ?: return@OnRequestPermissionResultListener
-                        val granted = grantResult == PackageManager.PERMISSION_GRANTED
-                        snapshot.forEach { runCatching { it(granted) } }
-                    }
-                    listener.also { resultListener = it }
+            stagedEpoch = activeEpoch
+            listener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+                val epoch = synchronized(lock) {
+                    if (!attached) return@OnRequestPermissionResultListener
+                    activeEpoch
                 }
-            if (runCatching { Shizuku.addRequestPermissionResultListener(staged) }.isFailure) {
-                if (resultListener === staged) resultListener = null
-                return
+                dispatchResult(requestCode, grantResult, epoch)
             }
-            attached = true
+        }
+
+        val added = try {
+            addListener(listener)
+            true
+        } catch (_: Exception) {
+            false
+        } catch (_: LinkageError) {
+            false
+        }
+
+        if (!added) return
+
+        val shouldRemove: Boolean
+        synchronized(lock) {
+            if (activeEpoch != stagedEpoch || attached) {
+                // 解鎖期間被 detach / invalidatePending 或已有其它執行緒 attach 成功
+                shouldRemove = true
+            } else {
+                attached = true
+                resultListener = listener
+                shouldRemove = false
+            }
+        }
+
+        if (shouldRemove) {
+            try {
+                removeListener(listener)
+            } catch (_: Exception) {
+            } catch (_: LinkageError) {
+            }
         }
     }
 
     /**
      * 解除接線：反註冊上游 listener 並清空本地回呼表、丟棄暫存引用、重置守衛。
-     *
-     * 產品唯一出口：任何 attach 成功路徑必須以 [detach] 收尾，不得只調 [clear]——
-     * [clear] 不觸碰上游註冊，只清本地會造成上游靜態表殘留累積。
-     * 空 detach（未 attach 即調）為無操作，不外抛。
+     * 鎖反轉防禦：在鎖內清空狀態並取出 listener 引用，在鎖外呼叫 [removeListener]。
      */
     fun detach() {
         val staged: Shizuku.OnRequestPermissionResultListener?
@@ -117,7 +232,11 @@ class ShizukuPermissionRequests {
             clearLocked()
         }
         if (staged != null) {
-            runCatching { Shizuku.removeRequestPermissionResultListener(staged) }
+            try {
+                removeListener(staged)
+            } catch (_: Exception) {
+            } catch (_: LinkageError) {
+            }
         }
     }
 
@@ -133,6 +252,7 @@ class ShizukuPermissionRequests {
     }
 
     private fun clearLocked() {
+        activeEpoch++
         callbacks.clear()
         resultListener = null
         attached = false

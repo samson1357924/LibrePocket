@@ -5570,6 +5570,7 @@ class TurnController(
     event: StreamEvent.ToolDone,
     attemptRunId: String,
     onWiredToolDone: ((dev.librepocket.provider.ToolCall) -> Unit)?,
+    offeredToolNames: Set<String>,
   ) {
     // Terminal-only guard (Stage E): a direct ToolDone that never
     // went through delta budgeting must still fit ALL budgets
@@ -5664,6 +5665,7 @@ class TurnController(
       onWiredToolDone != null &&
       toolSlice != null &&
       event.name == SafeToolSlice.TOOL_NAME &&
+      event.name in offeredToolNames &&
       pairingId !in state.seenCallIds
     ) {
       state.seenCallIds.add(pairingId)
@@ -5764,6 +5766,7 @@ class TurnController(
     onWiredToolDone: ((dev.librepocket.provider.ToolCall) -> Unit)?,
   ): StreamOutcome {
     coroutineContext.ensureActive()
+    val offeredToolNames = request.tools.map { it.name }.toSet()
     var done = false
     var failed: StreamEvent.Failed? = null
     try {
@@ -5824,7 +5827,7 @@ class TurnController(
           // (covers reasoning origins with no replayable payload).
           is StreamEvent.ReasoningPresent -> markAssistantReasoning(attemptRunId)
           is StreamEvent.ToolDelta -> noteToolDelta(state, event)
-          is StreamEvent.ToolDone -> noteToolDone(state, event, attemptRunId, onWiredToolDone)
+          is StreamEvent.ToolDone -> noteToolDone(state, event, attemptRunId, onWiredToolDone, offeredToolNames)
           is StreamEvent.Usage -> {
             // Authoritative per-attempt usage (#84): merge last-wins (null
             // fields keep the previous value) and write once before the

@@ -1,5 +1,6 @@
 package dev.librepocket.router
 
+import androidx.annotation.VisibleForTesting
 import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.ChatMessage
@@ -129,6 +130,9 @@ class SafeToolSlice(
     init {
         require(maxCallsPerTurn in 1..8) { "maxCallsPerTurn must be 1..8, was $maxCallsPerTurn" }
     }
+
+    internal fun usesPolicy(other: PolicyStore): Boolean = policy === other
+
     companion object {
         /** The single slice tool (registry `executionReady=true`; loop is opt-in/test-attached). */
         const val TOOL_NAME: String = "lsp.symbols"
@@ -475,6 +479,7 @@ class SafeToolSlice(
      * volatile so a mid-turn install from the test thread is visible to the
      * turn dispatcher thread.
      */
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
     @Volatile
     internal var beforeExecuteForTest: (suspend () -> Unit)? = null
 
@@ -489,6 +494,7 @@ class SafeToolSlice(
      * Volatile for the same cross-thread install reason as
      * [beforeExecuteForTest].
      */
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
     @Volatile
     internal var backendTimeoutMillisForTest: Long? = null
 

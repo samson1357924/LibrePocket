@@ -1,6 +1,7 @@
 package dev.librepocket.agent.ui.chat
 
 import android.app.Application
+import androidx.annotation.VisibleForTesting
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import dev.librepocket.agent.ui.setup.EndpointConfig
@@ -626,6 +627,14 @@ class ChatSessionFactory(
      */
     private val networkOptInStore: NetworkOptInStore? = null,
 ) : ChatSessionProvider {
+    init {
+        if (toolSlice != null) {
+            require(toolSlice.usesPolicy(policy)) {
+                "toolSlice.policy must be identical to ChatSessionFactory's policy to prevent policy split-brain"
+            }
+        }
+    }
+
     // S1: no defaults on overrides (Kotlin forbids defaults on overriding
     // functions): the fail-closed default allowAsk=false lives on the
     // interface only. Concrete-type callers must pass an explicit
@@ -2626,16 +2635,34 @@ private fun markerNamePrefix(text: String, start: Int, limit: Int): String {
     return text.substring(start, end)
 }
 
-/** Production wiring for [ChatViewModel] (shares the process-singleton endpoint store). */
-class ChatViewModelFactory(
+class ChatViewModelFactory private constructor(
     app: Application,
-    private val store: EndpointStore = EndpointStore(app),
-    policy: PolicyStore? = null,
-    buildProvider: ((ProviderConfig, KeyProvider) -> LlmProvider)? = null,
-    vaultSource: VaultSource? = null,
-    sessionStores: SessionStoreSource? = null,
+    private val store: EndpointStore,
+    policy: PolicyStore?,
+    buildProvider: ((ProviderConfig, KeyProvider) -> LlmProvider)?,
+    vaultSource: VaultSource?,
+    sessionStores: SessionStoreSource?,
+    toolSlice: SafeToolSlice?,
 ) : ViewModelProvider.Factory {
+    /** Production wiring for [ChatViewModel] (records-only pinned; shares the process-singleton endpoint store). */
+    constructor(
+        app: Application,
+        store: EndpointStore = EndpointStore(app),
+        policy: PolicyStore? = null,
+        buildProvider: ((ProviderConfig, KeyProvider) -> LlmProvider)? = null,
+        vaultSource: VaultSource? = null,
+        sessionStores: SessionStoreSource? = null,
+    ) : this(app, store, policy, buildProvider, vaultSource, sessionStores, toolSlice = null)
+
     private val effectivePolicy: PolicyStore = policy ?: DataStorePolicyStore(app)
+
+    init {
+        if (toolSlice != null) {
+            require(toolSlice.usesPolicy(effectivePolicy)) {
+                "toolSlice.policy must be identical to ChatViewModelFactory's effectivePolicy to prevent policy split-brain"
+            }
+        }
+    }
 
     @Volatile
     private var vault: KeyVault? = null
@@ -2654,11 +2681,43 @@ class ChatViewModelFactory(
         vaultSource = effectiveVaultSource,
         buildProvider = buildProvider ?: { cfg, keys -> DefaultProviderFactory(keys).create(cfg) },
         sessionStores = effectiveSessionStores,
-        toolSlice = null, // Records-only invariant pinned in production composition
+        toolSlice = toolSlice, // Records-only invariant pinned in production composition (default null)
     )
 
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         return ChatViewModel(store, sessions, effectivePolicy) as T
+    }
+
+    companion object {
+        /**
+         * B2-phase1 (#19) test factory seam: allows attaching an explicit [SafeToolSlice]
+         * to prove the real-factory round-trip (visibleTools -> ChatRequest.tools -> execute -> continuation)
+         * without exposing the slice parameter on the production constructor.
+         *
+         * Production composition strictly leaves [toolSlice] null (records-only invariant
+         * pinned by [ProductionChatCompositionTest]).
+         *
+         * Invariant: when non-null, [toolSlice] must match [effectivePolicy]
+         * (reference-identical `===` via [SafeToolSlice.usesPolicy]) to prevent policy split-brain.
+         */
+        @VisibleForTesting(otherwise = VisibleForTesting.NONE)
+        internal fun forTesting(
+            app: Application,
+            store: EndpointStore = EndpointStore(app),
+            policy: PolicyStore? = null,
+            buildProvider: ((ProviderConfig, KeyProvider) -> LlmProvider)? = null,
+            vaultSource: VaultSource? = null,
+            sessionStores: SessionStoreSource? = null,
+            toolSlice: SafeToolSlice? = null,
+        ): ChatViewModelFactory = ChatViewModelFactory(
+            app = app,
+            store = store,
+            policy = policy,
+            buildProvider = buildProvider,
+            vaultSource = vaultSource,
+            sessionStores = sessionStores,
+            toolSlice = toolSlice,
+        )
     }
 }

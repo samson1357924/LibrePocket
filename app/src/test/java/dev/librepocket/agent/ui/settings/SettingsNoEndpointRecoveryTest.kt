@@ -71,9 +71,10 @@ class SettingsNoEndpointRecoveryTest {
         onArea("重試清除").assertIsDisplayed()
         onArea("關閉").assertIsDisplayed()
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
-        // readyGate 反例：恢復態不顯示「尚未設定」文案。
+        // readyGate 反例：恢復態不顯示「尚未設定」文案與備份卡。
         composeRule.onAllNodesWithText("尚未設定 API 端點。").assertCountEquals(0)
         composeRule.onAllNodesWithText("前往設定").assertCountEquals(0)
+        composeRule.onAllNodesWithText("對話備份與匯出 (JSONL)").assertCountEquals(0)
         onArea("重試清除").performClick()
         assertEquals(1, logoutCalls)
         onArea("關閉").performClick()
@@ -101,6 +102,7 @@ class SettingsNoEndpointRecoveryTest {
         onArea("重試目標：v1|preset:openai|1|1700000000000").assertIsDisplayed()
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
         composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
+        composeRule.onAllNodesWithText("對話備份與匯出 (JSONL)").assertCountEquals(0)
         onArea("重試清除").performClick()
         assertEquals(1, logoutCalls)
         assertEquals(0, dismissed)
@@ -123,6 +125,7 @@ class SettingsNoEndpointRecoveryTest {
         onArea(setupErrorText("LOGOUT_STALE")).assertIsDisplayed()
         composeRule.onAllNodesWithText("重試清除").assertCountEquals(0)
         composeRule.onAllNodesWithText("確定清除").assertCountEquals(0)
+        composeRule.onAllNodesWithText("對話備份與匯出 (JSONL)").assertCountEquals(0)
         onArea("關閉").assertIsDisplayed()
         onArea("關閉").performClick()
         assertEquals(1, dismissed)
@@ -137,9 +140,10 @@ class SettingsNoEndpointRecoveryTest {
                 gate = EndpointGate.NoEndpoint,
             )
         }
-        // 無碼時保留原尚未設定文案 + 前往設定，無恢復鍵。
+        // 無碼時保留原尚未設定文案 + 前往設定 + 備份卡，無恢復鍵。
         onArea("尚未設定 API 端點。").assertIsDisplayed()
         onArea("前往設定").assertIsDisplayed()
+        composeRule.onAllNodesWithText("對話備份與匯出 (JSONL)").assertCountEquals(1)
         composeRule.onAllNodesWithText("重試清除").assertCountEquals(0)
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
         composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
@@ -163,6 +167,7 @@ class SettingsNoEndpointRecoveryTest {
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
         onArea("關閉").assertIsDisplayed()
         onArea("關閉").assertIsNotEnabled()
+        composeRule.onAllNodesWithText("對話備份與匯出 (JSONL)").assertCountEquals(0)
     }
 
     @Test
@@ -180,14 +185,55 @@ class SettingsNoEndpointRecoveryTest {
         }
         onArea(setupErrorText("LOGOUT_READ_FAILED")).assertIsDisplayed()
         onArea("重試清除").assertIsDisplayed()
-        // Stage R5：無身份時關閉可達（兩碼皆然）；無取消。
+        // Stage R5：無身份時關閉可達（兩碼皆然）；無取消；恢復態隱藏備份卡。
         onArea("關閉").assertIsDisplayed()
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
+        composeRule.onAllNodesWithText("對話備份與匯出 (JSONL)").assertCountEquals(0)
         code = "LOGOUT_DELETE_FAILED"
         composeRule.waitForIdle()
         onArea(setupErrorText("LOGOUT_DELETE_FAILED")).assertIsDisplayed()
         onArea("重試清除").assertIsDisplayed()
         onArea("關閉").assertIsDisplayed()
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
+        composeRule.onAllNodesWithText("對話備份與匯出 (JSONL)").assertCountEquals(0)
+    }
+
+    @Test
+    fun noEndpointReadRetryHidesBackupCardAndShowsRetryRead() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = EndpointGate.NoEndpoint,
+                logoutErrorCode = "LOGOUT_READ_RETRY",
+            )
+        }
+        onArea(setupErrorText("LOGOUT_READ_RETRY")).assertIsDisplayed()
+        onArea("重試讀取").assertIsDisplayed()
+        composeRule.onAllNodesWithText("重試清除").assertCountEquals(0)
+        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
+        composeRule.onAllNodesWithText("尚未設定 API 端點。").assertCountEquals(0)
+        composeRule.onAllNodesWithText("對話備份與匯出 (JSONL)").assertCountEquals(0)
+    }
+
+    @Test
+    fun noEndpointUnknownRetainedHidesBackupCard() {
+        var code by mutableStateOf("LOGOUT_UNKNOWN")
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = EndpointGate.NoEndpoint,
+                logoutErrorCode = code,
+                logoutRetryJournal = "v1|preset:openai|1|1700000000000",
+            )
+        }
+        onArea(setupErrorText("LOGOUT_UNKNOWN")).assertIsDisplayed()
+        onArea("重試清除").assertIsDisplayed()
+        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
+        composeRule.onAllNodesWithText("對話備份與匯出 (JSONL)").assertCountEquals(0)
+        code = "LOGOUT_STALE"
+        composeRule.waitForIdle()
+        onArea(setupErrorText("LOGOUT_STALE")).assertIsDisplayed()
+        onArea("關閉").assertIsDisplayed()
+        composeRule.onAllNodesWithText("對話備份與匯出 (JSONL)").assertCountEquals(0)
     }
 }

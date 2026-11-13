@@ -914,20 +914,22 @@ fun SettingsScreen(
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                 }
-                TranscriptBackupCard(
-                    currentSessionId = currentSessionId,
-                    exportState = exportState,
-                    importState = importState,
-                    onLaunchExport = launchExport,
-                    onLaunchImport = launchImport,
-                    exportPickerPending = pickers.exportPickerPending,
-                    importPickerPending = importPickerPending,
-                    exportPickerFailed = exportPickerFailed,
-                    importPickerFailed = importPickerFailed,
-                    onViewTranscript = onViewTranscript,
-                    onDismissExportState = onDismissExportState,
-                    onDismissImportState = onDismissImportState,
-                )
+                if (recoveryCode == null) {
+                    TranscriptBackupCard(
+                        currentSessionId = currentSessionId,
+                        exportState = exportState,
+                        importState = importState,
+                        onLaunchExport = launchExport,
+                        onLaunchImport = launchImport,
+                        exportPickerPending = pickers.exportPickerPending,
+                        importPickerPending = importPickerPending,
+                        exportPickerFailed = exportPickerFailed,
+                        importPickerFailed = importPickerFailed,
+                        onViewTranscript = onViewTranscript,
+                        onDismissExportState = onDismissExportState,
+                        onDismissImportState = onDismissImportState,
+                    )
+                }
             }
             EndpointGate.Loading -> {
                 Text(

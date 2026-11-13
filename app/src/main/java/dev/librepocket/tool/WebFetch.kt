@@ -19,11 +19,14 @@ import java.util.concurrent.Callable
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
+import okhttp3.Authenticator
 import okhttp3.ConnectionPool
+import okhttp3.CookieJar
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -134,6 +137,11 @@ object WebFetch {
                 .retryOnConnectionFailure(false)
                 .followRedirects(false)
                 .followSslRedirects(false)
+                .authenticator(Authenticator.NONE)
+                .proxyAuthenticator(Authenticator.NONE)
+                .cookieJar(CookieJar.NO_COOKIES)
+                .cache(null)
+                .addNetworkInterceptor(WebFetchRetryAfterStrip())
                 .build()
                 .also { shared = it }
         }
@@ -163,20 +171,63 @@ object WebFetch {
     fun resolveRedirect(currentUrl: String, location: String): String? =
         currentUrl.toHttpUrlOrNull()?.resolve(location)?.toString()
 
+    /** 比較兩個 URL 的 origin（scheme + host + port）是否相同。 */
+    private fun sameOrigin(a: String, b: String): Boolean {
+        val ua = a.toHttpUrlOrNull() ?: return false
+        val ub = b.toHttpUrlOrNull() ?: return false
+        return ua.scheme == ub.scheme && ua.host == ub.host && ua.port == ub.port
+    }
+
     /** 跳轉失敗一律 typed `REDIRECT_BLOCKED`（[FetchOutcome.Unavailable]，不建第二連線）。 */
     private fun redirectBlocked(): FetchOutcome.Unavailable =
         unavailable(NetworkDenyCode.REDIRECT_BLOCKED.name)
 
+    private fun isCleartextPolicyError(t: Throwable, isCleartextEndpoint: Boolean): Boolean {
+        if (!isCleartextEndpoint) return false
+        val seen = java.util.IdentityHashMap<Throwable, Boolean>()
+        val stack = ArrayDeque<Throwable>()
+        stack.addLast(t)
+        while (stack.isNotEmpty()) {
+            val cur = stack.removeLast()
+            if (seen.put(cur, true) != null) continue
+            if (cur is java.net.UnknownServiceException) {
+                val msg = cur.message
+                if (msg != null && (
+                        msg.contains("CLEARTEXT communication", ignoreCase = true) ||
+                            (
+                                msg.contains("cleartext", ignoreCase = true) &&
+                                    (
+                                        msg.contains("not permitted", ignoreCase = true) ||
+                                            msg.contains("not enabled", ignoreCase = true)
+                                        )
+                                )
+                        )
+                ) {
+                    return true
+                }
+            }
+            cur.cause?.let { stack.addLast(it) }
+            for (suppressed in cur.suppressed) {
+                stack.addLast(suppressed)
+            }
+        }
+        return false
+    }
+
     private val preflightThreadCount = AtomicInteger(1)
 
-    /** WARN-04：WebFetch DNS preflight 專用有界執行器（避免阻塞調用方執行緒）。 */
-    private val preflightExecutor: ExecutorService =
+    @Volatile
+    internal var preflightExecutor: ExecutorService =
         Executors.newFixedThreadPool(4) { r ->
             Thread(r, "webfetch-preflight-${preflightThreadCount.getAndIncrement()}").apply { isDaemon = true }
         }
 
     private fun evaluateWithBudget(budgetMs: Long, block: () -> NetworkEvaluation): NetworkEvaluation? {
-        val future = preflightExecutor.submit(Callable { block() })
+        val future = try {
+            preflightExecutor.submit(Callable { block() })
+        } catch (_: RejectedExecutionException) {
+            return null
+        }
         return try {
             future.get(budgetMs.coerceAtLeast(1L), TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
@@ -269,13 +320,21 @@ object WebFetch {
         //（`ConnectionPool(0, 1, NANOSECONDS)`，對齊 provider `pinnedTransportFor`
         // 與 `McpTransport.postJson`）：舊 keep-alive socket 不得跨 fetch 重用、
         // 繞過當次 pin；同 fetch 內多跳共用同一 pin 生命週期。
-        val callClientBase = client.newBuilder()
+        val builder = client.newBuilder()
             .dns(pinned)
             .proxy(Proxy.NO_PROXY)
             .connectionPool(ConnectionPool(0, 1, TimeUnit.NANOSECONDS))
             .followRedirects(false)
             .followSslRedirects(false)
-            .build()
+            .retryOnConnectionFailure(false)
+            .authenticator(Authenticator.NONE)
+            .proxyAuthenticator(Authenticator.NONE)
+            .cookieJar(CookieJar.NO_COOKIES)
+            .cache(null)
+        if (client.networkInterceptors.none { it is WebFetchRetryAfterStrip }) {
+            builder.addNetworkInterceptor(WebFetchRetryAfterStrip())
+        }
+        val callClientBase = builder.build()
         var current = first
         var hops = 0
         while (true) {
@@ -290,8 +349,9 @@ object WebFetch {
             val request = Request.Builder().url(current).get()
                 .header("Accept", "text/*, application/*+json, application/json;q=0.9, */*;q=0.1")
                 .build()
+            val call = hopClient.newCall(request)
             val next: String = try {
-                hopClient.newCall(request).execute().use { response ->
+                call.execute().use { response ->
                     if (isRedirect(response.code)) {
                         if (hops >= MAX_REDIRECTS) return redirectBlocked()
                         val location = response.header("Location")
@@ -303,8 +363,11 @@ object WebFetch {
                         // 通過才補釘並跟隨（建連只走釘住答案）。
                         val hopEvalRemaining = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
                         if (hopEvalRemaining <= 0L) return transportFailed("TIMEOUT")
+                        // 跨 origin 跳轉時 opt-in 降級為 HTTPS_ONLY（deny-all）：
+                        // 原端點授權不得沿用到跨站目標，避免私有/明文權限外洩。
+                        val hopOptIn = if (sameOrigin(current, resolved)) optIn else EndpointNetworkOptIn()
                         val hopEval = evaluateWithBudget(hopEvalRemaining) {
-                            evaluateRedirectTarget(current, resolved, optIn, resolver)
+                            evaluateRedirectTarget(current, resolved, hopOptIn, resolver)
                         } ?: return transportFailed("TIMEOUT")
                         if (!hopEval.allowed || hopEval.resolvedAddresses.isEmpty()) return redirectBlocked()
                         val hopUrl = hopEval.normalizedUrl ?: resolved
@@ -313,6 +376,7 @@ object WebFetch {
                         hopUrl
                     } else {
                         if (!response.isSuccessful) {
+                            call.cancel()
                             val detail = "HTTP_${response.code}"
                             return FetchOutcome.Failed(
                                 detail = detail,
@@ -326,32 +390,29 @@ object WebFetch {
                             )
                         }
                         val body = response.body
-                            ?: return FetchOutcome.Failed(
-                                detail = "EMPTY_BODY",
-                                message = S1bFallback.message(
-                                    what = "讀取該連結內容（EMPTY_BODY）",
-                                    reason = DenyReason.NO_PRIVILEGE,
-                                    detail = "EMPTY_BODY",
-                                    alternative = FALLBACK_HINT,
-                                    needFromUser = "手動在瀏覽器開啟該連結",
-                                ),
-                            )
                         val rawType = body.contentType()
-                        val bytes = readCapped(body.byteStream(), cap)
-                        val text = decodeDowngraded(bytes.data, rawType?.charsetName())
+                        val capped = readCapped(body.byteStream(), cap, deadlineNs)
+                        if (capped.truncated) call.cancel()
+                        val text = decodeDowngraded(capped.data, rawType?.charsetName())
                         return FetchOutcome.Ok(
                             text = text,
-                            bytesKept = bytes.data.size,
-                            truncated = bytes.truncated,
+                            bytesKept = capped.data.size,
+                            truncated = capped.truncated,
                             contentType = rawType?.toString(),
                         )
                     }
                 }
             } catch (e: SocketTimeoutException) {
+                call.cancel()
                 return transportFailed("TIMEOUT")
             } catch (e: InterruptedIOException) {
+                call.cancel()
                 return transportFailed("TIMEOUT")
             } catch (e: IOException) {
+                call.cancel()
+                if (isCleartextPolicyError(e, current.startsWith("http://", ignoreCase = true))) {
+                    return unavailable(NetworkDenyCode.CLEARTEXT_NOT_PERMITTED.name)
+                }
                 val detail = if ((e.message ?: "").contains("timeout", ignoreCase = true)) "TIMEOUT" else "TRANSPORT"
                 return transportFailed(detail)
             }
@@ -374,13 +435,16 @@ object WebFetch {
 
     private data class Capped(val data: ByteArray, val truncated: Boolean)
 
-    private fun readCapped(stream: java.io.InputStream, cap: Int): Capped {
+    private fun readCapped(stream: java.io.InputStream, cap: Int, deadlineNs: Long): Capped {
         val out = ByteArrayOutputStream(minOf(cap, 8192))
         val buf = ByteArray(8192)
         var total = 0
         var truncated = false
         stream.use { input ->
             while (true) {
+                if (deadlineNs - System.nanoTime() <= 0L) {
+                    throw InterruptedIOException("webfetch: deadline exceeded")
+                }
                 val n = input.read(buf)
                 if (n == -1) break
                 if (total + n > cap) {
@@ -421,6 +485,21 @@ object WebFetch {
                 .toString()
         } catch (_: Exception) {
             String(data, Charsets.UTF_8)
+        }
+    }
+}
+
+/**
+ * 剝除 `503 + Retry-After` 觸發 OkHttp 重送：雖 GET 重送相對 POST 安全，
+ * 仍為縱深防禦，一律移除該 header 讓 503 原樣回到呼叫方。
+ */
+internal class WebFetchRetryAfterStrip : okhttp3.Interceptor {
+    override fun intercept(chain: okhttp3.Interceptor.Chain): okhttp3.Response {
+        val response = chain.proceed(chain.request())
+        return if (response.code == 503) {
+            response.newBuilder().removeHeader("Retry-After").build()
+        } else {
+            response
         }
     }
 }

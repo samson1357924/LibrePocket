@@ -242,15 +242,22 @@ class WebFetchTest {
         assertEquals(NetworkDenyCode.REDIRECT_BLOCKED, eval.denyCode)
     }
 
-    @Test fun redirectSameHostLoopbackWithOptInIsFollowable() {
-        val dns = loopbackDns()
-        val eval = WebFetch.evaluateRedirectTarget(
-            "http://localhost:1/a",
-            "http://localhost:1/b",
-            cleartextPrivate,
-            dns,
-        )
-        assertTrue("expected allow: $eval", eval.allowed)
+    @Test fun redirectCrossOriginDowngradesOptInToHttpsOnly() {
+        // 跨 origin 跳轉：opt-in 降級為 HTTPS_ONLY（deny-all），私有/明文權限不得沿用到跨站目標。
+        val redirector = MockWebServer()
+        try {
+            val dns = loopbackDns()
+            redirector.enqueue(MockResponse().setResponseCode(302).setHeader("Location", "http://127.0.0.1:${redirector.port}/target"))
+            val outcome = WebFetch.fetch(
+                redirector.url("/start").toString(),
+                optIn = cleartextPrivate,
+                resolver = dns,
+            )
+            assertUnavailable(NetworkDenyCode.REDIRECT_BLOCKED.name, outcome)
+            assertEquals(1, redirector.requestCount)
+        } finally {
+            redirector.shutdown()
+        }
     }
 
     // ---- 傳輸行為（MockWebServer = 本地 http，配 opt-in＋fake DNS） ----

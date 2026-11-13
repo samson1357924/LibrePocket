@@ -61,18 +61,23 @@ data class McpServerConfig(
      * 回環／私有明文須經 `NetworkOptInStore.confirm` 明示確認升級到
      * `ALLOW_CLEARTEXT_PRIVATE`（該 tier 另供 WebFetch 的 LAN pilot；
      * MCP 形狀閘（[dev.librepocket.mcp.McpWire.requireSecureEndpoint]）不放行
-     * 非回環明文，故 MCP 經此確認僅開迴環 `http`；play 維持 deny-all，
+     * 非回環明文，且 DNS 後 [requireMcpNetworkPolicyAllowed] 強制 `http` 的所有
+     * 解析位址位元組皆須為回環（非回環／混合一律 `CLEARTEXT_NOT_PERMITTED`），
+     * 故 MCP 經此確認僅開迴環 `http`；play 維持 deny-all，
      * 見 [dev.librepocket.policy.NetworkOptInStore.checkPlayTierAllows]），
      * 無全域一鍵開放。公網 `http` 永不開放（見 [dev.librepocket.policy.NetworkPolicy]）。
      */
     val networkOptIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
     /**
      * A3：首跳解析 seam。production 預設 [SystemHostResolver]；測試注入 fake。
-     * [dev.librepocket.mcp.McpServer] 預驗後把放行決策經 `preverifiedEval` 傳入
-     * transport（單次解析，傳輸層只做一致性檢查，見 `takePreverifiedEval`）；
-     * 直調 transport（無決策可傳）在建連前先 `evaluateUrl(endpoint, networkOptIn,
-     * networkResolver)`，拒絕即 typed fatal（[McpNetworkPolicyBlocked]），
-     * 不送 credential／body。
+     * [dev.librepocket.mcp.McpServer] 透過 `McpTransport.preflightMcpNetworkPolicy`
+     * 在共享單調 `deadlineNs` 與 [dev.librepocket.policy.NetworkPolicy.defaultPreflightExecutor]
+     * 上執行有界 DNS 預驗並鑄造密封的 [McpPreflightToken]（私有建構子，外部無法偽造
+     * `NetworkEvaluation`），再以 `McpTransport.postJsonWithPreverified` 帶入：
+     * URL／字面 IP／resolver 一致時零二次 DNS 沿用釘住答案並以即時 `effectiveOptIn()`
+     * 重驗，不一致則於同一 `deadlineNs` 下重走有界預驗；直調 `McpTransport.postJson`
+     * 一律於共享 `deadlineNs` 下執行有界預驗並以 [dev.librepocket.policy.PinnedNetworkDns] 釘住建連，拒絕即
+     * typed fatal（[McpNetworkPolicyBlocked]），不送 credential／body。
      */
     val networkResolver: HostResolver = SystemHostResolver,
     /**

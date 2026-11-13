@@ -462,10 +462,16 @@ object NetworkPolicy {
 
   internal fun hasInterruptedCause(t: Throwable): Boolean {
     val seen = IdentityHashMap<Throwable, Boolean>()
-    var cur: Throwable? = t
-    while (cur != null && seen.put(cur, true) == null) {
+    val stack = ArrayDeque<Throwable>()
+    stack.addLast(t)
+    while (stack.isNotEmpty()) {
+      val cur = stack.removeLast()
+      if (seen.put(cur, true) != null) continue
       if (cur is InterruptedException) return true
-      cur = cur.cause
+      cur.cause?.let { stack.addLast(it) }
+      for (suppressed in cur.suppressed) {
+        stack.addLast(suppressed)
+      }
     }
     return false
   }

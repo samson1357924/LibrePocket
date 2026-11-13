@@ -15,7 +15,16 @@ package dev.librepocket.mcp
  *   工具業務錯（HTTP 200 + `isError=true` 且具內容，或 code 為 `-32602`/範圍外
  *   未知碼的 error 包）為中性（[onNeutral]，不記成功也不記失敗，避免交錯 TOOL_ERROR
  *   壓住熔斷）；
- *   客戶端參數錯誤（未發送即回 PROTOCOL）同樣不碰熔斷，由呼叫方早退。
+ *   客戶端參數錯誤、vault 前拒絕（停用／baseUrl 畸形或空白／`requireSecureEndpoint`
+ *   拒／Step 5 DNS preflight `Blocked`・`TimedOut`・`OverloadRejected`）、
+ *   Step 6 受共享 `deadlineNs` 約束的 vault 讀取逾時或讀後剩餘預算耗盡（0 HTTP）、
+ *   key 讀取後 opt-in 即時降級觸發的 [McpNetworkPolicyBlocked]、Step 7 回落重驗拋出的
+ *   [McpPreflightOverloadedException]、以及 `http://` 端點上由 Android Network
+ *   Security Config 攔截明文產生的 `UnknownServiceException` 鏈（直接或 `IOException`
+ *   `cause`/`suppressed` 鏈含明文拒收訊息 → `PROTOCOL`＋`denyCode=CLEARTEXT_NOT_PERMITTED`）
+ *   同樣**不碰熔斷**（0 failure）；
+ *   Step 7 已進入傳輸的 HTTP 超時（`TIMEOUT`）與 `https://` 端點或非明文拒收的
+ *   `UnknownServiceException`／其他傳輸例外（`TRANSPORT`）則計一次失敗。
  *   本類只記 [onSuccess]/[onFailure]/[onNeutral]，語義由 [McpServer] 統一
  *   （契約面僅此三事件＋[canCall]/[isOpen]/[failureCount] 查詢——D-04 曾存在的
  *   `onStatus`/`reset` 為零呼叫死碼，已移除，見 McpCircuitBreakerConcurrencyTest 釘面）。

@@ -305,6 +305,35 @@ class McpNetworkPolicyTest {
         }
     }
 
+    @Test fun tunnelEmbeddedAddressesAreNotAcceptedAsMcpHttpLoopback() {
+        val cleartext = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
+        // 轉換/隧道位址不得因內嵌 127.0.0.1/10.x 而取得 MCP http loopback 或 private 授權。
+        for (url in listOf(
+            "http://[64:ff9b::127.0.0.1]/mcp",
+            "http://[64:ff9b::10.0.0.1]/mcp",
+            "http://[2002:7f00:1::1]/mcp",
+            "http://[2002:0a00:1::1]/mcp",
+            "http://[::ffff:0:127.0.0.1]/mcp",
+            "http://[::127.0.0.1]/mcp",
+            "http://[2001:0000:c633:6401:0000:ffff:80ff:fffe]/mcp",
+        )) {
+            try {
+                requireMcpNetworkPolicyAllowed(url, cleartext, noDns)
+                fail("$url must not be accepted as MCP http loopback/private")
+            } catch (e: McpNetworkPolicyBlocked) {
+                assertEquals("$url deny code", NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, e.denyCode)
+            }
+        }
+        // DNS 解析到 tunnel-embedded loopback 同樣 fail-closed（無二次授權）。
+        val dns = HostResolver { listOf(InetAddress.getByName("2002:7f00:1::1")) }
+        try {
+            requireMcpNetworkPolicyAllowed("https://mcp-embedded.example/mcp", cleartext, dns)
+            fail("dns-resolved tunnel embedded address must be denied")
+        } catch (e: McpNetworkPolicyBlocked) {
+            assertEquals(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, e.denyCode)
+        }
+    }
+
     // ---- 負向：redirect 永不跟隨 ----
 
     @Test fun redirectToHttpTargetIsNeverFollowed() = runBlocking {

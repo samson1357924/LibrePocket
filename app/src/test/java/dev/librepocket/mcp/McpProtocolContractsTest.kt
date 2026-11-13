@@ -671,6 +671,13 @@ class McpProtocolContractsTest {
             "sub.localhost",
             "::2",
             "fe80::1",
+            // IPv4-embedded 轉換/隧道位址：即使內嵌 loopback，也不是實際回環主機字面。
+            "[64:ff9b::127.0.0.1]",
+            "64:ff9b::127.0.0.1",
+            "[2002:7f00:1::1]",
+            "[2001:0000:c633:6401:0000:ffff:80ff:fffe]",
+            "[::ffff:0:127.0.0.1]",
+            "[::127.0.0.1]",
         )
         for (h in nonLoopback) {
             assertFalse("[$h] 必須非回環（精確白名單）", McpWire.isLoopbackHost(h))
@@ -679,11 +686,19 @@ class McpProtocolContractsTest {
         for (h in listOf("localhost", "LOCALHOST", "127.0.0.1", "::1", "[::1]", "  localhost  ")) {
             assertTrue("[$h] 必須為回環", McpWire.isLoopbackHost(h))
         }
-        // 端到端：http + 回環近似域 → insecure endpoint（不得當回環放行明文）。
-        for (bad in listOf("http://localhost.evil.com/mcp", "http://127.0.0.1.evil.com/mcp")) {
+        // 端到端：http + 回環近似域/轉換位址 → insecure endpoint（不得當回環放行明文）。
+        for (bad in listOf(
+            "http://localhost.evil.com/mcp",
+            "http://127.0.0.1.evil.com/mcp",
+            "http://[64:ff9b::127.0.0.1]/mcp",
+            "http://[2002:7f00:1::1]/mcp",
+            "http://[2001:0000:c633:6401:0000:ffff:80ff:fffe]/mcp",
+            "http://[::ffff:0:127.0.0.1]/mcp",
+            "http://[::127.0.0.1]/mcp",
+        )) {
             try {
                 McpWire.requireSecureEndpoint(bad)
-                fail("回環近似域必須拒：$bad")
+                fail("非實際回環端點必須拒：$bad")
             } catch (e: IllegalArgumentException) {
                 assertEquals("mcp: insecure endpoint", e.message)
             }

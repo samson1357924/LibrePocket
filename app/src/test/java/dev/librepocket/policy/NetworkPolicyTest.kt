@@ -505,19 +505,19 @@ class NetworkPolicyTest {
   }
 
   @Test fun nat64EmbeddedPrivateDecision() {
-    // 64:ff9b::c0a8:101 內嵌 192.168.1.1：按 v4 重走為 PRIVATE（預設拒、opt-in 放行）。
-    assertEquals(AddressClass.PRIVATE, NetworkPolicy.classifyAddress(addr("64:ff9b::c0a8:101")))
+    // 64:ff9b::/96 為 IPv4-embedded 轉換位址：內嵌 v4 不得授權為 LOOPBACK/PRIVATE/PUBLIC。
+    assertEquals(AddressClass.UNSPECIFIED, NetworkPolicy.classifyAddress(addr("64:ff9b::c0a8:101")))
     assertDenied(
       NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED,
       NetworkPolicy.evaluateUrl("https://[64:ff9b::c0a8:101]/", resolver = neverResolve),
     )
-    val allowed = NetworkPolicy.evaluateUrl(
+    val deniedWithOptIn = NetworkPolicy.evaluateUrl(
       "https://[64:ff9b::c0a8:101]/",
       EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS),
       neverResolve,
     )
-    assertTrue("expected allow: $allowed", allowed.allowed)
-    assertEquals(AddressClass.PRIVATE, allowed.addressClass)
+    assertDenied(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, deniedWithOptIn)
+    assertEquals(AddressClass.UNSPECIFIED, deniedWithOptIn.addressClass)
   }
 
   @Test fun ipv4MappedLoopbackStaysMapped() {
@@ -871,14 +871,29 @@ class NetworkPolicyTest {
     val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
 
     // SIIT IPv4-translated ::ffff:0:0:0/96
+    // NAT64 well-known 64:ff9b::/96
+    assertEquals(AddressClass.METADATA, NetworkPolicy.classifyAddress(addr("64:ff9b::169.254.169.254")))
+    assertEquals(AddressClass.UNSPECIFIED, NetworkPolicy.classifyAddress(addr("64:ff9b::127.0.0.1")))
+    assertEquals(AddressClass.UNSPECIFIED, NetworkPolicy.classifyAddress(addr("64:ff9b::10.0.0.1")))
+    assertDenied(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("https://[64:ff9b::169.254.169.254]/", optIn, neverResolve))
+    assertDenied(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("http://[64:ff9b::127.0.0.1]/", optIn, neverResolve))
+    assertDenied(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("http://[64:ff9b::10.0.0.1]/", optIn, neverResolve))
+    // public-embedded tunnel 位址同屬轉換/隧道目標，不得授權為 PUBLIC。
+    assertEquals(AddressClass.UNSPECIFIED, NetworkPolicy.classifyAddress(addr("64:ff9b::8.8.8.8")))
+    assertEquals(AddressClass.UNSPECIFIED, NetworkPolicy.classifyAddress(addr("2002:0808:0808::1")))
+    assertDenied(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("https://[64:ff9b::8.8.8.8]/", EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS), neverResolve))
+    assertDenied(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("https://[2002:0808:0808::1]/", EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS), neverResolve))
+
     val siitMeta = Inet6Address.getByName("::ffff:0:169.254.169.254")
     val siitLoopback = Inet6Address.getByName("::ffff:0:127.0.0.1")
     val siitPrivate = Inet6Address.getByName("::ffff:0:10.0.0.1")
     assertEquals(AddressClass.METADATA, NetworkPolicy.classifyAddress(siitMeta))
-    assertEquals(AddressClass.LOOPBACK, NetworkPolicy.classifyAddress(siitLoopback))
-    assertEquals(AddressClass.PRIVATE, NetworkPolicy.classifyAddress(siitPrivate))
+    assertEquals(AddressClass.UNSPECIFIED, NetworkPolicy.classifyAddress(siitLoopback))
+    assertEquals(AddressClass.UNSPECIFIED, NetworkPolicy.classifyAddress(siitPrivate))
     assertDenied(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("https://[::ffff:0:169.254.169.254]/", optIn, neverResolve))
     assertDenied(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("https://[::ffff:0:127.0.0.1]/", EndpointNetworkOptIn(), neverResolve))
+    assertDenied(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("http://[::ffff:0:127.0.0.1]/", optIn, neverResolve))
+    assertDenied(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("http://[::ffff:0:10.0.0.1]/", optIn, neverResolve))
 
     // RFC 8215 NAT64 Local-Use 64:ff9b:1::/48（Global=False：metadata 優先，其餘一律 UNSPECIFIED 永擋）
     val nat64LocalMeta = Inet6Address.getByName("64:ff9b:1::169.254.169.254")
@@ -893,27 +908,34 @@ class NetworkPolicyTest {
 
     // 6to4 2002::/16
     assertEquals(AddressClass.METADATA, NetworkPolicy.classifyAddress(addr("2002:a9fe:a9fe::1")))
-    assertEquals(AddressClass.LOOPBACK, NetworkPolicy.classifyAddress(addr("2002:7f00:1::1")))
+    assertEquals(AddressClass.UNSPECIFIED, NetworkPolicy.classifyAddress(addr("2002:7f00:1::1")))
+    assertEquals(AddressClass.UNSPECIFIED, NetworkPolicy.classifyAddress(addr("2002:0a00:1::1")))
     assertDenied(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("https://[2002:a9fe:a9fe::1]/", optIn, neverResolve))
+    assertDenied(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("http://[2002:0a00:1::1]/", optIn, neverResolve))
+    assertDenied(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("http://[2002:7f00:1::1]/", optIn, neverResolve))
 
     // Teredo 2001::/32（含 XOR-obfuscated 169.254.169.254 與 127.0.0.1）
     val teredoMeta = addr("2001:0000:c633:6401:0000:ffff:5601:5601")
     val teredoLoop = addr("2001:0000:c633:6401:0000:ffff:80ff:fffe")
     assertEquals(AddressClass.METADATA, NetworkPolicy.classifyAddress(teredoMeta))
-    assertEquals(AddressClass.LOOPBACK, NetworkPolicy.classifyAddress(teredoLoop))
+    assertEquals(AddressClass.UNSPECIFIED, NetworkPolicy.classifyAddress(teredoLoop))
     assertDenied(
       NetworkDenyCode.METADATA_ADDRESS_BLOCKED,
       NetworkPolicy.evaluateUrl("https://[2001:0000:c633:6401:0000:ffff:5601:5601]/", optIn, neverResolve),
     )
+    assertDenied(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("http://[2001:0000:c633:6401:0000:ffff:80ff:fffe]/", optIn, neverResolve))
 
     // compat ::/96（16-byte 及字串形式）
     val compatPrivRaw = ByteArray(12) + byteArrayOf(10, 0, 0, 1)
     val compatMetaRaw = ByteArray(12) + byteArrayOf(169.toByte(), 254.toByte(), 169.toByte(), 254.toByte())
-    assertEquals(AddressClass.PRIVATE, NetworkPolicy.classifyAddress(Inet6Address.getByAddress(null, compatPrivRaw, 0)))
+    assertEquals(AddressClass.UNSPECIFIED, NetworkPolicy.classifyAddress(Inet6Address.getByAddress(null, compatPrivRaw, 0)))
     assertEquals(AddressClass.METADATA, NetworkPolicy.classifyAddress(Inet6Address.getByAddress(null, compatMetaRaw, 0)))
-    assertEquals(AddressClass.PRIVATE, NetworkPolicy.classifyAddress(addr("::10.0.0.1")))
+    assertEquals(AddressClass.UNSPECIFIED, NetworkPolicy.classifyAddress(addr("::10.0.0.1")))
     assertEquals(AddressClass.METADATA, NetworkPolicy.classifyAddress(addr("::169.254.169.254")))
+    assertEquals(AddressClass.UNSPECIFIED, NetworkPolicy.classifyAddress(addr("::127.0.0.1")))
     assertDenied(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("https://[::169.254.169.254]/", optIn, neverResolve))
+    assertDenied(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("http://[::10.0.0.1]/", optIn, neverResolve))
+    assertDenied(NetworkDenyCode.PRIVATE_ADDRESS_BLOCKED, NetworkPolicy.evaluateUrl("http://[::127.0.0.1]/", optIn, neverResolve))
   }
 
   @Test fun nat64LocalUseRfc8215MetadataOffsetsAndAlwaysBlocked() {

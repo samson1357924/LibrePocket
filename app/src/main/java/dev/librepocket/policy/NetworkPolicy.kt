@@ -682,8 +682,11 @@ object NetworkPolicy {
         extractEmbeddedV4(b)
       } catch (_: Exception) {
         null
-      }
-      return if (v4 != null) classifyEmbeddedV4(v4) else AddressClass.UNSPECIFIED
+      } ?: return AddressClass.UNSPECIFIED
+      // 轉換/隧道型 IPv4-embedded IPv6（6to4/Teredo/NAT64 well-known/SIIT/compat）：
+      // 實際可路由目的地是 16-byte IPv6 位址，不得僅因內嵌 v4 片段取得 LOOPBACK/PRIVATE
+      // 授權（避免 http/MCP-loopback 邊界被誤判）。metadata 仍優先封鎖，其餘一律拒絕授權。
+      return if (isMetadataEndpoint(v4)) AddressClass.METADATA else AddressClass.UNSPECIFIED
     }
     if (isNat64LocalUse(b)) {
       return if (hasNat64LocalUseMetadata(b)) AddressClass.METADATA else AddressClass.UNSPECIFIED
@@ -962,24 +965,6 @@ private fun extractEmbeddedV4(b: ByteArray): ByteArray {
     return tail
   }
   throw IllegalArgumentException("NOT_EMBEDDED_V4")
-}
-
-/**
- * 內嵌 v4 按 v4 規則重走：metadata 優先，其次保留段→迴環→link-local→
- * CGNAT→multicast→私有→公網，與 [NetworkPolicy.classifyAddress] 的 v4 側一致。
- */
-private fun classifyEmbeddedV4(v4: ByteArray): AddressClass {
-  require(v4.size == 4) { "NOT_IPV4" }
-  if (isMetadataEndpoint(v4)) return AddressClass.METADATA
-  if (isReservedV4(v4)) return AddressClass.UNSPECIFIED
-  val f0 = v4[0].toInt() and 0xff
-  val f1 = v4[1].toInt() and 0xff
-  if (f0 == 127) return AddressClass.LOOPBACK
-  if (f0 == 169 && f1 == 254) return AddressClass.LINK_LOCAL
-  if (isCgnat(v4)) return AddressClass.CGNAT
-  if (f0 in 224..239) return AddressClass.MULTICAST
-  if (f0 == 10 || (f0 == 172 && f1 in 16..31) || (f0 == 192 && f1 == 168)) return AddressClass.PRIVATE
-  return AddressClass.PUBLIC
 }
 
 private fun isUla(b: ByteArray): Boolean =

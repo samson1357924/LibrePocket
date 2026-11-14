@@ -465,6 +465,7 @@ internal fun parseExaResults(json: Json, body: String, limitHint: Int = 16): Lis
  * Body `{"query","limit"}`；回應 `{"success":true,"data":{"web":[{title,url,description}]}}`
  * （v2 的 `data` 為物件、`web` 為陣列，非平陣列；v1 已不再針對）。
  * `success:false`（HTTP 200 包錯誤）→ `Failed(SUPPLIER_ERROR)`（防禦性處理）；
+ * 非布林 success → BAD_RESPONSE。
  * snippet 優先 `description`、缺則回退 `markdown`（無 scrapeOptions 時通常缺；description 缺席時
  * 回退 markdown/snippet 仍支援）、再缺 `snippet`。
  * DEFAULT_KEY_ID 綁定 v2 endpoint；自 v1 升級時舊 vault 項目失效，需重新輸入 Firecrawl key（未隨本 PR 發佈）。
@@ -520,8 +521,14 @@ class FirecrawlSearchProvider(
         } catch (_: Exception) {
             null
         } ?: return WebSearchOutcome.Failed(WebFailureReason.BAD_RESPONSE)
-        if ((root["success"] as? JsonPrimitive)?.booleanOrNull == false) {
-            return WebSearchOutcome.Failed(WebFailureReason.SUPPLIER_ERROR)
+        val success = root["success"]
+        if (success != null) {
+            val ok = (success as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull
+            when (ok) {
+                false -> return WebSearchOutcome.Failed(WebFailureReason.SUPPLIER_ERROR)
+                null -> return WebSearchOutcome.Failed(WebFailureReason.BAD_RESPONSE)
+                true -> Unit
+            }
         }
         return finishOk(parseFirecrawlData(root, count), count)
     }

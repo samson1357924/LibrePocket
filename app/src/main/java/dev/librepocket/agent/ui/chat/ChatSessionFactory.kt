@@ -422,9 +422,11 @@ data class CreatedSession(
      */
     val historyWithheld: Boolean = false,
     /**
-     * Stage E: exact number of older history rows omitted by the tail cap.
-     * 0 when everything fit. Observable truncation: callers surface
-     * "已省略N則" instead of resuming silently short-context.
+     * Stage E: exact number of older history rows omitted by the tail cap
+     * (DB-tail omission only; the scan keeps the newest HISTORY_LOAD_CAP
+     * rows). 0 when everything fit. Disjoint from the provider-request
+     * context omission (window + per-request trim legs), which is surfaced
+     * via `session.contextOmission` — never summed.
      */
     val historyDroppedCount: Int = 0,
 )
@@ -885,10 +887,8 @@ class ChatSessionFactory(
             backfillInterrupted(store, sessionId)
         }
         // Stage E: tail load (newest kept) with an exact dropped count; the
-        // cap also travels as MaxMessages so TurnController.droppedHistoryCount
-        // observes the same truncation (defense in depth: the prefix already
-        // saturates the cap, so each new live turn evicts the oldest prefix
-        // row to hold the combined request total at cap).
+        // count reports the DB-tail omission only (provider-context omission
+        // travels via session.contextOmission).
         // B2 hydration-tail unification (done): the prefix travels
         // HistoryWindowCap.DEFAULT (200 msgs / 60k chars), same as create /
         // openForked / TurnController default, so a resumed long dialogue

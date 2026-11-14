@@ -1176,9 +1176,19 @@ class TurnControllerToolSliceTest {
         val c = controller(provider, pol, sink, loop(pol, backend), HistoryWindowCap.Unbounded)
         val nearCapHistory = "a".repeat(98_500)
         val echoArgs = """{"query":"${"x".repeat(4_000)}"}"""
+        var baseOmission = -1
+        var baseTrimmed = -1
         var responses = 0
         provider.handler = { _ ->
             responses++
+            if (responses == 2) {
+                // The tool-round request has just been built and published:
+                // record the base (pre-continuation) cells so the post-turn
+                // assertions can split base publish from the continuation
+                // top-up.
+                baseOmission = c.contextOmission.value
+                baseTrimmed = c.requestTrimmedCount.value
+            }
             flow {
                 when (responses) {
                     1 -> {
@@ -1220,6 +1230,22 @@ class TurnControllerToolSliceTest {
         val payload = cont.messages.sumOf { it.wirePayloadChars() }
         assertTrue(payload <= TurnController.MAX_REQUEST_CHARS)
         assertTrue("continuation must head-trim once the args echo rides along", c.requestTrimmedCount.value > 0)
+        // B2 symmetry: buildToolContinuation tops contextOmission up on top
+        // of the base request's publish (base + the continuation prefix
+        // drop), mirroring the requestTrimmedCount contract above. The base
+        // leg contributes 0 here (Unbounded cap; ~98.6k text stays under the
+        // 100k send-time cap, and the resume window never bound), so the
+        // top-up alone accounts for the whole total.
+        assertTrue(
+            "continuation must top up contextOmission above the base publish " +
+                "(base=$baseOmission, got=${c.contextOmission.value})",
+            c.contextOmission.value >= baseOmission + 1,
+        )
+        assertEquals(
+            "contextOmission top-up must equal the base publish plus the continuation prefix trim",
+            baseOmission + (c.requestTrimmedCount.value - baseTrimmed),
+            c.contextOmission.value,
+        )
         assertEquals(ChatStatus.IDLE, c.uiState.value.status)
         assertEquals(2, sink.succeeded.size)
         assertTrue(sink.succeeded.last().second.contains("trimmed answer"))

@@ -75,6 +75,9 @@ class ChatSessionImpl(
   /** R5-5: live send-time per-request trim count (see [TurnController.requestTrimmedCount]). */
   override val requestTrimmedCount: StateFlow<Int> = controller.requestTrimmedCount
 
+  /** Provider-request context omission total (see [TurnController.contextOmission]). */
+  override val contextOmission: StateFlow<Int> = controller.contextOmission
+
   override suspend fun send(text: String, images: List<ChatImageRef>) = controller.send(text, images)
 
   override suspend fun startTurn(text: String, images: List<ChatImageRef>) = controller.startTurn(text, images)

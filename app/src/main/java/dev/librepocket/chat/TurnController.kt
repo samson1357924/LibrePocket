@@ -124,6 +124,11 @@ class ApprovalRequiredException : Exception("chat.send approval required")
  * attachment can never trip this exception on byte volume alone; image
  * size/rejection is governed separately (spec §4 byte caps and
  * ImageFallbackPolicy).
+ *
+ * Throw path observability: on throw the controller's context-omission flow
+ * retains the base request's published value — that value corresponds to a
+ * request that was never shipped; it is kept for observation only, and the
+ * next [buildRequest] re-publishes per request.
  */
 class ContinuationOverBudgetException : Exception("continuation request over budget")
 
@@ -1047,18 +1052,22 @@ class TurnController(
   /** Resumed-history prefix after [historyCap] (oldest-first, whole messages). */
   private val cappedHistory: List<ChatMessage> = applyHistoryCap(initialHistory, historyCap)
 
+  /** Constructor-time resumed prefix size; lets [buildRequest] publish [contextOmission] without re-touching the constructor param. */
+  private val initialHistorySize: Int = initialHistory.size
+
   /**
-   * Messages dropped from the last outgoing request by [historyCap], seeded
-   * with the resumed-prefix drops at load time (0 when nothing is dropped,
-   * e.g. explicit [HistoryWindowCap.Unbounded]). The observable counterpart
-   * to context truncation: the request copy never silently loses history.
-   * Updated on
-   * every [buildRequest] to that request's combined-window drop
-   * (`combined - base`, capped prefix + live); the seed is then replaced, so
-   * a resumed session at cap reports a growing send-time count while the
-   * load-time total stays observable separately via the factory's
-   * historyDroppedCount (DB-tail drops only; the init-time window drop on a
-   * resumed session is overwritten by the first send-time count).
+   * Per-request combined-window drop by [historyCap] for the last outgoing
+   * request (capped prefix + live, oldest-first): how many rows the window
+   * removed from the combined segment, **not** the load-time resumed-prefix
+   * seed. Seeded with the resumed-prefix drops at construction time (0 when
+   * nothing is dropped, e.g. explicit [HistoryWindowCap.Unbounded]), then
+   * replaced on every [buildRequest] with that request's combined-window
+   * drop (`combined - base`). The construction-time seed is therefore NOT
+   * observable here after the first send — the total omission against the
+   * full (resumed + live) history is published on [contextOmission]
+   * instead. DB-tail drops (rows never loaded into [initialHistory]) are
+   * observed separately via the factory's `historyDroppedCount` / VM
+   * `historyOmittedCount`; the two are disjoint sets of rows — never sum.
    */
   @Volatile var droppedHistoryCount: Int = (initialHistory.size - cappedHistory.size).coerceAtLeast(0)
     private set
@@ -1072,13 +1081,56 @@ class TurnController(
    * dropped, e.g. explicit [HistoryWindowCap.Unbounded]), replaced on every [buildRequest] with that
    * request's combined-window drop (time-block excluded: the ephemeral block
    * is suffixed after the window trim, so it never inflates this cell — see
-   * the [HistoryWindowCap] reconciliation note). The UI list and transcript
+   * the [HistoryWindowCap] reconciliation note). Per-request combined-window
+   * drop only, like [droppedHistoryCount] — the construction-time seed is
+   * excluded; the count-side total omission is published on
+   * [contextOmission] (no char counterpart). The UI list and transcript
    * keep everything; only the outgoing request copy is windowed. Read-only
    * observability: never gates truncation, never changes the request.
    */
   @Volatile var droppedHistoryChars: Long =
     (initialHistory.sumOf { it.text.length.toLong() } - cappedHistory.sumOf { it.text.length.toLong() }).coerceAtLeast(0L)
     private set
+
+  /**
+   * Provider-request context omission total: how many rows the windowing legs
+   * keep out of the outgoing request, unified across legs — any row a leg
+   * removes counts, synthesized tool-round rows included. For the base request the
+   * counted set is the original rows (the resumed [initialHistory] + this send's
+   * live rows) removed by the windowing legs — the construction-time
+   * history window (seed, `initialHistory.size - cappedHistory.size`), the
+   * per-request combined window (capped prefix + live, oldest-first), and
+   * the send-time [MAX_REQUEST_CHARS] head trim (whose leg is also
+   * published separately on [requestTrimmedCount] / [lastRequestTrimmedCount]
+   * for debug — a strict subset of this total, never additive).
+   *
+   * Published synchronously on every [buildRequest] as
+   * `(initialHistory.size + live.size - outgoingMessages.size).coerceAtLeast(0)`.
+   * Count caveat: with no user row in the windowed base, [buildRequest] appends one
+   * empty-text image row after the cap — the total may low-report by exactly that row.
+   * A tool continuation ([buildToolContinuation]) additionally emits its
+   * own prefix trim on top, mirroring [requestTrimmedCount]'s continuation
+   * contract (the continuation only adds synthesized round rows on top of the
+   * trimmed prefix; every row its prefix trim removes — synthesized tool rows
+   * included — counts as an omission). Throw path:
+   * [ContinuationOverBudgetException] leaves this flow at the base
+   * request's published value (that value corresponds to a request that was
+   * never shipped — the continuation was never sent). Rejections
+   * before any request leave the last published value (the construction-time
+   * seed until the first [buildRequest] publishes; from the second send on,
+   * the previous request's published value is retained).
+   *
+   * Orthogonal to the DB-tail omission (factory
+   * `CreatedSession.historyDroppedCount` / VM `historyOmittedCount`, which
+   * counts rows never loaded into [initialHistory]): the two are disjoint
+   * sets of rows — never sum them, and never add them into UI copy. The
+   * seed carries the resume-time init-window drop so a resumed long
+   * conversation reports a non-zero badge before the first send.
+   * Read-only observability: never gates truncation, never changes the
+   * request.
+   */
+  private val _contextOmission = MutableStateFlow((initialHistorySize - cappedHistory.size).coerceAtLeast(0))
+  val contextOmission: StateFlow<Int> = _contextOmission.asStateFlow()
 
   /**
    * Visible-text deltas collected this controller lifetime (text + reasoning).
@@ -6025,8 +6077,9 @@ class TurnController(
    * When the structured round pushes the request past [MAX_REQUEST_CHARS],
    * history-prefix trimming (oldest-first, whole messages, tool pairing kept
    * atomic by snapping forward via [snapHistoryToPairBoundary], the structured payload counted) is additionally published on
-   * [lastRequestTrimmedCount]/[requestTrimmedCount] (counts) and
-   * [lastRequestTrimmedChars]/[lastRequestChars] (chars)
+   * [lastRequestTrimmedCount]/[requestTrimmedCount] (counts),
+   * [lastRequestTrimmedChars]/[lastRequestChars] (chars), and on top of the
+   * base request's [contextOmission] value
    * as the total head trim of the outgoing request (added on top of the
    * base request's own emission) — never silent. Wire-vs-text: the drop
    * *decision* sums wire-estimate units (`requestWireEstimate`, wrapper +
@@ -6083,8 +6136,9 @@ class TurnController(
       // silently shipping an over-cap request.
       // Trim-count contract: on this throw path requestTrimmedCount
       // retains only the base request's published dropCount (the request
-      // was never shipped); the next build resets it per request. Char
-      // cells likewise keep the base values (mirrors the count contract).
+      // was never shipped); contextOmission likewise keeps the base
+      // request's published value; the next build resets it per request.
+      // Char cells likewise keep the base values (mirrors the count contract).
       throw ContinuationOverBudgetException()
     }
     val finalBase = if (drop > 0) baseMessages.drop(drop) else baseMessages
@@ -6095,11 +6149,15 @@ class TurnController(
     // read-add-set is exact, char side likewise (text.length units, never the
     // wire-estimate units that drove the drop decision); lastRequestChars is
     // refreshed to the shipped continuation size (finalBase + structured
-    // round). Observability only.
+    // round); contextOmission likewise tops up with the continuation's own
+    // prefix trim (the continuation only ADDS synthesized round rows on top;
+    // every row its prefix trim removes — synthesized tool rows included —
+    // is an omission). Observability only.
     if (drop > 0) {
       val total = _lastRequestTrimmedCount.get() + drop
       _lastRequestTrimmedCount.set(total)
       _requestTrimmedCount.value = total
+      _contextOmission.value = _contextOmission.value + drop
       var contTrimmedChars = 0L
       for (i in 0 until drop) contTrimmedChars += baseMessages[i].text.length
       // Single-writer (same coroutine as the base trim): read-add-set is exact.
@@ -6222,6 +6280,11 @@ class TurnController(
     _lastRequestTrimmedCount.set(dropCount)
     _requestTrimmedCount.value = dropCount
     val finalMessages = if (dropCount > 0) base.drop(dropCount) else base
+    // Provider-request context omission total (init window + combined window +
+    // 100k trim): rows absent from the shipped request (original rows for the
+    // base; the continuation top-up adds its own dropped rows). `live` is the
+    // local reference to this send's live rows (same source as `combined`).
+    _contextOmission.value = (initialHistorySize + live.size - finalMessages.size).coerceAtLeast(0)
     // H1 char reconciliation (observability only): MAX_REQUEST_CHARS trim in
     // text chars (head trim only — maxDropLimit stops before the time-blocked
     // last-user row suffixed above, so the block lands in the final size as

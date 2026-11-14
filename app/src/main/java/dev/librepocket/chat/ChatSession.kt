@@ -7,6 +7,9 @@ import kotlinx.coroutines.flow.asStateFlow
 /** Shared zero trim flow for [ChatSession.requestTrimmedCount]'s default (read-only, safe to share). */
 private val ZeroRequestTrimmedCount: StateFlow<Int> = MutableStateFlow(0).asStateFlow()
 
+/** Shared zero omission flow for [ChatSession.contextOmission]'s default (read-only, safe to share). */
+private val ZeroContextOmission: StateFlow<Int> = MutableStateFlow(0).asStateFlow()
+
 /**
  * Single-turn chat controller: send / stream / cancel / steering.
  *
@@ -31,6 +34,33 @@ interface ChatSession {
    * production ([ChatSessionImpl]) overrides with the live controller flow.
    */
   val requestTrimmedCount: StateFlow<Int> get() = ZeroRequestTrimmedCount
+
+  /**
+   * Provider-request context omission total: how many rows the windowing legs
+   * keep out of the outgoing request, unified across legs — any row a leg
+   * removes counts, synthesized tool-round rows included (the legs drop only
+   * original rows today; the continuation's top-up counts every row its own
+   * prefix trim removes). The base legs count the original rows
+   * (the resumed history prefix + this send's live rows) after every
+   * windowing leg — the construction-time
+   * history window, the per-request combined window, and the send-time
+   * MAX_REQUEST_CHARS head trim (a tool continuation additionally tops up
+   * its own prefix trim). A tool continuation throw leaves the last
+   * published value (the base request's publish — a request that was never
+   * shipped, retained for observation). Rejections before any request leave
+   * the last published value too — the shared zero default until the first
+   * publish; from the second send on, the previous request's published
+   * value is retained.
+   *
+   * Orthogonal to [requestTrimmedCount] (the send-time MAX_REQUEST_CHARS
+   * leg alone — a strict subset of this total, kept for debug) and to the
+   * DB-tail omission (factory `CreatedSession.historyDroppedCount` / VM
+   * `historyOmittedCount`, which counts rows never loaded into the model
+   * prefix): the two are disjoint sets of rows — never summed. Default is
+   * a shared zero flow so test fakes stay source-compatible; production
+   * ([ChatSessionImpl]) overrides with the live controller flow.
+   */
+  val contextOmission: StateFlow<Int> get() = ZeroContextOmission
 
   /** Send one user message and stream the reply. One in-flight turn at a time. */
   suspend fun send(text: String, images: List<ChatImageRef> = emptyList())

@@ -109,6 +109,10 @@ jobs:
               # be able to bypass the gates it edits.
               - '.github/workflows/**'
               - '.github/actions/**'
+              # Any signer-pins-shaped path (root-level or nested) must flip
+              # policy=true so the never-committed tripwire runs (Issue #12).
+              - '*signer_pins*'
+              - '**/*signer_pins*'
               # Trailing catch-all: the explicit entries above exist for
               # readability/history; this glob defaults new scripts/ harness
               # code (any new checker or script test) into the policy gate

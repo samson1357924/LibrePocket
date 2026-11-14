@@ -1,7 +1,9 @@
 package dev.librepocket.web
 
 import dev.librepocket.keystore.KeyVault
+import java.net.URI
 import java.net.URLEncoder
+import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -11,20 +13,25 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 
 /**
  * D5 keyed 搜尋 providers（#138 D5；純 JVM，不接線）。
  *
- * - 四家固定雲端 origin（phase 2）：Brave（GET）／Tavily（POST）／Exa（POST）／
+ * - 四家固定雲端 endpoint（phase 2）：Brave（GET）／Tavily（POST）／Exa（POST）／
  *   Firecrawl（POST）。各 provider 皆為 [WebSearchProvider] delegate，呼叫方以
  *   [WebSearchService] 包裝後即得 cache＋single-flight（見 [defaultKeyedProviders]
  *   與 `WebSearchD5Test`）。
  * - Key 來源：一律經 [KeyVault] 以 `keyId` 讀取，預設
- *   `web.<providerId>@<origin>`（如 `web.brave@https://api.search.brave.com`）；
- *   keyId 同時綁定 providerId 與 origin——endpoint 切換（不同 keyId）不可沿用舊 key
- *   （見 `keyIdBinding` 測試）。D3 的 `WebSearchSettings.keyIdFor` 為 Settings-UX
- *   的嚴格驗證真相源（本分支不依賴 D3 檔；production 接線時請顯式傳入其回傳值，
- *   本預設值僅覆蓋固定雲端 origin 的形狀）。
+ *   `web.<providerId>@<endpoint>`（如 `web.brave@https://api.search.brave.com/res/v1/web/search`；
+ *   綁定的是完整 endpoint 路徑）；
+ *   keyId 同時綁定 providerId 與 endpoint——本層建構期 fail-fast：任何非綁定 keyId
+ *   （foreign 命名空間如 `preset:`／`custom:`／`mcp:`／`jev`、跨 provider、自訂
+ *   endpoint）皆於建構拋 [IllegalArgumentException]，endpoint 切換不可沿用舊 key，
+ *   聊天 key 也無法被誤送往搜尋 API（defense-in-depth，見 [BaseKeyedSearchProvider]
+ *   的 init 檢查與 `mismatchedKeyIdFailsFastAtConstruction` 測試）。自訂 endpoint
+ *   需未來 D3 驗證流程另行開放，本層有意不接受。D3 的 `WebSearchSettings.keyIdFor`
+ *   留待 D3 落地；無論 D3 為何，本層皆 fail-fast。
  * - 缺 key（vault 無值／讀取失敗／空字串）→ `Unavailable(MISSING_KEY)`，零網路請求，
  *   不靜默換 provider；401／403 → `Failed(AUTH)`、請求形狀錯誤 → `Failed(PROTOCOL)`，
  *   兩者皆不 fallback（見 [WebSearchSelector.mayFallback]）。
@@ -68,10 +75,26 @@ private fun primitiveOf(obj: JsonObject, vararg keys: String): String? {
     return null
 }
 
+/**
+ * http(s) URL 白名單檢查：scheme 限 http/https（大小寫不拘）、host 非空白、無 userinfo
+ * （拒絕 `https://user:pass@evil.example/`）；否則回傳 null。
+ *
+ * 未 punycode 化的 Unicode IDN 與含 `_` 的 host 會因 `URI.getHost()==null` 被拒
+ * （URI 式白名單為 Phase 1 一併引入——相對 HEAD 為新行為；不改變 D4 之後的 NetworkPolicy 義務）。
+ * 本層不 fetch，D4 必須過 NetworkPolicy（http:// 仍放行至 D4 為止）。
+ */
 private fun httpUrlOrNull(raw: String): String? {
     val u = raw.trim()
     if (u.isEmpty()) return null
-    if (!u.startsWith("http://", ignoreCase = true) && !u.startsWith("https://", ignoreCase = true)) return null
+    val uri = try {
+        URI(u)
+    } catch (_: Exception) {
+        return null
+    }
+    val scheme = uri.scheme?.lowercase(Locale.ROOT)
+    if (scheme != "http" && scheme != "https") return null
+    if (uri.host.isNullOrBlank()) return null
+    if (uri.userInfo != null) return null
     return u
 }
 
@@ -94,21 +117,41 @@ private fun resultOrNull(
 /**
  * Keyed provider 共用骨架（key 經 [KeyVault]＋`keyId` 讀取；無 key 零網路）。
  *
- * Throw 契約沿 D1 [WebSearchProvider]：除 [CancellationException] 原樣透傳外不拋異常；
+ * 建構期 fail-fast：`keyId` 必須等於 `expectedKeyId`（子類綁定之 `DEFAULT_KEY_ID`，
+ * 形狀 `web.<id>@<endpoint>`），否則拋 [IllegalArgumentException]。此檢查防呼叫點誤帶
+ * keyId（如 `preset:*`、跨 provider、自訂 endpoint）——foreign 命名空間
+ * （`preset:`／`custom:`／`mcp:`／`jev`；聊天憑證與搜尋 key 共用同一 vault，此處防止
+ * 聊天 key 被誤送往搜尋 API）、跨 provider（如 Brave 誤帶 `web.tavily@…`）、自訂
+ * endpoint。自訂 endpoint 需未來經 D3 驗證流程開放，本層有意不接受；D3 的
+ * `WebSearchSettings.keyIdFor` 留待 D3 落地，此層無論如何都 fail-fast。
+ *
+ * 範圍限定：base class 為 public；內建四家為 final 且各自綁定自身 `DEFAULT_KEY_ID`。
+ * 第三方子類若自綁任意常數則不在本防護範圍；未來子類 MUST 綁定自身 `DEFAULT_KEY_ID`。
+ *
+ * Throw 契約沿 D1 [WebSearchProvider]：除 [CancellationException] 原樣透傳外不拋異常
+ * （建構期的 [IllegalArgumentException] 除外）；
  * vault 讀取失敗 fail-closed 為 `Unavailable(MISSING_KEY)`。
  */
 abstract class BaseKeyedSearchProvider(
     private val vault: KeyVault,
     private val keyId: String,
+    expectedKeyId: String,
     protected val timeoutMs: Long = WebHttpTimeouts.DEFAULT_TIMEOUT_MS,
     protected val maxBodyChars: Int = WebHttpTimeouts.MAX_BODY_CHARS,
     protected val json: Json = KeyedSearchJson,
 ) : WebSearchProvider {
+    init {
+        require(keyId == expectedKeyId) {
+            "KEYID_PROVIDER_MISMATCH: keyId must equal this provider's bound credential id (web.<id>@<endpoint>)"
+        }
+    }
+
     abstract override val id: String
 
     override val capabilities: Set<WebCapability> = setOf(WebCapability.REQUIRES_KEY)
 
     override suspend fun probe(): WebProbe {
+        // unreachable defense-in-depth（建構期已 fail-fast）
         if (keyId.isBlank()) return WebProbe.NotReady(WebUnavailableReason.MISSING_KEY)
         return try {
             if (vault.hasKey(keyId)) WebProbe.Ready
@@ -122,6 +165,7 @@ abstract class BaseKeyedSearchProvider(
 
     override suspend fun search(query: String, count: Int): WebSearchOutcome {
         if (query.isBlank()) return WebSearchOutcome.Unavailable(WebUnavailableReason.EMPTY_QUERY)
+        // unreachable defense-in-depth（建構期已 fail-fast）
         if (keyId.isBlank()) return WebSearchOutcome.Unavailable(WebUnavailableReason.MISSING_KEY)
         val n = WebSearchBudgets.countOf(count)
         val raw: CharArray = try {
@@ -147,8 +191,9 @@ abstract class BaseKeyedSearchProvider(
 /**
  * Brave Search API（GET `{ENDPOINT}?q=...&count=...`；`X-Subscription-Token` 傳 key）。
  *
- * 回應 `{"web":{"results":[{title,url,description,published_date}]}}`；缺 url／非 http(s)
- * 條目跳過（沿 D2 SearXNG 姿態）。
+ * 回應 `{"web":{"results":[{title,url,description,page_age}]}}`；缺 url／非 http(s)
+ * 條目跳過（沿 D2 SearXNG 姿態）。發布日期欄位為 `page_age`（解析另容忍
+ * `published_date`／`published`）。
  */
 class BraveSearchProvider(
     vault: KeyVault,
@@ -157,7 +202,7 @@ class BraveSearchProvider(
     timeoutMs: Long = WebHttpTimeouts.DEFAULT_TIMEOUT_MS,
     maxBodyChars: Int = WebHttpTimeouts.MAX_BODY_CHARS,
     json: Json = KeyedSearchJson,
-) : BaseKeyedSearchProvider(vault, keyId, timeoutMs, maxBodyChars, json) {
+) : BaseKeyedSearchProvider(vault, keyId, DEFAULT_KEY_ID, timeoutMs, maxBodyChars, json) {
     override val id: String = ID
 
     // Same posture as SearXNG/DDGS: namespace includes the fixed endpoint
@@ -187,7 +232,7 @@ class BraveSearchProvider(
         if (response.body.length > maxBodyChars.coerceAtLeast(1)) {
             return WebSearchOutcome.Failed(WebFailureReason.BAD_RESPONSE)
         }
-        return finishOk(parseBraveResults(json, response.body), count)
+        return finishOk(parseBraveResults(json, response.body, count), count)
     }
 
     internal fun parseBraveResults(body: String, limitHint: Int = 16): List<WebSearchResult>? =
@@ -212,7 +257,7 @@ internal fun parseBraveResults(json: Json, body: String, limitHint: Int = 16): L
                 url = url,
                 title = primitiveOf(obj, "title"),
                 snippet = primitiveOf(obj, "description", "snippet", "text"),
-                published = primitiveOf(obj, "published_date", "published"),
+                published = primitiveOf(obj, "page_age", "published_date", "published"),
             ) ?: continue
             out.add(hit)
         } catch (e: CancellationException) {
@@ -225,10 +270,12 @@ internal fun parseBraveResults(json: Json, body: String, limitHint: Int = 16): L
 }
 
 /**
- * Tavily Search API（POST `{ENDPOINT}`；`api_key` 置於 JSON body，官方文件形狀）。
+ * Tavily Search API（POST `{ENDPOINT}`；`Authorization: Bearer` header 傳 key，官方現行形狀）。
  *
- * Body `{"api_key","query","max_results","include_answer":false}`；
- * 回應 `{"results":[{title,url,content,published_date}]}`（`answer` 欄位忽略）。
+ * Body `{"query","max_results","include_answer":false}`（Bearer header 為官方現行形狀；
+ * 現行 OpenAPI spec 僅餘 bearerAuth，body 不含 api_key 欄位；body 攜帶秘密有寫入日誌風險）；
+ * 回應 `{"results":[{title,url,content,…}]}`（`answer` 欄位忽略）。
+ * 發布日期欄位需 `include_published_date:true`（本層未要求），故 `published` 維持 null。
  */
 class TavilySearchProvider(
     vault: KeyVault,
@@ -237,7 +284,7 @@ class TavilySearchProvider(
     timeoutMs: Long = WebHttpTimeouts.DEFAULT_TIMEOUT_MS,
     maxBodyChars: Int = WebHttpTimeouts.MAX_BODY_CHARS,
     json: Json = KeyedSearchJson,
-) : BaseKeyedSearchProvider(vault, keyId, timeoutMs, maxBodyChars, json) {
+) : BaseKeyedSearchProvider(vault, keyId, DEFAULT_KEY_ID, timeoutMs, maxBodyChars, json) {
     override val id: String = ID
 
     // Same posture as SearXNG/DDGS: namespace includes the fixed endpoint
@@ -252,7 +299,6 @@ class TavilySearchProvider(
 
     override suspend fun searchWithKey(query: String, count: Int, key: String): WebSearchOutcome {
         val body = buildJsonObject {
-            put("api_key", key)
             put("query", query)
             put("max_results", count)
             put("include_answer", false)
@@ -261,7 +307,11 @@ class TavilySearchProvider(
             val fetched = fetchWithTimeout(
                 postAsGet(httpPost, body),
                 ENDPOINT,
-                mapOf("Accept" to "application/json", "Content-Type" to "application/json"),
+                mapOf(
+                    "Accept" to "application/json",
+                    "Content-Type" to "application/json",
+                    "Authorization" to "Bearer $key",
+                ),
                 timeoutMs,
             )
         ) {
@@ -272,7 +322,7 @@ class TavilySearchProvider(
         if (response.body.length > maxBodyChars.coerceAtLeast(1)) {
             return WebSearchOutcome.Failed(WebFailureReason.BAD_RESPONSE)
         }
-        return finishOk(parseTavilyResults(json, response.body), count)
+        return finishOk(parseTavilyResults(json, response.body, count), count)
     }
 
     internal fun parseTavilyResults(body: String, limitHint: Int = 16): List<WebSearchResult>? =
@@ -312,8 +362,10 @@ internal fun parseTavilyResults(json: Json, body: String, limitHint: Int = 16): 
 /**
  * Exa Search API（POST `{ENDPOINT}`；`x-api-key` header 傳 key）。
  *
- * Body `{"query","numResults"}`；回應 `{"results":[{title,url,text,publishedDate}]}`；
- * `text` 可能很長，下游以 [capResultsForModel] 收斂（沿 D2 姿態）。
+ * Body `{"query","numResults","contents":{"highlights":true}}`（`contents` 為必要欄位，
+ * 缺則不回 `text`／`highlights`）；回應 `{"results":[{title,url,highlights,publishedDate}]}`；
+ * snippet 優先取 `highlights` 陣列以 `" "` 接合並 trim，缺則回退 `text`→`snippet`→`description`；
+ * 下游以 [capResultsForModel] 收斂（沿 D2 姿態）。
  */
 class ExaSearchProvider(
     vault: KeyVault,
@@ -322,7 +374,7 @@ class ExaSearchProvider(
     timeoutMs: Long = WebHttpTimeouts.DEFAULT_TIMEOUT_MS,
     maxBodyChars: Int = WebHttpTimeouts.MAX_BODY_CHARS,
     json: Json = KeyedSearchJson,
-) : BaseKeyedSearchProvider(vault, keyId, timeoutMs, maxBodyChars, json) {
+) : BaseKeyedSearchProvider(vault, keyId, DEFAULT_KEY_ID, timeoutMs, maxBodyChars, json) {
     override val id: String = ID
 
     // Same posture as SearXNG/DDGS: namespace includes the fixed endpoint
@@ -339,6 +391,9 @@ class ExaSearchProvider(
         val body = buildJsonObject {
             put("query", query)
             put("numResults", count)
+            putJsonObject("contents") {
+                put("highlights", true)
+            }
         }.toString()
         val response = when (
             val fetched = fetchWithTimeout(
@@ -359,7 +414,7 @@ class ExaSearchProvider(
         if (response.body.length > maxBodyChars.coerceAtLeast(1)) {
             return WebSearchOutcome.Failed(WebFailureReason.BAD_RESPONSE)
         }
-        return finishOk(parseExaResults(json, response.body), count)
+        return finishOk(parseExaResults(json, response.body, count), count)
     }
 
     internal fun parseExaResults(body: String, limitHint: Int = 16): List<WebSearchResult>? =
@@ -380,10 +435,15 @@ internal fun parseExaResults(json: Json, body: String, limitHint: Int = 16): Lis
         try {
             val obj = item as? JsonObject ?: continue
             val url = primitiveOf(obj, "url") ?: continue
+            val highlightSnippet = (obj["highlights"] as? JsonArray)
+                ?.mapNotNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.contentOrNull?.trim()?.takeIf { s -> s.isNotEmpty() } }
+                ?.joinToString(" ")
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
             val hit = resultOrNull(
                 url = url,
                 title = primitiveOf(obj, "title"),
-                snippet = primitiveOf(obj, "text", "snippet", "description"),
+                snippet = highlightSnippet ?: primitiveOf(obj, "text", "snippet", "description"),
                 published = primitiveOf(obj, "publishedDate", "published_date", "published"),
             ) ?: continue
             out.add(hit)
@@ -397,11 +457,14 @@ internal fun parseExaResults(json: Json, body: String, limitHint: Int = 16): Lis
 }
 
 /**
- * Firecrawl Search API（POST `{ENDPOINT}`；`Authorization: Bearer` 傳 key）。
+ * Firecrawl Search API（POST `{ENDPOINT}`，v2；`Authorization: Bearer` 傳 key）。
  *
- * Body `{"query","limit"}`；回應 `{"success":true,"data":[{title,url,description,markdown}]}`。
- * `success:false`（HTTP 200 包錯誤）→ `Failed(SUPPLIER_ERROR)`；`description` 優先、
- * 缺則回退 `markdown`（長文本由 [capResultsForModel] 收斂）。
+ * Body `{"query","limit"}`；回應 `{"success":true,"data":{"web":[{title,url,description}]}}`
+ * （v2 的 `data` 為物件、`web` 為陣列，非平陣列；v1 已不再針對）。
+ * `success:false`（HTTP 200 包錯誤）→ `Failed(SUPPLIER_ERROR)`（防禦性處理）；
+ * snippet 優先 `description`、缺則回退 `markdown`（無 scrapeOptions 時通常缺；description 缺席時
+ * 回退 markdown/snippet 仍支援）、再缺 `snippet`。
+ * DEFAULT_KEY_ID 綁定 v2 endpoint；自 v1 升級時舊 vault 項目失效，需重新輸入 Firecrawl key（未隨本 PR 發佈）。
  */
 class FirecrawlSearchProvider(
     vault: KeyVault,
@@ -410,7 +473,7 @@ class FirecrawlSearchProvider(
     timeoutMs: Long = WebHttpTimeouts.DEFAULT_TIMEOUT_MS,
     maxBodyChars: Int = WebHttpTimeouts.MAX_BODY_CHARS,
     json: Json = KeyedSearchJson,
-) : BaseKeyedSearchProvider(vault, keyId, timeoutMs, maxBodyChars, json) {
+) : BaseKeyedSearchProvider(vault, keyId, DEFAULT_KEY_ID, timeoutMs, maxBodyChars, json) {
     override val id: String = ID
 
     // Same posture as SearXNG/DDGS: namespace includes the fixed endpoint
@@ -419,7 +482,7 @@ class FirecrawlSearchProvider(
 
     companion object {
         const val ID = "firecrawl"
-        const val ENDPOINT = "https://api.firecrawl.dev/v1/search"
+        const val ENDPOINT = "https://api.firecrawl.dev/v2/search"
         const val DEFAULT_KEY_ID = "web.$ID@$ENDPOINT"
     }
 
@@ -457,7 +520,7 @@ class FirecrawlSearchProvider(
         if ((root["success"] as? JsonPrimitive)?.booleanOrNull == false) {
             return WebSearchOutcome.Failed(WebFailureReason.SUPPLIER_ERROR)
         }
-        return finishOk(parseFirecrawlData(root), count)
+        return finishOk(parseFirecrawlData(root, count), count)
     }
 
     internal fun parseFirecrawlDataForTest(body: String): List<WebSearchResult>? {
@@ -473,7 +536,8 @@ class FirecrawlSearchProvider(
 }
 
 internal fun parseFirecrawlData(root: JsonObject, limitHint: Int = 16): List<WebSearchResult>? {
-    val arr = root["data"] as? JsonArray ?: return null
+    val data = root["data"] as? JsonObject ?: return null
+    val arr = data["web"] as? JsonArray ?: return null
     val out = ArrayList<WebSearchResult>(arr.size.coerceAtMost(limitHint + 8))
     for (item in arr) {
         try {

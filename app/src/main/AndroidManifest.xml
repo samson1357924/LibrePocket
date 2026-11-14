@@ -7,7 +7,8 @@
   service is declared only in src/foss + src/github overlays (service
   hardening relies on DEX superclass + xmltree gates).
 -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -19,6 +20,11 @@
          Play 無需申報）。完整理由與 <queries> 可見性契約：
          docs/specs/ANDROID_INTENT_VISIBILITY.md -->
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+
+    <!-- 零新增權限契約（Issue #137 C1/C2）：防範任何 transitive AAR 依賴
+         （如 github flavor 的 azure-speech sdk）意外合入 RECORD_AUDIO。
+         本 App 語音錄製一律走系統 RecognizerIntent 委派，永遠不直接持有 RECORD_AUDIO。 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" tools:node="remove" />
 
     <!-- queries 可見性（S2 語音 + #14 intent adapter）：targetSdk 36 package
          visibility 會把未宣告的隱式 Intent 過濾掉，resolve-first launcher 即
@@ -137,5 +143,13 @@
                 <action android:name="android.speech.RecognitionService" />
             </intent-filter>
         </service>
+
+        <!-- C2 voice retrigger handoff（Issue #137）：main-process, app-private cross-process
+             channel for :voice session -> trusted voice UI token delivery. -->
+        <provider
+            android:name=".assistant.VoiceHandoffProvider"
+            android:authorities="${applicationId}.voice.handoff"
+            android:exported="false"
+            android:process="" />
     </application>
 </manifest>

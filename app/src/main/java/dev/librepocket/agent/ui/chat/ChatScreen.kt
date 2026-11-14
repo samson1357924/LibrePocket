@@ -68,6 +68,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.librepocket.agent.R
+import dev.librepocket.agent.assistant.AssistantVoice
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.tool.DenyReason
@@ -117,6 +118,12 @@ fun ChatScreen(
     // 預設空 map 即全預設值（voice_input/voice_output 預設開，僅預覽用）。
     // mic 鈕與朗讀鈕按此顯隱。
     userSwitches: Map<String, Boolean> = emptyMap(),
+    // C2 active voice task retrigger handoff（trusted, cross-process token）。When a later
+    // assistant gesture is accepted for an already-active voice task, UI consumes the token once
+    // and relaunches system STT under the same delivery/switch gates. Consume must succeed to
+    // preserve once-only/cancellation semantics.
+    voiceRetriggerToken: Long = 0L,
+    onVoiceRetriggerConsumed: (Long) -> Boolean = { false },
     // R4-2：設定讀取失敗旗（真相源讀錯時 true）：此時 userSwitches 已為全關
     //（入口隱藏、VoiceSpeaker 未建構），另在此顯示一行讀取問題提示（沿用下方
     // 錯誤區既有樣式，不新增設計語言）。
@@ -126,6 +133,17 @@ fun ChatScreen(
     // 失敗仍執行本次朗讀並顯示 TTS_ACK_PERSIST_WARNING（保持未確認，下次重問）。
     ttsAcknowledged: Boolean = false,
     onTtsAcknowledged: suspend () -> Boolean = { true },
+    // C2 session 語音喚起（Issue #137）：MainActivity 經 MainScreen 傳入的
+    // 一次態 voice 請求（MainScreen 已守衛 hasEndpoint && !navLoading &&
+    // currentRoute == Routes.CHAT）；true 且開關快照已落定（voiceSwitchesLoaded）
+    // 即自動走下方既有 launchSystemStt()（RecognizerIntent 委派，零新權限），
+    // 先消費再啟動（防重組重放）。
+    // 結果經 AssistantVoice.resolveVoicePrefill 截斷至上限並只 prefill 不自動送出；
+    // 開關關閉／讀取失敗（loadFailed→userSwitches 全關）／無服務時由 launchSystemStt
+    // 內既有降級話術承擔（USER_DISABLED / NO_PRIVILEGE）。預設 false／true 保舊構造／預覽相容。
+    voiceInputRequested: Boolean = false,
+    onVoiceInputConsumed: () -> Unit = {},
+    voiceSwitchesLoaded: Boolean = true,
 ) {
     val session by viewModel.sessionState.collectAsStateWithLifecycle()
     val messages by viewModel.messages.collectAsStateWithLifecycle()
@@ -294,12 +312,26 @@ fun ChatScreen(
     val sttLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
+        // TODO(#137): implement explicit auto-send handling before enabling; do not discard prefill results.
+        // Runtime contract today: voice results are prefill-only. Even if AUTO_SEND_AFTER_VOICE is
+        // flipped prematurely, never silently drop STT results—prefill/error handling below must still run.
+        val autoSendAfterVoice = AssistantVoice.AUTO_SEND_AFTER_VOICE
         if (result.resultCode == Activity.RESULT_OK) {
-            val candidates = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
-            val text = VoiceStt.pickResult(candidates)
+            // Treat extras retrieval + candidate extraction/validation + resolve as one untrusted boundary.
+            // Handles wrong container/element types (including generic-erasure/ClassCastException) and
+            // parcel errors (e.g. BadParcelableException) without crashing, prefilling, or sending.
+            val text = try {
+                val raw = result.data?.extras?.get(RecognizerIntent.EXTRA_RESULTS)
+                AssistantVoice.resolveVoicePrefill(raw as? List<*>)
+            } catch (_: Exception) {
+                null
+            }
             if (text != null) {
                 voiceErrors.onSttSuccess()
                 viewModel.prefill(text)
+                if (autoSendAfterVoice) {
+                    // TODO(#137): wire explicit user-confirmed send here; intentionally no-op for now.
+                }
             } else {
                 voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_EMPTY_RESULT))
             }
@@ -334,6 +366,27 @@ fun ChatScreen(
             sttLauncher.launch(intent)
         } catch (_: Exception) {
             voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE))
+        }
+    }
+    // C2 自動喚起：session ASSIST＋flag → 須待 VoiceSwitchStore 快照落定
+    // （voiceSwitchesLoaded == true，含 loaded 與 loadFailed，避免冷啟動
+    // LOADING 窗口誤以全關 map 提前消費／降級）；落定後消費一次並走既有委派。
+    // 先消費再啟動：啟動後重組不再重放；開關關閉或 loadFailed 時，
+    // launchSystemStt() 內 cleanly 降級為 USER_DISABLED。
+    LaunchedEffect(voiceInputRequested, voiceSwitchesLoaded) {
+        if (voiceInputRequested && voiceSwitchesLoaded) {
+            onVoiceInputConsumed()
+            launchSystemStt()
+        }
+    }
+    // C2 retrigger：同一 trusted voice task 已存在且 session 接受新的真實 onShow 時，
+    // 以跨 process handoff token 一次性重啟 STT（不建立新 voice task、不自動送出）。
+    // 僅在 switches 狀態已落定且 consume 成功時啟動，避免誤觸發/重放/競態。
+    LaunchedEffect(voiceRetriggerToken, voiceSwitchesLoaded) {
+        if (voiceRetriggerToken != 0L && voiceSwitchesLoaded) {
+            if (onVoiceRetriggerConsumed(voiceRetriggerToken)) {
+                launchSystemStt()
+            }
         }
     }
 

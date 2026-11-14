@@ -9,7 +9,10 @@ import android.util.Log
 
 private const val TAG = "LibreRecognition"
 
-// TODO(C2-assistant): 在 session 內接系統 STT（串流辨識＋onError 語義），取代本 stub。
+// C2 定案：session 內不做串流 STT（自家 process 辨識需要 RECORD_AUDIO，
+// 與零新增權限契約衝突）。本 stub 保持誠實無能力：不接系統 STT、不偽造結果。
+// 語音輸入走 AssistantVoice 委派 RecognizerIntent（錄音由系統／第三方辨識
+// Activity 承擔）。
 
 /**
  * C1 RecognitionService stub（Issue #137 C1a）。

@@ -2,6 +2,9 @@ package dev.librepocket.agent.ui
 
 import android.util.Log
 import kotlinx.coroutines.CancellationException
+import androidx.compose.material3.DrawerState
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -16,6 +19,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavHostController
+import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import dev.librepocket.agent.R
 import dev.librepocket.agent.ui.chat.ChatScreen
@@ -32,6 +37,7 @@ import dev.librepocket.agent.ui.setup.PendingDelete
 import dev.librepocket.agent.ui.setup.SetupScreen
 import dev.librepocket.agent.ui.setup.SetupViewModel
 import dev.librepocket.agent.ui.setup.SetupViewModelFactory
+import dev.librepocket.agent.assistant.AssistantVoiceHandoff
 import dev.librepocket.agent.assistant.rememberAssistantRole
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.entry.EntryDispatch
@@ -60,6 +66,11 @@ private const val TAG = "MainScreen"
 fun MainScreen(
     sharedText: String? = null,
     onSharedConsumed: () -> Unit = {},
+    // C2 session 語音喚起（Issue #137）：MainActivity 的一次態 voice 請求；
+    // 轉交 ChatScreen 自動走既有 RecognizerIntent 委派（零新權限），
+    // 結果只 prefill 不自動送出。預設 false 保舊構造相容。
+    assistVoiceRequested: Boolean = false,
+    onAssistVoiceConsumed: () -> Unit = {},
 ) {
     val navController = rememberNavController()
     val scope = rememberCoroutineScope()
@@ -74,6 +85,10 @@ fun MainScreen(
     // 守衛／spinner／drawer 接線只在 StartupGateHost 實現（單一來源，接線測直
     // 接測該 host）；此處只收集狀態並傳入，不重算、不重抄。
     val startupReconcilePending by setupViewModel.startupReconcilePending.collectAsStateWithLifecycle()
+    val navLoading = startupEffectiveLoading(gate is EndpointGate.Loading, startupReconcilePending)
+    val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+    val backStack by navController.currentBackStackEntryAsState()
+    val currentRoute = backStack?.destination?.route
     // 登出失敗 Settings UI 可見（Re-review #7 Finding 2 階段2）：false 分支不導航
     // 不清空，只靠 form.errorCode（LOGOUT_*）驅動 Settings 失敗卡；簽名不改。
     val setupForm by setupViewModel.form.collectAsStateWithLifecycle()
@@ -174,6 +189,33 @@ fun MainScreen(
         }
     }
 
+    // C2 session 語音喚起路由與邊界守衛（單一來源見 AssistVoiceCoordinator / shouldDeliverVoiceToChat）。
+    // drawerState 由 coordinator 負責在投遞前收斂至完全關閉；delivery gate 另行要求 target/current 皆為 Closed。
+    AssistVoiceCoordinator(
+        assistVoiceRequested = assistVoiceRequested,
+        hasEndpoint = hasEndpoint,
+        navLoading = navLoading,
+        currentRoute = currentRoute,
+        navController = navController,
+        drawerState = drawerState,
+        viewedSessionId = viewedSessionId,
+        onClearViewedSession = { viewedSessionId = null },
+        onAssistVoiceConsumed = onAssistVoiceConsumed,
+    )
+
+    // Trusted cross-process retrigger handoff from active voice session (F1): deliver only under
+    // the same chat-safe boundary as initial voice delivery.
+    val pendingVoiceRetrigger by AssistantVoiceHandoff.pendingFlow().collectAsStateWithLifecycle(initialValue = null)
+    val pendingVoiceRetriggerToken = pendingVoiceRetrigger?.token ?: 0L
+    val deliverVoiceRetrigger = pendingVoiceRetrigger != null &&
+        currentRoute == Routes.CHAT &&
+        hasEndpoint &&
+        !navLoading &&
+        viewedSessionId == null &&
+        drawerState.isClosed &&
+        drawerState.targetValue == DrawerValue.Closed
+    val voiceRetriggerToken = if (deliverVoiceRetrigger) pendingVoiceRetriggerToken else 0L
+
     // Edit-entry helper: prefill the form with the live endpoint (key stays
     // blank) so "edit" never shows another preset's defaults.
     fun goSetupForEdit() {
@@ -226,12 +268,36 @@ fun MainScreen(
         pendingTeardown = pendingTeardown,
         // Stage F：stale 抑制標籤同源傳入（四參派生；pure 只隱藏，真清卡靠 retry 終端）。
         logoutErrorSourceJournal = setupForm.logoutErrorSourceJournal,
+        drawerState = drawerState,
         chatContent = { padding ->
             ChatScreen(
                 padding = padding,
                 viewModel = chatViewModel,
                 onOpenSettings = { goSetupForEdit() },
                 onTurnFinished = { sessionListViewModel.refresh() },
+                // Safety net for coordinator key omissions/in-flight transitions: only deliver when CHAT,
+                // endpoint/nav are ready, no readonly transcript overlay (viewedSessionId excluded), and
+                // drawer is fully closed (current+target). Coordinator routes/clears; this gate blocks misdelivery.
+                voiceInputRequested = shouldDeliverVoiceToChat(
+                    assistVoiceRequested = assistVoiceRequested,
+                    currentRoute = currentRoute,
+                    hasEndpoint = hasEndpoint,
+                    navLoading = navLoading,
+                    viewedSessionId = viewedSessionId,
+                    drawerState = drawerState,
+                ),
+                onVoiceInputConsumed = onAssistVoiceConsumed,
+                voiceRetriggerToken = voiceRetriggerToken,
+                onVoiceRetriggerConsumed = { token ->
+                    val p = pendingVoiceRetrigger?.takeIf { it.token == token }
+                    AssistantVoiceHandoff.consume(
+                        token = token,
+                        context = app,
+                        targetTaskId = p?.targetTaskId ?: Int.MIN_VALUE,
+                        sessionInstanceId = p?.sessionInstanceId ?: Long.MIN_VALUE,
+                    )
+                },
+                voiceSwitchesLoaded = voiceEffectiveSnapshot.loaded || voiceEffectiveSnapshot.loadFailed,
                 userSwitches = voiceUiSwitches,
                 voiceSwitchLoadFailed = voiceEffectiveSnapshot.loadFailed,
                 ttsAcknowledged = ttsAcknowledged,
@@ -433,5 +499,73 @@ fun MainScreen(
     )
     viewedSessionId?.let { id ->
         TranscriptViewer(id, sessionListViewModel::readTranscriptPage) { viewedSessionId = null }
+    }
+}
+
+/**
+ * C2 session 語音喚起投遞門禁（與 [AssistVoiceCoordinator] 同源）：
+ * 僅在已導至 `Routes.CHAT`、有端點、啟動已落定、無唯讀覆蓋且抽屜已完全關閉時才向
+ * [ChatScreen] 遞送一次態 `voiceInputRequested`。
+ */
+internal fun shouldDeliverVoiceToChat(
+    assistVoiceRequested: Boolean,
+    currentRoute: String?,
+    hasEndpoint: Boolean,
+    navLoading: Boolean,
+    viewedSessionId: String?,
+    drawerState: DrawerState,
+): Boolean =
+    assistVoiceRequested &&
+        currentRoute == Routes.CHAT &&
+        hasEndpoint &&
+        !navLoading &&
+        viewedSessionId == null &&
+        drawerState.isClosed &&
+        drawerState.targetValue == DrawerValue.Closed
+
+/**
+ * C2 session 語音喚起路由與邊界守衛（MainScreen 與接線測試共用單一來源）：
+ * - 啟動落定前（`navLoading`）不啟動也不消費，等待 gate 與 reconcile 落定；
+ * - 落定後若無可用端點（`!hasEndpoint`），消費清除 stale flag，避免日後設定
+ *   完成回到 CHAT 時意外補彈 STT；
+ * - 有端點且已落定時，關閉唯讀檢視（`viewedSessionId`），若當前不在 CHAT
+ *   路由則先導回 CHAT，待 `currentRoute == Routes.CHAT` 後關閉抽屜並交由 ChatScreen 消費。
+ */
+@Composable
+internal fun AssistVoiceCoordinator(
+    assistVoiceRequested: Boolean,
+    hasEndpoint: Boolean,
+    navLoading: Boolean,
+    currentRoute: String?,
+    navController: NavHostController,
+    drawerState: DrawerState,
+    viewedSessionId: String?,
+    onClearViewedSession: () -> Unit,
+    onAssistVoiceConsumed: () -> Unit,
+) {
+    // 刻意不把 viewedSessionId 放進 LaunchedEffect key：若納入 key，下方
+    // onClearViewedSession() 將 viewedSessionId 設為 null 會立即重啟效應並取消
+    // 正在執行的 drawerState.close()；同時 shouldDeliverVoiceToChat 已要求
+    // viewedSessionId == null 才允許投遞，不會在唯讀覆蓋關閉前誤送。
+    LaunchedEffect(assistVoiceRequested, hasEndpoint, navLoading, currentRoute) {
+        if (!assistVoiceRequested) return@LaunchedEffect
+        if (navLoading) return@LaunchedEffect
+        if (!hasEndpoint) {
+            onAssistVoiceConsumed()
+            return@LaunchedEffect
+        }
+        if (viewedSessionId != null) {
+            onClearViewedSession()
+        }
+        if (currentRoute != null && currentRoute != Routes.CHAT) {
+            navController.navigate(Routes.CHAT) {
+                popUpTo(Routes.CHAT) { inclusive = false }
+                launchSingleTop = true
+            }
+            return@LaunchedEffect
+        }
+        if (!drawerState.isClosed || drawerState.targetValue != DrawerValue.Closed) {
+            drawerState.close()
+        }
     }
 }

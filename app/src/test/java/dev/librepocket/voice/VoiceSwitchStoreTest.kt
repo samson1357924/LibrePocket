@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
@@ -54,6 +55,15 @@ class VoiceSwitchStoreTest {
     @After
     fun tearDown() {
         scopes.forEach { it.cancel() }
+        scopes.forEach { scope ->
+            val job = scope.coroutineContext[Job]
+            runBlocking {
+                withTimeout(5_000) {
+                    job?.join()
+                }
+            }
+        }
+        scopes.clear()
         tmpDirs.forEach { it.deleteRecursively() }
     }
 
@@ -460,13 +470,14 @@ class VoiceSwitchStoreTest {
                 emit(loaded)
             }
         }
+        val sharingScope = CoroutineScope(
+            coroutineContext[kotlin.coroutines.ContinuationInterceptor]
+                as kotlinx.coroutines.CoroutineDispatcher + SupervisorJob(),
+        ).also { scopes.add(it) }
         val shared = upstream.stateIn(
             // 不用 backgroundScope（experimental 且實測不由 advanceUntilIdle 驅動）：
             // 以測試 dispatcher 自建 sharing scope，同 scheduler 可虛擬時間推進。
-            CoroutineScope(
-                coroutineContext[kotlin.coroutines.ContinuationInterceptor]
-                    as kotlinx.coroutines.CoroutineDispatcher + SupervisorJob(),
-            ).also { scopes.add(it) },
+            sharingScope,
             SharingStarted.WhileSubscribed(5000),
             VoiceSwitchSnapshot.LOADING,
         )
@@ -507,5 +518,7 @@ class VoiceSwitchStoreTest {
         )
         gapJob.cancel()
         gapJob.join()
+        sharingScope.cancel()
+        advanceUntilIdle()
     }
 }

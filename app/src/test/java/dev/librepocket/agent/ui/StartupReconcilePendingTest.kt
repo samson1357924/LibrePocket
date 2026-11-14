@@ -84,8 +84,17 @@ class StartupReconcilePendingTest {
 
     @After
     fun tearDown() {
-        Dispatchers.resetMain()
         scopes.forEach { it.cancel() }
+        scopes.forEach { scope ->
+            val job = scope.coroutineContext[kotlinx.coroutines.Job]
+            runBlocking {
+                withTimeout(5_000) {
+                    job?.join()
+                }
+            }
+        }
+        Dispatchers.resetMain()
+        scopes.clear()
         tmpDirs.forEach { it.deleteRecursively() }
     }
 

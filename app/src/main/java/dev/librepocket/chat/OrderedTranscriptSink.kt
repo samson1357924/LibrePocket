@@ -10,6 +10,7 @@ import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -425,93 +426,130 @@ class OrderedTranscriptSink(
 
   private val writer: Job = writerScope.launch {
     var lastFailure: Throwable? = null
+    var terminalFailure: Throwable? = null
     try {
-      for (entry in channel) {
-        var failure: Throwable? = null
-        try {
-          if (entry.bestEffort) {
-            withTimeout(BEST_EFFORT_TIMEOUT_MS) { entry.block() }
-          } else {
-            entry.block()
-          }
-        } catch (e: CancellationException) {
-          if (entry.bestEffort && writerScope.isActive) {
-            // Best-effort accounting: swallow cancellation (including the
-            // bounded-timeout cancellation) so a stalled usage write can never
-            // seal the writer or block subsequent durable core writes. Scope
-            // cancellation (shutdown) still propagates below.
-            failure = null
-          } else {
-            // Writer teardown (scope cancel) OR a CE thrown by the delegate
-            // block itself (e.g. an inner withTimeout): remember the failure
-            // so the finally below fails the ack explicitly instead of
-            // reporting a false durable ack, then propagate so the writer ends.
-            // Reach note: every core and non-best-effort notice entry CE
-            // lands in this else; the two best-effort usage notices (onUsage
-            // + flushBufferedUsageBestEffort) land in the swallow branch
-            // above while the scope is active — a self-thrown CE and the
-            // bounded-timeout CE alike; a best-effort entry reaches this
-            // else only at teardown, when writerScope is already inactive.
+      try {
+        for (entry in channel) {
+          var failure: Throwable? = null
+          try {
+            if (entry.bestEffort) {
+              withTimeout(BEST_EFFORT_TIMEOUT_MS) { entry.block() }
+            } else {
+              entry.block()
+            }
+          } catch (e: CancellationException) {
+            if (entry.bestEffort && writerScope.isActive) {
+              // Best-effort accounting: swallow cancellation (including the
+              // bounded-timeout cancellation) so a stalled usage write can never
+              // seal the writer or block subsequent durable core writes. Scope
+              // cancellation (shutdown) still propagates below.
+              failure = null
+            } else {
+              // Writer teardown (scope cancel) OR a CE thrown by the delegate
+              // block itself (e.g. an inner withTimeout): remember the failure
+              // so the finally below fails the ack explicitly instead of
+              // reporting a false durable ack, then propagate so the writer ends.
+              // Reach note: every core and non-best-effort notice entry CE
+              // lands in this else; the two best-effort usage notices (onUsage
+              // + flushBufferedUsageBestEffort) land in the swallow branch
+              // above while the scope is active — a self-thrown CE and the
+              // bounded-timeout CE alike; a best-effort entry reaches this
+              // else only at teardown, when writerScope is already inactive.
+              failure = e
+              throw e
+            }
+          } catch (e: Exception) {
+            // Durable core failure (e.g. store IOException): fail this entry's
+            // ack explicitly; the writer itself stays alive for later entries.
+            // Notice entries carry no ack, so this stays best-effort for them.
             failure = e
-            throw e
-          }
-        } catch (e: Exception) {
-          // Durable core failure (e.g. store IOException): fail this entry's
-          // ack explicitly; the writer itself stays alive for later entries.
-          // Notice entries carry no ack, so this stays best-effort for them.
-          failure = e
-          if (entry.bestEffort) {
-            // Accounting failures are best-effort: do not fail/seal.
-            failure = null
-          }
-        } catch (e: Throwable) {
-          // Fatal Error (e.g. store AssertionError/LinkageError): fail this
-          // entry's ack explicitly instead of reporting a false durable ack,
-          // then propagate so the writer seals like teardown. The Error also
-          // LEAKS to the submitting caller on purpose: the failed ack delivers
-          // it verbatim to whoever is awaiting this entry (type and payload
-          // pinned by OrderedTranscriptSinkErrorTest). Never swallow, and
-          // never continue draining behind a fatal: after the seal the later
-          // cores fail fast instead of pretending durability survived an
-          // invariant break.
-          failure = e
-          if (entry.bestEffort && !(e is VirtualMachineError || e is ThreadDeath)) {
-            // Non-VM fatal in an accounting entry must not seal the writer
-            // or block later core writes; swallow it (best-effort).
-            failure = null
-          } else {
-            throw e
-          }
-        } finally {
-          // Only propagating failures (cancellation / VM-fatal) should become
-          // the seal cause for later outstanding acks; routine durable store
-          // failures keep the writer alive and must not poison the seal cause.
-          if (failure != null && (failure is CancellationException || failure !is Exception)) {
-            lastFailure = failure
-          }
-          val ack = entry.ack
-          if (ack != null) {
-            coreAcks.remove(ack)
-            val outcome = entry.outcome ?: coreOutcomes.remove(ack)
-            if (!ack.isCompleted) {
-              if (failure != null) {
+            if (entry.bestEffort) {
+              // Accounting failures are best-effort: do not fail/seal.
+              failure = null
+            }
+          } catch (e: Throwable) {
+            // Fatal Error (e.g. store AssertionError/LinkageError): fail this
+            // entry's ack explicitly instead of reporting a false durable ack,
+            // then propagate so the writer seals like teardown. The Error also
+            // LEAKS to the submitting caller on purpose: the failed ack delivers
+            // it verbatim to whoever is awaiting this entry (type and payload
+            // pinned by OrderedTranscriptSinkErrorTest). Never swallow, and
+            // never continue draining behind a fatal: after the seal the later
+            // cores fail fast instead of pretending durability survived an
+            // invariant break.
+            failure = e
+            if (entry.bestEffort && !(e is VirtualMachineError || e is ThreadDeath)) {
+              // Non-VM fatal in an accounting entry must not seal the writer
+              // or block later core writes; swallow it (best-effort).
+              failure = null
+            } else {
+              throw e
+            }
+          } finally {
+            // Only propagating failures (cancellation / VM-fatal) should become
+            // the seal cause for later outstanding acks; routine durable store
+            // failures keep the writer alive and must not poison the seal cause.
+            if (failure != null && (failure is CancellationException || failure !is Exception)) {
+              lastFailure = failure
+            }
+            val ack = entry.ack
+            if (ack != null) {
+              coreAcks.remove(ack)
+              val outcome = entry.outcome ?: coreOutcomes.remove(ack)
+              if (!ack.isCompleted) {
+                if (failure != null) {
+                  entry.runId?.let(::markStoreFailure)
+                  outcome?.compareAndSet(null, false)
+                  coreOutcomes.remove(ack)
+                  ack.completeExceptionally(failure)
+                } else {
+                  // D15-2: record the commit BEFORE clearing pending, so a
+                  // host cancelled in the commit→ack window still observes
+                  // COMMITTED via [coreCommitCount]. The intermediate state
+                  // (pending + committed) suppresses via either signal, safe.
+                  // Runs before the test hook below so the hook widens the
+                  // true post-commit window. The pair is committed under
+                  // [submitTruthLock] so [coreSubmitTruth] never observes the
+                  // torn (old count + cleared pending) mix (see its KDoc).
+                  // R23-1: the same section clears a drain-timeout mark for a
+                  // genuinely committed row (never a store failure — see
+                  // [clearTimeoutMarkOnCommit]), so a mark-then-commit race
+                  // converges clean instead of poisoning durability forever.
+                  entry.runId?.let { id ->
+                    synchronized(submitTruthLock) {
+                      commitCounts.computeIfAbsent(id) { AtomicInteger(0) }.incrementAndGet()
+                      pendingCore.remove(id)
+                      clearTimeoutMarkOnCommit(id)
+                    }
+                  }
+                  // D15-2 test seam: widens the commit→ack window for the
+                  // cancel-race grid (null in production). Must not throw;
+                  // a throw here would fail an already-durable ack.
+                  val commitHook = afterCommitBeforeAckForTest
+                  if (commitHook != null && failure == null && entry.runId != null) {
+                    try {
+                      commitHook(entry.runId)
+                    } catch (_: Throwable) {
+                      // Test-only: never fail a durable commit on hook error.
+                    }
+                  }
+                  outcome?.compareAndSet(null, true)
+                  coreOutcomes.remove(ack)
+                  ack.complete(Unit)
+                }
+              } else if (failure != null) {
                 entry.runId?.let(::markStoreFailure)
-                outcome?.compareAndSet(null, false)
-                coreOutcomes.remove(ack)
-                ack.completeExceptionally(failure)
+                (entry.outcome ?: coreOutcomes.remove(ack))?.compareAndSet(null, false)
               } else {
-                // D15-2: record the commit BEFORE clearing pending, so a
-                // host cancelled in the commit→ack window still observes
-                // COMMITTED via [coreCommitCount]. The intermediate state
-                // (pending + committed) suppresses via either signal, safe.
-                // Runs before the test hook below so the hook widens the
-                // true post-commit window. The pair is committed under
-                // [submitTruthLock] so [coreSubmitTruth] never observes the
-                // torn (old count + cleared pending) mix (see its KDoc).
-                // R23-1: the same section clears a drain-timeout mark for a
-                // genuinely committed row (never a store failure — see
-                // [clearTimeoutMarkOnCommit]), so a mark-then-commit race
-                // converges clean instead of poisoning durability forever.
+                // D15-2: the ack was already completed (abandoned waiter) but
+                // the row still committed — record the proof before clearing
+                // pending so a racing cancel handler observes COMMITTED,
+                // never a false NOT_COMMITTED. Same [submitTruthLock] pair as
+                // above: the snapshot below sees either pre- or post-commit,
+                // never the torn mix. Same R23-1 late-commit clear as above:
+                // a drain-timeout mark (whose waiter ack was failed first)
+                // lifts on the proven commit, a store failure never does
+                // (see [clearTimeoutMarkOnCommit]).
                 entry.runId?.let { id ->
                   synchronized(submitTruthLock) {
                     commitCounts.computeIfAbsent(id) { AtomicInteger(0) }.incrementAndGet()
@@ -519,52 +557,25 @@ class OrderedTranscriptSink(
                     clearTimeoutMarkOnCommit(id)
                   }
                 }
-                // D15-2 test seam: widens the commit→ack window for the
-                // cancel-race grid (null in production). Must not throw;
-                // a throw here would fail an already-durable ack.
-                val commitHook = afterCommitBeforeAckForTest
-                if (commitHook != null && failure == null && entry.runId != null) {
-                  try {
-                    commitHook(entry.runId)
-                  } catch (_: Throwable) {
-                    // Test-only: never fail a durable commit on hook error.
-                  }
-                }
-                outcome?.compareAndSet(null, true)
-                coreOutcomes.remove(ack)
-                ack.complete(Unit)
+                (entry.outcome ?: coreOutcomes.remove(ack))?.compareAndSet(null, true)
               }
-            } else if (failure != null) {
-              entry.runId?.let(::markStoreFailure)
-              (entry.outcome ?: coreOutcomes.remove(ack))?.compareAndSet(null, false)
             } else {
-              // D15-2: the ack was already completed (abandoned waiter) but
-              // the row still committed — record the proof before clearing
-              // pending so a racing cancel handler observes COMMITTED,
-              // never a false NOT_COMMITTED. Same [submitTruthLock] pair as
-              // above: the snapshot below sees either pre- or post-commit,
-              // never the torn mix. Same R23-1 late-commit clear as above:
-              // a drain-timeout mark (whose waiter ack was failed first)
-              // lifts on the proven commit, a store failure never does
-              // (see [clearTimeoutMarkOnCommit]).
-              entry.runId?.let { id ->
-                synchronized(submitTruthLock) {
-                  commitCounts.computeIfAbsent(id) { AtomicInteger(0) }.incrementAndGet()
-                  pendingCore.remove(id)
-                  clearTimeoutMarkOnCommit(id)
-                }
-              }
-              (entry.outcome ?: coreOutcomes.remove(ack))?.compareAndSet(null, true)
+              entry.runId?.let { pendingCore.remove(it) }
             }
-          } else {
-            entry.runId?.let { pendingCore.remove(it) }
           }
         }
+      } finally {
+        // Any exit (teardown, fatal, or post-seal drain) seals: no later core
+        // may park unbounded behind a dead writer.
+        sealWriter(lastFailure ?: CancellationException("transcript writer dead"))
       }
-    } finally {
-      // Any exit (teardown, fatal, or post-seal drain) seals: no later core
-      // may park unbounded behind a dead writer.
-      sealWriter(lastFailure ?: CancellationException("transcript writer dead"))
+    } catch (t: Throwable) {
+      // Fatal/terminal writer failures are already delivered to the durable
+      // waiter ack and reflected in seal/interrupted state above. Suppress
+      // uncaught propagation from this internal coroutine so intentional
+      // fail-loud test paths (and rare production fatals) cannot poison
+      // unrelated coroutines-test/runTest collectors or global handlers.
+      terminalFailure = t
     }
   }
 
@@ -1418,7 +1429,10 @@ class OrderedTranscriptSink(
     settle: suspend () -> Unit = {},
   ): Job? {
     if (!shutdownGuard.compareAndSet(false, true)) return null
-    return writerScope.launch {
+    // Keep exceptional completion observable on the returned Job (tests/callers
+    // inspect invokeOnCompletion) without reporting as uncaught to global handlers.
+    val suppressUncaught = CoroutineExceptionHandler { _, _ -> }
+    return writerScope.launch(suppressUncaught) {
       withContext(NonCancellable) {
         try {
           withTimeoutOrNull(drainTimeoutMs) { settle() }

@@ -82,8 +82,19 @@ class StartupReconcileSingleFlightTest {
 
     @After
     fun tearDown() {
-        Dispatchers.resetMain()
+        // Cancel tracked scopes and await completion before resetting Main to avoid
+        // Dispatchers.Main-after-reset leaks (e.g. DataStore/background work).
         scopes.forEach { it.cancel() }
+        scopes.forEach { scope ->
+            val job = scope.coroutineContext[kotlinx.coroutines.Job]
+            runBlocking {
+                withTimeout(5_000) {
+                    job?.join()
+                }
+            }
+        }
+        Dispatchers.resetMain()
+        scopes.clear()
         tmpDirs.forEach { it.deleteRecursively() }
     }
 

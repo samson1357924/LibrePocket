@@ -2929,12 +2929,15 @@ class WebSearchViewModelTest {
 
             val barrier = CyclicBarrier(2)
             val done = CountDownLatch(2)
+            val errors = java.util.concurrent.CopyOnWriteArrayList<Throwable>()
             val a = "https://a.example"
             val b = "https://b.example"
             val t1 = Thread {
                 try {
                     barrier.await(5, TimeUnit.SECONDS)
                     vm.onSearxngUrlChange(a)
+                } catch (t: Throwable) {
+                    errors.add(t)
                 } finally {
                     done.countDown()
                 }
@@ -2943,6 +2946,8 @@ class WebSearchViewModelTest {
                 try {
                     barrier.await(5, TimeUnit.SECONDS)
                     vm.onSearxngUrlChange(b)
+                } catch (t: Throwable) {
+                    errors.add(t)
                 } finally {
                     done.countDown()
                 }
@@ -2952,6 +2957,11 @@ class WebSearchViewModelTest {
             assertTrue(done.await(10, TimeUnit.SECONDS))
             t1.join(1_000)
             t2.join(1_000)
+            if (errors.isNotEmpty()) {
+                val err = AssertionError("worker thread failures: ${errors.size}")
+                errors.forEach { err.addSuppressed(it) }
+                throw err
+            }
 
             advanceUntilIdle()
 

@@ -1281,7 +1281,7 @@ internal object McpWire {
                 c == '\n' -> sb.append("\\n")
                 c == '\r' -> sb.append("\\r")
                 c == '\t' -> sb.append("\\t")
-                c.code < 0x20 -> sb.append("\\u%04x".format(c.code))
+                c.code < 0x20 -> sb.append(String.format(java.util.Locale.ROOT, "\\u%04x", c.code))
                 // Lone surrogate（無伴的 high/low）：OkHttp/okio 在 UTF-8 encode
                 // 時把孤立 surrogate 靜默換成 `?` (0x3F)（**不是** U+FFFD），
                 // 故上線值會與解析值不同——以確定性 \uXXXX 轉義（與 C0 分支
@@ -1294,7 +1294,7 @@ internal object McpWire {
                         sb.append(c).append(raw[i + 1])
                         i++
                     } else {
-                        sb.append("\\u%04x".format(c.code))
+                        sb.append(String.format(java.util.Locale.ROOT, "\\u%04x", c.code))
                     }
                 }
                 else -> sb.append(c)

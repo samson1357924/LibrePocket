@@ -2269,8 +2269,9 @@ class CommittedPinsAbsenceControl(unittest.TestCase):
     The checked-in placeholder (`scripts/release_signer_pins.example.json`) is the only
     permitted pins JSON. Docs (RELEASE.md) forbid committing production pins; this test
     makes that invariant mechanical. Fail-closed if git is unavailable.
-    Executes only when the pr-check.yml policy-harness path filter is true; it does not
-    run on docs-only diffs.
+    Executes when the pr-check.yml policy-harness path filter is true, which now includes
+    any `*signer_pins*` path anywhere in the diff (so a pins-shaped file in any diff runs
+    it), while diffs flipping no filter (e.g. pure docs) still skip it.
     """
 
     def test_no_tracked_production_signer_pins_registry(self) -> None:
@@ -2281,6 +2282,7 @@ class CommittedPinsAbsenceControl(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
+                timeout=30,
             )
         except OSError as exc:
             self.fail(f"pins-absence control requires git to enumerate tracked files: {exc}")

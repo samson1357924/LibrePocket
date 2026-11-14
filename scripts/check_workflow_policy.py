@@ -103,7 +103,7 @@ EXPECTED_WORKFLOW_SHA256 = {
         "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564"
     ),
     "pr-check.yml": (
-        "b3a34f2e6af595e5d9b9dcfefa2a6f8b4792b488a9263ae35c66298935683bc2"
+        "0f03b1445b19441aa5134caa29cb10dc658c4e9ceb26f5f84c589d3de500e59b"
     ),
     "release.yml": (
         "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f"
@@ -265,6 +265,10 @@ EXPECTED_POLICY_FILTER_PATHS = frozenset(
         "scripts/check_workflow_policy.py",
         "scripts/tests/test_workflow_policy.py",
         "scripts/check_python_shadowing.sh",
+        # Any signer-pins-shaped path (root-level or nested) must flip
+        # policy=true so the never-committed tripwire runs (Issue #12).
+        "*signer_pins*",
+        "**/*signer_pins*",
         ".github/workflows/pr-check.yml",
         ".github/workflows/codeql.yml",
         ".github/workflows/nightly-instrumented.yml",

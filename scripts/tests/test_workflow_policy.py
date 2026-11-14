@@ -1808,6 +1808,16 @@ jobs:
         )
         self._assert_rejected("policy filter is missing: .github/workflows/**")
 
+    def test_policy_filter_requires_signer_pins_paths(self) -> None:
+        for pattern in ("*signer_pins*", "**/*signer_pins*"):
+            with self.subTest(pattern=pattern):
+                self._reset_workflows()
+                self._write(
+                    "pr-check.yml",
+                    self._remove_filter_pattern("policy", pattern),
+                )
+                self._assert_rejected(f"policy filter is missing: {pattern}")
+
     def _remove_filter_pattern(self, filter_name: str, pattern: str) -> str:
         markers = {
             "code": ("            code:\n", "            policy:\n"),

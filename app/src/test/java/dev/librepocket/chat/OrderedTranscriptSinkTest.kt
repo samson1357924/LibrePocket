@@ -991,6 +991,80 @@ class OrderedTranscriptSinkTest {
     }
   }
 
+  @Test fun terminalVmFatalDedupe_usesStrictIdentity_notEquals() {
+    class EqualOome(msg: String) : OutOfMemoryError(msg) {
+      override fun equals(other: Any?): Boolean = other is EqualOome
+      override fun hashCode(): Int = 1
+    }
+
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val entered = CompletableDeferred<Unit>()
+      val release = CompletableDeferred<Unit>()
+      val release2 = CompletableDeferred<Unit>()
+      val reports = java.util.Collections.synchronizedList(mutableListOf<Throwable>())
+      val t1 = EqualOome("same-equals")
+      val t2 = EqualOome("same-equals")
+      val toggle = AtomicInteger(0)
+      val delegate = object : SinkProbe() {
+        override suspend fun onTurnStarted(runId: String, text: String) {
+          val n = toggle.incrementAndGet()
+          entered.complete(Unit)
+          if (n == 1) {
+            release.await()
+            throw t1
+          } else {
+            release2.await()
+            throw t2
+          }
+        }
+      }
+      val sink = OrderedTranscriptSink(
+        delegate = delegate,
+        dispatcher = dispatcher,
+        capacity = 8,
+        terminalFatalReporter = { t -> reports.add(t) },
+      )
+      runBlocking {
+        try {
+          // First distinct instance.
+          val first = async { runCatching { sink.onTurnStarted("r1", "hi") } }
+          entered.await()
+          release.complete(Unit)
+          withTimeout(10_000) {
+            first.await()
+            withTimeout(5_000) { while (!sink.isSealed()) delay(10) }
+          }
+          assertEquals("distinct equal-by-equals instances must both be reportable; first failed", 1, reports.size)
+
+          // Second distinct instance reported through shutdown-settle path.
+          val job = checkNotNull(
+            sink.shutdown(drainTimeoutMs = 200L, settle = { throw t2 }),
+          ) { "shutdown must return job" }
+          val causeSignal = CompletableDeferred<Throwable?>()
+          job.invokeOnCompletion { causeSignal.complete(it) }
+          val cause = causeSignal.await()
+          assertTrue("shutdown should propagate a VM fatal, got $cause", cause is OutOfMemoryError)
+          assertEquals("distinct instances with overridden equals must both be reported", 2, reports.size)
+          assertTrue("writer instance must be reported", reports.any { it === t1 })
+          assertTrue(
+            "shutdown instance must be reported as a distinct instance",
+            reports.any { it !== t1 && it is OutOfMemoryError && it.message == t2.message },
+          )
+
+          // Same instance again must not duplicate.
+          // (re-report path not directly invokable; covered by existing exactly-once tests)
+        } finally {
+          release.complete(Unit)
+          release2.complete(Unit)
+        }
+      }
+    } finally {
+      exec.shutdown()
+    }
+  }
+
   @Test fun bestEffortVmFatalStillSeals() {
     val exec = Executors.newSingleThreadExecutor()
     try {

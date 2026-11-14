@@ -114,12 +114,20 @@ class OrderedTranscriptSink(
 
   private val writerScope = CoroutineScope(SupervisorJob() + dispatcher)
   private val channel = kotlinx.coroutines.channels.Channel<Entry>(capacity)
-  /** Terminal fatals already reported (identity). Same instance reported once; distinct instances remain observable. */
-  private val reportedTerminalFatals = java.util.Collections.newSetFromMap(ConcurrentHashMap<Throwable, Boolean>())
+
+  private class TerminalFatalIdentityKey(val ref: Throwable) {
+    override fun equals(other: Any?): Boolean =
+      other is TerminalFatalIdentityKey && other.ref === this.ref
+
+    override fun hashCode(): Int = System.identityHashCode(ref)
+  }
+
+  /** Terminal fatals already reported (strict identity). Same instance once; distinct instances observable. */
+  private val reportedTerminalFatals = java.util.concurrent.ConcurrentHashMap.newKeySet<TerminalFatalIdentityKey>()
 
   private fun reportTerminalFatal(t: Throwable) {
     if (t !is VirtualMachineError && t !is ThreadDeath) return
-    if (reportedTerminalFatals.add(t)) {
+    if (reportedTerminalFatals.add(TerminalFatalIdentityKey(t))) {
       runCatching { terminalFatalReporter(t) }
     }
   }

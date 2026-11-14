@@ -36,6 +36,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.test.core.app.ApplicationProvider
 import dev.librepocket.agent.ui.chat.ChatScreen
+import dev.librepocket.agent.assistant.VoiceHandoffProvider
 import dev.librepocket.agent.ui.chat.ChatSessionFactory
 import dev.librepocket.agent.ui.chat.ChatViewModel
 import dev.librepocket.agent.ui.chat.VaultSource
@@ -106,6 +107,7 @@ class MainScreenAssistVoiceRoutingTest {
     @Before
     fun setUp() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
+        VoiceHandoffProvider.resetForTest()
         registerRecognitionService()
     }
 
@@ -120,6 +122,7 @@ class MainScreenAssistVoiceRoutingTest {
                 try {
                     tmpDirs.forEach { it.deleteRecursively() }
                 } finally {
+                    VoiceHandoffProvider.resetForTest()
                     Dispatchers.resetMain()
                 }
             }
@@ -317,6 +320,7 @@ class MainScreenAssistVoiceRoutingTest {
                             onVoiceRetriggerConsumed = {
                                 retriggerConsumedCount++
                                 pendingRetriggerToken.value = 0L
+                                true
                             },
                             voiceSwitchesLoaded = loaded,
                             voiceSwitchLoadFailed = loadFailed,

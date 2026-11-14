@@ -203,10 +203,11 @@ fun MainScreen(
         onAssistVoiceConsumed = onAssistVoiceConsumed,
     )
 
-    // Trusted in-process retrigger handoff from active voice session (F1): deliver only under
+    // Trusted cross-process retrigger handoff from active voice session (F1): deliver only under
     // the same chat-safe boundary as initial voice delivery.
-    val pendingVoiceRetriggerToken by AssistantVoiceHandoff.token.collectAsStateWithLifecycle()
-    val deliverVoiceRetrigger = pendingVoiceRetriggerToken != 0L &&
+    val pendingVoiceRetrigger by AssistantVoiceHandoff.pendingFlow().collectAsStateWithLifecycle(initialValue = null)
+    val pendingVoiceRetriggerToken = pendingVoiceRetrigger?.token ?: 0L
+    val deliverVoiceRetrigger = pendingVoiceRetrigger != null &&
         currentRoute == Routes.CHAT &&
         hasEndpoint &&
         !navLoading &&
@@ -287,7 +288,15 @@ fun MainScreen(
                 ),
                 onVoiceInputConsumed = onAssistVoiceConsumed,
                 voiceRetriggerToken = voiceRetriggerToken,
-                onVoiceRetriggerConsumed = { AssistantVoiceHandoff.consume(it) },
+                onVoiceRetriggerConsumed = { token ->
+                    val p = pendingVoiceRetrigger?.takeIf { it.token == token }
+                    AssistantVoiceHandoff.consume(
+                        token = token,
+                        context = app,
+                        targetTaskId = p?.targetTaskId ?: Int.MIN_VALUE,
+                        sessionInstanceId = p?.sessionInstanceId ?: Long.MIN_VALUE,
+                    )
+                },
                 voiceSwitchesLoaded = voiceEffectiveSnapshot.loaded || voiceEffectiveSnapshot.loadFailed,
                 userSwitches = voiceUiSwitches,
                 voiceSwitchLoadFailed = voiceEffectiveSnapshot.loadFailed,

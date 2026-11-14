@@ -118,11 +118,12 @@ fun ChatScreen(
     // 預設空 map 即全預設值（voice_input/voice_output 預設開，僅預覽用）。
     // mic 鈕與朗讀鈕按此顯隱。
     userSwitches: Map<String, Boolean> = emptyMap(),
-    // C2 active voice task retrigger handoff（trusted, process-local token）。When a later
+    // C2 active voice task retrigger handoff（trusted, cross-process token）。When a later
     // assistant gesture is accepted for an already-active voice task, UI consumes the token once
-    // and relaunches system STT under the same delivery/switch gates.
+    // and relaunches system STT under the same delivery/switch gates. Consume must succeed to
+    // preserve once-only/cancellation semantics.
     voiceRetriggerToken: Long = 0L,
-    onVoiceRetriggerConsumed: (Long) -> Unit = {},
+    onVoiceRetriggerConsumed: (Long) -> Boolean = { false },
     // R4-2：設定讀取失敗旗（真相源讀錯時 true）：此時 userSwitches 已為全關
     //（入口隱藏、VoiceSpeaker 未建構），另在此顯示一行讀取問題提示（沿用下方
     // 錯誤區既有樣式，不新增設計語言）。
@@ -379,12 +380,13 @@ fun ChatScreen(
         }
     }
     // C2 retrigger：同一 trusted voice task 已存在且 session 接受新的真實 onShow 時，
-    // 以 process-local handoff token 一次性重啟 STT（不建立新 voice task、不自動送出）。
-    // 僅在 switches 狀態已落定時消費，避免 loading/未知狀態誤觸發或重放。
+    // 以跨 process handoff token 一次性重啟 STT（不建立新 voice task、不自動送出）。
+    // 僅在 switches 狀態已落定且 consume 成功時啟動，避免誤觸發/重放/競態。
     LaunchedEffect(voiceRetriggerToken, voiceSwitchesLoaded) {
         if (voiceRetriggerToken != 0L && voiceSwitchesLoaded) {
-            onVoiceRetriggerConsumed(voiceRetriggerToken)
-            launchSystemStt()
+            if (onVoiceRetriggerConsumed(voiceRetriggerToken)) {
+                launchSystemStt()
+            }
         }
     }
 

@@ -608,8 +608,9 @@ object ShellExecutables {
             }
             // 不存在的搜尋目錄無法提供/遮蔽可執行檔：跳過且不列入 taint（避免
             // host/CI 上不存在的 Android 系統目錄因路徑語義觸發防禦性拒絕，
-            // 同時不改變真實存在目錄的 Stage1-5 防護）。
-            if (!Files.exists(Paths.get(dirNorm), LinkOption.NOFOLLOW_LINKS)) {
+            // 同時不改變真實存在目錄的 Stage1-5 防護）。對懸空 symlink 亦視為
+            // 不可用（跟隨連結不存在），避免 real 化失敗被誤判為不可信。
+            if (!Files.exists(Paths.get(dirNorm))) {
                 continue
             }
             if (isSearchDirUntrusted(dirNorm, isWritable)) {

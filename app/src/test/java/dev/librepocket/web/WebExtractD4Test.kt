@@ -9,7 +9,9 @@ import dev.librepocket.tool.Flavor
 import dev.librepocket.tool.ProjectionContext
 import dev.librepocket.tool.ToolRegistry
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.net.InetAddress
+import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.GZIPOutputStream
@@ -53,14 +55,27 @@ class WebExtractD4Test {
     private fun html(title: String = "Hello", body: String = "World content here"): String =
         """<html><head><title>$title</title></head><body><p>$body</p></body></html>"""
 
+    /**
+     * Fake transport：捕捉 urls／pinnedAddresses／maxBytes（test-side only；
+     * pin 建連釘住與 raw-read 上限透傳契約用）。
+     */
     private class FakeExtract(
         val handler: suspend (url: String) -> WebExtractRawResponse,
     ) : WebExtractHttpGet {
         val urls = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val pinnedAddressesSeen = java.util.Collections.synchronizedList(mutableListOf<List<InetAddress>>())
+        val maxBytesSeen = java.util.Collections.synchronizedList(mutableListOf<Int>())
         val calls = AtomicInteger(0)
-        override suspend fun get(url: String, headers: Map<String, String>): WebExtractRawResponse {
+        override suspend fun get(
+            url: String,
+            headers: Map<String, String>,
+            pinnedAddresses: List<InetAddress>,
+            maxBytes: Int,
+        ): WebExtractRawResponse {
             urls.add(url)
             calls.incrementAndGet()
+            pinnedAddressesSeen.add(pinnedAddresses)
+            maxBytesSeen.add(maxBytes)
             return handler(url)
         }
     }

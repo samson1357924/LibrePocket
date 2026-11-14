@@ -1,47 +1,87 @@
 package dev.librepocket.web
 
+import java.text.Normalizer
+
 /**
  * D4 外部不可信內容 envelope（#138 D4；純 JVM，不接線）。
  *
  * - 模型可見的外部抓取內容一律包一層 [BEGIN]／[END]，呼叫方不得直接把原始
  *   HTML／文字送模型。
  * - 防偽造：[wrap] 前先以 [stripForgedMarkers] 剝除內容內已有的 marker
- *   字串（大小寫敏感、精確匹配），再包一層，保證輸出恰含一組 marker。
- * - 清理：[sanitize] 移除所有 `Character.FORMAT`（Cf）碼點，涵蓋 bidi
+ *   字串；剝除為大小寫不敏感（sentinel marker 為 ASCII，任何大小寫變體不得
+ *   存活進模型可見體），且 [cleanField] 之每輪先以 NFKC 摺疊（fullwidth／
+ *   small-form 相似字摺為 ASCII）、再剝 marker（大小寫不敏感）再清理，令相似字亦無法躲過。
+ *   再包一層，保證輸出恰含一組 marker。
+ * - 清理：[sanitize] 移除所有 `Character.FORMAT`（Cf）碼點，並移除除
+ *   `\n`（U+000A）與 `\t`（U+0009）外之所有 `Character.CONTROL`（Cc）碼點
+ *   （ESC／BEL／DEL／C1 如 U+0085 NEL 等一律剔除），涵蓋 bidi
  *   控制（U+061C／U+200E／U+200F／U+202A–U+202E／U+2066–U+2069）與零寬／
  *   Cf（U+200B–U+200D／U+2060／U+FEFF／U+00AD／U+180E／U+2061–U+2064／
- *   U+206A–U+206F／U+FFF9–U+FFFB／tags U+E0000–U+E007F 等）；
- *   Cc／換行（`\n`／`\t`）保留，不影響版式。
+ *   U+206A–U+206F／U+FFF9–U+FFFB／tags U+E0000–U+E007F 等）；此外亦精確
+ *   剔除下列非 Cf 但有混淆／隱匿風險之碼點（見 [EXTRA_STRIP]）：
+ *   U+034F（CGJ）、U+115F／U+1160（Hangul fillers）、U+3164（Hangul filler）、
+ *   U+FFA0（halfwidth Hangul filler）、U+2028／U+2029（line／paragraph separator）。
  * - 按補充平面碼點迭代（[Character.charCount]），不切斷 surrogate pair。
+ * - [cleanField] 為 `nfkc → strip → sanitize` 迭代至精確定點（無輪數上限）：
+ *   nfkc 先摺 fullwidth／small-form marker 相似字為 ASCII，剝除 marker
+ *   （大小寫不敏感）再清理（去 Cf／Cc／EXTRA_STRIP），反覆至不動點。
+ *   終止性：nfkc 冪等（純正規化輪不會連續出現）；之後每一輪皆為
+ *   「返回不動點、刪除至少一碼點、或長度不變的 nfkc 正規化」三者之一，
+ *   刪除輪次數以輸入長度為上界，故必於有限輪內收斂（最壞 O(n²)；
+ *   病態深層嵌套 marker 的放大風險見 WebExtract KDoc 追蹤項）。
+ * - [wrap] 之輸出形狀為 `BEGIN + "\n" + cleaned + "\n" + END`，不因輸入而變；
+ *   語義僅輸出本體內容變化。
  */
 object WebContentEnvelope {
     const val BEGIN = "<<<EXTERNAL_UNTRUSTED_CONTENT>>>"
     const val END = "<<<END_EXTERNAL_UNTRUSTED_CONTENT>>>"
 
-    /** 剝除內容內偽造的 marker（[BEGIN]／[END] 精確子串全刪）。 */
+    /** 大小寫不敏感之 marker 匹配式（sentinel marker 為 ASCII）。 */
+    private val BEGIN_CI = Regex("(?i)" + Regex.escape(BEGIN))
+    private val END_CI = Regex("(?i)" + Regex.escape(END))
+
+    /**
+     * 剝除內容內偽造的 marker（[BEGIN]／[END]；大小寫不敏感全刪）。
+     *
+     * 剝除為大小寫不敏感：sentinel marker 皆為 ASCII，任何大小寫變體不得
+     * 存活進模型可見體；本函式通常於 [cleanField] 之 NFKC 摺疊之後執行，
+     * 兼容性（compatibility）相似字（fullwidth／small-form 等）已被摺為 ASCII。
+     */
     fun stripForgedMarkers(text: String): String {
         if (text.isEmpty()) return text
-        var s = text
-        if (BEGIN in s) s = s.replace(BEGIN, "")
-        if (END in s) s = s.replace(END, "")
-        return s
+        return END_CI.replace(BEGIN_CI.replace(text, ""), "")
     }
 
     /**
-     * 定點清理：`sanitize(strip(sanitize(strip(x))))`。
+     * 定點清理：`nfkc → stripForgedMarkers → sanitize` 迭代至精確定點（無輪數上限）。
      *
-     * Cf 混淆第二通道：攻擊者可在 marker 內插入 Cf（如 `EXTERNAL\u200B_UNTRUSTED`），
-     * 單次 `strip→sanitize` 會先因混淆比對失敗、再經 `sanitize` 去 Cf 後露出完整
-     * marker 而漏網；雙輪（剝→清→剝→清）達定點，保證混淆 marker 亦剝除。
+     * Cf／兼容性混淆第二通道：攻擊者可在 marker 內插入 Cf（如 `EXTERNAL\u200B_UNTRUSTED`）
+     * 或以 fullwidth／small-form 等兼容相似字構造 marker；單輪不足以收束——
+     * NFKC 先摺相似字為 ASCII，剝除 marker（大小寫不敏感），再清理（去 Cf／Cc／EXTRA_STRIP），
+     * 反覆至不動點即返回。終止性：[Normalizer.Form.NFKC] 冪等（純正規化輪不會連續出現）；
+     * 每一輪輸出為「返回不動點、刪除至少一碼點、或長度不變的 nfkc 正規化」三者之一，
+     * 刪除輪次數以輸入長度為上界，故必於有限輪內收斂（最壞 O(n²)）。
+     * 注意：`strip` 非冪等（END 先剝、後剝 BEGIN 可能「造」出 END），由外層迭代吸收；
+     * NFKC 摺疊僅施用於此處；parseHtml／entity unescape 不做 NFKC。
      */
-    fun cleanField(text: String): String =
-        sanitize(stripForgedMarkers(sanitize(stripForgedMarkers(text))))
+    fun cleanField(text: String): String {
+        var s = text
+        while (true) {
+            val next = sanitize(stripForgedMarkers(Normalizer.normalize(s, Normalizer.Form.NFKC)))
+            if (next == s) return next
+            s = next
+        }
+    }
 
     /**
-     * 移除 Cf（FORMAT）碼點；永不拋異常。
+     * 移除 Cf（FORMAT）碼點、除 `\n`（U+000A）與 `\t`（U+0009）外之所有
+     * Cc（CONTROL）碼點，以及 [EXTRA_STRIP] 中之精確碼點；永不拋異常。
      *
      * 以碼點迭代，補充平面 tags 等亦按整點判定；孤立 surrogate（
      * `getType` 回 SURROGATE）保留，交由上層 replacement 解碼處理。
+     * 注意：`\n`／`\t`（Cc）保留；其餘 Cc（ESC／BEL／DEL／C1 含 U+0085 NEL
+     * 等）一律移除，不進模型可見體；U+2028／U+2029 非 Cc 且明列於
+     * [EXTRA_STRIP]，亦會被移除（換行語義以 `\n` 表示）。
      */
     fun sanitize(text: String): String {
         if (text.isEmpty()) return text
@@ -50,7 +90,11 @@ object WebContentEnvelope {
         while (i < text.length) {
             val cp = text.codePointAt(i)
             val type = Character.getType(cp)
-            if (type != Character.FORMAT.toInt()) {
+            val isControl = type == Character.CONTROL.toInt()
+            if (type != Character.FORMAT.toInt() &&
+                !(isControl && cp != 0x0A && cp != 0x09) &&
+                cp !in EXTRA_STRIP
+            ) {
                 sb.appendCodePoint(cp)
             }
             i += Character.charCount(cp)
@@ -59,10 +103,19 @@ object WebContentEnvelope {
     }
 
     /**
-     * 先剝偽造 marker、再做 Cf 清理、最後包一層（定點版，見 [cleanField]）。
+     * 非 Cf、但有混淆／隱匿風險而明確剝除之碼點：
+     * U+034F（CGJ，combining grapheme joiner）、
+     * U+115F／U+1160／U+3164／U+FFA0（Hangul fillers）、
+     * U+2028／U+2029（line／paragraph separators）。
+     */
+    private val EXTRA_STRIP = setOf(0x034F, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x2028, 0x2029)
+
+    /**
+     * 先以 [cleanField] 定點處理（NFKC＋sanitize＋剝偽造 marker）、
+     * 最後包一層。
      *
      * 輸出形狀：`BEGIN + "\n" + cleaned + "\n" + END`，恰含一組 marker；
-     * 輸入 qualquer（含偽造 marker／bidi）皆 fail-closed 為單層乾淨 envelope。
+     * 輸入內容無論為何（含偽造 marker／bidi）皆 fail-closed 為單層乾淨 envelope。
      */
     fun wrap(raw: String): String {
         val cleaned = cleanField(raw)

@@ -799,6 +799,7 @@ object ToolRegistry {
     )
     // S4-ANCHOR-END
 
+    // D4-ANCHOR-BEGIN
     // #138 D4 web.extract (registry shape only; not wired, not executable).
     // Owned by D4 workstream; other workstreams append elsewhere.
     // - Tool name `web.extract` (dot form, local extract; distinct from
@@ -827,6 +828,7 @@ object ToolRegistry {
             ),
         ),
     )
+    // D4-ANCHOR-END
 
     // S1-B: ALL covers FAST + SLOW + S1B + S1A + VOICE + LINUX + WEB_EXTRACT (D4 appends WEB_EXTRACT; S1-A appends S1A; S1-C extended FAST; S2 appends VOICE; S4 appends LINUX).
     val ALL: List<ToolDef> = FAST_TOOLS + SLOW_TOOLS + S1B_TOOLS + S1A_TOOLS + VOICE_TOOLS + LINUX_TOOLS + WEB_EXTRACT_TOOLS

@@ -84,6 +84,17 @@ class ElevatedRunnerPhaseHTest {
 
     private fun totalOver(): List<String> = List(20) { "y".repeat(4000) }
 
+    private var hermeticExec: HermeticExecFixture? = null
+
+    @org.junit.Before fun setUpExec() {
+        hermeticExec = HermeticExecFixture("phaseh-hermetic", "id", "a", "x", "y")
+    }
+
+    @org.junit.After fun tearDownExec() {
+        hermeticExec?.close()
+        hermeticExec = null
+    }
+
     private fun rootRunner(spawns: AtomicInteger) = RootSuRunner(
         privateRoot = privateRoot,
         bridgeGranted = GrantFixtures.bridgeOn,
@@ -94,6 +105,9 @@ class ElevatedRunnerPhaseHTest {
         },
         suBinary = "/system/bin/su",
         grantCheck = GrantFixtures.allowAlways,
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     private fun shizukuRunner(spawns: AtomicInteger) = ShizukuShellRunner(
@@ -107,6 +121,9 @@ class ElevatedRunnerPhaseHTest {
         },
         status = { ShizukuStatus.Available(15) },
         grantCheck = GrantFixtures.allowAlways,
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     // ---- P2-6：阻塞 iterator 有界 fail-closed（雙 runner） ----

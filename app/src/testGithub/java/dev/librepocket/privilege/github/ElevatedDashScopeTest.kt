@@ -28,7 +28,10 @@ class ElevatedDashScopeTest {
 
     private fun tempDir(prefix: String): File = Files.createTempDirectory(prefix).toFile().canonicalFile
 
+    private var hermeticExec: HermeticExecFixture? = null
+
     @Before fun setUpBreakerIsolation() {
+        hermeticExec = HermeticExecFixture("dash-scope", "cat", "grep", "toybox", "find", "du", "ls")
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollTo(0, 10_000L)
@@ -38,6 +41,8 @@ class ElevatedDashScopeTest {
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollTo(0, 10_000L)
+        hermeticExec?.close()
+        hermeticExec = null
     }
 
     private fun pollTo(expected: Int, boundMs: Long) {
@@ -75,7 +80,10 @@ class ElevatedDashScopeTest {
         suBinary = "/system/bin/su",
         suExists = { true },
         grantCheck = GrantFixtures.allowAlways,
-    )
+        execSearchDirs = hermeticExec!!.searchDirs,
+    execAllowedRoots = hermeticExec!!.allowedRoots,
+    execIsWritable = hermeticExec!!.systemOwned,
+)
 
     private fun makeShizuku(scope: File, spawn: SpawnCounter): ShizukuShellRunner = ShizukuShellRunner(
         privateRoot = scope.absolutePath,
@@ -86,7 +94,10 @@ class ElevatedDashScopeTest {
         spawn = spawn::spawn,
         status = { ShizukuStatus.Available(15) },
         grantCheck = GrantFixtures.allowAlways,
-    )
+        execSearchDirs = hermeticExec!!.searchDirs,
+    execAllowedRoots = hermeticExec!!.allowedRoots,
+    execIsWritable = hermeticExec!!.systemOwned,
+)
 
     private fun dashVectors(scope: File): List<Pair<List<String>, String>> {
         // P3 hygiene: trailing incidental must be in-scope ABSOLUTE legal, so a

@@ -28,12 +28,15 @@ class ElevatedRunnerP1FixTest {
 
     private val privateRoot = "/data/data/files"
 
+    private var hermeticExec: HermeticExecFixture? = null
+
     /**
      * 終審殘留隔離（Phase 1 P1-1）：每用例首尾歸零 consecutive＋輪詢收斂
      * outstanding/active，避免同 JVM 內熔斷污染後測。
      * （測試隔離重置，非#136-B3修復；不升級 noteClean 可見性。）
      */
     @Before fun setUpBreakerIsolation() {
+        hermeticExec = HermeticExecFixture("p1fix-hermetic", "id")
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -41,6 +44,8 @@ class ElevatedRunnerP1FixTest {
     }
 
     @After fun tearDownBreakerIsolation() {
+        hermeticExec?.close()
+        hermeticExec = null
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -93,7 +98,10 @@ class ElevatedRunnerP1FixTest {
         spawn = spawn,
         suBinary = "/system/bin/su",
         grantCheck = GrantFixtures.allowAlways,
-    )
+        execSearchDirs = hermeticExec!!.searchDirs,
+    execAllowedRoots = hermeticExec!!.allowedRoots,
+    execIsWritable = hermeticExec!!.systemOwned,
+)
 
     // ---- P1-1: ghost race ----
 
@@ -625,7 +633,10 @@ class ElevatedRunnerP1FixTest {
                     spawn = { FakeProcess("ok".toByteArray()) },
                     suBinary = "/system/bin/su",
                     grantCheck = GrantFixtures.invalid("nope"),
-                ).runBinary(ElevatedRequest(listOf("id"), "LEAK"), 1_000L)
+                                execSearchDirs = hermeticExec!!.searchDirs,
+                execAllowedRoots = hermeticExec!!.allowedRoots,
+                execIsWritable = hermeticExec!!.systemOwned,
+).runBinary(ElevatedRequest(listOf("id"), "LEAK"), 1_000L)
             }
             // grant 抛。
             assertNoLeak("grantThrow") {
@@ -636,7 +647,10 @@ class ElevatedRunnerP1FixTest {
                     spawn = { FakeProcess("ok".toByteArray()) },
                     suBinary = "/system/bin/su",
                     grantCheck = { throw RuntimeException("boom") },
-                ).runBinary(ElevatedRequest(listOf("id"), "LEAK"), 1_000L)
+                                execSearchDirs = hermeticExec!!.searchDirs,
+                execAllowedRoots = hermeticExec!!.allowedRoots,
+                execIsWritable = hermeticExec!!.systemOwned,
+).runBinary(ElevatedRequest(listOf("id"), "LEAK"), 1_000L)
             }
             // activation off。
             assertNoLeak("activationOff") {
@@ -647,7 +661,10 @@ class ElevatedRunnerP1FixTest {
                     spawn = { FakeProcess("ok".toByteArray()) },
                     suBinary = "/system/bin/su",
                     grantCheck = GrantFixtures.allowAlways,
-                ).runBinary(ElevatedRequest(listOf("id"), "LEAK"), 1_000L)
+                                execSearchDirs = hermeticExec!!.searchDirs,
+                execAllowedRoots = hermeticExec!!.allowedRoots,
+                execIsWritable = hermeticExec!!.systemOwned,
+).runBinary(ElevatedRequest(listOf("id"), "LEAK"), 1_000L)
             }
             // bridge off。
             assertNoLeak("bridgeOff") {
@@ -658,7 +675,10 @@ class ElevatedRunnerP1FixTest {
                     spawn = { FakeProcess("ok".toByteArray()) },
                     suBinary = "/system/bin/su",
                     grantCheck = GrantFixtures.allowAlways,
-                ).runBinary(ElevatedRequest(listOf("id"), "LEAK"), 1_000L)
+                                execSearchDirs = hermeticExec!!.searchDirs,
+                execAllowedRoots = hermeticExec!!.allowedRoots,
+                execIsWritable = hermeticExec!!.systemOwned,
+).runBinary(ElevatedRequest(listOf("id"), "LEAK"), 1_000L)
             }
             // quota 耗盡（先佔滿配額，runner 准入成功後配額拒，finally 釋放）。
             val tightQuota = ShellQuota(maxCalls = 1)
@@ -670,7 +690,10 @@ class ElevatedRunnerP1FixTest {
                 spawn = { FakeProcess("ok".toByteArray()) },
                 suBinary = "/system/bin/su",
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
             val first = qRunner.runBinary(ElevatedRequest(listOf("id"), "LEAK"), 1_000L)
             assertTrue("$first", first is ElevatedBinaryResult.Ok)
             assertEquals(0, ElevatedCleanupTracker.activeCalls())

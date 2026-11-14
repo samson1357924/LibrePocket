@@ -98,8 +98,8 @@ internal class SpawnCounter(
  * Hermetic 可信 executable fixture（Round-2 Phase A，P1-1 CI 30 綠）：
  * 暫存目錄＋假 executable＋`systemOwned`（全不可寫，模擬裝置系統目錄），
  * 供 runner `execSearchDirs`／`execAllowedRoots`／`execIsWritable` 顯式注入。
- * 不碰宿主系統目錄、不讀宿主 `PATH`／cwd、不依賴 `File("/system/bin")` 合成回退；
- * 顯式搜尋表永不回退，`resolveForSnapshot` fail-closed 語義一字不動（生產門零變更）。
+ * 不碰宿主系統目錄、不讀宿主 `PATH`／cwd；`resolveForSnapshot` 為 fail-closed
+ * 實體驗證（無宿主代理合成回退），JVM 測試需透過本類 seams 提供已驗證目標。
  *
  * 用法：`@Before` 建（具名所需 binary），`@After` 關；runner 構造時傳
  * `execSearchDirs = fixture.searchDirs`、

@@ -229,7 +229,10 @@ class ElevatedRunnerB4Test {
             },
             status = { ShizukuStatus.Available(15) },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "B4-T"), 2_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Failed)
         assertTrue((b as ElevatedBinaryResult.Failed).message.contains("spawn failed"))
@@ -343,7 +346,10 @@ class ElevatedRunnerB4Test {
                 false
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val r = runner.run(ElevatedRequest(listOf("id"), "B4-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Ok)
         assertEquals(1, spawns)

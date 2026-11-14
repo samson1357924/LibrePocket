@@ -40,8 +40,10 @@ import org.junit.Test
 class ElevatedRunnerPhaseGTest {
 
     private val privateRoot = "/data/data/files"
+    private var hermeticExec: HermeticExecFixture? = null
 
     @Before fun setUpIsolation() {
+        hermeticExec = HermeticExecFixture("phaseg-hermetic", "id")
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -55,6 +57,8 @@ class ElevatedRunnerPhaseGTest {
         pollActiveTo(0)
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
+        hermeticExec?.close()
+        hermeticExec = null
     }
 
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 15_000L) {
@@ -343,6 +347,9 @@ class ElevatedRunnerPhaseGTest {
                 },
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
+                execSearchDirs = hermeticExec!!.searchDirs,
+                execAllowedRoots = hermeticExec!!.allowedRoots,
+                execIsWritable = hermeticExec!!.systemOwned,
             )
         }
     }
@@ -366,6 +373,9 @@ class ElevatedRunnerPhaseGTest {
                 },
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
+                execSearchDirs = hermeticExec!!.searchDirs,
+                execAllowedRoots = hermeticExec!!.allowedRoots,
+                execIsWritable = hermeticExec!!.systemOwned,
             )
         }
     }
@@ -420,7 +430,10 @@ class ElevatedRunnerPhaseGTest {
                 suBinary = "/system/bin/su",
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -438,7 +451,10 @@ class ElevatedRunnerPhaseGTest {
                 status = { ShizukuStatus.Available(15) },
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -493,7 +509,10 @@ class ElevatedRunnerPhaseGTest {
                 suBinary = "/system/bin/su",
                 isCancelled = isCancelled,
                 grantCheck = grantCheck,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -511,7 +530,10 @@ class ElevatedRunnerPhaseGTest {
                 status = { ShizukuStatus.Available(15) },
                 isCancelled = isCancelled,
                 grantCheck = grantCheck,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -533,7 +555,10 @@ class ElevatedRunnerPhaseGTest {
             },
             isCancelled = { false },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         try {
             val resultRef = AtomicReference<ElevatedBinaryResult?>()
             val bg = Thread {
@@ -577,7 +602,10 @@ class ElevatedRunnerPhaseGTest {
             },
             isCancelled = { false },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         try {
             val resultRef = AtomicReference<ElevatedBinaryResult?>()
             val bg = Thread {

@@ -36,7 +36,10 @@ class ElevatedRunnerPhaseBLateCompensationTest {
 
     private val privateRoot = "/data/data/files"
 
+    private var hermeticExec: HermeticExecFixture? = null
+
     @Before fun setUpIsolation() {
+        hermeticExec = HermeticExecFixture("phaseb-hermetic", "id")
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -45,6 +48,8 @@ class ElevatedRunnerPhaseBLateCompensationTest {
     }
 
     @After fun tearDownIsolation() {
+        hermeticExec?.close()
+        hermeticExec = null
         repeat(8) { ElevatedCleanupTracker.releaseSlot() }
         repeat(8) { ElevatedCleanupTracker.leaveCall() }
         pollOutstandingTo(0)
@@ -154,7 +159,10 @@ class ElevatedRunnerPhaseBLateCompensationTest {
         killer = killer,
         isCancelled = isCancelled,
         grantCheck = GrantFixtures.allowAlways,
-    )
+        execSearchDirs = hermeticExec!!.searchDirs,
+    execAllowedRoots = hermeticExec!!.allowedRoots,
+    execIsWritable = hermeticExec!!.systemOwned,
+)
 
     private fun shizukuRunner(
         spawn: (List<String>) -> Process,
@@ -170,7 +178,10 @@ class ElevatedRunnerPhaseBLateCompensationTest {
         killer = killer,
         isCancelled = isCancelled,
         grantCheck = GrantFixtures.allowAlways,
-    )
+        execSearchDirs = hermeticExec!!.searchDirs,
+    execAllowedRoots = hermeticExec!!.allowedRoots,
+    execIsWritable = hermeticExec!!.systemOwned,
+)
 
     // ---- 1. caller CAS 認領＋遲到補償永久吞 interrupt（Root／Shizuku） ----
     //

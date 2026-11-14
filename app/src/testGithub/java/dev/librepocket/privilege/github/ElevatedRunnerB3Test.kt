@@ -36,6 +36,8 @@ class ElevatedRunnerB3Test {
 
     private val privateRoot = "/data/data/files"
 
+    private var hermeticExec: HermeticExecFixture? = null
+
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {
         val deadline = System.currentTimeMillis() + boundMs
         while (ElevatedCleanupTracker.outstanding() != expected) {
@@ -139,7 +141,10 @@ class ElevatedRunnerB3Test {
         killer = killer,
         isCancelled = isCancelled,
         grantCheck = grant,
-    )
+        execSearchDirs = hermeticExec!!.searchDirs,
+    execAllowedRoots = hermeticExec!!.allowedRoots,
+    execIsWritable = hermeticExec!!.systemOwned,
+)
 
     private fun shizukuRunner(
         grant: () -> GrantCheck = GrantFixtures.allowAlways,
@@ -157,9 +162,21 @@ class ElevatedRunnerB3Test {
         killer = killer,
         isCancelled = isCancelled,
         grantCheck = grant,
-    )
+        execSearchDirs = hermeticExec!!.searchDirs,
+    execAllowedRoots = hermeticExec!!.allowedRoots,
+    execIsWritable = hermeticExec!!.systemOwned,
+)
 
     // ---- Root blocked grant × timeout/cancel ----
+
+    @org.junit.Before fun setUpHermeticExec() {
+        hermeticExec = HermeticExecFixture("b3-hermetic", "id")
+    }
+
+    @org.junit.After fun tearDownHermeticExec() {
+        hermeticExec?.close()
+        hermeticExec = null
+    }
 
     @Test fun rootBlockedGrantTimeout() {
         ElevatedCleanupTracker.clearUnverified()
@@ -345,7 +362,10 @@ class ElevatedRunnerB3Test {
                 true
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         try {
             val start = System.currentTimeMillis()
             val r = runner.runBinary(ElevatedRequest(listOf("id"), "B3-T"), 300L)

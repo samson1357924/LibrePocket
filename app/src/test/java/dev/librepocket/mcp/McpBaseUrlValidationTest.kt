@@ -1,6 +1,8 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkEgressPolicy
 import kotlinx.coroutines.runBlocking
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.mockwebserver.MockResponse
@@ -48,6 +50,10 @@ class McpBaseUrlValidationTest {
     private class Clock(var now: Long = 0L) {
         fun get(): Long = now
     }
+
+    // A3：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in；
+    // production 預設仍 deny-all（HTTPS_ONLY）。
+    private val loopbackOptIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
 
     private fun goodListBody(): String =
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[" +
@@ -266,7 +272,13 @@ class McpBaseUrlValidationTest {
             val clock = Clock(0L)
             val breaker = McpCircuitBreaker(maxFailures = 3, openMs = 60_000L, clockMs = clock::get)
             val s = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), keyId = "mcp:s1"),
+                // A3：迴環明文須顯式 opt-in；production 預設仍 deny-all。
+                config = McpServerConfig(
+                    id = "s1",
+                    baseUrl = web.url("/").toString(),
+                    keyId = "mcp:s1",
+                    networkOptIn = loopbackOptIn,
+                ),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -300,7 +312,13 @@ class McpBaseUrlValidationTest {
             val clock = Clock(0L)
             val breaker = McpCircuitBreaker(maxFailures = 3, openMs = 60_000L, clockMs = clock::get)
             val s = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), keyId = "mcp:s1"),
+                // A3：迴環明文須顯式 opt-in；production 預設仍 deny-all。
+                config = McpServerConfig(
+                    id = "s1",
+                    baseUrl = web.url("/").toString(),
+                    keyId = "mcp:s1",
+                    networkOptIn = loopbackOptIn,
+                ),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,

@@ -13,6 +13,9 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  * 綁定（變更即失效，沿用 S4-C 顯式重綁姿態，不與 chat key 共用 namespace）：
  * - `endpointId`：`preset:<presetId>`（內建）或 `custom:<sha256-32hex>`（自訂，
  *   與 `SetupValidation.deriveEndpointId` 同形；此處只驗形狀，不重算）；
+ *   A3 另接受 `mcp:<serverId>`（MCP 伺服器專用命名空間，與 chat key 槽位
+ *   `preset:`／`custom:` 嚴格區分；MCP 側以獨立 store 實例持有確認，
+ *   不與 chat 共用確認）；
  * - `baseUrl` HttpUrl 正規化後字串（scheme／host 小寫、預設埠歸一、去
  *   fragment；尾點保留（視為不同身份，fail-closed，需重確認）；寫入與查詢兩側
  *   同經 boundOf 歸一；任何重寫即新身份）；
@@ -55,7 +58,10 @@ class NetworkOptInStore(
     val port: Int,
     val policy: NetworkEgressPolicy,
     val configRevision: Long,
-  )
+  ) {
+    override fun toString(): String =
+      "ConfirmedOptIn(endpointId=$endpointId, scheme=$scheme, port=$port, policy=$policy, configRevision=$configRevision)"
+  }
 
   private val lock = Any()
   private val confirmed = mutableMapOf<String, ConfirmedOptIn>()
@@ -136,7 +142,14 @@ class NetworkOptInStore(
       configRevision: Long,
     ): String {
       val bound = boundOf(endpointId, baseUrl, policy, configRevision)
-      val material = "${bound.endpointId}|${bound.baseUrl}|${bound.scheme}|${bound.port}|${bound.policy.name}|${bound.configRevision}"
+      val material = listOf(
+        bound.endpointId,
+        bound.baseUrl,
+        bound.scheme,
+        bound.port.toString(),
+        bound.policy.name,
+        bound.configRevision.toString(),
+      ).joinToString("|") { "${it.length}:$it" }
       val digest = try {
         MessageDigest.getInstance("SHA-256")
       } catch (e: java.security.NoSuchAlgorithmException) {
@@ -169,11 +182,66 @@ class NetworkOptInStore(
       configRevision: Long,
     ): ConfirmedOptIn {
       require(endpointId.isNotBlank()) { "NETWORK_OPTIN_ENDPOINT_BLANK" }
-      require(endpointId.startsWith("preset:") || endpointId.startsWith("custom:")) {
+      // `mcp:` 為 MCP 伺服器專用命名空間（A3；見類 KDoc）：MCP 確認以獨立
+      // store 實例持有，不與 chat 的 `preset:`／`custom:` 確認混用；前綴後必須有非空白識別後綴。
+      val colonIdx = endpointId.indexOf(':')
+      val prefix = if (colonIdx > 0) endpointId.substring(0, colonIdx + 1) else ""
+      val suffix = if (colonIdx > 0) endpointId.substring(colonIdx + 1) else ""
+      require((prefix == "preset:" || prefix == "custom:" || prefix == "mcp:") && suffix.isNotBlank()) {
         "NETWORK_OPTIN_ENDPOINT_MALFORMED"
       }
-      val trimmed = baseUrl.trim()
+      require(baseUrl.none { (it < ' ' && it != ' ') || it.isISOControl() }) {
+        "NETWORK_OPTIN_URL_MALFORMED"
+      }
+      val trimmed = baseUrl.trim { it == ' ' }
       require(trimmed.isNotEmpty()) { "NETWORK_OPTIN_URL_BLANK" }
+      val schemeEnd = trimmed.indexOf(':')
+      require(schemeEnd > 0 && trimmed.startsWith("://", schemeEnd)) {
+        "NETWORK_OPTIN_URL_MALFORMED"
+      }
+      val rawScheme = trimmed.substring(0, schemeEnd).lowercase(Locale.ROOT)
+      require(rawScheme.none { it.isWhitespace() || it < ' ' || it.isISOControl() }) {
+        "NETWORK_OPTIN_URL_MALFORMED"
+      }
+      require(rawScheme == "http" || rawScheme == "https") {
+        "NETWORK_OPTIN_SCHEME_UNSUPPORTED"
+      }
+      val authStart = schemeEnd + 3
+      var authEnd = trimmed.length
+      for (i in authStart until trimmed.length) {
+        val c = trimmed[i]
+        if (c == '/' || c == '?' || c == '#') {
+          authEnd = i
+          break
+        }
+      }
+      val authority = trimmed.substring(authStart, authEnd)
+      require(authority.isNotEmpty()) { "NETWORK_OPTIN_URL_MALFORMED" }
+      require(authority.none { it.isWhitespace() || it < ' ' || it.isISOControl() }) {
+        "NETWORK_OPTIN_URL_MALFORMED"
+      }
+      require('@' !in authority) {
+        "NETWORK_OPTIN_USERINFO_BLOCKED"
+      }
+      require('\\' !in authority) {
+        "NETWORK_OPTIN_AUTHORITY_INVALID"
+      }
+      if ('[' in authority || ']' in authority) {
+        val closeIdx = authority.indexOf(']')
+        require(
+          authority.startsWith('[') &&
+            closeIdx > 1 &&
+            authority.indexOf('[', 1) < 0 &&
+            authority.indexOf(']', closeIdx + 1) < 0 &&
+            (closeIdx == authority.length - 1 || authority[closeIdx + 1] == ':'),
+        ) {
+          "NETWORK_OPTIN_URL_MALFORMED"
+        }
+        val literal = authority.substring(1, closeIdx)
+        require(':' in literal && NetworkPolicy.parseLiteralIp(literal) != null) {
+          "NETWORK_OPTIN_URL_MALFORMED"
+        }
+      }
       val url = trimmed.toHttpUrlOrNull() ?: throw IllegalArgumentException("NETWORK_OPTIN_URL_MALFORMED")
       // userinfo 永不納入身份：寫入期直接拒收（確認成功後每次請求才擋
       // USERINFO_BLOCKED 會造成困惑；此處 fail-closed 使含 userinfo 的 URL 連確認都拿不到）。

@@ -2,7 +2,15 @@ pluginManagement {
     repositories {
         google()
         mavenCentral()
-        gradlePluginPortal()
+        gradlePluginPortal {
+            content {
+                excludeGroup("org.jetbrains.kotlin")
+                excludeGroup("org.jetbrains.kotlin.android")
+                excludeGroup("org.jetbrains.kotlin.plugin.compose")
+                excludeGroup("com.android.application")
+                excludeGroup("com.android.tools.build")
+            }
+        }
     }
 }
 dependencyResolutionManagement {

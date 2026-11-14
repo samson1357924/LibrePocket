@@ -1,6 +1,8 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkEgressPolicy
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
@@ -46,6 +48,10 @@ class McpServerSemanticsTest {
         override suspend fun deleteKey(providerId: String) = Unit
         override suspend fun hasKey(providerId: String): Boolean = false
     }
+
+    // A3：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in；
+    // production 預設仍 deny-all（HTTPS_ONLY）。
+    private val loopbackOptIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
 
     // ---- nextCursor：單頁子集但不靜默丟頁 ----
 
@@ -104,7 +110,7 @@ class McpServerSemanticsTest {
             )
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -132,7 +138,7 @@ class McpServerSemanticsTest {
             )
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -156,7 +162,7 @@ class McpServerSemanticsTest {
                 ),
             )
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
@@ -436,7 +442,7 @@ class McpServerSemanticsTest {
             )
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -463,7 +469,7 @@ class McpServerSemanticsTest {
             repeat(3) { web.enqueue(MockResponse().setResponseCode(200).setBody(badBody)) }
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -496,7 +502,7 @@ class McpServerSemanticsTest {
             repeat(3) { web.enqueue(MockResponse().setResponseCode(200).setBody(badBody)) }
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -612,7 +618,7 @@ class McpServerSemanticsTest {
             )
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -648,7 +654,7 @@ class McpServerSemanticsTest {
             )
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -673,7 +679,7 @@ class McpServerSemanticsTest {
                 ),
             )
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
@@ -705,7 +711,7 @@ class McpServerSemanticsTest {
             )
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -731,7 +737,7 @@ class McpServerSemanticsTest {
                 ),
             )
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
@@ -758,7 +764,7 @@ class McpServerSemanticsTest {
                 ),
             )
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
@@ -788,7 +794,7 @@ class McpServerSemanticsTest {
             )
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -814,7 +820,7 @@ class McpServerSemanticsTest {
             )
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -839,7 +845,7 @@ class McpServerSemanticsTest {
                 ),
             )
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
@@ -865,7 +871,7 @@ class McpServerSemanticsTest {
                 ),
             )
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
@@ -888,7 +894,7 @@ class McpServerSemanticsTest {
             // 400/404/405：端點/請求形狀配置錯（非暫態）→ PROTOCOL + 計熔斷。
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -912,7 +918,7 @@ class McpServerSemanticsTest {
             // list 端同待遇：400/404/405 → PROTOCOL + 計熔斷（與 call 端一致）。
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -937,7 +943,7 @@ class McpServerSemanticsTest {
             // 熔斷待遇相同：皆計失敗（分類只差 status 標籤）。
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -1053,7 +1059,7 @@ class McpServerSemanticsTest {
             )
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -1094,7 +1100,7 @@ class McpServerSemanticsTest {
             val breaker = McpCircuitBreaker()
             val openVault = FakeVault()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = openVault,
                 transport = McpTransport(),
                 breaker = breaker,
@@ -1111,7 +1117,7 @@ class McpServerSemanticsTest {
             // 對照（先後序反面）：同一非法名在「啟用＋熔斷閉合」時才走形狀閘 → PROTOCOL。
             val liveVault = FakeVault()
             val live = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = liveVault,
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
@@ -1161,7 +1167,7 @@ class McpServerSemanticsTest {
         try {
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = EmptyVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -1207,7 +1213,7 @@ class McpServerSemanticsTest {
         try {
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -1233,7 +1239,7 @@ class McpServerSemanticsTest {
         try {
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,

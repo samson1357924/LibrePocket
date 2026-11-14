@@ -1,8 +1,12 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkEgressPolicy
 import java.io.InterruptedIOException
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
@@ -63,11 +67,20 @@ class McpServerAccountingTest {
         breaker: McpCircuitBreaker = McpCircuitBreaker(),
         vault: KeyVault = FakeVault(),
     ): McpServer = McpServer(
-        config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+        // A3：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in；
+        // production 預設仍 deny-all（HTTPS_ONLY）。
+        config = McpServerConfig(
+            id = "s1",
+            baseUrl = web.url("/").toString(),
+            networkOptIn = loopbackOptIn,
+        ),
         keyVault = vault,
         transport = transport,
         breaker = breaker,
     )
+
+    // A3 loopback 明文 opt-in（見上）。
+    private val loopbackOptIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
 
     // ---- socket 讀超時 → TIMEOUT（非 TRANSPORT） ----
 
@@ -412,5 +425,122 @@ class McpServerAccountingTest {
                 "uptime 與 epoch 差值須遠大於 1e6 ms",
             System.currentTimeMillis() - clock() > 1_000_000L,
         )
+    }
+
+    // ---- B-01：vault key 必須在 IO block 內清零（withTimeoutOrNull 丟棄結果路徑） ----
+
+    private class DelayedBlockingVault(
+        private val delayMs: Long,
+        private val keyReturnedToCaller: CountDownLatch,
+        val capturedKey: AtomicReference<CharArray?>,
+    ) : KeyVault {
+        override suspend fun putKey(providerId: String, apiKey: CharArray) = Unit
+        override suspend fun deleteKey(providerId: String) = Unit
+        override suspend fun hasKey(providerId: String): Boolean = true
+        override suspend fun getKey(providerId: String): CharArray? {
+            val key = "sekret-token-1".toCharArray()
+            capturedKey.set(key)
+            Thread.sleep(delayMs)
+            // Signal after the blocking delay but before returning to the caller's IO block,
+            // so the test can wait for the caller-side finally { key.fill('\u0000') } to run
+            // deterministically instead of racing on a pre-cleanup latch.
+            keyReturnedToCaller.countDown()
+            return key
+        }
+    }
+
+    private fun awaitZeroized(key: CharArray, timeoutMs: Long = 5_000L): Boolean {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        while (System.nanoTime() < deadline) {
+            if (key.all { it == '\u0000' }) return true
+            Thread.sleep(10)
+        }
+        return key.all { it == '\u0000' }
+    }
+
+    @Test fun listToolsWipesVaultKeyWhenTimeoutDropsIoResult() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            val keyReturnedToCaller = CountDownLatch(1)
+            val captured = AtomicReference<CharArray?>()
+            val breaker = McpCircuitBreaker()
+            val s = McpServer(
+                config = McpServerConfig(
+                    id = "s1",
+                    baseUrl = web.url("/").toString().replace("://localhost", "://127.0.0.1"),
+                    networkOptIn = loopbackOptIn,
+                ),
+                keyVault = DelayedBlockingVault(
+                    delayMs = McpTimeouts.MIN_MS + 5_000L,
+                    keyReturnedToCaller = keyReturnedToCaller,
+                    capturedKey = captured,
+                ),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = withTimeoutOrNull(McpTimeouts.MIN_MS + 10_000L) {
+                s.listTools(McpTimeouts.MIN_MS)
+            }
+            assertNotNull("listTools must complete with TIMEOUT", got)
+            assertEquals(McpStatus.TIMEOUT, got!!.status)
+            assertTrue(
+                "blocking vault must return key to caller",
+                keyReturnedToCaller.await(15, TimeUnit.SECONDS),
+            )
+            val key = captured.get()
+            assertNotNull("vault must have produced key", key)
+            assertTrue(
+                "dropped IO result must still zeroize key",
+                awaitZeroized(key!!),
+            )
+            assertEquals("timeout path must not send HTTP", 0, web.requestCount)
+            assertEquals("timeout path must not count breaker failure", 0, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun callToolWipesVaultKeyWhenTimeoutDropsIoResult() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            val keyReturnedToCaller = CountDownLatch(1)
+            val captured = AtomicReference<CharArray?>()
+            val breaker = McpCircuitBreaker()
+            val s = McpServer(
+                config = McpServerConfig(
+                    id = "s1",
+                    baseUrl = web.url("/").toString().replace("://localhost", "://127.0.0.1"),
+                    networkOptIn = loopbackOptIn,
+                ),
+                keyVault = DelayedBlockingVault(
+                    delayMs = McpTimeouts.MIN_MS + 5_000L,
+                    keyReturnedToCaller = keyReturnedToCaller,
+                    capturedKey = captured,
+                ),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = withTimeoutOrNull(McpTimeouts.MIN_MS + 10_000L) {
+                s.callTool("t", "{}", McpTimeouts.MIN_MS)
+            }
+            assertNotNull("callTool must complete with TIMEOUT", got)
+            assertEquals(McpStatus.TIMEOUT, got!!.status)
+            assertTrue(
+                "blocking vault must return key to caller",
+                keyReturnedToCaller.await(15, TimeUnit.SECONDS),
+            )
+            val key = captured.get()
+            assertNotNull("vault must have produced key", key)
+            assertTrue(
+                "dropped IO result must still zeroize key",
+                awaitZeroized(key!!),
+            )
+            assertEquals("timeout path must not send HTTP", 0, web.requestCount)
+            assertEquals("timeout path must not count breaker failure", 0, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
     }
 }

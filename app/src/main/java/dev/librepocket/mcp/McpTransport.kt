@@ -1,9 +1,19 @@
 package dev.librepocket.mcp
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.HostResolver
+import dev.librepocket.policy.NetworkDenyCode
+import dev.librepocket.policy.NetworkEvaluation
+import dev.librepocket.policy.NetworkPolicy
+import dev.librepocket.policy.PinnedNetworkDns
+import dev.librepocket.policy.SystemHostResolver
 import java.io.IOException
+import java.net.InetAddress
+import java.net.Proxy
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.InternalCoroutinesApi
@@ -13,7 +23,9 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Authenticator
+import okhttp3.ConnectionPool
 import okhttp3.CookieJar
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
@@ -41,7 +53,19 @@ import okio.BufferedSink
  * - [bearer] 只放 `Authorization` 標頭，永不拼進 body，不寫 log；
  * - 呼叫方（[McpServer]）負責從 KeyVault 取 key、用後即擦，本層不留存；
  * - 僅放行 `https` 與回環 `http`（見 [McpWire.requireSecureEndpoint]，
- *   直調亦擋；其餘明文拋 `McpProtocol`）；
+ *   直調亦擋；其餘明文拋 `McpProtocol`；回環 `http` 另需政策閘
+ *   [requireMcpNetworkPolicyAllowed] 的 opt-in 放行並於 DNS 後逐 IP 驗證皆為回環
+ *   位址，非回環／混合一律 `CLEARTEXT_NOT_PERMITTED`，預設 deny-all）；
+ * - 單次解析密封權杖（[McpPreflightToken]）：建構子私有，僅能由本檔
+ *   [preflightMcpNetworkPolicy] 於 [requireMcpNetworkPolicyAllowed] 通過後鑄造；
+ *   對外不接受呼叫端自行構造的 [NetworkEvaluation]；[McpServer] 透過
+ *   [postJsonWithPreverified] 傳入權杖並於同一單調 `deadlineNs` 下重驗即時
+ *   `effectiveOptIn()`，URL／字面 IP／resolver 一致時零二次 DNS；
+ * - 有界 DNS preflight：預設共用 [NetworkPolicy.defaultPreflightExecutor]
+ *   （`SynchronousQueue` + `AbortPolicy`、0 core / 16 max daemon 執行緒、30s 閒置回收，
+ *   屬進程／App 生命週期共享池，不於單次請求後關閉；無需 DNS 解析的 URL
+ *   經 `NetworkPolicy.requiresDnsLookup` 略過執行器直走純檢查）；滿載過載拒收
+ *   拋 [McpPreflightOverloadedException]（`IOException` 子類；[McpServer] 映射 `TRANSPORT`、不計熔斷）；
  * - 不自動跟隨 redirect：3xx 為終端回應（[McpServer] 映射 PROTOCOL + 計熔斷），
  *   `tools/call` body／Bearer 只會送到預驗過的初始端點；
  *   注入的 client 經 [transportClient] 強制套用 redirect／連線失敗重試／503 重送／
@@ -59,9 +83,30 @@ import okio.BufferedSink
  *   解碼（非法序列拋 `mcp: invalid utf-8`，見 [readBoundedBody]）；
  * - 回傳 null = 本步超時（呼叫方映射為 [McpStatus.TIMEOUT]，不重試）。
  */
-class McpTransport(
-    client: OkHttpClient = defaultHttp(),
+class McpTransport /**
+ * 內部建構子（供同包 [McpServer] 與測試注入執行器／超時鉗制／單調時鐘）。
+ *
+ * 注意：[McpServer] 會將自身注入的 `preflightExecutor` 與 `nanoClock` 顯式傳入
+ * [preflightMcpNetworkPolicy] 與 [postJsonWithPreverified]，確保單一請求週期的
+ * DNS 預驗、回落重驗與傳輸計時共用同一執行器與時鐘來源。
+ */
+internal constructor(
+    client: OkHttpClient,
+    /**
+     * 有界 DNS preflight 執行器：預設共用 [NetworkPolicy.defaultPreflightExecutor]
+     * （0 core / 16 max daemon、30s 閒置回收，隨 App 生命週期常駐）；測試可注入自訂執行器。
+     */
+    private val preflightExecutor: ExecutorService,
+    private val clampTimeoutMs: (Long) -> Long,
+    private val nanoClock: () -> Long,
 ) {
+    constructor(client: OkHttpClient = defaultHttp()) : this(
+        client = client,
+        preflightExecutor = NetworkPolicy.defaultPreflightExecutor,
+        clampTimeoutMs = McpTimeouts::clamp,
+        nanoClock = System::nanoTime,
+    )
+
     /** 注入 client 一律正規化（見 [transportClient]）：不重定向、不預算外重送。 */
     private val http: OkHttpClient = transportClient(client)
 
@@ -124,26 +169,54 @@ class McpTransport(
     }
 
     /**
+     * 有界 DNS preflight（受共享單調 [deadlineNs] 與 [preflightExecutor] 約束）：
+     * - [deadlineNs] 已到期回 [McpPreflightOutcome.TimedOut]；
+     * - `!NetworkPolicy.requiresDnsLookup(url, optIn)`（字面 IP／無效 host／缺明文權限）
+     *   不經執行器直接執行 [requireMcpNetworkPolicyAllowed]（零執行緒跳躍、不受 DNS 過載影響）；
+     * - 需 DNS 名稱解析時交由 [NetworkPolicy.runPreflightSuspend] 於有界執行器執行，
+     *   並只在 [requireMcpNetworkPolicyAllowed] 放行後鑄造 [McpPreflightToken]。
+     */
+    internal suspend fun preflightMcpNetworkPolicy(
+        url: String,
+        optIn: EndpointNetworkOptIn,
+        resolver: HostResolver,
+        deadlineNs: Long,
+        preflightExecutor: ExecutorService = this.preflightExecutor,
+        nanoClock: () -> Long = this.nanoClock,
+    ): McpPreflightOutcome = McpPreflightToken.preflight(
+        url = url,
+        optIn = optIn,
+        resolver = resolver,
+        deadlineNs = deadlineNs,
+        preflightExecutor = preflightExecutor,
+        nanoClock = nanoClock,
+    )
+
+    /**
      * 取消語義（對齊 provider `executeProviderRequest`）：
      * - handler 自 `execute()` 前覆蓋到 body 消費完，`onCancelling=true` 使外部取消
      *   或總 deadline 到期立即 `call.cancel()` 中斷 blocking header/body IO，而非等其自然返回；
      * - 取消與否只以 coroutine Job（[ensureActive]）判斷，不以 `Call.isCanceled()` 判斷；
-     * - 總 deadline = `withTimeoutOrNull(McpTimeouts.clamp)`（沿用既有常數），僅本層到期回 null（TIMEOUT）；
-     *   父層 `withTimeout`/外部取消原樣透傳 `CancellationException`（不斷熔斷、不映射 TRANSPORT，見 [McpServer]）；
+     * - 單調 `deadlineNs` 由 `clampTimeoutMs(timeoutMs)`（預設 [McpTimeouts.clamp]）起算並同時
+     *   約束 DNS preflight 與 HTTP 傳輸（僅本層到期回 null（TIMEOUT）；
+     *   父層 `withTimeout`/外部取消原樣透傳 `CancellationException`，不斷熔斷、不映射 TRANSPORT，見 [McpServer]）；
      * - 成功 body 雙上限：[RESPONSE_MAX_BYTES] 位元組與 [RESPONSE_MAX_CHARS] 字元
      *   （相容舊 `take(64_000)`）；超量拋 [McpResponseTooLarge]，
      *   呼叫方映射 PROTOCOL + 計熔斷，絕不回截斷半 JSON 充 OK；
      *   非 2xx 不讀 body（呼叫方只看 code）：先 cancel 再回 `code to null`，
      *   保留 401/403→UNAUTHORIZED、3xx→PROTOCOL、其餘→TRANSPORT 語義，
      *   且 close() 不排空大 body；
-     * - 其餘 `IOException` 透傳（呼叫方映射 TRANSPORT）。
+     * - DNS preflight 執行器滿載拒收拋 [McpPreflightOverloadedException]
+     *   （`IOException("mcp: dns preflight overloaded")`），
+     *   政策阻擋拋 [McpNetworkPolicyBlocked]，其餘 `IOException` 透傳（呼叫方映射 TRANSPORT）。
      */
-    @OptIn(InternalCoroutinesApi::class)
     suspend fun postJson(
         baseUrl: String,
         bearer: String,
         bodyJson: String,
         timeoutMs: Long,
+        optIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+        resolver: HostResolver = SystemHostResolver,
     ): Pair<Int, String?>? {
         // 縱深：直調 transport 亦 fail-closed（McpServer 已預驗，此處僅防直調）。
         try {
@@ -158,6 +231,146 @@ class McpTransport(
         }
         // bare-origin 相容：無 path 時 endpoint() 自動補 /mcp（舊配置相容，建議記 warning 提醒手動補完整 path）。
         val url = McpWire.endpoint(baseUrl)
+        val totalMs = clampTimeoutMs(timeoutMs)
+        val deadlineNs = nanoClock() + TimeUnit.MILLISECONDS.toNanos(totalMs)
+        val eval = when (
+            val outcome = preflightMcpNetworkPolicy(
+                url = url,
+                optIn = optIn,
+                resolver = resolver,
+                deadlineNs = deadlineNs,
+                preflightExecutor = preflightExecutor,
+                nanoClock = nanoClock,
+            )
+        ) {
+            is McpPreflightOutcome.Allowed -> outcome.token.eval
+            McpPreflightOutcome.TimedOut -> return null
+            McpPreflightOutcome.OverloadRejected -> throw McpPreflightOverloadedException()
+            is McpPreflightOutcome.Blocked -> throw McpNetworkPolicyBlocked(outcome.denyCode)
+        }
+        return executePinnedPost(
+            baseUrl = baseUrl,
+            url = url,
+            bearer = bearer,
+            bodyJson = bodyJson,
+            resolvedAddresses = eval.resolvedAddresses,
+            resolver = resolver,
+            deadlineNs = deadlineNs,
+            nanoClock = nanoClock,
+        )
+    }
+
+    /**
+     * [McpServer] 專用的單次解析＋聚合 deadline 傳輸入口：
+     * 接受由 [preflightMcpNetworkPolicy] 鑄造的密封 [McpPreflightToken]（建構子私有，
+     * 不得由外部構造任意 `NetworkEvaluation`）。
+     *
+     * - 若正規化 URL、字面 IP 與 `resolver` 實例皆與 [preverified] 一致、解析答案非空且
+     *   [McpPreflightToken.consume] 成功（單次使用，已消耗權杖不可跨呼叫重用）：
+     *   直接以釘住位址重跑 [requireMcpNetworkPolicyAllowed]（零二次 DNS），若
+     *   [optIn] 於讀 key 期間降級即立即拋 [McpNetworkPolicyBlocked]（不重查 DNS）；
+     * - 任一不一致或權杖已被消耗：於同一 [deadlineNs] 下回落有界
+     *   [preflightMcpNetworkPolicy] 重驗（過載拒收拋 [McpPreflightOverloadedException]）。
+     */
+    internal suspend fun postJsonWithPreverified(
+        baseUrl: String,
+        bearer: String,
+        bodyJson: String,
+        deadlineNs: Long,
+        optIn: EndpointNetworkOptIn,
+        resolver: HostResolver,
+        preverified: McpPreflightToken,
+        preflightExecutor: ExecutorService = this.preflightExecutor,
+        nanoClock: () -> Long = this.nanoClock,
+    ): Pair<Int, String?>? {
+        try {
+            McpWire.requireSecureEndpoint(baseUrl)
+        } catch (e: IllegalArgumentException) {
+            throw McpWire.McpProtocol(e.message ?: "mcp: bad endpoint")
+        }
+        if (!isPrintableAscii(bearer)) {
+            throw McpWire.McpProtocol("mcp: bad bearer")
+        }
+        val url = McpWire.endpoint(baseUrl)
+        val httpUrl = url.toHttpUrlOrNull()
+        val canonicalUrl = httpUrl?.toString() ?: url
+        val hostLiteral = httpUrl?.host?.trimEnd('.')?.let { NetworkPolicy.parseLiteralIp(it) }
+        val literalMismatch = hostLiteral != null &&
+            preverified.eval.resolvedAddresses != listOf(hostLiteral)
+        val eval = if (
+            preverified.eval.allowed &&
+            preverified.eval.normalizedUrl == canonicalUrl &&
+            preverified.resolver === resolver &&
+            preverified.eval.resolvedAddresses.isNotEmpty() &&
+            !literalMismatch &&
+            preverified.consume()
+        ) {
+            // 密封權杖且 URL／字面 IP／resolver 相符且單次消耗成功：零二次 DNS，以釘住位址重驗當前 optIn。
+            // 若 optIn 已於取 key 期間降級，此處立即拋 McpNetworkPolicyBlocked（不重查 DNS）。
+            currentCoroutineContext().ensureActive()
+            requireMcpNetworkPolicyAllowed(
+                url,
+                optIn,
+                HostResolver { preverified.eval.resolvedAddresses.toList() },
+            )
+        } else {
+            when (
+                val outcome = preflightMcpNetworkPolicy(
+                    url = url,
+                    optIn = optIn,
+                    resolver = resolver,
+                    deadlineNs = deadlineNs,
+                    preflightExecutor = preflightExecutor,
+                    nanoClock = nanoClock,
+                )
+            ) {
+                is McpPreflightOutcome.Allowed -> outcome.token.eval
+                McpPreflightOutcome.TimedOut -> return null
+                McpPreflightOutcome.OverloadRejected -> throw McpPreflightOverloadedException()
+                is McpPreflightOutcome.Blocked -> throw McpNetworkPolicyBlocked(outcome.denyCode)
+            }
+        }
+        return executePinnedPost(
+            baseUrl = baseUrl,
+            url = url,
+            bearer = bearer,
+            bodyJson = bodyJson,
+            resolvedAddresses = eval.resolvedAddresses,
+            resolver = resolver,
+            deadlineNs = deadlineNs,
+            nanoClock = nanoClock,
+        )
+    }
+
+    @OptIn(InternalCoroutinesApi::class)
+    private suspend fun executePinnedPost(
+        baseUrl: String,
+        url: String,
+        bearer: String,
+        bodyJson: String,
+        resolvedAddresses: List<InetAddress>,
+        resolver: HostResolver,
+        deadlineNs: Long,
+        nanoClock: () -> Long,
+    ): Pair<Int, String?>? {
+        val safeAddresses = resolvedAddresses.toList()
+        if (safeAddresses.isEmpty()) {
+            throw McpNetworkPolicyBlocked(NetworkDenyCode.INVALID_HOST)
+        }
+        val host = url.toHttpUrlOrNull()?.host
+            ?: throw McpWire.McpProtocol("mcp: bad endpoint")
+        currentCoroutineContext().ensureActive()
+        // Pre-HTTP deadline recheck：在建構 PinnedNetworkDns／Request 之前先確認聚合
+        // deadline 未到期；若已到期回 null（TIMEOUT）而不計入後續 setup 開銷。建構後
+        // 仍再 recheck 一次（原邏輯），確保 setup 延遲亦計入 deadlineNs。
+        val earlyRemainingNs = deadlineNs - nanoClock()
+        if (earlyRemainingNs <= 0L) return null
+        val pinned = PinnedNetworkDns.forHost(host, safeAddresses, resolver)
+        val pinnedHttp = http.newBuilder()
+            .dns(pinned)
+            .proxy(Proxy.NO_PROXY)
+            .connectionPool(ConnectionPool(0, 1, TimeUnit.NANOSECONDS))
+            .build()
         // 可觀測性：自動補 /mcp 時記 warning（runCatching 使 JVM 單測無 mocked Log 仍綠）。
         if (McpWire.isBareOrigin(baseUrl)) {
             runCatching {
@@ -174,12 +387,15 @@ class McpTransport(
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
             .build()
-        val deadlineMs = McpTimeouts.clamp(timeoutMs)
+        // 將 PinnedNetworkDns / Request 建構時間亦計入 deadlineNs（於 withTimeoutOrNull 前計算剩餘預算）。
+        val remainingNs = deadlineNs - nanoClock()
+        if (remainingNs <= 0L) return null
+        val remainingMs = (remainingNs / 1_000_000L) + if (remainingNs % 1_000_000L > 0L) 1L else 0L
         // withTimeoutOrNull 僅將本層 deadline 到期轉為 null；父層 withTimeout/外部取消
         // 以 TimeoutCancellationException/CancellationException 原樣傳播，不吞為 null。
-        return withTimeoutOrNull(deadlineMs) {
+        return withTimeoutOrNull(remainingMs) {
             withContext(Dispatchers.IO) {
-                val call = http.newCall(request)
+                val call = pinnedHttp.newCall(request)
                 val job = currentCoroutineContext()[Job]
                 val cancellation =
                     job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
@@ -244,6 +460,141 @@ class McpTransport(
         }
     }
 }
+
+private val LOOPBACK_ADDRESS_CLASS = NetworkPolicy.classifyAddress(
+    InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1)),
+)
+
+/**
+ * A3 (Issue #135 A3)：MCP 建連前政策閘（對齊 provider
+ * `requireNetworkPolicyAllowed`）。
+ *
+ * 呼叫方（[McpServer.listTools]／[McpServer.callTool]）必須在讀 key、組 body
+ * 之後、發送之前先調此閘（McpServer 另在 vault read 之前預驗一次）；
+ * 直調 [McpTransport.postJson] 亦經此閘。拒絕即 typed fatal
+ * [McpNetworkPolicyBlocked]（deny code 可辨、不重試——MCP 單次預算本就無重試），
+ * 不傳送 credential／body、不建連。
+ *
+ * B-01（`http` 僅限回環位址）：[NetworkPolicy.evaluateUrl] 因共用 WebFetch LAN pilot，
+ * 在 `ALLOW_CLEARTEXT_PRIVATE` 下亦放行私有位址（如 `10.x`／`fc00::1`）；本閘於其通過後
+ * 再針對 `http` 方案強制檢查：已解析位址列表非空且**每筆**皆須為回環分類
+ * （[LOOPBACK_ADDRESS_CLASS]），否則拋 [McpNetworkPolicyBlocked]（[NetworkDenyCode.CLEARTEXT_NOT_PERMITTED]）。
+ *
+ * Redirect 執行面：本層 0-follow（見 `transportClient`），3xx 由 [McpServer]
+ * 映射 PROTOCOL + 計熔斷（即 REDIRECT_BLOCKED 語義：跳轉目標永不被跟隨、
+ * credential／body 永不重送，`Location` 亦不觸發 DNS 解析）。
+ */
+internal fun requireMcpNetworkPolicyAllowed(
+    rawUrl: String,
+    optIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+    resolver: HostResolver = SystemHostResolver,
+): NetworkEvaluation {
+    val rawEval = NetworkPolicy.evaluateUrl(rawUrl, optIn, resolver)
+    val safeAddresses = rawEval.resolvedAddresses.toList()
+    val eval = rawEval.copy(resolvedAddresses = safeAddresses)
+    if (!eval.allowed) throw McpNetworkPolicyBlocked(eval.denyCode ?: NetworkDenyCode.INVALID_HOST)
+    val scheme = (eval.normalizedUrl ?: rawUrl).trim().toHttpUrlOrNull()?.scheme
+    if (scheme == "http") {
+        if (safeAddresses.isEmpty() ||
+            safeAddresses.any { NetworkPolicy.classifyAddress(it) != LOOPBACK_ADDRESS_CLASS }
+        ) {
+            throw McpNetworkPolicyBlocked(NetworkDenyCode.CLEARTEXT_NOT_PERMITTED)
+        }
+    }
+    if (safeAddresses.isEmpty()) {
+        throw McpNetworkPolicyBlocked(NetworkDenyCode.INVALID_HOST)
+    }
+    return eval
+}
+
+/** 有界 DNS preflight 結果（供 [McpServer]／[McpTransport] 統一對應超時、過載與政策拒絕）。 */
+internal sealed interface McpPreflightOutcome {
+    data class Allowed(val token: McpPreflightToken) : McpPreflightOutcome
+    data object TimedOut : McpPreflightOutcome
+    data object OverloadRejected : McpPreflightOutcome
+    data class Blocked(val denyCode: NetworkDenyCode) : McpPreflightOutcome
+}
+
+/**
+ * 密封單次解析權杖（B-02）：建構子私有，僅能由 [McpTransport.preflightMcpNetworkPolicy]
+ * 於 [requireMcpNetworkPolicyAllowed] 通過後鑄造；不暴露接受外部 `NetworkEvaluation`
+ * 的工廠，消滅偽造或跨端點／跨 resolver 借用預驗決策的信任邊界漏洞。
+ */
+internal class McpPreflightToken private constructor(
+    val eval: NetworkEvaluation,
+    val resolver: HostResolver,
+) {
+    private val consumed = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    internal fun consume(): Boolean = consumed.compareAndSet(false, true)
+
+    internal companion object {
+        internal suspend fun preflight(
+            url: String,
+            optIn: EndpointNetworkOptIn,
+            resolver: HostResolver,
+            deadlineNs: Long,
+            preflightExecutor: ExecutorService,
+            nanoClock: () -> Long,
+        ): McpPreflightOutcome {
+            currentCoroutineContext().ensureActive()
+            if (deadlineNs - nanoClock() <= 0L) return McpPreflightOutcome.TimedOut
+            if (!NetworkPolicy.requiresDnsLookup(url, optIn)) {
+                return try {
+                    val eval = requireMcpNetworkPolicyAllowed(url, optIn, resolver)
+                    val copied = eval.copy(resolvedAddresses = eval.resolvedAddresses.toList())
+                    McpPreflightOutcome.Allowed(McpPreflightToken(copied, resolver))
+                } catch (e: McpNetworkPolicyBlocked) {
+                    McpPreflightOutcome.Blocked(e.denyCode)
+                }
+            }
+            return try {
+                when (
+                    val res = NetworkPolicy.runPreflightSuspend(
+                        deadlineNs = deadlineNs,
+                        executor = preflightExecutor,
+                        nanoClock = nanoClock,
+                    ) {
+                        requireMcpNetworkPolicyAllowed(url, optIn, resolver)
+                    }
+                ) {
+                    is NetworkPolicy.PreflightOutcome.Completed -> {
+                        val copied = res.value.copy(
+                            resolvedAddresses = res.value.resolvedAddresses.toList(),
+                        )
+                        McpPreflightOutcome.Allowed(McpPreflightToken(copied, resolver))
+                    }
+                    NetworkPolicy.PreflightOutcome.TimedOut ->
+                        McpPreflightOutcome.TimedOut
+                    NetworkPolicy.PreflightOutcome.OverloadRejected ->
+                        McpPreflightOutcome.OverloadRejected
+                }
+            } catch (e: McpNetworkPolicyBlocked) {
+                McpPreflightOutcome.Blocked(e.denyCode)
+            }
+        }
+    }
+}
+
+/**
+ * DNS preflight 有界執行器滿載拒收例外（[IOException] 子類）：
+ * [McpServer] 在 [McpWire.McpProtocol]／[SocketTimeoutException] 之外以專屬 catch 攔截，
+ * 映射為 [McpStatus.TRANSPORT] 且**不計熔斷失敗**（對齊 Step 5 `OverloadRejected`）。
+ */
+internal class McpPreflightOverloadedException : IOException("mcp: dns preflight overloaded")
+
+/**
+ * 政策阻擋 typed fatal（A3）：與 [McpWire.McpProtocol] 平級的獨立例外
+ * （同為 [IllegalArgumentException] 子類、型別不相交）。[McpServer] 以專屬
+ * catch 先攔（配置錯誤姿態：PROTOCOL、不計熔斷、不碰 vault），再由
+ * `catch (McpProtocol) → PROTOCOL + 計熔斷` 兜底——順序不得顛倒，
+ * 否則阻擋會落到熔斷計數分支。
+ *
+ * 訊息僅帶 deny code（`mcp: network policy blocked:<CODE>`），不含 URL、
+ * 位址、credential——[NetworkEvaluation.resolvedAddresses] 永不進錯誤面。
+ */
+internal class McpNetworkPolicyBlocked(val denyCode: NetworkDenyCode) :
+    IllegalArgumentException("mcp: network policy blocked:${denyCode.name}")
 
 /**
  * 本層唯一的 JSON media type（top-level：[OneShotJsonBody] 共用）。

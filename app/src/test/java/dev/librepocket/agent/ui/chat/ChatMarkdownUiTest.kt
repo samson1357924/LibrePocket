@@ -2055,13 +2055,13 @@ class ChatMarkdownUiTest {
         val t1 = medianOf(t1Samples)
         val t2 = medianOf(t2Samples)
         val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
-        // Linear scaling in K should stay near ~2x; quadratic growth trends to ~4x.
-        // Median-of-samples reduces CI noise while keeping a bound that can still
-        // distinguish linear from quadratic drift.
+        // Linear scaling in K should stay near ~2x for a 2x input; O(K^2) trends to ~4x.
+        // Median-of-samples with warmup absorbs CI jitter, but the bound must stay
+        // strictly below quadratic so regressions cannot satisfy it.
         assertTrue(
-            "identity-only 2x-input ratio $ratio exceeds linear bound " +
+            "identity-only 2x-input ratio $ratio exceeds strict linear-vs-quadratic bound " +
                 "(t1=${t1}ns t2=${t2}ns t1Samples=$t1Samples t2Samples=$t2Samples)",
-            ratio < 6.0,
+            ratio < 3.5,
         )
         // Correctness pin: all-different rewrite migrates nothing and prunes stale.
         val prev = listOf("A", "B")

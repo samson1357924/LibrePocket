@@ -829,6 +829,7 @@ class OrderedTranscriptSinkTest {
       val entered = CompletableDeferred<Unit>()
       val release = CompletableDeferred<Unit>()
       val reported = AtomicReference<Throwable?>()
+      val reportCount = AtomicInteger(0)
       val fatal = OutOfMemoryError("simulated best-effort VM fatal without waiter")
       val delegate = object : SinkProbe() {
         override suspend fun flushBufferedUsageBestEffort(runId: String) {
@@ -841,7 +842,10 @@ class OrderedTranscriptSinkTest {
         delegate = delegate,
         dispatcher = dispatcher,
         capacity = 8,
-        terminalFatalReporter = { t -> reported.compareAndSet(null, t) },
+        terminalFatalReporter = { t ->
+          reported.set(t)
+          reportCount.incrementAndGet()
+        },
       )
       runBlocking {
         try {
@@ -861,10 +865,67 @@ class OrderedTranscriptSinkTest {
         "best-effort VM-fatal without waiter must be reported observably, got $seen",
         seen is OutOfMemoryError && seen.message == fatal.message,
       )
+      assertEquals("VM-fatal must be reported exactly once", 1, reportCount.get())
       assertTrue("VM-fatal must seal the writer", sink.isSealed())
       assertTrue("no core write admitted, so no interrupted runIds: ${sink.interruptedRunIds()}", sink.interruptedRunIds().isEmpty())
       assertTrue(sink.pendingRunIds().isEmpty())
       assertFalse("best-effort notice must not poison durable core failures", sink.hasDurableFailures())
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  @Test fun coreVmFatalWithDurableWaiter_reportsExactlyOnceAndSeals() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val entered = CompletableDeferred<Unit>()
+      val release = CompletableDeferred<Unit>()
+      val reported = AtomicReference<Throwable?>()
+      val reportCount = AtomicInteger(0)
+      val fatal = OutOfMemoryError("simulated core VM fatal with durable waiter")
+      val delegate = object : SinkProbe() {
+        override suspend fun onTurnStarted(runId: String, text: String) {
+          entered.complete(Unit)
+          release.await()
+          throw fatal
+        }
+      }
+      val sink = OrderedTranscriptSink(
+        delegate = delegate,
+        dispatcher = dispatcher,
+        capacity = 8,
+        terminalFatalReporter = { t ->
+          reported.set(t)
+          reportCount.incrementAndGet()
+        },
+      )
+      runBlocking {
+        try {
+          val started = async { runCatching { sink.onTurnStarted("run-fatal", "hi") } }
+          entered.await()
+          release.complete(Unit)
+          withTimeout(10_000) {
+            val result = started.await()
+            val err = result.exceptionOrNull()
+            assertTrue("fatal Error must not ack as durable, got $err", err is OutOfMemoryError)
+            assertEquals(fatal.message, (err as OutOfMemoryError).message)
+            withTimeout(5_000) { while (!sink.isSealed()) delay(10) }
+          }
+        } finally {
+          release.complete(Unit)
+        }
+      }
+      val seen = reported.get()
+      assertTrue(
+        "core VM-fatal with durable waiter must be reported observably, got $seen",
+        seen is OutOfMemoryError && seen.message == fatal.message,
+      )
+      assertEquals("VM-fatal must be reported exactly once", 1, reportCount.get())
+      assertTrue("VM-fatal must seal the writer", sink.isSealed())
+      assertTrue(sink.interruptedRunIds().contains("run-fatal"))
+      assertTrue(sink.pendingRunIds().isEmpty())
+      assertTrue(sink.hasDurableFailures())
     } finally {
       exec.shutdown()
     }

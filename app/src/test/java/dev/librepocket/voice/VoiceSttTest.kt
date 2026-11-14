@@ -39,7 +39,7 @@ class VoiceSttTest {
 
     @Test fun emptyResults_stayManual() {
         assertNull(VoiceStt.pickResult(null))
-        assertNull(VoiceStt.pickResult(emptyList()))
+        assertNull(VoiceStt.pickResult(emptyList<Any?>()))
         assertNull(VoiceStt.pickResult(listOf("", "   ")))
     }
 
@@ -51,7 +51,7 @@ class VoiceSttTest {
     @Test fun mixedAndNullElements_pickFirstNonBlankString() {
         assertEquals("ok", VoiceStt.pickResult(listOf(42, "", "  ", "ok")))
         assertEquals("ok", VoiceStt.pickResult(listOf(null, "ok")))
-        assertNull(VoiceStt.pickResult(listOf(null, null)))
+        assertNull(VoiceStt.pickResult(listOf<Any?>(null, null)))
         assertNull(VoiceStt.pickResult(listOf<Any?>(null, 1, "", "  ")))
     }
 

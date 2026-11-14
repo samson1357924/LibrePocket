@@ -2164,5 +2164,46 @@ class ReleaseTagVersionTest(unittest.TestCase):
                 self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
 
 
+class CommittedPinsAbsenceControl(unittest.TestCase):
+    """Issue #12 tripwire: a real signer-pins registry must never be tracked.
+
+    The checked-in placeholder (`scripts/release_signer_pins.example.json`) is the only
+    permitted pins JSON. Docs (RELEASE.md) forbid committing production pins; this test
+    makes that invariant mechanical. Fail-closed if git is unavailable.
+    Executes only when the pr-check.yml policy-harness path filter is true; it does not
+    run on docs-only diffs.
+    """
+
+    def test_no_tracked_production_signer_pins_registry(self) -> None:
+        try:
+            result = subprocess.run(
+                ["git", "ls-files", "-z"],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except OSError as exc:
+            self.fail(f"pins-absence control requires git to enumerate tracked files: {exc}")
+        if result.returncode != 0:
+            self.fail(
+                "pins-absence control requires git to enumerate tracked files: "
+                + result.stderr.decode("utf-8", "replace").strip()
+            )
+        tracked = [p for p in result.stdout.decode("utf-8", "replace").split("\0") if p]
+        offenders = sorted(
+            p for p in tracked
+            if "signer_pins" in p.lower()
+            and p.lower().endswith((".json", ".txt", ".yaml", ".yml", ".toml"))
+            and p != PINS_EXAMPLE.relative_to(ROOT).as_posix()
+        )
+        self.assertEqual(
+            offenders,
+            [],
+            "production signer-pin registry must never be committed; only "
+            "scripts/release_signer_pins.example.json is permitted: " + ", ".join(offenders),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

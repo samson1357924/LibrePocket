@@ -1,6 +1,7 @@
 package dev.librepocket.privilege.github
 
 import java.lang.reflect.InaccessibleObjectException
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 提權子進程清理（B2，Issue #136 B2，僅 github 風味；P1-B 誠實化措辭；R2-A 可驗證化；
@@ -73,6 +74,24 @@ import java.lang.reflect.InaccessibleObjectException
  * interrupt＋500ms grace；永不跳過 killer 嘗試），未完成經
  * [ElevatedProcessIo.Drained.cleanupIncomplete] 帶出（runner verdict 映射不變）。
  *
+ * Stage 2A（P1-A7，PID-reuse 守門，security-auditor；不改呼叫方契約）：
+ * 巢狀（descendants）`destroy/destroyForcibly` 前一律重驗——[killDescendantsReflective]
+ * 對每個 handle 於其逐 handle 流出當下之後、信號之前取 `info().startInstant()` 快照
+ * （僅存活 handle 取快照；已死 handle 直接跳過不讀 info()），每次信號前重讀
+ * `startInstant()` 與 `isAlive()`：
+ * - 兩次 startInstant 不符 ⇒ PID 已被回收重用 ⇒ **跳過信號**
+ *   （不得對一顆可能已非原 process 的 PID 發信號；子孫清理 best-effort 語義不變）；
+ * - `info()` 抛／`startInstant` 缺席／`isAlive()==false`／不可驗證 ⇒ 同跳過；
+ *   其中「不可驗證／PID 回收」（死亡後的常規跳過除外）計入
+ *   [pidReuseSkippedCount] 診斷計數（不抛、不崩，fail-closed 方向是不誤殺）；
+ * - 本體 killTree 的 `process.destroy()/destroyForcibly()` 不走此守門
+ *   （本體 handle 由 caller 持有，語義與現況一致）。
+ * 子孫樹殺語義**維持 best-effort**：本守門只縮小「流出→信號」窗口，
+ * 不保證 handle 快照當下 PID 仍真值原子配對（TOCTOU 無法根除，裝置 SELinux／
+ * Root 差異 E2E 仍歸 #136-B3）。
+ * 平台 `info()`／`startInstant()` 完全不可讀時，巢狀樹殺退化為僅殺本體
+ * （body-only）——產品必須於啟用前以真機查驗 [pidReuseSkippedCount]（#136-B3 gate）。
+ *
  * B2 P1-3 誠實化（owner 新 P1-3，行為見 drain）：本物件全 runCatching（destroy／
  * destroyForcibly 抛即吞，遠端 destroy 失敗亦吞），`killTree` 正常返回≠進程真死
  * （no-op／抛吞／streams EOF 皆可返回）。真死由 [ElevatedProcessIo.drain] 經
@@ -82,6 +101,48 @@ import java.lang.reflect.InaccessibleObjectException
  * Root 語義差異 E2E 歸 #136-B3，見上）。
  */
 object ElevatedProcessKiller {
+
+    /**
+     * Stage 2A（P1-A7，PID-reuse 守門；診斷用，產品不讀取；正常路徑恆為 0）：
+     * 巢狀信號被跳過之次數——僅計「不可驗證或已回收（unverifiable or recycled）」，
+     * 即我們無法 attest 該 handle 之身份（we could not attest identity）者：
+     * `isAlive` API 缺席（method null）、`isAlive` 讀抛／非常規回傳、
+     * `info()`／`startInstant()` 不可讀（handle 快照或信號前重讀）、
+     * PID 已回收（startInstant 不符）。只有 `isAlive()==false` 的常規確認死亡
+     * （dead-but-alive-previously handles）不計。
+     *
+     * 刻意非接線（deliberate NON-wiring）進 verdict／breaker／admission：
+     * 平台若對任何一顆子孫完全無法 attest（無 isAlive／info／startInstant），
+     * tree kill 會對每個 handle 都 fail-close——等於把整個提權子孫清理
+     * 靜默關掉。那是產品決策（product decision），不是 killer 內部可定的
+     * 行為，必須由 #136-B3 以裝置端證據決定——pidReuseSkipped 必須列入
+     * #136-B3 裝置驗收清單（device-acceptance checklist）：啟用提權 runner
+     * 前，須先以真機量測本計數確認平台 attest 能力。
+     */
+    private val pidReuseSkipped = AtomicInteger(0)
+
+    /** PID-reuse 守門跳過的信號數快照（僅測試／診斷用）。 */
+    internal fun pidReuseSkippedCount(): Int = pidReuseSkipped.get()
+
+    /**
+     * Stage 2A（P1-A7）巢狀信號判定（純函數 seam，供 JVM 單測直斷；
+     * [killDescendantsReflective] 經 runtime reflection 餵入實際值）：
+     * 僅當 `isAlive()==true`、handle 快照 startInstant 可取得且當前重讀一致時
+     * 允許信號；任一不成立即跳過。`info()` 抛／`startInstant` 缺席以
+     * `currentStart=null` 表達；handle 快照不可驗證以 `expectedStart=null` 表達
+     * （兩者皆跳過）。PID 已回收（startInstant 不同）即 mismatch→跳過。
+     *
+     * Stage 2A（T7）：M2/M3 重構僅改呼叫點（不可驗證計數拆分／快照僅 alive
+     * 才取／死亡短路），本判定式一字不動（`alive && expectedStart != null &&
+     * expectedStart == currentStart`）；真值表（見 ElevatedProcessKillerTest
+     * `pidReuseSignalAllowedTruthTable`）同步維持。
+     */
+    internal fun pidReuseSignalAllowed(
+        alive: Boolean,
+        expectedStart: Any?,
+        currentStart: Any?,
+    ): Boolean = alive && expectedStart != null && expectedStart == currentStart
+
     fun killTree(process: Process) {
         runCatching { killDescendantsReflective(process) }
         // Y1：只管 destroy，不關流（串流由 drain 經已取引用關；此處重調 getter
@@ -129,11 +190,86 @@ object ElevatedProcessKiller {
         val destroy = runCatching { handleClass.getMethod("destroy") }.getOrNull()
         val destroyForcibly = runCatching { handleClass.getMethod("destroyForcibly") }.getOrNull()
         if (destroy == null && destroyForcibly == null) return
+        // Stage 2A（P1-A7）PID-reuse 守門：handle 流出後、信號前一律重驗。
+        // - 每 handle 於其流出（forEach 取到該 handle）當下之後、信號之前，僅對
+        //   存活 handle 取 `info().startInstant()` 快照（同一 process 判定基準；
+        //   已死 handle 直接跳過不讀 info()，Stage 2A M3）；不可讀（info 抛／
+        //   startInstant 缺席）即該 handle 全程不信號；
+        // - 每次 destroy／destroyForcibly 前重讀 `isAlive()`＋`info().startInstant()`：
+        //   PID 已回收（startInstant 不同）／info 抛／isAlive=false 即跳過該次信號
+        //   （無法驗證＝不得信號可能已非原 process 的 PID）；
+        // - 兩次信號各自重驗（destroy 與 destroyForcibly 之間 PID 亦可能被回收）；
+        // - 跳過計 [pidReuseSkipped]（僅不可驗證／已回收；`isAlive()==false` 的
+        //   常規確認死亡不計；不抛不崩；本體單殺不受此守門約束）；
+        // - 子孫樹殺語義維持 best-effort（本守門只縮「流出→信號」窗口，
+        //   TOCTOU 無法根除，見 KDoc）。
+        val infoMethod = runCatching { handleClass.getMethod("info") }.getOrNull()
+        val isAliveMethod = runCatching { handleClass.getMethod("isAlive") }.getOrNull()
+        fun isAliveOf(h: Any): Boolean? {
+            if (isAliveMethod == null) return null // 平台無 isAlive API：不可驗證
+            return try {
+                isAliveMethod.invoke(h) as? Boolean
+            } catch (_: Throwable) {
+                null // 讀不可驗證
+            }
+        }
+        fun startInstantOf(h: Any): Any? {
+            if (infoMethod == null) return null
+            return try {
+                val info = infoMethod.invoke(h) ?: return null
+                // 注意（R2-A 同款陷阱）：info 的執行時類（如 `ProcessHandleImpl$Info`）
+                // 常為模組內 package-private，`info.javaClass.getMethod("startInstant")`
+                // 取到的 Method 宣告類不可見 → invoke 即 IllegalAccessException。
+                // 故以 runtime 宣告類的公開介面（ProcessHandle$Info）查表，不繫結
+                // 任何編譯期型別（舊 Android 缺席亦自然收斂為 null＝不可驗證）。
+                val infoIface = info.javaClass.interfaces.firstOrNull { cls ->
+                    cls.methods.any { it.name == "startInstant" && it.parameterCount == 0 }
+                } ?: return null
+                val opt = infoIface.getMethod("startInstant").invoke(info) ?: return null
+                val present =
+                    opt.javaClass.getMethod("isPresent").invoke(opt) as? Boolean ?: false
+                if (present) opt.javaClass.getMethod("get").invoke(opt) else null
+            } catch (_: Throwable) {
+                null // info/startInstant 抛或缺席＝不可驗證（以 null 表達，呼叫方跳過）
+            }
+        }
+
+        fun signalAllowed(h: Any, expectedStart: Any?): Boolean {
+            val alive = isAliveOf(h)
+            if (alive == null) {
+                // isAlive API 缺席／讀抛／非常規回傳＝不可驗證：不信號＋計診斷。
+                pidReuseSkipped.incrementAndGet()
+                return false
+            }
+            if (!alive) {
+                // 已死（destroy 已生效／自然退出）：無信號可發——常規態，不計診斷
+                // （此路徑不得污染 pidReuseSkipped 的「無法 attest 身份」語義）。
+                return false
+            }
+            val current = startInstantOf(h)
+            if (!pidReuseSignalAllowed(alive, expectedStart, current)) {
+                // 不可驗證（expected/current 任一 null ⇒ info 抛或 startInstant 缺席，
+                // 含 handle 快照不可讀）或 PID 已回收（startInstant 不符）：跳過＋計診斷。
+                pidReuseSkipped.incrementAndGet()
+                return false
+            }
+            return true
+        }
         try {
             descendants.forEach { h ->
                 if (h == null) return@forEach
-                runCatching { destroy?.invoke(h) }
-                runCatching { destroyForcibly?.invoke(h) }
+                // Stage 2A（M3）：快照僅取存活 handle——已死 handle 直接跳過，
+                // 不讀 info()（dead handle 無信號可發；行為不變，僅省一次 info()）；
+                // 不可驗證（null）同樣不取快照（signalAllowed 走 pidReuseSkipped 計數）。
+                val alive = isAliveOf(h)
+                if (alive == false) return@forEach
+                val expectedStart: Any? = if (alive == true) startInstantOf(h) else null
+                if (signalAllowed(h, expectedStart)) {
+                    runCatching { destroy?.invoke(h) }
+                }
+                if (signalAllowed(h, expectedStart)) {
+                    runCatching { destroyForcibly?.invoke(h) }
+                }
             }
         } catch (_: Exception) {
             // Stream.forEach 本體異常（列舉中途 IO/併發失敗）：單個 handle 已在內層

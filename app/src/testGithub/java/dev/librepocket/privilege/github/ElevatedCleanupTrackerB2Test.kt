@@ -939,6 +939,147 @@ class ElevatedCleanupTrackerB2Test {
         }
     }
 
+    // ---- Stage 2A（P1-A1）：acquireSlotOrQuarantine 原子 acquire-or-quarantine ----
+    //
+    // code-reviewer 標記（pre-Stage-2A gap）：飽和臂舊碼 `acquireSlot()==false →（gap）
+    // → quarantineUnverified(v)` 兩次獨立取鎖——併發 drain 可在縫隙內釋槽至 0，並行
+    // tryEnterReserved 可能在 quarantine 登記前被准入（fail-open）。helper 把預留
+    // 檢查＋佔席（或登記）壓成同一 [lock] 持有內的單一原子判定，本組測試直接斷
+    // 言其語義（無法以測試強制交錯的縫隙——縫隙已不存在）。
+
+    @Test fun acquireSlotOrQuarantineSaturatedRegistersQuarantineAtomically() {
+        ElevatedCleanupTracker.resetPeak()
+        val victim = FastAliveProcess()
+        try {
+            repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
+                assertTrue("slot $it must grant below MAX", ElevatedCleanupTracker.acquireSlot())
+            }
+            assertTrue(ElevatedCleanupTracker.isSaturated())
+            // 飽和：helper 同鎖內登記 quarantine，不佔槽、outstanding 封頂不增。
+            assertFalse("saturated acquire-or-quarantine must refuse the slot",
+                ElevatedCleanupTracker.acquireSlotOrQuarantine(victim))
+            assertEquals(
+                "saturated acquire-or-quarantine must leave outstanding unchanged",
+                ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+                ElevatedCleanupTracker.outstanding(),
+            )
+            assertEquals(
+                "saturated acquire-or-quarantine must register quarantine under the same lock",
+                1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
+            // 冪等閂：同 handle 重複登記不雙計、outstanding 不增。
+            assertFalse(ElevatedCleanupTracker.acquireSlotOrQuarantine(victim))
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            assertEquals(
+                ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+                ElevatedCleanupTracker.outstanding(),
+            )
+        } finally {
+            repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
+                ElevatedCleanupTracker.releaseSlot()
+            }
+            ElevatedCleanupTracker.clearUnverified()
+            pollOutstandingTo(0)
+            ElevatedCleanupTracker.noteClean()
+        }
+    }
+
+    @Test fun acquireSlotOrQuarantineGrantsSlotWhenAvailableLeavesQuarantineEmpty() {
+        ElevatedCleanupTracker.resetPeak()
+        val victim = FastAliveProcess()
+        try {
+            assertTrue(ElevatedCleanupTracker.acquireSlotOrQuarantine(victim))
+            assertEquals(1, ElevatedCleanupTracker.outstanding())
+            assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
+            assertFalse(ElevatedCleanupTracker.isQuarantined())
+        } finally {
+            ElevatedCleanupTracker.releaseSlot()
+            ElevatedCleanupTracker.clearUnverified()
+            pollOutstandingTo(0)
+            ElevatedCleanupTracker.noteClean()
+        }
+    }
+
+    @Test fun acquireSlotOrQuarantineSealedAdmissionWindowWhenSaturated() {
+        // 飽和登記完成後即使 outstanding 歸零（併發 drain 釋槽的最壞情境），
+        // 並行准入仍被 quarantine 槍末門擋下（QUARANTINE，不佔席、零 spawn）。
+        ElevatedCleanupTracker.resetPeak()
+        val victim = FastAliveProcess()
+        var prefilled = 0
+        try {
+            repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) { i ->
+                assertTrue("prefill slot $i must grant below MAX",
+                    ElevatedCleanupTracker.acquireSlot())
+                prefilled++
+            }
+            assertFalse(ElevatedCleanupTracker.acquireSlotOrQuarantine(victim))
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            // 併發 drain 全部釋槽（最壞的歸零窗口）。
+            repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
+            prefilled = 0
+            pollOutstandingTo(0)
+            // 歸零後並行准入：quarantine 末門獨力封死 fail-open 窗口。
+            assertEquals(
+                ElevatedCleanupTracker.Admission.QUARANTINE,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+        } finally {
+            // 恰好釋放仍持有的槽（body 已釋則 0）；絕不同超過 acquire 數。
+            repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
+            ElevatedCleanupTracker.clearUnverified()
+            pollOutstandingTo(0)
+            ElevatedCleanupTracker.noteClean()
+        }
+    }
+
+    @Test fun acquireSlotOrQuarantineConcurrentCallersNeverLoseOrDoubleCount() {
+        // burst 個不同 handle 併發競爭 MAX 槽：成功者恰好 MAX（無人釋放）、
+        // 其餘逐一登記 quarantine（identity 去重互不影響）——完成態斷言
+        // acquired==MAX、quarantined==burst-MAX，無丟失、無雙計。
+        ElevatedCleanupTracker.resetPeak()
+        val burst = ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS + 4
+        val handles = List(burst) { FastAliveProcess() }
+        val successes = AtomicInteger(0)
+        val gate = CountDownLatch(1)
+        try {
+            val threads = handles.map { h ->
+                Thread({
+                    val awaited = gate.await(5, TimeUnit.SECONDS)
+                    assertTrue("burst gate must open within 5s", awaited)
+                    if (ElevatedCleanupTracker.acquireSlotOrQuarantine(h)) {
+                        successes.incrementAndGet()
+                    }
+                }, "acq-or-quarantine").also { it.isDaemon = true; it.start() }
+            }
+            gate.countDown()
+            threads.forEach { it.join(10_000L) }
+            assertTrue(threads.none { it.isAlive })
+            assertEquals(
+                ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+                successes.get(),
+            )
+            assertEquals(
+                burst - ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
+            assertEquals(
+                ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+                ElevatedCleanupTracker.outstanding(),
+            )
+        } finally {
+            // 僅釋放本 burst 成功者實際佔的槽（恰好 successes.get()）；
+            // quarantine 登記的敗者未佔槽，經 clearUnverified 清除。
+            repeat(successes.get()) {
+                ElevatedCleanupTracker.releaseSlot()
+            }
+            ElevatedCleanupTracker.clearUnverified()
+            pollOutstandingTo(0)
+            ElevatedCleanupTracker.noteClean()
+        }
+    }
+
     @Test fun kickSweepAsyncStartThreadOomAfterConcurrentClearPreservesResetAndReleasesLease() {
         try {
             // 1. Seed a previous sweep at t1 = 10s so prevHasStart=true, prevStart=10s.

@@ -97,6 +97,35 @@ class ElevatedProcessKillerTest {
         assertTrue("fallback must still destroy parent", stub.destroyed)
     }
 
+    @Test fun pidReuseSignalAllowedTruthTable() {
+        // Stage 2A（P1-A7）PID-reuse 守門判定表（killDescendantsReflective 的純函數 seam）。
+        // 接線（snapshot→recheck→skip＋計數）無法以假 ProcessHandle 直測：單元測試編譯
+        // 走 SDK 公開表面過濾，toHandle/descendants override 不可行（見本檔 KDoc），
+        // 而真實 PID 回收無法確定性誘發；故接線以真樹測試＋本判定表共同覆蓋，
+        // 殘餘歸 #136-B3 E2E。
+        val t0 = java.time.Instant.ofEpochMilli(1_700_000_000_000L)
+        val t1 = java.time.Instant.ofEpochMilli(1_800_000_000_000L)
+        // Happy path：存活＋快照一致 → 允許信號。
+        assertTrue(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, t0))
+        // PID 已回收（startInstant 不同）→ 跳過。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, t1))
+        // handle 快照不可驗證（info 抛／startInstant 缺席）→ 跳過。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, null, t0))
+        // 信號前重讀不可驗證（info 抛／缺席）→ 跳過。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, null))
+        // 兩者皆 null（完全不可驗證）→ 跳過。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, null, null))
+        // 已死 → 跳過（常規態，無信號可發）。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(false, t0, t0))
+        // 已死（PID 已重用，startInstant 不同）→ 跳過；釘死 alive&& 短路順序。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(false, t0, t1))
+        // 已死（快照不可驗證，current 讀得 t0）→ 跳過；短路順序同上。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(false, null, t0))
+        // 值語義等值：不同值即 mismatch，相同值即放行。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, "start-a", "start-b"))
+        assertTrue(ElevatedProcessKiller.pidReuseSignalAllowed(true, "start-a", "start-a"))
+    }
+
     @Test fun destroyForciblyReturnsThis() {
         // AB1 順手補（核實缺失後新增）：fake 契約——destroyForcibly 回同一實例
         //（drain／kill 流程依賴此語義；ShizukuRemoteProcess 包裝直通同理）。

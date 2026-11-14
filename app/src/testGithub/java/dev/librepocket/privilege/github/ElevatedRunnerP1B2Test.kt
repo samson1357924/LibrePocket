@@ -826,6 +826,134 @@ class ElevatedRunnerP1B2Test {
         }
     }
 
+    // ---- Stage 2A（P1-A2）：飽和 cleanup worker → Drained.untrackedResidual＋tracker 計數 ----
+
+    @Test fun drainCleanupSaturationRecordsUntrackedResidualWorker() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val untrackedBefore = ElevatedCleanupTracker.untrackedResidualCount()
+        val killNeverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+        var prefilled = 0
+        val killerCalls = AtomicInteger(0)
+        try {
+            // 預填至 MAX：drain kill 路徑 runCleanupBounded 佔槽必敗 → worker 未佔槽起動。
+            repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
+                assertTrue(ElevatedCleanupTracker.acquireSlot())
+                prefilled++
+            }
+            val d = ElevatedProcessIo.drainWithThreadStarter(
+                process = KillableImmediateProcess(),
+                timeoutMs = 300L,
+                killer = {
+                    killerCalls.incrementAndGet()
+                    it.destroy()
+                },
+                isCancelled = { false },
+                startThread = { it.start() },
+            )
+            // killer 仍被嘗試（飽和不跳過），但 worker 無槽可記 → 不完整。
+            assertEquals("kill path must still attempt the killer", 1, killerCalls.get())
+            assertTrue(
+                "saturated cleanup worker must flag cleanupIncomplete",
+                d.cleanupIncomplete,
+            )
+            assertTrue(
+                "saturated cleanup worker must surface untrackedResidual",
+                d.untrackedResidual,
+            )
+            assertEquals(
+                "untracked residual counter must increment exactly once (cleanup worker only)",
+                1,
+                ElevatedCleanupTracker.untrackedResidualCount() - untrackedBefore,
+            )
+            assertEquals(
+                "thread start succeeded ⇒ kill-never-attempted must NOT increment",
+                killNeverBefore,
+                ElevatedCleanupTracker.killNeverAttemptedCount(),
+            )
+            // Stage 2A（M1）：飽和臂改經 acquireSlotOrQuarantine——handle 已在同一
+            // 鎖內原子登記 quarantine（准入自此密封至 sweep 驗證）；telemetry
+            // 計數（untrackedResidual）並列不變。
+            assertEquals(
+                "saturated cleanup handle must be registered in quarantine atomically",
+                quarantineBefore + 1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
+            // 預填槽保持（untracked worker 未佔而釋不了、也不得釋）。
+            assertEquals(
+                ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+                ElevatedCleanupTracker.outstanding(),
+            )
+        } finally {
+            repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
+            pollOutstandingTo(0)
+            // M1：飽和 cleanup handle 仍在 quarantine——明確清除（tearDownIsolation
+            // 亦會清，此處顯式呼叫以隔離本測試的登記）。
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
+        }
+    }
+
+    // ---- Stage 2A（P1-A3）：cleanup worker 起線程失敗 → killNeverAttempted（既有語義不變） ----
+
+    @Test fun drainCleanupThreadStartFailureRecordsKillNeverAttempted() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val neverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
+        val untrackedBefore = ElevatedCleanupTracker.untrackedResidualCount()
+        val killerCalls = AtomicInteger(0)
+        try {
+            val d = ElevatedProcessIo.drainWithThreadStarter(
+                process = KillableImmediateProcess(),
+                timeoutMs = 300L,
+                killer = {
+                    // 起線程失敗即無 worker 執行 block() ⇒ killer 從未被信號。
+                    killerCalls.incrementAndGet()
+                    it.destroy()
+                },
+                isCancelled = { false },
+                startThread = { t ->
+                    if (t.name == "elevated-cleanup") {
+                        throw OutOfMemoryError("simulated OOM on elevated-cleanup")
+                    }
+                    t.start()
+                },
+            )
+            assertEquals(
+                "killer must never run on the thread-start-failure path",
+                0,
+                killerCalls.get(),
+            )
+            assertEquals(
+                "kill-never-attempted counter must increment exactly once",
+                1,
+                ElevatedCleanupTracker.killNeverAttemptedCount() - neverBefore,
+            )
+            assertEquals(
+                "no worker existed ⇒ untracked residual must NOT increment",
+                untrackedBefore,
+                ElevatedCleanupTracker.untrackedResidualCount(),
+            )
+            // 既有語義不變：不完整＋timedOut=true（kill 路徑）＋exitCode=-1。
+            assertTrue("cleanupIncomplete must stay true", d.cleanupIncomplete)
+            assertTrue("timedOut must stay true (kill path)", d.timedOut)
+            assertEquals(-1, d.exitCode)
+            assertFalse(
+                "untrackedResidual must stay false (no worker was ever started)",
+                d.untrackedResidual,
+            )
+        } finally {
+            pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
+        }
+    }
+
     @Test fun drainInputStreamOomMarksReadFailedNeverPartialOk() {
         val exec = HermeticExecFixture("p1-oom-stream", "screencap", "id")
         try {

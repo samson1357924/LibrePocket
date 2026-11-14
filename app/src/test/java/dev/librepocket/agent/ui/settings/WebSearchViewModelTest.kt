@@ -1380,6 +1380,53 @@ class WebSearchViewModelTest {
     }
 
     @Test
+    fun resetQueuedNotYetDequeued_postResetDraftSurvives_withLaterConsentConfirm_withoutWorkerDispatch() = runTest {
+        val fakeDs = FakePreferencesDataStore(
+            prefs(master = false, ddgs = true, consent = false, url = "https://old.example"),
+        )
+        val vm = installStandardVm(fakeDs)
+        val collector = collectUi(vm)
+        vm.uiState.first { !it.isLoading }
+
+        // A -> Reset -> B -> MasterOn(consent sheet) -> ConsentConfirm, all before worker dispatch.
+        vm.onSearxngUrlChange("https://a.example")
+        vm.onResetSettings()
+        vm.onSearxngUrlChange("https://b.example")
+        vm.onMasterSwitch(true)
+        vm.onConsentConfirm()
+
+        advanceUntilIdle()
+
+        assertEquals("https://b.example", fakeDs.currentUrl())
+        assertEquals("https://b.example", vm.uiState.value.searxngUrl)
+        assertFalse(fakeDs.writtenUrls.contains("https://a.example"))
+        assertTrue(fakeDs.currentMaster())
+        assertTrue(fakeDs.currentConsent())
+        // ResetAll must have executed (clearing stale ddgs) despite later queued consent submission.
+        assertFalse(fakeDs.currentDdgs())
+        assertFalse(vm.uiState.value.consentSubmitting)
+        assertFalse(vm.uiState.value.showConsent)
+        collector.cancel()
+
+        val vmStore2 = trackStore(ViewModelStore())
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        Dispatchers.setMain(dispatcher)
+        val ioDispatcher = dispatcher
+        val store = WebSwitchStore(fakeDs, ioDispatcher)
+        val factory = object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T = WebSearchViewModel(store, ioDispatcher) as T
+        }
+        val vm2 = ViewModelProvider(vmStore2, factory)[WebSearchViewModel::class.java]
+        val collector2 = collectUi(vm2)
+        vm2.uiState.first { !it.isLoading }
+        assertEquals("https://b.example", vm2.uiState.value.searxngUrl)
+        assertTrue(vm2.uiState.value.masterEnabled)
+        assertFalse(vm2.uiState.value.ddgsOptIn)
+        collector2.cancel()
+    }
+
+    @Test
     fun inFlightUrlWrite_resetQueued_postResetDraftWins_andPersistsAcrossRecreation() = runTest {
         val firstWriteEntered = CompletableDeferred<Unit>()
         val firstWriteGate = CompletableDeferred<Unit>()

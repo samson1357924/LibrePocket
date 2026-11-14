@@ -288,15 +288,15 @@ class LibreVoiceInteractionSessionTest {
         AssistantVoiceHandoff.clear()
 
         ShadowSystemClock.advanceBy(Duration.ofMillis(1000))
-        session.onShow(null, 0) // retrigger attempt fails
-        assertEquals(1, session.startedIntents.size)
+        session.onShow(null, 0) // retrigger attempt fails (attempt recorded by test double)
+        assertEquals(2, session.startedIntents.size)
         assertEquals(0L, AssistantVoiceHandoff.peek())
         assertEquals(0, session.hideCalls)
 
         // Next real gesture shortly after failure must still be accepted.
         ShadowSystemClock.advanceBy(Duration.ofMillis(50))
         session.onShow(null, 0)
-        assertEquals(2, session.startedIntents.size)
+        assertEquals(3, session.startedIntents.size)
         assertNotEquals(0L, AssistantVoiceHandoff.peek())
         assertEquals(0, session.hideCalls)
 

@@ -5,6 +5,7 @@ import java.util.Collections
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
@@ -816,6 +817,54 @@ class OrderedTranscriptSinkTest {
       assertEquals(1, notices.get())
       assertFalse("non-VM fatal in a best-effort entry must not seal", sink.isSealed())
       assertFalse(sink.hasDurableFailures())
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  @Test fun bestEffortVmFatalWithNoWaiter_reportsAndSealsWithoutDurablePoison() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val entered = CompletableDeferred<Unit>()
+      val release = CompletableDeferred<Unit>()
+      val reported = AtomicReference<Throwable?>()
+      val fatal = OutOfMemoryError("simulated best-effort VM fatal without waiter")
+      val delegate = object : SinkProbe() {
+        override suspend fun flushBufferedUsageBestEffort(runId: String) {
+          entered.complete(Unit)
+          release.await()
+          throw fatal
+        }
+      }
+      val sink = OrderedTranscriptSink(
+        delegate = delegate,
+        dispatcher = dispatcher,
+        capacity = 8,
+        terminalFatalReporter = { t -> reported.compareAndSet(null, t) },
+      )
+      runBlocking {
+        try {
+          withTimeout(10_000) {
+            // Ackless best-effort notice: no flush waiter/ack observes this entry.
+            sink.flushBufferedUsageBestEffort("r1")
+            entered.await()
+            release.complete(Unit)
+            withTimeout(5_000) { while (!sink.isSealed()) delay(10) }
+          }
+        } finally {
+          release.complete(Unit)
+        }
+      }
+      val seen = reported.get()
+      assertTrue(
+        "best-effort VM-fatal without waiter must be reported observably, got $seen",
+        seen is OutOfMemoryError && seen.message == fatal.message,
+      )
+      assertTrue("VM-fatal must seal the writer", sink.isSealed())
+      assertTrue("no core write admitted, so no interrupted runIds: ${sink.interruptedRunIds()}", sink.interruptedRunIds().isEmpty())
+      assertTrue(sink.pendingRunIds().isEmpty())
+      assertFalse("best-effort notice must not poison durable core failures", sink.hasDurableFailures())
     } finally {
       exec.shutdown()
     }

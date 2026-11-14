@@ -65,6 +65,24 @@ class OrderedTranscriptSink(
   private val delegate: TranscriptSink,
   dispatcher: CoroutineDispatcher = Dispatchers.Default,
   capacity: Int = DEFAULT_CAPACITY,
+  /**
+   * Terminal fatal reporter for [VirtualMachineError]/[ThreadDeath] paths that
+   * must remain observable even when the internal writer/shutdown coroutine
+   * suppresses uncaught propagation to avoid CI/test-harness pollution. Default
+   * reports to the process uncaught handler (or stderr). Must not throw.
+   */
+  private val terminalFatalReporter: (Throwable) -> Unit = { t ->
+    try {
+      val handler = Thread.getDefaultUncaughtExceptionHandler()
+      if (handler != null) {
+        handler.uncaughtException(Thread.currentThread(), t)
+      } else {
+        t.printStackTrace(System.err)
+      }
+    } catch (_: Throwable) {
+      // Never let reporting mask fail-closed sink state.
+    }
+  },
 ) : TranscriptSink {
 
   private data class Entry(
@@ -96,6 +114,11 @@ class OrderedTranscriptSink(
 
   private val writerScope = CoroutineScope(SupervisorJob() + dispatcher)
   private val channel = kotlinx.coroutines.channels.Channel<Entry>(capacity)
+
+  private fun reportTerminalFatal(t: Throwable) {
+    if (t !is VirtualMachineError && t !is ThreadDeath) return
+    runCatching { terminalFatalReporter(t) }
+  }
   private val pendingCore = ConcurrentHashMap.newKeySet<String>()
   /**
    * R17-1 P1 review: leaf monitor for the writer success-path commit pair
@@ -483,6 +506,10 @@ class OrderedTranscriptSink(
               // or block later core writes; swallow it (best-effort).
               failure = null
             } else {
+              // VM-fatal/ThreadDeath (including best-effort notices with no
+              // waiter/ack): seal fail-closed and report observably, then
+              // propagate to terminate the writer.
+              reportTerminalFatal(e)
               throw e
             }
           } finally {
@@ -571,11 +598,14 @@ class OrderedTranscriptSink(
       }
     } catch (t: Throwable) {
       // Fatal/terminal writer failures are already delivered to the durable
-      // waiter ack and reflected in seal/interrupted state above. Suppress
-      // uncaught propagation from this internal coroutine so intentional
-      // fail-loud test paths (and rare production fatals) cannot poison
-      // unrelated coroutines-test/runTest collectors or global handlers.
+      // waiter ack and reflected in seal/interrupted state above. VM-fatal/
+      // ThreadDeath must remain observable (especially best-effort no-waiter
+      // cases), but suppress coroutine-uncaught propagation to avoid
+      // unrelated coroutines-test/runTest collector pollution.
       terminalFailure = t
+      if (t is VirtualMachineError || t is ThreadDeath) {
+        reportTerminalFatal(t)
+      }
     }
   }
 
@@ -1451,7 +1481,10 @@ class OrderedTranscriptSink(
           // best-effort swallow. Honest cost: teardown aborts early on OOM
           // and the drain is not attempted, which is the correct
           // fail-loud choice.
-          if (e is VirtualMachineError || e is ThreadDeath) throw e
+          if (e is VirtualMachineError || e is ThreadDeath) {
+            reportTerminalFatal(e)
+            throw e
+          }
         }
         val flushed = try {
           flush(drainTimeoutMs)
@@ -1510,7 +1543,10 @@ class OrderedTranscriptSink(
             // (TurnController); honest cost: teardown aborts early on OOM
             // (the final scope cancel below is skipped), which is the
             // correct fail-loud choice.
-            if (e is VirtualMachineError || e is ThreadDeath) throw e
+            if (e is VirtualMachineError || e is ThreadDeath) {
+              reportTerminalFatal(e)
+              throw e
+            }
           }
         }
         writerScope.cancel()

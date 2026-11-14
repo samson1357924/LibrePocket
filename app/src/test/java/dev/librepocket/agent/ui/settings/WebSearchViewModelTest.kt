@@ -17,7 +17,10 @@ import dev.librepocket.web.WebSearchSettings
 import dev.librepocket.web.WebSwitchStore
 import dev.librepocket.web.WebUnavailableReason
 import java.io.IOException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -2911,5 +2914,58 @@ class WebSearchViewModelTest {
         assertEquals("", fakeDs.currentUrl())
         assertFalse(vm.uiState.value.canReset)
         collector.cancel()
+    }
+
+
+    @Test
+    fun concurrentUrlEdits_publishAtomically_persistNewestDraft() = runTest {
+        repeat(10) {
+            val fakeDs = FakePreferencesDataStore(
+                prefs(master = true, ddgs = false, consent = true, url = "https://old.example"),
+            )
+            val vm = installStandardVm(fakeDs)
+            val collector = collectUi(vm)
+            vm.uiState.first { !it.isLoading }
+
+            val barrier = CyclicBarrier(2)
+            val done = CountDownLatch(2)
+            val a = "https://a.example"
+            val b = "https://b.example"
+            val t1 = Thread {
+                try {
+                    barrier.await(5, TimeUnit.SECONDS)
+                    vm.onSearxngUrlChange(a)
+                } finally {
+                    done.countDown()
+                }
+            }
+            val t2 = Thread {
+                try {
+                    barrier.await(5, TimeUnit.SECONDS)
+                    vm.onSearxngUrlChange(b)
+                } finally {
+                    done.countDown()
+                }
+            }
+            t1.start()
+            t2.start()
+            assertTrue(done.await(10, TimeUnit.SECONDS))
+            t1.join(1_000)
+            t2.join(1_000)
+
+            advanceUntilIdle()
+
+            val uiUrl = vm.uiState.value.searxngUrl
+            assertTrue(
+                "UI must show one of the raced drafts, got $uiUrl",
+                uiUrl == a || uiUrl == b,
+            )
+            assertEquals(
+                "persisted URL must match newest admitted draft shown in UI (no stale displacement)",
+                uiUrl,
+                fakeDs.currentUrl(),
+            )
+            collector.cancel()
+        }
     }
 }

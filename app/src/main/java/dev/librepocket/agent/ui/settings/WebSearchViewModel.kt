@@ -427,7 +427,20 @@ class WebSearchViewModel(
         next
     }
 
-    private fun enqueueUrlWrite(cmd: StoreCommand.UrlWrite): Boolean {
+    /**
+     * Publish latest URL draft for conflated flush. Must be called while holding
+     * [stateLock] together with the corresponding draft state transition so a
+     * newer draft cannot be displaced by a stale concurrent publication.
+     */
+    private fun enqueueUrlWriteLocked(cmd: StoreCommand.UrlWrite): Boolean {
+        val cur = pendingUrlWrite.get()
+        if (cur != null &&
+            (cmd.resetGeneration < cur.resetGeneration ||
+                (cmd.resetGeneration == cur.resetGeneration && cmd.draftVersion < cur.draftVersion))
+        ) {
+            // Stale publication; keep the newer conflated draft.
+            return true
+        }
         pendingUrlWrite.set(cmd)
         if (urlFlushQueued.compareAndSet(false, true)) {
             val sent = storeCommandChannel.trySend(StoreCommand.UrlFlush)
@@ -849,9 +862,10 @@ class WebSearchViewModel(
 
     fun onSearxngUrlChange(newUrl: String) {
         var oldProbe: Job? = null
-        var urlCmd: StoreCommand.UrlWrite? = null
-        val next = updateState { cur ->
-            if (!canMutateWith(cur) || cur.consentSubmitting) {
+        var enqueueFailed = false
+        val next = synchronized(stateLock) {
+            val cur = latestState
+            val raw = if (!canMutateWith(cur) || cur.consentSubmitting) {
                 cur
             } else {
                 oldProbe = cancelProbeLocked()
@@ -870,7 +884,10 @@ class WebSearchViewModel(
                         writeError = "SearXNG 網址過長，未儲存至本機設定。",
                     )
                 } else {
-                    urlCmd = StoreCommand.UrlWrite(url = newUrl, draftVersion = ver, resetGeneration = rGen)
+                    val urlCmd = StoreCommand.UrlWrite(url = newUrl, draftVersion = ver, resetGeneration = rGen)
+                    if (!enqueueUrlWriteLocked(urlCmd)) {
+                        enqueueFailed = true
+                    }
                     cur.copy(
                         draftUrl = newUrl,
                         urlDirty = true,
@@ -881,13 +898,17 @@ class WebSearchViewModel(
                     )
                 }
             }
-        }
-        val cmd = urlCmd
-        if (cmd != null) {
-            val enqueued = enqueueUrlWrite(cmd)
-            if (!enqueued && !next.isCleared) {
-                runCatching { Log.w(TAG, "web store command rejected unexpectedly") }
+            val bumped = if (raw != cur) {
+                val n = raw.copy(stateVersion = cur.stateVersion + 1)
+                latestState = n
+                n
+            } else {
+                cur
             }
+            bumped
+        }
+        if (enqueueFailed && !next.isCleared) {
+            runCatching { Log.w(TAG, "web store command rejected unexpectedly") }
         }
         oldProbe?.cancel()
         syncUi(next)

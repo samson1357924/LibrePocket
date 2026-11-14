@@ -33,7 +33,7 @@ class AssistantVoiceTest {
 
     @Test fun emptyResults_stayManual() {
         assertNull(AssistantVoice.resolveVoicePrefill(null))
-        assertNull(AssistantVoice.resolveVoicePrefill(emptyList()))
+        assertNull(AssistantVoice.resolveVoicePrefill(emptyList<Any?>()))
         assertNull(AssistantVoice.resolveVoicePrefill(listOf("", "   ")))
     }
 

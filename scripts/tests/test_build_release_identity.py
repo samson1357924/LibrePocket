@@ -1248,6 +1248,83 @@ class SignerPinRegistryTest(unittest.TestCase):
         with self.assertRaises(signer_pins.PinError):
             signer_pins.load_pins(None)  # type: ignore[arg-type]
 
+    def test_foss_and_github_flavor_entries_are_accepted(self) -> None:
+        path = self._write(
+            "pins.json",
+            {
+                "foss": {"package": "dev.librepocket.agent", "cert_sha256": "CD34" * 16},
+                "github": {"package": "dev.librepocket.agent", "cert_sha256": "EF56" * 16},
+            },
+        )
+
+        pins = signer_pins.load_pins(str(path))
+
+        self.assertEqual(
+            pins,
+            {
+                "foss": {"package": "dev.librepocket.agent", "cert_sha256": "cd34" * 16},
+                "github": {"package": "dev.librepocket.agent", "cert_sha256": "ef56" * 16},
+            },
+        )
+
+    def test_require_flavors_cli_accepts_full_three_flavor_registry(self) -> None:
+        path = self._write(
+            "pins.json",
+            {
+                "play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16},
+                "foss": {"package": "dev.librepocket.agent", "cert_sha256": "cd34" * 16},
+                "github": {"package": "dev.librepocket.agent", "cert_sha256": "ef56" * 16},
+            },
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(PINS_CHECKER), "--pins", str(path),
+             "--require-flavors", "play foss github"],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        result_json = json.loads(result.stdout)
+        self.assertEqual(result_json.get("status"), "ok")
+
+    def test_size_cap_boundary_is_exactly_65536_bytes(self) -> None:
+        base = json.dumps(
+            {"play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16}}
+        ).encode("utf-8")
+        self.assertLess(len(base), 65536)
+        at_cap = self.tmp / "pins-at-cap.json"
+        at_cap.write_bytes(base + b" " * (65536 - len(base)))
+        self.assertEqual(at_cap.stat().st_size, 65536)
+        pins = signer_pins.load_pins(str(at_cap))
+        self.assertEqual(pins["play"]["cert_sha256"], "ab12" * 16)
+        over_cap = self.tmp / "pins-over-cap.json"
+        over_cap.write_bytes(base + b" " * (65537 - len(base)))
+        self.assertEqual(over_cap.stat().st_size, 65537)
+        with self.assertRaisesRegex(signer_pins.PinError, "exceeds"):
+            signer_pins.load_pins(str(over_cap))
+
+    def test_package_segment_grammar_rejects_malformed_segments(self) -> None:
+        malformed = ("1abc.def", "dev..agent", "dev-agent.app", "_dev.app")
+        for package in malformed:
+            with self.subTest(package=package):
+                path = self._write(
+                    "pins.json",
+                    {"play": {"package": package, "cert_sha256": "ab12" * 16}},
+                )
+                with self.assertRaisesRegex(signer_pins.PinError, "invalid package"):
+                    signer_pins.load_pins(str(path))
+        path = self._write(
+            "pins.json",
+            {"play": {"package": "dev_agent.app", "cert_sha256": "ab12" * 16}},
+        )
+        pins = signer_pins.load_pins(str(path))
+        self.assertEqual(pins["play"]["package"], "dev_agent.app")
+
     def test_package_length_boundary_and_cert_variants(self) -> None:
         long_ok = "a." + "b" * 251 + ".c"  # 255 chars, valid dotted shape
         self.assertEqual(len(long_ok), 255)
@@ -2162,6 +2239,28 @@ class ReleaseTagVersionTest(unittest.TestCase):
             with self.subTest(content=content):
                 path.write_text(content, encoding="utf-8")
                 self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+    def test_expression_templates_outside_default_config_are_rejected(self) -> None:
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        block = 'android {\n defaultConfig {\n' + direct + '}\n}\n'
+        path = self.tmp / "expression-template.gradle.kts"
+        cases = (
+            'val x = "${run { 1 }}"\n' + block,
+            'val x = "${count + 1}"\n' + block,  # NOT a simple ${identifier}
+            'val x = """${run { 1 }}"""\n' + block,  # braced template inside raw string at script level
+        )
+        for case in cases:
+            with self.subTest(case=case.splitlines()[0]):
+                path.write_text(case, encoding="utf-8")
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.parse_gradle_version(str(path))
+
+    def test_unbraced_identifier_template_outside_default_config_is_accepted(self) -> None:
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        block = 'android {\n defaultConfig {\n' + direct + '}\n}\n'
+        path = self.tmp / "unbraced-identifier.gradle.kts"
+        path.write_text('val prefix = "p"\nval x = "$prefix"\n' + block, encoding="utf-8")
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
 
 
 class CommittedPinsAbsenceControl(unittest.TestCase):

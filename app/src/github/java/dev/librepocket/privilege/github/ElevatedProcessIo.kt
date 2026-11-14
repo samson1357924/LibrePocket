@@ -1000,7 +1000,8 @@ internal object ElevatedCleanupTracker {
  *   在 worker 內立即有界補償（[lateCompensateSpawn]：killer＋`waitFor(1s)`＋
  *   三流 best-effort 關，不再經 holder）；認領競態（worker 發布與 caller 過期間
  *   的 µs 交錯）以 holder CAS 恰好一次交付清理方（worker 內聯或 caller 側
- *   `elevated-late-spawn` daemon），不雙殺不漏殺；
+ *   `elevated-late-spawn` daemon），不雙殺不漏殺（飽和／起線程失敗路徑不 kill，
+ *   見 startLateDaemon 的 quarantine-only 契約）；
  * - preflight 三層（皆零新 spawn）：[awaitInternal]／[awaitSpawn] 入口
  *   `isExpired` 即不啟 worker 直回 `Expired(hasLinger=false)`；[awaitSpawn]
  *   worker 返回後再確認 deadline（逾期交付即補償＋`Expired(true)`）；quota 後、
@@ -1650,10 +1651,13 @@ internal object ElevatedCallSupervisor {
      * - late 補償執行前先 [ElevatedCleanupTracker.acquireSlot]（worker 內聯與 caller
      *   daemon 同一全域管理，佔槽即自然受 7 管；持槽全程，stall 即 outstanding 擋
      *   新 spawn，不再有 untracked 永久卡住）；
-     * - 飽和（acquire false）即不起無界 daemon，經 [lateIncomplete]＋breaker 終審
+     * - 飽和（acquire false）即不起 daemon、不嘗試 kill（無槽即無法保證 bounded
+     *   supervision），handle 一律轉入 [ElevatedCleanupTracker.quarantineUnverified]
+     *   登記（准入阻擋＋verifier 復核），經 [lateIncomplete]＋breaker 終審
      *   （fail-closed：owner 仍為 late Process 唯一追蹤者，記為殘留而非丟棄）；
-     * - `t.start()` 抛即釋槽＋計數（同步有界收斂，不靜默丟 owner；資源壓力最高時
-     *   不放大，不重試起線程）；
+     * - `t.start()` 抛即先 quarantine 登記＋置旗＋計數、再釋槽（關閉 outstanding==0
+     *   且 quarantine 為空的 admission fail-open 窗口；同步有界收斂，不靜默丟 owner；
+     *   資源壓力最高時不放大，不重試起線程）；
      * - 單 call breaker 恰好一次（[uncleanCounted] guard：lingering 與 late 雙因不雙計，
      *   首因勝出；verified clean 不計，outstanding 釋放後 admission 自然恢復）。
      *   每 call 至多新增槽位：spawn worker lingering 1＋late daemon 1＋verify 1＝3≤7，
@@ -1685,6 +1689,28 @@ internal object ElevatedCallSupervisor {
         killer: (Process) -> Unit,
         nowNanos: () -> Long = { System.nanoTime() },
         block: () -> Process,
+    ): Res<Process> =
+        awaitSpawnWithThreadStarter(
+            deadlineNanos = deadlineNanos,
+            isCancelled = isCancelled,
+            killer = killer,
+            nowNanos = nowNanos,
+            block = block,
+        )
+
+    /**
+     * [awaitSpawn] 的 internal seam（測試注入用）：`startThread` 注入線程起動方式。
+     * 注入的 starter 契約：要麼完整啟動線程，要麼在啟動之前拋出；starts-then-throws
+     * 會雙釋同一槽（daemon finally 釋＋本函數 catch 釋）並觸發 release floor counter——
+     * 注入方必須保證「抛即未起」。
+     */
+    internal fun awaitSpawnWithThreadStarter(
+        deadlineNanos: Long,
+        isCancelled: () -> Boolean,
+        killer: (Process) -> Unit,
+        nowNanos: () -> Long = { System.nanoTime() },
+        startThread: (Thread) -> Unit = { it.start() },
+        block: () -> Process,
     ): Res<Process> {
         // P1-3 入口 preflight：budget 已盡即不提交 spawn（零特權進程）。
         val preExpired = try {
@@ -1712,10 +1738,12 @@ internal object ElevatedCallSupervisor {
         // R2-PhaseB：caller 側 daemon 起動（含飽和／起失敗收斂）。
         // - acquired 才起 daemon（daemon 持槽全程，stall 即 outstanding 擋 admission，
         //   受 MAX 7 管，不再有無界 untracked daemon）；
-        // - 飽和（acquire false）即不起 daemon，經 countUncleanOnce 記殘留
+        // - 飽和（acquire false）即不起 daemon，不嘗試 kill（無槽即無法保證有界
+        //   supervision）；handle 一律轉入 quarantine 登記＋countUncleanOnce 記殘留
         //   （fail-closed：owner 仍為唯一追蹤者，記為殘留而非丟棄，breaker 終審擋新 spawn）；
-        // - t.start() 抛即釋槽＋計數（同步有界收斂，不靜默丟 owner；不再重試起線程，
-        //   資源壓力最高時不放大）；
+        // - t.start() 抛即先 quarantine 登記＋置旗＋計數、再釋槽（關閉 outstanding==0
+        //   且 quarantine 為空的 admission fail-open 窗口；同步有界收斂，不靜默丟 owner；
+        //   不再重試起線程，資源壓力最高時不放大）；
         // - daemon 終審：incomplete 才計數（guard 保 lingering 不雙計），verified
         //   clean 不計（outstanding 釋放後 admission 自然恢復，見 lateCompensateSpawn）。
         // - Round-3 Phase E（P1-1）：飽和無槽／起線程失敗的 owner 一律轉入
@@ -1723,29 +1751,19 @@ internal object ElevatedCallSupervisor {
         //   outstanding 歸零後仍以 QUARANTINE 擋後續 spawn（同條漏回收路徑消除，
         //   不只寫 breaker 計數）。
         // Note: quarantine only blocks admission and verifies death; it does NOT kill.
-        // Best-effort termination is attempted via detached daemon thread (fire-and-forget).
+        // At saturation / thread-start failure we cannot safely bound a kill (even a
+        // detached daemon would be an untracked, unjoined residue), so no kill is
+        // attempted at all — the handle is quarantined (admission-blocking,
+        // verifier-checked) and flagged incomplete/unclean; recovery is the sweep path.
+        // drain（runCleanupBounded）仍會嘗試有界 supervised kill（永不跳過 killer，
+        // 只記錄）；late-compensation 飽和路徑刻意不 kill——不在此放大無追蹤 Binder IPC。
         fun startLateDaemon(v: Process) {
             val acquired = ElevatedCleanupTracker.acquireSlot()
             if (!acquired) {
-                // Bounded caller-side path: killer is ElevatedProcessKiller.killTree which
-                // may perform unbounded synchronous Binder IPC (Shizuku Process). Calling it
-                // on the caller thread breaks the bounded execution guarantee. Instead,
-                // launch a detached daemon thread for best-effort termination (fire-and-forget,
-                // never joined), then register the handle in quarantine, mark incomplete/
-                // unclean, and return immediately. The detached thread attempts kill but does
-                // not block the caller.
-                try {
-                    Thread({
-                        runCatching { killer(v) }
-                        runCatching { v.destroyForcibly() }
-                        runCatching { v.inputStream.close() }
-                        runCatching { v.errorStream.close() }
-                        runCatching { v.outputStream.close() }
-                    }, "elevated-late-kill").apply { isDaemon = true; start() }
-                } catch (_: Throwable) {
-                    // Thread.start() failed (e.g. OOM); ensure fail-closed accounting
-                    // still runs even if thread creation failed.
-                }
+                // 飽和（fail-closed）：不嘗試 kill——無槽即無法保證有界 supervision，
+                // 任何 kill 嘗試（即便 detached）都會成為無追蹤殘留。handle 一律轉入
+                // quarantine 登記（准入阻擋＋verifier 復核），置 incomplete/unclean，
+                // 立即返回；回收經 sweep 路徑。
                 ElevatedCleanupTracker.quarantineUnverified(v)
                 lateIncomplete.set(true)
                 countUncleanOnce()
@@ -1766,27 +1784,18 @@ internal object ElevatedCallSupervisor {
                     }
                 }, "elevated-late-spawn")
                 t.isDaemon = true
-                t.start()
+                startThread(t)
             } catch (_: Throwable) {
-                ElevatedCleanupTracker.releaseSlot()
-                // Detached best-effort kill (bounded caller path, fire-and-forget).
-                // Quarantine only blocks admission and verifies death; it does NOT kill.
-                // The detached daemon thread attempts termination without blocking caller.
-                try {
-                    Thread({
-                        runCatching { killer(v) }
-                        runCatching { v.destroyForcibly() }
-                        runCatching { v.inputStream.close() }
-                        runCatching { v.errorStream.close() }
-                        runCatching { v.outputStream.close() }
-                    }, "elevated-late-kill").apply { isDaemon = true; start() }
-                } catch (_: Throwable) {
-                    // Thread.start() failed (e.g. OOM); ensure fail-closed accounting
-                    // still runs even if thread creation failed.
-                }
+                // 起線程失敗（例如 OOM）：不嘗試 kill——無法保證有界 supervision，
+                // 亦不再起任何 detached 線程；handle 轉入 quarantine 登記（准入阻擋＋
+                // verifier 復核），置 incomplete/unclean，同步有界收斂，不重試起線程。
+                // 順序（F1）：先 quarantine＋置旗＋計數再釋槽——關閉 outstanding==0
+                // 且 quarantine 為空的 admission fail-open 窗口（並行 caller 可能
+                // 在釋槽後、登記前看見全空）；槽確已取得，release 不可少。
                 ElevatedCleanupTracker.quarantineUnverified(v)
                 lateIncomplete.set(true)
                 countUncleanOnce()
+                ElevatedCleanupTracker.releaseSlot()
             }
         }
         val worker = try {
@@ -1800,18 +1809,11 @@ internal object ElevatedCallSupervisor {
                         fun compensateInline(v: Process) {
                             val acquired = ElevatedCleanupTracker.acquireSlot()
                             if (!acquired) {
-                                // Bounded worker-side path: detached best-effort kill.
-                                try {
-                                    Thread({
-                                        runCatching { killer(v) }
-                                        runCatching { v.destroyForcibly() }
-                                        runCatching { v.inputStream.close() }
-                                        runCatching { v.errorStream.close() }
-                                        runCatching { v.outputStream.close() }
-                                    }, "elevated-late-kill").apply { isDaemon = true; start() }
-                                } catch (_: Throwable) {
-                                    // Thread.start() failed; ensure fail-closed accounting.
-                                }
+                                // 飽和（fail-closed）：不嘗試 kill——無槽即無法保證
+                                // 有界 supervision，任何 kill 嘗試（即便 detached）都會
+                                // 成為無追蹤殘留。handle 轉入 quarantine 登記（准入阻擋＋
+                                // verifier 復核），置 incomplete/unclean，返回；回收經
+                                // sweep 路徑。
                                 ElevatedCleanupTracker.quarantineUnverified(v)
                                 lateIncomplete.set(true)
                                 countUncleanOnce()
@@ -1854,7 +1856,7 @@ internal object ElevatedCallSupervisor {
                 }
             }, "elevated-supervisor").also {
                 it.isDaemon = true
-                it.start()
+                startThread(it)
             }
         } catch (_: Throwable) {
             return Res.Expired(hasLinger = false)

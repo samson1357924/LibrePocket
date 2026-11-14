@@ -24,7 +24,10 @@ import org.junit.Test
  *  （補償前先 acquireSlot，stall 即持槽擋 admission，不再有 untracked 永久卡住）；
  * - worker 內聯快速補償（destroy no-op＋waitFor=false）必經 parent／reap 驗證，
  *   未驗證即 `cleanupIncomplete=true`＋breaker 計數，不恢復 admission；
- * - 飽和無槽即不起無界 daemon，經旗標＋breaker 終審（fail-closed，不丟 owner）。
+ * - 飽和無槽即不起無界 daemon，經旗標＋breaker 終審（fail-closed，不丟 owner）；
+ * - 飽和無槽／起線程失敗一律 quarantine-only（Round-3 Phase E 契約）：零 kill 嘗試
+ *   （killer／destroy／destroyForcibly 呼叫 0），handle 登記 quarantine 阻擋准入，
+ *   回收經 sweep 路徑（detached best-effort kill 已刪除）。
  *
  * Root＋Shizuku 雙軌，全 fake，零真機、零 su、零 binder。
  * 排序一律 latch／barrier（polling 為 barrier，不靠 sleep 時序）：
@@ -108,6 +111,9 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             "elevated-cleanup",
             "elevated-supervisor",
             "elevated-late-spawn",
+            "elevated-late-kill",
+            "elevated-quarantine-sweep",
+            "elevated-quarantine-verify",
             "elevated-wait",
             "elevated-verify",
         )
@@ -144,6 +150,39 @@ class ElevatedRunnerPhaseBLateCompensationTest {
         override fun exitValue(): Int = 0
         override fun destroy() = Unit
         override fun destroyForcibly(): Process = this
+    }
+
+    /**
+     * destroy／destroyForcibly 皆記數＋阻塞於 [blockLatch]（吞 interrupt 續等，
+     * 模擬 Binder 不可靠中斷 stall；teardown 放行才返回）：飽和／起線程失敗
+     * 路徑不得呼叫本 Process 的任何終止方法（零 kill 嘗試 tripwire）。
+     */
+    private class LatchBlockedDestroyProcess(
+        private val blockLatch: CountDownLatch,
+    ) : Process() {
+        val destroyCalls = AtomicInteger(0)
+        val destroyForciblyCalls = AtomicInteger(0)
+        override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+        override fun getInputStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int = 0
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = false
+        override fun exitValue(): Int = 0
+        override fun destroy() {
+            destroyCalls.incrementAndGet()
+        }
+        override fun destroyForcibly(): Process {
+            destroyForciblyCalls.incrementAndGet()
+            while (true) {
+                try {
+                    blockLatch.await()
+                    break
+                } catch (_: InterruptedException) {
+                    // 吞 interrupt 續等（Binder stall 不可靠中斷）。
+                }
+            }
+            return this
+        }
     }
 
     private fun rootRunner(
@@ -444,5 +483,416 @@ class ElevatedRunnerPhaseBLateCompensationTest {
 
     @Test fun shizukuSaturatedLateNoDaemonExplicitIncomplete() {
         doSaturatedLateExplicitIncomplete { s, k -> shizukuRunner(spawn = s, killer = k) }
+    }
+
+    // ---- 4. 飽和／起線程失敗 = 只 quarantine（零 kill 嘗試，不變量迴歸） ----
+    //
+    // Round-3 Phase E（P1-1）quarantine-only 契約：飽和無槽／起線程失敗時，無槽即
+    // 無法保證有界 supervision，任何 kill 嘗試（即便 detached daemon）都會成為
+    // 無追蹤殘留。故 handle 一律轉入 quarantine 登記（准入阻擋＋verifier 復核），
+    // 置 incomplete/unclean，零 kill／destroyForcibly 呼叫，caller 有界返回；
+    // 回收經 sweep 路徑。以下三用例以 latch 阻塞 killer／destroyForcibly 作
+    // tripwire：任何終止嘗試都會被計數（或使測試卡死），必然被斷言抓住。
+
+    /**
+     * (a) 逾期後交付＋全域槽飽和（MAX 預填）：worker 內聯補償飽和路徑。
+     * killer／destroyForcibly 全 latch 阻塞（teardown 才放）：caller 於逾期界內
+     * 返回（TimedOut cleanupIncomplete=true）。caller 逾期時 lingering 佔 1 槽＋
+     * 預填 MAX-1 槽＝MAX（飽和）；worker 逾期交付後退出，其 finally 釋放 lingering
+     * 槽——故放行後 outstanding 收斂在 MAX-1（預填槽留存、lingering 已釋放），
+     * 並非持久飽和 MAX；handle 轉入 quarantine（quarantinedCount=1），
+     * killer／destroy／destroyForcibly 呼叫 0，無 `elevated-late-kill` 線程。
+     */
+    @Test fun lateSpawnDeliveredAfterTimeoutUnderSaturationQuarantinesWithoutKillAttempt() {
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+        ElevatedCleanupTracker.resetPeak()
+        // 釋放 spawn 使 worker 發佈逾期 Process（latch barrier，非 sleep 時序）。
+        val release = CountDownLatch(1)
+        // killer／destroyForcibly 阻塞門：teardown 才放，期間任何調用皆會被記數。
+        val killerLatch = CountDownLatch(1)
+        val lateRef = AtomicReference<LatchBlockedDestroyProcess?>()
+        val kills = AtomicInteger(0)
+        val runner = rootRunner(
+            {
+                stuckAwait(release)
+                LatchBlockedDestroyProcess(killerLatch).also { lateRef.set(it) }
+            },
+            {
+                kills.incrementAndGet()
+                stuckAwait(killerLatch)
+            },
+        )
+        var prefilled = 0
+        try {
+            val start = System.currentTimeMillis()
+            val r = runner.runBinary(ElevatedRequest(listOf("id"), "PB-LATE-SAT"), 300L)
+            val elapsed = System.currentTimeMillis() - start
+            assertTrue("$r", r is ElevatedBinaryResult.TimedOut)
+            assertTrue(
+                "caller must return within a bounded time, elapsed=$elapsed",
+                elapsed < 3_000L,
+            )
+            r as ElevatedBinaryResult.TimedOut
+            assertTrue("late gap must flag, got $r", r.cleanupIncomplete)
+            // lingering 1：caller 逾期時 worker 仍卡 spawn，markLingering 佔 1 槽。
+            assertEquals(1, ElevatedCleanupTracker.outstanding())
+            // barrier 後預填至 MAX（worker 仍卡 release，lingering 1 保持）。
+            val need = ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS - 1
+            repeat(need) { k ->
+                if (!ElevatedCleanupTracker.acquireSlot()) {
+                    throw AssertionError(
+                        "prefill failed at $k/$need outstanding=${ElevatedCleanupTracker.outstanding()}",
+                    )
+                }
+                prefilled = k + 1
+            }
+            assertTrue(ElevatedCleanupTracker.isSaturated())
+            // 放行→worker 逾期交付→飽和無槽→僅 quarantine 登記（零 kill 嘗試）。
+            release.countDown()
+            val late = pollRefNonNull(lateRef, "late spawn under saturation")!!
+            pollTrue("outstanding must settle at MAX-1 after worker exit") {
+                ElevatedCleanupTracker.outstanding() ==
+                    ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS - 1
+            }
+            pollActiveTo(0)
+            // 先斷線程活性（named-thread liveness checks），再斷計數器
+            // （best-effort entry counters，只作殘留證據斷言，可能落後線程退出）。
+            assertEquals(0, countLive("elevated-late-spawn"))
+            val lateKillThreads = Thread.getAllStackTraces().keys.filter {
+                it.name == "elevated-late-kill" && it.isAlive
+            }
+            assertTrue(
+                "no thread named elevated-late-kill may exist: $lateKillThreads",
+                lateKillThreads.isEmpty(),
+            )
+            assertEquals(
+                "saturated late handle must stay quarantined",
+                1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
+            assertEquals("killer must never run on the saturation path", 0, kills.get())
+            assertEquals("destroy() must never run on the saturation path", 0, late.destroyCalls.get())
+            assertEquals(
+                "destroyForcibly() must never run on the saturation path",
+                0,
+                late.destroyForciblyCalls.get(),
+            )
+            assertEquals(
+                "saturation untouched by caller (pre-filled slots retained)",
+                ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS - 1,
+                ElevatedCleanupTracker.outstanding(),
+            )
+            // 計數器（best-effort entry counters）：lingering 恰好計 1 次
+            // （worker 內聯補償 incomplete 計數被 guard 擋住，不雙計）。
+            assertEquals(1, ElevatedCleanupTracker.consecutiveCount())
+            assertFalse(ElevatedCleanupTracker.isBreakerOpen())
+            assertEquals(
+                "peak must reach exactly MAX (lingering 1 + pre-filled MAX-1)",
+                ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+                ElevatedCleanupTracker.peakOutstanding(),
+            )
+        } finally {
+            release.countDown()
+            killerLatch.countDown()
+            repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
+        }
+    }
+
+    /**
+     * (b) `elevated-late-spawn` 起線程失敗（注入 starter 抛 OutOfMemoryError／
+     * RuntimeException）：caller CAS 認領成功後 `startLateDaemon` 佔槽→起線程
+     * 失敗→釋槽＋quarantine＋incomplete/unclean（同步有界收斂，零 kill 嘗試，
+     * 不重試起線程）。確定性 barrier：spawn 發佈後 worker 立即退出（expired=false
+     * 不認領）；caller 等 `countLive("elevated-supervisor")==1`（僅 watcher 卡
+     * cancelGate）後才放行取消門，保證 caller 側 CAS 認領成功。
+     * ARMED harness：late Process 為 latch 阻塞 destroy（teardown 才放），注入
+     * killer 亦記數後 latch 阻塞——任何終止嘗試要麼被計數、要麼卡死 detached
+     * 線程，必然被零 kill 斷言抓住（detached-kill 迴歸確定性 turn red）。
+     */
+    @Test fun lateSpawnDaemonThreadStartFailureQuarantinesAndFlagsIncomplete() {
+        val startFailures: List<() -> Throwable> = listOf(
+            { OutOfMemoryError("simulated OOM on elevated-late-spawn") },
+            { RuntimeException("simulated start failure on elevated-late-spawn") },
+        )
+        for (boom in startFailures) {
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            ElevatedCleanupTracker.resetPeak()
+            val spawnEntered = CountDownLatch(1)
+            val spawnRelease = CountDownLatch(1)
+            val cancelGate = CountDownLatch(1)
+            val cancelBlockEntered = CountDownLatch(1)
+            // armed killer 阻塞門：teardown（所有斷言之後）才放；期間任何 kill
+            // 嘗試皆被 kills 計數且卡死於 latch，必然被斷言抓住。
+            val killerLatch = CountDownLatch(1)
+            val lateRef = AtomicReference<LatchBlockedDestroyProcess?>()
+            val resultRef = AtomicReference<ElevatedCallSupervisor.Res<Process>?>()
+            val kills = AtomicInteger(0)
+            // 確定性 barrier：spawn 進入前不擋門，進入後阻塞門（watcher 卡門內，
+            // caller 仍輪詢），放行後 hook 回 true，caller 經 expireWorker 認領。
+            val isCancelled: () -> Boolean = {
+                if (spawnEntered.count > 0) {
+                    false
+                } else if (resultRef.get() != null) {
+                    false
+                } else {
+                    cancelBlockEntered.countDown()
+                    stuckAwait(cancelGate)
+                    true
+                }
+            }
+            val bg = Thread {
+                resultRef.set(
+                    ElevatedCallSupervisor.awaitSpawnWithThreadStarter(
+                        deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(60),
+                        isCancelled = isCancelled,
+                        killer = {
+                            kills.incrementAndGet()
+                            stuckAwait(killerLatch)
+                        },
+                        startThread = { t ->
+                            if (t.name == "elevated-late-spawn") throw boom()
+                            t.start()
+                        },
+                    ) {
+                        spawnEntered.countDown()
+                        stuckAwait(spawnRelease)
+                        LatchBlockedDestroyProcess(killerLatch).also { lateRef.set(it) }
+                    },
+                )
+            }.also { it.isDaemon = true; it.start() }
+            try {
+                assertTrue("spawn must enter", spawnEntered.await(10_000L, TimeUnit.MILLISECONDS))
+                assertTrue(
+                    "caller watcher must block in cancel gate",
+                    cancelBlockEntered.await(10_000L, TimeUnit.MILLISECONDS),
+                )
+                // 放行 spawn→worker 發佈（expired 仍 false，留 Val 給 caller）。
+                spawnRelease.countDown()
+                // barrier：lateRef 非空即已發佈；worker 退出由下條 countLive 收斂。
+                pollRefNonNull(lateRef, "late spawn")
+                // 等 worker 完全退出：countLive("elevated-supervisor") 從 2
+                // （spawn worker＋watcher）降到 1（僅 watcher 卡 cancelGate）。
+                // worker 死亡⇒holder 已含 Val＋worker 重讀 expired==false 不認領，
+                // 保證 caller 側 CAS 認領成功，t.start() 失敗路徑被確定性觸發。
+                pollTrue("spawn worker must exit before cancel gate opens") {
+                    countLive("elevated-supervisor") == 1
+                }
+                // 放行取消門→watcher bit 閂→caller expireWorker→CAS 認領→
+                // startLateDaemon 佔槽→起線程失敗→釋槽＋quarantine（零 kill）。
+                cancelGate.countDown()
+                val res = pollRefNonNull(resultRef, "caller result")
+                assertTrue("expected Res.Expired, got $res", res is ElevatedCallSupervisor.Res.Expired)
+                res as ElevatedCallSupervisor.Res.Expired
+                assertTrue(
+                    "daemon start failure must flag cleanupIncomplete, got $res",
+                    res.hasLinger,
+                )
+                val late = pollRefNonNull(lateRef, "late spawn")!!
+                // 限制：ElevatedCleanupTracker 無 identity probe，不能斷言 quarantine
+                // 條目即 late handle——只斷登記數；quarantine 誤歸因他 handle 不在
+                // 本用例斷言範圍。
+                assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+                assertEquals("killer must never run on the start-failure path", 0, kills.get())
+                assertEquals(
+                    "destroy() must never run on the start-failure path",
+                    0,
+                    late.destroyCalls.get(),
+                )
+                assertEquals(
+                    "destroyForcibly() must never run on the start-failure path",
+                    0,
+                    late.destroyForciblyCalls.get(),
+                )
+                pollTrue("outstanding must release back to 0 after failed start") {
+                    ElevatedCleanupTracker.outstanding() == 0
+                }
+                assertEquals(1, ElevatedCleanupTracker.consecutiveCount())
+                assertEquals(0, countLive("elevated-late-spawn"))
+                pollTrue("watcher must exit") { countLive("elevated-supervisor") == 0 }
+                // 確定性峰值：本迭代 startLateDaemon 恰好佔槽＋釋槽一次（lingering 0，
+                // 預填 0；resetPeak 已於迭代入口呼叫），故 peak==1（< MAX）。
+                assertEquals(1, ElevatedCleanupTracker.peakOutstanding())
+                val lateKillThreads = Thread.getAllStackTraces().keys.filter {
+                    it.name == "elevated-late-kill" && it.isAlive
+                }
+                assertTrue(
+                    "no thread named elevated-late-kill may exist: $lateKillThreads",
+                    lateKillThreads.isEmpty(),
+                )
+            } finally {
+                // 所有斷言完成後才放 armed killer latch（teardown 放行，daemon 若被迴歸
+                // 觸發阻塞於 killer，此處解卡以免 join 懸掛）；countDown 只此一次。
+                killerLatch.countDown()
+                cancelGate.countDown()
+                spawnRelease.countDown()
+                bg.join(10_000L)
+                pollOutstandingTo(0)
+                pollActiveTo(0)
+                ElevatedCleanupTracker.clearUnverified()
+                ElevatedCleanupTracker.noteClean()
+                awaitNoElevatedThreads()
+            }
+        }
+    }
+
+    /**
+     * (c) caller 側 CAS 認領瞬間槽飽和（startLateDaemon 飽和 arm）：spawn 逾期交付
+     * 發佈、worker 退出後、caller 取消門放行之前，預填至 MAX 使 acquireSlot
+     * 必敗——expireWorker 認領成功後 startLateDaemon 無槽可佔→quarantine 登記
+     * ＋incomplete/unclean（零 kill、不發起 daemon、不同步阻塞）；caller 有界返回
+     * Res.Expired(hasLinger=true)。確定性 barrier 結構同 (b)（預填夾在 publish
+     * barrier 與 cancelGate 放行之間）。ARMED harness：late Process 為 latch 阻塞
+     * destroy（teardown 才放）、注入 killer 記數後 latch 阻塞，任何終止嘗試皆被
+     * 計數／阻塞，必然被零 kill 斷言抓住。
+     */
+    @Test fun lateSpawnCallerSaturatedAtClaimQuarantinesWithoutKillAttempt() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+        ElevatedCleanupTracker.resetPeak()
+        val spawnEntered = CountDownLatch(1)
+        val spawnRelease = CountDownLatch(1)
+        val cancelGate = CountDownLatch(1)
+        val cancelBlockEntered = CountDownLatch(1)
+        // armed killer 阻塞門：teardown（所有斷言之後）才放；期間任何 kill
+        // 嘗試皆被 kills 計數且卡死於 latch，必然被斷言抓住。
+        val killerLatch = CountDownLatch(1)
+        val lateRef = AtomicReference<LatchBlockedDestroyProcess?>()
+        val resultRef = AtomicReference<ElevatedCallSupervisor.Res<Process>?>()
+        val kills = AtomicInteger(0)
+        // 確定性 barrier：spawn 進入前不擋門，進入後阻塞門（watcher 卡門內，
+        // caller 仍輪詢），放行後 hook 回 true，caller 經 expireWorker 認領。
+        val isCancelled: () -> Boolean = {
+            if (spawnEntered.count > 0) {
+                false
+            } else if (resultRef.get() != null) {
+                false
+            } else {
+                cancelBlockEntered.countDown()
+                stuckAwait(cancelGate)
+                true
+            }
+        }
+        val bg = Thread {
+            resultRef.set(
+                ElevatedCallSupervisor.awaitSpawnWithThreadStarter(
+                    deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(60),
+                    isCancelled = isCancelled,
+                    killer = {
+                        kills.incrementAndGet()
+                        stuckAwait(killerLatch)
+                    },
+                ) {
+                    spawnEntered.countDown()
+                    stuckAwait(spawnRelease)
+                    LatchBlockedDestroyProcess(killerLatch).also { lateRef.set(it) }
+                },
+            )
+        }.also { it.isDaemon = true; it.start() }
+        var prefilled = 0
+        try {
+            assertTrue("spawn must enter", spawnEntered.await(10_000L, TimeUnit.MILLISECONDS))
+            assertTrue(
+                "caller watcher must block in cancel gate",
+                cancelBlockEntered.await(10_000L, TimeUnit.MILLISECONDS),
+            )
+            // 放行 spawn→worker 發佈（expired 仍 false，留 Val 給 caller）。
+            spawnRelease.countDown()
+            // barrier：lateRef 非空即已發佈；worker 退出由下條 countLive 收斂。
+            pollRefNonNull(lateRef, "late spawn")
+            // 等 worker 完全退出：countLive("elevated-supervisor") 從 2
+            //（spawn worker＋watcher）降到 1（僅 watcher 卡 cancelGate）。
+            pollTrue("spawn worker must exit before saturation pre-fill") {
+                countLive("elevated-supervisor") == 1
+            }
+            // 預填至 MAX（worker 已退出，caller 尚未認領；lingering 0）：
+            // expireWorker CAS 認領後 startLateDaemon acquireSlot 必敗（飽和 arm）。
+            repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) { k ->
+                if (!ElevatedCleanupTracker.acquireSlot()) {
+                    throw AssertionError(
+                        "prefill failed at $k/${ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS}" +
+                            " outstanding=${ElevatedCleanupTracker.outstanding()}",
+                    )
+                }
+                prefilled = k + 1
+            }
+            assertTrue(ElevatedCleanupTracker.isSaturated())
+            // 放行取消門→watcher bit 閂→caller expireWorker→CAS 認領→startLateDaemon
+            // 佔槽失敗→quarantine（零 kill），caller 有界返回。
+            val start = System.currentTimeMillis()
+            cancelGate.countDown()
+            val res = pollRefNonNull(resultRef, "caller result")
+            val elapsed = System.currentTimeMillis() - start
+            assertTrue(
+                "caller must return within a bounded time, elapsed=$elapsed",
+                elapsed < 3_000L,
+            )
+            assertTrue("expected Res.Expired, got $res", res is ElevatedCallSupervisor.Res.Expired)
+            res as ElevatedCallSupervisor.Res.Expired
+            assertTrue(
+                "caller-side saturation claim must flag hasLinger, got $res",
+                res.hasLinger,
+            )
+            val late = pollRefNonNull(lateRef, "late spawn")!!
+            // 限制：ElevatedCleanupTracker 無 identity probe，不能斷言 quarantine
+            // 條目即 late handle——只斷登記數；誤歸因不在本用例斷言範圍。
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            assertEquals("killer must never run on the saturation claim path", 0, kills.get())
+            assertEquals(
+                "destroy() must never run on the saturation claim path",
+                0,
+                late.destroyCalls.get(),
+            )
+            assertEquals(
+                "destroyForcibly() must never run on the saturation claim path",
+                0,
+                late.destroyForciblyCalls.get(),
+            )
+            assertEquals(0, countLive("elevated-late-spawn"))
+            val lateKillThreads = Thread.getAllStackTraces().keys.filter {
+                it.name == "elevated-late-kill" && it.isAlive
+            }
+            assertTrue(
+                "no thread named elevated-late-kill may exist: $lateKillThreads",
+                lateKillThreads.isEmpty(),
+            )
+            // caller 認領前不持槽（預填槽留存、lingering 0），startLateDaemon 飽和即
+            // 不佔槽不釋槽，故 outstanding 恰為預填的 MAX，不增不減。
+            assertEquals(
+                "caller-side saturated claim must retain pre-filled slots exactly",
+                ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+                ElevatedCleanupTracker.outstanding(),
+            )
+            assertEquals(1, ElevatedCleanupTracker.consecutiveCount())
+            assertFalse(ElevatedCleanupTracker.isBreakerOpen())
+            // 確定性峰值：預填恰好佔滿 MAX 即峰值（無額外佔槽／釋槽）。
+            assertEquals(
+                ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+                ElevatedCleanupTracker.peakOutstanding(),
+            )
+        } finally {
+            // 所有斷言完成後才放 armed killer latch；countDown 只此一次。
+            killerLatch.countDown()
+            cancelGate.countDown()
+            spawnRelease.countDown()
+            bg.join(10_000L)
+            repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
+        }
     }
 }

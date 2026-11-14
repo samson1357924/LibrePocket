@@ -931,6 +931,66 @@ class OrderedTranscriptSinkTest {
     }
   }
 
+  @Test fun distinctTerminalVmFatals_writerAndShutdownSettle_bothReportedOnce() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val entered = CompletableDeferred<Unit>()
+      val release = CompletableDeferred<Unit>()
+      val reports = java.util.Collections.synchronizedList(mutableListOf<Throwable>())
+      val fatalA = OutOfMemoryError("writer fatal A")
+      val fatalB = OutOfMemoryError("settle fatal B")
+      val delegate = object : SinkProbe() {
+        override suspend fun onTurnStarted(runId: String, text: String) {
+          entered.complete(Unit)
+          release.await()
+          throw fatalA
+        }
+      }
+      val sink = OrderedTranscriptSink(
+        delegate = delegate,
+        dispatcher = dispatcher,
+        capacity = 8,
+        terminalFatalReporter = { t -> reports.add(t) },
+      )
+      runBlocking {
+        try {
+          val started = async { runCatching { sink.onTurnStarted("run-fatal-distinct", "hi") } }
+          entered.await()
+          release.complete(Unit)
+          withTimeout(10_000) {
+            started.await()
+            withTimeout(5_000) { while (!sink.isSealed()) delay(10) }
+            val job = checkNotNull(
+              sink.shutdown(
+                drainTimeoutMs = 200L,
+                settle = { throw fatalB },
+              ),
+            ) { "shutdown must return job" }
+            val causeSignal = CompletableDeferred<Throwable?>()
+            job.invokeOnCompletion { causeSignal.complete(it) }
+            val cause = causeSignal.await()
+            assertTrue(
+              "shutdown settle fatal must propagate as completion cause, got $cause",
+              cause is OutOfMemoryError && cause.message == fatalB.message,
+            )
+          }
+        } finally {
+          release.complete(Unit)
+        }
+      }
+      assertEquals("distinct VM-fatals must both be reported, got=${reports.map { it.message }}", 2, reports.size)
+      assertTrue("writer fatal must be reported, got=${reports.map { it.message }}", reports.any { it.message == fatalA.message })
+      assertTrue(
+        "shutdown settle fatal must be reported, got=${reports.map { it.message }}",
+        reports.any { it.message == fatalB.message },
+      )
+      assertEquals("same instances must not be duplicated", reports.toSet().size, reports.size)
+    } finally {
+      exec.shutdown()
+    }
+  }
+
   @Test fun bestEffortVmFatalStillSeals() {
     val exec = Executors.newSingleThreadExecutor()
     try {

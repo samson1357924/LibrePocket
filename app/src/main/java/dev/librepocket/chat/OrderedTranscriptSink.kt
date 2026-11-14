@@ -114,17 +114,14 @@ class OrderedTranscriptSink(
 
   private val writerScope = CoroutineScope(SupervisorJob() + dispatcher)
   private val channel = kotlinx.coroutines.channels.Channel<Entry>(capacity)
-  private val reportedTerminalFatal = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+  /** Terminal fatals already reported (identity). Same instance reported once; distinct instances remain observable. */
+  private val reportedTerminalFatals = java.util.Collections.newSetFromMap(ConcurrentHashMap<Throwable, Boolean>())
 
   private fun reportTerminalFatal(t: Throwable) {
     if (t !is VirtualMachineError && t !is ThreadDeath) return
-    // Report each terminal fatal instance at most once (writer/shutdown paths may
-    // converge on the same throwable); preserves observability without duplicates.
-    if (reportedTerminalFatal.compareAndSet(null, t) || reportedTerminalFatal.get() === t && run { false }) {
+    if (reportedTerminalFatals.add(t)) {
       runCatching { terminalFatalReporter(t) }
-      return
     }
-    if (reportedTerminalFatal.get() === t) return
   }
   private val pendingCore = ConcurrentHashMap.newKeySet<String>()
   /**

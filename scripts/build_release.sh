@@ -272,17 +272,22 @@ if [ "$PINS_SEEN" -eq 1 ]; then
     PINS_RESULT=$(python3 -I "$SCRIPT_DIR/check_release_pins.py" \
         --pins "$PINS_FILE") \
         || die "release pins check failed"
-    python3 -I - "$PINS_RESULT" "$FLAVORS" \
+    RELEASE_PINS_RESULT="$PINS_RESULT" python3 -I - "$FLAVORS" \
         "$PACKAGE_PLAY" "$CERT_PLAY" \
         "$PACKAGE_FOSS" "$CERT_FOSS" \
         "$PACKAGE_GITHUB" "$CERT_GITHUB" <<'PY' || die "expected identity does not match release pins"
 import json
+import os
 import sys
 
-if len(sys.argv) != 9:
+if len(sys.argv) != 8:
     raise SystemExit("invalid arguments for pins comparison")
 
-pins_json, flavors_str, pkg_play, cert_play, pkg_foss, cert_foss, pkg_github, cert_github = sys.argv[1:9]
+pins_json = os.environ.pop("RELEASE_PINS_RESULT", None)
+if pins_json is None:
+    raise SystemExit("pins comparison result was not supplied")
+
+flavors_str, pkg_play, cert_play, pkg_foss, cert_foss, pkg_github, cert_github = sys.argv[1:8]
 
 try:
     parsed = json.loads(pins_json)

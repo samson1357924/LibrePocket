@@ -46,7 +46,9 @@ private class TailFakeProvider(
  *   (200 msgs / 60k chars) bounds the outgoing copy downstream —
  *   B2 unification, see `ChatSessionFactoryHydrationB2Test`).
  * - The outgoing cap windows the combined (prefix + live) total, so the
- *   first send after a full tail evicts one more oldest row to hold 200.
+ *   first send after a full tail evicts oldest rows to hold ~200 (199
+ *   after the user-boundary snap re-aligns the cut onto the next user
+ *   row — see `snapHistoryToUserBoundary`).
  * - A giant single row is truncated with a visible marker (fail-closed, never
  *   a silent unbounded payload).
  */
@@ -120,14 +122,17 @@ class ChatSessionFactoryHistoryTailTest {
             assertEquals(2, opened.historyDroppedCount)
             opened.session.send("q-new")
             val req = provider.seenRequests.single()
-            // Combined (200 prefix + 1 live) windows to 200: the new turn
-            // evicts one more oldest prefix row. Request holds
-            // [a901..a1000, q-new] (newest 100 turns of the 2000-row tail).
-            assertEquals(200, req.messages.size)
-            assertEquals("a901", req.messages.first().text)
-            assertEquals("a1000", req.messages[200 - 2].text)
+            // Combined (200 prefix + 1 live) windows to 199: naive ~200
+            // then snap → 199. The naive cut (201 - 200 = 1) drops u901;
+            // user-boundary snap drops one more
+            // (a901, the assistant row the cut landed on), so the request
+            // holds [u902..a1000, q-new] (newest 99 turns of the 2000-row
+            // tail + live row).
+            assertEquals(199, req.messages.size)
+            assertEquals("u902", req.messages.first().text)
+            assertEquals("a1000", req.messages[197].text)
             assertTrue(req.messages.last().text.startsWith("q-new"))
-            assertTrue(req.messages.none { it.text == "u0" || it.text == "a0" || it.text == "u901" })
+            assertTrue(req.messages.none { it.text == "u0" || it.text == "a0" || it.text == "u901" || it.text == "a901" })
         } finally {
             opened.session.close()
         }

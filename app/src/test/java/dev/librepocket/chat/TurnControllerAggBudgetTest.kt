@@ -391,12 +391,13 @@ class TurnControllerAggBudgetTest {
         c.send("q2")
         c.send("q3")
       }
-      // Settled [u1,a1,u2,a2,u3] windows to [a2,u3] in the request copy.
+      // Settled [u1,a1,u2,a2,u3]: the naive combined cut drops u1,a1,u2,
+      // and the user-boundary snap re-aligns onto the next user row, so the
+      // request ships only the live row.
       val req = provider.seenRequests.last()
-      assertEquals(listOf("assistant", "user"), req.messages.map { it.role })
-      assertEquals("r2", req.messages[0].text)
-      assertTrue(req.messages[1].text.startsWith("q3"))
-      assertEquals(3, c.droppedHistoryCount)
+      assertEquals(listOf("user"), req.messages.map { it.role })
+      assertTrue(req.messages[0].text.startsWith("q3"))
+      assertEquals(4, c.droppedHistoryCount)
       // UI state keeps everything; only the request copy is windowed.
       assertEquals(3, c.uiState.value.messages.count { it.role == "user" })
       assertEquals(3, c.uiState.value.messages.count { it.role == "assistant" })

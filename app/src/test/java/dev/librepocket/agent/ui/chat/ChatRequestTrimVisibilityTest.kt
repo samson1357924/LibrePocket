@@ -70,10 +70,11 @@ private class TrimAllowPolicy : PolicyStore {
 /**
  * R5-5 request-level trim visibility (pure JVM, all fake data).
  *
- * - A large resumed history that exceeds MAX_REQUEST_CHARS is trimmed
- *   oldest-first per request; the provider sees the cropped request and the
- *   send-time count surfaces via [ChatViewModel.requestTrimmedCount] while
- *   the load-time [ChatViewModel.historyOmittedCount] stays 0 (orthogonal).
+ * - A large resumed history never reaches the send-time MAX_REQUEST_CHARS
+ *   trim: the DEFAULT window preempts it at load/combined (trimmed stays 0),
+ *   the provider sees the cropped request, and the omitted-row total surfaces
+ *   via [ChatViewModel.contextOmittedCount] while the load-time
+ *   [ChatViewModel.historyOmittedCount] stays 0 (orthogonal).
  * - A 2002-row small history omits 2 rows at load (tail cap) but trims
  *   nothing per request (control: omitted == 2, requestTrim == 0).
  * - [ChatSessionImpl.requestTrimmedCount] mirrors the controller flow.
@@ -187,15 +188,17 @@ class ChatRequestTrimVisibilityTest {
     private fun bigRow(prefix: String): String = prefix + "x".repeat(19_000 - prefix.length)
 
     @Test
-    fun largeHistoryTrim_surfacesRequestTrimmedCountAndKeepsOmissionZero() {
+    fun largeHistoryTrim_windowPreemptsSendTimeTrim() {
         val store = newStore()
         runBlocking { store.save(openaiEndpoint()) }
         val transcripts = FakeSessionStore()
         val sid = runBlocking {
             val id = transcripts.createSession("big chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
             // 3 complete turns x 19k chars = 114k. 6 rows < 2000-row DB scan
-            // so DB-tail omission stays 0. B2: the DEFAULT window (60k) keeps
-            // the newest 3 rows (57k) downstream; the send-time trim stays 0
+            // so DB-tail omission stays 0. B2: the DEFAULT window (60k char
+            // leg) keeps the newest 3 rows (57k) at load, then the
+            // user-boundary snap drops the leading assistant row (a1) too,
+            // leaving [u2, a2]; the send-time trim stays 0
             // (window preempts it — send-time coverage lives in the
             // Unbounded unit tests).
             for (i in 0 until 3) {
@@ -219,22 +222,27 @@ class ChatRequestTrimVisibilityTest {
         onMain { vm.send() }
         awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 8 }
 
-        // B2: DEFAULT window keeps [a1, u2, a2] (57k) + "hi" (tiny); total
-        // well under 100k, so the send-time trim stays 0.
+        // B2: DEFAULT window keeps [u2, a2] (38k) after the user-boundary
+        // snap drops the leading assistant row a1 (load cut lands on it),
+        // plus "hi" (tiny); total well under 100k, so the send-time trim
+        // stays 0.
         val req = fake.seenRequests.single()
         val totalChars = req.messages.sumOf { it.text.length }
         assertTrue(
             "total request chars must be <= MAX_REQUEST_CHARS, was $totalChars",
             totalChars <= TurnController.MAX_REQUEST_CHARS,
         )
-        assertEquals(4, req.messages.size)
-        assertTrue(req.messages.first().text.startsWith("a1:"))
+        assertEquals(3, req.messages.size)
+        assertTrue(req.messages.first().text.startsWith("u2:"))
         assertTrue(req.messages.last().text.startsWith("hi"))
 
-        // Window preempts send-time: trimmed stays 0, omission stays 0.
+        // Window preempts send-time: trimmed stays 0, contextOmittedCount == 4
+        // (6 resumed rows + 1 live - 3 shipped = 4).
         awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE }
+        awaitTrue { vm.contextOmittedCount.value == 4 }
         assertEquals(0, vm.requestTrimmedCount.value)
         assertEquals(0, vm.historyOmittedCount.value)
+        assertEquals(4, vm.contextOmittedCount.value)
     }
 
     @Test
@@ -272,8 +280,11 @@ class ChatRequestTrimVisibilityTest {
             "small request must fit uncropped, was ${req.messages.sumOf { it.text.length }}",
             req.messages.sumOf { it.text.length } <= TurnController.MAX_REQUEST_CHARS,
         )
-        // Window keeps newest 200 rows total (2000 tiny rows + live "hi" capped together).
-        assertEquals(200, req.messages.size)
+        // Window keeps the newest 200 rows at load, then the combined
+        // (prefix + live) window's naive cut drops one more oldest row and
+        // the user-boundary snap drops the leading assistant row behind it:
+        // 199 rows ship.
+        assertEquals(199, req.messages.size)
         assertEquals(0, vm.requestTrimmedCount.value)
         assertEquals(2, vm.historyOmittedCount.value)
     }
@@ -300,8 +311,9 @@ class ChatRequestTrimVisibilityTest {
         val vm = chatViewModels.own(ChatViewModel(store, newFactory(fake, transcripts), allowKeyReadPolicy()))
         onMain { vm.openSession(big) }
         awaitTrue { vm.messages.value.size == 6 }
-        // B2: DEFAULT window preempts send-time for plain history (57k
-        // windowed + tiny live << 100k), so trimmed stays 0.
+        // B2: DEFAULT window preempts send-time for plain history (38k
+        // windowed + tiny live << 100k; the user-boundary snap keeps
+        // [u2, a2] after the load cut lands on a1), so trimmed stays 0.
         onMain { vm.onInputChange("hi") }
         onMain { vm.send() }
         awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 8 }
@@ -364,14 +376,17 @@ class ChatRequestTrimVisibilityTest {
             sessionStart = null,
             systemZone = zoneSupplier,
             initialHistory = history,
-            // B1: this test pins the send-time trim layer (trimmedCount==1),
+            // B1: this test pins the send-time trim layer (trimmedCount==2),
             // not the window layer — opt out of the bounded DEFAULT window.
             historyCap = HistoryWindowCap.Unbounded,
         )
         try {
             assertEquals(0, session.requestTrimmedCount.value)
             runBlocking { session.send("hi") }
-            assertEquals(1, session.requestTrimmedCount.value)
+            // Char accounting stops after the first head row (u0); the cut
+            // then re-aligns to the next user row, dropping the assistant
+            // row a0 as well -> 2 trimmed.
+            assertEquals(2, session.requestTrimmedCount.value)
         } finally {
             session.close()
         }

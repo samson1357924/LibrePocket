@@ -40,9 +40,14 @@ private class B2TailFakeProvider(
  * openImpl travels MaxMessages(2000), must PASS after B2 unifies to DEFAULT).
  *
  * - [open_resumeUsesDefaultWindow]: 300 tiny rows (< 2000 DB tail, > 200 DEFAULT)
- *   must window to DEFAULT (200), not ship 301.
+ *   must window to DEFAULT (199 request rows after the user-boundary snap),
+ *   not ship 301.
  * - [createAndOpenShareDefaultWindow]: create with 250-row initialHistory and
  *   open with 250 DB rows must agree (both DEFAULT).
+ *
+ * (Red pins kept green through the #16 turn-boundary fix: the DEFAULT *window
+ * constant* is unchanged (200), but the naive cut it produces is re-aligned to
+ * the next user row, so the shipped request carries 199 rows here.)
  */
 class ChatSessionFactoryHydrationB2Test {
   private fun sampleEndpoint() = EndpointConfig(
@@ -105,10 +110,13 @@ class ChatSessionFactoryHydrationB2Test {
       opened.session.send("q-new")
       val req = provider.seenRequests.single()
       // B2: DEFAULT count leg (200) windows the 300-row prefix + live.
-      // Prefix windows 300 -> 200, combined 200 + live = 201 -> 200.
+      // Prefix windows 300 -> 200, combined 200 + live = 201 -> 199 after
+      // the user-boundary snap re-aligns the naive cut onto the next user
+      // row (the cut lands on the leading assistant row of the capped
+      // prefix, so it drops one more).
       assertEquals(
-        "resume must travel DEFAULT (200), not 2000-tail (300+1=301), got ${req.messages.size}",
-        200,
+        "resume must travel DEFAULT (200, i.e. 199 request rows after the user-boundary snap), not 2000-tail (300+1=301), got ${req.messages.size}",
+        199,
         req.messages.size,
       )
       assertTrue(req.messages.last().text.startsWith("q-new"))
@@ -159,7 +167,9 @@ class ChatSessionFactoryHydrationB2Test {
           createSize,
           openReq.messages.size,
         )
-        assertEquals(200, openReq.messages.size)
+        // Create/open both: combined 201 -> naive cut 1 lands on the leading
+        // assistant row -> user-boundary snap drops it too -> 199.
+        assertEquals(199, openReq.messages.size)
         assertEquals(HistoryWindowCap.DEFAULT_MAX_MESSAGES, 200)
       } finally {
         opened.session.close()

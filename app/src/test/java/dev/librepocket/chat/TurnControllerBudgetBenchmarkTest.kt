@@ -147,18 +147,19 @@ class TurnControllerBudgetBenchmarkTest {
       runBlocking { c.send("q3") }
       val req = provider.seenRequests.single()
       // Total-window semantics: capped prefix [keep-q2, keep-a2] + live q3
-      // (3 rows) windows to [keep-a2, q3] (2 rows): one head row dropped.
-      assertEquals(1, c.droppedHistoryCount)
-      // Char side mirrors the count: the dropped head row is "keep-q2"
-      // (7 chars) — the load-time seed (2 rows) is replaced by this
-      // request's window drop, same contract as the count.
-      assertEquals("keep-q2".length.toLong(), c.droppedHistoryChars)
+      // (3 rows): the naive cut drops keep-q2, the user-boundary snap drops
+      // keep-a2 too — the live row ships alone.
+      assertEquals(2, c.droppedHistoryCount)
+      // Char side mirrors the count: the dropped head rows are "keep-q2"
+      // and "keep-a2" (7 chars each) — the load-time seed (2 rows) is
+      // replaced by this request's window drop, same contract as the count.
+      assertEquals(("keep-q2".length + "keep-a2".length).toLong(), c.droppedHistoryChars)
       // Small request fits MAX_REQUEST_CHARS: no send-time trim.
       assertEquals(0, c.lastRequestTrimmedCount)
       assertEquals(0L, c.lastRequestTrimmedChars)
       // Final size mirrors the shipped request exactly (time-block included).
       assertEquals(req.messages.sumOf { it.text.length }.toLong(), c.lastRequestChars)
-      assertEquals("keep-a2", req.messages[0].text)
+      assertTrue(req.messages[0].text.startsWith("q3"))
     } finally {
       c.close()
     }
@@ -209,8 +210,8 @@ class TurnControllerBudgetBenchmarkTest {
       )
       // And the shipped request is exactly the windowed base + the block.
       assertEquals(req.messages.sumOf { it.text.length }.toLong(), c.lastRequestChars)
-      assertEquals(1, c.droppedHistoryCount)
-      assertEquals("keep-q2".length.toLong(), c.droppedHistoryChars)
+      assertEquals(2, c.droppedHistoryCount)
+      assertEquals(("keep-q2".length + "keep-a2".length).toLong(), c.droppedHistoryChars)
       assertEquals(0, c.lastRequestTrimmedCount)
       assertEquals(0L, c.lastRequestTrimmedChars)
     } finally {
@@ -745,11 +746,11 @@ class TurnControllerBudgetBenchmarkTest {
       val req = provider.seenRequests.single()
       assertEquals(req.messages.sumOf { it.text.length }.toLong(), c.lastRequestChars)
       // 2000 x ~93-char rows ≈ 186k of combined window: the MaxMessages(2000)
-      // window drops exactly the oldest row, then the still-over-cap head
-      // exceeds MAX_REQUEST_CHARS, so the send-time trim must trip in both
-      // units and the shipped payload must fit the cap.
-      assertEquals(1, c.droppedHistoryCount)
-      assertEquals(history.first().text.length.toLong(), c.droppedHistoryChars)
+      // window's naive cut drops exactly the oldest row, and the
+      // user-boundary snap drops the assistant row behind it too; then the
+      // send-time trim trips in both units and the shipped payload fits.
+      assertEquals(2, c.droppedHistoryCount)
+      assertEquals((history[0].text.length + history[1].text.length).toLong(), c.droppedHistoryChars)
       val payload = req.messages.sumOf { it.text.length }
       assertTrue("request must fit the cap, got $payload", payload <= TurnController.MAX_REQUEST_CHARS)
       assertTrue("trim count must trip, got ${c.lastRequestTrimmedCount}", c.lastRequestTrimmedCount > 0)

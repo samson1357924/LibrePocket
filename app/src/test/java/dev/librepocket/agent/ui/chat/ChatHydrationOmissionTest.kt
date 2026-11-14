@@ -70,19 +70,21 @@ private class OmissionAllowPolicy : PolicyStore {
  * Resume a 150-turn dialogue (300 short replay rows): the model-context
  * prefix windows to [HistoryWindowCap.DEFAULT] (200) at construction and
  * again inside the first send's combined window, so the outgoing request
- * carries 200 rows while the UI replay keeps all 300. The provider-request
- * context omission total (init window + combined window, 100 + 1 = 101)
- * surfaces via [ChatViewModel.contextOmittedCount]; the DB-tail omission
- * ([ChatViewModel.historyOmittedCount]) stays 0 (300 rows < 2000) and the
- * send-time 100k-trim leg ([ChatViewModel.requestTrimmedCount]) stays 0
- * (tiny rows) — orthogonal counters, never summed.
+ * carries 199 rows (the naive combined cut lands on the leading assistant
+ * row; the user-boundary snap drops one more) while the UI replay keeps all
+ * 300. The provider-request context omission total (init window + combined
+ * window, 100 + 2 = 102) surfaces via [ChatViewModel.contextOmittedCount];
+ * the DB-tail omission ([ChatViewModel.historyOmittedCount]) stays 0
+ * (300 rows < 2000) and the send-time 100k-trim leg
+ * ([ChatViewModel.requestTrimmedCount]) stays 0 (tiny rows) — orthogonal
+ * counters, never summed.
  *
  * [controller_resumeLongDialogue_seedsInitWindowAndPublishesTotal] pins the
  * same numbers at the controller layer (construction seed = 100, post-send =
- * 101), and
+ * 102), and
  * [controller_windowAndSendTimeTrimBothBind_publishesFullOmissionTotal] pins
- * the send-time 100k-trim leg of the same identity (init window 19 +
- * combined window 1 + 100k trim 6 = 26).
+ * the send-time 100k-trim leg of the same identity (init window 20 +
+ * combined window 0 + 100k trim 6 = 26).
  *
  * Fixed clock/zone pins the ephemeral time block; history rows stay tiny
  * (char legs never bind) and far below MODEL_HISTORY_MAX_CHARS_PER_MESSAGE
@@ -230,14 +232,14 @@ class ChatHydrationOmissionTest {
                     " dbTail=${vm.historyOmittedCount.value}"
             },
         ) { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 302 }
-        awaitTrue { vm.contextOmittedCount.value == 101 }
+        awaitTrue { vm.contextOmittedCount.value == 102 }
 
-        // (a) provider sees the windowed request: 200 rows (199 resumed + live).
+        // (a) provider sees the windowed request: 199 rows (198 resumed + live).
         val req = fake.seenRequests.single()
-        assertEquals(200, req.messages.size)
+        assertEquals(199, req.messages.size)
         assertTrue(req.messages.last().text.startsWith("hi"))
-        // (b) provider-request context omission: 100 init-window + 1 combined-window.
-        assertEquals(101, vm.contextOmittedCount.value)
+        // (b) provider-request context omission: 100 init-window + 2 combined-window.
+        assertEquals(102, vm.contextOmittedCount.value)
         // (c) UI replay keeps everything: 300 rows + user + assistant.
         assertEquals(302, vm.messages.value.size)
         // (d) orthogonal counters stay 0: DB-tail fits (300 < 2000), send-time
@@ -259,23 +261,26 @@ class ChatHydrationOmissionTest {
      *
      * 1. Construction window: count leg (150 ≤ 250) never binds; char leg
      *    keeps the newest floor(105_000 / 800) = 131 rows (131 × 800 =
-     *    104,800 ≤ 105,000; 132 would be 105,600 > 105,000), dropping the
-     *    19 oldest — construction-time omission = 19.
+     *    104,800 ≤ 105,000; 132 would be 105,600 > 105,000), so the naive
+     *    cut drops the 19 oldest (rows 0..18). Row 19 is an assistant row,
+     *    so the user-boundary snap advances the cut to row 20 —
+     *    construction-time omission = 20 (rows 0..19), prefix = rows 20..149
+     *    (130 rows).
      * 2. send(500-char plain text): live = [user, 500 chars]. Combined =
-     *    131 × 800 + 500 = 105,300 chars > 105,000; the combined window
-     *    keeps the live row (500) + the newest 130 prefix rows
-     *    (104,500 ≤ 105,000; one more would be 105,300), dropping the
-     *    oldest prefix row — combined window contributes 1 (drop = 20 total).
+     *    130 × 800 + 500 = 104,500 ≤ 105,000 — the combined window drops
+     *    nothing (0).
      * 3. The time block is suffixed to the last user row AFTER the window,
-     *    so base chars = 104,000 + 500 + 2 + 98 = 104,600 > 100,000: the
+     *    so base chars = 104,500 + 2 + 98 = 104,600 > 100,000: the
      *    send-time 100k head trim drops 6 oldest prefix rows (5 would leave
      *    100,600 > 100,000; 6 leave 99,800 ≤ 100,000). maxDropLimit (index
      *    of the live user row = 130) is not hit; snapHistoryToPairBoundary
-     *    is a no-op (no tool rows kept/dropped).
+     *    is a no-op (no tool rows kept/dropped), and the row at the
+     *    post-trim cut (row 26, a user row) leaves snapHistoryToUserBoundary
+     *    a no-op too.
      *
      * Therefore: contextOmission = initialHistory.size + live.size
      *   − finalMessages.size = 150 + 1 − 125 = 26
-     *   = 19 (init window) + 1 (combined window) + 6 (100k trim) — the exact
+     *   = 20 (init window) + 0 (combined window) + 6 (100k trim) — the exact
      * assertEquals(26) below stands or falls with the 100k leg being counted
      * (a window-only count would report 20). The outgoing request's text sum
      * (99,800) must satisfy lastRequestChars ≤ MAX_REQUEST_CHARS and
@@ -302,8 +307,10 @@ class ChatHydrationOmissionTest {
             historyCap = HistoryWindowCap.Bounded(250, 105_000),
         )
         try {
-            // Construction seed: 150 rows -> newest 131 kept, 19 dropped.
-            assertEquals(19, controller.contextOmission.value)
+            // Construction seed: 150 rows -> newest 131 kept naively, then
+            // the user-boundary snap drops the leading assistant row too, so
+            // 20 dropped (rows 0..19).
+            assertEquals(20, controller.contextOmission.value)
             runBlocking { controller.send("q".repeat(500)) }
             val req = fake.seenRequests.single()
             // (a) The outgoing request stays within the send-time cap.
@@ -315,8 +322,8 @@ class ChatHydrationOmissionTest {
             // (b) The 100k head trim bound: 6 rows dropped, observable.
             assertEquals(6, controller.requestTrimmedCount.value)
             // (c) The context omission total accounts for all three legs:
-            // 19 (init window) + 1 (combined window) + 6 (100k trim) = 26 —
-            // a window-only implementation would report 20.
+            // 20 (init window) + 0 (combined window) + 6 (100k trim) = 26 —
+            // without the 100k trim leg the total would read 20.
             assertEquals(26, controller.contextOmission.value)
             assertEquals(125, req.messages.size)
         } finally {
@@ -346,10 +353,13 @@ class ChatHydrationOmissionTest {
             // Construction seed: 300 -> 200 windowed prefix.
             assertEquals(100, controller.contextOmission.value)
             runBlocking { controller.send("hi") }
-            // Post-send: init window (100) + combined window (1); tiny rows,
-            // send-time 100k trim contributes 0.
-            assertEquals(101, controller.contextOmission.value)
-            assertEquals(200, fake.seenRequests.single().messages.size)
+            // Post-send: init window (100) + combined window (2); tiny rows,
+            // send-time 100k trim contributes 0. The naive combined cut
+            // lands on m101 (assistant); the user-boundary snap drops one
+            // more, so the request opens on m102.
+            assertEquals(102, controller.contextOmission.value)
+            assertEquals(199, fake.seenRequests.single().messages.size)
+            assertEquals("m102", fake.seenRequests.single().messages.first().text)
         } finally {
             controller.close()
         }

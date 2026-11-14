@@ -179,7 +179,8 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * delta.
  *
  * The default is [Bounded] ([HistoryWindowCap.DEFAULT]: at most 200 messages
- * and 60_000 chars, oldest-first, whole-message, pair-atomic — see below).
+ * and 60_000 chars, oldest-first, whole-message, pair-atomic and
+ * turn-aligned — see below).
  * Synthetic JVM measurement basis (fake provider/policy, no network/device):
  * 20 x ~500-char rows ship ~10k chars while 100 x ~500-char rows ship ~50k
  * chars under explicit [Unbounded] (linear, unbounded — both fit the 100k
@@ -230,9 +231,29 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * newest user/assistant row is never a tool batch, so it survives even over a
  * char budget). When an invalid or unpaired part survives into the retained
  * slice (such as an orphan `tool` row, a dangling batch, or an ambiguous
- * blank `toolCallId` within or straddling the retained window), the window
- * never repairs or drops it: it keeps the naive cut and fails closed
- * downstream in `ProviderJson.validateToolPairing`.
+ * blank `toolCallId` within or straddling the retained window), the pair
+ * snap never repairs or drops it by itself: it keeps the naive cut for the
+ * pair decision and lets the pairing fail closed downstream in
+ * `ProviderJson.validateToolPairing`. (The separate turn-boundary snap may
+ * still drop such rows wholesale when a `role == "user"` row follows them —
+ * it aligns boundaries, it never repairs pairing.)
+ *
+ * Turn-boundary snap (B2, #16): even after the pair snap, a naive head cut
+ * can open the retained slice on an orphan assistant (or tool) row, and the
+ * Anthropic Messages API rejects a first non-system message whose role is not
+ * `user` (HTTP 400); OpenAI has no hard rejection but mis-reads the
+ * context / wastes window. After the pair
+ * snap, [snapHistoryToUserBoundary] advances the cut to the next
+ * `role == "user"` row (never beyond the caller's `limit`), dropping the
+ * orphan rows whole. If no `role == "user"` row lies within `[start, limit]`
+ * the cut is kept as-is (fail-closed): the window never repairs *pairing*;
+ * leading invalid/unpaired slices may be dropped wholesale by boundary
+ * alignment (counted in the drop); only the no-user-row-follows case keeps
+ * the slice and fails closed downstream in
+ * `ProviderJson.validateToolPairing`, mirroring the pair-atomic policy. A
+ * legal tool batch never straddles a user row, and a batch wholly before the
+ * cut is dropped together with its user row, so tool-pair integrity is
+ * unaffected.
  *
  * Canonical note (B1 review, mirror-canonical drift): the pairing rule here
  * mirrors the downstream gate `ProviderJson.validateToolPairing(...,
@@ -259,7 +280,8 @@ sealed interface HistoryWindowCap {
   /**
    * B1 (#16) dual-track bound: the request copy must satisfy BOTH legs
    * (newest kept). The naive head cut is `max(count-leg cut, char-leg cut)`
-   * and then snaps forward to the next tool-pair boundary (see above).
+   * and then snaps forward to the next tool-pair boundary (see above), and
+   * finally to the next user row (turn boundary) per [snapHistoryToUserBoundary].
    */
   data class Bounded(val maxMessages: Int, val maxChars: Int) : HistoryWindowCap {
     init {
@@ -297,9 +319,21 @@ sealed interface HistoryWindowCap {
  * messages, never splits one — so at least the newest message always survives.
  * When an invalid or unpaired part survives into the retained slice (e.g., an
  * orphan `tool` row, a dangling batch, or an ambiguous blank `toolCallId`
- * within the retained window), it is never repaired or dropped here: the
- * window keeps the naive cut and fails closed downstream in
- * `ProviderJson.validateToolPairing`.
+ * within the retained window), it is never repaired or dropped here by
+ * pair-atomic logic: the pair decision keeps the naive cut and fails closed
+ * downstream in `ProviderJson.validateToolPairing`.
+ *
+ * Turn boundary (B2, #16): after the pair snap, the cut may still land on an
+ * orphan assistant (or tool) row, and the Anthropic Messages API rejects a
+ * first non-system message whose role is not `user` (HTTP 400). The cut then
+ * snaps forward to the next `role == "user"` row via
+ * [snapHistoryToUserBoundary] — dropping the leading non-user rows whole —
+ * with fail-closed semantics: if no user row
+ * follows within the allowed window the naive cut is kept and the violation
+ * fails closed downstream. The window never repairs *pairing*; leading
+ * invalid/unpaired slices may be dropped wholesale by boundary alignment
+ * (counted in the drop); only the no-user-row-follows case keeps the slice
+ * and fails closed downstream.
  */
 internal fun applyHistoryCap(history: List<ChatMessage>, cap: HistoryWindowCap): List<ChatMessage> {
   if (history.isEmpty()) return history
@@ -307,15 +341,15 @@ internal fun applyHistoryCap(history: List<ChatMessage>, cap: HistoryWindowCap):
     is HistoryWindowCap.Unbounded -> history
     is HistoryWindowCap.MaxMessages -> {
       val naiveStart = (history.size - cap.maxMessages).coerceAtLeast(0)
-      history.drop(snapHistoryToPairBoundary(history, naiveStart))
+      history.drop(snapHistoryToUserBoundary(history, snapHistoryToPairBoundary(history, naiveStart)))
     }
     is HistoryWindowCap.MaxChars -> {
-      history.drop(snapHistoryToPairBoundary(history, charWindowStart(history, cap.maxChars)))
+      history.drop(snapHistoryToUserBoundary(history, snapHistoryToPairBoundary(history, charWindowStart(history, cap.maxChars))))
     }
     is HistoryWindowCap.Bounded -> {
       val countStart = (history.size - cap.maxMessages).coerceAtLeast(0)
       val charStart = charWindowStart(history, cap.maxChars)
-      history.drop(snapHistoryToPairBoundary(history, maxOf(countStart, charStart)))
+      history.drop(snapHistoryToUserBoundary(history, snapHistoryToPairBoundary(history, maxOf(countStart, charStart))))
     }
   }
 }
@@ -333,8 +367,9 @@ private fun charWindowStart(history: List<ChatMessage>, maxChars: Int): Int {
 }
 
 /**
- * Turn-boundary snap for [applyHistoryCap] (and send-time prefix trimming;
- * B1 pair atomicity).
+ * Tool-pair boundary snap for [applyHistoryCap] (and send-time prefix
+ * trimming; B1 pair atomicity). Callers apply [snapHistoryToUserBoundary]
+ * afterwards; the two snaps compose.
  *
  * Scans `0 until naiveStart` for any assistant message with `toolCalls` whose
  * valid, complete tool-call/output batch (per [completeToolBatchEnd])
@@ -349,8 +384,12 @@ private fun charWindowStart(history: List<ChatMessage>, maxChars: Int): Int {
  * dangling batch, or an ambiguous blank `toolCallId` within or straddling
  * the retained window), [completeToolBatchEnd] returns `-1` for malformed/incomplete
  * batches and [snapHistoryToPairBoundary] returns [naiveStart] unchanged — the
- * window never repairs invalid history and fails closed downstream in
- * `ProviderJson.validateToolPairing`.
+ * pair snap only holds the naive cut and never repairs *pairing*. Whether
+ * that cut ships is decided by [snapHistoryToUserBoundary]: when a
+ * `role == "user"` row follows within `[start, limit]` the leading
+ * invalid/unpaired slice is dropped wholesale (counted in the drop); only
+ * when no user row lies within `[start, limit]` is the cut kept and the
+ * slice fails closed downstream in `ProviderJson.validateToolPairing`.
  */
 private fun snapHistoryToPairBoundary(history: List<ChatMessage>, naiveStart: Int): Int {
   if (naiveStart <= 0) return 0
@@ -374,7 +413,57 @@ private fun snapHistoryToPairBoundary(history: List<ChatMessage>, naiveStart: In
 }
 
 /**
- * If [history] at [start] opens a valid, complete tool-call/output batch
+ * Turn-boundary snap for [applyHistoryCap] and the send-time head trims
+ * (B2, #16): after the naive/pair-snapped head cut at [start], advance to
+ * the next `role == "user"` row so the retained slice never opens on an
+ * orphan assistant (or tool) row. The Anthropic Messages API rejects a
+ * first non-system message whose role is not `user` (HTTP 400); OpenAI has
+ * no hard rejection but mis-reads the context / wastes window. The
+ * pair-atomic snap only protects
+ * structured tool batches and cannot align plain user/assistant turn
+ * boundaries — this snap closes that gap. A legal tool-call/output batch
+ * never straddles a user row, and a batch wholly before [start] is dropped
+ * together with its user row, so tool-pair integrity is unaffected.
+ *
+ * Semantics:
+ * 1. `start <= 0` or `start >= history.size` returns [start] unchanged
+ *    (no cap pressure; an empty request is never "fixed").
+ * 2. `history[start].role == "user"` returns [start] unchanged.
+ * 3. Otherwise returns the index of the first `role == "user"` row after
+ *    [start], never beyond [limit]. [limit] is the caller-side upper bound
+ *    on the returned index (inclusive; default [history.size], i.e. no
+ *    limit). The send-time trims pass their last-user/newest-row protection
+ *    limit so the snap can never consume the row the trim must preserve.
+ * 4. No `role == "user"` row within `[start, limit]` returns [start]
+ *    (fail-closed: keeps the naive cut and lets
+ *    `ProviderJson.validateToolPairing` fail closed downstream — mirroring
+ *    the pair-atomic policy, the window never repairs *pairing*).
+ * 5. Forward-only, never backwards; whole rows are dropped.
+ * 6. System rows are NOT exempt — a leading `role == "system"` row at the
+ *    cut is dropped like any non-user row (only `role == "user"` stops it).
+ *
+ * The window never repairs *pairing*; leading invalid/unpaired slices may
+ * be dropped wholesale by boundary alignment (counted in the drop); only
+ * the no-user-row-follows case keeps the slice and fails closed
+ * downstream. Violations still fail closed downstream in
+ * `ProviderJson.validateToolPairing`.
+ */
+internal fun snapHistoryToUserBoundary(
+  history: List<ChatMessage>,
+  start: Int,
+  limit: Int = history.size,
+): Int {
+  if (start <= 0 || start >= history.size) return start
+  if (history[start].role == "user") return start
+  val last = limit.coerceAtMost(history.size - 1)
+  for (i in start + 1..last) {
+    if (history[i].role == "user") return i
+  }
+  return start
+}
+
+/**
+ * If a valid, complete tool-call/output batch
  * (assistant `toolCalls` with non-blank, batch-unique ids/names immediately
  * followed by matching `tool` rows, including single-pending backfill
  * matching `ProviderJson.validateToolPairing(..., allowChatBackfill = true)`),
@@ -609,8 +698,10 @@ internal enum class DurableAdmission {
  * flush commits).
  *
  * Context window: the outgoing request carries [historyCap] (default
- * [HistoryWindowCap.DEFAULT] — bounded, pair-atomic); truncation is
- * oldest-first, whole-message, tool-pair-atomic, and counted on
+ * [HistoryWindowCap.DEFAULT] — bounded, pair-atomic and turn-aligned);
+ * truncation is
+ * oldest-first, whole-message, tool-pair-atomic and user-boundary-aligned,
+ * and counted on
  * [droppedHistoryCount]/[droppedHistoryChars]. The resumed prefix below is
  * part of that windowed history. [HistoryWindowCap.Unbounded] remains as an
  * explicit opt-in for tests/scaffolds only.
@@ -6076,7 +6167,10 @@ class TurnController(
    *
    * When the structured round pushes the request past [MAX_REQUEST_CHARS],
    * history-prefix trimming (oldest-first, whole messages, tool pairing kept
-   * atomic by snapping forward via [snapHistoryToPairBoundary], the structured payload counted) is additionally published on
+   * atomic by snapping forward via [snapHistoryToPairBoundary], the structured payload counted;
+   * the cut then re-aligns to the next user row via [snapHistoryToUserBoundary] so the retained
+   * prefix never opens on an orphan assistant/tool row — an illegal retained slice still fails
+   * closed downstream (only when no user row follows within `[start, limit]`)) is additionally published on
    * [lastRequestTrimmedCount]/[requestTrimmedCount] (counts),
    * [lastRequestTrimmedChars]/[lastRequestChars] (chars), and on top of the
    * base request's [contextOmission] value
@@ -6103,7 +6197,9 @@ class TurnController(
     val contMessages = loop.continuationMessages(calls, results)
     // Keep tool-call/tool-result pairing atomic: trim only the history prefix
     // when the structured round pushes the request over MAX_REQUEST_CHARS,
-    // snapping forward via snapHistoryToPairBoundary.
+    // snapping forward via snapHistoryToPairBoundary; then re-align the cut
+    // to the next user row via snapHistoryToUserBoundary so the retained
+    // prefix never opens on an orphan assistant/tool row.
     // Payload accounting is the conservative full-request estimate
     // (`requestWireEstimate`: per-message terms for the base AND the
     // structured round, plus the request envelope once) and includes the
@@ -6123,6 +6219,12 @@ class TurnController(
       val snapped = snapHistoryToPairBoundary(baseMessages, drop)
       if (snapped <= baseMessages.size - 1) {
         drop = snapped
+      }
+      // Always true given the while-loop bound (drop <= size - 1) and the
+      // pair-snap rejection path above (a snap past size - 1 is refused, so
+      // drop never exceeds it here); kept as belt-and-braces.
+      if (drop <= baseMessages.size - 1) {
+        drop = snapHistoryToUserBoundary(baseMessages, drop, baseMessages.size - 1)
       }
     }
     if (drop > 0) {
@@ -6217,7 +6319,11 @@ class TurnController(
    * with the final size on [lastRequestChars] (see [HistoryWindowCap] for the
    * reconciliation formula). The send-time [MAX_REQUEST_CHARS] trim is also
    * pair-atomic, snapping forward via [snapHistoryToPairBoundary] so tool
-   * call/result pairs are never fractured.
+   * call/result pairs are never fractured; the cut then re-aligns to the
+   * next user row via [snapHistoryToUserBoundary] (never beyond the
+   * last-user protection limit) so the retained slice never opens on an
+   * orphan assistant/tool row — an illegal retained slice still fails
+   * closed downstream (only when no user row follows within `[start, limit]`).
    *
    * Ephemeral time context: a [buildRuntimeTimeContext] block is appended to a
    * copy of the last user message only. No user message means no injection
@@ -6276,6 +6382,7 @@ class TurnController(
       if (snapped <= maxDropLimit) {
         dropCount = snapped
       }
+      dropCount = snapHistoryToUserBoundary(base, dropCount, maxDropLimit)
     }
     _lastRequestTrimmedCount.set(dropCount)
     _requestTrimmedCount.value = dropCount

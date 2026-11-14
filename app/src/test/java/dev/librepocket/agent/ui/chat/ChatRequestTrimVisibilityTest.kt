@@ -193,8 +193,11 @@ class ChatRequestTrimVisibilityTest {
         val transcripts = FakeSessionStore()
         val sid = runBlocking {
             val id = transcripts.createSession("big chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
-            // 3 complete turns x 19k chars = 114k > MAX_REQUEST_CHARS (100k);
-            // 6 rows < HISTORY_CAP so load-time omission stays 0.
+            // 3 complete turns x 19k chars = 114k. 6 rows < 2000-row DB scan
+            // so DB-tail omission stays 0. B2: the DEFAULT window (60k) keeps
+            // the newest 3 rows (57k) downstream; the send-time trim stays 0
+            // (window preempts it — send-time coverage lives in the
+            // Unbounded unit tests).
             for (i in 0 until 3) {
                 transcripts.appendEvent(
                     TranscriptEvent(sessionId = id, runId = "r$i", kind = "user", text = bigRow("u$i:"), createdAt = 1L),
@@ -216,20 +219,21 @@ class ChatRequestTrimVisibilityTest {
         onMain { vm.send() }
         awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 8 }
 
-        // Provider sees the cropped request: 114k + "hi" + time block drops
-        // exactly the oldest 19k row (95k remainder fits 100k).
+        // B2: DEFAULT window keeps [a1, u2, a2] (57k) + "hi" (tiny); total
+        // well under 100k, so the send-time trim stays 0.
         val req = fake.seenRequests.single()
         val totalChars = req.messages.sumOf { it.text.length }
         assertTrue(
             "total request chars must be <= MAX_REQUEST_CHARS, was $totalChars",
             totalChars <= TurnController.MAX_REQUEST_CHARS,
         )
-        assertEquals(6, req.messages.size)
-        assertTrue(req.messages.first().text.startsWith("a0:"))
+        assertEquals(4, req.messages.size)
+        assertTrue(req.messages.first().text.startsWith("a1:"))
         assertTrue(req.messages.last().text.startsWith("hi"))
 
-        // Send-time trim is observable via the VM and orthogonal to omission.
-        awaitTrue { vm.requestTrimmedCount.value == 1 }
+        // Window preempts send-time: trimmed stays 0, omission stays 0.
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE }
+        assertEquals(0, vm.requestTrimmedCount.value)
         assertEquals(0, vm.historyOmittedCount.value)
     }
 
@@ -268,6 +272,8 @@ class ChatRequestTrimVisibilityTest {
             "small request must fit uncropped, was ${req.messages.sumOf { it.text.length }}",
             req.messages.sumOf { it.text.length } <= TurnController.MAX_REQUEST_CHARS,
         )
+        // Window keeps newest 200 rows total (2000 tiny rows + live "hi" capped together).
+        assertEquals(200, req.messages.size)
         assertEquals(0, vm.requestTrimmedCount.value)
         assertEquals(2, vm.historyOmittedCount.value)
     }
@@ -294,9 +300,12 @@ class ChatRequestTrimVisibilityTest {
         val vm = chatViewModels.own(ChatViewModel(store, newFactory(fake, transcripts), allowKeyReadPolicy()))
         onMain { vm.openSession(big) }
         awaitTrue { vm.messages.value.size == 6 }
+        // B2: DEFAULT window preempts send-time for plain history (57k
+        // windowed + tiny live << 100k), so trimmed stays 0.
         onMain { vm.onInputChange("hi") }
         onMain { vm.send() }
-        awaitTrue { vm.requestTrimmedCount.value == 1 }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 8 }
+        assertEquals(0, vm.requestTrimmedCount.value)
 
         // Fence baseline while still on the big session (post-trim): the big
         // session's projections are never empty, so under the quiet premise

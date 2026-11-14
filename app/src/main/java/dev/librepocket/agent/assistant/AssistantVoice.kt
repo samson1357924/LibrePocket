@@ -66,7 +66,7 @@ object AssistantVoice {
      * trim/empty 檢查為防禦性邊界：涵蓋 [VoiceStt.pickResult] 契約與未修剪／純空白候選，
      * 長度上限則維持 prefill-only 邊界（不自動送出，亦不接受超長回填）。
      */
-    fun resolveVoicePrefill(results: List<String>?): String? =
+    fun resolveVoicePrefill(results: List<*>?): String? =
         VoiceStt.pickResult(results)
             ?.trim()
             ?.take(EntryNormalize.MAX_TEXT_LENGTH)

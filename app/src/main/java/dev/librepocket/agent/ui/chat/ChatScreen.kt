@@ -311,12 +311,15 @@ fun ChatScreen(
         // flipped prematurely, never silently drop STT results—prefill/error handling below must still run.
         val autoSendAfterVoice = AssistantVoice.AUTO_SEND_AFTER_VOICE
         if (result.resultCode == Activity.RESULT_OK) {
-            val candidates = try {
-                result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
-            } catch (_: Exception) {
+            // Treat extras retrieval + candidate extraction/validation + resolve as one untrusted boundary.
+            // Handles wrong container/element types (including generic-erasure/ClassCastException) and
+            // parcel errors (e.g. BadParcelableException) without crashing, prefilling, or sending.
+            val text = try {
+                val raw = result.data?.extras?.get(RecognizerIntent.EXTRA_RESULTS)
+                AssistantVoice.resolveVoicePrefill(raw as? List<*>)
+            } catch (_: Throwable) {
                 null
             }
-            val text = AssistantVoice.resolveVoicePrefill(candidates)
             if (text != null) {
                 voiceErrors.onSttSuccess()
                 viewModel.prefill(text)

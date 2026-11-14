@@ -43,6 +43,18 @@ class VoiceSttTest {
         assertNull(VoiceStt.pickResult(listOf("", "   ")))
     }
 
+    @Test fun wrongElementTypes_areIgnoredWithoutException() {
+        assertNull(VoiceStt.pickResult(listOf(42)))
+        assertNull(VoiceStt.pickResult(listOf(Any())))
+    }
+
+    @Test fun mixedAndNullElements_pickFirstNonBlankString() {
+        assertEquals("ok", VoiceStt.pickResult(listOf(42, "", "  ", "ok")))
+        assertEquals("ok", VoiceStt.pickResult(listOf(null, "ok")))
+        assertNull(VoiceStt.pickResult(listOf(null, null)))
+        assertNull(VoiceStt.pickResult(listOf<Any?>(null, 1, "", "  ")))
+    }
+
     @Test fun switchOff_isUserDisabled() {
         assertEquals(
             DenyReason.USER_DISABLED,

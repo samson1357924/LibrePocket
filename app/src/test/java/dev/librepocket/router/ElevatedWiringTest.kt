@@ -11,6 +11,7 @@ import dev.librepocket.shell.ElevatedShellRunner
 import dev.librepocket.shell.InMemoryPrivilegeRevokeStore
 import dev.librepocket.shell.PrivilegeAuditLog
 import dev.librepocket.shell.PrivilegeBridgeState
+import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellResult
 import dev.librepocket.tool.CapabilityLevel
 import dev.librepocket.tool.Flavor
@@ -28,6 +29,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.AbstractMap
@@ -61,6 +63,13 @@ class ElevatedWiringTest {
         initialRules = listOf(
             PolicyRule("*:*", Verdict.ASK, 0),
             PolicyRule("${ElevatedWiring.POLICY_ACTION}:${ElevatedWiring.TOOL_NAME}", Verdict.ALLOW, 10),
+        ),
+    )
+
+    private fun denyPolicy(): InMemoryPolicyStore = InMemoryPolicyStore(
+        initialRules = listOf(
+            PolicyRule("*:*", Verdict.DENY, 0),
+            PolicyRule("${ElevatedWiring.POLICY_ACTION}:${ElevatedWiring.TOOL_NAME}", Verdict.DENY, 10),
         ),
     )
 
@@ -291,6 +300,8 @@ class ElevatedWiringTest {
         assertTrue("$r", r is ShellResult.Denied)
         assertTrue("$r", (r as ShellResult.Denied).message.contains("bridge off"))
         assertEquals(0, runner.calls)
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+        assertEquals(1, audit.size())
     }
 
     @Test fun blockingGrantCheckFailsClosedNoSpawn() = runBlocking {
@@ -313,6 +324,7 @@ class ElevatedWiringTest {
         assertTrue("$r", r is ShellResult.Denied)
         assertTrue("$r", (r as ShellResult.Denied).message.contains("grant check failed"))
         assertEquals(0, runner.calls)
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
         assertEquals(1, audit.size())
     }
 
@@ -333,6 +345,8 @@ class ElevatedWiringTest {
         assertTrue("$r", r is ShellResult.Denied)
         assertEquals("NEVER_GRANTED", (r as ShellResult.Denied).message)
         assertEquals(0, runner.calls)
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+        assertEquals(1, audit.size())
     }
 
     @Test fun confirmAfterMutationVoids() = runBlocking {
@@ -434,9 +448,19 @@ class ElevatedWiringTest {
     }
 
     @Test fun happyPathAuditsSnapshotWithoutPlaintext() = runBlocking {
-        val runner = SpawnCounter()
-        val audit = PrivilegeAuditLog()
+        // 執行期間竄改 caller 保留的 mutable list：執行與審計仍須用入口快照（非竄改後值）。
         val argv = mutableListOf("id")
+        val runner = object : ElevatedShellRunner {
+            var calls = 0
+            var lastArgv: List<String>? = null
+            override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult {
+                calls++
+                lastArgv = request.argv.toList()
+                argv[0] = "rm" // runner 執行期間竄改 caller list（模擬 TOCTOU 嘗試）
+                return ShellResult.Ok("ok", "", 0, false)
+            }
+        }
+        val audit = PrivilegeAuditLog()
         val r = ElevatedWiring.execute(
             argv = argv,
             reasonCode = "B3-OK",
@@ -451,6 +475,8 @@ class ElevatedWiringTest {
         assertTrue("$r", r is ShellResult.Ok)
         assertEquals(1, runner.calls)
         assertEquals(listOf("id"), runner.lastArgv)
+        // 竄改確實發生（caller 保留的 list 已被改寫），但快照不受污染。
+        assertEquals(listOf("rm"), argv)
         assertEquals(1, audit.size())
         val row = audit.snapshot().single()
         assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), row.argvHash)
@@ -1390,5 +1416,682 @@ class ElevatedWiringTest {
         val row = audit.snapshot().single()
         assertTrue("argvHash must be set", row.argvHash.isNotEmpty())
         assertEquals("OK", audit.snapshot().single().verdict)
+    }
+
+    // --- Phase 2（PR #168）：執行期間竄改／重驗翻轉／dispatch 直測／取消與快照失敗 pin ---
+
+    @Test fun sameSizeArgvContentSwapRejectedOnReverify() = runBlocking {
+        // argv[0] 同長度同元素數替換（"id00"→"evil"）：size 與單項字元數皆不變，
+        // 唯內容重驗（argvMatchesSnapshot）可擋——證明比對不被 size/長度捷徑繞過。
+        val mutable = mutableListOf("id00")
+        assertEquals(4, "id00".length)
+        assertEquals(4, "evil".length)
+        var calls = 0
+        val ctxSupplier: () -> ProjectionContext = {
+            calls++
+            if (calls == 2) mutable[0] = "evil"
+            elevatedCtx()
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = mutable,
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = ctxSupplier,
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("changed after confirm"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+        assertEquals("evil", mutable[0])
+        val row = audit.snapshot().single()
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id00")), row.argvHash)
+    }
+
+    @Test fun reverifyFlavorFlipDeniedZeroSpawnPinsSnapshotHash() = runBlocking {
+        // 前驗 GITHUB、重驗 PLAY：flavor 翻轉即作廢（context changed），零 spawn、一筆 DENY、
+        // argvHash 記 snapshot argv（非空 argv）。
+        var calls = 0
+        val ctxSupplier: () -> ProjectionContext = {
+            calls++
+            if (calls == 1) elevatedCtx(Flavor.GITHUB) else elevatedCtx(Flavor.PLAY)
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = ctxSupplier,
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("context changed after confirm"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+        val row = audit.snapshot().single()
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), row.argvHash)
+    }
+
+    @Test fun reverifyUserSwitchFlipDeniedZeroSpawn() = runBlocking {
+        // 重驗側 privilege_bridge 開關翻轉（userSwitches ctx 開關面；與 bridgeGranted
+        // 供應者翻轉、與 grant 身份翻轉皆不同的一個面）→ context changed，零 spawn。
+        var calls = 0
+        val ctxSupplier: () -> ProjectionContext = {
+            calls++
+            if (calls == 1) elevatedCtx(bridgeOn = true) else elevatedCtx(bridgeOn = false)
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = ctxSupplier,
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("context changed after confirm"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+        val row = audit.snapshot().single()
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), row.argvHash)
+    }
+
+    @Test fun reverifyPolicyAllowToDenyDeniedZeroSpawn() = runBlocking {
+        // 前驗 ALLOW（首調）、重驗 DENY（次調）：policy 翻轉即作廢，零 spawn、一筆 DENY。
+        val denyOnSecond = object : PolicyStore by allowPolicy() {
+            private var calls = 0
+            override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision =
+                if (++calls == 1) {
+                    allowPolicy().evaluateFresh(action, resource)
+                } else {
+                    denyPolicy().evaluateFresh(action, resource)
+                }
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = denyOnSecond,
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("policy denied on reverify"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+        val row = audit.snapshot().single()
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), row.argvHash)
+    }
+
+    // --- executeWithFrozen 直測（同模組 internal，單一凍結快速路徑防禦門） ---
+
+    @Test fun executeWithFrozenReasonTooLongDeniedWithoutSpawnOrRunner() = runBlocking {
+        // reasonCode 512B+1 → BLACKLISTED Denied、空 argv＋空 reason 一筆 DENY、runner 不被呼叫。
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val tooLong = "a".repeat(513)
+        assertTrue(PrivilegeAuditLog.isReasonCodeTooLong(tooLong))
+        val r = ElevatedDispatch.executeWithFrozen(
+            tool = ToolRegistry.find("shell.elevated")!!,
+            frozen = ElevatedRequest(listOf("id"), tooLong),
+            runner = runner,
+            audit = audit,
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertEquals(ShellDeny.BLACKLISTED, (r as ShellResult.Denied).reason)
+        assertTrue(r.message.contains("reasonCode too long"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+        val row = audit.snapshot().single()
+        assertEquals(PrivilegeAuditLog.argvHash(emptyList()), row.argvHash)
+        assertEquals(PrivilegeAuditLog.sha256Hex(""), row.reasonHash)
+    }
+
+    @Test fun executeWithFrozenNormalFrozenExecutesAuditsOnce() = runBlocking {
+        // 正常 frozen（shell.elevated ToolDef＋合法 argv/reason）：runner 恰呼叫一次、
+        // 恰一筆審計、verdict OK、argvHash 綁定快照 argv。
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedDispatch.executeWithFrozen(
+            tool = ToolRegistry.find("shell.elevated")!!,
+            frozen = ElevatedRequest(listOf("id"), "M8-OK"),
+            runner = runner,
+            audit = audit,
+        )
+        assertTrue("$r", r is ShellResult.Ok)
+        assertEquals(1, runner.calls)
+        assertEquals(listOf("id"), runner.lastArgv)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("OK" to 1), audit.countByVerdict())
+        val row = audit.snapshot().single()
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), row.argvHash)
+        assertEquals(PrivilegeAuditLog.sha256Hex("M8-OK"), row.reasonHash)
+    }
+
+    @Test fun executeWithFrozenRejectsNonElevatedTool() {
+        // tool.name 非 shell.elevated → require 拋 IllegalArgumentException。
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val shellExec = ToolRegistry.find("shell.exec")!!
+        assertThrows(IllegalArgumentException::class.java) {
+            ElevatedDispatch.executeWithFrozen(
+                tool = shellExec,
+                frozen = ElevatedRequest(listOf("id"), "M8-X"),
+                runner = runner,
+                audit = audit,
+            )
+        }
+        assertEquals(0, runner.calls)
+        assertEquals(0, audit.size())
+    }
+
+    // --- cheap-gate／前驗異常注入（!confirmed、bridge/grant supplier 直拋） ---
+
+    @Test fun unconfirmedCtxSupplierThrowsDeniesProjectionUnavailableZeroSpawn() = runBlocking {
+        // !confirmed 且 ctxSupplier 直拋 IllegalStateException → evalBounded 收斂 null →
+        // Denied（projection unavailable）、零 spawn、一筆 DENY。
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = false,
+            ctxSupplier = { throw IllegalStateException("ctx boom") },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("projection unavailable"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+    }
+
+    @Test fun bridgeGrantedThrowsDeniedZeroSpawn() = runBlocking {
+        // bridgeGranted 直拋 IllegalStateException（非逾時；Throwable catch→null 路徑，
+        // 與 blockingGrantCheck 的 sleep→逾時路徑區分）→ Denied，零 spawn、一筆 DENY。
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { throw IllegalStateException("bridge boom") },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("bridge check failed"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+    }
+
+    @Test fun grantCheckThrowsDeniedZeroSpawn() = runBlocking {
+        // grantCheck 直拋 IllegalStateException → Denied（grant check failed），零 spawn、一筆 DENY。
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { throw IllegalStateException("grant boom") },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("grant check failed"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+    }
+
+    // --- 重驗階段失敗注入（prefix ALLOW/true，第二次翻面） ---
+
+    @Test fun reverifyGrantInvalidDeniedZeroSpawn() = runBlocking {
+        // 前驗 Valid、重驗 Invalid("SCOPE_REVOKED") → Denied（Invalid reason 透傳），
+        // 零 spawn、一筆 DENY、argvHash 記 snapshot argv。
+        var calls = 0
+        val grantCheck: () -> ElevatedWiring.ElevatedGrant = {
+            calls++
+            if (calls == 1) validGrant() else ElevatedWiring.ElevatedGrant.Invalid("SCOPE_REVOKED")
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = grantCheck,
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("SCOPE_REVOKED"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+        val row = audit.snapshot().single()
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), row.argvHash)
+    }
+
+    @Test fun reverifyGrantBlankProviderIdMalformedDeniedZeroSpawn() = runBlocking {
+        // 前驗 Valid("preset:openai")，重驗 Valid(blank providerId) → Denied
+        // 「grant identity malformed on reverify」，零 spawn、一筆 DENY。
+        var calls = 0
+        val grantCheck: () -> ElevatedWiring.ElevatedGrant = {
+            calls++
+            if (calls == 1) validGrant() else ElevatedWiring.ElevatedGrant.Valid("  ", TEST_REVISION)
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = grantCheck,
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("grant identity malformed"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), audit.snapshot().single().argvHash)
+    }
+
+    @Test fun reverifyBridgeThrowsDeniedZeroSpawn() = runBlocking {
+        // 前驗 true，重驗 bridgeGranted 直拋 IllegalStateException → Denied
+        // 「privilege bridge recheck failed」，零 spawn、一筆 DENY。
+        var calls = 0
+        val bridgeGranted: () -> Boolean = {
+            calls++
+            if (calls == 1) true else throw IllegalStateException("bridge reverify boom")
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = bridgeGranted,
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("privilege bridge recheck failed"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), audit.snapshot().single().argvHash)
+    }
+
+    @Test fun elevatedSnapshotBlockingArgvDeniedZeroSpawnBounded() = runBlocking {
+        // 自訂 AbstractList：size()／iterator() 永久阻塞（吞中斷、hold 於測試結尾釋放）→
+        // frozenOrNull 有界 ~1.2s（1s get＋200ms grace）→ Denied(BLACKLISTED, "elevated snapshot failed")、
+        // 零 spawn、一筆 DENY（空 argv）。
+        val hold = CountDownLatch(1) // 測試中不釋放：模擬永久阻塞（釋放於 finally）
+        val blockingArgv: List<String> = object : AbstractList<String>() {
+            override val size: Int get() {
+                while (hold.count > 0) {
+                    try {
+                        hold.await()
+                    } catch (_: InterruptedException) {
+                        // 吞中斷：模擬自訂 List 不響應中斷的永久阻塞。
+                    }
+                }
+                return 1
+            }
+            override fun get(index: Int): String = "id"
+            override fun iterator(): MutableIterator<String> {
+                while (hold.count > 0) {
+                    try {
+                        hold.await()
+                    } catch (_: InterruptedException) {
+                        // 同上。
+                    }
+                }
+                return mutableListOf("id").iterator()
+            }
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        try {
+            val start = System.currentTimeMillis()
+            val r = ElevatedWiring.execute(
+                argv = blockingArgv,
+                reasonCode = "B3-T",
+                confirmed = true,
+                ctxSupplier = { elevatedCtx() },
+                policyStore = allowPolicy(),
+                runner = runner,
+                audit = audit,
+                grantCheck = { validGrant() },
+                bridgeGranted = { true },
+            )
+            val elapsed = System.currentTimeMillis() - start
+            assertTrue("$r", r is ShellResult.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (r as ShellResult.Denied).reason)
+            assertTrue(r.message.contains("elevated snapshot failed"))
+            assertEquals(0, runner.calls)
+            assertEquals(1, audit.size())
+            assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+            val row = audit.snapshot().single()
+            assertEquals(PrivilegeAuditLog.argvHash(emptyList()), row.argvHash)
+            assertTrue("blocked path must be reached (elapsed=${elapsed}ms)", elapsed >= 900L)
+            // 有界 ~1.2s（1s get＋200ms grace），下界 900ms 錨住阻塞路徑確實執行，上限 5s 為 backstop。
+            assertTrue("frozenOrNull 有界 ~1.2s（1s get＋200ms grace），elapsed=${elapsed}ms", elapsed < 5_000)
+        } finally {
+            hold.countDown() // 釋放阻塞 worker，避免池槽永久殘留
+        }
+    }
+
+    @Test fun reverifyCancellationPropagatesWithoutDenyAudit() = runBlocking {
+        // 取消於「重驗（第二次）呼叫」：policy／bridge／grant 各自的第二次呼叫拋 CE →
+        // execute 重拋 CE、零 spawn、audit 無一筆（第一次呼叫皆須成功）。
+        val secondCallCePolicy = object : PolicyStore by allowPolicy() {
+            private var calls = 0
+            override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision =
+                if (++calls == 1) {
+                    allowPolicy().evaluateFresh(action, resource)
+                } else {
+                    throw CancellationException("policy reverify cancelled")
+                }
+        }
+        for (name in listOf("evaluateFresh", "bridgeGranted", "grantCheck")) {
+            val audit = PrivilegeAuditLog()
+            val runner = SpawnCounter()
+            try {
+                when (name) {
+                    "evaluateFresh" -> ElevatedWiring.execute(
+                        argv = listOf("id"),
+                        reasonCode = "B3-T",
+                        confirmed = true,
+                        ctxSupplier = { elevatedCtx() },
+                        policyStore = secondCallCePolicy,
+                        runner = runner,
+                        audit = audit,
+                        grantCheck = { validGrant() },
+                        bridgeGranted = { true },
+                    )
+                    "bridgeGranted" -> {
+                        var calls = 0
+                        val bridge: () -> Boolean = {
+                            calls++
+                            if (calls == 1) true else throw CancellationException("bridge reverify cancelled")
+                        }
+                        ElevatedWiring.execute(
+                            argv = listOf("id"),
+                            reasonCode = "B3-T",
+                            confirmed = true,
+                            ctxSupplier = { elevatedCtx() },
+                            policyStore = allowPolicy(),
+                            runner = runner,
+                            audit = audit,
+                            grantCheck = { validGrant() },
+                            bridgeGranted = bridge,
+                        )
+                    }
+                    else -> {
+                        var calls = 0
+                        val grant: () -> ElevatedWiring.ElevatedGrant = {
+                            calls++
+                            if (calls == 1) validGrant() else throw CancellationException("grant reverify cancelled")
+                        }
+                        ElevatedWiring.execute(
+                            argv = listOf("id"),
+                            reasonCode = "B3-T",
+                            confirmed = true,
+                            ctxSupplier = { elevatedCtx() },
+                            policyStore = allowPolicy(),
+                            runner = runner,
+                            audit = audit,
+                            grantCheck = grant,
+                            bridgeGranted = { true },
+                        )
+                    }
+                }
+                assertTrue("$name reverify must throw CE", false)
+            } catch (_: CancellationException) {
+                // 預期：重拋，不轉 Denied。
+            }
+            assertEquals("$name must not record DENY", 0, audit.size())
+            assertEquals("$name must not spawn", 0, runner.calls)
+        }
+    }
+
+    @Test fun reverifyArgvRecheckCancellationDeniedZeroSpawnPin() = runBlocking {
+        // pin 實際行為（非 CE 重拋）：重驗時 argvMatchesSnapshot 的重凍結經
+        // frozenOrNull→copyArgvBounded，iterator 拋 CE 被池 worker 內 `catch (_: Throwable)`
+        // 收斂為 null → argvMatchesSnapshot 回 false → Denied("changed after confirm")、
+        // 零 spawn、一筆 DENY（argvHash＝snapshot）。註：argvMatchesSnapshot 的
+        // `catch (e: CancellationException) { throw e }` 對「列表本身」不可達——
+        // CE 在 copyArgvBounded 內即被吞（fail-closed）；CE 只在 supplier／policy／
+        // freeze 路徑重拋（見 cancellationPropagatesWithoutDenyAudit／本檔 reverify CE）。
+        var iteratorCalls = 0
+        val adversarialArgv: List<String> = object : AbstractList<String>() {
+            override val size: Int get() = 1
+            override fun get(index: Int): String = "id"
+            override fun iterator(): MutableIterator<String> {
+                if (++iteratorCalls >= 2) {
+                    throw CancellationException("recheck iterator cancelled")
+                }
+                return mutableListOf("id").iterator()
+            }
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = adversarialArgv,
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("changed after confirm"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+        val row = audit.snapshot().single()
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), row.argvHash)
+    }
+
+    // --- reasonCode 超限（接線層 cheap gate） ---
+
+    @Test fun reasonCodeTooLongDeniedEmptyArgvNoSpawn() = runBlocking {
+        // 512B+1（ASCII 'a'×513）→ BLACKLISTED Denied「reasonCode too long」、
+        // 零 spawn、一筆 DENY（空 argv＋空 reason 記錄，不哈希無界輸入）。
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "a".repeat(513),
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertEquals(ShellDeny.BLACKLISTED, (r as ShellResult.Denied).reason)
+        assertTrue(r.message.contains("reasonCode too long"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+        val row = audit.snapshot().single()
+        assertEquals(PrivilegeAuditLog.argvHash(emptyList()), row.argvHash)
+        assertEquals(PrivilegeAuditLog.sha256Hex(""), row.reasonHash)
+    }
+
+    // --- M7：撤權於執行中生效的 pin（bridgeGranted supplier 共享可變狀態） ---
+
+    @Test fun privilegeBridgeRevokedMidRunBlocksNextCall() = runBlocking {
+        // 共享 AtomicBoolean 由 runner 於執行期間翻 false（模擬撤權於執行中生效）：
+        // 當輪已過門→執行；次一 call 的前驗 bridgeGranted 即見 false → Denied
+        // 「privilege bridge off」、零 spawn、一筆 DENY。
+        val bridgeOn = AtomicBoolean(true)
+        val runner = object : ElevatedShellRunner {
+            var calls = 0
+            var lastArgv: List<String>? = null
+            override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult {
+                calls++
+                lastArgv = request.argv.toList()
+                bridgeOn.set(false) // 撤權於執行中生效
+                return ShellResult.Ok("ok", "", 0, false)
+            }
+        }
+        val audit = PrivilegeAuditLog()
+        val first = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-OK",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { bridgeOn.get() },
+        )
+        assertTrue("$first", first is ShellResult.Ok)
+        // 撤權已生效：次一 call 立即被拒（bridge supplier 見 false）。
+        val second = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { bridgeOn.get() },
+        )
+        assertTrue("$second", second is ShellResult.Denied)
+        assertTrue("$second", (second as ShellResult.Denied).message.contains("privilege bridge off"))
+        assertEquals(1, runner.calls) // 次一 call 未 spawn
+        assertEquals(2, audit.size())
+        assertEquals(mapOf("OK" to 1, "DENY" to 1), audit.countByVerdict())
+    }
+
+    // --- runner 拋 CancellationException 的實際語義（以實碼為準 pin） ---
+
+    @Test fun runnerCancellationMapsFailedAndAuditsOnce() = runBlocking {
+        // pin 實際行為：runner 拋 CE 被 ShellExecTool.executeElevatedFrozen 的
+        // `catch (t: Throwable)` 收斂（CE 非 VirtualMachineError/ThreadDeath）→
+        // ShellResult.Failed（訊息含 "CancellationException"）＋單筆 FAILED 審計；
+        // CE 不外拋、不映 DENY。
+        val runner = object : ElevatedShellRunner {
+            var calls = 0
+            override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult {
+                calls++
+                throw CancellationException("runner cancelled")
+            }
+        }
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Failed)
+        assertTrue("$r", (r as ShellResult.Failed).message.contains("CancellationException"))
+        assertEquals(1, runner.calls) // 已 spawn（門禁已過）
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("FAILED" to 1), audit.countByVerdict())
+        val row = audit.snapshot().single()
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), row.argvHash)
+    }
+
+    // --- 重驗 grantCheck 期間竄改 caller mutable argv（clear） ---
+
+    @Test fun reverifyGrantRecheckMutationStillExecutesSnapshot() = runBlocking {
+        // 第二次 grantCheck（重驗）清空 caller 的 mutable argv：clear() 發生於
+        // argvMatchesSnapshot 之後（grant 重驗在 argv 重驗之後），且執行／審計用
+        // 快照 argv——空 argv 不構成誤判、result Ok、快照 argvHash 綁定。
+        val mutable = mutableListOf("id")
+        var grantCalls = 0
+        val grantCheck: () -> ElevatedWiring.ElevatedGrant = {
+            grantCalls++
+            if (grantCalls == 2) mutable.clear()
+            validGrant()
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = mutable,
+            reasonCode = "B3-OK",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = grantCheck,
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Ok)
+        assertEquals(0, mutable.size) // 竄改確實發生（caller 保留的 list 已被清空）
+        assertEquals(1, runner.calls)
+        assertEquals(listOf("id"), runner.lastArgv)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("OK" to 1), audit.countByVerdict())
+        val row = audit.snapshot().single()
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), row.argvHash)
     }
 }

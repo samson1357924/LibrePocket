@@ -25,10 +25,13 @@ import java.text.Normalizer
  * - [cleanField] 為 `nfkc → strip → sanitize` 迭代至精確定點（無輪數上限）：
  *   nfkc 先摺 fullwidth／small-form marker 相似字為 ASCII，剝除 marker
  *   （大小寫不敏感）再清理（去 Cf／Cc／EXTRA_STRIP），反覆至不動點。
- *   終止性：nfkc 冪等（純正規化輪不會連續出現）；之後每一輪皆為
- *   「返回不動點、刪除至少一碼點、或長度不變的 nfkc 正規化」三者之一，
- *   刪除輪次數以輸入長度為上界，故必於有限輪內收斂（最壞 O(n²)；
- *   病態深層嵌套 marker 的放大風險見 WebExtract KDoc 追蹤項）。
+ *   終止性：NFKC 僅首輪可擴張（展開為單字元有限映射；首輪後無待展開
+ *   字元，其後之 nfkc 至多合併／重排，長度不增、碼點數不增）；自第二輪
+ *   起每一輪或達不動點、或碼點數嚴格下降，刪除輪次數以首輪正規化後
+ *   長度為上界，故必於有限輪內收斂（最壞 O(n²)；病態深層
+ *   嵌套 marker 之放大風險已記錄於 WebExtract.kt header KDoc 之「D3 追蹤項」；
+ *   html 派生欄位（title／snippet／published）受 PARSE_INPUT_CAP（256k 字元）約束；
+ *   url／title fallback／siteName 係 cleanField 後才截斷，分別 2048／500／253）。
  * - [wrap] 之輸出形狀為 `BEGIN + "\n" + cleaned + "\n" + END`，不因輸入而變；
  *   語義僅輸出本體內容變化。
  */
@@ -58,10 +61,14 @@ object WebContentEnvelope {
      * Cf／兼容性混淆第二通道：攻擊者可在 marker 內插入 Cf（如 `EXTERNAL\u200B_UNTRUSTED`）
      * 或以 fullwidth／small-form 等兼容相似字構造 marker；單輪不足以收束——
      * NFKC 先摺相似字為 ASCII，剝除 marker（大小寫不敏感），再清理（去 Cf／Cc／EXTRA_STRIP），
-     * 反覆至不動點即返回。終止性：[Normalizer.Form.NFKC] 冪等（純正規化輪不會連續出現）；
-     * 每一輪輸出為「返回不動點、刪除至少一碼點、或長度不變的 nfkc 正規化」三者之一，
-     * 刪除輪次數以輸入長度為上界，故必於有限輪內收斂（最壞 O(n²)）。
-     * 注意：`strip` 非冪等（END 先剝、後剝 BEGIN 可能「造」出 END），由外層迭代吸收；
+     * 反覆至不動點即返回。終止性：NFKC 僅首輪可擴張（展開為單字元有限映射；
+     * 首輪後無待展開字元，其後 nfkc 至多合併／重排，長度不增、碼點數不增）；
+     * 自第二輪起每輪或達不動點、或碼點數嚴格下降，刪除輪次數以首輪
+     * 正規化後長度為上界，故必於有限輪內收斂（最壞 O(n²)）。
+     * 注意：`strip` 非冪等（先剝 BEGIN、後剝 END）：END 之移除可於接縫「造」出
+     * 新的 BEGIN（實測例：`<<<EXTERNAL_UNTRUSTED_CONTENT<<<END_EXTERNAL_UNTRUSTED_CONTENT>>>>>>`
+     * 單輪後留下 `<<<EXTERNAL_UNTRUSTED_CONTENT>>>`；實測未造出 END），故單輪不足以
+     * 收束，由外層迭代至定點吸收；
      * NFKC 摺疊僅施用於此處；parseHtml／entity unescape 不做 NFKC。
      */
     fun cleanField(text: String): String {
@@ -122,10 +129,4 @@ object WebContentEnvelope {
         return "$BEGIN\n$cleaned\n$END"
     }
 
-    /** 計數輸出內 marker 出現次數（測試／稽核用）。 */
-    internal fun countBegin(enveloped: String): Int =
-        enveloped.split(BEGIN, ignoreCase = false).size - 1
-
-    internal fun countEnd(enveloped: String): Int =
-        enveloped.split(END, ignoreCase = false).size - 1
 }

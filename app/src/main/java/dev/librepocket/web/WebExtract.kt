@@ -47,7 +47,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  *   無論 Content-Encoding 為何，未解壓即超限一律 `TOO_LARGE`（無 gzip 豁免）。
  * - Content-Encoding：僅 `gzip`／`x-gzip`（大小寫不敏感、trim）為合法值；
  *   未知值或多值（含逗號）→ `BAD_RESPONSE`（never 猜測編碼）。
- * - Content-Type（存在時）：僅 `text/*`、`application/xhtml+xml`、
+ * - Content-Type（存在時）：僅 `text/` 開頭型別、`application/xhtml+xml`、
  *   `application/xml`、`application/json` 或 `+xml`／`+json` suffixed 型別；
  *   其餘 → `BAD_RESPONSE`；缺席該 header 放行（legacy）。
  * - Gzip：解壓同樣受位元組上限約束
@@ -77,7 +77,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  *   例外：leader 於取消前已完整產出 Ok（okForFollowers 路徑）者，follower
  *   收到該 Ok 而非 CANCELLED。
  * - 內容：`title/url/snippet/published/siteName` 正規化（見 [parseHtml]），
- *   全經 [WebContentEnvelope.sanitize] 清理；模型可見體為
+ *   全經 [WebContentEnvelope.cleanField]（`nfkc → strip → sanitize` 定點）清理；模型可見體為
  *   [WebContentEnvelope.wrap] 單層 envelope；各欄位另受硬上限約束
  *  （title 500／siteName 253／url 2048／published 128，皆 surrogate 安全截斷）。
  * - 偽造 marker 定點清理：`title/snippet/published` 皆經
@@ -87,8 +87,12 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  *   marker（[WebContentEnvelope.BEGIN]／[END]）剝除為大小寫不敏感（sentinel
  *   marker 皆為 ASCII，任何大小寫變體不得存活進模型可見體）；wrap 輸出恰含一組
  *   原始大小寫 marker，listeners 以精確 marker 比對，屬契約。
- * - 全欄位皆為模型可見體外層 envelope 之內：`url/siteName/title` 等亦先經
- *   `cleanField` 再 cap，絕不出現未清理控制碼點。
+ * - fence 之範圍（契約）：僅 [WebContentEnvelope.wrap] 之輸出（＝清理後 capped 之
+ *   `snippet`，truncated 時含 sentinel）為模型可見體、置於單層 envelope 之內；
+ *   `content` 之 `url/title/siteName/published` 為 marker-free、Cf／Cc 已清理、
+ *   硬上限截斷之 untrusted **structured values**，**不在 fence 之內**；D3 wiring
+ *   必須僅將 `envelope` 呈現予模型，或於序列化 `content` 前自行 re-wrap／fence；
+ *   不得把未 fence 欄位當作攜帶信任語意之內容。
  *
  * Blocking（production 接線前必解）：[WebExtractHttpGet] 介面現攜帶
  * `pinnedAddresses`＋`maxBytes` 參數（見該介面之契約 KDoc：建連必釘住、
@@ -101,6 +105,27 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  * 複製（避免 web↔tool 套件循環），收斂至共享 helper 列為 Target 追蹤項
  * （#138/D5）；收斂時不得把 `TOO_LARGE` 改為截斷（extract 拒部分內容，避免
  * 模型見到截斷 HTML 誤判）。
+ *
+ * D3 追蹤項（production 接線前必解／必評估，#138/D3，否則不得 wiring）：
+ * 1. cache key＝URL（去 fragment 後之修剪字串，**非正規化**：default port／
+ *    case／percent-encoding 差異會產生重複 key——只是浪費，非正確性問題）
+ *    ＋`maxBytes`＋`maxModelChars`＋`policy`＋`configRevision`；**不含 port
+ *    維度之語義**（port 已內含於 URL 字串，無遺失，但 D3 須確認與政策側
+ *    port 處理一致）；亦**不含 resolver identity**（兩個不同 DNS 快照對同
+ *    key 不可區分；快取內容可能反映舊解析至多 60min — 重綁唯一手段為
+ *    `configRevision` bump 或 `WebExtractService.invalidate()`）。
+ * 2. cache **不解析 `Cache-Control`（含 `no-store`）**：TTL-only，屬刻意
+ *    設計（read 工具、無寫副作用）；D3 須決定 honor 或明文件化此行為。
+ * 3. `cleanField` 最壞 O(n²)（`snippet` 於 cap 前進入 cleanField，input 可達
+ *    [PARSE_INPUT_CAP] 256k 字元；`effModel` 截斷發生於清理之後；病態深層嵌套
+ *    marker 之 CPU 放大發生在 15s 預算之外）；url／siteName／title fallback 係
+ *    cleanField 後才截斷 — D3 wiring 前須緩解（如 marker 計數前掃）或記錄 accept。
+ * 4. envelope 僅為標記籬笆，**非授權**；D3 須另行接 `#165` consent/授權
+ *    流程，envelope 不擔任 authorization 角色。
+ * 5. Follower `await()` 未獨立掛 per-follower deadline（由 leader 預算＋cap-bounded
+ *    parse 間接有界）；D3 wiring 時可另加 `withTimeoutOrNull`。
+ * 6. `timeoutMs <= 0` 會被 `coerceAtLeast(1)` 收斂為 1ms 預算 — 幾乎立即
+ *    fail-closed `TIMEOUT`；屬保守方向，安全可接受。
  *
  * 純 JVM fixture 可測：transport 經 [WebExtractHttpGet] 注入，DNS 經
  * [HostResolver] 注入，時鐘經 [WebExtractCache] 注入；零真網。
@@ -189,7 +214,8 @@ sealed interface WebExtractOutcome {
         /**
          * 單層 envelope：非 truncated 時為 [WebContentEnvelope.wrap] 於 `capped`；
          * truncated 時為 wrap 於 `capped + "\n[...TRUNCATED AT $N CHARS]"`
-         * （見 [WebExtract.TRUNCATED_SENTINEL_MARK]）；模型可見體。
+         * （見 [WebExtract.TRUNCATED_SENTINEL_MARK]）；模型可見體。fence 僅涵蓋
+         * `snippet`；`content` 之其餘欄位不在 fence 之內（見 header「fence 之範圍」）。
          */
         val envelope: String,
         val truncated: Boolean = false,
@@ -240,6 +266,11 @@ data class WebExtractRawResponse(
  * 3. 必須可取消：協程取消時 socket 必須即時關閉，不得繼續讀取；
  *    取消訊號以 [kotlinx.coroutines.CancellationException] 透傳。
  * 4. 僅允許 `Accept` header（無 credentials、無 cookie、無自訂標頭）。
+ * 5. 重複 response headers（如兩個 `Content-Encoding` 行）：fixtures 以
+ *    `Map<String,String>` 不可表示重複；D3 OkHttp adapter 必須對具語義之
+ *    headers（`content-encoding`／`content-type`／`transfer-encoding`）採
+ *    fail-closed（重複即拒絕）或以 `getAll` 串接後視為多值（`content-encoding`
+ *    多值已由 `extractUncached` 判 `BAD_RESPONSE`）；不得取首值放行。
  */
 fun interface WebExtractHttpGet {
     suspend fun get(
@@ -298,7 +329,8 @@ internal suspend fun fetchRawWithTimeout(
 /**
  * D4 抽取快取（TTL 60min；純 JVM）。
  *
- * - key＝正規化 URL（呼叫方應先去 fragment；見 [stripFragment]）＋`maxBytes`
+ * - key＝去 fragment 之修剪字串（刻意**不做** URL 正規化，見 [stripFragment]
+ *  與 header「D3 追蹤項」#1）＋`maxBytes`
  *  ＋`maxModelChars`＋policy identity（[EndpointNetworkOptIn.policy]＋
  *  [EndpointNetworkOptIn.configRevision]）；不同預算／不同 tier／
  *  不同 revision 絕不互撞。
@@ -475,6 +507,10 @@ class WebExtractService(
                     // complete(ok) 而非 completeExceptionally），follower 收到該 Ok
                     // 而非 CANCELLED——`await()` 會直接回傳已落定的結果。
                     return WebExtractOutcome.Unavailable(WebExtract.DETAIL_CANCELLED, null)
+                } catch (e: Error) {
+                    // Error（OOM/SOE 等致命錯誤）原樣上拋，不映射為 TRANSPORT、不吞噬；
+                    // 與 leader 路徑（catch Throwable → completeExceptionally(e) → 上拋）對稱。
+                    throw e
                 } catch (_: Throwable) {
                     return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
                 }
@@ -615,6 +651,12 @@ class WebExtractService(
             }
 
             if (NetworkPolicy.isRedirectStatus(response.code)) {
+                // Redirect body 同樣受位元組上限約束（transport 契約「body > maxBytes →
+                // TOO_LARGE」在此分支原被靜默繞過——body 雖不據此消費內容，契約不得有
+                // 豁免缺口；重定向回應攜帶超限 body 一律 fail-closed 中止）。
+                if (response.body.size > effBytes) {
+                    return WebExtractOutcome.Failed(WebExtract.DETAIL_TOO_LARGE)
+                }
                 if (hops >= WebExtract.MAX_REDIRECTS) {
                     return WebExtractOutcome.Failed(WebExtract.DETAIL_TOO_MANY_REDIRECTS)
                 }
@@ -783,9 +825,9 @@ private fun downgradedOptInForRedirect(
 /**
  * Content-Type 閘：回傳 true 當型別可接受（缺 charset 無妨）。
  *
- * 允許：`text/*`、`application/xhtml+xml`、`application/xml`、`application/json`、
+ * 允許：`text/` 開頭型別、`application/xhtml+xml`、`application/xml`、`application/json`、
  * 以及主型別字根（`/` 後）以 `+xml` 或 `+json` 結尾者（如 `application/atom+xml`）；
- * 其餘一律 false（包含任何 `image/*`／`audio/*` 等非後綴型別）。
+ * 其餘一律 false（包含任何 `image/`／`audio/` 等非後綴型別）。
  * 型別比對大小寫不敏感、`;` 之後之參數（如 `; charset=...`）忽略。
  */
 internal fun isAllowedContentType(contentType: String): Boolean {

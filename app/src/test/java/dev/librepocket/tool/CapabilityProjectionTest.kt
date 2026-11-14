@@ -1,5 +1,6 @@
 package dev.librepocket.tool
 
+import dev.librepocket.web.WebExtract
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -163,6 +164,7 @@ class CapabilityProjectionTest {
             "shell.exec",
             "shell.elevated",
             WebFetch.TOOL_NAME,
+            WebExtract.TOOL_NAME,
             DbTools.QUERY_NAME,
             DbTools.EXEC_NAME,
             ToolRegistry.SLOW_TOOL_NAME,
@@ -203,6 +205,7 @@ class CapabilityProjectionTest {
                 "screenshot" to true,
                 "webfetch" to true,
                 "websearch" to true,
+                "webextract" to true,
                 "database" to true,
                 "lsp" to true,
                 "clipboard" to true,
@@ -220,6 +223,7 @@ class CapabilityProjectionTest {
             "shell.exec",
             "shell.elevated",
             WebFetch.TOOL_NAME,
+            WebExtract.TOOL_NAME,
             DbTools.QUERY_NAME,
             DbTools.EXEC_NAME,
             ToolRegistry.SLOW_TOOL_NAME,

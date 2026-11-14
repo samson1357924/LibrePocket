@@ -431,29 +431,38 @@ class McpServerAccountingTest {
 
     private class DelayedBlockingVault(
         private val delayMs: Long,
-        private val workerDone: CountDownLatch,
+        private val keyReturnedToCaller: CountDownLatch,
         val capturedKey: AtomicReference<CharArray?>,
     ) : KeyVault {
         override suspend fun putKey(providerId: String, apiKey: CharArray) = Unit
         override suspend fun deleteKey(providerId: String) = Unit
         override suspend fun hasKey(providerId: String): Boolean = true
         override suspend fun getKey(providerId: String): CharArray? {
-            try {
-                val key = "sekret-token-1".toCharArray()
-                capturedKey.set(key)
-                Thread.sleep(delayMs)
-                return key
-            } finally {
-                workerDone.countDown()
-            }
+            val key = "sekret-token-1".toCharArray()
+            capturedKey.set(key)
+            Thread.sleep(delayMs)
+            // Signal after the blocking delay but before returning to the caller's IO block,
+            // so the test can wait for the caller-side finally { key.fill('\u0000') } to run
+            // deterministically instead of racing on a pre-cleanup latch.
+            keyReturnedToCaller.countDown()
+            return key
         }
+    }
+
+    private fun awaitZeroized(key: CharArray, timeoutMs: Long = 5_000L): Boolean {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        while (System.nanoTime() < deadline) {
+            if (key.all { it == '\u0000' }) return true
+            Thread.sleep(10)
+        }
+        return key.all { it == '\u0000' }
     }
 
     @Test fun listToolsWipesVaultKeyWhenTimeoutDropsIoResult() = runBlocking {
         val web = MockWebServer()
         web.start()
         try {
-            val workerDone = CountDownLatch(1)
+            val keyReturnedToCaller = CountDownLatch(1)
             val captured = AtomicReference<CharArray?>()
             val breaker = McpCircuitBreaker()
             val s = McpServer(
@@ -464,7 +473,7 @@ class McpServerAccountingTest {
                 ),
                 keyVault = DelayedBlockingVault(
                     delayMs = McpTimeouts.MIN_MS + 5_000L,
-                    workerDone = workerDone,
+                    keyReturnedToCaller = keyReturnedToCaller,
                     capturedKey = captured,
                 ),
                 transport = McpTransport(),
@@ -475,10 +484,16 @@ class McpServerAccountingTest {
             }
             assertNotNull("listTools must complete with TIMEOUT", got)
             assertEquals(McpStatus.TIMEOUT, got!!.status)
-            assertTrue("blocking vault worker must complete", workerDone.await(15, TimeUnit.SECONDS))
+            assertTrue(
+                "blocking vault must return key to caller",
+                keyReturnedToCaller.await(15, TimeUnit.SECONDS),
+            )
             val key = captured.get()
             assertNotNull("vault must have produced key", key)
-            assertTrue("dropped IO result must still zeroize key", key!!.all { it == '\u0000' })
+            assertTrue(
+                "dropped IO result must still zeroize key",
+                awaitZeroized(key!!),
+            )
             assertEquals("timeout path must not send HTTP", 0, web.requestCount)
             assertEquals("timeout path must not count breaker failure", 0, breaker.failureCount())
         } finally {
@@ -490,7 +505,7 @@ class McpServerAccountingTest {
         val web = MockWebServer()
         web.start()
         try {
-            val workerDone = CountDownLatch(1)
+            val keyReturnedToCaller = CountDownLatch(1)
             val captured = AtomicReference<CharArray?>()
             val breaker = McpCircuitBreaker()
             val s = McpServer(
@@ -501,7 +516,7 @@ class McpServerAccountingTest {
                 ),
                 keyVault = DelayedBlockingVault(
                     delayMs = McpTimeouts.MIN_MS + 5_000L,
-                    workerDone = workerDone,
+                    keyReturnedToCaller = keyReturnedToCaller,
                     capturedKey = captured,
                 ),
                 transport = McpTransport(),
@@ -512,10 +527,16 @@ class McpServerAccountingTest {
             }
             assertNotNull("callTool must complete with TIMEOUT", got)
             assertEquals(McpStatus.TIMEOUT, got!!.status)
-            assertTrue("blocking vault worker must complete", workerDone.await(15, TimeUnit.SECONDS))
+            assertTrue(
+                "blocking vault must return key to caller",
+                keyReturnedToCaller.await(15, TimeUnit.SECONDS),
+            )
             val key = captured.get()
             assertNotNull("vault must have produced key", key)
-            assertTrue("dropped IO result must still zeroize key", key!!.all { it == '\u0000' })
+            assertTrue(
+                "dropped IO result must still zeroize key",
+                awaitZeroized(key!!),
+            )
             assertEquals("timeout path must not send HTTP", 0, web.requestCount)
             assertEquals("timeout path must not count breaker failure", 0, breaker.failureCount())
         } finally {

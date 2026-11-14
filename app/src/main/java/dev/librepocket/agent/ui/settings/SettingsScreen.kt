@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -153,6 +154,20 @@ fun SettingsScreen(
     onVoiceOutputSwitch: (Boolean) -> Unit = {},
     onOpenAiTtsSwitch: (Boolean) -> Unit = {},
     /**
+     * D3 網路搜尋（Settings→Tools→Web；null 時整卡隱藏，仿 automation 模式）。
+     * master 預設關；provider 狀態由 `probe()` 映射（可用／缺 key／缺 URL）；
+     * 首次開啟走 consent sheet（`showConsent`）；DDGS opt-in＋非官方警語見卡內。
+     */
+    web: WebSearchSettingsState? = null,
+    onWebMasterSwitch: (Boolean) -> Unit = {},
+    onWebDdgsSwitch: (Boolean) -> Unit = {},
+    onWebSearxngUrlChange: (String) -> Unit = {},
+    onWebProbe: () -> Unit = {},
+    onWebConsentConfirm: () -> Unit = {},
+    onWebConsentDismiss: () -> Unit = {},
+    onWebRetryLoad: () -> Unit = {},
+    onWebResetSettings: () -> Unit = {},
+    /**
      * C1 系統預設助理（Issue #137 C1b，三 flavor 共用 main 接線）：
      * null（未接線）時整卡隱藏（仿 automation 模式）；非 null 顯示狀態＋
      * 「設為預設助理」一鍵（RoleManager 流程）＋「語音輸入設定」fallback。
@@ -228,10 +243,16 @@ fun SettingsScreen(
     val importPickerPending = pickers.importPickerPending
     // 失敗不自動關 dialog：error 存續即重現確認態（confirm 已手動關閉又回來也一樣）。
     val showConfirmLogout = confirmLogout || logoutErrorCode != null
+    val effectiveWeb = if (logoutInFlight) {
+        web?.copy(switchesEnabled = false, urlEditable = false)
+    } else {
+        web
+    }
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(padding)
+            .imePadding()
             .verticalScroll(rememberScrollState())
             .padding(20.dp),
     ) {
@@ -379,6 +400,22 @@ fun SettingsScreen(
                     }
                 }
                 Spacer(modifier = Modifier.height(8.dp))
+                // D3 網路搜尋（Settings→Tools→Web）：僅傳入 web 非 null 才顯示
+                //（master 預設關、`executionReady=false` 不可執行；provider 狀態＋probe＋首次開啟 consent＋DDGS 警語見卡內）。
+                if (effectiveWeb != null) {
+                    WebSearchCard(
+                        state = effectiveWeb,
+                        onMasterSwitch = onWebMasterSwitch,
+                        onDdgsSwitch = onWebDdgsSwitch,
+                        onSearxngUrlChange = onWebSearxngUrlChange,
+                        onProbe = onWebProbe,
+                        onConsentConfirm = onWebConsentConfirm,
+                        onConsentDismiss = onWebConsentDismiss,
+                        onRetryLoad = onWebRetryLoad,
+                        onResetSettings = onWebResetSettings,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
                 // C1 系統預設助理（Issue #137 C1b）：僅 main 接線傳入非 null 才顯示
                 // （三 flavor 共用；play 不加 a11y overlay，本卡與 a11y 無關）。
                 // 被拒／撤銷／OEM 不支援／請求失敗皆顯示原因並提供 fallback 入口。
@@ -772,20 +809,6 @@ fun SettingsScreen(
                         Text("前往設定")
                     }
                     Spacer(modifier = Modifier.height(12.dp))
-                    TranscriptBackupCard(
-                        currentSessionId = currentSessionId,
-                        exportState = exportState,
-                        importState = importState,
-                        onLaunchExport = launchExport,
-                        onLaunchImport = launchImport,
-                        exportPickerPending = pickers.exportPickerPending,
-                        importPickerPending = importPickerPending,
-                        exportPickerFailed = exportPickerFailed,
-                        importPickerFailed = importPickerFailed,
-                        onViewTranscript = onViewTranscript,
-                        onDismissExportState = onDismissExportState,
-                        onDismissImportState = onDismissImportState,
-                    )
                 } else {
                     Card(
                         colors = CardDefaults.cardColors(
@@ -875,6 +898,37 @@ fun SettingsScreen(
                             Text("關閉")
                         }
                     }
+                    Spacer(modifier = Modifier.height(12.dp))
+                }
+                if (effectiveWeb != null) {
+                    WebSearchCard(
+                        state = effectiveWeb,
+                        onMasterSwitch = onWebMasterSwitch,
+                        onDdgsSwitch = onWebDdgsSwitch,
+                        onSearxngUrlChange = onWebSearxngUrlChange,
+                        onProbe = onWebProbe,
+                        onConsentConfirm = onWebConsentConfirm,
+                        onConsentDismiss = onWebConsentDismiss,
+                        onRetryLoad = onWebRetryLoad,
+                        onResetSettings = onWebResetSettings,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+                if (recoveryCode == null) {
+                    TranscriptBackupCard(
+                        currentSessionId = currentSessionId,
+                        exportState = exportState,
+                        importState = importState,
+                        onLaunchExport = launchExport,
+                        onLaunchImport = launchImport,
+                        exportPickerPending = pickers.exportPickerPending,
+                        importPickerPending = importPickerPending,
+                        exportPickerFailed = exportPickerFailed,
+                        importPickerFailed = importPickerFailed,
+                        onViewTranscript = onViewTranscript,
+                        onDismissExportState = onDismissExportState,
+                        onDismissImportState = onDismissImportState,
+                    )
                 }
             }
             EndpointGate.Loading -> {
@@ -906,6 +960,20 @@ fun SettingsScreen(
                     } else {
                         Text("重試讀取")
                     }
+                }
+                if (effectiveWeb != null) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    WebSearchCard(
+                        state = effectiveWeb,
+                        onMasterSwitch = onWebMasterSwitch,
+                        onDdgsSwitch = onWebDdgsSwitch,
+                        onSearxngUrlChange = onWebSearxngUrlChange,
+                        onProbe = onWebProbe,
+                        onConsentConfirm = onWebConsentConfirm,
+                        onConsentDismiss = onWebConsentDismiss,
+                        onRetryLoad = onWebRetryLoad,
+                        onResetSettings = onWebResetSettings,
+                    )
                 }
             }
         }

@@ -2,12 +2,17 @@ package dev.librepocket.web
 
 import java.io.IOException
 import java.io.InterruptedIOException
+import java.net.Inet6Address
+import java.net.InetAddress
 import java.net.SocketTimeoutException
+import java.net.URI
+import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withTimeout
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /**
  * D2 最小 HTTP 抽象（#138 D2；純 JVM，不接線）。
@@ -114,9 +119,160 @@ internal fun failureForStatus(code: Int): WebFailureReason? = when (code) {
 internal fun hostOf(url: String): String? = try {
     java.net.URI(url).host
         ?.takeIf { it.isNotBlank() }
-        ?.lowercase()
+        ?.lowercase(Locale.ROOT)
         ?.removePrefix("www.")
         ?.takeIf { it.isNotEmpty() }
 } catch (_: Exception) {
     null
+}
+
+internal const val MAX_WEB_BASE_URL_LENGTH = 2048
+
+internal fun isSafeUrlForStorage(url: String): Boolean {
+    if (url.isEmpty()) return true
+    if (url.length > MAX_WEB_BASE_URL_LENGTH) return false
+    if (containsControlFormatOrSurrogateChar(url)) return false
+    if (url.any { it == '@' || it == '?' || it == '#' || it == '\\' || it == '\u2028' || it == '\u2029' }) {
+        return false
+    }
+    return true
+}
+
+private val NUMERIC_IPV4_PART = Regex("""^(\d+|0[xX][0-9a-fA-F]+)$""")
+private val IPV6_LITERAL_CHARS = Regex("""^[0-9a-fA-F:.]+$""")
+private val DOT_SEGMENTS = setOf(".", "..")
+
+internal fun containsControlFormatOrSurrogateChar(value: String): Boolean {
+    var i = 0
+    while (i < value.length) {
+        val cp = value.codePointAt(i)
+        if (
+            cp <= 0x1F ||
+            cp == 0x7F ||
+            cp in 0xD800..0xDFFF ||
+            Character.getType(cp) == Character.CONTROL.toInt() ||
+            Character.getType(cp) == Character.FORMAT.toInt()
+        ) {
+            return true
+        }
+        i += Character.charCount(cp)
+    }
+    return false
+}
+
+private fun isIpv4MappedBytes(bytes: ByteArray): Boolean =
+    bytes.size == 16 &&
+        bytes.take(10).all { it == 0.toByte() } &&
+        (bytes[10].toInt() and 0xff) == 0xff &&
+        (bytes[11].toInt() and 0xff) == 0xff
+
+private fun isDeprecatedIpv4CompatBytes(bytes: ByteArray): Boolean =
+    bytes.size == 16 &&
+        bytes.take(12).all { it == 0.toByte() } &&
+        !(bytes[12] == 0.toByte() && bytes[13] == 0.toByte() && bytes[14] == 0.toByte() &&
+            (bytes[15] == 0.toByte() || bytes[15] == 1.toByte()))
+
+private fun isAwsMetadataIpv6(bytes: ByteArray): Boolean =
+    bytes.size == 16 &&
+        (bytes[0].toInt() and 0xff) == 0xfd &&
+        (bytes[1].toInt() and 0xff) == 0x00 &&
+        (bytes[2].toInt() and 0xff) == 0x0e &&
+        (bytes[3].toInt() and 0xff) == 0xc2 &&
+        bytes.slice(4..13).all { it == 0.toByte() } &&
+        (bytes[14].toInt() and 0xff) == 0x02 &&
+        (bytes[15].toInt() and 0xff) == 0x54
+
+internal fun parseHttpBaseUri(raw: String): URI? {
+    val trimmed = raw.trim { it == ' ' || it == '\t' || it == '\r' || it == '\n' }
+    if (trimmed.isEmpty() || trimmed.length > MAX_WEB_BASE_URL_LENGTH) return null
+    if (containsControlFormatOrSurrogateChar(trimmed) || trimmed.any { it.isWhitespace() }) return null
+    if ('\\' in trimmed) return null
+    if (!trimmed.startsWith("http://", ignoreCase = true) && !trimmed.startsWith("https://", ignoreCase = true)) {
+        return null
+    }
+    val authority = trimmed
+        .substringAfter("://", "")
+        .substringBefore('/')
+        .substringBefore('?')
+        .substringBefore('#')
+    if (authority.isEmpty() || '@' in authority || authority.endsWith(':')) return null
+    val base = trimmed.trimEnd('/')
+    if (base.isEmpty()) return null
+    val uri = try {
+        URI(base)
+    } catch (_: Exception) {
+        return null
+    }
+    val scheme = uri.scheme?.lowercase(Locale.ROOT) ?: return null
+    if (scheme != "http" && scheme != "https") return null
+    val host = uri.host
+    if (host.isNullOrBlank()) return null
+    if (containsControlFormatOrSurrogateChar(host) || host.any { it.isWhitespace() }) return null
+    if (uri.port != -1 && uri.port !in 1..65535) return null
+    if (
+        uri.userInfo != null ||
+        uri.rawUserInfo != null ||
+        uri.query != null ||
+        uri.rawQuery != null ||
+        uri.fragment != null ||
+        uri.rawFragment != null
+    ) {
+        return null
+    }
+    val rawPath = uri.rawPath.orEmpty()
+    if (rawPath.split('/').any { seg ->
+            seg == "." || seg == ".." || seg.replace("%2e", ".", ignoreCase = true) in DOT_SEGMENTS
+        }
+    ) {
+        return null
+    }
+    val httpUrl = base.toHttpUrlOrNull() ?: return null
+    if (httpUrl.scheme != scheme) return null
+    if (httpUrl.username.isNotEmpty() || httpUrl.password.isNotEmpty()) return null
+    if (httpUrl.query != null || httpUrl.fragment != null) return null
+    if (uri.port != -1 && uri.port != httpUrl.port) return null
+
+    if (host.startsWith("[")) {
+        if (!host.endsWith("]") || '%' in host) return null
+        val inner = host.substring(1, host.length - 1)
+        if (':' !in inner || !IPV6_LITERAL_CHARS.matches(inner)) return null
+        val addr = try {
+            InetAddress.getByName(inner)
+        } catch (_: Exception) {
+            return null
+        }
+        if (addr !is Inet6Address) return null
+        val bytes = addr.address
+        if (isIpv4MappedBytes(bytes) || isDeprecatedIpv4CompatBytes(bytes) || isAwsMetadataIpv6(bytes)) return null
+        if (addr.isAnyLocalAddress || addr.isLinkLocalAddress || addr.isMulticastAddress) return null
+    } else {
+        if (']' in host || ':' in host || '%' in host) return null
+        if (host.lowercase(Locale.ROOT) != httpUrl.host) return null
+        val hostNoTrailDot = host.trimEnd('.')
+        val labels = hostNoTrailDot.split('.')
+        if (labels.size in 1..4 && labels.all { NUMERIC_IPV4_PART.matches(it) }) {
+            if (host.endsWith('.')) return null
+            if (labels.size != 4) return null
+            if (labels.any { it.startsWith("0x", ignoreCase = true) }) return null
+            if (labels.any { it.length > 1 && it.startsWith('0') }) return null
+            val parts = labels.map { it.toIntOrNull() ?: return null }
+            if (parts.any { it !in 0..255 }) return null
+            val bytes = ByteArray(4) { idx -> parts[idx].toByte() }
+            val addr = InetAddress.getByAddress(bytes)
+            if (addr.isAnyLocalAddress || addr.isLinkLocalAddress || addr.isMulticastAddress) return null
+            val first = parts[0]
+            if (first == 0 || first >= 240) return null
+            if (parts == listOf(100, 100, 100, 200)) return null
+        }
+    }
+    return uri
+}
+
+internal fun normalizeHttpOrigin(raw: String): String? {
+    val uri = parseHttpBaseUri(raw) ?: return null
+    val scheme = uri.scheme.lowercase(Locale.ROOT)
+    val host = uri.host.lowercase(Locale.ROOT)
+    val port = if (uri.port != -1) ":${uri.port}" else ""
+    val rawPath = uri.rawPath.orEmpty()
+    return "$scheme://$host$port$rawPath"
 }

@@ -40,6 +40,8 @@ import dev.librepocket.shell.PrivilegeBridgeState
 import dev.librepocket.voice.VoiceSwitchStore
 import dev.librepocket.voice.VoiceSwitchSnapshot
 import dev.librepocket.voice.VoiceTools
+import dev.librepocket.agent.ui.settings.WebSearchViewModel
+import dev.librepocket.agent.ui.settings.WebSearchViewModelFactory
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -133,6 +135,11 @@ fun MainScreen(
         voiceStore.observeTtsAcknowledged().stateIn(scope, SharingStarted.WhileSubscribed(5000), false)
     }
     val ttsAcknowledged by ackFlow.collectAsStateWithLifecycle()
+
+    val webViewModel: WebSearchViewModel = viewModel(
+        factory = WebSearchViewModelFactory(app),
+    )
+    val webSettingsState by webViewModel.uiState.collectAsStateWithLifecycle()
 
     // S3 提權橋產品態（BACKLOG D09）：審計表 + privilege_bridge 開關 +
     // 橋接授權三位一體；一鍵收回原子清表、關開關、撤授權（見 PrivilegeBridgeState）。
@@ -415,6 +422,15 @@ fun MainScreen(
                 onRequestAssistantRole = assistantRole.request,
                 onRecheckAssistantRole = assistantRole.recheck,
                 onOpenVoiceInputSettings = assistantRole.openFallback,
+                web = webSettingsState,
+                onWebMasterSwitch = webViewModel::onMasterSwitch,
+                onWebDdgsSwitch = webViewModel::onDdgsSwitch,
+                onWebSearxngUrlChange = webViewModel::onSearxngUrlChange,
+                onWebProbe = webViewModel::onProbe,
+                onWebConsentConfirm = webViewModel::onConsentConfirm,
+                onWebConsentDismiss = webViewModel::onConsentDismiss,
+                onWebRetryLoad = webViewModel::retryLoad,
+                onWebResetSettings = webViewModel::onResetSettings,
             )
         },
         setupContent = { padding, isFirstRun ->

@@ -20,6 +20,8 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -55,8 +57,17 @@ class SetupModelsTest {
 
     @After
     fun tearDown() {
-        Dispatchers.resetMain()
         scopes.forEach { it.cancel() }
+        scopes.forEach { scope ->
+            val job = scope.coroutineContext[kotlinx.coroutines.Job]
+            runBlocking {
+                withTimeout(5_000) {
+                    job?.join()
+                }
+            }
+        }
+        Dispatchers.resetMain()
+        scopes.clear()
         tmpDirs.forEach { it.deleteRecursively() }
     }
 

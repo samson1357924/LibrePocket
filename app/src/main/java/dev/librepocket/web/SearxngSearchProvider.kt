@@ -1,6 +1,5 @@
 package dev.librepocket.web
 
-import java.net.URI
 import java.net.URLEncoder
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -15,7 +14,7 @@ import kotlinx.serialization.json.contentOrNull
  *   `count` 在 client 端 `take(n)`（不自創 server-side 參數）。
  * - Timeout 可注入（[timeoutMs]）；狀態映射見 [failureForStatus]；
  *   解析失敗／body 超限 → `BAD_RESPONSE`。
- * - `probe()` 只做設定檢查（[buildUrl]("probe") == null → `MISSING_URL`），不打網路。
+ * - `probe()` 只做設定檢查（空白 → `MISSING_URL`、無效格式 → `INVALID_URL`），不打網路。
  * - Ctor 參數順序與 [DdgsSearchProvider] 不同是歷史因素（此處為 baseUrl 先）；
  *   為避免 positional 誤用請 prefer named args；為 binary-compat 不更名。
  * - Cleartext（http）仍接受（tests＋自架 LAN 需要）；release cleartext 由
@@ -37,11 +36,15 @@ class SearxngSearchProvider(
     companion object {
         const val ID = "searxng"
         internal val SearxngJson = Json { ignoreUnknownKeys = true; isLenient = true }
+
+        fun probeUrl(baseUrl: String): WebProbe = when {
+            baseUrl.isBlank() -> WebProbe.NotReady(WebUnavailableReason.MISSING_URL)
+            parseHttpBaseUri(baseUrl) == null -> WebProbe.NotReady(WebUnavailableReason.INVALID_URL)
+            else -> WebProbe.Ready
+        }
     }
 
-    override suspend fun probe(): WebProbe =
-        if (buildUrl("probe") == null) WebProbe.NotReady(WebUnavailableReason.MISSING_URL)
-        else WebProbe.Ready
+    override suspend fun probe(): WebProbe = probeUrl(baseUrl)
 
     override suspend fun search(query: String, count: Int): WebSearchOutcome {
         if (query.isBlank()) return WebSearchOutcome.Unavailable(WebUnavailableReason.EMPTY_QUERY)
@@ -78,40 +81,19 @@ class SearxngSearchProvider(
      * Raw (encoded) path is used so equivalent-decoding paths (e.g. `%2F` vs `/`,
      * `%41` vs `A`) stay isolated (safe direction: extra upstream, never cross-hit)。
      */
-    private fun normalizedBase(): String {
-        val raw = baseUrl.trim().trimEnd('/')
-        return try {
-            val uri = URI(raw)
-            val scheme = uri.scheme?.lowercase() ?: return raw
-            val host = uri.host?.lowercase() ?: return raw
-            val port = if (uri.port != -1) ":${uri.port}" else ""
-            val path = uri.rawPath.orEmpty()
-            "$scheme://$host$port$path"
-        } catch (_: Exception) {
-            raw
-        }
-    }
+    private fun normalizedBase(): String =
+        normalizeHttpOrigin(baseUrl) ?: baseUrl.trim().trimEnd('/')
 
     /**
      * URL 組裝（scheme 非 http/https、缺 host、解析失敗 → null → `PROTOCOL`）。
      *
-     * 含 userinfo／query／fragment 的 base 視為形狀錯誤一律拒絕（→ null → `PROTOCOL`），
+     * 含 userinfo／query／fragment／控制字元的 base 視為形狀錯誤一律拒絕（→ null → `PROTOCOL`），
      * 保持 raw-string concat 形狀以縮小 blast radius（不做 URI-builder 重構）。
      * http 仍接受（cleartext 由 release NetworkSecurityConfig 管控，見 class KDoc）。
      */
     internal fun buildUrl(query: String): String? {
-        val base = baseUrl.trim().trimEnd('/')
-        if (base.isEmpty()) return null
-        return try {
-            val uri = URI(base)
-            val scheme = uri.scheme?.lowercase()
-            if (scheme != "http" && scheme != "https") return null
-            if (uri.host.isNullOrBlank()) return null
-            if (uri.userInfo != null || uri.query != null || uri.fragment != null) return null
-            "$base/search?format=json&q=${URLEncoder.encode(query.trim(), Charsets.UTF_8)}"
-        } catch (_: Exception) {
-            null
-        }
+        val base = normalizeHttpOrigin(baseUrl) ?: return null
+        return "$base/search?format=json&q=${URLEncoder.encode(query.trim(), Charsets.UTF_8)}"
     }
 
     /**

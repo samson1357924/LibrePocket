@@ -13,6 +13,7 @@ enum class WebUnavailableReason {
     PROVIDER_DISABLED,
     MISSING_KEY,
     MISSING_URL,
+    INVALID_URL,
     PINNED_UNAVAILABLE,
     HOSTED_NOT_SUPPORTED;
 

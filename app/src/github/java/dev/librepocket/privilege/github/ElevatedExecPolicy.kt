@@ -95,12 +95,13 @@ internal object ElevatedExecPolicy {
      * 宿主（生產 Android 必有 `/system/bin`），此時預設搜尋表
      * （`searchDirs == TRUSTED_BIN_DIRS`）的 bare 命中若因宿主 exotic
      * （如 cargo `coreutils` 致 `OUTSIDE_ROOTS`、或 `screencap` 等裝置二進位在宿主
-     * 缺席致 `NOT_FOUND`）而失敗，回退為合成 `Ok("/system/bin/<name>")`
+     * 缺席致 `NOT_FOUND`、或 CI 宿主預設目錄被 Stage 1-5 搜尋目錄守衛判定為
+     * `SEARCH_DIR_UNTRUSTED`）而失敗，回退為合成 `Ok("/system/bin/<name>")`
      * （`applet=null`，僅供既有單測的假 spawn 斷言 verdict／計數，不執行真機）；
-     * 顯式注入搜尋表（新 P1-1 安全測試的暫存可信目錄）永不回退，一律 fail-closed；
-     * 含分隔符的絕對 `argv[0]` 永不回退（含可信父目錄但宿主缺席亦 fail-closed，
-     * 既有單測無此形，不影響）；`SEARCH_DIR_UNTRUSTED`／`REAL_WRITABLE`／
-     * `ENTRY_WRITABLE`／`UNTRUSTED_PATH` 等安全閘永不回退。
+     * 顯式注入搜尋表／自訂 `allowedRoots`（新 P1-1 安全測試的暫存可信目錄）永不回退，
+     * 一律 fail-closed；含分隔符的絕對 `argv[0]` 永不回退（含可信父目錄但宿主缺席亦
+     * fail-closed，既有單測無此形，不影響）；`REAL_WRITABLE`／`ENTRY_WRITABLE`／
+     * `UNTRUSTED_PATH` 等目標/路徑安全閘永不回退。
      * 生產裝置（`/system/bin` 存在）無回退分支，一律嚴格實體驗證。
      *
      * Phase 5 B7 三表同步警告（不改型別，僅 KDoc）：
@@ -190,16 +191,24 @@ internal object ElevatedExecPolicy {
         }
         if (outcome is ShellExecutables.ResolveOutcome.Denied &&
             searchDirs == ShellExecutables.TRUSTED_BIN_DIRS &&
-            allowedRoots == null &&
-            (outcome.reason == ShellExecutables.ResolveDeny.NOT_FOUND ||
-                outcome.reason == ShellExecutables.ResolveDeny.OUTSIDE_ROOTS)
+            allowedRoots == null
         ) {
-            val raw = snapshotArgv0.trim()
-            val isBare = !raw.contains('/') && !raw.contains('\\')
-            if (isBare && !java.io.File("/system/bin").exists()) {
-                return ShellExecutables.ResolveOutcome.Ok(
-                    ShellExecutables.ResolvedExec("/system/bin/$raw", null),
-                )
+            val reason = outcome.reason
+            val hostDefaultSearchFallback =
+                reason == ShellExecutables.ResolveDeny.NOT_FOUND ||
+                    reason == ShellExecutables.ResolveDeny.OUTSIDE_ROOTS ||
+                    reason == ShellExecutables.ResolveDeny.SEARCH_DIR_UNTRUSTED
+            if (hostDefaultSearchFallback) {
+                val raw = snapshotArgv0.trim()
+                val isBare = !raw.contains('/') && !raw.contains('\\')
+                // JVM 單測宿主相容：預設裝置搜尋表在非 Android 宿主上可能因目錄缺席、
+                // 宿主差異或搜尋目錄守衛而失敗；僅在 /system/bin 不存在時回退為合成目標。
+                // 顯式搜尋表/allowedRoots、絕對 argv0 與目標/路徑安全閘永不回退。
+                if (isBare && !java.io.File("/system/bin").exists()) {
+                    return ShellExecutables.ResolveOutcome.Ok(
+                        ShellExecutables.ResolvedExec("/system/bin/$raw", null),
+                    )
+                }
             }
         }
         return outcome

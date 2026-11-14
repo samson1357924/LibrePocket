@@ -479,7 +479,8 @@ class WebSearchD5Test {
             val body = when {
                 url.startsWith(TavilySearchProvider.ENDPOINT) -> tavilyBody
                 url.startsWith(ExaSearchProvider.ENDPOINT) -> exaBody
-                else -> firecrawlBody
+                url.startsWith(FirecrawlSearchProvider.ENDPOINT) -> firecrawlBody
+                else -> error("unexpected endpoint: $url")
             }
             ok(body = body)
         }
@@ -1268,6 +1269,15 @@ class WebSearchD5Test {
         val vault = FakeVault()
         vault.putKey(FirecrawlSearchProvider.DEFAULT_KEY_ID, "k".toCharArray())
         val http = FakePost { _, _ -> ok(body = "{}") }
+        val out = FirecrawlSearchProvider(vault, http).search("q", 5)
+        assertTrue(out is WebSearchOutcome.Failed)
+        assertEquals(WebFailureReason.BAD_RESPONSE, (out as WebSearchOutcome.Failed).reason)
+    }
+
+    @Test fun firecrawlMissingSuccessWithValidDataIsBadResponse() = runBlocking {
+        val vault = FakeVault()
+        vault.putKey(FirecrawlSearchProvider.DEFAULT_KEY_ID, "k".toCharArray())
+        val http = FakePost { _, _ -> ok(body = """{"data":{"web":[{"title":"X","url":"https://example.com/"}]}}""") }
         val out = FirecrawlSearchProvider(vault, http).search("q", 5)
         assertTrue(out is WebSearchOutcome.Failed)
         assertEquals(WebFailureReason.BAD_RESPONSE, (out as WebSearchOutcome.Failed).reason)

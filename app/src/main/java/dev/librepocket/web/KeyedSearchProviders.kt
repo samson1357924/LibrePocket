@@ -365,8 +365,8 @@ internal fun parseTavilyResults(json: Json, body: String, limitHint: Int = 16): 
 /**
  * Exa Search API（POST `{ENDPOINT}`；`x-api-key` header 傳 key）。
  *
- * Body `{"query","numResults","contents":{"highlights":true}}`（`contents` 為必要欄位，
- * 缺則不回 `text`／`highlights`）；回應 `{"results":[{title,url,highlights,publishedDate}]}`；
+ * Body `{"query","numResults","contents":{"highlights":true}}`（`contents` 選填，但缺則不回
+ * text/highlights（本形狀必須帶 highlights 才有摘要））；回應 `{"results":[{title,url,highlights,publishedDate}]}`；
  * snippet 優先取 `highlights` 陣列以 `" "` 接合並 trim，缺則回退 `text`→`snippet`→`description`；
  * 下游以 [capResultsForModel] 收斂（沿 D2 姿態）。
  */
@@ -464,8 +464,8 @@ internal fun parseExaResults(json: Json, body: String, limitHint: Int = 16): Lis
  *
  * Body `{"query","limit"}`；回應 `{"success":true,"data":{"web":[{title,url,description}]}}`
  * （v2 的 `data` 為物件、`web` 為陣列，非平陣列；v1 已不再針對）。
- * `success:false`（HTTP 200 包錯誤）→ `Failed(SUPPLIER_ERROR)`（防禦性處理）；
- * 非布林 success → BAD_RESPONSE。
+ * `success` 缺席／非布林（含字串 "true"/"false"）→ `BAD_RESPONSE`；`true` 才進 `data.web` 解析；
+ * `false` → `SUPPLIER_ERROR`。
  * snippet 優先 `description`、缺則回退 `markdown`（無 scrapeOptions 時通常缺；description 缺席時
  * 回退 markdown/snippet 仍支援）、再缺 `snippet`。
  * DEFAULT_KEY_ID 綁定 v2 endpoint；自 v1 升級時舊 vault 項目失效，需重新輸入 Firecrawl key（未隨本 PR 發佈）。
@@ -522,13 +522,11 @@ class FirecrawlSearchProvider(
             null
         } ?: return WebSearchOutcome.Failed(WebFailureReason.BAD_RESPONSE)
         val success = root["success"]
-        if (success != null) {
-            val ok = (success as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull
-            when (ok) {
-                false -> return WebSearchOutcome.Failed(WebFailureReason.SUPPLIER_ERROR)
-                null -> return WebSearchOutcome.Failed(WebFailureReason.BAD_RESPONSE)
-                true -> Unit
-            }
+        val ok = (success as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull
+        when (ok) {
+            true -> Unit
+            false -> return WebSearchOutcome.Failed(WebFailureReason.SUPPLIER_ERROR)
+            null -> return WebSearchOutcome.Failed(WebFailureReason.BAD_RESPONSE)
         }
         return finishOk(parseFirecrawlData(root, count), count)
     }

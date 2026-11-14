@@ -606,11 +606,12 @@ object ShellExecutables {
             } catch (_: Exception) {
                 continue
             }
-            // 不存在的搜尋目錄無法提供/遮蔽可執行檔：跳過且不列入 taint（避免
-            // host/CI 上不存在的 Android 系統目錄因路徑語義觸發防禦性拒絕，
-            // 同時不改變真實存在目錄的 Stage1-5 防護）。對懸空 symlink 亦視為
-            // 不可用（跟隨連結不存在），避免 real 化失敗被誤判為不可信。
-            if (!Files.exists(Paths.get(dirNorm))) {
+            // 不存在/不可用的搜尋目錄無法提供/遮蔽可執行檔：跳過且不列入 taint
+            //（避免 host/CI 上不存在的 Android 系統目錄因路徑語義觸發防禦性拒絕，
+            // 同時不改變真實存在目錄的 Stage1-5 防護）。對懸空 symlink 或非目錄
+            // 亦視為不可用（跟隨連結判定），避免 real 化失敗被誤判為不可信。
+            val dirPath = Paths.get(dirNorm)
+            if (!Files.isDirectory(dirPath)) {
                 continue
             }
             if (isSearchDirUntrusted(dirNorm, isWritable)) {

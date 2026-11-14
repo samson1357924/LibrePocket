@@ -96,7 +96,10 @@ object ShellExecTool {
      * 產品調用方（傳 gate 後同一 frozen 經 [executeElevatedFrozen]；本函數僅供
      * Dispatch 外的防線縱深與單測直調，產品代碼禁止直調本函數繞過
      * [dev.librepocket.router.PrivilegeGate] 確認／投影／reason 門。誤調即編譯期
-     * 攔截（internal 可見性），見 `ShellGateSoleEntryTest`）。
+     * 攔截（internal 可見性）＋ main 源集 token 掃描雙重防線；提權鏈 sole-entry
+     * 為 `ElevatedWiring.execute`（唯一合法呼叫方），本 PR 新 pin 見
+     * `ElevatedSoleEntryTest.soleEntryForExecuteWithFrozen`；本函數零直調同見
+     * `ShellStage5Test.soleEntryNoDirectToolCallsInMain`）。
      */
     internal fun executeElevated(
         request: ElevatedRequest,

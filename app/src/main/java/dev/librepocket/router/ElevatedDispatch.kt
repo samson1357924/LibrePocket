@@ -116,9 +116,13 @@ object ElevatedDispatch {
      * and delegates to [ShellExecTool.executeElevatedFrozen] so runner execution/result auditing
      * happens exactly once without re-freezing.
      *
+     * 唯一合法呼叫方：[ElevatedWiring].execute（重驗通過後委派；本 PR 新 pin 見
+     * `ElevatedSoleEntryTest.soleEntryForExecuteWithFrozen`）。
+     *
      * PRECONDITION (defense-in-depth): caller MUST have completed tool/confirmation/projection/
      * policy/bridge/grant checks and post-confirm reverify on the same immutable snapshot.
      * Do not call with unverified or stale requests; misuse inside module can bypass gates.
+     * sole-entry 由 `ElevatedSoleEntryTest`（main 源集 token 掃描）釘死，除 `ElevatedDispatch.kt`（宣明檔）外，main 源集出現 `executeWithFrozen(` 呼叫即 fail。
      */
     internal fun executeWithFrozen(
         tool: ToolDef,

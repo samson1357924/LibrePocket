@@ -125,6 +125,8 @@ fun SettingsScreen(
     onRevokePrivilege: () -> Unit = {},
     /** 提權審計筆數（僅計數，不含明文；0 表示無待收回授權痕跡）。 */
     privilegeAuditCount: Int = 0,
+    privilegeRevokeInFlight: Boolean = false,
+    privilegeRevokeError: Boolean = false,
     /**
      * S3 無障礙自動化設定（P1 inert 收斂，PR#1 re-review）：
      * null（play 或未接線）時整卡隱藏；非 null（foss/github flavor wiring 傳入）
@@ -537,12 +539,30 @@ fun SettingsScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                        if (privilegeRevokeError) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                "收回授權失敗，請重試",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
                         Spacer(modifier = Modifier.height(8.dp))
                         OutlinedButton(
                             onClick = onRevokePrivilege,
+                            enabled = !privilegeRevokeInFlight,
                             modifier = Modifier.fillMaxWidth(),
                         ) {
-                            Text("一鍵收回提權授權並清空審計")
+                            if (privilegeRevokeInFlight) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    strokeWidth = 2.dp,
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("收回中…")
+                            } else {
+                                Text("一鍵收回提權授權並清空審計")
+                            }
                         }
                     }
                 }

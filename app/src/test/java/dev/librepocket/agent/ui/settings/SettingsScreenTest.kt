@@ -599,4 +599,57 @@ class SettingsScreenTest {
         dismissButtons[1].performScrollTo().performClick()
         assertTrue(dismissedImport)
     }
+
+    @Test
+    fun privilegeRevoke_idleStateRendersAndTriggersRevoke() {
+        var revokeClicked = false
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                privilegeAuditCount = 3,
+                privilegeRevokeInFlight = false,
+                privilegeRevokeError = false,
+                onRevokePrivilege = { revokeClicked = true },
+            )
+        }
+        composeRule.onNodeWithText("目前審計筆數：3", substring = true).performScrollTo().assertIsDisplayed()
+        onLogoutArea("一鍵收回提權授權並清空審計").assertIsDisplayed().assertIsEnabled()
+        composeRule.onAllNodesWithText("收回授權失敗，請重試").assertCountEquals(0)
+        composeRule.onAllNodesWithText("收回中…").assertCountEquals(0)
+
+        onLogoutArea("一鍵收回提權授權並清空審計").performClick()
+        assertTrue(revokeClicked)
+    }
+
+    @Test
+    fun privilegeRevoke_inFlightStateDisablesButtonAndShowsProgress() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                privilegeRevokeInFlight = true,
+                privilegeRevokeError = false,
+            )
+        }
+        onLogoutArea("收回中…").assertIsDisplayed().assertIsNotEnabled()
+        composeRule.onAllNodesWithText("一鍵收回提權授權並清空審計").assertCountEquals(0)
+    }
+
+    @Test
+    fun privilegeRevoke_errorStateDisplaysErrorMessageAndAllowsRetry() {
+        var retryClicked = false
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                privilegeRevokeInFlight = false,
+                privilegeRevokeError = true,
+                onRevokePrivilege = { retryClicked = true },
+            )
+        }
+        onLogoutArea("收回授權失敗，請重試").assertIsDisplayed()
+        onLogoutArea("一鍵收回提權授權並清空審計").assertIsDisplayed().assertIsEnabled().performClick()
+        assertTrue(retryClicked)
+    }
 }

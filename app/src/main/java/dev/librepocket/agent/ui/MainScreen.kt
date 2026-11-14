@@ -36,7 +36,9 @@ import dev.librepocket.agent.assistant.rememberAssistantRole
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.entry.EntryDispatch
 import dev.librepocket.entry.EntryRoute
+import dev.librepocket.shell.FlavorPrivilegeScope
 import dev.librepocket.shell.PrivilegeBridgeState
+import dev.librepocket.shell.PrivilegeBridgeStore
 import dev.librepocket.voice.VoiceSwitchStore
 import dev.librepocket.voice.VoiceSwitchSnapshot
 import dev.librepocket.voice.VoiceTools
@@ -136,8 +138,12 @@ fun MainScreen(
 
     // S3 提權橋產品態（BACKLOG D09）：審計表 + privilege_bridge 開關 +
     // 橋接授權三位一體；一鍵收回原子清表、關開關、撤授權（見 PrivilegeBridgeState）。
-    val privilegeState = remember { PrivilegeBridgeState() }
-    var privilegeAuditCount by remember { mutableIntStateOf(privilegeState.auditCount()) }
+    // #136-B1 行程單例：跨 composition／Activity 唯一持有者，審計計數不因重組丟失。
+    val privilegeState = remember { PrivilegeBridgeState.process() }
+    val privilegeStore = remember(app) { PrivilegeBridgeStore(app) }
+    val privilegeAuditCount by privilegeState.auditCountFlow.collectAsStateWithLifecycle()
+    var privilegeRevokeInFlight by remember { mutableStateOf(false) }
+    var privilegeRevokeError by remember { mutableStateOf(false) }
 
     // C1 系統預設助理（Issue #137 C1b，三 flavor 共用 main 接線）：
     // RoleManager 快照＋一鍵要求＋fallback launcher（見 rememberAssistantRole）。
@@ -271,10 +277,28 @@ fun MainScreen(
                     }
                 },
                 onRevokePrivilege = {
-                    privilegeState.revoke()
-                    privilegeAuditCount = privilegeState.auditCount()
+                    if (!privilegeRevokeInFlight) {
+                        scope.launch {
+                            privilegeRevokeInFlight = true
+                            privilegeRevokeError = false
+                            try {
+                                privilegeState.revoke(privilegeStore) {
+                                    FlavorPrivilegeScope.withdraw(app)
+                                }
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                Log.w(TAG, "privilege revoke failed", e)
+                                privilegeRevokeError = true
+                            } finally {
+                                privilegeRevokeInFlight = false
+                            }
+                        }
+                    }
                 },
                 privilegeAuditCount = privilegeAuditCount,
+                privilegeRevokeInFlight = privilegeRevokeInFlight,
+                privilegeRevokeError = privilegeRevokeError,
                 voiceInputEnabled = VoiceTools.inputEnabled(voiceEffectiveSnapshot),
                 voiceOutputEnabled = VoiceTools.outputEnabled(voiceEffectiveSnapshot),
                 openAiTtsEnabled = VoiceTools.openAiTtsEnabled(voiceEffectiveSnapshot),

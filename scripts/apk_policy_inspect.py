@@ -202,6 +202,7 @@ PLAY_DEFINED_CLASS_PREFIXES = (
     "Ldev/librepocket/agent/foss/",
     "Ldev/librepocket/privilege/github/",
     "Lrikka/shizuku/",
+    "Lmoe/shizuku/",
 )
 PLAY_FORBIDDEN_SUPERCLASSES = frozenset(
     (
@@ -214,12 +215,14 @@ FOSS_MANIFEST_NEEDLES = (
     "com.google.android.gms",
     "com.microsoft.cognitiveservices.speech",
     "rikka.shizuku",
+    "moe.shizuku",
 )
 FOSS_TYPE_PREFIXES = (
     "Lcom/google/mlkit/",
     "Lcom/google/android/gms/",
     "Lcom/microsoft/cognitiveservices/speech/",
     "Lrikka/shizuku/",
+    "Lmoe/shizuku/",
 )
 # Android root multidex names are classes.dex, then classes2.dex through
 # classesN.dex. Accept every canonical decimal N >= 2 (including 10+), while
@@ -1058,9 +1061,54 @@ def _validate_aapt_output(aapt: str, apk: Path) -> tuple[str, str]:
         [aapt, "dump", "xmltree", str(apk), "AndroidManifest.xml"],
         "aapt dump xmltree",
     )
-    if not re.search(r"(?im)^\s*E:\s*manifest\b", xmltree):
+    if not re.search(r"(?im)^\s*E:\s*manifest(?=\s|\(|$)", xmltree):
         raise PolicyError("aapt xmltree output lacks a manifest root")
     return permissions, xmltree
+
+
+_XMLTREE_ELEMENT_LINE_RE = re.compile(r"^([ \t]*)E:\s*([^(\s]+)(?=\s|\(|$)")
+_APPLICATION_LINE_RE = re.compile(r"^([ \t]*)E:\s*application(?=\s|\(|$)")
+
+
+def _locate_application_manifest_span(xmltree: str) -> tuple[list[str], int, int, int]:
+    """Locate the unique top-level <application> element line span and indent."""
+    lines = xmltree.splitlines()
+    stack: list[tuple[int, str]] = []
+    manifest_roots = 0
+    app_matches: list[tuple[int, int]] = []
+    for index, line in enumerate(lines):
+        elem = _XMLTREE_ELEMENT_LINE_RE.match(line)
+        if elem is None:
+            continue
+        indent_len = len(elem.group(1))
+        tag = elem.group(2)
+        while stack and stack[-1][0] >= indent_len:
+            stack.pop()
+        if not stack and tag == "manifest":
+            manifest_roots += 1
+            if manifest_roots > 1:
+                raise PolicyError(
+                    "merged manifest contains multiple <manifest> elements"
+                )
+        if tag == "application" and (not stack or stack[-1][1] == "manifest"):
+            app_matches.append((index, indent_len))
+        stack.append((indent_len, tag))
+    if not app_matches:
+        raise PolicyError(
+            "merged manifest lacks an <application> element - the backup and "
+            "network security bindings cannot survive a manifest that has no "
+            "application to bind"
+        )
+    if len(app_matches) > 1:
+        raise PolicyError("merged manifest contains multiple <application> elements")
+    app_index, app_indent = app_matches[0]
+    end = len(lines)
+    for follow in range(app_index + 1, len(lines)):
+        sibling = _XMLTREE_ELEMENT_LINE_RE.match(lines[follow])
+        if sibling and len(sibling.group(1)) <= app_indent:
+            end = follow
+            break
+    return lines, app_index, end, app_indent
 
 
 def _application_manifest_block(xmltree: str) -> tuple[str, int]:
@@ -1070,6 +1118,8 @@ def _application_manifest_block(xmltree: str) -> tuple[str, int]:
     (``  E: application``); the block ends at the next ``E:`` element line of
     the same or shallower indentation. A manifest without an application
     element cannot carry either backup binding, so absence fails closed.
+    Duplicate top-level ``<manifest>`` or ``<application>`` elements also fail
+    closed so a second block cannot shadow bindings or hide components.
 
     Alongside the slice this returns the application element line's leading
     whitespace length so the binding gates can anchor their ``A:`` matches at
@@ -1079,24 +1129,8 @@ def _application_manifest_block(xmltree: str) -> tuple[str, int]:
     wears ``android:fullBackupContent`` / ``android:dataExtractionRules``
     while the ``<application>`` itself lost both bindings.
     """
-    lines = xmltree.splitlines()
-    for index, line in enumerate(lines):
-        match = re.match(r"^(\s*)E:\s*application\b", line)
-        if match is None:
-            continue
-        indent = match.group(1)
-        end = len(lines)
-        for follow in range(index + 1, len(lines)):
-            sibling = re.match(r"^(\s*)E:\s", lines[follow])
-            if sibling and len(sibling.group(1)) <= len(indent):
-                end = follow
-                break
-        return "\n".join(lines[index:end]), len(indent)
-    raise PolicyError(
-        "merged manifest lacks an <application> element - the backup and "
-        "network security bindings cannot survive a manifest that has no "
-        "application to bind"
-    )
+    lines, app_index, end, app_indent = _locate_application_manifest_span(xmltree)
+    return "\n".join(lines[app_index:end]), app_indent
 
 
 def _application_attr_anchor(app_indent: int) -> str:
@@ -1559,7 +1593,7 @@ def _network_security_mode(application_block: str, app_indent: int | None = None
     indent = app_indent
     if indent is None:
         anchor_match = re.search(
-            r"^([ \t]*)E:\s*application\b", application_block, re.MULTILINE
+            r"^([ \t]*)E:\s*application(?=\s|\(|$)", application_block, re.MULTILINE
         )
         if anchor_match is not None:
             indent = len(anchor_match.group(1))
@@ -1768,6 +1802,343 @@ def _check_common_permissions(permissions: str, xmltree: str) -> None:
         )
 
 
+_ANDROID_NS = "http://schemas.android.com/apk/res/android"
+_SHIZUKU_PROVIDER_PERMISSION = "android.permission.INTERACT_ACROSS_USERS_FULL"
+_PROVIDER_BLOCK_START_RE = re.compile(r"^([ ]*)E:\s*provider(?=\s|\(|$)")
+_NS_DECL_LINE_RE = re.compile(
+    r"^([ \t]*)N:\s*([^\s=]+)=([^\s(]+)(?:\s*\(line=\d+\))?\s*$"
+)
+_PROVIDER_ATTR_LINE_RE = re.compile(r"^([ \t]*)A:\s+([^=]+)=(.*)$")
+_PROVIDER_ANDROID_ATTR_IDS = {
+    "0x01010003": "name",
+    "0x01010018": "authorities",
+    "0x01010006": "permission",
+    "0x01010007": "readPermission",
+    "0x01010008": "writePermission",
+    "0x0101001b": "grantUriPermissions",
+}
+_PROVIDER_ATTR_NAMES = frozenset(_PROVIDER_ANDROID_ATTR_IDS.values())
+_SHIZUKU_MANIFEST_RE = re.compile(
+    r"rikka\.shizuku|moe\.shizuku|shizukuprovider", re.IGNORECASE
+)
+
+
+def _is_shizuku_provider(name: str, authorities: str) -> bool:
+    lower_name = name.lower()
+    if (
+        "shizukuprovider" in lower_name
+        or "rikka.shizuku" in lower_name
+        or "moe.shizuku" in lower_name
+    ):
+        return True
+    return any(
+        part.strip().lower().endswith(".shizuku") for part in authorities.split(";")
+    )
+
+
+def _push_xmltree_ns_decl(
+    ns_stack: list[tuple[int, str, str, int | None, int]],
+    elem_stack: list[tuple[int, str]],
+    n_indent: int,
+    prefix: str,
+    uri: str,
+) -> None:
+    ns_stack[:] = [
+        item for item in ns_stack if item[3] is None or item[3] < n_indent
+    ]
+    while elem_stack and elem_stack[-1][0] >= n_indent:
+        elem_stack.pop()
+    parent_indent = elem_stack[-1][0] if elem_stack else -1
+    ns_stack.append((n_indent, prefix, uri, None, parent_indent))
+
+
+def _resolve_xmltree_element_ns(
+    ns_stack: list[tuple[int, str, str, int | None, int]],
+    elem_stack: list[tuple[int, str]],
+    e_indent: int,
+    tag: str,
+) -> None:
+    resolved: list[tuple[int, str, str, int | None, int]] = []
+    for n_indent, prefix, uri, pop_at, parent_indent in ns_stack:
+        if pop_at is None:
+            pop_at = n_indent if e_indent > n_indent else parent_indent
+        if pop_at < e_indent:
+            resolved.append((n_indent, prefix, uri, pop_at, parent_indent))
+    ns_stack[:] = resolved
+    while elem_stack and elem_stack[-1][0] >= e_indent:
+        elem_stack.pop()
+    elem_stack.append((e_indent, tag))
+
+
+def _active_xmltree_namespaces(
+    ns_stack: list[tuple[int, str, str, int | None, int]],
+) -> dict[str, str]:
+    active = {"android": _ANDROID_NS}
+    for _n_indent, prefix, uri, _pop_at, _parent_indent in ns_stack:
+        active[prefix] = uri
+    return active
+
+
+def _iter_application_providers(
+    xmltree: str,
+) -> list[tuple[dict[str, str], set[str]]]:
+    """Extract Shizuku-relevant attributes and child tags per ``<provider>``.
+
+    Scans only ``<provider>`` blocks inside ``<application>`` without running
+    ``_parse_aapt_xmltree`` over unrelated manifest elements (a real
+    ``AndroidManifest.xml`` dump carries integer/enum attributes such as
+    ``versionCode=(type 0x10)0x1`` elsewhere). Own attributes sit at exact
+    two-space indent past the ``E: provider`` line and precede any child
+    element so child attributes (e.g. nested ``<meta-data android:name=...>``)
+    never overwrite them. ``N: <prefix>=<uri>`` namespace declarations are
+    resolved across the xmltree so aliased Android attributes cannot evade
+    inspection, and unexpected prefixes on provider security attributes fail
+    closed instead of being silently dropped.
+    """
+    raw_lines = xmltree.splitlines()
+    if not any(_APPLICATION_LINE_RE.match(line) for line in raw_lines):
+        return []
+    lines, app_index, app_end, _app_indent = _locate_application_manifest_span(xmltree)
+    elem_stack: list[tuple[int, str]] = []
+    ns_stack: list[tuple[int, str, str, int | None, int]] = []
+    for pre_line in lines[: app_index + 1]:
+        ns_match = _NS_DECL_LINE_RE.match(pre_line)
+        if ns_match is not None:
+            _push_xmltree_ns_decl(
+                ns_stack,
+                elem_stack,
+                len(ns_match.group(1)),
+                ns_match.group(2),
+                ns_match.group(3),
+            )
+            continue
+        elem = _XMLTREE_ELEMENT_LINE_RE.match(pre_line)
+        if elem is not None:
+            _resolve_xmltree_element_ns(
+                ns_stack, elem_stack, len(elem.group(1)), elem.group(2)
+            )
+
+    providers: list[tuple[dict[str, str], set[str]]] = []
+    index = app_index + 1
+    while index < app_end:
+        line = lines[index]
+        ns_match = _NS_DECL_LINE_RE.match(line)
+        if ns_match is not None:
+            _push_xmltree_ns_decl(
+                ns_stack,
+                elem_stack,
+                len(ns_match.group(1)),
+                ns_match.group(2),
+                ns_match.group(3),
+            )
+            index += 1
+            continue
+        elem = _XMLTREE_ELEMENT_LINE_RE.match(line)
+        if elem is None:
+            index += 1
+            continue
+        _resolve_xmltree_element_ns(
+            ns_stack, elem_stack, len(elem.group(1)), elem.group(2)
+        )
+        provider_match = _PROVIDER_BLOCK_START_RE.match(line)
+        if provider_match is None:
+            index += 1
+            continue
+
+        provider_indent = provider_match.group(1)
+        provider_indent_len = len(provider_indent)
+        end = app_end
+        for follow in range(index + 1, app_end):
+            follow_elem = _XMLTREE_ELEMENT_LINE_RE.match(lines[follow])
+            if follow_elem is not None and len(follow_elem.group(1)) <= provider_indent_len:
+                end = follow
+                break
+            follow_ns = _NS_DECL_LINE_RE.match(lines[follow])
+            if follow_ns is not None and len(follow_ns.group(1)) <= provider_indent_len:
+                end = follow
+                break
+
+        attr_prefix = provider_indent + "  "
+        raw_attrs: dict[str, str] = {}
+        child_tags: set[str] = set()
+        seen_child = False
+        active_ns = _active_xmltree_namespaces(ns_stack)
+
+        for body_line in lines[index + 1 : end]:
+            child_elem = _XMLTREE_ELEMENT_LINE_RE.match(body_line)
+            if child_elem is not None:
+                seen_child = True
+                child_tags.add(child_elem.group(2))
+                _resolve_xmltree_element_ns(
+                    ns_stack,
+                    elem_stack,
+                    len(child_elem.group(1)),
+                    child_elem.group(2),
+                )
+                continue
+            child_ns = _NS_DECL_LINE_RE.match(body_line)
+            if child_ns is not None:
+                _push_xmltree_ns_decl(
+                    ns_stack,
+                    elem_stack,
+                    len(child_ns.group(1)),
+                    child_ns.group(2),
+                    child_ns.group(3),
+                )
+                if not seen_child:
+                    active_ns = _active_xmltree_namespaces(ns_stack)
+                continue
+            if not body_line.strip():
+                continue
+
+            a_match = _PROVIDER_ATTR_LINE_RE.match(body_line)
+            if seen_child:
+                if a_match is not None and len(a_match.group(1)) <= len(attr_prefix):
+                    raise PolicyError(
+                        "merged manifest <provider> has attribute line after child element: "
+                        f"{body_line.strip()!r}"
+                    )
+                continue
+            if a_match is None:
+                if body_line.lstrip().startswith("A:"):
+                    raise PolicyError(
+                        "merged manifest <provider> has malformed attribute line: "
+                        f"{body_line.strip()!r}"
+                    )
+                continue
+            if a_match.group(1) != attr_prefix:
+                raise PolicyError(
+                    "merged manifest <provider> attribute has unexpected indentation "
+                    f"(expected {len(attr_prefix)} spaces, got {len(a_match.group(1))}): "
+                    f"{body_line.strip()!r}"
+                )
+
+            attr_lhs = a_match.group(2).strip()
+            attr_rhs = a_match.group(3).strip()
+            attr_id_match = re.search(r"\(\s*(0x[0-9a-fA-F]+)\s*\)\s*$", attr_lhs)
+            attr_id = attr_id_match.group(1).lower() if attr_id_match else None
+            attr_qname = (
+                attr_lhs[: attr_id_match.start()].strip()
+                if attr_id_match is not None
+                else attr_lhs
+            )
+            if ":" in attr_qname:
+                ns_prefix, attr_local = attr_qname.rsplit(":", 1)
+            else:
+                ns_prefix, attr_local = "", attr_qname
+
+            is_android_ns = ns_prefix == _ANDROID_NS or (
+                ns_prefix != "" and active_ns.get(ns_prefix) == _ANDROID_NS
+            )
+            if not is_android_ns:
+                if attr_local in _PROVIDER_ATTR_NAMES or (
+                    attr_id is not None and attr_id in _PROVIDER_ANDROID_ATTR_IDS
+                ):
+                    raise PolicyError(
+                        f"merged manifest <provider> attribute {attr_lhs!r} uses an "
+                        "unexpected or unbound namespace prefix"
+                    )
+                continue
+
+            if attr_id is not None and attr_id in _PROVIDER_ANDROID_ATTR_IDS:
+                expected_local = _PROVIDER_ANDROID_ATTR_IDS[attr_id]
+                if attr_local != expected_local:
+                    raise PolicyError(
+                        f"merged manifest <provider> attribute {attr_lhs!r} disagrees "
+                        f"with Android attribute ID {attr_id}"
+                    )
+                target_attr = expected_local
+            elif attr_local in _PROVIDER_ATTR_NAMES:
+                if attr_id is not None:
+                    raise PolicyError(
+                        f"merged manifest <provider> attribute {attr_lhs!r} has "
+                        f"unexpected resource ID {attr_id}"
+                    )
+                target_attr = attr_local
+            else:
+                continue
+
+            if target_attr in raw_attrs:
+                raise PolicyError(
+                    f"merged manifest <provider> declares duplicate attribute {target_attr!r}"
+                )
+            raw_attrs[target_attr] = attr_rhs
+
+        name = (
+            _xmltree_attr_value(
+                raw_attrs["name"], "merged manifest <provider> android:name"
+            )
+            if "name" in raw_attrs
+            else ""
+        )
+        authorities = (
+            _xmltree_attr_value(
+                raw_attrs["authorities"],
+                "merged manifest <provider> android:authorities",
+            )
+            if "authorities" in raw_attrs
+            else ""
+        )
+        decoded: dict[str, str] = {"name": name, "authorities": authorities}
+        if _is_shizuku_provider(name, authorities):
+            for attr_name in (
+                "permission",
+                "readPermission",
+                "writePermission",
+                "grantUriPermissions",
+            ):
+                if attr_name in raw_attrs:
+                    decoded[attr_name] = _xmltree_attr_value(
+                        raw_attrs[attr_name],
+                        f"merged manifest <provider> android:{attr_name}",
+                    )
+        providers.append((decoded, child_tags))
+        index = end
+    return providers
+
+
+def _check_github_shizuku_provider(xmltree: str) -> None:
+    """Enforce ShizukuProvider permission & URI-grant boundaries when present.
+
+    In ``--mode github`` the real APK declares ``rikka.shizuku.ShizukuProvider``
+    (compact synthetic unit fixtures may omit ``<provider>`` elements).
+    Whenever a Shizuku provider appears in the merged manifest xmltree, verify
+    that effective read and write permissions resolve to
+    ``android.permission.INTERACT_ACROSS_USERS_FULL``, ``grantUriPermissions``
+    is not enabled, and no ``<path-permission>`` / ``<grant-uri-permission>``
+    children exist.
+    """
+    for attrs, child_tags in _iter_application_providers(xmltree):
+        if not _is_shizuku_provider(
+            attrs.get("name", ""), attrs.get("authorities", "")
+        ):
+            continue
+        perm = attrs.get("permission")
+        read_perm = attrs["readPermission"] if "readPermission" in attrs else perm
+        write_perm = attrs["writePermission"] if "writePermission" in attrs else perm
+        if (
+            read_perm != _SHIZUKU_PROVIDER_PERMISSION
+            or write_perm != _SHIZUKU_PROVIDER_PERMISSION
+        ):
+            raise PolicyError(
+                "github APK ShizukuProvider must enforce "
+                f"{_SHIZUKU_PROVIDER_PERMISSION} for both read and write "
+                f"(got readPermission={read_perm!r}, writePermission={write_perm!r})"
+            )
+        grant_uri = attrs.get("grantUriPermissions")
+        if grant_uri is not None and grant_uri != "false":
+            raise PolicyError(
+                "github APK ShizukuProvider must not enable "
+                f"android:grantUriPermissions (got {grant_uri!r})"
+            )
+        for forbidden_child in ("path-permission", "grant-uri-permission"):
+            if forbidden_child in child_tags:
+                raise PolicyError(
+                    "github APK ShizukuProvider must not declare "
+                    f"<{forbidden_child}> children"
+                )
+
+
 def _check_play(permissions: str, xmltree: str, infos: Iterable[zipfile.ZipInfo], dexes: list[ParsedDex]) -> None:
     manifest_dump = (permissions + "\n" + xmltree).upper()
     for token in PLAY_FORBIDDEN_PERMISSIONS:
@@ -1775,11 +2146,20 @@ def _check_play(permissions: str, xmltree: str, infos: Iterable[zipfile.ZipInfo]
             raise PolicyError(f"Play APK declares forbidden permission/reference {token}")
     if re.search(r"accessibilityservice", xmltree, re.IGNORECASE):
         raise PolicyError("Play APK manifest registers an AccessibilityService")
+    if _SHIZUKU_MANIFEST_RE.search(manifest_dump):
+        raise PolicyError("Play APK manifest references Shizuku")
+    for attrs, _child_tags in _iter_application_providers(xmltree):
+        if _is_shizuku_provider(attrs.get("name", ""), attrs.get("authorities", "")):
+            raise PolicyError("Play APK manifest registers a Shizuku provider")
 
     for dex in dexes:
         for descriptor in dex.defined_classes:
             if any(descriptor.startswith(prefix) for prefix in PLAY_DEFINED_CLASS_PREFIXES):
                 raise PolicyError(f"Play APK defines self-install-only class {descriptor}")
+        for descriptor in dex.type_descriptors:
+            class_descriptor = descriptor.lstrip("[")
+            if any(class_descriptor.startswith(prefix) for prefix in PLAY_DEFINED_CLASS_PREFIXES):
+                raise PolicyError(f"Play APK DEX type_ids references self-install-only type {descriptor}")
         for superclass in dex.superclasses:
             if superclass in PLAY_FORBIDDEN_SUPERCLASSES:
                 raise PolicyError(f"Play APK subclasses forbidden service {superclass}")
@@ -1796,6 +2176,11 @@ def _check_foss(permissions: str, xmltree: str, dexes: list[ParsedDex]) -> None:
     for needle in FOSS_MANIFEST_NEEDLES:
         if needle in manifest_dump:
             raise PolicyError(f"Foss APK manifest references proprietary component {needle}")
+    if _SHIZUKU_MANIFEST_RE.search(manifest_dump):
+        raise PolicyError("Foss APK manifest references Shizuku")
+    for attrs, _child_tags in _iter_application_providers(xmltree):
+        if _is_shizuku_provider(attrs.get("name", ""), attrs.get("authorities", "")):
+            raise PolicyError("Foss APK manifest registers a Shizuku provider")
 
     for dex in dexes:
         for descriptor in dex.type_descriptors:
@@ -1852,9 +2237,11 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str) -> None:
         # class-table policy applies. It already proved the mode-independent
         # artifact authorities (merged backup binding + compiled rules bytes
         # + NSC binding compiled check) plus the COMMON flavor permission
-        # policy above - that is the entire contract here. The aapt/dexdump
-        # tool contract is still enforced above, so a wrong tool invocation
-        # cannot silently degrade the mode.
+        # policy above - and when ShizukuProvider is present in the merged
+        # manifest, verifies its INTERACT_ACROSS_USERS_FULL & URI-grant bounds.
+        # The aapt/dexdump tool contract is still enforced above, so a wrong
+        # tool invocation cannot silently degrade the mode.
+        _check_github_shizuku_provider(xmltree)
         print(
             f"  structure: APK ZIP/manifest OK ({len(dex_infos)} root DEX "
             "shard(s), DEX tables not parsed)"

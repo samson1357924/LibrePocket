@@ -9,7 +9,9 @@ import android.service.voice.VoiceInteractionSessionService
  * `SessionService` action；每個手勢喚起經 [onNewSession] 產生
  * [LibreVoiceInteractionSession]（C1 無狀態、C2 才加 Compose／STT）。
  */
-// TODO(C2-assistant): 隨 session 內 Compose／STT 落地補齊喚起參數與生命週期處理。
+// C2-final（Issue #137）：session 內 Compose／串流 STT 已否決——直接
+// SpeechRecognizer 需本 App 錄音權限，與 C1 零新增權限契約衝突；
+// UI 由 MainActivity（獨立 voice task）承載，STT 走 RecognizerIntent 委派（見 AssistantVoice.kt）。
 class LibreVoiceInteractionSessionService : VoiceInteractionSessionService() {
     override fun onNewSession(args: Bundle?): VoiceInteractionSession =
         LibreVoiceInteractionSession(this)

@@ -11,7 +11,10 @@ import java.util.concurrent.atomic.AtomicLong
 
 private const val TAG = "LibreVoiceSession"
 private const val DUPLICATE_SHOW_DEBOUNCE_MS = 350L
-private val SESSION_INSTANCE_SEQ = AtomicLong(0L)
+// Seeded from monotonic uptime so session instance ids stay monotonic across :voice-process
+// restarts. (uptime shl 12) keeps bounded headroom below Long overflow and starts odd; any
+// residual collision is harmless because delivery is sid-bound and TTL-limited.
+private val SESSION_INSTANCE_SEQ = AtomicLong((SystemClock.elapsedRealtime() shl 12) or 1L)
 
 private fun nextSessionInstanceId(): Long = SESSION_INSTANCE_SEQ.incrementAndGet()
 
@@ -54,10 +57,15 @@ private fun nextSessionInstanceId(): Long = SESSION_INSTANCE_SEQ.incrementAndGet
  * 亦不自動觸發 STT），不授予額外能力。
  */
 open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSession(context) {
+    @Volatile
     private var sessionHidden = false
+    @Volatile
     private var launchPending = false
+    @Volatile
     private var activeTaskId: Int? = null
+    @Volatile
     private var sessionInstanceId: Long = 0L
+    @Volatile
     private var lastAcceptedShowUptimeMs: Long = 0L
 
     /**
@@ -87,19 +95,22 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
             }
             lastAcceptedShowUptimeMs = now
             try {
-                AssistantVoiceHandoff.requestRetrigger(
+                val token = AssistantVoiceHandoff.requestRetrigger(
                     context = context,
                     targetTaskId = activeTaskId!!,
                     sessionInstanceId = sessionInstanceId,
                 )
+                if (token == 0L) {
+                    Log.w(TAG, "voice retrigger publish failed; allowing immediate retry gesture")
+                    // Allow an immediate retry gesture. A failed publish must not wipe an older
+                    // pending one-shot token from the same session cycle.
+                    lastAcceptedShowUptimeMs = 0L
+                }
             } catch (e: Exception) {
+                // Defensive: requestRetrigger already logs and returns 0L on failure; keep the throw path safe.
                 Log.w(TAG, "voice retrigger handoff publish failed; keeping active task", e)
-                AssistantVoiceHandoff.clear(
-                    context = context,
-                    targetTaskId = activeTaskId ?: -1,
-                    sessionInstanceId = sessionInstanceId,
-                )
-                // Allow an immediate retry gesture.
+                // Allow an immediate retry gesture. A failed publish must not wipe an older
+                // pending one-shot token from the same session cycle.
                 lastAcceptedShowUptimeMs = 0L
             }
             return
@@ -133,7 +144,7 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
         AssistantVoice.withVoiceInput(assistantVoiceIntent(context)).setClass(
             context,
             MainActivity::class.java,
-        )
+        ).putExtra(AssistantVoice.EXTRA_SESSION_INSTANCE_ID, sessionInstanceId)
 
     override fun onTaskStarted(intent: Intent?, taskId: Int) {
         // Bind the started task only for the current pending launch with no active task yet.
@@ -141,8 +152,9 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
         if (launchPending && activeTaskId == null) {
             activeTaskId = taskId
             launchPending = false
-            super.onTaskStarted(intent, taskId)
         }
+        // Always delegate to the framework default, regardless of binding outcome.
+        super.onTaskStarted(intent, taskId)
     }
 
     override fun onTaskFinished(intent: Intent?, taskId: Int) {
@@ -170,17 +182,20 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
         super.onHide()
     }
 
+    @Synchronized
     private fun clearTaskState() {
-        val taskId = activeTaskId ?: -1
+        // Wildcard sentinel for "unspecified task" (matches AssistantVoiceHandoff/VoiceHandoffProvider).
+        // Passing -1 would mean "match only a real task id of -1" (silently nothing); with Int.MIN_VALUE
+        // the sid still disambiguates (task axis wildcards, sid must match).
+        val taskId = activeTaskId ?: Int.MIN_VALUE
         val sid = sessionInstanceId
         launchPending = false
         activeTaskId = null
         sessionInstanceId = 0L
-        if (sid != 0L || taskId != -1) {
+        if (sid != 0L || taskId != Int.MIN_VALUE) {
             AssistantVoiceHandoff.clear(context = context, targetTaskId = taskId, sessionInstanceId = sid)
-        } else {
-            AssistantVoiceHandoff.clear(context = context)
         }
+        // Nothing tracked: clear nothing (no clearAll — would wipe a newer/pending gesture token).
     }
 
     /**
@@ -188,6 +203,7 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
      * task-completion paths without repeated hide/re-entrancy loops. Resets lifecycle
      * tracking so a subsequent onShow can start a fresh cycle after the session ends.
      */
+    @Synchronized
     protected open fun finishSession() {
         clearTaskState()
         // Idempotent convergence: release session wake lock on task completion/failure cleanup.

@@ -23,7 +23,11 @@
 
     <!-- 零新增權限契約（Issue #137 C1/C2）：防範任何 transitive AAR 依賴
          （如 github flavor 的 azure-speech sdk）意外合入 RECORD_AUDIO。
-         本 App 語音錄製一律走系統 RecognizerIntent 委派，永遠不直接持有 RECORD_AUDIO。 -->
+         本 App 語音錄製一律走系統 RecognizerIntent 委派，永遠不直接持有 RECORD_AUDIO。
+         OEM 備註：若 OEM 出貨自訂 recognizer Activity，錄音權限由該 Activity 持有，
+         不在本 App 的權限聲明範圍；此 remove 是 load-bearing 的（github flavor 的
+         azure-speech transitive AAR 會帶入 RECORD_AUDIO），OEM 不相容時的 fallback
+         是使用者手動聽寫，絕不可放寬此 remove。merged-manifest Robolectric 測試鎖定之。 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" tools:node="remove" />
 
     <!-- queries 可見性（S2 語音 + #14 intent adapter）：targetSdk 36 package
@@ -145,11 +149,11 @@
         </service>
 
         <!-- C2 voice retrigger handoff（Issue #137）：main-process, app-private cross-process
-             channel for :voice session -> trusted voice UI token delivery. -->
+             channel for :voice session -> trusted voice UI token delivery.
+             無 android:process 屬性＝預設為 app main process。 -->
         <provider
             android:name=".assistant.VoiceHandoffProvider"
             android:authorities="${applicationId}.voice.handoff"
-            android:exported="false"
-            android:process="" />
+            android:exported="false" />
     </application>
 </manifest>

@@ -10,6 +10,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import dev.librepocket.agent.assistant.AssistantVoice
+import dev.librepocket.agent.assistant.VoiceTaskIdentity
 import dev.librepocket.agent.ui.MainScreen
 import dev.librepocket.agent.ui.theme.LibrePocketTheme
 import dev.librepocket.entry.EntryGate
@@ -31,6 +32,13 @@ open class MainActivity : ComponentActivity() {
     // 待消費保留，非可信工作階段仍 fail-closed），否則再檢 isTrustedVoiceRequest(intent)。
     private val assistVoiceState = mutableStateOf(false)
 
+    // C2 retrigger identity binding (Issue #137): when this activity hosts the trusted voice task,
+    // bind retrigger delivery/consume to (taskId, sessionInstanceId). The normal-task MainActivity
+    // instance sees null here, so it can never steal the one-shot STT retrigger.
+    // Plain var, not Compose state: it is never read during composition (it is only passed to
+    // installMainScreenContent once at onCreate), so it needs no snapshot observation.
+    private var assistVoiceIdentity: VoiceTaskIdentity? = null
+
     /**
      * 檢查目前 Activity 是否處於系統可信語音互動工作階段根節點
      * （由 `VoiceInteractionSession.startVoiceActivity` 啟動時由系統授予）。
@@ -38,6 +46,12 @@ open class MainActivity : ComponentActivity() {
      * 測試子類別可覆寫以模擬系統可信喚起與第三方偽造情境。
      */
     protected open fun isTrustedVoiceSession(): Boolean = isVoiceInteractionRoot
+
+    /**
+     * Test seam: Robolectric cannot set [taskId]; production reads the real task id.
+     * The value binds retrigger delivery/consume to this activity's task.
+     */
+    protected open fun currentTaskId(): Int = taskId
 
     private fun isTrustedVoiceRequest(intent: Intent?): Boolean =
         isTrustedVoiceSession() && AssistantVoice.isVoiceInputRequested(intent)
@@ -55,12 +69,14 @@ open class MainActivity : ComponentActivity() {
             } else {
                 isTrustedVoiceRequest(intent)
             }
+        assistVoiceIdentity = computeVoiceIdentity(intent, savedInstanceState)
         enableEdgeToEdge()
         installMainScreenContent(
             sharedText = { entryConsumptionState.pendingText },
             onSharedConsumed = { entryConsumptionState = entryConsumptionState.consume() },
             voiceInputRequested = { assistVoiceState.value },
             onVoiceInputConsumed = { assistVoiceState.value = false },
+            voiceTaskIdentity = assistVoiceIdentity,
         )
     }
 
@@ -70,6 +86,7 @@ open class MainActivity : ComponentActivity() {
         onSharedConsumed: () -> Unit,
         voiceInputRequested: () -> Boolean = { false },
         onVoiceInputConsumed: () -> Unit = {},
+        voiceTaskIdentity: VoiceTaskIdentity? = null,
     ) {
         setContent {
             LibrePocketTheme {
@@ -78,15 +95,42 @@ open class MainActivity : ComponentActivity() {
                     onSharedConsumed = onSharedConsumed,
                     assistVoiceRequested = voiceInputRequested(),
                     onAssistVoiceConsumed = onVoiceInputConsumed,
+                    voiceTaskIdentity = voiceTaskIdentity,
                 )
             }
         }
+    }
+
+    /**
+     * Binds this activity's identity when it hosts a trusted voice session: requires the
+     * trusted voice-interaction root plus a session-instance nonce from the launch intent
+     * (or restored saved state). Returns null for the normal-task instance and for any
+     * session-less launch — retrigger delivery is impossible there (fail-closed).
+     *
+     * Note: taskId is deliberately NOT persisted in onSaveInstanceState (only the sid is).
+     * After process death the recreated activity may land in a *different* task; the restored
+     * identity is then bound to the new currentTaskId(), which never matches the taskId the
+     * session published its retrigger tokens for — so delivery fails closed (and an untrusted
+     * restore yields identity == null, i.e. retrigger is impossible). The voice task's own
+     * recreation into the same task is the expected restore path.
+     */
+    private fun computeVoiceIdentity(intent: Intent?, saved: Bundle?): VoiceTaskIdentity? {
+        if (!isTrustedVoiceSession()) return null
+        val savedSid = saved?.getLong(KEY_ASSIST_SID, 0L) ?: 0L
+        val sid = if (savedSid != 0L) {
+            savedSid
+        } else {
+            intent?.getLongExtra(AssistantVoice.EXTRA_SESSION_INSTANCE_ID, 0L) ?: 0L
+        }
+        if (sid == 0L) return null
+        return VoiceTaskIdentity(currentTaskId(), sid)
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         entryConsumptionState.saveTo(outState)
         outState.putBoolean(KEY_ASSIST_VOICE, assistVoiceState.value)
+        outState.putLong(KEY_ASSIST_SID, assistVoiceIdentity?.sessionInstanceId ?: 0L)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -145,5 +189,6 @@ open class MainActivity : ComponentActivity() {
 
     companion object {
         private const val KEY_ASSIST_VOICE = "dev.librepocket.agent.assist_voice"
+        private const val KEY_ASSIST_SID = "dev.librepocket.agent.assist_session_instance_id"
     }
 }

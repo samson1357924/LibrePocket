@@ -5,6 +5,7 @@ import android.content.ContentValues
 import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
+import android.os.SystemClock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -18,7 +19,7 @@ import java.util.concurrent.atomic.AtomicLong
  * a token only when target identity matches and delivery gates allow STT relaunch.
  *
  * Security: exported=false, same-UID only by manifest; contract is internal and intended for the
- * trusted session path. Tokens are one-shot and replaceable by newer gestures.
+ * trusted session path. Tokens are one-shot, replaceable by newer gestures, and expire after RETRIGGER_TTL_MS.
  */
 class VoiceHandoffProvider : ContentProvider() {
 
@@ -32,8 +33,13 @@ class VoiceHandoffProvider : ContentProvider() {
                 val targetTaskId = b.getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, -1)
                 val sessionInstanceId = b.getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, 0L)
                 val issued = b.getLong(VoiceHandoffContract.KEY_ISSUED_UPTIME_MS, 0L)
-                publish(PendingVoiceRetrigger(token, targetTaskId, sessionInstanceId, issued))
-                Bundle.EMPTY
+                // Bundle.EMPTY only when the publish was actually stored; a null ack means
+                // "not stored" so the caller can retry instead of believing a dead token lives.
+                if (publish(PendingVoiceRetrigger(token, targetTaskId, sessionInstanceId, issued))) {
+                    Bundle.EMPTY
+                } else {
+                    null
+                }
             }
             VoiceHandoffContract.METHOD_CONSUME -> {
                 val b = extras ?: Bundle()
@@ -45,13 +51,17 @@ class VoiceHandoffProvider : ContentProvider() {
             }
             VoiceHandoffContract.METHOD_CLEAR -> {
                 val b = extras ?: Bundle()
+                val token = b.getLong(VoiceHandoffContract.KEY_TOKEN, 0L)
                 val hasTarget = b.containsKey(VoiceHandoffContract.KEY_TARGET_TASK_ID) ||
                     b.containsKey(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID)
                 if (hasTarget) {
                     clearMatching(
                         b.getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, Int.MIN_VALUE),
                         b.getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, Long.MIN_VALUE),
+                        token,
                     )
+                } else if (token != 0L) {
+                    clearIfToken(token)
                 } else {
                     clearAll()
                 }
@@ -81,15 +91,21 @@ class VoiceHandoffProvider : ContentProvider() {
     companion object {
         private val _pending = MutableStateFlow<PendingVoiceRetrigger?>(null)
         val pending: StateFlow<PendingVoiceRetrigger?> = _pending.asStateFlow()
-        private val seq = AtomicLong(0L)
+        // Seeded from monotonic uptime so tokens stay monotonic across :voice-process restarts
+        // (a fresh process must not re-issue token 1 and collide with/impersonate a live token).
+        // (uptime shl 12) keeps bounded headroom below Long overflow and starts odd; any residual
+        // collision is harmless because delivery is sid-bound and TTL-limited.
+        private val seq = AtomicLong((SystemClock.elapsedRealtime() shl 12) or 1L)
 
         /** For session-side token generation in any process (IDs are still owned by session). */
         fun nextToken(): Long = seq.incrementAndGet()
 
+        /** @return true when stored; false when rejected (token <= 0, not persisted). */
         @Synchronized
-        internal fun publish(p: PendingVoiceRetrigger) {
-            if (p.token <= 0L) return
+        internal fun publish(p: PendingVoiceRetrigger): Boolean {
+            if (p.token <= 0L) return false
             _pending.value = p
+            return true
         }
 
         @Synchronized
@@ -99,16 +115,33 @@ class VoiceHandoffProvider : ContentProvider() {
             // If caller provides identity constraints, enforce them; MIN_VALUE means "unspecified".
             if (targetTaskId != Int.MIN_VALUE && cur.targetTaskId != targetTaskId) return false
             if (sessionInstanceId != Long.MIN_VALUE && cur.sessionInstanceId != sessionInstanceId) return false
+            // TTL: an expired retrigger must never fire STT; drop it on consume attempt.
+            // Negative age (clock skew / bogus issued timestamp) is treated as expired too.
+            val age = SystemClock.uptimeMillis() - cur.issuedUptimeMs
+            if (age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS) {
+                _pending.value = null
+                return false
+            }
             _pending.value = null
             return true
         }
 
         @Synchronized
-        internal fun clearMatching(targetTaskId: Int, sessionInstanceId: Long) {
+        internal fun clearMatching(targetTaskId: Int, sessionInstanceId: Long, token: Long = 0L) {
             val cur = _pending.value ?: return
+            // When a token is supplied, only clear the pending entry if it is exactly that token;
+            // never wipe a newer token from the same session cycle.
+            if (token != 0L && cur.token != token) return
             val taskMatches = targetTaskId == Int.MIN_VALUE || cur.targetTaskId == targetTaskId
             val sessionMatches = sessionInstanceId == Long.MIN_VALUE || cur.sessionInstanceId == sessionInstanceId
             if (taskMatches && sessionMatches) _pending.value = null
+        }
+
+        /** Clears pending only if its token matches [token]; leaves newer tokens intact. */
+        @Synchronized
+        internal fun clearIfToken(token: Long) {
+            if (token == 0L) return
+            if (_pending.value?.token == token) _pending.value = null
         }
 
         @Synchronized
@@ -119,7 +152,7 @@ class VoiceHandoffProvider : ContentProvider() {
         /** Test/reset hook (main-process/in-process only). */
         internal fun resetForTest() {
             _pending.value = null
-            seq.set(0L)
+            seq.set((SystemClock.elapsedRealtime() shl 12) or 1L)
         }
     }
 }

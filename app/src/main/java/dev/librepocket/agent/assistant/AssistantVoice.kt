@@ -35,6 +35,13 @@ object AssistantVoice {
     const val EXTRA_VOICE_INPUT = "dev.librepocket.extra.ASSIST_VOICE_INPUT"
 
     /**
+     * Session-instance nonce bound to the initial trusted handoff; the voice-task MainActivity
+     * echoes it back so retrigger delivery/consume can be bound to the trusted voice task.
+     * Not a secret; grants nothing by itself.
+     */
+    const val EXTRA_SESSION_INSTANCE_ID = "dev.librepocket.extra.ASSIST_SESSION_INSTANCE_ID"
+
+    /**
      * 語音結果只做 prefill，不自動送出（恆 false，由使用者確認後送出）。
      * 未來任何自動送出都必須另立決策並改此常數＋測試，此處先鎖死。
      */

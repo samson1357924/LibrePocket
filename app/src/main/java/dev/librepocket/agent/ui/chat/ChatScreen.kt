@@ -381,8 +381,10 @@ fun ChatScreen(
     // C2 retrigger：同一 trusted voice task 已存在且 session 接受新的真實 onShow 時，
     // 以跨 process handoff token 一次性重啟 STT（不建立新 voice task、不自動送出）。
     // 僅在 switches 狀態已落定且 consume 成功時啟動，避免誤觸發/重放/競態。
+    // 與初始 voice effect 互斥：初始 voice effect 於同幀先行；絕不在單一 frame 疊加兩個
+    // RecognizerIntent 啟動（voiceInputRequested 尚未消費時，retrigger 不消費／不啟動）。
     LaunchedEffect(voiceRetriggerToken, voiceSwitchesLoaded) {
-        if (voiceRetriggerToken != 0L && voiceSwitchesLoaded) {
+        if (voiceRetriggerToken != 0L && voiceSwitchesLoaded && !voiceInputRequested) {
             if (onVoiceRetriggerConsumed(voiceRetriggerToken)) {
                 launchSystemStt()
             }

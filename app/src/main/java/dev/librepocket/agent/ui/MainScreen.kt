@@ -1,5 +1,6 @@
 package dev.librepocket.agent.ui
 
+import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.CancellationException
 import androidx.compose.material3.DrawerState
@@ -38,6 +39,9 @@ import dev.librepocket.agent.ui.setup.SetupScreen
 import dev.librepocket.agent.ui.setup.SetupViewModel
 import dev.librepocket.agent.ui.setup.SetupViewModelFactory
 import dev.librepocket.agent.assistant.AssistantVoiceHandoff
+import dev.librepocket.agent.assistant.PendingVoiceRetrigger
+import dev.librepocket.agent.assistant.VoiceHandoffContract
+import dev.librepocket.agent.assistant.VoiceTaskIdentity
 import dev.librepocket.agent.assistant.rememberAssistantRole
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.entry.EntryDispatch
@@ -73,6 +77,9 @@ fun MainScreen(
     // 結果只 prefill 不自動送出。預設 false 保舊構造相容。
     assistVoiceRequested: Boolean = false,
     onAssistVoiceConsumed: () -> Unit = {},
+    // C2（Issue #137）：本 Activity 若為可信 voice session 的任務宿主，帶其任務身份；
+    // 否則 null——retrigger 投遞在此任務上不可能（normal task 搶不到一次態 STT retrigger）。
+    voiceTaskIdentity: VoiceTaskIdentity? = null,
 ) {
     val navController = rememberNavController()
     val scope = rememberCoroutineScope()
@@ -210,18 +217,35 @@ fun MainScreen(
         onAssistVoiceConsumed = onAssistVoiceConsumed,
     )
 
-    // Trusted cross-process retrigger handoff from active voice session (F1): deliver only under
-    // the same chat-safe boundary as initial voice delivery.
+    // Trusted cross-process retrigger handoff from active voice session (F1): deliver only when
+    // this activity's identity matches the pending entry's bound task/session AND under the same
+    // chat-safe boundary as initial voice delivery.
     val pendingVoiceRetrigger by AssistantVoiceHandoff.pendingFlow().collectAsStateWithLifecycle(initialValue = null)
-    val pendingVoiceRetriggerToken = pendingVoiceRetrigger?.token ?: 0L
-    val deliverVoiceRetrigger = pendingVoiceRetrigger != null &&
-        currentRoute == Routes.CHAT &&
-        hasEndpoint &&
-        !navLoading &&
-        viewedSessionId == null &&
-        drawerState.isClosed &&
-        drawerState.targetValue == DrawerValue.Closed
-    val voiceRetriggerToken = if (deliverVoiceRetrigger) pendingVoiceRetriggerToken else 0L
+    val deliverVoiceRetrigger = shouldDeliverVoiceRetrigger(
+        pending = pendingVoiceRetrigger,
+        identity = voiceTaskIdentity,
+        currentRoute = currentRoute,
+        hasEndpoint = hasEndpoint,
+        navLoading = navLoading,
+        viewedSessionId = viewedSessionId,
+        drawerState = drawerState,
+    )
+    val voiceRetriggerToken = if (deliverVoiceRetrigger) pendingVoiceRetrigger?.token ?: 0L else 0L
+
+    // C2 retrigger 過期/無法投遞收斂：token 超過 TTL 或端點落定後仍不可投遞 → 清除，避免日後 CHAT 進入時補彈 STT。
+    // Both instances (normal task + voice task) observe the same flow; only the owning
+    // (identity-matched) instance may converge/clear its own token.
+    LaunchedEffect(pendingVoiceRetrigger, navLoading, hasEndpoint) {
+        val p = pendingVoiceRetrigger ?: return@LaunchedEffect
+        val id = voiceTaskIdentity
+        if (id == null || id.taskId != p.targetTaskId || id.sessionInstanceId != p.sessionInstanceId) {
+            return@LaunchedEffect
+        }
+        val stale = SystemClock.uptimeMillis() - p.issuedUptimeMs > VoiceHandoffContract.RETRIGGER_TTL_MS
+        if (stale || (!navLoading && !hasEndpoint)) {
+            AssistantVoiceHandoff.clear(context = app, targetTaskId = p.targetTaskId, sessionInstanceId = p.sessionInstanceId, token = p.token)
+        }
+    }
 
     // Edit-entry helper: prefill the form with the live endpoint (key stays
     // blank) so "edit" never shows another preset's defaults.
@@ -296,13 +320,18 @@ fun MainScreen(
                 onVoiceInputConsumed = onAssistVoiceConsumed,
                 voiceRetriggerToken = voiceRetriggerToken,
                 onVoiceRetriggerConsumed = { token ->
+                    val id = voiceTaskIdentity
                     val p = pendingVoiceRetrigger?.takeIf { it.token == token }
-                    AssistantVoiceHandoff.consume(
-                        token = token,
-                        context = app,
-                        targetTaskId = p?.targetTaskId ?: Int.MIN_VALUE,
-                        sessionInstanceId = p?.sessionInstanceId ?: Long.MIN_VALUE,
-                    )
+                    if (id == null || p == null) {
+                        false
+                    } else {
+                        AssistantVoiceHandoff.consume(
+                            token = token,
+                            context = app,
+                            targetTaskId = id.taskId,
+                            sessionInstanceId = id.sessionInstanceId,
+                        )
+                    }
                 },
                 voiceSwitchesLoaded = voiceEffectiveSnapshot.loaded || voiceEffectiveSnapshot.loadFailed,
                 userSwitches = voiceUiSwitches,
@@ -519,9 +548,27 @@ fun MainScreen(
 }
 
 /**
+ * C2 聊天頁安全投遞邊界（單一來源；initial delivery 與 retrigger 共用）：
+ * 僅在 `Routes.CHAT`、有端點、啟動已落定、無唯讀覆蓋且抽屜已完全關閉。
+ */
+internal fun chatSafeBoundary(
+    currentRoute: String?,
+    hasEndpoint: Boolean,
+    navLoading: Boolean,
+    viewedSessionId: String?,
+    drawerState: DrawerState,
+): Boolean =
+    currentRoute == Routes.CHAT &&
+        hasEndpoint &&
+        !navLoading &&
+        viewedSessionId == null &&
+        drawerState.isClosed &&
+        drawerState.targetValue == DrawerValue.Closed
+
+/**
  * C2 session 語音喚起投遞門禁（與 [AssistVoiceCoordinator] 同源）：
  * 僅在已導至 `Routes.CHAT`、有端點、啟動已落定、無唯讀覆蓋且抽屜已完全關閉時才向
- * [ChatScreen] 遞送一次態 `voiceInputRequested`。
+ * [ChatScreen] 遞送一次態 `voiceInputRequested`；邊界判斷單一來源為 [chatSafeBoundary]。
  */
 internal fun shouldDeliverVoiceToChat(
     assistVoiceRequested: Boolean,
@@ -532,12 +579,30 @@ internal fun shouldDeliverVoiceToChat(
     drawerState: DrawerState,
 ): Boolean =
     assistVoiceRequested &&
-        currentRoute == Routes.CHAT &&
-        hasEndpoint &&
-        !navLoading &&
-        viewedSessionId == null &&
-        drawerState.isClosed &&
-        drawerState.targetValue == DrawerValue.Closed
+        chatSafeBoundary(currentRoute, hasEndpoint, navLoading, viewedSessionId, drawerState)
+
+/**
+ * C2 retrigger 投遞門禁：除 [chatSafeBoundary] 外，還要求此 Activity 的 [identity]
+ * （可信 voice task 宿主）與 [pending] entry 綁定的 task/session 完全一致，且 token
+ * 未超過 [VoiceHandoffContract.RETRIGGER_TTL_MS]。normal-task 實例（identity == null）
+ * 恆不投遞。
+ */
+internal fun shouldDeliverVoiceRetrigger(
+    pending: PendingVoiceRetrigger?,
+    identity: VoiceTaskIdentity?,
+    currentRoute: String?,
+    hasEndpoint: Boolean,
+    navLoading: Boolean,
+    viewedSessionId: String?,
+    drawerState: DrawerState,
+    nowUptimeMs: Long = SystemClock.uptimeMillis(),
+): Boolean =
+    pending != null &&
+        identity != null &&
+        identity.taskId == pending.targetTaskId &&
+        identity.sessionInstanceId == pending.sessionInstanceId &&
+        nowUptimeMs - pending.issuedUptimeMs in 0..VoiceHandoffContract.RETRIGGER_TTL_MS &&
+        chatSafeBoundary(currentRoute, hasEndpoint, navLoading, viewedSessionId, drawerState)
 
 /**
  * C2 session 語音喚起路由與邊界守衛（MainScreen 與接線測試共用單一來源）：

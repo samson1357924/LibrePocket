@@ -22,10 +22,15 @@ class LibreVoiceInteractionSessionTest {
         val uiEnabledCalls = mutableListOf<Boolean>()
         val startedIntents = mutableListOf<Intent>()
         val startedTaskIds = mutableListOf<Int>()
+        val keepAwakeCalls = mutableListOf<Boolean>()
         var hideCalls = 0
 
         override fun setUiEnabled(enabled: Boolean) {
             uiEnabledCalls += enabled
+        }
+
+        override fun setKeepAwake(keepAwake: Boolean) {
+            keepAwakeCalls += keepAwake
         }
 
         override fun startVoiceActivity(intent: Intent?) {
@@ -72,6 +77,9 @@ class LibreVoiceInteractionSessionTest {
         assertTrue(AssistantVoice.isVoiceInputRequested(intent))
         // Successful start must keep the session alive for the delegated voice task/activity flow.
         assertEquals(0, session.hideCalls)
+        // Each successful start re-acquires the default voice wake lock; release it for long-lived C2 task.
+        assertTrue(session.keepAwakeCalls.contains(false))
+        assertEquals(false, session.keepAwakeCalls.last())
     }
 
     @Test
@@ -83,6 +91,8 @@ class LibreVoiceInteractionSessionTest {
 
         assertEquals(1, session.startedIntents.size)
         assertEquals(1, session.hideCalls)
+        // Best-effort convergence: failed start path must not leave wake lock held.
+        assertTrue(session.keepAwakeCalls.contains(false))
     }
 
     @Test
@@ -97,6 +107,8 @@ class LibreVoiceInteractionSessionTest {
         session.onTaskFinished(null, 42)
 
         assertEquals(1, session.hideCalls)
+        // Idempotent convergence on task completion.
+        assertTrue(session.keepAwakeCalls.contains(false))
     }
 
     @Test
@@ -204,10 +216,13 @@ class LibreVoiceInteractionSessionTest {
         session.onHide()
         session.onShow(null, 0)
         assertEquals(2, session.startedIntents.size)
+        // Each accepted start must release the re-acquired default voice wake lock.
+        assertEquals(false, session.keepAwakeCalls.last())
 
         session.onTaskStarted(null, 20)
         session.onTaskFinished(null, 20)
         assertEquals(2, session.hideCalls)
+        assertTrue(session.keepAwakeCalls.contains(false))
     }
 
     @Test

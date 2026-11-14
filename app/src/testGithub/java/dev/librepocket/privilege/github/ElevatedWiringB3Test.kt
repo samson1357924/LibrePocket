@@ -4,7 +4,6 @@ import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.policy.PolicyRule
 import dev.librepocket.policy.Verdict
 import dev.librepocket.router.ElevatedWiring
-import dev.librepocket.shell.ElevatedRequest
 import dev.librepocket.shell.PrivilegeAuditLog
 import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellPolicy
@@ -109,18 +108,6 @@ class ElevatedWiringB3Test {
         revision: Long = TEST_REVISION,
     ): () -> ElevatedWiring.ElevatedGrant =
         { ElevatedWiring.ElevatedGrant.Valid(providerId, revision) }
-
-    private fun grantInvalid(reason: String): () -> ElevatedWiring.ElevatedGrant =
-        { ElevatedWiring.ElevatedGrant.Invalid(reason) }
-
-    private fun mapGrant(
-        check: GrantCheck,
-        providerId: String = TEST_PROVIDER_ID,
-        revision: Long = TEST_REVISION,
-    ): ElevatedWiring.ElevatedGrant = when (check) {
-        is GrantCheck.Valid -> ElevatedWiring.ElevatedGrant.Valid(providerId, revision)
-        is GrantCheck.Invalid -> ElevatedWiring.ElevatedGrant.Invalid(check.reason)
-    }
 
     private fun rootRunner(
         spawn: SpawnCounter,
@@ -273,25 +260,23 @@ class ElevatedWiringB3Test {
             }
             val audit = PrivilegeAuditLog()
             val runner = if (isRoot) {
-                rootRunner(SpawnCounter(), isCancelled = { false }).let {
-                    RootSuRunner(
-                        privateRoot = privateRoot,
-                        bridgeGranted = GrantFixtures.bridgeOn,
-                        activationCheck = GrantFixtures.activationOn,
-                        spawn = { hang },
-                        suBinary = "/system/bin/su",
-                        killer = {
-                            destroyed = true
-                            latch.countDown()
-                            it.destroy()
-                        },
-                        isCancelled = { false },
-                        grantCheck = GrantFixtures.allowAlways,
-                        execSearchDirs = hermeticExec!!.searchDirs,
-                        execAllowedRoots = hermeticExec!!.allowedRoots,
-                        execIsWritable = hermeticExec!!.systemOwned,
-                    )
-                }
+                RootSuRunner(
+                    privateRoot = privateRoot,
+                    bridgeGranted = GrantFixtures.bridgeOn,
+                    activationCheck = GrantFixtures.activationOn,
+                    spawn = { hang },
+                    suBinary = "/system/bin/su",
+                    killer = {
+                        destroyed = true
+                        latch.countDown()
+                        it.destroy()
+                    },
+                    isCancelled = { false },
+                    grantCheck = GrantFixtures.allowAlways,
+                    execSearchDirs = hermeticExec!!.searchDirs,
+                    execAllowedRoots = hermeticExec!!.allowedRoots,
+                    execIsWritable = hermeticExec!!.systemOwned,
+                )
             } else {
                 ShizukuShellRunner(
                     privateRoot = privateRoot,
@@ -329,7 +314,36 @@ class ElevatedWiringB3Test {
         for (isRoot in listOf(true, false)) {
             val cancelled = AtomicBoolean(false)
             // hang 直到被 killer 銷毀（drain 的 isCancelled 輪詢觸發 kill，解除 blocking IO）。
-            val hang = FakeProcess("ok".toByteArray(), hang = true)
+            // waitEntered：drain 進入 waitFor（blocking wait）首片即 countDown，
+            // 供取消前輪詢——取代固定 sleep，確保取消落在 blocking IO 期間；
+            // 隱含假設 runner drain 的 waitFor 切片 ≤15s join 預算（此倉庫無法驗證 drain 切片大小）。
+            val waitEntered = CountDownLatch(1)
+            val hang = object : java.lang.Process() {
+                var destroyed = false
+                override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+                override fun getInputStream(): InputStream = ByteArrayInputStream("ok".toByteArray())
+                override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+                override fun waitFor(): Int =
+                    if (destroyed) 0 else throw IllegalThreadStateException("process has not exited")
+                override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
+                    waitEntered.countDown()
+                    try {
+                        Thread.sleep(unit.toMillis(timeout))
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                    }
+                    return destroyed
+                }
+                override fun exitValue(): Int =
+                    if (destroyed) 0 else throw IllegalThreadStateException("process has not exited")
+                override fun destroy() {
+                    destroyed = true
+                }
+                override fun destroyForcibly(): java.lang.Process {
+                    destroyed = true
+                    return this
+                }
+            }
             val audit = PrivilegeAuditLog()
             val runner = if (isRoot) {
                 RootSuRunner(
@@ -361,16 +375,24 @@ class ElevatedWiringB3Test {
             }
             try {
                 var result: ShellResult? = null
+                var elapsedMs = -1L
                 val bg = Thread {
+                    // timeoutMs=60s 遠大於 15s join 預算：若 cancel 接線壞掉，deadline 不會拯救（測試會 fail 而非 pass）。
+                    val startMs = System.currentTimeMillis()
                     result = runBlocking {
-                        wireExecute(argv = listOf("id"), runner = runner, audit = audit, timeoutMs = 10_000L)
+                        wireExecute(argv = listOf("id"), runner = runner, audit = audit, timeoutMs = 60_000L)
                     }
+                    elapsedMs = System.currentTimeMillis() - startMs
                 }.also { it.isDaemon = true; it.start() }
-                // 等 drain 進入阻塞再取消（無 sleep 猜測：輪詢 spawn 側 hang 存活）。
-                Thread.sleep(300L)
+                // 等 drain 進入 waitFor（blocking IO）再取消：輪詢 waitEntered，
+                // 輪詢到才 cancelled.set(true)；5s 上限，逾時 fail（無固定 sleep 時序假設）。
+                if (!waitEntered.await(5_000L, TimeUnit.MILLISECONDS)) {
+                    throw AssertionError("drain never entered waitFor within 5s")
+                }
                 cancelled.set(true)
                 bg.join(15_000L)
-                assertFalse(bg.isAlive)
+                assertFalse("bg must finish after cancel", bg.isAlive)
+                assertTrue("cancel must finish well before deadline, elapsedMs=$elapsedMs", elapsedMs in 0 until 10_000L)
                 // 取消解除 blocking IO：drain 受監督 kill 後回 TimedOut（非 Ok、非 hang）。
                 assertTrue("$result", result is ShellResult.TimedOut)
                 assertTrue("cancel must destroy hanging process", hang.destroyed)
@@ -549,19 +571,4 @@ class ElevatedWiringB3Test {
         }
     }
 
-    @Test fun wiringGrantMapsGithubCheck() {
-        // 最小抽象對映：github GrantCheck ↔ 接線 ElevatedGrant（rebase 後以 B1
-        // `PrivilegeGrantCheck.check()` 為準；Valid 攜帶 endpoint 身份＋revision，
-        // endpoint／revision 輪轉即作廢，見主側接線測試）。
-        assertEquals(
-            ElevatedWiring.ElevatedGrant.Valid(TEST_PROVIDER_ID, TEST_REVISION),
-            mapGrant(GrantCheck.Valid),
-        )
-        val invalid = mapGrant(GrantCheck.Invalid(ShizukuGrantPolicy.REASON_NEVER_GRANTED))
-        assertTrue("$invalid", invalid is ElevatedWiring.ElevatedGrant.Invalid)
-        assertEquals(
-            ShizukuGrantPolicy.REASON_NEVER_GRANTED,
-            (invalid as ElevatedWiring.ElevatedGrant.Invalid).reason,
-        )
-    }
 }

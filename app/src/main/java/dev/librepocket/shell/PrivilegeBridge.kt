@@ -1,6 +1,7 @@
 package dev.librepocket.shell
 
 import java.io.File
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.Future
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.SynchronousQueue
@@ -107,6 +108,98 @@ internal object ElevatedSnapshotPool {
 
     /** 執行中 worker 數（僅單測斷言有界用；近似值）。 */
     internal fun activeCount(): Int = pool.activeCount
+}
+
+/**
+ * 有界專用 supplier 池（Round-5 Phase 1，P2#3＝安全 M1）：
+ *
+ * [ElevatedSnapshotPool] 的同型小池（容量 [POOL_SIZE]＝2、零佇列、daemon，
+ * thread 名 `elevated-supplier-N`），專供不具取消協作的同步 supplier
+ * （`ctxSupplier`／`bridgeGranted`／`grantCheck` 與 `freezeCtx` 的拷貝體）
+ * 在有界線程上執行。
+ *
+ * 為什麼不重用 [ElevatedSnapshotPool]：快照池的槽位是為 argv 凍結保留的
+ * 共用門（入口／重驗各消費一次）；supplier 阻塞（如 Shizuku binder 無回應）
+ * 佔住兩槽即讓入口凍結全數 fail-closed，跨子系統互相放大故障。容量一樣
+ * 保守（2）、語義同型（池滿即拒、不排隊）。
+ *
+ * 飽和語義 fail-closed：池忙（2 槽皆卡於忽略 interrupt 的 supplier）時新
+ * caller 即時回 null（[trySubmit] 回 null → [boundedSupplierCall] 回 null →
+ * 呼叫方按既有 fail-closed 路徑拒絕，零等待）；全域殘留 worker 恆 ≤2。
+ */
+internal object ElevatedSupplierPool {
+    /** 池容量（殘留引用全域上界同值）。 */
+    const val POOL_SIZE: Int = 2
+
+    private val threadSeq = AtomicInteger(0)
+    private val pool = ThreadPoolExecutor(
+        POOL_SIZE,
+        POOL_SIZE,
+        0L,
+        TimeUnit.MILLISECONDS,
+        SynchronousQueue(),
+        ThreadFactory { r ->
+            Thread(r, "elevated-supplier-${threadSeq.incrementAndGet()}").apply {
+                isDaemon = true
+            }
+        },
+    )
+
+    /** 忙即 null（fail-closed，不抛，零新 thread）。 */
+    fun <T> trySubmit(block: () -> T): Future<T>? = try {
+        pool.submit(block)
+    } catch (_: RejectedExecutionException) {
+        null
+    } catch (_: Throwable) {
+        // 起线程失败（资源枯竭）同样 fail-closed。
+        null
+    }
+}
+
+/**
+ * 有界 supplier 呼叫（F4）：caller 恆有界（`get ≤ timeoutMs`；逾時路徑含
+ * `cancel(true)`＋grace[SNAPSHOT_GRACE_MS]，最壞 ≈ timeoutMs＋200ms；
+ * 預設 1s → ≤ ~1.2s），不隨忽略 interrupt 的 supplier 無限等待。
+ *
+ * - 池滿（[ElevatedSupplierPool] 兩槽皆佔用）→ 即時回 null（fail-closed）；
+ * - 正常 → 回傳 supplier 結果（含 null 結果，呼叫方自行 fail-closed 解讀）；
+ * - 逾時 → `cancel(true)`＋grace（[SNAPSHOT_GRACE_MS]）輪詢 `isDone` 後回 null
+ *   （worker 仍未退出即池內殘留，全域上界 [ElevatedSupplierPool.POOL_SIZE]）；
+ * - caller 被中斷 → 復位 interrupt flag、`cancel(true)`、回 null；
+ * - supplier 抛 [kotlinx.coroutines.CancellationException] → 重拋（取消語義
+ *   不得被吞）；其餘例外 → null（fail-closed）。
+ */
+internal fun <T> boundedSupplierCall(
+    block: () -> T,
+    timeoutMs: Long = SNAPSHOT_MAX_WAIT_MS,
+): T? {
+    val future = ElevatedSupplierPool.trySubmit(block) ?: return null
+    return try {
+        future.get(timeoutMs, TimeUnit.MILLISECONDS)
+    } catch (_: TimeoutException) {
+        future.cancel(true)
+        // grace：给可中断 worker 退出机会；仍未 done 即池内残留（有界，见上）。
+        val graceEnd = System.nanoTime() + SNAPSHOT_GRACE_MS * 1_000_000L
+        while (!future.isDone && System.nanoTime() < graceEnd) {
+            try {
+                Thread.sleep(10L)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            }
+        }
+        null
+    } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        future.cancel(true)
+        null
+    } catch (e: ExecutionException) {
+        val cause = e.cause
+        if (cause is kotlinx.coroutines.CancellationException) throw cause
+        null
+    } catch (_: Throwable) {
+        null
+    }
 }
 
 /**

@@ -20,7 +20,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -87,13 +86,15 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows
 import org.robolectric.annotation.Config
 
-// Harness for MainScreen voice-routing integration tests. Each piece mirrors its production
-// counterpart in MainScreen/ChatScreen — keep them in sync:
+// Harness for MainScreen voice-routing integration tests. Each piece shares its production
+// counterpart's source of truth rather than mirroring it:
 //   - delivery gate: shouldDeliverVoiceRetrigger import (same function MainScreen uses),
 //   - pending retrigger source: AssistantVoiceHandoff.pendingFlow() (real provider, not a harness
 //     stand-in MutableStateFlow),
-//   - onVoiceRetriggerConsumed: MainScreen's consume lambda (identity-checked AssistantVoiceHandoff.consume),
-//   - stale-clear LaunchedEffect: MainScreen's (identity-gated + token-matched AssistantVoiceHandoff.clear),
+//   - onVoiceRetriggerConsumed: consumeVoiceRetrigger (production function, the exact code path
+//     MainScreen uses; the harness short-circuits only to simulate a non-committing consume failure),
+//   - stale-clear effect: RetriggerStaleClearEffect (production composable, the exact code path
+//     MainScreen uses),
 //   - AssistVoiceCoordinator / StartupGateHost: shared production composables,
 //   - chat tree: production ChatScreen with the same onVoiceRetriggerConsumed/onVoiceInputConsumed seams.
 // Anything not listed here (e.g. RecordingRegistry instead of SavedStateRegistry, fake Drawer/Nav
@@ -344,17 +345,15 @@ class MainScreenAssistVoiceRoutingTest {
                 },
             )
 
-            // Mirrors MainScreen stale-clear effect (MainScreen.kt) — keep in sync.
-            // Identity-gated + token-matched: only the owning instance converges its own token.
-            LaunchedEffect(pendingRetrigger, navLoading, hasEndpoint) {
-                val p = pendingRetrigger ?: return@LaunchedEffect
-                val id = voiceTaskIdentity
-                if (id == null || id.taskId != p.targetTaskId || id.sessionInstanceId != p.sessionInstanceId) return@LaunchedEffect
-                val age = SystemClock.uptimeMillis() - p.issuedUptimeMs
-                if (age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS || (!navLoading && !hasEndpoint)) {
-                    AssistantVoiceHandoff.clear(context = appContext, targetTaskId = p.targetTaskId, sessionInstanceId = p.sessionInstanceId, token = p.token)
-                }
-            }
+            // Production stale-clear effect (single source of truth): identity-gated + token-matched;
+            // only the owning instance converges its own token.
+            RetriggerStaleClearEffect(
+                pending = pendingRetrigger,
+                identity = voiceTaskIdentity,
+                navLoading = navLoading,
+                hasEndpoint = hasEndpoint,
+                context = appContext,
+            )
 
             CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
                 StartupGateHost(
@@ -390,18 +389,7 @@ class MainScreenAssistVoiceRoutingTest {
                                     // a different path, pinned by the provider tests.
                                     false
                                 } else {
-                                    val id = voiceTaskIdentity
-                                    val p = pendingRetrigger?.takeIf { it.token == token }
-                                    if (id == null || p == null) {
-                                        false
-                                    } else {
-                                        AssistantVoiceHandoff.consume(
-                                            token = token,
-                                            context = appContext,
-                                            targetTaskId = id.taskId,
-                                            sessionInstanceId = id.sessionInstanceId,
-                                        )
-                                    }
+                                    consumeVoiceRetrigger(token, pendingRetrigger, voiceTaskIdentity, appContext)
                                 }
                             },
                             voiceSwitchesLoaded = loaded,

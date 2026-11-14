@@ -12,6 +12,17 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.atomic.AtomicLong
 
 /**
+ * Defense-in-depth caller check for the app-private handoff provider.
+ *
+ * Same package (including the `:voice` process, which shares [android.content.Context.packageName])
+ * is allowed; in-process/Robolectric direct calls (callingPackage == null) are allowed; any other
+ * package is rejected. Exported=false in the manifest is the primary boundary; this is
+ * belt-and-suspenders so a same-UID third-party package cannot ride the channel.
+ */
+internal fun isCallerAllowed(callerPackage: String?, ownPackage: String?): Boolean =
+    callerPackage == null || callerPackage == ownPackage
+
+/**
  * Main-process, app-private handoff state/provider for C2 voice retrigger (F1/F2, #137).
  *
  * The trusted voice session runs in :voice process and publishes retrigger requests via
@@ -26,6 +37,10 @@ class VoiceHandoffProvider : ContentProvider() {
     override fun onCreate(): Boolean = true
 
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
+        // Defense-in-depth: reject callers from other same-UID packages. Same package (incl. the
+        // :voice process, which shares this packageName) and in-process/Robolectric calls
+        // (callingPackage == null) are allowed; see [isCallerAllowed].
+        if (!isCallerAllowed(callingPackage, context?.packageName)) return null
         return when (method) {
             VoiceHandoffContract.METHOD_PUBLISH -> {
                 val b = extras ?: Bundle()

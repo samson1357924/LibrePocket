@@ -127,6 +127,10 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
         // New show cycle may occur after a previous finish; allow one hide for this cycle.
         sessionHidden = false
         sessionInstanceId = nextSessionInstanceId()
+        // This session has no live task binding (activeTaskId == null, launchPending == false) and no token
+        // on its just-minted sid axis yet. clear(context) with no args is clearAll — it discards stale
+        // entries from prior dead cycles, and may also drop a <TTL prior-cycle token whose voice task
+        // survived a :voice-process loss; that is intended fail-closed convergence (retrigger is one-shot).
         AssistantVoiceHandoff.clear(context)
         lastAcceptedShowUptimeMs = now
         try {
@@ -135,7 +139,10 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
             launchPending = true
             // startVoiceActivity acquires the default voice wake lock; release it after a successful
             // start because C2 may keep the voice task/chat UI alive long after STT delegation.
-            setKeepAwake(false)
+            // runCatching: a keepAwake failure here must NOT cascade into the catch path below
+            // (hide/clearTaskState) — the voice task was started successfully.
+            runCatching { setKeepAwake(false) }
+                .onFailure { Log.w(TAG, "setKeepAwake(false) after successful start failed", it) }
         } catch (e: Exception) {
             Log.w(TAG, "startVoiceActivity failed; hiding session", e)
             // Best-effort convergence: do not leave the session wake lock held on failed start.

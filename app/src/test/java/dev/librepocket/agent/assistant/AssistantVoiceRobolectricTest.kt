@@ -174,7 +174,8 @@ class AssistantVoiceRobolectricTest {
         assertTrue("manifest must mention RECORD_AUDIO (remove directive)", manifest.contains("android.permission.RECORD_AUDIO"))
         assertTrue(
             "RECORD_AUDIO must be declared with tools:node=\"remove\" (transitive AAR guard)",
-            Regex("RECORD_AUDIO[^>]*tools:node=\"remove\"").containsMatchIn(manifest),
+            Regex("RECORD_AUDIO[^>]*tools:node=\"remove\"").containsMatchIn(manifest) ||
+                Regex("tools:node=\"remove\"[^>]*RECORD_AUDIO").containsMatchIn(manifest),
         )
     }
 

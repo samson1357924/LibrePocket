@@ -81,6 +81,31 @@ class AssistantVoiceHandoffTest {
         override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
     }
 
+    /** Provider stub that records every (method, extras) call instead of handling it. */
+    private class CountingProvider : ContentProvider() {
+        val calls = mutableListOf<Pair<String, Bundle?>>()
+
+        override fun onCreate(): Boolean = true
+
+        override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
+            calls += method to extras
+            return null
+        }
+
+        override fun query(
+            uri: Uri,
+            projection: Array<out String>?,
+            selection: String?,
+            selectionArgs: Array<out String>?,
+            sortOrder: String?,
+        ): Cursor? = null
+
+        override fun getType(uri: Uri): String? = null
+        override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+        override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+        override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
+    }
+
     /** Provider stub whose call() throws for every method: simulates an IPC/publish failure. */
     private class ThrowingProvider : ContentProvider() {
         override fun onCreate(): Boolean = true
@@ -240,6 +265,49 @@ class AssistantVoiceHandoffTest {
         assertEquals(c2, AssistantVoiceHandoff.currentPending(appContext)?.token)
         AssistantVoiceHandoff.clear(context = appContext, targetTaskId = 10, sessionInstanceId = 7L, token = c2)
         assertNull(AssistantVoiceHandoff.currentPending(appContext))
+    }
+
+    @Test
+    fun successfulConsume_makesNoIpcCalls() {
+        // Pins "zero IPC of any method during a successful local consume" — stronger than the
+        // minimum (post-CAS METHOD_CLEAR). This is an intentional lock, not an accident: if a
+        // future change adds any provider call to the success path, this test must fail.
+        // Pre-seed a fresh pending entry (companion publish is in-process, no IPC).
+        seedPending(token = 999L, issuedUptimeMs = SystemClock.uptimeMillis(), targetTaskId = 10, sessionInstanceId = 7L)
+
+        val counting = CountingProvider()
+        swapHandoffProvider(counting)
+        try {
+            assertTrue(AssistantVoiceHandoff.consume(999L, appContext, 10, 7L))
+            assertTrue("successful in-process consume must not perform any provider IPC: ${counting.calls}", counting.calls.isEmpty())
+        } finally {
+            restoreManifestProvider()
+        }
+    }
+
+    @Test
+    fun currentPending_ageExactlyTtl_returnsEntry() {
+        seedPending(token = 555L, issuedUptimeMs = SystemClock.uptimeMillis() - VoiceHandoffContract.RETRIGGER_TTL_MS)
+        val pending = AssistantVoiceHandoff.currentPending(appContext)
+        assertNotNull("entry aged exactly TTL is still valid", pending)
+        assertEquals(555L, pending?.token)
+
+        VoiceHandoffProvider.resetForTest()
+        seedPending(token = 556L, issuedUptimeMs = SystemClock.uptimeMillis() - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
+        assertNull("entry aged TTL+1 is expired", AssistantVoiceHandoff.currentPending(appContext))
+    }
+
+    @Test
+    fun consume_zeroToken_returnsFalse() {
+        assertFalse(AssistantVoiceHandoff.consume(0L, appContext, 10, 7L))
+        // Provider arm: seed a live entry first; a zero-token consume must fail without touching it.
+        assertTrue(
+            VoiceHandoffProvider.publish(
+                PendingVoiceRetrigger(555L, 10, 7L, SystemClock.uptimeMillis()),
+            ),
+        )
+        assertFalse(VoiceHandoffProvider.consume(0L, 10, 7L))
+        assertEquals(555L, VoiceHandoffProvider.pending.value?.token)
     }
 
     @Test

@@ -16,7 +16,8 @@ import org.junit.Test
  *
  * 斷言 RecognizerIntent 委託參數（FREE_FORM / zh-TW / MAX 1）、
  * 無辨識服務降級原因碼（NO_PRIVILEGE / USER_DISABLED）、
- * manifest `<queries>` 動作為 RECOGNIZE_SPEECH 且探測帶 MATCH_DEFAULT_ONLY（B1），
+ * manifest `<queries>` 動作為 RECOGNIZE_SPEECH（B1）；探測（MATCH_DEFAULT_ONLY）行為由
+ * `ChatScreenVoiceLaunchTest.recognizerWithoutDefaultCategory_degradesToNoPrivilege_initialVoice` 覆蓋，
  * 以及 `voice.transcribe` 投影（READ，`voice_input` 預設開）。
  */
 class VoiceSttTest {
@@ -86,7 +87,7 @@ class VoiceSttTest {
         assertTrue(switchedOff.contains("USER_DISABLED"))
     }
 
-    // ---- B1：manifest <queries> + 探測旗標 ----
+    // ---- B1：manifest <queries>（MATCH_DEFAULT_ONLY 探測行為測試見 ChatScreenVoiceLaunchTest.recognizerWithoutDefaultCategory_degradesToNoPrivilege_initialVoice） ----
 
     /** 單測工作目錄（模組 dir）出發，向上走最多 5 層找原始碼/清單檔。 */
     private fun findSource(vararg relPaths: String): java.io.File {

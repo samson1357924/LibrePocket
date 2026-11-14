@@ -44,6 +44,7 @@ class LibreVoiceInteractionSessionTest {
         val startedTaskIds = mutableListOf<Int>()
         val keepAwakeCalls = mutableListOf<Boolean>()
         var hideCalls = 0
+        var throwOnKeepAwakeOnce: Boolean = false
 
         override fun setUiEnabled(enabled: Boolean) {
             uiEnabledCalls += enabled
@@ -51,6 +52,10 @@ class LibreVoiceInteractionSessionTest {
 
         override fun setKeepAwake(keepAwake: Boolean) {
             keepAwakeCalls += keepAwake
+            if (throwOnKeepAwakeOnce) {
+                throwOnKeepAwakeOnce = false
+                throw RuntimeException("simulated keepAwake failure")
+            }
         }
 
         override fun startVoiceActivity(intent: Intent?) {
@@ -100,6 +105,24 @@ class LibreVoiceInteractionSessionTest {
         // Each successful start re-acquires the default voice wake lock; release it for long-lived C2 task.
         assertTrue(session.keepAwakeCalls.contains(false))
         assertEquals(false, session.keepAwakeCalls.last())
+    }
+
+    @Test
+    fun keepAwakeFailureAfterSuccessfulStart_doesNotHideSessionOrLoseTaskBinding() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val session = RecordingVoiceSession(context)
+        session.throwOnKeepAwakeOnce = true
+        try {
+            // setKeepAwake(false) after a successful start throws; the success-path runCatching
+            // must swallow it — no exception escapes, the voice task stays alive and bound.
+            session.onShow(null, 0)
+
+            assertEquals(1, session.startedIntents.size)
+            assertEquals(0, session.hideCalls)
+            assertTrue(session.keepAwakeCalls.contains(false))
+        } finally {
+            session.throwOnKeepAwakeOnce = false
+        }
     }
 
     @Test

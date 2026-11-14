@@ -1,5 +1,6 @@
 package dev.librepocket.agent.ui
 
+import android.content.Context
 import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.CancellationException
@@ -235,18 +236,13 @@ fun MainScreen(
     // C2 retrigger 過期/無法投遞收斂：token 超過 TTL 或端點落定後仍不可投遞 → 清除，避免日後 CHAT 進入時補彈 STT。
     // Both instances (normal task + voice task) observe the same flow; only the owning
     // (identity-matched) instance may converge/clear its own token.
-    LaunchedEffect(pendingVoiceRetrigger, navLoading, hasEndpoint) {
-        val p = pendingVoiceRetrigger ?: return@LaunchedEffect
-        val id = voiceTaskIdentity
-        if (id == null || id.taskId != p.targetTaskId || id.sessionInstanceId != p.sessionInstanceId) {
-            return@LaunchedEffect
-        }
-        val age = SystemClock.uptimeMillis() - p.issuedUptimeMs
-        val stale = age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS
-        if (stale || (!navLoading && !hasEndpoint)) {
-            AssistantVoiceHandoff.clear(context = app, targetTaskId = p.targetTaskId, sessionInstanceId = p.sessionInstanceId, token = p.token)
-        }
-    }
+    RetriggerStaleClearEffect(
+        pending = pendingVoiceRetrigger,
+        identity = voiceTaskIdentity,
+        navLoading = navLoading,
+        hasEndpoint = hasEndpoint,
+        context = app,
+    )
 
     // Edit-entry helper: prefill the form with the live endpoint (key stays
     // blank) so "edit" never shows another preset's defaults.
@@ -321,18 +317,7 @@ fun MainScreen(
                 onVoiceInputConsumed = onAssistVoiceConsumed,
                 voiceRetriggerToken = voiceRetriggerToken,
                 onVoiceRetriggerConsumed = { token ->
-                    val id = voiceTaskIdentity
-                    val p = pendingVoiceRetrigger?.takeIf { it.token == token }
-                    if (id == null || p == null) {
-                        false
-                    } else {
-                        AssistantVoiceHandoff.consume(
-                            token = token,
-                            context = app,
-                            targetTaskId = id.taskId,
-                            sessionInstanceId = id.sessionInstanceId,
-                        )
-                    }
+                    consumeVoiceRetrigger(token, pendingVoiceRetrigger, voiceTaskIdentity, app)
                 },
                 voiceSwitchesLoaded = voiceEffectiveSnapshot.loaded || voiceEffectiveSnapshot.loadFailed,
                 userSwitches = voiceUiSwitches,
@@ -546,6 +531,50 @@ fun MainScreen(
     viewedSessionId?.let { id ->
         TranscriptViewer(id, sessionListViewModel::readTranscriptPage) { viewedSessionId = null }
     }
+}
+
+/**
+ * Production source of truth (not a test mirror). Stale/undeliverable retrigger convergence.
+ * Expiry is enforced at gate/consume/currentPending time and on the next state change — there is
+ * no background timer; an over-TTL entry simply stops being deliverable/consumable until this
+ * effect converges it on the next state change. Fail-closed.
+ */
+@Composable
+internal fun RetriggerStaleClearEffect(
+    pending: PendingVoiceRetrigger?,
+    identity: VoiceTaskIdentity?,
+    navLoading: Boolean,
+    hasEndpoint: Boolean,
+    context: Context,
+) {
+    LaunchedEffect(pending, navLoading, hasEndpoint) {
+        val p = pending ?: return@LaunchedEffect
+        val id = identity
+        if (id == null || id.taskId != p.targetTaskId || id.sessionInstanceId != p.sessionInstanceId) {
+            return@LaunchedEffect
+        }
+        val age = SystemClock.uptimeMillis() - p.issuedUptimeMs
+        val stale = age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS
+        if (stale || (!navLoading && !hasEndpoint)) {
+            AssistantVoiceHandoff.clear(context = context, targetTaskId = p.targetTaskId, sessionInstanceId = p.sessionInstanceId, token = p.token)
+        }
+    }
+}
+
+/**
+ * Production source of truth for the retrigger consume lambda used by MainScreen. Identity-gated
+ * and token-matched: only the owning (identity-matched) instance may consume its token.
+ */
+internal fun consumeVoiceRetrigger(
+    token: Long,
+    pending: PendingVoiceRetrigger?,
+    identity: VoiceTaskIdentity?,
+    context: Context,
+): Boolean {
+    val id = identity
+    val p = pending?.takeIf { it.token == token }
+    if (id == null || p == null) return false
+    return AssistantVoiceHandoff.consume(token = token, context = context, targetTaskId = id.taskId, sessionInstanceId = id.sessionInstanceId)
 }
 
 /**

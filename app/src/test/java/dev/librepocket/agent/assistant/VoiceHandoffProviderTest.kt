@@ -16,7 +16,9 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.Shadows
 import org.robolectric.shadows.ShadowSystemClock
+import java.time.Duration
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
@@ -236,6 +238,56 @@ class VoiceHandoffProviderTest {
         publish(805L, targetTaskId = 10, sessionInstanceId = 7L)
         VoiceHandoffProvider.clearMatching(Int.MIN_VALUE, 7L, token = 999L)
         assertEquals(805L, VoiceHandoffProvider.pending.value?.token)
+    }
+
+    @Test
+    fun nextToken_survivesResetWithMonotonicSeed() {
+        val first = VoiceHandoffProvider.nextToken()
+        ShadowSystemClock.advanceBy(Duration.ofSeconds(1))
+        VoiceHandoffProvider.resetForTest()
+        val second = VoiceHandoffProvider.nextToken()
+        assertTrue(second > first)
+    }
+
+    @Test
+    fun isCallerAllowed_nullCaller_isAllowed() {
+        assertTrue(isCallerAllowed(null, appContext.packageName))
+    }
+
+    @Test
+    fun isCallerAllowed_samePackage_isAllowed() {
+        assertTrue(isCallerAllowed(appContext.packageName, appContext.packageName))
+    }
+
+    @Test
+    fun isCallerAllowed_foreignPackage_isRejected() {
+        assertFalse(isCallerAllowed("com.example.other.sameuid", appContext.packageName))
+    }
+
+    @Test
+    fun call_foreignPackage_returnsNull() {
+        publish(888L, targetTaskId = 10, sessionInstanceId = 7L)
+        val provider = newAttachedProvider()
+        val shadow = Shadows.shadowOf(provider)
+        shadow.setCallingPackage("com.example.other.sameuid")
+        try {
+            assertNull("foreign same-UID caller must be rejected", provider.call(VoiceHandoffContract.METHOD_PEEK, null, null))
+            assertNull(
+                "foreign same-UID caller must be rejected",
+                provider.call(
+                    VoiceHandoffContract.METHOD_CONSUME,
+                    null,
+                    Bundle().apply {
+                        putLong(VoiceHandoffContract.KEY_TOKEN, 888L)
+                        putInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, 10)
+                        putLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, 7L)
+                    },
+                ),
+            )
+            assertEquals("rejected call must not consume", 888L, VoiceHandoffProvider.pending.value?.token)
+        } finally {
+            shadow.setCallingPackage(null)
+        }
     }
 
     @Test

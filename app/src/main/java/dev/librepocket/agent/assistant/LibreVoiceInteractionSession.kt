@@ -49,6 +49,8 @@ private const val TAG = "LibreVoiceSession"
  */
 open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSession(context) {
     private var sessionHidden = false
+    private var launchPending = false
+    private var activeTaskId: Int? = null
 
     /**
      * Activity-only 流程（人類 review #5 session UI）：關預設 voice UI window，
@@ -61,6 +63,11 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
 
     override fun onShow(args: Bundle?, showFlags: Int) {
         super.onShow(args, showFlags)
+        // Ignore duplicate onShow while a launch is pending or an active task is running,
+        // so a stale/duplicate show cannot start or kill a newer request lifecycle.
+        if (launchPending || activeTaskId != null) {
+            return
+        }
         // New show cycle may occur after a previous finish; allow one hide for this cycle.
         sessionHidden = false
         try {
@@ -71,31 +78,61 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
                 MainActivity::class.java,
             )
             startVoiceActivity(assist)
+            // Launch accepted but task not yet started; wait for onTaskStarted to bind taskId.
+            launchPending = true
         } catch (e: Exception) {
             Log.w(TAG, "startVoiceActivity failed; hiding session", e)
-            // Fail-closed: do not leave an empty/inactive session around.
+            // Fail-closed: clear lifecycle tracking and do not leave an empty/inactive session around.
+            clearTaskState()
             finishSession()
         }
-        // On success: keep session alive until the delegated voice task/activity flow completes.
+    }
+
+    override fun onTaskStarted(intent: Intent?, taskId: Int) {
+        // Bind the started task only for the current pending launch with no active task yet.
+        // Unexpected/extra task starts are ignored to preserve single-active-task semantics.
+        if (launchPending && activeTaskId == null) {
+            activeTaskId = taskId
+            launchPending = false
+            super.onTaskStarted(intent, taskId)
+        }
     }
 
     override fun onTaskFinished(intent: Intent?, taskId: Int) {
-        // End session when the delegated voice task finishes. Do not call super here:
-        // framework/default implementations may also hide(), and our cleanup must remain
-        // idempotent and predictable in tests and production.
+        // End session only for the current request. If finish arrives while launch is still
+        // pending (before onTaskStarted bound a taskId), treat it as completion of that request
+        // to avoid a stuck session. Ignore finishes for non-active/unknown tasks.
+        val shouldFinish = when {
+            activeTaskId != null -> taskId == activeTaskId
+            launchPending -> true
+            else -> false
+        }
+        if (!shouldFinish) return
+
+        clearTaskState()
+        // Do not call super here: framework/default implementations may also hide(),
+        // and our cleanup must remain idempotent and predictable in tests and production.
         finishSession()
     }
 
     override fun onHide() {
+        clearTaskState()
         sessionHidden = true
         super.onHide()
     }
 
+    private fun clearTaskState() {
+        launchPending = false
+        activeTaskId = null
+    }
+
     /**
      * Ends this session once per lifecycle transition. Safe to call from failure and
-     * task-completion paths without repeated hide/re-entrancy loops.
+     * task-completion paths without repeated hide/re-entrancy loops. Resets lifecycle
+     * tracking so a subsequent onShow can start a fresh cycle after the session ends.
      */
     protected open fun finishSession() {
+        clearTaskState()
         if (sessionHidden) return
         sessionHidden = true
         hide()

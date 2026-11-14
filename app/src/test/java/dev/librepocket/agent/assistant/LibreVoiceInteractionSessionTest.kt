@@ -21,6 +21,7 @@ class LibreVoiceInteractionSessionTest {
     ) : LibreVoiceInteractionSession(context) {
         val uiEnabledCalls = mutableListOf<Boolean>()
         val startedIntents = mutableListOf<Intent>()
+        val startedTaskIds = mutableListOf<Int>()
         var hideCalls = 0
 
         override fun setUiEnabled(enabled: Boolean) {
@@ -34,6 +35,11 @@ class LibreVoiceInteractionSessionTest {
             if (throwOnStart) {
                 throw RuntimeException("simulated startVoiceActivity failure")
             }
+        }
+
+        override fun onTaskStarted(intent: Intent?, taskId: Int) {
+            startedTaskIds += taskId
+            super.onTaskStarted(intent, taskId)
         }
 
         override fun hide() {
@@ -80,15 +86,150 @@ class LibreVoiceInteractionSessionTest {
     }
 
     @Test
-    fun onTaskFinished_hidesSessionOnce() {
+    fun onTaskFinished_hidesSessionOnceForActiveTask() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val session = RecordingVoiceSession(context)
 
         session.onShow(null, 0)
+        session.onTaskStarted(null, 42)
         assertEquals(0, session.hideCalls)
 
         session.onTaskFinished(null, 42)
 
         assertEquals(1, session.hideCalls)
+    }
+
+    @Test
+    fun duplicateOnShow_whileActiveTaskStarted_isIgnored_andActiveTaskCanFinish() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val session = RecordingVoiceSession(context)
+
+        session.onShow(null, 0)
+        assertEquals(1, session.startedIntents.size)
+        session.onTaskStarted(null, 10)
+
+        session.onShow(null, 0)
+        assertEquals(1, session.startedIntents.size)
+        assertEquals(0, session.hideCalls)
+
+        // Non-active callbacks must not break the active request.
+        session.onTaskFinished(null, 999)
+        assertEquals(0, session.hideCalls)
+
+        session.onTaskFinished(null, 10)
+        assertEquals(1, session.hideCalls)
+    }
+
+    @Test
+    fun duplicateOnShow_whileLaunchPending_isIgnored_untilTaskStarts() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val session = RecordingVoiceSession(context)
+
+        session.onShow(null, 0)
+        assertEquals(1, session.startedIntents.size)
+
+        session.onShow(null, 0)
+        assertEquals(1, session.startedIntents.size)
+        assertEquals(0, session.hideCalls)
+
+        session.onTaskStarted(null, 10)
+        session.onTaskFinished(null, 10)
+        assertEquals(1, session.hideCalls)
+    }
+
+    @Test
+    fun onTaskFinished_forNonActiveTask_isIgnored() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val session = RecordingVoiceSession(context)
+
+        session.onShow(null, 0)
+        session.onTaskStarted(null, 10)
+
+        session.onTaskFinished(null, 999)
+        assertEquals(0, session.hideCalls)
+
+        session.onTaskFinished(null, 10)
+        assertEquals(1, session.hideCalls)
+    }
+
+    @Test
+    fun interleaving_duplicateIgnored_andExtraTaskStartCannotKillActive() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val session = RecordingVoiceSession(context)
+
+        session.onShow(null, 0) // A
+        session.onTaskStarted(null, 10)
+        session.onShow(null, 0) // B ignored, must not start
+        assertEquals(1, session.startedIntents.size)
+
+        // If B's task start arrives anyway it must not become active or finish session.
+        session.onTaskStarted(null, 11)
+        assertEquals(listOf(10, 11), session.startedTaskIds)
+        session.onTaskFinished(null, 11)
+        assertEquals(0, session.hideCalls)
+
+        session.onTaskFinished(null, 10)
+        assertEquals(1, session.hideCalls)
+    }
+
+    @Test
+    fun startFailure_clearsPendingSoLaterOnShowCanStartAgain() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val session = RecordingVoiceSession(context, throwOnStart = true)
+
+        session.onShow(null, 0)
+        assertEquals(1, session.startedIntents.size)
+        assertEquals(1, session.hideCalls)
+
+        // Simulate next cycle after failure cleanup/hide.
+        session.onHide()
+        session.onShow(null, 0)
+        // throwOnStart still true, but proves a new launch attempt was made (not blocked as pending).
+        assertEquals(2, session.startedIntents.size)
+        assertEquals(2, session.hideCalls)
+    }
+
+    @Test
+    fun afterTaskCompletes_newOnShowCanStartNewTask() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val session = RecordingVoiceSession(context)
+
+        session.onShow(null, 0)
+        session.onTaskStarted(null, 10)
+        session.onTaskFinished(null, 10)
+        assertEquals(1, session.startedIntents.size)
+        assertEquals(1, session.hideCalls)
+
+        // Framework/session hide transition may occur; next show must be able to start fresh.
+        session.onHide()
+        session.onShow(null, 0)
+        assertEquals(2, session.startedIntents.size)
+
+        session.onTaskStarted(null, 20)
+        session.onTaskFinished(null, 20)
+        assertEquals(2, session.hideCalls)
+    }
+
+    @Test
+    fun onTaskFinished_whileLaunchPending_finishesCurrentRequest() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val session = RecordingVoiceSession(context)
+
+        session.onShow(null, 0)
+        assertEquals(1, session.startedIntents.size)
+        assertEquals(0, session.hideCalls)
+
+        // Finish arrives before onTaskStarted bound taskId: treat as completion of current request.
+        session.onTaskFinished(null, 77)
+        assertEquals(1, session.hideCalls)
+
+        // Late start/finish for that request must not re-hide; new cycle should work.
+        session.onTaskStarted(null, 77)
+        session.onTaskFinished(null, 77)
+        assertEquals(1, session.hideCalls)
+
+        session.onHide()
+        session.onShow(null, 0)
+        assertEquals(2, session.startedIntents.size)
     }
 }

@@ -2032,23 +2032,66 @@ class ChatMarkdownUiTest {
         // once per recomposition (O(K)). Rewriting K cards to K fully different cards
         // must scale ~linearly (well under the quadratic 4x plus noise headroom),
         // unlike a per-card linear scan over all previous entries.
-        fun timed(k: Int): Long {
+        //
+        // Hardened: a single-shot timing on a small base can be dominated by CI/JIT/GC
+        // noise (foss CI observed ratio 13.44 with t1=1.26ms). Interleaved rounds measure
+        // both sides back to back so machine drift cancels; per-side medians and a larger
+        // repeat count stabilize the baseline. Bound 3.5 remains strictly inside (2, 4),
+        // preserving linear (~2) vs quadratic (~4) discrimination.
+        data class Case(
+            val prev: List<String>,
+            val prevIds: List<String>,
+            val currIds: List<String>,
+            val curr: List<String>,
+            val currSet: Set<String>,
+        )
+
+        fun makeCase(k: Int): Case {
             val prev = List(k) { "prev-content-$it" }
             val curr = List(k) { "curr-content-$it" }
             val prevIds = thinkingOverrideIds(prev)
             val currIds = thinkingOverrideIds(curr)
-            val currSet = currIds.toSet()
-            repeat(3) {
-                alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
+            return Case(prev, prevIds, currIds, curr, currIds.toSet())
+        }
+
+        fun timedOnce(case: Case): Long {
+            repeat(5) {
+                alignThinkingOverridesIdentityOnly(
+                    case.prev,
+                    case.prevIds,
+                    case.currIds,
+                    case.curr,
+                    mutableMapOf(),
+                    case.currSet,
+                )
             }
             val start = System.nanoTime()
-            repeat(5) {
-                alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
+            repeat(20) {
+                alignThinkingOverridesIdentityOnly(
+                    case.prev,
+                    case.prevIds,
+                    case.currIds,
+                    case.curr,
+                    mutableMapOf(),
+                    case.currSet,
+                )
             }
             return System.nanoTime() - start
         }
-        val t1 = timed(400)
-        val t2 = timed(800)
+
+        val case1 = makeCase(400)
+        val case2 = makeCase(800)
+        // Warmup both cases before interleaved sampling.
+        repeat(5) { timedOnce(case1) }
+        repeat(5) { timedOnce(case2) }
+        val samples1 = LongArray(7)
+        val samples2 = LongArray(7)
+        repeat(7) { i ->
+            samples1[i] = timedOnce(case1)
+            samples2[i] = timedOnce(case2)
+        }
+        val t1 = samples1.sorted()[samples1.size / 2]
+        val t2 = samples2.sorted()[samples2.size / 2]
         val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
         assertTrue(
             "identity-only 2x-input ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)",

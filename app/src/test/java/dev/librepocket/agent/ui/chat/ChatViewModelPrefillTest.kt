@@ -121,6 +121,21 @@ class ChatViewModelPrefillTest {
     }
 
     @Test
+    fun prefill_overwritesExistingNonBlankDraft() {
+        val provider = PrefillFakeProvider()
+        val vm = newVm(provider)
+
+        onMain {
+            vm.prefill("第一次")
+            vm.prefill("第二次")
+        }
+
+        assertEquals("第二次", vm.input.value)
+        assertEquals(0, provider.streamCalls)
+        assertTrue(vm.messages.value.isEmpty())
+    }
+
+    @Test
     fun prefill_blankTextDoesNotOverwriteExistingInputOrSend() {
         val provider = PrefillFakeProvider()
         val vm = newVm(provider)

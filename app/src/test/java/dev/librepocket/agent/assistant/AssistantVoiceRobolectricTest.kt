@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -130,6 +131,51 @@ class AssistantVoiceRobolectricTest {
             .addFlags(Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY)
             .putExtra(AssistantVoice.EXTRA_VOICE_INPUT, true)
         assertFalse(AssistantVoice.isVoiceInputRequested(intent))
+    }
+
+    @Test
+    fun manifest_declaresVoiceHandoffProviderLockedDown() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        @Suppress("DEPRECATION")
+        val providerInfo = context.packageManager.resolveContentProvider(
+            "${context.packageName}.voice.handoff",
+            0,
+        )
+        assertNotNull("voice handoff provider must be declared in the merged manifest", providerInfo)
+        assertFalse("provider must stay app-private", providerInfo!!.exported)
+        assertEquals("${context.packageName}.voice.handoff", providerInfo.authority)
+        assertEquals(
+            "provider must run in the app (main) process, not :voice",
+            context.packageName,
+            providerInfo.processName,
+        )
+    }
+
+    // ---- manifest textual guards ----
+
+    /** 單測工作目錄（模組 dir）出發，向上走最多 5 層找原始碼/清單檔。 */
+    private fun findSource(vararg relPaths: String): java.io.File {
+        val bases = generateSequence(java.io.File(System.getProperty("user.dir") ?: ".")) { it.parentFile }.take(6).toList()
+        for (base in bases) {
+            for (rel in relPaths) {
+                val f = java.io.File(base, rel)
+                if (f.isFile) return f
+            }
+        }
+        error("not found: ${relPaths.toList()} under ${System.getProperty("user.dir")}")
+    }
+
+    @Test
+    fun manifest_recordAudioNodeRemove_isPresent() {
+        val manifest = findSource(
+            "src/main/AndroidManifest.xml",
+            "app/src/main/AndroidManifest.xml",
+        ).readText()
+        assertTrue("manifest must mention RECORD_AUDIO (remove directive)", manifest.contains("android.permission.RECORD_AUDIO"))
+        assertTrue(
+            "RECORD_AUDIO must be declared with tools:node=\"remove\" (transitive AAR guard)",
+            Regex("RECORD_AUDIO[^>]*tools:node=\"remove\"").containsMatchIn(manifest),
+        )
     }
 
     @Test

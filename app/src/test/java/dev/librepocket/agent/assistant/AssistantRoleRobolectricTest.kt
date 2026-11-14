@@ -182,8 +182,9 @@ class AssistantRoleRobolectricTest {
      * 生產探測契約：`openFallback` 必須走 `queryIntentActivities` 全枚舉＋
      * `setComponent` explicit（見 AssistantRoleUi）：`resolveActivity` 在
      * 多候選無預設時回傳系統 Resolver 本身，`FLAG_SYSTEM` 檢查會誤判放行
-     * 第三方（同 VoiceSttTest `sttProbe_usesMatchDefaultOnly` 模式，以原始碼
-     * 內容＋審查為準）。
+     * 第三方（同 ChatScreenVoiceLaunchTest
+     * `recognizerWithoutDefaultCategory_degradesToNoPrivilege_initialVoice` 覆蓋的
+     * MATCH_DEFAULT_ONLY 探測模式，以商品行為＋審查為準）。
      */
     @Test
     fun fallbackProbe_usesQueryIntentActivities() {

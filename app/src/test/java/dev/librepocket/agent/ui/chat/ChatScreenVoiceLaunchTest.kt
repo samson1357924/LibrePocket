@@ -110,7 +110,7 @@ class ChatScreenVoiceLaunchTest {
         }
     }
 
-    private fun registerRecognitionService() {
+    private fun registerRecognitionService(includeDefaultCategory: Boolean = true) {
         val app = ApplicationProvider.getApplicationContext<Application>()
         val component = ComponentName("com.example.stt", "com.example.stt.RecognizerActivity")
         val appInfo = ApplicationInfo().apply {
@@ -129,9 +129,24 @@ class ChatScreenVoiceLaunchTest {
         shadowPm.addIntentFilterForActivity(
             component,
             IntentFilter(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                addCategory(Intent.CATEGORY_DEFAULT)
+                // MATCH_DEFAULT_ONLY probes only find services carrying CATEGORY_DEFAULT;
+                // omit it to model a recognizer the system cannot launch by default.
+                if (includeDefaultCategory) {
+                    addCategory(Intent.CATEGORY_DEFAULT)
+                }
             },
         )
+    }
+
+    private class ThrowingRegistry : ActivityResultRegistry() {
+        override fun <I : Any?, O : Any?> onLaunch(
+            requestCode: Int,
+            contract: ActivityResultContract<I, O>,
+            input: I,
+            options: ActivityOptionsCompat?,
+        ) {
+            throw RuntimeException("launchBoom")
+        }
     }
 
     private class RecordingRegistry : ActivityResultRegistry() {
@@ -784,5 +799,175 @@ class ChatScreenVoiceLaunchTest {
         assertEquals(listOf(7L), consumed)
         assertEquals(1, registry.launchedIntents.size)
         assertEquals(RecognizerIntent.ACTION_RECOGNIZE_SPEECH, registry.launchedIntents.single().action)
+    }
+
+    @Test
+    fun recognizerWithoutDefaultCategory_degradesToNoPrivilege_initialVoice() {
+        // Service exists but without CATEGORY_DEFAULT: the MATCH_DEFAULT_ONLY probe cannot see it.
+        registerRecognitionService(includeDefaultCategory = false)
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+        var consumedCount = 0
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = {
+                        consumedCount++
+                        voiceRequested.value = false
+                    },
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        assertEquals(1, consumedCount)
+        assertTrue(registry.launchedIntents.isEmpty())
+        composeRule.onAllNodesWithText(
+            VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE),
+        ).assertCountEquals(1)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun voiceRetriggerConsumedFalse_doesNotLaunch() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val retriggerToken = MutableStateFlow(33L)
+        val consumed = ArrayList<Long>()
+
+        composeRule.setContent {
+            val token by retriggerToken.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceSwitchesLoaded = true,
+                    voiceRetriggerToken = token,
+                    onVoiceRetriggerConsumed = {
+                        consumed += it
+                        false
+                    },
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        assertEquals(listOf(33L), consumed)
+        assertTrue(registry.launchedIntents.isEmpty())
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun initialVoiceAndRetrigger_dontStackInSameFrame() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+        val retriggerToken = MutableStateFlow(44L)
+        val consumedRetrigger = ArrayList<Long>()
+        var consumedInitial = 0
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            val token by retriggerToken.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    // Intentionally do NOT clear voiceRequested in onVoiceInputConsumed: this test
+                    // pins down first-frame mutual exclusion and the req=false re-fire below.
+                    onVoiceInputConsumed = { consumedInitial++ },
+                    voiceSwitchesLoaded = true,
+                    voiceRetriggerToken = token,
+                    onVoiceRetriggerConsumed = {
+                        consumedRetrigger += it
+                        true
+                    },
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        // Only the initial voice launch happened in this frame; the retrigger LaunchedEffect saw
+        // voiceInputRequested == true (its snapshot guard skips the consume) and did not fire.
+        // The voiceInputRequested key flips to false later, re-firing the effect in a later frame.
+        assertEquals(1, consumedInitial)
+        assertEquals(1, registry.launchedIntents.size)
+        assertEquals(emptyList<Long>(), consumedRetrigger)
+        assertEquals(0, provider.streamCalls)
+
+        // The retrigger is blocked only while req == true. Once req flips false the
+        // voiceInputRequested effect key re-fires and the pending retrigger is delivered on the
+        // next frame. This pins that behavior — it silently fails if the voiceInputRequested key
+        // is removed from the retrigger LaunchedEffect.
+        composeRule.runOnIdle { voiceRequested.value = false }
+        composeRule.waitForIdle()
+
+        assertEquals(listOf(44L), consumedRetrigger)
+        assertEquals(2, registry.launchedIntents.size)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun launchThrows_showsNoServiceFallback_consumedStillOnce() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = ThrowingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+        var consumedCount = 0
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = {
+                        consumedCount++
+                        voiceRequested.value = false
+                    },
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        // Registry blew up inside launch: no crash escapes, the no-service fallback shows,
+        // and the one-shot voice consume still happened exactly once.
+        assertEquals(1, consumedCount)
+        composeRule.onAllNodesWithText(
+            VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE),
+        ).assertCountEquals(1)
+        assertEquals(0, provider.streamCalls)
     }
 }

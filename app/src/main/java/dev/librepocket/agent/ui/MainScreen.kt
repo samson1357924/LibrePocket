@@ -241,7 +241,8 @@ fun MainScreen(
         if (id == null || id.taskId != p.targetTaskId || id.sessionInstanceId != p.sessionInstanceId) {
             return@LaunchedEffect
         }
-        val stale = SystemClock.uptimeMillis() - p.issuedUptimeMs > VoiceHandoffContract.RETRIGGER_TTL_MS
+        val age = SystemClock.uptimeMillis() - p.issuedUptimeMs
+        val stale = age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS
         if (stale || (!navLoading && !hasEndpoint)) {
             AssistantVoiceHandoff.clear(context = app, targetTaskId = p.targetTaskId, sessionInstanceId = p.sessionInstanceId, token = p.token)
         }

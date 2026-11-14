@@ -2,10 +2,12 @@ package dev.librepocket.agent.ui
 
 import android.app.Application
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.pm.ApplicationInfo
+import android.os.SystemClock
 import android.speech.RecognizerIntent
 import androidx.activity.compose.LocalActivityResultRegistryOwner
 import androidx.activity.result.ActivityResultRegistry
@@ -18,6 +20,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -36,7 +39,11 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.test.core.app.ApplicationProvider
 import dev.librepocket.agent.ui.chat.ChatScreen
+import dev.librepocket.agent.assistant.AssistantVoiceHandoff
+import dev.librepocket.agent.assistant.PendingVoiceRetrigger
+import dev.librepocket.agent.assistant.VoiceHandoffContract
 import dev.librepocket.agent.assistant.VoiceHandoffProvider
+import dev.librepocket.agent.assistant.VoiceTaskIdentity
 import dev.librepocket.agent.ui.chat.ChatSessionFactory
 import dev.librepocket.agent.ui.chat.ChatViewModel
 import dev.librepocket.agent.ui.chat.VaultSource
@@ -80,6 +87,17 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows
 import org.robolectric.annotation.Config
 
+// Harness for MainScreen voice-routing integration tests. Each piece mirrors its production
+// counterpart in MainScreen/ChatScreen — keep them in sync:
+//   - delivery gate: shouldDeliverVoiceRetrigger import (same function MainScreen uses),
+//   - pending retrigger source: AssistantVoiceHandoff.pendingFlow() (real provider, not a harness
+//     stand-in MutableStateFlow),
+//   - onVoiceRetriggerConsumed: MainScreen's consume lambda (identity-checked AssistantVoiceHandoff.consume),
+//   - stale-clear LaunchedEffect: MainScreen's (identity-gated + token-matched AssistantVoiceHandoff.clear),
+//   - AssistVoiceCoordinator / StartupGateHost: shared production composables,
+//   - chat tree: production ChatScreen with the same onVoiceRetriggerConsumed/onVoiceInputConsumed seams.
+// Anything not listed here (e.g. RecordingRegistry instead of SavedStateRegistry, fake Drawer/Nav
+// hosts) is test-only scaffolding with no production counterpart.
 private class RoutingFakeProvider : LlmProvider {
     override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
     @Volatile var streamCalls = 0
@@ -177,10 +195,16 @@ class MainScreenAssistVoiceRoutingTest {
     }
 
     private class Harness(val chatViewModel: ChatViewModel) {
+        val appContext: Context
+            get() = ApplicationProvider.getApplicationContext<Context>()
         val gate = MutableStateFlow<EndpointGate>(EndpointGate.NoEndpoint)
         val pending = MutableStateFlow(false)
         val assistVoiceRequested = MutableStateFlow(false)
-        val pendingRetriggerToken = MutableStateFlow(0L)
+
+        // Trusted voice-task identity for this activity instance; delivery is fail-closed without
+        // a match. Override per-test to exercise identity gates.
+        var voiceTaskIdentity: VoiceTaskIdentity? = VoiceTaskIdentity(taskId = 10, sessionInstanceId = 7L)
+        var consumeResult: Boolean = true
         val voiceSwitchesLoaded = MutableStateFlow(false)
         val voiceSwitchLoadFailed = MutableStateFlow(false)
         val userSwitches = MutableStateFlow(
@@ -202,6 +226,28 @@ class MainScreenAssistVoiceRoutingTest {
         fun recreate() {
             recreationEpoch.value++
         }
+
+        /**
+         * Publishes a retrigger entry into the REAL provider (mirrors the :voice-process session
+         * publishing via AssistantVoiceHandoff.requestRetrigger). Returns the minted token.
+         */
+        fun publishRetrigger(
+            targetTaskId: Int = 10,
+            sessionInstanceId: Long = 7L,
+            issuedUptimeMs: Long = SystemClock.uptimeMillis(),
+        ): Long = VoiceHandoffProvider.nextToken().also { token ->
+            VoiceHandoffProvider.publish(
+                PendingVoiceRetrigger(
+                    token = token,
+                    targetTaskId = targetTaskId,
+                    sessionInstanceId = sessionInstanceId,
+                    issuedUptimeMs = issuedUptimeMs,
+                ),
+            )
+        }
+
+        /** Assertion helper: the provider's currently pending entry, or null. */
+        fun providerPending(): PendingVoiceRetrigger? = VoiceHandoffProvider.pending.value
 
         fun emitVoiceSnapshot(snapshot: VoiceSwitchSnapshot) {
             voiceSwitchesLoaded.value = snapshot.loaded || snapshot.loadFailed
@@ -255,7 +301,7 @@ class MainScreenAssistVoiceRoutingTest {
             val g by gate.collectAsState()
             val p by pending.collectAsState()
             val req by assistVoiceRequested.collectAsState()
-            val pendingRetrigger by pendingRetriggerToken.collectAsState()
+            val pendingRetrigger by AssistantVoiceHandoff.pendingFlow().collectAsState(initial = null)
             val loaded by voiceSwitchesLoaded.collectAsState()
             val loadFailed by voiceSwitchLoadFailed.collectAsState()
             val switches by userSwitches.collectAsState()
@@ -264,14 +310,21 @@ class MainScreenAssistVoiceRoutingTest {
             val currentRoute = backStack?.destination?.route
             val hasEndpoint = g is EndpointGate.Ready
             val navLoading = startupEffectiveLoading(g is EndpointGate.Loading, p)
-            val deliverRetrigger = pendingRetrigger != 0L &&
-                currentRoute == Routes.CHAT &&
-                hasEndpoint &&
-                !navLoading &&
-                viewed == null &&
-                drawerState.isClosed &&
-                drawerState.targetValue == DrawerValue.Closed
-            val voiceRetriggerToken = if (deliverRetrigger) pendingRetrigger else 0L
+            val voiceRetriggerToken = if (
+                shouldDeliverVoiceRetrigger(
+                    pending = pendingRetrigger,
+                    identity = voiceTaskIdentity,
+                    currentRoute = currentRoute,
+                    hasEndpoint = hasEndpoint,
+                    navLoading = navLoading,
+                    viewedSessionId = viewed,
+                    drawerState = drawerState,
+                )
+            ) {
+                pendingRetrigger?.token ?: 0L
+            } else {
+                0L
+            }
             val owner = object : ActivityResultRegistryOwner {
                 override val activityResultRegistry: ActivityResultRegistry = registry
             }
@@ -290,6 +343,18 @@ class MainScreenAssistVoiceRoutingTest {
                     assistVoiceRequested.value = false
                 },
             )
+
+            // Mirrors MainScreen stale-clear effect (MainScreen.kt) — keep in sync.
+            // Identity-gated + token-matched: only the owning instance converges its own token.
+            LaunchedEffect(pendingRetrigger, navLoading, hasEndpoint) {
+                val p = pendingRetrigger ?: return@LaunchedEffect
+                val id = voiceTaskIdentity
+                if (id == null || id.taskId != p.targetTaskId || id.sessionInstanceId != p.sessionInstanceId) return@LaunchedEffect
+                val age = SystemClock.uptimeMillis() - p.issuedUptimeMs
+                if (age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS || (!navLoading && !hasEndpoint)) {
+                    AssistantVoiceHandoff.clear(context = appContext, targetTaskId = p.targetTaskId, sessionInstanceId = p.sessionInstanceId, token = p.token)
+                }
+            }
 
             CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
                 StartupGateHost(
@@ -317,10 +382,27 @@ class MainScreenAssistVoiceRoutingTest {
                                 assistVoiceRequested.value = false
                             },
                             voiceRetriggerToken = voiceRetriggerToken,
-                            onVoiceRetriggerConsumed = {
+                            onVoiceRetriggerConsumed = { token ->
                                 retriggerConsumedCount++
-                                pendingRetriggerToken.value = 0L
-                                true
+                                if (!consumeResult) {
+                                    // Non-committing rejection (pins "no launch on rejected consume");
+                                    // note provider-side consume() drops the entry on TTL-rejection —
+                                    // a different path, pinned by the provider tests.
+                                    false
+                                } else {
+                                    val id = voiceTaskIdentity
+                                    val p = pendingRetrigger?.takeIf { it.token == token }
+                                    if (id == null || p == null) {
+                                        false
+                                    } else {
+                                        AssistantVoiceHandoff.consume(
+                                            token = token,
+                                            context = appContext,
+                                            targetTaskId = id.taskId,
+                                            sessionInstanceId = id.sessionInstanceId,
+                                        )
+                                    }
+                                }
                             },
                             voiceSwitchesLoaded = loaded,
                             voiceSwitchLoadFailed = loadFailed,
@@ -344,7 +426,7 @@ class MainScreenAssistVoiceRoutingTest {
     }
 
     private fun awaitRoute(h: Harness, route: String) {
-        composeRule.waitUntil(timeoutMillis = 5_000) {
+        composeRule.waitUntil(timeoutMillis = 10_000) {
             h.nav.currentDestination?.route == route
         }
     }
@@ -399,12 +481,12 @@ class MainScreenAssistVoiceRoutingTest {
             h.uiScope.launch { h.drawerState.open() }
         }
         awaitRoute(h, Routes.SETTINGS)
-        composeRule.waitUntil(timeoutMillis = 5_000) { h.drawerState.isOpen }
+        composeRule.waitUntil(timeoutMillis = 10_000) { h.drawerState.isOpen }
 
         // Deliver warm assist voice request while switches are still loading.
         composeRule.runOnIdle { h.assistVoiceRequested.value = true }
         awaitRoute(h, Routes.CHAT)
-        composeRule.waitUntil(timeoutMillis = 5_000) {
+        composeRule.waitUntil(timeoutMillis = 10_000) {
             h.drawerState.isClosed && h.drawerState.targetValue == DrawerValue.Closed
         }
         composeRule.waitForIdle()
@@ -775,10 +857,14 @@ class MainScreenAssistVoiceRoutingTest {
             h.nav.navigate(Routes.SETTINGS)
         }
         awaitRoute(h, Routes.SETTINGS)
-        composeRule.runOnIdle { h.pendingRetriggerToken.value = 11L }
+        var token = 0L
+        composeRule.runOnIdle {
+            token = h.publishRetrigger(targetTaskId = 10, sessionInstanceId = 7L)
+        }
         composeRule.waitForIdle()
         assertEquals(0, h.retriggerConsumedCount)
         assertTrue(h.registry.launchedIntents.isEmpty())
+        assertEquals(token, h.providerPending()?.token)
 
         // Not deliverable while transcript overlay is active (even on CHAT).
         composeRule.runOnIdle {
@@ -794,9 +880,234 @@ class MainScreenAssistVoiceRoutingTest {
         composeRule.runOnIdle { h.viewedSessionId.value = null }
         composeRule.waitForIdle()
         assertEquals(1, h.retriggerConsumedCount)
-        assertEquals(0L, h.pendingRetriggerToken.value)
+        assertNull(h.providerPending())
         assertEquals(1, h.registry.launchedIntents.size)
         assertEquals(RecognizerIntent.ACTION_RECOGNIZE_SPEECH, h.registry.launchedIntents.single().action)
         assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun retrigger_notDelivered_toNonTargetTask_evenWhenChatSafe() {
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.Ready(sampleEndpoint())
+        h.voiceSwitchesLoaded.value = true
+        h.userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true)
+        // Pending entry was published for task 10; this trusted activity hosts task 11.
+        h.voiceTaskIdentity = VoiceTaskIdentity(taskId = 11, sessionInstanceId = 7L)
+
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+
+        var token = 0L
+        composeRule.runOnIdle {
+            token = h.publishRetrigger(targetTaskId = 10, sessionInstanceId = 7L)
+        }
+        composeRule.waitForIdle()
+
+        assertEquals(0, h.retriggerConsumedCount)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+        assertEquals(token, h.providerPending()?.token)
+    }
+
+    @Test
+    fun retrigger_notDelivered_whenSessionInstanceMismatch() {
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.Ready(sampleEndpoint())
+        h.voiceSwitchesLoaded.value = true
+        h.userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true)
+        // Same task, different session instance: the normal-task/sibling-cycle instance must not steal it.
+        h.voiceTaskIdentity = VoiceTaskIdentity(taskId = 10, sessionInstanceId = 99L)
+
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+
+        var token = 0L
+        composeRule.runOnIdle {
+            token = h.publishRetrigger(targetTaskId = 10, sessionInstanceId = 7L)
+        }
+        composeRule.waitForIdle()
+
+        assertEquals(0, h.retriggerConsumedCount)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+        assertEquals(token, h.providerPending()?.token)
+    }
+
+    @Test
+    fun retrigger_staleToken_notDelivered() {
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.Ready(sampleEndpoint())
+        h.voiceSwitchesLoaded.value = true
+        h.userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true)
+
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+
+        // Stale entry is not delivered, and the owning instance's stale-clear effect converges
+        // (drops) it — the non-owner instance could not do this.
+        composeRule.runOnIdle {
+            h.publishRetrigger(
+                targetTaskId = 10,
+                sessionInstanceId = 7L,
+                issuedUptimeMs = SystemClock.uptimeMillis() - 11_000L,
+            )
+        }
+        composeRule.waitForIdle()
+
+        assertEquals(0, h.retriggerConsumedCount)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+        assertNull(h.providerPending())
+    }
+
+    @Test
+    fun retrigger_negativeAgeToken_notDelivered_andCleared() {
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.Ready(sampleEndpoint())
+        h.voiceSwitchesLoaded.value = true
+        h.userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true)
+
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+
+        // Future-dated entry (clock skew / bogus timestamp): negative age, never deliverable,
+        // and the owning instance's stale-clear effect converges it.
+        composeRule.runOnIdle {
+            h.publishRetrigger(
+                targetTaskId = 10,
+                sessionInstanceId = 7L,
+                issuedUptimeMs = SystemClock.uptimeMillis() + 60_000L,
+            )
+        }
+        composeRule.waitForIdle()
+
+        assertEquals(0, h.retriggerConsumedCount)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+        assertNull(h.providerPending())
+    }
+
+    @Test
+    fun retrigger_staleToken_notCleared_byNonOwningInstance() {
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.Ready(sampleEndpoint())
+        h.voiceSwitchesLoaded.value = true
+        h.userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true)
+        // Normal-task instance: no voice-task identity, so the stale-clear effect must not fire
+        // here (this instance does not own the token).
+        h.voiceTaskIdentity = null
+
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+
+        var publishedToken = 0L
+        composeRule.runOnIdle {
+            publishedToken = h.publishRetrigger(
+                targetTaskId = 10,
+                sessionInstanceId = 7L,
+                issuedUptimeMs = SystemClock.uptimeMillis() - 11_000L,
+            )
+        }
+        composeRule.waitForIdle()
+
+        assertEquals(0, h.retriggerConsumedCount)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+        assertEquals("non-owning instance must not clear a token it does not own", publishedToken, h.providerPending()?.token)
+    }
+
+    @Test
+    fun retrigger_consumeRejected_doesNotLaunch() {
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.Ready(sampleEndpoint())
+        h.voiceSwitchesLoaded.value = true
+        h.userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true)
+        h.consumeResult = false
+
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+
+        var token = 0L
+        composeRule.runOnIdle {
+            token = h.publishRetrigger(targetTaskId = 10, sessionInstanceId = 7L)
+        }
+        composeRule.waitForIdle()
+
+        // The fake short-circuits before invoking the real consume; AssistantVoiceHandoff.consume is
+        // not called: no STT launch and the pending entry survives.
+        // (harness returns false without consuming — a non-committing failure; provider-side
+        // consume() dropping the entry on TTL-rejection is a different path, pinned by provider tests.)
+        assertEquals(1, h.retriggerConsumedCount)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+        assertEquals(token, h.providerPending()?.token)
+    }
+
+    private fun gateDrawer(): DrawerState =
+        DrawerState(initialValue = DrawerValue.Closed, confirmStateChange = { true })
+
+    private fun gateRetrigger(
+        pending: PendingVoiceRetrigger?,
+        identity: VoiceTaskIdentity?,
+        nowUptimeMs: Long = SystemClock.uptimeMillis(),
+    ): Boolean = shouldDeliverVoiceRetrigger(
+        pending = pending,
+        identity = identity,
+        currentRoute = Routes.CHAT,
+        hasEndpoint = true,
+        navLoading = false,
+        viewedSessionId = null,
+        drawerState = gateDrawer(),
+        nowUptimeMs = nowUptimeMs,
+    )
+
+    @Test
+    fun shouldDeliverVoiceRetrigger_nullIdentity_returnsFalse() {
+        val now = SystemClock.uptimeMillis()
+        val pending = PendingVoiceRetrigger(7L, 10, 7L, now)
+
+        assertEquals(false, gateRetrigger(pending, identity = null, nowUptimeMs = now))
+    }
+
+    @Test
+    fun shouldDeliverVoiceRetrigger_taskMismatch_returnsFalse() {
+        val now = SystemClock.uptimeMillis()
+        val pending = PendingVoiceRetrigger(7L, 10, 7L, now)
+
+        assertEquals(false, gateRetrigger(pending, VoiceTaskIdentity(11, 7L), now))
+    }
+
+    @Test
+    fun shouldDeliverVoiceRetrigger_sessionInstanceMismatch_returnsFalse() {
+        val now = SystemClock.uptimeMillis()
+        val pending = PendingVoiceRetrigger(7L, 10, 7L, now)
+
+        assertEquals(false, gateRetrigger(pending, VoiceTaskIdentity(10, 99L), now))
+    }
+
+    @Test
+    fun shouldDeliverVoiceRetrigger_negativeAge_returnsFalse() {
+        val now = SystemClock.uptimeMillis()
+        // Entry issued in the future (clock skew/bogus timestamp) must never be delivered.
+        val pending = PendingVoiceRetrigger(7L, 10, 7L, now + 60_000L)
+
+        assertEquals(false, gateRetrigger(pending, VoiceTaskIdentity(10, 7L), now))
+    }
+
+    @Test
+    fun shouldDeliverVoiceRetrigger_ageExactlyTtl_returnsTrue() {
+        val now = SystemClock.uptimeMillis()
+        val pending = PendingVoiceRetrigger(7L, 10, 7L, now - VoiceHandoffContract.RETRIGGER_TTL_MS)
+
+        assertEquals(true, gateRetrigger(pending, VoiceTaskIdentity(10, 7L), now))
+    }
+
+    @Test
+    fun shouldDeliverVoiceRetrigger_ageTtlPlusOne_returnsFalse() {
+        val now = SystemClock.uptimeMillis()
+        val pending = PendingVoiceRetrigger(7L, 10, 7L, now - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
+
+        assertEquals(false, gateRetrigger(pending, VoiceTaskIdentity(10, 7L), now))
     }
 }

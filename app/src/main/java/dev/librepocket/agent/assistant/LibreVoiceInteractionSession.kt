@@ -65,6 +65,14 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
     private var activeTaskId: Int? = null
     @Volatile
     private var sessionInstanceId: Long = 0L
+    /**
+     * Test seam: production delegates to [AssistantVoiceHandoff.requestRetrigger]; unit tests may
+     * substitute a counting/failing publisher to exercise IPC-outcome branches without a real
+     * cross-process provider. Not part of the public API surface.
+     */
+    internal var retriggerPublisher: (Context, Int, Long) -> Long =
+        { c, t, s -> AssistantVoiceHandoff.requestRetrigger(c, t, s) }
+
     @Volatile
     private var lastAcceptedShowUptimeMs: Long = 0L
 
@@ -95,10 +103,10 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
             }
             lastAcceptedShowUptimeMs = now
             try {
-                val token = AssistantVoiceHandoff.requestRetrigger(
-                    context = context,
-                    targetTaskId = activeTaskId!!,
-                    sessionInstanceId = sessionInstanceId,
+                val token = retriggerPublisher(
+                    context,
+                    activeTaskId!!,
+                    sessionInstanceId,
                 )
                 if (token == 0L) {
                     Log.w(TAG, "voice retrigger publish failed; allowing immediate retry gesture")
@@ -193,7 +201,14 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
         activeTaskId = null
         sessionInstanceId = 0L
         if (sid != 0L || taskId != Int.MIN_VALUE) {
-            AssistantVoiceHandoff.clear(context = context, targetTaskId = taskId, sessionInstanceId = sid)
+            // Long.MIN_VALUE is the handoff/provider "unspecified" sentinel for sessionInstanceId:
+            // treating a missing sid as "0L matches only sid 0" would silently match nothing; the
+            // sentinel wildcard-matches any sid instead. Task axis stays Int.MIN_VALUE.
+            AssistantVoiceHandoff.clear(
+                context = context,
+                targetTaskId = taskId,
+                sessionInstanceId = if (sid == 0L) Long.MIN_VALUE else sid,
+            )
         }
         // Nothing tracked: clear nothing (no clearAll — would wipe a newer/pending gesture token).
     }

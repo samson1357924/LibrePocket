@@ -2,7 +2,10 @@ package dev.librepocket.agent
 
 import android.content.Intent
 import android.os.Bundle
+import dev.librepocket.agent.assistant.AssistantVoice
+import dev.librepocket.agent.assistant.VoiceTaskIdentity
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -172,6 +175,74 @@ class MainActivityEntryLifecycleTest {
             assertEquals(true, activity.pendingVoice)
         } finally {
             destroy(controller)
+        }
+    }
+
+    @Test
+    fun voiceIdentity_mintedFromTrustedAssistWithSessionExtra() {
+        val controller = launch(assistVoiceIntentWithSid(42L))
+        try {
+            val identity = controller.get().capturedVoiceIdentity
+            assertNotNull("trusted ASSIST with session sid must bind a voice identity", identity)
+            assertEquals(42L, identity!!.sessionInstanceId)
+            assertEquals(controller.get().exposedTaskId, identity.taskId)
+        } finally {
+            destroy(controller)
+        }
+    }
+
+    @Test
+    fun voiceIdentity_nullWithoutSessionExtra() {
+        val controller = launch(assistVoiceIntent())
+        try {
+            assertNull("session-less ASSIST must not bind a retrigger identity", controller.get().capturedVoiceIdentity)
+        } finally {
+            destroy(controller)
+        }
+    }
+
+    @Test
+    fun voiceIdentity_nullWhenSessionInstanceIdIsExplicitZero() {
+        // 0L is the "unspecified" sentinel on both the intent extra and the saved-state key:
+        // an explicit zero must unbind, not bind a zero sid.
+        val controller = launch(assistVoiceIntentWithSid(0L))
+        try {
+            assertNull("ASSIST with sid == 0L must not bind a retrigger identity", controller.get().capturedVoiceIdentity)
+        } finally {
+            destroy(controller)
+        }
+    }
+
+    @Test
+    fun voiceIdentity_nullWhenUntrustedSessionEvenWithSidExtra() {
+        val controller = launch(assistVoiceIntentWithSid(42L), trustedVoiceSession = false)
+        try {
+            assertNull("untrusted session must not bind a retrigger identity", controller.get().capturedVoiceIdentity)
+        } finally {
+            destroy(controller)
+        }
+    }
+
+    @Test
+    fun voiceIdentity_restoredAfterRecreationWithSameSid() {
+        val first = launch(assistVoiceIntentWithSid(42L))
+        val savedState = Bundle()
+        try {
+            assertEquals(42L, first.get().capturedVoiceIdentity?.sessionInstanceId)
+            first.saveInstanceState(savedState)
+        } finally {
+            destroy(first)
+        }
+
+        // Rotation: sid persists via saved state (taskId is intentionally re-bound to the
+        // recreated activity's current task, never restored from the bundle).
+        val recreated = recreate(assistVoiceIntentWithSid(42L), savedState)
+        try {
+            val identity = recreated.get().capturedVoiceIdentity
+            assertNotNull("restored trusted session must keep the saved sid", identity)
+            assertEquals(42L, identity!!.sessionInstanceId)
+        } finally {
+            destroy(recreated)
         }
     }
 
@@ -399,7 +470,10 @@ class MainActivityEntryLifecycleTest {
         .putExtra(Intent.EXTRA_TEXT, text)
 
     private fun assistVoiceIntent() = Intent(Intent.ACTION_ASSIST)
-        .putExtra(dev.librepocket.agent.assistant.AssistantVoice.EXTRA_VOICE_INPUT, true)
+        .putExtra(AssistantVoice.EXTRA_VOICE_INPUT, true)
+
+    private fun assistVoiceIntentWithSid(sid: Long) = assistVoiceIntent()
+        .putExtra(AssistantVoice.EXTRA_SESSION_INSTANCE_ID, sid)
 }
 
 /** Captures MainActivity's existing acknowledgement callback without product composition. */
@@ -410,6 +484,7 @@ open class FakeDispatchMainActivity : MainActivity() {
     private lateinit var onVoiceInputConsumed: () -> Unit
     val deliveries = mutableListOf<String>()
     var trustedVoiceSession: Boolean = true
+    var capturedVoiceIdentity: VoiceTaskIdentity? = null
 
     override fun isTrustedVoiceSession(): Boolean = trustedVoiceSession
 
@@ -418,12 +493,17 @@ open class FakeDispatchMainActivity : MainActivity() {
         onSharedConsumed: () -> Unit,
         voiceInputRequested: () -> Boolean,
         onVoiceInputConsumed: () -> Unit,
+        voiceTaskIdentity: VoiceTaskIdentity?,
     ) {
         this.sharedText = sharedText
         this.onSharedConsumed = onSharedConsumed
         this.voiceInputRequested = voiceInputRequested
         this.onVoiceInputConsumed = onVoiceInputConsumed
+        this.capturedVoiceIdentity = voiceTaskIdentity
     }
+
+    val exposedTaskId: Int
+        get() = currentTaskId()
 
     val pendingText: String?
         get() = sharedText()
@@ -455,6 +535,7 @@ class DefaultTrustFakeMainActivity : MainActivity() {
         onSharedConsumed: () -> Unit,
         voiceInputRequested: () -> Boolean,
         onVoiceInputConsumed: () -> Unit,
+        voiceTaskIdentity: VoiceTaskIdentity?,
     ) {
         this.voiceInputRequested = voiceInputRequested
     }

@@ -9,6 +9,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -20,6 +21,13 @@ import java.time.Duration
 @Config(sdk = [33])
 class LibreVoiceInteractionSessionTest {
 
+    @Before
+    fun setUp() {
+        AssistantVoiceHandoff.clear()
+        VoiceHandoffProvider.resetForTest()
+        ShadowSystemClock.reset()
+    }
+
     @After
     fun tearDown() {
         AssistantVoiceHandoff.clear()
@@ -30,14 +38,12 @@ class LibreVoiceInteractionSessionTest {
     private class RecordingVoiceSession(
         context: Context,
         private val throwOnStart: Boolean = false,
-        private val throwOnStartAt: Int? = null,
     ) : LibreVoiceInteractionSession(context) {
         val uiEnabledCalls = mutableListOf<Boolean>()
         val startedIntents = mutableListOf<Intent>()
         val startedTaskIds = mutableListOf<Int>()
         val keepAwakeCalls = mutableListOf<Boolean>()
         var hideCalls = 0
-        private var startAttempts = 0
 
         override fun setUiEnabled(enabled: Boolean) {
             uiEnabledCalls += enabled
@@ -48,11 +54,10 @@ class LibreVoiceInteractionSessionTest {
         }
 
         override fun startVoiceActivity(intent: Intent?) {
-            startAttempts++
             if (intent != null) {
                 startedIntents += intent
             }
-            if (throwOnStart || throwOnStartAt == startAttempts) {
+            if (throwOnStart) {
                 throw RuntimeException("simulated startVoiceActivity failure")
             }
         }
@@ -350,6 +355,114 @@ class LibreVoiceInteractionSessionTest {
         session.onTaskFinished(null, 20)
         assertEquals(2, session.hideCalls)
         assertTrue(session.keepAwakeCalls.contains(false))
+    }
+
+    @Test
+    fun retriggerPublishFailure_resetsDebounceSoImmediateRetryIsAccepted() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val session = RecordingVoiceSession(context)
+        val defaultPublisher = session.retriggerPublisher
+        var publisherCalls = 0
+        session.retriggerPublisher = { _, _, _ ->
+            publisherCalls++
+            0L // simulated IPC/publish failure
+        }
+        try {
+            session.onShow(null, 0)
+            session.onTaskStarted(null, 10)
+
+            ShadowSystemClock.advanceBy(Duration.ofMillis(1000))
+            session.onShow(null, 0)
+            assertEquals(1, publisherCalls)
+
+            // A failed publish must not stick the debounce: the very next gesture retries immediately.
+            session.onShow(null, 0)
+            assertEquals(2, publisherCalls)
+            assertEquals(0, session.hideCalls)
+        } finally {
+            session.retriggerPublisher = defaultPublisher
+        }
+    }
+
+    @Test
+    fun retriggerPublishSuccess_appliesDebounceWithBoundary() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val session = RecordingVoiceSession(context)
+        val defaultPublisher = session.retriggerPublisher
+        var publisherCalls = 0
+        session.retriggerPublisher = { _, _, _ ->
+            publisherCalls++
+            4242L // publish accepted with a real token
+        }
+        try {
+            session.onShow(null, 0)
+            session.onTaskStarted(null, 10)
+
+            ShadowSystemClock.advanceBy(Duration.ofMillis(1000))
+            session.onShow(null, 0)
+            assertEquals(1, publisherCalls)
+
+            // Inside the 350ms duplicate window: coalesced, no publish.
+            session.onShow(null, 0)
+            assertEquals(1, publisherCalls)
+
+            ShadowSystemClock.advanceBy(Duration.ofMillis(349))
+            session.onShow(null, 0)
+            assertEquals(1, publisherCalls)
+
+            ShadowSystemClock.advanceBy(Duration.ofMillis(1)) // exactly 350ms since accepted retrigger
+            session.onShow(null, 0)
+            assertEquals(2, publisherCalls)
+        } finally {
+            session.retriggerPublisher = defaultPublisher
+        }
+    }
+
+    @Test
+    fun onHide_thenOnShow_startsFreshCycle() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val session = RecordingVoiceSession(context)
+
+        session.onShow(null, 0)
+        val firstSid = session.startedIntents.single()
+            .getLongExtra(AssistantVoice.EXTRA_SESSION_INSTANCE_ID, 0L)
+        assertNotEquals(0L, firstSid)
+
+        session.onHide()
+        session.onShow(null, 0)
+
+        assertEquals(2, session.startedIntents.size)
+        assertEquals(0, session.hideCalls)
+        val secondSid = session.startedIntents[1]
+            .getLongExtra(AssistantVoice.EXTRA_SESSION_INSTANCE_ID, 0L)
+        assertTrue("fresh cycle must mint a new session instance id", secondSid > firstSid)
+    }
+
+    @Test
+    fun onTaskFinished_twice_hidesOnce() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val session = RecordingVoiceSession(context)
+
+        session.onShow(null, 0)
+        session.onTaskStarted(null, 42)
+        session.onTaskFinished(null, 42)
+        session.onTaskFinished(null, 42)
+
+        assertEquals(1, session.hideCalls)
+        assertEquals(false, session.keepAwakeCalls.last())
+    }
+
+    @Test
+    fun onHide_afterTaskFinished_noDoubleFinish() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val session = RecordingVoiceSession(context)
+
+        session.onShow(null, 0)
+        session.onTaskStarted(null, 42)
+        session.onTaskFinished(null, 42)
+        session.onHide()
+
+        assertEquals(1, session.hideCalls)
     }
 
     @Test

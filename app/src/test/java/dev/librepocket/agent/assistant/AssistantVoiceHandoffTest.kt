@@ -1,0 +1,253 @@
+package dev.librepocket.agent.assistant
+
+import android.content.ContentProvider
+import android.content.ContentValues
+import android.content.Context
+import android.content.pm.ProviderInfo
+import android.database.Cursor
+import android.net.Uri
+import android.os.Bundle
+import android.os.SystemClock
+import androidx.test.core.app.ApplicationProvider
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowContentResolver
+import org.robolectric.shadows.ShadowSystemClock
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [33])
+class AssistantVoiceHandoffTest {
+
+    private val appContext: Context
+        get() = ApplicationProvider.getApplicationContext<Context>()
+
+    @Before
+    fun setUp() {
+        VoiceHandoffProvider.resetForTest()
+        ShadowSystemClock.reset()
+    }
+
+    @After
+    fun tearDown() {
+        VoiceHandoffProvider.resetForTest()
+        ShadowSystemClock.reset()
+    }
+
+    /** Swaps the manifest-declared handoff provider for [replacement] (probe: replacement wins). */
+    private fun swapHandoffProvider(replacement: ContentProvider) {
+        val info = ProviderInfo().apply { authority = authority() }
+        replacement.attachInfo(appContext, info)
+        ShadowContentResolver.registerProviderInternal(authority(), replacement)
+    }
+
+    /** Restores a fresh real provider after [swapHandoffProvider] (registration persists per sandbox). */
+    private fun restoreManifestProvider() {
+        val fresh = VoiceHandoffProvider()
+        val info = ProviderInfo().apply { authority = authority() }
+        fresh.attachInfo(appContext, info)
+        ShadowContentResolver.registerProviderInternal(authority(), fresh)
+    }
+
+    private fun authority(): String = "${appContext.packageName}.voice.handoff"
+
+    /** Provider stub whose call() returns null for METHOD_PUBLISH: simulates a publish with no ack. */
+    private class NullAckProvider : ContentProvider() {
+        override fun onCreate(): Boolean = true
+
+        override fun call(method: String, arg: String?, extras: Bundle?): Bundle? =
+            if (method == VoiceHandoffContract.METHOD_PUBLISH) null else throw RuntimeException("unexpected call: $method")
+
+        override fun query(
+            uri: Uri,
+            projection: Array<out String>?,
+            selection: String?,
+            selectionArgs: Array<out String>?,
+            sortOrder: String?,
+        ): Cursor? = null
+
+        override fun getType(uri: Uri): String? = null
+        override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+        override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+        override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
+    }
+
+    /** Provider stub whose call() throws for every method: simulates an IPC/publish failure. */
+    private class ThrowingProvider : ContentProvider() {
+        override fun onCreate(): Boolean = true
+
+        override fun call(method: String, arg: String?, extras: Bundle?): Bundle? =
+            throw RuntimeException("boom from $method")
+
+        override fun query(
+            uri: Uri,
+            projection: Array<out String>?,
+            selection: String?,
+            selectionArgs: Array<out String>?,
+            sortOrder: String?,
+        ): Cursor? = null
+
+        override fun getType(uri: Uri): String? = null
+        override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+        override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+        override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
+    }
+
+    private fun seedPending(token: Long, issuedUptimeMs: Long, targetTaskId: Int = 10, sessionInstanceId: Long = 7L) {
+        assertTrue(
+            VoiceHandoffProvider.publish(
+                PendingVoiceRetrigger(
+                    token = token,
+                    targetTaskId = targetTaskId,
+                    sessionInstanceId = sessionInstanceId,
+                    issuedUptimeMs = issuedUptimeMs,
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun requestRetrigger_success_returnsNonzeroToken_andPublishes() {
+        val token = AssistantVoiceHandoff.requestRetrigger(appContext, targetTaskId = 10, sessionInstanceId = 7L)
+
+        assertNotEquals(0L, token)
+        val pending = AssistantVoiceHandoff.currentPending(appContext)
+        assertNotNull("successful publish must be visible to the facade", pending)
+        assertEquals(token, pending?.token)
+        assertEquals(10, pending?.targetTaskId)
+        assertEquals(7L, pending?.sessionInstanceId)
+    }
+
+    @Test
+    fun requestRetrigger_failure_returnsZero_andLeavesSameCycleOlderToken() {
+        // Pre-seed an older pending entry from the same session cycle (10/7L, different token);
+        // the failure cleanup must not wipe it.
+        seedPending(token = 999L, issuedUptimeMs = SystemClock.uptimeMillis(), targetTaskId = 10, sessionInstanceId = 7L)
+
+        // Probe-verified: registering a replacement provider under the manifest authority replaces
+        // dispatch, so this models "IPC blew up" deterministically for the publish call.
+        swapHandoffProvider(ThrowingProvider())
+        try {
+            val token = AssistantVoiceHandoff.requestRetrigger(appContext, targetTaskId = 10, sessionInstanceId = 7L)
+
+            assertEquals(0L, token)
+            assertEquals("token-matched cleanup must not wipe an older pending token from the same session cycle", 999L, VoiceHandoffProvider.pending.value?.token)
+            assertEquals(999L, AssistantVoiceHandoff.currentPending(appContext)?.token)
+        } finally {
+            restoreManifestProvider()
+        }
+    }
+
+    @Test
+    fun requestRetrigger_nullAck_returnsZero_andLeavesSameCycleOlderToken() {
+        // Pre-seed an older pending entry from the same session cycle (10/7L, different token);
+        // the null-ack cleanup must not wipe it.
+        seedPending(token = 999L, issuedUptimeMs = SystemClock.uptimeMillis(), targetTaskId = 10, sessionInstanceId = 7L)
+
+        // Probe-verified: registering a replacement provider under the manifest authority replaces
+        // dispatch, so this models "publish with no ack" deterministically for the publish call.
+        swapHandoffProvider(NullAckProvider())
+        try {
+            val token = AssistantVoiceHandoff.requestRetrigger(appContext, targetTaskId = 10, sessionInstanceId = 7L)
+
+            assertEquals(0L, token)
+            assertEquals("token-matched cleanup must not wipe an older pending token from the same session cycle", 999L, VoiceHandoffProvider.pending.value?.token)
+            assertEquals(999L, AssistantVoiceHandoff.currentPending(appContext)?.token)
+        } finally {
+            restoreManifestProvider()
+        }
+    }
+
+    @Test
+    fun currentPending_filtersExpiredAndFutureEntries() {
+        val now = SystemClock.uptimeMillis()
+
+        // Expired (older than RETRIGGER_TTL_MS).
+        seedPending(token = 1L, issuedUptimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
+        assertNull(AssistantVoiceHandoff.currentPending(appContext))
+
+        // Future-dated (clock skew / bogus timestamp): negative age, treated as absent.
+        VoiceHandoffProvider.resetForTest()
+        seedPending(token = 2L, issuedUptimeMs = SystemClock.uptimeMillis() + 5_000L)
+        assertNull(AssistantVoiceHandoff.currentPending(appContext))
+
+        // Fresh entry within TTL: visible.
+        VoiceHandoffProvider.resetForTest()
+        seedPending(token = 3L, issuedUptimeMs = SystemClock.uptimeMillis())
+        assertEquals(3L, AssistantVoiceHandoff.currentPending(appContext)?.token)
+    }
+
+    @Test
+    fun consume_withMatchingAndMismatchedIdentity() {
+        val token = AssistantVoiceHandoff.requestRetrigger(appContext, targetTaskId = 10, sessionInstanceId = 7L)
+        assertNotEquals(0L, token)
+
+        // Wrong taskId: rejected, entry survives.
+        assertFalse(AssistantVoiceHandoff.consume(token, appContext, targetTaskId = 11, sessionInstanceId = 7L))
+        assertEquals(token, AssistantVoiceHandoff.currentPending(appContext)?.token)
+
+        // Matching identity: consumed.
+        assertTrue(AssistantVoiceHandoff.consume(token, appContext, targetTaskId = 10, sessionInstanceId = 7L))
+        assertNull(AssistantVoiceHandoff.currentPending(appContext))
+
+        // Already consumed: false.
+        assertFalse(AssistantVoiceHandoff.consume(token, appContext, targetTaskId = 10, sessionInstanceId = 7L))
+    }
+
+    // Note on the spec's literal "consume(T1) == true after publishing T1 then T2": impossible with a
+    // single pending slot (T2 overwrites T1). The pinned property here is that stale-token
+    // consume/clear never touches the newer entry; the "consuming a token succeeds exactly once"
+    // half is pinned in the second half of this test.
+    @Test
+    fun consumeAndClear_areTokenMatched_staleTokensNeverHitNewerEntry() {
+        // Single pending slot: publishing T2 overwrites T1 (same target/sid).
+        val t1 = AssistantVoiceHandoff.requestRetrigger(appContext, targetTaskId = 10, sessionInstanceId = 7L)
+        val t2 = AssistantVoiceHandoff.requestRetrigger(appContext, targetTaskId = 10, sessionInstanceId = 7L)
+        assertNotEquals(0L, t1)
+        assertNotEquals(0L, t2)
+        assertNotEquals(t1, t2)
+        assertEquals(t2, AssistantVoiceHandoff.currentPending(appContext)?.token)
+
+        // Consuming the stale token T1 fails and must not hit T2.
+        assertFalse(AssistantVoiceHandoff.consume(t1, appContext, targetTaskId = 10, sessionInstanceId = 7L))
+        assertEquals(t2, AssistantVoiceHandoff.currentPending(appContext)?.token)
+
+        // Clearing with the stale token T1 leaves T2 intact.
+        AssistantVoiceHandoff.clear(context = appContext, targetTaskId = 10, sessionInstanceId = 7L, token = t1)
+        assertEquals(t2, AssistantVoiceHandoff.currentPending(appContext)?.token)
+
+        // Clearing with the matching token removes T2.
+        AssistantVoiceHandoff.clear(context = appContext, targetTaskId = 10, sessionInstanceId = 7L, token = t2)
+        assertNull(AssistantVoiceHandoff.currentPending(appContext))
+
+        // Second half: consuming T1 succeeds once while it is current, then a clear with the
+        // already-consumed T1 still must not hit the newer T2.
+        VoiceHandoffProvider.resetForTest()
+        val c1 = AssistantVoiceHandoff.requestRetrigger(appContext, targetTaskId = 10, sessionInstanceId = 7L)
+        assertTrue(AssistantVoiceHandoff.consume(c1, appContext, targetTaskId = 10, sessionInstanceId = 7L))
+        val c2 = AssistantVoiceHandoff.requestRetrigger(appContext, targetTaskId = 10, sessionInstanceId = 7L)
+        assertEquals(c2, AssistantVoiceHandoff.currentPending(appContext)?.token)
+        AssistantVoiceHandoff.clear(context = appContext, targetTaskId = 10, sessionInstanceId = 7L, token = c1)
+        assertEquals(c2, AssistantVoiceHandoff.currentPending(appContext)?.token)
+        AssistantVoiceHandoff.clear(context = appContext, targetTaskId = 10, sessionInstanceId = 7L, token = c2)
+        assertNull(AssistantVoiceHandoff.currentPending(appContext))
+    }
+
+    @Test
+    fun consume_withSeededExpiredEntry_returnsFalseAndDropsEntry() {
+        val now = SystemClock.uptimeMillis()
+        seedPending(token = 777L, issuedUptimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
+
+        assertFalse(AssistantVoiceHandoff.consume(777L, appContext, targetTaskId = 10, sessionInstanceId = 7L))
+        assertNull("expired entry must be dropped on consume attempt", VoiceHandoffProvider.pending.value)
+    }
+}

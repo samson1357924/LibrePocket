@@ -115,15 +115,6 @@ class VoiceSttTest {
         assertEquals("android.speech.action.RECOGNIZE_SPEECH", VoiceStt.ACTION)
     }
 
-    @Test fun sttProbe_usesMatchDefaultOnly() {
-        // B1：探測只認 DEFAULT 可處理的辨識服務（見 ChatScreen.launchSystemStt）。
-        val chatScreen = findSource(
-            "src/main/java/dev/librepocket/agent/ui/chat/ChatScreen.kt",
-            "app/src/main/java/dev/librepocket/agent/ui/chat/ChatScreen.kt",
-        ).readText()
-        assertTrue(chatScreen.contains("MATCH_DEFAULT_ONLY"))
-    }
-
     // ---- voice.transcribe 投影（系統委託；B2 後 Azure 不再碰 STT） ----
 
     @Test fun transcribeIsReadWithInputSwitchDefaultOn() {

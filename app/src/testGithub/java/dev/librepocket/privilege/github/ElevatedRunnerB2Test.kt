@@ -213,7 +213,7 @@ class ElevatedRunnerB2Test {
         execAllowedRoots = hermeticExec!!.allowedRoots,
         execIsWritable = hermeticExec!!.systemOwned,
 )
-        val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 120L)
+        val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 500L)
         assertTrue("$r", r is ShellResult.TimedOut)
         assertEquals(1, kills)
         assertTrue((lastVictim as? FakeProcess)?.destroyed == true)

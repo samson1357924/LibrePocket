@@ -133,6 +133,11 @@ class WebSearchViewModel(
     private val pendingUrlWrite = java.util.concurrent.atomic.AtomicReference<StoreCommand.UrlWrite?>()
     /** At most one [StoreCommand.UrlFlush] marker queued when a URL draft is pending. */
     private val urlFlushQueued = java.util.concurrent.atomic.AtomicBoolean(false)
+    /**
+     * ResetAll barrier queued but not yet applied. Used so a pre-barrier UrlFlush
+     * marker cannot consume/persist a draft authored after ResetAll was enqueued.
+     */
+    private val pendingResetBarrier = java.util.concurrent.atomic.AtomicReference<StoreCommand.ResetAll?>()
 
     private val probeGen = AtomicLong(0L)
     private var probeJob: Job? = null
@@ -309,11 +314,23 @@ class WebSearchViewModel(
                 when (cmd) {
                     is StoreCommand.UrlFlush -> {
                         // Consume latest conflated draft; if new drafts arrived during
-                        // handling, loop until stable (slot stays O(1)).
+                        // handling, loop until stable (slot stays O(1)). A pre-barrier
+                        // flush marker must not consume a draft authored after a queued
+                        // ResetAll barrier (post-reset draft).
                         while (true) {
                             urlFlushQueued.set(false)
                             val latest = pendingUrlWrite.getAndSet(null)
                             if (latest != null) {
+                                val barrier = pendingResetBarrier.get()
+                                val isPostResetDraft =
+                                    barrier != null &&
+                                        latest.resetGeneration == barrier.resetGeneration &&
+                                        latest.draftVersion > barrier.draftVersion
+                                if (isPostResetDraft) {
+                                    // Leave post-reset draft for processing after ResetAll.
+                                    pendingUrlWrite.compareAndSet(null, latest)
+                                    break
+                                }
                                 handleCommand(latest)
                                 if (pendingUrlWrite.get() == null) break
                                 // A newer draft arrived while handling; re-mark and continue.
@@ -750,7 +767,10 @@ class WebSearchViewModel(
             }
         }
         syncUi(preNext)
-        if (!shouldRun) return
+        if (!shouldRun) {
+            pendingResetBarrier.compareAndSet(cmd, null)
+            return
+        }
 
         try {
             withContext(NonCancellable) {
@@ -798,6 +818,19 @@ class WebSearchViewModel(
                 }
             }
             syncUi(errNext)
+        } finally {
+            pendingResetBarrier.compareAndSet(cmd, null)
+            // A draft authored after this reset barrier must survive the reset.
+            // If it was deferred because a pre-barrier UrlFlush marker was consumed,
+            // persist it now in-order.
+            val postResetDraft = pendingUrlWrite.get()
+            if (postResetDraft != null &&
+                postResetDraft.resetGeneration == cmd.resetGeneration &&
+                postResetDraft.draftVersion > cmd.draftVersion &&
+                pendingUrlWrite.compareAndSet(postResetDraft, null)
+            ) {
+                handleUrlWrite(postResetDraft)
+            }
         }
     }
 
@@ -1000,13 +1033,20 @@ class WebSearchViewModel(
 
     fun onResetSettings() {
         var oldProbe: Job? = null
-        val next = updateStateAndCommand { cur ->
+        var resetCmd: StoreCommand.ResetAll? = null
+        val next = updateState { cur ->
             if (!canMutateWith(cur) || cur.consentSubmitting) {
-                cur to null
+                cur
             } else {
                 oldProbe = cancelProbeLocked()
                 val rGen = cur.resetGeneration + 1
                 val ver = cur.draftVersion + 1
+                resetCmd = StoreCommand.ResetAll(draftVersion = ver, resetGeneration = rGen)
+                // Drop any stale pre-reset URL draft; post-reset drafts are authored
+                // after this state transition and must survive the barrier.
+                pendingUrlWrite.updateAndGet { pending ->
+                    if (pending != null && pending.resetGeneration < rGen) null else pending
+                }
                 cur.copy(
                     resetGeneration = rGen,
                     draftVersion = ver,
@@ -1018,7 +1058,18 @@ class WebSearchViewModel(
                     pendingConsentReopenSeq = -1L,
                     pendingConsentReopenGen = -1L,
                     writeError = null,
-                ) to StoreCommand.ResetAll(draftVersion = ver, resetGeneration = rGen)
+                )
+            }
+        }
+        val cmd = resetCmd
+        if (cmd != null) {
+            pendingResetBarrier.set(cmd)
+            val sent = storeCommandChannel.trySend(cmd)
+            if (sent.isFailure) {
+                pendingResetBarrier.compareAndSet(cmd, null)
+                if (!next.isCleared) {
+                    runCatching { Log.w(TAG, "web store command rejected unexpectedly") }
+                }
             }
         }
         oldProbe?.cancel()

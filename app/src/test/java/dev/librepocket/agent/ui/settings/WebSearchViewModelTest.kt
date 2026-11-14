@@ -1355,6 +1355,91 @@ class WebSearchViewModelTest {
     }
 
     @Test
+    fun resetQueuedNotYetDequeued_postResetDraftSurvives_withoutWorkerDispatch() = runTest {
+        val fakeDs = FakePreferencesDataStore(
+            prefs(master = true, ddgs = true, consent = true, url = "https://old.example"),
+        )
+        val vm = installStandardVm(fakeDs)
+        val collector = collectUi(vm)
+        vm.uiState.first { !it.isLoading }
+
+        // All enqueued before worker dispatch: UrlFlush(A), ResetAll(gen1), pending=B(gen1,no marker).
+        vm.onSearxngUrlChange("https://a.example")
+        vm.onResetSettings()
+        vm.onSearxngUrlChange("https://b.example")
+
+        advanceUntilIdle()
+
+        assertEquals("https://b.example", fakeDs.currentUrl())
+        assertEquals("https://b.example", vm.uiState.value.searxngUrl)
+        assertFalse(fakeDs.writtenUrls.contains("https://a.example"))
+        assertFalse(fakeDs.currentMaster())
+        assertFalse(fakeDs.currentDdgs())
+        assertFalse(fakeDs.currentConsent())
+        collector.cancel()
+    }
+
+    @Test
+    fun inFlightUrlWrite_resetQueued_postResetDraftWins_andPersistsAcrossRecreation() = runTest {
+        val firstWriteEntered = CompletableDeferred<Unit>()
+        val firstWriteGate = CompletableDeferred<Unit>()
+        val fakeDs = FakePreferencesDataStore(
+            prefs(master = true, ddgs = true, consent = true, url = "https://old.example"),
+        ).apply {
+            beforeWrite = { idx ->
+                if (idx == 1) {
+                    firstWriteEntered.complete(Unit)
+                    firstWriteGate.await()
+                }
+            }
+        }
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        Dispatchers.setMain(dispatcher)
+        trackScheduler()
+        val ioDispatcher = dispatcher
+        val store = WebSwitchStore(fakeDs, ioDispatcher)
+        val vmStore = trackStore(ViewModelStore())
+        val factory = object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                return WebSearchViewModel(store, ioDispatcher) as T
+            }
+        }
+        val vm = ViewModelProvider(vmStore, factory)[WebSearchViewModel::class.java]
+        val collector = collectUi(vm)
+        vm.uiState.first { !it.isLoading }
+
+        vm.onSearxngUrlChange("https://a.example")
+        runCurrent()
+        firstWriteEntered.await()
+
+        // Reset queued while A is in-flight, then post-reset draft B arrives.
+        vm.onResetSettings()
+        vm.onSearxngUrlChange("https://b.example")
+        runCurrent()
+        assertEquals("https://b.example", vm.uiState.value.searxngUrl)
+
+        firstWriteGate.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals("https://b.example", fakeDs.currentUrl())
+        assertEquals("https://b.example", vm.uiState.value.searxngUrl)
+        assertFalse(fakeDs.currentMaster())
+        assertFalse(fakeDs.currentDdgs())
+        assertFalse(fakeDs.currentConsent())
+        collector.cancel()
+
+        // Recreate VM over same persisted store state: post-reset draft must survive.
+        val vmStore2 = trackStore(ViewModelStore())
+        val vm2 = ViewModelProvider(vmStore2, factory)[WebSearchViewModel::class.java]
+        val collector2 = collectUi(vm2)
+        vm2.uiState.first { !it.isLoading }
+        assertEquals("https://b.example", vm2.uiState.value.searxngUrl)
+        assertEquals("https://b.example", fakeDs.currentUrl())
+        collector2.cancel()
+    }
+
+    @Test
     fun onResetSettings_failureRestoresPersistedSearxngUrl() = runTest {
         val fakeDs = FakePreferencesDataStore(
             prefs(master = true, ddgs = true, consent = true, url = "https://search.example"),

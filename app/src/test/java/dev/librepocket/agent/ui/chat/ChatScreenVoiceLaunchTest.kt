@@ -28,6 +28,7 @@ import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.lifecycle.ViewModelStore
 import androidx.test.core.app.ApplicationProvider
 import dev.librepocket.agent.ui.setup.EndpointConfig
+import dev.librepocket.agent.assistant.VoiceHandoffProvider
 import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
@@ -88,6 +89,7 @@ class ChatScreenVoiceLaunchTest {
     @Before
     fun setUp() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
+        VoiceHandoffProvider.resetForTest()
     }
 
     @After
@@ -101,6 +103,7 @@ class ChatScreenVoiceLaunchTest {
                 try {
                     tmpDirs.forEach { it.deleteRecursively() }
                 } finally {
+                    VoiceHandoffProvider.resetForTest()
                     Dispatchers.resetMain()
                 }
             }
@@ -718,6 +721,7 @@ class ChatScreenVoiceLaunchTest {
                     onVoiceRetriggerConsumed = {
                         consumed += it
                         retriggerToken.value = 0L
+                        true
                     },
                 )
             }
@@ -765,6 +769,7 @@ class ChatScreenVoiceLaunchTest {
                     onVoiceRetriggerConsumed = {
                         consumed += it
                         retriggerToken.value = 0L
+                        true
                     },
                 )
             }

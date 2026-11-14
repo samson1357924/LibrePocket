@@ -23,6 +23,7 @@ class LibreVoiceInteractionSessionTest {
     @After
     fun tearDown() {
         AssistantVoiceHandoff.clear()
+        VoiceHandoffProvider.resetForTest()
         ShadowSystemClock.reset()
     }
 
@@ -134,11 +135,11 @@ class LibreVoiceInteractionSessionTest {
         assertEquals(1, session.startedIntents.size)
         session.onTaskStarted(null, 10)
 
-        // Immediate duplicate dispatch while handoff/token debounce window is active: coalesce.
+        // Immediate duplicate dispatch within debounce window: coalesce (no retrigger handoff).
         session.onShow(null, 0)
         assertEquals(1, session.startedIntents.size)
         assertEquals(0, session.hideCalls)
-        assertEquals(0L, AssistantVoiceHandoff.peek())
+        assertEquals(0L, AssistantVoiceHandoff.peek(context))
 
         // Non-active callbacks must not break the active request.
         session.onTaskFinished(null, 999)
@@ -155,21 +156,21 @@ class LibreVoiceInteractionSessionTest {
 
         session.onShow(null, 0)
         session.onTaskStarted(null, 10)
-        AssistantVoiceHandoff.clear() // initial consume equivalent; active task remains.
+        AssistantVoiceHandoff.clear(context)
 
-        // Later real gesture (after debounce window): accept retrigger, keep active task alive.
+        // Later real gesture (after debounce window): accept retrigger via cross-process handoff,
+        // keep active task alive, and do NOT create/start a new voice task (F1/F2).
         ShadowSystemClock.advanceBy(Duration.ofMillis(1000))
         session.onShow(null, 0)
-        assertEquals(2, session.startedIntents.size) // initial + bring-to-front
-        val retriggerIntent = session.startedIntents.last()
-        assertEquals(Intent.ACTION_ASSIST, retriggerIntent.action)
-        assertEquals(MainActivity::class.java.name, retriggerIntent.component?.className)
-        assertTrue(AssistantVoice.isVoiceInputRequested(retriggerIntent))
-        assertNotEquals(0L, AssistantVoiceHandoff.peek())
+        assertEquals(1, session.startedIntents.size)
+        val pending = AssistantVoiceHandoff.currentPending(context)
+        assertNotEquals(null, pending)
+        assertNotEquals(0L, pending!!.token)
+        assertEquals(10, pending.targetTaskId)
         assertEquals(0, session.hideCalls)
 
         // Simulate UI consuming retrigger handoff; active task continues.
-        assertTrue(AssistantVoiceHandoff.consume(AssistantVoiceHandoff.peek()))
+        assertTrue(AssistantVoiceHandoff.consume(pending.token, context))
         session.onTaskFinished(null, 10)
         assertEquals(1, session.hideCalls)
     }
@@ -213,9 +214,9 @@ class LibreVoiceInteractionSessionTest {
 
         session.onShow(null, 0) // A
         session.onTaskStarted(null, 10)
-        session.onShow(null, 0) // immediate duplicate/coalesced, must not retrigger or start new task binding
+        session.onShow(null, 0) // immediate duplicate/coalesced, must not retrigger or start new task
         assertEquals(1, session.startedIntents.size)
-        assertEquals(0L, AssistantVoiceHandoff.peek())
+        assertEquals(0L, AssistantVoiceHandoff.peek(context))
 
         // If an extra task start arrives anyway it must not become active or finish session.
         session.onTaskStarted(null, 11)
@@ -234,13 +235,15 @@ class LibreVoiceInteractionSessionTest {
 
         session.onShow(null, 0) // A
         session.onTaskStarted(null, 10)
-        AssistantVoiceHandoff.clear() // simulate initial handoff consumed by UI
+        AssistantVoiceHandoff.clear(context)
 
         // B: later real gesture while same voice task/activity remains active.
         ShadowSystemClock.advanceBy(Duration.ofMillis(1000))
         session.onShow(null, 0)
-        assertEquals(2, session.startedIntents.size) // bring-to-front/handoff request, not a new task
-        assertNotEquals(0L, AssistantVoiceHandoff.peek())
+        assertEquals(1, session.startedIntents.size) // no new voice task/start
+        val pending = AssistantVoiceHandoff.currentPending(context)
+        assertNotEquals(null, pending)
+        assertEquals(10, pending!!.targetTaskId)
         assertEquals(0, session.hideCalls)
 
         // Extra task callbacks must not take over or end the active request.
@@ -251,7 +254,7 @@ class LibreVoiceInteractionSessionTest {
         // Active task (A/10) finishing ends the session once.
         session.onTaskFinished(null, 10)
         assertEquals(1, session.hideCalls)
-        assertEquals(0L, AssistantVoiceHandoff.peek())
+        assertEquals(0L, AssistantVoiceHandoff.peek(context))
     }
 
     @Test
@@ -261,43 +264,46 @@ class LibreVoiceInteractionSessionTest {
 
         session.onShow(null, 0)
         session.onTaskStarted(null, 10)
-        AssistantVoiceHandoff.clear()
+        AssistantVoiceHandoff.clear(context)
         ShadowSystemClock.advanceBy(Duration.ofMillis(1000))
         session.onShow(null, 0)
-        assertEquals(2, session.startedIntents.size)
-        val token = AssistantVoiceHandoff.peek()
+        assertEquals(1, session.startedIntents.size)
+        val token = AssistantVoiceHandoff.peek(context)
         assertNotEquals(0L, token)
 
         // Later real gesture replaces unconsumed token so requests are not dropped.
         ShadowSystemClock.advanceBy(Duration.ofMillis(1000))
         session.onShow(null, 0)
-        assertEquals(3, session.startedIntents.size)
-        val replaced = AssistantVoiceHandoff.peek()
+        assertEquals(1, session.startedIntents.size)
+        val replaced = AssistantVoiceHandoff.peek(context)
         assertNotEquals(0L, replaced)
         assertNotEquals(token, replaced)
     }
 
     @Test
-    fun retriggerStartFailure_doesNotDropNextRealGesture() {
+    fun retriggerPublishesHandoff_andSubsequentRealGestureIsNotDropped() {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        // 1st start: initial launch succeeds, 2nd: retrigger bring-to-front fails, 3rd: retry succeeds.
-        val session = RecordingVoiceSession(context, throwOnStartAt = 2)
-
+        val session = RecordingVoiceSession(context)
         session.onShow(null, 0)
         session.onTaskStarted(null, 10)
-        AssistantVoiceHandoff.clear()
+        AssistantVoiceHandoff.clear(context)
 
+        // Later real gesture: retrigger accepted, no new voice task started.
         ShadowSystemClock.advanceBy(Duration.ofMillis(1000))
-        session.onShow(null, 0) // retrigger attempt fails (attempt recorded by test double)
-        assertEquals(2, session.startedIntents.size)
-        assertEquals(0L, AssistantVoiceHandoff.peek())
+        session.onShow(null, 0)
+        assertEquals(1, session.startedIntents.size)
+        val first = AssistantVoiceHandoff.currentPending(context)
+        assertNotEquals(null, first)
+        assertEquals(10, first!!.targetTaskId)
         assertEquals(0, session.hideCalls)
 
-        // Next real gesture shortly after failure must still be accepted.
-        ShadowSystemClock.advanceBy(Duration.ofMillis(50))
+        // Another real gesture after debounce window must still be accepted (replaced token), not dropped.
+        ShadowSystemClock.advanceBy(Duration.ofMillis(1000))
         session.onShow(null, 0)
-        assertEquals(3, session.startedIntents.size)
-        assertNotEquals(0L, AssistantVoiceHandoff.peek())
+        assertEquals(1, session.startedIntents.size)
+        val second = AssistantVoiceHandoff.currentPending(context)
+        assertNotEquals(null, second)
+        assertNotEquals(first.token, second!!.token)
         assertEquals(0, session.hideCalls)
 
         session.onTaskFinished(null, 10)

@@ -143,5 +143,13 @@
                 <action android:name="android.speech.RecognitionService" />
             </intent-filter>
         </service>
+
+        <!-- C2 voice retrigger handoff（Issue #137）：main-process, app-private cross-process
+             channel for :voice session -> trusted voice UI token delivery. -->
+        <provider
+            android:name=".assistant.VoiceHandoffProvider"
+            android:authorities="${applicationId}.voice.handoff"
+            android:exported="false"
+            android:process="" />
     </application>
 </manifest>

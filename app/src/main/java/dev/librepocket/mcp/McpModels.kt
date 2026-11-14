@@ -1,5 +1,8 @@
 package dev.librepocket.mcp
 
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.HostResolver
+import dev.librepocket.policy.SystemHostResolver
 import dev.librepocket.tool.SideEffect
 
 /**
@@ -52,6 +55,37 @@ data class McpServerConfig(
     val enabledTools: Map<String, Boolean> = emptyMap(),
     /** 單次呼叫超時，鉗制在 [McpTimeouts.MIN_MS]..[McpTimeouts.MAX_MS]。 */
     val timeoutMs: Long = McpTimeouts.DEFAULT_MS,
+    /**
+     * A3 (Issue #135 A3)：per-server 網路 opt-in（預設 deny-all
+     * [dev.librepocket.policy.NetworkEgressPolicy.HTTPS_ONLY]）。
+     * 回環／私有明文須經 `NetworkOptInStore.confirm` 明示確認升級到
+     * `ALLOW_CLEARTEXT_PRIVATE`（該 tier 另供 WebFetch 的 LAN pilot；
+     * MCP 形狀閘（[dev.librepocket.mcp.McpWire.requireSecureEndpoint]）不放行
+     * 非回環明文，且 DNS 後 [requireMcpNetworkPolicyAllowed] 強制 `http` 的所有
+     * 解析位址位元組皆須為回環（非回環／混合一律 `CLEARTEXT_NOT_PERMITTED`），
+     * 故 MCP 經此確認僅開迴環 `http`；play 維持 deny-all，
+     * 見 [dev.librepocket.policy.NetworkOptInStore.checkPlayTierAllows]），
+     * 無全域一鍵開放。公網 `http` 永不開放（見 [dev.librepocket.policy.NetworkPolicy]）。
+     */
+    val networkOptIn: EndpointNetworkOptIn = EndpointNetworkOptIn(),
+    /**
+     * A3：首跳解析 seam。production 預設 [SystemHostResolver]；測試注入 fake。
+     * [dev.librepocket.mcp.McpServer] 透過 `McpTransport.preflightMcpNetworkPolicy`
+     * 在共享單調 `deadlineNs` 與 [dev.librepocket.policy.NetworkPolicy.defaultPreflightExecutor]
+     * 上執行有界 DNS 預驗並鑄造密封的 [McpPreflightToken]（私有建構子，外部無法偽造
+     * `NetworkEvaluation`），再以 `McpTransport.postJsonWithPreverified` 帶入：
+     * URL／字面 IP／resolver 一致時零二次 DNS 沿用釘住答案並以即時 `effectiveOptIn()`
+     * 重驗，不一致則於同一 `deadlineNs` 下重走有界預驗；直調 `McpTransport.postJson`
+     * 一律於共享 `deadlineNs` 下執行有界預驗並以 [dev.librepocket.policy.PinnedNetworkDns] 釘住建連，拒絕即
+     * typed fatal（[McpNetworkPolicyBlocked]），不送 credential／body。
+     */
+    val networkResolver: HostResolver = SystemHostResolver,
+    /**
+     * A3：opt-in 綁定世代。`NetworkOptInStore` 以 (`mcp:<id>`＋正規化 baseUrl＋
+     * scheme／port＋tier＋本 revision) 綁定確認；任一變動使舊確認自動失效
+     * （fail-closed，需重新明示確認；見 [dev.librepocket.policy.NetworkOptInStore]）。
+     */
+    val configRevision: Long = 0L,
 ) {
     fun effectiveTimeoutMs(): Long = McpTimeouts.clamp(timeoutMs)
 
@@ -137,6 +171,13 @@ data class McpListResult(
     val tools: List<McpTool>,
     val status: McpStatus,
     val latencyMs: Long,
+    /**
+     * A3 政策阻擋碼（[dev.librepocket.policy.NetworkDenyCode] 名）：
+     * 政策閘阻擋與 3xx 終端（執行層拒絕，`REDIRECT_BLOCKED`）的 PROTOCOL 路徑
+     * 非 null，記入 [auditMap] 供診斷（`denyCode` 鍵）。
+     * 只記碼名，不記位址／URL／解析答案（隱私：見 [McpNetworkPolicyBlocked]）。
+     */
+    val denyCode: String? = null,
 ) {
     /**
      * 稽核面。[serverId] 是本地配置值、tool 名可來自 wire 或本地建構，兩者都可能
@@ -145,14 +186,18 @@ data class McpListResult(
      * 與 [McpCallResult.auditMap] 的 `tool` 欄同政策。wire 來源的名雖已 fail-closed
      * 拒 C0/DEL 與孤立 surrogate，C1/LS/PS/bidi/零寬仍可自遠端流入，故 `tools`
      * 清單逐名轉義（PR #93 F-03/RT-03）；本地直呼建構子的呼叫端亦受同一保護。
+     *
+     * A3：政策阻擋與 3xx 終端（執行層拒絕，`REDIRECT_BLOCKED`）另記 `denyCode`
+     *（阻擋／終端路徑出現；碼名為靜態 ASCII，不含位址／URL）。
      */
-    fun auditMap(): Map<String, Any?> = mapOf(
-        "serverId" to McpWire.escapeControlUnits(serverId),
-        "toolCount" to tools.size,
-        "tools" to tools.map { McpWire.escapeControlUnits(it.name) },
-        "status" to status.name,
-        "latencyMs" to latencyMs,
-    )
+    fun auditMap(): Map<String, Any?> = buildMap {
+        put("serverId", McpWire.escapeControlUnits(serverId))
+        put("toolCount", tools.size)
+        put("tools", tools.map { McpWire.escapeControlUnits(it.name) })
+        put("status", status.name)
+        put("latencyMs", latencyMs)
+        if (denyCode != null) put("denyCode", denyCode)
+    }
 
     /**
      * 隱私覆寫：data class 自動 [toString] 會把 [tools] 內每支工具的 name/description/
@@ -194,6 +239,13 @@ data class McpCallResult(
     val resultJson: String? = null,
     val isError: Boolean = false,
     val errorMessage: String? = null,
+    /**
+     * A3 政策阻擋碼（[dev.librepocket.policy.NetworkDenyCode] 名）：
+     * 政策閘阻擋與 3xx 終端（執行層拒絕，`REDIRECT_BLOCKED`）的 PROTOCOL 路徑
+     * 非 null，記入 [auditMap] 供診斷（`denyCode` 鍵）。
+     * 只記碼名，不記位址／URL／解析答案（隱私：見 [McpNetworkPolicyBlocked]）。
+     */
+    val denyCode: String? = null,
 ) {
     /**
      * 稽核面 [tool] 欄（Stage3 A-01）：形狀閘**被拒**的 toolName（呼叫端自備字串，
@@ -204,14 +256,18 @@ data class McpCallResult(
      * [serverId] 同政策（本地配置值可含控制/格式字元）：C0/DEL、C1、LS/PS、bidi、
      * U+200B–200D／U+2060／U+FEFF 與孤立 surrogate 轉義，一般字元原樣；其餘 Cf
      * 仍原樣（S2-03）。
+     *
+     * A3：政策阻擋與 3xx 終端（執行層拒絕，`REDIRECT_BLOCKED`）另記 `denyCode`
+     *（阻擋／終端路徑出現；碼名為靜態 ASCII，不含位址／URL）。
      */
-    fun auditMap(): Map<String, Any?> = mapOf(
-        "serverId" to McpWire.escapeControlUnits(serverId),
-        "tool" to McpWire.escapeControlUnits(tool),
-        "status" to status.name,
-        "latencyMs" to latencyMs,
-        "isError" to isError,
-    )
+    fun auditMap(): Map<String, Any?> = buildMap {
+        put("serverId", McpWire.escapeControlUnits(serverId))
+        put("tool", McpWire.escapeControlUnits(tool))
+        put("status", status.name)
+        put("latencyMs", latencyMs)
+        put("isError", isError)
+        if (denyCode != null) put("denyCode", denyCode)
+    }
 
     /**
      * 隱私覆寫：data class 自動 [toString] 會把 [resultJson]（結果原文）與

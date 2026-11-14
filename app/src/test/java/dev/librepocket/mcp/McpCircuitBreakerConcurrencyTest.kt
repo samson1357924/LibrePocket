@@ -1,6 +1,8 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkEgressPolicy
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -43,6 +45,10 @@ class McpCircuitBreakerConcurrencyTest {
     private val threads = 8
     private val perThread = 250
 
+    // A3：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in；
+    // production 預設仍 deny-all（HTTPS_ONLY）。
+    private val loopbackOptIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
+
     @Test fun concurrentFailuresAreCountedWithoutLostUpdates() {
         // C-11：非同步安全的計數會在 2000 併發遞增下丟更新（<2000）；
         // 閾值設 10_000 使 hammer 期間永不開路，純驗計數守恆。
@@ -80,7 +86,12 @@ class McpCircuitBreakerConcurrencyTest {
             val vault = CountingVault()
             val breaker = McpCircuitBreaker(maxFailures = 1, openMs = 600_000L, clockMs = { 0L })
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                // A3：迴環明文須顯式 opt-in；production 預設仍 deny-all。
+                config = McpServerConfig(
+                    id = "s1",
+                    baseUrl = web.url("/").toString(),
+                    networkOptIn = loopbackOptIn,
+                ),
                 keyVault = vault,
                 transport = McpTransport(),
                 breaker = breaker,

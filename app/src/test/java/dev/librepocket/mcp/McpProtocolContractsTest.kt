@@ -1,6 +1,8 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import dev.librepocket.policy.EndpointNetworkOptIn
+import dev.librepocket.policy.NetworkEgressPolicy
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.runBlocking
@@ -58,6 +60,10 @@ class McpProtocolContractsTest {
         override suspend fun deleteKey(providerId: String) = Unit
         override suspend fun hasKey(providerId: String): Boolean = true
     }
+
+    // A3：MockWebServer 走 http://localhost（迴環明文），須顯式 opt-in；
+    // production 預設仍 deny-all（HTTPS_ONLY）。
+    private val loopbackOptIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE)
 
     // ---- a. 空包永不回 OK（{} 無 result 即拒） ----
 
@@ -345,7 +351,7 @@ class McpProtocolContractsTest {
             val vault = CountingVault()
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = vault,
                 transport = McpTransport(),
                 breaker = breaker,
@@ -387,7 +393,7 @@ class McpProtocolContractsTest {
             val vault = CountingVault()
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = vault,
                 transport = McpTransport(),
                 breaker = breaker,
@@ -431,7 +437,7 @@ class McpProtocolContractsTest {
         try {
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -665,6 +671,13 @@ class McpProtocolContractsTest {
             "sub.localhost",
             "::2",
             "fe80::1",
+            // IPv4-embedded 轉換/隧道位址：即使內嵌 loopback，也不是實際回環主機字面。
+            "[64:ff9b::127.0.0.1]",
+            "64:ff9b::127.0.0.1",
+            "[2002:7f00:1::1]",
+            "[2001:0000:c633:6401:0000:ffff:80ff:fffe]",
+            "[::ffff:0:127.0.0.1]",
+            "[::127.0.0.1]",
         )
         for (h in nonLoopback) {
             assertFalse("[$h] 必須非回環（精確白名單）", McpWire.isLoopbackHost(h))
@@ -673,11 +686,19 @@ class McpProtocolContractsTest {
         for (h in listOf("localhost", "LOCALHOST", "127.0.0.1", "::1", "[::1]", "  localhost  ")) {
             assertTrue("[$h] 必須為回環", McpWire.isLoopbackHost(h))
         }
-        // 端到端：http + 回環近似域 → insecure endpoint（不得當回環放行明文）。
-        for (bad in listOf("http://localhost.evil.com/mcp", "http://127.0.0.1.evil.com/mcp")) {
+        // 端到端：http + 回環近似域/轉換位址 → insecure endpoint（不得當回環放行明文）。
+        for (bad in listOf(
+            "http://localhost.evil.com/mcp",
+            "http://127.0.0.1.evil.com/mcp",
+            "http://[64:ff9b::127.0.0.1]/mcp",
+            "http://[2002:7f00:1::1]/mcp",
+            "http://[2001:0000:c633:6401:0000:ffff:80ff:fffe]/mcp",
+            "http://[::ffff:0:127.0.0.1]/mcp",
+            "http://[::127.0.0.1]/mcp",
+        )) {
             try {
                 McpWire.requireSecureEndpoint(bad)
-                fail("回環近似域必須拒：$bad")
+                fail("非實際回環端點必須拒：$bad")
             } catch (e: IllegalArgumentException) {
                 assertEquals("mcp: insecure endpoint", e.message)
             }
@@ -758,7 +779,7 @@ class McpProtocolContractsTest {
             web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -791,7 +812,7 @@ class McpProtocolContractsTest {
             web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -824,7 +845,7 @@ class McpProtocolContractsTest {
             )
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -850,7 +871,7 @@ class McpProtocolContractsTest {
             if (contentType != null) resp.addHeader("Content-Type", contentType)
             web.enqueue(resp)
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
@@ -939,7 +960,7 @@ class McpProtocolContractsTest {
             )
             val outcome = withTimeoutOrNull(5_000) {
                 runCatching {
-                    McpTransport().postJson(web0.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                    McpTransport().postJson(web0.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS, loopbackOptIn)
                 }
             }
             assertNotNull("傳輸層必須回傳（成功或例外）", outcome)
@@ -961,7 +982,7 @@ class McpProtocolContractsTest {
             )
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,
@@ -988,7 +1009,7 @@ class McpProtocolContractsTest {
                     .setBody(withBom),
             )
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
@@ -1018,7 +1039,7 @@ class McpProtocolContractsTest {
                     .setBody(doubleBom),
             )
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
@@ -1045,7 +1066,7 @@ class McpProtocolContractsTest {
             web.enqueue(resp)
             val outcome = withTimeoutOrNull(5_000) {
                 runCatching {
-                    McpTransport().postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                    McpTransport().postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS, loopbackOptIn)
                 }
             }
             assertNotNull(outcome)
@@ -1067,7 +1088,7 @@ class McpProtocolContractsTest {
                 ),
             )
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/api/v2/mcp?key=set").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/api/v2/mcp?key=set").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = McpCircuitBreaker(),
@@ -1111,7 +1132,7 @@ class McpProtocolContractsTest {
             )
             val breaker = McpCircuitBreaker()
             val server = McpServer(
-                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString(), networkOptIn = loopbackOptIn),
                 keyVault = FakeVault(),
                 transport = McpTransport(),
                 breaker = breaker,

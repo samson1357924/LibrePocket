@@ -86,6 +86,14 @@ def is_ident_part(c):
 # The only `dev.librepocket.*` types the MCP package may import outward.
 ALLOWLIST = frozenset({
     "dev.librepocket.keystore.KeyVault",
+    "dev.librepocket.policy.EndpointNetworkOptIn",
+    "dev.librepocket.policy.HostResolver",
+    "dev.librepocket.policy.NetworkDenyCode",
+    "dev.librepocket.policy.NetworkEvaluation",
+    "dev.librepocket.policy.NetworkOptInStore",
+    "dev.librepocket.policy.NetworkPolicy",
+    "dev.librepocket.policy.PinnedNetworkDns",
+    "dev.librepocket.policy.SystemHostResolver",
     "dev.librepocket.tool.CapabilityLevel",
     "dev.librepocket.tool.DenyReason",
     "dev.librepocket.tool.Projection",

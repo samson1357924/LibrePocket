@@ -572,6 +572,10 @@ internal object McpWire {
      * - 解析後 URL 亦不得含 userinfo（防禦深度，與原始 authority 檢查同訊息）；
      * - 僅放行 `https`，以及回環 `http`（`localhost`／`127.0.0.1`／`[::1]`，
      *   供 MockWebServer／本機開發；其餘 `http` 一律拋 `mcp: insecure endpoint`）。
+     *   註：本函之 [isLoopbackHost] 僅為 DNS 前主機字串形狀檢查（如 `http://localhost`
+     *   於預檢階段形狀合法，即便 DNS 稍後解析出非回環 IP）；解析後的位元組級回環強制限縮
+     *   （`http` 所有解析位址皆須屬回環位址，否則拋 `CLEARTEXT_NOT_PERMITTED`）由
+     *   [requireMcpNetworkPolicyAllowed] 於 DNS 後執行；
      * 回傳正規化後 endpoint（可直接發送）。
      */
     fun requireSecureEndpoint(baseUrl: String): String {
@@ -622,8 +626,15 @@ internal object McpWire {
         throw IllegalArgumentException("mcp: insecure endpoint")
     }
 
+    /**
+     * DNS 前主機字串形狀檢查（pre-DNS shape gate）：僅辨識字面回環寫法
+     * `localhost`／`127.0.0.1`／`[::1]`（[Locale.ROOT] 小寫正規化）。
+     * 本檢查不查 DNS；若 `localhost` 等名稱解析出非回環位址（如 `10.x`／`fc00::1`
+     * 或混合位址），由 DNS 後政策閘 [requireMcpNetworkPolicyAllowed] 在位元組層以
+     * `CLEARTEXT_NOT_PERMITTED` 拒絕。
+     */
     internal fun isLoopbackHost(host: String): Boolean {
-        val h = host.trim().trim('[', ']').lowercase()
+        val h = host.trim().trim('[', ']').lowercase(Locale.ROOT)
         return h == "localhost" || h == "127.0.0.1" || h == "::1"
     }
 
@@ -1123,6 +1134,11 @@ internal object McpWire {
      * 注意 `mcp: missing result`／`mcp: bad result`／`mcp: bad result.tools`／
      * `mcp: tool without name` 四類結果形狀錯刻意拋一般 [IllegalArgumentException]
      * （與本類在 [McpServer] 同映射，行為無差異；型別區分由 McpWireD1Test 釘住）。
+     *
+     * 本類為 final（不得繼承）：A3 政策阻擋 [McpNetworkPolicyBlocked] 為與本類
+     * 平級的獨立例外（同為 [IllegalArgumentException] 子類、同訊息前綴，
+     * 但型別不相交），由 [McpServer] 專屬 catch 先攔（配置姿態 PROTOCOL、
+     * 不計熔斷），再由本類兜底；新增錯誤型別先經契約評審。
      */
     class McpProtocol(message: String) : IllegalArgumentException(message)
 

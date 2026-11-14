@@ -96,6 +96,9 @@ class WebSearchViewModel(
             val resetGeneration: Long,
         ) : StoreCommand
 
+        /** Marker: consume latest conflated URL draft from [pendingUrlWrite]. */
+        data object UrlFlush : StoreCommand
+
         data class MasterSwitch(
             val enabled: Boolean,
             val seq: Long,
@@ -126,6 +129,10 @@ class WebSearchViewModel(
     private var latestState = InternalState()
     private val _internalState = MutableStateFlow(latestState)
     private val storeCommandChannel = Channel<StoreCommand>(Channel.UNLIMITED)
+    /** Latest pending URL draft; consumed by [StoreCommand.UrlFlush] to bound backlog. */
+    private val pendingUrlWrite = java.util.concurrent.atomic.AtomicReference<StoreCommand.UrlWrite?>()
+    /** At most one [StoreCommand.UrlFlush] marker queued when a URL draft is pending. */
+    private val urlFlushQueued = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private val probeGen = AtomicLong(0L)
     private var probeJob: Job? = null
@@ -298,24 +305,30 @@ class WebSearchViewModel(
 
     init {
         viewModelScope.launch(ioDispatcher) {
-            var pending: StoreCommand? = null
-            while (true) {
-                val cmd = pending ?: storeCommandChannel.receiveCatching().getOrNull() ?: break
-                pending = null
-                if (cmd is StoreCommand.UrlWrite) {
-                    var latestUrl = cmd
-                    while (true) {
-                        val next = storeCommandChannel.tryReceive().getOrNull() ?: break
-                        if (next is StoreCommand.UrlWrite) {
-                            latestUrl = next
-                        } else {
-                            pending = next
+            for (cmd in storeCommandChannel) {
+                when (cmd) {
+                    is StoreCommand.UrlFlush -> {
+                        // Consume latest conflated draft; if new drafts arrived during
+                        // handling, loop until stable (slot stays O(1)).
+                        while (true) {
+                            urlFlushQueued.set(false)
+                            val latest = pendingUrlWrite.getAndSet(null)
+                            if (latest != null) {
+                                handleCommand(latest)
+                                if (pendingUrlWrite.get() == null) break
+                                // A newer draft arrived while handling; re-mark and continue.
+                                urlFlushQueued.set(true)
+                                continue
+                            }
+                            // Nothing pending (e.g. stale/cleared marker); stop.
+                            if (pendingUrlWrite.get() != null && urlFlushQueued.compareAndSet(false, true)) {
+                                continue
+                            }
                             break
                         }
                     }
-                    handleCommand(latestUrl)
-                } else {
-                    handleCommand(cmd)
+                    is StoreCommand.UrlWrite -> handleCommand(cmd)
+                    else -> handleCommand(cmd)
                 }
             }
         }
@@ -397,6 +410,18 @@ class WebSearchViewModel(
         next
     }
 
+    private fun enqueueUrlWrite(cmd: StoreCommand.UrlWrite): Boolean {
+        pendingUrlWrite.set(cmd)
+        if (urlFlushQueued.compareAndSet(false, true)) {
+            val sent = storeCommandChannel.trySend(StoreCommand.UrlFlush)
+            if (sent.isFailure) {
+                urlFlushQueued.set(false)
+                return false
+            }
+        }
+        return true
+    }
+
     private fun syncUi(next: InternalState) {
         _internalState.update { cur -> if (next.stateVersion >= cur.stateVersion) next else cur }
     }
@@ -421,6 +446,7 @@ class WebSearchViewModel(
     private suspend fun handleCommand(cmd: StoreCommand) {
         when (cmd) {
             is StoreCommand.UrlWrite -> handleUrlWrite(cmd)
+            StoreCommand.UrlFlush -> Unit
             is StoreCommand.MasterSwitch -> handleMasterSwitch(cmd)
             is StoreCommand.DdgsSwitch -> handleDdgsSwitch(cmd)
             is StoreCommand.ConsentConfirm -> handleConsentConfirm(cmd)
@@ -777,14 +803,18 @@ class WebSearchViewModel(
 
     fun onSearxngUrlChange(newUrl: String) {
         var oldProbe: Job? = null
-        val next = updateStateAndCommand { cur ->
+        var urlCmd: StoreCommand.UrlWrite? = null
+        val next = updateState { cur ->
             if (!canMutateWith(cur) || cur.consentSubmitting) {
-                cur to null
+                cur
             } else {
                 oldProbe = cancelProbeLocked()
                 val ver = cur.draftVersion + 1
                 val rGen = cur.resetGeneration
                 if (newUrl.length > MAX_WEB_BASE_URL_LENGTH) {
+                    // Drop any previously pending write: this draft is rejected and must
+                    // not persist a stale earlier URL.
+                    pendingUrlWrite.set(null)
                     cur.copy(
                         draftUrl = newUrl,
                         urlDirty = true,
@@ -792,8 +822,9 @@ class WebSearchViewModel(
                         draftVersion = ver,
                         probeMessage = null,
                         writeError = "SearXNG 網址過長，未儲存至本機設定。",
-                    ) to null
+                    )
                 } else {
+                    urlCmd = StoreCommand.UrlWrite(url = newUrl, draftVersion = ver, resetGeneration = rGen)
                     cur.copy(
                         draftUrl = newUrl,
                         urlDirty = true,
@@ -801,8 +832,15 @@ class WebSearchViewModel(
                         draftVersion = ver,
                         probeMessage = null,
                         writeError = null,
-                    ) to StoreCommand.UrlWrite(url = newUrl, draftVersion = ver, resetGeneration = rGen)
+                    )
                 }
+            }
+        }
+        val cmd = urlCmd
+        if (cmd != null) {
+            val enqueued = enqueueUrlWrite(cmd)
+            if (!enqueued && !next.isCleared) {
+                runCatching { Log.w(TAG, "web store command rejected unexpectedly") }
             }
         }
         oldProbe?.cancel()

@@ -314,6 +314,45 @@ class WebSearchViewModelTest {
     }
 
     @Test
+    fun highFrequencyUrlEditsWhileWriteInFlight_persistOnlyInFlightAndLatestDraft() = runTest {
+        val firstWriteEntered = CompletableDeferred<Unit>()
+        val firstWriteGate = CompletableDeferred<Unit>()
+        val fakeDs = FakePreferencesDataStore().apply {
+            beforeWrite = { idx ->
+                if (idx == 1) {
+                    firstWriteEntered.complete(Unit)
+                    firstWriteGate.await()
+                }
+            }
+        }
+        val vm = installStandardVm(fakeDs)
+        val collector = collectUi(vm)
+        vm.uiState.first { !it.isLoading }
+
+        vm.onSearxngUrlChange("h")
+        runCurrent()
+        firstWriteEntered.await()
+
+        var latest = "h"
+        repeat(500) { i ->
+            latest = "https://search.example/$i"
+            vm.onSearxngUrlChange(latest)
+        }
+        runCurrent()
+        assertEquals(latest, vm.uiState.value.searxngUrl)
+
+        firstWriteGate.complete(Unit)
+        advanceUntilIdle()
+
+        // Backlog must remain bounded to latest draft while first write is in-flight.
+        assertEquals(listOf("h", latest), fakeDs.writtenUrls)
+        assertEquals(latest, fakeDs.currentUrl())
+        assertEquals(latest, vm.uiState.value.searxngUrl)
+        assertNull(vm.uiState.value.writeError)
+        collector.cancel()
+    }
+
+    @Test
     fun onSearxngUrlChange_overMaxLength_notEnqueuedAndShowsWriteError() = runTest {
         val fakeDs = FakePreferencesDataStore(prefs(url = "https://good.example"))
         val vm = installStandardVm(fakeDs)

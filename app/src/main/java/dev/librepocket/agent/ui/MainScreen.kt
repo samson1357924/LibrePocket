@@ -37,6 +37,7 @@ import dev.librepocket.agent.ui.setup.PendingDelete
 import dev.librepocket.agent.ui.setup.SetupScreen
 import dev.librepocket.agent.ui.setup.SetupViewModel
 import dev.librepocket.agent.ui.setup.SetupViewModelFactory
+import dev.librepocket.agent.assistant.AssistantVoiceHandoff
 import dev.librepocket.agent.assistant.rememberAssistantRole
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.entry.EntryDispatch
@@ -202,6 +203,18 @@ fun MainScreen(
         onAssistVoiceConsumed = onAssistVoiceConsumed,
     )
 
+    // Trusted in-process retrigger handoff from active voice session (F1): deliver only under
+    // the same chat-safe boundary as initial voice delivery.
+    val pendingVoiceRetriggerToken by AssistantVoiceHandoff.token.collectAsStateWithLifecycle()
+    val deliverVoiceRetrigger = pendingVoiceRetriggerToken != 0L &&
+        currentRoute == Routes.CHAT &&
+        hasEndpoint &&
+        !navLoading &&
+        viewedSessionId == null &&
+        drawerState.isClosed &&
+        drawerState.targetValue == DrawerValue.Closed
+    val voiceRetriggerToken = if (deliverVoiceRetrigger) pendingVoiceRetriggerToken else 0L
+
     // Edit-entry helper: prefill the form with the live endpoint (key stays
     // blank) so "edit" never shows another preset's defaults.
     fun goSetupForEdit() {
@@ -273,6 +286,8 @@ fun MainScreen(
                     drawerState = drawerState,
                 ),
                 onVoiceInputConsumed = onAssistVoiceConsumed,
+                voiceRetriggerToken = voiceRetriggerToken,
+                onVoiceRetriggerConsumed = { AssistantVoiceHandoff.consume(it) },
                 voiceSwitchesLoaded = voiceEffectiveSnapshot.loaded || voiceEffectiveSnapshot.loadFailed,
                 userSwitches = voiceUiSwitches,
                 voiceSwitchLoadFailed = voiceEffectiveSnapshot.loadFailed,

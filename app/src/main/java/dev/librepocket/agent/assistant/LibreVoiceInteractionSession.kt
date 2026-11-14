@@ -8,6 +8,7 @@ import android.util.Log
 import dev.librepocket.agent.MainActivity
 
 private const val TAG = "LibreVoiceSession"
+private const val DUPLICATE_SHOW_DEBOUNCE_MS = 350L
 
 // TODO(C2-assistant, Issue #137): session 內 Compose／串流 STT 不做——直接
 // SpeechRecognizer 需本 App 錄音權限，與 C1 零新增權限契約衝突；
@@ -51,6 +52,7 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
     private var sessionHidden = false
     private var launchPending = false
     private var activeTaskId: Int? = null
+    private var lastAcceptedShowUptimeMs: Long = 0L
 
     /**
      * Activity-only 流程（人類 review #5 session UI）：關預設 voice UI window，
@@ -63,21 +65,44 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
 
     override fun onShow(args: Bundle?, showFlags: Int) {
         super.onShow(args, showFlags)
-        // Ignore duplicate onShow while a launch is pending or an active task is running,
-        // so a stale/duplicate show cannot start or kill a newer request lifecycle.
-        if (launchPending || activeTaskId != null) {
+        val now = android.os.SystemClock.uptimeMillis()
+
+        // Initial launch is still pending task binding: suppress duplicate dispatch/start.
+        if (launchPending && activeTaskId == null) {
             return
         }
+
+        // Active trusted voice task exists: accept a new real show as retrigger handoff to the
+        // existing task/activity (single-flight, no second task), but coalesce rapid duplicate callbacks.
+        // A later real gesture (beyond debounce) replaces any still-pending token so requests are not lost.
+        if (activeTaskId != null) {
+            if (now - lastAcceptedShowUptimeMs < DUPLICATE_SHOW_DEBOUNCE_MS) {
+                return
+            }
+            lastAcceptedShowUptimeMs = now
+            AssistantVoiceHandoff.requestRetrigger()
+            try {
+                // Bring the existing trusted voice activity/task forward if needed. Each start
+                // re-acquires the default voice wake lock; release it after a successful request.
+                startVoiceActivity(buildVoiceAssistIntent())
+                runCatching { setKeepAwake(false) }
+            } catch (e: Exception) {
+                Log.w(TAG, "voice retrigger bring-to-front failed; keeping active task", e)
+                AssistantVoiceHandoff.clear()
+                // Allow an immediate retry gesture: failed bring-to-front must not debounce/drop next real show.
+                lastAcceptedShowUptimeMs = 0L
+                // Do not kill the healthy active task; allow a later real onShow to retry.
+                runCatching { setKeepAwake(false) }
+            }
+            return
+        }
+
         // New show cycle may occur after a previous finish; allow one hide for this cycle.
         sessionHidden = false
+        AssistantVoiceHandoff.clear()
+        lastAcceptedShowUptimeMs = now
         try {
-            // C2：掛 voice 請求 flag（見 AssistantVoice：只是 UI 提示，
-            // MainActivity 收到後自動走既有 RecognizerIntent 委派；零新權限）。
-            val assist = AssistantVoice.withVoiceInput(assistantVoiceIntent(context)).setClass(
-                context,
-                MainActivity::class.java,
-            )
-            startVoiceActivity(assist)
+            startVoiceActivity(buildVoiceAssistIntent())
             // Launch accepted but task not yet started; wait for onTaskStarted to bind taskId.
             launchPending = true
             // startVoiceActivity acquires the default voice wake lock; release it after a successful
@@ -93,6 +118,14 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
             finishSession()
         }
     }
+
+    private fun buildVoiceAssistIntent(): Intent =
+        // C2：掛 voice 請求 flag（見 AssistantVoice：只是 UI 提示，
+        // MainActivity 收到後自動走既有 RecognizerIntent 委派；零新權限）。
+        AssistantVoice.withVoiceInput(assistantVoiceIntent(context)).setClass(
+            context,
+            MainActivity::class.java,
+        )
 
     override fun onTaskStarted(intent: Intent?, taskId: Int) {
         // Bind the started task only for the current pending launch with no active task yet.
@@ -132,6 +165,7 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
     private fun clearTaskState() {
         launchPending = false
         activeTaskId = null
+        AssistantVoiceHandoff.clear()
     }
 
     /**

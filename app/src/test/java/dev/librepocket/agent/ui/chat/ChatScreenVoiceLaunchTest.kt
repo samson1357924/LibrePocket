@@ -693,4 +693,91 @@ class ChatScreenVoiceLaunchTest {
         composeRule.onAllNodesWithText("做不到", substring = true).assertCountEquals(0)
         assertEquals(0, provider.streamCalls)
     }
+
+    @Test
+    fun voiceRetriggerToken_consumesOnceAndLaunchesRecognizerIntent_whenSwitchesReady() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val retriggerToken = MutableStateFlow(0L)
+        val consumed = ArrayList<Long>()
+
+        composeRule.setContent {
+            val token by retriggerToken.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceSwitchesLoaded = true,
+                    voiceRetriggerToken = token,
+                    onVoiceRetriggerConsumed = {
+                        consumed += it
+                        retriggerToken.value = 0L
+                    },
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertTrue(registry.launchedIntents.isEmpty())
+
+        composeRule.runOnIdle { retriggerToken.value = 42L }
+        composeRule.waitForIdle()
+
+        assertEquals(listOf(42L), consumed)
+        assertEquals(1, registry.launchedIntents.size)
+        assertEquals(RecognizerIntent.ACTION_RECOGNIZE_SPEECH, registry.launchedIntents.single().action)
+        assertEquals(0, provider.streamCalls)
+
+        // No replay on recomposition/state stability.
+        composeRule.waitForIdle()
+        assertEquals(listOf(42L), consumed)
+        assertEquals(1, registry.launchedIntents.size)
+    }
+
+    @Test
+    fun voiceRetriggerToken_waitsForSwitchesLoaded_thenLaunchesOnce() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val retriggerToken = MutableStateFlow(7L)
+        val switchesLoaded = MutableStateFlow(false)
+        val consumed = ArrayList<Long>()
+
+        composeRule.setContent {
+            val token by retriggerToken.collectAsState()
+            val loaded by switchesLoaded.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceSwitchesLoaded = loaded,
+                    voiceRetriggerToken = token,
+                    onVoiceRetriggerConsumed = {
+                        consumed += it
+                        retriggerToken.value = 0L
+                    },
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertTrue(consumed.isEmpty())
+        assertTrue(registry.launchedIntents.isEmpty())
+
+        composeRule.runOnIdle { switchesLoaded.value = true }
+        composeRule.waitForIdle()
+
+        assertEquals(listOf(7L), consumed)
+        assertEquals(1, registry.launchedIntents.size)
+        assertEquals(RecognizerIntent.ACTION_RECOGNIZE_SPEECH, registry.launchedIntents.single().action)
+    }
 }

@@ -177,6 +177,7 @@ class MainScreenAssistVoiceRoutingTest {
         val gate = MutableStateFlow<EndpointGate>(EndpointGate.NoEndpoint)
         val pending = MutableStateFlow(false)
         val assistVoiceRequested = MutableStateFlow(false)
+        val pendingRetriggerToken = MutableStateFlow(0L)
         val voiceSwitchesLoaded = MutableStateFlow(false)
         val voiceSwitchLoadFailed = MutableStateFlow(false)
         val userSwitches = MutableStateFlow(
@@ -188,6 +189,7 @@ class MainScreenAssistVoiceRoutingTest {
         )
         val viewedSessionId = MutableStateFlow<String?>(null)
         var consumedCount = 0
+        var retriggerConsumedCount = 0
         val registry = RecordingRegistry()
         lateinit var nav: NavHostController
         lateinit var drawerState: DrawerState
@@ -250,6 +252,7 @@ class MainScreenAssistVoiceRoutingTest {
             val g by gate.collectAsState()
             val p by pending.collectAsState()
             val req by assistVoiceRequested.collectAsState()
+            val pendingRetrigger by pendingRetriggerToken.collectAsState()
             val loaded by voiceSwitchesLoaded.collectAsState()
             val loadFailed by voiceSwitchLoadFailed.collectAsState()
             val switches by userSwitches.collectAsState()
@@ -258,6 +261,14 @@ class MainScreenAssistVoiceRoutingTest {
             val currentRoute = backStack?.destination?.route
             val hasEndpoint = g is EndpointGate.Ready
             val navLoading = startupEffectiveLoading(g is EndpointGate.Loading, p)
+            val deliverRetrigger = pendingRetrigger != 0L &&
+                currentRoute == Routes.CHAT &&
+                hasEndpoint &&
+                !navLoading &&
+                viewed == null &&
+                drawerState.isClosed &&
+                drawerState.targetValue == DrawerValue.Closed
+            val voiceRetriggerToken = if (deliverRetrigger) pendingRetrigger else 0L
             val owner = object : ActivityResultRegistryOwner {
                 override val activityResultRegistry: ActivityResultRegistry = registry
             }
@@ -301,6 +312,11 @@ class MainScreenAssistVoiceRoutingTest {
                             onVoiceInputConsumed = {
                                 consumedCount++
                                 assistVoiceRequested.value = false
+                            },
+                            voiceRetriggerToken = voiceRetriggerToken,
+                            onVoiceRetriggerConsumed = {
+                                retriggerConsumedCount++
+                                pendingRetriggerToken.value = 0L
                             },
                             voiceSwitchesLoaded = loaded,
                             voiceSwitchLoadFailed = loadFailed,
@@ -736,6 +752,47 @@ class MainScreenAssistVoiceRoutingTest {
 
         assertEquals(1, h.consumedCount)
         assertTrue(h.registry.launchedIntents.isEmpty())
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun retriggerToken_deliveredOnlyWhenChatSafe_thenConsumedOnce() {
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.Ready(sampleEndpoint())
+        h.voiceSwitchesLoaded.value = true
+        h.userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true)
+
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+
+        // Not deliverable on non-CHAT route.
+        composeRule.runOnIdle {
+            h.nav.navigate(Routes.SETTINGS)
+        }
+        awaitRoute(h, Routes.SETTINGS)
+        composeRule.runOnIdle { h.pendingRetriggerToken.value = 11L }
+        composeRule.waitForIdle()
+        assertEquals(0, h.retriggerConsumedCount)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+
+        // Not deliverable while transcript overlay is active (even on CHAT).
+        composeRule.runOnIdle {
+            h.nav.navigate(Routes.CHAT)
+            h.viewedSessionId.value = "readonly-1"
+        }
+        awaitRoute(h, Routes.CHAT)
+        composeRule.waitForIdle()
+        assertEquals(0, h.retriggerConsumedCount)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+
+        // Deliver once when CHAT-safe boundary is satisfied.
+        composeRule.runOnIdle { h.viewedSessionId.value = null }
+        composeRule.waitForIdle()
+        assertEquals(1, h.retriggerConsumedCount)
+        assertEquals(0L, h.pendingRetriggerToken.value)
+        assertEquals(1, h.registry.launchedIntents.size)
+        assertEquals(RecognizerIntent.ACTION_RECOGNIZE_SPEECH, h.registry.launchedIntents.single().action)
         assertEquals(0, provider.streamCalls)
     }
 }

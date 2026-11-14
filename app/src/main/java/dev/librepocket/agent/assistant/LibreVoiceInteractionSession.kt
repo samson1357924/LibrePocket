@@ -80,8 +80,14 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
             startVoiceActivity(assist)
             // Launch accepted but task not yet started; wait for onTaskStarted to bind taskId.
             launchPending = true
+            // startVoiceActivity acquires the default voice wake lock; release it after a successful
+            // start because C2 may keep the voice task/chat UI alive long after STT delegation.
+            // Each start re-acquires the lock, so retrigger starts must also release it.
+            setKeepAwake(false)
         } catch (e: Exception) {
             Log.w(TAG, "startVoiceActivity failed; hiding session", e)
+            // Best-effort convergence: do not leave the session wake lock held on failed start.
+            runCatching { setKeepAwake(false) }
             // Fail-closed: clear lifecycle tracking and do not leave an empty/inactive session around.
             clearTaskState()
             finishSession()
@@ -118,6 +124,8 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
     override fun onHide() {
         clearTaskState()
         sessionHidden = true
+        // Idempotent convergence: ensure session wake lock is not retained after hide.
+        runCatching { setKeepAwake(false) }
         super.onHide()
     }
 
@@ -133,6 +141,8 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
      */
     protected open fun finishSession() {
         clearTaskState()
+        // Idempotent convergence: release session wake lock on task completion/failure cleanup.
+        runCatching { setKeepAwake(false) }
         if (sessionHidden) return
         sessionHidden = true
         hide()

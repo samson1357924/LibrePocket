@@ -317,7 +317,7 @@ fun ChatScreen(
             val text = try {
                 val raw = result.data?.extras?.get(RecognizerIntent.EXTRA_RESULTS)
                 AssistantVoice.resolveVoicePrefill(raw as? List<*>)
-            } catch (_: Throwable) {
+            } catch (_: Exception) {
                 null
             }
             if (text != null) {

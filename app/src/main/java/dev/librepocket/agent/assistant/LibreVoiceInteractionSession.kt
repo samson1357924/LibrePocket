@@ -80,7 +80,9 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
     }
 
     override fun onTaskFinished(intent: Intent?, taskId: Int) {
-        super.onTaskFinished(intent, taskId)
+        // End session when the delegated voice task finishes. Do not call super here:
+        // framework/default implementations may also hide(), and our cleanup must remain
+        // idempotent and predictable in tests and production.
         finishSession()
     }
 

@@ -500,6 +500,135 @@ class WebSearchD5Test {
         }
     }
 
+    @Test fun hostedMarkerRejectsInvalidStates() {
+        val invalid = listOf(
+            "",
+            "Completed",
+            "COMPLETED",
+            "completed ",
+            " completed",
+            "9lives",
+            "a]b",
+            "a\nb",
+            "a\rb",
+            "\tcompleted",
+            "web_search!",
+            "a".repeat(33),
+            "\u0007x",
+        )
+        for (state in invalid) {
+            assertThrows("hostedMarker(\"$state\") must throw IllegalArgumentException", IllegalArgumentException::class.java) {
+                WebSearchDispatch.hostedMarker(state)
+            }
+        }
+    }
+
+    @Test fun hostedMarkerAcceptsProtocolStates() {
+        for (state in listOf("in_progress", "completed", "failed", "cancelled", "started")) {
+            val marker = WebSearchDispatch.hostedMarker(state)
+            assertTrue("marker for $state must contain the state", marker.contains(state))
+        }
+    }
+
+    @Test fun hostedMarkerFormatIsPinned() {
+        assertEquals(
+            "\n[SERVER_TOOL:web_search completed]\n",
+            WebSearchDispatch.hostedMarker("completed"),
+        )
+    }
+
+    @Test fun dispatchPassesQueryAndCountToRunner() = runBlocking {
+        val registry = registryOf("brave")
+        var seenQuery: String? = null
+        var seenCount: Int? = null
+        val out = WebSearchDispatch.search(
+            pinnedId = null,
+            hostedAvailable = false,
+            registry = registry,
+            query = "kotlin",
+            count = 5,
+            isReady = { true },
+            runHosted = { "completed" },
+            runLocal = { _, q, c ->
+                seenQuery = q
+                seenCount = c
+                WebSearchOutcome.Ok(emptyList())
+            },
+        )
+        assertTrue(out is WebDispatchOutcome.Local)
+        assertEquals("kotlin", seenQuery)
+        assertEquals(5, seenCount)
+    }
+
+    @Test fun dispatchNoProviderIsUnavailable() = runBlocking {
+        // WebSearchRegistry 允許空清單（見 WebSearchCoreTest 的 emptyList 用法）。
+        val registry = WebSearchRegistry(emptyList())
+        var hostedCalls = 0
+        var localCalls = 0
+        val out = WebSearchDispatch.search(
+            pinnedId = null,
+            hostedAvailable = false,
+            registry = registry,
+            query = "kotlin",
+            count = 5,
+            isReady = { false },
+            runHosted = { hostedCalls++; "completed" },
+            runLocal = { _, _, _ -> localCalls++; WebSearchOutcome.Ok(emptyList()) },
+        )
+        assertTrue(out is WebDispatchOutcome.Unavailable)
+        assertEquals(WebUnavailableReason.NO_PROVIDER, (out as WebDispatchOutcome.Unavailable).reason)
+        assertEquals(0, hostedCalls)
+        assertEquals(0, localCalls)
+    }
+
+    @Test fun dispatchRunnerExceptionPropagates() {
+        val registry = registryOf("brave")
+        // (a) runLocal 拋 IllegalStateException → 原樣傳播（本層不捕捉）。
+        val localEx = assertThrows(IllegalStateException::class.java) {
+            runBlocking {
+                WebSearchDispatch.search(
+                    pinnedId = null,
+                    hostedAvailable = false,
+                    registry = registry,
+                    query = "kotlin",
+                    count = 5,
+                    isReady = { true },
+                    runHosted = { "completed" },
+                    runLocal = { _, _, _ -> throw IllegalStateException("boom") },
+                )
+            }
+        }
+        assertEquals("boom", localEx.message)
+        // (b) runHosted 回傳非法狀態字 → hostedMarker 的 IllegalArgumentException 傳播出 search()。
+        val hostedEx = assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                WebSearchDispatch.search(
+                    pinnedId = null,
+                    hostedAvailable = true,
+                    registry = registry,
+                    query = "kotlin",
+                    count = 5,
+                    isReady = { true },
+                    runHosted = { "bad]state" },
+                    runLocal = { _, _, _ -> throw AssertionError("runLocal must not be called") },
+                )
+            }
+        }
+        assertTrue(hostedEx.message?.contains("a-z") == true)
+    }
+
+    @Test fun responseToStringDoesNotLeakKey() {
+        val r = WebHttpResponse(
+            code = 200,
+            body = "supersecret-body-value",
+            headers = mapOf("Authorization" to "Bearer supersecret-token"),
+        )
+        val s = r.toString()
+        assertFalse(s.contains("supersecret-body-value"))
+        assertFalse(s.contains("supersecret-token"))
+        assertTrue(s.contains("bodyChars"))
+    }
+
     @Test fun hostedPreferredMarkedExclusive() = runBlocking {
         val registry = registryOf("brave")
         var hostedCalls = 0
@@ -510,8 +639,9 @@ class WebSearchD5Test {
             registry = registry,
             query = "kotlin",
             count = 5,
+            isReady = { true },
             runHosted = { hostedCalls++; "completed" },
-            runLocal = { localCalls++; WebSearchOutcome.Ok(emptyList()) },
+            runLocal = { _, _, _ -> localCalls++; WebSearchOutcome.Ok(emptyList()) },
         )
         assertTrue(out is WebDispatchOutcome.Hosted)
         assertEquals(
@@ -536,7 +666,7 @@ class WebSearchD5Test {
             count = 5,
             isReady = { true },
             runHosted = { hostedCalls++; "completed" },
-            runLocal = { p -> WebSearchService(p).search("kotlin", 5) },
+            runLocal = { p, q, c -> WebSearchService(p).search(q, c) },
         )
         assertTrue(out is WebDispatchOutcome.Local)
         val local = out as WebDispatchOutcome.Local
@@ -560,7 +690,7 @@ class WebSearchD5Test {
                 count = 5,
                 isReady = { false },
                 runHosted = { hostedCalls++; "completed" },
-                runLocal = { localCalls++; WebSearchOutcome.Ok(emptyList()) },
+                runLocal = { _, _, _ -> localCalls++; WebSearchOutcome.Ok(emptyList()) },
             )
         }
         // pinned 缺失：即使 hosted 可用也不升 hosted、不跑本地。
@@ -589,11 +719,206 @@ class WebSearchD5Test {
             count = 5,
             isReady = { it.id == "brave" },
             runHosted = { hostedCalls++; "completed" },
-            runLocal = { p -> seen.add(p.id); WebSearchOutcome.Ok(emptyList()) },
+            runLocal = { p, _, _ -> seen.add(p.id); WebSearchOutcome.Ok(emptyList()) },
         )
         assertTrue(out is WebDispatchOutcome.Local)
         assertEquals("brave", (out as WebDispatchOutcome.Local).providerId)
         assertEquals(listOf("brave"), seen)
         assertEquals(0, hostedCalls)
+    }
+
+    // ---- 短路／探測次數／select parity／例外傳播 ----
+
+    @Test fun hostedMarkerAccepts32CharBoundary() {
+        // "a".repeat(32) 為 HOSTED_STATE 上限（首字母 [a-z]＋至多 31 個 [a-z_]），必須接受。
+        val state = "a".repeat(32)
+        val marker = WebSearchDispatch.hostedMarker(state)
+        assertTrue("marker must contain the 32-char state", marker.contains(state))
+        // 首字元不得為底線（regex 首類別為 [a-z]）：一律 IllegalArgumentException。
+        assertThrows(IllegalArgumentException::class.java) {
+            WebSearchDispatch.hostedMarker("_completed")
+        }
+    }
+
+    @Test fun emptyQueryProbesZeroProviders() = runBlocking {
+        val registry = registryOf("brave")
+        val probes = mutableListOf<String>()
+        var hostedCalls = 0
+        val out = WebSearchDispatch.search(
+            pinnedId = null,
+            hostedAvailable = true,
+            registry = registry,
+            query = "   ",
+            count = 5,
+            isReady = { probes.add(it.id); true },
+            runHosted = { hostedCalls++; "completed" },
+            runLocal = { _, _, _ -> error("runLocal must not run") },
+        )
+        assertTrue(out is WebDispatchOutcome.Unavailable)
+        assertEquals(WebUnavailableReason.EMPTY_QUERY, (out as WebDispatchOutcome.Unavailable).reason)
+        assertTrue("blank query must short-circuit before any probe", probes.isEmpty())
+        assertEquals(0, hostedCalls)
+    }
+
+    @Test fun hostedPathProbesNoProviders() = runBlocking {
+        val registry = registryOf("brave", "tavily")
+        val probes = mutableListOf<String>()
+        var hostedCalls = 0
+        val out = WebSearchDispatch.search(
+            pinnedId = null,
+            hostedAvailable = true,
+            registry = registry,
+            query = "kotlin",
+            count = 5,
+            isReady = { probes.add(it.id); true },
+            runHosted = { hostedCalls++; "completed" },
+            runLocal = { _, _, _ -> error("runLocal must not run") },
+        )
+        assertTrue(out is WebDispatchOutcome.Hosted)
+        assertTrue("hosted path must probe zero providers", probes.isEmpty())
+        assertEquals(1, hostedCalls)
+    }
+
+    @Test fun firstReadyShortCircuitsProbing() = runBlocking {
+        val registry = registryOf("brave", "tavily")
+        // (a) brave 未就緒、tavily 就緒 → 依註冊序探測 brave→tavily，見到首個就緒即短路。
+        run {
+            val probes = mutableListOf<String>()
+            var localId: String? = null
+            val out = WebSearchDispatch.search(
+                pinnedId = null,
+                hostedAvailable = false,
+                registry = registry,
+                query = "kotlin",
+                count = 5,
+                isReady = { probes.add(it.id); it.id == "tavily" },
+                runHosted = { error("hosted must not run") },
+                runLocal = { p, _, _ -> localId = p.id; WebSearchOutcome.Ok(emptyList()) },
+            )
+            assertTrue(out is WebDispatchOutcome.Local)
+            assertEquals("tavily", (out as WebDispatchOutcome.Local).providerId)
+            assertEquals("tavily", localId)
+            assertEquals(listOf("brave", "tavily"), probes)
+        }
+        // (b) brave 就緒 → 只探測 brave，tavily 不被探測（短路，無多餘 probe）。
+        run {
+            val probes = mutableListOf<String>()
+            var localId: String? = null
+            val out = WebSearchDispatch.search(
+                pinnedId = null,
+                hostedAvailable = false,
+                registry = registry,
+                query = "kotlin",
+                count = 5,
+                isReady = { probes.add(it.id); it.id == "brave" },
+                runHosted = { error("hosted must not run") },
+                runLocal = { p, _, _ -> localId = p.id; WebSearchOutcome.Ok(emptyList()) },
+            )
+            assertTrue(out is WebDispatchOutcome.Local)
+            assertEquals("brave", (out as WebDispatchOutcome.Local).providerId)
+            assertEquals("brave", localId)
+            assertEquals(listOf("brave"), probes)
+        }
+    }
+
+    @Test fun pinnedPathProbesOnlyPinned() = runBlocking {
+        val registry = registryOf("brave", "tavily")
+        val probes = mutableListOf<String>()
+        var hostedCalls = 0
+        var localId: String? = null
+        val out = WebSearchDispatch.search(
+            pinnedId = "tavily",
+            hostedAvailable = false,
+            registry = registry,
+            query = "kotlin",
+            count = 5,
+            isReady = { probes.add(it.id); true },
+            runHosted = { hostedCalls++; "completed" },
+            runLocal = { p, _, _ -> localId = p.id; WebSearchOutcome.Ok(emptyList()) },
+        )
+        assertTrue(out is WebDispatchOutcome.Local)
+        assertEquals("tavily", (out as WebDispatchOutcome.Local).providerId)
+        assertEquals("tavily", localId)
+        assertEquals(listOf("tavily"), probes)
+        assertEquals(0, hostedCalls)
+    }
+
+    @Test fun dispatchSelectParityWithSelector() = runBlocking {
+        val registry = registryOf("brave", "tavily")
+        val readySets = listOf(
+            emptySet(),
+            setOf("brave"),
+            setOf("tavily"),
+            setOf("brave", "tavily"),
+        )
+        for (pinnedId in listOf<String?>(null, "tavily")) {
+            for (hostedAvailable in listOf(false, true)) {
+                for (readySet in readySets) {
+                    val case = "pinned=$pinnedId hostedAvailable=$hostedAvailable readySet=$readySet"
+                    val route = WebSearchSelector.select(pinnedId, hostedAvailable, registry) {
+                        it.id in readySet
+                    }
+                    val out = WebSearchDispatch.search(
+                        pinnedId = pinnedId,
+                        hostedAvailable = hostedAvailable,
+                        registry = registry,
+                        query = "kotlin",
+                        count = 5,
+                        isReady = { it.id in readySet },
+                        runHosted = { "completed" },
+                        runLocal = { _, _, _ -> WebSearchOutcome.Ok(emptyList()) },
+                    )
+                    when (route) {
+                        is WebRoute.Hosted ->
+                            assertTrue("$case: select=Hosted but outcome=$out", out is WebDispatchOutcome.Hosted)
+                        is WebRoute.Local -> {
+                            assertTrue(
+                                "$case: select=Local(${route.providerId}) but outcome=$out",
+                                out is WebDispatchOutcome.Local,
+                            )
+                            assertEquals(
+                                "$case: providerId mismatch",
+                                route.providerId,
+                                (out as WebDispatchOutcome.Local).providerId,
+                            )
+                        }
+                        is WebRoute.Unavailable -> {
+                            assertTrue(
+                                "$case: select=Unavailable(${route.reason}) but outcome=$out",
+                                out is WebDispatchOutcome.Unavailable,
+                            )
+                            assertEquals(
+                                "$case: reason mismatch",
+                                route.reason,
+                                (out as WebDispatchOutcome.Unavailable).reason,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test fun isReadyExceptionPropagatesBeforeRunners() {
+        val registry = registryOf("brave")
+        var hostedCalls = 0
+        var localCalls = 0
+        val ex = assertThrows(IllegalStateException::class.java) {
+            runBlocking {
+                WebSearchDispatch.search(
+                    pinnedId = null,
+                    hostedAvailable = false,
+                    registry = registry,
+                    query = "kotlin",
+                    count = 5,
+                    isReady = { throw IllegalStateException("probe boom") },
+                    runHosted = { hostedCalls++; "completed" },
+                    runLocal = { _, _, _ -> localCalls++; WebSearchOutcome.Ok(emptyList()) },
+                )
+            }
+        }
+        assertEquals("probe boom", ex.message)
+        assertEquals(0, hostedCalls)
+        assertEquals(0, localCalls)
     }
 }

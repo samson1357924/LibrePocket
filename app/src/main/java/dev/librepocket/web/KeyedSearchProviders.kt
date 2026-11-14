@@ -57,6 +57,9 @@ fun interface WebHttpPost {
 private fun postAsGet(httpPost: WebHttpPost, body: String): WebHttpGet =
     WebHttpGet { url, headers -> httpPost.post(url, body, headers) }
 
+/**
+ * `isLenient = true` 用於前向相容與寬鬆解析（沿 D2 姿態）；`maxBodyChars` 是「post-fetch String 級」檢查，不是傳輸層上限——production OkHttp adapter（D3）必須複製 McpTransport 的 content-length 預檢＋串流 byteCap 模式（含解壓後計數），否則上限形同虛設；本層不 log 回應體。
+ */
 private val KeyedSearchJson = Json { ignoreUnknownKeys = true; isLenient = true }
 
 /** `Ok` 收斂（null → `BAD_RESPONSE`；client 端 `take(n)`＋`clipped` 標記，沿 D2 姿態）。 */

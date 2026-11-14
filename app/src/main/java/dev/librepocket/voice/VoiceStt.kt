@@ -42,8 +42,10 @@ object VoiceStt {
     }
 
     /** 取辨識候選首條非空正文；無結果回 null（呼叫方留手動輸入）。 */
-    fun pickResult(results: List<String>?): String? =
-        results?.firstOrNull { it.isNotBlank() }
+    fun pickResult(results: List<*>?): String? =
+        results?.asSequence()
+            ?.mapNotNull { it as? String }
+            ?.firstOrNull { it.isNotBlank() }
 
     /** 降級話術（CAPABILITY_MATRIX §5：原因碼原文引用）。 */
     fun fallbackMessage(reason: DenyReason, detail: String): String =

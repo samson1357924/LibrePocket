@@ -53,4 +53,18 @@ class AssistantVoiceTest {
         assertEquals("a".repeat(4000), result)
         assertEquals(4000, result?.length)
     }
+
+    @Test fun wrongElementTypes_returnNull() {
+        assertNull(AssistantVoice.resolveVoicePrefill(listOf(42)))
+    }
+
+    @Test fun mixedAndNullElements_resolveFirstValidTrimmedString() {
+        assertEquals("ok", AssistantVoice.resolveVoicePrefill(listOf(null, 1, "  ok  ")))
+        assertNull(AssistantVoice.resolveVoicePrefill(listOf<Any?>(null, 1, "", "  ")))
+        val longText = "a".repeat(4500)
+        assertEquals(
+            "a".repeat(4000),
+            AssistantVoice.resolveVoicePrefill(listOf<Any?>(42, "  $longText  ")),
+        )
+    }
 }

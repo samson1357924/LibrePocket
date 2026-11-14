@@ -527,6 +527,133 @@ class ChatScreenVoiceLaunchTest {
     }
 
     @Test
+    fun sttResultOk_integerArrayListElements_showsEmptyResultErrorWithoutPrefillOrSend() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+
+        val malformedIntent = Intent().putIntegerArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf(42),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.lastRequestCode, ActivityResult(Activity.RESULT_OK, malformedIntent))
+        }
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithText(
+            VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_EMPTY_RESULT),
+        ).assertIsDisplayed()
+        assertEquals("", vm.input.value)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun sttResultOk_mixedNullInvalidElements_showsEmptyResultErrorWithoutPrefillOrSend() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+
+        val mixedIntent = Intent().putExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf<Any?>(null, 1, "  "),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.lastRequestCode, ActivityResult(Activity.RESULT_OK, mixedIntent))
+        }
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithText(
+            VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_EMPTY_RESULT),
+        ).assertIsDisplayed()
+        assertEquals("", vm.input.value)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun sttResultOk_mixedElementsWithValidString_prefillsTrimmedWithoutSend() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+
+        val mixedIntent = Intent().putExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf<Any?>(1, "  hi  "),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.lastRequestCode, ActivityResult(Activity.RESULT_OK, mixedIntent))
+        }
+        composeRule.waitForIdle()
+
+        assertEquals("hi", vm.input.value)
+        composeRule.onNodeWithText("hi").assertIsDisplayed()
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
     fun sttResultNonOkNonCanceled_keepsManualInputWithoutErrorOrSend() {
         registerRecognitionService()
         val provider = VoiceLaunchFakeProvider()

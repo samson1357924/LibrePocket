@@ -35,8 +35,9 @@ import kotlinx.serialization.json.putJsonObject
  * - 缺 key（vault 無值／讀取失敗／空字串）→ `Unavailable(MISSING_KEY)`，零網路請求，
  *   不靜默換 provider；401／403 → `Failed(AUTH)`、請求形狀錯誤 → `Failed(PROTOCOL)`，
  *   兩者皆不 fallback（見 [WebSearchSelector.mayFallback]）。
- * - Vault 安全：`getKey` 回傳的 [CharArray] 在 `finally` 以 `fill` 抹除後才離開
- *   `search()`；`probe()` 只用 [KeyVault.hasKey]（boolean，不洩漏存在性以外的資訊）。
+ * - Vault 安全：`getKey` 回傳的 [CharArray] 以不可變 [CredentialSnapshot] 承載；
+ *   snapshot 由最外層持有者於 `finally` 以 `fill` 抹除；
+ *   `probe()` 只用 [KeyVault.hasKey]（boolean，不洩漏存在性以外的資訊）。
  *   已知限制：傳輸層（header／JSON body）需不可變 [String] 拷貝，GC 前短暫駐留，
  *   與聊天 provider 的傳輸姿態一致，呼叫方不得記錄請求內容。
  * - POST 複用 GET 語義：Tavily／Exa／Firecrawl 經 [postAsGet] 把 [WebHttpPost]
@@ -167,20 +168,62 @@ abstract class BaseKeyedSearchProvider(
     }
 
     /**
-     * Cache identity 綁定至當前 credential 的 credential revision：
+     * 單次 vault 讀取取得的憑證狀態（F1 fix）：讀取成功 → [CredentialState.Ready]，
+     * 同一份不可變 [CredentialSnapshot] 既產生 fingerprint、亦供 HTTP 請求使用，
+     * 消除原 read#1(指紋)／read#2(key) 之間的憑證漂移（TOCTOU）。
      * SHA-256（byte-packed CharArray，避免中間 String）截斷為 16 hex chars（64 bits）；
-     * in-memory only、不持久化、不可逆推回 key material；同 keyId 輪換／刪除憑證會自然 miss 舊 cache 列。
-     * 無法確定當前憑證狀態（含暫時故障與缺 key）→ 回傳 [WebSearchProvider.REV_UNAVAILABLE]，Service 將完全旁路快取。
+     * in-memory only、不持久化、不可逆推回 key material。
+     * 無法確定當前憑證狀態（vault 讀取失敗／缺 key／指紋計算失敗）→ [CredentialState.Unavailable]，Service 將完全旁路快取。
+     * [CancellationException] 原樣透傳。
      */
-    final override suspend fun cacheRevision(): String? {
-        val raw = try {
+    final override suspend fun credentialState(): CredentialState {
+        val raw: CharArray = try {
             vault.getKey(keyId)
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
-            return WebSearchProvider.REV_UNAVAILABLE
-        } ?: return WebSearchProvider.REV_UNAVAILABLE
-        val buf = ByteArray(raw.size * 2)
+            return CredentialState.Unavailable
+        } ?: return CredentialState.Unavailable
+        // blank／empty／不可見 key → Unavailable（先 wipe；不產生 fingerprint 列）。
+        // 涵蓋 C0 控制字元與 DEL／C1（CONTROL 類，含 <= 0x20 與 0x7F/0x80-0x9F）、
+        // Unicode 空白（NBSP/figure/narrow/ideographic space 等，以 isSpaceChar 判）
+        // 與 FORMAT 類不可見字元（ZWSP、BOM、soft hyphen、bidi controls）；正當 key 永不含 Cf／Cc 不可見字元。
+        if (raw.isEmpty() || raw.all { it.code <= 0x20 || Character.isWhitespace(it.code) || Character.isSpaceChar(it.code)
+                || Character.getType(it.code) == Character.FORMAT.toInt() || Character.getType(it.code) == Character.CONTROL.toInt() }) {
+            raw.fill('\u0000')
+            return CredentialState.Unavailable
+        }
+        // buf 配置移入 try（Error-window 加固）；任何 Throwable 皆先抹除 raw 再原樣拋出。
+        val fingerprint = try {
+            val buf = ByteArray(raw.size * 2)
+            try {
+                fingerprintOf(raw, buf)
+            } finally {
+                buf.fill(0)
+            }
+        } catch (e: CancellationException) {
+            // CE 原樣透傳；raw 一併抹除
+            raw.fill('\u0000')
+            throw e
+        } catch (t: Throwable) {
+            // Error（如 OOM）window 內亦不得殘留 key material；不改例外型別、原樣拋出。
+            raw.fill('\u0000')
+            throw t
+        }
+        if (fingerprint == null) {
+            // 指紋計算失敗（含理論上的 NoSuchAlgorithmException）→ 不 raw throw。
+            raw.fill('\u0000')
+            return CredentialState.Unavailable
+        }
+        // 所有權移交呼叫方（呼叫方負責 wipe）；此處不得 wipe raw。
+        return CredentialState.Ready(CredentialSnapshot(raw, fingerprint))
+    }
+
+    /**
+     * 計算 [raw] 的 byte-packed SHA-256 指紋（16 hex）；任何失敗（含 NoSuchAlgorithmException）→ null。
+     * 呼叫方負責 wipe [raw]／[buf]。
+     */
+    private fun fingerprintOf(raw: CharArray, buf: ByteArray): String? {
         var j = 0
         try {
             for (c in raw) {
@@ -189,36 +232,48 @@ abstract class BaseKeyedSearchProvider(
             }
             val digest = java.security.MessageDigest.getInstance("SHA-256")
             digest.update(buf)
-            return digest.digest().joinToString("") { "%02x".format(it) }.take(16)
+            return digest.digest().joinToString("") { b -> "%02x".format(Locale.ROOT, b.toInt() and 0xFF) }.take(16)
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
-            // 指紋計算失敗（含理論上的 NoSuchAlgorithmException）→ 哨兵，不 raw throw。
-            return WebSearchProvider.REV_UNAVAILABLE
-        } finally {
-            raw.fill('\u0000')
-            buf.fill(0)
+            return null
         }
     }
 
+    /**
+     * 以 [snapshot] 執行搜尋（**不再讀 vault**；HTTP 使用 snapshot 的 key）。
+     * snapshot 由最外層持有者負責 wipe，本層不得清零。
+     */
+    final override suspend fun searchWithSnapshot(snapshot: CredentialSnapshot, query: String, count: Int): WebSearchOutcome {
+        if (query.isBlank()) return WebSearchOutcome.Unavailable(WebUnavailableReason.EMPTY_QUERY)
+        val key = snapshot.keyAsTrimmedString()
+        if (key.isEmpty()) return WebSearchOutcome.Unavailable(WebUnavailableReason.MISSING_KEY)
+        return searchWithKey(query.trim(), WebSearchBudgets.countOf(count), key)
+    }
+
+    /**
+     * 單次 vault 讀取：request 與 cache fingerprint 同源（F1 fix），不再有第二次 vault 讀取。
+     * vault 故障／缺 key → `Unavailable(MISSING_KEY)`、零網路請求、不寫 cache
+     *（Ok 以外不進 cache 的既有不變量維持）。
+     * blank key → `Unavailable(MISSING_KEY)`、零網路。
+     */
     override suspend fun search(query: String, count: Int): WebSearchOutcome {
         if (query.isBlank()) return WebSearchOutcome.Unavailable(WebUnavailableReason.EMPTY_QUERY)
         // unreachable defense-in-depth（建構期已 fail-fast）
         if (keyId.isBlank()) return WebSearchOutcome.Unavailable(WebUnavailableReason.MISSING_KEY)
         val n = WebSearchBudgets.countOf(count)
-        val raw: CharArray = try {
-            vault.getKey(keyId)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
-            null
-        } ?: return WebSearchOutcome.Unavailable(WebUnavailableReason.MISSING_KEY)
-        try {
-            val key = raw.concatToString().trim()
-            if (key.isEmpty()) return WebSearchOutcome.Unavailable(WebUnavailableReason.MISSING_KEY)
-            return searchWithKey(query.trim(), n, key)
-        } finally {
-            raw.fill('\u0000')
+        when (val state = credentialState()) {
+            CredentialState.Unavailable -> return WebSearchOutcome.Unavailable(WebUnavailableReason.MISSING_KEY)
+            is CredentialState.Ready -> {
+                try {
+                    return searchWithSnapshot(state.snapshot, query, n)
+                } finally {
+                    state.snapshot.wipe()
+                }
+            }
+            CredentialState.NotApplicable ->
+                // unreachable：keyed base 必覆寫 credentialState()
+                return WebSearchOutcome.Unavailable(WebUnavailableReason.MISSING_KEY)
         }
     }
 

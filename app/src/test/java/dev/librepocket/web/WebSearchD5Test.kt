@@ -92,6 +92,33 @@ class WebSearchD5Test {
         override suspend fun hasKey(providerId: String): Boolean = keys.containsKey(providerId)
     }
 
+    /**
+     * FakeVault that models rotation between the first and second read:
+     * the first getKey returns key-A and rotates the stored key to key-B
+     * (any rotation done via putKey still wins for subsequent reads).
+     */
+    private class RotationVault : KeyVault {
+        private val map = mutableMapOf<String, CharArray>()
+        var reads = 0
+
+        override suspend fun putKey(providerId: String, apiKey: CharArray) {
+            map[providerId] = apiKey.copyOf()
+        }
+
+        override suspend fun getKey(providerId: String): CharArray? {
+            reads++
+            val a = map[providerId]?.copyOf()
+            if (reads == 1) map[providerId] = "key-B".toCharArray()
+            return a
+        }
+
+        override suspend fun deleteKey(providerId: String) {
+            map.remove(providerId)
+        }
+
+        override suspend fun hasKey(providerId: String): Boolean = map.containsKey(providerId)
+    }
+
     private class FakeGet(
         val handler: suspend (url: String) -> WebHttpResponse,
     ) : WebHttpGet {
@@ -103,6 +130,24 @@ class WebSearchD5Test {
             lastUrl = url
             lastHeaders = headers
             return handler(url)
+        }
+    }
+
+    /**
+     * FakeGet variant that exposes request headers to the handler
+     *（per-key response dispatch：同一 HTTP endpoint 依 token 回不同 fixture）。
+     */
+    private class FakeGetWithHeaders(
+        val handler: suspend (url: String, headers: Map<String, String>) -> WebHttpResponse,
+    ) : WebHttpGet {
+        val calls = AtomicInteger(0)
+        var lastUrl: String? = null
+        var lastHeaders: Map<String, String>? = null
+        override suspend fun get(url: String, headers: Map<String, String>): WebHttpResponse {
+            calls.incrementAndGet()
+            lastUrl = url
+            lastHeaders = headers
+            return handler(url, headers)
         }
     }
 
@@ -137,6 +182,10 @@ class WebSearchD5Test {
           {"title":"underscore pick","url":"https://foo_bar.example.com/x","description":"skip no host"}
         ]}}
     """.trimIndent()
+
+    /** Per-title Brave response fixture（snapshot 一致性測試專用；單一 result，URL 固定）。 */
+    private fun braveJsonFor(title: String): String =
+        """{"web":{"results":[{"title":"$title","url":"https://example.com/hit","description":"d"}]}}"""
 
     private val tavilyJson = """
         {"results":[
@@ -637,7 +686,7 @@ class WebSearchD5Test {
         assertTrue(first is WebSearchOutcome.Ok)
         assertFalse((first as WebSearchOutcome.Ok).cached)
         vault.deleteKey(BraveSearchProvider.DEFAULT_KEY_ID)
-        // cacheRevision 回 REV_UNAVAILABLE（vault 無 key）→ Service 完全旁路快取（不讀不寫）；
+        // credentialState 回 Unavailable（vault 無 key）→ Service 完全旁路快取（不讀不寫）；
         // delegate.search 亦讀不到 key → Unavailable(MISSING_KEY)，零網路。
         val second = svc.search("kotlin", 5)
         assertTrue(second is WebSearchOutcome.Unavailable)
@@ -650,17 +699,17 @@ class WebSearchD5Test {
         vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
         val http = FakeGet { ok(body = braveJson) }
         val svc = WebSearchService(BraveSearchProvider(vault, http))
-        vault.failRemaining = 1 // 僅第一次 rev probe 拋錯；bypass 路徑不寫 cache
+        vault.failRemaining = 1 // 僅第一次 credentialState 讀取拋錯；bypass 路徑不寫 cache
         val first = svc.search("kotlin", 5)
         assertTrue(first is WebSearchOutcome.Ok)
         assertFalse((first as WebSearchOutcome.Ok).cached)
         assertEquals(1, http.calls.get())
-        // probe 恢復後：cache 尚未有 A 的列（bypass 未寫）→ 再打一次 upstream 並寫入 cache。
+        // 憑證讀取恢復後：cache 尚未有 A 的列（bypass 未寫）→ 再打一次 upstream 並寫入 cache。
         val second = svc.search("kotlin", 5)
         assertTrue(second is WebSearchOutcome.Ok)
         assertFalse((second as WebSearchOutcome.Ok).cached)
         assertEquals(2, http.calls.get())
-        // 後續搜尋：probe 正常 → 命中 A 的 rev 綁定 cache 列。
+        // 後續搜尋：憑證狀態正常 → 命中 A 的指紋綁定 cache 列。
         val third = svc.search("kotlin", 5)
         assertTrue(third is WebSearchOutcome.Ok)
         assertTrue((third as WebSearchOutcome.Ok).cached)
@@ -677,7 +726,7 @@ class WebSearchD5Test {
         assertTrue(first is WebSearchOutcome.Ok)
         assertEquals(1, http.calls.get())
         vault.deleteKey(BraveSearchProvider.DEFAULT_KEY_ID)
-        // probe 回 REV_UNAVAILABLE（vault 無 key）→ 旁路快取，不得讀到舊 Ok 列；
+        // credentialState 回 Unavailable（vault 無 key）→ 旁路快取，不得讀到舊 Ok 列；
         // delegate.search 亦讀不到 key → Unavailable(MISSING_KEY)，零新網路。
         val second = svc.search("kotlin", 5)
         assertTrue(second is WebSearchOutcome.Unavailable)
@@ -693,7 +742,7 @@ class WebSearchD5Test {
         val first = svc.search("kotlin", 5)
         assertTrue(first is WebSearchOutcome.Ok)
         assertEquals(1, http.calls.get())
-        // A → B 輪換；probe 暫時故障 → bypass，直接以 B 打 upstream，不得命中 A 的 stale 列。
+        // A → B 輪換；憑證讀取暫時故障 → bypass，直接以 B 打 upstream，不得命中 A 的 stale 列。
         vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-B".toCharArray())
         vault.failRemaining = 1
         val second = svc.search("kotlin", 5)
@@ -710,8 +759,8 @@ class WebSearchD5Test {
         val first = svc.search("kotlin", 5)
         assertTrue(first is WebSearchOutcome.Ok)
         assertEquals(1, http.calls.get())
-        // A 的 Ok 列已寫入 fp-A；接著讓下一次 rev probe 故障並刪除 key：
-        // stale A 列＋壞 probe＋已撤銷憑證 → 不得回傳 stale Ok，零網路。
+        // A 的 Ok 列已寫入 fp-A；接著讓下一次 credentialState 故障並刪除 key：
+        // stale A 列＋壞 credentialState＋已撤銷憑證 → 不得回傳 stale Ok，零網路。
         vault.failRemaining = 1
         vault.deleteKey(BraveSearchProvider.DEFAULT_KEY_ID)
         val second = svc.search("kotlin", 5)
@@ -721,7 +770,7 @@ class WebSearchD5Test {
     }
 
     @Test fun sentinelSearchesNeverWriteCacheRows() = runBlocking {
-        // G1 哨兵不得「退化」成 plain cache：REV_UNAVAILABLE 期間每次皆 bypass，
+        // 缺 key／vault 故障哨兵（Unavailable）不得「退化」成 plain cache：Unavailable 期間每次皆 bypass，
         // 不讀不寫；若 sentinel 路徑寫了 plain 列，後續輪換後的搜尋會被誤中。
         val vault = FlakyProbeVault()
         vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
@@ -731,14 +780,14 @@ class WebSearchD5Test {
         val first = svc.search("kotlin", 5)
         assertTrue(first is WebSearchOutcome.Ok)
         assertEquals(1, http.calls.get())
-        // A → B 輪換；probe 暫時故障 → bypass，B 必須 fresh 打 upstream，命中不得寫 cache。
+        // A → B 輪換；憑證讀取暫時故障 → bypass，B 必須 fresh 打 upstream，命中不得寫 cache。
         vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-B".toCharArray())
         vault.failRemaining = 1
         val second = svc.search("kotlin", 5)
         assertTrue(second is WebSearchOutcome.Ok)
         assertFalse((second as WebSearchOutcome.Ok).cached)
         assertEquals(2, http.calls.get())
-        // B → C 輪換；再度 bypass：若 sentinel 路徑曾寫 plain 列，此搜尋會被 cache 命中。
+        // B → C 輪換；再度 bypass：若 Unavailable 路徑曾寫 plain 列，此搜尋會被 cache 命中。
         vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-C".toCharArray())
         vault.failRemaining = 1
         val third = svc.search("kotlin", 5)
@@ -753,15 +802,15 @@ class WebSearchD5Test {
         val http = FakeGet { ok(body = braveJson) }
         val inner = WebSearchService(BraveSearchProvider(vault, http))
         val outer = WebSearchService(inner)
-        // outer rev probe 故障 → outer 完全 bypass → inner 自行跑：
-        // inner 的 probe 在 flake 消耗後恢復 → fp-A → inner MISS → upstream 一次；
+        // outer credentialState 故障 → outer 完全 bypass → inner 自行跑：
+        // inner 的憑證讀取在 flake 消耗後恢復 → fp-A → inner MISS → upstream 一次；
         // outer bypass 不寫 cache，outer 層 cached=false。
         vault.failRemaining = 1
         val first = outer.search("kotlin", 5)
         assertTrue(first is WebSearchOutcome.Ok)
         assertFalse((first as WebSearchOutcome.Ok).cached)
         assertEquals(1, http.calls.get())
-        // 同 query 再搜：outer rev=fp-A、outer cache miss → 委派 inner；
+        // 同 query 再搜：outer 解析得 fp-A、outer cache miss → 委派 inner；
         // inner 命中 search #1 寫入的 fp-A 列（cached=true），upstream 不再打。
         val second = outer.search("kotlin", 5)
         assertTrue(second is WebSearchOutcome.Ok)
@@ -769,21 +818,51 @@ class WebSearchD5Test {
         assertEquals(1, http.calls.get())
     }
 
-    @Test fun throwingCacheRevisionIsUncacheableAndFailClosed() = runBlocking {
+    @Test fun nestedServicesUseOuterSnapshotAndNeverReReadVault() = runBlocking {
+        // 巢狀 Service：outer 解析一次 vault，sticky 透傳 inner → 最底層 provider。
+        // inner／provider 層皆不得重讀 vault（每層各自快取以同一份 snapshot fingerprint 為 key）。
+        val vault = RotationVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGetWithHeaders { _, headers ->
+            val key = headers["X-Subscription-Token"]
+            if (key == "key-A") ok(body = braveJsonFor("A-title")) else ok(body = braveJsonFor("B-title"))
+        }
+        val inner = WebSearchService(BraveSearchProvider(vault, http))
+        val outer = WebSearchService(inner)
+        // 第一次：outer 解析（getKey#1 → A）並順手輪換成 B；sticky 透傳 inner → HTTP 仍用 A
+        val first = outer.search("kotlin", 5)
+        assertTrue(first is WebSearchOutcome.Ok)
+        assertEquals("A-title", (first as WebSearchOutcome.Ok).results[0].title)
+        assertFalse(first.cached)
+        assertEquals("key-A", http.lastHeaders!!["X-Subscription-Token"])
+        // 第二次：outer 解析 getKey#2 → B → fpB → outer miss（只有 fpA 列）→ inner sticky(fpB) →
+        // inner miss → provider.searchWithSnapshot(B) → HTTP 帶 key-B → B-title。
+        // 每次搜尋恰好 1 次 vault reads（outer resolve；inner 全走 sticky，零重讀）。
+        val second = outer.search("kotlin", 5)
+        assertTrue(second is WebSearchOutcome.Ok)
+        assertEquals("B-title", (second as WebSearchOutcome.Ok).results[0].title)
+        assertFalse(second.cached)
+        assertEquals("key-B", http.lastHeaders!!["X-Subscription-Token"])
+        assertEquals(2, http.calls.get())
+        // inner 層零憑證讀取（否則總 reads ≥ 3）；輪換只發生一次（reads==1 gate 已消耗）。
+        assertEquals(2, vault.reads)
+    }
+
+    @Test fun throwingCredentialStateIsUncacheableAndFailClosed() = runBlocking {
         val delegate = object : WebSearchProvider {
             override val id: String = "custom-keyed"
             override val capabilities: Set<WebCapability> = emptySet()
-            var calls = 0; var revCalls = 0
+            var calls = 0
             override suspend fun probe(): WebProbe = WebProbe.Ready
             override suspend fun search(query: String, count: Int): WebSearchOutcome {
                 calls++
                 return WebSearchOutcome.Ok(emptyList())
             }
-            override suspend fun cacheRevision(): String? = throw IllegalStateException("boom")
+            override suspend fun credentialState(): CredentialState = throw IllegalStateException("boom")
         }
         val svc = WebSearchService(delegate)
         val out = svc.search("q", 5)
-        assertTrue("rev 拋出不得原樣逃出：$out", out is WebSearchOutcome.Ok)
+        assertTrue("credentialState 拋出不得原樣逃出：$out", out is WebSearchOutcome.Ok)
         assertEquals(1, delegate.calls)
         // 旁路不寫快取：第二次照樣打 upstream
         svc.search("q", 5)
@@ -1384,6 +1463,115 @@ class WebSearchD5Test {
         assertEquals(2, http.calls.get())
     }
 
+    // ---- F1：credentialState→fetch 快照一致性 ----
+
+    @Test fun rotationBetweenProbeAndFetchServesConsistentSnapshot() = runBlocking {
+        // 第一次 getKey（外層 resolve）回傳 A 並把 vault 輪換為 B：
+        // snapshot 必須全程帶 A（HTTP 與 cache fingerprint 同源），輪換後的 B 只能在下一次搜尋出現。
+        val vault = RotationVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGetWithHeaders { _, headers ->
+            if (headers["X-Subscription-Token"] == "key-A") {
+                ok(body = braveJsonFor("A-title"))
+            } else {
+                ok(body = braveJsonFor("B-title"))
+            }
+        }
+        val svc = WebSearchService(BraveSearchProvider(vault, http))
+        val first = svc.search("kotlin", 5)
+        assertTrue(first is WebSearchOutcome.Ok)
+        assertEquals("A-title", (first as WebSearchOutcome.Ok).results[0].title)
+        assertFalse(first.cached)
+        assertEquals(1, http.calls.get())
+        // vault 已於第一次 getKey 輪換為 B（RotationVault 行為）：
+        // 第二次 resolve 得 B → 打 upstream 時帶 B，不得命中 fp-A 的 cache 列。
+        val second = svc.search("kotlin", 5)
+        assertTrue(second is WebSearchOutcome.Ok)
+        assertEquals("B-title", (second as WebSearchOutcome.Ok).results[0].title)
+        assertFalse(second.cached)
+        assertEquals(2, http.calls.get())
+        // 輪回 A：fp-A 的 cache 列必須命中；B 的列絕不得被當成 A 的資料。
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val third = svc.search("kotlin", 5)
+        assertTrue(third is WebSearchOutcome.Ok)
+        val thirdOk = third as WebSearchOutcome.Ok
+        assertEquals("A-title", thirdOk.results[0].title)
+        assertTrue(thirdOk.cached)
+        assertEquals(2, http.calls.get())
+    }
+
+    @Test fun followerReElectionAfterLeaderDeathUsesCurrentCredential() = runBlocking {
+        // Follower 已掛上 leader 的 shared deferred（同 fp-A cacheKey）；此時 vault A→B：
+        // leader 死亡後 follower 重選必須重讀當前 vault，以 B 打 upstream，不得重用 A 的憑證／HTTP 依據。
+        val release = CompletableDeferred<Unit>()
+        val entered = CompletableDeferred<Unit>()
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGetWithHeaders { _, headers ->
+            entered.complete(Unit)
+            release.await()
+            if (headers["X-Subscription-Token"] == "key-A") {
+                ok(body = braveJsonFor("A-title"))
+            } else {
+                ok(body = braveJsonFor("B-title"))
+            }
+        }
+        val svc = WebSearchService(BraveSearchProvider(vault, http, timeoutMs = 60_000))
+        val leader = async { svc.search("kotlin", 5) }
+        withTimeout(5_000) { entered.await() }
+        // UNDISPATCHED：return 時 follower 已掛上 shared deferred。
+        val follower = async(start = CoroutineStart.UNDISPATCHED) { svc.search("kotlin", 5) }
+        delay(50)
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-B".toCharArray())
+        leader.cancel()
+        release.complete(Unit)
+        try {
+            withTimeout(5_000) { leader.await() }
+            fail("leader must throw CancellationException")
+        } catch (_: CancellationException) {
+            // expected：leader 取消，shared deferred completeExceptionally
+        }
+        val out = withTimeout(5_000) { follower.await() }
+        assertTrue(out is WebSearchOutcome.Ok)
+        assertFalse((out as WebSearchOutcome.Ok).cached)
+        assertEquals("B-title", out.results[0].title)
+        assertEquals("key-B", http.lastHeaders!!["X-Subscription-Token"])
+        assertEquals(2, http.calls.get())
+    }
+
+    @Test fun deletedCredentialNeverResentAfterLeaderDeath() = runBlocking {
+        // Follower 已掛上 leader 的 shared deferred；leader 死亡前 key 被刪除：
+        // follower 重選 resolve 不到憑證 → 旁路 → delegate search 回 MISSING_KEY，零網路，
+        // 已刪除的憑證絕不會被重送。
+        val release = CompletableDeferred<Unit>()
+        val entered = CompletableDeferred<Unit>()
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGetWithHeaders { _, _ ->
+            entered.complete(Unit)
+            release.await()
+            ok(body = braveJsonFor("A-title"))
+        }
+        val svc = WebSearchService(BraveSearchProvider(vault, http, timeoutMs = 60_000))
+        val leader = async { svc.search("kotlin", 5) }
+        withTimeout(5_000) { entered.await() }
+        val follower = async(start = CoroutineStart.UNDISPATCHED) { svc.search("kotlin", 5) }
+        delay(50)
+        vault.deleteKey(BraveSearchProvider.DEFAULT_KEY_ID)
+        leader.cancel()
+        release.complete(Unit)
+        try {
+            withTimeout(5_000) { leader.await() }
+            fail("leader must throw CancellationException")
+        } catch (_: CancellationException) {
+            // expected：leader 取消，shared deferred completeExceptionally
+        }
+        val out = withTimeout(5_000) { follower.await() }
+        assertTrue(out is WebSearchOutcome.Unavailable)
+        assertEquals(WebUnavailableReason.MISSING_KEY, (out as WebSearchOutcome.Unavailable).reason)
+        assertEquals(1, http.calls.get()) // 只有 leader 的那一次；retry 沒發任何請求
+    }
+
     // ---- keyed CharArray 抹除（TrackingVault：getKey 直接參照回傳） ----
 
     @Test fun keyArrayWipedOnSuccess() = runBlocking {
@@ -1423,7 +1611,20 @@ class WebSearchD5Test {
         assertTrue("blank key 的 buffer 必須被抹除", vault.captured!!.all { it == '\u0000' })
     }
 
-    // ---- probe／vault 失敗分支 ----
+    @Test fun cfBlankKeyIsMissingKeyZeroNetworkAndCapturedBufferWiped() = runBlocking {
+        // Unicode FORMAT 類不可見字元（soft hyphen、ZWSP、BOM）構成的 key：不可見 ⇒ 缺憑證，
+        // 不得產生 HTTP 呼叫；buffer 必須被抹除。（U+007F DEL 等 CONTROL 類亦涵蓋。）
+        val vault = TrackingVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "\u00AD\u200B\uFEFF".toCharArray())
+        val httpGet = FakeGet { ok(body = braveJson) }
+        val out = BraveSearchProvider(vault, httpGet).search("kotlin", 5)
+        assertTrue(out is WebSearchOutcome.Unavailable)
+        assertEquals(WebUnavailableReason.MISSING_KEY, (out as WebSearchOutcome.Unavailable).reason)
+        assertEquals(0, httpGet.calls.get())
+        assertTrue("CF blank key 的 buffer 必須被抹除", vault.captured!!.all { it == '\u0000' })
+    }
+
+    // ---- credentialState／vault 失敗分支 ----
 
     @Test fun hasKeyThrowsMakesProbeNotReady() = runBlocking {
         val vault = FakeVault()

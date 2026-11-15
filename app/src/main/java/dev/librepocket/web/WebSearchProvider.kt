@@ -6,6 +6,34 @@ enum class WebCapability {
     REQUIRES_URL,
 }
 
+/** 單次 vault 讀取得出的憑證狀態。 */
+sealed interface CredentialState {
+    /** 非 keyed provider（無綁定憑證）→ 沿用舊 cache 行為。 */
+    data object NotApplicable : CredentialState
+    /** vault 讀取失敗／缺 key（含暫時故障）→ Service 完全旁路快取（不讀不寫、不進 single-flight）、fail-closed；零網路（delegate `search()` 傳回 MISSING_KEY）。 */
+    data object Unavailable : CredentialState
+    /** 讀取成功；snapshot 所有權移交呼叫方，呼叫方負責 wipe（見 [CredentialSnapshot.wipe]）。 */
+    class Ready(val snapshot: CredentialSnapshot) : CredentialState
+}
+
+/**
+ * 不可變憑證快照：同一份 CharArray 既產生 cache 指紋（[fingerprint]）、亦供 HTTP 請求使用，
+ * 消除 read#1(指紋)／read#2(key) 之間的憑證漂移。in-memory only；絕不落盤。
+ * 指紋 = SHA-256(CharArray 經 LE byte-pack) 截斷 16 hex。key material 不進指紋、不印出。
+ */
+class CredentialSnapshot internal constructor(
+    internal val key: CharArray,
+    val fingerprint: String,
+) {
+    /** 與原 `search()` 相同的正規化：concat → trim。僅供 provider 內部單次請求使用。 */
+    internal fun keyAsTrimmedString(): String = key.concatToString().trim()
+
+    /** 清零持有的 key material（呼叫方責任：`finally` 保證）。 */
+    fun wipe() {
+        key.fill('\u0000')
+    }
+}
+
 /** `probe()` 結果（D1 只定契約；SearXNG／DDGS 實作與超時待 D2）。 */
 sealed interface WebProbe {
     data object Ready : WebProbe
@@ -41,28 +69,25 @@ interface WebSearchProvider {
     val capabilities: Set<WebCapability>
 
     /**
-     * Credential revision for cache coherence. Implementations holding a
-     * bound credential (keyed providers) MUST return a non-null, stable-but-
-     * distinct value per distinct credential, or [REV_UNAVAILABLE] when the
-     * credential state cannot be determined (transient vault failure / missing
-     * key); [null] means "no credential" (non-keyed provider) and preserves
-     * legacy cache behavior.
-     *
-     * The value is in-memory only (a fingerprint), never persisted, and must not
-     * be derivable back into key material.
-     * [REV_UNAVAILABLE] is a bypass sentinel: [WebSearchService] must not read,
-     * join, or write any cache row when it is returned.
+     * 解析一次 vault 憑證快照（keyed provider）。預設 [CredentialState.NotApplicable]（keyless）。
+     * 以 throw 方式表達 vault 暫時故障時，[WebSearchService] 會映射為 [CredentialState.Unavailable]（旁路、fail-closed），不拋給呼叫端。
+     * [CancellationException] 原樣透傳。
      */
-    suspend fun cacheRevision(): String? = null
+    suspend fun credentialState(): CredentialState = CredentialState.NotApplicable
+
+    /**
+     * 以 [snapshot] 執行搜尋（不再讀 vault；HTTP 使用 snapshot 的 key）。
+     * 巢狀 [WebSearchService]：Service 收到此呼叫時，沿用外層已解析的同一份 snapshot 繼續處理（見 Service KDoc）。
+     * 預設實作 fail-closed（`Unavailable(MISSING_KEY)`）：keyed provider MUST 覆寫本方法
+     * （否則 HTTP 會重讀 vault，重新引入憑證漂移）。keyless provider 不會走到這裡。
+     * 不得清零傳入的 snapshot（由最外層持有者負責）。
+     */
+    suspend fun searchWithSnapshot(snapshot: CredentialSnapshot, query: String, count: Int): WebSearchOutcome =
+        WebSearchOutcome.Unavailable(WebUnavailableReason.MISSING_KEY)
 
     /** 可用性探測（缺 key／缺 URL 回 [WebProbe.NotReady]，不拋異常）。 */
     suspend fun probe(): WebProbe
 
     /** 搜尋（空 query 回 `Unavailable(EMPTY_QUERY)`，不發任何請求）。 */
     suspend fun search(query: String, count: Int): WebSearchOutcome
-
-    companion object {
-        /** keyed provider 的 vault 讀取故障／憑證狀態未知哨兵：Service 必須旁路（bypass）整個快取，不讀不寫。 */
-        const val REV_UNAVAILABLE: String = "rev-unavailable"
-    }
 }

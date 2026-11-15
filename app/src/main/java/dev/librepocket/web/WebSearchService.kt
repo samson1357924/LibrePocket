@@ -34,10 +34,19 @@ import kotlinx.coroutines.withContext
  *   `Failed(TRANSPORT)` 值回傳（fail-closed，允許非 pinned fallback），不 raw throw；
  *   `Error` 仍 `completeExceptionally` 後原樣拋出。
  * - 空 query 直接委派（`Unavailable(EMPTY_QUERY)`），不進 cache／in-flight 表。
- * - Cache identity 綁定 credential revision：[WebSearchProvider.cacheRevision] 非 null 時
- *   （keyed provider）cache key 附加 `#rev:<fingerprint>`，同 keyId 輪換／刪除憑證會自然 miss 舊列；
- *   `REV_UNAVAILABLE`（keyed vault 暫時故障／缺 key，憑證狀態未知）→ 完全旁路快取（不讀不寫、不進
- *   single-flight、不寫快取，uncacheable）；非 keyed provider（rev==null）行為完全不變。
+ * - Cache identity 綁定同一份不可變 credential snapshot（F1）：以 [WebSearchProvider.credentialState]
+ *   單次解析（keyed provider），[CredentialState.Ready] 的 snapshot 同時供 fingerprint 與 HTTP 請求使用
+ *   （request 與 cache identity 同源）；[CredentialState.Unavailable]（keyed vault 暫時故障／缺 key，
+ *   憑證狀態未知）→ 完全旁路快取（不讀不寫、不進 single-flight、不寫快取，uncacheable）；
+ *   [CredentialState.NotApplicable]（非 keyed provider）→ plain cache key，行為完全不變。
+ * - Follower 重選會重讀「當前」vault：重試時 [WebSearchProvider.credentialState] 重新解析，
+ *   不沿用已輪換／已刪除的舊憑證；刪除的憑證絕不會在重試時被重送（resolve 不到 → 旁路 → delegate `search()`
+ *   回 MISSING_KEY）。刪除憑證由 keyed delegate 零網路收斂。
+ * - 巢狀 Service 透傳同一份 snapshot：[searchWithSnapshot] 沿用外層已解析的同一份 snapshot 繼續處理
+ *   （sticky），所有權不轉移、本層絕不 wipe（最外層持有者於 `finally` 負責）；
+ *   每個 nesting 層級各自執行 cache／single-flight，fingerprint 一致故不會互撞。
+ * - 非符合契約之 delegate 若 credentialState 拋出 raw Exception：CE 原樣透傳、
+ *   其他一律映射為旁路（[CredentialState.Unavailable]），不把例外直接拋給呼叫端。
  * - 快取隔離：預設每個 Service 持有自有 [WebSearchCache]，不同 provider 的
  *   Service 快取互相隔離；如需跨 provider／跨 Service 共用快取，請顯式傳入
  *   同一 [WebSearchCache] 實例。共用快取以 [WebSearchProvider.cacheNamespace]
@@ -59,8 +68,8 @@ class WebSearchService(
 
     override suspend fun probe(): WebProbe = delegate.probe()
 
-    /** 透傳 delegate 的 credential revision（巢狀 Service 包裝時 cache identity 不遺失）。 */
-    override suspend fun cacheRevision(): String? = delegate.cacheRevision()
+    /** 透傳 delegate 的憑證狀態解析（巢狀 Service 包裝時 cache identity 不遺失）。 */
+    override suspend fun credentialState(): CredentialState = delegate.credentialState()
 
     @Deprecated("Use id", ReplaceWith("id"))
     val providerId: String get() = delegate.id
@@ -73,102 +82,159 @@ class WebSearchService(
 
     override suspend fun search(query: String, count: Int): WebSearchOutcome {
         if (query.isBlank()) return delegate.search(query, count)
-        val n = WebSearchBudgets.countOf(count)
-        // Keyed provider 以 credential revision 綁定 cache identity：輪換／刪除憑證自然 miss 舊列；
-        // rev==null（非 keyed）→ plain key，行為不變；REV_UNAVAILABLE（keyed vault 暫時故障／缺 key）
-        // → 完全旁路快取，不讀不寫（uncacheable）。
-        // 非符合契約之 delegate 若 rev probe 拋出 raw Exception：CE 原樣透傳、
-        // 其他一律映射為旁路（REV_UNAVAILABLE），不把例外直接拋給呼叫端。
-        val rev = try {
-            delegate.cacheRevision()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
-            WebSearchProvider.REV_UNAVAILABLE
-        }
-        if (rev == WebSearchProvider.REV_UNAVAILABLE) {
-            // 不查快取、不 single-flight、不寫快取（uncacheable）；
+        return searchInternal(query, WebSearchBudgets.countOf(count), null)
+    }
+
+    /**
+     * 巢狀 Service 入口：沿用外層已解析的同一份 [snapshot]（sticky）繼續處理。
+     * 所有權不在本函數；絕不 wipe 傳入的 snapshot（由最外層持有者於 `finally` 負責）。
+     * 收到此呼叫時不重新解析 vault——外層 snapshot 即本層 cache identity 與 HTTP 依據。
+     * 非符合契約之 keyed 子類務必覆寫 searchWithSnapshot（否則 HTTP 會重讀 vault，重新引入憑證漂移）。
+     */
+    override suspend fun searchWithSnapshot(
+        snapshot: CredentialSnapshot,
+        query: String,
+        count: Int,
+    ): WebSearchOutcome {
+        if (query.isBlank()) return delegate.search(query, count)
+        return searchInternal(query, WebSearchBudgets.countOf(count), snapshot)
+    }
+
+    /**
+     * 搜尋主迴圈。每個迴圈迭代重新解析「當前」憑證狀態（sticky 模式除外——sticky 由外層持有，
+     * 所有權不在此，絕不 wipe）；follower 重選因此會重讀當前 vault，不重用過期憑證。
+     */
+    private suspend fun searchInternal(
+        query: String,
+        n: Int,
+        sticky: CredentialSnapshot?,
+    ): WebSearchOutcome {
+        while (true) {
+            val state = if (sticky != null) {
+                CredentialState.Ready(sticky)
+            } else {
+                try {
+                    delegate.credentialState()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    CredentialState.Unavailable
+                }
+            }
+            // 旁路（uncacheable）共用：不查快取、不 single-flight、不寫快取；
             // 對 delegate 的 raw Exception 映射為 Failed(TRANSPORT)（fail-closed），CE 原樣透傳。
-            return try {
+            // NOTE(F2): central ensureActive() for this branch lands in the next phase
+            suspend fun bypass(): WebSearchOutcome = try {
                 delegate.search(query, n)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
                 WebSearchOutcome.Failed(WebFailureReason.TRANSPORT)
             }
-        }
-        val cacheKey = cache.key(delegate.cacheNamespace, query, n).let { if (rev != null) "$it#rev:$rev" else it }
-        while (true) {
-            cache.getByKey(cacheKey)?.let { return it.copy(cached = true) }
-
-            var lateHit: WebSearchOutcome.Ok? = null
-            var mine: CompletableDeferred<WebSearchOutcome>? = null
-            var leader = false
-            mutex.withLock {
-                lateHit = cache.getByKey(cacheKey) // re-check under lock closes check-then-elect race
-                if (lateHit == null) {
-                    val existing = inFlight[cacheKey]
-                    if (existing != null) {
-                        mine = existing
-                    } else {
-                        val fresh = CompletableDeferred<WebSearchOutcome>()
-                        mine = fresh
-                        inFlight[cacheKey] = fresh
-                        leader = true
-                    }
-                }
-            }
-            lateHit?.let { return it.copy(cached = true) }
-            val m = mine ?: continue // unreachable (lateHit==null implies elected/joined) but safe
-            if (!leader) {
-                try {
-                    return m.await()
-                } catch (_: CancellationException) {
-                    // Follower 自己被取消 → ensureActive 拋出，原樣透傳；
-                    // 否則是 leader 死亡 → 迴圈重選（成為新 leader）。
-                    currentCoroutineContext().ensureActive()
-                    continue
-                }
-            }
-
-            var okForFollowers: WebSearchOutcome.Ok? = null
+            // snapshot 於 try 內指派（含 cacheKey 建構／cacheNamespace 取用）——
+            // 任何路徑（cache hit、join、leader 收斂、例外、retry）皆由單一 finally 負責 wipe。
+            var snapshot: CredentialSnapshot? = null
+            var retry = false
             try {
-                val outcome = delegate.search(query, n)
-                if (outcome is WebSearchOutcome.Ok) okForFollowers = outcome
-                // 吞掉取消的壞 delegate：已取消仍回值時不得寫 cache。
-                currentCoroutineContext().ensureActive()
-                if (outcome is WebSearchOutcome.Ok) {
-                    cache.putByKey(cacheKey, outcome)
-                }
-                m.complete(outcome)
-                return outcome
-            } catch (e: CancellationException) {
-                // Leader 已拿到 Ok 才觀察到取消：follower 仍值得該值（不寫 cache），
-                // leader 自己拋 CE；否則 follower 會重試，不污染。
-                val ok = okForFollowers
-                if (ok != null) {
-                    m.complete(ok)
-                } else {
-                    m.completeExceptionally(e)
-                }
-                throw e
-            } catch (_: Exception) {
-                try { currentCoroutineContext().ensureActive() }
-                catch (ce: CancellationException) { m.completeExceptionally(ce); throw ce }
-                val failed = WebSearchOutcome.Failed(WebFailureReason.TRANSPORT)
-                m.complete(failed)
-                return failed
-            } catch (e: Throwable) {
-                m.completeExceptionally(e)
-                throw e
-            } finally {
-                // 取消狀態下仍須清 inFlight，否則殘留已取消的 deferred 會焊住後續同 key。
-                withContext(NonCancellable) {
-                    mutex.withLock {
-                        if (inFlight[cacheKey] === m) inFlight.remove(cacheKey)
+                snapshot = when (state) {
+                    CredentialState.Unavailable -> return bypass()
+                    CredentialState.NotApplicable -> null // plain cache key，行為不變
+                    is CredentialState.Ready -> state.snapshot
+                    else -> {
+                        // 未來新增子型式時 fail-closed（預設旁路）
+                        return bypass()
                     }
                 }
+                val cacheKey = cache.key(delegate.cacheNamespace, query, n)
+                    .let { if (snapshot != null) "$it#rev:${snapshot.fingerprint}" else it }
+                cache.getByKey(cacheKey)?.let { return it.copy(cached = true) }
+
+                var lateHit: WebSearchOutcome.Ok? = null
+                var mine: CompletableDeferred<WebSearchOutcome>? = null
+                var leader = false
+                mutex.withLock {
+                    lateHit = cache.getByKey(cacheKey) // re-check under lock closes check-then-elect race
+                    if (lateHit == null) {
+                        val existing = inFlight[cacheKey]
+                        if (existing != null) {
+                            mine = existing
+                        } else {
+                            val fresh = CompletableDeferred<WebSearchOutcome>()
+                            mine = fresh
+                            inFlight[cacheKey] = fresh
+                            leader = true
+                        }
+                    }
+                }
+                lateHit?.let { return it.copy(cached = true) }
+                val m = mine
+                if (m == null) {
+                    // unreachable（lateHit == null ⇒ 已選舉／加入 in-flight），但安全重解析。
+                    retry = true
+                } else if (!leader) {
+                    try {
+                        return m.await()
+                    } catch (_: CancellationException) {
+                        // Follower 自己被取消 → ensureActive 拋出，原樣透傳；
+                        // 否則是 leader 死亡 → 迴圈重選（成為新 leader），重解析當前憑證狀態。
+                        currentCoroutineContext().ensureActive()
+                        retry = true
+                    }
+                } else {
+                    var okForFollowers: WebSearchOutcome.Ok? = null
+                    try {
+                        // request 與 cache identity 同源：snapshot 存在 → 同一 key；
+                        // 不再讀 vault（F1）。
+                        val outcome = if (snapshot != null) {
+                            delegate.searchWithSnapshot(snapshot, query, n)
+                        } else {
+                            delegate.search(query, n)
+                        }
+                        if (outcome is WebSearchOutcome.Ok) okForFollowers = outcome
+                        // 吞掉取消的壞 delegate：已取消仍回值時不得寫 cache。
+                        currentCoroutineContext().ensureActive()
+                        if (outcome is WebSearchOutcome.Ok) {
+                            cache.putByKey(cacheKey, outcome)
+                        }
+                        m.complete(outcome)
+                        return outcome
+                    } catch (e: CancellationException) {
+                        // Leader 已拿到 Ok 才觀察到取消：follower 仍值得該值（不寫 cache），
+                        // leader 自己拋 CE；否則 follower 會重試，不污染。
+                        val ok = okForFollowers
+                        if (ok != null) {
+                            m.complete(ok)
+                        } else {
+                            m.completeExceptionally(e)
+                        }
+                        throw e
+                    } catch (_: Exception) {
+                        try {
+                            currentCoroutineContext().ensureActive()
+                        } catch (ce: CancellationException) {
+                            m.completeExceptionally(ce)
+                            throw ce
+                        }
+                        val failed = WebSearchOutcome.Failed(WebFailureReason.TRANSPORT)
+                        m.complete(failed)
+                        return failed
+                    } catch (e: Throwable) {
+                        m.completeExceptionally(e)
+                        throw e
+                    } finally {
+                        // 取消狀態下仍須清 inFlight，否則殘留已取消的 deferred 會焊住後續同 key。
+                        withContext(NonCancellable) {
+                            mutex.withLock {
+                                if (inFlight[cacheKey] === m) inFlight.remove(cacheKey)
+                            }
+                        }
+                    }
+                }
+            } finally {
+                // sticky 由外層持有 → 絕不 wipe；否則本層 delete 掉自己解析的 snapshot。
+                if (sticky == null) snapshot?.wipe()
             }
+            if (!retry) error("unreachable") // 所有路徑皆已 return
         }
     }
 }

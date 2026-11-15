@@ -1,10 +1,12 @@
 package dev.librepocket.privilege.github
 
 import java.io.File
+import java.nio.file.Files
 import javax.xml.parsers.DocumentBuilderFactory
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.w3c.dom.Document
@@ -40,7 +42,7 @@ class ShizukuManifestPinTest {
         const val ANDROID_NS = "http://schemas.android.com/apk/res/android"
         const val TOOLS_NS = "http://schemas.android.com/tools"
         const val SHIZUKU_PROVIDER_CLASS = "rikka.shizuku.ShizukuProvider"
-        const val SHIZUKU_AUTHORITY = "\${applicationId}.shizuku"
+        const val SHIZUKU_AUTHORITY = "${'$'}{applicationId}.shizuku"
         const val SHIZUKU_PERMISSION = "android.permission.INTERACT_ACROSS_USERS_FULL"
     }
 
@@ -224,7 +226,7 @@ class ShizukuManifestPinTest {
         assertProviderParentIsApplication(file, provider)
         val nodeAction = provider.getAttributeNS(TOOLS_NS, "node").trim()
         assertFalse(
-            "github variant overlay (${file.path}) must not remove ShizukuProvider",
+            "github variant overlay (${file.path}) must not use tools:node='remove' on ShizukuProvider",
             nodeAction.equals("remove", ignoreCase = true),
         )
         if (nodeAction.equals("replace", ignoreCase = true)) {
@@ -247,22 +249,46 @@ class ShizukuManifestPinTest {
             )
         }
         if (provider.hasAttributeNS(ANDROID_NS, "name")) {
-            assertEquals(SHIZUKU_PROVIDER_CLASS, provider.getAttributeNS(ANDROID_NS, "name"))
+            assertEquals(
+                "github variant overlay (${file.path}) must keep android:name=$SHIZUKU_PROVIDER_CLASS",
+                SHIZUKU_PROVIDER_CLASS,
+                provider.getAttributeNS(ANDROID_NS, "name"),
+            )
         }
         if (provider.hasAttributeNS(ANDROID_NS, "authorities")) {
-            assertEquals(SHIZUKU_AUTHORITY, provider.getAttributeNS(ANDROID_NS, "authorities"))
+            assertEquals(
+                "github variant overlay (${file.path}) must keep android:authorities=$SHIZUKU_AUTHORITY",
+                SHIZUKU_AUTHORITY,
+                provider.getAttributeNS(ANDROID_NS, "authorities"),
+            )
         }
         if (provider.hasAttributeNS(ANDROID_NS, "enabled")) {
-            assertEquals("true", provider.getAttributeNS(ANDROID_NS, "enabled"))
+            assertEquals(
+                "github variant overlay (${file.path}) must keep android:enabled=true",
+                "true",
+                provider.getAttributeNS(ANDROID_NS, "enabled"),
+            )
         }
         if (provider.hasAttributeNS(ANDROID_NS, "exported")) {
-            assertEquals("true", provider.getAttributeNS(ANDROID_NS, "exported"))
+            assertEquals(
+                "github variant overlay (${file.path}) must keep android:exported=true",
+                "true",
+                provider.getAttributeNS(ANDROID_NS, "exported"),
+            )
         }
         if (provider.hasAttributeNS(ANDROID_NS, "multiprocess")) {
-            assertEquals("false", provider.getAttributeNS(ANDROID_NS, "multiprocess"))
+            assertEquals(
+                "github variant overlay (${file.path}) must keep android:multiprocess=false",
+                "false",
+                provider.getAttributeNS(ANDROID_NS, "multiprocess"),
+            )
         }
         if (provider.hasAttributeNS(ANDROID_NS, "permission")) {
-            assertEquals(SHIZUKU_PERMISSION, provider.getAttributeNS(ANDROID_NS, "permission"))
+            assertEquals(
+                "github variant overlay (${file.path}) must keep android:permission=$SHIZUKU_PERMISSION",
+                SHIZUKU_PERMISSION,
+                provider.getAttributeNS(ANDROID_NS, "permission"),
+            )
         }
         assertFalse(
             "github variant overlay (${file.path}) must not override android:readPermission",
@@ -307,6 +333,10 @@ class ShizukuManifestPinTest {
     }
 
     @Test fun githubVariantOverlaysIfPresentDoNotWeakenShizukuProvider() {
+        // NOTE: the tree currently carries NO github*/ variant-overlay
+        // directory, so this loop runs zero times and its assertions never
+        // execute. The fixture-driven pin (githubVariantOverlayWeakeningIsRejectedByFixture)
+        // is the test that actually exercises the overlay contract.
         val srcDir = appSrcDir()
         val dirs = srcDir.listFiles()
             ?.filter { it.isDirectory && it.name.startsWith("github") && it.name != "github" }
@@ -316,6 +346,215 @@ class ShizukuManifestPinTest {
             val manifest = File(dir, "AndroidManifest.xml")
             if (!manifest.isFile) continue
             assertGithubOverlayDoesNotWeakenShizuku(manifest)
+        }
+    }
+
+    @Test fun githubVariantOverlayWeakeningIsRejectedByFixture() {
+        // Fixture-driven pin of the variant-overlay contract: the real
+        // github*/ tree currently carries no variant overlay directory, so
+        // githubVariantOverlaysIfPresentDoNotWeakenShizukuProvider loops
+        // zero times and its assertions never execute. This test drives the
+        // SAME checkPath with synthetic overlays written to a temp directory:
+        // every weakened shape must raise AssertionError, the compliant
+        // overlay must pass.
+        fun overlay(providerBody: String): String =
+            """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+                xmlns:tools="http://schemas.android.com/tools">
+                <application>
+                    $providerBody
+                </application>
+            </manifest>
+            """.trimIndent()
+
+        val compliant = overlay(
+            """<provider
+                android:name="rikka.shizuku.ShizukuProvider"
+                android:authorities="${'$'}{applicationId}.shizuku"
+                android:enabled="true"
+                android:exported="true"
+                android:multiprocess="false"
+                android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+            """.trimIndent(),
+        )
+        fun weakened(messagePart: String, content: String) = messagePart to content
+
+        // Each weakened case pins BOTH the exception type and the assertion
+        // message: the message must name the breakpoint the overlay tripped
+        // (exported/permission/tools:node/tools:remove/grantUriPermissions/
+        // duplicate), otherwise a gutted helper could stay green on an
+        // unrelated AssertionError.
+        val weakened = mapOf(
+            "exported=false" to weakened(
+                "exported",
+                overlay(
+                    """<provider
+                        android:name="rikka.shizuku.ShizukuProvider"
+                        android:authorities="${'$'}{applicationId}.shizuku"
+                        android:exported="false"
+                        android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+                    """.trimIndent(),
+                ),
+            ),
+            "permission weakened" to weakened(
+                "permission",
+                overlay(
+                    """<provider
+                        android:name="rikka.shizuku.ShizukuProvider"
+                        android:authorities="${'$'}{applicationId}.shizuku"
+                        android:exported="true"
+                        android:permission="android.permission.INTERNET" />
+                    """.trimIndent(),
+                ),
+            ),
+            "tools:node=remove" to weakened(
+                "node",
+                overlay(
+                    """<provider
+                        android:name="rikka.shizuku.ShizukuProvider"
+                        tools:node="remove" />
+                    """.trimIndent(),
+                ),
+            ),
+            "tools:remove=exported" to weakened(
+                "remove",
+                overlay(
+                    """<provider
+                        android:name="rikka.shizuku.ShizukuProvider"
+                        tools:remove="exported" />
+                    """.trimIndent(),
+                ),
+            ),
+            "grantUriPermissions=true" to weakened(
+                "grantUriPermissions",
+                overlay(
+                    """<provider
+                        android:name="rikka.shizuku.ShizukuProvider"
+                        android:authorities="${'$'}{applicationId}.shizuku"
+                        android:exported="true"
+                        android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"
+                        android:grantUriPermissions="true" />
+                    """.trimIndent(),
+                ),
+            ),
+            "duplicate provider" to weakened(
+                "duplicate",
+                overlay(
+                    """<provider
+                        android:name="rikka.shizuku.ShizukuProvider"
+                        android:authorities="${'$'}{applicationId}.shizuku" />
+                        <provider
+                        android:name="rikka.shizuku.ShizukuProvider"
+                        android:authorities="${'$'}{applicationId}.shizuku" />
+                    """.trimIndent(),
+                ),
+            ),
+        )
+        val tmp = Files.createTempDirectory("github-variant-overlay").toFile()
+        try {
+            val manifest = File(tmp, "AndroidManifest.xml")
+            for ((label, fixture) in weakened) {
+                val (messagePart, content) = fixture
+                manifest.writeText(content)
+                val thrown = assertThrows(AssertionError::class.java) {
+                    assertGithubOverlayDoesNotWeakenShizuku(manifest)
+                }
+                assertTrue(
+                    "weakened variant overlay ($label) must fail on its own " +
+                        "breakpoint assertion, got message: ${thrown.message}",
+                    thrown.message?.contains(messagePart) == true,
+                )
+            }
+            // tools:node="replace", provider level: the replace branch runs
+            // assertFullShizukuContract on the redeclared provider, so a
+            // weakened redeclaration throws and names the weakened attr.
+            val providerReplaceWeakened = overlay(
+                """<provider
+                    android:name="rikka.shizuku.ShizukuProvider"
+                    android:authorities="${'$'}{applicationId}.shizuku"
+                    android:enabled="true"
+                    android:exported="false"
+                    android:multiprocess="false"
+                    android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"
+                    tools:node="replace" />
+                """.trimIndent(),
+            )
+            val providerReplaceCompliant = overlay(
+                """<provider
+                    android:name="rikka.shizuku.ShizukuProvider"
+                    android:authorities="${'$'}{applicationId}.shizuku"
+                    android:enabled="true"
+                    android:exported="true"
+                    android:multiprocess="false"
+                    android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"
+                    tools:node="replace" />
+                """.trimIndent(),
+            )
+            // tools:node="replace", application level: the helper's <application>
+            // branch demands exactly one redeclared ShizukuProvider (the
+            // replacedProviders count check); zero-or-more-than-one trips that
+            // assertion, and a single WEAKENED redeclaration passes the count
+            // check but trips the provider-level attribute checks afterwards.
+            fun applicationReplace(providerBodies: List<String>): String =
+                """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+                    xmlns:tools="http://schemas.android.com/tools">
+                    <application tools:node="replace">
+                        ${providerBodies.joinToString("\n            ")}
+                    </application>
+                </manifest>
+                """.trimIndent()
+            val shizukuProvider = """<provider
+                    android:name="rikka.shizuku.ShizukuProvider"
+                    android:authorities="${'$'}{applicationId}.shizuku"
+                    android:enabled="true"
+                    android:exported="true"
+                    android:multiprocess="false"
+                    android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />"""
+            val weakenedShizukuProvider = """<provider
+                    android:name="rikka.shizuku.ShizukuProvider"
+                    android:authorities="${'$'}{applicationId}.shizuku"
+                    android:enabled="true"
+                    android:exported="false"
+                    android:multiprocess="false"
+                    android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />"""
+            val applicationReplaceCases = mapOf(
+                "application replace with two redeclared ShizukuProviders (replacedProviders count)" to Pair(
+                    "redeclare exactly one",
+                    applicationReplace(listOf(shizukuProvider, shizukuProvider)),
+                ),
+                "application replace with a weakened redeclared ShizukuProvider" to Pair(
+                    "exported",
+                    applicationReplace(listOf(weakenedShizukuProvider)),
+                ),
+            )
+            for ((label, fixture) in applicationReplaceCases) {
+                val (messagePart, content) = fixture
+                manifest.writeText(content)
+                val thrown = assertThrows(AssertionError::class.java) {
+                    assertGithubOverlayDoesNotWeakenShizuku(manifest)
+                }
+                assertTrue(
+                    "weakened variant overlay ($label) must fail on its own " +
+                        "breakpoint assertion, got message: ${thrown.message}",
+                    thrown.message?.contains(messagePart) == true,
+                )
+            }
+            manifest.writeText(compliant)
+            assertGithubOverlayDoesNotWeakenShizuku(manifest)
+            manifest.writeText(providerReplaceCompliant)
+            assertGithubOverlayDoesNotWeakenShizuku(manifest)
+            manifest.writeText(applicationReplace(listOf(shizukuProvider)))
+            assertGithubOverlayDoesNotWeakenShizuku(manifest)
+            manifest.writeText(providerReplaceWeakened)
+            val providerReplaceThrown = assertThrows(AssertionError::class.java) {
+                assertGithubOverlayDoesNotWeakenShizuku(manifest)
+            }
+            assertTrue(
+                "provider-level tools:node='replace' with a weakened redeclaration " +
+                    "must fail on its own breakpoint assertion, got message: ${providerReplaceThrown.message}",
+                providerReplaceThrown.message?.contains("exported") == true,
+            )
+        } finally {
+            tmp.deleteRecursively()
         }
     }
 

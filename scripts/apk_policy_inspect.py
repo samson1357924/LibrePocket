@@ -75,7 +75,13 @@ merged networkSecurityConfig binding + compiled NSC) plus the COMMON flavor
 permission policy below: the Github debug artifact is neither a Play nor a
 Foss package, so the flavor DEX class-table policies do not apply, while the
 same manifest/resource merger paths this scanner exists to police are shared
-by all three flavors.
+by all three flavors. In github mode ``--expect-provider required`` upgrades
+the ShizukuProvider check to a fail-closed existence contract (the merged
+manifest must declare exactly one compliant provider); the default
+``optional`` only verifies provider attributes when a provider is present.
+When a ShizukuProvider is present, the upstream ``attachInfo()`` hard
+contract is pinned regardless of mode: ``exported`` must be the exact
+boolean true and ``multiprocess`` absent or the exact boolean false.
 
 Common manifest policy (P2-1): SMS, MANAGE_EXTERNAL_STORAGE, and VPN
 declarations are forbidden in EVERY flavor (``COMMON_FORBIDDEN_PERMISSIONS``
@@ -1067,7 +1073,6 @@ def _validate_aapt_output(aapt: str, apk: Path) -> tuple[str, str]:
 
 
 _XMLTREE_ELEMENT_LINE_RE = re.compile(r"^([ \t]*)E:\s*([^(\s]+)(?=\s|\(|$)")
-_APPLICATION_LINE_RE = re.compile(r"^([ \t]*)E:\s*application(?=\s|\(|$)")
 
 
 def _locate_application_manifest_span(xmltree: str) -> tuple[list[str], int, int, int]:
@@ -1413,9 +1418,10 @@ def _xmltree_attr_value(raw_value: str, label: str) -> str:
 
     Measured aapt encodings (real APK dumps, build-tools 35/36):
       * booleans print without quotes as ``(type 0x12)0x0`` /
-        ``(type 0x12)0xffffffff``; a boolean exists only as these two values
-        in compiled binary XML, so any other typed encoding fails closed
-        instead of being guessed into the tree;
+        ``(type 0x12)0xffffffff``; a boolean exists only as these two exact
+        TYPE_INT_BOOLEAN (0x12) encodings in compiled binary XML, so any
+        other typed encoding fails closed instead of being guessed into
+        the tree;
       * strings print as ``"value" (Raw: "value")`` - the RAW payload wins
         when both spellings appear and both go through the escape decoder;
       * resource references print unquoted (``@0x…``, ``@res/0x…``,
@@ -1423,13 +1429,14 @@ def _xmltree_attr_value(raw_value: str, label: str) -> str:
         wherever non-string values are illegal.
     """
     value = raw_value.strip()
-    typed = re.match(r"^\(type\s+[^\s)]+\)(.*)$", value)
-    if typed is not None:
-        payload = typed.group(1).strip()
-        if payload == "0x0":
-            return "false"
-        if payload == "0xffffffff":
-            return "true"
+    typed_boolean = re.match(r"^\(type\s+0x12\)(0x0|0xffffffff)$", value)
+    if typed_boolean is not None:
+        return "false" if typed_boolean.group(1) == "0x0" else "true"
+    if re.match(r"^\(type\s+[^\s)]+\)(.*)$", value) is not None:
+        # Any OTHER typed encoding (integer 0x10, reference 0x01, ...) is not
+        # a boolean: accepting its payload as true/false would guess a type
+        # the artifact never proved. Fail closed with the attribute name
+        # (carried by `label`) and the original value fragment.
         raise PolicyError(
             f"{label}: unrecognized compiled attribute encoding {value!r}"
         )
@@ -1507,7 +1514,14 @@ def _parse_aapt_xmltree(dump: str, label: str) -> ET.Element:
             if not stack:
                 raise PolicyError(f"{label} has an attribute outside any element")
             name = _XMLTREE_ATTR_ID_PARENS.sub("", attribute_match.group(2).strip())
-            stack[-1][1].set(name, _xmltree_attr_value(attribute_match.group(3), label))
+            # Thread the attribute name into the decoder label so a
+            # fail-closed error names BOTH the attribute and the raw value.
+            stack[-1][1].set(
+                name,
+                _xmltree_attr_value(
+                    attribute_match.group(3), f"{label} android:{name}"
+                ),
+            )
             continue
         text_match = _XMLTREE_TEXT.match(line)
         if text_match is not None:
@@ -1809,6 +1823,11 @@ _NS_DECL_LINE_RE = re.compile(
     r"^([ \t]*)N:\s*([^\s=]+)=([^\s(]+)(?:\s*\(line=\d+\))?\s*$"
 )
 _PROVIDER_ATTR_LINE_RE = re.compile(r"^([ \t]*)A:\s+([^=]+)=(.*)$")
+# android:exported = 0x01010010, android:multiprocess = 0x01010013 (stable
+# SDK definitions). ShizukuProvider carries the hard upstream contract:
+# exported=true (the Manager must reach the binder) and multiprocess=false
+# (attachInfo() throws IllegalStateException otherwise), so the github
+# artifact gate pins both on the merged manifest.
 _PROVIDER_ANDROID_ATTR_IDS = {
     "0x01010003": "name",
     "0x01010018": "authorities",
@@ -1816,6 +1835,8 @@ _PROVIDER_ANDROID_ATTR_IDS = {
     "0x01010007": "readPermission",
     "0x01010008": "writePermission",
     "0x0101001b": "grantUriPermissions",
+    "0x01010010": "exported",
+    "0x01010013": "multiprocess",
 }
 _PROVIDER_ATTR_NAMES = frozenset(_PROVIDER_ANDROID_ATTR_IDS.values())
 _SHIZUKU_MANIFEST_RE = re.compile(
@@ -1894,10 +1915,16 @@ def _iter_application_providers(
     resolved across the xmltree so aliased Android attributes cannot evade
     inspection, and unexpected prefixes on provider security attributes fail
     closed instead of being silently dropped.
+
+    Fail-closed precondition: ``xmltree`` must carry a unique top-level
+    ``<application>`` element; otherwise ``_locate_application_manifest_span``
+    raises ``PolicyError`` (a manifest without an application has no provider
+    scope). Callers never observe a silent empty provider list for that case.
     """
-    raw_lines = xmltree.splitlines()
-    if not any(_APPLICATION_LINE_RE.match(line) for line in raw_lines):
-        return []
+    # Fail-closed precondition: a merged manifest without <application> has no
+    # provider scope at all. ``_locate_application_manifest_span`` raises the
+    # named "lacks an <application> element" PolicyError - never a silent
+    # empty provider list.
     lines, app_index, app_end, _app_indent = _locate_application_manifest_span(xmltree)
     elem_stack: list[tuple[int, str]] = []
     ns_stack: list[tuple[int, str, str, int | None, int]] = []
@@ -2086,6 +2113,8 @@ def _iter_application_providers(
                 "readPermission",
                 "writePermission",
                 "grantUriPermissions",
+                "exported",
+                "multiprocess",
             ):
                 if attr_name in raw_attrs:
                     decoded[attr_name] = _xmltree_attr_value(
@@ -2107,6 +2136,14 @@ def _check_github_shizuku_provider(xmltree: str) -> None:
     ``android.permission.INTERACT_ACROSS_USERS_FULL``, ``grantUriPermissions``
     is not enabled, and no ``<path-permission>`` / ``<grant-uri-permission>``
     children exist.
+
+    The upstream ``ShizukuProvider.attachInfo()`` hard contract is pinned too:
+    ``android:exported`` must be exactly the compiled boolean true
+    (``(type 0x12)0xffffffff`` / ``"true"``) and ``android:multiprocess`` must
+    be absent (the default, false) or exactly the compiled boolean false -
+    anything else trips an IllegalStateException at runtime. A missing or
+    unproven ``exported`` fails closed: a merged manifest that cannot prove
+    the provider exported is treated as non-compliant.
     """
     for attrs, child_tags in _iter_application_providers(xmltree):
         if not _is_shizuku_provider(
@@ -2130,6 +2167,19 @@ def _check_github_shizuku_provider(xmltree: str) -> None:
             raise PolicyError(
                 "github APK ShizukuProvider must not enable "
                 f"android:grantUriPermissions (got {grant_uri!r})"
+            )
+        exported = attrs.get("exported")
+        if exported != "true":
+            raise PolicyError(
+                "github APK ShizukuProvider must declare android:exported "
+                f"as the exact boolean true (Shizuku attachInfo contract; "
+                f"got {exported!r})"
+            )
+        multiprocess = attrs.get("multiprocess")
+        if multiprocess is not None and multiprocess != "false":
+            raise PolicyError(
+                "github APK ShizukuProvider must not set android:multiprocess "
+                f"to true (Shizuku attachInfo contract; got {multiprocess!r})"
             )
         for forbidden_child in ("path-permission", "grant-uri-permission"):
             if forbidden_child in child_tags:
@@ -2189,7 +2239,11 @@ def _check_foss(permissions: str, xmltree: str, dexes: list[ParsedDex]) -> None:
                 raise PolicyError(f"Foss APK DEX type_ids references proprietary type {descriptor}")
 
 
-def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str) -> None:
+def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str, expect_provider: str = "optional") -> None:
+    if expect_provider not in ("required", "optional"):
+        raise PolicyError(f"unknown --expect-provider value: {expect_provider!r}")
+    if expect_provider == "required" and mode != "github":
+        raise PolicyError("--expect-provider required is only valid with --mode github")
     if apk.suffix.lower() == ".aab":
         raise PolicyError("AAB is unsupported by this APK-only policy scanner")
     if apk.suffix.lower() != ".apk":
@@ -2241,6 +2295,19 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str) -> None:
         # manifest, verifies its INTERACT_ACROSS_USERS_FULL & URI-grant bounds.
         # The aapt/dexdump tool contract is still enforced above, so a wrong
         # tool invocation cannot silently degrade the mode.
+        if expect_provider == "required":
+            providers = [
+                provider
+                for provider in _iter_application_providers(xmltree)
+                if _is_shizuku_provider(
+                    provider[0].get("name", ""), provider[0].get("authorities", "")
+                )
+            ]
+            if len(providers) != 1:
+                raise PolicyError(
+                    "github APK must declare exactly one ShizukuProvider "
+                    f"(found {len(providers)})"
+                )
         _check_github_shizuku_provider(xmltree)
         print(
             f"  structure: APK ZIP/manifest OK ({len(dex_infos)} root DEX "
@@ -2281,9 +2348,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apk", required=True)
     parser.add_argument("--aapt", required=True)
     parser.add_argument("--dexdump", required=True)
+    parser.add_argument(
+        "--expect-provider",
+        choices=("required", "optional"),
+        default="optional",
+        help=(
+            "github mode: 'required' demands the merged manifest declare "
+            "exactly one ShizukuProvider (release/debug gate fail-closed); "
+            "'optional' (default) checks provider attributes only when a "
+            "ShizukuProvider is present"
+        ),
+    )
     args = parser.parse_args(argv)
     try:
-        inspect_apk(Path(args.apk), args.mode, args.aapt, args.dexdump)
+        inspect_apk(Path(args.apk), args.mode, args.aapt, args.dexdump, args.expect_provider)
         return 0
     except PolicyError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)

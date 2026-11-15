@@ -487,7 +487,7 @@ jobs:
           # exit 1; report the missing tool named (fail-closed, not skipped).
           AAPT=$(command -v aapt) || { echo "::error::aapt not found: build-tools PATH step failed"; exit 1; }
           DEXDUMP=$(command -v dexdump) || { echo "::error::dexdump not found: build-tools PATH step failed"; exit 1; }
-          python3 scripts/apk_policy_inspect.py --mode github --apk app/build/outputs/apk/github/debug/app-github-debug.apk --aapt "$AAPT" --dexdump "$DEXDUMP"
+          python3 scripts/apk_policy_inspect.py --mode github --apk app/build/outputs/apk/github/debug/app-github-debug.apk --aapt "$AAPT" --dexdump "$DEXDUMP" --expect-provider required
           main=app/src/main/AndroidManifest.xml
           overlay=app/src/github/AndroidManifest.xml
           for m in "$main" "$overlay"; do
@@ -533,7 +533,7 @@ jobs:
           set -- app/build/outputs/apk/github/release/*.apk
           [ -f "$1" ] || { echo "::error::no assembled release APK for github under app/build/outputs/apk/github/release/"; exit 1; }
           for apk in "$@"; do
-            python3 scripts/apk_policy_inspect.py --mode github --apk "$apk" --aapt "$AAPT" --dexdump "$DEXDUMP"
+            python3 scripts/apk_policy_inspect.py --mode github --apk "$apk" --aapt "$AAPT" --dexdump "$DEXDUMP" --expect-provider required
           done
 
       - name: Upload Debug & Release APKs

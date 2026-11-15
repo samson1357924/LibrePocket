@@ -1052,6 +1052,31 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
             "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
             "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-ok-two)\n"
+            "          # Like shizuku-ok but with TWO ShizukuProvider elements\n"
+            "          # (authorities both end with .shizuku, so BOTH match\n"
+            "          # _is_shizuku_provider); --expect-provider required must\n"
+            "          # fail closed with the found-count message.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
             "        shizuku-weak-perm)\n"
             "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
             "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
@@ -1121,6 +1146,71 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '        A: p:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
             "            '        A: p:writePermission(0x01010008)=\"android.permission.INTERNET\" (Raw: \"android.permission.INTERNET\")' \\\n"
             "            '        A: p:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-read-write-only)\n"
+            "          # Positive control: provider guarded ONLY by explicit\n"
+            "          # readPermission+writePermission (no 'permission' attr),\n"
+            "          # exported=true/multiprocess=false. Must PASS.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:readPermission(0x01010007)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:writePermission(0x01010008)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-exported-false)\n"
+            "          # Shizuku attachInfo() hard contract: exported must be\n"
+            "          # exactly true. exported=false must FAIL.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-multiprocess-true)\n"
+            "          # Shizuku attachInfo() hard contract: multiprocess must\n"
+            "          # be absent or false. multiprocess=true must FAIL.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-no-exported)\n"
+            "          # Merged manifest must prove exported on the provider;\n"
+            "          # absent exported fails closed.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-grant-uri-int)\n"
+            "          # grantUriPermissions is a boolean by binary-XML type;\n"
+            "          # (type 0x12)0x1 is not a boolean false and must fail.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:grantUriPermissions(0x0101001b)=(type 0x12)0x1' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
             "        *)  # bindings (the default, realistic merged manifest)\n"
             "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
             "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
@@ -2460,6 +2550,7 @@ class ApkPolicyHarness(unittest.TestCase):
         nsc_mode: str = "ok",
         permissions: str = "",
         aapt2_mode: str = "ok",
+        expect_provider: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = self._env(
             rules_mode=rules_mode,
@@ -2469,19 +2560,22 @@ class ApkPolicyHarness(unittest.TestCase):
             permissions=permissions,
             aapt2_mode=aapt2_mode,
         )
+        command = [
+            sys.executable,
+            str(ROOT / "scripts" / "apk_policy_inspect.py"),
+            "--mode",
+            mode,
+            "--apk",
+            str(apk),
+            "--aapt",
+            str(self.build_tools / "aapt"),
+            "--dexdump",
+            str(self.dexdump_path),
+        ]
+        if expect_provider is not None:
+            command.extend(("--expect-provider", expect_provider))
         return subprocess.run(
-            [
-                sys.executable,
-                str(ROOT / "scripts" / "apk_policy_inspect.py"),
-                "--mode",
-                mode,
-                "--apk",
-                str(apk),
-                "--aapt",
-                str(self.build_tools / "aapt"),
-                "--dexdump",
-                str(self.dexdump_path),
-            ],
+            command,
             env=env,
             text=True,
             stdout=subprocess.PIPE,
@@ -2772,11 +2866,13 @@ class ApkPolicyHarness(unittest.TestCase):
 
         # Positive controls: explicit read+write permissions and nested child meta-data
         # under <provider> (child attributes at +4 must not shadow provider attrs at +2).
+        # exported=true rides along: the upstream attachInfo() hard contract is pinned.
         policy_inspect._check_github_shizuku_provider(
             "  E: application\n"
             "    E: provider\n"
             '      A: android:name(0x01010003)="rikka.shizuku.ShizukuProvider" (Raw: "rikka.shizuku.ShizukuProvider")\n'
             '      A: android:permission(0x01010006)="android.permission.INTERACT_ACROSS_USERS_FULL" (Raw: "android.permission.INTERACT_ACROSS_USERS_FULL")\n'
+            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff\n'
             '      A: android:grantUriPermissions(0x0101001b)=(type 0x12)0x0\n'
             "      E: meta-data\n"
             '        A: android:name="child.Meta"\n'
@@ -2787,6 +2883,7 @@ class ApkPolicyHarness(unittest.TestCase):
             '      A: http://schemas.android.com/apk/res/android:name="rikka.shizuku.ShizukuProvider"\n'
             '      A: http://schemas.android.com/apk/res/android:readPermission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
             '      A: http://schemas.android.com/apk/res/android:writePermission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+            '      A: http://schemas.android.com/apk/res/android:exported="true"\n'
         )
 
         # Negative controls: missing permission, weakened read/write override,
@@ -2824,6 +2921,7 @@ class ApkPolicyHarness(unittest.TestCase):
                 "    E: provider\n"
                 '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
                 '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '      A: android:exported="true"\n'
                 "      E: path-permission\n"
                 '        A: android:path="/"\n',
                 "path-permission",
@@ -2834,6 +2932,7 @@ class ApkPolicyHarness(unittest.TestCase):
                 "    E: provider\n"
                 '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
                 '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '      A: android:exported="true"\n'
                 "      E: grant-uri-permission\n"
                 '        A: android:path="/"\n',
                 "grant-uri-permission",
@@ -2867,12 +2966,14 @@ class ApkPolicyHarness(unittest.TestCase):
                 self.assertIn("grantUriPermissions", result.stderr)
 
         # Direct positive control for explicit string "false" and typed false.
+        # exported=true rides along: the upstream attachInfo() hard contract is pinned.
         for false_encoding in ('"false" (Raw: "false")', "(type 0x12)0x0"):
             policy_inspect._check_github_shizuku_provider(
                 "  E: application\n"
                 "    E: provider\n"
                 '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
                 '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '      A: android:exported=(type 0x12)0xffffffff\n'
                 f"      A: android:grantUriPermissions={false_encoding}\n"
             )
 
@@ -2959,6 +3060,7 @@ class ApkPolicyHarness(unittest.TestCase):
         self.assertIn("INTERACT_ACROSS_USERS_FULL", cli_weak.stderr)
 
         # Bound alias `N: p=http://schemas.android.com/apk/res/android` with valid attrs passes.
+        # exported=true rides along: the upstream attachInfo() hard contract is pinned.
         policy_inspect._check_github_shizuku_provider(
             "N: p=http://schemas.android.com/apk/res/android\n"
             "  E: manifest\n"
@@ -2967,6 +3069,7 @@ class ApkPolicyHarness(unittest.TestCase):
             '        A: p:name="rikka.shizuku.ShizukuProvider"\n'
             '        A: p:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
             '        A: p:authorities="dev.librepocket.agent.github.shizuku"\n'
+            '        A: p:exported="true"\n'
         )
 
         # Bound alias catching weak writePermission and grantUriPermissions=true.
@@ -3104,6 +3207,186 @@ class ApkPolicyHarness(unittest.TestCase):
         self.assertNotEqual(
             defined_result.returncode, 0, defined_result.stderr + defined_result.stdout
         )
+
+    # -- github --expect-provider contract + provider parser fail-closed branches --
+
+    def test_provider_attribute_parser_fail_closed_branches(self) -> None:
+        # Direct pins of the five parser fail-closed branches in
+        # _iter_application_providers (duplicate attribute, unexpected
+        # indentation, malformed attribute line, ID/local-name mismatch,
+        # unexpected resource ID) plus the F4 fail-closed precondition
+        # (no <application> => PolicyError, never a silent empty list).
+        base = "E: manifest\n  E: application\n    E: provider\n"
+        cases = (
+            (
+                "duplicate-attribute",
+                base
+                + '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                + '      A: android:permission(0x01010006)="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                + '      A: android:permission="android.permission.INTERNET"\n',
+                r"declares duplicate attribute 'permission'",
+            ),
+            (
+                "unexpected-indentation",
+                base
+                + '        A: android:name="rikka.shizuku.ShizukuProvider"\n',
+                r"unexpected indentation",
+            ),
+            (
+                "malformed-attribute-line",
+                base
+                + '      A:android:name="rikka.shizuku.ShizukuProvider"\n',
+                r"malformed attribute line",
+            ),
+            (
+                "attribute-id-disagrees-with-local-name",
+                base
+                + '      A: android:name(0x01010008)="rikka.shizuku.ShizukuProvider"\n',
+                r"disagrees with Android attribute ID 0x01010008",
+            ),
+            (
+                "unexpected-resource-id",
+                base
+                + '      A: android:grantUriPermissions(0x01015555)="false"\n',
+                r"unexpected resource ID 0x01015555",
+            ),
+        )
+        for label, tree, msg in cases:
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, msg):
+                    policy_inspect._iter_application_providers(tree)
+
+    def test_iter_application_providers_requires_application_element(self) -> None:
+        # F4: a merged manifest without <application> has no provider scope;
+        # the iterator must fail closed with the named PolicyError, never a
+        # silent empty list (the old behavior masked merger-stripped manifests).
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, r"lacks an <application> element"
+        ):
+            policy_inspect._iter_application_providers("E: manifest\n")
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, r"lacks an <application> element"
+        ):
+            policy_inspect._check_github_shizuku_provider("E: manifest\n")
+
+    def test_github_mode_provider_read_write_only_permissions_pass(self) -> None:
+        # Positive control: provider guarded ONLY by explicit readPermission
+        # and writePermission (no `permission` attribute) - still a compliant
+        # ShizukuProvider; the github artifact gate must PASS (exit 0).
+        apk = complete_apk(
+            self.tmp / "github-read-write-only.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-read-write-only"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("policy: github OK", result.stdout)
+
+    def test_github_mode_rejects_non_boolean_typed_grant_uri_permission(self) -> None:
+        # grantUriPermissions is a boolean by binary-XML type; (type 0x12)0x1
+        # is not a boolean false and must fail closed, never pass as false.
+        apk = complete_apk(
+            self.tmp / "github-grant-uri-int.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-grant-uri-int"
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("grantUriPermissions", result.stderr)
+
+    def test_github_expect_provider_required_fail_closed(self) -> None:
+        apk = complete_apk(
+            self.tmp / "github-expect-provider.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        # required + merged manifest with NO ShizukuProvider => exit 1.
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="bindings", expect_provider="required"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("exactly one ShizukuProvider", result.stderr)
+
+        # required + TWO ShizukuProviders (authorities of both end with
+        # .shizuku, so BOTH match the _is_shizuku_provider authorities rule)
+        # => exit 1 with the found-count message (first-match must never win).
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-ok-two", expect_provider="required"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("found 2", result.stderr)
+
+        # required + valid ShizukuProvider => exit 0.
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-ok", expect_provider="required"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        # optional (the default) + missing provider => exit 0 (backward compat).
+        result = self._run_scanner_cli(apk, "github", xmltree_mode="bindings")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="bindings", expect_provider="optional"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_foss_expect_provider_required_rejected(self) -> None:
+        # §--expect-provider required is a github-mode-only contract; any
+        # other mode must fail closed (exit 1) before the artifact is read.
+        apk = complete_apk(
+            self.tmp / "foss-expect-provider-required.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self._run_scanner_cli(apk, "foss", expect_provider="required")
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn(
+            "--expect-provider required is only valid with --mode github",
+            result.stderr,
+        )
+
+    def test_github_mode_exported_and_multiprocess_contract(self) -> None:
+        # Upstream ShizukuProvider.attachInfo() hard contract pinned at the
+        # artifact level: exported must be the exact boolean true; multiprocess
+        # must be absent or the exact boolean false.
+        apk = complete_apk(
+            self.tmp / "github-exported-contract.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for xmltree_mode, msg in (
+            ("shizuku-exported-false", "exported"),
+            ("shizuku-multiprocess-true", "multiprocess"),
+            ("shizuku-no-exported", "exported"),
+        ):
+            with self.subTest(xmltree_mode=xmltree_mode):
+                result = self._run_scanner_cli(apk, "github", xmltree_mode=xmltree_mode)
+                self.assertNotEqual(
+                    result.returncode, 0, result.stderr + result.stdout
+                )
+                self.assertIn(msg, result.stderr)
+        # Direct-call negative controls for the same contract at function level.
+        for tree, msg in (
+            (
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '      A: android:exported=(type 0x12)0x0\n',
+                "exported",
+            ),
+            (
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '      A: android:exported=(type 0x12)0xffffffff\n'
+                '      A: android:multiprocess="true"\n',
+                "multiprocess",
+            ),
+        ):
+            with self.subTest(tree_case=msg):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, msg):
+                    policy_inspect._check_github_shizuku_provider(tree)
 
     # -- merged-manifest networkSecurityConfig binding (artifact authority) --
 
@@ -6230,6 +6513,36 @@ class BackupAnchorSync(unittest.TestCase):
                 r"^(sharedpref|database|file|device_root)/.+$",
                 f"non-literal or malformed entry in BackupPolicy: {literal}",
             )
+
+
+class GitHubProviderGateWiring(unittest.TestCase):
+    """Pin the staging lanes so the github vehicle demands its provider."""
+
+    def test_github_lane_passes_expect_provider_required(self) -> None:
+        # The github artifact lane must invoke apk_policy_inspect.py with
+        # --expect-provider required (release/debug gate fail-closed on a
+        # missing/stripped ShizukuProvider); the foss/play lanes must NOT
+        # carry the flag (GitHub-only contract).
+        text = POLICY_CHECK.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        guard = next(
+            i
+            for i, line in enumerate(lines)
+            if 'if [ "$MODE" = github ]; then' in line
+        )
+        else_idx = next(
+            i for i in range(guard + 1, len(lines)) if lines[i].strip() == "else"
+        )
+        fi_idx = next(
+            i for i in range(else_idx + 1, len(lines)) if lines[i].strip() == "fi"
+        )
+        github_block = "\n".join(lines[guard:else_idx])
+        other_block = "\n".join(lines[else_idx:fi_idx])
+        self.assertIn("--expect-provider required", github_block)
+        self.assertNotIn("--expect-provider", other_block)
+        # foss/play lanes carry no expect-provider flag anywhere in the gate:
+        # exactly one occurrence in file scope.
+        self.assertEqual(text.count("--expect-provider required"), 1)
 
 
 class BackupRulesGateWiring(unittest.TestCase):

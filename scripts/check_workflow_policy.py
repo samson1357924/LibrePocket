@@ -381,7 +381,7 @@ GITHUB_DEBUG_INSPECT_RUN = (
     'build-tools PATH step failed"; exit 1; }\n'
     "python3 scripts/apk_policy_inspect.py --mode github --apk "
     'app/build/outputs/apk/github/debug/app-github-debug.apk --aapt "$AAPT" '
-    '--dexdump "$DEXDUMP"\n'
+    '--dexdump "$DEXDUMP" --expect-provider required\n'
     "main=app/src/main/AndroidManifest.xml\n"
     "overlay=app/src/github/AndroidManifest.xml\n"
     'for m in "$main" "$overlay"; do\n'
@@ -416,7 +416,7 @@ GITHUB_RELEASE_INSPECT_RUN = (
     'under app/build/outputs/apk/github/release/"; exit 1; }\n'
     'for apk in "$@"; do\n'
     '  python3 scripts/apk_policy_inspect.py --mode github --apk "$apk" '
-    '--aapt "$AAPT" --dexdump "$DEXDUMP"\n'
+    '--aapt "$AAPT" --dexdump "$DEXDUMP" --expect-provider required\n'
     "done"
 )
 DOCS_SELFTEST_RUN = (

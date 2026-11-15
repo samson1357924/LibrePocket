@@ -7,6 +7,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import rikka.shizuku.Shizuku
@@ -39,6 +40,10 @@ class ShizukuPermissionRequestTest {
         val requests = attachedRequests()
         val dispatched = requests.request(1001) { throw SecurityException("no binder") }
         assertFalse(dispatched)
+        // 送出失敗照燒：同碼送出／裸送／登記此後皆不得接受（fail-closed 釘住）
+        assertFalse(requests.requestWithCallback(1001, { }) { })
+        assertFalse(requests.request(1001) { })
+        assertFalse(requests.onResult(1001) { })
     }
 
     @Test fun requestUnattachedFailsClosed() {
@@ -209,6 +214,10 @@ class ShizukuPermissionRequestTest {
         assertFalse(ok)
         requests.emitResult(1001, PackageManager.PERMISSION_GRANTED)
         assertFalse(callbackFired)
+        // 登記回滾照燒：同碼送出／裸送／登記此後皆不得接受（fail-closed 釘住）
+        assertFalse(requests.requestWithCallback(1001, { }) { })
+        assertFalse(requests.request(1001) { })
+        assertFalse(requests.onResult(1001) { })
     }
 
     @Test fun requestWithCallback_unattached_returnsFalseAndRegistersNothing() {
@@ -269,7 +278,7 @@ class ShizukuPermissionRequestTest {
         assertFalse(ok)
     }
 
-    @Test fun staleListener_afterDetachReattach_doesNotConsumeNewEpochCallbacks() {
+    @Test fun staleListener_afterDetachReattach_requestCodeReuseRefused() {
         val listeners = mutableListOf<Shizuku.OnRequestPermissionResultListener>()
         val requests = ShizukuPermissionRequests(
             addListener = { listeners += it },
@@ -278,22 +287,33 @@ class ShizukuPermissionRequestTest {
         )
         requests.attach()
         val l1 = listeners.last()
-        requests.detach() // removeListener 拋 LinkageError → 吞掉，但 attached=false、epoch 前進
+        var staleFired = false
+        val staleOk = requests.requestWithCallback(42, { staleFired = true }) { }
+        assertTrue(staleOk)
+        requests.detach() // removeListener 拋 LinkageError → 吞掉，但 attached=false、epoch 前進；42 已燒
         assertFalse(requests.isAttached())
         requests.attach()
         val l2 = listeners.last()
         assertNotSame(l1, l2)
 
-        var fired = false
-        val ok = requests.requestWithCallback(42, { fired = true }) { }
-        assertTrue(ok)
+        // reattach 後復用燒過的碼 42 必拒絕（本實例生存期內碼不重用）
+        var reuseFired = false
+        assertFalse(
+            "reattach 後復用 burned 碼必拒絕",
+            requests.requestWithCallback(42, { reuseFired = true }) { },
+        )
+        assertFalse(reuseFired)
 
-        // 舊 listener（上游反註冊靜默失敗仍殘留）以新碼觸發：身份檢查必須擋下，
-        // 不得以 reattach 後的 epoch 分發 stale 結果
-        l1.onRequestPermissionResult(42, PackageManager.PERMISSION_GRANTED)
+        // 全新碼 43 可用：過期 listener 以 43 觸發仍被身份檢查擋下（l1 不得再分發）
+        var fired = false
+        val ok = requests.requestWithCallback(43, { fired = true }) { }
+        assertTrue(ok)
+        l1.onRequestPermissionResult(43, PackageManager.PERMISSION_GRANTED)
         assertFalse(fired)
+        // 結構性護欄（真正判別性斷言在 :309-312——l1 身份檢查擋下 stale 43）
+        assertFalse(staleFired)
         // 新 listener 正常分發
-        l2.onRequestPermissionResult(42, PackageManager.PERMISSION_GRANTED)
+        l2.onRequestPermissionResult(43, PackageManager.PERMISSION_GRANTED)
         assertTrue(fired)
     }
 
@@ -406,6 +426,137 @@ class ShizukuPermissionRequestTest {
         var plainSent = false
         assertFalse(requests.request(1001) { plainSent = true })
         assertFalse(plainSent)
+    }
+
+    @Test fun staleResultFromOldRequest_deliveredViaNewListener_sameRequestCode_doesNotFireNewCallback() {
+        // Re-review #4 Finding 1 exploit 形狀：
+        // attach → l1；requestWithCallback(42) 登記 cbA；detach（removeListener 靜默失敗）；
+        // attach → l2；以燒過的 42 再請求必拒絕（burned）；stale OS 結果經「當前」l2 送達，
+        // 兩個回呼都不得觸發。
+        val listeners = mutableListOf<Shizuku.OnRequestPermissionResultListener>()
+        val requests = ShizukuPermissionRequests(
+            addListener = { listeners += it },
+            removeListener = { throw LinkageError("remove failed") },
+        )
+        requests.attach()
+        val l1 = listeners.last()
+        var cbA = false
+        assertTrue(requests.requestWithCallback(42, { cbA = true }) { })
+        requests.detach()
+        requests.attach()
+        val l2 = listeners.last()
+        assertNotSame(l1, l2)
+
+        var cbB = false
+        assertFalse(
+            "reattach 後復用燒過的 42 必拒絕（不登記 cbB）",
+            requests.requestWithCallback(42, { cbB = true }) { },
+        )
+        // 表內無 live 42（detach 已清空、重登記被拒）——以 onResult 探測：burned 且無 live ⇒ false
+        assertFalse("回呼表不得留有 live 42", requests.onResult(42) { })
+
+        l2.onRequestPermissionResult(42, PackageManager.PERMISSION_GRANTED)
+        assertFalse("cbB 從未登記，不得觸發", cbB)
+        // 結構性護欄（真正判別性斷言在 :451-456——燒碼 42 重登記被 burn 閘拒絕、onResult(42) 探測無 live）
+        assertFalse("cbA 隨 detach 回滾，stale 結果不得觸發", cbA)
+    }
+
+    @Test fun allocateRequestCode_isStrictlyIncreasingAndSkipsBurned() {
+        val requests = attachedRequests()
+        val a = requests.allocateRequestCode()
+        requests.detach()
+        requests.attach()
+        val b = requests.allocateRequestCode()
+        val c = requests.allocateRequestCode()
+        assertTrue("allocator 必發正數碼", a >= 1)
+        assertTrue("detach/reattach 之間仍嚴格遞增", b > a)
+        assertTrue("碼不重複", c > b)
+
+        // 呼叫方自選碼 7 燒掉後，allocator 下一碼必超過並跳過 7
+        val seeded = attachedRequests()
+        seeded.seedRequestCodeCounterForTest(7)
+        assertTrue(seeded.requestWithCallback(7, { }) { })
+        val next = seeded.allocateRequestCode()
+        assertTrue("allocator 不得與 burned 碼 7 重疊，實際=$next", next > 7)
+
+        // allocator 發出的碼不 burn：同碼 requestWithCallback 必可接受（僅此一次）、之後 burn 閘拒絕
+        val code = requests.allocateRequestCode()
+        assertTrue("allocator 發出的碼未 burn：同碼送出必可接受", requests.requestWithCallback(code, { }) { })
+        assertFalse("同碼消耗後必 burn：不得再次接受", requests.requestWithCallback(code, { }) { })
+
+        // 新 pin F：呼叫方高碼 1000 燒掉後，種子 999 的 allocator 必跳過 1000
+        val pinned = attachedRequests()
+        pinned.seedRequestCodeCounterForTest(999)
+        assertTrue(pinned.requestWithCallback(1000, { }) { })
+        assertEquals("種子 999 的首次分配應為 999", 999, pinned.allocateRequestCode())
+        assertEquals("burned 1000 必跳過，次碼必為 1001", 1001, pinned.allocateRequestCode())
+    }
+
+    @Test fun allocateRequestCode_exhaustionFailsClosed() {
+        val requests = ShizukuPermissionRequests()
+        requests.seedRequestCodeCounterForTest(Int.MAX_VALUE)
+        assertEquals(Int.MAX_VALUE, requests.allocateRequestCode())
+        val error = assertThrows(IllegalStateException::class.java) {
+            requests.allocateRequestCode()
+        }
+        assertEquals("REQUEST_CODE_SPACE_EXHAUSTED", error.message)
+        // 計數器已釘在 MAX_VALUE+1：後續呼叫必一律 fail-closed（不再依賴 per-alloc burn）
+        assertThrows(IllegalStateException::class.java) {
+            requests.allocateRequestCode()
+        }
+    }
+
+    @Test fun request_sameCodeAsOutstandingRequestWithCallback_rejected() {
+        val requests = attachedRequests()
+        assertTrue(requests.requestWithCallback(7, { }) { })
+        var bareSent = false
+        assertFalse(
+            "同碼 outstanding 時裸 request 必拒",
+            requests.request(7) { bareSent = true },
+        )
+        assertFalse("被拒的裸送不得送出", bareSent)
+        // 裸送過的碼即 burn：重送同碼被拒；不同碼可送出、送出後亦 burn
+        assertTrue(requests.request(8) { })
+        var resend = false
+        assertFalse("burned 裸送碼不得重送", requests.request(8) { resend = true })
+        assertFalse(resend)
+    }
+
+    @Test fun onResult_refusedWhenOutstandingCapacityExhausted() {
+        val requests = attachedRequests()
+        repeat(ShizukuPermissionRequests.MAX_OUTSTANDING) { i ->
+            assertTrue("registration $i should succeed", requests.onResult(20000 + i) { })
+        }
+        assertFalse("第 33 筆 onResult 必被共享上限拒絕", requests.onResult(99999) { })
+        var sent = false
+        assertFalse("bare request also refused at capacity", requests.request(99997) { sent = true })
+        assertFalse("bare request 超限不得送出", sent)
+        assertFalse(
+            "requestWithCallback 同受共享上限（MAX_OUTSTANDING）",
+            requests.requestWithCallback(99998, { }) { sent = true },
+        )
+        assertFalse(sent)
+    }
+
+    @Test fun onResult_rearmingConsumedCode_refused() {
+        val requests = ShizukuPermissionRequests()
+        var fired = false
+        assertTrue(requests.onResult(1001) { fired = true })
+        requests.emitResult(1001, PackageManager.PERMISSION_GRANTED)
+        assertTrue(fired)
+        assertFalse("消費（one-shot）後重新武裝同碼必拒絕", requests.onResult(1001) { })
+    }
+
+    @Test fun onResult_firstRegistrationCountsAndBurns() {
+        val requests = attachedRequests()
+        assertTrue("首次 live 登記必接受並 burn", requests.onResult(1001, { }))
+        assertTrue("同一 live 登記追加回呼必允許（不重複 burn）", requests.onResult(1001, { }))
+        var sent = false
+        assertFalse(
+            "burned 碼經 requestWithCallback 必拒（同碼 outstanding＋burned 雙重拒絕）",
+            requests.requestWithCallback(1001, { }) { sent = true },
+        )
+        assertFalse(sent)
     }
 
     @Test fun processSingletonStabilityAndReset() {

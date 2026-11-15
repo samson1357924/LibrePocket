@@ -7,8 +7,8 @@ import dev.librepocket.privilege.github.ShizukuGrantStore
 import dev.librepocket.privilege.github.ShizukuPermissionRequests
 import kotlinx.coroutines.runBlocking
 import org.junit.After
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -52,12 +52,12 @@ class FlavorPrivilegeScopeTest {
             serviceVersion = 13,
         )
         grantStore.save(grant)
-        assertNotNull(grantStore.load())
+        assertEquals("save 後 load 必回傳等值授權（non-vacuous pin）", grant, grantStore.load())
 
         val requests = ShizukuPermissionRequests.process()
         var callbackFired = false
         val oldEpoch = requests.currentEpoch()
-        requests.onResult(1001) { callbackFired = true }
+        assertTrue("registration must succeed or this test is vacuous", requests.onResult(1001) { callbackFired = true })
 
         FlavorPrivilegeScope.withdraw(context)
 

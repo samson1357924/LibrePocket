@@ -47,6 +47,19 @@ private fun safeLogW(tag: String, msg: String, e: Throwable? = null) {
  * [attach] 僅在上游註冊成功後才將守衛置 true，失敗即回滾並保持 false，
  * 呼叫方可重試；JVM 單測下 Shizuku 類初始化即失敗，attach 恆走失敗路徑。
  *
+ * requestCode 生命週期（本類保證）：本實例生存期內（經 [process] 取得的單例
+ * ＝行程生存期；單測新實例＝實例生存期），任何 requestCode 一旦被使用即永久
+ * burn——僅增不減、永不復原（含 detach/reattach、revoke、送出失敗與登記回滾；
+ * 失敗與回滾照燒，fail-closed）。[allocateRequestCode] 為嚴格遞增 allocator
+ * （起點 1、跳過 burned 碼）；發出不 burn，碼於首次送出／登記才照燒
+ * （與呼叫方自選碼同一規則）；耗盡（候選越過 Int.MAX_VALUE）拋出
+ * `IllegalStateException("REQUEST_CODE_SPACE_EXHAUSTED")`（fail-closed）。
+ * 呼叫方自選碼經 [request]／[requestWithCallback]／[onResult] 註冊或送出時照燒。
+ * 殘餘邊界：行程重啟後碼空間自 1 重新開始（含呼叫方自選碼）——stale pending
+ * dialog 在重啟後答覆，可把舊碼送達新行程的 listener；唯一緩解是 B3 落庫前的
+ * final-commit fence（`ShizukuGrantStore.save()` 前即時持久重查），為 B3 啟用的
+ * 不可通融硬性前置（見 docs/THREAT_MODEL.md 第 4 項）。
+ *
  * attach 成功後才能請求：[request]/[requestWithCallback] 在未成功 attach
  * （含從未 attach、已 [detach]）時一律 fail-closed 回傳 false，不登記任何回呼；
  * [detach] 會反註冊上游 listener 並作廢進行中請求（遞增 epoch＋清空回呼表），
@@ -62,7 +75,7 @@ class ShizukuPermissionRequests(
     private val removeListener: (Shizuku.OnRequestPermissionResultListener) -> Unit = { Shizuku.removeRequestPermissionResultListener(it) },
 ) {
     companion object {
-        /** outstanding 回呼表的總筆數上限（超限時 [requestWithCallback] 拒絕並回傳 false）。 */
+        /** outstanding 回呼表的總筆數上限（超限時 [requestWithCallback]／[onResult]／[request] 拒絕並回傳 false）。 */
         const val MAX_OUTSTANDING = 32
 
         @Volatile
@@ -83,9 +96,20 @@ class ShizukuPermissionRequests(
     }
 
     private val callbacks = mutableMapOf<Int, MutableList<(Boolean) -> Unit>>()
+
+    /**
+     * 已使用（burn）的 requestCode：僅增不減，永不清空、永不復原
+     * （含 detach/reattach、revoke、送出失敗與登記回滾；fail-closed）。
+     * 讀寫皆在 [lock] 下。
+     */
+    private val burnedCodes = HashSet<Int>()
+
     private val lock = Any()
 
     private var activeEpoch = 0L
+
+    /** 嚴格遞增 allocator 的下一個候選起點（僅增；burned 跳過）。讀寫皆在 [lock] 下。 */
+    private var requestCodeCounter = 1L
 
     /** 是否已向上游註冊結果 listener（冪等守衛，僅 [attach]/[detach]/[clear] 內讀寫）。 */
     private var attached = false
@@ -97,34 +121,99 @@ class ShizukuPermissionRequests(
     private var resultListener: Shizuku.OnRequestPermissionResultListener? = null
 
     /**
-     * 按 requestCode 登記授權結果回呼（#136-B3 接線：回呼內做 grant 持久化＋審計）。
+     * 按 requestCode 登記授權結果回呼（僅測試用驅動分發表；產品路徑請用
+     * [requestWithCallback] 原子登記）。
      *
-     * 低階多回呼語義（B3 接線用）：同一 requestCode 可登記多筆回呼，結果到達時
-     * 逐筆分發；每筆回呼執行前仍會重查 epoch（作廢後不再執行）。產品路徑的
-     * 請求＋回呼原子登記請用 [requestWithCallback]（含 attach 門檻與同碼隔離）。
-     * 注意：此處登記的回呼計入 [MAX_OUTSTANDING] 總額，且同碼登記會擋住後續
-     * [requestWithCallback] 對同 requestCode 的請求（同碼隔離以回呼表非空為準）。
+     * 僅測試用驅動（test-only）：無 production caller，B3 不得經此接線；
+     * `otherwise = PRIVATE`（模組內僅單測可見）。
+     *
+     * 多回呼語義：同一 requestCode 可登記多筆回呼，結果到達時按登記順序逐筆分發；
+     * 每筆回呼執行前仍會重查 epoch（作廢後不再執行）。產品路徑的請求＋回呼原子
+     * 登記請用 [requestWithCallback]（含 attach 門檻與同碼隔離）。
+     * [MAX_OUTSTANDING] 總額與 [requestWithCallback] 共用同一計數（表內全部回呼
+     * 筆數達上限即拒絕並回傳 false）；同碼登記會擋住後續 [requestWithCallback]
+     * 對同 requestCode 的請求（同碼隔離以回呼表非空為準）。
+     *
+     * requestCode burn-on-use：首次 live 登記即 burn 該碼（本實例內此後不得再用）；
+     * 碼已 burn 且當下無 live（outstanding）回呼時拒絕並回傳 false（防止消費後
+     * 重新武裝舊碼）；碼已 burn 但仍有 live 回呼時可追加登記（多回呼語義，
+     * 不重複 burn）。
+     *
+     * @return 登記是否被接受（false＝已達 [MAX_OUTSTANDING] 上限，或碼已 burn
+     * 且當下無 live 回呼）。
      */
-    fun onResult(requestCode: Int, callback: (granted: Boolean) -> Unit) {
-        synchronized(lock) {
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    internal fun onResult(requestCode: Int, callback: (granted: Boolean) -> Unit): Boolean {
+        return synchronized(lock) {
+            var outstanding = 0
+            for (list in callbacks.values) outstanding += list.size
+            if (outstanding >= MAX_OUTSTANDING) {
+                safeLogW(TAG, "onResult rejected: outstanding capacity exhausted")
+                return@synchronized false
+            }
+            val live = callbacks[requestCode]?.isNotEmpty() == true
+            if (burnedCodes.contains(requestCode) && !live) {
+                safeLogW(TAG, "onResult rejected: requestCode burned and no live callbacks")
+                return@synchronized false
+            }
             callbacks.getOrPut(requestCode) { mutableListOf() } += callback
+            burnedCodes.add(requestCode)
+            true
         }
     }
 
     /**
-     * 送出授權請求（預設走真實 `Shizuku.requestPermission`）。
+     * 送出授權請求（低階 fire-and-forget；產品路徑請用 [requestWithCallback]）。
      *
-     * 未成功 [attach] 時 fail-closed：不送出、回傳 false；[detach] 後需重新
-     * [attach] 才能再請求（attach 失敗可重試）。
+     * 裸送本函數不登記任何回呼、不保存任何結果、不具 grant 語義；結果只能由
+     * [requestWithCallback]／[onResult] 登記的回呼取得。
+     * 未成功 [attach]（含從未 attach、已 [detach]）時 fail-closed：不送出、回傳 false；
+     * [detach] 後需重新 [attach] 才能再請求（attach 失敗可重試）。
+     * 送出即 burn 該碼（送出失敗照燒、不復原）——本實例內此後不得再用；
+     * 同碼已有 outstanding 回呼、或 outstanding 總額已達 [MAX_OUTSTANDING] 上限
+     * 亦拒絕並回傳 false。
      *
-     * @return 請求是否已送出（未 attach 或送出時抛異常即 false，fail-closed；true 不代表
-     * 已授權，結果只經 [onResult] 回呼到達）。`CancellationException` 會原樣傳播（不折成 false）。
+     * 二段式（本函數＋另行 [onResult] 登記）自始不可行：裸送即 burn 該碼
+     * （本實例生存期內永久），故之後對同碼 [onResult] 登記因「burned 且無 live 回呼」
+     * 一律回傳 false——這是確定性結果，不是競態或時序問題。`request()` 回傳 true
+     * 僅代表「請求已送出，結果在本實例內不可觀測」；需要回呼必須用
+     * [requestWithCallback]（原子登記＋送出）。勿試圖「先 [request] 再 [onResult]
+     * 補救」——此為文件誤用，修復請改用 [requestWithCallback]。
+     * [detach] 僅作廢本地回呼表與 epoch，無法取消伺服器／系統側已送出的請求
+     * （server 端不存在取消路徑）。呼叫方無法將結果歸屬到裸送出的請求
+     * （同實例內裸送碼已 burn、無法再登記）；不得以裸 `request()` 搭建 grant 流程。
+     * 跨行程重啟的碼空間重新開始是殘餘風險，見類別 KDoc 的 requestCode 生命週期段。
+     *
+     * @return 請求是否已送出（未 attach／碼已 burn／同碼 outstanding／總額超限／
+     * 送出時抛異常即 false，fail-closed；true 不代表已授權，結果只經回呼到達）。
+     * `CancellationException` 會原樣傳播（不折成 false）。
      */
     fun request(
         requestCode: Int,
         requestPermission: (Int) -> Unit = { code -> Shizuku.requestPermission(code) },
     ): Boolean {
-        if (!synchronized(lock) { attached }) return false
+        synchronized(lock) {
+            if (!attached) {
+                safeLogW(TAG, "request rejected: not attached")
+                return false
+            }
+            if (burnedCodes.contains(requestCode)) {
+                safeLogW(TAG, "request rejected: requestCode burned")
+                return false
+            }
+            if (callbacks[requestCode]?.isNotEmpty() == true) {
+                safeLogW(TAG, "request rejected: requestCode in use")
+                return false
+            }
+            var outstanding = 0
+            for (list in callbacks.values) outstanding += list.size
+            if (outstanding >= MAX_OUTSTANDING) {
+                safeLogW(TAG, "request rejected: outstanding capacity exhausted")
+                return false
+            }
+            // 送出前 burn（失敗照燒、不復原，fail-closed）
+            burnedCodes.add(requestCode)
+        }
         return try {
             requestPermission(requestCode)
             true
@@ -151,6 +240,8 @@ class ShizukuPermissionRequests(
      * 同一 requestCode 已有 outstanding 回呼時拒絕並回傳 false（不登記）——
      * 一個 requestCode 同時僅一個 outstanding 回呼；需並行請求用不同 requestCode。
      * outstanding 回呼總數上限 [MAX_OUTSTANDING]，超限回傳 false。
+     * requestCode 送出即 burn（送出失敗與登記回滾照燒、不復原）：本實例內此後
+     * 不得再用（見類別 KDoc 的 requestCode 生命週期段）。
      * 若送出異常或失敗，自動回滾並移除已登記的回呼。
      * 回呼登記與實際送出並非對 detach 原子：detach 可能先於送出發生，
      * 屆時登記的回呼會隨表清空被丟棄、結果不再分發（方向 fail-closed）。
@@ -175,6 +266,12 @@ class ShizukuPermissionRequests(
                 safeLogW(TAG, "requestWithCallback rejected: outstanding capacity exhausted")
                 return false
             }
+            if (burnedCodes.contains(requestCode)) {
+                safeLogW(TAG, "requestWithCallback rejected: requestCode burned")
+                return false
+            }
+            // 送出前 burn（登記回滾仍照燒、不復原，fail-closed）
+            burnedCodes.add(requestCode)
             callbacks.getOrPut(requestCode) { mutableListOf() } += callback
         }
         val success = try {
@@ -212,6 +309,56 @@ class ShizukuPermissionRequests(
     internal fun currentEpoch(): Long = synchronized(lock) { activeEpoch }
 
     /**
+     * 嚴格遞增 requestCode allocator（起點 1，跳過 burned 碼）；發出不保留、不燒碼。
+     *
+     * allocation 本身【不 burn】：本函數僅保證回傳的碼在本實例內「發出當下」未 burn
+     * （嚴格遞增、跳過 burned 碼）。發出不登記、不送出、不佔位——碼於首次實際
+     * 送出／登記時才照本實例 burn 規則燒掉（與呼叫方自選碼同一規則；
+     * 送出失敗與登記回滾照燒）。僅發出而從未消耗（未送出／未登記）的碼
+     * 對本實例完全無影響（inert）：不擋其他呼叫方、不擋後續分配
+     * （計數器一律前進，絕不復發同一候選）。
+     * 呼叫方（含 B3）應恰為每次請求分配一次，並在恰唯一一次送出／登記中消耗；
+     * 發出後若被其他呼叫方先燒（同碼自選送出／登記），消耗時將被 burn 閘拒絕
+     * （fail-closed，呼叫方需重新分配）。凍結保證僅在單一實例內有效——
+     * 行程重啟後碼空間自 1 重新開始（見類別 KDoc 的 requestCode 生命週期段）。
+     * 跳過掃描的最壞情況為線性於「高於計數器的 burned 碼數」
+     * （上界為 Int.MAX_VALUE − counter；實務上 burned 碼由單一遞增源維護，
+     * 掃描長度可忽略）。
+     *
+     * @throws IllegalStateException 碼空間耗盡（候選越過 [Int.MAX_VALUE]），
+     * message 為 `REQUEST_CODE_SPACE_EXHAUSTED`（fail-closed；計數器釘在
+     * Int.MAX_VALUE + 1，後續呼叫必再拋同一例外）。
+     */
+    @VisibleForTesting
+    internal fun allocateRequestCode(): Int = synchronized(lock) {
+        var candidate = requestCodeCounter
+        while (candidate <= Int.MAX_VALUE.toLong() && burnedCodes.contains(candidate.toInt())) {
+            candidate++
+        }
+        if (candidate > Int.MAX_VALUE.toLong()) {
+            // 釘住計數器：後續呼叫必再判 exhausted（fail-closed、可重入）
+            requestCodeCounter = Int.MAX_VALUE.toLong() + 1
+            throw IllegalStateException("REQUEST_CODE_SPACE_EXHAUSTED")
+        }
+        val code = candidate.toInt()
+        requestCodeCounter = candidate + 1
+        code
+    }
+
+    /**
+     * 測試專用：把 allocator 種子推進到 [next]，用於近耗盡（exhaustion）場景。
+     * production 不得調用；僅單測可見；[next] 不得小於目前計數器（僅允許向前重定位）。
+     */
+    @VisibleForTesting
+    internal fun seedRequestCodeCounterForTest(next: Int) {
+        require(next >= 1) { "SEED_MUST_BE_POSITIVE" }
+        synchronized(lock) {
+            require(next.toLong() >= requestCodeCounter) { "SEED_MUST_NOT_REGRESS_COUNTER" }
+            requestCodeCounter = next.toLong()
+        }
+    }
+
+    /**
      * 單次消費回呼分發：按 requestCode 查找並移除回呼（one-shot），
      * 比對 epoch 一致性；每個回呼執行前重查 epoch（作廢後批次中止）；
      * 逐個調用並隔離異常。
@@ -235,7 +382,12 @@ class ShizukuPermissionRequests(
         }
     }
 
-    /** 僅供測試驅動 dispatch 路徑用；無 production caller；勿在產品碼呼叫。 */
+    /**
+     * 僅供測試驅動 dispatch 路徑用；無 production caller；勿在產品碼呼叫。
+     * 注意：emitResult 的 epoch 參數重查只能擋「作廢後的過期分發」，無法分辨 stale 與
+     * fresh 送達「當前」listener（同一 epoch 內兩者不可分辨）——落庫前的唯一兜底是
+     * B3 的 final-commit fence（`ShizukuGrantStore.save()` 前即時重查持久層）。
+     */
     @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
     internal fun emitResult(
         requestCode: Int,

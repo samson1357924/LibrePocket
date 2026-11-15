@@ -2,7 +2,6 @@ package dev.librepocket.shell
 
 import android.util.Log
 import androidx.annotation.VisibleForTesting
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
@@ -119,6 +118,64 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
     fun revokeInMemoryForTest(): Int = revoke()
 
     /**
+     * 僅單測使用：推進 [revokeEpoch]（不寫任何旗標）；production 不得調用。
+     * 供 [bridgeGrantedEpochBumpHookForTest] 在 second-read 前確定性插入
+     * 「epoch 已前進」的 bump，用以釘住 second-read 單層防線。
+     */
+    @VisibleForTesting
+    internal fun incrementRevokeEpochOnlyForTest() {
+        revokeEpoch.incrementAndGet()
+    }
+
+    /**
+     * 旗標發布（write＋second-read 重查，epoch 原子雙重檢查）：
+     * 寫入值為 `valid && revokeEpoch.get() == epochBefore`；寫後再讀一次 epoch——
+     * 撤銷落在「賦值」與「回讀」之間時仍落 false（fail-closed，不復活為 true）。
+     *
+     * 精度說明：本函數兩層（conjunct 重查／second-read）各自獨立即可擋下
+     * 「撤銷落在發布窗口」的競態，故既有單執行緒測試只能判別雙重檢查
+     * 「整體」被移除；second-read 獨有的「賦值→回讀」納秒窗無法以既有
+     * publish hook seam 判別性釘住（該 hook 觸發在賦值「之前」），
+     * 故另設 [bridgeGrantedEpochBumpHookForTest]（觸發於賦值與 second-read 之間，
+     * 僅推進 epoch、不寫旗標）。
+     *
+     * 殘留：second-read 仍非對 volatile 讀者全然原子——「賦值（可能為 true）」
+     * 與「second-read 壓回 false」之間的納秒窗，並發 volatile 讀取仍可能瞬時
+     * 觀測為 true（無法在不持有 opMutex 對抗 revoke 的前提下消除）；
+     * #136-B3 以落庫前 final-commit fence 為最終兜底，不得僅憑本旗標放行。
+     *
+     * [bridgeGrantedPublishHookForTest]（測試專用，production 恆 null）在旗標
+     * 寫入前觸發，用以確定性模擬「撤銷發布窗口內落地」。
+     * 測試鉤刻意放在「賦值之前」而非「賦值與 second-read 之間」：若放在兩者之間，
+     * 撤銷自身會把旗標寫成 false（last-writer-wins），還原 conjunct 或還原
+     * second-read 任一處都不會判紅；放在賦值之前，「賦值」成為最後寫入者，
+     * 才能確定性判別 epoch 雙重檢查是否真正生效。second-read 仍保留作結構性
+     * 防線（涵蓋賦值與回讀之間的競態；該納秒窗以 [bridgeGrantedEpochBumpHookForTest]
+     * 單獨釘住）。
+     */
+    private fun publishBridgeGranted(valid: Boolean, epochBefore: Long) {
+        bridgeGrantedPublishHookForTest?.invoke()
+        bridgeGranted = valid && revokeEpoch.get() == epochBefore
+        bridgeGrantedEpochBumpHookForTest?.invoke()
+        // second-read：覆蓋「撤銷落在賦值與回讀之間」的殘餘窗口
+        if (revokeEpoch.get() != epochBefore) bridgeGranted = false
+    }
+
+    /** 測試專用：旗標寫入前的 hook（fire revokeInMemoryForTest() 等）；production 不得呼叫。 */
+    @Volatile
+    @VisibleForTesting
+    internal var bridgeGrantedPublishHookForTest: (() -> Unit)? = null
+
+    /**
+     * 測試專用：旗標賦值後、second-read 前的 hook；bump 僅經
+     * [incrementRevokeEpochOnlyForTest] 推進 [revokeEpoch]（不寫旗標），
+     * 用以確定性釘住 second-read 單層防線；production 不得呼叫。
+     */
+    @Volatile
+    @VisibleForTesting
+    internal var bridgeGrantedEpochBumpHookForTest: (() -> Unit)? = null
+
+    /**
      * 簽發橋授權：校驗＋落庫成功後才置 [bridgeGranted]（落庫抛錯即旗標不動，
      * fail-closed）；開關 [bridgeSwitchOn] 不在此動（UI 側意圖，見本類 KDoc）。
      *
@@ -179,7 +236,8 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
                 }
                 throw IllegalStateException("PRIVILEGE_GRANT_REVOKED_CONCURRENTLY")
             }
-            bridgeGranted = postCheck is PrivilegeGrantCheck.Valid
+            // 旗標發布（write＋second-read 重查；撤銷落在發布窗口內 → 不得復活為 true）
+            publishBridgeGranted(postCheck is PrivilegeGrantCheck.Valid, epochBefore)
             grant
         }
     }
@@ -221,7 +279,8 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
                 // （同上 epoch 變更分支說明）。
                 return@withLock PrivilegeGrantCheck.Invalid(PrivilegeGrantPolicy.REASON_NEVER_GRANTED)
             }
-            bridgeGranted = check is PrivilegeGrantCheck.Valid
+            // 旗標發布（write＋second-read 重查；撤銷落在發布窗口內 → 不得復活為 true）
+            publishBridgeGranted(check is PrivilegeGrantCheck.Valid, epochBefore)
             check
         }
     }
@@ -271,24 +330,16 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
         withContext(NonCancellable) {
             // 有界等待 opMutex：只包 acquisition，臨界區內各段另以 timeout 保護，
             // 鎖取得超時 → fail-closed 抛錯（記憶體已關旗標，呼叫端可重試）。
-            val acquiredLock = AtomicBoolean(false)
             val acquired = withTimeoutOrNull(revokeOpTimeoutMs) {
                 opMutex.lock()
-                acquiredLock.set(true)
                 true
             }
             var primaryFailure: Throwable? = null
             if (acquired == null) {
-                // tryLock 競態：逾時瞬間恰取得鎖 → 本協程已持鎖但以為失敗；
-                // 補 unlock（防禦性吞掉「未持鎖」IllegalStateException），
-                // 避免 opMutex 永久殘留持有（全行程卡死）。
-                if (acquiredLock.get()) {
-                    try {
-                        opMutex.unlock()
-                    } catch (_: IllegalStateException) {
-                        // 鎖已不歸本協程持有（不應發生）；不得掩蓋 primaryFailure。
-                    }
-                }
+                // kotlinx.coroutines 1.11.0：Mutex.lock() 文件保證——若等待期間
+                // 取得鎖後才遇 mid-wait 取消（如逾時），會先釋放鎖再傳播取消，
+                // 故逾時取得點不會殘留「已持鎖但以為失敗」的情形，無需補 unlock；
+                // 絕不 force-unlock 他協程持有的 mutex（unlock() 不做擁有者檢查）。
                 // opMutex 被長臨界區佔用（grant/refresh 含 DataStore I/O）或
                 // DataStore 永久掛起 → 不再無界等待。
                 primaryFailure = IllegalStateException("PRIVILEGE_REVOKE_TIMEOUT")

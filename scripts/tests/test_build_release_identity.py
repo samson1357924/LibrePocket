@@ -40,7 +40,8 @@ def _normalize_for_match(path: str) -> str:
     Lookalike homoglyph substitutions (e.g. Cyrillic і for Latin i) are NOT folded,
     and neither are Turkish İ (U+0130, whose .lower() splits a dot above) nor
     U+2011 (non-breaking hyphen); these remain documented limitations of this
-    path-name control; a content-based registry-shape scan is the planned defense-in-depth layer.
+    path-name control; a content-based registry-shape scan shipping in this same tripwire
+    is the defense-in-depth backstop.
     """
     normalized = unicodedata.normalize("NFKC", path)
     return "".join(ch for ch in normalized if unicodedata.category(ch) != "Cf")

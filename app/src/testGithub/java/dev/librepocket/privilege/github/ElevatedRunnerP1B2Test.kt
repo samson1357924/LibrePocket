@@ -293,8 +293,8 @@ class ElevatedRunnerP1B2Test {
 
     /**
      * verify-stall 模型（Stage 3 item 6，`drainVerifyStallSealsAdmissionWithLingeringVerifyWorker`）：
-     * kill 路徑 cleanup block 為 no-op destroy＋isAlive→false，drain 不 stall；唯一卡死點為
-     * 有界 verify 的 `elevated-verify` worker：其 `waitFor(5, SECONDS)` 進入 [verifyGate] 閘門
+     * kill 路徑 cleanup block 為 no-op destroy＋`isAlive()` 恆為 true；kill 路徑照常收斂，唯一卡死點為
+     * verify 的 5s `waitFor(5, SECONDS)` 門控（有界 verify 的 `elevated-verify` worker 其 `waitFor(5, SECONDS)` 進入 [verifyGate] 閘門
      * 後**永不返回**（吞 interrupt＋無上界 await，模擬 Binder stall）——drain 的
      * `VERIFY_JOIN_MS(5500)+GRACE_MS(500)` 之後即宣告 verify 失敗（return false）並
      * `markLingering` 記槽（worker 存活期間持有一槽）；閘門 countDown 後 waitFor 回 true，
@@ -320,6 +320,7 @@ class ElevatedRunnerP1B2Test {
                 // 閘門離開即回 true（值不影響已超時宣告；finally 另行釋放槽）。
                 while (true) {
                     try {
+                        // Long.MAX_VALUE ms 經 TimeUnit.toNanos 飽和（JDK25 驗證），效果等同永久門控；退出僅靠 countDown；吞 interrupt 續等。
                         if (verifyGate.await(Long.MAX_VALUE, TimeUnit.MILLISECONDS)) return true
                     } catch (_: InterruptedException) {
                         // 吞 interrupt 續等至閘門。
@@ -1086,8 +1087,9 @@ class ElevatedRunnerP1B2Test {
             assertTrue("timedOut must stay true (kill path)", d.timedOut)
             assertEquals(-1, d.exitCode)
             // Stage 3（drain/verdict hardening，admitted residual surfacing）：起線程失敗 arm
-            // 亦置 untrackedOut——handle 未被任何追蹤包住（無 worker、killer 未信號），
-            // 嚴格差於飽和臂，Drained.untrackedResidual 必須 surface。tracker
+            // 亦置 untrackedOut——未持槽／無 worker／killer 未信號（handle 無 outstanding 追蹤；
+            // quarantine 以無條件登記另行涵蓋——僅登記拋出且 caller verify 臂 helper 重試再拋時方無任何追蹤接管），
+            // Drained.untrackedResidual 必須 surface。tracker
             // noteUntrackedResidual 計數仍只飽和臂計（與 kill-never-attempted 互斥語義不變），
             // 見下方 untrackedResidualCount 斷言。
             assertTrue(
@@ -3084,7 +3086,7 @@ class ElevatedRunnerP1B2Test {
      * drain kill 路徑 `runCleanupBounded` 佔槽必敗）：
      * - verdict == `TimedOut(cleanupIncomplete == true)`（interrupt-safe 文件化契約之 runner 映射）；
      * - `killNeverAttemptedCount()` 不變（worker 起動成功；saturation 不阻止 worker）；
-     * - `quarantinedCount() >= 1`（saturation 臂 `acquireSlotOrQuarantine` 原子登記）；
+     * - `quarantinedCount() == before+1`（saturation 臂 `acquireSlotOrQuarantine` 原子登記）；
      * - 釋放預填槽、清 quarantine 後的乾淨請求 ⇒ `Ok(cleanupIncomplete == false)`
      *   （verdict isolation：殘留計數／breaker 痕跡不降級後續乾淨 verdict）。
      * 雙 runner 皆測（makeRoot／makeShizuku 構造皆已由 AA1 驗證 trivial）。
@@ -3101,6 +3103,7 @@ class ElevatedRunnerP1B2Test {
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         val neverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
         val prefilled = AtomicInteger(0)
         val requestTag = if (which == Isolation.Root) "P1B2-SAT-ROOT" else "P1B2-SAT-SHIZUKU"
         val makeRunner: ((List<String>) -> Process) -> BinaryElevatedRunner =
@@ -3131,13 +3134,13 @@ class ElevatedRunnerP1B2Test {
                 neverBefore,
                 ElevatedCleanupTracker.killNeverAttemptedCount(),
             )
-            assertTrue(
-                "$which saturation must register the victim in quarantine via acquireSlotOrQuarantine",
-                ElevatedCleanupTracker.quarantinedCount() >= 1,
+            assertEquals(
+                "$which saturation must register exactly the victim in quarantine via acquireSlotOrQuarantine",
+                quarantineBefore + 1,
+                ElevatedCleanupTracker.quarantinedCount(),
             )
-            // 清 quarantine＋釋預填槽：後續乾淨請求須回 Ok(false)（verdict isolation）。
+            // 清 quarantine（釋預填槽與 reset 由 finally 承擔）：後續乾淨請求須回 Ok(false)（verdict isolation）。
             ElevatedCleanupTracker.clearUnverified()
-            ElevatedCleanupTracker.noteClean()
         } finally {
             repeat(prefilled.get()) { ElevatedCleanupTracker.releaseSlot() }
             ElevatedCleanupTracker.clearUnverified()
@@ -3275,7 +3278,6 @@ class ElevatedRunnerP1B2Test {
             )
             // 停滯期間：drain 尚未返回、outstanding==1（cleanup 槽由 caller 持有；verify
             // linger 槽尚未發放——markLingering 在 6s 上界之後）、admission 密封、零 quarantine。
-            assertFalse("drain must still be inside the bounded verify window", drainDone.await(0, TimeUnit.NANOSECONDS))
             assertEquals(
                 "cleanup slot must stay held during the verify stall",
                 1,

@@ -441,8 +441,9 @@ internal object ElevatedCleanupTracker {
      *    late-daemon 起線程失敗收斂臂／compensateInline 本體）及所有 helper 冪等重試）。
      * `lateCompensateSpawn` 內層 guarded attempt 不計數（N5 已單站點化）。
      * 語義見 [noteQuarantineRegistrationFailed]：每次拋出的登記嘗試計數一次；單一 incident
-     * 上限：drain 臂至多 3 次（臂內首嘗＋second-chance＋caller verify 臂 helper 重試）；
-     * 兩晚補償臂至多 2 次（臂內首嘗＋second-chance，無 helper 重試）；
+     * 上限：drain acquire-throw 臂至多 3 次（臂內首嘗＋second-chance＋caller verify 臂
+     * helper 重試）；drain start-failure 臂至多 2 次（臂內登記失敗 note＋caller verify
+     * 臂 helper 重試）；兩晚補償臂至多 2 次（臂內首嘗＋second-chance，無 helper 重試）；
      * 告警接線一律以 `>0` 判定，禁止當作唯一失敗計數。
      * 登記失敗＝槽保留（admission 續拒）之 fail-closed 記數；app 重啟前不可自清、應告警。
      * 零消費方（僅診斷可見）：非零即 fail-closed brick 需 app 重啟恢復；告警/上報接線歸 #136-B3
@@ -476,7 +477,11 @@ internal object ElevatedCleanupTracker {
 
     /**
      * 遞增「quarantine 登記失敗」計數。語義＝每次拋出的登記嘗試計數一次；
-     * 單一 incident 可能至多計 2 次（臂內二次登記＋helper 重試各一次）。
+     * 單一 incident 上限：drain acquire-throw 臂至多 3 次（臂內首嘗＋second-chance＋
+     * caller verify 臂 helper 重試；首嘗可能從未執行，計數為保守上限，非字面嘗試
+     * 次數統計）；drain start-failure 臂至多 2 次（臂內登記失敗 note＋caller verify
+     * 臂 helper 重試）；兩晚補償臂至多 2 次（臂內首嘗＋second-chance，無 helper
+     * 重試）。
      * 告警接線一律以 `>0` 判定，禁止當作唯一失敗計數（亦不得據此反推殘留 handle 數）。
      */
     internal fun noteQuarantineRegistrationFailed() {
@@ -2567,8 +2572,9 @@ internal object ElevatedProcessIo {
          * `elevated-cleanup` worker（tracker 飽和時仍嘗試監督清理，killer 已被
          * 嘗試一次、worker 不受准入看見）即 true。
          * Stage 3（drain/verdict hardening）：起線程失敗臂／acquire 拋臂亦置 true
-         * （admitted residual surfacing——兩臂 killer 從未信號、handle 未被任何追蹤
-         * 包住）；tracker 飽和計數互斥語義不變。worker stall 於不可中斷 Binder
+         * （admitted residual surfacing——兩臂 killer 從未信號、未持槽／無 worker，
+         * handle 無 outstanding 追蹤；quarantine 以無條件／best-effort 登記另行涵蓋——
+         * 僅雙登記皆拋時方無任何追蹤接管）；tracker 飽和計數互斥語義不變。worker stall 於不可中斷 Binder
          * 即無 handle 可追蹤；本位供 per-drain 歸因（runners 不需映射，純監測），
          * 跨呼叫累計見 [ElevatedCleanupTracker.noteUntrackedResidual]／
          * [ElevatedCleanupTracker.untrackedResidualCount]。kill 從未被信號（起線程
@@ -3683,8 +3689,10 @@ internal object ElevatedProcessIo {
      * untracked 殘留可計，只記 never-attempted。
      * Stage 3（drain/verdict hardening）：Drained 歸因不再只反映飽和——起線程失敗臂
      * 及 acquire 拋臂（acquireSlotOrQuarantine 本身 throw，如 VME）同置 `untrackedOut`
-     * （admitted residual surfacing：兩臂 handle 皆未被任何追蹤包住，嚴格差於
-     * 飽和臂；tracker `noteUntrackedResidual` 計數不變，互斥語義不變）。後者另附
+     * （admitted residual surfacing：兩臂皆未持槽／無 worker／killer 未信號——handle 無
+     * outstanding 追蹤；quarantine 以無條件（起線程失敗臂）／best-effort 二次登記
+     * （acquire 拋臂）另行涵蓋——僅雙登記皆拋時方無任何追蹤接管；
+     * tracker `noteUntrackedResidual` 計數不變，互斥語義不變）。後者另附
      * 與晚補償兩臂同構的二次 best-effort quarantine 登記（登記拋出即計
      * 連 [ElevatedCleanupTracker.noteQuarantineRegistrationFailed]，此臂至多 2 次失敗計數
      * （臂內首嘗＋second-chance）；caller verify 臂 helper 另計 1 次——drain 臂
@@ -3723,7 +3731,7 @@ internal object ElevatedProcessIo {
      * @param untrackedOut Stage 2A（P1-A2）可選 out：本次呼叫若起了未佔槽
      *   worker（飽和）即置 true；null 即不回報（僅 tracker 計數）。
      *   Stage 3：起線程失敗臂／acquire 拋臂亦置 true（admitted residual surfacing；
-     *   三臂語義見 KDoc 對應段；tracker 計數不變）。
+     *   三臂語義見 KDoc 對應段；tracker 計數不變；quarantine 登記另行涵蓋，僅雙登記皆拋時方無任何追蹤接管）。
      * @param startThread Stage 2A（P1-A3）可注入的線程啟動方式（測試注入用）：
      *   drain 層的 `startThread` seam 一併穿入，使 elevated-cleanup 起線程失敗
      *   可注入（「抛即未起」契約同 drain 其他執行緒；預設 `{ it.start() }`）。
@@ -3771,8 +3779,10 @@ internal object ElevatedProcessIo {
         // （見本函數 P1-4 段）。
         // fail-closed：acquireSlotOrQuarantine 本身抛（如 VME in ArrayList.add）——
         // 槽從未取得（acquire 失敗路徑未遞增），不啟 worker、不 releaseSlot；
-        // slotHeldOut=false（caller 無槽可放）、untrackedOut=true（killer 從未信號、
-        // handle 未被任何追蹤包住——Stage 3 admitted residual surfacing，drain 歸因必須帶出），
+        // slotHeldOut=false（caller 無槽可放）、untrackedOut=true（killer 從未信號——
+        // 未持槽／無 worker，handle 無 outstanding 追蹤；quarantine 以 best-effort 二次
+        // 登記另行涵蓋——僅雙登記皆拋時方無任何追蹤接管；Stage 3 admitted residual
+        // surfacing，drain 歸因必須帶出），
         // return false → caller cleanupIncomplete=true → verify →
         // releaseCleanupSlotAfterVerify(verified, slotHeld=false) handles the rest。
         // 二次登記（與兩晚補償臂 `startLateDaemon`／`compensateInline` 同構；首次登記
@@ -3783,6 +3793,8 @@ internal object ElevatedProcessIo {
         // double-count 語義一致）；caller verify 臂 releaseCleanupSlotAfterVerify
         // （verified=false 且 registrar 仍抛）可另計 1 次——drain 臂全 incident 上限
         // 3 次（兩晚補償臂無 helper 重試，上限 2 次）。
+        // 註：首登記可能從未執行（如 VME 於 acquire 本體內含任何 registrar 嘗試之前即抛）——
+        // 本臂計數為保守上限，非字面嘗試次數統計（phantom count 可能發生）。
         val acquired = try {
             ElevatedCleanupTracker.acquireSlotOrQuarantine(process)
         } catch (_: Throwable) {
@@ -3846,8 +3858,10 @@ internal object ElevatedProcessIo {
             // （不佔 untracked 殘留：無 worker 即無殘留；不計 cleanupIncomplete 之外
             // 的新旗標，呼叫方既有 incomplete／breaker 語義不變）。
             // Stage 3（drain/verdict hardening，admitted residual surfacing）：Drained
-            // 歸因同置 `untrackedOut`（此臂 handle 未被任何追蹤包住，嚴格差於飽和臂；
-            // tracker `noteUntrackedResidual` 計數不變，與 kill-never-attempted 互斥語義不變）。
+            // 歸因同置 `untrackedOut`（此臂未持槽／無 worker／killer 未信號——handle 無
+            // outstanding 追蹤；quarantine 以無條件登記另行涵蓋，登記拋出即計 count，
+            // caller verify 臂 helper 不論 slotHeld 皆再嘗試登記——僅兩次皆拋時方無任何
+            // 追蹤接管；tracker `noteUntrackedResidual` 計數不變，與 kill-never-attempted 互斥語義不變）。
             ElevatedCleanupTracker.noteKillNeverAttempted()
             untrackedOut?.set(true)
             return false

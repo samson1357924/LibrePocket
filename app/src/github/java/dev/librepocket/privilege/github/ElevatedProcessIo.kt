@@ -83,8 +83,8 @@ import java.util.concurrent.TimeUnit
  * 峰值由 #136-B3 heap profile 驗收，本檔不承諾 8.5MiB 程序峰值。
  *
  * X1 有界 acquisition（owner 新 P1 lifecycle，W1 引入的 timeout 繞過）：
- * W1 在呼叫執行緒先取雙流（L177-203）→ Shizuku getter 為同步 Binder IPC，
- * stall 即呼叫執行緒卡死：deadline（L215）與首次 isCancelled（L218）永不進入；
+ * W1 在呼叫執行緒先取雙流（gobbler 啟動前的 drain 入口 getter 段）→ Shizuku getter 為同步 Binder IPC，
+ * stall 即呼叫執行緒卡死：drain 入口的 deadline 判定（[ElevatedCallSupervisor.isExpired]）與首次 isCancelled 檢查永不進入；
  * kill 路徑重調 `process.inputStream/errorStream.close()` 同樣觸阻塞 getter。
  * 現：
  * - deadline 移到 drain 入口第一行（outputStream 關閉之前），全部開銷計入同一 budget；
@@ -336,7 +336,7 @@ internal object ElevatedCleanupTracker {
      * quarantine 的 `waitFor(0)==true` 條目；無槽 lingering worker 債務
      * `lingerDebt>0` 時 admission 仍拒（見 [classifyAdmissionLocked] gate 6，
      * end 入口三處：(i) markLingering 飽和臂 → 四態 finally 的 3 臂；(ii) cleanup worker cell-finally 之 acquired==false 臂（0→2）;(iii) 起線程失敗臂的 catch 經 cell 互斥收斂（前提：startThread「拋即未起」契約）。exactly-once 由同一 cell/state 鎖保證）。
-     * 本 seal 與 Stage 3c verify-stall seal 同政策：#136-B3 落地前無 operator 可見性（不接 verdict、不接 prod telemetry）;B3 必接 alert＋runbook（重啟）。
+     * 本 seal 與 Stage 3c verify-stall seal 同政策：#136-B3 落地前無 operator 可見性（不接 verdict、不接 prod telemetry）;B3 必接 alert＋runbook（重啟）；late-spawn daemon stall 同樣永久密封 outstanding≥1 且不計 cleanupWorkerStalledAfterVerify（該數僅覆蓋 runCleanupBounded）；#136-B3 runbook 須列舉此臂。
      */
     private val quarantine = ArrayList<Process>()
 
@@ -388,6 +388,18 @@ internal object ElevatedCleanupTracker {
     private val lastAttemptNanos = IdentityHashMap<Process, Long>()
 
     /**
+     * Round-6（#136-B2 review D-A4）：sweep verifier 飽和跳過計數（telemetry-only，fail-closed 方向不變）。
+     * [verifyQuarantinedOneBounded] 起線程前同 [lock] 內預佔 [sweepPending]，`size>=MAX_SWEEP_VERIFIERS`
+     * 即跳過該條目、保持 quarantine（fail-closed 不翻轉）——本計數累計此類「飽和跳過」事件：
+     * 復原＝app 重啟（本地 latch 判定 QUARANTINE，無產品清除路徑；僅 [clearUnverified] 測試隔離可調）；
+     * #136-B3 必接 alert（verifier stall 滿 [MAX_SWEEP_VERIFIERS] 條即該 handle 永不再驗證）。
+     * 純診斷：不改准入／verdict／quarantine 語義（計數本身不使任何 verdict 翻轉，飽和跳過維持 QUARANTINE）。
+     */
+    private val sweepSaturationSkips = AtomicInteger(0)
+    internal fun noteSweepSaturationSkip() { sweepSaturationSkips.incrementAndGet() }
+    @VisibleForTesting internal fun sweepSaturationSkipsCount(): Int = sweepSaturationSkips.get()
+
+    /**
      * floor 命中計數（診斷用，產品保持 floor 不變負但上報；正常路徑永不觸發，
      * 觸發即呼叫方 bug——未佔而釋）。
      */
@@ -417,19 +429,27 @@ internal object ElevatedCleanupTracker {
 
     /**
      * Stage 2A（P1-A3，kill-never-attempted 計數；與 [noteUnclean] 分離，純診斷）：
-     * 僅計「清理 worker 從未成功起動、killer 從未被信號」的事件
-     * （`runCleanupBounded` 起線程失敗——`Thread.start()` 抛，如 OOM／resource
-     * exhaustion）。與 `cleanupIncomplete`／breaker 分離的理由：
+     * 僅計「清理 worker 從未成功起動、killer 從未被信號」的事件。
+     * 兩臂：(i) 起線程失敗（`runCleanupBounded` 起線程失敗——`Thread.start()` 抛，如 OOM／resource
+     * exhaustion）；(ii) acquire-throw 臂（drain／兩 late 臂三處 acquireSlotOrQuarantine
+     * 本身拋，如 VME）—acquire 從未成功＝無槽亦無任何臂收斂前置。
+     * 與 `cleanupIncomplete`／breaker 分離的理由：
      * - 飽和無槽**仍會**嘗試 killer（`elevated-cleanup` worker 照起，kill 至少
      *   被嘗試一次，只是無法記槽自證有界完成）——那是 A2 缺口（untracked），
      *   不是「never attempted」；
      * - finish／kill 路徑其餘未完成只代表「信號已送但完成/死亡不可證」
      *   （worker stall／verify=false——信號已發出，進程可能已死）；
-     * - 唯一「信號從未發出」的分支是起線程失敗：對此分支 incident response
+     * - 兩臂（i)(ii)「信號從未發出」：對此分支 incident response
      *   須走不同路徑（handle 仍在／可能存活，無 killer 嘗試可倚仗），故獨立
      *   計數，不混入 breaker（breaker 語義＝連續清理未完成，保持不動）。
      */
     private val killNeverAttempted = AtomicInteger(0)
+
+    /** Round-6（#136-B2 review D-D5）：drain wait-loop 直接 catch 的 Throwable 寬化（輪詢異常收斂為未完成）計數；
+     *  main path 其餘 `catch (_: Throwable)` 寬化皆刻意 fail-closed 且不計數（主體 fail-open 不成立）；#136-B3 遙測缺口 accepted。 */
+    private val swallowedPollThrows = AtomicInteger(0)
+    internal fun noteSwallowedPollThrows() { swallowedPollThrows.incrementAndGet() }
+    @VisibleForTesting internal fun swallowedPollThrowsCount(): Int = swallowedPollThrows.get()
 
     /**
      * B3 telemetry（P2 診斷計數；單調不遞減，永不接 admission／verdict）：
@@ -451,12 +471,17 @@ internal object ElevatedCleanupTracker {
      * 4. [releaseCleanupSlotAfterVerify] 登記拋出（單一計數站點，涵蓋 helper 六處
      *    調用點（drain 三臂含 preflight：preflight kill／kill 路徑／
      *    cleanupOnThreadStartFailure 收斂臂；late 三臂：late daemon 本體／
-     *    late-daemon 起線程失敗收斂臂／compensateInline 本體）及所有 helper 冪等重試）。
+     *    late-daemon 起線程失敗收斂臂／compensateInline 本體）及所有 helper 冪等重試）；
+     * 5. `drainFailClosedDrained()`（catch-all 總包裝）的 onFailure 臂——catch-all 臂登記
+     *    失敗（此臂不經 verify／runCleanupBounded，無槽可留，登記失敗僅 note＋brick 兜底）。
      * `lateCompensateSpawn` 內層 guarded attempt 不計數（N5 已單站點化）。
      * 語義見 [noteQuarantineRegistrationFailed]：每次拋出的登記嘗試計數一次；單一 incident
      * 上限：drain acquire-throw 臂至多 3 次（臂內首嘗＋second-chance＋caller verify 臂
      * helper 重試）；drain start-failure 臂至多 2 次（臂內登記失敗 note＋caller verify
      * 臂 helper 重試）；兩晚補償臂至多 2 次（臂內首嘗＋second-chance，無 helper 重試）；
+     * 上界皆為保守上限，非字面嘗試次數統計（⊆經 cleanupOnThreadStartFailure 總包裝／
+     * Inner 異常臂轉入 `drainFailClosedDrained()` onFailure 臂時可再加 1；
+     * `drainFailClosedDrained()` 登記失敗本臂另含 noteRegistrationFailedSticky——經此臂再 +1 屬設計，>0 ⇒ brick 語義保持）；
      * 告警接線一律以 `>0` 判定，禁止當作唯一失敗計數。
      * 登記失敗＝槽保留（admission 續拒）之 fail-closed 記數；app 重啟前不可自清、應告警。
      * 零消費方（僅診斷可見）：非零即 fail-closed brick 需 app 重啟恢復；告警/上報接線歸 #136-B3
@@ -466,12 +491,15 @@ internal object ElevatedCleanupTracker {
     private val quarantineRegistrationFailed = AtomicInteger(0)
 
     /** untracked 殘留 worker 起動累計數（僅測試／診斷用；產品不讀取）。 */
+    @VisibleForTesting
     internal fun untrackedResidualCount(): Int = untrackedResidual.get()
 
     /** 起線程失敗（killer 從未信號）累計數（僅測試／診斷用；產品不讀取）。 */
+    @VisibleForTesting
     internal fun killNeverAttemptedCount(): Int = killNeverAttempted.get()
 
     /** 槽 carrying worker 在最終 post-grace `isAlive` 重讀仍存活（不可中斷 stall）累計數（B3 telemetry only；產品不讀取，永不接 admission／verdict）。 */
+    @VisibleForTesting
     internal fun cleanupWorkerStalledAfterVerifyCount(): Int = cleanupWorkerStalledAfterVerify.get()
 
     internal fun noteCleanupWorkerStalledAfterVerify() {
@@ -532,9 +560,11 @@ internal object ElevatedCleanupTracker {
      * 遞增「quarantine 登記失敗」計數。語義＝每次拋出的登記嘗試計數一次；
      * 單一 incident 上限：drain acquire-throw 臂至多 3 次（臂內首嘗＋second-chance＋
      * caller verify 臂 helper 重試；首嘗可能從未執行，計數為保守上限，非字面嘗試
-     * 次數統計）；drain start-failure 臂至多 2 次（臂內登記失敗 note＋caller verify
-     * 臂 helper 重試）；兩晚補償臂至多 2 次（臂內首嘗＋second-chance，無 helper
-     * 重試）。
+     * 次數統計；⊆經 cleanupOnThreadStartFailure 總包裝／Inner 異常臂轉入
+     * `drainFailClosedDrained()` 的 onFailure 臂時可再加 1）；drain start-failure 臂
+     * 至多 2 次（臂內登記失敗 note＋caller verify 臂 helper 重試）；兩晚補償臂至多
+     * 2 次（臂內首嘗＋second-chance，無 helper 重試）。`drainFailClosedDrained()`
+     * onFailure 臂再 +1 屬設計（brick 語義 >0 保持，不雙釋）。
      * 告警接線一律以 `>0` 判定，禁止當作唯一失敗計數（亦不得據此反推殘留 handle 數）。
      */
     internal fun noteQuarantineRegistrationFailed() {
@@ -575,16 +605,21 @@ internal object ElevatedCleanupTracker {
     fun activeCalls(): Int = synchronized(lock) { activeCalls.get() }
 
     /** 連續未完成計數快照（僅測試／診斷用；正式 verdict 以 [isBreakerOpen] 為準）。 */
+    @VisibleForTesting
     internal fun consecutiveCount(): Int = synchronized(lock) { consecutiveUnclean.get() }
 
     /** floor 命中快照（僅診斷用；正常路徑永為 0，測用不断言）。 */
+    @VisibleForTesting
     internal fun releaseFloorHits(): Int = releaseFloorHits.get()
+    @VisibleForTesting
     internal fun leaveFloorHits(): Int = leaveFloorHits.get()
 
     /** 同步峰值快照（僅測試／診斷用；[acquireSlot] 同鎖內同步更新，替代 sleep 採樣）。 */
+    @VisibleForTesting
     internal fun peakOutstanding(): Int = synchronized(lock) { peakOutstanding.get() }
 
     /** 重置同步峰值為當前值（測試隔離用）。 */
+    @VisibleForTesting
     internal fun resetPeak() {
         synchronized(lock) { peakOutstanding.set(outstandingCount.get()) }
     }
@@ -600,6 +635,7 @@ internal object ElevatedCleanupTracker {
      * 零 spawn、不耗配額）。成功後呼叫方須以
      * `try { ... } finally { leaveCall() }` 包住剩餘路徑，否則計數洩漏即永久拒絕。
      */
+    @VisibleForTesting
     internal fun tryEnterCall(): Boolean = synchronized(lock) {
         if (activeCalls.get() >= MAX_CONCURRENT_CALLS) return false
         activeCalls.incrementAndGet()
@@ -630,6 +666,7 @@ internal object ElevatedCleanupTracker {
      * 鎖存語義：熔斷後所有新 spawn 被入口門拒絕，故不會再有 drain 執行、
      * 計數器不會自然歸零；#136-B3 在驗證修復後須顯式呼叫 [noteClean] 重置
      * （internal，同模組可見），不得僅調大上限繞行。*/
+    @VisibleForTesting
     fun isBreakerOpen(): Boolean = synchronized(lock) { consecutiveUnclean.get() >= MAX_CONSECUTIVE_UNCLEAN }
 
     /**
@@ -698,9 +735,11 @@ internal object ElevatedCleanupTracker {
     }
 
     /** quarantine 是否非空（快照，僅測試／診斷用；正式准入 verdict 以 [tryEnterReserved] 為準）。 */
+    @VisibleForTesting
     internal fun isQuarantined(): Boolean = synchronized(lock) { quarantine.isNotEmpty() }
 
     /** quarantine 登記數快照（僅測試／診斷用）。 */
+    @VisibleForTesting
     internal fun quarantinedCount(): Int = synchronized(lock) { quarantine.size }
 
     /**
@@ -741,9 +780,11 @@ internal object ElevatedCleanupTracker {
     internal const val SWEEP_LAST_ATTEMPT_PRUNE_MS = 3_600_000L
 
     /** sweep 是否有在飛驗證（快照，僅測試／診斷用）。 */
+    @VisibleForTesting
     internal fun isSweepInFlight(): Boolean = sweepLease.get()
 
     /** sweep 在飛內層檢查數快照（僅測試／診斷用；含預佔在飛＋stall 殘留，恆 `<=MAX_SWEEP_VERIFIERS`，收斂後歸零）。 */
+    @VisibleForTesting
     internal fun sweepPendingCount(): Int = synchronized(lock) { sweepPending.size }
 
     /**
@@ -802,6 +843,7 @@ internal object ElevatedCleanupTracker {
      * @param nowNanos 可注入單調時鐘（預設 `System.nanoTime`；單測傳假時鐘做確定性
      *   節流迴歸，不靠 sleep 時序；產品呼叫沿用預設，不傳參）。
      */
+    @VisibleForTesting
     internal fun sweepQuarantine(
         nowNanos: () -> Long = { System.nanoTime() },
     ): Int {
@@ -987,7 +1029,11 @@ internal object ElevatedCleanupTracker {
     private fun verifyQuarantinedOneBounded(p: Process): Boolean {
         synchronized(lock) {
             if (sweepPending.any { it === p }) return false
-            if (sweepPending.size >= MAX_SWEEP_VERIFIERS) return false
+            if (sweepPending.size >= MAX_SWEEP_VERIFIERS) {
+                // Round-6（#136-B2 review D-A4）：verifier 飽和跳過遙測（telemetry-only；fail-closed 保持 quarantine）。
+                noteSweepSaturationSkip()
+                return false
+            }
             sweepPending.add(p)
         }
         val holder = AtomicReference<Boolean?>()
@@ -1085,6 +1131,8 @@ internal object ElevatedCleanupTracker {
      * Round-6（#136-B2 IR-P1）gate 6：無槽 lingering worker 債務 >0 即
      * [Admission.BACKLOG_FULL]。原因優先級：多門同成立時 BACKLOG_FULL 訊息不變；
      * 復原＝debt 歸零（end 入口三處，見 beginLingerDebt KDoc）或 app 重啟。
+     * 多門同成立時既有門 reason 優先，QUARANTINE 恆居末門、diagnostics 應讀
+     * `quarantinedCount` 而非 reason code。
      */
     private fun classifyAdmissionLocked(): Admission {
         // Round-6（#136-B2）：登記雙失敗 brick — admission 永久密封（app 重啟恢復）。
@@ -1327,7 +1375,7 @@ internal object ElevatedCleanupTracker {
  *   `Denied` 站點皆帶 `preSpawnLinger(x.hasLinger)`（含 cancel 門、門 `Ok(true)`／
  *   中斷臂的 `preSpawnLinger(false)`、quota 後顯式過期前門）；唯 spawn 前 preflight
  *   入口零 budget 站點仍字面 `false`（worker 從未啟動）。P2-4 契約見
- *   `preSpawnLinger` KDoc（~L4213）。
+ *   `preSpawnLinger` KDoc（[ElevatedRunnerCommon.preSpawnLinger] KDoc 區塊）。
  *
  * 常數不動 READY／MAX（新增本物件常數，不改 [ElevatedCleanupTracker] 上限）。
  */
@@ -1806,7 +1854,7 @@ internal object ElevatedCallSupervisor {
                     val watchLingering = closeWatch()
                     if (lingering) ElevatedCleanupTracker.markLingering(worker, state)
                     if ((lingering || watchLingering) && markUncleanOnLinger) {
-                        ElevatedCleanupTracker.noteUnclean()
+                        runCatching { ElevatedCleanupTracker.noteUnclean() }
                     }
                     return Res.Expired(hasLinger = lingering || watchLingering)
                 }
@@ -1837,7 +1885,7 @@ internal object ElevatedCallSupervisor {
                             val watchLingering = closeWatch()
                             if (lingering) ElevatedCleanupTracker.markLingering(worker, state)
                             if ((lingering || watchLingering) && markUncleanOnLinger) {
-                                ElevatedCleanupTracker.noteUnclean()
+                                runCatching { ElevatedCleanupTracker.noteUnclean() }
                             }
                             return Res.Expired(hasLinger = lingering || watchLingering)
                         } else if (w.observedFalse()) {
@@ -1846,7 +1894,7 @@ internal object ElevatedCallSupervisor {
                             // 則落到下方慢檢查繼續等 hook 明確／中斷／deadline，
                             // 不樂觀消費（PhaseB caller-claim 確定性）。
                             val watchLingering = closeWatch()
-                            if (watchLingering && markUncleanOnLinger) ElevatedCleanupTracker.noteUnclean()
+                            if (watchLingering && markUncleanOnLinger) runCatching { ElevatedCleanupTracker.noteUnclean() }
                             // Round-4 Phase L P1-2：linger 即該 gate 失敗（即使 block
                             // 值已交付）：watcher 殘留即不 handoff，fail-closed 回
                             // Expired（單 call 至多 1 linger，後續 gate 不再執行；
@@ -1872,7 +1920,7 @@ internal object ElevatedCallSupervisor {
                         // else unknown：交付值 pending，落到下方慢檢查等待。
                     } else {
                         val watchLingering = closeWatch()
-                        if (watchLingering && markUncleanOnLinger) ElevatedCleanupTracker.noteUnclean()
+                        if (watchLingering && markUncleanOnLinger) runCatching { ElevatedCleanupTracker.noteUnclean() }
                         // R3-PhaseG P2-2 快路徑 postcheck（見本函數 KDoc）：worker
                         // 已死＋watcher 從未啟動時，仍須重驗 deadline＋中斷。
                         // Thr／無交付（Err 語義）不轉 Expired，只有成功交付才驗。
@@ -1913,7 +1961,7 @@ internal object ElevatedCallSupervisor {
                     val watchLingering = closeWatch()
                     if (lingering) ElevatedCleanupTracker.markLingering(worker, state)
                     if ((lingering || watchLingering) && markUncleanOnLinger) {
-                        ElevatedCleanupTracker.noteUnclean()
+                        runCatching { ElevatedCleanupTracker.noteUnclean() }
                     }
                     return Res.Expired(hasLinger = lingering || watchLingering)
                 }
@@ -1927,7 +1975,7 @@ internal object ElevatedCallSupervisor {
                         Thread.currentThread().interrupt()
                         runCatching { worker.interrupt() }
                         val watchLingering = closeWatch()
-                        if (watchLingering && markUncleanOnLinger) ElevatedCleanupTracker.noteUnclean()
+                        if (watchLingering && markUncleanOnLinger) runCatching { ElevatedCleanupTracker.noteUnclean() }
                         return Res.Expired(hasLinger = watchLingering)
                     }
                 }
@@ -1943,7 +1991,7 @@ internal object ElevatedCallSupervisor {
             val watchLingering = closeWatch()
             if (lingering) ElevatedCleanupTracker.markLingering(worker, state)
             if ((lingering || watchLingering) && markUncleanOnLinger) {
-                ElevatedCleanupTracker.noteUnclean()
+                runCatching { ElevatedCleanupTracker.noteUnclean() }
             }
             return Res.Expired(hasLinger = lingering || watchLingering)
         }
@@ -2067,7 +2115,7 @@ internal object ElevatedCallSupervisor {
         // 仍 fail-closed（任一殘留必計 1），不漏不重，連續 4 次熔斷語義不變。
         val uncleanCounted = AtomicBoolean(false)
         fun countUncleanOnce() {
-            if (uncleanCounted.compareAndSet(false, true)) ElevatedCleanupTracker.noteUnclean()
+            if (uncleanCounted.compareAndSet(false, true)) runCatching { ElevatedCleanupTracker.noteUnclean() }
         }
         // R2-PhaseB：caller 側 daemon 起動（含飽和／起失敗收斂）。
         // - acquired 才起 daemon（daemon 持槽全程，stall 即 outstanding 擋 admission，
@@ -2103,6 +2151,8 @@ internal object ElevatedCallSupervisor {
                 ElevatedCleanupTracker.acquireSlotOrQuarantine(v)
             } catch (_: Throwable) {
                 ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
+                // Round-6（#136-B2 review D-D1）：acquire-throw 臂＝killer 從未信號（acquire 從未成功）。
+                ElevatedCleanupTracker.noteKillNeverAttempted()
                 // 此臂無 verify 階段：second-chance 登記失敗即無後續重試，僅 breaker（countUncleanOnce）＋診斷計數＋#136-B3 接管。
                 try { ElevatedProcessIo.quarantineRegistrar(v) } catch (_: Throwable) {
                     ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
@@ -2191,6 +2241,8 @@ internal object ElevatedCallSupervisor {
                                 ElevatedCleanupTracker.acquireSlotOrQuarantine(v)
                             } catch (_: Throwable) {
                                 ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
+                                // Round-6（#136-B2 review D-D1）：acquire-throw 臂＝killer 從未信號（acquire 從未成功）。
+                                ElevatedCleanupTracker.noteKillNeverAttempted()
                                 // 此臂無 verify 階段：second-chance 登記失敗即無後續重試，僅 breaker（countUncleanOnce）＋診斷計數＋#136-B3 接管。
                                 try { ElevatedProcessIo.quarantineRegistrar(v) } catch (_: Throwable) {
                                     ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
@@ -2975,8 +3027,13 @@ internal object ElevatedProcessIo {
          *   原子，與 kill／start-failure 路徑同式）；持槽後由線程本體 finally 恰好釋放一次
          *   （已終止／state 非 0 no-op，零雙計、零槽洩漏）；
          * - process 最佳努力登記 [ElevatedProcessIo.quarantineRegistrar]（拋出即
-         *   [ElevatedCleanupTracker.noteQuarantineRegistrationFailed] 遙測；本臂不經
-         *   verify／runCleanupBounded，無槽可留，登記失敗僅 noteUnclean＋breaker 兜底）；
+         *   [ElevatedCleanupTracker.noteQuarantineRegistrationFailed] 遙測並
+         *   [ElevatedCleanupTracker.noteRegistrationFailedSticky] 置位（catch-all 臂登記失敗
+         *   即 brick，作為最後防線直接密封）；本臂不經
+         *   verify／runCleanupBounded，無槽可留，登記失敗僅 note＋breaker 兜底）；
+         * - D-D10（Round-6）：caller 側已佔槽（acquired==true）於本臂不被釋放 —outstanding
+         *   永久≥1、admission 永久 BACKLOG_FULL（或 registrar 拋→REGISTRATION_FAILED）；
+         *   恢復唯一途徑 app 重啟；B3 必接 alert＋runbook。
          * - [ElevatedCleanupTracker.noteUntrackedResidual] 遙測 +1（registered ⇒
          *   admission 以 QUARANTINE 拒新 spawn，恢復走 sweep 路徑；本臂不自行清 quarantine）。
          * `noteUnclean()` 與回傳 `Drained` 旗標（readFailed／tailIncomplete／cleanupIncomplete／
@@ -3135,9 +3192,9 @@ internal object ElevatedProcessIo {
                 }
             }
             if (cleanupIncomplete) {
-                ElevatedCleanupTracker.noteUnclean()
+                runCatching { ElevatedCleanupTracker.noteUnclean() }
             } else if (ElevatedCleanupTracker.outstanding() == 0) {
-                ElevatedCleanupTracker.noteClean()
+                runCatching { ElevatedCleanupTracker.noteClean() }
             }
             if (callerInterrupted) Thread.currentThread().interrupt()
             return Drained(
@@ -3216,9 +3273,9 @@ internal object ElevatedProcessIo {
                 // 於 worker 退出時發生（admission 於彼時前維持 fail-closed）。
                 releaseCleanupSlotAfterVerify(process, preVerified, cleanupSlotHeld.get())
                 if (preIncomplete) {
-                    ElevatedCleanupTracker.noteUnclean()
+                    runCatching { ElevatedCleanupTracker.noteUnclean() }
                 } else if (ElevatedCleanupTracker.outstanding() == 0) {
-                    ElevatedCleanupTracker.noteClean()
+                    runCatching { ElevatedCleanupTracker.noteClean() }
                 }
                 if (callerInterrupted) Thread.currentThread().interrupt()
                 return Drained(
@@ -3455,6 +3512,8 @@ internal object ElevatedProcessIo {
                 }
             } catch (_: Throwable) {
                 // 輪詢異常收斂為未完成，走下方清理（fail-closed：timedOut，不偽造成功）。
+                // 本臂計 D-D5（noteSwallowedPollThrows）；main path 其餘 catch 寬化皆刻意 fail-closed 且不計數。
+                runCatching { ElevatedCleanupTracker.noteSwallowedPollThrows() }
             }
             // gobbler 有界 join 未完成標記：任一 join 超界/中斷後執行緒仍存活即部分讀，
             // 經 Drained.truncated 帶出（絕不靜默短讀不標）。
@@ -3821,9 +3880,9 @@ internal object ElevatedProcessIo {
             } else -1
             if (joinInterrupted) Thread.currentThread().interrupt()
             if (cleanupIncomplete) {
-                ElevatedCleanupTracker.noteUnclean()
+                runCatching { ElevatedCleanupTracker.noteUnclean() }
             } else if (ElevatedCleanupTracker.outstanding() == 0) {
-                ElevatedCleanupTracker.noteClean()
+                runCatching { ElevatedCleanupTracker.noteClean() }
             }
             // P2 caller 中斷恢復：入口預置中斷出口恢復一次（不吞 caller 中斷）。
             if (callerInterrupted) Thread.currentThread().interrupt()
@@ -3872,10 +3931,10 @@ internal object ElevatedProcessIo {
             // 可能於 VME 下抛，但逃逸機率可忽略且此時無資源可追蹤（零執行緒起動），接受並文件化。
             // noteUnclean／markLingering／releaseCleanupSlotAfterVerify 等無保護點逃逸即落此臂：
             // slot 保留（不雙釋）；admission fail-closed；登記盡力而為。
-            // D-D10（Round-6）：caller 側已佔槽（acquired==true）於本臂不被釋放（custody 不移交給
-            // verify／終審臂不觸及釋槽）—outstanding 永久 ≥1、admission 永久密封
-            // （BACKLOG_FULL；registrar 亦失敗時第一門 REGISTRATION_FAILED 優先僅縮門），
-            // 恢復唯一途徑 app 重啟，此洩漏以 fail-closed 為刻意設計，#136-B3 必須接 alert＋runbook（重啟）。
+            // D-D10（Round-6；詳見 drainFailClosedDrained KDoc 同名段）：caller 側已佔槽（acquired==true）
+            // 於本臂不被釋放（custody 不移交給 verify／終審臂不觸及釋槽）—outstanding 永久≥1、
+            // admission 永久 BACKLOG_FULL（registrar 亦失敗時第一門 REGISTRATION_FAILED 優先僅縮門），
+            // 恢復唯一途徑 app 重啟；此洩漏以 fail-closed 為刻意設計，#136-B3 必須接 alert＋runbook（重啟）。
             return drainFailClosedDrained()
         }
     }
@@ -4007,8 +4066,10 @@ internal object ElevatedProcessIo {
      * 返回契約：任何內部建線程失敗皆收斂為旗標，不把異常抛給呼叫方）。
      * Stage 2A（P1-A3）：起線程失敗即 [ElevatedCleanupTracker.noteKillNeverAttempted]，
      * 與 breaker 分離計數（kill 從未信號，供 incident response 直接 triage；見
-     * 其 KDoc）；untracked／kill-never-attempted 兩計數互斥——worker 未起即無
-     * untracked 殘留可計，只記 never-attempted。
+     * 其 KDoc）；untracked／kill-never-attempted 兩計數於臂內互斥——起線程失敗臂
+     * 與 acquire-throw 臂（Round-6 D-D1 起同計 never-attempted）皆未起 worker 即無
+     * untracked 殘留可計，只記 never-attempted（Drained 級複合臂仍可能跨臂同時
+     * 出現兩計數，如 acquire-throw 後 Inner 再異常轉 catch-all，以臂內互斥為準）。
      * Stage 3（drain/verdict hardening）：Drained 歸因不再只反映飽和——起線程失敗臂
      * 及 acquire 拋臂（acquireSlotOrQuarantine 本身 throw，如 VME）同置 `untrackedOut`
      * （admitted residual surfacing：兩臂 killer 皆未信號／無 worker。acquire 拋臂
@@ -4130,6 +4191,8 @@ internal object ElevatedProcessIo {
             ElevatedCleanupTracker.acquireSlotOrQuarantine(process)
         } catch (_: Throwable) {
             ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
+            // Round-6（#136-B2 review D-D1）：acquire-throw 臂＝killer 從未信號（acquire 從未成功）。
+            ElevatedCleanupTracker.noteKillNeverAttempted()
             // 此臂無 verify 階段：second-chance 登記失敗即無後續重試，僅診斷計數＋#136-B3 接管
             // （與兩晚補償臂 startLateDaemon／compensateInline 的二次登記同構；===-dedup 冪等）。
             try { ElevatedProcessIo.quarantineRegistrar(process) } catch (_: Throwable) {
@@ -4430,9 +4493,9 @@ internal object ElevatedRunnerCommon {
     const val CLEANUP_BACKLOG_FULL_MESSAGE =
         "elevated cleanup backlog full (fail-closed, no spawn)"
 
-    /** 清理 backlog 飽和時的 typed 拒絕：`QUOTA_EXCEEDED`，不建子進程。 */
+    /** 清理 backlog 飽和時的 typed 拒絕：`QUOTA_EXCEEDED`，不建子進程；攜 `cleanupIncomplete=true`（飽和＝有不可回收清理，fail-closed 信號經 verdict 帶出）。 */
     fun cleanupBacklogFull(): ElevatedBinaryResult.Denied =
-        ElevatedBinaryResult.Denied(ShellDeny.QUOTA_EXCEEDED, CLEANUP_BACKLOG_FULL_MESSAGE)
+        ElevatedBinaryResult.Denied(ShellDeny.QUOTA_EXCEEDED, CLEANUP_BACKLOG_FULL_MESSAGE, true)
 
     /** 連續不清創熔斷拒絕訊息（終審殘留，與飽和同級，零 spawn、不耗配額）。 */
     const val CLEANUP_BREAKER_OPEN_MESSAGE =

@@ -342,6 +342,7 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             denied as ElevatedBinaryResult.Denied
             assertEquals(ShellDeny.QUOTA_EXCEEDED, denied.reason)
             assertTrue("msg=${denied.message}", denied.message.contains("backlog full"))
+            assertTrue("backlog-full Denied must carry cleanupIncomplete=true (Round-6 D-D4)", denied.cleanupIncomplete)
             assertEquals("saturated late must not allow new spawn", 1, spawns.get())
             assertFalse(bg.isAlive)
         } finally {
@@ -463,7 +464,7 @@ class ElevatedRunnerPhaseBLateCompensationTest {
         try {
             val r = runner.runBinary(ElevatedRequest(listOf("id"), "PB-SAT"), 300L)
             assertTrue("$r", r is ElevatedBinaryResult.TimedOut)
-            assertTrue((r as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
+            assertTrue("got $r", (r as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
             assertEquals(1, ElevatedCleanupTracker.outstanding())
             // barrier 後預填至 MAX（worker 仍卡 release，lingering 1 保持）。
             val need = ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS - 1
@@ -532,6 +533,8 @@ class ElevatedRunnerPhaseBLateCompensationTest {
         pollOutstandingTo(0)
         pollActiveTo(0)
         ElevatedCleanupTracker.resetPeak()
+        // PG-8：late-spawn quarantine delta——登記數須恰為 before＋1（additive-only）。
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
         // 釋放 spawn 使 worker 發佈逾期 Process（latch barrier，非 sleep 時序）。
         val release = CountDownLatch(1)
         // killer／destroyForcibly 阻塞門：teardown 才放，期間任何調用皆會被記數。
@@ -597,6 +600,11 @@ class ElevatedRunnerPhaseBLateCompensationTest {
                 1,
                 ElevatedCleanupTracker.quarantinedCount(),
             )
+            assertEquals(
+                "PG-8: late-spawn saturation arm must add exactly one quarantine entry over the pre-test baseline",
+                quarantineBefore + 1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
             assertEquals("killer must never run on the saturation path", 0, kills.get())
             assertEquals("destroy() must never run on the saturation path", 0, late.destroyCalls.get())
             assertEquals(
@@ -652,6 +660,8 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             pollOutstandingTo(0)
             pollActiveTo(0)
             ElevatedCleanupTracker.resetPeak()
+            // PG-8：每次迭代一個全新 baseline——登記數須恰為 before＋1（additive-only）。
+            val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
             val spawnEntered = CountDownLatch(1)
             val spawnRelease = CountDownLatch(1)
             val cancelGate = CountDownLatch(1)
@@ -727,6 +737,11 @@ class ElevatedRunnerPhaseBLateCompensationTest {
                 // 條目即 late handle——只斷登記數；quarantine 誤歸因他 handle 不在
                 // 本用例斷言範圍。
                 assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+                assertEquals(
+                    "PG-8: late-spawn start-failure arm must add exactly one quarantine entry over the pre-arm baseline",
+                    quarantineBefore + 1,
+                    ElevatedCleanupTracker.quarantinedCount(),
+                )
                 assertEquals("killer must never run on the start-failure path", 0, kills.get())
                 assertEquals(
                     "destroy() must never run on the start-failure path",
@@ -1024,6 +1039,8 @@ class ElevatedRunnerPhaseBLateCompensationTest {
      */
     @Test fun lateDaemonBodyWithThrowingRegistrarKeepsSlotFailClosed() {
         val before = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        // PG-8：late-spawn quarantine delta——daemon 本體臂登記數須恰為 before＋1（additive-only）。
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
         val spawnEntered = CountDownLatch(1)
         val spawnRelease = CountDownLatch(1)
         val cancelGate = CountDownLatch(1)
@@ -1090,6 +1107,11 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
             assertEquals(1, ElevatedCleanupTracker.outstanding())
             assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            assertEquals(
+                "PG-8: late-spawn daemon-body arm must add exactly one quarantine entry over the pre-test baseline",
+                quarantineBefore + 1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
             assertEquals(1, kills.get())
             val admission = ElevatedCleanupTracker.tryEnterReserved()
             if (admission == ElevatedCleanupTracker.Admission.OK) {
@@ -1110,6 +1132,11 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             ElevatedProcessIo.releaseCleanupSlotAfterVerify(late, verified = false, slotHeld = true)
             assertEquals(0, ElevatedCleanupTracker.outstanding())
             assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            assertEquals(
+                "PG-8: retry must not double-register (quarantine stays at baseline+1)",
+                quarantineBefore + 1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
             assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
             assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
         } finally {

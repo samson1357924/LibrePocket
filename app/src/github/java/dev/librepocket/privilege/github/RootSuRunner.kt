@@ -455,12 +455,12 @@ class RootSuRunner(
                 is ShellExecutables.ResolveOutcome.Denied ->
                     return ElevatedBinaryResult.Denied(
                         ShellDeny.BLACKLISTED,
-                        "untrusted executable: ${Redactor.redactError(argvSnapshot[0].trim())} (reason=${outcome.reason})",
+                        "untrusted executable: ${Redactor.redactError(argvSnapshot[0].trim().substringAfterLast('/'))} (reason=${outcome.reason})",
                     )
             }
             is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                 ShellDeny.BLACKLISTED,
-                "untrusted executable: ${Redactor.redactError(argvSnapshot[0].trim())} (reason=NOT_FOUND)",
+                "untrusted executable: ${Redactor.redactError(argvSnapshot[0].trim().substringAfterLast('/'))} (reason=NOT_FOUND)",
                 cleanupIncomplete = ElevatedRunnerCommon.preSpawnLinger(resolvedRes.hasLinger),
             )
             is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, ElevatedRunnerCommon.preSpawnLinger(resolvedRes.hasLinger))
@@ -629,7 +629,7 @@ class RootSuRunner(
                 is ElevatedCallSupervisor.Res.Ok -> reResolvedRes.v
                 is ElevatedCallSupervisor.Res.Err -> return ElevatedBinaryResult.Denied(
                     ShellDeny.BLACKLISTED,
-                    "untrusted executable: ${Redactor.redactError(argvSnapshot[0].trim())} (reason=NOT_FOUND)",
+                    "untrusted executable: ${Redactor.redactError(argvSnapshot[0].trim().substringAfterLast('/'))} (reason=NOT_FOUND)",
                     cleanupIncomplete = ElevatedRunnerCommon.preSpawnLinger(reResolvedRes.hasLinger),
                 )
                 is ElevatedCallSupervisor.Res.Expired -> return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, ElevatedRunnerCommon.preSpawnLinger(reResolvedRes.hasLinger))
@@ -639,13 +639,13 @@ class RootSuRunner(
                 is ShellExecutables.ResolveOutcome.Denied ->
                     return ElevatedBinaryResult.Denied(
                         ShellDeny.BLACKLISTED,
-                        "untrusted executable: ${Redactor.redactError(argvSnapshot[0].trim())} (reason=${reOutcome.reason})",
+                        "untrusted executable: ${Redactor.redactError(argvSnapshot[0].trim().substringAfterLast('/'))} (reason=${reOutcome.reason})",
                     )
             }
             if (reResolved != resolvedExec) {
                 return ElevatedBinaryResult.Denied(
                     ShellDeny.BLACKLISTED,
-                    "untrusted executable: ${Redactor.redactError(argvSnapshot[0].trim())} (reason=REVERIFY_MISMATCH)",
+                    "untrusted executable: ${Redactor.redactError(argvSnapshot[0].trim().substringAfterLast('/'))} (reason=REVERIFY_MISMATCH)",
                 )
             }
             // P1-4 spawn 前最終取消檢查（B2＋B3＋R2-PhaseC P2-1 有界化）：重驗後、

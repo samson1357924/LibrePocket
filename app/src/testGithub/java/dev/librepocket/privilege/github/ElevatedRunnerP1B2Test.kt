@@ -519,6 +519,55 @@ class ElevatedRunnerP1B2Test {
         assertFalse(ElevatedCleanupTracker.isBreakerOpen())
     }
 
+    @Test fun drainKillPathVerifiedDeathReleasesCleanupSlotSynchronously() {
+        // PG-2：drain kill 路徑 verify=true（destroy 置旗＋有界 waitFor 真）時，
+        // 清理槽 custody 由 caller 持有跨 post-kill verify，verify 已知後恰好釋放一次——
+        // drain 返回當下 outstanding 即歸零、准入即恢復 OK（不同步等待任何 background
+        // worker 退出）、quarantine 不新登記。
+        // 對照（contrast）：verify-stall 臂（verify=false＋verify worker 卡死）則
+        // slot 持有至 worker 退出才釋放（見 drainVerifyStallSealsAdmissionWithLingeringVerifyWorker）。
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+        val runner = makeRoot(
+            spawn = { KillableImmediateProcess() },
+            killer = { it.destroy() },
+        )
+        val b = runner.runBinary(ElevatedRequest(listOf("id"), "PG-2-T"), 300L)
+        assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
+        b as ElevatedBinaryResult.TimedOut
+        assertFalse("$b must not flag when verified stopped", b.cleanupIncomplete)
+        // drain 已返回（同步語義斷言）：verify=true ⇒ 槽於 drain 內同步釋放，
+        // outstanding 不等 worker 任何後續動作即歸零。
+        assertEquals(
+            "verified-death drain must release the cleanup slot before returning",
+            0,
+            ElevatedCleanupTracker.outstanding(),
+        )
+        val admission = ElevatedCleanupTracker.tryEnterReserved()
+        try {
+            assertEquals(
+                "verified-death drain must restore admission immediately",
+                ElevatedCleanupTracker.Admission.OK,
+                admission,
+            )
+        } finally {
+            // 成功佔席必 leaveCall 收尾（否則 activeCalls 洩漏＝後續准入假性飽和）。
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                ElevatedCleanupTracker.leaveCall()
+            }
+        }
+        pollOutstandingTo(0)
+        assertEquals(
+            "verified-death drain must not register quarantine",
+            quarantineBefore,
+            ElevatedCleanupTracker.quarantinedCount(),
+        )
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+    }
+
     @Test fun consecutiveUncleanOpensBreaker() {
         // 資源／breaker 知悉：連續不可驗證即累計，達上限即熔斷（零 spawn 拒絕由 AA1 覆）。
         ElevatedCleanupTracker.noteClean()
@@ -3640,6 +3689,26 @@ class ElevatedRunnerP1B2Test {
                 "admission must stay denied while the verify worker lingers",
                 ElevatedCleanupTracker.Admission.BACKLOG_FULL,
                 admissionSealed,
+            )
+            // D-C5（verify=false custody pin）：caller 側 helper 於 stall 路徑
+            // （slotHeld=false）不觸發 releaseSlot——outstanding 不被 helper 釋放、
+            // releaseFloorHits 不遞增、quarantine 去重不變；槽僅由 worker 本體 finally
+            // 恰好釋放一次（custody 已移交 worker）。gate 仍關 ⇒ 確定性斷言（非競態窗口）。
+            ElevatedProcessIo.releaseCleanupSlotAfterVerify(victim, verified = false, slotHeld = false)
+            assertEquals(
+                "caller helper with slotHeld=false must not release the worker-held slot",
+                1,
+                ElevatedCleanupTracker.outstanding(),
+            )
+            assertEquals(
+                "caller helper no-op must not hit the release floor",
+                floorBeforeTest,
+                ElevatedCleanupTracker.releaseFloorHits(),
+            )
+            assertEquals(
+                "caller helper no-op must not change quarantine (dedup applies)",
+                quarantineBefore + 1,
+                ElevatedCleanupTracker.quarantinedCount(),
             )
         } finally {
             // 放閘門：verify worker 的 waitFor 返回 true；worker finally 恰好釋放一次。

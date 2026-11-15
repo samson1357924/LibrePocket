@@ -423,6 +423,7 @@ object ElevatedProcessKiller {
      * pidReuseSkipped——nothing was proven）；`isAlive()==false`（含 mid-window
      * 兩讀之間死亡）跳過該信號、零計數。latch 已閂 ⇒ 剩餘本體信號一律抑制
      * （不信號、不計數；bystander 保護不依賴第二次讀取恰好抛）。
+     * 以下 3 臂在 CI 無確定性覆蓋（SDK 表面限制：cannot override toHandle/descendants；回收 PID 不可確定性誘發）：(1) proven-mismatch⇒兩信號不發＋閂 (2) latch 抑制 destroyForcibly (3) alive==false⇒零計數 —歸 #136-B3 裝置驗收。
      */
     private fun signalBody(
         attest: HandleAttest,
@@ -624,7 +625,7 @@ object ElevatedProcessKiller {
      * 「unverifiable ⇒ skip」語義經此方法，改為不可驗即無條件 destroy（見
      * [signalBody]）。
      */
-    private class HandleAttest(
+    internal class HandleAttest(
         val handle: Any?,
         val handleClass: Class<*>?,
         val destroy: Method?,

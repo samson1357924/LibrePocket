@@ -142,6 +142,7 @@ class ElevatedRunnerPhaseRTest {
         pollActiveTo(0)
         val latch = CountDownLatch(1)
         val bound = ElevatedCleanupTracker.MAX_SWEEP_VERIFIERS
+        val skipsBefore = ElevatedCleanupTracker.sweepSaturationSkipsCount()
         try {
             repeat(12) { i ->
                 val p = StallSwallowProcess(latch)
@@ -177,6 +178,10 @@ class ElevatedRunnerPhaseRTest {
             assertTrue(
                 "final alive verify must stay <= bound=$bound",
                 aliveQuarantineVerifyCount() <= bound,
+            )
+            assertTrue(
+                "sweep saturation skip telemetry must have advanced (stalled verifiers force skips)",
+                ElevatedCleanupTracker.sweepSaturationSkipsCount() > skipsBefore,
             )
             // 新代驗證被飽和跳過即保持 QUARANTINE（安全方向，不翻轉放行）。
             val fresh = FastAliveProcess()

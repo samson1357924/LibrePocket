@@ -4,6 +4,7 @@ import java.lang.reflect.InvocationTargetException
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
@@ -152,7 +153,8 @@ class ElevatedProcessKillerTest {
         assertSame(stub, stub.destroyForcibly())
     }
 
-    @Test fun killTreeAttestsBodyBeforeSignalAndCountsUnattestedPlatform() {
+    /** pidReuseSignalAllowed 純判定表、非 killTree 時序斷言：下方僅釘 (alive, expectedStart, currentStart) 真值表；時序／接線（snapshot→recheck→skip＋計數）無法以假 ProcessHandle 直測（見測試體 KDoc）。 */
+    @Test fun bodyAttestCadencePredicateTruthTable() {
         // Stage 4（本體 best-effort PID-reuse attestation）判定表式釘點：
         // 下方 pidReuseSignalAllowed 的各次呼叫釘住的是子孫路徑——
         // killDescendantsReflective 經 HandleAttest.signalAllowed 共用的同一純判定函數。
@@ -192,6 +194,119 @@ class ElevatedProcessKillerTest {
         // 平台專屬；#136-B3 device-acceptance checklist 項）。具體讀數由
         // killTreeOnNonAttestableFakeProcessDegradesToUnconditionalDestroyAndCounts
         // 釘點（FakeProcess 兩信號 +2）；平台／測序相依不在此重複斷言。
+    }
+
+    // ---- HandleAttest seam 直測（Round-6 D-B7）：isAliveOf／startInstantOf 逐臂 ----
+
+    private interface FakeHandleIface {
+        fun info(): Any?
+        fun isAlive(): Boolean
+    }
+
+    private interface FakeInfoLike {
+        fun startInstant(): java.util.Optional<java.time.Instant>
+    }
+
+    private class TrueAliveHandle : FakeHandleIface {
+        override fun info(): Any? = null
+        override fun isAlive(): Boolean = true
+    }
+
+    private class FalseAliveHandle : FakeHandleIface {
+        override fun info(): Any? = null
+        override fun isAlive(): Boolean = false
+    }
+
+    private class BoomIsAliveHandle : FakeHandleIface {
+        override fun info(): Any? = null
+        override fun isAlive(): Boolean = throw RuntimeException("alive boom")
+    }
+
+    private class ThrowingInfoHandle : FakeHandleIface {
+        override fun info(): Nothing = throw RuntimeException("info boom")
+        override fun isAlive(): Boolean = true
+    }
+
+    private class StaticInfoHandle(private val info: Any?) : FakeHandleIface {
+        override fun info(): Any? = info
+        override fun isAlive(): Boolean = true
+    }
+
+    private class PresentInfo(private val t: java.time.Instant) : FakeInfoLike {
+        override fun startInstant(): java.util.Optional<java.time.Instant> =
+            java.util.Optional.of(t)
+    }
+
+    private class EmptyInfo : FakeInfoLike {
+        override fun startInstant(): java.util.Optional<java.time.Instant> =
+            java.util.Optional.empty()
+    }
+
+    private class BoomStartInstantInfo : FakeInfoLike {
+        override fun startInstant(): java.util.Optional<java.time.Instant> =
+            throw RuntimeException("startInstant boom")
+    }
+
+    private val iface = FakeHandleIface::class.java
+    private val aliveMethod = iface.getMethod("isAlive")
+    private val infoMethod = iface.getMethod("info")
+
+    @Test fun handleAttestIsAliveOfNullMethodReturnsNull() {
+        // 平台無 isAlive API（Method 缺席）⇒ 不可驗證（null），fail toward destruction 的輸入訊號。
+        val h = TrueAliveHandle()
+        val attest = ElevatedProcessKiller.HandleAttest(h, iface, null, null, null, null)
+        assertNull(attest.isAliveOf(h))
+    }
+
+    @Test fun handleAttestIsAliveOfThrowingMethodReturnsNull() {
+        // isAlive Method invoke 拋（如 binder death）⇒ 不可驗證（null），不外拋。
+        val h = BoomIsAliveHandle()
+        val attest = ElevatedProcessKiller.HandleAttest(h, iface, null, null, infoMethod, aliveMethod)
+        assertNull(attest.isAliveOf(h))
+    }
+
+    @Test fun handleAttestIsAliveOfTrueFalseNormal() {
+        val t = TrueAliveHandle()
+        val f = FalseAliveHandle()
+        val attest = ElevatedProcessKiller.HandleAttest(t, iface, null, null, infoMethod, aliveMethod)
+        assertEquals(true, attest.isAliveOf(t))
+        assertEquals(false, attest.isAliveOf(f))
+    }
+
+    @Test fun handleAttestStartInstantOfNullInfoMethodReturnsNull() {
+        // 平台無 info Method（Method 缺席）⇒ 不可驗證（null）。
+        val h = TrueAliveHandle()
+        val attest = ElevatedProcessKiller.HandleAttest(h, iface, null, null, null, aliveMethod)
+        assertNull(attest.startInstantOf(h))
+    }
+
+    @Test fun handleAttestStartInstantOfInfoInvokeThrowsReturnsNull() {
+        // info() invoke 拋（binder death／handles 無效）⇒ 不可驗證（null），不外拋。
+        val h = ThrowingInfoHandle()
+        val attest = ElevatedProcessKiller.HandleAttest(h, iface, null, null, infoMethod, aliveMethod)
+        assertNull(attest.startInstantOf(h))
+    }
+
+    @Test fun handleAttestStartInstantOfEmptyOptionalReturnsNull() {
+        // info.startInstant Optional.empty（PID 無 incarnation）⇒ 不可驗證（null）。
+        val h = StaticInfoHandle(EmptyInfo())
+        val attest = ElevatedProcessKiller.HandleAttest(h, iface, null, null, infoMethod, aliveMethod)
+        assertNull(attest.startInstantOf(h))
+    }
+
+    @Test fun handleAttestStartInstantOfInvokeThrowsReturnsNull() {
+        // startInstant() invoke 拋⇒ 不可驗證（null），不外拋。
+        val h = StaticInfoHandle(BoomStartInstantInfo())
+        val attest = ElevatedProcessKiller.HandleAttest(h, iface, null, null, infoMethod, aliveMethod)
+        assertNull(attest.startInstantOf(h))
+    }
+
+    @Test fun handleAttestStartInstantOfPresentReturnsValue() {
+        // info.startInstant Optional.of(v) ⇒ 回傳該值（可驗 incarnation）。
+        val t = java.time.Instant.ofEpochMilli(1_700_000_000_000L)
+        val h = StaticInfoHandle(PresentInfo(t))
+        val attest = ElevatedProcessKiller.HandleAttest(h, iface, null, null, infoMethod, aliveMethod)
+        assertEquals(t, attest.startInstantOf(h))
     }
 
     @Test fun killTreeOnNonAttestableFakeProcessDegradesToUnconditionalDestroyAndCounts() {

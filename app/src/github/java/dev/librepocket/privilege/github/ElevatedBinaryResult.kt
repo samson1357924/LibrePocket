@@ -180,7 +180,9 @@ interface BinaryElevatedRunner : ElevatedShellRunner {
  * 只是不回位元組、不摘要部分幀，見 `RootFramebufferCapture`）：
  * - `QUOTA_EXCEEDED` 五因同碼（僅訊息區分，皆零 spawn、不耗配額）：
  *   配額耗盡（`ElevatedRunnerCommon.quotaExceeded`）／清理 backlog 飽和
- *   （`cleanupBacklogFull`）／連續不清創熔斷（`cleanupBreakerOpen`）／
+ *   （`cleanupBacklogFull`；backlog full 之 Denied 攜 `cleanupIncomplete=true`，
+ *   breaker／concurrency 不攜）／
+ *   連續不清創熔斷（`cleanupBreakerOpen`）／
  *   併發上限（`concurrencyFull`）／登記雙失敗 brick（`registrationFailed`，
  *   無槽且 quarantine 雙登記皆抛之極角，app 重啟方能恢復，#136-B3 必接 alert）。
  *   審計 `DENY` 下五因不可區分，排障須看拒絕訊息
@@ -203,13 +205,19 @@ interface BinaryElevatedRunner : ElevatedShellRunner {
  *   `ElevatedRunnerCommon.preSpawnLinger` 判定（`hasLinger || outstanding>0`
  *   即 true）；`result=false` 與同 request `outstanding==1` 並存即為契約違反
  *   （舊 blocked entry 缺口，現已封）。`cleanupIncomplete=false` 僅在
- *   `!expiredHasLinger && outstanding()==0` 時成立：二 runner（`RootSuRunner`／
+ *   `!expiredHasLinger && outstanding()==0` 時成立（blanket 規則）：二 runner（`RootSuRunner`／
  *   `ShizukuShellRunner`，逐站點等價）於所有非 spawn `Err`／`Expired`／`Denied`
  *   站點一律經 `ElevatedRunnerCommon.preSpawnLinger(x.hasLinger)` 映射旗標
  *   （含 cancel 門／門 `Ok(true)`／中斷臂的 `preSpawnLinger(false)`、quota 後
  *   顯式過期前門——`outstanding()>0` 仍覆蓋）；唯 spawn 前 preflight 入口零 budget
  *   站點仍為字面 `false`（worker 從未啟動，零新增殘留）；spawn 逾期沿既有
  *   `hasLinger` 穿透（late Process 缺口）。
+ *   blanket 例外列舉（`cleanupIncomplete=true` 而非上述語境者）：准入飽和臂
+ *   BACKLOG_FULL 拒絕（`ElevatedRunnerCommon.cleanupBacklogFull`，Denied）攜 true
+ *   （飽和＝有不可回收清理）；breaker（`cleanupBreakerOpen`）／concurrency
+ *   （`concurrencyFull`）拒絕不攜。`toShellResult()` 僅穿透 TimedOut 分支的
+ *   `cleanupIncomplete`；Denied／Failed 分支之旗標一併丟棄（文字殼路徑不攜，
+ *   監測須用 runBinary）。
  * - tail 取消／超時（R2-PhaseC P2-2）：finished（命令已 exit 0）但 tail 未排空
  *   （取消／deadline／tail budget 致 gobbler 中斷＋殘留，`Drained.tailIncomplete`）
  *   → `TimedOut`（攜 partial＋truncated＋cleanupIncomplete），不再回 Ok；
@@ -245,6 +253,8 @@ fun ElevatedBinaryResult.verdict(): String = when (this) {
  * [ElevatedBinaryResult.TimedOut.cleanupIncomplete]（[ShellResult.TimedOut] 同名欄，
  * 預設 false；舊 4 參構造仍可編譯）。監測仍建議用 runBinary（二進位為準），
  * 但文字路徑亦不再丟旗標。
+ * `toShellResult()` 僅穿透 TimedOut 分支的 `cleanupIncomplete`；
+ * Denied／Failed 分支之旗標一併丟棄（Denied 無對應欄、Failed 旗標不穿透）。
  */
 fun ElevatedBinaryResult.toShellResult(): ShellResult = when (this) {
     is ElevatedBinaryResult.Ok ->

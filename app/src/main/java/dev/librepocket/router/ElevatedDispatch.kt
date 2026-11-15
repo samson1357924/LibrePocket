@@ -66,7 +66,10 @@ object ElevatedDispatch {
      * @param confirmed 當輪二次確認。
      * @param projection 投影（`privilege_bridge` 未開即 UNAVAILABLE，先擋）。
      * @param request 提權請求（含 reasonCode，門禁與審計共用同一份凍結）。
+     *
+     * @JvmSynthetic（封死 Java 經 JVM mangled 名稱直呼內部成員；對 Kotlin 呼叫者無影響）
      */
+    @JvmSynthetic
     internal fun execute(
         tool: ToolDef,
         confirmed: Boolean,
@@ -143,7 +146,10 @@ object ElevatedDispatch {
      * policy/bridge/grant checks and post-confirm reverify on the same immutable snapshot.
      * Do not call with unverified or stale requests; misuse inside module can bypass gates.
      * sole-entry 由 `ElevatedSoleEntryTest`（產品源集 main＋foss＋play＋github＋debug，java＋kotlin 雙目錄 token 掃描，best-effort tripwire）攔截，除 `ElevatedDispatch.kt`（宣明檔）外，產品源集出現 `executeWithFrozen(` 呼叫即 fail。
+     *
+     * @JvmSynthetic（封死 Java 經 JVM mangled 名稱直呼內部成員；對 Kotlin 呼叫者無影響）
      */
+    @JvmSynthetic
     internal fun executeWithFrozen(
         tool: ToolDef,
         frozen: ElevatedRequest,

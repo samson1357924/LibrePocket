@@ -104,7 +104,10 @@ object ShellExecTool {
      * `ElevatedSoleEntryTest.executeElevatedFrozenSoleEntry`（僅 ElevatedDispatch）；
      * 殘餘同-package 裸呼叫需 code review 把關。本函數零直調同見
      * `ShellStage5Test.soleEntryNoDirectToolCallsInMain`）。
+     *
+     * @JvmSynthetic（封死 Java 經 JVM mangled 名稱直呼內部成員；對 Kotlin 呼叫者無影響）
      */
+    @JvmSynthetic
     internal fun executeElevated(
         request: ElevatedRequest,
         runner: ElevatedShellRunner,
@@ -150,7 +153,10 @@ object ShellExecTool {
      * 僅 ElevatedDispatch.kt 允許命中）。
      * 本函數刻意不做二次凍結：傳未凍結物件的行為未定義（TOCTOU），由可見性
      * （internal）＋本契約防範，不另加執行期重驗。
+     *
+     * @JvmSynthetic（封死 Java 經 JVM mangled 名稱直呼內部成員；對 Kotlin 呼叫者無影響）
      */
+    @JvmSynthetic
     internal fun executeElevatedFrozen(
         frozen: ElevatedRequest,
         runner: ElevatedShellRunner,

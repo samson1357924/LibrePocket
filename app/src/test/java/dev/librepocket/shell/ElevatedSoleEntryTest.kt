@@ -10,7 +10,16 @@ import org.junit.Test
  *
  * 本測試為 **best-effort static tripwire**，非完整邊界——`internal` 可見性（單一
  * module 內同樣可被引用）＋ 本 pin 構成雙重防線；誤用會繞過 gates/re-verify/audit
- * 語義。已知無法覆蓋的誤用形（接受殘餘、須 code review 把關）：
+ * 語義。
+ *
+ * JVM mangled internal（Kotlin `object` internal 成員編譯為 JVM `public $<module-suffix>` 方法，
+ * 如 `executeElevatedFrozen$app_debug`，Java 識別字合法可 call）——已於編譯期封閉：
+ * 四個內部成員（ShellExecTool.executeElevated／executeElevatedFrozen、
+ * ElevatedDispatch.execute／executeWithFrozen）皆標 `@JvmSynthetic`，Java 原始碼無法
+ * 解析 synthetic 成員，直呼路徑於編譯期即死。本檔案的 `\$<suffix>?` 可選群組
+ * （`(\$[A-Za-z0-9_]*)?`，任一 suffix 皆命中、fail-closed 方向）僅為 tripwire
+ * backstop，不再是防線主體。殘餘同-package 裸呼叫仍靠 code review。
+ * 已知無法覆蓋的誤用形（接受殘餘、須 code review 把關）：
  * - 反射／註解處理器生成的程式碼（`build/` 目錄不掃描）；fresh clone 不會出現；
  * - 同一 `package dev.librepocket.router` 內裸 `execute(`（無 qualifier）：
  *   Wiring 本身即此 package——現況無此形誤用，新檔須 code review 把關
@@ -25,33 +34,40 @@ import org.junit.Test
  * kotlin 目錄目前不存在，出現即納入）。
  *
  * 產品源 token pin（四，共用同一剝離器；註解／字串整段剝離）：
- * - [soleEntryForExecuteWithFrozen]：`executeWithFrozen\s*\(`
+ * - [soleEntryForExecuteWithFrozen]：`executeWithFrozen(\$<suffix>)?\s*\(`
  *   whitespace/newline 容忍、token 前一字元非識別字組成
  *   （`.executeWithFrozen(`／裸 `executeWithFrozen(` 皆涵蓋）；
  *   callable-reference（`::executeWithFrozen`，token 結尾邊界非識別字組成）亦涵蓋；
+ *   可選 `\$<suffix>` 涵蓋 JVM mangled internal（tripwire backstop）；
  *   命中僅允許 `dev/librepocket/router/ElevatedWiring.kt`；
  * - [legacyElevatedDispatchExecuteZeroAllowance]：零容忍掃描
- *   `ElevatedDispatch.execute(` ／ `ElevatedDispatch::execute` ／
+ *   `ElevatedDispatch.execute(`（含 `ElevatedDispatch.INSTANCE.execute(` Java interop 形）／
+ *   `ElevatedDispatch::execute` ／
  *   member／star／object import（`import (static )?…ElevatedDispatch.execute[as …]`、
  *   `import (static )?…ElevatedDispatch.*`、`import (static )?…ElevatedDispatch`）
  *   （whitespace 容忍、識別字邊界；樣板 `${…}` 本體視為 code；
  *   `.java` 來源亦掃（Java 無樣板／反引號；涵蓋 `ElevatedDispatch.INSTANCE.execute(`
  *   互通形）——token 正則同樣適用）
+ *   （`execute` 皆可帶可選 `\$<suffix>`，涵蓋 JVM mangled internal；star／object import
+ *   無成員 token，mangled suffix 無處附著，維持不變）
  *   ——任何產品源集出現任一形命中即 fail（宣明檔除外）；
  *   ElevatedWiring.kt 僅走 executeWithFrozen，現今零命中為預期；此 pin
  *   釘死 legacy inline 閘已關閉；
- * - [executeElevatedFrozenSoleEntry]：`executeElevatedFrozen\s*\(`
+ * - [executeElevatedFrozenSoleEntry]：`executeElevatedFrozen(\$<suffix>)?\s*\(`
  *   （whitespace/newline 容忍、token 前邊界非識別字組成；`ShellExecTool.executeElevatedFrozen(`／
  *   裸 `executeElevatedFrozen(` 皆涵蓋；反引號內容原樣輸出後仍命中）或
  *   callable reference（`::executeElevatedFrozen`，結尾邊界非識別字組成）或
  *   Java interop（`ShellExecTool\s*\.\s*INSTANCE\s*\.\s*executeElevatedFrozen\s*\(`）；
+ *   上述 token 皆可帶可選 `\$<suffix>`，涵蓋 JVM mangled internal；
  *   命中僅允許 `dev/librepocket/router/ElevatedDispatch.kt`（唯一產品調用方）；
  *   宣明檔 `dev/librepocket/shell/ShellExecTool.kt` 跳過（宣明並內部呼叫 `executeElevatedFrozen`）；
- * - [executeElevatedZeroAllowance]：零容忍掃描 `executeElevated\s*\(`
- *   （不含 `executeElevatedFrozen(`——`executeElevated` 後必須緊接 `\s*\(`，`F` 擋下）或
+ * - [executeElevatedZeroAllowance]：零容忍掃描 `executeElevated(\$<suffix>)?\s*\(`
+ *   （不含 `executeElevatedFrozen(`——`executeElevated` 後必須緊接可選 `\$<suffix>` 再 `\s*\(`，`F` 擋下；
+ *   `executeElevatedFrozen$app_debug(` 亦不命中）或
  *   callable reference（`::executeElevated`，結尾邊界非識別字組成）或
  *   Java interop（`ShellExecTool\s*\.\s*INSTANCE\s*\.\s*executeElevated\s*\(`，
- *   同樣不匹配 `INSTANCE.executeElevatedFrozen(`）；全產品源集零命中；
+ *   同樣不匹配 `INSTANCE.executeElevatedFrozen(`）；
+ *   上述 token 皆可帶可選 `\$<suffix>`，涵蓋 JVM mangled internal；全產品源集零命中；
  *   宣明檔 ShellExecTool.kt 跳過（宣明 `executeElevated` 且內部呼叫 `executeElevatedFrozen`）；
  *
  * 其餘 pin：
@@ -375,79 +391,102 @@ class ElevatedSoleEntryTest {
      * 識別字組成（lookbehind），`.executeElevatedFrozen(`／裸 `executeElevatedFrozen(`
      * 皆命中；`fooexecuteElevatedFrozen(` 不誤計。不命中 `executeElevated (`
      * （`executeElevated` 後必須緊接 `Frozen`）。
+     * JVM mangled internal（如 `executeElevatedFrozen$app_debug(`）亦命中（可選 `\$<suffix>`，
+     * 任意 suffix、fail-closed）；呼叫 @JvmSynthetic 後 Java 已無法編譯期直呼，此為 tripwire backstop。
      */
-    private val executeElevatedFrozenCall = Regex("(?<![A-Za-z0-9_$])executeElevatedFrozen\\s*\\(")
+    private val executeElevatedFrozenCall = Regex("(?<![A-Za-z0-9_$])executeElevatedFrozen(\\\$[A-Za-z0-9_]*)?\\s*\\(")
 
     /**
      * `::executeElevatedFrozen` callable reference（無呼叫括號）：token 結尾後續字元
      * 非識別字組成（`::executeElevatedFrozenX` 不命中）。
      * `::` 前綴的接收者識別字（`Foo::executeElevatedFrozen`）合法，故 token 起始
      * 不做前界檢查（`':'` 前為識別字屬正常限定形）。
+     * JVM mangled internal（`::executeElevatedFrozen$app_debug`）亦命中（可選 `\$<suffix>`）。
      */
-    private val callableReferenceExecuteElevatedFrozen = Regex("::\\s*executeElevatedFrozen(?![A-Za-z0-9_$])")
+    private val callableReferenceExecuteElevatedFrozen = Regex("::\\s*executeElevatedFrozen(\\\$[A-Za-z0-9_]*)?(?![A-Za-z0-9_$])")
 
     /**
      * Java interop：Kotlin object 經 `ShellExecTool.INSTANCE.executeElevatedFrozen(` 呼叫
      * （`.` 兩側 whitespace 容忍；token 前邊界非識別字組成）。
+     * JVM mangled internal（`INSTANCE.executeElevatedFrozen$app_debug(`）亦命中（可選 `\$<suffix>`）。
      */
     private val javaInteropExecuteElevatedFrozen =
-        Regex("(?<![A-Za-z0-9_$])ShellExecTool\\s*\\.\\s*INSTANCE\\s*\\.\\s*executeElevatedFrozen\\s*\\(")
+        Regex("(?<![A-Za-z0-9_$])ShellExecTool\\s*\\.\\s*INSTANCE\\s*\\.\\s*executeElevatedFrozen(\\\$[A-Za-z0-9_]*)?\\s*\\(")
 
     /**
      * `executeElevated\s*\(`（whitespace/newline 容忍）：同 executeElevatedFrozenCall 之邊界規則。
-     * `executeElevatedFrozen(` 不命中（`executeElevated` 後必須緊接 `\s*\(`，`F` 擋下）。
+     * `executeElevatedFrozen(` 不命中（`executeElevated` 後必須緊接 `\s*\(` 或可選 `\$<suffix>`，`F` 擋下；
+     * `executeElevatedFrozen$app_debug(` 亦不命中——`F` 擋下）。
+     * JVM mangled internal（`executeElevated$app_debug(`）亦命中（可選 `\$<suffix>`）。
      */
-    private val executeElevatedCall = Regex("(?<![A-Za-z0-9_$])executeElevated\\s*\\(")
+    private val executeElevatedCall = Regex("(?<![A-Za-z0-9_$])executeElevated(\\\$[A-Za-z0-9_]*)?\\s*\\(")
 
     /**
      * `::executeElevated` callable reference（無呼叫括號）：token 結尾後續字元
      * 非識別字組成（`::executeElevatedFrozen` 不命中——`F` 擋下；
      * `::executeElevatedX` 不命中）。
+     * JVM mangled internal（`::executeElevated$app_debug`）亦命中（可選 `\$<suffix>`）。
      */
-    private val callableReferenceExecuteElevated = Regex("::\\s*executeElevated(?![A-Za-z0-9_$])")
+    private val callableReferenceExecuteElevated = Regex("::\\s*executeElevated(\\\$[A-Za-z0-9_]*)?(?![A-Za-z0-9_$])")
 
     /**
      * Java interop：Kotlin object 經 `ShellExecTool.INSTANCE.executeElevated(` 呼叫。
-     * `ShellExecTool.INSTANCE.executeElevatedFrozen(` 不命中（`executeElevated` 後必須緊接 `\s*\(`）。
+     * `ShellExecTool.INSTANCE.executeElevatedFrozen(` 不命中（`executeElevated` 後必須緊接 `\s*\(`
+     * 或可選 `\$<suffix>`，`F` 擋下；`INSTANCE.executeElevatedFrozen$app_debug(` 亦不命中）。
+     * JVM mangled internal（`INSTANCE.executeElevated$app_debug(`）亦命中（可選 `\$<suffix>`）。
      */
     private val javaInteropExecuteElevated =
-        Regex("(?<![A-Za-z0-9_$])ShellExecTool\\s*\\.\\s*INSTANCE\\s*\\.\\s*executeElevated\\s*\\(")
+        Regex("(?<![A-Za-z0-9_$])ShellExecTool\\s*\\.\\s*INSTANCE\\s*\\.\\s*executeElevated(\\\$[A-Za-z0-9_]*)?\\s*\\(")
 
     /**
      * `executeWithFrozen\s*\(`（whitespace/newline 容忍）：token 前一字元非
      * 識別字組成（lookbehind），`.executeWithFrozen(`／裸 `executeWithFrozen(`
      * 皆命中；`fooexecuteWithFrozen(` 不誤計。
+     * JVM mangled internal（`executeWithFrozen$app_debug(`）亦命中（可選 `\$<suffix>`）。
      */
-    private val executeWithFrozenCall = Regex("(?<![A-Za-z0-9_$])executeWithFrozen\\s*\\(")
+    private val executeWithFrozenCall = Regex("(?<![A-Za-z0-9_$])executeWithFrozen(\\\$[A-Za-z0-9_]*)?\\s*\\(")
 
     /**
      * `::executeWithFrozen` callable reference（無呼叫括號）：token 結尾後續字元
      * 非識別字組成（`::executeWithFrozenX` 不命中；`::executeWithFrozen` 命中）。
      * `::` 前綴的接收者識別字（`Foo::executeWithFrozen`）合法，故 token 起始
      * 不做前界檢查（`':'` 前為識別字屬正常限定形）。
+     * JVM mangled internal（`::executeWithFrozen$app_debug`）亦命中（可選 `\$<suffix>`）。
      */
-    private val callableReferenceToken = Regex("::\\s*executeWithFrozen(?![A-Za-z0-9_$])")
+    private val callableReferenceToken = Regex("::\\s*executeWithFrozen(\\\$[A-Za-z0-9_]*)?(?![A-Za-z0-9_$])")
 
     /**
-     * 零容忍 legacy 入口：`ElevatedDispatch.execute(`（`.` 兩側 whitespace 容忍）
+     * 零容忍 legacy 入口：`ElevatedDispatch.execute(`（`.` 兩側 whitespace 容忍；含
+     * `ElevatedDispatch.INSTANCE.execute(` Java interop 形）
      * 或 `ElevatedDispatch::execute`（callable reference；結尾邊界非識別字組成）。
      * `ElevatedDispatch.executeWithFrozen(` 不命中（`execute` 後非
      * `\s*\(`／結尾邊界）。
+     * JVM mangled internal（`ElevatedDispatch.execute$app_debug(`、
+     * `ElevatedDispatch.INSTANCE.execute$app_debug(`、`::execute$app_debug`）亦命中（可選 `\$<suffix>`）。
      */
     private val legacyDispatchExecuteCall =
-        Regex("(?<![A-Za-z0-9_$])ElevatedDispatch\\s*\\.\\s*(INSTANCE\\s*\\.\\s*)?\\s*execute\\s*\\(")
+        Regex("(?<![A-Za-z0-9_$])ElevatedDispatch\\s*\\.\\s*(INSTANCE\\s*\\.\\s*)?\\s*execute(\\\$[A-Za-z0-9_]*)?\\s*\\(")
     private val legacyDispatchExecuteRef =
-        Regex("(?<![A-Za-z0-9_$])ElevatedDispatch\\s*(\\.\\s*INSTANCE)?\\s*::\\s*execute(?![A-Za-z0-9_$])")
+        Regex("(?<![A-Za-z0-9_$])ElevatedDispatch\\s*(\\.\\s*INSTANCE)?\\s*::\\s*execute(\\\$[A-Za-z0-9_]*)?(?![A-Za-z0-9_$])")
 
-    /** member import（含 alias 與 Java `import static`）——零容忍。 */
+    /**
+     * member import（含 alias 與 Java `import static`）——零容忍。
+     * JVM mangled internal（`import static …ElevatedDispatch.execute$app_debug`）亦命中（可選 `\$<suffix>`）；
+     * `@JvmSynthetic` 後 Java 已無法 import 該成員，此為 tripwire backstop。
+     */
     private val importedDispatchMemberExecute =
-        Regex("import\\s+(static\\s+)?dev\\.librepocket\\.router\\.ElevatedDispatch\\s*\\.\\s*execute(?![A-Za-z0-9_$])")
+        Regex("import\\s+(static\\s+)?dev\\.librepocket\\.router\\.ElevatedDispatch\\s*\\.\\s*execute(\\\$[A-Za-z0-9_]*)?(?![A-Za-z0-9_$])")
 
-    /** star import（`import (static )?…ElevatedDispatch.*`）——零容忍。 */
+    /**
+     * star import（`import (static )?…ElevatedDispatch.*`）——零容忍。
+     * 決策：不加 `\$<suffix>`——star import 無成員名稱可攜帶 mangled suffix（`ElevatedDispatch.*$x` 非合法 Java）；
+     * Java 無法 import Kotlin internal（含 mangled）成員，`ElevatedDispatch.*` 不授予四成員任何可見性；
+     * 保留原 pattern 作 plain star 形 tripwire。
+     */
     private val importedDispatchStar =
         Regex("import\\s+(static\\s+)?dev\\.librepocket\\.router\\.ElevatedDispatch\\s*\\.\\s*\\*")
 
-    /** object 直接 import（無 member 後綴）——零容忍（可達成 `with(ElevatedDispatch) { execute(…) }`；product 現無此 import，直接封死）。 */
+    /** object 直接 import（無 member 後綴）——零容忍（可達成 `with(ElevatedDispatch) { execute(…) }`；product 現無此 import，直接封死）。object import 本身不攜帶成員 token，mangled suffix 無處附著，維持不變。 */
     private val importedDispatchObject =
         Regex("import\\s+(static\\s+)?dev\\.librepocket\\.router\\.ElevatedDispatch(?![A-Za-z0-9_$.])")
 

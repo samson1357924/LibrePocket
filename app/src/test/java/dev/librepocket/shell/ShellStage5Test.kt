@@ -111,7 +111,10 @@ class ShellStage5Test {
                 code.append(c)
                 i++
             }
+            // 允許 JVM-mangled suffix（internal $<module> 由 @JvmSynthetic 於編譯期
+            // 封死；此處為 tripwire 對照形，覆蓋任何 $<suffix> 直呼；fail-closed）。
             if (code.contains(".executeElevated(")) return true
+            if (Regex("""\.executeElevated\$[A-Za-z0-9_]*\s*\(""").containsMatchIn(code)) return true
         }
         return false
     }

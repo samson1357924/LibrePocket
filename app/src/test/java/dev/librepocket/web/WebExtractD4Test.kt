@@ -752,6 +752,9 @@ class WebExtractD4Test {
     // leaderCancellationMapsFollowerToUnavailableCancelled pin。
 
     @Test fun serviceInvalidateClearsCacheForcingRefetch() = runBlocking {
+        // invalidate() 亦會 drain in-flight entries（exceptionally）：進行中的
+        // leader 不受影響地完成並把 outcome 交給自己的 caller，但其 cache 寫入
+        // 被 epoch guard 抑制；follower 見 Unavailable(CANCELLED)。
         val dns = publicDns("example.com")
         val http = FakeExtract { okResp(html()) }
         val svc = WebExtractService(http)
@@ -760,6 +763,79 @@ class WebExtractD4Test {
         svc.invalidate()
         val again = svc.extract("https://example.com/inv", resolver = dns) as WebExtractOutcome.Ok
         assertFalse("invalidate 後必須重打 upstream", again.cached)
+        assertEquals(2, http.calls.get())
+    }
+
+    @Test fun pausedLeaderInvalidateDropsStaleWrite() = runBlocking {
+        // 暫停 leader 於 fake handler（CompletableDeferred gate）；invalidate() 之後
+        // release：stale leader 仍須把 Ok 交給它自己的 caller，但不得重填於
+        // 已清空之快取；新呼叫必打 upstream、快取維持空。
+        val dns = publicDns("example.com")
+        val gate = CompletableDeferred<Unit>()
+        val http = FakeExtract {
+            gate.await()
+            okResp(html())
+        }
+        val cache = WebExtractCache()
+        val svc = WebExtractService(http, cache = cache)
+        val leader = async { svc.extract("https://example.com/paused", resolver = dns) }
+        withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
+        svc.invalidate()
+        gate.complete(Unit)
+        val leaderOut = withTimeout(5_000) { leader.await() }
+        assertTrue("stale leader 仍須返回其 outcome，got $leaderOut", leaderOut is WebExtractOutcome.Ok)
+        assertEquals("stale leader 不得在 invalidate 後重填快取", 0, cache.size)
+        val again = svc.extract("https://example.com/paused", resolver = dns) as WebExtractOutcome.Ok
+        assertFalse("invalidate 後新呼叫必打 upstream", again.cached)
+        assertEquals(2, http.calls.get())
+    }
+
+    @Test fun invalidateDrainsInFlightFailsFast() = runBlocking {
+        // leader gated 於 handler 中；follower 正在 await leader。invalidate()
+        // 排空 inFlight → follower 立即（不等 30s leader 預算）收到
+        // Unavailable(CANCELLED)。leader 於 release 後仍完成 Ok。
+        val dns = publicDns("example.com")
+        val gate = CompletableDeferred<Unit>()
+        val http = FakeExtract {
+            gate.await()
+            okResp(html())
+        }
+        val svc = WebExtractService(http, timeoutMs = 30_000)
+        val leader = async { svc.extract("https://example.com/drain", resolver = dns) }
+        withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
+        val follower = async { svc.extract("https://example.com/drain", resolver = dns) }
+        delay(30) // 讓 follower 進入 await()
+        svc.invalidate()
+        val followerOut = withTimeout(5_000) { follower.await() }
+        assertTrue("invalidate 後 follower 應立即 fail-fast，got $followerOut", followerOut is WebExtractOutcome.Unavailable)
+        assertEquals(WebExtract.DETAIL_CANCELLED, (followerOut as WebExtractOutcome.Unavailable).detail)
+        gate.complete(Unit)
+        val leaderOut = withTimeout(5_000) { leader.await() }
+        assertTrue("leader 於 release 後仍完成 Ok，got $leaderOut", leaderOut is WebExtractOutcome.Ok)
+    }
+
+    @Test fun twoServicesSharedCacheStaleWriteRejected() = runBlocking {
+        // 兩個 WebExtractService 共用一個 WebExtractCache：svcB 的 invalidate()
+        // 無法 drain svcA 的 inFlight，但 epoch guard 必須抑制 svcA 之 leader
+        // 寫入共享快取（跨 service 陳舊寫入亦被拒絕）。
+        val dns = publicDns("example.com")
+        val gate = CompletableDeferred<Unit>()
+        val http = FakeExtract {
+            gate.await()
+            okResp(html())
+        }
+        val cache = WebExtractCache()
+        val svcA = WebExtractService(http, cache = cache)
+        val svcB = WebExtractService(http, cache = cache)
+        val leaderA = async { svcA.extract("https://example.com/shared", resolver = dns) }
+        withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
+        svcB.invalidate()
+        gate.complete(Unit)
+        val leaderOut = withTimeout(5_000) { leaderA.await() }
+        assertTrue("leader 仍須返回其 outcome，got $leaderOut", leaderOut is WebExtractOutcome.Ok)
+        assertEquals("跨 service stale leader 不得重填共享快取", 0, cache.size)
+        val again = svcB.extract("https://example.com/shared", resolver = dns) as WebExtractOutcome.Ok
+        assertFalse("invalidate 後新呼叫必打 upstream", again.cached)
         assertEquals(2, http.calls.get())
     }
 

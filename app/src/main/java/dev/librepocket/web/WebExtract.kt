@@ -365,6 +365,16 @@ class WebExtractCache(
             },
         )
 
+    /**
+     * 快取 generation epoch：每次 [clear]（含 `WebExtractService.invalidate()`）
+     * 先 bump 此值，再清空 map；寫入方以進入時捕獲之 epoch 通過 [putByKey]
+     * 的 guard，否則寫入被拒絕（stale write 不得在 invalidate 之後重填快取）。
+     */
+    private val generation = java.util.concurrent.atomic.AtomicLong(0)
+
+    /** 目前 generation（供呼叫方捕獲 epoch 用）。 */
+    internal val currentGeneration: Long get() = generation.get()
+
     fun key(url: String, maxBytes: Int, maxModelChars: Int, optIn: EndpointNetworkOptIn): String {
         val u = url.trim()
         return "${u.length}:$u\u0001$maxBytes\u0001$maxModelChars\u0001${optIn.policy.name}\u0001${optIn.configRevision}"
@@ -386,14 +396,21 @@ class WebExtractCache(
     }
 
     fun put(url: String, maxBytes: Int, maxModelChars: Int, optIn: EndpointNetworkOptIn, outcome: WebExtractOutcome.Ok) {
-        putByKey(key(url, maxBytes, maxModelChars, optIn), outcome)
+        // 公開 put() 以當下 generation 寫入（呼叫方對陳舊寫入的自辨屬其自身責任；
+        // single-flight leader 路徑則傳入 extract() 入口捕獲之 epoch）。
+        putByKey(key(url, maxBytes, maxModelChars, optIn), outcome, generation.get())
     }
 
-    internal fun putByKey(k: String, outcome: WebExtractOutcome.Ok) {
+    internal fun putByKey(k: String, outcome: WebExtractOutcome.Ok, generationCaptured: Long) {
         val now = clockMs()
         val expiresAt = now.coerceAtMost(Long.MAX_VALUE - ttlMs) + ttlMs
         val snapshot = outcome.copy(cached = false, content = outcome.content.copy())
         synchronized(map) {
+            // epoch guard（置於 map 鎖內）：進入時捕獲之 generation 已變
+            //（clear()/invalidate() 已 bump），拒絕本次寫入——陳舊 leader
+            // 不得在 invalidate 之後重填快取（bump 先於 map.clear()，
+            // 故鎖內看到 bump 即知 clear 已開始或完成）。
+            if (generation.get() != generationCaptured) return
             sweepLocked(now)
             map[k] = Entry(snapshot, expiresAt)
         }
@@ -406,6 +423,9 @@ class WebExtractCache(
     }
 
     fun clear() {
+        // 先 bump generation 再清 map：任何捕獲舊 epoch 的寫入從此刻起一律被
+        // [putByKey] 拒絕（即使 map 清空與寫入競爭，guard 也以 epoch 判決）。
+        generation.incrementAndGet()
         map.clear()
     }
 
@@ -441,14 +461,34 @@ class WebExtractService(
     private val timeoutMs: Long = WebExtract.TIMEOUT_MS,
 ) {
     /**
-     * 清空快取。
+     * 撤銷原語：revocation primitive。
      *
-     * resolver 變更後必須 `invalidate()`（或 bump `configRevision`），
-     * 否則快取保留舊解析之內容；`invalidate()` 不會阻擋已在飛行之 leader，
-     * 其完成後可能重新寫入快取（與 WebSearchService 同姿態）。
-     * 不影響 inFlight／follower——已 detach 的 follower 之單飛結果不變。
+     * - `cache.clear()`（先 bump generation epoch，再清空 map）：
+     *   invalidate() 之前建立之快取條目永遠無法再被回傳。
+     * - 排空當前 in-flight entries：`inFlight` 內所有 pending leader 之
+     *   `CompletableDeferred` 以 `CancellationException("web.extract invalidated")`
+     *   完成（exceptionally）。已 detach 之 follower 經 `await()` 收到
+     *   CancellationException → 映射為 `Unavailable(DETAIL_CANCELLED, null)`
+     *   （never cached）；follower 自身的取消仍以 `ensureActive()` 優先透傳。
+     * - invalidate() 之後之新呼叫走完整 policy／DNS cycle（含 cache 重驗），
+     *   不得重用 invalidate 前之 in-flight 或 cache 結果。
+     * - leader 於 drain 之後完成者：其 `Ok` 仍正常返回給它自己的 caller，
+     *   但 cache 寫入被 epoch guard 抑制；follower 因 `m.complete(outcome)`
+     *   對已例外完成的 deferred 無效而只見 CancellationException。
+     *
+     * resolver／政策變更後必須 `invalidate()`（或 bump `configRevision`）重綁，
+     * 否則舊解析之內容仍會命中（重驗無法區分 resolver/endpoint 身份）。
      */
-    fun invalidate() = cache.clear()
+    suspend fun invalidate() {
+        cache.clear()
+        mutex.withLock {
+            val pending = inFlight.values.toList()
+            inFlight.clear()
+            pending.forEach {
+                it.completeExceptionally(CancellationException("web.extract invalidated"))
+            }
+        }
+    }
 
     private val mutex = Mutex()
     private val inFlight: MutableMap<String, CompletableDeferred<WebExtractOutcome>> = mutableMapOf()
@@ -477,6 +517,10 @@ class WebExtractService(
         // 全程單一單調 deadline：per-call 政策重驗（含 DNS preflight）＋
         // `extractUncached`（DNS preflight＋逐跳 HTTP＋解壓）共用此單一單調預算。
         val deadlineNs = System.nanoTime() + timeoutMs.coerceAtLeast(1) * 1_000_000L
+        // 入口捕獲 cache generation epoch：leader 完成時若 epoch 已變
+        //（期間發生過 invalidate()/clear()），抑制本次 cache 寫入
+        //（caller 自身仍正常拿到 outcome；僅 cache write 被抑制）。
+        val epochAtEntry = cache.currentGeneration
         val hop0 = stripFragment(rawUrl.trim())
         val k = cache.key(hop0, effBytes, effModel, optIn)
         while (true) {
@@ -560,8 +604,11 @@ class WebExtractService(
                 val outcome = extractUncached(rawUrl, optIn, resolver, effBytes, effModel, deadlineNs)
                 if (outcome is WebExtractOutcome.Ok) okForFollowers = outcome
                 currentCoroutineContext().ensureActive()
-                if (outcome is WebExtractOutcome.Ok) {
-                    cache.putByKey(k, outcome)
+                if (outcome is WebExtractOutcome.Ok && cache.currentGeneration == epochAtEntry) {
+                    // epoch guard：extract() 入口後發生過 invalidate()/clear()，
+                    // 陳舊結果不得寫回快取（m.isCompleted 情形亦由本檢查涵蓋——
+                    // drain 會 bump generation；leader 仍正常返回 outcome 予其 caller）。
+                    cache.putByKey(k, outcome, epochAtEntry)
                 }
                 m.complete(outcome)
                 return outcome

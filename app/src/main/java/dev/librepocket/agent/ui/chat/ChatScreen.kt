@@ -308,9 +308,20 @@ fun ChatScreen(
             pendingSpeak = null
         }
     }
+    // F1/P2 single-owner 單飛閘（Stage C）：所有 STT 啟動一律經 sttArbiter 決策，
+    // 一次最多一枚 RecognizerIntent；消費仍由呼叫點的一次性 callback 負責。
+    // sttArbiterState 為 currentInFlight 的 compose 鏡像（arm 承認／result settle 時翻轉，
+    // 重觸發上方統一決策效應續行下一 arm）；userVoiceArmed 為 mic 鈕的一次態 arm
+    //（閘忙時按住佇列一次，settle 後續行）。
+    val sttArbiter = remember { VoiceSttArbiter() }
+    var sttArbiterState by remember { mutableStateOf<VoiceSttArmKind?>(null) }
+    var userVoiceArmed by remember { mutableStateOf(false) }
     val sttLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
+        // STT 結果回呼一律先結算單飛閘：無論 resultCode／降級路徑，恰一次 onResultSettled()。
+        sttArbiter.onResultSettled()
+        sttArbiterState = null
         // TODO(#137): implement explicit auto-send handling before enabling; do not discard prefill results.
         // Runtime contract today: voice results are prefill-only. Even if AUTO_SEND_AFTER_VOICE is
         // flipped prematurely, never silently drop STT results—prefill/error handling below must still run.
@@ -337,15 +348,21 @@ fun ChatScreen(
         }
         // 非 OK（使用者取消）維持手動輸入，不報錯。
     }
-    fun launchSystemStt() {
+    // true iff sttLauncher.launch was invoked without throwing (degrade paths and exceptions return false).
+    fun launchSystemStt(): Boolean {
         val probe = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
         // B1：探測必須帶 MATCH_DEFAULT_ONLY，只認「預設可處理」的辨識服務，
         // 避免列出無 DEFAULT category 的非可啟動目標；action 與 manifest
         // <queries> 同為 RECOGNIZE_SPEECH（見 VoiceStt.ACTION）。
-        val hasService = context.packageManager.queryIntentActivities(
-            probe,
-            PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_DEFAULT_ONLY.toLong()),
-        ).isNotEmpty()
+        // 探測本身拋例外（SecurityException 等）：視為無服務，落入既有降級路徑。
+        val hasService = try {
+            context.packageManager.queryIntentActivities(
+                probe,
+                PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_DEFAULT_ONLY.toLong()),
+            ).isNotEmpty()
+        } catch (_: Exception) {
+            false
+        }
         val reason = VoiceStt.degradeReason(hasRecognitionService = hasService, inputEnabled = inputEnabled)
         if (reason != null) {
             val detail = if (reason == DenyReason.USER_DISABLED) {
@@ -354,43 +371,100 @@ fun ChatScreen(
                 VoiceStt.DETAIL_NO_SERVICE
             }
             voiceErrors.onSttFailure(VoiceStt.fallbackMessage(reason, detail))
-            return
+            return false
         }
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, VoiceStt.LANGUAGE)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, VoiceStt.MAX_RESULTS)
         }
-        try {
+        return try {
             sttLauncher.launch(intent)
+            true
         } catch (_: Exception) {
             voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE))
+            false
         }
     }
-    // C2 自動喚起：session ASSIST＋flag → 須待 VoiceSwitchStore 快照落定
-    // （voiceSwitchesLoaded == true，含 loaded 與 loadFailed，避免冷啟動
-    // LOADING 窗口誤以全關 map 提前消費／降級）；落定後消費一次並走既有委派。
-    // 先消費再啟動：啟動後重組不再重放；開關關閉或 loadFailed 時，
-    // launchSystemStt() 內 cleanly 降級為 USER_DISABLED。
-    LaunchedEffect(voiceInputRequested, voiceSwitchesLoaded) {
-        if (voiceInputRequested && voiceSwitchesLoaded) {
-            onVoiceInputConsumed()
-            launchSystemStt()
-        }
-    }
-    // C2 retrigger：同一 trusted voice task 已存在且 session 接受新的真實 onShow 時，
-    // 以跨 process handoff token 一次性重啟 STT（不建立新 voice task、不自動送出）。
-    // 僅在 switches 狀態已落定且 consume 成功時啟動，避免誤觸發/重放/競態。
-    // 與初始 voice effect 互斥：初始 voice effect 於同幀先行；絕不在單一 frame 疊加兩個
-    // RecognizerIntent 啟動（voiceInputRequested 尚未消費時，retrigger 不消費／不啟動）。
-    // voiceInputRequested 也須列入 key：effect 執行時必須讀到同幀最新值，否則組合期
-    // 快照與 key 不同步會放行同幀雙重啟動。
-    LaunchedEffect(voiceRetriggerToken, voiceSwitchesLoaded, voiceInputRequested) {
-        if (voiceRetriggerToken != 0L && voiceSwitchesLoaded && !voiceInputRequested) {
-            if (onVoiceRetriggerConsumed(voiceRetriggerToken)) {
-                launchSystemStt()
+    // C2 自動喚起／retrigger／mic：所有 STT 啟動統一經單一決策效應（F1/P2 單飛閘）。
+    // 優先序由 arbiter 決定（INITIAL > RETRIGGER > USER），switches 落定前不消費不啟動；
+    // 先消費再啟動，消費失敗（如 retrigger TTL／provider 競態）則放棄啟動並釋放閘，
+    // 交出下一個已 arm 的 arm；降級（launch 回 false）亦在同一幀繼續裁決下一 arm。
+    // settle（STT result callback 第一行 onResultSettled）經 sttArbiterState 重觸發本效應，
+    // 確定性地續行下一 arm。效應內以本地旗標影子參數，避免同幀內重複消費 stale 快照。
+    LaunchedEffect(voiceInputRequested, voiceRetriggerToken, voiceSwitchesLoaded, sttArbiterState, userVoiceArmed) {
+        var initialRequested = voiceInputRequested
+        var retriggerArmed = isRetriggerArmed(voiceRetriggerToken)
+        var userArmed = userVoiceArmed
+        while (true) {
+            when (val decision = sttArbiter.decide(
+                initialRequested = initialRequested,
+                retriggerArmed = retriggerArmed,
+                userRequested = userArmed,
+                switchesLoaded = voiceSwitchesLoaded,
+            )) {
+                VoiceSttDecision.Wait, VoiceSttDecision.Idle -> break
+                is VoiceSttDecision.Admit -> {
+                    val arm = decision.arm
+                    // 任何非取消例外（消費回呼／launchSystemStt 內部未捕捉等）都必須
+                    // 釋放單飛閘並清同影子區域變數，否則閘永久楔住；取消例外照常傳播。
+                    try {
+                        when (arm) {
+                            VoiceSttArmKind.INITIAL -> {
+                                initialRequested = false
+                                // 先消費再啟動：啟動後重組不再重放；開關關閉或 loadFailed 時，
+                                // launchSystemStt() 內 cleanly 降級為 USER_DISABLED／NO_PRIVILEGE。
+                                onVoiceInputConsumed()
+                                val launched = launchSystemStt()
+                                sttArbiter.onLaunchReported(VoiceSttArmKind.INITIAL, launched)
+                                if (launched) {
+                                    sttArbiterState = VoiceSttArmKind.INITIAL
+                                }
+                            }
+                            VoiceSttArmKind.RETRIGGER -> {
+                                retriggerArmed = false
+                                if (onVoiceRetriggerConsumed(voiceRetriggerToken)) {
+                                    val launched = launchSystemStt()
+                                    sttArbiter.onLaunchReported(VoiceSttArmKind.RETRIGGER, launched)
+                                    if (launched) {
+                                        sttArbiterState = VoiceSttArmKind.RETRIGGER
+                                    }
+                                } else {
+                                    // Consume rejected (TTL／provider race)：不啟動，立即釋放閘。
+                                    sttArbiter.onLaunchReported(VoiceSttArmKind.RETRIGGER, launched = false)
+                                }
+                            }
+                            VoiceSttArmKind.USER -> {
+                                userArmed = false
+                                userVoiceArmed = false
+                                val launched = launchSystemStt()
+                                sttArbiter.onLaunchReported(VoiceSttArmKind.USER, launched)
+                                if (launched) {
+                                    sttArbiterState = VoiceSttArmKind.USER
+                                }
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        // 無論例外類型（含 CancellationException）都先歸零影子變數、
+                        // 釋放閘並同步鏡像——閘必須在 rethrow 前釋放，否則早退路徑
+                        // 會留下 inFlight，整個畫面工作階段的語音功能靜默死鎖。
+                        when (arm) {
+                            VoiceSttArmKind.INITIAL -> initialRequested = false
+                            VoiceSttArmKind.RETRIGGER -> retriggerArmed = false
+                            VoiceSttArmKind.USER -> {
+                                userArmed = false
+                                userVoiceArmed = false
+                            }
+                        }
+                        sttArbiter.onLaunchReported(arm, launched = false)
+                        sttArbiterState = null
+                        throw t
+                    }
+                }
             }
         }
+        // 保持鏡像與閘一致（涵蓋完全降級後 currentInFlight == null 的收尾）。
+        sttArbiterState = sttArbiter.currentInFlight
     }
 
     LaunchedEffect(messages.size, messages.lastOrNull()?.text?.length, session.status, contextOmittedCount) {
@@ -781,8 +855,10 @@ fun ChatScreen(
                     // S2 系統 STT：RecognizerIntent 委託（FREE_FORM / zh-TW / MAX 1），
                     // 結果進 ChatViewModel.prefill()；無服務降級手動輸入。
                     // M2：voice_input 關閉時隱藏 mic 鈕（與投影層同開關）。
+                    // F1/P2：mic 亦入單飛閘（ArmKind.USER）；閘忙時點按佇列一次，
+                    // 於 in-flight STT settle 後續行（同幀不疊加 RecognizerIntent）。
                     if (inputEnabled) {
-                        IconButton(onClick = { launchSystemStt() }) {
+                        IconButton(onClick = { userVoiceArmed = true }) {
                             Icon(
                                 imageVector = Icons.Filled.Mic,
                                 contentDescription = "語音輸入",

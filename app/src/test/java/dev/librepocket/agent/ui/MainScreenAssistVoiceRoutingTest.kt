@@ -1,6 +1,8 @@
 package dev.librepocket.agent.ui
 
+import android.app.Activity
 import android.app.Application
+import androidx.activity.result.ActivityResult
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -183,6 +185,7 @@ class MainScreenAssistVoiceRoutingTest {
     )
 
     private class RecordingRegistry : ActivityResultRegistry() {
+        var lastRequestCode = -1
         val launchedIntents = mutableListOf<Intent>()
 
         override fun <I : Any?, O : Any?> onLaunch(
@@ -191,6 +194,7 @@ class MainScreenAssistVoiceRoutingTest {
             input: I,
             options: ActivityOptionsCompat?,
         ) {
+            lastRequestCode = requestCode
             if (input is Intent) {
                 launchedIntents += input
             }
@@ -869,8 +873,20 @@ class MainScreenAssistVoiceRoutingTest {
         assertNull(h.providerPending())
         assertEquals(0, provider.streamCalls)
 
+        // Settle the first recognition: under the single-flight gate a fresh retrigger published
+        // while an STT launch is in flight stays held instead of stacking a second recognizer,
+        // so (b) below exercises the admitted-on-settle path.
+        composeRule.runOnIdle {
+            h.registry.dispatchResult(
+                h.registry.lastRequestCode,
+                ActivityResult(Activity.RESULT_CANCELED, null),
+            )
+        }
+        composeRule.waitForIdle()
+
         // (b) Fresh publish on CHAT while the read-only overlay is active: the coordinator clears
-        // the overlay in the same run; the boundary is satisfied and STT launches exactly once more.
+        // the overlay in the same run; the boundary is satisfied and STT launches exactly once more
+        // (gate is free after the settle above).
         composeRule.runOnIdle {
             h.viewedSessionId.value = "readonly-2"
         }

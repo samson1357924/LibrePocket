@@ -21,7 +21,9 @@ import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
 import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityOptionsCompat
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
@@ -898,13 +900,15 @@ class ChatScreenVoiceLaunchTest {
                     viewModel = vm,
                     userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
                     voiceInputRequested = req,
-                    // Intentionally do NOT clear voiceRequested in onVoiceInputConsumed: this test
-                    // pins down first-frame mutual exclusion and the req=false re-fire below.
-                    onVoiceInputConsumed = { consumedInitial++ },
+                    onVoiceInputConsumed = {
+                        consumedInitial++
+                        voiceRequested.value = false
+                    },
                     voiceSwitchesLoaded = true,
                     voiceRetriggerToken = token,
                     onVoiceRetriggerConsumed = {
                         consumedRetrigger += it
+                        retriggerToken.value = 0L
                         true
                     },
                 )
@@ -912,23 +916,29 @@ class ChatScreenVoiceLaunchTest {
         }
         composeRule.waitForIdle()
 
-        // Only the initial voice launch happened in this frame; the retrigger LaunchedEffect saw
-        // voiceInputRequested == true (its snapshot guard skips the consume) and did not fire.
-        // The voiceInputRequested key flips to false later, re-firing the effect in a later frame.
+        // Both armed on frame 1 with loaded=true: the arbiter admits INITIAL (precedence
+        // INITIAL > RETRIGGER). At most one recognizer is launched and the retrigger is
+        // NOT consumed yet — it stays armed pending the in-flight launch's settle.
         assertEquals(1, consumedInitial)
         assertEquals(1, registry.launchedIntents.size)
         assertEquals(emptyList<Long>(), consumedRetrigger)
         assertEquals(0, provider.streamCalls)
 
-        // The retrigger is blocked only while req == true. Once req flips false the
-        // voiceInputRequested effect key re-fires and the pending retrigger is delivered on the
-        // next frame. This pins that behavior — it silently fails if the voiceInputRequested key
-        // is removed from the retrigger LaunchedEffect.
-        composeRule.runOnIdle { voiceRequested.value = false }
+        // The settle (result callback) releases the gate; the pending retrigger is admitted
+        // on the next frame and its own launch follows.
+        val resultIntent = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("", "你好"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.lastRequestCode, ActivityResult(Activity.RESULT_OK, resultIntent))
+        }
         composeRule.waitForIdle()
 
-        assertEquals(listOf(44L), consumedRetrigger)
         assertEquals(2, registry.launchedIntents.size)
+        assertEquals(listOf(44L), consumedRetrigger)
+        assertEquals("你好", vm.input.value)
+        assertEquals(1, consumedInitial)
         assertEquals(0, provider.streamCalls)
     }
 
@@ -968,6 +978,593 @@ class ChatScreenVoiceLaunchTest {
         composeRule.onAllNodesWithText(
             VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE),
         ).assertCountEquals(1)
+        assertEquals(0, provider.streamCalls)
+    }
+
+
+    @Test
+    fun bothArmed_loadingSettles_initialWins_successionAdmitsRetriggerOnResult() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+        val retriggerToken = MutableStateFlow(44L)
+        val switchesLoaded = MutableStateFlow(false)
+        val consumedRetrigger = ArrayList<Long>()
+        var consumedInitial = 0
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            val token by retriggerToken.collectAsState()
+            val loaded by switchesLoaded.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = {
+                        consumedInitial++
+                        voiceRequested.value = false
+                    },
+                    voiceSwitchesLoaded = loaded,
+                    voiceRetriggerToken = token,
+                    onVoiceRetriggerConsumed = {
+                        consumedRetrigger += it
+                        retriggerToken.value = 0L
+                        true
+                    },
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        // LOADING window: Wait consumes nothing and launches nothing.
+        assertEquals(0, consumedInitial)
+        assertTrue(consumedRetrigger.isEmpty())
+        assertTrue(registry.launchedIntents.isEmpty())
+
+        composeRule.runOnIdle { switchesLoaded.value = true }
+        composeRule.waitForIdle()
+
+        // Settle: INITIAL wins (precedence); retrigger stays armed, not consumed.
+        assertEquals(1, consumedInitial)
+        assertTrue(consumedRetrigger.isEmpty())
+        assertEquals(1, registry.launchedIntents.size)
+        assertEquals(0, provider.streamCalls)
+
+        val resultA = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("a"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.lastRequestCode, ActivityResult(Activity.RESULT_OK, resultA))
+        }
+        composeRule.waitForIdle()
+
+        // Settle admits the pending retrigger on the next frame; its own launch follows.
+        assertEquals(2, registry.launchedIntents.size)
+        assertEquals(listOf(44L), consumedRetrigger)
+        assertEquals("a", vm.input.value)
+        assertEquals(1, consumedInitial)
+        assertEquals(0, provider.streamCalls)
+
+        val resultB = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("b"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.lastRequestCode, ActivityResult(Activity.RESULT_OK, resultB))
+        }
+        composeRule.waitForIdle()
+
+        assertEquals("b", vm.input.value)
+        assertEquals(2, registry.launchedIntents.size)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun recognitionInFlight_secondGesture_heldUntilResult() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+        val retriggerToken = MutableStateFlow(0L)
+        val consumedRetrigger = ArrayList<Long>()
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            val token by retriggerToken.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                    voiceRetriggerToken = token,
+                    onVoiceRetriggerConsumed = {
+                        consumedRetrigger += it
+                        retriggerToken.value = 0L
+                        true
+                    },
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+
+        // A second gesture (retrigger) arrives while the first recognition is in flight:
+        // it stays armed and is NOT launched.
+        composeRule.runOnIdle { retriggerToken.value = 55L }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+        assertTrue(consumedRetrigger.isEmpty())
+
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.lastRequestCode, ActivityResult(Activity.RESULT_CANCELED, null))
+        }
+        composeRule.waitForIdle()
+
+        assertEquals(2, registry.launchedIntents.size)
+        assertEquals(listOf(55L), consumedRetrigger)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun bothArmed_switchDisabled_degradesAndConsumesBoth_zeroLaunches() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+        val retriggerToken = MutableStateFlow(66L)
+        val switchesLoaded = MutableStateFlow(false)
+        val userSwitches = MutableStateFlow(mapOf(VoiceTools.SWITCH_INPUT to false))
+        val consumedRetrigger = ArrayList<Long>()
+        var consumedInitial = 0
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            val token by retriggerToken.collectAsState()
+            val loaded by switchesLoaded.collectAsState()
+            val switches by userSwitches.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = switches,
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = {
+                        consumedInitial++
+                        voiceRequested.value = false
+                    },
+                    voiceSwitchesLoaded = loaded,
+                    voiceRetriggerToken = token,
+                    onVoiceRetriggerConsumed = {
+                        consumedRetrigger += it
+                        retriggerToken.value = 0L
+                        true
+                    },
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        composeRule.runOnIdle { switchesLoaded.value = true }
+        composeRule.waitForIdle()
+
+        // Switch off at settle: both arms degrade in the same pass; zero recognizers launched.
+        assertTrue(registry.launchedIntents.isEmpty())
+        assertEquals(1, consumedInitial)
+        assertEquals(listOf(66L), consumedRetrigger)
+        composeRule.onNodeWithText(
+            VoiceStt.fallbackMessage(DenyReason.USER_DISABLED, VoiceStt.DETAIL_SWITCH_OFF),
+        ).assertIsDisplayed()
+        assertEquals(0, provider.streamCalls)
+
+        // Gate is not wedged: enabling the switch lets a fresh arm launch.
+        composeRule.runOnIdle { userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true) }
+        composeRule.waitForIdle()
+        composeRule.runOnIdle { voiceRequested.value = true }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+    }
+
+    @Test
+    fun bothArmed_noService_degradesBoth_gateFree() {
+        // Deliberately do NOT register RecognizerIntent.ACTION_RECOGNIZE_SPEECH yet.
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+        val retriggerToken = MutableStateFlow(77L)
+        val switchesLoaded = MutableStateFlow(false)
+        val consumedRetrigger = ArrayList<Long>()
+        var consumedInitial = 0
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            val token by retriggerToken.collectAsState()
+            val loaded by switchesLoaded.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = {
+                        consumedInitial++
+                        voiceRequested.value = false
+                    },
+                    voiceSwitchesLoaded = loaded,
+                    voiceRetriggerToken = token,
+                    onVoiceRetriggerConsumed = {
+                        consumedRetrigger += it
+                        retriggerToken.value = 0L
+                        true
+                    },
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        composeRule.runOnIdle { switchesLoaded.value = true }
+        composeRule.waitForIdle()
+
+        // No service at settle: both arms degrade in the same pass; zero recognizers launched.
+        assertTrue(registry.launchedIntents.isEmpty())
+        assertEquals(1, consumedInitial)
+        assertEquals(listOf(77L), consumedRetrigger)
+        composeRule.onNodeWithText(
+            VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE),
+        ).assertIsDisplayed()
+        assertEquals(0, provider.streamCalls)
+
+        // Gate is not wedged: once a recognizer appears, a fresh arm launches.
+        registerRecognitionService()
+        composeRule.runOnIdle { voiceRequested.value = true }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+    }
+
+    @Test
+    fun retriggerConsumeRejected_doesNotLaunch_gateReleased() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+        val retriggerToken = MutableStateFlow(88L)
+        val consumedRetrigger = ArrayList<Long>()
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            val token by retriggerToken.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                    voiceRetriggerToken = token,
+                    onVoiceRetriggerConsumed = {
+                        consumedRetrigger += it
+                        false
+                    },
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        // Initial still launches; the retrigger stays held by the in-flight gate.
+        assertEquals(1, registry.launchedIntents.size)
+        assertTrue(consumedRetrigger.isEmpty())
+
+        // Settle: retrigger is admitted; consume rejects it; no second launch happens.
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.lastRequestCode, ActivityResult(Activity.RESULT_CANCELED, null))
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+        assertEquals(listOf(88L), consumedRetrigger)
+        assertEquals(0, provider.streamCalls)
+
+        // Gate is not wedged: a later armed gesture CAN launch.
+        composeRule.runOnIdle { voiceRequested.value = true }
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size)
+    }
+
+    @Test
+    fun throwingRegistry_successionStillAdmitsAfterInitialSettle() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = ThrowingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+        val retriggerToken = MutableStateFlow(0L)
+        val consumedRetrigger = ArrayList<Long>()
+        var consumedInitial = 0
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            val token by retriggerToken.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = {
+                        consumedInitial++
+                        voiceRequested.value = false
+                    },
+                    voiceSwitchesLoaded = true,
+                    voiceRetriggerToken = token,
+                    onVoiceRetriggerConsumed = {
+                        consumedRetrigger += it
+                        retriggerToken.value = 0L
+                        true
+                    },
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        // Registry blew up on the initial arm: error shown; the slot is released (not wedged).
+        assertEquals(1, consumedInitial)
+        composeRule.onAllNodesWithText(
+            VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE),
+        ).assertCountEquals(1)
+        assertEquals(0, provider.streamCalls)
+
+        // Arm the retrigger after release: the effect admits it; it booms too.
+        composeRule.runOnIdle { retriggerToken.value = 99L }
+        composeRule.waitForIdle()
+        assertEquals(listOf(99L), consumedRetrigger)
+        composeRule.onAllNodesWithText(
+            VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE),
+        ).assertCountEquals(1)
+
+        // Gate is not wedged: a fresh initial arm can boom again.
+        composeRule.runOnIdle { voiceRequested.value = true }
+        composeRule.waitForIdle()
+        assertEquals(2, consumedInitial)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun sttResultNonOk_releasesSlot_admitsPendingRetrigger() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        vm.onInputChange("手動草稿")
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+        val retriggerToken = MutableStateFlow(0L)
+        val consumedRetrigger = ArrayList<Long>()
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            val token by retriggerToken.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                    voiceRetriggerToken = token,
+                    onVoiceRetriggerConsumed = {
+                        consumedRetrigger += it
+                        retriggerToken.value = 0L
+                        true
+                    },
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+
+        // Arm the retrigger mid-flight: held by the in-flight gate.
+        composeRule.runOnIdle { retriggerToken.value = 57L }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+
+        // Non-OK result: draft preserved, error NOT shown, gate released — retrigger admitted.
+        composeRule.runOnIdle {
+            registry.dispatchResult(
+                registry.lastRequestCode,
+                ActivityResult(Activity.RESULT_FIRST_USER, null),
+            )
+        }
+        composeRule.waitForIdle()
+
+        assertEquals(2, registry.launchedIntents.size)
+        assertEquals(listOf(57L), consumedRetrigger)
+        assertEquals("手動草稿", vm.input.value)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun micTap_launchesStt_whenGateFree() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        // No initial request, no retrigger token: the mic tap can only be served by the USER arm.
+        composeRule.setContent {
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertTrue(registry.launchedIntents.isEmpty())
+
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+
+        assertEquals(1, registry.launchedIntents.size)
+        assertEquals(RecognizerIntent.ACTION_RECOGNIZE_SPEECH, registry.launchedIntents.single().action)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun micTap_whileInitialInFlight_holdsUntilSettle_thenLaunches() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+        val retriggerToken = MutableStateFlow(0L)
+        val consumedRetrigger = ArrayList<Long>()
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            val token by retriggerToken.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                    voiceRetriggerToken = token,
+                    onVoiceRetriggerConsumed = {
+                        consumedRetrigger += it
+                        retriggerToken.value = 0L
+                        true
+                    },
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+
+        // Mic tap while the initial recognizer is in flight: held, no second launch.
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+        assertTrue(consumedRetrigger.isEmpty())
+
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.lastRequestCode, ActivityResult(Activity.RESULT_CANCELED, null))
+        }
+        composeRule.waitForIdle()
+
+        // Settle releases the gate: the held mic (USER) arm is admitted next.
+        assertEquals(2, registry.launchedIntents.size)
+        assertTrue(consumedRetrigger.isEmpty())
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun userArm_queuedBehindInitialAndRetrigger_settleAdmitsInPrecedenceOrder() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+        val retriggerToken = MutableStateFlow(42L)
+        val consumedRetrigger = ArrayList<Long>()
+        var consumedInitial = 0
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            val token by retriggerToken.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = {
+                        consumedInitial++
+                        voiceRequested.value = false
+                    },
+                    voiceSwitchesLoaded = true,
+                    voiceRetriggerToken = token,
+                    onVoiceRetriggerConsumed = {
+                        consumedRetrigger += it
+                        retriggerToken.value = 0L
+                        true
+                    },
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        // INITIAL launched; retrigger stays armed (not consumed); USER not armed yet.
+        assertEquals(1, consumedInitial)
+        assertEquals(1, registry.launchedIntents.size)
+        assertTrue(consumedRetrigger.isEmpty())
+
+        // Arm USER by tapping mic: still held by the in-flight initial launch.
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+        assertTrue(consumedRetrigger.isEmpty())
+
+        // Settle #1: the pending RETRIGGER is admitted next (INITIAL > RETRIGGER > USER).
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.lastRequestCode, ActivityResult(Activity.RESULT_CANCELED, null))
+        }
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size)
+        assertEquals(listOf(42L), consumedRetrigger)
+        assertEquals(1, consumedInitial)
+
+        // Settle #2: the queued USER arm is admitted last. Order: INITIAL → RETRIGGER → USER.
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.lastRequestCode, ActivityResult(Activity.RESULT_CANCELED, null))
+        }
+        composeRule.waitForIdle()
+        assertEquals(3, registry.launchedIntents.size)
+        assertEquals(listOf(42L), consumedRetrigger)
+        assertEquals(1, consumedInitial)
         assertEquals(0, provider.streamCalls)
     }
 }

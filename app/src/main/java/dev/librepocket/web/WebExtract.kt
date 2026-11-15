@@ -65,7 +65,8 @@ internal class DeadlineExceededException : RuntimeException()
  *   其餘 → `BAD_RESPONSE`；缺席該 header 放行（legacy）。
  *   放行之後依 [pipelineOf] 分派：HTML-family（`text/html`／`application/xhtml+xml`）
  *   走 HTML 管線（tag 剝除＋unescape）；其餘已放行型別走 raw-text 管線
- *   （不刪 tag、不 unescape，raw `&` 原樣保留）。
+ *   （不刪 tag、不 unescape，raw `&` 原樣保留；保留原文行結構與內部連續空白——
+ *   僅 `\n`／`\t` 保留，`\r` 移除，其餘空白僅 NFKC 摺疊＋首尾 trim）。
  * - Gzip：解壓同樣受位元組上限約束
  *  （bomb：小壓縮、大解壓 → `TOO_LARGE` fail-closed）；非 gzip 卻標 gzip
  *   或解壓失敗 → `BAD_RESPONSE`。
@@ -117,7 +118,9 @@ internal class DeadlineExceededException : RuntimeException()
  *   收到該 Ok 而非 CANCELLED。
  * - 內容：`title/url/snippet/published/siteName` 正規化（HTML-family 見 [parseHtml]：
  *   tag 剝除＋entity unescape；非 HTML-family 已放行型別走 raw-text 管線，
- *   不刪 tag、不 unescape，raw `&` 原樣保留，見 [pipelineOf]），全經 [WebContentEnvelope.cleanField]（`nfkc → strip → sanitize` 定點）清理；模型可見體為
+ *   不刪 tag、不 unescape，raw `&` 原樣保留，見 [pipelineOf]；raw-text 保留原文
+ *   行結構與內部連續空白——`\n`／`\t` 保留、`\r` 為 Cc 故移除，其餘空白字元僅經
+ *   NFKC 摺疊與首尾 trim，不做 \s+ → " " 收斂），全經 [WebContentEnvelope.cleanField]（`nfkc → strip → sanitize` 定點）清理；模型可見體為
  *   [WebContentEnvelope.wrap] 單層 envelope；各欄位另受硬上限約束
  *  （title 500／siteName 253／url 2048／published 128，皆 surrogate 安全截斷）。
  * - 偽造 marker 定點清理：`title/snippet/published` 皆經
@@ -1241,13 +1244,13 @@ class WebExtractService(
             // 管線（不刪 tag、不 unescape；raw `&` 原樣保留）。
             // RawText 不使用 parser 輸入前綴 cap（inputCapped=false）；
             // 其工作量由 bytes 上限與 deadline 約束。
+            // raw-text snippet 保留原文之行結構與內部連續空白：僅經
+            // [WebContentEnvelope.cleanField]（去 Cf／（\n／\t 以外之）Cc／EXTRA_STRIP，
+            // `\r` 為 Cc 故移除；NFKC 摺疊）再首尾 trim——不做 \s+ → " " 收斂。
             val parsed = when (pipelineOf(contentType)) {
                 Pipeline.Html -> parseHtml(decoded, normalized, deadlineNs)
                 Pipeline.RawText -> {
-                    val snippet = HtmlExtract.Spaces.replace(
-                        WebContentEnvelope.cleanField(decoded, deadlineNs),
-                        " ",
-                    ).trim()
+                    val snippet = WebContentEnvelope.cleanField(decoded, deadlineNs).trim()
                     if (snippet.isEmpty()) {
                         // snippet 清成空白 → BAD_RESPONSE（鏡照 HTML 管線之契約）。
                         null
@@ -1369,8 +1372,9 @@ private fun downgradedOptInForRedirect(
 /**
  * MIME 分派管線：HTML-family 走 HTML 管線（[parseHtml]：stripScriptAndStyle →
  * stripText → 空白收斂）；其餘已放行型別走 raw-text 管線
- * （`decoded → cleanField → Spaces.replace → trim`；不刪 tag、不 unescape，
- * raw `&` 原樣保留）。
+ * （`decoded → cleanField → trim`；不刪 tag、不 unescape，raw `&` 原樣保留；
+ * 保留原文行結構與內部連續空白——`\n`／`\t` 保留、`\r` 為 Cc 故移除，其餘空白
+ * 僅經 NFKC 摺疊與首尾 trim）。
  */
 internal enum class Pipeline { Html, RawText }
 

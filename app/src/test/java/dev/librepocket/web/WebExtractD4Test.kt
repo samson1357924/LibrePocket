@@ -2074,6 +2074,49 @@ class WebExtractD4Test {
         assertEquals(WebExtract.DETAIL_BAD_RESPONSE, (out as WebExtractOutcome.Failed).detail)
     }
 
+    @Test fun rawTextJsonDoubleSpacesPreserved() = runBlocking {
+        // raw-text 管線不做 \s+ → " " 收斂：JSON 內部連續空白原樣保留（exact 相等）
+        val dns = publicDns("example.com")
+        val http = FakeExtract {
+            WebExtractRawResponse(
+                200,
+                """{"message":"a  b"}""".toByteArray(Charsets.UTF_8),
+                mapOf("Content-Type" to "application/json"),
+            )
+        }
+        val out = WebExtractService(http).extract("https://example.com/json-dc", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals("""{"message":"a  b"}""", out.content.snippet)
+    }
+
+    @Test fun rawTextMarkdownCodeFenceNewlinesPreserved() = runBlocking {
+        // raw-text 管線保留原文行結構：code fence 的換行與縮排原樣保留（exact 相等）
+        val dns = publicDns("example.com")
+        val body = "# H\n```\ncode  line\n  indented\n```\n"
+        val http = FakeExtract {
+            WebExtractRawResponse(
+                200,
+                body.toByteArray(Charsets.UTF_8),
+                mapOf("Content-Type" to "text/markdown; charset=utf-8"),
+            )
+        }
+        val out = WebExtractService(http).extract("https://example.com/md-fence", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals("# H\n```\ncode  line\n  indented\n```", out.content.snippet)
+    }
+
+    @Test fun rawTextTabAndInternalSpaceRunsPreserved() = runBlocking {
+        // raw-text 管線：\t 與內部連續空白原樣保留（exact 相等）
+        val dns = publicDns("example.com")
+        val http = FakeExtract {
+            WebExtractRawResponse(
+                200,
+                "a\tb  c".toByteArray(Charsets.UTF_8),
+                mapOf("Content-Type" to "text/plain; charset=utf-8"),
+            )
+        }
+        val out = WebExtractService(http).extract("https://example.com/tab-runs", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals("a\tb  c", out.content.snippet)
+    }
+
     @Test fun webExtractDefaultsStayConstant() {
         // 常數釘死：預設不得在未經審查的 commit 中變動
         assertEquals(4L * 1024 * 1024, WebExtract.MAX_CACHE_BYTES)

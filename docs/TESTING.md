@@ -119,6 +119,16 @@ preflight, the pinned, hash-checked `PyYAML==6.0.3` install from
 --only-binary=:all:`, `PIP_BREAK_SYSTEM_PACKAGES=1`), the checker and the
 harness, plus the always-on `Pins-absence tripwire (Issue #12)` step that
 runs `CommittedPinsAbsenceControl` on every PR — with a five-minute timeout.
+The control rejects tracked paths with a `signer_pins`/`signer-pins` path
+component (marker-path predicate, filename-agnostic beyond those markers) and
+additionally content-scans every non-symlink tracked file of at most 64 KiB whose raw
+bytes are UTF-8 JSON objects (first non-whitespace byte `{`, with a UTF-8 BOM
+peeled first) for registry-shaped `play`/`foss`/`github` entries — exactly
+`{"package", "cert_sha256"}` with a dotted package and a 64-hex cert —
+regardless of filename. BOM'd files are scanned; a duplicate-key entry is
+flagged when at least one occurrence matches the cert/package shape; content
+that never parses is out of scope like history; registries that existed only
+in history remain out of scope.
 `--no-deps --only-binary=:all:` keeps
 pip from resolving transitive dependencies or building a local sdist/wheel
 before the checker runs, and the shadow preflight byte-pins

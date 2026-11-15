@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import shutil
@@ -119,6 +120,119 @@ def _load_example_strict() -> object:
     invisible to the sentinel check).
     """
     return _strict_loads(PINS_EXAMPLE.read_text(encoding="utf-8"))
+
+
+def _pairs_collect(pairs: list) -> dict:
+    """``object_pairs_hook`` that keeps every occurrence of each key.
+
+    Builds ``{key: [value, ...]}`` in order of appearance instead of collapsing
+    duplicates last-wins, so a duplicate-key entry can be inspected
+    occurrence by occurrence.
+    """
+    out: dict = {}
+    for key, value in pairs:
+        out.setdefault(key, []).append(value)
+    return out
+
+
+def _dup_aware_loads(text: str) -> object:
+    """Parse JSON keeping every occurrence of every object key (see ``_pairs_collect``)."""
+    return json.loads(text, object_pairs_hook=_pairs_collect)
+
+
+def _registry_shape_offender_from_occurrences(data: object) -> bool:
+    """Flag registry-shaped entries in a duplicate-occurrence parse tree.
+
+    ``data`` is the result of ``_dup_aware_loads``: every object maps each key
+    to the list of all values seen at that key. A strict-parse failure means
+    duplicate keys somewhere in the text (or that the text is not JSON at all,
+    which the caller already maps to False); this scan then flags a
+    ``play``/``foss``/``github`` entry iff:
+
+    - its distinct keyset is exactly ``{"package", "cert_sha256"}`` — the only
+      keys are ``package`` and ``cert_sha256``, possibly duplicated, and
+    - at least one ``cert_sha256`` occurrence matches ``signer_pins._CERT_RE``
+      (a full 64 hex chars, either case), and
+    - at least one ``package`` occurrence matches ``signer_pins._PACKAGE_RE``,
+
+    regardless of which occurrence a last-wins collapse would keep. Well-formed
+    files never reach this branch.
+    """
+    if not isinstance(data, dict):
+        return False
+    for flavor in ("play", "foss", "github"):
+        occurrences = data.get(flavor)
+        if not isinstance(occurrences, list):
+            continue
+        for entry in occurrences:
+            if not isinstance(entry, dict):
+                continue
+            if set(entry) != {"package", "cert_sha256"}:
+                continue
+            certs = entry["cert_sha256"]
+            packages = entry["package"]
+            if not isinstance(certs, list) or not isinstance(packages, list):
+                continue
+            if any(isinstance(c, str) and signer_pins._CERT_RE.fullmatch(c) for c in certs):
+                if any(isinstance(p, str) and signer_pins._PACKAGE_RE.fullmatch(p) for p in packages):
+                    return True
+    return False
+
+
+def _registry_shape_offender(text: str) -> bool:
+    """Content-based registry-shape scan for the pins-absence tripwire.
+
+    Returns True iff ``text`` parses as JSON whose top-level dict contains at least
+    one flavor key (``play``/``foss``/``github``) whose value is exactly
+    ``{"package": <str>, "cert_sha256": <str>}`` with the package matching
+    ``signer_pins._PACKAGE_RE`` and the cert matching ``signer_pins._CERT_RE``
+    (a full 64 hex chars, either case — neither value is lowercased first).
+
+    The duplicate-key interplay is deliberate: a file that strict parsing rejects
+    (duplicate keys anywhere in the text — a well-formed file never fails the
+    strict parse) is retried with ``_dup_aware_loads``, which keeps every
+    occurrence of each key. A duplicate-key entry is registry-shaped when its
+    only keys — possibly duplicated — are ``package`` and ``cert_sha256`` and at
+    least one occurrence of EACH matches the respective regex; a cert occurrence
+    that is 64 hex counts even when a later duplicate key shadows it behind a
+    sentinel. This is exactly the smuggling shape a strict-only scan (or a
+    last-wins collapse) would wave through, and it is why the lenient fallback
+    exists instead of returning False on strict failure. Well-formed files never
+    reach this branch.
+
+    No filename is involved: a real registry committed under an unrelated name
+    (e.g. ``configs/release_pins.json``) is content-flagged here. The canonical
+    sentinel example is not an offender (its certs are ``PUT_REAL_...`` sentinels,
+    which never match ``[0-9A-Fa-f]{64}``); if someone ever puts a real 64-hex
+    cert in it, this scan MUST flag it — there is no exemption.
+    """
+    try:
+        data = _strict_loads(text)
+    except Exception:
+        # Any strict-parse failure (ValueError/JSONDecodeError/RecursionError/...)
+        # falls back to the duplicate-aware parse so duplicate keys cannot hide a
+        # 64-hex cert behind a later sentinel; see the docstring for why.
+        try:
+            data = _dup_aware_loads(text)
+        except Exception:
+            return False  # not JSON at all
+        return _registry_shape_offender_from_occurrences(data)
+    if not isinstance(data, dict):
+        return False
+    for flavor in ("play", "foss", "github"):
+        if flavor not in data:
+            continue
+        value = data[flavor]
+        if not isinstance(value, dict):
+            continue
+        if set(value) != {"package", "cert_sha256"}:
+            continue
+        package, cert = value["package"], value["cert_sha256"]
+        if not isinstance(package, str) or not isinstance(cert, str):
+            continue
+        if signer_pins._PACKAGE_RE.fullmatch(package) and signer_pins._CERT_RE.fullmatch(cert):
+            return True
+    return False
 
 
 FLAVORS = ("play", "foss", "github")
@@ -1257,6 +1371,101 @@ class SignerPinRegistryTest(unittest.TestCase):
         self.assertFalse(_forbidden_signer_pins_path("docs/TESTING.md"))
         self.assertFalse(_forbidden_signer_pins_path("scripts/release_signer_pins.example.json"))
 
+    def test_registry_shape_offender_true_cases(self) -> None:
+        canonical_packages = {
+            "play": "dev.librepocket.agent",
+            "foss": "dev.librepocket.agent.foss",
+            "github": "dev.librepocket.agent.github",
+        }
+        one_registry = {
+            "play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16},
+        }
+        full_registry = {
+            flavor: {"package": package, "cert_sha256": "ab12" * 16}
+            for flavor, package in canonical_packages.items()
+        }
+        duplicate_cert = (
+            "{\n"
+            '  "play": {\n'
+            '    "package": "dev.librepocket.agent",\n'
+            f'    "cert_sha256": "{"aa" * 32}",\n'
+            f'    "cert_sha256": "{"ab12" * 16}"\n'
+            "  }\n"
+            "}\n"
+        )
+        # Mirror of the duplicate_cert case with the occurrences swapped: the
+        # 64-hex cert comes FIRST and a sentinel comes LAST. A last-wins
+        # collapse would yield the sentinel and miss this registry; the
+        # duplicate-aware scan MUST flag it because an earlier occurrence
+        # matches the cert shape.
+        all_sentinel_collapse = (
+            "{\n"
+            '  "play": {\n'
+            '    "package": "dev.librepocket.agent",\n'
+            f'    "cert_sha256": "{"aa" * 32}",\n'
+            '    "cert_sha256": "PUT_REAL_64_HEX_PIN_HERE_FOR_PLAY"\n'
+            "  }\n"
+            "}\n"
+        )
+        cases = {
+            "minimal single-flavor registry": json.dumps(one_registry),
+            "full three-flavor registry": json.dumps(full_registry, indent=2),
+            # Lenient collapse: strict parsing rejects the duplicate key, but plain
+            # json.loads keeps the last cert_sha256, yielding the canonical
+            # registry shape with a 64-hex cert — this MUST be flagged.
+            "lenient-collapse duplicate-key registry": duplicate_cert,
+            # Lenient fallback occurrence scan: an earlier 64-hex cert is shadowed
+            # by a later sentinel duplicate key; last-wins collapse would yield the
+            # sentinel and miss it — this MUST be flagged.
+            "all-sentinel-collapse duplicate-key registry": all_sentinel_collapse,
+            # The helper takes only text — no filename is involved, so a registry
+            # committed under an unrelated name is content-flagged regardless of it.
+            "registry-shaped text under an unrelated filename": json.dumps(one_registry),
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                self.assertTrue(_registry_shape_offender(text), name)
+
+    def test_registry_shape_offender_false_cases(self) -> None:
+        canonical_example = (
+            PINS_EXAMPLE.read_bytes().decode("utf-8")  # raw bytes for the scanner, not a sentinel gate
+        )
+        cases = {
+            "canonical on-disk example": canonical_example,
+            "sentinel placeholder cert": json.dumps(
+                {"play": {"package": "dev.librepocket.agent", "cert_sha256": "PUT_REAL_64_HEX_PIN_HERE_FOR_PLAY"}}
+            ),
+            "packages array instead of flavor keys": json.dumps(
+                {"packages": [{"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16}]}
+            ),
+            "package-lock shape": json.dumps({"lockfileVersion": 3, "packages": {}}),
+            "non-64-hex certs": json.dumps(
+                {
+                    "github": {"package": "dev.librepocket.agent.github", "cert_sha256": "xy"},
+                    "foss": {"package": "dev.librepocket.agent.foss", "cert_sha256": "zz" * 32},
+                }
+            ),
+            "not json at all": "not json at all {{{",
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                self.assertFalse(_registry_shape_offender(text), name)
+
+    def test_path_predicate_and_content_scan_compose_for_unmarked_filenames(self) -> None:
+        # This pair documents how the two controls close the gap together: the path
+        # predicate is filename-scoped (this file passes it), while the content scan
+        # flags its registry-shaped bytes regardless of the name it is committed under.
+        self.assertFalse(_forbidden_signer_pins_path("configs/release_pins.json"))
+        release_pins_content = json.dumps(
+            {
+                "play": {"package": "dev.librepocket.agent", "cert_sha256": "cd" * 32},
+                "foss": {"package": "dev.librepocket.agent.foss", "cert_sha256": "cd" * 32},
+                "github": {"package": "dev.librepocket.agent.github", "cert_sha256": "cd" * 32},
+            },
+            indent=2,
+        )
+        self.assertTrue(_registry_shape_offender(release_pins_content))
+
     def test_checked_in_example_contains_only_sentinel_placeholders(self) -> None:
         example = _load_example_strict()
         _assert_example_sentinel(example)
@@ -1307,9 +1516,8 @@ class SignerPinRegistryTest(unittest.TestCase):
         without a strict parse the byte-level "example stays placeholder-only"
         guarantee would be void.
         """
-        canonical_text = PINS_EXAMPLE.read_text(encoding="utf-8")
         # Strictly loaded baseline used only to build comparison values for this test.
-        canonical = _strict_loads(canonical_text)
+        canonical = _load_example_strict()
         synthetic_cert = "ab" * 32  # 64 hex chars, certificate-fingerprint-shaped
 
         def flavor_block(name: str, entry: dict) -> str:
@@ -1367,6 +1575,34 @@ class SignerPinRegistryTest(unittest.TestCase):
         self.assertEqual(json.loads(variant_ii), canonical)
         # The canonical on-disk example still passes the strict loader and the sentinel.
         _assert_example_sentinel(_load_example_strict())
+
+    def test_sentinel_example_reads_route_through_strict_loader(self) -> None:
+        """Guard the specific regression: PINS_EXAMPLE must be read only via ``_load_example_strict``.
+
+        Scans this module's own source: exactly one line may call the example's
+        ``read_text`` — inside ``_load_example_strict`` — so no assertion path can
+        parse the example with a loader that tolerates duplicate keys. This guards
+        the specific regression: PINS_EXAMPLE must be read only via
+        ``_load_example_strict``; it does not prove absence of every conceivable
+        alternate parse path.
+        """
+        module = sys.modules[__name__]
+        source_lines = inspect.getsource(module).splitlines()
+        needle = "PINS_EXAMPLE" + ".read_text("
+        hits = [index for index, line in enumerate(source_lines) if needle in line]
+        self.assertEqual(
+            len(hits),
+            1,
+            f"{needle} must appear exactly once (inside _load_example_strict); "
+            f"found {len(hits)} occurrence(s) at lines {[index + 1 for index in hits]}",
+        )
+        enclosing = None
+        for line in reversed(source_lines[: hits[0] + 1]):
+            stripped = line.strip()
+            if stripped.startswith("def "):
+                enclosing = stripped[len("def "):].split("(", 1)[0]
+                break
+        self.assertEqual(enclosing, "_load_example_strict")
 
     def test_unknown_flavor_is_rejected(self) -> None:
         path = self._write(
@@ -2512,13 +2748,21 @@ class CommittedPinsAbsenceControl(unittest.TestCase):
     and asserts no pins-shaped registry is present in it. A registry added and removed
     within one PR leaves fingerprints in merge history and is deliberately out of this
     control's scope (review-time responsibility); this control does not and cannot block
-    registries that only ever lived in history.
+    registries that only ever lived in history. Beyond the filename predicate above, the
+    control also content-scans every non-symlink tracked file of at most 64 KiB whose
+    raw bytes (with a UTF-8 BOM peeled, if any) decode as UTF-8 and whose first
+    non-whitespace byte is `{`, rejecting any whose JSON shape matches a signer-pins
+    registry (`play`/`foss`/`github` keys mapping to exactly `{"package", "cert_sha256"}`
+    string entries with a dotted package and a 64-hex cert; a duplicate-key entry is
+    flagged when at least one occurrence matches the cert/package shape) — regardless
+    of filename.
     The checked-in example's sentinel placeholder content is asserted on every PR too,
     so a placeholder file that drifts from the canonical sentinel shape fails here even
     without the policy-filtered suites. The example is parsed duplicate-key-strictly
     (via `_load_example_strict`), so duplicate JSON keys cannot smuggle
     certificate-like material past that assertion.
-    Fail-closed if git is unavailable.
+    Fail-closed if git is unavailable, and fail-closed if a tracked file that should
+    exist cannot be stat'ed or read.
     Runs unconditionally in the `workflow-guard` job of `pr-check.yml` on every PR (and additionally in the policy harness on policy-filtered diffs).
     """
 
@@ -2546,6 +2790,48 @@ class CommittedPinsAbsenceControl(unittest.TestCase):
             [],
             "production signer-pin registry must never be committed; only "
             "scripts/release_signer_pins.example.json is permitted: " + ", ".join(offenders),
+        )
+        # Content scan: filename-agnostic registry-shape detection. A non-symlink
+        # tracked file at most 64 KiB whose raw bytes decode UTF-8 and whose first
+        # non-whitespace byte (after peeling a UTF-8 BOM, if any) is `{` (registry
+        # JSON is an object) is parsed and checked for the registry shape, whatever
+        # its name. A tracked file that cannot be stat'ed or read means the checkout
+        # is broken — fail closed rather than skip. Tracked symlinks are skipped
+        # here (the path predicate above still applies; the pins validator rejects
+        # symlinks). Zero-size files fail the first-byte check and are skipped.
+        content_offenders = []
+        for rel in tracked:
+            path = ROOT / rel
+            # Tracked symlink: skip the content scan (the path predicate above
+            # still applies; check_release_pins.load_pins rejects symlinks).
+            if path.is_symlink():
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError as exc:
+                self.fail(f"tracked file {rel!r} cannot be stat'ed (broken checkout?): {exc}")
+            if size > 64 * 1024:
+                continue
+            try:
+                raw = path.read_bytes()
+            except OSError as exc:
+                self.fail(f"tracked file {rel!r} cannot be read (broken checkout?): {exc}")
+            # Peel a UTF-8 BOM for the first-non-whitespace `{` check and evaluate
+            # the BOM-free body; BOM'd files stay in scope.
+            body = raw[3:] if raw.startswith(b"\xef\xbb\xbf") else raw
+            if body.lstrip()[:1] != b"{":
+                continue
+            try:
+                text = body.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if _registry_shape_offender(text):
+                content_offenders.append(rel)
+        self.assertEqual(
+            sorted(content_offenders),
+            [],
+            "production signer-pin registry shape found in tracked file(s) "
+            "(content scan, filename-agnostic): " + ", ".join(sorted(content_offenders)),
         )
         # The sentinel example itself is asserted on every PR, unconditionally.
         # The example is parsed duplicate-key-strictly, so hidden duplicate keys

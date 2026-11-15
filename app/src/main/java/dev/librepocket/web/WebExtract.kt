@@ -228,6 +228,14 @@ object WebExtract {
     const val TIMEOUT_MS = 15_000L
 
     /**
+     * epoch-namespaced election 之有界重試上限：入口捕獲之 epoch 於 policy preflight 後、
+     * election 臨界區內被判定漂移（期間發生過 `invalidate()`）時，重捕新世代並重走完整
+     * policy／DNS cycle；超過此上限（3）即 fail-closed `Failed(TRANSPORT)`。
+     * 初始嘗試 + 3 次重試＝最多 4 次 gate 評估。
+     */
+    internal const val MAX_STALE_RESTARTS = 3
+
+    /**
      * `truncated` 時 envelope 內文尾端之 sentinel 前綴（精確 `"[...TRUNCATED"`）；
      * 尾端完整形如 `[...TRUNCATED AT $N CHARS]`。Phase-2 測試可據此斷言。
      *
@@ -631,6 +639,11 @@ class WebExtractCache(
  *   （[WebExtract.TIMEOUT_MS]）約束，完成／失敗即出 map；與 `WebSearchService`
  *   同姿態（不為 inFlight 另設容量上限）；`invalidate()` 會 drain 所有在途
  *   entries（以 `CancellationException` 例外完成，follower 映射 `Unavailable(CANCELLED)`）。
+ *   in-flight 條目以**世代（epoch）命名空間化**：entry 攜帶建立時之 cache
+ *   generation；入口於 policy preflight **之後**、election 臨界區內重檢 generation，
+ *   世代已變即不建立／不加入陳舊條目、改為有界重試（見 `extract()` KDoc 之
+ *   epoch-namespaced election）；invalidate 之後的呼叫不可能加入 invalidate 之前
+ *   建立的 entry。
  * - 取消／`Failed`／`Unavailable` 一律不寫快取。
  */
 class WebExtractService(
@@ -658,23 +671,37 @@ class WebExtractService(
      * - leader 於 drain 之後完成者：其 `Ok` 仍正常返回給它自己的 caller，
      *   但 cache 寫入被 epoch guard 抑制；follower 因 `m.complete(outcome)`
      *   對已例外完成的 deferred 無效而只見 CancellationException。
+     * - NonCancellable：整個撤銷流程（clear＋drain）包在 `withContext(NonCancellable)`
+     *   內——呼叫端自身被取消不得中斷撤銷（半撤銷狀態是不可接受的）；
+     *   drain 對所有 pending entries 例外完成，follower 映射 `Unavailable(CANCELLED)`。
      *
      * resolver／政策變更後必須 `invalidate()`（或 bump `configRevision`）重綁，
      * 否則舊解析之內容仍會命中（重驗無法區分 resolver/endpoint 身份）。
      */
     suspend fun invalidate() {
-        cache.clear()
-        mutex.withLock {
-            val pending = inFlight.values.toList()
-            inFlight.clear()
-            pending.forEach {
-                it.completeExceptionally(CancellationException("web.extract invalidated"))
+        // 撤銷不得被呼叫端之取消中斷：cache.clear()＋mutex drain 必須完整落地。
+        withContext(NonCancellable) {
+            cache.clear()
+            mutex.withLock {
+                val pending = inFlight.values.toList()
+                inFlight.clear()
+                pending.forEach { entry ->
+                    entry.deferred.completeExceptionally(CancellationException("web.extract invalidated"))
+                }
             }
         }
     }
 
+    /**
+     * in-flight 條目：以建立時之 cache generation（epoch）命名空間化。
+     * election 臨界區內以 `entry.epoch == epochAtEntry` 判 join；世代不符之
+     * 條目不得被 join，而是就地插入新世代條目（舊 leader 仍持有其 deferred
+     * 完成給自己的 caller；僅 map 中的入口改掛新世代）。
+     */
+    private data class InFlightEntry(val epoch: Long, val deferred: CompletableDeferred<WebExtractOutcome>)
+
     private val mutex = Mutex()
-    private val inFlight: MutableMap<String, CompletableDeferred<WebExtractOutcome>> = mutableMapOf()
+    private val inFlight: MutableMap<String, InFlightEntry> = mutableMapOf()
 
     /**
      * 單 URL 抽取（cache＋single-flight＋逐跳政策）。
@@ -684,6 +711,17 @@ class WebExtractService(
      * 禁止直連；`SystemHostResolver` 僅供純 JVM fixture 測試。
      * OkHttp adapter 須讓 `resolvedAddresses` 釘住建連，rebind 視新決策重驗
      * （S2 契約）。
+     *
+     * Epoch-namespaced election（#138 Phase 1 / #2 revocation race 修復）：
+     * election（`mutex` 臨界區）之**第一**動作是以入口捕獲之 `epochAtEntry`
+     * 重讀 cache 世代；世代已變（期間發生過 `invalidate()`）即不建立／不加入
+     * 條目，改為**有界重試**——`staleRestarts` 每次重試 +1，超過 3 次即
+     * fail-closed `Failed(TRANSPORT)`（絕不 fallback 為陳舊內容、絕不無界重試）；
+     * 重試時以當下世代重捕 `epochAtEntry` 並重新走完整 policy／DNS cycle
+     * （含 key 重算）。入口（epochAtEntry 捕獲點）至 election 之間被
+     * invalidate 的請求因此**不會**在 invalidate 之後建立陳舊世代的 inFlight 條目。
+     * follower 映射語義不變：leader drain 時 pending 者見
+     * `Unavailable(CANCELLED)`；leader 於 drain 前已完整產出 Ok 者 follower 照收。
      */
     suspend fun extract(
         rawUrl: String,
@@ -703,7 +741,10 @@ class WebExtractService(
         // 入口捕獲 cache generation epoch：leader 完成時若 epoch 已變
         //（期間發生過 invalidate()/clear()），抑制本次 cache 寫入
         //（caller 自身仍正常拿到 outcome；僅 cache write 被抑制）。
-        val epochAtEntry = cache.currentGeneration
+        // 有界重試：epoch-namespaced election 偵測到世代漂移時重捕重試；
+        // 超過 MAX_STALE_RESTARTS（3）次即 fail-closed Failed(TRANSPORT)。
+        var epochAtEntry = cache.currentGeneration
+        var staleRestarts = 0
         val hop0 = stripFragment(rawUrl.trim())
         while (true) {
             // per-call 政策重驗（含 DNS preflight），fail-closed；必須在 cache／
@@ -750,19 +791,42 @@ class WebExtractService(
             var lateHit: WebExtractOutcome.Ok? = null
             var mine: CompletableDeferred<WebExtractOutcome>? = null
             var leader = false
+            var stale = false
             mutex.withLock {
+                // epoch-namespaced election：先以入口捕獲之 epoch 重讀 cache 世代。
+                // 世代已變 → 不建立／不加入任何條目（留在鎖內、零寫入），
+                // 由鎖外以新 epoch 有界重試。此檢查與 entry 插入同一臨界區，
+                // invalidate() 的 clear()＋drain 亦在同一世代命名空間下原子生效。
                 lateHit = cache.getByKey(k, epochAtEntry)
                 if (lateHit == null) {
-                    val existing = inFlight[k]
-                    if (existing != null) {
-                        mine = existing
+                    if (cache.currentGeneration != epochAtEntry) {
+                        stale = true
                     } else {
-                        val fresh = CompletableDeferred<WebExtractOutcome>()
-                        mine = fresh
-                        inFlight[k] = fresh
-                        leader = true
+                        val existing = inFlight[k]
+                        if (existing != null && existing.epoch == epochAtEntry) {
+                            mine = existing.deferred
+                        } else {
+                            // 無條目，或條目世代不符（例如共享 cache 被其他 service
+                            // clear 而本 service 未 drain）→ 插入當前世代的新條目；
+                            // 陳舊世代條目不得被 join。
+                            val fresh = CompletableDeferred<WebExtractOutcome>()
+                            mine = fresh
+                            inFlight[k] = InFlightEntry(epochAtEntry, fresh)
+                            leader = true
+                        }
                     }
                 }
+            }
+            if (stale) {
+                // election 被 invalidate 競態打敗：放棄本輪（不寫 cache、不建立
+                // 條目），以新世代重走完整 policy／DNS cycle；超過上限即
+                // fail-closed TRANSPORT。
+                staleRestarts += 1
+                if (staleRestarts > WebExtract.MAX_STALE_RESTARTS) {
+                    return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
+                }
+                epochAtEntry = cache.currentGeneration
+                continue
             }
             lateHit?.let { return it }
             val m = mine ?: error("extract() invariant violated: no in-flight entry elected")
@@ -848,7 +912,7 @@ class WebExtractService(
             } finally {
                 withContext(NonCancellable) {
                     mutex.withLock {
-                        if (inFlight[k] === m) inFlight.remove(k)
+                        if (inFlight[k]?.deferred === m) inFlight.remove(k)
                     }
                 }
             }

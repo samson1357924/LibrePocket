@@ -30,7 +30,7 @@ import org.junit.Test
 /**
  * D4 `web.extract` fixture tests（#138 D4；全 fake，零真網）。
  *
- * - 命中快取零 upstream／metadata 擋／redirect-to-loopback 擋／
+ * - 命中快取（當次政策重驗（含 DNS preflight）仍執行；HTTP upstream 不觸）／metadata 擋／redirect-to-loopback 擋／
  *   https→http 永遠拒／超跳／大 body／gzip bomb fail-closed／
  *   超限 TOO_LARGE 與 malformed 區分／取消不寫 cache／
  *   偽造 envelope 剝除／bidi 清理。
@@ -122,7 +122,7 @@ class WebExtractD4Test {
         headers: Map<String, String> = mapOf("Content-Type" to "text/html; charset=utf-8"),
     ) = WebExtractRawResponse(code, body.toByteArray(Charsets.UTF_8), headers)
 
-    // ---- 命中：第二次零 upstream、cached=true ----
+    // ---- 命中：第二次 cached=true（當次政策重驗仍執行；HTTP upstream 不觸）----
 
     @Test fun extractHitSecondCallZeroUpstream() = runBlocking {
         val dns = publicDns("example.com")
@@ -148,7 +148,7 @@ class WebExtractD4Test {
     @Test fun cacheHitCrossResolverSameRevisionDenied() = runBlocking {
         // 同 URL + 同 policy + 同 revision，resolver A（公網）命中後，
         // resolver B（metadata 位址）之第二次呼叫不得命中快取；
-        // per-call 重驗必須先擋下（METADATA_ADDRESS_BLOCKED），零 upstream。
+        // per-call 重驗必須先擋下（METADATA_ADDRESS_BLOCKED），HTTP upstream 不觸。
         val dnsA = publicDns("split.example")
         val dnsB = fakeDns("split.example" to listOf("169.254.169.254"))
         val http = FakeExtract { okResp(html()) }
@@ -534,7 +534,7 @@ class WebExtractD4Test {
         val t0 = now
         val first = svc.extract("https://example.com/ttl", resolver = dns) as WebExtractOutcome.Ok
         assertFalse(first.cached)
-        // TTL-1ms：仍在有效期內，命中零 upstream
+        // TTL-1ms：仍在有效期內，命中（當次政策重驗仍執行；HTTP upstream 不觸）
         now = t0 + WebExtract.DEFAULT_TTL_MS - 1
         val second = svc.extract("https://example.com/ttl", resolver = dns) as WebExtractOutcome.Ok
         assertTrue("t+TTL-1 應命中快取", second.cached)
@@ -618,7 +618,7 @@ class WebExtractD4Test {
         val other = svc.extract("https://lan.example/rev", optIn = rev1, resolver = dns) as WebExtractOutcome.Ok
         assertFalse(other.cached)
         assertEquals(2, http.calls.get())
-        // 雙向隔離：rev0 第三次重打應命中第一次的 rev0 條目（key 不變），零上游
+        // 雙向隔離：rev0 第三次重打應命中第一次的 rev0 條目（key 不變；當次政策重驗仍執行；HTTP upstream 不觸）
         val again = svc.extract("https://lan.example/rev", optIn = rev0, resolver = dns) as WebExtractOutcome.Ok
         assertTrue(again.cached)
         assertEquals(2, http.calls.get())
@@ -638,7 +638,7 @@ class WebExtractD4Test {
         cache.put(url, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, first.copy(cached = true))
         val got = cache.get(url, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn)
         assertTrue("get 回傳一律 cached=true", got != null && got.cached)
-        // 全新 service 共享同一 cache：第二輪必為 cached=true，零上游
+        // 全新 service 共享同一 cache：第二輪必為 cached=true（當次政策重驗仍執行；HTTP upstream 不觸）
         val svc2 = WebExtractService(http, cache = cache)
         val served = svc2.extract(url, resolver = dns) as WebExtractOutcome.Ok
         assertTrue(served.cached)
@@ -703,7 +703,7 @@ class WebExtractD4Test {
         follower.cancelAndJoin()
         val leaderOut = withTimeout(5_000) { leader.await() }
         assertTrue("leader 不應受 follower 取消影響", leaderOut is WebExtractOutcome.Ok)
-        // leader 完成後寫入快取；下一輪命中、零 upstream、calls 仍為 1
+        // leader 完成後寫入快取；下一輪命中（當次政策重驗仍執行；HTTP upstream 不觸）、calls 仍為 1
         val next = withTimeout(5_000) {
             svc.extract("https://example.com/fc", resolver = dns) as WebExtractOutcome.Ok
         }
@@ -763,7 +763,7 @@ class WebExtractD4Test {
 
     @Test fun preflightTimeoutMapsToFailedTimeoutNoUpstream() = runBlocking {
         // DNS resolver 阻斷（模擬惡意／失聯 nameserver）：preflight 受全程
-        // deadline 約束，逾時 → Failed(TIMEOUT)，零 upstream。
+        // deadline 約束，逾時 → Failed(TIMEOUT)，HTTP upstream 不觸。
         val slowResolver = dev.librepocket.policy.HostResolver {
             Thread.sleep(5_000)
             listOf(InetAddress.getByName("203.0.113.10"))
@@ -1482,7 +1482,7 @@ class WebExtractD4Test {
         // transport 收到的 URL 不得含 fragment
         assertTrue("transport 不得收到 fragment", http.urls.none { '#' in it })
         assertEquals("https://example.com/page", http.urls.first())
-        // 不同 fragment 之第二發 → 同一 cache key → 命中，零上游
+        // 不同 fragment 之第二發 → 同一 cache key → 命中（當次政策重驗仍執行；HTTP upstream 不觸）
         val second = svc.extract("https://example.com/page#frag-two", resolver = dns) as WebExtractOutcome.Ok
         assertTrue(second.cached)
         assertEquals(1, http.calls.get())

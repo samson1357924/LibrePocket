@@ -78,17 +78,23 @@ internal class DeadlineExceededException : RuntimeException()
  *   （input sentinel）；input cap 不隨 maxBytes 放大；任一發生 → truncated=true。
  * - 快取：命中（[WebExtractCache]，TTL [DEFAULT_TTL_MS] 60min；key 含 URL 去 fragment
  *   ＋`maxBytes`＋`maxModelChars`＋policy identity（`policy`＋`configRevision`），
- *   不同 policy/revision 不互撞）零 upstream、`cached=true`；
+ *   不同 policy/revision 不互撞）仍須 per-call 政策重驗（含 DNS preflight，fail-closed）；
+ *   重驗通過才回 `cached=true` 之副本，HTTP upstream 不再出發。
+ *   同 policy＋`configRevision` 不代表同一信任上下文——resolver／endpoint 為
+ *   call-scoped，key 刻意不含二者（per-call 重驗才是真正的權威）；
+ *   重驗失敗（denial／`Failed(TIMEOUT)`）不讀取快取，亦不觸 upstream。
  *   `Failed`／`Unavailable`／取消一律不寫。
  *   有界雙上限（正交）：筆數 [MAX_CACHE_ENTRIES]（200）＋位元組 [MAX_CACHE_BYTES]
  *   （4 MiB；near-weighted LRU；單筆超限不入快取）。
- *   快取命中仍須 per-call 政策重驗（含 DNS preflight），不旁路當次政策評估；
- *   不同 resolver／endpoint（同 policy＋revision 之下）不得重用結果；
- *   重驗本身不 purge 快取；授權撤銷僅能經 `invalidate()`／bump `configRevision`。
+ *   重驗本身不 purge 快取；授權撤銷僅能經 `invalidate()`（drain 在途＋世代失效）
+ *   ／bump `configRevision` 生效。
  *   rebind 時（identity＋revision 變更）呼叫方必須 `invalidate()`。
  *   跨 tier 內容永不共用。
  * - `inFlight` single-flight map：無界，但受 per-key timeout 有界（leader 受
  *   [TIMEOUT_MS] 端到端約束，逾時即完成並出 map；與 `WebSearchService` 同姿態）。
+ *   `invalidate()` bump 快取 generation epoch、清空快取，並 drain 所有在途 entry
+ *   例外完成（`CancellationException`）→ follower 映射 `Unavailable(CANCELLED)`；
+ *   invalidate 之前建立之條目／在途結果永遠無法重新出現在 cache 或 follower 路徑。
  * - `bytesKept`：`Ok.bytesKept`＝（若 gzip 解壓後之）實際位元組數；identity
  *   編碼時即 raw body 位元組數。
  * - 取消語義：外部取消（leader／呼叫方自身）原樣透傳 [CancellationException]，
@@ -98,8 +104,9 @@ internal class DeadlineExceededException : RuntimeException()
  *   follower 不得 out-fetch 已取消的 leader，不再進入單飛迴圈 refetch）；
  *   例外：leader 於取消前已完整產出 Ok（okForFollowers 路徑）者，follower
  *   收到該 Ok 而非 CANCELLED。
- * - 內容：`title/url/snippet/published/siteName` 正規化（見 [parseHtml]；
- *   raw-text 型別見 [pipelineOf]），全經 [WebContentEnvelope.cleanField]（`nfkc → strip → sanitize` 定點）清理；模型可見體為
+ * - 內容：`title/url/snippet/published/siteName` 正規化（HTML-family 見 [parseHtml]：
+ *   tag 剝除＋entity unescape；非 HTML-family 已放行型別走 raw-text 管線，
+ *   不刪 tag、不 unescape，raw `&` 原樣保留，見 [pipelineOf]），全經 [WebContentEnvelope.cleanField]（`nfkc → strip → sanitize` 定點）清理；模型可見體為
  *   [WebContentEnvelope.wrap] 單層 envelope；各欄位另受硬上限約束
  *  （title 500／siteName 253／url 2048／published 128，皆 surrogate 安全截斷）。
  * - 偽造 marker 定點清理：`title/snippet/published` 皆經
@@ -133,24 +140,25 @@ internal class DeadlineExceededException : RuntimeException()
  *    case／percent-encoding 差異會產生重複 key——只是浪費，非正確性問題）
  *    ＋`maxBytes`＋`maxModelChars`＋`policy`＋`configRevision`；**不含 port
  *    維度之語義**（port 已內含於 URL 字串，無遺失，但 D3 須確認與政策側
- *    port 處理一致）；亦**不含 resolver identity**（兩個不同 DNS 快照對同
- *    key 不可區分；快取內容可能反映舊解析至多 60min — 重綁唯一手段為
- *    `configRevision` bump 或 `WebExtractService.invalidate()`）。
+ *    port 處理一致）；亦**刻意不含 resolver／endpoint 身份**——per-call
+ *    政策重驗才是真正的權威；同一 URL 以不同 resolver 取用是允許的用法，
+ *    呼叫方每次呼叫僅多付一次 policy preflight。
  * 2. cache **不解析 `Cache-Control`（含 `no-store`）**：TTL-only，屬刻意
  *    設計（read 工具、無寫副作用）；D3 須決定 honor 或明文件化此行為。
- * 3. `cleanField` 工作已以全程 deadline 有界（parse 預算，逾時拋
- *    [DeadlineExceededException]）；迭代仍為契約上正確的定點（最壞 O(n²)
- *    輪數上界，輪數以首輪 NFKC 正規化後長度為界）；url／siteName／title
- *    fallback 係 cleanField 後才截斷 — D3 wiring 前須緩解（如 marker 計數前掃）
- *    或記錄 accept。
+ * 3. `cleanField` 已由共享 15s 全程端到端預算限界（parse→clean 管線逐層
+ *    傳入單調 deadline，超過 → [DeadlineExceededException] → `Failed(TIMEOUT)`）；
+ *    最壞 O(n²) 定點迭代之上界現由 wall budget 實際兜底（不僅靠 input cap）；
+ *    D3 仍可加 marker-count 前掃（pre-scan）進一步壓縮最壞路徑。
  * 4. envelope 僅為標記籬笆，**非授權**；D3 須另行接 `#165` consent/授權
  *    流程，envelope 不擔任 authorization 角色。
- * 5. Follower `await()` 以共享整體預算為界
- *    （`withTimeoutOrNull(deadlineNs - now)`），逾時映射 `Failed(TIMEOUT)`；
- *    follower 不再於 leader 卡於 parse／gunzip 時無界等待（與取消語義區分：
- *    leader 取消仍映射 `Unavailable(CANCELLED)`）。
+ * 5. Follower `await()` 已由同一 `withTimeoutOrNull` 預算為界，逾時映射
+ *    `Failed(TIMEOUT)`（audit 上與 `CANCELLED` 區分）；per-follower 獨立
+ *    deadline 仍為可能的 D3 強化項。
  * 6. `timeoutMs <= 0` 會被 `coerceAtLeast(1)` 收斂為 1ms 預算 — 幾乎立即
  *    fail-closed `TIMEOUT`；屬保守方向，安全可接受。
+ * 7. 位元組加權 LRU 快取上限已實作（[MAX_CACHE_BYTES] 4 MiB：near-weighted
+ *    chars×2＋固定 overhead；單筆超限之 entry 永不入快取；筆數上限
+ *    [MAX_CACHE_ENTRIES]（200）與之正交，兩者皆 enforced）。
  *
  * 純 JVM fixture 可測：transport 經 [WebExtractHttpGet] 注入，DNS 經
  * [HostResolver] 注入，時鐘經 [WebExtractCache] 注入；零真網。
@@ -195,11 +203,14 @@ object WebExtract {
      *
      * `extract()` 於入口即以單調時鐘（`System.nanoTime()`）計算全程 deadline：
      * per-call 政策重驗（含 DNS preflight）＋`extractUncached`（DNS preflight＋
-     * 各 hop 之 HTTP 請求＋解壓＋parse／cleanup）共用此單一單調預算；
-     * `extractUncached` 於解析／解壓各迴圈內、以及返回 `Ok` 前檢查該 deadline
+     * 所有 redirect hops 之 HTTP 請求＋gzip 解壓＋parse／cleanField）共用此單一
+     * 單調預算；
+     * `extractUncached` 於解壓／解析／清理各迴圈內、以及返回 `Ok` 前檢查該 deadline
      *（逾時拋 [DeadlineExceededException]，映射 `Failed(TIMEOUT)`）；
      * follower `await()` 亦以同一預算為界（`withTimeoutOrNull`，逾時映射
-     * `Failed(TIMEOUT)`）；decode 不計入 deadline，但受位元組／字元上限
+     * `Failed(TIMEOUT)`）；協程取消時 transport 必須關閉 socket（見
+     * [WebExtractHttpGet] 契約第 3 點），取消一律不寫快取；
+     * decode 不計入 deadline，但受位元組／字元上限
      * 約束（cap-bounded）；逐跳以剩餘預算執行（見 `extractUncached`）。
      */
     const val TIMEOUT_MS = 15_000L
@@ -388,16 +399,18 @@ private const val ENTRY_OVERHEAD_BYTES = 256L
  *  與 header「D3 追蹤項」#1）＋`maxBytes`
  *  ＋`maxModelChars`＋policy identity（[EndpointNetworkOptIn.policy]＋
  *  [EndpointNetworkOptIn.configRevision]）；不同預算／不同 tier／
- *  不同 revision 絕不互撞。
+ *  不同 revision 絕不互撞；key 刻意不含 resolver／endpoint 身份
+ *  （per-call 重驗才是真正的權威）。
  * - 只存 `Ok`（`Failed`／`Unavailable`／取消不寫）；寫入時 `cached` 正規化
  *   為 `false`，讀回時正規化為 `true`（快取內一律以 `cached=false` 儲存，
  *   讀出一律以 `cached=true` 呈現；[WebExtractOutcome.Ok.cached] 預設
  *   `false` 不變）。
- * - 快取命中仍須 per-call 政策重驗（含 DNS preflight）：相同 `policy`＋`configRevision`
- *  但不同 resolver／endpoint 安全上下文不得重用結果；重驗本身不 purge
+ * - 快取命中仍須 per-call 政策重驗（含 DNS preflight，fail-closed）：相同
+ *  `policy`＋`configRevision` 但不同 resolver／endpoint 安全上下文不得重用
+ *  結果；重驗失敗（denial／TIMEOUT）不讀取快取；重驗本身不 purge
  *   快取；授權撤銷僅能經 `invalidate()`／bump `configRevision` 生效；跨 tier
  *  （不同 `policy`／`configRevision`）內容永不共用。
- * - 時鐘可注入，TTL 到期 lazy 淘汰＋`put` 順手掃；有界 LRU，雙上限正交：
+ * - 時鐘可注入，TTL-only（不解析 `Cache-Control`）：TTL 到期 lazy 淘汰＋`put` 順手掃；有界 LRU（access-order，`LinkedHashMap(accessOrder=true)`），雙上限正交：
  *  筆數上限 [WebExtract.MAX_CACHE_ENTRIES]（200）＋位元組上限
  *  [WebExtract.MAX_CACHE_BYTES]（4 MiB；建構子可注入小值測試）。
  *  entry 權重（near-weighted）＝key／snippet／envelope／title／url／published／
@@ -541,8 +554,10 @@ class WebExtractCache(
  * D4 抽取服務（cache＋single-flight；取消不寫 cache）。
  *
  * 與 [WebSearchService] 同併發姿態：
- * - 命中快取 → `cached=true` 零 upstream（[WebExtractCache.getByKey] 回傳副本即
- *   正規化 `cached=true`）；快取 key 含 policy identity（`policy`＋`configRevision`）；
+ * - 命中快取 → `cached=true`（per-call 重驗通過後，[WebExtractCache.getByKey]
+ *   回傳副本即正規化 `cached=true`；HTTP upstream 不再出發，但當次政策重驗
+ *   （含 DNS preflight）仍執行）；快取 key 含 policy identity（`policy`＋`configRevision`）；
+ *   快取 key 刻意不含 resolver／endpoint 身份；重驗失敗不讀取快取；
  *   命中前仍須 per-call 政策重驗（含 DNS preflight），不同 resolver／endpoint
  *   同 policy＋revision 不得重用結果；重驗本身不 purge 快取；
  *   授權撤銷／政策變更後必須 `invalidate()`（或 bump `configRevision`）重綁，
@@ -550,7 +565,8 @@ class WebExtractCache(
  * - 同 key 併發合流（leader 打、follower `await()`；follower 取消不影響 leader）。
  * - `inFlight` map：無界，但受 per-key timeout 有界——leader 受全程 deadline
  *   （[WebExtract.TIMEOUT_MS]）約束，完成／失敗即出 map；與 `WebSearchService`
- *   同姿態（不為 inFlight 另設容量上限）。
+ *   同姿態（不為 inFlight 另設容量上限）；`invalidate()` 會 drain 所有在途
+ *   entries（以 `CancellationException` 例外完成，follower 映射 `Unavailable(CANCELLED)`）。
  * - 取消／`Failed`／`Unavailable` 一律不寫快取。
  */
 class WebExtractService(
@@ -569,7 +585,8 @@ class WebExtractService(
      *   CancellationException → 映射為 `Unavailable(DETAIL_CANCELLED, null)`
      *   （never cached）；follower 自身的取消仍以 `ensureActive()` 優先透傳。
      * - invalidate() 之後之新呼叫走完整 policy／DNS cycle（含 cache 重驗），
-     *   不得重用 invalidate 前之 in-flight 或 cache 結果。
+     *   不得重用 invalidate 前之 in-flight 或 cache 結果；cache／follower
+     *   路徑不可能洩漏撤權限內容（世代守衛）。
      * - leader 於 drain 之後完成者：其 `Ok` 仍正常返回給它自己的 caller，
      *   但 cache 寫入被 epoch guard 抑制；follower 因 `m.complete(outcome)`
      *   對已例外完成的 deferred 無效而只見 CancellationException。

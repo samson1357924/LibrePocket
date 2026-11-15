@@ -2355,7 +2355,7 @@ class WebSearchD5Test {
     @Test fun threeLevelNestingBubblesRevisionSignal() = runBlocking {
         // 三層巢狀 outerTopA／outerTopB → middle → inner → provider：
         // leader 於 HTTP 中被取消、vault 輪換 A→B；inner 的 demoting 重解析指紋不符 →
-        // 標記向上信號；middle 層吸收並以 fp(B) 重綁重執行；最外層 outerTopB 完成。
+        // 標記向上信號；middle 為 thrower（middle 的標記繼續向上信號）；outerTopB 的 leader 分支吸收並以 fp(B) 重綁重執行。
         val release = CompletableDeferred<Unit>()
         val entered = CompletableDeferred<Unit>()
         val sentTokens = CopyOnWriteArrayList<String?>()
@@ -2498,6 +2498,97 @@ class WebSearchD5Test {
         assertTrue(out2 is WebSearchOutcome.Ok)
         assertFalse("budget 耗盡不得焊死 cache 列：$out2", (out2 as WebSearchOutcome.Ok).cached)
         assertEquals(5, marker.calls.get())
+    }
+
+    @Test fun leaderMarkerArmLosesToGenuineConcurrentCancellation() = runBlocking {
+        // R6-1 delta 3（leader 側）：delegate 在同一窗口先取消自己的呼叫 context、再拋 revision 標記 →
+        // genuine cancel 必須獲勝：leader CE arm 的第一動作 ensureActive() 先於 marker 分支，
+        // caller 拿到 e !is CredentialRevisionChangedException 的 plain CE；HTTP 恰一次；marker 不得被重試。
+        val release = CompletableDeferred<Unit>()
+        val entered = CompletableDeferred<Unit>()
+        val calls = AtomicInteger(0)
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val delegate = object : WebSearchProvider {
+            override val id: String = "marker-plus-cancel"
+            override val capabilities: Set<WebCapability> = setOf(WebCapability.REQUIRES_KEY)
+            override suspend fun probe(): WebProbe = WebProbe.Ready
+            override suspend fun search(query: String, count: Int): WebSearchOutcome =
+                WebSearchOutcome.Ok(emptyList()) // 防禦性保留
+            override suspend fun credentialState(): CredentialState =
+                CredentialState.Ready(CredentialSnapshot("key-A".toCharArray(), "fp-key-A"))
+            override suspend fun searchWithSnapshot(
+                snapshot: CredentialSnapshot,
+                query: String,
+                count: Int,
+            ): WebSearchOutcome {
+                calls.incrementAndGet()
+                entered.complete(Unit)
+                release.await()
+                // 同窗口：genuine 取消 + revision 標記。
+                kotlin.coroutines.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+                throw CredentialRevisionChangedException()
+            }
+        }
+        val svc = WebSearchService(delegate, WebSearchCache())
+        val leader = async { svc.search("kotlin", 5) }
+        withTimeout(5_000) { entered.await() }
+        release.complete(Unit)
+        val e = try {
+            withTimeout(5_000) { leader.await() }
+            null
+        } catch (ex: CancellationException) {
+            ex
+        }
+        assertTrue(
+            "genuine 並發取消獲勝：必須是 plain CE 而非 revision 標記／Failed／Ok：$e",
+            e != null && e !is CredentialRevisionChangedException,
+        )
+        assertEquals(1, calls.get()) // 無重試、無第二次上游
+    }
+
+    @Test fun leaderPlainCancellationFromDelegatePropagatesRaw() = runBlocking {
+        // R6-1：leader CE arm 的最後一個 else arm（非 marker、context 未取消、ok == null）→
+        // m.completeExceptionally(e) + 原樣拋出；follower await() 亦原 instance；一次重選斷言可接受。
+        val release = CompletableDeferred<Unit>()
+        val entered = CompletableDeferred<Unit>()
+        val delegate = object : WebSearchProvider {
+            override val id: String = "plain-ce"
+            override val capabilities: Set<WebCapability> = setOf(WebCapability.REQUIRES_KEY)
+            override suspend fun probe(): WebProbe = WebProbe.Ready
+            override suspend fun search(query: String, count: Int): WebSearchOutcome =
+                WebSearchOutcome.Ok(emptyList()) // 防禦性保留
+            override suspend fun credentialState(): CredentialState =
+                CredentialState.Ready(CredentialSnapshot("key-A".toCharArray(), "fp-key-A"))
+            override suspend fun searchWithSnapshot(
+                snapshot: CredentialSnapshot,
+                query: String,
+                count: Int,
+            ): WebSearchOutcome {
+                entered.complete(Unit)
+                release.await()
+                throw CancellationException("custom-plain-ce")
+            }
+        }
+        val svc = WebSearchService(delegate, WebSearchCache())
+        val leader = async { svc.search("kotlin", 5) }
+        withTimeout(5_000) { entered.await() }
+        val follower = async(start = CoroutineStart.UNDISPATCHED) { svc.search("kotlin", 5) }
+        release.complete(Unit)
+        val le = try {
+            withTimeout(5_000) { leader.await() }
+            null
+        } catch (e: CancellationException) {
+            e
+        }
+        assertEquals("custom-plain-ce", le?.message)
+        val fe = try {
+            withTimeout(5_000) { follower.await() }
+            null
+        } catch (e: CancellationException) {
+            e
+        }
+        assertEquals("custom-plain-ce", fe?.message)
     }
 
     @Test fun genuineCancellationWinsOverRevisionRetry() = runBlocking {

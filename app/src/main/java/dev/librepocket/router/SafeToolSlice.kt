@@ -804,7 +804,7 @@ class SafeToolSlice(
             tool.project(ctxSupplier())
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             return deny(call, DenyCodes.SCOPE_DENIED, "projection unavailable")
         }
         if (projection.level != CapabilityLevel.NATIVE) {
@@ -817,13 +817,22 @@ class SafeToolSlice(
             policy.evaluateFresh(POLICY_ACTION, tool.name).verdict
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             null
         }
         if (verdict != Verdict.ALLOW) {
             return deny(call, DenyCodes.POLICY_DENIED, verdict?.name ?: "ERROR")
         }
-        when (val gate = PrivilegeGate.check(tool, confirmed = false, projection)) {
+        // check 本身不得令 Throwable 逃逸：CE 重拋；其餘 Throwable（含 require(toolName) IAE）
+        // fail-closed → typed deny（不落後端、不洩漏例外細節）。
+        val gate = try {
+            PrivilegeGate.check(tool, confirmed = false, projection)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            return deny(call, DenyCodes.SCOPE_DENIED, "privilege gate evaluation failed")
+        }
+        when (gate) {
             is GateResult.Allowed -> Unit
             is GateResult.NeedConfirm ->
                 return deny(call, DenyCodes.NEED_CONFIRM, gate.toolName)

@@ -26,7 +26,8 @@ import kotlin.coroutines.coroutineContext
 /**
  * `shell.elevated` 接線形狀（#136-B3，JVM 可驗收部分；裝置 E2E 明確不做）。
  *
- * - executor 綁定：執行一律經 [ElevatedDispatch]（門禁先行＋凍結＋審計必行）；
+ * - executor 綁定：執行一律經 [ElevatedDispatch]（門禁先行＋凍結＋審計必行——除
+ *   CancellationException／Error 外恰一筆）；
  *   本對象只做接線形狀（每次 call 重新投影＋fresh policy＋ASK 確認＋不可變快照＋
  *   確認後 spawn 前重驗），不自建子進程、不碰真 Binder／su；
  * - 每次 call 重新投影：[ctxSupplier] 每次新鮮求值（flavor＋開關＋授權），
@@ -41,7 +42,7 @@ import kotlin.coroutines.coroutineContext
  *   reasonCode／flavor／投影開關（freeze 後的不可變有界拷貝）／grant 身份
  *   （grantProviderId／grantConfigRevision）；
  *   確認後 spawn 前重驗快照一致性（開關／flavor／已授權權限集合／grant 身份／policy 任一翻轉、
- *   argv／reason 被竄改即作廢，零 spawn）；已授權權限集合比對兩份皆為我方
+ *   argv 被竄改即作廢，零 spawn；reason 為不可變 String、入口凍結後只讀快照，不存在竄改面）；已授權權限集合比對兩份皆為我方
  *   unmodifiableSet，equals 安全有界，失敗→DENY；
  * - `ToolRegistry` 的 `shell.elevated` 維持 `executionReady=false`（B3 不翻旗——
  *   先接線形狀＋測試，翻旗是生產啟用決策，留待裝置 E2E 後；見接線測試 pin）。
@@ -63,6 +64,8 @@ import kotlin.coroutines.coroutineContext
  * - grant 有效性以 B1 `PrivilegeGrantCheck.check()`（現 B1 實作：
  *   `ShizukuGrantPolicy.check`／`ShizukuGrantStore.check`，rebase 時對齊命名）
  *   為準，本層 [ElevatedGrant.Valid] 僅為接線形狀的身份快照佔位。
+ * - [ElevatedGrant.Invalid] 的 supplier reason 不回顯於 Denied message（可能夾帶綁定錯誤細節）：
+ *   message 固定為 `grant invalid (fail-closed, no spawn)`，審計面本來就只有 hash。
  *
  * 殘餘 TOCTOU：重驗通過→spawn 之間仍有檢查→使用殘餘窗（revalidate 與 spawn
  * 非原子；無任何鎖可讓「重驗的 policy／bridge／grant／ctx」與「runner 實際
@@ -92,7 +95,9 @@ object ElevatedWiring {
      *   產品 `grantCheck` 供給責任：每次新鮮求值
      *   `{ store.check(freshProviderId, freshRevision) }` 的 blocking 包裝，
      *   `Valid` 時同時嵌入同一 emission 的身份（禁止分兩次讀 provider／revision
-     *   的撕裂混代），`Invalid` 透傳原因碼。
+     *   的撕裂混代）；
+     * - [Invalid] 的 supplier reason 不回顯於 Denied message（可能夾帶綁定錯誤細節；
+     *   message 固定為 `grant invalid (fail-closed, no spawn)`，審計面本來就只有 hash）。
      */
     sealed interface ElevatedGrant {
         data class Valid(val providerId: String, val configRevision: Long) : ElevatedGrant
@@ -147,7 +152,16 @@ object ElevatedWiring {
     private suspend fun <T> evalBounded(block: () -> T): T? {
         return try {
             withContext(Dispatchers.IO) {
-                boundedSupplierCall(block, SUPPLIER_TIMEOUT_MS)
+                try {
+                    boundedSupplierCall(block, SUPPLIER_TIMEOUT_MS)
+                } finally {
+                    // 清除池 worker（Dispatchers.IO 共享線程）上可能殘留的 interrupt flag：
+                    // 殘旗會污染下一個共用 worker 任務（github runner `isInterrupted` 契約可能被誤觸）。
+                    // 註：會一併清除外層 runInterruptible 的中斷信號——該次取消退化為 fail-closed
+                    // Denied（零 spawn、一筆 DENY）；coroutine 取消仍於下一掛起點由 job 生效。
+                    // 不改 boundedSupplierCall 本身的復位邏輯（caller-owned 線程語義保留）。
+                    Thread.interrupted()
+                }
             }
         } catch (e: CancellationException) {
             throw e
@@ -179,7 +193,14 @@ object ElevatedWiring {
      */
     private suspend fun freezeCtx(ctx: ProjectionContext): ProjectionContext? = try {
         withContext(Dispatchers.IO) {
-            boundedSupplierCall({ doFreeze(ctx) })
+            try {
+                boundedSupplierCall({ doFreeze(ctx) })
+            } finally {
+                // 清除池 worker（Dispatchers.IO 共享線程）上可能殘留的 interrupt flag：
+                // 殘旗會污染下一個共用 worker 任務（github runner `isInterrupted` 契約可能被誤觸）。
+                // 同 evalBounded：會一併清除外層 runInterruptible 中斷信號（退化為 fail-closed Denied）。
+                Thread.interrupted()
+            }
         }
     } catch (e: CancellationException) {
         throw e
@@ -230,9 +251,10 @@ object ElevatedWiring {
     private fun argvMatchesSnapshot(current: List<String>, snapshotArgv: List<String>): Boolean {
         val recheck = try {
             ElevatedRequest(current, "").frozenOrNull()
-        } catch (e: CancellationException) {
-            throw e
         } catch (_: Throwable) {
+            // frozenOrNull 內不丟 CancellationException（全 catch Throwable→null；
+            // timeout/interrupt 皆已收斂），CE 於此路徑不可達；外層 `: Throwable → false`
+            // 即 fail-closed，hostile list 的 CE 亦在 copyArgvBounded 內收斂為 null。
             null
         } ?: return false
         return recheck.argv == snapshotArgv
@@ -246,7 +268,7 @@ object ElevatedWiring {
      * F3：重驗參數竄改以有界重凍結比對，不直接對不可信 list 呼叫未受控 equals/iterator。
      * F4：ctx/bridge/grant supplier 走有界專用池（ElevatedSupplierPool，POOL_SIZE=2、零佇列、
      *   daemon；與快照池分離），caller 恆有界（get ≤ ~1.2s；get 1s＋grace 200ms；池滿即 null）；池滿或忽略 interrupt
-     *   的區塊殘留有界 2（全域上界，caller 不等殘留結束）；CE 一律重拋。projection context
+     *   的區塊殘留有界 2（全域上界，caller 不等殘留結束）；CE 重拋（supplier 面；argv 重凍結面見「審計留痕」取消語義分述）。projection context
      *   （userSwitches／grantedPermissions）亦經同池有界凍結（freezeCtx），此後所有投影／
      *   比對皆讀我方不可變拷貝。
      * F7：重驗通過後以單一 frozen snapshot 委派 executeWithFrozen（避免二次凍結）；
@@ -256,12 +278,21 @@ object ElevatedWiring {
      * F5：最終阻塞 runner 執行於 Dispatchers.IO，並經 runInterruptible 轉為 worker 執行緒
      *   interrupt；runner 具 interrupt 感知即停止；runner 不感知時殘留至其 timeoutMs，
      *   與撤權/離開頁面無保證中止——KDoc 如實記載。
+     * F5b：`timeoutMs` 超限即夾至 [ShellPolicy.MAX_ELEVATED_TIMEOUT_MS]
+     *   （fail-safe clamp，不拒絕——拒絕超過上界的誤用須另立需求）；runner 永遠收到有界預算。
      *
      * 殘餘 TOCTOU：重驗通過→spawn 之間仍有檢查→使用殘餘窗（revalidate 與 spawn 非原子）；
      * 由 github runner `awaitPreSpawn`＋`ELEVATED_RUNNERS_READY` 終門把關；本層不宣稱消除。
      *
-     * 全路徑留痕：門禁未過亦寫一筆 DENY 審計；任何拒絕一律零 spawn。
-     * 取消語義：[CancellationException] 一律重拋（不轉 `Denied`、不寫 DENY 審計）。
+     * 審計留痕：除 CancellationException 與 Error 外，所有路徑恰一筆審計（門禁未過亦寫一筆
+     * DENY 審計；任何拒絕一律零 spawn）。取消語義如實分述：
+     * - supplier／policy／freeze／projection 面：[CancellationException] 一律重拋
+     *   （不轉 `Denied`、不寫 DENY 審計；測試 pin：`cancellationPropagatesWithoutDenyAudit`）；
+     * - argv 重凍結面：hostile list 的 CE 於 `copyArgvBounded` 內即收斂為 null → Denied
+     *   （fail-closed、恰一筆 DENY），見 `reverifyArgvRecheckCancellationDeniedZeroSpawnPin`；
+     *   `frozenOrNull` 的 blocking get 不觀察呼叫方取消，取消最遲於本函式下一掛起點生效；
+     * - 上列「恰一筆審計」僅保證非 CancellationException、非 Error 路徑；Error 路徑之受控
+     *   掛起點（projection／policy／gate）已收斂為 Denied＋一筆 DENY，其餘 Error 不承諾審計。
      */
     suspend fun execute(
         argv: List<String>,
@@ -276,6 +307,8 @@ object ElevatedWiring {
         timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS,
     ): ShellResult {
         coroutineContext.ensureActive()
+        // fail-safe clamp（不拒絕——拒絕超過上界的誤用須另立需求）：runner 永遠收到有界預算。
+        val effectiveTimeoutMs = timeoutMs.coerceIn(1L, ShellPolicy.MAX_ELEVATED_TIMEOUT_MS)
         // --- Cheap gates first (F6): no argv iteration/snapshot before these pass ---
         val tool = ToolRegistry.find(TOOL_NAME)
             ?: run {
@@ -318,12 +351,22 @@ object ElevatedWiring {
                 tool.project(frozenCtx0)
             } catch (e: CancellationException) {
                 throw e
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
                 val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "projection unavailable (fail-closed, no spawn)")
                 audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
                 return denied
             }
-            val gate = PrivilegeGate.check(tool, false, projection0, mapOf("reasonCode" to reasonCode))
+            // check 本身不得令 Throwable 逃逸：CE 重拋；其餘 Throwable（含 require(toolName) IAE）
+            // fail-closed → Denied＋一筆 DENY（fail-closed，no spawn）。
+            val gate = try {
+                PrivilegeGate.check(tool, false, projection0, mapOf("reasonCode" to reasonCode))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "privilege gate evaluation failed (fail-closed, no spawn)")
+                audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
+                return denied
+            }
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "privilege gate blocked: $gate")
             audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
@@ -345,7 +388,7 @@ object ElevatedWiring {
             tool.project(frozenCtx1)
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "projection unavailable (fail-closed, no spawn)")
             audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
@@ -357,7 +400,7 @@ object ElevatedWiring {
         }
         // fresh policy（前驗）：僅 ALLOW 放行；ASK／DENY／異常／逾時一律拒（ASK 不變 ALLOW；CE 重拋）。
         // withTimeoutOrNull 是配合作式（掛起點觸發）：對永不掛起之實作不保證上界（產品以 DataStore 系為準）。
-        // withTimeoutOrNull 回 null 且 block 未返回＝逾時 → verdict=TIMEOUT；block 返回 null（Java-null verdict）或任何例外 → verdict=ERROR。
+        // withTimeoutOrNull 回 null 且 block 未返回＝逾時 → verdict=TIMEOUT；block 返回 null（Java-null verdict）或任何例外／Error → verdict=ERROR。
         var verdict1Timeout = false
         val verdict1 = try {
             var blockReturned = false
@@ -369,7 +412,7 @@ object ElevatedWiring {
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             null
         }
         if (verdict1 != Verdict.ALLOW) {
@@ -386,7 +429,17 @@ object ElevatedWiring {
             return denied
         }
         // ASK 確認（前驗）：四參 gate；NeedConfirm／Denied 一律拒（confirmed 已 cheap-gated，但保留完整 gate）。
-        val gate1 = PrivilegeGate.check(tool, confirmed, projection1, mapOf("reasonCode" to reasonCode))
+        // check 本身不得令 Throwable 逃逸：CE 重拋；其餘 Throwable（含 require(toolName) IAE）
+        // fail-closed → Denied＋一筆 DENY。
+        val gate1 = try {
+            PrivilegeGate.check(tool, confirmed, projection1, mapOf("reasonCode" to reasonCode))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "privilege gate evaluation failed (fail-closed, no spawn)")
+            audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
+            return denied
+        }
         if (gate1 !is GateResult.Allowed) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "privilege gate blocked: $gate1")
             audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
@@ -411,7 +464,7 @@ object ElevatedWiring {
             return denied
         }
         if (grant1 is ElevatedGrant.Invalid) {
-            val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, grant1.reason.take(200))
+            val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "grant invalid (fail-closed, no spawn)")
             audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
@@ -455,6 +508,9 @@ object ElevatedWiring {
             return denied
         }
         // F3: bounded/safe recheck of untrusted argv (no uncontrolled equals/iterator on adversarial list)
+        // 註：argvMatchesSnapshot 為非掛起函式且 frozenOrNull 全收斂 Throwable→null，此處 CE catch 為
+        // 防禦縱深（frozenOrNull 語義若改變仍保留 CE 不落 DENY 的不變式）；hostile list 的 CE 已於
+        // copyArgvBounded 內收斂為 false → Denied，見 reverifyArgvRecheckCancellationDeniedZeroSpawnPin。
         val argvOk = try {
             argvMatchesSnapshot(argv, snapshot.argv)
         } catch (e: CancellationException) {
@@ -479,7 +535,7 @@ object ElevatedWiring {
             tool.project(frozenCtx2)
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "reverify projection unavailable (fail-closed, no spawn)")
             audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
@@ -491,7 +547,7 @@ object ElevatedWiring {
         }
         // fresh policy（重驗）：僅 ALLOW 放行；異常／逾時一律拒（CE 重拋）。
         // withTimeoutOrNull 是配合作式（掛起點觸發）：對永不掛起之實作不保證上界（產品以 DataStore 系為準）。
-        // withTimeoutOrNull 回 null 且 block 未返回＝逾時 → verdict=TIMEOUT；block 返回 null（Java-null verdict）或任何例外 → verdict=ERROR。
+        // withTimeoutOrNull 回 null 且 block 未返回＝逾時 → verdict=TIMEOUT；block 返回 null（Java-null verdict）或任何例外／Error → verdict=ERROR。
         var verdict2Timeout = false
         val verdict2 = try {
             var blockReturned = false
@@ -503,7 +559,7 @@ object ElevatedWiring {
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             null
         }
         if (verdict2 != Verdict.ALLOW) {
@@ -537,7 +593,7 @@ object ElevatedWiring {
             return denied
         }
         if (grant2 is ElevatedGrant.Invalid) {
-            val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, grant2.reason.take(200))
+            val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "grant invalid (fail-closed, no spawn)")
             audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
@@ -567,7 +623,7 @@ object ElevatedWiring {
                     frozen = ElevatedRequest(snapshot.argv, snapshot.reasonCode),
                     runner = runner,
                     audit = audit,
-                    timeoutMs = timeoutMs,
+                    timeoutMs = effectiveTimeoutMs,
                 )
             }
         }

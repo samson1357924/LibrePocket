@@ -143,6 +143,9 @@ object ShellPolicy {
     /** 預設單次執行超時。 */
     const val DEFAULT_TIMEOUT_MS: Long = 10_000L
 
+    /** 提權通道單次執行超時上限（fail-safe clamp；超限即夾至此值，見 [dev.librepocket.router.ElevatedWiring]）。 */
+    const val MAX_ELEVATED_TIMEOUT_MS: Long = 60_000L
+
     /** 預設配額：每分鐘最多執行次數。 */
     const val DEFAULT_MAX_CALLS: Int = 30
     const val DEFAULT_WINDOW_MS: Long = 60_000L

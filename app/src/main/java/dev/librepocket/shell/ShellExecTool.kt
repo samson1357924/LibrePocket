@@ -16,7 +16,7 @@ import dev.librepocket.redact.Redactor
  *   直接 exec 遇跨域一律 [ShellResult.Denied]（[RestrictedShell] 經
  *   `FileScope.decide` 拒絕，foss/github 即使橋接已授權亦然，需改走 D09 橋）；
  *   提權執行一律經 [executeElevated]（審計版，必須傳 [PrivilegeAuditLog]）
- *   留痕，無審計直行路徑不存在。
+ *   留痕（除 CancellationException／Error 外恰一筆；CE 重拋零審計、require 誤用 fail-fast）。
  *
  * 本檔案零 Android 依賴，JVM 單測可直接斷言。
  */

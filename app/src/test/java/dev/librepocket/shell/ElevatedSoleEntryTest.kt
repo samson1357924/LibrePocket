@@ -1,6 +1,7 @@
 package dev.librepocket.shell
 
 import java.io.File
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -9,8 +10,9 @@ import org.junit.Test
  *
  * pin：executeWithFrozen 僅 [dev.librepocket.router.ElevatedWiring].execute 呼叫；
  * internal 可見性 + 本測試構成雙重防線；誤用會繞過 gates/re-verify/audit 語義。
- * - [soleEntryForExecuteWithFrozen]：main 源集 token 掃描，命中（`.executeWithFrozen(`
- *   與裸 `executeWithFrozen(`）僅允許 `dev/librepocket/router/ElevatedWiring.kt`；
+ * - [soleEntryForExecuteWithFrozen]：main 源集 token 掃描，命中（`.executeWithFrozen(`、
+ *   裸 `executeWithFrozen(`、callable reference `::executeWithFrozen`）僅允許
+ *   `dev/librepocket/router/ElevatedWiring.kt`；
  * - [elevatedDispatchKdocSoleEntryDeclared]：`ElevatedDispatch` 的 KDoc 須含
  *   sole-entry 聲明字樣（「ElevatedWiring」與「PRECONDITION」）。
  */
@@ -19,20 +21,22 @@ class ElevatedSoleEntryTest {
     // ---- sole-entry：產品源集僅 ElevatedWiring 得呼叫 executeWithFrozen ----
 
     @Test fun soleEntryForExecuteWithFrozen() {
-        // 定位 main 源集（多路徑相容：module cwd／repo root／CI 差異；找不到即跳過）。
+        // 定位 main 源集（多路徑相容：module cwd／repo root／CI 差異；找不到即 fail，不靜默通過）。
         val candidates = listOf(
             File("app/src/main/java"),
             File("src/main/java"),
             File("../app/src/main/java"),
         )
-        val root = candidates.firstOrNull { it.isDirectory } ?: return
+        val root = candidates.firstOrNull { it.isDirectory }
+        assertTrue("main 源集未定位，sole-entry pin 失效：$candidates", root != null)
+        val locatedRoot = root!!
         val hits = mutableListOf<String>()
-        root.walkTopDown().filter { it.isFile && it.name.endsWith(".kt") }.forEach { f ->
+        locatedRoot.walkTopDown().filter { it.isFile && it.name.endsWith(".kt") }.forEach { f ->
             // 僅掃產品源集（main），跳過宣明檔本身；註解/KDoc 命中不計，
             // 字串字面量內命中亦不計（僅計程式碼區實際調用 `executeWithFrozen(`）。
-            if (f.relativeTo(root).path.replace('\\', '/').endsWith("dev/librepocket/router/ElevatedDispatch.kt")) return@forEach
+            if (f.relativeTo(locatedRoot).path.replace('\\', '/').endsWith("dev/librepocket/router/ElevatedDispatch.kt")) return@forEach
             if (codeContainsExecuteWithFrozen(f.readText())) {
-                hits.add(f.relativeTo(root).path.replace('\\', '/'))
+                hits.add(f.relativeTo(locatedRoot).path.replace('\\', '/'))
             }
         }
         // 防護空轉：scanner 至少須找到預期的唯一合法呼叫方，否則 pin 形同虛設。
@@ -51,6 +55,11 @@ class ElevatedSoleEntryTest {
      * `executeWithFrozen(` 前綴檢查同時涵蓋 `.executeWithFrozen(`（具名接收者）
      * 與裸 `executeWithFrozen(`（無接收者直調）；`fooexecuteWithFrozen(` 這類
      * 識別字後綴不誤計（前一字元為識別字組成即跳過）。
+     *
+     * 另檢查 `::executeWithFrozen`（callable reference，無呼叫括號）：
+     * `Foo::executeWithFrozen`／`::executeWithFrozen` 皆為 sole-entry 繞過形，
+     * 須命中。`::` 前綴的接收者識別字（`Foo::`）在 token 起始位置之前，
+     * 故邊界判斷改檢查 token 結尾後續字元非識別字組成（見 [callableReferenceToken]）。
      */
     private fun codeContainsExecuteWithFrozen(text: String): Boolean {
         var inBlock = false
@@ -117,6 +126,26 @@ class ElevatedSoleEntryTest {
                 i++
             }
             if (tokenAtBoundary(code, "executeWithFrozen(")) return true
+            if (callableReferenceToken(code, "executeWithFrozen")) return true
+        }
+        return false
+    }
+
+    /**
+     * `::name` callable reference（無呼叫括號）探測（boundary 判斷沿用 tokenAtBoundary
+     * 的識別字組成規則，套用於 token 結尾後續字元）：
+     * - `::` 前綴的接收者識別字（`Foo::executeWithFrozen`）合法，token 起始位置
+     *   的 before-check 因此不適用（`':'` 前為識別字屬正常限定形）；
+     * - token 結尾後續字元為識別字組成（如 `::executeWithFrozenX`）不命中。
+     */
+    private fun callableReferenceToken(code: CharSequence, name: String): Boolean {
+        val needle = "::$name"
+        var i = code.indexOf(needle)
+        while (i >= 0) {
+            val end = i + needle.length
+            val after = if (end < code.length) code[end] else ' '
+            if (!(after.isLetterOrDigit() || after == '_' || after == '$')) return true
+            i = code.indexOf(needle, i + 1)
         }
         return false
     }
@@ -135,14 +164,17 @@ class ElevatedSoleEntryTest {
     // ---- sole-entry 聲明：ElevatedDispatch KDoc 須保留聲明字樣 ----
 
     @Test fun elevatedDispatchKdocSoleEntryDeclared() {
+        // 定位 main 源集（多路徑相容：module cwd／repo root／CI 差異；找不到即 fail，不靜默通過）。
         val candidates = listOf(
             File("app/src/main/java"),
             File("src/main/java"),
             File("../app/src/main/java"),
         )
-        val root = candidates.firstOrNull { it.isDirectory } ?: return
-        val file = File(root, "dev/librepocket/router/ElevatedDispatch.kt")
-        assertTrue("ElevatedDispatch.kt not found under ${root.path}", file.isFile)
+        val root = candidates.firstOrNull { it.isDirectory }
+        assertTrue("main 源集未定位，sole-entry pin 失效：$candidates", root != null)
+        val locatedRoot = root!!
+        val file = File(locatedRoot, "dev/librepocket/router/ElevatedDispatch.kt")
+        assertEquals("ElevatedDispatch.kt 未找到（pin 失效）", true, file.isFile)
         val text = file.readText()
         assertTrue(
             "ElevatedDispatch.kt KDoc 須聲明 sole-entry 唯一合法呼叫方 ElevatedWiring",

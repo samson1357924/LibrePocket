@@ -10,6 +10,7 @@ import dev.librepocket.shell.frozenOrNull
 import dev.librepocket.shell.ShellResult
 import dev.librepocket.tool.Projection
 import dev.librepocket.tool.ToolDef
+import kotlinx.coroutines.CancellationException
 
 /**
  * S3 提權執行分派（BACKLOG D09，矩陣 §3/§4）：產品路徑調用 [PrivilegeGate]
@@ -18,7 +19,8 @@ import dev.librepocket.tool.ToolDef
  * 順序：四參 args-aware [PrivilegeGate.check]（攜 reasonCode）
  * → 僅 [GateResult.Allowed] 才走審計版
  * [ShellExecTool.executeElevated]；門禁未過一律不建子進程，且同樣寫一筆
- * DENY 審計（全路徑留痕，無審計直行路徑不存在）。
+ * DENY 審計（除 CancellationException／Error 外恰一筆；CE 重拋零審計、
+ * require 誤用 fail-fast）。
  */
 object ElevatedDispatch {
 
@@ -41,7 +43,7 @@ object ElevatedDispatch {
      * - gate-first：cheap 門（tool 名／projection／confirmed／reasonCode 空與
      *   長度——皆只讀不可變 `String`／對象引用，不碰不可信 `argv`）一律在快照
      *   之前。`confirmed=false`／projection blocked／reason 缺失或超限即零
-     *   snapshot worker（不解析 argv）；門禁未過仍寫一筆 DENY 審計（全路徑留痕），
+     *   snapshot worker（不解析 argv）；門禁未過仍寫一筆 DENY 審計（CE 重拋路徑除外），
      *   但以空 argv＋有界 reason 記（超限 reason 不哈希，記空串標記；其餘記
      *   原 reason——已验长度，有界）。
      * - reasonCode 超限（[PrivilegeAuditLog.MAX_REASON_CODE_BYTES] UTF-8 位元組）
@@ -84,12 +86,25 @@ object ElevatedDispatch {
         }
         // P2-1 gate-first：cheap 门先行（只读 reason，不碰 argv）。
         // 未过即 DENY＋一笔审计（空 argv＋有界 reason），零 snapshot worker。
-        val gate = PrivilegeGate.check(
-            tool,
-            confirmed,
-            projection,
-            mapOf("reasonCode" to request.reasonCode),
-        )
+        // check 本身不得令 Throwable 逃逸：CE 重拋；其餘 Throwable（含 require(toolName) IAE）
+        // fail-closed → Denied＋一笔 DENY。
+        val gate = try {
+            PrivilegeGate.check(
+                tool,
+                confirmed,
+                projection,
+                mapOf("reasonCode" to request.reasonCode),
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            val gateDenied = ShellResult.Denied(
+                ShellDeny.NOT_WHITELISTED,
+                "privilege gate evaluation failed (fail-closed, no spawn)",
+            )
+            audit.record(emptyList(), request.reasonCode, PrivilegeAuditLog.verdictName(gateDenied))
+            return gateDenied
+        }
         if (gate !is GateResult.Allowed) {
             val denied = ShellResult.Denied(
                 ShellDeny.NOT_WHITELISTED,

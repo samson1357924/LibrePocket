@@ -556,12 +556,19 @@ class ElevatedCleanupTrackerB2Test {
         val fakeNow = AtomicLong(System.nanoTime())
         val nowNanos: () -> Long = { fakeNow.get() }
         try {
+            // Stage 4 review R3：直接以 lastAttemptNanosCount() 釘住 map 現況
+            // （delta 斷言，容忍其他測試可能殘留的條目；clearUnverified 會清空）。
+            val base = ElevatedCleanupTracker.lastAttemptNanosCount()
             val p = CountingAliveProcess()
             ElevatedCleanupTracker.quarantineUnverified(p)
             assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
             // 首掃：attempt 一次（記 t0 於 lastAttemptNanos）。
             assertEquals(0, ElevatedCleanupTracker.sweepQuarantine(nowNanos))
             assertEquals("first sweep must attempt once", 1, p.waitCalls.get())
+            assertEquals(
+                "first sweep must record one lastAttemptNanos entry (delta +1)",
+                base + 1, ElevatedCleanupTracker.lastAttemptNanosCount(),
+            )
             // 推進逾剪枝閾值（1h＋1s）：stale 條目剪除、本次不 attempt（節流語義不變）。
             fakeNow.addAndGet(
                 TimeUnit.MILLISECONDS.toNanos(
@@ -573,13 +580,24 @@ class ElevatedCleanupTrackerB2Test {
                 "stale sweep must prune (not re-attempt) in this pass",
                 1, p.waitCalls.get(),
             )
+            // R3：剪枝 sweep 結束後 map 不再留存 p 的條目（size delta 回到 base）。
+            // （清理登記成功或空條目情境皆不適用本測試：alive 的 CountingAliveProcess
+            //  驗證不通過，p 的 lastAttemptNanos 條目唯一來源即首掃記錄。）
+            assertEquals(
+                "stale sweep must remove the lastAttemptNanos entry",
+                base, ElevatedCleanupTracker.lastAttemptNanosCount(),
+            )
             // 下次 sweep：條目已剪（map 不再留存 p）——視同未嘗試，一次 re-attempt。
-            // （map 無直接 getter；以隔次 sweep 的 re-attempt 行為作為「不留存」
-            // 的可辨識代用斷言：若條目未剪，隔次 sweep 仍被逾齡檢視阻擋，waitCalls 不增。）
+            // （R3：「不留存」現由上方 lastAttemptNanosCount() 直接釘住，不再僅以
+            // re-attempt 行為代理；此處保留行為斷言雙釘。）
             assertEquals(0, ElevatedCleanupTracker.sweepQuarantine(nowNanos))
             assertEquals(
                 "next sweep after prune must re-attempt once (stale entry gone)",
                 2, p.waitCalls.get(),
+            )
+            assertEquals(
+                "re-attempt sweep must re-record one lastAttemptNanos entry (delta +1)",
+                base + 1, ElevatedCleanupTracker.lastAttemptNanosCount(),
             )
             assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
         } finally {

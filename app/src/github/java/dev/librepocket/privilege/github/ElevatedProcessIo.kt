@@ -668,6 +668,15 @@ internal object ElevatedCleanupTracker {
     internal fun sweepPendingCount(): Int = synchronized(lock) { sweepPending.size }
 
     /**
+     * Stage 4 review R3（prune 釘點，僅測試用）：`lastAttemptNanos` 於 `[lock]` 內
+     * 讀取之**當前** size（identity map；sweep 剪枝／re-attempt 記錄／clearUnverified
+     * 移除皆經 `[lock]`，故此讀取為一致快照）。供測試直接斷言「stale 條目已剪」，
+     * 不再僅以隔次 sweep 的 re-attempt 行為代理「不留存」。
+     */
+    @VisibleForTesting
+    internal fun lastAttemptNanosCount(): Int = synchronized(lock) { lastAttemptNanos.size }
+
+    /**
      * Round-3 Phase E 有界重試回收（P1-1；重試管道，不無界）＋Round-4 Phase M
      * 有界化（P1-3；呼叫側零 IPC＋singleflight＋受監督 verifier）＋Round-5
      * Phase Q（P2-4；runner 呼叫側永不等待 verifier，見 [kickSweepAsync]）：

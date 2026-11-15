@@ -2,6 +2,7 @@ package dev.librepocket.privilege.github
 
 import java.lang.reflect.InvocationTargetException
 import java.util.concurrent.TimeUnit
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -152,7 +153,10 @@ class ElevatedProcessKillerTest {
         assertTrue(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, t0))
         // destroyForcibly 信號第 2 次獨立重驗：一致即放行。
         assertTrue(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, t0))
-        // 任一次重驗鍵值不可驗／已回收 → fail-closed（跳過＋pidReuseSkipped）。
+        // 任一次重驗鍵值不可驗／已回收 → 該判定式回 false（fail-closed；
+        // 子孫路徑＝跳過＋pidReuseSkipped）。本體路徑（Stage 4 review R1(a)）
+        // 不再以本判定式落地——不可驗一律退化為無條件 destroy＋bodyDestroyUnattested，
+        // 僅 proven mismatch（兩讀皆成功＋startInstant 不符）才跳過＋兩計數＋latch。
         assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, t1))
         assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, null, t0))
         assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, null))
@@ -170,17 +174,23 @@ class ElevatedProcessKillerTest {
         )
     }
 
-    @Test fun killTreeOnNonAttestableFakeProcessDoesNotThrow() {
-        // Stage 4 冒煙（wiring-agnostic）：FakeProcess（同包 ElevatedTestFakes；
+    @Test fun killTreeOnNonAttestableFakeProcessDegradesToUnconditionalDestroyAndCounts() {
+        // Stage 4 review O1（strengthened）：FakeProcess（同包 ElevatedTestFakes；
         // 未覆寫 toHandle；JDK 基類預設即抛 UOE，android.jar 樁同為 UOE）在任何
-        // 平台皆無法 attest ⇒ 本體走 unconditional destroy（今日行為，kill 契約
-        // 不變＝destroy＋destroyForcibly 必跑、不抛）。
-        // 刻意只斷言「不抛＋有界返回」、不斷言 destroyed／計數（平台相依：可 attest
-        // 平台若未來 FakeProcess 演化為可 attest，信號改走 handle 路徑、fake.destroyed
-        // 不翻；unattested 計數亦視平台而異）。具體計數釘點見上一測試之
-        // bodyDestroyUnattestedCount。
+        // 平台皆無法 attest ⇒ 本體兩個信號一律走 unattested 無條件 destroy 臂
+        // （kill 契約＝destroy＋destroyForcibly 必跑、不抛），且每個未經 attest
+        // 的信號計入 bodyDestroyUnattestedCount（once per SIGNAL）。
+        // deterministic：FakeProcess 不 override toHandle ⇒ reflectHandleAttest 收斂
+        // handle=null ⇒ attestBodyDestroy 退化 unattestedBodyDestroy（+2），與平台無關。
         val fake = FakeProcess()
+        val before = ElevatedProcessKiller.bodyDestroyUnattestedCount()
         ElevatedProcessKiller.killTree(fake) // 不抛即通過；有界返回（不 hang）。
+        assertEquals(
+            "FakeProcess cannot attest ⇒ both body signals route to the unattested arm",
+            before + 2, ElevatedProcessKiller.bodyDestroyUnattestedCount(),
+        )
+        assertTrue("destroy() must have run (kill contract)", fake.destroyed)
+        assertTrue("destroyForcibly() must have run (kill contract)", fake.forciblyDestroyed)
     }
 
     /**

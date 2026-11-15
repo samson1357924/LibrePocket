@@ -76,42 +76,70 @@ import java.util.concurrent.atomic.AtomicInteger
  * interrupt＋500ms grace；永不跳過 killer 嘗試），未完成經
  * [ElevatedProcessIo.Drained.cleanupIncomplete] 帶出（runner verdict 映射不變）。
  *
- * Stage 2A（P1-A7，PID-reuse 守門，security-auditor；Stage 4 擴及本體）：
+ * Stage 2A（P1-A7，PID-reuse 守門，security-auditor；Stage 4 擴及本體；Stage 4 review 收斂）：
  * 子孫（descendants）與**本體** `destroy/destroyForcibly` 前一律重驗——Stage 4
  * 起兩條路徑共用同一反射 attestation seam（[HandleAttest]，語義逐項一致，
  * R2-A 宣告類查表紀律不變）：於流出當下之後、信號之前取 `info().startInstant()`
  * 快照（僅存活 handle 取快照；已死 handle 直接跳過不讀 info()），每次信號前重讀
  * `startInstant()` 與 `isAlive()`：
- * - 兩次 startInstant 不符 ⇒ PID 已被回收重用 ⇒ **跳過信號**
+ * - 子孫路徑：兩次 startInstant 不符 ⇒ PID 已被回收重用 ⇒ **跳過信號**
  *   （不得對一顆可能已非原 process 的 PID 發信號；子孫清理 best-effort 語義不變）；
- * - `info()` 抛／`startInstant` 缺席／`isAlive()==false`／不可驗證 ⇒ 同跳過；
+ *   `info()` 抛／`startInstant` 缺席／`isAlive()==false`／不可驗證 ⇒ 同跳過；
  *   其中「不可驗證／PID 回收」（死亡後的常規跳過除外）計入
  *   [pidReuseSkippedCount] 診斷計數（不抛、不崩，fail-closed 方向是不誤殺）；
+ * - **本體（Stage 4 review R1(a)，kill 契約優先）**：本體不再使用
+ *   「unverifiable ⇒ skip」——僅 **「proven recycled ⇒ skip」**：
+ *   僅當兩次讀取皆成功且 `startInstant` 不符（可證回收的 incarnation）⇒
+ *   跳過該信號＋[pidReuseSkippedCount]＋[bodyPidReuseSkippedCount]（本體歸因），
+ *   並以 one-shot latch 抑制本 killTree 剩餘本體信號（bystander 保護不依賴第二次
+ *   讀取恰好抛）；`alive == null`（isAlive 讀抛／非常規回傳）或任一次
+ *   `startInstant` 讀為 null ⇒ 該信號**退化為無條件**
+ *   `process.destroy()/destroyForcibly()`＋[bodyDestroyUnattestedCount]
+ *   （fail toward destruction，kill 契約不破壞；不計 pidReuseSkipped——nothing
+ *   was proven）；`isAlive()==false`（含 mid-window 兩讀之間死亡）⇒ 跳過該信號，
+ *   零信號、零計數（died mid-kill，非 skip、非 unattested）。
+ *   [pidReuseSignalAllowed] 真值表語義僅子孫路徑使用，不變；
  * - **本體（Stage 4）**：[killTree] 不再無條件 `process.destroy()/destroyForcibly()`。
  *   平台可 attest（`toHandle` 可 invoke、`ProcessHandle` 類在、`isAlive`／`info`
  *   Method 在、且本次 `startInstant` 探測可讀）時，兩個信號（destroy 先、
  *   destroyForcibly 後）各自獨立重驗（與子孫逐信號重驗一致），信號經 **handle**
- *   的 `destroy/destroyForcibly` Method 發出（handle 即 attested 身份），不經
- *   `process.destroy()`；身份不可驗／PID 回收 ⇒ 跳過＋計 [pidReuseSkippedCount]；
+ *   的 `destroy/destroyForcibly` Method 發出（handle 即 attested 身份；
+ *   `ProcessHandle.destroy()` 回 Boolean，false 即 EPERM——handle 信號失敗無聲，
+ *   與 JDK `process.destroy()` 同，不計入任何計數）；本體信號前僅「proven recycled
+ *   mismatch」（兩讀皆成功＋startInstant 不符）才跳過（見上 R1(a)）；其餘不可驗
+ *   一律保守退化為無條件 destroy（fail toward destruction，per-signal）。
  * - 平台**完全無 attestation toolkit**（`toHandle` 缺席／`ProcessHandle` 類缺席／
- *   `isAlive` Method 缺席／`info` Method 缺席／本次 `startInstant` 探測不可讀——
- *   即整組工具缺席，而非單次瞬時讀失敗）時，本體退化為今日之**無條件**
+ *   `isAlive` Method 缺席／`info` Method 缺席／本次 `startInstant` 探測不可讀，
+ *   或 seam 反射本身抛出任何 Throwable（如連結期 `NoClassDefFoundError`，見
+ *   [attestBodyDestroy] C1 說明）——即整組工具缺席，而非單次瞬時讀失敗）時，
+ *   本體退化為今日之**無條件**
  *   `process.destroy()/destroyForcibly()`（保 kill 契約不破壞），且每個未經
  *   attest 的信號計入 [bodyDestroyUnattestedCount]（once per SIGNAL，一次
- *   killTree 最多 2）。fade to 無條件 destroy 僅發生於此（toolkit 全缺；
- *   探測失敗無法區分結構性缺席與瞬時讀失敗，一律保守歸入 unattested，close
- *   toward destruction）——平台**有能力** attest 而身份不可驗（瞬時讀失敗／
- *   PID 回收）者不退化，跳過＋[pidReuseSkippedCount]（與子孫同款 fail-closed）。
- * 樹殺語義**維持 best-effort**：本守門只縮小「流出→信號」窗口，
- * 不保證 handle 快照當下 PID 仍真值原子配對（TOCTOU 無法根除，裝置 SELinux／
- * Root 差異 E2E 仍歸 #136-B3）。本 KDoc 只描述 JVM／Host 測試環境已驗的
+ *   killTree 最多 2；不再僅限 toolkit 全缺——per-signal 不可驗亦退化，見 R1(a)）。
+ *
+ * 真機現實（Stage 4 review，O1/O2 誠實化）：attested 本體路徑**不會**在
+ * Android／Shizuku 執行——android.jar（34/36/37.0）`java.lang.Process.toHandle()`
+ * 為 UOE 樁、libcore **無** `java.lang.ProcessHandle` 類，[ShizukuRemoteProcess]
+ * 亦未覆寫 `toHandle()`（沿用 JDK 預設抛 UOE）⇒ 裝置上所有 kill 皆走
+ * unattested 退化臂（telemetry-only；kill 契約 preserved）；handle 路徑僅供
+ * Host-JDK／桌面語義。
+ * 誠實化回收窗口（F-1/F-2/F-3）：本守門**僅**偵測「kill 當下兩次讀取之間」的
+ * 回收窗口（plus JDK 原生 `destroy0` 內建 re-check）——kill 之前即已發生的
+ * pre-existing recycle 在本 API 契約下**不可偵測**（無 spawn-time baseline）
+ * ⇒ mismatch-skip 是唯一偵測手段，且讀取失敗時本體仍會 SIGKILL 一顆已回收的
+ * PID（by design：kill 契約優先；准入 backstop 於 drain verify+quarantine
+ * 終審）。殘餘限 mid-window，本守門僅縮小窗口、不根除（TOCTOU）；真正的
+ * regression-proof 為裝置 E2E＋spawn-time baseline——後者列為 #136-B3 跟進項目。
+ * 平台 `info()`／`startInstant()` 完全不可讀時，巢狀樹殺退化為僅對本體發信號；
+ * 本體信號為 unattested 無條件 destroy 並計入 [bodyDestroyUnattestedCount]
+ * ——產品必須於啟用前以真機查驗 [pidReuseSkippedCount]、
+ * [bodyPidReuseSkippedCount] 與 [bodyDestroyUnattestedCount]
+ * （#136-B3 device-acceptance gate）。probe 期讀取欠穩（`isAlive`／
+ * `startInstant` 瞬時讀失敗）現在退化為 destruction 方向而非 attestation skip，
+ * 計入 [bodyDestroyUnattestedCount]。本 KDoc 只描述 JVM／Host 測試環境已驗的
  * attested-NOW 語義（Host 真子進程單測見 `ElevatedProcessKillerTest`）；JVM 與
  * 裝置端的差異（AOSP 樁、Shizuku 遠端、實機 startInstant 可讀性）為 #136-B3
  * 領域，本 KDoc 不宣稱裝置 E2E 已驗證。
- * 平台 `info()`／`startInstant()` 完全不可讀時，巢狀樹殺退化為僅對本體發信號；
- * 本體信號為 unattested 無條件 destroy 並計入 [bodyDestroyUnattestedCount]
- * ——產品必須於啟用前以真機查驗 [pidReuseSkippedCount] 與
- * [bodyDestroyUnattestedCount]（#136-B3 device-acceptance gate）。
  *
  * B2 P1-3 誠實化（owner 新 P1-3，行為見 drain）：本物件全 runCatching（destroy／
  * destroyForcibly 抛即吞，遠端 destroy 失敗亦吞），`killTree` 正常返回≠進程真死
@@ -133,6 +161,17 @@ object ElevatedProcessKiller {
      * （dead-but-alive-previously handles）不計。平台完全無 attestation toolkit
      * 時，本體信號走 unattested 無條件路徑，計入 [bodyDestroyUnattestedCount]，
      * 不計此計數。
+     * Stage 4 review R1(a) 起：本體側僅「proven recycled mismatch」（兩讀皆成功＋
+     * startInstant 不符）計入本計數（不可驗一律退化為無條件 destroy＋
+     * [bodyDestroyUnattestedCount]，不計此計數）；子孫側語義不變。
+     *
+     * body vs descendant 歸因（Stage 4 review R2）：子孫側跳過僅計本計數；
+     * 本體側跳過同時計本計數與 [bodyPidReuseSkippedCount]（本體歸因）。
+     * #136-B3 device-acceptance checklist：發佈並讀取本計數（與
+     * [bodyPidReuseSkippedCount]）；host/JVM 預期 ≈0–2（僅本體兩信號，
+     * mismatch 機率極低，常態 0）；裝置預期一切皆經 unattested 臂
+     * （≈2/killTree 走 [bodyDestroyUnattestedCount]，本計數≈0）——其他任何
+     * 讀數皆須調查。
      *
      * 刻意非接線（deliberate NON-wiring）進 verdict／breaker／admission：
      * 平台若對任何一顆子孫完全無法 attest（無 isAlive／info／startInstant），
@@ -147,26 +186,56 @@ object ElevatedProcessKiller {
      */
     private val pidReuseSkipped = AtomicInteger(0)
 
-    /** PID-reuse 守門跳過的信號數快照（僅測試／診斷用）。 */
+    /** PID-reuse 守門跳過的信號數快照（僅測試／診斷用；#136-B3 device-acceptance；body＋descendant 共用母數）。 */
+    @VisibleForTesting
     internal fun pidReuseSkippedCount(): Int = pidReuseSkipped.get()
 
     /**
-     * Stage 4（body unattested destroy 診斷計數；非接線，產品不讀取）：
-     * 平台完全無 attestation toolkit（toHandle 缺席／`ProcessHandle` 類缺席／
-     * `isAlive`／`info` Method 缺席／本次 `startInstant` 探測不可讀）時，
-     * [attestBodyDestroy] 退化為無條件 `process.destroy()/destroyForcibly()`
-     * （保 kill 契約不破壞），**每個未經 attest 的信號計 1**（once per SIGNAL；
-     * 一次 killTree 最多 2）。平台可 attest 而身份不可驗者不進此計數
-     * （計 [pidReuseSkippedCount]）；`isAlive()==false` 的常規確認死亡不計。
-     * 必須列入 #136-B3 裝置驗收清單（device-acceptance checklist）：啟用提權
-     * runner 前，須先以真機量測本計數確認平台是否走 unattested 退化
-     * （must feed #136-B3 device-acceptance）。
+     * Stage 4（Stage 4 review R1(a) 強化；body unattested destroy 診斷計數；
+     * 非接線，產品不讀取）：下列任一成立時，本體該信號退化為無條件
+     * `process.destroy()/destroyForcibly()`（保 kill 契約不破壞），**每個未經
+     * attest 的信號計 1**（once per SIGNAL；一次 killTree 最多 2）：
+     * - 平台完全無 attestation toolkit（toHandle 缺席／`ProcessHandle` 類缺席／
+     *   `isAlive`／`info` Method 缺席／本次 `startInstant` 探測不可讀——整組工具
+     *   缺席，而非單次瞬時讀失敗）；
+     * - 平台可 attest，但該信號身份不可驗（`isAlive()` 讀抛／非常規回傳（null），
+     *   或快照／重讀 `startInstant` 為 null；R1(a)：fail toward destruction，
+     *   不計 [pidReuseSkippedCount]——nothing was proven）；
+     * - 該信號 handle 缺 `destroy/destroyForcibly` Method（防禦性退化）；
+     * - reflective seam 本身抛出任何 Throwable（如連結期 `NoClassDefFoundError`，
+     *   C1：兩個信號皆退化並各計 1）。
+     * 平台可 attest 且身份可驗且回收（proven mismatch）者不進此計數
+     * （計 [pidReuseSkippedCount]＋[bodyPidReuseSkippedCount]）；`isAlive()==false`
+     * 的常規確認死亡不計（零信號、零計數）；latch 抑制之剩餘信號亦不計。
+     * #136-B3 device-acceptance checklist：發佈並讀取本計數（與
+     * [bodyPidReuseSkippedCount]）；host/JVM 預期 ≈0–2（真實 JVM 進程可 attest
+     * 故常態 0；無法 attest 的假件如 FakeProcess 每 killTree +2）；裝置預期
+     * 一切皆經 unattested 臂（≈2/killTree）——其他任何讀數皆須調查。啟用提權
+     * runner 前，須先以真機量測本計數確認平台是否走 unattested 退化。
      */
     private val bodyDestroyUnattested = AtomicInteger(0)
 
     /** Stage 4 未經 attest 的本體信號數快照（僅測試／診斷用；#136-B3 device-acceptance）。 */
     @VisibleForTesting
     internal fun bodyDestroyUnattestedCount(): Int = bodyDestroyUnattested.get()
+
+    /**
+     * Stage 4 review R2（body vs descendant attribution；診斷用，產品不讀取）：
+     * 本體信號於「兩次讀取皆成功且 `startInstant` 不符」（proven recycled
+     * incarnation，可證回收）時被跳過——**每信號計 1**（與 [pidReuseSkippedCount]
+     * 同時遞增；子孫側跳過不計此計數）。one-shot latch 抑制之剩餘信號不計
+     * （非 mismatch 證實態，純 bystander 保護）；`isAlive()==false` 的常規確認
+     * 死亡不計。上界：per killTree 最多 2（本體兩信號）。
+     * #136-B3 device-acceptance checklist：發佈並讀取本計數（與
+     * [pidReuseSkippedCount]）；host/JVM 預期 ≈0–2（常態 0，mismatch 機率極低）；
+     * 裝置預期 ≈0（一切皆經 unattested 臂，≈2/killTree 計入
+     * [bodyDestroyUnattestedCount]）——其他任何讀數皆須調查。
+     */
+    private val bodyPidReuseSkipped = AtomicInteger(0)
+
+    /** Stage 4 本體 proven-recycled 跳過的信號數快照（僅測試／診斷用；#136-B3 device-acceptance）。 */
+    @VisibleForTesting
+    internal fun bodyPidReuseSkippedCount(): Int = bodyPidReuseSkipped.get()
 
     /**
      * Stage 2A（P1-A7）信號判定（純函數 seam，供 JVM 單測直斷；
@@ -176,6 +245,9 @@ object ElevatedProcessKiller {
      * 允許信號；任一不成立即跳過。`info()` 抛／`startInstant` 缺席以
      * `currentStart=null` 表達；handle 快照不可驗證以 `expectedStart=null` 表達
      * （兩者皆跳過）。PID 已回收（startInstant 不同）即 mismatch→跳過。
+     * 僅子孫路徑使用——本體路徑自 Stage 4 review R1(a) 起不再經本判定式
+     * （僅「proven recycled ⇒ skip」；不可驗一律退化為無條件 destroy，見
+     * [signalBody]）。
      *
      * Stage 2A（T7）：M2/M3 重構僅改呼叫點（不可驗證計數拆分／快照僅 alive
      * 才取／死亡短路），本判定式一字不動（`alive && expectedStart != null &&
@@ -188,6 +260,12 @@ object ElevatedProcessKiller {
         currentStart: Any?,
     ): Boolean = alive && expectedStart != null && expectedStart == currentStart
 
+    /**
+     * Tree kill 入口（Y1 契約見 KDoc）：先子孫（[killDescendantsReflective]）再本體
+     * （[attestBodyDestroy]），兩段各自 runCatching 縱深（互不連坐）。Stage 4 review
+     * F-4：兩路徑各自建構獨立 [HandleAttest] 實例（語義獨立；僅約微秒級純查表，
+     * 無 IPC）——統一建構列為 #136-B3 的 hygiene item，本階段不要求。
+     */
     fun killTree(process: Process) {
         runCatching { killDescendantsReflective(process) }
         // Y1：只管 destroy，不關流（串流由 drain 經已取引用關；此處重調 getter
@@ -202,72 +280,161 @@ object ElevatedProcessKiller {
      * 取 [HandleAttest]（與子孫路徑同一 seam）；兩分支：
      *
      * - **平台完全無 attestation toolkit**（toHandle 缺席／`ProcessHandle` 類缺席／
-     *   `isAlive`／`info` Method 缺席／本次 `startInstant` 探測不可讀——整組工具
+     *   `isAlive`／`info` Method 缺席／本次 `startInstant` 探測不可讀，或 seam
+     *   反射本身抛出任何 Throwable（NoClassDefFoundError 等，C1）——整組工具
      *   缺席，而非單次瞬時讀失敗）：保 kill 契約，降級為今日之**無條件**
      *   `process.destroy()/destroyForcibly()`，且每個未經 attest 的信號計一次
      *   [bodyDestroyUnattested]（once per SIGNAL；一次 killTree 最多 2）。
-     *   探測失敗無法區分結構性缺席與瞬時讀失敗；一律保守歸入 unattested
-     *   （fail toward destruction，kill 契約優先）。平台**有能力** attest 者不走
-     *   此分支——身份不可驗／瞬時讀失敗 ⇒ 跳過＋[pidReuseSkipped]
-     *   （與子孫同款 fail-closed，不誤殺）。
+     *   probe 順序為 **isAlive 先、startInstant 後**（F-2/F-3）：`isAlive()==false`
+     *   ⇒ 本體已死——零信號、零計數（dead body is not a skip, not unattested）；
+     *   `isAlive()==null`（probe 讀不可驗）⇒ unattested（fail toward destruction）；
+     *   僅 `isAlive()==true` 且 `startInstant` 可讀才進入 attested 信號流程。
      * - **平台可 attest**：兩個信號各自獨立重驗（destroy 先、destroyForcibly 後，
      *   每次信號前 `isAlive()`＋`startInstant()` 重讀，與子孫逐信號重驗一致）；
      *   attested ⇒ 信號經 **handle** 的 `destroy/destroyForcibly` Method 發出
-     *   （handle 即 attested 身份），不經 `process.destroy()`；mismatch／
-     *   不可驗 ⇒ 跳過＋[pidReuseSkipped]（[HandleAttest.signalAllowed] 計數）。
+     *   （handle 即 attested 身份；`ProcessHandle.destroy()` 回 Boolean，false 即
+     *   EPERM——handle 信號失敗無聲，與 JDK `process.destroy()` 同，不計入任何
+     *   計數），不經 `process.destroy()`。**R1(a)：本體不再使用
+     *   「unverifiable ⇒ skip」——僅「proven recycled ⇒ skip」**：僅當兩讀皆成功
+     *   且 `startInstant` 不符（可證回收）⇒ 跳過該信號＋[pidReuseSkipped]＋
+     *   [bodyPidReuseSkipped]，並以 one-shot latch 抑制本 killTree 剩餘本體信號
+     *   （bystander 保護不依賴第二次讀取恰好抛）；身份不可驗（`alive == null`／
+     *   快照或重讀 `startInstant` 為 null）⇒ 該信號退化為無條件 destroy＋
+     *   [bodyDestroyUnattested]（fail toward destruction，kill 契約優先）；
+     *   `isAlive()==false`（含 mid-window 兩讀之間死亡）⇒ 跳過該信號，零計數。
      *   本體 handle 未曾存活（`isAlive()==false`）⇒ 兩個信號皆跳過（已死，無
-     *   PID 重用窗口；不計診斷）。fail-closed 方向恆成立：本體信號要嘛至多兩發
-     *   attested，要嘛若干次跳過——無第三結果。
+     *   PID 重用窗口；不計診斷）。
+     *
+     * 誠實聲明（F-2/F-3/F-1）：本守門**僅**偵測「kill 當下兩次讀取之間」的回收
+     * 窗口（plus JDK 原生 `destroy0` 內建 re-check）；pre-existing recycle（kill
+     * 之前 PID 即已被回收）在本 API 契約下不可偵測（無 spawn-time baseline）⇒
+     * mismatch-skip 是唯一偵測手段，且讀取失敗時本體仍會 SIGKILL 一顆已回收的
+     * PID（by design：kill 契約優先；准入 backstop 於 drain verify+quarantine
+     * 終審）。殘餘限 mid-window；真正的 regression-proof 為裝置 E2E＋spawn-time
+     * baseline（後者列為 #136-B3 跟進）。
      */
     private fun attestBodyDestroy(process: Process) {
-        val attest = reflectHandleAttest(process)
+        // C1：reflective seam 的任何 Throwable（如連結期 NoClassDefFoundError）
+        // 一律退化為 unattested 無條件 destroy（kill 契約不破壞），不外抛至 killTree。
+        val attest = runCatching { reflectHandleAttest(process) }.getOrElse {
+            unattestedBodyDestroy(process); return
+        }
         val h = attest.handle
         // 整組 toolkit 探測（僅一次，本體共用；子孫路徑不經本函數）。
-        if (h == null ||
-            !attest.toolkitPresent ||
-            attest.startInstantOf(h) == null
-        ) {
+        if (h == null || !attest.toolkitPresent) {
             unattestedBodyDestroy(process)
             return
         }
-        signalBody(attest, h, attest.destroy, process, forcible = false)
-        signalBody(attest, h, attest.destroyForcibly, process, forcible = true)
+        // F-2/F-3：probe 順序——isAlive 先、startInstant 後。
+        val alive = attest.isAliveOf(h)
+        if (alive == false) {
+            // 已死：零信號、零計數（dead body is not a skip, not unattested）。
+            return
+        }
+        if (alive == null) {
+            // probe 讀不可驗：fail toward destruction。
+            unattestedBodyDestroy(process)
+            return
+        }
+        if (attest.startInstantOf(h) == null) {
+            unattestedBodyDestroy(process)
+            return
+        }
+        // R1(a) one-shot latch：本 killTree 一旦正證 mismatch，剩餘本體信號一律抑制。
+        var mismatchLatched = false
+        mismatchLatched = signalBody(
+            attest, h, attest.destroy, process,
+            forcible = false, mismatchLatched = mismatchLatched,
+        )
+        signalBody(
+            attest, h, attest.destroyForcibly, process,
+            forcible = true, mismatchLatched = mismatchLatched,
+        )
     }
 
     /**
-     * 平台完全無 attestation toolkit：今日之無條件 `process.destroy()/destroyForcibly()`
-     * （kill 契約不破壞），每個未經 attest 的信號計一次 [bodyDestroyUnattested]
-     * （once per SIGNAL；一次 killTree 最多 2）。
+     * 平台完全無 attestation toolkit，或本次 probe 讀取不可驗證：今日之無條件
+     * `process.destroy()/destroyForcibly()`（kill 契約不破壞），每個未經 attest
+     * 的信號計一次 [bodyDestroyUnattested]（once per SIGNAL；一次 killTree 最多 2）。
      */
     private fun unattestedBodyDestroy(process: Process) {
-        runCatching { process.destroy() }
-        bodyDestroyUnattested.incrementAndGet()
-        runCatching { process.destroyForcibly() }
+        unattestedSignal(process, forcible = false)
+        unattestedSignal(process, forcible = true)
+    }
+
+    /** R1(a)：單一本體信號退化為無條件 destroy（kill 契約）並計一次 [bodyDestroyUnattested]。 */
+    private fun unattestedSignal(process: Process, forcible: Boolean) {
+        if (forcible) runCatching { process.destroyForcibly() }
+        else runCatching { process.destroy() }
         bodyDestroyUnattested.incrementAndGet()
     }
 
-    /** Stage 4 單一本體信號（destroy 或 destroyForcibly）：獨立重驗→attested 即發。 */
+    /**
+     * Stage 4 單一本體信號（destroy 或 destroyForcibly）：獨立重驗→attested 即發。
+     *
+     * 回傳值：本 killTree 是否已確立 proven-recycled mismatch（one-shot latch）。
+     * R1(a)：僅「兩讀皆成功且 `startInstant` 不符」才跳過＋[pidReuseSkipped]＋
+     * [bodyPidReuseSkipped] 並閂；身份不可驗一律退化為無條件 destroy＋
+     * [bodyDestroyUnattested]（fail toward destruction，kill 契約優先，不計
+     * pidReuseSkipped——nothing was proven）；`isAlive()==false`（含 mid-window
+     * 兩讀之間死亡）跳過該信號、零計數。latch 已閂 ⇒ 剩餘本體信號一律抑制
+     * （不信號、不計數；bystander 保護不依賴第二次讀取恰好抛）。
+     */
     private fun signalBody(
         attest: HandleAttest,
         h: Any,
         signalMethod: Method?,
         process: Process,
         forcible: Boolean,
-    ) {
+        mismatchLatched: Boolean,
+    ): Boolean {
+        if (mismatchLatched) {
+            // R1(a) one-shot latch：本 killTree 已正證 mismatch——剩餘本體信號
+            // 無條件抑制，不計任何診斷。
+            return true
+        }
         if (signalMethod == null) {
             // handle 缺該信號 Method（ProcessHandle 介面宣告 destroy/destroyForcibly，
             // 實務上不可達；防禦性退化：保 kill 契約＋計 unattested）。
-            if (forcible) runCatching { process.destroyForcibly() }
-            else runCatching { process.destroy() }
-            bodyDestroyUnattested.incrementAndGet()
-            return
+            unattestedSignal(process, forcible)
+            return false
         }
         val alive = attest.isAliveOf(h)
-        if (alive == false) return // 已死：無信號可發（常規態，不計）
-        val expectedStart: Any? = if (alive == true) attest.startInstantOf(h) else null
-        if (attest.signalAllowed(h, expectedStart)) {
-            runCatching { signalMethod.invoke(h) }
+        if (alive == false) return mismatchLatched // 已死（或 mid-window 死亡）：skip，零計數
+        if (alive == null) {
+            // 身份不可驗（isAlive API 讀抛／非常規回傳）：fail toward destruction。
+            unattestedSignal(process, forcible)
+            return mismatchLatched
         }
+        val expectedStart: Any? = attest.startInstantOf(h)
+        if (expectedStart == null) {
+            // 快照不可驗（info 抛／startInstant 缺席）：fail toward destruction。
+            unattestedSignal(process, forcible)
+            return mismatchLatched
+        }
+        // 重讀（kill-window 另一端）：alive＋startInstant。
+        val currentAlive = attest.isAliveOf(h)
+        if (currentAlive == false) return mismatchLatched // mid-window 死亡：skip，零計數
+        if (currentAlive == null) {
+            // 重讀不可驗：fail toward destruction（nothing proven）。
+            unattestedSignal(process, forcible)
+            return mismatchLatched
+        }
+        val currentStart: Any? = attest.startInstantOf(h)
+        if (currentStart == null) {
+            // 重讀不可驗：fail toward destruction（nothing proven）。
+            unattestedSignal(process, forcible)
+            return mismatchLatched
+        }
+        if (currentStart != expectedStart) {
+            // POSITIVE MISMATCH ONLY：proven recycled incarnation ⇒ skip＋計數＋閂
+            // （bystander 保護：本 killTree 剩餘本體信號一律抑制）。
+            pidReuseSkipped.incrementAndGet()
+            bodyPidReuseSkipped.incrementAndGet()
+            return true
+        }
+        runCatching { signalMethod.invoke(h) }
+        return mismatchLatched
     }
 
     private fun killDescendantsReflective(process: Process) {
@@ -276,7 +443,10 @@ object ElevatedProcessKiller {
         // 例 `javaClass` 查表取到的 Method 宣告類不可見，invoke 即
         // IllegalAccessException（setAccessible 又觸 InaccessibleObjectException）。
         // 以宣告類（Process/ProcessHandle，public 且 exported）查表則直通。
-        val attest = reflectHandleAttest(process)
+        // C1 縱深：reflective seam 的任何 Throwable（如連結期 NoClassDefFoundError）
+        // 一律收斂為僅退化單殺本體，不外抛至 killTree——本體銷毀由 killTree 的
+        // 各自 runCatching 保障，不受此連坐。
+        val attest = runCatching { reflectHandleAttest(process) }.getOrNull() ?: return
         // toHandle 缺席／抛／回傳 null（舊 Android 無此 API）：退化單殺
         // （fail-closed；串流由 drain 關）。
         val handle: Any = attest.handle ?: return
@@ -391,7 +561,11 @@ object ElevatedProcessKiller {
      * - info/isAlive Method 原文保留於 [HandleAttest]；Method 存在性由
      *   [toolkitPresent] 表達；讀取成敗由 [isAliveOf]／[startInstantOf] 以
      *   null（不可驗證）表達。
-     * pidReuseSkipped 為本體／子孫共用的診斷計數（僅不可驗證／已回收計）。
+     * pidReuseSkipped 為本體／子孫共用的診斷計數（本體僅 proven-mismatch 計；子孫
+     * 不可驗證／已回收皆計；見 [signalBody]／[HandleAttest.signalAllowed]）。
+     * [signalAllowed] 僅子孫路徑使用——本體路徑（Stage 4 review R1(a)）不再以
+     * 「unverifiable ⇒ skip」語義經此方法，改為不可驗即無條件 destroy（見
+     * [signalBody]）。
      */
     private class HandleAttest(
         val handle: Any?,
@@ -440,6 +614,10 @@ object ElevatedProcessKiller {
             }
         }
 
+        /**
+         * Stage 2A（僅子孫路徑；Stage 4 review R1(a) 起本體路徑不再呼叫本方法——
+         * 不可驗一律退化為無條件 destroy，見 [signalBody]）：逐信號重驗。
+         */
         fun signalAllowed(h: Any, expectedStart: Any?): Boolean {
             val alive = isAliveOf(h)
             if (alive == null) {

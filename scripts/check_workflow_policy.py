@@ -103,7 +103,7 @@ EXPECTED_WORKFLOW_SHA256 = {
         "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564"
     ),
     "pr-check.yml": (
-        "b3a34f2e6af595e5d9b9dcfefa2a6f8b4792b488a9263ae35c66298935683bc2"
+        "837b4c98d85fd5a879e2a078720580a3bfd92539f926e99ca5d28cef5b1e176c"
     ),
     "release.yml": (
         "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f"
@@ -157,6 +157,12 @@ GUARD_HARNESS_RUN = (
 )
 GUARD_CHECK_NAME = "Check workflow policy"
 GUARD_HARNESS_NAME = "Run workflow policy harness"
+GUARD_PINS_NAME = "Pins-absence tripwire (Issue #12)"
+GUARD_PINS_RUN = (
+    "PYTHONPATH=\"$PWD\" PYTHONDONTWRITEBYTECODE=1 python3 -P -m "
+    "unittest scripts/tests/test_build_release_identity.py "
+    "-k CommittedPinsAbsenceControl"
+)
 GUARD_INSTALL_NAME = "Install pinned PyYAML"
 SHADOW_PREFLIGHT_NAME = "Reject Python import shadowing"
 EXPECTED_SHADOW_RUN = (
@@ -265,6 +271,10 @@ EXPECTED_POLICY_FILTER_PATHS = frozenset(
         "scripts/check_workflow_policy.py",
         "scripts/tests/test_workflow_policy.py",
         "scripts/check_python_shadowing.sh",
+        # Any signer-pins-shaped path (root-level or nested) must flip
+        # policy=true so the never-committed tripwire runs (Issue #12).
+        "*signer_pins*",
+        "**/*signer_pins*",
         ".github/workflows/pr-check.yml",
         ".github/workflows/codeql.yml",
         ".github/workflows/nightly-instrumented.yml",
@@ -2137,15 +2147,15 @@ def check_pr_check(path: str, data: dict[Any, Any]) -> list[Finding]:
                 Finding(path, 1, "workflow-guard.timeout-minutes must be 5")
             )
         steps = guard.get("steps")
-        expected_step_count = 5
+        expected_step_count = 6
         if not isinstance(steps, list) or len(steps) != expected_step_count:
             findings.append(
                 Finding(
                     path,
                     1,
-                    "workflow-guard must have exactly five steps (pinned "
+                    "workflow-guard must have exactly six steps (pinned "
                     "checkout, Python shadow preflight, pinned PyYAML install, "
-                    "checker and harness)",
+                    "checker, harness and pins-absence tripwire)",
                 )
             )
             steps = steps if isinstance(steps, list) else []
@@ -2288,14 +2298,34 @@ def check_pr_check(path: str, data: dict[Any, Any]) -> list[Finding]:
                             + " | ".join((GUARD_CHECK_RUN, GUARD_HARNESS_RUN)),
                         )
                     )
+            elif index == 5:
+                findings.extend(
+                    exact_keys(
+                        path,
+                        "workflow-guard pins-absence tripwire step",
+                        step,
+                        frozenset({"name", "run"}),
+                    )
+                )
+                if step.get("name") != GUARD_PINS_NAME or step.get(
+                    "run"
+                ) != GUARD_PINS_RUN:
+                    findings.append(
+                        Finding(
+                            path,
+                            1,
+                            "workflow-guard pins-absence tripwire run command must be "
+                            "exactly: " + GUARD_PINS_RUN,
+                        )
+                    )
         if not steps:
             findings.append(
                 Finding(
                     path,
                     1,
-                    "workflow-guard must have exactly five steps (pinned "
+                    "workflow-guard must have exactly six steps (pinned "
                     "checkout, Python shadow preflight, pinned PyYAML install, "
-                    "checker and harness)",
+                    "checker, harness and pins-absence tripwire)",
                 )
             )
 

@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 
@@ -27,6 +29,212 @@ PINS_CHECKER = ROOT / "scripts" / "check_release_pins.py"
 PINS_EXAMPLE = ROOT / "scripts" / "release_signer_pins.example.json"
 TAG_CHECKER = ROOT / "scripts" / "check_release_tag_version.py"
 APP_BUILD_GRADLE = ROOT / "app" / "build.gradle.kts"
+
+_PINS_EXAMPLE_POSIX = PINS_EXAMPLE.relative_to(ROOT).as_posix()
+
+
+def _normalize_for_match(path: str) -> str:
+    """NFKC-normalize and strip Unicode format characters for path matching.
+
+    Keeps the original separators; callers split on "/" themselves.
+    Lookalike homoglyph substitutions (e.g. Cyrillic і for Latin i) are NOT folded,
+    and neither are Turkish İ (U+0130, whose .lower() splits a dot above) nor
+    U+2011 (non-breaking hyphen); these remain documented limitations of this
+    path-name control; a content-based registry-shape scan shipping in this same tripwire
+    is the defense-in-depth backstop.
+    """
+    normalized = unicodedata.normalize("NFKC", path)
+    return "".join(ch for ch in normalized if unicodedata.category(ch) != "Cf")
+
+
+def _forbidden_signer_pins_path(path: str) -> bool:
+    """Suffix- and component-agnostic tripwire predicate for the pins-absence control.
+
+    A tracked path is forbidden iff ANY path component, lowercased, contains
+    "signer_pins" or "signer-pins" — the pins validator consumes file content,
+    not the filename suffix, so any extension (or none) and any directory
+    component are equally usable as a production registry. The canonical
+    placeholder example is the ONLY exempt path: it is matched byte-exactly
+    (case-sensitive, no normalization) against the raw path. Everything else
+    with a marker component is forbidden, including byte-distinct Unicode
+    lookalikes of the canonical path.
+    """
+    if path == _PINS_EXAMPLE_POSIX:
+        return False
+    normalized = _normalize_for_match(path)
+    return any(
+        marker in part.lower()
+        for part in normalized.split("/")
+        for marker in ("signer_pins", "signer-pins")
+    )
+
+
+def _assert_example_sentinel(example: object) -> None:
+    """Assert the parsed example pins file contains only sentinel placeholders.
+
+    Raises AssertionError if any flavor carries a real-looking value or the
+    top-level shape drifts from the canonical three-flavor placeholder.
+    """
+    if not isinstance(example, dict):
+        raise AssertionError(f"example pins must be a JSON object, got {type(example).__name__}")
+    if set(example) != {"play", "foss", "github"}:
+        raise AssertionError(f"example pins must define exactly play/foss/github, got {sorted(example)}")
+    expected_packages = {
+        "play": "dev.librepocket.agent",
+        "foss": "dev.librepocket.agent.foss",
+        "github": "dev.librepocket.agent.github",
+    }
+    expected_certs = {
+        "play": "PUT_REAL_64_HEX_PIN_HERE_FOR_PLAY",
+        "foss": "PUT_REAL_64_HEX_PIN_HERE_FOR_FOSS",
+        "github": "PUT_REAL_64_HEX_PIN_HERE_FOR_GITHUB",
+    }
+    for flavor in ("play", "foss", "github"):
+        entry = example[flavor]
+        if not isinstance(entry, dict):
+            raise AssertionError(f"example pins entry {flavor!r} must be a JSON object")
+        if set(entry) != {"package", "cert_sha256"}:
+            raise AssertionError(f"example pins entry {flavor!r} must define exactly package/cert_sha256, got {sorted(entry)}")
+        if entry.get("package") != expected_packages[flavor]:
+            raise AssertionError(f"example pins package for {flavor!r} drifted from the canonical placeholder")
+        if entry.get("cert_sha256") != expected_certs[flavor]:
+            raise AssertionError(f"example pins cert_sha256 for {flavor!r} must remain a sentinel placeholder")
+
+
+def _strict_loads(text: str) -> object:
+    """Parse JSON text, rejecting duplicate object keys at any depth.
+
+    Fail-closed: mirrors the pins validator (`check_release_pins.load_pins`), which
+    parses with `object_pairs_hook=_no_duplicate_object`. Plain `json.loads` silently
+    keeps the last duplicate key, so a file could hide certificate-like material under
+    an earlier key while the parsed dict still looked sentinel-clean; this loader
+    raises ValueError instead.
+    """
+    return json.loads(text, object_pairs_hook=signer_pins._no_duplicate_object)
+
+
+def _load_example_strict() -> object:
+    """Read the checked-in example pins file and parse it duplicate-key-strictly.
+
+    Every sentinel assertion against the on-disk example must go through this loader;
+    plain `json.loads` must never gate the example's bytes (duplicate keys would be
+    invisible to the sentinel check).
+    """
+    return _strict_loads(PINS_EXAMPLE.read_text(encoding="utf-8"))
+
+
+def _pairs_collect(pairs: list) -> dict:
+    """``object_pairs_hook`` that keeps every occurrence of each key.
+
+    Builds ``{key: [value, ...]}`` in order of appearance instead of collapsing
+    duplicates last-wins, so a duplicate-key entry can be inspected
+    occurrence by occurrence.
+    """
+    out: dict = {}
+    for key, value in pairs:
+        out.setdefault(key, []).append(value)
+    return out
+
+
+def _dup_aware_loads(text: str) -> object:
+    """Parse JSON keeping every occurrence of every object key (see ``_pairs_collect``)."""
+    return json.loads(text, object_pairs_hook=_pairs_collect)
+
+
+def _registry_shape_offender_from_occurrences(data: object) -> bool:
+    """Flag registry-shaped entries in a duplicate-occurrence parse tree.
+
+    ``data`` is the result of ``_dup_aware_loads``: every object maps each key
+    to the list of all values seen at that key. A strict-parse failure means
+    duplicate keys somewhere in the text (or that the text is not JSON at all,
+    which the caller already maps to False); this scan then flags a
+    ``play``/``foss``/``github`` entry iff:
+
+    - its distinct keyset is exactly ``{"package", "cert_sha256"}`` — the only
+      keys are ``package`` and ``cert_sha256``, possibly duplicated, and
+    - at least one ``cert_sha256`` occurrence matches ``signer_pins._CERT_RE``
+      (a full 64 hex chars, either case), and
+    - at least one ``package`` occurrence matches ``signer_pins._PACKAGE_RE``,
+
+    regardless of which occurrence a last-wins collapse would keep. Well-formed
+    files never reach this branch.
+    """
+    if not isinstance(data, dict):
+        return False
+    for flavor in ("play", "foss", "github"):
+        occurrences = data.get(flavor)
+        if not isinstance(occurrences, list):
+            continue
+        for entry in occurrences:
+            if not isinstance(entry, dict):
+                continue
+            if set(entry) != {"package", "cert_sha256"}:
+                continue
+            certs = entry["cert_sha256"]
+            packages = entry["package"]
+            if not isinstance(certs, list) or not isinstance(packages, list):
+                continue
+            if any(isinstance(c, str) and signer_pins._CERT_RE.fullmatch(c) for c in certs):
+                if any(isinstance(p, str) and signer_pins._PACKAGE_RE.fullmatch(p) for p in packages):
+                    return True
+    return False
+
+
+def _registry_shape_offender(text: str) -> bool:
+    """Content-based registry-shape scan for the pins-absence tripwire.
+
+    Returns True iff ``text`` parses as JSON whose top-level dict contains at least
+    one flavor key (``play``/``foss``/``github``) whose value is exactly
+    ``{"package": <str>, "cert_sha256": <str>}`` with the package matching
+    ``signer_pins._PACKAGE_RE`` and the cert matching ``signer_pins._CERT_RE``
+    (a full 64 hex chars, either case — neither value is lowercased first).
+
+    The duplicate-key interplay is deliberate: a file that strict parsing rejects
+    (duplicate keys anywhere in the text — a well-formed file never fails the
+    strict parse) is retried with ``_dup_aware_loads``, which keeps every
+    occurrence of each key. A duplicate-key entry is registry-shaped when its
+    only keys — possibly duplicated — are ``package`` and ``cert_sha256`` and at
+    least one occurrence of EACH matches the respective regex; a cert occurrence
+    that is 64 hex counts even when a later duplicate key shadows it behind a
+    sentinel. This is exactly the smuggling shape a strict-only scan (or a
+    last-wins collapse) would wave through, and it is why the lenient fallback
+    exists instead of returning False on strict failure. Well-formed files never
+    reach this branch.
+
+    No filename is involved: a real registry committed under an unrelated name
+    (e.g. ``configs/release_pins.json``) is content-flagged here. The canonical
+    sentinel example is not an offender (its certs are ``PUT_REAL_...`` sentinels,
+    which never match ``[0-9A-Fa-f]{64}``); if someone ever puts a real 64-hex
+    cert in it, this scan MUST flag it — there is no exemption.
+    """
+    try:
+        data = _strict_loads(text)
+    except Exception:
+        # Any strict-parse failure (ValueError/JSONDecodeError/RecursionError/...)
+        # falls back to the duplicate-aware parse so duplicate keys cannot hide a
+        # 64-hex cert behind a later sentinel; see the docstring for why.
+        try:
+            data = _dup_aware_loads(text)
+        except Exception:
+            return False  # not JSON at all
+        return _registry_shape_offender_from_occurrences(data)
+    if not isinstance(data, dict):
+        return False
+    for flavor in ("play", "foss", "github"):
+        if flavor not in data:
+            continue
+        value = data[flavor]
+        if not isinstance(value, dict):
+            continue
+        if set(value) != {"package", "cert_sha256"}:
+            continue
+        package, cert = value["package"], value["cert_sha256"]
+        if not isinstance(package, str) or not isinstance(cert, str):
+            continue
+        if signer_pins._PACKAGE_RE.fullmatch(package) and signer_pins._CERT_RE.fullmatch(cert):
+            return True
+    return False
+
 
 FLAVORS = ("play", "foss", "github")
 CONDITIONAL_BACKTICK_GRADLE = (
@@ -1133,6 +1341,270 @@ class SignerPinRegistryTest(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0, result.stdout)
 
+    def test_tripwire_predicate_catches_any_suffix(self) -> None:
+        self.assertFalse(_forbidden_signer_pins_path("scripts/release_signer_pins.example.json"))
+        for forbidden in (
+            "release_signer_pins.data",
+            "release_signer_pins",
+            "docs/RELEASE_SIGNER_PINS.JSON",
+            "docs/signer-pins.yaml",
+            "sub/dir/release_signer_pins.md",
+            "prod_signer_pins.toml",
+            "nested/release_signer_pins.backup",
+            "docs/signer_pins.md",
+        ):
+            self.assertTrue(_forbidden_signer_pins_path(forbidden), forbidden)
+        self.assertFalse(_forbidden_signer_pins_path("scripts/release_signer_pins.example.json"))
+        self.assertFalse(_forbidden_signer_pins_path("docs/TESTING.md"))
+
+    def test_tripwire_predicate_component_and_case_variants(self) -> None:
+        for forbidden in (
+            "signer_pins/prod.json",
+            "sub/signer-pins/x.json",
+            "docs/signer_pins/certs.json",
+            "SCRIPTS/RELEASE_SIGNER_PINS.EXAMPLE.JSON",
+            "\uff53\uff49\uff47\uff4e\uff45\uff52_pins.json",
+            "signer\u200d_pins.json",
+            "\uff53\uff43\uff52\uff49\uff50\uff54\uff53\uff0f\uff52\uff45\uff4c\uff45\uff41\uff53\uff45\uff3f\uff53\uff49\uff47\uff4e\uff45\uff52\uff3f\uff50\uff49\uff4e\uff53\uff0e\uff45\uff58\uff41\uff4d\uff50\uff4c\uff45\uff0e\uff4a\uff53\uff4f\uff4e",
+            "scripts/release_signer_pins.\u200bexample.json",
+        ):
+            self.assertTrue(_forbidden_signer_pins_path(forbidden), forbidden)
+        self.assertFalse(_forbidden_signer_pins_path("docs/TESTING.md"))
+        self.assertFalse(_forbidden_signer_pins_path("scripts/release_signer_pins.example.json"))
+
+    def test_registry_shape_offender_true_cases(self) -> None:
+        canonical_packages = {
+            "play": "dev.librepocket.agent",
+            "foss": "dev.librepocket.agent.foss",
+            "github": "dev.librepocket.agent.github",
+        }
+        one_registry = {
+            "play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16},
+        }
+        full_registry = {
+            flavor: {"package": package, "cert_sha256": "ab12" * 16}
+            for flavor, package in canonical_packages.items()
+        }
+        duplicate_cert = (
+            "{\n"
+            '  "play": {\n'
+            '    "package": "dev.librepocket.agent",\n'
+            f'    "cert_sha256": "{"aa" * 32}",\n'
+            f'    "cert_sha256": "{"ab12" * 16}"\n'
+            "  }\n"
+            "}\n"
+        )
+        # Mirror of the duplicate_cert case with the occurrences swapped: the
+        # 64-hex cert comes FIRST and a sentinel comes LAST. A last-wins
+        # collapse would yield the sentinel and miss this registry; the
+        # duplicate-aware scan MUST flag it because an earlier occurrence
+        # matches the cert shape.
+        all_sentinel_collapse = (
+            "{\n"
+            '  "play": {\n'
+            '    "package": "dev.librepocket.agent",\n'
+            f'    "cert_sha256": "{"aa" * 32}",\n'
+            '    "cert_sha256": "PUT_REAL_64_HEX_PIN_HERE_FOR_PLAY"\n'
+            "  }\n"
+            "}\n"
+        )
+        cases = {
+            "minimal single-flavor registry": json.dumps(one_registry),
+            "full three-flavor registry": json.dumps(full_registry, indent=2),
+            # Lenient collapse: strict parsing rejects the duplicate key, but plain
+            # json.loads keeps the last cert_sha256, yielding the canonical
+            # registry shape with a 64-hex cert — this MUST be flagged.
+            "lenient-collapse duplicate-key registry": duplicate_cert,
+            # Lenient fallback occurrence scan: an earlier 64-hex cert is shadowed
+            # by a later sentinel duplicate key; last-wins collapse would yield the
+            # sentinel and miss it — this MUST be flagged.
+            "all-sentinel-collapse duplicate-key registry": all_sentinel_collapse,
+            # The helper takes only text — no filename is involved, so a registry
+            # committed under an unrelated name is content-flagged regardless of it.
+            "registry-shaped text under an unrelated filename": json.dumps(one_registry),
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                self.assertTrue(_registry_shape_offender(text), name)
+
+    def test_registry_shape_offender_false_cases(self) -> None:
+        canonical_example = (
+            PINS_EXAMPLE.read_bytes().decode("utf-8")  # raw bytes for the scanner, not a sentinel gate
+        )
+        cases = {
+            "canonical on-disk example": canonical_example,
+            "sentinel placeholder cert": json.dumps(
+                {"play": {"package": "dev.librepocket.agent", "cert_sha256": "PUT_REAL_64_HEX_PIN_HERE_FOR_PLAY"}}
+            ),
+            "packages array instead of flavor keys": json.dumps(
+                {"packages": [{"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16}]}
+            ),
+            "package-lock shape": json.dumps({"lockfileVersion": 3, "packages": {}}),
+            "non-64-hex certs": json.dumps(
+                {
+                    "github": {"package": "dev.librepocket.agent.github", "cert_sha256": "xy"},
+                    "foss": {"package": "dev.librepocket.agent.foss", "cert_sha256": "zz" * 32},
+                }
+            ),
+            "not json at all": "not json at all {{{",
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                self.assertFalse(_registry_shape_offender(text), name)
+
+    def test_path_predicate_and_content_scan_compose_for_unmarked_filenames(self) -> None:
+        # This pair documents how the two controls close the gap together: the path
+        # predicate is filename-scoped (this file passes it), while the content scan
+        # flags its registry-shaped bytes regardless of the name it is committed under.
+        self.assertFalse(_forbidden_signer_pins_path("configs/release_pins.json"))
+        release_pins_content = json.dumps(
+            {
+                "play": {"package": "dev.librepocket.agent", "cert_sha256": "cd" * 32},
+                "foss": {"package": "dev.librepocket.agent.foss", "cert_sha256": "cd" * 32},
+                "github": {"package": "dev.librepocket.agent.github", "cert_sha256": "cd" * 32},
+            },
+            indent=2,
+        )
+        self.assertTrue(_registry_shape_offender(release_pins_content))
+
+    def test_checked_in_example_contains_only_sentinel_placeholders(self) -> None:
+        example = _load_example_strict()
+        _assert_example_sentinel(example)
+
+    def test_example_with_one_real_fingerprint_is_rejected_by_sentinel_assertion(self) -> None:
+        example = _load_example_strict()
+        mutated = json.loads(json.dumps(example))
+        mutated["play"]["cert_sha256"] = "ab12" * 16
+        with self.assertRaises(AssertionError):
+            _assert_example_sentinel(mutated)
+        # The file on disk must be untouched and still pass the sentinel assertion.
+        on_disk = _load_example_strict()
+        _assert_example_sentinel(on_disk)
+
+    def test_sentinel_assertion_rejects_other_envelope_mutations(self) -> None:
+        example = _load_example_strict()
+        mutations = {}
+        # (a) play package drift
+        package_drift = json.loads(json.dumps(example))
+        package_drift["play"]["package"] = "dev.librepocket.agent.evil"
+        mutations["play package drift"] = package_drift
+        # (b) extra key in the foss entry
+        extra_key = json.loads(json.dumps(example))
+        extra_key["foss"]["fingerprint"] = "ab12" * 16
+        mutations["foss entry extra key"] = extra_key
+        # (c) missing github flavor
+        missing_github = json.loads(json.dumps(example))
+        del missing_github["github"]
+        mutations["missing github flavor"] = missing_github
+        for name, mutated in mutations.items():
+            with self.subTest(mutation=name):
+                with self.assertRaises(AssertionError):
+                    _assert_example_sentinel(mutated)
+        # The canonical on-disk example must still pass the sentinel assertion.
+        on_disk = _load_example_strict()
+        _assert_example_sentinel(on_disk)
+
+    def test_example_with_duplicate_json_keys_is_rejected(self) -> None:
+        """Duplicate JSON keys must not smuggle certificate-like material past the sentinel check.
+
+        Plain ``json.loads`` keeps the last duplicate key, so the variants below parse
+        to a dict identical to the canonical example and would pass a plain-loads
+        sentinel assertion while 64-hex, certificate-like bytes sit in the file. The
+        strict loader (duplicate-key-rejecting, mirroring the pins validator's
+        ``object_pairs_hook=signer_pins._no_duplicate_object``) raises instead, and
+        every sentinel path against the on-disk example goes through it. Why the strict
+        raise is required: the sentinel assertion alone cannot see duplicate keys, so
+        without a strict parse the byte-level "example stays placeholder-only"
+        guarantee would be void.
+        """
+        # Strictly loaded baseline used only to build comparison values for this test.
+        canonical = _load_example_strict()
+        synthetic_cert = "ab" * 32  # 64 hex chars, certificate-fingerprint-shaped
+
+        def flavor_block(name: str, entry: dict) -> str:
+            return (
+                f'  "{name}": {{\n'
+                f'    "package": "{entry["package"]}",\n'
+                f'    "cert_sha256": "{entry["cert_sha256"]}"\n'
+                f"  }}"
+            )
+
+        other_blocks = ",\n".join(flavor_block(flavor, canonical[flavor]) for flavor in ("foss", "github"))
+
+        # Variant (i): duplicated `cert_sha256` inside the `play` entry — synthetic
+        # 64-hex first, canonical sentinel second. Plain loads keeps the last value,
+        # so the parsed dict equals the canonical example.
+        variant_i = (
+            "{\n"
+            '  "play": {\n'
+            f'    "package": "{canonical["play"]["package"]}",\n'
+            f'    "cert_sha256": "{synthetic_cert}",\n'
+            f'    "cert_sha256": "{canonical["play"]["cert_sha256"]}"\n'
+            "  },\n"
+            + other_blocks
+            + "\n}\n"
+        )
+        # Variant (ii): duplicated top-level `play` flavor key — one `play` object with
+        # a 64-hex cert, one canonical. Plain loads keeps the last `play` object, so
+        # the parsed dict equals the canonical example.
+        variant_ii = (
+            "{\n"
+            '  "play": {\n'
+            f'    "package": "{canonical["play"]["package"]}",\n'
+            f'    "cert_sha256": "{synthetic_cert}"\n'
+            "  },\n"
+            + flavor_block("play", canonical["play"])
+            + ",\n"
+            + other_blocks
+            + "\n}\n"
+        )
+        for name, variant in (
+            ("duplicate cert_sha256 in the play entry", variant_i),
+            ("duplicate top-level play flavor", variant_ii),
+        ):
+            with self.subTest(variant=name):
+                with self.assertRaises(ValueError):
+                    # _strict_loads raises ValueError("duplicate key ...") via
+                    # signer_pins._no_duplicate_object; the bytes never reach the
+                    # sentinel assertion.
+                    _strict_loads(variant)
+        # Document the gap — NOT desired behavior: plain json.loads silently accepts
+        # variant (i) and yields a dict equal to the canonical example. Plain loads is
+        # unsafe and must not be used for the example.
+        self.assertEqual(json.loads(variant_i), canonical)
+        # Same gap for variant (ii): plain loads collapses the duplicate `play` key.
+        self.assertEqual(json.loads(variant_ii), canonical)
+        # The canonical on-disk example still passes the strict loader and the sentinel.
+        _assert_example_sentinel(_load_example_strict())
+
+    def test_sentinel_example_reads_route_through_strict_loader(self) -> None:
+        """Guard the specific regression: PINS_EXAMPLE must be read only via ``_load_example_strict``.
+
+        Scans this module's own source: exactly one line may call the example's
+        ``read_text`` — inside ``_load_example_strict`` — so no assertion path can
+        parse the example with a loader that tolerates duplicate keys. This guards
+        the specific regression: PINS_EXAMPLE must be read only via
+        ``_load_example_strict``; it does not prove absence of every conceivable
+        alternate parse path.
+        """
+        module = sys.modules[__name__]
+        source_lines = inspect.getsource(module).splitlines()
+        needle = "PINS_EXAMPLE" + ".read_text("
+        hits = [index for index, line in enumerate(source_lines) if needle in line]
+        self.assertEqual(
+            len(hits),
+            1,
+            f"{needle} must appear exactly once (inside _load_example_strict); "
+            f"found {len(hits)} occurrence(s) at lines {[index + 1 for index in hits]}",
+        )
+        enclosing = None
+        for line in reversed(source_lines[: hits[0] + 1]):
+            stripped = line.strip()
+            if stripped.startswith("def "):
+                enclosing = stripped[len("def "):].split("(", 1)[0]
+                break
+        self.assertEqual(enclosing, "_load_example_strict")
+
     def test_unknown_flavor_is_rejected(self) -> None:
         path = self._write(
             "pins.json",
@@ -1247,6 +1719,83 @@ class SignerPinRegistryTest(unittest.TestCase):
     def test_non_string_path_is_rejected_fail_closed(self) -> None:
         with self.assertRaises(signer_pins.PinError):
             signer_pins.load_pins(None)  # type: ignore[arg-type]
+
+    def test_foss_and_github_flavor_entries_are_accepted(self) -> None:
+        path = self._write(
+            "pins.json",
+            {
+                "foss": {"package": "dev.librepocket.agent.foss", "cert_sha256": "CD34" * 16},
+                "github": {"package": "dev.librepocket.agent.github", "cert_sha256": "EF56" * 16},
+            },
+        )
+
+        pins = signer_pins.load_pins(str(path))
+
+        self.assertEqual(
+            pins,
+            {
+                "foss": {"package": "dev.librepocket.agent.foss", "cert_sha256": "cd34" * 16},
+                "github": {"package": "dev.librepocket.agent.github", "cert_sha256": "ef56" * 16},
+            },
+        )
+
+    def test_require_flavors_cli_accepts_full_three_flavor_registry(self) -> None:
+        path = self._write(
+            "pins.json",
+            {
+                "play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16},
+                "foss": {"package": "dev.librepocket.agent.foss", "cert_sha256": "cd34" * 16},
+                "github": {"package": "dev.librepocket.agent.github", "cert_sha256": "ef56" * 16},
+            },
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(PINS_CHECKER), "--pins", str(path),
+             "--require-flavors", "play foss github"],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        result_json = json.loads(result.stdout)
+        self.assertEqual(result_json.get("status"), "ok")
+
+    def test_size_cap_boundary_is_exactly_65536_bytes(self) -> None:
+        base = json.dumps(
+            {"play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16}}
+        ).encode("utf-8")
+        self.assertLess(len(base), 65536)
+        at_cap = self.tmp / "pins-at-cap.json"
+        at_cap.write_bytes(base + b" " * (65536 - len(base)))
+        self.assertEqual(at_cap.stat().st_size, 65536)
+        pins = signer_pins.load_pins(str(at_cap))
+        self.assertEqual(pins["play"]["cert_sha256"], "ab12" * 16)
+        over_cap = self.tmp / "pins-over-cap.json"
+        over_cap.write_bytes(base + b" " * (65537 - len(base)))
+        self.assertEqual(over_cap.stat().st_size, 65537)
+        with self.assertRaisesRegex(signer_pins.PinError, "exceeds"):
+            signer_pins.load_pins(str(over_cap))
+
+    def test_package_segment_grammar_rejects_malformed_segments(self) -> None:
+        malformed = ("1abc.def", "dev..agent", "dev-agent.app", "_dev.app")
+        for package in malformed:
+            with self.subTest(package=package):
+                path = self._write(
+                    "pins.json",
+                    {"play": {"package": package, "cert_sha256": "ab12" * 16}},
+                )
+                with self.assertRaisesRegex(signer_pins.PinError, "invalid package"):
+                    signer_pins.load_pins(str(path))
+        path = self._write(
+            "pins.json",
+            {"play": {"package": "dev_agent.app", "cert_sha256": "ab12" * 16}},
+        )
+        pins = signer_pins.load_pins(str(path))
+        self.assertEqual(pins["play"]["package"], "dev_agent.app")
 
     def test_package_length_boundary_and_cert_variants(self) -> None:
         long_ok = "a." + "b" * 251 + ".c"  # 255 chars, valid dotted shape
@@ -2162,6 +2711,134 @@ class ReleaseTagVersionTest(unittest.TestCase):
             with self.subTest(content=content):
                 path.write_text(content, encoding="utf-8")
                 self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+    def test_expression_templates_outside_default_config_are_rejected(self) -> None:
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        block = 'android {\n defaultConfig {\n' + direct + '}\n}\n'
+        path = self.tmp / "expression-template.gradle.kts"
+        cases = (
+            'val x = "${run { 1 }}"\n' + block,
+            'val x = "${count + 1}"\n' + block,  # NOT a simple ${identifier}
+            'val x = """${run { 1 }}"""\n' + block,  # braced template inside raw string at script level
+        )
+        for case in cases:
+            with self.subTest(case=case.splitlines()[0]):
+                path.write_text(case, encoding="utf-8")
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.parse_gradle_version(str(path))
+
+    def test_unbraced_identifier_template_outside_default_config_is_accepted(self) -> None:
+        direct = 'versionCode = 7\nversionName = "1.2.3"\n'
+        block = 'android {\n defaultConfig {\n' + direct + '}\n}\n'
+        path = self.tmp / "unbraced-identifier.gradle.kts"
+        path.write_text('val prefix = "p"\nval x = "$prefix"\n' + block, encoding="utf-8")
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+
+
+class CommittedPinsAbsenceControl(unittest.TestCase):
+    """Issue #12 tripwire: no signer-pins registry is present in the final tracked tree.
+
+    The checked-in placeholder (`scripts/release_signer_pins.example.json`) is the only
+    permitted pins file. Docs (RELEASE.md) forbid committing production pins; this test
+    makes that invariant mechanical. The invariant is suffix- and component-agnostic: the
+    pins validator consumes file content, not the filename suffix, so any file (or
+    extensionless name) where ANY path component contains "signer_pins" or "signer-pins"
+    is rejected, whatever its suffix — or lack of one. Only the exact canonical
+    placeholder example is exempt.
+    Scope: this control enumerates the final tracked tree (`git ls-files`) on every PR
+    and asserts no pins-shaped registry is present in it. A registry added and removed
+    within one PR leaves fingerprints in merge history and is deliberately out of this
+    control's scope (review-time responsibility); this control does not and cannot block
+    registries that only ever lived in history. Beyond the filename predicate above, the
+    control also content-scans every non-symlink tracked file of at most 64 KiB whose
+    raw bytes (with a UTF-8 BOM peeled, if any) decode as UTF-8 and whose first
+    non-whitespace byte is `{`, rejecting any whose JSON shape matches a signer-pins
+    registry (`play`/`foss`/`github` keys mapping to exactly `{"package", "cert_sha256"}`
+    string entries with a dotted package and a 64-hex cert; a duplicate-key entry is
+    flagged when at least one occurrence matches the cert/package shape) — regardless
+    of filename.
+    The checked-in example's sentinel placeholder content is asserted on every PR too,
+    so a placeholder file that drifts from the canonical sentinel shape fails here even
+    without the policy-filtered suites. The example is parsed duplicate-key-strictly
+    (via `_load_example_strict`), so duplicate JSON keys cannot smuggle
+    certificate-like material past that assertion.
+    Fail-closed if git is unavailable, and fail-closed if a tracked file that should
+    exist cannot be stat'ed or read.
+    Runs unconditionally in the `workflow-guard` job of `pr-check.yml` on every PR (and additionally in the policy harness on policy-filtered diffs).
+    """
+
+    def test_no_tracked_production_signer_pins_registry(self) -> None:
+        try:
+            result = subprocess.run(
+                ["git", "ls-files", "-z"],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.fail(f"git ls-files timed out or is unavailable: {exc}")
+        if result.returncode != 0:
+            self.fail(
+                "pins-absence control requires git to enumerate tracked files: "
+                + result.stderr.decode("utf-8", "replace").strip()
+            )
+        tracked = [p for p in result.stdout.decode("utf-8", "replace").split("\0") if p]
+        offenders = sorted(p for p in tracked if _forbidden_signer_pins_path(p))
+        self.assertEqual(
+            offenders,
+            [],
+            "production signer-pin registry must never be committed; only "
+            "scripts/release_signer_pins.example.json is permitted: " + ", ".join(offenders),
+        )
+        # Content scan: filename-agnostic registry-shape detection. A non-symlink
+        # tracked file at most 64 KiB whose raw bytes decode UTF-8 and whose first
+        # non-whitespace byte (after peeling a UTF-8 BOM, if any) is `{` (registry
+        # JSON is an object) is parsed and checked for the registry shape, whatever
+        # its name. A tracked file that cannot be stat'ed or read means the checkout
+        # is broken — fail closed rather than skip. Tracked symlinks are skipped
+        # here (the path predicate above still applies; the pins validator rejects
+        # symlinks). Zero-size files fail the first-byte check and are skipped.
+        content_offenders = []
+        for rel in tracked:
+            path = ROOT / rel
+            # Tracked symlink: skip the content scan (the path predicate above
+            # still applies; check_release_pins.load_pins rejects symlinks).
+            if path.is_symlink():
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError as exc:
+                self.fail(f"tracked file {rel!r} cannot be stat'ed (broken checkout?): {exc}")
+            if size > 64 * 1024:
+                continue
+            try:
+                raw = path.read_bytes()
+            except OSError as exc:
+                self.fail(f"tracked file {rel!r} cannot be read (broken checkout?): {exc}")
+            # Peel a UTF-8 BOM for the first-non-whitespace `{` check and evaluate
+            # the BOM-free body; BOM'd files stay in scope.
+            body = raw[3:] if raw.startswith(b"\xef\xbb\xbf") else raw
+            if body.lstrip()[:1] != b"{":
+                continue
+            try:
+                text = body.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if _registry_shape_offender(text):
+                content_offenders.append(rel)
+        self.assertEqual(
+            sorted(content_offenders),
+            [],
+            "production signer-pin registry shape found in tracked file(s) "
+            "(content scan, filename-agnostic): " + ", ".join(sorted(content_offenders)),
+        )
+        # The sentinel example itself is asserted on every PR, unconditionally.
+        # The example is parsed duplicate-key-strictly, so hidden duplicate keys
+        # (which plain json.loads would silently collapse) cannot smuggle
+        # certificate-like material past the sentinel check.
+        _assert_example_sentinel(_load_example_strict())
 
 
 if __name__ == "__main__":

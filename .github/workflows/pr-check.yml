@@ -109,6 +109,9 @@ jobs:
               # be able to bypass the gates it edits.
               - '.github/workflows/**'
               - '.github/actions/**'
+              # Signer-pins-shaped basenames flip policy=true (defense-in-depth; enforcement is the workflow-guard tripwire above, unconditional). Marker-named directories do not match these globs; gitignore does not cover them either — the tripwire does.
+              - '*signer_pins*'
+              - '**/*signer_pins*'
               # Trailing catch-all: the explicit entries above exist for
               # readability/history; this glob defaults new scripts/ harness
               # code (any new checker or script test) into the policy gate
@@ -159,6 +162,9 @@ jobs:
 
       - name: Run workflow policy harness
         run: PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 python3 -P -m unittest scripts/tests/test_workflow_policy.py
+
+      - name: "Pins-absence tripwire (Issue #12)"
+        run: PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 python3 -P -m unittest scripts/tests/test_build_release_identity.py -k CommittedPinsAbsenceControl
 
   unit-tests:
     name: Unit & Robolectric Tests (${{ matrix.flavor }})

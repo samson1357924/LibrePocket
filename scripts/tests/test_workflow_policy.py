@@ -1443,7 +1443,7 @@ jobs:
                 1,
             ),
         )
-        self._assert_rejected("workflow-guard must have exactly five steps")
+        self._assert_rejected("workflow-guard must have exactly six steps")
 
     def test_workflow_guard_missing_run_step_is_rejected(self) -> None:
         self._write(
@@ -1455,7 +1455,7 @@ jobs:
                 1,
             ),
         )
-        self._assert_rejected("workflow-guard must have exactly five steps")
+        self._assert_rejected("workflow-guard must have exactly six steps")
 
     def test_workflow_guard_missing_shadow_preflight_is_rejected(self) -> None:
         self._write(
@@ -1469,7 +1469,7 @@ jobs:
                 1,
             ),
         )
-        self._assert_rejected("workflow-guard must have exactly five steps")
+        self._assert_rejected("workflow-guard must have exactly six steps")
 
     def test_workflow_guard_modified_shadow_preflight_is_rejected(self) -> None:
         self._write(
@@ -1549,7 +1549,59 @@ jobs:
                 1,
             ),
         )
-        self._assert_rejected("workflow-guard must have exactly five steps")
+        self._assert_rejected("workflow-guard must have exactly six steps")
+
+    def test_workflow_guard_missing_pins_tripwire_step_is_rejected(self) -> None:
+        self._write(
+            "pr-check.yml",
+            PR_CHECK.replace(
+                '      - name: "Pins-absence tripwire (Issue #12)"\n'
+                '        run: PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 '
+                "python3 -P -m unittest scripts/tests/test_build_release_identity.py "
+                "-k CommittedPinsAbsenceControl\n",
+                "",
+                1,
+            ),
+        )
+        self._assert_rejected("workflow-guard must have exactly six steps")
+
+    def test_workflow_guard_pins_tripwire_run_is_rejected(self) -> None:
+        self._write(
+            "pr-check.yml",
+            PR_CHECK.replace(
+                '      - name: "Pins-absence tripwire (Issue #12)"\n'
+                '        run: PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 '
+                "python3 -P -m unittest scripts/tests/test_build_release_identity.py "
+                "-k CommittedPinsAbsenceControl\n",
+                '      - name: "Pins-absence tripwire (Issue #12)"\n'
+                "        run: 'true'\n",
+                1,
+            ),
+        )
+        self._assert_rejected(
+            "workflow-guard pins-absence tripwire run command must be exactly"
+        )
+
+    def test_workflow_guard_pins_tripwire_before_install_is_rejected(self) -> None:
+        # Finding association is via the index-5 fallout: moving the pins step
+        # before "Install pinned PyYAML" lands the harness at index 5, which the
+        # exact-run pin on the workflow-guard steps enforces.
+        pins_step = (
+            '      - name: "Pins-absence tripwire (Issue #12)"\n'
+            '        run: PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 '
+            "python3 -P -m unittest scripts/tests/test_build_release_identity.py "
+            "-k CommittedPinsAbsenceControl\n"
+        )
+        workflow = PR_CHECK
+        self.assertIn(pins_step, workflow)
+        workflow = workflow.replace(pins_step, "", 1)
+        anchor = "      - name: Install pinned PyYAML\n"
+        self.assertIn(anchor, workflow)
+        workflow = workflow.replace(anchor, pins_step + anchor, 1)
+        self._write("pr-check.yml", workflow)
+        self._assert_rejected(
+            "workflow-guard pins-absence tripwire run command must be exactly"
+        )
 
     def test_workflow_guard_unpinned_install_is_rejected(self) -> None:
         self._write(
@@ -1807,6 +1859,16 @@ jobs:
             PR_CHECK.replace("              - '.github/workflows/**'\n", "", 1),
         )
         self._assert_rejected("policy filter is missing: .github/workflows/**")
+
+    def test_policy_filter_requires_signer_pins_paths(self) -> None:
+        for pattern in ("*signer_pins*", "**/*signer_pins*"):
+            with self.subTest(pattern=pattern):
+                self._reset_workflows()
+                self._write(
+                    "pr-check.yml",
+                    self._remove_filter_pattern("policy", pattern),
+                )
+                self._assert_rejected(f"policy filter is missing: {pattern}")
 
     def _remove_filter_pattern(self, filter_name: str, pattern: str) -> str:
         markers = {

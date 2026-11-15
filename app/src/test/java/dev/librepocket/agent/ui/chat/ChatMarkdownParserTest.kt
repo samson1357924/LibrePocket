@@ -1864,26 +1864,45 @@ class ChatMarkdownParserTest {
         // head re-scan per card costs Theta(K^2) (the last K cards each re-skip K consumed
         // entries), while cursor consumption is amortized O(K). Doubling K must therefore
         // scale ~linearly (bound strictly inside (2, 4)).
-        fun timed(k: Int): Long {
-            val prev = List(k) { "same-dup-content" }
-            val curr = List(2 * k) { "same-dup-content" }
-            val prevIds = List(k) { "prev-$it" }
-            val currIds = List(2 * k) { "curr-$it" }
-            val currSet = currIds.toSet()
+        // 與 shared-triple scaling test（884fce1b，#140）相同的 interleaved sampling：
+        // 每輪 back-to-back 量測 k 與 2k，drift 為 common-mode，比值由 per-side median 決定；bound 維持 3.5。
+        // CI 43679602842（github flavor）t2 相位遭遇 runner 爭用，ratio 4.10 > 3.5（t1=9.4ms, t2=38.5ms）。
+        val prev1 = List(4000) { "same-dup-content" }
+        val prevIds1 = List(4000) { "prev-$it" }
+        val curr1 = List(8000) { "same-dup-content" }
+        val currIds1 = List(8000) { "curr-$it" }
+        val prev2 = List(8000) { "same-dup-content" }
+        val prevIds2 = List(8000) { "prev-$it" }
+        val curr2 = List(16000) { "same-dup-content" }
+        val currIds2 = List(16000) { "curr-$it" }
+        val currSet1 = currIds1.toSet()
+        val currSet2 = currIds2.toSet()
+        fun timedOnce(
+            prev: List<String>,
+            prevIds: List<String>,
+            currIds: List<String>,
+            curr: List<String>,
+            currSet: Set<String>,
+        ): Long {
             repeat(5) {
                 alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
             }
-            val samples = LongArray(7) {
-                val start = System.nanoTime()
-                repeat(10) {
-                    alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
-                }
-                System.nanoTime() - start
+            val start = System.nanoTime()
+            repeat(10) {
+                alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
             }
-            return samples.sorted()[samples.size / 2]
+            return System.nanoTime() - start
         }
-        val t1 = timed(4000)
-        val t2 = timed(8000)
+        // Interleaved rounds: each round measures both back to back so machine
+        // drift hits both sides equally; ratio uses per-side medians.
+        val samples1 = LongArray(7)
+        val samples2 = LongArray(7)
+        repeat(7) { i ->
+            samples1[i] = timedOnce(prev1, prevIds1, currIds1, curr1, currSet1)
+            samples2[i] = timedOnce(prev2, prevIds2, currIds2, curr2, currSet2)
+        }
+        val t1 = samples1.sorted()[samples1.size / 2]
+        val t2 = samples2.sorted()[samples2.size / 2]
         val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
         assertTrue(
             "identity-only duplicate 2x-input ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)",

@@ -13,6 +13,8 @@ import java.io.IOException
 import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.GZIPOutputStream
 import kotlinx.coroutines.CancellationException
@@ -877,6 +879,52 @@ class WebExtractD4Test {
         val again = svc.extract("https://example.com/inv", resolver = dns) as WebExtractOutcome.Ok
         assertFalse("invalidate 後必須重打 upstream", again.cached)
         assertEquals(2, http.calls.get())
+    }
+
+    @Test fun blockedAtDnsThenInvalidateThenJoin() = runBlocking {
+        // #2 反例之決定性屏障：caller A 進入 extract()、於初始 DNS preflight 被卡住
+        // （尚未註冊任何 inFlight 條目）；invalidate() 在空 inFlight 上完成並 bump
+        // 世代；放行舊 caller。舊 caller 的 election 必須偵測世代漂移並有界重試
+        // （不得建立舊世代 inFlight 條目）；post-invalidate caller B 不得加入
+        // 舊世代工作、兩者必須收斂於同一個以 10.0.0.12（而非 10.0.0.11）釘住的上游回應。
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val dnsCalls = AtomicInteger(0)
+        val dns = HostResolver { _ ->
+            if (dnsCalls.getAndIncrement() == 0) {
+                entered.countDown()
+                // 30ms 上限：避免 invalidate 路徑損壞時死鎖（逾時照樣返回第一個答案，
+                // 由 epoch-namespaced election 丟棄該輪、走重試）。
+                release.await(30, TimeUnit.MILLISECONDS)
+                listOf(InetAddress.getByName("10.0.0.11"))
+            } else {
+                listOf(InetAddress.getByName("10.0.0.12"))
+            }
+        }
+        val http = FakeExtract { okResp(html()) }
+        val cache = WebExtractCache()
+        val svc = WebExtractService(http, cache = cache)
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val url = "https://barrier.example/x"
+        val a = async { svc.extract(url, optIn = optIn, resolver = dns) }
+        // 注意：runBlocking 事件迴圈不可被阻塞式 await 佔住——以 delay 輪詢讓出執行權。
+        withTimeout(5_000) { while (entered.count > 0L) delay(1) }
+        assertEquals("A 必須進入 DNS preflight", 0L, entered.count)
+        // A 被擋在 preflight 內、尚未 election；invalidate 此刻應 drain 空 map 且 bump 世代。
+        svc.invalidate()
+        release.countDown()
+        val b = async { svc.extract(url, optIn = optIn, resolver = dns) }
+        val aOut = withTimeout(10_000) { a.await() }
+        val bOut = withTimeout(10_000) { b.await() }
+        assertTrue("A 必須 Ok（重試後），got $aOut", aOut is WebExtractOutcome.Ok)
+        assertTrue("B 必須 Ok，got $bOut", bOut is WebExtractOutcome.Ok)
+        // (ii) A 之 HTTP 建連必須釘住 10.0.0.12——10.0.0.11 之評估結果於重試後被丟棄。
+        assertEquals(1, http.pinnedAddressesSeen.size)
+        assertEquals(listOf(addr("10.0.0.12")), http.pinnedAddressesSeen.first())
+        // (iii) 全程僅一次上游 fetch（single-flight 收斂；A 重試後與 B 同一世代、同一 key）。
+        assertEquals(1, http.calls.get())
+        // (iv) cache 恰一筆（世代一致，寫入未被抑制）。
+        assertEquals(1, cache.size)
     }
 
     @Test fun pausedLeaderInvalidateDropsStaleWrite() = runBlocking {

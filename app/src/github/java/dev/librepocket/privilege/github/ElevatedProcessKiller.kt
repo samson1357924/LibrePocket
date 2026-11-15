@@ -118,6 +118,8 @@ object ElevatedProcessKiller {
      * 行為，必須由 #136-B3 以裝置端證據決定——pidReuseSkipped 必須列入
      * #136-B3 裝置驗收清單（device-acceptance checklist）：啟用提權 runner
      * 前，須先以真機量測本計數確認平台 attest 能力。
+     * 上界：per handle per killTree 最多 2 次（destroy＋destroyForcibly 各重驗一次）；
+     * 完全不可 attest 平台讀數≈2×descendants；must feed #136-B3 device-acceptance.
      */
     private val pidReuseSkipped = AtomicInteger(0)
 
@@ -220,11 +222,16 @@ object ElevatedProcessKiller {
                 // 注意（R2-A 同款陷阱）：info 的執行時類（如 `ProcessHandleImpl$Info`）
                 // 常為模組內 package-private，`info.javaClass.getMethod("startInstant")`
                 // 取到的 Method 宣告類不可見 → invoke 即 IllegalAccessException。
-                // 故以 runtime 宣告類的公開介面（ProcessHandle$Info）查表，不繫結
-                // 任何編譯期型別（舊 Android 缺席亦自然收斂為 null＝不可驗證）。
-                val infoIface = info.javaClass.interfaces.firstOrNull { cls ->
-                    cls.methods.any { it.name == "startInstant" && it.parameterCount == 0 }
-                } ?: return null
+                // 故以 runtime 宣告類的公開介面查表，不繫結任何編譯期型別
+                // （舊 Android 缺席亦自然收斂為 null＝不可驗證）。
+                // 走整個 superclass 鏈（generateSequence … superclass）逐層取其直接
+                // interfaces（不遞迴超介面——各層 `it.interfaces` 非遞迴直取），覆蓋
+                // 「startInstant 宣告於父類實作之介面」的平台實作。
+                val infoIface = generateSequence(info.javaClass as Class<*>) { it.superclass }
+                    .flatMap { it.interfaces.asSequence() }
+                    .firstOrNull { cls ->
+                        cls.methods.any { it.name == "startInstant" && it.parameterCount == 0 }
+                    } ?: return null
                 val opt = infoIface.getMethod("startInstant").invoke(info) ?: return null
                 val present =
                     opt.javaClass.getMethod("isPresent").invoke(opt) as? Boolean ?: false

@@ -144,8 +144,9 @@ import java.util.concurrent.TimeUnit
  * - 殘留 gobbler／stdin-closer 計數（啟動不預佔；join 超界仍存活即 interrupt＋grace，
  *   仍存活即 [ElevatedCleanupTracker.markLingering]：每執行緒三態
  *   [AtomicInteger]（0=init／1=held／2=done）＋僅未計數時佔槽，
- *   執行緒本體 finally 釋放；清理 worker 維持啟動佔／
- *   finally 釋，不變）；
+ *   執行緒本體 finally 釋放；清理 worker 不自釋——Stage 3b slot-ownership
+ *   transfer：槽位跨 post-kill verify 由 drain 呼叫方持有，verify 結果已知後
+ *   釋放一次（見 [runCleanupBounded]））；
  * - linger 成功走 [ElevatedCleanupTracker.noteUnclean]（finished／kill 統一終審
  *   `if (cleanupIncomplete) noteUnclean() else if (outstanding()==0) noteClean()`；
  *   cleanupIncomplete 含殘留 gobbler／stdin；正常完成且全域無殘留仍 noteClean，
@@ -393,6 +394,8 @@ internal object ElevatedCleanupTracker {
      * （不可中斷 Binder kill），沒有任何 handle 可回收它。本計數累計此類
      * 「併發無槽」事件（worker 起動當下累計，與是否卡住無關；是否卡住沒有
      * 可移植的同步判定點，故不設登記閂——計數是「曾發生」而非「當前存活數」）。
+     * 飽和登記解除只能等下一次 admission-triggered sweep 驗證死亡
+     * （drain 不自行清除 quarantine，避免重新打開未驗證登記競態）。
      */
     private val untrackedResidual = AtomicInteger(0)
 
@@ -412,6 +415,24 @@ internal object ElevatedCleanupTracker {
      */
     private val killNeverAttempted = AtomicInteger(0)
 
+    /**
+     * Stage 3b（P2，quarantine 登記失敗記數；與 [noteUnclean] 分離，純診斷）：
+     * 遞增站點（現碼 `grep noteQuarantineRegistrationFailed` 全數）：
+     * 1. acquire-throw 臂 ×3——`startLateDaemon` 佔槽拋（晚補償 caller 臂）、
+     *    `compensateInline` 佔槽拋（worker 內聯補償臂）、
+     *    `runCleanupBounded` 佔槽拋（drain 臂）；
+     * 2. 兩個 late 臂的 second-chance 二次登記拋出（臂內再失敗）；
+     * 3. `runCleanupBounded` 起線程失敗臂內的二次登記拋出（登記再失敗）；
+     * 4. [releaseCleanupSlotAfterVerify] 登記拋出（單一計數站點，涵蓋 drain 三處
+     *    verify 臂／preflight 臂／晚補償 daemon/inline 臂及所有 helper 冪等重試）。
+     * `lateCompensateSpawn` 內層 guarded attempt 不計數（N5 已單站點化）。
+     * 語義見 [noteQuarantineRegistrationFailed]：每次拋出的登記嘗試計數一次；單一 incident
+     * 可能至多計 2 次（臂內＋helper 重試）；告警接線一律以 `>0` 判定，禁止當作唯一失敗計數。
+     * 登記失敗＝槽保留（admission 續拒）之 fail-closed 記數；app 重啟前不可自清、應告警。
+     * 零消費方（僅診斷可見）：非零即 fail-closed brick 需 app 重啟恢復；告警/上報接線歸 #136-B3
+     */
+    private val quarantineRegistrationFailed = AtomicInteger(0)
+
     /** untracked 殘留 worker 起動累計數（僅測試／診斷用；產品不讀取）。 */
     internal fun untrackedResidualCount(): Int = untrackedResidual.get()
 
@@ -424,6 +445,19 @@ internal object ElevatedCleanupTracker {
 
     internal fun noteKillNeverAttempted() {
         killNeverAttempted.incrementAndGet()
+    }
+
+    /** quarantine 登記失敗累計數（僅測試／診斷用；產品不讀取）。 */
+    @VisibleForTesting
+    internal fun quarantineRegistrationFailedCount(): Int = quarantineRegistrationFailed.get()
+
+    /**
+     * 遞增「quarantine 登記失敗」計數。語義＝每次拋出的登記嘗試計數一次；
+     * 單一 incident 可能至多計 2 次（臂內二次登記＋helper 重試各一次）。
+     * 告警接線一律以 `>0` 判定，禁止當作唯一失敗計數（亦不得據此反推殘留 handle 數）。
+     */
+    internal fun noteQuarantineRegistrationFailed() {
+        quarantineRegistrationFailed.incrementAndGet()
     }
 
     /** 目前未完成清理數（跨呼叫全域，雙 runner 共用；僅計未完成，正常完成即釋放）。 */
@@ -937,6 +971,7 @@ internal object ElevatedCleanupTracker {
      * 乾淨態第二呼叫即 `0+2*7>7` 走 BACKLOG_FULL，不會走到 `active>=4`），
      * 為未來放寬 MAX／SLOTS 後的併發上限保留，不刪分支；reservation 矩陣直測見
      * `ElevatedCleanupTrackerTest`（不經 runner，直接斷言預留表）。
+     * admission 在 outstanding==0 時仍依賴 MAX_OUTSTANDING_CLEANUPS=7／SLOTS_PER_CALL=7 的保留算式；調大 MAX 會使單活 orphan 可旁觀而 admit，框架勿在未補 leak-gate 前調整。
      */
     fun tryEnterReserved(): Admission = synchronized(lock) {
         val decision = classifyAdmissionLocked()
@@ -1000,7 +1035,10 @@ internal object ElevatedCleanupTracker {
     }
 
     /**
-     * 釋一槽（`runCleanupBounded` worker finally 或殘留執行緒本體 finally 調用）。
+     * 釋一槽（Stage 3b slot-ownership transfer 後，`runCleanupBounded` 不自釋放：
+     * 已佔槽經 `slotHeldOut` 移交 drain 呼叫方，呼叫方在 post-kill verify 結果已知後
+     * 調用——verify 窗口內 slot 始終由呼叫方持有，live victim 於驗證完成前始終被
+     * 追蹤——或殘留執行緒本體 finally 調用）。
      *
      * floor 觸發即 bug（未佔而釋）：產品保持 floor 不變負，但經
      * [releaseFloorHits] 計數上報（測用不断言，僅供診斷；正常三態機制下永不觸發）。
@@ -1748,7 +1786,7 @@ internal object ElevatedCallSupervisor {
      *   Stage 2A（P1-A1）：兩飽和臂改經 [ElevatedCleanupTracker.acquireSlotOrQuarantine]
      *   （同一鎖內佔槽或登記二選一，無中間縫隙），消除「outstanding 歸零→登記」間
      *   並行准入的 fail-open 窗口（舊碼 acquire false→登記為兩次獨立取鎖）；
-     * - `t.start()` 抛即先 quarantine 登記＋置旗＋計數、再釋槽（關閉 outstanding==0
+     * - `t.start()` 抛即經 helper 登記先於釋槽（登記拋出則槽保留 fail-closed）；置旗＋計數於 helper 返回後（關閉 outstanding==0
      *   且 quarantine 為空的 admission fail-open 窗口；同步有界收斂，不靜默丟 owner；
      *   資源壓力最高時不放大，不重試起線程）；
      * - 單 call breaker 恰好一次（[uncleanCounted] guard：lingering 與 late 雙因不雙計，
@@ -1793,9 +1831,14 @@ internal object ElevatedCallSupervisor {
 
     /**
      * [awaitSpawn] 的 internal seam（測試注入用）：`startThread` 注入線程起動方式。
-     * 注入的 starter 契約：要麼完整啟動線程，要麼在啟動之前拋出；starts-then-throws
-     * 會雙釋同一槽（daemon finally 釋＋本函數 catch 釋）並觸發 release floor counter——
-     * 注入方必須保證「抛即未起」。
+     * 注入的 starter 契約：要麼完整啟動線程，要麼在啟動之前拋出。
+     * starts-then-throws 非 supported 形狀：晚補償 daemon 體內以
+     * `releaseCleanupSlotAfterVerify`（clean→release）恰好釋放一次、無 finally
+     * release；若 starter 於啟動後才拋，本函數 catch 臂會再以
+     * slotHeld=acquired 呼叫 helper。登記重試經 `===` 去重冪等，但 release 無去重——
+     * daemon 體內 helper 與 catch 臂可能各自 releaseSlot，outstanding 被扣多次；
+     * `releaseSlot` floor 僅防負計數，帳目仍可能失真；故「抛即未起」不可放寬，
+     * 不得依賴此路徑（releaseFloorHits 為該違例注入的唯一 tripwire）。
      */
     internal fun awaitSpawnWithThreadStarter(
         deadlineNanos: Long,
@@ -1834,7 +1877,7 @@ internal object ElevatedCallSupervisor {
         // - 飽和（acquire false）即不起 daemon，不嘗試 kill（無槽即無法保證有界
         //   supervision）；handle 一律轉入 quarantine 登記＋countUncleanOnce 記殘留
         //   （fail-closed：owner 仍為唯一追蹤者，記為殘留而非丟棄，breaker 終審擋新 spawn）；
-        // - t.start() 抛即先 quarantine 登記＋置旗＋計數、再釋槽（關閉 outstanding==0
+        // - t.start() 抛即經 helper 登記先於釋槽（登記拋出則槽保留 fail-closed）；置旗＋計數於 helper 返回後（關閉 outstanding==0
         //   且 quarantine 為空的 admission fail-open 窗口；同步有界收斂，不靜默丟 owner；
         //   不再重試起線程，資源壓力最高時不放大）；
         // - daemon 終審：incomplete 才計數（guard 保 lingering 不雙計），verified
@@ -1854,7 +1897,20 @@ internal object ElevatedCallSupervisor {
             // Stage 2A（P1-A1）：佔槽或登記 quarantine 同一鎖內原子二選一——
             // 消除「outstanding 歸零→quarantine 登記」縫隙的 fail-open 窗口
             // （並行准入不可能看見 outstanding==0 且 quarantine 為空的中間態）。
-            val acquired = ElevatedCleanupTracker.acquireSlotOrQuarantine(v)
+            // fail-closed：acquireSlotOrQuarantine 本身抛（如 VME in ArrayList.add）——
+            // 不 kill、不 release（槽從未取得）、handle untracked-but-flagged：
+            // 置 incomplete＋計數＋noteQuarantineRegistrationFailed，立即返回
+            // （與飽和臂一致的有界收敛，不外抛）。
+            val acquired = try {
+                ElevatedCleanupTracker.acquireSlotOrQuarantine(v)
+            } catch (_: Throwable) {
+                ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
+                // 此臂無 verify 階段：second-chance 登記失敗即無後續重試，僅 breaker（countUncleanOnce）＋診斷計數＋#136-B3 接管。
+                try { ElevatedProcessIo.quarantineRegistrar(v) } catch (_: Throwable) { ElevatedCleanupTracker.noteQuarantineRegistrationFailed() }
+                lateIncomplete.set(true)
+                countUncleanOnce()
+                return
+            }
             if (!acquired) {
                 // 飽和（fail-closed）：不嘗試 kill——無槽即無法保證有界 supervision，
                 // 任何 kill 嘗試（即便 detached）都會成為無追蹤殘留。handle 已由
@@ -1866,17 +1922,17 @@ internal object ElevatedCallSupervisor {
             }
             try {
                 val t = Thread({
-                    try {
-                        val clean = try {
-                            lateCompensateSpawn(v, killer)
-                        } catch (_: Throwable) {
-                            ElevatedCleanupTracker.quarantineUnverified(v)
-                            false
-                        }
-                        if (!clean) countUncleanOnce()
-                    } finally {
-                        ElevatedCleanupTracker.releaseSlot()
+                    val clean = try {
+                        lateCompensateSpawn(v, killer)
+                    } catch (_: Throwable) {
+                        false
                     }
+                    // Stage 4（P2）：登記改由 releaseCleanupSlotAfterVerify 執行
+                    // （clean→release；未驗證＋登記成功→release；登記拋出→槽保留
+                    // fail-closed＋noteQuarantineRegistrationFailed）。
+                    // quarantine 登記為 `===`-dedup 冪等；slot release 由 slotHeld 單次釋放（caller 保有 ownership）。
+                    ElevatedProcessIo.releaseCleanupSlotAfterVerify(v, clean, slotHeld = true)
+                    if (!clean) countUncleanOnce()
                 }, "elevated-late-spawn")
                 t.isDaemon = true
                 startThread(t)
@@ -1884,13 +1940,16 @@ internal object ElevatedCallSupervisor {
                 // 起線程失敗（例如 OOM）：不嘗試 kill——無法保證有界 supervision，
                 // 亦不再起任何 detached 線程；handle 轉入 quarantine 登記（准入阻擋＋
                 // verifier 復核），置 incomplete/unclean，同步有界收斂，不重試起線程。
-                // 順序（F1）：先 quarantine＋置旗＋計數再釋槽——關閉 outstanding==0
+                // 順序（F1）：登記先於釋槽（helper 內）；置旗＋計數於 helper 返回後——關閉 outstanding==0
                 // 且 quarantine 為空的 admission fail-open 窗口（並行 caller 可能
                 // 在釋槽後、登記前看見全空）；槽確已取得，release 不可少。
-                ElevatedCleanupTracker.quarantineUnverified(v)
+                // Stage 4（P2）：登記改由 releaseCleanupSlotAfterVerify 執行
+                // （verified=false → quarantine 先行、release 殿後；登記拋出則槽保留
+                // fail-closed＋note，不復審）。舊碼 releaseSlot 已由 helper 涵蓋，移除。
+                // quarantine 登記為 `===`-dedup 冪等；slot release 由 slotHeld 單次釋放（caller 保有 ownership）。
+                ElevatedProcessIo.releaseCleanupSlotAfterVerify(v, verified = false, slotHeld = acquired)
                 lateIncomplete.set(true)
                 countUncleanOnce()
-                ElevatedCleanupTracker.releaseSlot()
             }
         }
         val worker = try {
@@ -1903,7 +1962,19 @@ internal object ElevatedCallSupervisor {
                     if (expired.get()) {
                         fun compensateInline(v: Process) {
                             // Stage 2A（P1-A1）：同一鎖內原子二選一（見 [acquireSlotOrQuarantine]）。
-                            val acquired = ElevatedCleanupTracker.acquireSlotOrQuarantine(v)
+                            // fail-closed：acquireSlotOrQuarantine 本身抛——不 spawn 線程、
+                            // 不 releaseSlot（槽從未取得，acquire 失敗路徑未遞增 outstanding），
+                            // 置 incomplete＋計數＋noteQuarantineRegistrationFailed，立即返回。
+                            val acquired = try {
+                                ElevatedCleanupTracker.acquireSlotOrQuarantine(v)
+                            } catch (_: Throwable) {
+                                ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
+                                // 此臂無 verify 階段：second-chance 登記失敗即無後續重試，僅 breaker（countUncleanOnce）＋診斷計數＋#136-B3 接管。
+                                try { ElevatedProcessIo.quarantineRegistrar(v) } catch (_: Throwable) { ElevatedCleanupTracker.noteQuarantineRegistrationFailed() }
+                                lateIncomplete.set(true)
+                                countUncleanOnce()
+                                return
+                            }
                             if (!acquired) {
                                 // 飽和（fail-closed）：不嘗試 kill——無槽即無法保證
                                 // 有界 supervision，任何 kill 嘗試（即便 detached）都會
@@ -1914,19 +1985,17 @@ internal object ElevatedCallSupervisor {
                                 countUncleanOnce()
                                 return
                             }
-                            try {
-                                val clean = try {
-                                    lateCompensateSpawn(v, killer)
-                                } catch (_: Throwable) {
-                                    ElevatedCleanupTracker.quarantineUnverified(v)
-                                    false
-                                }
-                                if (!clean) {
-                                    lateIncomplete.set(true)
-                                    countUncleanOnce()
-                                }
-                            } finally {
-                                ElevatedCleanupTracker.releaseSlot()
+                            val clean = try {
+                                lateCompensateSpawn(v, killer)
+                            } catch (_: Throwable) {
+                                false
+                            }
+                            // Stage 4（P2）：同上——登記／釋放經 releaseCleanupSlotAfterVerify
+                            // （冪等；登記拋出則槽保留 fail-closed），舊 finally releaseSlot 移除。
+                            ElevatedProcessIo.releaseCleanupSlotAfterVerify(v, clean, slotHeld = acquired)
+                            if (!clean) {
+                                lateIncomplete.set(true)
+                                countUncleanOnce()
                             }
                         }
                         if (holder.compareAndSet(published, null)) {
@@ -2217,7 +2286,15 @@ internal object ElevatedCallSupervisor {
         }
         // Round-3 Phase E（P1-1）：未驗證即登記 quarantine（worker 完成≠verified dead；
         // 呼叫方 breaker 計數經返回值另行終審，此處只登記，不雙計）。
-        if (!ok) ElevatedCleanupTracker.quarantineUnverified(p)
+        // Stage 4（P2）：登記改 guarded——拋出不外抛（outer releaseCleanupSlotAfterVerify 以冪等 `===` 去重重試登記＋釋放）。
+        // 單一計數站點＝releaseCleanupSlotAfterVerify（所有 caller 匯流）；內層 guarded attempt 不再重複計數。
+        if (!ok) {
+            try {
+                ElevatedCleanupTracker.quarantineUnverified(p)
+            } catch (_: Throwable) {
+                // 內層 guarded attempt 敗：計數於外層 releaseCleanupSlotAfterVerify 重試時統一記（單站點）
+            }
+        }
         deferredVme?.let { throw it }
         return ok
     }
@@ -2590,8 +2667,13 @@ internal object ElevatedProcessIo {
         }
         if (preflightExpired) {
             var preIncomplete = false
+            // Stage 3b：清理槽所有權移交——runCleanupBounded 正常返回且已佔槽即
+            // slotHeldOut=true；caller 持至 post-kill verify 結果已知後（quarantine
+            // 先行、release 殿後，順序不變）恰好釋放一次；slot 跨 verify 持有，
+            // live victim 在 verify 有界窗口內始終被 tracker 追蹤。
+            val cleanupSlotHeld = AtomicBoolean(false)
             val preOk = try {
-                runCleanupBounded(CLEANUP_MIN_MS, process, untrackedResidual, startThread) {
+                runCleanupBounded(CLEANUP_MIN_MS, process, untrackedResidual, startThread, cleanupSlotHeld) {
                     try {
                         killer(process)
                     } catch (_: Throwable) {
@@ -2612,9 +2694,12 @@ internal object ElevatedProcessIo {
                 // Round-3 Phase E（P1-1）：preflight 監督殺後仍未驗證即登記 quarantine
                 // （worker 完成≠verified dead；僅 verify 失敗才登記，worker stall 但已驗證
                 // 死亡不登記——process 已死，無未驗證 handle；後續 spawn 以 QUARANTINE 拒，
-                // 不靠 breaker 計數）。
-                ElevatedCleanupTracker.quarantineUnverified(process)
+                // 不靠 breaker 計數）。登記改由 [releaseCleanupSlotAfterVerify] 執行
+                // （quarantine 先行、release 殿後，順序不變；登記拋出則槽保留 fail-closed）。
             }
+            // Stage 3b：slot 僅在 verify 結果已知後釋放（unconditional of outcome；
+            // quarantine 先行、release 殿後，順序不變）。
+            releaseCleanupSlotAfterVerify(process, preVerified, cleanupSlotHeld.get())
             if (preIncomplete) {
                 ElevatedCleanupTracker.noteUnclean()
             } else if (ElevatedCleanupTracker.outstanding() == 0) {
@@ -2710,8 +2795,12 @@ internal object ElevatedProcessIo {
                 0L
             }
             val cleanupBudgetMs = minOf(maxOf(cleanupRemainMs, CLEANUP_MIN_MS), CLEANUP_JOIN_MS)
+            // Stage 3b：清理槽所有權移交——slot 持有跨 post-kill verify 有界窗口
+            // （live victim 始終被追蹤）；verify 結果已知後恰好釋放一次（quarantine
+            // 先行、release 殿後，順序不變）。
+            val cleanupSlotHeld = AtomicBoolean(false)
             val cleanupOk = try {
-                runCleanupBounded(cleanupBudgetMs, process, untrackedResidual, startThread) {
+                runCleanupBounded(cleanupBudgetMs, process, untrackedResidual, startThread, cleanupSlotHeld) {
                     try {
                         killer(process)
                     } catch (_: Throwable) {
@@ -2731,8 +2820,13 @@ internal object ElevatedProcessIo {
             }
             if (!verified) {
                 cleanupIncomplete = true
-                ElevatedCleanupTracker.quarantineUnverified(process)
+                // verify 失敗即登記 quarantine（Round-3 Phase E P1-1 語義不動）；登記改由
+                // [releaseCleanupSlotAfterVerify] 執行（quarantine 先行、release 殿後，
+                // 順序不變；登記拋出則槽保留 fail-closed）。
             }
+            // Stage 3b：slot 僅在 verify 結果已知後釋放（unconditional of outcome；
+            // quarantine 先行、release 殿後，順序不變）。
+            releaseCleanupSlotAfterVerify(process, verified, cleanupSlotHeld.get())
             if (startedOut != null && (outStarted || startedOut.isAlive)) {
                 runCatching { startedOut.interrupt() }
                 try {
@@ -3025,8 +3119,12 @@ internal object ElevatedProcessIo {
                 0L
             }
             val cleanupBudgetMs = minOf(maxOf(cleanupRemainMs, CLEANUP_MIN_MS), CLEANUP_JOIN_MS)
+            // Stage 3b：清理槽所有權移交——slot 持有跨 post-kill verify 有界窗口
+            // （live victim 始終被追蹤）；verify 結果已知後恰好釋放一次（quarantine
+            // 先行、release 殿後，順序不變）。
+            val cleanupSlotHeld = AtomicBoolean(false)
             val cleanupOk = try {
-                runCleanupBounded(cleanupBudgetMs, process, untrackedResidual, startThread) {
+                runCleanupBounded(cleanupBudgetMs, process, untrackedResidual, startThread, cleanupSlotHeld) {
                     // P2 吞例外計數：killer 抛即吞（best-effort，已盡力殺；刻意靜默，
                     // 不升級為崩潰，計數見 swallowedKillerThrows；流 close 另逐段吞，
                     // 預期 close 收斂，不計數）。
@@ -3052,9 +3150,15 @@ internal object ElevatedProcessIo {
             // 仍為真機 blocker（JVM 真樹已驗，裝置 SELinux／Root 語義差異 E2E
             // 歸 #136-B3，見 ElevatedProcessKiller）。
             // Round-3 Phase E（P1-1）：驗證失敗即登記 quarantine（worker 完成≠
-            // verified dead；僅 verify 失敗才登記，cleanupOk==false 但已驗證死亡
-            // 不登記）。verdict cleanupIncomplete 保持 true（經尾收終審），
+            // verified dead）。注意：registered ⇒ 驗證失敗 僅對此 arm 成立——
+            // 起線程失敗 arm（runCleanupBounded catch）在失敗當下無條件登記
+            // quarantine（即使進程稍後驗證為亡），解除密封專屬 verify-only sweep；
+            // 讀者不得從「已登記」反推「驗證失敗」（起線程失敗與驗證無關）。
+            // 此 arm 的語義：驗證失敗才登記；cleanupOk==false 但已驗證死亡不登記。
+            // verdict cleanupIncomplete 保持 true（經尾收終審），
             // quarantine 以 QUARANTINE 把 fail-closed 擴展到後續 spawn。
+            // 登記改由 [releaseCleanupSlotAfterVerify] 執行（quarantine 先行、
+            // release 殿後，順序不變；登記拋出則槽保留 fail-closed）。
             val verified = try {
                 ElevatedCallSupervisor.verifyParentStoppedBounded(process)
             } catch (_: Throwable) {
@@ -3062,8 +3166,10 @@ internal object ElevatedProcessIo {
             }
             if (!verified) {
                 cleanupIncomplete = true
-                ElevatedCleanupTracker.quarantineUnverified(process)
             }
+            // Stage 3b：slot 僅在 verify 結果已知後釋放（unconditional of outcome；
+            // quarantine 先行、release 殿後，順序不變）。
+            releaseCleanupSlotAfterVerify(process, verified, cleanupSlotHeld.get())
             // 超時/cancel 路徑保留有界 join：gobbler 仍可能卡住，避免無限等。
             // join 中斷必須 restore 中斷旗標（不吞 InterruptedException）。
             // AB1 P1-A：join 超界仍存活即殘留 gobbler（入口已中斷兩 gobbler，
@@ -3376,6 +3482,33 @@ internal object ElevatedProcessIo {
     }
 
     /**
+     * Stage 3b-final（seam）：quarantine 登記的單一測試注入點。
+     * 預設值＝[ElevatedCleanupTracker.quarantineUnverified]（登記不拋出時，生產行為
+     * 與舊碼 byte-for-byte 一致；若登記本身拋出，現收斂為 fail-closed——槽保留＋計數，
+     * 而非外抛，較舊碼更保守，此差異為刻意設計）。所有登記呼叫點（[releaseCleanupSlotAfterVerify]、drain 起線程失敗臂、
+     * 兩個 late-compensation acquire-throw 臂的二次登記）皆改經本 registrar，使測試可
+     * 注入拋出（RuntimeException／OutOfMemoryError）斷言 fail-closed 槽保留語義。
+     * 僅測試可調（@VisibleForTesting）；測試須於 finally 還原預設值。
+     * `acquireSlotOrQuarantine` 內部登記刻意不掛本 registrar（同鎖原子二選一，
+     * 不經本間接層）。
+     */
+    @VisibleForTesting
+    internal var quarantineRegistrar: (Process) -> Unit = { ElevatedCleanupTracker.quarantineUnverified(it) }
+
+    /** verified-dead → release; unverifiable+registered → release; registration failed → keep slot.
+     *  internal：晚補償臂（[ElevatedCallSupervisor]）與 drain 共用同一 fail-closed 語義。
+     *  每 (process, 槽) 至多呼叫一次：三處 drain 臂與兩處 late 臂各為恰好一條
+     *  直線呼叫（無分支/無迴圈）；新 caller 不得在 verify 路徑上第二次呼叫。
+     *  內層 lateCompensateSpawn 已嘗試登記（`===`-dedup 冪等）；helper 的 quarantine 呼叫可能為
+     *  no-op（同 handle 已在登記表內）、仍冪等安全——登記路徑不假設「首登」。 */
+    internal fun releaseCleanupSlotAfterVerify(process: Process, verified: Boolean, slotHeld: Boolean) {
+        if (verified) { if (slotHeld) ElevatedCleanupTracker.releaseSlot(); return }
+        val registered = try { quarantineRegistrar(process); true } catch (_: Throwable) { false }
+        if (registered) { if (slotHeld) ElevatedCleanupTracker.releaseSlot() } else { ElevatedCleanupTracker.noteQuarantineRegistrationFailed() }
+        // !slotHeld && !registered：acquire 期 OOM 且登記再失敗，仍無任何追蹤；breaker＋診斷可見；#136-B3 恢復待辦
+    }
+
+    /**
      * Z1 清理監督 worker（owner 新 P1）：daemon thread 執行 [block]（killer＋已取流
      * close），主執行緒 join 上界 [timeoutMs]；超界即 interrupt＋[CLEANUP_GRACE_MS]
      * grace 重 join，回是否完成（grace 後仍存活即 false，殘留 daemon 由
@@ -3384,13 +3517,39 @@ internal object ElevatedProcessIo {
      * 自然返回（如 8s 睡眠模型），呼叫方有界返回不受影響。
      *
      * AA1 跨呼叫計數（owner 新 P1）：worker 啟動即 [ElevatedCleanupTracker.acquireSlot]
-     * （飽和即拒：回 false 即無槽，見下）、finally 僅已佔槽才
-     * [ElevatedCleanupTracker.releaseSlot]（正常完成即釋放；永久卡住期間
-     * 即殘留計數）。drain 層飽和亦不跳過 killer（入口拒絕由 runner 資源門承擔，
-     * 此處無槽仍嘗試，回 false 保守記不完整）。
+     * （飽和即拒：回 false 即無槽，見下）；slot 釋放所有權於本函數
+     * **轉移**給呼叫方（Stage 3b，見下 AA1-slot 段）——worker 本體自此不再
+     * `releaseSlot`；正常返回且已佔槽時經 [slotHeldOut] 移交呼叫方，呼叫方須
+     * 持有至 post-kill 驗證結果已知後（verify true＝釋放不 quarantine；
+     * verify false＝先 quarantine 再釋放）恰好釋放一次。永久卡住期間即殘留計數
+     * （隨呼叫方 verify 有界後釋放）。drain 層飽和亦不跳過 killer（入口拒絕由
+     * runner 資源門承擔，此處無槽仍嘗試，回 false 保守記不完整）。
+     *
+     * AA1-slot（Stage 3b，slot-ownership transfer）：**slot 跨 post-kill verify
+     * 持有**——`slotHeldOut` 置 true 後，`ElevatedCleanupTracker.releaseSlot()`
+     * 的呼叫責任完全由呼叫方承擔（本函數不再釋放，worker finally 亦不釋放）。
+     * 呼叫方在 `verifyParentStoppedBounded` 返回（結果 true／false 皆同）後依
+     * `slotHeldOut==true` 恰好釋放一次；quarantine 一律先於釋放（呼叫方既有
+     * quarantine-before-release 順序不變）。理由：runCleanupBounded 返回時
+     * cleanup worker 已退出並已讓出 tracker slot，若在 verify 前釋放，一個
+     * 真正存活的 victim 將在 verify 窗口內變成 untracked
+     * （outstanding==0 && quarantine 空 ⇒ `tryEnterReserved` OK），admission
+     * 密封缺口。持有跨越 verify 保證：live victim 在 verify 有界窗口內始終被
+     * 追蹤（outstanding>0），verify 失敗即 quarantine 密封，直至 handle 經
+     * verify-only sweep 證死才解除；verify 成功（證死）即釋放。
+     * 飽和（未佔槽）路徑 `slotHeldOut` 保持 false（呼叫方零釋放義務）。
+     * 起線程失敗 arm（`start()` 抛）：登記成功當下即釋放已佔槽並置
+     * `slotHeldOut=false`（呼叫方不重複釋放）；登記拋出（罕見，如 OOM）時槽**保留**
+     * （fail-closed，admission 續拒）、`slotHeldOut=true`（已佔槽時），交給呼叫方
+     * verify 臂以 `releaseCleanupSlotAfterVerify` 冪等重試登記後釋放。
      *
      * P1-4 `start()` 抛收斂：`Thread.start()` 抛（`IllegalThreadState`／
-     * `SecurityException` 等）即先釋放已佔槽再回 false（呼叫方置
+     * `SecurityException` 等）即先無條件登記 quarantine（即使進程稍後驗證為亡；
+     * 解除密封專屬 verify-only sweep，讀者不得從「已登記」反推「驗證失敗」），
+     * 登記僅由 verify-only sweep 解封（進程自然死亡後）; QUARANTINE 密封直至 sweep 成功。
+     * 登記成功即釋放已佔槽；登記拋出則槽保留並交呼叫方 verify 臂重試，
+     * [ElevatedCleanupTracker.noteQuarantineRegistrationFailed] 計數
+     * （fail-closed 記數，app 重啟前不可自清、應告警）。回 false（呼叫方置
      * `cleanupIncomplete=true` 統一進終審），不抛穿透 drain（drain 全路徑有界
      * 返回契約：任何內部建線程失敗皆收斂為旗標，不把異常抛給呼叫方）。
      * Stage 2A（P1-A3）：起線程失敗即 [ElevatedCleanupTracker.noteKillNeverAttempted]，
@@ -3400,8 +3559,9 @@ internal object ElevatedProcessIo {
      *
      * P1-4 飽和即拒（[ElevatedCleanupTracker.acquireSlotOrQuarantine] 回 false）：
      * 無槽仍起 worker 嘗試 killer（永不跳過），但回 false（無法記槽即無法自證
-     * 有界完成，保守記不完整，呼叫方置 `cleanupIncomplete=true`）；worker 本體
-     * 僅已佔槽才釋放（未佔而釋會扣減他人槽位，見 `releaseSlot` floor 語義）。
+     * 有界完成，保守記不完整，呼叫方置 `cleanupIncomplete=true`）；未佔槽即
+     * 呼叫方零釋放義務（[slotHeldOut] 保持 false；僅已佔槽才有釋放責任，
+     * 見 `releaseSlot` floor 語義）。
      * Stage 2A（P1-A2）：飽和起 worker 未佔槽＝untracked `elevated-cleanup`
      * worker（worker 本身不受准入阻擋、不佔槽；若其永久卡住即無界 untracked；
      * handle 已隨飽和登記 quarantine，見 M1 段）：
@@ -3420,7 +3580,9 @@ internal object ElevatedProcessIo {
      *
      * AB1 P1-A：gobbler／stdin-closer 殘留改經
      * [ElevatedCleanupTracker.markLingering] 計數（啟動不預佔，僅 grace 後仍存活
-     * 才佔槽；執行緒本體 finally 釋放）；清理 worker 保持本函數既有語義不變。
+     * 才佔槽；執行緒本體 finally 釋放）；清理 worker 不走 markLingering，其槽位
+     * 所有權如上 AA1-slot 段移交呼叫方（worker 本體不 acquire／release，槽位
+     * 跨 post-kill verify 由呼叫方持有直至驗證結果已知）。
      *
      * @param process 受監督的目標 process handle（飽和登記 quarantine 用；
      *   必須為本次清理 real target，不得傳其他 handle）。
@@ -3429,16 +3591,26 @@ internal object ElevatedProcessIo {
      * @param startThread Stage 2A（P1-A3）可注入的線程啟動方式（測試注入用）：
      *   drain 層的 `startThread` seam 一併穿入，使 elevated-cleanup 起線程失敗
      *   可注入（「抛即未起」契約同 drain 其他執行緒；預設 `{ it.start() }`）。
+     * @param slotHeldOut Stage 3b 必傳 out：本次呼叫若取得並持有清理槽
+     *   （acquire 成功且走正常返回路徑，或起線程失敗臂登記拋出）即置 true；
+     *   呼叫方須在 post-kill verify 結果已知後恰好 `releaseCleanupSlotAfterVerify(process, verified, slotHeldOut.get())`
+     *   一次（verified＝true 即釋放；verify 失敗時登記 quarantine 先行、release 殿後，
+     *   順序不變；登記拋出則槽保留 fail-closed，見 [releaseCleanupSlotAfterVerify]）。
+     *   slotHeldOut 必傳：false 表示 caller 無槽可放（飽和/起線程失敗且登記成功/其他 caller 自持無槽）；true 表示槽已移交 caller，caller 於 verify 後以 releaseCleanupSlotAfterVerify 釋放恰好一次。
      */
     private fun runCleanupBounded(
         timeoutMs: Long,
         process: Process,
         untrackedOut: AtomicBoolean? = null,
         startThread: (Thread) -> Unit = { it.start() },
+        slotHeldOut: AtomicBoolean,
         block: () -> Unit,
     ): Boolean {
-        // AA1: worker 啟動即佔一槽（呼叫執行緒計數，避免啟動競態漏計），finally 釋放
-        // （正常完成即--；永久卡住即殘留計數，見 ElevatedCleanupTracker）。
+        // AA1: worker 啟動即佔一槽（呼叫執行緒計數，避免啟動競態漏計）；slot 釋放
+        // 所有權於本函數轉移給呼叫方（Stage 3b，見 KDoc AA1-slot 段）：worker 本體
+        // 不再 releaseSlot；本函數正常返回且已佔槽即置 slotHeldOut=true，呼叫方須
+        // 持有至 post-kill verify 結果已知後恰好釋放一次（跨 verify 持有，使
+        // verify 窗口內真正存活的 victim 始終被 tracker 追蹤）。
         // Stage 2A（M1）：佔槽改經 acquireSlotOrQuarantine（同 [lock] 原子二選一，
         // 與晚補償臂同一語義）：飽和當下 `process` 即原子登記 quarantine——admission
         // 自此以 QUARANTINE 拒新 spawn，直到 verify-only sweep 有界驗證自然死亡
@@ -3447,7 +3619,19 @@ internal object ElevatedProcessIo {
         // 入口拒絕由兩 runner 資源門承擔，此處不拒絕 killer 嘗試，只記賬；
         // 無槽（acquireSlotOrQuarantine 回 false）仍嘗試，但回 false 保守記不完整
         // （見本函數 P1-4 段）。
-        val acquired = ElevatedCleanupTracker.acquireSlotOrQuarantine(process)
+        // fail-closed：acquireSlotOrQuarantine 本身抛（如 VME in ArrayList.add）——
+        // 槽從未取得（acquire 失敗路徑未遞增），不啟 worker、不 releaseSlot；
+        // slotHeldOut=false（caller 無槽可放）、untrackedOut=false（無 untracked
+        // worker 起動），return false → caller cleanupIncomplete=true → verify →
+        // releaseCleanupSlotAfterVerify(verified, slotHeld=false) handles the rest。
+        val acquired = try {
+            ElevatedCleanupTracker.acquireSlotOrQuarantine(process)
+        } catch (_: Throwable) {
+            ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
+            slotHeldOut.set(false)
+            untrackedOut?.set(false)
+            return false
+        }
         val t = try {
             Thread({
                 try {
@@ -3455,20 +3639,45 @@ internal object ElevatedProcessIo {
                 } catch (_: Throwable) {
                     // block 內已逐段 runCatching，此處僅兜底線程體異常，不外抛。
                 } finally {
-                    if (acquired) ElevatedCleanupTracker.releaseSlot()
+                    // Stage 3b：slot 釋放所有權已移交呼叫方（見 KDoc AA1-slot 段）——
+                    // worker 本體不釋放；acquire 成功即由 runCleanupBounded 正常返回點
+                    // 以 slotHeldOut 移交呼叫方，呼叫方於 post-kill verify 結果已知後
+                    // 恰好釋放一次。未佔槽（飽和／起線程失敗）本就不持槽，亦無動作。
                 }
             }, "elevated-cleanup").also {
                 it.isDaemon = true
                 startThread(it)
             }
         } catch (_: Throwable) {
-            if (acquired) ElevatedCleanupTracker.releaseSlot()
+            // 不變量：quarantine 一律先於 slot 釋放——`quarantineUnverified` 與 `releaseSlot`
+            // 為兩次依序取 [ElevatedCleanupTracker.lock] 的 synchronized 區塊（非同一鎖之原子段）；
+            // 中間態（已登記 quarantine、尚未遞減 outstanding）fail-closed 安全：此時 admission 見
+            // quarantine 非空即 QUARANTINE 拒，無 admitted 觀察者可旁觀 quarantine.isEmpty() 的窗口。
+            // Stage 2A（P1）：worker 從未起動＝killer 從未信號、handle 可能仍存活且無人追蹤——
+            // 此 arm 無條件登記 quarantine（即使進程稍後驗證為亡）；登記僅由 verify-only sweep 解封
+            // （進程自然死亡後），解除密封專屬 verify-only sweep，讀者不得從「已登記」反推「驗證失敗」。
+            // 飽和臂已由 acquireSlotOrQuarantine 同鎖登記，`===` 去重冪等；此處無條件登記涵蓋
+            // acquired==true 分支；登記成功即先釋槽，mission-critical fail-closed，admission 自此密封直至
+            // verify-only sweep 證死。
+            val registered = try { quarantineRegistrar(process); true } catch (_: Throwable) { false }
+            if (registered) {
+                if (acquired) ElevatedCleanupTracker.releaseSlot()
+                slotHeldOut.set(false)           // caller releases nothing (today's semantics)
+            } else {
+                // fail-closed: 登記失敗＝槽保留且交給 caller verify 臂重試登記（冪等）
+                slotHeldOut.set(acquired)        // 讓 caller verify 臂在登記成功後釋放
+                ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
+            }
             // Stage 2A（P1-A3）：worker 從未起動＝killer 從未信號——獨立計數
             // （不佔 untracked 殘留：無 worker 即無殘留；不計 cleanupIncomplete 之外
             // 的新旗標，呼叫方既有 incomplete／breaker 語義不變）。
             ElevatedCleanupTracker.noteKillNeverAttempted()
             return false
         }
+        // O1（Stage 3b-final）：acquire 成功且 start() 未抛即於此點移交 slot——
+        // 早於 joins，使 joins 途中即便拋出 Error，caller 仍見 slotHeldOut==true
+        //（releaseCleanupSlotAfterVerify 恰好釋放一次；exactly-once 洞關閉）。
+        if (acquired) slotHeldOut.set(true)
         if (!acquired) {
             // Stage 2A（P1-A2）：worker 已起但未佔槽＝untracked 殘留候選（飽和）。
             // Stage 2A（M1）：acquireSlotOrQuarantine 已同鎖內登記 quarantine
@@ -3491,6 +3700,9 @@ internal object ElevatedProcessIo {
         }
         // P1-4 飽和即拒：未佔槽（acquired==false）即回 false（上已嘗試 killer，
         // 永不跳過；但無法記槽即無法自證有界完成，保守記不完整）。
+        // Stage 3b：已佔槽即沿途持有至此——正常返回點（whether t 已死或 grace 後仍
+        // 存活皆然）呼叫方持有至 post-kill verify 結果已知後恰好釋放一次（本函數不釋放；
+        // 見 KDoc AA1-slot 段；slotHeldOut 已於 joins 前置位，見 O1 註記）。
         return acquired && !t.isAlive
     }
 

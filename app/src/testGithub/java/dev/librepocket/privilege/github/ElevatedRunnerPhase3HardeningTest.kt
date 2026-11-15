@@ -22,6 +22,9 @@ import org.junit.Test
 /**
  * Phase 3 資源上界＋生命週期硬化迴歸（P1-4，PR #140 Phase 3）：
  * - 六點同卡 barrier（wait＋cleanup＋verify＋stdout＋stderr＋stdin-close）：
+ *   Stage 3b slot-ownership transfer 後 cleanup 槽於 verify 結果已知後才釋放
+ *   （verified-false → quarantine 封存、release 殿後），實際同持槽鎖點現為 5
+ *   （wait＋verify＋stdout＋stderr＋stdin）；保留「六點／SixPoint」名稱與計數註解；
  *   同步峰值 `peakOutstanding() <= MAX_OUTSTANDING_CLEANUPS`（替代 sleep 採樣，
  *   `acquireSlot` 同鎖內同步更新，無遺漏）；終止後 slot 全釋、verdict
  *   `TimedOut(cleanupIncomplete=true)`、breaker 只計 1（不熔斷）、殘留期間新
@@ -47,6 +50,10 @@ class ElevatedRunnerPhase3HardeningTest {
 
     @Before fun setUpIsolation() {
         hermeticExec = HermeticExecFixture("phase3hard-hermetic", "id")
+        assertFalse(
+            "#136-B3 gate must stay closed",
+            PrivilegeActivation.ELEVATED_RUNNERS_READY,
+        )
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -57,12 +64,19 @@ class ElevatedRunnerPhase3HardeningTest {
     @After fun tearDownIsolation() {
         hermeticExec?.close()
         hermeticExec = null
-        repeat(8) { ElevatedCleanupTracker.releaseSlot() }
-        repeat(8) { ElevatedCleanupTracker.leaveCall() }
+        // P1B2-mirror fail-closed teardown：先快照 leak（remediation 前），再補救，再斷言。
+        val leakedOutstanding = ElevatedCleanupTracker.outstanding()
+        val leakedActive = ElevatedCleanupTracker.activeCalls()
+        val leakedQuarantine = ElevatedCleanupTracker.quarantinedCount()
+        Thread.interrupted()
+        ElevatedCleanupTracker.clearUnverified()
         pollOutstandingTo(0)
         pollActiveTo(0)
-        ElevatedCleanupTracker.clearUnverified()
+        awaitNoElevatedThreads()
         ElevatedCleanupTracker.noteClean()
+        assertEquals("test leaked outstanding slots", 0, leakedOutstanding)
+        assertEquals("test leaked active calls", 0, leakedActive)
+        assertEquals("test leaked quarantined processes", 0, leakedQuarantine)
     }
 
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 15_000L) {
@@ -309,12 +323,16 @@ class ElevatedRunnerPhase3HardeningTest {
             assertTrue("cleanupIncomplete expected", b.cleanupIncomplete)
             assertEquals(1, kills.get())
             assertEquals(1, spawns.get())
-            // 六槽同持（wait＋cleanup＋verify＋stdout＋stderr＋stdin），同步峰值有界。
+            // 五槽同持（wait＋verify＋stdout＋stderr＋stdin），同步峰值有界。
+            // Stage 3b slot-ownership transfer：cleanup 點於 verify 結果已知後釋放
+            // （verified-false → quarantine 先行、release 殿後）——victim 改由 quarantine
+            // 封存追蹤（fail-closed 不變），outstanding 落回 5。
             assertEquals(
                 "outstanding=${ElevatedCleanupTracker.outstanding()}",
-                6,
+                5,
                 ElevatedCleanupTracker.outstanding(),
             )
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
             val peak = ElevatedCleanupTracker.peakOutstanding()
             assertTrue(
                 "peak=$peak must stay within MAX=${ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS}",
@@ -324,7 +342,7 @@ class ElevatedRunnerPhase3HardeningTest {
             assertEquals(1, ElevatedCleanupTracker.consecutiveCount())
             assertFalse(ElevatedCleanupTracker.isBreakerOpen())
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
-            // 殘留期間新 call 即預留拒（6+7>7），零新增 spawn。
+            // 殘留期間新 call 即預留拒（5+7>7），零新增 spawn。
             val denied = runner.runBinary(ElevatedRequest(listOf("id"), "P3-6PT"), 300L)
             assertTrue("$denied", denied is ElevatedBinaryResult.Denied)
             denied as ElevatedBinaryResult.Denied
@@ -333,6 +351,9 @@ class ElevatedRunnerPhase3HardeningTest {
             assertEquals(1, spawns.get())
         } finally {
             latch.countDown()
+            // Stage 3b：本測 by design 留 1 條 quarantine 登記（verify=false）；
+            // teardown 現以 leak 斷言把關，此處先清除登記（僅測試隔離，非#136-B3修復）。
+            ElevatedCleanupTracker.clearUnverified()
             pollOutstandingTo(0)
             ElevatedCleanupTracker.noteClean()
             pollActiveTo(0)
@@ -385,11 +406,14 @@ class ElevatedRunnerPhase3HardeningTest {
             assertTrue("cleanupIncomplete expected", b.cleanupIncomplete)
             assertEquals(1, kills.get())
             assertEquals(1, spawns.get())
+            // Stage 3b slot-ownership transfer：cleanup 點於 verify 結果已知後釋放——
+            // outstanding 落回 5，victim 改由 quarantine 封存（fail-closed 不變）。
             assertEquals(
                 "outstanding=${ElevatedCleanupTracker.outstanding()}",
-                6,
+                5,
                 ElevatedCleanupTracker.outstanding(),
             )
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
             val peak = ElevatedCleanupTracker.peakOutstanding()
             assertTrue(
                 "peak=$peak must stay within MAX=${ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS}",
@@ -406,6 +430,9 @@ class ElevatedRunnerPhase3HardeningTest {
             assertEquals(1, spawns.get())
         } finally {
             latch.countDown()
+            // Stage 3b：本測 by design 留 1 條 quarantine 登記（verify=false）；
+            // teardown 現以 leak 斷言把關，此處先清除登記（僅測試隔離，非#136-B3修復）。
+            ElevatedCleanupTracker.clearUnverified()
             pollOutstandingTo(0)
             ElevatedCleanupTracker.noteClean()
             pollActiveTo(0)
@@ -687,6 +714,8 @@ class ElevatedRunnerPhase3HardeningTest {
             assertEquals(0, ElevatedCleanupTracker.consecutiveCount())
             assertFalse(ElevatedCleanupTracker.isBreakerOpen())
             assertEquals(1, ElevatedCleanupTracker.outstanding())
+            // prefill 主導計數：本 call 驗證通過即釋放，不得洩漏 quarantine 登記。
+            assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
         } finally {
             ElevatedCleanupTracker.releaseSlot()
             pollOutstandingTo(0)
@@ -816,10 +845,15 @@ class ElevatedRunnerPhase3HardeningTest {
             )
             assertEquals(1, ElevatedCleanupTracker.consecutiveCount())
             assertFalse(ElevatedCleanupTracker.isBreakerOpen())
+            assertEquals("saturated drain must quarantine the unverified handle", 1, ElevatedCleanupTracker.quarantinedCount())
         } finally {
             repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
                 ElevatedCleanupTracker.releaseSlot()
             }
+            // Stage 3b：飽和臂在 acquireSlotOrQuarantine 同鎖內原子登記 1 條
+            // quarantine（verify 後登記冪等去重）；by design 留存，teardown 以
+            // leak 斷言把關，此處先清除（僅測試隔離，非#136-B3修復）。
+            ElevatedCleanupTracker.clearUnverified()
             pollOutstandingTo(0)
             ElevatedCleanupTracker.noteClean()
             pollActiveTo(0)

@@ -22,7 +22,9 @@ import org.junit.Before
 import org.junit.Test
 
 /**
- * B2 P1-3 post-kill 驗證＋P1-4 spawn 前取消（owner 新 P1-3／P1-4，PR140 Phase B2）。
+ * B2 P1-3 post-kill 驗證＋P1-4 spawn 前取消（owner 新 P1-3／P1-4，PR140 Phase B2）
+ * ＋ Stage 2A drain 起線程失敗／飽和殘留加固直測（P1-A2/A3：untrackedResidual、
+ *   kill-never-attempted、drain-OOM／thread-start-failure 硬化路徑）。
  *
  * P1-3：killer 真≠進程真死（destroy／destroyForcibly 全 runCatching，遠端 destroy
  * 吞失敗；cleanup worker 離開只代表本機 thread 結束）。drain kill 路徑經
@@ -48,6 +50,10 @@ class ElevatedRunnerP1B2Test {
 
     @Before fun setUpIsolation() {
         hermeticExec = HermeticExecFixture("p1b2-hermetic", "id")
+        assertFalse(
+            "#136-B3 gate must stay closed",
+            PrivilegeActivation.ELEVATED_RUNNERS_READY,
+        )
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
     }
@@ -55,11 +61,17 @@ class ElevatedRunnerP1B2Test {
     @After fun tearDownIsolation() {
         hermeticExec?.close()
         hermeticExec = null
+        val leakedOutstanding = ElevatedCleanupTracker.outstanding()
+        val leakedActive = ElevatedCleanupTracker.activeCalls()
+        val leakedQuarantine = ElevatedCleanupTracker.quarantinedCount()
         Thread.interrupted()
         ElevatedCleanupTracker.clearUnverified()
         pollOutstandingTo(0)
         awaitNoElevatedThreads()
         ElevatedCleanupTracker.noteClean()
+        assertEquals("test leaked outstanding slots", 0, leakedOutstanding)
+        assertEquals("test leaked active calls", 0, leakedActive)
+        assertEquals("test leaked quarantined processes", 0, leakedQuarantine)
     }
 
     private fun awaitNoElevatedThreads(boundMs: Long = 15_000L) {
@@ -98,6 +110,17 @@ class ElevatedRunnerP1B2Test {
             Thread.sleep(50L)
         }
     }
+
+    private fun pollTrue(what: String, boundMs: Long = 10_000L, cond: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (!cond()) {
+            if (System.currentTimeMillis() >= deadline) throw AssertionError("$what did not become true")
+            Thread.sleep(20L)
+        }
+    }
+
+    private fun countLive(name: String): Int =
+        Thread.getAllStackTraces().keys.count { it.name == name && it.isAlive }
 
     private fun makeRoot(
         spawn: (List<String>) -> Process,
@@ -195,6 +218,29 @@ class ElevatedRunnerP1B2Test {
         override fun destroyForcibly(): Process = this
     }
 
+    /**
+     * 自然死亡模型（Stage 3 F6）：`waitFor(0L, MILLISECONDS)` 零超時 liveness 探針
+     * 即回 true（sweep 見確死，無需 destroy）；非零超時片仍回 false（drain wait 圈
+     * 不誤判完成，正常走 kill 路徑）；destroy 從未被調用＝真自然死亡。
+     */
+    private class NaturalDeathProcess : Process() {
+        var destroyCalls = 0
+        override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+        override fun getInputStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int = 0
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean =
+            unit.toMillis(timeout) == 0L
+        override fun exitValue(): Int = 0
+        override fun destroy() {
+            destroyCalls++
+        }
+        override fun destroyForcibly(): Process {
+            destroyCalls++
+            return this
+        }
+    }
+
     /** 可殺模型：destroy 置旗，waitFor 即回旗標（驗證可過，宣告無殘留才準）。 */
     private class KillableImmediateProcess : Process() {
         var destroyed = false
@@ -265,6 +311,7 @@ class ElevatedRunnerP1B2Test {
         pollOutstandingTo(0)
         assertTrue(ElevatedCleanupTracker.consecutiveCount() > before)
         assertFalse(ElevatedCleanupTracker.isSaturated())
+        ElevatedCleanupTracker.clearUnverified()
     }
 
     @Test fun shizukuNoOpKillerPostWaitFalseMarksIncomplete() {
@@ -280,6 +327,7 @@ class ElevatedRunnerP1B2Test {
         assertTrue((b as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
         pollOutstandingTo(0)
         assertTrue(ElevatedCleanupTracker.consecutiveCount() > before)
+        ElevatedCleanupTracker.clearUnverified()
     }
 
     @Test fun rootDestroyThrowsStillIncomplete() {
@@ -292,6 +340,7 @@ class ElevatedRunnerP1B2Test {
         assertTrue((b as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
         pollOutstandingTo(0)
         assertFalse(ElevatedCleanupTracker.isSaturated())
+        ElevatedCleanupTracker.clearUnverified()
     }
 
     @Test fun shizukuRemoteDestroyThrowsStillIncomplete() {
@@ -306,6 +355,7 @@ class ElevatedRunnerP1B2Test {
         assertTrue((b as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
         pollOutstandingTo(0)
         assertFalse(ElevatedCleanupTracker.isSaturated())
+        ElevatedCleanupTracker.clearUnverified()
     }
 
     @Test fun shizukuRemoteNoOpDestroyStillIncomplete() {
@@ -318,6 +368,7 @@ class ElevatedRunnerP1B2Test {
         assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
         assertTrue((b as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
         pollOutstandingTo(0)
+        ElevatedCleanupTracker.clearUnverified()
     }
 
     @Test fun rootPostWaitFalseDespiteDestroyMarksIncomplete() {
@@ -336,6 +387,7 @@ class ElevatedRunnerP1B2Test {
         assertTrue("post-wait false must flag even though destroy ran", (b as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
         assertTrue(victim?.destroyed == true)
         pollOutstandingTo(0)
+        ElevatedCleanupTracker.clearUnverified()
     }
 
     @Test fun binderDiedUnknownMarksIncomplete() {
@@ -360,6 +412,7 @@ class ElevatedRunnerP1B2Test {
         assertTrue((sb as ElevatedBinaryResult.TimedOut).cleanupIncomplete)
         pollOutstandingTo(0)
         assertFalse(ElevatedCleanupTracker.isSaturated())
+        ElevatedCleanupTracker.clearUnverified()
     }
 
     @Test fun verifiedKillMarksCleanNoResidue() {
@@ -902,9 +955,11 @@ class ElevatedRunnerP1B2Test {
     @Test fun drainCleanupThreadStartFailureRecordsKillNeverAttempted() {
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
+        ElevatedCleanupTracker.resetPeak()
         pollOutstandingTo(0)
         val neverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
         val untrackedBefore = ElevatedCleanupTracker.untrackedResidualCount()
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
         val killerCalls = AtomicInteger(0)
         try {
             val d = ElevatedProcessIo.drainWithThreadStarter(
@@ -938,7 +993,21 @@ class ElevatedRunnerP1B2Test {
                 untrackedBefore,
                 ElevatedCleanupTracker.untrackedResidualCount(),
             )
+            // Stage 2A（P1）：起線程失敗＝killer 從未信號、handle 可能仍存活——
+            // 新增無條件 quarantineUnverified（飽和臂已由 acquireSlotOrQuarantine 登記，
+            // 此處 === 去重冪等），fail-closed 密封 admission 直至 sweep 驗證。
+            assertEquals(
+                "thread-start-failure must quarantine the never-killed handle",
+                1,
+                ElevatedCleanupTracker.quarantinedCount() - quarantineBefore,
+            )
             // 既有語義不變：不完整＋timedOut=true（kill 路徑）＋exitCode=-1。
+            // Stage 3（F5）：恰一次 acquire（起線程失敗前）⇒ peakOutstanding==1（release 後不清零）。
+            assertEquals(
+                "exactly one acquire before thread-start failure ⇒ peak must be 1",
+                1,
+                ElevatedCleanupTracker.peakOutstanding(),
+            )
             assertTrue("cleanupIncomplete must stay true", d.cleanupIncomplete)
             assertTrue("timedOut must stay true (kill path)", d.timedOut)
             assertEquals(-1, d.exitCode)
@@ -951,6 +1020,171 @@ class ElevatedRunnerP1B2Test {
             ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
+        }
+    }
+
+    // ---- Stage 3（N1）：飽和 drain kill → sweep 驗證死亡 → admission 恢復（防 seal 永久化回歸） ----
+
+    @Test fun saturatedDrainKillSweepRestoresAdmission() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+        var prefilled = 0
+        val killerCalls = AtomicInteger(0)
+        try {
+            // 預填至 MAX（incremental assertTrue）。
+            repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) { i ->
+                assertTrue("prefill slot $i must grant below MAX", ElevatedCleanupTracker.acquireSlot())
+                prefilled++
+            }
+            // 飽和下 drain kill 路徑：runCleanupBounded 佔槽必敗 → worker 無槽起動，
+            // killer 仍被嘗試；handle 已由 acquireSlotOrQuarantine 同鎖原子登記 quarantine。
+            val d = ElevatedProcessIo.drainWithThreadStarter(
+                process = KillableImmediateProcess(),
+                timeoutMs = 300L,
+                killer = {
+                    killerCalls.incrementAndGet()
+                    it.destroy()
+                },
+                isCancelled = { false },
+                startThread = { it.start() },
+            )
+            assertEquals("kill path must still attempt the killer", 1, killerCalls.get())
+            assertTrue(
+                "saturated cleanup worker must flag cleanupIncomplete",
+                d.cleanupIncomplete,
+            )
+            assertTrue(
+                "saturated cleanup worker must surface untrackedResidual",
+                d.untrackedResidual,
+            )
+            assertEquals(
+                "saturated drain must register quarantine exactly once",
+                quarantineBefore + 1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
+            assertEquals(
+                ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+                ElevatedCleanupTracker.outstanding(),
+            )
+            // Stage 3（F7）：drain 終審 noteUnclean（consecutive 由 0 升至 1，飽和值封頂語義）。
+            assertEquals(
+                "saturated drain must count exactly one consecutive unclean",
+                1,
+                ElevatedCleanupTracker.consecutiveCount(),
+            )
+            // 釋預填槽（drain 不自行清 quarantine——飽和登記解除只能等下一次
+            // admission-triggered sweep 驗證；先放行歸零再看 admission）。
+            repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
+            prefilled = 0
+            pollOutstandingTo(0)
+            // 密封此刻仍在位（QUARANTINE 末門獨力阻擋）。
+            assertEquals(
+                ElevatedCleanupTracker.Admission.QUARANTINE,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+            // production 入口（runner 准入前同式 kick）：victim destroy 置旗，
+            // sweep 經 waitFor(0)==true 有界驗證即解除登記。
+            assertTrue(
+                "admission-triggered sweep must kick for the saturated registration",
+                ElevatedCleanupTracker.kickSweepAsync(),
+            )
+            pollTrue("sweep must clear quarantine after verified death", 10_000L) {
+                ElevatedCleanupTracker.quarantinedCount() == quarantineBefore
+            }
+            // 鏈末端：admission 恢復 OK（seal 未永久化）。
+            assertEquals(
+                ElevatedCleanupTracker.Admission.OK,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+            ElevatedCleanupTracker.leaveCall()
+        } finally {
+            repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
+            ElevatedCleanupTracker.clearUnverified()
+            pollOutstandingTo(0)
+            awaitNoElevatedThreads()
+            ElevatedCleanupTracker.noteClean()
+        }
+    }
+
+    // ---- Stage 3（F6）：起線程失敗 quarantine → sweep 驗證死亡 → admission 恢復（鏈式迴歸） ----
+
+    @Test fun startFailureQuarantineThenSweepRecoversAdmission() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+        val victim = NaturalDeathProcess()
+        val killerCalls = AtomicInteger(0)
+        try {
+            // 非飽和（無預填）：acquireSlotOrQuarantine 成功佔槽 → elevated-cleanup
+            // 起線程即 OOM ⇒ runCleanupBounded catch 無條件登記 quarantine（先登記再釋槽），
+            // killer 從未信號；waitFor(0)==true 自然死亡供 sweep 驗證解除。
+            val d = ElevatedProcessIo.drainWithThreadStarter(
+                process = victim,
+                timeoutMs = 300L,
+                killer = {
+                    killerCalls.incrementAndGet()
+                    it.destroy()
+                },
+                isCancelled = { false },
+                startThread = { t ->
+                    if (t.name == "elevated-cleanup") {
+                        throw OutOfMemoryError("simulated OOM on elevated-cleanup")
+                    }
+                    t.start()
+                },
+            )
+            assertEquals(
+                "killer must never run on the thread-start-failure path",
+                0,
+                killerCalls.get(),
+            )
+            assertEquals(
+                "thread-start-failure must quarantine the never-killed handle",
+                quarantineBefore + 1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
+            assertTrue("cleanupIncomplete must stay true", d.cleanupIncomplete)
+            assertEquals(
+                "this path acquires+releases cleanly (acquired==true) ⇒ outstanding back to 0",
+                0,
+                ElevatedCleanupTracker.outstanding(),
+            )
+            assertEquals(
+                "fixture must never be declared dead via destroy()",
+                0,
+                victim.destroyCalls,
+            )
+            // 密封此刻仍在位（QUARANTINE 末門獨力阻擋；tryEnterReserved 拒入即不佔席）。
+            assertEquals(
+                ElevatedCleanupTracker.Admission.QUARANTINE,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+            // production 入口（runner 准入前同式 kick）：sweep 經 waitFor(0)==true
+            // 有界驗證即解除登記（不經 destroy、不經 noteClean）。
+            assertTrue(
+                "admission-triggered sweep must kick for the start-failure registration",
+                ElevatedCleanupTracker.kickSweepAsync(),
+            )
+            pollTrue("sweep must clear quarantine after verified death", 10_000L) {
+                ElevatedCleanupTracker.quarantinedCount() == quarantineBefore
+            }
+            // 鏈末端：admission 恢復 OK（seal 未永久化）。
+            assertEquals(
+                ElevatedCleanupTracker.Admission.OK,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+            ElevatedCleanupTracker.leaveCall()
+        } finally {
+            // 此路徑 acquired==true 自行配對釋放，無預填可還；僅隔離清場。
+            ElevatedCleanupTracker.clearUnverified()
+            pollOutstandingTo(0)
+            awaitNoElevatedThreads()
+            ElevatedCleanupTracker.noteClean()
         }
     }
 
@@ -1929,7 +2163,7 @@ class ElevatedRunnerP1B2Test {
                 }.also { it.isDaemon = true; it.start() }
                 try {
                     assertTrue(clockThrew.await(10, TimeUnit.SECONDS))
-                    Thread.sleep(30L)
+                    // 不需 sleep：clockThrew.await 已保證 watcher 的失敗先於此處可見；bg.join 界定其餘收斂。
                     blockRelease.countDown()
                     bg.join(10_000L)
                     assertFalse(bg.isAlive)
@@ -2073,16 +2307,11 @@ class ElevatedRunnerP1B2Test {
                 spawnRelease.countDown()
                 assertTrue(spawnDone.await(10, TimeUnit.SECONDS))
                 cancelGate.countDown()
-                val workerDeadline = System.currentTimeMillis() + 5_000L
-                while (Thread.getAllStackTraces().keys.any { it.name == "elevated-supervisor" && it.isAlive } &&
-                    System.currentTimeMillis() < workerDeadline
-                ) {
-                    Thread.sleep(2L)
+                // elevated-supervisor 命名同時涵蓋 worker 與 watcher；cancelGate 先行放開 watcher，
+                // 此處等兩者皆終止（worker 先行，watcher 隨 caller 讀取結果後退出）才代表 supervisor 完全收斂。
+                pollTrue("supervisor worker must terminate after publishing before cancel", 5_000L) {
+                    countLive("elevated-supervisor") == 0
                 }
-                assertFalse(
-                    "supervisor worker must terminate after publishing before cancel",
-                    Thread.getAllStackTraces().keys.any { it.name == "elevated-supervisor" && it.isAlive },
-                )
                 bg.join(10_000L)
                 assertFalse(bg.isAlive)
                 val res = resRef.get()
@@ -2275,13 +2504,8 @@ class ElevatedRunnerP1B2Test {
                 try {
                     latch.await()
                 } catch (e: InterruptedException) {
-                    // Delay longer than the 0ms gap between tOut.interrupt() and tOut.isAlive/out.failed
-                    // when grace is missing, while staying well within CLEANUP_GRACE_MS (500ms).
-                    try {
-                        Thread.yield()
-                    } catch (_: InterruptedException) {
-                        // Interrupt flag was cleared by catching InterruptedException above.
-                    }
+                    // 不 yield：立即重拋；中斷後 markFailed() 能否在 500ms grace 內結算由
+                    // CLEANUP_GRACE_MS 保證，不靠 Thread.yield() 碰排程運氣。
                     Thread.currentThread().interrupt()
                     throw RuntimeException("interrupted stdout getter", e)
                 }
@@ -2382,20 +2606,98 @@ class ElevatedRunnerP1B2Test {
         pollOutstandingTo(0)
         val before = ElevatedProcessIo.swallowedKillerThrows.get()
         val p = FakeProcess("ok".toByteArray(), ByteArray(0), 0, hang = true)
-        val d = ElevatedProcessIo.drain(
-            process = p,
-            timeoutMs = 100L,
-            killer = { throw OutOfMemoryError("killer boom") },
-            isCancelled = { false },
+        try {
+            val d = ElevatedProcessIo.drain(
+                process = p,
+                timeoutMs = 100L,
+                killer = { throw OutOfMemoryError("killer boom") },
+                isCancelled = { false },
+            )
+            assertTrue("drain must time out on hanging process", d.timedOut)
+            assertTrue(
+                "swallowedKillerThrows must increment on throwing killer",
+                ElevatedProcessIo.swallowedKillerThrows.get() > before,
+            )
+            assertTrue("cleanupIncomplete must be true on throwing killer", d.cleanupIncomplete)
+            // hang=true 的 FakeProcess 從未被 destroy（killer 拋 OOM 先於 destroy），
+            // post-kill verify（waitFor=false）必敗 → handle 轉入 quarantine。
+            assertEquals(
+                "hung process must be quarantined",
+                1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
+            pollOutstandingTo(0)
+            awaitNoElevatedThreads()
+        } finally {
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+        }
+    }
+
+    @Test fun drainHangMidVerifyHoldsCleanupSlotUntilVerifyOutcomeKnown() {
+        // Stage 3b（slot-ownership transfer）直測：清理 worker 已退出（killer 抛 OOM）
+        // 之後，post-kill verify 窗口內 outstanding 不得落回 0——slot 必須橫跨有界
+        // verify（本假件 waitFor 切片睡滿 5s）持有至 verify 結果已知、quarantine
+        // 先行登記後，caller 才釋放一次（verified-false → quarantine + release）。
+        // 舊行為（worker finally 自釋）下 verify 窗口內 outstanding==0，本斷言必掛。
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val p = FakeProcess("ok".toByteArray(), ByteArray(0), 0, hang = true)
+        val killEntered = CountDownLatch(1)
+        val drainDone = CountDownLatch(1)
+        val result = AtomicReference<ElevatedProcessIo.Drained?>()
+        val bg = Thread {
+            val d = ElevatedProcessIo.drain(
+                process = p,
+                timeoutMs = 100L,
+                killer = {
+                    killEntered.countDown()
+                    throw OutOfMemoryError("killer boom")
+                },
+                isCancelled = { false },
+            )
+            result.set(d)
+            drainDone.countDown()
+        }.also { it.isDaemon = true; it.start() }
+        try {
+            assertTrue("killer must be entered", killEntered.await(10, TimeUnit.SECONDS))
+            // verify 窗口遠早於其 5s waitFor 上界：slot 必須持續為 1（drain 未返回）。
+            pollOutstandingTo(1, boundMs = 10_000L)
+            repeat(3) {
+                Thread.sleep(250L)
+                assertEquals(
+                    "cleanup slot must stay held across the post-kill verify window",
+                    1,
+                    ElevatedCleanupTracker.outstanding(),
+                )
+            }
+            assertFalse(
+                "drain must still be inside the bounded verify window",
+                drainDone.await(0, TimeUnit.NANOSECONDS),
+            )
+        } finally {
+            bg.join(30_000L)
+        }
+        val d = result.get()
+        assertTrue("drain must return", d != null)
+        assertTrue("drain must time out on hanging process", d!!.timedOut)
+        assertTrue("cleanupIncomplete must be true on throwing killer", d.cleanupIncomplete)
+        // hang=true 的 FakeProcess 從未被 destroy（killer 拋 OOM 先於 destroy），
+        // post-kill verify（waitFor=false）必敗 → handle 轉入 quarantine。
+        assertEquals(
+            "hung process must be quarantined",
+            1,
+            ElevatedCleanupTracker.quarantinedCount(),
         )
-        assertTrue("drain must time out on hanging process", d.timedOut)
-        assertTrue(
-            "swallowedKillerThrows must increment on throwing killer",
-            ElevatedProcessIo.swallowedKillerThrows.get() > before,
-        )
+        // caller 於 verify 結果已知後已釋放一次；drain 返回後 outstanding 必為 0。
         pollOutstandingTo(0)
         awaitNoElevatedThreads()
-        ElevatedCleanupTracker.noteClean()
+        try {
+            bg.join(5_000L)
+        } finally {
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+        }
     }
 
     @Test fun drainBlockingKillerReturnsBoundedAndSetsIncomplete() {
@@ -2416,22 +2718,37 @@ class ElevatedRunnerP1B2Test {
         }
         val p = FakeProcess("ok".toByteArray(), ByteArray(0), 0, hang = true)
         val t0 = System.currentTimeMillis()
-        val d = ElevatedProcessIo.drain(
-            process = p,
-            timeoutMs = 100L,
-            killer = { stuckAwait(killerLatch) },
-            isCancelled = { false },
-        )
-        val wallMs = System.currentTimeMillis() - t0
-        // Must return within bounded time (CLEANUP_JOIN_MS + grace + margin).
-        assertTrue("drain must return bounded under blocking killer, wall=${wallMs}ms", wallMs < 15_000L)
-        assertTrue("drain must time out on hanging process", d.timedOut)
-        assertTrue("cleanupIncomplete must be true", d.cleanupIncomplete)
-        // Release the blocking killer so the detached worker can exit.
-        killerLatch.countDown()
-        pollOutstandingTo(0)
-        awaitNoElevatedThreads()
-        ElevatedCleanupTracker.noteClean()
+        try {
+            val d = ElevatedProcessIo.drain(
+                process = p,
+                timeoutMs = 100L,
+                killer = { stuckAwait(killerLatch) },
+                isCancelled = { false },
+            )
+            val wallMs = System.currentTimeMillis() - t0
+            // 上限推導：runCleanupBounded join 上界 min(max(remaining, CLEANUP_MIN_MS),
+            // CLEANUP_JOIN_MS=3000) + 超界時 CLEANUP_GRACE_MS≈500 重 join →
+            // kill 路徑有界 ≈3.5s（gobbler joins／verify 另有自己的界）；15s 留大餘量，
+            // 超界即代表 killer 真卡死（非慢 CI 可致）。
+            assertTrue("drain must return bounded under blocking killer, wall=${wallMs}ms", wallMs < 15_000L)
+            assertTrue("drain must time out on hanging process", d.timedOut)
+            assertTrue("cleanupIncomplete must be true", d.cleanupIncomplete)
+            // hang=true 的 FakeProcess 從未被 destroy（killer 永久阻塞，destroy 未執行），
+            // post-kill verify（waitFor=false）必敗 → handle 轉入 quarantine。
+            assertEquals(
+                "hung process must be quarantined",
+                1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
+            // Release the blocking killer so the detached worker can exit.
+            killerLatch.countDown()
+            pollOutstandingTo(0)
+            awaitNoElevatedThreads()
+        } finally {
+            killerLatch.countDown()
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+        }
     }
 
     @Test fun rootRawSuResLingerPathMarksTimedOut() {

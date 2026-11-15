@@ -21,7 +21,7 @@ import org.junit.Test
  *
  * 範圍警戒：
  * - 純 tracker 直接斷言（不經 runner、不碰執行語義、不翻旗、不接線）；
- * - 零真機、零 su、零 binder；排序一律 latch／barrier＋假時鐘，不靠 sleep 時序；
+ * - 零真機、零 su、零 binder；排序一律 latch／barrier＋假時鐘（有界輪詢），不用固定 sleep 當 oracle；
  * - 裝置 E2E 明確不做（見完成回報）。
  *
  * 與既有覆蓋的分工（不重複 runner 整合語義，只補 tracker 直接缺口）：
@@ -35,6 +35,10 @@ import org.junit.Test
 class ElevatedCleanupTrackerB2Test {
 
     @Before fun setUpIsolation() {
+        assertFalse(
+            "#136-B3 gate must stay closed",
+            PrivilegeActivation.ELEVATED_RUNNERS_READY,
+        )
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -45,6 +49,7 @@ class ElevatedCleanupTrackerB2Test {
     @After fun tearDownIsolation() {
         val leakedOutstanding = ElevatedCleanupTracker.outstanding()
         val leakedActive = ElevatedCleanupTracker.activeCalls()
+        val leakedQuarantine = ElevatedCleanupTracker.quarantinedCount()
         ElevatedCleanupTracker.clearUnverified()
         while (ElevatedCleanupTracker.outstanding() > 0) {
             ElevatedCleanupTracker.releaseSlot()
@@ -59,6 +64,7 @@ class ElevatedCleanupTrackerB2Test {
         awaitNoQuarantineThreads()
         assertEquals("test leaked outstanding slots", 0, leakedOutstanding)
         assertEquals("test leaked active calls", 0, leakedActive)
+        assertEquals("test leaked quarantined processes", 0, leakedQuarantine)
     }
 
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {
@@ -210,9 +216,11 @@ class ElevatedCleanupTrackerB2Test {
 
     @Test fun saturatedAcquireRefusesWithoutGrowthAndPeakCapped() {
         ElevatedCleanupTracker.resetPeak()
+        var prefilled = 0
         try {
             repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
                 assertTrue("slot $it must grant below MAX", ElevatedCleanupTracker.acquireSlot())
+                prefilled++
             }
             assertEquals(
                 ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
@@ -231,20 +239,21 @@ class ElevatedCleanupTrackerB2Test {
             // 飽和不佔 active（准入層職責，此處只斷 tracker 計數正交）。
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
         } finally {
-            repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS + 1) {
+            repeat(prefilled) {
                 ElevatedCleanupTracker.releaseSlot()
             }
             pollOutstandingTo(0)
             ElevatedCleanupTracker.noteClean()
         }
-        assertFalse(ElevatedCleanupTracker.isSaturated())
     }
 
     // ---- 2. 飽和 markLingering fail-closed（不佔槽、終態、不欠釋放） ----
 
     @Test fun markLingeringAtSaturationTakesNoSlotFailClosed() {
+        var prefilled = 0
         repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
             assertTrue(ElevatedCleanupTracker.acquireSlot())
+            prefilled++
         }
         assertTrue(ElevatedCleanupTracker.isSaturated())
         val latch = CountDownLatch(1)
@@ -288,13 +297,12 @@ class ElevatedCleanupTrackerB2Test {
         } finally {
             latch.countDown()
             worker.join(5_000L)
-            repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS + 1) {
+            repeat(prefilled) {
                 ElevatedCleanupTracker.releaseSlot()
             }
             pollOutstandingTo(0)
             ElevatedCleanupTracker.noteClean()
         }
-        assertEquals(0, ElevatedCleanupTracker.outstanding())
     }
 
     // ---- 3. noteClean／outstanding 分離直測（P0-1，不經 drain） ----
@@ -315,11 +323,9 @@ class ElevatedCleanupTrackerB2Test {
             ElevatedCleanupTracker.noteClean()
             assertEquals(0, ElevatedCleanupTracker.consecutiveCount())
         } finally {
-            while (ElevatedCleanupTracker.outstanding() > 0) { ElevatedCleanupTracker.releaseSlot() }
             pollOutstandingTo(0)
             ElevatedCleanupTracker.noteClean()
         }
-        assertEquals(0, ElevatedCleanupTracker.consecutiveCount())
     }
 
     // ---- 4. noteUnclean 封頂精確值（不溢出） ----
@@ -357,11 +363,12 @@ class ElevatedCleanupTrackerB2Test {
             pollActiveTo(0)
             ElevatedCleanupTracker.noteClean()
         }
+        var activeHeld = 0
         try {
             // a) backlog＋breaker＋quarantine 三門同立 → BACKLOG（首門優先）。
             resetAll()
             repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
-                ElevatedCleanupTracker.acquireSlot()
+                assertTrue(ElevatedCleanupTracker.acquireSlot())
             }
             repeat(ElevatedCleanupTracker.MAX_CONSECUTIVE_UNCLEAN) {
                 ElevatedCleanupTracker.noteUnclean()
@@ -389,7 +396,7 @@ class ElevatedCleanupTrackerB2Test {
 
             // c) reservation（outstanding=1）＋quarantine → BACKLOG（預留先於末門）。
             resetAll()
-            ElevatedCleanupTracker.acquireSlot()
+            assertTrue(ElevatedCleanupTracker.acquireSlot())
             ElevatedCleanupTracker.quarantineUnverified(FastAliveProcess())
             assertEquals(
                 ElevatedCleanupTracker.Admission.BACKLOG_FULL,
@@ -409,30 +416,29 @@ class ElevatedCleanupTrackerB2Test {
             )
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
 
-            // e) CONCURRENCY_FULL 死分支仍可達：僅測用 tryEnterCall 預填 active=4。
+            // e) CONCURRENCY_FULL 死分支仍可達：僅測用 tryEnterCall 預填 active=MAX_CONCURRENT_CALLS。
             resetAll()
-            repeat(4) { assertTrue(ElevatedCleanupTracker.tryEnterCall()) }
-            assertEquals(4, ElevatedCleanupTracker.activeCalls())
-            // e) active=4 時 reservation 必為 CONCURRENCY_FULL：classifyAdmissionLocked
-            // 先查 active>=MAX_SLOTS（併發門）才查 reservation，順序調換即迴歸，
+            repeat(ElevatedCleanupTracker.MAX_CONCURRENT_CALLS) {
+                assertTrue(ElevatedCleanupTracker.tryEnterCall())
+                activeHeld += 1
+            }
+            assertEquals(ElevatedCleanupTracker.MAX_CONCURRENT_CALLS, ElevatedCleanupTracker.activeCalls())
+            // e) active=MAX_CONCURRENT_CALLS 時 reservation 必為 CONCURRENCY_FULL：classifyAdmissionLocked
+            // 先查 active>=MAX_CONCURRENT_CALLS（併發門）才查 reservation，順序調換即迴歸，
             // 故此處精確斷言（既有 reservationMatrixDirect 亦同）。
             val verdict = ElevatedCleanupTracker.tryEnterReserved()
             assertEquals(
                 ElevatedCleanupTracker.Admission.CONCURRENCY_FULL,
                 verdict,
             )
-            assertEquals(4, ElevatedCleanupTracker.activeCalls())
+            assertEquals(ElevatedCleanupTracker.MAX_CONCURRENT_CALLS, ElevatedCleanupTracker.activeCalls())
         } finally {
             ElevatedCleanupTracker.clearUnverified()
-            while (ElevatedCleanupTracker.outstanding() > 0) { ElevatedCleanupTracker.releaseSlot() }
-            while (ElevatedCleanupTracker.activeCalls() > 0) { ElevatedCleanupTracker.leaveCall() }
+            repeat(activeHeld) { ElevatedCleanupTracker.leaveCall() }
             pollOutstandingTo(0)
             pollActiveTo(0)
             ElevatedCleanupTracker.noteClean()
         }
-        assertEquals(0, ElevatedCleanupTracker.activeCalls())
-        assertEquals(0, ElevatedCleanupTracker.outstanding())
-        assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
     }
 
     // ---- 6. quarantine identity 去重（===，非 equals） ----
@@ -467,8 +473,6 @@ class ElevatedCleanupTrackerB2Test {
             ElevatedCleanupTracker.noteClean()
             pollOutstandingTo(0)
         }
-        assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
-        assertFalse(ElevatedCleanupTracker.isQuarantined())
     }
 
     // ---- 7. sweep：確死清除、存活／拋保持（fail-closed，不外拋） ----
@@ -498,7 +502,6 @@ class ElevatedCleanupTrackerB2Test {
             pollOutstandingTo(0)
             awaitNoQuarantineThreads()
         }
-        assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
     }
 
     // ---- 8. per-handle 節流：同 handle 同一時刻不重驗（計數直測） ----
@@ -562,8 +565,10 @@ class ElevatedCleanupTrackerB2Test {
             val cleared = ElevatedCleanupTracker.sweepQuarantine(throwingClock)
             assertEquals(0, cleared)
             assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
-            // 背景 kick：拋時鐘即 fallback，不外拋（回 true/false 皆合法，只斷不拋＋保持）。
+            // 背景 kick：拋時鐘即 fallback（@Before 已 clearUnverified 重置冷卻，
+            // 此處必須成功發起；fallback 時鐘為單調 System.nanoTime，首 kick 不受冷卻限）。
             val kicked = ElevatedCleanupTracker.kickSweepAsync(throwingClock)
+            assertTrue("fallback clock must still start the sweep", kicked)
             // 無論是否發起，quarantine 必須保持（fail-closed）。
             assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
             assertTrue(
@@ -641,8 +646,6 @@ class ElevatedCleanupTrackerB2Test {
             pollActiveTo(0)
             awaitNoQuarantineThreads()
         }
-        assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
-        assertEquals(0, ElevatedCleanupTracker.sweepPendingCount())
     }
 
     // ---- 12. 拒絕不佔席（BACKLOG／BREAKER／QUARANTINE 全門） ----
@@ -661,18 +664,22 @@ class ElevatedCleanupTrackerB2Test {
             ElevatedCleanupTracker.noteClean()
         }
         try {
-            // BACKLOG（outstanding=7）。
+            // BACKLOG（outstanding=MAX_OUTSTANDING_CLEANUPS）。
             resetAll()
-            repeat(7) { ElevatedCleanupTracker.acquireSlot() }
+            repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
+                assertTrue(ElevatedCleanupTracker.acquireSlot())
+            }
             assertEquals(
                 ElevatedCleanupTracker.Admission.BACKLOG_FULL,
                 ElevatedCleanupTracker.tryEnterReserved(),
             )
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
 
-            // BREAKER（consecutive=4）。
+            // BREAKER（consecutive=MAX_CONSECUTIVE_UNCLEAN）。
             resetAll()
-            repeat(4) { ElevatedCleanupTracker.noteUnclean() }
+            repeat(ElevatedCleanupTracker.MAX_CONSECUTIVE_UNCLEAN) {
+                ElevatedCleanupTracker.noteUnclean()
+            }
             assertEquals(
                 ElevatedCleanupTracker.Admission.BREAKER_OPEN,
                 ElevatedCleanupTracker.tryEnterReserved(),
@@ -699,8 +706,6 @@ class ElevatedCleanupTrackerB2Test {
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
         } finally {
             ElevatedCleanupTracker.clearUnverified()
-            while (ElevatedCleanupTracker.outstanding() > 0) { ElevatedCleanupTracker.releaseSlot() }
-            while (ElevatedCleanupTracker.activeCalls() > 0) { ElevatedCleanupTracker.leaveCall() }
             pollOutstandingTo(0)
             pollActiveTo(0)
             ElevatedCleanupTracker.noteClean()
@@ -711,25 +716,30 @@ class ElevatedCleanupTrackerB2Test {
 
     @Test fun peakTracksMaxAndResetPeakRebases() {
         ElevatedCleanupTracker.resetPeak()
+        var held = 0
         try {
             assertEquals(0, ElevatedCleanupTracker.outstanding())
-            repeat(2) { ElevatedCleanupTracker.acquireSlot() }
+            repeat(2) {
+                assertTrue(ElevatedCleanupTracker.acquireSlot())
+                held += 1
+            }
             assertEquals(2, ElevatedCleanupTracker.outstanding())
             assertEquals(2, ElevatedCleanupTracker.peakOutstanding())
             ElevatedCleanupTracker.releaseSlot()
+            held -= 1
             assertEquals(1, ElevatedCleanupTracker.outstanding())
             assertEquals("peak must hold max, not current", 2, ElevatedCleanupTracker.peakOutstanding())
             ElevatedCleanupTracker.resetPeak()
             assertEquals("resetPeak must rebase to current", 1, ElevatedCleanupTracker.peakOutstanding())
-            ElevatedCleanupTracker.acquireSlot()
+            assertTrue(ElevatedCleanupTracker.acquireSlot())
+            held += 1
             assertEquals(2, ElevatedCleanupTracker.outstanding())
             assertEquals(2, ElevatedCleanupTracker.peakOutstanding())
         } finally {
-            while (ElevatedCleanupTracker.outstanding() > 0) { ElevatedCleanupTracker.releaseSlot() }
+            repeat(held) { ElevatedCleanupTracker.releaseSlot() }
             pollOutstandingTo(0)
             ElevatedCleanupTracker.noteClean()
         }
-        assertEquals(0, ElevatedCleanupTracker.outstanding())
     }
 
     // ---- 14. quarantine 不佔槽／不計 consecutive（與 breaker 分離） ----
@@ -950,9 +960,11 @@ class ElevatedCleanupTrackerB2Test {
     @Test fun acquireSlotOrQuarantineSaturatedRegistersQuarantineAtomically() {
         ElevatedCleanupTracker.resetPeak()
         val victim = FastAliveProcess()
+        var prefilled = 0
         try {
             repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
                 assertTrue("slot $it must grant below MAX", ElevatedCleanupTracker.acquireSlot())
+                prefilled++
             }
             assertTrue(ElevatedCleanupTracker.isSaturated())
             // 飽和：helper 同鎖內登記 quarantine，不佔槽、outstanding 封頂不增。
@@ -976,7 +988,7 @@ class ElevatedCleanupTrackerB2Test {
                 ElevatedCleanupTracker.outstanding(),
             )
         } finally {
-            repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
+            repeat(prefilled) {
                 ElevatedCleanupTracker.releaseSlot()
             }
             ElevatedCleanupTracker.clearUnverified()

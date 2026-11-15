@@ -43,6 +43,10 @@ class ElevatedRunnerPhaseBLateCompensationTest {
 
     @Before fun setUpIsolation() {
         hermeticExec = HermeticExecFixture("phaseb-hermetic", "id")
+        assertFalse(
+            "#136-B3 gate must stay closed",
+            PrivilegeActivation.ELEVATED_RUNNERS_READY,
+        )
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -53,12 +57,19 @@ class ElevatedRunnerPhaseBLateCompensationTest {
     @After fun tearDownIsolation() {
         hermeticExec?.close()
         hermeticExec = null
-        repeat(8) { ElevatedCleanupTracker.releaseSlot() }
-        repeat(8) { ElevatedCleanupTracker.leaveCall() }
+        val leakedOutstanding = ElevatedCleanupTracker.outstanding()
+        val leakedActive = ElevatedCleanupTracker.activeCalls()
+        val leakedQuarantine = ElevatedCleanupTracker.quarantinedCount()
+        Thread.interrupted()
+        // fail-closed：不盲發 releaseSlot/leaveCall；洩漏即輪詢逾時丟 AssertionError。
         pollOutstandingTo(0)
         pollActiveTo(0)
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
+        awaitNoElevatedThreads()
+        assertEquals("test leaked outstanding slots", 0, leakedOutstanding)
+        assertEquals("test leaked active calls", 0, leakedActive)
+        assertEquals("test leaked quarantined processes", 0, leakedQuarantine)
     }
 
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 15_000L) {
@@ -305,7 +316,9 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             assertTrue("$r", r is ElevatedBinaryResult.TimedOut)
             r as ElevatedBinaryResult.TimedOut
             assertTrue("caller-claimed late must flag, got $r", r.cleanupIncomplete)
-            assertEquals(1, kills.get())
+            // killer 由 elevated-late-spawn daemon 非同步觸發；以 daemon barrier 等待其呼叫，
+            // 不做無界裸讀（裸 assertEquals(1, kills.get()) 對該競態不穩定）。
+            pollTrue("late compensation daemon must have invoked the killer") { kills.get() == 1 }
             assertEquals(1, spawns.get())
             // daemon 持槽殘留：outstanding/active/活 daemon 一致。
             pollTrue("late daemon must hold one slot") { ElevatedCleanupTracker.outstanding() == 1 }
@@ -401,6 +414,9 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             release.countDown()
             pollOutstandingTo(0)
             pollActiveTo(0)
+            // late 驗證失敗已登記 quarantine：此處顯式清除以隔離本測試登記
+            //（tearDownIsolation 亦會清＋斷言無洩漏，故各測試須自行清場）。
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }
@@ -472,6 +488,8 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
             pollOutstandingTo(0)
             pollActiveTo(0)
+            // 飽和登記 quarantine：此處顯式清除以隔離本測試登記（同上）。
+            ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
         }

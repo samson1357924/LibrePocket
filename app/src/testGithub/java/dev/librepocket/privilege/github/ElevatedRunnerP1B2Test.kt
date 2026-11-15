@@ -48,6 +48,7 @@ class ElevatedRunnerP1B2Test {
 
     private var hermeticExec: HermeticExecFixture? = null
     private var floorBefore: Int = 0
+    private var lingerFloorBefore: Int = 0
 
     @Before fun setUpIsolation() {
         hermeticExec = HermeticExecFixture("p1b2-hermetic", "id")
@@ -56,6 +57,7 @@ class ElevatedRunnerP1B2Test {
             PrivilegeActivation.ELEVATED_RUNNERS_READY,
         )
         floorBefore = ElevatedCleanupTracker.releaseFloorHits()
+        lingerFloorBefore = ElevatedCleanupTracker.lingerDebtFloorHits()
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
     }
@@ -75,6 +77,10 @@ class ElevatedRunnerP1B2Test {
         assertEquals("test leaked active calls", 0, leakedActive)
         assertEquals("test leaked quarantined processes", 0, leakedQuarantine)
         assertEquals("release floor must not be hit during this test", floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+        pollTrue("linger debt must unwind to zero", 10_000L) {
+            ElevatedCleanupTracker.lingerDebtCount() == 0
+        }
+        assertEquals("linger debt floor must not be hit during this test", lingerFloorBefore, ElevatedCleanupTracker.lingerDebtFloorHits())
     }
 
     private fun awaitNoElevatedThreads(boundMs: Long = 15_000L) {
@@ -1107,6 +1113,63 @@ class ElevatedRunnerP1B2Test {
         }
     }
 
+    // ---- Round-6（review IR-P1）：飽和 cleanup worker 起線程失敗 — catch arm 收斂 linger debt（恰好一次） ----
+    @Test fun saturatedCleanupThreadStartFailureConvergesLingerDebt() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val debtBefore = ElevatedCleanupTracker.lingerDebtCount()
+        val lingerFloorBefore = ElevatedCleanupTracker.lingerDebtFloorHits()
+        val untrackedBefore = ElevatedCleanupTracker.untrackedResidualCount()
+        var prefilled = 0
+        try {
+            repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
+                assertTrue(ElevatedCleanupTracker.acquireSlot())
+                prefilled++
+            }
+            val d = ElevatedProcessIo.drainWithThreadStarter(
+                process = KillableImmediateProcess(),
+                timeoutMs = 300L,
+                killer = { /* never runs: elevated-cleanup thread fails to start */ it.destroy() },
+                isCancelled = { false },
+                startThread = { t ->
+                    if (t.name == "elevated-cleanup") {
+                        throw OutOfMemoryError("simulated OOM on elevated-cleanup")
+                    }
+                    t.start()
+                },
+            )
+            // catch 臂恰好 endLingerDebt 一次：debt 必須回到基線（與 worker 退出無關——worker 從未存在）。
+            assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
+            assertEquals(lingerFloorBefore, ElevatedCleanupTracker.lingerDebtFloorHits())
+            assertTrue("cleanupIncomplete must stay true", d.cleanupIncomplete)
+            assertTrue("untrackedResidual must surface", d.untrackedResidual)
+            // 互斥語義：起線程失敗只計 kill-never-attempted，untracked residual 計數不增
+            // （無 worker 即無殘留；見 drainCleanupThreadStartFailureRecordsKillNeverAttempted）。
+            assertEquals(untrackedBefore, ElevatedCleanupTracker.untrackedResidualCount())
+            assertEquals(
+                ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+                ElevatedCleanupTracker.outstanding(),
+            )
+            // 先釋預填槽（與 saturatedDrainKillSweepRestoresAdmission 同式）——outstanding 歸零後
+            // gate 1 通過；debt 已於 catch 臂同步收斂（== debtBefore），gate 5 亦通過。
+            repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
+            prefilled = 0
+            pollOutstandingTo(0)
+            // 迴歸註記（F5）：sweep 移除 `waitFor(0)==true` 條目為同一鎖內原子操作，與 admission
+            // 判定同鎖；方向 fail-closed（僅 verified-death 方移除；飽和 stalled 條目持續殘留）。
+            // gate 5 不觸發（debt==0）；gate 6（quarantine）於 debt==0 時獨力封死。
+            assertEquals(ElevatedCleanupTracker.Admission.QUARANTINE, ElevatedCleanupTracker.tryEnterReserved())
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+        } finally {
+            repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            awaitNoElevatedThreads()
+        }
+    }
+
     // ---- Stage 3（N1）：飽和 drain kill → sweep 驗證死亡 → admission 恢復（防 seal 永久化回歸） ----
 
     @Test fun saturatedDrainKillSweepRestoresAdmission() {
@@ -1163,7 +1226,10 @@ class ElevatedRunnerP1B2Test {
             repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
             prefilled = 0
             pollOutstandingTo(0)
-            // 密封此刻仍在位（QUARANTINE 末門獨力阻擋）。
+            pollTrue("cleanup worker must unwind linger debt", 10_000L) {
+                ElevatedCleanupTracker.lingerDebtCount() == 0
+            }
+            // 密封此刻仍在位（gate 6（quarantine）於 debt==0 時獨力封死）。
             assertEquals(
                 ElevatedCleanupTracker.Admission.QUARANTINE,
                 ElevatedCleanupTracker.tryEnterReserved(),
@@ -1190,6 +1256,95 @@ class ElevatedRunnerP1B2Test {
             pollOutstandingTo(0)
             awaitNoElevatedThreads()
             ElevatedCleanupTracker.noteClean()
+        }
+    }
+
+    // ---- Round-6（review IR-P1）：飽和無槽 blocked cleanup worker — sweep 解封 quarantine 後 admission 仍密封（linger debt） ----
+
+    @Test fun saturatedBlockedCleanupWorkerHoldsAdmissionAfterSweep() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+        val untrackedBefore = ElevatedCleanupTracker.untrackedResidualCount()
+        val stalledBefore = ElevatedCleanupTracker.cleanupWorkerStalledAfterVerifyCount()
+        val killerEntered = CountDownLatch(1)
+        val killerRelease = CountDownLatch(1)
+        var prefilled = 0
+        try {
+            repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
+                assertTrue(ElevatedCleanupTracker.acquireSlot())
+                prefilled++
+            }
+            val victim = KillableImmediateProcess()
+            // killer：destroy 置旗（victim 確死）後永久阻塞（吞 interrupt，模擬不可中斷 Binder stall）。
+            val d = ElevatedProcessIo.drainWithThreadStarter(
+                process = victim,
+                timeoutMs = 300L,
+                killer = { p ->
+                    p.destroy()
+                    killerEntered.countDown()
+                    while (true) {
+                        try {
+                            killerRelease.await()
+                            break
+                        } catch (_: InterruptedException) {
+                            // 吞 interrupt（模擬不可中斷 Binder stall）。
+                        }
+                    }
+                },
+                isCancelled = { false },
+                startThread = { it.start() },
+            )
+            // worker 已進入 killer（destroy 完成、victim 確死）才進行下一步，確保確定性。
+            assertTrue("cleanup worker must enter the blocking killer", killerEntered.await(10, TimeUnit.SECONDS))
+            assertTrue("saturated cleanup worker must flag cleanupIncomplete", d.cleanupIncomplete)
+            assertTrue("saturated cleanup worker must surface untrackedResidual", d.untrackedResidual)
+            assertEquals(1, ElevatedCleanupTracker.untrackedResidualCount() - untrackedBefore)
+            assertEquals(
+                "cleanupWorkerStalledAfterVerifyCount must NOT move (saturated arm, not acquired)",
+                stalledBefore,
+                ElevatedCleanupTracker.cleanupWorkerStalledAfterVerifyCount(),
+            )
+            // 手動釋放 7 槽；victim 死 → sweep 解除 quarantine。
+            repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
+            prefilled = 0
+            pollOutstandingTo(0)
+            // 密封此刻已在位（debt gate 5 先於 quarantine gate 6；debt==1 ⇒ BACKLOG_FULL）。
+            assertEquals(
+                "pre-sweep admission must refuse (debt gate)",
+                ElevatedCleanupTracker.Admission.BACKLOG_FULL,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+            assertTrue("sweep must kick for the saturated registration", ElevatedCleanupTracker.kickSweepAsync())
+            pollTrue("sweep must clear the quarantine entry after verified death", 10_000L) {
+                ElevatedCleanupTracker.quarantinedCount() == quarantineBefore
+            }
+            // 關鍵：worker 仍 blocked、debt>0 ⇒ admission 不得回 OK。
+            assertEquals(ElevatedCleanupTracker.Admission.BACKLOG_FULL, ElevatedCleanupTracker.tryEnterReserved())
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+            // 釋放 killer：worker 退出 → debt 歸零 → admission 恢復 OK。
+            killerRelease.countDown()
+            pollTrue("worker exit must clear the linger debt", 10_000L) {
+                ElevatedCleanupTracker.lingerDebtCount() == 0
+            }
+            assertEquals(ElevatedCleanupTracker.Admission.OK, ElevatedCleanupTracker.tryEnterReserved())
+            ElevatedCleanupTracker.leaveCall()
+        } finally {
+            killerRelease.countDown()
+            repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
+            // worker 自最終態收斂至 debt 0（若測試中途失敗，latch 已放行，worker 可退出）。
+            // 包 runCatching：teardown 失敗不得覆蓋原始 AssertionError。
+            runCatching {
+                pollTrue("worker must exit after latch release", 10_000L) {
+                    ElevatedCleanupTracker.lingerDebtCount() == 0
+                }
+            }
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            awaitNoElevatedThreads()
         }
     }
 
@@ -1242,7 +1397,7 @@ class ElevatedRunnerP1B2Test {
                 0,
                 victim.destroyCalls,
             )
-            // 密封此刻仍在位（QUARANTINE 末門獨力阻擋；tryEnterReserved 拒入即不佔席）。
+            // 密封此刻仍在位（gate 6（quarantine）於 debt==0 時獨力封死；tryEnterReserved 拒入即不佔席）。
             assertEquals(
                 ElevatedCleanupTracker.Admission.QUARANTINE,
                 ElevatedCleanupTracker.tryEnterReserved(),
@@ -1275,7 +1430,7 @@ class ElevatedRunnerP1B2Test {
     /**
      * Stage 5（I6，late-飽和臂 → sweep 鏈式迴歸）：caller CAS 認領 late Process 時
      * 槽全滿 ⇒ `startLateDaemon` 飽和臂經 `acquireSlotOrQuarantine` 原子轉入
-     * quarantine（零 kill、不發 daemon）；釋預填槽後 seal 獨力阻擋（QUARANTINE），
+     * quarantine（零 kill、不發 daemon）；釋預填槽後 gate 6（quarantine）於 debt==0 時獨力封死，
      * admission-triggered `kickSweepAsync` 經 `waitFor(0, MILLISECONDS)` 有界驗證
      * （NaturalDeathProcess＝確死 fixture）即解除登記，admission 恢復 OK（seal 未永久化）。
      * harness 結構同 PhaseB 飽和認領 pin（spawn→worker publish→預填→cancelGate 放行），
@@ -1368,7 +1523,7 @@ class ElevatedRunnerP1B2Test {
                 quarantineBefore + 1,
                 ElevatedCleanupTracker.quarantinedCount(),
             )
-            // 釋預填槽（victim 仍封印中），quarantine seal 獨力阻擋新 spawn。
+            // 釋預填槽（victim 仍封印中），gate 6（quarantine）於 debt==0 時獨力封死新 spawn。
             repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
             prefilled = 0
             pollOutstandingTo(0)

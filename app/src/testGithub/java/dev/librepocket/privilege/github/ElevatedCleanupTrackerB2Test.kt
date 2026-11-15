@@ -35,6 +35,7 @@ import org.junit.Test
 class ElevatedCleanupTrackerB2Test {
 
     private var floorBefore: Int = 0
+    private var lingerFloorBefore: Int = 0
 
     @Before fun setUpIsolation() {
         assertFalse(
@@ -42,6 +43,7 @@ class ElevatedCleanupTrackerB2Test {
             PrivilegeActivation.ELEVATED_RUNNERS_READY,
         )
         floorBefore = ElevatedCleanupTracker.releaseFloorHits()
+        lingerFloorBefore = ElevatedCleanupTracker.lingerDebtFloorHits()
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -69,6 +71,10 @@ class ElevatedCleanupTrackerB2Test {
         assertEquals("test leaked active calls", 0, leakedActive)
         assertEquals("test leaked quarantined processes", 0, leakedQuarantine)
         assertEquals("release floor must not be hit during this test", floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+        pollTrue("linger debt must unwind to zero", 10_000L) {
+            ElevatedCleanupTracker.lingerDebtCount() == 0
+        }
+        assertEquals("linger debt floor must not be hit during this test", lingerFloorBefore, ElevatedCleanupTracker.lingerDebtFloorHits())
     }
 
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {
@@ -251,10 +257,11 @@ class ElevatedCleanupTrackerB2Test {
         }
     }
 
-    // ---- 2. 飽和 markLingering fail-closed（不佔槽、終態、不欠釋放） ----
+    // ---- 2. 飽和 markLingering fail-closed（不佔槽、state=3＋ debt 持有至 worker finally） ----
 
     @Test fun markLingeringAtSaturationTakesNoSlotFailClosed() {
         var prefilled = 0
+        val debtBefore = ElevatedCleanupTracker.lingerDebtCount()
         repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
             assertTrue(ElevatedCleanupTracker.acquireSlot())
             prefilled++
@@ -274,6 +281,9 @@ class ElevatedCleanupTrackerB2Test {
                         ElevatedCleanupTracker.releaseSlot()
                     } else if (state.get() == 0) {
                         state.set(2)
+                    } else if (state.get() == 3) {
+                        state.set(2)
+                        ElevatedCleanupTracker.endLingerDebt()
                     }
                 }
             }
@@ -285,15 +295,18 @@ class ElevatedCleanupTrackerB2Test {
             while (!worker.isAlive && System.currentTimeMillis() < d) Thread.sleep(5L)
             assertTrue(worker.isAlive)
             ElevatedCleanupTracker.markLingering(worker, state)
-            // 飽和即終態、不佔槽（outstanding 封頂不增）。
-            assertEquals(2, state.get())
+            // 飽和即終態 3（state=3＝飽和無槽＋債務；不佔槽，outstanding 封頂不增）：
+            // debt 持有至 worker 本體 finally 見 3 即歸零（admission 此時對密封直至 worker 退出）。
+            assertEquals(3, state.get())
+            assertEquals(debtBefore + 1, ElevatedCleanupTracker.lingerDebtCount())
             assertEquals(
                 ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
                 ElevatedCleanupTracker.outstanding(),
             )
-            // 同 state 重複 mark 不重佔。
+            // 同 state 重複 mark 不重記、不重佔。
             ElevatedCleanupTracker.markLingering(worker, state)
-            assertEquals(2, state.get())
+            assertEquals(3, state.get())
+            assertEquals(debtBefore + 1, ElevatedCleanupTracker.lingerDebtCount())
             assertEquals(
                 ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
                 ElevatedCleanupTracker.outstanding(),
@@ -301,10 +314,14 @@ class ElevatedCleanupTrackerB2Test {
         } finally {
             latch.countDown()
             worker.join(5_000L)
+            assertTrue("worker must exit within 5s", !worker.isAlive)
+            // 先釋槽＋清零 outstanding，再斷言 debt baseline——fail-fast 斷言不得阻止共享狀態清理。
             repeat(prefilled) {
                 ElevatedCleanupTracker.releaseSlot()
             }
             pollOutstandingTo(0)
+            // worker 已退出 ⇒ finally 恰好歸債一次——debt 必須回到 baseline 才算收斂。
+            assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
             ElevatedCleanupTracker.noteClean()
         }
     }
@@ -1112,7 +1129,7 @@ class ElevatedCleanupTrackerB2Test {
             repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
             prefilled = 0
             pollOutstandingTo(0)
-            // 歸零後並行准入：quarantine 末門獨力封死 fail-open 窗口。
+            // 歸零後並行准入：gate 6（quarantine）於 debt==0 時獨力封死 fail-open 窗口。
             assertEquals(
                 ElevatedCleanupTracker.Admission.QUARANTINE,
                 ElevatedCleanupTracker.tryEnterReserved(),

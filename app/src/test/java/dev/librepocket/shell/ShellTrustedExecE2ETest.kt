@@ -3,10 +3,15 @@ package dev.librepocket.shell
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 
@@ -39,13 +44,21 @@ class ShellTrustedExecE2ETest {
         val proc = ProcessBuilder(listOf(path))
             .redirectErrorStream(true)
             .start()
+        // 背景執行緒即時排空 stdout：子進程輸出超過 pipe 緩衝區（通常 64KB）時，
+        // 若先 waitFor 再讀，子進程會阻塞於 write、父行程阻塞於 waitFor → 死鎖；
+        // 改以背景執行緒並行讀取，>64KB 輸出也不會在 timeout 之前卡死。
+        val out = CompletableDeferred<String>()
+        thread(name = "spawnAndWait-stdout", isDaemon = true) {
+            out.complete(proc.inputStream.bufferedReader().readText())
+        }
         val finished = proc.waitFor(10, TimeUnit.SECONDS)
         if (!finished) {
             proc.destroyForcibly()
-            throw AssertionError("process did not exit within 10s: $path")
+            fail("process did not exit within 10s: $path")
         }
-        val out = proc.inputStream.bufferedReader().readText()
-        return proc.exitValue() to out
+        // 子進程已退出：pipe 於 EOF 時完成；10s 上限防禦孫進程握住寫端的病態情形。
+        val text = runBlocking { withTimeout(10_000) { out.await() } }
+        return proc.exitValue() to text
     }
 
     @Test fun bareIdResolvesAndActuallyRuns() {

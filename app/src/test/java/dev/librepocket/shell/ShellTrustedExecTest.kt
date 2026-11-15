@@ -8,6 +8,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 
 /**
@@ -366,7 +367,8 @@ class ShellTrustedExecTest {
         } catch (_: Exception) {
             false
         }
-        if (!probe) return
+        // `env` 二進位不可用（如無 coreutils/busybox env）時跳過（SKIP，非靜默綠燈）。
+        assumeTrue("shell env binary unavailable", probe)
         val out = DefaultProcessRunner().run(listOf("env"), 5_000L, null)
         val text = String(out.stdout, Charsets.UTF_8)
         val keys = text.lineSequence()

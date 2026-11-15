@@ -30,6 +30,7 @@ import kotlinx.coroutines.withContext
  *   follower 重選時同樣退回 [WebSearchProvider.credentialState] 重驗（N1 修復），
  *   已刪除憑證在巢狀路徑同樣不會被重送。in-flight 移除
  *   仍在 `NonCancellable` finally 內，殘留已取消的 deferred 不會焊住後續同 key。
+ * - 抹除不變式（R6-2）：searchInternal 每個迭代先將 self-resolved snapshot 指派進局部欄位、次執行 ensureActive()、最後分派；wipe 僅有一處（唯一 finally、以 stickyIter == null 為準），涵蓋 cache hit／follower／leader／例外／retry／state 解析後取消；sticky 絕不由本層 wipe。
  * - leader 已拿到值才觀察到取消（delegate 回 `Ok` 後 `ensureActive()` 失敗）：
  *   不寫快取、leader 仍拋 [CancellationException]，但已在等待的 follower 仍以該
  *   `Ok`（非 cached）完成，不陪葬重打。
@@ -173,20 +174,28 @@ class WebSearchService(
                     CredentialState.Unavailable
                 }
             }
-            // CE-swallowing delegate 在已取消 context 下 credentialState() 仍「正常返回」時，
-            // 此 ensureActive() 讓取消原樣透傳（覆蓋後續 cache hit 與其下游所有路徑）。
-            currentCoroutineContext().ensureActive()
-            // snapshot 於 try 內指派（含 cacheKey 建構／cacheNamespace 取用）——
-            // 任何路徑（cache hit、join、leader 收斂、例外、retry）皆由單一 finally 負責 wipe。
+            // snapshot 於 try 內指派、且早於一切可能 throw／return 的語句（含 ensureActive）——
+            // 任何路徑（cache hit、join、leader 收斂、例外、retry、state 解析後 ensureActive 拋 CE）
+            // 皆由單一 finally 負責 wipe。
             var snapshot: CredentialSnapshot? = null
             var retry = false
             try {
-                snapshot = when (state) {
+                // 順序不變式（R6-2）：順序固定——
+                //   1) self-resolved snapshot 先指派（state 為 Ready 時；sticky 同一物件亦先入此欄位）；
+                //   2) ensureActive() 其次——此行之上不得出現任何 throw／return；
+                //   3) 分派最後。此行以下的每一條出口都已位於 snapshot 指派之後，
+                //      不再存在「Ready 存在但 finally 尚未接管」的窗口。
+                // sticky（stickyIter != null）絕不 wipe——所有權在外層；下方 finally 以 stickyIter 為準。
+                snapshot = (state as? CredentialState.Ready)?.snapshot
+                // CE-swallowing delegate 在已取消 context 下 credentialState() 仍「正常返回」時，
+                // 此 ensureActive() 讓取消原樣透傳（覆蓋 bypass／cache 查找／cache hit 與其下游所有路徑）。
+                currentCoroutineContext().ensureActive()
+                when (state) {
                     CredentialState.Unavailable -> return bypass(query, n)
-                    CredentialState.NotApplicable -> null // plain cache key，行為不變
-                    is CredentialState.Ready -> state.snapshot
+                    CredentialState.NotApplicable -> Unit // plain cache key；snapshot 保持 null，行為不變
+                    is CredentialState.Ready -> Unit      // snapshot 已於上方指派（同一物件）
                     else -> {
-                        // 未來新增子型式時 fail-closed（預設旁路）
+                        // 未來新增子型式時 fail-closed（預設旁路）；snapshot 保持 null（as? 必為 null）
                         return bypass(query, n)
                     }
                 }

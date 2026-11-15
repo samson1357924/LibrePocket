@@ -2362,6 +2362,72 @@ class WebSearchD5Test {
         }
     }
 
+    @Test fun serviceLevelWipeOnCancellationAfterStateResolution() = runBlocking {
+        // R6-2 / pre-fix leak：state 解析得到 Ready(S)（freshly-minted buffer）後、
+        // try/finally 開始之前的 ensureActive() 拋 CE，S 從未進入 finally 的保護範圍 → buffer 殘留。
+        // fix 後：snapshot 於 ensureActive() 之前指派（try 內第一語句群）→ finally 抹除恰一次。
+        val vault = TrackingVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "super-secret-key".toCharArray())
+        val http = FakeGet { ok(body = braveJson) }
+        val svc = WebSearchService(BraveSearchProvider(vault, http, timeoutMs = 60_000))
+        val deferred = async(start = CoroutineStart.UNDISPATCHED) {
+            kotlin.coroutines.coroutineContext[kotlinx.coroutines.Job]?.cancel() // 呼叫前已取消
+            svc.search("kotlin", 5)
+        }
+        try {
+            withTimeout(5_000) { deferred.await() }
+            fail("已取消的呼叫端必須收到 CancellationException")
+        } catch (_: CancellationException) {
+            // expected：N2 語義不變，CE 原樣透傳（不映射為 Failed／TRANSPORT）
+        }
+        assertEquals(0, http.calls.get()) // CE 於任何下游動作之前拋出 → 零 HTTP
+        assertTrue("state 解析後 CE 透傳時，self-resolved snapshot 必須已被 finally 抹除",
+            vault.captured!!.all { it == '\u0000' })
+    }
+
+    @Test fun innerFrameInCancelledStateDoesNotWipeOuterSticky() = runBlocking {
+        val vault = TrackingVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "super-secret-key".toCharArray())
+        val provider = BraveSearchProvider(vault, FakeGet { ok(body = braveJson) })
+        // 外層（所有權測試端）單次 resolve——ownership 移交呼叫方（本測試）
+        val state = provider.credentialState()
+        val snapshot = (state as CredentialState.Ready).snapshot
+        val inner = WebSearchService(provider)
+        val deferred = async(start = CoroutineStart.UNDISPATCHED) {
+            kotlin.coroutines.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+            inner.searchWithSnapshot(snapshot, "kotlin", 5)
+        }
+        try {
+            withTimeout(5_000) { deferred.await() }
+            fail("已取消的巢狀呼叫端必須收到 CancellationException")
+        } catch (_: CancellationException) {
+            // expected
+        }
+        assertTrue("inner（sticky）絕不得 wipe 外層所有權的 snapshot", vault.captured!!.all { it != '\u0000' })
+        assertEquals(1, vault.seenGet.size) // sticky 接管：inner 未重讀 vault
+        snapshot.wipe()                      // 外層持有者模擬
+        assertTrue(vault.captured!!.all { it == '\u0000' })
+    }
+
+    @Test fun nestedOuterFrameWipesStickyAfterBothFramesUnwind() = runBlocking {
+        val vault = TrackingVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "super-secret-key".toCharArray())
+        val selfCancelHttp = FakeGet {
+            kotlin.coroutines.coroutineContext[kotlinx.coroutines.Job]?.cancel() // HTTP 回傳前取消呼叫端
+            ok(body = braveJson)
+        }
+        val inner = WebSearchService(BraveSearchProvider(vault, selfCancelHttp, timeoutMs = 60_000))
+        val outer = WebSearchService(inner)
+        try {
+            outer.search("kotlin", 5)
+            fail("已取消的巢狀呼叫端必須收到 CancellationException")
+        } catch (_: CancellationException) {
+            // expected：leader 於取消後回值，ensureActive 拋 CE；outer finally 抹除 sticky
+        }
+        assertEquals(1, selfCancelHttp.calls.get())     // leader 恰打一次 upstream
+        assertTrue("內層（stickyIter != null）不 wipe；外層 finally 必須已抹除", vault.captured!!.all { it == '\u0000' })
+    }
+
     // ---- keyed CharArray 抹除（TrackingVault：getKey 直接參照回傳） ----
 
     @Test fun keyArrayWipedOnSuccess() = runBlocking {

@@ -20,6 +20,7 @@ sealed interface CredentialState {
      * 所有權契約（亦見 `searchWithSnapshot()` KDoc）：呼叫方 MUST 以 try/finally 於 finally 內 `wipe()`，
      * 即使 search()／searchWithSnapshot() 拋出；snapshot 為單次使用。被呼叫端不得保留／複製／清零傳入的 snapshot；
      * 負責 wipe 的是持有最外層 search() 呼叫的一方（一般為最外層 WebSearchService）。
+     * 含取消（CE 原樣透傳）路徑：持有者必須先確保 snapshot 已指派進入 try/finally 再做任何可能拋出的動作（WebSearchService 以「指派→ensureActive→分派」順序落實）。
      */
     class Ready(val snapshot: CredentialSnapshot) : CredentialState
 }

@@ -1601,102 +1601,136 @@ private object HtmlExtract {
     }
 
     /**
-     * 取首個 `<title>...</title>` 文本（index-based，case-insensitive；
-     * tag-name 邊界檢查）；任一環節缺失即回空字串（由上層回退 URL）。
+     * tag-open 判定（text context 掃描用）：`<`（開標籤）或 `</`（閉標籤）
+     * 後接 ASCII 字母，且 tag-name（ASCII 字母／數字／`-`／`_`／`:`）結束處
+     * 為 tag-name 邊界（見 [isTagNameBoundary]）或 EOF 即為 tag-open。
+     * `<!--`（comment）由 [nextTagStartInText] 先行攔截；`<!DOCTYPE`、`<?xml`、
+     * `<1`、`< s` 等皆非 tag-open。皆 ASCII 比對（`lower` 為 ASCII 摺疊，索引不錯位）。
+     */
+    private fun isTagOpen(lower: String, i: Int): Boolean {
+        if (i < 0 || i >= lower.length || lower[i] != '<') return false
+        var p = i + 1
+        if (p < lower.length && lower[p] == '/') p++ // 閉標籤
+        if (p >= lower.length) return false
+        val c0 = lower[p]
+        if (!(c0 in 'a'..'z' || c0 in 'A'..'Z')) return false
+        var j = p
+        while (j < lower.length) {
+            val c = lower[j]
+            if (c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9' ||
+                c == '-' || c == '_' || c == ':'
+            ) {
+                j++
+            } else {
+                break
+            }
+        }
+        return isTagNameBoundary(lower, j)
+    }
+
+    /**
+     * text context 掃描核心：自 `from` 起，前進並回傳下一個 tag-open `<` 之
+     * 索引；若無則回 -1。comment（`<!--` 至首個 `-->`，或 `-->` 缺席時至 EOF）
+     * 整體跳過——comment 內容原樣保留在文本流中，但不構成任何 tag-open。
+     * 已開啟之 tag 之內部（含引號包裹之子字串）**不由本掃描器觀察**——
+     * 呼叫端應以 [findTagEnd]（引號感知）消耗整個 tag，再自其後繼續。
+     * 每 512 code units 檢查 deadline；逾時拋 [DeadlineExceededException]。
+     */
+    private fun nextTagStartInText(lower: String, from: Int, deadlineNs: Long): Int {
+        var i = maxOf(from, 0)
+        var scanned = 0
+        while (i < lower.length) {
+            if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
+                throw DeadlineExceededException()
+            }
+            if (lower.startsWith("<!--", i)) {
+                val close = lower.indexOf("-->", i + 4)
+                i = if (close < 0) lower.length else close + 3
+                continue
+            }
+            if (lower[i] == '<' && isTagOpen(lower, i)) return i
+            i++
+        }
+        return -1
+    }
+
+    /**
+     * text context 中下一個 needle（如 `<title`／`<meta`）之 tag-open 索引；
+     * needle 之後須為 tag-name 邊界（見 [isTagNameBoundary]）才回候選。
+     * comment（`<!--`…`-->`／EOF）與非候選 tag 之內部（含引號屬性值，
+     * 單引號／雙引號）皆不產生候選；非候選 tag 以 [findTagEnd]（引號感知）
+     * 整體跳過。無候選回 -1。每個 tag／comment 至多掃過一次，整體 O(n)。
+     * 每 512 個迭代檢查 deadline；逾時拋 [DeadlineExceededException]。
+     */
+    private fun findTagStart(lower: String, from: Int, needle: String, deadlineNs: Long): Int {
+        var cursor = maxOf(from, 0)
+        var scanned = 0
+        while (true) {
+            if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
+                throw DeadlineExceededException()
+            }
+            val p = nextTagStartInText(lower, cursor, deadlineNs)
+            if (p < 0) return -1
+            if (lower.startsWith(needle, p) && isTagNameBoundary(lower, p + needle.length)) {
+                return p
+            }
+            // 非候選 tag：引號感知整體跳過；未閉合 tag 之後不可能再有候選——收束至 EOF。
+            val end = findTagEnd(lower, p, deadlineNs)
+            cursor = if (end < 0) lower.length else end + 1
+        }
+    }
+
+    /**
+     * 取首個 text-context `<title>...</title>` 文本（case-insensitive；
+     * tag-name 邊界檢查；comment／引號屬性值內之偽 `<title>` 不成候選）；
+     * 開標籤以 [findTagEnd]（引號感知）取得收尾；任一環節缺失即回空字串
+     * （由上層回退 URL）。
      */
     fun titleOf(input: String, lower: String, deadlineNs: Long = Long.MAX_VALUE): String {
         if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
-        var tOpen = -1
-        var cursor = 0
-        var scanned = 0
-        while (true) {
-            if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
-            val p = lower.indexOf("<title", cursor)
-            if (p < 0) break
-            if (isTagNameBoundary(lower, p + "<title".length)) {
-                tOpen = p
-                break
-            }
-            // 非標籤（如 `<titlex>`）：游標前進一個 past-offending-`<` 之位置續掃。
-            cursor = p + 1
-        }
+        val tOpen = findTagStart(lower, 0, "<title", deadlineNs)
         if (tOpen < 0) return ""
-        val openEnd = lower.indexOf('>', tOpen)
-        if (openEnd < 0) return ""
+        val openEnd = findTagEnd(lower, tOpen, deadlineNs)
+        if (openEnd < 0) return "" // 未閉合開標籤：無 title
         val tClose = lower.indexOf("</title>", openEnd + 1)
         if (tClose < 0) return ""
         return input.substring(openEnd + 1, tClose)
     }
 
     /**
-     * 線性剝除 `<script>...</script>`／`<style>...</style>`（index-based，
-     * case-insensitive，tag-name 邊界檢查；無對應關閉標籤者，
-     * 自開始標籤剝至輸入結尾）。
+     * 單趟、前向游標剝除 `<script>...</script>`／`<style>...</style>`
+     * （case-insensitive，tag-name 邊界檢查；**text context**：comment（`<!--`…`-->`／EOF）
+     * 與引號屬性值（單／雙引號）內之偽標籤不構成候選；非候選 tag 以
+     * [findTagEnd]（引號感知）整體跳過）。無對應關閉標籤者，
+     * 自開始標籤剝至輸入結尾。comment 本身原樣保留在文本流中（含 `<!--`…EOF
+     * 的未閉合 comment——其內容一併原樣保留至輸入結尾）。
      * 以 StringBuilder 逐段拼接，不使用 backtracking regex。
-     * 雙游標（scriptCandidate／styleCandidate）皆單調前進，總工作量 O(n)。
+     * 游標單調前進，總工作量 O(n)（每次外層迭代的兩個候選搜尋掃過的區段
+     * 不重疊，總計兩趟）。
      */
     fun stripScriptAndStyle(input: String, lower: String, deadlineNs: Long = Long.MAX_VALUE): String {
         val sb = StringBuilder(input.length)
         var i = 0
-        var scriptCandidate = 0
-        var styleCandidate = 0
         while (i < input.length) {
             if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
-            var sOpen = -1
-            var scannedCandidates = 0
-            while (true) {
-                if (++scannedCandidates and 511 == 0 && System.nanoTime() >= deadlineNs) {
-                    throw DeadlineExceededException()
-                }
-                val p = lower.indexOf("<script", scriptCandidate)
-                if (p < 0) {
-                    scriptCandidate = lower.length
-                    break
-                }
-                if (isTagNameBoundary(lower, p + "<script".length)) {
-                    sOpen = p
-                    scriptCandidate = p
-                    break
-                }
-                scriptCandidate = p + 1
-            }
-            var tOpen = -1
-            scannedCandidates = 0
-            while (true) {
-                if (++scannedCandidates and 511 == 0 && System.nanoTime() >= deadlineNs) {
-                    throw DeadlineExceededException()
-                }
-                val p = lower.indexOf("<style", styleCandidate)
-                if (p < 0) {
-                    styleCandidate = lower.length
-                    break
-                }
-                if (isTagNameBoundary(lower, p + "<style".length)) {
-                    tOpen = p
-                    styleCandidate = p
-                    break
-                }
-                styleCandidate = p + 1
-            }
+            val scriptP = findTagStart(lower, i, "<script", deadlineNs)
+            val styleP = findTagStart(lower, i, "<style", deadlineNs)
             val open: Int
             val tag: String
-            if (sOpen < 0 && tOpen < 0) {
+            if (scriptP < 0 && styleP < 0) {
                 sb.append(input, i, input.length)
                 break
-            } else if (sOpen >= 0 && (tOpen < 0 || sOpen <= tOpen)) {
-                open = sOpen
+            } else if (scriptP >= 0 && (styleP < 0 || scriptP <= styleP)) {
+                open = scriptP
                 tag = "script"
             } else {
-                open = tOpen
+                open = styleP
                 tag = "style"
             }
             sb.append(input, i, open)
             val closeMark = "</$tag>"
             val close = lower.indexOf(closeMark, open)
             val end = if (close < 0) input.length else close + closeMark.length
-            // 被挪走的區段內不得再命中：兩游標皆不倒退。
-            scriptCandidate = maxOf(scriptCandidate, end)
-            styleCandidate = maxOf(styleCandidate, end)
             i = end
         }
         return sb.toString()
@@ -1817,6 +1851,8 @@ private object HtmlExtract {
      * 自 `from` 起尋找 tag 收尾 `>`：引號內的 `>` 不算收尾
      *（`content="a>>>b"` 是合法 HTML；tag 只在未引號態的 `>` 處結束）。
      * 無法找到即回 -1（未閉合 tag）；全文掃描 O(n)。
+     * 本函式同時供 [nextTagStartInText] 之呼叫端消耗整個 tag（非候選 tag
+     * 整體跳過），以及 titleOf／publishedOf 取得候選 tag 之收尾。
      */
     private fun findTagEnd(lower: String, from: Int, deadlineNs: Long): Int {
         var inQuote: Char? = null
@@ -1845,14 +1881,24 @@ private object HtmlExtract {
      * META_PUBLISHED_REV／TIME_DATETIME 三 regex 的病態回溯風險）。
      * alias 清單比對先於 NFKC（fullwidth alias 不符；fail-closed，no published）。
      *
-     * 先掃 `<meta` 候選（依文件順序），每候選標籤以引號感知的掃描取得 `>`
-     * 收尾（`content="a>>>b"` 內的 `>` 不算收尾），再切出
-     * `property`／`name`＋`content` 屬性對，`property`／`name` 值（大小寫不
+     * 掃描僅於 **text context** 進行（[findTagStart]）：comment（`<!--`…`-->`／EOF）
+     * 與引號屬性值（單／雙引號，經 [findTagEnd] 取得 tag 收尾）內之偽 `<meta`／
+     * `<time>` 皆不成候選。先掃 `<meta` 候選（依文件順序），每候選標籤以
+     * 引號感知的掃描取得 `>` 收尾（`content="a>>>b"` 內的 `>` 不算收尾），
+     * 再切出 `property`／`name`＋`content` 屬性對，`property`／`name` 值（大小寫不
      * 敏感）與五個 published alias 比對（article:published_time／datePublished／
      * publish_date／pubdate／dc.date），命中即回 `unescapeHtml(content)`；
      * 否則續掃。無匹配時再掃 `<time datetime>` 候選同法解析。
-     * 對抗性 `<meta a` 鏈（無 `>`）：首個候選即整段掃描收尾，之後無後續
-     * 候選——整體線性。
+     *
+     * 未閉合候選 tag 之處理（stop vs skip，依候選型別區分）——
+     * meta／time：候選**作廢**，自候選之後（`candidateIdx + 1`）續掃；
+     * 不中止整趟解析（其後理論上無引號感知 `>` 可用，至多耗盡全文）。
+     * script／style（見 [stripScriptAndStyle]）：自開始標籤剝至輸入結尾。
+     *
+     * 對抗性 `<meta a` 鏈（無 `>`）：首個候選作廢（-1）後續掃，之後每個
+     * 候選同法被作廢；每個未閉合候選各觸發一次 O(n) 的 findTagEnd 掃描，
+     * 最壞 O(n²)（常數由輸入上限與 512-codeunit deadline 檢查兜底；
+     * findTagEnd 逾時拋 [DeadlineExceededException] → `Failed(TIMEOUT)`，永不部分回傳）。
      */
     fun publishedOf(html: String, deadlineNs: Long = Long.MAX_VALUE): String? {
         if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
@@ -1863,14 +1909,14 @@ private object HtmlExtract {
         var cursor = 0
         while (true) {
             if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
-            val p = lower.indexOf("<meta", cursor)
+            val p = findTagStart(lower, cursor, "<meta", deadlineNs)
             if (p < 0) break
-            if (!isTagNameBoundary(lower, p + "<meta".length)) {
+            val tagEnd = findTagEnd(lower, p, deadlineNs)
+            if (tagEnd < 0) {
+                // 未閉合 meta tag：候選作廢，自候選之後續掃（不中止整趟解析）。
                 cursor = p + 1
                 continue
             }
-            val tagEnd = findTagEnd(lower, p, deadlineNs)
-            if (tagEnd < 0) break // 未閉合 tag：無更多可解析候選
             val attrs = parseTagAttrs(html.substring(p, tagEnd + 1), deadlineNs)
             val name = attrs.propertyName?.lowercase()
             if (name != null && name in PUBLISHED_ALIASES && !attrs.content.isNullOrBlank()) {
@@ -1881,14 +1927,14 @@ private object HtmlExtract {
         cursor = 0
         while (true) {
             if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
-            val p = lower.indexOf("<time", cursor)
+            val p = findTagStart(lower, cursor, "<time", deadlineNs)
             if (p < 0) break
-            if (!isTagNameBoundary(lower, p + "<time".length)) {
+            val tagEnd = findTagEnd(lower, p, deadlineNs)
+            if (tagEnd < 0) {
+                // 未閉合 time tag：候選作廢，自候選之後續掃（不中止整趟解析）。
                 cursor = p + 1
                 continue
             }
-            val tagEnd = findTagEnd(lower, p, deadlineNs)
-            if (tagEnd < 0) break
             val attrs = parseTagAttrs(html.substring(p, tagEnd + 1), deadlineNs)
             if (!attrs.datetime.isNullOrBlank()) {
                 return unescapeHtml(attrs.datetime)

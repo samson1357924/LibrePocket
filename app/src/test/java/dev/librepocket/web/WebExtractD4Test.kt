@@ -2004,6 +2004,133 @@ class WebExtractD4Test {
         assertEquals("2024-01-02", out.content.published)
     }
 
+    @Test fun scriptTagInsideQuotedAttributeNotStripped() = runBlocking {
+        // 引號屬性值內之偽 <script> 不得觸發剝除（#138 #4：attribute-quote context）
+        val dns = publicDns("example.com")
+        val doc = """<div data-template="<script>">VISIBLE_CONTENT</div>"""
+        val http = FakeExtract { okResp(doc) }
+        val out = WebExtractService(http).extract("https://example.com/attr-script", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("snippet 應含 VISIBLE_CONTENT，got ${out.content.snippet}",
+            out.content.snippet.contains("VISIBLE_CONTENT"))
+    }
+
+    @Test fun scriptTagInsideCommentNotStripped() = runBlocking {
+        // comment 內之偽 <script> 不得觸發剝除（#138 #4：comment context）
+        val dns = publicDns("example.com")
+        val doc = "<!-- <script> --><p>VISIBLE</p>"
+        val http = FakeExtract { okResp(doc) }
+        val out = WebExtractService(http).extract("https://example.com/comment-script", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("snippet 應含 VISIBLE，got ${out.content.snippet}",
+            out.content.snippet.contains("VISIBLE"))
+    }
+
+    @Test fun unterminatedCommentRunsToEof() = runBlocking {
+        // 未閉合 comment（無 `-->`）：自 `<!--` 至 EOF 整體視為 comment；內容原樣
+        // 保留在文本流中（不 crash），snippet 仍含 comment 起點之前的 HEAD
+        val dns = publicDns("example.com")
+        val doc = "<p>HEAD</p><!-- <script>"
+        val http = FakeExtract { okResp(doc) }
+        val out = WebExtractService(http).extract("https://example.com/unterminated-comment", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("snippet 應含 HEAD，got ${out.content.snippet}",
+            out.content.snippet.contains("HEAD"))
+    }
+
+    @Test fun styleTagInsideQuotedAttributeNotStripped() = runBlocking {
+        // 引號屬性值內之偽 <style> 不得觸發剝除（style arm）
+        val dns = publicDns("example.com")
+        val doc = """<div data-x="<style>">STYLE_VISIBLE</div>"""
+        val http = FakeExtract { okResp(doc) }
+        val out = WebExtractService(http).extract("https://example.com/attr-style", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("snippet 應含 STYLE_VISIBLE，got ${out.content.snippet}",
+            out.content.snippet.contains("STYLE_VISIBLE"))
+    }
+
+    @Test fun styleTagInsideCommentNotStripped() = runBlocking {
+        // comment 內之偽 <style>…</style> 不得觸發剝除（style arm）
+        val dns = publicDns("example.com")
+        val doc = "<!-- <style>.x{display:none}</style> --><p>STYLE_COMMENT_VISIBLE</p>"
+        val http = FakeExtract { okResp(doc) }
+        val out = WebExtractService(http).extract("https://example.com/comment-style", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("snippet 應含 STYLE_COMMENT_VISIBLE，got ${out.content.snippet}",
+            out.content.snippet.contains("STYLE_COMMENT_VISIBLE"))
+    }
+
+    @Test fun metaInsideQuotedAttributeNotPublished() = runBlocking {
+        // 引號屬性值內之偽 <meta … pubdate> 不得產出 published（單引號入雙引號／雙引號入單引號皆釘）
+        val dns = publicDns("example.com")
+        val docSingleInDouble = """<div data-x="<meta name='pubdate' content='1999-01-01'>"><p>BODY</p></div>"""
+        val docDoubleInSingle = """<div data-x='<meta name="pubdate" content="1999-01-01">'><p>BODY</p></div>"""
+        val http = FakeExtract { url ->
+            when (url) {
+                "https://example.com/meta-quote-sd" -> okResp(docSingleInDouble)
+                else -> okResp(docDoubleInSingle)
+            }
+        }
+        val svc = WebExtractService(http)
+        val outSD = svc.extract("https://example.com/meta-quote-sd", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals("單引號入雙引號之偽 meta 不得產出 published", null, outSD.content.published)
+        val outDS = svc.extract("https://example.com/meta-quote-ds", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals("雙引號入單引號之偽 meta 不得產出 published", null, outDS.content.published)
+    }
+
+    @Test fun timeInsideCommentNotPublished() = runBlocking {
+        // comment 內之偽 <time datetime> 不得產出 published
+        val dns = publicDns("example.com")
+        val doc = """<!-- <time datetime="1999-01-01"> --><p>BODY</p>"""
+        val http = FakeExtract { okResp(doc) }
+        val out = WebExtractService(http).extract("https://example.com/comment-time", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals(null, out.content.published)
+    }
+
+    @Test fun metaInsideCommentNotPublished() = runBlocking {
+        // comment 內之偽 <meta … name='pubdate'> 不得產出 published
+        val dns = publicDns("example.com")
+        val doc = "<!-- <meta name='pubdate' content='1999-01-01'> --><p>BODY</p>"
+        val http = FakeExtract { okResp(doc) }
+        val out = WebExtractService(http).extract("https://example.com/comment-meta", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals(null, out.content.published)
+    }
+
+    @Test fun realMetaAndTimeStillExtracted() = runBlocking {
+        // 防過剝：text-context 之真 meta pubdate／<time datetime> 仍須正常抽取
+        val dns = publicDns("example.com")
+        val docMeta = """<html><head><title>T</title><meta property="article:published_time" content="2024-01-02"></head><body><p>BODY</p></body></html>"""
+        val docTime = """<html><head><title>T</title></head><body><time datetime="2030-05-06">2030</time><p>BODY</p></body></html>"""
+        val http = FakeExtract { url ->
+            when (url) {
+                "https://example.com/real-meta" -> okResp(docMeta)
+                else -> okResp(docTime)
+            }
+        }
+        val svc = WebExtractService(http)
+        val outMeta = svc.extract("https://example.com/real-meta", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals("2024-01-02", outMeta.content.published)
+        val outTime = svc.extract("https://example.com/real-time", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals("2030-05-06", outTime.content.published)
+    }
+
+    @Test fun scriptInsideTwoParserContexts() = runBlocking {
+        // <template> 非 comment：template 內之 <script> 仍是 script → 必須剝除；
+        // template 本身原樣保留（未特別處理 template，僅記錄於此）。
+        val dns = publicDns("example.com")
+        val doc = """<html><head><title>RealTitle</title></head><body><template><script>alert(1)</script>TEMPLATE_VISIBLE</template></body></html>"""
+        val http = FakeExtract { okResp(doc) }
+        val out = WebExtractService(http).extract("https://example.com/template-script", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("template 內容應保留，got ${out.content.snippet}",
+            out.content.snippet.contains("TEMPLATE_VISIBLE"))
+        assertFalse("template 內之 script 內容必須被剝除", out.content.snippet.contains("alert"))
+        assertEquals("RealTitle", out.content.title)
+    }
+
+    @Test fun titleInsideQuotedAttributeNotUsedAsTitle() {
+        // 引號屬性值內之偽 <title> 不得作為 title；無 text-context <title> 時
+        // title 回退 finalUrl（釘此回退語義）
+        val doc = """<html><head></head><body><div data-x="<title>">text</div></body></html>"""
+        val parsed = parseHtml(doc, "https://example.com/")
+        assertTrue(parsed != null)
+        assertEquals("https://example.com/", parsed!!.content.title)
+    }
+
     @Test fun cacheOverwriteAccountingPin() {
         // 同 key 覆寫（小→大）：舊 entry 權重必須扣除，不得雙計、不得洩漏；
         // 覆寫讀回 K 把 K 提升為 MRU（accessOrder LinkedHashMap），故之後逐出最舊者為 other1。

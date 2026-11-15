@@ -1239,8 +1239,9 @@ internal object McpWire {
                 // 字元同待遇轉成 \uXXXX（計入預算）。成對 surrogate 原樣保留。
                 c.isSurrogate() || needsDisplayEscape(c) -> {
                     // Keep the escape ASCII-hex in every locale — `format`
-                    // without a locale prefixes with localized digits in some
-                    // locales (e.g. U+0660) and corrupts the escape.
+                    // without a locale is digit-localized in some locales, and
+                    // consistency with FastRouter.esc/JevClient is the
+                    // documented contract for this file's escape helpers.
                     val escText = String.format(java.util.Locale.ROOT, "\\u%04x", c.code)
                     if (escText.length > budget) return sb.toString()
                     sb.append(escText)

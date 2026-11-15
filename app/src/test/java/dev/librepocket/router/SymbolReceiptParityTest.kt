@@ -74,8 +74,8 @@ import java.time.ZoneId
  * is covered at its projection-boundary EXEC_ERROR arms
  * (SafeToolSliceTest.throwingBackendMapsToTypedExecError;
  * FastDispatchTest.okResultInternalBoundaryMapsIteratorThrowToExecError) plus
- * the ceiling pins (SafeToolSliceTest:1239 —
- * resultBudgetSingleSymbolFloorStaysUnderTotalCap — and [singleSymbolCeilingPin]
+ * the ceiling pins (SafeToolSliceTest.resultBudgetSingleSymbolFloorStaysUnderTotalCap
+ * — and [singleSymbolCeilingPin]
  * here); the literal single-symbol-over-MAX_RESULT_CHARS branch is unreachable
  * and NOT asserted.
  *

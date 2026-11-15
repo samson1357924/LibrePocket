@@ -114,7 +114,7 @@ class FastDispatchTest {
         val call = d.toolCall
         assertNotNull(call)
         assertEquals("lsp.symbols", call!!.toolName)
-        assertTrue("template must extract the symbol name: ${call.argumentsJson}", call.argumentsJson.contains("Foo"))
+        assertEquals("Foo", Json.parseToJsonElement(call.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content)
         assertNull(d.reasonCode)
 
         val out = lspDispatcher(backend).dispatch(d, lspOn)
@@ -125,7 +125,7 @@ class FastDispatchTest {
         // Executed outcome 現在攜帶有界形態（見「executedCallIdCarriesBoundedForm」）。
         assertEquals(call.callId, executed!!.result.callId)
         assertFalse(executed.result.denied)
-        assertTrue(executed.result.resultJson.contains("Foo"))
+        assertTrue(executed.result.resultJson.contains("\"name\":\"Foo:example\""))
     }
 
     @Test fun decideAndDispatchEndToEndWithFakeExecutor() = runBlocking {
@@ -137,7 +137,7 @@ class FastDispatchTest {
         val executed = r.outcome as? FastDispatchOutcome.Executed
         assertNotNull("decideAndDispatch must execute FAST lsp.symbols (got ${r.outcome})", executed)
         assertEquals(1, backend.invocations.get())
-        assertTrue(executed!!.result.resultJson.contains("Bar"))
+        assertTrue(executed!!.result.resultJson.contains("\"name\":\"Bar:example\""))
     }
 
     @Test fun codeIdentifierSymbolNamesRouteToLspSymbols() = runBlocking {
@@ -358,7 +358,7 @@ class FastDispatchTest {
         // Simplified hint routes too.
         val t6 = decide("查 Foo 符号")
         assertEquals(RouteKind.FAST, t6.route)
-        assertTrue(t6.toolCall!!.argumentsJson.contains("Foo"))
+        assertEquals("Foo", Json.parseToJsonElement(t6.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content)
 
         // `symbolize` must NOT route (word-anchored latin hint).
         val t7 = decide("symbolize")
@@ -516,6 +516,19 @@ class FastDispatchTest {
         assertTrue(
             "executor must receive the exact qualified query: ${executed!!.result.resultJson}",
             executed.result.resultJson.contains("com.example.Foo:example"),
+        )
+        // Dispatch variant for the dropped \blsp\b strip: `查 lsp 符號` executes
+        // with query `lsp` (lsp is a legitimate identifier — parity with the
+        // decide-level pin above).
+        val backend2 = CountingBackend()
+        val r2 = lspDispatcher(backend2).decideAndDispatch("查 lsp 符號", lspOn, sessionId = "s-qn2", turnIndex = 4)
+        assertEquals(RouteKind.FAST, r2.decision.route)
+        assertEquals(1, backend2.invocations.get())
+        val executed2 = r2.outcome as? FastDispatchOutcome.Executed
+        assertNotNull("lsp must execute: ${r2.outcome}", executed2)
+        assertTrue(
+            "executor must receive the exact query `lsp`: ${executed2!!.result.resultJson}",
+            executed2.result.resultJson.contains("lsp:example"),
         )
     }
 

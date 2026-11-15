@@ -110,8 +110,8 @@ import java.util.concurrent.atomic.AtomicLong
  *   之類普通詞仍收為否定系副作用（recorded, fail-safe）；裸名詞絕不單獨收錄（anchor-or-nothing）；EN 連接詞詞幹槽已納 CJK 許可詞幹
  *   （許可|许可|同意|核准|核準|批准|確認|确认|點頭|点头）——錨定於 EN 連接詞之後者否決；EN/CJK 交集其餘仍 open-world recorded。
  * - 已知殘餘（accepted, frame-local, not fixed；audit F7）：CJK 框架內部的
- *   空白相鄰仍可入閘——如 `同意 後再查`（CJK run 之間僅一個空白）仍被准入。
- *   此為框架內之空白容忍，非修正目標，僅記錄。
+ *   空白相鄰在 clause 閘仍可通過——如 `同意 後再查`（CJK run 之間僅一個空白）clause gate 放行、
+ *   但 extraction 的 whitespace 閘仍會拒絕（multi-token → clarification），永不執行；僅記錄。
  * - 已知過度否決（accepted fail-safe, do not "fix"）：`查 Main 方法 符號` 因 CJK
  *   方法 教學標記事否決落 DENIED——保留，僅記錄；`查 Foo 符號 pending review`
  *   亦因結構性詞幹 `review` 否決——為預期結果。
@@ -544,8 +544,9 @@ class FastRouter(
          * B3 re-review（#3）新增明確禁止/順延 句族：拒絕/暫緩/延緩/延後/推遲/延遲/
          * 延期/推後/寬限/延宕 繁簡對稱共 18 條，與 {取消,停止,禁止,算了} 同屬通用禁止詞載荷；
          * 本表相對 [NEGATION_MARKERS] 的獨有載荷 = `取消`/`停止`/`禁止`/`算了` 四個通用禁止詞
-         * ——中文複合詞的每條子串皆含不/未/別等單顆粒，實為 MARKERS 的子集合；與 MARKERS
-         * 英文集重複的 11 個 \b 詞）；
+         * ＋ 18 條明確禁止/順延 複合詞（拒絕/拒绝/暫緩/暂缓/延緩/延缓/延後/延后/推遲/推迟/延遲/延迟/延期/推後/推后/寬限/宽限/延宕，繁簡對稱）
+         * —— 這 18 條不含任何單顆粒旗標（不/未/別 等），並非 MARKERS 的子集合；
+         * 與 MARKERS 英文集重複的 11 個 \b 詞）；
          * [NEGATION_MARKERS] 收單一顆粒集（不 沒 没 別 别 勿 莫 嫑 否 無 无 免 未 毋 休）＋英文 \b 集。
          * [isNegated] 將兩表 OR 同命三個文本：否定詞片語是開放集合，
          * 封閉表不可能完整，故不猜——命中即澄清（過度澄清為 fail-safe 方向）。
@@ -675,9 +676,10 @@ class FastRouter(
         // postponement): `forbid\w*`/`prohibit\w*`/`ban\w*`/`postpone\w*`/`suspend\w*`/
         // `defer\w*`/`den[iy]\w*`/`hold\s*off`; [NEGATION_HINTS]
         // holds the multi-verb compound negations plus general forbiddens, whose unique
-        // load-bearing contribution is {取消,停止,禁止,算了} (its Chinese compounds and EN
-        // entries are subsets of this gate). The single-particle set and those four words
-        // are load-bearing and must not be deleted; [isNegated] ORs both
+        // load-bearing contribution is {取消,停止,禁止,算了} plus the 18 prohibition/deferral
+        // compounds (拒絕/拒绝/暫緩/暂缓/延緩/延缓/延後/延后/推遲/推迟/延遲/延迟/延期/推後/推后/寬限/宽限/延宕 — none of which
+        // contain a single-particle marker, so they are NOT a subset of this gate). The single-particle set,
+        // those four words and those 18 compounds are all load-bearing and must not be deleted; [isNegated] ORs both
         // over the same three texts
         // (raw, NFKC-removed, NFKC-spaced). Over-clarification is the
         // fail-safe direction here (the single ready tool is READ-only and this lane
@@ -808,9 +810,11 @@ class FastRouter(
                 ?.value
 
         // RFC-8259-complete escape encoder (C0 + quote + backslash), mirroring
-        // dev.librepocket.mcp.McpWire.esc — the file to sync with. Control-char
-        // rule changes and the lone-surrogate handling must be made in BOTH,
-        // or extract a shared helper — do not silently diverge.
+        // the sibling escapers: dev.librepocket.mcp.McpWire.esc AND
+        // dev.librepocket.jev.JevClient.jsonEscape — all three are the sync
+        // pact. Control-char rule changes and the lone-surrogate handling
+        // must be made in ALL of them (or extract a shared helper) — do not
+        // silently diverge.
         private fun esc(text: String): String = buildString {
             var i = 0
             while (i < text.length) {
@@ -1071,6 +1075,12 @@ class FastRouter(
          * query — fail-safe direction. The esc test pins passthrough for a
          * paired astral letter embedded in a BMP-letter token instead (a
          * multi-token remainder would clarify before reaching here).
+         *
+         * This predicate is intentionally stricter than Step G's code-point
+         * letters/numbers test inside [extractSymbolQuery] (it rejects
+         * No-category glyphs and astral letters/digits, e.g. ① U+2460, U+1D7D8);
+         * the stricter of the two decides — fail-safe direction, pinned by
+         * the `查 𠮷 符號` clarification pin.
          */
         private fun hasSymbolQuery(text: String): Boolean =
             extractSymbolQuery(text).any { it.isLetterOrDigit() }
@@ -1136,9 +1146,9 @@ class FastRouter(
         // 收單一顆粒集（不 沒 没 別 别 勿 莫 嫑 否 無 无 免 未 毋 休）＋英文 \b 集
         //（`no`/`not`/`never`/`don'?t`/`do not`/`stop`/`cancel`/`refus\w*`/`avoid\w*`/`skip\w*`/`without`
         // ＋#3 B3 re-review：`forbid\w*`/`prohibit\w*`/`ban\w*`/`postpone\w*`/`suspend\w*`/`defer\w*`/
-        // `den[iy]\w*`/`ban\w*`/`hold\s*off`）；[NEGATION_HINTS]
-        // 收多動詞複合否定與通用禁止詞，其獨有載荷 = {取消,停止,禁止,算了}（中文複合詞與英文集
-        // 實為 MARKERS 的子集合/重複，可清理但非必須）。
+        // `den[iy]\w*`/`hold\s*off`）；[NEGATION_HINTS]
+        // 收多動詞複合否定與通用禁止詞，其獨有載荷 = {取消,停止,禁止,算了} + 18 條（拒絕/暫緩/延緩/延後/推遲/延遲/延期/推後/寬限/延宕，
+        // 繁簡對稱——皆不含單顆粒旗標，非 MARKERS 子集合；其餘中文複合詞與英文集與 MARKERS 重複，可清理但非必須）。
         // 兩表皆 OR 同命同文本——任何否定詞/不確定詞存在即澄清，絕不執行（封閉表不
         // 完整是既定限制，不再宣稱；任一表皆不得以涵蓋另一表為由刪除）。
         private fun isNegated(text: String): Boolean {

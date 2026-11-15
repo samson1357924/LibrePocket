@@ -1126,8 +1126,8 @@ class SafeToolSlice(
      * The slice's success-receipt pipeline; the fast-lane executor's
      * `okResult` ([LspSymbolsExecutor]) mirrors this projection by hand
      * (item-cap clamp via the shared [effectiveLimitOf], the effective
-     * limit, `omittedCount`/`truncated` computation) — [SymbolReceiptParityTest]
-     * pins the two Ok receipts byte-/semantic-identical modulo the documented
+     * limit, `omittedCount`/`truncated` computation) — SymbolReceiptParityTest
+     * (router test suite) pins the two Ok receipts byte-/semantic-identical modulo the documented
      * asymmetries (this receipt's `clockMillis`, the tool echo rule, key
      * order). Shared helpers live in this companion (single source, #19 B3
      * stage-4); never re-copy them into [FastDispatch].

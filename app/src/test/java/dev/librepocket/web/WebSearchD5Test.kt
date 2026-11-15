@@ -64,6 +64,34 @@ class WebSearchD5Test {
         }
     }
 
+    /**
+     * FakeVault that fails the first `failRemaining` getKey calls with
+     * IllegalStateException (transient vault outage), copying out like
+     * [FakeVault] once the failure budget is exhausted.
+     */
+    private class FlakyProbeVault : KeyVault {
+        val keys = mutableMapOf<String, CharArray>()
+        var failRemaining: Int = 0
+
+        override suspend fun putKey(providerId: String, apiKey: CharArray) {
+            keys[providerId] = apiKey.copyOf()
+        }
+
+        override suspend fun getKey(providerId: String): CharArray? {
+            if (failRemaining > 0) {
+                failRemaining--
+                throw IllegalStateException("vault down")
+            }
+            return keys[providerId]?.copyOf()
+        }
+
+        override suspend fun deleteKey(providerId: String) {
+            keys.remove(providerId)
+        }
+
+        override suspend fun hasKey(providerId: String): Boolean = keys.containsKey(providerId)
+    }
+
     private class FakeGet(
         val handler: suspend (url: String) -> WebHttpResponse,
     ) : WebHttpGet {
@@ -561,6 +589,169 @@ class WebSearchD5Test {
         val jobs = List(8) { async { svc.search("kotlin", 5) } }
         val outs = jobs.map { it.await() }
         assertTrue(outs.all { it is WebSearchOutcome.Ok })
+        assertEquals(1, http.calls.get())
+    }
+
+    @Test fun keyRotationInvalidatesCachedRows() = runBlocking {
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGet { ok(body = braveJson) }
+        val svc = WebSearchService(BraveSearchProvider(vault, http))
+        val first = svc.search("kotlin", 5)
+        assertTrue(first is WebSearchOutcome.Ok)
+        assertFalse((first as WebSearchOutcome.Ok).cached)
+        assertTrue(vault.seenGet.contains(BraveSearchProvider.DEFAULT_KEY_ID))
+        // 同 keyId 輪換 key-A → key-B：舊憑證 cache 列不得命中。
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-B".toCharArray())
+        val second = svc.search("kotlin", 5)
+        assertTrue(second is WebSearchOutcome.Ok)
+        assertFalse((second as WebSearchOutcome.Ok).cached)
+        assertEquals(2, http.calls.get())
+        // key-B 的列已寫入：第三次命中 key-B cache。
+        val third = svc.search("kotlin", 5)
+        assertTrue(third is WebSearchOutcome.Ok)
+        assertTrue((third as WebSearchOutcome.Ok).cached)
+        assertEquals(2, http.calls.get())
+    }
+
+    @Test fun keyDeletionInvalidatesCachedRows() = runBlocking {
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGet { ok(body = braveJson) }
+        val svc = WebSearchService(BraveSearchProvider(vault, http))
+        val first = svc.search("kotlin", 5)
+        assertTrue(first is WebSearchOutcome.Ok)
+        assertFalse((first as WebSearchOutcome.Ok).cached)
+        vault.deleteKey(BraveSearchProvider.DEFAULT_KEY_ID)
+        // cacheRevision 回 REV_UNAVAILABLE（vault 無 key）→ Service 完全旁路快取（不讀不寫）；
+        // delegate.search 亦讀不到 key → Unavailable(MISSING_KEY)，零網路。
+        val second = svc.search("kotlin", 5)
+        assertTrue(second is WebSearchOutcome.Unavailable)
+        assertEquals(WebUnavailableReason.MISSING_KEY, (second as WebSearchOutcome.Unavailable).reason)
+        assertEquals(1, http.calls.get())
+    }
+
+    @Test fun transientProbeFailureBypassesCacheAndRecachesLater() = runBlocking {
+        val vault = FlakyProbeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGet { ok(body = braveJson) }
+        val svc = WebSearchService(BraveSearchProvider(vault, http))
+        vault.failRemaining = 1 // 僅第一次 rev probe 拋錯；bypass 路徑不寫 cache
+        val first = svc.search("kotlin", 5)
+        assertTrue(first is WebSearchOutcome.Ok)
+        assertFalse((first as WebSearchOutcome.Ok).cached)
+        assertEquals(1, http.calls.get())
+        // probe 恢復後：cache 尚未有 A 的列（bypass 未寫）→ 再打一次 upstream 並寫入 cache。
+        val second = svc.search("kotlin", 5)
+        assertTrue(second is WebSearchOutcome.Ok)
+        assertFalse((second as WebSearchOutcome.Ok).cached)
+        assertEquals(2, http.calls.get())
+        // 後續搜尋：probe 正常 → 命中 A 的 rev 綁定 cache 列。
+        val third = svc.search("kotlin", 5)
+        assertTrue(third is WebSearchOutcome.Ok)
+        assertTrue((third as WebSearchOutcome.Ok).cached)
+        assertEquals(2, http.calls.get())
+    }
+
+    @Test fun transientProbeFailureWithDeletionNeverServesStale() = runBlocking {
+        val vault = FlakyProbeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGet { ok(body = braveJson) }
+        val svc = WebSearchService(BraveSearchProvider(vault, http))
+        vault.failRemaining = 1
+        val first = svc.search("kotlin", 5)
+        assertTrue(first is WebSearchOutcome.Ok)
+        assertEquals(1, http.calls.get())
+        vault.deleteKey(BraveSearchProvider.DEFAULT_KEY_ID)
+        // probe 回 REV_UNAVAILABLE（vault 無 key）→ 旁路快取，不得讀到舊 Ok 列；
+        // delegate.search 亦讀不到 key → Unavailable(MISSING_KEY)，零新網路。
+        val second = svc.search("kotlin", 5)
+        assertTrue(second is WebSearchOutcome.Unavailable)
+        assertEquals(WebUnavailableReason.MISSING_KEY, (second as WebSearchOutcome.Unavailable).reason)
+        assertEquals(1, http.calls.get())
+    }
+
+    @Test fun rotateViaProbeFailureServesFreshUpstream() = runBlocking {
+        val vault = FlakyProbeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGet { ok(body = braveJson) }
+        val svc = WebSearchService(BraveSearchProvider(vault, http))
+        val first = svc.search("kotlin", 5)
+        assertTrue(first is WebSearchOutcome.Ok)
+        assertEquals(1, http.calls.get())
+        // A → B 輪換；probe 暫時故障 → bypass，直接以 B 打 upstream，不得命中 A 的 stale 列。
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-B".toCharArray())
+        vault.failRemaining = 1
+        val second = svc.search("kotlin", 5)
+        assertTrue(second is WebSearchOutcome.Ok)
+        assertFalse((second as WebSearchOutcome.Ok).cached)
+        assertEquals(2, http.calls.get())
+    }
+
+    @Test fun staleCachedRowNeverServedWhenKeyDeletedWithFlakyProbe() = runBlocking {
+        val vault = FlakyProbeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGet { ok(body = braveJson) }
+        val svc = WebSearchService(BraveSearchProvider(vault, http))
+        val first = svc.search("kotlin", 5)
+        assertTrue(first is WebSearchOutcome.Ok)
+        assertEquals(1, http.calls.get())
+        // A 的 Ok 列已寫入 fp-A；接著讓下一次 rev probe 故障並刪除 key：
+        // stale A 列＋壞 probe＋已撤銷憑證 → 不得回傳 stale Ok，零網路。
+        vault.failRemaining = 1
+        vault.deleteKey(BraveSearchProvider.DEFAULT_KEY_ID)
+        val second = svc.search("kotlin", 5)
+        assertTrue(second is WebSearchOutcome.Unavailable)
+        assertEquals(WebUnavailableReason.MISSING_KEY, (second as WebSearchOutcome.Unavailable).reason)
+        assertEquals(1, http.calls.get())
+    }
+
+    @Test fun sentinelSearchesNeverWriteCacheRows() = runBlocking {
+        // G1 哨兵不得「退化」成 plain cache：REV_UNAVAILABLE 期間每次皆 bypass，
+        // 不讀不寫；若 sentinel 路徑寫了 plain 列，後續輪換後的搜尋會被誤中。
+        val vault = FlakyProbeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGet { ok(body = braveJson) }
+        val svc = WebSearchService(BraveSearchProvider(vault, http))
+        vault.failRemaining = 1
+        val first = svc.search("kotlin", 5)
+        assertTrue(first is WebSearchOutcome.Ok)
+        assertEquals(1, http.calls.get())
+        // A → B 輪換；probe 暫時故障 → bypass，B 必須 fresh 打 upstream，命中不得寫 cache。
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-B".toCharArray())
+        vault.failRemaining = 1
+        val second = svc.search("kotlin", 5)
+        assertTrue(second is WebSearchOutcome.Ok)
+        assertFalse((second as WebSearchOutcome.Ok).cached)
+        assertEquals(2, http.calls.get())
+        // B → C 輪換；再度 bypass：若 sentinel 路徑曾寫 plain 列，此搜尋會被 cache 命中。
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-C".toCharArray())
+        vault.failRemaining = 1
+        val third = svc.search("kotlin", 5)
+        assertTrue(third is WebSearchOutcome.Ok)
+        assertFalse((third as WebSearchOutcome.Ok).cached)
+        assertEquals(3, http.calls.get())
+    }
+
+    @Test fun nestedKeyedServicesBypassOnProbeFailure() = runBlocking {
+        val vault = FlakyProbeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGet { ok(body = braveJson) }
+        val inner = WebSearchService(BraveSearchProvider(vault, http))
+        val outer = WebSearchService(inner)
+        // outer rev probe 故障 → outer 完全 bypass → inner 自行跑：
+        // inner 的 probe 在 flake 消耗後恢復 → fp-A → inner MISS → upstream 一次；
+        // outer bypass 不寫 cache，outer 層 cached=false。
+        vault.failRemaining = 1
+        val first = outer.search("kotlin", 5)
+        assertTrue(first is WebSearchOutcome.Ok)
+        assertFalse((first as WebSearchOutcome.Ok).cached)
+        assertEquals(1, http.calls.get())
+        // 同 query 再搜：outer rev=fp-A、outer cache miss → 委派 inner；
+        // inner 命中 search #1 寫入的 fp-A 列（cached=true），upstream 不再打。
+        val second = outer.search("kotlin", 5)
+        assertTrue(second is WebSearchOutcome.Ok)
+        assertTrue((second as WebSearchOutcome.Ok).cached)
         assertEquals(1, http.calls.get())
     }
 

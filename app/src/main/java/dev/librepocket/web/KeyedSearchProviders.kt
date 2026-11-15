@@ -166,6 +166,36 @@ abstract class BaseKeyedSearchProvider(
         }
     }
 
+    /**
+     * Cache identity 綁定至當前 credential 的 credential revision：
+     * SHA-256（byte-packed CharArray，避免中間 String）截斷為 16 hex chars（64 bits）；
+     * in-memory only、不持久化、不可逆推回 key material；同 keyId 輪換／刪除憑證會自然 miss 舊 cache 列。
+     * 無法確定當前憑證狀態（含暫時故障與缺 key）→ 回傳 [WebSearchProvider.REV_UNAVAILABLE]，Service 將完全旁路快取。
+     */
+    final override suspend fun cacheRevision(): String? {
+        val raw = try {
+            vault.getKey(keyId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return WebSearchProvider.REV_UNAVAILABLE
+        } ?: return WebSearchProvider.REV_UNAVAILABLE
+        val buf = ByteArray(raw.size * 2)
+        var j = 0
+        try {
+            for (c in raw) {
+                buf[j++] = (c.code and 0xFF).toByte()
+                buf[j++] = ((c.code shr 8) and 0xFF).toByte()
+            }
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            digest.update(buf)
+            return digest.digest().joinToString("") { "%02x".format(it) }.take(16)
+        } finally {
+            raw.fill('\u0000')
+            buf.fill(0)
+        }
+    }
+
     override suspend fun search(query: String, count: Int): WebSearchOutcome {
         if (query.isBlank()) return WebSearchOutcome.Unavailable(WebUnavailableReason.EMPTY_QUERY)
         // unreachable defense-in-depth（建構期已 fail-fast）

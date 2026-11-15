@@ -34,6 +34,10 @@ import kotlinx.coroutines.withContext
  *   `Failed(TRANSPORT)` 值回傳（fail-closed，允許非 pinned fallback），不 raw throw；
  *   `Error` 仍 `completeExceptionally` 後原樣拋出。
  * - 空 query 直接委派（`Unavailable(EMPTY_QUERY)`），不進 cache／in-flight 表。
+ * - Cache identity 綁定 credential revision：[WebSearchProvider.cacheRevision] 非 null 時
+ *   （keyed provider）cache key 附加 `#rev:<fingerprint>`，同 keyId 輪換／刪除憑證會自然 miss 舊列；
+ *   `REV_UNAVAILABLE`（keyed vault 暫時故障／缺 key，憑證狀態未知）→ 完全旁路快取（不讀不寫、不進
+ *   single-flight、不寫快取，uncacheable）；非 keyed provider（rev==null）行為完全不變。
  * - 快取隔離：預設每個 Service 持有自有 [WebSearchCache]，不同 provider 的
  *   Service 快取互相隔離；如需跨 provider／跨 Service 共用快取，請顯式傳入
  *   同一 [WebSearchCache] 實例。共用快取以 [WebSearchProvider.cacheNamespace]
@@ -55,6 +59,9 @@ class WebSearchService(
 
     override suspend fun probe(): WebProbe = delegate.probe()
 
+    /** 透傳 delegate 的 credential revision（巢狀 Service 包裝時 cache identity 不遺失）。 */
+    override suspend fun cacheRevision(): String? = delegate.cacheRevision()
+
     @Deprecated("Use id", ReplaceWith("id"))
     val providerId: String get() = delegate.id
 
@@ -67,23 +74,30 @@ class WebSearchService(
     override suspend fun search(query: String, count: Int): WebSearchOutcome {
         if (query.isBlank()) return delegate.search(query, count)
         val n = WebSearchBudgets.countOf(count)
-        val key = cache.key(delegate.cacheNamespace, query, n)
+        // Keyed provider 以 credential revision 綁定 cache identity：輪換／刪除憑證自然 miss 舊列；
+        // rev==null（非 keyed）→ plain key，行為不變；REV_UNAVAILABLE（keyed vault 暫時故障／缺 key）
+        // → 完全旁路快取，不讀不寫（uncacheable）。
+        val rev = delegate.cacheRevision()
+        if (rev == WebSearchProvider.REV_UNAVAILABLE) {
+            return delegate.search(query, n)  // 不查快取、不 single-flight、不寫快取（uncacheable）
+        }
+        val cacheKey = cache.key(delegate.cacheNamespace, query, n).let { if (rev != null) "$it#rev:$rev" else it }
         while (true) {
-            cache.getByKey(key)?.let { return it.copy(cached = true) }
+            cache.getByKey(cacheKey)?.let { return it.copy(cached = true) }
 
             var lateHit: WebSearchOutcome.Ok? = null
             var mine: CompletableDeferred<WebSearchOutcome>? = null
             var leader = false
             mutex.withLock {
-                lateHit = cache.getByKey(key) // re-check under lock closes check-then-elect race
+                lateHit = cache.getByKey(cacheKey) // re-check under lock closes check-then-elect race
                 if (lateHit == null) {
-                    val existing = inFlight[key]
+                    val existing = inFlight[cacheKey]
                     if (existing != null) {
                         mine = existing
                     } else {
                         val fresh = CompletableDeferred<WebSearchOutcome>()
                         mine = fresh
-                        inFlight[key] = fresh
+                        inFlight[cacheKey] = fresh
                         leader = true
                     }
                 }
@@ -108,7 +122,7 @@ class WebSearchService(
                 // 吞掉取消的壞 delegate：已取消仍回值時不得寫 cache。
                 currentCoroutineContext().ensureActive()
                 if (outcome is WebSearchOutcome.Ok) {
-                    cache.putByKey(key, outcome)
+                    cache.putByKey(cacheKey, outcome)
                 }
                 m.complete(outcome)
                 return outcome
@@ -135,7 +149,7 @@ class WebSearchService(
                 // 取消狀態下仍須清 inFlight，否則殘留已取消的 deferred 會焊住後續同 key。
                 withContext(NonCancellable) {
                     mutex.withLock {
-                        if (inFlight[key] === m) inFlight.remove(key)
+                        if (inFlight[cacheKey] === m) inFlight.remove(cacheKey)
                     }
                 }
             }

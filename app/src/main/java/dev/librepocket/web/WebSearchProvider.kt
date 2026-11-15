@@ -40,9 +40,29 @@ interface WebSearchProvider {
 
     val capabilities: Set<WebCapability>
 
+    /**
+     * Credential revision for cache coherence. Implementations holding a
+     * bound credential (keyed providers) MUST return a non-null, stable-but-
+     * distinct value per distinct credential, or [REV_UNAVAILABLE] when the
+     * credential state cannot be determined (transient vault failure / missing
+     * key); [null] means "no credential" (non-keyed provider) and preserves
+     * legacy cache behavior.
+     *
+     * The value is in-memory only (a fingerprint), never persisted, and must not
+     * be derivable back into key material.
+     * [REV_UNAVAILABLE] is a bypass sentinel: [WebSearchService] must not read,
+     * join, or write any cache row when it is returned.
+     */
+    suspend fun cacheRevision(): String? = null
+
     /** 可用性探測（缺 key／缺 URL 回 [WebProbe.NotReady]，不拋異常）。 */
     suspend fun probe(): WebProbe
 
     /** 搜尋（空 query 回 `Unavailable(EMPTY_QUERY)`，不發任何請求）。 */
     suspend fun search(query: String, count: Int): WebSearchOutcome
+
+    companion object {
+        /** keyed provider 的 vault 讀取故障／憑證狀態未知哨兵：Service 必須旁路（bypass）整個快取，不讀不寫。 */
+        const val REV_UNAVAILABLE: String = "rev-unavailable"
+    }
 }

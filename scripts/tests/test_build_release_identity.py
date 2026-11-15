@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 
@@ -27,6 +28,71 @@ PINS_CHECKER = ROOT / "scripts" / "check_release_pins.py"
 PINS_EXAMPLE = ROOT / "scripts" / "release_signer_pins.example.json"
 TAG_CHECKER = ROOT / "scripts" / "check_release_tag_version.py"
 APP_BUILD_GRADLE = ROOT / "app" / "build.gradle.kts"
+
+_PINS_EXAMPLE_POSIX = PINS_EXAMPLE.relative_to(ROOT).as_posix()
+
+
+def _normalize_for_match(path: str) -> str:
+    """NFKC-normalize and strip Unicode format characters for path matching.
+
+    Keeps the original separators; callers split on "/" themselves.
+    Lookalike homoglyph substitutions (e.g. Cyrillic і for Latin i) are NOT folded and remain a documented limitation of this path-name control; a content-based registry-shape scan is the planned defense-in-depth layer.
+    """
+    normalized = unicodedata.normalize("NFKC", path)
+    return "".join(ch for ch in normalized if unicodedata.category(ch) != "Cf")
+
+
+def _forbidden_signer_pins_path(path: str) -> bool:
+    """Suffix- and component-agnostic tripwire predicate for the pins-absence control.
+
+    A tracked path is forbidden iff ANY path component, lowercased, contains
+    "signer_pins" or "signer-pins" — the pins validator consumes file content,
+    not the filename suffix, so any extension (or none) and any directory
+    component are equally usable as a production registry. The canonical
+    placeholder example is the ONLY exempt path: it is matched byte-exactly
+    (case-sensitive, no normalization) against the raw path. Everything else
+    with a marker component is forbidden, including byte-distinct Unicode
+    lookalikes of the canonical path.
+    """
+    if path == _PINS_EXAMPLE_POSIX:
+        return False
+    normalized = _normalize_for_match(path)
+    return any(
+        marker in part.lower()
+        for part in normalized.split("/")
+        for marker in ("signer_pins", "signer-pins")
+    )
+
+
+def _assert_example_sentinel(example: object) -> None:
+    """Assert the parsed example pins file contains only sentinel placeholders.
+
+    Raises AssertionError if any flavor carries a real-looking value or the
+    top-level shape drifts from the canonical three-flavor placeholder.
+    """
+    if not isinstance(example, dict):
+        raise AssertionError(f"example pins must be a JSON object, got {type(example).__name__}")
+    if set(example) != {"play", "foss", "github"}:
+        raise AssertionError(f"example pins must define exactly play/foss/github, got {sorted(example)}")
+    expected_packages = {
+        "play": "dev.librepocket.agent",
+        "foss": "dev.librepocket.agent.foss",
+        "github": "dev.librepocket.agent.github",
+    }
+    expected_certs = {
+        "play": "PUT_REAL_64_HEX_PIN_HERE_FOR_PLAY",
+        "foss": "PUT_REAL_64_HEX_PIN_HERE_FOR_FOSS",
+        "github": "PUT_REAL_64_HEX_PIN_HERE_FOR_GITHUB",
+    }
+    for flavor in ("play", "foss", "github"):
+        entry = example[flavor]
+        if not isinstance(entry, dict):
+            raise AssertionError(f"example pins entry {flavor!r} must be a JSON object")
+        if entry.get("package") != expected_packages[flavor]:
+            raise AssertionError(f"example pins package for {flavor!r} drifted from the canonical placeholder")
+        if entry.get("cert_sha256") != expected_certs[flavor]:
+            raise AssertionError(f"example pins cert_sha256 for {flavor!r} must remain a sentinel placeholder")
+
 
 FLAVORS = ("play", "foss", "github")
 CONDITIONAL_BACKTICK_GRADLE = (
@@ -1132,6 +1198,51 @@ class SignerPinRegistryTest(unittest.TestCase):
             timeout=30,
         )
         self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_tripwire_predicate_catches_any_suffix(self) -> None:
+        self.assertFalse(_forbidden_signer_pins_path("scripts/release_signer_pins.example.json"))
+        for forbidden in (
+            "release_signer_pins.data",
+            "release_signer_pins",
+            "docs/RELEASE_SIGNER_PINS.JSON",
+            "docs/signer-pins.yaml",
+            "sub/dir/release_signer_pins.md",
+            "prod_signer_pins.toml",
+            "nested/release_signer_pins.backup",
+            "docs/signer_pins.md",
+        ):
+            self.assertTrue(_forbidden_signer_pins_path(forbidden), forbidden)
+        self.assertFalse(_forbidden_signer_pins_path("scripts/release_signer_pins.example.json"))
+        self.assertFalse(_forbidden_signer_pins_path("docs/TESTING.md"))
+
+    def test_tripwire_predicate_component_and_case_variants(self) -> None:
+        for forbidden in (
+            "signer_pins/prod.json",
+            "sub/signer-pins/x.json",
+            "docs/signer_pins/certs.json",
+            "SCRIPTS/RELEASE_SIGNER_PINS.EXAMPLE.JSON",
+            "\uff53\uff49\uff47\uff4e\uff45\uff52_pins.json",
+            "signer\u200d_pins.json",
+            "\uff53\uff43\uff52\uff49\uff50\uff54\uff53\uff0f\uff52\uff45\uff4c\uff45\uff41\uff53\uff45\uff3f\uff53\uff49\uff47\uff4e\uff45\uff52\uff3f\uff50\uff49\uff4e\uff53\uff0e\uff45\uff58\uff41\uff4d\uff50\uff4c\uff45\uff0e\uff4a\uff53\uff4f\uff4e",
+            "scripts/release_signer_pins.\u200bexample.json",
+        ):
+            self.assertTrue(_forbidden_signer_pins_path(forbidden), forbidden)
+        self.assertFalse(_forbidden_signer_pins_path("docs/TESTING.md"))
+        self.assertFalse(_forbidden_signer_pins_path("scripts/release_signer_pins.example.json"))
+
+    def test_checked_in_example_contains_only_sentinel_placeholders(self) -> None:
+        example = json.loads(PINS_EXAMPLE.read_text(encoding="utf-8"))
+        _assert_example_sentinel(example)
+
+    def test_example_with_one_real_fingerprint_is_rejected_by_sentinel_assertion(self) -> None:
+        example = json.loads(PINS_EXAMPLE.read_text(encoding="utf-8"))
+        mutated = json.loads(json.dumps(example))
+        mutated["play"]["cert_sha256"] = "ab12" * 16
+        with self.assertRaises(AssertionError):
+            _assert_example_sentinel(mutated)
+        # The file on disk must be untouched and still pass the sentinel assertion.
+        on_disk = json.loads(PINS_EXAMPLE.read_text(encoding="utf-8"))
+        _assert_example_sentinel(on_disk)
 
     def test_unknown_flavor_is_rejected(self) -> None:
         path = self._write(
@@ -2267,8 +2378,13 @@ class CommittedPinsAbsenceControl(unittest.TestCase):
     """Issue #12 tripwire: a real signer-pins registry must never be tracked.
 
     The checked-in placeholder (`scripts/release_signer_pins.example.json`) is the only
-    permitted pins JSON. Docs (RELEASE.md) forbid committing production pins; this test
-    makes that invariant mechanical. Fail-closed if git is unavailable.
+    permitted pins file. Docs (RELEASE.md) forbid committing production pins; this test
+    makes that invariant mechanical. The invariant is suffix- and component-agnostic: the
+    pins validator consumes file content, not the filename suffix, so any file (or
+    extensionless name) where ANY path component contains "signer_pins" or "signer-pins"
+    is rejected, whatever its suffix — or lack of one. Only the exact canonical
+    placeholder example is exempt.
+    Fail-closed if git is unavailable.
     Executes when the pr-check.yml policy-harness path filter is true, which now includes
     any `*signer_pins*` path anywhere in the diff (so a pins-shaped file in any diff runs
     it), while diffs flipping no filter (e.g. pure docs) still skip it.
@@ -2292,12 +2408,7 @@ class CommittedPinsAbsenceControl(unittest.TestCase):
                 + result.stderr.decode("utf-8", "replace").strip()
             )
         tracked = [p for p in result.stdout.decode("utf-8", "replace").split("\0") if p]
-        offenders = sorted(
-            p for p in tracked
-            if "signer_pins" in p.lower()
-            and p.lower().endswith((".json", ".txt", ".yaml", ".yml", ".toml"))
-            and p != PINS_EXAMPLE.relative_to(ROOT).as_posix()
-        )
+        offenders = sorted(p for p in tracked if _forbidden_signer_pins_path(p))
         self.assertEqual(
             offenders,
             [],

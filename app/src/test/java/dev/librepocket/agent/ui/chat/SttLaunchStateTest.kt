@@ -2,6 +2,7 @@ package dev.librepocket.agent.ui.chat
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -213,6 +214,14 @@ class SttLaunchStateTest {
             it[0] = listOf(true, true)
             it[1] = listOf(3L, 4L)
         }))
+    }
+
+    @Test
+    fun `restore returns null when inFlightName is set but all slots are free`() {
+        // Production invariant: a named in-flight arm must hold at least one reserved slot.
+        assertNull(restore(listOf(listOf(false, false), listOf(0L, 0L), 4L, "INITIAL", 5L)))
+        // At least one busy slot satisfies the invariant.
+        assertNotNull(restore(listOf(listOf(true, false), listOf(3L, 0L), 4L, "INITIAL", 5L)))
     }
 
     @Test

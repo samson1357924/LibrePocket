@@ -17,14 +17,12 @@ private const val TAG = "LibreRecognition"
 /**
  * C1 RecognitionService stub（Issue #137 C1a）。
  *
- * C1 不做語音辨識（C2 才在 session 內接系統 STT）：[onStartListening]
- * 誠實回報 [SpeechRecognizer.ERROR_CLIENT]，不偽造辨識結果；
- * [onCheckRecognitionSupport] 回報零支援（空語言清單），不偽造能力；
- * [onCancel]／[onStopListening] 無狀態可清，直接 no-op。
- *
- * STT 遷移計畫（C2）：在 session 內接系統 STT（串流辨識），取代本 stub；
- * 本 stub 的 onError／onResults 僅為佔位（fail-closed，不偽造結果）。
- * ERROR_CLIENT 選擇理由：誠實客戶端錯誤（C1 無辨識能力）；[onCheckRecognitionSupport]
+ * C2 已定案（非目標，session 內不做串流辨識，語音輸入委派系統
+ * RecognizerIntent 處理）：[onStartListening] 誠實回報 [SpeechRecognizer.ERROR_CLIENT]，
+ * 不偽造辨識結果；[onCheckRecognitionSupport] 回報零支援（空語言清單），
+ * 不偽造能力；[onCancel]／[onStopListening] 無狀態可清，直接 no-op。
+ * 本 stub 保持誠實無能力，非待實作的遷移佔位。
+ * ERROR_CLIENT 選擇理由：誠實客戶端錯誤（無辨識能力）；[onCheckRecognitionSupport]
  * 已報零支援故本方法極少被調；若實測發現系統重試 aggressive，再評估 ERROR_SERVER，
  * 目前保持語義正確。
  */

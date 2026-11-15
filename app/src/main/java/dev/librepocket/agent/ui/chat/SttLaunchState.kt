@@ -104,6 +104,10 @@ internal fun restoreSttLaunchState(saved: List<Any?>): SttLaunchState? {
     if (name != null) {
         if (generation == 0L) return null
         if (admitted == 0L) return null
+        // A restored in-flight arm MUST hold at least one wedged/reserved slot — production
+        // invariant (launch reserves its slot atomically with the admit). All-slots-free with
+        // a named in-flight arm cannot be a production snapshot (crafted/half-written bundle).
+        if (busyList.none { it }) return null
     }
     // 水位達 Long.MAX_VALUE 時下一枚 admit 會 wrap，污染單調性；拒絕。
     if (generation >= Long.MAX_VALUE) return null

@@ -74,10 +74,10 @@ class VoiceHandoffProvider : ContentProvider() {
                 // The provider (main process) stamps the stored entry with its own clock;
                 // the caller cannot outsource/forward-anchor the TTL.
                 val issued = SystemClock.elapsedRealtime()
-                // Refuse publishes carrying an undeliverable identity (sentinel/zero axes):
+                // Refuse publishes carrying an undeliverable identity (sentinel/negative/zero axes):
                 // fail-closed at the boundary instead of occupying the slot until TTL.
-                if (token <= 0L || targetTaskId == -1 || targetTaskId == VoiceHandoffContract.WILDCARD_TASK_ID ||
-                    sessionInstanceId == 0L || sessionInstanceId == VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID
+                if (token <= 0L || targetTaskId < 0 ||
+                    sessionInstanceId <= 0L
                 ) {
                     return null
                 }
@@ -127,19 +127,29 @@ class VoiceHandoffProvider : ContentProvider() {
                 } else {
                     val b = extras ?: Bundle()
                     val token = b.getLong(VoiceHandoffContract.KEY_TOKEN, 0L)
-                    val hasTarget = b.containsKey(VoiceHandoffContract.KEY_TARGET_TASK_ID) ||
-                        b.containsKey(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID)
-                    if (hasTarget) {
-                        clearMatching(
-                            b.getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, VoiceHandoffContract.WILDCARD_TASK_ID),
-                            b.getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID),
-                            token,
-                        )
-                    } else if (token != 0L) {
-                        clearIfToken(token)
+                    // An explicitly-sent wildcard sentinel is never a legitimate IPC clear
+                    // (identityBundle omits wildcard axes entirely) — refuse it, entry preserved.
+                    // Wildcards remain the *omission* default for the other axis only.
+                    val targetRaw = b.getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, VoiceHandoffContract.WILDCARD_TASK_ID)
+                    val sessionRaw = b.getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID)
+                    val targetExplicitWildcard = b.containsKey(VoiceHandoffContract.KEY_TARGET_TASK_ID) && targetRaw == VoiceHandoffContract.WILDCARD_TASK_ID
+                    val sessionExplicitWildcard = b.containsKey(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID) && sessionRaw == VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID
+                    if (targetExplicitWildcard || sessionExplicitWildcard) {
+                        // Explicit wildcard sentinel(s) are never legitimate over IPC —
+                        // refuse, entry preserved. Wildcards remain the *omission* default
+                        // for the unspecified axis only.
+                        Bundle.EMPTY
+                    } else {
+                        val hasTarget = b.containsKey(VoiceHandoffContract.KEY_TARGET_TASK_ID) ||
+                            b.containsKey(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID)
+                        if (hasTarget) {
+                            clearMatching(targetRaw, sessionRaw, token)
+                        } else if (token != 0L) {
+                            clearIfToken(token)
+                        }
+                        // else: no token and no identity keys -> no-op (no clearAll from IPC).
+                        Bundle.EMPTY
                     }
-                    // else: no token and no identity keys -> no-op (no clearAll from IPC).
-                    Bundle.EMPTY
                 }
             }
             VoiceHandoffContract.METHOD_CLEAR_EXPIRED -> {

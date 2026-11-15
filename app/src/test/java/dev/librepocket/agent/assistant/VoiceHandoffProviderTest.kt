@@ -465,6 +465,81 @@ class VoiceHandoffProviderTest {
         )
         assertNull(ack2)
         assertNull(VoiceHandoffProvider.pending.value)
+
+        // Negative task axis: refused.
+        val ack3 = provider.call(
+            VoiceHandoffContract.METHOD_PUBLISH,
+            null,
+            Bundle().apply {
+                putLong(VoiceHandoffContract.KEY_TOKEN, 993L)
+                putInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, -5)
+                putLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, 7L)
+                putLong(VoiceHandoffContract.KEY_ISSUED_ELAPSED_REALTIME_MS, SystemClock.elapsedRealtime())
+            },
+        )
+        assertNull(ack3)
+        assertNull(VoiceHandoffProvider.pending.value)
+
+        // Sentinel sid axis: refused (Int.MIN_VALUE is negative as a Long too).
+        val ack4 = provider.call(
+            VoiceHandoffContract.METHOD_PUBLISH,
+            null,
+            Bundle().apply {
+                putLong(VoiceHandoffContract.KEY_TOKEN, 994L)
+                putInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, 10)
+                putLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, Long.MIN_VALUE)
+                putLong(VoiceHandoffContract.KEY_ISSUED_ELAPSED_REALTIME_MS, SystemClock.elapsedRealtime())
+            },
+        )
+        assertNull(ack4)
+        assertNull(VoiceHandoffProvider.pending.value)
+    }
+
+    @Test
+    fun callClear_withExplicitWildcardSentinel_preservesEntry() {
+        publish(995L, targetTaskId = 10, sessionInstanceId = 7L)
+        val provider = newAttachedProvider()
+
+        // Explicit sentinel sent on the task axis — never legitimate from identityBundle; refused.
+        provider.call(
+            VoiceHandoffContract.METHOD_CLEAR,
+            null,
+            Bundle().apply {
+                putInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, Int.MIN_VALUE)
+            },
+        )
+        assertEquals(995L, VoiceHandoffProvider.pending.value?.token)
+
+        // Explicit sentinel on the sid axis — refused, entry intact.
+        provider.call(
+            VoiceHandoffContract.METHOD_CLEAR,
+            null,
+            Bundle().apply {
+                putLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, Long.MIN_VALUE)
+            },
+        )
+        assertEquals(995L, VoiceHandoffProvider.pending.value?.token)
+
+        // Explicit sentinel with a real counterpart axis — still refused (omission defaults remain legal).
+        provider.call(
+            VoiceHandoffContract.METHOD_CLEAR,
+            null,
+            Bundle().apply {
+                putInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, Int.MIN_VALUE)
+                putLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, 7L)
+            },
+        )
+        assertEquals(995L, VoiceHandoffProvider.pending.value?.token)
+
+        // Omitted axis stays a wildcard: task axis only (sid axis omitted) must clear.
+        provider.call(
+            VoiceHandoffContract.METHOD_CLEAR,
+            null,
+            Bundle().apply {
+                putInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, 10)
+            },
+        )
+        assertNull("omitted axis must remain wildcard-default", VoiceHandoffProvider.pending.value)
     }
 
     @Test

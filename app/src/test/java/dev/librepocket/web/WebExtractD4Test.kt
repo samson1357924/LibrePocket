@@ -518,6 +518,11 @@ class WebExtractD4Test {
     }
 
     @Test fun extractCancelDoesNotWriteCache() = runBlocking {
+        // Service-level contract pin：呼叫方於 flight 途中取消 → leader 以 CancellationException 退出，
+        // cache 絕不寫（下方第二次 extract 必須 refetch，http.calls==2 為佐證），Ok 絕不返回給已取消的呼叫方。
+        // （「parse 階段中途取消」無法在不注入 checking 計數器的前提下決定性斷言；checking 的決定性
+        //   切斷由 parseHtmlCheckingCounterStopsDeterministically／cleanFieldCheckingCounterStopsDeterministically／
+        //   stripScriptAndStyleCheckingCounterStopsDeterministically 釘死；本案固定 service 層既有映射。）
         val dns = publicDns("example.com")
         val release = CompletableDeferred<Unit>()
         var observedCancel = false
@@ -1896,6 +1901,65 @@ class WebExtractD4Test {
         val compressed = bos.toByteArray()
         org.junit.Assert.assertThrows(DeadlineExceededException::class.java) {
             gunzipCapped(compressed, WebExtract.DEFAULT_MAX_BYTES, System.nanoTime() - 1)
+        }
+    }
+
+    // ---- I-bis. cooperative cancellation（deterministic：checking 計數器於第 N 次呼叫拋 CE） ----
+
+    @Test fun parseHtmlCheckingCounterStopsDeterministically() {
+        // checking 探針於第 2 次呼叫拋 CancellationException → parseHtml 原樣上拋
+        // （不映射 null／BAD_RESPONSE／TIMEOUT）。不依賴 wall-clock；counter 決定性切斷。
+        var calls = 0
+        val checking: () -> Unit = {
+            calls += 1
+            if (calls >= 2) throw CancellationException("test-cancel-at-2")
+        }
+        try {
+            parseHtml(html(), "https://example.com/", Long.MAX_VALUE, checking)
+            org.junit.Assert.fail("checking 於第 2 次呼叫應拋出 CancellationException")
+        } catch (e: CancellationException) {
+            assertEquals("test-cancel-at-2", e.message)
+            assertTrue("checking 至少被呼叫 2 次（實得 $calls）", calls >= 2)
+        }
+    }
+
+    @Test fun cleanFieldCheckingCounterStopsDeterministically() {
+        // cleanField 每外層定點輪雙閘（checking 先）；counter 於第 3 次呼叫拋 CE →
+        // CancellationException 原樣上拋（不映射 DeadlineExceededException、不回傳部分結果）。
+        var calls = 0
+        val checking: () -> Unit = {
+            calls += 1
+            if (calls >= 3) throw CancellationException("test-cancel-at-3")
+        }
+        try {
+            WebContentEnvelope.cleanField(
+                "\u200B".repeat(2048) + WebContentEnvelope.BEGIN.repeat(4),
+                Long.MAX_VALUE,
+                checking,
+            )
+            org.junit.Assert.fail("checking 於第 3 次呼叫應拋出 CancellationException")
+        } catch (e: CancellationException) {
+            assertEquals("test-cancel-at-3", e.message)
+            assertTrue("checking 至少被呼叫 3 次（實得 $calls）", calls >= 3)
+        }
+    }
+
+    @Test fun stripScriptAndStyleCheckingCounterStopsDeterministically() {
+        // HtmlExtract.stripScriptAndStyle 每外層迭代雙閘（checking 先）；counter 於第 2 次
+        // 呼叫拋 CE → 原樣上拋（無 catch-all 吞沒）。doc 全小寫 ASCII，doc 即其 ASCII 摺疊，
+        // 故直接以 doc 作 lower 傳入。不依賴 wall-clock。
+        val doc = "<p>keep</p><script>var hidden = 1; var secret = 2</script><p>keep2</p><script>more hidden</script>"
+        var calls = 0
+        val checking: () -> Unit = {
+            calls += 1
+            if (calls >= 2) throw CancellationException("test-cancel-at-2")
+        }
+        try {
+            HtmlExtract.stripScriptAndStyle(doc, doc, Long.MAX_VALUE, checking)
+            org.junit.Assert.fail("checking 於第 2 次呼叫應拋出 CancellationException")
+        } catch (e: CancellationException) {
+            assertEquals("test-cancel-at-2", e.message)
+            assertTrue("checking 至少被呼叫 2 次（實得 $calls）", calls >= 2)
         }
     }
 

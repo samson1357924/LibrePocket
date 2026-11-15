@@ -37,6 +37,11 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  * code unit 檢查 [System.nanoTime] 後拋出此例外；任何不允許逸出的 catch-all
  * 皆須於其前重拋本例外；最終由 `WebExtractService` 的 deadline 映射 arm 收束為
  * `Failed(TIMEOUT)`（never cached）。
+ *
+ * 協程取消不是本例外：synchronous 迴圈另有 `checking: () -> Unit = {}` 探針
+ * （協程活性檢查，production 為 `ensureActive()`）於相同檢查點呼叫，探針拋出
+ * [CancellationException] 時原樣上拋、與 DeadlineExceededException 正交；
+ * 不允許逸出的 catch-all 亦須於其前重拋 CancellationException。
  */
 internal class DeadlineExceededException : RuntimeException()
 
@@ -111,7 +116,13 @@ internal class DeadlineExceededException : RuntimeException()
  *   編碼時即 raw body 位元組數。
  * - 取消語義：外部取消（leader／呼叫方自身）原樣透傳 [CancellationException]，
  *   不映射、不寫快取、不 fallback（`fetchRawWithTimeout` 內五處 `ensureActive()` 守衛，與
- *   `WebHttp.fetchWithTimeout` 對稱）；leader 被取消而 follower 仍 active 者，
+ *   `WebHttp.fetchWithTimeout` 對稱）；synchronous 解析／清理／解壓迴圈（parseHtml／
+ *   HtmlExtract／cleanField／sanitize／gunzipCapped 等）另以 **雙閘** 約束：deadline
+ *   （[System.nanoTime] → [DeadlineExceededException]）＋`checking: () -> Unit`
+ *   協程活性探針（production 為捕獲之協程 context 上的 `CoroutineContext.ensureActive()`，
+ *   非 suspend 版、語義同 `currentCoroutineContext().ensureActive()`，拋
+ *   [CancellationException]），兩閘於同一檢查點觸發，CancellationException 原樣上拋、
+ *   不映射 TIMEOUT／TRANSPORT、不寫快取、不 fallback；leader 被取消而 follower 仍 active 者，
  *   follower 映射 typed `Unavailable(DETAIL_CANCELLED, null)`（never cached；
  *   follower 不得 out-fetch 已取消的 leader，不再進入單飛迴圈 refetch）；
  *   例外：leader 於取消前已完整產出 Ok（okForFollowers 路徑）者，follower
@@ -869,6 +880,13 @@ class WebExtractService(
         // 全程單一單調 deadline：per-call 政策重驗（含 DNS preflight）＋
         // `extractUncached`（DNS preflight＋逐跳 HTTP＋解壓）共用此單一單調預算。
         val deadlineNs = System.nanoTime() + timeoutMs.coerceAtLeast(1) * 1_000_000L
+        // Cooperative cancellation：synchronous 解析／清理／解壓階段的迴圈以同一探針
+        // 檢查本協程活性（`CoroutineContext.ensureActive()`，非 suspend 版，與檔內
+        // `currentCoroutineContext().ensureActive()` 語義一致）；呼叫方取消即拋
+        // CancellationException（原樣上拋，不映射 TIMEOUT／TRANSPORT、不寫快取）。
+        // 全程僅建立一次，傳給屬本協程的所有下游階段（extractUncached → parseHtml／gunzip／cleanField／wrap 等）。
+        val callingContext = currentCoroutineContext()
+        val checking: () -> Unit = { callingContext.ensureActive() }
         // 入口捕獲 cache generation epoch：leader 完成時若 epoch 已變
         //（期間發生過 invalidate()/clear()），抑制本次 cache 寫入
         //（caller 自身仍正常拿到 outcome；僅 cache write 被抑制）。
@@ -969,7 +987,7 @@ class WebExtractService(
             // Ok 仍為公開契約，chain 經內部 channel 傳回）。
             var chain = emptyList<HopBinding>()
             try {
-                val outcome = extractUncached(rawUrl, optIn, resolver, effBytes, effModel, deadlineNs) { chain = it }
+                val outcome = extractUncached(rawUrl, optIn, resolver, effBytes, effModel, deadlineNs, checking) { chain = it }
                 if (outcome is WebExtractOutcome.Ok) okForFollowers = outcome
                 currentCoroutineContext().ensureActive()
                 if (outcome is WebExtractOutcome.Ok && cache.currentGeneration == epochAtEntry) {
@@ -1074,12 +1092,14 @@ class WebExtractService(
         effBytes: Int,
         effModel: Int,
         deadlineNs: Long,
+        checking: () -> Unit = {},
         chainSink: ((List<HopBinding>) -> Unit)? = null,
     ): WebExtractOutcome =
         // 任何 DeadlineExceededException（gunzip／parse／cleanup 之 deadline 耗盡）
         // → 與預算耗盡同 detail：Failed(TIMEOUT)；never Ok、never cached。
+        // CancellationException（協程取消，含 checking 探針拋出）刻意不攔截：原樣上拋。
         try {
-            extractUncachedInner(rawUrl, optIn, resolver, effBytes, effModel, deadlineNs, chainSink)
+            extractUncachedInner(rawUrl, optIn, resolver, effBytes, effModel, deadlineNs, checking, chainSink)
         } catch (e: DeadlineExceededException) {
             WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
         }
@@ -1091,6 +1111,7 @@ class WebExtractService(
         effBytes: Int,
         effModel: Int,
         deadlineNs: Long,
+        checking: () -> Unit = {},
         chainSink: ((List<HopBinding>) -> Unit)? = null,
     ): WebExtractOutcome {
         // 全程單一單調 deadline（由 extract() 入口計算並傳入）：DNS preflight
@@ -1220,7 +1241,7 @@ class WebExtractService(
                 return WebExtractOutcome.Failed(WebExtract.DETAIL_TOO_LARGE)
             }
             val bytes: ByteArray = if (encoding == "gzip" || encoding == "x-gzip") {
-                when (val dec = gunzipCapped(rawBytes, effBytes, deadlineNs)) {
+                when (val dec = gunzipCapped(rawBytes, effBytes, deadlineNs, checking)) {
                     is GunzipOut.Ok -> dec.data
                     is GunzipOut.TooLarge -> return WebExtractOutcome.Failed(WebExtract.DETAIL_TOO_LARGE)
                     is GunzipOut.Corrupt -> return WebExtractOutcome.Failed(WebExtract.DETAIL_BAD_RESPONSE)
@@ -1248,9 +1269,9 @@ class WebExtractService(
             // [WebContentEnvelope.cleanField]（去 Cf／（\n／\t 以外之）Cc／EXTRA_STRIP，
             // `\r` 為 Cc 故移除；NFKC 摺疊）再首尾 trim——不做 \s+ → " " 收斂。
             val parsed = when (pipelineOf(contentType)) {
-                Pipeline.Html -> parseHtml(decoded, normalized, deadlineNs)
+                Pipeline.Html -> parseHtml(decoded, normalized, deadlineNs, checking)
                 Pipeline.RawText -> {
-                    val snippet = WebContentEnvelope.cleanField(decoded, deadlineNs).trim()
+                    val snippet = WebContentEnvelope.cleanField(decoded, deadlineNs, checking).trim()
                     if (snippet.isEmpty()) {
                         // snippet 清成空白 → BAD_RESPONSE（鏡照 HTML 管線之契約）。
                         null
@@ -1270,14 +1291,14 @@ class WebExtractService(
             } ?: return WebExtractOutcome.Failed(WebExtract.DETAIL_BAD_RESPONSE)
 
             // Model 可見截斷（定點清理後、截斷後、envelope 最外；見 cleanField）。
-            val cleanSnippet = WebContentEnvelope.cleanField(parsed.content.snippet, deadlineNs)
-            val cleanTitle = WebContentEnvelope.cleanField(parsed.content.title, deadlineNs).takeExtractPrefix(500)
-            val cleanUrl = WebContentEnvelope.cleanField(parsed.content.url, deadlineNs).takeExtractPrefix(2048)
+            val cleanSnippet = WebContentEnvelope.cleanField(parsed.content.snippet, deadlineNs, checking)
+            val cleanTitle = WebContentEnvelope.cleanField(parsed.content.title, deadlineNs, checking).takeExtractPrefix(500)
+            val cleanUrl = WebContentEnvelope.cleanField(parsed.content.url, deadlineNs, checking).takeExtractPrefix(2048)
             val cleanSiteName = parsed.content.siteName?.let {
-                WebContentEnvelope.cleanField(it, deadlineNs).takeExtractPrefix(253)
+                WebContentEnvelope.cleanField(it, deadlineNs, checking).takeExtractPrefix(253)
             }
             val cleanPublished = parsed.content.published?.let {
-                WebContentEnvelope.cleanField(it, deadlineNs).takeExtractPrefix(128)
+                WebContentEnvelope.cleanField(it, deadlineNs, checking).takeExtractPrefix(128)
             }
             val capped = cleanSnippet.takeExtractPrefix(effModel)
             val modelTruncated = capped.length < cleanSnippet.length
@@ -1291,16 +1312,17 @@ class WebExtractService(
                 published = cleanPublished,
                 siteName = cleanSiteName,
             )
-            // pre-Ok gate：預算已耗盡則絕不建構／返回逾越預算之 Ok
-            //（parse／gunzip 內部 deadline 檢查之外的最後一道守門）。
+            // pre-Ok gate：預算已耗盡／呼叫方已取消則絕不建構／返回逾越預算之 Ok
+            //（parse／gunzip 內部雙閘檢查之外的最後一道守門）。
+            checking()
             if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
             val envelope = if (!truncated) {
-                WebContentEnvelope.wrap(capped, deadlineNs)
+                WebContentEnvelope.wrap(capped, deadlineNs, checking)
             } else if (modelTruncated) {
-                WebContentEnvelope.wrap(capped + "\n${WebExtract.TRUNCATED_SENTINEL_MARK} AT $effModel CHARS]", deadlineNs)
+                WebContentEnvelope.wrap(capped + "\n${WebExtract.TRUNCATED_SENTINEL_MARK} AT $effModel CHARS]", deadlineNs, checking)
             } else {
                 // truncated 僅由 parser 輸入前綴截斷觸發（model 預算未截）：input sentinel。
-                WebContentEnvelope.wrap(capped + "\n${WebExtract.TRUNCATED_INPUT_SENTINEL_MARK}$PARSE_INPUT_CAP CHARS]", deadlineNs)
+                WebContentEnvelope.wrap(capped + "\n${WebExtract.TRUNCATED_INPUT_SENTINEL_MARK}$PARSE_INPUT_CAP CHARS]", deadlineNs, checking)
             }
             // Option B：成功路徑——把鏈式信任上下文交回 extract()（供 cache 寫入）。
             chainSink?.invoke(chain.toList())
@@ -1422,21 +1444,23 @@ internal sealed interface GunzipOut {
 }
 
 /**
- * 受上限的 gzip 解壓（bomb fail-closed；deadline 有界）。
+ * 受上限的 gzip 解壓（bomb fail-closed；deadline＋協程活性雙有界）。
  *
  * - 解壓超過 [cap] 即回 [GunzipOut.TooLarge]（不回部分資料）；
  * - 非 gzip／損壞即回 [GunzipOut.Corrupt]（→ `BAD_RESPONSE`，與超限區分）；
- * - 每次 `gz.read` 前、以及回傳前各檢查一次 [deadlineNs]：逾時拋
- *   [DeadlineExceededException]（→ `Failed(TIMEOUT)`；絕不回部分資料）。
- *   預設 `Long.MAX_VALUE`（直接呼叫語義不變）。
+ * - 每次 `gz.read` 前、以及回傳前各做一次雙閘（[checking] 先、[deadlineNs] 後）：
+ *   呼叫方協程已取消 → [kotlinx.coroutines.CancellationException] 原樣上拋；
+ *   逾時拋 [DeadlineExceededException]（→ `Failed(TIMEOUT)`；絕不回部分資料）。
+ *   預設 `Long.MAX_VALUE`／`{}`（直接呼叫語義不變）。
  */
-internal fun gunzipCapped(data: ByteArray, cap: Int, deadlineNs: Long = Long.MAX_VALUE): GunzipOut {
+internal fun gunzipCapped(data: ByteArray, cap: Int, deadlineNs: Long = Long.MAX_VALUE, checking: () -> Unit = {}): GunzipOut {
     return try {
         GZIPInputStream(ByteArrayInputStream(data)).use { gz ->
             val out = ByteArrayOutputStream(minOf(cap.coerceAtLeast(1), 8192))
             val buf = ByteArray(8192)
             var total = 0
             while (true) {
+                checking()
                 if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
                 val n = gz.read(buf)
                 if (n == -1) break
@@ -1444,7 +1468,8 @@ internal fun gunzipCapped(data: ByteArray, cap: Int, deadlineNs: Long = Long.MAX
                 out.write(buf, 0, n)
                 total += n
             }
-            // 回傳前再確認一次預算：膨脹工作不得逾越預算後才交出位元組。
+            // 回傳前再確認一次預算與活性：膨脹工作不得逾越預算後才交出位元組。
+            checking()
             if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
             GunzipOut.Ok(out.toByteArray())
         }
@@ -1465,7 +1490,13 @@ internal fun charsetOf(contentType: String?): String? {
     return m?.groupValues?.get(1)?.trim()?.takeIf { it.isNotEmpty() }
 }
 
-/** 轉碼降級：未知 charset／損壞位元組一律 UTF-8 replacement 解碼，永不拋異常。 */
+/** 轉碼降級：未知 charset／損壞位元組一律 UTF-8 replacement 解碼，永不拋異常。
+ *
+ * 未 weave `checking`／deadline：本函式無自有迴圈（解碼由 native ByteBuffer decode 完成，
+ * 無插入點），且 decode 依設計不計入 deadline（見 header「decode 不計入 deadline」）；
+ * 工作受 bytes 上限（≤ [WebExtract.ABSOLUTE_MAX_BYTES]）約束。兩個入口 catch-all 皆不可能
+ * 看到 checking 拋出的 CancellationException（checking 未穿入本函式）；deadline arm 保留。
+ */
 internal fun decodeDowngraded(data: ByteArray, charsetName: String?): String {
     val charset: Charset = try {
         if (charsetName.isNullOrBlank()) Charsets.UTF_8 else Charset.forName(charsetName)
@@ -1521,8 +1552,10 @@ internal data class ParseResult(val content: WebExtractContent, val inputCapped:
  * `<script>/<style>` 剝除皆為 index-based 線性掃描（不使用 lazy backtracking
  * regex），避免病態輸入觸發災難性回溯。metadata（published）改為單趟、
  * 前向游標的屬性解析器（無 regex），整體 O(n)。
- * 所有迴圈受 [deadlineNs] 約束：逾時拋 [DeadlineExceededException]
- *（不被 catch-all 吞沒，原樣上拋給呼叫方映射為 `Failed(TIMEOUT)`）。
+ * 所有迴圈受 [deadlineNs] **與** `checking` 雙閘約束：逾時拋 [DeadlineExceededException]；
+ * 呼叫方協程已取消時由 `checking` 拋 [kotlinx.coroutines.CancellationException]——
+ * 兩者皆不被 catch-all 吞沒（CancellationException 有專屬 rethrow arm），原樣上拋給呼叫方
+ * （DeadlineExceededException → `Failed(TIMEOUT)`；CancellationException → 協程取消契約）。
  *
  * - `title`：首個 `<title>` 文本（去 tag＋unescape＋trim）；缺或空白 → 回退 URL。
  * - `snippet`：剔除 `<script>/<style>` 後去 tag＋unescape＋空白收斂；空白 → 回退
@@ -1541,30 +1574,29 @@ internal data class ParseResult(val content: WebExtractContent, val inputCapped:
  * `<script`／`<style`／`<title` 僅在緊接的字元為 ASCII 空白、`/`、`>` 或 EOF
  * 時才被視為標籤（tag-name 邊界）；如 `<scripture>`／`<titlex>` 不再誤判。
  */
-internal fun parseHtml(html: String, finalUrl: String, deadlineNs: Long = Long.MAX_VALUE): ParseResult? {
+internal fun parseHtml(html: String, finalUrl: String, deadlineNs: Long = Long.MAX_VALUE, checking: () -> Unit = {}): ParseResult? {
     return try {
+        checking()
         if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
         val inputCapped = html.length > PARSE_INPUT_CAP
         val input = html.take(PARSE_INPUT_CAP)
         // ASCII 摺疊（長度不變）：所有被搜的 needle（`<title`／`<script`／`<style`／
         // `</title>`／`</script>`／`</style>`）皆 ASCII，索引必然不錯位
         //（ICU lowercase 可能變長度，故不用）。
-        val lower = buildString(input.length) {
-            for (c in input) append(if (c in 'A'..'Z') c + 32 else c)
-        }
+        val lower = HtmlExtract.foldAsciiLower(input, deadlineNs, checking)
         // 先剝 script/style，title／published 皆於剝除後的 body 上提取
         //（不得在 script/style 內容中命中 <title> 或 meta published）。
-        val body = HtmlExtract.stripScriptAndStyle(input, lower, deadlineNs)
+        val body = HtmlExtract.stripScriptAndStyle(input, lower, deadlineNs, checking)
+        checking()
         if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
-        val bodyLower = buildString(body.length) {
-            for (c in body) append(if (c in 'A'..'Z') c + 32 else c)
-        }
+        val bodyLower = HtmlExtract.foldAsciiLower(body, deadlineNs, checking)
+        checking()
         if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
-        val titleRaw = HtmlExtract.titleOf(body, bodyLower, deadlineNs)
-        val titleText = HtmlExtract.stripText(titleRaw, deadlineNs).trim().takeIf { it.isNotEmpty() } ?: finalUrl
-        val text = HtmlExtract.stripText(body, deadlineNs).trim().let { HtmlExtract.Spaces.replace(it, " ") }
+        val titleRaw = HtmlExtract.titleOf(body, bodyLower, deadlineNs, checking)
+        val titleText = HtmlExtract.stripText(titleRaw, deadlineNs, checking).trim().takeIf { it.isNotEmpty() } ?: finalUrl
+        val text = HtmlExtract.stripText(body, deadlineNs, checking).trim().let { HtmlExtract.Spaces.replace(it, " ") }
         val snippet = text.takeIf { it.isNotEmpty() } ?: titleText
-        val published = HtmlExtract.publishedOf(body, deadlineNs)
+        val published = HtmlExtract.publishedOf(body, deadlineNs, checking)
             ?.let { HtmlExtract.Spaces.replace(it, " ") }
             ?.trim()
             ?.takeIf { it.isNotEmpty() }
@@ -1582,15 +1614,39 @@ internal fun parseHtml(html: String, finalUrl: String, deadlineNs: Long = Long.M
     } catch (e: DeadlineExceededException) {
         // deadline 耗盡不得被吞沒：原樣上拋給呼叫方（service 映射 Failed(TIMEOUT)）。
         throw e
+    } catch (e: CancellationException) {
+        // checking 探針（協程活性）拋出之取消：原樣上拋，絕不映射為 null／BAD_RESPONSE。
+        throw e
     } catch (_: Exception) {
         null
     }
 }
 
-private object HtmlExtract {
+// 內部 HTML 掃描器（internal：測試與 parseHtml 共用；外部不得依賴）。
+internal object HtmlExtract {
+    // Spaces Regex 為線性掃描且不可 weave（regex 無逐步插入點）：其工作量受 input cap 約束，接受此剩餘，
+    // 不在其上加 checking；其餘所有單趟掃描迴圈皆雙閘（checking 先、nanoTime 後）。
     val Spaces = Regex("\\s+")
     val NUMERIC_ENTITY = Regex("&#(\\d+);")
     val HEX_ENTITY = Regex("&#x([0-9a-fA-F]+);")
+
+    /**
+     * ASCII 摺疊（長度不變）：所有被搜的 needle（`<title`／`<script`／`<style`／
+     * `</title>`／`<meta`／`<time`）皆 ASCII，索引必然不錯位（ICU lowercase 可能變長度，
+     * 故不用）。每 512 code units 雙閘（checking 先、[deadlineNs] 後）。
+     */
+    fun foldAsciiLower(input: String, deadlineNs: Long, checking: () -> Unit = {}): String {
+        var scan = 0
+        return buildString(input.length) {
+            for (c in input) {
+                if (++scan and 511 == 0) {
+                    checking()
+                    if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
+                }
+                append(if (c in 'A'..'Z') c + 32 else c)
+            }
+        }
+    }
 
     /** tag-name 邊界：緊接 needle 之 byte 必須為 ASCII 空白、`/`、`>` 或 EOF。 */
     private fun isTagNameBoundary(lower: String, p: Int): Boolean {
@@ -1606,8 +1662,9 @@ private object HtmlExtract {
      * 為 tag-name 邊界（見 [isTagNameBoundary]）或 EOF 即為 tag-open。
      * `<!--`（comment）由 [nextTagStartInText] 先行攔截；`<!DOCTYPE`、`<?xml`、
      * `<1`、`< s` 等皆非 tag-open。皆 ASCII 比對（`lower` 為 ASCII 摺疊，索引不錯位）。
+     * tag-name 掃描迴圈每 512 code units 雙閘（checking 先、[deadlineNs] 後）。
      */
-    private fun isTagOpen(lower: String, i: Int): Boolean {
+    private fun isTagOpen(lower: String, i: Int, deadlineNs: Long, checking: () -> Unit): Boolean {
         if (i < 0 || i >= lower.length || lower[i] != '<') return false
         var p = i + 1
         if (p < lower.length && lower[p] == '/') p++ // 閉標籤
@@ -1615,7 +1672,14 @@ private object HtmlExtract {
         val c0 = lower[p]
         if (!(c0 in 'a'..'z' || c0 in 'A'..'Z')) return false
         var j = p
+        var scanned = 0
         while (j < lower.length) {
+            if (++scanned and 511 == 0) {
+                checking()
+                if (System.nanoTime() >= deadlineNs) {
+                    throw DeadlineExceededException()
+                }
+            }
             val c = lower[j]
             if (c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9' ||
                 c == '-' || c == '_' || c == ':'
@@ -1634,21 +1698,27 @@ private object HtmlExtract {
      * 整體跳過——comment 內容原樣保留在文本流中，但不構成任何 tag-open。
      * 已開啟之 tag 之內部（含引號包裹之子字串）**不由本掃描器觀察**——
      * 呼叫端應以 [findTagEnd]（引號感知）消耗整個 tag，再自其後繼續。
-     * 每 512 code units 檢查 deadline；逾時拋 [DeadlineExceededException]。
+     * 每 512 code units 雙閘（checking 先、[deadlineNs] 後）；逾時拋
+     * [DeadlineExceededException]；呼叫方協程已取消時 [checking] 拋
+     * [kotlinx.coroutines.CancellationException]。
      */
-    private fun nextTagStartInText(lower: String, from: Int, deadlineNs: Long): Int {
+    private fun nextTagStartInText(lower: String, from: Int, deadlineNs: Long, checking: () -> Unit): Int {
         var i = maxOf(from, 0)
         var scanned = 0
         while (i < lower.length) {
-            if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
-                throw DeadlineExceededException()
+            if (++scanned and 511 == 0) {
+                checking()
+                if (System.nanoTime() >= deadlineNs) {
+                    throw DeadlineExceededException()
+                }
             }
             if (lower.startsWith("<!--", i)) {
+                // indexOf 為原生掃描、不可 weave；線性且受 input cap 約束，接受此剩餘。
                 val close = lower.indexOf("-->", i + 4)
                 i = if (close < 0) lower.length else close + 3
                 continue
             }
-            if (lower[i] == '<' && isTagOpen(lower, i)) return i
+            if (lower[i] == '<' && isTagOpen(lower, i, deadlineNs, checking)) return i
             i++
         }
         return -1
@@ -1660,22 +1730,27 @@ private object HtmlExtract {
      * comment（`<!--`…`-->`／EOF）與非候選 tag 之內部（含引號屬性值，
      * 單引號／雙引號）皆不產生候選；非候選 tag 以 [findTagEnd]（引號感知）
      * 整體跳過。無候選回 -1。每個 tag／comment 至多掃過一次，整體 O(n)。
-     * 每 512 個迭代檢查 deadline；逾時拋 [DeadlineExceededException]。
+     * 每 512 個迭代雙閘（checking 先、[deadlineNs] 後）；逾時拋
+     * [DeadlineExceededException]；呼叫方協程已取消時 [checking] 拋
+     * [kotlinx.coroutines.CancellationException]。
      */
-    private fun findTagStart(lower: String, from: Int, needle: String, deadlineNs: Long): Int {
+    private fun findTagStart(lower: String, from: Int, needle: String, deadlineNs: Long, checking: () -> Unit): Int {
         var cursor = maxOf(from, 0)
         var scanned = 0
         while (true) {
-            if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
-                throw DeadlineExceededException()
+            if (++scanned and 511 == 0) {
+                checking()
+                if (System.nanoTime() >= deadlineNs) {
+                    throw DeadlineExceededException()
+                }
             }
-            val p = nextTagStartInText(lower, cursor, deadlineNs)
+            val p = nextTagStartInText(lower, cursor, deadlineNs, checking)
             if (p < 0) return -1
             if (lower.startsWith(needle, p) && isTagNameBoundary(lower, p + needle.length)) {
                 return p
             }
             // 非候選 tag：引號感知整體跳過；未閉合 tag 之後不可能再有候選——收束至 EOF。
-            val end = findTagEnd(lower, p, deadlineNs)
+            val end = findTagEnd(lower, p, deadlineNs, checking)
             cursor = if (end < 0) lower.length else end + 1
         }
     }
@@ -1684,14 +1759,17 @@ private object HtmlExtract {
      * 取首個 text-context `<title>...</title>` 文本（case-insensitive；
      * tag-name 邊界檢查；comment／引號屬性值內之偽 `<title>` 不成候選）；
      * 開標籤以 [findTagEnd]（引號感知）取得收尾；任一環節缺失即回空字串
-     * （由上層回退 URL）。
+     * （由上層回退 URL）；`lower.indexOf("</title>")` 為原生掃描、不可 weave（線性、受 input cap 約束）。
+     * 入口與各子掃描雙閘（checking 先、[deadlineNs] 後）。
      */
-    fun titleOf(input: String, lower: String, deadlineNs: Long = Long.MAX_VALUE): String {
+    fun titleOf(input: String, lower: String, deadlineNs: Long = Long.MAX_VALUE, checking: () -> Unit = {}): String {
+        checking()
         if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
-        val tOpen = findTagStart(lower, 0, "<title", deadlineNs)
+        val tOpen = findTagStart(lower, 0, "<title", deadlineNs, checking)
         if (tOpen < 0) return ""
-        val openEnd = findTagEnd(lower, tOpen, deadlineNs)
+        val openEnd = findTagEnd(lower, tOpen, deadlineNs, checking)
         if (openEnd < 0) return "" // 未閉合開標籤：無 title
+        // indexOf 為原生掃描、不可 weave；線性且受 input cap 約束，接受此剩餘。
         val tClose = lower.indexOf("</title>", openEnd + 1)
         if (tClose < 0) return ""
         return input.substring(openEnd + 1, tClose)
@@ -1706,15 +1784,18 @@ private object HtmlExtract {
      * 的未閉合 comment——其內容一併原樣保留至輸入結尾）。
      * 以 StringBuilder 逐段拼接，不使用 backtracking regex。
      * 游標單調前進，總工作量 O(n)（每次外層迭代的兩個候選搜尋掃過的區段
-     * 不重疊，總計兩趟）。
+     * 不重疊，總計兩趟）。外層每趟雙閘（[checking] 先、[deadlineNs] 後）；
+     * 子掃描（[findTagStart]／[findTagEnd]）同樣雙閘。
+     * 內部 `lower.indexOf(closeMark)` 為原生掃描、不可 weave（線性、受 input cap 約束）。
      */
-    fun stripScriptAndStyle(input: String, lower: String, deadlineNs: Long = Long.MAX_VALUE): String {
+    fun stripScriptAndStyle(input: String, lower: String, deadlineNs: Long = Long.MAX_VALUE, checking: () -> Unit = {}): String {
         val sb = StringBuilder(input.length)
         var i = 0
         while (i < input.length) {
+            checking()
             if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
-            val scriptP = findTagStart(lower, i, "<script", deadlineNs)
-            val styleP = findTagStart(lower, i, "<style", deadlineNs)
+            val scriptP = findTagStart(lower, i, "<script", deadlineNs, checking)
+            val styleP = findTagStart(lower, i, "<style", deadlineNs, checking)
             val open: Int
             val tag: String
             if (scriptP < 0 && styleP < 0) {
@@ -1729,6 +1810,7 @@ private object HtmlExtract {
             }
             sb.append(input, i, open)
             val closeMark = "</$tag>"
+            // indexOf 為原生掃描、不可 weave；線性且受 input cap 約束，接受此剩餘。
             val close = lower.indexOf(closeMark, open)
             val end = if (close < 0) input.length else close + closeMark.length
             i = end
@@ -1757,8 +1839,9 @@ private object HtmlExtract {
     /**
      * 自 tag 起始處，抽取 `property|name`／`content`／`datetime` 屬性
      *（key 大小寫不敏感；值以單／雙引號或裸字元表示）。
+     * 各掃描迴圈每 512 code units 雙閘（checking 先、[deadlineNs] 後）。
      */
-    private fun parseTagAttrs(tag: String, deadlineNs: Long): MetaAttrs {
+    private fun parseTagAttrs(tag: String, deadlineNs: Long, checking: () -> Unit): MetaAttrs {
         var propertyName: String? = null
         var content: String? = null
         var datetime: String? = null
@@ -1767,14 +1850,20 @@ private object HtmlExtract {
         val n = tag.length
         // 跳過前導 `<meta`／`<time`。
         while (pos < n && !isAsciiWs(tag[pos]) && tag[pos] != '>') {
-            if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
-                throw DeadlineExceededException()
+            if (++scanned and 511 == 0) {
+                checking()
+                if (System.nanoTime() >= deadlineNs) {
+                    throw DeadlineExceededException()
+                }
             }
             pos++
         }
         while (pos < n) {
-            if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
-                throw DeadlineExceededException()
+            if (++scanned and 511 == 0) {
+                checking()
+                if (System.nanoTime() >= deadlineNs) {
+                    throw DeadlineExceededException()
+                }
             }
             val c = tag[pos]
             if (c == '>') break
@@ -1784,8 +1873,11 @@ private object HtmlExtract {
             }
             val nameStart = pos
             while (pos < n && isNameChar(tag[pos])) {
-                if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
-                    throw DeadlineExceededException()
+                if (++scanned and 511 == 0) {
+                    checking()
+                    if (System.nanoTime() >= deadlineNs) {
+                        throw DeadlineExceededException()
+                    }
                 }
                 pos++
             }
@@ -1796,16 +1888,22 @@ private object HtmlExtract {
             }
             val attrName = tag.substring(nameStart, pos).lowercase()
             while (pos < n && isAsciiWs(tag[pos])) {
-                if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
-                    throw DeadlineExceededException()
+                if (++scanned and 511 == 0) {
+                    checking()
+                    if (System.nanoTime() >= deadlineNs) {
+                        throw DeadlineExceededException()
+                    }
                 }
                 pos++
             }
             if (pos < n && tag[pos] == '=') {
                 pos++
                 while (pos < n && isAsciiWs(tag[pos])) {
-                    if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
-                        throw DeadlineExceededException()
+                    if (++scanned and 511 == 0) {
+                        checking()
+                        if (System.nanoTime() >= deadlineNs) {
+                            throw DeadlineExceededException()
+                        }
                     }
                     pos++
                 }
@@ -1814,8 +1912,11 @@ private object HtmlExtract {
                     pos++
                     val valStart = pos
                     while (pos < n && tag[pos] != quote) {
-                        if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
-                            throw DeadlineExceededException()
+                        if (++scanned and 511 == 0) {
+                            checking()
+                            if (System.nanoTime() >= deadlineNs) {
+                                throw DeadlineExceededException()
+                            }
                         }
                         pos++
                     }
@@ -1829,8 +1930,11 @@ private object HtmlExtract {
                 } else {
                     val valStart = pos
                     while (pos < n && !isAsciiWs(tag[pos]) && tag[pos] != '>') {
-                        if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
-                            throw DeadlineExceededException()
+                        if (++scanned and 511 == 0) {
+                            checking()
+                            if (System.nanoTime() >= deadlineNs) {
+                                throw DeadlineExceededException()
+                            }
                         }
                         pos++
                     }
@@ -1853,14 +1957,18 @@ private object HtmlExtract {
      * 無法找到即回 -1（未閉合 tag）；全文掃描 O(n)。
      * 本函式同時供 [nextTagStartInText] 之呼叫端消耗整個 tag（非候選 tag
      * 整體跳過），以及 titleOf／publishedOf 取得候選 tag 之收尾。
+     * 每 512 code units 雙閘（[checking] 先、[deadlineNs] 後）。
      */
-    private fun findTagEnd(lower: String, from: Int, deadlineNs: Long): Int {
+    private fun findTagEnd(lower: String, from: Int, deadlineNs: Long, checking: () -> Unit): Int {
         var inQuote: Char? = null
         var j = from
         var scanned = 0
         while (j < lower.length) {
-            if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
-                throw DeadlineExceededException()
+            if (++scanned and 511 == 0) {
+                checking()
+                if (System.nanoTime() >= deadlineNs) {
+                    throw DeadlineExceededException()
+                }
             }
             val c = lower[j]
             val q = inQuote
@@ -1898,24 +2006,27 @@ private object HtmlExtract {
      *
      * 對抗性 `<meta a` 鏈（無 `>`）：首個候選作廢（-1）後 break；
      * metaPublishedLinearFixture 對 44,800 字元 < 10 秒上限穩定通過。
+     *
+     * 入口、兩趟候選迴圈、fold 與子掃描皆雙閘（[checking] 先、[deadlineNs] 後）；
+     * `unescapeHtml` 之 regex 替換不可 weave（線性、受 input cap 約束）。
      */
-    fun publishedOf(html: String, deadlineNs: Long = Long.MAX_VALUE): String? {
+    fun publishedOf(html: String, deadlineNs: Long = Long.MAX_VALUE, checking: () -> Unit = {}): String? {
+        checking()
         if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
         // ASCII 摺疊（長度不變）：所有 needle 皆 ASCII。
-        val lower = buildString(html.length) {
-            for (c in html) append(if (c in 'A'..'Z') c + 32 else c)
-        }
+        val lower = foldAsciiLower(html, deadlineNs, checking)
         var cursor = 0
         while (true) {
+            checking()
             if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
-            val p = findTagStart(lower, cursor, "<meta", deadlineNs)
+            val p = findTagStart(lower, cursor, "<meta", deadlineNs, checking)
             if (p < 0) break
-            val tagEnd = findTagEnd(lower, p, deadlineNs)
+            val tagEnd = findTagEnd(lower, p, deadlineNs, checking)
             if (tagEnd < 0) {
                 // 未閉合 meta tag：前向證明此後不存在 `>`，之後所有候選皆不可閉合 → break。
                 break
             }
-            val attrs = parseTagAttrs(html.substring(p, tagEnd + 1), deadlineNs)
+            val attrs = parseTagAttrs(html.substring(p, tagEnd + 1), deadlineNs, checking)
             val name = attrs.propertyName?.lowercase()
             if (name != null && name in PUBLISHED_ALIASES && !attrs.content.isNullOrBlank()) {
                 return unescapeHtml(attrs.content)
@@ -1924,15 +2035,16 @@ private object HtmlExtract {
         }
         cursor = 0
         while (true) {
+            checking()
             if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
-            val p = findTagStart(lower, cursor, "<time", deadlineNs)
+            val p = findTagStart(lower, cursor, "<time", deadlineNs, checking)
             if (p < 0) break
-            val tagEnd = findTagEnd(lower, p, deadlineNs)
+            val tagEnd = findTagEnd(lower, p, deadlineNs, checking)
             if (tagEnd < 0) {
                 // 未閉合 time tag：前向證明此後不存在 `>`，之後所有候選皆不可閉合 → break。
                 break
             }
-            val attrs = parseTagAttrs(html.substring(p, tagEnd + 1), deadlineNs)
+            val attrs = parseTagAttrs(html.substring(p, tagEnd + 1), deadlineNs, checking)
             if (!attrs.datetime.isNullOrBlank()) {
                 return unescapeHtml(attrs.datetime)
             }
@@ -1941,11 +2053,13 @@ private object HtmlExtract {
         return null
     }
 
-    /** 線性去 tag（無 regex）：`<` 至下一個 `>`（含）視為一個 tag，輸出單一空白；若無 `>` 則捨棄其餘字串。 */
-    private fun stripTags(html: String, deadlineNs: Long = Long.MAX_VALUE): String {
+    /** 線性去 tag（無 regex）：`<` 至下一個 `>`（含）視為一個 tag，輸出單一空白；若無 `>` 則捨棄其餘字串。
+     *  每輪雙閘（[checking] 先、[deadlineNs] 後）；內部 `indexOf('<'／'>')` 為原生掃描、不可 weave（線性、受 input cap 約束）。 */
+    private fun stripTags(html: String, deadlineNs: Long = Long.MAX_VALUE, checking: () -> Unit = {}): String {
         val sb = StringBuilder(html.length)
         var i = 0
         while (i < html.length) {
+            checking()
             if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
             val lt = html.indexOf('<', i)
             if (lt < 0) {
@@ -1961,12 +2075,21 @@ private object HtmlExtract {
         return sb.toString()
     }
 
-    fun stripText(html: String, deadlineNs: Long = Long.MAX_VALUE): String =
-        unescapeHtml(stripTags(html, deadlineNs)).let { Spaces.replace(it, " ").trim() }
+    /**
+     * 去 tag＋unescape＋收斂空白。兩段入口雙閘由下游承擔（stripTags 每輪、[checking] 透傳）；
+     * `unescapeHtml` 之 regex 替換與 [Spaces] Regex 替換皆不可 weave（線性、受 input cap 約束）。
+     */
+    fun stripText(html: String, deadlineNs: Long = Long.MAX_VALUE, checking: () -> Unit = {}): String =
+        unescapeHtml(stripTags(html, deadlineNs, checking)).let { Spaces.replace(it, " ").trim() }
 
     private fun decodeCodePoint(cp: Int?): String? =
         if (cp != null && cp in 0..0x10FFFF && (cp < 0xD800 || cp > 0xDFFF)) String(Character.toChars(cp)) else null
 
+    /**
+     * entity unescape：`String.replace`／Regex（NUMERIC_ENTITY／HEX_ENTITY）全為線性操作且不可 weave
+     * （regex／native 無逐步插入點），受 input cap 約束，接受此剩餘；呼叫方之 deadline／checking
+     * 仍於進入本函式前與後續工作點生效。
+     */
     fun unescapeHtml(raw: String): String {
         var s = raw
             .replace("&lt;", "<")

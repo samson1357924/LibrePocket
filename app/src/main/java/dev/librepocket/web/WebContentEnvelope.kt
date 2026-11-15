@@ -29,10 +29,14 @@ import java.text.Normalizer
  *   字元，其後之 nfkc 至多合併／重排，長度不增、碼點數不增）；自第二輪
  *   起每一輪或達不動點、或碼點數嚴格下降，刪除輪次數以首輪正規化後
  *   長度為上界，故必於有限輪內收斂（最壞 O(n²) 輪數上界）。
- * - 所有迴圈受呼叫方傳入的 `deadlineNs` 約束（預設 `Long.MAX_VALUE`，
- *   語義與先前版本完全一致）：逾時即拋 [DeadlineExceededException]
- *  （WebExtract.kt 定義；與 CancellationException 區分）。工作由呼叫方的
- *   解析預算（全程 deadline）有界化；迭代仍為契約上正確的定點。
+ * - 所有迴圈受呼叫方傳入的 `deadlineNs` **與** `checking` 探針雙約束
+ *   （預設 `Long.MAX_VALUE`／`{}`，語義與先前版本完全一致）：deadline 到期即拋
+ *   [DeadlineExceededException]（WebExtract.kt 定義；與 CancellationException 區分）；
+ *   `checking`（協程活性探針，通常為 `ensureActive()`）於相同檢查點呼叫，
+ *   呼叫方之協程已取消時拋 [kotlinx.coroutines.CancellationException]。
+ *   工作由呼叫方的解析預算（全程 deadline）＋協程活性雙閘化；迭代仍為契約上正確的定點。
+ *   注意：`stripForgedMarkers` 內之 Regex 替換與 `Normalizer.normalize` 不織入檢查
+ *   （regex／ICU 無逐步插入點，線性且受 input cap 約束，刻意不 weave）。
  * - [wrap] 之輸出形狀為 `BEGIN + "\n" + cleaned + "\n" + END`，不因輸入而變；
  *   語義僅輸出本體內容變化。
  */
@@ -50,8 +54,13 @@ object WebContentEnvelope {
      * 剝除為大小寫不敏感：sentinel marker 皆為 ASCII，任何大小寫變體不得
      * 存活進模型可見體；本函式通常於 [cleanField] 之 NFKC 摺疊之後執行，
      * 兼容性（compatibility）相似字（fullwidth／small-form 等）已被摺為 ASCII。
+     *
+     * 進入時先檢查 deadline／[checking]（雙閘，與其他工作點同一約束）；
+     * 內部之 `BEGIN_CI`／`END_CI` Regex 替換不可 weave（regex 無逐步插入點），
+     * 其工作量線性且受輸入長度（input cap）約束，接受此剩餘。
      */
-    fun stripForgedMarkers(text: String, deadlineNs: Long = Long.MAX_VALUE): String {
+    fun stripForgedMarkers(text: String, deadlineNs: Long = Long.MAX_VALUE, checking: () -> Unit = {}): String {
+        checking()
         if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
         if (text.isEmpty()) return text
         return END_CI.replace(BEGIN_CI.replace(text, ""), "")
@@ -73,18 +82,23 @@ object WebContentEnvelope {
      * 收束，由外層迭代至定點吸收；
      * NFKC 摺疊僅施用於此處；parseHtml／entity unescape 不做 NFKC。
      *
-     * 工作受 `deadlineNs` 約束（預設 `Long.MAX_VALUE`，語義不變）：外層每輪、
-     * 以及 [sanitize] 內每 512 個 codepoint 檢查 deadline；逾時拋
-     * [DeadlineExceededException]（與 CancellationException 區分，呼叫方映射
-     * `Failed(TIMEOUT)`）。逾時即中止，不回傳部分清理結果。
+     * 工作受 `deadlineNs` **與** `checking` 雙約束（預設 `Long.MAX_VALUE`／`{}`，
+     * 語義與先前版本一致）：外層每輪先呼叫 [checking] 再檢查 [deadlineNs]、
+     * 以及 [sanitize] 內每 512 個 codepoint 雙閘；逾時拋
+     * [DeadlineExceededException]；呼叫方協程已取消時由 [checking] 拋
+     * [kotlinx.coroutines.CancellationException]——兩者皆原樣上拋
+     * （CancellationException 不映射、不吞沒）。逾時／取消即中止，不回傳部分清理結果。
+     * 注意：`Normalizer.normalize`（ICU）本身不可 weave，其工作量受輸入長度約束，接受此剩餘。
      */
-    fun cleanField(text: String, deadlineNs: Long = Long.MAX_VALUE): String {
+    fun cleanField(text: String, deadlineNs: Long = Long.MAX_VALUE, checking: () -> Unit = {}): String {
         var s = text
         while (true) {
+            checking()
             if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
             val next = sanitize(
-                stripForgedMarkers(Normalizer.normalize(s, Normalizer.Form.NFKC), deadlineNs),
+                stripForgedMarkers(Normalizer.normalize(s, Normalizer.Form.NFKC), deadlineNs, checking),
                 deadlineNs,
+                checking,
             )
             if (next == s) return next
             s = next
@@ -100,16 +114,23 @@ object WebContentEnvelope {
      * 注意：`\n`／`\t`（Cc）保留；其餘 Cc（ESC／BEL／DEL／C1 含 U+0085 NEL
      * 等）一律移除，不進模型可見體；U+2028／U+2029 非 Cc 且明列於
      * [EXTRA_STRIP]，亦會被移除（換行語義以 `\n` 表示）。
+     *
+     * 每 512 個 codepoint 同點雙閘：先呼叫 [checking]（呼叫方協程已取消 →
+     * [kotlinx.coroutines.CancellationException] 原樣上拋），再檢查 [deadlineNs]
+     * （逾時 → [DeadlineExceededException]）。
      */
-    fun sanitize(text: String, deadlineNs: Long = Long.MAX_VALUE): String {
+    fun sanitize(text: String, deadlineNs: Long = Long.MAX_VALUE, checking: () -> Unit = {}): String {
         if (text.isEmpty()) return text
         val sb = StringBuilder(text.length)
         var i = 0
         var units = 0
         while (i < text.length) {
-            // 每 512 個 codepoint 檢查一次 deadline（避免逐 char 的時鐘讀取開銷）。
-            if (++units and 511 == 0 && System.nanoTime() >= deadlineNs) {
-                throw DeadlineExceededException()
+            // 每 512 個 codepoint 雙閘一次（避免逐 char 的時鐘讀取開銷）。
+            if (++units and 511 == 0) {
+                checking()
+                if (System.nanoTime() >= deadlineNs) {
+                    throw DeadlineExceededException()
+                }
             }
             val cp = text.codePointAt(i)
             val type = Character.getType(cp)
@@ -135,14 +156,16 @@ object WebContentEnvelope {
 
     /**
      * 先以 [cleanField] 定點處理（NFKC＋sanitize＋剝偽造 marker）、
-     * 最後包一層。工作受 `deadlineNs` 約束（預設 `Long.MAX_VALUE`，語義不變）：
-     * 逾時拋 [DeadlineExceededException]（不回傳部分結果）。
+     * 最後包一層。工作受 `deadlineNs` **與** `checking` 雙約束
+     * （預設 `Long.MAX_VALUE`／`{}`，語義與先前版本一致）：
+     * 逾時拋 [DeadlineExceededException]；呼叫方協程已取消時由 `checking` 拋
+     * [kotlinx.coroutines.CancellationException]——兩者皆不回傳部分結果。
      *
      * 輸出形狀：`BEGIN + "\n" + cleaned + "\n" + END`，恰含一組 marker；
      * 輸入內容無論為何（含偽造 marker／bidi）皆 fail-closed 為單層乾淨 envelope。
      */
-    fun wrap(raw: String, deadlineNs: Long = Long.MAX_VALUE): String {
-        val cleaned = cleanField(raw, deadlineNs)
+    fun wrap(raw: String, deadlineNs: Long = Long.MAX_VALUE, checking: () -> Unit = {}): String {
+        val cleaned = cleanField(raw, deadlineNs, checking)
         return "$BEGIN\n$cleaned\n$END"
     }
 

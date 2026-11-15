@@ -2573,7 +2573,7 @@ internal object ElevatedProcessIo {
          * 嘗試一次、worker 不受准入看見）即 true。
          * Stage 3（drain/verdict hardening）：起線程失敗臂／acquire 拋臂亦置 true
          * （admitted residual surfacing——兩臂 killer 皆未信號、無 worker）。
-         * acquire 拋臂（nothing acquired ⇒ slotHeldOut=false，helper 不釋槽亦不登記）：
+         * acquire 拋臂（nothing acquired ⇒ slotHeldOut=false，helper 不釋槽（slotHeld=false）——verified==false 時仍再嘗試登記，兩次登記皆拋方無任何追蹤接管）：
          * quarantine 以 best-effort 二次登記另行涵蓋——僅 acquire 拋臂在雙登記皆拋時方無
          * 任何追蹤接管；起線程失敗臂登記拋出則槽經 caller verify 臂保留（helper 登記拋出
          * 不釋槽），handle 不入 quarantine，但 outstanding 追蹤持續至 app 重啟，admission 續拒；
@@ -3693,7 +3693,7 @@ internal object ElevatedProcessIo {
      * Stage 3（drain/verdict hardening）：Drained 歸因不再只反映飽和——起線程失敗臂
      * 及 acquire 拋臂（acquireSlotOrQuarantine 本身 throw，如 VME）同置 `untrackedOut`
      * （admitted residual surfacing：兩臂 killer 皆未信號／無 worker。acquire 拋臂
-     * （nothing acquired ⇒ slotHeldOut=false，helper 不釋槽亦不登記）quarantine 以
+     * （nothing acquired ⇒ slotHeldOut=false，helper 不釋槽（slotHeld=false）——verified==false 時仍再嘗試登記，兩次登記皆拋方無任何追蹤接管）quarantine 以
      * best-effort 二次登記另行涵蓋——僅 acquire 拋臂在雙登記皆拋時方無任何追蹤接管；
      * 起線程失敗臂登記拋出則槽經 caller verify 臂保留（helper 登記拋出不釋槽），
      * handle 不入 quarantine，但 outstanding 追蹤持續至 app 重啟，admission 續拒

@@ -21,6 +21,11 @@ import kotlinx.coroutines.CancellationException
  * [ShellExecTool.executeElevated]；門禁未過一律不建子進程，且同樣寫一筆
  * DENY 審計（除 CancellationException／Error 外恰一筆；CE 重拋零審計、
  * require 誤用 fail-fast）。
+ *
+ * [execute]（legacy 直通閘）為 `internal`——與 [executeWithFrozen] 同級，
+ * 產品源集零調用（pin 見 `ElevatedSoleEntryTest.legacyElevatedDispatchExecuteZeroAllowance`）；
+ * 門禁僅驗 tool／projection／confirmed／reason，不重驗 policy／bridge／grant，
+ * 產品路徑一律改走 [dev.librepocket.router.ElevatedWiring].execute。
  */
 object ElevatedDispatch {
 
@@ -62,7 +67,7 @@ object ElevatedDispatch {
      * @param projection 投影（`privilege_bridge` 未開即 UNAVAILABLE，先擋）。
      * @param request 提權請求（含 reasonCode，門禁與審計共用同一份凍結）。
      */
-    fun execute(
+    internal fun execute(
         tool: ToolDef,
         confirmed: Boolean,
         projection: Projection,
@@ -137,7 +142,8 @@ object ElevatedDispatch {
      * PRECONDITION (defense-in-depth): caller MUST have completed tool/confirmation/projection/
      * policy/bridge/grant checks and post-confirm reverify on the same immutable snapshot.
      * Do not call with unverified or stale requests; misuse inside module can bypass gates.
-     * sole-entry 由 `ElevatedSoleEntryTest`（main 源集 token 掃描）釘死，除 `ElevatedDispatch.kt`（宣明檔）外，main 源集出現 `executeWithFrozen(` 呼叫即 fail。
+     * sole-entry 由 `ElevatedSoleEntryTest`（產品源集 main＋foss＋play＋github、
+     * 註解／字串剝離後的 token 掃描，best-effort tripwire）攔截，除 `ElevatedDispatch.kt`（宣明檔）外，產品源集出現 `executeWithFrozen(` 呼叫即 fail。
      */
     internal fun executeWithFrozen(
         tool: ToolDef,

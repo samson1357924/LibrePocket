@@ -1032,6 +1032,62 @@ class ElevatedWiringTest {
         }
     }
 
+    @Test fun nonCooperativeSupplierDoesNotPoisonSharedWorkers() = runBlocking {
+        // pin（T2-5，誠實範圍）：ctxSupplier 忽略 interrupt、spin 超過 supplier 預算被拒
+        // （有界 wall-clock、零 spawn、恰一筆 DENY）；其後 cooperative call 完成 Ok——
+        // 證明非協作區塊殘留期間，後續 execute 無需等待該區塊退出、pool／IO worker 仍能服務。
+        // **不釘** `clearSharedWorkerInterruptFlag()` 本身：interrupt flag 是 Dispatchers.IO
+        // 共享 worker 的 thread-local，caller（test 線程）無從觀察；該 helper 的保證由
+        // finally 位置＋helper KDoc 提供，且殘旗後果僅影響下一個共享 worker 任務——
+        // 本測試以「後續 call 完成」作為間接、非決定性觀測。釘死 helper 需內部可見性，不值得。
+        val stop = AtomicBoolean(false)
+        val runner1 = SpawnCounter()
+        val audit1 = PrivilegeAuditLog()
+        try {
+            val start = System.currentTimeMillis()
+            val r1 = ElevatedWiring.execute(
+                argv = listOf("id"),
+                reasonCode = "B3-T",
+                confirmed = true,
+                ctxSupplier = {
+                    val end = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+                    // 非協作：吞掉 interrupt（pool cancel(true)），只認 stop 旗標。
+                    while (!stop.get() && System.nanoTime() < end) { /* spin, ignore interrupt */ }
+                    elevatedCtx()
+                },
+                policyStore = allowPolicy(),
+                runner = runner1,
+                audit = audit1,
+                grantCheck = { validGrant() },
+                bridgeGranted = { true },
+            )
+            val elapsed = System.currentTimeMillis() - start
+            assertTrue("$r1", r1 is ShellResult.Denied)
+            assertTrue("caller must be bounded, elapsed=${elapsed}ms", elapsed < 2_000)
+            assertEquals(0, runner1.calls)
+            assertTrue("audit must have records", audit1.size() >= 1)
+            assertEquals(mapOf("DENY" to 1), audit1.countByVerdict())
+        } finally {
+            stop.set(true)
+        }
+        // 後續 cooperative call：無需等待殘留區塊退出即可完成。
+        val runner2 = SpawnCounter()
+        val audit2 = PrivilegeAuditLog()
+        val r2 = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner2,
+            audit = audit2,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("subsequent call must complete Ok (shared workers not poisoned): $r2", r2 is ShellResult.Ok)
+        assertEquals(1, runner2.calls)
+    }
+
     @Test fun nonCooperativeGrantCheckFailsClosedBounded() = runBlocking {
         // 非協作 grantCheck（忽略 interrupt 的 spin）：caller 恆有界（< 2s；實作上界 ~1.2s）；一筆 DENY、零 spawn。
         val stop = AtomicBoolean(false)

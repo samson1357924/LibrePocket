@@ -163,12 +163,8 @@ object ElevatedWiring {
                 try {
                     boundedSupplierCall(block, SUPPLIER_TIMEOUT_MS)
                 } finally {
-                    // 清除池 worker（Dispatchers.IO 共享線程）上可能殘留的 interrupt flag：
-                    // 殘旗會污染下一個共用 worker 任務（github runner `isInterrupted` 契約可能被誤觸）。
-                    // 註：會一併清除外層 runInterruptible 的中斷信號——該次取消退化為 fail-closed
-                    // Denied（零 spawn、一筆 DENY）；coroutine 取消仍於下一掛起點由 job 生效。
-                    // 不改 boundedSupplierCall 本身的復位邏輯（caller-owned 線程語義保留）。
-                    Thread.interrupted()
+                    // 清共享 Dispatchers.IO worker 上可能殘留的 interrupt flag（見 helper KDoc）。
+                    clearSharedWorkerInterruptFlag()
                 }
             }
         } catch (e: CancellationException) {
@@ -176,6 +172,20 @@ object ElevatedWiring {
         } catch (_: Throwable) {
             null
         }
+    }
+
+    /**
+     * 清除共享 Dispatchers.IO worker 上的 interrupt flag（[Thread.interrupted]）。
+     *
+     * - 清旗對象是 Dispatchers.IO 共享線程：防殘旗污染下一個共用 worker 任務
+     *   （例如 github runner `isInterrupted` 契約可能被誤觸）；
+     * - 會一併清除外層 runInterruptible 的中斷信號——該次取消退化為
+     *   fail-closed Denied（零 spawn、一筆 DENY），coroutine 取消仍於下一掛起點由 job 生效
+     *   （語義不變）；
+     * - [boundedSupplierCall] 保持其 caller-owned 復位邏輯，本 helper 不取代之。
+     */
+    private fun clearSharedWorkerInterruptFlag() {
+        Thread.interrupted()
     }
 
     /** Bounded projection context fetch (F4). */
@@ -204,10 +214,8 @@ object ElevatedWiring {
             try {
                 boundedSupplierCall({ doFreeze(ctx) })
             } finally {
-                // 清除池 worker（Dispatchers.IO 共享線程）上可能殘留的 interrupt flag：
-                // 殘旗會污染下一個共用 worker 任務（github runner `isInterrupted` 契約可能被誤觸）。
-                // 同 evalBounded：會一併清除外層 runInterruptible 中斷信號（退化為 fail-closed Denied）。
-                Thread.interrupted()
+                // 清共享 Dispatchers.IO worker 上可能殘留的 interrupt flag（見 helper KDoc）。
+                clearSharedWorkerInterruptFlag()
             }
         }
     } catch (e: CancellationException) {

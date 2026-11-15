@@ -219,14 +219,22 @@ class FastDispatchTest {
         val backend = CountingBackend()
         val phoneFake = CountingFake("phone.dial")
         val dispatcher = lspDispatcher(backend, mapOf("phone.dial" to phoneFake))
-        for (text in listOf(
+        // #19 B3 stage-1: symbol 否定前置句（starts with 不/別/没）不再滿足
+        // symbol 前閘的命令式准入（start-anchored opener 不命中）⇒ 落入 RULES
+        // 無命中 ⇒ no-match DENIED（reasonCode null）；其餘 keyword 探針仍照常
+        // 綁模板 + 否定閘轉 NEED_CLARIFICATION。兩群組皆為 DENIED、toolCall null、
+        // dispatch Skipped、後端零呼叫——絕不執行。
+        val clarifyTexts = listOf(
+            "不要打電話給 0912345678",
+            "別設鬧鐘，明天早上7點叫我",
+        )
+        val noMatchTexts = listOf(
             "不要查 Foo 這個符號",
             "別查 Foo 這個符號",
             "别查 Foo 符號",
             "不用幫我查符號",
-            "不要打電話給 0912345678",
-            "別設鬧鐘，明天早上7點叫我",
-        )) {
+        )
+        for (text in clarifyTexts) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
             assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
@@ -235,18 +243,28 @@ class FastDispatchTest {
             val skipped = skippedOf(out, text)
             assertEquals(text, DenyReason.NEED_CLARIFICATION, skipped.reasonCode)
         }
+        for (text in noMatchTexts) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertNull(text, d.reasonCode)
+            assertNull(text, d.toolCall)
+            val out = dispatcher.dispatch(d, lspOn)
+            val skipped = skippedOf(out, text)
+            assertNull(text, skipped.reasonCode)
+        }
         assertEquals(0, backend.invocations.get())
         assertEquals("clarification path must not execute even with an executor registered", 0, phoneFake.invocations.get())
     }
 
     @Test fun negatedSymbolLookupVariantsNeverExecute() = runBlocking {
-        // 繁簡對稱 `不/別/沒`×動詞 否定符號查詢意圖：一律 DENIED +
-        // NEED_CLARIFICATION、toolCall == null；dispatch 亦必須 Skipped、
-        // 後端零呼叫（不得走 FAST 執行）。
+        // 繁簡對稱 `不/別/沒`×動詞 否定符號查詢意圖：一律 DENIED、toolCall == null；
+        // dispatch 亦必須 Skipped、後端零呼叫（不得走 FAST 執行）。
         val backend = CountingBackend()
         val dispatcher = lspDispatcher(backend)
-        // A2 note: lookup markers are 繁簡對稱（查|找|尋|搜|詢|寻|询…）；
-        // 所有 symbol 否定探針皆帶 marker ⇒ NEED_CLARIFICATION。
+        // #19 B3 stage-1: symbol 否定前置句皆不滿足命令式准入（start-anchored
+        // opener 不命中）⇒ 落入 RULES 無命中 ⇒ no-match DENIED（reasonCode null）——
+        // DENIED、toolCall null、後端零呼叫，絕不執行。其中與 keyword 規則相關者
+        // 才會命中 RULES（見 otherTexts）。
         // （`問`/`設` 等非 lookup 動詞的陰性探針見 mixedScriptNegationNeverExecutes。）
         val symbolTexts = listOf(
             "不查 Foo 這個符號",
@@ -272,7 +290,8 @@ class FastDispatchTest {
         for (text in symbolTexts) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
-            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            // #19 B3 stage-1: 不再澄清（no-match DENIED，reasonCode null）。
+            assertNull(text, d.reasonCode)
             assertNull(text, d.toolCall)
         }
         for (text in otherTexts) {
@@ -427,17 +446,16 @@ class FastDispatchTest {
 
     @Test fun letterNumberSplittersStillDeny() = runBlocking {
         // Ⅱ（U+2161，ROMAN NUMERAL TWO，Nl 字母數字）作為否定詞拆分器：
-        // 此字 NFKC 折疊為 ASCII `II`，removed pass 以 [A-Za-z0-9]+ 分支剝離，
-        // `別Ⅱ查` 接合回 `別查` ⇒ 模板成立後否定閘轉 NEED_CLARIFICATION。
-        // （NFKC-stable Nl 如 U+2180，則由 \p{Nl}+ 分支剝離。）
-        // 絕不 FAST、絕不進 executor、後端零呼叫。
+        // #19 B3 stage-1: `別Ⅱ查…` 非命令式句首 ⇒ 不進 symbol 模板 ⇒
+        // no-match DENIED（reasonCode null）——仍 DENIED、絕不執行、後端零呼叫。
+        // （否定閘僅作用於模板成立後——命令式句首帶否定顆粒者才會轉 NEED_CLARIFICATION。）
         val backend = CountingBackend()
         val dispatcher = lspDispatcher(backend)
         val text = "別Ⅱ查 Foo 符號"
         val d = decide(text)
         assertEquals(RouteKind.DENIED, d.route)
-        assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
-        assertNull(d.toolCall)
+        assertNull(text, d.reasonCode)
+        assertNull(text, d.toolCall)
         skippedOf(dispatcher.dispatch(d, lspOn), text)
         assertEquals(0, backend.invocations.get())
     }
@@ -445,12 +463,12 @@ class FastDispatchTest {
     @Test fun negatedSymbolVerbsNeverExecuteForDispatch() = runBlocking {
         // 代表性否定符號意圖（含 別問/别問）走 decide → dispatch，並註冊 executor：
         // 全部 Skipped、後端零呼叫。
-        // A2 note: `別問`/`别问` carry no lookup marker (問 is not one), so the
-        // symbol template no-matches (reasonCode null) instead of clarifying —
-        // still DENIED, never FAST, zero backend invocations. The `查/搜`
-        // probes keep the clarification reason via the negation gate.
         val backend = CountingBackend()
         val dispatcher = lspDispatcher(backend)
+        // #19 B3 stage-1: symbol 否定前置句皆不滿足命令式准入（start-anchored
+        // opener 不命中）⇒ 兩群組皆 no-match DENIED（reasonCode null）而非澄清。
+        // （含否定顆粒的命令式句首，例 `查 Foo 符號 不要`，仍會命中模板後閘轉
+        // NEED_CLARIFICATION——見 commandFormWithNegationClarifies。）
         val markerProbes = listOf(
             "不查 Foo 這個符號",
             "別搜 Foo 符號",
@@ -464,7 +482,8 @@ class FastDispatchTest {
         for (text in markerProbes) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
-            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            // #19 B3 stage-1: 非命令式句首 ⇒ no-match DENIED（reasonCode null）。
+            assertNull(text, d.reasonCode)
             assertNull(text, d.toolCall)
             skippedOf(dispatcher.dispatch(d, lspOn), text)
         }
@@ -621,9 +640,17 @@ class FastDispatchTest {
         for ((text, tool) in probes) {
             val d = decide(text, lspOnCalendarGranted)
             assertEquals(text, RouteKind.DENIED, d.route)
-            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            // #19 B3 stage-1: `不要查…` 非命令式句首 ⇒ 不進 symbol 模板 ⇒
+            // no-match DENIED（reasonCode null、header toolName 不綁 lsp.symbols）；
+            // 其餘 keyword 模板探針仍照常綁模板 + 否定閘轉 NEED_CLARIFICATION。
+            if (tool == "lsp.symbols") {
+                assertNull(text, d.reasonCode)
+                assertNull(text, d.header.toolName)
+            } else {
+                assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+                assertEquals(text, tool, d.header.toolName)
+            }
             assertNull(text, d.toolCall)
-            assertEquals(text, tool, d.header.toolName)
         }
         // Second pass (decision → dispatch): register a backend-independent
         // fake executor for every templated tool and dispatch the same
@@ -645,13 +672,18 @@ class FastDispatchTest {
         }
     }
 
-    @Test fun bareBieVerbClarifiesForSymbolLookup() {
+    @Test fun bareBieVerbSymbolQueriesNoMatch() {
+        // #19 B3 stage-1: `別查…`/`别查…` 非命令式句首 ⇒ 不進 symbol 模板 ⇒
+        // no-match DENIED（reasonCode null、header toolName 不綁 lsp.symbols）——
+        // DENIED、toolCall null、後端零呼叫，絕不執行。
+        // （舊行為：marker 命中模板後否定閘轉 NEED_CLARIFICATION——本 stage 之
+        // affirmative-command 准入取代之，pinned per #19 B3 stage-1。）
         for (text in listOf("別查 Foo 這個符號", "别查 Foo 符號")) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
-            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.reasonCode)
             assertNull(text, d.toolCall)
-            assertEquals(text, "lsp.symbols", d.header.toolName)
+            assertNull(text, d.header.toolName)
         }
     }
 
@@ -731,9 +763,11 @@ class FastDispatchTest {
     }
 
     @Test fun separatorSplitNegationNeverExecutes() = runBlocking {
-        // Negation hints split by whitespace / punctuation / Cf format chars
-        // (zero-width space, variation selectors) must still clarify, never
-        // execute — isNegated() re-checks on separator/Cf-normalized text.
+        // #19 B3 stage-1: symbol 否定前置探針皆非命令式句首（start-anchored opener
+        // 不命中）⇒ 不進 symbol 模板 ⇒ no-match DENIED（reasonCode null）——
+        // DENIED、toolCall null、dispatch Skipped、後端零呼叫，絕不執行。
+        // isNegated() 僅作用於模板成立後——命令式句首帶否定顆粒者才會轉
+        // NEED_CLARIFICATION（見 commandFormWithNegationClarifies）。
         val backend = CountingBackend()
         val dispatcher = lspDispatcher(backend)
         for (text in listOf(
@@ -762,20 +796,20 @@ class FastDispatchTest {
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
-            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            // #19 B3 stage-1: 非命令式句首 ⇒ no-match DENIED（reasonCode null）。
+            assertNull(text, d.reasonCode)
             assertNull(text, d.toolCall)
             skippedOf(dispatcher.dispatch(d, lspOn), text)
         }
-        // A2: English negations carrying no lookup marker (find/search/lookup/
-        // locate) no-match at the template stage (reasonCode null), not
-        // clarification — still DENIED, never FAST. (`never find symbol
-        // Foo` DOES clarify — it carries `find` — covered by
-        // englishNegationNeverExecutes.)
+        // English negations with no affirmative-command opener likewise no-match
+        // at the template stage (reasonCode null), not clarification — still
+        // DENIED, never FAST. (`never find symbol Foo` — stage-1: non-command
+        // opener, also no-match — covered by englishNegationNeverExecutes.)
         for (text in listOf(
             "not symbols",
             "NOT SYMBOLS",
             "no symbols",
-            "ｎｅｖｅｒ symbols",     // fullwidth never + ASCII symbols: hint matches, intent does not (A2)
+            "ｎｅｖｅｒ symbols",     // fullwidth never + ASCII symbols: hint matches, no affirmative command opener (stage-1)
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
@@ -789,7 +823,7 @@ class FastDispatchTest {
     @Test fun visibleSplittersStillDeny() = runBlocking {
         // ASCII-alphanumeric / symbol in-run splitters (visible chars, not
         // separators): NFKC + the removed pass strip them, rejoining the
-        // negation hint — DENIED + NEED_CLARIFICATION, never FAST.
+        // negation hint — DENIED + no-match（stage-1，非命令式句首），never FAST.
         // （`不一查` 類以可見 CJK 字母/數字夾在否定詞 run 中的情形為 NOT closed
         // 殘餘，刻意不在此釘住——見 FastRouter KDoc。）
         val backend = CountingBackend()
@@ -802,7 +836,8 @@ class FastDispatchTest {
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
-            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            // #19 B3 stage-1: 非命令式句首 ⇒ no-match DENIED（reasonCode null）。
+            assertNull(text, d.reasonCode)
             assertNull(text, d.toolCall)
             skippedOf(dispatcher.dispatch(d, lspOn), text)
         }
@@ -812,8 +847,9 @@ class FastDispatchTest {
     @Test fun modifierAndDigitSplittersStillDeny() = runBlocking {
         // Lm modifier letters（ˇ U+02C7／ˉ U+02C9／ـ U+0640／々 U+3005）與非 ASCII
         // digit（¹ U+00B9 No；U+09E8 Bengali digit two Nd——稽核所指碼位；U+0662
-        // Arabic-Indic digit two Nd——稽核逐字字元）in-run 拆開否定詞：removed pass
-        // 剝離後接合回連續 hint ⇒ DENIED + NEED_CLARIFICATION + backend 零呼叫。
+        // Arabic-Indic digit two Nd——稽核逐字字元）in-run 拆開否定詞：
+        // #19 B3 stage-1: 皆非命令式句首 ⇒ 不進 symbol 模板 ⇒ no-match DENIED
+        // （reasonCode null）+ backend 零呼叫。
         val backend = CountingBackend()
         val dispatcher = lspDispatcher(backend)
         for (text in listOf(
@@ -828,7 +864,8 @@ class FastDispatchTest {
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
-            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            // #19 B3 stage-1: 非命令式句首 ⇒ no-match DENIED（reasonCode null）。
+            assertNull(text, d.reasonCode)
             assertNull(text, d.toolCall)
             skippedOf(dispatcher.dispatch(d, lspOn), text)
         }
@@ -837,13 +874,12 @@ class FastDispatchTest {
 
     @Test fun mixedScriptNegationNeverExecutes() = runBlocking {
         // 繁簡交叉混排否定詞（traditional prefix × simplified verb and vice
-        // versa）：一律 DENIED + 絕不執行 + backend 0。A2 後依是否有 lookup
-        // marker 分流——marker 有則 NEED_CLARIFICATION，無則 no-match。
+        // versa）：一律 DENIED + 絕不執行 + backend 0。#19 B3 stage-1: 全部探針
+        // 皆非命令式句首（start-anchored opener 不命中）⇒ no-match DENIED
+        // （reasonCode null）——皆為 DENIED、絕不執行。
         val backend = CountingBackend()
         val dispatcher = lspDispatcher(backend)
-        // 尋/寻/詢/询 皆為 lookup marker（繁簡對稱）⇒ 模板成立 ⇒ 否定閘轉澄清。
-        // 問/設/調/導/發/寫 非 lookup marker ⇒ A2 起模板不成立 ⇒ no-match
-        // DENIED（reasonCode null）。皆為 DENIED、絕不執行。
+        // （舊 A2 分流：marker 有則 NEED_CLARIFICATION——本 stage 之命令式准入取代之。）
         val markerProbes = listOf(
             "别尋 Foo 符號",
             "别寻 Foo 符號",
@@ -863,7 +899,8 @@ class FastDispatchTest {
         for (text in markerProbes) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
-            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            // #19 B3 stage-1: 非命令式句首 ⇒ no-match DENIED（reasonCode null）。
+            assertNull(text, d.reasonCode)
             assertNull(text, d.toolCall)
             skippedOf(dispatcher.dispatch(d, lspOn), text)
         }
@@ -911,9 +948,9 @@ class FastDispatchTest {
     }
 
     @Test fun englishNegationNeverExecutes() = runBlocking {
-        // English negation verbs (best-effort): each of these either routes
-        // via the symbol template into clarification, or misses the template
-        // into the ordinary no-match denial — both are safe DENIED outcomes.
+        // English negation verbs (best-effort): each of these misses the
+        // symbol template (no affirmative-command opener) into the ordinary
+        // no-match denial — all are safe DENIED outcomes.
         val backend = CountingBackend()
         val dispatcher = lspDispatcher(backend)
         for (text in listOf(
@@ -927,11 +964,15 @@ class FastDispatchTest {
             assertEquals(text, RouteKind.DENIED, d.route)
             assertNull(text, d.toolCall)
         }
-        // Sanity: the case reaching the symbol template clarifies and the
-        // dispatcher skips — the backend is never invoked.
+        // Sanity: `never find symbol Foo` misses the symbol template entirely
+        // under the affirmative-command model (non-command opener) — the
+        // dispatcher skips without invoking the backend.
+        // #19 B3 stage-1: no-match DENIED（reasonCode null），不再進否定閘。
         val d = decide("never find symbol Foo")
+        assertNull(d.reasonCode)
+        assertNull(d.toolCall)
         val skipped = skippedOf(dispatcher.dispatch(d, lspOn), "never find symbol Foo")
-        assertEquals(DenyReason.NEED_CLARIFICATION, skipped.reasonCode)
+        assertNull(skipped.reasonCode)
         assertEquals(0, backend.invocations.get())
     }
 
@@ -989,12 +1030,15 @@ class FastDispatchTest {
         assertEquals(0, backend.invocations.get())
     }
 
-    @Test fun specialFindIsOverClarified() {
-        // Accepted over-clarify residual: 「特別找」含「別找」⇒ NEED_CLARIFICATION,
-        // never FAST (message may be anything — the contract is DENIED + clarify).
+    @Test fun specialFindSymbolIsNoMatchDenied() {
+        // #19 B3 stage-1: 「特別找」非命令式句首（ starts with 特，非 lookup 動詞）
+        // ⇒ 不進 symbol 模板 ⇒ no-match DENIED（reasonCode null）——
+        // DENIED、toolCall null、絕不執行。
+        // （舊行為：`特別找` ⊃ `別找` 過度澄清成 NEED_CLARIFICATION——本 stage
+        // 之 affirmative-command 准入取代之，pinned per #19 B3 stage-1。）
         val d = decide("特別找 Foo 符號")
         assertEquals(RouteKind.DENIED, d.route)
-        assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
+        assertNull(d.reasonCode)
         assertNull(d.toolCall)
     }
 
@@ -1638,12 +1682,25 @@ class FastDispatchTest {
         // 一律 DENIED、toolCall null、dispatch Skipped、後端零呼叫。
         val backend = CountingBackend()
         val dispatcher = lspDispatcher(backend)
-        // 群組一：含 lookup marker（查/找）的否定句 ⇒ 模板成立後否定閘轉
-        // NEED_CLARIFICATION（marker 命中模板，否定詞命中否定閘 → 澄清而非 no-match）。
-        // 涵蓋 無/无（無法＝unable）與 免（免查＝refrain/avoid）。
-        // 未（尚未／未曾＝not yet）、毋（毋查＝do not）、休（休查＝desist）同組：
-        // 「我 沒 辦 法 查」為多空白 沒 辦 法（spaced pass 接合回 沒法→含 沒 顆粒）。
-        val markerProbes = listOf(
+        // 群組一（命令式句首）：含否定顆粒之命令式句首 ⇒ 模板成立後
+        // 否定閘轉 NEED_CLARIFICATION；絕不 FAST、絕不進 executor。
+        // #3（B3 re-review）明確禁止/順延句族（natural-language 等價於否定）
+        // 皆以命令式句首 + 否定顆粒成立（command form 或句首 lookup 動詞）。
+        val commandLedProbes = listOf(
+            "symbols Foo banana",
+            "查 prohibit 符號 Foo",
+            "查 defer 符號 Foo",
+            "查 延期 符號 Foo",
+            "查 推後 符號 Foo",
+            "查 寬限 符號 Foo",
+            "查 延宕 符號 Foo",
+        )
+        // #19 B3 stage-1: 非命令式句首之否定句——不滿足 symbol 前閘的命令式准入
+        // （start-anchored opener 不命中）⇒ 落入 RULES 無命中 ⇒ no-match DENIED
+        // （reasonCode null）；仍 DENIED、toolCall null、Skipped、後端零呼叫。
+        // 涵蓋 無/无（無法＝unable）與 免（免查＝refrain/avoid）；
+        // 未（尚未／未曾＝not yet）、毋（毋查＝do not）、休（休查＝desist）同組。
+        val nonCommandLedProbes = listOf(
             "我不想查 Foo 符號",
             "先別再查 Foo 符號",
             "我沒有要查 Foo 符號",
@@ -1665,10 +1722,6 @@ class FastDispatchTest {
             "毋查 Foo 符號",
             "休查 Foo 符號",
             "我 沒 辦 法 查 Foo 符號",
-            // #3（B3 re-review）明確禁止/順延句族（natural-language 等價於否定）：
-            // 全數成立 symbol 模板（command form 或 lookup marker）⇒ 模板成立後否定閘轉
-            // NEED_CLARIFICATION；絕不 FAST、絕不進 executor。
-            "symbols Foo banana",
             "我拒絕查 Foo 符號",
             "拒绝查 Foo 符号",
             "我拒绝查 Foo 符号",
@@ -1678,23 +1731,25 @@ class FastDispatchTest {
             "延遲查 Foo 符號",
             "延後查 Foo 符號",
             "推遲查 Foo 符號",
-            "查 prohibit 符號 Foo",
-            "查 defer 符號 Foo",
-            "查 延期 符號 Foo",
-            "查 推後 符號 Foo",
-            "查 寬限 符號 Foo",
-            "查 延宕 符號 Foo",
             "I forbid you to search symbol Foo",
             "suspend lookup of symbol Foo",
         )
-        for (text in markerProbes) {
+        for (text in commandLedProbes) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
             assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
             assertNull(text, d.toolCall)
             skippedOf(dispatcher.dispatch(d, lspOn), text)
         }
-        // 群組二：EN-mix `我不想 symbol Foo` 無 lookup marker ⇒ A2 兩段式模板不成立
+        for (text in nonCommandLedProbes) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            // #19 B3 stage-1: 非命令式句首 ⇒ no-match DENIED（reasonCode null）。
+            assertNull(text, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        // 群組二：EN-mix `我不想 symbol Foo` 非命令式句首 ⇒ 模板不成立
         // ⇒ no-match DENIED（reasonCode null，不進否定閘）。
         // #3（B3 re-review）：`searching`/`finding`/`hold off` 皆不匹配
         // word-anchored marker `\b(find|search|lookup|locate)\b` ⇒ 同樣無 marker，
@@ -1996,4 +2051,222 @@ class FastDispatchTest {
             override val toolName: String = LspTools.SYMBOLS_NAME
             override suspend fun execute(call: ToolCall, ctx: ProjectionContext): FastExecResult = result
         }
+
+    // ---- #19 B3 stage-1：symbol 前閘僅收命令式肯定語句（affirmative-command admission）----
+    // symbol 前閘僅准許**命令式肯定語句**（explicit lookup command）：句首（可選 EN
+    // `please`／CJK 請|麻煩|帮我|幫我|给我|給我|请 前綴）必須是查詢動詞
+    // （find/search/lookup/locate，或 CJK 查/找/尋/搜/詢/寻/询）或
+    // `symbol(s) <name>` 命令形；句中出現授權/條件授權子句（命令式 opener + 結構性
+    // 授權/條件子句否決：only after/when/if/until/once/before/with/upon …、
+    // after|until|unless|once|when|while|if|before|since|whenever|as|because|
+    // provided|upon|following|pending|with|subject to|prior to|given|on 後接可選受詞/限定詞（0–3 個）再接詞幹
+    // （approve/agree/consent/confirm/say/allow/ok/okay/release/permit/permission/
+    // review 等；gerund 與過去式一併涵蓋）、wait for/until/till、hold on/off、not yet、
+    // CJK 結構性條件句（等…同意、同意後（再/才）、只有/只許/只允…才有界框架），
+    // 皆對 raw 文本與兩個正規化探針（NFKC + Cf 摺空白／NFKC + Cf 刪除）聯集測試），
+    // 或任意教學/說明標記（命令式 opener + 教學標記否決：explain|teach|tutorial|
+    // how-to|howto|mean|describe|demonstrate 等屈折形式，或 CJK 說明|説明|講解|讲解|
+    // 介紹|介绍|討論|讨论|教程|方法（是）?|意思|名稱|名称|如何|怎麼|怎么|怎样|怎樣），
+    // 或疑問尾標（? ？ 嗎 吗 呢）
+    // ⇒ 不滿足前閘。該類語句不成立 symbol 模板——即使句中含 lookup 動詞也絕不准許
+    // 執行；它們落入 RULES 迴圈（仍無命中者 ⇒ no-match DENIED）。
+    // 釘住：implement per review findings on PR #171 / #19 B3 stage-1。
+    @Test fun nonAffirmativeSymbolCommandsDenyZeroBackend() = runBlocking {
+        // 每個 utterance：decide() ⇒ DENIED + toolCall == null；
+        // decideAndDispatch 帶 counting fake backend ⇒ 後端零呼叫、outcome 非 Executed。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for (text in listOf(
+            "I won't allow you to search symbol Foo",
+            "I decline to search symbol Foo",
+            "Search symbol Foo only after I approve",
+            "Wait until I agree, then search symbol Foo",
+            "Can you search symbol Foo",
+            "Could you search symbol Foo",
+            "I want to find symbol Foo",
+            "I need to find symbol Foo",
+            "Please search symbol Foo only after approval",
+            "Search symbol Foo only when I say so",
+            "Can you explain how to find symbol Foo",
+            "Could you show me how to search symbol Foo",
+            "Please explain how to find symbol Foo",
+            "The symbol is find",
+            "符號名稱叫 find",
+            "請先說明如何查 Foo 符號",
+            "請說明如何查 Foo 符號",
+            "麻煩說明怎麼查 Foo 符號",
+            "Tutorial: 如何查 Foo 符號",
+            "教程：如何查 Foo 符號",
+            "可以幫我查 Foo 符號",
+            "查 Foo 符號的方法是",
+            "我查 Foo 符號的結果",
+            // #19 B3 stage-1 fix：noun-form / inflected consent clauses（結構性錨定）。
+            "search symbol Foo after approval",
+            "search symbol Foo after the approval",
+            "search symbol Foo after my approval",
+            "search symbol Foo after their consent",
+            "search symbol Foo until consent",
+            "search symbol Foo before approval",
+            "search symbol Foo once approved",
+            "search symbol Foo when approved",
+            "search symbol Foo upon approval",
+            "search symbol Foo upon consent",
+            "search symbol Foo upon prior approval",
+            "search symbol Foo following approval",
+            "search symbol Foo following consent",
+            "search symbol Foo pending approval",
+            "search symbol Foo pending my approval",
+            "search symbol Foo with approval",
+            "search symbol Foo with their consent",
+            "search symbol Foo only with approval",
+            "find symbol FOO after approval",
+            "search symbol Foo since I approved",
+            "search symbol Foo whenever approved",
+            "search symbol Foo as approved",
+            "search symbol Foo because approved",
+            "search symbol Foo provided approval",
+            "search symbol Foo while approved",
+            "search symbol Foo after I approved",
+            "search symbol Foo after I consented",
+            "search symbol Foo after I confirmed",
+            "search symbol Foo after I agreed",
+            "search symbol Foo after I allowed",
+            "search symbol Foo after I permitted",
+            "search symbol Foo after I said",
+            "search symbol Foo after she approves",
+            "search symbol Foo after anyone approves",
+            "search symbol Foo once I approved",
+            "search symbol Foo when she approved",
+            "search symbol Foo after I had approved",
+            "search symbol Foo after approving",
+            "search symbol Foo after agreeing",
+            "search symbol Foo after consenting",
+            "search symbol Foo after my approval",
+            "search symbol Foo once it is approved",
+            // #19 B3 stage-1 fix：Cf/格式符拆分（NFKC + Cf 剝離/刪除探針）。
+            "search symbol Foo if\u200BI approve",
+            "search symbol Foo after\u200BI approve",
+            "search symbol Foo after I\u200Bapprove",
+            "search symbol Foo after I ap\u200Bprove",
+            "search symbol Foo only after\u200BI approve",
+            "search symbol Foo wait\u200Bfor",
+            "search symbol Foo hold\u200Boff",
+            "search symbol Foo after\u00ADI approve",
+            "search symbol Foo after\u2060I approve",
+            "search symbol Foo after\uFEFFI approve",
+            "how\u200Bto search symbols",
+            "howto search symbol Foo",
+            "how\u00A0to search symbol Foo",
+            "how\u3000to search symbol Foo",
+            "how\u2011to search symbol Foo",
+            "how\u00ADTo search symbol Foo",
+            "how-to search symbol Foo",
+            "search symbol Foo ｉｆ Ｉ ａｐｐｒｏｖｅ",
+            // CJK 結構性條件句框架（所列框架外不宣稱完備）。
+            "查 Foo 符號 等我同意",
+            "查 Foo 符號 同意後再查",
+            "查 Foo 符號 核準後再查",
+            "查 Foo 符號 只许我核准才查",
+            // #19 B3 re-review round-3：conjunction 擴充（subject to／prior to／given／on）。
+            "search symbol Foo subject to approval",
+            "search symbol Foo on the approval",
+            "search symbol Foo on my approval",
+            "search symbol Foo given approval",
+            "search symbol Foo prior to consent",
+            "search symbol Foo prior to approval",
+            // #19 B3 final polish：EN 連接詞後錨定 CJK 許可詞幹餘例（繁簡對稱）。
+            "search symbol Foo given 同意",
+            "search symbol Foo on 同意",
+            "search symbol Foo prior to 核准",
+            "search symbol Foo prior to 许可",
+            // #19 B3 final polish（security audit L-1）：疑問尾標探針亦剝 Hangul filler／combining marks。
+            "查 Foo 符號呢\u3164",
+            "查 Foo 符號呢\u0301",
+            // #19 B3 final polish（security audit L-2）：EN 連接詞後錨定 CJK 許可詞幹。
+            "search symbol Foo subject to 許可",
+            // #19 B3 re-review round-3：疑問尾標跑在 Cf 剝離後的視圖上。
+            "查 Foo 符號呢\u200B",
+            "查 Foo 符號?\u200B",
+            "search symbol Foo?\u200B",
+            // #19 B3 re-review round-3：CJK 結構性條件句框架（只有…才／等…／X後（再）×繁簡）。
+            // 註：獨立 CJK pins 於 opener/hint 閘即否決（所斷言契約＝DENIED）；
+            // 框架正則本體由 查-前綴 probes（如 `查 Foo 符號 同意後再查`）演練。
+            "只有你同意我才查",
+            "等我們同意",
+            "批准後再查",
+            "只有我核准才查",
+            "只許我確認才查",
+            "只允他確認才查",
+        )) {
+            // decide()：decision is DENIED, toolCall == null。
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertNull(text, d.toolCall)
+            // decideAndDispatch：decision DENIED、backend 零呼叫、outcome 非 Executed。
+            val before = backend.invocations.get()
+            val result = dispatcher.decideAndDispatch(text, lspOn, sessionId = "s1", turnIndex = 1)
+            assertEquals(text, RouteKind.DENIED, result.decision.route)
+            assertNull(text, result.decision.toolCall)
+            assertFalse(text, result.outcome is FastDispatchOutcome.Executed)
+            assertEquals(text, before, backend.invocations.get())
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun affirmativeSymbolCommandsStayFast() {
+        // #19 B3 stage-1 positive guards：命令式肯定語句仍成立 symbol 前閘 ⇒ FAST；
+        // query 以 parsed argumentsJson 的 query 欄位精確等值斷言（與
+        // requestedLimitIsEnforced 同一 Json.parseToJsonElement 風格）。
+        for ((text, expectedQuery) in listOf(
+            "search symbol Foo" to "Foo",
+            "find symbol Foo" to "Foo",
+            "查 Foo 符號" to "Foo",
+            "查 SymbolTable 符號" to "SymbolTable",
+            "find symbols Foo" to "Foo",
+            // #5（B3 re-review）EN connective strip 仍生效（legacy compatibility）。
+            "search for symbol Foo" to "Foo",
+            "查一下 symbols Foo" to "Foo",
+            "symbols Foo" to "Foo",
+            // #19 B3 final polish：`on` 非條件子句（後接非詞幹）——FAST，exact query 以 scratch 探針實測釘住
+            //（剝離流水線維持原樣；空白全剝、裸 `on` 殘留接合，見 SYMBOL_QUERY_STRIP）。
+            "search symbol Foo on button" to "Fooonbutton",
+            "search symbol Foo on Foo" to "FooonFoo",
+            "查 Foo 符號 on 按鈕 符號" to "Fooon按鈕",
+            // #19 B3 stage-1 fix flip side：結構性錨定不得誤傷識別字/普通詞。
+            "search symbol Approved" to "Approved",
+            "search symbol approval" to "approval",
+            "search symbol consent" to "consent",
+            "查 ApprovedWidget 符號" to "ApprovedWidget",
+            "查 Approved 符號" to "Approved",
+            "查 同意 符號" to "同意",
+            "查 批准 符號" to "批准",
+            "查 許可 符號" to "許可",
+            "search symbol afterApproval" to "afterApproval",
+            "search symbol after_approval" to "after_approval",
+            "查 ConsentFlow 符號" to "ConsentFlow",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertEquals(text, "lsp.symbols", d.toolCall?.toolName)
+            assertNotNull(text, d.toolCall)
+            assertEquals(
+                text,
+                expectedQuery,
+                Json.parseToJsonElement(d.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content,
+            )
+        }
+    }
+
+    @Test fun narrowTailAcceptedResidualStaysFast() {
+        // #19 B3 accepted residual (narrow-tail limitation; documented in KDoc)：
+        // 疑問顆粒後接圖形標點（。）躲過疑問尾標檢查 ⇒ 仍成立 symbol 前閘 ⇒ FAST（query `Foo`）。
+        val d = decide("查 Foo 符號呢。")
+        assertEquals(RouteKind.FAST, d.route)
+        assertEquals("lsp.symbols", d.toolCall?.toolName)
+        assertNotNull(d.toolCall)
+        assertEquals(
+            "Foo",
+            Json.parseToJsonElement(d.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content,
+        )
+    }
 }

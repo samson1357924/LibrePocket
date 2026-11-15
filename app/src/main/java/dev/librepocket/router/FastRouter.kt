@@ -46,36 +46,39 @@ import java.util.concurrent.atomic.AtomicLong
  * no-match, never executes) but a NEGATION gap is not (a complete-args
  * negated intent would sail through to FAST). `lsp.symbols` is the
  * reference expansion (template + the full `不/別/沒` × verb NEGATION table,
- * 繁簡對稱 + blank-query clarification). The 14 pinned negated probes are
- * now also checked behaviorally (sampling, not the full table):
+ * 繁簡對稱 + blank-query clarification). The behaviorally pinned probes are
+ * sampling, not the full table:
  * `FastDispatchTest.newToolMustExpandVerbTableBeforeReady` probes the
  * sampled negated intents to deny the ready tool before FAST, not just
  * RULES membership. 路由順序見下方「matchTemplate 路由順序」段：symbol 前閘介於
  * SLOW_HINTS 與 RULES 之間，`查 AlarmManager 符號` 綁 lsp.symbols——由
  * `FastDispatchTest.codeIdentifierSymbolNamesRouteToLspSymbols` 釘住。
  *
- * A1/A2 routing hardening (fail-opens closed, conservatively): the
- * `lsp.symbols` template no longer fires on mere hint presence — it now
- * requires an explicit lookup intent (single-word command form
- * `^symbol(s)?\s+\S`, or a lookup marker: CJK 查/找/尋/搜/詢 family or
- * `\b(find|search|lookup|locate)\b`; `where` deliberately excluded).
- * Question/knowledge utterances (`What is a symbol?`, `Explain symbols`,
- * `請解釋符號`, `符號有哪些種類`, bare `symbols`, `符號是Foo嗎`) fall through
- * to no-match DENIED (reasonCode null) when nothing else matches — not
- * clarification. #4（B3 re-review）interrogative/teaching-request utterances
- * *with* a lookup verb （`Why does search symbol Foo work?`,
- * `How to find symbol Foo`, `教我如何查 Foo 符號`）: [isInterrogativeOrTeachingRequest]
- * excludes them from the symbol front gate, so the symbol template never
- * matches (never FAST); they then fall through — either to no-match DENIED
- * （reasonCode null）when no keyword template matches, or to the matching
- * keyword template's own fail-closed outcome （e.g. `查 AlarmManager 符號呢`
- * → alarm.create missing-time clarification; NEVER FAST). The gate now
- * lives in the symbol front gate ahead of [RULES] (see the
- * matchTemplate 路由順序 paragraph below), not inside the RULES loop — hint
- * presence alone still routes
- * no-match DENIED when no lookup marker is present (pinned by
- * `FastDispatchTest.symbolQueryBeatsKeywordHints`). The negation
- * gate is now a conservative ANY-presence gate ([NEGATION_MARKERS]): any
+ * A1/A2/stage-1 routing hardening (fail-opens closed, conservatively): the
+ * `lsp.symbols` template no longer fires on mere hint presence — it matches
+ * ONLY an **explicit lookup command** under the affirmative-command
+ * admission model ([isAffirmativeSymbolCommand], #19 B3 stage-1):
+ * 句首（可選 EN `please`／CJK 請|麻煩|帮我|幫我|给我|給我|请 前綴）必須是查詢動詞
+ * （find/search/lookup/locate，或 CJK 查/找/尋/搜/詢/寻/询）或
+ * `symbol(s) <name>` 命令形；句中出現授權/條件授權子句（命令式 opener +
+ * 結構性授權/條件子句否決：only after/when/if/until/once/before/with/upon …、
+ * after|until|unless|once|when|while|if|before|since|whenever|as|because|
+ * provided|upon|following|pending|with|subject to|prior to|given|on 後接可選受詞/限定詞（0–3 個）再接
+ * approve/agree/consent/confirm/say/allow/release/permit/ok/ready/permission/
+ * review 等詞幹（gerund 與過去式一併涵蓋）、wait for/until/till、hold on/off、
+ * not yet、CJK 結構性條件句（等…同意、同意後再/才、只有…才等有界框架）等），
+ * 或任意教學/說明標記（命令式 opener + 教學標記否決：explain|teach|tutorial|
+ * how-to|howto|mean|describe|demonstrate 等屈折形式，或 CJK 說明|説明|講解|
+ * 讲解|介紹|介绍|討論|讨论|教程|方法（是）?|意思|名稱|名称|如何|怎麼|怎么|
+ * 怎样|怎樣），或疑問尾標（命令式 opener + 疑問尾標否決：? ？ 嗎
+ * 吗 呢）⇒ 不滿足前閘。該類語句一律不成立 symbol 模板（不 FAST）——問句/知識/
+ * 教學語句與否定前置語句皆然；它們落入 RULES 迴圈後：無 keyword 規則命中者
+ * → no-match DENIED（reasonCode null）；命中 keyword 規則者落到該規則原有的
+ * fail-closed 語意（例如 `查 AlarmManager 符號呢` → alarm.create 缺時間澄清；
+ * 絕不執行）。Cf/格式符拆分（如 `if\u200BI approve`）在子句否決前先經 NFKC +
+ * Cf 剝離/刪除 + 非字母數字摺空白的正規化探針覆蓋（見 [isAffirmativeSymbolCommand]）；
+ * 教學標記亦在同樣三個文本上測試。The negation
+ * gate is a conservative ANY-presence gate ([NEGATION_MARKERS]): any
  * occurrence of 不/沒/別/勿/莫… or English negation words — plus (#3 B3
  * re-review) the explicit prohibition/postponement words
  * （`forbid`/`prohibit`/`ban`/`postpone`/`suspend`/`defer`/`den[iy]\w*`/`hold off`
@@ -85,36 +88,69 @@ import java.util.concurrent.atomic.AtomicLong
  * verb table cannot be complete; over-clarification is the fail-safe
  * direction (the single ready tool is READ-only).
  *
+ * 誠實殘餘（honest residuals）：
+ * - CJK 否定顆粒（不/別/沒…）仍為封閉否定表——那是防禦縱深（defense in depth），
+ *   非 symbol 前閘之准入依據；前閘的准入唯一依據是上列命令式 opener + 結構性
+ *   授權/條件子句否決 + 教學標記否決 + 疑問尾標否決。
+ * - EN 開放詞彙一律 open-world deny-by-default：非命令式一律 no-match
+ *   （DENIED、reasonCode null），不宣稱 EN 否定或 EN 語序的封閉表完整性。
+ * - 過度澄清為受控 fail-safe：帶教學標記的命令式語句（如 `查 Foo 符號的方法是`）
+ *   一律不成立前閘——寧可 no-match/澄清，絕不把非查詢命令綁到 lsp.symbols 執行。
+ * - Cf/default-ignorable-split normalization 已納（本輪）：授權子句/教學標記在
+ *   raw 文本與兩個正規化探針（NFKC + Cf 摺空白；NFKC + Cf 刪除）上取聯集測試。
+ * - noun-form/inflected consent clauses 已納結構性錨定（本輪）：連接詞集
+ *   （含 since|whenever|as|while|because|provided|upon|following|pending|with|subject to|prior to|given|on）
+ *   + 0–3 個可選受詞/限定詞 + 動詞/詞幹槽（gerund/過去式/第三人稱涵蓋）。
+ * - 已知殘餘（accepted, open-world）：任意非槽詞 possessor（含專有名詞：after Sam approves、
+ *   on Foo approve）亦不收——anchor-or-nothing。
+ * - 已知殘餘（accepted, anchor-or-nothing 一致性）：`with readiness`／`readiness\b`
+ *   與 bare `pending`／`review` 之類 identifier 形態一致性接受。
+ * - 殘餘：CJK 結構性條件句僅覆蓋所列框架（等…同意/核准/核準、同意/核準後（再/才）、
+ *   只有/只許/只许/只允…才之有界缺口）；EN 開放詞彙不宣稱完備；`\bban\w*\b` 之類（如 `symbols Foo banana` → NEED_CLARIFICATION）、`特別找`
+ *   之類普通詞仍收為否定系副作用（recorded, fail-safe）；裸名詞絕不單獨收錄（anchor-or-nothing）；EN 連接詞詞幹槽已納 CJK 許可詞幹
+ *   （許可|许可|同意|核准|核準|批准|確認|确认|點頭|点头）——錨定於 EN 連接詞之後者否決；EN/CJK 交集其餘仍 open-world recorded。
+ * - 已知殘餘（accepted, frame-local, not fixed；audit F7）：CJK 框架內部的
+ *   空白相鄰仍可入閘——如 `同意 後再查`（CJK run 之間僅一個空白）仍被准入。
+ *   此為框架內之空白容忍，非修正目標，僅記錄。
+ * - 已知過度否決（accepted fail-safe, do not "fix"）：`查 Main 方法 符號` 因 CJK
+ *   方法 教學標記事否決落 DENIED——保留，僅記錄；`查 Foo 符號 pending review`
+ *   亦因結構性詞幹 `review` 否決——為預期結果。
+ *
  * matchTemplate 路由順序（B3 re-review pin；依序，fail-safe）：
  * 1. SLOW_HINTS（自動化描述 → SLOW automation descriptor，由 projection
  *    誠實拒絕，play 上 FLAVOR_BLOCKED）先於一切；
  * 2. code-symbol lookup 前閘第二：containsAny(SYMBOL_HINTS) 且
- *    [hasSymbolLookupIntent] 命中且非 [isInterrogativeOrTeachingRequest]
- *    才回 `lsp.symbols`——在任何關鍵詞工具之前。
+ *    [isAffirmativeSymbolCommand] 命中（命令式肯定語句准入，見上段）才回
+ *    `lsp.symbols`——在任何關鍵詞工具之前。
  *    識別字如 `AlarmManager`／`NotificationManager`／`CalendarProvider`／
  *    `ScreenshotController`／`EmailClient`／`VolumeController` 內含其他工具的
  *    無錨點 hint 子串（`alarm`、`notification`、`calendar`、`screenshot`、
  *    `e-?mail`、`volume`），若仍走 RULES 順序會被這些工具先搶走
  *    （`查 AlarmManager 符號` 會落到 alarm.create 的缺時間澄清）。
  *    前閘保證 `查 AlarmManager 符號` 綁 lsp.symbols 而非 alarm.create；
- *    #4（B3 re-review）：問句/知識/教學（how-to）語句絕不滿足 symbol 前閘——
- *    英文開頭疑問詞/教學動詞（why|how|who|what|when|where|explain|teach|tell|show|
- *    describe|demonstrate|walk，word-anchored）、中文開頭教學/疑問起始語（教我|學我|
- *    学我|請教|请教|請問|请问|問|问|如何|怎麼|怎么|為什麼|为什么|何時|何时|何地|何处|
- *    何處|可否|是否|怎樣|怎样|告訴我|告诉我|告訴|告诉|我想知道|請告訴我|请告诉我|
- *    講解|讲解|說明|说明|介紹|介绍|示範|演示）、
- *    或以疑問尾標收尾（? ？ 嗎 吗 呢）者一律不進 symbol 前閘 ⇒ 該語句不走 lsp.symbols
- *    （絕不 FAST）；無其他規則命中時 no-match DENIED（reasonCode null），
+ *    #4（B3 re-review）/stage-1：問句/知識/教學（how-to）語句與含授權/條件授權
+ *    子句或教學/說明標記的語句一律不滿足 symbol 前閘——
+ *    但句首（可選 EN please／CJK 請|麻煩|帮我|幫我|给我|給我|请 前綴）必須是查詢動詞
+ *    （find/search/lookup/locate，或 CJK 查/找/尋/搜/詢/寻/询）或 `symbol(s) <name>`
+ *    命令形；句中出現授權/條件授權子句（only after/until i…approve、
+ *    after|until|unless|once|when|while|if|before|since|whenever|as|because|
+ *    provided|upon|following|pending|with|subject to|prior to|given|on 後接可選受詞/限定詞（0–3 個）再接詞幹、
+ *    wait for/until、hold on/off、not yet、CJK 結構性條件句等，皆對 raw 文本與兩個
+ *    正規化探針聯集測試）或任意教學/說明標記（explain|teach|tutorial|how-to|
+ *    howto|mean|describe|demonstrate 等屈折形式|說明|講解|如何|怎麼|方法|意思|
+ *    名稱…）或疑問尾標（? ？ 嗎 吗 呢）⇒ 不進 symbol 前閘 ⇒
+ *    該語句不走 lsp.symbols；無其他規則命中時 no-match DENIED（reasonCode null），
  *    命中 keyword 規則時落到該規則原有的 fail-closed 語意（例如查 AlarmManager
  *    符號呢 → alarm.create 缺時間澄清），絕不執行（pinned by
  *    `FastDispatchTest.interrogativeSymbolUtterancesDenyZeroBackend`）。
  * 3. RULES 關鍵詞工具最後（SYMBOLS 已自 RULES 移除，symbol 匹配由前閘獨占；
  *    [templateToolNames] 顯式補入 lsp.symbols 維持 expansion-rule oracle）。
- * 前閘與舊 RULES 內 symbol 條目同樣要求 A2 lookup intent——僅有 hint 不足；
+ * 前閘要求命令式肯定語句准入（僅有 hint 不足；查詢動詞出現在句中——如
+ * `I want to find symbol Foo`——同樣不足）；
  * SLOW 命中不受前閘影響（自動化語句仍先轉 automation descriptor）。
  * 由 `FastDispatchTest.codeIdentifierSymbolNamesRouteToLspSymbols`（六個識別字
  * 端到端 FAST＋invocation==1）與 `FastDispatchTest.symbolQueryBeatsKeywordHints`
- * （非 symbol 意圖照常落 keyword 工具、無 marker 者 no-match）釘住。
+ * （非 symbol 意圖照常落 keyword 工具、無准入者 no-match）釘住。
  *
  * Pure logic, no Android dependencies.
  *
@@ -180,7 +216,14 @@ class FastRouter(
                 fallbackMessage = FallbackMessages.forNoMatch(intentText),
                 header = header(RouteKind.DENIED, match.toolName, null),
             )
-        val projection = projections.getValue(tool.name)
+        // Deliberate fail-safe branch for an inconsistent registry; never hit with the canonical registry: keep match.toolName in the audit header, like the neighboring match-found DENIED branches.
+        val projection = projections[tool.name] ?: return RouteDecision(
+            route = RouteKind.DENIED,
+            toolCall = null,
+            reasonCode = null,
+            fallbackMessage = FallbackMessages.forNoMatch(intentText),
+            header = header(RouteKind.DENIED, match.toolName, null),
+        )
         if (projection.level != CapabilityLevel.NATIVE) {
             val reason = projection.reason ?: dev.librepocket.tool.DenyReason.USER_DISABLED
             return RouteDecision(
@@ -264,9 +307,11 @@ class FastRouter(
         // Symbol-naming lookup is checked before keyword-matched tools:
         // identifiers like `AlarmManager` contain other tools' hint words, but
         // `查 AlarmManager 符號` is a code-symbol query, not an alarm/call/mail ask.
-        // Interrogative/teaching utterances (「Why does search symbol Foo work?」)
-        // never qualify — question/knowledge is not a lookup command (#4).
-        if (containsAny(text, SYMBOL_HINTS) && hasSymbolLookupIntent(text) && !isInterrogativeOrTeachingRequest(text)) {
+        // Affirmative-command admission (#19 B3 stage-1): the gate matches ONLY an
+        // explicit lookup command ([isAffirmativeSymbolCommand]) — anything else
+        // falls through (never FAST); a question/knowledge/teaching utterance
+        // with a lookup verb no longer qualifies (#4).
+        if (containsAny(text, SYMBOL_HINTS) && isAffirmativeSymbolCommand(text)) {
             return TemplateMatch(LspTools.SYMBOLS_NAME, symbolArgs(text))
         }
         for ((toolName, hints, args) in RULES) {
@@ -306,53 +351,183 @@ class FastRouter(
         // narrow (symbol words only — a bare 「查」 without a symbol word is
         // NOT a symbol query and stays no-match, fail-safe). Latin hint is
         // word-anchored: `symbolize` does NOT route; `symbol`/`symbols` do.
-        // A2: hint membership is only the prefilter — the authoritative
-        // test is [hasSymbolLookupIntent] (command form or lookup marker;
-        // fullwidth ｓｅａｒｃｈ/ｆｉｎｄ do NOT match the EN marker — they
+        // Prefilter: hint membership is only the prefilter — the authoritative
+        // test is [isAffirmativeSymbolCommand] (affirmative-command admission;
+        // fullwidth ｓｅａｒｃｈ/ｆｉｎｄ do NOT match the EN opener — they
         // route no-match, same fail-safe direction, pinned by the
         // fullwidth-English tests). The prefilter fires in the symbol front
         // gate (see matchTemplate), never inside the RULES loop.
         private val SYMBOL_HINTS = listOf(r("符號"), r("符号"), r("\\bsymbols?\\b"))
-        // A2 explicit-lookup gate for the symbol template: either the
-        // single-word command form (`symbol(s) <name>`, anchored at start)
-        // or a lookup marker (CJK 查/找/尋/搜/詢 — 「查詢/查找/搜尋」 are
-        // subsumed by their CJK syllables — or EN find/search/lookup/locate,
-        // word-anchored). `where` is deliberately excluded: a bare
-        // 「where is symbol Foo」 carries no lookup verb and over-clarifies
-        // into no-match (accepted, conservative direction).
-        private val SYMBOL_LOOKUP_MARKER =
-            Regex("查|找|尋|搜|詢|寻|询|查询|查找|搜尋|搜寻|\\b(find|search|lookup|locate)\\b", RegexOption.IGNORE_CASE)
-        private val SYMBOL_COMMAND_FORM = Regex("^symbols?\\s+\\S", RegexOption.IGNORE_CASE)
-        // #4（B3 re-review）：問句／教學（how-to）型語句的 symbol 前閘豁免。
-        // 「Why does search symbol Foo work?」這類自然語句只要含 lookup verb 就會
-        // 命中前閘而執行——問句/知識/教學語句絕不得進 symbol 模板（symbol 前閘豁免）：
-        // 命中豁免只免除 symbol 模板；其餘 keyword 規則照常套用（如查 AlarmManager
-        // 符號呢 → alarm.create 缺時間澄清，DENIED 絕不 FAST），當無任何 keyword
-        // 規則命中時才落 no-match DENIED（reasonCode null）。
-        // 英文：開頭為疑問詞/教學動詞（word-anchored，IGNORE_CASE；`tell`/`show` 涵蓋
-        // 「tell me …」「show me …」）；中文：開頭為 教我|學我|学我|請教|請問|告訴我|告诉我… 等
-        // 教學/疑問起始語；或整句以疑問尾標（? ？ 嗎 吗 呢）收尾——問句不是查詢命令。
-        // 命中 ⇒ symbol 模板不成立；其餘模板（其他工具）不受影響（fail-safe 只關 symbol
-        // 前閘，其餘模板維持原語意）。
-        private val INTERROGATIVE_EN_PREFIX =
-            Regex("^(?:why|how|who|what|when|where|explain|teach|tell|show|describe|demonstrate|walk)\\b", RegexOption.IGNORE_CASE)
-        private val INTERROGATIVE_CJK_PREFIX =
-            Regex("^(?:教我|學我|学我|請教|请教|請問|请问|问|問|如何|怎麼|怎么|為什麼|为什么|何時|何时|何地|何处|何處|可否|是否|怎樣|怎样|告訴我|告诉我|告訴|告诉|我想知道|請告訴我|请告诉我|講解|讲解|說明|说明|介紹|介绍|示範|演示)")
+        // #19 B3 stage-1（affirmative-command admission model，取代 A2 lookup-marker
+        // 准入）: symbol 前閘僅收**命令式肯定語句**（explicit lookup command）。
+        // 准入條件（isAffirmativeSymbolCommand；全部成立才滿足前閘）：
+        // 1. 句首（start-anchored，IGNORE_CASE）必須是以下之一：
+        //    - EN：`^(?:please[\s,]+)?(?:find|search|lookup|locate)\b`（可選 please 前綴）
+        //    - EN 單詞命令形：`^symbol(s)?\s+\S`（如 `symbols Foo`，原樣保留）
+        //    - CJK：`^(?:(?:請|麻煩|帮我|幫我|给我|給我|请)[\s，,]*)?(?:查|找|尋|搜|詢|寻|询)`
+        //      （可選禮貌前綴 請|麻煩|帮我|幫我|给我|給我|请 後接查詢動詞
+        //       查|找|尋|搜|詢|寻|询；`請先說明…` 不匹配——請後接 先 而非動詞，正確）
+        // 2. 任意位置不得出現授權/條件授權子句（對 raw text 與下方兩個正規化探針測——
+        //    「任意位置」＝三個文本之一命中即否決；IGNORE_CASE；結構性錨定，絕不裸名詞）：
+        //    A. `\bonly\s+(?:after|when|if|until|once|before|with|upon)\b` 變體（approval|consent|permission 收尾）、
+        //    B. 連接詞集 after|until|unless|once|when|while|if|before|since|whenever|as|
+        //       because|provided|upon|following|pending|with|subject to|prior to|given|on ＋ 可選受詞/限定詞槽
+        //       （i|we|you|they|anyone|he|she|it|my|our|your|their|his|her|the|this|that|
+        //        a|an|some|any|prior|is|are|was|were|has|have|had|been，最多 3 個）
+        //       ＋ 動詞/詞幹槽（approv\w*|agree\w*|consent\w*|confirm\w*|say\w*/said|
+        //       allow\w*|release\w*|permit\w*|ok\w*|okay\w*|go[- ]?ahead\w*|ready|
+        //       permission|review|（許可|许可|同意|核准|核準|批准|確認|确认|點頭|点头），皆 \w* 或 \b 詞幹錨定）——gerund/過去式/第三人稱
+        //       一併涵蓋（`after approving`、`once approved`、`after I had approved`、
+        //       `once it is approved`、`since I approved`、`after my approval`）；
+        //       裸 `\b(?:approval|approved|consent|pending)\b` 絕不單獨收錄；
+        //    C. `\bwait\s+(?:for|until|till)\b`、`\bhold\s+(?:on|off)\b`、`\bnot\s+yet\b`；
+        //    D. CJK 結構性條件句僅覆蓋所列框架：`等\s*(我|我們|我们|你|他|她)?\s*(同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)`、
+        //       `(同意|核准|核準|批准|確認|确认|許可|许可)(之後|之后|以後|以后|後|后)(?:再|才)?`、
+        //       以及有界缺口 `只有.{0,8}才`／`只許.{0,8}才|只许.{0,8}才`／`只允.{0,8}才`（無裸名詞 CJK 匹配）；
+        //    探針：NFKC → 剝 Cf/格式符 → 非字母/數字 run 摺成單一空白（`_` 保留——after_approval
+        //    之類識別字不得被拆），以及 NFKC → Cf 直接刪除 → 同樣摺疊（`after I ap\u200Bprove` 這種
+        //    字內部拆分才會還原）。兩探針與 raw 取聯集，`_` 以外的連接符不造成誤FAST。
+        // 3. 任意位置不得出現教學/說明標記（EN 部分 IGNORE_CASE；CJK 為字面量）：
+        //    `\b(?:explain\w*|teach\w*|tutorial|how\s*-?\s*to|howto|mean\w*|describ\w*|demonstrat\w*)\b`
+        //    （涵蓋 explained/explaining/described/describing/demonstrated/demonstrating/meant/means 等
+        //    屈折形式；`how-to`／`howto` 為明示替代）、
+        //    CJK：`說明|説明|講解|讲解|介紹|介绍|討論|讨论|教程|方法(?:是)?|意思|名稱|名称|如何|怎麼|怎么|怎样|怎樣`
+        //    （過度封閉為受控 fail-safe 方向，接受）
+        // 4. 不以疑問尾標收尾（? ？ 嗎 吗 呢，見 [INTERROGATIVE_ENDINGS]）。
+        // 5. [hasSymbolQuery] 仍由呼叫端（missingQuestionFor）要求——剝離提示詞
+        //    後無有意義殘餘（無 Unicode 字母/數字）時轉 NEED_CLARIFICATION，
+        //    FAST 與否皆不可能（與先前行為一致）。
+        // `where` 仍不是准入依據（`where is symbol Foo` 不滿足句首動詞條件）。
+        // 命中准入 ⇒ 前閘成立；未命中 ⇒ 落入 RULES 迴圈，無規則命中則 no-match
+        // DENIED（reasonCode null）；命中 keyword 規則者落其原有 fail-closed
+        // 語意（如 `查 AlarmManager 符號呢` → alarm.create 缺時間澄清）——絕不執行。
+        // EN 開放詞彙一律 open-world deny-by-default：非命令式一律 no-match。
+        // CJK 否定顆粒（不/別/沒…）仍為封閉否定表（見 [NEGATION_HINTS]／
+        // [NEGATION_MARKERS]），屬防禦縱深，非本前閘之准入依據。
+        private val AFFIRMATIVE_OPENER_EN =
+            Regex("^(?:please[\\s,]+)?(?:find|search|lookup|locate)\\b", RegexOption.IGNORE_CASE)
+        private val AFFIRMATIVE_OPENER_EN_COMMAND = Regex("^symbols?\\s+\\S", RegexOption.IGNORE_CASE)
+        private val AFFIRMATIVE_OPENER_CJK =
+            Regex("^(?:(?:請|麻煩|帮我|幫我|给我|給我|请)[\\s，,]*)?(?:查|找|尋|搜|詢|寻|询)")
+        private val PERMISSION_CONDITIONAL_CLAUSE = Regex(
+            "\\bonly\\s+(?:after|when|if|until|once|before|with|upon)\\s+[a-z\\s]*?(?:approval|consent|permission)\\b" +
+                "|\\b(?:after|until|unless|once|when|while|if|before|since|whenever|as|because|provided|upon|following|pending|with|subject\\s+to|prior\\s+to|given|on)[\\s,]+" +
+                "(?:(?:i|we|you|they|anyone|he|she|it|my|our|your|their|his|her|the|this|that|a|an|some|any|prior|is|are|was|were|has|have|had|been)[\\s,]+){0,3}?" +
+                "(?:approv\\w*|agree\\w*|consent\\w*|confirm\\w*|say\\w*|said\\b|allow\\w*|release\\w*|permit\\w*|ok\\w*|okay\\w*|go[- ]?ahead\\w*|ready\\b|permission\\b|review\\b|(?:許可|许可|同意|核准|核準|批准|確認|确认|點頭|点头))" +
+                "|\\bwait\\s+(?:for|until|till)\\b" +
+                "|\\bhold\\s+(?:on|off)\\b" +
+                "|\\bnot\\s+yet\\b" +
+                "|等\\s*(?:我|我們|我们|你|他|她)?\\s*(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)" +
+                "|(?:同意|核准|核準|批准|確認|确认|許可|许可)(?:之後|之后|以後|以后|後|后)(?:再|才)?" +
+                "|只有.{0,8}才" +
+                "|只許.{0,8}才|只许.{0,8}才" +
+                "|只允.{0,8}才",
+            RegexOption.IGNORE_CASE,
+        )
+        private val TEACHING_DESCRIPTION_MARKER = Regex(
+            "\\b(?:explain\\w*|teach\\w*|tutorial|how\\s*-?\\s*to\\b|howto\\b|mean\\w*|describ\\w*|demonstrat\\w*)\\b" +
+                "|說明|説明|講解|讲解|介紹|介绍|討論|讨论|教程|方法(?:是)?|意思|名稱|名称|如何|怎麼|怎么|怎样|怎樣",
+            RegexOption.IGNORE_CASE,
+        )
         private val INTERROGATIVE_ENDINGS = charArrayOf('?', '？', '嗎', '吗', '呢')
 
+        // 授權子句/教學標記的正規化探針（#19 B3 stage-1 fix；解決 Cf/格式符拆分繞過）。
+        // NFKC → 剝 Cf/格式符 → 非字母/數字 run 摺成單一空白（`_` 保留——`after_approval`
+        // 之類識別字不得被拆成 after approval）為 spaced 探針；NFKC → Cf 直接刪除（不留空白）
+        // → 同樣摺疊為 joined 探針（字內部拆分如 `ap\u200Bprove` 才還原得回 `approve`）。
+        // 兩探針與 raw text 取聯集比對：任一命中即否決。CJK 字元皆 \p{L} 被保留，不拆。
+        private val CLAUSE_Cf = Regex("\\p{Cf}+")
+        private val CLAUSE_FOLD = Regex("[^\\p{L}\\p{N}_]+")
+        private val HANGUL_FILLER = Regex("[\\u115F\\u1160\\u3164\\uFFA0]+")
+        private val COMBINING_MARKS = Regex("\\p{M}+")
+
         /**
-         * Interrogative/teaching-request predicate for the symbol front gate:
-         * trimmed text starts with an EN question/teaching word (word-anchored,
-         * case-insensitive), starts with a CJK teaching/question opener, or ends
-         * with a CJK/EN question tail （? ？ 嗎 吗 呢）. Matching utterances are
-         * never symbol lookups — the symbol template does not match; the utterance
-         * falls through (no-match DENIED only when no keyword rule matches; otherwise
-         * the matching keyword rule's own fail-closed outcome — never FAST).
+         * NFKC + Cf-strip + whitespace-fold probe for the admission clauses. Two
+         * passes, evaluated as alternatives (union with the raw text):
+         * (a) [clauseProbeSpaced] — Cf folds into the space run: `if\u200BI approve`
+         *     rejoins as `if I approve`;
+         * (b) [clauseProbeJoined] — Cf is REMOVED silently: `ap\u200Bprove` rejoins as
+         *     `approve` (an intra-word split neither the raw text nor the spaced
+         *     probe can match).
+         * `_` (Pc) is KEEPED in both probes so identifiers like `after_approval`
+         * stay one word and cannot collide with the `after … approval` clause.
+         * Unlike [isNegated]'s three-text scheme this never feeds `\b`-less
+         * matching: [NEGATION_REMOVED]-style full removal is deliberately not
+         * used here (it would dissolve the very word boundaries the clause
+         * regexes anchor on).
          */
-        private fun isInterrogativeOrTeachingRequest(text: String): Boolean {
-            if (INTERROGATIVE_EN_PREFIX.containsMatchIn(text)) return true
-            if (INTERROGATIVE_CJK_PREFIX.containsMatchIn(text)) return true
-            return text.lastOrNull()?.let { it in INTERROGATIVE_ENDINGS } ?: false
+        private fun clauseProbeSpaced(text: String): String =
+            Normalizer.normalize(text, Normalizer.Form.NFKC).replace(CLAUSE_FOLD, " ").trim()
+
+        private fun clauseProbeJoined(text: String): String =
+            Normalizer.normalize(text, Normalizer.Form.NFKC)
+                .replace(CLAUSE_Cf, "")
+                .replace(CLAUSE_FOLD, " ")
+                .trim()
+
+        /**
+         * Affirmative-command admission predicate for the symbol front gate
+         * (#19 B3 stage-1). Returns true iff the trimmed raw text is an
+         * explicit lookup command: it opens with the EN verb set
+         * (optionally after a leading `please`), the EN single-word command
+         * form (`symbol(s) <name>`), or a CJK lookup verb (optionally after a
+         * politeness prefix 請|麻煩|帮我|幫我|给我|給我|请 directly followed by
+         * 查|找|尋|搜|詢|寻|询）; it contains NO permission/conditional/consent
+         * clause anywhere (checked against the raw text AND the two normalized
+         * probes, see [clauseProbeSpaced]/[clauseProbeJoined]); it contains NO
+         * teaching/description marker anywhere (same three texts); and its
+         * Cf-stripped view does NOT end with a question tail （? ？ 嗎 吗 呢）.
+         * The tail check ignores Cf/default-ignorables (best-effort) — it is
+         * NOT Unicode-complete: graphical punctuation after a question particle
+         * (`呢。`／`嗎！`) defeats it (narrow-tail limitation, recorded).
+         * Tail probe now also strips Hangul fillers (U+115F/U+1160/U+3164/U+FFA0) and combining marks (\p{M}); graphical punctuation after a particle remains the documented narrow-tail limitation.
+         *
+         * Any gate failure falls through to the RULES loop, then to no-match
+         * DENIED (reasonCode null) when nothing matches, or to the matching
+         * keyword template's own fail-closed outcome — never FAST.
+         *
+         * The predicate deliberately knows nothing about negation: the closed
+         * CJK negation table ([NEGATION_HINTS]/[NEGATION_MARKERS]) remains as
+         * defense in depth for command-led utterances carrying negation
+         * particles (e.g. `查 Foo 符號 不要`); the affirmative-command model is
+         * the admission basis, negation is not. English vocabulary is treated
+         * open-world deny-by-default: any non-command utterance no-matches.
+         * Over-clarification (an affirmative-looking command that still carries
+         * a teaching marker such as `查 Foo 符號的方法是`) is the accepted,
+         * controlled fail-safe direction — never the reverse.
+         */
+        private fun isAffirmativeSymbolCommand(text: String): Boolean {
+            val trimmed = text.trim()
+            if (trimmed.isEmpty()) return false
+            val opensWithCommand = AFFIRMATIVE_OPENER_EN.containsMatchIn(trimmed) ||
+                AFFIRMATIVE_OPENER_EN_COMMAND.containsMatchIn(trimmed) ||
+                AFFIRMATIVE_OPENER_CJK.containsMatchIn(trimmed)
+            if (!opensWithCommand) return false
+            val spaced = clauseProbeSpaced(trimmed)
+            val joined = clauseProbeJoined(trimmed)
+            if (PERMISSION_CONDITIONAL_CLAUSE.containsMatchIn(trimmed) ||
+                PERMISSION_CONDITIONAL_CLAUSE.containsMatchIn(spaced) ||
+                PERMISSION_CONDITIONAL_CLAUSE.containsMatchIn(joined)
+            ) {
+                return false
+            }
+            if (TEACHING_DESCRIPTION_MARKER.containsMatchIn(trimmed) ||
+                TEACHING_DESCRIPTION_MARKER.containsMatchIn(spaced) ||
+                TEACHING_DESCRIPTION_MARKER.containsMatchIn(joined)
+            ) {
+                return false
+            }
+            // 疑問尾標檢查跑在剝離 Cf/Hangul filler/combining mark 後的視圖上：
+            // 句尾預設忽略字（如 `查 Foo 符號呢\u200B`）及填充字/組合記號
+            // （如 `呢\u3164`／`呢\u0301`）不得翻轉 DENIED→FAST。
+            // best-effort：疑問顆粒後接圖形標點（`呢。`／`嗎！`）
+            // 仍躲過本檢查——narrow-tail 侷限，記錄於上方 KDoc。
+            val tailProbe = Normalizer.normalize(trimmed, Normalizer.Form.NFKC)
+                .replace(CLAUSE_Cf, "")
+                .replace(HANGUL_FILLER, "")
+                .replace(COMBINING_MARKS, "")
+                .trim()
+            return tailProbe.lastOrNull()?.let { it !in INTERROGATIVE_ENDINGS } ?: true
         }
         private val SLOW_HINTS = listOf(
             r("自動點擊"), r("自动点击"), r("點擊螢幕"), r("点击屏幕"), r("幫我點"), r("帮我点"),
@@ -374,7 +549,7 @@ class FastRouter(
          * [NEGATION_MARKERS] 收單一顆粒集（不 沒 没 別 别 勿 莫 嫑 否 無 无 免 未 毋 休）＋英文 \b 集。
          * [isNegated] 將兩表 OR 同命三個文本：否定詞片語是開放集合，
          * 封閉表不可能完整，故不猜——命中即澄清（過度澄清為 fail-safe 方向）。
-         * 「特別找」必澄清（先前即如此釘住）；「特別」/「别人」後接任意模板動詞
+         * 「特別找」非命令式句首、亦不命中 symbol 前閘 ⇒ no-match DENIED（非准入、原因為 no-match，永遠不會 FAST）；「特別」/「别人」後接任意模板動詞
          * 同樣轉澄清（A1 閘的必然結果，取代只收「別+動詞」的舊精度）。
          *
          * 擴表規則（B3 fail-safe ordering）：封閉動詞表——新工具上線為執行 ready
@@ -397,8 +572,7 @@ class FastRouter(
          * 「非字母/數字字元→空白」的文本上（見 [isNegated]），故 `別 查`／`不\u200B查`／
          * `不2查`／全形英文（`ｎｅｖｅｒ`）之類插入分隔符、組合字標記、Cf 格式符或寬度混淆的
          * 形式同樣不執行（澄清或 no-match DENIED）。
-         * 已知過度澄清殘餘：「特別找」含「別找」，會被誤轉澄清——屬安全方向
-         *（寧可澄清、絕不執行），可接受並以測試釘住。
+         * 已記錄：「特別找」含「別找」，但非命令式句首 ⇒ no-match DENIED（非准入、原因為 no-match，永遠不會 FAST，永遠不會執行）。
          * 已知侷限：複合句（「取消舊鬧鐘再設一個新的」同時命中模板與取消/停止詞）
          * 會被轉澄清，屬誤澄清（安全方向），由測試釘住。
          * 測試只釘住連續探針（sampling，非全表）：行為測試抽樣驗證，不宣稱整表行為。
@@ -425,18 +599,18 @@ class FastRouter(
          *       `cannot`/`later`/`afterwards` 類及未列舉動詞不涵蓋；`ban\w*` 會過度涵蓋 `banana` 以及識別字前綴（`BanController`、`BannerLayout`、`DenialOfServiceException`——皆 `\bban\w*\b`/`\bden[iy]\w*\b` 全詞命中，壓成需澄清而非誤執行）
          *       ——皆過度澄清 fail-safe 方向，接受並記錄；
          *   (d) 全形-only 符號 hint 不會路由（SYMBOL_HINTS 比對原始文本，安全方向）；
-         *   (e) `符號是Foo嗎` → no-match（A2 起：無 lookup marker，不進模板，reasonCode null）；
-         *       `特別找` 過度澄清（pinned）；`查理`→`理` 過度剝離（pinned）；
-         *       `意思是符號` → no-match（A2：無 lookup marker，reasonCode null）；
+         *   (e) `符號是Foo嗎` → no-match（無准入 ⇒ 不進模板，reasonCode null）；
+         *       `特別找` 現為 no-match（非命令式句首 ⇒ 不進模板，reasonCode null）；`查理`→`理` 過度剝離（pinned）；
+         *       `意思是符號` → no-match（無准入 ⇒ reasonCode null）；
          *   (f) CJK 異體字碼點（查 vs 査）未涵蓋。
-         * - 含 lookup marker 之否定句仍轉澄清（marker 命中模板後閘才會跑）；
-         *   無 marker 之否定句（如 `別問 Foo 符號`、`not symbols`）直接
+         * - 命令式肯定語句帶否定顆粒者（如 `查 Foo 符號 不要` 型）才會進模板後閘轉澄清；
+         *   非命令式句首者（如 `別問 Foo 符號`、`not symbols`、`我不想查 Foo 符號`）直接
          *   no-match DENIED——皆為 DENIED、絕不執行。
-         * - `查 是 符號` → clarify；`查 要 用 符號` → clarify（marker 命中，
-         *   剝離後無有意義殘餘）。無 marker 者一律 no-match：
+         * - `查 是 符號` → clarify；`查 要 用 符號` → clarify（命令式句首命中，
+         *   剝離後無有意義殘餘）。非命令式句首者一律 no-match：
          *   `什麼是符號`、`為什麼要用符號`、`符號是什麼`、`符號的意思`、
          *   `符號有哪些種類`、bare `symbols`、`What is a symbol?`、`Explain symbols`
-         *   （A2：不問模板語意，只問 lookup intent 的兩段式）。
+         *   （無命令式准入 ⇒ 不進 symbol 模板；否定閘不介入）。
          * - `查 find 符號`/`查 search 符號` 等：EN lookup 動詞同為剝離詞，
          *   符號名恰為 find/search/lookup/locate 者剝空 → clarify（pinned by
          *   `englishLookupMarkerStripped`）。
@@ -514,7 +688,8 @@ class FastRouter(
             // 無/无（無法＝unable）與 免（免查＝refrain/avoid）亦為否定語氣顆粒，
             // 保守閘必須收錄（否則「無法查 Foo 符號」「免查 Foo 符號」會落 FAST）。
             // 未（尚未查＝not yet）、毋（毋查＝do not, literary）、休（休查＝desist, literary）同為
-            // 否定語氣顆粒——「尚未查 Foo 符號」「未曾查 Foo 符號」「毋查 Foo 符號」「休查 Foo 符號」皆須澄清。
+            // 否定語氣顆粒——惟「尚未查 Foo 符號」「未曾查 Foo 符號」「毋查 Foo 符號」「休查 Foo 符號」
+            // 皆不滿足命令式句首（尚/未/毋/休 非查詢動詞）⇒ no-match DENIED（reasonCode null），否定閘不介入。
             r("無"), r("无"), r("免"), r("未"), r("毋"), r("休"),
             r("\\bno\\b"), r("\\bnot\\b"), r("\\bnever\\b"), r("\\bdon'?t\\b"), r("\\bdo not\\b"),
             r("\\bstop\\b"), r("\\bcancel\\b"), r("\\brefus\\w*\\b"), r("\\bavoid\\w*\\b"),
@@ -716,23 +891,23 @@ class FastRouter(
          * 內嵌名不受影響：`theSymbol`／`getSymbol`／`SymbolTable` 的 `the`/`symbol`
          * 無 word boundary ⇒ 完整保留。
          * Meta-question tokens (什麼/什么/為什麼/为什么/是什麼/是什么/怎麼/怎么/如何/意思/嗎/吗/呢)
-         * strip as well, so a marker-bearing utterance that reduces to empty
+         * strip as well, so an affirmative-command utterance that reduces to empty
          * (e.g. `查 是 符號`) clarifies rather than executing. Bare
-         * `符號是什麼？` itself carries no lookup marker, so under A2 it does not
-         * reach this path at all (no-match DENIED — pinned by test). The bare
+         * `符號是什麼？` carries no lookup command, so under the
+         * affirmative-command model it does not reach this path at all (no-match DENIED — pinned by test). The bare
          * meta-question verbs 是/的/要/用 are stripped
          * too since the B3 re-review:
          * 「查 是 符號」 / 「查 要 用 符號」 strip to empty and clarify — but note
-         * A2: utterances WITHOUT a lookup marker never reach this path at all
+         * utterances WITHOUT a lookup command never reach this path at all
          * （`什麼是符號`、`為什麼要用符號`、`符號的意思` 等一律 no-match DENIED）；
-         * clarify 只保留帶 marker 者。
+         * clarify 只保留帶命令式句首者。
          * Accepted over-strip residual class (recorded, safe direction):
          * 「符號是Foo嗎」 → query=Foo if it reached extraction (arguably a
          * legitimate query), and symbol names containing 是/的/要/用 are shredded
          * — both fail safe (a mis-query or a clarification, never a wrong
          * execution); this over-strip is accepted and documented here rather
-         * than fixed with token boundaries. A2: 「符號是Foo嗎」 no longer reaches
-         * this path — without a lookup marker the symbol template does not
+         * than fixed with token boundaries. 「符號是Foo嗎」 never reaches
+         * this path — without an affirmative command the symbol template does not
          * match at all (no-match DENIED).
          * The meaningful-remainder predicate lives in
          * [hasSymbolQuery]: at least one Unicode letter/digit must survive,
@@ -762,13 +937,6 @@ class FastRouter(
          * query — fail-safe direction. The esc test uses 𠮷 together with a
          * BMP anchor (`Foo`) for the same reason.
          */
-        // A2 explicit-intent predicate: single-word command form anchored at
-        // start (`symbol(s) <name>`), or any lookup marker anywhere. `where`
-        // intentionally NOT a marker — English question phrasings without a
-        // lookup verb route no-match (documented over-clarify → no-match).
-        private fun hasSymbolLookupIntent(text: String): Boolean =
-            SYMBOL_COMMAND_FORM.containsMatchIn(text) || SYMBOL_LOOKUP_MARKER.containsMatchIn(text)
-
         private fun hasSymbolQuery(text: String): Boolean =
             extractSymbolQuery(text).any { it.isLetterOrDigit() }
 
@@ -825,9 +993,8 @@ class FastRouter(
          * U+30FC, U+02C7, U+02C9, U+0640, U+3005) are stripped by `\p{Lm}+`;
          * the Lo Hangul fillers (U+115F/U+1160 — U+3164/U+FFA0 fold in via
          * NFKC) are removed explicitly for the same reason.
-         * The `查詢` compound is covered by substring match of 別查/不查. Over-clarify residual: `特別找` ⊃
-         * `別找` stays mis-routed to clarification — accepted as the safe tail
-         * (never executes).
+         * The `查詢` compound is covered by substring match of 別查/不查. 「特別找」為 no-match DENIED
+         * （非命令式句首、非准入、原因為 no-match，永遠不會 FAST，永遠不會執行）——pinned。
          */
         // [isNegated] 同命三個文本（raw / NFKCremoved / NFKCspaced）；A1 保守否定閘。
         // 兩表互補（COMPLEMENTARY），不得刪除單顆粒集或四個通用禁止詞：[NEGATION_MARKERS]

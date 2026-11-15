@@ -77,11 +77,14 @@ internal class DeadlineExceededException : RuntimeException()
  *   envelope 內文為 `capped + "\n[...TRUNCATED INPUT AT $PARSE_INPUT_CAP CHARS]"`
  *   （input sentinel）；input cap 不隨 maxBytes 放大；任一發生 → truncated=true。
  * - 快取：命中（[WebExtractCache]，TTL [DEFAULT_TTL_MS] 60min；key 含 URL 去 fragment
- *   ＋`maxBytes`＋`maxModelChars`＋policy identity（`policy`＋`configRevision`），
- *   不同 policy/revision 不互撞）仍須 per-call 政策重驗（含 DNS preflight，fail-closed）；
- *   重驗通過才回 `cached=true` 之副本，HTTP upstream 不再出發。
+ *   ＋`maxBytes`＋`maxModelChars`＋policy identity（`policy`＋`configRevision`）
+ *   ＋**hop-0 經當次重驗解析並授權之位址集合**（去重＋排序之 sorted set，
+ *   `round-robin` 返回答案順序不影響 key，length-prefix 附於 key 尾端），
+ *   相同 policy/revision 但不同首跳解析答案不互撞）仍須 per-call 政策重驗
+ *   （含 DNS preflight，fail-closed）；重驗通過才回 `cached=true` 之副本，HTTP upstream 不再出發。
  *   同 policy＋`configRevision` 不代表同一信任上下文——resolver／endpoint 為
- *   call-scoped，key 刻意不含二者（per-call 重驗才是真正的權威）；
+ *   call-scoped；hop-0 位址集合綁定首跳決策結果，但**不含 redirect 逐跳之信任上下文**
+ *   （已知殘留，見 D3 追蹤項 #1）；per-call 重驗仍是真正的權威；
  *   重驗失敗（denial／`Failed(TIMEOUT)`）不讀取快取，亦不觸 upstream。
  *   `Failed`／`Unavailable`／取消一律不寫。
  *   有界雙上限（正交）：筆數 [MAX_CACHE_ENTRIES]（200）＋位元組 [MAX_CACHE_BYTES]
@@ -92,6 +95,7 @@ internal class DeadlineExceededException : RuntimeException()
  *   跨 tier 內容永不共用。
  * - `inFlight` single-flight map：無界，但受 per-key timeout 有界（leader 受
  *   [TIMEOUT_MS] 端到端約束，逾時即完成並出 map；與 `WebSearchService` 同姿態）。
+ *   key 同樣綁 hop-0 位址集合（與快取相同 identity；redirect 逐跳殘留見 D3 追蹤項 #1）。
  *   `invalidate()` bump 快取 generation epoch、清空快取，並 drain 所有在途 entry
  *   例外完成（`CancellationException`）→ follower 映射 `Unavailable(CANCELLED)`；
  *   invalidate 之前建立之條目／在途結果永遠無法重新出現在 cache 或 follower 路徑。
@@ -138,11 +142,19 @@ internal class DeadlineExceededException : RuntimeException()
  * D3 追蹤項（production 接線前必解／必評估，#138/D3，否則不得 wiring）：
  * 1. cache key＝URL（去 fragment 後之修剪字串，**非正規化**：default port／
  *    case／percent-encoding 差異會產生重複 key——只是浪費，非正確性問題）
- *    ＋`maxBytes`＋`maxModelChars`＋`policy`＋`configRevision`；**不含 port
- *    維度之語義**（port 已內含於 URL 字串，無遺失，但 D3 須確認與政策側
- *    port 處理一致）；亦**刻意不含 resolver／endpoint 身份**——per-call
- *    政策重驗才是真正的權威；同一 URL 以不同 resolver 取用是允許的用法，
- *    呼叫方每次呼叫僅多付一次 policy preflight。
+ *    ＋`maxBytes`＋`maxModelChars`＋`policy`＋`configRevision`
+ *    ＋**hop-0 已核准位址集合**（[sortedDistinctAddressTokens]：位元組去重＋
+ *    `(大小, 位元組序)` 排序＋`hostAddress` join；length-prefix 附於 key 尾端；
+ *    round-robin 返回答案順序不影響 key）；不同首跳解析答案不互撞——
+ *    resolver／endpoint 身份仍**刻意不入 key**，binding 的是當次決策之**結果**
+ *    （已核准位址集合），per-call 政策重驗仍是真正的權威；同一 URL 以不同 resolver
+ *    取用是允許的用法，呼叫方每次呼叫僅多付一次 policy preflight。
+ *    **不含 port 維度之語義**（port 已內含於 URL 字串，無遺失，但 D3 須確認與政策側
+ *    port 處理一致）。
+ *    **已知殘留：redirect 逐跳之信任上下文尚未綁入 key**——僅 hop-0 綁定；
+ *    跨 redirect 之 A/B 位址差異目前仍可能命中（redirect 鏈上的 hop 不會改變
+ *    hop-0 的 key）；chain-recording 綁定（記錄逐跳 (url, 位址集合) 於 entry，
+ *    命中時逐跳重驗）於本 PR（#138）Phase 1 後續 commit 處理。
  * 2. cache **不解析 `Cache-Control`（含 `no-store`）**：TTL-only，屬刻意
  *    設計（read 工具、無寫副作用）；D3 須決定 honor 或明文件化此行為。
  * 3. `cleanField` 已由共享 15s 全程端到端預算限界（parse→clean 管線逐層
@@ -393,21 +405,40 @@ internal suspend fun fetchRawWithTimeout(
 private const val ENTRY_OVERHEAD_BYTES = 256L
 
 /**
+ * 解析後位址集合之正規化 token 列表：先以位元組 `contentToString()` 去重
+ *（同一 seeder 之 round-robin 多次答案不重複計入），再依
+ * `(位元組大小, 位元組序)` 排序（大小順序容差：不同答案順序產生相同 token），
+ * 最後以 `hostAddress` 呈現。cache key 綁定與（後續）鏈式驗證共用同一實作，
+ * 避免兩套排序／去重邏輯漂移。
+ */
+internal fun sortedDistinctAddressTokens(addresses: List<InetAddress>): List<String> =
+    addresses
+        .distinctBy { it.address.contentToString() }
+        .sortedWith(compareBy({ it.address.size }, { it.address.contentToString() }))
+        .map { it.hostAddress }
+
+/**
  * D4 抽取快取（TTL 60min；純 JVM）。
  *
  * - key＝去 fragment 之修剪字串（刻意**不做** URL 正規化，見 [stripFragment]
  *  與 header「D3 追蹤項」#1）＋`maxBytes`
  *  ＋`maxModelChars`＋policy identity（[EndpointNetworkOptIn.policy]＋
- *  [EndpointNetworkOptIn.configRevision]）；不同預算／不同 tier／
- *  不同 revision 絕不互撞；key 刻意不含 resolver／endpoint 身份
- *  （per-call 重驗才是真正的權威）。
+ *  [EndpointNetworkOptIn.configRevision]）
+ *  ＋**hop-0 經當次重驗解析並授權之位址集合**（[addressToken]：先以位元組
+ *  `contentToString()` 去重，再依 `(位元組大小, 位元組序)` 排序，以 `hostAddress`
+ *  join 為 `,`；length-prefix 附於 key 尾端）；不同預算／不同 tier／
+ *  不同 revision／不同首跳解析答案絕不互撞；`round-robin` 返回答案順序不影響 key；
+ *  key 不含 resolver／endpoint 身份（per-call 重驗才是真正的權威），hop-0 位址
+ *  集合僅綁定當次決策之結果；key 不含 redirect 逐跳之信任上下文（已知殘留，
+ *  見 header「D3 追蹤項」#1）。
  * - 只存 `Ok`（`Failed`／`Unavailable`／取消不寫）；寫入時 `cached` 正規化
  *   為 `false`，讀回時正規化為 `true`（快取內一律以 `cached=false` 儲存，
  *   讀出一律以 `cached=true` 呈現；[WebExtractOutcome.Ok.cached] 預設
  *   `false` 不變）。
  * - 快取命中仍須 per-call 政策重驗（含 DNS preflight，fail-closed）：相同
- *  `policy`＋`configRevision` 但不同 resolver／endpoint 安全上下文不得重用
- *  結果；重驗失敗（denial／TIMEOUT）不讀取快取；重驗本身不 purge
+ *  `policy`＋`configRevision` 但不同首跳解析答案（或不同 resolver／endpoint 安全上下文）
+ *  不得重用結果——key 已綁 hop-0 位址集合，不同解析答案根本不會命中；
+ *  重驗失敗（denial／TIMEOUT）不讀取快取；重驗本身不 purge
  *   快取；授權撤銷僅能經 `invalidate()`／bump `configRevision` 生效；跨 tier
  *  （不同 `policy`／`configRevision`）內容永不共用。
  * - 時鐘可注入，TTL-only（不解析 `Cache-Control`）：TTL 到期 lazy 淘汰＋`put` 順手掃；有界 LRU（access-order，`LinkedHashMap(accessOrder=true)`），雙上限正交：
@@ -461,13 +492,34 @@ class WebExtractCache(
     /** 目前 generation（供呼叫方捕獲 epoch 用）。 */
     internal val currentGeneration: Long get() = generation.get()
 
-    fun key(url: String, maxBytes: Int, maxModelChars: Int, optIn: EndpointNetworkOptIn): String {
+    /**
+     * hop-0 位址集合之字串 token（去重＋排序後 `hostAddress` join 為 `,`；空集合 → 空字串）。
+     * 僅 supply [key] 使用；token 本身不含分隔符 `\u0001`（hostAddress 只有 digits／`.`／`:`／`,`），
+     * 且以 length-prefix 附於 key 尾端，杜絕與 URL／budget 三域互混。
+     */
+    private fun addressToken(addresses: List<InetAddress>): String =
+        sortedDistinctAddressTokens(addresses).joinToString(",")
+
+    fun key(
+        url: String,
+        maxBytes: Int,
+        maxModelChars: Int,
+        optIn: EndpointNetworkOptIn,
+        addresses: List<InetAddress>,
+    ): String {
         val u = url.trim()
-        return "${u.length}:$u\u0001$maxBytes\u0001$maxModelChars\u0001${optIn.policy.name}\u0001${optIn.configRevision}"
+        val token = addressToken(addresses)
+        return "${u.length}:$u\u0001$maxBytes\u0001$maxModelChars\u0001${optIn.policy.name}\u0001${optIn.configRevision}\u0001${token.length}:$token"
     }
 
-    fun get(url: String, maxBytes: Int, maxModelChars: Int, optIn: EndpointNetworkOptIn): WebExtractOutcome.Ok? =
-        getByKey(key(url, maxBytes, maxModelChars, optIn))
+    fun get(
+        url: String,
+        maxBytes: Int,
+        maxModelChars: Int,
+        optIn: EndpointNetworkOptIn,
+        addresses: List<InetAddress>,
+    ): WebExtractOutcome.Ok? =
+        getByKey(key(url, maxBytes, maxModelChars, optIn, addresses))
 
     // read-side epoch guard：呼叫方傳入進入時捕獲之 epoch（per-call 重驗後、
     // cache 存取點 a／b 皆傳 epochAtEntry）；不符即視同 miss——invalidate 之後
@@ -486,10 +538,17 @@ class WebExtractCache(
         return entry?.outcome?.copy(cached = true, content = entry.outcome.content.copy())
     }
 
-    fun put(url: String, maxBytes: Int, maxModelChars: Int, optIn: EndpointNetworkOptIn, outcome: WebExtractOutcome.Ok) {
+    fun put(
+        url: String,
+        maxBytes: Int,
+        maxModelChars: Int,
+        optIn: EndpointNetworkOptIn,
+        addresses: List<InetAddress>,
+        outcome: WebExtractOutcome.Ok,
+    ) {
         // 公開 put() 以當下 generation 寫入（呼叫方對陳舊寫入的自辨屬其自身責任；
         // single-flight leader 路徑則傳入 extract() 入口捕獲之 epoch）。
-        putByKey(key(url, maxBytes, maxModelChars, optIn), outcome, generation.get())
+        putByKey(key(url, maxBytes, maxModelChars, optIn, addresses), outcome, generation.get())
     }
 
     internal fun putByKey(k: String, outcome: WebExtractOutcome.Ok, generationCaptured: Long) {
@@ -560,7 +619,8 @@ class WebExtractCache(
  * 與 [WebSearchService] 同併發姿態：
  * - 命中快取 → `cached=true`（per-call 重驗通過後，[WebExtractCache.getByKey]
  *   回傳副本即正規化 `cached=true`；HTTP upstream 不再出發，但當次政策重驗
- *   （含 DNS preflight）仍執行）；快取 key 含 policy identity（`policy`＋`configRevision`）；
+ *   （含 DNS preflight）仍執行）；快取 key 含 policy identity（`policy`＋`configRevision`）
+ *   ＋hop-0 已核准位址集合；
  *   快取 key 刻意不含 resolver／endpoint 身份；重驗失敗不讀取快取；
  *   命中前仍須 per-call 政策重驗（含 DNS preflight），不同 resolver／endpoint
  *   同 policy＋revision 不得重用結果；重驗本身不 purge 快取；
@@ -645,7 +705,6 @@ class WebExtractService(
         //（caller 自身仍正常拿到 outcome；僅 cache write 被抑制）。
         val epochAtEntry = cache.currentGeneration
         val hop0 = stripFragment(rawUrl.trim())
-        val k = cache.key(hop0, effBytes, effModel, optIn)
         while (true) {
             // per-call 政策重驗（含 DNS preflight），fail-closed；必須在 cache／
             // inFlight 存取之前完成——initial peek、lateHit（mutex 內）、follower join
@@ -682,6 +741,10 @@ class WebExtractService(
                     gate.denyCode,
                 )
             }
+            // hop-0 綁定：key 納入當次重驗所解析並授權之位址集合（與閘共用同一份
+            // eval，不二次查 DNS）；sorted set 語義（去重＋排序），round-robin
+            // 返回答案順序不影響 key identity。
+            val k = cache.key(hop0, effBytes, effModel, optIn, gate.resolvedAddresses)
             cache.getByKey(k, epochAtEntry)?.let { return it }
 
             var lateHit: WebExtractOutcome.Ok? = null

@@ -41,6 +41,9 @@ class WebExtractD4Test {
 
     private fun addr(literal: String): InetAddress = InetAddress.getByName(literal)
 
+    /** 固定良性 fixture 位址（TEST-NET-3，文件保留段）：direct cache key/get/put 呼叫共用。 */
+    private fun fixtureAddresses(): List<InetAddress> = listOf(addr("203.0.113.10"))
+
     /** Fake DNS：精確表，其餘拋 UnknownHostException。 */
     private fun fakeDns(vararg entries: Pair<String, List<String>>): HostResolver {
         val table = entries.toMap()
@@ -112,7 +115,7 @@ class WebExtractD4Test {
         optIn: EndpointNetworkOptIn,
     ): Long {
         val probe = WebExtractCache()
-        val k = probe.key(url, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn)
+        val k = probe.key(url, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses())
         return 256L + 2L * (k.length + snippet.length + envelope.length + "t".length + "https://e.com/x".length)
     }
 
@@ -635,8 +638,8 @@ class WebExtractD4Test {
         assertFalse(first.cached)
         // 以 cached=true 的 outcome 直接 put：put 內部一律正規化存 cached=false，
         // get 讀回一律正規化呈現 cached=true（僅能以 get 旗標觀測）。
-        cache.put(url, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, first.copy(cached = true))
-        val got = cache.get(url, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn)
+        cache.put(url, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), first.copy(cached = true))
+        val got = cache.get(url, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses())
         assertTrue("get 回傳一律 cached=true", got != null && got.cached)
         // 全新 service 共享同一 cache：第二輪必為 cached=true（當次政策重驗仍執行；HTTP upstream 不觸）
         val svc2 = WebExtractService(http, cache = cache)
@@ -1565,14 +1568,14 @@ class WebExtractD4Test {
         assertEquals("等長 url 應得等權重", w, expectedEntryWeight(u2, snippet, envelope, optIn))
         assertEquals("等長 url 應得等權重", w, expectedEntryWeight(u3, snippet, envelope, optIn))
         val cache = WebExtractCache(ttlMs = 60_000, clockMs = { now }, maxBytes = 2 * w + 1)
-        cache.put(u1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippet, envelope))
-        cache.put(u2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippet, envelope))
-        cache.put(u3, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippet, envelope))
+        cache.put(u1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), byteCacheOk(snippet, envelope))
+        cache.put(u2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), byteCacheOk(snippet, envelope))
+        cache.put(u3, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), byteCacheOk(snippet, envelope))
         // 容量僅 2 筆 → 最舊者（u1）被逐出
         assertEquals(2, cache.size)
-        assertTrue("u2 應在快取", cache.get(u2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) != null)
-        assertTrue("u3 應在快取", cache.get(u3, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) != null)
-        assertTrue("u1 應被逐出", cache.get(u1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) == null)
+        assertTrue("u2 應在快取", cache.get(u2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses()) != null)
+        assertTrue("u3 應在快取", cache.get(u3, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses()) != null)
+        assertTrue("u1 應被逐出", cache.get(u1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses()) == null)
     }
 
     @Test fun cacheSingleEntryHeavierThanCapNotCached() {
@@ -1583,9 +1586,9 @@ class WebExtractD4Test {
         val w = expectedEntryWeight(u, snippet, envelope, optIn)
         val cache = WebExtractCache(clockMs = { 1_000L }, maxBytes = w - 1)
         // 單筆超限 → put 正常返回（無例外），但不入快取
-        cache.put(u, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippet, envelope))
+        cache.put(u, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), byteCacheOk(snippet, envelope))
         assertEquals(0, cache.size)
-        assertTrue(cache.get(u, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) == null)
+        assertTrue(cache.get(u, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses()) == null)
     }
 
     @Test fun cacheTtlSweepFreesBytesForNewPut() {
@@ -1598,16 +1601,16 @@ class WebExtractD4Test {
         val u3 = "https://e.com/cccc"
         val w = expectedEntryWeight(u1, snippet, envelope, optIn)
         val cache = WebExtractCache(ttlMs = 60_000, clockMs = { now }, maxBytes = 2 * w + 1)
-        cache.put(u1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippet, envelope))
-        cache.put(u2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippet, envelope))
+        cache.put(u1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), byteCacheOk(snippet, envelope))
+        cache.put(u2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), byteCacheOk(snippet, envelope))
         assertEquals(2, cache.size)
         now += 60_000 // u1、u2 恰好到期
-        cache.put(u3, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippet, envelope))
+        cache.put(u3, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), byteCacheOk(snippet, envelope))
         // TTL sweep 於 put 內釋出過期 bytes → u3 放得下
         assertEquals(1, cache.size)
-        assertTrue("u3 應在快取", cache.get(u3, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) != null)
-        assertTrue("u1 應已過期不可見", cache.get(u1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) == null)
-        assertTrue("u2 應已過期不可見", cache.get(u2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) == null)
+        assertTrue("u3 應在快取", cache.get(u3, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses()) != null)
+        assertTrue("u1 應已過期不可見", cache.get(u1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses()) == null)
+        assertTrue("u2 應已過期不可見", cache.get(u2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses()) == null)
     }
 
     // ---- I. deadline／線性掃描回歸 ----
@@ -1742,14 +1745,14 @@ class WebExtractD4Test {
         val cache = WebExtractCache(ttlMs = 60_000, clockMs = { 1_000L })
         val optIn = EndpointNetworkOptIn()
         val e0 = cache.currentGeneration
-        val k = cache.key("https://e.com/r1", WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn)
-        cache.put("https://e.com/r1", WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk("revoke me", "envelope"))
+        val k = cache.key("https://e.com/r1", WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses())
+        cache.put("https://e.com/r1", WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), byteCacheOk("revoke me", "envelope"))
         assertTrue("同一世代條目必須可讀回", cache.getByKey(k, e0) != null)
         cache.clear()
         assertEquals(e0 + 1L, cache.currentGeneration)
         assertEquals("陳舊世代不得讀回", null, cache.getByKey(k, e0))
         assertEquals("清空後任何查詢必須 miss", null, cache.getByKey(k))
-        cache.put("https://e.com/r1", WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk("fresh generation content", "envelope2"))
+        cache.put("https://e.com/r1", WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), byteCacheOk("fresh generation content", "envelope2"))
         assertTrue("post-invalidate 之新世代條目必須可讀回", cache.getByKey(k, cache.currentGeneration) != null)
     }
 
@@ -1813,32 +1816,32 @@ class WebExtractD4Test {
         val wB = expectedEntryWeight(kUrl, snippetB, envelopeB, optIn)
         // 僅容 K(B)＋other(A) 一筆之餘裕
         val cache = WebExtractCache(ttlMs = 60_000, clockMs = { 1_000L }, maxBytes = wB + wA + 1)
-        cache.put(kUrl, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippetA, envelopeA))
+        cache.put(kUrl, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), byteCacheOk(snippetA, envelopeA))
         assertEquals(1, cache.size)
         // 覆寫同 key：size 維持 1（不得因舊 entry 未扣除而雙計）
-        cache.put(kUrl, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippetB, envelopeB))
+        cache.put(kUrl, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), byteCacheOk(snippetB, envelopeB))
         assertEquals("覆寫同 key 後 size 必須為 1", 1, cache.size)
-        cache.put(other1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippetA, envelopeA))
+        cache.put(other1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), byteCacheOk(snippetA, envelopeA))
         assertEquals("覆寫後之 bytes 計數必須容得下 other1（舊 entry 權重已扣除）", 2, cache.size)
         // 讀回 K：pin 覆寫扣除語義（K 此刻必須仍在）；get 同時把 K 提升為 MRU（accessOrder）。
         assertTrue(
             "覆寫後 K 必須仍可讀回（舊 entry 權重已扣除）",
-            cache.get(kUrl, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) != null,
+            cache.get(kUrl, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses()) != null,
         )
         // accessOrder：[other1, K] → put(other2) 使容量超 → 逐出最舊者 other1。
-        cache.put(other2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippetA, envelopeA))
+        cache.put(other2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), byteCacheOk(snippetA, envelopeA))
         assertEquals(2, cache.size)
         assertTrue(
             "K 經 get 提升為 MRU，應仍在快取",
-            cache.get(kUrl, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) != null,
+            cache.get(kUrl, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses()) != null,
         )
         assertTrue(
             "other1 為最舊者（K 曾被 get 提升），應被逐出",
-            cache.get(other1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) == null,
+            cache.get(other1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses()) == null,
         )
         assertTrue(
             "other2 應在快取",
-            cache.get(other2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) != null,
+            cache.get(other2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses()) != null,
         )
     }
 

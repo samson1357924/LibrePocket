@@ -171,7 +171,7 @@ class ShellExecRestrictedTest {
 
     @Test fun elevatedDeniedAndAuditedWithoutSpawn() {
         // S3 D09：提權唯一路徑為審計版 executeElevated（無 audit 過載已刪除，
-        // 全路徑強制留痕；見 ElevatedDispatch）。
+        // 全程帶審計（除 CE／Error 外恰一筆）；見 ElevatedDispatch）。
         val runner = FakeRunner(ByteArray(0))
         val audit = PrivilegeAuditLog()
         // 佔位 DenyingElevatedRunner：拒絕且不建子進程，同時寫 DENY 審計。

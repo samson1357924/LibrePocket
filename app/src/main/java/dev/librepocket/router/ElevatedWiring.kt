@@ -509,8 +509,8 @@ object ElevatedWiring {
         }
         // F3: bounded/safe recheck of untrusted argv (no uncontrolled equals/iterator on adversarial list)
         // 註：argvMatchesSnapshot 為非掛起函式且 frozenOrNull 全收斂 Throwable→null，此處 CE catch 為
-        // 防禦縱深（frozenOrNull 語義若改變仍保留 CE 不落 DENY 的不變式）；hostile list 的 CE 已於
-        // copyArgvBounded 內收斂為 false → Denied，見 reverifyArgvRecheckCancellationDeniedZeroSpawnPin。
+        // 防禦縱深（現況下不可達——frozenOrNull 全收斂 Throwable→null）；hostile list 的 CE 已於
+        // copyArgvBounded 內收斂為 null → argvMatchesSnapshot 回 false → Denied，見 reverifyArgvRecheckCancellationDeniedZeroSpawnPin。
         val argvOk = try {
             argvMatchesSnapshot(argv, snapshot.argv)
         } catch (e: CancellationException) {

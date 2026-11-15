@@ -25,7 +25,7 @@ import kotlinx.coroutines.CancellationException
 object ElevatedDispatch {
 
     /**
-     * 門禁先行、審計必行的提權執行。
+     * 門禁先行、審計必行（除 CancellationException／Error 外恰一筆）的提權執行。
      *
      * Phase 4（P2-1，PR #140）：入口先凍結 [request]（見
      * [dev.librepocket.shell.frozenOrNull]），同一凍結物件用於門禁
@@ -36,7 +36,7 @@ object ElevatedDispatch {
      * [ShellExecTool.executeElevated] 保證（非致命 throw 映 `Failed`＋一筆
      * FAILED 審計，致命重抛前亦已盡力審計），本函數不再另包 try/catch——
      * 重複捕捉即重複審計（`audit.size()==2` 違反單筆契約），故此處刻意只做
-     * 單一委派；「所有執行必有一筆審計」由工具層單點保證（直調工具層與經
+     * 單一委派；「所有執行（除 CE／Error 外恰一筆）必有一筆審計」由工具層單點保證（直調工具層與經
      * dispatch 同契約，見工具層 KDoc）。
      *
      * Round-4 Phase N（P2-1 gate-first＋SLA 統一＋P2-2 reason 上限）：

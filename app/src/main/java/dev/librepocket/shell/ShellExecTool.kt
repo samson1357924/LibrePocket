@@ -58,9 +58,9 @@ object ShellExecTool {
      * 提權執行（S3 D09，唯一產品路徑）：執行後把「種類名 + 雜湊」寫入 [audit]，
      * 輸出明文不進表。真實現（Shizuku/Root）由風味源集注入 [runner]。
      *
-     * 注意：無 audit 的過載已刪除 —— 任何提權執行都必須留痕，
+     * 注意：無 audit 的過載已刪除 —— 任何提權執行（除 CancellationException／Error 外恰一筆）都必須留痕，
      * 呼叫方一律傳 [PrivilegeAuditLog]（見 [dev.librepocket.router.ElevatedDispatch]，
-     * 先四參門禁再執行，全路徑審計）。
+     * 先四參門禁再執行，審計必行（除 CE／Error 外恰一筆）。
      *
      * Phase 4（P2-1，PR #140）：入口先 [frozenOrNull] 凍結 argv＋reason，
      * 同一凍結物件用於 gate（上游 [dev.librepocket.router.ElevatedDispatch]
@@ -69,7 +69,7 @@ object ShellExecTool {
      * 見 F9）即 `Denied(BLACKLISTED)` 且零 spawn，審計以空 argv＋原始
      * reasonCode 記一筆 DENY（argv 讀取本身不可信，故不雜湊原文）。
      *
-     * Round-3 Phase H（P2-5）：審計契約升級為「所有執行必有一筆審計」——
+     * Round-3 Phase H（P2-5）：審計契約升級為「所有執行（除 CE／Error 外恰一筆）必有一筆審計」——
      * [runner.run][ElevatedShellRunner.run] 非致命 throw（注入 fake 抛
      * `IllegalStateException`、真 runner 在 thread 建立／IO 邊界抛未預期例外）
      * 不再外抛：映 `Failed`（訊息經 [Redactor.redactError] 收斂，攜例外類名，

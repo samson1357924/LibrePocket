@@ -560,7 +560,9 @@ class SafeToolSlice(
     /**
      * Execute one attempt's model tool calls in order. Never throws except
      * [CancellationException] (cancel aborts remaining calls; partial
-     * results are discarded by the throw — zero further backend effects).
+     * results are discarded by the throw — zero further backend effects),
+     * [VirtualMachineError], and [ThreadDeath], which propagate unwrapped
+     * (fail-loud for fatal VM state; ordinary failures are typed denies).
      * Backend exceptions (non-cancel) are mapped to typed `EXEC_ERROR`
      * denials to preserve call-id pairing; a backend call exceeding the
      * registry `ToolAnnotations.timeoutMs` is a typed `EXEC_DENIED`.

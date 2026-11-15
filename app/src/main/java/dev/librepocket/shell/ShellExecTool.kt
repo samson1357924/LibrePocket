@@ -96,9 +96,13 @@ object ShellExecTool {
      * 產品調用方（傳 gate 後同一 frozen 經 [executeElevatedFrozen]；本函數僅供
      * Dispatch 外的防線縱深與單測直調，產品代碼禁止直調本函數繞過
      * [dev.librepocket.router.PrivilegeGate] 確認／投影／reason 門。誤調即編譯期
-     * 攔截（internal 可見性）＋ main 源集 token 掃描雙重防線；提權鏈 sole-entry
-     * 為 `ElevatedWiring.execute`（唯一合法呼叫方），本 PR 新 pin 見
-     * `ElevatedSoleEntryTest.soleEntryForExecuteWithFrozen`；本函數零直調同見
+     * 攔截（internal 可見性）＋ 產品源集（全 flavor、java＋kotlin、含 debug）token
+     * 掃描雙重防線；提權鏈 sole-entry 為 `ElevatedWiring.execute`（唯一合法呼叫方），
+     * 三 pin 見 `ElevatedSoleEntryTest.soleEntryForExecuteWithFrozen`
+     * （僅 Wiring 得呼叫）、`ElevatedSoleEntryTest.executeElevatedZeroAllowance`
+     * （zero tolerance，本函數零直調亦涵蓋）、
+     * `ElevatedSoleEntryTest.executeElevatedFrozenSoleEntry`（僅 ElevatedDispatch）；
+     * 殘餘同-package 裸呼叫需 code review 把關。本函數零直調同見
      * `ShellStage5Test.soleEntryNoDirectToolCallsInMain`）。
      */
     internal fun executeElevated(
@@ -141,7 +145,9 @@ object ShellExecTool {
      * （尤其 `MutableList` 背板：runner／審計讀到活引用即舊 snapshot TOCTOU
      * 重現）。公開入口一律走 [executeElevated]（入口凍結＋單次凍結 SLA）；
      * 同模組唯一產品調用為 [dev.librepocket.router.ElevatedDispatch]
-     * （傳 gate 後同一 frozen），跨模組產品調用不存在。
+     * （傳 gate 後同一 frozen），跨模組產品調用不存在（由
+     * `ElevatedSoleEntryTest.executeElevatedFrozenSoleEntry` pin 攔截；
+     * 僅 ElevatedDispatch.kt 允許命中）。
      * 本函數刻意不做二次凍結：傳未凍結物件的行為未定義（TOCTOU），由可見性
      * （internal）＋本契約防範，不另加執行期重驗。
      */

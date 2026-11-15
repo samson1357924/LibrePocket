@@ -142,8 +142,7 @@ object ElevatedDispatch {
      * PRECONDITION (defense-in-depth): caller MUST have completed tool/confirmation/projection/
      * policy/bridge/grant checks and post-confirm reverify on the same immutable snapshot.
      * Do not call with unverified or stale requests; misuse inside module can bypass gates.
-     * sole-entry 由 `ElevatedSoleEntryTest`（產品源集 main＋foss＋play＋github、
-     * 註解／字串剝離後的 token 掃描，best-effort tripwire）攔截，除 `ElevatedDispatch.kt`（宣明檔）外，產品源集出現 `executeWithFrozen(` 呼叫即 fail。
+     * sole-entry 由 `ElevatedSoleEntryTest`（產品源集 main＋foss＋play＋github＋debug，java＋kotlin 雙目錄 token 掃描，best-effort tripwire）攔截，除 `ElevatedDispatch.kt`（宣明檔）外，產品源集出現 `executeWithFrozen(` 呼叫即 fail。
      */
     internal fun executeWithFrozen(
         tool: ToolDef,

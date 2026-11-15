@@ -10,11 +10,14 @@ import dev.librepocket.tool.ProjectionContext
 import dev.librepocket.tool.ToolRegistry
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.nio.charset.Charset
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.GZIPOutputStream
 import kotlinx.coroutines.CancellationException
@@ -75,6 +78,8 @@ class WebExtractD4Test {
         val urls = java.util.Collections.synchronizedList(mutableListOf<String>())
         val pinnedAddressesSeen = java.util.Collections.synchronizedList(mutableListOf<List<InetAddress>>())
         val maxBytesSeen = java.util.Collections.synchronizedList(mutableListOf<Int>())
+        /** H2：每次 get() 收到之 headers 快照（ synchronized；供 Accept／禁送 header 契約斷言）。 */
+        val headersSeen = java.util.Collections.synchronizedList(mutableListOf<Map<String, String>>())
         val calls = AtomicInteger(0)
         override suspend fun get(
             url: String,
@@ -86,6 +91,7 @@ class WebExtractD4Test {
             calls.incrementAndGet()
             pinnedAddressesSeen.add(pinnedAddresses)
             maxBytesSeen.add(maxBytes)
+            headersSeen.add(headers.toMap())
             return pinnedHandler?.invoke(url, pinnedAddresses) ?: handler(url)
         }
     }
@@ -566,6 +572,16 @@ class WebExtractD4Test {
         assertEquals(1, countIgnoreCase(out.envelope, WebContentEnvelope.END))
         assertTrue(out.envelope.startsWith(WebContentEnvelope.BEGIN))
         assertTrue(out.envelope.trimEnd().endsWith(WebContentEnvelope.END))
+        // Q4：偽造 marker 之前後真文字（real／fake-inner／tail）必須保留且順序不變
+        //（剝除只收斂 marker 區段；不吃鄰字、不重排）。
+        assertTrue("real 應保留，got ${out.content.snippet}", out.content.snippet.contains("real"))
+        assertTrue("fake-inner 應保留，got ${out.content.snippet}", out.content.snippet.contains("fake-inner"))
+        assertTrue("tail 應保留，got ${out.content.snippet}", out.content.snippet.contains("tail"))
+        assertTrue(
+            "周遭文字順序不得改變，got ${out.content.snippet}",
+            out.content.snippet.indexOf("real") < out.content.snippet.indexOf("fake-inner") &&
+                out.content.snippet.indexOf("fake-inner") < out.content.snippet.indexOf("tail"),
+        )
     }
 
     @Test fun extractCfObfuscatedMarkersDoNotLeakToAnyField() = runBlocking {
@@ -610,7 +626,9 @@ class WebExtractD4Test {
             assertFalse("U+%04X 應被清理".format(cp), out.content.snippet.contains(ch))
             assertFalse("U+%04X 不得進 envelope".format(cp), out.envelope.contains(ch))
         }
-        assertTrue("換行應保留", out.envelope.contains("\n"))
+        // \n 於 HTML 管線經 Spaces（\s+→" "）收斂為單一空白；Cf 於 cleanField 剝除：
+        // 以左右鄰字（E/F/G，單空白相隔）結構完整取代恆真之 contains("\n") 斷言。
+        assertTrue("E/F/G 相鄰結構應保留於 envelope，got: ${out.envelope}", out.envelope.contains("E F G"))
     }
 
     @Test fun extractSanitizesCcAndExtraStripCodepoints() = runBlocking {
@@ -886,7 +904,9 @@ class WebExtractD4Test {
         val leader = async { svc.extract("https://example.com/lc", resolver = dns) }
         withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
         val follower = async { svc.extract("https://example.com/lc", resolver = dns) }
-        delay(30)
+        // Q5(b)：service/FakeExtract 未暴露 inFlight join 可觀測面（無公開 API 可輪詢
+        // follower 是否已註冊為 joiner），故以最小 150ms 延遲＋保留 withTimeout 護欄。
+        delay(150)
         leader.cancelAndJoin()
         val followerOut = withTimeout(5_000) { follower.await() }
         assertTrue("expected Unavailable, got $followerOut", followerOut is WebExtractOutcome.Unavailable)
@@ -911,7 +931,9 @@ class WebExtractD4Test {
         val leader = async { svc.extract("https://example.com/ioerr", resolver = dns) }
         withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
         val follower = async { svc.extract("https://example.com/ioerr", resolver = dns) }
-        delay(30)
+        // Q5(b)：service/FakeExtract 未暴露 inFlight join 可觀測面（無公開 API 可輪詢
+        // follower 是否已註冊為 joiner），故以最小 150ms 延遲＋保留 withTimeout 護欄。
+        delay(150)
         val leaderOut = withTimeout(5_000) { leader.await() }
         val followerOut = withTimeout(5_000) { follower.await() }
         // handler IOException → FetchOut.Fail(TRANSPORT)：leader 正常完成 Failed，
@@ -1050,7 +1072,9 @@ class WebExtractD4Test {
         val leader = async { svc.extract("https://example.com/drain", resolver = dns) }
         withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
         val follower = async { svc.extract("https://example.com/drain", resolver = dns) }
-        delay(30) // 讓 follower 進入 await()
+        // Q5(b)：service/FakeExtract 未暴露 inFlight join 可觀測面（無公開 API 可輪詢
+        // follower 是否已註冊為 joiner），故以最小 150ms 延遲＋保留 withTimeout 護欄。
+        delay(150)
         svc.invalidate()
         val followerOut = withTimeout(5_000) { follower.await() }
         assertTrue("invalidate 後 follower 應立即 fail-fast，got $followerOut", followerOut is WebExtractOutcome.Unavailable)
@@ -1477,9 +1501,15 @@ class WebExtractD4Test {
 
     @Test fun multiValuedContentEncodingFailsBadResponse() = runBlocking {
         val dns = publicDns("example.com")
-        // 多值（含逗號）→ BAD_RESPONSE：絕不猜測編碼
+        // 多值（含逗號）＋「合法 gzip body」組合：gate 必須於任何 decode 之前 reject——
+        // 若 gate 失效 fallthrough 至 gunzip，合法 gzip 會解出 → Ok；斷言 Failed(BAD_RESPONSE)
+        // 即釘死「gate 先於 decode」的順序，而非與 gate 失效同形的歷史版本。
+        val payload = "<p>hi</p>".toByteArray(Charsets.UTF_8)
+        val bos = ByteArrayOutputStream()
+        GZIPOutputStream(bos).use { it.write(payload) }
+        val compressed = bos.toByteArray()
         val http = FakeExtract {
-            WebExtractRawResponse(200, "<p>hi</p>".toByteArray(), mapOf("Content-Encoding" to "gzip, br"))
+            WebExtractRawResponse(200, compressed, mapOf("Content-Encoding" to "gzip, br"))
         }
         val svc = WebExtractService(http)
         val out = svc.extract("https://example.com/multiEnc", resolver = dns)
@@ -2346,6 +2376,7 @@ class WebExtractD4Test {
         assertEquals(4L * 1024 * 1024, WebExtract.MAX_CACHE_BYTES)
         assertEquals(200, WebExtract.MAX_CACHE_ENTRIES)
         assertEquals(262_144, WebExtract.DEFAULT_MAX_BYTES)
+        assertEquals(3, WebExtract.MAX_STALE_RESTARTS)
     }
 
     @Test fun bothTruncationCapsModelSentinelWinsFixture() = runBlocking {
@@ -2380,5 +2411,591 @@ class WebExtractD4Test {
             "input sentinel 不得出現（model cap 觸發時 model sentinel 勝出）",
             out.envelope.contains(WebExtract.TRUNCATED_INPUT_SENTINEL_MARK),
         )
+    }
+
+    // ---- K. Phase C：LLM 複審測試缺口收斂 ----
+
+    // R1 — surrogate pair 恰跨越 PARSE_INPUT_CAP（256k）邊界：parser 不得見孤兒 high surrogate
+    @Test fun parseInputCapCutDropsStraddlingSurrogatePairWholly() {
+        // "x"×262_143 ＋ 😀（surrogate pair：\uD83D\uDE00）＋ TAIL：pair 恰跨越 262_144 前綴邊界。
+        // PARSE_INPUT_CAP 為 private（=256*1024=262_144），此處硬編碼並鏡照既有 cap 測試命名。
+        val pair = "😀"
+        val doc = "x".repeat(262_144 - 1) + pair + "TAIL"
+        assertEquals(262_149, doc.length)
+        val parsed = parseHtml(doc, "https://example.com/")
+        assertTrue("parseHtml 應成功，got null", parsed != null)
+        assertTrue("input 前綴截斷必須回報 inputCapped=true", parsed!!.inputCapped)
+        assertFalse("snippet 不得含孤兒 high surrogate（\\uD83D）", parsed.content.snippet.contains('\uD83D'))
+        assertFalse("snippet 不得含孤兒 low surrogate（\\uDE00）", parsed.content.snippet.contains('\uDE00'))
+        assertFalse("邊界之後的 TAIL 不得出現於 snippet", parsed.content.snippet.contains("TAIL"))
+    }
+
+    @Test fun takeExtractPrefixBoundaryChecks() {
+        // takeExtractPrefix 純函式邊界：take(n) 切在 high surrogate 上必須 dropLast；
+        // 恰落在 pair 之後／EOF／n<=0／n>=length 逐一釘住。
+        val pair = "😀"
+        val doc = "x".repeat(262_144 - 1) + pair + "TAIL"
+        // R1 之邊界：262_144 之切點落在 pair 高半部 → 整體丟棄，輸出恰 262_143 個 'x'。
+        assertEquals(262_144 - 1, doc.takeExtractPrefix(262_144).length)
+        assertEquals(262_144 - 1, doc.takeExtractPrefix(262_144).count { it == 'x' })
+        assertEquals("", pair.takeExtractPrefix(1))          // 切在高半部 → 整體丟棄
+        assertEquals(pair, pair.takeExtractPrefix(2))       // 恰好涵蓋 pair
+        assertEquals("a", "a${pair}b".takeExtractPrefix(2))   // 切在高半部 → dropLast
+        assertEquals("a$pair", "a${pair}b".takeExtractPrefix(3)) // 恰好涵蓋 pair
+        assertEquals("abc$pair", "abc$pair".takeExtractPrefix(5)) // n == length → 原樣
+        assertEquals("abcd", "abcd".takeExtractPrefix(100))        // n > length → 原樣
+        assertEquals("", "abc".takeExtractPrefix(0))               // n <= 0 → ""
+        // envelope 層結構欄位上限之 helper 語義（siteName 253 為該層落實；service 不可達，見 L3 註解）
+        assertEquals(253, "x".repeat(300).takeExtractPrefix(253).length)
+        assertEquals(500, "x".repeat(600).takeExtractPrefix(500).length)
+        assertEquals(2048, "x".repeat(3000).takeExtractPrefix(2048).length)
+        assertEquals(128, "x".repeat(200).takeExtractPrefix(128).length)
+    }
+
+    // R2 — hit 之 chain 逐跳重驗期間 invalidate() 落地 → epoch re-check 必須判定 miss
+    @Test fun hitPathEpochRecheckSuppressesPostInvalidateCachedOk() = runBlocking {
+        // entry 以 resolver A 之 redirect fetch 種入（chain = [x.example.com hop0, y.example.net hop1]）。
+        // 第二次呼叫之 gated resolver：僅首次 resolve("y.example.net")（＝hit 重驗之 hop1）時阻斷；
+        // 測試主執行緒待 entered 後呼叫 invalidate()，再放行——重驗「阻斷中」世代已 bump、
+        // 快取已清空；epoch re-check 必須不接受此 hit → miss → refetch。
+        val dnsA = fakeDns(
+            "x.example.com" to listOf("10.0.0.30"),
+            "y.example.net" to listOf("203.0.113.41"),
+        )
+        val http = FakeExtract(
+            pinnedHandler = { url, pinned ->
+                when {
+                    url == "https://x.example.com/start" ->
+                        WebExtractRawResponse(302, ByteArray(0), mapOf("Location" to "https://y.example.net/secret"))
+                    pinned.any { it.hostAddress == "203.0.113.41" } -> okResp(html(body = "TENANT_A data"))
+                    else -> okResp(html(body = "UNEXPECTED_MARKER"))
+                }
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER")) },
+        )
+        val cache = WebExtractCache()
+        val svc = WebExtractService(http, cache = cache)
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val url = "https://x.example.com/start"
+        val first = svc.extract(url, optIn = optIn, resolver = dnsA) as WebExtractOutcome.Ok
+        assertFalse(first.cached)
+        val callsAfterSeed = http.calls.get()
+        assertEquals("seed 應恰 2 次上游（302＋終端）", 2, callsAfterSeed)
+
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val yGateSeen = AtomicBoolean(false)
+        val gated = HostResolver { host ->
+            if (host == "y.example.net" && yGateSeen.compareAndSet(false, true)) {
+                entered.countDown()
+                // 2s 上限：避免 invalidate 路徑損壞時鎖死。逾時會導致 re-check 於 bump 前通過 → cached=true → 斷言失敗（大聲失敗，絕非靜默通過）。
+                release.await(2_000, TimeUnit.MILLISECONDS)
+            }
+            dnsA.resolve(host)
+        }
+        val second = async { svc.extract(url, optIn = optIn, resolver = gated) }
+        try {
+            withTimeout(5_000) { while (entered.count > 0L) delay(1) }
+            assertEquals("extract 必須進入 chain 重驗（hop1）阻斷點", 0L, entered.count)
+            // invalidate() 於重驗阻斷中落地：世代 bump＋快取清空＋inFlight drain（此時尚無 entry）。
+            svc.invalidate()
+        } finally {
+            release.countDown()
+        }
+        val out = withTimeout(10_000) { second.await() }
+        assertTrue("expected Ok(cached=false), got $out", out is WebExtractOutcome.Ok)
+        assertFalse("invalidate 後之 hit 絕不得 cached=true", (out as WebExtractOutcome.Ok).cached)
+        assertEquals("epoch re-check 必須導向 miss＋refetch（302＋終端）", callsAfterSeed + 2, http.calls.get())
+    }
+
+    // R3 — https→http 降級對注入 cache 條目：hit 路徑 defense-in-depth 必須視為 miss
+    @Test fun injectedHttpHopPairInCachedChainIsTreatedAsMiss() = runBlocking {
+        // 內部 putByKey 直接注入 chain = [https://a.example/, http://b.example/] 之條目
+        //（生產 fetch 路徑永遠不可能產生此鏈——https→http 一律被拒絕）；
+        // hit 之逐跳重驗必須在 hop1 之 scheme 檢查 miss、重打 upstream，絕不交付 poisoned Ok。
+        val dns = fakeDns(
+            "a.example" to listOf("203.0.113.10"),
+            "b.example" to listOf("203.0.113.20"),
+        )
+        val http = FakeExtract { okResp(html(body = "FRESH body")) }
+        val cache = WebExtractCache()
+        val svc = WebExtractService(http, cache = cache)
+        val optIn = EndpointNetworkOptIn()
+        val url0 = "https://a.example/"
+        val k = cache.key(url0, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, listOf(addr("203.0.113.10")))
+        val chain = listOf(
+            HopBinding("https://a.example/", sortedDistinctAddressTokens(listOf(addr("203.0.113.10")))),
+            HopBinding("http://b.example/", sortedDistinctAddressTokens(listOf(addr("203.0.113.20")))),
+        )
+        cache.putByKey(k, byteCacheOk("POISONED_TENANT content", "poisoned envelope"), cache.currentGeneration, chain)
+        val out = svc.extract(url0, optIn = optIn, resolver = dns) as WebExtractOutcome.Ok
+        assertFalse("https→http poisoned chain 之條目絕不得命中（cached=false）", out.cached)
+        assertFalse("不得交付 poisoned 內容，got ${out.content.snippet}", out.content.snippet.contains("POISONED"))
+        assertTrue("應交付 fresh refetch 內容，got ${out.content.snippet}", out.content.snippet.contains("FRESH"))
+        assertEquals("refetch 應恰恰一次 upstream", 1, http.calls.get())
+    }
+
+    // R4 — URL_TOO_LONG：8193 code units fail-closed，resolver 零喚起、upstream 零次；8192 放行
+    @Test fun urlTooLongGateFailsClosedBeforeAnyPolicyOrDns() = runBlocking {
+        var resolverInvoked = false
+        val recordingDns = HostResolver { _ ->
+            resolverInvoked = true
+            listOf(addr("203.0.113.10"))
+        }
+        val http = FakeExtract { okResp(html()) }
+        val svc = WebExtractService(http)
+        val prefix = "https://example.com/"
+        fun urlOfLen(n: Int): String = prefix + "a".repeat(n - prefix.length)
+        val tooLong = urlOfLen(8193) // MAX_URL_CHARS(8192) + 1
+        assertEquals(8193, tooLong.length)
+        val out = svc.extract(tooLong, resolver = recordingDns)
+        assertTrue("expected Unavailable, got $out", out is WebExtractOutcome.Unavailable)
+        val u = out as WebExtractOutcome.Unavailable
+        assertEquals(WebExtract.DETAIL_URL_TOO_LONG, u.detail)
+        assertEquals(null, u.denyCode)
+        assertFalse("resolver 絕不得被喚起（policy／DNS gate 之前 fail-closed）", resolverInvoked)
+        assertEquals(0, http.calls.get())
+        // 邊界 8192：通過 gate → 正常 policy/fetch 路徑（非 URL_TOO_LONG）
+        val atLimit = urlOfLen(8192)
+        assertEquals(8192, atLimit.length)
+        val ok = svc.extract(atLimit, resolver = publicDns("example.com"))
+        assertTrue("8192 邊界應通過 gate（expected Ok, got $ok）", ok is WebExtractOutcome.Ok)
+    }
+
+    // R5 — stripScriptAndStyle Phase A rewrite 回填案例（findTagEnd==-1／全大寫候選）；L4 併案
+    @Test fun stripScriptAndStyleRewriteBackfillsUnterminatedAndUppercase() {
+        // (a) 未閉合引號屬性之 <script data-x="unterminated：findTagEnd == -1 且全文無 closeMark
+        //     → 自開始標籤剝至 EOF → snippet == "A"。
+        val unterminated = parseHtml("""A<script data-x="unterminated""", "https://example.com/")
+        assertTrue("parseHtml 應成功，got null", unterminated != null)
+        assertEquals("A", unterminated!!.content.snippet)
+        // (b) 全大寫 <STYLE>／<SCRIPT> 皆為候選（case-insensitive）：A 前置 → "ABC"
+        val uppercase = parseHtml("A<STYLE>CSS</STYLE>B<SCRIPT>JS</SCRIPT>C", "https://example.com/")
+        assertTrue("parseHtml 應成功，got null", uppercase != null)
+        assertEquals("ABC", uppercase!!.content.snippet)
+        // L4：裸 <script（無任何屬性、無收尾）→ 同樣剝至 EOF → "A"
+        val bare = parseHtml("A<script", "https://example.com/")
+        assertTrue("parseHtml 應成功，got null", bare != null)
+        assertEquals("A", bare!!.content.snippet)
+    }
+
+    // H1 — 非 2xx 終端：Failed("HTTP_<code>")；不寫快取（重打必 miss、upstream 重發）
+    @Test fun nonTwoXxTerminalsFailWithHttpCodeDetailAndNeverCached() = runBlocking {
+        val dns = publicDns("example.com")
+        // 404／500：一般終端錯誤；304（isRedirectStatus 明確排除）：亦落 Failed("HTTP_304") 而非跟隨
+        for (code in listOf(404, 500, 304)) {
+            val http = FakeExtract { WebExtractRawResponse(code, ByteArray(0)) }
+            val cache = WebExtractCache()
+            val svc = WebExtractService(http, cache = cache)
+            val out = svc.extract("https://example.com/status-$code", resolver = dns)
+            assertTrue("code=$code expected Failed, got $out", out is WebExtractOutcome.Failed)
+            assertEquals("HTTP_$code", (out as WebExtractOutcome.Failed).detail)
+            assertEquals("code=$code：Failed 絕不得寫快取", 0, cache.size)
+            svc.extract("https://example.com/status-$code", resolver = dns)
+            assertEquals("code=$code：重打必再發 upstream（calls==2）", 2, http.calls.get())
+        }
+    }
+
+    // H2 — 請求 headers 契約：Accept 恰為 WebExtract.kt 之字面值；無 credentials 類 header
+    @Test fun requestHeadersContractSendsAcceptOnlyAndNeverCredentials() = runBlocking {
+        val dns = publicDns("example.com")
+        val http = FakeExtract { okResp(html()) }
+        val svc = WebExtractService(http)
+        svc.extract("https://example.com/hdr", resolver = dns)
+        assertEquals("恰一次上游", 1, http.headersSeen.size)
+        val headers = http.headersSeen.first()
+        assertEquals("text/html, text/plain;q=0.9, */*;q=0.1", headers["Accept"])
+        assertEquals("Accept 為唯一送出之 header，got ${headers.keys}", 1, headers.size)
+        for (forbidden in listOf("cookie", "authorization", "proxy-authorization")) {
+            assertTrue(
+                "不得送出 $forbidden（CI 比對），got ${headers.keys}",
+                headers.keys.none { it.equals(forbidden, ignoreCase = true) },
+            )
+        }
+    }
+
+    // M4 — published 別名參數化釘住（property／name 屬性形態＋一個大小寫不敏感變體）
+    @Test fun publishedAliasesExtractFromMetaFixtures() = runBlocking {
+        val dns = publicDns("example.com")
+        val aliases = listOf("datePublished", "publish_date", "pubdate", "dc.date")
+        for (alias in aliases) {
+            val doc = """<html><head><title>T</title><meta property="$alias" content="2024-01-02"></head><body><p>body text</p></body></html>"""
+            val http = FakeExtract { okResp(doc) }
+            val out = WebExtractService(http).extract("https://example.com/alias-$alias", resolver = dns) as WebExtractOutcome.Ok
+            assertEquals("alias $alias 應抽取出 published", "2024-01-02", out.content.published)
+        }
+        // name 屬性形態亦生效（PUBLISHED_ALIASES 對 property／name 一視同仁）
+        val nameDoc = """<html><head><title>T</title><meta name="datePublished" content="2024-03-04"></head><body><p>body text</p></body></html>"""
+        val nameOut = WebExtractService(FakeExtract { okResp(nameDoc) })
+            .extract("https://example.com/alias-name", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals("name 屬性形態應抽取出 published", "2024-03-04", nameOut.content.published)
+        // 大小寫不敏感變體：Article:Published_Time（屬性值 lowercase 後與 article:published_time 匹配）
+        val mixedDoc = """<html><head><title>T</title><meta property="Article:Published_Time" content="2024-05-06"></head><body><p>body text</p></body></html>"""
+        val mixedOut = WebExtractService(FakeExtract { okResp(mixedDoc) })
+            .extract("https://example.com/alias-mixed", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals("大小寫不敏感變體應抽取出 published", "2024-05-06", mixedOut.content.published)
+    }
+
+    // M5 — 裸（無引號）屬性值：<meta property=… content=2024-01-02> → published 原樣抽取
+    @Test fun metaBareAttributeValueWithoutQuotesParsesPublished() = runBlocking {
+        val dns = publicDns("example.com")
+        val doc = """<html><head><title>T</title><meta property=article:published_time content=2024-01-02></head><body><p>body text</p></body></html>"""
+        val http = FakeExtract { okResp(doc) }
+        val out = WebExtractService(http).extract("https://example.com/bare-attr", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals("2024-01-02", out.content.published)
+    }
+
+    // M6 — unescapeHtml 雙層 entity 順序：&amp;lt; 只解一層；&#38;lt; 解為 &lt;
+    @Test fun doubleUnescapeOrderPreservesEntityText() = runBlocking {
+        val dns = publicDns("example.com")
+        // ① &amp;lt;script&amp;gt;：具體 entity 先於 &amp; 解碼 → 只解一層 → 含 "&lt;script&gt;"、絕不含 "<script>"
+        val httpA = FakeExtract { okResp(html(body = "&amp;lt;script&amp;gt;")) }
+        val outA = WebExtractService(httpA).extract("https://example.com/unesc-a", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("snippet 應含 &lt;script&gt;，got ${outA.content.snippet}", outA.content.snippet.contains("&lt;script&gt;"))
+        assertFalse("不得再解一層為 <script>，got ${outA.content.snippet}", outA.content.snippet.contains("<script>"))
+        // ② &#38;lt;：NUMERIC_ENTITY 先於 &amp; 解碼 → &#38; → '&' → 與 'lt;' 相接為 "&lt;"
+        val httpB = FakeExtract { okResp(html(body = "&#38;lt;")) }
+        val outB = WebExtractService(httpB).extract("https://example.com/unesc-b", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("&#38; 應解為 &，相接為『&lt;』，got ${outB.content.snippet}", outB.content.snippet.contains("&lt;"))
+        assertFalse("不得含裸 <，got ${outB.content.snippet}", outB.content.snippet.contains("<"))
+    }
+
+    // M7 — MAX_CACHE_ENTRIES（200）筆數上限逐出：第 201 筆插入 → 最舊者（首筆）被逐出
+    @Test fun cacheEntryCapEvictsEldestAt201stInsert() {
+        val now = 1_000L
+        val optIn = EndpointNetworkOptIn()
+        val cache = WebExtractCache(ttlMs = 60_000, clockMs = { now })
+        val urls = (0..200).map { "https://e.com/cap%03d".format(it) } // 201 個等長 url
+        for (u in urls) {
+            cache.put(u, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), byteCacheOk("s", "e"))
+        }
+        assertEquals("201 筆插入後應恰為 200", WebExtract.MAX_CACHE_ENTRIES, cache.size)
+        assertTrue(
+            "最舊（${urls.first()}）應已被逐出",
+            cache.get(urls.first(), WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses()) == null,
+        )
+        assertTrue(
+            "次舊（${urls[1]}）應仍在快取",
+            cache.get(urls[1], WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses()) != null,
+        )
+        assertTrue(
+            "最新（${urls.last()}）應仍在快取",
+            cache.get(urls.last(), WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses()) != null,
+        )
+    }
+
+    // M8 — redirect-hop preflight 與全程 deadline 共用預算：hop2 DNS 阻斷 5s → Failed(TIMEOUT)，hop2 upstream 絕不發送
+    @Test fun secondHopPreflightTimeoutAbortsBeforeAnyUpstreamToSecondHost() = runBlocking {
+        val dns = HostResolver { host ->
+            if (host == "slow2.example") {
+                Thread.sleep(5_000)
+                listOf(InetAddress.getByName("203.0.113.11"))
+            } else {
+                listOf(InetAddress.getByName("203.0.113.10"))
+            }
+        }
+        val http = FakeExtract { url ->
+            if (url.contains("/start")) {
+                WebExtractRawResponse(302, ByteArray(0), mapOf("Location" to "https://slow2.example/next"))
+            } else {
+                okResp(html())
+            }
+        }
+        val svc = WebExtractService(http, timeoutMs = 300)
+        val out = withTimeout(5_000) { svc.extract("https://start.example/start", resolver = dns) }
+        assertTrue("expected Failed, got $out", out is WebExtractOutcome.Failed)
+        assertEquals(WebExtract.DETAIL_TIMEOUT, (out as WebExtractOutcome.Failed).detail)
+        assertEquals("hop2 upstream 絕不得發出（僅首跳 302）", 1, http.calls.get())
+    }
+
+    // M9 — application/xhtml+xml 派發 HTML 管線：tag 剝除＋title 解析（證明 HTML family dispatch）
+    @Test fun xhtmlMimeDispatchesToHtmlPipeline() = runBlocking {
+        val dns = publicDns("example.com")
+        val doc = """<html><head><title>XHTML Title</title></head><body><p>World content here</p></body></html>"""
+        val http = FakeExtract {
+            WebExtractRawResponse(
+                200,
+                doc.toByteArray(Charsets.UTF_8),
+                mapOf("Content-Type" to "application/xhtml+xml; charset=utf-8"),
+            )
+        }
+        val out = WebExtractService(http).extract("https://example.com/xhtml", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals("XHTML Title", out.content.title)
+        assertTrue("snippet 應含正文，got ${out.content.snippet}", out.content.snippet.contains("World content here"))
+        assertFalse("HTML 管線必須剝除 <p> 標籤，got ${out.content.snippet}", out.content.snippet.contains("<p>"))
+    }
+
+    // M10 — charset 路徑：(a) GBK round-trip；(b) 未知 charset → UTF-8 降級（replace，不 crash）
+    @Test fun gbkDeclaredCharsetDecodesChineseCorrectly() = runBlocking {
+        val dns = publicDns("example.com")
+        val gbk = Charset.forName("GBK")
+        val doc = "<html><head><title>T</title></head><body><p>中文內容</p></body></html>"
+        val http = FakeExtract {
+            WebExtractRawResponse(200, doc.toByteArray(gbk), mapOf("Content-Type" to "text/html; charset=gbk"))
+        }
+        val out = WebExtractService(http).extract("https://example.com/gbk", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("GBK 解碼應還原『中文內容』，got ${out.content.snippet}", out.content.snippet.contains("中文內容"))
+    }
+
+    @Test fun unknownCharsetFallsBackToUtf8LossyWithoutCrash() = runBlocking {
+        val dns = publicDns("example.com")
+        // 0xFF 於 UTF-8 為 malformed → 解碼為 U+FFFD；Ok 不得 crash
+        val body = "<html><head><title>T</title></head><body><p>A".toByteArray(Charsets.UTF_8) +
+            byteArrayOf(0xFF.toByte()) +
+            "B</p></body></html>".toByteArray(Charsets.UTF_8)
+        val http = FakeExtract {
+            WebExtractRawResponse(200, body, mapOf("Content-Type" to "text/html; charset=x-unknown-charset"))
+        }
+        val out = WebExtractService(http).extract("https://example.com/unknown-charset", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("UTF-8 降級應保留 A/B 周邊內容，got ${out.content.snippet}",
+            out.content.snippet.contains("A") && out.content.snippet.contains("B"))
+        assertTrue("malformed 位元組應解為 U+FFFD，got ${out.content.snippet}", out.content.snippet.contains('\uFFFD'))
+    }
+
+    // M11 — 空鏈 scaffold 條目（internal put）：鎖內直接命中、零重驗；chain 變體 revalidation 失敗 → miss+refetch 之對照
+    @Test fun internalScaffoldEmptyChainEntryServesHitWithZeroRevalidation() = runBlocking {
+        // internal put() 之空鏈條目：無從重驗 → 沿用舊命中語義（零 DNS／policy 之鏈驗證）。
+        // 以「第 2 次起任何 resolver 呼叫即拋」之 resolver 釘住：若 hit 路徑嘗試鏈驗證，即 fail-closed；
+        // Ok（cached=true）且 resolver 恰 1 次（per-call 重驗）才能證明零鏈驗證。
+        val cache = WebExtractCache()
+        val http = FakeExtract { okResp(html(body = "SHOULD NOT BE FETCHED")) }
+        val svc = WebExtractService(http, cache = cache)
+        val optIn = EndpointNetworkOptIn()
+        val url = "https://example.com/scaffold"
+        val resolverCalls = AtomicInteger(0)
+        val dns = HostResolver { _ ->
+            if (resolverCalls.incrementAndGet() > 1) {
+                throw UnknownHostException("hit 路徑不應再觸 DNS（空鏈無從重驗）")
+            }
+            listOf(addr("203.0.113.10"))
+        }
+        cache.put(url, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), byteCacheOk("scaffold snippet", "scaffold envelope"))
+        val out = svc.extract(url, optIn = optIn, resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("空鏈 scaffold 條目必須命中（cached=true）", out.cached)
+        assertEquals("空鏈零鏈驗證：僅 per-call 重驗之 1 次 DNS", 1, resolverCalls.get())
+        assertEquals("scaffold hit 不得觸 upstream", 0, http.calls.get())
+    }
+
+    @Test fun chainCarryingEntryFailingRevalidationIsTreatedAsMissAndRefetched() = runBlocking {
+        // 對照：攜帶 chain 之條目 revalidation token 不符（resolver 答案 203.0.113.10 ≠ 記錄 203.0.113.99）
+        // → 視為 miss、refetch、cached=false、絕不交付 stale Ok。
+        val dns = publicDns("example.com")
+        val http = FakeExtract { okResp(html(body = "FRESH chain content")) }
+        val cache = WebExtractCache()
+        val svc = WebExtractService(http, cache = cache)
+        val optIn = EndpointNetworkOptIn()
+        val url = "https://example.com/chainmiss"
+        val k = cache.key(url, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses())
+        val chain = listOf(HopBinding(url, listOf("203.0.113.99")))
+        cache.putByKey(k, byteCacheOk("STALE poisoned", "stale envelope"), cache.currentGeneration, chain)
+        val out = svc.extract(url, optIn = optIn, resolver = dns) as WebExtractOutcome.Ok
+        assertFalse("chain revalidation 失敗必須 miss+refetch（cached=false）", out.cached)
+        assertFalse("不得交付 stale 內容，got ${out.content.snippet}", out.content.snippet.contains("poisoned"))
+        assertTrue("應交付 fresh refetch 內容", out.content.snippet.contains("FRESH"))
+        assertEquals(1, http.calls.get())
+    }
+
+    // M12 — round-robin 答案順序／重複對 cache key 不變（sortedDistinctAddressTokens 去重＋排序）：同一 key 合流
+    @Test fun roundRobinAnswerOrderSharesOneCacheKey() = runBlocking {
+        val patterns = listOf(
+            listOf("10.0.0.11", "10.0.0.12"),
+            listOf("10.0.0.12", "10.0.0.11"),
+            listOf("10.0.0.11", "10.0.0.11", "10.0.0.12"),
+        )
+        val order = AtomicInteger(0)
+        val dns = HostResolver { _ ->
+            patterns[order.getAndIncrement() % patterns.size].map(::addr)
+        }
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val http = FakeExtract { okResp(html()) }
+        val svc = WebExtractService(http)
+        val first = svc.extract("https://rr.example/page", optIn = optIn, resolver = dns) as WebExtractOutcome.Ok
+        assertFalse(first.cached)
+        val second = svc.extract("https://rr.example/page", optIn = optIn, resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("答案順序交換不得分裂 cache key（cached=true）", second.cached)
+        val third = svc.extract("https://rr.example/page", optIn = optIn, resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("含重複答案之多重集亦須同 key（cached=true）", third.cached)
+        assertEquals("upstream 僅一次", 1, http.calls.get())
+    }
+
+    // M13 — defensive arms：EMPTY_URL／InterruptedIOException→TIMEOUT／generic Exception→TRANSPORT
+    @Test fun emptyAndBlankUrlMapsToUnavailableEmptyUrlZeroUpstream() = runBlocking {
+        val dns = publicDns("example.com")
+        val http = FakeExtract { okResp(html()) }
+        val svc = WebExtractService(http)
+        for (raw in listOf("", "   ", "\t\n ")) {
+            val out = svc.extract(raw, resolver = dns)
+            assertTrue("expected Unavailable, got $out", out is WebExtractOutcome.Unavailable)
+            assertEquals(WebExtract.DETAIL_EMPTY_URL, (out as WebExtractOutcome.Unavailable).detail)
+            assertEquals(null, out.denyCode)
+        }
+        assertEquals(0, http.calls.get())
+    }
+
+    @Test fun interruptedIoExceptionMapsToTimeout() = runBlocking {
+        val dns = publicDns("example.com")
+        val http = FakeExtract { throw InterruptedIOException("interrupted") }
+        val svc = WebExtractService(http)
+        val out = svc.extract("https://example.com/iie", resolver = dns)
+        assertTrue(out is WebExtractOutcome.Failed)
+        assertEquals(WebExtract.DETAIL_TIMEOUT, (out as WebExtractOutcome.Failed).detail)
+        assertEquals(1, http.calls.get())
+    }
+
+    @Test fun genericExceptionMapsToTransport() = runBlocking {
+        val dns = publicDns("example.com")
+        val http = FakeExtract { throw IllegalStateException("boom") }
+        val svc = WebExtractService(http)
+        val out = svc.extract("https://example.com/ise", resolver = dns)
+        assertTrue(out is WebExtractOutcome.Failed)
+        assertEquals(WebExtract.DETAIL_TRANSPORT, (out as WebExtractOutcome.Failed).detail)
+        assertEquals(1, http.calls.get())
+    }
+
+    // M13 — policyGate OverloadRejected → Failed(TRANSPORT)。
+    // 注入途徑：policyGate 對 defaultPreflightExecutor（16 threads／SynchronousQueue／AbortPolicy）
+    // 提交 DNS preflight；executor 無注入縫，唯一確定性觸發 OverloadRejected 之途徑＝把 executor 塞滿。
+    // fixture：連續投入阻斷於 latch 之 blocker，並以 probe extract 判定是否已滿；
+    // probe 回 Failed(TRANSPORT) 即代表 submit 遭 RejectedExecutionException → gate OverloadRejected
+    // → Failed(TRANSPORT)。blocker 至多 64 次迭代必觸發（pool 至多 16 個 worker）；release 後
+    // blocker 全數完成（finally 有界等待）。已知限制：探測依賴『blockers 吸收於 pool 或遭拒』
+    // 之執行序，3×delay(1) 僅作提交與 worker 取件之間的讓出；失敗模式為斷言 loud fail，非靜默通過。
+    // ⚠ 本測試飽和的是 JVM 全域 NetworkPolicy.defaultPreflightExecutor：不得與其他依賴 preflight 之測試並行；
+    // 若未來啟用 unit test parallelism（maxParallelForks／類別並行），必須先重跑並重新評估本 fixture。
+    @Test fun policyGateOverloadRejectedFailsTransport() = runBlocking {
+        val release = CountDownLatch(1)
+        val blockingDns = HostResolver { _ ->
+            release.await(5_000, TimeUnit.MILLISECONDS)
+            listOf(InetAddress.getByName("203.0.113.10"))
+        }
+        val http = FakeExtract { okResp(html()) }
+        val svc = WebExtractService(http)
+        val blockers = mutableListOf<kotlinx.coroutines.Deferred<WebExtractOutcome>>()
+        var probe: WebExtractOutcome? = null
+        try {
+            for (i in 0 until 64) {
+                blockers += async { svc.extract("https://block$i.example/", resolver = blockingDns) }
+                repeat(3) { delay(1) }
+                probe = withTimeout(5_000) {
+                    svc.extract("https://probe.example/", resolver = publicDns("probe.example"))
+                }
+                if (probe is WebExtractOutcome.Failed && probe!!.detail == WebExtract.DETAIL_TRANSPORT) break
+            }
+            val out = probe
+            assertTrue(
+                "expected probe Failed(TRANSPORT)（executor 滿載 → OverloadRejected），got $out",
+                out is WebExtractOutcome.Failed && out.detail == WebExtract.DETAIL_TRANSPORT,
+            )
+        } finally {
+            release.countDown()
+            withTimeout(10_000) { blockers.forEach { it.await() } }
+        }
+    }
+
+    // M14 — x-gzip content-encoding 別名（大小寫／前後空白）：gzip body → Ok、bytesKept 為解壓後位元組數
+    @Test fun xGzipContentEncodingAliasCaseAndTrimAccepted() = runBlocking {
+        val dns = publicDns("example.com")
+        val plain = "gzip aliased content body ".repeat(8)
+        val bos = ByteArrayOutputStream()
+        GZIPOutputStream(bos).use { it.write(plain.toByteArray(Charsets.UTF_8)) }
+        for (encoding in listOf(" GZIP ", " X-GZIP ", "x-gzip", "gzip")) {
+            val http = FakeExtract {
+                WebExtractRawResponse(
+                    200,
+                    bos.toByteArray(),
+                    mapOf("Content-Type" to "text/plain; charset=utf-8", "Content-Encoding" to encoding),
+                )
+            }
+            val out = WebExtractService(http).extract("https://example.com/x-gzip", resolver = dns)
+            assertTrue("encoding=$encoding expected Ok, got $out", out is WebExtractOutcome.Ok)
+            assertEquals(plain.toByteArray(Charsets.UTF_8).size, (out as WebExtractOutcome.Ok).bytesKept)
+        }
+    }
+
+    // L1 — <meta … content=""> 空值 → 落入 <time> 掃描，time 勝出
+    @Test fun emptyMetaContentFallsThroughToTimeElement() = runBlocking {
+        val dns = publicDns("example.com")
+        val doc = """<html><head><title>T</title><meta name="pubdate" content=""></head><body><time datetime="2030-05-06">2030</time></body></html>"""
+        val http = FakeExtract { okResp(doc) }
+        val out = WebExtractService(http).extract("https://example.com/empty-meta", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals("2030-05-06", out.content.published)
+    }
+
+    // L2 — 數值實體邊角：&#0; → U+0000（Cc，cleanField 剝除）；&#xD800;（surrogate）／&#99999999;（>10FFFF）→
+    //      decodeCodePoint 回 null → 保留原實體字面；皆不得 crash、不得 mangle
+    @Test fun numericEntityEdgeCasesDoNotCrashAndPinCurrentBehavior() = runBlocking {
+        val dns = publicDns("example.com")
+        val doc = html(body = "A&#0;B&#xD800;C&#99999999;D")
+        val http = FakeExtract { okResp(doc) }
+        val out = WebExtractService(http).extract("https://example.com/entities", resolver = dns) as WebExtractOutcome.Ok
+        assertFalse("U+0000（Cc）必須於 cleanField 剝除", out.content.snippet.contains('\u0000'))
+        assertTrue("&#xD800; 應保留原實體字面，got ${out.content.snippet}", out.content.snippet.contains("&#xD800;"))
+        assertTrue("&#99999999; 應保留原實體字面，got ${out.content.snippet}", out.content.snippet.contains("&#99999999;"))
+        assertTrue(
+            "錨點 A/B/C/D 皆應保留，got ${out.content.snippet}",
+            listOf("A", "B", "C", "D").all { out.content.snippet.contains(it) },
+        )
+    }
+
+    // L3 — 結構欄位長度上限：title ≤ 500／url ≤ 2048／siteName ≤ 253
+    @Test fun structuredFieldLengthCapsEnforced() = runBlocking {
+        val dns = publicDns("example.com")
+        // title：600 → 500（takeExtractPrefix 截斷）
+        val longTitle = "t".repeat(600)
+        val docTitle = """<html><head><title>$longTitle</title></head><body><p>body text</p></body></html>"""
+        val outTitle = WebExtractService(FakeExtract { okResp(docTitle) })
+            .extract("https://example.com/long-title", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals(500, outTitle.content.title.length)
+        // url：2120 UTF-16 units（≤8192 gate）→ 截斷為 2048
+        val url = "https://example.com/" + "u".repeat(2100)
+        assertTrue(url.length > 2048)
+        val outUrl = WebExtractService(FakeExtract { okResp(html()) })
+            .extract(url, resolver = dns) as WebExtractOutcome.Ok
+        assertEquals(2048, outUrl.content.url.length)
+        // siteName >253：service 層不可達（policy gate 拒絕 host 長度 >253 之 INVALID_HOST，
+        // 建連前 fail-closed）——253 上限僅能由 envelope 層之 takeExtractPrefix(253) 落實，
+        // 該 helper 之截斷語義已由 takeExtractPrefixBoundaryChecks 之單元釘住；
+        // parseHtml 層本身不截斷（≤300 char host 原樣回傳）。
+        val longHost = "a".repeat(300) + ".com"
+        val parsed = parseHtml(
+            """<html><head><title>T</title></head><body><p>body text</p></body></html>""",
+            "https://$longHost/",
+        )
+        assertTrue("parseHtml 應成功，got null", parsed != null)
+        assertEquals(longHost, parsed!!.content.siteName)
+    }
+
+    // L5 — U-pins：comment／引號屬性上下文之 script 掃描案例
+    @Test fun commentAndQuoteContextPins() = runBlocking {
+        val dns = publicDns("example.com")
+        // U1：quoted attr 內之 `<!--` 不構成 comment 開啟；其後之 <script> 仍須剝除
+        val docU1 = """<div data-x="<!--">VISIBLE_A</div><script>SECRET_A</script>VISIBLE_B"""
+        val outU1 = WebExtractService(FakeExtract { okResp(docU1) })
+            .extract("https://example.com/u1", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("U1：VISIBLE_A 保留，got ${outU1.content.snippet}", outU1.content.snippet.contains("VISIBLE_A"))
+        assertTrue("U1：VISIBLE_B 保留，got ${outU1.content.snippet}", outU1.content.snippet.contains("VISIBLE_B"))
+        assertFalse("U1：script 內文必須被剝除", outU1.content.snippet.contains("SECRET_A"))
+        // U2：quoted attr 內之 `-->` 與 `<script>` 皆不構成候選；其後之 <script> 仍須剝除
+        val docU2 = """<div data-x="--><script>">VISIBLE_C</div><script>SECRET_B</script>VISIBLE_D"""
+        val outU2 = WebExtractService(FakeExtract { okResp(docU2) })
+            .extract("https://example.com/u2", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("U2：VISIBLE_C 保留，got ${outU2.content.snippet}", outU2.content.snippet.contains("VISIBLE_C"))
+        assertTrue("U2：VISIBLE_D 保留，got ${outU2.content.snippet}", outU2.content.snippet.contains("VISIBLE_D"))
+        assertFalse("U2：script 內文必須被剝除", outU2.content.snippet.contains("SECRET_B"))
+        // U9：abrupt comment `<!-->`（開頭之 `-->` 與 opener 重疊，tail 其後再無 `-->`）：現行行為＝comment 吞至 EOF，
+        // 其內 <script> 不被視為 script 候選（spec 偏離但刻意保留之殘留；勿視為 regression pin）。
+        val docU9 = "<!--><script>x</script>"
+        val outU9 = WebExtractService(FakeExtract { okResp(docU9) })
+            .extract("https://example.com/u9", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue(
+            "U9：abrupt <!--> 之 script body『x』於現行行為下保留（swallow-to-EOF，非 spec 行為；已知殘留），got ${outU9.content.snippet}",
+            outU9.content.snippet.contains("x"),
+        )
+        // U3：comment 緊接 script（無文字間隔）→ script 仍須剝除
+        val docU3 = "<!--c--><script>SECRET_C</script>VISIBLE_E"
+        val outU3 = WebExtractService(FakeExtract { okResp(docU3) })
+            .extract("https://example.com/u3", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("U3：VISIBLE_E 保留，got ${outU3.content.snippet}", outU3.content.snippet.contains("VISIBLE_E"))
+        assertFalse("U3：script 內文必須被剝除", outU3.content.snippet.contains("SECRET_C"))
     }
 }

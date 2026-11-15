@@ -433,7 +433,7 @@ internal object ElevatedCleanupTracker {
      * 1. acquire-throw 臂 ×3——`startLateDaemon` 佔槽拋（晚補償 caller 臂）、
      *    `compensateInline` 佔槽拋（worker 內聯補償臂）、
      *    `runCleanupBounded` 佔槽拋（drain 臂）；
-     * 2. 兩個 late 臂的 second-chance 二次登記拋出（臂內再失敗）；
+     * 2. 三個臂的 second-chance 二次登記拋出（兩晚補償臂＋`runCleanupBounded` 佔槽拋臂的 Stage 3 二次登記，臂內再失敗）；
      * 3. `runCleanupBounded` 起線程失敗臂內的二次登記拋出（登記再失敗）；
      * 4. [releaseCleanupSlotAfterVerify] 登記拋出（單一計數站點，涵蓋 helper 六處
      *    調用點（drain 三臂含 preflight：preflight kill／kill 路徑／
@@ -441,7 +441,9 @@ internal object ElevatedCleanupTracker {
      *    late-daemon 起線程失敗收斂臂／compensateInline 本體）及所有 helper 冪等重試）。
      * `lateCompensateSpawn` 內層 guarded attempt 不計數（N5 已單站點化）。
      * 語義見 [noteQuarantineRegistrationFailed]：每次拋出的登記嘗試計數一次；單一 incident
-     * 可能至多計 2 次（臂內＋helper 重試）；告警接線一律以 `>0` 判定，禁止當作唯一失敗計數。
+     * 上限：drain 臂至多 3 次（臂內首嘗＋second-chance＋caller verify 臂 helper 重試）；
+     * 兩晚補償臂至多 2 次（臂內首嘗＋second-chance，無 helper 重試）；
+     * 告警接線一律以 `>0` 判定，禁止當作唯一失敗計數。
      * 登記失敗＝槽保留（admission 續拒）之 fail-closed 記數；app 重啟前不可自清、應告警。
      * 零消費方（僅診斷可見）：非零即 fail-closed brick 需 app 重啟恢復；告警/上報接線歸 #136-B3
      */
@@ -2563,7 +2565,10 @@ internal object ElevatedProcessIo {
         /**
          * Stage 2A（P1-A2，觀測位；不改 verdict）：本次 drain 期間曾起過未佔槽的
          * `elevated-cleanup` worker（tracker 飽和時仍嘗試監督清理，killer 已被
-         * 嘗試一次、worker 不受准入看見）即 true。worker stall 於不可中斷 Binder
+         * 嘗試一次、worker 不受准入看見）即 true。
+         * Stage 3（drain/verdict hardening）：起線程失敗臂／acquire 拋臂亦置 true
+         * （admitted residual surfacing——兩臂 killer 從未信號、handle 未被任何追蹤
+         * 包住）；tracker 飽和計數互斥語義不變。worker stall 於不可中斷 Binder
          * 即無 handle 可追蹤；本位供 per-drain 歸因（runners 不需映射，純監測），
          * 跨呼叫累計見 [ElevatedCleanupTracker.noteUntrackedResidual]／
          * [ElevatedCleanupTracker.untrackedResidualCount]。kill 從未被信號（起線程
@@ -2825,6 +2830,8 @@ internal object ElevatedProcessIo {
         }
 
         fun cleanupOnThreadStartFailureInner(): Drained {
+            /** 僅供測試：強制 Inner 於入口拋出以釘 `drainFailClosedDrained()` 的 catch-all 契約。永不在生產路徑置位。 */
+            if (forceCleanupOnThreadStartFailureFailure) error("forced cleanupOnThreadStartFailureInner failure (test seam)")
             aborted.set(true)
             out.markFailed()
             err.markFailed()
@@ -3579,6 +3586,15 @@ internal object ElevatedProcessIo {
     @VisibleForTesting
     internal var quarantineRegistrar: (Process) -> Unit = { ElevatedCleanupTracker.quarantineUnverified(it) }
 
+    /** 僅供測試：強制 Inner 於入口拋出以釘 `drainFailClosedDrained()` 的 catch-all 契約。永不在生產路徑置位。
+     *  僅測試可調（@VisibleForTesting）；測試須於 finally 還原預設值。
+     *  語義：Inner 於入口即 throw（`error("forced cleanupOnThreadStartFailureInner failure (test seam)")`，
+     *  IllegalStateException），wrapper `cleanupOnThreadStartFailure()` 捕捉任一 Throwable 後改走
+     *  `drainFailClosedDrained()`——釘 fail-closed 兜底臂（Inner 起線程失敗臂以外、任何內部
+     *  Throwable（VME 類）皆收斂為 fail-closed Drained 而不外抛）。 */
+    @VisibleForTesting
+    internal var forceCleanupOnThreadStartFailureFailure: Boolean = false
+
     /** verified-dead → release; unverifiable+registered → release; registration failed → keep slot.
      *  internal：晚補償臂（[ElevatedCallSupervisor]）與 drain 共用同一 fail-closed 語義。
      *  每 (process, 槽) 至多呼叫一次：六處調用點，皆恰好一條直線呼叫（無分支/無迴圈）——
@@ -3665,6 +3681,14 @@ internal object ElevatedProcessIo {
      * 與 breaker 分離計數（kill 從未信號，供 incident response 直接 triage；見
      * 其 KDoc）；untracked／kill-never-attempted 兩計數互斥——worker 未起即無
      * untracked 殘留可計，只記 never-attempted。
+     * Stage 3（drain/verdict hardening）：Drained 歸因不再只反映飽和——起線程失敗臂
+     * 及 acquire 拋臂（acquireSlotOrQuarantine 本身 throw，如 VME）同置 `untrackedOut`
+     * （admitted residual surfacing：兩臂 handle 皆未被任何追蹤包住，嚴格差於
+     * 飽和臂；tracker `noteUntrackedResidual` 計數不變，互斥語義不變）。後者另附
+     * 與晚補償兩臂同構的二次 best-effort quarantine 登記（登記拋出即計
+     * 連 [ElevatedCleanupTracker.noteQuarantineRegistrationFailed]，此臂至多 2 次失敗計數
+     * （臂內首嘗＋second-chance）；caller verify 臂 helper 另計 1 次——drain 臂
+     * 全 incident 上限 3 次（兩晚補償臂無 helper 重試，上限 2 次）。
      *
      * P1-4 飽和即拒（[ElevatedCleanupTracker.acquireSlotOrQuarantine] 回 false）：
      * 無槽仍起 worker 嘗試 killer（永不跳過），但回 false（無法記槽即無法自證
@@ -3698,6 +3722,8 @@ internal object ElevatedProcessIo {
      *   必須為本次清理 real target，不得傳其他 handle）。
      * @param untrackedOut Stage 2A（P1-A2）可選 out：本次呼叫若起了未佔槽
      *   worker（飽和）即置 true；null 即不回報（僅 tracker 計數）。
+     *   Stage 3：起線程失敗臂／acquire 拋臂亦置 true（admitted residual surfacing；
+     *   三臂語義見 KDoc 對應段；tracker 計數不變）。
      * @param startThread Stage 2A（P1-A3）可注入的線程啟動方式（測試注入用）：
      *   drain 層的 `startThread` seam 一併穿入，使 elevated-cleanup 起線程失敗
      *   可注入（「抛即未起」契約同 drain 其他執行緒；預設 `{ it.start() }`）。
@@ -3745,15 +3771,27 @@ internal object ElevatedProcessIo {
         // （見本函數 P1-4 段）。
         // fail-closed：acquireSlotOrQuarantine 本身抛（如 VME in ArrayList.add）——
         // 槽從未取得（acquire 失敗路徑未遞增），不啟 worker、不 releaseSlot；
-        // slotHeldOut=false（caller 無槽可放）、untrackedOut=false（無 untracked
-        // worker 起動），return false → caller cleanupIncomplete=true → verify →
+        // slotHeldOut=false（caller 無槽可放）、untrackedOut=true（killer 從未信號、
+        // handle 未被任何追蹤包住——Stage 3 admitted residual surfacing，drain 歸因必須帶出），
+        // return false → caller cleanupIncomplete=true → verify →
         // releaseCleanupSlotAfterVerify(verified, slotHeld=false) handles the rest。
+        // 二次登記（與兩晚補償臂 `startLateDaemon`／`compensateInline` 同構；首次登記
+        // 可能未執行——VME 於 acquire 本體內含 spawn 原子登記前即抛，或鎖內同一鎖
+        // 路徑下 `quarantineUnverifiedLocked` 即抛；`===`-dedup 冪等，重登無害）：
+        // best-effort 再登記一次；登記拋出即計 noteQuarantineRegistrationFailed——
+        // 本臂至多 2 次失敗計數（臂內首嘗 note＋second-chance，與兩晚補償臂的
+        // double-count 語義一致）；caller verify 臂 releaseCleanupSlotAfterVerify
+        // （verified=false 且 registrar 仍抛）可另計 1 次——drain 臂全 incident 上限
+        // 3 次（兩晚補償臂無 helper 重試，上限 2 次）。
         val acquired = try {
             ElevatedCleanupTracker.acquireSlotOrQuarantine(process)
         } catch (_: Throwable) {
             ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
+            // 此臂無 verify 階段：second-chance 登記失敗即無後續重試，僅診斷計數＋#136-B3 接管
+            // （與兩晚補償臂 startLateDaemon／compensateInline 的二次登記同構；===-dedup 冪等）。
+            try { ElevatedProcessIo.quarantineRegistrar(process) } catch (_: Throwable) { ElevatedCleanupTracker.noteQuarantineRegistrationFailed() }
             slotHeldOut.set(false)
-            untrackedOut?.set(false)
+            untrackedOut?.set(true)
             return false
         }
         val t = try {
@@ -3807,7 +3845,11 @@ internal object ElevatedProcessIo {
             // Stage 2A（P1-A3）：worker 從未起動＝killer 從未信號——獨立計數
             // （不佔 untracked 殘留：無 worker 即無殘留；不計 cleanupIncomplete 之外
             // 的新旗標，呼叫方既有 incomplete／breaker 語義不變）。
+            // Stage 3（drain/verdict hardening，admitted residual surfacing）：Drained
+            // 歸因同置 `untrackedOut`（此臂 handle 未被任何追蹤包住，嚴格差於飽和臂；
+            // tracker `noteUntrackedResidual` 計數不變，與 kill-never-attempted 互斥語義不變）。
             ElevatedCleanupTracker.noteKillNeverAttempted()
+            untrackedOut?.set(true)
             return false
         }
         // O1（Stage 3b-final）：acquire 成功且 start() 未抛即於此點移交 slot——

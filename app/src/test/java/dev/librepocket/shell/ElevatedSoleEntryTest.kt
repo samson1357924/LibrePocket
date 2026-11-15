@@ -6,23 +6,26 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * executeWithFrozen sole-entry pin（產品源集：main＋foss＋github＋play）。
+ * sole-entry pin（產品源集：main＋foss＋play＋github＋debug × java／kotlin；`.kt`＋`.java`）。
  *
  * 本測試為 **best-effort static tripwire**，非完整邊界——`internal` 可見性（單一
  * module 內同樣可被引用）＋ 本 pin 構成雙重防線；誤用會繞過 gates/re-verify/audit
  * 語義。已知無法覆蓋的誤用形（接受殘餘、須 code review 把關）：
  * - 反射／註解處理器生成的程式碼（`build/` 目錄不掃描）；fresh clone 不會出現；
  * - 同一 `package dev.librepocket.router` 內裸 `execute(`（無 qualifier）：
- *   Wiring 本身即此 package——現況無此形誤用，新檔須 code review 把關；
+ *   Wiring 本身即此 package——現況無此形誤用，新檔須 code review 把關
+ *   （executeElevatedFrozen／executeElevated 兩 pin 為 qualifier-agnostic，裸呼叫亦攔截）；
  * - （已封閉）object 被 `import …ElevatedDispatch` 後 `with(ElevatedDispatch) { execute(…) }`：
  *   該 import 現已零容忍攔截；
  * - 產物 `.kt`／`.java` 之外的生成來源（如 BuildConfig、Room 生成）不含 dispatcher 呼叫。
  * pin 目標是讓「回歸人人可見的誤用」在 CI 直接 fail，而非證明不可能誤用。
- * - [soleEntryForExecuteWithFrozen]：產品源集 token 掃描（main 必備；
- *   foss／play／github 存在即掃、缺失即略過——play 源集目前不存在，僅
- *   manifest／res）。掃描對象為註解／字串剝離後的整段文字（非逐行）：
- *   block 註解（支援巢套、跨行）與 line 註解、字串字面量（`"…"`、raw
- *   `"""…"""`、字元 `'…'`）整段剝離；`executeWithFrozen\s*\(`
+ *
+ * 掃描範圍（兩種源：java／kotlin）：main／foss／play／github／debug × java／kotlin 源集
+ * （存在即掃、缺失即略過——play 源集目前不存在，僅 manifest／res；debug 目前僅 res；
+ * kotlin 目錄目前不存在，出現即納入）。
+ *
+ * 產品源 token pin（四，共用同一剝離器；註解／字串整段剝離）：
+ * - [soleEntryForExecuteWithFrozen]：`executeWithFrozen\s*\(`
  *   whitespace/newline 容忍、token 前一字元非識別字組成
  *   （`.executeWithFrozen(`／裸 `executeWithFrozen(` 皆涵蓋）；
  *   callable-reference（`::executeWithFrozen`，token 結尾邊界非識別字組成）亦涵蓋；
@@ -37,11 +40,28 @@ import org.junit.Test
  *   ——任何產品源集出現任一形命中即 fail（宣明檔除外）；
  *   ElevatedWiring.kt 僅走 executeWithFrozen，現今零命中為預期；此 pin
  *   釘死 legacy inline 閘已關閉；
- * - 兩掃描對象為註解／字串剝離後的整段文字（`.kt`＋`.java`）；
- * - [unknownFlavorSourcesWithKotlinFailPin]：`app/src 下各 flavor 的 java 目錄` 出現不在已知
- *   清單（main／foss／play／github；測試／benchmark 源集另計）內的 flavor
+ * - [executeElevatedFrozenSoleEntry]：`executeElevatedFrozen\s*\(`
+ *   （whitespace/newline 容忍、token 前邊界非識別字組成；`ShellExecTool.executeElevatedFrozen(`／
+ *   裸 `executeElevatedFrozen(` 皆涵蓋；反引號內容原樣輸出後仍命中）或
+ *   callable reference（`::executeElevatedFrozen`，結尾邊界非識別字組成）或
+ *   Java interop（`ShellExecTool\s*\.\s*INSTANCE\s*\.\s*executeElevatedFrozen\s*\(`）；
+ *   命中僅允許 `dev/librepocket/router/ElevatedDispatch.kt`（唯一產品調用方）；
+ *   宣明檔 `dev/librepocket/shell/ShellExecTool.kt` 跳過（宣明並內部呼叫 `executeElevatedFrozen`）；
+ * - [executeElevatedZeroAllowance]：零容忍掃描 `executeElevated\s*\(`
+ *   （不含 `executeElevatedFrozen(`——`executeElevated` 後必須緊接 `\s*\(`，`F` 擋下）或
+ *   callable reference（`::executeElevated`，結尾邊界非識別字組成）或
+ *   Java interop（`ShellExecTool\s*\.\s*INSTANCE\s*\.\s*executeElevated\s*\(`，
+ *   同樣不匹配 `INSTANCE.executeElevatedFrozen(`）；全產品源集零命中；
+ *   宣明檔 ShellExecTool.kt 跳過（宣明 `executeElevated` 且內部呼叫 `executeElevatedFrozen`）；
+ *
+ * 其餘 pin：
+ * - 兩掃描對象為註解／字串剝離後的整段文字（`.kt`＋`.java`），全部 token pin 同此；
+ * - soleEntry／legacy 兩 pin 跳過宣明檔 dev/librepocket/router/ElevatedDispatch.kt；
+ *   executeElevatedFrozen／executeElevated 兩 pin 跳過宣明檔 dev/librepocket/shell/ShellExecTool.kt
+ * - [unknownFlavorSourcesWithKotlinFailPin]：`app/src 下各 flavor 的 java／kotlin 目錄` 出現不在已知
+ *   清單（main／foss／play／github／debug／test／benchmark 源集另計）內的 flavor
  *   且含 `.kt`／`.java` → fail（防未來 flavor 靜默逃逸本 pin）；
- * - 兩掃描皆跳過宣明檔 dev/librepocket/router/ElevatedDispatch.kt；
+ *   benchmark／androidBenchmark／androidBenchmarkTest 皆在已知清單；
  * - [elevatedDispatchKdocSoleEntryDeclared]：`ElevatedDispatch` 的 KDoc 須含
  *   sole-entry 聲明字樣（「ElevatedWiring」與「PRECONDITION」）。
  *   KDoc 宣明 pin 不變，仍僅掃 main 源集宣明檔。
@@ -51,44 +71,55 @@ import org.junit.Test
  */
 class ElevatedSoleEntryTest {
 
-    // ---- 產品源集定位（main 必備；flavor 缺失即略過） ----
+    // ---- 產品源集定位（main 必備；flavor 缺失即略過；java／kotlin 皆納入） ----
 
     private data class ProductRoot(val name: String, val dir: File)
 
     /** 多路徑相容候選（module cwd／repo root／CI 差異）。 */
-    private fun productRootCandidates(name: String): List<File> = listOf(
-        File("app/src/$name/java"),
-        File("src/$name/java"),
-        File("../app/src/$name/java"),
+    private fun productRootCandidates(name: String, subdir: String = "java"): List<File> = listOf(
+        File("app/src/$name/$subdir"),
+        File("src/$name/$subdir"),
+        File("../app/src/$name/$subdir"),
     )
 
     /**
-     * 定位全部產品源集。main 必備（找不到即 fail，不靜默通過）；
-     * foss／play／github 缺失即略過（play 源集目前不存在）。
+     * 定位全部產品源集。main 必備（找不到任何 main 源即 fail，不靜默通過）；
+     * foss／play／github／debug 缺失即略過（play 源集目前不存在，debug 目前僅 res）。
+     * 每個 flavor 皆涵蓋 java 與 kotlin 兩種子目錄（存在即掃、缺失即略過；kotlin 目錄目前不存在）。
+     * kotlin 源集以 `name-kotlin` 命名（如 `foss-kotlin`）以便顯示與除錯。
      */
     private fun locateProductRoots(): List<ProductRoot> {
-        val mainCandidates = productRootCandidates("main")
-        val main = mainCandidates.firstOrNull { it.isDirectory }
-        assertTrue("main 源集未定位，sole-entry pin 失效：$mainCandidates", main != null)
-        val roots = mutableListOf(ProductRoot("main", main!!))
-        for (flavor in listOf("foss", "play", "github")) {
-            val root = productRootCandidates(flavor).firstOrNull { it.isDirectory }
-            if (root != null) roots.add(ProductRoot(flavor, root))
+        val roots = mutableListOf<ProductRoot>()
+        var mainFound = false
+        for (flavor in listOf("main", "foss", "play", "github", "debug")) {
+            for (subdir in listOf("java", "kotlin")) {
+                val root = productRootCandidates(flavor, subdir).firstOrNull { it.isDirectory } ?: continue
+                if (flavor == "main") mainFound = true
+                roots.add(ProductRoot(if (subdir == "kotlin") "$flavor-kotlin" else flavor, root))
+            }
         }
+        assertTrue("main 源集未定位（java／kotlin 皆不存在），sole-entry pin 失效：${productRootCandidates("main")}／${productRootCandidates("main", "kotlin")}", mainFound)
         return roots
     }
 
-    /** 宣明檔路徑（相對源集根，`/` 分隔）；兩掃描皆跳過。 */
+    /** 宣明檔路徑（相對源集根，`/` 分隔）；legacy 兩掃描預設跳過。 */
     private fun isDispatchDeclaration(relativeSlashPath: String): Boolean =
         relativeSlashPath.endsWith("dev/librepocket/router/ElevatedDispatch.kt")
 
-    /** 掃描產品源集中全部 `.kt`（跳過宣明檔）；回 display 路徑（`name:relative`）配對。 */
-    private fun productSourceFiles(roots: List<ProductRoot>): List<Pair<String, File>> {
+    /** 宣明檔路徑（相對源集根，`/` 分隔）；executeElevated 兩 pin 皆跳過（ShellExecTool 宣明並內部呼叫）。 */
+    private fun isShellExecToolDeclaration(relativeSlashPath: String): Boolean =
+        relativeSlashPath.endsWith("dev/librepocket/shell/ShellExecTool.kt")
+
+    /** 掃描產品源集中全部 `.kt`／`.java`（預設跳過 ElevatedDispatch 宣明檔）；回 display 路徑（`name:relative`）配對。 */
+    private fun productSourceFiles(
+        roots: List<ProductRoot>,
+        isSkipped: (String) -> Boolean = ::isDispatchDeclaration,
+    ): List<Pair<String, File>> {
         val files = mutableListOf<Pair<String, File>>()
         for (root in roots) {
             root.dir.walkTopDown().filter { it.isFile && (it.name.endsWith(".kt") || it.name.endsWith(".java")) }.forEach { f ->
                 val rel = f.relativeTo(root.dir).path.replace('\\', '/')
-                if (isDispatchDeclaration(rel)) return@forEach
+                if (isSkipped(rel)) return@forEach
                 files.add("${root.name}:$rel" to f)
             }
         }
@@ -107,9 +138,9 @@ class ElevatedSoleEntryTest {
             }
         }
         // 防護空轉：scanner 至少須掃到檔案且命中預期的唯一合法呼叫方，否則 pin 形同虛設。
-        assertTrue("sole-entry pin 掃描零檔案（pin 失效）", files.isNotEmpty())
+        assertTrue("sole-entry 測試掃描零檔案（pin 失效）", files.isNotEmpty())
         assertTrue("產品源集應命中 main:dev/librepocket/router/ElevatedWiring.kt（唯一合法呼叫方）：$hits",
-            hits.contains("main:dev/librepocket/router/ElevatedWiring.kt"))
+            hits.any { it.substringAfter(':') == "dev/librepocket/router/ElevatedWiring.kt" })
         val unexpected = hits.filter { it.substringAfter(':') != "dev/librepocket/router/ElevatedWiring.kt" }
         assertTrue("產品源集非 ElevatedWiring 呼叫 executeWithFrozen（繞 gates/re-verify/audit）：$unexpected",
             unexpected.isEmpty())
@@ -127,9 +158,49 @@ class ElevatedSoleEntryTest {
             }
         }
         // 防護空轉：至少須掃到檔案，否則 pin 形同虛設。
-        assertTrue("sole-entry pin 掃描零檔案（pin 失效）", files.isNotEmpty())
+        assertTrue("sole-entry 測試掃描零檔案（pin 失效）", files.isNotEmpty())
         assertTrue(
             "產品源集出現 legacy ElevatedDispatch.execute 調用（一律零容忍；ElevatedWiring 僅走 executeWithFrozen）：$hits",
+            hits.isEmpty(),
+        )
+    }
+
+    // ---- sole-entry：產品源集僅 ElevatedDispatch 得呼叫 executeElevatedFrozen ----
+
+    @Test fun executeElevatedFrozenSoleEntry() {
+        val roots = locateProductRoots()
+        val hits = mutableListOf<String>()
+        // ElevatedDispatch 為允許命中（唯一產品調用方）；僅跳過 ShellExecTool 宣明檔。
+        val files = productSourceFiles(roots) { isShellExecToolDeclaration(it) }
+        for ((display, f) in files) {
+            if (codeContainsExecuteElevatedFrozen(stripCommentsAndStrings(f.readText(), isJava = f.name.endsWith(".java")))) {
+                hits.add(display)
+            }
+        }
+        // 防護空轉：scanner 至少須掃到檔案且命中預期的唯一合法呼叫方，否則 pin 形同虛設。
+        assertTrue("sole-entry 測試掃描零檔案（pin 失效）", files.isNotEmpty())
+        assertTrue("產品源集應命中 main:dev/librepocket/router/ElevatedDispatch.kt（唯一合法調用方）：$hits",
+            hits.any { it.substringAfter(':') == "dev/librepocket/router/ElevatedDispatch.kt" })
+        val unexpected = hits.filter { it.substringAfter(':') != "dev/librepocket/router/ElevatedDispatch.kt" }
+        assertTrue("產品源集非 ElevatedDispatch 呼叫 executeElevatedFrozen（繞 gates/re-verify/audit）：$unexpected",
+            unexpected.isEmpty())
+    }
+
+    // ---- 零容忍：產品源集不得出現 executeElevated 調用 ----
+
+    @Test fun executeElevatedZeroAllowance() {
+        val roots = locateProductRoots()
+        val hits = mutableListOf<String>()
+        val files = productSourceFiles(roots) { isShellExecToolDeclaration(it) }
+        for ((display, f) in files) {
+            if (codeContainsExecuteElevated(stripCommentsAndStrings(f.readText(), isJava = f.name.endsWith(".java")))) {
+                hits.add(display)
+            }
+        }
+        // 防護空轉：至少須掃到檔案，否則 pin 形同虛設。
+        assertTrue("sole-entry 測試掃描零檔案（pin 失效）", files.isNotEmpty())
+        assertTrue(
+            "產品源集出現 executeElevated 調用（一律零容忍；產品唯一入口為 ElevatedDispatch.executeWithFrozen）：$hits",
             hits.isEmpty(),
         )
     }
@@ -300,6 +371,49 @@ class ElevatedSoleEntryTest {
     // ---- token 樣式（正則＋識別字邊界） ----
 
     /**
+     * `executeElevatedFrozen\s*\(`（whitespace/newline 容忍）：token 前一字元非
+     * 識別字組成（lookbehind），`.executeElevatedFrozen(`／裸 `executeElevatedFrozen(`
+     * 皆命中；`fooexecuteElevatedFrozen(` 不誤計。不命中 `executeElevated (`
+     * （`executeElevated` 後必須緊接 `Frozen`）。
+     */
+    private val executeElevatedFrozenCall = Regex("(?<![A-Za-z0-9_$])executeElevatedFrozen\\s*\\(")
+
+    /**
+     * `::executeElevatedFrozen` callable reference（無呼叫括號）：token 結尾後續字元
+     * 非識別字組成（`::executeElevatedFrozenX` 不命中）。
+     * `::` 前綴的接收者識別字（`Foo::executeElevatedFrozen`）合法，故 token 起始
+     * 不做前界檢查（`':'` 前為識別字屬正常限定形）。
+     */
+    private val callableReferenceExecuteElevatedFrozen = Regex("::\\s*executeElevatedFrozen(?![A-Za-z0-9_$])")
+
+    /**
+     * Java interop：Kotlin object 經 `ShellExecTool.INSTANCE.executeElevatedFrozen(` 呼叫
+     * （`.` 兩側 whitespace 容忍；token 前邊界非識別字組成）。
+     */
+    private val javaInteropExecuteElevatedFrozen =
+        Regex("(?<![A-Za-z0-9_$])ShellExecTool\\s*\\.\\s*INSTANCE\\s*\\.\\s*executeElevatedFrozen\\s*\\(")
+
+    /**
+     * `executeElevated\s*\(`（whitespace/newline 容忍）：同 executeElevatedFrozenCall 之邊界規則。
+     * `executeElevatedFrozen(` 不命中（`executeElevated` 後必須緊接 `\s*\(`，`F` 擋下）。
+     */
+    private val executeElevatedCall = Regex("(?<![A-Za-z0-9_$])executeElevated\\s*\\(")
+
+    /**
+     * `::executeElevated` callable reference（無呼叫括號）：token 結尾後續字元
+     * 非識別字組成（`::executeElevatedFrozen` 不命中——`F` 擋下；
+     * `::executeElevatedX` 不命中）。
+     */
+    private val callableReferenceExecuteElevated = Regex("::\\s*executeElevated(?![A-Za-z0-9_$])")
+
+    /**
+     * Java interop：Kotlin object 經 `ShellExecTool.INSTANCE.executeElevated(` 呼叫。
+     * `ShellExecTool.INSTANCE.executeElevatedFrozen(` 不命中（`executeElevated` 後必須緊接 `\s*\(`）。
+     */
+    private val javaInteropExecuteElevated =
+        Regex("(?<![A-Za-z0-9_$])ShellExecTool\\s*\\.\\s*INSTANCE\\s*\\.\\s*executeElevated\\s*\\(")
+
+    /**
      * `executeWithFrozen\s*\(`（whitespace/newline 容忍）：token 前一字元非
      * 識別字組成（lookbehind），`.executeWithFrozen(`／裸 `executeWithFrozen(`
      * 皆命中；`fooexecuteWithFrozen(` 不誤計。
@@ -340,6 +454,16 @@ class ElevatedSoleEntryTest {
     private fun codeContainsExecuteWithFrozen(code: String): Boolean =
         executeWithFrozenCall.containsMatchIn(code) || callableReferenceToken.containsMatchIn(code)
 
+    private fun codeContainsExecuteElevatedFrozen(code: String): Boolean =
+        executeElevatedFrozenCall.containsMatchIn(code) ||
+            callableReferenceExecuteElevatedFrozen.containsMatchIn(code) ||
+            javaInteropExecuteElevatedFrozen.containsMatchIn(code)
+
+    private fun codeContainsExecuteElevated(code: String): Boolean =
+        executeElevatedCall.containsMatchIn(code) ||
+            callableReferenceExecuteElevated.containsMatchIn(code) ||
+            javaInteropExecuteElevated.containsMatchIn(code)
+
     private fun codeContainsLegacyElevatedDispatchExecute(code: String): Boolean =
         legacyDispatchExecuteCall.containsMatchIn(code) ||
             legacyDispatchExecuteRef.containsMatchIn(code) ||
@@ -347,7 +471,7 @@ class ElevatedSoleEntryTest {
             importedDispatchStar.containsMatchIn(code) ||
             importedDispatchObject.containsMatchIn(code)
 
-    // ---- 未來 flavor 防護：未知 src/*/java 含 Kotlin/Java 來源即 fail ----
+    // ---- 未來 flavor 防護：未知 src/*/{java,kotlin} 含 Kotlin/Java 來源即 fail ----
 
     @Test fun unknownFlavorSourcesWithKotlinFailPin() {
         val baseCandidates = listOf(
@@ -365,16 +489,18 @@ class ElevatedSoleEntryTest {
         val offenders = base!!.listFiles()
             ?.filter { it.isDirectory && it.name !in known }
             ?.filter { dir ->
-                val javaDir = File(dir, "java")
-                javaDir.isDirectory &&
-                    javaDir.walkTopDown().any { f ->
-                        f.isFile && (f.name.endsWith(".kt") || f.name.endsWith(".java"))
-                    }
+                listOf("java", "kotlin").any { sub ->
+                    val subDir = File(dir, sub)
+                    subDir.isDirectory &&
+                        subDir.walkTopDown().any { f ->
+                            f.isFile && (f.name.endsWith(".kt") || f.name.endsWith(".java"))
+                        }
+                }
             }
             ?.map { it.name }
             ?: emptyList()
         assertTrue(
-            "未知 flavor 源集含 Kotlin/Java 來源、未入 sole-entry pin 掃描清單：$offenders（請更新 locateProductRoots 與本測試的 known 清單）",
+            "未知 flavor 源集含 Kotlin/Java 來源（java／kotlin 目錄）、未入 sole-entry pin 掃描清單：$offenders（請更新 locateProductRoots 與本測試的 known 清單）",
             offenders.isEmpty(),
         )
     }

@@ -566,7 +566,8 @@ class TurnControllerDefaultCapTest {
     )
     assertEquals(listOf("user"), keptBlank.map { it.role })
     assertEquals(listOf("tail"), keptBlank.map { it.text })
-    validateToolPairing(keptBlank, true)
+    // No tool rows remain: the gate must accept the shipped shape.
+    assertEquals(listOf<String?>(null), validateToolPairing(keptBlank, true))
   }
 
   @Test(timeout = 30_000) fun windowToGateComposeOnAmbiguousBlankToolId() {
@@ -1108,6 +1109,57 @@ class TurnControllerDefaultCapTest {
     } finally {
       c.close()
     }
+  }
+
+  @Test(timeout = 30_000) fun combinedWindowSnapsPastLeadingSystemRun() {
+    // (α) decision pin (Finding #2): inline role="system" rows are NOT
+    // snap-exempt. In the combined send-time window they behave like any
+    // other non-user row: the naive MaxMessages(3) cut lands after u0
+    // (index 1, the system row), the user-boundary snap finds no user row
+    // until the live tail, and the whole leading non-user run
+    // (u0 + system + a0) is dropped wholesale — the system instruction is
+    // never kept to "protect" it. Instructions that must survive window
+    // trims belong in systemPromptOverride; hydration never restores
+    // system rows, so this shape arises only via direct initialHistory
+    // construction.
+    val history = listOf(
+      ChatMessage(role = "user", text = "u0"),
+      ChatMessage(role = "system", text = "important-instruction"),
+      ChatMessage(role = "assistant", text = "a0"),
+    )
+    val provider = DefCapFakeProvider(doneOnce())
+    val c = controller(provider, history, HistoryWindowCap.MaxMessages(3))
+    try {
+      // Construction-time seed keeps everything (naiveStart = 0, no cut).
+      assertEquals(0, c.droppedHistoryCount)
+      runBlocking { c.send("u1") }
+      val req = provider.seenRequests.single()
+      assertEquals(listOf("user"), req.messages.map { it.role })
+      assertTrue(req.messages.single().text.startsWith("u1"))
+      assertEquals(3, c.droppedHistoryCount)
+      assertEquals(history.sumOf { it.text.length }.toLong(), c.droppedHistoryChars)
+      // contextOmission is a publish-time formula (initial=3 + live=1 -
+      // final=1 = 3); the cell is only re-published when buildRequest
+      // re-runs, never grown by UI state between sends.
+      assertEquals(3, c.contextOmission.value)
+      assertEquals(0, c.lastRequestTrimmedCount)
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test(timeout = 30_000) fun constructionTimeApplyHistoryCapKeepsLeadingSystemRun() {
+    // Construction-time leg of the same (α) pin: with a 3-row history and a
+    // 3-row cap the naive cut is 0, so applyHistoryCap keeps all 3 rows —
+    // the load path does not trim at all; only the combined send-time
+    // window drops the leading non-user run. Pinning both legs keeps the
+    // "construction keeps / combined window drops" split explicit.
+    val history = listOf(
+      ChatMessage(role = "user", text = "u0"),
+      ChatMessage(role = "system", text = "important-instruction"),
+      ChatMessage(role = "assistant", text = "a0"),
+    )
+    assertEquals(history, applyHistoryCap(history, HistoryWindowCap.MaxMessages(3)))
   }
 
   @Test(timeout = 30_000) fun malformedBatchAndToolRowWithToolCallsFailClosed() {

@@ -467,8 +467,32 @@ class ChatSessionFactoryHistoryTailTest {
         assertTrue("newest in-window marker must restore the flag", assistants.last().hasReasoning)
         assertEquals("a-newest", assistants.last().text)
         assertTrue("older plain turns must stay unflagged", assistants.dropLast(1).none { it.hasReasoning })
-        // The marker itself never enters model context.
-        assertTrue(loaded.messages.none { it.text.isEmpty() && it.role == "reasoning" })
+        assertTrue("the marker itself never enters model context", loaded.messages.none { it.text.isEmpty() && it.role == "reasoning" })
+    }
+
+    /**
+     * #16/B2: `system` runtime rows (interrupted/failure/usage notices) are
+     * transcript- and replay-only. `loadModelHistoryScan` keeps only
+     * non-partial `user`/`assistant` rows and `loadModelHistory` maps those
+     * — a caller constructing `initialHistory` directly is the only source of
+     * inline system rows in model context.
+     */
+    @Test fun hydrationSkipsSystemRows() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        transcripts.appendEvent(event(sid, "s1", "system", "turn interrupted"))
+        transcripts.appendEvent(event(sid, "u1", "user", "u1"))
+        transcripts.appendEvent(event(sid, "s2", "system", "resume notice"))
+        transcripts.appendEvent(event(sid, "a1", "assistant", "a1"))
+        transcripts.appendEvent(event(sid, "s3", "system", "usage notice"))
+
+        val scan = loadModelHistoryScan(transcripts, sid)
+        assertTrue("system rows never enter the scan", scan.events.all { it.kind != "system" })
+
+        val loaded = loadModelHistory(transcripts, sid)
+        assertEquals(2, loaded.messages.size)
+        assertTrue(loaded.messages.none { it.role == "system" || it.role == "reasoning" })
+        assertEquals(listOf("u1", "a1"), loaded.messages.map { it.text })
     }
 
     /**

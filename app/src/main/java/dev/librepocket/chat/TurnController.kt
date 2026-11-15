@@ -243,7 +243,7 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * Turn-boundary snap (B2, #16): even after the pair snap, a naive head cut
  * can open the retained slice on an orphan assistant (or tool) row, and the
  * Anthropic Messages API rejects a first non-system message whose role is not
- * `user` (HTTP 400); OpenAI has no hard rejection but mis-reads the
+ * `user` (HTTP 400 equivalent); OpenAI has no hard rejection but mis-reads the
  * context / wastes window. After the pair
  * snap, [snapHistoryToUserBoundary] advances the cut to the next
  * `role == "user"` row (never beyond the caller's `limit`), dropping the
@@ -253,8 +253,8 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * alignment (counted in the drop); only the no-user-row-follows case keeps
  * the slice: a pairing violation still fails closed downstream in
  * `ProviderJson.validateToolPairing`; a pure assistant/tool first row with
- * no pairing violation is refused at the provider side (Anthropic HTTP 400 /
- * `FIRST_MESSAGE_MUST_BE_USER`; OpenAI has no hard rejection and mis-reads
+ * no pairing violation is refused at the provider side (Anthropic `FIRST_MESSAGE_MUST_BE_USER` typed
+ * precheck, zero HTTP; OpenAI has no hard rejection and mis-reads
  * the context) — mirroring the pair-atomic policy. A
  * legal tool batch never straddles a user row, and a batch wholly before the
  * cut is dropped together with its user row, so tool-pair integrity is
@@ -332,7 +332,7 @@ sealed interface HistoryWindowCap {
  *
  * Turn boundary (B2, #16): after the pair snap, the cut may still land on an
  * orphan assistant (or tool) row, and the Anthropic Messages API rejects a
- * first non-system message whose role is not `user` (HTTP 400). The cut then
+ * first non-system message whose role is not `user` (HTTP 400 equivalent). The cut then
  * snaps forward to the next `role == "user"` row via
  * [snapHistoryToUserBoundary] — dropping the leading non-user rows whole —
  * with fail-closed semantics: if no user row
@@ -342,7 +342,7 @@ sealed interface HistoryWindowCap {
  * no-user-row-follows case keeps the slice: a pairing violation still fails
  * closed downstream in `ProviderJson.validateToolPairing`; a pure
  * assistant/tool first row with no pairing violation is refused at the
- * provider side (Anthropic HTTP 400 / `FIRST_MESSAGE_MUST_BE_USER`; OpenAI
+ * provider side (Anthropic `FIRST_MESSAGE_MUST_BE_USER` typed precheck (zero HTTP); OpenAI
  * has no hard rejection and mis-reads the context).
  */
 internal fun applyHistoryCap(history: List<ChatMessage>, cap: HistoryWindowCap): List<ChatMessage> {
@@ -403,8 +403,8 @@ private fun charWindowStart(history: List<ChatMessage>, maxChars: Int): Int {
  * when no user row lies within `[start, limit]` is the cut kept: a pairing
  * violation still fails closed downstream in
  * `ProviderJson.validateToolPairing`; a pure assistant/tool first row with
- * no pairing violation is refused at the provider side (Anthropic HTTP 400 /
- * `FIRST_MESSAGE_MUST_BE_USER`; OpenAI has no hard rejection and mis-reads
+ * no pairing violation is refused at the provider side (Anthropic `FIRST_MESSAGE_MUST_BE_USER` typed
+ * precheck, zero HTTP; OpenAI has no hard rejection and mis-reads
  * the context).
  */
 private fun snapHistoryToPairBoundary(history: List<ChatMessage>, naiveStart: Int): Int {
@@ -433,7 +433,7 @@ private fun snapHistoryToPairBoundary(history: List<ChatMessage>, naiveStart: In
  * (B2, #16): after the naive/pair-snapped head cut at [start], advance to
  * the next `role == "user"` row so the retained slice never opens on an
  * orphan assistant (or tool) row. The Anthropic Messages API rejects a
- * first non-system message whose role is not `user` (HTTP 400); OpenAI has
+ * first non-system message whose role is not `user` (HTTP 400 equivalent); OpenAI has
  * no hard rejection but mis-reads the context / wastes window. The
  * pair-atomic snap only protects
  * structured tool batches and cannot align plain user/assistant turn
@@ -454,7 +454,7 @@ private fun snapHistoryToPairBoundary(history: List<ChatMessage>, naiveStart: In
  *    (fail-closed: keeps the naive cut; a pairing violation still fails
  *    closed downstream in `ProviderJson.validateToolPairing`; a pure
  *    assistant/tool first row with no pairing violation is refused at the
- *    provider side — Anthropic HTTP 400 / `FIRST_MESSAGE_MUST_BE_USER`;
+ *    provider side — Anthropic `FIRST_MESSAGE_MUST_BE_USER` typed precheck (zero HTTP);
  *    OpenAI has no hard rejection and mis-reads the context — mirroring
  *    the pair-atomic policy, the window never repairs *pairing*).
  * 5. Forward-only, never backwards; whole rows are dropped.
@@ -463,12 +463,26 @@ private fun snapHistoryToPairBoundary(history: List<ChatMessage>, naiveStart: In
  *    dropped only when a `role == "user"` row follows within
  *    `[start, limit]` (otherwise the cut is kept — see point 4).
  *
+ * Inline `role="system"` rows are not exempt from windowing: one leading a
+ * non-user run is dropped wholesale with the run (counted in
+ * `droppedHistoryCount`/`droppedHistoryChars`/`contextOmission`), never
+ * kept to "protect" instructions. Instructions that must survive window
+ * trims belong in `systemPromptOverride` (serialized at request-build time
+ * into each adapter's system slot — Anthropic top-level `system`,
+ * Responses top-level `instructions`, ChatCompletions a leading `system`
+ * message — which no window leg touches) — not as transcript-prefix rows in
+ * `initialHistory`. The
+ * hydration path (`loadModelHistory`) never restores system rows (it only
+ * projects non-partial user/assistant rows), so this shape arises only
+ * when a caller constructs `initialHistory` directly; an inline system row
+ * carrying an instruction is a caller bug the window will not accommodate.
+ *
  * The window never repairs *pairing*; leading invalid/unpaired slices may
  * be dropped wholesale by boundary alignment (counted in the drop); only
  * the no-user-row-follows case keeps the slice: a pairing violation still
  * fails closed downstream in `ProviderJson.validateToolPairing`; a pure
  * assistant/tool first row with no pairing violation is refused at the
- * provider side (Anthropic HTTP 400 / `FIRST_MESSAGE_MUST_BE_USER`; OpenAI
+ * provider side (Anthropic `FIRST_MESSAGE_MUST_BE_USER` typed precheck (zero HTTP); OpenAI
  * has no hard rejection and mis-reads the context).
  */
 internal fun snapHistoryToUserBoundary(
@@ -1207,10 +1221,10 @@ class TurnController(
     private set
 
   /**
-   * Provider-request context omission total: how many rows the windowing legs
-   * keep out of the outgoing request, unified across legs. The two send legs
-   * (the construction-time history window seed and the per-request combined
-   * window) drop only original rows; their send-time
+   * Provider-request context omission total: how many rows the windowing
+   * legs keep out of the outgoing request, unified across legs. The
+   * windowing legs (the construction-time history window seed and the
+   * per-request combined window) drop only original rows; their send-time
    * [MAX_REQUEST_CHARS] head trim also drops only original rows; synthesized
    * tool-round rows are never dropped and never counted. For the base request the
    * counted set is the original rows (the resumed [initialHistory] + this send's
@@ -6200,10 +6214,10 @@ class TurnController(
    * the cut then re-aligns to the next user row via [snapHistoryToUserBoundary] so the retained
    * prefix never opens on an orphan assistant/tool row — the slice is kept only
    * when no user row follows within `[start, limit]` (a pairing violation then
-   * fails closed downstream in `ProviderJson.validateToolPairing`; a pure
-   * assistant/tool first row with no pairing violation is refused at the
-   * provider side — Anthropic HTTP 400 / `FIRST_MESSAGE_MUST_BE_USER`; OpenAI
-   * has no hard rejection and mis-reads the context); otherwise the leading
+   * fails closed downstream in `ProviderJson.validateToolPairing`; a head whose
+   * first non-system row is not `user` — same shape as the Anthropic
+   * `FIRST_MESSAGE_MUST_BE_USER` precheck — is refused at the provider side;
+   * OpenAI has no hard rejection and mis-reads the context); otherwise the leading
    * orphan rows are dropped wholesale) is additionally published on
    * [lastRequestTrimmedCount]/[requestTrimmedCount] (counts),
    * [lastRequestTrimmedChars]/[lastRequestChars] (chars), and on top of the
@@ -6278,21 +6292,33 @@ class TurnController(
       throw ContinuationOverBudgetException()
     }
     val finalBase = if (drop > 0) baseMessages.drop(drop) else baseMessages
-    // Defense-in-depth (LOW-2): the trim exhausted the prefix down to a
-    // non-user head — the slice is kept only when no user row lies within
-    // `[start, baseMessages.size - 1]`. Shipping it would be refused/mis-read
-    // at the provider side (Anthropic HTTP 400 on a first non-user message;
-    // OpenAI has no hard rejection and mis-reads the context). Fail closed
-    // (typed, non-retryable) instead. Unreachable by construction today:
-    // `buildRequest` always carries the live user row at the tail of the
-    // base and the snap limit `baseMessages.size - 1` includes it, so the
-    // retained head is always a user row — the guard pins that invariant.
-    // `finalBase` is guaranteed non-empty here: the while bound is
+    // Defense-in-depth (LOW-2), mirroring the Anthropic provider precheck
+    // (`FIRST_MESSAGE_MUST_BE_USER`: the first non-system message must be
+    // `role=user`). Fail closed (typed, non-retryable) instead of shipping a
+    // head the provider would refuse/mis-read. The check is scoped to
+    // `drop > 0` deliberately: with `drop == 0` the retained base is the
+    // exact shape the attempt round already shipped — the provider either
+    // accepted it (attempt was emitted and only the continuation is new) or
+    // already rejected it there — so a legal `[system, user]` prefix must
+    // PASS here; a `first().role`-style check would wrongly refuse it. With
+    // `drop > 0` the cut can have consumed a leading slice and left an
+    // orphan non-user head; the guard then mirrors the provider rule (the
+    // first non-system row must be `user`). A fully system-prefixed head
+    // (`firstOrNull { it.role != "system" } == null`) fails closed too,
+    // consistent with the provider gate. Belt-and-braces: unreachable by
+    // construction today — `buildRequest` always carries the live user row at
+    // the tail of the base whenever any user row survives the window, and
+    // both snaps (pair, then user-boundary with limit `baseMessages.size - 1`)
+    // cover it, so the retained head's first non-system row is an invariant
+    // constant (`user`); the guard pins that invariant (if the window ever
+    // removes every user row, the guard fires and fails closed). `finalBase`
+    // is guaranteed non-empty here: the while bound is
     // `drop < baseMessages.size - 1` and both snaps refuse to push `drop`
     // past `baseMessages.size - 1`, so at least the newest base row survives.
-    if (finalBase.first().role != "user") {
-      // The trim exhausted the prefix down to a non-user head: shipping it
-      // would be rejected by the provider. Fail closed (typed, non-retryable).
+    if (drop > 0 && finalBase.firstOrNull { it.role != "system" }?.role != "user") {
+      // The trim exhausted the prefix down to a non-user head (or an all-
+      // system head): shipping it would be rejected by the provider. Fail
+      // closed (typed, non-retryable).
       throw ContinuationOverBudgetException()
     }
     // Publish the continuation's own prefix trim (never silent): buildRequest
@@ -6377,7 +6403,7 @@ class TurnController(
    * no user row follows within `[start, limit]` (a pairing violation then
    * fails closed downstream in `ProviderJson.validateToolPairing`; a pure
    * assistant/tool first row with no pairing violation is refused at the
-   * provider side — Anthropic HTTP 400 / `FIRST_MESSAGE_MUST_BE_USER`; OpenAI
+   * provider side — Anthropic `FIRST_MESSAGE_MUST_BE_USER` typed precheck (zero HTTP); OpenAI
    * has no hard rejection and mis-reads the context).
    *
    * Ephemeral time context: a [buildRuntimeTimeContext] block is appended to a

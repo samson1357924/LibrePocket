@@ -332,6 +332,45 @@ class ChatHydrationOmissionTest {
         }
     }
 
+    /**
+     * Second send on a resumed long dialogue: `buildRequest` re-publishes
+     * `contextOmission` as a fresh identity (not an accumulator), so the
+     * second send — with two more live rows — strictly increases the
+     * omission (102 → 104), never resets to the construction seed.
+     */
+    @Test
+    fun controller_resumeLongDialogue_omissionGrowsAcrossSends() {
+        val history = (0 until 300).map { i ->
+            val role = if (i % 2 == 0) "user" else "assistant"
+            ChatMessage(role = role, text = "m$i")
+        }
+        val fake = OmissionFakeProvider(okHandler())
+        var n = 0
+        val controller = TurnController(
+            provider = fake,
+            policy = OmissionAllowPolicy(),
+            dispatcher = Dispatchers.Default,
+            sleeper = {},
+            newId = { "omission-growth-${n++}" },
+            initialHistory = history,
+            historyCap = HistoryWindowCap.DEFAULT,
+        )
+        try {
+            runBlocking { controller.send("hi-a") }
+            assertEquals(102, controller.contextOmission.value)
+            runBlocking { controller.send("hi-b") }
+            // Live grew by 2 rows and the shipped prefix stays at 200:
+            // combined = 200 + 3 = 203 → naive cut 3 (m103, assistant) →
+            // user-boundary snap drops one more → 199 shipped;
+            // omission = 300 + 3 - 199 = 104.
+            assertEquals(104, controller.contextOmission.value)
+            assertEquals(199, fake.seenRequests[1].messages.size)
+            assertEquals("m104", fake.seenRequests[1].messages.first().text)
+        } finally {
+            controller.close()
+        }
+    }
+
     @Test
     fun controller_resumeLongDialogue_seedsInitWindowAndPublishesTotal() {
         val history = (0 until 300).map { i ->

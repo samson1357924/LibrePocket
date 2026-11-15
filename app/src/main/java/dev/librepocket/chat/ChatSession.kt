@@ -38,13 +38,14 @@ interface ChatSession {
   val requestTrimmedCount: StateFlow<Int> get() = ZeroRequestTrimmedCount
 
   /**
-   * Provider-request context omission total: how many rows the windowing legs
-   * keep out of the outgoing request, unified across legs. The two send legs
-   * (the construction-time history window and the per-request combined
-   * window, plus the send-time MAX_REQUEST_CHARS head trim) drop only
-   * original rows; synthesized tool-round rows are never dropped and never
-   * counted; the continuation top-up only adds the prefix trim (rows the
-   * prefix trim removes are likewise all original rows). What it publishes
+   * Provider-request context omission total: how many rows the windowing
+   * legs keep out of the outgoing request, unified across legs. The
+   * windowing legs (the construction-time history window and the
+   * per-request combined window, plus the send-time MAX_REQUEST_CHARS head
+   * trim) drop only original rows; synthesized tool-round rows are never
+   * dropped and never counted; the continuation top-up only adds the
+   * prefix trim (rows the prefix trim removes are likewise all original
+   * rows). What it publishes
    * is the count of original rows absent from the outgoing request — this
    * send's live rows plus the resumed history prefix — after every
    * windowing leg (the construction-time history window, the per-request

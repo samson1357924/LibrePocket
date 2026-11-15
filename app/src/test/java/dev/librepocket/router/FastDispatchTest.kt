@@ -121,6 +121,77 @@ class FastDispatchTest {
         assertTrue(executed!!.result.resultJson.contains("Bar"))
     }
 
+    @Test fun codeIdentifierSymbolNamesRouteToLspSymbols() = runBlocking {
+        // 識別字含其他工具的（無錨點）hint 子串：AlarmManager⊃alarm、
+        // NotificationManager⊃notification、CalendarProvider⊃calendar、
+        // ScreenshotController⊃screenshot、EmailClient⊃e-?mail、
+        // VolumeController⊃volume——舊 RULES 順序會被這些工具搶走；
+        // symbol 前閘（SLOW 之後、RULES 之前）獨占 symbol 匹配，
+        // `查 X 符號` 必綁 lsp.symbols 而非 keyword 工具。
+        // 每個 case 各自 decide → dispatch（[lspDispatcher] + [CountingBackend]
+        // 計數），逐 case 斷言 invocations +1，最終累計恰 6。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for (identifier in listOf(
+            "AlarmManager",
+            "NotificationManager",
+            "CalendarProvider",
+            "ScreenshotController",
+            "EmailClient",
+            "VolumeController",
+        )) {
+            val text = "查 $identifier 符號"
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertEquals(text, "lsp.symbols", d.toolCall?.toolName)
+            assertNotNull(text, d.toolCall)
+            assertTrue(
+                "query must isolate the identifier: ${d.toolCall!!.argumentsJson}",
+                d.toolCall!!.argumentsJson.contains("\"query\": \"$identifier\""),
+            )
+            val before = backend.invocations.get()
+            val out = dispatcher.dispatch(d, lspOn)
+            val executed = out as? FastDispatchOutcome.Executed
+            assertNotNull("$text must execute against the fake backend (got $out)", executed)
+            assertFalse(executed!!.result.denied)
+            assertTrue(
+                "executed body must echo the queried identifier: ${executed.result.resultJson}",
+                executed.result.resultJson.contains(identifier),
+            )
+            assertEquals(text, before + 1, backend.invocations.get())
+        }
+        assertEquals("backend must be invoked exactly once per case", 6, backend.invocations.get())
+    }
+
+    @Test fun symbolQueryBeatsKeywordHints() {
+        // 前閘必須帶 lookup intent 才生效 ⇒ 非 symbol 意圖照常落 keyword 工具，
+        // 且 SYMBOLS 自 RULES 移除後 volume 規則依然有效。
+        // 採用不含任何工具 hint 子串的 Widget（`AlarmManager` ⊃ 無錨點 `alarm`
+        // 會命中 alarm.create，不適合作 volume.set 的探針）：
+        // `音量` 命中 VOLUME_HINTS → volume.set（未 ready ⇒ DENIED USER_DISABLED，
+        // header.toolName ＝ volume.set）——前閘未吞、volume 規則完好。
+        val d1 = decide("查 Widget 音量")
+        assertEquals(RouteKind.DENIED, d1.route)
+        assertEquals("volume.set", d1.header.toolName)
+
+        // 禮貌填充語（幫我…這個）下 symbol 查詢仍綁 lsp.symbols，query 剝離正確。
+        val d2 = decide("幫我查 AlarmManager 這個符號")
+        assertEquals(RouteKind.FAST, d2.route)
+        assertEquals("lsp.symbols", d2.toolCall?.toolName)
+        assertNotNull(d2.toolCall)
+        assertTrue(d2.toolCall!!.argumentsJson.contains("\"query\": \"AlarmManager\""))
+
+        // A2 閘在前閘重排後依然存活：symbol hint 出現但無 lookup marker ⇒
+        // 前閘不生效、其餘 RULES 亦無命中 ⇒ no-match DENIED
+        // （reasonCode null、toolCall null）——絕不綁 lsp.symbols。
+        // 採用不含其他工具 hint 的 SymbolTable（`符號 AlarmManager` 會命中
+        // 無錨點 `alarm` → alarm.create，不是 no-match）。
+        val d3 = decide("符號 SymbolTable")
+        assertEquals(RouteKind.DENIED, d3.route)
+        assertNull(d3.reasonCode)
+        assertNull(d3.toolCall)
+    }
+
     @Test fun negatedIntentsNeverExecute() = runBlocking {
         val backend = CountingBackend()
         val phoneFake = CountingFake("phone.dial")
@@ -924,7 +995,7 @@ class FastDispatchTest {
         assertEquals(RouteKind.DENIED, d.route)
         assertEquals(DenyReason.NO_PRIVILEGE, d.reasonCode)
 
-        // dispatch 端：ready-copy 也必須在 gate 3（NATIVE-only）fail-closed。
+        // dispatch 端：ready-copy 也必須在 gate 4（NATIVE-only）fail-closed。
         val readyCopy: (String) -> ToolDef? = { name ->
             ToolRegistry.find(name)?.let { if (name == "notification.read") it.copy(executionReady = true) else it }
         }
@@ -953,7 +1024,7 @@ class FastDispatchTest {
     }
 
     @Test fun writeReadyCopyRefusesExecute() = runBlocking {
-        // gate 5（READ-only）：WRITE ready-copy 也絕不執行。
+        // gate 6（READ-only）：WRITE ready-copy 也絕不執行。
         val readyCopy: (String) -> ToolDef? = { name ->
             ToolRegistry.find(name)?.let { if (name == "alarm.create") it.copy(executionReady = true) else it }
         }
@@ -1012,6 +1083,25 @@ class FastDispatchTest {
         val skipped = skippedOf(out, "lookup throwing")
         assertEquals("LOOKUP_ERROR", skipped.denyCode)
         assertFalse(skipped.fallbackMessage!!.contains("lookup-boom"))
+    }
+
+    @Test fun lookupIdentityMismatchFailsClosed() = runBlocking {
+        // 注入的 lookup 不回音要求：call 要的是 alarm.create（WRITE、未 ready），
+        // lookup 卻回傳 lsp.symbols（ready + READ + NATIVE）——gate 3 身分比對
+        // 在任何投影／執行之前即 fail-closed；執行器與 backend 零觸碰；
+        // 話術為不回音的固定字串，不含任何一方的工具名。
+        val backend = CountingBackend()
+        val lspLookup: (String) -> ToolDef? = { ToolRegistry.find(LspTools.SYMBOLS_NAME) }
+        val fake = CountingFake("alarm.create")
+        val synthetic = fastDecision("alarm.create", "{\"hour\": 7, \"minute\": 30}", "call-mismatch")
+        val out = FastDispatcher(mapOf("alarm.create" to fake), lookup = lspLookup).dispatch(synthetic, lspOn)
+        val skipped = skippedOf(out, "lookup identity mismatch")
+        assertEquals("LOOKUP_IDENTITY_MISMATCH", skipped.denyCode)
+        assertFalse("lookup identity mismatch fails before any executor is entered", skipped.attempted)
+        assertNull(skipped.reasonCode)
+        assertEquals(0, fake.invocations.get())
+        assertEquals("backend must never be invoked", 0, backend.invocations.get())
+        assertEquals("執行工具失敗，請重試或手動操作", skipped.fallbackMessage)
     }
 
     @Test fun executorDeniedMapsTypedOutcome() = runBlocking {

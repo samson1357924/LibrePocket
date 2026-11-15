@@ -36,42 +36,50 @@ import kotlin.coroutines.coroutineContext
  * `FastDispatchTest`, including the clarification path which must never
  * execute even when an executor IS registered for that tool.
  *
- * Dispatch gates, in order (fail-closed; gates 1–6 and gate 7's non-positive
+ * Dispatch gates, in order (fail-closed; gates 1–7 and gate 8's non-positive
  * `timeoutMs` branch trip before any executor entry; the rest — including
- * gate 7's timeout branch and gates 8–10 — trip at or after it; see
+ * gate 8's timeout branch and gates 9–11 — trip at or after it; see
  * `attempted`):
  * 1. the decision must be FAST with a non-null [ToolCall] (DENIED /
  *    NEED_CLARIFICATION / no-match intents never execute);
  * 2. the tool must resolve via [lookup] — a lookup that throws (non-cancel)
  *    maps to [FastDispatchOutcome.Skipped] with denyCode `LOOKUP_ERROR`;
  *    unknown names fail closed with `UNKNOWN_TOOL`;
- * 3. a FRESH projection at dispatch time must be NATIVE (any non-NATIVE
+ * 3. the resolved tool's identity must equal the call's tool name
+ *    (`tool.name == call.toolName`) — checked BEFORE any projection or
+ *    execution. An injected [lookup] that returns a DIFFERENT [ToolDef]
+ *    than requested (e.g. a ready, READ-only tool for an unready WRITE
+ *    call) fails closed with denyCode `LOOKUP_IDENTITY_MISMATCH`; the
+ *    returned tool's name is never interpolated (it may be
+ *    attacker-controlled content) — the fixed non-echoing message applies,
+ *    like the lookup-failure paths;
+ * 4. a FRESH projection at dispatch time must be NATIVE (any non-NATIVE
  *    projection — UNAVAILABLE or DEGRADED — denies, mirroring the slice's
  *    NATIVE-only rule; DEGRADED tools never execute on the fast lane. The
  *    ready `lsp.symbols` projects NATIVE once its switch is on, so the
  *    pinned suite is unaffected);
- * 4. the tool must be `executionReady` (registry readiness; B3 flips no
+ * 5. the tool must be `executionReady` (registry readiness; B3 flips no
  *    flags — today only `lsp.symbols` qualifies);
- * 5. the tool must be [SideEffect.READ] (defense in depth: WRITE/PRIVILEGED
+ * 6. the tool must be [SideEffect.READ] (defense in depth: WRITE/PRIVILEGED
  *    tools need the confirmation pipeline before any execution, which lives
  *    in a future wiring PR — this dispatcher refuses them even if ready);
- * 6. an executor must be registered for the tool name, and the executor's
+ * 7. an executor must be registered for the tool name, and the executor's
  *    [FastToolExecutor.toolName] must equal the call's tool name — checked
  *    BEFORE any execution (a mismatched executor never runs; map keys and
  *    executor self-descriptions are never trusted);
- * 7. the executor call runs under `tool.annotations.timeoutMs`
+ * 8. the executor call runs under `tool.annotations.timeoutMs`
  *    (`withTimeout`); a non-positive budget is a fail-closed typed
  *    `TIMEOUT` denial with zero backend invocations (`attempted=false` —
  *    executor never entered), and a `withTimeout`
  *    expiry maps to [FastDispatchOutcome.Skipped] with denyCode `TIMEOUT`
  *    — a typed failure, never a propagated cancel (`attempted=true` —
  *    executor was entered);
- * 8. AFTER the executor returns, its [FastExecResult.toolName] and
+ * 9. AFTER the executor returns, its [FastExecResult.toolName] and
  *    [FastExecResult.callId] must equal the call's, else
  *    [FastDispatchOutcome.Skipped] with denyCode `RESULT_IDENTITY_MISMATCH`
  *    — executor was entered (`attempted=true`); zero propagation: a forged
  *    result never rides the outcome;
- * 9. executor denials (typed [FastExecResult.denied]) — executor was
+ * 10. executor denials (typed [FastExecResult.denied]) — executor was
  *    entered (`attempted=true`) — never reach the caller as executions:
  *    `SCHEMA_INVALID` → [DenyReason.NEED_CLARIFICATION],
  *    anything else (including `UNAVAILABLE`) → [DenyReason.USER_DISABLED].
@@ -81,9 +89,9 @@ import kotlin.coroutines.coroutineContext
  *    raw executor/backend text never does; `fallbackMessage` is always the
  *    fixed failure string (deny codes preserved on the outcome:
  *    `SCHEMA_INVALID` / `UNAVAILABLE` / `TIMEOUT` / `LOOKUP_ERROR` /
- *    `UNKNOWN_TOOL` / `PROJECTION_ERROR` / `EXECUTOR_IDENTITY_MISMATCH` /
- *    `RESULT_IDENTITY_MISMATCH` / `EXEC_ERROR`);
- * 10. defense in depth on the executed path: a result whose serialized
+ *    `UNKNOWN_TOOL` / `LOOKUP_IDENTITY_MISMATCH` / `PROJECTION_ERROR` /
+ *    `EXECUTOR_IDENTITY_MISMATCH` / `RESULT_IDENTITY_MISMATCH` / `EXEC_ERROR`);
+ * 11. defense in depth on the executed path: a result whose serialized
  *    `resultJson` exceeds [SafeToolSlice.MAX_RESULT_CHARS] never rides the
  *    outcome — [FastDispatchOutcome.Executed] is withheld and the call maps
  *    to [FastDispatchOutcome.Skipped] with denyCode `EXEC_ERROR`
@@ -161,6 +169,12 @@ class FastDispatcher(
             return FastDispatchOutcome.Skipped(null, fixedFailureMessage(null), denyCode = "LOOKUP_ERROR")
         }
             ?: return FastDispatchOutcome.Skipped(null, fixedFailureMessage(null), denyCode = "UNKNOWN_TOOL")
+        if (tool.name != call.toolName) {
+            // lookup 回傳了「非所要求」的工具定義：fail-closed。回傳 ToolDef 的
+            // name 來自注入的 lookup callback（可能含攻擊者構造內容），話術一律
+            // 用不回音的固定字串——與 LOOKUP_ERROR / UNKNOWN_TOOL 同一模子。
+            return FastDispatchOutcome.Skipped(null, fixedFailureMessage(null), denyCode = "LOOKUP_IDENTITY_MISMATCH")
+        }
         val projection = try {
             tool.project(ctx)
         } catch (e: CancellationException) {
@@ -261,7 +275,7 @@ class FastDispatcher(
      * beyond [FastRouter.decide] + [dispatch] with the same [ctx].
      *
      * The SAME [ctx] snapshot is passed to both decide and dispatch, so the
-     * gate-3 projection re-check inside [dispatch] re-validates the same
+     * gate-4 projection re-check inside [dispatch] re-validates the same
      * snapshot the router saw — it is a same-snapshot recheck, NOT a
      * freshness signal. Freshness still requires the caller to re-read
      * [ProjectionContext] per call; a future wiring PR owns the
@@ -305,7 +319,7 @@ sealed interface FastDispatchOutcome {
      * Skipped.
      *
      * [attempted] is false ⇔ the dispatcher resolved everything BEFORE
-     * entering `executor.execute(...)` (all gates 1–6, plus the non-positive
+     * entering `executor.execute(...)` (all gates 1–7, plus the non-positive
      * timeout budget check) — genuinely zero executor effects.
      * [attempted] is true ⇔ `executor.execute(...)` was entered (timeout
      * mid-flight, executor exception, denied result, post-execute identity /
@@ -319,8 +333,9 @@ sealed interface FastDispatchOutcome {
      * allowlist (`SCHEMA_INVALID` / `UNAVAILABLE`-class codes pass through
      * verbatim; only shape-violating codes map to `EXEC_ERROR`) or a
      * dispatcher-internal code (`UNKNOWN_TOOL` / `LOOKUP_ERROR` /
-     * `PROJECTION_ERROR` / `EXECUTOR_IDENTITY_MISMATCH` /
-     * `RESULT_IDENTITY_MISMATCH` / `TIMEOUT` / `EXEC_ERROR`). Null when a code is
+     * `LOOKUP_IDENTITY_MISMATCH` / `PROJECTION_ERROR` /
+     * `EXECUTOR_IDENTITY_MISMATCH` / `RESULT_IDENTITY_MISMATCH` /
+     * `TIMEOUT` / `EXEC_ERROR`). Null when a code is
      * not applicable (e.g. a non-FAST decision).
      *
      * [fallbackMessage] remains a fixed, curated, non-interpolated string —

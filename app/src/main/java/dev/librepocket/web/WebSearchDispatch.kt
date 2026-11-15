@@ -23,10 +23,9 @@ package dev.librepocket.web
  * [runLocal] 收到 `(provider, query, count)`，query／count 由本層原樣下傳，
  * 無隱藏 closure 漂移；[runHosted] 不帶參數（hosted 內容由 endpoint 決定）。
  *
- * [hostedMarker] 為真正的 allowlist：非 conforming 的狀態字直接拋
- * [IllegalArgumentException]，異常原樣向上傳播給呼叫方（D3 必須自行捕捉／處理；
- * 本層不捕捉）。注意 `ServerToolTranscript.webSearchMarker` 本身不做驗證——
- * web 側刻意更嚴格，避免 hosted 狀態字把結構性字元帶進轉錄層。
+ * [hostedMarker] 為真正的 enum allowlist：僅含六個已知狀態字，其他字串
+ * 直接拋 [IllegalArgumentException]，異常原樣向上傳播給呼叫方
+ * （D3 必須自行捕捉／處理；本層不捕捉）。
  *
  * Throw 契約：本層不捕捉異常（runner 的 [kotlinx.coroutines.CancellationException]
  * 原樣透傳；provider 的值契約由 [WebSearchService] 中央保證）。
@@ -46,21 +45,33 @@ sealed interface WebDispatchOutcome {
 }
 
 object WebSearchDispatch {
-    /** allowlist for hosted 轉錄狀態字（protocol 狀態如 `in_progress`／`completed`／`failed`／`cancelled`／`started`）。 */
-    private val HOSTED_STATE = Regex("^[a-z][a-z_]{0,31}$")
+    /**
+     * ENUM allowlist for hosted 轉錄狀態字：僅六個已知狀態字——
+     * production 程式碼於別處實際發出的狀態字（`started`／`searching`／`completed`／`update`，
+     * 見 `ResponsesProvider.webSearchStateOf` 對廠商事件後綴的收斂），
+     * 加上 `failed`／`cancelled`（錯誤路徑）。
+     */
+    private val HOSTED_STATES: Set<String> = setOf("started", "searching", "completed", "update", "failed", "cancelled")
 
     /**
      * Hosted 轉錄標記（與 `provider/ServerTools.kt`
      * `ServerToolTranscript.webSearchMarker(state)` 同形，避免 web 模組硬依賴
      * provider 模組；兩者一致性由 `hostedMarkerMirrorsServerTools` 測試釘住。
      * `state` 為呼叫方傳入的狀態字（如 `completed`），不攜帶使用者原文。
-     * 構造保證：[state] 必須匹配 [HOSTED_STATE]（真正的 allowlist），否則拋
-     * [IllegalArgumentException]——異常原樣傳播給呼叫方（D3 須自行處理，本層不捕捉）。
+     *
+     * 構造保證：[state] 必須屬於 [HOSTED_STATES]——僅此六個已知狀態字的
+     * ENUM allowlist（`started`／`searching`／`completed`／`update` 為 production
+     * 程式碼於別處實際發出的狀態字，加上 `failed`／`cancelled` 供錯誤路徑）；
+     * 任何其他字串（例如 server 送來的 garbage）皆拋 [IllegalArgumentException]——
+     * 異常原樣傳播給呼叫方（D3 須自行捕捉／處理，本層不捕捉）。
+     * 本層不嘗試「清理」未知狀態字，allowlist 就是允許列表本身。
+     *
+     * 注意 `ServerToolTranscript.webSearchMarker` 本身不做驗證——web 側刻意更嚴格；
+     * 兩者的 mirror 一致性由 `hostedMarkerMirrorsServerTools` 測試釘住
+     * （mirror 校驗的狀態字是 enum 的子集）。
      */
     fun hostedMarker(state: String): String {
-        require(state.matches(HOSTED_STATE)) {
-            "hostedMarker state must match [a-z][a-z_]{0,31}"
-        }
+        require(state in HOSTED_STATES) { "hostedMarker state must be one of $HOSTED_STATES" }
         return "\n[SERVER_TOOL:${WebSearchSelector.HOSTED_TOOL_NAME} $state]\n"
     }
 

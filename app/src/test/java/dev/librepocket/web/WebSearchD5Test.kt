@@ -277,6 +277,20 @@ class WebSearchD5Test {
         assertTrue(http.lastBody!!.contains("\"limit\":5"))
     }
 
+    @Test fun firecrawlQueryIsCappedAt500() = runBlocking {
+        val vault = FakeVault()
+        vault.putKey(FirecrawlSearchProvider.DEFAULT_KEY_ID, "k-fire".toCharArray())
+        val http = FakePost { _, _ -> ok(body = firecrawlJson) }
+        val p = FirecrawlSearchProvider(vault, http)
+        val out = p.search("x".repeat(600), 5)
+        assertTrue(out is WebSearchOutcome.Ok)
+        // v2 `query` 契約上限 500 字元：本層靜默截斷（不送 501+ 字元）。
+        assertTrue(http.lastBody!!.contains("\"query\":\"${"x".repeat(500)}\""))
+        assertFalse(http.lastBody!!.contains("x".repeat(501)))
+        // count 不受影響。
+        assertTrue(http.lastBody!!.contains("\"limit\":5"))
+    }
+
     @Test fun firecrawlSuccessAsStringIsBadResponse() = runBlocking {
         val vault = FakeVault()
         vault.putKey(FirecrawlSearchProvider.DEFAULT_KEY_ID, "k".toCharArray())
@@ -790,6 +804,7 @@ class WebSearchD5Test {
         }
     }
 
+    // unknown/ill-formed 狀態字一律拒絕（enum allowlist：不在六字集合內＝拋 IAE；CR/LF 亦然）。
     @Test fun hostedMarkerRejectsInvalidStates() {
         val invalid = listOf(
             "",
@@ -807,16 +822,44 @@ class WebSearchD5Test {
             "\u0007x",
         )
         for (state in invalid) {
-            assertThrows("hostedMarker(\"$state\") must throw IllegalArgumentException", IllegalArgumentException::class.java) {
+            assertThrows("hostedMarker(\"$state\") must throw IllegalArgumentException (unknown/ill-formed state)", IllegalArgumentException::class.java) {
                 WebSearchDispatch.hostedMarker(state)
             }
         }
     }
 
-    @Test fun hostedMarkerAcceptsProtocolStates() {
-        for (state in listOf("in_progress", "completed", "failed", "cancelled", "started")) {
+    @Test fun hostedMarkerAcceptsKnownStates() {
+        // 僅六個已知狀態字（production 收斂後的狀態字＋錯誤路徑字）一律接受。
+        for (state in listOf("started", "searching", "completed", "update", "failed", "cancelled")) {
             val marker = WebSearchDispatch.hostedMarker(state)
             assertTrue("marker for $state must contain the state", marker.contains(state))
+        }
+    }
+
+    @Test fun hostedMarkerRejectsUnknownStates() {
+        // `in_progress` 不是 production 詞彙（webSearchStateOf 先收斂為 started），必須拒絕；
+        // 其餘皆為未知／ill-formed 狀態字。
+        val unknown = listOf(
+            "in_progress",
+            "arbitrary_state",
+            "progress",
+            "",
+            "Completed",
+            "completed ",
+            " a",
+            "a]b",
+            "9lives",
+            "a".repeat(33),
+            "started\ncompleted",
+            "\tstarted",
+        )
+        for (state in unknown) {
+            assertThrows(
+                "hostedMarker(\"$state\") must throw IllegalArgumentException (unknown/ill-formed state)",
+                IllegalArgumentException::class.java,
+            ) {
+                WebSearchDispatch.hostedMarker(state)
+            }
         }
     }
 
@@ -889,7 +932,7 @@ class WebSearchD5Test {
             }
         }
         assertEquals("boom", localEx.message)
-        // (b) runHosted 回傳非法狀態字 → hostedMarker 的 IllegalArgumentException 傳播出 search()。
+        // (b) runHosted 回傳未知狀態字 → hostedMarker 的 IllegalArgumentException 傳播出 search()。
         val hostedEx = assertThrows(IllegalArgumentException::class.java) {
             runBlocking {
                 WebSearchDispatch.search(
@@ -904,7 +947,7 @@ class WebSearchD5Test {
                 )
             }
         }
-        assertTrue(hostedEx.message?.contains("a-z") == true)
+        assertTrue(hostedEx.message?.contains("one of") == true)
     }
 
     @Test fun responseToStringDoesNotLeakKey() {
@@ -1019,15 +1062,48 @@ class WebSearchD5Test {
 
     // ---- 短路／探測次數／select parity／例外傳播 ----
 
-    @Test fun hostedMarkerAccepts32CharBoundary() {
-        // "a".repeat(32) 為 HOSTED_STATE 上限（首字母 [a-z]＋至多 31 個 [a-z_]），必須接受。
-        val state = "a".repeat(32)
-        val marker = WebSearchDispatch.hostedMarker(state)
-        assertTrue("marker must contain the 32-char state", marker.contains(state))
-        // 首字元不得為底線（regex 首類別為 [a-z]）：一律 IllegalArgumentException。
+    @Test fun hostedMarkerStateSpaceIsExactlyKnown() {
+        // HOSTED_STATES 為 private；測試釘住恰好六個已知狀態字：
+        // 六字皆接受（marker 含該字）；in_progress 等未收斂字一律 IAE。
+        val hostedStates = WebSearchDispatch::class.java
+            .getDeclaredField("HOSTED_STATES")
+            .apply { isAccessible = true }
+            .get(null) as Set<String>
+        assertEquals(setOf("started", "searching", "completed", "update", "failed", "cancelled"), hostedStates)
+        for (state in listOf("started", "searching", "completed", "update", "failed", "cancelled")) {
+            val marker = WebSearchDispatch.hostedMarker(state)
+            assertTrue("marker for $state must contain the state", marker.contains(state))
+        }
+        // `in_progress` 不是 production 詞彙（webSearchStateOf 收斂為 started），必須拒絕。
+        assertThrows(IllegalArgumentException::class.java) {
+            WebSearchDispatch.hostedMarker("in_progress")
+        }
         assertThrows(IllegalArgumentException::class.java) {
             WebSearchDispatch.hostedMarker("_completed")
         }
+    }
+
+    @Test fun hostedMarkerUnknownServerStatePropagates() {
+        // worst-case server drift：runHosted 回傳 "in_progress"（我們的 enum 未收斂此字）
+        // → hostedMarker 拋 IAE → 例外傳播出 search()（D3 契約：本層不捕捉）。
+        // （provider 路徑不會以 server 原字直接呼叫 hostedMarker——webSearchStateOf 先收斂；
+        //   本測試釘住 dispatch 層的 guard。）
+        val registry = registryOf("brave")
+        val ex = assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                WebSearchDispatch.search(
+                    pinnedId = null,
+                    hostedAvailable = true,
+                    registry = registry,
+                    query = "kotlin",
+                    count = 5,
+                    isReady = { true },
+                    runHosted = { "in_progress" },
+                    runLocal = { _, _, _ -> throw AssertionError("runLocal must not be called") },
+                )
+            }
+        }
+        assertTrue(ex.message?.contains("one of") == true)
     }
 
     @Test fun emptyQueryProbesZeroProviders() = runBlocking {

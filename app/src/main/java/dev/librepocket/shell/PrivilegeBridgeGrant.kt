@@ -68,7 +68,8 @@ class PendingRevokeMarker(val file: File? = null) {
         // 反向失效）；記憶體旗標 OR 檔案分支（記憶體優先語義：同行程記憶體 pending
         // 不可因檔案缺失/為目錄而被放行）。file == null 時只看記憶體。
         inMemoryPending.get() || (file != null && file.isFile)
-    } catch (_: Exception) {
+    } catch (t: Exception) {
+        if (t is CancellationException) throw t
         true // Fail-closed: assume pending on filesystem/security error so grant is not loaded
     }
 
@@ -96,7 +97,8 @@ class PendingRevokeMarker(val file: File? = null) {
             } else {
                 f.isFile
             }
-        } catch (_: Exception) {
+        } catch (t: Exception) {
+            if (t is CancellationException) throw t
             false
         }
     }
@@ -108,7 +110,8 @@ class PendingRevokeMarker(val file: File? = null) {
             if (f.exists()) {
                 f.delete()
             }
-        } catch (_: Exception) {
+        } catch (t: Exception) {
+            if (t is CancellationException) throw t
             // best effort
         }
     }
@@ -266,6 +269,8 @@ object PrivilegeGrantPolicy {
  *     剛落盤的 marker（該方記憶體旗標仍置位，fail-closed；但跨重啟 marker 保障削弱）。
  * (v) ReplaceFileCorruptionHandler 損毀 ⇒ journal 一併消失 ⇒ 表現為「從未授權」（fail-closed）。
  * (vi) heal/wipe 失敗僅 logcat 一行，無 audit 計數。
+ * (vii) 本檔測試以單執行緒注入 seam 釘住順序語義；未證明真並行 interleaving 的行為；
+ *     並行 save() vs load()-heal 的完整化併 #136-B3 generation fence。
  */
 class PrivilegeBridgeStore(
     private val dataStore: DataStore<Preferences>,

@@ -370,6 +370,58 @@ class PrivilegeBridgeStateTest {
         assertNull(store.load())
     }
 
+    @Test fun grantAtExactlyNow_accepted() = runBlocking {
+        // atMs == 當下毫秒：fail-fast 判準為 atMs > now（require），等於邊界必須被接受
+        // （若誤收成 atMs >= now 才拒會誤拒合法授權；毫秒級精度足以釘住邊界）。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "atms_equal_now.preferences_pb")
+        }
+        val store = PrivilegeBridgeStore(backing)
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+        val atMs = System.currentTimeMillis()
+
+        state.grant(store, "preset:openai", 1L, ttlMs = null, atMs = atMs)
+
+        assertTrue("atMs == now 必為合法授權，旗標必為 true", state.bridgeGranted)
+        assertEquals(atMs, store.load()?.grantedAtMs)
+    }
+
+    @Test fun failedSecondGrant_preservesPreviousBridgeGranted() = runBlocking {
+        // 首次授權成功（旗標 true、持久庫為第一份授權）；第二次授權落庫失敗 →
+        // 例外上拋、旗標保持 true：「重新授權失敗」不得回溯作廢首份授權的記憶體
+        // 授權（fail-closed 僅施加於撤權側／落庫後 policy 判定，不施加於再簽發側；
+        // 持久庫亦仍為首份授權，與記憶體旗標一致）。此為語義 pin，非 tautology。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "failed_re_grant.preferences_pb")
+        }
+        // fail-once-per-call 假件（同檔既有模式）：第一次 updateData（首次授權落庫）
+        // 走真實 DataStore；之後（第二次 grant 的落庫）直接拋 IOException。
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val failingDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                if (saveCalls.getAndIncrement() >= 1) {
+                    throw java.io.IOException("simulated re-grant save failure")
+                }
+                return backing.updateData(transform)
+            }
+        }
+        val store = PrivilegeBridgeStore(failingDs)
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+        val atMs = System.currentTimeMillis()
+
+        val first = state.grant(store, "preset:openai", 1L, ttlMs = null, atMs = atMs)
+        assertTrue("首次授權必置旗標", state.bridgeGranted)
+
+        val error = assertThrows(java.io.IOException::class.java) {
+            runBlocking {
+                state.grant(store, "preset:openai", 1L, ttlMs = null, atMs = System.currentTimeMillis())
+            }
+        }
+        assertEquals("simulated re-grant save failure", error.message)
+        assertTrue("重新授權失敗不得回溯作廢首份授權", state.bridgeGranted)
+        assertEquals("持久庫仍為首份授權（再簽發未落庫）", first, store.load())
+    }
+
     @Test fun revokeWithStuckDataStore_failsBoundedlyAndMemoryRevoked() = runBlocking {
         // 假 Store 的 clear() 永不返回：revoke 必須在 revokeOpTimeoutMs 量級內
         // fail-closed 拋 IllegalStateException（不得無界掛起），且記憶體旗標已落 false。

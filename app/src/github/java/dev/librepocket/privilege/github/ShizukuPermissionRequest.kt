@@ -8,6 +8,12 @@ import rikka.shizuku.Shizuku
 
 private const val TAG = "ShizukuPermissionRequests"
 
+/** github 源集專用錯誤碼命名空間（值與 main 側 PrivilegeBridgeErrors 相互獨立）。 */
+internal object ShizukuRequestErrors {
+    /** 碼空間耗盡（候選越過 Int.MAX_VALUE；fail-closed）。 */
+    const val REQUEST_CODE_SPACE_EXHAUSTED = "REQUEST_CODE_SPACE_EXHAUSTED"
+}
+
 /**
  * android.util.Log 在非 Robolectric 的 JVM 單元測試中未 mock（呼叫即抛
  * RuntimeException）；日誌絕不得影響 fail-closed 控制流，故包一層容錯。
@@ -53,7 +59,7 @@ private fun safeLogW(tag: String, msg: String, e: Throwable? = null) {
  * 失敗與回滾照燒，fail-closed）。[allocateRequestCode] 為嚴格遞增 allocator
  * （起點 1、跳過 burned 碼）；發出不 burn，碼於首次送出／登記才照燒
  * （與呼叫方自選碼同一規則）；耗盡（候選越過 Int.MAX_VALUE）拋出
- * `IllegalStateException("REQUEST_CODE_SPACE_EXHAUSTED")`（fail-closed）。
+ * `IllegalStateException(ShizukuRequestErrors.REQUEST_CODE_SPACE_EXHAUSTED)`（fail-closed）。
  * 呼叫方自選碼經 [request]／[requestWithCallback]／[onResult] 註冊或送出時照燒。
  * 殘餘邊界：行程重啟後碼空間自 1 重新開始（含呼叫方自選碼）——stale pending
  * dialog 在重啟後答覆，可把舊碼送達新行程的 listener；唯一緩解是 B3 落庫前的
@@ -91,6 +97,23 @@ class ShizukuPermissionRequests(
             synchronized(this) {
                 processInstance?.detach()
                 processInstance = null
+            }
+        }
+
+        /**
+         * 僅單測隔離用：以指定實例取代行程單例（供注入假 addListener/removeListener 的
+         * 實例進 [process] 語義）；僅模組內可見、production 不得調用。取代前先 detach 舊實例，
+         * 與 [resetProcessForTest] 相同的隔離語義。
+         *
+         * 注意：舊實例 detach() 若抛出非 Exception／LinkageError 的 Throwable
+         *（detach() 刻意放行），例外會原樣上拋且 processInstance 仍綁定舊實例——
+         * fail-loud，不會洩漏 listener（舊實例已先 clearLocked 再 removeListener）。
+         */
+        @VisibleForTesting
+        internal fun setProcessForTest(instance: ShizukuPermissionRequests) {
+            synchronized(this) {
+                processInstance?.detach()
+                processInstance = instance
             }
         }
     }
@@ -326,7 +349,7 @@ class ShizukuPermissionRequests(
      * 掃描長度可忽略）。
      *
      * @throws IllegalStateException 碼空間耗盡（候選越過 [Int.MAX_VALUE]），
-     * message 為 `REQUEST_CODE_SPACE_EXHAUSTED`（fail-closed；計數器釘在
+     * message 為 [ShizukuRequestErrors.REQUEST_CODE_SPACE_EXHAUSTED]（fail-closed；計數器釘在
      * Int.MAX_VALUE + 1，後續呼叫必再拋同一例外）。
      */
     @VisibleForTesting
@@ -338,7 +361,7 @@ class ShizukuPermissionRequests(
         if (candidate > Int.MAX_VALUE.toLong()) {
             // 釘住計數器：後續呼叫必再判 exhausted（fail-closed、可重入）
             requestCodeCounter = Int.MAX_VALUE.toLong() + 1
-            throw IllegalStateException("REQUEST_CODE_SPACE_EXHAUSTED")
+            throw IllegalStateException(ShizukuRequestErrors.REQUEST_CODE_SPACE_EXHAUSTED)
         }
         val code = candidate.toInt()
         requestCodeCounter = candidate + 1

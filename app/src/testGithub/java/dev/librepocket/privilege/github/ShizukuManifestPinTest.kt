@@ -33,7 +33,8 @@ import org.w3c.dom.Element
  *   MCP 面同政策）。
  *
  * 全靜態（只讀源集 manifest XML，namespace-aware 解析），零真機、零 binder、零 su。
- * 路徑解析：Gradle 單測工作目錄為模組目錄（`app/`）時走 `src/<sourceSet>/…`；
+ * 路徑解析：`-Dtest.src.dir=<path>` 可覆蓋源集根目錄（外部 runner 指定；預設不設）；
+ * 未設時：Gradle 單測工作目錄為模組目錄（`app/`）時走 `src/<sourceSet>/…`；
  * IDE/倉庫根工作目錄時走 `app/src/<sourceSet>/…`；向上回溯找首個命中。
  */
 class ShizukuManifestPinTest {
@@ -47,6 +48,8 @@ class ShizukuManifestPinTest {
     }
 
     private fun appSrcDir(): File {
+        // 外部 runner 可經 -Dtest.src.dir 指定源集根（預設不設，走下方回溯）。
+        System.getProperty("test.src.dir")?.let { return File(it) }
         val cwd = System.getProperty("user.dir") ?: "."
         var dir = File(cwd)
         while (true) {

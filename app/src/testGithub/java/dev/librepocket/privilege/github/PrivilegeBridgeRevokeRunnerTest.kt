@@ -84,6 +84,16 @@ class PrivilegeBridgeRevokeRunnerTest {
         hermeticExec = null
     }
 
+    /**
+     * 輪詢 [ElevatedCleanupTracker.outstanding] 至 [expected]；有界 10s deadline
+     * （超出即以 AssertionError 失敗，絕不無界等待）。
+     *
+     * 環境相依註記：`ElevatedCleanupTracker` 為 JVM 內共享 statics；本模組單測
+     * 未強制 fork-per-class，故與同 fork 內 cleanup-tracker 系測試的相對順序為
+     * 環境相依（例如是否先於 `ElevatedCleanupTrackerTest` 執行皆合法）。可接受——
+     * 輪詢有 deadline 上界保護，且 setUp／tearDown 皆以 `clearUnverified()`＋
+     * `noteClean()` 重置為 0，跨測試不殘留漂移。
+     */
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {
         val deadline = System.currentTimeMillis() + boundMs
         while (ElevatedCleanupTracker.outstanding() != expected) {
@@ -96,6 +106,16 @@ class PrivilegeBridgeRevokeRunnerTest {
         }
     }
 
+    /**
+     * 輪詢 [ElevatedCleanupTracker.activeCalls] 至 [expected]；有界 10s deadline
+     * （超出即以 AssertionError 失敗，絕不無界等待）。
+     *
+     * 環境相依註記：`ElevatedCleanupTracker` 為 JVM 內共享 statics；本模組單測
+     * 未強制 fork-per-class，故與同 fork 內 cleanup-tracker 系測試的相對順序為
+     * 環境相依（例如是否先於 `ElevatedCleanupTrackerTest` 執行皆合法）。可接受——
+     * 輪詢有 deadline 上界保護，且 setUp／tearDown 皆以 `clearUnverified()`＋
+     * `noteClean()` 重置為 0，跨測試不殘留漂移。
+     */
     private fun pollActiveTo(expected: Int, boundMs: Long = 10_000L) {
         val deadline = System.currentTimeMillis() + boundMs
         while (ElevatedCleanupTracker.activeCalls() != expected) {

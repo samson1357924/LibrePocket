@@ -39,6 +39,7 @@ class PrivilegeBridgeStoreRobolectricTest {
 
     @Before fun setUp() {
         context = ApplicationProvider.getApplicationContext<Context>()
+        deleteSharedDataStores()
         val markerFile = File(context.noBackupFilesDir, PRIVILEGE_PENDING_REVOKE_FILE_NAME)
         if (markerFile.exists()) markerFile.delete()
     }
@@ -48,14 +49,27 @@ class PrivilegeBridgeStoreRobolectricTest {
         if (markerFile.exists()) markerFile.delete()
         val corruptedFile = File(context.filesDir, "corrupted_test.preferences_pb")
         if (corruptedFile.exists()) corruptedFile.delete()
-        // context-constructor 共用的預設 DataStore（preferencesDataStore 落 filesDir/datastore/）：
-        // 測試間若殘留授權鍵會跨案例污染自癒斷言，必須刪除。
-        val grantStoreFile = File(context.filesDir, "datastore/librepocket_privilege_bridge.preferences_pb")
-        if (grantStoreFile.exists()) grantStoreFile.delete()
-        val grantStoreTmp = File(context.filesDir, "datastore/librepocket_privilege_bridge.preferences_pb.tmp")
-        if (grantStoreTmp.exists()) grantStoreTmp.delete()
+        deleteSharedDataStores()
         testScopes.forEach { it.cancel() }
         testScopes.clear()
+    }
+
+    /**
+     * context-constructor 共用的預設 DataStore（preferencesDataStore 落 filesDir/datastore/）：
+     * 兩套授權 DataStore（bridge／shizuku）測試間若殘留會跨案例、跨 class 污染
+     * （自癒斷言等），setUp／tearDown 皆須刪除。
+     */
+    private fun deleteSharedDataStores() {
+        listOf(
+            "datastore/librepocket_privilege_bridge.preferences_pb",
+            "datastore/librepocket_privilege_bridge.preferences_pb.tmp",
+            "datastore/librepocket_shizuku_grant.preferences_pb",
+            "datastore/librepocket_shizuku_grant.preferences_pb.tmp",
+        ).forEach { rel ->
+            runCatching {
+                java.nio.file.Files.deleteIfExists(File(context.filesDir, rel).toPath())
+            }
+        }
     }
 
     @Test fun contextConstructorUsesNoBackupFilesDirForPendingRevokeMarker() {

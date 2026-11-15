@@ -47,6 +47,7 @@ class ShizukuGrantStoreRobolectricTest {
         context = ApplicationProvider.getApplicationContext<Context>()
         val markerFile = File(context.noBackupFilesDir, SHIZUKU_PENDING_REVOKE_FILE_NAME)
         if (markerFile.exists()) markerFile.delete()
+        deleteSharedDataStores()
     }
 
     @After fun tearDown() {
@@ -60,8 +61,23 @@ class ShizukuGrantStoreRobolectricTest {
         if (grantStoreFile.exists()) grantStoreFile.delete()
         val grantStoreTmp = File(context.filesDir, "datastore/librepocket_shizuku_grant.preferences_pb.tmp")
         if (grantStoreTmp.exists()) grantStoreTmp.delete()
+        deleteSharedDataStores()
         testScopes.forEach { it.cancel() }
         testScopes.clear()
+    }
+
+    /** 與 [dev.librepocket.shell.PrivilegeBridgeStoreRobolectricTest] 對稱：setUp／tearDown 皆須刪除兩套授權 DataStore（+.tmp）。 */
+    private fun deleteSharedDataStores() {
+        listOf(
+            "datastore/librepocket_privilege_bridge.preferences_pb",
+            "datastore/librepocket_privilege_bridge.preferences_pb.tmp",
+            "datastore/librepocket_shizuku_grant.preferences_pb",
+            "datastore/librepocket_shizuku_grant.preferences_pb.tmp",
+        ).forEach { rel ->
+            runCatching {
+                java.nio.file.Files.deleteIfExists(File(context.filesDir, rel).toPath())
+            }
+        }
     }
 
     @Test fun contextConstructorUsesNoBackupFilesDirForPendingRevokeMarker() {

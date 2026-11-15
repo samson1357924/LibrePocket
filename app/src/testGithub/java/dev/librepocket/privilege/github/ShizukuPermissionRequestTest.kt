@@ -89,10 +89,15 @@ class ShizukuPermissionRequestTest {
         assertEquals(listOf("a", "b"), seen)
     }
 
-    @Test fun attachWithoutBinderEnvironmentDoesNotThrow() {
-        // JVM 單測無 Shizuku 服務：類初始化即失敗，註冊異常由內部收斂，
-        // 守衛恆 false（失敗不卡死，允許重試）；detach 冪等不抛。
-        val requests = ShizukuPermissionRequests()
+    @Test fun attachFailureKeepsGuardFalseAndDetachDoesNotThrow() {
+        // 注入假 addListener（註冊時抛 LinkageError，模擬無 binder 環境）：
+        // attach 內部收斂失敗、守衛恆 false（失敗不卡死，允許重試）；
+        // detach 冪等不抛；attach 可重試（不因前次失敗進入壞狀態）。
+        // 不依賴宿主 Shizuku clinit——確定性、零環境公理。
+        val requests = ShizukuPermissionRequests(
+            addListener = { throw LinkageError("no binder") },
+            removeListener = { },
+        )
         requests.attach()
         assertFalse(requests.isAttached())
         requests.attach()

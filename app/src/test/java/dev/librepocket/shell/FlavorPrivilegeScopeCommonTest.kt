@@ -28,19 +28,24 @@ import org.robolectric.annotation.Config
 class FlavorPrivilegeScopeCommonTest {
 
     @Before
-    fun setUp() = resetPrivilegeSingletons()
+    fun setUp() {
+        // 先刪檔再重置：即使反射重置抛 AssertionError，檔案清理仍已完成。
+        deleteRevokeArtifacts()
+        resetPrivilegeSingletons()
+    }
 
     @After
     fun tearDown() {
-        resetPrivilegeSingletons()
         deleteRevokeArtifacts()
+        resetPrivilegeSingletons()
     }
 
     /**
      * github 的 withdraw 會以 context-constructor 觸碰共用 DataStore 與撤權標記檔，
      * 在 robolectric filesDir/noBackupFilesDir 留下殘留檔案會跨案例污染同 JVM
-     * 的其他測試——tearDown 盡力刪除（失敗僅吞掉，不遮蔽測試本體結果）。
+     * 的其他測試——setUp／tearDown 盡力刪除（失敗僅吞掉，不遮蔽測試本體結果）。
      * 檔案清單：`datastore/librepocket_shizuku_grant.preferences_pb`（含 .tmp）、
+     * `datastore/librepocket_privilege_bridge.preferences_pb`（含 .tmp）、
      * `librepocket_shizuku_revoke.pending`、`librepocket_privilege_revoke.pending`。
      */
     private fun deleteRevokeArtifacts() {
@@ -49,6 +54,8 @@ class FlavorPrivilegeScopeCommonTest {
         val candidates = listOf(
             File(context.filesDir, "datastore/librepocket_shizuku_grant.preferences_pb"),
             File(context.filesDir, "datastore/librepocket_shizuku_grant.preferences_pb.tmp"),
+            File(context.filesDir, "datastore/librepocket_privilege_bridge.preferences_pb"),
+            File(context.filesDir, "datastore/librepocket_privilege_bridge.preferences_pb.tmp"),
             File(noBackup, "librepocket_shizuku_revoke.pending"),
             File(noBackup, "librepocket_privilege_revoke.pending"),
             File(context.filesDir, "librepocket_shizuku_revoke.pending"),

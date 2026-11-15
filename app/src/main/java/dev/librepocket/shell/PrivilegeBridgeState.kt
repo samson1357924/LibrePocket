@@ -205,11 +205,11 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
         atMs: Long = System.currentTimeMillis(),
     ): PrivilegeGrant {
         val epochBefore = revokeEpoch.get()
-        require(atMs <= System.currentTimeMillis()) { "AT_MS_IN_FUTURE" }
+        require(atMs <= System.currentTimeMillis()) { PrivilegeBridgeErrors.AT_MS_IN_FUTURE }
         return opMutex.withLock {
             if (revokeEpoch.get() != epochBefore) {
                 bridgeGranted = false
-                throw IllegalStateException("PRIVILEGE_GRANT_REVOKED_CONCURRENTLY")
+                throw IllegalStateException(PrivilegeBridgeErrors.GRANT_REVOKED_CONCURRENTLY)
             }
             val grant = PrivilegeGrantPolicy.grant(providerId, configRevision, ttlMs, atMs)
             store.save(grant)
@@ -222,7 +222,7 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
                     if (t is CancellationException) throw t
                     safeLogW(TAG, "revoke-compensation clear failed", t)
                 }
-                throw IllegalStateException("PRIVILEGE_GRANT_REVOKED_CONCURRENTLY")
+                throw IllegalStateException(PrivilegeBridgeErrors.GRANT_REVOKED_CONCURRENTLY)
             }
             // 以新鮮時鐘判定（不重用簽發時 atMs）：落庫耗時可跨過 TTL，
             // postCheck 必須見 expiresAtMs 已過而判失效，否則會置出已過期授權旗標。
@@ -234,7 +234,7 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
                     if (t is CancellationException) throw t
                     safeLogW(TAG, "revoke-compensation clear failed", t)
                 }
-                throw IllegalStateException("PRIVILEGE_GRANT_REVOKED_CONCURRENTLY")
+                throw IllegalStateException(PrivilegeBridgeErrors.GRANT_REVOKED_CONCURRENTLY)
             }
             // 旗標發布（write＋second-read 重查；撤銷落在發布窗口內 → 不得復活為 true）
             publishBridgeGranted(postCheck is PrivilegeGrantCheck.Valid, epochBefore)
@@ -342,21 +342,21 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
                 // 絕不 force-unlock 他協程持有的 mutex（unlock() 不做擁有者檢查）。
                 // opMutex 被長臨界區佔用（grant/refresh 含 DataStore I/O）或
                 // DataStore 永久掛起 → 不再無界等待。
-                primaryFailure = IllegalStateException("PRIVILEGE_REVOKE_TIMEOUT")
+                primaryFailure = IllegalStateException(PrivilegeBridgeErrors.REVOKE_TIMEOUT)
                 // 鎖外同有界 best-effort durable 清除（與臨界區內的 clear 冪等）：
                 // journal/marker 任一落地即可使舊授權不復活；兩者皆失敗＝已知限制 (ii)。
                 try {
                     val bestEffort = withTimeoutOrNull(revokeOpTimeoutMs) { store.clear() }
                     if (bestEffort == null) {
                         primaryFailure.addSuppressed(
-                            IllegalStateException("PRIVILEGE_REVOKE_BEST_EFFORT_CLEAR_TIMEOUT"),
+                            IllegalStateException(PrivilegeBridgeErrors.REVOKE_BEST_EFFORT_CLEAR_TIMEOUT),
                         )
                     }
                 } catch (t: Throwable) {
                     // 不得以 CancellationException 作 suppressed（不與 CE-first 契約同形）：
                     // 一律包 IllegalStateException。
                     primaryFailure.addSuppressed(
-                        IllegalStateException("PRIVILEGE_REVOKE_BEST_EFFORT_CLEAR_FAILED", t),
+                        IllegalStateException(PrivilegeBridgeErrors.REVOKE_BEST_EFFORT_CLEAR_FAILED, t),
                     )
                 }
             } else {
@@ -367,7 +367,7 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
                     try {
                         val clearedStore = withTimeoutOrNull(revokeOpTimeoutMs) { store.clear() }
                         if (clearedStore == null) {
-                            primaryFailure = IllegalStateException("PRIVILEGE_REVOKE_STORE_TIMEOUT")
+                            primaryFailure = IllegalStateException(PrivilegeBridgeErrors.REVOKE_STORE_TIMEOUT)
                         }
                     } catch (t: Throwable) {
                         // CancellationException 照現況捕捉為 primaryFailure，最終原樣 rethrow。
@@ -387,12 +387,12 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
                     if (withdrawn == null) {
                         val existing = primaryFailure
                         if (existing == null) {
-                            primaryFailure = IllegalStateException("PRIVILEGE_REVOKE_SCOPE_TIMEOUT")
+                            primaryFailure = IllegalStateException(PrivilegeBridgeErrors.REVOKE_SCOPE_TIMEOUT)
                         } else {
                             // TimeoutCancellationException 為 public，但其型別與 CE-first 契約
                             // 同形（MainScreen 會誤判為上層取消而原樣上拋）；改以型別一致的
                             // IllegalStateException 附加（fail-closed 語義不變）。
-                            existing.addSuppressed(IllegalStateException("PRIVILEGE_REVOKE_SCOPE_TIMEOUT"))
+                            existing.addSuppressed(IllegalStateException(PrivilegeBridgeErrors.REVOKE_SCOPE_TIMEOUT))
                         }
                     }
                 } catch (t: Throwable) {

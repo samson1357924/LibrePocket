@@ -256,7 +256,7 @@ class FastRouter(
          *（英文否定為 best-effort：`refuses symbols` 已涵蓋；其餘未列動詞仍是殘餘缺口，
          * 屬 fail-open 候選，監測留待 Phase 2/3）。其他模板動詞（擷／安排／帶／切／靜音）
          * 在其工具把 executionReady 翻轉前補入——不得提前宣稱涵蓋。
-         * 否定偵測同時跑在原始文本、NFKC 正規化後「刪除非字母/數字字元與 ASCII 英數字」的文本、以及
+         * 否定偵測同時跑在原始文本、NFKC 正規化後「刪除非（非 Lm）字母字元（含所有數字）與 ASCII 英數字」的文本、以及
          * 「非字母/數字字元→空白」的文本上（見 [isNegated]），故 `別 查`／`不\u200B查`／
          * `不2查`／全形英文（`ｎｅｖｅｒ`）之類插入分隔符、組合字標記、Cf 格式符或寬度混淆的
          * 形式同樣不執行（澄清或 no-match DENIED）。
@@ -268,14 +268,16 @@ class FastRouter(
          *
          * 已知殘餘（Known residuals，皆為安全方向或已記錄）：
          * - 完全處理：zero-width／default-ignorable／separator／combining mark／
-         *   punctuation／symbol／PUA／Cc/Cf 碼點（經 exhaustive code-point scan 驗證）
+         *   punctuation／symbol／PUA／Cc/Cf 碼點，Lm modifier letters
+         *   （`ˇ` U+02C7、`ˉ` U+02C9、阿拉伯 tatweel U+0640、`々` U+3005 等 400+ 碼點），
+         *   以及所有 Nd/No 數字（含非 ASCII，如 U+09E8（Bengali digit two）等）
          *   作為分隔符拆開的 CJK 否定詞，以及全形 Latin/digit 否定句（經 NFKC）
          *   ——皆不執行（澄清或 no-match DENIED）。
          * - 亦已處理：ASCII-alphanumeric in-run splitter
          *   （`不2查`、`別¹查` 類 NFKC digit、`不™查`、`別½查`）——removed pass
          *   剝離後接合回連續 hint。
          * - NOT closed（記錄在案，監測）：
-         *   (a) negation run 中可見的 CJK 字母/數字（例如 `不一查`）——無法避免
+         *   (a) negation run 中可見的非 Lm CJK 字母（含漢字數字，例如 `不一查`）——無法避免
          *       （hint 即 letter runs）；
          *   (b) 混合文字同形字（Cyrillic/Greek lookalikes；例如 `nеver` 用 U+0435）
          *       未折疊——Phase 2/3 再評估 confusable folding；
@@ -558,29 +560,41 @@ class FastRouter(
             return "{\"query\": \"${esc(q)}\", \"limit\": ${LspTools.DEFAULT_LIMIT}}"
         }
 
-        // NFKC + 白名單（whitelist）正規化樣式：非字母/數字字元的一段會被整體吃掉，
-        // 比黑名單更完整——Java 黑名單無法窮舉 `\p{Cc}`/組合字標記/破折號/符號/Lm/Lo/
-        // PUA 等近 19 萬碼點。removed pass 直接刪除（CJK 被拆開的否定詞接合回連續
-        // hint）；spaced pass 折為單一空白（`\b` 因此保持完整，全形英文 NFKC 後的
-        // `\bnever\b` 與多空白英文同樣可匹配）。兩 passes 皆為 fail-safe 方向。
-        // 例外：Unicode 把延長音符（U+30FC, Lm）與諺文 filler（U+115F/U+1160, Lo —
-        // NFKC 把 U+3164/U+FFA0 折為 U+1160）歸在 L 類，`[^\p{L}\p{N}]` 吃不到，
-        // 必須顯式加入，否則 `別ー查`／`別ㅤ查` 會逃過正規化。
-        // 兩個 pass 用不同樣式：removed 額外剝 ASCII 英數字（`[A-Za-z0-9]+`），
-        // 使 `不2查`／`別¹查`（NFKC 上標數字）／`不™查`（NFKC→TM）／`別½查`
-        // （NFKC→1⁄2）這類 ASCII-alphanumeric in-run splitter 也接合回連續 hint；
-        // spaced 不剝 ASCII（`\b` 需保住，英文 `\bnever\b` 才可匹配）。
-        private val NEGATION_REMOVED = Regex("[^\\p{L}\\p{N}]+|[\\u30FC\\u115F\\u1160]+|[A-Za-z0-9]+")
+        // NFKC + 白名單（whitelist）正規化樣式：非（非 Lm）字母的一段會被整體吃掉，
+        // 比黑名單更完整——Java 黑名單無法窮舉 `\p{Cc}`/組合字標記/破折號/符號/
+        // PUA 等近 19 萬碼點。removed pass 保留「非 Lm 字母」以外一律刪除
+        // （CJK 被拆開的否定詞接合回連續 hint）；spaced pass 折為單一空白（`\b`
+        // 因此保持完整，全形英文 NFKC 後的 `\bnever\b` 與多空白英文同樣可匹配）。
+        // 兩 passes 皆為 fail-safe 方向。
+        // removed：`[^\p{L}]+` 一段吃掉所有非字母（含全部 Nd/No 數字、組合標記
+        // Mn/Mc/Me、符號 S、標點 P、Cc/Cf、PUA）；`\p{Lm}+` 吃掉 modifier letters
+        // （`ˇ` U+02C7、`ˉ` U+02C9、阿拉伯 tatweel U+0640、`々` U+3005、延長音符
+        // U+30FC——400+ 碼點），否則 `別ˇ查`／`別ˉ查`／`別ـ查`／`別々查` 會把否定詞
+        // 拆開逃過偵測。諺文 filler（U+115F/U+1160 為 Lo 字母，NFKC 把 U+3164/
+        // U+FFA0 折為 U+1160）非 Lm——顯式 `[\u115F\u1160]+` 剝離，否則 `別ㅤ查`
+        // 會逃過正規化。`[A-Za-z0-9]+` 保留：`不™查` NFKC→`不TM查`（ASCII 字母），
+        // `[^\p{L}]+` 吃不到，非剝離則無法接合回 hint；此支同時吃掉 ASCII 數字（冗餘，
+        // fail-safe 方向）。
+        // spaced 維持原樣不動（須保住 ASCII `\b` 以匹配英文 hint；它本就保留
+        // `\p{N}` 與 ASCII 字母，EN hint 由本 pass 以 `\b`-錨定匹配）。
+        private val NEGATION_REMOVED = Regex("[^\\p{L}]+|\\p{Lm}+|[A-Za-z0-9]+|[\\u115F\\u1160]+")
         private val NEGATION_SPACED = Regex("[^\\p{L}\\p{N}]+|[\\u30FC\\u115F\\u1160]+")
 
         /**
          * NFKC + whitelist-normalized negation matching: negation hints are
          * tested against THREE texts —
          * (1) the raw text,
-         * (2) the NFKC-normalized text with every run of non-letter/non-digit
-         *     chars AND every run of ASCII alphanumerics REMOVED (`別 查` /
+         * (2) the NFKC-normalized text with every run of non-letter code points
+         *     (`[^\p{L}]+` — ALL digits Nd/No, marks Mn/Mc/Me, symbols S,
+         *     punctuation P, Cc/Cf, PUA), every run of modifier letters
+         *     (`\p{Lm}+`, e.g. `ˇ` U+02C7, `ˉ` U+02C9, tatweel U+0640,
+         *     `々` U+3005, U+30FC), the Lo hangul fillers `[\u115F\u1160]+`
+         *     and every run of ASCII alphanumerics REMOVED — keeps only
+         *     non-Lm letters, which is all the CJK/English hints need
+         *     (`別 查` /
          *     `別　查` / `別，查` / `不\u200B查` / `別\uFE0E查` / `別-查` /
-         *     `別😀查` / `不2查` / `別½查` all rejoin into a contiguous hint;
+         *     `別😀查` / `不2查` / `別¹查` / `別ˇ查` / `不\u09E8查` all rejoin into a
+         *     contiguous hint;
          *     fullwidth Latin/digit negations strip out entirely here — CJK
          *     rejoin is what this pass is for),
          * (3) the same with non-letter/non-digit runs folded to a single space
@@ -590,9 +604,10 @@ class FastRouter(
          * A blacklist of separator classes can never be complete (Cc/marks/
          * dashes/symbols/Lm/Lo/PUA span ~190k code points), hence the whitelist
          * approach. Both passes push in the fail-safe direction (extra
-         * clarification, never extra execution). The prolonged-sound mark
-         * (U+30FC, Lm) and the Hangul fillers (U+115F/U+1160, Lo — U+3164/
-         * U+FFA0 fold in via NFKC) are removed explicitly for the same reason.
+         * clarification, never extra execution). Modifier letters (Lm — e.g.
+         * U+30FC, U+02C7, U+02C9, U+0640, U+3005) are stripped by `\p{Lm}+`;
+         * the Lo Hangul fillers (U+115F/U+1160 — U+3164/U+FFA0 fold in via
+         * NFKC) are removed explicitly for the same reason.
          * The `查詢` compound is covered by substring match of 別查/不查. Over-clarify residual: `特別找` ⊃
          * `別找` stays mis-routed to clarification — accepted as the safe tail
          * (never executes).

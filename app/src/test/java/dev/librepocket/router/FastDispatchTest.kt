@@ -18,6 +18,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
@@ -557,6 +558,32 @@ class FastDispatchTest {
             "別①查 Foo 符號",   // U+2460 circled digit one (NFKC→1)
             "不™查 Foo 符號",   // U+2122 trade mark sign (NFKC→TM)
             "別½查 Foo 符號",   // U+00BD vulgar fraction one half (NFKC→1⁄2)
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun modifierAndDigitSplittersStillDeny() = runBlocking {
+        // Lm modifier letters（ˇ U+02C7／ˉ U+02C9／ـ U+0640／々 U+3005）與非 ASCII
+        // digit（¹ U+00B9 No；U+09E8 Bengali digit two Nd——稽核所指碼位；U+0662
+        // Arabic-Indic digit two Nd——稽核逐字字元）in-run 拆開否定詞：removed pass
+        // 剝離後接合回連續 hint ⇒ DENIED + NEED_CLARIFICATION + backend 零呼叫。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for (text in listOf(
+            "別ˇ查 Foo 符號",   // U+02C7 CARON (Lm)
+            "別ˉ查 Foo 符號",   // U+02C9 MODIFIER LETTER MACRON (Lm)
+            "別ـ查 Foo 符號",   // U+0640 ARABIC TATWEEL (Lm)
+            "不ˇ查 Foo 符號",   // U+02C7 CARON (Lm)，不+動詞
+            "別々查 Foo 符號",  // U+3005 KATAKANA ITERATION MARK (Lm)
+            "別¹查 Foo 符號",   // U+00B9 SUPERSCRIPT ONE (No)
+            "不\u09E8查 Foo 符號",  // U+09E8 BENGALI DIGIT TWO (Nd)——稽核所指碼位
+            "不٢查 Foo 符號",  // U+0662 ARABIC-INDIC DIGIT TWO (Nd)——稽核逐字字元
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
@@ -1191,6 +1218,106 @@ class FastDispatchTest {
         assertNull(skipped.reasonCode)
         assertNotNull(skipped.fallbackMessage)
         assertFalse(skipped.fallbackMessage!!.contains("flight.book"))
+    }
+
+    // ---- Phase 3 (#19 B3)：fail-closed / 正向路由追加測試 ----
+
+    @Test fun executorThrowsUnexpectedExceptionFailsClosed() = runBlocking {
+        // Dispatcher catch-all：非取消的 RuntimeException 映射為型別化 EXEC_ERROR
+        // skip——永不外拋、永不回音 executor 訊息（test 目標是 dispatcher 的
+        // catch-all，故直接構造 throwing executor，不經 LspSymbolsExecutor/backend）。
+        val entered = AtomicInteger(0)
+        val thrower = object : FastToolExecutor {
+            override val toolName: String = LspTools.SYMBOLS_NAME
+            override suspend fun execute(call: ToolCall, ctx: ProjectionContext): FastExecResult {
+                entered.incrementAndGet()
+                throw RuntimeException("marker-should-not-ride")
+            }
+        }
+        val d = decide("幫我查 Foo 這個符號")
+        assertEquals(RouteKind.FAST, d.route)
+        val out = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to thrower)).dispatch(d, lspOn)
+        val skipped = skippedOf(out, "executor threw")
+        assertEquals("EXEC_ERROR", skipped.denyCode)
+        assertFalse(skipped.fallbackMessage!!.contains("marker-should-not-ride"))
+        assertEquals("executor must be entered exactly once", 1, entered.get())
+    }
+
+    @Test fun lookupCancellationPropagates() {
+        runBlocking {
+        // lookup 拋 CancellationException → 外拋（不得映射為 LOOKUP_ERROR Skipped）；
+        // executor / backend 零接觸（lookup 先於 executor）。
+        val backend = CountingBackend()
+        val dispatcher = FastDispatcher(
+            mapOf(LspTools.SYMBOLS_NAME to LspSymbolsExecutor(backend)),
+            lookup = { throw CancellationException("lookup-cancel-marker") },
+        )
+        val d = decide("幫我查 Foo 這個符號")
+        assertThrows(CancellationException::class.java) { runBlocking { dispatcher.dispatch(d, lspOn) } }
+        assertEquals(0, backend.invocations.get())
+        }
+    }
+
+    @Test fun fastCallIdsAreUniqueAcrossRouterInstances() {
+        // Process-wide AtomicLong：callId 跨 FastRouter instance 亦唯一。
+        val d1 = FastRouter().decide("幫我查 Foo 這個符號", lspOn)
+        val d2 = FastRouter().decide("查 Bar 符號", lspOn)
+        val d3 = FastRouter().decide("幫我查 Baz 這個符號", lspOn)
+        assertEquals(RouteKind.FAST, d1.route)
+        assertEquals(RouteKind.FAST, d2.route)
+        assertEquals(RouteKind.FAST, d3.route)
+        val id1 = d1.toolCall!!.callId
+        val id2 = d2.toolCall!!.callId
+        val id3 = d3.toolCall!!.callId
+        assertNotEquals("callIds must be unique across FastRouter instances", id1, id2)
+        assertEquals("callIds must be all-distinct across instances", 3, setOf(id1, id2, id3).size)
+        for (id in listOf(id1, id2, id3)) {
+            assertTrue("callId must carry the fast- prefix: $id", id.startsWith("fast-"))
+        }
+    }
+
+    @Test fun executorDeniedAllowlistBoundaryIsEnforced() = runBlocking {
+        // boundedDenyCode 的 allowlist ^[A-Z0-9_]{1,64}$ 邊界：null／""／65 字 →
+        // EXEC_ERROR；64 字合法碼原樣放行；僅 "SCHEMA_INVALID" 映射
+        // NEED_CLARIFICATION——其餘（含 allowlist 放行碼）皆 USER_DISABLED。
+        val d = decide("幫我查 Foo 這個符號")
+        val call = d.toolCall!!
+        val cases = listOf(
+            null to "EXEC_ERROR",
+            "" to "EXEC_ERROR",
+            "A".repeat(64) to "A".repeat(64),
+            "A".repeat(65) to "EXEC_ERROR",
+        )
+        for ((code, expected) in cases) {
+            val executor = executorReturning(
+                FastExecResult(
+                    LspTools.SYMBOLS_NAME,
+                    call.callId,
+                    """{"denied":true}""",
+                    denied = true,
+                    denyCode = code,
+                ),
+            )
+            val out = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to executor)).dispatch(d, lspOn)
+            val skipped = skippedOf(out, "denyCode=<$code>")
+            assertEquals("denyCode=<$code> must map to $expected", expected, skipped.denyCode)
+            assertEquals(
+                "denyCode=<$code> (not SCHEMA_INVALID) must map to USER_DISABLED",
+                DenyReason.USER_DISABLED,
+                skipped.reasonCode,
+            )
+        }
+    }
+
+    @Test fun symbolEnglishHintRoutesPositively() {
+        // Pin the \bsymbols?\b positive routing: 英文符號意圖必須 FAST。
+        // 若日後停止路由，本測試 MUST 轉紅（不得靜默地 strand 為 no-match DENIED）。
+        val d1 = decide("symbols Foo")
+        assertEquals(RouteKind.FAST, d1.route)
+        assertTrue(d1.toolCall!!.argumentsJson.contains("\"query\": \"Foo\""))
+        val d2 = decide("symbol Foo")
+        assertEquals(RouteKind.FAST, d2.route)
+        assertTrue(d2.toolCall!!.argumentsJson.contains("\"query\": \"Foo\""))
     }
 
     private fun fastDecision(toolName: String, argumentsJson: String, callId: String): RouteDecision =

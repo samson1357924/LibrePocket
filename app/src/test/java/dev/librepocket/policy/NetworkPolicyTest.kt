@@ -1579,7 +1579,8 @@ class NetworkPolicyTest {
     try {
       withTimeout(2_000) {
         NetworkPolicy.runPreflightSuspend(
-          deadlineNs = 1_000_000L,
+          // 10s：消除 ~1ms withTimeoutOrNull 與 worker 排程的競賽（CI run 43665097579, play flavor）
+          deadlineNs = 10_000_000_000L,
           nanoClock = {
             if (clockCalls.incrementAndGet() == 1) 0L else throw IllegalStateException("clock-boom")
           },

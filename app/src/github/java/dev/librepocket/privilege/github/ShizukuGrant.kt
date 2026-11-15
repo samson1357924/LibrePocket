@@ -155,6 +155,7 @@ object ShizukuGrantPolicy {
 /**
  * 授權 DataStore 持久化（github-only）。
  *
+ * - **B3 硬契約**：B3 callback 落庫（本類別 [save]）前必須以新鮮讀確認撤權未發生（marker pending／journal==true／epoch 不符 → 不得 save()，直接 fail-closed 返回）；[save] 須與 `FlavorPrivilegeScope.withdraw()`／本類別 [clear] 序列化（跨實例不可）；禁止僅憑 `grantResult==PERMISSION_GRANTED` 落庫——詳見 THREAT_MODEL「#136-B1 提權橋」第 4 項 Gate，fail-closed。
  * - 讀寫皆 fail-closed：讀取異常/缺鍵/空白 providerId 一律回 null
  *   （呼叫方視為未授權）；寫入校驗失敗抛給呼叫方（呼叫方不得吞錯放行）；
  * - 撤銷＝[clear]：marker＋journal＋（擦除授權鍵＋journal）的有序序列

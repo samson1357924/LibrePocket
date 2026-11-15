@@ -146,11 +146,11 @@ class PrivilegeBridgeStateTest {
         val backing = PreferenceDataStoreFactory.create(scope = scope) { File(dir, "concurrent_grant.preferences_pb") }
         lateinit var stateRef: PrivilegeBridgeState
 
-        // Wrap dataStore so when updateData is called, revoke() is triggered concurrently
+        // Wrap dataStore so when updateData is called, revokeInMemoryForTest() is triggered concurrently
         val hookingDataStore = object : DataStore<Preferences> by backing {
             override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
-                // Trigger revoke while grant is saving
-                stateRef.revoke()
+                // Trigger in-memory revoke while grant is saving
+                stateRef.revokeInMemoryForTest()
                 return backing.updateData(transform)
             }
         }
@@ -175,12 +175,15 @@ class PrivilegeBridgeStateTest {
         // Wrap dataStore so reading data triggers revoke()
         val hookingDataStore = object : DataStore<Preferences> by backing {
             override val data: Flow<Preferences> = backing.data.map {
-                stateRef.revoke()
+                // @Deprecated 記憶體版 revoke()（語義同 revokeInMemoryForTest()）：
+                // 只清記憶體旗標與審計表，盤上 grant 一律不動。
+                stateRef.revokeInMemoryForTest()
                 it
             }
         }
         val store = PrivilegeBridgeStore(hookingDataStore)
-        store.save(PrivilegeGrantPolicy.grant("preset:openai", 1L))
+        val grant = PrivilegeGrantPolicy.grant("preset:openai", 1L)
+        store.save(grant)
 
         val state = PrivilegeBridgeState(bridgeSwitchOn = true, bridgeGranted = true)
         stateRef = state
@@ -190,6 +193,13 @@ class PrivilegeBridgeStateTest {
         assertTrue(check is PrivilegeGrantCheck.Invalid)
         assertEquals(PrivilegeGrantPolicy.REASON_NEVER_GRANTED, (check as PrivilegeGrantCheck.Invalid).reason)
         assertFalse("bridgeGranted must be false after concurrent revoke during refresh", state.bridgeGranted)
+        // 語義缺口 pin：hookingDataStore 內觸發的是 in-memory 撤權——盤上 grant 未被清。
+        // 上面 Invalid(NEVER_GRANTED) 來自 epoch 競態折疊（並發撤銷的保守語義），而非
+        // 磁碟已無授權；重新 load 仍讀得到有效 grant。
+        // 產品撤權必須走 suspend revoke(store, …) 持久版（marker/journal 防死灰復燃），
+        // 只靠記憶體撤權重啟後舊授權可能復活。若把此處改為持久 revoke，下列斷言即不成立——
+        // 此分歧正是本測試釘住的 in-memory 語義缺口（僅註解標明，不在本案例修復）。
+        assertEquals("In-memory revoke must leave the backing grant untouched on disk", grant, store.load())
     }
 
     @Test fun grantRevokedWhileQueuedOnMutexFailsClosed() = runBlocking {
@@ -214,30 +224,32 @@ class PrivilegeBridgeStateTest {
         }
         lockHoldStarted.await(10, java.util.concurrent.TimeUnit.SECONDS)
 
-        // Now Coroutine 2 calls grant - it samples epochBefore (0), and suspends waiting for opMutex
-        val grantStarted = java.util.concurrent.CountDownLatch(1)
-        var grantError: Throwable? = null
-        val job2 = launch(Dispatchers.IO) {
-            grantStarted.countDown()
+        // 以 Unconfined 明確驅動：launch 返回時 job2 已執行到 opMutex.lock() 的掛起點
+        //（epochBefore 已捕捉且排隊等鎖）——不再靠 Thread.sleep 猜測排程。
+        val grantError = java.util.concurrent.atomic.AtomicReference<Throwable?>()
+        val job2 = launch(kotlinx.coroutines.Dispatchers.Unconfined) {
             try {
                 state.grant(store, "preset:openai", 1L)
             } catch (t: Throwable) {
-                grantError = t
+                grantError.set(t)
             }
         }
-        grantStarted.await()
-        Thread.sleep(50) // ensure job2 is queued on opMutex
+        // launch 返回即代表 job2 已排隊於 opMutex（Mutex 由 job1 持有）。
 
         // User revokes while job2 is queued
-        state.revoke()
+        state.revokeInMemoryForTest()
 
         // Release job1
         lockHoldRelease.countDown()
         job1.join()
         job2.join()
 
-        assertTrue(grantError is IllegalStateException)
-        assertEquals("PRIVILEGE_GRANT_REVOKED_CONCURRENTLY", grantError?.message)
+        val grantFailure = grantError.get()
+        assertTrue(
+            "grant 必 fail-closed 拋 IllegalStateException，實際=$grantFailure",
+            grantFailure is IllegalStateException,
+        )
+        assertEquals("PRIVILEGE_GRANT_REVOKED_CONCURRENTLY", grantFailure?.message)
         assertFalse(state.bridgeGranted)
     }
 

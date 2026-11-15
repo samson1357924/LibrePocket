@@ -47,6 +47,12 @@ class PrivilegeBridgeStoreRobolectricTest {
         if (markerFile.exists()) markerFile.delete()
         val corruptedFile = File(context.filesDir, "corrupted_test.preferences_pb")
         if (corruptedFile.exists()) corruptedFile.delete()
+        // context-constructor 共用的預設 DataStore（preferencesDataStore 落 filesDir/datastore/）：
+        // 測試間若殘留授權鍵會跨案例污染自癒斷言，必須刪除。
+        val grantStoreFile = File(context.filesDir, "datastore/librepocket_privilege_bridge.preferences_pb")
+        if (grantStoreFile.exists()) grantStoreFile.delete()
+        val grantStoreTmp = File(context.filesDir, "datastore/librepocket_privilege_bridge.preferences_pb.tmp")
+        if (grantStoreTmp.exists()) grantStoreTmp.delete()
         testScopes.forEach { it.cancel() }
         testScopes.clear()
     }
@@ -172,5 +178,16 @@ class PrivilegeBridgeStoreRobolectricTest {
         val store = PrivilegeBridgeStore(ds)
         val result = store.load()
         assertNull("Corrupted preferences must fail-closed to null via corruption handler", result)
+        // 不得僅 tautology 地重複斷言 load()==null：corruption handler 必須已以空 prefs
+        // 覆寫檔案，使後續 save/load 可正常運作（證明 handler 確實修復了檔案）。
+        val prefsAfterCorruption = ds.data.first()
+        assertNull("Corruption handler must have rewritten the file with empty prefs",
+            prefsAfterCorruption[PRIVILEGE_GRANT_PROVIDER_ID])
+        assertNull("Corruption handler rewrite must drop the revoke journal",
+            prefsAfterCorruption[PRIVILEGE_REVOKE_JOURNAL])
+        val validGrant = PrivilegeGrantPolicy.grant("preset:openai", 7L)
+        store.save(validGrant)
+        assertEquals("Store must round-trip a new grant after corruption handler repair",
+            validGrant, store.load())
     }
 }

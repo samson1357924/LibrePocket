@@ -34,6 +34,7 @@ import dev.librepocket.agent.ui.setup.setupErrorText
 import dev.librepocket.automation.AutomationSettingsState
 import dev.librepocket.provider.ProviderProtocol
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -736,6 +737,26 @@ class SettingsScreenTest {
         }
         onLogoutArea("收回中…").assertIsDisplayed().assertIsNotEnabled()
         composeRule.onAllNodesWithText("一鍵收回提權授權並清空審計").assertCountEquals(0)
+    }
+
+    @Test
+    fun privilegeRevoke_inFlightPerformClickDoesNotTriggerCallback() {
+        var revokeClicked = false
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                privilegeRevokeInFlight = true,
+                privilegeRevokeError = false,
+                onRevokePrivilege = { revokeClicked = true },
+            )
+        }
+        val node = onLogoutArea("收回中…")
+        node.assertIsDisplayed().assertIsNotEnabled()
+        // Compose disabled 節點不暴露 OnClick action：依框架版本 performClick 可能直接抛异常，
+        // 也可能静默 no-op；無論哪種語義，回呼皆不得觸發（此處不依賴哪一種，故不斷言异常）。
+        runCatching { node.performClick() }
+        assertFalse("inFlight=true 時按鈕 disabled，performClick 不得觸發回呼", revokeClicked)
     }
 
     @Test

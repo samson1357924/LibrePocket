@@ -4,6 +4,9 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
 import dev.librepocket.shell.ElevatedRequest
+import dev.librepocket.shell.PRIVILEGE_GRANT_PROVIDER_ID
+import dev.librepocket.shell.PRIVILEGE_REVOKE_JOURNAL
+import dev.librepocket.shell.PendingRevokeMarker
 import dev.librepocket.shell.PrivilegeBridgeState
 import dev.librepocket.shell.PrivilegeBridgeStore
 import dev.librepocket.shell.PrivilegeGrantCheck
@@ -16,6 +19,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import org.junit.After
@@ -270,6 +274,52 @@ class PrivilegeBridgeRevokeRunnerTest {
         assertEquals("zero spawn required when bridgeSwitchOn is false", 0, spawn.calls)
     }
 
+    /**
+     * clear() 的 updateData 失敗注入 DataStore 包裝：
+     * [failNextUpdate] 連續呼叫可累計多個待注入失敗（B1 雙重失敗案：journal 寫入＋best-effort wipe 擦除各一次）；
+     * [failOnUpdateDataCall] 指定絕對呼叫次序（1-based）失敗一次（B2 erase-only 案：第 3 次 updateData＝erase edit）。
+     */
+    private class FailOnceClearDataStore(
+        private val backing: DataStore<Preferences>,
+    ) : DataStore<Preferences> by backing {
+        private val remainingFailures = java.util.concurrent.atomic.AtomicInteger(0)
+        private val failOnCall = java.util.concurrent.atomic.AtomicInteger(-1)
+        private val callCounter = java.util.concurrent.atomic.AtomicInteger(0)
+
+        /** 讓接下來一次 updateData 呼叫拋 [IOException]（連續呼叫則累計多個待注入失敗）。 */
+        fun failNextUpdate() {
+            remainingFailures.incrementAndGet()
+        }
+
+        /** 讓第 [n] 次 updateData 呼叫（1-based，自本 DataStore 建立起計）拋 [IOException] 僅一次。 */
+        fun failOnUpdateDataCall(n: Int) {
+            failOnCall.set(n)
+        }
+
+        override suspend fun updateData(
+            transform: suspend (t: Preferences) -> Preferences,
+        ): Preferences {
+            val call = callCounter.incrementAndGet()
+            if (failOnCall.get() == call && failOnCall.compareAndSet(call, -1)) {
+                throw IOException("fail-once simulated clear failure (call #$call)")
+            }
+            if (remainingFailures.get() > 0) {
+                remainingFailures.decrementAndGet()
+                throw IOException("fail-once simulated clear failure")
+            }
+            return backing.updateData(transform)
+        }
+    }
+
+    /**
+     * 註（#136-B1 假件分歧）：本案例的 failingStore 是與 grant 所在 bridgeStore
+     * 完全不同的 fake DataStore——其 clear() 失敗不會在 bridgeStore 落下
+     * marker/journal，因此本案例無法證明「持久撤權失敗後可跨重啟 fail-closed」，
+     * 只釘住記憶體旗標收回與 in-memory 拒絕行為。跨重啟語義由
+     * [failedPersistentRevoke_markerPersists_restartRefreshDeniedAndZeroSpawn]
+     * 以真 Store＋file-backed marker＋fail-once DataStore 覆蓋；舊案例保留作
+     * 記憶體 fail-closed 釘住，不刪除。
+     */
     @Test fun postFailedRevokeZeroSpawn() = runBlocking {
         val state = PrivilegeBridgeState(bridgeSwitchOn = true)
         grantBoth(state)
@@ -311,6 +361,216 @@ class PrivilegeBridgeRevokeRunnerTest {
         val sDenied = sResult as ElevatedBinaryResult.Denied
         assertTrue(sDenied.message.contains("privilege bridge off"))
         assertEquals("zero spawn after failed revoke", 1, spawn.calls)
+    }
+
+    @Test fun failedPersistentRevoke_markerPersists_restartRefreshDeniedAndZeroSpawn() = runBlocking {
+        // 真 PrivilegeBridgeStore＋file-backed PendingRevokeMarker＋fail-once DataStore：
+        // 持久撤權的 journal 寫入第一次失敗 → revoke 拋錯（fail-closed），但 marker 已落盤；
+        // 「重啟」（新 State＋fresh Store＋fresh file-backed marker）後 load() 見 marker 自癒擦除 → refresh Invalid(NEVER_GRANTED)
+        // → runner Denied 且零 spawn（失敗撤權不得跨重啟死灰復燃）。
+        val bridgeBacking = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "bridge_fail_once.preferences_pb")
+        }
+        val failingDataStore = FailOnceClearDataStore(bridgeBacking)
+        val markerFile = File(dir, "bridge_fail_once.pending")
+        val failingStore = PrivilegeBridgeStore(
+            failingDataStore,
+            revokeMarker = PendingRevokeMarker(markerFile),
+        )
+
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+        state.grant(failingStore, "provider-a", 1L)
+        shizukuStore.save(ShizukuGrantPolicy.grant("provider-a", 1L, 15))
+
+        val spawn = SpawnCounter()
+        val root = rootRunner(state, spawn)
+        val first = root.runBinary(request(), 2_000L)
+        assertTrue(first is ElevatedBinaryResult.Ok)
+        assertEquals(1, spawn.calls)
+
+        // journal 寫入 fail-once：revoke 必須拋錯（fail-closed），marker 必須已落盤。
+        failingDataStore.failNextUpdate()
+        try {
+            state.revoke(failingStore)
+            org.junit.Assert.fail("revoke must throw when store clear fails")
+        } catch (e: IOException) {
+            // expected：fail-once 的 journal 寫入失敗 → 原始 IOException 重拋（fail-closed）
+        }
+        assertFalse("bridgeGranted 必已落 false（記憶體 fail-closed）", state.bridgeGranted)
+        assertFalse("bridgeSwitchOn 必已關閉（記憶體 fail-closed）", state.bridgeSwitchOn)
+        assertTrue("marker 必須已落盤（重啟防死灰復燃的持久兜底）", markerFile.isFile)
+
+        // 模擬重啟：新 State＋fresh Store＋fresh file-backed PendingRevokeMarker（檔案同一路徑），
+        // file-only 隔離（不繼承原 Store 的記憶體 pending 旗標）。
+        val restartedStore = PrivilegeBridgeStore(
+            failingDataStore,
+            revokeMarker = PendingRevokeMarker(markerFile),
+        )
+        val restarted = PrivilegeBridgeState(bridgeSwitchOn = true)
+        val check = restarted.refresh(restartedStore, "provider-a", 1L)
+        assertTrue("$check", check is PrivilegeGrantCheck.Invalid)
+        assertEquals(
+            PrivilegeGrantPolicy.REASON_NEVER_GRANTED,
+            (check as PrivilegeGrantCheck.Invalid).reason,
+        )
+        assertFalse("重啟後 refresh 必判未授權", restarted.bridgeGranted)
+        assertFalse("load() 自癒 heal 必刪除 marker 檔", markerFile.exists())
+
+        val spawn2 = SpawnCounter()
+        val rootAfterRestart = rootRunner(restarted, spawn2)
+        val denied = rootAfterRestart.runBinary(request(), 2_000L)
+        assertTrue(denied is ElevatedBinaryResult.Denied)
+        assertEquals("重啟後 runner 必零 spawn", 0, spawn2.calls)
+    }
+
+    @Test fun failedClearWithJournalAndWipeFailure_restartDeniedAndZeroSpawn() = runBlocking {
+        // 雙重失敗（security P2-1／test P2-3）：journal 寫入失敗＋best-effort wipe 擦除亦失敗
+        // → revoke 拋 IOException；marker 已落盤（檔案分支兜底），backing 中 grant 鍵仍在盤上
+        // （marker heal 之前）；「重啟」（新 State＋fresh Store＋fresh file-backed marker）後
+        // refresh→Invalid(NEVER_GRANTED)；load() 見 marker（無條件擦除分支）擦掉 grant 鍵＋刪 marker；
+        // runner Denied 且零 spawn（失敗撤權不得跨重啟死灰復燃）。
+        // 註：Denied 訊息斷言須經 /usr/bin/id resolve 成功方可到達橋門；本機（symlink→cargo
+        // coreutils，containment 外）resolve 先拒 → 本機同級紅，標準 coreutils/CI 佈局方綠。
+        val bridgeBacking = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "bridge_fail_twice.preferences_pb")
+        }
+        val failingDataStore = FailOnceClearDataStore(bridgeBacking)
+        val markerFile = File(dir, "bridge_fail_twice.pending")
+        val failingStore = PrivilegeBridgeStore(
+            failingDataStore,
+            revokeMarker = PendingRevokeMarker(markerFile),
+        )
+
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+        state.grant(failingStore, "provider-a", 1L)
+        shizukuStore.save(ShizukuGrantPolicy.grant("provider-a", 1L, 15))
+
+        // 連續兩次 fail-once：journal 寫入（第 2 次 updateData）＋best-effort wipe 擦除（第 3 次）皆失敗。
+        failingDataStore.failNextUpdate()
+        failingDataStore.failNextUpdate()
+        try {
+            state.revoke(failingStore)
+            org.junit.Assert.fail("revoke must throw when journal write and wipe both fail")
+        } catch (_: IOException) {
+            // expected：fail-once 的 journal 寫入失敗 → 原始 IOException 重拋（fail-closed）
+        }
+        assertFalse("bridgeGranted 必已落 false（記憶體 fail-closed）", state.bridgeGranted)
+        assertFalse("bridgeSwitchOn 必已關閉（記憶體 fail-closed）", state.bridgeSwitchOn)
+        assertTrue("marker 必須已落盤（重啟防死灰復燃的持久兜底）", markerFile.isFile)
+
+        // 直接驗 backing 中 grant 鍵仍在盤上（marker heal 之前）——雙重失敗殘留證據。
+        val prefsBefore = bridgeBacking.data.first()
+        assertEquals(
+            "journal＋wipe 雙失敗時 grant 鍵必須仍在盤上",
+            "provider-a",
+            prefsBefore[PRIVILEGE_GRANT_PROVIDER_ID],
+        )
+
+        // 模擬重啟：新 State＋fresh Store＋fresh file-backed marker（檔案同一路徑），file-only 隔離。
+        val restartedStore = PrivilegeBridgeStore(
+            failingDataStore,
+            revokeMarker = PendingRevokeMarker(markerFile),
+        )
+        val restarted = PrivilegeBridgeState(bridgeSwitchOn = true)
+        val check = restarted.refresh(restartedStore, "provider-a", 1L)
+        assertTrue("$check", check is PrivilegeGrantCheck.Invalid)
+        assertEquals(
+            PrivilegeGrantPolicy.REASON_NEVER_GRANTED,
+            (check as PrivilegeGrantCheck.Invalid).reason,
+        )
+        assertFalse("重啟後 refresh 必判未授權", restarted.bridgeGranted)
+        assertFalse("load() marker heal 必刪除 marker 檔", markerFile.exists())
+        val prefsAfter = bridgeBacking.data.first()
+        assertNull("marker heal 必擦除 backing grant 鍵", prefsAfter[PRIVILEGE_GRANT_PROVIDER_ID])
+
+        val spawn2 = SpawnCounter()
+        val rootAfterRestart = rootRunner(restarted, spawn2)
+        val denied = rootAfterRestart.runBinary(request(), 2_000L)
+        assertTrue("$denied", denied is ElevatedBinaryResult.Denied)
+        // 零 spawn 與環境無關（resolve 失敗亦零 spawn）——先驗。
+        assertEquals("重啟後 runner 必零 spawn", 0, spawn2.calls)
+        // production Denied 字串（RootSuRunner「privilege bridge off (fail-closed, no spawn)」）：
+        // bridge 門拒（reason＝ShellDeny.NOT_WHITELISTED）。須經 /usr/bin/id resolve 成功方可
+        // 到達橋門——本機 resolve 先拒（BLACKLISTED）→ 本機紅、標準 coreutils/CI 佈局方綠。
+        assertEquals(ShellDeny.NOT_WHITELISTED, (denied as ElevatedBinaryResult.Denied).reason)
+        assertTrue("${denied.message}", denied.message.contains("privilege bridge off"))
+    }
+
+    @Test fun journalResidual_restartHealDeniedAndZeroSpawn() = runBlocking {
+        // fail-erase-only 失敗分支（journal 成功、第 3 次 updateData＝erase edit 失敗）：
+        // journal==true 殘留＋grant 鍵殘留；marker 落盤後模擬遺失（noBackupFilesDir 被清/卸載），
+        // 「重啟」時 isPending()==false → load() 走 journal 條件式 heal（journal==true 才擦），
+        // 擦除 grant 鍵與 journal → refresh Invalid(NEVER_GRANTED) → runner Denied 且零 spawn。
+        // 計數：grant save＝第 1 次 updateData、journal 寫入＝第 2 次、erase 擦除＝第 3 次（本案只注入第 3 次失敗）。
+        // 註：Denied 訊息斷言須經 /usr/bin/id resolve 成功方可到達橋門；本機同級紅，標準佈局/CI 方綠。
+        val bridgeBacking = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "bridge_erase_fail.preferences_pb")
+        }
+        val failingDataStore = FailOnceClearDataStore(bridgeBacking)
+        val markerFile = File(dir, "bridge_erase_fail.pending")
+        val failingStore = PrivilegeBridgeStore(
+            failingDataStore,
+            revokeMarker = PendingRevokeMarker(markerFile),
+        )
+
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+        state.grant(failingStore, "provider-a", 1L)
+        shizukuStore.save(ShizukuGrantPolicy.grant("provider-a", 1L, 15))
+
+        // journal 寫入（第 2 次）成功；第 3 次 updateData（erase edit）fail-once。
+        failingDataStore.failOnUpdateDataCall(3)
+        try {
+            state.revoke(failingStore)
+            org.junit.Assert.fail("revoke must throw when the erase edit fails")
+        } catch (_: IOException) {
+            // expected：erase edit 失敗 → 原始 IOException 重拋（fail-closed）
+        }
+        // journal 必已落盤：erase-only 失敗時 journal 與 grant 鍵皆殘留於盤上（重啟 heal 的前提）。
+        val prefsAfterRevoke = bridgeBacking.data.first()
+        assertEquals(
+            "erase-only 失敗時 journal 必須殘留於盤上",
+            true,
+            prefsAfterRevoke[PRIVILEGE_REVOKE_JOURNAL],
+        )
+        assertEquals(
+            "erase-only 失敗時 grant 鍵必須殘留於盤上",
+            "provider-a",
+            prefsAfterRevoke[PRIVILEGE_GRANT_PROVIDER_ID],
+        )
+        assertTrue("marker 必須已落盤", markerFile.isFile)
+
+        // 模擬 marker 遺失：僅 journal 殘留 → 重啟時走 journal 條件式 heal 分支。
+        assertTrue("模擬 marker 遺失（刪除標記檔）", markerFile.delete())
+
+        // 模擬重啟：新 State＋fresh Store＋fresh file-backed marker（檔案同一路徑，已不存在），file-only 隔離。
+        val restartedStore = PrivilegeBridgeStore(
+            failingDataStore,
+            revokeMarker = PendingRevokeMarker(markerFile),
+        )
+        val restarted = PrivilegeBridgeState(bridgeSwitchOn = true)
+        val check = restarted.refresh(restartedStore, "provider-a", 1L)
+        assertTrue("$check", check is PrivilegeGrantCheck.Invalid)
+        assertEquals(
+            PrivilegeGrantPolicy.REASON_NEVER_GRANTED,
+            (check as PrivilegeGrantCheck.Invalid).reason,
+        )
+        assertFalse("重啟後 refresh 必判未授權", restarted.bridgeGranted)
+        assertFalse("fresh marker 不得被無中生有", markerFile.exists())
+        val prefsAfter = bridgeBacking.data.first()
+        assertNull("journal heal 必擦除 backing grant 鍵", prefsAfter[PRIVILEGE_GRANT_PROVIDER_ID])
+        assertNull("journal heal 必擦除 journal 鍵", prefsAfter[PRIVILEGE_REVOKE_JOURNAL])
+
+        val spawn2 = SpawnCounter()
+        val rootAfterRestart = rootRunner(restarted, spawn2)
+        val denied = rootAfterRestart.runBinary(request(), 2_000L)
+        assertTrue("$denied", denied is ElevatedBinaryResult.Denied)
+        // 零 spawn 與環境無關（resolve 失敗亦零 spawn）——先驗。
+        assertEquals("重啟後 runner 必零 spawn", 0, spawn2.calls)
+        // production Denied 字串（RootSuRunner「privilege bridge off (fail-closed, no spawn)」）：
+        // bridge 門拒（reason＝ShellDeny.NOT_WHITELISTED）。須經 /usr/bin/id resolve 成功方可
+        // 到達橋門——本機 resolve 先拒（BLACKLISTED）→ 本機紅、標準 coreutils/CI 佈局方綠。
+        assertEquals(ShellDeny.NOT_WHITELISTED, (denied as ElevatedBinaryResult.Denied).reason)
+        assertTrue("${denied.message}", denied.message.contains("privilege bridge off"))
     }
 
     @Test fun shizukuExpiryRefreshDeniesWithoutSpawn() = runBlocking {

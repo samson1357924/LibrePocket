@@ -122,13 +122,19 @@ class WebSearchService(
                 }
             }
             // 旁路（uncacheable）共用：不查快取、不 single-flight、不寫快取；
-            // 對 delegate 的 raw Exception 映射為 Failed(TRANSPORT)（fail-closed），CE 原樣透傳。
-            // NOTE(F2): central ensureActive() for this branch lands in the next phase
+            // 對 delegate 的 raw Exception 映射為 Failed(TRANSPORT)（fail-closed），CE 原樣透傳；
+            // 壞 delegate 吞掉取消仍回值／把取消表現成一般例外時，central ensureActive() 讓 CE
+            // 原樣透傳，絕不把已取消的結果當正常值（或可 fallback 的 TRANSPORT）回傳。
             suspend fun bypass(): WebSearchOutcome = try {
-                delegate.search(query, n)
+                val outcome = delegate.search(query, n)
+                // delegate 正常返回但外部已取消（吞掉 CE 的壞 delegate）：CE 原樣透傳。
+                currentCoroutineContext().ensureActive()
+                outcome
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
+                // 外部已取消時 CE 透傳（不得映射 TRANSPORT）；否則 mapping 為 Failed(TRANSPORT)。
+                currentCoroutineContext().ensureActive()
                 WebSearchOutcome.Failed(WebFailureReason.TRANSPORT)
             }
             // snapshot 於 try 內指派（含 cacheKey 建構／cacheNamespace 取用）——

@@ -10,6 +10,7 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
@@ -867,6 +868,97 @@ class WebSearchD5Test {
         // 旁路不寫快取：第二次照樣打 upstream
         svc.search("q", 5)
         assertEquals(2, delegate.calls)
+    }
+
+    // ---- 旁路（Unavailable）取消語義：delegate 吞取消的防禦 ----
+
+    @Test fun cancellationSwallowingDelegateOnBypassPathPropagatesCe() = runBlocking {
+        // 壞 delegate：credentialState=Unavailable → bypass；search() 內吞掉 CE 仍回 Ok。
+        // central ensureActive() 必須讓外部取消原樣透傳（不得把取消結果當正常 Ok 回傳）。
+        val delegate = object : WebSearchProvider {
+            override val id: String = "cancellation-swallower"
+            override val capabilities: Set<WebCapability> = emptySet()
+            override suspend fun probe(): WebProbe = WebProbe.Ready
+            override suspend fun search(query: String, count: Int): WebSearchOutcome {
+                return try {
+                    delay(10_000)
+                    WebSearchOutcome.Ok(emptyList())
+                } catch (_: CancellationException) {
+                    WebSearchOutcome.Ok(emptyList()) // 吞掉取消，仍回值
+                }
+            }
+            override suspend fun credentialState(): CredentialState = CredentialState.Unavailable
+        }
+        val svc = WebSearchService(delegate)
+        // 兩種機制皆無法從 await() 的結果區分 fix（runtime 會把任何正常完成遮蔽成 JCE）；
+        // 改以觀測「Service 是否回傳值」為區分通道：
+        // fix 生效 → bypass 的 ensureActive() 拋 CE → coroutine 以 CE 結束 → result 從不完成；
+        // pre-fix → bypass 直接回 Ok → result.complete(Ok) → isCompleted == true。
+        val result = CompletableDeferred<WebSearchOutcome>()
+        val job = launch { result.complete(svc.search("kotlin", 5)) }
+        delay(50)
+        job.cancel()
+        job.join()
+        assertFalse("吞取消 delegate 在 bypass 路徑不得回傳正常值（central ensureActive() 必須拋 CE）：$result", result.isCompleted)
+    }
+
+    @Test fun throwingDelegateOnBypassPathAfterCancelPropagatesCeNotTransport() = runBlocking {
+        // 壞 delegate：bypass 路徑把取消表現成一般 Exception；外部已取消時 CE 必須透傳，
+        // 不得映射成可 fallback 的 Failed(TRANSPORT)。
+        val delegate = object : WebSearchProvider {
+            override val id: String = "exception-swallower"
+            override val capabilities: Set<WebCapability> = emptySet()
+            override suspend fun probe(): WebProbe = WebProbe.Ready
+            override suspend fun search(query: String, count: Int): WebSearchOutcome {
+                return try {
+                    delay(10_000)
+                    WebSearchOutcome.Ok(emptyList())
+                } catch (_: CancellationException) {
+                    throw IllegalStateException("cancelled-as-exception") // 把取消表現成一般例外
+                }
+            }
+            override suspend fun credentialState(): CredentialState = CredentialState.Unavailable
+        }
+        val svc = WebSearchService(delegate)
+        // 同一觀測通道：fix 生效 → catch 分支先 ensureActive() 拋 CE → result 從不完成；
+        // pre-fix → 一般 Exception 映射成 Failed(TRANSPORT) 回傳 → result.complete(Failed) → isCompleted == true。
+        val result = CompletableDeferred<WebSearchOutcome>()
+        val job = launch { result.complete(svc.search("kotlin", 5)) }
+        delay(50)
+        job.cancel()
+        job.join()
+        assertFalse("取消後 delegate 拋一般 Exception 不得映射 TRANSPORT（CE 必須透傳）：$result", result.isCompleted)
+    }
+
+    @Test fun bypassPathReturnsDelegateValueWhenNotCancelled() = runBlocking {
+        // 正常路徑（未取消）：ensureActive() 為 no-op；delegate 的 Ok 原樣回傳。
+        val delegate = object : WebSearchProvider {
+            override val id: String = "unavailable-plain"
+            override val capabilities: Set<WebCapability> = emptySet()
+            override suspend fun probe(): WebProbe = WebProbe.Ready
+            override suspend fun search(query: String, count: Int): WebSearchOutcome =
+                WebSearchOutcome.Ok(emptyList())
+            override suspend fun credentialState(): CredentialState = CredentialState.Unavailable
+        }
+        val svc = WebSearchService(delegate)
+        val out = svc.search("kotlin", 5)
+        assertEquals(WebSearchOutcome.Ok(emptyList()), out)
+    }
+
+    @Test fun throwingDelegateOnBypassPathMapsToFailedTransportWhenNotCancelled() = runBlocking {
+        // 未取消時 raw Exception → Failed(TRANSPORT)（既有 fail-closed 映射保留）。
+        val delegate = object : WebSearchProvider {
+            override val id: String = "unavailable-thrower"
+            override val capabilities: Set<WebCapability> = emptySet()
+            override suspend fun probe(): WebProbe = WebProbe.Ready
+            override suspend fun search(query: String, count: Int): WebSearchOutcome =
+                throw IllegalStateException("boom")
+            override suspend fun credentialState(): CredentialState = CredentialState.Unavailable
+        }
+        val svc = WebSearchService(delegate)
+        val out = svc.search("kotlin", 5)
+        assertTrue(out is WebSearchOutcome.Failed)
+        assertEquals(WebFailureReason.TRANSPORT, (out as WebSearchOutcome.Failed).reason)
     }
 
     // ---- 預設註冊 ----
